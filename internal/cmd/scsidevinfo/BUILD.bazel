@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "scsidevinfo_lib",
+    srcs = ["main.go"],
+    importpath = "linux.bzl/internal/cmd/scsidevinfo",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "scsidevinfo",
+    embed = [":scsidevinfo_lib"],
+    visibility = ["//:__subpackages__"],
+)

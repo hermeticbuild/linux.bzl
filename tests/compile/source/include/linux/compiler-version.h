@@ -1,0 +1,1 @@
+/* Minimal compile fixture header. */

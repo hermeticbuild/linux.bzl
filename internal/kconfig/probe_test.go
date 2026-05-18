@@ -1,0 +1,176 @@
+// Copyright The Monogon Project Authors.
+// SPDX-License-Identifier: Apache-2.0
+
+package kconfig
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestLinuxLLVMProbeShellSupportsKconfigIncludeProbes(t *testing.T) {
+	rootDir := t.TempDir()
+	scriptsDir := filepath.Join(rootDir, "scripts")
+	if err := os.Mkdir(scriptsDir, 0o755); err != nil {
+		t.Fatalf("Mkdir() failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(scriptsDir, "Kconfig.include"), []byte(`
+comma := ,
+if-success = $(shell,{ $(1); } >/dev/null 2>&1 && echo "$(2)" || echo "$(3)")
+success = $(if-success,$(1),y,n)
+failure = $(if-success,$(1),n,y)
+
+$(error-if,$(failure,command -v $(CC)),C compiler '$(CC)' not found)
+$(error-if,$(failure,command -v $(LD)),linker '$(LD)' not found)
+
+cc-info := $(shell,$(srctree)/scripts/cc-version.sh $(CC))
+$(error-if,$(success,test -z "$(cc-info)"),Sorry$(comma) this C compiler is not supported.)
+cc-name := $(shell,set -- $(cc-info) && echo $1)
+cc-version := $(shell,set -- $(cc-info) && echo $2)
+
+as-info := $(shell,$(srctree)/scripts/as-version.sh $(CC) $(CLANG_FLAGS))
+$(error-if,$(success,test -z "$(as-info)"),Sorry$(comma) this assembler is not supported.)
+as-name := $(shell,set -- $(as-info) && echo $1)
+as-version := $(shell,set -- $(as-info) && echo $2)
+
+ld-info := $(shell,$(srctree)/scripts/ld-version.sh $(LD))
+$(error-if,$(success,test -z "$(ld-info)"),Sorry$(comma) this linker is not supported.)
+ld-name := $(shell,set -- $(ld-info) && echo $1)
+ld-version := $(shell,set -- $(ld-info) && echo $2)
+
+config CC_IS_GCC
+	def_bool $(success,test "$(cc-name)" = GCC)
+
+config CC_IS_CLANG
+	def_bool $(success,test "$(cc-name)" = Clang)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile() failed: %v", err)
+	}
+
+	shell, err := LinuxProbeShell(LinuxProbeModelLLVM)
+	if err != nil {
+		t.Fatalf("LinuxProbeShell() failed: %v", err)
+	}
+	tree, err := Parse(context.Background(), strings.NewReader(`
+srctree := `+rootDir+`
+CC := clang
+LD := ld.lld
+CLANG_FLAGS := -fintegrated-as
+
+source "scripts/Kconfig.include"
+
+config CC_IS_CLANG_TEST
+	bool
+	default y if CC_IS_CLANG
+
+config CC_IS_GCC_TEST
+	bool
+	default y if CC_IS_GCC
+
+config LLD_MAJOR
+	int
+	default $(shell,expr $(ld-version) / 10000)
+
+config PAHOLE_VERSION
+	int
+	default $(shell,$(srctree)/scripts/pahole-version.sh $(PAHOLE))
+
+config BINDGEN_VERSION_TEXT
+	string
+	default "$(shell,$(BINDGEN) --version workaround-for-0.69.0 2>/dev/null)"
+`), "Kconfig", Options{
+		AllowShell: true,
+		RootDir:    rootDir,
+		Env: map[string]string{
+			"BINDGEN": "bindgen",
+			"PAHOLE":  "pahole",
+		},
+		Shell: shell,
+	})
+	if err != nil {
+		t.Fatalf("Parse() failed: %v", err)
+	}
+	resolved, err := tree.ResolveConfig("test", nil)
+	if err != nil {
+		t.Fatalf("ResolveConfig() failed: %v", err)
+	}
+	if got := resolved.Value("CONFIG_CC_IS_CLANG"); got != "y" {
+		t.Fatalf("CONFIG_CC_IS_CLANG = %q, want y", got)
+	}
+	if got := resolved.Value("CONFIG_CC_IS_GCC"); got != "n" {
+		t.Fatalf("CONFIG_CC_IS_GCC = %q, want n", got)
+	}
+	if got := resolved.Value("CONFIG_CC_IS_CLANG_TEST"); got != "y" {
+		t.Fatalf("CONFIG_CC_IS_CLANG_TEST = %q, want y", got)
+	}
+	if got := resolved.Value("CONFIG_CC_IS_GCC_TEST"); got != "n" {
+		t.Fatalf("CONFIG_CC_IS_GCC_TEST = %q, want n", got)
+	}
+	if got := resolved.Value("CONFIG_LLD_MAJOR"); got != "22" {
+		t.Fatalf("CONFIG_LLD_MAJOR = %q, want 22", got)
+	}
+	if got := resolved.Value("CONFIG_PAHOLE_VERSION"); got != "0" {
+		t.Fatalf("CONFIG_PAHOLE_VERSION = %q, want 0", got)
+	}
+	if got := resolved.Value("CONFIG_BINDGEN_VERSION_TEXT"); got != "\"\"" {
+		t.Fatalf("CONFIG_BINDGEN_VERSION_TEXT = %q, want quoted empty string", got)
+	}
+}
+
+func TestLinuxProbeShellSupportsValueOverrides(t *testing.T) {
+	config, err := LinuxProbeConfigForModel(LinuxProbeModelLLVM)
+	if err != nil {
+		t.Fatalf("LinuxProbeConfigForModel() failed: %v", err)
+	}
+	for key, value := range map[string]string{
+		"bindgen_version": "bindgen 0.71.1",
+		"ld_version":      "210000",
+		"pahole_version":  "124",
+		"rust_available":  "yes",
+	} {
+		if err := ApplyLinuxProbeValue(&config, key, value); err != nil {
+			t.Fatalf("ApplyLinuxProbeValue(%q, %q) failed: %v", key, value, err)
+		}
+	}
+
+	shell := LinuxProbeShellFromConfig(config)
+	for _, test := range []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{
+			name:    "linker version",
+			command: "/src/scripts/ld-version.sh ld.lld",
+			want:    "LLD 210000",
+		},
+		{
+			name:    "pahole version",
+			command: "/src/scripts/pahole-version.sh pahole",
+			want:    "124",
+		},
+		{
+			name:    "bindgen version",
+			command: "bindgen --version workaround-for-0.69.0 2>/dev/null",
+			want:    "bindgen 0.71.1",
+		},
+		{
+			name:    "rust availability",
+			command: `{ /src/scripts/rust_is_available.sh rustc; } >/dev/null 2>&1 && echo "y" || echo "n"`,
+			want:    "y",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := shell(context.Background(), test.command)
+			if err != nil {
+				t.Fatalf("shell(%q) failed: %v", test.command, err)
+			}
+			if got != test.want {
+				t.Fatalf("shell(%q) = %q, want %q", test.command, got, test.want)
+			}
+		})
+	}
+}

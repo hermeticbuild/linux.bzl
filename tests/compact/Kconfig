@@ -1,0 +1,25 @@
+mainmenu "Compact generator fixture"
+
+config MODULES
+	tristate "Modules"
+	modules
+
+config NET
+	tristate "Networking"
+
+config DEBUG
+	bool "Debug"
+
+config FORCE_NET
+	bool "Force networking"
+	select NET
+
+config PCI
+	bool "PCI"
+
+config DRIVER
+	tristate "Driver"
+	depends on NET && PCI
+
+config EXTRA_CFLAGS
+	bool "Extra compiler flags"

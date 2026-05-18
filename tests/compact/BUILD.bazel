@@ -1,0 +1,40 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("//internal:compact_generator.bzl", "linux_compact_buildfiles")
+
+package(default_visibility = ["//:__subpackages__"])
+
+linux_compact_buildfiles(
+    name = "golden",
+    configs = {
+        "base.config": "base",
+        "blocked_driver.config": "blocked_driver",
+        "debug.config": "debug",
+        "force_net.config": "force_net",
+    },
+    kbuild = "Kbuild",
+    linux_objects_load = "@linux.bzl//internal:linux_objects.bzl",
+    object_label_package = "tests/compact/objects",
+    out_buildfile = "expected.BUILD.bazel",
+    out_metadata = "expected.metadata.golden",
+    root = "Kconfig",
+    workspace_path_prefix = ".registry/linux.bzl",
+)
+
+genrule(
+    name = "shared_object_variant_check",
+    srcs = [":golden_metadata"],
+    outs = ["shared_object_variant_check.txt"],
+    cmd = "$(location //internal/cmd/compact_metadata_check) " +
+          "-metadata $(location :golden_metadata) " +
+          "-share base:blocked_driver:init.o " +
+          "-share base:debug:init.o " +
+          "-differ base:force_net:init.o " +
+          "-absent base:debug.o " +
+          "-present debug:debug.o > $@",
+    tools = ["//internal/cmd/compact_metadata_check"],
+)
+
+build_test(
+    name = "shared_object_variant_check_test",
+    targets = [":shared_object_variant_check"],
+)

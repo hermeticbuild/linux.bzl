@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "emptyrootdtb_lib",
+    srcs = ["main.go"],
+    importpath = "linux.bzl/internal/cmd/emptyrootdtb",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "emptyrootdtb",
+    embed = [":emptyrootdtb_lib"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "emptyrootdtb_test",
+    srcs = ["main_test.go"],
+    embed = [":emptyrootdtb_lib"],
+)

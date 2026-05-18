@@ -1,0 +1,42 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "kconfig",
+    srcs = [
+        "buildmerge.go",
+        "compact.go",
+        "config.go",
+        "dump.go",
+        "expr.go",
+        "expr_dnf.go",
+        "kbuild.go",
+        "parser.go",
+        "preprocess.go",
+        "probe.go",
+        "token.go",
+        "types.go",
+        "util.go",
+    ],
+    importpath = "linux.bzl/internal/kconfig",
+    visibility = ["//internal:__subpackages__"],
+    deps = [
+        "//internal/kconfig/buildgen",
+        "@com_github_bazelbuild_buildtools//build",
+    ],
+)
+
+go_test(
+    name = "kconfig_test",
+    srcs = [
+        "compact_test.go",
+        "config_test.go",
+        "kbuild_test.go",
+        "parser_test.go",
+        "preprocess_test.go",
+        "probe_test.go",
+        "test_helpers_test.go",
+    ],
+    data = glob(["testdata/**"]),
+    embed = [":kconfig"],
+    deps = ["@com_github_bazelbuild_buildtools//build"],
+)

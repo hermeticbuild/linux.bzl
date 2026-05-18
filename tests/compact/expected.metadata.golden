@@ -1,0 +1,102 @@
+{
+  "configs": [
+    {
+      "name": "base",
+      "image_target": "base_image",
+      "object_targets": ["init__fd3944586c4e3607"]
+    },
+    {
+      "name": "blocked_driver",
+      "image_target": "blocked_driver_image",
+      "object_targets": ["init__fd3944586c4e3607"]
+    },
+    {
+      "name": "debug",
+      "image_target": "debug_image",
+      "object_targets": ["init__fd3944586c4e3607", "debug__9bd2624514a26c6b"]
+    },
+    {
+      "name": "force_net",
+      "image_target": "force_net_image",
+      "object_targets": [
+        "init__968eb52a1c2b2ece",
+        "net_core__9ca35c553b7abeb1",
+        "drivers_foo__4471a80948c8d811"
+      ]
+    }
+  ],
+  "object_packages": [
+    {
+      "package": "",
+      "object_targets": [
+        "debug__9bd2624514a26c6b",
+        "init__968eb52a1c2b2ece",
+        "init__fd3944586c4e3607"
+      ]
+    },
+    {
+      "package": "drivers",
+      "object_targets": ["drivers_foo__4471a80948c8d811"]
+    },
+    {
+      "package": "net",
+      "object_targets": ["net_core__9ca35c553b7abeb1"]
+    }
+  ],
+  "object_variants": [
+    {
+      "target": "debug__9bd2624514a26c6b",
+      "object": "debug.o",
+      "mode": "y",
+      "flags": ["-Wall"],
+      "config_fragment": {
+        "CONFIG_DEBUG": "y",
+        "CONFIG_EXTRA_CFLAGS": "n",
+        "CONFIG_NET": "n"
+      }
+    },
+    {
+      "target": "drivers_foo__4471a80948c8d811",
+      "package": "drivers",
+      "object": "drivers/foo.o",
+      "mode": "y",
+      "flags": ["-Wall", "-DNET=y"],
+      "config_fragment": {
+        "CONFIG_DRIVER": "y",
+        "CONFIG_EXTRA_CFLAGS": "n",
+        "CONFIG_NET": "y"
+      }
+    },
+    {
+      "target": "init__968eb52a1c2b2ece",
+      "object": "init.o",
+      "mode": "y",
+      "flags": ["-Wall", "-DNET=y"],
+      "config_fragment": {
+        "CONFIG_EXTRA_CFLAGS": "n",
+        "CONFIG_NET": "y"
+      }
+    },
+    {
+      "target": "init__fd3944586c4e3607",
+      "object": "init.o",
+      "mode": "y",
+      "flags": ["-Wall"],
+      "config_fragment": {
+        "CONFIG_EXTRA_CFLAGS": "n",
+        "CONFIG_NET": "n"
+      }
+    },
+    {
+      "target": "net_core__9ca35c553b7abeb1",
+      "package": "net",
+      "object": "net/core.o",
+      "mode": "y",
+      "flags": ["-Wall", "-DNET=y", "-DNET_CORE"],
+      "config_fragment": {
+        "CONFIG_EXTRA_CFLAGS": "n",
+        "CONFIG_NET": "y"
+      }
+    }
+  ]
+}

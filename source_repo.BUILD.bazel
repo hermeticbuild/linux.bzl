@@ -1,0 +1,103 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@rules_devicetree//devicetree:devicetree_library.bzl", "devicetree_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Kbuild",
+    "Kconfig",
+    "Makefile",
+    "init/Makefile",
+])
+
+filegroup(
+    name = "all",
+    srcs = glob(["**"]),
+)
+
+filegroup(
+    name = "headers",
+    srcs = glob([
+        "include/**/*.h",
+        "arch/*/include/**/*.h",
+    ]),
+)
+
+cc_library(
+    name = "linux_headers_cc",
+    hdrs = glob([
+        "include/**/*.h",
+        "arch/*/include/**/*.h",
+    ]),
+    includes = [
+        "include",
+        "arch/arm/include",
+        "arch/arm64/include",
+        "arch/mips/include",
+        "arch/riscv/include",
+        "arch/x86/include",
+    ],
+)
+
+cc_library(
+    name = "scripts_headers_cc",
+    hdrs = glob(["scripts/include/**/*.h"]),
+    includes = ["scripts/include"],
+)
+
+cc_library(
+    name = "tools_headers_cc",
+    hdrs = glob([
+        "arch/x86/tools/**/*.h",
+        "tools/arch/x86/include/**/*.h",
+        "tools/include/**/*.h",
+        "tools/lib/**/*.h",
+        "tools/objtool/**/*.h",
+    ]),
+    includes = [
+        "arch/x86/tools",
+        "tools/arch/x86/include",
+        "tools/arch/x86/include/uapi",
+        "tools/include",
+        "tools/include/uapi",
+        "tools/lib",
+        "tools/objtool/arch/x86/include",
+        "tools/objtool/include",
+    ],
+)
+
+filegroup(
+    name = "x86_syscall_32_tbl",
+    srcs = ["arch/x86/entry/syscalls/syscall_32.tbl"],
+)
+
+filegroup(
+    name = "x86_syscall_64_tbl",
+    srcs = ["arch/x86/entry/syscalls/syscall_64.tbl"],
+)
+
+cc_binary(
+    name = "gen_init_cpio",
+    srcs = ["usr/gen_init_cpio.c"],
+)
+
+[
+    devicetree_library(
+        name = "dts_includes_%s" % arch,
+        hdrs = glob([
+            "arch/%s/boot/dts/**/*.dtsi" % arch,
+            "include/dt-bindings/**/*.h",
+        ]),
+        includes = [
+            "arch/%s/boot/dts" % arch,
+            "include",
+        ],
+    )
+    for arch in [
+        "arm",
+        "arm64",
+        "mips",
+        "riscv",
+        "x86",
+    ]
+]

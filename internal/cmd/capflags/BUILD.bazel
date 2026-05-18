@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "capflags_lib",
+    srcs = ["main.go"],
+    importpath = "linux.bzl/internal/cmd/capflags",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "capflags",
+    embed = [":capflags_lib"],
+    visibility = ["//:__subpackages__"],
+)

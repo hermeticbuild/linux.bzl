@@ -1,0 +1,69 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load(
+    "//internal:linux_objects.bzl",
+    "linux_archive",
+    "linux_config",
+    "linux_object",
+    "linux_source_tree",
+)
+
+package(default_visibility = ["//:__subpackages__"])
+
+linux_config(
+    name = "fixture_config",
+    config_flags = {
+        "CONFIG_FIXTURE": "y",
+        "CONFIG_FIXTURE_MODULE": "m",
+        "CONFIG_FIXTURE_VALUE": "7",
+        "CONFIG_LOCALVERSION": "\"-native\"",
+    },
+    version = "6.18.2",
+)
+
+linux_source_tree(
+    name = "fixture_source_tree",
+    srcs = ["fixture.c"] + glob(["source/**"]),
+    root = "source/Kconfig",
+)
+
+linux_object(
+    name = "fixture_object",
+    src = "fixture.c",
+    config = ":fixture_config",
+    flags = [
+        "-Werror",
+        "-Wall",
+    ],
+    mode = "y",
+    object = "fixture.o",
+    source_tree_info = ":fixture_source_tree",
+)
+
+linux_object(
+    name = "fixture_module_object",
+    src = "fixture.c",
+    config = ":fixture_config",
+    flags = [
+        "-DEXPECT_MODULE",
+        "-Werror",
+        "-Wall",
+    ],
+    mode = "m",
+    object = "fixture_module.o",
+    source_tree_info = ":fixture_source_tree",
+)
+
+linux_archive(
+    name = "fixture_archive",
+    objects = [":fixture_object"],
+)
+
+build_test(
+    name = "fixture_compile_build_test",
+    targets = [
+        ":fixture_archive",
+        ":fixture_config",
+        ":fixture_module_object",
+        ":fixture_object",
+    ],
+)

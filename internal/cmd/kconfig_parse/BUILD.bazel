@@ -1,0 +1,22 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "kconfig_parse_lib",
+    srcs = ["main.go"],
+    importpath = "linux.bzl/internal/cmd/kconfig_parse",
+    visibility = ["//visibility:private"],
+    deps = ["//internal/kconfig"],
+)
+
+go_binary(
+    name = "kconfig_parse",
+    embed = [":kconfig_parse_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "kconfig_parse_test",
+    srcs = ["main_test.go"],
+    embed = [":kconfig_parse_lib"],
+    deps = ["//internal/kconfig"],
+)

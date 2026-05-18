@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "buildgen",
+    srcs = ["buildgen.go"],
+    importpath = "linux.bzl/internal/kconfig/buildgen",
+    visibility = ["//internal:__subpackages__"],
+    deps = [
+        "@com_github_bazelbuild_buildtools//build",
+        "@gazelle//rule",
+    ],
+)
+
+go_test(
+    name = "buildgen_test",
+    srcs = ["buildgen_test.go"],
+    embed = [":buildgen"],
+)

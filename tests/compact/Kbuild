@@ -1,0 +1,9 @@
+obj-y += init.o
+obj-$(CONFIG_NET) += net/core.o
+obj-$(CONFIG_DEBUG) += debug.o
+obj-$(CONFIG_DRIVER) += drivers/foo.o
+
+ccflags-y += -Wall
+ccflags-$(CONFIG_NET) += -DNET=$(CONFIG_NET)
+ccflags-$(CONFIG_EXTRA_CFLAGS) += -DEXTRA
+CFLAGS_net/core.o += -DNET_CORE

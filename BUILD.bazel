@@ -1,0 +1,24 @@
+load("@buildifier_prebuilt//:rules.bzl", "buildifier", "buildifier_test")
+
+package(default_visibility = ["//visibility:public"])
+
+buildifier(
+    name = "buildifier",
+    lint_mode = "fix",
+    mode = "fix",
+)
+
+buildifier_test(
+    name = "buildifier_test",
+    lint_mode = "warn",
+    lint_warnings = [
+        "-module-docstring",
+        "-function-docstring-args",
+        "-function-docstring",
+        "-function-docstring-header",
+        "-function-docstring-return",
+    ],
+    no_sandbox = True,
+    tags = ["no-remote"],
+    workspace = "//:MODULE.bazel",
+)

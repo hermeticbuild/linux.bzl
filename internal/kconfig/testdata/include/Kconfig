@@ -1,0 +1,4 @@
+source "Kconfig.child"
+
+config ROOT
+	bool "Root"

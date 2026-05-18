@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "oidregistry_lib",
+    srcs = ["main.go"],
+    importpath = "linux.bzl/internal/cmd/oidregistry",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "oidregistry",
+    embed = [":oidregistry_lib"],
+    visibility = ["//:__subpackages__"],
+)

@@ -1,0 +1,42 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+load("//internal:kconfig.bzl", "kconfig_import", "kconfig_overlay")
+
+package(default_visibility = ["//:__subpackages__"])
+
+base = kconfig_import(
+    name = "base",
+    config = "base.config",
+    config_flags = {
+        "CONFIG_EMPTY": "\"old\"",
+        "CONFIG_KEEP": "m",
+        "CONFIG_REMOVE": "y",
+        "CONFIG_SET_TO_N": "y",
+    },
+    update = False,
+)
+
+kconfig_overlay(
+    name = "overlay",
+    base = base.label,
+    set = {
+        "CONFIG_EMPTY": "",
+        "CONFIG_NEW": "\"value\"",
+        "CONFIG_SET_TO_N": "n",
+    },
+    unset = [
+        "CONFIG_ABSENT",
+        "CONFIG_REMOVE",
+    ],
+)
+
+diff_test(
+    name = "overlay_golden_test",
+    file1 = ":overlay",
+    file2 = "expected.config",
+)
+
+build_test(
+    name = "overlay_build_test",
+    targets = [":overlay"],
+)

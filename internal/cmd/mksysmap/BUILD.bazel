@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "mksysmap_lib",
+    srcs = ["main.go"],
+    importpath = "linux.bzl/internal/cmd/mksysmap",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "mksysmap",
+    embed = [":mksysmap_lib"],
+    visibility = ["//:__subpackages__"],
+)
