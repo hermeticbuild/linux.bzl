@@ -339,6 +339,7 @@ func main() {
 				objectPkg = inferLabelPackage(*objectBuildfileOut)
 			}
 			data, err := metadata.ImageBuildFile(kconfig.CompactImageBuildFileOptions{
+				Arch:               vars["ARCH"],
 				Visibility:         []string(visibility),
 				ObjectLabelPackage: objectPkg,
 				RequireReal:        *sourceConfig != "",
@@ -376,6 +377,7 @@ func main() {
 				objectPkg = inferLabelPackage(*compactBuildfileOut)
 			}
 			imageBuild, err := metadata.ImageBuildFile(kconfig.CompactImageBuildFileOptions{
+				Arch:               vars["ARCH"],
 				Visibility:         []string(visibility),
 				ObjectLabelPackage: objectPkg,
 				RequireReal:        *sourceConfig != "",

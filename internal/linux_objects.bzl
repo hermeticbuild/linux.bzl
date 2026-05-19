@@ -139,6 +139,25 @@ def _cc_compile_flags(ctx, cc_toolchain, feature_configuration):
         variables = variables,
     )
 
+def _linux_platform_transition_impl(_, attr):
+    arch = getattr(attr, "arch", "")
+    if arch == "arm64":
+        platform = "@llvm//platforms:linux_arm64_musl"
+    elif arch == "x86":
+        platform = "@llvm//platforms:linux_x86_64_musl"
+    else:
+        fail("unsupported Linux rule arch for platform transition: %s" % arch)
+    return {"//command_line_option:platforms": platform}
+
+_linux_platform_transition = transition(
+    implementation = _linux_platform_transition_impl,
+    inputs = [],
+    outputs = ["//command_line_option:platforms"],
+)
+
+def _linux_platform_transition_allowlist_attr():
+    return attr.label(default = "@bazel_tools//tools/allowlists/function_transition_allowlist")
+
 def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
     flags = _cc_compile_flags(ctx, cc_toolchain, feature_configuration)
     out = []
@@ -226,11 +245,13 @@ def _linux_cc_context_impl(ctx):
 linux_cc_context = rule(
     implementation = _linux_cc_context_impl,
     attrs = {
+        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "x86"),
         "image_format": attr.string(default = "bzImage"),
         "srcarch": attr.string(default = "x86"),
         "target_triple": attr.string(),
     },
+    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Rules_cc-backed Linux toolchain context metadata.",
@@ -2039,6 +2060,8 @@ def _linux_x86_generated_headers_impl(ctx):
 linux_x86_generated_headers = rule(
     implementation = _linux_x86_generated_headers_impl,
     attrs = {
+        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
+        "arch": attr.string(default = "x86"),
         "asm_offsets_c": attr.label(allow_single_file = True, mandatory = True),
         "bounds_c": attr.label(allow_single_file = True, mandatory = True),
         "config": attr.label(providers = [LinuxConfigInfo], mandatory = True),
@@ -2092,6 +2115,7 @@ linux_x86_generated_headers = rule(
             executable = True,
         ),
     },
+    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Generates the x86 header subset normally produced before compiling Linux C objects.",
@@ -2377,6 +2401,8 @@ def _linux_arm64_generated_headers_impl(ctx):
 linux_arm64_generated_headers = rule(
     implementation = _linux_arm64_generated_headers_impl,
     attrs = {
+        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
+        "arch": attr.string(default = "arm64"),
         "asm_offsets_c": attr.label(allow_single_file = True, mandatory = True),
         "bounds_c": attr.label(allow_single_file = True, mandatory = True),
         "config": attr.label(providers = [LinuxConfigInfo], mandatory = True),
@@ -2436,6 +2462,7 @@ linux_arm64_generated_headers = rule(
             executable = True,
         ),
     },
+    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Generates the arm64 header subset normally produced before compiling Linux C objects.",
@@ -3029,7 +3056,8 @@ def _linux_real_object_impl(ctx):
 linux_object = rule(
     implementation = _linux_object_impl,
     attrs = {
-        "arch": attr.string(),
+        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
+        "arch": attr.string(default = "x86"),
         "config_fragment": attr.string_dict(),
         "config": attr.label(providers = [LinuxConfigInfo]),
         "deps": attr.label_list(providers = [LinuxObjectInfo]),
@@ -3135,6 +3163,7 @@ linux_object = rule(
             executable = True,
         ),
     },
+    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain() + [_PERL_TOOLCHAIN],
     doc = "Placeholder for one Linux object variant keyed by a reduced Kconfig fragment.",
@@ -3215,11 +3244,14 @@ def _linux_real_composite_object_impl(ctx, object_infos):
 linux_composite_object = rule(
     implementation = _linux_composite_object_impl,
     attrs = {
+        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
+        "arch": attr.string(default = "x86"),
         "config_fragment": attr.string_dict(),
         "mode": attr.string(values = ["y", "m"], mandatory = True),
         "object": attr.string(mandatory = True),
         "objects": attr.label_list(providers = [LinuxObjectInfo], mandatory = True),
     },
+    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Links Kbuild composite object members into one relocatable object.",
@@ -3392,6 +3424,7 @@ def _linux_arm64_nvhe_object_impl(ctx):
 linux_arm64_nvhe_object = rule(
     implementation = _linux_arm64_nvhe_object_impl,
     attrs = {
+        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "arm64"),
         "config_fragment": attr.string_dict(),
         "config": attr.label(providers = [LinuxConfigInfo]),
@@ -3416,6 +3449,7 @@ linux_arm64_nvhe_object = rule(
             executable = True,
         ),
     },
+    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Builds the arm64 nVHE KVM custom composite object with hyp relocations.",
@@ -3505,6 +3539,8 @@ def _linux_real_archive_impl(ctx, object_infos):
 linux_archive = rule(
     implementation = _linux_archive_impl,
     attrs = {
+        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
+        "arch": attr.string(default = "x86"),
         "kind": attr.string(
             default = "built-in.a",
             values = [
@@ -3515,6 +3551,7 @@ linux_archive = rule(
         ),
         "objects": attr.label_list(providers = [LinuxObjectInfo]),
     },
+    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Placeholder native archive action for built-in.a, lib.a, or module object groups.",
@@ -3591,9 +3628,12 @@ def _linux_real_compact_image_impl(ctx, object_infos):
 linux_compact_image = rule(
     implementation = _linux_compact_image_impl,
     attrs = {
+        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
+        "arch": attr.string(default = "x86"),
         "objects": attr.label_list(providers = [LinuxObjectInfo]),
         "require_real": attr.bool(),
     },
+    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Links compact Linux object variants into one relocatable image object when all inputs are real.",
@@ -3941,7 +3981,8 @@ def _linux_vmlinux_impl(ctx):
 linux_vmlinux = rule(
     implementation = _linux_vmlinux_impl,
     attrs = {
-        "arch": attr.string(),
+        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
+        "arch": attr.string(default = "x86"),
         "archives": attr.label_list(providers = [LinuxArchiveInfo]),
         "config": attr.label(providers = [LinuxConfigInfo]),
         "format": attr.string(
@@ -3987,6 +4028,7 @@ linux_vmlinux = rule(
             executable = True,
         ),
     },
+    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Links a native vmlinux ELF when image is set, otherwise emits placeholder metadata.",
@@ -4783,7 +4825,8 @@ def _linux_real_objcopy_image_impl(ctx, objcopy_flags):
 linux_compressed_image = rule(
     implementation = _linux_packaged_output_impl,
     attrs = {
-        "arch": attr.string(),
+        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
+        "arch": attr.string(default = "x86"),
         "config": attr.label(providers = [LinuxConfigInfo]),
         "extension": attr.string(default = "image"),
         "format": attr.string(
@@ -4826,6 +4869,7 @@ linux_compressed_image = rule(
             executable = True,
         ),
     },
+    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Placeholder native compressed kernel image action.",

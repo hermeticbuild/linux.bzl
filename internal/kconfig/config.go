@@ -210,19 +210,38 @@ type configResolver struct {
 
 func (t *Tree) choiceSymbols() []*Symbol {
 	var choices []*Symbol
-	var walk func(*Menu)
-	walk = func(menu *Menu) {
+	seen := map[*Symbol]bool{}
+	var walkMenus func(*Menu)
+	walkMenus = func(menu *Menu) {
 		if menu == nil {
 			return
 		}
-		if menu.Type == MenuChoice && menu.Symbol != nil {
+		if menu.Symbol != nil && len(menu.Symbol.ChoiceMembers) != 0 && !seen[menu.Symbol] {
 			choices = append(choices, menu.Symbol)
+			seen[menu.Symbol] = true
 		}
 		for _, child := range menu.Children {
-			walk(child)
+			walkMenus(child)
 		}
 	}
-	walk(t.Root)
+	walkMenus(t.Root)
+	for _, sym := range t.Symbols {
+		if len(sym.ChoiceMembers) == 0 || seen[sym] {
+			continue
+		}
+		choices = append(choices, sym)
+		seen[sym] = true
+	}
+	for _, sym := range t.definedSymbols() {
+		if sym.Choice == nil || len(sym.Choice.ChoiceMembers) == 0 || seen[sym.Choice] {
+			continue
+		}
+		choices = append(choices, sym.Choice)
+		seen[sym.Choice] = true
+	}
+	sort.SliceStable(choices, func(i, j int) bool {
+		return choices[i].Name < choices[j].Name
+	})
 	return choices
 }
 
@@ -255,10 +274,19 @@ func (r *configResolver) baseTri(sym *Symbol) triValue {
 			return minResolvedTri(r.rawTri[sym], visible)
 		}
 	}
-	if r.allNoConfig {
+	if r.allNoConfig && r.promptedSymbol(sym) {
 		return triN
 	}
 	return r.defaultTri(sym)
+}
+
+func (r *configResolver) promptedSymbol(sym *Symbol) bool {
+	for _, menu := range sym.Menus {
+		if menu.Prompt != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *configResolver) visibleUserValue(sym *Symbol) bool {
@@ -292,7 +320,7 @@ func (r *configResolver) applyChoiceSemantics(choices []*Symbol) bool {
 func (r *configResolver) choiceSelection(choice *Symbol) *Symbol {
 	visible := map[*Symbol]bool{}
 	for _, member := range choice.ChoiceMembers {
-		if r.promptVisibility(member) != triN {
+		if r.choiceMemberVisible(member) {
 			visible[member] = true
 		}
 	}
@@ -310,10 +338,6 @@ func (r *configResolver) choiceSelection(choice *Symbol) *Symbol {
 		return def
 	}
 
-	if r.allNoConfig {
-		return nil
-	}
-
 	for _, member := range choice.ChoiceMembers {
 		if visible[member] && !r.rawSet[member] {
 			return member
@@ -329,6 +353,13 @@ func (r *configResolver) choiceSelection(choice *Symbol) *Symbol {
 	return nil
 }
 
+func (r *configResolver) choiceMemberVisible(member *Symbol) bool {
+	if member == nil {
+		return false
+	}
+	return r.evalDepExprDefault(member.DirDep, triY) != triN
+}
+
 func (r *configResolver) choiceDefault(choice *Symbol, visible map[*Symbol]bool) *Symbol {
 	for _, prop := range choice.Properties {
 		if prop.Type != PropertyDefault {
@@ -338,11 +369,14 @@ func (r *configResolver) choiceDefault(choice *Symbol, visible map[*Symbol]bool)
 			continue
 		}
 		member := choiceDefaultMember(prop.Expr)
-		if member == nil || !visible[member] {
+		if member == nil {
 			continue
 		}
 		if r.rawSet[member] && r.rawTri[member] == triN {
-			return nil
+			continue
+		}
+		if !visible[member] {
+			continue
 		}
 		return member
 	}

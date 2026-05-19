@@ -78,16 +78,20 @@ config SELECTOR
 
 config SELECTED
 	bool "Selected"
+
+config HIDDEN_DEFAULT
+	def_bool y
 `
 	resolved := mustResolveConfigWithOptions(t, fixture, nil, ResolveConfigOptions{
 		AllNoConfig: true,
 	})
 	wantConfigValues(t, resolved, map[string]string{
-		"CONFIG_DEFAULT_ON":  "n",
-		"CONFIG_DEP_DEFAULT": "n",
-		"CONFIG_GATE":        "n",
-		"CONFIG_SELECTED":    "n",
-		"CONFIG_SELECTOR":    "n",
+		"CONFIG_DEFAULT_ON":     "n",
+		"CONFIG_DEP_DEFAULT":    "n",
+		"CONFIG_GATE":           "n",
+		"CONFIG_HIDDEN_DEFAULT": "y",
+		"CONFIG_SELECTED":       "n",
+		"CONFIG_SELECTOR":       "n",
 	})
 
 	explicit := mustResolveConfigWithOptions(t, fixture, map[string]string{
@@ -96,11 +100,12 @@ config SELECTED
 		AllNoConfig: true,
 	})
 	wantConfigValues(t, explicit, map[string]string{
-		"CONFIG_DEFAULT_ON":  "n",
-		"CONFIG_DEP_DEFAULT": "n",
-		"CONFIG_GATE":        "n",
-		"CONFIG_SELECTED":    "y",
-		"CONFIG_SELECTOR":    "y",
+		"CONFIG_DEFAULT_ON":     "n",
+		"CONFIG_DEP_DEFAULT":    "n",
+		"CONFIG_GATE":           "n",
+		"CONFIG_HIDDEN_DEFAULT": "y",
+		"CONFIG_SELECTED":       "y",
+		"CONFIG_SELECTOR":       "y",
 	})
 }
 
@@ -707,6 +712,79 @@ endchoice
 	wantConfigValues(t, explicit, map[string]string{
 		"CONFIG_MODE_A": "y",
 		"CONFIG_MODE_B": "n",
+	})
+}
+
+func TestResolveConfigAllNoConfigFallsBackToVisibleChoiceMember(t *testing.T) {
+	fixture := `
+mainmenu "Test"
+
+config GATE
+	bool
+	default y
+
+choice
+	prompt "Mode"
+	default MODE_A
+
+config MODE_A
+	bool "Mode A"
+	depends on !GATE
+
+config MODE_B
+	bool "Mode B"
+	depends on GATE
+
+endchoice
+
+config MODE_VALUE
+	int
+	default 1 if MODE_A
+	default 2 if MODE_B
+`
+	resolved := mustResolveConfigWithOptions(t, fixture, nil, ResolveConfigOptions{
+		AllNoConfig: true,
+	})
+	wantConfigValues(t, resolved, map[string]string{
+		"CONFIG_GATE":       "y",
+		"CONFIG_MODE_A":     "n",
+		"CONFIG_MODE_B":     "y",
+		"CONFIG_MODE_VALUE": "2",
+	})
+}
+
+func TestResolveConfigPromptlessChoiceUsesFirstVisibleMember(t *testing.T) {
+	fixture := `
+mainmenu "Test"
+
+config HAVE_MODE_A
+	bool
+	default y
+
+choice
+
+config MODE_A
+	bool "Mode A"
+	depends on HAVE_MODE_A
+
+config MODE_B
+	bool "Mode B"
+
+endchoice
+
+config MODE_VALUE
+	int
+	default 1 if MODE_A
+	default 2 if MODE_B
+`
+	resolved := mustResolveConfigWithOptions(t, fixture, nil, ResolveConfigOptions{
+		AllNoConfig: true,
+	})
+	wantConfigValues(t, resolved, map[string]string{
+		"CONFIG_HAVE_MODE_A": "y",
+		"CONFIG_MODE_A":      "y",
+		"CONFIG_MODE_B":      "n",
+		"CONFIG_MODE_VALUE":  "1",
 	})
 }
 

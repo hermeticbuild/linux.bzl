@@ -69,6 +69,7 @@ type CompactBuildFileOptions struct {
 }
 
 type CompactImageBuildFileOptions struct {
+	Arch               string
 	Visibility         []string
 	ObjectLabelPackage string
 	RequireReal        bool
@@ -1065,6 +1066,9 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 			r.SetAttr("mode", variant.Mode)
 			r.SetAttr("tags", []string{"manual"})
 			r.SetAttr("objects", localLabels(variant.Members))
+			if opts.Arch != "" {
+				r.SetAttr("arch", opts.Arch)
+			}
 			if len(variant.ConfigFragment) != 0 {
 				r.SetAttr("config_fragment", variant.ConfigFragment)
 			}
@@ -1081,10 +1085,10 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 		r.SetAttr("object", variant.Object)
 		r.SetAttr("mode", variant.Mode)
 		r.SetAttr("tags", []string{"manual"})
+		if opts.Arch != "" {
+			r.SetAttr("arch", opts.Arch)
+		}
 		if emitSource {
-			if opts.Arch != "" {
-				r.SetAttr("arch", opts.Arch)
-			}
 			r.SetAttr("src", labelForSource(opts, variant.Source))
 			if opts.SourceConfig != "" {
 				r.SetAttr("config", opts.SourceConfig)
@@ -1285,6 +1289,9 @@ func (m *CompactMetadata) ImageBuildFile(opts CompactImageBuildFileOptions) ([]b
 			labels[i] = labelFor(opts.ObjectLabelPackage, target)
 		}
 		r := file.AddRule("linux_compact_image", config.ImageTarget)
+		if opts.Arch != "" {
+			r.SetAttr("arch", opts.Arch)
+		}
 		r.SetAttr("objects", labels)
 		r.SetAttr("tags", []string{"manual"})
 		if opts.RequireReal {
