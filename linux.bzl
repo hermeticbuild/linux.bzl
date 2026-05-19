@@ -122,7 +122,7 @@ def _linux_kernel_impl(module_ctx):
 
     if kconfigs and kconfig_tool == None:
         kconfig_tool_repository(name = _KCONFIG_TOOL_REPO)
-        kconfig_tool = Label("@%s//:kconfig" % _KCONFIG_TOOL_REPO)
+        kconfig_tool = "@%s//:kconfig" % _KCONFIG_TOOL_REPO
 
     for repo in sorted(kconfigs.keys()):
         kconfig = kconfigs[repo]

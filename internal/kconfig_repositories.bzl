@@ -36,8 +36,8 @@ def _kconfig_tool_repository_impl(rctx):
     release = KCONFIG_TOOL_RELEASES.get(platform)
     if not release:
         fail("no kconfig tool prebuilt metadata for host platform %s" % platform)
-    if not release.integrity and not release.sha256:
-        fail("kconfig tool prebuilt metadata for %s is missing an integrity or sha256 value; update //internal:kconfig_tool_releases.bzl after publishing kconfig %s prebuilts" % (
+    if not release.integrity:
+        fail("kconfig tool prebuilt metadata for %s is missing an integrity value; update //internal:kconfig_tool_releases.bzl after publishing kconfig %s prebuilts" % (
             platform,
             KCONFIG_TOOL_VERSION,
         ))
@@ -46,10 +46,7 @@ def _kconfig_tool_repository_impl(rctx):
         "output": ".",
         "url": release.urls,
     }
-    if release.integrity:
-        download_kwargs["integrity"] = release.integrity
-    if release.sha256:
-        download_kwargs["sha256"] = release.sha256
+    download_kwargs["integrity"] = release.integrity
     rctx.download_and_extract(**download_kwargs)
 
     tool = _tool_filename(platform)
