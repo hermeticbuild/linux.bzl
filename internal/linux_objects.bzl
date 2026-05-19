@@ -2840,6 +2840,8 @@ def _linux_real_object_impl(ctx):
 
     generated_headers = ctx.attr.generated_headers[LinuxGeneratedHeadersInfo] if ctx.attr.generated_headers else None
     source_root = source_root_file.dirname if source_root_file else ""
+    if source_root:
+        make_values["srctree"] = source_root
     if _is_dtb_source(ctx.file.src):
         if not source_root:
             fail("linux_object %s builds a devicetree blob and requires source_root" % ctx.label)

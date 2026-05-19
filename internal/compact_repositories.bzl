@@ -4,8 +4,10 @@ def _run_compact_generator(rctx):
     root = rctx.path(rctx.attr.root)
     config = rctx.path(rctx.attr.config)
     kbuild = rctx.path(rctx.attr.kbuild)
+    kconfig_parse_tool = rctx.path(rctx.attr.kconfig_parse_tool)
     rctx.watch(config)
     rctx.watch(kbuild)
+    rctx.watch(kconfig_parse_tool)
     rctx.watch(root)
     source_root = root.dirname
     output_build = rctx.path("BUILD.bazel")
@@ -14,7 +16,7 @@ def _run_compact_generator(rctx):
     _configure_probe_env(rctx.attr.allow_shell, env)
 
     args = [
-        str(rctx.path(rctx.attr.kconfig_parse_tool)),
+        str(kconfig_parse_tool),
         "-root",
         str(root),
         "-srctree",

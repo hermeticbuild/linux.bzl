@@ -675,7 +675,7 @@ endchoice
 	})
 }
 
-func TestResolveConfigAllNoConfigDoesNotSelectChoiceDefault(t *testing.T) {
+func TestResolveConfigAllNoConfigUsesChoiceDefault(t *testing.T) {
 	fixture := `
 mainmenu "Test"
 
@@ -696,7 +696,7 @@ endchoice
 	})
 	wantConfigValues(t, resolved, map[string]string{
 		"CONFIG_MODE_A": "n",
-		"CONFIG_MODE_B": "n",
+		"CONFIG_MODE_B": "y",
 	})
 
 	explicit := mustResolveConfigWithOptions(t, fixture, map[string]string{

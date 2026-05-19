@@ -1194,7 +1194,7 @@ func (v CompactObjectVariant) sourceBuildReady() bool {
 	}
 	for _, flag := range v.Flags {
 		for _, ref := range makeVariableRefs(flag) {
-			if ref == "obj" || ref == "src" {
+			if ref == "obj" || ref == "src" || ref == "srctree" {
 				continue
 			}
 			if knownEmptyKbuildMakeRef(ref) {
@@ -1207,7 +1207,7 @@ func (v CompactObjectVariant) sourceBuildReady() bool {
 	}
 	for _, flag := range v.RemoveFlags {
 		for _, ref := range makeVariableRefs(flag) {
-			if ref == "obj" || ref == "src" {
+			if ref == "obj" || ref == "src" || ref == "srctree" {
 				continue
 			}
 			if knownEmptyKbuildMakeRef(ref) {

@@ -306,11 +306,12 @@ func (r *configResolver) choiceSelection(choice *Symbol) *Symbol {
 		}
 	}
 
-	if r.allNoConfig {
-		return nil
-	}
 	if def := r.choiceDefault(choice, visible); def != nil {
 		return def
+	}
+
+	if r.allNoConfig {
+		return nil
 	}
 
 	for _, member := range choice.ChoiceMembers {
