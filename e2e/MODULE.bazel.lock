@@ -242,7 +242,7 @@
   "moduleExtensions": {
     "@@linux.bzl+//:linux.bzl%linux_kernel": {
       "general": {
-        "bzlTransitiveDigest": "IbxNcGumtcLNFyVfyULW8vwJJQyhPiSuEapl/ZC4KBE=",
+        "bzlTransitiveDigest": "y1bfzVqLw6tnZWOCS2HsW4FN05kqWRblyK9imqE7jYA=",
         "usagesDigest": "DaACqzm76smU/bR5gHINje89yHtnVqs8Rrt7XSYoK/o=",
         "recordedInputs": [
           "REPO_MAPPING:bazel_features+,bazel_features_globals bazel_features++version_extension+bazel_features_globals",
@@ -305,7 +305,7 @@
                 "ARCH": "x86",
                 "SRCARCH": "x86"
               },
-              "generated_headers": "@//:kernel_x86_64_x86_generated_headers",
+              "generated_headers": "'@@//:kernel_x86_64_x86_generated_headers'",
               "generated_visibility": [
                 "//visibility:public"
               ],
@@ -313,8 +313,8 @@
               "kbuild_tree": true,
               "kconfig_parse_tool": "@@linux.bzl++linux_kernel+linux_bzl_kconfig_tool//:kconfig_parse",
               "root": "@@linux.bzl++linux_kernel+linux_6_18_2//:Kconfig",
-              "source_asn1_compiler": "@//:kernel_x86_64_asn1_compiler_tool",
-              "source_config": "@//:kernel_x86_64_config",
+              "source_asn1_compiler": "'@@//:kernel_x86_64_asn1_compiler_tool'",
+              "source_config": "'@@//:kernel_x86_64_config'",
               "source_label_package": "@linux_6_18_2//",
               "source_root_label": "@linux_6_18_2//:Kconfig",
               "source_tree_labels": [
