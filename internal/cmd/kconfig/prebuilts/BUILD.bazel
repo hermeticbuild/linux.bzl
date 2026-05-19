@@ -1,0 +1,63 @@
+load("@bazel_lib//lib:transitions.bzl", "platform_transition_filegroup")
+load("@tar.bzl//tar:tar.bzl", "tar")
+
+package(default_visibility = ["//visibility:public"])
+
+[
+    platform_transition_filegroup(
+        name = "for_" + platform,
+        srcs = ["//internal/cmd/kconfig"],
+        target_platform = "@rules_go//go/toolchain:" + platform,
+    )
+    for platform in [
+        "darwin_amd64",
+        "darwin_arm64",
+        "linux_amd64",
+        "linux_arm64",
+        "windows_amd64",
+        "windows_arm64",
+    ]
+]
+
+filegroup(
+    name = "for_all_platforms",
+    srcs = [
+        ":for_darwin_amd64",
+        ":for_darwin_arm64",
+        ":for_linux_amd64",
+        ":for_linux_arm64",
+        ":for_windows_amd64",
+        ":for_windows_arm64",
+    ],
+)
+
+[
+    tar(
+        name = archive,
+        srcs = [":for_" + platform],
+        compress = "gzip",
+        mtree = [
+            "kconfig uid=0 gid=0 mode=0755 time=0 type=file content=$(location :for_{})".format(platform),
+        ],
+    )
+    for archive, platform in {
+        "kconfig-darwin-amd64": "darwin_amd64",
+        "kconfig-darwin-arm64": "darwin_arm64",
+        "kconfig-linux-amd64": "linux_amd64",
+        "kconfig-linux-arm64": "linux_arm64",
+        "kconfig-windows-amd64": "windows_amd64",
+        "kconfig-windows-arm64": "windows_arm64",
+    }.items()
+]
+
+filegroup(
+    name = "kconfig_prebuilts",
+    srcs = [
+        ":kconfig-darwin-amd64",
+        ":kconfig-darwin-arm64",
+        ":kconfig-linux-amd64",
+        ":kconfig-linux-arm64",
+        ":kconfig-windows-amd64",
+        ":kconfig-windows-arm64",
+    ],
+)

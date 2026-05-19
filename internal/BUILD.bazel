@@ -18,6 +18,11 @@ load(
 
 package(default_visibility = ["//:__subpackages__"])
 
+exports_files(
+    ["qemu_boot_test.sh"],
+    visibility = ["//visibility:public"],
+)
+
 linux_cc_context(
     name = "cc_context_smoke",
 )

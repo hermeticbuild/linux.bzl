@@ -1,7 +1,6 @@
 """Kconfig import primitives."""
 
 load("@bazel_lib//lib:write_source_files.bzl", "write_source_file")
-load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
 
 KconfigInfo = provider(
     doc = "Parsed Linux Kconfig values.",
@@ -121,9 +120,9 @@ _kconfig_import = rule(
 def kconfig_file(name, config, config_flags = {}, visibility = None, **kwargs):
     """Declare a provider-only imported Linux .config.
 
-    This is intended for generated BUILD files. Hand-written packages should
-    prefer `kconfig_buildfile` plus the generated target, or `kconfig_import`
-    when they intentionally want the in-place updater.
+    This is intended for generated BUILD files and repository-rule output.
+    Hand-written packages should prefer `kconfig_import` when they intentionally
+    want the in-place updater.
     """
     _kconfig_file(
         name = name,
@@ -175,99 +174,6 @@ def kconfig_import(name, config, config_flags = {}, buildfile = None, visibility
     return struct(
         config_flags = config_flags,
         label = ":" + info_name,
-    )
-
-def _kconfig_buildfile_impl(ctx):
-    out = ctx.actions.declare_file(ctx.label.name + ".BUILD.bazel")
-
-    args = ctx.actions.args()
-    args.add("-generate_buildfile")
-    args.add("-kconfig", ctx.file.config)
-    args.add("-rule", ctx.attr.kconfig_name)
-    args.add("-config_label", ctx.attr.config_label)
-    args.add("-out", out)
-    for visibility in ctx.attr.generated_visibility:
-        args.add("-visibility", visibility)
-
-    ctx.actions.run(
-        executable = ctx.executable._kconfig,
-        inputs = [ctx.file.config],
-        outputs = [out],
-        arguments = [args],
-        mnemonic = "GenerateKconfigBuildfile",
-        progress_message = "Generating Kconfig BUILD file %{label}",
-    )
-
-    return [DefaultInfo(files = depset([out]))]
-
-_kconfig_buildfile = rule(
-    implementation = _kconfig_buildfile_impl,
-    attrs = {
-        "config": attr.label(
-            doc = "Linux .config file used as the source of truth.",
-            allow_single_file = True,
-            mandatory = True,
-        ),
-        "config_label": attr.string(
-            doc = "Canonical Bazel label for config, emitted into the generated BUILD file.",
-            mandatory = True,
-        ),
-        "generated_visibility": attr.string_list(
-            default = ["//visibility:public"],
-            doc = "Visibility emitted on the generated kconfig_file target.",
-        ),
-        "kconfig_name": attr.string(
-            default = "kconfig",
-            doc = "Name of the generated kconfig_file target.",
-        ),
-        "_kconfig": attr.label(
-            default = "//internal/cmd/kconfig",
-            executable = True,
-            cfg = "exec",
-        ),
-    },
-    doc = "Generates a checked-in BUILD file containing parsed Kconfig flags.",
-)
-
-def kconfig_buildfile(
-        name,
-        config,
-        out_buildfile,
-        config_label = None,
-        kconfig_name = "kconfig",
-        generated_visibility = ["//visibility:public"],
-        visibility = None,
-        tags = None):
-    """Generate and validate a checked-in Kconfig metadata BUILD file."""
-    if config_label == None:
-        config_label = _canonical_label(config)
-
-    generated = name + "_generated"
-    _kconfig_buildfile(
-        name = generated,
-        config = config,
-        config_label = config_label,
-        generated_visibility = generated_visibility,
-        kconfig_name = kconfig_name,
-        tags = tags,
-        visibility = visibility,
-    )
-
-    diff_test(
-        name = name + "_test",
-        file1 = ":" + generated,
-        file2 = _source_file_label(out_buildfile),
-        tags = tags,
-    )
-
-    write_source_file(
-        name = name,
-        check_that_out_file_exists = False,
-        diff_test = False,
-        in_file = ":" + generated,
-        out_file = _source_file_label(out_buildfile),
-        tags = tags,
-        visibility = visibility,
     )
 
 def _kconfig_overlay_impl(ctx):
@@ -327,32 +233,3 @@ kconfig_overlay = rule(
     provides = [KconfigInfo],
     doc = "Applies declarative Linux Kconfig raw-value overlays without hiding them behind generated files.",
 )
-
-def _canonical_label(label):
-    if type(label) != "string":
-        fail("config_label is required when config is not a plain label string")
-    if label.startswith("//") or label.startswith("@"):
-        return label
-    if label.startswith(":"):
-        package = native.package_name()
-        if package:
-            return "//%s%s" % (package, label)
-        return "//%s" % label
-    fail("config must be an absolute label or a package-local :label when config_label is omitted")
-
-def _source_file_label(path):
-    if path.startswith("//") or path.startswith("@"):
-        return path
-    if path.endswith("/BUILD.bazel"):
-        package = _join_package(native.package_name(), path[:-len("/BUILD.bazel")])
-        if package:
-            return "//%s:BUILD.bazel" % package
-        return "//:BUILD.bazel"
-    return ":" + path
-
-def _join_package(parent, child):
-    if not parent:
-        return child
-    if not child:
-        return parent
-    return parent + "/" + child

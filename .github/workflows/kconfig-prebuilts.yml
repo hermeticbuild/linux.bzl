@@ -1,0 +1,30 @@
+name: kconfig prebuilts
+
+on:
+  push:
+    tags:
+      - "kconfig-v*"
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: .github/workflows/build_kconfig_prebuilts.sh
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/kconfig-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/kconfig_tool_releases.metadata

@@ -1,15 +1,16 @@
 """Public entry points for Bazel-native Linux kernel builds."""
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-load("//internal:kconfig.bzl", _kconfig_buildfile = "kconfig_buildfile")
+load("//internal:kconfig_repositories.bzl", "kconfig_repository", "kconfig_tool_repository")
 load("//internal:linux.bzl", _linux = "linux")
 load("//internal:linux_objects.bzl", _linux_compressed_image = "linux_compressed_image", _linux_generated_file = "linux_generated_file", _linux_module = "linux_module", _linux_vmlinux = "linux_vmlinux")
+load("//internal:qemu_boot.bzl", _linux_qemu_boot_test = "linux_qemu_boot_test")
 
-kconfig_buildfile = _kconfig_buildfile
 linux = _linux
 linux_compressed_image = _linux_compressed_image
 linux_generated_file = _linux_generated_file
 linux_module = _linux_module
+linux_qemu_boot_test = _linux_qemu_boot_test
 linux_vmlinux = _linux_vmlinux
 
 _archive = tag_class(
@@ -30,13 +31,61 @@ _archive = tag_class(
     },
 )
 
+_kconfig = tag_class(
+    attrs = {
+        "config": attr.label(
+            allow_single_file = True,
+            doc = "Linux .config file used as the source of truth.",
+            mandatory = True,
+        ),
+        "generated_visibility": attr.string_list(
+            default = ["//visibility:public"],
+            doc = "Visibility emitted on the generated kconfig_file target.",
+        ),
+        "kconfig_name": attr.string(
+            default = "kconfig",
+            doc = "Name of the generated kconfig_file target.",
+        ),
+        "name": attr.string(
+            doc = "Generated repository name.",
+            mandatory = True,
+        ),
+    },
+)
+
+_kconfig_tool = tag_class(
+    attrs = {
+        "tool": attr.label(
+            allow_single_file = True,
+            doc = "Optional host kconfig executable override. Intended for local development before published prebuilts are available.",
+            mandatory = True,
+        ),
+    },
+)
+
+_KCONFIG_TOOL_REPO = "linux_bzl_kconfig_tool"
+
 def _linux_kernel_impl(module_ctx):
     archives = {}
+    kconfigs = {}
+    kconfig_tool = None
     for module in module_ctx.modules:
         for archive in module.tags.archive:
             if archive.name in archives:
                 fail("duplicate Linux archive repo %q" % archive.name)
+            if archive.name in kconfigs:
+                fail("duplicate generated repo %q" % archive.name)
             archives[archive.name] = archive
+        for kconfig in module.tags.kconfig:
+            if kconfig.name in archives or kconfig.name in kconfigs:
+                fail("duplicate generated repo %q" % kconfig.name)
+            if kconfig.name == _KCONFIG_TOOL_REPO:
+                fail("kconfig repo name %q is reserved for the internal tool repository" % kconfig.name)
+            kconfigs[kconfig.name] = kconfig
+        for tool in module.tags.kconfig_tool:
+            if kconfig_tool != None:
+                fail("linux_kernel.kconfig_tool may only be declared once")
+            kconfig_tool = tool.tool
 
     for repo in sorted(archives.keys()):
         archive = archives[repo]
@@ -71,9 +120,25 @@ def _linux_kernel_impl(module_ctx):
             kwargs["patch_tool"] = archive.patch_tool
         http_archive(**kwargs)
 
+    if kconfigs and kconfig_tool == None:
+        kconfig_tool_repository(name = _KCONFIG_TOOL_REPO)
+        kconfig_tool = Label("@%s//:kconfig" % _KCONFIG_TOOL_REPO)
+
+    for repo in sorted(kconfigs.keys()):
+        kconfig = kconfigs[repo]
+        kconfig_repository(
+            name = repo,
+            config = kconfig.config,
+            generated_visibility = kconfig.generated_visibility,
+            kconfig_name = kconfig.kconfig_name,
+            kconfig_tool = kconfig_tool,
+        )
+
 linux_kernel = module_extension(
     implementation = _linux_kernel_impl,
     tag_classes = {
         "archive": _archive,
+        "kconfig": _kconfig,
+        "kconfig_tool": _kconfig_tool,
     },
 )
