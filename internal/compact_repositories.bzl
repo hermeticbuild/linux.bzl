@@ -2,9 +2,16 @@
 
 def _run_compact_generator(rctx):
     root = rctx.path(rctx.attr.root)
+    config = rctx.path(rctx.attr.config)
+    kbuild = rctx.path(rctx.attr.kbuild)
+    rctx.watch(config)
+    rctx.watch(kbuild)
+    rctx.watch(root)
     source_root = root.dirname
     output_build = rctx.path("BUILD.bazel")
     output_metadata = rctx.path("metadata.json")
+    env = dict(rctx.attr.env)
+    _configure_probe_env(rctx.attr.allow_shell, env)
 
     args = [
         str(rctx.path(rctx.attr.kconfig_parse_tool)),
@@ -13,7 +20,7 @@ def _run_compact_generator(rctx):
         "-srctree",
         str(source_root),
         "-kbuild",
-        str(rctx.path(rctx.attr.kbuild)),
+        str(kbuild),
         "-compact_metadata_out",
         str(output_metadata),
         "-compact_buildfile_out",
@@ -23,7 +30,7 @@ def _run_compact_generator(rctx):
         "-linux_objects_load",
         rctx.attr.linux_objects_load,
         "-config",
-        "%s=%s" % (rctx.attr.config_name, rctx.path(rctx.attr.config)),
+        "%s=%s" % (rctx.attr.config_name, config),
     ]
     if rctx.attr.allow_shell:
         args.append("-allow_shell")
@@ -47,7 +54,7 @@ def _run_compact_generator(rctx):
         args.extend(["-source_tree_label", label])
     for key, value in sorted(rctx.attr.vars.items()):
         args.extend(["-var", "%s=%s" % (key, value)])
-    for key, value in sorted(rctx.attr.env.items()):
+    for key, value in sorted(env.items()):
         args.extend(["-env", "%s=%s" % (key, value)])
     for key, value in sorted(rctx.attr.probe_values.items()):
         args.extend(["-linux_probe_value", "%s=%s" % (key, value)])
@@ -61,6 +68,16 @@ def _run_compact_generator(rctx):
             result.stdout,
             result.stderr,
         ))
+
+def _configure_probe_env(allow_shell, env):
+    if not allow_shell:
+        return
+    env.setdefault("CC", "clang")
+    env.setdefault("LD", "ld.lld")
+    env.setdefault("CLANG_FLAGS", "-fintegrated-as")
+    env.setdefault("RUSTC", "rustc")
+    env.setdefault("PAHOLE", "pahole")
+    env.setdefault("BINDGEN", "bindgen")
 
 def _linux_compact_repository_impl(rctx):
     _run_compact_generator(rctx)

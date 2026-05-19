@@ -2,4 +2,7 @@ try-import ../.bazelrc
 
 build:remote --platforms=@llvm//platforms:linux_x86_64
 
+build:remote_arm64 --config=remote
+build:remote_arm64 --platforms=@llvm//platforms:linux_arm64
+
 try-import %workspace%/.bazelrc.user

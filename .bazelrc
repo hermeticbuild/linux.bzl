@@ -4,7 +4,6 @@ common --incompatible_enforce_starlark_utf8=error
 common --incompatible_modify_execution_info_additive
 common --module_mirrors="https://bcr.cloudflaremirrors.com"
 common --nobuild_runfile_links
-common --noexperimental_check_external_repository_files
 common --nosandbox_default_allow_network
 common --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
 common --repo_env=BAZEL_NO_APPLE_CPP_TOOLCHAIN=1

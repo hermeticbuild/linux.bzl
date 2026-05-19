@@ -97,6 +97,7 @@ def _write_build_file(rctx, config_path, out_path):
 
 def _kconfig_repository_impl(rctx):
     config_path = rctx.path(rctx.attr.config)
+    rctx.watch(config_path)
     rctx.symlink(config_path, "config")
     _write_build_file(rctx, config_path, "BUILD.bazel")
     return rctx.repo_metadata(reproducible = True)

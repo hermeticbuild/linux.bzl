@@ -76,6 +76,7 @@ LinuxGeneratedHeadersInfo = provider(
         "files": "Depset of generated header files.",
         "include_dirs": "Include directories for the generated header tree.",
         "srcarch": "Linux SRCARCH value used for source include paths.",
+        "vdsomunge": "Optional exec-config vdsomunge tool for arm64 compat vDSO generation.",
     },
 )
 
@@ -287,6 +288,29 @@ def _expand_flag_refs(flags, config_values, make_values, object):
     ]:
         replacements[key] = ""
     return [_expand_make_refs(flag, replacements, object) for flag in flags]
+
+def _rewrite_source_root_flags(flags, source_root):
+    if not source_root:
+        return flags
+    marker = "/" + source_root
+    out = []
+    for flag in flags:
+        index = flag.find(marker)
+        if index < 0:
+            out.append(flag)
+            continue
+        if flag.startswith("/"):
+            out.append(flag[index + 1:])
+            continue
+        replaced = False
+        for prefix in ["-I", "-iquote", "-isystem", "-include"]:
+            if flag.startswith(prefix + "/"):
+                out.append(prefix + flag[index + 1:])
+                replaced = True
+                break
+        if not replaced:
+            out.append(flag)
+    return out
 
 def _linux_generated_include_groups(include_dirs, srcarch):
     arch_generated = []
@@ -1232,7 +1256,19 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         assembler_include_roots.append(vdso.dirname[:-len("/arch/arm64/kernel/vdso")])
 
     if ctx.attr.object == "arch/arm64/kernel/vdso32-wrap.o" and generated_headers:
-        vdso32 = _linux_generated_header(generated_headers, "arch/arm64/kernel/vdso32/vdso.so")
+        if not generated_headers.vdsomunge:
+            fail("arch/arm64/kernel/vdso32-wrap.o requires an arm64 generated_headers provider with vdsomunge")
+        vdso32 = _linux_arm64_vdso32_outputs(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            source_root,
+            generated_headers.include_dirs,
+            generated_headers.files.to_list(),
+            ctx.label.name + ".obj",
+            generated_headers.vdsomunge,
+        ).so
         files.append(vdso32)
         assembler_include_roots.append(vdso32.dirname[:-len("/arch/arm64/kernel/vdso32")])
 
@@ -1703,7 +1739,7 @@ def _linux_arm64_vdso32_linker_script(ctx, cc_toolchain, feature_configuration, 
     )
     return out
 
-def _linux_arm64_vdso32_outputs(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, base):
+def _linux_arm64_vdso32_outputs(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, base, vdsomunge):
     objects = [
         _linux_arm64_vdso32_compile(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, _source_tree_file(ctx, "arch/arm64/kernel/vdso32/note.c"), base + "/arch/arm64/kernel/vdso32/note.o"),
         _linux_arm64_vdso32_compile(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, _source_tree_file(ctx, "arch/arm64/kernel/vdso32/vgettimeofday.c"), base + "/arch/arm64/kernel/vdso32/vgettimeofday.o", extra_flags = ["-include", source_root + "/lib/vdso/gettimeofday.c"]),
@@ -1743,7 +1779,7 @@ def _linux_arm64_vdso32_outputs(ctx, cc_toolchain, feature_configuration, config
 
     dbg = ctx.actions.declare_file(base + "/arch/arm64/kernel/vdso32/vdso32.so.dbg")
     ctx.actions.run(
-        executable = ctx.executable.vdsomunge,
+        executable = vdsomunge,
         inputs = [raw],
         outputs = [dbg],
         arguments = [raw.path, dbg.path],
@@ -1990,6 +2026,7 @@ def _linux_x86_generated_headers_impl(ctx):
             files = files,
             include_dirs = include_dirs + [kvm_asm_offsets_h.dirname],
             srcarch = "x86",
+            vdsomunge = None,
         ),
     ]
 
@@ -2318,18 +2355,6 @@ def _linux_arm64_generated_headers_impl(ctx):
     )
     headers.extend([vdso.offsets, vdso.so])
 
-    vdso32 = _linux_arm64_vdso32_outputs(
-        ctx,
-        cc_toolchain,
-        feature_configuration,
-        config,
-        source_root,
-        include_dirs,
-        headers,
-        base,
-    )
-    headers.append(vdso32.so)
-
     files = depset(headers)
     return [
         DefaultInfo(files = files),
@@ -2339,6 +2364,7 @@ def _linux_arm64_generated_headers_impl(ctx):
             files = files,
             include_dirs = include_dirs,
             srcarch = "arm64",
+            vdsomunge = ctx.executable.vdsomunge,
         ),
     ]
 
@@ -2855,7 +2881,7 @@ def _linux_real_object_impl(ctx):
         generated_headers,
         source_root,
     )
-    expanded_remove_flags = _expand_flag_refs(ctx.attr.remove_flags, config_values, make_values, ctx.attr.object)
+    expanded_remove_flags = _rewrite_source_root_flags(_expand_flag_refs(ctx.attr.remove_flags, config_values, make_values, ctx.attr.object), source_root)
     config_flag_inputs = _linux_filtered_config_flags_for_source(ctx, config, src, expanded_remove_flags)
 
     args = ctx.actions.args()
@@ -2893,7 +2919,7 @@ def _linux_real_object_impl(ctx):
     if _is_assembly_source(src):
         for include_root in generated_inputs.assembler_include_roots:
             args.add("-Wa,-I," + include_root)
-    expanded_flags = _expand_flag_refs(ctx.attr.flags, config_values, make_values, ctx.attr.object)
+    expanded_flags = _rewrite_source_root_flags(_expand_flag_refs(ctx.attr.flags, config_values, make_values, ctx.attr.object), source_root)
     if utsversion_tmp != None:
         expanded_flags = _rewrite_utsversion_tmp_flags(expanded_flags, ctx.attr.object, utsversion_tmp)
     args.add_all(expanded_flags)
@@ -4295,13 +4321,18 @@ def _linux_x86_compressed_vmlinux(ctx, compiler, linker, archiver, cc_toolchain,
         ("arch/x86/boot/compressed/pgtable_64.c", "arch/x86/boot/compressed/pgtable_64.o", [], []),
         ("arch/x86/boot/compressed/early_serial_console.c", "arch/x86/boot/compressed/early_serial_console.o", [], []),
         ("arch/x86/boot/compressed/kaslr.c", "arch/x86/boot/compressed/kaslr.o", [], []),
-        ("arch/x86/boot/compressed/mem_encrypt.S", "arch/x86/boot/compressed/mem_encrypt.o", [], []),
-        ("arch/x86/boot/compressed/sev.c", "arch/x86/boot/compressed/sev.o", [], []),
-        ("arch/x86/boot/compressed/sev-handle-vc.c", "arch/x86/boot/compressed/sev-handle-vc.o", [inat_tables], [inat_tables.dirname]),
         ("arch/x86/boot/compressed/acpi.c", "arch/x86/boot/compressed/acpi.o", [], []),
-        ("arch/x86/boot/compressed/mem.c", "arch/x86/boot/compressed/mem.o", [], []),
-        ("arch/x86/boot/compressed/efi.c", "arch/x86/boot/compressed/efi.o", [], []),
     ]
+    if _linux_x86_config_enabled(config, "CONFIG_AMD_MEM_ENCRYPT"):
+        source_specs.extend([
+            ("arch/x86/boot/compressed/mem_encrypt.S", "arch/x86/boot/compressed/mem_encrypt.o", [], []),
+            ("arch/x86/boot/compressed/sev.c", "arch/x86/boot/compressed/sev.o", [], []),
+            ("arch/x86/boot/compressed/sev-handle-vc.c", "arch/x86/boot/compressed/sev-handle-vc.o", [inat_tables], [inat_tables.dirname]),
+        ])
+    if _linux_x86_config_enabled(config, "CONFIG_UNACCEPTED_MEMORY"):
+        source_specs.append(("arch/x86/boot/compressed/mem.c", "arch/x86/boot/compressed/mem.o", [], []))
+    if _linux_x86_config_enabled(config, "CONFIG_EFI"):
+        source_specs.append(("arch/x86/boot/compressed/efi.c", "arch/x86/boot/compressed/efi.o", [], []))
 
     objects = []
     for src_relpath, object, extra_inputs, extra_include_dirs in source_specs:
@@ -4332,54 +4363,60 @@ def _linux_x86_compressed_vmlinux(ctx, compiler, linker, archiver, cc_toolchain,
     ))
 
     linker_script = _linux_x86_compressed_linker_script(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root)
-    efi_stub_specs = [
-        ("drivers/firmware/efi/libstub/efi-stub-helper.c", "drivers/firmware/efi/libstub/efi-stub-helper.stub.o"),
-        ("drivers/firmware/efi/libstub/gop.c", "drivers/firmware/efi/libstub/gop.stub.o"),
-        ("drivers/firmware/efi/libstub/secureboot.c", "drivers/firmware/efi/libstub/secureboot.stub.o"),
-        ("drivers/firmware/efi/libstub/tpm.c", "drivers/firmware/efi/libstub/tpm.stub.o"),
-        ("drivers/firmware/efi/libstub/file.c", "drivers/firmware/efi/libstub/file.stub.o"),
-        ("drivers/firmware/efi/libstub/mem.c", "drivers/firmware/efi/libstub/mem.stub.o"),
-        ("drivers/firmware/efi/libstub/random.c", "drivers/firmware/efi/libstub/random.stub.o"),
-        ("drivers/firmware/efi/libstub/randomalloc.c", "drivers/firmware/efi/libstub/randomalloc.stub.o"),
-        ("drivers/firmware/efi/libstub/pci.c", "drivers/firmware/efi/libstub/pci.stub.o"),
-        ("drivers/firmware/efi/libstub/skip_spaces.c", "drivers/firmware/efi/libstub/skip_spaces.stub.o"),
-        ("lib/cmdline.c", "drivers/firmware/efi/libstub/lib-cmdline.stub.o"),
-        ("lib/ctype.c", "drivers/firmware/efi/libstub/lib-ctype.stub.o"),
-        ("drivers/firmware/efi/libstub/alignedmem.c", "drivers/firmware/efi/libstub/alignedmem.stub.o"),
-        ("drivers/firmware/efi/libstub/relocate.c", "drivers/firmware/efi/libstub/relocate.stub.o"),
-        ("drivers/firmware/efi/libstub/printk.c", "drivers/firmware/efi/libstub/printk.stub.o"),
-        ("drivers/firmware/efi/libstub/vsprintf.c", "drivers/firmware/efi/libstub/vsprintf.stub.o"),
-        ("drivers/firmware/efi/libstub/x86-stub.c", "drivers/firmware/efi/libstub/x86-stub.stub.o"),
-        ("drivers/firmware/efi/libstub/smbios.c", "drivers/firmware/efi/libstub/smbios.stub.o"),
-        ("drivers/firmware/efi/libstub/x86-5lvl.c", "drivers/firmware/efi/libstub/x86-5lvl.stub.o"),
-        ("drivers/firmware/efi/libstub/unaccepted_memory.c", "drivers/firmware/efi/libstub/unaccepted_memory.stub.o"),
-        ("drivers/firmware/efi/libstub/bitmap.c", "drivers/firmware/efi/libstub/bitmap.stub.o"),
-        ("drivers/firmware/efi/libstub/find.c", "drivers/firmware/efi/libstub/find.stub.o"),
-    ]
-    efi_stub_objects = []
-    for src_relpath, object in efi_stub_specs:
-        efi_stub_objects.append(_linux_x86_efi_stub_compile(
-            ctx,
-            compiler,
-            cc_toolchain,
-            feature_configuration,
-            config,
-            generated_headers,
-            source_root,
-            src_relpath,
-            object,
-        ))
-
     archives = []
-    efi_archive = _linux_x86_archive(
-        ctx,
-        archiver,
-        cc_toolchain,
-        "drivers/firmware/efi/libstub/lib.a",
-        efi_stub_objects,
-    )
-    if efi_archive:
-        archives.append(efi_archive)
+    efi_archive = None
+    if _linux_x86_config_enabled(config, "CONFIG_EFI_STUB"):
+        efi_stub_specs = [
+            ("drivers/firmware/efi/libstub/efi-stub-helper.c", "drivers/firmware/efi/libstub/efi-stub-helper.stub.o"),
+            ("drivers/firmware/efi/libstub/gop.c", "drivers/firmware/efi/libstub/gop.stub.o"),
+            ("drivers/firmware/efi/libstub/secureboot.c", "drivers/firmware/efi/libstub/secureboot.stub.o"),
+            ("drivers/firmware/efi/libstub/tpm.c", "drivers/firmware/efi/libstub/tpm.stub.o"),
+            ("drivers/firmware/efi/libstub/file.c", "drivers/firmware/efi/libstub/file.stub.o"),
+            ("drivers/firmware/efi/libstub/mem.c", "drivers/firmware/efi/libstub/mem.stub.o"),
+            ("drivers/firmware/efi/libstub/random.c", "drivers/firmware/efi/libstub/random.stub.o"),
+            ("drivers/firmware/efi/libstub/randomalloc.c", "drivers/firmware/efi/libstub/randomalloc.stub.o"),
+            ("drivers/firmware/efi/libstub/pci.c", "drivers/firmware/efi/libstub/pci.stub.o"),
+            ("drivers/firmware/efi/libstub/skip_spaces.c", "drivers/firmware/efi/libstub/skip_spaces.stub.o"),
+            ("lib/cmdline.c", "drivers/firmware/efi/libstub/lib-cmdline.stub.o"),
+            ("lib/ctype.c", "drivers/firmware/efi/libstub/lib-ctype.stub.o"),
+            ("drivers/firmware/efi/libstub/alignedmem.c", "drivers/firmware/efi/libstub/alignedmem.stub.o"),
+            ("drivers/firmware/efi/libstub/relocate.c", "drivers/firmware/efi/libstub/relocate.stub.o"),
+            ("drivers/firmware/efi/libstub/printk.c", "drivers/firmware/efi/libstub/printk.stub.o"),
+            ("drivers/firmware/efi/libstub/vsprintf.c", "drivers/firmware/efi/libstub/vsprintf.stub.o"),
+            ("drivers/firmware/efi/libstub/x86-stub.c", "drivers/firmware/efi/libstub/x86-stub.stub.o"),
+            ("drivers/firmware/efi/libstub/smbios.c", "drivers/firmware/efi/libstub/smbios.stub.o"),
+            ("drivers/firmware/efi/libstub/x86-5lvl.c", "drivers/firmware/efi/libstub/x86-5lvl.stub.o"),
+        ]
+        if _linux_x86_config_enabled(config, "CONFIG_UNACCEPTED_MEMORY"):
+            efi_stub_specs.extend([
+                ("drivers/firmware/efi/libstub/unaccepted_memory.c", "drivers/firmware/efi/libstub/unaccepted_memory.stub.o"),
+                ("drivers/firmware/efi/libstub/bitmap.c", "drivers/firmware/efi/libstub/bitmap.stub.o"),
+                ("drivers/firmware/efi/libstub/find.c", "drivers/firmware/efi/libstub/find.stub.o"),
+            ])
+
+        efi_stub_objects = []
+        for src_relpath, object in efi_stub_specs:
+            efi_stub_objects.append(_linux_x86_efi_stub_compile(
+                ctx,
+                compiler,
+                cc_toolchain,
+                feature_configuration,
+                config,
+                generated_headers,
+                source_root,
+                src_relpath,
+                object,
+            ))
+
+        efi_archive = _linux_x86_archive(
+            ctx,
+            archiver,
+            cc_toolchain,
+            "drivers/firmware/efi/libstub/lib.a",
+            efi_stub_objects,
+        )
+        if efi_archive:
+            archives.append(efi_archive)
     startup_archive = _linux_x86_archive(
         ctx,
         archiver,

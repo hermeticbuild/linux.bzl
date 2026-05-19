@@ -87,6 +87,9 @@ def _define_arch_kernel(
         "ARCH": arch.arch,
         "SRCARCH": arch.srcarch,
     }
+    generated_visibility = list(package_visibility)
+    if compact_repo:
+        generated_visibility.append("%s//:__pkg__" % _normalize_repo(compact_repo))
 
     linux_resolved_config(
         name = config_target,
@@ -97,7 +100,7 @@ def _define_arch_kernel(
         source_root = source_root,
         target_compatible_with = [arch.platform],
         vars = compact_vars,
-        visibility = package_visibility,
+        visibility = generated_visibility,
     )
 
     host_tools = arch.host_tools(
@@ -108,7 +111,7 @@ def _define_arch_kernel(
         source_root = source_root,
         source_tree = source_tree,
         target_prefix = prefix,
-        visibility = package_visibility,
+        visibility = generated_visibility,
     )
 
     if compact_repo:

@@ -1,6 +1,6 @@
 """Public entry points for Bazel-native Linux kernel builds."""
 
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("@llvm//:http_bsdtar_archive.bzl", "http_bsdtar_archive")
 load("//internal:architectures.bzl", "linux_architectures")
 load("//internal:compact_repositories.bzl", "linux_compact_repository")
 load("//internal:kconfig_repositories.bzl", "kconfig_repository", "kconfig_tool_repository")
@@ -18,7 +18,10 @@ linux_vmlinux = _linux_vmlinux
 _archive = tag_class(
     attrs = {
         "add_prefix": attr.string(doc = "Directory prefix to add to extracted files."),
+        "bsdtar_extra_args": attr.string_list(doc = "Additional arguments passed to bsdtar while extracting the archive."),
         "canonical_id": attr.string(doc = "Canonical repository cache key for the archive."),
+        "excludes": attr.string_list(doc = "Archive paths to exclude while extracting."),
+        "includes": attr.string_list(doc = "Archive paths to include while extracting."),
         "integrity": attr.string(doc = "Expected Subresource Integrity metadata for the archive."),
         "name": attr.string(mandatory = True, doc = "Generated source repository name."),
         "patch_args": attr.string_list(doc = "Arguments for the patch tool."),
@@ -108,6 +111,11 @@ _compact = tag_class(
 
 _KCONFIG_TOOL_REPO = "linux_bzl_kconfig_tool"
 
+_LINUX_ARCHIVE_EXCLUDES = [
+    "Build",
+    "*/Build",
+]
+
 def _linux_kernel_impl(module_ctx):
     archives = {}
     compacts = {}
@@ -143,6 +151,7 @@ def _linux_kernel_impl(module_ctx):
         archive = archives[repo]
         kwargs = {
             "build_file": Label("//:source_repo.BUILD.bazel"),
+            "excludes": _linux_archive_excludes(archive.excludes),
             "name": archive.name,
             "urls": archive.urls,
         }
@@ -152,6 +161,10 @@ def _linux_kernel_impl(module_ctx):
             kwargs["canonical_id"] = archive.canonical_id
         if archive.add_prefix:
             kwargs["add_prefix"] = archive.add_prefix
+        if archive.bsdtar_extra_args:
+            kwargs["bsdtar_extra_args"] = archive.bsdtar_extra_args
+        if archive.includes:
+            kwargs["includes"] = archive.includes
         if archive.type:
             kwargs["type"] = archive.type
         if archive.sha256:
@@ -170,7 +183,7 @@ def _linux_kernel_impl(module_ctx):
             kwargs["patch_cmds"] = archive.patch_cmds
         if archive.patch_tool:
             kwargs["patch_tool"] = archive.patch_tool
-        http_archive(**kwargs)
+        http_bsdtar_archive(**kwargs)
 
     if (kconfigs or compacts) and kconfig_tool == None:
         tools = ["kconfig"]
@@ -211,19 +224,20 @@ def _linux_kernel_impl(module_ctx):
             "ARCH": arch.arch,
             "SRCARCH": arch.srcarch,
         }
+        label_repo = compact.config.repo_name
         linux_compact_repository(
             name = compact.name,
             config = compact.config,
             config_name = arch.config_name,
             env = env,
-            generated_headers = _package_label(compact.kernel_package, prefix + "_" + arch.arch + "_generated_headers"),
+            generated_headers = _package_label(label_repo, compact.kernel_package, prefix + "_" + arch.arch + "_generated_headers"),
             generated_visibility = compact.generated_visibility,
             kbuild = "%s//:Kbuild" % source_repo,
             kbuild_tree = compact.kbuild_tree,
             kconfig_parse_tool = kconfig_parse_tool,
             root = "%s//:Kconfig" % source_repo,
-            source_asn1_compiler = _package_label(compact.kernel_package, prefix + "_asn1_compiler_tool"),
-            source_config = _package_label(compact.kernel_package, prefix + "_config"),
+            source_asn1_compiler = _package_label(label_repo, compact.kernel_package, prefix + "_asn1_compiler_tool"),
+            source_config = _package_label(label_repo, compact.kernel_package, prefix + "_config"),
             source_label_package = source_repo + "//",
             source_root_label = "%s//:Kconfig" % source_repo,
             source_tree_labels = ["%s//:all" % source_repo],
@@ -251,7 +265,18 @@ def _normalize_repo(repo):
         return repo
     return "@" + repo
 
-def _package_label(package, name):
+def _linux_archive_excludes(excludes):
+    seen = {}
+    merged = []
+    for exclude in list(excludes) + _LINUX_ARCHIVE_EXCLUDES:
+        if exclude in seen:
+            continue
+        seen[exclude] = True
+        merged.append(exclude)
+    return merged
+
+def _package_label(repo_name, package, name):
+    repo = "@@%s" % repo_name if repo_name else "@@"
     if package:
-        return "@//%s:%s" % (package, name)
-    return "@//:%s" % name
+        return "%s//%s:%s" % (repo, package, name)
+    return "%s//:%s" % (repo, name)

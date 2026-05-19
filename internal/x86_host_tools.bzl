@@ -261,8 +261,9 @@ def linux_x86_host_tools(
         srcs = source_labels(source_repo, _X86_OBJTOOL_SRCS),
         copts = [
             "-D_GNU_SOURCE",
-            "-DLIBELF_USE_DEPRECATED",
-            "-Iexternal/+http_archive+libelf/include",
+            "-Dbswap_16=__bswap_16",
+            "-Dbswap_32=__bswap_32",
+            "-Dbswap_64=__bswap_64",
             "-I" + bindir_path(genrule_inat_out[:-len("/inat-tables.c")]),
             "-Wno-missing-field-initializers",
             "-Wno-nested-externs",

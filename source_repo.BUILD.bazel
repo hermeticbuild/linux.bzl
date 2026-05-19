@@ -3,12 +3,10 @@ load("@rules_devicetree//devicetree:devicetree_library.bzl", "devicetree_library
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files([
-    "Kbuild",
-    "Kconfig",
-    "Makefile",
-    "init/Makefile",
-])
+exports_files(
+    glob(["**"]),
+    visibility = ["//visibility:public"],
+)
 
 filegroup(
     name = "all",
@@ -49,18 +47,24 @@ cc_library(
     name = "tools_headers_cc",
     hdrs = glob([
         "arch/x86/tools/**/*.h",
-        "tools/arch/x86/include/**/*.h",
+        "tools/arch/*/include/**/*.h",
         "tools/include/**/*.h",
         "tools/lib/**/*.h",
         "tools/objtool/**/*.h",
-    ]),
+    ], allow_empty = True),
     includes = [
         "arch/x86/tools",
-        "tools/arch/x86/include",
-        "tools/arch/x86/include/uapi",
         "tools/include",
         "tools/include/uapi",
         "tools/lib",
+    ] + select({
+        "@platforms//cpu:aarch64": ["tools/arch/arm64/include/uapi"],
+        "@platforms//cpu:arm64": ["tools/arch/arm64/include/uapi"],
+        "@platforms//cpu:x86_32": ["tools/arch/x86/include/uapi"],
+        "@platforms//cpu:x86_64": ["tools/arch/x86/include/uapi"],
+        "//conditions:default": ["tools/arch/x86/include/uapi"],
+    }) + [
+        "tools/arch/x86/include",
         "tools/objtool/arch/x86/include",
         "tools/objtool/include",
     ],
@@ -87,7 +91,7 @@ cc_binary(
         hdrs = glob([
             "arch/%s/boot/dts/**/*.dtsi" % arch,
             "include/dt-bindings/**/*.h",
-        ]),
+        ], allow_empty = True),
         includes = [
             "arch/%s/boot/dts" % arch,
             "include",

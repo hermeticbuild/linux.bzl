@@ -5,6 +5,7 @@ package kconfig
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -846,6 +847,33 @@ func TestConfigRefsAcceptLowercaseSymbols(t *testing.T) {
 	got := strings.Join(configRefs("-DCONFIG_foo=1 -DCONFIG_BAR"), ",")
 	if want := "CONFIG_BAR,CONFIG_foo"; got != want {
 		t.Fatalf("configRefs() = %q, want %q", got, want)
+	}
+}
+
+func TestCompactMetadataNormalizesSourceRootFlags(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	sourceRoot := t.TempDir()
+	writeCompactSource(t, sourceRoot, "lib/crypto/sha256.c")
+	kb, err := ParseKbuild(strings.NewReader(fmt.Sprintf(`
+obj-y += lib/crypto/sha256.o
+ccflags-y += -I%s/lib/crypto/x86 -include %s/include/linux/hidden.h
+`, sourceRoot, sourceRoot)), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+
+	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{
+		{Name: "base", Flags: nil},
+	}, CompactMetadataOptions{SourceRoot: sourceRoot})
+	if err != nil {
+		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+	}
+
+	config := configByName(metadata, "base")
+	target := objectTarget(metadata, config, "lib/crypto/sha256.o")
+	variant := variantByTarget(metadata, target)
+	if got, want := strings.Join(variant.Flags, " "), "-I$(srctree)/lib/crypto/x86 -include $(srctree)/include/linux/hidden.h"; got != want {
+		t.Fatalf("flags = %q, want %q", got, want)
 	}
 }
 

@@ -27,6 +27,7 @@ cc_library(
         "lib/gelfehdr.c",
         "lib/gelfphdr.c",
         "lib/gelfshdr.c",
+        "lib/gelf_shndx_compat.c",
         "lib/gelftrans.c",
         "lib/getarhdr.c",
         "lib/getaroff.c",
@@ -65,6 +66,7 @@ cc_library(
         "lib/*.h",
     ]),
     copts = [
+        "-DHAVE_CONFIG_H=1",
         "-D__LIBELF_INTERNAL__=1",
         "-Wno-deprecated-non-prototype",
         "-Wno-implicit-function-declaration",

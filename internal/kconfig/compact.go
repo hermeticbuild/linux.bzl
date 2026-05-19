@@ -674,12 +674,12 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 		sort.Strings(deps)
 	}
 
-	variant := object.variant(config, source, members, deps)
+	variant := object.variant(config, source, members, deps, opts.SourceRoot)
 	memo[name] = variant
 	return variant, nil
 }
 
-func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, members, deps []string) CompactObjectVariant {
+func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, members, deps []string, sourceRoot string) CompactObjectVariant {
 	fragment := map[string]string{}
 	refs := make([]string, 0, len(o.footprint))
 	for ref := range o.footprint {
@@ -689,8 +689,8 @@ func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, mem
 	for _, ref := range refs {
 		fragment[ref] = config.Value(ref)
 	}
-	flags := filterResolvedKbuildFlags(o.flags, source)
-	remove := filterResolvedKbuildFlags(o.remove, source)
+	flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.flags, source), sourceRoot)
+	remove := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.remove, source), sourceRoot)
 	hash := objectVariantHash(o.object, o.mode, o.modname, flags, remove, fragment, deps, members)
 	return CompactObjectVariant{
 		Target:         sanitizeTargetName(strings.TrimSuffix(o.object, ".o")) + "__" + hash,
@@ -705,6 +705,51 @@ func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, mem
 		Deps:           append([]string(nil), deps...),
 		Members:        append([]string(nil), members...),
 	}
+}
+
+func normalizeSourceRootFlags(flags []string, sourceRoot string) []string {
+	if sourceRoot == "" {
+		return flags
+	}
+	sourceRoot = filepath.ToSlash(filepath.Clean(sourceRoot))
+	if sourceRoot == "." || sourceRoot == "/" {
+		return flags
+	}
+	out := make([]string, len(flags))
+	changed := false
+	for i, flag := range flags {
+		normalized := normalizeSourceRootFlag(flag, sourceRoot)
+		if normalized != flag {
+			changed = true
+		}
+		out[i] = normalized
+	}
+	if !changed {
+		return flags
+	}
+	return out
+}
+
+func normalizeSourceRootFlag(flag, sourceRoot string) string {
+	if flag == sourceRoot {
+		return "$(srctree)"
+	}
+	if strings.HasPrefix(flag, sourceRoot+"/") {
+		return "$(srctree)/" + strings.TrimPrefix(flag, sourceRoot+"/")
+	}
+	for _, prefix := range []string{"-I", "-iquote", "-isystem", "-include"} {
+		path := strings.TrimPrefix(flag, prefix)
+		if path == flag {
+			continue
+		}
+		if path == sourceRoot {
+			return prefix + "$(srctree)"
+		}
+		if strings.HasPrefix(path, sourceRoot+"/") {
+			return prefix + "$(srctree)/" + strings.TrimPrefix(path, sourceRoot+"/")
+		}
+	}
+	return flag
 }
 
 func filterResolvedKbuildFlags(groups []resolvedKbuildFlag, source string) []string {
