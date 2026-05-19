@@ -69,6 +69,50 @@ func (f *namedPathFlag) Set(value string) error {
 	return nil
 }
 
+func namedPathMap(values []namedPath) map[string]string {
+	out := map[string]string{}
+	for _, value := range values {
+		out[value.Name] = workspacePath(value.Path)
+	}
+	return out
+}
+
+func namedValueMap(values []namedPath) map[string]string {
+	out := map[string]string{}
+	for _, value := range values {
+		out[value.Name] = value.Path
+	}
+	return out
+}
+
+func syntheticKconfigRoot(root string, extras []namedPath) (string, func(), error) {
+	file, err := os.CreateTemp("", "linux-bzl-kconfig-root-*")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() {
+		_ = os.Remove(file.Name())
+	}
+	if _, err := fmt.Fprintf(file, "source %q\n", workspacePath(root)); err != nil {
+		file.Close()
+		cleanup()
+		return "", nil, err
+	}
+	for _, extra := range extras {
+		path := filepath.ToSlash(filepath.Join(extra.Name, filepath.Base(extra.Path)))
+		if _, err := fmt.Fprintf(file, "source %q\n", path); err != nil {
+			file.Close()
+			cleanup()
+			return "", nil, err
+		}
+	}
+	if err := file.Close(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return file.Name(), cleanup, nil
+}
+
 func main() {
 	var (
 		root                = flag.String("root", "", "Root Kconfig file to parse")
@@ -110,6 +154,10 @@ func main() {
 		kbuildTreeExcludes  = stringSliceFlag{}
 		compactConfigInputs = namedPathFlag{}
 		compactExports      = stringSliceFlag{}
+		sourceRootMaps      = namedPathFlag{}
+		kconfigExtras       = namedPathFlag{}
+		kbuildExtras        = namedPathFlag{}
+		sourceLabelMaps     = namedPathFlag{}
 		sourceTreeLabels    = stringSliceFlag{}
 	)
 	flag.Var(vars, "var", "Preprocessor variable in KEY=VALUE form. May be repeated")
@@ -119,6 +167,10 @@ func main() {
 	flag.Var(&kbuildTreeExcludes, "kbuild_tree_exclude", "Source-root-relative subtree to skip during -kbuild_tree_root validation. May be repeated")
 	flag.Var(&compactConfigInputs, "config", "Named .config input in NAME=PATH form for compact metadata generation. May be repeated")
 	flag.Var(&compactExports, "compact_buildfile_export", "Source filename exported by the generated compact BUILD file. May be repeated")
+	flag.Var(&sourceRootMaps, "source_root_map", "Virtual source prefix to filesystem root in PREFIX=PATH form. May be repeated")
+	flag.Var(&kconfigExtras, "kconfig_extra", "Extra Kconfig source in PREFIX=PATH form. May be repeated")
+	flag.Var(&kbuildExtras, "kbuild_extra", "Extra Kbuild/Makefile source in PREFIX=PATH form. May be repeated")
+	flag.Var(&sourceLabelMaps, "source_label_map", "Virtual source prefix to Bazel label package in PREFIX=LABEL_PACKAGE form. May be repeated")
 	flag.Var(&sourceTreeLabels, "source_tree_label", "Bazel label for source tree files emitted into source-backed compact object rules. May be repeated")
 	flag.Parse()
 
@@ -135,17 +187,28 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to configure Linux probe model: %v\n", err)
 			os.Exit(2)
 		}
+		sourceRoots := namedPathMap(sourceRootMaps)
 		resolvedRoot := *root
 		if *srctree == "" {
 			resolvedRoot = workspacePath(*root)
 		}
 		resolvedSrctree := workspacePath(*srctree)
+		if len(kconfigExtras) != 0 {
+			synthetic, cleanup, err := syntheticKconfigRoot(resolvedRoot, kconfigExtras)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to write synthetic Kconfig root: %v\n", err)
+				os.Exit(1)
+			}
+			defer cleanup()
+			resolvedRoot = synthetic
+		}
 		tree, err = kconfig.ParseFile(context.Background(), resolvedRoot, kconfig.Options{
-			RootDir:    resolvedSrctree,
-			Variables:  vars,
-			Env:        env,
-			AllowShell: *allowShell || shell != nil,
-			Shell:      shell,
+			RootDir:     resolvedSrctree,
+			SourceRoots: sourceRoots,
+			Variables:   vars,
+			Env:         env,
+			AllowShell:  *allowShell || shell != nil,
+			Shell:       shell,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to parse Kconfig: %v\n", err)
@@ -230,7 +293,7 @@ func main() {
 	}
 
 	if *compactMetadataOut != "" || *compactBuildfileOut != "" || *objectBuildfileOut != "" || *imageBuildfileOut != "" {
-		metadata, err := compactMetadata(tree, *root, *kbuildPath, compactConfigInputs, *compactKbuildTree, vars)
+		metadata, err := compactMetadata(tree, *root, *kbuildPath, compactConfigInputs, *compactKbuildTree, vars, kbuildExtras, namedPathMap(sourceRootMaps))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to generate compact metadata: %v\n", err)
 			os.Exit(1)
@@ -248,16 +311,17 @@ func main() {
 		}
 		if *objectBuildfileOut != "" {
 			data, err := metadata.ObjectBuildFile(kconfig.CompactBuildFileOptions{
-				Arch:               vars["ARCH"],
-				Visibility:         []string(visibility),
-				RuleLoadLabel:      *linuxObjectsLoad,
-				SourceLabelPackage: *sourceLabelPackage,
-				SourceASN1Compiler: *sourceASN1Compiler,
-				SourceConfig:       *sourceConfig,
-				SourceRootLabel:    *sourceRootLabel,
-				SourceTreeLabels:   []string(sourceTreeLabels),
-				GeneratedHeaders:   *generatedHeaders,
-				Srcarch:            vars["SRCARCH"],
+				Arch:                vars["ARCH"],
+				Visibility:          []string(visibility),
+				RuleLoadLabel:       *linuxObjectsLoad,
+				SourceLabelPackage:  *sourceLabelPackage,
+				SourceLabelPackages: namedValueMap(sourceLabelMaps),
+				SourceASN1Compiler:  *sourceASN1Compiler,
+				SourceConfig:        *sourceConfig,
+				SourceRootLabel:     *sourceRootLabel,
+				SourceTreeLabels:    []string(sourceTreeLabels),
+				GeneratedHeaders:    *generatedHeaders,
+				Srcarch:             vars["SRCARCH"],
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to generate compact object BUILD file: %v\n", err)
@@ -290,16 +354,17 @@ func main() {
 		}
 		if *compactBuildfileOut != "" {
 			objectBuild, err := metadata.ObjectBuildFile(kconfig.CompactBuildFileOptions{
-				Arch:               vars["ARCH"],
-				Visibility:         []string(visibility),
-				RuleLoadLabel:      *linuxObjectsLoad,
-				SourceLabelPackage: *sourceLabelPackage,
-				SourceASN1Compiler: *sourceASN1Compiler,
-				SourceConfig:       *sourceConfig,
-				SourceRootLabel:    *sourceRootLabel,
-				SourceTreeLabels:   []string(sourceTreeLabels),
-				GeneratedHeaders:   *generatedHeaders,
-				Srcarch:            vars["SRCARCH"],
+				Arch:                vars["ARCH"],
+				Visibility:          []string(visibility),
+				RuleLoadLabel:       *linuxObjectsLoad,
+				SourceLabelPackage:  *sourceLabelPackage,
+				SourceLabelPackages: namedValueMap(sourceLabelMaps),
+				SourceASN1Compiler:  *sourceASN1Compiler,
+				SourceConfig:        *sourceConfig,
+				SourceRootLabel:     *sourceRootLabel,
+				SourceTreeLabels:    []string(sourceTreeLabels),
+				GeneratedHeaders:    *generatedHeaders,
+				Srcarch:             vars["SRCARCH"],
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to generate compact object BUILD file: %v\n", err)
@@ -597,7 +662,7 @@ func isKbuildValidationFile(name string) bool {
 	return name == "Kbuild" || name == "Makefile" || strings.HasSuffix(name, ".mk")
 }
 
-func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, configInputs []namedPath, compactKbuildTree bool, vars map[string]string) (*kconfig.CompactMetadata, error) {
+func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, configInputs []namedPath, compactKbuildTree bool, vars map[string]string, kbuildExtras []namedPath, sourceRoots map[string]string) (*kconfig.CompactMetadata, error) {
 	if kbuildPath == "" {
 		return nil, fmt.Errorf("-kbuild is required")
 	}
@@ -634,8 +699,9 @@ func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, con
 		}
 	}
 	opts := kconfig.CompactMetadataOptions{
-		ObjectDir:  objectDir,
-		SourceRoot: sourceRoot,
+		ObjectDir:   objectDir,
+		SourceRoot:  sourceRoot,
+		SourceRoots: sourceRoots,
 	}
 	rootDir := sourceRoot
 	if rootDir == "" {
@@ -661,6 +727,21 @@ func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, con
 		}
 		if parseErr != nil {
 			return nil, parseErr
+		}
+		for _, extra := range kbuildExtras {
+			extraRoot := sourceRoots[extra.Name]
+			if extraRoot == "" {
+				extraRoot = filepath.Dir(workspacePath(extra.Path))
+			}
+			extraKb, err := kconfig.ParseKbuildDirectoryTree(workspacePath(extra.Path), kconfig.KbuildOptions{
+				RootDir:         extraRoot,
+				Variables:       kbuildVariablesForConfig(vars, resolved),
+				MaxIncludeDepth: 64,
+			})
+			if err != nil {
+				return nil, err
+			}
+			kb = kconfig.MergeKbuildFiles(kb, kconfig.PrefixKbuildFile(extraKb, extra.Name))
 		}
 		part, err := tree.CompactMetadataWithOptions(kb, []kconfig.NamedConfig{config}, opts)
 		if err != nil {

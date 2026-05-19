@@ -52,6 +52,16 @@ def _run_compact_generator(rctx):
         args.extend(["-source_root_label", rctx.attr.source_root_label])
     for label in rctx.attr.source_tree_labels:
         args.extend(["-source_tree_label", label])
+    for label, prefix in rctx.attr.extra_kconfigs.items():
+        path = rctx.path(label)
+        args.extend(["-source_root_map", "%s=%s" % (prefix, path.dirname)])
+        args.extend(["-kconfig_extra", "%s=%s" % (prefix, path)])
+    for label, prefix in rctx.attr.extra_kbuilds.items():
+        path = rctx.path(label)
+        args.extend(["-source_root_map", "%s=%s" % (prefix, path.dirname)])
+        args.extend(["-kbuild_extra", "%s=%s" % (prefix, path)])
+    for prefix, label_package in sorted(rctx.attr.extra_source_label_packages.items()):
+        args.extend(["-source_label_map", "%s=%s" % (prefix, label_package)])
     for key, value in sorted(rctx.attr.vars.items()):
         args.extend(["-var", "%s=%s" % (key, value)])
     for key, value in sorted(env.items()):
@@ -101,6 +111,17 @@ linux_compact_repository = repository_rule(
         ),
         "env": attr.string_dict(
             doc = "Hermetic Kconfig preprocessor environment values.",
+        ),
+        "extra_kbuilds": attr.label_keyed_string_dict(
+            allow_files = True,
+            doc = "Map of extra Kbuild/Makefile labels to virtual Linux source prefixes.",
+        ),
+        "extra_kconfigs": attr.label_keyed_string_dict(
+            allow_files = True,
+            doc = "Map of extra Kconfig labels to virtual Linux source prefixes.",
+        ),
+        "extra_source_label_packages": attr.string_dict(
+            doc = "Map of virtual Linux source prefixes to Bazel label packages used for generated source labels.",
         ),
         "generated_headers": attr.string(
             doc = "Label emitted for generated Linux headers.",

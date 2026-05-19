@@ -123,6 +123,7 @@ type KbuildCondition struct {
 type KbuildOptions struct {
 	RootDir         string
 	RootMakefiles   []string
+	SourceRoots     map[string]string
 	Variables       map[string]string
 	MaxIncludeDepth int
 }
@@ -180,6 +181,20 @@ func ParseKbuildDirectoryTree(path string, opts KbuildOptions) (*KbuildFile, err
 		stack:   map[string]bool{},
 	}
 	return parser.parsePath(path, "", KbuildCondition{Kind: "const", State: "y"}, true)
+}
+
+func MergeKbuildFiles(parts ...*KbuildFile) *KbuildFile {
+	out := &KbuildFile{}
+	for _, part := range parts {
+		if part != nil {
+			out.merge(part)
+		}
+	}
+	return out
+}
+
+func PrefixKbuildFile(kb *KbuildFile, dir string) *KbuildFile {
+	return prefixKbuildFile(kb, dir, KbuildCondition{Kind: "const", State: "y"}, true)
 }
 
 func ParseKbuild(r io.Reader, filename string) (*KbuildFile, error) {
@@ -1619,6 +1634,21 @@ func (p *kbuildTreeParser) resolvePath(path, baseDir string) string {
 	}
 	if _, err := os.Stat(path); err == nil {
 		return path
+	}
+	if baseDir != "" {
+		candidate := filepath.Join(baseDir, path)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	if p.opts.RootDir != "" {
+		candidate := filepath.Join(p.opts.RootDir, path)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	if mapped, ok := mappedSourceRootPath(path, p.opts.SourceRoots); ok {
+		return mapped
 	}
 	if baseDir != "" {
 		return filepath.Join(baseDir, path)

@@ -14,7 +14,7 @@ go_library(
 go_binary(
     name = "kconfig",
     embed = [":kconfig_lib"],
-    visibility = ["//:__subpackages__"],
+    visibility = ["//visibility:public"],
 )
 
 go_test(

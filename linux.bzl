@@ -98,6 +98,9 @@ _compact = tag_class(
             default = True,
             doc = "Follow active Kbuild directory descent when generating compact metadata.",
         ),
+        "extra_sources": attr.string_list(
+            doc = "Names of linux_kernel.extra_source tags to include in this compact source view.",
+        ),
         "name": attr.string(
             doc = "Generated compact repository name.",
             mandatory = True,
@@ -105,6 +108,34 @@ _compact = tag_class(
         "source_repo": attr.string(
             doc = "Generated or external Linux source repository name.",
             mandatory = True,
+        ),
+    },
+)
+
+_extra_source = tag_class(
+    attrs = {
+        "kbuild": attr.label(
+            allow_single_file = True,
+            doc = "Kbuild or Makefile entry point for this extra source root.",
+        ),
+        "kconfig": attr.label(
+            allow_single_file = True,
+            doc = "Kconfig entry point for this extra source root.",
+        ),
+        "name": attr.string(
+            doc = "Extra source name referenced by compact extra_sources.",
+            mandatory = True,
+        ),
+        "source_dir": attr.string(
+            doc = "Virtual Linux source directory, for example fs/actiondfs.",
+            mandatory = True,
+        ),
+        "source_label_package": attr.string(
+            doc = "Bazel label package for generated source labels. Defaults to the package of kbuild, kconfig, or the first src.",
+        ),
+        "srcs": attr.label_list(
+            allow_files = True,
+            doc = "Files belonging to this extra source root.",
         ),
     },
 )
@@ -119,6 +150,7 @@ _LINUX_ARCHIVE_EXCLUDES = [
 def _linux_kernel_impl(mctx):
     archives = {}
     compacts = {}
+    extras = {}
     kconfigs = {}
     kconfig_tool = None
     kconfig_parse_tool = None
@@ -135,6 +167,10 @@ def _linux_kernel_impl(mctx):
             if compact.name == _KCONFIG_TOOL_REPO:
                 fail("compact repo name %q is reserved for the internal tool repository" % compact.name)
             compacts[compact.name] = compact
+        for extra in module.tags.extra_source:
+            if extra.name in extras:
+                fail("duplicate Linux extra source %q" % extra.name)
+            extras[extra.name] = extra
         for kconfig in module.tags.kconfig:
             if kconfig.name in archives or kconfig.name in compacts or kconfig.name in kconfigs:
                 fail("duplicate generated repo %q" % kconfig.name)
@@ -225,11 +261,34 @@ def _linux_kernel_impl(mctx):
             "SRCARCH": arch.srcarch,
         }
         label_repo = compact.config.repo_name
+        extra_kconfigs = {}
+        extra_kbuilds = {}
+        extra_source_label_packages = {}
+        extra_source_tree_labels = []
+        for extra_name in compact.extra_sources:
+            if extra_name not in extras:
+                fail("compact repo %q references unknown Linux extra source %q" % (compact.name, extra_name))
+            extra = extras[extra_name]
+            prefix_dir = _source_dir(extra.source_dir)
+            if extra.kconfig:
+                extra_kconfigs[extra.kconfig] = prefix_dir
+            if extra.kbuild:
+                extra_kbuilds[extra.kbuild] = prefix_dir
+            label_package = extra.source_label_package
+            if not label_package:
+                label_package = _label_package_for_extra(extra)
+            if label_package:
+                extra_source_label_packages[prefix_dir] = label_package
+            for src in extra.srcs:
+                extra_source_tree_labels.append(_label_string(src))
         linux_compact_repository(
             name = compact.name,
             config = compact.config,
             config_name = arch.config_name,
             env = env,
+            extra_kbuilds = extra_kbuilds,
+            extra_kconfigs = extra_kconfigs,
+            extra_source_label_packages = extra_source_label_packages,
             generated_headers = _package_label(label_repo, compact.kernel_package, prefix + "_" + arch.arch + "_generated_headers"),
             generated_visibility = compact.generated_visibility,
             kbuild = "%s//:Kbuild" % source_repo,
@@ -240,7 +299,7 @@ def _linux_kernel_impl(mctx):
             source_config = _package_label(label_repo, compact.kernel_package, prefix + "_config"),
             source_label_package = source_repo + "//",
             source_root_label = "%s//:Kconfig" % source_repo,
-            source_tree_labels = ["%s//:all" % source_repo],
+            source_tree_labels = ["%s//:all" % source_repo] + extra_source_tree_labels,
             vars = compact_vars,
         )
     return mctx.extension_metadata(reproducible = True)
@@ -250,6 +309,7 @@ linux_kernel = module_extension(
     tag_classes = {
         "archive": _archive,
         "compact": _compact,
+        "extra_source": _extra_source,
         "kconfig": _kconfig,
         "kconfig_tool": _kconfig_tool,
     },
@@ -281,3 +341,30 @@ def _package_label(repo_name, package, name):
     if package:
         return "%s//%s:%s" % (repo, package, name)
     return "%s//:%s" % (repo, name)
+
+def _source_dir(path):
+    path = path.strip("/")
+    if not path or path == ".":
+        fail("Linux extra source_dir must not be empty")
+    return path
+
+def _label_string(label):
+    repo = "@@%s" % label.repo_name if label.repo_name else "@@"
+    if label.package:
+        return "%s//%s:%s" % (repo, label.package, label.name)
+    return "%s//:%s" % (repo, label.name)
+
+def _label_package_for_extra(extra):
+    labels = []
+    if extra.kbuild:
+        labels.append(extra.kbuild)
+    if extra.kconfig:
+        labels.append(extra.kconfig)
+    labels.extend(extra.srcs)
+    if not labels:
+        return ""
+    label = labels[0]
+    repo = "@@%s" % label.repo_name if label.repo_name else "@@"
+    if label.package:
+        return "%s//%s" % (repo, label.package)
+    return "%s//" % repo

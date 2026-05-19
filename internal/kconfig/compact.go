@@ -54,16 +54,17 @@ type CompactObjectPackage struct {
 }
 
 type CompactBuildFileOptions struct {
-	Arch               string
-	Visibility         []string
-	RuleLoadLabel      string
-	SourceLabelPackage string
-	SourceASN1Compiler string
-	SourceRootLabel    string
-	SourceTreeLabels   []string
-	GeneratedHeaders   string
-	SourceConfig       string
-	Srcarch            string
+	Arch                string
+	Visibility          []string
+	RuleLoadLabel       string
+	SourceLabelPackage  string
+	SourceLabelPackages map[string]string
+	SourceASN1Compiler  string
+	SourceRootLabel     string
+	SourceTreeLabels    []string
+	GeneratedHeaders    string
+	SourceConfig        string
+	Srcarch             string
 }
 
 type CompactImageBuildFileOptions struct {
@@ -74,8 +75,9 @@ type CompactImageBuildFileOptions struct {
 }
 
 type CompactMetadataOptions struct {
-	ObjectDir  string
-	SourceRoot string
+	ObjectDir   string
+	SourceRoot  string
+	SourceRoots map[string]string
 }
 
 func (t *Tree) CompactMetadata(kb *KbuildFile, configs []NamedConfig) (*CompactMetadata, error) {
@@ -652,7 +654,7 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 	}
 	delete(stack, name)
 
-	source := sourceForObject(opts.SourceRoot, opts.ObjectDir, object.object)
+	source := sourceForObject(opts.SourceRoot, opts.ObjectDir, object.object, opts.SourceRoots)
 	if len(members) != 0 {
 		source = ""
 	}
@@ -777,20 +779,26 @@ func kbuildFlagLanguageMatchesSource(language string, source string) bool {
 	}
 }
 
-func sourceForObject(sourceRoot, objectDir, object string) string {
-	if sourceRoot == "" || !strings.HasSuffix(object, ".o") {
+func sourceForObject(sourceRoot, objectDir, object string, sourceRoots map[string]string) string {
+	if !strings.HasSuffix(object, ".o") {
 		return ""
 	}
 	for _, mapped := range sourceCandidatesForObject(object) {
 		candidate := filepath.ToSlash(filepath.Join(objectDir, mapped))
-		if fileExists(filepath.Join(sourceRoot, filepath.FromSlash(candidate))) {
+		if sourceRoot != "" && fileExists(filepath.Join(sourceRoot, filepath.FromSlash(candidate))) {
+			return candidate
+		}
+		if mappedPath, ok := mappedSourceRootPath(candidate, sourceRoots); ok && fileExists(mappedPath) {
 			return candidate
 		}
 	}
 	stem := strings.TrimSuffix(object, ".o")
 	for _, ext := range []string{".c", ".S", ".s"} {
 		candidate := filepath.ToSlash(filepath.Join(objectDir, stem+ext))
-		if fileExists(filepath.Join(sourceRoot, filepath.FromSlash(candidate))) {
+		if sourceRoot != "" && fileExists(filepath.Join(sourceRoot, filepath.FromSlash(candidate))) {
+			return candidate
+		}
+		if mappedPath, ok := mappedSourceRootPath(candidate, sourceRoots); ok && fileExists(mappedPath) {
 			return candidate
 		}
 	}
@@ -1074,7 +1082,7 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 			if opts.Arch != "" {
 				r.SetAttr("arch", opts.Arch)
 			}
-			r.SetAttr("src", labelFor(opts.SourceLabelPackage, variant.Source))
+			r.SetAttr("src", labelForSource(opts, variant.Source))
 			if opts.SourceConfig != "" {
 				r.SetAttr("config", opts.SourceConfig)
 			} else {
@@ -1118,6 +1126,33 @@ func localLabels(targets []string) []string {
 		labels = append(labels, ":"+target)
 	}
 	return labels
+}
+
+func labelForSource(opts CompactBuildFileOptions, source string) string {
+	if len(opts.SourceLabelPackages) != 0 {
+		prefixes := make([]string, 0, len(opts.SourceLabelPackages))
+		for prefix := range opts.SourceLabelPackages {
+			prefix = strings.Trim(filepath.ToSlash(prefix), "/")
+			if prefix != "" && prefix != "." {
+				prefixes = append(prefixes, prefix)
+			}
+		}
+		sort.Slice(prefixes, func(i, j int) bool {
+			if len(prefixes[i]) == len(prefixes[j]) {
+				return prefixes[i] < prefixes[j]
+			}
+			return len(prefixes[i]) > len(prefixes[j])
+		})
+		for _, prefix := range prefixes {
+			if source != prefix && !strings.HasPrefix(source, prefix+"/") {
+				continue
+			}
+			target := strings.TrimPrefix(source, prefix)
+			target = strings.TrimPrefix(target, "/")
+			return labelFor(opts.SourceLabelPackages[prefix], target)
+		}
+	}
+	return labelFor(opts.SourceLabelPackage, source)
 }
 
 func (m *CompactMetadata) objectBuildFileNeedsConfig(opts CompactBuildFileOptions) bool {

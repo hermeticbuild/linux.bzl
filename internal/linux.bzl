@@ -9,6 +9,8 @@ def linux(
         config,
         source_repo = "@linux_6_18_2",
         compact_repos = None,
+        extra_kconfigs = None,
+        extra_srcs = None,
         image_format = "auto",
         generated_dir = "generated",
         visibility = None,
@@ -22,6 +24,10 @@ def linux(
     """
     if compact_repos == None:
         compact_repos = {}
+    if extra_kconfigs == None:
+        extra_kconfigs = {}
+    if extra_srcs == None:
+        extra_srcs = []
     source_repo = _normalize_repo(source_repo)
     source_root = _repo_label(source_repo, "Kconfig")
     source_tree = [_repo_label(source_repo, "all")]
@@ -34,6 +40,8 @@ def linux(
             arch = arch,
             config = config,
             compact_repo = compact_repos.get(arch.config_name),
+            extra_kconfigs = extra_kconfigs,
+            extra_srcs = extra_srcs,
             generated_dir = generated_dir,
             image_format = image_format,
             package_visibility = package_visibility,
@@ -62,6 +70,8 @@ def _define_arch_kernel(
         arch,
         config,
         compact_repo,
+        extra_kconfigs,
+        extra_srcs,
         generated_dir,
         image_format,
         package_visibility,
@@ -93,11 +103,12 @@ def _define_arch_kernel(
 
     linux_resolved_config(
         name = config_target,
-        srcs = source_tree,
         config = config,
         env = env,
+        extra_kconfigs = extra_kconfigs,
         root = source_root,
         source_root = source_root,
+        srcs = source_tree + extra_srcs,
         target_compatible_with = [arch.platform],
         vars = compact_vars,
         visibility = generated_visibility,

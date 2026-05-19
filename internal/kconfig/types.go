@@ -11,6 +11,7 @@ import (
 
 type Options struct {
 	RootDir         string
+	SourceRoots     map[string]string
 	Variables       map[string]string
 	Env             map[string]string
 	UseHostEnv      bool

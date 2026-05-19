@@ -84,10 +84,22 @@ func (p *parser) parseReader(r io.Reader, filename string, parent *Menu) error {
 }
 
 func (p *parser) resolvePath(path string) string {
-	if filepath.IsAbs(path) || p.rootDir == "" {
+	if filepath.IsAbs(path) {
 		return path
 	}
 	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	if p.rootDir != "" {
+		candidate := filepath.Join(p.rootDir, path)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	if mapped, ok := mappedSourceRootPath(path, p.opts.SourceRoots); ok {
+		return mapped
+	}
+	if p.rootDir == "" {
 		return path
 	}
 	return filepath.Join(p.rootDir, path)

@@ -489,6 +489,12 @@ def _unique_strings(values):
         out.append(value)
     return out
 
+def _single_file(target, attr_name):
+    files = target.files.to_list()
+    if len(files) != 1:
+        fail("%s entry %s must provide exactly one file, got %d" % (attr_name, target.label, len(files)))
+    return files[0]
+
 def _linux_config_cflags(config):
     if config:
         return ["@" + config.cflags.path]
@@ -2549,6 +2555,12 @@ def _linux_resolved_config_impl(ctx):
     args = ctx.actions.args()
     args.add("-root", ctx.file.root)
     args.add("-srctree", source_root)
+    extra_kconfig_inputs = []
+    for target, prefix in ctx.attr.extra_kconfigs.items():
+        file = _single_file(target, "extra_kconfigs")
+        args.add("-source_root_map", "%s=%s" % (prefix, file.dirname))
+        args.add("-kconfig_extra", "%s=%s" % (prefix, file.path))
+        extra_kconfig_inputs.append(file)
     args.add("-resolve_config", "%s=%s" % (ctx.attr.config_name if ctx.attr.config_name else ctx.label.name, fragment.path))
     args.add("-resolved_config_out", config)
     args.add("-resolved_auto_conf_out", auto_conf)
@@ -2563,7 +2575,7 @@ def _linux_resolved_config_impl(ctx):
     for key, value in sorted(env.items()):
         args.add("-env", "%s=%s" % (key, value))
 
-    inputs = [ctx.file.root, fragment] + ctx.files.srcs
+    inputs = [ctx.file.root, fragment] + ctx.files.srcs + extra_kconfig_inputs
     if ctx.file.source_root:
         inputs.append(ctx.file.source_root)
     ctx.actions.run(
@@ -2627,6 +2639,10 @@ linux_resolved_config = rule(
         ),
         "env": attr.string_dict(
             doc = "Hermetic Kconfig preprocessor environment values.",
+        ),
+        "extra_kconfigs": attr.label_keyed_string_dict(
+            allow_files = True,
+            doc = "Map of extra Kconfig labels to virtual Linux source prefixes.",
         ),
         "probe_model": attr.string(
             default = "linux_llvm",
