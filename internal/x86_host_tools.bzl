@@ -276,7 +276,7 @@ def linux_x86_host_tools(
         visibility = visibility,
         deps = [
             ":" + objtool_inputs,
-            "@libelf//:elf",
+            Label("@libelf//:elf"),
             source_label(source_repo, "tools_headers_cc"),
         ],
     )

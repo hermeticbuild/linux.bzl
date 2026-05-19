@@ -18,6 +18,9 @@ bazel_dep(name = "rules_perl", version = "0.5.0")
 bazel_dep(name = "rules_qemu", version = "0.1.1", dev_dependency = True)
 bazel_dep(name = "tar.bzl", version = "0.9.0", dev_dependency = True)
 
+linux_bzl_libelf = use_extension("//internal:libelf_repositories.bzl", "linux_bzl_libelf")
+use_repo(linux_bzl_libelf, "libelf")
+
 tar_toolchains = use_extension("@tar.bzl//tar:extensions.bzl", "toolchains", dev_dependency = True)
 use_repo(tar_toolchains, "bsd_tar_toolchains")
 

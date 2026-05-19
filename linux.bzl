@@ -116,13 +116,13 @@ _LINUX_ARCHIVE_EXCLUDES = [
     "*/Build",
 ]
 
-def _linux_kernel_impl(module_ctx):
+def _linux_kernel_impl(mctx):
     archives = {}
     compacts = {}
     kconfigs = {}
     kconfig_tool = None
     kconfig_parse_tool = None
-    for module in module_ctx.modules:
+    for module in mctx.modules:
         for archive in module.tags.archive:
             if archive.name in archives:
                 fail("duplicate Linux archive repo %q" % archive.name)
@@ -243,6 +243,7 @@ def _linux_kernel_impl(module_ctx):
             source_tree_labels = ["%s//:all" % source_repo],
             vars = compact_vars,
         )
+    return mctx.extension_metadata(reproducible = True)
 
 linux_kernel = module_extension(
     implementation = _linux_kernel_impl,
