@@ -3,20 +3,51 @@ load("@tar.bzl//tar:tar.bzl", "tar")
 
 package(default_visibility = ["//visibility:public"])
 
+_PLATFORMS = [
+    "darwin_amd64",
+    "darwin_arm64",
+    "linux_amd64",
+    "linux_arm64",
+    "windows_amd64",
+    "windows_arm64",
+]
+
+_ARCHIVES = {
+    "kconfig-darwin-amd64": "darwin_amd64",
+    "kconfig-darwin-arm64": "darwin_arm64",
+    "kconfig-linux-amd64": "linux_amd64",
+    "kconfig-linux-arm64": "linux_arm64",
+    "kconfig-windows-amd64": "windows_amd64",
+    "kconfig-windows-arm64": "windows_arm64",
+}
+
 [
     platform_transition_filegroup(
-        name = "for_" + platform,
+        name = "kconfig_for_" + platform,
         srcs = ["//internal/cmd/kconfig"],
         target_platform = "@rules_go//go/toolchain:" + platform,
     )
-    for platform in [
-        "darwin_amd64",
-        "darwin_arm64",
-        "linux_amd64",
-        "linux_arm64",
-        "windows_amd64",
-        "windows_arm64",
-    ]
+    for platform in _PLATFORMS
+]
+
+[
+    platform_transition_filegroup(
+        name = "kconfig_parse_for_" + platform,
+        srcs = ["//internal/cmd/kconfig_parse"],
+        target_platform = "@rules_go//go/toolchain:" + platform,
+    )
+    for platform in _PLATFORMS
+]
+
+[
+    filegroup(
+        name = "for_" + platform,
+        srcs = [
+            ":kconfig_for_" + platform,
+            ":kconfig_parse_for_" + platform,
+        ],
+    )
+    for platform in _PLATFORMS
 ]
 
 filegroup(
@@ -34,20 +65,17 @@ filegroup(
 [
     tar(
         name = archive,
-        srcs = [":for_" + platform],
+        srcs = [
+            ":kconfig_for_" + platform,
+            ":kconfig_parse_for_" + platform,
+        ],
         compress = "gzip",
         mtree = [
-            "kconfig uid=0 gid=0 mode=0755 time=0 type=file content=$(location :for_{})".format(platform),
+            "kconfig uid=0 gid=0 mode=0755 time=0 type=file content=$(location :kconfig_for_{})".format(platform),
+            "kconfig_parse uid=0 gid=0 mode=0755 time=0 type=file content=$(location :kconfig_parse_for_{})".format(platform),
         ],
     )
-    for archive, platform in {
-        "kconfig-darwin-amd64": "darwin_amd64",
-        "kconfig-darwin-arm64": "darwin_arm64",
-        "kconfig-linux-amd64": "linux_amd64",
-        "kconfig-linux-arm64": "linux_arm64",
-        "kconfig-windows-amd64": "windows_amd64",
-        "kconfig-windows-arm64": "windows_arm64",
-    }.items()
+    for archive, platform in _ARCHIVES.items()
 ]
 
 filegroup(

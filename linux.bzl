@@ -1,6 +1,8 @@
 """Public entry points for Bazel-native Linux kernel builds."""
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("//internal:architectures.bzl", "linux_architectures")
+load("//internal:compact_repositories.bzl", "linux_compact_repository")
 load("//internal:kconfig_repositories.bzl", "kconfig_repository", "kconfig_tool_repository")
 load("//internal:linux.bzl", _linux = "linux")
 load("//internal:linux_objects.bzl", _linux_compressed_image = "linux_compressed_image", _linux_generated_file = "linux_generated_file", _linux_module = "linux_module", _linux_vmlinux = "linux_vmlinux")
@@ -55,9 +57,50 @@ _kconfig = tag_class(
 
 _kconfig_tool = tag_class(
     attrs = {
+        "parse_tool": attr.label(
+            allow_single_file = True,
+            doc = "Optional host kconfig_parse executable override. Required with local tool overrides when compact repositories are declared.",
+        ),
         "tool": attr.label(
             allow_single_file = True,
             doc = "Optional host kconfig executable override. Intended for local development before published prebuilts are available.",
+            mandatory = True,
+        ),
+    },
+)
+
+_compact = tag_class(
+    attrs = {
+        "config": attr.label(
+            allow_single_file = True,
+            doc = "Linux .config fragment used as the source of truth.",
+            mandatory = True,
+        ),
+        "config_name": attr.string(
+            doc = "Linux architecture config name, such as x86_64 or aarch64.",
+            mandatory = True,
+        ),
+        "generated_visibility": attr.string_list(
+            default = ["//visibility:public"],
+            doc = "Visibility emitted into the generated compact BUILD file.",
+        ),
+        "kernel_name": attr.string(
+            doc = "Name of the linux(...) target consuming this compact repository.",
+            mandatory = True,
+        ),
+        "kernel_package": attr.string(
+            doc = "Package containing the linux(...) target. Empty means the root package.",
+        ),
+        "kbuild_tree": attr.bool(
+            default = True,
+            doc = "Follow active Kbuild directory descent when generating compact metadata.",
+        ),
+        "name": attr.string(
+            doc = "Generated compact repository name.",
+            mandatory = True,
+        ),
+        "source_repo": attr.string(
+            doc = "Generated or external Linux source repository name.",
             mandatory = True,
         ),
     },
@@ -67,17 +110,25 @@ _KCONFIG_TOOL_REPO = "linux_bzl_kconfig_tool"
 
 def _linux_kernel_impl(module_ctx):
     archives = {}
+    compacts = {}
     kconfigs = {}
     kconfig_tool = None
+    kconfig_parse_tool = None
     for module in module_ctx.modules:
         for archive in module.tags.archive:
             if archive.name in archives:
                 fail("duplicate Linux archive repo %q" % archive.name)
-            if archive.name in kconfigs:
+            if archive.name in compacts or archive.name in kconfigs:
                 fail("duplicate generated repo %q" % archive.name)
             archives[archive.name] = archive
+        for compact in module.tags.compact:
+            if compact.name in archives or compact.name in compacts or compact.name in kconfigs:
+                fail("duplicate generated repo %q" % compact.name)
+            if compact.name == _KCONFIG_TOOL_REPO:
+                fail("compact repo name %q is reserved for the internal tool repository" % compact.name)
+            compacts[compact.name] = compact
         for kconfig in module.tags.kconfig:
-            if kconfig.name in archives or kconfig.name in kconfigs:
+            if kconfig.name in archives or kconfig.name in compacts or kconfig.name in kconfigs:
                 fail("duplicate generated repo %q" % kconfig.name)
             if kconfig.name == _KCONFIG_TOOL_REPO:
                 fail("kconfig repo name %q is reserved for the internal tool repository" % kconfig.name)
@@ -86,6 +137,7 @@ def _linux_kernel_impl(module_ctx):
             if kconfig_tool != None:
                 fail("linux_kernel.kconfig_tool may only be declared once")
             kconfig_tool = tool.tool
+            kconfig_parse_tool = tool.parse_tool
 
     for repo in sorted(archives.keys()):
         archive = archives[repo]
@@ -120,9 +172,19 @@ def _linux_kernel_impl(module_ctx):
             kwargs["patch_tool"] = archive.patch_tool
         http_archive(**kwargs)
 
-    if kconfigs and kconfig_tool == None:
-        kconfig_tool_repository(name = _KCONFIG_TOOL_REPO)
+    if (kconfigs or compacts) and kconfig_tool == None:
+        tools = ["kconfig"]
+        if compacts:
+            tools.append("kconfig_parse")
+        kconfig_tool_repository(
+            name = _KCONFIG_TOOL_REPO,
+            tools = tools,
+        )
         kconfig_tool = "@%s//:kconfig" % _KCONFIG_TOOL_REPO
+        if compacts:
+            kconfig_parse_tool = "@%s//:kconfig_parse" % _KCONFIG_TOOL_REPO
+    elif compacts and kconfig_parse_tool == None:
+        fail("linux_kernel.kconfig_tool(parse_tool = ...) is required when compact repositories are declared with a local kconfig tool override")
 
     for repo in sorted(kconfigs.keys()):
         kconfig = kconfigs[repo]
@@ -134,11 +196,62 @@ def _linux_kernel_impl(module_ctx):
             kconfig_tool = kconfig_tool,
         )
 
+    for repo in sorted(compacts.keys()):
+        compact = compacts[repo]
+        arch = _architecture(compact.config_name)
+        source_repo = _normalize_repo(compact.source_repo)
+        prefix = compact.kernel_name + "_" + arch.config_name
+        compact_vars = dict(arch.compact_vars)
+        compact_vars.update({
+            "ARCH": arch.arch,
+            "SRCARCH": arch.srcarch,
+            "UTS_MACHINE": arch.uts_machine,
+        })
+        env = {
+            "ARCH": arch.arch,
+            "SRCARCH": arch.srcarch,
+        }
+        linux_compact_repository(
+            name = compact.name,
+            config = compact.config,
+            config_name = arch.config_name,
+            env = env,
+            generated_headers = _package_label(compact.kernel_package, prefix + "_" + arch.arch + "_generated_headers"),
+            generated_visibility = compact.generated_visibility,
+            kbuild = "%s//:Kbuild" % source_repo,
+            kbuild_tree = compact.kbuild_tree,
+            kconfig_parse_tool = kconfig_parse_tool,
+            root = "%s//:Kconfig" % source_repo,
+            source_asn1_compiler = _package_label(compact.kernel_package, prefix + "_asn1_compiler_tool"),
+            source_config = _package_label(compact.kernel_package, prefix + "_config"),
+            source_label_package = source_repo + "//",
+            source_root_label = "%s//:Kconfig" % source_repo,
+            source_tree_labels = ["%s//:all" % source_repo],
+            vars = compact_vars,
+        )
+
 linux_kernel = module_extension(
     implementation = _linux_kernel_impl,
     tag_classes = {
         "archive": _archive,
+        "compact": _compact,
         "kconfig": _kconfig,
         "kconfig_tool": _kconfig_tool,
     },
 )
+
+def _architecture(config_name):
+    for arch in linux_architectures():
+        if arch.config_name == config_name:
+            return arch
+    fail("unsupported Linux compact config_name %q" % config_name)
+
+def _normalize_repo(repo):
+    if repo.startswith("@"):
+        return repo
+    return "@" + repo
+
+def _package_label(package, name):
+    if package:
+        return "@//%s:%s" % (package, name)
+    return "@//:%s" % name

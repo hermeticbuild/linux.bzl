@@ -22,6 +22,7 @@ use_repo(tar_toolchains, "bsd_tar_toolchains")
 
 register_toolchains(
     "@bsd_tar_toolchains//:all",
+    "@llvm//toolchain:all",
     dev_dependency = True,
 )
 

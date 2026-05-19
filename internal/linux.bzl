@@ -8,6 +8,7 @@ def linux(
         name,
         config,
         source_repo = "@linux_6_18_2",
+        compact_repos = None,
         image_format = "auto",
         generated_dir = "generated",
         visibility = None,
@@ -19,6 +20,8 @@ def linux(
     final image target so Bazel can cache each architecture independently. The
     config label may itself be a platform-selected alias.
     """
+    if compact_repos == None:
+        compact_repos = {}
     source_repo = _normalize_repo(source_repo)
     source_root = _repo_label(source_repo, "Kconfig")
     source_tree = [_repo_label(source_repo, "all")]
@@ -30,6 +33,7 @@ def linux(
             name = name,
             arch = arch,
             config = config,
+            compact_repo = compact_repos.get(arch.config_name),
             generated_dir = generated_dir,
             image_format = image_format,
             package_visibility = package_visibility,
@@ -57,6 +61,7 @@ def _define_arch_kernel(
         name,
         arch,
         config,
+        compact_repo,
         generated_dir,
         image_format,
         package_visibility,
@@ -106,30 +111,34 @@ def _define_arch_kernel(
         visibility = package_visibility,
     )
 
-    linux_compact_buildfiles(
-        name = buildfiles_target,
-        config = config,
-        config_name = arch.config_name,
-        generated_headers = host_tools.generated_headers,
-        generated_visibility = package_visibility,
-        kbuild = _repo_label(source_repo, "Kbuild"),
-        kbuild_tree = True,
-        object_label_package = compact_package,
-        out_buildfile = _join_path(arch_generated_dir, "build/BUILD.bazel"),
-        out_metadata = _join_path(arch_generated_dir, "build/metadata.json"),
-        probe_config = host_tools.probe_config,
-        root = source_root,
-        source_asn1_compiler = host_tools.source_asn1_compiler,
-        source_config = _package_label(config_target),
-        source_label_package = host_tools.source_label_package,
-        source_root_label = host_tools.source_root,
-        source_tree_labels = host_tools.source_tree,
-        srcs = source_tree,
-        target_compatible_with = [arch.platform],
-        tags = tags,
-        vars = compact_vars,
-        visibility = package_visibility,
-    )
+    if compact_repo:
+        compact_image = "%s//:%s_image" % (_normalize_repo(compact_repo), arch.config_name)
+    else:
+        linux_compact_buildfiles(
+            name = buildfiles_target,
+            config = config,
+            config_name = arch.config_name,
+            generated_headers = host_tools.generated_headers,
+            generated_visibility = package_visibility,
+            kbuild = _repo_label(source_repo, "Kbuild"),
+            kbuild_tree = True,
+            object_label_package = compact_package,
+            out_buildfile = _join_path(arch_generated_dir, "build/BUILD.bazel"),
+            out_metadata = _join_path(arch_generated_dir, "build/metadata.json"),
+            probe_config = host_tools.probe_config,
+            root = source_root,
+            source_asn1_compiler = host_tools.source_asn1_compiler,
+            source_config = _package_label(config_target),
+            source_label_package = host_tools.source_label_package,
+            source_root_label = host_tools.source_root,
+            source_tree_labels = host_tools.source_tree,
+            srcs = source_tree,
+            target_compatible_with = [arch.platform],
+            tags = tags,
+            vars = compact_vars,
+            visibility = package_visibility,
+        )
+        compact_image = "//%s:%s_image" % (compact_package, arch.config_name)
 
     vmlinux_kwargs = {
         "name": vmlinux_target,
@@ -137,7 +146,7 @@ def _define_arch_kernel(
         "config": ":" + config_target,
         "format": arch.vmlinux_format,
         "generated_headers": host_tools.generated_headers,
-        "image": "//%s:%s_image" % (compact_package, arch.config_name),
+        "image": compact_image,
         "kallsyms_tool": host_tools.kallsyms_tool,
         "linker_script": _repo_label(source_repo, arch.vmlinux_linker_script),
         "source_root": source_root,

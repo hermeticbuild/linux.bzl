@@ -1,0 +1,31 @@
+common --enable_platform_specific_config
+common --heap_dump_on_oom
+common --incompatible_enforce_starlark_utf8=error
+common --incompatible_modify_execution_info_additive
+common --module_mirrors="https://bcr.cloudflaremirrors.com"
+common --nobuild_runfile_links
+common --noexperimental_check_external_repository_files
+common --nosandbox_default_allow_network
+common --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+common --repo_env=BAZEL_NO_APPLE_CPP_TOOLCHAIN=1
+common --show_result=20
+common --test_output=errors
+
+common --check_direct_dependencies=off
+
+common --bes_results_url=https://app.buildbuddy.io/invocation/
+common --bes_backend=grpcs://remote.buildbuddy.io
+common --experimental_remote_downloader=grpcs://remote.buildbuddy.io
+common --grpc_keepalive_time=30s
+common --remote_cache=grpcs://remote.buildbuddy.io
+common --remote_cache_compression
+common --remote_download_toplevel
+common --remote_timeout=120
+common --noexperimental_throttle_remote_action_building
+common --experimental_remote_execution_keepalive
+
+common:remote --remote_executor=grpcs://remote.buildbuddy.io
+common:remote --jobs=800
+common:remote --extra_execution_platforms=@llvm//:rbe_platform
+
+try-import %workspace%/.bazelrc.user

@@ -5,7 +5,7 @@ load("//internal:kconfig_tool_releases.bzl", "KCONFIG_TOOL_RELEASES", "KCONFIG_T
 _KCONFIG_TOOL_BUILD = """\
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["{tool}"])
+exports_files({tools})
 """
 
 _OS_NAMES = {
@@ -28,9 +28,6 @@ def _host_platform(rctx):
         fail("unsupported kconfig host platform: os=%r arch=%r" % (rctx.os.name, rctx.os.arch))
     return "{}_{}".format(os_name, arch_name)
 
-def _tool_filename(_platform):
-    return "kconfig"
-
 def _kconfig_tool_repository_impl(rctx):
     platform = _host_platform(rctx)
     release = KCONFIG_TOOL_RELEASES.get(platform)
@@ -49,18 +46,28 @@ def _kconfig_tool_repository_impl(rctx):
     download_kwargs["integrity"] = release.integrity
     rctx.download_and_extract(**download_kwargs)
 
-    tool = _tool_filename(platform)
-    if not rctx.path(tool).exists:
-        fail("kconfig prebuilt archive for %s did not contain %s" % (platform, tool))
+    for tool in rctx.attr.tools:
+        if not rctx.path(tool).exists:
+            fail("kconfig prebuilt archive for %s did not contain required tool %s; publish a new %s archive with all required repo-rule tools" % (
+                platform,
+                tool,
+                KCONFIG_TOOL_VERSION,
+            ))
 
     rctx.file(
         "BUILD.bazel",
-        _KCONFIG_TOOL_BUILD.format(tool = tool),
+        _KCONFIG_TOOL_BUILD.format(tools = repr(rctx.attr.tools)),
     )
     return rctx.repo_metadata(reproducible = True)
 
 kconfig_tool_repository = repository_rule(
     implementation = _kconfig_tool_repository_impl,
+    attrs = {
+        "tools": attr.string_list(
+            default = ["kconfig"],
+            doc = "Tool filenames that must be present in the selected prebuilt archive.",
+        ),
+    },
     doc = "Downloads the host kconfig executable used by repository rules.",
 )
 

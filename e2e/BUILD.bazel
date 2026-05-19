@@ -1,0 +1,14 @@
+load("@linux.bzl//:linux.bzl", "linux")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["tiny.config"])
+
+linux(
+    name = "kernel",
+    compact_repos = {
+        "x86_64": "@tiny_compact",
+    },
+    config = "@tiny_kconfig//:kconfig",
+    source_repo = "@linux_6_18_2",
+)

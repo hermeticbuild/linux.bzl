@@ -1,6 +1,6 @@
 """Release metadata for prebuilt kconfig repository-rule tools.
 
-Each archive must extract a host executable named `kconfig`.
+Each archive must extract the requested host executables at its root.
 """
 
 KCONFIG_TOOL_VERSION = "v0.0.3"

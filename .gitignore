@@ -1,2 +1,3 @@
 *.swp
+.bazelrc.user
 bazel-*

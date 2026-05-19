@@ -1,0 +1,43 @@
+module(
+    name = "linux_bzl_e2e",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "linux.bzl", version = "0.0.0")
+bazel_dep(name = "llvm", version = "0.7.1")
+bazel_dep(name = "platforms", version = "1.0.0")
+
+register_toolchains(
+    "@llvm//toolchain:all",
+    dev_dependency = True,
+)
+
+local_path_override(
+    module_name = "linux.bzl",
+    path = "..",
+)
+
+linux_kernel = use_extension("@linux.bzl//:linux.bzl", "linux_kernel")
+linux_kernel.archive(
+    name = "linux_6_18_2",
+    integrity = "sha256-VYxrurdJSSs0+Zgn/oB7ADmnRGk8IdOn4Ds6SO2quWo=",
+    strip_prefix = "linux-6.18.2",
+    urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.2.tar.xz"],
+)
+linux_kernel.kconfig(
+    name = "tiny_kconfig",
+    config = "//:tiny.config",
+)
+linux_kernel.compact(
+    name = "tiny_compact",
+    config = "//:tiny.config",
+    config_name = "x86_64",
+    kernel_name = "kernel",
+    source_repo = "linux_6_18_2",
+)
+use_repo(
+    linux_kernel,
+    "linux_6_18_2",
+    "tiny_compact",
+    "tiny_kconfig",
+)

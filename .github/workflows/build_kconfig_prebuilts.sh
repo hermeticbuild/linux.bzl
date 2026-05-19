@@ -42,7 +42,6 @@ copy_out //internal/cmd/kconfig/prebuilts:kconfig-windows-arm64
     integrity="sha256-$(openssl dgst -sha256 -binary "${archive}" | openssl base64 -A)"
     {
       echo "${archive}"
-      echo "sha256=$(awk -v archive="${archive}" '$2 == archive {print $1}' SHA256SUMS)"
       echo "integrity=${integrity}"
     }
   done > kconfig_tool_releases.metadata
