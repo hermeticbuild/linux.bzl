@@ -2561,6 +2561,8 @@ def _linux_resolved_config_impl(ctx):
         args.add("-source_root_map", "%s=%s" % (prefix, file.dirname))
         args.add("-kconfig_extra", "%s=%s" % (prefix, file.path))
         extra_kconfig_inputs.append(file)
+    if ctx.attr.config_mode:
+        args.add("-config_mode", ctx.attr.config_mode)
     args.add("-resolve_config", "%s=%s" % (ctx.attr.config_name if ctx.attr.config_name else ctx.label.name, fragment.path))
     args.add("-resolved_config_out", config)
     args.add("-resolved_auto_conf_out", auto_conf)
@@ -2636,6 +2638,14 @@ linux_resolved_config = rule(
         ),
         "config_name": attr.string(
             doc = "Stable name passed to the Kconfig resolver. Defaults to the rule name.",
+        ),
+        "config_mode": attr.string(
+            default = "default",
+            doc = "Config resolver mode passed to kconfig_parse. Supported: default, allnoconfig.",
+            values = [
+                "default",
+                "allnoconfig",
+            ],
         ),
         "env": attr.string_dict(
             doc = "Hermetic Kconfig preprocessor environment values.",

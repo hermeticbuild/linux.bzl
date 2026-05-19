@@ -83,6 +83,14 @@ _compact = tag_class(
             doc = "Linux architecture config name, such as x86_64 or aarch64.",
             mandatory = True,
         ),
+        "config_mode": attr.string(
+            default = "default",
+            doc = "Config resolver mode. Use allnoconfig for KCONFIG_ALLCONFIG-on-allnoconfig semantics.",
+            values = [
+                "default",
+                "allnoconfig",
+            ],
+        ),
         "generated_visibility": attr.string_list(
             default = ["//visibility:public"],
             doc = "Visibility emitted into the generated compact BUILD file.",
@@ -285,6 +293,7 @@ def _linux_kernel_impl(mctx):
             name = compact.name,
             config = compact.config,
             config_name = arch.config_name,
+            config_mode = compact.config_mode,
             env = env,
             extra_kbuilds = extra_kbuilds,
             extra_kconfigs = extra_kconfigs,

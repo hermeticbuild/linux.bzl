@@ -17,8 +17,9 @@ import (
 )
 
 type NamedConfig struct {
-	Name  string
-	Flags map[string]string
+	Name        string
+	Flags       map[string]string
+	AllNoConfig bool
 }
 
 type CompactMetadata struct {
@@ -132,7 +133,9 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 		}
 		seenConfigs[named.Name] = true
 
-		resolved, err := t.ResolveConfig(named.Name, named.Flags)
+		resolved, err := t.ResolveConfigWithOptions(named.Name, named.Flags, ResolveConfigOptions{
+			AllNoConfig: named.AllNoConfig,
+		})
 		if err != nil {
 			return nil, err
 		}

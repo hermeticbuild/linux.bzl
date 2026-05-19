@@ -295,9 +295,6 @@ func (p *parser) parseChoice(lines []sourceLine, idx int, parent *Menu) (int, er
 	if err != nil {
 		return idx, err
 	}
-	if entry.Prompt == nil {
-		return idx, p.parseError(entry.Position, "choice must have a prompt")
-	}
 	previousChoice := p.currentChoice
 	p.currentChoice = entry
 	idx, err = p.parseBlock(lines, idx, entry, map[string]bool{"endchoice": true})
@@ -420,7 +417,7 @@ func isOptionKeyword(kw string, class optionClass) bool {
 		}
 	case choiceOption:
 		switch kw {
-		case "prompt", "default":
+		case "bool", "tristate", "prompt", "default", "optional":
 			return true
 		}
 	case menuOption:
@@ -435,7 +432,10 @@ func (p *parser) applyOption(entry *Menu, toks []token, class optionClass) error
 	kw := toks[0].value
 	switch kw {
 	case "bool", "tristate", "int", "hex", "string":
-		if class != configOption {
+		if class != configOption && class != choiceOption {
+			return p.parseError(toks[0].pos, "%q is not valid here", kw)
+		}
+		if class == choiceOption && kw != "bool" && kw != "tristate" {
 			return p.parseError(toks[0].pos, "%q is not valid here", kw)
 		}
 		if err := p.setType(entry, typeForKeyword(kw)); err != nil {
@@ -460,6 +460,13 @@ func (p *parser) applyOption(entry *Menu, toks []token, class optionClass) error
 			return err
 		}
 		entry.addProperty(&Property{Type: PropertyPrompt, Text: toks[1].value, Visible: visible, Position: toks[0].pos})
+	case "optional":
+		if class != choiceOption {
+			return p.parseError(toks[0].pos, "%q is not valid here", kw)
+		}
+		if len(toks) != 1 {
+			return p.parseError(toks[0].pos, "optional does not accept arguments")
+		}
 	case "default", "def_bool", "def_tristate":
 		if len(toks) < 2 {
 			return p.parseError(toks[0].pos, "%s expects a value", kw)

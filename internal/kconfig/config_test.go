@@ -55,6 +55,55 @@ config DEFAULT_ON
 	})
 }
 
+func TestResolveConfigAllNoConfigStartsFromN(t *testing.T) {
+	fixture := `
+mainmenu "Test"
+
+config DEFAULT_ON
+	bool "Default on"
+	default y
+
+config GATE
+	bool "Gate"
+	default y
+
+config DEP_DEFAULT
+	bool "Depends default"
+	depends on GATE
+	default y
+
+config SELECTOR
+	bool "Selector"
+	select SELECTED
+
+config SELECTED
+	bool "Selected"
+`
+	resolved := mustResolveConfigWithOptions(t, fixture, nil, ResolveConfigOptions{
+		AllNoConfig: true,
+	})
+	wantConfigValues(t, resolved, map[string]string{
+		"CONFIG_DEFAULT_ON":  "n",
+		"CONFIG_DEP_DEFAULT": "n",
+		"CONFIG_GATE":        "n",
+		"CONFIG_SELECTED":    "n",
+		"CONFIG_SELECTOR":    "n",
+	})
+
+	explicit := mustResolveConfigWithOptions(t, fixture, map[string]string{
+		"CONFIG_SELECTOR": "y",
+	}, ResolveConfigOptions{
+		AllNoConfig: true,
+	})
+	wantConfigValues(t, explicit, map[string]string{
+		"CONFIG_DEFAULT_ON":  "n",
+		"CONFIG_DEP_DEFAULT": "n",
+		"CONFIG_GATE":        "n",
+		"CONFIG_SELECTED":    "y",
+		"CONFIG_SELECTOR":    "y",
+	})
+}
+
 func TestResolveConfigSelectBypassesTargetDepends(t *testing.T) {
 	fixture := `
 mainmenu "Test"
@@ -626,6 +675,41 @@ endchoice
 	})
 }
 
+func TestResolveConfigAllNoConfigDoesNotSelectChoiceDefault(t *testing.T) {
+	fixture := `
+mainmenu "Test"
+
+choice
+	prompt "Mode"
+	default MODE_B
+
+config MODE_A
+	bool "Mode A"
+
+config MODE_B
+	bool "Mode B"
+
+endchoice
+`
+	resolved := mustResolveConfigWithOptions(t, fixture, nil, ResolveConfigOptions{
+		AllNoConfig: true,
+	})
+	wantConfigValues(t, resolved, map[string]string{
+		"CONFIG_MODE_A": "n",
+		"CONFIG_MODE_B": "n",
+	})
+
+	explicit := mustResolveConfigWithOptions(t, fixture, map[string]string{
+		"CONFIG_MODE_A": "y",
+	}, ResolveConfigOptions{
+		AllNoConfig: true,
+	})
+	wantConfigValues(t, explicit, map[string]string{
+		"CONFIG_MODE_A": "y",
+		"CONFIG_MODE_B": "n",
+	})
+}
+
 func TestResolveConfigScalarDefaultFromChoice(t *testing.T) {
 	resolved := mustResolveConfig(t, `
 mainmenu "Test"
@@ -759,11 +843,16 @@ config B
 
 func mustResolveConfig(t *testing.T, fixture string, raw map[string]string) *ResolvedConfig {
 	t.Helper()
+	return mustResolveConfigWithOptions(t, fixture, raw, ResolveConfigOptions{})
+}
+
+func mustResolveConfigWithOptions(t *testing.T, fixture string, raw map[string]string, opts ResolveConfigOptions) *ResolvedConfig {
+	t.Helper()
 	tree, err := Parse(context.Background(), strings.NewReader(fixture), "Kconfig", Options{})
 	if err != nil {
 		t.Fatalf("Parse() failed: %v", err)
 	}
-	resolved, err := tree.ResolveConfig("test", raw)
+	resolved, err := tree.ResolveConfigWithOptions("test", raw, opts)
 	if err != nil {
 		t.Fatalf("ResolveConfig() failed: %v", err)
 	}

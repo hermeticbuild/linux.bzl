@@ -32,6 +32,8 @@ def _run_compact_generator(rctx):
         "-config",
         "%s=%s" % (rctx.attr.config_name, config),
     ]
+    if rctx.attr.config_mode:
+        args.extend(["-config_mode", rctx.attr.config_mode])
     if rctx.attr.allow_shell:
         args.append("-allow_shell")
         if rctx.attr.probe_model:
@@ -108,6 +110,14 @@ linux_compact_repository = repository_rule(
         "config_name": attr.string(
             mandatory = True,
             doc = "Compact config name, usually the Linux architecture config name.",
+        ),
+        "config_mode": attr.string(
+            default = "default",
+            doc = "Config resolver mode passed to kconfig_parse. Supported: default, allnoconfig.",
+            values = [
+                "default",
+                "allnoconfig",
+            ],
         ),
         "env": attr.string_dict(
             doc = "Hermetic Kconfig preprocessor environment values.",

@@ -88,6 +88,46 @@ endchoice
 	}
 }
 
+func TestParseChoiceTypePrompt(t *testing.T) {
+	tree, err := Parse(context.Background(), strings.NewReader(`
+choice
+	bool "Pick one"
+	default FOO
+
+config FOO
+	bool "Foo"
+
+endchoice
+`), "Kconfig", Options{})
+	if err != nil {
+		t.Fatalf("Parse() failed: %v", err)
+	}
+
+	choice := tree.Root.Children[0]
+	if got, want := choice.Symbol.Type, SymbolBool; got != want {
+		t.Fatalf("choice type = %q, want %q", got, want)
+	}
+	if choice.Prompt == nil || choice.Prompt.Text != "Pick one" {
+		t.Fatalf("choice prompt = %#v, want Pick one", choice.Prompt)
+	}
+}
+
+func TestParsePromptlessChoice(t *testing.T) {
+	_, err := Parse(context.Background(), strings.NewReader(`
+choice
+	bool
+	optional
+
+config FOO
+	bool "Foo"
+
+endchoice
+`), "Kconfig", Options{})
+	if err != nil {
+		t.Fatalf("Parse() failed: %v", err)
+	}
+}
+
 func TestParseTransitionalSymbols(t *testing.T) {
 	tree, err := Parse(context.Background(), strings.NewReader(`
 config OLD

@@ -106,16 +106,27 @@ func (r *ResolvedConfig) ShouldWrite(key string) bool {
 	return value != "" && value != "n"
 }
 
+type ResolveConfigOptions struct {
+	AllNoConfig bool
+}
+
 // ResolveConfig computes effective Kconfig values for one imported .config.
 func (t *Tree) ResolveConfig(name string, raw map[string]string) (*ResolvedConfig, error) {
+	return t.ResolveConfigWithOptions(name, raw, ResolveConfigOptions{})
+}
+
+// ResolveConfigWithOptions computes effective Kconfig values for one imported
+// .config with explicit resolver semantics.
+func (t *Tree) ResolveConfigWithOptions(name string, raw map[string]string, opts ResolveConfigOptions) (*ResolvedConfig, error) {
 	resolver := &configResolver{
-		tree:      t,
-		rawFlags:  raw,
-		rawSet:    map[*Symbol]bool{},
-		rawTri:    map[*Symbol]triValue{},
-		effective: map[*Symbol]triValue{},
-		values:    map[*Symbol]string{},
-		written:   map[*Symbol]bool{},
+		tree:        t,
+		rawFlags:    raw,
+		rawSet:      map[*Symbol]bool{},
+		rawTri:      map[*Symbol]triValue{},
+		effective:   map[*Symbol]triValue{},
+		values:      map[*Symbol]string{},
+		written:     map[*Symbol]bool{},
+		allNoConfig: opts.AllNoConfig,
 	}
 	symbols := t.definedSymbols()
 	choices := t.choiceSymbols()
@@ -187,13 +198,14 @@ func (t *Tree) ResolveConfig(name string, raw map[string]string) (*ResolvedConfi
 }
 
 type configResolver struct {
-	tree      *Tree
-	rawFlags  map[string]string
-	rawSet    map[*Symbol]bool
-	rawTri    map[*Symbol]triValue
-	effective map[*Symbol]triValue
-	values    map[*Symbol]string
-	written   map[*Symbol]bool
+	tree        *Tree
+	rawFlags    map[string]string
+	rawSet      map[*Symbol]bool
+	rawTri      map[*Symbol]triValue
+	effective   map[*Symbol]triValue
+	values      map[*Symbol]string
+	written     map[*Symbol]bool
+	allNoConfig bool
 }
 
 func (t *Tree) choiceSymbols() []*Symbol {
@@ -243,6 +255,9 @@ func (r *configResolver) baseTri(sym *Symbol) triValue {
 			return minResolvedTri(r.rawTri[sym], visible)
 		}
 	}
+	if r.allNoConfig {
+		return triN
+	}
 	return r.defaultTri(sym)
 }
 
@@ -291,6 +306,9 @@ func (r *configResolver) choiceSelection(choice *Symbol) *Symbol {
 		}
 	}
 
+	if r.allNoConfig {
+		return nil
+	}
 	if def := r.choiceDefault(choice, visible); def != nil {
 		return def
 	}

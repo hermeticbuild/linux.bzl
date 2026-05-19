@@ -133,6 +133,7 @@ func main() {
 		objectBuildfileOut  = flag.String("object_buildfile_out", "", "Path to write compact shared object-variant BUILD file")
 		imageBuildfileOut   = flag.String("image_buildfile_out", "", "Path to write compact per-config image BUILD file")
 		resolveConfig       = flag.String("resolve_config", "", "Named .config input in NAME=PATH form to resolve through Kconfig defaults and dependencies")
+		configMode          = flag.String("config_mode", "default", "Config resolver mode. Supported: default, allnoconfig")
 		resolvedConfigOut   = flag.String("resolved_config_out", "", "Path to write the resolved .config")
 		resolvedAutoConfOut = flag.String("resolved_auto_conf_out", "", "Path to write the resolved include/config/auto.conf")
 		resolvedCmdOut      = flag.String("resolved_auto_conf_cmd_out", "", "Path to write the resolved include/config/auto.conf.cmd")
@@ -279,7 +280,7 @@ func main() {
 	}
 
 	if resolvedConfigRequested {
-		if err := writeResolvedConfig(tree, *resolveConfig, resolvedConfigOutputs{
+		if err := writeResolvedConfig(tree, *resolveConfig, *configMode, resolvedConfigOutputs{
 			config:        *resolvedConfigOut,
 			autoConf:      *resolvedAutoConfOut,
 			autoConfCmd:   *resolvedCmdOut,
@@ -293,7 +294,7 @@ func main() {
 	}
 
 	if *compactMetadataOut != "" || *compactBuildfileOut != "" || *objectBuildfileOut != "" || *imageBuildfileOut != "" {
-		metadata, err := compactMetadata(tree, *root, *kbuildPath, compactConfigInputs, *compactKbuildTree, vars, kbuildExtras, namedPathMap(sourceRootMaps))
+		metadata, err := compactMetadata(tree, *root, *kbuildPath, compactConfigInputs, *configMode, *compactKbuildTree, vars, kbuildExtras, namedPathMap(sourceRootMaps))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to generate compact metadata: %v\n", err)
 			os.Exit(1)
@@ -459,7 +460,7 @@ type resolvedConfigOutputs struct {
 	kernelRelease string
 }
 
-func writeResolvedConfig(tree *kconfig.Tree, input string, outputs resolvedConfigOutputs, kernelVersion string) error {
+func writeResolvedConfig(tree *kconfig.Tree, input string, configMode string, outputs resolvedConfigOutputs, kernelVersion string) error {
 	if input == "" {
 		return fmt.Errorf("-resolve_config is required when resolved config outputs are requested")
 	}
@@ -495,11 +496,26 @@ func writeResolvedConfig(tree *kconfig.Tree, input string, outputs resolvedConfi
 	if err != nil {
 		return err
 	}
-	resolved, err := tree.ResolveConfig(name, raw)
+	resolveOpts, err := resolveConfigOptions(configMode)
+	if err != nil {
+		return err
+	}
+	resolved, err := tree.ResolveConfigWithOptions(name, raw, resolveOpts)
 	if err != nil {
 		return err
 	}
 	return writeResolvedConfigOutputs(resolved, outputs, kernelVersion)
+}
+
+func resolveConfigOptions(mode string) (kconfig.ResolveConfigOptions, error) {
+	switch mode {
+	case "", "default":
+		return kconfig.ResolveConfigOptions{}, nil
+	case "allnoconfig":
+		return kconfig.ResolveConfigOptions{AllNoConfig: true}, nil
+	default:
+		return kconfig.ResolveConfigOptions{}, fmt.Errorf("unsupported -config_mode %q", mode)
+	}
 }
 
 func writeResolvedConfigOutputs(resolved *kconfig.ResolvedConfig, outputs resolvedConfigOutputs, kernelVersion string) error {
@@ -662,12 +678,16 @@ func isKbuildValidationFile(name string) bool {
 	return name == "Kbuild" || name == "Makefile" || strings.HasSuffix(name, ".mk")
 }
 
-func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, configInputs []namedPath, compactKbuildTree bool, vars map[string]string, kbuildExtras []namedPath, sourceRoots map[string]string) (*kconfig.CompactMetadata, error) {
+func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, configInputs []namedPath, configMode string, compactKbuildTree bool, vars map[string]string, kbuildExtras []namedPath, sourceRoots map[string]string) (*kconfig.CompactMetadata, error) {
 	if kbuildPath == "" {
 		return nil, fmt.Errorf("-kbuild is required")
 	}
 	if len(configInputs) == 0 {
 		return nil, fmt.Errorf("at least one -config NAME=PATH is required")
+	}
+	resolveOpts, err := resolveConfigOptions(configMode)
+	if err != nil {
+		return nil, err
 	}
 	configs := make([]kconfig.NamedConfig, 0, len(configInputs))
 	for _, input := range configInputs {
@@ -683,7 +703,7 @@ func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, con
 		if closeErr != nil {
 			return nil, fmt.Errorf("%s: %w", input.Path, closeErr)
 		}
-		configs = append(configs, kconfig.NamedConfig{Name: input.Name, Flags: flags})
+		configs = append(configs, kconfig.NamedConfig{Name: input.Name, Flags: flags, AllNoConfig: resolveOpts.AllNoConfig})
 	}
 	sourceRoot := ""
 	objectDir := ""
@@ -709,7 +729,9 @@ func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, con
 	}
 	parts := make([]*kconfig.CompactMetadata, 0, len(configs))
 	for _, config := range configs {
-		resolved, err := tree.ResolveConfig(config.Name, config.Flags)
+		resolved, err := tree.ResolveConfigWithOptions(config.Name, config.Flags, kconfig.ResolveConfigOptions{
+			AllNoConfig: config.AllNoConfig,
+		})
 		if err != nil {
 			return nil, err
 		}

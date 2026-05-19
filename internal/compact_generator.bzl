@@ -66,6 +66,8 @@ def _linux_compact_outputs_impl(ctx):
         args.add("-generated_headers", ctx.attr.generated_headers)
     if ctx.attr.kbuild_tree:
         args.add("-compact_kbuild_tree")
+    if ctx.attr.config_mode:
+        args.add("-config_mode", ctx.attr.config_mode)
     args.add("-object_label_package", ctx.attr.object_label_package)
     if ctx.attr.source_label_package:
         args.add("-source_label_package", ctx.attr.source_label_package)
@@ -158,6 +160,14 @@ _linux_compact_outputs = rule(
         ),
         "config_name": attr.string(
             doc = "Generated config name for the single config attr.",
+        ),
+        "config_mode": attr.string(
+            default = "default",
+            doc = "Config resolver mode passed to kconfig_parse. Supported: default, allnoconfig.",
+            values = [
+                "default",
+                "allnoconfig",
+            ],
         ),
         "configs": attr.label_keyed_string_dict(
             allow_files = True,
@@ -509,6 +519,7 @@ def linux_compact_buildfiles(
         configs = {},
         config = None,
         config_name = "",
+        config_mode = "default",
         srcs = [],
         object_label_package = None,
         source_label_package = "",
@@ -546,6 +557,7 @@ def linux_compact_buildfiles(
         buildfile_exports = buildfile_exports,
         config = config,
         config_name = config_name,
+        config_mode = config_mode,
         configs = configs,
         env = env,
         generated_visibility = generated_visibility,
