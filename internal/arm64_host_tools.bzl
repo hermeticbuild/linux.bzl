@@ -33,11 +33,18 @@ def linux_arm64_host_tools(
         target_prefix = name
 
     vdsomunge_tool = target_prefix + "_vdsomunge_tool"
+    relacheck_tool = target_prefix + "_relacheck_tool"
     generated_headers = target_prefix + "_arm64_generated_headers"
 
     cc_binary(
         name = vdsomunge_tool,
         srcs = [source_label(source_repo, "arch/arm/vdso/vdsomunge.c")],
+        visibility = visibility,
+    )
+
+    cc_binary(
+        name = relacheck_tool,
+        srcs = [source_label(source_repo, "arch/arm64/kernel/pi/relacheck.c")],
         visibility = visibility,
     )
 
@@ -63,10 +70,12 @@ def linux_arm64_host_tools(
         generated_headers = package_label(generated_headers),
         kallsyms_tool = common.kallsyms_tool,
         probe_config = common.probe_config,
+        relacheck_tool = package_label(relacheck_tool),
         source_asn1_compiler = common.source_asn1_compiler,
         source_label_package = common.source_label_package,
         source_repo = source_repo,
         source_root = common.source_root,
         source_tree = common.source_tree,
+        sorttable_tool = common.sorttable_tool,
         vdsomunge_tool = package_label(vdsomunge_tool),
     )

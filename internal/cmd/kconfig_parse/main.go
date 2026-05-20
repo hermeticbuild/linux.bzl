@@ -145,6 +145,7 @@ func main() {
 		objectLabelPackage  = flag.String("object_label_package", "", "Bazel package containing the compact object BUILD file. Defaults to -object_buildfile_out package")
 		sourceLabelPackage  = flag.String("source_label_package", "", "Bazel package containing Linux source file labels for generated compact object BUILD files")
 		sourceASN1Compiler  = flag.String("source_asn1_compiler", "", "Bazel label for the kernel source tree's scripts/asn1_compiler tool emitted into source-backed compact object rules")
+		sourceRelacheck     = flag.String("source_relacheck", "", "Bazel label for the kernel source tree's arch/arm64/kernel/pi/relacheck tool emitted into arm64 .pi.o rules")
 		sourceConfig        = flag.String("source_config", "", "Bazel label for a full LinuxConfigInfo target emitted into source-backed compact object rules")
 		sourceRootLabel     = flag.String("source_root_label", "", "Bazel label for a file in the Linux source root, emitted into source-backed compact object rules")
 		linuxObjectsLoad    = flag.String("linux_objects_load", "", "Load label for the compact Linux object/image rules")
@@ -318,6 +319,7 @@ func main() {
 				SourceLabelPackage:  *sourceLabelPackage,
 				SourceLabelPackages: namedValueMap(sourceLabelMaps),
 				SourceASN1Compiler:  *sourceASN1Compiler,
+				SourceRelacheck:     *sourceRelacheck,
 				SourceConfig:        *sourceConfig,
 				SourceRootLabel:     *sourceRootLabel,
 				SourceTreeLabels:    []string(sourceTreeLabels),
@@ -362,6 +364,7 @@ func main() {
 				SourceLabelPackage:  *sourceLabelPackage,
 				SourceLabelPackages: namedValueMap(sourceLabelMaps),
 				SourceASN1Compiler:  *sourceASN1Compiler,
+				SourceRelacheck:     *sourceRelacheck,
 				SourceConfig:        *sourceConfig,
 				SourceRootLabel:     *sourceRootLabel,
 				SourceTreeLabels:    []string(sourceTreeLabels),
@@ -724,6 +727,7 @@ func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, con
 		ObjectDir:   objectDir,
 		SourceRoot:  sourceRoot,
 		SourceRoots: sourceRoots,
+		LibraryDirs: kbuildLibraryDirs(vars),
 	}
 	rootDir := sourceRoot
 	if rootDir == "" {
@@ -765,7 +769,7 @@ func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, con
 			if err != nil {
 				return nil, err
 			}
-			kb = kconfig.MergeKbuildFiles(kb, kconfig.PrefixKbuildFile(extraKb, extra.Name))
+			kb = kconfig.MergeKbuildFileAtDirectory(kb, extra.Name, kconfig.PrefixKbuildFile(extraKb, extra.Name))
 		}
 		part, err := tree.CompactMetadataWithOptions(kb, []kconfig.NamedConfig{config}, opts)
 		if err != nil {
@@ -774,6 +778,23 @@ func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, con
 		parts = append(parts, part)
 	}
 	return kconfig.MergeCompactMetadata(parts...)
+}
+
+func kbuildLibraryDirs(vars map[string]string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, value := range strings.Fields(vars["ARCH_LIB"]) {
+		if !strings.HasSuffix(value, "/") {
+			continue
+		}
+		dir := strings.Trim(filepath.ToSlash(value), "/")
+		if dir == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	return out
 }
 
 func linuxRootMakefiles(rootDir string, vars map[string]string) []string {

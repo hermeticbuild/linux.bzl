@@ -120,6 +120,60 @@ config BINDGEN_VERSION_TEXT
 	}
 }
 
+func TestLinuxLLVMProbeShellSupportsCCOptionInt128Probe(t *testing.T) {
+	rootDir := t.TempDir()
+	scriptsDir := filepath.Join(rootDir, "scripts")
+	if err := os.Mkdir(scriptsDir, 0o755); err != nil {
+		t.Fatalf("Mkdir() failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(scriptsDir, "Kconfig.include"), []byte(`
+if-success = $(shell,{ $(1); } >/dev/null 2>&1 && echo "$(2)" || echo "$(3)")
+success = $(if-success,$(1),y,n)
+cc-option = $(success,trap "rm -rf .tmp_$$" EXIT; mkdir .tmp_$$; $(CC) -Werror $(CLANG_FLAGS) $(1) -c -x c /dev/null -o .tmp_$$/tmp.o)
+cc-option-bit = $(if-success,$(CC) -Werror $(1) -E -x c /dev/null -o /dev/null,$(1))
+m64-flag := $(cc-option-bit,-m64)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile() failed: %v", err)
+	}
+
+	var commands []string
+	baseShell, err := LinuxProbeShell(LinuxProbeModelLLVM)
+	if err != nil {
+		t.Fatalf("LinuxProbeShell() failed: %v", err)
+	}
+	shell := func(ctx context.Context, command string) (string, error) {
+		commands = append(commands, command)
+		return baseShell(ctx, command)
+	}
+	tree, err := Parse(context.Background(), strings.NewReader(`
+srctree := `+rootDir+`
+CC := clang
+CLANG_FLAGS := -fintegrated-as
+
+source "scripts/Kconfig.include"
+
+config 64BIT
+	def_bool y
+
+config CC_HAS_INT128
+	def_bool !$(cc-option,$(m64-flag) -D__SIZEOF_INT128__=0) && 64BIT
+`), "Kconfig", Options{
+		AllowShell: true,
+		RootDir:    rootDir,
+		Shell:      shell,
+	})
+	if err != nil {
+		t.Fatalf("Parse() failed: %v", err)
+	}
+	resolved, err := tree.ResolveConfig("test", nil)
+	if err != nil {
+		t.Fatalf("ResolveConfig() failed: %v", err)
+	}
+	if got := resolved.Value("CONFIG_CC_HAS_INT128"); got != "y" {
+		t.Fatalf("CONFIG_CC_HAS_INT128 = %q, want y; commands=%q", got, commands)
+	}
+}
+
 func TestLinuxProbeShellSupportsValueOverrides(t *testing.T) {
 	config, err := LinuxProbeConfigForModel(LinuxProbeModelLLVM)
 	if err != nil {
@@ -160,6 +214,31 @@ func TestLinuxProbeShellSupportsValueOverrides(t *testing.T) {
 		{
 			name:    "rust availability",
 			command: `{ /src/scripts/rust_is_available.sh rustc; } >/dev/null 2>&1 && echo "y" || echo "n"`,
+			want:    "y",
+		},
+		{
+			name:    "generic compiler option",
+			command: `{ clang -Werror -fno-stack-protector -c -x c /dev/null -o /tmp/tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`,
+			want:    "y",
+		},
+		{
+			name:    "compiler smoke test",
+			command: `{ echo 'void foo(void) { asm inline (""); }' | clang -x c - -c -o /dev/null; } >/dev/null 2>&1 && echo "y" || echo "n"`,
+			want:    "y",
+		},
+		{
+			name:    "compiler option with trailing Werror",
+			command: `{ echo '__attribute__((no_profile_instrument_function)) int x();' | clang -x c - -c -o /dev/null -Werror; } >/dev/null 2>&1 && echo "y" || echo "n"`,
+			want:    "y",
+		},
+		{
+			name:    "builtin macro redefined",
+			command: `{ clang -Werror -D__SIZEOF_INT128__=0 -c -x c /dev/null -o /tmp/tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`,
+			want:    "n",
+		},
+		{
+			name:    "builtin macro redefined to same value",
+			command: `{ clang -Werror -D__SIZEOF_INT128__=16 -c -x c /dev/null -o /tmp/tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`,
 			want:    "y",
 		},
 	} {

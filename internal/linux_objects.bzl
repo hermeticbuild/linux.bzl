@@ -147,12 +147,26 @@ def _linux_platform_transition_impl(_, attr):
         platform = "@llvm//platforms:linux_x86_64_musl"
     else:
         fail("unsupported Linux rule arch for platform transition: %s" % arch)
-    return {"//command_line_option:platforms": platform}
+    return {
+        "//command_line_option:platforms": platform,
+        "//command_line_option:copt": [],
+        "//command_line_option:conlyopt": [],
+        "//command_line_option:cxxopt": [],
+        "//command_line_option:features": [],
+        "//command_line_option:linkopt": [],
+    }
 
 _linux_platform_transition = transition(
     implementation = _linux_platform_transition_impl,
     inputs = [],
-    outputs = ["//command_line_option:platforms"],
+    outputs = [
+        "//command_line_option:platforms",
+        "//command_line_option:copt",
+        "//command_line_option:conlyopt",
+        "//command_line_option:cxxopt",
+        "//command_line_option:features",
+        "//command_line_option:linkopt",
+    ],
 )
 
 def _linux_platform_transition_allowlist_attr():
@@ -160,17 +174,56 @@ def _linux_platform_transition_allowlist_attr():
 
 def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
     flags = _cc_compile_flags(ctx, cc_toolchain, feature_configuration)
+    flags = _linux_rewrite_target_flags(flags, _linux_kbuild_target_triple(ctx))
     out = []
     skip_next = False
+    drop_count = 0
     for index in range(len(flags)):
         if skip_next:
             skip_next = False
             continue
+        if drop_count:
+            drop_count -= 1
+            continue
         flag = flags[index]
+        if flag == "-Xclang":
+            if index + 1 < len(flags) and flags[index + 1] == "-internal-isystem":
+                drop_count = 3
+                continue
+            if index + 1 < len(flags) and flags[index + 1] == "-fno-cxx-modules":
+                drop_count = 1
+                continue
         if flag in ["-I", "-iquote", "-isystem"]:
             if index + 1 < len(flags) and _linux_drop_toolchain_include(flags[index + 1]):
                 skip_next = True
                 continue
+        if flag in [
+            "-fcolor-diagnostics",
+            "-fstack-protector",
+            "-no-canonical-prefixes",
+            "-nostdlibinc",
+            "-Werror=incomplete-umbrella",
+            "-Wall",
+            "-Wno-builtin-macro-redefined",
+            "-Wno-free-nonheap-object",
+            "-Wno-module-import-in-extern-c",
+            "-Wno-modules-import-nested-redundant",
+            "-Wself-assign",
+            "-Wthread-safety",
+            "-Wunused-but-set-parameter",
+        ]:
+            continue
+        if flag == "--sysroot":
+            skip_next = index + 1 < len(flags)
+            continue
+        if (
+            flag.startswith("--sysroot=") or
+            flag.startswith("-D__DATE__=") or
+            flag.startswith("-D__TIMESTAMP__=") or
+            flag.startswith("-D__TIME__=") or
+            flag.startswith("-ffile-compilation-dir=")
+        ):
+            continue
         if flag.startswith("-I") and _linux_drop_toolchain_include(flag[len("-I"):]):
             continue
         if flag.startswith("-iquote") and _linux_drop_toolchain_include(flag[len("-iquote"):]):
@@ -178,6 +231,45 @@ def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
         if flag.startswith("-isystem") and _linux_drop_toolchain_include(flag[len("-isystem"):]):
             continue
         out.append(flag)
+    if "-nostdinc" not in out:
+        out.append("-nostdinc")
+    if "-fintegrated-as" not in out:
+        out.append("-fintegrated-as")
+    return out
+
+def _linux_kbuild_target_triple(ctx):
+    arch = getattr(ctx.attr, "arch", "")
+    if arch == "arm64":
+        return "aarch64-linux-gnu"
+    if arch == "x86":
+        return "x86_64-linux-gnu"
+    return ""
+
+def _linux_rewrite_target_flags(flags, target_triple):
+    if not target_triple:
+        return flags
+    out = []
+    inserted = False
+    skip_next = False
+    for index in range(len(flags)):
+        if skip_next:
+            skip_next = False
+            continue
+        flag = flags[index]
+        if flag in ["-target", "--target"]:
+            skip_next = index + 1 < len(flags)
+            if not inserted:
+                out.append("--target=%s" % target_triple)
+                inserted = True
+            continue
+        if flag.startswith("-target=") or flag.startswith("--target="):
+            if not inserted:
+                out.append("--target=%s" % target_triple)
+                inserted = True
+            continue
+        out.append(flag)
+    if not inserted:
+        out.insert(0, "--target=%s" % target_triple)
     return out
 
 def _linux_drop_toolchain_include(path):
@@ -417,6 +509,8 @@ def _linux_source_preinclude_flags_for_root(source_root, assembly = False):
             "-D__KERNEL__",
             "-D__ASSEMBLY__",
             "-include",
+            source_root + "/include/linux/compiler-version.h",
+            "-include",
             source_root + "/include/linux/kconfig.h",
         ]
     return [
@@ -471,6 +565,9 @@ def _linux_objcopy_flags_for_object(object, arch = ""):
                 ])
         return flags
     return []
+
+def _linux_object_needs_relacheck(object):
+    return object.endswith(".pi.o")
 
 def _linux_perlasm_kind(object):
     if object in [
@@ -994,6 +1091,8 @@ def _linux_vdso_linker_script(ctx, compiler, cc_toolchain, feature_configuration
     out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/entry/vdso/vdso.lds")
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all(_linux_config_cflags(config))
+    args.add_all(_linux_generated_header_cflags(generated_headers))
     args.add_all([
         "-E",
         "-P",
@@ -1434,12 +1533,6 @@ def _linux_offsets_header(ctx, cc_toolchain, feature_configuration, config, sour
 
     compile_args = ctx.actions.args()
     compile_args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
-    compile_args.add_all([
-        "-ffreestanding",
-        "-fno-builtin",
-        "-fno-stack-protector",
-        "-Wno-unused-command-line-argument",
-    ])
     compile_args.add_all(_linux_config_cflags(config))
     compile_args.add_all(_linux_source_preinclude_flags_for_root(source_root))
     compile_args.add("-I" + config.include_dir)
@@ -1485,6 +1578,7 @@ def _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, 
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all(_linux_config_flags_for_source(config, src))
     args.add_all([
         "-fno-common",
         "-fno-builtin",
@@ -1495,7 +1589,6 @@ def _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, 
         "-O2",
         "-mcmodel=tiny",
         "-fasynchronous-unwind-tables",
-        "-fPIC",
         "-Wno-default-const-init-unsafe",
         "-Wno-default-const-init-var-unsafe",
         "-Wno-frame-address",
@@ -1570,35 +1663,43 @@ def _linux_arm64_vdso_linker_script(ctx, cc_toolchain, feature_configuration, co
 
 def _linux_arm64_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, base):
     objects = [
+        _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, _source_tree_file(ctx, "arch/arm64/kernel/vdso/vgettimeofday.c"), base + "/arch/arm64/kernel/vdso/vgettimeofday.o", extra_flags = ["-include", source_root + "/lib/vdso/gettimeofday.c"]),
         _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, _source_tree_file(ctx, "arch/arm64/kernel/vdso/note.S"), base + "/arch/arm64/kernel/vdso/note.o"),
         _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, _source_tree_file(ctx, "arch/arm64/kernel/vdso/sigreturn.S"), base + "/arch/arm64/kernel/vdso/sigreturn.o"),
-        _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, _source_tree_file(ctx, "arch/arm64/kernel/vdso/vgetrandom-chacha.S"), base + "/arch/arm64/kernel/vdso/vgetrandom-chacha.o"),
-        _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, _source_tree_file(ctx, "arch/arm64/kernel/vdso/vgettimeofday.c"), base + "/arch/arm64/kernel/vdso/vgettimeofday.o", extra_flags = ["-include", source_root + "/lib/vdso/gettimeofday.c"]),
         _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, _source_tree_file(ctx, "arch/arm64/kernel/vdso/vgetrandom.c"), base + "/arch/arm64/kernel/vdso/vgetrandom.o", extra_flags = ["-include", source_root + "/lib/vdso/getrandom.c"]),
+        _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, _source_tree_file(ctx, "arch/arm64/kernel/vdso/vgetrandom-chacha.S"), base + "/arch/arm64/kernel/vdso/vgetrandom-chacha.o"),
     ]
     linker_script = _linux_arm64_vdso_linker_script(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, generated_inputs, base + "/arch/arm64/kernel/vdso/vdso.lds")
     linker = cc_common.get_tool_for_action(
         feature_configuration = feature_configuration,
         action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
     )
+    ld = _linux_x86_tool_sibling(linker, "ld.lld")
     dbg = ctx.actions.declare_file(base + "/arch/arm64/kernel/vdso/vdso.so.dbg")
     link_args = ctx.actions.args()
-    link_args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
     link_args.add_all([
-        "-fuse-ld=lld",
-        "-nostdlib",
+        "-EL",
+        "-maarch64elf",
+        "-z",
+        "norelro",
+        "-z",
+        "noexecstack",
         "-shared",
-        "-Wl,-soname=linux-vdso.so.1",
-        "-Wl,-Bsymbolic",
-        "-Wl,--build-id=sha1",
-        "-Wl,-n",
-        "-Wl,-T," + linker_script.path,
+        "-soname=linux-vdso.so.1",
+        "-Bsymbolic",
+        "--build-id=sha1",
+        "-n",
+        "--orphan-handling=warn",
+        "-T",
+        linker_script.path,
+    ])
+    link_args.add_all(objects)
+    link_args.add_all([
         "-o",
         dbg,
     ])
-    link_args.add_all(objects)
     ctx.actions.run(
-        executable = linker,
+        executable = ld,
         inputs = depset(objects + [linker_script], transitive = [cc_toolchain.all_files]),
         outputs = [dbg],
         arguments = [link_args],
@@ -1877,6 +1978,7 @@ def _linux_x86_generated_headers_impl(ctx):
     version_args.add("-utsrelease_out", utsrelease_h)
     version_args.add("-utsversion_out", utsversion_h)
     version_args.add("-machine", "x86_64")
+    version_args.add("-compiler", _linux_compiler_version_string())
     ctx.actions.run(
         executable = ctx.executable._versionheaders,
         inputs = depset([], transitive = [config.files]),
@@ -2243,6 +2345,7 @@ def _linux_arm64_generated_headers_impl(ctx):
     version_args.add("-utsrelease_out", utsrelease_h)
     version_args.add("-utsversion_out", utsversion_h)
     version_args.add("-machine", "aarch64")
+    version_args.add("-compiler", _linux_compiler_version_string())
     ctx.actions.run(
         executable = ctx.executable._versionheaders,
         inputs = depset([], transitive = [config.files]),
@@ -2555,11 +2658,15 @@ def _configure_linux_probe_env(allow_shell, env):
     if not allow_shell:
         return
     env.setdefault("CC", "clang")
+    env.setdefault("CC_VERSION_TEXT", "clang version 22.1.4None")
     env.setdefault("LD", "ld.lld")
     env.setdefault("CLANG_FLAGS", "-fintegrated-as")
     env.setdefault("RUSTC", "rustc")
     env.setdefault("PAHOLE", "pahole")
     env.setdefault("BINDGEN", "bindgen")
+
+def _linux_compiler_version_string():
+    return "clang version 22.1.4None, LLD 22.1.4"
 
 def _linux_resolved_config_impl(ctx):
     config_dir = ctx.label.name + ".config_tree"
@@ -2777,9 +2884,15 @@ def _linux_real_object_impl(ctx):
     cmd = ctx.actions.declare_file(ctx.label.name + ".cmd")
     compile_object = _linux_compile_object_name(ctx.attr.object)
     objcopy_flags = _linux_objcopy_flags_for_object(ctx.attr.object, ctx.attr.arch)
+    needs_relacheck = _linux_object_needs_relacheck(ctx.attr.object)
+    if needs_relacheck and not ctx.executable.relacheck:
+        fail("linux_object %s builds %s and requires relacheck" % (ctx.label, ctx.attr.object))
     compile_out = out
     if objcopy_flags:
         compile_out = ctx.actions.declare_file(ctx.label.name + ".obj/" + compile_object)
+    objcopy_out = out
+    if objcopy_flags and needs_relacheck:
+        objcopy_out = ctx.actions.declare_file(ctx.label.name + ".obj/" + ctx.attr.object)
     generated_object_headers = []
     exported_generated_headers = []
     exported_generated_include_dirs = []
@@ -2849,6 +2962,8 @@ def _linux_real_object_impl(ctx):
         uts_args.add("-config", config.config)
         uts_args.add("-kernel_release", config.kernel_release)
         uts_args.add("-utsversion_out", utsversion_tmp)
+        uts_args.add("-build_version=")
+        uts_args.add("-build_timestamp=")
         ctx.actions.run(
             executable = ctx.executable._versionheaders,
             inputs = depset([], transitive = [config.files]),
@@ -2941,12 +3056,6 @@ def _linux_real_object_impl(ctx):
 
     args = ctx.actions.args()
     args.add_all(base_flags)
-    args.add_all([
-        "-ffreestanding",
-        "-fno-builtin",
-        "-fno-stack-protector",
-        "-Wno-unused-command-line-argument",
-    ])
     args.add_all(config_flag_inputs.flags)
     args.add_all(_linux_generated_header_cflags(generated_headers))
     args.add_all(_linux_module_flags(ctx.attr.mode))
@@ -2957,6 +3066,8 @@ def _linux_real_object_impl(ctx):
     args.add_all(_linux_source_preinclude_flags_for_root(source_root, _is_assembly_source(src)))
     if config:
         args.add("-I" + config.include_dir)
+    if source_root:
+        args.add("-fmacro-prefix-map=%s/=" % source_root)
     dep_generated_header_inputs = []
     for dep in ctx.attr.deps:
         dep_info = dep[LinuxObjectInfo]
@@ -3013,15 +3124,30 @@ def _linux_real_object_impl(ctx):
         objcopy_args = ctx.actions.args()
         objcopy_args.add_all(objcopy_flags)
         objcopy_args.add(compile_out)
-        objcopy_args.add(out)
+        objcopy_args.add(objcopy_out)
         ctx.actions.run(
             executable = ctx.executable._llvm_objcopy,
             inputs = [compile_out, ctx.executable._llvm_objcopy],
-            outputs = [out],
+            outputs = [objcopy_out],
             arguments = [objcopy_args],
             mnemonic = "LinuxObjectObjcopy",
             progress_message = "Objcopying Linux object %{label}",
         )
+        if needs_relacheck:
+            ctx.actions.run_shell(
+                inputs = [objcopy_out, compile_out],
+                tools = [ctx.executable.relacheck],
+                outputs = [out],
+                arguments = [
+                    objcopy_out.path,
+                    out.path,
+                    ctx.executable.relacheck.path,
+                    compile_out.path,
+                ],
+                command = "cp \"$1\" \"$2\" && \"$3\" \"$2\" \"$4\"",
+                mnemonic = "LinuxObjectRelacheck",
+                progress_message = "Checking Linux arm64 PI relocations %{label}",
+            )
 
     ctx.actions.write(
         output = cmd,
@@ -3078,6 +3204,11 @@ linux_object = rule(
         "asn1_compiler": attr.label(
             cfg = "exec",
             doc = "Kernel-source-specific scripts/asn1_compiler executable. Required only for .asn1.o objects.",
+            executable = True,
+        ),
+        "relacheck": attr.label(
+            cfg = "exec",
+            doc = "Kernel-source-specific arch/arm64/kernel/pi/relacheck executable. Required only for arm64 .pi.o objects.",
             executable = True,
         ),
         "_versionheaders": attr.label(
@@ -3514,7 +3645,7 @@ def _linux_real_archive_impl(ctx, object_infos):
     )
     out = ctx.actions.declare_file(ctx.label.name + ".a")
     args = ctx.actions.args()
-    args.add("rcsD")
+    args.add("cDPrST")
     args.add(out)
     args.add_all([info.output for info in object_infos])
     ctx.actions.run(
@@ -3592,27 +3723,23 @@ def _linux_compact_image_impl(ctx):
 def _linux_real_compact_image_impl(ctx, object_infos):
     cc_toolchain = find_cpp_toolchain(ctx)
     feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
-    linker = cc_common.get_tool_for_action(
+    archiver = cc_common.get_tool_for_action(
         feature_configuration = feature_configuration,
-        action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
+        action_name = CPP_LINK_STATIC_LIBRARY_ACTION_NAME,
     )
-    out = ctx.actions.declare_file(ctx.label.name + ".vmlinux.o")
+    out = ctx.actions.declare_file(ctx.label.name + ".vmlinux.a")
     object_outputs = [info.output for info in object_infos]
     args = ctx.actions.args()
-    args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
-    args.add("-fuse-ld=lld")
-    args.add("-nostdlib")
-    args.add("-r")
-    args.add("-o")
+    args.add("cDPrST")
     args.add(out)
     args.add_all(object_outputs)
     ctx.actions.run(
-        executable = linker,
+        executable = archiver,
         inputs = depset(object_outputs, transitive = [cc_toolchain.all_files]),
         outputs = [out],
         arguments = [args],
-        mnemonic = "LinuxCompactImageLink",
-        progress_message = "Linking compact Linux image object %{label}",
+        mnemonic = "LinuxCompactImageArchive",
+        progress_message = "Archiving compact Linux image %{label}",
     )
     info = LinuxImageInfo(
         archives = [],
@@ -3686,12 +3813,6 @@ def _linux_vmlinux_compile_source(ctx, compiler, cc_toolchain, feature_configura
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
-    args.add_all([
-        "-ffreestanding",
-        "-fno-builtin",
-        "-fno-stack-protector",
-        "-Wno-unused-command-line-argument",
-    ])
     args.add_all(_linux_config_flags_for_source(config, src))
     args.add_all(_linux_generated_header_cflags(generated_headers))
     args.add_all(_linux_object_name_flags(object_name))
@@ -3766,6 +3887,75 @@ def _linux_system_map(ctx, input, name):
     )
     return out
 
+def _linux_sorttable(ctx, config, input):
+    out = ctx.actions.declare_file(ctx.label.name + ".sorted.vmlinux")
+    nm_out = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux.nm-sort")
+    inputs = [input, config.config, ctx.executable._llvm_nm]
+    sorttable_path = ""
+    if ctx.executable.sorttable_tool:
+        inputs.append(ctx.executable.sorttable_tool)
+        sorttable_path = ctx.executable.sorttable_tool.path
+    ctx.actions.run_shell(
+        inputs = inputs,
+        outputs = [out, nm_out],
+        command = """\
+if grep -qx 'CONFIG_BUILDTIME_TABLE_SORT=y' "$2"; then
+  if [ -z "$4" ]; then
+    echo "CONFIG_BUILDTIME_TABLE_SORT=y requires sorttable_tool" >&2
+    exit 1
+  fi
+  "$3" -S "$1" > "$5"
+  cp "$1" "$6"
+  chmod u+w "$6"
+  "$4" -s "$5" "$6"
+else
+  : > "$5"
+  cp "$1" "$6"
+fi
+""",
+        arguments = [input.path, config.config.path, ctx.executable._llvm_nm.path, sorttable_path, nm_out.path, out.path],
+        mnemonic = "LinuxVmlinuxSortTable",
+        progress_message = "Sorting Linux kernel tables %{label}",
+    )
+    return out
+
+def _shell_quote(value):
+    return "'" + value.replace("'", "'\\''") + "'"
+
+def _linux_strip_vmlinux(ctx, config, input, out):
+    set_flags = ["--set-section-flags", ".modinfo=noload"]
+    remove_flags = [
+        "--remove-section=.modinfo",
+        "-w",
+        "--strip-unneeded-symbol=__mod_device_table__*",
+    ]
+    if config.config_flags.get("CONFIG_ARCH_VMLINUX_NEEDS_RELOCS") == "y":
+        set_flags.extend([
+            "--set-section-flags",
+            ".rel*=noload",
+            "--set-section-flags",
+            "!.rel*.dyn=noload",
+            "--set-section-flags",
+            ".rel.*=noload",
+        ])
+        remove_flags.extend([
+            "--remove-section=.rel*",
+            "--remove-section=!.rel*.dyn",
+            "--remove-section=.rel.*",
+        ])
+
+    set_flags_shell = " ".join([_shell_quote(flag) for flag in set_flags])
+    remove_flags_shell = " ".join([_shell_quote(flag) for flag in remove_flags])
+    ctx.actions.run_shell(
+        inputs = [input, ctx.executable._llvm_objcopy],
+        outputs = [out],
+        command = "\"$1\" %s \"$2\" \"$3\" && \"$1\" %s \"$3\"" % (set_flags_shell, remove_flags_shell),
+        arguments = [ctx.executable._llvm_objcopy.path, input.path, out.path],
+        mnemonic = "LinuxVmlinuxStrip",
+        progress_message = "Stripping Linux vmlinux %{label}",
+    )
+    return out
+
 def _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, system_map, name, kallsyms_tool):
     asm = ctx.actions.declare_file(ctx.label.name + ".obj/" + name + ".kallsyms.S")
     kallsyms_flags = []
@@ -3794,28 +3984,49 @@ def _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, c
         name + ".kallsyms.o",
     )
 
-def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, export_object, version_object, linker_script, kallsyms_object, out, strip_debug):
-    inputs = [image_object, export_object, version_object, linker_script]
+def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, out, strip_debug):
+    inputs = depset(
+        [image_object, export_object, version_object, linker_script],
+        transitive = [image_object_inputs, cc_toolchain.all_files],
+    )
+    executable = linker
     args = ctx.actions.args()
-    args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
-    args.add_all(_linux_vmlinux_link_flags(ctx))
-    args.add("-Wl,--script=" + linker_script.path)
-    if strip_debug:
-        args.add("-Wl,--strip-debug")
+    if ctx.attr.format == "arm64":
+        executable = _linux_x86_tool_sibling(linker, "ld.lld")
+        args.add_all(_linux_arm64_vmlinux_ld_flags(ctx.attr.config[LinuxConfigInfo]))
+        args.add("--script=" + linker_script.path)
+        if strip_debug:
+            args.add("--strip-debug")
+        whole_archive = "--whole-archive"
+        no_whole_archive = "--no-whole-archive"
+    else:
+        args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
+        args.add_all(_linux_vmlinux_link_flags(ctx, ctx.attr.config[LinuxConfigInfo]))
+        args.add("-Wl,--script=" + linker_script.path)
+        if strip_debug:
+            args.add("-Wl,--strip-debug")
+        whole_archive = "-Wl,--whole-archive"
+        no_whole_archive = "-Wl,--no-whole-archive"
     args.add("-o")
     args.add(out)
-    args.add("-Wl,--whole-archive")
+    args.add(whole_archive)
     args.add(image_object)
     args.add(export_object)
     args.add(version_object)
-    args.add("-Wl,--no-whole-archive")
+    args.add(no_whole_archive)
+    if ctx.attr.format == "arm64":
+        args.add("--start-group")
+        args.add("--end-group")
+    else:
+        args.add("-Wl,--start-group")
+        args.add("-Wl,--end-group")
     if kallsyms_object:
         args.add(kallsyms_object)
-        inputs.append(kallsyms_object)
+        inputs = depset([kallsyms_object], transitive = [inputs])
 
     ctx.actions.run(
-        executable = linker,
-        inputs = depset(inputs, transitive = [cc_toolchain.all_files]),
+        executable = executable,
+        inputs = inputs,
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxVmlinuxLink",
@@ -3823,27 +4034,66 @@ def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_
     )
     return out
 
-def _linux_vmlinux_link_flags(ctx):
+def _linux_arm64_vmlinux_ld_flags(config):
+    flags = [
+        "-EL",
+        "-maarch64elf",
+        "--no-undefined",
+        "-X",
+        "--pic-veneer",
+        "-z",
+        "norelro",
+        "-z",
+        "noexecstack",
+        "--build-id=sha1",
+        "--orphan-handling=warn",
+    ]
+    if config.config_flags.get("CONFIG_ARCH_VMLINUX_NEEDS_RELOCS") == "y":
+        flags.extend([
+            "--emit-relocs",
+            "--discard-none",
+        ])
+    if config.config_flags.get("CONFIG_RELOCATABLE") == "y":
+        flags.extend([
+            "-shared",
+            "-Bsymbolic",
+            "-z",
+            "notext",
+            "--no-apply-dynamic-relocs",
+        ])
+    return flags
+
+def _linux_vmlinux_link_flags(ctx, config):
     if ctx.attr.format == "arm64":
-        return [
+        flags = [
             "-fuse-ld=lld",
             "-nostdlib",
-            "-shared",
             "-Wl,--no-undefined",
             "-Wl,-X",
             "-Wl,--pic-veneer",
             "-Wl,-EL",
             "-Wl,-maarch64elf",
             "-Wl,-z,norelro",
-            "-Wl,-Bsymbolic",
-            "-Wl,-z,notext",
-            "-Wl,--no-apply-dynamic-relocs",
+            "-Wl,-z,noexecstack",
             "-Wl,--build-id=sha1",
             "-Wl,--orphan-handling=warn",
-            "-Wl,--emit-relocs",
-            "-Wl,--discard-none",
         ]
-    return [
+        if config.config_flags.get("CONFIG_ARCH_VMLINUX_NEEDS_RELOCS") == "y":
+            flags.extend([
+                "-Wl,--emit-relocs",
+                "-Wl,--discard-none",
+            ])
+        if config.config_flags.get("CONFIG_RELOCATABLE") == "y":
+            flags.extend([
+                "-shared",
+                "-Wl,-Bsymbolic",
+                "-Wl,-z,notext",
+                "-Wl,--no-apply-dynamic-relocs",
+            ])
+        else:
+            flags.append("-no-pie")
+        return flags
+    flags = [
         "-fuse-ld=lld",
         "-nostdlib",
         "-no-pie",
@@ -3852,9 +4102,13 @@ def _linux_vmlinux_link_flags(ctx):
         "-Wl,-z,max-page-size=0x200000",
         "-Wl,--build-id=sha1",
         "-Wl,--orphan-handling=warn",
-        "-Wl,--emit-relocs",
-        "-Wl,--discard-none",
     ]
+    if config.config_flags.get("CONFIG_ARCH_VMLINUX_NEEDS_RELOCS") == "y":
+        flags.extend([
+            "-Wl,--emit-relocs",
+            "-Wl,--discard-none",
+        ])
+    return flags
 
 def _linux_vmlinux_objtool(ctx, config, image_object):
     if not ctx.executable.objtool:
@@ -3916,9 +4170,14 @@ def _linux_real_vmlinux_impl(ctx):
         ["-fno-function-sections", "-fno-data-sections", "-include", "generated/utsversion.h"],
     )
     image_object = _linux_vmlinux_objtool(ctx, config, image.output)
+    image_object_inputs = depset([info.output for info in image.objects])
 
     kallsyms_object = None
-    if ctx.attr.kallsyms:
+    if ctx.attr.kallsyms == "auto":
+        kallsyms_enabled = config.config_flags.get("CONFIG_KALLSYMS") == "y"
+    else:
+        kallsyms_enabled = ctx.attr.kallsyms == "true"
+    if kallsyms_enabled:
         if not ctx.executable.kallsyms_tool:
             fail("linux_vmlinux %s has kallsyms enabled and requires kallsyms_tool" % ctx.label)
         empty_map = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux0.syms")
@@ -3926,12 +4185,15 @@ def _linux_real_vmlinux_impl(ctx):
         kallsyms_object = _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, empty_map, ".tmp_vmlinux0", ctx.executable.kallsyms_tool)
         for i in range(1, 5):
             tmp = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux%d" % i)
-            _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, export_object, version_object, linker_script, kallsyms_object, tmp, True)
+            _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, tmp, True)
             system_map = _linux_system_map(ctx, tmp, ".tmp_vmlinux%d" % i)
             kallsyms_object = _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, system_map, ".tmp_vmlinux%d" % i, ctx.executable.kallsyms_tool)
 
+    unstripped = ctx.actions.declare_file(ctx.label.name + ".vmlinux.unstripped")
+    linked = _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, unstripped, False)
+    unstripped = _linux_sorttable(ctx, config, linked)
     out = ctx.actions.declare_file(ctx.label.name + ".vmlinux")
-    _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, export_object, version_object, linker_script, kallsyms_object, out, False)
+    out = _linux_strip_vmlinux(ctx, config, unstripped, out)
     system_map = _linux_system_map(ctx, out, "System.map")
     info = LinuxImageInfo(
         archives = image.archives,
@@ -3995,7 +4257,7 @@ linux_vmlinux = rule(
         "generated": attr.label_list(providers = [LinuxGeneratedInfo]),
         "generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
         "image": attr.label(providers = [LinuxImageInfo]),
-        "kallsyms": attr.bool(default = True),
+        "kallsyms": attr.string(default = "auto", values = ["auto", "false", "true"]),
         "kallsyms_all": attr.bool(),
         "kallsyms_pc_relative": attr.bool(),
         "linker_script": attr.label(allow_single_file = True),
@@ -4011,10 +4273,21 @@ linux_vmlinux = rule(
             doc = "Kernel-source-specific scripts/kallsyms executable. Required when kallsyms is enabled for a real vmlinux link.",
             executable = True,
         ),
+        "sorttable_tool": attr.label(
+            cfg = "exec",
+            doc = "Kernel-source-specific scripts/sorttable executable. Required when BUILDTIME_TABLE_SORT is enabled.",
+            executable = True,
+        ),
         "_llvm_nm": attr.label(
             allow_single_file = True,
             cfg = "exec",
             default = Label("@llvm//tools:llvm-nm"),
+            executable = True,
+        ),
+        "_llvm_objcopy": attr.label(
+            allow_single_file = True,
+            cfg = "exec",
+            default = Label("@llvm//tools:llvm-objcopy"),
             executable = True,
         ),
         "_mksysmap": attr.label(
@@ -4345,7 +4618,7 @@ def _linux_x86_archive(ctx, archiver, cc_toolchain, out_relpath, objects):
         return None
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
     args = ctx.actions.args()
-    args.add("rcsD")
+    args.add("cDPrST")
     args.add(out)
     args.add_all(objects)
     ctx.actions.run(
@@ -4751,6 +5024,8 @@ def _linux_packaged_output_impl(ctx):
         return _linux_real_objcopy_image_impl(ctx, [
             "-O",
             "binary",
+            "-R",
+            ".modinfo",
             "-R",
             ".note",
             "-R",

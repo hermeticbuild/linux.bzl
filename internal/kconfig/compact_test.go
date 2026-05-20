@@ -179,18 +179,24 @@ proc-$(CONFIG_MMU) := task_mmu.o
 	}
 
 	mmu := configByName(metadata, "mmu")
-	if compositeMemberTarget(metadata, mmu, "proc.o", "task_mmu.o") == "" {
-		t.Fatalf("MMU config missing replacement member: %#v", variantByTarget(metadata, objectTarget(metadata, mmu, "proc.o")))
+	if objectTarget(metadata, mmu, "proc.o") != "" {
+		t.Fatalf("MMU config kept built-in composite parent in image targets")
 	}
-	if target := compositeMemberTarget(metadata, mmu, "proc.o", "nommu.o"); target != "" {
+	if objectTarget(metadata, mmu, "task_mmu.o") == "" {
+		t.Fatalf("MMU config missing replacement member: %#v", mmu)
+	}
+	if target := objectTarget(metadata, mmu, "nommu.o"); target != "" {
 		t.Fatalf("MMU config kept replaced member %q", target)
 	}
 
 	nommu := configByName(metadata, "nommu")
-	if compositeMemberTarget(metadata, nommu, "proc.o", "nommu.o") == "" || compositeMemberTarget(metadata, nommu, "proc.o", "task_nommu.o") == "" {
-		t.Fatalf("NOMMU config missing default members: %#v", variantByTarget(metadata, objectTarget(metadata, nommu, "proc.o")))
+	if objectTarget(metadata, nommu, "proc.o") != "" {
+		t.Fatalf("NOMMU config kept built-in composite parent in image targets")
 	}
-	if target := compositeMemberTarget(metadata, nommu, "proc.o", "task_mmu.o"); target != "" {
+	if objectTarget(metadata, nommu, "nommu.o") == "" || objectTarget(metadata, nommu, "task_nommu.o") == "" {
+		t.Fatalf("NOMMU config missing default members: %#v", nommu)
+	}
+	if target := objectTarget(metadata, nommu, "task_mmu.o"); target != "" {
 		t.Fatalf("NOMMU config kept replacement member %q", target)
 	}
 }
@@ -210,7 +216,10 @@ mlx4_core-y += alloc.o main.o
 	}
 
 	base := configByName(metadata, "base")
-	member := variantByTarget(metadata, compositeMemberTarget(metadata, base, "mlx4_core.o", "main.o"))
+	if objectTarget(metadata, base, "mlx4_core.o") != "" {
+		t.Fatalf("built-in composite parent leaked into image targets")
+	}
+	member := variantByTarget(metadata, objectTarget(metadata, base, "main.o"))
 	if member.ModName != "mlx4_core" {
 		t.Fatalf("composite member ModName = %q, want mlx4_core", member.ModName)
 	}
@@ -266,8 +275,11 @@ endif
 	}
 
 	on := configByName(metadata, "on")
-	if target := compositeMemberTarget(metadata, on, "mlx5_core.o", "lib/vxlan.o"); target == "" {
-		t.Fatalf("known conditional append did not add composite member: %#v", variantByTarget(metadata, objectTarget(metadata, on, "mlx5_core.o")))
+	if objectTarget(metadata, on, "mlx5_core.o") != "" {
+		t.Fatalf("built-in composite parent leaked into image targets")
+	}
+	if target := objectTarget(metadata, on, "lib/vxlan.o"); target == "" {
+		t.Fatalf("known conditional append did not add composite member: %#v", on)
 	}
 }
 
@@ -346,6 +358,125 @@ obj-y += fs/
 
 	base := configByName(metadata, "base")
 	if got, want := objectNames(metadata, base.ObjectTargets), []string{"kernel/ksysfs.o", "fs/configfs.o"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("ObjectTargets order = %#v, want %#v", got, want)
+	}
+}
+
+func TestCompactMetadataExpandsDirectoryAtAssignmentPosition(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Kbuild"), []byte(`obj-y := early.o child/ late.o
+obj-y += head.o
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "child"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(child) failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "child", "Makefile"), []byte(`obj-y += child.o
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(child/Makefile) failed: %v", err)
+	}
+
+	kb, err := ParseKbuildDirectoryTree(filepath.Join(dir, "Kbuild"), KbuildOptions{RootDir: dir})
+	if err != nil {
+		t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+	}
+	metadata, err := tree.CompactMetadata(kb, []NamedConfig{{Name: "base"}})
+	if err != nil {
+		t.Fatalf("CompactMetadata() failed: %v", err)
+	}
+
+	base := configByName(metadata, "base")
+	if got, want := objectNames(metadata, base.ObjectTargets), []string{"early.o", "child/child.o", "late.o", "head.o"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("ObjectTargets order = %#v, want %#v", got, want)
+	}
+}
+
+func TestCompactMetadataSplicesExtraKbuildIntoParentDirectory(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Kbuild"), []byte(`obj-y += fs/
+obj-y += security/
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	for subdir, content := range map[string]string{
+		"fs":       "obj-y += base.o\n",
+		"security": "obj-y += commoncap.o\n",
+	} {
+		if err := os.MkdirAll(filepath.Join(dir, subdir), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q) failed: %v", subdir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, subdir, "Makefile"), []byte(content), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q/Makefile) failed: %v", subdir, err)
+		}
+	}
+
+	kb, err := ParseKbuildDirectoryTree(filepath.Join(dir, "Kbuild"), KbuildOptions{RootDir: dir})
+	if err != nil {
+		t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+	}
+	extra, err := ParseKbuild(strings.NewReader(`obj-y += actiondfs.o
+`), "Makefile")
+	if err != nil {
+		t.Fatalf("ParseKbuild(extra) failed: %v", err)
+	}
+	kb = MergeKbuildFileAtDirectory(kb, "fs/actiondfs", PrefixKbuildFile(extra, "fs/actiondfs"))
+	metadata, err := tree.CompactMetadata(kb, []NamedConfig{{Name: "base"}})
+	if err != nil {
+		t.Fatalf("CompactMetadata() failed: %v", err)
+	}
+
+	base := configByName(metadata, "base")
+	if got, want := objectNames(metadata, base.ObjectTargets), []string{"fs/base.o", "fs/actiondfs/actiondfs.o", "security/commoncap.o"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("ObjectTargets order = %#v, want %#v", got, want)
+	}
+}
+
+func TestCompactMetadataAppendsSortedLibraryRoots(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Kbuild"), []byte(`obj-y += arch/lib/
+obj-y += lib/
+obj-y += drivers/
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	for subdir, content := range map[string]string{
+		"arch/lib": "lib-y := z.o a.o\n",
+		"drivers":  "obj-y += driver.o\n",
+		"lib":      "lib-y := c.o b.o\nobj-y += builtin.o\n",
+	} {
+		if err := os.MkdirAll(filepath.Join(dir, subdir), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q) failed: %v", subdir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, subdir, "Makefile"), []byte(content), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q/Makefile) failed: %v", subdir, err)
+		}
+	}
+
+	kb, err := ParseKbuildDirectoryTree(filepath.Join(dir, "Kbuild"), KbuildOptions{RootDir: dir})
+	if err != nil {
+		t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+	}
+	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{Name: "base"}}, CompactMetadataOptions{
+		LibraryDirs: []string{"arch/lib", "lib"},
+	})
+	if err != nil {
+		t.Fatalf("CompactMetadata() failed: %v", err)
+	}
+
+	base := configByName(metadata, "base")
+	want := []string{
+		"lib/builtin.o",
+		"drivers/driver.o",
+		"arch/lib/a.o",
+		"arch/lib/z.o",
+		"lib/b.o",
+		"lib/c.o",
+	}
+	if got := objectNames(metadata, base.ObjectTargets); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("ObjectTargets order = %#v, want %#v", got, want)
 	}
 }

@@ -61,6 +61,7 @@ type CompactBuildFileOptions struct {
 	SourceLabelPackage  string
 	SourceLabelPackages map[string]string
 	SourceASN1Compiler  string
+	SourceRelacheck     string
 	SourceRootLabel     string
 	SourceTreeLabels    []string
 	GeneratedHeaders    string
@@ -80,6 +81,7 @@ type CompactMetadataOptions struct {
 	ObjectDir   string
 	SourceRoot  string
 	SourceRoots map[string]string
+	LibraryDirs []string
 }
 
 func (t *Tree) CompactMetadata(kb *KbuildFile, configs []NamedConfig) (*CompactMetadata, error) {
@@ -160,19 +162,37 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 			variants[variant.Target] = variant
 		}
 
+		variantsByTarget := map[string]CompactObjectVariant{}
+		for _, variant := range resolvedVariants {
+			variantsByTarget[variant.Target] = variant
+		}
+
 		targets := make([]string, 0, len(objects.roots))
 		moduleTargets := make([]string, 0, len(objects.roots))
-		for _, object := range objects.roots {
-			variant, ok := resolvedVariants[object.object]
-			if !ok {
-				return nil, fmt.Errorf("internal error: missing resolved variant for %q", object.object)
+		appendRootTargets := func(roots []resolvedKbuildObject) error {
+			for _, object := range roots {
+				variant, ok := resolvedVariants[object.object]
+				if !ok {
+					return fmt.Errorf("internal error: missing resolved variant for %q", object.object)
+				}
+				switch variant.Mode {
+				case "y":
+					expanded, err := imageObjectTargetsForVariant(variant, variantsByTarget)
+					if err != nil {
+						return err
+					}
+					targets = append(targets, expanded...)
+				case "m":
+					moduleTargets = append(moduleTargets, variant.Target)
+				}
 			}
-			switch variant.Mode {
-			case "y":
-				targets = append(targets, variant.Target)
-			case "m":
-				moduleTargets = append(moduleTargets, variant.Target)
-			}
+			return nil
+		}
+		if err := appendRootTargets(objects.roots); err != nil {
+			return nil, err
+		}
+		if err := appendRootTargets(objects.orderedLibRoots(opts.LibraryDirs)); err != nil {
+			return nil, err
 		}
 		out.Configs = append(out.Configs, CompactConfig{
 			Name:                named.Name,
@@ -193,6 +213,92 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 	out.ObjectPackages = compactObjectPackages(out.ObjectVariants)
 	sort.Slice(out.Configs, func(i, j int) bool { return out.Configs[i].Name < out.Configs[j].Name })
 	return out, nil
+}
+
+func imageObjectTargetsForVariant(variant CompactObjectVariant, variantsByTarget map[string]CompactObjectVariant) ([]string, error) {
+	return imageObjectTargetsForVariantStack(variant, variantsByTarget, map[string]bool{})
+}
+
+func imageObjectTargetsForVariantStack(variant CompactObjectVariant, variantsByTarget map[string]CompactObjectVariant, stack map[string]bool) ([]string, error) {
+	if len(variant.Members) == 0 || keepLinkedBuiltinComposite(variant.Object) {
+		return []string{variant.Target}, nil
+	}
+	if stack[variant.Target] {
+		return nil, fmt.Errorf("cycle in compact image object graph at %q", variant.Object)
+	}
+	stack[variant.Target] = true
+	out := []string{}
+	for _, memberTarget := range variant.Members {
+		member, ok := variantsByTarget[memberTarget]
+		if !ok {
+			return nil, fmt.Errorf("compact image member target %q for %q is missing", memberTarget, variant.Object)
+		}
+		expanded, err := imageObjectTargetsForVariantStack(member, variantsByTarget, stack)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, expanded...)
+	}
+	delete(stack, variant.Target)
+	return out, nil
+}
+
+func keepLinkedBuiltinComposite(object string) bool {
+	return object == "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o"
+}
+
+func (objects resolvedKbuildObjects) orderedLibRoots(libraryDirs []string) []resolvedKbuildObject {
+	if len(objects.libRoots) == 0 {
+		return nil
+	}
+	if len(libraryDirs) == 0 {
+		out := append([]resolvedKbuildObject(nil), objects.libRoots...)
+		sort.SliceStable(out, func(i, j int) bool {
+			return out[i].object < out[j].object
+		})
+		return out
+	}
+
+	byDir := map[string][]resolvedKbuildObject{}
+	var remainingDirs []string
+	seenRemainingDir := map[string]bool{}
+	for _, root := range objects.libRoots {
+		dir := cleanKbuildDir(root.directory)
+		byDir[dir] = append(byDir[dir], root)
+		if !seenRemainingDir[dir] {
+			seenRemainingDir[dir] = true
+			remainingDirs = append(remainingDirs, dir)
+		}
+	}
+	appendDir := func(out []resolvedKbuildObject, dir string) []resolvedKbuildObject {
+		roots := byDir[dir]
+		if len(roots) == 0 {
+			return out
+		}
+		sort.SliceStable(roots, func(i, j int) bool {
+			return roots[i].object < roots[j].object
+		})
+		out = append(out, roots...)
+		delete(byDir, dir)
+		return out
+	}
+
+	out := []resolvedKbuildObject{}
+	for _, dir := range libraryDirs {
+		out = appendDir(out, cleanKbuildDir(dir))
+	}
+	for _, dir := range remainingDirs {
+		out = appendDir(out, dir)
+	}
+	return out
+}
+
+func cleanKbuildDir(dir string) string {
+	dir = strings.Trim(filepath.ToSlash(dir), "/")
+	if dir == "." {
+		return ""
+	}
+	return dir
 }
 
 func (v CompactObjectVariant) equal(other CompactObjectVariant) bool {
@@ -305,14 +411,17 @@ type resolvedKbuildFlag struct {
 }
 
 type resolvedKbuildObjects struct {
-	byName map[string]*resolvedKbuildObject
-	roots  []resolvedKbuildObject
+	byName   map[string]*resolvedKbuildObject
+	roots    []resolvedKbuildObject
+	libRoots []resolvedKbuildObject
 }
 
 func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObjects {
 	byObject := map[string]*resolvedKbuildObject{}
 	var rootOrder []string
+	var libRootOrder []string
 	seenRoot := map[string]bool{}
+	seenLibRoot := map[string]bool{}
 	for _, entry := range kb.resolvedObjectEntries(config) {
 		mode := entry.Condition.Mode(config)
 		if mode == "n" {
@@ -333,7 +442,12 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 		}
 		if entry.Root {
 			object.root = true
-			if !seenRoot[entry.Object] {
+			if entry.Kind == "lib" {
+				if !seenLibRoot[entry.Object] {
+					seenLibRoot[entry.Object] = true
+					libRootOrder = append(libRootOrder, entry.Object)
+				}
+			} else if !seenRoot[entry.Object] {
 				seenRoot[entry.Object] = true
 				rootOrder = append(rootOrder, entry.Object)
 			}
@@ -438,6 +552,11 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 			out.roots = append(out.roots, *object)
 		}
 	}
+	for _, name := range libRootOrder {
+		if object := byObject[name]; object != nil && object.root {
+			out.libRoots = append(out.libRoots, *object)
+		}
+	}
 	return out
 }
 
@@ -451,8 +570,14 @@ func (kb *KbuildFile) resolvedObjectEntries(config *ResolvedConfig) []KbuildObje
 		kind      string
 		mode      string
 	}
-	buckets := map[bucketKey][]KbuildObject{}
-	var bucketOrder []bucketKey
+	type assignmentRecord struct {
+		key    bucketKey
+		values []KbuildObject
+		active bool
+	}
+
+	var records []*assignmentRecord
+	recordsByKey := map[bucketKey][]*assignmentRecord{}
 	assigned := map[bucketKey]bool{}
 	for _, assignment := range kb.objectAssigns {
 		mode := assignment.Condition.Mode(config)
@@ -460,36 +585,49 @@ func (kb *KbuildFile) resolvedObjectEntries(config *ResolvedConfig) []KbuildObje
 			continue
 		}
 		key := bucketKey{directory: assignment.Directory, kind: assignment.Kind, mode: mode}
-		if _, ok := buckets[key]; !ok {
-			bucketOrder = append(bucketOrder, key)
-		}
 		values := make([]KbuildObject, 0, len(assignment.Objects))
 		for _, object := range assignment.Objects {
 			values = append(values, KbuildObject{
 				Object:    object,
+				Kind:      assignment.Kind,
 				Directory: assignment.Directory,
 				Condition: assignment.Condition,
 				Root:      assignment.Root,
 				Position:  assignment.Position,
 			})
 		}
+		addRecord := func() {
+			record := &assignmentRecord{
+				key:    key,
+				values: values,
+				active: true,
+			}
+			records = append(records, record)
+			recordsByKey[key] = append(recordsByKey[key], record)
+		}
 		switch assignment.Operator {
 		case "+=":
-			buckets[key] = append(buckets[key], values...)
+			addRecord()
+			assigned[key] = true
 		case "?=":
 			if !assigned[key] {
-				buckets[key] = values
+				addRecord()
 				assigned[key] = true
 			}
 		default:
-			buckets[key] = values
+			for _, record := range recordsByKey[key] {
+				record.active = false
+			}
+			addRecord()
 			assigned[key] = true
 		}
 	}
 
 	var out []KbuildObject
-	for _, key := range bucketOrder {
-		out = append(out, buckets[key]...)
+	for _, record := range records {
+		if record.active {
+			out = append(out, record.values...)
+		}
 	}
 	return out
 }
@@ -1106,6 +1244,9 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 			}
 			if opts.SourceASN1Compiler != "" && strings.HasSuffix(variant.Object, ".asn1.o") {
 				r.SetAttr("asn1_compiler", opts.SourceASN1Compiler)
+			}
+			if opts.SourceRelacheck != "" && strings.HasSuffix(variant.Object, ".pi.o") {
+				r.SetAttr("relacheck", opts.SourceRelacheck)
 			}
 		}
 		if len(variant.Flags) != 0 {

@@ -258,12 +258,11 @@ def _linux_kernel_impl(mctx):
         arch = _architecture(compact.config_name)
         source_repo = _normalize_repo(compact.source_repo)
         prefix = compact.kernel_name + "_" + arch.config_name
-        compact_vars = dict(arch.compact_vars)
-        compact_vars.update({
+        compact_vars = arch.compact_vars | {
             "ARCH": arch.arch,
             "SRCARCH": arch.srcarch,
             "UTS_MACHINE": arch.uts_machine,
-        })
+        }
         env = {
             "ARCH": arch.arch,
             "SRCARCH": arch.srcarch,
@@ -300,15 +299,16 @@ def _linux_kernel_impl(mctx):
             extra_source_label_packages = extra_source_label_packages,
             generated_headers = _package_label(label_repo, compact.kernel_package, prefix + "_" + arch.arch + "_generated_headers"),
             generated_visibility = compact.generated_visibility,
-            kbuild = "%s//:Kbuild" % source_repo,
+            kbuild = source_repo + "//:Kbuild",
             kbuild_tree = compact.kbuild_tree,
             kconfig_parse_tool = kconfig_parse_tool,
-            root = "%s//:Kconfig" % source_repo,
+            root = source_repo + "//:Kconfig",
             source_asn1_compiler = _package_label(label_repo, compact.kernel_package, prefix + "_asn1_compiler_tool"),
+            source_relacheck = _package_label(label_repo, compact.kernel_package, prefix + "_relacheck_tool") if arch.config_name == "aarch64" else "",
             source_config = _package_label(label_repo, compact.kernel_package, prefix + "_config"),
             source_label_package = source_repo + "//",
-            source_root_label = "%s//:Kconfig" % source_repo,
-            source_tree_labels = ["%s//:all" % source_repo] + extra_source_tree_labels,
+            source_root_label = source_repo + "//:Kconfig",
+            source_tree_labels = [source_repo + "//:all_files"] + extra_source_tree_labels,
             vars = compact_vars,
         )
     return mctx.extension_metadata(reproducible = True)

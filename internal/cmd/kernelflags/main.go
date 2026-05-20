@@ -55,6 +55,8 @@ func linuxCFlags(config map[string]string, arch string) []string {
 		"-funsigned-char",
 		"-fno-common",
 		"-fno-PIE",
+		"-fno-function-sections",
+		"-fno-data-sections",
 		"-fno-strict-aliasing",
 		"-fno-delete-null-pointer-checks",
 		"-Wno-address-of-packed-member",
@@ -66,6 +68,7 @@ func linuxCFlags(config map[string]string, arch string) []string {
 	}
 	if enabled(config, "CONFIG_CC_IS_CLANG") {
 		flags = append(flags,
+			"-fno-addrsig",
 			"-Wno-default-const-init-unsafe",
 			"-Wno-default-const-init-var-unsafe",
 			"-Wno-gnu",
@@ -110,12 +113,18 @@ func linuxCFlags(config map[string]string, arch string) []string {
 	if enabled(config, "CONFIG_DEBUG_SECTION_MISMATCH") {
 		flags = append(flags, "-fno-inline-functions-called-once")
 	}
+	if enabled(config, "CONFIG_CC_IS_CLANG") {
+		flags = append(flags, "-fno-stack-clash-protection")
+	}
 	if alignment := config["CONFIG_FUNCTION_ALIGNMENT"]; alignment != "" {
 		if enabled(config, "CONFIG_CC_HAS_MIN_FUNCTION_ALIGNMENT") && !enabled(config, "CONFIG_CC_IS_CLANG") {
 			flags = append(flags, "-fmin-function-alignment="+alignment)
 		} else {
 			flags = append(flags, "-falign-functions="+alignment)
 		}
+	}
+	if enabled(config, "CONFIG_CC_IS_CLANG") {
+		flags = append(flags, "-fstrict-flex-arrays=3")
 	}
 	flags = append(flags,
 		"-fno-strict-overflow",
@@ -254,6 +263,7 @@ func linuxAFlags(config map[string]string, arch string) []string {
 func arm64CFlags(config map[string]string) []string {
 	flags := []string{
 		"-mgeneral-regs-only",
+		"-DCONFIG_CC_HAS_K_CONSTRAINT=1",
 		"-Wno-psabi",
 	}
 	if enabled(config, "CONFIG_CPU_BIG_ENDIAN") {
@@ -292,21 +302,25 @@ func arm64CFlags(config map[string]string) []string {
 	} else if enabled(config, "CONFIG_KASAN_GENERIC") {
 		kasanShift = "3"
 	}
-	if kasanShift != "" {
-		flags = append(flags, "-DKASAN_SHADOW_SCALE_SHIFT="+kasanShift)
-	}
+	flags = append(flags, "-DKASAN_SHADOW_SCALE_SHIFT="+kasanShift)
 	return flags
 }
 
 func arm64AFlags(config map[string]string) []string {
 	flags := []string{
 		"-D__ASSEMBLY__",
+		"-fno-PIE",
 		"-Wno-psabi",
 	}
 	if enabled(config, "CONFIG_CPU_BIG_ENDIAN") {
 		flags = append(flags, "-mbig-endian")
 	} else {
 		flags = append(flags, "-mlittle-endian")
+	}
+	if enabled(config, "CONFIG_UNWIND_TABLES") {
+		flags = append(flags, "-fasynchronous-unwind-tables")
+	} else {
+		flags = append(flags, "-fno-asynchronous-unwind-tables", "-fno-unwind-tables")
 	}
 	asmArch := "armv8.4-a"
 	if enabled(config, "CONFIG_AS_HAS_ARMV8_5") {
@@ -316,6 +330,13 @@ func arm64AFlags(config map[string]string) []string {
 	if enabled(config, "CONFIG_SHADOW_CALL_STACK") {
 		flags = append(flags, "-ffixed-x18")
 	}
+	kasanShift := ""
+	if enabled(config, "CONFIG_KASAN_SW_TAGS") {
+		kasanShift = "4"
+	} else if enabled(config, "CONFIG_KASAN_GENERIC") {
+		kasanShift = "3"
+	}
+	flags = append(flags, "-DKASAN_SHADOW_SCALE_SHIFT="+kasanShift)
 	return flags
 }
 

@@ -73,6 +73,8 @@ def _linux_compact_outputs_impl(ctx):
         args.add("-source_label_package", ctx.attr.source_label_package)
     if ctx.attr.source_asn1_compiler:
         args.add("-source_asn1_compiler", ctx.attr.source_asn1_compiler)
+    if ctx.attr.source_relacheck:
+        args.add("-source_relacheck", ctx.attr.source_relacheck)
     if ctx.attr.source_config:
         args.add("-source_config", ctx.attr.source_config)
     if ctx.attr.source_root_label:
@@ -223,6 +225,9 @@ _linux_compact_outputs = rule(
         ),
         "source_asn1_compiler": attr.string(
             doc = "Label for a scripts/asn1_compiler executable emitted into source-backed compact object rules.",
+        ),
+        "source_relacheck": attr.string(
+            doc = "Label for arch/arm64/kernel/pi/relacheck emitted into arm64 .pi.o object rules.",
         ),
         "source_config": attr.string(
             doc = "Label for a full linux_config target emitted into source-backed compact object rules.",
@@ -524,6 +529,7 @@ def linux_compact_buildfiles(
         object_label_package = None,
         source_label_package = "",
         source_asn1_compiler = "",
+        source_relacheck = "",
         source_config = "",
         source_root_label = "",
         source_tree_labels = [],
@@ -572,6 +578,7 @@ def linux_compact_buildfiles(
         root = root,
         source_label_package = source_label_package,
         source_asn1_compiler = source_asn1_compiler,
+        source_relacheck = source_relacheck,
         source_config = source_config,
         source_root_label = source_root_label,
         source_tree_labels = source_tree_labels,
@@ -765,6 +772,8 @@ def _configure_probe_env(allow_shell, env):
         return
     if "CC" not in env:
         env["CC"] = "clang"
+    if "CC_VERSION_TEXT" not in env:
+        env["CC_VERSION_TEXT"] = "clang version 22.1.4None"
     if "LD" not in env:
         env["LD"] = "ld.lld"
     if "CLANG_FLAGS" not in env:

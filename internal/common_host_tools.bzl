@@ -18,13 +18,14 @@ def linux_common_host_tools(
     if source_root == None:
         source_root = source_label(source_repo, "Kconfig")
     if source_tree == None:
-        source_tree = [source_label(source_repo, "all")]
+        source_tree = [source_label(source_repo, "all_files")]
     if env == None:
         env = {}
 
     probe_config = target_prefix + "_linux_probe"
     asn1_compiler = target_prefix + "_asn1_compiler_tool"
     kallsyms_tool = target_prefix + "_kallsyms_tool"
+    sorttable_tool = target_prefix + "_sorttable_tool"
 
     linux_probe_config(
         name = probe_config,
@@ -46,10 +47,21 @@ def linux_common_host_tools(
         deps = [source_label(source_repo, "scripts_headers_cc")],
     )
 
+    cc_binary(
+        name = sorttable_tool,
+        srcs = [source_label(source_repo, "scripts/sorttable.c")],
+        visibility = visibility,
+        deps = [
+            source_label(source_repo, "scripts_headers_cc"),
+            source_label(source_repo, "tools_headers_cc"),
+        ],
+    )
+
     return struct(
         asn1_compiler = package_label(asn1_compiler),
         kallsyms_tool = package_label(kallsyms_tool),
         probe_config = package_label(probe_config),
+        sorttable_tool = package_label(sorttable_tool),
         source_asn1_compiler = package_label(asn1_compiler),
         source_label_package = source_label_package(source_repo),
         source_repo = source_repo,

@@ -31,7 +31,7 @@ def linux(
         extra_srcs = []
     source_repo = _normalize_repo(source_repo)
     source_root = _repo_label(source_repo, "Kconfig")
-    source_tree = [_repo_label(source_repo, "all")]
+    source_tree = [_repo_label(source_repo, "all_files")]
     package_visibility = _package_visibility()
     actuals = {}
 
@@ -147,6 +147,7 @@ def _define_arch_kernel(
             probe_config = host_tools.probe_config,
             root = source_root,
             source_asn1_compiler = host_tools.source_asn1_compiler,
+            source_relacheck = host_tools.relacheck_tool if hasattr(host_tools, "relacheck_tool") else "",
             source_config = _package_label(config_target),
             source_label_package = host_tools.source_label_package,
             source_root_label = host_tools.source_root,
@@ -170,6 +171,7 @@ def _define_arch_kernel(
         "linker_script": _repo_label(source_repo, arch.vmlinux_linker_script),
         "source_root": source_root,
         "source_tree": source_tree,
+        "sorttable_tool": host_tools.sorttable_tool,
         "srcarch": arch.srcarch,
         "visibility": package_visibility,
     }

@@ -21,6 +21,7 @@ var ifSuccessPattern = regexp.MustCompile(`^\{\s*(.*);\s*\}\s*>/dev/null\s+2>&1\
 type LinuxProbeConfig struct {
 	CCName           string
 	CCVersion        int
+	CCVersionText    string
 	ASName           string
 	ASVersion        int
 	LDName           string
@@ -35,6 +36,8 @@ type LinuxProbeConfig struct {
 	CCOptions     bool
 	ASInstr       bool
 	RustOptions   bool
+
+	CCBuiltinMacros map[string]string
 }
 
 // LinuxProbeShell returns a deterministic shell model for Linux Kconfig feature
@@ -55,17 +58,21 @@ func LinuxProbeConfigForModel(model string) (LinuxProbeConfig, error) {
 	case LinuxProbeModelLLVM:
 		return LinuxProbeConfig{
 			CCName:           "Clang",
-			CCVersion:        220103,
+			CCVersion:        220104,
+			CCVersionText:    "clang version 22.1.4None",
 			ASName:           "LLVM",
 			ASVersion:        0,
 			LDName:           "LLD",
-			LDVersion:        220103,
+			LDVersion:        220104,
 			RustcVersion:     0,
 			RustcLLVMVersion: 0,
 			PaholeVersion:    0,
 			CanLink:          true,
 			CCOptions:        true,
 			ASInstr:          true,
+			CCBuiltinMacros: map[string]string{
+				"__SIZEOF_INT128__": "16",
+			},
 		}, nil
 	default:
 		return LinuxProbeConfig{}, fmt.Errorf("unknown Linux probe model %q", model)
@@ -88,6 +95,8 @@ func ApplyLinuxProbeValue(config *LinuxProbeConfig, key, value string) error {
 		config.CCName = value
 	case "cc_version":
 		return setProbeInt(&config.CCVersion, key, value)
+	case "cc_version_text":
+		config.CCVersionText = value
 	case "as_name":
 		config.ASName = value
 	case "as_version":
@@ -115,6 +124,16 @@ func ApplyLinuxProbeValue(config *LinuxProbeConfig, key, value string) error {
 	case "rust_options":
 		return setProbeBool(&config.RustOptions, key, value)
 	default:
+		if name, ok := strings.CutPrefix(key, "cc_builtin_macro."); ok {
+			if name == "" {
+				return fmt.Errorf("invalid Linux probe value %q: expected macro name", key)
+			}
+			if config.CCBuiltinMacros == nil {
+				config.CCBuiltinMacros = map[string]string{}
+			}
+			config.CCBuiltinMacros[name] = value
+			return nil
+		}
 		return fmt.Errorf("unknown Linux probe value %q", key)
 	}
 	return nil
@@ -142,6 +161,8 @@ func (s *linuxProbeShell) output(command string) (string, error) {
 	switch {
 	case strings.Contains(command, "/scripts/cc-version.sh"):
 		return fmt.Sprintf("%s %d", s.config.CCName, s.config.CCVersion), nil
+	case strings.Contains(command, " --version") && strings.Contains(command, "clang"):
+		return s.config.CCVersionText, nil
 	case strings.Contains(command, "/scripts/as-version.sh"):
 		return fmt.Sprintf("%s %d", s.config.ASName, s.config.ASVersion), nil
 	case strings.Contains(command, "/scripts/ld-version.sh"):
@@ -178,7 +199,9 @@ func (s *linuxProbeShell) commandSucceeds(command string) bool {
 		return s.config.CanLink
 	case strings.Contains(command, " --crate-type=rlib "):
 		return s.config.RustOptions
-	case strings.Contains(command, " -Werror "):
+	case hasShellField(command, "-Werror"):
+		return s.ccOptionSucceeds(command)
+	case strings.Contains(command, " -x c - ") && strings.Contains(command, " -c "):
 		return s.config.CCOptions
 	case strings.Contains(command, " -Wa,"):
 		return s.config.ASInstr
@@ -187,6 +210,38 @@ func (s *linuxProbeShell) commandSucceeds(command string) bool {
 	default:
 		return false
 	}
+}
+
+func (s *linuxProbeShell) ccOptionSucceeds(command string) bool {
+	if !s.config.CCOptions {
+		return false
+	}
+	for _, field := range strings.Fields(command) {
+		if !linuxLLVMProbeSupportsOption(field) {
+			return false
+		}
+		if !strings.HasPrefix(field, "-D") || len(field) == len("-D") {
+			continue
+		}
+		define := strings.TrimPrefix(field, "-D")
+		name, value, ok := strings.Cut(define, "=")
+		if !ok {
+			value = "1"
+		}
+		if builtin, ok := s.config.CCBuiltinMacros[name]; ok && value != builtin {
+			return false
+		}
+	}
+	return true
+}
+
+func hasShellField(command, field string) bool {
+	for _, got := range strings.Fields(command) {
+		if got == field {
+			return true
+		}
+	}
+	return false
 }
 
 func setProbeInt(dst *int, key, value string) error {

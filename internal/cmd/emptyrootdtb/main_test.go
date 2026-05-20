@@ -23,7 +23,10 @@ func TestEmptyRootDTB(t *testing.T) {
 	if got := binary.BigEndian.Uint32(dtb[4:8]); got != uint32(len(dtb)) {
 		t.Fatalf("totalsize = %d, want %d", got, len(dtb))
 	}
-	if got := string(dtb[len(dtb)-28:]); got != "#address-cells\x00#size-cells\x00\x00" {
+	if got := binary.BigEndian.Uint32(dtb[32:36]); got != 27 {
+		t.Fatalf("size_dt_strings = %d, want 27", got)
+	}
+	if got := string(dtb[len(dtb)-27:]); got != "#address-cells\x00#size-cells\x00" {
 		t.Fatalf("strings block suffix = %q", got)
 	}
 }

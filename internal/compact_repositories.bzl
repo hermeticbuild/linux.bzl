@@ -82,11 +82,49 @@ def _run_compact_generator(rctx):
             result.stdout,
             result.stderr,
         ))
+    if rctx.attr.source_relacheck:
+        rctx.file(output_build, _add_relacheck_to_pi_objects(rctx.read(output_build), rctx.attr.source_relacheck))
+
+def _add_relacheck_to_pi_objects(content, relacheck):
+    lines = content.splitlines()
+    out = []
+    block = None
+    object = ""
+    has_relacheck = False
+    for line in lines:
+        if block == None:
+            if line == "linux_object(":
+                block = [line]
+                object = ""
+                has_relacheck = False
+                continue
+            out.append(line)
+            continue
+
+        if line == ")":
+            if object.endswith(".pi.o") and not has_relacheck:
+                block.append("    relacheck = \"%s\"," % relacheck)
+            out.extend(block)
+            out.append(line)
+            block = None
+            continue
+
+        stripped = line.strip()
+        if stripped.startswith("object = \"") and stripped.endswith("\","):
+            object = stripped[len("object = \""):-len("\",")]
+        if stripped.startswith("relacheck = "):
+            has_relacheck = True
+        block.append(line)
+
+    if block != None:
+        out.extend(block)
+    return "\n".join(out) + "\n"
 
 def _configure_probe_env(allow_shell, env):
     if not allow_shell:
         return
     env.setdefault("CC", "clang")
+    env.setdefault("CC_VERSION_TEXT", "clang version 22.1.4None")
     env.setdefault("LD", "ld.lld")
     env.setdefault("CLANG_FLAGS", "-fintegrated-as")
     env.setdefault("RUSTC", "rustc")
@@ -177,6 +215,9 @@ linux_compact_repository = repository_rule(
         ),
         "source_asn1_compiler": attr.string(
             doc = "Label emitted for the source tree's scripts/asn1_compiler tool.",
+        ),
+        "source_relacheck": attr.string(
+            doc = "Label emitted for arch/arm64/kernel/pi/relacheck.",
         ),
         "source_config": attr.string(
             doc = "Label emitted for the resolved LinuxConfigInfo target.",

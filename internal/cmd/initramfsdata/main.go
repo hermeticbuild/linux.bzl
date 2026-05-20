@@ -69,6 +69,9 @@ func run(in, out string) error {
 			return err
 		}
 	}
+	if err := writePaddingTo(file, 512); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -243,4 +246,25 @@ func writePadding(w io.Writer, size int) error {
 	}
 	_, err := w.Write(make([]byte, padding))
 	return err
+}
+
+func writePaddingTo(w io.Writer, align int) error {
+	if align == 0 {
+		return nil
+	}
+	if seeker, ok := w.(interface {
+		Seek(offset int64, whence int) (int64, error)
+	}); ok {
+		off, err := seeker.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		padding := (align - int(off)%align) % align
+		if padding == 0 {
+			return nil
+		}
+		_, err = w.Write(make([]byte, padding))
+		return err
+	}
+	return fmt.Errorf("writer does not support seeking")
 }

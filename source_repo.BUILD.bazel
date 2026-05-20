@@ -9,7 +9,7 @@ exports_files(
 )
 
 filegroup(
-    name = "all",
+    name = "all_files",
     srcs = glob(["**"]),
 )
 
@@ -23,10 +23,7 @@ filegroup(
 
 cc_library(
     name = "linux_headers_cc",
-    hdrs = glob([
-        "include/**/*.h",
-        "arch/*/include/**/*.h",
-    ]),
+    hdrs = [":headers"],
     includes = [
         "include",
         "arch/arm/include",

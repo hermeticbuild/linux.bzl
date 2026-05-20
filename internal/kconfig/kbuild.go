@@ -30,10 +30,12 @@ type KbuildFile struct {
 
 type KbuildObject struct {
 	Object    string          `json:"object"`
+	Kind      string          `json:"kind,omitempty"`
 	Directory string          `json:"directory,omitempty"`
 	Condition KbuildCondition `json:"condition"`
 	Root      bool            `json:"root,omitempty"`
 	Position  Position        `json:"position"`
+	order     int
 }
 
 type KbuildFlag struct {
@@ -53,6 +55,7 @@ type KbuildDir struct {
 	Root      bool            `json:"root,omitempty"`
 	Condition KbuildCondition `json:"condition"`
 	Position  Position        `json:"position"`
+	order     int
 }
 
 type KbuildTarget struct {
@@ -111,6 +114,7 @@ type kbuildObjectAssignment struct {
 	Condition KbuildCondition
 	Root      bool
 	Position  Position
+	order     int
 }
 
 type KbuildCondition struct {
@@ -193,6 +197,63 @@ func MergeKbuildFiles(parts ...*KbuildFile) *KbuildFile {
 	return out
 }
 
+func MergeKbuildFileAtDirectory(base *KbuildFile, dir string, extra *KbuildFile) *KbuildFile {
+	out := &KbuildFile{}
+	out.merge(base)
+	if extra == nil {
+		return out
+	}
+	extraAssignments := append([]kbuildObjectAssignment(nil), extra.objectAssigns...)
+	out.Objects = append(out.Objects, extra.Objects...)
+	out.Flags = append(out.Flags, extra.Flags...)
+	out.RemoveFlags = append(out.RemoveFlags, extra.RemoveFlags...)
+	out.Directories = append(out.Directories, extra.Directories...)
+	out.Generated = append(out.Generated, extra.Generated...)
+	out.Includes = append(out.Includes, extra.Includes...)
+	out.Rules = append(out.Rules, extra.Rules...)
+	out.TargetVariables = append(out.TargetVariables, extra.TargetVariables...)
+	out.compositeMembers = append(out.compositeMembers, extra.compositeMembers...)
+	out.compositeAssigns = append(out.compositeAssigns, extra.compositeAssigns...)
+	if len(extraAssignments) == 0 {
+		return out
+	}
+	insertAt := kbuildDirectoryInsertionIndex(out.objectAssigns, dir)
+	assignments := make([]kbuildObjectAssignment, 0, len(out.objectAssigns)+len(extraAssignments))
+	assignments = append(assignments, out.objectAssigns[:insertAt]...)
+	assignments = append(assignments, extraAssignments...)
+	assignments = append(assignments, out.objectAssigns[insertAt:]...)
+	out.objectAssigns = assignments
+	return out
+}
+
+func kbuildDirectoryInsertionIndex(assignments []kbuildObjectAssignment, dir string) int {
+	parent := filepath.ToSlash(filepath.Dir(strings.Trim(filepath.ToSlash(dir), "/")))
+	if parent == "." {
+		parent = ""
+	}
+	seenParent := false
+	insertAt := len(assignments)
+	for i, assignment := range assignments {
+		if kbuildAssignmentInDirectoryTree(assignment, parent) {
+			seenParent = true
+			insertAt = i + 1
+			continue
+		}
+		if seenParent {
+			return i
+		}
+	}
+	return insertAt
+}
+
+func kbuildAssignmentInDirectoryTree(assignment kbuildObjectAssignment, dir string) bool {
+	assignmentDir := strings.Trim(filepath.ToSlash(assignment.Directory), "/")
+	if dir == "" {
+		return assignmentDir == ""
+	}
+	return assignmentDir == dir || strings.HasPrefix(assignmentDir, dir+"/")
+}
+
 func PrefixKbuildFile(kb *KbuildFile, dir string) *KbuildFile {
 	return prefixKbuildFile(kb, dir, KbuildCondition{Kind: "const", State: "y"}, true)
 }
@@ -271,6 +332,7 @@ type kbuildParser struct {
 	definePos    Position
 	defineBody   []string
 	currentRule  int
+	order        int
 	includeFunc  func([]KbuildInclude) error
 	includeDepth int
 }
@@ -306,6 +368,11 @@ func newKbuildParser(vars map[string]string, baseDir string) *kbuildParser {
 		baseDir:     baseDir,
 		currentRule: -1,
 	}
+}
+
+func (p *kbuildParser) nextOrder() int {
+	p.order++
+	return p.order
 }
 
 func (p *kbuildParser) parseLine(line string, pos Position) error {
@@ -753,49 +820,72 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 func (p *kbuildParser) parseCollectionAssignment(kind string, cond KbuildCondition, op string, values []string, pos Position) error {
 	cond = p.withActiveCondition(cond)
 	objects := []string{}
+	objectOrder := 0
+	objectOp := op
+	flushObjects := func() {
+		if len(objects) == 0 || (kind != "obj" && kind != "lib") {
+			return
+		}
+		p.kb.objectAssigns = append(p.kb.objectAssigns, kbuildObjectAssignment{
+			Kind:      kind,
+			Objects:   append([]string(nil), objects...),
+			Operator:  objectOp,
+			Condition: cond,
+			Root:      true,
+			Position:  pos,
+			order:     objectOrder,
+		})
+		objects = nil
+		objectOrder = 0
+		if objectOp != "+=" {
+			objectOp = "+="
+		}
+	}
 	for _, value := range values {
+		order := p.nextOrder()
 		object, ok := kbuildObjectToken(value)
 		if ok && (kind == "obj" || kind == "lib") {
+			if objectOrder == 0 {
+				objectOrder = order
+			}
 			objects = append(objects, object)
 			p.kb.Objects = append(p.kb.Objects, KbuildObject{
 				Object:    object,
+				Kind:      kind,
 				Condition: cond,
 				Root:      true,
 				Position:  pos,
+				order:     order,
 			})
+			continue
 		}
 		dir, ok := kbuildDirectoryToken(value, kind == "subdir")
 		if ok {
+			flushObjects()
 			p.kb.Directories = append(p.kb.Directories, KbuildDir{
 				Kind:      kind,
 				Directory: dir,
 				Condition: cond,
 				Position:  pos,
+				order:     order,
 			})
 			continue
 		}
 		var root bool
 		dir, root, ok = p.kbuildArchiveDirectoryToken(value)
 		if ok {
+			flushObjects()
 			p.kb.Directories = append(p.kb.Directories, KbuildDir{
 				Kind:      kind,
 				Directory: dir,
 				Root:      root,
 				Condition: cond,
 				Position:  pos,
+				order:     order,
 			})
 		}
 	}
-	if len(objects) != 0 && (kind == "obj" || kind == "lib") {
-		p.kb.objectAssigns = append(p.kb.objectAssigns, kbuildObjectAssignment{
-			Kind:      kind,
-			Objects:   objects,
-			Operator:  op,
-			Condition: cond,
-			Root:      true,
-			Position:  pos,
-		})
-	}
+	flushObjects()
 	return nil
 }
 
@@ -1220,7 +1310,7 @@ func kbuildKnownCall(name string, args []string, original string) (string, bool)
 
 func linuxLLVMProbeSupportsOption(option string) bool {
 	switch option {
-	case "", "-fno-code-hoisting":
+	case "", "-fno-code-hoisting", "-fmin-function-alignment=8", "-fsanitize=kernel-memory":
 		return false
 	default:
 		return true
@@ -1737,37 +1827,89 @@ func (p *kbuildDirectoryTreeParser) parsePath(path, objectDir string, gate Kbuil
 	defer delete(p.stack, abs)
 
 	out := prefixKbuildFile(local, objectDir, gate, linkRoots)
-	directories := local.Directories
+	sources := []struct {
+		raw       *KbuildFile
+		prefixed  *KbuildFile
+		objectDir string
+	}{{raw: local, prefixed: out, objectDir: objectDir}}
 	if objectDir == "" {
 		for _, rootMakefile := range p.opts.RootMakefiles {
 			rootLocal, err := p.parseRootMakefile(rootMakefile)
 			if err != nil {
 				return nil, err
 			}
-			out.merge(prefixKbuildFile(rootLocal, "", gate, linkRoots))
-			directories = append(directories, rootLocal.Directories...)
+			rootPrefixed := prefixKbuildFile(rootLocal, "", gate, linkRoots)
+			out.merge(rootPrefixed)
+			sources = append(sources, struct {
+				raw       *KbuildFile
+				prefixed  *KbuildFile
+				objectDir string
+			}{raw: rootLocal, prefixed: rootPrefixed, objectDir: ""})
 		}
 	}
-	for _, dir := range directories {
-		childDir := filepath.ToSlash(filepath.Clean(filepath.Join(objectDir, dir.Directory)))
-		if dir.Root {
-			childDir = filepath.ToSlash(filepath.Clean(dir.Directory))
-		}
-		if childDir == "." {
-			childDir = ""
-		}
-		childPath, ok := p.kbuildFileForDir(childDir)
-		if !ok {
-			continue
-		}
-		childGate := combineKbuildConditions(gate, dir.Condition)
-		childLinkRoots := linkRoots && dir.Kind != "subdir"
-		child, err := p.parsePath(childPath, childDir, childGate, childLinkRoots)
-		if err != nil {
-			return nil, err
-		}
-		out.merge(child)
+
+	type orderedEvent struct {
+		order      int
+		assignment *kbuildObjectAssignment
+		dir        *KbuildDir
+		objectDir  string
+		index      int
 	}
+	var orderedAssignments []kbuildObjectAssignment
+	var events []orderedEvent
+	for _, source := range sources {
+		events = events[:0]
+		for i := range source.prefixed.objectAssigns {
+			assignment := source.prefixed.objectAssigns[i]
+			events = append(events, orderedEvent{
+				order:      assignment.order,
+				assignment: &assignment,
+				index:      len(events),
+			})
+		}
+		for i := range source.raw.Directories {
+			dir := source.raw.Directories[i]
+			events = append(events, orderedEvent{
+				order:     dir.order,
+				dir:       &dir,
+				objectDir: source.objectDir,
+				index:     len(events),
+			})
+		}
+		sort.SliceStable(events, func(i, j int) bool {
+			if events[i].order != events[j].order {
+				return events[i].order < events[j].order
+			}
+			return events[i].index < events[j].index
+		})
+		for _, event := range events {
+			if event.assignment != nil {
+				orderedAssignments = append(orderedAssignments, *event.assignment)
+				continue
+			}
+			dir := *event.dir
+			childDir := filepath.ToSlash(filepath.Clean(filepath.Join(event.objectDir, dir.Directory)))
+			if dir.Root {
+				childDir = filepath.ToSlash(filepath.Clean(dir.Directory))
+			}
+			if childDir == "." {
+				childDir = ""
+			}
+			childPath, ok := p.kbuildFileForDir(childDir)
+			if !ok {
+				continue
+			}
+			childGate := combineKbuildConditions(gate, dir.Condition)
+			childLinkRoots := linkRoots && dir.Kind != "subdir"
+			child, err := p.parsePath(childPath, childDir, childGate, childLinkRoots)
+			if err != nil {
+				return nil, err
+			}
+			out.merge(child)
+			orderedAssignments = append(orderedAssignments, child.objectAssigns...)
+		}
+	}
+	out.objectAssigns = orderedAssignments
 	return out, nil
 }
 

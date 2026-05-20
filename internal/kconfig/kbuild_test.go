@@ -772,10 +772,10 @@ endif
 		t.Fatalf("CompactMetadata() failed: %v", err)
 	}
 	base := configByName(metadata, "base")
-	if target := compositeMemberTarget(metadata, base, "dwc3.o", "gadget.o"); target != "" {
+	if target := objectTarget(metadata, base, "gadget.o"); target != "" {
 		t.Fatalf("disabled gadget branch leaked into composite: %q", target)
 	}
-	if target := compositeMemberTarget(metadata, base, "dwc3.o", "core.o"); target == "" {
+	if target := objectTarget(metadata, base, "core.o"); target == "" {
 		t.Fatalf("unconditional core member missing")
 	}
 }
@@ -1166,17 +1166,15 @@ always-y += generated.o
 	}
 
 	base := configByName(metadata, "base")
-	if target := objectTarget(metadata, base, "net/stack.o"); target == "" {
-		t.Fatalf("base config does not include composite parent: %#v", metadata.Configs)
-	} else if variant := variantByTarget(metadata, target); len(variant.Members) == 0 {
-		t.Fatalf("net/stack.o has no composite members: %#v", variant)
+	if target := objectTarget(metadata, base, "net/stack.o"); target != "" {
+		t.Fatalf("base config kept built-in composite parent in image targets: %q", target)
 	}
-	if target := compositeMemberTarget(metadata, base, "net/stack.o", "net/base.o"); target == "" {
+	if target := objectTarget(metadata, base, "net/base.o"); target == "" {
 		t.Fatalf("base config does not include unconditional composite member: %#v", metadata.Configs)
 	} else if variant := variantByTarget(metadata, target); strings.Join(variant.Flags, " ") != "-DBASE" {
 		t.Fatalf("net/base.o flags = %#v, want -DBASE", variant.Flags)
 	}
-	if compositeMemberTarget(metadata, base, "net/stack.o", "net/debug.o") != "" {
+	if objectTarget(metadata, base, "net/debug.o") != "" {
 		t.Fatalf("base config unexpectedly includes conditional debug member")
 	}
 	if objectTarget(metadata, base, "host-helper.o") != "" || objectTarget(metadata, base, "generated.o") != "" {
@@ -1184,19 +1182,19 @@ always-y += generated.o
 	}
 
 	debug := configByName(metadata, "debug")
-	if target := compositeMemberTarget(metadata, debug, "net/stack.o", "net/debug.o"); target == "" {
+	if target := objectTarget(metadata, debug, "net/debug.o"); target == "" {
 		t.Fatalf("debug config does not include conditional composite member")
 	} else if variant := variantByTarget(metadata, target); strings.Join(variant.Flags, " ") != "-DDEBUG_ASM" {
 		t.Fatalf("net/debug.o flags = %#v, want -DDEBUG_ASM", variant.Flags)
 	}
-	if target := compositeMemberTarget(metadata, debug, "net/stack.o", "net/selected.o"); target == "" {
+	if target := objectTarget(metadata, debug, "net/selected.o"); target == "" {
 		t.Fatalf("debug config does not include ${CONFIG_NET} composite member")
 	} else if variant := variantByTarget(metadata, target); variant.ConfigFragment["CONFIG_NET"] != "y" {
 		t.Fatalf("net/selected.o CONFIG_NET footprint = %q, want y", variant.ConfigFragment["CONFIG_NET"])
 	}
 
 	off := configByName(metadata, "off")
-	if objectTarget(metadata, off, "net/stack.o") != "" || compositeMemberTarget(metadata, off, "net/stack.o", "net/base.o") != "" || compositeMemberTarget(metadata, off, "net/stack.o", "net/debug.o") != "" {
+	if objectTarget(metadata, off, "net/stack.o") != "" || objectTarget(metadata, off, "net/base.o") != "" || objectTarget(metadata, off, "net/debug.o") != "" {
 		t.Fatalf("disabled parent object leaked composite members into off config")
 	}
 }
@@ -1256,7 +1254,7 @@ net/stack-$(CONFIG_FEATURE) += net/debug.o
 	if variant := variantByTarget(metadata, moduleDebugTarget); variant.Mode != "m" {
 		t.Fatalf("module debug member mode = %q, want m", variant.Mode)
 	}
-	if compositeMemberTarget(metadata, configByName(metadata, "builtin"), "net/stack.o", "net/debug.o") != "" {
+	if objectTarget(metadata, configByName(metadata, "builtin"), "net/debug.o") != "" {
 		t.Fatalf("builtin parent unexpectedly includes m-only composite member")
 	}
 }

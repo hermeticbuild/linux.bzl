@@ -68,9 +68,6 @@ func emptyRootDTB(source string) ([]byte, error) {
 	write32(&structBlock, fdtEnd)
 
 	stringsBlock := []byte("#address-cells\x00#size-cells\x00")
-	for len(stringsBlock)%4 != 0 {
-		stringsBlock = append(stringsBlock, 0)
-	}
 
 	offMemRsvmap := uint32(fdtHeaderSize)
 	offStruct := uint32(fdtHeaderSize + fdtReserveSize)

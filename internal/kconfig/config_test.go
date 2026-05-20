@@ -81,17 +81,22 @@ config SELECTED
 
 config HIDDEN_DEFAULT
 	def_bool y
+
+config HIDDEN_PROMPT_DEFAULT
+	bool "Hidden prompt default" if GATE
+	default y
 `
 	resolved := mustResolveConfigWithOptions(t, fixture, nil, ResolveConfigOptions{
 		AllNoConfig: true,
 	})
 	wantConfigValues(t, resolved, map[string]string{
-		"CONFIG_DEFAULT_ON":     "n",
-		"CONFIG_DEP_DEFAULT":    "n",
-		"CONFIG_GATE":           "n",
-		"CONFIG_HIDDEN_DEFAULT": "y",
-		"CONFIG_SELECTED":       "n",
-		"CONFIG_SELECTOR":       "n",
+		"CONFIG_DEFAULT_ON":            "n",
+		"CONFIG_DEP_DEFAULT":           "n",
+		"CONFIG_GATE":                  "n",
+		"CONFIG_HIDDEN_DEFAULT":        "y",
+		"CONFIG_HIDDEN_PROMPT_DEFAULT": "y",
+		"CONFIG_SELECTED":              "n",
+		"CONFIG_SELECTOR":              "n",
 	})
 
 	explicit := mustResolveConfigWithOptions(t, fixture, map[string]string{
@@ -100,12 +105,13 @@ config HIDDEN_DEFAULT
 		AllNoConfig: true,
 	})
 	wantConfigValues(t, explicit, map[string]string{
-		"CONFIG_DEFAULT_ON":     "n",
-		"CONFIG_DEP_DEFAULT":    "n",
-		"CONFIG_GATE":           "n",
-		"CONFIG_HIDDEN_DEFAULT": "y",
-		"CONFIG_SELECTED":       "y",
-		"CONFIG_SELECTOR":       "y",
+		"CONFIG_DEFAULT_ON":            "n",
+		"CONFIG_DEP_DEFAULT":           "n",
+		"CONFIG_GATE":                  "n",
+		"CONFIG_HIDDEN_DEFAULT":        "y",
+		"CONFIG_HIDDEN_PROMPT_DEFAULT": "y",
+		"CONFIG_SELECTED":              "y",
+		"CONFIG_SELECTOR":              "y",
 	})
 }
 
@@ -463,18 +469,29 @@ config SELECTED_RANGE
 config HEX_VALUE
 	hex "Hex value"
 	range 0x10 0x20
+
+config LARGE_HEX_DEFAULT
+	hex
+	default 0xdead000000000000
+
+config LARGE_HEX_RANGE
+	hex "Large hex range"
+	range 0x8000000000000000 0xffffffffffffffff
 `
 	t.Run("raw values clamp to active ranges", func(t *testing.T) {
 		resolved := mustResolveConfig(t, fixture, map[string]string{
-			"CONFIG_CLAMPED_INT":    "100",
-			"CONFIG_HEX_VALUE":      "30",
-			"CONFIG_SELECTED_RANGE": "15",
+			"CONFIG_CLAMPED_INT":     "100",
+			"CONFIG_HEX_VALUE":       "30",
+			"CONFIG_LARGE_HEX_RANGE": "0x7000000000000000",
+			"CONFIG_SELECTED_RANGE":  "15",
 		})
 		wantConfigValues(t, resolved, map[string]string{
-			"CONFIG_CLAMPED_INT":    "8",
-			"CONFIG_DEFAULT_LOW":    "3",
-			"CONFIG_HEX_VALUE":      "0x20",
-			"CONFIG_SELECTED_RANGE": "20",
+			"CONFIG_CLAMPED_INT":       "8",
+			"CONFIG_DEFAULT_LOW":       "3",
+			"CONFIG_HEX_VALUE":         "0x20",
+			"CONFIG_LARGE_HEX_DEFAULT": "0xdead000000000000",
+			"CONFIG_LARGE_HEX_RANGE":   "0x8000000000000000",
+			"CONFIG_SELECTED_RANGE":    "20",
 		})
 	})
 

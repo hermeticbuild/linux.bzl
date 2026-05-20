@@ -274,7 +274,7 @@ func (r *configResolver) baseTri(sym *Symbol) triValue {
 			return minResolvedTri(r.rawTri[sym], visible)
 		}
 	}
-	if r.allNoConfig && r.promptedSymbol(sym) {
+	if r.allNoConfig && r.promptVisibility(sym) != triN {
 		return triN
 	}
 	return r.defaultTri(sym)
@@ -451,29 +451,63 @@ type scalarRangeBound struct {
 	text  string
 }
 
+type hexRangeBound struct {
+	value uint64
+	text  string
+}
+
 func (r *configResolver) clampScalarRange(sym *Symbol, value string) string {
-	if sym.Type != SymbolInt && sym.Type != SymbolHex {
+	switch sym.Type {
+	case SymbolInt:
+		return r.clampIntRange(sym, value)
+	case SymbolHex:
+		return r.clampHexRange(sym, value)
+	default:
 		return value
 	}
-	parsed, ok := parseScalarNumber(sym.Type, value)
+}
+
+func (r *configResolver) clampIntRange(sym *Symbol, value string) string {
+	parsed, ok := parseScalarNumber(SymbolInt, value)
 	if !ok {
-		value = defaultScalarValue(sym.Type)
-		parsed, ok = parseScalarNumber(sym.Type, value)
+		value = defaultScalarValue(SymbolInt)
+		parsed, ok = parseScalarNumber(SymbolInt, value)
 		if !ok {
 			return value
 		}
 	}
 	lo, hi, ok := r.visibleScalarRange(sym)
 	if !ok {
-		return normalizeScalarValue(sym.Type, value)
+		return normalizeScalarValue(SymbolInt, value)
 	}
 	if parsed < lo.value {
-		return normalizeScalarValue(sym.Type, lo.text)
+		return normalizeScalarValue(SymbolInt, lo.text)
 	}
 	if parsed > hi.value {
-		return normalizeScalarValue(sym.Type, hi.text)
+		return normalizeScalarValue(SymbolInt, hi.text)
 	}
-	return normalizeScalarValue(sym.Type, value)
+	return normalizeScalarValue(SymbolInt, value)
+}
+
+func (r *configResolver) clampHexRange(sym *Symbol, value string) string {
+	if !validConfigHex(value) {
+		value = defaultScalarValue(SymbolHex)
+	}
+	parsed, ok := parseConfigUintOK(value)
+	if !ok {
+		return defaultScalarValue(SymbolHex)
+	}
+	lo, hi, ok := r.visibleHexRange(sym)
+	if !ok {
+		return normalizeScalarValue(SymbolHex, value)
+	}
+	if parsed < lo.value {
+		return normalizeScalarValue(SymbolHex, lo.text)
+	}
+	if parsed > hi.value {
+		return normalizeScalarValue(SymbolHex, hi.text)
+	}
+	return normalizeScalarValue(SymbolHex, value)
 }
 
 func (r *configResolver) visibleScalarRange(sym *Symbol) (scalarRangeBound, scalarRangeBound, bool) {
@@ -523,6 +557,39 @@ func (r *configResolver) scalarRangeBound(targetType SymbolType, expr Expr) (sca
 		return scalarRangeBound{}, false
 	}
 	return scalarRangeBound{value: value, text: text}, true
+}
+
+func (r *configResolver) visibleHexRange(sym *Symbol) (hexRangeBound, hexRangeBound, bool) {
+	for _, prop := range sym.Properties {
+		if prop.Type != PropertyRange {
+			continue
+		}
+		if r.evalDepExprDefault(prop.Visible, triY) == triN {
+			continue
+		}
+		expr, ok := prop.Expr.(*CompareExpr)
+		if !ok || expr.Op != ".." {
+			continue
+		}
+		lo, loOK := r.hexRangeBound(expr.Left)
+		hi, hiOK := r.hexRangeBound(expr.Right)
+		if loOK && hiOK {
+			return lo, hi, true
+		}
+	}
+	return hexRangeBound{}, hexRangeBound{}, false
+}
+
+func (r *configResolver) hexRangeBound(expr Expr) (hexRangeBound, bool) {
+	text := r.exprValue(expr)
+	if !validConfigHex(text) {
+		return hexRangeBound{}, false
+	}
+	value, ok := parseConfigUintOK(text)
+	if !ok {
+		return hexRangeBound{}, false
+	}
+	return hexRangeBound{value: value, text: text}, true
 }
 
 func (r *configResolver) evalExprDefault(expr Expr, def triValue) triValue {
@@ -812,6 +879,16 @@ func parseConfigIntOK(value string) (int64, bool) {
 		return 0, false
 	}
 	parsed, err := strconv.ParseInt(value, 0, 64)
+	return parsed, err == nil
+}
+
+func parseConfigUintOK(value string) (uint64, bool) {
+	value = strings.Trim(value, `"`)
+	if value == "" {
+		return 0, false
+	}
+	value = strings.TrimPrefix(strings.TrimPrefix(value, "0x"), "0X")
+	parsed, err := strconv.ParseUint(value, 16, 64)
 	return parsed, err == nil
 }
 
