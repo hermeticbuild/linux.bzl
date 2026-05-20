@@ -88,6 +88,7 @@ def _define_arch_kernel(
     buildfiles_target = prefix + "_buildfiles"
     vmlinux_target = prefix + "_vmlinux"
     image_target = prefix + "_" + arch.final_suffix
+    unsupported_image_format_target = prefix + "_unsupported_image_format"
     arch_generated_dir = _join_path(generated_dir, arch.config_name)
     compact_package = _join_package(native.package_name(), _join_path(arch_generated_dir, "build"))
     compact_vars = dict(arch.compact_vars)
@@ -103,6 +104,16 @@ def _define_arch_kernel(
     generated_visibility = list(package_visibility)
     if compact_repo:
         generated_visibility.append("%s//:__pkg__" % _normalize_repo(compact_repo))
+
+    if not _image_format_supported(arch, image_format):
+        _unsupported_image_format(
+            name = unsupported_image_format_target,
+            allowed = _allowed_image_formats(arch),
+            arch = arch.config_name,
+            requested = image_format,
+            target_compatible_with = [arch.platform],
+        )
+        return ":" + unsupported_image_format_target
 
     linux_resolved_config(
         name = config_target,
@@ -173,6 +184,7 @@ def _define_arch_kernel(
         "source_tree": source_tree,
         "sorttable_tool": host_tools.sorttable_tool,
         "srcarch": arch.srcarch,
+        "target_compatible_with": [arch.platform],
         "visibility": package_visibility,
     }
     if hasattr(host_tools, "objtool"):
@@ -190,6 +202,7 @@ def _define_arch_kernel(
         "source_root": source_root,
         "source_tree": source_tree,
         "srcarch": arch.srcarch,
+        "target_compatible_with": [arch.platform],
         "visibility": package_visibility,
     }
     if hasattr(host_tools, "x86_relocs_tool"):
@@ -200,7 +213,7 @@ def _define_arch_kernel(
         arch = arch,
         image_format = image_format,
         image_target = image_target,
-        name = prefix + "_unsupported_image_format",
+        name = unsupported_image_format_target,
         target_compatible_with = [arch.platform],
         vmlinux_target = vmlinux_target,
     )
@@ -213,19 +226,25 @@ def _image_actual(name, arch, image_format, image_target, target_compatible_with
 
     _unsupported_image_format(
         name = name,
-        allowed = [
-            "auto",
-            "compressed",
-            "vmlinux",
-            arch.extension,
-            arch.final_suffix,
-            arch.compressed_format,
-        ],
+        allowed = _allowed_image_formats(arch),
         arch = arch.config_name,
         requested = image_format,
         target_compatible_with = target_compatible_with,
     )
     return ":" + name
+
+def _image_format_supported(arch, image_format):
+    return image_format in _allowed_image_formats(arch)
+
+def _allowed_image_formats(arch):
+    return [
+        "auto",
+        "compressed",
+        "vmlinux",
+        arch.extension,
+        arch.final_suffix,
+        arch.compressed_format,
+    ]
 
 def _unsupported_image_format_impl(ctx):
     fail("linux image_format %r is not supported for %s; allowed values: %s" % (

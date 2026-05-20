@@ -111,6 +111,11 @@ EOF""",
 #define R_AARCH64_PREL64 260
 #endif
 
+#ifndef EF_ARM_EABI_MASK
+#define EF_ARM_EABI_MASK 0xff000000
+#define EF_ARM_EABI_VERSION(flags) ((flags) & EF_ARM_EABI_MASK)
+#endif
+
 #endif
 EOF""",
     """cat >> lib/gelf.h <<'EOF'

@@ -3144,7 +3144,7 @@ def _linux_real_object_impl(ctx):
                     ctx.executable.relacheck.path,
                     compile_out.path,
                 ],
-                command = "cp \"$1\" \"$2\" && \"$3\" \"$2\" \"$4\"",
+                command = "cp \"$1\" \"$2\" && chmod u+w \"$2\" && \"$3\" \"$2\" \"$4\"",
                 mnemonic = "LinuxObjectRelacheck",
                 progress_message = "Checking Linux arm64 PI relocations %{label}",
             )
