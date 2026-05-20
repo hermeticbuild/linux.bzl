@@ -3,7 +3,7 @@
 Each archive must extract the requested host executables at its root.
 """
 
-KCONFIG_TOOL_VERSION = "v0.0.8"
+KCONFIG_TOOL_VERSION = "v0.0.9"
 
 _RELEASE_BASE_URL = "https://github.com/hermeticbuild/linux.bzl/releases/download/kconfig-{version}".format(
     version = KCONFIG_TOOL_VERSION,
@@ -11,27 +11,27 @@ _RELEASE_BASE_URL = "https://github.com/hermeticbuild/linux.bzl/releases/downloa
 
 KCONFIG_TOOL_RELEASES = {
     "darwin_amd64": struct(
-        integrity = "sha256-A6wTqg+Lyket2TFycSQFvCSGVGz3zL9Sixa1rpeWPb0=",
+        integrity = "sha256-RljQJDhEtpMJmbDkCI0veXnaeMP9IgPLWpFEpoLj9oc=",
         urls = ["{}/kconfig-darwin-amd64.tar.gz".format(_RELEASE_BASE_URL)],
     ),
     "darwin_arm64": struct(
-        integrity = "sha256-zH2qTlEzuPhsIpRqJNsVw/v8/YJIs7vWzZjMovWp6LY=",
+        integrity = "sha256-hgtApLWr2AWS9NSvYojRCpRJn1rbwNQy8w6FSAVeMUY=",
         urls = ["{}/kconfig-darwin-arm64.tar.gz".format(_RELEASE_BASE_URL)],
     ),
     "linux_amd64": struct(
-        integrity = "sha256-XQAlqx2gc81FSFKmXRtrBS3SNu5+drEEM60CHsAGYLI=",
+        integrity = "sha256-+tM23nyxqGQh0Z2tCCgky2NNmAQDJ0PqKx1V87NbeO4=",
         urls = ["{}/kconfig-linux-amd64.tar.gz".format(_RELEASE_BASE_URL)],
     ),
     "linux_arm64": struct(
-        integrity = "sha256-4jKDk4ARnCcUL/hKbwizNQEVFn9+1hAOgebDt6Mu8Tk=",
+        integrity = "sha256-sRn5WekSNN0nX+hP+bOfEEeWgNDfoXNjy9MU0KDSnhM=",
         urls = ["{}/kconfig-linux-arm64.tar.gz".format(_RELEASE_BASE_URL)],
     ),
     "windows_amd64": struct(
-        integrity = "sha256-Lr/ZSmGCbIIXKxtRNmQnR5EJoW9a/PdstWUM7UhsT2s=",
+        integrity = "sha256-LyUA6v/f+Hz+WtM6ecgwl06VmKRhW76qbuZu2gIYupw=",
         urls = ["{}/kconfig-windows-amd64.tar.gz".format(_RELEASE_BASE_URL)],
     ),
     "windows_arm64": struct(
-        integrity = "sha256-dLZf7BHDvNzp9XsRv5WMBqoR+n7oRP95aCxKJOe/S9A=",
+        integrity = "sha256-sBBLDaJkDIPKBQ/4r7/7Mf1Zme5UBDOeMnGGnDZ76fk=",
         urls = ["{}/kconfig-windows-arm64.tar.gz".format(_RELEASE_BASE_URL)],
     ),
 }
