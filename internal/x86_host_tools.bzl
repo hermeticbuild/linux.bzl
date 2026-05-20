@@ -330,7 +330,10 @@ def linux_x86_host_tools(
             source_label(source_repo, "arch/x86/tools/relocs_common.c"),
         ],
         visibility = visibility,
-        deps = [source_label(source_repo, "tools_headers_cc")],
+        deps = [
+            Label("@libelf//:elf_headers"),
+            source_label(source_repo, "tools_headers_cc"),
+        ],
     )
 
     return struct(

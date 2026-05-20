@@ -105,6 +105,12 @@ EOF""",
 #define R_X86_64_GOTPC32 26
 #endif
 
+#ifndef R_AARCH64_NONE
+#define R_AARCH64_NONE 0
+#define R_AARCH64_ABS64 257
+#define R_AARCH64_PREL64 260
+#endif
+
 #endif
 EOF""",
     """cat >> lib/gelf.h <<'EOF'
@@ -178,7 +184,7 @@ int gelf_update_symshndx(Elf_Data *symdata, Elf_Data *shndxdata, int ndx,
     return 1;
 }
 EOF""",
-    "mkdir -p include/libelf && cp lib/libelf.h lib/gelf.h lib/nlist.h lib/sys_elf.h include/ && cp lib/libelf.h lib/gelf.h lib/nlist.h lib/sys_elf.h lib/elf_repl.h include/libelf/",
+    "mkdir -p include/libelf && cp lib/libelf.h lib/gelf.h lib/nlist.h lib/sys_elf.h include/ && cp lib/sys_elf.h include/elf.h && cp lib/libelf.h lib/gelf.h lib/nlist.h lib/sys_elf.h lib/elf_repl.h include/libelf/",
 ]
 
 def _linux_bzl_libelf_impl(mctx):

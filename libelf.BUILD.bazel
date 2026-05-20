@@ -3,6 +3,14 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "elf_headers",
+    hdrs = glob([
+        "include/**/*.h",
+    ]),
+    includes = ["include"],
+)
+
+cc_library(
     name = "elf",
     srcs = [
         "lib/32.fsize.c",

@@ -52,6 +52,7 @@ def linux_common_host_tools(
         srcs = [source_label(source_repo, "scripts/sorttable.c")],
         visibility = visibility,
         deps = [
+            Label("@libelf//:elf_headers"),
             source_label(source_repo, "scripts_headers_cc"),
             source_label(source_repo, "tools_headers_cc"),
         ],

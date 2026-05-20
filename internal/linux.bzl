@@ -201,10 +201,11 @@ def _define_arch_kernel(
         image_format = image_format,
         image_target = image_target,
         name = prefix + "_unsupported_image_format",
+        target_compatible_with = [arch.platform],
         vmlinux_target = vmlinux_target,
     )
 
-def _image_actual(name, arch, image_format, image_target, vmlinux_target):
+def _image_actual(name, arch, image_format, image_target, target_compatible_with, vmlinux_target):
     if image_format in ["auto", "compressed", arch.extension, arch.final_suffix, arch.compressed_format]:
         return ":" + image_target
     if image_format == "vmlinux":
@@ -222,11 +223,12 @@ def _image_actual(name, arch, image_format, image_target, vmlinux_target):
         ],
         arch = arch.config_name,
         requested = image_format,
+        target_compatible_with = target_compatible_with,
     )
     return ":" + name
 
 def _unsupported_image_format_impl(ctx):
-    fail("linux image_format %q is not supported for %s; allowed values: %s" % (
+    fail("linux image_format %r is not supported for %s; allowed values: %s" % (
         ctx.attr.requested,
         ctx.attr.arch,
         ", ".join(ctx.attr.allowed),

@@ -39,12 +39,14 @@ def linux_arm64_host_tools(
     cc_binary(
         name = vdsomunge_tool,
         srcs = [source_label(source_repo, "arch/arm/vdso/vdsomunge.c")],
+        deps = [Label("@libelf//:elf_headers")],
         visibility = visibility,
     )
 
     cc_binary(
         name = relacheck_tool,
         srcs = [source_label(source_repo, "arch/arm64/kernel/pi/relacheck.c")],
+        deps = [Label("@libelf//:elf_headers")],
         visibility = visibility,
     )
 
