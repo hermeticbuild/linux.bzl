@@ -83,8 +83,16 @@ LinuxGeneratedHeadersInfo = provider(
 LinuxSourceTreeInfo = provider(
     doc = "Shared Linux source tree inputs consumed by generated object targets.",
     fields = {
+        "all_files": "Depset of all Linux source tree files; only explicit full-tree actions should consume this.",
+        "arch_headers": "Depset of architecture include headers under arch/*/include.",
+        "dtb_sources": "Depset of devicetree source and include files.",
         "files": "Depset of Linux source tree files.",
+        "global_headers": "Depset of global include headers under include.",
+        "headers": "Depset of all header-like files in the Linux source tree.",
+        "kbuild_files": "Depset of Kbuild and Makefile files.",
         "root": "Root marker file for the Linux source tree, usually Kconfig.",
+        "scripts_headers": "Depset of headers under scripts.",
+        "uapi_headers": "Depset of UAPI headers.",
     },
 )
 
@@ -98,10 +106,77 @@ LinuxImageInfo = provider(
     },
 )
 
+def _source_tree_relpath(file, root_dir):
+    path = file.short_path
+    if root_dir and (path == root_dir or path.startswith(root_dir + "/")):
+        return path[len(root_dir):].lstrip("/")
+    return path
+
+def _source_tree_root_dir(root):
+    if not root:
+        return ""
+    path = root.short_path
+    if "/" not in path:
+        return ""
+    return path.rsplit("/", 1)[0]
+
+def _is_kbuild_file(relpath):
+    return relpath == "Kbuild" or relpath == "Makefile" or relpath.endswith("/Kbuild") or relpath.endswith("/Makefile")
+
+def _is_header_file(relpath):
+    return relpath.endswith(".h")
+
+def _is_global_header(relpath):
+    return relpath.startswith("include/") and _is_header_file(relpath)
+
+def _is_arch_header(relpath):
+    return relpath.startswith("arch/") and "/include/" in relpath and _is_header_file(relpath)
+
+def _is_uapi_header(relpath):
+    return (relpath.startswith("include/uapi/") or (relpath.startswith("arch/") and "/include/uapi/" in relpath)) and _is_header_file(relpath)
+
+def _is_scripts_header(relpath):
+    return relpath.startswith("scripts/") and _is_header_file(relpath)
+
+def _is_dtb_source_input(relpath):
+    return relpath.endswith(".dts") or relpath.endswith(".dtsi") or relpath.startswith("include/dt-bindings/")
+
 def _linux_source_tree_impl(ctx):
+    root_dir = _source_tree_root_dir(ctx.file.root)
+    arch_headers = []
+    dtb_sources = []
+    global_headers = []
+    headers = []
+    kbuild_files = []
+    scripts_headers = []
+    uapi_headers = []
+    for file in ctx.files.srcs:
+        relpath = _source_tree_relpath(file, root_dir)
+        if _is_kbuild_file(relpath):
+            kbuild_files.append(file)
+        if _is_header_file(relpath):
+            headers.append(file)
+        if _is_global_header(relpath):
+            global_headers.append(file)
+        if _is_arch_header(relpath):
+            arch_headers.append(file)
+        if _is_uapi_header(relpath):
+            uapi_headers.append(file)
+        if _is_scripts_header(relpath):
+            scripts_headers.append(file)
+        if _is_dtb_source_input(relpath):
+            dtb_sources.append(file)
     return [LinuxSourceTreeInfo(
+        all_files = depset(ctx.files.srcs),
+        arch_headers = depset(arch_headers),
+        dtb_sources = depset(dtb_sources),
         files = depset(ctx.files.srcs),
+        global_headers = depset(global_headers),
+        headers = depset(headers),
+        kbuild_files = depset(kbuild_files),
         root = ctx.file.root,
+        scripts_headers = depset(scripts_headers),
+        uapi_headers = depset(uapi_headers),
     )]
 
 linux_source_tree = rule(
@@ -739,6 +814,61 @@ def _linux_source_tree_inputs(ctx, direct = []):
     if root:
         inputs.append(root)
     inputs.extend(_linux_source_tree_files(ctx))
+    return inputs
+
+def _linux_source_tree_class_inputs(ctx, classes, direct = []):
+    root = _linux_source_root_file(ctx)
+    inputs = list(direct)
+    if root:
+        inputs.append(root)
+    info = _linux_source_tree_info(ctx)
+    if info:
+        for class_name in classes:
+            inputs.extend(getattr(info, class_name).to_list())
+    elif hasattr(ctx.files, "source_tree"):
+        inputs.extend(ctx.files.source_tree)
+    return inputs
+
+def _linux_source_tree_relpath_from_ctx(ctx, file):
+    root = _linux_source_root_file(ctx)
+    return _source_tree_relpath(file, _source_tree_root_dir(root))
+
+def _is_local_include_file(relpath):
+    return relpath.endswith(".c") or relpath.endswith(".S") or relpath.endswith(".inc")
+
+def _source_tree_local_include_files(ctx, dirs):
+    info = _linux_source_tree_info(ctx)
+    if not info:
+        return []
+    normalized_dirs = {}
+    for dir in dirs:
+        dir = dir.strip("/")
+        if dir:
+            normalized_dirs[dir] = True
+    if not normalized_dirs:
+        return []
+    inputs = []
+    for file in info.files.to_list():
+        relpath = _linux_source_tree_relpath_from_ctx(ctx, file)
+        if _linux_object_directory(relpath) in normalized_dirs and _is_local_include_file(relpath):
+            inputs.append(file)
+    return inputs
+
+def _linux_object_compile_source_tree_inputs(ctx, src, direct = []):
+    object_dir = _linux_object_directory(ctx.attr.object)
+    source_dir = _linux_object_directory(_linux_source_tree_relpath_from_ctx(ctx, ctx.file.src))
+    inputs = _linux_source_tree_class_inputs(
+        ctx,
+        classes = [
+            "headers",
+        ],
+        direct = direct,
+    )
+    inputs.extend(_source_tree_local_include_files(ctx, [object_dir, source_dir]))
+    if _is_dtb_source(src):
+        info = _linux_source_tree_info(ctx)
+        if info:
+            inputs.extend(info.dtb_sources.to_list())
     return inputs
 
 def _rewrite_utsversion_tmp_flags(flags, object, utsversion_tmp):
@@ -3060,6 +3190,11 @@ def _linux_real_object_impl(ctx):
         )
         src = generated.src
         generated_sources.extend(generated.files)
+    source_relpath = _linux_source_tree_relpath_from_ctx(ctx, ctx.file.src)
+    if source_relpath.startswith("lib/fdt") and source_relpath.endswith(".c"):
+        generated_sources.append(_source_tree_file(ctx, "scripts/dtc/libfdt/" + source_relpath.rsplit("/", 1)[-1]))
+    if ctx.attr.object == "init/version.o":
+        generated_sources.append(_source_tree_file(ctx, "init/version-timestamp.c"))
     if ctx.attr.object == "arch/x86/kernel/cpu/capflags.o":
         generated = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/kernel/cpu/capflags.c")
         cap_args = ctx.actions.args()
@@ -3167,8 +3302,9 @@ def _linux_real_object_impl(ctx):
     for generated in ctx.attr.generated:
         generated_files.append(generated[LinuxGeneratedInfo].output)
 
-    direct_inputs = _linux_source_tree_inputs(
+    direct_inputs = _linux_object_compile_source_tree_inputs(
         ctx,
+        src,
         direct = [src] + generated_files + generated_object_headers + generated_sources + generated_inputs.files + config_flag_inputs.inputs,
     )
     if src != ctx.file.src:
