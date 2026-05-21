@@ -22,7 +22,9 @@ linux_config(
 
 linux_source_tree(
     name = "fixture_source_tree",
-    srcs = ["fixture.c"] + glob(["source/**"]),
+    all_files = ["fixture.c"] + glob(["source/**"]),
+    global_headers = glob(["source/include/**/*.h"]),
+    headers = glob(["source/**/*.h"]),
     root = "source/Kconfig",
 )
 

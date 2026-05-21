@@ -62,15 +62,59 @@ filegroup(
 
 filegroup(
     name = "headers",
+    srcs = glob(["**/*.h"]),
+)
+
+filegroup(
+    name = "global_headers",
+    srcs = glob(["include/**/*.h"]),
+)
+
+filegroup(
+    name = "arch_headers",
     srcs = glob([
-        "include/**/*.h",
         "arch/*/include/**/*.h",
     ]),
 )
 
+filegroup(
+    name = "uapi_headers",
+    srcs = glob([
+        "include/uapi/**/*.h",
+        "arch/*/include/uapi/**/*.h",
+    ], allow_empty = True),
+)
+
+filegroup(
+    name = "scripts_headers",
+    srcs = glob(["scripts/**/*.h"], allow_empty = True),
+)
+
+filegroup(
+    name = "kbuild_files",
+    srcs = glob([
+        "Kbuild",
+        "Makefile",
+        "**/Kbuild",
+        "**/Makefile",
+    ], allow_empty = True),
+)
+
+filegroup(
+    name = "dtb_sources",
+    srcs = glob([
+        "arch/*/boot/dts/**/*.dts",
+        "arch/*/boot/dts/**/*.dtsi",
+        "include/dt-bindings/**/*.h",
+    ], allow_empty = True),
+)
+
 cc_library(
     name = "linux_headers_cc",
-    hdrs = [":headers"],
+    hdrs = [
+        ":global_headers",
+        ":arch_headers",
+    ],
     includes = [
         "include",
         "arch/arm/include",

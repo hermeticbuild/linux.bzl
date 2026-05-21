@@ -874,7 +874,8 @@ func TestCompactObjectBuildFileEmitsSourceInputs(t *testing.T) {
 	objectBuild, err := metadata.ObjectBuildFile(CompactBuildFileOptions{
 		SourceLabelPackage: "@linux//",
 		SourceRootLabel:    "@linux//:Kconfig",
-		SourceTreeLabels:   []string{"@linux//:all"},
+		SourceTreeAllFiles: []string{"@linux//:all"},
+		SourceTreeHeaders:  []string{"@linux//:headers"},
 		GeneratedHeaders:   "//linux:generated_headers",
 	})
 	if err != nil {
@@ -883,7 +884,8 @@ func TestCompactObjectBuildFileEmitsSourceInputs(t *testing.T) {
 	for _, want := range []string{
 		`linux_source_tree(`,
 		`root = "@linux//:Kconfig"`,
-		`srcs = ["@linux//:all"]`,
+		`all_files = ["@linux//:all"]`,
+		`headers = ["@linux//:headers"]`,
 		`source_tree_info = ":_source_tree"`,
 		`generated_headers = "//linux:generated_headers"`,
 	} {

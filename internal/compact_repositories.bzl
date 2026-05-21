@@ -57,8 +57,22 @@ def _run_compact_generator(rctx):
         args.extend(["-source_label_package", rctx.attr.source_label_package])
     if rctx.attr.source_root_label:
         args.extend(["-source_root_label", rctx.attr.source_root_label])
-    for label in rctx.attr.source_tree_labels:
-        args.extend(["-source_tree_label", label])
+    for label in rctx.attr.source_tree_all_files_labels:
+        args.extend(["-source_tree_all_files_label", label])
+    for label in rctx.attr.source_tree_arch_headers_labels:
+        args.extend(["-source_tree_arch_headers_label", label])
+    for label in rctx.attr.source_tree_dtb_sources_labels:
+        args.extend(["-source_tree_dtb_sources_label", label])
+    for label in rctx.attr.source_tree_global_headers_labels:
+        args.extend(["-source_tree_global_headers_label", label])
+    for label in rctx.attr.source_tree_headers_labels:
+        args.extend(["-source_tree_headers_label", label])
+    for label in rctx.attr.source_tree_kbuild_files_labels:
+        args.extend(["-source_tree_kbuild_files_label", label])
+    for label in rctx.attr.source_tree_scripts_headers_labels:
+        args.extend(["-source_tree_scripts_headers_label", label])
+    for label in rctx.attr.source_tree_uapi_headers_labels:
+        args.extend(["-source_tree_uapi_headers_label", label])
     for label, prefix in rctx.attr.extra_kconfigs.items():
         path = rctx.path(label)
         args.extend(["-source_root_map", "%s=%s" % (prefix, path.dirname)])
@@ -231,8 +245,29 @@ linux_compact_repository = repository_rule(
         "source_root_label": attr.string(
             doc = "Label emitted for a file in the Linux source root.",
         ),
-        "source_tree_labels": attr.string_list(
-            doc = "Labels emitted for source tree inputs.",
+        "source_tree_all_files_labels": attr.string_list(
+            doc = "Labels emitted for explicit full source tree inputs.",
+        ),
+        "source_tree_arch_headers_labels": attr.string_list(
+            doc = "Labels emitted for architecture headers.",
+        ),
+        "source_tree_dtb_sources_labels": attr.string_list(
+            doc = "Labels emitted for devicetree source inputs.",
+        ),
+        "source_tree_global_headers_labels": attr.string_list(
+            doc = "Labels emitted for global headers.",
+        ),
+        "source_tree_headers_labels": attr.string_list(
+            doc = "Labels emitted for source tree headers.",
+        ),
+        "source_tree_kbuild_files_labels": attr.string_list(
+            doc = "Labels emitted for Kbuild and Makefile inputs.",
+        ),
+        "source_tree_scripts_headers_labels": attr.string_list(
+            doc = "Labels emitted for scripts headers.",
+        ),
+        "source_tree_uapi_headers_labels": attr.string_list(
+            doc = "Labels emitted for UAPI headers.",
         ),
         "vars": attr.string_dict(
             doc = "Kconfig/Kbuild make variables.",

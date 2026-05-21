@@ -89,8 +89,22 @@ def _linux_compact_outputs_impl(ctx):
         args.add("-source_config", ctx.attr.source_config)
     if ctx.attr.source_root_label:
         args.add("-source_root_label", ctx.attr.source_root_label)
-    for label in ctx.attr.source_tree_labels:
-        args.add("-source_tree_label", label)
+    for label in ctx.attr.source_tree_all_files_labels:
+        args.add("-source_tree_all_files_label", label)
+    for label in ctx.attr.source_tree_arch_headers_labels:
+        args.add("-source_tree_arch_headers_label", label)
+    for label in ctx.attr.source_tree_dtb_sources_labels:
+        args.add("-source_tree_dtb_sources_label", label)
+    for label in ctx.attr.source_tree_global_headers_labels:
+        args.add("-source_tree_global_headers_label", label)
+    for label in ctx.attr.source_tree_headers_labels:
+        args.add("-source_tree_headers_label", label)
+    for label in ctx.attr.source_tree_kbuild_files_labels:
+        args.add("-source_tree_kbuild_files_label", label)
+    for label in ctx.attr.source_tree_scripts_headers_labels:
+        args.add("-source_tree_scripts_headers_label", label)
+    for label in ctx.attr.source_tree_uapi_headers_labels:
+        args.add("-source_tree_uapi_headers_label", label)
     args.add("-linux_objects_load", ctx.attr.linux_objects_load)
     env = dict(ctx.attr.env)
     vars = dict(ctx.attr.vars)
@@ -245,8 +259,29 @@ _linux_compact_outputs = rule(
         "source_root_label": attr.string(
             doc = "Label for a file in the Linux source root emitted into source-backed compact object rules.",
         ),
-        "source_tree_labels": attr.string_list(
-            doc = "Labels for source tree inputs emitted into source-backed compact object rules.",
+        "source_tree_all_files_labels": attr.string_list(
+            doc = "Labels for explicit full source tree inputs emitted into source-backed compact object rules.",
+        ),
+        "source_tree_arch_headers_labels": attr.string_list(
+            doc = "Labels for architecture headers emitted into source-backed compact object rules.",
+        ),
+        "source_tree_dtb_sources_labels": attr.string_list(
+            doc = "Labels for devicetree source inputs emitted into source-backed compact object rules.",
+        ),
+        "source_tree_global_headers_labels": attr.string_list(
+            doc = "Labels for global headers emitted into source-backed compact object rules.",
+        ),
+        "source_tree_headers_labels": attr.string_list(
+            doc = "Labels for source tree headers emitted into source-backed compact object rules.",
+        ),
+        "source_tree_kbuild_files_labels": attr.string_list(
+            doc = "Labels for Kbuild and Makefile inputs emitted into source-backed compact object rules.",
+        ),
+        "source_tree_scripts_headers_labels": attr.string_list(
+            doc = "Labels for scripts headers emitted into source-backed compact object rules.",
+        ),
+        "source_tree_uapi_headers_labels": attr.string_list(
+            doc = "Labels for UAPI headers emitted into source-backed compact object rules.",
         ),
         "vars": attr.string_dict(
             doc = "Kconfig preprocessor variables.",
@@ -542,7 +577,14 @@ def linux_compact_buildfiles(
         source_relacheck = "",
         source_config = "",
         source_root_label = "",
-        source_tree_labels = [],
+        source_tree_all_files_labels = [],
+        source_tree_arch_headers_labels = [],
+        source_tree_dtb_sources_labels = [],
+        source_tree_global_headers_labels = [],
+        source_tree_headers_labels = [],
+        source_tree_kbuild_files_labels = [],
+        source_tree_scripts_headers_labels = [],
+        source_tree_uapi_headers_labels = [],
         linux_objects_load = "@linux.bzl//internal:linux_objects.bzl",
         generated_headers = "",
         kbuild_tree = False,
@@ -591,7 +633,14 @@ def linux_compact_buildfiles(
         source_relacheck = source_relacheck,
         source_config = source_config,
         source_root_label = source_root_label,
-        source_tree_labels = source_tree_labels,
+        source_tree_all_files_labels = source_tree_all_files_labels,
+        source_tree_arch_headers_labels = source_tree_arch_headers_labels,
+        source_tree_dtb_sources_labels = source_tree_dtb_sources_labels,
+        source_tree_global_headers_labels = source_tree_global_headers_labels,
+        source_tree_headers_labels = source_tree_headers_labels,
+        source_tree_kbuild_files_labels = source_tree_kbuild_files_labels,
+        source_tree_scripts_headers_labels = source_tree_scripts_headers_labels,
+        source_tree_uapi_headers_labels = source_tree_uapi_headers_labels,
         srcs = srcs,
         target_compatible_with = target_compatible_with,
         vars = vars,

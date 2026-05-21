@@ -292,7 +292,7 @@ def _linux_kernel_impl(mctx):
         extra_kconfigs = {}
         extra_kbuilds = {}
         extra_source_label_packages = {}
-        extra_source_tree_labels = []
+        extra_source_all_files_labels = []
         for extra_name in compact.extra_sources:
             if extra_name not in extras:
                 fail("compact repo %q references unknown Linux extra source %q" % (compact.name, extra_name))
@@ -308,7 +308,7 @@ def _linux_kernel_impl(mctx):
             if label_package:
                 extra_source_label_packages[prefix_dir] = label_package
             for src in extra.srcs:
-                extra_source_tree_labels.append(_label_string(src))
+                extra_source_all_files_labels.append(_label_string(src))
         linux_compact_repository(
             name = compact.name,
             config = compact.config,
@@ -330,7 +330,14 @@ def _linux_kernel_impl(mctx):
             source_config = _package_label(label_repo, compact.kernel_package, prefix + "_config"),
             source_label_package = source_repo + "//",
             source_root_label = source_repo + "//:Kconfig",
-            source_tree_labels = [source_repo + "//:all_files"] + extra_source_tree_labels,
+            source_tree_all_files_labels = [source_repo + "//:all_files"] + extra_source_all_files_labels,
+            source_tree_arch_headers_labels = [source_repo + "//:arch_headers"],
+            source_tree_dtb_sources_labels = [source_repo + "//:dtb_sources"],
+            source_tree_global_headers_labels = [source_repo + "//:global_headers"],
+            source_tree_headers_labels = [source_repo + "//:headers"],
+            source_tree_kbuild_files_labels = [source_repo + "//:kbuild_files"],
+            source_tree_scripts_headers_labels = [source_repo + "//:scripts_headers"],
+            source_tree_uapi_headers_labels = [source_repo + "//:uapi_headers"],
             vars = compact_vars,
         )
     return mctx.extension_metadata(reproducible = True)
