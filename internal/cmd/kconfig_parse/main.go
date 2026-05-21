@@ -115,52 +115,59 @@ func syntheticKconfigRoot(root string, extras []namedPath) (string, func(), erro
 
 func main() {
 	var (
-		root                = flag.String("root", "", "Root Kconfig file to parse")
-		srctree             = flag.String("srctree", "", "Source tree used to resolve source statements")
-		allowShell          = flag.Bool("allow_shell", false, "Allow $(shell,...) expansion")
-		linuxProbeModel     = flag.String("linux_probe_model", "", "Hermetic Linux Kconfig probe model to use for $(shell,...) expansion. Supported: linux_llvm")
-		out                 = flag.String("out", "", "Path to write the parsed Kconfig as JSON. Defaults to stdout when no other output is set")
-		kbuildPath          = flag.String("kbuild", "", "Kbuild/Makefile path for compact object metadata generation")
-		kbuildRecursive     = flag.Bool("kbuild_recursive", false, "Follow static Kbuild include directives when writing -kbuild_out")
-		kbuildSrctree       = flag.String("kbuild_srctree", "", "Source tree used to resolve recursive Kbuild includes. Defaults to -srctree")
-		kbuildOut           = flag.String("kbuild_out", "", "Path to write the parsed Kbuild/Makefile as JSON")
-		kbuildTreeRoot      = flag.String("kbuild_tree_root", "", "Linux source tree root to recursively validate Kbuild/Makefile/*.mk files")
-		kbuildTreeOut       = flag.String("kbuild_tree_out", "", "Path to write recursive Kbuild tree validation summary JSON")
-		kbuildTreeMinCount  = flag.Int("kbuild_tree_min_count", 0, "Minimum number of Kbuild-like files that must be parsed during -kbuild_tree_root validation")
-		compactMetadataOut  = flag.String("compact_metadata_out", "", "Path to write compact fragment-keyed Linux metadata JSON")
-		compactBuildfileOut = flag.String("compact_buildfile_out", "", "Path to write a combined compact object/image BUILD file")
-		compactKbuildTree   = flag.Bool("compact_kbuild_tree", false, "Follow active Kbuild directory descent when generating compact metadata")
-		objectBuildfileOut  = flag.String("object_buildfile_out", "", "Path to write compact shared object-variant BUILD file")
-		imageBuildfileOut   = flag.String("image_buildfile_out", "", "Path to write compact per-config image BUILD file")
-		resolveConfig       = flag.String("resolve_config", "", "Named .config input in NAME=PATH form to resolve through Kconfig defaults and dependencies")
-		configMode          = flag.String("config_mode", "default", "Config resolver mode. Supported: default, allnoconfig")
-		resolvedConfigOut   = flag.String("resolved_config_out", "", "Path to write the resolved .config")
-		resolvedAutoConfOut = flag.String("resolved_auto_conf_out", "", "Path to write the resolved include/config/auto.conf")
-		resolvedCmdOut      = flag.String("resolved_auto_conf_cmd_out", "", "Path to write the resolved include/config/auto.conf.cmd")
-		resolvedAutoconfOut = flag.String("resolved_autoconf_out", "", "Path to write the resolved include/generated/autoconf.h")
-		resolvedRustcCfgOut = flag.String("resolved_rustc_cfg_out", "", "Path to write the resolved include/generated/rustc_cfg")
-		resolvedReleaseOut  = flag.String("resolved_kernel_release_out", "", "Path to write the resolved include/config/kernel.release")
-		kernelVersion       = flag.String("kernel_version", "6.18.2", "Base kernel release used when writing resolved config outputs")
-		generatedHeaders    = flag.String("generated_headers", "", "Bazel label for generated Linux headers emitted into source-backed compact object rules")
-		objectLabelPackage  = flag.String("object_label_package", "", "Bazel package containing the compact object BUILD file. Defaults to -object_buildfile_out package")
-		sourceLabelPackage  = flag.String("source_label_package", "", "Bazel package containing Linux source file labels for generated compact object BUILD files")
-		sourceASN1Compiler  = flag.String("source_asn1_compiler", "", "Bazel label for the kernel source tree's scripts/asn1_compiler tool emitted into source-backed compact object rules")
-		sourceRelacheck     = flag.String("source_relacheck", "", "Bazel label for the kernel source tree's arch/arm64/kernel/pi/relacheck tool emitted into arm64 .pi.o rules")
-		sourceConfig        = flag.String("source_config", "", "Bazel label for a full LinuxConfigInfo target emitted into source-backed compact object rules")
-		sourceRootLabel     = flag.String("source_root_label", "", "Bazel label for a file in the Linux source root, emitted into source-backed compact object rules")
-		linuxObjectsLoad    = flag.String("linux_objects_load", "", "Load label for the compact Linux object/image rules")
-		vars                = stringMapFlag{}
-		env                 = stringMapFlag{}
-		linuxProbeValues    = stringMapFlag{}
-		visibility          = stringSliceFlag{}
-		kbuildTreeExcludes  = stringSliceFlag{}
-		compactConfigInputs = namedPathFlag{}
-		compactExports      = stringSliceFlag{}
-		sourceRootMaps      = namedPathFlag{}
-		kconfigExtras       = namedPathFlag{}
-		kbuildExtras        = namedPathFlag{}
-		sourceLabelMaps     = namedPathFlag{}
-		sourceTreeLabels    = stringSliceFlag{}
+		root                     = flag.String("root", "", "Root Kconfig file to parse")
+		srctree                  = flag.String("srctree", "", "Source tree used to resolve source statements")
+		allowShell               = flag.Bool("allow_shell", false, "Allow $(shell,...) expansion")
+		linuxProbeModel          = flag.String("linux_probe_model", "", "Hermetic Linux Kconfig probe model to use for $(shell,...) expansion. Supported: linux_llvm")
+		out                      = flag.String("out", "", "Path to write the parsed Kconfig as JSON. Defaults to stdout when no other output is set")
+		kbuildPath               = flag.String("kbuild", "", "Kbuild/Makefile path for compact object metadata generation")
+		kbuildRecursive          = flag.Bool("kbuild_recursive", false, "Follow static Kbuild include directives when writing -kbuild_out")
+		kbuildSrctree            = flag.String("kbuild_srctree", "", "Source tree used to resolve recursive Kbuild includes. Defaults to -srctree")
+		kbuildOut                = flag.String("kbuild_out", "", "Path to write the parsed Kbuild/Makefile as JSON")
+		kbuildTreeRoot           = flag.String("kbuild_tree_root", "", "Linux source tree root to recursively validate Kbuild/Makefile/*.mk files")
+		kbuildTreeOut            = flag.String("kbuild_tree_out", "", "Path to write recursive Kbuild tree validation summary JSON")
+		kbuildTreeMinCount       = flag.Int("kbuild_tree_min_count", 0, "Minimum number of Kbuild-like files that must be parsed during -kbuild_tree_root validation")
+		compactMetadataOut       = flag.String("compact_metadata_out", "", "Path to write compact fragment-keyed Linux metadata JSON")
+		compactBuildfileOut      = flag.String("compact_buildfile_out", "", "Path to write a combined compact object/image BUILD file")
+		compactKbuildTree        = flag.Bool("compact_kbuild_tree", false, "Follow active Kbuild directory descent when generating compact metadata")
+		objectBuildfileOut       = flag.String("object_buildfile_out", "", "Path to write compact shared object-variant BUILD file")
+		imageBuildfileOut        = flag.String("image_buildfile_out", "", "Path to write compact per-config image BUILD file")
+		resolveConfig            = flag.String("resolve_config", "", "Named .config input in NAME=PATH form to resolve through Kconfig defaults and dependencies")
+		configMode               = flag.String("config_mode", "default", "Config resolver mode. Supported: default, allnoconfig")
+		resolvedConfigOut        = flag.String("resolved_config_out", "", "Path to write the resolved .config")
+		resolvedAutoConfOut      = flag.String("resolved_auto_conf_out", "", "Path to write the resolved include/config/auto.conf")
+		resolvedCmdOut           = flag.String("resolved_auto_conf_cmd_out", "", "Path to write the resolved include/config/auto.conf.cmd")
+		resolvedAutoconfOut      = flag.String("resolved_autoconf_out", "", "Path to write the resolved include/generated/autoconf.h")
+		resolvedRustcCfgOut      = flag.String("resolved_rustc_cfg_out", "", "Path to write the resolved include/generated/rustc_cfg")
+		resolvedReleaseOut       = flag.String("resolved_kernel_release_out", "", "Path to write the resolved include/config/kernel.release")
+		kernelVersion            = flag.String("kernel_version", "6.18.2", "Base kernel release used when writing resolved config outputs")
+		generatedHeaders         = flag.String("generated_headers", "", "Bazel label for generated Linux headers emitted into source-backed compact object rules")
+		objectLabelPackage       = flag.String("object_label_package", "", "Bazel package containing the compact object BUILD file. Defaults to -object_buildfile_out package")
+		sourceLabelPackage       = flag.String("source_label_package", "", "Bazel package containing Linux source file labels for generated compact object BUILD files")
+		sourceASN1Compiler       = flag.String("source_asn1_compiler", "", "Bazel label for the kernel source tree's scripts/asn1_compiler tool emitted into source-backed compact object rules")
+		sourceRelacheck          = flag.String("source_relacheck", "", "Bazel label for the kernel source tree's arch/arm64/kernel/pi/relacheck tool emitted into arm64 .pi.o rules")
+		sourceConfig             = flag.String("source_config", "", "Bazel label for a full LinuxConfigInfo target emitted into source-backed compact object rules")
+		sourceRootLabel          = flag.String("source_root_label", "", "Bazel label for a file in the Linux source root, emitted into source-backed compact object rules")
+		linuxObjectsLoad         = flag.String("linux_objects_load", "", "Load label for the compact Linux object/image rules")
+		vars                     = stringMapFlag{}
+		env                      = stringMapFlag{}
+		linuxProbeValues         = stringMapFlag{}
+		visibility               = stringSliceFlag{}
+		kbuildTreeExcludes       = stringSliceFlag{}
+		compactConfigInputs      = namedPathFlag{}
+		compactExports           = stringSliceFlag{}
+		sourceRootMaps           = namedPathFlag{}
+		kconfigExtras            = namedPathFlag{}
+		kbuildExtras             = namedPathFlag{}
+		sourceLabelMaps          = namedPathFlag{}
+		sourceTreeAllFiles       = stringSliceFlag{}
+		sourceTreeArchHeaders    = stringSliceFlag{}
+		sourceTreeDtbSources     = stringSliceFlag{}
+		sourceTreeGlobalHeaders  = stringSliceFlag{}
+		sourceTreeHeaders        = stringSliceFlag{}
+		sourceTreeKbuildFiles    = stringSliceFlag{}
+		sourceTreeScriptsHeaders = stringSliceFlag{}
+		sourceTreeUapiHeaders    = stringSliceFlag{}
 	)
 	flag.Var(vars, "var", "Preprocessor variable in KEY=VALUE form. May be repeated")
 	flag.Var(env, "env", "Hermetic environment variable in KEY=VALUE form. May be repeated")
@@ -173,7 +180,14 @@ func main() {
 	flag.Var(&kconfigExtras, "kconfig_extra", "Extra Kconfig source in PREFIX=PATH form. May be repeated")
 	flag.Var(&kbuildExtras, "kbuild_extra", "Extra Kbuild/Makefile source in PREFIX=PATH form. May be repeated")
 	flag.Var(&sourceLabelMaps, "source_label_map", "Virtual source prefix to Bazel label package in PREFIX=LABEL_PACKAGE form. May be repeated")
-	flag.Var(&sourceTreeLabels, "source_tree_label", "Bazel label for source tree files emitted into source-backed compact object rules. May be repeated")
+	flag.Var(&sourceTreeAllFiles, "source_tree_all_files_label", "Bazel label for explicit full source tree files emitted into source-backed compact object rules. May be repeated")
+	flag.Var(&sourceTreeArchHeaders, "source_tree_arch_headers_label", "Bazel label for architecture source headers emitted into source-backed compact object rules. May be repeated")
+	flag.Var(&sourceTreeDtbSources, "source_tree_dtb_sources_label", "Bazel label for devicetree source inputs emitted into source-backed compact object rules. May be repeated")
+	flag.Var(&sourceTreeGlobalHeaders, "source_tree_global_headers_label", "Bazel label for global source headers emitted into source-backed compact object rules. May be repeated")
+	flag.Var(&sourceTreeHeaders, "source_tree_headers_label", "Bazel label for source headers emitted into source-backed compact object rules. May be repeated")
+	flag.Var(&sourceTreeKbuildFiles, "source_tree_kbuild_files_label", "Bazel label for Kbuild/Makefile source inputs emitted into source-backed compact object rules. May be repeated")
+	flag.Var(&sourceTreeScriptsHeaders, "source_tree_scripts_headers_label", "Bazel label for scripts headers emitted into source-backed compact object rules. May be repeated")
+	flag.Var(&sourceTreeUapiHeaders, "source_tree_uapi_headers_label", "Bazel label for UAPI headers emitted into source-backed compact object rules. May be repeated")
 	flag.Parse()
 
 	if *root == "" && *kbuildOut == "" && *kbuildTreeOut == "" {
@@ -313,18 +327,25 @@ func main() {
 		}
 		if *objectBuildfileOut != "" {
 			data, err := metadata.ObjectBuildFile(kconfig.CompactBuildFileOptions{
-				Arch:                vars["ARCH"],
-				Visibility:          []string(visibility),
-				RuleLoadLabel:       *linuxObjectsLoad,
-				SourceLabelPackage:  *sourceLabelPackage,
-				SourceLabelPackages: namedValueMap(sourceLabelMaps),
-				SourceASN1Compiler:  *sourceASN1Compiler,
-				SourceRelacheck:     *sourceRelacheck,
-				SourceConfig:        *sourceConfig,
-				SourceRootLabel:     *sourceRootLabel,
-				SourceTreeLabels:    []string(sourceTreeLabels),
-				GeneratedHeaders:    *generatedHeaders,
-				Srcarch:             vars["SRCARCH"],
+				Arch:                     vars["ARCH"],
+				Visibility:               []string(visibility),
+				RuleLoadLabel:            *linuxObjectsLoad,
+				SourceLabelPackage:       *sourceLabelPackage,
+				SourceLabelPackages:      namedValueMap(sourceLabelMaps),
+				SourceASN1Compiler:       *sourceASN1Compiler,
+				SourceRelacheck:          *sourceRelacheck,
+				SourceConfig:             *sourceConfig,
+				SourceRootLabel:          *sourceRootLabel,
+				SourceTreeAllFiles:       []string(sourceTreeAllFiles),
+				SourceTreeArchHeaders:    []string(sourceTreeArchHeaders),
+				SourceTreeDtbSources:     []string(sourceTreeDtbSources),
+				SourceTreeGlobalHeaders:  []string(sourceTreeGlobalHeaders),
+				SourceTreeHeaders:        []string(sourceTreeHeaders),
+				SourceTreeKbuildFiles:    []string(sourceTreeKbuildFiles),
+				SourceTreeScriptsHeaders: []string(sourceTreeScriptsHeaders),
+				SourceTreeUapiHeaders:    []string(sourceTreeUapiHeaders),
+				GeneratedHeaders:         *generatedHeaders,
+				Srcarch:                  vars["SRCARCH"],
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to generate compact object BUILD file: %v\n", err)
@@ -358,18 +379,25 @@ func main() {
 		}
 		if *compactBuildfileOut != "" {
 			objectBuild, err := metadata.ObjectBuildFile(kconfig.CompactBuildFileOptions{
-				Arch:                vars["ARCH"],
-				Visibility:          []string(visibility),
-				RuleLoadLabel:       *linuxObjectsLoad,
-				SourceLabelPackage:  *sourceLabelPackage,
-				SourceLabelPackages: namedValueMap(sourceLabelMaps),
-				SourceASN1Compiler:  *sourceASN1Compiler,
-				SourceRelacheck:     *sourceRelacheck,
-				SourceConfig:        *sourceConfig,
-				SourceRootLabel:     *sourceRootLabel,
-				SourceTreeLabels:    []string(sourceTreeLabels),
-				GeneratedHeaders:    *generatedHeaders,
-				Srcarch:             vars["SRCARCH"],
+				Arch:                     vars["ARCH"],
+				Visibility:               []string(visibility),
+				RuleLoadLabel:            *linuxObjectsLoad,
+				SourceLabelPackage:       *sourceLabelPackage,
+				SourceLabelPackages:      namedValueMap(sourceLabelMaps),
+				SourceASN1Compiler:       *sourceASN1Compiler,
+				SourceRelacheck:          *sourceRelacheck,
+				SourceConfig:             *sourceConfig,
+				SourceRootLabel:          *sourceRootLabel,
+				SourceTreeAllFiles:       []string(sourceTreeAllFiles),
+				SourceTreeArchHeaders:    []string(sourceTreeArchHeaders),
+				SourceTreeDtbSources:     []string(sourceTreeDtbSources),
+				SourceTreeGlobalHeaders:  []string(sourceTreeGlobalHeaders),
+				SourceTreeHeaders:        []string(sourceTreeHeaders),
+				SourceTreeKbuildFiles:    []string(sourceTreeKbuildFiles),
+				SourceTreeScriptsHeaders: []string(sourceTreeScriptsHeaders),
+				SourceTreeUapiHeaders:    []string(sourceTreeUapiHeaders),
+				GeneratedHeaders:         *generatedHeaders,
+				Srcarch:                  vars["SRCARCH"],
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to generate compact object BUILD file: %v\n", err)

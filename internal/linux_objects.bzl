@@ -120,63 +120,18 @@ def _source_tree_root_dir(root):
         return ""
     return path.rsplit("/", 1)[0]
 
-def _is_kbuild_file(relpath):
-    return relpath == "Kbuild" or relpath == "Makefile" or relpath.endswith("/Kbuild") or relpath.endswith("/Makefile")
-
-def _is_header_file(relpath):
-    return relpath.endswith(".h")
-
-def _is_global_header(relpath):
-    return relpath.startswith("include/") and _is_header_file(relpath)
-
-def _is_arch_header(relpath):
-    return relpath.startswith("arch/") and "/include/" in relpath and _is_header_file(relpath)
-
-def _is_uapi_header(relpath):
-    return (relpath.startswith("include/uapi/") or (relpath.startswith("arch/") and "/include/uapi/" in relpath)) and _is_header_file(relpath)
-
-def _is_scripts_header(relpath):
-    return relpath.startswith("scripts/") and _is_header_file(relpath)
-
-def _is_dtb_source_input(relpath):
-    return relpath.endswith(".dts") or relpath.endswith(".dtsi") or relpath.startswith("include/dt-bindings/")
-
 def _linux_source_tree_impl(ctx):
-    root_dir = _source_tree_root_dir(ctx.file.root)
-    arch_headers = []
-    dtb_sources = []
-    global_headers = []
-    headers = []
-    kbuild_files = []
-    scripts_headers = []
-    uapi_headers = []
-    for file in ctx.files.srcs:
-        relpath = _source_tree_relpath(file, root_dir)
-        if _is_kbuild_file(relpath):
-            kbuild_files.append(file)
-        if _is_header_file(relpath):
-            headers.append(file)
-        if _is_global_header(relpath):
-            global_headers.append(file)
-        if _is_arch_header(relpath):
-            arch_headers.append(file)
-        if _is_uapi_header(relpath):
-            uapi_headers.append(file)
-        if _is_scripts_header(relpath):
-            scripts_headers.append(file)
-        if _is_dtb_source_input(relpath):
-            dtb_sources.append(file)
     return [LinuxSourceTreeInfo(
-        all_files = depset(ctx.files.srcs),
-        arch_headers = depset(arch_headers),
-        dtb_sources = depset(dtb_sources),
-        files = depset(ctx.files.srcs),
-        global_headers = depset(global_headers),
-        headers = depset(headers),
-        kbuild_files = depset(kbuild_files),
+        all_files = depset(ctx.files.all_files),
+        arch_headers = depset(ctx.files.arch_headers),
+        dtb_sources = depset(ctx.files.dtb_sources),
+        files = depset(ctx.files.all_files),
+        global_headers = depset(ctx.files.global_headers),
+        headers = depset(ctx.files.headers),
+        kbuild_files = depset(ctx.files.kbuild_files),
         root = ctx.file.root,
-        scripts_headers = depset(scripts_headers),
-        uapi_headers = depset(uapi_headers),
+        scripts_headers = depset(ctx.files.scripts_headers),
+        uapi_headers = depset(ctx.files.uapi_headers),
     )]
 
 linux_source_tree = rule(
@@ -186,9 +141,37 @@ linux_source_tree = rule(
             allow_single_file = True,
             doc = "Root marker file for the Linux source tree, usually Kconfig.",
         ),
-        "srcs": attr.label_list(
+        "all_files": attr.label_list(
             allow_files = True,
-            doc = "Files in the Linux source tree.",
+            doc = "Explicit full Linux source tree files. Normal object compiles should not request this class.",
+        ),
+        "arch_headers": attr.label_list(
+            allow_files = True,
+            doc = "Architecture include headers under arch/*/include.",
+        ),
+        "dtb_sources": attr.label_list(
+            allow_files = True,
+            doc = "Devicetree source and include files.",
+        ),
+        "global_headers": attr.label_list(
+            allow_files = True,
+            doc = "Global include headers under include.",
+        ),
+        "headers": attr.label_list(
+            allow_files = True,
+            doc = "All source tree header-like files.",
+        ),
+        "kbuild_files": attr.label_list(
+            allow_files = True,
+            doc = "Kbuild and Makefile files.",
+        ),
+        "scripts_headers": attr.label_list(
+            allow_files = True,
+            doc = "Headers under scripts.",
+        ),
+        "uapi_headers": attr.label_list(
+            allow_files = True,
+            doc = "UAPI headers.",
         ),
     },
     doc = "Provider wrapper for source tree inputs shared by generated Linux object targets.",
