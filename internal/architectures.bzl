@@ -9,7 +9,7 @@ def linux_architectures():
             arch = "x86",
             compact_vars = {
                 "ARCH_CORE": "",
-                "ARCH_DRIVERS": "arch/x86/pci/ arch/x86/power/ arch/x86/video/",
+                "ARCH_DRIVERS": "arch/x86/pci/ arch/x86/power/",
                 "ARCH_LIB": "lib/ arch/x86/lib/",
                 "BITS": "64",
                 "PROFILING": "",

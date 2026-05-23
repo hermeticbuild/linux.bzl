@@ -4751,7 +4751,7 @@ def _linux_x86_archive(ctx, archiver, cc_toolchain, out_relpath, objects):
         return None
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
     args = ctx.actions.args()
-    args.add("cDPrST")
+    args.add("cDPrS")
     args.add(out)
     args.add_all(objects)
     ctx.actions.run(
@@ -4795,10 +4795,13 @@ def _linux_x86_compressed_vmlinux(ctx, compiler, linker, archiver, cc_toolchain,
         ("arch/x86/boot/compressed/idt_64.c", "arch/x86/boot/compressed/idt_64.o", [], []),
         ("arch/x86/boot/compressed/idt_handlers_64.S", "arch/x86/boot/compressed/idt_handlers_64.o", [], []),
         ("arch/x86/boot/compressed/pgtable_64.c", "arch/x86/boot/compressed/pgtable_64.o", [], []),
-        ("arch/x86/boot/compressed/early_serial_console.c", "arch/x86/boot/compressed/early_serial_console.o", [], []),
-        ("arch/x86/boot/compressed/kaslr.c", "arch/x86/boot/compressed/kaslr.o", [], []),
-        ("arch/x86/boot/compressed/acpi.c", "arch/x86/boot/compressed/acpi.o", [], []),
     ]
+    if _linux_x86_config_enabled(config, "CONFIG_EARLY_PRINTK"):
+        source_specs.append(("arch/x86/boot/compressed/early_serial_console.c", "arch/x86/boot/compressed/early_serial_console.o", [], []))
+    if _linux_x86_config_enabled(config, "CONFIG_RANDOMIZE_BASE"):
+        source_specs.append(("arch/x86/boot/compressed/kaslr.c", "arch/x86/boot/compressed/kaslr.o", [], []))
+    if _linux_x86_config_enabled(config, "CONFIG_ACPI"):
+        source_specs.append(("arch/x86/boot/compressed/acpi.c", "arch/x86/boot/compressed/acpi.o", [], []))
     if _linux_x86_config_enabled(config, "CONFIG_AMD_MEM_ENCRYPT"):
         source_specs.extend([
             ("arch/x86/boot/compressed/mem_encrypt.S", "arch/x86/boot/compressed/mem_encrypt.o", [], []),
