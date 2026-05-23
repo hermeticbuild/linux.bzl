@@ -102,6 +102,9 @@ _compact = tag_class(
         "kernel_package": attr.string(
             doc = "Package containing the linux(...) target. Empty means the root package.",
         ),
+        "probe_values": attr.string_dict(
+            doc = "Overrides for the selected Linux Kconfig probe model, for example cc_version or pahole_version.",
+        ),
         "kbuild_tree": attr.bool(
             default = True,
             doc = "Follow active Kbuild directory descent when generating compact metadata.",
@@ -302,6 +305,7 @@ def _linux_kernel_impl(mctx):
             kbuild = source_repo + "//:Kbuild",
             kbuild_tree = compact.kbuild_tree,
             kconfig_parse_tool = kconfig_parse_tool,
+            probe_values = compact.probe_values,
             root = source_repo + "//:Kconfig",
             source_asn1_compiler = _package_label(label_repo, compact.kernel_package, prefix + "_asn1_compiler_tool"),
             source_relacheck = _package_label(label_repo, compact.kernel_package, prefix + "_relacheck_tool") if arch.config_name == "aarch64" else "",

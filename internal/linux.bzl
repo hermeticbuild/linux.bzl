@@ -13,6 +13,7 @@ def linux(
         extra_kconfigs = None,
         extra_srcs = None,
         image_format = "auto",
+        probe_values = None,
         generated_dir = "generated",
         visibility = None,
         tags = None):
@@ -31,6 +32,8 @@ def linux(
         extra_srcs = []
     source_repo = _normalize_repo(source_repo)
     source_root = _repo_label(source_repo, "Kconfig")
+    if probe_values == None:
+        probe_values = {}
     source_tree = [_repo_label(source_repo, "all_files")]
     package_visibility = _package_visibility()
     actuals = {}
@@ -48,6 +51,7 @@ def linux(
             image_format = image_format,
             package_visibility = package_visibility,
             source_repo = source_repo,
+            probe_values = probe_values,
             source_root = source_root,
             source_tree = source_tree,
             tags = tags,
@@ -81,6 +85,7 @@ def _define_arch_kernel(
         source_repo,
         source_root,
         source_tree,
+        probe_values,
         tags):
     prefix = name + "_" + arch.config_name
     config_target = prefix + "_config"
@@ -127,6 +132,7 @@ def _define_arch_kernel(
         target_compatible_with = [arch.platform],
         vars = compact_vars,
         visibility = generated_visibility,
+        probe_values = probe_values,
     )
 
     host_tools = arch.host_tools(
