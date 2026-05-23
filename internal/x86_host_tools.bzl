@@ -342,6 +342,7 @@ def linux_x86_host_tools(
         kallsyms_tool = common.kallsyms_tool,
         objtool = package_label(objtool),
         probe_config = common.probe_config,
+        resolve_btfids_tool = common.resolve_btfids_tool,
         source_asn1_compiler = common.source_asn1_compiler,
         source_label_package = common.source_label_package,
         source_repo = source_repo,

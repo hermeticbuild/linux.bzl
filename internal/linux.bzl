@@ -13,6 +13,8 @@ def linux(
         extra_kconfigs = None,
         extra_srcs = None,
         image_format = "auto",
+        kallsyms = "auto",
+        pahole = None,
         probe_values = None,
         generated_dir = "generated",
         visibility = None,
@@ -30,10 +32,10 @@ def linux(
         extra_kconfigs = {}
     if extra_srcs == None:
         extra_srcs = []
-    source_repo = _normalize_repo(source_repo)
-    source_root = _repo_label(source_repo, "Kconfig")
     if probe_values == None:
         probe_values = {}
+    source_repo = _normalize_repo(source_repo)
+    source_root = _repo_label(source_repo, "Kconfig")
     source_tree = [_repo_label(source_repo, "all_files")]
     package_visibility = _package_visibility()
     actuals = {}
@@ -49,9 +51,11 @@ def linux(
             extra_srcs = extra_srcs,
             generated_dir = generated_dir,
             image_format = image_format,
+            kallsyms = kallsyms,
+            pahole = pahole,
+            probe_values = probe_values,
             package_visibility = package_visibility,
             source_repo = source_repo,
-            probe_values = probe_values,
             source_root = source_root,
             source_tree = source_tree,
             tags = tags,
@@ -81,11 +85,13 @@ def _define_arch_kernel(
         extra_srcs,
         generated_dir,
         image_format,
+        kallsyms,
+        pahole,
+        probe_values,
         package_visibility,
         source_repo,
         source_root,
         source_tree,
-        probe_values,
         tags):
     prefix = name + "_" + arch.config_name
     config_target = prefix + "_config"
@@ -126,13 +132,13 @@ def _define_arch_kernel(
         config_mode = config_mode,
         env = env,
         extra_kconfigs = extra_kconfigs,
+        probe_values = probe_values,
         root = source_root,
         source_root = source_root,
         srcs = source_tree + extra_srcs,
         target_compatible_with = [arch.platform],
         vars = compact_vars,
         visibility = generated_visibility,
-        probe_values = probe_values,
     )
 
     host_tools = arch.host_tools(
@@ -184,8 +190,11 @@ def _define_arch_kernel(
         "format": arch.vmlinux_format,
         "generated_headers": host_tools.generated_headers,
         "image": compact_image,
+        "kallsyms": kallsyms,
         "kallsyms_tool": host_tools.kallsyms_tool,
         "linker_script": _repo_label(source_repo, arch.vmlinux_linker_script),
+        "pahole": pahole,
+        "resolve_btfids_tool": host_tools.resolve_btfids_tool,
         "source_root": source_root,
         "source_tree": source_tree,
         "sorttable_tool": host_tools.sorttable_tool,

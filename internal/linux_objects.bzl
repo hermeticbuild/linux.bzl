@@ -2749,7 +2749,7 @@ def _linux_resolved_config_impl(ctx):
             auto_conf_cmd = auto_conf_cmd,
             autoconf_h = autoconf_h,
             config = config,
-            config_flags = {},
+            config_flags = dict(ctx.attr.config[KconfigInfo].config_flags),
             cflags = cflags,
             files = files,
             include_dir = include_dir,
@@ -3959,7 +3959,7 @@ def _linux_strip_vmlinux(ctx, config, input, out):
 def _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, system_map, name, kallsyms_tool):
     asm = ctx.actions.declare_file(ctx.label.name + ".obj/" + name + ".kallsyms.S")
     kallsyms_flags = []
-    if ctx.attr.kallsyms_all:
+    if ctx.attr.kallsyms_all or config.config_flags.get("CONFIG_KALLSYMS_ALL") == "y":
         kallsyms_flags.append("--all-symbols")
     if ctx.attr.kallsyms_pc_relative:
         kallsyms_flags.append("--pc-relative")
@@ -3984,7 +3984,78 @@ def _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, c
         name + ".kallsyms.o",
     )
 
-def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, out, strip_debug):
+def _linux_btf_object(ctx, config, input):
+    if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") != "y":
+        return None
+    if not ctx.executable.pahole:
+        fail("linux_vmlinux %s has DEBUG_INFO_BTF enabled and requires pahole" % ctx.label)
+
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + input.basename + ".btf.o")
+    btf_vmlinux = ctx.actions.declare_file(ctx.label.name + ".obj/" + input.basename + ".btf")
+    pahole_flags = [
+        "--btf_features=encode_force,var,float,enum64,decl_tag,type_tag,optimized_func,consistent_func,decl_tag_kfuncs",
+        "--btf_features=attributes",
+        "--lang_exclude=rust",
+    ]
+    et_rel = "\\0\\1" if config.config_flags.get("CONFIG_CPU_BIG_ENDIAN") == "y" else "\\1\\0"
+    ctx.actions.run_shell(
+        inputs = [input],
+        tools = [ctx.executable.pahole, ctx.executable._llvm_objcopy],
+        outputs = [btf_vmlinux, out],
+        command = """\
+set -euo pipefail
+cp "$1" "$2"
+chmod u+w "$2"
+LLVM_OBJCOPY="$3" "$4" -J {pahole_flags} "$2"
+"$3" --only-section=.BTF --set-section-flags .BTF=alloc,readonly --strip-all "$2" "$5" 2>/dev/null
+printf '{et_rel}' | dd of="$5" conv=notrunc bs=1 seek=16 status=none
+""".format(
+            et_rel = et_rel,
+            pahole_flags = " ".join([_shell_quote(flag) for flag in pahole_flags]),
+        ),
+        arguments = [
+            input.path,
+            btf_vmlinux.path,
+            ctx.executable._llvm_objcopy.path,
+            ctx.executable.pahole.path,
+            out.path,
+        ],
+        mnemonic = "LinuxBTF",
+        progress_message = "Generating Linux BTF %{label}",
+    )
+    return out
+
+def _linux_resolve_btfids(ctx, config, input):
+    if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") != "y":
+        return input
+    if not ctx.executable.resolve_btfids_tool:
+        fail("linux_vmlinux %s has DEBUG_INFO_BTF enabled and requires resolve_btfids_tool" % ctx.label)
+
+    out = ctx.actions.declare_file(ctx.label.name + ".btfids.vmlinux.unstripped")
+    args = []
+    if config.config_flags.get("CONFIG_WERROR") == "y":
+        args.append("--fatal_warnings")
+    ctx.actions.run_shell(
+        inputs = [input],
+        tools = [ctx.executable.resolve_btfids_tool],
+        outputs = [out],
+        command = """\
+set -euo pipefail
+cp "$1" "$2"
+chmod u+w "$2"
+"$3" {args} "$2"
+""".format(args = " ".join([_shell_quote(arg) for arg in args])),
+        arguments = [
+            input.path,
+            out.path,
+            ctx.executable.resolve_btfids_tool.path,
+        ],
+        mnemonic = "LinuxResolveBTFIDs",
+        progress_message = "Resolving Linux BTF IDs %{label}",
+    )
+    return out
+
+def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, out, strip_debug):
     inputs = depset(
         [image_object, export_object, version_object, linker_script],
         transitive = [image_object_inputs, cc_toolchain.all_files],
@@ -4023,6 +4094,9 @@ def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_
     if kallsyms_object:
         args.add(kallsyms_object)
         inputs = depset([kallsyms_object], transitive = [inputs])
+    if btf_object:
+        args.add(btf_object)
+        inputs = depset([btf_object], transitive = [inputs])
 
     ctx.actions.run(
         executable = executable,
@@ -4110,10 +4184,38 @@ def _linux_vmlinux_link_flags(ctx, config):
         ])
     return flags
 
-def _linux_vmlinux_objtool(ctx, config, image_object):
+def _linux_vmlinux_relocatable_object(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs):
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/vmlinux.o")
+    args = ctx.actions.args()
+    args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all([
+        "-fuse-ld=lld",
+        "-nostdlib",
+        "-no-pie",
+        "-Wl,-r",
+        "-Wl,-m,elf_x86_64",
+        "-o",
+        out,
+        "-Wl,--whole-archive",
+    ])
+    args.add(image_object)
+    args.add("-Wl,--no-whole-archive")
+
+    ctx.actions.run(
+        executable = linker,
+        inputs = depset([image_object], transitive = [image_object_inputs, cc_toolchain.all_files]),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxVmlinuxRelocatable",
+        progress_message = "Linking Linux relocatable vmlinux.o %{label}",
+    )
+    return out
+
+def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs):
     if not ctx.executable.objtool:
         return image_object
 
+    image_object = _linux_vmlinux_relocatable_object(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs)
     out = ctx.actions.declare_file(ctx.label.name + ".obj/vmlinux.o.objtool")
     args = ctx.actions.args()
     args.add("-config", config.config)
@@ -4169,8 +4271,8 @@ def _linux_real_vmlinux_impl(ctx):
         "init/version-timestamp.o",
         ["-fno-function-sections", "-fno-data-sections", "-include", "generated/utsversion.h"],
     )
-    image_object = _linux_vmlinux_objtool(ctx, config, image.output)
     image_object_inputs = depset([info.output for info in image.objects])
+    image_object = _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, image.output, image_object_inputs)
 
     kallsyms_object = None
     if ctx.attr.kallsyms == "auto":
@@ -4183,14 +4285,23 @@ def _linux_real_vmlinux_impl(ctx):
         empty_map = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux0.syms")
         ctx.actions.write(empty_map, "")
         kallsyms_object = _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, empty_map, ".tmp_vmlinux0", ctx.executable.kallsyms_tool)
+
+    btf_object = None
+    if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") == "y":
+        btf_base = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux.btf")
+        _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, None, btf_base, False)
+        btf_object = _linux_btf_object(ctx, config, btf_base)
+
+    if kallsyms_enabled:
         for i in range(1, 5):
             tmp = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux%d" % i)
-            _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, tmp, True)
+            _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, tmp, True)
             system_map = _linux_system_map(ctx, tmp, ".tmp_vmlinux%d" % i)
             kallsyms_object = _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, system_map, ".tmp_vmlinux%d" % i, ctx.executable.kallsyms_tool)
 
     unstripped = ctx.actions.declare_file(ctx.label.name + ".vmlinux.unstripped")
-    linked = _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, unstripped, False)
+    linked = _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, unstripped, False)
+    linked = _linux_resolve_btfids(ctx, config, linked)
     unstripped = _linux_sorttable(ctx, config, linked)
     out = ctx.actions.declare_file(ctx.label.name + ".vmlinux")
     out = _linux_strip_vmlinux(ctx, config, unstripped, out)
@@ -4262,6 +4373,14 @@ linux_vmlinux = rule(
         "kallsyms_pc_relative": attr.bool(),
         "linker_script": attr.label(allow_single_file = True),
         "objtool": attr.label(
+            cfg = "exec",
+            executable = True,
+        ),
+        "pahole": attr.label(
+            cfg = "exec",
+            executable = True,
+        ),
+        "resolve_btfids_tool": attr.label(
             cfg = "exec",
             executable = True,
         ),
