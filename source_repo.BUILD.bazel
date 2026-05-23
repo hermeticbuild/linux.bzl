@@ -9,8 +9,33 @@ exports_files(
 )
 
 filegroup(
+    name = "source_tree_lookup_files",
+    srcs = glob([
+        "arch/arm64/kernel/vdso/**",
+        "arch/arm64/kernel/vdso32/**",
+        "arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
+        "arch/x86/boot/**",
+        "arch/x86/entry/vdso/**",
+        "arch/x86/include/asm/cpufeatures.h",
+        "arch/x86/include/asm/vmxfeatures.h",
+        "arch/x86/lib/x86-opcode-map.txt",
+        "arch/x86/purgatory/**",
+        "arch/x86/realmode/rm/**",
+        "drivers/firmware/efi/libstub/**/*.c",
+        "drivers/tty/vt/*_shipped",
+        "include/linux/oid_registry.h",
+        "include/scsi/scsi_devinfo.h",
+        "init/version-timestamp.c",
+        "lib/cmdline.c",
+        "lib/crypto/sha256.c",
+        "lib/ctype.c",
+        "usr/default_cpio_list",
+    ], allow_empty = True),
+)
+
+filegroup(
     name = "all_files",
-    srcs = glob(["**"]),
+    srcs = glob(["*"], exclude_directories = 0) + [":source_tree_lookup_files"],
 )
 
 filegroup(
