@@ -84,8 +84,9 @@ func vmlinuxObjtoolArgs(config map[string]string) []string {
 	}
 
 	delayObjtool := enabled(config, "CONFIG_LTO_CLANG") || enabled(config, "CONFIG_X86_KERNEL_IBT")
+	mcountObjtool := enabled(config, "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL")
 	noinstrValidation := enabled(config, "CONFIG_NOINSTR_VALIDATION")
-	if !delayObjtool && !noinstrValidation {
+	if !delayObjtool && !mcountObjtool && !noinstrValidation {
 		return nil
 	}
 
@@ -105,12 +106,6 @@ func vmlinuxObjtoolArgs(config map[string]string) []string {
 		}
 		if enabled(config, "CONFIG_FINEIBT") {
 			args = append(args, "--cfi")
-		}
-		if enabled(config, "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL") {
-			args = append(args, "--mcount")
-			if enabled(config, "CONFIG_HAVE_OBJTOOL_NOP_MCOUNT") {
-				args = append(args, "--mnop")
-			}
 		}
 		if enabled(config, "CONFIG_UNWINDER_ORC") {
 			args = append(args, "--orc")
@@ -138,6 +133,13 @@ func vmlinuxObjtoolArgs(config map[string]string) []string {
 		}
 		if enabled(config, "CONFIG_PREFIX_SYMBOLS") {
 			args = append(args, "--prefix="+config["CONFIG_FUNCTION_PADDING_BYTES"])
+		}
+	}
+
+	if mcountObjtool {
+		args = append(args, "--mcount")
+		if enabled(config, "CONFIG_HAVE_OBJTOOL_NOP_MCOUNT") {
+			args = append(args, "--mnop")
 		}
 	}
 

@@ -84,6 +84,7 @@ func linuxCFlags(config map[string]string, arch string) []string {
 	if enabled(config, "CONFIG_READABLE_ASM") {
 		flags = append(flags, "-fno-reorder-blocks", "-fno-ipa-cp-clone", "-fno-partial-inlining")
 	}
+	flags = append(flags, debugInfoFlags(config)...)
 	switch {
 	case enabled(config, "CONFIG_STACKPROTECTOR_STRONG"):
 		flags = append(flags, "-fstack-protector-strong")
@@ -109,7 +110,7 @@ func linuxCFlags(config map[string]string, arch string) []string {
 	if enabled(config, "CONFIG_ZERO_CALL_USED_REGS") {
 		flags = append(flags, "-fzero-call-used-regs=used-gpr")
 	}
-	flags = append(flags, ftraceFlags(config)...)
+	flags = append(flags, ftraceFlags(config, arch)...)
 	if enabled(config, "CONFIG_DEBUG_SECTION_MISMATCH") {
 		flags = append(flags, "-fno-inline-functions-called-once")
 	}
@@ -143,15 +144,16 @@ func linuxCFlags(config map[string]string, arch string) []string {
 	return flags
 }
 
-func ftraceFlags(config map[string]string) []string {
+func ftraceFlags(config map[string]string, arch string) []string {
 	if !enabled(config, "CONFIG_FUNCTION_TRACER") {
 		return nil
 	}
 	flags := []string{}
+	if !(arch == "arm64" && (enabled(config, "CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS") || enabled(config, "CONFIG_DYNAMIC_FTRACE_WITH_ARGS"))) {
+		flags = append(flags, "-pg")
+	}
 	if enabled(config, "CONFIG_FTRACE_MCOUNT_USE_CC") {
-		if !enabled(config, "CONFIG_CC_IS_CLANG") {
-			flags = append(flags, "-mrecord-mcount")
-		}
+		flags = append(flags, "-mrecord-mcount")
 		if enabled(config, "CONFIG_HAVE_NOP_MCOUNT") {
 			flags = append(flags, "-mnop-mcount")
 		}
@@ -176,6 +178,20 @@ func ftraceUsingFlags(config map[string]string) []string {
 	}
 	if enabled(config, "CONFIG_HAVE_FENTRY") {
 		flags = append(flags, "-DCC_USING_FENTRY")
+	}
+	return flags
+}
+
+func debugInfoFlags(config map[string]string) []string {
+	if !enabled(config, "CONFIG_DEBUG_INFO") {
+		return nil
+	}
+	flags := []string{"-g"}
+	switch {
+	case enabled(config, "CONFIG_DEBUG_INFO_DWARF4"):
+		flags = append(flags, "-gdwarf-4")
+	case enabled(config, "CONFIG_DEBUG_INFO_DWARF5"):
+		flags = append(flags, "-gdwarf-5")
 	}
 	return flags
 }
@@ -252,9 +268,9 @@ func x86CFlags(config map[string]string) []string {
 func linuxAFlags(config map[string]string, arch string) []string {
 	switch arch {
 	case "arm64":
-		return arm64AFlags(config)
+		return append(arm64AFlags(config), debugInfoFlags(config)...)
 	case "x86":
-		return append(x86CFlags(config), ftraceUsingFlags(config)...)
+		return append(append(x86CFlags(config), ftraceUsingFlags(config)...), debugInfoFlags(config)...)
 	default:
 		return nil
 	}

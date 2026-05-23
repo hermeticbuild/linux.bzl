@@ -1310,7 +1310,7 @@ func kbuildKnownCall(name string, args []string, original string) (string, bool)
 
 func linuxLLVMProbeSupportsOption(option string) bool {
 	switch option {
-	case "", "-fno-code-hoisting", "-fmin-function-alignment=8", "-fsanitize=kernel-memory":
+	case "", "-fno-code-hoisting", "-fmin-function-alignment=8", "-fsanitize=kernel-memory", "-mrecord-mcount":
 		return false
 	default:
 		return true

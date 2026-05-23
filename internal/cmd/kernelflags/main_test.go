@@ -7,9 +7,10 @@ import "testing"
 
 func TestLinuxAFlagsX86IncludeFtraceUsingDefines(t *testing.T) {
 	config := map[string]string{
-		"CONFIG_FUNCTION_TRACER": "y",
-		"CONFIG_HAVE_FENTRY":     "y",
-		"CONFIG_X86_64":          "y",
+		"CONFIG_FUNCTION_TRACER":      "y",
+		"CONFIG_FTRACE_MCOUNT_USE_CC": "y",
+		"CONFIG_HAVE_FENTRY":          "y",
+		"CONFIG_X86_64":               "y",
 	}
 	flags := linuxAFlags(config, "x86")
 	if !contains(flags, "-DCC_USING_FENTRY") {
@@ -22,12 +23,13 @@ func TestLinuxAFlagsX86IncludeFtraceUsingDefines(t *testing.T) {
 
 func TestLinuxCFlagsX86IncludeFtraceCompilerAndUsingFlags(t *testing.T) {
 	config := map[string]string{
-		"CONFIG_FUNCTION_TRACER": "y",
-		"CONFIG_HAVE_FENTRY":     "y",
-		"CONFIG_X86_64":          "y",
+		"CONFIG_FUNCTION_TRACER":      "y",
+		"CONFIG_FTRACE_MCOUNT_USE_CC": "y",
+		"CONFIG_HAVE_FENTRY":          "y",
+		"CONFIG_X86_64":               "y",
 	}
 	flags := linuxCFlags(config, "x86")
-	for _, want := range []string{"-mfentry", "-DCC_USING_FENTRY"} {
+	for _, want := range []string{"-pg", "-mrecord-mcount", "-mfentry", "-DCC_USING_FENTRY"} {
 		if !contains(flags, want) {
 			t.Fatalf("linuxCFlags() missing %s: %v", want, flags)
 		}

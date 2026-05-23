@@ -567,7 +567,17 @@ def _linux_objcopy_flags_for_object(object, arch = ""):
     return []
 
 def _linux_object_needs_relacheck(object):
-    return object.endswith(".pi.o")
+    return object.startswith("arch/arm64/") and object.endswith(".pi.o")
+
+def _linux_ftrace_remove_flags():
+    return [
+        "-pg",
+        "-mrecord-mcount",
+        "-mnop-mcount",
+        "-mfentry",
+        "-fpatchable-function-entry=4,2",
+        "-fpatchable-function-entry=2",
+    ]
 
 def _linux_perlasm_kind(object):
     if object in [
@@ -3052,6 +3062,10 @@ def _linux_real_object_impl(ctx):
         source_root,
     )
     expanded_remove_flags = _rewrite_source_root_flags(_expand_flag_refs(ctx.attr.remove_flags, config_values, make_values, ctx.attr.object), source_root)
+    if ctx.attr.arch == "arm64" and ctx.attr.object.startswith("arch/arm64/kernel/pi/") and ctx.attr.object.endswith(".pi.o"):
+        expanded_remove_flags = expanded_remove_flags + _linux_ftrace_remove_flags()
+    if ctx.attr.arch == "x86" and ctx.attr.object.startswith("arch/x86/boot/startup/") and ctx.attr.object.endswith(".pi.o"):
+        expanded_remove_flags = expanded_remove_flags + _linux_ftrace_remove_flags()
     config_flag_inputs = _linux_filtered_config_flags_for_source(ctx, config, src, expanded_remove_flags)
 
     args = ctx.actions.args()
