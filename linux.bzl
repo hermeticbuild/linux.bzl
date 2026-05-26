@@ -155,7 +155,21 @@ _KCONFIG_TOOL_REPO = "linux_bzl_kconfig_tool"
 
 _LINUX_ARCHIVE_EXCLUDES = [
     "Build",
+    "Documentation",
+    "Documentation/",
+    "Documentation/*",
+    "Documentation/**",
+    "samples",
+    "samples/",
+    "samples/*",
+    "samples/**",
     "*/Build",
+]
+
+_LINUX_ARCHIVE_PATCH_CMDS = [
+    "rm -rf Documentation samples",
+    "mkdir -p Documentation && : > Documentation/Kconfig",
+    "mkdir -p samples && : > samples/Kconfig",
 ]
 
 def _linux_kernel_impl(mctx):
@@ -226,8 +240,9 @@ def _linux_kernel_impl(mctx):
             kwargs["patch_args"] = ["-p%d" % archive.patch_strip]
         elif archive.patch_args:
             kwargs["patch_args"] = archive.patch_args
-        if archive.patch_cmds:
-            kwargs["patch_cmds"] = archive.patch_cmds
+        patch_cmds = list(archive.patch_cmds) + _LINUX_ARCHIVE_PATCH_CMDS
+        if patch_cmds:
+            kwargs["patch_cmds"] = patch_cmds
         if archive.patch_tool:
             kwargs["patch_tool"] = archive.patch_tool
         http_bsdtar_archive(**kwargs)

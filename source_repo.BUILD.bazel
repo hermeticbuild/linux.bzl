@@ -11,6 +11,7 @@ exports_files(
 filegroup(
     name = "source_tree_lookup_files",
     srcs = glob([
+        "Documentation/Kconfig",
         "arch/arm64/kernel/vdso/**",
         "arch/arm64/kernel/vdso32/**",
         "arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
@@ -29,13 +30,21 @@ filegroup(
         "lib/cmdline.c",
         "lib/crypto/sha256.c",
         "lib/ctype.c",
+        "samples/Kconfig",
         "usr/default_cpio_list",
     ], allow_empty = True),
 )
 
 filegroup(
     name = "all_files",
-    srcs = glob(["*"], exclude_directories = 0) + [":source_tree_lookup_files"],
+    srcs = glob(
+        ["*"],
+        exclude = [
+            "Documentation",
+            "samples",
+        ],
+        exclude_directories = 0,
+    ) + [":source_tree_lookup_files"],
 )
 
 filegroup(
