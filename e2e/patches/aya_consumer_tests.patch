@@ -1,0 +1,18 @@
+diff --git a/MODULE.bazel b/MODULE.bazel
+index 00d93a2..916bdf3 100644
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -7,11 +7,11 @@ bazel_dep(name = "bazel_lib", version = "3.2.2")
+ bazel_dep(name = "bazel_skylib", version = "1.9.0")
+ bazel_dep(name = "linux.bzl", version = "0.0.0")
+ 
+-bazel_dep(name = "libbpf", version = "1.7.0", dev_dependency = True)
++bazel_dep(name = "libbpf", version = "1.7.0")
+ 
+ bazel_dep(name = "llvm", version = "0.8.3")
+ 
+-bazel_dep(name = "pahole", version = "1.31", dev_dependency = True)
++bazel_dep(name = "pahole", version = "1.31")
+ 
+ bazel_dep(name = "platforms", version = "1.1.0")
+ bazel_dep(name = "rules_cc", version = "0.2.18")

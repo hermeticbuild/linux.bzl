@@ -1,0 +1,5 @@
+alias(
+    name = "bpf-linker",
+    actual = "@aya//bazel/toolchains:bpf-linker",
+    visibility = ["//visibility:public"],
+)

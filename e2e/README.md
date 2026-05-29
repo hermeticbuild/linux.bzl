@@ -14,3 +14,15 @@ Build the arm64 kernel target with:
 ```sh
 bazel build --config=remote --platforms=@llvm//platforms:linux_arm64 //:kernel_arm64
 ```
+
+Run the pinned Aya VM integration tests with:
+
+```sh
+bazel test --config=aya_vm //:aya_vm_tests
+```
+
+Build-test the pinned Actiond kernel target with:
+
+```sh
+bazel test --config=remote_arm64 //:actiond_kernel_build_test
+```

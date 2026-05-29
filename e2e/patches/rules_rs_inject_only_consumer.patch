@@ -1,0 +1,12 @@
+diff --git a/rs/extensions.bzl b/rs/extensions.bzl
+--- a/rs/extensions.bzl
++++ b/rs/extensions.bzl
+@@ -640,7 +640,7 @@ def _crate_impl(mctx):
+     annotations_by_hub_name = {}
+ 
+     for mod in mctx.modules:
+-        if not mod.tags.from_cargo:
++        if not mod.tags.from_cargo and not mod.is_root:
+             fail("`.from_cargo` is required. Please update %s" % mod.name)
+ 
+         for cfg in mod.tags.from_cargo:

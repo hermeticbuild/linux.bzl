@@ -1,3 +1,4 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@linux.bzl//:linux.bzl", "linux")
 
 package(default_visibility = ["//visibility:public"])
@@ -13,7 +14,7 @@ linux(
         "x86_64": "@tiny_compact",
     },
     config = "@tiny_kconfig//:kconfig",
-    source_repo = "@linux_6_18_2",
+    source_repo = "@e2e_linux_6_18_2",
 )
 
 linux(
@@ -22,5 +23,18 @@ linux(
         "aarch64": "@tiny_arm64_compact",
     },
     config = "@tiny_arm64_kconfig//:kconfig",
-    source_repo = "@linux_6_18_2",
+    source_repo = "@e2e_linux_6_18_2",
+)
+
+test_suite(
+    name = "aya_vm_tests",
+    tests = [
+        "@aya//test/integration-test:vm_aarch64",
+        "@aya//test/integration-test:vm_x86_64",
+    ],
+)
+
+build_test(
+    name = "actiond_kernel_build_test",
+    targets = ["@actiond//vm:linux_kernel"],
 )
