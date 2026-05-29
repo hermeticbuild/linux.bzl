@@ -18,16 +18,21 @@ def linux(
         probe_values = None,
         generated_dir = "generated",
         visibility = None,
-        tags = None):
+        tags = None,
+        arch_configs = None):
     """Build a Linux kernel image for the active Bazel platform.
 
     The public target is a platform-selected alias. Each supported architecture
     gets its own resolved config, generated Kbuild BUILD files, host tools and
     final image target so Bazel can cache each architecture independently. The
-    config label may itself be a platform-selected alias.
+    config label may itself be a platform-selected alias. Use arch_configs for
+    architecture-specific config labels when private architecture targets may
+    be selected directly.
     """
     if compact_repos == None:
         compact_repos = {}
+    if arch_configs == None:
+        arch_configs = {}
     if extra_kconfigs == None:
         extra_kconfigs = {}
     if extra_srcs == None:
@@ -44,7 +49,7 @@ def linux(
         actuals[arch.platform] = _define_arch_kernel(
             name = name,
             arch = arch,
-            config = config,
+            config = arch_configs.get(arch.config_name, config),
             config_mode = config_mode,
             compact_repo = compact_repos.get(arch.config_name),
             extra_kconfigs = extra_kconfigs,

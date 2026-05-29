@@ -36,15 +36,28 @@ filegroup(
 )
 
 filegroup(
+    name = "tools_files",
+    srcs = glob([
+        "tools/**",
+    ], exclude = [
+        "tools/docker/**",
+    ], allow_empty = True),
+)
+
+filegroup(
     name = "all_files",
     srcs = glob(
         ["*"],
         exclude = [
             "Documentation",
             "samples",
+            "tools",
         ],
         exclude_directories = 0,
-    ) + [":source_tree_lookup_files"],
+    ) + [
+        ":source_tree_lookup_files",
+        ":tools_files",
+    ],
 )
 
 filegroup(
