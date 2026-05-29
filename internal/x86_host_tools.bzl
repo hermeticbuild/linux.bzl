@@ -3,7 +3,7 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load(":common_host_tools.bzl", "linux_common_host_tools")
 load(":linux_objects.bzl", "linux_x86_generated_headers")
-load(":source_utils.bzl", "bindir_path", "package_label", "source_label", "source_labels")
+load(":source_utils.bzl", "package_label", "source_label", "source_labels")
 
 _X86_OBJTOOL_TEXTUAL_HDRS = [
     "tools/arch/x86/include/asm/amd/ibs.h",
@@ -252,6 +252,7 @@ def linux_x86_host_tools(
 
     cc_library(
         name = objtool_inputs,
+        includes = [genrule_inat_out[:-len("/inat-tables.c")]],
         textual_hdrs = [":" + objtool_inat_tables] + source_labels(source_repo, _X86_OBJTOOL_TEXTUAL_HDRS),
         visibility = visibility,
     )
@@ -264,7 +265,6 @@ def linux_x86_host_tools(
             "-Dbswap_16=__bswap_16",
             "-Dbswap_32=__bswap_32",
             "-Dbswap_64=__bswap_64",
-            "-I" + bindir_path(genrule_inat_out[:-len("/inat-tables.c")]),
             "-Wno-missing-field-initializers",
             "-Wno-nested-externs",
             "-Wno-packed",

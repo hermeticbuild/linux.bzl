@@ -5,6 +5,8 @@ common --@rules_rust//rust/toolchain/channel=nightly
 common --@llvm//config:experimental_stub_libgcc_s=True
 
 build:remote --platforms=@llvm//platforms:linux_x86_64
+build:remote --extra_execution_platforms=//bazel/toolchains:rbe_x86_64_linux_libcxx
+test:remote --remote_download_minimal
 
 build:remote_arm64 --config=remote
 build:remote_arm64 --platforms=@llvm//platforms:linux_arm64

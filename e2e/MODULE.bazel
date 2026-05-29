@@ -115,7 +115,7 @@ linux_kernel.compact(
     name = "tiny_arm64_compact",
     config = "//:tiny_arm64.config",
     config_name = "aarch64",
-    kernel_name = "kernel_arm64",
+    kernel_name = "kernel",
     source_repo = "e2e_linux_6_18_2",
 )
 use_repo(

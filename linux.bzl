@@ -163,6 +163,7 @@ _LINUX_ARCHIVE_EXCLUDES = [
     "samples/",
     "samples/*",
     "samples/**",
+    "tools/docker/**",
     "*/Build",
 ]
 

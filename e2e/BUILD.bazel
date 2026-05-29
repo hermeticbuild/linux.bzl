@@ -1,5 +1,6 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@linux.bzl//:linux.bzl", "linux")
+load("//:build_tests.bzl", "arm64_build_target")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -8,22 +9,27 @@ exports_files([
     "tiny_arm64.config",
 ])
 
-linux(
-    name = "kernel",
-    compact_repos = {
-        "x86_64": "@tiny_compact",
-    },
-    config = "@tiny_kconfig//:kconfig",
-    source_repo = "@e2e_linux_6_18_2",
+alias(
+    name = "selected_kconfig",
+    actual = select({
+        "@platforms//cpu:aarch64": "@tiny_arm64_kconfig//:kconfig",
+        "@platforms//cpu:x86_64": "@tiny_kconfig//:kconfig",
+    }),
 )
 
 linux(
-    name = "kernel_arm64",
+    name = "kernel",
     compact_repos = {
         "aarch64": "@tiny_arm64_compact",
+        "x86_64": "@tiny_compact",
     },
-    config = "@tiny_arm64_kconfig//:kconfig",
+    config = ":selected_kconfig",
     source_repo = "@e2e_linux_6_18_2",
+)
+
+alias(
+    name = "kernel_arm64",
+    actual = ":kernel",
 )
 
 test_suite(
@@ -34,7 +40,12 @@ test_suite(
     ],
 )
 
+arm64_build_target(
+    name = "actiond_kernel_arm64",
+    target = "@actiond//vm:linux_kernel",
+)
+
 build_test(
     name = "actiond_kernel_build_test",
-    targets = ["@actiond//vm:linux_kernel"],
+    targets = [":actiond_kernel_arm64"],
 )

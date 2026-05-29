@@ -3,3 +3,19 @@ alias(
     actual = "@aya//bazel/toolchains:bpf-linker",
     visibility = ["//visibility:public"],
 )
+
+platform(
+    name = "rbe_x86_64_linux_libcxx",
+    constraint_values = [
+        "@llvm//constraints/cxxstdlib:libcxx",
+        "@llvm//constraints/libc:gnu.2.28",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    exec_properties = {
+        "Arch": "amd64",
+        "OSFamily": "Linux",
+        "container-image": "docker://ubuntu:24.04",
+    },
+    visibility = ["//visibility:public"],
+)
