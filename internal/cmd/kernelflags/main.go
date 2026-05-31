@@ -84,10 +84,10 @@ func linuxCFlags(config map[string]string, arch string) []string {
 	} else {
 		flags = append(flags, "-fno-function-sections", "-fno-data-sections")
 	}
-	if enabled(config, "CONFIG_CC_OPTIMIZE_FOR_SIZE") {
-		flags = append(flags, "-Os")
-	} else {
+	if enabled(config, "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE") {
 		flags = append(flags, "-O2")
+	} else if enabled(config, "CONFIG_CC_OPTIMIZE_FOR_SIZE") {
+		flags = append(flags, "-Os")
 	}
 	if enabled(config, "CONFIG_READABLE_ASM") {
 		flags = append(flags, "-fno-reorder-blocks", "-fno-ipa-cp-clone", "-fno-partial-inlining")

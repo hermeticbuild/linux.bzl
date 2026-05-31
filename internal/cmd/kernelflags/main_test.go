@@ -79,6 +79,32 @@ func TestLinuxCFlagsUseSectionSplittingForDeadCodeElimination(t *testing.T) {
 	}
 }
 
+func TestLinuxCFlagsUseO2ForPerformanceOptimization(t *testing.T) {
+	config := map[string]string{
+		"CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE": "y",
+	}
+	flags := linuxCFlags(config, "arm64")
+	if !contains(flags, "-O2") {
+		t.Fatalf("linuxCFlags() missing -O2: %v", flags)
+	}
+	if contains(flags, "-Os") {
+		t.Fatalf("linuxCFlags() unexpectedly contains -Os: %v", flags)
+	}
+}
+
+func TestLinuxCFlagsUseOsForSizeOptimization(t *testing.T) {
+	config := map[string]string{
+		"CONFIG_CC_OPTIMIZE_FOR_SIZE": "y",
+	}
+	flags := linuxCFlags(config, "arm64")
+	if !contains(flags, "-Os") {
+		t.Fatalf("linuxCFlags() missing -Os: %v", flags)
+	}
+	if contains(flags, "-O2") {
+		t.Fatalf("linuxCFlags() unexpectedly contains -O2: %v", flags)
+	}
+}
+
 func contains(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
