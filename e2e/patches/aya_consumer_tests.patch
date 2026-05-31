@@ -16,3 +16,30 @@ index 00d93a2..916bdf3 100644
  
  bazel_dep(name = "platforms", version = "1.1.0")
  bazel_dep(name = "rules_cc", version = "0.2.18")
+diff --git a/test/kernel/aya_aarch64.config b/test/kernel/aya_aarch64.config
+--- a/test/kernel/aya_aarch64.config
++++ b/test/kernel/aya_aarch64.config
+@@ -48,2 +48,3 @@
+ CONFIG_INET = y
+ CONFIG_IPV6 = y
++CONFIG_IPV6_SEG6_LWTUNNEL = y
+@@ -60,4 +61,6 @@ CONFIG_NET_SCHED = y
+ CONFIG_NETFILTER = y
+ CONFIG_NETDEVICES = y
+ CONFIG_PCI = y
+ CONFIG_XDP_SOCKETS = y
++CONFIG_XFRM_USER = y
++CONFIG_SYN_COOKIES = y
+diff --git a/test/kernel/aya_x86_64.config b/test/kernel/aya_x86_64.config
+--- a/test/kernel/aya_x86_64.config
++++ b/test/kernel/aya_x86_64.config
+@@ -60,2 +60,3 @@
+ CONFIG_INET = y
+ CONFIG_IPV6 = y
++CONFIG_IPV6_SEG6_LWTUNNEL = y
+@@ -72,3 +73,5 @@ CONFIG_NET_SCHED = y
+ CONFIG_NETFILTER = y
+ CONFIG_NETDEVICES = y
+ CONFIG_XDP_SOCKETS = y
++CONFIG_XFRM_USER = y
++CONFIG_SYN_COOKIES = y
