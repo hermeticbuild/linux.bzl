@@ -197,6 +197,8 @@ func (s *linuxProbeShell) commandSucceeds(command string) bool {
 		return s.config.RustAvailable
 	case strings.Contains(command, "/scripts/cc-can-link.sh"):
 		return s.config.CanLink
+	case strings.Contains(command, " --help | head -n 1 | grep -qi llvm"):
+		return strings.Contains(command, "llvm-nm") || strings.Contains(command, "llvm-ar")
 	case strings.Contains(command, " --crate-type=rlib "):
 		return s.config.RustOptions
 	case hasShellField(command, "-Werror"):

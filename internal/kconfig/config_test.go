@@ -697,6 +697,35 @@ endchoice
 	})
 }
 
+func TestResolveConfigChoiceMemberDependsOnHiddenDefBoolGate(t *testing.T) {
+	resolved := mustResolveConfig(t, `
+mainmenu "Test"
+
+config GATE
+	def_bool y
+
+choice
+	prompt "Backend"
+	default FIRST
+
+config FIRST
+	bool "First"
+
+config SECOND
+	bool "Second"
+	depends on GATE
+
+endchoice
+`, map[string]string{
+		"CONFIG_SECOND": "y",
+	})
+	wantConfigValues(t, resolved, map[string]string{
+		"CONFIG_GATE":   "y",
+		"CONFIG_FIRST":  "n",
+		"CONFIG_SECOND": "y",
+	})
+}
+
 func TestResolveConfigAllNoConfigUsesChoiceDefault(t *testing.T) {
 	fixture := `
 mainmenu "Test"

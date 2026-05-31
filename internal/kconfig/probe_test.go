@@ -120,6 +120,25 @@ config BINDGEN_VERSION_TEXT
 	}
 }
 
+func TestLinuxLLVMProbeShellSupportsLLVMNmAndArProbes(t *testing.T) {
+	shell, err := LinuxProbeShell(LinuxProbeModelLLVM)
+	if err != nil {
+		t.Fatalf("LinuxProbeShell() failed: %v", err)
+	}
+	for _, command := range []string{
+		"llvm-nm --help | head -n 1 | grep -qi llvm",
+		"llvm-ar --help | head -n 1 | grep -qi llvm",
+	} {
+		out, err := shell(context.Background(), "{ "+command+"; } >/dev/null 2>&1 && echo \"y\" || echo \"n\"")
+		if err != nil {
+			t.Fatalf("shell(%q) failed: %v", command, err)
+		}
+		if got := strings.TrimSpace(out); got != "y" {
+			t.Fatalf("shell(%q) = %q, want y", command, got)
+		}
+	}
+}
+
 func TestLinuxLLVMProbeShellSupportsCCOptionInt128Probe(t *testing.T) {
 	rootDir := t.TempDir()
 	scriptsDir := filepath.Join(rootDir, "scripts")
