@@ -643,14 +643,14 @@ def _linux_generated_header_cflags(generated_headers):
         return ["@" + generated_headers.cflags.path]
     return []
 
-def _linux_filtered_config_flags_for_source(ctx, config, src, remove_flags):
+def _linux_filtered_config_flags_for_source(ctx, config, src, remove_flags, out_suffix = "filtered"):
     if not config:
         return struct(flags = [], inputs = [])
     base = config.aflags if _is_assembly_source(src) else config.cflags
     if not remove_flags:
         return struct(flags = ["@" + base.path], inputs = [])
 
-    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + base.basename + ".filtered.rsp")
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + base.basename + "." + out_suffix + ".rsp")
     args = ctx.actions.args()
     args.add("-in", base)
     args.add("-out", out)
@@ -664,6 +664,19 @@ def _linux_filtered_config_flags_for_source(ctx, config, src, remove_flags):
         progress_message = "Filtering Linux compiler flags %{label}",
     )
     return struct(flags = ["@" + out.path], inputs = [out])
+
+def _linux_non_lto_config_flags_for_source(ctx, config, src, out_suffix = "nolto"):
+    if not config:
+        return struct(flags = [], inputs = [])
+    if config.config_flags.get("CONFIG_LTO_CLANG_THIN") != "y" and config.config_flags.get("CONFIG_LTO_CLANG_FULL") != "y":
+        return struct(flags = _linux_config_flags_for_source(config, src), inputs = [])
+    return _linux_filtered_config_flags_for_source(
+        ctx,
+        config,
+        src,
+        ["-flto=thin", "-flto", "-fsplit-lto-unit", "-fvisibility=hidden"],
+        out_suffix = out_suffix,
+    )
 
 def _flags_need_obj_dir(flags):
     for flag in flags:
@@ -1540,10 +1553,13 @@ def _linux_offsets_header(ctx, cc_toolchain, feature_configuration, config, sour
     )
     asm = ctx.actions.declare_file(out_path + ".s")
     out = ctx.actions.declare_file(out_path)
-
     compile_args = ctx.actions.args()
     compile_args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
-    compile_args.add_all(_linux_config_cflags(config))
+    # These preparatory -S compiles are consumed by the offsets parser, so they
+    # must emit real assembly even when the kernel itself is built with Clang
+    # LTO. LLVM bitcode output from -flto is not parseable as offsets assembly.
+    config_flags = _linux_non_lto_config_flags_for_source(ctx, config, src, out_suffix = "offsets.nolto")
+    compile_args.add_all(config_flags.flags)
     compile_args.add_all(_linux_source_preinclude_flags_for_root(source_root))
     compile_args.add("-I" + config.include_dir)
     compile_args.add_all(_linux_source_include_flags_for_root(source_root, srcarch, include_dirs))
@@ -1555,7 +1571,7 @@ def _linux_offsets_header(ctx, cc_toolchain, feature_configuration, config, sour
     compile_args.add("-o")
     compile_args.add(asm)
 
-    direct_inputs = _linux_source_tree_inputs(ctx, direct = [src] + generated_inputs)
+    direct_inputs = _linux_source_tree_inputs(ctx, direct = [src] + generated_inputs + config_flags.inputs)
     ctx.actions.run(
         executable = compiler,
         inputs = depset(direct_inputs, transitive = [cc_toolchain.all_files, config.files]),
@@ -1588,7 +1604,16 @@ def _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, 
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
-    args.add_all(_linux_config_flags_for_source(config, src))
+    # vDSO objects are built as a separate miniature image, not as part of the
+    # final vmlinux LTO unit. Keep their compile path non-LTO even when the
+    # kernel proper uses Clang LTO.
+    config_flags = _linux_non_lto_config_flags_for_source(
+        ctx,
+        config,
+        src,
+        out_suffix = out.basename + ".nolto",
+    )
+    args.add_all(config_flags.flags)
     args.add_all([
         "-fno-common",
         "-fno-builtin",
@@ -1624,7 +1649,7 @@ def _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, 
     ctx.actions.run(
         executable = compiler,
         inputs = depset(
-            _linux_source_tree_inputs(ctx, direct = [src] + generated_inputs),
+            _linux_source_tree_inputs(ctx, direct = [src] + generated_inputs + config_flags.inputs),
             transitive = [cc_toolchain.all_files, config.files],
         ),
         outputs = [out],
@@ -2196,6 +2221,11 @@ linux_x86_generated_headers = rule(
             default = Label("//internal/cmd/offsetsheader"),
             executable = True,
         ),
+        "_flagfilter": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/flagfilter"),
+            executable = True,
+        ),
         "_orchash": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/orchash"),
@@ -2554,6 +2584,11 @@ linux_arm64_generated_headers = rule(
             default = Label("//internal/cmd/offsetsheader"),
             executable = True,
         ),
+        "_flagfilter": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/flagfilter"),
+            executable = True,
+        ),
         "_syscallhdr": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/syscallhdr"),
@@ -2670,6 +2705,8 @@ def _configure_linux_probe_env(allow_shell, env):
     env.setdefault("CC", "clang")
     env.setdefault("CC_VERSION_TEXT", "clang version 22.1.4None")
     env.setdefault("LD", "ld.lld")
+    env.setdefault("NM", "llvm-nm")
+    env.setdefault("AR", "llvm-ar")
     env.setdefault("CLANG_FLAGS", "-fintegrated-as")
     env.setdefault("RUSTC", "rustc")
     env.setdefault("PAHOLE", "pahole")
@@ -3063,9 +3100,9 @@ def _linux_real_object_impl(ctx):
     )
     expanded_remove_flags = _rewrite_source_root_flags(_expand_flag_refs(ctx.attr.remove_flags, config_values, make_values, ctx.attr.object), source_root)
     if ctx.attr.arch == "arm64" and ctx.attr.object.startswith("arch/arm64/kernel/pi/") and ctx.attr.object.endswith(".pi.o"):
-        expanded_remove_flags = expanded_remove_flags + _linux_ftrace_remove_flags()
+        expanded_remove_flags = expanded_remove_flags + _linux_ftrace_remove_flags() + ["-flto=thin", "-flto", "-fsplit-lto-unit", "-fvisibility=hidden"]
     if ctx.attr.arch == "x86" and ctx.attr.object.startswith("arch/x86/boot/startup/") and ctx.attr.object.endswith(".pi.o"):
-        expanded_remove_flags = expanded_remove_flags + _linux_ftrace_remove_flags()
+        expanded_remove_flags = expanded_remove_flags + _linux_ftrace_remove_flags() + ["-flto=thin", "-flto", "-fsplit-lto-unit", "-fvisibility=hidden"]
     config_flag_inputs = _linux_filtered_config_flags_for_source(ctx, config, src, expanded_remove_flags)
 
     args = ctx.actions.args()
@@ -4136,6 +4173,8 @@ def _linux_arm64_vmlinux_ld_flags(config):
         "--build-id=sha1",
         "--orphan-handling=warn",
     ]
+    if config.config_flags.get("CONFIG_LD_DEAD_CODE_DATA_ELIMINATION") == "y":
+        flags.append("--gc-sections")
     if config.config_flags.get("CONFIG_ARCH_VMLINUX_NEEDS_RELOCS") == "y":
         flags.extend([
             "--emit-relocs",
@@ -4166,6 +4205,18 @@ def _linux_vmlinux_link_flags(ctx, config):
             "-Wl,--build-id=sha1",
             "-Wl,--orphan-handling=warn",
         ]
+        if config.config_flags.get("CONFIG_LD_DEAD_CODE_DATA_ELIMINATION") == "y":
+            flags.append("-Wl,--gc-sections")
+        if config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y":
+            flags.extend([
+                "-flto=thin",
+                "-Wl,-mllvm,-import-instr-limit=5",
+            ])
+        elif config.config_flags.get("CONFIG_LTO_CLANG_FULL") == "y":
+            flags.extend([
+                "-flto",
+                "-Wl,-mllvm,-import-instr-limit=5",
+            ])
         if config.config_flags.get("CONFIG_ARCH_VMLINUX_NEEDS_RELOCS") == "y":
             flags.extend([
                 "-Wl,--emit-relocs",
@@ -4191,6 +4242,18 @@ def _linux_vmlinux_link_flags(ctx, config):
         "-Wl,--build-id=sha1",
         "-Wl,--orphan-handling=warn",
     ]
+    if config.config_flags.get("CONFIG_LD_DEAD_CODE_DATA_ELIMINATION") == "y":
+        flags.append("-Wl,--gc-sections")
+    if config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y":
+        flags.extend([
+            "-flto=thin",
+            "-Wl,-mllvm,-import-instr-limit=5",
+        ])
+    elif config.config_flags.get("CONFIG_LTO_CLANG_FULL") == "y":
+        flags.extend([
+            "-flto",
+            "-Wl,-mllvm,-import-instr-limit=5",
+        ])
     if config.config_flags.get("CONFIG_ARCH_VMLINUX_NEEDS_RELOCS") == "y":
         flags.extend([
             "-Wl,--emit-relocs",
@@ -4198,26 +4261,104 @@ def _linux_vmlinux_link_flags(ctx, config):
         ])
     return flags
 
-def _linux_vmlinux_relocatable_object(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs):
+def _linux_vmlinux_initcalls_linker_script(ctx, config, source_root, image_object):
+    if config.config_flags.get("CONFIG_LTO_CLANG_THIN") != "y" and config.config_flags.get("CONFIG_LTO_CLANG_FULL") != "y":
+        return None
+
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_initcalls.lds")
+    ctx.actions.write(out, """SECTIONS {
+  .initcallearly.init : { *(.initcallearly.init..*) }
+  .initcall0.init : { *(.initcall0.init..*) }
+  .initcall0s.init : { *(.initcall0s.init..*) }
+  .initcall1.init : { *(.initcall1.init..*) }
+  .initcall1s.init : { *(.initcall1s.init..*) }
+  .initcall2.init : { *(.initcall2.init..*) }
+  .initcall2s.init : { *(.initcall2s.init..*) }
+  .initcall3.init : { *(.initcall3.init..*) }
+  .initcall3s.init : { *(.initcall3s.init..*) }
+  .initcall4.init : { *(.initcall4.init..*) }
+  .initcall4s.init : { *(.initcall4s.init..*) }
+  .initcall5.init : { *(.initcall5.init..*) }
+  .initcall5s.init : { *(.initcall5s.init..*) }
+  .initcallrootfs.init : { *(.initcallrootfs.init..*) }
+  .initcall6.init : { *(.initcall6.init..*) }
+  .initcall6s.init : { *(.initcall6s.init..*) }
+  .initcall7.init : { *(.initcall7.init..*) }
+  .initcall7s.init : { *(.initcall7s.init..*) }
+  .con_initcall.init : { *(.con_initcall.init..*) }
+}
+""")
+    return out
+
+def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature_configuration, source_root, image_object, image_object_inputs):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/vmlinux.o")
+    initcalls_linker_script = _linux_vmlinux_initcalls_linker_script(ctx, config, source_root, image_object)
     args = ctx.actions.args()
-    args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
-    args.add_all([
-        "-fuse-ld=lld",
-        "-nostdlib",
-        "-no-pie",
-        "-Wl,-r",
-        "-Wl,-m,elf_x86_64",
-        "-o",
-        out,
-        "-Wl,--whole-archive",
-    ])
-    args.add(image_object)
-    args.add("-Wl,--no-whole-archive")
+    if ctx.attr.format == "arm64":
+        executable = _linux_x86_tool_sibling(linker, "ld.lld")
+        flags = [
+            "-EL",
+            "-maarch64elf",
+            "-z",
+            "norelro",
+            "-z",
+            "noexecstack",
+            "-r",
+        ]
+        if config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y":
+            flags.extend([
+                "-mllvm",
+                "-import-instr-limit=5",
+            ])
+        elif config.config_flags.get("CONFIG_LTO_CLANG_FULL") == "y":
+            flags.extend([
+                "-mllvm",
+                "-import-instr-limit=5",
+            ])
+        flags.extend([
+            "-o",
+            out,
+        ])
+        if initcalls_linker_script:
+            flags.extend(["-T", initcalls_linker_script.path])
+        flags.append("--whole-archive")
+        args.add_all(flags)
+        args.add(image_object)
+        args.add("--no-whole-archive")
+    else:
+        executable = linker
+        args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
+        flags = [
+            "-fuse-ld=lld",
+            "-nostdlib",
+            "-no-pie",
+            "-Wl,-r",
+            "-Wl,-m,elf_x86_64",
+        ]
+        if config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y":
+            flags.extend([
+                "-flto=thin",
+                "-Wl,-mllvm,-import-instr-limit=5",
+            ])
+        elif config.config_flags.get("CONFIG_LTO_CLANG_FULL") == "y":
+            flags.extend([
+                "-flto",
+                "-Wl,-mllvm,-import-instr-limit=5",
+            ])
+        flags.extend([
+            "-o",
+            out,
+        ])
+        if initcalls_linker_script:
+            flags.append("-Wl,-T," + initcalls_linker_script.path)
+        flags.append("-Wl,--whole-archive")
+        args.add_all(flags)
+        args.add(image_object)
+        args.add("-Wl,--no-whole-archive")
 
     ctx.actions.run(
-        executable = linker,
-        inputs = depset([image_object], transitive = [image_object_inputs, cc_toolchain.all_files]),
+        executable = executable,
+        inputs = depset(([image_object] + ([initcalls_linker_script] if initcalls_linker_script else [])), transitive = [image_object_inputs, cc_toolchain.all_files]),
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxVmlinuxRelocatable",
@@ -4225,11 +4366,17 @@ def _linux_vmlinux_relocatable_object(ctx, linker, cc_toolchain, feature_configu
     )
     return out
 
-def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs):
+def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, source_root, image_object, image_object_inputs):
+    needs_relocatable = (
+        config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y" or
+        config.config_flags.get("CONFIG_LTO_CLANG_FULL") == "y" or
+        ctx.executable.objtool
+    )
+    if needs_relocatable:
+        image_object = _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature_configuration, source_root, image_object, image_object_inputs)
     if not ctx.executable.objtool:
         return image_object
 
-    image_object = _linux_vmlinux_relocatable_object(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs)
     out = ctx.actions.declare_file(ctx.label.name + ".obj/vmlinux.o.objtool")
     args = ctx.actions.args()
     args.add("-config", config.config)
@@ -4286,7 +4433,7 @@ def _linux_real_vmlinux_impl(ctx):
         ["-fno-function-sections", "-fno-data-sections", "-include", "generated/utsversion.h"],
     )
     image_object_inputs = depset([info.output for info in image.objects])
-    image_object = _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, image.output, image_object_inputs)
+    image_object = _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, source_root, image.output, image_object_inputs)
 
     kallsyms_object = None
     if ctx.attr.kallsyms == "auto":
