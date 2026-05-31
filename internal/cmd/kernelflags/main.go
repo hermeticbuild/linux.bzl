@@ -55,8 +55,6 @@ func linuxCFlags(config map[string]string, arch string) []string {
 		"-funsigned-char",
 		"-fno-common",
 		"-fno-PIE",
-		"-fno-function-sections",
-		"-fno-data-sections",
 		"-fno-strict-aliasing",
 		"-fno-delete-null-pointer-checks",
 		"-Wno-address-of-packed-member",
@@ -75,6 +73,16 @@ func linuxCFlags(config map[string]string, arch string) []string {
 			"-Wno-gnu-variable-sized-type-not-at-end",
 			"-Wno-initializer-overrides",
 		)
+		if enabled(config, "CONFIG_LTO_CLANG_THIN") {
+			flags = append(flags, "-fno-lto", "-flto=thin", "-fsplit-lto-unit", "-fvisibility=hidden")
+		} else if enabled(config, "CONFIG_LTO_CLANG_FULL") {
+			flags = append(flags, "-fno-lto", "-flto", "-fvisibility=hidden")
+		}
+	}
+	if enabled(config, "CONFIG_LD_DEAD_CODE_DATA_ELIMINATION") {
+		flags = append(flags, "-ffunction-sections", "-fdata-sections")
+	} else {
+		flags = append(flags, "-fno-function-sections", "-fno-data-sections")
 	}
 	if enabled(config, "CONFIG_CC_OPTIMIZE_FOR_SIZE") {
 		flags = append(flags, "-Os")
