@@ -1,5 +1,6 @@
 """Macros for source-tree-specific x86 Linux host tools."""
 
+load("@bazel_lib//lib:run_binary.bzl", "run_binary")
 load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load(":common_host_tools.bzl", "linux_common_host_tools")
@@ -242,12 +243,17 @@ def linux_x86_host_tools(
     )
 
     genrule_inat_out = target_prefix + "_x86_objtool_inat/arch/x86/lib/inat-tables.c"
-    native.genrule(
+    run_binary(
         name = objtool_inat_tables,
         srcs = [source_label(source_repo, "arch/x86/lib/x86-opcode-map.txt")],
         outs = [genrule_inat_out],
-        cmd = "$(location @linux.bzl//tools:insnattr) -in $(location %s) -out $@" % source_label(source_repo, "arch/x86/lib/x86-opcode-map.txt"),
-        tools = ["@linux.bzl//tools:insnattr"],
+        args = [
+            "-in",
+            "$(location %s)" % source_label(source_repo, "arch/x86/lib/x86-opcode-map.txt"),
+            "-out",
+            "$(location %s)" % genrule_inat_out,
+        ],
+        tool = "@linux.bzl//tools:insnattr",
         visibility = visibility,
     )
 
