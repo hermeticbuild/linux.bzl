@@ -35,6 +35,27 @@ copy_out //internal/cmd/kconfig/prebuilts:kconfig-linux-arm64
 copy_out //internal/cmd/kconfig/prebuilts:kconfig-windows-amd64
 copy_out //internal/cmd/kconfig/prebuilts:kconfig-windows-arm64
 
+check_archive() {
+  local archive="$1"
+  shift
+  local listing
+
+  listing="$(tar -tzf "dist/${archive}")"
+  for tool in "$@"; do
+    if ! grep -Fxq "${tool}" <<<"${listing}"; then
+      echo "dist/${archive} does not contain ${tool}" >&2
+      exit 1
+    fi
+  done
+}
+
+check_archive kconfig-darwin-amd64.tar.gz kconfig kconfig_parse
+check_archive kconfig-darwin-arm64.tar.gz kconfig kconfig_parse
+check_archive kconfig-linux-amd64.tar.gz kconfig kconfig_parse
+check_archive kconfig-linux-arm64.tar.gz kconfig kconfig_parse
+check_archive kconfig-windows-amd64.tar.gz kconfig.exe kconfig_parse.exe
+check_archive kconfig-windows-arm64.tar.gz kconfig.exe kconfig_parse.exe
+
 (
   cd dist
   shasum -a 256 *.tar.gz > SHA256SUMS
@@ -42,6 +63,7 @@ copy_out //internal/cmd/kconfig/prebuilts:kconfig-windows-arm64
     integrity="sha256-$(openssl dgst -sha256 -binary "${archive}" | openssl base64 -A)"
     {
       echo "${archive}"
+      echo "sha256=$(awk -v archive="${archive}" '$2 == archive {print $1}' SHA256SUMS)"
       echo "integrity=${integrity}"
     }
   done > kconfig_tool_releases.metadata
