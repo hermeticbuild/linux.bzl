@@ -1,5 +1,6 @@
 """Macros for source-tree-specific x86 Linux host tools."""
 
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load(":common_host_tools.bzl", "linux_common_host_tools")
 load(":linux_objects.bzl", "linux_x86_generated_headers")
@@ -281,15 +282,14 @@ def linux_x86_host_tools(
         ],
     )
 
-    native.genrule(
-        name = relocs_sources,
-        srcs = [source_label(source_repo, "arch/x86/tools/relocs.c")],
-        outs = [
-            target_prefix + "_x86_relocs_32.c",
-            target_prefix + "_x86_relocs_64.c",
-        ],
-        cmd = "\n".join([
-            "cat > $(location %s_x86_relocs_32.c) <<'EOF'" % target_prefix,
+    relocs_32_source = target_prefix + "_x86_relocs_32_source"
+    relocs_64_source = target_prefix + "_x86_relocs_64_source"
+    relocs_inputs = target_prefix + "_x86_relocs_inputs"
+
+    write_file(
+        name = relocs_32_source,
+        out = target_prefix + "_x86_relocs_32.c",
+        content = [
             "#include \"relocs.h\"",
             "#define ELF_BITS 32",
             "#define ELF_MACHINE EM_386",
@@ -347,9 +347,15 @@ def linux_x86_host_tools(
             "#ifndef R_386_PC8",
             "#define R_386_PC8 23",
             "#endif",
-            "EOF",
-            "cat $(location %s) >> $(location %s_x86_relocs_32.c)" % (source_label(source_repo, "arch/x86/tools/relocs.c"), target_prefix),
-            "cat > $(location %s_x86_relocs_64.c) <<'EOF'" % target_prefix,
+            "#include \"relocs.c\"",
+        ],
+        visibility = visibility,
+    )
+
+    write_file(
+        name = relocs_64_source,
+        out = target_prefix + "_x86_relocs_64.c",
+        content = [
             "#include \"relocs.h\"",
             "#define ELF_BITS 64",
             "#define ELF_MACHINE EM_X86_64",
@@ -413,10 +419,25 @@ def linux_x86_host_tools(
             "#ifndef R_X86_64_PC64",
             "#define R_X86_64_PC64 24",
             "#endif",
-            "EOF",
-            "cat $(location %s) >> $(location %s_x86_relocs_64.c)" % (source_label(source_repo, "arch/x86/tools/relocs.c"), target_prefix),
-        ]),
+            "#include \"relocs.c\"",
+        ],
         visibility = visibility,
+    )
+
+    native.filegroup(
+        name = relocs_sources,
+        srcs = [
+            ":" + relocs_32_source,
+            ":" + relocs_64_source,
+        ],
+        visibility = visibility,
+    )
+
+    cc_library(
+        name = relocs_inputs,
+        textual_hdrs = [source_label(source_repo, "arch/x86/tools/relocs.c")],
+        visibility = ["//visibility:private"],
+        deps = [source_label(source_repo, "tools_headers_cc")],
     )
 
     cc_binary(
@@ -427,6 +448,7 @@ def linux_x86_host_tools(
         ],
         visibility = visibility,
         deps = [
+            ":" + relocs_inputs,
             Label("@libelf//:elf_headers"),
             source_label(source_repo, "tools_headers_cc"),
         ],
