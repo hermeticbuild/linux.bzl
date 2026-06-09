@@ -2750,7 +2750,7 @@ def _linux_resolved_config_impl(ctx):
 
     fragment = ctx.attr.config[KconfigInfo].config
     args = ctx.actions.args()
-    args.add("-root", ctx.file.root)
+    args.add("-root", _linux_execroot_path(ctx.file.root))
     args.add("-srctree", source_root)
     extra_kconfig_inputs = []
     for target, prefix in ctx.attr.extra_kconfigs.items():
