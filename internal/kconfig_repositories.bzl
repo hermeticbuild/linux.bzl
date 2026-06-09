@@ -3,14 +3,31 @@
 load("@bazel_lib//lib:repo_utils.bzl", "repo_utils")
 load("//internal:kconfig_tool_releases.bzl", "KCONFIG_TOOL_RELEASES", "KCONFIG_TOOL_VERSION")
 
-_KCONFIG_TOOL_BUILD = """\
-package(default_visibility = ["//visibility:public"])
-
-exports_files({tools})
-"""
+def kconfig_tool_filename(platform, tool):
+    if platform.startswith("windows_"):
+        return tool + ".exe"
+    return tool
 
 def _host_platform(rctx):
     return repo_utils.platform(rctx)
+
+def _kconfig_tool_build(platform, tools):
+    filenames = [kconfig_tool_filename(platform, tool) for tool in tools]
+    lines = [
+        'package(default_visibility = ["//visibility:public"])',
+        "",
+        "exports_files({})".format(repr(filenames)),
+    ]
+    for tool, filename in zip(tools, filenames):
+        if tool != filename:
+            lines.extend([
+                "",
+                "alias(",
+                '    name = "{}",'.format(tool),
+                '    actual = "{}",'.format(filename),
+                ")",
+            ])
+    return "\n".join(lines) + "\n"
 
 def _kconfig_tool_repository_impl(rctx):
     platform = _host_platform(rctx)
@@ -31,16 +48,17 @@ def _kconfig_tool_repository_impl(rctx):
     rctx.download_and_extract(**download_kwargs)
 
     for tool in rctx.attr.tools:
-        if not rctx.path(tool).exists:
+        filename = kconfig_tool_filename(platform, tool)
+        if not rctx.path(filename).exists:
             fail("kconfig prebuilt archive for %s did not contain required tool %s; publish a new %s archive with all required repo-rule tools" % (
                 platform,
-                tool,
+                filename,
                 KCONFIG_TOOL_VERSION,
             ))
 
     rctx.file(
         "BUILD.bazel",
-        _KCONFIG_TOOL_BUILD.format(tools = repr(rctx.attr.tools)),
+        _kconfig_tool_build(platform, rctx.attr.tools),
     )
     return rctx.repo_metadata(reproducible = True)
 
