@@ -3962,25 +3962,19 @@ def _linux_sorttable(ctx, config, input):
     if ctx.executable.sorttable_tool:
         inputs.append(ctx.executable.sorttable_tool)
         sorttable_path = ctx.executable.sorttable_tool.path
-    ctx.actions.run_shell(
+    args = ctx.actions.args()
+    args.add("-config", config.config)
+    args.add("-nm", ctx.executable._llvm_nm)
+    if sorttable_path:
+        args.add("-sorttable", sorttable_path)
+    args.add("-in", input)
+    args.add("-nm_out", nm_out)
+    args.add("-out", out)
+    ctx.actions.run(
+        executable = ctx.executable._sorttablerun,
         inputs = inputs,
         outputs = [out, nm_out],
-        command = """\
-if grep -qx 'CONFIG_BUILDTIME_TABLE_SORT=y' "$2"; then
-  if [ -z "$4" ]; then
-    echo "CONFIG_BUILDTIME_TABLE_SORT=y requires sorttable_tool" >&2
-    exit 1
-  fi
-  "$3" -S "$1" > "$5"
-  cp "$1" "$6"
-  chmod u+w "$6"
-  "$4" -s "$5" "$6"
-else
-  : > "$5"
-  cp "$1" "$6"
-fi
-""",
-        arguments = [input.path, config.config.path, ctx.executable._llvm_nm.path, sorttable_path, nm_out.path, out.path],
+        arguments = [args],
         mnemonic = "LinuxVmlinuxSortTable",
         progress_message = "Sorting Linux kernel tables %{label}",
     )
@@ -4594,6 +4588,11 @@ linux_vmlinux = rule(
         "_objtoolrun": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/objtoolrun"),
+            executable = True,
+        ),
+        "_sorttablerun": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/sorttablerun"),
             executable = True,
         ),
     },
