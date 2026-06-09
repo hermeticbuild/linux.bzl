@@ -13,6 +13,9 @@ def _run_compact_generator(rctx):
     output_build = rctx.path("BUILD.bazel")
     output_metadata = rctx.path("metadata.json")
     env = dict(rctx.attr.env)
+    vars = dict(rctx.attr.vars)
+    if "srctree" not in vars:
+        vars["srctree"] = str(source_root).replace("\\", "/")
     _configure_probe_env(rctx.attr.allow_shell, env)
 
     args = [
@@ -66,7 +69,7 @@ def _run_compact_generator(rctx):
         args.extend(["-kbuild_extra", "%s=%s" % (prefix, path)])
     for prefix, label_package in sorted(rctx.attr.extra_source_label_packages.items()):
         args.extend(["-source_label_map", "%s=%s" % (prefix, label_package)])
-    for key, value in sorted(rctx.attr.vars.items()):
+    for key, value in sorted(vars.items()):
         args.extend(["-var", "%s=%s" % (key, value)])
     for key, value in sorted(env.items()):
         args.extend(["-env", "%s=%s" % (key, value)])
