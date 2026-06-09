@@ -3931,11 +3931,15 @@ def _linux_vmlinux_export_object(ctx, compiler, cc_toolchain, feature_configurat
 
 def _linux_system_map(ctx, input, name):
     nm_out = ctx.actions.declare_file(ctx.label.name + ".obj/" + name + ".nm")
-    ctx.actions.run_shell(
+    nm_args = ctx.actions.args()
+    nm_args.add("-nm", ctx.executable._llvm_nm)
+    nm_args.add("-in", input)
+    nm_args.add("-out", nm_out)
+    ctx.actions.run(
+        executable = ctx.executable._nmrun,
         inputs = [input, ctx.executable._llvm_nm],
         outputs = [nm_out],
-        command = "\"$1\" -n \"$2\" > \"$3\"",
-        arguments = [ctx.executable._llvm_nm.path, input.path, nm_out.path],
+        arguments = [nm_args],
         mnemonic = "LinuxVmlinuxNM",
         progress_message = "Generating Linux vmlinux nm output %{label}",
     )
@@ -4598,6 +4602,11 @@ linux_vmlinux = rule(
         "_mksysmap": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/mksysmap"),
+            executable = True,
+        ),
+        "_nmrun": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/nmrun"),
             executable = True,
         ),
         "_objtoolrun": attr.label(
