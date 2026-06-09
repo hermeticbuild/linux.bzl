@@ -2755,8 +2755,8 @@ def _linux_resolved_config_impl(ctx):
     extra_kconfig_inputs = []
     for target, prefix in ctx.attr.extra_kconfigs.items():
         file = _single_file(target, "extra_kconfigs")
-        args.add("-source_root_map", "%s=%s" % (prefix, file.dirname))
-        args.add("-kconfig_extra", "%s=%s" % (prefix, file.path))
+        args.add("-source_root_map", "%s=%s" % (prefix, _linux_execroot_dir(file)))
+        args.add("-kconfig_extra", "%s=%s" % (prefix, _linux_execroot_path(file)))
         extra_kconfig_inputs.append(file)
     if ctx.attr.config_mode:
         args.add("-config_mode", ctx.attr.config_mode)
@@ -2964,7 +2964,7 @@ def _linux_real_object_impl(ctx):
     src = ctx.file.src
     source_root_file = _linux_source_root_file(ctx)
     make_values = {
-        "src": ctx.file.src.dirname,
+        "src": _linux_execroot_dir(ctx.file.src),
     }
     if _is_shipped_c_source(ctx.file.src):
         src = ctx.actions.declare_file(ctx.label.name + ".obj/" + ctx.attr.object[:-len(".o")] + ".c")
