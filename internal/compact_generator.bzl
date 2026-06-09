@@ -22,6 +22,16 @@ LinuxCompactInfo = provider(
     },
 )
 
+def _execroot_path(file):
+    path = file.short_path.replace("\\", "/")
+    if path.startswith("../"):
+        return "external/" + path[3:]
+    return path
+
+def _execroot_dir(file):
+    path = _execroot_path(file)
+    return path.rsplit("/", 1)[0] if "/" in path else ""
+
 def _linux_probe_config_impl(ctx):
     return [LinuxProbeInfo(
         allow_shell = ctx.attr.allow_shell,
@@ -85,7 +95,7 @@ def _linux_compact_outputs_impl(ctx):
     env = dict(ctx.attr.env)
     vars = dict(ctx.attr.vars)
     if "srctree" not in vars:
-        vars["srctree"] = ctx.file.root.dirname
+        vars["srctree"] = _execroot_dir(ctx.file.root)
 
     probe = _probe_settings(ctx, env)
     _add_probe_args(args, probe.allow_shell, probe.model, probe.values)
