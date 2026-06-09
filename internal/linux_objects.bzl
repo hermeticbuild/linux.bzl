@@ -4005,13 +4005,28 @@ def _linux_strip_vmlinux(ctx, config, input, out):
             "--remove-section=.rel.*",
         ])
 
-    set_flags_shell = " ".join([_shell_quote(flag) for flag in set_flags])
-    remove_flags_shell = " ".join([_shell_quote(flag) for flag in remove_flags])
-    ctx.actions.run_shell(
+    prepared = ctx.actions.declare_file(ctx.label.name + ".obj/vmlinux.strip-prepared")
+    prepare_args = ctx.actions.args()
+    prepare_args.add_all(set_flags)
+    prepare_args.add(input)
+    prepare_args.add(prepared)
+    ctx.actions.run(
+        executable = ctx.executable._llvm_objcopy,
         inputs = [input, ctx.executable._llvm_objcopy],
+        outputs = [prepared],
+        arguments = [prepare_args],
+        mnemonic = "LinuxVmlinuxPrepareStrip",
+        progress_message = "Preparing Linux vmlinux for stripping %{label}",
+    )
+    strip_args = ctx.actions.args()
+    strip_args.add_all(remove_flags)
+    strip_args.add(prepared)
+    strip_args.add(out)
+    ctx.actions.run(
+        executable = ctx.executable._llvm_objcopy,
+        inputs = [prepared, ctx.executable._llvm_objcopy],
         outputs = [out],
-        command = "\"$1\" %s \"$2\" \"$3\" && \"$1\" %s \"$3\"" % (set_flags_shell, remove_flags_shell),
-        arguments = [ctx.executable._llvm_objcopy.path, input.path, out.path],
+        arguments = [strip_args],
         mnemonic = "LinuxVmlinuxStrip",
         progress_message = "Stripping Linux vmlinux %{label}",
     )
