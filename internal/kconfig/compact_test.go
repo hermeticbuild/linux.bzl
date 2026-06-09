@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -800,6 +801,16 @@ func TestCompactMetadataJSONMatchesPrettierArrayLayout(t *testing.T) {
 	}
 	if !strings.Contains(text, "      \"object_targets\": [\n        \"first_extremely_long_object_target_name_for_layout_testing\",") {
 		t.Fatalf("JSON() compacted long string array:\n%s", text)
+	}
+}
+
+func TestNormalizeSourceRootFlagsWindowsPaths(t *testing.T) {
+	got := normalizeSourceRootFlags([]string{
+		`-includeC:\users\runneradmin\execroot\external\linux\include\linux\hidden.h`,
+	}, `C:\users\runneradmin\execroot\external\linux`)
+	want := []string{`-include$(srctree)/include/linux/hidden.h`}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeSourceRootFlags() = %#v, want %#v", got, want)
 	}
 }
 

@@ -855,7 +855,7 @@ func normalizeSourceRootFlags(flags []string, sourceRoot string) []string {
 	if sourceRoot == "" {
 		return flags
 	}
-	sourceRoot = filepath.ToSlash(filepath.Clean(sourceRoot))
+	sourceRoot = normalizeCompactPath(sourceRoot)
 	if sourceRoot == "." || sourceRoot == "/" {
 		return flags
 	}
@@ -875,6 +875,7 @@ func normalizeSourceRootFlags(flags []string, sourceRoot string) []string {
 }
 
 func normalizeSourceRootFlag(flag, sourceRoot string) string {
+	flag = normalizeCompactPath(flag)
 	if flag == sourceRoot {
 		return "$(srctree)"
 	}
@@ -894,6 +895,10 @@ func normalizeSourceRootFlag(flag, sourceRoot string) string {
 		}
 	}
 	return flag
+}
+
+func normalizeCompactPath(path string) string {
+	return filepath.ToSlash(filepath.Clean(strings.ReplaceAll(path, `\`, "/")))
 }
 
 func filterResolvedKbuildFlags(groups []resolvedKbuildFlag, source string) []string {
