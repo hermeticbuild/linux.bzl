@@ -708,6 +708,22 @@ def _linux_source_root_file(ctx):
         return ctx.file.source_root
     fail("%s requires source_tree_info for source-backed Linux actions" % ctx.label)
 
+def _linux_execroot_path(file):
+    path = file.short_path.replace("\\", "/")
+    if path.startswith("../"):
+        return "external/" + path[3:]
+    return path
+
+def _linux_execroot_dir(file):
+    path = _linux_execroot_path(file)
+    return path.rsplit("/", 1)[0] if "/" in path else ""
+
+def _linux_source_root_path(ctx):
+    root = _linux_source_root_file(ctx)
+    if not root:
+        return ""
+    return _linux_execroot_dir(root)
+
 def _linux_source_tree_files(ctx):
     files = []
     info = _linux_source_tree_info(ctx)
@@ -1970,7 +1986,7 @@ def _linux_x86_generated_headers_impl(ctx):
     cc_toolchain = find_cpp_toolchain(ctx)
     feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
     config = ctx.attr.config[LinuxConfigInfo]
-    source_root = ctx.file.source_root.dirname
+    source_root = _linux_source_root_path(ctx)
     headers = []
     for header in _X86_ASM_GENERIC_WRAPPERS:
         out = ctx.actions.declare_file(base + "/arch/x86/include/generated/asm/" + header)
@@ -2320,7 +2336,7 @@ def _linux_arm64_generated_headers_impl(ctx):
     cc_toolchain = find_cpp_toolchain(ctx)
     feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
     config = ctx.attr.config[LinuxConfigInfo]
-    source_root = ctx.file.source_root.dirname
+    source_root = _linux_source_root_path(ctx)
     headers = []
 
     for header in _ARM64_ASM_GENERIC_WRAPPERS:
@@ -2726,7 +2742,7 @@ def _linux_resolved_config_impl(ctx):
     aflags = ctx.actions.declare_file(config_dir + "/include/generated/bazel_kbuild_aflags.rsp")
     cflags = ctx.actions.declare_file(config_dir + "/include/generated/bazel_kbuild_cflags.rsp")
 
-    source_root = ctx.file.source_root.dirname if ctx.file.source_root else ctx.file.root.dirname
+    source_root = _linux_source_root_path(ctx) if ctx.file.source_root else _linux_execroot_dir(ctx.file.root)
     vars = dict(ctx.attr.vars)
     vars.setdefault("srctree", source_root)
     env = dict(ctx.attr.env)
@@ -3028,7 +3044,7 @@ def _linux_real_object_impl(ctx):
         make_values["obj"] = obj_marker.dirname
 
     generated_headers = ctx.attr.generated_headers[LinuxGeneratedHeadersInfo] if ctx.attr.generated_headers else None
-    source_root = source_root_file.dirname if source_root_file else ""
+    source_root = _linux_source_root_path(ctx)
     if source_root:
         make_values["srctree"] = source_root
     if _is_dtb_source(ctx.file.src):
@@ -3518,7 +3534,7 @@ def _linux_arm64_nvhe_object_impl(ctx):
     )
     config = ctx.attr.config[LinuxConfigInfo]
     generated_headers = ctx.attr.generated_headers[LinuxGeneratedHeadersInfo]
-    source_root = source_root_file.dirname
+    source_root = _linux_source_root_path(ctx)
     linker_script = _linux_arm64_nvhe_linker_script(
         ctx,
         compiler,
@@ -4416,7 +4432,7 @@ def _linux_real_vmlinux_impl(ctx):
         feature_configuration = feature_configuration,
         action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
     )
-    source_root = ctx.file.source_root.dirname
+    source_root = _linux_source_root_path(ctx)
     linker_script = _linux_vmlinux_linker_script(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root)
     export_object = _linux_vmlinux_export_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root)
     version_object = _linux_vmlinux_compile_source(
@@ -5247,7 +5263,7 @@ def _linux_real_x86_bzimage_impl(ctx):
         feature_configuration = feature_configuration,
         action_name = CPP_LINK_STATIC_LIBRARY_ACTION_NAME,
     )
-    source_root = ctx.file.source_root.dirname
+    source_root = _linux_source_root_path(ctx)
 
     voffset = _linux_x86_offsets(ctx, image.output, "voffset", "arch/x86/boot/voffset.h")
     compressed_vmlinux = _linux_x86_compressed_vmlinux(
