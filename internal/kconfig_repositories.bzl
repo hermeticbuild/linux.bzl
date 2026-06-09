@@ -1,57 +1,16 @@
 """Repository rules for generated Kconfig metadata."""
 
+load("@bazel_lib//lib:repo_utils.bzl", "repo_utils")
 load("//internal:kconfig_tool_releases.bzl", "KCONFIG_TOOL_RELEASES", "KCONFIG_TOOL_VERSION")
 
-_OS_NAMES = {
-    "linux": "linux",
-    "mac os x": "darwin",
-}
+_KCONFIG_TOOL_BUILD = """\
+package(default_visibility = ["//visibility:public"])
 
-_ARCH_NAMES = {
-    "aarch64": "arm64",
-    "amd64": "amd64",
-    "arm64": "arm64",
-    "x86_64": "amd64",
-}
-
-def kconfig_host_platform(os_name, arch_name):
-    if os_name.startswith("windows"):
-        normalized_os_name = "windows"
-    else:
-        normalized_os_name = _OS_NAMES.get(os_name)
-    normalized_arch_name = _ARCH_NAMES.get(arch_name)
-    if not normalized_os_name or not normalized_arch_name:
-        return None
-    return "{}_{}".format(normalized_os_name, normalized_arch_name)
-
-def kconfig_tool_filename(platform, tool):
-    if platform.startswith("windows_"):
-        return tool + ".exe"
-    return tool
+exports_files({tools})
+"""
 
 def _host_platform(rctx):
-    platform = kconfig_host_platform(rctx.os.name, rctx.os.arch)
-    if not platform:
-        fail("unsupported kconfig host platform: os=%r arch=%r" % (rctx.os.name, rctx.os.arch))
-    return platform
-
-def _kconfig_tool_build(platform, tools):
-    filenames = [kconfig_tool_filename(platform, tool) for tool in tools]
-    lines = [
-        'package(default_visibility = ["//visibility:public"])',
-        "",
-        "exports_files({})".format(repr(filenames)),
-    ]
-    for tool, filename in zip(tools, filenames):
-        if tool != filename:
-            lines.extend([
-                "",
-                "alias(",
-                '    name = "{}",'.format(tool),
-                '    actual = "{}",'.format(filename),
-                ")",
-            ])
-    return "\n".join(lines) + "\n"
+    return repo_utils.platform(rctx)
 
 def _kconfig_tool_repository_impl(rctx):
     platform = _host_platform(rctx)
@@ -72,17 +31,16 @@ def _kconfig_tool_repository_impl(rctx):
     rctx.download_and_extract(**download_kwargs)
 
     for tool in rctx.attr.tools:
-        filename = kconfig_tool_filename(platform, tool)
-        if not rctx.path(filename).exists:
+        if not rctx.path(tool).exists:
             fail("kconfig prebuilt archive for %s did not contain required tool %s; publish a new %s archive with all required repo-rule tools" % (
                 platform,
-                filename,
+                tool,
                 KCONFIG_TOOL_VERSION,
             ))
 
     rctx.file(
         "BUILD.bazel",
-        _kconfig_tool_build(platform, rctx.attr.tools),
+        _KCONFIG_TOOL_BUILD.format(tools = repr(rctx.attr.tools)),
     )
     return rctx.repo_metadata(reproducible = True)
 

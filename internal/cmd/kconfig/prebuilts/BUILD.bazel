@@ -21,11 +21,6 @@ _ARCHIVES = {
     "kconfig-windows-arm64": "windows_arm64",
 }
 
-_ARCHIVE_TOOL_SUFFIXES = {
-    "windows_amd64": ".exe",
-    "windows_arm64": ".exe",
-}
-
 [
     platform_transition_filegroup(
         name = "kconfig_for_" + platform,
@@ -76,14 +71,8 @@ filegroup(
         ],
         compress = "gzip",
         mtree = [
-            "{} uid=0 gid=0 mode=0755 time=0 type=file content=$(location :kconfig_for_{})".format(
-                "kconfig" + _ARCHIVE_TOOL_SUFFIXES.get(platform, ""),
-                platform,
-            ),
-            "{} uid=0 gid=0 mode=0755 time=0 type=file content=$(location :kconfig_parse_for_{})".format(
-                "kconfig_parse" + _ARCHIVE_TOOL_SUFFIXES.get(platform, ""),
-                platform,
-            ),
+            "kconfig uid=0 gid=0 mode=0755 time=0 type=file content=$(location :kconfig_for_{})".format(platform),
+            "kconfig_parse uid=0 gid=0 mode=0755 time=0 type=file content=$(location :kconfig_parse_for_{})".format(platform),
         ],
     )
     for archive, platform in _ARCHIVES.items()

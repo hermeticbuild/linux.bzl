@@ -1,5 +1,4 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
-load(":kconfig_repositories_test.bzl", "kconfig_host_platform_test", "kconfig_tool_filename_test")
 load(
     ":linux_objects.bzl",
     "linux_archive",
@@ -18,10 +17,6 @@ load(
 )
 
 package(default_visibility = ["//:__subpackages__"])
-
-kconfig_host_platform_test(name = "kconfig_host_platform_test")
-
-kconfig_tool_filename_test(name = "kconfig_tool_filename_test")
 
 exports_files(
     ["qemu_boot_test.sh"],

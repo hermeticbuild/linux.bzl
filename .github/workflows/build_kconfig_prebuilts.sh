@@ -53,8 +53,8 @@ check_archive kconfig-darwin-amd64.tar.gz kconfig kconfig_parse
 check_archive kconfig-darwin-arm64.tar.gz kconfig kconfig_parse
 check_archive kconfig-linux-amd64.tar.gz kconfig kconfig_parse
 check_archive kconfig-linux-arm64.tar.gz kconfig kconfig_parse
-check_archive kconfig-windows-amd64.tar.gz kconfig.exe kconfig_parse.exe
-check_archive kconfig-windows-arm64.tar.gz kconfig.exe kconfig_parse.exe
+check_archive kconfig-windows-amd64.tar.gz kconfig kconfig_parse
+check_archive kconfig-windows-arm64.tar.gz kconfig kconfig_parse
 
 (
   cd dist
