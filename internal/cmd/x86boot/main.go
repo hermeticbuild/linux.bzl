@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -40,10 +41,14 @@ func main() {
 		err = runConcat(os.Args[2:])
 	case "cpustr":
 		err = runCPUString(os.Args[2:])
+	case "empty-dir":
+		err = runEmptyDir(os.Args[2:])
 	case "offsets":
 		err = runOffsets(os.Args[2:])
 	case "piggy":
 		err = runPiggy(os.Args[2:])
+	case "relocs":
+		err = runRelocs(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -62,8 +67,59 @@ commands:
   bzimage -setup <setup.bin> -kernel <vmlinux.bin> -out <bzImage>
   concat -in <file> [-in <file> ...] -out <file>
   cpustr -cpufeatures <cpufeatures.h> -masks <cpufeaturemasks.h> -out <cpustr.h>
+  empty-dir -out <directory>
   offsets -kind <voffset|zoffset> -in <elf> -out <header>
-  piggy -in <compressed-with-size> -out <piggy.S>`)
+  piggy -in <compressed-with-size> -out <piggy.S>
+  relocs -tool <relocs> -in <vmlinux> -out <vmlinux.relocs>`)
+}
+
+func runEmptyDir(args []string) error {
+	fs := flag.NewFlagSet("empty-dir", flag.ContinueOnError)
+	out := fs.String("out", "", "output directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("-out is required")
+	}
+	return os.MkdirAll(*out, 0o755)
+}
+
+func runRelocs(args []string) error {
+	fs := flag.NewFlagSet("relocs", flag.ContinueOnError)
+	tool := fs.String("tool", "", "relocs executable")
+	in := fs.String("in", "", "input vmlinux")
+	out := fs.String("out", "", "output relocation data")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *tool == "" || *in == "" || *out == "" {
+		return fmt.Errorf("-tool, -in, and -out are required")
+	}
+	if err := os.MkdirAll(filepath.Dir(*out), 0o755); err != nil {
+		return err
+	}
+	output, err := os.Create(*out)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(*tool, *in)
+	cmd.Env = []string{}
+	cmd.Stdout = output
+	cmd.Stderr = os.Stderr
+	runErr := cmd.Run()
+	closeErr := output.Close()
+	if runErr != nil {
+		return runErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	validate := exec.Command(*tool, "--abs-relocs", *in)
+	validate.Env = []string{}
+	validate.Stdout = os.Stdout
+	validate.Stderr = os.Stderr
+	return validate.Run()
 }
 
 type repeatedFlag []string

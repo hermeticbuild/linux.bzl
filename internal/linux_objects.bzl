@@ -4679,13 +4679,11 @@ def _linux_x86_relocs(ctx, vmlinux):
     if not ctx.executable.x86_relocs_tool:
         fail("linux_compressed_image with CONFIG_X86_NEED_RELOCS requires x86_relocs_tool")
     out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/boot/compressed/vmlinux.relocs")
-    ctx.actions.run_shell(
-        inputs = [ctx.executable.x86_relocs_tool, vmlinux],
-        outputs = [out],
-        command = "\"$1\" \"$2\" > \"$3\"; \"$1\" --abs-relocs \"$2\"",
-        arguments = [ctx.executable.x86_relocs_tool.path, vmlinux.path, out.path],
-        mnemonic = "LinuxX86Relocs",
-        progress_message = "Generating Linux x86 compressed relocation data %{label}",
+    _linux_x86_run_x86boot(
+        ctx,
+        [out],
+        ["relocs", "-tool", ctx.executable.x86_relocs_tool, "-in", vmlinux, "-out", out],
+        inputs = [ctx.executable._x86boot, ctx.executable.x86_relocs_tool, vmlinux],
     )
     return out
 
@@ -4711,11 +4709,15 @@ def _linux_x86_append_size(ctx, payload, size_inputs, out_relpath):
 
 def _linux_x86_lz4(ctx, input, out_relpath):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
-    ctx.actions.run_shell(
+    args = ctx.actions.args()
+    args.add_all(["-l", "-9"])
+    args.add(input)
+    args.add(out)
+    ctx.actions.run(
+        executable = ctx.executable._lz4,
         inputs = [ctx.executable._lz4, input],
         outputs = [out],
-        command = "\"$1\" -l -9 -c \"$2\" > \"$3\"",
-        arguments = [ctx.executable._lz4.path, input.path, out.path],
+        arguments = [args],
         mnemonic = "LinuxX86LZ4",
         progress_message = "Compressing Linux x86 kernel payload %{label}",
     )
@@ -5318,10 +5320,14 @@ def _linux_empty_module_outputs(ctx):
     modinfo = ctx.actions.declare_file(ctx.label.name + ".modules.builtin.modinfo")
     modules = ctx.actions.declare_directory(ctx.label.name + ".modules")
     ctx.actions.write(modinfo, "")
-    ctx.actions.run_shell(
+    args = ctx.actions.args()
+    args.add_all(["empty-dir", "-out"])
+    args.add(modules.path)
+    ctx.actions.run(
+        executable = ctx.executable._x86boot,
+        inputs = [ctx.executable._x86boot],
         outputs = [modules],
-        command = "mkdir -p \"$1\"",
-        arguments = [modules.path],
+        arguments = [args],
         mnemonic = "LinuxEmptyModules",
         progress_message = "Creating empty Linux module output group %{label}",
     )
