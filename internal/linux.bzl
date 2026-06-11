@@ -13,43 +13,48 @@ def linux(
         extra_kconfigs = None,
         extra_srcs = None,
         image_format = "auto",
+        image_name = None,
         kallsyms = "auto",
         pahole = None,
         probe_values = None,
         generated_dir = "generated",
         visibility = None,
         tags = None,
-        arch_configs = None):
+        vmlinux_name = None):
     """Build a Linux kernel image for the active Bazel platform.
 
     The public target is a platform-selected alias. Each supported architecture
     gets its own resolved config, generated Kbuild BUILD files, host tools and
     final image target so Bazel can cache each architecture independently. The
-    config label may itself be a platform-selected alias. Use arch_configs for
-    architecture-specific config labels when private architecture targets may
-    be selected directly.
+    config accepts either one config label or a dict keyed by architecture name.
+    image_name defaults to <name>.image and vmlinux_name defaults to
+    <name>.vm_linux.
     """
     if compact_repos == None:
         compact_repos = {}
-    if arch_configs == None:
-        arch_configs = {}
     if extra_kconfigs == None:
         extra_kconfigs = {}
     if extra_srcs == None:
         extra_srcs = []
     if probe_values == None:
         probe_values = {}
+    if image_name == None:
+        image_name = name + ".image"
+    if vmlinux_name == None:
+        vmlinux_name = name + ".vm_linux"
     source_repo = _normalize_repo(source_repo)
     source_root = _repo_label(source_repo, "Kconfig")
     source_tree = [_repo_label(source_repo, "all_files")]
     package_visibility = _package_visibility()
     actuals = {}
+    image_actuals = {}
+    vmlinux_actuals = {}
 
     for arch in linux_architectures():
-        actuals[arch.platform] = _define_arch_kernel(
+        outputs = _define_arch_kernel(
             name = name,
             arch = arch,
-            config = arch_configs.get(arch.config_name, config),
+            config = _arch_config(config, arch.config_name),
             config_mode = config_mode,
             compact_repo = compact_repos.get(arch.config_name),
             extra_kconfigs = extra_kconfigs,
@@ -65,17 +70,39 @@ def linux(
             source_tree = source_tree,
             tags = tags,
         )
+        actuals[arch.platform] = outputs.selected
+        image_actuals[arch.platform] = outputs.image
+        vmlinux_actuals[arch.platform] = outputs.vmlinux
 
     native.alias(
         name = name,
         actual = select(actuals),
         visibility = visibility,
     )
+    if image_name:
+        native.alias(
+            name = image_name,
+            actual = select(image_actuals),
+            visibility = visibility,
+        )
+    if vmlinux_name:
+        native.alias(
+            name = vmlinux_name,
+            actual = select(vmlinux_actuals),
+            visibility = visibility,
+        )
 
 def _normalize_repo(repo):
     if repo.startswith("@"):
         return repo
     return "@" + repo
+
+def _arch_config(config, config_name):
+    if type(config) != "dict":
+        return config
+    if config_name not in config:
+        fail("linux config does not contain architecture %r" % config_name)
+    return config[config_name]
 
 def _repo_label(repo, name):
     return "%s//:%s" % (repo, name)
@@ -120,16 +147,6 @@ def _define_arch_kernel(
     generated_visibility = list(package_visibility)
     if compact_repo:
         generated_visibility.append("%s//:__pkg__" % _normalize_repo(compact_repo))
-
-    if not _image_format_supported(arch, image_format):
-        _unsupported_image_format(
-            name = unsupported_image_format_target,
-            allowed = _allowed_image_formats(arch),
-            arch = arch.config_name,
-            requested = image_format,
-            target_compatible_with = [arch.platform],
-        )
-        return ":" + unsupported_image_format_target
 
     linux_resolved_config(
         name = config_target,
@@ -229,13 +246,17 @@ def _define_arch_kernel(
         image_kwargs["x86_relocs_tool"] = host_tools.x86_relocs_tool
     linux_compressed_image(**image_kwargs)
 
-    return _image_actual(
-        arch = arch,
-        image_format = image_format,
-        image_target = image_target,
-        name = unsupported_image_format_target,
-        target_compatible_with = [arch.platform],
-        vmlinux_target = vmlinux_target,
+    return struct(
+        image = ":" + image_target,
+        selected = _image_actual(
+            arch = arch,
+            image_format = image_format,
+            image_target = image_target,
+            name = unsupported_image_format_target,
+            target_compatible_with = [arch.platform],
+            vmlinux_target = vmlinux_target,
+        ),
+        vmlinux = ":" + vmlinux_target,
     )
 
 def _image_actual(name, arch, image_format, image_target, target_compatible_with, vmlinux_target):
@@ -252,9 +273,6 @@ def _image_actual(name, arch, image_format, image_target, target_compatible_with
         target_compatible_with = target_compatible_with,
     )
     return ":" + name
-
-def _image_format_supported(arch, image_format):
-    return image_format in _allowed_image_formats(arch)
 
 def _allowed_image_formats(arch):
     return [
