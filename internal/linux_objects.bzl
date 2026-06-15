@@ -2694,6 +2694,7 @@ def _linux_config_impl(ctx):
             kernel_release = kernel_release,
             rustc_cfg = rustc_cfg,
         ),
+        OutputGroupInfo(config = depset([config])),
     ]
 
 linux_config = rule(
@@ -2819,6 +2820,7 @@ def _linux_resolved_config_impl(ctx):
             kernel_release = kernel_release,
             rustc_cfg = rustc_cfg,
         ),
+        OutputGroupInfo(config = depset([config])),
     ]
 
 linux_resolved_config = rule(

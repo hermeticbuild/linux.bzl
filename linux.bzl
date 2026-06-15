@@ -3,12 +3,14 @@
 load("@llvm//:http_bsdtar_archive.bzl", "http_bsdtar_archive")
 load("//internal:architectures.bzl", "linux_architectures")
 load("//internal:compact_repositories.bzl", "linux_compact_repository")
+load("//internal:initramfs.bzl", _initramfs = "initramfs")
 load("//internal:kconfig_repositories.bzl", "kconfig_repository", "kconfig_tool_repository")
 load("//internal:linux.bzl", _linux = "linux")
 load("//internal:linux_objects.bzl", _linux_compressed_image = "linux_compressed_image", _linux_generated_file = "linux_generated_file", _linux_module = "linux_module", _linux_vmlinux = "linux_vmlinux")
 load("//internal:qemu_boot.bzl", _linux_qemu_boot_test = "linux_qemu_boot_test")
 
 linux = _linux
+initramfs = _initramfs
 linux_compressed_image = _linux_compressed_image
 linux_generated_file = _linux_generated_file
 linux_module = _linux_module
