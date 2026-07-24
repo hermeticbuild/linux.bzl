@@ -1,4 +1,18 @@
+load("@linux.bzl", "initramfs")
+
 package(default_visibility = ["//visibility:public"])
+
+initramfs(
+    name = "example_initramfs",
+    character_devices = {
+        "/dev/console": "5:1",
+        "/dev/null": "1:3",
+    },
+    directories = ["/proc"],
+    files = {
+        "/etc/motd": "README.md",
+    },
+)
 
 alias(
     name = "x86_64_kernel",

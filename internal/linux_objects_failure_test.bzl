@@ -13,6 +13,8 @@ load(
     "linux_object",
 )
 
+visibility("//...")
+
 def _fake_linux_image_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".vmlinux")
     ctx.actions.write(out, "")

@@ -3,6 +3,8 @@
 Each archive must extract the requested host executables at its root.
 """
 
+visibility("//...")
+
 KCONFIG_TOOL_VERSION = "v0.0.11"
 
 _RELEASE_BASE_URL = "https://github.com/hermeticbuild/linux.bzl/releases/download/kconfig-{version}".format(

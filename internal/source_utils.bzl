@@ -1,5 +1,7 @@
 """Shared source-label helpers for Linux module internals."""
 
+visibility("//...")
+
 def source_label(source_repo, path):
     if source_repo.endswith("//"):
         return "%s:%s" % (source_repo, path)

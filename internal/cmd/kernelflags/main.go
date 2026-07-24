@@ -239,6 +239,8 @@ func x86CFlags(config map[string]string) []string {
 				"-mstack-protector-guard-reg=gs",
 				"-mstack-protector-guard-symbol=__ref_stack_chk_guard",
 			)
+		} else if enabled(config, "CONFIG_STACKPROTECTOR") {
+			flags = append(flags, "-mstack-protector-guard=global")
 		}
 	} else {
 		flags = append(flags, "-m32", "-msoft-float", "-mregparm=3", "-freg-struct-return", "-fno-pic")
@@ -247,6 +249,8 @@ func x86CFlags(config map[string]string) []string {
 				"-mstack-protector-guard-reg=fs",
 				"-mstack-protector-guard-symbol=__ref_stack_chk_guard",
 			)
+		} else if enabled(config, "CONFIG_STACKPROTECTOR") {
+			flags = append(flags, "-mstack-protector-guard=global")
 		}
 	}
 	flags = append(flags, "-Wno-sign-compare", "-fno-asynchronous-unwind-tables")

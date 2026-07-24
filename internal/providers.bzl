@@ -1,5 +1,7 @@
 """Public providers returned by Bazel-native Linux build rules."""
 
+visibility("//...")
+
 LinuxKernelInfo = provider(
     doc = "Outputs and metadata for one configured Linux kernel.",
     fields = {

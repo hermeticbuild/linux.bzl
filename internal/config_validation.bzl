@@ -1,5 +1,7 @@
 """Validation for the intentionally small supported Linux config surface."""
 
+visibility("//...")
+
 def validate_config_features(config, description):
     """Rejects config selections that do not have a cache-safe native graph."""
     if config.get("CONFIG_MODULES", "n") == "y":

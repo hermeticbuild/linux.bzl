@@ -11,6 +11,13 @@ bazel build //:x86_64_kernel
 bazel build //:aarch64_kernel
 ```
 
+Build a deterministic `newc` initramfs through the public `@linux.bzl` entry
+point:
+
+```sh
+bazel build //:example_initramfs
+```
+
 Build the named config variant:
 
 ```sh

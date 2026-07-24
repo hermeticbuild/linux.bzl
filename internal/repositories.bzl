@@ -4,6 +4,8 @@ load(":config_validation.bzl", "validate_config_features")
 load(":kconfig_tool_filename.bzl", "kconfig_tool_filename")
 load(":kconfig_tool_releases.bzl", "KCONFIG_TOOL_RELEASES", "KCONFIG_TOOL_VERSION")
 
+visibility("//...")
+
 _KERNEL_RELEASES = {
     "6.12.96": struct(
         integrity = "sha256-fS4bXVqzazoBhW5xeC2tKlTmNPsrN8CkKZje87v5V8E=",
@@ -618,7 +620,7 @@ def _render_config(config):
 
 def _write_configs(rctx, arch, configs, rules_repo):
     rules = [
-        'load("%s//internal:kconfig.bzl", "kconfig_file")' % rules_repo,
+        'load("%s//:linux.bzl", kconfig_file = "linux_internal_kconfig_file")' % rules_repo,
         "",
         'package(default_visibility = ["//:__subpackages__"])',
         "",
@@ -712,7 +714,7 @@ def _generate_config_graph(
         "-compact_buildfile_export",
         "metadata.json",
         "-linux_objects_load",
-        rules_repo + "//internal:linux_objects.bzl",
+        rules_repo + "//:linux.bzl",
         "-object_label_package",
         "//" + graph_dir,
         "-source_label_package",
@@ -757,11 +759,11 @@ def _generate_config_graph(
             "Linux graph generation failed for %s config %s\nstdout:\n%s\nstderr:\n%s" %
             (rctx.original_name, config_name, result.stdout, result.stderr),
         )
-    _upgrade_v011_schema(rctx, graph_dir, source_repo)
+    _upgrade_v011_schema(rctx, graph_dir, source_repo, rules_repo)
     _validate_generated_metadata(rctx, graph_dir, config_name, source_root)
     _validate_generated_build(rctx, graph_dir, config_name)
 
-def _upgrade_v011_schema(rctx, graph_dir, source_repo):
+def _upgrade_v011_schema(rctx, graph_dir, source_repo, rules_repo):
     build_path = graph_dir + "/BUILD.bazel"
     content = rctx.read(build_path)
     legacy = '    srcs = ["%s//:all_files"],\n' % source_repo
@@ -794,7 +796,31 @@ def _upgrade_v011_schema(rctx, graph_dir, source_repo):
             KCONFIG_TOOL_VERSION +
             "expected exactly one legacy require_real declaration",
         )
-    rctx.file(build_path, parts[0] + parts[1], executable = False)
+    content = _alias_generated_rule_loads(parts[0] + parts[1], rules_repo)
+    rctx.file(build_path, content, executable = False)
+
+def _alias_generated_rule_loads(content, rules_repo):
+    parts = content.split("\npackage(")
+    if len(parts) != 2:
+        fail("Linux graph generator emitted an incompatible BUILD file package declaration")
+    header = parts[0]
+    load_label = '"%s//:linux.bzl"' % rules_repo
+    if len(header.split(load_label)) != 2:
+        fail("Linux graph generator emitted an incompatible linux.bzl load declaration")
+    generated_symbols = {
+        "linux_arm64_nvhe_object": "linux_internal_arm64_nvhe_object",
+        "linux_compact_image": "linux_internal_compact_image",
+        "linux_composite_object": "linux_internal_composite_object",
+        "linux_config": "linux_internal_config",
+        "linux_object": "linux_internal_object",
+        "linux_source_tree": "linux_internal_source_tree",
+    }
+    for symbol in sorted(generated_symbols.keys()):
+        header = header.replace(
+            '"%s"' % symbol,
+            '%s = "%s"' % (symbol, generated_symbols[symbol]),
+        )
+    return header + "\npackage(" + parts[1]
 
 def _add_generator_variables(args, descriptor):
     variables = dict(descriptor.compact_vars)
@@ -900,7 +926,7 @@ def _kernel_root_build(
         variant_configs,
         variant_graph_images,
         rules_repo):
-    return """load("{rules_repo}//internal:kernel_repository_targets.bzl", "linux_image_targets")
+    return """load("{rules_repo}//:linux.bzl", linux_image_targets = "linux_internal_image_targets")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -928,7 +954,7 @@ linux_image_targets(
     )
 
 def _variant_build(arch, graph, platform, rules_repo):
-    return """load("{rules_repo}//internal:kernel_bundle.bzl", "linux_kernel_exports")
+    return """load("{rules_repo}//:linux.bzl", linux_kernel_exports = "linux_internal_kernel_exports")
 
 package(default_visibility = ["//visibility:private"])
 

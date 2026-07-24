@@ -88,11 +88,11 @@ No `BUILD.bazel` macro is required in the consuming repository. Repository
 generation turns the selected Linux source, config, and architecture into the
 per-object Bazel graph.
 
-## Repository API
+## Public API
 
-Both public repository rules are loaded directly from the root `linux.bzl`.
-They are intended for the root module: kernel source and product configs are
-application choices, not transitive dependency resolution.
+Every public symbol is loaded directly from the root `linux.bzl`. The source
+and image repository rules are intended for the root module: kernel source and
+product configs are application choices, not transitive dependency resolution.
 
 Because the module repository and its public file have the same name, Starlark
 outside `MODULE.bazel` can use Bazel's shorthand label:
@@ -134,6 +134,38 @@ apparent name. Architecture is derived from the canonical target, and the
 config must select the same architecture. There are also no compiler paths,
 host probe overrides, image-format switches, or signing keys in the public API.
 
+### Initramfs
+
+`initramfs` constructs a deterministic, root-owned `newc` archive. It is a
+normal build rule, independent of `linux_image`, so the same archive can be
+paired with any compatible kernel or VM rule:
+
+```starlark
+load("@linux.bzl", "initramfs")
+
+initramfs(
+    name = "boot_files",
+    character_devices = {
+        "/dev/console": "5:1",
+        "/dev/null": "1:3",
+    },
+    executables = {
+        "/init": "//init",
+    },
+    files = {
+        "/etc/motd": "motd",
+    },
+    symlinks = {
+        "/bin/sh": "/bin/busybox",
+    },
+)
+```
+
+All archive paths are canonical absolute paths. Parent directories are created
+automatically. `directories`, `files`, `executables`, `symlinks`, and
+`character_devices` are the complete initial surface; file modes and ownership
+are fixed to reproducible values.
+
 ## Why
 
 Wrapping `make` in one Bazel action hides the kernel build graph from Bazel.
@@ -165,6 +197,7 @@ graph rejects a non-Clang C/C++ toolchain.
 | Build toolchain | Hermetic LLVM 22.1.4 through module `llvm` 0.8.3 |
 | Images | x86 `bzImage`, arm64 `Image`, and `vmlinux` |
 | Config variants | Base fragment plus named overlay fragments |
+| Initramfs | Deterministic root-owned `newc` archives |
 
 The two LTS lines are the maintained compatibility catalog. Other
 integrity-pinned Linux 6.x releases may work, but are experimental until added
@@ -172,10 +205,11 @@ to that catalog and its release checks. The repository generator is published
 for each host listed above; kernel compile actions still target the registered
 Linux Hermetic LLVM toolchain.
 
-The initial public contract is limited to resolved configs, boot images,
-`vmlinux`, `System.map`, and kernel release metadata. Modules, device trees,
-BPF syscall support, BTF, signing, Rust, and other build paths are not exported
-or supported. Module selections and known incompatible BPF, BTF, signing, and
+The initial public kernel contract is limited to resolved configs, boot images,
+`vmlinux`, `System.map`, and kernel release metadata; the separate `initramfs`
+rule supplies boot userspace archives. Modules, device trees, BPF syscall
+support, BTF, signing, Rust, and other build paths are not exported or
+supported. Module selections and known incompatible BPF, BTF, signing, and
 Rust selections are rejected during repository generation. So is
 `CONFIG_X86_NATIVE_CPU`, because `-march=native` would make an action depend on
 worker CPU features that are absent from its cache key. Generated graphs that
@@ -288,7 +322,7 @@ used directly by packaging and VM rules without selecting an output group.
 Load public providers from the root entry point:
 
 ```starlark
-load("@linux.bzl//:linux.bzl", "LinuxKernelInfo")
+load("@linux.bzl", "LinuxKernelInfo")
 ```
 
 `LinuxKernelInfo` exposes:
@@ -350,6 +384,7 @@ image.
 
 - catalog-backed x86_64 and aarch64 kernels;
 - named debug and LZ4 overlays;
+- a deterministic initramfs built through the public `@linux.bzl` entry point;
 - aliases for real fixed image outputs.
 
 From a repository checkout:
@@ -360,6 +395,7 @@ bazel build @example_x86_64//:kernel
 bazel build @example_x86_64//variants/debug:kernel
 bazel build @example_x86_64//variants/lz4:kernel
 bazel build @example_aarch64//:kernel
+bazel build //:example_initramfs
 ```
 
 ## Development
@@ -374,9 +410,3 @@ The standalone examples and compatibility workspaces are excluded from root
 package discovery with `.bazelignore`; run them from their own directories.
 Release preparation and generator distribution are documented in
 [`RELEASING.md`](RELEASING.md).
-
-## License
-
-`linux.bzl` is licensed under the
-[Apache License 2.0](LICENSE). Downloaded Linux source remains under its
-upstream licenses and is not redistributed as part of this module.

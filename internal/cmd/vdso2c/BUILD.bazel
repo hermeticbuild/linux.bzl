@@ -1,4 +1,4 @@
-load("@rules_go//go:def.bzl", "go_binary", "go_library")
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
     name = "vdso2c_lib",
@@ -11,4 +11,10 @@ go_binary(
     name = "vdso2c",
     embed = [":vdso2c_lib"],
     visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "vdso2c_test",
+    srcs = ["main_test.go"],
+    embed = [":vdso2c_lib"],
 )

@@ -4,6 +4,8 @@ load(":architectures.bzl", "linux_architectures")
 load(":kernel_bundle.bzl", "linux_kernel_bundle", "linux_kernel_exports")
 load(":linux_objects.bzl", "linux_compressed_image", "linux_resolved_config", "linux_vmlinux")
 
+visibility("//...")
+
 def _architecture(config_name):
     for arch in linux_architectures():
         if arch.config_name == config_name:

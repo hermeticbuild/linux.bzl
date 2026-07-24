@@ -3,6 +3,8 @@
 load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
 load(":kconfig.bzl", "KconfigInfo")
 
+visibility("//...")
+
 LinuxProbeInfo = provider(
     doc = "Explicit Linux Kconfig probe values supplied by Bazel configuration/toolchain wrapper targets.",
     fields = {

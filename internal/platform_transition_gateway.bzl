@@ -2,6 +2,8 @@
 
 load(":providers.bzl", "LinuxKernelInfo")
 
+visibility("//...")
+
 _ARCH_CPU_CONSTRAINTS = {
     "aarch64": Label("@platforms//cpu:aarch64"),
     "x86_64": Label("@platforms//cpu:x86_64"),

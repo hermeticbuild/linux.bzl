@@ -21,6 +21,7 @@ filegroup(
         "arch/x86/coco/tdx/tdx-shared.c",
         "arch/x86/include/asm/cpufeatures.h",
         "arch/x86/include/asm/inat.h",
+        "arch/x86/include/asm/vdso.h",
         "arch/x86/include/asm/vmxfeatures.h",
         "arch/x86/kernel/asm-offsets_*.c",
         "arch/x86/kernel/sev_verify_cbit.S",

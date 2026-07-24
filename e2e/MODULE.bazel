@@ -3,9 +3,13 @@ module(
     version = "0.0.0",
 )
 
+bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "linux.bzl", version = "0.1.0", repo_name = "kernel_rules")
 bazel_dep(name = "llvm", version = "0.8.3", repo_name = "hermetic_llvm")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_go", version = "0.60.0")
+bazel_dep(name = "rules_qemu", version = "0.3.0")
 
 register_toolchains("@hermetic_llvm//toolchain:all")
 
@@ -13,6 +17,23 @@ local_path_override(
     module_name = "linux.bzl",
     path = "..",
 )
+
+qemu = use_extension("@rules_qemu//qemu/extension:qemu.bzl", "qemu")
+qemu.system_toolchain(
+    system_target = "x86_64-softmmu",
+    target_settings = ["//:qemu_system_x86_64"],
+)
+qemu.system_toolchain(
+    system_target = "aarch64-softmmu",
+    target_settings = ["//:qemu_system_aarch64"],
+)
+use_repo(
+    qemu,
+    "qemu_system_toolchains",
+    "qemu_user_toolchains",
+)
+
+register_toolchains("@qemu_system_toolchains//:all")
 
 linux_source_repository = use_repo_rule(
     "@kernel_rules//:linux.bzl",

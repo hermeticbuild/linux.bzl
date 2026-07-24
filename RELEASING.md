@@ -11,12 +11,14 @@ the rules module.
    notes.
 2. Run `bazel test //...`, the standalone examples, and the Linux 6.12 and 6.18
    compatibility builds for x86_64 and aarch64.
-3. Build a named overlay and verify its kernel release and fixed output
+3. Boot all four maintained kernel/architecture pairs under hermetic QEMU and
+   verify that each reaches the initramfs userspace marker.
+4. Build a named overlay and verify its kernel release and fixed output
    contract.
-4. Test a consumer that renames the `linux.bzl` module repository and loads
+5. Test a consumer that renames the `linux.bzl` module repository and loads
    `linux_image` only from the root `linux.bzl` entry point.
-5. Audit the pinned source URLs and integrities in the catalog.
-6. Audit `KCONFIG_TOOL_VERSION` and all six entries in
+6. Audit the pinned source URLs and integrities in the catalog.
+7. Audit `KCONFIG_TOOL_VERSION` and all six entries in
    `internal/kconfig_tool_releases.bzl`.
 
 When updating the generator, first publish deterministic
@@ -39,7 +41,6 @@ VERSION=vX.Y.Z ./release_kconfig.sh
    integrity.
 3. Test a clean consumer module using the tag, without `local_path_override` or
    a locally built generator.
-4. Submit the release to the Bazel Central Registry using the files in `.bcr/`.
 
 ## Support checks
 
@@ -48,6 +49,8 @@ A release is ready only when:
 - Bazel 8.x and 9.x pass the root test suite.
 - Linux 6.12 and 6.18 build for x86_64 and aarch64 with the registered Bazel C++
   toolchains.
+- All four maintained kernel/architecture pairs boot under the registered QEMU
+  system toolchains and reach the initramfs userspace marker.
 - Repository generation is smoke-tested with all six host generator archives.
 - The base and named-overlay repositories produce the documented fixed outputs.
 - Unsupported Kbuild constructs and toolchain/config mismatches fail with
@@ -58,18 +61,3 @@ Cross-variant action sharing is not a release requirement until the config
 input model can prove it correct.
 
 Signing kernel images or modules is outside the current release contract.
-
-For version `X.Y.Z` and tag `vX.Y.Z`, create the BCR-compatible source asset
-from the verified release commit:
-
-```sh
-git archive \
-  --format=tar.gz \
-  --prefix=linux.bzl-X.Y.Z/ \
-  --output=linux.bzl-vX.Y.Z.tar.gz \
-  vX.Y.Z
-openssl dgst -sha256 -binary linux.bzl-vX.Y.Z.tar.gz | openssl base64 -A
-```
-
-Attach `linux.bzl-vX.Y.Z.tar.gz` to the matching GitHub release. Its name and
-top-level prefix match `.bcr/source.template.json`.

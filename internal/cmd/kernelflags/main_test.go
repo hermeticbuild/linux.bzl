@@ -64,6 +64,68 @@ func TestLinuxCFlagsX86ExcludeGCCOnlyAlignmentFlag(t *testing.T) {
 	}
 }
 
+func TestLinuxCFlagsX86UPUseGlobalStackProtectorGuard(t *testing.T) {
+	for _, config := range []map[string]string{
+		{
+			"CONFIG_STACKPROTECTOR": "y",
+			"CONFIG_X86_64":         "y",
+		},
+		{
+			"CONFIG_STACKPROTECTOR": "y",
+		},
+	} {
+		flags := linuxCFlags(config, "x86")
+		if !contains(flags, "-mstack-protector-guard=global") {
+			t.Fatalf("linuxCFlags() missing global stack-protector guard: %v", flags)
+		}
+		for _, unwanted := range []string{
+			"-mstack-protector-guard-reg=fs",
+			"-mstack-protector-guard-reg=gs",
+			"-mstack-protector-guard-symbol=__ref_stack_chk_guard",
+		} {
+			if contains(flags, unwanted) {
+				t.Fatalf("linuxCFlags() unexpectedly contains %s: %v", unwanted, flags)
+			}
+		}
+	}
+}
+
+func TestLinuxCFlagsX86SMPUsePerCPUStackProtectorGuard(t *testing.T) {
+	for _, test := range []struct {
+		config map[string]string
+		reg    string
+	}{
+		{
+			config: map[string]string{
+				"CONFIG_SMP":            "y",
+				"CONFIG_STACKPROTECTOR": "y",
+				"CONFIG_X86_64":         "y",
+			},
+			reg: "gs",
+		},
+		{
+			config: map[string]string{
+				"CONFIG_SMP":            "y",
+				"CONFIG_STACKPROTECTOR": "y",
+			},
+			reg: "fs",
+		},
+	} {
+		flags := linuxCFlags(test.config, "x86")
+		for _, want := range []string{
+			"-mstack-protector-guard-reg=" + test.reg,
+			"-mstack-protector-guard-symbol=__ref_stack_chk_guard",
+		} {
+			if !contains(flags, want) {
+				t.Fatalf("linuxCFlags() missing %s: %v", want, flags)
+			}
+		}
+		if contains(flags, "-mstack-protector-guard=global") {
+			t.Fatalf("linuxCFlags() unexpectedly contains global guard: %v", flags)
+		}
+	}
+}
+
 func TestLinuxCFlagsIncludeClangThinLTO(t *testing.T) {
 	config := map[string]string{
 		"CONFIG_CC_IS_CLANG":    "y",
