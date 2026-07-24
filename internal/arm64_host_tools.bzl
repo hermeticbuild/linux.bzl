@@ -5,6 +5,8 @@ load(":common_host_tools.bzl", "linux_common_host_tools")
 load(":linux_objects.bzl", "linux_arm64_generated_headers")
 load(":source_utils.bzl", "package_label", "source_label")
 
+visibility("//...")
+
 def linux_arm64_host_tools(
         name,
         config,

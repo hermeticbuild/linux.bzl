@@ -3,6 +3,8 @@
 load("@bazel_skylib//lib:unittest.bzl", "asserts", "unittest")
 load(":kconfig_tool_filename.bzl", "kconfig_tool_filename")
 
+visibility("//...")
+
 def _kconfig_tool_filename_test_impl(ctx):
     env = unittest.begin(ctx)
     asserts.equals(env, "kconfig.exe", kconfig_tool_filename("windows_amd64", "kconfig"))

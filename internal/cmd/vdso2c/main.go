@@ -10,10 +10,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
-var requiredSymbols = []string{
+var knownSymbols = []string{
+	"vvar_start",
+	"vvar_page",
+	"pvclock_page",
+	"hvclock_page",
+	"timens_page",
 	"VDSO32_NOTE_MASK",
 	"__kernel_vsyscall",
 	"__kernel_sigreturn",
@@ -26,19 +32,20 @@ var requiredSymbols = []string{
 func main() {
 	raw := flag.String("raw", "", "unstripped vDSO shared object")
 	stripped := flag.String("stripped", "", "stripped vDSO shared object")
+	vdsoHeader := flag.String("vdso-header", "", "kernel asm/vdso.h")
 	out := flag.String("out", "", "generated C output")
 	flag.Parse()
-	if *raw == "" || *stripped == "" || *out == "" {
-		fmt.Fprintln(os.Stderr, "-raw, -stripped, and -out are required")
+	if *raw == "" || *stripped == "" || *vdsoHeader == "" || *out == "" {
+		fmt.Fprintln(os.Stderr, "-raw, -stripped, -vdso-header, and -out are required")
 		os.Exit(2)
 	}
-	if err := run(*raw, *stripped, *out); err != nil {
+	if err := run(*raw, *stripped, *vdsoHeader, *out); err != nil {
 		fmt.Fprintf(os.Stderr, "vdso2c: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(rawPath, strippedPath, outPath string) error {
+func run(rawPath, strippedPath, vdsoHeaderPath, outPath string) error {
 	rawData, err := os.ReadFile(rawPath)
 	if err != nil {
 		return err
@@ -46,6 +53,14 @@ func run(rawPath, strippedPath, outPath string) error {
 	strippedData, err := os.ReadFile(strippedPath)
 	if err != nil {
 		return err
+	}
+	vdsoHeader, err := os.ReadFile(vdsoHeaderPath)
+	if err != nil {
+		return err
+	}
+	symbolFields, err := vdsoSymbolFields(vdsoHeader)
+	if err != nil {
+		return fmt.Errorf("%s: %w", vdsoHeaderPath, err)
 	}
 	file, err := elf.NewFile(bytes.NewReader(rawData))
 	if err != nil {
@@ -69,11 +84,14 @@ func run(rawPath, strippedPath, outPath string) error {
 	if err != nil {
 		return err
 	}
+	if err := validateVvarSymbols(symbols, symbolFields); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return err
 	}
 	var out strings.Builder
-	writeC(&out, rawData, strippedData, file, imageName(outPath), symbols)
+	writeC(&out, rawData, strippedData, file, imageName(outPath), symbols, symbolFields)
 	return os.WriteFile(outPath, []byte(out.String()), 0o644)
 }
 
@@ -139,7 +157,7 @@ func vdsoSymbols(file *elf.File) (map[string]int64, error) {
 		return nil, err
 	}
 	wanted := map[string]bool{}
-	for _, name := range requiredSymbols {
+	for _, name := range knownSymbols {
 		wanted[name] = true
 	}
 	out := map[string]int64{}
@@ -151,6 +169,55 @@ func vdsoSymbols(file *elf.File) (map[string]int64, error) {
 	return out, nil
 }
 
+var vdsoSymbolFieldPattern = regexp.MustCompile(`\bsym_([A-Za-z0-9_]+)\s*;`)
+
+func vdsoSymbolFields(header []byte) (map[string]bool, error) {
+	known := map[string]bool{}
+	for _, name := range knownSymbols {
+		known[name] = true
+	}
+	fields := map[string]bool{}
+	for _, match := range vdsoSymbolFieldPattern.FindAllSubmatch(header, -1) {
+		name := string(match[1])
+		if known[name] {
+			fields[name] = true
+		}
+	}
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("struct vdso_image has no recognized symbol fields")
+	}
+	return fields, nil
+}
+
+func validateVvarSymbols(symbols map[string]int64, fields map[string]bool) error {
+	if !fields["vvar_start"] {
+		return nil
+	}
+	vvarStart := symbols["vvar_start"]
+	if vvarStart == 0 {
+		return fmt.Errorf("vDSO image has no vvar_start symbol")
+	}
+	if vvarStart%4096 != 0 {
+		return fmt.Errorf("vvar_start must be a multiple of 4096")
+	}
+	for _, name := range []string{"vvar_page", "pvclock_page", "hvclock_page", "timens_page"} {
+		value := symbols[name]
+		if value == 0 {
+			continue
+		}
+		if value%4096 != 0 {
+			return fmt.Errorf("%s must be a multiple of 4096", name)
+		}
+		if value+4096 < vvarStart {
+			return fmt.Errorf("%s underruns vvar_start", name)
+		}
+		if value+4096 > 0 {
+			return fmt.Errorf("%s is on the wrong side of the vDSO text", name)
+		}
+	}
+	return nil
+}
+
 func imageName(path string) string {
 	name := filepath.Base(path)
 	if idx := strings.IndexByte(name, '.'); idx >= 0 {
@@ -159,7 +226,7 @@ func imageName(path string) string {
 	return strings.ReplaceAll(name, "-", "_")
 }
 
-func writeC(out *strings.Builder, rawData, strippedData []byte, file *elf.File, name string, symbols map[string]int64) {
+func writeC(out *strings.Builder, rawData, strippedData []byte, file *elf.File, name string, symbols map[string]int64, symbolFields map[string]bool) {
 	mappingSize := (len(strippedData) + 4095) / 4096 * 4096
 	out.WriteString("/* AUTOMATICALLY GENERATED -- DO NOT EDIT */\n\n")
 	out.WriteString("#include <linux/linkage.h>\n")
@@ -189,8 +256,8 @@ func writeC(out *strings.Builder, rawData, strippedData []byte, file *elf.File, 
 		fmt.Fprintf(out, "\t.extable_len = %d,\n", extable.Size)
 		out.WriteString("\t.extable = extable,\n")
 	}
-	for _, sym := range requiredSymbols {
-		if value := symbols[sym]; value != 0 {
+	for _, sym := range knownSymbols {
+		if value := symbols[sym]; value != 0 && symbolFields[sym] {
 			fmt.Fprintf(out, "\t.sym_%s = %d,\n", sym, value)
 		}
 	}

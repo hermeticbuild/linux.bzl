@@ -1,5 +1,7 @@
 """External repositories required by linux.bzl host tools."""
 
+visibility("//...")
+
 def _libelf_repository_impl(rctx):
     rctx.download_and_extract(
         integrity = "sha256-WRqbTsgcHyBCqXqmBWTgy3nQQcUvqnQWrLOLyVvSx20=",

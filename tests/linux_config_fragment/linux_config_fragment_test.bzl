@@ -7,6 +7,8 @@ load(
 )
 load("//internal:linux_objects.bzl", "linux_config")
 
+visibility("private")
+
 def _fragment_flags_action_test_impl(ctx):
     env = analysistest.begin(ctx)
     actions = [

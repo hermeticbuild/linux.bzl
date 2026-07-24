@@ -7,6 +7,8 @@ load(":common_host_tools.bzl", "linux_common_host_tools")
 load(":linux_objects.bzl", "linux_x86_generated_headers")
 load(":source_utils.bzl", "package_label", "source_label", "source_labels")
 
+visibility("//...")
+
 _X86_OBJTOOL_TEXTUAL_SRCS = [
     "tools/arch/x86/lib/inat.c",
     "tools/arch/x86/lib/insn.c",

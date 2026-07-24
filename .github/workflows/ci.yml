@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - fionera/init
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  root-tests:
+    name: Root tests (Bazel ${{ matrix.bazel }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        bazel:
+          - 8.7.0
+          - 9.1.0
+    env:
+      USE_BAZEL_VERSION: ${{ matrix.bazel }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          repository-cache: |
+            - MODULE.bazel
+            - MODULE.bazel.lock
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Test
+        run: bazel --host_jvm_args=-Xmx3g test //... --jobs=2
+
+  examples:
+    name: Standalone examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          module-root: examples
+          repository-cache: |
+            - examples/.bazelversion
+            - examples/MODULE.bazel
+            - examples/MODULE.bazel.lock
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build
+        working-directory: examples
+        run: bazel --host_jvm_args=-Xmx3g build //... --jobs=2
+
+  qemu-e2e:
+    name: QEMU boot tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          module-root: e2e
+          repository-cache: |
+            - e2e/.bazelversion
+            - e2e/MODULE.bazel
+            - e2e/MODULE.bazel.lock
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Boot all kernels under TCG
+        working-directory: e2e
+        run: bazel --host_jvm_args=-Xmx3g test //... --jobs=2

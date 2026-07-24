@@ -3,6 +3,8 @@
 load(":arm64_host_tools.bzl", "linux_arm64_host_tools")
 load(":x86_host_tools.bzl", "linux_x86_host_tools")
 
+visibility("//...")
+
 def linux_architectures():
     return [
         struct(

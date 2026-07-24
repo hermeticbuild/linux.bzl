@@ -1,0 +1,9 @@
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "initramfs",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/initramfs",
+    pure = "on",
+    visibility = ["//internal:__pkg__"],
+)

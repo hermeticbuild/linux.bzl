@@ -3,6 +3,8 @@
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
 load(":linux_objects.bzl", "LinuxCcContextInfo")
 
+visibility("//...")
+
 _REPRODUCIBLE_FLAGS = [
     "-Wno-builtin-macro-redefined",
     "-D__DATE__=\"redacted\"",

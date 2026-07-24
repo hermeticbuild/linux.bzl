@@ -5,6 +5,8 @@ load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolch
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load(":kconfig.bzl", "KconfigInfo")
 
+visibility("//...")
+
 _PERL_TOOLCHAIN = "@rules_perl//perl:toolchain_type"
 
 LinuxCcContextInfo = provider(
@@ -1315,10 +1317,12 @@ def _linux_vdso_image_source(ctx, compiler, linker, cc_toolchain, feature_config
     vdso2c_args = ctx.actions.args()
     vdso2c_args.add("-raw", dbg)
     vdso2c_args.add("-stripped", stripped)
+    vdso_header = _source_tree_file(ctx, "arch/x86/include/asm/vdso.h")
+    vdso2c_args.add("-vdso-header", vdso_header)
     vdso2c_args.add("-out", out)
     ctx.actions.run(
         executable = ctx.executable._vdso2c,
-        inputs = [dbg, stripped],
+        inputs = [dbg, stripped, vdso_header],
         outputs = [out],
         arguments = [vdso2c_args],
         mnemonic = "LinuxVDSO2C",
@@ -1596,6 +1600,7 @@ _X86_ASM_GENERIC_WRAPPERS = [
     "mmiowb.h",
     "mmzone.h",
     "module.lds.h",
+    "ring_buffer.h",
     "rwonce.h",
     "unwind_user.h",
 ]

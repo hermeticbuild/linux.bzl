@@ -4,6 +4,8 @@ load("@rules_cc//cc:defs.bzl", "cc_binary")
 load(":compact_generator.bzl", "linux_probe_config")
 load(":source_utils.bzl", "package_label", "source_label", "source_label_package")
 
+visibility("//...")
+
 def linux_common_host_tools(
         name,
         source_repo,

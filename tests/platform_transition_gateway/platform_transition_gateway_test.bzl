@@ -3,6 +3,8 @@
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
 load("//internal:providers.bzl", "LinuxKernelInfo")
 
+visibility("private")
+
 def _graph_fixture_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".txt")
     ctx.actions.write(

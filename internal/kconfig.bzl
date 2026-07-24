@@ -1,5 +1,7 @@
 """Kconfig provider primitives used by generated kernel repositories."""
 
+visibility("//...")
+
 KconfigInfo = provider(
     doc = "Parsed Linux Kconfig values.",
     fields = {
