@@ -4,7 +4,9 @@
 package main
 
 import (
+	"compress/gzip"
 	"encoding/binary"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,6 +63,47 @@ func TestPiggy(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("piggy output missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestGZIP(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "vmlinux.bin")
+	outA := filepath.Join(dir, "vmlinux.bin.gz")
+	outB := filepath.Join(dir, "vmlinux-again.bin.gz")
+	want := []byte(strings.Repeat("kernel payload\n", 128))
+	if err := os.WriteFile(in, want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, out := range []string{outA, outB} {
+		if err := runGZIP([]string{"-in", in, "-out", out}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gotA, err := os.ReadFile(outA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotB, err := os.ReadFile(outB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotA) != string(gotB) {
+		t.Fatal("gzip output is not deterministic")
+	}
+	reader, err := gzip.NewReader(strings.NewReader(string(gotA)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("decompressed payload differs: got %d bytes, want %d", len(got), len(want))
 	}
 }
 

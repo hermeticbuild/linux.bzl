@@ -3,7 +3,28 @@
 
 package main
 
-import "testing"
+import (
+	_ "embed"
+	"regexp"
+	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
+)
+
+//go:embed main.go
+var kernelflagsSource string
+
+func TestKernelFlagsConfigSymbolsCoverSource(t *testing.T) {
+	known := map[string]bool{}
+	for _, symbol := range kconfig.KernelFlagsConfigSymbols() {
+		known[symbol] = true
+	}
+	for _, token := range regexp.MustCompile(`CONFIG_[A-Z0-9_]+`).FindAllString(kernelflagsSource, -1) {
+		if !known[token] {
+			t.Errorf("kernelflags reads %s but it is absent from kconfig.KernelFlagsConfigSymbols()", token)
+		}
+	}
+}
 
 func TestLinuxAFlagsX86IncludeFtraceUsingDefines(t *testing.T) {
 	config := map[string]string{
@@ -33,6 +54,13 @@ func TestLinuxCFlagsX86IncludeFtraceCompilerAndUsingFlags(t *testing.T) {
 		if !contains(flags, want) {
 			t.Fatalf("linuxCFlags() missing %s: %v", want, flags)
 		}
+	}
+}
+
+func TestLinuxCFlagsX86ExcludeGCCOnlyAlignmentFlag(t *testing.T) {
+	flags := linuxCFlags(map[string]string{"CONFIG_X86_64": "y"}, "x86")
+	if contains(flags, "-falign-jumps=1") {
+		t.Fatalf("linuxCFlags() contains GCC-only -falign-jumps=1: %v", flags)
 	}
 }
 

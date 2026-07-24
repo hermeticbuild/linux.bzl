@@ -1,0 +1,49 @@
+module(
+    name = "linux_bzl_examples",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "linux.bzl", version = "0.1.0")
+bazel_dep(name = "llvm", version = "0.8.3")
+
+# This override makes the example exercise the adjacent checkout. Remove it
+# when consuming a published linux.bzl release.
+local_path_override(
+    module_name = "linux.bzl",
+    path = "..",
+)
+
+register_toolchains("@llvm//toolchain:all")
+
+linux_source_repository = use_repo_rule(
+    "@linux.bzl//:linux.bzl",
+    "linux_source_repository",
+)
+
+linux_source_repository(
+    name = "linux_6_18_39",
+    version = "6.18.39",
+)
+
+linux_image = use_repo_rule(
+    "@linux.bzl//:linux.bzl",
+    "linux_image",
+)
+
+linux_image(
+    name = "example_x86_64",
+    config = "//configs:x86_64.config",
+    overlays = {
+        "debug": "//configs:debug.config",
+        "lz4": "//configs:lz4.config",
+    },
+    platform = "@llvm//platforms:linux_x86_64",
+    source = "@linux_6_18_39//:Kconfig",
+)
+
+linux_image(
+    name = "example_aarch64",
+    config = "//configs:aarch64.config",
+    platform = "@llvm//platforms:linux_arm64",
+    source = "@linux_6_18_39//:Kconfig",
+)

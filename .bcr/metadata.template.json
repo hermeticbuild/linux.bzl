@@ -1,0 +1,15 @@
+{
+  "homepage": "https://github.com/hermeticbuild/linux.bzl",
+  "maintainers": [
+    {
+      "email": "fionera@users.noreply.github.com",
+      "github": "fionera",
+      "name": "fionera"
+    }
+  ],
+  "repository": [
+    "github:hermeticbuild/linux.bzl"
+  ],
+  "versions": [],
+  "yanked_versions": {}
+}

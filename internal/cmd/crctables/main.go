@@ -20,21 +20,22 @@ const (
 )
 
 func main() {
-	kind := flag.String("kind", "", "Table kind: crc32 or crc64")
+	kind := flag.String("kind", "", "Table kind: crc32, crc32-legacy, or crc64")
 	out := flag.String("out", "", "Generated table header output")
+	rows := flag.Int("rows", -1, "Legacy CRC32 table rows: 0, 1, 4, or 8")
 	flag.Parse()
 
 	if *kind == "" || *out == "" {
 		fmt.Fprintln(os.Stderr, "-kind and -out are required")
 		os.Exit(2)
 	}
-	if err := run(*kind, *out); err != nil {
+	if err := run(*kind, *out, *rows); err != nil {
 		fmt.Fprintf(os.Stderr, "crctables: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(kind, out string) error {
+func run(kind, out string, rows int) error {
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return err
 	}
@@ -47,12 +48,73 @@ func run(kind, out string) error {
 	switch kind {
 	case "crc32":
 		writeCRC32(output)
+	case "crc32-legacy":
+		if rows != 0 && rows != 1 && rows != 4 && rows != 8 {
+			return fmt.Errorf("-rows for crc32-legacy must be 0, 1, 4, or 8, got %d", rows)
+		}
+		writeLegacyCRC32(output, rows)
 	case "crc64":
 		writeCRC64(output)
 	default:
 		return fmt.Errorf("unknown -kind %q", kind)
 	}
 	return nil
+}
+
+func writeLegacyCRC32(output *os.File, rows int) {
+	fmt.Fprint(output, "/* this file is generated - do not edit */\n\n")
+	if rows == 0 {
+		return
+	}
+
+	outputLegacyCRC32Table(output, "crc32table_le", crc32TablesLE(crc32PolyLE, rows), "tole")
+	outputLegacyCRC32Table(output, "crc32table_be", crc32TablesBE(crc32PolyBE, rows), "tobe")
+	outputLegacyCRC32Table(output, "crc32ctable_le", crc32TablesLE(crc32cPolyLE, rows), "tole")
+}
+
+func crc32TablesLE(polynomial uint32, rows int) [][256]uint32 {
+	tables := make([][256]uint32, rows)
+	tables[0] = crc32TableLE(polynomial)
+	for row := 1; row < rows; row++ {
+		for i, value := range tables[row-1] {
+			tables[row][i] = tables[0][value&0xff] ^ (value >> 8)
+		}
+	}
+	return tables
+}
+
+func crc32TablesBE(polynomial uint32, rows int) [][256]uint32 {
+	tables := make([][256]uint32, rows)
+	tables[0] = crc32TableBE(polynomial)
+	for row := 1; row < rows; row++ {
+		for i, value := range tables[row-1] {
+			tables[row][i] = tables[0][value>>24] ^ (value << 8)
+		}
+	}
+	return tables
+}
+
+func outputLegacyCRC32Table(output *os.File, name string, tables [][256]uint32, transform string) {
+	fmt.Fprintf(output, "static const u32 ____cacheline_aligned %s[%d][256] = {\n", name, len(tables))
+	for _, table := range tables {
+		fmt.Fprint(output, "\t{\n")
+		for i := 0; i < 256; i += 4 {
+			fmt.Fprintf(
+				output,
+				"\t\t%s(0x%08xL), %s(0x%08xL), %s(0x%08xL), %s(0x%08xL),\n",
+				transform,
+				table[i],
+				transform,
+				table[i+1],
+				transform,
+				table[i+2],
+				transform,
+				table[i+3],
+			)
+		}
+		fmt.Fprint(output, "\t},\n")
+	}
+	fmt.Fprint(output, "};\n")
 }
 
 func writeCRC32(output *os.File) {

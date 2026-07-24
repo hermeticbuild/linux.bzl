@@ -6,8 +6,12 @@ cc_library(
     name = "elf_headers",
     hdrs = glob([
         "include/**/*.h",
+        "lib/*.h",
     ]),
-    includes = ["include"],
+    includes = [
+        "include",
+        "lib",
+    ],
 )
 
 cc_library(

@@ -1,6 +1,4 @@
-"""Kconfig import primitives."""
-
-load("@bazel_lib//lib:write_source_files.bzl", "write_source_file")
+"""Kconfig provider primitives used by generated kernel repositories."""
 
 KconfigInfo = provider(
     doc = "Parsed Linux Kconfig values.",
@@ -24,38 +22,6 @@ def _overlay_config_content(config_flags, unset):
     for key in sorted(unset):
         lines.append("# %s is not set" % key)
     return "\n".join(lines) + "\n"
-
-def _kconfig_import_impl(ctx):
-    updated_buildfile = ctx.actions.declare_file(ctx.label.name + ".BUILD.bazel")
-
-    args = ctx.actions.args()
-    args.add("-kconfig", ctx.file.config)
-    args.add("-buildfile", ctx.file.buildfile)
-    args.add("-rule", ctx.attr.import_name)
-    args.add("-out", updated_buildfile)
-
-    ctx.actions.run(
-        executable = ctx.executable._kconfig,
-        inputs = [
-            ctx.file.config,
-            ctx.file.buildfile,
-        ],
-        outputs = [updated_buildfile],
-        arguments = [args],
-        mnemonic = "UpdateKconfigImport",
-        progress_message = "Updating Kconfig import %{label}",
-    )
-
-    return [
-        DefaultInfo(files = depset([updated_buildfile])),
-        KconfigInfo(
-            base = None,
-            config = ctx.file.config,
-            config_flags = dict(ctx.attr.config_flags),
-            set = dict(ctx.attr.config_flags),
-            unset = [],
-        ),
-    ]
 
 def _kconfig_info(ctx):
     return [
@@ -86,94 +52,14 @@ _kconfig_file = rule(
     doc = "Provider-only imported Linux .config used by generated config BUILD files.",
 )
 
-_kconfig_import = rule(
-    implementation = _kconfig_import_impl,
-    attrs = {
-        "buildfile": attr.label(
-            doc = "BUILD file containing this kconfig_import call.",
-            allow_single_file = True,
-            mandatory = True,
-        ),
-        "config": attr.label(
-            doc = "Linux .config file used as the source of truth for config_flags.",
-            allow_single_file = True,
-            mandatory = True,
-        ),
-        "config_flags": attr.string_dict(
-            doc = "Parsed explicit CONFIG_* assignments. Comment-only unset symbols are omitted.",
-            default = {},
-        ),
-        "import_name": attr.string(
-            doc = "Name of the kconfig_import call to update in buildfile.",
-            mandatory = True,
-        ),
-        "_kconfig": attr.label(
-            default = "//internal/cmd/kconfig",
-            executable = True,
-            cfg = "exec",
-        ),
-    },
-    provides = [KconfigInfo],
-    doc = "Imports parsed Linux Kconfig values for later kernel build transitions.",
-)
-
 def kconfig_file(name, config, config_flags = {}, visibility = None, **kwargs):
-    """Declare a provider-only imported Linux .config.
-
-    This is intended for generated BUILD files and repository-rule output.
-    Hand-written packages should prefer `kconfig_import` when they intentionally
-    want the in-place updater.
-    """
+    """Declares a provider-only imported Linux .config."""
     _kconfig_file(
         name = name,
         config = config,
         config_flags = config_flags,
         visibility = visibility,
         **kwargs
-    )
-
-def kconfig_import(name, config, config_flags = {}, buildfile = None, visibility = None, update = True, **kwargs):
-    """Declare an imported Linux .config.
-
-    By default, creates two targets:
-
-    * `name` — a write_source_file target. Running `bazel run :name` refreshes
-      this BUILD file's `kconfig_import` call to reflect the current `config`.
-      The matching `:name_test` target validates that the in-tree BUILD file is
-      up to date.
-    * `name_info` — exposes [`KconfigInfo`](#KconfigInfo) for internal rules
-      that need the parsed config values or the source .config file as a
-      Bazel-tracked input.
-
-    Set `update = False` for examples or tests that only need the provider and
-    should not create source-update targets.
-    """
-    if buildfile == None:
-        buildfile = "//{}:BUILD.bazel".format(native.package_name())
-
-    info_name = name + "_info"
-
-    _kconfig_import(
-        name = info_name,
-        buildfile = buildfile,
-        config = config,
-        config_flags = config_flags,
-        import_name = name,
-        visibility = visibility,
-    )
-
-    if update:
-        write_source_file(
-            name = name,
-            in_file = ":" + info_name,
-            out_file = buildfile,
-            visibility = visibility,
-            **kwargs
-        )
-
-    return struct(
-        config_flags = config_flags,
-        label = ":" + info_name,
     )
 
 def _kconfig_overlay_impl(ctx):

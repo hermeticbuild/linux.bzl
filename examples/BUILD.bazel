@@ -1,0 +1,21 @@
+package(default_visibility = ["//visibility:public"])
+
+alias(
+    name = "x86_64_kernel",
+    actual = "@example_x86_64//:kernel",
+)
+
+alias(
+    name = "x86_64_debug_kernel",
+    actual = "@example_x86_64//variants/debug:kernel",
+)
+
+alias(
+    name = "x86_64_lz4_kernel",
+    actual = "@example_x86_64//variants/lz4:kernel",
+)
+
+alias(
+    name = "aarch64_kernel",
+    actual = "@example_aarch64//:kernel",
+)

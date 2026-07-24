@@ -61,6 +61,66 @@ EndSysreg
 	}
 }
 
+func TestGenerateSysregDefsLinux612EnumAliases(t *testing.T) {
+	out, err := generateSysregDefs([]byte(`
+Sysreg	ID_PFR1_EL1	3	0	0	1	1
+Res0	63:8
+Enum	7:4	Security
+0b0000	NI
+0b0001	EL3
+0b0001	NSACR_RFR
+EndEnum
+Res0	3:0
+EndSysreg
+
+Sysreg	ID_AA64SMFR0_EL1	3	0	0	4	5
+Res0	63:60
+UnsignedEnum	59:56	SMEver
+0b0000	SME
+0b0001	SME2
+0b0010	SME2p1
+0b0000	IMP
+EndEnum
+Res0	55:0
+EndSysreg
+`))
+	if err != nil {
+		t.Fatalf("generateSysregDefs() failed: %v", err)
+	}
+	defines := map[string]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[0] == "#define" {
+			defines[fields[1]] = fields[2]
+		}
+	}
+	for name, want := range map[string]string{
+		"ID_PFR1_EL1_Security_EL3":       "UL(0b0001)",
+		"ID_PFR1_EL1_Security_NSACR_RFR": "UL(0b0001)",
+		"ID_AA64SMFR0_EL1_SMEver_SME":    "UL(0b0000)",
+		"ID_AA64SMFR0_EL1_SMEver_IMP":    "UL(0b0000)",
+	} {
+		if got := defines[name]; got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestGenerateSysregDefsRejectsOtherDuplicateEnumValues(t *testing.T) {
+	_, err := generateSysregDefs([]byte(`
+Sysreg	TEST_EL1	3	0	1	2	3
+Res0	63:4
+Enum	3:0	Mode
+0b0001	One
+0b0001	Alias
+EndEnum
+EndSysreg
+`))
+	if err == nil || !strings.Contains(err.Error(), "duplicate Enum value 0b0001 for Alias") {
+		t.Fatalf("generateSysregDefs() error = %v, want duplicate Enum value", err)
+	}
+}
+
 func TestGenerateVDSOOffsets(t *testing.T) {
 	out, err := generateVDSOOffsets([]byte("0000000000000420 T VDSO_clock_gettime\n0000000000000000 A ignored\n"))
 	if err != nil {

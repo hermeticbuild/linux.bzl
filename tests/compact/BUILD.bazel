@@ -1,10 +1,22 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("//internal:compact_generator.bzl", "linux_compact_buildfiles")
+load("//internal:linux_objects.bzl", "linux_config")
 
 package(default_visibility = ["//:__subpackages__"])
 
+linux_config(
+    name = "source_config",
+    config_flags = {},
+)
+
 linux_compact_buildfiles(
     name = "golden",
+    srcs = [
+        "debug.c",
+        "drivers/foo.c",
+        "init.c",
+        "net/core.c",
+    ],
     configs = {
         "base.config": "base",
         "blocked_driver.config": "blocked_driver",
@@ -17,7 +29,9 @@ linux_compact_buildfiles(
     out_buildfile = "expected.BUILD.bazel",
     out_metadata = "expected.metadata.golden",
     root = "Kconfig",
-    workspace_path_prefix = ".registry/linux.bzl",
+    source_config = "//tests/compact:source_config",
+    source_label_package = "//tests/compact",
+    source_root_label = "//tests/compact:Kconfig",
 )
 
 genrule(

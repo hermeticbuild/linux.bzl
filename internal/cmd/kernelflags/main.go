@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 
-	"linux.bzl/internal/kconfig"
+	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
 
 func main() {
@@ -221,7 +221,6 @@ func x86CFlags(config map[string]string) []string {
 	if enabled(config, "CONFIG_X86_64") {
 		flags = append(flags,
 			"-m64",
-			"-falign-jumps=1",
 			"-falign-loops=1",
 			"-mno-80387",
 			"-mno-fp-ret-in-387",

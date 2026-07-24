@@ -1,0 +1,1 @@
+int linux_objects_test_fixture;

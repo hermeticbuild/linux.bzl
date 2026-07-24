@@ -1,0 +1,1 @@
+int compact_debug;

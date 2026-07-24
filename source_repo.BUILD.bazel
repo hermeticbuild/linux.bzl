@@ -1,5 +1,4 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
-load("@rules_devicetree//devicetree:devicetree_library.bzl", "devicetree_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -17,11 +16,23 @@ filegroup(
         "arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
         "arch/x86/boot/**",
         "arch/x86/entry/vdso/**",
+        "arch/x86/coco/sev/vc-shared.c",
+        "arch/x86/coco/tdx/tdcall.S",
+        "arch/x86/coco/tdx/tdx-shared.c",
         "arch/x86/include/asm/cpufeatures.h",
+        "arch/x86/include/asm/inat.h",
         "arch/x86/include/asm/vmxfeatures.h",
+        "arch/x86/kernel/asm-offsets_*.c",
+        "arch/x86/kernel/sev_verify_cbit.S",
+        "arch/x86/kernel/verify_cpu.S",
+        "arch/x86/lib/inat.c",
+        "arch/x86/lib/insn.c",
+        "arch/x86/lib/kaslr.c",
         "arch/x86/lib/x86-opcode-map.txt",
+        "arch/x86/mm/ident_map.c",
         "arch/x86/purgatory/**",
         "arch/x86/realmode/rm/**",
+        "arch/x86/xen/xen-head.S",
         "drivers/firmware/efi/libstub/**/*.c",
         "drivers/tty/vt/*_shipped",
         "include/linux/oid_registry.h",
@@ -30,8 +41,35 @@ filegroup(
         "lib/cmdline.c",
         "lib/crypto/sha256.c",
         "lib/ctype.c",
+        "lib/decompress_*.c",
+        "lib/lz4/lz4_decompress.c",
+        "lib/lzo/lzo1x_decompress_safe.c",
+        "lib/xxhash.c",
+        "lib/xz/xz_crc32.c",
+        "lib/xz/xz_dec_bcj.c",
+        "lib/xz/xz_dec_lzma2.c",
+        "lib/xz/xz_dec_stream.c",
+        "lib/zlib_dfltcc/dfltcc.c",
+        "lib/zlib_dfltcc/dfltcc_inflate.c",
+        "lib/zlib_inflate/inffast.c",
+        "lib/zlib_inflate/inflate.c",
+        "lib/zlib_inflate/inftrees.c",
+        "lib/zstd/common/*.c",
+        "lib/zstd/decompress/*.c",
+        "lib/zstd/zstd_decompress_module.c",
+        "lib/vdso/**",
         "samples/Kconfig",
+        "scripts/dtc/libfdt/**",
         "usr/default_cpio_list",
+    ], allow_empty = True),
+)
+
+filegroup(
+    name = "local_include_files",
+    srcs = glob([
+        "**/*.S",
+        "**/*.c",
+        "**/*.inc",
     ], allow_empty = True),
 )
 
@@ -46,18 +84,16 @@ filegroup(
 
 filegroup(
     name = "all_files",
-    srcs = glob(
-        ["*"],
-        exclude = [
-            "Documentation",
-            "samples",
-            "tools",
-        ],
-        exclude_directories = 0,
-    ) + [
-        ":source_tree_lookup_files",
-        ":tools_files",
-    ],
+    srcs = glob(["**"]),
+)
+
+filegroup(
+    name = "kconfig_files",
+    srcs = glob([
+        "Kconfig",
+        "**/Kconfig",
+        "**/Kconfig.*",
+    ], allow_empty = True),
 )
 
 filegroup(
@@ -168,28 +204,28 @@ filegroup(
     srcs = ["arch/x86/entry/syscalls/syscall_64.tbl"],
 )
 
+filegroup(
+    name = "rq_offsets_c",
+    srcs = glob([
+        "kernel/sched/rq-offsets.c",
+    ], allow_empty = True),
+)
+
+filegroup(
+    name = "arm64_cfi_h",
+    srcs = glob([
+        "arch/arm64/include/asm/cfi.h",
+    ], allow_empty = True),
+)
+
+filegroup(
+    name = "x86_required_features_h",
+    srcs = glob([
+        "arch/x86/include/asm/required-features.h",
+    ], allow_empty = True),
+)
+
 cc_binary(
     name = "gen_init_cpio",
     srcs = ["usr/gen_init_cpio.c"],
 )
-
-[
-    devicetree_library(
-        name = "dts_includes_%s" % arch,
-        hdrs = glob([
-            "arch/%s/boot/dts/**/*.dtsi" % arch,
-            "include/dt-bindings/**/*.h",
-        ], allow_empty = True),
-        includes = [
-            "arch/%s/boot/dts" % arch,
-            "include",
-        ],
-    )
-    for arch in [
-        "arm",
-        "arm64",
-        "mips",
-        "riscv",
-        "x86",
-    ]
-]

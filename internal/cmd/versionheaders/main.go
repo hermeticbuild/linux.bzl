@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"linux.bzl/internal/kconfig"
+	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
 
 func main() {

@@ -25,6 +25,8 @@ linux_source_tree(
     all_files = ["fixture.c"] + glob(["source/**"]),
     global_headers = glob(["source/include/**/*.h"]),
     headers = glob(["source/**/*.h"]),
+    local_include_files = ["fixture.c"],
+    lookup_files = glob(["source/**"]),
     root = "source/Kconfig",
 )
 

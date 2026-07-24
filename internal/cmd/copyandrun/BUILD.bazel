@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "copyandrun_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/copyandrun",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "copyandrun",
+    embed = [":copyandrun_lib"],
+    visibility = ["//:__subpackages__"],
+)
