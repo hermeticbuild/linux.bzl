@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "kernelflags_lib",
     srcs = ["main.go"],
-    importpath = "linux.bzl/internal/cmd/kernelflags",
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/kernelflags",
     visibility = ["//visibility:private"],
     deps = ["//internal/kconfig"],
 )
@@ -18,4 +18,6 @@ go_test(
     name = "kernelflags_test",
     srcs = ["main_test.go"],
     embed = [":kernelflags_lib"],
+    embedsrcs = ["main.go"],
+    deps = ["//internal/kconfig"],
 )

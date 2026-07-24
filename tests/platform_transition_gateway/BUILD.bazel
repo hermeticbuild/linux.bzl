@@ -1,0 +1,109 @@
+load("//internal:platform_transition_gateway.bzl", "linux_platform_gateway")
+load(
+    ":platform_transition_gateway_test.bzl",
+    "gateway_failure_test",
+    "gateway_forwarding_test",
+    "platform_graph_fixture",
+)
+
+package(default_visibility = ["//visibility:private"])
+
+platform(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+platform(
+    name = "linux_aarch64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+)
+
+platform(
+    name = "macos_x86_64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:macos",
+    ],
+)
+
+platform_graph_fixture(
+    name = "graph",
+    selected_arch = select({
+        "@platforms//cpu:aarch64": "aarch64",
+        "@platforms//cpu:x86_64": "x86_64",
+        "//conditions:default": "unknown",
+    }),
+    selected_os = select({
+        "@platforms//os:linux": "linux",
+        "@platforms//os:macos": "macos",
+        "//conditions:default": "unknown",
+    }),
+)
+
+linux_platform_gateway(
+    name = "x86_gateway",
+    arch = "x86_64",
+    graph = ":graph",
+    platform = ":linux_x86_64",
+)
+
+linux_platform_gateway(
+    name = "aarch64_gateway",
+    arch = "aarch64",
+    graph = ":graph",
+    platform = ":linux_aarch64",
+)
+
+linux_platform_gateway(
+    name = "wrong_arch_gateway",
+    arch = "aarch64",
+    graph = ":graph",
+    platform = ":linux_x86_64",
+    tags = ["manual"],
+)
+
+linux_platform_gateway(
+    name = "wrong_os_gateway",
+    arch = "x86_64",
+    graph = ":graph",
+    platform = ":macos_x86_64",
+    tags = ["manual"],
+)
+
+gateway_forwarding_test(
+    name = "x86_gateway_test",
+    expected_arch = "x86_64",
+    target_under_test = ":x86_gateway",
+)
+
+gateway_forwarding_test(
+    name = "aarch64_gateway_test",
+    expected_arch = "aarch64",
+    target_under_test = ":aarch64_gateway",
+)
+
+gateway_failure_test(
+    name = "wrong_arch_gateway_test",
+    target_under_test = ":wrong_arch_gateway",
+)
+
+gateway_failure_test(
+    name = "wrong_os_gateway_test",
+    target_under_test = ":wrong_os_gateway",
+)
+
+test_suite(
+    name = "tests",
+    tests = [
+        ":aarch64_gateway_test",
+        ":wrong_arch_gateway_test",
+        ":wrong_os_gateway_test",
+        ":x86_gateway_test",
+    ],
+)

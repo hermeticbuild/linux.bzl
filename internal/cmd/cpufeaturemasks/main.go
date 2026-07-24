@@ -23,6 +23,7 @@ var (
 func main() {
 	cpufeatures := flag.String("cpufeatures", "", "arch/x86/include/asm/cpufeatures.h input")
 	config := flag.String("config", "", "Resolved Linux .config input")
+	legacy := flag.Bool("legacy", false, "Use source-tree required/disabled feature masks")
 	out := flag.String("out", "", "Generated cpufeaturemasks.h output")
 	flag.Parse()
 
@@ -30,13 +31,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "-cpufeatures, -config, and -out are required")
 		os.Exit(2)
 	}
-	if err := run(*cpufeatures, *config, *out); err != nil {
+	if err := run(*cpufeatures, *config, *out, *legacy); err != nil {
 		fmt.Fprintf(os.Stderr, "cpufeaturemasks: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(cpufeaturesPath, configPath, outPath string) error {
+func run(cpufeaturesPath, configPath, outPath string, legacy bool) error {
+	if legacy {
+		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+			return err
+		}
+		content := "#include <asm/required-features.h>\n#include <asm/disabled-features.h>\n"
+		return os.WriteFile(outPath, []byte(content), 0o644)
+	}
+
 	features, ncapints, err := parseCPUFeatures(cpufeaturesPath)
 	if err != nil {
 		return err

@@ -1,28 +1,32 @@
 # linux.bzl e2e
 
-This is a standalone Bzlmod workspace for exercising `linux.bzl` against a real
-Linux source archive and a generated Kconfig repository.
+This is a standalone Bzlmod workspace for exercising `linux.bzl` against the
+catalog-backed Linux 6.12.96 and 6.18.39 source archives and
+repository-generated x86_64 and aarch64 kernel graphs. It deliberately renames
+both the rules and LLVM repositories to cover Bzlmod repository mappings across
+generated BUILD files.
 
-Run the kernel build smoke test from this directory:
-
-```sh
-bazel build --config=remote //:kernel
-```
-
-Build the arm64 kernel target with:
+Build the real `:kernel`, `:image`, `:vmlinux`, `:config`, `:system_map`, and
+`:kernel_release` outputs for both architectures:
 
 ```sh
-bazel build --config=remote --platforms=@llvm//platforms:linux_arm64 //:kernel_arm64
+bazel test //:kernel_outputs_build_test
 ```
 
-Run the pinned Aya VM integration tests with:
+Build both catalog releases for both architectures:
 
 ```sh
-bazel test --config=aya_vm //:aya_vm_tests
+bazel test //...
 ```
 
-Build-test the pinned Actiond kernel target with:
+Build one fixed output directly:
 
 ```sh
-bazel test --config=remote_arm64 //:actiond_kernel_build_test
+bazel build @e2e_x86_64//:kernel
 ```
+
+Each generated kernel repository owns its mandatory target platform, so these
+commands do not need a caller-supplied `--platforms` flag. Add
+`--config=remote` when a remote executor is configured.
+
+This workspace intentionally tests only implemented core image outputs.

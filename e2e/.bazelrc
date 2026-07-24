@@ -1,18 +1,5 @@
 try-import ../.bazelrc
 
-common --@rules_cc//cc/toolchains/args/archiver_flags:use_libtool_on_macos=False
-common --@rules_rust//rust/toolchain/channel=nightly
-common --@llvm//config:experimental_stub_libgcc_s=True
-
-build:remote --platforms=@llvm//platforms:linux_x86_64
-build:remote --extra_execution_platforms=//bazel/toolchains:rbe_x86_64_linux_libcxx
-test:remote --remote_download_minimal
-
-build:remote_arm64 --config=remote
-build:remote_arm64 --platforms=@llvm//platforms:linux_arm64
-
-build:aya_vm --config=remote
-build:aya_vm --extra_execution_platforms=@aya//bazel/toolchains:rbe_x86_64_linux
-build:aya_vm --platforms=@rules_rs//rs/platforms:x86_64-unknown-linux-gnu
+common:remote --extra_execution_platforms=@hermetic_llvm//:rbe_platform
 
 try-import %workspace%/.bazelrc.user

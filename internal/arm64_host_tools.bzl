@@ -52,12 +52,13 @@ def linux_arm64_host_tools(
 
     linux_arm64_generated_headers(
         name = generated_headers,
+        arm64_cfi_h = source_label(source_repo, "arm64_cfi_h"),
         asm_offsets_c = source_label(source_repo, "arch/arm64/kernel/asm-offsets.c"),
         bounds_c = source_label(source_repo, "kernel/bounds.c"),
         config = config,
         cpucaps = source_label(source_repo, "arch/arm64/tools/cpucaps"),
         hyp_constants_c = source_label(source_repo, "arch/arm64/kvm/hyp/hyp-constants.c"),
-        rq_offsets_c = source_label(source_repo, "kernel/sched/rq-offsets.c"),
+        rq_offsets_c = source_label(source_repo, "rq_offsets_c"),
         source_root = common.source_root,
         source_tree = common.source_tree,
         syscall_32_tbl = source_label(source_repo, "arch/arm64/tools/syscall_32.tbl"),
@@ -73,7 +74,6 @@ def linux_arm64_host_tools(
         kallsyms_tool = common.kallsyms_tool,
         probe_config = common.probe_config,
         relacheck_tool = package_label(relacheck_tool),
-        resolve_btfids_tool = common.resolve_btfids_tool,
         source_asn1_compiler = common.source_asn1_compiler,
         source_label_package = common.source_label_package,
         source_repo = source_repo,

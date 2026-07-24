@@ -1,6 +1,4 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
-load("@linux.bzl//:linux.bzl", "linux")
-load("//:build_tests.bzl", "platform_build_target")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -9,73 +7,48 @@ exports_files([
     "tiny_arm64.config",
 ])
 
-linux(
-    name = "kernel",
-    compact_repos = {
-        "aarch64": "@tiny_arm64_compact",
-        "x86_64": "@tiny_compact",
-    },
-    config = {
-        "aarch64": "@tiny_arm64_kconfig//:kconfig",
-        "x86_64": "@tiny_kconfig//:kconfig",
-    },
-    source_repo = "@e2e_linux_6_18_2",
-)
-
-alias(
-    name = "kernel_arm64",
-    actual = ":kernel",
-)
-
-test_suite(
-    name = "aya_vm_tests",
-    tests = [
-        "@aya//test/integration-test:vm_aarch64",
-        "@aya//test/integration-test:vm_x86_64",
+build_test(
+    name = "linux_6_12_96_build_test",
+    targets = [
+        "@e2e_6_12_96_aarch64//:kernel",
+        "@e2e_6_12_96_x86_64//:kernel",
     ],
 )
 
-platform_build_target(
-    name = "actiond_kernel_arm64",
-    target = "@actiond//vm:linux_kernel",
-    target_platform = "@llvm//platforms:linux_arm64",
+alias(
+    name = "kernel_image_aarch64",
+    actual = "@e2e_aarch64//:image",
 )
 
-platform_build_target(
-    name = "kernel_image_arm64",
-    target = ":kernel.image",
-    target_platform = "@llvm//platforms:linux_arm64",
+alias(
+    name = "kernel_vmlinux_aarch64",
+    actual = "@e2e_aarch64//:vmlinux",
 )
 
-platform_build_target(
-    name = "kernel_vmlinux_arm64",
-    target = ":kernel.vm_linux",
-    target_platform = "@llvm//platforms:linux_arm64",
-)
-
-platform_build_target(
+alias(
     name = "kernel_image_x86_64",
-    target = ":kernel.image",
-    target_platform = "@llvm//platforms:linux_x86_64",
+    actual = "@e2e_x86_64//:image",
 )
 
-platform_build_target(
+alias(
     name = "kernel_vmlinux_x86_64",
-    target = ":kernel.vm_linux",
-    target_platform = "@llvm//platforms:linux_x86_64",
+    actual = "@e2e_x86_64//:vmlinux",
 )
 
 build_test(
-    name = "actiond_kernel_build_test",
-    targets = [":actiond_kernel_arm64"],
-)
-
-build_test(
-    name = "kernel_output_aliases_build_test",
+    name = "kernel_outputs_build_test",
     targets = [
-        ":kernel_image_arm64",
+        "@e2e_aarch64//:config",
+        "@e2e_aarch64//:kernel",
+        "@e2e_aarch64//:kernel_release",
+        "@e2e_aarch64//:system_map",
+        "@e2e_x86_64//:config",
+        "@e2e_x86_64//:kernel",
+        "@e2e_x86_64//:kernel_release",
+        "@e2e_x86_64//:system_map",
+        ":kernel_image_aarch64",
         ":kernel_image_x86_64",
-        ":kernel_vmlinux_arm64",
+        ":kernel_vmlinux_aarch64",
         ":kernel_vmlinux_x86_64",
     ],
 )

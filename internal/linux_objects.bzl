@@ -40,13 +40,12 @@ LinuxObjectInfo = provider(
     fields = {
         "config_fragment": "Dictionary of CONFIG_* values that affect this object action.",
         "flags": "Kbuild flags that affect this object action.",
+        "generated_headers": "Depset of generated headers exported by this object.",
+        "generated_include_dirs": "Include directories for generated headers exported by this object.",
         "mode": "Kbuild mode: y for built-in or m for module.",
         "object": "Object path relative to the kernel source tree.",
         "output": "Object output file.",
-        "real": "Whether output is a compiled object instead of placeholder metadata.",
-        "generated_headers": "Depset of generated headers exported by this object.",
-        "generated_include_dirs": "Include directories for generated headers exported by this object.",
-        "source": "Source file short path, when this is a real compiled object.",
+        "source": "Source file short path.",
     },
 )
 
@@ -56,15 +55,6 @@ LinuxArchiveInfo = provider(
         "kind": "Archive kind, for example built-in.a or module-objects.",
         "objects": "LinuxObjectInfo values included in the archive.",
         "output": "Archive output file.",
-        "real": "Whether output is a real archive instead of placeholder metadata.",
-    },
-)
-
-LinuxGeneratedInfo = provider(
-    doc = "Metadata for a generated Linux source/header action.",
-    fields = {
-        "output": "Generated placeholder output file.",
-        "target": "Kbuild target path represented by the action.",
     },
 )
 
@@ -86,10 +76,11 @@ LinuxSourceTreeInfo = provider(
         "all_files": "Depset of all Linux source tree files; only explicit full-tree actions should consume this.",
         "arch_headers": "Depset of architecture include headers under arch/*/include.",
         "dtb_sources": "Depset of devicetree source and include files.",
-        "files": "Depset of Linux source tree files.",
         "global_headers": "Depset of global include headers under include.",
         "headers": "Depset of all header-like files in the Linux source tree.",
         "kbuild_files": "Depset of Kbuild and Makefile files.",
+        "local_include_files": "Depset of source-like files that may be included from another source in the same directory.",
+        "lookup_files": "Bounded depset of special source files looked up by native Linux actions.",
         "root": "Root marker file for the Linux source tree, usually Kconfig.",
         "scripts_headers": "Depset of headers under scripts.",
         "uapi_headers": "Depset of UAPI headers.",
@@ -97,12 +88,11 @@ LinuxSourceTreeInfo = provider(
 )
 
 LinuxImageInfo = provider(
-    doc = "Metadata for a native Linux image/module output action.",
+    doc = "Metadata for a native Linux kernel image output action.",
     fields = {
         "archives": "Archive providers consumed by this output.",
-        "generated": "Generated file providers consumed by this output.",
         "objects": "Object providers consumed by this output.",
-        "output": "Placeholder output file.",
+        "output": "Kernel image output file.",
     },
 )
 
@@ -125,10 +115,11 @@ def _linux_source_tree_impl(ctx):
         all_files = depset(ctx.files.all_files),
         arch_headers = depset(ctx.files.arch_headers),
         dtb_sources = depset(ctx.files.dtb_sources),
-        files = depset(ctx.files.all_files),
         global_headers = depset(ctx.files.global_headers),
         headers = depset(ctx.files.headers),
         kbuild_files = depset(ctx.files.kbuild_files),
+        local_include_files = depset(ctx.files.local_include_files),
+        lookup_files = depset(ctx.files.lookup_files),
         root = ctx.file.root,
         scripts_headers = depset(ctx.files.scripts_headers),
         uapi_headers = depset(ctx.files.uapi_headers),
@@ -165,6 +156,14 @@ linux_source_tree = rule(
             allow_files = True,
             doc = "Kbuild and Makefile files.",
         ),
+        "local_include_files": attr.label_list(
+            allow_files = True,
+            doc = "Source-like files that may be included from another source in the same directory.",
+        ),
+        "lookup_files": attr.label_list(
+            allow_files = True,
+            doc = "Bounded special source inputs looked up by native Linux actions.",
+        ),
         "scripts_headers": attr.label_list(
             allow_files = True,
             doc = "Headers under scripts.",
@@ -196,39 +195,6 @@ def _cc_compile_flags(ctx, cc_toolchain, feature_configuration):
         action_name = C_COMPILE_ACTION_NAME,
         variables = variables,
     )
-
-def _linux_platform_transition_impl(_, attr):
-    arch = getattr(attr, "arch", "")
-    if arch == "arm64":
-        platform = "@llvm//platforms:linux_arm64_musl"
-    elif arch == "x86":
-        platform = "@llvm//platforms:linux_x86_64_musl"
-    else:
-        fail("unsupported Linux rule arch for platform transition: %s" % arch)
-    return {
-        "//command_line_option:platforms": platform,
-        "//command_line_option:copt": [],
-        "//command_line_option:conlyopt": [],
-        "//command_line_option:cxxopt": [],
-        "//command_line_option:features": [],
-        "//command_line_option:linkopt": [],
-    }
-
-_linux_platform_transition = transition(
-    implementation = _linux_platform_transition_impl,
-    inputs = [],
-    outputs = [
-        "//command_line_option:platforms",
-        "//command_line_option:copt",
-        "//command_line_option:conlyopt",
-        "//command_line_option:cxxopt",
-        "//command_line_option:features",
-        "//command_line_option:linkopt",
-    ],
-)
-
-def _linux_platform_transition_allowlist_attr():
-    return attr.label(default = "@bazel_tools//tools/allowlists/function_transition_allowlist")
 
 def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
     flags = _cc_compile_flags(ctx, cc_toolchain, feature_configuration)
@@ -262,7 +228,6 @@ def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
             "-nostdlibinc",
             "-Werror=incomplete-umbrella",
             "-Wall",
-            "-Wno-builtin-macro-redefined",
             "-Wno-free-nonheap-object",
             "-Wno-module-import-in-extern-c",
             "-Wno-modules-import-nested-redundant",
@@ -275,11 +240,7 @@ def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
             skip_next = index + 1 < len(flags)
             continue
         if (
-            flag.startswith("--sysroot=") or
-            flag.startswith("-D__DATE__=") or
-            flag.startswith("-D__TIMESTAMP__=") or
-            flag.startswith("-D__TIME__=") or
-            flag.startswith("-ffile-compilation-dir=")
+            flag.startswith("--sysroot=")
         ):
             continue
         if flag.startswith("-I") and _linux_drop_toolchain_include(flag[len("-I"):]):
@@ -395,13 +356,11 @@ def _linux_cc_context_impl(ctx):
 linux_cc_context = rule(
     implementation = _linux_cc_context_impl,
     attrs = {
-        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "x86"),
         "image_format": attr.string(default = "bzImage"),
         "srcarch": attr.string(default = "x86"),
         "target_triple": attr.string(),
     },
-    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Rules_cc-backed Linux toolchain context metadata.",
@@ -786,18 +745,20 @@ def _linux_source_tree_files(ctx):
     files = []
     info = _linux_source_tree_info(ctx)
     if info:
-        files.extend(info.files.to_list())
+        files.extend(info.lookup_files.to_list())
     if hasattr(ctx.files, "source_tree"):
         files.extend(ctx.files.source_tree)
     return files
 
 def _linux_source_tree_inputs(ctx, direct = []):
-    root = _linux_source_root_file(ctx)
-    inputs = list(direct)
-    if root:
-        inputs.append(root)
-    inputs.extend(_linux_source_tree_files(ctx))
-    return inputs
+    return _linux_source_tree_class_inputs(
+        ctx,
+        classes = [
+            "headers",
+            "lookup_files",
+        ],
+        direct = direct,
+    )
 
 def _linux_source_tree_class_inputs(ctx, classes, direct = []):
     root = _linux_source_root_file(ctx)
@@ -831,7 +792,7 @@ def _source_tree_local_include_files(ctx, dirs):
     if not normalized_dirs:
         return []
     inputs = []
-    for file in info.files.to_list():
+    for file in info.local_include_files.to_list():
         relpath = _linux_source_tree_relpath_from_ctx(ctx, file)
         if _linux_object_directory(relpath) in normalized_dirs and _is_local_include_file(relpath):
             inputs.append(file)
@@ -844,6 +805,7 @@ def _linux_object_compile_source_tree_inputs(ctx, src, direct = []):
         ctx,
         classes = [
             "headers",
+            "lookup_files",
         ],
         direct = direct,
     )
@@ -1060,8 +1022,9 @@ def _linux_realmode_pasyms(ctx, objects):
     args.add("-out", out)
     args.add_all(objects)
     ctx.actions.run(
-        executable = ctx.executable._pasyms,
-        inputs = objects + [ctx.executable._llvm_nm],
+        executable = ctx.attr._pasyms[DefaultInfo].files_to_run,
+        inputs = objects,
+        tools = [ctx.attr._llvm_nm[DefaultInfo].files_to_run],
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxRealmodePASYMS",
@@ -1398,10 +1361,23 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         files.append(out)
         include_dirs.append(out.dirname)
 
-    if ctx.attr.object == "lib/crc/crc32-main.o":
-        out = ctx.actions.declare_file(ctx.label.name + ".obj/lib/crc/crc32table.h")
+    if ctx.attr.object in ["lib/crc/crc32-main.o", "lib/crc32.o"]:
+        out = ctx.actions.declare_file(
+            ctx.label.name + ".obj/" + _linux_object_directory(ctx.attr.object) + "/crc32table.h",
+        )
         args = ctx.actions.args()
-        args.add("-kind", "crc32")
+        if ctx.attr.object == "lib/crc32.o":
+            rows = 8
+            if config.config_flags.get("CONFIG_CRC32_SLICEBY4") == "y":
+                rows = 4
+            elif config.config_flags.get("CONFIG_CRC32_SARWATE") == "y":
+                rows = 1
+            elif config.config_flags.get("CONFIG_CRC32_BIT") == "y":
+                rows = 0
+            args.add("-kind", "crc32-legacy")
+            args.add("-rows", rows)
+        else:
+            args.add("-kind", "crc32")
         args.add("-out", out)
         ctx.actions.run(
             executable = ctx.executable._crctables,
@@ -1413,8 +1389,10 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         files.append(out)
         include_dirs.append(out.dirname)
 
-    if ctx.attr.object == "lib/crc/crc64-main.o":
-        out = ctx.actions.declare_file(ctx.label.name + ".obj/lib/crc/crc64table.h")
+    if ctx.attr.object in ["lib/crc/crc64-main.o", "lib/crc64.o"]:
+        out = ctx.actions.declare_file(
+            ctx.label.name + ".obj/" + _linux_object_directory(ctx.attr.object) + "/crc64table.h",
+        )
         args = ctx.actions.args()
         args.add("-kind", "crc64")
         args.add("-out", out)
@@ -1447,13 +1425,15 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
 
     if ctx.attr.object == "arch/x86/lib/inat.o":
         opcode_map = _source_tree_file(ctx, "arch/x86/lib/x86-opcode-map.txt")
+        inat_h = _source_tree_file(ctx, "arch/x86/include/asm/inat.h")
         out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/lib/inat-tables.c")
         args = ctx.actions.args()
         args.add("-in", opcode_map)
+        args.add("-inat_h", inat_h)
         args.add("-out", out)
         ctx.actions.run(
             executable = ctx.executable._insnattr,
-            inputs = [opcode_map],
+            inputs = [inat_h, opcode_map],
             outputs = [out],
             arguments = [args],
             mnemonic = "LinuxInsnAttr",
@@ -1461,28 +1441,6 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         )
         files.append(out)
         include_dirs.append(out.dirname)
-
-    if ctx.attr.object == "certs/system_certificates.o":
-        signing_key = ctx.actions.declare_file(ctx.label.name + ".obj/certs/signing_key.x509")
-        cert_list = ctx.actions.declare_file(ctx.label.name + ".obj/certs/x509_certificate_list")
-        if config:
-            args = ctx.actions.args()
-            args.add("-config", config.config)
-            args.add("-signing_key_out", signing_key)
-            args.add("-cert_list_out", cert_list)
-            ctx.actions.run(
-                executable = ctx.executable._certdata,
-                inputs = depset([], transitive = [config.files]),
-                outputs = [signing_key, cert_list],
-                arguments = [args],
-                mnemonic = "LinuxCertData",
-                progress_message = "Generating Linux certificate data %{label}",
-            )
-        else:
-            ctx.actions.write(signing_key, "")
-            ctx.actions.write(cert_list, "")
-        files.extend([signing_key, cert_list])
-        assembler_include_roots.append(signing_key.dirname[:-len("/certs")])
 
     if ctx.attr.object == "usr/initramfs_data.o":
         initramfs_list = _source_tree_file(ctx, "usr/default_cpio_list")
@@ -1684,6 +1642,7 @@ def _linux_offsets_header(ctx, cc_toolchain, feature_configuration, config, sour
     out = ctx.actions.declare_file(out_path)
     compile_args = ctx.actions.args()
     compile_args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+
     # These preparatory -S compiles are consumed by the offsets parser, so they
     # must emit real assembly even when the kernel itself is built with Clang
     # LTO. LLVM bitcode output from -flto is not parseable as offsets assembly.
@@ -1733,6 +1692,7 @@ def _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, 
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+
     # vDSO objects are built as a separate miniature image, not as part of the
     # final vmlinux LTO unit. Keep their compile path non-LTO even when the
     # kernel proper uses Clang LTO.
@@ -1886,11 +1846,16 @@ def _linux_arm64_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, 
     )
 
     nm = ctx.actions.declare_file(base + "/arch/arm64/kernel/vdso/vdso.so.dbg.nm")
-    ctx.actions.run_shell(
-        inputs = [dbg, ctx.executable._llvm_nm],
+    nm_args = ctx.actions.args()
+    nm_args.add(nm)
+    nm_args.add(ctx.executable._llvm_nm)
+    nm_args.add(dbg)
+    ctx.actions.run(
+        executable = ctx.attr._runandwrite[DefaultInfo].files_to_run,
+        inputs = [dbg],
+        tools = [ctx.attr._llvm_nm[DefaultInfo].files_to_run],
         outputs = [nm],
-        command = "\"$1\" \"$2\" > \"$3\"",
-        arguments = [ctx.executable._llvm_nm.path, dbg.path, nm.path],
+        arguments = [nm_args],
         mnemonic = "LinuxARM64VDSONM",
         progress_message = "Generating Linux arm64 vDSO symbols %{label}",
     )
@@ -2211,9 +2176,16 @@ def _linux_x86_generated_headers_impl(ctx):
     cpufeature_args.add("-cpufeatures", ctx.file.cpufeatures_h)
     cpufeature_args.add("-config", config.config)
     cpufeature_args.add("-out", cpufeaturemasks)
+    if len(ctx.files.required_features_h) > 1:
+        fail("linux_x86_generated_headers requires at most one required-features.h source")
+    if ctx.files.required_features_h:
+        cpufeature_args.add("-legacy")
     ctx.actions.run(
         executable = ctx.executable._cpufeaturemasks,
-        inputs = depset([ctx.file.cpufeatures_h], transitive = [config.files]),
+        inputs = depset(
+            [ctx.file.cpufeatures_h] + ctx.files.required_features_h,
+            transitive = [config.files],
+        ),
         outputs = [cpufeaturemasks],
         arguments = [cpufeature_args],
         mnemonic = "LinuxCPUFeatureMasks",
@@ -2282,19 +2254,22 @@ def _linux_x86_generated_headers_impl(ctx):
         headers,
     )
     headers.append(asm_offsets_h)
-    rq_offsets_h = _linux_offsets_header(
-        ctx,
-        cc_toolchain,
-        feature_configuration,
-        config,
-        source_root,
-        include_dirs,
-        ctx.file.rq_offsets_c,
-        base + "/include/generated/rq-offsets.h",
-        "__RQ_OFFSETS_H__",
-        headers,
-    )
-    headers.append(rq_offsets_h)
+    if len(ctx.files.rq_offsets_c) > 1:
+        fail("linux_x86_generated_headers requires at most one rq-offsets.c source")
+    if ctx.files.rq_offsets_c:
+        rq_offsets_h = _linux_offsets_header(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            source_root,
+            include_dirs,
+            ctx.files.rq_offsets_c[0],
+            base + "/include/generated/rq-offsets.h",
+            "__RQ_OFFSETS_H__",
+            headers,
+        )
+        headers.append(rq_offsets_h)
     kvm_asm_offsets_h = _linux_offsets_header(
         ctx,
         cc_toolchain,
@@ -2326,7 +2301,6 @@ def _linux_x86_generated_headers_impl(ctx):
 linux_x86_generated_headers = rule(
     implementation = _linux_x86_generated_headers_impl,
     attrs = {
-        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "x86"),
         "asm_offsets_c": attr.label(allow_single_file = True, mandatory = True),
         "bounds_c": attr.label(allow_single_file = True, mandatory = True),
@@ -2334,7 +2308,8 @@ linux_x86_generated_headers = rule(
         "cpufeatures_h": attr.label(allow_single_file = True, mandatory = True),
         "kvm_asm_offsets_c": attr.label(allow_single_file = True, mandatory = True),
         "orc_types_h": attr.label(allow_single_file = True, mandatory = True),
-        "rq_offsets_c": attr.label(allow_single_file = True, mandatory = True),
+        "required_features_h": attr.label(allow_files = True, mandatory = True),
+        "rq_offsets_c": attr.label(allow_files = True, mandatory = True),
         "source_root": attr.label(allow_single_file = True, mandatory = True),
         "source_tree": attr.label_list(allow_files = True),
         "syscall_32_tbl": attr.label(allow_single_file = True, mandatory = True),
@@ -2386,7 +2361,6 @@ linux_x86_generated_headers = rule(
             executable = True,
         ),
     },
-    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Generates the x86 header subset normally produced before compiling Linux C objects.",
@@ -2452,7 +2426,15 @@ def _linux_arm64_generated_headers_impl(ctx):
     source_root = _linux_source_root_path(ctx)
     headers = []
 
-    for header in _ARM64_ASM_GENERIC_WRAPPERS:
+    if len(ctx.files.arm64_cfi_h) > 1:
+        fail("linux_arm64_generated_headers requires at most one arm64 cfi.h source")
+    asm_generic_wrappers = _ARM64_ASM_GENERIC_WRAPPERS
+
+    # arm64 gained its own cfi.h in Linux 6.18; older kernels use the mandatory asm-generic fallback.
+    if not ctx.files.arm64_cfi_h:
+        asm_generic_wrappers = ["cfi.h"] + asm_generic_wrappers
+
+    for header in asm_generic_wrappers:
         out = ctx.actions.declare_file(base + "/arch/arm64/include/generated/asm/" + header)
         ctx.actions.write(
             output = out,
@@ -2614,20 +2596,23 @@ def _linux_arm64_generated_headers_impl(ctx):
         progress_message = "Generating Linux arm64 stack protector flags %{label}",
     )
     headers.append(generated_cflags)
-    rq_offsets_h = _linux_offsets_header(
-        ctx,
-        cc_toolchain,
-        feature_configuration,
-        config,
-        source_root,
-        include_dirs,
-        ctx.file.rq_offsets_c,
-        base + "/include/generated/rq-offsets.h",
-        "__RQ_OFFSETS_H__",
-        headers,
-        srcarch = "arm64",
-    )
-    headers.append(rq_offsets_h)
+    if len(ctx.files.rq_offsets_c) > 1:
+        fail("linux_arm64_generated_headers requires at most one rq-offsets.c source")
+    if ctx.files.rq_offsets_c:
+        rq_offsets_h = _linux_offsets_header(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            source_root,
+            include_dirs,
+            ctx.files.rq_offsets_c[0],
+            base + "/include/generated/rq-offsets.h",
+            "__RQ_OFFSETS_H__",
+            headers,
+            srcarch = "arm64",
+        )
+        headers.append(rq_offsets_h)
     hyp_constants_h = _linux_offsets_header(
         ctx,
         cc_toolchain,
@@ -2673,14 +2658,14 @@ def _linux_arm64_generated_headers_impl(ctx):
 linux_arm64_generated_headers = rule(
     implementation = _linux_arm64_generated_headers_impl,
     attrs = {
-        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "arm64"),
+        "arm64_cfi_h": attr.label(allow_files = True, mandatory = True),
         "asm_offsets_c": attr.label(allow_single_file = True, mandatory = True),
         "bounds_c": attr.label(allow_single_file = True, mandatory = True),
         "config": attr.label(providers = [LinuxConfigInfo], mandatory = True),
         "cpucaps": attr.label(allow_single_file = True, mandatory = True),
         "hyp_constants_c": attr.label(allow_single_file = True, mandatory = True),
-        "rq_offsets_c": attr.label(allow_single_file = True, mandatory = True),
+        "rq_offsets_c": attr.label(allow_files = True, mandatory = True),
         "source_root": attr.label(allow_single_file = True, mandatory = True),
         "source_tree": attr.label_list(allow_files = True),
         "syscall_32_tbl": attr.label(allow_single_file = True, mandatory = True),
@@ -2706,6 +2691,11 @@ linux_arm64_generated_headers = rule(
             allow_single_file = True,
             cfg = "exec",
             default = Label("@llvm//tools:llvm-objcopy"),
+            executable = True,
+        ),
+        "_runandwrite": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/runandwrite"),
             executable = True,
         ),
         "_offsetsheader": attr.label(
@@ -2739,7 +2729,6 @@ linux_arm64_generated_headers = rule(
             executable = True,
         ),
     },
-    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Generates the arm64 header subset normally produced before compiling Linux C objects.",
@@ -2785,8 +2774,24 @@ def _linux_config_impl(ctx):
     ctx.actions.write(autoconf_h, "\n".join(header_lines) + "\n")
     ctx.actions.write(rustc_cfg, "\n".join(rustc_lines) + "\n")
     ctx.actions.write(kernel_release, kernel_release_value + "\n")
-    ctx.actions.write(aflags, "")
-    ctx.actions.write(cflags, "")
+
+    if ctx.attr.arch:
+        cflags_args = ctx.actions.args()
+        cflags_args.add("-config", config)
+        cflags_args.add("-arch", ctx.attr.arch)
+        cflags_args.add("-out", cflags)
+        cflags_args.add("-asm_out", aflags)
+        ctx.actions.run(
+            executable = ctx.executable._kernelflags,
+            inputs = [config],
+            outputs = [aflags, cflags],
+            arguments = [cflags_args],
+            mnemonic = "LinuxKernelCFlags",
+            progress_message = "Generating Linux compiler flags %{label}",
+        )
+    else:
+        ctx.actions.write(aflags, "")
+        ctx.actions.write(cflags, "")
 
     files = depset([config, auto_conf, auto_conf_cmd, autoconf_h, rustc_cfg, kernel_release, aflags, cflags])
     include_dir = autoconf_h.dirname
@@ -2813,9 +2818,17 @@ def _linux_config_impl(ctx):
 linux_config = rule(
     implementation = _linux_config_impl,
     attrs = {
+        "arch": attr.string(
+            doc = "Linux ARCH. When set, derive global compiler and assembler flags from this config.",
+        ),
         "config": attr.label(providers = [KconfigInfo]),
         "config_flags": attr.string_dict(),
         "version": attr.string(default = "6.18.2"),
+        "_kernelflags": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/kernelflags:kernelflags"),
+            executable = True,
+        ),
     },
     doc = "Materializes Linux config files used by native compile and link actions.",
 )
@@ -3012,39 +3025,22 @@ def _linux_perl_runtime(ctx):
     )
 
 def _linux_object_impl(ctx):
-    if ctx.file.src:
-        return _linux_real_object_impl(ctx)
+    if ctx.attr.object in [
+        "certs/blacklist_hashes.o",
+        "certs/revocation_certificates.o",
+        "certs/system_certificates.o",
+    ]:
+        fail(
+            "linux_object %s builds %s, but hermetic certificate embedding and signing are not implemented" %
+            (ctx.label, ctx.attr.object),
+        )
 
-    out = ctx.actions.declare_file(ctx.label.name + ".object.txt")
-    lines = [
-        "object=%s" % ctx.attr.object,
-        "mode=%s" % ctx.attr.mode,
-    ]
-    for flag in ctx.attr.flags:
-        lines.append("flag=%s" % flag)
-    for flag in ctx.attr.remove_flags:
-        lines.append("remove_flag=%s" % flag)
-    for key in sorted(ctx.attr.config_fragment.keys()):
-        lines.append("%s=%s" % (key, ctx.attr.config_fragment[key]))
-    ctx.actions.write(out, "\n".join(lines) + "\n")
-    info = LinuxObjectInfo(
-        config_fragment = dict(ctx.attr.config_fragment),
-        flags = list(ctx.attr.flags),
-        mode = ctx.attr.mode,
-        object = ctx.attr.object,
-        output = out,
-        real = False,
-        generated_headers = depset(),
-        generated_include_dirs = [],
-        source = "",
-    )
-    return [
-        DefaultInfo(files = depset([out])),
-        info,
-    ]
-
-def _linux_real_object_impl(ctx):
     cc_toolchain = find_cpp_toolchain(ctx)
+    if cc_toolchain.compiler.lower().find("clang") < 0:
+        fail(
+            "linux_object %s requires the Hermetic LLVM Clang toolchain, got compiler %r" %
+            (ctx.label, cc_toolchain.compiler),
+        )
     feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
     compiler = cc_common.get_tool_for_action(
         feature_configuration = feature_configuration,
@@ -3077,7 +3073,6 @@ def _linux_real_object_impl(ctx):
     generated_sources = []
     utsversion_tmp = None
     src = ctx.file.src
-    source_root_file = _linux_source_root_file(ctx)
     make_values = {
         "src": _linux_execroot_dir(ctx.file.src),
     }
@@ -3116,22 +3111,37 @@ def _linux_real_object_impl(ctx):
         generated = ctx.actions.declare_file(ctx.label.name + ".obj/" + ctx.attr.object[:-len(".o")] + ".S")
         perl_runtime = _linux_perl_runtime(ctx)
         if perlasm_kind == "arm64_with_args":
-            command = "\"$1\" \"$2\" void \"$3\""
+            perlasm_args = ctx.actions.args()
+            perlasm_args.add(ctx.file.src)
+            perlasm_args.add("void")
+            perlasm_args.add(generated)
+            ctx.actions.run(
+                executable = perl_runtime.interpreter,
+                inputs = depset(
+                    [ctx.file.src],
+                    transitive = [perl_runtime.files],
+                ),
+                outputs = [generated],
+                arguments = [perlasm_args],
+                mnemonic = "LinuxPerlAsm",
+                progress_message = "Generating Linux perlasm source %{label}",
+            )
         else:
-            command = "\"$1\" \"$2\" > \"$3\""
-        ctx.actions.run_shell(
-            inputs = depset(
-                [ctx.file.src],
-                transitive = [
-                    perl_runtime.files,
-                ],
-            ),
-            outputs = [generated],
-            command = command,
-            arguments = [perl_runtime.interpreter.path, ctx.file.src.path, generated.path],
-            mnemonic = "LinuxPerlAsm",
-            progress_message = "Generating Linux perlasm source %{label}",
-        )
+            perlasm_args = ctx.actions.args()
+            perlasm_args.add(generated)
+            perlasm_args.add(perl_runtime.interpreter)
+            perlasm_args.add(ctx.file.src)
+            ctx.actions.run(
+                executable = ctx.attr._runandwrite[DefaultInfo].files_to_run,
+                inputs = depset(
+                    [ctx.file.src],
+                    transitive = [perl_runtime.files],
+                ),
+                outputs = [generated],
+                arguments = [perlasm_args],
+                mnemonic = "LinuxPerlAsm",
+                progress_message = "Generating Linux perlasm source %{label}",
+            )
         src = generated
         generated_sources.append(generated)
     if config and _flags_need_utsversion_tmp(ctx.attr.flags):
@@ -3281,14 +3291,10 @@ def _linux_real_object_impl(ctx):
     args.add("-o")
     args.add(compile_out)
 
-    generated_files = []
-    for generated in ctx.attr.generated:
-        generated_files.append(generated[LinuxGeneratedInfo].output)
-
     direct_inputs = _linux_object_compile_source_tree_inputs(
         ctx,
         src,
-        direct = [src] + generated_files + generated_object_headers + generated_sources + generated_inputs.files + config_flag_inputs.inputs,
+        direct = [src] + generated_object_headers + generated_sources + generated_inputs.files + config_flag_inputs.inputs,
     )
     if src != ctx.file.src:
         direct_inputs.append(ctx.file.src)
@@ -3322,17 +3328,17 @@ def _linux_real_object_impl(ctx):
             progress_message = "Objcopying Linux object %{label}",
         )
         if needs_relacheck:
-            ctx.actions.run_shell(
+            relacheck_args = ctx.actions.args()
+            relacheck_args.add(objcopy_out)
+            relacheck_args.add(out)
+            relacheck_args.add(ctx.executable.relacheck)
+            relacheck_args.add(compile_out)
+            ctx.actions.run(
+                executable = ctx.attr._copyandrun[DefaultInfo].files_to_run,
                 inputs = [objcopy_out, compile_out],
-                tools = [ctx.executable.relacheck],
+                tools = [ctx.attr.relacheck[DefaultInfo].files_to_run],
                 outputs = [out],
-                arguments = [
-                    objcopy_out.path,
-                    out.path,
-                    ctx.executable.relacheck.path,
-                    compile_out.path,
-                ],
-                command = "cp \"$1\" \"$2\" && chmod u+w \"$2\" && \"$3\" \"$2\" \"$4\"",
+                arguments = [relacheck_args],
                 mnemonic = "LinuxObjectRelacheck",
                 progress_message = "Checking Linux arm64 PI relocations %{label}",
             )
@@ -3353,7 +3359,6 @@ def _linux_real_object_impl(ctx):
         mode = ctx.attr.mode,
         object = ctx.attr.object,
         output = out,
-        real = True,
         generated_headers = depset(exported_generated_headers),
         generated_include_dirs = exported_generated_include_dirs,
         source = ctx.file.src.short_path,
@@ -3370,20 +3375,18 @@ def _linux_real_object_impl(ctx):
 linux_object = rule(
     implementation = _linux_object_impl,
     attrs = {
-        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "x86"),
         "config_fragment": attr.string_dict(),
         "config": attr.label(providers = [LinuxConfigInfo]),
         "deps": attr.label_list(providers = [LinuxObjectInfo]),
         "flags": attr.string_list(),
         "remove_flags": attr.string_list(),
-        "generated": attr.label_list(providers = [LinuxGeneratedInfo]),
         "generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
         "include_dirs": attr.string_list(),
         "mode": attr.string(values = ["y", "m"], mandatory = True),
         "modname": attr.string(),
         "object": attr.string(mandatory = True),
-        "src": attr.label(allow_single_file = True),
+        "src": attr.label(allow_single_file = True, mandatory = True),
         "srcarch": attr.string(),
         "source_tree_info": attr.label(
             providers = [LinuxSourceTreeInfo],
@@ -3404,14 +3407,14 @@ linux_object = rule(
             default = Label("//internal/cmd/versionheaders"),
             executable = True,
         ),
-        "_certdata": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/certdata"),
-            executable = True,
-        ),
         "_capflags": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/capflags"),
+            executable = True,
+        ),
+        "_copyandrun": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/copyandrun"),
             executable = True,
         ),
         "_conmakehash": attr.label(
@@ -3476,50 +3479,26 @@ linux_object = rule(
             default = Label("//internal/cmd/realmoderelocs"),
             executable = True,
         ),
+        "_runandwrite": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/runandwrite"),
+            executable = True,
+        ),
         "_vdso2c": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/vdso2c"),
             executable = True,
         ),
     },
-    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain() + [_PERL_TOOLCHAIN],
-    doc = "Placeholder for one Linux object variant keyed by a reduced Kconfig fragment.",
+    doc = "Compiles one source-backed Linux object variant keyed by a reduced Kconfig fragment.",
 )
 
 def _linux_composite_object_impl(ctx):
     object_infos = [obj[LinuxObjectInfo] for obj in ctx.attr.objects]
-    if object_infos and all([info.real for info in object_infos]):
-        return _linux_real_composite_object_impl(ctx, object_infos)
-
-    out = ctx.actions.declare_file(ctx.label.name + ".object.txt")
-    lines = [
-        "composite=%s" % ctx.attr.object,
-        "mode=%s" % ctx.attr.mode,
-    ]
-    for info in object_infos:
-        lines.append("member=%s mode=%s output=%s" % (info.object, info.mode, info.output.short_path))
-    for key in sorted(ctx.attr.config_fragment.keys()):
-        lines.append("%s=%s" % (key, ctx.attr.config_fragment[key]))
-    ctx.actions.write(out, "\n".join(lines) + "\n")
-    info = LinuxObjectInfo(
-        config_fragment = dict(ctx.attr.config_fragment),
-        flags = [],
-        mode = ctx.attr.mode,
-        object = ctx.attr.object,
-        output = out,
-        real = False,
-        generated_headers = depset(),
-        generated_include_dirs = [],
-        source = "",
-    )
-    return [
-        DefaultInfo(files = depset([out])),
-        info,
-    ]
-
-def _linux_real_composite_object_impl(ctx, object_infos):
+    if not object_infos:
+        fail("linux_composite_object %s requires at least one member object" % ctx.label)
     cc_toolchain = find_cpp_toolchain(ctx)
     feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
     linker = cc_common.get_tool_for_action(
@@ -3549,7 +3528,6 @@ def _linux_real_composite_object_impl(ctx, object_infos):
         mode = ctx.attr.mode,
         object = ctx.attr.object,
         output = out,
-        real = True,
         generated_headers = depset(transitive = [info.generated_headers for info in object_infos]),
         generated_include_dirs = _unique_strings([include_dir for info in object_infos for include_dir in info.generated_include_dirs]),
         source = "",
@@ -3563,14 +3541,12 @@ def _linux_real_composite_object_impl(ctx, object_infos):
 linux_composite_object = rule(
     implementation = _linux_composite_object_impl,
     attrs = {
-        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "x86"),
         "config_fragment": attr.string_dict(),
         "mode": attr.string(values = ["y", "m"], mandatory = True),
         "object": attr.string(mandatory = True),
         "objects": attr.label_list(providers = [LinuxObjectInfo], mandatory = True),
     },
-    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Links Kbuild composite object members into one relocatable object.",
@@ -3632,9 +3608,8 @@ def _linux_link_relocatable(ctx, linker, cc_toolchain, feature_configuration, ou
 
 def _linux_arm64_nvhe_object_impl(ctx):
     object_infos = [obj[LinuxObjectInfo] for obj in ctx.attr.objects]
-    missing = [info.object for info in object_infos if not info.real]
-    if missing:
-        fail("linux_arm64_nvhe_object %s requires real member objects:\n%s" % (ctx.label, "\n".join(missing)))
+    if not object_infos:
+        fail("linux_arm64_nvhe_object %s requires at least one member object" % ctx.label)
     if not ctx.attr.config:
         fail("linux_arm64_nvhe_object %s requires config" % ctx.label)
     if not ctx.attr.generated_headers:
@@ -3679,11 +3654,16 @@ def _linux_arm64_nvhe_object_impl(ctx):
     )
 
     reloc_s = ctx.actions.declare_file(ctx.label.name + ".obj/arch/arm64/kvm/hyp/nvhe/hyp-reloc.S")
-    ctx.actions.run_shell(
-        inputs = [tmp, ctx.executable._genhyprel],
+    reloc_args = ctx.actions.args()
+    reloc_args.add(reloc_s)
+    reloc_args.add(ctx.executable._genhyprel)
+    reloc_args.add(tmp)
+    ctx.actions.run(
+        executable = ctx.attr._runandwrite[DefaultInfo].files_to_run,
+        inputs = [tmp],
+        tools = [ctx.attr._genhyprel[DefaultInfo].files_to_run],
         outputs = [reloc_s],
-        command = "\"$1\" \"$2\" > \"$3\"",
-        arguments = [ctx.executable._genhyprel.path, tmp.path, reloc_s.path],
+        arguments = [reloc_args],
         mnemonic = "LinuxArm64NvheHypReloc",
         progress_message = "Generating Linux arm64 nVHE relocation source %{label}",
     )
@@ -3729,7 +3709,6 @@ def _linux_arm64_nvhe_object_impl(ctx):
         mode = ctx.attr.mode,
         object = ctx.attr.object,
         output = out,
-        real = True,
         generated_headers = depset(transitive = [info.generated_headers for info in object_infos]),
         generated_include_dirs = _unique_strings([include_dir for info in object_infos for include_dir in info.generated_include_dirs]),
         source = "",
@@ -3743,7 +3722,6 @@ def _linux_arm64_nvhe_object_impl(ctx):
 linux_arm64_nvhe_object = rule(
     implementation = _linux_arm64_nvhe_object_impl,
     attrs = {
-        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "arm64"),
         "config_fragment": attr.string_dict(),
         "config": attr.label(providers = [LinuxConfigInfo]),
@@ -3767,64 +3745,19 @@ linux_arm64_nvhe_object = rule(
             default = Label("@llvm//tools:llvm-objcopy"),
             executable = True,
         ),
+        "_runandwrite": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/runandwrite"),
+            executable = True,
+        ),
     },
-    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Builds the arm64 nVHE KVM custom composite object with hyp relocations.",
 )
 
-def _linux_generated_file_impl(ctx):
-    out = ctx.actions.declare_file(ctx.label.name + ".generated.txt")
-    lines = [
-        "generated=%s" % ctx.attr.target,
-    ]
-    for src in ctx.files.srcs:
-        lines.append("src=%s" % src.short_path)
-    ctx.actions.write(out, "\n".join(lines) + "\n")
-    info = LinuxGeneratedInfo(
-        output = out,
-        target = ctx.attr.target,
-    )
-    return [
-        DefaultInfo(files = depset([out])),
-        info,
-    ]
-
-linux_generated_file = rule(
-    implementation = _linux_generated_file_impl,
-    attrs = {
-        "srcs": attr.label_list(allow_files = True),
-        "target": attr.string(mandatory = True),
-    },
-    doc = "Placeholder native action for a generated Linux source or header target.",
-)
-
 def _linux_archive_impl(ctx):
     object_infos = [obj[LinuxObjectInfo] for obj in ctx.attr.objects]
-    if object_infos and all([info.real for info in object_infos]):
-        return _linux_real_archive_impl(ctx, object_infos)
-
-    out = ctx.actions.declare_file(ctx.label.name + ".archive.txt")
-    lines = [
-        "archive=%s" % ctx.label.name,
-        "kind=%s" % ctx.attr.kind,
-    ]
-    for info in object_infos:
-        lines.append("object=%s mode=%s output=%s" % (info.object, info.mode, info.output.short_path))
-    ctx.actions.write(out, "\n".join(lines) + "\n")
-    info = LinuxArchiveInfo(
-        kind = ctx.attr.kind,
-        objects = object_infos,
-        output = out,
-        real = False,
-    )
-    return [
-        DefaultInfo(files = depset([out])),
-        info,
-    ]
-
-def _linux_real_archive_impl(ctx, object_infos):
     cc_toolchain = find_cpp_toolchain(ctx)
     feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
     archiver = cc_common.get_tool_for_action(
@@ -3848,7 +3781,6 @@ def _linux_real_archive_impl(ctx, object_infos):
         kind = ctx.attr.kind,
         objects = object_infos,
         output = out,
-        real = True,
     )
     return [
         DefaultInfo(files = depset([out])),
@@ -3858,7 +3790,6 @@ def _linux_real_archive_impl(ctx, object_infos):
 linux_archive = rule(
     implementation = _linux_archive_impl,
     attrs = {
-        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "x86"),
         "kind": attr.string(
             default = "built-in.a",
@@ -3870,45 +3801,15 @@ linux_archive = rule(
         ),
         "objects": attr.label_list(providers = [LinuxObjectInfo]),
     },
-    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
-    doc = "Placeholder native archive action for built-in.a, lib.a, or module object groups.",
+    doc = "Archives compiled Linux objects into built-in.a, lib.a, or module object groups.",
 )
 
 def _linux_compact_image_impl(ctx):
     object_infos = [obj[LinuxObjectInfo] for obj in ctx.attr.objects]
-    if object_infos and all([info.real for info in object_infos]):
-        return _linux_real_compact_image_impl(ctx, object_infos)
-    missing = [info.object for info in object_infos if not info.real]
-    if ctx.attr.require_real and missing:
-        fail("linux_compact_image %s still has non-real object inputs:\n%s" % (ctx.label, "\n".join(missing)))
-
-    out = ctx.actions.declare_file(ctx.label.name + ".image.txt")
-    lines = ["image=%s" % ctx.label.name]
-    for info in object_infos:
-        lines.append("object=%s mode=%s output=%s" % (info.object, info.mode, info.output.short_path))
-    object_outputs = [info.output for info in object_infos]
-    ctx.actions.run_shell(
-        inputs = object_outputs,
-        outputs = [out],
-        command = "cat > \"$1\" <<'EOF'\n%s\nEOF\n" % ("\n".join(lines)),
-        arguments = [out.path],
-        mnemonic = "LinuxCompactImage",
-        progress_message = "Collecting compact Linux image inputs %{label}",
-    )
-    info = LinuxImageInfo(
-        archives = [],
-        generated = [],
-        objects = object_infos,
-        output = out,
-    )
-    return [
-        DefaultInfo(files = depset([out])),
-        info,
-    ]
-
-def _linux_real_compact_image_impl(ctx, object_infos):
+    if not object_infos:
+        fail("linux_compact_image %s requires at least one compiled object" % ctx.label)
     cc_toolchain = find_cpp_toolchain(ctx)
     feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
     archiver = cc_common.get_tool_for_action(
@@ -3931,7 +3832,6 @@ def _linux_real_compact_image_impl(ctx, object_infos):
     )
     info = LinuxImageInfo(
         archives = [],
-        generated = [],
         objects = object_infos,
         output = out,
     )
@@ -3943,15 +3843,12 @@ def _linux_real_compact_image_impl(ctx, object_infos):
 linux_compact_image = rule(
     implementation = _linux_compact_image_impl,
     attrs = {
-        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "x86"),
         "objects": attr.label_list(providers = [LinuxObjectInfo]),
-        "require_real": attr.bool(),
     },
-    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
-    doc = "Links compact Linux object variants into one relocatable image object when all inputs are real.",
+    doc = "Archives compact Linux object variants into one relocatable image object.",
 )
 
 def _linux_cpp_undef_flags(arch, srcarch):
@@ -4057,8 +3954,9 @@ def _linux_system_map(ctx, input, name):
     nm_args.add("-in", input)
     nm_args.add("-out", nm_out)
     ctx.actions.run(
-        executable = ctx.executable._nmrun,
-        inputs = [input, ctx.executable._llvm_nm],
+        executable = ctx.attr._nmrun[DefaultInfo].files_to_run,
+        inputs = [input],
+        tools = [ctx.attr._llvm_nm[DefaultInfo].files_to_run],
         outputs = [nm_out],
         arguments = [nm_args],
         mnemonic = "LinuxVmlinuxNM",
@@ -4082,10 +3980,11 @@ def _linux_system_map(ctx, input, name):
 def _linux_sorttable(ctx, config, input):
     out = ctx.actions.declare_file(ctx.label.name + ".sorted.vmlinux")
     nm_out = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux.nm-sort")
-    inputs = [input, config.config, ctx.executable._llvm_nm]
+    inputs = [input, config.config]
+    tools = [ctx.attr._llvm_nm[DefaultInfo].files_to_run]
     sorttable_path = ""
     if ctx.executable.sorttable_tool:
-        inputs.append(ctx.executable.sorttable_tool)
+        tools.append(ctx.attr.sorttable_tool[DefaultInfo].files_to_run)
         sorttable_path = ctx.executable.sorttable_tool.path
     args = ctx.actions.args()
     args.add("-config", config.config)
@@ -4096,17 +3995,15 @@ def _linux_sorttable(ctx, config, input):
     args.add("-nm_out", nm_out)
     args.add("-out", out)
     ctx.actions.run(
-        executable = ctx.executable._sorttablerun,
+        executable = ctx.attr._sorttablerun[DefaultInfo].files_to_run,
         inputs = inputs,
+        tools = tools,
         outputs = [out, nm_out],
         arguments = [args],
         mnemonic = "LinuxVmlinuxSortTable",
         progress_message = "Sorting Linux kernel tables %{label}",
     )
     return out
-
-def _shell_quote(value):
-    return "'" + value.replace("'", "'\\''") + "'"
 
 def _linux_strip_vmlinux(ctx, config, input, out):
     set_flags = ["--set-section-flags", ".modinfo=noload"]
@@ -4164,11 +4061,17 @@ def _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, c
         kallsyms_flags.append("--all-symbols")
     if ctx.attr.kallsyms_pc_relative:
         kallsyms_flags.append("--pc-relative")
-    ctx.actions.run_shell(
-        inputs = [kallsyms_tool, system_map],
+    kallsyms_args = ctx.actions.args()
+    kallsyms_args.add(asm)
+    kallsyms_args.add(kallsyms_tool)
+    kallsyms_args.add_all(kallsyms_flags)
+    kallsyms_args.add(system_map)
+    ctx.actions.run(
+        executable = ctx.attr._runandwrite[DefaultInfo].files_to_run,
+        inputs = [system_map],
+        tools = [ctx.attr.kallsyms_tool[DefaultInfo].files_to_run],
         outputs = [asm],
-        command = "\"$1\" %s \"$2\" > \"$3\"" % " ".join(kallsyms_flags),
-        arguments = [kallsyms_tool.path, system_map.path, asm.path],
+        arguments = [kallsyms_args],
         mnemonic = "LinuxKallsyms",
         progress_message = "Generating Linux kallsyms assembly %{label}",
     )
@@ -4184,77 +4087,6 @@ def _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, c
         name + ".kallsyms.o",
         name + ".kallsyms.o",
     )
-
-def _linux_btf_object(ctx, config, input):
-    if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") != "y":
-        return None
-    if not ctx.executable.pahole:
-        fail("linux_vmlinux %s has DEBUG_INFO_BTF enabled and requires pahole" % ctx.label)
-
-    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + input.basename + ".btf.o")
-    btf_vmlinux = ctx.actions.declare_file(ctx.label.name + ".obj/" + input.basename + ".btf")
-    pahole_flags = [
-        "--btf_features=encode_force,var,float,enum64,decl_tag,type_tag,optimized_func,consistent_func,decl_tag_kfuncs",
-        "--btf_features=attributes",
-        "--lang_exclude=rust",
-    ]
-    et_rel = "\\0\\1" if config.config_flags.get("CONFIG_CPU_BIG_ENDIAN") == "y" else "\\1\\0"
-    ctx.actions.run_shell(
-        inputs = [input],
-        tools = [ctx.executable.pahole, ctx.executable._llvm_objcopy],
-        outputs = [btf_vmlinux, out],
-        command = """\
-set -euo pipefail
-cp "$1" "$2"
-chmod u+w "$2"
-LLVM_OBJCOPY="$3" "$4" -J {pahole_flags} "$2"
-"$3" --only-section=.BTF --set-section-flags .BTF=alloc,readonly --strip-all "$2" "$5" 2>/dev/null
-printf '{et_rel}' | dd of="$5" conv=notrunc bs=1 seek=16 status=none
-""".format(
-            et_rel = et_rel,
-            pahole_flags = " ".join([_shell_quote(flag) for flag in pahole_flags]),
-        ),
-        arguments = [
-            input.path,
-            btf_vmlinux.path,
-            ctx.executable._llvm_objcopy.path,
-            ctx.executable.pahole.path,
-            out.path,
-        ],
-        mnemonic = "LinuxBTF",
-        progress_message = "Generating Linux BTF %{label}",
-    )
-    return out
-
-def _linux_resolve_btfids(ctx, config, input):
-    if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") != "y":
-        return input
-    if not ctx.executable.resolve_btfids_tool:
-        fail("linux_vmlinux %s has DEBUG_INFO_BTF enabled and requires resolve_btfids_tool" % ctx.label)
-
-    out = ctx.actions.declare_file(ctx.label.name + ".btfids.vmlinux.unstripped")
-    args = []
-    if config.config_flags.get("CONFIG_WERROR") == "y":
-        args.append("--fatal_warnings")
-    ctx.actions.run_shell(
-        inputs = [input],
-        tools = [ctx.executable.resolve_btfids_tool],
-        outputs = [out],
-        command = """\
-set -euo pipefail
-cp "$1" "$2"
-chmod u+w "$2"
-"$3" {args} "$2"
-""".format(args = " ".join([_shell_quote(arg) for arg in args])),
-        arguments = [
-            input.path,
-            out.path,
-            ctx.executable.resolve_btfids_tool.path,
-        ],
-        mnemonic = "LinuxResolveBTFIDs",
-        progress_message = "Resolving Linux BTF IDs %{label}",
-    )
-    return out
 
 def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, out, strip_debug):
     inputs = depset(
@@ -4411,7 +4243,7 @@ def _linux_vmlinux_link_flags(ctx, config):
         ])
     return flags
 
-def _linux_vmlinux_initcalls_linker_script(ctx, config, source_root, image_object):
+def _linux_vmlinux_initcalls_linker_script(ctx, config):
     if config.config_flags.get("CONFIG_LTO_CLANG_THIN") != "y" and config.config_flags.get("CONFIG_LTO_CLANG_FULL") != "y":
         return None
 
@@ -4440,9 +4272,9 @@ def _linux_vmlinux_initcalls_linker_script(ctx, config, source_root, image_objec
 """)
     return out
 
-def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature_configuration, source_root, image_object, image_object_inputs):
+def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/vmlinux.o")
-    initcalls_linker_script = _linux_vmlinux_initcalls_linker_script(ctx, config, source_root, image_object)
+    initcalls_linker_script = _linux_vmlinux_initcalls_linker_script(ctx, config)
     args = ctx.actions.args()
     if ctx.attr.format == "arm64":
         executable = _linux_x86_tool_sibling(linker, "ld.lld")
@@ -4516,14 +4348,14 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
     )
     return out
 
-def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, source_root, image_object, image_object_inputs):
+def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs):
     needs_relocatable = (
         config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y" or
         config.config_flags.get("CONFIG_LTO_CLANG_FULL") == "y" or
         ctx.executable.objtool
     )
     if needs_relocatable:
-        image_object = _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature_configuration, source_root, image_object, image_object_inputs)
+        image_object = _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs)
     if not ctx.executable.objtool:
         return image_object
 
@@ -4534,8 +4366,9 @@ def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configurat
     args.add("-in", image_object)
     args.add("-out", out)
     ctx.actions.run(
-        executable = ctx.executable._objtoolrun,
-        inputs = [config.config, image_object, ctx.executable.objtool],
+        executable = ctx.attr._objtoolrun[DefaultInfo].files_to_run,
+        inputs = [config.config, image_object],
+        tools = [ctx.attr.objtool[DefaultInfo].files_to_run],
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxObjtool",
@@ -4543,7 +4376,7 @@ def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configurat
     )
     return out
 
-def _linux_real_vmlinux_impl(ctx):
+def _linux_vmlinux_impl(ctx):
     if not ctx.attr.config:
         fail("linux_vmlinux with image requires config")
     if not ctx.attr.generated_headers:
@@ -4583,7 +4416,7 @@ def _linux_real_vmlinux_impl(ctx):
         ["-fno-function-sections", "-fno-data-sections", "-include", "generated/utsversion.h"],
     )
     image_object_inputs = depset([info.output for info in image.objects])
-    image_object = _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, source_root, image.output, image_object_inputs)
+    image_object = _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, image.output, image_object_inputs)
 
     kallsyms_object = None
     if ctx.attr.kallsyms == "auto":
@@ -4597,29 +4430,21 @@ def _linux_real_vmlinux_impl(ctx):
         ctx.actions.write(empty_map, "")
         kallsyms_object = _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, empty_map, ".tmp_vmlinux0", ctx.executable.kallsyms_tool)
 
-    btf_object = None
-    if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") == "y":
-        btf_base = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux.btf")
-        _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, None, btf_base, False)
-        btf_object = _linux_btf_object(ctx, config, btf_base)
-
     if kallsyms_enabled:
         for i in range(1, 5):
             tmp = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux%d" % i)
-            _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, tmp, True)
+            _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, None, tmp, True)
             system_map = _linux_system_map(ctx, tmp, ".tmp_vmlinux%d" % i)
             kallsyms_object = _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, system_map, ".tmp_vmlinux%d" % i, ctx.executable.kallsyms_tool)
 
     unstripped = ctx.actions.declare_file(ctx.label.name + ".vmlinux.unstripped")
-    linked = _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, unstripped, False)
-    linked = _linux_resolve_btfids(ctx, config, linked)
+    linked = _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, None, unstripped, False)
     unstripped = _linux_sorttable(ctx, config, linked)
     out = ctx.actions.declare_file(ctx.label.name + ".vmlinux")
     out = _linux_strip_vmlinux(ctx, config, unstripped, out)
     system_map = _linux_system_map(ctx, out, "System.map")
     info = LinuxImageInfo(
         archives = image.archives,
-        generated = image.generated,
         objects = image.objects,
         output = out,
     )
@@ -4629,45 +4454,10 @@ def _linux_real_vmlinux_impl(ctx):
         OutputGroupInfo(system_map = depset([system_map]), vmlinux = depset([out])),
     ]
 
-def _linux_vmlinux_impl(ctx):
-    if ctx.attr.image:
-        return _linux_real_vmlinux_impl(ctx)
-
-    out = ctx.actions.declare_file(ctx.label.name + ".vmlinux.txt")
-    archive_infos = [archive[LinuxArchiveInfo] for archive in ctx.attr.archives]
-    generated_infos = [generated[LinuxGeneratedInfo] for generated in ctx.attr.generated]
-    lines = ["vmlinux=%s" % ctx.label.name]
-    for info in archive_infos:
-        lines.append("archive=%s kind=%s" % (info.output.short_path, info.kind))
-    for info in generated_infos:
-        lines.append("generated=%s output=%s" % (info.target, info.output.short_path))
-    archive_outputs = [info.output for info in archive_infos]
-    generated_outputs = [info.output for info in generated_infos]
-    ctx.actions.run_shell(
-        inputs = archive_outputs + generated_outputs,
-        outputs = [out],
-        command = "cat > \"$1\" <<'EOF'\n%s\nEOF\n" % ("\n".join(lines)),
-        arguments = [out.path],
-        mnemonic = "LinuxVmlinux",
-        progress_message = "Collecting Linux vmlinux inputs %{label}",
-    )
-    info = LinuxImageInfo(
-        archives = archive_infos,
-        generated = generated_infos,
-        objects = [],
-        output = out,
-    )
-    return [
-        DefaultInfo(files = depset([out], transitive = [depset(archive_outputs + generated_outputs)])),
-        info,
-    ]
-
 linux_vmlinux = rule(
     implementation = _linux_vmlinux_impl,
     attrs = {
-        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "x86"),
-        "archives": attr.label_list(providers = [LinuxArchiveInfo]),
         "config": attr.label(providers = [LinuxConfigInfo]),
         "format": attr.string(
             default = "x86_64",
@@ -4676,9 +4466,8 @@ linux_vmlinux = rule(
                 "x86_64",
             ],
         ),
-        "generated": attr.label_list(providers = [LinuxGeneratedInfo]),
         "generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
-        "image": attr.label(providers = [LinuxImageInfo]),
+        "image": attr.label(providers = [LinuxImageInfo], mandatory = True),
         "kallsyms": attr.string(default = "auto", values = ["auto", "false", "true"]),
         "kallsyms_all": attr.bool(),
         "kallsyms_pc_relative": attr.bool(),
@@ -4687,20 +4476,12 @@ linux_vmlinux = rule(
             cfg = "exec",
             executable = True,
         ),
-        "pahole": attr.label(
-            cfg = "exec",
-            executable = True,
-        ),
-        "resolve_btfids_tool": attr.label(
-            cfg = "exec",
-            executable = True,
-        ),
         "source_root": attr.label(allow_single_file = True),
         "source_tree": attr.label_list(allow_files = True),
         "srcarch": attr.string(),
         "kallsyms_tool": attr.label(
             cfg = "exec",
-            doc = "Kernel-source-specific scripts/kallsyms executable. Required when kallsyms is enabled for a real vmlinux link.",
+            doc = "Kernel-source-specific scripts/kallsyms executable. Required when kallsyms is enabled for a vmlinux link.",
             executable = True,
         ),
         "sorttable_tool": attr.label(
@@ -4740,11 +4521,15 @@ linux_vmlinux = rule(
             default = Label("//internal/cmd/sorttablerun"),
             executable = True,
         ),
+        "_runandwrite": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/runandwrite"),
+            executable = True,
+        ),
     },
-    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
-    doc = "Links a native vmlinux ELF when image is set, otherwise emits placeholder metadata.",
+    doc = "Links a native vmlinux ELF from a compact image.",
 )
 
 def _linux_x86_config_enabled(config, key):
@@ -4771,12 +4556,13 @@ def _linux_x86_add_include_flags(args, config, generated_headers, source_root, e
     for include_dir in extra:
         args.add("-I" + include_dir)
 
-def _linux_x86_run_x86boot(ctx, outputs, arguments, inputs = []):
+def _linux_x86_run_x86boot(ctx, outputs, arguments, inputs = [], tools = []):
     args = ctx.actions.args()
     args.add_all(arguments)
     ctx.actions.run(
-        executable = ctx.executable._x86boot,
+        executable = ctx.attr._x86boot[DefaultInfo].files_to_run,
         inputs = inputs,
+        tools = tools,
         outputs = outputs,
         arguments = [args],
         mnemonic = "LinuxX86BootTool",
@@ -4813,7 +4599,8 @@ def _linux_x86_relocs(ctx, vmlinux):
         ctx,
         [out],
         ["relocs", "-tool", ctx.executable.x86_relocs_tool, "-in", vmlinux, "-out", out],
-        inputs = [ctx.executable._x86boot, ctx.executable.x86_relocs_tool, vmlinux],
+        inputs = [vmlinux],
+        tools = [ctx.attr.x86_relocs_tool[DefaultInfo].files_to_run],
     )
     return out
 
@@ -4823,7 +4610,7 @@ def _linux_x86_concat(ctx, inputs, out_relpath):
     for input in inputs:
         args.extend(["-in", input])
     args.extend(["-out", out])
-    _linux_x86_run_x86boot(ctx, [out], args, inputs = [ctx.executable._x86boot] + inputs)
+    _linux_x86_run_x86boot(ctx, [out], args, inputs = inputs)
     return out
 
 def _linux_x86_append_size(ctx, payload, size_inputs, out_relpath):
@@ -4834,7 +4621,7 @@ def _linux_x86_append_size(ctx, payload, size_inputs, out_relpath):
     for input in size_inputs:
         args.extend(["-size-in", input])
     args.extend(["-out", out])
-    _linux_x86_run_x86boot(ctx, [out], args, inputs = [ctx.executable._x86boot] + payload + size_inputs)
+    _linux_x86_run_x86boot(ctx, [out], args, inputs = payload + size_inputs)
     return out
 
 def _linux_x86_lz4(ctx, input, out_relpath):
@@ -4844,8 +4631,8 @@ def _linux_x86_lz4(ctx, input, out_relpath):
     args.add(input)
     args.add(out)
     ctx.actions.run(
-        executable = ctx.executable._lz4,
-        inputs = [ctx.executable._lz4, input],
+        executable = ctx.attr._lz4[DefaultInfo].files_to_run,
+        inputs = [input],
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxX86LZ4",
@@ -4853,13 +4640,30 @@ def _linux_x86_lz4(ctx, input, out_relpath):
     )
     return out
 
+def _linux_x86_gzip(ctx, input, out_relpath):
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
+    _linux_x86_run_x86boot(
+        ctx,
+        [out],
+        ["gzip", "-in", input, "-out", out],
+        inputs = [input],
+    )
+    return out
+
+def _linux_x86_compress(ctx, config, input):
+    if _linux_x86_config_enabled(config, "CONFIG_KERNEL_GZIP"):
+        return _linux_x86_gzip(ctx, input, "arch/x86/boot/compressed/vmlinux.bin.gz.raw")
+    if _linux_x86_config_enabled(config, "CONFIG_KERNEL_LZ4"):
+        return _linux_x86_lz4(ctx, input, "arch/x86/boot/compressed/vmlinux.bin.lz4.raw")
+    fail("x86 kernel compression must select CONFIG_KERNEL_GZIP=y or CONFIG_KERNEL_LZ4=y")
+
 def _linux_x86_piggy(ctx, compressed):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/boot/compressed/piggy.S")
     _linux_x86_run_x86boot(
         ctx,
         [out],
         ["piggy", "-in", compressed, "-out", out],
-        inputs = [ctx.executable._x86boot, compressed],
+        inputs = [compressed],
     )
     return out
 
@@ -4869,7 +4673,7 @@ def _linux_x86_offsets(ctx, input, kind, out_relpath):
         ctx,
         [out],
         ["offsets", "-kind", kind, "-in", input, "-out", out],
-        inputs = [ctx.executable._x86boot, input],
+        inputs = [input],
     )
     return out
 
@@ -4879,7 +4683,7 @@ def _linux_x86_bzimage(ctx, setup_bin, vmlinux_bin):
         ctx,
         [out],
         ["bzimage", "-setup", setup_bin, "-kernel", vmlinux_bin, "-out", out],
-        inputs = [ctx.executable._x86boot, setup_bin, vmlinux_bin],
+        inputs = [setup_bin, vmlinux_bin],
     )
     return out
 
@@ -5087,8 +4891,8 @@ def _linux_x86_compressed_vmlinux(ctx, compiler, linker, archiver, cc_toolchain,
     if ctx.executable.x86_relocs_tool:
         payload_inputs.append(_linux_x86_relocs(ctx, image.output))
     payload = _linux_x86_concat(ctx, payload_inputs, "arch/x86/boot/compressed/vmlinux.bin.all")
-    compressed = _linux_x86_lz4(ctx, payload, "arch/x86/boot/compressed/vmlinux.bin.lz4.raw")
-    compressed_with_size = _linux_x86_append_size(ctx, [compressed], [payload], "arch/x86/boot/compressed/vmlinux.bin.lz4")
+    compressed = _linux_x86_compress(ctx, config, payload)
+    compressed_with_size = _linux_x86_append_size(ctx, [compressed], [payload], "arch/x86/boot/compressed/vmlinux.bin.compressed")
     piggy = _linux_x86_piggy(ctx, compressed_with_size)
     inat_tables = _linux_x86_inat_tables(ctx)
 
@@ -5307,7 +5111,7 @@ def _linux_x86_cpustr(ctx, generated_headers):
         ctx,
         [out],
         ["cpustr", "-cpufeatures", cpufeatures, "-masks", masks, "-out", out],
-        inputs = [ctx.executable._x86boot, cpufeatures, masks],
+        inputs = [cpufeatures, masks],
     )
     return out
 
@@ -5384,13 +5188,13 @@ def _linux_x86_setup_bin(ctx, compiler, linker, cc_toolchain, feature_configurat
     )
     return _linux_x86_objcopy(ctx, setup_elf, "arch/x86/boot/setup.bin", ["-O", "binary"])
 
-def _linux_real_x86_bzimage_impl(ctx):
+def _linux_x86_bzimage_impl(ctx):
     if not ctx.attr.config:
-        fail("linux_compressed_image with real x86 output requires config")
+        fail("linux_compressed_image with x86_bzimage format requires config")
     if not ctx.attr.generated_headers:
-        fail("linux_compressed_image with real x86 output requires generated_headers")
+        fail("linux_compressed_image with x86_bzimage format requires generated_headers")
     if not ctx.file.source_root:
-        fail("linux_compressed_image with real x86 output requires source_root")
+        fail("linux_compressed_image with x86_bzimage format requires source_root")
 
     image = ctx.attr.image[LinuxImageInfo]
     config = ctx.attr.config[LinuxConfigInfo]
@@ -5431,46 +5235,20 @@ def _linux_real_x86_bzimage_impl(ctx):
     out = _linux_x86_bzimage(ctx, setup_bin, vmlinux_bin)
     info = LinuxImageInfo(
         archives = image.archives,
-        generated = image.generated,
         objects = image.objects,
         output = out,
     )
-    module_outputs = _linux_empty_module_outputs(ctx)
     return [
         DefaultInfo(files = depset([out])),
         info,
-        OutputGroupInfo(
-            bzimage = depset([out]),
-            modinfo = depset([module_outputs.modinfo]),
-            modules = depset([module_outputs.modules]),
-        ),
+        OutputGroupInfo(bzimage = depset([out])),
     ]
 
-def _linux_empty_module_outputs(ctx):
-    modinfo = ctx.actions.declare_file(ctx.label.name + ".modules.builtin.modinfo")
-    modules = ctx.actions.declare_directory(ctx.label.name + ".modules")
-    ctx.actions.write(modinfo, "")
-    args = ctx.actions.args()
-    args.add_all(["empty-dir", "-out"])
-    args.add(modules.path)
-    ctx.actions.run(
-        executable = ctx.executable._x86boot,
-        inputs = [ctx.executable._x86boot],
-        outputs = [modules],
-        arguments = [args],
-        mnemonic = "LinuxEmptyModules",
-        progress_message = "Creating empty Linux module output group %{label}",
-    )
-    return struct(
-        modinfo = modinfo,
-        modules = modules,
-    )
-
-def _linux_packaged_output_impl(ctx):
-    if getattr(ctx.attr, "format", "placeholder") == "x86_bzimage":
-        return _linux_real_x86_bzimage_impl(ctx)
-    if getattr(ctx.attr, "format", "placeholder") == "arm64_image":
-        return _linux_real_objcopy_image_impl(ctx, [
+def _linux_compressed_image_impl(ctx):
+    if ctx.attr.format == "x86_bzimage":
+        return _linux_x86_bzimage_impl(ctx)
+    if ctx.attr.format == "arm64_image":
+        return _linux_objcopy_image_impl(ctx, [
             "-O",
             "binary",
             "-R",
@@ -5483,38 +5261,12 @@ def _linux_packaged_output_impl(ctx):
             ".comment",
             "-S",
         ])
-
-    image = ctx.attr.image[LinuxImageInfo]
-    out = ctx.actions.declare_file(ctx.label.name + "." + ctx.attr.extension + ".txt")
-    lines = [
-        "%s=%s" % (ctx.attr.kind, ctx.label.name),
-        "input=%s" % image.output.short_path,
-    ]
-    ctx.actions.run_shell(
-        inputs = [image.output],
-        outputs = [out],
-        command = "cat > \"$1\" <<'EOF'\n%s\nEOF\n" % ("\n".join(lines)),
-        arguments = [out.path],
-        mnemonic = "LinuxPackagedOutput",
-        progress_message = "Collecting Linux packaged output inputs %{label}",
+    fail(
+        "linux_compressed_image %s requires format \"x86_bzimage\" or \"arm64_image\"" %
+        ctx.label,
     )
-    info = LinuxImageInfo(
-        archives = image.archives,
-        generated = image.generated,
-        objects = image.objects,
-        output = out,
-    )
-    module_outputs = _linux_empty_module_outputs(ctx)
-    return [
-        DefaultInfo(files = depset([out])),
-        info,
-        OutputGroupInfo(
-            modinfo = depset([module_outputs.modinfo]),
-            modules = depset([module_outputs.modules]),
-        ),
-    ]
 
-def _linux_real_objcopy_image_impl(ctx, objcopy_flags):
+def _linux_objcopy_image_impl(ctx, objcopy_flags):
     image = ctx.attr.image[LinuxImageInfo]
     out = ctx.actions.declare_file(ctx.label.name + "." + ctx.attr.extension)
     args = ctx.actions.args()
@@ -5531,39 +5283,30 @@ def _linux_real_objcopy_image_impl(ctx, objcopy_flags):
     )
     info = LinuxImageInfo(
         archives = image.archives,
-        generated = image.generated,
         objects = image.objects,
         output = out,
     )
-    module_outputs = _linux_empty_module_outputs(ctx)
     return [
         DefaultInfo(files = depset([out])),
         info,
-        OutputGroupInfo(
-            image = depset([out]),
-            modinfo = depset([module_outputs.modinfo]),
-            modules = depset([module_outputs.modules]),
-        ),
+        OutputGroupInfo(image = depset([out])),
     ]
 
 linux_compressed_image = rule(
-    implementation = _linux_packaged_output_impl,
+    implementation = _linux_compressed_image_impl,
     attrs = {
-        "_allowlist_function_transition": _linux_platform_transition_allowlist_attr(),
         "arch": attr.string(default = "x86"),
         "config": attr.label(providers = [LinuxConfigInfo]),
         "extension": attr.string(default = "image"),
         "format": attr.string(
-            default = "placeholder",
+            mandatory = True,
             values = [
                 "arm64_image",
-                "placeholder",
                 "x86_bzimage",
             ],
         ),
         "generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
         "image": attr.label(providers = [LinuxImageInfo], mandatory = True),
-        "kind": attr.string(default = "compressed_image"),
         "source_root": attr.label(allow_single_file = True),
         "source_tree": attr.label_list(allow_files = True),
         "srcarch": attr.string(),
@@ -5593,81 +5336,9 @@ linux_compressed_image = rule(
             executable = True,
         ),
     },
-    cfg = _linux_platform_transition,
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
-    doc = "Placeholder native compressed kernel image action.",
-)
-
-def _linux_module_impl(ctx):
-    image = ctx.attr.image[LinuxImageInfo]
-    dep_infos = [dep[LinuxImageInfo] for dep in ctx.attr.deps]
-    out = ctx.actions.declare_file(ctx.label.name + "." + ctx.attr.extension + ".txt")
-    lines = [
-        "module=%s" % ctx.label.name,
-        "input=%s" % image.output.short_path,
-    ]
-    if ctx.attr.module_name:
-        lines.append("module_name=%s" % ctx.attr.module_name)
-    if ctx.attr.target:
-        lines.append("target=%s" % ctx.attr.target)
-    for src in ctx.files.srcs:
-        lines.append("src=%s" % src.short_path)
-    for dep in dep_infos:
-        lines.append("dep=%s" % dep.output.short_path)
-    ctx.actions.write(out, "\n".join(lines) + "\n")
-    info = LinuxImageInfo(
-        archives = image.archives,
-        generated = image.generated,
-        objects = image.objects,
-        output = out,
-    )
-    return [
-        DefaultInfo(files = depset([out])),
-        info,
-    ]
-
-linux_module = rule(
-    implementation = _linux_module_impl,
-    attrs = {
-        "deps": attr.label_list(providers = [LinuxImageInfo]),
-        "extension": attr.string(default = "ko"),
-        "image": attr.label(providers = [LinuxImageInfo], mandatory = True),
-        "module_name": attr.string(),
-        "srcs": attr.label_list(allow_files = True),
-        "target": attr.string(),
-    },
-    doc = "Placeholder native module packaging action.",
-)
-
-linux_modpost = rule(
-    implementation = _linux_packaged_output_impl,
-    attrs = {
-        "extension": attr.string(default = "modpost"),
-        "image": attr.label(providers = [LinuxImageInfo], mandatory = True),
-        "kind": attr.string(default = "modpost"),
-    },
-    doc = "Placeholder native modpost action.",
-)
-
-linux_dtb = rule(
-    implementation = _linux_packaged_output_impl,
-    attrs = {
-        "extension": attr.string(default = "dtb"),
-        "image": attr.label(providers = [LinuxImageInfo], mandatory = True),
-        "kind": attr.string(default = "dtb"),
-    },
-    doc = "Placeholder native device-tree blob action.",
-)
-
-linux_install = rule(
-    implementation = _linux_packaged_output_impl,
-    attrs = {
-        "extension": attr.string(default = "install"),
-        "image": attr.label(providers = [LinuxImageInfo], mandatory = True),
-        "kind": attr.string(default = "install"),
-    },
-    doc = "Placeholder native install/package output action.",
+    doc = "Builds an x86 bzImage or arm64 Image from a linked kernel.",
 )
 
 def _collect_image_objects(image):

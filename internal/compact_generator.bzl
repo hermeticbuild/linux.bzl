@@ -219,7 +219,7 @@ _linux_compact_outputs = rule(
         ),
         "linux_objects_load": attr.string(
             default = "@linux.bzl//internal:linux_objects.bzl",
-            doc = "Load label emitted for linux_object/linux_compact_image placeholder rules.",
+            doc = "Load label emitted for linux_object/linux_compact_image rules.",
         ),
         "object_label_package": attr.string(
             doc = "Package label path used by generated image BUILD files to reference generated object targets.",
@@ -292,78 +292,6 @@ _linux_compact_outputs = rule(
             executable = True,
         ),
     },
-)
-
-def _linux_compact_update_source_files_impl(ctx):
-    entries = []
-    runfiles = []
-    for target, destination in ctx.attr.files.items():
-        file = _single_file(target, "files")
-        entries.append((destination, file.short_path))
-        runfiles.append(file)
-
-    entries = sorted(entries)
-
-    script = ctx.actions.declare_file(ctx.label.name + ".sh")
-    lines = [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
-        "",
-        "if [[ -z \"${BUILD_WORKSPACE_DIRECTORY:-}\" ]]; then",
-        "  echo \"This updater must be run with bazel run so BUILD_WORKSPACE_DIRECTORY is set.\" >&2",
-        "  exit 1",
-        "fi",
-        "",
-        "runfiles_dir=\"${RUNFILES_DIR:-$0.runfiles}\"",
-        "workspace_runfiles=\"${runfiles_dir}/_main\"",
-        "if [[ ! -d \"${workspace_runfiles}\" ]]; then",
-        "  workspace_runfiles=\"${runfiles_dir}\"",
-        "fi",
-        "workspace_path_prefix=" + _sh_quote(ctx.attr.workspace_path_prefix),
-        "",
-        "copy_one() {",
-        "  local src_rel=\"$1\"",
-        "  local dest_rel=\"$2\"",
-        "  local src=\"${workspace_runfiles}/${src_rel}\"",
-        "  local dest=\"${BUILD_WORKSPACE_DIRECTORY}/${workspace_path_prefix}/${dest_rel}\"",
-        "  if [[ ! -f \"${src}\" ]]; then",
-        "    echo \"missing generated runfile: ${src}\" >&2",
-        "    exit 1",
-        "  fi",
-        "  mkdir -p \"$(dirname \"${dest}\")\"",
-        "  cp -f \"${src}\" \"${dest}\"",
-        "  echo \"updated ${dest_rel}\"",
-        "}",
-        "",
-    ]
-    for destination, short_path in entries:
-        lines.append("copy_one %s %s" % (_sh_quote(short_path), _sh_quote(destination)))
-
-    ctx.actions.write(
-        output = script,
-        content = "\n".join(lines) + "\n",
-        is_executable = True,
-    )
-
-    return [DefaultInfo(
-        executable = script,
-        runfiles = ctx.runfiles(files = runfiles),
-    )]
-
-_linux_compact_update_source_files = rule(
-    implementation = _linux_compact_update_source_files_impl,
-    attrs = {
-        "files": attr.label_keyed_string_dict(
-            allow_files = True,
-            mandatory = True,
-            doc = "Map of generated file labels to workspace-relative source paths to update.",
-        ),
-        "workspace_path_prefix": attr.string(
-            doc = "Optional workspace-relative prefix prepended to every update destination.",
-        ),
-    },
-    executable = True,
-    doc = "Updates generated compact Linux source files from Bazel outputs.",
 )
 
 def _linux_parser_validation_impl(ctx):
@@ -597,7 +525,6 @@ def linux_compact_buildfiles(
         probe_values = {},
         vars = {},
         env = {},
-        workspace_path_prefix = "",
         target_compatible_with = None,
         visibility = None,
         tags = None):
@@ -664,9 +591,7 @@ def linux_compact_buildfiles(
         visibility = visibility,
     )
 
-    update_files = {}
     if out_buildfile != None:
-        update_files[":" + buildfile] = _workspace_source_path(out_buildfile)
         diff_test(
             name = name + "_buildfile_test",
             file1 = ":" + buildfile,
@@ -675,7 +600,6 @@ def linux_compact_buildfiles(
             tags = tags,
         )
     if out_metadata != None:
-        update_files[":" + metadata] = _workspace_source_path(out_metadata)
         diff_test(
             name = name + "_metadata_test",
             file1 = ":" + metadata,
@@ -683,16 +607,6 @@ def linux_compact_buildfiles(
             target_compatible_with = target_compatible_with,
             tags = tags,
         )
-    if update_files:
-        _linux_compact_update_source_files(
-            name = name,
-            files = update_files,
-            target_compatible_with = target_compatible_with,
-            tags = tags,
-            visibility = visibility,
-            workspace_path_prefix = workspace_path_prefix,
-        )
-
     return struct(
         buildfile = ":" + buildfile,
         metadata = ":" + metadata,
@@ -778,21 +692,12 @@ def _basename(path):
         return path
     return path.rsplit("/", 1)[1]
 
-def _workspace_source_path(path):
-    package = native.package_name()
-    if package:
-        return package + "/" + path
-    return path
-
 def _join_package(parent, child):
     if not parent:
         return child
     if not child:
         return parent
     return parent + "/" + child
-
-def _sh_quote(value):
-    return "'" + value.replace("'", "'\\''") + "'"
 
 def _config_file(target, attr_name):
     if KconfigInfo in target:

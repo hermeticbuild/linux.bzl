@@ -3,126 +3,61 @@ module(
     version = "0.0.0",
 )
 
-bazel_dep(name = "actiond", version = "0.1.0")
-bazel_dep(name = "aya", version = "0.0.0")
-bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
-bazel_dep(name = "libbpf", version = "1.7.0")
-bazel_dep(name = "linux.bzl", version = "0.0.3")
-bazel_dep(name = "llvm", version = "0.8.3")
-bazel_dep(name = "platforms", version = "1.1.0")
-bazel_dep(name = "rules_cc", version = "0.2.18")
-bazel_dep(name = "rules_qemu", version = "0.1.1")
-bazel_dep(name = "rules_rs", version = "0.0.82")
-bazel_dep(name = "xz", version = "5.4.5.bcr.8")
-bazel_dep(name = "zlib", version = "1.3.2")
+bazel_dep(name = "linux.bzl", version = "0.1.0", repo_name = "kernel_rules")
+bazel_dep(name = "llvm", version = "0.8.3", repo_name = "hermetic_llvm")
 
-archive_override(
-    module_name = "actiond",
-    integrity = "sha256-Z6n50mPmKH8pFxeHIgGgsb3zTHikakPpXMOdbqnHBRg=",
-    strip_prefix = "actiond-1a5f3ebca176641d47e1fec754cf2b2f8b0d4fc0",
-    urls = ["https://github.com/hermeticbuild/actiond/archive/1a5f3ebca176641d47e1fec754cf2b2f8b0d4fc0.tar.gz"],
-)
-
-archive_override(
-    module_name = "aya",
-    integrity = "sha256-R5W1BXhbbPndQrEds1Y44/0AALZG42s2qSgGIRssvzE=",
-    patch_strip = 1,
-    patches = ["//patches:aya_consumer_tests.patch"],
-    strip_prefix = "aya-1356d15a6f9ed63f4d259fd2dde429d7034be36a",
-    urls = ["https://github.com/dzbarsky/aya/archive/1356d15a6f9ed63f4d259fd2dde429d7034be36a.tar.gz"],
-)
-
-archive_override(
-    module_name = "llvm",
-    integrity = "sha256-GCOxxXoADbWpKg536VaJ7IJLOrWwiTOAvnzJE1Cgm2k=",
-    strip_prefix = "hermetic-llvm-92b57b1998276d6b1bbd6af4613fc860ab50dc32",
-    urls = ["https://github.com/hermeticbuild/hermetic-llvm/archive/92b57b1998276d6b1bbd6af4613fc860ab50dc32.tar.gz"],
-)
-
-archive_override(
-    module_name = "rules_qemu",
-    integrity = "sha256-Sm7OYHvHMLPzG5kysmLQ5M6R+SucwiFTziI7/CeaZXA=",
-    strip_prefix = "rules_qemu-53059535110cb8b132a110c94c1881331655e483",
-    urls = ["https://github.com/hermeticbuild/rules_qemu/archive/53059535110cb8b132a110c94c1881331655e483.tar.gz"],
-)
-
-single_version_override(
-    module_name = "rules_rs",
-    patch_strip = 1,
-    patches = [
-        "//patches:rules_rs_bpf_source_std.patch",
-        "//patches:rules_rs_inject_only_consumer.patch",
-    ],
-    version = "0.0.82",
-)
-
-bazel_lib_toolchains = use_extension("@bazel_lib//lib:extensions.bzl", "toolchains")
-use_repo(bazel_lib_toolchains, "copy_to_directory_toolchains")
-
-qemu = use_extension("@rules_qemu//qemu/extension:qemu.bzl", "qemu")
-use_repo(qemu, "qemu_system_toolchains", "qemu_user_toolchains")
-
-rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
-use_repo(rules_rust, "rules_rust")
-
-rust_toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
-use_repo(rust_toolchains, "default_rust_toolchains")
-
-crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
-
-inject_repo(crate, "libbpf")
-
-inject_repo(crate, "xz")
-
-inject_repo(crate, "zlib")
-
-register_toolchains(
-    "@copy_to_directory_toolchains//:all",
-    "@default_rust_toolchains//:all",
-    "@llvm//toolchain:all",
-    "@qemu_system_toolchains//:all",
-)
+register_toolchains("@hermetic_llvm//toolchain:all")
 
 local_path_override(
     module_name = "linux.bzl",
     path = "..",
 )
 
-linux_kernel = use_extension("@linux.bzl//:linux.bzl", "linux_kernel")
-linux_kernel.archive(
-    name = "e2e_linux_6_18_2",
-    integrity = "sha256-VYxrurdJSSs0+Zgn/oB7ADmnRGk8IdOn4Ds6SO2quWo=",
-    strip_prefix = "linux-6.18.2",
-    urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.2.tar.xz"],
+linux_source_repository = use_repo_rule(
+    "@kernel_rules//:linux.bzl",
+    "linux_source_repository",
 )
-linux_kernel.kconfig(
-    name = "tiny_kconfig",
+
+linux_source_repository(
+    name = "e2e_linux_6_12_96",
+    version = "6.12.96",
+)
+
+linux_source_repository(
+    name = "e2e_linux_6_18_39",
+    version = "6.18.39",
+)
+
+linux_image = use_repo_rule(
+    "@kernel_rules//:linux.bzl",
+    "linux_image",
+)
+
+linux_image(
+    name = "e2e_6_12_96_x86_64",
     config = "//:tiny.config",
+    platform = "@hermetic_llvm//platforms:linux_x86_64",
+    source = "@e2e_linux_6_12_96//:Kconfig",
 )
-linux_kernel.kconfig(
-    name = "tiny_arm64_kconfig",
+
+linux_image(
+    name = "e2e_6_12_96_aarch64",
     config = "//:tiny_arm64.config",
+    platform = "@hermetic_llvm//platforms:linux_arm64",
+    source = "@e2e_linux_6_12_96//:Kconfig",
 )
-linux_kernel.compact(
-    name = "tiny_compact",
+
+linux_image(
+    name = "e2e_x86_64",
     config = "//:tiny.config",
-    config_name = "x86_64",
-    kernel_name = "kernel",
-    source_repo = "e2e_linux_6_18_2",
+    platform = "@hermetic_llvm//platforms:linux_x86_64",
+    source = "@e2e_linux_6_18_39//:Kconfig",
 )
-linux_kernel.compact(
-    name = "tiny_arm64_compact",
+
+linux_image(
+    name = "e2e_aarch64",
     config = "//:tiny_arm64.config",
-    config_name = "aarch64",
-    kernel_name = "kernel",
-    source_repo = "e2e_linux_6_18_2",
-)
-use_repo(
-    linux_kernel,
-    "e2e_linux_6_18_2",
-    "tiny_arm64_compact",
-    "tiny_arm64_kconfig",
-    "tiny_compact",
-    "tiny_kconfig",
+    platform = "@hermetic_llvm//platforms:linux_arm64",
+    source = "@e2e_linux_6_18_39//:Kconfig",
 )

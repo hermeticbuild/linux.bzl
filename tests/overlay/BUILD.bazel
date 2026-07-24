@@ -1,10 +1,10 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
-load("//internal:kconfig.bzl", "kconfig_import", "kconfig_overlay")
+load("//internal:kconfig.bzl", "kconfig_file", "kconfig_overlay")
 
 package(default_visibility = ["//:__subpackages__"])
 
-base = kconfig_import(
+kconfig_file(
     name = "base",
     config = "base.config",
     config_flags = {
@@ -13,12 +13,11 @@ base = kconfig_import(
         "CONFIG_REMOVE": "y",
         "CONFIG_SET_TO_N": "y",
     },
-    update = False,
 )
 
 kconfig_overlay(
     name = "overlay",
-    base = base.label,
+    base = ":base",
     set = {
         "CONFIG_EMPTY": "",
         "CONFIG_NEW": "\"value\"",

@@ -1,7 +1,7 @@
 """Tests for kconfig repository platform selection."""
 
 load("@bazel_skylib//lib:unittest.bzl", "asserts", "unittest")
-load(":kconfig_repositories.bzl", "kconfig_tool_filename")
+load(":kconfig_tool_filename.bzl", "kconfig_tool_filename")
 
 def _kconfig_tool_filename_test_impl(ctx):
     env = unittest.begin(ctx)

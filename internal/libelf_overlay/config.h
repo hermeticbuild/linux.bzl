@@ -1,0 +1,33 @@
+#include <stdint.h>
+
+#define STDC_HEADERS 1
+#define ENABLE_EXTENDED_FORMAT 1
+#define ENABLE_SANITY_CHECKS 1
+#define HAVE_AR_H 1
+#define HAVE_ELF_H 1
+#define HAVE_FCNTL_H 1
+#define HAVE_FTRUNCATE 1
+#define HAVE_GETPAGESIZE 1
+#define HAVE_LINK_H 1
+#define HAVE_MEMCMP 1
+#define HAVE_MEMCPY 1
+#define HAVE_MEMMOVE 1
+#define HAVE_MEMSET 1
+#define HAVE_MMAP 1
+#define HAVE_STDINT_H 1
+#define HAVE_UNISTD_H 1
+#define __LIBELF64 1
+#define __LIBELF64_LINUX 1
+#define __LIBELF_GNU_SYMBOL_VERSIONS 1
+#define __LIBELF_HEADER_ELF_H <elf_repl.h>
+#define __LIBELF_SYMBOL_VERSIONS 1
+#define __libelf_i16_t int16_t
+#define __libelf_i32_t int32_t
+#define __libelf_i64_t int64_t
+#define __libelf_u16_t uint16_t
+#define __libelf_u32_t uint32_t
+#define __libelf_u64_t uint64_t
+#define SIZEOF_INT 4
+#define SIZEOF_LONG 8
+#define SIZEOF_LONG_LONG 8
+#define SIZEOF_SHORT 2

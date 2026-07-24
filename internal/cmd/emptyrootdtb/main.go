@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 )
 
 const (
@@ -49,25 +48,22 @@ func main() {
 }
 
 func emptyRootDTB(source string) ([]byte, error) {
-	for _, required := range []string{
-		"/dts-v1/;",
-		"#address-cells = <0x02>;",
-		"#size-cells = <0x02>;",
-	} {
-		if !strings.Contains(source, required) {
-			return nil, fmt.Errorf("empty root DTS missing %q", required)
-		}
+	hasCellProperties, err := parseEmptyRootDTS(source)
+	if err != nil {
+		return nil, err
 	}
 
 	var structBlock bytes.Buffer
 	write32(&structBlock, fdtBeginNode)
 	structBlock.Write([]byte{0, 0, 0, 0})
-	writeProp32(&structBlock, 0, 2)
-	writeProp32(&structBlock, uint32(len("#address-cells")+1), 2)
+	var stringsBlock []byte
+	if hasCellProperties {
+		writeProp32(&structBlock, 0, 2)
+		writeProp32(&structBlock, uint32(len("#address-cells")+1), 2)
+		stringsBlock = []byte("#address-cells\x00#size-cells\x00")
+	}
 	write32(&structBlock, fdtEndNode)
 	write32(&structBlock, fdtEnd)
-
-	stringsBlock := []byte("#address-cells\x00#size-cells\x00")
 
 	offMemRsvmap := uint32(fdtHeaderSize)
 	offStruct := uint32(fdtHeaderSize + fdtReserveSize)
@@ -90,6 +86,99 @@ func emptyRootDTB(source string) ([]byte, error) {
 	out.Write(structBlock.Bytes())
 	out.Write(stringsBlock)
 	return out.Bytes(), nil
+}
+
+func parseEmptyRootDTS(source string) (bool, error) {
+	tokens, err := lexEmptyRootDTS(source)
+	if err != nil {
+		return false, err
+	}
+	emptyRoot := []string{"/dts-v1/", ";", "/", "{", "}", ";"}
+	rootWithCells := []string{
+		"/dts-v1/", ";", "/", "{",
+		"#address-cells", "=", "<", "0x02", ">", ";",
+		"#size-cells", "=", "<", "0x02", ">", ";",
+		"}", ";",
+	}
+	switch {
+	case equalTokens(tokens, emptyRoot):
+		return false, nil
+	case equalTokens(tokens, rootWithCells):
+		return true, nil
+	default:
+		return false, fmt.Errorf("unsupported empty root DTS structure")
+	}
+}
+
+func lexEmptyRootDTS(source string) ([]string, error) {
+	var tokens []string
+	for pos := 0; pos < len(source); {
+		switch {
+		case isDTSWhitespace(source[pos]):
+			pos++
+		case source[pos] == '/' && pos+1 < len(source) && source[pos+1] == '/':
+			pos += 2
+			for pos < len(source) && source[pos] != '\n' {
+				pos++
+			}
+		case source[pos] == '/' && pos+1 < len(source) && source[pos+1] == '*':
+			end := pos + 2
+			for end+1 < len(source) && (source[end] != '*' || source[end+1] != '/') {
+				end++
+			}
+			if end+1 >= len(source) {
+				return nil, fmt.Errorf("unterminated block comment in empty root DTS")
+			}
+			pos = end + 2
+		case len(source)-pos >= len("/dts-v1/") && source[pos:pos+len("/dts-v1/")] == "/dts-v1/":
+			tokens = append(tokens, "/dts-v1/")
+			pos += len("/dts-v1/")
+		case source[pos] == '/' || isDTSPunctuation(source[pos]):
+			tokens = append(tokens, source[pos:pos+1])
+			pos++
+		default:
+			end := pos
+			for end < len(source) &&
+				!isDTSWhitespace(source[end]) &&
+				source[end] != '/' &&
+				!isDTSPunctuation(source[end]) {
+				end++
+			}
+			tokens = append(tokens, source[pos:end])
+			pos = end
+		}
+	}
+	return tokens, nil
+}
+
+func isDTSWhitespace(value byte) bool {
+	switch value {
+	case ' ', '\t', '\r', '\n':
+		return true
+	default:
+		return false
+	}
+}
+
+func isDTSPunctuation(value byte) bool {
+	switch value {
+	case '{', '}', ';', '=', '<', '>':
+		return true
+	default:
+		return false
+	}
+}
+
+func equalTokens(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func writeProp32(buf *bytes.Buffer, nameOffset, value uint32) {

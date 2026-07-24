@@ -1,5 +1,0 @@
-exports_files([
-    "aya_consumer_tests.patch",
-    "rules_rs_bpf_source_std.patch",
-    "rules_rs_inject_only_consumer.patch",
-])

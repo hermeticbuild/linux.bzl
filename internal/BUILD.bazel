@@ -1,33 +1,27 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load(":config_validation_test.bzl", "config_validation_test_suite")
 load(":kconfig_repositories_test.bzl", "kconfig_tool_filename_test")
+load(":linux_compile_flags_test.bzl", "linux_compile_flags_test")
 load(
     ":linux_objects.bzl",
-    "linux_archive",
-    "linux_cache_shape_check",
     "linux_cc_context",
-    "linux_compact_image",
-    "linux_compressed_image",
     "linux_config",
-    "linux_dtb",
-    "linux_generated_file",
-    "linux_install",
-    "linux_modpost",
-    "linux_module",
-    "linux_object",
-    "linux_vmlinux",
 )
+load(":linux_objects_failure_test.bzl", "linux_objects_fail_closed_test_suite")
 
 package(default_visibility = ["//:__subpackages__"])
 
-kconfig_tool_filename_test(name = "kconfig_tool_filename_test")
+config_validation_test_suite(name = "config_validation_tests")
 
-exports_files(
-    ["qemu_boot_test.sh"],
-    visibility = ["//visibility:public"],
-)
+kconfig_tool_filename_test(name = "kconfig_tool_filename_test")
 
 linux_cc_context(
     name = "cc_context_smoke",
+)
+
+linux_compile_flags_test(
+    name = "linux_compile_flags_test",
+    target_under_test = ":cc_context_smoke",
 )
 
 linux_config(
@@ -39,101 +33,12 @@ linux_config(
     },
 )
 
-linux_object(
-    name = "compact_object_smoke",
-    config_fragment = {
-        "CONFIG_TEST": "y",
-    },
-    flags = ["-DCONFIG_TEST"],
-    mode = "y",
-    object = "test.o",
-)
-
-linux_object(
-    name = "debug_object_smoke",
-    config_fragment = {
-        "CONFIG_DEBUG": "y",
-    },
-    flags = ["-DDEBUG"],
-    mode = "y",
-    object = "debug.o",
-)
-
-linux_compact_image(
-    name = "compact_image_smoke",
-    objects = [":compact_object_smoke"],
-)
-
-linux_compact_image(
-    name = "compact_image_debug_smoke",
-    objects = [
-        ":compact_object_smoke",
-        ":debug_object_smoke",
-    ],
-)
-
-linux_cache_shape_check(
-    name = "cache_shape_smoke",
-    images = [
-        ":compact_image_smoke",
-        ":compact_image_debug_smoke",
-    ],
-    shared_objects = ["test.o"],
-)
-
-linux_generated_file(
-    name = "generated_header_smoke",
-    target = "include/generated/autoconf.h",
-)
-
-linux_archive(
-    name = "archive_smoke",
-    objects = [":compact_object_smoke"],
-)
-
-linux_vmlinux(
-    name = "vmlinux_smoke",
-    archives = [":archive_smoke"],
-    generated = [":generated_header_smoke"],
-)
-
-linux_compressed_image(
-    name = "compressed_image_smoke",
-    image = ":vmlinux_smoke",
-)
-
-linux_module(
-    name = "module_smoke",
-    image = ":compact_image_smoke",
-)
-
-linux_modpost(
-    name = "modpost_smoke",
-    image = ":module_smoke",
-)
-
-linux_dtb(
-    name = "dtb_smoke",
-    image = ":vmlinux_smoke",
-)
-
-linux_install(
-    name = "install_smoke",
-    image = ":compressed_image_smoke",
-)
-
 build_test(
-    name = "compact_image_build_test",
+    name = "internal_rule_build_test",
     targets = [
-        ":compact_image_smoke",
-        ":cache_shape_smoke",
         ":cc_context_smoke",
-        ":compressed_image_smoke",
         ":config_smoke",
-        ":dtb_smoke",
-        ":install_smoke",
-        ":modpost_smoke",
-        ":module_smoke",
-        ":vmlinux_smoke",
     ],
 )
+
+linux_objects_fail_closed_test_suite(name = "linux_objects_fail_closed_test")

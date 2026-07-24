@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"compress/gzip"
 	"debug/elf"
 	"encoding/binary"
 	"flag"
@@ -39,6 +40,8 @@ func main() {
 		err = runBZImage(os.Args[2:])
 	case "concat":
 		err = runConcat(os.Args[2:])
+	case "gzip":
+		err = runGZIP(os.Args[2:])
 	case "cpustr":
 		err = runCPUString(os.Args[2:])
 	case "empty-dir":
@@ -68,6 +71,7 @@ commands:
   concat -in <file> [-in <file> ...] -out <file>
   cpustr -cpufeatures <cpufeatures.h> -masks <cpufeaturemasks.h> -out <cpustr.h>
   empty-dir -out <directory>
+  gzip -in <file> -out <file>
   offsets -kind <voffset|zoffset> -in <elf> -out <header>
   piggy -in <compressed-with-size> -out <piggy.S>
   relocs -tool <relocs> -in <vmlinux> -out <vmlinux.relocs>`)
@@ -205,6 +209,45 @@ func runConcat(args []string) error {
 		}
 	}
 	return nil
+}
+
+func runGZIP(args []string) error {
+	fs := flag.NewFlagSet("gzip", flag.ContinueOnError)
+	in := fs.String("in", "", "input file")
+	out := fs.String("out", "", "output file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *in == "" || *out == "" {
+		return fmt.Errorf("-in and -out are required")
+	}
+	input, err := os.Open(*in)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	if err := os.MkdirAll(filepath.Dir(*out), 0o755); err != nil {
+		return err
+	}
+	output, err := os.Create(*out)
+	if err != nil {
+		return err
+	}
+	compressor, err := gzip.NewWriterLevel(output, gzip.BestCompression)
+	if err != nil {
+		output.Close()
+		return err
+	}
+	if _, err := io.Copy(compressor, input); err != nil {
+		compressor.Close()
+		output.Close()
+		return err
+	}
+	if err := compressor.Close(); err != nil {
+		output.Close()
+		return err
+	}
+	return output.Close()
 }
 
 func fileSizeTotal(paths []string) (uint32, error) {

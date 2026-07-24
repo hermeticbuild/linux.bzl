@@ -15,7 +15,8 @@ import (
 )
 
 type generator struct {
-	output *os.File
+	output            *os.File
+	supportsInvalid64 bool
 
 	table    map[string]string
 	lptable1 map[string]string
@@ -115,20 +116,34 @@ var prefixNum = map[string]string{
 
 func main() {
 	in := flag.String("in", "", "arch/x86/lib/x86-opcode-map.txt input")
+	inatH := flag.String("inat_h", "", "tools/arch/x86/include/asm/inat.h input")
 	out := flag.String("out", "", "Generated inat-tables.c output")
 	flag.Parse()
 
-	if *in == "" || *out == "" {
-		fmt.Fprintln(os.Stderr, "-in and -out are required")
+	if *in == "" || *inatH == "" || *out == "" {
+		fmt.Fprintln(os.Stderr, "-in, -inat_h, and -out are required")
 		os.Exit(2)
 	}
-	if err := run(*in, *out); err != nil {
+	supportsInvalid64, err := headerDefines(*inatH, "INAT_INV64")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "insnattr: %v\n", err)
+		os.Exit(1)
+	}
+	if err := run(*in, *out, supportsInvalid64); err != nil {
 		fmt.Fprintf(os.Stderr, "insnattr: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(in, out string) error {
+func headerDefines(path, name string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", path, err)
+	}
+	return regexp.MustCompile(`(?m)^[[:space:]]*#define[[:space:]]+` + regexp.QuoteMeta(name) + `(?:[[:space:]]|$)`).Match(data), nil
+}
+
+func run(in, out string, supportsInvalid64 bool) error {
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return err
 	}
@@ -138,7 +153,7 @@ func run(in, out string) error {
 	}
 	defer output.Close()
 
-	g := newGenerator(output)
+	g := newGenerator(output, supportsInvalid64)
 	if err := g.process(in); err != nil {
 		return err
 	}
@@ -146,17 +161,18 @@ func run(in, out string) error {
 	return nil
 }
 
-func newGenerator(output *os.File) *generator {
+func newGenerator(output *os.File, supportsInvalid64 bool) *generator {
 	g := &generator{
-		output:   output,
-		escape:   map[string]int{},
-		group:    map[string]int{},
-		etable:   map[pair]string{},
-		gtable:   map[pair]string{},
-		atable:   map[pair]string{},
-		xoptable: map[int]string{},
-		ggid:     1,
-		geid:     1,
+		output:            output,
+		supportsInvalid64: supportsInvalid64,
+		escape:            map[string]int{},
+		group:             map[string]int{},
+		etable:            map[pair]string{},
+		gtable:            map[pair]string{},
+		atable:            map[pair]string{},
+		xoptable:          map[int]string{},
+		ggid:              1,
+		geid:              1,
 	}
 	g.clearVars()
 	fmt.Fprint(output, "/* x86 opcode map generated from x86-opcode-map.txt */\n")
@@ -388,7 +404,7 @@ func (g *generator) opcodeLine(line string, fields []string) error {
 		if force64Expr.MatchString(ext) {
 			flags = addFlags(flags, "INAT_FORCE64")
 		}
-		if invalid64Expr.MatchString(ext) && !only64Expr.MatchString(line) {
+		if g.supportsInvalid64 && invalid64Expr.MatchString(ext) && !only64Expr.MatchString(line) {
 			flags = addFlags(flags, "INAT_INV64")
 		}
 		if noRex2Expr.MatchString(ext) {
@@ -517,14 +533,16 @@ func (g *generator) finish() {
 	}
 	fmt.Fprint(g.output, "};\n\n")
 
-	fmt.Fprint(g.output, "/* XOP opcode map array */\n")
-	fmt.Fprint(g.output, "const insn_attr_t * const inat_xop_tables[X86_XOP_M_MAX - X86_XOP_M_MIN + 1] = {\n")
-	for i := 0; i < g.gxopid; i++ {
-		if value := g.xoptable[i]; value != "" {
-			fmt.Fprintf(g.output, "\t[%d] = %s,\n", i, value)
+	if g.gxopid > 0 {
+		fmt.Fprint(g.output, "/* XOP opcode map array */\n")
+		fmt.Fprint(g.output, "const insn_attr_t * const inat_xop_tables[X86_XOP_M_MAX - X86_XOP_M_MIN + 1] = {\n")
+		for i := 0; i < g.gxopid; i++ {
+			if value := g.xoptable[i]; value != "" {
+				fmt.Fprintf(g.output, "\t[%d] = %s,\n", i, value)
+			}
 		}
+		fmt.Fprint(g.output, "};\n")
 	}
-	fmt.Fprint(g.output, "};\n")
 
 	fmt.Fprint(g.output, "#else /* !__BOOT_COMPRESSED */\n\n")
 
@@ -534,8 +552,10 @@ func (g *generator) finish() {
 	fmt.Fprint(g.output, "static const insn_attr_t *inat_group_tables[INAT_GRP_MAX + 1][INAT_LSTPFX_MAX + 1];\n\n")
 	fmt.Fprint(g.output, "/* AVX opcode map array */\n")
 	fmt.Fprint(g.output, "static const insn_attr_t *inat_avx_tables[X86_VEX_M_MAX + 1][INAT_LSTPFX_MAX + 1];\n\n")
-	fmt.Fprint(g.output, "/* XOP opcode map array */\n")
-	fmt.Fprint(g.output, "static const insn_attr_t *inat_xop_tables[X86_XOP_M_MAX - X86_XOP_M_MIN + 1];\n\n")
+	if g.gxopid > 0 {
+		fmt.Fprint(g.output, "/* XOP opcode map array */\n")
+		fmt.Fprint(g.output, "static const insn_attr_t *inat_xop_tables[X86_XOP_M_MAX - X86_XOP_M_MIN + 1];\n\n")
+	}
 	fmt.Fprint(g.output, "static void inat_init_tables(void)\n")
 	fmt.Fprint(g.output, "{\n")
 
@@ -569,10 +589,12 @@ func (g *generator) finish() {
 	}
 	fmt.Fprint(g.output, "\n")
 
-	fmt.Fprint(g.output, "\t/* Print XOP opcode map array */\n")
-	for i := 0; i < g.gxopid; i++ {
-		if value := g.xoptable[i]; value != "" {
-			fmt.Fprintf(g.output, "\tinat_xop_tables[%d] = %s;\n", i, value)
+	if g.gxopid > 0 {
+		fmt.Fprint(g.output, "\t/* Print XOP opcode map array */\n")
+		for i := 0; i < g.gxopid; i++ {
+			if value := g.xoptable[i]; value != "" {
+				fmt.Fprintf(g.output, "\tinat_xop_tables[%d] = %s;\n", i, value)
+			}
 		}
 	}
 	fmt.Fprint(g.output, "}\n")

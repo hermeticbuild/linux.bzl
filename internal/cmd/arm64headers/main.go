@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"linux.bzl/internal/kconfig"
+	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
 
 func main() {
@@ -418,7 +418,7 @@ func (g *sysregGenerator) handleSysregLine(lineNum int, fields []string) error {
 			if err := expect(2); err != nil {
 				return err
 			}
-			if g.seenEnumVals[fields[0]] {
+			if g.seenEnumVals[fields[0]] && !isLegacySysregEnumAlias(g.reg, g.field, fields[0], fields[1]) {
 				return fail("duplicate Enum value %s for %s", fields[0], fields[1])
 			}
 			g.seenEnumVals[fields[0]] = true
@@ -427,6 +427,18 @@ func (g *sysregGenerator) handleSysregLine(lineNum int, fields []string) error {
 		}
 	}
 	return fail("unhandled statement %q in %s block", strings.Join(fields, " "), g.block())
+}
+
+func isLegacySysregEnumAlias(reg, field, value, name string) bool {
+	// Linux 6.12's gen-sysreg.awk permits these aliases. Linux 6.18 rejects
+	// duplicate values after correcting or removing both source entries.
+	switch reg + "." + field + "." + value + "." + name {
+	case "ID_PFR1_EL1.Security.0b0001.NSACR_RFR",
+		"ID_AA64SMFR0_EL1.SMEver.0b0000.IMP":
+		return true
+	default:
+		return false
+	}
 }
 
 func (g *sysregGenerator) block() string {

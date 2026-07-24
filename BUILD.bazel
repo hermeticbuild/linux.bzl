@@ -2,6 +2,8 @@ load("@buildifier_prebuilt//:rules.bzl", "buildifier", "buildifier_test")
 
 package(default_visibility = ["//visibility:public"])
 
+exports_files(["linux.bzl"])
+
 buildifier(
     name = "buildifier",
     lint_mode = "fix",
