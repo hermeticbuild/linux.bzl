@@ -137,6 +137,9 @@ func run(opts options) error {
 	if err := command.Run(); err != nil {
 		return fmt.Errorf("run %q: %w", opts.toolPath, err)
 	}
+	if err := os.Chmod(opts.outputPath, 0o600); err != nil {
+		return fmt.Errorf("make tool output %q writable: %w", opts.outputPath, err)
+	}
 	if opts.elfETRelEndian != "" {
 		if err := patchELFTypeToRelocatable(opts.outputPath, opts.elfETRelEndian); err != nil {
 			return err

@@ -127,6 +127,41 @@ func TestPatchELFTypeToRelocatable(t *testing.T) {
 	}
 }
 
+func TestToolOutputIsMadeWritableBeforeELFPatch(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "input")
+	output := filepath.Join(dir, "output")
+	if err := os.WriteFile(input, elfHeader("little", 2), 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	tool, arguments := helperCommand(t, "readonly", outputPlaceholder)
+	err := run(options{
+		inputPath:      input,
+		outputPath:     output,
+		elfETRelEndian: "little",
+		toolPath:       tool,
+		toolArguments:  arguments,
+	})
+	if err != nil {
+		t.Fatalf("run() failed: %v", err)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data[16:18], []byte{1, 0}) {
+		t.Fatalf("e_type = %v, want [1 0]", data[16:18])
+	}
+	info, err := os.Stat(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := info.Mode().Perm(), os.FileMode(0o600); got != want {
+		t.Fatalf("output mode = %#o, want %#o", got, want)
+	}
+}
+
 func TestPatchELFTypeRejectsWrongByteOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "output")
 	if err := os.WriteFile(path, elfHeader("little", 2), 0o600); err != nil {
@@ -219,6 +254,10 @@ func TestBTFMutateHelperProcess(t *testing.T) {
 			os.Exit(93)
 		}
 	case "noop":
+	case "readonly":
+		if err := os.Chmod(path, 0o400); err != nil {
+			os.Exit(91)
+		}
 	case "fail":
 		os.Exit(23)
 	default:
