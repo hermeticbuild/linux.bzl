@@ -292,7 +292,6 @@ jobs:
           bazel --host_jvm_args=-Xmx3g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test '${{ matrix.target }}' \
-            --config=path-mapping \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"

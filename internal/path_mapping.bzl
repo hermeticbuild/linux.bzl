@@ -60,9 +60,10 @@ def add_mapped_values(args, values, files = [], directory_anchors = {}):
             if path in value and len(path) > len(best_file_path):
                 best_file_path = path
         if best_file_path:
-            args.add(
-                files_by_path[best_file_path],
-                format = _path_arg_format(value, best_file_path),
+            args.add_all(
+                [files_by_path[best_file_path]],
+                expand_directories = False,
+                format_each = _path_arg_format(value, best_file_path),
             )
             continue
         best_directory = ""

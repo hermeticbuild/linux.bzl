@@ -7,12 +7,19 @@ load(
     "linux_kbuild_tree_validation",
     "linux_parser_validation",
 )
-load("//internal:path_mapping.bzl", "add_directory_arg", "directory_anchor", "path_mapped_run")
+load(
+    "//internal:path_mapping.bzl",
+    "add_directory_arg",
+    "add_mapped_values",
+    "directory_anchor",
+    "path_mapped_run",
+)
 
 visibility("private")
 
 def _directory_argument_probe_impl(ctx):
     anchor = ctx.actions.declare_file(ctx.label.name + ".tree/include/generated/anchor.h")
+    runtime_tree = ctx.actions.declare_directory(ctx.label.name + ".runtime")
     out = ctx.actions.declare_file(ctx.label.name + ".out")
     ctx.actions.write(anchor, "")
 
@@ -22,11 +29,16 @@ def _directory_argument_probe_impl(ctx):
         directory_anchor(anchor, anchor.dirname.rsplit("/", 1)[0]),
         format = "-I%s",
     )
+    add_mapped_values(
+        args,
+        ["-L" + runtime_tree.path + "/lib"],
+        files = [runtime_tree],
+    )
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._tool,
         inputs = [anchor],
-        outputs = [out],
+        outputs = [out, runtime_tree],
         arguments = [args],
         mnemonic = "PathMappedDirectoryProbe",
     )
@@ -59,6 +71,14 @@ def _directory_argument_test_impl(ctx):
                 env,
                 directory_args[0].startswith("-Ibazel-out/cfg/bin/"),
                 "expected stripped output path, got %s" % directory_args[0],
+            )
+        tree_args = [arg for arg in actions[0].argv if arg.startswith("-L")]
+        asserts.equals(env, 1, len(tree_args))
+        if tree_args:
+            asserts.true(
+                env,
+                tree_args[0].startswith("-Lbazel-out/cfg/bin/"),
+                "expected mapped TreeArtifact path, got %s" % tree_args[0],
             )
     return analysistest.end(env)
 
