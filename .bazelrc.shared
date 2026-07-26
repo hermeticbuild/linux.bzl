@@ -28,7 +28,6 @@ common:remote --remote_cache_compression
 common:remote --remote_download_toplevel
 common:remote --remote_header=x-buildbuddy-api-key=4jtaxdhxtyu4ylxdEwI7
 common:remote --remote_timeout=120
-common:remote --noexperimental_throttle_remote_action_building
 common:remote --experimental_remote_execution_keepalive
 common:remote --remote_executor=grpcs://remote.buildbuddy.io
-common:remote --jobs=800
+common:remote --jobs=100
