@@ -88,6 +88,7 @@ func objtoolArgs(config map[string]string, mode string) ([]string, bool, error) 
 	}
 
 	delayObjtool := enabled(config, "CONFIG_LTO_CLANG") || enabled(config, "CONFIG_X86_KERNEL_IBT")
+	mcountObjtool := enabled(config, "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL")
 	noinstrValidation := enabled(config, "CONFIG_NOINSTR_VALIDATION")
 	switch mode {
 	case "builtin":
@@ -103,14 +104,17 @@ func objtoolArgs(config map[string]string, mode string) ([]string, bool, error) 
 		args = append(args, "--module")
 		return args, true, nil
 	case "vmlinux":
-		if !delayObjtool && !noinstrValidation {
+		if !delayObjtool && !mcountObjtool && !noinstrValidation {
 			return nil, false, nil
 		}
 		args := []string{}
 		if delayObjtool {
 			args = commonObjtoolArgs(config)
-		} else if enabled(config, "CONFIG_OBJTOOL_WERROR") {
-			args = append(args, "--Werror")
+		} else {
+			args = append(args, mcountObjtoolArgs(config)...)
+			if enabled(config, "CONFIG_OBJTOOL_WERROR") {
+				args = append(args, "--Werror")
+			}
 		}
 		if noinstrValidation {
 			args = append(args, "--noinstr")
@@ -170,15 +174,21 @@ func commonObjtoolArgs(config map[string]string) []string {
 		args = append(args, "--prefix="+config["CONFIG_FUNCTION_PADDING_BYTES"])
 	}
 
+	args = append(args, mcountObjtoolArgs(config)...)
+
+	if enabled(config, "CONFIG_OBJTOOL_WERROR") {
+		args = append(args, "--Werror")
+	}
+	return args
+}
+
+func mcountObjtoolArgs(config map[string]string) []string {
+	var args []string
 	if enabled(config, "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL") {
 		args = append(args, "--mcount")
 		if enabled(config, "CONFIG_HAVE_OBJTOOL_NOP_MCOUNT") {
 			args = append(args, "--mnop")
 		}
-	}
-
-	if enabled(config, "CONFIG_OBJTOOL_WERROR") {
-		args = append(args, "--Werror")
 	}
 	return args
 }

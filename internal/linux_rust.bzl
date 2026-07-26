@@ -613,6 +613,7 @@ def _proc_macro(
     args.extend(crate_flags)
     args.extend([
         "--sysroot=" + rust_toolchain.sysroot,
+        "-Clink-self-contained=-linker",
         "-Clinker-flavor=gcc",
         "-Clinker=" + host_compiler,
     ])
