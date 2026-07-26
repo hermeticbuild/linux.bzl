@@ -180,7 +180,6 @@
     "https://bcr.bazel.build/modules/rules_go/0.42.0/MODULE.bazel": "8cfa875b9aa8c6fce2b2e5925e73c1388173ea3c32a0db4d2b4804b453c14270",
     "https://bcr.bazel.build/modules/rules_go/0.46.0/MODULE.bazel": "3477df8bdcc49e698b9d25f734c4f3a9f5931ff34ee48a2c662be168f5f2d3fd",
     "https://bcr.bazel.build/modules/rules_go/0.59.0/MODULE.bazel": "b7e43e7414a3139a7547d1b4909b29085fbe5182b6c58cbe1ed4c6272815aeae",
-    "https://bcr.bazel.build/modules/rules_go/0.60.0/MODULE.bazel": "4a57ff2ffc2a3570e3c5646575c5a4b07287e91bcdac5d1f72383d51502b48cb",
     "https://bcr.bazel.build/modules/rules_go/0.62.0/MODULE.bazel": "8ee616065c3d2b2f7ac0880108316ce8d0c332b3a30aad24e95c0bc124ec853e",
     "https://bcr.bazel.build/modules/rules_go/0.62.0/source.json": "36d781c558eb7d3bd49dc5e190455714f174232372f15207ab200b4348bda3e6",
     "https://bcr.bazel.build/modules/rules_java/4.0.0/MODULE.bazel": "5a78a7ae82cd1a33cef56dc578c7d2a46ed0dca12643ee45edbb8417899e6f74",

@@ -1,9 +1,9 @@
 """Analysis tests for Linux compile flag preservation."""
 
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
-load(":linux_objects.bzl", "LinuxCcContextInfo")
+load("//internal:linux_objects.bzl", "LinuxCcContextInfo")
 
-visibility("//...")
+visibility("private")
 
 _REPRODUCIBLE_FLAGS = [
     "-Wno-builtin-macro-redefined",

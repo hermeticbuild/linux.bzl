@@ -1,11 +1,9 @@
-// Copyright The Monogon Project Authors.
-// SPDX-License-Identifier: Apache-2.0
-
 package buildgen
 
 import (
 	"bytes"
-	"sort"
+	"maps"
+	"slices"
 
 	gazellerule "github.com/bazelbuild/bazel-gazelle/rule"
 	bzl "github.com/bazelbuild/buildtools/build"
@@ -123,11 +121,7 @@ func Tuple(values ...bzl.Expr) bzl.Expr {
 }
 
 func Dict(values map[string]bzl.Expr) bzl.Expr {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(values))
 	items := make([]*bzl.KeyValueExpr, 0, len(keys))
 	for _, key := range keys {
 		items = append(items, &bzl.KeyValueExpr{
@@ -146,11 +140,7 @@ func StringDict(values map[string]string) bzl.Expr {
 	for key, value := range values {
 		exprs[key] = String(value)
 	}
-	keys := make([]string, 0, len(exprs))
-	for key := range exprs {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(exprs))
 	items := make([]*bzl.KeyValueExpr, 0, len(keys))
 	for _, key := range keys {
 		items = append(items, &bzl.KeyValueExpr{
@@ -207,7 +197,7 @@ func withHeader(header string, data []byte) []byte {
 }
 
 func sortedStrings(values []string) []string {
-	out := append([]string(nil), values...)
-	sort.Strings(out)
+	out := slices.Clone(values)
+	slices.Sort(out)
 	return out
 }

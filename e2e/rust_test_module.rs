@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
-
 //! Runtime fixture for the public linux_module rule.
 
 use kernel::prelude::*;

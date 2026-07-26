@@ -5,6 +5,7 @@ go_library(
     srcs = ["main.go"],
     importpath = "github.com/hermeticbuild/linux.bzl/e2e/cmd/qemuboot",
     visibility = ["//visibility:private"],
+    deps = ["@rules_go//go/runfiles"],
 )
 
 go_binary(

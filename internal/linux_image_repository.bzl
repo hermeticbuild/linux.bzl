@@ -1,27 +1,16 @@
-"""Hermetic repository rules behind the public linux.bzl facade."""
+"""Hermetic Linux image repository rule."""
 
 load(":config_validation.bzl", "validate_config_features")
 load(":kconfig_tool_filename.bzl", "kconfig_tool_filename")
 load(":kconfig_tool_releases.bzl", "KCONFIG_TOOL_RELEASES", "KCONFIG_TOOL_VERSION")
+load(
+    ":repository_utils.bzl",
+    _SOURCE_REPOSITORY_PROTOCOL = "LINUX_SOURCE_REPOSITORY_PROTOCOL",
+    _linux_makefile_version = "linux_makefile_version",
+    _repository_prefix = "repository_prefix",
+)
 
 visibility("//...")
-
-_KERNEL_RELEASES = {
-    "6.12.96": struct(
-        integrity = "sha256-fS4bXVqzazoBhW5xeC2tKlTmNPsrN8CkKZje87v5V8E=",
-        strip_prefix = "linux-6.12.96",
-        urls = [
-            "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.96.tar.xz",
-        ],
-    ),
-    "6.18.39": struct(
-        integrity = "sha256-p6fj0q6dledBlyI6jU619r56rCG25t4n6WhdABwfjLA=",
-        strip_prefix = "linux-6.18.39",
-        urls = [
-            "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.39.tar.xz",
-        ],
-    ),
-}
 
 _ARCHITECTURES = {
     "aarch64": struct(
@@ -88,118 +77,8 @@ _PROBE_VALUES = {
     "rustc_version": "109700",
 }
 
-_SOURCE_REPOSITORY_PROTOCOL = "linux-source-v1"
-_REPOSITORY_GENERATOR_PROTOCOL = "compact-v2-rust-sdk-state"
+_REPOSITORY_GENERATOR_PROTOCOL = "compact-v3-rust-profile"
 _LLVM_VERSION = "22.1.8"
-
-def _linux_source_repository_impl(rctx):
-    catalog = _KERNEL_RELEASES.get(rctx.attr.version)
-    has_urls = len(rctx.attr.urls) != 0
-    has_integrity = rctx.attr.integrity != ""
-    if has_urls != has_integrity:
-        fail("linux_source_repository %s requires urls and integrity together" % rctx.original_name)
-
-    if has_urls:
-        urls = rctx.attr.urls
-        integrity = rctx.attr.integrity
-        strip_prefix = rctx.attr.strip_prefix or (catalog.strip_prefix if catalog != None else "")
-    elif catalog != None:
-        urls = catalog.urls
-        integrity = catalog.integrity
-        strip_prefix = rctx.attr.strip_prefix or catalog.strip_prefix
-    else:
-        fail(
-            "Linux %s is not in the maintained source catalog; set both urls and integrity" %
-            rctx.attr.version,
-        )
-    if not integrity.startswith("sha256-"):
-        fail("linux_source_repository integrity must be a sha256 SRI digest")
-
-    if rctx.attr.patch_strip < 0:
-        fail("patch_strip must be non-negative")
-
-    rctx.download_and_extract(
-        url = urls,
-        integrity = integrity,
-        strip_prefix = strip_prefix,
-        canonical_id = "linux.bzl-source-%s-%s" % (rctx.attr.version, integrity),
-    )
-    for patch in rctx.attr.patches:
-        rctx.patch(patch, strip = rctx.attr.patch_strip)
-
-    makefile = rctx.path("Makefile")
-    kconfig = rctx.path("Kconfig")
-    if not makefile.exists or not kconfig.exists:
-        fail(
-            "Linux source archive for %s must contain root Makefile and Kconfig files" %
-            rctx.attr.version,
-        )
-    actual_version = _linux_makefile_version(rctx.read(makefile))
-    if actual_version != rctx.attr.version:
-        fail(
-            "Linux source archive version mismatch: requested %s, Makefile reports %s" %
-            (rctx.attr.version, actual_version),
-        )
-
-    source_build = rctx.read(rctx.attr._source_build_file)
-    source_build = source_build.replace(
-        "@rules_cc",
-        _repository_prefix(rctx.attr._rules_cc_defs),
-    )
-    source_build = source_build.replace(
-        "@platforms",
-        _repository_prefix(rctx.attr._platforms_x86_64),
-    )
-    rctx.file("BUILD.bazel", source_build, executable = False)
-    rctx.file(
-        ".linux-bzl-source.json",
-        json.encode({
-            "integrity": integrity,
-            "protocol": _SOURCE_REPOSITORY_PROTOCOL,
-            "version": actual_version,
-        }) + "\n",
-        executable = False,
-    )
-    return rctx.repo_metadata(reproducible = True)
-
-linux_source_repository = repository_rule(
-    implementation = _linux_source_repository_impl,
-    attrs = {
-        "integrity": attr.string(
-            doc = "SHA-256 SRI digest required with explicit urls.",
-        ),
-        "patch_strip": attr.int(
-            default = 1,
-            doc = "Number of leading path components stripped from patches.",
-        ),
-        "patches": attr.label_list(
-            allow_files = True,
-            doc = "Deterministic unified-diff patches applied with Bazel's native patcher.",
-        ),
-        "strip_prefix": attr.string(
-            doc = "Archive directory prefix to remove. Catalog entries provide a default.",
-        ),
-        "urls": attr.string_list(
-            doc = "Explicit mirrors for a source not selected solely from the catalog.",
-        ),
-        "version": attr.string(
-            mandatory = True,
-            doc = "Exact upstream Linux version.",
-        ),
-        "_source_build_file": attr.label(
-            allow_single_file = True,
-            default = Label("//:source_repo.BUILD.bazel"),
-        ),
-        "_rules_cc_defs": attr.label(
-            allow_single_file = True,
-            default = Label("@rules_cc//cc:defs.bzl"),
-        ),
-        "_platforms_x86_64": attr.label(
-            default = Label("@platforms//cpu:x86_64"),
-        ),
-    },
-    doc = "Downloads an integrity-pinned, complete upstream Linux source tree.",
-)
 
 def _linux_image_impl(rctx):
     source = rctx.attr.source
@@ -302,6 +181,15 @@ def _linux_image_impl(rctx):
         variant_graph_images[name] = "//graph/%s:%s_image" % (name, sanitized)
         variant_rust_enabled[name] = resolved.get("CONFIG_RUST") == "y"
 
+    rust_profile_json = ""
+    if base_rust_enabled or True in variant_rust_enabled.values():
+        rust_profile_json = _generate_rust_profile(
+            rctx,
+            tool,
+            source_root,
+            _ARCHITECTURES[arch],
+        )
+
     _write_configs(rctx, arch, configs, rules_repo)
     _generate_config_graph(
         rctx = rctx,
@@ -343,6 +231,7 @@ def _linux_image_impl(rctx):
             arch = arch,
             version = version,
             source_repo = source_repo,
+            rust_profile_json = rust_profile_json,
             platform = platform,
             base_config = "//configs:%s" % arch,
             base_rust_enabled = base_rust_enabled,
@@ -372,6 +261,7 @@ def _linux_image_impl(rctx):
             "architecture": arch,
             "protocol": _REPOSITORY_GENERATOR_PROTOCOL,
             "rust_enabled": base_rust_enabled,
+            "rust_profile_schema": "linux-rust-profile-v1" if rust_profile_json else "",
             "tool_version": KCONFIG_TOOL_VERSION,
             "variant_rust_enabled": variant_rust_enabled,
             "version": version,
@@ -441,7 +331,7 @@ def _platform_arch(rctx):
     return arch
 
 def _validate_llvm_profile(rctx):
-    module = rctx.read(rctx.path(rctx.attr._llvm_module))
+    module = rctx.read(rctx.attr._llvm_module)
     expected = 'LLVM_VERSION = "%s"' % _LLVM_VERSION
     expected_prebuilt = 'PREBUILT_LLVM_VERSION = "%s"' % _LLVM_VERSION
     if module.find(expected) < 0 or module.find(expected_prebuilt) < 0:
@@ -451,9 +341,7 @@ def _validate_llvm_profile(rctx):
         )
 
 def _read_config(rctx, label, description):
-    path = rctx.path(label)
-    rctx.watch(path)
-    return _parse_config(rctx.read(path), description)
+    return _parse_config(rctx.read(label), description)
 
 def _parse_config(content, description):
     values = {}
@@ -649,7 +537,7 @@ def _render_config(config):
 
 def _write_configs(rctx, arch, configs, rules_repo):
     rules = [
-        'load("%s//:linux.bzl", kconfig_file = "linux_internal_kconfig_file")' % rules_repo,
+        'load("%s//internal:kconfig.bzl", "kconfig_file")' % rules_repo,
         "",
         'package(default_visibility = ["//:__subpackages__"])',
         "",
@@ -711,6 +599,45 @@ def _download_generator(rctx):
         fail("linux.bzl generator archive for %s does not contain kconfig_parse" % platform)
     return tool
 
+def _generate_rust_profile(rctx, tool, source_root, descriptor):
+    output = ".linux_bzl_rust_profile.json"
+    rctx.file(output, "", executable = False)
+    args = [
+        str(tool),
+        "-compact_schema=v0.0.12",
+        "-rust_profile_out",
+        str(rctx.path(output)),
+        "-srctree",
+        str(source_root),
+        "-var",
+        "ARCH=" + descriptor.arch,
+    ]
+    result = rctx.execute(
+        args,
+        environment = {
+            "LANG": "C",
+            "LC_ALL": "C",
+            "TZ": "UTC",
+        },
+        quiet = False,
+        timeout = 1200,
+    )
+    if result.return_code != 0:
+        fail(
+            "Linux Rust profile generation failed for %s\nstdout:\n%s\nstderr:\n%s" %
+            (rctx.original_name, result.stdout, result.stderr),
+        )
+    content = rctx.read(output)
+    profile = json.decode(content)
+    if (
+        type(profile) != "dict" or
+        profile.get("schema") != "linux-rust-profile-v1" or
+        profile.get("architecture") != "x86_64"
+    ):
+        fail("Linux graph generator emitted an invalid Rust profile")
+    rctx.delete(output)
+    return content
+
 def _generate_config_graph(
         rctx,
         tool,
@@ -744,7 +671,7 @@ def _generate_config_graph(
         "-compact_buildfile_export",
         "metadata.json",
         "-linux_objects_load",
-        rules_repo + "//:linux.bzl",
+        rules_repo + "//internal:linux_objects.bzl",
         "-object_label_package",
         "//" + graph_dir,
         "-source_label_package",
@@ -799,7 +726,6 @@ def _generate_config_graph(
         source_repo,
         source_root,
         descriptor.srcarch,
-        rules_repo,
     )
     _validate_generated_metadata(rctx, graph_dir, config_name, source_root)
     _validate_generated_build(rctx, graph_dir, config_name)
@@ -817,8 +743,7 @@ def _upgrade_v011_schema(
         graph_dir,
         source_repo,
         source_root,
-        srcarch,
-        rules_repo):
+        srcarch):
     build_path = graph_dir + "/BUILD.bazel"
     content = rctx.read(build_path)
     legacy = '    srcs = ["%s//:all_files"],\n' % source_repo
@@ -876,7 +801,6 @@ def _upgrade_v011_schema(
         metadata,
         graph_dir,
     )
-    content = _alias_generated_rule_loads(content, rules_repo)
     rctx.file(build_path, content, executable = False)
 
 def _remove_generated_rule(content, target):
@@ -1225,29 +1149,6 @@ def _inject_v011_module_objects(content, metadata, graph_dir):
         content = content.replace(marker, marker + rendered)
     return content
 
-def _alias_generated_rule_loads(content, rules_repo):
-    parts = content.split("\npackage(")
-    if len(parts) != 2:
-        fail("Linux graph generator emitted an incompatible BUILD file package declaration")
-    header = parts[0]
-    load_label = '"%s//:linux.bzl"' % rules_repo
-    if len(header.split(load_label)) != 2:
-        fail("Linux graph generator emitted an incompatible linux.bzl load declaration")
-    generated_symbols = {
-        "linux_arm64_nvhe_object": "linux_internal_arm64_nvhe_object",
-        "linux_compact_image": "linux_internal_compact_image",
-        "linux_composite_object": "linux_internal_composite_object",
-        "linux_config": "linux_internal_config",
-        "linux_object": "linux_internal_object",
-        "linux_source_tree": "linux_internal_source_tree",
-    }
-    for symbol in sorted(generated_symbols.keys()):
-        header = header.replace(
-            '"%s"' % symbol,
-            '%s = "%s"' % (symbol, generated_symbols[symbol]),
-        )
-    return header + "\npackage(" + parts[1]
-
 def _add_generator_variables(args, descriptor):
     variables = dict(descriptor.compact_vars)
     variables.update({
@@ -1348,6 +1249,7 @@ def _kernel_root_build(
         arch,
         version,
         source_repo,
+        rust_profile_json,
         platform,
         base_config,
         base_rust_enabled,
@@ -1357,7 +1259,7 @@ def _kernel_root_build(
         variant_graph_images,
         variant_rust_enabled,
         rules_repo):
-    return """load("{rules_repo}//:linux.bzl", linux_image_targets = "linux_internal_image_targets")
+    return """load("{rules_repo}//internal:kernel_repository_targets.bzl", "linux_image_targets")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -1366,6 +1268,7 @@ linux_image_targets(
     arch = {arch},
     version = {version},
     source_repo = {source_repo},
+    rust_profile_json = {rust_profile_json},
     platform = {platform},
     base_config = {base_config},
     base_rust_enabled = {base_rust_enabled},
@@ -1379,6 +1282,7 @@ linux_image_targets(
         arch = repr(arch),
         version = repr(version),
         source_repo = repr(source_repo),
+        rust_profile_json = repr(rust_profile_json),
         platform = repr(platform),
         base_config = repr(base_config),
         base_rust_enabled = repr(base_rust_enabled),
@@ -1397,7 +1301,7 @@ repositories_test_helpers = struct(
 )
 
 def _variant_build(arch, graph, platform, rules_repo):
-    return """load("{rules_repo}//:linux.bzl", linux_kernel_exports = "linux_internal_kernel_exports")
+    return """load("{rules_repo}//internal:kernel_bundle.bzl", "linux_kernel_exports")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -1422,28 +1326,3 @@ def _starlark_dict(values, indent = "    "):
         lines.append("%s%r: %r," % (indent, key, values[key]))
     lines.append(indent[:-4] + "}")
     return "\n".join(lines)
-
-def _repository_prefix(label):
-    return "@@" + label.repo_name
-
-def _linux_makefile_version(content):
-    values = {}
-    for raw_line in content.splitlines():
-        line = raw_line.strip()
-        for key in ["VERSION", "PATCHLEVEL", "SUBLEVEL", "EXTRAVERSION"]:
-            prefix = key + " ="
-            if line.startswith(prefix):
-                values[key] = line[len(prefix):].strip()
-    missing = [
-        key
-        for key in ["VERSION", "PATCHLEVEL", "SUBLEVEL"]
-        if key not in values
-    ]
-    if missing:
-        fail("Linux Makefile is missing version fields: %s" % missing)
-    return "%s.%s.%s%s" % (
-        values["VERSION"],
-        values["PATCHLEVEL"],
-        values["SUBLEVEL"],
-        values.get("EXTRAVERSION", ""),
-    )

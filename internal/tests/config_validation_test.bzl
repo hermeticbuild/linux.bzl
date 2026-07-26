@@ -1,9 +1,9 @@
 """Analysis tests for supported Linux config validation."""
 
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
-load(":config_validation.bzl", "validate_config_features")
+load("//internal:config_validation.bzl", "validate_config_features")
 
-visibility("//...")
+visibility("private")
 
 def _config_validation_fixture_impl(ctx):
     validate_config_features(ctx.attr.config, str(ctx.label))

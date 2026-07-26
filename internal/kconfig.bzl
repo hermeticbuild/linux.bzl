@@ -1,6 +1,6 @@
 """Kconfig provider primitives used by generated kernel repositories."""
 
-visibility("//...")
+visibility("public")
 
 KconfigInfo = provider(
     doc = "Parsed Linux Kconfig values.",

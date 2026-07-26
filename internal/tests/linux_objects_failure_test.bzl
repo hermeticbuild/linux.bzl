@@ -6,14 +6,14 @@ load(
     "asserts",
 )
 load(
-    ":linux_objects.bzl",
+    "//internal:linux_objects.bzl",
     "LinuxImageInfo",
     "linux_compact_image",
     "linux_compressed_image",
     "linux_object",
 )
 
-visibility("//...")
+visibility("private")
 
 def _fake_linux_image_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".vmlinux")

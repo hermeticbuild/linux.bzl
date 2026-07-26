@@ -17,6 +17,8 @@ common:ci --color=yes
 common:ci --show_timestamps
 test:ci --test_summary=terse
 
+common:path-mapping --experimental_output_paths=strip
+
 common:remote --bes_results_url=https://app.buildbuddy.io/invocation/
 common:remote --bes_backend=grpcs://remote.buildbuddy.io
 common:remote --experimental_remote_downloader=grpcs://remote.buildbuddy.io
@@ -24,6 +26,7 @@ common:remote --grpc_keepalive_time=30s
 common:remote --remote_cache=grpcs://remote.buildbuddy.io
 common:remote --remote_cache_compression
 common:remote --remote_download_toplevel
+common:remote --remote_header=x-buildbuddy-api-key=4jtaxdhxtyu4ylxdEwI7
 common:remote --remote_timeout=120
 common:remote --noexperimental_throttle_remote_action_building
 common:remote --experimental_remote_execution_keepalive

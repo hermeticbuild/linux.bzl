@@ -6,7 +6,7 @@ load(":linux_modules.bzl", "linux_module_sdk")
 load(":linux_objects.bzl", "linux_compressed_image", "linux_resolved_config", "linux_vmlinux")
 load(":linux_rust.bzl", "linux_disabled_rust_kernel_sdk", "linux_rust_kernel_sdk")
 
-visibility("//...")
+visibility("public")
 
 def _architecture(config_name):
     for arch in linux_architectures():
@@ -60,6 +60,7 @@ def _define_outputs(
         config,
         compact_image,
         host_tools,
+        rust_profile_json,
         rust_enabled,
         source_repo,
         version,
@@ -78,11 +79,11 @@ def _define_outputs(
                 "@platforms//os:linux",
             ],
             "generated_headers": host_tools.generated_headers,
+            "profile_json": rust_profile_json,
             "source_root": _source_label(source_repo, "Kconfig"),
             "source_tree": _source_tree_inputs(source_repo),
             "srcarch": arch.srcarch,
             "target_compatible_with": [arch.platform],
-            "version": version,
             "visibility": visibility,
         }
         if hasattr(host_tools, "objtool"):
@@ -159,6 +160,7 @@ def linux_image_targets(
         arch,
         version,
         source_repo,
+        rust_profile_json,
         platform,
         base_config,
         base_rust_enabled,
@@ -170,6 +172,10 @@ def linux_image_targets(
     """Defines private kernel graphs and the base stable exports."""
     if type(base_rust_enabled) != "bool":
         fail("base_rust_enabled must be a bool")
+    if type(rust_profile_json) != "string":
+        fail("rust_profile_json must be a string")
+    if (base_rust_enabled or True in variant_rust_enabled.values()) and not rust_profile_json:
+        fail("Rust-enabled Linux targets require a source-derived Rust profile")
     if sorted(variant_configs.keys()) != sorted(variant_rust_enabled.keys()):
         fail("variant_rust_enabled must contain exactly the variant config names")
     descriptor = _architecture(arch)
@@ -210,6 +216,7 @@ def linux_image_targets(
         config = ":_base_config",
         compact_image = graph_image,
         host_tools = host_tools,
+        rust_profile_json = rust_profile_json,
         rust_enabled = base_rust_enabled,
         source_repo = source_repo,
         version = version,
@@ -265,6 +272,7 @@ def linux_image_targets(
             config = ":" + config_target,
             compact_image = variant_graph_images[variant],
             host_tools = variant_host_tools,
+            rust_profile_json = rust_profile_json,
             rust_enabled = variant_rust_enabled[variant],
             source_repo = source_repo,
             version = version,

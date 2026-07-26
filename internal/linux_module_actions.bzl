@@ -4,6 +4,13 @@ load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "C_COM
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load(":host_cc_toolchain.bzl", "host_cc_toolchain")
+load(
+    ":path_mapping.bzl",
+    "add_directory_arg",
+    "add_mapped_values",
+    "directory_anchor",
+    "path_mapped_run",
+)
 
 visibility("//...")
 
@@ -73,26 +80,67 @@ def _target_compile_inputs(kernel, target, direct = []):
         ],
     )
 
+def _generated_include_dir_anchors(generated_headers):
+    return generated_headers.include_dir_anchors if hasattr(generated_headers, "include_dir_anchors") else {}
+
+def _add_include_dirs(args, include_dirs, anchors):
+    for include_dir in include_dirs:
+        anchor = anchors.get(include_dir)
+        if anchor == None:
+            args.add("-I" + include_dir)
+        else:
+            add_directory_arg(args, anchor, format = "-I%s")
+
+def _add_kernel_include_dirs(args, helpers, kernel, source_root):
+    config_anchor = kernel.config.include_dir_anchor if hasattr(kernel.config, "include_dir_anchor") else None
+    if config_anchor == None:
+        args.add("-I" + kernel.config.include_dir)
+    else:
+        add_directory_arg(args, config_anchor, format = "-I%s")
+    _add_include_dirs(
+        args,
+        helpers.source_include_dirs(
+            source_root,
+            kernel.srcarch,
+            kernel.generated_headers.include_dirs,
+        ),
+        _generated_include_dir_anchors(kernel.generated_headers),
+    )
+
 def _target_c_flags(ctx, helpers, kernel, target):
     source_root = _execroot_dir(kernel.source_root)
-    flags = []
-    flags.extend(helpers.compile_flags(
-        ctx,
-        target.cc_toolchain,
-        target.feature_configuration,
-    ))
-    flags.append("@" + kernel.config.cflags.path)
+    response_files = [kernel.config.cflags]
     if kernel.generated_headers.cflags != None:
-        flags.append("@" + kernel.generated_headers.cflags.path)
-    flags.extend(helpers.source_preinclude_flags(source_root))
-    flags.append("-I" + kernel.config.include_dir)
-    flags.extend(helpers.source_include_flags(
-        source_root,
-        kernel.srcarch,
-        kernel.generated_headers.include_dirs,
-    ))
-    flags.append("-fmacro-prefix-map=%s/=" % source_root)
-    return flags
+        response_files.append(kernel.generated_headers.cflags)
+    return struct(
+        config_include_dir = kernel.config.include_dir,
+        config_include_dir_anchor = kernel.config.include_dir_anchor if hasattr(kernel.config, "include_dir_anchor") else None,
+        generated_include_dir_anchors = _generated_include_dir_anchors(kernel.generated_headers),
+        leading_flags = helpers.compile_flags(
+            ctx,
+            target.cc_toolchain,
+            target.feature_configuration,
+        ),
+        response_files = response_files,
+        source_include_dirs = helpers.source_include_dirs(
+            source_root,
+            kernel.srcarch,
+            kernel.generated_headers.include_dirs,
+        ),
+        source_preinclude_flags = helpers.source_preinclude_flags(source_root),
+        source_root = source_root,
+    )
+
+def _add_target_c_flags(args, flags):
+    args.add_all(flags.leading_flags)
+    args.add_all(flags.response_files, format_each = "@%s")
+    args.add_all(flags.source_preinclude_flags)
+    if flags.config_include_dir_anchor == None:
+        args.add("-I" + flags.config_include_dir)
+    else:
+        add_directory_arg(args, flags.config_include_dir_anchor, format = "-I%s")
+    _add_include_dirs(args, flags.source_include_dirs, flags.generated_include_dir_anchors)
+    args.add("-fmacro-prefix-map=%s/=" % flags.source_root)
 
 def _target_link_flags(ctx, helpers, target):
     return helpers.target_flags(
@@ -107,12 +155,13 @@ def _devicetable_offsets(ctx, helpers, kernel, target, source_files):
     header = ctx.actions.declare_file(ctx.label.name + ".module_prep/scripts/mod/devicetable-offsets.h")
 
     compile_args = ctx.actions.args()
-    compile_args.add_all(_target_c_flags(ctx, helpers, kernel, target))
+    _add_target_c_flags(compile_args, _target_c_flags(ctx, helpers, kernel, target))
     compile_args.add("-S")
     compile_args.add(src)
     compile_args.add("-o")
     compile_args.add(asm)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = target.compiler,
         inputs = _target_compile_inputs(kernel, target, [src]),
         outputs = [asm],
@@ -125,7 +174,8 @@ def _devicetable_offsets(ctx, helpers, kernel, target, source_files):
     header_args.add("-in", asm)
     header_args.add("-out", header)
     header_args.add("-guard", "__DEVICETABLE_OFFSETS_H__")
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._offsetsheader,
         inputs = [asm],
         outputs = [header],
@@ -173,7 +223,25 @@ def _build_modpost(ctx, helpers, kernel, target, source_files):
             source_file = src.path,
             user_compile_flags = compile_flags,
         )
-        ctx.actions.run(
+        compile_args = ctx.actions.args()
+        add_mapped_values(
+            compile_args,
+            cc_common.get_memory_inefficient_command_line(
+                feature_configuration = host_features,
+                action_name = C_COMPILE_ACTION_NAME,
+                variables = compile_variables,
+            ),
+            files = [
+                object_file,
+                src,
+            ],
+            directory_anchors = {
+                devicetable_offsets.dirname: directory_anchor(devicetable_offsets),
+                source_root: directory_anchor(kernel.source_root, source_root),
+            },
+        )
+        path_mapped_run(
+            ctx.actions,
             executable = host_compiler,
             exec_group = "host_cc",
             inputs = depset(
@@ -182,11 +250,7 @@ def _build_modpost(ctx, helpers, kernel, target, source_files):
             ),
             tools = host_cc.all_files,
             outputs = [object_file],
-            arguments = cc_common.get_memory_inefficient_command_line(
-                feature_configuration = host_features,
-                action_name = C_COMPILE_ACTION_NAME,
-                variables = compile_variables,
-            ),
+            arguments = [compile_args],
             env = cc_common.get_environment_variables(
                 feature_configuration = host_features,
                 action_name = C_COMPILE_ACTION_NAME,
@@ -206,17 +270,22 @@ def _build_modpost(ctx, helpers, kernel, target, source_files):
         output_file = out.path,
     )
     link_args = ctx.actions.args()
-    link_args.add_all(cc_common.get_memory_inefficient_command_line(
-        feature_configuration = host_features,
-        action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
-        variables = link_variables,
-    ))
+    add_mapped_values(
+        link_args,
+        cc_common.get_memory_inefficient_command_line(
+            feature_configuration = host_features,
+            action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
+            variables = link_variables,
+        ),
+        files = [out],
+    )
     link_args.add_all(objects)
     host_linker = cc_common.get_tool_for_action(
         feature_configuration = host_features,
         action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
     )
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = host_linker,
         exec_group = "host_cc",
         inputs = objects,
@@ -243,7 +312,7 @@ def _module_linker_script(ctx, helpers, kernel, target, source_files):
         target.cc_toolchain,
         target.feature_configuration,
     ))
-    args.add("@" + kernel.config.cflags.path)
+    args.add(kernel.config.cflags, format = "@%s")
     args.add_all([
         "-E",
         "-P",
@@ -257,16 +326,12 @@ def _module_linker_script(ctx, helpers, kernel, target, source_files):
         kernel.generated_headers.arch,
         kernel.srcarch,
     ))
-    args.add("-I" + kernel.config.include_dir)
-    args.add_all(helpers.source_include_flags(
-        source_root,
-        kernel.srcarch,
-        kernel.generated_headers.include_dirs,
-    ))
+    _add_kernel_include_dirs(args, helpers, kernel, source_root)
     args.add(src)
     args.add("-o")
     args.add(out)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = target.compiler,
         inputs = _target_compile_inputs(kernel, target, [src]),
         outputs = [out],
@@ -278,14 +343,15 @@ def _module_linker_script(ctx, helpers, kernel, target, source_files):
 
 def _compile_module_c(ctx, helpers, kernel, target, src, out, object_name, modname):
     args = ctx.actions.args()
-    args.add_all(_target_c_flags(ctx, helpers, kernel, target))
+    _add_target_c_flags(args, _target_c_flags(ctx, helpers, kernel, target))
     args.add_all(helpers.module_flags("m"))
     args.add_all(helpers.object_name_flags(object_name, modname))
     args.add("-c")
     args.add(src)
     args.add("-o")
     args.add(out)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = target.compiler,
         inputs = _target_compile_inputs(kernel, target, [src]),
         outputs = [out],
@@ -371,7 +437,8 @@ def _check_module_modinfo(ctx, module, output):
     args = ctx.actions.args()
     args.add("-in", module)
     args.add("-out", output)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._modulemodinfo,
         inputs = [module],
         outputs = [output],
@@ -407,7 +474,8 @@ def _process_objtool(ctx, config, objtool, input, output, mode, mnemonic, progre
         output,
         mode,
     ))
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._objtoolrun,
         inputs = [config.config, input],
         tools = [objtool],
@@ -467,7 +535,8 @@ def _run_modpost(ctx, kernel, modpost, module_outputs):
     ]
 
     args = ctx.actions.args()
-    args.add("-cwd", modules_order.dirname)
+    args.add("-cwd")
+    add_directory_arg(args, directory_anchor(modules_order))
     args.add("--")
     args.add(modpost)
     args.add_all(_modpost_args(kernel.config))
@@ -476,7 +545,8 @@ def _run_modpost(ctx, kernel, modpost, module_outputs):
     args.add("-T")
     args.add("modules.order")
     args.add("vmlinux.o")
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._runincwd,
         exec_group = "host_cc",
         inputs = [staged_vmlinux, modules_order] + staged_modules + module_checks,
@@ -528,6 +598,7 @@ linux_module_actions = struct(
     prepare = _prepare,
     process_objtool = _process_objtool,
     target_c_flags = _target_c_flags,
+    add_target_c_flags = _add_target_c_flags,
     target_context = _target_context,
     target_link_flags = _target_link_flags,
 )

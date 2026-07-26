@@ -5,6 +5,13 @@ load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolch
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load(":host_cc_toolchain.bzl", "host_cc_toolchain", "host_cc_toolchain_attr")
 load(":linux_objects.bzl", "LinuxConfigInfo", "LinuxGeneratedHeadersInfo", "linux_module_cc_helpers")
+load(
+    ":path_mapping.bzl",
+    "add_directory_arg",
+    "add_mapped_values",
+    "directory_anchor",
+    "path_mapped_run",
+)
 load(":providers.bzl", "LinuxRustSdkInfo")
 
 visibility("//...")
@@ -12,72 +19,7 @@ visibility("//...")
 _RUST_TOOLCHAIN_TYPE = Label("@rules_rust//rust:toolchain_type")
 _BINDGEN_TOOLCHAIN_TYPE = Label("@rules_rs//rs:bindgen_toolchain_type")
 _RUSTC_VERSION = "1.97.0"
-
-_RUST_ALLOWED_FEATURES = [
-    "asm_const",
-    "asm_goto",
-    "arbitrary_self_types",
-    "lint_reasons",
-    "offset_of_nested",
-    "raw_ref_op",
-    "used_with_arg",
-]
-
-_RUST_COMMON_FLAGS = [
-    "--edition=2021",
-    "-Zbinary_dep_depinfo=y",
-    "-Astable_features",
-    "-Aunused_features",
-    "-Dnon_ascii_idents",
-    "-Dunsafe_op_in_unsafe_fn",
-    "-Wmissing_docs",
-    "-Wrust_2018_idioms",
-    "-Wunreachable_pub",
-    "-Wclippy::all",
-    "-Wclippy::as_ptr_cast_mut",
-    "-Wclippy::as_underscore",
-    "-Wclippy::cast_lossless",
-    "-Aclippy::collapsible_if",
-    "-Aclippy::collapsible_match",
-    "-Wclippy::ignored_unit_patterns",
-    "-Wclippy::mut_mut",
-    "-Wclippy::needless_bitwise_bool",
-    "-Aclippy::needless_lifetimes",
-    "-Wclippy::no_mangle_with_rust_abi",
-    "-Wclippy::ptr_as_ptr",
-    "-Wclippy::ptr_cast_constness",
-    "-Wclippy::ref_as_ptr",
-    "-Wclippy::undocumented_unsafe_blocks",
-    "-Aclippy::uninlined_format_args",
-    "-Wclippy::unnecessary_safety_comment",
-    "-Wclippy::unnecessary_safety_doc",
-    "-Wrustdoc::missing_crate_level_docs",
-    "-Wrustdoc::unescaped_backticks",
-]
-
-_REDIRECT_INTRINSICS = [
-    "__addsf3",
-    "__eqsf2",
-    "__extendsfdf2",
-    "__gesf2",
-    "__lesf2",
-    "__ltsf2",
-    "__mulsf3",
-    "__nesf2",
-    "__truncdfsf2",
-    "__unordsf2",
-    "__adddf3",
-    "__eqdf2",
-    "__ledf2",
-    "__ltdf2",
-    "__muldf3",
-    "__unorddf2",
-    "__muloti4",
-    "__multi3",
-    "__udivmodti4",
-    "__udivti3",
-    "__umodti3",
-]
+_RUST_PROFILE_SCHEMA = "linux-rust-profile-v1"
 
 def _execroot_path(file):
     path = file.short_path.replace("\\", "/")
@@ -111,13 +53,173 @@ def _source_subtree(files, prefix):
         if path.startswith(prefix)
     ]
 
-def _rust_env(rust_toolchain, objtree = None, modfile = None):
+def _required_profile_field(value, name, expected_type):
+    field = value.get(name)
+    if type(field) != expected_type:
+        fail("Rust profile field %s must be a %s" % (name, expected_type))
+    return field
+
+def _profile_string_list(value, name):
+    items = _required_profile_field(value, name, "list")
+    for item in items:
+        if type(item) != "string":
+            fail("Rust profile field %s must contain only strings" % name)
+    return items
+
+def _validate_profile_name(name, field):
+    if type(name) != "string" or not name:
+        fail("Rust profile field %s must be a non-empty string" % field)
+    for character in name.elems():
+        if not (
+            (character >= "a" and character <= "z") or
+            (character >= "A" and character <= "Z") or
+            (character >= "0" and character <= "9") or
+            character == "_"
+        ):
+            fail("Rust profile field %s contains invalid name %r" % (field, name))
+    return name
+
+def _validate_profile_path(path, field):
+    if (
+        not path or
+        path.startswith("/") or
+        "\\" in path or
+        path == ".." or
+        path.startswith("../") or
+        "/../" in path or
+        path.endswith("/..")
+    ):
+        fail("Rust profile field %s contains invalid relative path %r" % (field, path))
+    return path
+
+def _relative_output_root(file, relative_path):
+    root = file.path
+    for _segment in relative_path.split("/"):
+        if "/" not in root:
+            fail("cannot derive output root for %s from %s" % (relative_path, file.path))
+        root = root.rsplit("/", 1)[0]
+    return root
+
+def _decode_rust_profile(profile_json, arch):
+    profile = json.decode(profile_json)
+    if type(profile) != "dict":
+        fail("Rust profile must decode to an object")
+    if profile.get("schema") != _RUST_PROFILE_SCHEMA:
+        fail(
+            "unsupported Rust profile schema %r; expected %r" %
+            (profile.get("schema"), _RUST_PROFILE_SCHEMA),
+        )
+    if profile.get("source_layout") not in ["legacy", "pin-init"]:
+        fail("unsupported Rust profile source layout %r" % profile.get("source_layout"))
+    architecture = profile.get("architecture")
+    expected_architecture = "x86_64" if arch == "x86" else arch
+    if architecture != expected_architecture:
+        fail(
+            "Rust profile architecture %r does not match Linux ARCH=%r" %
+            (architecture, arch),
+        )
+    for field in [
+        "target",
+        "target_flags",
+        "module",
+        "bindgen",
+        "exports",
+    ]:
+        _required_profile_field(profile, field, "dict")
+    for field in [
+        "common_flags",
+        "proc_macros",
+        "crates",
+        "runtime_objects",
+    ]:
+        _required_profile_field(profile, field, "list")
+    if type(profile.get("generated_assembly", [])) != "list":
+        fail("Rust profile field generated_assembly must be a list")
+    return profile
+
+def _condition_matches(config, condition):
+    symbol = _required_profile_field(condition, "config", "string")
+    expected = condition.get("equals", "y")
+    if type(expected) != "string":
+        fail("Rust profile conditional equals field must be a string")
+    return config.config_flags.get(symbol, "n") == expected
+
+def _expand_profile_value(value, config, replacements):
+    if type(value) != "string":
+        fail("Rust profile flag must be a string, got %s" % type(value))
+    expanded = value
+    for name in sorted(replacements.keys()):
+        expanded = expanded.replace("{" + name + "}", replacements[name])
+    for symbol in sorted(config.config_flags.keys()):
+        expanded = expanded.replace(
+            "{" + symbol + "}",
+            config.config_flags[symbol],
+        )
+    if "{" in expanded or "}" in expanded:
+        fail("Rust profile contains an unsupported placeholder in %r" % value)
+    return expanded
+
+def _expand_profile_values(values, config, replacements):
+    return [
+        _expand_profile_value(value, config, replacements)
+        for value in values
+    ]
+
+def _profile_target_flags(profile, config, replacements):
+    target_flags = profile["target_flags"]
+    flags = list(profile["common_flags"])
+    flags.extend(_required_profile_field(target_flags, "always", "list"))
+    for condition in target_flags.get("conditional", []):
+        if type(condition) != "dict":
+            fail("Rust profile target_flags.conditional entries must be objects")
+        branch = "flags" if _condition_matches(config, condition) else "else_flags"
+        flags.extend(condition.get(branch, []))
+    return _expand_profile_values(flags, config, replacements)
+
+def _profile_inputs(source_files, prefixes, paths):
+    inputs = {}
+    for prefix in prefixes:
+        _validate_profile_path(prefix, "source_prefixes")
+        for file in _source_subtree(source_files, prefix):
+            inputs[file.path] = file
+    for path in paths:
+        _validate_profile_path(path, "source_files")
+        file = _source_file(source_files, path)
+        inputs[file.path] = file
+    return [inputs[path] for path in sorted(inputs.keys())]
+
+def _rustc_profile_path(path):
+    prefix = "rustc://"
+    if not path.startswith(prefix):
+        fail("expected rustc source path, got %r" % path)
+    return _validate_profile_path(path[len(prefix):], "crate source")
+
+def _rustc_file(rustc_srcs, path):
+    suffix = "/" + _rustc_profile_path(path)
+    matches = [
+        file
+        for file in rustc_srcs
+        if ("/" + file.short_path.replace("\\", "/").lstrip("/")).endswith(suffix)
+    ]
+    if len(matches) != 1:
+        fail("pinned Rust sources contain %d matches for %s" % (len(matches), path))
+    return matches[0]
+
+def _rustc_subtree(rustc_srcs, prefix):
+    relative = _rustc_profile_path(prefix)
+    marker = "/" + relative
+    return [
+        file
+        for file in rustc_srcs
+        if (
+            marker in ("/" + file.short_path.replace("\\", "/").lstrip("/")) and
+            ("/" + file.short_path.replace("\\", "/").lstrip("/")).split(marker, 1)[1] != ""
+        )
+    ]
+
+def _rust_env(rust_toolchain):
     env = dict(rust_toolchain.env)
     env["RUSTC_BOOTSTRAP"] = "1"
-    if objtree != None:
-        env["OBJTREE"] = "{cwd}/" + objtree
-    if modfile != None:
-        env["RUST_MODFILE"] = modfile
     return env
 
 def _run_rustc(
@@ -128,21 +230,36 @@ def _run_rustc(
         outputs,
         mnemonic,
         progress_message,
-        objtree = None,
+        mapped_files = [],
+        mapped_directories = {},
+        objtree_anchor = None,
         transitive_tool_inputs = []):
     runner_args = ctx.actions.args()
     runner_args.add("-cwd", ".")
-    env = _rust_env(rust_toolchain, objtree = objtree)
+    env = _rust_env(rust_toolchain)
     for name in sorted(env.keys()):
         runner_args.add("-env", name + "=" + env[name])
+    if objtree_anchor != None:
+        runner_args.add("-env")
+        add_directory_arg(
+            runner_args,
+            objtree_anchor,
+            format = "OBJTREE={cwd}/%s",
+        )
     runner_args.add("--")
     runner_args.add(ctx.executable._rustcversionrun)
     runner_args.add("-expected")
     runner_args.add(_RUSTC_VERSION)
     runner_args.add("--")
     runner_args.add(rust_toolchain.rustc)
-    runner_args.add_all(args)
-    ctx.actions.run(
+    add_mapped_values(
+        runner_args,
+        args,
+        files = mapped_files,
+        directory_anchors = mapped_directories,
+    )
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._runincwd,
         inputs = depset(
             inputs,
@@ -155,69 +272,90 @@ def _run_rustc(
         progress_message = progress_message,
     )
 
-def _target_spec(ctx, config):
-    features = "-mmx,+soft-float"
-    if config.config_flags.get("CONFIG_MITIGATION_RETPOLINE") == "y":
-        features += ",+retpoline-external-thunk,+retpoline-indirect-branches,+retpoline-indirect-calls"
-    if config.config_flags.get("CONFIG_MITIGATION_SLS") == "y":
-        features += ",+harden-sls-ijmp,+harden-sls-ret"
-    spec = {
-        "arch": "x86_64",
-        "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
-        "emit-debug-gdb-scripts": False,
-        "features": features,
-        "frame-pointer": "may-omit",
-        "llvm-target": "x86_64-linux-gnu",
-        "rustc-abi": "x86-softfloat",
-        "stack-probes": {"kind": "none"},
-        "supported-sanitizers": ["kcfi", "kernel-address"],
-        "target-pointer-width": 64,
-    }
-    out = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/scripts/target.json")
-    ctx.actions.write(out, json.encode(spec) + "\n")
-    return out
-
-def _target_rust_flags(config, target_spec):
-    flags = list(_RUST_COMMON_FLAGS)
-    flags.extend([
-        "-Cpanic=abort",
-        "-Cembed-bitcode=n",
-        "-Clto=n",
-        "-Cforce-unwind-tables=n",
-        "-Ccodegen-units=1",
-        "-Csymbol-mangling-version=v0",
-        "-Crelocation-model=static",
-        "-Zfunction-sections=n",
-        "-Wclippy::float_arithmetic",
-        "--target=" + target_spec.path,
-        "-Ctarget-feature=-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2",
-        "-Ctarget-cpu=x86-64",
-        "-Ztune-cpu=generic",
-        "-Cno-redzone=y",
-        "-Ccode-model=kernel",
-    ])
-    if config.config_flags.get("CONFIG_CC_OPTIMIZE_FOR_SIZE") == "y":
-        flags.append("-Copt-level=s")
-    else:
-        flags.append("-Copt-level=2")
-    flags.extend([
-        "-Cdebug-assertions=" + ("y" if config.config_flags.get("CONFIG_RUST_DEBUG_ASSERTIONS") == "y" else "n"),
-        "-Coverflow-checks=" + ("y" if config.config_flags.get("CONFIG_RUST_OVERFLOW_CHECKS") == "y" else "n"),
-    ])
-    if config.config_flags.get("CONFIG_FRAME_POINTER") == "y":
-        flags.extend([
-            "-Cforce-frame-pointers=y",
-            "-Zllvm_module_flag=frame-pointer:u32:2:max",
-        ])
-    if config.config_flags.get("CONFIG_MITIGATION_RETHUNK") == "y":
-        flags.append("-Zfunction-return=thunk-extern")
-    if config.config_flags.get("CONFIG_X86_KERNEL_IBT") == "y":
-        flags.extend(["-Zcf-protection=branch", "-Cjump-tables=n"])
-    if config.config_flags.get("CONFIG_CALL_PADDING") == "y":
-        padding = config.config_flags.get("CONFIG_FUNCTION_PADDING_BYTES", "0")
-        flags.append("-Zpatchable-function-entry=%s,%s" % (padding, padding))
-    flags.append("@" + config.rustc_cfg.path)
+def _host_rust_link_flags(host_cc, host_features):
+    host_compiler = cc_common.get_tool_for_action(
+        feature_configuration = host_features,
+        action_name = C_COMPILE_ACTION_NAME,
+    )
+    link_variables = cc_common.create_link_variables(
+        cc_toolchain = host_cc,
+        feature_configuration = host_features,
+        is_linking_dynamic_library = False,
+        is_using_linker = True,
+    )
+    host_link_flags = cc_common.get_memory_inefficient_command_line(
+        feature_configuration = host_features,
+        action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
+        variables = link_variables,
+    )
+    flags = [
+        "-Clink-self-contained=-linker",
+        "-Clinker-flavor=gcc",
+        "-Clinker=" + host_compiler,
+    ]
+    flags.extend(["-Clink-arg=" + flag for flag in host_link_flags])
     return flags
+
+def _target_spec(
+        ctx,
+        profile,
+        rust_toolchain,
+        host_cc,
+        host_features,
+        config,
+        source_files):
+    target = profile["target"]
+    source_path = _validate_profile_path(
+        _required_profile_field(target, "generator_source", "string"),
+        "target.generator_source",
+    )
+    if target.get("stdin") != "config_auto_conf":
+        fail("unsupported Rust target generator stdin recipe %r" % target.get("stdin"))
+    output_path = _validate_profile_path(
+        _required_profile_field(target, "output", "string"),
+        "target.output",
+    )
+    source = _source_file(source_files, source_path)
+    generator = ctx.actions.declare_file(
+        ctx.label.name + ".rust_sdk/scripts/generate_rust_target",
+    )
+    args = list(profile["common_flags"])
+    args.extend(_host_rust_link_flags(host_cc, host_features))
+    args.extend([
+        "--crate-name",
+        "generate_rust_target",
+        "--emit=link=" + generator.path,
+        source.path,
+    ])
+    _run_rustc(
+        ctx,
+        rust_toolchain,
+        args,
+        [source],
+        [generator],
+        "LinuxRustTargetGeneratorCompile",
+        "Compiling the Linux Rust target generator %{label}",
+        mapped_files = [generator, source],
+        transitive_tool_inputs = [host_cc.all_files],
+    )
+
+    out = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/" + output_path)
+    run_args = ctx.actions.args()
+    run_args.add("-stdin")
+    run_args.add(config.auto_conf)
+    run_args.add(out)
+    run_args.add(generator)
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._runandwrite,
+        inputs = [config.auto_conf],
+        tools = [generator],
+        outputs = [out],
+        arguments = [run_args],
+        mnemonic = "LinuxRustTargetGenerate",
+        progress_message = "Generating the Linux Rust target specification %{label}",
+    )
+    return out
 
 def _unsupported_rust_config_symbols(config):
     unsupported = []
@@ -245,32 +383,56 @@ def _unsupported_rust_config_symbols(config):
 
 def _validate_rust_config(ctx, config):
     if ctx.attr.arch != "x86":
-        fail("%s enables CONFIG_RUST, but the initial Rust-for-Linux SDK supports only x86_64" % ctx.label)
-    if not ctx.attr.version.startswith("6.18."):
-        fail("%s enables CONFIG_RUST for Linux %s; only the Linux 6.18 crate graph is supported" % (ctx.label, ctx.attr.version))
+        fail("%s enables CONFIG_RUST, but the Rust toolchain supports only x86_64" % ctx.label)
     unsupported = _unsupported_rust_config_symbols(config)
     if unsupported:
         fail("%s enables Rust configuration paths not yet modeled: %s" % (ctx.label, unsupported))
 
 def _kernel_c_flags(ctx, config, generated_headers, cc_toolchain, feature_configuration, source_root):
-    flags = []
-    flags.extend(linux_module_cc_helpers.compile_flags(
+    values = []
+    values.extend(linux_module_cc_helpers.compile_flags(
         ctx,
         cc_toolchain,
         feature_configuration,
     ))
-    flags.append("@" + config.cflags.path)
+    values.append("@" + config.cflags.path)
+    mapped_files = [config.cflags]
     if generated_headers.cflags != None:
-        flags.append("@" + generated_headers.cflags.path)
-    flags.extend(linux_module_cc_helpers.source_preinclude_flags(source_root))
-    flags.append("-I" + config.include_dir)
-    flags.extend(linux_module_cc_helpers.source_include_flags(
+        values.append("@" + generated_headers.cflags.path)
+        mapped_files.append(generated_headers.cflags)
+    values.extend(linux_module_cc_helpers.source_preinclude_flags(source_root))
+    values.append("-I" + config.include_dir)
+    values.extend(linux_module_cc_helpers.source_include_flags(
         source_root,
         ctx.attr.srcarch,
         generated_headers.include_dirs,
     ))
-    flags.append("-fmacro-prefix-map=%s/=" % source_root)
-    return flags
+    values.append("-fmacro-prefix-map=%s/=" % source_root)
+    directory_anchors = {}
+    if hasattr(config, "include_dir_anchor"):
+        directory_anchors[config.include_dir] = config.include_dir_anchor
+    if hasattr(generated_headers, "include_dir_anchors"):
+        directory_anchors.update(generated_headers.include_dir_anchors)
+    return struct(
+        directory_anchors = directory_anchors,
+        mapped_files = mapped_files,
+        values = values,
+    )
+
+def _add_kernel_c_flags(args, flags):
+    add_mapped_values(
+        args,
+        flags.values,
+        files = flags.mapped_files,
+        directory_anchors = flags.directory_anchors,
+    )
+
+def _extend_kernel_c_flags(flags, values):
+    return struct(
+        directory_anchors = flags.directory_anchors,
+        mapped_files = flags.mapped_files,
+        values = flags.values + values,
+    )
 
 def _target_inputs(config, generated_headers, source_tree, cc_toolchain, direct = []):
     return depset(
@@ -288,7 +450,8 @@ def _postprocess(ctx, mode, input, output):
     args.add("-mode", mode)
     args.add("-in", input)
     args.add("-out", output)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._rustpostprocess,
         inputs = [input],
         outputs = [output],
@@ -308,7 +471,8 @@ def _process_objtool(ctx, config, input, path):
     args.add("-in", input)
     args.add("-mode", "builtin")
     args.add("-out", out)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._objtoolrun,
         inputs = [config.config, input],
         tools = [ctx.attr.objtool[DefaultInfo].files_to_run],
@@ -331,11 +495,12 @@ def _preprocess_rust_asm(
         output_path):
     raw = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/" + output_path + ".preprocessed")
     args = ctx.actions.args()
-    args.add_all(c_flags)
+    _add_kernel_c_flags(args, c_flags)
     args.add_all(["-E", "-xc", "-C", "-P"])
     args.add(source)
     args.add("-o", raw)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = compiler,
         inputs = _target_inputs(
             config,
@@ -353,20 +518,6 @@ def _preprocess_rust_asm(
     _postprocess(ctx, "rust-asm", raw, out)
     return out
 
-def _bindgen_common_flags():
-    return [
-        "--rust-target",
-        "1.68",
-        "--use-core",
-        "--with-derive-default",
-        "--ctypes-prefix",
-        "ffi",
-        "--no-layout-tests",
-        "--no-debug",
-        ".*",
-        "--enable-function-attribute-detection",
-    ]
-
 def _run_bindgen_with_parameters(
         ctx,
         bindgen,
@@ -376,6 +527,7 @@ def _run_bindgen_with_parameters(
         source_tree,
         header,
         parameters,
+        common_flags,
         c_flags,
         output,
         mode = None):
@@ -389,11 +541,12 @@ def _run_bindgen_with_parameters(
     args.add(bindgen)
     args.add(header)
     args.add("{args_file}")
-    args.add_all(_bindgen_common_flags())
+    args.add_all(common_flags)
     args.add("-o", "{output}")
     args.add("--")
-    args.add_all(c_flags)
-    ctx.actions.run(
+    _add_kernel_c_flags(args, c_flags)
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._lineargsrun,
         inputs = depset(
             [header, parameters],
@@ -421,22 +574,24 @@ def _run_helpers_bindgen(
         generated_headers,
         source_tree,
         source,
+        common_flags,
         c_flags,
-        rust_dir):
+        rust_dir_anchor):
     raw = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/rust/bindings/bindings_helpers_generated.rs.raw")
     args = ctx.actions.args()
     args.add(source)
     args.add("--blocklist-type", ".*")
     args.add("--allowlist-var", "")
     args.add("--allowlist-function", "rust_helper_.*")
-    args.add_all(_bindgen_common_flags())
+    args.add_all(common_flags)
     args.add("-o", raw)
     args.add("--")
-    args.add_all(c_flags)
-    args.add("-I" + rust_dir)
+    _add_kernel_c_flags(args, c_flags)
+    add_directory_arg(args, rust_dir_anchor, format = "-I%s")
     args.add("-Wno-missing-prototypes")
     args.add("-Wno-missing-declarations")
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = bindgen,
         inputs = depset(
             [source],
@@ -467,15 +622,23 @@ def _compile_kernel_c(
         source,
         object_path,
         extra_flags = [],
+        extra_directory_flags = [],
         direct_inputs = []):
     raw = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/" + object_path + ".compile")
     args = ctx.actions.args()
-    args.add_all(c_flags)
+    _add_kernel_c_flags(args, c_flags)
     args.add_all(extra_flags)
+    for directory_flag in extra_directory_flags:
+        add_directory_arg(
+            args,
+            directory_flag.anchor,
+            format = directory_flag.format,
+        )
     args.add_all(linux_module_cc_helpers.object_name_flags(object_path, object_path))
     args.add("-c", source)
     args.add("-o", raw)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = compiler,
         inputs = _target_inputs(
             config,
@@ -497,7 +660,8 @@ def _objcopy(ctx, input, path, flags):
     args.add_all(flags)
     args.add(input)
     args.add(out)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._llvm_objcopy,
         inputs = [input],
         outputs = [out],
@@ -511,25 +675,24 @@ def _rust_crate(
         ctx,
         rust_toolchain,
         config,
-        objtree,
+        objtree_anchor,
         rust_dir,
+        rust_dir_anchor,
         target_flags,
         crate,
         source,
         source_inputs,
         dep_inputs,
         crate_flags = [],
+        skip_flags = [],
         objcopy_flags = []):
     raw_object = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/rust/" + crate + ".rustc.o")
     metadata = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/rust/lib" + crate + ".rmeta")
-    flags = list(target_flags)
-    if crate == "core":
-        flags = [
-            flag
-            for flag in flags
-            if flag not in ["--edition=2021", "-Wunreachable_pub"]
-        ]
-        flags.extend(["--edition=2024", "--cfg", "no_fp_fmt_parse"])
+    flags = [
+        flag
+        for flag in target_flags
+        if flag not in skip_flags
+    ]
     flags.extend(crate_flags)
     flags.extend([
         "--emit=obj=" + raw_object.path,
@@ -551,7 +714,16 @@ def _rust_crate(
         [raw_object, metadata],
         "LinuxRustc",
         "Compiling Rust-for-Linux crate %s %%{label}" % crate,
-        objtree = objtree,
+        mapped_files = [
+            raw_object,
+            metadata,
+            source,
+            config.rustc_cfg,
+        ] + dep_inputs,
+        mapped_directories = {
+            rust_dir: rust_dir_anchor,
+        },
+        objtree_anchor = objtree_anchor,
     )
     processed = raw_object
     if objcopy_flags:
@@ -567,7 +739,8 @@ def _export_header(ctx, object, name):
     nm_args.add("-nm", ctx.executable._llvm_nm)
     nm_args.add("-in", object)
     nm_args.add("-out", symbols)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._nmrun,
         inputs = [object],
         tools = [ctx.executable._llvm_nm],
@@ -586,38 +759,20 @@ def _proc_macro(
         host_cc,
         host_features,
         config,
+        common_flags,
         name,
         source,
         source_inputs,
+        uses_rustc_cfg,
         crate_flags = []):
     extension = rust_toolchain.dylib_ext
     output = ctx.actions.declare_file(
         ctx.label.name + ".rust_sdk/rust/lib" + name + extension,
     )
-    host_compiler = cc_common.get_tool_for_action(
-        feature_configuration = host_features,
-        action_name = C_COMPILE_ACTION_NAME,
-    )
-    link_variables = cc_common.create_link_variables(
-        cc_toolchain = host_cc,
-        feature_configuration = host_features,
-        is_linking_dynamic_library = False,
-        is_using_linker = True,
-    )
-    host_link_flags = cc_common.get_memory_inefficient_command_line(
-        feature_configuration = host_features,
-        action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
-        variables = link_variables,
-    )
-    args = list(_RUST_COMMON_FLAGS)
+    args = list(common_flags)
     args.extend(crate_flags)
-    args.extend([
-        "--sysroot=" + rust_toolchain.sysroot,
-        "-Clink-self-contained=-linker",
-        "-Clinker-flavor=gcc",
-        "-Clinker=" + host_compiler,
-    ])
-    args.extend(["-Clink-arg=" + flag for flag in host_link_flags])
+    args.append("--sysroot=" + rust_toolchain.sysroot)
+    args.extend(_host_rust_link_flags(host_cc, host_features))
     args.extend([
         "--emit=link=" + output.path,
         "--extern",
@@ -626,31 +781,30 @@ def _proc_macro(
         "proc-macro",
         "--crate-name",
         name,
-        "@" + config.rustc_cfg.path,
-        source.path,
     ])
+    inputs = list(source_inputs)
+    if uses_rustc_cfg:
+        args.append("@" + config.rustc_cfg.path)
+        inputs.append(config.rustc_cfg)
+    args.append(source.path)
     _run_rustc(
         ctx,
         rust_toolchain,
         args,
-        source_inputs + [config.rustc_cfg],
+        inputs,
         [output],
         "LinuxRustProcMacro",
         "Compiling Rust-for-Linux procedural macro %s %%{label}" % name,
+        mapped_files = [output, source, config.rustc_cfg],
+        mapped_directories = {
+            rust_toolchain.sysroot: directory_anchor(
+                rust_toolchain.sysroot_anchor,
+                rust_toolchain.sysroot,
+            ),
+        },
         transitive_tool_inputs = [host_cc.all_files],
     )
     return output
-
-def _core_sources(rustc_srcs):
-    marker = "/library/core/src/"
-    crate_root = None
-    for file in rustc_srcs:
-        path = "/" + file.short_path.replace("\\", "/").lstrip("/")
-        if marker in path and path.endswith("/core/src/lib.rs"):
-            crate_root = file
-    if crate_root == None:
-        fail("pinned Rust sources do not expose library/core/src/lib.rs")
-    return crate_root, rustc_srcs
 
 def _disabled_sdk():
     return LinuxRustSdkInfo(
@@ -659,7 +813,9 @@ def _disabled_sdk():
         module_flags = [],
         objtool = None,
         objtree = "",
+        objtree_anchor = None,
         rust_dir = "",
+        rust_dir_anchor = None,
         rustc = None,
         rustc_env = {},
         rustc_files = depset(),
@@ -686,6 +842,7 @@ def _linux_rust_kernel_sdk_impl(ctx):
         fail("%s requires CONFIG_RUST=y" % ctx.label)
 
     _validate_rust_config(ctx, config)
+    profile = _decode_rust_profile(ctx.attr.profile_json, ctx.attr.arch)
     rust_toolchain = ctx.toolchains[_RUST_TOOLCHAIN_TYPE]
     generated_headers = ctx.attr.generated_headers[LinuxGeneratedHeadersInfo]
     source_tree = depset(ctx.files.source_tree)
@@ -705,9 +862,37 @@ def _linux_rust_kernel_sdk_impl(ctx):
         unsupported_features = [],
     )
     bindgen = ctx.toolchains[_BINDGEN_TOOLCHAIN_TYPE].bindgen
-    target_spec = _target_spec(ctx, config)
-    objtree = target_spec.dirname.rsplit("/", 1)[0]
+    target_spec = _target_spec(
+        ctx,
+        profile,
+        rust_toolchain,
+        host_cc,
+        host_features,
+        config,
+        source_files,
+    )
+    objtree = _relative_output_root(target_spec, profile["target"]["output"])
+    objtree_anchor = directory_anchor(target_spec, objtree)
     rust_dir = objtree + "/rust"
+    module = profile["module"]
+    allowed_features = _profile_string_list(
+        module,
+        "allowed_features",
+    )
+    for feature in allowed_features:
+        _validate_profile_name(feature, "module.allowed_features")
+    replacements = {
+        "allowed_features_csv": ",".join(allowed_features),
+        "rust_dir": rust_dir,
+        "rustc_cfg": config.rustc_cfg.path,
+        "target_spec": target_spec.path,
+    }
+    common_flags = _expand_profile_values(
+        profile["common_flags"],
+        config,
+        replacements,
+    )
+    target_flags = _profile_target_flags(profile, config, replacements)
     c_flags = _kernel_c_flags(
         ctx,
         config,
@@ -716,16 +901,29 @@ def _linux_rust_kernel_sdk_impl(ctx):
         feature_configuration,
         source_root,
     )
-    bindgen_c_flags = c_flags + [
+    bindgen_c_flags = _extend_kernel_c_flags(c_flags, [
         "-fno-builtin",
         "-D__BINDGEN__",
         "-DMODULE",
-    ]
+    ])
 
-    bindgen_parameters = _source_file(source_files, "rust/bindgen_parameters")
+    bindgen_profile = profile["bindgen"]
+    bindgen_parameters = _source_file(
+        source_files,
+        _validate_profile_path(
+            _required_profile_field(bindgen_profile, "parameters", "string"),
+            "bindgen.parameters",
+        ),
+    )
+    bindgen_common_flags = _expand_profile_values(
+        _required_profile_field(bindgen_profile, "common_flags", "list"),
+        config,
+        replacements,
+    )
     bindings_generated = ctx.actions.declare_file(
         ctx.label.name + ".rust_sdk/rust/bindings/bindings_generated.rs",
     )
+    rust_dir_anchor = directory_anchor(bindings_generated, rust_dir)
     _run_bindgen_with_parameters(
         ctx,
         bindgen,
@@ -733,11 +931,18 @@ def _linux_rust_kernel_sdk_impl(ctx):
         config,
         generated_headers,
         source_tree,
-        _source_file(source_files, "rust/bindings/bindings_helper.h"),
-        bindgen_parameters,
-        bindgen_c_flags + linux_module_cc_helpers.object_name_flags(
-            "rust/bindings/bindings_generated.o",
+        _source_file(
+            source_files,
+            _validate_profile_path(
+                _required_profile_field(bindgen_profile, "bindings_header", "string"),
+                "bindgen.bindings_header",
+            ),
         ),
+        bindgen_parameters,
+        bindgen_common_flags,
+        _extend_kernel_c_flags(bindgen_c_flags, linux_module_cc_helpers.object_name_flags(
+            "rust/bindings/bindings_generated.o",
+        )),
         bindings_generated,
         mode = "bindings",
     )
@@ -751,14 +956,25 @@ def _linux_rust_kernel_sdk_impl(ctx):
         config,
         generated_headers,
         source_tree,
-        _source_file(source_files, "rust/uapi/uapi_helper.h"),
-        bindgen_parameters,
-        bindgen_c_flags + linux_module_cc_helpers.object_name_flags(
-            "rust/uapi/uapi_generated.o",
+        _source_file(
+            source_files,
+            _validate_profile_path(
+                _required_profile_field(bindgen_profile, "uapi_header", "string"),
+                "bindgen.uapi_header",
+            ),
         ),
+        bindgen_parameters,
+        bindgen_common_flags,
+        _extend_kernel_c_flags(bindgen_c_flags, linux_module_cc_helpers.object_name_flags(
+            "rust/uapi/uapi_generated.o",
+        )),
         uapi_generated,
     )
-    helpers_source = _source_file(source_files, "rust/helpers/helpers.c")
+    helpers_source_path = _validate_profile_path(
+        _required_profile_field(bindgen_profile, "helpers_source", "string"),
+        "bindgen.helpers_source",
+    )
+    helpers_source = _source_file(source_files, helpers_source_path)
     bindings_helpers_generated = _run_helpers_bindgen(
         ctx,
         bindgen,
@@ -767,15 +983,35 @@ def _linux_rust_kernel_sdk_impl(ctx):
         generated_headers,
         source_tree,
         helpers_source,
-        bindgen_c_flags + linux_module_cc_helpers.object_name_flags(
+        bindgen_common_flags,
+        _extend_kernel_c_flags(bindgen_c_flags, linux_module_cc_helpers.object_name_flags(
             "rust/bindings/bindings_helpers_generated.o",
-        ),
-        rust_dir,
+        )),
+        rust_dir_anchor,
     )
 
+    generated_inputs = {
+        "bindings_generated": bindings_generated,
+        "bindings_helpers_generated": bindings_helpers_generated,
+        "uapi_generated": uapi_generated,
+    }
+    conditional_generated_inputs = {}
     generated_arch_sources = []
-    if config.config_flags.get("CONFIG_JUMP_LABEL") == "y":
-        generated_arch_sources.append(_preprocess_rust_asm(
+    for recipe in profile.get("generated_assembly", []):
+        if type(recipe) != "dict":
+            fail("Rust profile generated_assembly entries must be objects")
+        output_path = _validate_profile_path(
+            _required_profile_field(recipe, "output", "string"),
+            "generated_assembly.output",
+        )
+        conditional_generated_inputs[output_path] = True
+        if not _condition_matches(config, recipe):
+            continue
+        source_path = _validate_profile_path(
+            _required_profile_field(recipe, "source", "string"),
+            "generated_assembly.source",
+        )
+        generated = _preprocess_rust_asm(
             ctx,
             config,
             generated_headers,
@@ -783,213 +1019,135 @@ def _linux_rust_kernel_sdk_impl(ctx):
             cc_toolchain,
             compiler,
             c_flags,
-            _source_file(source_files, "rust/kernel/generated_arch_static_branch_asm.rs.S"),
-            "rust/kernel/generated_arch_static_branch_asm.rs",
-        ))
-    if config.config_flags.get("CONFIG_BUG") == "y":
-        for basename in [
-            "generated_arch_warn_asm.rs",
-            "generated_arch_reachable_asm.rs",
-        ]:
-            generated_arch_sources.append(_preprocess_rust_asm(
-                ctx,
+            _source_file(source_files, source_path),
+            output_path,
+        )
+        generated_inputs[output_path] = generated
+        generated_arch_sources.append(generated)
+
+    proc_macros = {}
+    for recipe in profile["proc_macros"]:
+        if type(recipe) != "dict":
+            fail("Rust profile proc_macros entries must be objects")
+        name = _validate_profile_name(
+            _required_profile_field(recipe, "name", "string"),
+            "proc_macros.name",
+        )
+        if name in proc_macros:
+            fail("Rust profile contains duplicate proc macro %r" % name)
+        source_path = _validate_profile_path(
+            _required_profile_field(recipe, "source", "string"),
+            "proc_macros.source",
+        )
+        source_inputs = _profile_inputs(
+            source_files,
+            _profile_string_list(recipe, "source_prefixes"),
+            _profile_string_list(recipe, "source_files") + [source_path],
+        )
+        proc_macros[name] = _proc_macro(
+            ctx,
+            rust_toolchain,
+            host_cc,
+            host_features,
+            config,
+            common_flags,
+            name,
+            _source_file(source_files, source_path),
+            source_inputs,
+            _required_profile_field(recipe, "uses_rustc_cfg", "bool"),
+            crate_flags = _expand_profile_values(
+                _required_profile_field(recipe, "flags", "list"),
                 config,
-                generated_headers,
-                source_tree,
-                cc_toolchain,
-                compiler,
-                c_flags,
-                _source_file(source_files, "rust/kernel/" + basename + ".S"),
-                "rust/kernel/" + basename,
-            ))
+                replacements,
+            ),
+        )
 
-    macros = _proc_macro(
-        ctx,
-        rust_toolchain,
-        host_cc,
-        host_features,
-        config,
-        "macros",
-        _source_file(source_files, "rust/macros/lib.rs"),
-        _source_subtree(source_files, "rust/macros/"),
-    )
-    pin_init_internal = _proc_macro(
-        ctx,
-        rust_toolchain,
-        host_cc,
-        host_features,
-        config,
-        "pin_init_internal",
-        _source_file(source_files, "rust/pin-init/internal/src/lib.rs"),
-        _source_subtree(source_files, "rust/pin-init/internal/src/") + [
-            _source_file(source_files, "rust/macros/quote.rs"),
-        ],
-        crate_flags = ["--cfg", "kernel"],
-    )
+    crates = {}
+    crate_order = []
+    rustc_srcs = ctx.files._rustc_srcs
+    for recipe in profile["crates"]:
+        if type(recipe) != "dict":
+            fail("Rust profile crates entries must be objects")
+        name = _validate_profile_name(
+            _required_profile_field(recipe, "name", "string"),
+            "crates.name",
+        )
+        if name in crates or name in proc_macros:
+            fail("Rust profile contains duplicate crate %r" % name)
+        source_path = _required_profile_field(recipe, "source", "string")
+        source_inputs = []
+        if source_path.startswith("rustc://"):
+            source = _rustc_file(rustc_srcs, source_path)
+            for prefix in _profile_string_list(recipe, "source_prefixes"):
+                source_inputs.extend(_rustc_subtree(rustc_srcs, prefix))
+            for path in _profile_string_list(recipe, "source_files"):
+                source_inputs.append(_rustc_file(rustc_srcs, path))
+            source_inputs.append(source)
+        else:
+            source_path = _validate_profile_path(source_path, "crates.source")
+            source = _source_file(source_files, source_path)
+            source_inputs = _profile_inputs(
+                source_files,
+                _profile_string_list(recipe, "source_prefixes"),
+                _profile_string_list(recipe, "source_files") + [source_path],
+            )
+        for generated_name in _profile_string_list(recipe, "generated_inputs"):
+            generated = generated_inputs.get(generated_name)
+            if generated == None and generated_name in conditional_generated_inputs:
+                continue
+            if generated == None:
+                fail(
+                    "Rust profile crate %s references unavailable generated input %s" %
+                    (name, generated_name),
+                )
+            source_inputs.append(generated)
 
-    target_flags = _target_rust_flags(config, target_spec)
-    common_dep_inputs = [target_spec]
-    core_root, core_source_inputs = _core_sources(ctx.files._rustc_srcs)
-    core_objcopy_flags = []
-    for symbol in _REDIRECT_INTRINSICS:
-        core_objcopy_flags.extend([
-            "--redefine-sym",
-            symbol + "=__rust" + symbol,
-        ])
-    core = _rust_crate(
-        ctx,
-        rust_toolchain,
-        config,
-        objtree,
-        rust_dir,
-        target_flags,
-        "core",
-        core_root,
-        core_source_inputs,
-        common_dep_inputs,
-        objcopy_flags = core_objcopy_flags,
-    )
-    compiler_builtins = _rust_crate(
-        ctx,
-        rust_toolchain,
-        config,
-        objtree,
-        rust_dir,
-        target_flags,
-        "compiler_builtins",
-        _source_file(source_files, "rust/compiler_builtins.rs"),
-        [_source_file(source_files, "rust/compiler_builtins.rs")],
-        common_dep_inputs + [core.metadata],
-        objcopy_flags = ["-w", "-W", "__*"],
-    )
-    ffi = _rust_crate(
-        ctx,
-        rust_toolchain,
-        config,
-        objtree,
-        rust_dir,
-        target_flags,
-        "ffi",
-        _source_file(source_files, "rust/ffi.rs"),
-        [_source_file(source_files, "rust/ffi.rs")],
-        common_dep_inputs + [core.metadata, compiler_builtins.metadata],
-    )
-    build_error = _rust_crate(
-        ctx,
-        rust_toolchain,
-        config,
-        objtree,
-        rust_dir,
-        target_flags,
-        "build_error",
-        _source_file(source_files, "rust/build_error.rs"),
-        [_source_file(source_files, "rust/build_error.rs")],
-        common_dep_inputs + [core.metadata, compiler_builtins.metadata],
-    )
-    pin_init = _rust_crate(
-        ctx,
-        rust_toolchain,
-        config,
-        objtree,
-        rust_dir,
-        target_flags,
-        "pin_init",
-        _source_file(source_files, "rust/pin-init/src/lib.rs"),
-        _source_subtree(source_files, "rust/pin-init/src/"),
-        common_dep_inputs + [
-            core.metadata,
-            compiler_builtins.metadata,
-            macros,
-            pin_init_internal,
-        ],
-        crate_flags = [
-            "--extern",
-            "pin_init_internal",
-            "--extern",
-            "macros",
-            "--cfg",
-            "kernel",
-        ],
-    )
-    bindings = _rust_crate(
-        ctx,
-        rust_toolchain,
-        config,
-        objtree,
-        rust_dir,
-        target_flags,
-        "bindings",
-        _source_file(source_files, "rust/bindings/lib.rs"),
-        _source_subtree(source_files, "rust/bindings/") + [
-            bindings_generated,
-            bindings_helpers_generated,
-        ],
-        common_dep_inputs + [
-            core.metadata,
-            compiler_builtins.metadata,
-            ffi.metadata,
-            pin_init.metadata,
-            macros,
-            pin_init_internal,
-        ],
-        crate_flags = ["--extern", "ffi", "--extern", "pin_init"],
-    )
-    uapi = _rust_crate(
-        ctx,
-        rust_toolchain,
-        config,
-        objtree,
-        rust_dir,
-        target_flags,
-        "uapi",
-        _source_file(source_files, "rust/uapi/lib.rs"),
-        _source_subtree(source_files, "rust/uapi/") + [uapi_generated],
-        common_dep_inputs + [
-            core.metadata,
-            compiler_builtins.metadata,
-            ffi.metadata,
-            pin_init.metadata,
-            macros,
-            pin_init_internal,
-        ],
-        crate_flags = ["--extern", "ffi", "--extern", "pin_init"],
-    )
-    kernel = _rust_crate(
-        ctx,
-        rust_toolchain,
-        config,
-        objtree,
-        rust_dir,
-        target_flags,
-        "kernel",
-        _source_file(source_files, "rust/kernel/lib.rs"),
-        _source_subtree(source_files, "rust/kernel/") + generated_arch_sources,
-        common_dep_inputs + [
-            core.metadata,
-            compiler_builtins.metadata,
-            ffi.metadata,
-            build_error.metadata,
-            pin_init.metadata,
-            bindings.metadata,
-            uapi.metadata,
-            macros,
-            pin_init_internal,
-        ],
-        crate_flags = [
-            "--extern",
-            "ffi",
-            "--extern",
-            "pin_init",
-            "--extern",
-            "build_error",
-            "--extern",
-            "macros",
-            "--extern",
-            "bindings",
-            "--extern",
-            "uapi",
-        ],
-    )
+        dep_inputs = [target_spec]
+        for dep in _profile_string_list(recipe, "deps"):
+            if dep in crates:
+                dep_inputs.append(crates[dep].metadata)
+            elif dep in proc_macros:
+                dep_inputs.append(proc_macros[dep])
+            else:
+                fail(
+                    "Rust profile crate %s depends on unavailable crate %s; " +
+                    "crates must be topologically ordered" %
+                    (name, dep),
+                )
+        crate_flags = _expand_profile_values(
+            _required_profile_field(recipe, "flags", "list"),
+            config,
+            replacements,
+        )
+        for extern in _profile_string_list(recipe, "externs"):
+            if extern not in crates and extern not in proc_macros:
+                fail("Rust profile crate %s exposes unavailable extern %s" % (name, extern))
+            crate_flags.extend(["--extern", extern])
+        crates[name] = _rust_crate(
+            ctx,
+            rust_toolchain,
+            config,
+            objtree_anchor,
+            rust_dir,
+            rust_dir_anchor,
+            target_flags,
+            name,
+            source,
+            source_inputs,
+            dep_inputs,
+            crate_flags = crate_flags,
+            skip_flags = _expand_profile_values(
+                _required_profile_field(recipe, "skip_flags", "list"),
+                config,
+                replacements,
+            ),
+            objcopy_flags = _expand_profile_values(
+                _required_profile_field(recipe, "objcopy_flags", "list"),
+                config,
+                replacements,
+            ),
+        )
+        crate_order.append(name)
 
     helpers = _compile_kernel_c(
         ctx,
@@ -1006,12 +1164,19 @@ def _linux_rust_kernel_sdk_impl(ctx):
             "-Wno-missing-declarations",
         ],
     )
-    export_headers = [
-        _export_header(ctx, core.object, "core"),
-        _export_header(ctx, helpers, "helpers"),
-        _export_header(ctx, bindings.object, "bindings"),
-        _export_header(ctx, kernel.object, "kernel"),
-    ]
+    export_profile = profile["exports"]
+    export_headers = []
+    for name in _profile_string_list(export_profile, "crates"):
+        if name == "helpers":
+            export_headers.append(_export_header(ctx, helpers, name))
+        elif name in crates:
+            export_headers.append(_export_header(ctx, crates[name].object, name))
+        else:
+            fail("Rust profile exports unavailable crate %r" % name)
+    exports_source_path = _validate_profile_path(
+        _required_profile_field(export_profile, "source", "string"),
+        "exports.source",
+    )
     exports = _compile_kernel_c(
         ctx,
         config,
@@ -1020,70 +1185,65 @@ def _linux_rust_kernel_sdk_impl(ctx):
         cc_toolchain,
         compiler,
         c_flags,
-        _source_file(source_files, "rust/exports.c"),
+        _source_file(source_files, exports_source_path),
         "rust/exports.o",
-        extra_flags = ["-I" + rust_dir],
+        extra_directory_flags = [
+            struct(
+                anchor = rust_dir_anchor,
+                format = "-I%s",
+            ),
+        ],
         direct_inputs = export_headers,
     )
 
-    runtime_objects = [
-        core.object,
-        compiler_builtins.object,
-        ffi.object,
-        helpers,
-        bindings.object,
-        pin_init.object,
-        kernel.object,
-        uapi.object,
-    ]
-    if config.config_flags.get("CONFIG_RUST_BUILD_ASSERT_ALLOW") == "y":
-        runtime_objects.append(build_error.object)
-    runtime_objects.append(exports)
+    objects_by_path = {
+        "rust/helpers/helpers.o": helpers,
+        "rust/exports.o": exports,
+    }
+    for name in crate_order:
+        objects_by_path["rust/" + name + ".o"] = crates[name].object
+    runtime_objects = []
+    for recipe in profile["runtime_objects"]:
+        if type(recipe) != "dict":
+            fail("Rust profile runtime_objects entries must be objects")
+        if recipe.get("config") and not _condition_matches(config, recipe):
+            continue
+        path = _validate_profile_path(
+            _required_profile_field(recipe, "path", "string"),
+            "runtime_objects.path",
+        )
+        object = objects_by_path.get(path)
+        if object == None:
+            fail("Rust profile references unavailable runtime object %r" % path)
+        runtime_objects.append(object)
 
     metadata = [
-        core.metadata,
-        compiler_builtins.metadata,
-        ffi.metadata,
-        build_error.metadata,
-        pin_init.metadata,
-        bindings.metadata,
-        uapi.metadata,
-        kernel.metadata,
-        macros,
-        pin_init_internal,
         target_spec,
         config.rustc_cfg,
         bindings_generated,
         bindings_helpers_generated,
         uapi_generated,
     ] + generated_arch_sources
+    metadata.extend([crates[name].metadata for name in crate_order])
+    metadata.extend([proc_macros[name] for name in sorted(proc_macros.keys())])
     compile_inputs = depset(
         metadata,
         transitive = [rust_toolchain.all_files],
     )
-    module_flags = target_flags + [
-        "--cfg",
-        "MODULE",
-        "-Zallow-features=" + ",".join(_RUST_ALLOWED_FEATURES),
-        "-Zcrate-attr=no_std",
-        "-Zcrate-attr=feature(%s)" % ",".join(_RUST_ALLOWED_FEATURES),
-        "-Zunstable-options",
-        "--extern",
-        "pin_init",
-        "--extern",
-        "kernel",
-        "--crate-type",
-        "rlib",
-        "-L" + rust_dir,
-        "--sysroot=/dev/null",
-    ]
+    module_flags = target_flags + _expand_profile_values(
+        _required_profile_field(module, "flags", "list"),
+        config,
+        replacements,
+    )
     sdk = LinuxRustSdkInfo(
         compile_inputs = compile_inputs,
         enabled = True,
         module_flags = module_flags,
         objtool = ctx.executable.objtool,
         objtree = objtree,
+        objtree_anchor = objtree_anchor,
         rust_dir = rust_dir,
+        rust_dir_anchor = rust_dir_anchor,
         rustc = rust_toolchain.rustc,
         rustc_env = _rust_env(rust_toolchain),
         rustc_files = rust_toolchain.all_files,
@@ -1117,13 +1277,13 @@ linux_rust_kernel_sdk = rule(
             cfg = "exec",
             executable = True,
         ),
+        "profile_json": attr.string(mandatory = True),
         "source_root": attr.label(
             allow_single_file = True,
             mandatory = True,
         ),
         "source_tree": attr.label_list(allow_files = True),
         "srcarch": attr.string(mandatory = True),
-        "version": attr.string(mandatory = True),
         "_lineargsrun": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/lineargsrun"),
@@ -1157,6 +1317,11 @@ linux_rust_kernel_sdk = rule(
             default = Label("//internal/cmd/runincwd"),
             executable = True,
         ),
+        "_runandwrite": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/runandwrite"),
+            executable = True,
+        ),
         "_rustpostprocess": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/rustpostprocess"),
@@ -1180,5 +1345,9 @@ linux_rust_kernel_sdk = rule(
 )
 
 linux_rust_test_helpers = struct(
+    decode_profile = _decode_rust_profile,
+    extend_kernel_c_flags = _extend_kernel_c_flags,
+    expand_profile_value = _expand_profile_value,
+    profile_target_flags = _profile_target_flags,
     unsupported_config_symbols = _unsupported_rust_config_symbols,
 )

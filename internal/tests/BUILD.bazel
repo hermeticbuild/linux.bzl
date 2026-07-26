@@ -1,0 +1,58 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load(
+    "//internal:linux_objects.bzl",
+    "linux_cc_context",
+    "linux_config",
+)
+load(":config_validation_test.bzl", "config_validation_test_suite")
+load(":host_cc_toolchain_test.bzl", "host_cc_toolchain_test")
+load(":kconfig_repositories_test.bzl", "graph_config_args_test", "kconfig_tool_filename_test")
+load(":linux_compile_flags_test.bzl", "linux_compile_flags_test")
+load(":linux_modules_test.bzl", "linux_module_test_suite")
+load(":linux_objects_failure_test.bzl", "linux_objects_fail_closed_test_suite")
+load(":linux_rust_test.bzl", "linux_rust_test_suite")
+load(":path_mapping_test.bzl", "path_mapping_test")
+
+package(default_visibility = ["//visibility:private"])
+
+config_validation_test_suite(name = "config_validation_tests")
+
+graph_config_args_test(name = "graph_config_args_test")
+
+host_cc_toolchain_test(name = "host_cc_toolchain_test")
+
+kconfig_tool_filename_test(name = "kconfig_tool_filename_test")
+
+linux_cc_context(
+    name = "cc_context_smoke",
+)
+
+linux_compile_flags_test(
+    name = "linux_compile_flags_test",
+    target_under_test = ":cc_context_smoke",
+)
+
+linux_config(
+    name = "config_smoke",
+    config_flags = {
+        "CONFIG_TEST": "y",
+        "CONFIG_TEST_MODULE": "m",
+        "CONFIG_TEST_VALUE": "7",
+    },
+)
+
+build_test(
+    name = "internal_rule_build_test",
+    targets = [
+        ":cc_context_smoke",
+        ":config_smoke",
+    ],
+)
+
+linux_objects_fail_closed_test_suite(name = "linux_objects_fail_closed_test")
+
+linux_module_test_suite(name = "linux_module_test")
+
+linux_rust_test_suite(name = "linux_rust_test")
+
+path_mapping_test(name = "path_mapping_test")

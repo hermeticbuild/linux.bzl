@@ -1,6 +1,3 @@
-// Copyright The Monogon Project Authors.
-// SPDX-License-Identifier: Apache-2.0
-
 package kconfig
 
 import (
@@ -8,9 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -279,11 +277,7 @@ func normalizeShellOutput(out []byte) string {
 }
 
 func sortedEnv(env map[string]string) []string {
-	keys := make([]string, 0, len(env))
-	for key := range env {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(env))
 	out := make([]string, 0, len(keys))
 	for _, key := range keys {
 		out = append(out, key+"="+env[key])

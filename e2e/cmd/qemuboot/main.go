@@ -8,11 +8,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bazelbuild/rules_go/go/runfiles"
 )
 
 const (
@@ -184,7 +185,7 @@ func run(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	configPath, err = resolveRunfile(configPath, os.Getenv)
+	configPath, err = runfiles.Rlocation(configPath)
 	if err != nil {
 		return fmt.Errorf("resolve config: %w", err)
 	}
@@ -193,7 +194,7 @@ func run(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := resolveConfigPaths(&config, os.Getenv); err != nil {
+	if err := resolveConfigPaths(&config); err != nil {
 		return err
 	}
 
@@ -325,83 +326,20 @@ func validateConfig(config bootConfig) error {
 	return nil
 }
 
-func resolveConfigPaths(config *bootConfig, getenv func(string) string) error {
+func resolveConfigPaths(config *bootConfig) error {
 	for name, path := range map[string]*string{
 		"qemu_system":        &config.QEMUSystem,
 		"system_data_anchor": &config.SystemDataAnchor,
 		"kernel":             &config.Kernel,
 		"initramfs":          &config.Initramfs,
 	} {
-		resolved, err := resolveRunfile(*path, getenv)
+		resolved, err := runfiles.Rlocation(*path)
 		if err != nil {
 			return fmt.Errorf("resolve %s: %w", name, err)
 		}
 		*path = resolved
 	}
 	return nil
-}
-
-func resolveRunfile(path string, getenv func(string) string) (string, error) {
-	if path == "" {
-		return "", errors.New("empty runfile path")
-	}
-	if filepath.IsAbs(path) {
-		if _, err := os.Stat(path); err != nil {
-			return "", fmt.Errorf("%s: %w", path, err)
-		}
-		return path, nil
-	}
-
-	candidates := []string{path}
-	for _, variable := range []string{"RUNFILES_DIR", "TEST_SRCDIR"} {
-		if root := getenv(variable); root != "" {
-			candidates = append(candidates, filepath.Join(root, filepath.FromSlash(path)))
-			if workspace := getenv("TEST_WORKSPACE"); workspace != "" {
-				candidates = append(candidates, filepath.Join(root, workspace, filepath.FromSlash(path)))
-			}
-		}
-	}
-	for _, candidate := range candidates {
-		if _, err := os.Stat(candidate); err == nil {
-			absolute, err := filepath.Abs(candidate)
-			if err != nil {
-				return "", err
-			}
-			return absolute, nil
-		}
-	}
-
-	if manifest := getenv("RUNFILES_MANIFEST_FILE"); manifest != "" {
-		resolved, err := resolveManifestEntry(manifest, path)
-		if err == nil {
-			return resolved, nil
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return "", err
-		}
-	}
-	return "", fmt.Errorf("%s: %w", path, os.ErrNotExist)
-}
-
-func resolveManifestEntry(manifest, path string) (string, error) {
-	data, err := os.ReadFile(manifest)
-	if err != nil {
-		return "", err
-	}
-	prefix := path + " "
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, prefix) {
-			value := strings.TrimPrefix(line, prefix)
-			if value == "" {
-				return "", fmt.Errorf("empty manifest value for %s", path)
-			}
-			return value, nil
-		}
-		if line == path {
-			return path, nil
-		}
-	}
-	return "", os.ErrNotExist
 }
 
 func qemuCommand(config bootConfig) (string, []string, error) {
