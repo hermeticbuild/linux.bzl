@@ -59,6 +59,66 @@ func isConfigKey(key string) bool {
 	return strings.HasPrefix(key, "CONFIG_") && len(key) > len("CONFIG_")
 }
 
+// ParseConfigOverlay parses a .config overlay fragment. Unlike ParseConfig it
+// also recognizes the "# CONFIG_X is not set" form, recording it as "n", so an
+// overlay merged onto a base config can both set and clear symbols.
+func ParseConfigOverlay(r io.Reader) (map[string]string, error) {
+	flags := map[string]string{}
+	scanner := bufio.NewScanner(r)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			if key, ok := parseConfigIsNotSet(line); ok {
+				if err := setParsedConfig(flags, key, "n", lineNo); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("line %d: expected CONFIG_* assignment", lineNo)
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if !isConfigKey(key) {
+			return nil, fmt.Errorf("line %d: expected CONFIG_* key, got %q", lineNo, key)
+		}
+		if err := setParsedConfig(flags, key, value, lineNo); err != nil {
+			return nil, err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return flags, nil
+}
+
+func parseConfigIsNotSet(line string) (string, bool) {
+	const suffix = " is not set"
+	body := strings.TrimSpace(strings.TrimPrefix(line, "#"))
+	if !strings.HasSuffix(body, suffix) {
+		return "", false
+	}
+	key := strings.TrimSpace(strings.TrimSuffix(body, suffix))
+	if !isConfigKey(key) {
+		return "", false
+	}
+	return key, true
+}
+
+// MergeConfigOverlay applies overlay onto base in place; overlay values win.
+func MergeConfigOverlay(base, overlay map[string]string) {
+	for key, value := range overlay {
+		base[key] = value
+	}
+}
+
 // definedSymbols returns the defined CONFIG_* symbols in sorted order.
 // Constants, transitional, and undeclared symbols (those appearing only in
 // expressions but never declared via `config X`) are excluded.

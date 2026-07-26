@@ -11,6 +11,37 @@ import (
 	"testing"
 )
 
+func TestLinuxLLVMProbeProfile(t *testing.T) {
+	config, err := LinuxProbeConfigForModel(LinuxProbeModelLLVM)
+	if err != nil {
+		t.Fatalf("LinuxProbeConfigForModel() failed: %v", err)
+	}
+	if config.CCVersion != 220108 || config.LDVersion != 220108 {
+		t.Fatalf("LLVM probe versions = clang %d, lld %d; want 220108", config.CCVersion, config.LDVersion)
+	}
+	if config.RustcVersion != 109700 || config.RustcLLVMVersion != 220106 {
+		t.Fatalf(
+			"Rust probe versions = rustc %d, LLVM %d; want 109700 and 220106",
+			config.RustcVersion,
+			config.RustcLLVMVersion,
+		)
+	}
+	if config.PaholeVersion != 131 || config.BindgenVersion != "bindgen 0.72.1" {
+		t.Fatalf(
+			"host probes = pahole %d, %q; want 131 and bindgen 0.72.1",
+			config.PaholeVersion,
+			config.BindgenVersion,
+		)
+	}
+	if !config.RustAvailable || !config.RustOptions {
+		t.Fatalf(
+			"Rust probe support = available %t, options %t; want both true",
+			config.RustAvailable,
+			config.RustOptions,
+		)
+	}
+}
+
 func TestLinuxLLVMProbeShellSupportsKconfigIncludeProbes(t *testing.T) {
 	rootDir := t.TempDir()
 	scriptsDir := filepath.Join(rootDir, "scripts")
@@ -112,11 +143,11 @@ config BINDGEN_VERSION_TEXT
 	if got := resolved.Value("CONFIG_LLD_MAJOR"); got != "22" {
 		t.Fatalf("CONFIG_LLD_MAJOR = %q, want 22", got)
 	}
-	if got := resolved.Value("CONFIG_PAHOLE_VERSION"); got != "0" {
-		t.Fatalf("CONFIG_PAHOLE_VERSION = %q, want 0", got)
+	if got := resolved.Value("CONFIG_PAHOLE_VERSION"); got != "131" {
+		t.Fatalf("CONFIG_PAHOLE_VERSION = %q, want 131", got)
 	}
-	if got := resolved.Value("CONFIG_BINDGEN_VERSION_TEXT"); got != "\"\"" {
-		t.Fatalf("CONFIG_BINDGEN_VERSION_TEXT = %q, want quoted empty string", got)
+	if got := resolved.Value("CONFIG_BINDGEN_VERSION_TEXT"); got != "\"bindgen 0.72.1\"" {
+		t.Fatalf("CONFIG_BINDGEN_VERSION_TEXT = %q, want bindgen 0.72.1", got)
 	}
 }
 

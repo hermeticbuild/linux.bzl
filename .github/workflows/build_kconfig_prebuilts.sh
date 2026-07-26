@@ -37,29 +37,28 @@ copy_out //internal/cmd/kconfig/prebuilts:kconfig-windows-arm64
 
 check_archive() {
   local archive="$1"
-  shift
+  local expected="$2"
   local listing
 
-  listing="$(tar -tzf "dist/${archive}")"
-  for tool in "$@"; do
-    if ! grep -Fxq "${tool}" <<<"${listing}"; then
-      echo "dist/${archive} does not contain ${tool}" >&2
-      exit 1
-    fi
-  done
+  listing="$(tar --zstd -tf "dist/${archive}")"
+  if [[ "${listing}" != "${expected}" ]]; then
+    echo "dist/${archive} must contain only ${expected}; got:" >&2
+    printf '%s\n' "${listing}" >&2
+    exit 1
+  fi
 }
 
-check_archive kconfig-darwin-amd64.tar.gz kconfig kconfig_parse
-check_archive kconfig-darwin-arm64.tar.gz kconfig kconfig_parse
-check_archive kconfig-linux-amd64.tar.gz kconfig kconfig_parse
-check_archive kconfig-linux-arm64.tar.gz kconfig kconfig_parse
-check_archive kconfig-windows-amd64.tar.gz kconfig.exe kconfig_parse.exe
-check_archive kconfig-windows-arm64.tar.gz kconfig.exe kconfig_parse.exe
+check_archive kconfig-darwin-amd64.tar.zst kconfig_parse
+check_archive kconfig-darwin-arm64.tar.zst kconfig_parse
+check_archive kconfig-linux-amd64.tar.zst kconfig_parse
+check_archive kconfig-linux-arm64.tar.zst kconfig_parse
+check_archive kconfig-windows-amd64.tar.zst kconfig_parse.exe
+check_archive kconfig-windows-arm64.tar.zst kconfig_parse.exe
 
 (
   cd dist
-  shasum -a 256 *.tar.gz > SHA256SUMS
-  for archive in *.tar.gz; do
+  shasum -a 256 *.tar.zst > SHA256SUMS
+  for archive in *.tar.zst; do
     integrity="sha256-$(openssl dgst -sha256 -binary "${archive}" | openssl base64 -A)"
     {
       echo "${archive}"

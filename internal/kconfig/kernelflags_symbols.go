@@ -1,0 +1,67 @@
+// Copyright The Monogon Project Authors.
+// SPDX-License-Identifier: Apache-2.0
+
+package kconfig
+
+import "sort"
+
+// kernelFlagsConfigSymbols is the set of CONFIG_* symbols consulted by
+// //internal/cmd/kernelflags when computing global compiler and assembler
+// flags. These symbols affect every source-backed object, independent of its
+// per-source CONFIG_* references.
+var kernelFlagsConfigSymbols = []string{
+	"CONFIG_ARM64_BTI_KERNEL",
+	"CONFIG_ARM64_PTR_AUTH_KERNEL",
+	"CONFIG_AS_HAS_ARMV8_5",
+	"CONFIG_CALL_PADDING",
+	"CONFIG_CC_HAS_AUTO_VAR_INIT_ZERO_ENABLER",
+	"CONFIG_CC_HAS_K_CONSTRAINT",
+	"CONFIG_CC_HAS_MIN_FUNCTION_ALIGNMENT",
+	"CONFIG_CC_IS_CLANG",
+	"CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE",
+	"CONFIG_CC_OPTIMIZE_FOR_SIZE",
+	"CONFIG_CPU_BIG_ENDIAN",
+	"CONFIG_DEBUG_INFO",
+	"CONFIG_DEBUG_INFO_DWARF4",
+	"CONFIG_DEBUG_INFO_DWARF5",
+	"CONFIG_DEBUG_SECTION_MISMATCH",
+	"CONFIG_DYNAMIC_FTRACE_WITH_ARGS",
+	"CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS",
+	"CONFIG_FRAME_POINTER",
+	"CONFIG_FTRACE_MCOUNT_USE_CC",
+	"CONFIG_FTRACE_MCOUNT_USE_OBJTOOL",
+	"CONFIG_FUNCTION_ALIGNMENT",
+	"CONFIG_FUNCTION_PADDING_BYTES",
+	"CONFIG_FUNCTION_TRACER",
+	"CONFIG_HAVE_FENTRY",
+	"CONFIG_HAVE_NOP_MCOUNT",
+	"CONFIG_HAVE_OBJTOOL_NOP_MCOUNT",
+	"CONFIG_INIT_STACK_ALL_PATTERN",
+	"CONFIG_INIT_STACK_ALL_ZERO",
+	"CONFIG_KASAN_GENERIC",
+	"CONFIG_KASAN_SW_TAGS",
+	"CONFIG_LD_DEAD_CODE_DATA_ELIMINATION",
+	"CONFIG_LTO_CLANG_FULL",
+	"CONFIG_LTO_CLANG_THIN",
+	"CONFIG_MITIGATION_RETHUNK",
+	"CONFIG_MITIGATION_RETPOLINE",
+	"CONFIG_MITIGATION_SLS",
+	"CONFIG_READABLE_ASM",
+	"CONFIG_SHADOW_CALL_STACK",
+	"CONFIG_SMP",
+	"CONFIG_STACKPROTECTOR",
+	"CONFIG_STACKPROTECTOR_STRONG",
+	"CONFIG_UNWIND_TABLES",
+	"CONFIG_X86_64",
+	"CONFIG_X86_KERNEL_IBT",
+	"CONFIG_X86_NATIVE_CPU",
+	"CONFIG_ZERO_CALL_USED_REGS",
+}
+
+// KernelFlagsConfigSymbols returns a sorted copy of the global flag footprint.
+func KernelFlagsConfigSymbols() []string {
+	out := make([]string, len(kernelFlagsConfigSymbols))
+	copy(out, kernelFlagsConfigSymbols)
+	sort.Strings(out)
+	return out
+}
