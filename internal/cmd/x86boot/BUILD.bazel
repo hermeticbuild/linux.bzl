@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "x86boot_lib",
     srcs = ["main.go"],
-    importpath = "linux.bzl/internal/cmd/x86boot",
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/x86boot",
     visibility = ["//visibility:private"],
 )
 

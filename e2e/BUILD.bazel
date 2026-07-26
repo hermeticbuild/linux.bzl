@@ -1,3 +1,5 @@
+# gazelle:prefix github.com/hermeticbuild/linux.bzl/e2e
+
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@kernel_rules//:linux.bzl", "initramfs", "linux_module")
 load(":qemu_boot_test.bzl", "qemu_boot_test", "qemu_system_target")

@@ -1,8 +1,26 @@
+# gazelle:prefix github.com/hermeticbuild/linux.bzl
+# gazelle:exclude aya_e2e
+# gazelle:exclude e2e
+# gazelle:exclude examples
+# gazelle:resolve go github.com/bazelbuild/bazel-gazelle/rule @gazelle//rule
+
 load("@buildifier_prebuilt//:rules.bzl", "buildifier", "buildifier_test")
+load("@gazelle//:def.bzl", "gazelle", "gazelle_test")
 
 package(default_visibility = ["//visibility:public"])
 
 exports_files(["linux.bzl"])
+
+gazelle(
+    name = "gazelle",
+    extra_args = ["internal"],
+)
+
+gazelle_test(
+    name = "gazelle_test",
+    extra_args = ["internal"],
+    workspace = "//:MODULE.bazel",
+)
 
 buildifier(
     name = "buildifier",

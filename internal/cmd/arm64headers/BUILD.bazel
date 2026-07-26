@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "arm64headers_lib",
     srcs = ["main.go"],
-    importpath = "linux.bzl/internal/cmd/arm64headers",
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/arm64headers",
     visibility = ["//visibility:private"],
     deps = ["//internal/kconfig"],
 )

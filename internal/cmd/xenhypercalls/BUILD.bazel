@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library")
 go_library(
     name = "xenhypercalls_lib",
     srcs = ["main.go"],
-    importpath = "linux.bzl/internal/cmd/xenhypercalls",
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/xenhypercalls",
     visibility = ["//visibility:private"],
 )
 
