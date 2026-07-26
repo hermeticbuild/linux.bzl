@@ -1,6 +1,7 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load(":config_validation_test.bzl", "config_validation_test_suite")
-load(":kconfig_repositories_test.bzl", "kconfig_tool_filename_test")
+load(":host_cc_toolchain_test.bzl", "host_cc_toolchain_test")
+load(":kconfig_repositories_test.bzl", "graph_config_args_test", "kconfig_tool_filename_test")
 load(":linux_compile_flags_test.bzl", "linux_compile_flags_test")
 load(":linux_modules_test.bzl", "linux_module_test_suite")
 load(
@@ -14,6 +15,10 @@ load(":linux_rust_test.bzl", "linux_rust_test_suite")
 package(default_visibility = ["//:__subpackages__"])
 
 config_validation_test_suite(name = "config_validation_tests")
+
+graph_config_args_test(name = "graph_config_args_test")
+
+host_cc_toolchain_test(name = "host_cc_toolchain_test")
 
 kconfig_tool_filename_test(name = "kconfig_tool_filename_test")
 

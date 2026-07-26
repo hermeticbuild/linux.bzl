@@ -3,6 +3,7 @@
 load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "CPP_LINK_STATIC_LIBRARY_ACTION_NAME", "C_COMPILE_ACTION_NAME")
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+load(":host_cc_toolchain.bzl", "host_cc_toolchain_attr")
 load(":kconfig.bzl", "KconfigInfo")
 load(":linux_module_actions.bzl", "linux_module_actions")
 load(":providers.bzl", "LinuxRustSdkInfo", "LinuxVmlinuxInfo")
@@ -4707,6 +4708,7 @@ linux_vmlinux = rule(
             default = Label("//internal/cmd/btfmutate"),
             executable = True,
         ),
+        "_host_cc_toolchain": host_cc_toolchain_attr(exec_group = "host_cc"),
         "_llvm_objcopy": attr.label(
             allow_single_file = True,
             cfg = "exec",

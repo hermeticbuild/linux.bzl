@@ -311,6 +311,7 @@ def _linux_image_impl(rctx):
         arch = arch,
         config_name = arch,
         config_path = "configs/base.config",
+        config_mode = rctx.attr.config_mode,
         graph_dir = "graph/base",
         source_config = "//:_base_config",
         target_prefix = "_base",
@@ -325,6 +326,7 @@ def _linux_image_impl(rctx):
             arch = arch,
             config_name = name,
             config_path = "configs/%s.config" % name,
+            config_mode = rctx.attr.config_mode,
             graph_dir = "graph/%s" % name,
             source_config = "//:_variant_%s_config" % name,
             target_prefix = "_variant_%s" % name,
@@ -717,6 +719,7 @@ def _generate_config_graph(
         arch,
         config_name,
         config_path,
+        config_mode,
         graph_dir,
         source_config,
         target_prefix,
@@ -767,7 +770,11 @@ def _generate_config_graph(
             "-source_relacheck",
             "//:%s_relacheck_tool" % target_prefix,
         ])
-    args.extend(["-config", "%s=%s" % (config_name, rctx.path(config_path))])
+    args.extend(_graph_config_args(
+        config_name,
+        rctx.path(config_path),
+        config_mode,
+    ))
 
     _add_generator_variables(args, descriptor)
 
@@ -796,6 +803,14 @@ def _generate_config_graph(
     )
     _validate_generated_metadata(rctx, graph_dir, config_name, source_root)
     _validate_generated_build(rctx, graph_dir, config_name)
+
+def _graph_config_args(config_name, config_path, config_mode):
+    return [
+        "-config",
+        "%s=%s" % (config_name, config_path),
+        "-config_mode",
+        config_mode,
+    ]
 
 def _upgrade_v011_schema(
         rctx,
@@ -1376,6 +1391,7 @@ linux_image_targets(
     )
 
 repositories_test_helpers = struct(
+    graph_config_args = _graph_config_args,
     generator_protocol = _REPOSITORY_GENERATOR_PROTOCOL,
     kernel_root_build = _kernel_root_build,
 )
