@@ -1,8 +1,9 @@
 """Private Rust-for-Linux SDK actions."""
 
 load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "C_COMPILE_ACTION_NAME")
-load("@rules_cc//cc:find_cc_toolchain.bzl", "CC_TOOLCHAIN_TYPE", "find_cpp_toolchain", "use_cc_toolchain")
+load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+load(":host_cc_toolchain.bzl", "host_cc_toolchain", "host_cc_toolchain_attr")
 load(":linux_objects.bzl", "LinuxConfigInfo", "LinuxGeneratedHeadersInfo", "linux_module_cc_helpers")
 load(":providers.bzl", "LinuxRustSdkInfo")
 
@@ -109,16 +110,6 @@ def _source_subtree(files, prefix):
         for path in sorted(files.keys())
         if path.startswith(prefix)
     ]
-
-def _unwrap_cc_toolchain(toolchain):
-    if hasattr(toolchain, "cc_provider_in_toolchain") and hasattr(toolchain, "cc"):
-        return toolchain.cc
-    return toolchain
-
-def _host_cc_toolchain(ctx):
-    return _unwrap_cc_toolchain(
-        ctx.exec_groups["host_cc"].toolchains[CC_TOOLCHAIN_TYPE],
-    )
 
 def _rust_env(rust_toolchain, objtree = None, modfile = None):
     env = dict(rust_toolchain.env)
@@ -705,7 +696,7 @@ def _linux_rust_kernel_sdk_impl(ctx):
         feature_configuration = feature_configuration,
         action_name = C_COMPILE_ACTION_NAME,
     )
-    host_cc = _host_cc_toolchain(ctx)
+    host_cc = host_cc_toolchain(ctx)
     host_features = cc_common.configure_features(
         ctx = ctx,
         cc_toolchain = host_cc,
@@ -1137,6 +1128,7 @@ linux_rust_kernel_sdk = rule(
             default = Label("//internal/cmd/lineargsrun"),
             executable = True,
         ),
+        "_host_cc_toolchain": host_cc_toolchain_attr(),
         "_llvm_nm": attr.label(
             allow_single_file = True,
             cfg = "exec",
@@ -1177,9 +1169,6 @@ linux_rust_kernel_sdk = rule(
             default = Label("//internal/cmd/rustcversionrun"),
             executable = True,
         ),
-    },
-    exec_groups = {
-        "host_cc": exec_group(toolchains = use_cc_toolchain()),
     },
     fragments = ["cpp"],
     toolchains = [

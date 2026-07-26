@@ -1,8 +1,9 @@
 """Private actions shared by configured vmlinux and module finalization."""
 
 load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "C_COMPILE_ACTION_NAME")
-load("@rules_cc//cc:find_cc_toolchain.bzl", "CC_TOOLCHAIN_TYPE", "find_cpp_toolchain")
+load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+load(":host_cc_toolchain.bzl", "host_cc_toolchain")
 
 visibility("//...")
 
@@ -44,16 +45,6 @@ def _source_file(source_files, relpath):
     if file == None:
         fail("configured Linux module actions are missing source input %s" % relpath)
     return file
-
-def _unwrap_cc_toolchain(toolchain):
-    if hasattr(toolchain, "cc_provider_in_toolchain") and hasattr(toolchain, "cc"):
-        return toolchain.cc
-    return toolchain
-
-def _host_cc_toolchain(ctx):
-    return _unwrap_cc_toolchain(
-        ctx.exec_groups["host_cc"].toolchains[CC_TOOLCHAIN_TYPE],
-    )
 
 def _target_context(ctx, helpers):
     cc_toolchain = find_cpp_toolchain(ctx)
@@ -149,7 +140,7 @@ def _build_modpost(ctx, helpers, kernel, target, source_files):
     elfconfig = ctx.actions.declare_file(ctx.label.name + ".module_prep/scripts/mod/elfconfig.h")
     ctx.actions.write(elfconfig, "#define KERNEL_ELFCLASS ELFCLASS64\n")
 
-    host_cc = _host_cc_toolchain(ctx)
+    host_cc = host_cc_toolchain(ctx)
     host_features = cc_common.configure_features(
         ctx = ctx,
         cc_toolchain = host_cc,
