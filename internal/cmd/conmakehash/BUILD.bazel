@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library")
 go_library(
     name = "conmakehash_lib",
     srcs = ["main.go"],
-    importpath = "linux.bzl/internal/cmd/conmakehash",
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/conmakehash",
     visibility = ["//visibility:private"],
 )
 

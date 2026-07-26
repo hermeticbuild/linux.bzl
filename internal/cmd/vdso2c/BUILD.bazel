@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "vdso2c_lib",
     srcs = ["main.go"],
-    importpath = "linux.bzl/internal/cmd/vdso2c",
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/vdso2c",
     visibility = ["//visibility:private"],
 )
 
