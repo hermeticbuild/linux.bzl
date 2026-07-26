@@ -94,19 +94,13 @@ jobs:
         include:
           - batch: initramfs
             title: initramfs
-            target: "//:example_initramfs"
-          - batch: x86-64-base
-            title: x86_64 base
-            target: "//:x86_64_kernel"
-          - batch: x86-64-debug
-            title: x86_64 debug
-            target: "//:x86_64_debug_kernel"
-          - batch: x86-64-lz4
-            title: x86_64 LZ4
-            target: "//:x86_64_lz4_kernel"
+            targets: "//:example_initramfs"
+          - batch: x86-64-variants
+            title: x86_64 base + overlays
+            targets: "//:x86_64_kernel //:x86_64_debug_kernel //:x86_64_lz4_kernel"
           - batch: aarch64-base
             title: aarch64 base
-            target: "//:aarch64_kernel"
+            targets: "//:aarch64_kernel"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -129,12 +123,13 @@ jobs:
           BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.batch }}.bep.json
           BAZEL_LOG: ${{ runner.temp }}/examples-${{ matrix.batch }}.log
           BAZEL_PROFILE: ${{ runner.temp }}/examples-${{ matrix.batch }}.profile.gz
-          BAZEL_TARGET: ${{ matrix.target }}
+          BAZEL_TARGETS: ${{ matrix.targets }}
         run: |
           set -euo pipefail
+          read -r -a targets <<<"${BAZEL_TARGETS}"
           bazel --host_jvm_args=-Xmx3g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-            build "${BAZEL_TARGET}" \
+            build "${targets[@]}" \
             --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
