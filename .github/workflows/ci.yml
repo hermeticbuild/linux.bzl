@@ -79,9 +79,28 @@ jobs:
           retention-days: 14
 
   examples:
-    name: Standalone examples
+    name: Standalone examples (${{ matrix.title }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - batch: initramfs
+            title: initramfs
+            target: "//:example_initramfs"
+          - batch: x86-64-base
+            title: x86_64 base
+            target: "//:x86_64_kernel"
+          - batch: x86-64-debug
+            title: x86_64 debug
+            target: "//:x86_64_debug_kernel"
+          - batch: x86-64-lz4
+            title: x86_64 LZ4
+            target: "//:x86_64_lz4_kernel"
+          - batch: aarch64-base
+            title: aarch64 base
+            target: "//:aarch64_kernel"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -90,7 +109,7 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-examples
+          disk-cache: ${{ github.workflow }}-examples-${{ matrix.batch }}
           module-root: examples
           repository-cache: |
             - examples/.bazelversion
@@ -98,15 +117,16 @@ jobs:
             - examples/MODULE.bazel.lock
           cache-save: ${{ github.event_name != 'pull_request' }}
 
-      - name: Build
+      - name: Build ${{ matrix.title }}
         working-directory: examples
         env:
-          BAZEL_BEP: ${{ runner.temp }}/examples.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/examples.log
-          BAZEL_PROFILE: ${{ runner.temp }}/examples.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.batch }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/examples-${{ matrix.batch }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/examples-${{ matrix.batch }}.profile.gz
+          BAZEL_TARGET: ${{ matrix.target }}
         run: |
-          set -o pipefail
-          bazel --host_jvm_args=-Xmx3g build //... --jobs=2 \
+          set -euo pipefail
+          bazel --host_jvm_args=-Xmx3g build "${BAZEL_TARGET}" --jobs=1 \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -114,12 +134,12 @@ jobs:
       - name: Report cache efficiency
         if: ${{ !cancelled() }}
         env:
-          BAZEL_BEP: ${{ runner.temp }}/examples.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/examples.log
-          BAZEL_PROFILE: ${{ runner.temp }}/examples.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.batch }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/examples-${{ matrix.batch }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/examples-${{ matrix.batch }}.profile.gz
         run: |
           .github/workflows/bazel_cache_report.sh \
-            "Standalone examples" \
+            "Standalone examples (${{ matrix.title }})" \
             "${BAZEL_PROFILE}" \
             "${BAZEL_BEP}" \
             "${BAZEL_LOG}"
@@ -128,18 +148,40 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: bazel-profile-examples
+          name: bazel-profile-examples-${{ matrix.batch }}
           path: |
-            ${{ runner.temp }}/examples.profile.gz
-            ${{ runner.temp }}/examples.bep.json
-            ${{ runner.temp }}/examples.log
+            ${{ runner.temp }}/examples-${{ matrix.batch }}.profile.gz
+            ${{ runner.temp }}/examples-${{ matrix.batch }}.bep.json
+            ${{ runner.temp }}/examples-${{ matrix.batch }}.log
           if-no-files-found: warn
           retention-days: 14
 
   qemu-e2e:
-    name: QEMU boot tests
+    name: QEMU e2e (${{ matrix.batch }})
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - batch: tooling
+            title: E2E tooling
+            targets: "//boot:init_test //cmd/qemuboot:qemuboot_test"
+          - batch: linux-6.12-x86_64
+            title: Linux 6.12 x86_64
+            targets: "//:linux_6_12_96_x86_64_boot_test //:linux_6_12_96_x86_64_module_test"
+          - batch: linux-6.12-aarch64
+            title: Linux 6.12 aarch64
+            targets: "//:linux_6_12_96_aarch64_boot_test //:linux_6_12_96_aarch64_module_test"
+          - batch: linux-6.18-x86_64
+            title: Linux 6.18 x86_64
+            targets: "//:kernel_outputs_x86_64_build_test //:linux_6_18_39_x86_64_boot_test //:linux_6_18_39_x86_64_module_test"
+          - batch: linux-6.18-aarch64
+            title: Linux 6.18 aarch64
+            targets: "//:kernel_outputs_aarch64_build_test //:linux_6_18_39_aarch64_boot_test //:linux_6_18_39_aarch64_module_test"
+          - batch: linux-6.18-rust-x86_64
+            title: Linux 6.18 Rust x86_64
+            targets: "//:linux_6_18_39_rust_module_test"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -148,7 +190,7 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-qemu-e2e
+          disk-cache: ${{ github.workflow }}-qemu-e2e-${{ matrix.batch }}
           module-root: e2e
           repository-cache: |
             - e2e/.bazelversion
@@ -156,15 +198,18 @@ jobs:
             - e2e/MODULE.bazel.lock
           cache-save: ${{ github.event_name != 'pull_request' }}
 
-      - name: Boot all kernels under TCG
+      - name: Run ${{ matrix.title }}
         working-directory: e2e
         env:
-          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e.log
-          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.profile.gz
+          BAZEL_TARGETS: ${{ matrix.targets }}
         run: |
-          set -o pipefail
-          bazel --host_jvm_args=-Xmx3g test //... --jobs=2 --nocache_test_results \
+          set -euo pipefail
+          read -r -a targets <<<"${BAZEL_TARGETS}"
+          bazel --host_jvm_args=-Xmx3g test "${targets[@]}" \
+            --jobs=1 --nocache_test_results \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -172,12 +217,12 @@ jobs:
       - name: Report cache efficiency
         if: ${{ !cancelled() }}
         env:
-          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e.log
-          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.profile.gz
         run: |
           .github/workflows/bazel_cache_report.sh \
-            "QEMU boot tests" \
+            "QEMU e2e (${{ matrix.title }})" \
             "${BAZEL_PROFILE}" \
             "${BAZEL_BEP}" \
             "${BAZEL_LOG}"
@@ -186,10 +231,78 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: bazel-profile-qemu-e2e
+          name: bazel-profile-qemu-e2e-${{ matrix.batch }}
           path: |
-            ${{ runner.temp }}/qemu-e2e.profile.gz
-            ${{ runner.temp }}/qemu-e2e.bep.json
-            ${{ runner.temp }}/qemu-e2e.log
+            ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.profile.gz
+            ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.bep.json
+            ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  aya-e2e:
+    name: Aya eBPF VM (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: "@aya//test/integration-test:vm_aarch64"
+          - arch: x86_64
+            target: "@aya//test/integration-test:vm_x86_64"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-aya-e2e-${{ matrix.arch }}
+          module-root: aya_e2e
+          repository-cache: |
+            - aya_e2e/.bazelversion
+            - aya_e2e/MODULE.bazel
+            - aya_e2e/MODULE.bazel.lock
+            - aya_e2e/patches/aya_linux_bzl_api.patch
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Run Aya integration VMs
+        working-directory: aya_e2e
+        env:
+          BAZEL_BEP: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.profile.gz
+        run: |
+          set -o pipefail
+          bazel --host_jvm_args=-Xmx3g test '${{ matrix.target }}' \
+            --jobs=1 --nocache_test_results \
+            --build_event_json_file="${BAZEL_BEP}" \
+            --profile="${BAZEL_PROFILE}" \
+            2>&1 | tee "${BAZEL_LOG}"
+
+      - name: Report cache efficiency
+        if: ${{ !cancelled() }}
+        env:
+          BAZEL_BEP: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.profile.gz
+        run: |
+          .github/workflows/bazel_cache_report.sh \
+            "Aya eBPF VM (${{ matrix.arch }})" \
+            "${BAZEL_PROFILE}" \
+            "${BAZEL_BEP}" \
+            "${BAZEL_LOG}"
+
+      - name: Upload Bazel profile
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bazel-profile-aya-e2e-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.profile.gz
+            ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.bep.json
+            ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.log
           if-no-files-found: warn
           retention-days: 14

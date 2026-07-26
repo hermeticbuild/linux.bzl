@@ -4,34 +4,29 @@ visibility("//...")
 
 def validate_config_features(config, description):
     """Rejects config selections that do not have a cache-safe native graph."""
-    if config.get("CONFIG_MODULES", "n") == "y":
-        fail("%s enables CONFIG_MODULES, but loadable modules are not implemented" % description)
-
-    module_symbols = sorted([
-        symbol
-        for symbol, value in config.items()
-        if value == "m"
-    ])
-    if module_symbols:
-        fail(
-            "%s contains unsupported loadable-module selections: %s" %
-            (description, module_symbols),
-        )
-
     if config.get("CONFIG_X86_NATIVE_CPU", "n") == "y":
         fail(
             "%s enables CONFIG_X86_NATIVE_CPU, whose -march=native output is not cache-safe" %
             description,
         )
-    if config.get("CONFIG_BPF_SYSCALL", "n") == "y":
-        fail(
-            "%s enables CONFIG_BPF_SYSCALL, whose cross-tree source include closure is not implemented" %
-            description,
-        )
-    if config.get("CONFIG_RUST", "n") == "y":
-        fail("%s enables CONFIG_RUST, which is not implemented" % description)
-    if config.get("CONFIG_DEBUG_INFO_BTF", "n") == "y":
-        fail("%s enables CONFIG_DEBUG_INFO_BTF, which is not implemented" % description)
+    for symbol in [
+        "CONFIG_MODVERSIONS",
+        "CONFIG_BASIC_MODVERSIONS",
+        "CONFIG_EXTENDED_MODVERSIONS",
+        "CONFIG_GENDWARFKSYMS",
+        "CONFIG_MODULE_SRCVERSION_ALL",
+        "CONFIG_TRIM_UNUSED_KSYMS",
+    ]:
+        if config.get(symbol, "n") in ["y", "m"]:
+            fail("%s enables unsupported module versioning path %s" % (description, symbol))
+
+    for symbol in [
+        "CONFIG_CFI_CLANG",
+        "CONFIG_GCOV_KERNEL",
+        "CONFIG_KCSAN",
+    ]:
+        if config.get(symbol, "n") in ["y", "m"]:
+            fail("%s enables %s, whose module metadata instrumentation is not modeled" % (description, symbol))
 
     for symbol in [
         "CONFIG_MODULE_SIG",

@@ -24,3 +24,25 @@ Build the named config variant:
 bazel build //:x86_64_debug_kernel
 bazel build //:x86_64_lz4_kernel
 ```
+
+Kernel graph repositories also expose their fixed in-tree module outputs:
+
+```sh
+bazel build @example_x86_64//:modules
+bazel build @example_x86_64//:module_symvers
+bazel build @example_x86_64//:modules_order
+bazel build @example_x86_64//:modules_builtin
+bazel build @example_x86_64//:modules_builtin_modinfo
+```
+
+The example configurations set `CONFIG_MODULES=n`, so the `:modules`
+projection is an empty file set; these commands exercise the fixed label
+contract rather than compiling a module. Module build and load coverage lives
+in `e2e`.
+
+These examples focus on repository-rule configuration and deterministic
+packaging. Runtime coverage lives in the sibling `e2e` workspace, which boots
+the kernels with an initramfs under hermetic QEMU and verifies module loading.
+Aya's eBPF consumer tests live in the separate `aya_e2e` workspace so its
+nightly Rust toolchain remains isolated from the stable Rust-for-Linux
+toolchain.

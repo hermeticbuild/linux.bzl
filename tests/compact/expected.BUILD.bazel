@@ -70,6 +70,7 @@ linux_object(
     flags = ["-Wall"],
     mode = "y",
     object = "debug.o",
+    source_includes_complete = True,
     source_tree_info = ":_source_tree",
     tags = ["manual"],
 )
@@ -135,6 +136,7 @@ linux_object(
     ],
     mode = "y",
     object = "drivers/foo.o",
+    source_includes_complete = True,
     source_tree_info = ":_source_tree",
     tags = ["manual"],
 )
@@ -196,6 +198,7 @@ linux_object(
     flags = ["-Wall"],
     mode = "y",
     object = "init.o",
+    source_includes_complete = True,
     source_tree_info = ":_source_tree",
     tags = ["manual"],
 )
@@ -260,6 +263,7 @@ linux_object(
     ],
     mode = "y",
     object = "init.o",
+    source_includes_complete = True,
     source_tree_info = ":_source_tree",
     tags = ["manual"],
 )
@@ -325,6 +329,7 @@ linux_object(
     ],
     mode = "y",
     object = "net/core.o",
+    source_includes_complete = True,
     source_tree_info = ":_source_tree",
     tags = ["manual"],
 )

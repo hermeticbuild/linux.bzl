@@ -14,7 +14,7 @@ Add `linux.bzl` and a hermetic C/C++ toolchain to `MODULE.bazel`:
 
 ```starlark
 bazel_dep(name = "linux.bzl", version = "0.1.0")
-bazel_dep(name = "llvm", version = "0.8.3")
+bazel_dep(name = "llvm", version = "0.8.14")
 
 register_toolchains("@llvm//toolchain:all")
 
@@ -123,6 +123,7 @@ form shown above.
 | `name` | Generated kernel graph repository name |
 | `source` | Root `Kconfig` from `linux_source_repository` |
 | `config` | Base Kconfig fragment |
+| `config_mode` | Kconfig baseline: `default` or `allnoconfig` |
 | `platform` | Hermetic LLVM Linux target platform |
 | `overlays` | Named config fragments |
 
@@ -166,6 +167,52 @@ automatically. `directories`, `files`, `executables`, `symlinks`, and
 `character_devices` are the complete initial surface; file modes and ownership
 are fixed to reproducible values.
 
+### Rust-for-Linux modules
+
+`linux_module(name, kernel, srcs, crate_root = None, deps = [])` builds one
+out-of-tree Rust-for-Linux loadable module. It is a normal BUILD rule loaded
+from the same root entry point:
+
+```starlark
+load("@linux.bzl", "linux_module")
+
+linux_module(
+    name = "hello",
+    kernel = "@example_kernel//:kernel",
+    srcs = ["hello.rs"],
+)
+```
+
+The target's default output is `hello.ko`. `kernel` identifies the configured
+kernel and supplies its generated headers, Rust SDK, symbol versions, and
+module linker inputs. The rule follows that kernel's target platform, so there
+is no separate architecture attribute. Set `crate_root` when `srcs` does not
+make the crate root unambiguous. `deps` accepts other `linux_module` targets
+built against the same configured kernel; cross-kernel dependencies are
+rejected.
+
+The initial Rust-for-Linux contract is intentionally narrower than the kernel
+image matrix: a Linux 6.18.x kernel targeting x86_64, a Linux x86_64 execution
+platform, `CONFIG_MODULES=y`, `CONFIG_RUST=y`, and the exact stable Rust 1.97.0
+toolchain registered by `linux.bzl`. Unsupported architectures, kernel lines,
+symbol versioning, LTO/CFI, sanitizers, and Rust debug/BTF configurations fail
+during analysis with an explicit diagnostic. `MODULE_VERSION` and module
+`version=` or `srcversion=` metadata are not supported.
+
+The standalone end-to-end workspace compiles this path, boots the kernel under
+QEMU, inserts the resulting module, and checks its load marker:
+
+```sh
+cd e2e
+bazel test //:linux_6_18_39_rust_module_test --test_output=streamed
+```
+
+This rule builds a Rust-for-Linux `.ko`: native kernel code loaded through the
+Linux module loader. It does not build eBPF bytecode. Aya builds and loads eBPF
+programs through the kernel's BPF subsystem; the standalone
+[`aya_e2e/`](aya_e2e/) workspace verifies that separate consumer workflow
+against kernels produced by `linux.bzl`.
+
 ## Why
 
 Wrapping `make` in one Bazel action hides the kernel build graph from Bazel.
@@ -183,8 +230,8 @@ cannot cache or schedule the individual compile steps.
 - lets Bazel schedule and cache compilation at object granularity.
 
 Repository generation resolves Kconfig with a deterministic probe profile for
-Hermetic LLVM 22.1.4. The kernel repository requires that exact profile, rather
-than treating module `llvm` 0.8.3 as a minimum version, and the transitioned
+Hermetic LLVM 22.1.8. The kernel repository requires that exact profile, rather
+than treating module `llvm` 0.8.14 as a minimum version, and the transitioned
 graph rejects a non-Clang C/C++ toolchain.
 
 ## Supported configurations
@@ -194,10 +241,14 @@ graph rejects a non-Clang C/C++ toolchain.
 | Catalog releases | 6.12.96 and 6.18.39 |
 | Target architectures | x86_64 and aarch64 |
 | Repository evaluation | Pinned generator archives for Linux, macOS, and Windows on amd64 and arm64 |
-| Build toolchain | Hermetic LLVM 22.1.4 through module `llvm` 0.8.3 |
+| Build toolchain | Hermetic LLVM 22.1.8 through module `llvm` 0.8.14 |
 | Images | x86 `bzImage`, arm64 `Image`, and `vmlinux` |
 | Config variants | Base fragment plus named overlay fragments |
 | Initramfs | Deterministic root-owned `newc` archives |
+| In-tree modules | Loadable `.ko` files plus Kbuild module metadata |
+| Out-of-tree modules | Rust-for-Linux `.ko` files on x86_64 Linux 6.18.x through `linux_module` |
+| Kernel BPF/BTF | BPF syscall configurations and BTF-enabled `vmlinux` |
+| VM verification | Hermetic QEMU boots with initramfs and module-load checks |
 
 The two LTS lines are the maintained compatibility catalog. Other
 integrity-pinned Linux 6.x releases may work, but are experimental until added
@@ -205,17 +256,20 @@ to that catalog and its release checks. The repository generator is published
 for each host listed above; kernel compile actions still target the registered
 Linux Hermetic LLVM toolchain.
 
-The initial public kernel contract is limited to resolved configs, boot images,
-`vmlinux`, `System.map`, and kernel release metadata; the separate `initramfs`
-rule supplies boot userspace archives. Modules, device trees, BPF syscall
-support, BTF, signing, Rust, and other build paths are not exported or
-supported. Module selections and known incompatible BPF, BTF, signing, and
-Rust selections are rejected during repository generation. So is
-`CONFIG_X86_NATIVE_CPU`, because `-march=native` would make an action depend on
-worker CPU features that are absent from its cache key. Generated graphs that
-require device-tree or other unsupported artifact rules are also rejected.
-Selecting other unimplemented features remains outside the supported contract.
-No placeholder labels or provider fields are reserved for unsupported outputs.
+The public kernel contract includes resolved configs, boot images, `vmlinux`,
+`System.map`, kernel release metadata, configured in-tree modules, and their
+installation metadata. The separate `initramfs` rule supplies boot userspace
+archives, while `linux_module` builds out-of-tree Rust-for-Linux modules.
+BPF-syscall and BTF-enabled kernel configurations are supported; eBPF program
+compilation remains the responsibility of consumers such as Aya.
+
+Kernel and module signing, `MODULE_VERSION`/module source-version metadata,
+device-tree artifacts, and other unimplemented Kbuild products remain outside
+the supported contract.
+`CONFIG_X86_NATIVE_CPU` is rejected because `-march=native` would make an action
+depend on worker CPU features that are absent from its cache key. Generated
+graphs that require an unsupported artifact rule are rejected with an
+actionable diagnostic.
 
 ## Source repositories
 
@@ -302,8 +356,7 @@ collide after target-name sanitization are rejected.
 
 ## Fixed output contract
 
-Every base and variant package exposes the same labels, and every label returns
-a real kernel artifact:
+Every base and variant package exposes the same projection labels:
 
 | Label | Current contents |
 | --- | --- |
@@ -313,9 +366,16 @@ a real kernel artifact:
 | `:config` | Resolved kernel configuration |
 | `:system_map` | Real `System.map` |
 | `:kernel_release` | Real computed kernel release |
+| `:modules` | Configured in-tree loadable `.ko` files |
+| `:module_symvers` | Kernel and in-tree module `Module.symvers` |
+| `:modules_order` | Deterministic Kbuild module load order |
+| `:modules_builtin` | Deterministic built-in module inventory |
+| `:modules_builtin_modinfo` | Deterministic built-in module metadata |
 
 The `:kernel` target's `DefaultInfo` contains only the boot image, so it can be
 used directly by packaging and VM rules without selecting an output group.
+When no loadable in-tree modules are configured, `:modules` is an empty file
+set; the metadata labels remain available.
 
 ### Providers
 
@@ -364,8 +424,9 @@ this repository does not prescribe a service.
 
 Source and object actions are separate, so changing one source file does not
 invalidate a monolithic kernel-build action. Source inputs are classified:
-ordinary compiles receive headers, bounded special lookups, and same-directory
-include candidates rather than the complete source archive.
+ordinary compiles receive headers, bounded special lookups, and the exact
+repository-generated closure of source-like includes rather than the complete
+source archive.
 
 Version 0.1 deliberately includes the resolved config artifact and generated
 header set in each object action. This is a conservative cache key: named
@@ -385,6 +446,7 @@ image.
 - catalog-backed x86_64 and aarch64 kernels;
 - named debug and LZ4 overlays;
 - a deterministic initramfs built through the public `@linux.bzl` entry point;
+- in-tree module and Kbuild metadata outputs; and
 - aliases for real fixed image outputs.
 
 From a repository checkout:
@@ -398,6 +460,44 @@ bazel build @example_aarch64//:kernel
 bazel build //:example_initramfs
 ```
 
+The standalone compatibility suites exercise the runtime contracts:
+
+```sh
+cd e2e
+bazel test //boot:init_test //cmd/qemuboot:qemuboot_test --jobs=1
+bazel shutdown
+bazel test //:linux_6_12_96_x86_64_boot_test \
+  //:linux_6_12_96_x86_64_module_test --jobs=1 --nocache_test_results
+bazel shutdown
+bazel test //:linux_6_12_96_aarch64_boot_test \
+  //:linux_6_12_96_aarch64_module_test --jobs=1 --nocache_test_results
+bazel shutdown
+bazel test //:kernel_outputs_x86_64_build_test \
+  //:linux_6_18_39_x86_64_boot_test \
+  //:linux_6_18_39_x86_64_module_test --jobs=1 --nocache_test_results
+bazel shutdown
+bazel test //:kernel_outputs_aarch64_build_test \
+  //:linux_6_18_39_aarch64_boot_test \
+  //:linux_6_18_39_aarch64_module_test --jobs=1 --nocache_test_results
+bazel shutdown
+bazel test //:linux_6_18_39_rust_module_test \
+  --jobs=1 --nocache_test_results
+bazel shutdown
+
+cd ../aya_e2e
+bazel test @aya//test/integration-test:vm_x86_64 --jobs=1 --nocache_test_results
+bazel shutdown
+bazel test @aya//test/integration-test:vm_aarch64 --jobs=1 --nocache_test_results
+```
+
+The e2e commands boot maintained kernels with a deterministic initramfs under
+hermetic QEMU, verify configured module loading, and keep each configured
+kernel graph in a fresh Bazel server to bound peak analysis memory. The final
+two commands apply the same isolation to Aya's x86_64 and aarch64 eBPF
+integration VMs. These are separate Bzlmod roots because Aya pins a nightly
+Rust toolchain, while Rust-for-Linux modules use the stable toolchain registered
+by `linux.bzl`.
+
 ## Development
 
 The root workspace contains parser, generator, transition, rule, and tool tests:
@@ -406,7 +506,7 @@ The root workspace contains parser, generator, transition, rule, and tool tests:
 bazel test //...
 ```
 
-The standalone examples and compatibility workspaces are excluded from root
-package discovery with `.bazelignore`; run them from their own directories.
-Release preparation and generator distribution are documented in
-[`RELEASING.md`](RELEASING.md).
+The standalone examples, QEMU compatibility workspace, and Aya consumer
+workspace are excluded from root package discovery with `.bazelignore`; run
+them from their own directories. Release preparation and generator
+distribution are documented in [`RELEASING.md`](RELEASING.md).

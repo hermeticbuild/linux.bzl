@@ -1,4 +1,4 @@
-try-import ../.bazelrc
+import ../.bazelrc.shared
 
 common:remote --extra_execution_platforms=@hermetic_llvm//:rbe_platform
 

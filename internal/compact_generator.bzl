@@ -739,7 +739,7 @@ def _configure_probe_env(allow_shell, env):
     if "CC" not in env:
         env["CC"] = "clang"
     if "CC_VERSION_TEXT" not in env:
-        env["CC_VERSION_TEXT"] = "clang version 22.1.4None"
+        env["CC_VERSION_TEXT"] = "clang version 22.1.8None"
     if "LD" not in env:
         env["LD"] = "ld.lld"
     if "CLANG_FLAGS" not in env:

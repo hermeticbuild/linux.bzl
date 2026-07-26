@@ -6,6 +6,7 @@ load(
     "linux_object",
     "linux_source_tree",
 )
+load(":source_include_closure_test.bzl", "source_include_closure_test")
 
 package(default_visibility = ["//:__subpackages__"])
 
@@ -25,8 +26,10 @@ linux_source_tree(
     all_files = ["fixture.c"] + glob(["source/**"]),
     global_headers = glob(["source/include/**/*.h"]),
     headers = glob(["source/**/*.h"]),
-    local_include_files = ["fixture.c"],
-    lookup_files = glob(["source/**"]),
+    local_include_files = ["fixture.c"] + glob([
+        "source/**/*.c",
+        "source/**/*.inc",
+    ]),
     root = "source/Kconfig",
 )
 
@@ -62,9 +65,33 @@ linux_archive(
     objects = [":fixture_object"],
 )
 
+linux_object(
+    name = "cross_tree_object",
+    src = "source/cross_tree/leaf.c",
+    config = ":fixture_config",
+    flags = [
+        "-Werror",
+        "-Wall",
+    ],
+    mode = "y",
+    object = "cross_tree/leaf.o",
+    source_includes = [
+        "source/shared/first.inc",
+        "source/shared/nested/second.inc",
+    ],
+    source_includes_complete = True,
+    source_tree_info = ":fixture_source_tree",
+)
+
+source_include_closure_test(
+    name = "cross_tree_source_include_action_test",
+    target_under_test = ":cross_tree_object",
+)
+
 build_test(
     name = "fixture_compile_build_test",
     targets = [
+        ":cross_tree_object",
         ":fixture_archive",
         ":fixture_config",
         ":fixture_module_object",

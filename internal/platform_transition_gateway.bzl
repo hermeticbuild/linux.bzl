@@ -1,6 +1,6 @@
 """Private platform transition boundary for generated Linux build graphs."""
 
-load(":providers.bzl", "LinuxKernelInfo")
+load(":providers.bzl", "LinuxKernelInfo", "LinuxModuleSdkInfo")
 
 visibility("//...")
 
@@ -24,6 +24,8 @@ def _forwarded_providers(target):
     providers = [target[DefaultInfo]]
     if LinuxKernelInfo in target:
         providers.append(target[LinuxKernelInfo])
+    if LinuxModuleSdkInfo in target:
+        providers.append(target[LinuxModuleSdkInfo])
     if OutputGroupInfo in target:
         providers.append(target[OutputGroupInfo])
     return providers

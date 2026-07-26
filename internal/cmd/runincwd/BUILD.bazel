@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "runincwd_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/runincwd",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "runincwd",
+    embed = [":runincwd_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "runincwd_test",
+    srcs = ["main_test.go"],
+    embed = [":runincwd_lib"],
+)

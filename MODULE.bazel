@@ -6,18 +6,54 @@ module(
 bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "buildifier_prebuilt", version = "8.2.1.1")
-bazel_dep(name = "gazelle", version = "0.47.0")
-bazel_dep(name = "llvm", version = "0.8.3")
+bazel_dep(name = "elfutils", version = "0.195")
+bazel_dep(name = "gazelle", version = "0.51.3")
+bazel_dep(name = "libbpf", version = "1.7.0")
+bazel_dep(name = "llvm", version = "0.8.14")
 bazel_dep(name = "lz4", version = "1.10.0.bcr.1")
+bazel_dep(name = "pahole", version = "1.31")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "rules_cc", version = "0.2.17")
 bazel_dep(name = "rules_go", version = "0.60.0")
 bazel_dep(name = "rules_perl", version = "0.5.0")
+bazel_dep(name = "rules_rs", version = "0.0.98")
 
 bazel_dep(name = "tar.bzl", version = "0.9.0", dev_dependency = True)
 
-linux_bzl_libelf = use_extension("//internal:libelf_repositories.bzl", "linux_bzl_libelf")
-use_repo(linux_bzl_libelf, "libelf")
+rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+use_repo(rules_rust, "rules_rust")
+
+rust_toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+rust_toolchains.toolchain(
+    name = "default_rust_toolchains",
+    version = "1.97.0",
+)
+use_repo(
+    rust_toolchains,
+    linux_rust_toolchains = "default_rust_toolchains",
+)
+
+rust_sources = use_repo_rule(
+    "@bazel_tools//tools/build_defs/repo:http.bzl",
+    "http_archive",
+)
+
+rust_sources(
+    name = "linux_rust_sources",
+    build_file_content = """
+filegroup(
+    name = "rustc_srcs",
+    srcs = glob(["**/*"]),
+    visibility = ["//visibility:public"],
+)
+""",
+    sha256 = "f2530acd6b4da25a21151e3560d908b31f082edd6968f96d2682c8c2c15c66b7",
+    strip_prefix = "rust-src-1.97.0/rust-src/lib/rustlib/src/rust",
+    urls = ["https://static.rust-lang.org/dist/rust-src-1.97.0.tar.xz"],
+)
+
+bindgen_toolchains = use_extension("@rules_rs//rs:rules_rust_bindgen.bzl", "rules_rust_bindgen")
+use_repo(bindgen_toolchains, "rules_rust_bindgen")
 
 tar_toolchains = use_extension("@tar.bzl//tar:extensions.bzl", "toolchains", dev_dependency = True)
 use_repo(tar_toolchains, "bsd_tar_toolchains")
@@ -32,6 +68,12 @@ llvm_toolchains.target(
     os = "linux",
 )
 use_repo(llvm_toolchains, "llvm_toolchains")
+
+register_toolchains(
+    "@linux_rust_toolchains//:linux_x86_64_to_non_bpf_targets_1_97_0",
+    "@linux_rust_toolchains//:linux_x86_64_to_non_bpf_targets_1_97_0_bootstrap",
+    "@rules_rust_bindgen//:linux_amd64",
+)
 
 register_toolchains(
     "@bsd_tar_toolchains//:all",

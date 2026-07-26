@@ -2,12 +2,14 @@ load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load(":config_validation_test.bzl", "config_validation_test_suite")
 load(":kconfig_repositories_test.bzl", "kconfig_tool_filename_test")
 load(":linux_compile_flags_test.bzl", "linux_compile_flags_test")
+load(":linux_modules_test.bzl", "linux_module_test_suite")
 load(
     ":linux_objects.bzl",
     "linux_cc_context",
     "linux_config",
 )
 load(":linux_objects_failure_test.bzl", "linux_objects_fail_closed_test_suite")
+load(":linux_rust_test.bzl", "linux_rust_test_suite")
 
 package(default_visibility = ["//:__subpackages__"])
 
@@ -42,3 +44,7 @@ build_test(
 )
 
 linux_objects_fail_closed_test_suite(name = "linux_objects_fail_closed_test")
+
+linux_module_test_suite(name = "linux_module_test")
+
+linux_rust_test_suite(name = "linux_rust_test")

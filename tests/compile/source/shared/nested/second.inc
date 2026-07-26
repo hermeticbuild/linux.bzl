@@ -1,0 +1,1 @@
+#define SECOND_VALUE 41

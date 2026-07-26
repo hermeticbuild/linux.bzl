@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -59,7 +59,11 @@ filegroup(
         "lib/zstd/decompress/*.c",
         "lib/zstd/zstd_decompress_module.c",
         "lib/vdso/**",
+        "rust/**",
         "samples/Kconfig",
+        "scripts/mod/**",
+        "scripts/module-common.c",
+        "scripts/module.lds.S",
         "scripts/dtc/libfdt/**",
         "usr/default_cpio_list",
     ], allow_empty = True),
@@ -224,9 +228,4 @@ filegroup(
     srcs = glob([
         "arch/x86/include/asm/required-features.h",
     ], allow_empty = True),
-)
-
-cc_binary(
-    name = "gen_init_cpio",
-    srcs = ["usr/gen_init_cpio.c"],
 )
