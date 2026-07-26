@@ -10,6 +10,9 @@ on:
 permissions:
   contents: read
 
+env:
+  BUILDBUDDY_API_KEY: 4jtaxdhxtyu4ylxdEwI7
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -48,7 +51,10 @@ jobs:
           BAZEL_PROFILE: ${{ runner.temp }}/root-${{ matrix.bazel }}.profile.gz
         run: |
           set -o pipefail
-          bazel --host_jvm_args=-Xmx3g test //... --jobs=2 \
+          bazel --host_jvm_args=-Xmx3g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            test //... \
+            --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -126,7 +132,10 @@ jobs:
           BAZEL_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          bazel --host_jvm_args=-Xmx3g build "${BAZEL_TARGET}" --jobs=1 \
+          bazel --host_jvm_args=-Xmx3g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            build "${BAZEL_TARGET}" \
+            --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -208,8 +217,11 @@ jobs:
         run: |
           set -euo pipefail
           read -r -a targets <<<"${BAZEL_TARGETS}"
-          bazel --host_jvm_args=-Xmx3g test "${targets[@]}" \
-            --jobs=1 --nocache_test_results \
+          bazel --host_jvm_args=-Xmx3g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            test "${targets[@]}" \
+            --nocache_test_results \
+            --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -276,8 +288,11 @@ jobs:
           BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.profile.gz
         run: |
           set -o pipefail
-          bazel --host_jvm_args=-Xmx3g test '${{ matrix.target }}' \
-            --jobs=1 --nocache_test_results \
+          bazel --host_jvm_args=-Xmx3g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            test '${{ matrix.target }}' \
+            --nocache_test_results \
+            --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"

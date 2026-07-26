@@ -1,5 +1,5 @@
-common --enable_platform_specific_config
-common --incompatible_enforce_starlark_utf8=error
-common --nosandbox_default_allow_network
-common --show_result=20
-common --test_output=errors
+import ../.bazelrc.shared
+
+common:remote --extra_execution_platforms=@llvm//:rbe_platform
+
+try-import %workspace%/.bazelrc.user

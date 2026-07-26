@@ -12,6 +12,11 @@ common --test_output=errors
 
 common --check_direct_dependencies=off
 
+common:ci --announce_rc
+common:ci --color=yes
+common:ci --show_timestamps
+test:ci --test_summary=terse
+
 common:remote --bes_results_url=https://app.buildbuddy.io/invocation/
 common:remote --bes_backend=grpcs://remote.buildbuddy.io
 common:remote --experimental_remote_downloader=grpcs://remote.buildbuddy.io
