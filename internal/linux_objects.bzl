@@ -4,6 +4,8 @@ load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "CPP_L
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load(":kconfig.bzl", "KconfigInfo")
+load(":linux_module_actions.bzl", "linux_module_actions")
+load(":providers.bzl", "LinuxRustSdkInfo", "LinuxVmlinuxInfo")
 
 visibility("//...")
 
@@ -93,6 +95,7 @@ LinuxImageInfo = provider(
     doc = "Metadata for a native Linux kernel image output action.",
     fields = {
         "archives": "Archive providers consumed by this output.",
+        "module_objects": "Configured module-root LinuxObjectInfo values.",
         "objects": "Object providers consumed by this output.",
         "output": "Kernel image output file.",
     },
@@ -811,7 +814,9 @@ def _linux_object_compile_source_tree_inputs(ctx, src, direct = []):
         ],
         direct = direct,
     )
-    inputs.extend(_source_tree_local_include_files(ctx, [object_dir, source_dir]))
+    inputs.extend(ctx.files.source_includes)
+    if not ctx.attr.source_includes_complete:
+        inputs.extend(_source_tree_local_include_files(ctx, [object_dir, source_dir]))
     if _is_dtb_source(src):
         info = _linux_source_tree_info(ctx)
         if info:
@@ -2764,10 +2769,11 @@ def _linux_config_impl(ctx):
         header = _config_value_to_header_suffix(key, value)
         if header != None:
             header_lines.append(header)
-        if value == "y":
+        if value in ["y", "m"]:
             rustc_lines.append("--cfg=%s" % key)
-        elif value == "m":
-            rustc_lines.append("--cfg=%s_MODULE" % key)
+        if value != "n":
+            rendered_value = value if value.startswith('"') else '"%s"' % value
+            rustc_lines.append("--cfg=%s=%s" % (key, rendered_value))
     header_lines.append("#endif")
 
     localversion = _unquote(flags.get("CONFIG_LOCALVERSION", ""))
@@ -2851,7 +2857,7 @@ def _configure_linux_probe_env(allow_shell, env):
     if not allow_shell:
         return
     env.setdefault("CC", "clang")
-    env.setdefault("CC_VERSION_TEXT", "clang version 22.1.4None")
+    env.setdefault("CC_VERSION_TEXT", "clang version 22.1.8None")
     env.setdefault("LD", "ld.lld")
     env.setdefault("NM", "llvm-nm")
     env.setdefault("AR", "llvm-ar")
@@ -2861,7 +2867,7 @@ def _configure_linux_probe_env(allow_shell, env):
     env.setdefault("BINDGEN", "bindgen")
 
 def _linux_compiler_version_string():
-    return "clang version 22.1.4None, LLD 22.1.4"
+    return "clang version 22.1.8None, LLD 22.1.8"
 
 def _linux_resolved_config_impl(ctx):
     config_dir = ctx.label.name + ".config_tree"
@@ -3393,6 +3399,13 @@ linux_object = rule(
         "object": attr.string(mandatory = True),
         "src": attr.label(allow_single_file = True, mandatory = True),
         "srcarch": attr.string(),
+        "source_includes": attr.label_list(
+            allow_files = True,
+            doc = "Exact recursive closure of source-like files reached by literal quoted includes.",
+        ),
+        "source_includes_complete": attr.bool(
+            doc = "Whether source_includes is complete, including when it is empty. False retains the legacy directory fallback.",
+        ),
         "source_tree_info": attr.label(
             providers = [LinuxSourceTreeInfo],
             doc = "Shared Linux source tree provider required by source-backed objects.",
@@ -3813,6 +3826,7 @@ linux_archive = rule(
 
 def _linux_compact_image_impl(ctx):
     object_infos = [obj[LinuxObjectInfo] for obj in ctx.attr.objects]
+    module_object_infos = [obj[LinuxObjectInfo] for obj in ctx.attr.module_objects]
     if not object_infos:
         fail("linux_compact_image %s requires at least one compiled object" % ctx.label)
     cc_toolchain = find_cpp_toolchain(ctx)
@@ -3837,6 +3851,7 @@ def _linux_compact_image_impl(ctx):
     )
     info = LinuxImageInfo(
         archives = [],
+        module_objects = module_object_infos,
         objects = object_infos,
         output = out,
     )
@@ -3849,6 +3864,7 @@ linux_compact_image = rule(
     implementation = _linux_compact_image_impl,
     attrs = {
         "arch": attr.string(default = "x86"),
+        "module_objects": attr.label_list(providers = [LinuxObjectInfo]),
         "objects": attr.label_list(providers = [LinuxObjectInfo]),
     },
     fragments = ["cpp"],
@@ -3929,16 +3945,17 @@ def _linux_vmlinux_compile_source(ctx, compiler, cc_toolchain, feature_configura
     )
     return out
 
-def _linux_vmlinux_export_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root):
-    src = ctx.actions.declare_file(ctx.label.name + ".obj/.vmlinux.export.c")
-    ctx.actions.write(
-        output = src,
-        content = """#include <linux/export-internal.h>
+def _linux_vmlinux_export_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, src = None):
+    if src == None:
+        src = ctx.actions.declare_file(ctx.label.name + ".obj/.vmlinux.export.c")
+        ctx.actions.write(
+            output = src,
+            content = """#include <linux/export-internal.h>
 #include <linux/module.h>
 #undef __MODULE_INFO_PREFIX
 #define __MODULE_INFO_PREFIX
 """,
-    )
+        )
     return _linux_vmlinux_compile_source(
         ctx,
         compiler,
@@ -4092,6 +4109,88 @@ def _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, c
         name + ".kallsyms.o",
         name + ".kallsyms.o",
     )
+
+def _linux_btf_object(ctx, config, input):
+    if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") != "y":
+        return None
+    if not ctx.executable.pahole:
+        fail("linux_vmlinux %s has DEBUG_INFO_BTF enabled and requires pahole" % ctx.label)
+
+    btf_vmlinux = ctx.actions.declare_file(ctx.label.name + ".obj/" + input.basename + ".btf")
+    pahole_args = ctx.actions.args()
+    pahole_args.add("-input", input)
+    pahole_args.add("-output", btf_vmlinux)
+    pahole_args.add("-env", "LLVM_OBJCOPY=" + ctx.executable._llvm_objcopy.path)
+    pahole_args.add("--")
+    pahole_args.add(ctx.executable.pahole)
+    pahole_args.add("-J")
+    pahole_args.add_all(linux_module_actions.pahole_flags(config, ctx.attr.version))
+    pahole_args.add("{output}")
+    ctx.actions.run(
+        executable = ctx.executable._btfmutate,
+        inputs = [input],
+        tools = [
+            ctx.attr.pahole[DefaultInfo].files_to_run,
+            ctx.attr._llvm_objcopy[DefaultInfo].files_to_run,
+        ],
+        outputs = [btf_vmlinux],
+        arguments = [pahole_args],
+        mnemonic = "LinuxBTFEncode",
+        progress_message = "Encoding Linux vmlinux BTF %{label}",
+    )
+
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + input.basename + ".btf.o")
+    extract_args = ctx.actions.args()
+    extract_args.add("-input", btf_vmlinux)
+    extract_args.add("-output", out)
+    extract_args.add(
+        "-elf-et-rel-endian",
+        "big" if config.config_flags.get("CONFIG_CPU_BIG_ENDIAN") == "y" else "little",
+    )
+    extract_args.add("--")
+    extract_args.add(ctx.executable._llvm_objcopy)
+    extract_args.add("--only-section=.BTF")
+    extract_args.add("--set-section-flags")
+    extract_args.add(".BTF=alloc,readonly")
+    extract_args.add("--strip-all")
+    extract_args.add(btf_vmlinux)
+    extract_args.add("{output}")
+    ctx.actions.run(
+        executable = ctx.executable._btfmutate,
+        inputs = [btf_vmlinux],
+        tools = [ctx.attr._llvm_objcopy[DefaultInfo].files_to_run],
+        outputs = [out],
+        arguments = [extract_args],
+        mnemonic = "LinuxBTFExtract",
+        progress_message = "Extracting Linux vmlinux BTF %{label}",
+    )
+    return out
+
+def _linux_resolve_btfids(ctx, config, input):
+    if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") != "y":
+        return input
+    if not ctx.executable.resolve_btfids_tool:
+        fail("linux_vmlinux %s has DEBUG_INFO_BTF enabled and requires resolve_btfids_tool" % ctx.label)
+
+    out = ctx.actions.declare_file(ctx.label.name + ".btfids.vmlinux.unstripped")
+    args = ctx.actions.args()
+    args.add("-input", input)
+    args.add("-output", out)
+    args.add("--")
+    args.add(ctx.executable.resolve_btfids_tool)
+    if config.config_flags.get("CONFIG_WERROR") == "y":
+        args.add("--fatal_warnings")
+    args.add("{output}")
+    ctx.actions.run(
+        executable = ctx.executable._btfmutate,
+        inputs = [input],
+        tools = [ctx.attr.resolve_btfids_tool[DefaultInfo].files_to_run],
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxResolveBTFIDs",
+        progress_message = "Resolving Linux vmlinux BTF IDs %{label}",
+    )
+    return out
 
 def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, out, strip_debug):
     inputs = depset(
@@ -4277,7 +4376,7 @@ def _linux_vmlinux_initcalls_linker_script(ctx, config):
 """)
     return out
 
-def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs):
+def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, extra_objects):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/vmlinux.o")
     initcalls_linker_script = _linux_vmlinux_initcalls_linker_script(ctx, config)
     args = ctx.actions.args()
@@ -4311,6 +4410,7 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
         flags.append("--whole-archive")
         args.add_all(flags)
         args.add(image_object)
+        args.add_all(extra_objects)
         args.add("--no-whole-archive")
     else:
         executable = linker
@@ -4341,11 +4441,15 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
         flags.append("-Wl,--whole-archive")
         args.add_all(flags)
         args.add(image_object)
+        args.add_all(extra_objects)
         args.add("-Wl,--no-whole-archive")
 
     ctx.actions.run(
         executable = executable,
-        inputs = depset(([image_object] + ([initcalls_linker_script] if initcalls_linker_script else [])), transitive = [image_object_inputs, cc_toolchain.all_files]),
+        inputs = depset(
+            [image_object] + extra_objects + ([initcalls_linker_script] if initcalls_linker_script else []),
+            transitive = [image_object_inputs, cc_toolchain.all_files],
+        ),
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxVmlinuxRelocatable",
@@ -4353,14 +4457,20 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
     )
     return out
 
-def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs):
-    needs_relocatable = (
-        config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y" or
-        config.config_flags.get("CONFIG_LTO_CLANG_FULL") == "y" or
-        ctx.executable.objtool
+def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, extra_objects):
+    # Upstream modpost consumes vmlinux.o even when neither LTO nor objtool is
+    # enabled. Always materialize the relocatable link so the configured kernel
+    # can expose a complete private module SDK without reconstructing it later.
+    image_object = _linux_vmlinux_relocatable_object(
+        ctx,
+        config,
+        linker,
+        cc_toolchain,
+        feature_configuration,
+        image_object,
+        image_object_inputs,
+        extra_objects,
     )
-    if needs_relocatable:
-        image_object = _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs)
     if not ctx.executable.objtool:
         return image_object
 
@@ -4369,6 +4479,7 @@ def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configurat
     args.add("-config", config.config)
     args.add("-objtool", ctx.executable.objtool)
     args.add("-in", image_object)
+    args.add("-mode", "vmlinux")
     args.add("-out", out)
     ctx.actions.run(
         executable = ctx.attr._objtoolrun[DefaultInfo].files_to_run,
@@ -4394,6 +4505,13 @@ def _linux_vmlinux_impl(ctx):
     image = ctx.attr.image[LinuxImageInfo]
     config = ctx.attr.config[LinuxConfigInfo]
     generated_headers = ctx.attr.generated_headers[LinuxGeneratedHeadersInfo]
+    rust_sdk = ctx.attr.rust_sdk[LinuxRustSdkInfo] if ctx.attr.rust_sdk else None
+    rust_enabled = config.config_flags.get("CONFIG_RUST") == "y"
+    if rust_sdk == None or rust_sdk.enabled != rust_enabled:
+        fail(
+            "%s requires a Rust SDK whose enabled state matches CONFIG_RUST=%s" %
+            (ctx.label, "y" if rust_enabled else "n"),
+        )
     cc_toolchain = find_cpp_toolchain(ctx)
     feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
     compiler = cc_common.get_tool_for_action(
@@ -4406,7 +4524,6 @@ def _linux_vmlinux_impl(ctx):
     )
     source_root = _linux_source_root_path(ctx)
     linker_script = _linux_vmlinux_linker_script(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root)
-    export_object = _linux_vmlinux_export_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root)
     version_object = _linux_vmlinux_compile_source(
         ctx,
         compiler,
@@ -4421,7 +4538,40 @@ def _linux_vmlinux_impl(ctx):
         ["-fno-function-sections", "-fno-data-sections", "-include", "generated/utsversion.h"],
     )
     image_object_inputs = depset([info.output for info in image.objects])
-    image_object = _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, image.output, image_object_inputs)
+    image_object = _linux_vmlinux_objtool(
+        ctx,
+        config,
+        linker,
+        cc_toolchain,
+        feature_configuration,
+        image.output,
+        image_object_inputs,
+        rust_sdk.runtime_objects,
+    )
+    module_prep = linux_module_actions.prepare(
+        ctx,
+        linux_module_cc_helpers,
+        struct(
+            config = config,
+            generated_headers = generated_headers,
+            module_objects = image.module_objects,
+            source_root = _linux_source_root_file(ctx),
+            source_tree = depset(ctx.files.source_tree),
+            srcarch = ctx.attr.srcarch,
+            version = ctx.attr.version,
+            vmlinux_object = image_object,
+        ),
+    )
+    export_object = _linux_vmlinux_export_object(
+        ctx,
+        compiler,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        module_prep.export_source if module_prep != None else None,
+    )
 
     kallsyms_object = None
     if ctx.attr.kallsyms == "auto":
@@ -4435,27 +4585,69 @@ def _linux_vmlinux_impl(ctx):
         ctx.actions.write(empty_map, "")
         kallsyms_object = _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, empty_map, ".tmp_vmlinux0", ctx.executable.kallsyms_tool)
 
+    btf_object = None
+    if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") == "y":
+        btf_base = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux.btf")
+        _linux_vmlinux_link(
+            ctx,
+            linker,
+            cc_toolchain,
+            feature_configuration,
+            image_object,
+            image_object_inputs,
+            export_object,
+            version_object,
+            linker_script,
+            kallsyms_object,
+            None,
+            btf_base,
+            False,
+        )
+        btf_object = _linux_btf_object(ctx, config, btf_base)
+
     if kallsyms_enabled:
         for i in range(1, 5):
             tmp = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux%d" % i)
-            _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, None, tmp, True)
+            _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, tmp, True)
             system_map = _linux_system_map(ctx, tmp, ".tmp_vmlinux%d" % i)
             kallsyms_object = _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, system_map, ".tmp_vmlinux%d" % i, ctx.executable.kallsyms_tool)
 
     unstripped = ctx.actions.declare_file(ctx.label.name + ".vmlinux.unstripped")
-    linked = _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, None, unstripped, False)
+    linked = _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, unstripped, False)
+    linked = _linux_resolve_btfids(ctx, config, linked)
     unstripped = _linux_sorttable(ctx, config, linked)
     out = ctx.actions.declare_file(ctx.label.name + ".vmlinux")
     out = _linux_strip_vmlinux(ctx, config, unstripped, out)
     system_map = _linux_system_map(ctx, out, "System.map")
     info = LinuxImageInfo(
         archives = image.archives,
+        module_objects = image.module_objects,
         objects = image.objects,
         output = out,
     )
     return [
         DefaultInfo(files = depset([out, system_map])),
         info,
+        LinuxVmlinuxInfo(
+            arch = "aarch64" if ctx.attr.arch == "arm64" else "x86_64",
+            config = config,
+            generated_headers = generated_headers,
+            module_common = module_prep.module_common if module_prep != None else None,
+            module_lds = module_prep.module_lds if module_prep != None else None,
+            module_objects = image.module_objects,
+            module_outputs = module_prep.module_outputs if module_prep != None else {},
+            module_sources = module_prep.module_sources if module_prep != None else {},
+            module_symvers = module_prep.module_symvers if module_prep != None else None,
+            modules_order = module_prep.modules_order if module_prep != None else None,
+            modpost = module_prep.modpost if module_prep != None else None,
+            source_root = _linux_source_root_file(ctx),
+            source_tree = depset(ctx.files.source_tree),
+            srcarch = ctx.attr.srcarch,
+            rust = rust_sdk,
+            vmlinux = out,
+            vmlinux_unstripped = unstripped,
+            vmlinux_object = image_object,
+        ),
         OutputGroupInfo(system_map = depset([system_map]), vmlinux = depset([out])),
     ]
 
@@ -4481,9 +4673,19 @@ linux_vmlinux = rule(
             cfg = "exec",
             executable = True,
         ),
+        "pahole": attr.label(
+            cfg = "exec",
+            executable = True,
+        ),
+        "resolve_btfids_tool": attr.label(
+            cfg = "exec",
+            executable = True,
+        ),
+        "rust_sdk": attr.label(providers = [LinuxRustSdkInfo]),
         "source_root": attr.label(allow_single_file = True),
         "source_tree": attr.label_list(allow_files = True),
         "srcarch": attr.string(),
+        "version": attr.string(mandatory = True),
         "kallsyms_tool": attr.label(
             cfg = "exec",
             doc = "Kernel-source-specific scripts/kallsyms executable. Required when kallsyms is enabled for a vmlinux link.",
@@ -4500,10 +4702,25 @@ linux_vmlinux = rule(
             default = Label("@llvm//tools:llvm-nm"),
             executable = True,
         ),
+        "_btfmutate": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/btfmutate"),
+            executable = True,
+        ),
         "_llvm_objcopy": attr.label(
             allow_single_file = True,
             cfg = "exec",
             default = Label("@llvm//tools:llvm-objcopy"),
+            executable = True,
+        ),
+        "_modulemodinfo": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/modulemodinfo"),
+            executable = True,
+        ),
+        "_offsetsheader": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/offsetsheader"),
             executable = True,
         ),
         "_mksysmap": attr.label(
@@ -4531,6 +4748,14 @@ linux_vmlinux = rule(
             default = Label("//internal/cmd/runandwrite"),
             executable = True,
         ),
+        "_runincwd": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/runincwd"),
+            executable = True,
+        ),
+    },
+    exec_groups = {
+        "host_cc": exec_group(toolchains = use_cc_toolchain()),
     },
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
@@ -5240,6 +5465,7 @@ def _linux_x86_bzimage_impl(ctx):
     out = _linux_x86_bzimage(ctx, setup_bin, vmlinux_bin)
     info = LinuxImageInfo(
         archives = image.archives,
+        module_objects = image.module_objects,
         objects = image.objects,
         output = out,
     )
@@ -5288,6 +5514,7 @@ def _linux_objcopy_image_impl(ctx, objcopy_flags):
     )
     info = LinuxImageInfo(
         archives = image.archives,
+        module_objects = image.module_objects,
         objects = image.objects,
         output = out,
     )
@@ -5385,4 +5612,18 @@ linux_cache_shape_check = rule(
         "shared_objects": attr.string_list(mandatory = True),
     },
     doc = "Analysis-time check that shared object variants keep the same provider output across image targets.",
+)
+
+# Narrow private helper surface shared with internal/linux_modules.bzl. Keeping
+# these functions behind one struct avoids making the implementation helpers
+# individual loadable symbols or part of the root public API.
+linux_module_cc_helpers = struct(
+    compile_flags = _linux_compile_flags,
+    configure_features = _cc_feature_configuration,
+    cpp_undef_flags = _linux_cpp_undef_flags,
+    module_flags = _linux_module_flags,
+    object_name_flags = _linux_object_name_flags,
+    source_include_flags = _linux_source_include_flags_for_root,
+    source_preinclude_flags = _linux_source_preinclude_flags_for_root,
+    target_flags = _cc_target_flags,
 )

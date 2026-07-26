@@ -18,6 +18,7 @@ func main() {
 	config := flag.String("config", "", "resolved Linux .config")
 	objtool := flag.String("objtool", "", "objtool executable")
 	in := flag.String("in", "", "input vmlinux.o")
+	mode := flag.String("mode", "vmlinux", "objtool mode: builtin, module, or vmlinux")
 	out := flag.String("out", "", "output vmlinux.o")
 	flag.Parse()
 
@@ -25,19 +26,22 @@ func main() {
 		fmt.Fprintln(os.Stderr, "-config, -objtool, -in, and -out are required")
 		os.Exit(2)
 	}
-	if err := run(*config, *objtool, *in, *out); err != nil {
+	if err := run(*config, *objtool, *in, *out, *mode); err != nil {
 		fmt.Fprintf(os.Stderr, "objtoolrun: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(configPath, objtoolPath, inPath, outPath string) error {
+func run(configPath, objtoolPath, inPath, outPath, mode string) error {
 	config, err := readConfig(configPath)
 	if err != nil {
 		return err
 	}
-	args := vmlinuxObjtoolArgs(config)
-	if len(args) == 0 {
+	args, enabled, err := objtoolArgs(config, mode)
+	if err != nil {
+		return err
+	}
+	if !enabled {
 		return copyFile(inPath, outPath)
 	}
 	if err := copyFile(inPath, outPath); err != nil {
@@ -78,65 +82,95 @@ func readConfig(path string) (map[string]string, error) {
 	return config, scanner.Err()
 }
 
-func vmlinuxObjtoolArgs(config map[string]string) []string {
+func objtoolArgs(config map[string]string, mode string) ([]string, bool, error) {
 	if !enabled(config, "CONFIG_OBJTOOL") {
-		return nil
+		return nil, false, nil
 	}
 
 	delayObjtool := enabled(config, "CONFIG_LTO_CLANG") || enabled(config, "CONFIG_X86_KERNEL_IBT")
-	mcountObjtool := enabled(config, "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL")
 	noinstrValidation := enabled(config, "CONFIG_NOINSTR_VALIDATION")
-	if !delayObjtool && !mcountObjtool && !noinstrValidation {
-		return nil
+	switch mode {
+	case "builtin":
+		if delayObjtool {
+			return nil, false, nil
+		}
+		return commonObjtoolArgs(config), true, nil
+	case "module":
+		args := commonObjtoolArgs(config)
+		if delayObjtool {
+			args = append(args, "--link")
+		}
+		args = append(args, "--module")
+		return args, true, nil
+	case "vmlinux":
+		if !delayObjtool && !noinstrValidation {
+			return nil, false, nil
+		}
+		args := []string{}
+		if delayObjtool {
+			args = commonObjtoolArgs(config)
+		} else if enabled(config, "CONFIG_OBJTOOL_WERROR") {
+			args = append(args, "--Werror")
+		}
+		if noinstrValidation {
+			args = append(args, "--noinstr")
+			if enabled(config, "CONFIG_MITIGATION_UNRET_ENTRY") || enabled(config, "CONFIG_MITIGATION_SRSO") {
+				args = append(args, "--unret")
+			}
+		}
+		args = append(args, "--link")
+		return args, true, nil
+	default:
+		return nil, false, fmt.Errorf("unsupported -mode %q", mode)
 	}
+}
 
+func commonObjtoolArgs(config map[string]string) []string {
 	var args []string
-	if delayObjtool {
-		if enabled(config, "CONFIG_HAVE_JUMP_LABEL_HACK") {
-			args = append(args, "--hacks=jump_label")
-		}
-		if enabled(config, "CONFIG_HAVE_NOINSTR_HACK") {
-			args = append(args, "--hacks=noinstr")
-		}
-		if enabled(config, "CONFIG_MITIGATION_CALL_DEPTH_TRACKING") {
-			args = append(args, "--hacks=skylake")
-		}
-		if enabled(config, "CONFIG_X86_KERNEL_IBT") {
-			args = append(args, "--ibt")
-		}
-		if enabled(config, "CONFIG_FINEIBT") {
-			args = append(args, "--cfi")
-		}
-		if enabled(config, "CONFIG_UNWINDER_ORC") {
-			args = append(args, "--orc")
-		}
-		if enabled(config, "CONFIG_MITIGATION_RETPOLINE") {
-			args = append(args, "--retpoline")
-		}
-		if enabled(config, "CONFIG_MITIGATION_RETHUNK") {
-			args = append(args, "--rethunk")
-		}
-		if enabled(config, "CONFIG_MITIGATION_SLS") {
-			args = append(args, "--sls")
-		}
-		if enabled(config, "CONFIG_STACK_VALIDATION") {
-			args = append(args, "--stackval")
-		}
-		if enabled(config, "CONFIG_HAVE_STATIC_CALL_INLINE") {
-			args = append(args, "--static-call")
-		}
-		if enabled(config, "CONFIG_HAVE_UACCESS_VALIDATION") {
-			args = append(args, "--uaccess")
-		}
-		if enabled(config, "CONFIG_GCOV_KERNEL") || enabled(config, "CONFIG_KCOV") {
-			args = append(args, "--no-unreachable")
-		}
-		if enabled(config, "CONFIG_PREFIX_SYMBOLS") {
-			args = append(args, "--prefix="+config["CONFIG_FUNCTION_PADDING_BYTES"])
-		}
+	if enabled(config, "CONFIG_HAVE_JUMP_LABEL_HACK") {
+		args = append(args, "--hacks=jump_label")
+	}
+	if enabled(config, "CONFIG_HAVE_NOINSTR_HACK") {
+		args = append(args, "--hacks=noinstr")
+	}
+	if enabled(config, "CONFIG_MITIGATION_CALL_DEPTH_TRACKING") {
+		args = append(args, "--hacks=skylake")
+	}
+	if enabled(config, "CONFIG_X86_KERNEL_IBT") {
+		args = append(args, "--ibt")
+	}
+	if enabled(config, "CONFIG_FINEIBT") {
+		args = append(args, "--cfi")
+	}
+	if enabled(config, "CONFIG_UNWINDER_ORC") {
+		args = append(args, "--orc")
+	}
+	if enabled(config, "CONFIG_MITIGATION_RETPOLINE") {
+		args = append(args, "--retpoline")
+	}
+	if enabled(config, "CONFIG_MITIGATION_RETHUNK") {
+		args = append(args, "--rethunk")
+	}
+	if enabled(config, "CONFIG_MITIGATION_SLS") {
+		args = append(args, "--sls")
+	}
+	if enabled(config, "CONFIG_STACK_VALIDATION") {
+		args = append(args, "--stackval")
+	}
+	if enabled(config, "CONFIG_HAVE_STATIC_CALL_INLINE") {
+		args = append(args, "--static-call")
+	}
+	if enabled(config, "CONFIG_HAVE_UACCESS_VALIDATION") {
+		args = append(args, "--uaccess")
+	}
+	if enabled(config, "CONFIG_GCOV_KERNEL") || enabled(config, "CONFIG_KCOV") {
+		args = append(args, "--no-unreachable")
+	}
+	if enabled(config, "CONFIG_PREFIX_SYMBOLS") {
+		args = append(args, "--prefix="+config["CONFIG_FUNCTION_PADDING_BYTES"])
 	}
 
-	if mcountObjtool {
+	if enabled(config, "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL") {
 		args = append(args, "--mcount")
 		if enabled(config, "CONFIG_HAVE_OBJTOOL_NOP_MCOUNT") {
 			args = append(args, "--mnop")
@@ -146,13 +180,6 @@ func vmlinuxObjtoolArgs(config map[string]string) []string {
 	if enabled(config, "CONFIG_OBJTOOL_WERROR") {
 		args = append(args, "--Werror")
 	}
-	if noinstrValidation {
-		args = append(args, "--noinstr")
-		if enabled(config, "CONFIG_MITIGATION_UNRET_ENTRY") || enabled(config, "CONFIG_MITIGATION_SRSO") {
-			args = append(args, "--unret")
-		}
-	}
-	args = append(args, "--link")
 	return args
 }
 

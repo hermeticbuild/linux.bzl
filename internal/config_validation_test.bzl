@@ -31,21 +31,41 @@ config_validation_failure_test = analysistest.make(
 
 def config_validation_test_suite(name):
     cases = {
-        "bpf": (
-            {"CONFIG_BPF_SYSCALL": "y"},
-            "CONFIG_BPF_SYSCALL",
+        "cfi_modules": (
+            {"CONFIG_CFI_CLANG": "y"},
+            "module metadata instrumentation",
         ),
-        "module": (
-            {"CONFIG_TEST_DRIVER": "m"},
-            "loadable-module selections",
+        "extended_modversions": (
+            {"CONFIG_EXTENDED_MODVERSIONS": "y"},
+            "module versioning",
         ),
-        "modules": (
-            {"CONFIG_MODULES": "y"},
-            "CONFIG_MODULES",
+        "gcov_modules": (
+            {"CONFIG_GCOV_KERNEL": "y"},
+            "module metadata instrumentation",
+        ),
+        "gendwarfksyms": (
+            {"CONFIG_GENDWARFKSYMS": "y"},
+            "module versioning",
+        ),
+        "kcsan_modules": (
+            {"CONFIG_KCSAN": "y"},
+            "module metadata instrumentation",
+        ),
+        "modversions": (
+            {"CONFIG_MODVERSIONS": "y"},
+            "module versioning",
         ),
         "native_cpu": (
             {"CONFIG_X86_NATIVE_CPU": "y"},
             "CONFIG_X86_NATIVE_CPU",
+        ),
+        "srcversion": (
+            {"CONFIG_MODULE_SRCVERSION_ALL": "y"},
+            "module versioning",
+        ),
+        "trim_unused_ksyms": (
+            {"CONFIG_TRIM_UNUSED_KSYMS": "y"},
+            "module versioning",
         ),
     }
     tests = []

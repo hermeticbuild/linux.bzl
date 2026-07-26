@@ -22,6 +22,7 @@ def _fake_linux_image_impl(ctx):
         DefaultInfo(files = depset([out])),
         LinuxImageInfo(
             archives = [],
+            module_objects = [],
             objects = [],
             output = out,
         ),

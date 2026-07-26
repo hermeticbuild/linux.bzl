@@ -1,0 +1,182 @@
+diff --git a/MODULE.bazel b/MODULE.bazel
+index 00d93a2..e591333 100644
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -33,14 +33,7 @@
+ bazel_lib_toolchains.copy_to_directory()
+ use_repo(bazel_lib_toolchains, "copy_to_directory_toolchains")
+ 
+-# Pin the linux.bzl revision that provides the deterministic C initramfs rule.
+-archive_override(
+-    module_name = "linux.bzl",
+-    integrity = "sha256-2gveHVEG4EE5x3N4kDnUftB7ed/6RRFslFwDquObqRg=",
+-    strip_prefix = "linux.bzl-e18628f3e177022c2ff0cf93a2e5f2d408f7d2fc",
+-    urls = ["https://github.com/hermeticbuild/linux.bzl/archive/e18628f3e177022c2ff0cf93a2e5f2d408f7d2fc.tar.gz"],
+-)
+ 
+ # @rules_rs creates @rules_rust here; generated BUILD files and .bazelrc labels
+ # reference @rules_rust directly.
+ rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+@@ -50,10 +50,11 @@
+ # core_intrinsics, so the hermetic Rust toolchain must be a pinned nightly.
+ toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+ toolchains.toolchain(
++    name = "aya_rust_toolchains",
+     edition = "2024",
+     version = "nightly/2026-06-24",
+ )
+-use_repo(toolchains, "default_rust_toolchains")
++use_repo(toolchains, "aya_rust_toolchains")
+ 
+ # Each qemu-system toolchain is compatible with the corresponding
+ # //bazel:bpf_target_arch value. bazel/vm.bzl transitions that value for each
+@@ -74,7 +75,7 @@
+ 
+ register_toolchains(
+     "@copy_to_directory_toolchains//:all",
+-    "@default_rust_toolchains//:all",
++    "@aya_rust_toolchains//:all",
+     "@llvm//toolchain:all",
+     "@qemu_system_toolchains//:all",
+ )
+@@ -126,54 +126,34 @@ use_repo(crate, "crates")
+ # Use one integrity-pinned Linux source archive for both integration VM
+ # architectures.
+-linux_kernel = use_extension("@linux.bzl//:linux.bzl", "linux_kernel")
+-linux_kernel.archive(
++linux_source_repository = use_repo_rule(
++    "@linux.bzl//:linux.bzl",
++    "linux_source_repository",
++)
++linux_source_repository(
+     name = "aya_linux_6_18_2",
+     integrity = "sha256-VYxrurdJSSs0+Zgn/oB7ADmnRGk8IdOn4Ds6SO2quWo=",
+     strip_prefix = "linux-6.18.2",
+     urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.2.tar.xz"],
++    version = "6.18.2",
+ )
+ 
+-# Convert each requested Kconfig fragment into a KconfigInfo repository.
+-linux_kernel.kconfig(
+-    name = "aya_aarch64_kconfig",
++linux_image = use_repo_rule(
++    "@linux.bzl//:linux.bzl",
++    "linux_image",
++)
++
++linux_image(
++    name = "aya_aarch64_kernel",
+     config = "//test/kernel:aya_aarch64.config",
++    config_mode = "allnoconfig",
++    platform = "@llvm//platforms:linux_arm64",
++    source = "@aya_linux_6_18_2//:Kconfig",
+ )
+-linux_kernel.kconfig(
+-    name = "aya_x86_64_kconfig",
++
++linux_image(
++    name = "aya_x86_64_kernel",
+     config = "//test/kernel:aya_x86_64.config",
+-)
+-
+-# Generate architecture-specific compact Kbuild metadata from
+-# aya_aarch64.config and aya_x86_64.config.
+-# linux.bzl encodes pahole 1.31 as "131" for the CONFIG_DEBUG_INFO_BTF probe;
+-# keep this value synchronized with bazel_dep(name = "pahole") above.
+-# TODO(https://github.com/hermeticbuild/linux.bzl/issues/6): Teach linux.bzl to
+-# derive pahole_version from the pahole toolchain.
+-linux_kernel.compact(
+-    name = "aya_aarch64_compact",
+-    config = "//test/kernel:aya_aarch64.config",
+     config_mode = "allnoconfig",
+-    config_name = "aarch64",
+-    kernel_name = "aya_kernel",
+-    kernel_package = "test/kernel",
+-    probe_values = {"pahole_version": "131"},
+-    source_repo = "aya_linux_6_18_2",
+-)
+-linux_kernel.compact(
+-    name = "aya_x86_64_compact",
+-    config = "//test/kernel:aya_x86_64.config",
+-    config_mode = "allnoconfig",
+-    config_name = "x86_64",
+-    kernel_name = "aya_kernel",
+-    kernel_package = "test/kernel",
+-    probe_values = {"pahole_version": "131"},
+-    source_repo = "aya_linux_6_18_2",
+-)
+-use_repo(
+-    linux_kernel,
+-    "aya_aarch64_compact",
+-    "aya_aarch64_kconfig",
+-    "aya_linux_6_18_2",
+-    "aya_x86_64_compact",
+-    "aya_x86_64_kconfig",
++    platform = "@llvm//platforms:linux_x86_64",
++    source = "@aya_linux_6_18_2//:Kconfig",
+ )
+diff --git a/test/kernel/BUILD.bazel b/test/kernel/BUILD.bazel
+index a8349f2..f645fd1 100644
+--- a/test/kernel/BUILD.bazel
++++ b/test/kernel/BUILD.bazel
+@@ -1,46 +1,30 @@
+-load("@linux.bzl//:linux.bzl", "linux")
+-
+ package(default_visibility = ["//visibility:public"])
+ 
+ exports_files([
+     "aya_aarch64.config",
+     "aya_x86_64.config",
+ ])
+ 
+-# linux.bzl encodes pahole 1.31 as "131". Keep this synchronized with
+-# bazel_dep(name = "pahole", version = "1.31") in MODULE.bazel.
+-_PAHOLE_VERSION = "131"
+-
+-# MODULE.bazel declares this integrity-pinned Linux 6.18.2 repository.
+-_LINUX_SOURCE_REPOSITORY = "@aya_linux_6_18_2"
+-
+-linux(
++alias(
+     name = "aya_kernel",
+-    compact_repos = {
+-        "aarch64": "@aya_aarch64_compact",
+-        "x86_64": "@aya_x86_64_compact",
+-    },
+-    config = {
+-        "aarch64": "@aya_aarch64_kconfig//:kconfig",
+-        "x86_64": "@aya_x86_64_kconfig//:kconfig",
+-    },
+-    config_mode = "allnoconfig",
+-    pahole = "@pahole//:pahole",
+-    probe_values = {"pahole_version": _PAHOLE_VERSION},
+-    source_repo = _LINUX_SOURCE_REPOSITORY,
++    actual = select({
++        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//:kernel",
++        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//:kernel",
++    }),
+ )
+ 
+-filegroup(
++alias(
+     name = "aya_kernel_config",
+-    srcs = select({
+-        "@platforms//cpu:aarch64": [":aya_kernel_aarch64_config"],
+-        "@platforms//cpu:x86_64": [":aya_kernel_x86_64_config"],
++    actual = select({
++        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//:config",
++        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//:config",
+     }),
+-    output_group = "config",
+ )
+ 
+-filegroup(
++alias(
+     name = "aya_kernel_system_map",
+-    srcs = [":aya_kernel.vm_linux"],
+-    output_group = "system_map",
++    actual = select({
++        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//:system_map",
++        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//:system_map",
++    }),
+ )

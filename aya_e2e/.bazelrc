@@ -1,0 +1,6 @@
+import ../.bazelrc.shared
+
+common:remote --extra_execution_platforms=@llvm//:rbe_platform
+common --@rules_rust//rust/toolchain/channel=nightly
+
+try-import %workspace%/.bazelrc.user

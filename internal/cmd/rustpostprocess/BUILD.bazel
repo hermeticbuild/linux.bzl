@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "rustpostprocess_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/rustpostprocess",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "rustpostprocess",
+    embed = [":rustpostprocess_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "rustpostprocess_test",
+    srcs = ["main_test.go"],
+    embed = [":rustpostprocess_lib"],
+)

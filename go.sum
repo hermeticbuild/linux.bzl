@@ -1,4 +1,8 @@
-github.com/bazelbuild/bazel-gazelle v0.47.0 h1:g3Rr1ZbkC1Pk20aOgBITxSD/efS1WbaSty5jC786Z3Q=
-github.com/bazelbuild/bazel-gazelle v0.47.0/go.mod h1:8Ozf20jhv+in87nCUHdmUPPcVGTfKg/gotZ/hce3T+w=
+github.com/bazel-contrib/bazel-gazelle/v2 v2.0.0-2 h1:lSINS7DK4xjm0Z4CBd7onO63uIe6WUsEZ/0voExa+JY=
+github.com/bazel-contrib/bazel-gazelle/v2 v2.0.0-2/go.mod h1:B76PjnaM2KyUG8ypV/ePHHDmGbyUNZ2PCEdEQIJISQM=
+github.com/bazelbuild/bazel-gazelle v0.51.3 h1:WtLCDPJTj06AWZizuN0SpkX8njjH1meOFgYbia6mD64=
+github.com/bazelbuild/bazel-gazelle v0.51.3/go.mod h1:AeYjUGaxXcMZ51CYHBT1YK3Qxb2yrJl77A8g7GF6d+g=
 github.com/bazelbuild/buildtools v0.0.0-20251112105957-8e68360eeafa h1:IaOUNCNilQPM8o/igIpxzN34lfjPVYsZMiVFmMyKp/0=
 github.com/bazelbuild/buildtools v0.0.0-20251112105957-8e68360eeafa/go.mod h1:PLNUetjLa77TCCziPsz0EI8a6CUxgC+1jgmWv0H25tg=
+github.com/google/go-cmp v0.6.0 h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=
+github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=

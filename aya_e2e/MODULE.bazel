@@ -1,0 +1,38 @@
+module(
+    name = "linux_bzl_aya_e2e",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "aya", version = "0.0.0")
+bazel_dep(name = "linux.bzl", version = "0.1.0")
+bazel_dep(name = "llvm", version = "0.8.14")
+bazel_dep(name = "rules_rs", version = "0.0.98")
+
+archive_override(
+    module_name = "aya",
+    integrity = "sha256-TJUod2HC1bcWJKHoUXoiy8451sGF1um7qvrRXcS4oHw=",
+    patch_strip = 1,
+    patches = ["//patches:aya_linux_bzl_api.patch"],
+    strip_prefix = "aya-231e54f29f5de163924671029e72da4672eba274",
+    urls = ["https://github.com/dzbarsky/aya/archive/231e54f29f5de163924671029e72da4672eba274.tar.gz"],
+)
+
+local_path_override(
+    module_name = "linux.bzl",
+    path = "..",
+)
+
+rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+use_repo(rules_rust, "rules_rust")
+
+aya_rust_toolchains = use_extension(
+    "@rules_rs//rs/toolchains:module_extension.bzl",
+    "toolchains",
+)
+use_repo(
+    aya_rust_toolchains,
+    "aya_rust_toolchains",
+    "default_rust_toolchains",
+)
+
+register_toolchains("@aya_rust_toolchains//:all")

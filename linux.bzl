@@ -8,6 +8,7 @@ load("//internal:initramfs.bzl", _initramfs = "initramfs")
 load("//internal:kconfig.bzl", _linux_internal_kconfig_file = "kconfig_file")
 load("//internal:kernel_bundle.bzl", _linux_internal_kernel_exports = "linux_kernel_exports")
 load("//internal:kernel_repository_targets.bzl", _linux_internal_image_targets = "linux_image_targets")
+load("//internal:linux_modules.bzl", _linux_module = "linux_module")
 load(
     "//internal:linux_objects.bzl",
     _linux_internal_arm64_nvhe_object = "linux_arm64_nvhe_object",
@@ -25,6 +26,7 @@ visibility("public")
 LinuxKernelInfo = _LinuxKernelInfo
 initramfs = _initramfs
 linux_image = _linux_image
+linux_module = _linux_module
 linux_source_repository = _linux_source_repository
 
 # These aliases are an implementation protocol used only by BUILD files emitted

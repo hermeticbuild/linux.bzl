@@ -12,13 +12,23 @@ the rules module.
 2. Run `bazel test //...`, the standalone examples, and the Linux 6.12 and 6.18
    compatibility builds for x86_64 and aarch64.
 3. Boot all four maintained kernel/architecture pairs under hermetic QEMU and
-   verify that each reaches the initramfs userspace marker.
+   verify that each reaches the initramfs userspace marker. For module-enabled
+   configurations, also verify that the selected in-tree `.ko` loads.
 4. Build a named overlay and verify its kernel release and fixed output
    contract.
 5. Test a consumer that renames the `linux.bzl` module repository and loads
    `linux_image` only from the root `linux.bzl` entry point.
-6. Audit the pinned source URLs and integrities in the catalog.
-7. Audit `KCONFIG_TOOL_VERSION` and all six entries in
+6. On a Linux x86_64 executor with the registered stable Rust 1.97.0
+   toolchain, run
+   `bazel test //:linux_6_18_39_rust_module_test --test_output=streamed`
+   from `e2e`. This builds and loads a Rust-for-Linux module for an x86_64
+   Linux 6.18.x kernel. Also verify that cross-kernel dependencies and
+   `MODULE_VERSION`/module source-version metadata are rejected.
+7. From `aya_e2e`, run the pinned Aya x86_64 and aarch64 VM targets separately
+   with `--jobs=1 --nocache_test_results`, shutting down Bazel between targets
+   to bound the configured graph.
+8. Audit the pinned source URLs and integrities in the catalog.
+9. Audit `KCONFIG_TOOL_VERSION` and all six entries in
    `internal/kconfig_tool_releases.bzl`.
 
 When updating the generator, first publish deterministic
@@ -50,7 +60,19 @@ A release is ready only when:
 - Linux 6.12 and 6.18 build for x86_64 and aarch64 with the registered Bazel C++
   toolchains.
 - All four maintained kernel/architecture pairs boot under the registered QEMU
-  system toolchains and reach the initramfs userspace marker.
+  system toolchains, reach the initramfs userspace marker, and exercise
+  configured module loading.
+- The fixed `:modules`, `:module_symvers`, `:modules_order`,
+  `:modules_builtin`, and `:modules_builtin_modinfo` labels produce the
+  corresponding Kbuild artifacts.
+- Rust-for-Linux modules build for the documented x86_64 Linux 6.18.x target
+  on a Linux x86_64 executor with stable Rust 1.97.0 through the public
+  `linux_module` API. Cross-kernel module dependencies and
+  `MODULE_VERSION`/module source-version metadata fail explicitly.
+- The pinned Aya x86_64 and aarch64 VM tests pass from the standalone
+  `aya_e2e` module root.
+- BPF-syscall and BTF-enabled configurations are covered by a compatibility
+  build.
 - Repository generation is smoke-tested with all six host generator archives.
 - The base and named-overlay repositories produce the documented fixed outputs.
 - Unsupported Kbuild constructs and toolchain/config mismatches fail with
@@ -60,4 +82,5 @@ Version 0.1 intentionally gives named variants independent object graphs.
 Cross-variant action sharing is not a release requirement until the config
 input model can prove it correct.
 
-Signing kernel images or modules is outside the current release contract.
+Signing kernel images or modules, `MODULE_VERSION`/module source-version
+metadata, and device-tree artifacts are outside the current release contract.

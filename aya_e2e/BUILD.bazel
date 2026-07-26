@@ -1,0 +1,9 @@
+package(default_visibility = ["//visibility:public"])
+
+test_suite(
+    name = "aya_vm_tests",
+    tests = [
+        "@aya//test/integration-test:vm_aarch64",
+        "@aya//test/integration-test:vm_x86_64",
+    ],
+)

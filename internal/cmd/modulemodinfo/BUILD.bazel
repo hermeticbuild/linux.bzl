@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "modulemodinfo_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/modulemodinfo",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "modulemodinfo",
+    embed = [":modulemodinfo_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "modulemodinfo_test",
+    srcs = ["main_test.go"],
+    embed = [":modulemodinfo_lib"],
+)

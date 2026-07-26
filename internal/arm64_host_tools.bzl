@@ -41,14 +41,14 @@ def linux_arm64_host_tools(
     cc_binary(
         name = vdsomunge_tool,
         srcs = [source_label(source_repo, "arch/arm/vdso/vdsomunge.c")],
-        deps = [Label("@libelf//:elf_headers")],
+        deps = [Label("@elfutils//:elf")],
         visibility = visibility,
     )
 
     cc_binary(
         name = relacheck_tool,
         srcs = [source_label(source_repo, "arch/arm64/kernel/pi/relacheck.c")],
-        deps = [Label("@libelf//:elf_headers")],
+        deps = [Label("@elfutils//:elf")],
         visibility = visibility,
     )
 
@@ -76,6 +76,7 @@ def linux_arm64_host_tools(
         kallsyms_tool = common.kallsyms_tool,
         probe_config = common.probe_config,
         relacheck_tool = package_label(relacheck_tool),
+        resolve_btfids_tool = common.resolve_btfids_tool,
         source_asn1_compiler = common.source_asn1_compiler,
         source_label_package = common.source_label_package,
         source_repo = source_repo,
