@@ -19,6 +19,7 @@ gazelle(
 gazelle_test(
     name = "gazelle_test",
     extra_args = ["internal"],
+    tags = ["no-remote"],
     workspace = "//:MODULE.bazel",
 )
 

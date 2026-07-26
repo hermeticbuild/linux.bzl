@@ -79,6 +79,7 @@ func TestObjtoolArgsModule(t *testing.T) {
 func TestObjtoolArgsVmlinux(t *testing.T) {
 	t.Run("not_needed", func(t *testing.T) {
 		config := commonArgsConfig()
+		delete(config, "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL")
 		args, run, err := objtoolArgs(config, "vmlinux")
 		if err != nil {
 			t.Fatal(err)
@@ -88,8 +89,21 @@ func TestObjtoolArgsVmlinux(t *testing.T) {
 		}
 	})
 
+	t.Run("mcount_without_delay", func(t *testing.T) {
+		config := commonArgsConfig()
+		args, run, err := objtoolArgs(config, "vmlinux")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"--mcount", "--mnop", "--Werror", "--link"}
+		if !run || !reflect.DeepEqual(args, want) {
+			t.Fatalf("objtoolArgs() = (%q, %t), want (%q, true)", args, run, want)
+		}
+	})
+
 	t.Run("noinstr_without_delay", func(t *testing.T) {
 		config := commonArgsConfig()
+		delete(config, "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL")
 		config["CONFIG_NOINSTR_VALIDATION"] = "y"
 		config["CONFIG_MITIGATION_UNRET_ENTRY"] = "y"
 		args, run, err := objtoolArgs(config, "vmlinux")
