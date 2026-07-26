@@ -1,9 +1,6 @@
-// Copyright The Monogon Project Authors.
-// SPDX-License-Identifier: Apache-2.0
-
 package kconfig
 
-import "sort"
+import "slices"
 
 // kernelFlagsConfigSymbols is the set of CONFIG_* symbols consulted by
 // //internal/cmd/kernelflags when computing global compiler and assembler
@@ -60,8 +57,7 @@ var kernelFlagsConfigSymbols = []string{
 
 // KernelFlagsConfigSymbols returns a sorted copy of the global flag footprint.
 func KernelFlagsConfigSymbols() []string {
-	out := make([]string, len(kernelFlagsConfigSymbols))
-	copy(out, kernelFlagsConfigSymbols)
-	sort.Strings(out)
+	out := slices.Clone(kernelFlagsConfigSymbols)
+	slices.Sort(out)
 	return out
 }

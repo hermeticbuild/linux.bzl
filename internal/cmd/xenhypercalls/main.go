@@ -1,16 +1,14 @@
-// Copyright The Monogon Project Authors.
-// SPDX-License-Identifier: Apache-2.0
-
 package main
 
 import (
 	"bufio"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -60,11 +58,7 @@ func run(inputs []string, out string) error {
 		lines["HYPERCALL("+name+")"] = true
 	}
 
-	sorted := make([]string, 0, len(lines))
-	for line := range lines {
-		sorted = append(sorted, line)
-	}
-	sort.Strings(sorted)
+	sorted := slices.Sorted(maps.Keys(lines))
 
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return err

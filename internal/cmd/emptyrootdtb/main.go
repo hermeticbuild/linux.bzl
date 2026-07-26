@@ -1,6 +1,3 @@
-// Copyright The Monogon Project Authors.
-// SPDX-License-Identifier: Apache-2.0
-
 package main
 
 import (
@@ -26,9 +23,12 @@ const (
 func main() {
 	in := flag.String("in", "", "drivers/of/empty_root.dts input")
 	out := flag.String("out", "", "output dtb")
+	wrapperOut := flag.String("wrapper_out", "", "output assembly wrapper")
+	section := flag.String("section", "", "assembly section for the embedded dtb")
+	symbol := flag.String("symbol", "", "symbol prefix for the embedded dtb")
 	flag.Parse()
-	if *in == "" || *out == "" {
-		fmt.Fprintln(os.Stderr, "-in and -out are required")
+	if *in == "" || *out == "" || *wrapperOut == "" || *section == "" || *symbol == "" {
+		fmt.Fprintln(os.Stderr, "-in, -out, -wrapper_out, -section, and -symbol are required")
 		os.Exit(2)
 	}
 	data, err := os.ReadFile(*in)
@@ -45,6 +45,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "write output: %v\n", err)
 		os.Exit(1)
 	}
+	if err := os.WriteFile(*wrapperOut, []byte(assemblyWrapper(*out, *section, *symbol)), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "write assembly wrapper: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func assemblyWrapper(dtbPath, section, symbol string) string {
+	return fmt.Sprintf(`#include <asm-generic/vmlinux.lds.h>
+.section %s,"a"
+.balign STRUCT_ALIGNMENT
+.global %s_begin
+%s_begin:
+.incbin %q
+.global %s_end
+%s_end:
+.balign STRUCT_ALIGNMENT
+`, section, symbol, symbol, dtbPath, symbol, symbol)
 }
 
 func emptyRootDTB(source string) ([]byte, error) {

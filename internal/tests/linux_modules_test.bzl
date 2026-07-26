@@ -1,17 +1,27 @@
 """Analysis tests for the public Rust-for-Linux module rule."""
 
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts", "unittest")
-load(":linux_module_actions.bzl", "linux_module_actions")
-load(":linux_modules.bzl", "linux_module", "linux_modules_test_helpers")
-load(":providers.bzl", "LinuxModuleInfo", "LinuxModuleSdkInfo")
+load("//internal:linux_module_actions.bzl", "linux_module_actions")
+load("//internal:linux_modules.bzl", "linux_module")
+load("//internal:providers.bzl", "LinuxModuleInfo", "LinuxModuleSdkInfo")
 
-visibility("//...")
+visibility("private")
 
 def _fake_module_kernel_impl(ctx):
     module_symvers = ctx.actions.declare_file(ctx.label.name + ".Module.symvers")
     rustc = ctx.actions.declare_file(ctx.label.name + ".rustc")
     rustc_version_runner = ctx.actions.declare_file(ctx.label.name + ".rustcversionrun")
-    for output in [module_symvers, rustc, rustc_version_runner]:
+    rustc_cfg = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/include/generated/rustc_cfg")
+    target_spec = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/scripts/target.json")
+    rust_dir_anchor_file = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/rust/.anchor")
+    for output in [
+        module_symvers,
+        rustc,
+        rustc_cfg,
+        rustc_version_runner,
+        rust_dir_anchor_file,
+        target_spec,
+    ]:
         ctx.actions.write(output, "")
 
     return [
@@ -23,6 +33,7 @@ def _fake_module_kernel_impl(ctx):
                     "CONFIG_MODULES": "y",
                     "CONFIG_RUST": "y",
                 },
+                rustc_cfg = rustc_cfg,
             ),
             kernel_key = ctx.attr.kernel_key,
             module_symvers = module_symvers,
@@ -31,12 +42,16 @@ def _fake_module_kernel_impl(ctx):
                 enabled = True,
                 module_flags = [],
                 objtool = None,
-                objtree = "test-objtree",
+                objtree = target_spec.dirname.rsplit("/", 1)[0],
+                objtree_anchor = struct(file = target_spec, parents = 1),
+                rust_dir = rust_dir_anchor_file.dirname,
+                rust_dir_anchor = struct(file = rust_dir_anchor_file, parents = 0),
                 rustc = rustc,
                 rustc_env = {},
                 rustc_files = depset([rustc, rustc_version_runner]),
                 rustc_version = "1.97.0",
                 rustc_version_runner = rustc_version_runner,
+                target_spec = target_spec,
             ),
             version = "6.18.39",
         ),
@@ -102,18 +117,6 @@ def _module_command_flags_test_impl(ctx):
             "module.raw.o",
             "module.o",
             "module",
-        ),
-    )
-    asserts.equals(
-        env,
-        [
-            "--out-dir",
-            "out/module",
-            "--emit=obj=out/module/example.o.raw",
-        ],
-        linux_modules_test_helpers.external_rust_output_flags(
-            "out/module",
-            "out/module/example.o.raw",
         ),
     )
     return unittest.end(env)

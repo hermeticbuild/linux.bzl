@@ -10,9 +10,6 @@ on:
 permissions:
   contents: read
 
-env:
-  BUILDBUDDY_API_KEY: 4jtaxdhxtyu4ylxdEwI7
-
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -48,13 +45,20 @@ jobs:
         env:
           BAZEL_BEP: ${{ runner.temp }}/root-${{ matrix.bazel }}.bep.json
           BAZEL_LOG: ${{ runner.temp }}/root-${{ matrix.bazel }}.log
+          BAZEL_PATH_MAPPING: ${{ matrix.bazel == '9.1.0' && '--config=path-mapping' || '' }}
           BAZEL_PROFILE: ${{ runner.temp }}/root-${{ matrix.bazel }}.profile.gz
         run: |
-          set -o pipefail
+          set -euo pipefail
+          targets=(//...)
+          path_mapping_args=()
+          if [[ -n "${BAZEL_PATH_MAPPING}" ]]; then
+            targets+=(//internal/tests:path_mapping_test)
+            path_mapping_args+=("${BAZEL_PATH_MAPPING}")
+          fi
           bazel --host_jvm_args=-Xmx3g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-            test //... \
-            --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
+            test "${targets[@]}" \
+            "${path_mapping_args[@]}" \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -130,7 +134,7 @@ jobs:
           bazel --host_jvm_args=-Xmx3g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             build "${targets[@]}" \
-            --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
+            --config=path-mapping \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -186,6 +190,9 @@ jobs:
           - batch: linux-6.18-rust-x86_64
             title: Linux 6.18 Rust x86_64
             targets: "//:linux_6_18_39_rust_module_test"
+          - batch: linux-6.12-rust-x86_64
+            title: Linux 6.12 Rust x86_64
+            targets: "//:linux_6_12_96_rust_module_test"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -215,8 +222,7 @@ jobs:
           bazel --host_jvm_args=-Xmx3g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test "${targets[@]}" \
-            --nocache_test_results \
-            --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
+            --config=path-mapping \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -286,8 +292,7 @@ jobs:
           bazel --host_jvm_args=-Xmx3g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test '${{ matrix.target }}' \
-            --nocache_test_results \
-            --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" \
+            --config=path-mapping \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"

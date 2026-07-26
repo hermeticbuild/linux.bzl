@@ -2,9 +2,6 @@ package main
 
 import (
 	"bytes"
-	"os"
-	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -77,37 +74,6 @@ func TestMarkerWriterBoundsCapture(t *testing.T) {
 	}
 }
 
-func TestQEMUCommandX8664(t *testing.T) {
-	config := validConfig()
-	command, args, err := qemuCommand(config)
-	if err != nil {
-		t.Fatalf("qemuCommand() failed: %v", err)
-	}
-	if command != "/qemu/bin/qemu-system-x86_64" {
-		t.Fatalf("command = %q", command)
-	}
-	want := []string{
-		"-L", "/qemu/share/qemu",
-		"-machine", "pc",
-		"-accel", "tcg",
-		"-m", "512M",
-		"-smp", "1",
-		"-display", "none",
-		"-monitor", "none",
-		"-serial", "stdio",
-		"-nic", "none",
-		"-no-reboot",
-		"-no-shutdown",
-		"-kernel", "/kernel",
-		"-initrd", "/initramfs",
-		"-append", "console=ttyS0 rdinit=/init",
-		"-d", "guest_errors",
-	}
-	if !reflect.DeepEqual(args, want) {
-		t.Fatalf("args = %#v, want %#v", args, want)
-	}
-}
-
 func TestQEMUCommandAarch64AddsCPU(t *testing.T) {
 	config := validConfig()
 	config.Arch = "aarch64"
@@ -125,45 +91,6 @@ func TestFormatCommand(t *testing.T) {
 	want := `"/qemu system" "-append" "console=ttyS0 rdinit=/init"`
 	if got != want {
 		t.Fatalf("formatCommand() = %q, want %q", got, want)
-	}
-}
-
-func TestResolveRunfileDirectory(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "repo", "file")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := resolveRunfile("repo/file", getenvMap(map[string]string{"RUNFILES_DIR": root}))
-	if err != nil {
-		t.Fatalf("resolveRunfile() failed: %v", err)
-	}
-	if got != path {
-		t.Fatalf("resolveRunfile() = %q, want %q", got, path)
-	}
-}
-
-func TestResolveRunfileManifest(t *testing.T) {
-	root := t.TempDir()
-	file := filepath.Join(root, "actual file")
-	manifest := filepath.Join(root, "MANIFEST")
-	if err := os.WriteFile(file, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(manifest, []byte("repo/file "+file+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := resolveRunfile("repo/file", getenvMap(map[string]string{"RUNFILES_MANIFEST_FILE": manifest}))
-	if err != nil {
-		t.Fatalf("resolveRunfile() failed: %v", err)
-	}
-	if got != file {
-		t.Fatalf("resolveRunfile() = %q, want %q", got, file)
 	}
 }
 

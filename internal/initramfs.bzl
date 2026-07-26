@@ -1,5 +1,7 @@
 """Rule for constructing a Linux initramfs archive."""
 
+load(":path_mapping.bzl", "path_mapped_run")
+
 visibility("//...")
 
 def _archive_name(path, attribute):
@@ -84,7 +86,8 @@ def _initramfs_impl(ctx):
             fail("character_devices[%s] numbers must be unsigned 32-bit integers, got %s" % (path, device))
         args.add_all(["--character-device", path[1:], major, minor])
 
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         arguments = [args],
         executable = ctx.executable._generator,
         inputs = depset(inputs),

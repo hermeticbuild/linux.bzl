@@ -1,13 +1,11 @@
-// Copyright The Monogon Project Authors.
-// SPDX-License-Identifier: Apache-2.0
-
 package kconfig
 
 import (
 	"bufio"
 	"fmt"
 	"io"
-	"sort"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -130,8 +128,8 @@ func (t *Tree) definedSymbols() []*Symbol {
 		}
 		symbols = append(symbols, sym)
 	}
-	sort.Slice(symbols, func(i, j int) bool {
-		return symbols[i].Name < symbols[j].Name
+	slices.SortFunc(symbols, func(a, b *Symbol) int {
+		return strings.Compare(a.Name, b.Name)
 	})
 	return symbols
 }
@@ -299,8 +297,8 @@ func (t *Tree) choiceSymbols() []*Symbol {
 		choices = append(choices, sym.Choice)
 		seen[sym.Choice] = true
 	}
-	sort.SliceStable(choices, func(i, j int) bool {
-		return choices[i].Name < choices[j].Name
+	slices.SortStableFunc(choices, func(a, b *Symbol) int {
+		return strings.Compare(a.Name, b.Name)
 	})
 	return choices
 }
@@ -976,10 +974,5 @@ func compareOrdered[T ordered](left, right T, op string) bool {
 }
 
 func sortedConfigKeys(values map[string]string) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
+	return slices.Sorted(maps.Keys(values))
 }

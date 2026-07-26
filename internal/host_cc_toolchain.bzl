@@ -2,7 +2,7 @@
 
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 
-visibility("//internal")
+visibility("//internal/...")
 
 def host_cc_toolchain(ctx):
     return ctx.attr._host_cc_toolchain[cc_common.CcToolchainInfo]

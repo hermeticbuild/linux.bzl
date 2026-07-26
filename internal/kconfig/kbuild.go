@@ -1,14 +1,13 @@
-// Copyright The Monogon Project Authors.
-// SPDX-License-Identifier: Apache-2.0
-
 package kconfig
 
 import (
 	"bufio"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -3228,12 +3227,7 @@ func (c KbuildCondition) Refs() []string {
 				refs[ref] = true
 			}
 		}
-		out := make([]string, 0, len(refs))
-		for ref := range refs {
-			out = append(out, ref)
-		}
-		sort.Strings(out)
-		return out
+		return slices.Sorted(maps.Keys(refs))
 	default:
 		return nil
 	}

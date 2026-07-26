@@ -1,6 +1,6 @@
 """Private QEMU userspace boot test support for the compatibility workspace."""
 
-load("@kernel_rules//:linux.bzl", "LinuxKernelInfo")
+load("@linux.bzl", "LinuxKernelInfo")
 
 visibility("private")
 

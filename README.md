@@ -191,20 +191,22 @@ make the crate root unambiguous. `deps` accepts other `linux_module` targets
 built against the same configured kernel; cross-kernel dependencies are
 rejected.
 
-The initial Rust-for-Linux contract is intentionally narrower than the kernel
-image matrix: a Linux 6.18.x kernel targeting x86_64, a Linux x86_64 execution
-platform, `CONFIG_MODULES=y`, `CONFIG_RUST=y`, and the exact stable Rust 1.97.0
-toolchain registered by `linux.bzl`. Unsupported architectures, kernel lines,
-symbol versioning, LTO/CFI, sanitizers, and Rust debug/BTF configurations fail
-during analysis with an explicit diagnostic. `MODULE_VERSION` and module
-`version=` or `srcversion=` metadata are not supported.
+Rust-for-Linux support covers the cataloged Linux 6.12.x and 6.18.x kernels
+targeting x86_64. The repository generator derives each release's crate graph
+and flags from its kernel sources, while Bazel uses the exact stable Rust
+1.97.0 toolchain registered by `linux.bzl`. Unsupported architectures, symbol
+versioning, LTO/CFI, sanitizers, and Rust debug/BTF configurations fail during
+analysis with an explicit diagnostic. `MODULE_VERSION` and module `version=`
+or `srcversion=` metadata are not supported.
 
 The standalone end-to-end workspace compiles this path, boots the kernel under
 QEMU, inserts the resulting module, and checks its load marker:
 
 ```sh
 cd e2e
-bazel test //:linux_6_18_39_rust_module_test --test_output=streamed
+bazel test //:linux_6_12_96_rust_module_test \
+  //:linux_6_18_39_rust_module_test \
+  --test_output=streamed
 ```
 
 This rule builds a Rust-for-Linux `.ko`: native kernel code loaded through the
@@ -246,7 +248,7 @@ graph rejects a non-Clang C/C++ toolchain.
 | Config variants | Base fragment plus named overlay fragments |
 | Initramfs | Deterministic root-owned `newc` archives |
 | In-tree modules | Loadable `.ko` files plus Kbuild module metadata |
-| Out-of-tree modules | Rust-for-Linux `.ko` files on x86_64 Linux 6.18.x through `linux_module` |
+| Out-of-tree modules | Rust-for-Linux `.ko` files on cataloged x86_64 kernels through `linux_module` |
 | Kernel BPF/BTF | BPF syscall configurations and BTF-enabled `vmlinux` |
 | VM verification | Hermetic QEMU boots with initramfs and module-load checks |
 
@@ -464,30 +466,30 @@ The standalone compatibility suites exercise the runtime contracts:
 
 ```sh
 cd e2e
-bazel test //boot:init_test //cmd/qemuboot:qemuboot_test --jobs=1
+bazel test //boot:init_test //cmd/qemuboot:qemuboot_test
 bazel shutdown
 bazel test //:linux_6_12_96_x86_64_boot_test \
-  //:linux_6_12_96_x86_64_module_test --jobs=1 --nocache_test_results
+  //:linux_6_12_96_x86_64_module_test
 bazel shutdown
 bazel test //:linux_6_12_96_aarch64_boot_test \
-  //:linux_6_12_96_aarch64_module_test --jobs=1 --nocache_test_results
+  //:linux_6_12_96_aarch64_module_test
 bazel shutdown
 bazel test //:kernel_outputs_x86_64_build_test \
   //:linux_6_18_39_x86_64_boot_test \
-  //:linux_6_18_39_x86_64_module_test --jobs=1 --nocache_test_results
+  //:linux_6_18_39_x86_64_module_test
 bazel shutdown
 bazel test //:kernel_outputs_aarch64_build_test \
   //:linux_6_18_39_aarch64_boot_test \
-  //:linux_6_18_39_aarch64_module_test --jobs=1 --nocache_test_results
+  //:linux_6_18_39_aarch64_module_test
 bazel shutdown
-bazel test //:linux_6_18_39_rust_module_test \
-  --jobs=1 --nocache_test_results
+bazel test //:linux_6_12_96_rust_module_test \
+  //:linux_6_18_39_rust_module_test
 bazel shutdown
 
 cd ../aya_e2e
-bazel test @aya//test/integration-test:vm_x86_64 --jobs=1 --nocache_test_results
+bazel test @aya//test/integration-test:vm_x86_64
 bazel shutdown
-bazel test @aya//test/integration-test:vm_aarch64 --jobs=1 --nocache_test_results
+bazel test @aya//test/integration-test:vm_aarch64
 ```
 
 The e2e commands boot maintained kernels with a deterministic initramfs under

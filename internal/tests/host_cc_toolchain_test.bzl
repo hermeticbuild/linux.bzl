@@ -2,9 +2,9 @@
 
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
-load(":host_cc_toolchain.bzl", "host_cc_toolchain", "host_cc_toolchain_attr")
+load("//internal:host_cc_toolchain.bzl", "host_cc_toolchain", "host_cc_toolchain_attr")
 
-visibility("//internal")
+visibility("private")
 
 _HostCcToolchainInfo = provider(
     doc = "Target identities selected for kernel and host C actions.",

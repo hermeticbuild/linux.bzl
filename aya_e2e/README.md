@@ -1,8 +1,8 @@
 # Aya consumer tests
 
 This standalone module pins
-[`dzbarsky/aya`](https://github.com/dzbarsky/aya) at
-`231e54f29f5de163924671029e72da4672eba274` and runs Aya's upstream
+[`aya-rs/aya`](https://github.com/aya-rs/aya) at
+`412fe810cb9d933a3db42d7b427ad8290f969c3d` and runs Aya's upstream
 x86_64 and aarch64 integration VMs against the adjacent `linux.bzl`
 checkout.
 
@@ -13,9 +13,9 @@ by Rust-for-Linux kernel modules.
 Run each architecture in a fresh Bazel server to bound the configured graph:
 
 ```sh
-bazel test @aya//test/integration-test:vm_x86_64 --jobs=1 --nocache_test_results
+bazel test @aya//test/integration-test:vm_x86_64
 bazel shutdown
-bazel test @aya//test/integration-test:vm_aarch64 --jobs=1 --nocache_test_results
+bazel test @aya//test/integration-test:vm_aarch64
 ```
 
 `//:aya_vm_tests` remains an aggregate test suite for machines with enough

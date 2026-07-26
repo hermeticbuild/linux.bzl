@@ -1,6 +1,3 @@
-// Copyright The Monogon Project Authors.
-// SPDX-License-Identifier: Apache-2.0
-
 package main
 
 import (
@@ -8,8 +5,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -529,11 +528,7 @@ func linuxProbeShell(model string, values map[string]string) (func(context.Conte
 	if err != nil {
 		return nil, err
 	}
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(values))
 	for _, key := range keys {
 		if err := kconfig.ApplyLinuxProbeValue(&config, key, values[key]); err != nil {
 			return nil, err
@@ -633,11 +628,7 @@ func writeResolvedFlags(tree *kconfig.Tree, input, overlay, configMode, out stri
 }
 
 func resolvedFlagLines(resolved *kconfig.ResolvedConfig) []string {
-	keys := make([]string, 0, len(resolved.Effective))
-	for key := range resolved.Effective {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(resolved.Effective))
 	lines := make([]string, 0, len(keys))
 	for _, key := range keys {
 		if !resolved.ShouldWrite(key) {
@@ -681,11 +672,7 @@ func resolveConfigOptions(mode string) (kconfig.ResolveConfigOptions, error) {
 }
 
 func rustcCfgLines(tree *kconfig.Tree, resolved *kconfig.ResolvedConfig) []string {
-	keys := make([]string, 0, len(resolved.Effective))
-	for key := range resolved.Effective {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(resolved.Effective))
 
 	var lines []string
 	for _, key := range keys {
@@ -736,11 +723,7 @@ func unquoteKconfigString(value string) string {
 }
 
 func writeResolvedConfigOutputs(tree *kconfig.Tree, resolved *kconfig.ResolvedConfig, outputs resolvedConfigOutputs, kernelVersion string) error {
-	keys := make([]string, 0, len(resolved.Effective))
-	for key := range resolved.Effective {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(resolved.Effective))
 
 	configLines := make([]string, 0, len(keys))
 	headerLines := []string{

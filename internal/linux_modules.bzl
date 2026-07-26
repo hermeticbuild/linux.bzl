@@ -3,6 +3,12 @@
 load("@rules_cc//cc:find_cc_toolchain.bzl", "use_cc_toolchain")
 load(":linux_module_actions.bzl", "linux_module_actions")
 load(":linux_objects.bzl", "linux_module_cc_helpers")
+load(
+    ":path_mapping.bzl",
+    "add_directory_arg",
+    "directory_anchor",
+    "path_mapped_run",
+)
 load(":providers.bzl", "LinuxModuleInfo", "LinuxModuleSdkInfo", "LinuxVmlinuxInfo")
 
 visibility("//...")
@@ -23,14 +29,15 @@ def _link_module(ctx, target, preliminary, mod_object, module_common, module_lds
         "-r",
         "-Wl,--build-id=sha1",
         "-Wl,-z,noexecstack",
-        "-Wl,-T," + module_lds.path,
-        "-o",
-        out,
-        preliminary,
-        mod_object,
-        module_common,
     ])
-    ctx.actions.run(
+    args.add(module_lds, format = "-Wl,-T,%s")
+    args.add("-o")
+    args.add(out)
+    args.add(preliminary)
+    args.add(mod_object)
+    args.add(module_common)
+    path_mapped_run(
+        ctx.actions,
         executable = target.linker,
         inputs = depset(
             [preliminary, mod_object, module_common, module_lds],
@@ -89,23 +96,31 @@ def _compile_external_rust(ctx, sdk, crate_root, crate_name):
     args = ctx.actions.args()
     args.add("-cwd", ".")
     env = dict(rust.rustc_env)
-    env["OBJTREE"] = "{cwd}/" + rust.objtree
     modfile = ctx.label.package + "/" + crate_name if ctx.label.package else crate_name
     env["RUST_MODFILE"] = modfile
     for name in sorted(env.keys()):
         args.add("-env", name + "=" + env[name])
+    args.add("-env")
+    add_directory_arg(
+        args,
+        rust.objtree_anchor,
+        format = "OBJTREE={cwd}/%s",
+    )
     args.add("--")
     args.add(rust.rustc_version_runner)
     args.add("-expected")
     args.add(rust.rustc_version)
     args.add("--")
     args.add(rust.rustc)
-    args.add_all(rust.module_flags)
+    _add_rust_sdk_flags(args, sdk, rust.module_flags)
     args.add("--crate-name")
     args.add(crate_name)
-    args.add_all(_external_rust_output_flags(raw.dirname, raw.path))
+    args.add("--out-dir")
+    add_directory_arg(args, directory_anchor(raw))
+    args.add(raw, format = "--emit=obj=%s")
     args.add(crate_root)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._runincwd,
         inputs = depset(
             ctx.files.srcs,
@@ -130,12 +145,27 @@ def _compile_external_rust(ctx, sdk, crate_root, crate_name):
         "Processing Rust-for-Linux module with objtool %{label}",
     )
 
-def _external_rust_output_flags(output_dir, output_path):
-    return [
-        "--out-dir",
-        output_dir,
-        "--emit=obj=" + output_path,
-    ]
+def _add_rust_sdk_flags(args, sdk, flags):
+    rust = sdk.rust
+    for flag in flags:
+        if rust.target_spec.path in flag:
+            args.add(
+                rust.target_spec,
+                format = flag.replace("%", "%%").replace(rust.target_spec.path, "%s"),
+            )
+        elif sdk.config.rustc_cfg.path in flag:
+            args.add(
+                sdk.config.rustc_cfg,
+                format = flag.replace("%", "%%").replace(sdk.config.rustc_cfg.path, "%s"),
+            )
+        elif rust.rust_dir in flag:
+            add_directory_arg(
+                args,
+                rust.rust_dir_anchor,
+                format = flag.replace("%", "%%").replace(rust.rust_dir, "%s"),
+            )
+        else:
+            args.add(flag)
 
 def _check_external_modinfo(ctx, preliminary, crate_name):
     checked = ctx.actions.declare_file(
@@ -144,7 +174,8 @@ def _check_external_modinfo(ctx, preliminary, crate_name):
     check_args = ctx.actions.args()
     check_args.add("-in", preliminary)
     check_args.add("-out", checked)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._modulemodinfo,
         inputs = [preliminary],
         outputs = [checked],
@@ -180,7 +211,8 @@ def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check):
     mod_source = ctx.actions.declare_file(stage + "/" + crate_name + ".mod.c")
     module_symvers = ctx.actions.declare_file(stage + "/Module.symvers")
     args = ctx.actions.args()
-    args.add("-cwd", modules_order.dirname)
+    args.add("-cwd")
+    add_directory_arg(args, directory_anchor(modules_order))
     args.add("--")
     args.add(sdk.modpost)
     args.add_all(linux_module_actions.modpost_args(sdk.config))
@@ -194,7 +226,8 @@ def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check):
     args.add("Module.symvers")
     args.add("-T")
     args.add("modules.order")
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._runincwd,
         inputs = [
             staged_object,
@@ -214,7 +247,7 @@ def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check):
 def _compile_external_mod_source(ctx, sdk, source, crate_name):
     out = ctx.actions.declare_file(ctx.label.name + ".external/" + crate_name + ".mod.o")
     args = ctx.actions.args()
-    args.add_all(sdk.target_c_flags)
+    linux_module_actions.add_target_c_flags(args, sdk.target_c_flags)
     args.add_all(linux_module_cc_helpers.module_flags("m"))
     args.add_all(linux_module_cc_helpers.object_name_flags(
         crate_name + ".mod.o",
@@ -224,7 +257,8 @@ def _compile_external_mod_source(ctx, sdk, source, crate_name):
     args.add(source)
     args.add("-o")
     args.add(out)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = sdk.target.compiler,
         inputs = _sdk_target_inputs(sdk, [source]),
         outputs = [out],
@@ -240,8 +274,8 @@ def _linux_module_impl(ctx):
         fail("%s requires a kernel with CONFIG_MODULES=y" % ctx.label)
     if sdk.rust == None or not sdk.rust.enabled:
         fail("%s requires a kernel with CONFIG_RUST=y" % ctx.label)
-    if sdk.arch != "x86_64" or not sdk.version.startswith("6.18."):
-        fail("%s supports Rust modules only for x86_64 Linux 6.18.x" % ctx.label)
+    if sdk.arch != "x86_64":
+        fail("%s supports Rust modules only for x86_64 kernels" % ctx.label)
     if sdk.config.config_flags.get("CONFIG_DEBUG_INFO_BTF_MODULES") == "y":
         fail("%s does not yet support Rust module BTF" % ctx.label)
 
@@ -293,7 +327,8 @@ def _btf_module(ctx, vmlinux, linked, path, version):
     pahole_args = ctx.actions.args()
     pahole_args.add("-input", linked)
     pahole_args.add("-output", encoded)
-    pahole_args.add("-env", "LLVM_OBJCOPY=" + ctx.executable._llvm_objcopy.path)
+    pahole_args.add("-env")
+    pahole_args.add(ctx.executable._llvm_objcopy, format = "LLVM_OBJCOPY=%s")
     pahole_args.add("--")
     pahole_args.add(ctx.executable.pahole)
     pahole_args.add("-J")
@@ -301,7 +336,8 @@ def _btf_module(ctx, vmlinux, linked, path, version):
     pahole_args.add("--btf_base")
     pahole_args.add(vmlinux.vmlinux)
     pahole_args.add("{output}")
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._btfmutate,
         inputs = [linked, vmlinux.vmlinux],
         tools = [ctx.attr.pahole[DefaultInfo].files_to_run, ctx.attr._llvm_objcopy[DefaultInfo].files_to_run],
@@ -320,7 +356,8 @@ def _btf_module(ctx, vmlinux, linked, path, version):
     resolve_args.add("-b")
     resolve_args.add(vmlinux.vmlinux)
     resolve_args.add("{output}")
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._btfmutate,
         inputs = [encoded, vmlinux.vmlinux],
         tools = [ctx.attr.resolve_btfids_tool[DefaultInfo].files_to_run],
@@ -347,7 +384,8 @@ def _builtin_module_metadata(ctx, vmlinux):
         vmlinux.vmlinux_unstripped,
         raw,
     ])
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._llvm_objcopy,
         inputs = [vmlinux.vmlinux_unstripped],
         outputs = [raw],
@@ -362,7 +400,8 @@ def _builtin_module_metadata(ctx, vmlinux):
     metadata_args.add("-input", raw)
     metadata_args.add("-modinfo_out", modules_builtin_modinfo)
     metadata_args.add("-modules_out", modules_builtin)
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._builtinmodinfo,
         inputs = [raw],
         outputs = [modules_builtin, modules_builtin_modinfo],
@@ -588,7 +627,3 @@ def linux_module(
         srcs = srcs,
         **kwargs
     )
-
-linux_modules_test_helpers = struct(
-    external_rust_output_flags = _external_rust_output_flags,
-)

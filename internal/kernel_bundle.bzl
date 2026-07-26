@@ -4,7 +4,7 @@ load(":linux_objects.bzl", "LinuxConfigInfo")
 load(":platform_transition_gateway.bzl", "linux_platform_gateway")
 load(":providers.bzl", "LinuxKernelInfo", "LinuxModuleSdkInfo")
 
-visibility("//...")
+visibility("public")
 
 _PROJECTION_FIELDS = [
     "config",

@@ -1,6 +1,3 @@
-// Copyright The Monogon Project Authors.
-// SPDX-License-Identifier: Apache-2.0
-
 package main
 
 import (
@@ -8,6 +5,24 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestAssemblyWrapper(t *testing.T) {
+	got := assemblyWrapper(
+		"bazel-out/pm/bin/kernel/empty_root.dtb",
+		".rodata",
+		"__dtb_empty_root",
+	)
+	for _, want := range []string{
+		`.section .rodata,"a"`,
+		`.global __dtb_empty_root_begin`,
+		`.incbin "bazel-out/pm/bin/kernel/empty_root.dtb"`,
+		`.global __dtb_empty_root_end`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("assemblyWrapper() missing %q:\n%s", want, got)
+		}
+	}
+}
 
 func TestEmptyRootDTBLinux618(t *testing.T) {
 	dtb, err := emptyRootDTB(`/dts-v1/;

@@ -3,7 +3,8 @@ package kconfig
 import (
 	"bytes"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 
 	bzl "github.com/bazelbuild/buildtools/build"
 
@@ -85,19 +86,9 @@ func exportsFilesStmt(files []string) bzl.Expr {
 }
 
 func sortedKeys(values map[string]bool) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
+	return slices.Sorted(maps.Keys(values))
 }
 
 func sortedLoadModules(values map[string]map[string]bool) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
+	return slices.Sorted(maps.Keys(values))
 }

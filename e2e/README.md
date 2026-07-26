@@ -2,17 +2,17 @@
 
 This is a standalone Bzlmod workspace for exercising `linux.bzl` against the
 catalog-backed Linux 6.12.96 and 6.18.39 source archives and
-repository-generated x86_64 and aarch64 kernel graphs. It deliberately renames
-both the rules and LLVM repositories to cover Bzlmod repository mappings across
-generated BUILD files.
+repository-generated x86_64 and aarch64 kernel graphs. It uses the canonical
+`@linux.bzl` API entry point while retaining a renamed LLVM repository to cover
+Bzlmod repository mappings across generated BUILD files.
 
 Build the real `:kernel`, `:image`, `:vmlinux`, `:config`, `:system_map`, and
 `:kernel_release` outputs one architecture at a time:
 
 ```sh
-bazel test //:kernel_outputs_x86_64_build_test --jobs=1
+bazel test //:kernel_outputs_x86_64_build_test
 bazel shutdown
-bazel test //:kernel_outputs_aarch64_build_test --jobs=1
+bazel test //:kernel_outputs_aarch64_build_test
 ```
 
 Build and boot the catalog releases under TCG in bounded batches. Each
@@ -20,24 +20,24 @@ Build and boot the catalog releases under TCG in bounded batches. Each
 server's analysis memory:
 
 ```sh
-bazel test //boot:init_test //cmd/qemuboot:qemuboot_test --jobs=1
+bazel test //boot:init_test //cmd/qemuboot:qemuboot_test
 bazel shutdown
 bazel test //:linux_6_12_96_x86_64_boot_test \
-  //:linux_6_12_96_x86_64_module_test --jobs=1 --nocache_test_results
+  //:linux_6_12_96_x86_64_module_test
 bazel shutdown
 bazel test //:linux_6_12_96_aarch64_boot_test \
-  //:linux_6_12_96_aarch64_module_test --jobs=1 --nocache_test_results
+  //:linux_6_12_96_aarch64_module_test
 bazel shutdown
 bazel test //:kernel_outputs_x86_64_build_test \
   //:linux_6_18_39_x86_64_boot_test \
-  //:linux_6_18_39_x86_64_module_test --jobs=1 --nocache_test_results
+  //:linux_6_18_39_x86_64_module_test
 bazel shutdown
 bazel test //:kernel_outputs_aarch64_build_test \
   //:linux_6_18_39_aarch64_boot_test \
-  //:linux_6_18_39_aarch64_module_test --jobs=1 --nocache_test_results
+  //:linux_6_18_39_aarch64_module_test
 bazel shutdown
-bazel test //:linux_6_18_39_rust_module_test \
-  --jobs=1 --nocache_test_results
+bazel test //:linux_6_12_96_rust_module_test \
+  //:linux_6_18_39_rust_module_test
 ```
 
 The four `*_boot_test` targets pair each kernel with an initramfs containing a
@@ -49,18 +49,20 @@ starts. Run one matrix entry directly while debugging:
 bazel test //:linux_6_12_96_x86_64_boot_test --test_output=streamed
 ```
 
-The Rust fixture enables `CONFIG_RUST` on Linux 6.18.x targeting x86_64, builds
-`rust_test_module.rs` through the public `linux_module` rule, inserts the
-resulting `.ko`, and checks the module-load marker:
+The Rust fixtures enable `CONFIG_RUST` on Linux 6.12.x and 6.18.x targeting
+x86_64, build version-native module sources through the public `linux_module`
+rule, insert the resulting `.ko`, and check the module-load marker:
 
 ```sh
-bazel test //:linux_6_18_39_rust_module_test --test_output=streamed
+bazel test //:linux_6_12_96_rust_module_test \
+  //:linux_6_18_39_rust_module_test \
+  --test_output=streamed
 ```
 
 Rust-for-Linux actions require a Linux x86_64 executor and the registered
 stable Rust 1.97.0 toolchain. They intentionally fail for other kernel
-versions, target architectures, unsupported instrumentation paths, or module
-sources that emit `MODULE_VERSION`, `version=`, or `srcversion=` metadata.
+target architectures, unsupported instrumentation paths, or module sources
+that emit `MODULE_VERSION`, `version=`, or `srcversion=` metadata.
 
 Build one fixed output directly:
 

@@ -2,6 +2,12 @@
 
 load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
 load(":kconfig.bzl", "KconfigInfo")
+load(
+    ":path_mapping.bzl",
+    "add_directory_arg",
+    "directory_anchor",
+    "path_mapped_run",
+)
 
 visibility("//...")
 
@@ -23,16 +29,6 @@ LinuxCompactInfo = provider(
         "object_label_package": "Package label path used by image BUILD files to reference object variants.",
     },
 )
-
-def _execroot_path(file):
-    path = file.short_path.replace("\\", "/")
-    if path.startswith("../"):
-        return "external/" + path[3:]
-    return path
-
-def _execroot_dir(file):
-    path = _execroot_path(file)
-    return path.rsplit("/", 1)[0] if "/" in path else ""
 
 def _linux_probe_config_impl(ctx):
     return [LinuxProbeInfo(
@@ -110,14 +106,15 @@ def _linux_compact_outputs_impl(ctx):
     args.add("-linux_objects_load", ctx.attr.linux_objects_load)
     env = dict(ctx.attr.env)
     vars = dict(ctx.attr.vars)
+    directory_vars = {}
     if "srctree" not in vars:
-        vars["srctree"] = _execroot_dir(ctx.file.root)
+        vars["srctree"] = ""
+        directory_vars["srctree"] = directory_anchor(ctx.file.root)
 
     probe = _probe_settings(ctx, env)
     _add_probe_args(args, probe.allow_shell, probe.model, probe.values)
 
-    for key, value in sorted(vars.items()):
-        args.add("-var", "%s=%s" % (key, value))
+    _add_var_args(args, vars, directory_vars)
     for key, value in sorted(env.items()):
         args.add("-env", "%s=%s" % (key, value))
     for visibility in ctx.attr.generated_visibility:
@@ -135,7 +132,7 @@ def _linux_compact_outputs_impl(ctx):
         seen_config_names[ctx.attr.config_name] = True
     for target, name in ctx.attr.configs.items():
         if name in seen_config_names:
-            fail("duplicate compact config name %q" % name)
+            fail("duplicate compact config name %r" % name)
         seen_config_names[name] = True
         file = _config_file(target, "configs")
         configs.append((name, file))
@@ -143,9 +140,11 @@ def _linux_compact_outputs_impl(ctx):
     if not configs:
         fail("at least one compact config must be provided")
     for name, file in sorted(configs):
-        args.add("-config", "%s=%s" % (name, file.path))
+        args.add("-config")
+        args.add(file, format = name + "=%s")
 
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._kconfig_parse,
         inputs = depset(inputs),
         outputs = [
@@ -303,8 +302,11 @@ def _linux_parser_validation_impl(ctx):
     env = dict(ctx.attr.env)
     vars = dict(ctx.attr.vars)
     source_root = ctx.file.source_root.dirname
+    source_root_anchor = directory_anchor(ctx.file.source_root, source_root)
+    directory_vars = {}
     if "srctree" not in vars:
-        vars["srctree"] = source_root
+        vars["srctree"] = ""
+        directory_vars["srctree"] = source_root_anchor
 
     probe = _probe_settings(ctx, env)
 
@@ -314,7 +316,7 @@ def _linux_parser_validation_impl(ctx):
     kconfigs = []
     for target, name in ctx.attr.kconfigs.items():
         if name in seen_names:
-            fail("duplicate parser validation name %q" % name)
+            fail("duplicate parser validation name %r" % name)
         seen_names[name] = True
         kconfigs.append((name, _single_file(target, "kconfigs")))
     for name, file in sorted(kconfigs):
@@ -330,16 +332,18 @@ source "scripts/Kconfig.include"
 source "%s"
 """ % root,
             )
-            root = root_file.path
+            root = root_file
             inputs.append(root_file)
         args = ctx.actions.args()
         args.add("-root", root)
-        args.add("-srctree", source_root)
+        args.add("-srctree")
+        add_directory_arg(args, source_root_anchor)
         _add_probe_args(args, probe.allow_shell, probe.model, probe.values)
-        _add_var_args(args, vars)
+        _add_var_args(args, vars, directory_vars)
         _add_env_args(args, env)
         args.add("-out", out)
-        ctx.actions.run(
+        path_mapped_run(
+            ctx.actions,
             executable = ctx.executable._kconfig_parse,
             inputs = depset(inputs),
             outputs = [out],
@@ -352,7 +356,7 @@ source "%s"
     kbuilds = []
     for target, name in ctx.attr.kbuilds.items():
         if name in seen_names:
-            fail("duplicate parser validation name %q" % name)
+            fail("duplicate parser validation name %r" % name)
         seen_names[name] = True
         kbuilds.append((name, _single_file(target, "kbuilds")))
     for name, file in sorted(kbuilds):
@@ -361,13 +365,15 @@ source "%s"
         args.add("-kbuild", file)
         if ctx.attr.kbuild_recursive:
             args.add("-kbuild_recursive")
-            args.add("-kbuild_srctree", source_root)
-            _add_var_args(args, vars)
+            args.add("-kbuild_srctree")
+            add_directory_arg(args, source_root_anchor)
+            _add_var_args(args, vars, directory_vars)
         args.add("-kbuild_out", out)
         inputs = [file]
         if ctx.attr.kbuild_recursive:
             inputs = [file, ctx.file.source_root] + ctx.files.srcs
-        ctx.actions.run(
+        path_mapped_run(
+            ctx.actions,
             executable = ctx.executable._kconfig_parse,
             inputs = depset(inputs),
             outputs = [out],
@@ -432,27 +438,32 @@ _linux_parser_validation = rule(
 
 def _linux_kbuild_tree_validation_impl(ctx):
     source_root = ctx.file.source_root.dirname
+    source_root_anchor = directory_anchor(ctx.file.source_root, source_root)
     vars = dict(ctx.attr.vars)
+    directory_vars = {}
     if "srctree" not in vars:
-        vars["srctree"] = source_root
+        vars["srctree"] = ""
+        directory_vars["srctree"] = source_root_anchor
 
     out = ctx.actions.declare_file(ctx.label.name + ".kbuild_tree.json")
     args = ctx.actions.args()
-    args.add("-kbuild_tree_root", source_root)
+    args.add("-kbuild_tree_root")
+    add_directory_arg(args, source_root_anchor)
     args.add("-kbuild_tree_out", out)
     if ctx.attr.min_files:
         args.add("-kbuild_tree_min_count", ctx.attr.min_files)
-    _add_var_args(args, vars)
+    _add_var_args(args, vars, directory_vars)
     for exclude in ctx.attr.excludes:
         args.add("-kbuild_tree_exclude", exclude)
 
-    ctx.actions.run(
+    path_mapped_run(
+        ctx.actions,
         executable = ctx.executable._kconfig_parse,
         inputs = depset([ctx.file.source_root] + ctx.files.srcs),
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxKbuildTreeParseValidation",
-        progress_message = "Validating all Linux Kbuild/Makefile files under %s" % source_root,
+        progress_message = "Validating Linux Kbuild/Makefile files for %{label}",
     )
 
     return [DefaultInfo(files = depset([out]))]
@@ -571,6 +582,7 @@ def linux_compact_buildfiles(
         source_tree_scripts_headers_labels = source_tree_scripts_headers_labels,
         source_tree_uapi_headers_labels = source_tree_uapi_headers_labels,
         srcs = srcs,
+        tags = tags,
         target_compatible_with = target_compatible_with,
         vars = vars,
         visibility = visibility,
@@ -706,9 +718,14 @@ def _config_file(target, attr_name):
         return target[KconfigInfo].config
     return _single_file(target, attr_name)
 
-def _add_var_args(args, vars):
+def _add_var_args(args, vars, directory_vars = {}):
     for key, value in sorted(vars.items()):
-        args.add("-var", "%s=%s" % (key, value))
+        args.add("-var")
+        anchor = directory_vars.get(key)
+        if anchor == None:
+            args.add("%s=%s" % (key, value))
+        else:
+            add_directory_arg(args, anchor, format = key + "=%s")
 
 def _add_env_args(args, env):
     for key, value in sorted(env.items()):
@@ -775,6 +792,7 @@ def _sanitize_output_fragment(value):
 
 def _source_relative_path(file, source_root):
     prefix = source_root + "/"
-    if file.path.startswith(prefix):
-        return file.path[len(prefix):]
-    return file.path
+    path = file.path
+    if path.startswith(prefix):
+        return path[len(prefix):]
+    return path

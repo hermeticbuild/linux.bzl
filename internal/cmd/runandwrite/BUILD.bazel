@@ -1,4 +1,4 @@
-load("@rules_go//go:def.bzl", "go_binary", "go_library")
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
     name = "runandwrite_lib",
@@ -11,4 +11,10 @@ go_binary(
     name = "runandwrite",
     embed = [":runandwrite_lib"],
     visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "runandwrite_test",
+    srcs = ["main_test.go"],
+    embed = [":runandwrite_lib"],
 )

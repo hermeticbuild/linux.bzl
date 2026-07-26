@@ -1,5 +1,5 @@
 load("@linux.bzl", "initramfs")
-load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_go//go:def.bzl", "go_test")
 
 initramfs(
     name = "archive",
@@ -45,15 +45,16 @@ initramfs(
     },
 )
 
-cc_test(
+go_test(
     name = "initramfs_test",
-    srcs = ["initramfs_test.c"],
+    srcs = ["initramfs_test.go"],
     args = [
-        "$(location :archive)",
-        "$(location :archive_reordered)",
+        "$(rlocationpath :archive)",
+        "$(rlocationpath :archive_reordered)",
     ],
     data = [
         ":archive",
         ":archive_reordered",
     ],
+    deps = ["@rules_go//go/runfiles"],
 )
