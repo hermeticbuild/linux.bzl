@@ -13,13 +13,34 @@ import (
 	"sort"
 	"strings"
 
-	"linux.bzl/internal/kconfig/buildgen"
+	"github.com/hermeticbuild/linux.bzl/internal/kconfig/buildgen"
 )
 
 type NamedConfig struct {
 	Name        string
 	Flags       map[string]string
 	AllNoConfig bool
+}
+
+type CompactSchema string
+
+const (
+	CompactSchemaV011 CompactSchema = "v0.0.11"
+	CompactSchemaV012 CompactSchema = "v0.0.12"
+)
+
+func ParseCompactSchema(value string) (CompactSchema, error) {
+	schema := CompactSchema(value)
+	switch schema {
+	case CompactSchemaV011, CompactSchemaV012:
+		return schema, nil
+	default:
+		return "", fmt.Errorf("unsupported compact schema %q (want %q or %q)", value, CompactSchemaV011, CompactSchemaV012)
+	}
+}
+
+func (s CompactSchema) isV012() bool {
+	return s == CompactSchemaV012
 }
 
 type CompactMetadata struct {
@@ -40,6 +61,7 @@ type CompactObjectVariant struct {
 	Package        string            `json:"package,omitempty"`
 	Object         string            `json:"object"`
 	Source         string            `json:"source,omitempty"`
+	SourceIncludes []string          `json:"source_includes,omitempty"`
 	Mode           string            `json:"mode"`
 	ModName        string            `json:"modname,omitempty"`
 	Flags          []string          `json:"flags,omitempty"`
@@ -55,6 +77,7 @@ type CompactObjectPackage struct {
 }
 
 type CompactBuildFileOptions struct {
+	Schema                   CompactSchema
 	Arch                     string
 	Visibility               []string
 	RuleLoadLabel            string
@@ -69,6 +92,8 @@ type CompactBuildFileOptions struct {
 	SourceTreeGlobalHeaders  []string
 	SourceTreeHeaders        []string
 	SourceTreeKbuildFiles    []string
+	SourceTreeLocalIncludes  []string
+	SourceTreeLookupFiles    []string
 	SourceTreeScriptsHeaders []string
 	SourceTreeUapiHeaders    []string
 	GeneratedHeaders         string
@@ -77,6 +102,7 @@ type CompactBuildFileOptions struct {
 }
 
 type CompactImageBuildFileOptions struct {
+	Schema             CompactSchema
 	Arch               string
 	Visibility         []string
 	ObjectLabelPackage string
@@ -91,15 +117,21 @@ func (opts CompactBuildFileOptions) hasSourceTreeLabels() bool {
 		len(opts.SourceTreeGlobalHeaders) != 0 ||
 		len(opts.SourceTreeHeaders) != 0 ||
 		len(opts.SourceTreeKbuildFiles) != 0 ||
+		len(opts.SourceTreeLocalIncludes) != 0 ||
+		len(opts.SourceTreeLookupFiles) != 0 ||
 		len(opts.SourceTreeScriptsHeaders) != 0 ||
 		len(opts.SourceTreeUapiHeaders) != 0
 }
 
 type CompactMetadataOptions struct {
+	Schema      CompactSchema
 	ObjectDir   string
 	SourceRoot  string
 	SourceRoots map[string]string
 	LibraryDirs []string
+	// Srcarch selects architecture include roots while scanning source files for
+	// CONFIG_* dependencies.
+	Srcarch string
 }
 
 func (t *Tree) CompactMetadata(kb *KbuildFile, configs []NamedConfig) (*CompactMetadata, error) {
@@ -145,6 +177,10 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 	out := &CompactMetadata{}
 	seenConfigs := map[string]bool{}
 	seenImageTargets := map[string]string{}
+	var scanner *configSourceScanner
+	if opts.Schema.isV012() {
+		scanner = newConfigSourceScanner(opts)
+	}
 	for _, named := range configs {
 		if named.Name == "" {
 			return nil, fmt.Errorf("compact config name must not be empty")
@@ -169,7 +205,10 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 		objects := kb.resolvedObjects(resolved)
 		resolvedVariants := compactVariantMemo{}
 		for _, object := range objects.all() {
-			variant, err := resolvedVariants.variantFor(object.object, resolved, opts, objects)
+			if opts.Schema.isV012() && rustSDKOwnsObject(object.object) {
+				continue
+			}
+			variant, err := resolvedVariants.variantFor(object.object, resolved, opts, objects, scanner)
 			if err != nil {
 				return nil, err
 			}
@@ -189,6 +228,9 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 		moduleTargets := make([]string, 0, len(objects.roots))
 		appendRootTargets := func(roots []resolvedKbuildObject) error {
 			for _, object := range roots {
+				if opts.Schema.isV012() && rustSDKOwnsObject(object.object) {
+					continue
+				}
 				variant, ok := resolvedVariants[object.object]
 				if !ok {
 					return fmt.Errorf("internal error: missing resolved variant for %q", object.object)
@@ -231,6 +273,14 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 	out.ObjectPackages = compactObjectPackages(out.ObjectVariants)
 	sort.Slice(out.Configs, func(i, j int) bool { return out.Configs[i].Name < out.Configs[j].Name })
 	return out, nil
+}
+
+// The Rust-for-Linux support crates have a configuration-specific build graph
+// that does not follow the ordinary one-source-to-one-object Kbuild model.
+// Bazel builds them as a dedicated SDK and injects their objects into vmlinux.
+func rustSDKOwnsObject(object string) bool {
+	object = strings.TrimPrefix(filepath.ToSlash(filepath.Clean(object)), "./")
+	return strings.HasPrefix(object, "rust/")
 }
 
 func imageObjectTargetsForVariant(variant CompactObjectVariant, variantsByTarget map[string]CompactObjectVariant) ([]string, error) {
@@ -320,8 +370,13 @@ func cleanKbuildDir(dir string) string {
 }
 
 func (v CompactObjectVariant) equal(other CompactObjectVariant) bool {
-	if v.Target != other.Target || v.Package != other.Package || v.Object != other.Object || v.Source != other.Source || v.Mode != other.Mode || v.ModName != other.ModName || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ConfigFragment) != len(other.ConfigFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
+	if v.Target != other.Target || v.Package != other.Package || v.Object != other.Object || v.Source != other.Source || v.Mode != other.Mode || v.ModName != other.ModName || len(v.SourceIncludes) != len(other.SourceIncludes) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ConfigFragment) != len(other.ConfigFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
 		return false
+	}
+	for i := range v.SourceIncludes {
+		if v.SourceIncludes[i] != other.SourceIncludes[i] {
+			return false
+		}
 	}
 	for i := range v.Flags {
 		if v.Flags[i] != other.Flags[i] {
@@ -788,11 +843,11 @@ func (objects resolvedKbuildObjects) all() []resolvedKbuildObject {
 
 type compactVariantMemo map[string]CompactObjectVariant
 
-func (memo compactVariantMemo) variantFor(name string, config *ResolvedConfig, opts CompactMetadataOptions, objects resolvedKbuildObjects) (CompactObjectVariant, error) {
-	return memo.variantForStack(name, config, opts, objects, map[string]bool{})
+func (memo compactVariantMemo) variantFor(name string, config *ResolvedConfig, opts CompactMetadataOptions, objects resolvedKbuildObjects, scanner *configSourceScanner) (CompactObjectVariant, error) {
+	return memo.variantForStack(name, config, opts, objects, scanner, map[string]bool{})
 }
 
-func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConfig, opts CompactMetadataOptions, objects resolvedKbuildObjects, stack map[string]bool) (CompactObjectVariant, error) {
+func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConfig, opts CompactMetadataOptions, objects resolvedKbuildObjects, scanner *configSourceScanner, stack map[string]bool) (CompactObjectVariant, error) {
 	if variant, ok := memo[name]; ok {
 		return variant, nil
 	}
@@ -806,7 +861,7 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 	stack[name] = true
 	members := make([]string, 0, len(object.members))
 	for _, member := range object.members {
-		variant, err := memo.variantForStack(member, config, opts, objects, stack)
+		variant, err := memo.variantForStack(member, config, opts, objects, scanner, stack)
 		if err != nil {
 			return CompactObjectVariant{}, err
 		}
@@ -827,7 +882,7 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 			if _, ok := objects.byName[dep]; !ok {
 				continue
 			}
-			variant, err := memo.variantForStack(dep, config, opts, objects, stack)
+			variant, err := memo.variantForStack(dep, config, opts, objects, scanner, stack)
 			if err != nil {
 				return CompactObjectVariant{}, err
 			}
@@ -836,29 +891,96 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 		sort.Strings(deps)
 	}
 
-	variant := object.variant(config, source, members, deps, opts.SourceRoot)
+	var sourceRefs, sourceIncludes []string
+	if opts.Schema.isV012() {
+		flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(object.flags, source), opts.SourceRoot)
+		sourceRefs = scanner.refsForSource(source, includeDirsFromFlags(flags))
+		sourceIncludes = scanner.sourceIncludesForSource(source, includeDirsFromFlags(flags))
+		if isMultiSourceImageObject(name) {
+			sourceRefs = append(sourceRefs, scanner.refsForSourceDir(objectPackage(name))...)
+		}
+	}
+	variant := object.variant(config, source, sourceIncludes, members, deps, opts.SourceRoot, sourceRefs, opts.Schema.isV012())
 	memo[name] = variant
 	return variant, nil
 }
 
-func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, members, deps []string, sourceRoot string) CompactObjectVariant {
+func isMultiSourceImageObject(object string) bool {
+	return strings.HasPrefix(object, "arch/x86/entry/vdso/vdso-image-") ||
+		object == "arch/x86/realmode/rmpiggy.o" ||
+		object == "arch/x86/purgatory/kexec-purgatory.o"
+}
+
+func objectNeedsFullConfig(object string) bool {
+	return object == "arch/x86/purgatory/kexec-purgatory.o"
+}
+
+func includeDirsFromFlags(flags []string) []string {
+	var dirs []string
+	for i := 0; i < len(flags); i++ {
+		path := ""
+		if flags[i] == "-I" && i+1 < len(flags) {
+			path = flags[i+1]
+			i++
+		} else if rest, ok := strings.CutPrefix(flags[i], "-I"); ok {
+			path = rest
+		} else {
+			continue
+		}
+		path = strings.TrimSpace(path)
+		if path == "$(srctree)" {
+			dirs = append(dirs, "")
+		} else if rel, ok := strings.CutPrefix(path, "$(srctree)/"); ok {
+			dirs = append(dirs, rel)
+		}
+	}
+	return dirs
+}
+
+func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, sourceIncludes, members, deps []string, sourceRoot string, sourceRefs []string, v012 bool) CompactObjectVariant {
 	fragment := map[string]string{}
-	refs := make([]string, 0, len(o.footprint))
+	refset := make(map[string]bool, len(o.footprint)+len(sourceRefs))
 	for ref := range o.footprint {
+		refset[ref] = true
+	}
+	if v012 {
+		for _, ref := range sourceRefs {
+			refset[ref] = true
+		}
+		if source != "" {
+			for _, ref := range KernelFlagsConfigSymbols() {
+				refset[ref] = true
+			}
+		}
+		if objectNeedsFullConfig(o.object) {
+			for key, written := range config.Written {
+				if written {
+					refset[key] = true
+				}
+			}
+		}
+	}
+	refs := make([]string, 0, len(refset))
+	for ref := range refset {
 		refs = append(refs, ref)
 	}
 	sort.Strings(refs)
 	for _, ref := range refs {
-		fragment[ref] = config.Value(ref)
+		if !v012 || config.ShouldWrite(ref) {
+			fragment[ref] = config.Value(ref)
+		} else {
+			fragment[ref] = "n"
+		}
 	}
 	flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.flags, source), sourceRoot)
 	remove := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.remove, source), sourceRoot)
-	hash := objectVariantHash(o.object, o.mode, o.modname, flags, remove, fragment, deps, members)
+	hash := objectVariantHash(o.object, o.mode, o.modname, flags, remove, fragment, sourceIncludes, deps, members)
 	return CompactObjectVariant{
 		Target:         sanitizeTargetName(strings.TrimSuffix(o.object, ".o")) + "__" + hash,
 		Package:        objectPackage(o.object),
 		Object:         o.object,
 		Source:         source,
+		SourceIncludes: append([]string(nil), sourceIncludes...),
 		Mode:           o.mode,
 		ModName:        o.modname,
 		Flags:          flags,
@@ -1123,7 +1245,7 @@ func objectPackage(object string) string {
 	return dir
 }
 
-func objectVariantHash(object, mode, modname string, flags, removeFlags []string, fragment map[string]string, deps, members []string) string {
+func objectVariantHash(object, mode, modname string, flags, removeFlags []string, fragment map[string]string, sourceIncludes, deps, members []string) string {
 	var b strings.Builder
 	b.WriteString(object)
 	b.WriteByte('\n')
@@ -1144,6 +1266,11 @@ func objectVariantHash(object, mode, modname string, flags, removeFlags []string
 		b.WriteString(key)
 		b.WriteByte('=')
 		b.WriteString(fragment[key])
+		b.WriteByte('\n')
+	}
+	for _, include := range sourceIncludes {
+		b.WriteString("source_include=")
+		b.WriteString(include)
 		b.WriteByte('\n')
 	}
 	for _, dep := range deps {
@@ -1208,6 +1335,12 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 		if len(opts.SourceTreeKbuildFiles) != 0 {
 			r.SetAttr("kbuild_files", opts.SourceTreeKbuildFiles)
 		}
+		if opts.Schema.isV012() && len(opts.SourceTreeLocalIncludes) != 0 {
+			r.SetAttr("local_include_files", opts.SourceTreeLocalIncludes)
+		}
+		if opts.Schema.isV012() && len(opts.SourceTreeLookupFiles) != 0 {
+			r.SetAttr("lookup_files", opts.SourceTreeLookupFiles)
+		}
 		if len(opts.SourceTreeScriptsHeaders) != 0 {
 			r.SetAttr("scripts_headers", opts.SourceTreeScriptsHeaders)
 		}
@@ -1257,8 +1390,36 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 			continue
 		}
 		emitSource := opts.SourceLabelPackage != "" && variant.sourceBuildReady()
+		if opts.Schema.isV012() {
+			if opts.SourceRootLabel == "" {
+				return nil, fmt.Errorf(
+					"cannot emit source-backed linux_object %q for %q: source root label is required",
+					variant.Target,
+					variant.Object,
+				)
+			}
+			if opts.SourceLabelPackage == "" {
+				return nil, fmt.Errorf(
+					"cannot emit source-backed linux_object %q for %q: source label package is required",
+					variant.Target,
+					variant.Object,
+				)
+			}
+			if reason := variant.sourceBuildError(); reason != "" {
+				return nil, fmt.Errorf(
+					"cannot emit source-backed linux_object %q for %q: %s",
+					variant.Target,
+					variant.Object,
+					reason,
+				)
+			}
+			emitSource = true
+		}
 		if emitSource && opts.SourceConfig == "" {
 			r := file.AddRule("linux_config", variant.Target+"_config")
+			if opts.Schema.isV012() && opts.Arch != "" {
+				r.SetAttr("arch", opts.Arch)
+			}
 			if len(variant.ConfigFragment) != 0 {
 				r.SetAttr("config_flags", variant.ConfigFragment)
 			}
@@ -1272,6 +1433,16 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 		}
 		if emitSource {
 			r.SetAttr("src", labelForSource(opts, variant.Source))
+			if opts.Schema.isV012() {
+				r.SetAttr("source_includes_complete", true)
+				if len(variant.SourceIncludes) != 0 {
+					sourceIncludes := make([]string, 0, len(variant.SourceIncludes))
+					for _, include := range variant.SourceIncludes {
+						sourceIncludes = append(sourceIncludes, labelForSource(opts, include))
+					}
+					r.SetAttr("source_includes", sourceIncludes)
+				}
+			}
 			if opts.SourceConfig != "" {
 				r.SetAttr("config", opts.SourceConfig)
 			} else {
@@ -1378,8 +1549,12 @@ func (m *CompactMetadata) objectBuildFileNeedsArm64Nvhe() bool {
 }
 
 func (v CompactObjectVariant) sourceBuildReady() bool {
+	return v.sourceBuildError() == ""
+}
+
+func (v CompactObjectVariant) sourceBuildError() string {
 	if v.Source == "" {
-		return false
+		return "no concrete source was resolved"
 	}
 	for _, flag := range v.Flags {
 		for _, ref := range makeVariableRefs(flag) {
@@ -1390,7 +1565,7 @@ func (v CompactObjectVariant) sourceBuildReady() bool {
 				continue
 			}
 			if _, ok := v.ConfigFragment[ref]; !ok {
-				return false
+				return fmt.Sprintf("flag %q contains unsupported Kbuild make variable %q", flag, ref)
 			}
 		}
 	}
@@ -1403,11 +1578,11 @@ func (v CompactObjectVariant) sourceBuildReady() bool {
 				continue
 			}
 			if _, ok := v.ConfigFragment[ref]; !ok {
-				return false
+				return fmt.Sprintf("remove flag %q contains unsupported Kbuild make variable %q", flag, ref)
 			}
 		}
 	}
-	return true
+	return ""
 }
 
 func knownEmptyKbuildMakeRef(ref string) bool {
@@ -1461,6 +1636,9 @@ func (m *CompactMetadata) ImageBuildFile(opts CompactImageBuildFileOptions) ([]b
 	canonicalImages := map[string]string{}
 	for _, config := range m.Configs {
 		key := objectTargetsKey(config.ObjectTargets)
+		if opts.Schema.isV012() {
+			key += "\x01" + objectTargetsKey(config.ModuleObjectTargets)
+		}
 		if canonical, ok := canonicalImages[key]; ok {
 			r := file.AddRule("alias", config.ImageTarget)
 			r.SetAttr("actual", ":"+canonical)
@@ -1478,10 +1656,18 @@ func (m *CompactMetadata) ImageBuildFile(opts CompactImageBuildFileOptions) ([]b
 			r.SetAttr("arch", opts.Arch)
 		}
 		r.SetAttr("objects", labels)
-		r.SetAttr("tags", []string{"manual"})
-		if opts.RequireReal {
+		if opts.Schema.isV012() {
+			moduleLabels := make([]string, len(config.ModuleObjectTargets))
+			for i, target := range config.ModuleObjectTargets {
+				moduleLabels[i] = labelFor(opts.ObjectLabelPackage, target)
+			}
+			if len(moduleLabels) != 0 {
+				r.SetAttr("module_objects", moduleLabels)
+			}
+		} else if opts.RequireReal {
 			r.SetAttr("require_real", true)
 		}
+		r.SetAttr("tags", []string{"manual"})
 	}
 	return file.Format(), nil
 }

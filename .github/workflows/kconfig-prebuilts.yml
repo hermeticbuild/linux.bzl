@@ -25,6 +25,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*.tar.gz
+            dist/*.tar.zst
             dist/SHA256SUMS
             dist/kconfig_tool_releases.metadata
