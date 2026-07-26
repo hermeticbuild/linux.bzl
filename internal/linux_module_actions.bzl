@@ -201,6 +201,7 @@ def _build_modpost(ctx, helpers, kernel, target, source_files):
         feature_configuration = host_features,
         action_name = C_COMPILE_ACTION_NAME,
     )
+    host_toolchain_files = host_cc.all_files.to_list()
     sources = [_source_file(source_files, path) for path in _MODPOST_SOURCES]
     source_root = _execroot_dir(kernel.source_root)
     compile_flags = [
@@ -231,7 +232,7 @@ def _build_modpost(ctx, helpers, kernel, target, source_files):
                 action_name = C_COMPILE_ACTION_NAME,
                 variables = compile_variables,
             ),
-            files = [
+            files = host_toolchain_files + [
                 object_file,
                 src,
             ],
@@ -277,7 +278,7 @@ def _build_modpost(ctx, helpers, kernel, target, source_files):
             action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
             variables = link_variables,
         ),
-        files = [out],
+        files = host_toolchain_files + [out],
     )
     link_args.add_all(objects)
     host_linker = cc_common.get_tool_for_action(

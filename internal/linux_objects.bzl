@@ -1749,7 +1749,7 @@ def _linux_offsets_header(ctx, cc_toolchain, feature_configuration, config, sour
     # must emit real assembly even when the kernel itself is built with Clang
     # LTO. LLVM bitcode output from -flto is not parseable as offsets assembly.
     config_flags = _linux_non_lto_config_flags_for_source(ctx, config, src, out_suffix = "offsets.nolto")
-    compile_args.add_all(config_flags.flags)
+    compile_args.add_all(config_flags.flags, format_each = "@%s")
     compile_args.add_all(_linux_source_preinclude_flags_for_root(source_root))
     _add_config_include_flag(compile_args, config)
     _add_linux_source_include_flags_for_root(
@@ -1812,7 +1812,7 @@ def _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, 
         src,
         out_suffix = out.basename + ".nolto",
     )
-    args.add_all(config_flags.flags)
+    args.add_all(config_flags.flags, format_each = "@%s")
     args.add_all([
         "-fno-common",
         "-fno-builtin",
