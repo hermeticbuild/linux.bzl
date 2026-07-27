@@ -19,7 +19,7 @@ actions. Rust-owned objects are excluded from the ordinary object graph.
 
 ## Prepare
 
-1. Run `go test ./internal/kconfig ./internal/cmd/kconfig_parse`.
+1. Run `go test ./internal/kconfig ./internal/cmd/kconfig ./internal/cmd/kconfig_parse`.
 2. Run the Bazel generator, compact-golden, and prebuilt archive tests.
 3. Exercise v0.0.12 against maintained Linux 6.12 and 6.18 source trees with
    `CONFIG_RUST=y`. Verify that the legacy and pin-init Rust layouts produce
@@ -40,7 +40,7 @@ version stream.
 After the release-preparation change is merged, tag that merge commit:
 
 ```sh
-VERSION=v0.0.12 ./release_kbuild.sh
+VERSION=v0.0.12 ./release_kconfig.sh
 ```
 
 The tag workflow publishes archives for Linux, macOS, and Windows on amd64 and
@@ -49,4 +49,4 @@ arm64, plus `SHA256SUMS` and `kconfig_tool_releases.metadata`.
 Once all six assets are available, update the rules repository's
 `KCONFIG_TOOL_VERSION` and integrity table in a separate change. That consumer
 change must request `-compact_schema=v0.0.12`; do not change the generator's
-default or the base branch's v0.0.11 pin.
+default.

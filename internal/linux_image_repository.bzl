@@ -657,6 +657,7 @@ def _generate_config_graph(
     source_repo = _repository_prefix(source)
     args = [
         str(tool),
+        "-compact_schema=v0.0.12",
         "-root",
         str(source_root.get_child("Kconfig")),
         "-srctree",
@@ -678,8 +679,24 @@ def _generate_config_graph(
         source_package,
         "-source_root_label",
         str(source),
-        "-source_tree_label",
-        source_repo + "//:all_files",
+        "-source_tree_arch_headers_label",
+        source_repo + "//:arch_headers",
+        "-source_tree_dtb_sources_label",
+        source_repo + "//:dtb_sources",
+        "-source_tree_global_headers_label",
+        source_repo + "//:global_headers",
+        "-source_tree_headers_label",
+        source_repo + "//:headers",
+        "-source_tree_kbuild_files_label",
+        source_repo + "//:kbuild_files",
+        "-source_tree_local_include_files_label",
+        source_repo + "//:local_include_files",
+        "-source_tree_lookup_files_label",
+        source_repo + "//:source_tree_lookup_files",
+        "-source_tree_scripts_headers_label",
+        source_repo + "//:scripts_headers",
+        "-source_tree_uapi_headers_label",
+        source_repo + "//:uapi_headers",
         "-generated_headers",
         "//:%s_%s_generated_headers" % (target_prefix, descriptor.arch),
         "-source_asn1_compiler",
@@ -720,13 +737,6 @@ def _generate_config_graph(
             "Linux graph generation failed for %s config %s\nstdout:\n%s\nstderr:\n%s" %
             (rctx.original_name, config_name, result.stdout, result.stderr),
         )
-    _upgrade_v011_schema(
-        rctx,
-        graph_dir,
-        source_repo,
-        source_root,
-        descriptor.srcarch,
-    )
     _validate_generated_metadata(rctx, graph_dir, config_name, source_root)
     _validate_generated_build(rctx, graph_dir, config_name)
 
@@ -737,417 +747,6 @@ def _graph_config_args(config_name, config_path, config_mode):
         "-config_mode",
         config_mode,
     ]
-
-def _upgrade_v011_schema(
-        rctx,
-        graph_dir,
-        source_repo,
-        source_root,
-        srcarch):
-    build_path = graph_dir + "/BUILD.bazel"
-    content = rctx.read(build_path)
-    legacy = '    srcs = ["%s//:all_files"],\n' % source_repo
-    parts = content.split(legacy)
-    if len(parts) != 2:
-        fail(
-            "Linux graph generator %s emitted an incompatible source-tree schema; " %
-            KCONFIG_TOOL_VERSION +
-            "expected exactly one legacy srcs declaration",
-        )
-    replacement = "\n".join([
-        '    arch_headers = ["%s//:arch_headers"],' % source_repo,
-        '    dtb_sources = ["%s//:dtb_sources"],' % source_repo,
-        '    global_headers = ["%s//:global_headers"],' % source_repo,
-        '    headers = ["%s//:headers"],' % source_repo,
-        '    kbuild_files = ["%s//:kbuild_files"],' % source_repo,
-        '    local_include_files = ["%s//:local_include_files"],' % source_repo,
-        '    lookup_files = ["%s//:source_tree_lookup_files"],' % source_repo,
-        '    scripts_headers = ["%s//:scripts_headers"],' % source_repo,
-        '    uapi_headers = ["%s//:uapi_headers"],' % source_repo,
-        "",
-    ])
-    content = parts[0] + replacement + parts[1]
-
-    legacy_require_real = "    require_real = True,\n"
-    parts = content.split(legacy_require_real)
-    if len(parts) != 2:
-        fail(
-            "Linux graph generator %s emitted an incompatible image schema; " %
-            KCONFIG_TOOL_VERSION +
-            "expected exactly one legacy require_real declaration",
-        )
-    content = parts[0] + parts[1]
-    metadata = json.decode(rctx.read(graph_dir + "/metadata.json"))
-    content, metadata = _remove_v011_rust_sdk_objects(
-        content,
-        metadata,
-        graph_dir,
-    )
-    rctx.file(
-        graph_dir + "/metadata.json",
-        json.encode(metadata) + "\n",
-        executable = False,
-    )
-    content = _inject_v011_source_includes(
-        rctx,
-        content,
-        metadata,
-        source_repo,
-        source_root,
-        srcarch,
-    )
-    content = _inject_v011_module_objects(
-        content,
-        metadata,
-        graph_dir,
-    )
-    rctx.file(build_path, content, executable = False)
-
-def _remove_generated_rule(content, target):
-    for rule_name in [
-        "linux_arm64_nvhe_object",
-        "linux_composite_object",
-        "linux_object",
-    ]:
-        marker = '\n%s(\n    name = "%s",\n' % (rule_name, target)
-        parts = content.split(marker)
-        if len(parts) == 1:
-            continue
-        if len(parts) != 2:
-            fail("Linux graph generator emitted duplicate target %s" % target)
-        end = parts[1].find("\n)\n")
-        if end < 0:
-            fail("Linux graph generator emitted malformed target %s" % target)
-        return parts[0] + "\n" + parts[1][end + len("\n)\n"):]
-    fail("Linux graph generator metadata references missing target %s" % target)
-
-def _remove_v011_rust_sdk_objects(content, metadata, graph_dir):
-    """Removes Rust runtime objects delegated to linux_rust_kernel_sdk."""
-    rust_targets = {}
-    kept_variants = []
-    for variant in metadata.get("object_variants", []):
-        object_path = _clean_source_tree_path(variant.get("object", ""))
-        if object_path != None and object_path.startswith("rust/"):
-            target = variant.get("target", "")
-            if target:
-                rust_targets[target] = True
-            continue
-        kept_variants.append(variant)
-    if not rust_targets:
-        return content, metadata
-
-    for target in sorted(rust_targets.keys()):
-        content = _remove_generated_rule(content, target)
-        for label in [
-            "//%s:%s" % (graph_dir, target),
-            ":" + target,
-        ]:
-            content = content.replace('"%s",' % label, "")
-
-    metadata["object_variants"] = kept_variants
-    for config in metadata.get("configs", []):
-        config["object_targets"] = [
-            target
-            for target in config.get("object_targets", [])
-            if target not in rust_targets
-        ]
-        config["module_object_targets"] = [
-            target
-            for target in config.get("module_object_targets", [])
-            if target not in rust_targets
-        ]
-    for package in metadata.get("object_packages", []):
-        package["object_targets"] = [
-            target
-            for target in package.get("object_targets", [])
-            if target not in rust_targets
-        ]
-    return content, metadata
-
-def _clean_source_tree_path(path):
-    """Normalizes a source-tree path and rejects paths escaping the tree."""
-    parts = []
-    for raw_part in path.replace("\\", "/").split("/"):
-        part = raw_part.strip()
-        if not part or part == ".":
-            continue
-        if part == "..":
-            if not parts:
-                return None
-            parts.pop()
-        else:
-            parts.append(part)
-    return "/".join(parts)
-
-def _source_dir(path):
-    parts = path.rsplit("/", 1)
-    return parts[0] if len(parts) == 2 else ""
-
-def _join_source_path(root, path):
-    if not root:
-        return _clean_source_tree_path(path)
-    return _clean_source_tree_path(root + "/" + path)
-
-def _parse_source_include(line):
-    line = line.strip()
-    if not line.startswith("#"):
-        return None
-    line = line[1:].strip()
-    if not line.startswith("include"):
-        return None
-    line = line[len("include"):].strip()
-    if len(line) < 3:
-        return None
-    opener = line[0]
-    if opener == "\"":
-        closer = "\""
-    elif opener == "<":
-        closer = ">"
-    else:
-        return None
-    end = line.find(closer, 1)
-    if end <= 1:
-        return None
-    return line[1:end]
-
-def _source_include_candidates(include):
-    candidates = [include]
-    if include.startswith("asm/"):
-        candidates.append("asm-generic/" + include[len("asm/"):])
-    elif include.startswith("uapi/asm/"):
-        candidates.append("uapi/asm-generic/" + include[len("uapi/asm/"):])
-    return candidates
-
-def _source_include_dirs(flags):
-    dirs = []
-    next_is_path = False
-    for flag in flags:
-        path = ""
-        if next_is_path:
-            path = flag
-            next_is_path = False
-        elif flag == "-I":
-            next_is_path = True
-            continue
-        elif flag.startswith("-I"):
-            path = flag[len("-I"):]
-        path = path.strip()
-        if path == "$(srctree)":
-            dirs.append("")
-        elif path.startswith("$(srctree)/"):
-            normalized = _clean_source_tree_path(path[len("$(srctree)/"):])
-            if normalized != None:
-                dirs.append(normalized)
-    return dirs
-
-def _is_source_like_include(path):
-    return (
-        path.endswith(".c") or
-        path.endswith(".S") or
-        path.endswith(".s") or
-        path.endswith(".inc")
-    )
-
-def _existing_source_path(source_root, path):
-    if path == None:
-        return None
-    normalized = _clean_source_tree_path(path)
-    if normalized == None:
-        return None
-    return normalized if source_root.get_child(normalized).exists else None
-
-def _resolve_source_include(source_root, from_path, include, include_roots):
-    resolved = {}
-    local = _existing_source_path(
-        source_root,
-        _join_source_path(_source_dir(from_path), include),
-    )
-    if local != None:
-        resolved[local] = True
-    for candidate in _source_include_candidates(include):
-        for root in include_roots:
-            path = _existing_source_path(
-                source_root,
-                _join_source_path(root, candidate),
-            )
-            if path != None:
-                resolved[path] = True
-    return sorted(resolved.keys())
-
-def _scan_source_includes(rctx, source_root, path, scan_cache):
-    raw_includes = scan_cache.get(path)
-    if raw_includes != None:
-        return raw_includes
-    raw_includes = []
-    for line in rctx.read(source_root.get_child(path)).splitlines():
-        include = _parse_source_include(line)
-        if include != None:
-            raw_includes.append(include)
-    scan_cache[path] = raw_includes
-    return raw_includes
-
-def _propagate_source_include_closures(edges, direct_includes, sources):
-    closures = {}
-    for path in edges.keys():
-        closures[path] = dict(direct_includes.get(path, {}))
-    for _ in range(1000):
-        changed = False
-        for path in sorted(edges.keys()):
-            closure = closures[path]
-            for child in edges[path]:
-                for include in closures.get(child, {}).keys():
-                    if include not in closure:
-                        closure[include] = True
-                        changed = True
-        if not changed:
-            return {
-                source: sorted([
-                    include
-                    for include in closures.get(source, {}).keys()
-                    if include != source
-                ])
-                for source in sources
-            }
-    fail("source include closure propagation did not converge")
-
-def _source_include_closures(
-        rctx,
-        source_root,
-        sources,
-        include_roots,
-        scan_cache):
-    pending = {
-        source: True
-        for source in sources
-        if _existing_source_path(source_root, source) != None
-    }
-    edges = {}
-    direct_includes = {}
-    for _ in range(1000):
-        if not pending:
-            return _propagate_source_include_closures(
-                edges,
-                direct_includes,
-                sources,
-            )
-        current = sorted(pending.keys())
-        pending = {}
-        for path in current:
-            if path in edges:
-                continue
-            children = {}
-            direct = {}
-            for include in _scan_source_includes(
-                rctx,
-                source_root,
-                path,
-                scan_cache,
-            ):
-                for resolved in _resolve_source_include(
-                    source_root,
-                    path,
-                    include,
-                    include_roots,
-                ):
-                    children[resolved] = True
-                    if _is_source_like_include(resolved):
-                        direct[resolved] = True
-                    if resolved not in edges:
-                        pending[resolved] = True
-            edges[path] = sorted(children.keys())
-            direct_includes[path] = direct
-    fail("source include graph exceeds 1000 levels")
-
-def _inject_v011_source_includes(
-        rctx,
-        content,
-        metadata,
-        source_repo,
-        source_root,
-        srcarch):
-    """Adds exact recursive source-like include closures missing from v0.0.11."""
-    default_roots = [
-        "include",
-        "include/uapi",
-        "arch/%s/include" % srcarch,
-        "arch/%s/include/uapi" % srcarch,
-    ]
-    scan_cache = {}
-    groups = {}
-    for variant in metadata.get("object_variants", []):
-        if variant.get("members", []):
-            continue
-        target = variant.get("target", "")
-        source = variant.get("source", "")
-        if not target or not source:
-            continue
-        include_roots = {}
-        for root in default_roots + _source_include_dirs(variant.get("flags", [])):
-            include_roots[root] = True
-        roots = sorted(include_roots.keys())
-        key = "\n".join(roots)
-        group = groups.get(key)
-        if group == None:
-            group = struct(
-                include_roots = roots,
-                sources = {},
-                variants = [],
-            )
-            groups[key] = group
-        group.sources[source] = True
-        group.variants.append(variant)
-
-    for key in sorted(groups.keys()):
-        group = groups[key]
-        closures = _source_include_closures(
-            rctx,
-            source_root,
-            sorted(group.sources.keys()),
-            group.include_roots,
-            scan_cache,
-        )
-        for variant in group.variants:
-            target = variant.get("target", "")
-            source = variant.get("source", "")
-            marker = 'linux_object(\n    name = "%s",\n' % target
-            if len(content.split(marker)) != 2:
-                fail(
-                    "Linux graph generator %s emitted an incompatible object schema for %s" %
-                    (KCONFIG_TOOL_VERSION, target),
-                )
-            includes = closures.get(source, [])
-            rendered = "    source_includes_complete = True,\n"
-            if includes:
-                labels = [
-                    "%s//:%s" % (source_repo, include)
-                    for include in includes
-                ]
-                rendered += "    source_includes = %r,\n" % labels
-            content = content.replace(marker, marker + rendered)
-    return content
-
-def _inject_v011_module_objects(content, metadata, graph_dir):
-    """Adds module roots carried by v0.0.11 metadata to its image rules."""
-    for config in metadata.get("configs", []):
-        targets = config.get("module_object_targets", [])
-        if not targets:
-            continue
-        image_target = config.get("image_target", "")
-        if not image_target:
-            fail("Linux graph generator emitted module roots without an image target")
-        marker = 'linux_compact_image(\n    name = "%s",\n' % image_target
-        if len(content.split(marker)) != 2:
-            fail(
-                "Linux graph generator %s emitted an incompatible module image schema for %s" %
-                (KCONFIG_TOOL_VERSION, image_target),
-            )
-        labels = [
-            "//%s:%s" % (graph_dir, target)
-            for target in targets
-        ]
-        rendered = "    module_objects = %r,\n" % labels
-        content = content.replace(marker, marker + rendered)
-    return content
 
 def _add_generator_variables(args, descriptor):
     variables = dict(descriptor.compact_vars)

@@ -5,7 +5,7 @@ Each archive must extract the requested host executables at its root.
 
 visibility("//...")
 
-KCONFIG_TOOL_VERSION = "v0.0.11"
+KCONFIG_TOOL_VERSION = "v0.0.12"
 
 _RELEASE_BASE_URL = "https://github.com/hermeticbuild/linux.bzl/releases/download/kconfig-{version}".format(
     version = KCONFIG_TOOL_VERSION,
@@ -13,27 +13,27 @@ _RELEASE_BASE_URL = "https://github.com/hermeticbuild/linux.bzl/releases/downloa
 
 KCONFIG_TOOL_RELEASES = {
     "darwin_amd64": struct(
-        integrity = "sha256-79ZvPXUUgjYt5L/8TXcsuGJHyx/TMcbxeMJVXfPOAjU=",
-        urls = ["{}/kconfig-darwin-amd64.tar.gz".format(_RELEASE_BASE_URL)],
+        integrity = "sha256-g8vKOukDOy7e7ED6LnCygFlAgvFfCOVGXae76PvVjOM=",
+        urls = ["{}/kconfig-darwin-amd64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "darwin_arm64": struct(
-        integrity = "sha256-t4uginHgtBk8xRld/HEmEvTbmAcVXy92q0LOdQZvCWE=",
-        urls = ["{}/kconfig-darwin-arm64.tar.gz".format(_RELEASE_BASE_URL)],
+        integrity = "sha256-FTUowStHo50sOsJH7XO4S7O9cfJ3xLMi8Co5OwtOd8U=",
+        urls = ["{}/kconfig-darwin-arm64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "linux_amd64": struct(
-        integrity = "sha256-onhDptEXE1NBfxKb3Gbqcq2b1xaQORBrgGMqFT5gFJo=",
-        urls = ["{}/kconfig-linux-amd64.tar.gz".format(_RELEASE_BASE_URL)],
+        integrity = "sha256-LsXQpfJDbOEv920zoTSTzz09hBrRPW71zTvW0J8618k=",
+        urls = ["{}/kconfig-linux-amd64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "linux_arm64": struct(
-        integrity = "sha256-oAKuoyC/DETWedDXAfjLIbcyuPCb2Na+qZOexnnOWBo=",
-        urls = ["{}/kconfig-linux-arm64.tar.gz".format(_RELEASE_BASE_URL)],
+        integrity = "sha256-1Ui1faoEJPbKGtJuVbcz8hmLIXHzMD8U9mGHnYYihBk=",
+        urls = ["{}/kconfig-linux-arm64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "windows_amd64": struct(
-        integrity = "sha256-pCL6m6i+E0GxmAKf4kacGOB/xADj1JTUSUWpABygf9c=",
-        urls = ["{}/kconfig-windows-amd64.tar.gz".format(_RELEASE_BASE_URL)],
+        integrity = "sha256-Yry+HxjzixIgi8U/uULoxTAFQEzzoQsL0MV5Xga7va4=",
+        urls = ["{}/kconfig-windows-amd64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "windows_arm64": struct(
-        integrity = "sha256-OTTOMUHndHsbaXp0zSo87ysCGrE7TmEF9MjMMnKigEA=",
-        urls = ["{}/kconfig-windows-arm64.tar.gz".format(_RELEASE_BASE_URL)],
+        integrity = "sha256-2eqgng6HGDVyh/MbMkEDyD5yfNA3rasKyzXxhhYvFis=",
+        urls = ["{}/kconfig-windows-arm64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
 }

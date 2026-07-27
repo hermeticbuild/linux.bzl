@@ -1,3 +1,6 @@
+// Copyright The Monogon Project Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 package kconfig
 
 import (
@@ -5,10 +8,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 
@@ -159,7 +160,11 @@ func MergeCompactMetadata(parts ...*CompactMetadata) (*CompactMetadata, error) {
 			variants[variant.Target] = variant
 		}
 	}
-	targets := slices.Sorted(maps.Keys(variants))
+	targets := make([]string, 0, len(variants))
+	for target := range variants {
+		targets = append(targets, target)
+	}
+	sort.Strings(targets)
 	for _, target := range targets {
 		out.ObjectVariants = append(out.ObjectVariants, variants[target])
 	}
@@ -257,7 +262,11 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 		})
 	}
 
-	targets := slices.Sorted(maps.Keys(variants))
+	targets := make([]string, 0, len(variants))
+	for target := range variants {
+		targets = append(targets, target)
+	}
+	sort.Strings(targets)
 	for _, target := range targets {
 		out.ObjectVariants = append(out.ObjectVariants, variants[target])
 	}
@@ -820,7 +829,11 @@ func globalFlagAppliesToObject(flag KbuildFlag, object *resolvedKbuildObject) bo
 }
 
 func (objects resolvedKbuildObjects) all() []resolvedKbuildObject {
-	names := slices.Sorted(maps.Keys(objects.byName))
+	names := make([]string, 0, len(objects.byName))
+	for name := range objects.byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
 	out := make([]resolvedKbuildObject, 0, len(names))
 	for _, name := range names {
 		out = append(out, *objects.byName[name])
@@ -947,7 +960,11 @@ func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, sou
 			}
 		}
 	}
-	refs := slices.Sorted(maps.Keys(refset))
+	refs := make([]string, 0, len(refset))
+	for ref := range refset {
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
 	for _, ref := range refs {
 		if !v012 || config.ShouldWrite(ref) {
 			fragment[ref] = config.Value(ref)
@@ -1203,7 +1220,11 @@ func compactObjectPackages(variants []CompactObjectVariant) []CompactObjectPacka
 	for _, variant := range variants {
 		byPackage[variant.Package] = append(byPackage[variant.Package], variant.Target)
 	}
-	packages := slices.Sorted(maps.Keys(byPackage))
+	packages := make([]string, 0, len(byPackage))
+	for pkg := range byPackage {
+		packages = append(packages, pkg)
+	}
+	sort.Strings(packages)
 	out := make([]CompactObjectPackage, 0, len(packages))
 	for _, pkg := range packages {
 		targets := byPackage[pkg]
@@ -1677,7 +1698,12 @@ func configRefs(value string) []string {
 		}
 		start = end
 	}
-	return slices.Sorted(maps.Keys(refs))
+	out := make([]string, 0, len(refs))
+	for ref := range refs {
+		out = append(out, ref)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func compactRuleLoadLabel(label string) string {
