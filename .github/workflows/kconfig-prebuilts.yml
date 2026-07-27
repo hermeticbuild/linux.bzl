@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches:
-      - fionera/init
+      - main
     tags:
       - "kconfig-v*"
   workflow_dispatch:
