@@ -25,6 +25,7 @@ type KbuildFile struct {
 	objectAssigns    []kbuildObjectAssignment
 	compositeMembers []kbuildCompositeMember
 	compositeAssigns []kbuildCompositeAssignment
+	objectSettings   []kbuildObjectSetting
 }
 
 type KbuildObject struct {
@@ -116,6 +117,13 @@ type kbuildObjectAssignment struct {
 	order     int
 }
 
+type kbuildObjectSetting struct {
+	Name      string
+	Object    string
+	Directory string
+	Value     string
+}
+
 type KbuildCondition struct {
 	Kind       string            `json:"kind"`
 	Symbol     string            `json:"symbol,omitempty"`
@@ -169,6 +177,9 @@ func ParseKbuildFileTree(path string, opts KbuildOptions) (*KbuildFile, error) {
 	if err := treeParser.parseInto(parser, path, 0); err != nil {
 		return nil, err
 	}
+	if err := parser.finalizeObjectSettings(); err != nil {
+		return nil, err
+	}
 	return parser.kb, nil
 }
 
@@ -213,6 +224,7 @@ func MergeKbuildFileAtDirectory(base *KbuildFile, dir string, extra *KbuildFile)
 	out.TargetVariables = append(out.TargetVariables, extra.TargetVariables...)
 	out.compositeMembers = append(out.compositeMembers, extra.compositeMembers...)
 	out.compositeAssigns = append(out.compositeAssigns, extra.compositeAssigns...)
+	out.objectSettings = append(out.objectSettings, extra.objectSettings...)
 	if len(extraAssignments) == 0 {
 		return out
 	}
@@ -266,7 +278,58 @@ func parseKbuild(r io.Reader, filename string, vars map[string]string, baseDir s
 	if err := parser.parseReader(r, filename); err != nil {
 		return nil, err
 	}
+	if err := parser.finalizeObjectSettings(); err != nil {
+		return nil, err
+	}
 	return parser.kb, nil
+}
+
+func (p *kbuildParser) finalizeObjectSettings() error {
+	names := make([]string, 0, len(p.vars))
+	for name := range p.vars {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, variable := range names {
+		name, object, ok := kbuildObjectSettingName(variable)
+		if !ok {
+			continue
+		}
+		value, err := p.expand("$(" + variable + ")")
+		if err != nil {
+			return err
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		p.kb.objectSettings = append(p.kb.objectSettings, kbuildObjectSetting{
+			Name:   name,
+			Object: object,
+			Value:  value,
+		})
+	}
+	for _, variable := range names {
+		object, language, ok := perObjectFlagTarget(variable)
+		if !ok || language != "c" {
+			continue
+		}
+		value, err := p.expand("$(" + variable + ")")
+		if err != nil {
+			return err
+		}
+		for _, sanitizer := range []string{"CFLAGS_KASAN", "CFLAGS_KCSAN"} {
+			if !assignmentReferencesVariable(value, sanitizer) {
+				continue
+			}
+			p.kb.objectSettings = append(p.kb.objectSettings, kbuildObjectSetting{
+				Name:   sanitizer,
+				Object: object,
+				Value:  "y",
+			})
+		}
+	}
+	return nil
 }
 
 func (p *kbuildParser) parseReader(r io.Reader, filename string) error {
@@ -796,6 +859,12 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 	}
 
 	if object, language, ok := perObjectFlagTarget(lhs); ok {
+		if language == "c" {
+			values = withoutExplicitSanitizerFlagReferences(values)
+		}
+		if len(values) == 0 {
+			return nil
+		}
 		p.kb.Flags = append(p.kb.Flags, KbuildFlag{
 			Scope:     "object",
 			Object:    object,
@@ -1271,7 +1340,7 @@ func (p *kbuildParser) evalReference(original, clause string, depth int) (string
 	return value, nil
 }
 
-func kbuildKnownCall(name string, args []string, original string) (string, bool) {
+func kbuildKnownCall(name string, args []string, original, srcarch string) (string, bool) {
 	switch name {
 	case "cc-disable-warning":
 		if len(args) != 1 {
@@ -1287,7 +1356,7 @@ func kbuildKnownCall(name string, args []string, original string) (string, bool)
 			return original, true
 		}
 		option := strings.TrimSpace(args[0])
-		if !linuxLLVMProbeSupportsOption(option) {
+		if !linuxLLVMKbuildProbeSupportsOption(option, srcarch) {
 			if len(args) == 2 {
 				return strings.TrimSpace(args[1]), true
 			}
@@ -1298,7 +1367,7 @@ func kbuildKnownCall(name string, args []string, original string) (string, bool)
 		if len(args) != 1 {
 			return original, true
 		}
-		if linuxLLVMProbeSupportsOption(strings.TrimSpace(args[0])) {
+		if linuxLLVMKbuildProbeSupportsOption(strings.TrimSpace(args[0]), srcarch) {
 			return "y", true
 		}
 		return "n", true
@@ -1309,11 +1378,18 @@ func kbuildKnownCall(name string, args []string, original string) (string, bool)
 
 func linuxLLVMProbeSupportsOption(option string) bool {
 	switch option {
-	case "", "-fno-code-hoisting", "-fmin-function-alignment=8", "-fsanitize=kernel-memory", "-mrecord-mcount":
+	case "", "-fno-code-hoisting", "-fno-conserve-stack", "-fmin-function-alignment=8", "-fsanitize=kernel-memory", "-mrecord-mcount":
 		return false
 	default:
 		return true
 	}
+}
+
+func linuxLLVMKbuildProbeSupportsOption(option, srcarch string) bool {
+	if option == "-mno-outline-atomics" && srcarch != "arm64" {
+		return false
+	}
+	return linuxLLVMProbeSupportsOption(option)
 }
 
 func (p *kbuildParser) expandVariable(name, original string, depth int) (string, bool, error) {
@@ -1411,7 +1487,8 @@ func (p *kbuildParser) evalCall(args []string, original string, depth int) (stri
 		}
 		callArgs = append(callArgs, expanded)
 	}
-	if value, ok := kbuildKnownCall(name, callArgs, original); ok {
+	srcarch, _ := p.lookupRawVar("SRCARCH")
+	if value, ok := kbuildKnownCall(name, callArgs, original, srcarch); ok {
 		return value, nil
 	}
 	body, ok := p.lookupRawVar(name)
@@ -1790,6 +1867,7 @@ func (kb *KbuildFile) merge(other *KbuildFile) {
 	kb.objectAssigns = append(kb.objectAssigns, other.objectAssigns...)
 	kb.compositeMembers = append(kb.compositeMembers, other.compositeMembers...)
 	kb.compositeAssigns = append(kb.compositeAssigns, other.compositeAssigns...)
+	kb.objectSettings = append(kb.objectSettings, other.objectSettings...)
 }
 
 type kbuildDirectoryTreeParser struct {
@@ -2036,6 +2114,13 @@ func prefixKbuildFile(kb *KbuildFile, dir string, gate KbuildCondition, linkRoot
 		}
 		assignment.Condition = combineKbuildConditions(gate, assignment.Condition)
 		out.compositeAssigns = append(out.compositeAssigns, assignment)
+	}
+	for _, setting := range kb.objectSettings {
+		setting.Directory = dir
+		if setting.Object != "" {
+			setting.Object = prefixKbuildPath(dir, setting.Object)
+		}
+		out.objectSettings = append(out.objectSettings, setting)
 	}
 	return out
 }
@@ -3054,6 +3139,18 @@ func perObjectFlagTarget(lhs string) (string, string, bool) {
 	return "", "", false
 }
 
+func withoutExplicitSanitizerFlagReferences(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if assignmentReferencesVariable(value, "CFLAGS_KASAN") ||
+			assignmentReferencesVariable(value, "CFLAGS_KCSAN") {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
 func removeFlagTarget(lhs string) (string, string, bool) {
 	for prefix, language := range map[string]string{
 		"AFLAGS_REMOVE_": "asm",
@@ -3068,6 +3165,31 @@ func removeFlagTarget(lhs string) (string, string, bool) {
 			return "", "", false
 		}
 		return object, language, true
+	}
+	return "", "", false
+}
+
+func kbuildObjectSettingName(variable string) (string, string, bool) {
+	for _, name := range []string{
+		"KASAN_SANITIZE",
+		"KCSAN_INSTRUMENT_BARRIERS",
+		"KCSAN_SANITIZE",
+		"UBSAN_INTEGER_WRAP",
+		"UBSAN_SANITIZE",
+		"UBSAN_SIGNED_WRAP",
+	} {
+		if variable == name {
+			return name, "", true
+		}
+		rest, ok := strings.CutPrefix(variable, name+"_")
+		if !ok {
+			continue
+		}
+		object, ok := kbuildObjectToken(rest)
+		if !ok {
+			return "", "", false
+		}
+		return name, object, true
 	}
 	return "", "", false
 }

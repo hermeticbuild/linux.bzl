@@ -123,6 +123,78 @@ def _module_command_flags_test_impl(ctx):
 
 _module_command_flags_test = unittest.make(_module_command_flags_test_impl)
 
+def _module_sanitizer_flags_test_impl(ctx):
+    env = unittest.begin(ctx)
+    flags = linux_module_actions.module_metadata_sanitizer_flags(
+        struct(config_flags = {
+            "CONFIG_CC_HAS_KASAN_MEMINTRINSIC_PREFIX": "y",
+            "CONFIG_KASAN": "y",
+            "CONFIG_KASAN_GENERIC": "y",
+            "CONFIG_KASAN_INLINE": "y",
+            "CONFIG_KASAN_SHADOW_OFFSET": "0xdffffc0000000000",
+            "CONFIG_KASAN_STACK": "y",
+            "CONFIG_KCSAN": "y",
+            "CONFIG_UBSAN": "y",
+            "CONFIG_UBSAN_BOOL": "y",
+            "CONFIG_UBSAN_INTEGER_WRAP": "y",
+        }),
+        "external/linux",
+        "6.18.39",
+    )
+    asserts.equals(
+        env,
+        [
+            "-fsanitize=kernel-address",
+            "-mllvm",
+            "-asan-mapping-offset=0xdffffc0000000000",
+            "-mllvm",
+            "-asan-instrumentation-with-call-threshold=10000",
+            "-mllvm",
+            "-asan-stack=1",
+            "-mllvm",
+            "-asan-instrument-allocas=1",
+            "-mllvm",
+            "-asan-globals=1",
+            "-mllvm",
+            "-asan-kernel-mem-intrinsic-prefix=1",
+            "-fsanitize=bool",
+            "-DINTEGER_WRAP",
+            "-fsanitize-undefined-ignore-overflow-pattern=all",
+            "-fsanitize=signed-integer-overflow",
+            "-fsanitize=unsigned-integer-overflow",
+            "-fsanitize=implicit-signed-integer-truncation",
+            "-fsanitize=implicit-unsigned-integer-truncation",
+            "-fsanitize-ignorelist=external/linux/scripts/integer-wrap-ignore.scl",
+            "-fsanitize=thread",
+            "-fno-optimize-sibling-calls",
+            "-mllvm",
+            "-tsan-instrument-read-before-write=1",
+            "-mllvm",
+            "-tsan-distinguish-volatile=1",
+            "-mllvm",
+            "-tsan-instrument-func-entry-exit=0",
+        ],
+        flags,
+    )
+    asserts.true(
+        env,
+        "-fsanitize=thread" in flags,
+        "Linux 6.18 module metadata must use KCSAN flags",
+    )
+    flags_612 = linux_module_actions.module_metadata_sanitizer_flags(
+        struct(config_flags = {
+            "CONFIG_KCSAN": "y",
+            "CONFIG_UBSAN": "y",
+            "CONFIG_UBSAN_SIGNED_WRAP": "y",
+        }),
+        "external/linux",
+        "6.12.96",
+    )
+    asserts.equals(env, ["-fsanitize=signed-integer-overflow"], flags_612)
+    return unittest.end(env)
+
+_module_sanitizer_flags_test = unittest.make(_module_sanitizer_flags_test_impl)
+
 def linux_module_test_suite(name):
     kernel = name + "_kernel"
     dependency = name + "_foreign_dependency"
@@ -151,11 +223,14 @@ def linux_module_test_suite(name):
     )
     command_flags_test = name + "_command_flags_test"
     _module_command_flags_test(name = command_flags_test)
+    sanitizer_flags_test = name + "_sanitizer_flags_test"
+    _module_sanitizer_flags_test(name = sanitizer_flags_test)
 
     native.test_suite(
         name = name,
         tests = [
             ":" + name + "_dependency_mismatch_test",
             ":" + command_flags_test,
+            ":" + sanitizer_flags_test,
         ],
     )

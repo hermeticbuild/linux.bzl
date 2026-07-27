@@ -612,6 +612,7 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 				}
 			}
 		}
+		object.flags = append(object.flags, sanitizerKbuildFlags(config, kb.objectSettings, object)...)
 	}
 
 	out := resolvedKbuildObjects{

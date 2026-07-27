@@ -114,6 +114,128 @@ obj-y += $(notdir $(lastword $(MAKEFILE_LIST))).o
 	}
 }
 
+func TestParseKbuildCapturesSanitizerObjectSettings(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`KASAN_SANITIZE := n
+KASAN_SANITIZE_head$(BITS).o += n
+KCSAN_SANITIZE_racy.o := y
+KCSAN_INSTRUMENT_BARRIERS_racy.o := y
+UBSAN_SANITIZE_undefined.o := n
+UBSAN_SIGNED_WRAP_legacy.o := y
+UBSAN_INTEGER_WRAP_modern.o := y
+CFLAGS_KASAN_TEST := $(CFLAGS_KASAN)
+CFLAGS_kasan_test_c.o := $(CFLAGS_KASAN_TEST) -fno-builtin
+CFLAGS_kcsan_test.o := $(CFLAGS_KCSAN) -fno-omit-frame-pointer
+UNRELATED_SETTING_ignored.o := y
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{"BITS": "64"},
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+
+	want := []kbuildObjectSetting{
+		{Name: "KASAN_SANITIZE", Value: "n"},
+		{Name: "KASAN_SANITIZE", Object: "head64.o", Value: "n"},
+		{Name: "KCSAN_INSTRUMENT_BARRIERS", Object: "racy.o", Value: "y"},
+		{Name: "KCSAN_SANITIZE", Object: "racy.o", Value: "y"},
+		{Name: "UBSAN_INTEGER_WRAP", Object: "modern.o", Value: "y"},
+		{Name: "UBSAN_SANITIZE", Object: "undefined.o", Value: "n"},
+		{Name: "UBSAN_SIGNED_WRAP", Object: "legacy.o", Value: "y"},
+		{Name: "CFLAGS_KASAN", Object: "kasan_test_c.o", Value: "y"},
+		{Name: "CFLAGS_KCSAN", Object: "kcsan_test.o", Value: "y"},
+	}
+	if !reflect.DeepEqual(kb.objectSettings, want) {
+		t.Fatalf("object settings mismatch\nwant: %#v\n got: %#v", want, kb.objectSettings)
+	}
+	gotFlags := map[string][]string{}
+	for _, flag := range kb.Flags {
+		if flag.Scope == "object" {
+			gotFlags[flag.Object] = append(gotFlags[flag.Object], flag.Flags...)
+		}
+	}
+	wantFlags := map[string][]string{
+		"kasan_test_c.o": {"-fno-builtin"},
+		"kcsan_test.o":   {"-fno-omit-frame-pointer"},
+	}
+	if !reflect.DeepEqual(gotFlags, wantFlags) {
+		t.Fatalf("explicit sanitizer reference filtering mismatch\nwant: %#v\n got: %#v", wantFlags, gotFlags)
+	}
+}
+
+func TestKbuildClangProbeModelsKcsanRuntimeOptionsByArchitecture(t *testing.T) {
+	for _, test := range []struct {
+		srcarch string
+		want    []string
+	}{
+		{srcarch: "x86", want: []string{"-fno-stack-protector"}},
+		{srcarch: "arm64", want: []string{"-mno-outline-atomics", "-fno-stack-protector"}},
+	} {
+		t.Run(test.srcarch, func(t *testing.T) {
+			dir := t.TempDir()
+			kbuild := filepath.Join(dir, "Kbuild")
+			if err := os.WriteFile(kbuild, []byte(`obj-y += core.o
+CFLAGS_core.o := $(call cc-option,-fno-conserve-stack) \
+	$(call cc-option,-mno-outline-atomics) -fno-stack-protector
+`), 0o644); err != nil {
+				t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+			}
+			kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+				Variables: map[string]string{"SRCARCH": test.srcarch},
+			})
+			if err != nil {
+				t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+			}
+			var got []string
+			for _, flag := range kb.Flags {
+				if flag.Scope == "object" && flag.Object == "core.o" {
+					got = append(got, flag.Flags...)
+				}
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("KCSAN runtime flags = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseKbuildDirectoryTreePrefixesSanitizerObjectSettings(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Kbuild"), []byte(`obj-y += root.o child/
+KASAN_SANITIZE_root.o := n
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "child"), 0o755); err != nil {
+		t.Fatalf("Mkdir(child) failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "child", "Makefile"), []byte(`obj-y += default.o override.o
+KASAN_SANITIZE := n
+KASAN_SANITIZE_override.o := y
+KCSAN_INSTRUMENT_BARRIERS := y
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(child/Makefile) failed: %v", err)
+	}
+	kb, err := ParseKbuildDirectoryTree(filepath.Join(dir, "Kbuild"), KbuildOptions{RootDir: dir})
+	if err != nil {
+		t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+	}
+
+	want := []kbuildObjectSetting{
+		{Name: "KASAN_SANITIZE", Object: "root.o", Value: "n"},
+		{Name: "KASAN_SANITIZE", Directory: "child", Value: "n"},
+		{Name: "KASAN_SANITIZE", Object: "child/override.o", Directory: "child", Value: "y"},
+		{Name: "KCSAN_INSTRUMENT_BARRIERS", Directory: "child", Value: "y"},
+	}
+	if !reflect.DeepEqual(kb.objectSettings, want) {
+		t.Fatalf("prefixed object settings mismatch\nwant: %#v\n got: %#v", want, kb.objectSettings)
+	}
+}
+
 func TestParseKbuildExpandsAdditionalPureMakeFunctions(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "existing.o"), nil, 0o644); err != nil {

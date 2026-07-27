@@ -12,6 +12,7 @@ load(":linux_modules_test.bzl", "linux_module_test_suite")
 load(":linux_objects_failure_test.bzl", "linux_objects_fail_closed_test_suite")
 load(":linux_rust_test.bzl", "linux_rust_test_suite")
 load(":path_mapping_test.bzl", "path_mapping_test")
+load(":sanitizer_actions_test.bzl", "sanitizer_actions_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -61,3 +62,5 @@ build_test(
 )
 
 path_mapping_test(name = "path_mapping_test")
+
+sanitizer_actions_test(name = "sanitizer_actions_test")

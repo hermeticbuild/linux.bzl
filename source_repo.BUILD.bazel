@@ -62,6 +62,7 @@ filegroup(
         "rust/**",
         "samples/Kconfig",
         "scripts/generate_rust_target.rs",
+        "scripts/integer-wrap-ignore.scl",
         "scripts/mod/**",
         "scripts/module-common.c",
         "scripts/module.lds.S",

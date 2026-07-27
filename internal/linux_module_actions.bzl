@@ -149,6 +149,90 @@ def _target_link_flags(ctx, helpers, target):
         target.feature_configuration,
     )
 
+def _module_metadata_sanitizer_flags(config, source_root, version):
+    values = config.config_flags
+    flags = []
+    if values.get("CONFIG_KASAN") == "y" and values.get("CONFIG_KASAN_HW_TAGS") != "y":
+        shadow_offset = values.get("CONFIG_KASAN_SHADOW_OFFSET", "")
+        stack = "1" if values.get("CONFIG_KASAN_STACK") == "y" else "0"
+        if values.get("CONFIG_KASAN_GENERIC") == "y":
+            flags.append("-fsanitize=kernel-address")
+            if shadow_offset and shadow_offset != "n":
+                flags.extend(["-mllvm", "-asan-mapping-offset=" + shadow_offset])
+            flags.extend([
+                "-mllvm",
+                "-asan-instrumentation-with-call-threshold=" + ("10000" if values.get("CONFIG_KASAN_INLINE") == "y" else "0"),
+                "-mllvm",
+                "-asan-stack=" + stack,
+                "-mllvm",
+                "-asan-instrument-allocas=1",
+                "-mllvm",
+                "-asan-globals=1",
+                "-mllvm",
+                "-asan-kernel-mem-intrinsic-prefix=1",
+            ])
+        elif values.get("CONFIG_KASAN_SW_TAGS") == "y":
+            flags.append("-fsanitize=kernel-hwaddress")
+            if values.get("CONFIG_KASAN_INLINE") == "y":
+                if shadow_offset and shadow_offset != "n":
+                    flags.extend(["-mllvm", "-hwasan-mapping-offset=" + shadow_offset])
+            else:
+                flags.extend(["-mllvm", "-hwasan-instrument-with-calls=1"])
+            flags.extend([
+                "-mllvm",
+                "-hwasan-instrument-stack=" + stack,
+                "-mllvm",
+                "-hwasan-use-short-granules=0",
+                "-mllvm",
+                "-hwasan-inline-all-checks=0",
+            ])
+            if values.get("CONFIG_CC_HAS_KASAN_MEMINTRINSIC_PREFIX") == "y":
+                flags.extend(["-mllvm", "-hwasan-kernel-mem-intrinsic-prefix=1"])
+
+    if values.get("CONFIG_UBSAN") == "y":
+        for symbol, flag in [
+            ("CONFIG_UBSAN_ALIGNMENT", "-fsanitize=alignment"),
+            ("CONFIG_UBSAN_BOUNDS_STRICT", "-fsanitize=bounds-strict"),
+            ("CONFIG_UBSAN_ARRAY_BOUNDS", "-fsanitize=array-bounds"),
+            ("CONFIG_UBSAN_LOCAL_BOUNDS", "-fsanitize=local-bounds"),
+            ("CONFIG_UBSAN_SHIFT", "-fsanitize=shift"),
+            ("CONFIG_UBSAN_DIV_ZERO", "-fsanitize=integer-divide-by-zero"),
+            ("CONFIG_UBSAN_UNREACHABLE", "-fsanitize=unreachable"),
+            ("CONFIG_UBSAN_BOOL", "-fsanitize=bool"),
+            ("CONFIG_UBSAN_ENUM", "-fsanitize=enum"),
+        ]:
+            if values.get(symbol) == "y":
+                flags.append(flag)
+        if values.get("CONFIG_UBSAN_TRAP") == "y":
+            flags.append("-fsanitize-trap=undefined")
+        if values.get("CONFIG_UBSAN_SIGNED_WRAP") == "y":
+            flags.append("-fsanitize=signed-integer-overflow")
+        if values.get("CONFIG_UBSAN_INTEGER_WRAP") == "y":
+            flags.extend([
+                "-DINTEGER_WRAP",
+                "-fsanitize-undefined-ignore-overflow-pattern=all",
+                "-fsanitize=signed-integer-overflow",
+                "-fsanitize=unsigned-integer-overflow",
+                "-fsanitize=implicit-signed-integer-truncation",
+                "-fsanitize=implicit-unsigned-integer-truncation",
+                "-fsanitize-ignorelist=" + source_root + "/scripts/integer-wrap-ignore.scl",
+            ])
+    if values.get("CONFIG_KCSAN") == "y" and _version_at_least(version, 6, 18):
+        flags.extend([
+            "-fsanitize=thread",
+            "-fno-optimize-sibling-calls",
+            "-mllvm",
+            "-tsan-compound-read-before-write=1" if values.get("CONFIG_CC_HAS_TSAN_COMPOUND_READ_BEFORE_WRITE") == "y" else "-tsan-instrument-read-before-write=1",
+            "-mllvm",
+            "-tsan-distinguish-volatile=1",
+        ])
+        if values.get("CONFIG_KCSAN_WEAK_MEMORY") != "y":
+            flags.extend([
+                "-mllvm",
+                "-tsan-instrument-func-entry-exit=0",
+            ])
+    return flags
+
 def _devicetable_offsets(ctx, helpers, kernel, target, source_files):
     src = _source_file(source_files, "scripts/mod/devicetable-offsets.c")
     asm = ctx.actions.declare_file(ctx.label.name + ".module_prep/scripts/mod/devicetable-offsets.s")
@@ -342,11 +426,16 @@ def _module_linker_script(ctx, helpers, kernel, target, source_files):
     )
     return out
 
-def _compile_module_c(ctx, helpers, kernel, target, src, out, object_name, modname):
+def _compile_module_c(ctx, helpers, kernel, target, src, out, object_name, modname, version):
     args = ctx.actions.args()
     _add_target_c_flags(args, _target_c_flags(ctx, helpers, kernel, target))
     args.add_all(helpers.module_flags("m"))
     args.add_all(helpers.object_name_flags(object_name, modname))
+    args.add_all(_module_metadata_sanitizer_flags(
+        kernel.config,
+        _execroot_dir(kernel.source_root),
+        version,
+    ))
     args.add("-c")
     args.add(src)
     args.add("-o")
@@ -374,6 +463,7 @@ def _module_common(ctx, helpers, kernel, target, source_files):
         out,
         ".module-common.o",
         ".module-common.o",
+        kernel.version,
     )
 
 def _module_map(module_objects):
@@ -592,6 +682,7 @@ def _prepare(ctx, helpers, kernel):
 
 linux_module_actions = struct(
     compile_module_c = _compile_module_c,
+    module_metadata_sanitizer_flags = _module_metadata_sanitizer_flags,
     modpost_args = _modpost_args,
     module_map = _module_map,
     objtool_args = _objtool_args,
