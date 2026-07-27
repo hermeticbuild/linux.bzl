@@ -14,7 +14,7 @@ import (
 
 	build "github.com/bazelbuild/buildtools/build"
 
-	"linux.bzl/internal/kconfig/buildgen"
+	"github.com/hermeticbuild/linux.bzl/internal/kconfig/buildgen"
 )
 
 var (

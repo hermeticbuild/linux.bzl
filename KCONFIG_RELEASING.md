@@ -1,8 +1,8 @@
 # Releasing the Kconfig graph generator
 
-The `kconfig_parse` binary has an independent release stream because repository
-rules download it before the normal Bazel analysis phase. Generator releases
-are tagged as `kconfig-vX.Y.Z`.
+The `kconfig` and `kconfig_parse` binaries share an independent release stream
+because repository rules download them before the normal Bazel analysis phase.
+Generator releases are tagged as `kconfig-vX.Y.Z`.
 
 ## Compatibility
 
@@ -30,8 +30,10 @@ actions. Rust-owned objects are excluded from the ordinary object graph.
 5. Build the six platform archives twice from clean output trees and compare
    their SHA-256 digests.
 
-Each deterministic `.tar.zst` archive must contain exactly one executable at
-its root: `kconfig_parse` on Linux and macOS, or `kconfig_parse.exe` on Windows.
+Each deterministic `.tar.zst` archive must contain exactly two executables at
+its root: `kconfig` and `kconfig_parse` on Linux and macOS, or `kconfig.exe` and
+`kconfig_parse.exe` on Windows. Both tools remain in the same archive and
+version stream.
 
 ## Publish
 
