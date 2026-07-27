@@ -20,6 +20,13 @@ _RUST_TOOLCHAIN_TYPE = Label("@rules_rust//rust:toolchain_type")
 _BINDGEN_TOOLCHAIN_TYPE = Label("@rules_rs//rs:bindgen_toolchain_type")
 _RUSTC_VERSION = "1.97.0"
 _RUST_PROFILE_SCHEMA = "linux-rust-profile-v1"
+_RUSTC_SOURCE_PREFIX_CLOSURE = {
+    # Rust 1.97 core imports these sibling trees with #[path].
+    "rustc://library/core/": [
+        "rustc://library/portable-simd/crates/core_simd/",
+        "rustc://library/stdarch/crates/core_arch/",
+    ],
+}
 
 def _execroot_path(file):
     path = file.short_path.replace("\\", "/")
@@ -217,6 +224,14 @@ def _rustc_subtree(rustc_srcs, prefix):
         )
     ]
 
+def _rustc_source_prefixes(prefixes):
+    expanded = {}
+    for prefix in prefixes:
+        expanded[prefix] = True
+        for transitive_prefix in _RUSTC_SOURCE_PREFIX_CLOSURE.get(prefix, []):
+            expanded[transitive_prefix] = True
+    return sorted(expanded.keys())
+
 def _rust_env(rust_toolchain):
     env = dict(rust_toolchain.env)
     env["RUSTC_BOOTSTRAP"] = "1"
@@ -272,7 +287,7 @@ def _run_rustc(
         progress_message = progress_message,
     )
 
-def _host_rust_link_flags(host_cc, host_features):
+def _host_rust_link(host_cc, host_features):
     host_compiler = cc_common.get_tool_for_action(
         feature_configuration = host_features,
         action_name = C_COMPILE_ACTION_NAME,
@@ -288,13 +303,23 @@ def _host_rust_link_flags(host_cc, host_features):
         action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
         variables = link_variables,
     )
+    runtime_files = host_cc.static_runtime_lib(
+        feature_configuration = host_features,
+    )
     flags = [
         "-Clink-self-contained=-linker",
         "-Clinker-flavor=gcc",
         "-Clinker=" + host_compiler,
     ]
+    flags.extend([
+        "-Clink-arg=" + file.path
+        for file in runtime_files.to_list()
+    ])
     flags.extend(["-Clink-arg=" + flag for flag in host_link_flags])
-    return flags
+    return struct(
+        flags = flags,
+        runtime_files = runtime_files,
+    )
 
 def _target_spec(
         ctx,
@@ -319,8 +344,9 @@ def _target_spec(
     generator = ctx.actions.declare_file(
         ctx.label.name + ".rust_sdk/scripts/generate_rust_target",
     )
+    host_link = _host_rust_link(host_cc, host_features)
     args = list(profile["common_flags"])
-    args.extend(_host_rust_link_flags(host_cc, host_features))
+    args.extend(host_link.flags)
     args.extend([
         "--crate-name",
         "generate_rust_target",
@@ -335,8 +361,8 @@ def _target_spec(
         [generator],
         "LinuxRustTargetGeneratorCompile",
         "Compiling the Linux Rust target generator %{label}",
-        mapped_files = [generator, source],
-        transitive_tool_inputs = [host_cc.all_files],
+        mapped_files = [generator, source] + host_link.runtime_files.to_list(),
+        transitive_tool_inputs = [host_cc.all_files, host_link.runtime_files],
     )
 
     out = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/" + output_path)
@@ -772,7 +798,8 @@ def _proc_macro(
     args = list(common_flags)
     args.extend(crate_flags)
     args.append("--sysroot=" + rust_toolchain.sysroot)
-    args.extend(_host_rust_link_flags(host_cc, host_features))
+    host_link = _host_rust_link(host_cc, host_features)
+    args.extend(host_link.flags)
     args.extend([
         "--emit=link=" + output.path,
         "--extern",
@@ -795,14 +822,14 @@ def _proc_macro(
         [output],
         "LinuxRustProcMacro",
         "Compiling Rust-for-Linux procedural macro %s %%{label}" % name,
-        mapped_files = [output, source, config.rustc_cfg],
+        mapped_files = [output, source, config.rustc_cfg] + host_link.runtime_files.to_list(),
         mapped_directories = {
             rust_toolchain.sysroot: directory_anchor(
                 rust_toolchain.sysroot_anchor,
                 rust_toolchain.sysroot,
             ),
         },
-        transitive_tool_inputs = [host_cc.all_files],
+        transitive_tool_inputs = [host_cc.all_files, host_link.runtime_files],
     )
     return output
 
@@ -1078,11 +1105,19 @@ def _linux_rust_kernel_sdk_impl(ctx):
         source_inputs = []
         if source_path.startswith("rustc://"):
             source = _rustc_file(rustc_srcs, source_path)
-            for prefix in _profile_string_list(recipe, "source_prefixes"):
-                source_inputs.extend(_rustc_subtree(rustc_srcs, prefix))
+            rustc_inputs = {source.path: source}
+            for prefix in _rustc_source_prefixes(
+                _profile_string_list(recipe, "source_prefixes"),
+            ):
+                for file in _rustc_subtree(rustc_srcs, prefix):
+                    rustc_inputs[file.path] = file
             for path in _profile_string_list(recipe, "source_files"):
-                source_inputs.append(_rustc_file(rustc_srcs, path))
-            source_inputs.append(source)
+                file = _rustc_file(rustc_srcs, path)
+                rustc_inputs[file.path] = file
+            source_inputs = [
+                rustc_inputs[path]
+                for path in sorted(rustc_inputs.keys())
+            ]
         else:
             source_path = _validate_profile_path(source_path, "crates.source")
             source = _source_file(source_files, source_path)
@@ -1349,5 +1384,6 @@ linux_rust_test_helpers = struct(
     extend_kernel_c_flags = _extend_kernel_c_flags,
     expand_profile_value = _expand_profile_value,
     profile_target_flags = _profile_target_flags,
+    rustc_source_prefixes = _rustc_source_prefixes,
     unsupported_config_symbols = _unsupported_rust_config_symbols,
 )

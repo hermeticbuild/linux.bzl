@@ -81,7 +81,20 @@ _ENABLED_PROFILE_JSON = """{
       "flags": []
     }
   ],
-  "crates": [],
+  "crates": [
+    {
+      "name": "core",
+      "source": "rustc://library/core/src/lib.rs",
+      "source_prefixes": ["rustc://library/core/"],
+      "source_files": [],
+      "generated_inputs": [],
+      "deps": [],
+      "externs": [],
+      "flags": [],
+      "skip_flags": [],
+      "objcopy_flags": []
+    }
+  ],
   "generated_assembly": [],
   "exports": {
     "crates": [],
@@ -179,11 +192,133 @@ _rust_source_fixture = rule(
     },
 )
 
+def _rust_host_link_outputs_fixture_impl(ctx):
+    sdk = ctx.attr.sdk[LinuxRustSdkInfo]
+    proc_macro_prefix = (
+        "/" +
+        ctx.attr.sdk.label.name +
+        ".rust_sdk/rust/lib" +
+        ctx.attr.proc_macro
+    )
+    proc_macros = [
+        file
+        for file in sdk.compile_inputs.to_list()
+        if proc_macro_prefix in ("/" + file.short_path.replace("\\", "/"))
+    ]
+    if len(proc_macros) != 1:
+        fail(
+            "expected one %s proc macro output, got %s" %
+            (ctx.attr.proc_macro, proc_macros),
+        )
+    return [DefaultInfo(files = depset([sdk.target_spec, proc_macros[0]]))]
+
+_rust_host_link_outputs_fixture = rule(
+    implementation = _rust_host_link_outputs_fixture_impl,
+    attrs = {
+        "proc_macro": attr.string(mandatory = True),
+        "sdk": attr.label(
+            mandatory = True,
+            providers = [LinuxRustSdkInfo],
+        ),
+    },
+)
+
+def _assert_host_rust_runtime_link(env, action):
+    runtime_prefix = "-Clink-arg="
+    runtime_indices = [
+        index
+        for index in range(len(action.argv))
+        if (
+            action.argv[index].startswith(runtime_prefix) and
+            action.argv[index].endswith(".a")
+        )
+    ]
+    asserts.true(
+        env,
+        len(runtime_indices) > 0,
+        "expected static C++ runtime archives in %s" % action.argv,
+    )
+    input_paths = {
+        file.path: True
+        for file in action.inputs.to_list()
+    }
+    for index in runtime_indices:
+        path = action.argv[index][len(runtime_prefix):]
+        asserts.false(
+            env,
+            path.startswith("/"),
+            "expected execroot-relative runtime path, got %s" % path,
+        )
+        asserts.true(
+            env,
+            path in input_paths,
+            "runtime archive %s is not an action input" % path,
+        )
+
+    unwind_indices = [
+        index
+        for index in range(len(action.argv))
+        if action.argv[index] == "-Clink-arg=--unwindlib=none"
+    ]
+    if unwind_indices:
+        asserts.true(
+            env,
+            max(runtime_indices) < unwind_indices[0],
+            "runtime archives must precede host default-library flags",
+        )
+
+def _action_has_argument_pair(action, flag, value):
+    for index in range(len(action.argv) - 1):
+        if action.argv[index] == flag and action.argv[index + 1] == value:
+            return True
+    return False
+
+def _action_has_input_suffix(action, suffix):
+    for file in action.inputs.to_list():
+        if ("/" + file.short_path.replace("\\", "/")).endswith(suffix):
+            return True
+    return False
+
 def _enabled_sdk_test_impl(ctx):
     env = analysistest.begin(ctx)
     target = analysistest.target_under_test(env)
     sdk = target[LinuxRustSdkInfo]
     asserts.true(env, sdk.enabled)
+    target_generator_actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxRustTargetGeneratorCompile"
+    ]
+    asserts.equals(env, 1, len(target_generator_actions))
+    if target_generator_actions:
+        _assert_host_rust_runtime_link(env, target_generator_actions[0])
+    core_actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if (
+            action.mnemonic == "LinuxRustc" and
+            _action_has_argument_pair(action, "--crate-name", "core")
+        )
+    ]
+    asserts.equals(env, 1, len(core_actions))
+    if core_actions:
+        for suffix in [
+            "/library/core/src/lib.rs",
+            "/library/portable-simd/crates/core_simd/src/core_simd_docs.md",
+            "/library/portable-simd/crates/core_simd/src/mod.rs",
+            "/library/stdarch/crates/core_arch/src/mod.rs",
+            "/library/stdarch/crates/core_arch/src/x86/mod.rs",
+        ]:
+            asserts.true(
+                env,
+                _action_has_input_suffix(core_actions[0], suffix),
+                "core rustc action is missing %s" % suffix,
+            )
+        asserts.false(
+            env,
+            _action_has_input_suffix(core_actions[0], "/library/std/src/lib.rs"),
+            "core rustc action should not depend on the full Rust source archive",
+        )
     proc_macro_actions = [
         action
         for action in analysistest.target_actions(env)
@@ -191,6 +326,7 @@ def _enabled_sdk_test_impl(ctx):
     ]
     asserts.equals(env, 1, len(proc_macro_actions))
     if proc_macro_actions:
+        _assert_host_rust_runtime_link(env, proc_macro_actions[0])
         sysroots = [
             arg
             for arg in proc_macro_actions[0].argv
@@ -270,6 +406,24 @@ def _legacy_profile_flags_test_impl(ctx):
     return unittest.end(env)
 
 _legacy_profile_flags_test = unittest.make(_legacy_profile_flags_test_impl)
+
+def _rustc_source_prefixes_test_impl(ctx):
+    env = unittest.begin(ctx)
+    asserts.equals(
+        env,
+        [
+            "rustc://library/core/",
+            "rustc://library/portable-simd/crates/core_simd/",
+            "rustc://library/stdarch/crates/core_arch/",
+        ],
+        linux_rust_test_helpers.rustc_source_prefixes([
+            "rustc://library/core/",
+            "rustc://library/stdarch/crates/core_arch/",
+        ]),
+    )
+    return unittest.end(env)
+
+_rustc_source_prefixes_test = unittest.make(_rustc_source_prefixes_test_impl)
 
 def _extend_kernel_c_flags_test_impl(ctx):
     env = unittest.begin(ctx)
@@ -372,6 +526,12 @@ def linux_rust_test_suite(name):
         tags = ["manual"],
         target_under_test = ":" + enabled_sdk,
     )
+    _rust_host_link_outputs_fixture(
+        name = name + "_host_link_outputs",
+        proc_macro = "test_macro",
+        sdk = ":" + enabled_sdk,
+        tags = ["manual"],
+    )
 
     protocol_test = name + "_repository_protocol_test"
     _repository_protocol_test(name = protocol_test)
@@ -379,6 +539,8 @@ def linux_rust_test_suite(name):
     _unsupported_dead_code_elimination_test(name = dead_code_test)
     legacy_profile_test = name + "_legacy_profile_flags_test"
     _legacy_profile_flags_test(name = legacy_profile_test)
+    source_prefixes_test = name + "_rustc_source_prefixes_test"
+    _rustc_source_prefixes_test(name = source_prefixes_test)
     extend_flags_test = name + "_extend_kernel_c_flags_test"
     _extend_kernel_c_flags_test(name = extend_flags_test)
 
@@ -391,5 +553,6 @@ def linux_rust_test_suite(name):
             ":" + dead_code_test,
             ":" + extend_flags_test,
             ":" + legacy_profile_test,
+            ":" + source_prefixes_test,
         ],
     )
