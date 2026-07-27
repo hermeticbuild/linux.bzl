@@ -25,6 +25,11 @@ alias(
 )
 
 alias(
+    name = "x86_64_btf_vmlinux",
+    actual = "@example_x86_64//variants/btf:vmlinux",
+)
+
+alias(
     name = "x86_64_lz4_kernel",
     actual = "@example_x86_64//variants/lz4:kernel",
 )

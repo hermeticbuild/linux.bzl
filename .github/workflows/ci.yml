@@ -101,7 +101,7 @@ jobs:
             targets: "//:example_initramfs"
           - batch: x86-64-variants
             title: x86_64 base + overlays
-            targets: "//:x86_64_kernel //:x86_64_debug_kernel //:x86_64_lz4_kernel"
+            targets: "//:x86_64_kernel //:x86_64_debug_kernel //:x86_64_btf_vmlinux //:x86_64_lz4_kernel"
           - batch: aarch64-base
             title: aarch64 base
             targets: "//:aarch64_kernel"

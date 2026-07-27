@@ -22,8 +22,13 @@ Build the named config variant:
 
 ```sh
 bazel build //:x86_64_debug_kernel
+bazel build //:x86_64_btf_vmlinux
 bazel build //:x86_64_lz4_kernel
 ```
+
+The BTF variant builds `vmlinux` with `CONFIG_DEBUG_INFO_BTF=y`. This consumer
+does not declare a direct `pahole` dependency; the build exercises the
+tool supplied transitively by `linux.bzl`.
 
 Kernel graph repositories also expose their fixed in-tree module outputs:
 

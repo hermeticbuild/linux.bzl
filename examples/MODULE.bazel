@@ -34,6 +34,7 @@ linux_image(
     name = "example_x86_64",
     config = "//configs:x86_64.config",
     overlays = {
+        "btf": "//configs:btf.config",
         "debug": "//configs:debug.config",
         "lz4": "//configs:lz4.config",
     },
