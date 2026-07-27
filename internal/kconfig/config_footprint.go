@@ -1,11 +1,13 @@
+// Copyright The Monogon Project Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 package kconfig
 
 import (
 	"io/fs"
-	"maps"
 	"os"
 	"path/filepath"
-	"slices"
+	"sort"
 	"strings"
 )
 
@@ -112,8 +114,16 @@ func (s *configSourceScanner) closureForSource(source string, extraIncludeRoots 
 			}
 		}
 	}
-	out := slices.Sorted(maps.Keys(refset))
-	includes := slices.Sorted(maps.Keys(includeSet))
+	out := make([]string, 0, len(refset))
+	for ref := range refset {
+		out = append(out, ref)
+	}
+	sort.Strings(out)
+	includes := make([]string, 0, len(includeSet))
+	for include := range includeSet {
+		includes = append(includes, include)
+	}
+	sort.Strings(includes)
 	result := sourceClosure{
 		refs:           out,
 		sourceIncludes: includes,
@@ -155,7 +165,12 @@ func (s *configSourceScanner) refsForSourceDir(dir string) []string {
 		}
 		return nil
 	})
-	return slices.Sorted(maps.Keys(refset))
+	out := make([]string, 0, len(refset))
+	for ref := range refset {
+		out = append(out, ref)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // scanFile returns the CONFIG_* tokens and raw include targets of one file.
