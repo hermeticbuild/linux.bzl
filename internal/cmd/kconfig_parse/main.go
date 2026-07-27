@@ -888,6 +888,13 @@ func isKbuildValidationFile(name string) bool {
 	return name == "Kbuild" || name == "Makefile" || strings.HasSuffix(name, ".mk")
 }
 
+func validateResolvedFlagsName(name string) error {
+	if name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("compact config name %q must be a single path component when -resolved_flags_dir is set", name)
+	}
+	return nil
+}
+
 func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, configInputs, configOverlays []namedPath, resolvedFlagsDir string, configMode string, compactKbuildTree bool, vars map[string]string, kbuildExtras []namedPath, sourceRoots map[string]string, schema kconfig.CompactSchema) (*kconfig.CompactMetadata, error) {
 	if kbuildPath == "" {
 		return nil, fmt.Errorf("-kbuild is required")
@@ -897,6 +904,11 @@ func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, con
 	}
 	configNames := map[string]bool{}
 	for _, input := range configInputs {
+		if resolvedFlagsDir != "" {
+			if err := validateResolvedFlagsName(input.Name); err != nil {
+				return nil, err
+			}
+		}
 		if configNames[input.Name] {
 			return nil, fmt.Errorf("duplicate compact config name %q", input.Name)
 		}
