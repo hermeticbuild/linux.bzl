@@ -168,3 +168,27 @@ func TestCompactMetadataRejectsDuplicateOverlay(t *testing.T) {
 		t.Fatalf("compactMetadata() error = %v, want duplicate overlay", err)
 	}
 }
+
+func TestCompactMetadataRejectsUnsafeResolvedFlagsNames(t *testing.T) {
+	for _, name := range []string{"../outside", "nested/config", `nested\config`, ".", ".."} {
+		t.Run(name, func(t *testing.T) {
+			_, err := compactMetadata(
+				nil,
+				"",
+				"Kbuild",
+				[]namedPath{{Name: name, Path: "base.config"}},
+				nil,
+				t.TempDir(),
+				"default",
+				false,
+				nil,
+				nil,
+				nil,
+				kconfig.CompactSchemaV012,
+			)
+			if err == nil || !strings.Contains(err.Error(), "must be a single path component") {
+				t.Fatalf("compactMetadata() error = %v, want unsafe name rejection", err)
+			}
+		})
+	}
+}
