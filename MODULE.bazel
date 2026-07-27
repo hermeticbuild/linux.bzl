@@ -26,9 +26,24 @@ use_repo(linux_bzl_libelf, "libelf")
 tar_toolchains = use_extension("@tar.bzl//tar:extensions.bzl", "toolchains", dev_dependency = True)
 use_repo(tar_toolchains, "bsd_tar_toolchains")
 
+llvm_toolchains = use_extension("@llvm//extensions:toolchain.bzl", "toolchain")
+llvm_toolchains.target(
+    arch = "x86_64",
+    os = "linux",
+)
+llvm_toolchains.target(
+    arch = "aarch64",
+    os = "linux",
+)
+use_repo(llvm_toolchains, "llvm_toolchains")
+
 register_toolchains(
     "@bsd_tar_toolchains//:all",
-    "@llvm//toolchain:all",
+    dev_dependency = True,
+)
+
+register_toolchains(
+    "@llvm_toolchains//:all",
     dev_dependency = True,
 )
 

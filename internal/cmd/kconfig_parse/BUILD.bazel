@@ -11,6 +11,7 @@ go_library(
 go_binary(
     name = "kconfig_parse",
     embed = [":kconfig_parse_lib"],
+    pure = "on",
     visibility = ["//visibility:public"],
 )
 

@@ -1,7 +1,10 @@
 name: kconfig prebuilts
 
 on:
+  pull_request:
   push:
+    branches:
+      - fionera/init
     tags:
       - "kconfig-v*"
   workflow_dispatch:
