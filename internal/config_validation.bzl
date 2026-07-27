@@ -26,12 +26,6 @@ def validate_config_features(config, description):
     ]:
         if config.get(symbol, "n") in ["y", "m"]:
             fail("%s enables %s, whose module metadata instrumentation is not modeled" % (description, symbol))
-    if config.get("CONFIG_KCSAN", "n") in ["y", "m"]:
-        fail(
-            "%s enables CONFIG_KCSAN, which requires the next kconfig generator release " %
-            description +
-            "to emit per-object instrumentation",
-        )
 
     for symbol in [
         "CONFIG_MODULE_SIG",

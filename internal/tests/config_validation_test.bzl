@@ -1,6 +1,6 @@
 """Analysis tests for supported Linux config validation."""
 
-load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
+load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts", "unittest")
 load("//internal:config_validation.bzl", "validate_config_features")
 
 visibility("private")
@@ -29,6 +29,16 @@ config_validation_failure_test = analysistest.make(
     expect_failure = True,
 )
 
+def _config_validation_kcsan_test_impl(ctx):
+    env = unittest.begin(ctx)
+    validate_config_features(
+        {"CONFIG_KCSAN": "y"},
+        str(ctx.label),
+    )
+    return unittest.end(env)
+
+config_validation_kcsan_test = unittest.make(_config_validation_kcsan_test_impl)
+
 def config_validation_test_suite(name):
     cases = {
         "cfi_modules": (
@@ -46,10 +56,6 @@ def config_validation_test_suite(name):
         "gendwarfksyms": (
             {"CONFIG_GENDWARFKSYMS": "y"},
             "module versioning",
-        ),
-        "kcsan_modules": (
-            {"CONFIG_KCSAN": "y"},
-            "requires the next kconfig generator release",
         ),
         "modversions": (
             {"CONFIG_MODVERSIONS": "y"},
@@ -83,6 +89,10 @@ def config_validation_test_suite(name):
             target_under_test = ":" + fixture,
         )
         tests.append(":" + test)
+
+    kcsan_test = name + "_kcsan_test"
+    config_validation_kcsan_test(name = kcsan_test)
+    tests.append(":" + kcsan_test)
 
     native.test_suite(
         name = name,
