@@ -26,6 +26,60 @@ _KERNEL_RELEASES = {
     ),
 }
 
+# Case-insensitive filesystems treat Linux's tools/**/Build make fragments as
+# Bazel package markers. Relocate them on every host for identical repositories.
+_TOOLS_BUILD_FILE = "Build"
+_TOOLS_BUILD_FILE_RELOCATED = "Build.linux-bzl"
+_TOOLS_MAX_DEPTH = 64
+
+def _relocate_tools_build_files(rctx, tools):
+    relocated = 0
+    directories = [tools]
+    for _ in range(_TOOLS_MAX_DEPTH):
+        if not directories:
+            break
+        next_directories = []
+        for directory in directories:
+            for entry in directory.readdir(watch = "no"):
+                if entry.is_dir:
+                    next_directories.append(entry)
+                elif entry.basename == _TOOLS_BUILD_FILE:
+                    rctx.rename(
+                        entry,
+                        entry.dirname.get_child(_TOOLS_BUILD_FILE_RELOCATED),
+                    )
+                    relocated += 1
+        directories = next_directories
+    if directories:
+        fail("Linux tools directory exceeds the supported traversal depth")
+    return relocated
+
+def _normalize_tools_build_files(rctx):
+    tools = rctx.path("tools")
+    if not tools.exists:
+        return
+
+    relocated = _relocate_tools_build_files(rctx, tools)
+    if relocated == 0:
+        return
+
+    makefile = rctx.path("tools/build/Makefile.build")
+    if not makefile.exists:
+        fail("Linux tools contain Build files but no tools/build/Makefile.build")
+
+    build_file_assignment = "build-file := $(dir)/Build\n"
+    relocated_assignment = "build-file := $(dir)/%s\n" % _TOOLS_BUILD_FILE_RELOCATED
+    content = rctx.read(makefile)
+    if build_file_assignment not in content:
+        fail(
+            "Linux tools/build/Makefile.build does not contain the expected Build assignment",
+        )
+    rctx.file(
+        makefile,
+        content.replace(build_file_assignment, relocated_assignment),
+        executable = False,
+    )
+
 def _linux_source_repository_impl(rctx):
     catalog = _KERNEL_RELEASES.get(rctx.attr.version)
     has_urls = len(rctx.attr.urls) != 0
@@ -60,6 +114,7 @@ def _linux_source_repository_impl(rctx):
     )
     for patch in rctx.attr.patches:
         rctx.patch(patch, strip = rctx.attr.patch_strip)
+    _normalize_tools_build_files(rctx)
 
     makefile = rctx.path("Makefile")
     kconfig = rctx.path("Kconfig")
