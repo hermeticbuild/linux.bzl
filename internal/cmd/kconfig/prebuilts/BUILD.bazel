@@ -28,6 +28,15 @@ _ARCHIVE_TOOL_SUFFIXES = {
 
 [
     platform_transition_filegroup(
+        name = "kconfig_for_" + platform,
+        srcs = ["//internal/cmd/kconfig"],
+        target_platform = "@rules_go//go/toolchain:" + platform,
+    )
+    for platform in _PLATFORMS
+]
+
+[
+    platform_transition_filegroup(
         name = "kconfig_parse_for_" + platform,
         srcs = ["//internal/cmd/kconfig_parse"],
         target_platform = "@rules_go//go/toolchain:" + platform,
@@ -38,7 +47,10 @@ _ARCHIVE_TOOL_SUFFIXES = {
 [
     filegroup(
         name = "for_" + platform,
-        srcs = [":kconfig_parse_for_" + platform],
+        srcs = [
+            ":kconfig_for_" + platform,
+            ":kconfig_parse_for_" + platform,
+        ],
     )
     for platform in _PLATFORMS
 ]
@@ -58,9 +70,16 @@ filegroup(
 [
     tar(
         name = archive,
-        srcs = [":kconfig_parse_for_" + platform],
+        srcs = [
+            ":kconfig_for_" + platform,
+            ":kconfig_parse_for_" + platform,
+        ],
         compress = "zstd",
         mtree = [
+            "{} uid=0 gid=0 mode=0755 time=0 type=file content=$(location :kconfig_for_{})".format(
+                "kconfig" + _ARCHIVE_TOOL_SUFFIXES.get(platform, ""),
+                platform,
+            ),
             "{} uid=0 gid=0 mode=0755 time=0 type=file content=$(location :kconfig_parse_for_{})".format(
                 "kconfig_parse" + _ARCHIVE_TOOL_SUFFIXES.get(platform, ""),
                 platform,

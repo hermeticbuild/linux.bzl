@@ -37,23 +37,27 @@ copy_out //internal/cmd/kconfig/prebuilts:kconfig-windows-arm64
 
 check_archive() {
   local archive="$1"
-  local expected="$2"
+  shift
+  local expected
   local listing
 
   listing="$(tar --zstd -tf "dist/${archive}")"
+  expected="$(printf '%s\n' "$@")"
   if [[ "${listing}" != "${expected}" ]]; then
-    echo "dist/${archive} must contain only ${expected}; got:" >&2
+    echo "dist/${archive} has unexpected contents; wanted:" >&2
+    printf '%s\n' "${expected}" >&2
+    echo "got:" >&2
     printf '%s\n' "${listing}" >&2
     exit 1
   fi
 }
 
-check_archive kconfig-darwin-amd64.tar.zst kconfig_parse
-check_archive kconfig-darwin-arm64.tar.zst kconfig_parse
-check_archive kconfig-linux-amd64.tar.zst kconfig_parse
-check_archive kconfig-linux-arm64.tar.zst kconfig_parse
-check_archive kconfig-windows-amd64.tar.zst kconfig_parse.exe
-check_archive kconfig-windows-arm64.tar.zst kconfig_parse.exe
+check_archive kconfig-darwin-amd64.tar.zst kconfig kconfig_parse
+check_archive kconfig-darwin-arm64.tar.zst kconfig kconfig_parse
+check_archive kconfig-linux-amd64.tar.zst kconfig kconfig_parse
+check_archive kconfig-linux-arm64.tar.zst kconfig kconfig_parse
+check_archive kconfig-windows-amd64.tar.zst kconfig.exe kconfig_parse.exe
+check_archive kconfig-windows-arm64.tar.zst kconfig.exe kconfig_parse.exe
 
 (
   cd dist
