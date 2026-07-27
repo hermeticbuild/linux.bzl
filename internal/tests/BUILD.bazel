@@ -55,4 +55,9 @@ linux_module_test_suite(name = "linux_module_test")
 
 linux_rust_test_suite(name = "linux_rust_test")
 
+build_test(
+    name = "linux_rust_enabled_sdk_build_test",
+    targets = [":linux_rust_test_host_link_outputs"],
+)
+
 path_mapping_test(name = "path_mapping_test")

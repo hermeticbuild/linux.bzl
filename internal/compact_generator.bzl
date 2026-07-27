@@ -64,6 +64,7 @@ def _linux_compact_outputs_impl(ctx):
     buildfile = ctx.actions.declare_file(ctx.label.name + ".BUILD.bazel")
 
     args = ctx.actions.args()
+    args.add("-compact_schema=v0.0.12")
     args.add("-root", ctx.file.root)
     args.add("-kbuild", ctx.file.kbuild)
     args.add("-compact_metadata_out", metadata)
