@@ -1,0 +1,91 @@
+name: Host platform builds
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-platforms-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  examples:
+    name: Standalone kernels (${{ matrix.host }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: macOS
+            runner: macos-latest
+          - host: Windows
+            runner: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-${{ runner.os }}
+          module-root: examples
+          repository-cache: |
+            - examples/.bazelversion
+            - examples/MODULE.bazel
+            - examples/MODULE.bazel.lock
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build Linux kernels
+        working-directory: examples
+        env:
+          BAZEL_BEP: ../.ci-artifacts/${{ runner.os }}.bep.json
+          BAZEL_LOG: ../.ci-artifacts/${{ runner.os }}.log
+          BAZEL_PROFILE: ../.ci-artifacts/${{ runner.os }}.profile.gz
+        run: |
+          set -euo pipefail
+          mkdir -p ../.ci-artifacts
+          bazel --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            build \
+            //:x86_64_kernel \
+            //:x86_64_debug_kernel \
+            //:x86_64_lz4_kernel \
+            --config=path-mapping \
+            --build_event_json_file="${BAZEL_BEP}" \
+            --profile="${BAZEL_PROFILE}" \
+            2>&1 | tee "${BAZEL_LOG}"
+
+      - name: Report cache efficiency
+        if: ${{ !cancelled() }}
+        env:
+          BAZEL_BEP: .ci-artifacts/${{ runner.os }}.bep.json
+          BAZEL_LOG: .ci-artifacts/${{ runner.os }}.log
+          BAZEL_PROFILE: .ci-artifacts/${{ runner.os }}.profile.gz
+        run: |
+          .github/workflows/bazel_cache_report.sh \
+            "Standalone kernels (${{ matrix.host }})" \
+            "${BAZEL_PROFILE}" \
+            "${BAZEL_BEP}" \
+            "${BAZEL_LOG}"
+
+      - name: Upload Bazel profile
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bazel-profile-host-${{ runner.os }}
+          path: |
+            .ci-artifacts/${{ runner.os }}.profile.gz
+            .ci-artifacts/${{ runner.os }}.bep.json
+            .ci-artifacts/${{ runner.os }}.log
+          if-no-files-found: warn
+          retention-days: 14
