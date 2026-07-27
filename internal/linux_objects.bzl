@@ -2890,6 +2890,7 @@ def _linux_config_impl(ctx):
     auto_conf = ctx.actions.declare_file(config_dir + "/include/config/auto.conf")
     auto_conf_cmd = ctx.actions.declare_file(config_dir + "/include/config/auto.conf.cmd")
     autoconf_h = ctx.actions.declare_file(config_dir + "/include/generated/autoconf.h")
+    integer_wrap_h = ctx.actions.declare_file(config_dir + "/include/generated/integer-wrap.h")
     rustc_cfg = ctx.actions.declare_file(config_dir + "/include/generated/rustc_cfg")
     kernel_release = ctx.actions.declare_file(config_dir + "/include/config/kernel.release")
     aflags = ctx.actions.declare_file(config_dir + "/include/generated/bazel_kbuild_aflags.rsp")
@@ -2925,6 +2926,7 @@ def _linux_config_impl(ctx):
     auto_conf_cmd_args.add(auto_conf, format = "cmd_%s := bazel linux_config")
     ctx.actions.write(auto_conf_cmd, auto_conf_cmd_args)
     ctx.actions.write(autoconf_h, "\n".join(header_lines) + "\n")
+    ctx.actions.write(integer_wrap_h, "")
     ctx.actions.write(rustc_cfg, "\n".join(rustc_lines) + "\n")
     ctx.actions.write(kernel_release, kernel_release_value + "\n")
 
@@ -2947,7 +2949,7 @@ def _linux_config_impl(ctx):
         ctx.actions.write(aflags, "")
         ctx.actions.write(cflags, "")
 
-    files = depset([config, auto_conf, auto_conf_cmd, autoconf_h, rustc_cfg, kernel_release, aflags, cflags])
+    files = depset([config, auto_conf, auto_conf_cmd, autoconf_h, integer_wrap_h, rustc_cfg, kernel_release, aflags, cflags])
     include_dir = autoconf_h.dirname
     if include_dir.endswith("/generated"):
         include_dir = include_dir[:-len("/generated")]
@@ -3019,6 +3021,7 @@ def _linux_resolved_config_impl(ctx):
     auto_conf = ctx.actions.declare_file(config_dir + "/include/config/auto.conf")
     auto_conf_cmd = ctx.actions.declare_file(config_dir + "/include/config/auto.conf.cmd")
     autoconf_h = ctx.actions.declare_file(config_dir + "/include/generated/autoconf.h")
+    integer_wrap_h = ctx.actions.declare_file(config_dir + "/include/generated/integer-wrap.h")
     rustc_cfg = ctx.actions.declare_file(config_dir + "/include/generated/rustc_cfg")
     kernel_release = ctx.actions.declare_file(config_dir + "/include/config/kernel.release")
     aflags = ctx.actions.declare_file(config_dir + "/include/generated/bazel_kbuild_aflags.rsp")
@@ -3072,6 +3075,7 @@ def _linux_resolved_config_impl(ctx):
         mnemonic = "LinuxResolvedConfig",
         progress_message = "Resolving Linux config %{label}",
     )
+    ctx.actions.write(integer_wrap_h, "")
 
     cflags_args = ctx.actions.args()
     cflags_args.add("-config", config)
@@ -3091,7 +3095,7 @@ def _linux_resolved_config_impl(ctx):
     include_dir = autoconf_h.dirname
     if include_dir.endswith("/generated"):
         include_dir = include_dir[:-len("/generated")]
-    files = depset([config, auto_conf, auto_conf_cmd, autoconf_h, rustc_cfg, kernel_release, aflags, cflags])
+    files = depset([config, auto_conf, auto_conf_cmd, autoconf_h, integer_wrap_h, rustc_cfg, kernel_release, aflags, cflags])
     return [
         DefaultInfo(files = files),
         LinuxConfigInfo(

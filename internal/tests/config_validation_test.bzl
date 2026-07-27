@@ -49,7 +49,7 @@ def config_validation_test_suite(name):
         ),
         "kcsan_modules": (
             {"CONFIG_KCSAN": "y"},
-            "module metadata instrumentation",
+            "requires the next kconfig generator release",
         ),
         "modversions": (
             {"CONFIG_MODVERSIONS": "y"},

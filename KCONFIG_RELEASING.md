@@ -17,6 +17,10 @@ actions. Rust-owned objects are excluded from the ordinary object graph.
 `linux-rust-profile-v1` JSON profile and is valid only with
 `-compact_schema=v0.0.12`.
 
+Generator `v0.0.13` keeps schema `v0.0.12` and adds config-sensitive
+KASAN/KCSAN/UBSAN instrumentation flags, including Kbuild per-object and
+per-directory overrides.
+
 ## Prepare
 
 1. Run `go test ./internal/kconfig ./internal/cmd/kconfig ./internal/cmd/kconfig_parse`.
@@ -24,10 +28,13 @@ actions. Rust-owned objects are excluded from the ordinary object graph.
 3. Exercise v0.0.12 against maintained Linux 6.12 and 6.18 source trees with
    `CONFIG_RUST=y`. Verify that the legacy and pin-init Rust layouts produce
    valid profiles and that a modified but compatible source tree is accepted.
-4. Verify that unsupported source layouts, unresolved Make expressions,
+4. Exercise C sanitizer configs against maintained Linux 6.12 and 6.18 source
+   trees. Verify KASAN/KCSAN/UBSAN object opt-outs, test-object opt-ins, arm64
+   nVHE defaults, and integer-wrap inputs.
+5. Verify that unsupported source layouts, unresolved Make expressions,
    incomplete leaf objects, and non-x86_64 Rust profiles fail with actionable
    errors.
-5. Build the six platform archives twice from clean output trees and compare
+6. Build the six platform archives twice from clean output trees and compare
    their SHA-256 digests.
 
 Each deterministic `.tar.zst` archive must contain exactly two executables at
@@ -40,7 +47,7 @@ version stream.
 After the release-preparation change is merged, tag that merge commit:
 
 ```sh
-VERSION=v0.0.12 ./release_kconfig.sh
+VERSION=v0.0.13 ./release_kconfig.sh
 ```
 
 The tag workflow publishes archives for Linux, macOS, and Windows on amd64 and

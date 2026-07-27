@@ -253,6 +253,11 @@ def _compile_external_mod_source(ctx, sdk, source, crate_name):
         crate_name + ".mod.o",
         crate_name + ".o",
     ))
+    args.add_all(linux_module_actions.module_metadata_sanitizer_flags(
+        sdk.config,
+        sdk.target_c_flags.source_root,
+        sdk.version,
+    ))
     args.add("-c")
     args.add(source)
     args.add("-o")
@@ -467,6 +472,7 @@ def _linux_module_sdk_impl(ctx):
                 mod_object,
                 path[:-len(".o")] + ".mod.o",
                 path,
+                ctx.attr.version,
             )
             linked = _link_module(
                 ctx,

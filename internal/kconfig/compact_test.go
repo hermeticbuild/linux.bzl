@@ -153,6 +153,113 @@ obj-$(CONFIG_NET) += net.o
 	}
 }
 
+func TestCompactMetadataAppliesPerObjectKasanFlagsToBuiltinsAndModules(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "Sanitizers"
+
+config MODULES
+	bool "Modules"
+	modules
+
+config KASAN
+	bool "KASAN"
+
+config KASAN_GENERIC
+	bool "Generic KASAN"
+
+config KASAN_INLINE
+	bool "Inline KASAN"
+
+config KASAN_STACK
+	bool "KASAN stack"
+
+config KASAN_SHADOW_OFFSET
+	hex "KASAN shadow offset"
+
+config CC_HAS_KASAN_MEMINTRINSIC_PREFIX
+	bool "KASAN memintrinsic prefix"
+`)
+	kb, err := ParseKbuild(strings.NewReader(`obj-y += builtin.o disabled.o
+obj-m += module.o
+KASAN_SANITIZE_disabled.o := n
+`), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{
+		Name: "kasan",
+		Flags: map[string]string{
+			"CONFIG_CC_HAS_KASAN_MEMINTRINSIC_PREFIX": "y",
+			"CONFIG_KASAN":               "y",
+			"CONFIG_KASAN_GENERIC":       "y",
+			"CONFIG_KASAN_INLINE":        "y",
+			"CONFIG_KASAN_SHADOW_OFFSET": "0xdffffc0000000000",
+			"CONFIG_KASAN_STACK":         "y",
+			"CONFIG_MODULES":             "y",
+		},
+	}}, CompactMetadataOptions{Schema: CompactSchemaV012})
+	if err != nil {
+		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+	}
+
+	config := configByName(metadata, "kasan")
+	for _, target := range []string{
+		objectTarget(metadata, config, "builtin.o"),
+		moduleObjectTarget(metadata, config, "module.o"),
+	} {
+		variant := variantByTarget(metadata, target)
+		if !slices.Contains(variant.Flags, "-fsanitize=kernel-address") {
+			t.Fatalf("%s mode=%s missing KASAN flags: %#v", variant.Object, variant.Mode, variant.Flags)
+		}
+	}
+	disabled := variantByTarget(metadata, objectTarget(metadata, config, "disabled.o"))
+	if slices.Contains(disabled.Flags, "-fsanitize=kernel-address") {
+		t.Fatalf("disabled object received KASAN flags: %#v", disabled.Flags)
+	}
+}
+
+func TestCompactMetadataExpandsUbsanTrapVariableForNvhe(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "nVHE UBSAN"
+
+config UBSAN
+	bool "UBSAN"
+
+config UBSAN_BOOL
+	bool "UBSAN bool"
+`)
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`obj-y += switch.nvhe.o
+UBSAN_SANITIZE := y
+ccflags-y += $(CFLAGS_UBSAN_TRAP)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{
+			"CFLAGS_UBSAN_TRAP": "-fsanitize-trap=undefined",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+	metadata, err := tree.CompactMetadata(kb, []NamedConfig{{
+		Name: "ubsan",
+		Flags: map[string]string{
+			"CONFIG_UBSAN":      "y",
+			"CONFIG_UBSAN_BOOL": "y",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("CompactMetadata() failed: %v", err)
+	}
+	variant := variantByTarget(metadata, objectTarget(metadata, configByName(metadata, "ubsan"), "switch.nvhe.o"))
+	if got, want := variant.Flags, []string{"-fsanitize-trap=undefined", "-fsanitize=bool"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("nVHE UBSAN flags = %#v, want %#v", got, want)
+	}
+}
+
 func TestCompactMetadataAppliesCompositeAssignmentReplacement(t *testing.T) {
 	tree := mustParseString(t, `
 mainmenu "Composite"
