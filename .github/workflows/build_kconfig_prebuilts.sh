@@ -4,18 +4,20 @@ set -euo pipefail
 export LANG=C
 export LC_ALL=C
 
-if [[ -z "${BUILDBUDDY_API_KEY:-}" ]]; then
-  echo "BUILDBUDDY_API_KEY GitHub secret is required for kconfig prebuilt builds." >&2
-  exit 1
+BAZEL_STARTUP_ARGS=()
+BAZEL_ARGS=("--lockfile_mode=error")
+if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
+  BAZEL_ARGS+=(
+    "--remote_cache=grpcs://remote.buildbuddy.io"
+    "--remote_executor=grpcs://remote.buildbuddy.io"
+    "--remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
+  )
+else
+  BAZEL_STARTUP_ARGS=("--ignore_all_rc_files")
 fi
 
-BAZEL_ARGS=(
-  "--remote_cache=grpcs://remote.buildbuddy.io"
-  "--remote_executor=grpcs://remote.buildbuddy.io"
-  "--remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
-)
-
-bazel build "${BAZEL_ARGS[@]}" //internal/cmd/kconfig/prebuilts:kconfig_prebuilts
+bazel "${BAZEL_STARTUP_ARGS[@]}" build "${BAZEL_ARGS[@]}" \
+  //internal/cmd/kconfig/prebuilts:kconfig_prebuilts
 
 rm -rf dist
 mkdir -p dist
@@ -24,7 +26,10 @@ copy_out() {
   local label="$1"
   local src
 
-  src="$(bazel cquery "${BAZEL_ARGS[@]}" --output=files "${label}")"
+  src="$(
+    bazel "${BAZEL_STARTUP_ARGS[@]}" cquery "${BAZEL_ARGS[@]}" \
+      --output=files "${label}"
+  )"
   cp "${src}" "dist/$(basename "${src}")"
 }
 
