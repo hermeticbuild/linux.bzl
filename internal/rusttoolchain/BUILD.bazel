@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "rusttoolchain",
+    srcs = ["probe.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/rusttoolchain",
+    visibility = ["//internal:__subpackages__"],
+)
+
+go_test(
+    name = "rusttoolchain_test",
+    srcs = ["probe_test.go"],
+    embed = [":rusttoolchain"],
+)

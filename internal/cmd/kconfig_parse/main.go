@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
+	"github.com/hermeticbuild/linux.bzl/internal/rusttoolchain"
 )
 
 type stringMapFlag map[string]string
@@ -27,6 +28,15 @@ func (f stringMapFlag) Set(value string) error {
 	}
 	f[key] = val
 	return nil
+}
+
+func applyRustToolchainProbe(
+	vars, linuxProbeValues stringMapFlag,
+	probe rusttoolchain.Probe,
+) {
+	vars["RUSTC_VERSION_TEXT"] = probe.VersionText
+	linuxProbeValues["rustc_version"] = strconv.Itoa(probe.VersionCode)
+	linuxProbeValues["rustc_llvm_version"] = strconv.Itoa(probe.LLVMVersionCode)
 }
 
 type stringSliceFlag []string
@@ -117,6 +127,8 @@ func main() {
 		srctree                  = flag.String("srctree", "", "Source tree used to resolve source statements")
 		allowShell               = flag.Bool("allow_shell", false, "Allow $(shell,...) expansion")
 		linuxProbeModel          = flag.String("linux_probe_model", "", "Hermetic Linux Kconfig probe model to use for $(shell,...) expansion. Supported: linux_llvm")
+		rustToolchainProbe       = flag.String("rust_toolchain_probe", "", "JSON identity produced from the selected rustc -vV output")
+		validateConfigEquivalent = flag.Bool("validate_config_equivalence", false, "Require action-time config to match the repository-generated structural snapshot")
 		out                      = flag.String("out", "", "Path to write the parsed Kconfig as JSON. Defaults to stdout when no other output is set")
 		kbuildPath               = flag.String("kbuild", "", "Kbuild/Makefile path for compact object metadata generation")
 		kbuildRecursive          = flag.Bool("kbuild_recursive", false, "Follow static Kbuild include directives when writing -kbuild_out")
@@ -148,6 +160,7 @@ func main() {
 		objectLabelPackage       = flag.String("object_label_package", "", "Bazel package containing the compact object BUILD file. Defaults to -object_buildfile_out package")
 		sourceLabelPackage       = flag.String("source_label_package", "", "Bazel package containing Linux source file labels for generated compact object BUILD files")
 		sourceASN1Compiler       = flag.String("source_asn1_compiler", "", "Bazel label for the kernel source tree's scripts/asn1_compiler tool emitted into source-backed compact object rules")
+		sourceObjtool            = flag.String("source_objtool", "", "Bazel label for the kernel source tree's objtool executable emitted into x86 source-backed compact object rules")
 		sourceRelacheck          = flag.String("source_relacheck", "", "Bazel label for the kernel source tree's arch/arm64/kernel/pi/relacheck tool emitted into arm64 .pi.o rules")
 		sourceConfig             = flag.String("source_config", "", "Bazel label for a full LinuxConfigInfo target emitted into source-backed compact object rules")
 		sourceRootLabel          = flag.String("source_root_label", "", "Bazel label for a file in the Linux source root, emitted into source-backed compact object rules")
@@ -213,6 +226,24 @@ func main() {
 	var tree *kconfig.Tree
 	if *root != "" {
 		var err error
+		if *rustToolchainProbe != "" {
+			probeFile, openErr := os.Open(workspacePath(*rustToolchainProbe))
+			if openErr != nil {
+				fmt.Fprintf(os.Stderr, "failed to open Rust toolchain probe: %v\n", openErr)
+				os.Exit(1)
+			}
+			probe, decodeErr := rusttoolchain.Decode(probeFile)
+			closeErr := probeFile.Close()
+			if decodeErr != nil {
+				fmt.Fprintf(os.Stderr, "failed to decode Rust toolchain probe: %v\n", decodeErr)
+				os.Exit(1)
+			}
+			if closeErr != nil {
+				fmt.Fprintf(os.Stderr, "failed to close Rust toolchain probe: %v\n", closeErr)
+				os.Exit(1)
+			}
+			applyRustToolchainProbe(vars, linuxProbeValues, probe)
+		}
 		shell, err := linuxProbeShell(*linuxProbeModel, linuxProbeValues)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to configure Linux probe model: %v\n", err)
@@ -342,7 +373,7 @@ func main() {
 			autoconf:      *resolvedAutoconfOut,
 			rustcCfg:      *resolvedRustcCfgOut,
 			kernelRelease: *resolvedReleaseOut,
-		}, *kernelVersion); err != nil {
+		}, *kernelVersion, *validateConfigEquivalent); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to write resolved config: %v\n", err)
 			os.Exit(1)
 		}
@@ -381,6 +412,7 @@ func main() {
 				SourceLabelPackage:       *sourceLabelPackage,
 				SourceLabelPackages:      namedValueMap(sourceLabelMaps),
 				SourceASN1Compiler:       *sourceASN1Compiler,
+				SourceObjtool:            *sourceObjtool,
 				SourceRelacheck:          *sourceRelacheck,
 				SourceConfig:             *sourceConfig,
 				SourceRootLabel:          *sourceRootLabel,
@@ -437,6 +469,7 @@ func main() {
 				SourceLabelPackage:       *sourceLabelPackage,
 				SourceLabelPackages:      namedValueMap(sourceLabelMaps),
 				SourceASN1Compiler:       *sourceASN1Compiler,
+				SourceObjtool:            *sourceObjtool,
 				SourceRelacheck:          *sourceRelacheck,
 				SourceConfig:             *sourceConfig,
 				SourceRootLabel:          *sourceRootLabel,
@@ -548,7 +581,7 @@ type resolvedConfigOutputs struct {
 	kernelRelease string
 }
 
-func writeResolvedConfig(tree *kconfig.Tree, input, overlay, configMode string, outputs resolvedConfigOutputs, kernelVersion string) error {
+func writeResolvedConfig(tree *kconfig.Tree, input, overlay, configMode string, outputs resolvedConfigOutputs, kernelVersion string, validateEquivalent bool) error {
 	if input == "" {
 		return fmt.Errorf("-resolve_config is required when resolved config outputs are requested")
 	}
@@ -594,6 +627,11 @@ func writeResolvedConfig(tree *kconfig.Tree, input, overlay, configMode string, 
 	resolved, err := tree.ResolveConfigWithOptions(name, raw, resolveOpts)
 	if err != nil {
 		return err
+	}
+	if validateEquivalent {
+		if err := kconfig.ValidateRustToolchainEquivalence(raw, resolved); err != nil {
+			return err
+		}
 	}
 	return writeResolvedConfigOutputs(tree, resolved, outputs, kernelVersion)
 }

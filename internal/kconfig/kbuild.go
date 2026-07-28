@@ -3174,6 +3174,7 @@ func kbuildObjectSettingName(variable string) (string, string, bool) {
 		"KASAN_SANITIZE",
 		"KCSAN_INSTRUMENT_BARRIERS",
 		"KCSAN_SANITIZE",
+		"OBJECT_FILES_NON_STANDARD",
 		"UBSAN_INTEGER_WRAP",
 		"UBSAN_SANITIZE",
 		"UBSAN_SIGNED_WRAP",
