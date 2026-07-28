@@ -443,11 +443,20 @@ ordinary compiles receive headers, bounded special lookups, and the exact
 repository-generated closure of source-like includes rather than the complete
 source archive.
 
-Version 0.1 deliberately includes the resolved config artifact and generated
-header set in each object action. This is a conservative cache key: named
-variants currently use independent graphs and do not share object actions.
-Reducing that config input requires a future generator/schema revision and
-broader differential coverage of source-level `CONFIG_*` references.
+The released repository consumer still requests compact schema `v0.0.12`.
+That schema deliberately includes the resolved config artifact and generated
+header set in each object action, so named variants use independent object
+graphs.
+
+The in-tree `v0.0.13` schema prepares the replacement: all named configs are
+resolved in one generator invocation, compile environments and generated
+header groups are content-addressed, source inputs are scanned exactly, and
+variant images are emitted as deltas from one canonical base graph. Equivalent
+configs therefore reference the same object and generated-header targets while
+the public `@repo//:kernel` and `@repo//variants/<name>:kernel` labels stay
+unchanged. Repository activation is intentionally gated on publishing the next
+generator release for all six supported host platforms and passing the
+differential output checks.
 
 For x86 boot images, the resolved config must select either
 `CONFIG_KERNEL_GZIP=y` or `CONFIG_KERNEL_LZ4=y`. Other x86 payload compression

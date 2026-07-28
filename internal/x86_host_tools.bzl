@@ -47,6 +47,7 @@ def linux_x86_host_tools(
         source_root = None,
         source_tree = None,
         env = None,
+        generated_headers_content_id = "",
         visibility = None):
     """Defines the source-tree-specific host tools required by x86 native builds."""
     if env == None:
@@ -78,6 +79,7 @@ def linux_x86_host_tools(
         asm_offsets_c = source_label(source_repo, "arch/x86/kernel/asm-offsets.c"),
         bounds_c = source_label(source_repo, "kernel/bounds.c"),
         config = config,
+        content_id = generated_headers_content_id,
         cpufeatures_h = source_label(source_repo, "arch/x86/include/asm/cpufeatures.h"),
         kvm_asm_offsets_c = source_label(source_repo, "arch/x86/kvm/kvm-asm-offsets.c"),
         orc_types_h = source_label(source_repo, "arch/x86/include/asm/orc_types.h"),
@@ -334,4 +336,57 @@ def linux_x86_host_tools(
         source_tree = common.source_tree,
         sorttable_tool = common.sorttable_tool,
         x86_relocs_tool = package_label(relocs_tool),
+    )
+
+def linux_x86_configured_host_tools(
+        name,
+        config,
+        shared,
+        source_repo,
+        source_root = None,
+        source_tree = None,
+        generated_headers_content_id = "",
+        visibility = None):
+    """Adds only the config-sensitive x86 headers to a shared host-tool set."""
+    if source_root == None:
+        source_root = shared.source_root
+    if source_tree == None:
+        source_tree = shared.source_tree
+    generated_headers = name + "_x86_generated_headers"
+    linux_x86_generated_headers(
+        name = generated_headers,
+        asm_offsets_c = source_label(source_repo, "arch/x86/kernel/asm-offsets.c"),
+        bounds_c = source_label(source_repo, "kernel/bounds.c"),
+        config = config,
+        content_id = generated_headers_content_id,
+        cpufeatures_h = source_label(source_repo, "arch/x86/include/asm/cpufeatures.h"),
+        kvm_asm_offsets_c = source_label(source_repo, "arch/x86/kvm/kvm-asm-offsets.c"),
+        orc_types_h = source_label(source_repo, "arch/x86/include/asm/orc_types.h"),
+        required_features_h = source_label(source_repo, "x86_required_features_h"),
+        rq_offsets_c = source_label(source_repo, "rq_offsets_c"),
+        source_root = source_root,
+        source_tree = source_tree,
+        syscall_32_tbl = source_label(source_repo, "x86_syscall_32_tbl"),
+        syscall_64_tbl = source_label(source_repo, "x86_syscall_64_tbl"),
+        visibility = visibility,
+        xen_interface_headers = source_labels(source_repo, [
+            "include/xen/interface/xen-mca.h",
+            "include/xen/interface/xen.h",
+            "include/xen/interface/xenpmu.h",
+        ]),
+    )
+    return struct(
+        asn1_compiler = shared.asn1_compiler,
+        generated_headers = package_label(generated_headers),
+        kallsyms_tool = shared.kallsyms_tool,
+        objtool = shared.objtool,
+        probe_config = shared.probe_config,
+        resolve_btfids_tool = shared.resolve_btfids_tool,
+        source_asn1_compiler = shared.source_asn1_compiler,
+        source_label_package = shared.source_label_package,
+        source_repo = shared.source_repo,
+        source_root = source_root,
+        source_tree = source_tree,
+        sorttable_tool = shared.sorttable_tool,
+        x86_relocs_tool = shared.x86_relocs_tool,
     )

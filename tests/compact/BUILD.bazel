@@ -1,12 +1,55 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("//internal:compact_generator.bzl", "linux_compact_buildfiles")
-load("//internal:linux_objects.bzl", "linux_config")
+load("//internal:linux_objects.bzl", "linux_compile_environment_index", "linux_config")
+load(
+    ":content_graph_test.bzl",
+    "config_payload_batch_test",
+    "content_graph_analysis_test_suite",
+    "fake_linux_generated_headers",
+)
 
 package(default_visibility = ["//:__subpackages__"])
+
+_CONTENT_GRAPH_HEADER_ID = "11aedeac94f8b7fd5b8eae40aea8086ab0422ac026d3888a65415344ee650f31"
 
 linux_config(
     name = "source_config",
     config_flags = {},
+)
+
+fake_linux_generated_headers(
+    name = "base_generated_headers",
+    content_id = _CONTENT_GRAPH_HEADER_ID,
+)
+
+fake_linux_generated_headers(
+    name = "blocked_driver_generated_headers",
+    content_id = _CONTENT_GRAPH_HEADER_ID,
+)
+
+fake_linux_generated_headers(
+    name = "debug_generated_headers",
+    content_id = _CONTENT_GRAPH_HEADER_ID,
+)
+
+fake_linux_generated_headers(
+    name = "force_net_generated_headers",
+    content_id = _CONTENT_GRAPH_HEADER_ID,
+)
+
+linux_compile_environment_index(
+    name = "same_bucket_compile_environment_index",
+    arch = "x86",
+    compile_environments = {
+        "3a733110d9038a56a767f64fcfa34872d59321a030d19acd443d907a00156113": "{\"abi\":\"linux.bzl/test/x86\",\"config_payload\":\"1a226ac103531b584f6be3869bfa92729b70da6caf45823e0d60ca2cac02363c\",\"header_groups\":[]}",
+        "be8a81d2989ebc4ed07cd253908d3fadfe54617eef8b6c5092a9962c5fea32ec": "{\"abi\":\"linux.bzl/test/x86\",\"config_payload\":\"10fe42875cfee06b63d6852484acaa3dd5293596b28c21f495db183814f217d2\",\"header_groups\":[]}",
+    },
+    config_payloads = {
+        "10fe42875cfee06b63d6852484acaa3dd5293596b28c21f495db183814f217d2": "CONFIG_BATCH_VALUE=2\n",
+        "1a226ac103531b584f6be3869bfa92729b70da6caf45823e0d60ca2cac02363c": "CONFIG_BATCH_VALUE=7\n",
+    },
+    expected_abi = "linux.bzl/test/x86",
+    tags = ["manual"],
 )
 
 linux_compact_buildfiles(
@@ -34,6 +77,47 @@ linux_compact_buildfiles(
     source_root_label = "//tests/compact:Kconfig",
 )
 
+linux_compact_buildfiles(
+    name = "content_addressed",
+    srcs = [
+        "debug.c",
+        "drivers/foo.c",
+        "include/linux/compiler-version.h",
+        "include/linux/compiler_types.h",
+        "include/linux/kconfig.h",
+        "init.c",
+        "net/core.c",
+    ],
+    compact_base_config = "base",
+    compact_schema = "v0.0.13",
+    compile_environment_abi = "linux.bzl/test/x86",
+    configs = {
+        "base.config": "base",
+        "blocked_driver.config": "blocked_driver",
+        "debug.config": "debug",
+        "force_net.config": "force_net",
+    },
+    generated_headers_by_config = {
+        "base": "//tests/compact:base_generated_headers",
+        "blocked_driver": "//tests/compact:blocked_driver_generated_headers",
+        "debug": "//tests/compact:debug_generated_headers",
+        "force_net": "//tests/compact:force_net_generated_headers",
+    },
+    kbuild = "Kbuild",
+    linux_objects_load = "@linux.bzl//internal:linux_objects.bzl",
+    object_label_package = "tests/compact/content_graph",
+    out_buildfile = "content_graph/BUILD.bazel",
+    out_metadata = "content_graph/content_addressed_generated.metadata.json",
+    root = "content_graph.Kconfig",
+    source_config = "//tests/compact:source_config",
+    source_label_package = "//tests/compact",
+    source_root_label = "//tests/compact:content_graph.Kconfig",
+    vars = {
+        "ARCH": "x86",
+        "SRCARCH": "x86",
+    },
+)
+
 genrule(
     name = "shared_object_variant_check",
     srcs = [":golden_metadata"],
@@ -51,4 +135,58 @@ genrule(
 build_test(
     name = "shared_object_variant_check_test",
     targets = [":shared_object_variant_check"],
+)
+
+genrule(
+    name = "content_addressed_check",
+    srcs = [":content_addressed_metadata"],
+    outs = ["content_addressed_check.txt"],
+    cmd = "$(location //internal/cmd/compact_metadata_check) " +
+          "-metadata $(location :content_addressed_metadata) " +
+          "-require_content_ids " +
+          "-summary " +
+          "-max_object_variants 5 " +
+          "-share base:blocked_driver:init.o " +
+          "-share base:debug:init.o " +
+          "-differ base:force_net:init.o " +
+          "-absent base:debug.o " +
+          "-present debug:debug.o > $@",
+    tools = ["//internal/cmd/compact_metadata_check"],
+)
+
+build_test(
+    name = "content_addressed_check_test",
+    targets = [":content_addressed_check"],
+)
+
+build_test(
+    name = "content_graph_images_build_test",
+    targets = [
+        "//tests/compact/content_graph:base_image",
+        "//tests/compact/content_graph:blocked_driver_image",
+        "//tests/compact/content_graph:debug_image",
+        "//tests/compact/content_graph:force_net_image",
+    ],
+)
+
+config_payload_batch_test(
+    name = "config_payload_batch_test",
+    expected_actions = 4,
+    expected_outputs = 36,
+    target = "//tests/compact/content_graph:_compile_environment_index",
+)
+
+config_payload_batch_test(
+    name = "config_payload_same_bucket_test",
+    expected_actions = 1,
+    expected_outputs = 18,
+    target = ":same_bucket_compile_environment_index",
+)
+
+content_graph_analysis_test_suite(
+    name = "content_graph_analysis_tests",
+    base_image = "//tests/compact/content_graph:base_image",
+    blocked_driver_image = "//tests/compact/content_graph:blocked_driver_image",
+    debug_image = "//tests/compact/content_graph:debug_image",
+    force_net_image = "//tests/compact/content_graph:force_net_image",
 )

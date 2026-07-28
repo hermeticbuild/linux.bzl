@@ -167,6 +167,7 @@ def _rust_generated_headers_fixture_impl(_ctx):
         LinuxGeneratedHeadersInfo(
             arch = "x86",
             cflags = None,
+            content_id = "",
             files = depset(),
             include_dirs = [],
             include_dir_anchors = {},
@@ -352,6 +353,7 @@ def _repository_protocol_test_impl(ctx):
         rust_profile_json = _LEGACY_PROFILE_JSON,
         platform = "@@llvm//platforms:linux_x86_64",
         base_config = "//configs:x86_64",
+        base_header_content_id = "",
         base_rust_enabled = False,
         config_mode = "default",
         graph_image = "//graph/base:x86_64_image",

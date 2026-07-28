@@ -1,0 +1,37 @@
+mainmenu "Content-addressed compact graph fixture"
+
+config MODULES
+	tristate "Modules"
+	modules
+
+config NET
+	tristate "Networking"
+
+config DEBUG
+	bool "Debug"
+
+config FORCE_NET
+	bool "Force networking"
+	select NET
+
+config PCI
+	bool "PCI"
+
+config DRIVER
+	tristate "Driver"
+	depends on NET && PCI
+
+config EXTRA_CFLAGS
+	bool "Extra compiler flags"
+
+config CC_IS_CLANG
+	bool
+	default y
+
+config FUNCTION_ALIGNMENT
+	int
+	default 16
+
+config X86_64
+	bool
+	default y

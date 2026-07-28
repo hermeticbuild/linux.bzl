@@ -15,6 +15,7 @@ def linux_arm64_host_tools(
         source_root = None,
         source_tree = None,
         env = None,
+        generated_headers_content_id = "",
         visibility = None):
     """Defines the source-tree-specific host tools required by arm64 native builds."""
     if env == None:
@@ -58,6 +59,7 @@ def linux_arm64_host_tools(
         asm_offsets_c = source_label(source_repo, "arch/arm64/kernel/asm-offsets.c"),
         bounds_c = source_label(source_repo, "kernel/bounds.c"),
         config = config,
+        content_id = generated_headers_content_id,
         cpucaps = source_label(source_repo, "arch/arm64/tools/cpucaps"),
         hyp_constants_c = source_label(source_repo, "arch/arm64/kvm/hyp/hyp-constants.c"),
         rq_offsets_c = source_label(source_repo, "rq_offsets_c"),
@@ -84,4 +86,53 @@ def linux_arm64_host_tools(
         source_tree = common.source_tree,
         sorttable_tool = common.sorttable_tool,
         vdsomunge_tool = package_label(vdsomunge_tool),
+    )
+
+def linux_arm64_configured_host_tools(
+        name,
+        config,
+        shared,
+        source_repo,
+        source_root = None,
+        source_tree = None,
+        generated_headers_content_id = "",
+        visibility = None):
+    """Adds only the config-sensitive arm64 headers to a shared host-tool set."""
+    if source_root == None:
+        source_root = shared.source_root
+    if source_tree == None:
+        source_tree = shared.source_tree
+    generated_headers = name + "_arm64_generated_headers"
+    linux_arm64_generated_headers(
+        name = generated_headers,
+        arm64_cfi_h = source_label(source_repo, "arm64_cfi_h"),
+        asm_offsets_c = source_label(source_repo, "arch/arm64/kernel/asm-offsets.c"),
+        bounds_c = source_label(source_repo, "kernel/bounds.c"),
+        config = config,
+        content_id = generated_headers_content_id,
+        cpucaps = source_label(source_repo, "arch/arm64/tools/cpucaps"),
+        hyp_constants_c = source_label(source_repo, "arch/arm64/kvm/hyp/hyp-constants.c"),
+        rq_offsets_c = source_label(source_repo, "rq_offsets_c"),
+        source_root = source_root,
+        source_tree = source_tree,
+        syscall_32_tbl = source_label(source_repo, "arch/arm64/tools/syscall_32.tbl"),
+        syscall_64_tbl = source_label(source_repo, "arch/arm64/tools/syscall_64.tbl"),
+        sysreg = source_label(source_repo, "arch/arm64/tools/sysreg"),
+        vdsomunge = shared.vdsomunge_tool,
+        visibility = visibility,
+    )
+    return struct(
+        asn1_compiler = shared.asn1_compiler,
+        generated_headers = package_label(generated_headers),
+        kallsyms_tool = shared.kallsyms_tool,
+        probe_config = shared.probe_config,
+        relacheck_tool = shared.relacheck_tool,
+        resolve_btfids_tool = shared.resolve_btfids_tool,
+        source_asn1_compiler = shared.source_asn1_compiler,
+        source_label_package = shared.source_label_package,
+        source_repo = shared.source_repo,
+        source_root = source_root,
+        source_tree = source_tree,
+        sorttable_tool = shared.sorttable_tool,
+        vdsomunge_tool = shared.vdsomunge_tool,
     )

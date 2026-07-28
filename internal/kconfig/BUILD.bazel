@@ -5,11 +5,13 @@ go_library(
     srcs = [
         "buildmerge.go",
         "compact.go",
+        "compact_content.go",
         "config.go",
         "config_footprint.go",
         "dump.go",
         "expr.go",
         "expr_dnf.go",
+        "generated_header_footprint.go",
         "kbuild.go",
         "kernelflags_symbols.go",
         "parser.go",

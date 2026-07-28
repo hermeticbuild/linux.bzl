@@ -64,7 +64,20 @@ def _linux_compact_outputs_impl(ctx):
     buildfile = ctx.actions.declare_file(ctx.label.name + ".BUILD.bazel")
 
     args = ctx.actions.args()
-    args.add("-compact_schema=v0.0.12")
+    args.add("-compact_schema", ctx.attr.compact_schema)
+    if ctx.attr.compact_schema == "v0.0.13":
+        if ctx.attr.generated_headers:
+            fail("generated_headers is not supported with compact_schema v0.0.13; use generated_headers_by_config")
+        if not ctx.attr.compact_base_config:
+            fail("compact_base_config must be set with compact_schema v0.0.13")
+        if not ctx.attr.compile_environment_abi:
+            fail("compile_environment_abi must be set with compact_schema v0.0.13")
+        args.add("-compact_base_config", ctx.attr.compact_base_config)
+        args.add("-compile_environment_abi", ctx.attr.compile_environment_abi)
+        for config_name, label in sorted(ctx.attr.generated_headers_by_config.items()):
+            args.add("-generated_headers_for_config", "%s=%s" % (config_name, label))
+    elif ctx.attr.generated_headers_by_config:
+        fail("generated_headers_by_config requires compact_schema v0.0.13")
     args.add("-root", ctx.file.root)
     args.add("-kbuild", ctx.file.kbuild)
     args.add("-compact_metadata_out", metadata)
@@ -77,6 +90,7 @@ def _linux_compact_outputs_impl(ctx):
         args.add("-compact_kbuild_tree")
     if ctx.attr.config_mode:
         args.add("-config_mode", ctx.attr.config_mode)
+    args.add("-kernel_version", ctx.attr.kernel_version)
     args.add("-object_label_package", ctx.attr.object_label_package)
     if ctx.attr.source_label_package:
         args.add("-source_label_package", ctx.attr.source_label_package)
@@ -197,6 +211,20 @@ _linux_compact_outputs = rule(
                 "allnoconfig",
             ],
         ),
+        "compact_base_config": attr.string(
+            doc = "Base config name used to emit v0.0.13 delta image targets.",
+        ),
+        "compact_schema": attr.string(
+            default = "v0.0.12",
+            doc = "Compact metadata schema emitted by kconfig_parse.",
+            values = [
+                "v0.0.12",
+                "v0.0.13",
+            ],
+        ),
+        "compile_environment_abi": attr.string(
+            doc = "Toolchain and action ABI identity bound into v0.0.13 compile environments.",
+        ),
         "configs": attr.label_keyed_string_dict(
             allow_files = True,
             doc = "Map of .config file labels to generated config names.",
@@ -211,6 +239,9 @@ _linux_compact_outputs = rule(
         "generated_headers": attr.string(
             doc = "Label for generated Linux headers emitted into source-backed compact object rules.",
         ),
+        "generated_headers_by_config": attr.string_dict(
+            doc = "Map of v0.0.13 config names to generated-header labels.",
+        ),
         "kbuild": attr.label(
             allow_single_file = True,
             mandatory = True,
@@ -218,6 +249,10 @@ _linux_compact_outputs = rule(
         ),
         "kbuild_tree": attr.bool(
             doc = "Follow Kbuild directory descent from the kbuild root when generating compact metadata.",
+        ),
+        "kernel_version": attr.string(
+            default = "6.18.2",
+            doc = "Base kernel release used when materializing indexed config payloads.",
         ),
         "linux_objects_load": attr.string(
             default = "@linux.bzl//internal:linux_objects.bzl",
@@ -512,6 +547,9 @@ def linux_compact_buildfiles(
         config = None,
         config_name = "",
         config_mode = "default",
+        compact_schema = "v0.0.12",
+        compact_base_config = "",
+        compile_environment_abi = "",
         srcs = [],
         object_label_package = None,
         source_label_package = "",
@@ -529,7 +567,9 @@ def linux_compact_buildfiles(
         source_tree_uapi_headers_labels = [],
         linux_objects_load = "@linux.bzl//internal:linux_objects.bzl",
         generated_headers = "",
+        generated_headers_by_config = {},
         kbuild_tree = False,
+        kernel_version = "6.18.2",
         out_buildfile = None,
         out_metadata = None,
         generated_visibility = ["//visibility:public"],
@@ -557,12 +597,17 @@ def linux_compact_buildfiles(
         config = config,
         config_name = config_name,
         config_mode = config_mode,
+        compact_base_config = compact_base_config,
+        compact_schema = compact_schema,
+        compile_environment_abi = compile_environment_abi,
         configs = configs,
         env = env,
         generated_visibility = generated_visibility,
         generated_headers = generated_headers,
+        generated_headers_by_config = generated_headers_by_config,
         kbuild = kbuild,
         kbuild_tree = kbuild_tree,
+        kernel_version = kernel_version,
         linux_objects_load = linux_objects_load,
         object_label_package = object_label_package,
         probe_config = probe_config,

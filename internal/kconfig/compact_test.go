@@ -125,6 +125,7 @@ config NET
 `)
 	kb, err := ParseKbuild(strings.NewReader(`obj-y += init.o
 obj-$(CONFIG_NET) += net.o
+obj-m += trace.o helper.o
 `), "Kbuild")
 	if err != nil {
 		t.Fatalf("ParseKbuild() failed: %v", err)
@@ -150,6 +151,13 @@ obj-$(CONFIG_NET) += net.o
 	}
 	if variant := variantByTarget(metadata, moduleTarget); variant.Mode != "m" {
 		t.Fatalf("module object mode = %q, want m", variant.Mode)
+	}
+	var moduleObjects []string
+	for _, target := range config.ModuleObjectTargets {
+		moduleObjects = append(moduleObjects, variantByTarget(metadata, target).Object)
+	}
+	if got, want := moduleObjects, []string{"net.o", "trace.o", "helper.o"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("module object order = %v, want %v", got, want)
 	}
 }
 
@@ -927,6 +935,872 @@ func TestCompactBuildFilesParse(t *testing.T) {
 	}
 }
 
+func TestCompactV013ObjectBuildUsesOneExactCompileEnvironmentIndex(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	kb := mustParseKbuildFixture(t)
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "init.c", "#include \"shared.h\"\n")
+	mustWriteSource(t, sourceRoot, "shared.h", "#define SHARED 1\n")
+	writeCompactSource(t, sourceRoot, "net/core.c")
+	writeCompactSource(t, sourceRoot, "debug.c")
+	writeCompactV013ForcedInputs(t, sourceRoot)
+
+	common := CompactMetadataOptions{
+		Schema:                CompactSchemaV013,
+		SourceRoot:            sourceRoot,
+		Srcarch:               "x86",
+		CompileEnvironmentABI: "clang-21-linux-object-abi-v1",
+	}
+	baseOpts := common
+	baseOpts.GeneratedHeadersLabel = "//headers:z_base"
+	base, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{
+		Name:  "base",
+		Flags: map[string]string{"CONFIG_NET": "y"},
+	}}, baseOpts)
+	if err != nil {
+		t.Fatalf("CompactMetadataWithOptions(base) failed: %v", err)
+	}
+	debugOpts := common
+	debugOpts.GeneratedHeadersLabel = "//headers:a_debug"
+	debug, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{
+		Name: "debug",
+		Flags: map[string]string{
+			"CONFIG_DEBUG": "y",
+			"CONFIG_NET":   "y",
+		},
+	}}, debugOpts)
+	if err != nil {
+		t.Fatalf("CompactMetadataWithOptions(debug) failed: %v", err)
+	}
+	metadata, err := MergeCompactMetadata(base, debug)
+	if err != nil {
+		t.Fatalf("MergeCompactMetadata() failed: %v", err)
+	}
+
+	if got := len(metadata.HeaderGroups); got != 1 {
+		t.Fatalf("header group count = %d, want 1: %#v", got, metadata.HeaderGroups)
+	}
+	if want := []string{"//headers:a_debug", "//headers:z_base"}; !reflect.DeepEqual(metadata.HeaderGroups[0].Labels, want) {
+		t.Fatalf("shared header group labels = %v, want %v", metadata.HeaderGroups[0].Labels, want)
+	}
+	baseInit := objectTarget(metadata, configByName(metadata, "base"), "init.o")
+	debugInit := objectTarget(metadata, configByName(metadata, "debug"), "init.o")
+	if baseInit == "" || baseInit != debugInit {
+		t.Fatalf("base/debug init targets = %q/%q, want one shared target", baseInit, debugInit)
+	}
+	initVariant := variantByTarget(metadata, baseInit)
+	if len(initVariant.ContentID) != 64 || len(initVariant.CompileEnvironment) != 64 {
+		t.Fatalf("init IDs = content %q environment %q, want full SHA-256 IDs", initVariant.ContentID, initVariant.CompileEnvironment)
+	}
+	var inputPaths []string
+	initInputs, err := metadata.expandedSourceInputGroup(
+		initVariant.SourceInputGroup,
+		initVariant.SourceInputs,
+		"init",
+	)
+	if err != nil {
+		t.Fatalf("expand init source inputs: %v", err)
+	}
+	for _, input := range initInputs {
+		inputPaths = append(inputPaths, input.Path)
+		if len(input.Digest) != 64 {
+			t.Fatalf("source input %q digest = %q, want full SHA-256", input.Path, input.Digest)
+		}
+	}
+	wantInputs := []string{
+		"include/linux/compiler-version.h",
+		"include/linux/compiler_types.h",
+		"include/linux/kconfig.h",
+		"init.c",
+		"shared.h",
+	}
+	if !reflect.DeepEqual(inputPaths, wantInputs) {
+		t.Fatalf("init source inputs = %v, want %v", inputPaths, wantInputs)
+	}
+	metadataJSON, err := metadata.JSON()
+	if err != nil {
+		t.Fatalf("JSON() failed: %v", err)
+	}
+	serialized := string(metadataJSON)
+	for _, redundant := range []string{`"source_inputs":`, `"config_fragment":`, `"fragment":`} {
+		if strings.Contains(serialized, redundant) {
+			t.Fatalf("v0.0.13 JSON retains redundant field %s:\n%s", redundant, metadataJSON)
+		}
+	}
+	for _, required := range []string{`"source_files":`, `"source_input_groups":`, `"source_input_group":`} {
+		if !strings.Contains(serialized, required) {
+			t.Fatalf("v0.0.13 JSON omits indexed field %s:\n%s", required, metadataJSON)
+		}
+	}
+
+	objectBuild, err := metadata.ObjectBuildFile(CompactBuildFileOptions{
+		Schema:                   CompactSchemaV013,
+		Arch:                     "x86",
+		Version:                  "6.18.39",
+		SourceLabelPackage:       "@linux//",
+		SourceRootLabel:          "@linux//:Kconfig",
+		SourceTreeAllFiles:       []string{"@linux//:all_files"},
+		SourceTreeArchHeaders:    []string{"@linux//:arch_headers"},
+		SourceTreeDtbSources:     []string{"@linux//:dtb_sources"},
+		SourceTreeGlobalHeaders:  []string{"@linux//:global_headers"},
+		SourceTreeHeaders:        []string{"@linux//:headers"},
+		SourceTreeKbuildFiles:    []string{"@linux//:kbuild_files"},
+		SourceTreeLocalIncludes:  []string{"@linux//:local_include_files"},
+		SourceTreeLookupFiles:    []string{"@linux//:lookup_files"},
+		SourceTreeScriptsHeaders: []string{"@linux//:scripts_headers"},
+		SourceTreeUapiHeaders:    []string{"@linux//:uapi_headers"},
+		Srcarch:                  "x86",
+	})
+	if err != nil {
+		t.Fatalf("ObjectBuildFile() failed: %v", err)
+	}
+	parsed, err := build.ParseBuild("objects.BUILD.bazel", objectBuild)
+	if err != nil {
+		t.Fatalf("generated object BUILD did not parse: %v\n%s", err, objectBuild)
+	}
+	index := parsed.RuleNamed("_compile_environment_index")
+	if index == nil || index.Kind() != "linux_compile_environment_index" {
+		t.Fatalf("generated object BUILD has no compile environment index:\n%s", objectBuild)
+	}
+	if got := index.AttrString("arch"); got != "x86" {
+		t.Fatalf("compile environment index arch = %q, want x86", got)
+	}
+	if got := index.AttrString("version"); got != "6.18.39" {
+		t.Fatalf("compile environment index version = %q, want 6.18.39", got)
+	}
+	if got := index.AttrString("expected_abi"); got != common.CompileEnvironmentABI {
+		t.Fatalf("compile environment index expected_abi = %q, want %q", got, common.CompileEnvironmentABI)
+	}
+	referencedPayloads := map[string]bool{}
+	for _, environment := range metadata.CompileEnvironments {
+		referencedPayloads[environment.ConfigPayload] = true
+	}
+	payloads, ok := index.Attr("config_payloads").(*build.DictExpr)
+	if !ok {
+		t.Fatalf("indexed config payloads = %T, want dictionary", index.Attr("config_payloads"))
+	}
+	if len(payloads.List) != len(referencedPayloads) {
+		t.Fatalf("indexed config payload count = %d, want %d referenced payloads", len(payloads.List), len(referencedPayloads))
+	}
+	sourceTree := parsed.RuleNamed("_source_tree")
+	if sourceTree == nil {
+		t.Fatalf("generated object BUILD has no source tree rule:\n%s", objectBuild)
+	}
+	for _, attr := range []string{
+		"all_files",
+		"arch_headers",
+		"dtb_sources",
+		"global_headers",
+		"headers",
+		"kbuild_files",
+		"local_include_files",
+		"lookup_files",
+		"scripts_headers",
+		"uapi_headers",
+	} {
+		if sourceTree.Attr(attr) != nil {
+			t.Errorf("v0.0.13 source tree unexpectedly emits broad %s", attr)
+		}
+	}
+	text := string(objectBuild)
+	if strings.Count(text, "linux_compile_environment_index(") != 1 {
+		t.Fatalf("compile environment index rule count != 1:\n%s", objectBuild)
+	}
+	sourceIndex := parsed.RuleNamed("_source_input_index")
+	if sourceIndex == nil || sourceIndex.Kind() != "linux_source_input_index" {
+		t.Fatalf("generated object BUILD has no source input index:\n%s", objectBuild)
+	}
+	if got := len(sourceIndex.AttrStrings("srcs")); got != len(metadata.SourceFiles) {
+		t.Fatalf("indexed source count = %d, want %d", got, len(metadata.SourceFiles))
+	}
+	for _, input := range metadata.SourceFiles {
+		label := labelForSource(CompactBuildFileOptions{SourceLabelPackage: "@linux//"}, input.Path)
+		if count := strings.Count(text, fmt.Sprintf("%q", label)); count != 1 {
+			t.Fatalf("source label %q occurs %d times, want once", label, count)
+		}
+	}
+	if strings.Contains(text, "linux_config(") {
+		t.Fatalf("v0.0.13 object BUILD emitted per-object linux_config rules:\n%s", objectBuild)
+	}
+	if !strings.Contains(text, `"//headers:a_debug"`) || strings.Contains(text, `"//headers:z_base"`) {
+		t.Fatalf("generated headers did not select the canonical shared label:\n%s", objectBuild)
+	}
+	initRule := parsed.RuleNamed(baseInit)
+	if initRule == nil {
+		t.Fatalf("generated object BUILD has no init rule %q:\n%s", baseInit, objectBuild)
+	}
+	for _, attr := range []string{"src", "source_includes", "source_includes_complete", "config_fragment"} {
+		if initRule.Attr(attr) != nil {
+			t.Fatalf("indexed init rule retains redundant %s:\n%s", attr, objectBuild)
+		}
+	}
+	if got := initRule.AttrString("source_input_index"); got != ":_source_input_index" {
+		t.Fatalf("init source_input_index = %q", got)
+	}
+	if got := initRule.AttrLiteral("source_input_group"); got != fmt.Sprintf("%d", initVariant.SourceInputGroup) {
+		t.Fatalf("init source_input_group = %q, want %d", got, initVariant.SourceInputGroup)
+	}
+	sourceFile, err := metadata.sourceFileIndex(initVariant.Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := initRule.AttrLiteral("source_input_file"); got != fmt.Sprintf("%d", sourceFile) {
+		t.Fatalf("init source_input_file = %q, want %d", got, sourceFile)
+	}
+	if got := initRule.AttrString("compile_environment_index"); got != ":_compile_environment_index" {
+		t.Fatalf("init compile_environment_index = %q", got)
+	}
+	if got := initRule.AttrString("compile_environment_id"); got != initVariant.CompileEnvironment {
+		t.Fatalf("init compile_environment_id = %q, want %q", got, initVariant.CompileEnvironment)
+	}
+	if got := initRule.AttrString("content_id"); got != initVariant.ContentID {
+		t.Fatalf("init content_id = %q, want %q", got, initVariant.ContentID)
+	}
+}
+
+func TestCompactV013ContentIDsTrackOnlyTransitiveInputs(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	kb, err := ParseKbuild(strings.NewReader("obj-y += init.o\n"), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "init.c", "#include \"shared.h\"\n")
+	mustWriteSource(t, sourceRoot, "shared.h", "#define VALUE 1\n")
+	writeCompactV013ForcedInputs(t, sourceRoot)
+	generate := func() CompactObjectVariant {
+		t.Helper()
+		metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{Name: "base"}}, CompactMetadataOptions{
+			Schema:                CompactSchemaV013,
+			SourceRoot:            sourceRoot,
+			CompileEnvironmentABI: "object-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+		}
+		config := configByName(metadata, "base")
+		return variantByTarget(metadata, objectTarget(metadata, config, "init.o"))
+	}
+
+	before := generate()
+	mustWriteSource(t, sourceRoot, "unrelated.h", "#define UNRELATED 1\n")
+	unrelated := generate()
+	if unrelated.ContentID != before.ContentID || unrelated.Target != before.Target {
+		t.Fatalf("unrelated source changed init identity: before=%q after=%q", before.ContentID, unrelated.ContentID)
+	}
+	mustWriteSource(t, sourceRoot, "shared.h", "#define VALUE 2\n")
+	changed := generate()
+	if changed.ContentID == before.ContentID || changed.Target == before.Target {
+		t.Fatalf("transitive source change did not change init identity: before=%q after=%q", before.ContentID, changed.ContentID)
+	}
+}
+
+func TestCompactV013ValidationRecomputesContentIDs(t *testing.T) {
+	generate := func(t *testing.T) *CompactMetadata {
+		t.Helper()
+		tree := mustParseCompactFixture(t)
+		kb, err := ParseKbuild(strings.NewReader("obj-y += init.o\n"), "Kbuild")
+		if err != nil {
+			t.Fatalf("ParseKbuild() failed: %v", err)
+		}
+		sourceRoot := t.TempDir()
+		mustWriteSource(t, sourceRoot, "init.c", "int init_value;\n")
+		writeCompactV013ForcedInputs(t, sourceRoot)
+		metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{Name: "base"}}, CompactMetadataOptions{
+			Schema:                CompactSchemaV013,
+			SourceRoot:            sourceRoot,
+			Srcarch:               "x86",
+			GeneratedHeadersLabel: "//headers:test",
+			CompileEnvironmentABI: "object-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+		}
+		return metadata
+	}
+	mutateDigest := func(t *testing.T, metadata *CompactMetadata, path string) {
+		t.Helper()
+		index, err := metadata.sourceFileIndex(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		metadata.SourceFiles[index-1].Digest = strings.Repeat("f", 64)
+	}
+	assertRejected := func(t *testing.T, metadata *CompactMetadata, want string) {
+		t.Helper()
+		err := metadata.validateContentIDs()
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("validateContentIDs() error = %v, want %q", err, want)
+		}
+	}
+
+	t.Run("payload content", func(t *testing.T) {
+		metadata := generate(t)
+		metadata.ConfigPayloads[0].Content += "CONFIG_MUTATED=y\n"
+		assertRejected(t, metadata, "config payload")
+	})
+	t.Run("header source digest", func(t *testing.T) {
+		metadata := generate(t)
+		group := metadata.HeaderGroups[0]
+		inputs, err := metadata.expandedSourceInputGroup(group.SourceInputGroup, nil, "header")
+		if err != nil {
+			t.Fatal(err)
+		}
+		mutateDigest(t, metadata, inputs[0].Path)
+		assertRejected(t, metadata, "header group")
+	})
+	t.Run("compile ABI", func(t *testing.T) {
+		metadata := generate(t)
+		metadata.CompileEnvironments[0].ABI += "-mutated"
+		assertRejected(t, metadata, "compile environment")
+	})
+	t.Run("leaf flags", func(t *testing.T) {
+		metadata := generate(t)
+		metadata.ObjectVariants[0].Flags = append(metadata.ObjectVariants[0].Flags, "-DMUTATED")
+		assertRejected(t, metadata, "object target")
+	})
+	t.Run("leaf source digest", func(t *testing.T) {
+		metadata := generate(t)
+		mutateDigest(t, metadata, "init.c")
+		assertRejected(t, metadata, "object target")
+	})
+	t.Run("dependency order", func(t *testing.T) {
+		metadata := generate(t)
+		root := metadata.ObjectVariants[0]
+		inputs, err := metadata.expandedSourceInputGroup(root.SourceInputGroup, root.SourceInputs, "root")
+		if err != nil {
+			t.Fatal(err)
+		}
+		abi := metadata.CompileEnvironments[0].ABI
+		dependencies := make([]CompactObjectVariant, 0, 2)
+		for _, object := range []string{"deps/a.o", "deps/b.o"} {
+			dependency := root
+			dependency.Object = object
+			dependency.Deps = nil
+			dependency.ContentID = objectVariantContentID(
+				dependency.Object,
+				dependency.Mode,
+				dependency.ModName,
+				dependency.Flags,
+				dependency.RemoveFlags,
+				dependency.CompileEnvironment,
+				dependency.Source,
+				inputs,
+				nil,
+				nil,
+				abi,
+			)
+			dependency.Target = sanitizeTargetName(strings.TrimSuffix(object, ".o")) + "__" + compactShortID(dependency.ContentID)
+			dependencies = append(dependencies, dependency)
+		}
+		metadata.ObjectVariants = append(metadata.ObjectVariants, dependencies...)
+		dependencyTargets := []string{dependencies[0].Target, dependencies[1].Target}
+		dependencyIDs := []string{dependencies[0].ContentID, dependencies[1].ContentID}
+		slices.Sort(dependencyTargets)
+		slices.Sort(dependencyIDs)
+		root = metadata.ObjectVariants[0]
+		root.Deps = dependencyTargets
+		root.ContentID = objectVariantContentID(
+			root.Object,
+			root.Mode,
+			root.ModName,
+			root.Flags,
+			root.RemoveFlags,
+			root.CompileEnvironment,
+			root.Source,
+			inputs,
+			dependencyIDs,
+			nil,
+			abi,
+		)
+		root.Target = sanitizeTargetName(strings.TrimSuffix(root.Object, ".o")) + "__" + compactShortID(root.ContentID)
+		metadata.ObjectVariants[0] = root
+		if err := metadata.validateContentIDs(); err != nil {
+			t.Fatalf("validateContentIDs() rejected canonical dependencies: %v", err)
+		}
+		metadata.ObjectVariants[0].Deps[0], metadata.ObjectVariants[0].Deps[1] =
+			metadata.ObjectVariants[0].Deps[1], metadata.ObjectVariants[0].Deps[0]
+		assertRejected(t, metadata, "non-canonical dependencies")
+	})
+}
+
+func TestCompactV013SourceAndKernelFlagConfigsSplitCompileIdentity(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "Exact compile identity"
+
+config SOURCE_GATE
+	bool "Source gate"
+
+config CC_OPTIMIZE_FOR_SIZE
+	bool "Optimize for size"
+`)
+	kb, err := ParseKbuild(strings.NewReader("obj-y += init.o\n"), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "init.c", `
+#if defined(CONFIG_SOURCE_GATE)
+int source_gate;
+#endif
+`)
+	writeCompactV013ForcedInputs(t, sourceRoot)
+	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{
+		{Name: "base"},
+		{Name: "source", Flags: map[string]string{"CONFIG_SOURCE_GATE": "y"}},
+		{Name: "opt", Flags: map[string]string{"CONFIG_CC_OPTIMIZE_FOR_SIZE": "y"}},
+	}, CompactMetadataOptions{
+		Schema:                CompactSchemaV013,
+		SourceRoot:            sourceRoot,
+		CompileEnvironmentABI: "object-abi-v1",
+	})
+	if err != nil {
+		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+	}
+
+	variants := map[string]CompactObjectVariant{}
+	for _, name := range []string{"base", "source", "opt"} {
+		config := configByName(metadata, name)
+		variants[name] = variantByTarget(metadata, objectTarget(metadata, config, "init.o"))
+	}
+	if got := variants["source"].ConfigFragment["CONFIG_SOURCE_GATE"]; got != "y" {
+		t.Fatalf("source payload CONFIG_SOURCE_GATE = %q, want y", got)
+	}
+	if got := variants["opt"].ConfigFragment["CONFIG_CC_OPTIMIZE_FOR_SIZE"]; got != "y" {
+		t.Fatalf("optimization payload CONFIG_CC_OPTIMIZE_FOR_SIZE = %q, want y", got)
+	}
+	for _, name := range []string{"source", "opt"} {
+		if variants[name].CompileEnvironment == variants["base"].CompileEnvironment {
+			t.Errorf("%s config did not change the compile environment", name)
+		}
+		if variants[name].ContentID == variants["base"].ContentID {
+			t.Errorf("%s config did not change the object content ID", name)
+		}
+	}
+}
+
+func TestCompactV013GeneratedObjectActionFootprints(t *testing.T) {
+	tests := []struct {
+		object          string
+		wantInput       string
+		wantInclude     string
+		wantConfig      string
+		additionalFlags []string
+	}{
+		{"drivers/tty/vt/ucs.o", "drivers/tty/vt/ucs_width_table.h_shipped", "ucs_width_table.h", "", nil},
+		{"drivers/scsi/scsi_sysfs.o", "include/scsi/scsi_devinfo.h", "scsi_devinfo_tbl.c", "", nil},
+		{"lib/crc/crc32-main.o", "", "crc32table.h", "", nil},
+		{"lib/crc32.o", "", "crc32table.h", "CONFIG_CRC32_SLICEBY4", nil},
+		{"lib/crc/crc64-main.o", "", "crc64table.h", "", nil},
+		{"lib/oid_registry.o", "include/linux/oid_registry.h", "oid_registry_data.c", "", nil},
+		{"arch/x86/lib/inat.o", "arch/x86/lib/x86-opcode-map.txt", "inat-tables.c", "", nil},
+		{"usr/initramfs_data.o", "usr/default_cpio_list", "", "", nil},
+		{"arch/x86/kernel/cpu/capflags.o", "arch/x86/include/asm/cpufeatures.h", "", "", nil},
+		{"arch/x86/realmode/rmpiggy.o", "", "pasyms.h", "", nil},
+		{"init/version.o", "init/version-timestamp.c", "", "", nil},
+		{"lib/fdt_ro.o", "scripts/dtc/libfdt/fdt_ro.c", "", "", nil},
+		{"crypto/example.asn1.o", "scripts/asn1_compiler.c", "", "", nil},
+		{"init/uts.o", "", "", "CONFIG_LOCALVERSION", []string{"-include", "$(obj)/utsversion-tmp.h"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.object, func(t *testing.T) {
+			got := compactObjectActionFootprintForObject(tc.object, tc.additionalFlags)
+			if tc.wantInput != "" && !slices.Contains(got.sourceInputs, tc.wantInput) {
+				t.Errorf("source inputs = %v, want %q", got.sourceInputs, tc.wantInput)
+			}
+			if tc.wantInclude != "" && !slices.Contains(got.providedIncludes, tc.wantInclude) {
+				t.Errorf("provided includes = %v, want %q", got.providedIncludes, tc.wantInclude)
+			}
+			if tc.wantConfig != "" && !slices.Contains(got.configSymbols, tc.wantConfig) {
+				t.Errorf("config symbols = %v, want %q", got.configSymbols, tc.wantConfig)
+			}
+		})
+	}
+}
+
+func TestCompactV013ASN1GeneratedParserBindsEmittedHeaderClosures(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	kb, err := ParseKbuild(strings.NewReader("obj-y += crypto/example.asn1.o\n"), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "crypto/example.asn1", "Example ::= INTEGER\n")
+	mustWriteSource(t, sourceRoot, "scripts/asn1_compiler.c", "int asn1_compiler;\n")
+	mustWriteSource(t, sourceRoot, "include/linux/asn1_ber_bytecode.h", "#define ASN1_BER 1\n")
+	mustWriteSource(t, sourceRoot, "include/linux/asn1_decoder.h", "#include <linux/asn1_nested.h>\n")
+	mustWriteSource(t, sourceRoot, "include/linux/asn1_nested.h", "#define ASN1_NESTED 1\n")
+	writeCompactV013ForcedInputs(t, sourceRoot)
+
+	generate := func() (CompactObjectVariant, []CompactSourceInput) {
+		t.Helper()
+		metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{Name: "base"}}, CompactMetadataOptions{
+			Schema:                CompactSchemaV013,
+			SourceRoot:            sourceRoot,
+			Srcarch:               "x86",
+			CompileEnvironmentABI: "object-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+		}
+		config := configByName(metadata, "base")
+		variant := variantByTarget(metadata, objectTarget(metadata, config, "crypto/example.asn1.o"))
+		inputs, err := metadata.expandedSourceInputGroup(
+			variant.SourceInputGroup,
+			variant.SourceInputs,
+			"ASN.1 parser test",
+		)
+		if err != nil {
+			t.Fatalf("expand ASN.1 source inputs failed: %v", err)
+		}
+		return variant, inputs
+	}
+
+	before, beforeInputs := generate()
+	for _, path := range []string{
+		"include/linux/asn1_ber_bytecode.h",
+		"include/linux/asn1_decoder.h",
+		"include/linux/asn1_nested.h",
+		"scripts/asn1_compiler.c",
+	} {
+		if !slices.ContainsFunc(beforeInputs, func(input CompactSourceInput) bool {
+			return input.Path == path
+		}) {
+			t.Errorf("ASN.1 parser source inputs omit %q: %v", path, beforeInputs)
+		}
+	}
+	mustWriteSource(t, sourceRoot, "include/linux/asn1_nested.h", "#define ASN1_NESTED 2\n")
+	after, _ := generate()
+	if before.ContentID == after.ContentID {
+		t.Fatalf("transitive ASN.1 decoder header change did not change content ID %q", before.ContentID)
+	}
+}
+
+func TestCompactV013ASN1ConsumerRequiresResolvedParserObject(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "crypto/consumer.c", "#include \"parser.asn1.h\"\n")
+	mustWriteSource(t, sourceRoot, "crypto/parser.asn1", "Parser ::= INTEGER\n")
+	mustWriteSource(t, sourceRoot, "scripts/asn1_compiler.c", "int asn1_compiler;\n")
+	mustWriteSource(t, sourceRoot, "include/linux/asn1_ber_bytecode.h", "#define ASN1_BER 1\n")
+	mustWriteSource(t, sourceRoot, "include/linux/asn1_decoder.h", "#define ASN1_DECODER 1\n")
+	writeCompactV013ForcedInputs(t, sourceRoot)
+	opts := CompactMetadataOptions{
+		Schema:                CompactSchemaV013,
+		SourceRoot:            sourceRoot,
+		Srcarch:               "x86",
+		CompileEnvironmentABI: "object-abi-v1",
+	}
+
+	withParser, err := ParseKbuild(strings.NewReader(`
+obj-y += crypto/consumer.o
+obj-y += crypto/parser.asn1.o
+`), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild(with parser) failed: %v", err)
+	}
+	metadata, err := tree.CompactMetadataWithOptions(withParser, []NamedConfig{{Name: "base"}}, opts)
+	if err != nil {
+		t.Fatalf("resolved ASN.1 consumer scan failed: %v", err)
+	}
+	config := configByName(metadata, "base")
+	consumer := variantByTarget(metadata, objectTarget(metadata, config, "crypto/consumer.o"))
+	if len(consumer.Deps) != 1 {
+		t.Fatalf("ASN.1 consumer deps = %v, want one generated parser dependency", consumer.Deps)
+	}
+
+	withoutParser, err := ParseKbuild(strings.NewReader("obj-y += crypto/consumer.o\n"), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild(without parser) failed: %v", err)
+	}
+	_, err = tree.CompactMetadataWithOptions(withoutParser, []NamedConfig{{Name: "base"}}, opts)
+	if err == nil || !strings.Contains(err.Error(), "unresolved potentially-active literal include") {
+		t.Fatalf("consumer without ASN.1 parser error = %v, want unresolved include", err)
+	}
+}
+
+func TestCompactV013CapflagsIdentityUsesProducerHeaders(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	kb, err := ParseKbuild(strings.NewReader("obj-y += arch/x86/kernel/cpu/capflags.o\n"), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "arch/x86/kernel/cpu/mkcapflags.sh", "# nominal source\n")
+	mustWriteSource(t, sourceRoot, "arch/x86/include/asm/cpufeatures.h", "#define X86_FEATURE_ONE 1\n")
+	mustWriteSource(t, sourceRoot, "arch/x86/include/asm/vmxfeatures.h", "#define VMX_FEATURE_ONE 1\n")
+	writeCompactV013ForcedInputs(t, sourceRoot)
+	generate := func() CompactObjectVariant {
+		t.Helper()
+		metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{Name: "base"}}, CompactMetadataOptions{
+			Schema:                CompactSchemaV013,
+			SourceRoot:            sourceRoot,
+			Srcarch:               "x86",
+			CompileEnvironmentABI: "object-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+		}
+		config := configByName(metadata, "base")
+		return variantByTarget(metadata, objectTarget(metadata, config, "arch/x86/kernel/cpu/capflags.o"))
+	}
+	before := generate()
+	mustWriteSource(t, sourceRoot, "arch/x86/include/asm/cpufeatures.h", "#define X86_FEATURE_TWO 2\n")
+	after := generate()
+	if before.ContentID == after.ContentID {
+		t.Fatalf("capflags producer header change did not change content ID %q", before.ContentID)
+	}
+}
+
+func TestObjectVariantContentIDUsesFullChildIDs(t *testing.T) {
+	prefix := strings.Repeat("a", compactShortIDLength)
+	left := prefix + strings.Repeat("b", 64-compactShortIDLength)
+	right := prefix + strings.Repeat("c", 64-compactShortIDLength)
+	leftID := objectVariantContentID("composite.o", "y", "", nil, nil, "", "", nil, nil, []string{left}, "abi-v1")
+	rightID := objectVariantContentID("composite.o", "y", "", nil, nil, "", "", nil, nil, []string{right}, "abi-v1")
+	if leftID == rightID {
+		t.Fatalf("full child content IDs with a shared presentation prefix produced the same parent ID %q", leftID)
+	}
+}
+
+func TestCompactV013CompositeIdentityIgnoresNonActionMetadata(t *testing.T) {
+	config := &ResolvedConfig{
+		Effective: map[string]string{"CONFIG_UNUSED": "y"},
+		Written:   map[string]bool{"CONFIG_UNUSED": true},
+	}
+	variant := func(flag, modname string) CompactObjectVariant {
+		t.Helper()
+		object := resolvedKbuildObject{
+			object:  "drivers/example/bundle.o",
+			mode:    "y",
+			modname: modname,
+			flags: []resolvedKbuildFlag{{
+				language: "any",
+				values:   []string{flag},
+			}},
+			footprint: map[string]bool{"CONFIG_UNUSED": true},
+		}
+		return object.variant(
+			config,
+			"",
+			[]string{"ignored.inc"},
+			[]CompactSourceInput{{Path: "ignored.inc", Digest: strings.Repeat("f", 64)}},
+			[]string{"member_target"},
+			[]string{"ignored_dep"},
+			[]string{strings.Repeat("a", 64)},
+			[]string{strings.Repeat("b", 64)},
+			"",
+			nil,
+			CompactSchemaV013,
+			"linker-abi-v1",
+			"",
+		)
+	}
+	left := variant("-DLEFT", "left")
+	right := variant("-DRIGHT", "right")
+	if left.ContentID != right.ContentID || left.Target != right.Target || !left.equal(right) {
+		t.Fatalf("irrelevant composite metadata split identity:\nleft=%#v\nright=%#v", left, right)
+	}
+	if len(left.Flags) != 0 || len(left.SourceInputs) != 0 || len(left.Deps) != 0 || left.ModName != "" {
+		t.Fatalf("v0.0.13 composite retained ignored action metadata: %#v", left)
+	}
+}
+
+func TestCompactV013Arm64NvheIdentityBindsLinkerScriptAndConfig(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "nVHE exact identity"
+
+config NVHE_LAYOUT
+	bool "nVHE layout"
+`)
+	kb, err := ParseKbuild(strings.NewReader(`
+obj-y := arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o
+arch/arm64/kvm/hyp/nvhe/kvm_nvhe-y := arch/arm64/kvm/hyp/nvhe/member.nvhe.o
+`), "Makefile")
+	if err != nil {
+		t.Fatalf("parseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "arch/arm64/kvm/hyp/nvhe/member.c", "int member;\n")
+	mustWriteSource(t, sourceRoot, "arch/arm64/kvm/hyp/nvhe/hyp.lds.S", `
+#if defined(CONFIG_NVHE_LAYOUT)
+SECTIONS { .text : { *(.text) } }
+#else
+SECTIONS { .text : { *(.text*) } }
+#endif
+`)
+	writeCompactV013ForcedInputs(t, sourceRoot)
+	generate := func(name string, flags map[string]string) (*CompactMetadata, CompactObjectVariant) {
+		t.Helper()
+		metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{
+			Name:  name,
+			Flags: flags,
+		}}, CompactMetadataOptions{
+			Schema:                CompactSchemaV013,
+			SourceRoot:            sourceRoot,
+			Srcarch:               "arm64",
+			CompileEnvironmentABI: "object-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataWithOptions(%s) failed: %v", name, err)
+		}
+		config := configByName(metadata, name)
+		return metadata, variantByTarget(metadata, objectTarget(metadata, config, "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o"))
+	}
+	_, off := generate("off", nil)
+	onMetadata, on := generate("on", map[string]string{"CONFIG_NVHE_LAYOUT": "y"})
+	if off.Object == "" || on.Object == "" {
+		t.Fatalf("missing nVHE variants: off=%#v on=%#v", off, on)
+	}
+	if got := on.ConfigFragment["CONFIG_NVHE_LAYOUT"]; got != "y" {
+		t.Fatalf("nVHE config fragment CONFIG_NVHE_LAYOUT = %q, want y", got)
+	}
+	if on.CompileEnvironment == off.CompileEnvironment || on.ContentID == off.ContentID {
+		t.Fatalf("nVHE linker-script config did not split identity: off=%#v on=%#v", off, on)
+	}
+	onInputs, err := onMetadata.expandedSourceInputGroup(on.SourceInputGroup, on.SourceInputs, "nVHE")
+	if err != nil {
+		t.Fatalf("expand nVHE source inputs: %v", err)
+	}
+	if !slices.ContainsFunc(onInputs, func(input CompactSourceInput) bool {
+		return input.Path == "arch/arm64/kvm/hyp/nvhe/hyp.lds.S"
+	}) {
+		t.Fatalf("nVHE source inputs omit hyp.lds.S: %v", onInputs)
+	}
+	objectBuild, err := onMetadata.ObjectBuildFile(CompactBuildFileOptions{
+		Schema:             CompactSchemaV013,
+		Arch:               "arm64",
+		SourceLabelPackage: "@linux//",
+		SourceRootLabel:    "@linux//:Kconfig",
+		Srcarch:            "arm64",
+	})
+	if err != nil {
+		t.Fatalf("ObjectBuildFile() failed: %v", err)
+	}
+	parsed, err := build.ParseBuild("objects.BUILD.bazel", objectBuild)
+	if err != nil {
+		t.Fatalf("generated nVHE object BUILD did not parse: %v\n%s", err, objectBuild)
+	}
+	rule := parsed.RuleNamed(on.Target)
+	if rule == nil {
+		t.Fatalf("generated object BUILD has no nVHE rule %q:\n%s", on.Target, objectBuild)
+	}
+	if got := rule.AttrString("source_input_index"); got != ":_source_input_index" {
+		t.Fatalf("nVHE source_input_index = %q", got)
+	}
+	if got := rule.AttrLiteral("source_input_group"); got != fmt.Sprintf("%d", on.SourceInputGroup) {
+		t.Fatalf("nVHE source_input_group = %q, want %d", got, on.SourceInputGroup)
+	}
+	for _, attr := range []string{"source_includes", "source_includes_complete", "config_fragment"} {
+		if rule.Attr(attr) != nil {
+			t.Fatalf("indexed nVHE rule retains redundant %s:\n%s", attr, objectBuild)
+		}
+	}
+	before := on.ContentID
+	mustWriteSource(t, sourceRoot, "arch/arm64/kvm/hyp/nvhe/hyp.lds.S", `
+#if defined(CONFIG_NVHE_LAYOUT)
+SECTIONS { .text : { *(.text .text.*) } }
+#endif
+`)
+	_, changed := generate("changed", map[string]string{"CONFIG_NVHE_LAYOUT": "y"})
+	if changed.ContentID == before {
+		t.Fatalf("nVHE linker-script digest did not change content ID %q", before)
+	}
+}
+
+func TestCompactV013Arm64VDSO32WrapBindsNestedActionInputs(t *testing.T) {
+	tree := mustParseString(t, "mainmenu \"compat vDSO exact identity\"\n")
+	kb, err := ParseKbuild(strings.NewReader(`
+obj-y := arch/arm64/kernel/vdso32-wrap.o
+`), "Makefile")
+	if err != nil {
+		t.Fatalf("parseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	for path, content := range map[string]string{
+		"arch/arm64/include/asm/vdso/compat.h":       "#define COMPAT_VDSO 1\n",
+		"arch/arm64/include/asm/vdso/gettimeofday.h": "#ifdef __aarch64__\n#include \"native.h\"\n#else\n#include \"compat.h\"\n#endif\n",
+		"arch/arm64/include/asm/vdso/native.h":       "#define NATIVE_VDSO 1\n",
+		"arch/arm64/kernel/vdso32-wrap.S":            "\n",
+		"arch/arm64/kernel/vdso32/note.c":            "int note;\n",
+		"arch/arm64/kernel/vdso32/vdso.lds.S":        "SECTIONS { .text : { *(.text*) } }\n",
+		"arch/arm64/kernel/vdso32/vgettimeofday.c":   "#include <asm/vdso/gettimeofday.h>\n",
+		"lib/vdso/gettimeofday.c":                    "#include <asm/vdso/gettimeofday.h>\n",
+	} {
+		mustWriteSource(t, sourceRoot, path, content)
+	}
+	writeCompactV013ForcedInputs(t, sourceRoot)
+	generate := func(name string) (*CompactMetadata, CompactObjectVariant) {
+		t.Helper()
+		metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{Name: name}}, CompactMetadataOptions{
+			Schema:                CompactSchemaV013,
+			SourceRoot:            sourceRoot,
+			Srcarch:               "arm64",
+			CompileEnvironmentABI: "object-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataWithOptions(%s) failed: %v", name, err)
+		}
+		config := configByName(metadata, name)
+		return metadata, variantByTarget(metadata, objectTarget(metadata, config, "arch/arm64/kernel/vdso32-wrap.o"))
+	}
+
+	metadata, before := generate("before")
+	inputs, err := metadata.expandedSourceInputGroup(before.SourceInputGroup, before.SourceInputs, "compat vDSO")
+	if err != nil {
+		t.Fatalf("expand compat vDSO source inputs: %v", err)
+	}
+	var paths []string
+	for _, input := range inputs {
+		paths = append(paths, input.Path)
+	}
+	for _, want := range []string{
+		"arch/arm64/include/asm/vdso/compat.h",
+		"arch/arm64/kernel/vdso32-wrap.S",
+		"arch/arm64/kernel/vdso32/note.c",
+		"arch/arm64/kernel/vdso32/vdso.lds.S",
+		"arch/arm64/kernel/vdso32/vgettimeofday.c",
+		"lib/vdso/gettimeofday.c",
+	} {
+		if !slices.Contains(paths, want) {
+			t.Errorf("compat vDSO source inputs = %v, want %q", paths, want)
+		}
+	}
+	if slices.Contains(paths, "arch/arm64/include/asm/vdso/native.h") {
+		t.Fatalf("compat vDSO source inputs selected native arm64 branch: %v", paths)
+	}
+
+	mustWriteSource(t, sourceRoot, "lib/vdso/gettimeofday.c", "#define COMPAT_CHANGED 1\n")
+	_, changed := generate("changed")
+	if changed.ContentID == before.ContentID {
+		t.Fatalf("compat vDSO nested source digest did not change content ID %q", before.ContentID)
+	}
+}
+
+func TestCompactV013SpecialSourceManifestExcludesHostTools(t *testing.T) {
+	inputs := compactSpecialSourcesForObject("arch/x86/entry/vdso/vdso-image-64.o")
+	if inputs.primary != "arch/x86/entry/vdso/vdso-note.S" {
+		t.Fatalf("vDSO primary source = %q", inputs.primary)
+	}
+	var paths []string
+	for _, input := range inputs.inputs {
+		paths = append(paths, input.path)
+	}
+	for _, want := range []string{
+		"arch/x86/entry/vdso/vdso-note.S",
+		"arch/x86/entry/vdso/vclock_gettime.c",
+		"arch/x86/entry/vdso/vdso.lds.S",
+		"arch/x86/include/asm/vdso.h",
+	} {
+		if !slices.Contains(paths, want) {
+			t.Fatalf("vDSO source manifest %v missing %q", paths, want)
+		}
+	}
+	if slices.Contains(paths, "arch/x86/entry/vdso/vdso2c.c") {
+		t.Fatalf("vDSO source manifest includes host tool vdso2c.c: %v", paths)
+	}
+}
+
 func TestCompactSchemasKeepLegacyImageContractOptIn(t *testing.T) {
 	metadata := &CompactMetadata{
 		Configs: []CompactConfig{{
@@ -965,7 +1839,7 @@ func TestCompactSchemasKeepLegacyImageContractOptIn(t *testing.T) {
 }
 
 func TestParseCompactSchema(t *testing.T) {
-	for _, value := range []string{string(CompactSchemaV011), string(CompactSchemaV012)} {
+	for _, value := range []string{string(CompactSchemaV011), string(CompactSchemaV012), string(CompactSchemaV013)} {
 		if got, err := ParseCompactSchema(value); err != nil || string(got) != value {
 			t.Fatalf("ParseCompactSchema(%q) = %q, %v", value, got, err)
 		}
@@ -1213,6 +2087,102 @@ func TestCompactImageBuildFileAliasesDuplicateObjectSets(t *testing.T) {
 	}
 }
 
+func TestCompactV013ImageBuildEmitsBaseRelativeDelta(t *testing.T) {
+	id := func(value string) string {
+		t.Helper()
+		return strings.Repeat(value, 64)
+	}
+	metadata := &CompactMetadata{
+		Schema: CompactSchemaV013,
+		Configs: []CompactConfig{
+			{
+				Name:                "base",
+				ImageTarget:         "base_image",
+				ObjectTargets:       []string{"a", "b"},
+				ModuleObjectTargets: []string{"m", "n"},
+			},
+			{
+				Name:                "copy",
+				ImageTarget:         "copy_image",
+				ObjectTargets:       []string{"a", "b"},
+				ModuleObjectTargets: []string{"m", "n"},
+			},
+			{
+				Name:                "module_reorder",
+				ImageTarget:         "module_reorder_image",
+				ObjectTargets:       []string{"a", "b"},
+				ModuleObjectTargets: []string{"n", "m"},
+			},
+			{
+				Name:                "overlay",
+				ImageTarget:         "overlay_image",
+				ObjectTargets:       []string{"b", "c", "a"},
+				ModuleObjectTargets: []string{"n"},
+			},
+		},
+		ObjectVariants: []CompactObjectVariant{
+			{Target: "a", Object: "a.o", ContentID: id("a")},
+			{Target: "b", Object: "b.o", ContentID: id("b")},
+			{Target: "c", Object: "c.o", ContentID: id("c")},
+			{Target: "m", Object: "m.o", ContentID: id("d")},
+			{Target: "n", Object: "n.o", ContentID: id("e")},
+		},
+	}
+	imageBuild, err := metadata.ImageBuildFile(CompactImageBuildFileOptions{
+		Schema:             CompactSchemaV013,
+		Arch:               "x86",
+		BaseConfig:         "base",
+		ObjectLabelPackage: "//objects",
+	})
+	if err != nil {
+		t.Fatalf("ImageBuildFile() failed: %v", err)
+	}
+	parsed, err := build.ParseBuild("images.BUILD.bazel", imageBuild)
+	if err != nil {
+		t.Fatalf("generated image BUILD did not parse: %v\n%s", err, imageBuild)
+	}
+	base := parsed.RuleNamed("base_image")
+	if base == nil || base.Kind() != "linux_compact_image" {
+		t.Fatalf("base image is not a linux_compact_image:\n%s", imageBuild)
+	}
+	if got, want := base.AttrStrings("objects"), []string{"//objects:a", "//objects:b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("base objects = %v, want %v", got, want)
+	}
+	if got, want := base.AttrStrings("module_objects"), []string{"//objects:m", "//objects:n"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("base module_objects = %v, want %v", got, want)
+	}
+	copyRule := parsed.RuleNamed("copy_image")
+	if copyRule == nil || copyRule.Kind() != "alias" || copyRule.AttrString("actual") != ":base_image" {
+		t.Fatalf("identical config did not alias the base image:\n%s", imageBuild)
+	}
+	moduleReorder := parsed.RuleNamed("module_reorder_image")
+	if moduleReorder == nil || moduleReorder.Kind() != "linux_compact_delta_image" {
+		t.Fatalf("module reorder with the same membership incorrectly aliased the base image:\n%s", imageBuild)
+	}
+	if got, want := moduleReorder.AttrStrings("ordered_module_content_ids"), []string{id("e"), id("d")}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("module reorder ordered_module_content_ids = %v, want %v", got, want)
+	}
+	overlay := parsed.RuleNamed("overlay_image")
+	if overlay == nil || overlay.Kind() != "linux_compact_delta_image" {
+		t.Fatalf("overlay is not a linux_compact_delta_image:\n%s", imageBuild)
+	}
+	if got := overlay.AttrString("base_image"); got != ":base_image" {
+		t.Fatalf("overlay base_image = %q, want :base_image", got)
+	}
+	if got, want := overlay.AttrStrings("add_objects"), []string{"//objects:c"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("overlay add_objects = %v, want %v", got, want)
+	}
+	if got, want := overlay.AttrStrings("remove_content_ids"), []string{id("d")}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("overlay remove_content_ids = %v, want %v", got, want)
+	}
+	if got, want := overlay.AttrStrings("ordered_content_ids"), []string{id("b"), id("c"), id("a")}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("overlay ordered_content_ids = %v, want built-ins only %v", got, want)
+	}
+	if got, want := overlay.AttrStrings("ordered_module_content_ids"), []string{id("e")}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("overlay ordered_module_content_ids = %v, want %v", got, want)
+	}
+}
+
 func TestCompactMetadataPreservesFlagOrder(t *testing.T) {
 	tree := mustParseCompactFixture(t)
 	kb, err := ParseKbuild(strings.NewReader(`
@@ -1425,6 +2395,17 @@ func writeCompactSource(t *testing.T, root, rel string) {
 	}
 	if err := os.WriteFile(path, []byte("int source;\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile(%q) failed: %v", path, err)
+	}
+}
+
+func writeCompactV013ForcedInputs(t *testing.T, root string) {
+	t.Helper()
+	for _, path := range []string{
+		"include/linux/compiler-version.h",
+		"include/linux/compiler_types.h",
+		"include/linux/kconfig.h",
+	} {
+		mustWriteSource(t, root, path, "\n")
 	}
 }
 
