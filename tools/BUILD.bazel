@@ -4,3 +4,8 @@ alias(
     name = "insnattr",
     actual = "//internal/cmd/insnattr",
 )
+
+alias(
+    name = "linuxobjectinputreport",
+    actual = "//internal/cmd/linuxobjectinputreport",
+)
