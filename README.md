@@ -424,9 +424,9 @@ implementations are not part of the supported contract yet.
 
 Repository generation downloads the platform-specific, integrity-pinned
 Kconfig graph generator selected by the rules release's checked-in table. The
-Starlark rule adapts its legacy source and `require_real` declarations, checks
-their expected schema, and verifies that the emitted metadata names the
-requested config and contains object variants. The generator never consumes a
+Starlark rule requires indexed content-graph metadata, verifies exact source
+inputs and content identities, and checks every generated-header family and
+compile environment before exposing the graph. The generator never consumes a
 build output, which keeps module resolution valid and reproducible.
 
 The build does not read ambient host tools or environment variables. All tools
@@ -443,21 +443,20 @@ ordinary compiles receive headers, bounded special lookups, and the exact
 repository-generated closure of source-like includes rather than the complete
 source archive.
 
-The released repository consumer still requests compact schema `v0.0.12`.
-That schema deliberately includes the resolved config artifact and generated
-header set in each object action, so named variants use independent object
-graphs.
+Repository generation resolves the base config and every named overlay in one
+compact-schema `v0.0.13` invocation. Compile environments, exact source inputs,
+and generated-header families are content-addressed, and variant images are
+emitted as deltas from one canonical base graph. Equivalent configs therefore
+reference the same object targets. Configs with only some identical generated
+headers share those family inputs without conflating the remaining
+generated-header tree. The public `@repo//:kernel` and
+`@repo//variants/<name>:kernel` labels stay unchanged.
 
-The in-tree `v0.0.13` schema prepares the replacement: all named configs are
-resolved in one generator invocation, compile environments and generated
-header families are content-addressed, source inputs are scanned exactly, and
-variant images are emitted as deltas from one canonical base graph. Equivalent
-configs therefore reference the same object targets. Configs with only some
-identical generated headers share those family inputs without conflating the
-remaining generated-header tree. The public `@repo//:kernel` and
-`@repo//variants/<name>:kernel` labels stay unchanged. Repository activation is
-intentionally gated on publishing the next generator release for all six
-supported host platforms and passing the differential output checks.
+For the maintained x86_64 base, BTF, debug, and LZ4 invocation, 4,711 config
+memberships resolve to 3,519 `LinuxObjectCompile` actions. Base and LZ4 share
+all 1,152 object actions; generated-header family identities additionally
+share 40 base/debug actions. BTF compiler flags differ, so BTF correctly shares
+generated-header producers but no object compile actions.
 
 For x86 boot images, the resolved config must select either
 `CONFIG_KERNEL_GZIP=y` or `CONFIG_KERNEL_LZ4=y`. Other x86 payload compression

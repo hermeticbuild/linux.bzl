@@ -79,9 +79,8 @@ _PROBE_VALUES = {
     "rustc_version": "109700",
 }
 
-_REPOSITORY_COMPACT_SCHEMA = "v0.0.12"
-_CONTENT_COMPACT_SCHEMA = "v0.0.13"
-_REPOSITORY_GENERATOR_PROTOCOL = "compact-v3-rust-profile"
+_COMPACT_SCHEMA = "v0.0.13"
+_REPOSITORY_GENERATOR_PROTOCOL = "compact-v5-content-graph"
 _LLVM_VERSION = "22.1.8"
 _IMAGE_COMPRESSION_CONFIGS = {
     "CONFIG_KERNEL_GZIP": True,
@@ -186,10 +185,7 @@ def _linux_image_impl(rctx):
         sanitized_names[sanitized] = name
         configs[name] = resolved
         variant_configs[name] = "//configs:%s" % name
-        if _REPOSITORY_COMPACT_SCHEMA == _CONTENT_COMPACT_SCHEMA:
-            variant_graph_images[name] = "//graph:%s_image" % sanitized
-        else:
-            variant_graph_images[name] = "//graph/%s:%s_image" % (name, sanitized)
+        variant_graph_images[name] = "//graph:%s_image" % sanitized
         variant_rust_enabled[name] = resolved.get("CONFIG_RUST") == "y"
 
     rust_profile_json = ""
@@ -202,96 +198,57 @@ def _linux_image_impl(rctx):
         )
 
     _write_configs(rctx, arch, configs, rules_repo)
-    graph_stats = {}
-    base_header_family_dependencies = {}
-    base_header_family_ids = {}
-    variant_core_configs = {}
-    variant_header_family_dependencies = {}
-    variant_header_family_ids = {}
-    variant_header_configs = {}
-    if _REPOSITORY_COMPACT_SCHEMA == _CONTENT_COMPACT_SCHEMA:
-        config_paths = {
-            arch: "configs/base.config",
-        }
-        generated_headers = {
-            arch: "//:_base_%s_generated_headers" % _ARCHITECTURES[arch].arch,
-        }
-        for name in sorted(variant_configs.keys()):
-            config_paths[name] = "configs/%s.config" % name
-            generated_headers[name] = "//:_variant_%s_%s_generated_headers" % (
-                name,
-                _ARCHITECTURES[arch].arch,
-            )
-        content_graph = _generate_content_graph(
-            rctx = rctx,
-            tool = tool,
-            source = source,
-            source_root = source_root,
-            arch = arch,
-            base_config = arch,
-            config_paths = config_paths,
-            config_mode = rctx.attr.config_mode,
-            generated_headers = generated_headers,
-            rules_repo = rules_repo,
-            version = version,
+    config_paths = {
+        arch: "configs/base.config",
+    }
+    generated_headers = {
+        arch: "//:_base_%s_generated_headers" % _ARCHITECTURES[arch].arch,
+    }
+    for name in sorted(variant_configs.keys()):
+        config_paths[name] = "configs/%s.config" % name
+        generated_headers[name] = "//:_variant_%s_%s_generated_headers" % (
+            name,
+            _ARCHITECTURES[arch].arch,
         )
-        graph_stats = content_graph.stats
-        base_header_family_dependencies = content_graph.header_family_dependencies[arch]
-        base_header_family_ids = content_graph.header_family_ids[arch]
-        variant_header_family_dependencies = {
-            name: content_graph.header_family_dependencies[name]
-            for name in variant_configs.keys()
-        }
-        variant_header_family_ids = {
-            name: content_graph.header_family_ids[name]
-            for name in variant_configs.keys()
-        }
-        variant_header_configs = content_graph.variant_header_configs
-        rust_enabled = dict(variant_rust_enabled)
-        rust_enabled[arch] = base_rust_enabled
-        core_configs = _content_core_config_aliases(
-            content_graph.metadata,
-            configs,
-            rust_enabled,
-            content_graph.header_configs,
-            arch,
-        )
-        variant_core_configs = {
-            name: core_configs[name]
-            for name in variant_configs.keys()
-        }
-        graph_image = "//graph:%s_image" % _sanitize_target_name(arch)
-    else:
-        _generate_config_graph(
-            rctx = rctx,
-            tool = tool,
-            source = source,
-            source_root = source_root,
-            arch = arch,
-            config_name = arch,
-            config_path = "configs/base.config",
-            config_mode = rctx.attr.config_mode,
-            graph_dir = "graph/base",
-            source_config = "//:_base_config",
-            target_prefix = "_base",
-            rules_repo = rules_repo,
-        )
-        for name in sorted(variant_configs.keys()):
-            _generate_config_graph(
-                rctx = rctx,
-                tool = tool,
-                source = source,
-                source_root = source_root,
-                arch = arch,
-                config_name = name,
-                config_path = "configs/%s.config" % name,
-                config_mode = rctx.attr.config_mode,
-                graph_dir = "graph/%s" % name,
-                source_config = "//:_variant_%s_config" % name,
-                target_prefix = "_variant_%s" % name,
-                rules_repo = rules_repo,
-            )
-        graph_image = "//graph/base:%s_image" % _sanitize_target_name(arch)
+    content_graph = _generate_content_graph(
+        rctx = rctx,
+        tool = tool,
+        source = source,
+        source_root = source_root,
+        arch = arch,
+        base_config = arch,
+        config_paths = config_paths,
+        config_mode = rctx.attr.config_mode,
+        generated_headers = generated_headers,
+        rules_repo = rules_repo,
+        version = version,
+    )
+    graph_stats = content_graph.stats
+    base_header_family_dependencies = content_graph.header_family_dependencies[arch]
+    base_header_family_ids = content_graph.header_family_ids[arch]
+    variant_header_family_dependencies = {
+        name: content_graph.header_family_dependencies[name]
+        for name in variant_configs.keys()
+    }
+    variant_header_family_ids = {
+        name: content_graph.header_family_ids[name]
+        for name in variant_configs.keys()
+    }
+    variant_header_configs = content_graph.variant_header_configs
+    rust_enabled = dict(variant_rust_enabled)
+    rust_enabled[arch] = base_rust_enabled
+    core_configs = _content_core_config_aliases(
+        content_graph.metadata,
+        configs,
+        rust_enabled,
+        content_graph.header_configs,
+        arch,
+    )
+    variant_core_configs = {
+        name: core_configs[name]
+        for name in variant_configs.keys()
+    }
+    graph_image = "//graph:%s_image" % _sanitize_target_name(arch)
     rctx.delete(".linux_bzl_tools")
     rctx.delete(".linux_bzl_resolve")
 
@@ -337,7 +294,7 @@ def _linux_image_impl(rctx):
         ".linux-bzl-generator.json",
         json.encode({
             "architecture": arch,
-            "compact_schema": _REPOSITORY_COMPACT_SCHEMA,
+            "compact_schema": _COMPACT_SCHEMA,
             "graph_stats": graph_stats,
             "protocol": _REPOSITORY_GENERATOR_PROTOCOL,
             "rust_enabled": base_rust_enabled,
@@ -684,7 +641,7 @@ def _generate_rust_profile(rctx, tool, source_root, descriptor):
     rctx.file(output, "", executable = False)
     args = [
         str(tool),
-        "-compact_schema=v0.0.12",
+        "-compact_schema=" + _COMPACT_SCHEMA,
         "-rust_profile_out",
         str(rctx.path(output)),
         "-srctree",
@@ -718,102 +675,6 @@ def _generate_rust_profile(rctx, tool, source_root, descriptor):
     rctx.delete(output)
     return content
 
-def _generate_config_graph(
-        rctx,
-        tool,
-        source,
-        source_root,
-        arch,
-        config_name,
-        config_path,
-        config_mode,
-        graph_dir,
-        source_config,
-        target_prefix,
-        rules_repo):
-    _initialize_generator_outputs(rctx, graph_dir)
-    descriptor = _ARCHITECTURES[arch]
-    source_package = str(source).rsplit(":", 1)[0]
-    source_repo = _repository_prefix(source)
-    args = [
-        str(tool),
-        "-compact_schema=v0.0.12",
-        "-root",
-        str(source_root.get_child("Kconfig")),
-        "-srctree",
-        str(source_root),
-        "-kbuild",
-        str(source_root.get_child("Kbuild")),
-        "-compact_kbuild_tree",
-        "-compact_buildfile_out",
-        str(rctx.path(graph_dir + "/BUILD.bazel")),
-        "-compact_metadata_out",
-        str(rctx.path(graph_dir + "/metadata.json")),
-        "-compact_buildfile_export",
-        "metadata.json",
-        "-linux_objects_load",
-        rules_repo + "//internal:linux_objects.bzl",
-        "-object_label_package",
-        "//" + graph_dir,
-        "-source_label_package",
-        source_package,
-        "-source_root_label",
-        str(source),
-        "-source_tree_arch_headers_label",
-        source_repo + "//:arch_headers",
-        "-source_tree_dtb_sources_label",
-        source_repo + "//:dtb_sources",
-        "-source_tree_global_headers_label",
-        source_repo + "//:global_headers",
-        "-source_tree_headers_label",
-        source_repo + "//:headers",
-        "-source_tree_kbuild_files_label",
-        source_repo + "//:kbuild_files",
-        "-source_tree_local_include_files_label",
-        source_repo + "//:local_include_files",
-        "-source_tree_lookup_files_label",
-        source_repo + "//:source_tree_lookup_files",
-        "-source_tree_scripts_headers_label",
-        source_repo + "//:scripts_headers",
-        "-source_tree_uapi_headers_label",
-        source_repo + "//:uapi_headers",
-        "-generated_headers",
-        "//:%s_%s_generated_headers" % (target_prefix, descriptor.arch),
-        "-source_config",
-        source_config,
-        "-allow_shell",
-        "-linux_probe_model",
-        "linux_llvm",
-        "-visibility",
-        "//:__subpackages__",
-    ]
-    args.extend(_graph_host_tool_args(arch))
-    args.extend(_graph_config_args(
-        config_name,
-        rctx.path(config_path),
-        config_mode,
-    ))
-
-    _add_generator_variables(args, descriptor, source_root)
-
-    result = rctx.execute(
-        args,
-        environment = {
-            "LANG": "C",
-            "LC_ALL": "C",
-            "TZ": "UTC",
-        },
-        quiet = False,
-        timeout = 1200,
-    )
-    if result.return_code != 0:
-        fail(
-            "Linux graph generation failed for %s config %s\nstdout:\n%s\nstderr:\n%s" %
-            (rctx.original_name, config_name, result.stdout, result.stderr),
-        )
-    _validate_generated_metadata(rctx, graph_dir, config_name, source_root)
-    _validate_generated_build(rctx, graph_dir, config_name)
-
 def _generate_content_graph(
         rctx,
         tool,
@@ -838,7 +699,7 @@ def _generate_content_graph(
     source_repo = _repository_prefix(source)
     args = [
         str(tool),
-        "-compact_schema=" + _CONTENT_COMPACT_SCHEMA,
+        "-compact_schema=" + _COMPACT_SCHEMA,
         "-compact_base_config",
         base_config,
         "-compile_environment_abi",
@@ -928,7 +789,6 @@ def _generate_content_graph(
         graph_dir,
         sorted(config_paths.keys()),
         source_root,
-        schema = _CONTENT_COMPACT_SCHEMA,
         expected_compile_environment_abi = compile_environment_abi,
         expected_srcarch = descriptor.srcarch,
     )
@@ -936,7 +796,6 @@ def _generate_content_graph(
         rctx,
         graph_dir,
         "content-addressed configs",
-        schema = _CONTENT_COMPACT_SCHEMA,
     )
     metadata = validated.metadata
     header_index = _content_generated_header_config_index(
@@ -956,26 +815,6 @@ def _generate_content_graph(
             if name != base_config
         },
     )
-
-def _graph_config_args(config_name, config_path, config_mode):
-    return [
-        "-config",
-        "%s=%s" % (config_name, config_path),
-        "-config_mode",
-        config_mode,
-    ]
-
-def _graph_host_tool_args(arch):
-    args = [
-        "-source_asn1_compiler",
-        "//:_base_asn1_compiler_tool",
-    ]
-    if arch == "aarch64":
-        args.extend([
-            "-source_relacheck",
-            "//:_base_relacheck_tool",
-        ])
-    return args
 
 def _graph_configs_args(config_paths, config_mode):
     args = []
@@ -1267,24 +1106,19 @@ def _validate_generated_metadata(
         graph_dir,
         config_names,
         source_root,
-        schema = "v0.0.12",
-        expected_compile_environment_abi = "",
-        expected_srcarch = ""):
+        expected_compile_environment_abi,
+        expected_srcarch):
     metadata = json.decode(rctx.read(graph_dir + "/metadata.json"))
     if type(metadata) != "dict":
         fail("Linux graph generator wrote invalid metadata")
-    if type(config_names) == "string":
-        config_names = [config_names]
     generated_configs = metadata.get("configs", [])
     names = sorted([config.get("name", "") for config in generated_configs])
     expected_names = sorted(config_names)
     if names != expected_names:
         fail("Linux graph generator emitted configs %s, expected %s" % (names, expected_names))
-    source_index = None
-    if schema == _CONTENT_COMPACT_SCHEMA:
-        if metadata.get("schema") != _CONTENT_COMPACT_SCHEMA:
-            fail("Linux content graph generator emitted schema %r" % metadata.get("schema"))
-        source_index = _metadata_source_input_index(metadata)
+    if metadata.get("schema") != _COMPACT_SCHEMA:
+        fail("Linux content graph generator emitted schema %r" % metadata.get("schema"))
+    source_index = _metadata_source_input_index(metadata)
 
     variants = metadata.get("object_variants", [])
     if type(variants) != "list" or not variants:
@@ -1307,7 +1141,7 @@ def _validate_generated_metadata(
         if target in variants_by_target:
             fail("Linux graph generator repeated object target %s" % target)
         variants_by_target[target] = variant
-        if schema == _CONTENT_COMPACT_SCHEMA and "config_fragment" in variant:
+        if "config_fragment" in variant:
             fail("Linux content graph object %s retains redundant config_fragment" % object_path)
         if variant.get("members", []):
             continue
@@ -1322,25 +1156,16 @@ def _validate_generated_metadata(
                 "Linux graph for configs %s resolved object %s to missing source %s" %
                 (expected_names, object_path, source),
             )
-        if schema == _CONTENT_COMPACT_SCHEMA:
-            if variant.get("source_inputs", []):
-                fail("Linux content graph object %s retains inline source_inputs" % object_path)
-            source_paths = _metadata_source_input_group(
-                source_index,
-                variant.get("source_input_group", 0),
-                "Linux content graph object %s" % object_path,
-            )
-            if source not in source_paths:
-                fail("Linux content graph object %s exact inputs omit %s" % (object_path, source))
-
-    if schema != _CONTENT_COMPACT_SCHEMA:
-        return struct(
-            metadata = metadata,
-            stats = {
-                "config_count": len(generated_configs),
-                "object_definitions": len(variants),
-            },
+        if variant.get("source_inputs", []):
+            fail("Linux content graph object %s retains inline source_inputs" % object_path)
+        source_paths = _metadata_source_input_group(
+            source_index,
+            variant.get("source_input_group", 0),
+            "Linux content graph object %s" % object_path,
         )
+        if source not in source_paths:
+            fail("Linux content graph object %s exact inputs omit %s" % (object_path, source))
+
     if not expected_compile_environment_abi:
         fail("Linux content graph validation requires an expected compile environment ABI")
 
@@ -1544,21 +1369,18 @@ def _validate_compile_environment_abi(actual, expected, environment_id):
             (environment_id, actual, expected),
         )
 
-def _generated_object_block_has_buildable_inputs(block, schema):
+def _generated_object_block_has_buildable_inputs(block):
     block_with_prefix = "\n" + block
-    if schema == _CONTENT_COMPACT_SCHEMA:
-        return (
-            "\n    source_input_file = " in block_with_prefix and
-            "\n    source_input_group = " in block_with_prefix and
-            "\n    source_input_index = " in block_with_prefix
-        )
-    return "\n    src = " in block_with_prefix
+    return (
+        "\n    source_input_file = " in block_with_prefix and
+        "\n    source_input_group = " in block_with_prefix and
+        "\n    source_input_index = " in block_with_prefix
+    )
 
 def _validate_generated_build(
         rctx,
         graph_dir,
-        config_name,
-        schema = "v0.0.12"):
+        config_name):
     content = rctx.read(graph_dir + "/BUILD.bazel")
     unsupported_rules = [
         "linux_dtb",
@@ -1580,7 +1402,7 @@ def _validate_generated_build(
         if end < 0:
             fail("Linux graph generator emitted a malformed linux_object rule")
         block = raw_block[:end]
-        if _generated_object_block_has_buildable_inputs(block, schema):
+        if _generated_object_block_has_buildable_inputs(block):
             continue
         name = "<unknown>"
         name_prefix = '    name = "'
@@ -1598,7 +1420,7 @@ def _validate_generated_build(
             (
                 config_name,
                 name,
-                "indexed" if schema == _CONTENT_COMPACT_SCHEMA else "source",
+                "indexed",
             ),
         )
 
@@ -1615,13 +1437,13 @@ def _kernel_root_build(
         config_mode,
         graph_image,
         variant_configs,
+        variant_core_configs,
         variant_graph_images,
+        variant_header_family_dependencies,
+        variant_header_family_ids,
+        variant_header_configs,
         variant_rust_enabled,
-        rules_repo,
-        variant_core_configs = {},
-        variant_header_family_dependencies = {},
-        variant_header_family_ids = {},
-        variant_header_configs = {}):
+        rules_repo):
     return """load("{rules_repo}//internal:kernel_repository_targets.bzl", "linux_image_targets")
 
 package(default_visibility = ["//visibility:private"])
@@ -1671,12 +1493,10 @@ linux_image_targets(
 
 repositories_test_helpers = struct(
     validate_compile_environment_abi = _validate_compile_environment_abi,
-    content_schema = _CONTENT_COMPACT_SCHEMA,
+    content_schema = _COMPACT_SCHEMA,
     core_config_aliases = _content_core_config_aliases,
     generated_object_block_has_buildable_inputs = _generated_object_block_has_buildable_inputs,
-    graph_config_args = _graph_config_args,
     graph_configs_args = _graph_configs_args,
-    graph_host_tool_args = _graph_host_tool_args,
     generator_variable_args = _generator_variable_args,
     generated_header_config_index = _content_generated_header_config_index,
     generator_protocol = _REPOSITORY_GENERATOR_PROTOCOL,

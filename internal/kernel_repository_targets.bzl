@@ -25,9 +25,7 @@ def _source_tree_inputs(source_repo):
 
 def _validate_header_family_dependencies(family_ids, family_dependencies, what):
     if not family_ids:
-        if family_dependencies:
-            fail("%s dependencies require generated-header family IDs" % what)
-        return
+        fail("%s requires generated-header family IDs" % what)
     if sorted(family_dependencies.keys()) != sorted(family_ids.keys()):
         fail(
             "%s dependency families %s do not match generated-header families %s" %
@@ -197,16 +195,16 @@ def linux_image_targets(
         base_config,
         base_rust_enabled,
         graph_image,
-        base_header_family_dependencies = {},
-        base_header_family_ids = {},
-        config_mode = "default",
-        variant_configs = {},
-        variant_core_configs = {},
-        variant_graph_images = {},
-        variant_header_family_dependencies = {},
-        variant_header_family_ids = {},
-        variant_header_configs = {},
-        variant_rust_enabled = {}):
+        base_header_family_dependencies,
+        base_header_family_ids,
+        variant_configs,
+        variant_core_configs,
+        variant_graph_images,
+        variant_header_family_dependencies,
+        variant_header_family_ids,
+        variant_header_configs,
+        variant_rust_enabled,
+        config_mode):
     """Defines private kernel graphs and the base stable exports."""
     if type(base_rust_enabled) != "bool":
         fail("base_rust_enabled must be a bool")
@@ -216,22 +214,15 @@ def linux_image_targets(
         fail("Rust-enabled Linux targets require a source-derived Rust profile")
     if sorted(variant_configs.keys()) != sorted(variant_rust_enabled.keys()):
         fail("variant_rust_enabled must contain exactly the variant config names")
-    if variant_core_configs and sorted(variant_configs.keys()) != sorted(variant_core_configs.keys()):
-        fail("variant_core_configs must contain exactly the variant config names when set")
-    if variant_header_configs and sorted(variant_configs.keys()) != sorted(variant_header_configs.keys()):
-        fail("variant_header_configs must contain exactly the variant config names when set")
-    if variant_header_family_ids and sorted(variant_configs.keys()) != sorted(variant_header_family_ids.keys()):
-        fail("variant_header_family_ids must contain exactly the variant config names when set")
-    if variant_header_family_dependencies and sorted(variant_configs.keys()) != sorted(variant_header_family_dependencies.keys()):
-        fail("variant_header_family_dependencies must contain exactly the variant config names when set")
-    if bool(base_header_family_ids) != bool(base_header_family_dependencies):
-        fail("base_header_family_ids and base_header_family_dependencies must be set together")
-    if bool(variant_header_family_ids) != bool(variant_header_family_dependencies):
-        fail("variant_header_family_ids and variant_header_family_dependencies must be set together")
-    if variant_header_family_ids and not base_header_family_ids:
-        fail("base_header_family_ids is required with variant_header_family_ids")
-    if variant_header_family_dependencies and not base_header_family_dependencies:
-        fail("base_header_family_dependencies is required with variant_header_family_dependencies")
+    for values, what in [
+        (variant_core_configs, "variant_core_configs"),
+        (variant_graph_images, "variant_graph_images"),
+        (variant_header_configs, "variant_header_configs"),
+        (variant_header_family_ids, "variant_header_family_ids"),
+        (variant_header_family_dependencies, "variant_header_family_dependencies"),
+    ]:
+        if sorted(variant_configs.keys()) != sorted(values.keys()):
+            fail("%s must contain exactly the variant config names" % what)
     _validate_header_family_dependencies(
         base_header_family_ids,
         base_header_family_dependencies,
@@ -240,7 +231,7 @@ def linux_image_targets(
     for variant in sorted(variant_header_family_ids.keys()):
         _validate_header_family_dependencies(
             variant_header_family_ids[variant],
-            variant_header_family_dependencies.get(variant, {}),
+            variant_header_family_dependencies[variant],
             "variant %s generated headers" % variant,
         )
     descriptor = _architecture(arch)
@@ -276,7 +267,7 @@ def linux_image_targets(
         "generated_header_family_ids": base_header_family_ids,
         "visibility": internal_visibility,
     }
-    if descriptor.srcarch == "x86" and base_header_family_ids:
+    if descriptor.srcarch == "x86":
         host_tools_kwargs["generated_header_family_dependencies"] = base_header_family_dependencies
     host_tools = descriptor.host_tools(**host_tools_kwargs)
     core_outputs = _define_core_outputs(
@@ -320,14 +311,12 @@ def linux_image_targets(
     host_tools_by_config = {
         arch: host_tools,
     }
-    reuse_generated_header_families = descriptor.srcarch == "x86" and bool(base_header_family_ids)
+    reuse_generated_header_families = descriptor.srcarch == "x86"
     reusable_generated_headers = [host_tools.generated_headers] if reuse_generated_header_families else []
     core_outputs_by_config = {
         arch: core_outputs,
     }
     for variant in sorted(variant_configs.keys()):
-        if variant not in variant_graph_images:
-            fail("variant %r is missing its generated graph image" % variant)
         prefix = "_variant_" + variant
         config_target = prefix + "_config"
         _define_config(
@@ -339,7 +328,7 @@ def linux_image_targets(
             version = version,
             visibility = internal_visibility,
         )
-        header_config = variant_header_configs.get(variant, variant)
+        header_config = variant_header_configs[variant]
         if header_config == variant:
             configured_host_tools_kwargs = {
                 "name": prefix,
@@ -348,7 +337,7 @@ def linux_image_targets(
                 "source_repo": source_repo,
                 "source_root": _source_label(source_repo, "Kconfig"),
                 "source_tree": _source_tree_inputs(source_repo),
-                "generated_header_family_ids": variant_header_family_ids.get(variant, {}),
+                "generated_header_family_ids": variant_header_family_ids[variant],
                 "visibility": internal_visibility,
             }
             if reuse_generated_header_families:
@@ -365,7 +354,7 @@ def linux_image_targets(
                 (variant, header_config),
             )
         host_tools_by_config[variant] = variant_host_tools
-        core_config = variant_core_configs.get(variant, variant)
+        core_config = variant_core_configs[variant]
         if core_config == variant:
             variant_core_outputs = _define_core_outputs(
                 prefix = prefix,

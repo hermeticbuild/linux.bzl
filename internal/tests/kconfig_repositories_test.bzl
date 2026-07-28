@@ -15,50 +15,6 @@ def _kconfig_tool_filename_test_impl(ctx):
 
 kconfig_tool_filename_test = unittest.make(_kconfig_tool_filename_test_impl)
 
-def _graph_config_args_test_impl(ctx):
-    env = unittest.begin(ctx)
-    asserts.equals(
-        env,
-        [
-            "-config",
-            "aarch64=configs/base.config",
-            "-config_mode",
-            "allnoconfig",
-        ],
-        repositories_test_helpers.graph_config_args(
-            "aarch64",
-            "configs/base.config",
-            "allnoconfig",
-        ),
-    )
-    return unittest.end(env)
-
-graph_config_args_test = unittest.make(_graph_config_args_test_impl)
-
-def _graph_host_tool_args_test_impl(ctx):
-    env = unittest.begin(ctx)
-    asserts.equals(
-        env,
-        [
-            "-source_asn1_compiler",
-            "//:_base_asn1_compiler_tool",
-        ],
-        repositories_test_helpers.graph_host_tool_args("x86_64"),
-    )
-    asserts.equals(
-        env,
-        [
-            "-source_asn1_compiler",
-            "//:_base_asn1_compiler_tool",
-            "-source_relacheck",
-            "//:_base_relacheck_tool",
-        ],
-        repositories_test_helpers.graph_host_tool_args("aarch64"),
-    )
-    return unittest.end(env)
-
-graph_host_tool_args_test = unittest.make(_graph_host_tool_args_test_impl)
-
 def _generator_variable_args_test_impl(ctx):
     env = unittest.begin(ctx)
     asserts.equals(
@@ -110,10 +66,6 @@ graph_configs_args_test = unittest.make(_graph_configs_args_test_impl)
 
 def _generated_object_inputs_test_impl(ctx):
     env = unittest.begin(ctx)
-    legacy = """
-    name = "legacy",
-    src = "//source:legacy.c",
-"""
     indexed = """
     name = "indexed",
     source_input_file = 7,
@@ -128,29 +80,13 @@ def _generated_object_inputs_test_impl(ctx):
     asserts.true(
         env,
         repositories_test_helpers.generated_object_block_has_buildable_inputs(
-            legacy,
-            "v0.0.12",
-        ),
-    )
-    asserts.false(
-        env,
-        repositories_test_helpers.generated_object_block_has_buildable_inputs(
             indexed,
-            "v0.0.12",
-        ),
-    )
-    asserts.true(
-        env,
-        repositories_test_helpers.generated_object_block_has_buildable_inputs(
-            indexed,
-            repositories_test_helpers.content_schema,
         ),
     )
     asserts.false(
         env,
         repositories_test_helpers.generated_object_block_has_buildable_inputs(
             incomplete_indexed,
-            repositories_test_helpers.content_schema,
         ),
     )
     return unittest.end(env)

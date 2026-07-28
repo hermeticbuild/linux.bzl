@@ -101,7 +101,7 @@ jobs:
             targets: "//:example_initramfs"
           - batch: x86-64-variants
             title: x86_64 base + overlays
-            targets: "//:x86_64_kernel //:x86_64_debug_kernel //:x86_64_btf_vmlinux //:x86_64_lz4_kernel"
+            targets: "//:x86_64_kernel //:x86_64_debug_kernel //:x86_64_btf_vmlinux //:x86_64_lz4_kernel //:x86_64_shared_graph_metadata"
           - batch: aarch64-base
             title: aarch64 base
             targets: "//:aarch64_kernel"
@@ -138,6 +138,7 @@ jobs:
             --notrack_incremental_state \
             --nokeep_state_after_build \
             --discard_analysis_cache \
+            --experimental_record_metrics_for_all_mnemonics \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -154,6 +155,18 @@ jobs:
             "${BAZEL_PROFILE}" \
             "${BAZEL_BEP}" \
             "${BAZEL_LOG}"
+
+      - name: Verify shared kernel graph
+        if: ${{ matrix.batch == 'x86-64-variants' }}
+        working-directory: examples
+        env:
+          BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.batch }}.bep.json
+        run: >-
+          ../.github/workflows/assert_shared_kernel_graph.sh
+          "${BAZEL_BEP}"
+          bazel-bin/x86_64_shared_graph_metadata.json
+          3519
+          4711
 
       - name: Upload Bazel profile
         if: ${{ !cancelled() }}
