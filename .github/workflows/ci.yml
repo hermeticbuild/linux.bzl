@@ -99,12 +99,36 @@ jobs:
           - batch: initramfs
             title: initramfs
             targets: "//:example_initramfs"
+            report_name: ""
+            report_target: ""
+            report_title: ""
+            report_mnemonics: ""
           - batch: x86-64-variants
             title: x86_64 base + overlays
             targets: "//:x86_64_kernel //:x86_64_debug_kernel //:x86_64_btf_vmlinux //:x86_64_lz4_kernel"
+            report_name: x86-64-base
+            report_target: "//:x86_64_kernel"
+            report_title: x86_64 base
+            report_mnemonics: >-
+              LinuxObjectCompile
+              LinuxPurgatoryCompile
+              LinuxRealmodeCompile
+              LinuxVDSOCompile
+              LinuxVmlinuxCompile
+              LinuxX86CompressedCompile
+              LinuxX86EFIStubCompile
+              LinuxX86SetupCompile
           - batch: aarch64-base
             title: aarch64 base
             targets: "//:aarch64_kernel"
+            report_name: aarch64-base
+            report_target: "//:aarch64_kernel"
+            report_title: aarch64 base
+            report_mnemonics: >-
+              LinuxObjectCompile
+              LinuxARM64VDSOCompile
+              LinuxARM64VDSO32Compile
+              LinuxVmlinuxCompile
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -138,6 +162,100 @@ jobs:
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
+
+      - name: Generate Linux object input reports
+        if: ${{ matrix.report_target != '' }}
+        working-directory: examples
+        env:
+          BAZEL_REPORT_MNEMONICS: ${{ matrix.report_mnemonics }}
+          BAZEL_REPORT_TARGET: ${{ matrix.report_target }}
+          REPORT_NAME: ${{ matrix.report_name }}
+          REPORT_TITLE: ${{ matrix.report_title }}
+        run: |
+          set -euo pipefail
+          report_dir="${RUNNER_TEMP}/linux-object-input-report-${REPORT_NAME}"
+          aquery="${report_dir}/aquery.json"
+          reporter="${RUNNER_TEMP}/linuxobjectinputreport"
+          mkdir -p "${report_dir}"
+
+          execroot="$(
+            bazel --host_jvm_args=-Xmx3g \
+              --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+              info \
+              --config=path-mapping \
+              execution_root
+          )"
+
+          bazel --host_jvm_args=-Xmx3g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            build \
+            --config=path-mapping \
+            --remote_download_toplevel \
+            @linux.bzl//tools:linuxobjectinputreport
+          reporter_output="$(
+            bazel --host_jvm_args=-Xmx3g \
+              --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+              cquery \
+              --config=path-mapping \
+              --output=files \
+              @linux.bzl//tools:linuxobjectinputreport
+          )"
+          install -m 0755 "${reporter_output}" "${reporter}"
+
+          bazel --host_jvm_args=-Xmx3g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            build \
+            --config=path-mapping \
+            --remote_download_all \
+            "${BAZEL_REPORT_TARGET}"
+
+          bazel --host_jvm_args=-Xmx3g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            aquery \
+            --config=path-mapping \
+            --output=jsonproto \
+            --include_artifacts \
+            --noinclude_commandline \
+            "deps(${BAZEL_REPORT_TARGET})" >"${aquery}"
+
+          "${reporter}" \
+            -input "${aquery}" \
+            -execroot "${execroot}" |
+            tee "${report_dir}/linux-object-input-report.txt"
+
+          read -r -a mnemonics <<<"${BAZEL_REPORT_MNEMONICS}"
+          mnemonic_args=()
+          for mnemonic in "${mnemonics[@]}"; do
+            mnemonic_args+=(-mnemonic "${mnemonic}")
+          done
+          "${reporter}" \
+            -input "${aquery}" \
+            -execroot "${execroot}" \
+            "${mnemonic_args[@]}" |
+            tee "${report_dir}/linux-object-input-report-all-compiles.txt"
+
+          gzip "${aquery}"
+
+          {
+            printf '### Linux object input reports (%s)\n\n' "${REPORT_TITLE}"
+            printf "Full reports and their compressed producer-complete aquery are attached as \`%s\`.\n\n" \
+              "linux-object-input-report-${REPORT_NAME}"
+            printf '<details><summary>LinuxObjectCompile report</summary>\n\n```text\n'
+            cat "${report_dir}/linux-object-input-report.txt"
+            printf '```\n\n</details>\n\n'
+            printf '<details><summary>All selected compile actions</summary>\n\n```text\n'
+            cat "${report_dir}/linux-object-input-report-all-compiles.txt"
+            printf '```\n\n</details>\n'
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload Linux object input reports
+        if: ${{ !cancelled() && matrix.report_target != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-object-input-report-${{ matrix.report_name }}
+          path: ${{ runner.temp }}/linux-object-input-report-${{ matrix.report_name }}
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Report cache efficiency
         if: ${{ !cancelled() }}
