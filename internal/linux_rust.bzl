@@ -17,7 +17,6 @@ load(":providers.bzl", "LinuxRustSdkInfo")
 visibility("//...")
 
 _RUST_TOOLCHAIN_TYPE = Label("@rules_rust//rust:toolchain_type")
-_RUST_SOURCE_TOOLCHAIN_TYPE = Label("@rules_rust//rust/rust_analyzer:toolchain_type")
 _BINDGEN_TOOLCHAIN_TYPE = Label("@rules_rs//rs:bindgen_toolchain_type")
 _RUST_PROFILE_SCHEMA = "linux-rust-profile-v2"
 _RUSTC_SOURCE_PREFIX_CLOSURE = {
@@ -319,7 +318,7 @@ def _rust_env(rust_toolchain):
     return env
 
 def _rustc_sources(ctx):
-    source_toolchain = ctx.toolchains[_RUST_SOURCE_TOOLCHAIN_TYPE]
+    source_toolchain = ctx.attr._rust_source_toolchain[platform_common.ToolchainInfo]
     if not hasattr(source_toolchain, "rustc_srcs"):
         fail(
             (
@@ -327,8 +326,8 @@ def _rustc_sources(ctx):
                 "register a rules_rs toolchain with the matching rust-src component"
             ) % ctx.label,
         )
-    rustc_srcs = source_toolchain.rustc_srcs[DefaultInfo].files
-    if not rustc_srcs.to_list():
+    rustc_srcs = source_toolchain.rustc_srcs[DefaultInfo].files.to_list()
+    if not rustc_srcs:
         fail("%s selected a Rust source toolchain without rust-src files" % ctx.label)
     return rustc_srcs
 
@@ -1006,7 +1005,7 @@ def _linux_rust_kernel_sdk_impl(ctx):
     _validate_rust_config(ctx, config, profile)
     rust_toolchain = ctx.toolchains[_RUST_TOOLCHAIN_TYPE]
     host_rust_toolchain = ctx.attr._host_rust[platform_common.ToolchainInfo]
-    rustc_srcs = _rustc_sources(ctx).to_list()
+    rustc_srcs = _rustc_sources(ctx)
     rustc_probe = config.rustc_probe
     if rustc_probe == None:
         fail("%s requires a Rust-enabled config with a compiler probe" % ctx.label)
@@ -1496,6 +1495,10 @@ linux_rust_kernel_sdk = rule(
             cfg = "exec",
             default = Label("@rules_rust//rust/toolchain:current_rust_toolchain"),
         ),
+        "_rust_source_toolchain": attr.label(
+            cfg = "exec",
+            default = Label("@rules_rust//rust/toolchain:current_rust_analyzer_toolchain"),
+        ),
         "_lineargsrun": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/lineargsrun"),
@@ -1548,7 +1551,6 @@ linux_rust_kernel_sdk = rule(
     fragments = ["cpp"],
     toolchains = [
         _BINDGEN_TOOLCHAIN_TYPE,
-        _RUST_SOURCE_TOOLCHAIN_TYPE,
         _RUST_TOOLCHAIN_TYPE,
     ] + use_cc_toolchain(),
     doc = "Builds the private configuration-specific Rust-for-Linux SDK.",
