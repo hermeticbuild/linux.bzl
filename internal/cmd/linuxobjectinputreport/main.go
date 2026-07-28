@@ -5,13 +5,17 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 type aqueryOutput struct {
@@ -23,8 +27,9 @@ type aqueryOutput struct {
 }
 
 type artifact struct {
-	ID             int `json:"id"`
-	PathFragmentID int `json:"pathFragmentId"`
+	ID             int  `json:"id"`
+	PathFragmentID int  `json:"pathFragmentId"`
+	IsTreeArtifact bool `json:"isTreeArtifact"`
 }
 
 type action struct {
@@ -58,16 +63,20 @@ type reportOptions struct {
 	mnemonic  string
 	top       int
 	sharedPct int
+	execroot  string
 }
 
 type inputUse struct {
-	path  string
-	count int
+	path        string
+	count       int
+	measurement *byteMeasurement
 }
 
 type actionSummary struct {
-	label string
-	count int
+	label         string
+	count         int
+	bytes         int64
+	bytesComplete bool
 }
 
 type producerID int
@@ -92,6 +101,7 @@ func main() {
 	flag.StringVar(&opts.mnemonic, "mnemonic", "LinuxObjectCompile", "Action mnemonic to report.")
 	flag.IntVar(&opts.top, "top", 20, "Number of top entries to print per section.")
 	flag.IntVar(&opts.sharedPct, "shared_pct", 80, "Minimum action percentage for high-fanout input sections.")
+	flag.StringVar(&opts.execroot, "execroot", "", "Optional Bazel execution root used to measure materialized input bytes.")
 	flag.Parse()
 
 	if err := run(os.Stdout, opts); err != nil {
@@ -143,6 +153,7 @@ func readInput(path string) ([]byte, error) {
 type model struct {
 	aq               *aqueryOutput
 	artifactPath     map[int]string
+	artifacts        map[int]artifact
 	depSets          map[int]depSet
 	targetLabels     map[int]string
 	artifactProducer map[int]producerID
@@ -153,6 +164,7 @@ func newModel(aq *aqueryOutput) (*model, error) {
 	m := &model{
 		aq:               aq,
 		artifactPath:     map[int]string{},
+		artifacts:        map[int]artifact{},
 		depSets:          map[int]depSet{},
 		targetLabels:     map[int]string{},
 		artifactProducer: map[int]producerID{},
@@ -163,6 +175,7 @@ func newModel(aq *aqueryOutput) (*model, error) {
 	}
 	for _, artifact := range aq.Artifacts {
 		m.artifactPath[artifact.ID] = resolvePathFragment(fragments, artifact.PathFragmentID)
+		m.artifacts[artifact.ID] = artifact
 	}
 	for _, depSet := range aq.DepSetOfFiles {
 		m.depSets[depSet.ID] = depSet
@@ -272,14 +285,28 @@ func writeReport(w io.Writer, m *model, opts reportOptions) error {
 		return fmt.Errorf("no actions with mnemonic %q", opts.mnemonic)
 	}
 
+	var measurer *byteMeasurer
+	if opts.execroot != "" {
+		var err error
+		measurer, err = newByteMeasurer(opts.execroot, m)
+		if err != nil {
+			return err
+		}
+	}
+
 	actionSummaries := make([]actionSummary, 0, len(actions))
 	inputCounts := make([]int, 0, len(actions))
+	completeActionBytes := make([]int64, 0, len(actions))
 	inputUses := map[int]*inputUse{}
 	producerConsumerCounts := make([]int, len(m.producers))
 	producerSeenGeneration := make([]int, len(m.producers))
+	actionByteOverflows := 0
 
 	for actionIndex, action := range actions {
 		inputs := m.actionInputs(action)
+		actionFiles := uniqueFiles{}
+		bytesComplete := measurer != nil
+		actionOverflow := false
 		for artifactID := range inputs {
 			path := m.artifactPath[artifactID]
 			use := inputUses[artifactID]
@@ -288,6 +315,20 @@ func writeReport(w io.Writer, m *model, opts reportOptions) error {
 				inputUses[artifactID] = use
 			}
 			use.count++
+			if measurer != nil {
+				measurement := measurer.measureArtifact(artifactID)
+				use.measurement = measurement
+				if !measurement.complete {
+					bytesComplete = false
+				}
+				if err := actionFiles.merge(&measurement.files); err != nil {
+					bytesComplete = false
+					if !actionOverflow {
+						actionByteOverflows++
+						actionOverflow = true
+					}
+				}
+			}
 			if id, ok := m.artifactProducer[artifactID]; ok {
 				if producerSeenGeneration[id] != actionIndex+1 {
 					producerSeenGeneration[id] = actionIndex + 1
@@ -297,27 +338,62 @@ func writeReport(w io.Writer, m *model, opts reportOptions) error {
 		}
 		inputCounts = append(inputCounts, len(inputs))
 		actionSummaries = append(actionSummaries, actionSummary{
-			label: m.targetLabels[action.TargetID],
-			count: len(inputs),
+			label:         m.targetLabels[action.TargetID],
+			count:         len(inputs),
+			bytes:         actionFiles.bytes,
+			bytesComplete: bytesComplete,
 		})
+		if bytesComplete {
+			completeActionBytes = append(completeActionBytes, actionFiles.bytes)
+		}
 	}
 
 	fmt.Fprintf(w, "Linux object input report\n")
 	fmt.Fprintf(w, "mnemonic: %s\n", opts.mnemonic)
 	fmt.Fprintf(w, "actions: %d\n", len(actions))
 	fmt.Fprintf(w, "input count min/p50/p95/max: %s\n", intStats(inputCounts))
+	if measurer == nil {
+		fmt.Fprintf(w, "materialized input bytes: disabled (pass -execroot)\n")
+	} else {
+		unavailableInputs, unavailableUses, issues := byteCoverage(inputUses)
+		fmt.Fprintf(w, "byte accounting: materialized file bytes deduplicated by local file identity under %s\n", measurer.execroot)
+		fmt.Fprintf(
+			w,
+			"byte coverage: %d / %d actions complete; %d distinct inputs unavailable (%d action uses)\n",
+			len(completeActionBytes),
+			len(actions),
+			unavailableInputs,
+			unavailableUses,
+		)
+		if actionByteOverflows != 0 {
+			issues[byteIssueOverflow] += actionByteOverflows
+		}
+		if len(issues) != 0 {
+			fmt.Fprintf(w, "byte issues: %s\n", formatByteIssues(issues))
+		}
+		if len(completeActionBytes) == 0 {
+			fmt.Fprintf(w, "materialized input bytes: unavailable (no complete actions)\n")
+		} else {
+			fmt.Fprintf(
+				w,
+				"materialized input bytes min/p50/p95/max (%d complete actions): %s\n",
+				len(completeActionBytes),
+				byteStats(completeActionBytes),
+			)
+		}
+	}
 	fmt.Fprintf(w, "\n")
 
 	threshold := ceilDiv(len(actions)*opts.sharedPct, 100)
 	writeTopInputs(w, "high-fanout inputs", topInputs(inputUses, func(use *inputUse) bool {
 		return use.count >= threshold
-	}), opts.top, len(actions))
+	}), opts.top, len(actions), measurer != nil)
 	writeTopInputs(w, "high-fanout non-tool inputs", topInputs(inputUses, func(use *inputUse) bool {
 		return use.count >= threshold && !isToolchainLikeInput(use.path)
-	}), opts.top, len(actions))
+	}), opts.top, len(actions), measurer != nil)
 	writeTopInputs(w, "high-fanout non-header source inputs", topInputs(inputUses, func(use *inputUse) bool {
 		return use.count >= threshold && isSourceLikeNonHeader(use.path)
-	}), opts.top, len(actions))
+	}), opts.top, len(actions), measurer != nil)
 	resolvedProducerInputs := 0
 	for artifactID := range inputUses {
 		if _, ok := m.artifactProducer[artifactID]; ok {
@@ -333,6 +409,14 @@ func writeReport(w io.Writer, m *model, opts reportOptions) error {
 		len(inputUses),
 	)
 	writeActionSummaries(w, "largest actions by input count", topActionSummaries(actionSummaries), opts.top)
+	if measurer != nil {
+		writeByteActionSummaries(
+			w,
+			"largest complete actions by materialized input bytes",
+			topActionSummariesByBytes(actionSummaries),
+			opts.top,
+		)
+	}
 	return nil
 }
 
@@ -396,6 +480,25 @@ func topActionSummaries(actions []actionSummary) []actionSummary {
 	return out
 }
 
+func topActionSummariesByBytes(actions []actionSummary) []actionSummary {
+	out := make([]actionSummary, 0, len(actions))
+	for _, action := range actions {
+		if action.bytesComplete {
+			out = append(out, action)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].bytes != out[j].bytes {
+			return out[i].bytes > out[j].bytes
+		}
+		if out[i].count != out[j].count {
+			return out[i].count > out[j].count
+		}
+		return out[i].label < out[j].label
+	})
+	return out
+}
+
 func topProducerUses(producers []producer, consumerCounts []int) []producerUse {
 	out := make([]producerUse, 0, len(producers))
 	for i, producer := range producers {
@@ -428,7 +531,7 @@ func topProducerUses(producers []producer, consumerCounts []int) []producerUse {
 	return out
 }
 
-func writeTopInputs(w io.Writer, title string, inputs []inputUse, limit int, actionCount int) {
+func writeTopInputs(w io.Writer, title string, inputs []inputUse, limit int, actionCount int, showBytes bool) {
 	fmt.Fprintf(w, "%s:\n", title)
 	if len(inputs) == 0 {
 		fmt.Fprintf(w, "  none\n\n")
@@ -439,7 +542,18 @@ func writeTopInputs(w io.Writer, title string, inputs []inputUse, limit int, act
 			break
 		}
 		pct := float64(input.count) * 100 / float64(actionCount)
-		fmt.Fprintf(w, "  %5d %6.1f%%  %s\n", input.count, pct, input.path)
+		if showBytes {
+			fmt.Fprintf(
+				w,
+				"  %5d %6.1f%% %10s  %s\n",
+				input.count,
+				pct,
+				measurementByteDisplay(input.measurement),
+				input.path,
+			)
+		} else {
+			fmt.Fprintf(w, "  %5d %6.1f%%  %s\n", input.count, pct, input.path)
+		}
 	}
 	fmt.Fprintf(w, "\n")
 }
@@ -501,6 +615,60 @@ func writeActionSummaries(w io.Writer, title string, actions []actionSummary, li
 	fmt.Fprintf(w, "\n")
 }
 
+func writeByteActionSummaries(w io.Writer, title string, actions []actionSummary, limit int) {
+	fmt.Fprintf(w, "%s:\n", title)
+	if len(actions) == 0 {
+		fmt.Fprintf(w, "  none\n\n")
+		return
+	}
+	for i, action := range actions {
+		if i >= limit {
+			break
+		}
+		fmt.Fprintf(w, "  %10s %5d inputs  %s\n", formatBytes(action.bytes), action.count, action.label)
+	}
+	fmt.Fprintf(w, "\n")
+}
+
+func byteCoverage(inputUses map[int]*inputUse) (int, int, map[byteIssue]int) {
+	unavailableInputs := 0
+	unavailableUses := 0
+	issues := map[byteIssue]int{}
+	for _, use := range inputUses {
+		if use.measurement == nil || use.measurement.complete {
+			continue
+		}
+		unavailableInputs++
+		unavailableUses += use.count
+		for issue, count := range use.measurement.issues {
+			issues[issue] += count
+		}
+	}
+	return unavailableInputs, unavailableUses, issues
+}
+
+func formatByteIssues(issues map[byteIssue]int) string {
+	names := make([]string, 0, len(issues))
+	for issue, count := range issues {
+		names = append(names, fmt.Sprintf("%s=%d", issue, count))
+	}
+	sort.Strings(names)
+	return strings.Join(names, " ")
+}
+
+func measurementByteDisplay(measurement *byteMeasurement) string {
+	if measurement == nil {
+		return "?"
+	}
+	if measurement.complete {
+		return formatBytes(measurement.files.bytes)
+	}
+	if measurement.files.bytes == 0 {
+		return "?"
+	}
+	return ">=" + formatBytes(measurement.files.bytes)
+}
+
 func isSourceLikeNonHeader(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".c", ".cc", ".cpp", ".s", ".lds", ".dts", ".dtsi", ".asn1":
@@ -524,7 +692,33 @@ func intStats(values []int) string {
 	return fmt.Sprintf("%d / %d / %d / %d", values[0], percentileInt(values, 50), percentileInt(values, 95), values[len(values)-1])
 }
 
+func byteStats(values []int64) string {
+	sorted := append([]int64(nil), values...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return fmt.Sprintf(
+		"%s / %s / %s / %s",
+		formatBytes(sorted[0]),
+		formatBytes(percentileInt64(sorted, 50)),
+		formatBytes(percentileInt64(sorted, 95)),
+		formatBytes(sorted[len(sorted)-1]),
+	)
+}
+
 func percentileInt(values []int, percentile int) int {
+	if len(values) == 0 {
+		return 0
+	}
+	index := ceilDiv(len(values)*percentile, 100) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(values) {
+		index = len(values) - 1
+	}
+	return values[index]
+}
+
+func percentileInt64(values []int64, percentile int) int64 {
 	if len(values) == 0 {
 		return 0
 	}
@@ -540,4 +734,260 @@ func percentileInt(values []int, percentile int) int {
 
 func ceilDiv(n, d int) int {
 	return (n + d - 1) / d
+}
+
+func formatBytes(value int64) string {
+	const unit = int64(1024)
+	if value < unit {
+		return fmt.Sprintf("%d B", value)
+	}
+	units := []string{"KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
+	divisor := unit
+	unitIndex := 0
+	for value/divisor >= unit && unitIndex < len(units)-1 {
+		divisor *= unit
+		unitIndex++
+	}
+	return fmt.Sprintf("%.2f %s", float64(value)/float64(divisor), units[unitIndex])
+}
+
+type byteIssue string
+
+const (
+	byteIssueBrokenSymlink  byteIssue = "broken-symlink"
+	byteIssueIO             byteIssue = "io-error"
+	byteIssueNotFound       byteIssue = "not-found"
+	byteIssueOverflow       byteIssue = "overflow"
+	byteIssuePermission     byteIssue = "permission"
+	byteIssueSpecialFile    byteIssue = "special-file"
+	byteIssueSymlinkCycle   byteIssue = "symlink-cycle"
+	byteIssueTypeMismatch   byteIssue = "type-mismatch"
+	byteIssueUnmaterialized byteIssue = "unmaterialized"
+)
+
+type sameFileSet struct {
+	bySize map[int64][]os.FileInfo
+}
+
+func (s *sameFileSet) contains(info os.FileInfo) bool {
+	for _, existing := range s.bySize[info.Size()] {
+		if os.SameFile(existing, info) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *sameFileSet) add(info os.FileInfo) bool {
+	if s.contains(info) {
+		return false
+	}
+	if s.bySize == nil {
+		s.bySize = map[int64][]os.FileInfo{}
+	}
+	size := info.Size()
+	s.bySize[size] = append(s.bySize[size], info)
+	return true
+}
+
+type uniqueFiles struct {
+	identities sameFileSet
+	files      []os.FileInfo
+	bytes      int64
+}
+
+func (f *uniqueFiles) add(info os.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", info.Name())
+	}
+	if !f.identities.add(info) {
+		return nil
+	}
+	size := info.Size()
+	if size < 0 || size > math.MaxInt64-f.bytes {
+		return fmt.Errorf("materialized byte count overflows int64")
+	}
+	f.files = append(f.files, info)
+	f.bytes += size
+	return nil
+}
+
+func (f *uniqueFiles) merge(other *uniqueFiles) error {
+	for _, info := range other.files {
+		if err := f.add(info); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type byteMeasurement struct {
+	files    uniqueFiles
+	complete bool
+	issues   map[byteIssue]int
+}
+
+func newByteMeasurement() *byteMeasurement {
+	return &byteMeasurement{
+		complete: true,
+		issues:   map[byteIssue]int{},
+	}
+}
+
+func (m *byteMeasurement) addIssue(issue byteIssue) {
+	m.complete = false
+	m.issues[issue]++
+}
+
+type byteMeasurer struct {
+	execroot string
+	model    *model
+	cache    map[int]*byteMeasurement
+}
+
+func newByteMeasurer(execroot string, model *model) (*byteMeasurer, error) {
+	absolute, err := filepath.Abs(execroot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve -execroot %q: %w", execroot, err)
+	}
+	info, err := os.Stat(absolute)
+	if err != nil {
+		return nil, fmt.Errorf("stat -execroot %q: %w", absolute, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("-execroot %q is not a directory", absolute)
+	}
+	return &byteMeasurer{
+		execroot: absolute,
+		model:    model,
+		cache:    map[int]*byteMeasurement{},
+	}, nil
+}
+
+func (m *byteMeasurer) measureArtifact(artifactID int) *byteMeasurement {
+	if measurement, ok := m.cache[artifactID]; ok {
+		return measurement
+	}
+
+	measurement := newByteMeasurement()
+	m.cache[artifactID] = measurement
+	path := m.model.artifactPath[artifactID]
+	if path == "" {
+		measurement.addIssue(byteIssueNotFound)
+		return measurement
+	}
+	relative := filepath.Clean(filepath.FromSlash(path))
+	if filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		measurement.addIssue(byteIssueIO)
+		return measurement
+	}
+
+	missingIssue := byteIssueNotFound
+	if _, ok := m.model.artifactProducer[artifactID]; ok {
+		missingIssue = byteIssueUnmaterialized
+	}
+	state := scanState{}
+	artifact := m.model.artifacts[artifactID]
+	m.scanPath(
+		filepath.Join(m.execroot, relative),
+		artifact.IsTreeArtifact,
+		missingIssue,
+		measurement,
+		&state,
+	)
+	return measurement
+}
+
+type scanState struct {
+	activeDirectories  []os.FileInfo
+	visitedDirectories sameFileSet
+}
+
+func (m *byteMeasurer) scanPath(
+	path string,
+	expectDirectory bool,
+	missingIssue byteIssue,
+	measurement *byteMeasurement,
+	state *scanState,
+) {
+	info, err := os.Stat(path)
+	if err != nil {
+		measurement.addIssue(classifyPathError(path, err, missingIssue))
+		return
+	}
+	if info.Mode().IsRegular() {
+		if expectDirectory {
+			measurement.addIssue(byteIssueTypeMismatch)
+			return
+		}
+		if err := measurement.files.add(info); err != nil {
+			measurement.addIssue(byteIssueOverflow)
+		}
+		return
+	}
+	if info.IsDir() {
+		m.scanDirectory(path, info, measurement, state)
+		return
+	}
+	if expectDirectory {
+		measurement.addIssue(byteIssueTypeMismatch)
+	} else {
+		measurement.addIssue(byteIssueSpecialFile)
+	}
+}
+
+func (m *byteMeasurer) scanDirectory(
+	path string,
+	info os.FileInfo,
+	measurement *byteMeasurement,
+	state *scanState,
+) {
+	for _, active := range state.activeDirectories {
+		if os.SameFile(active, info) {
+			measurement.addIssue(byteIssueSymlinkCycle)
+			return
+		}
+	}
+	if !state.visitedDirectories.add(info) {
+		return
+	}
+
+	state.activeDirectories = append(state.activeDirectories, info)
+	defer func() {
+		state.activeDirectories = state.activeDirectories[:len(state.activeDirectories)-1]
+	}()
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		measurement.addIssue(classifyPathError(path, err, byteIssueNotFound))
+		return
+	}
+	for _, entry := range entries {
+		m.scanPath(
+			filepath.Join(path, entry.Name()),
+			false,
+			byteIssueNotFound,
+			measurement,
+			state,
+		)
+	}
+}
+
+func classifyPathError(path string, err error, missingIssue byteIssue) byteIssue {
+	if errors.Is(err, syscall.ELOOP) {
+		return byteIssueSymlinkCycle
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		if info, lstatErr := os.Lstat(path); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+			return byteIssueBrokenSymlink
+		}
+		return missingIssue
+	}
+	if errors.Is(err, fs.ErrPermission) {
+		return byteIssuePermission
+	}
+	if info, lstatErr := os.Lstat(path); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		return byteIssueBrokenSymlink
+	}
+	return byteIssueIO
 }
