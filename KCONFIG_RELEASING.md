@@ -10,9 +10,9 @@ Generator releases are tagged as `kconfig-vX.Y.Z`.
 goldens must remain byte-compatible until the rules repository explicitly
 requests another schema.
 
-Schema `v0.0.12` is opt-in. It emits classified source-tree inputs, exact
-source-like include closures, module object roots, and fail-closed source
-actions. Rust-owned objects are excluded from the ordinary object graph.
+Schema `v0.0.12` is opt-in. It emits classified source-tree inputs, recursively
+resolved literal source include closures, module object roots, and fail-closed
+source actions. Rust-owned objects are excluded from the ordinary object graph.
 `-rust_profile_out` additionally emits a source-derived Rust profile and is
 valid only with `-compact_schema=v0.0.12`.
 
@@ -29,6 +29,21 @@ verify that dynamic rustc capabilities do not change the repository-generated
 structural snapshot. Compact object metadata preserves module roots and
 `OBJECT_FILES_NON_STANDARD` overrides, and can carry the source-built x86
 objtool label required for Kbuild-compatible post-processing.
+
+Generator `v0.0.15` keeps compact schema `v0.0.12` and extends each generated
+object with its recursively resolved private header closure. Global and
+selected-architecture headers remain classified source-tree inputs instead of
+being repeated on every object. A computed preprocessor include, unresolved
+forced source include, or unmodeled source include-search flag marks the
+closure incomplete so rules consumers retain their exhaustive full-tree
+fallback. Assembler `.incbin` dependencies also use that fallback. Source-root
+include directories, forced includes, comments, and preprocessor line splices
+are included in the scan. Rules consumers pass exact
+generated include spellings, with source backings for generated asm-generic
+wrappers. Other unresolved literals cannot name source files once the source
+search model is complete; generated and toolchain providers remain independent
+action inputs. Consumers assert generated-manifest completeness explicitly;
+other compact metadata producers retain the exhaustive fallback.
 
 ## Prepare
 
@@ -58,7 +73,7 @@ version stream.
 After the release-preparation change is merged, tag that merge commit:
 
 ```sh
-VERSION=v0.0.14 ./release_kconfig.sh
+VERSION=v0.0.15 ./release_kconfig.sh
 ```
 
 The tag workflow publishes archives for Linux, macOS, and Windows on amd64 and

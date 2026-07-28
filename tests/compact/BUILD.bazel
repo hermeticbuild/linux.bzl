@@ -30,6 +30,7 @@ linux_compact_buildfiles(
     out_metadata = "expected.metadata.golden",
     root = "Kconfig",
     source_config = "//tests/compact:source_config",
+    source_generated_includes_complete = True,
     source_label_package = "//tests/compact",
     source_root_label = "//tests/compact:Kconfig",
 )
