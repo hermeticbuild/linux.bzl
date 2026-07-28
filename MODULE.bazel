@@ -69,7 +69,18 @@ register_toolchains(
 )
 
 register_toolchains(
-    "@llvm_toolchains//:all",
+    "@llvm_toolchains//:linux_aarch64_to_linux_aarch64",
+    "@llvm_toolchains//:linux_aarch64_to_linux_x86_64",
+    "@llvm_toolchains//:linux_x86_64_to_linux_aarch64",
+    "@llvm_toolchains//:linux_x86_64_to_linux_x86_64",
+    "@llvm_toolchains//:macos_aarch64_to_linux_aarch64",
+    "@llvm_toolchains//:macos_aarch64_to_linux_x86_64",
+    "@llvm_toolchains//:macos_x86_64_to_linux_aarch64",
+    "@llvm_toolchains//:macos_x86_64_to_linux_x86_64",
+    "@llvm_toolchains//:windows_aarch64_to_linux_aarch64",
+    "@llvm_toolchains//:windows_aarch64_to_linux_x86_64",
+    "@llvm_toolchains//:windows_x86_64_to_linux_aarch64",
+    "@llvm_toolchains//:windows_x86_64_to_linux_x86_64",
     dev_dependency = True,
 )
 

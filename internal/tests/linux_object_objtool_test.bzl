@@ -3,8 +3,9 @@
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
 load(
     "//internal:linux_objects.bzl",
-    "linux_config",
+    "linux_compile_environment_index",
     "linux_object",
+    "linux_source_input_index",
     "linux_source_tree",
 )
 
@@ -64,11 +65,6 @@ def _linux_object_objtool_action_test_impl(ctx):
             ctx.attr.expected_mode,
             _argument_after(objtool_action.argv, "-mode"),
         )
-        asserts.equals(
-            env,
-            "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL=y",
-            _argument_after(objtool_action.argv, "-config_value"),
-        )
         if ctx.attr.expect_force:
             asserts.true(env, "-force" in objtool_action.argv)
             asserts.true(env, "-objtool_arg=--noabs" in objtool_action.argv)
@@ -121,21 +117,50 @@ _linux_object_objtool_action_test = analysistest.make(
 )
 
 def linux_object_objtool_test_suite(name):
-    config = name + "_config"
+    compile_environment_index = name + "_compile_environment_index"
     source_tree = name + "_source_tree"
+    source_input_index = name + "_source_input_index"
     fixture_tags = ["manual"]
-    linux_config(
-        name = config,
+    base_payload = "1111111111111111111111111111111111111111111111111111111111111111"
+    delayed_payload = "2222222222222222222222222222222222222222222222222222222222222222"
+    base_environment = "3333333333333333333333333333333333333333333333333333333333333333"
+    delayed_environment = "4444444444444444444444444444444444444444444444444444444444444444"
+
+    linux_compile_environment_index(
+        name = compile_environment_index,
         arch = "x86",
-        config_flags = {
-            "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL": "n",
-            "CONFIG_OBJTOOL": "y",
+        compile_environments = {
+            base_environment: json.encode({
+                "abi": "tests/objtool/x86",
+                "config_payload": base_payload,
+                "generated_header_families": [],
+            }),
+            delayed_environment: json.encode({
+                "abi": "tests/objtool/x86",
+                "config_payload": delayed_payload,
+                "generated_header_families": [],
+            }),
         },
+        config_payloads = {
+            base_payload: "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL=y\nCONFIG_OBJTOOL=y\n",
+            delayed_payload: "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL=y\nCONFIG_LTO_CLANG=y\nCONFIG_OBJTOOL=y\n",
+        },
+        expected_abi = "tests/objtool/x86",
         tags = fixture_tags,
     )
     linux_source_tree(
         name = source_tree,
         root = "linux_objects_test_fixture.c",
+        tags = fixture_tags,
+    )
+    linux_source_input_index(
+        name = source_input_index,
+        groups = ["1", "2"],
+        source_tree_info = ":" + source_tree,
+        srcs = [
+            "linux_objects_test_fixture.c",
+            "linux_objects_test_fixture.S",
+        ],
         tags = fixture_tags,
     )
 
@@ -151,23 +176,20 @@ def linux_object_objtool_test_suite(name):
         ("module_single_lto_nonstandard", "m", "module-single", False, True, True, False, False, False),
     ]:
         object_target = name + "_" + suffix + "_object"
-        config_fragment = {
-            "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL": "y",
-        }
-        if delayed:
-            config_fragment["CONFIG_LTO_CLANG"] = "y"
         linux_object(
             name = object_target,
-            config = ":" + config,
-            config_fragment = config_fragment,
+            compile_environment_id = delayed_environment if delayed else base_environment,
+            compile_environment_index = ":" + compile_environment_index,
+            content_id = "5555555555555555555555555555555555555555555555555555555555555555",
             mode = object_mode,
             module_root = module_root,
             object = "arch/x86/boot/startup/test.pi.o" if transformed else "test.o",
             objtool = "//internal/cmd/runandwrite" if use_objtool else None,
             objtool_args = ["--noabs"] if force else [],
             objtool_force = force,
-            source_tree_info = ":" + source_tree,
-            src = "linux_objects_test_fixture.S" if assembly else "linux_objects_test_fixture.c",
+            source_input_file = 1 if assembly else 2,
+            source_input_group = 1 if assembly else 2,
+            source_input_index = ":" + source_input_index,
             tags = fixture_tags,
         )
         test = name + "_" + suffix

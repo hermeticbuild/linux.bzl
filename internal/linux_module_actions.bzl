@@ -80,9 +80,6 @@ def _target_compile_inputs(kernel, target, direct = []):
         ],
     )
 
-def _generated_include_dir_anchors(generated_headers):
-    return generated_headers.include_dir_anchors if hasattr(generated_headers, "include_dir_anchors") else {}
-
 def _add_include_dirs(args, include_dirs, anchors):
     for include_dir in include_dirs:
         anchor = anchors.get(include_dir)
@@ -92,7 +89,7 @@ def _add_include_dirs(args, include_dirs, anchors):
             add_directory_arg(args, anchor, format = "-I%s")
 
 def _add_kernel_include_dirs(args, helpers, kernel, source_root):
-    config_anchor = kernel.config.include_dir_anchor if hasattr(kernel.config, "include_dir_anchor") else None
+    config_anchor = kernel.config.include_dir_anchor
     if config_anchor == None:
         args.add("-I" + kernel.config.include_dir)
     else:
@@ -104,7 +101,7 @@ def _add_kernel_include_dirs(args, helpers, kernel, source_root):
             kernel.srcarch,
             kernel.generated_headers.include_dirs,
         ),
-        _generated_include_dir_anchors(kernel.generated_headers),
+        kernel.generated_headers.include_dir_anchors,
     )
 
 def _target_c_flags(ctx, helpers, kernel, target):
@@ -114,8 +111,8 @@ def _target_c_flags(ctx, helpers, kernel, target):
         response_files.append(kernel.generated_headers.cflags)
     return struct(
         config_include_dir = kernel.config.include_dir,
-        config_include_dir_anchor = kernel.config.include_dir_anchor if hasattr(kernel.config, "include_dir_anchor") else None,
-        generated_include_dir_anchors = _generated_include_dir_anchors(kernel.generated_headers),
+        config_include_dir_anchor = kernel.config.include_dir_anchor,
+        generated_include_dir_anchors = kernel.generated_headers.include_dir_anchors,
         leading_flags = helpers.compile_flags(
             ctx,
             target.cc_toolchain,
@@ -588,15 +585,15 @@ def _process_objtool(ctx, config, objtool, input, output, mode, mnemonic, progre
     return output
 
 def _module_root_needs_objtool(config, info):
-    kind = info.module_root_kind if hasattr(info, "module_root_kind") else ""
+    kind = info.module_root_kind
     if kind == "single":
         return False
-    if kind == "composite":
-        return (
-            config.config_flags.get("CONFIG_LTO_CLANG") == "y" or
-            config.config_flags.get("CONFIG_X86_KERNEL_IBT") == "y"
-        )
-    return True
+    if kind != "composite":
+        fail("module_root_kind must be single or composite, got %r" % kind)
+    return (
+        config.config_flags.get("CONFIG_LTO_CLANG") == "y" or
+        config.config_flags.get("CONFIG_X86_KERNEL_IBT") == "y"
+    )
 
 def _process_module_roots(ctx, kernel, modules):
     outputs = {}
@@ -617,8 +614,8 @@ def _process_module_roots(ctx, kernel, modules):
             "module",
             "LinuxModuleObjtool",
             "Processing in-tree Linux module with objtool %{label}",
-            force = info.objtool_force if hasattr(info, "objtool_force") else False,
-            extra_args = info.objtool_args if hasattr(info, "objtool_args") else [],
+            force = info.objtool_force,
+            extra_args = info.objtool_args,
         )
     return outputs
 

@@ -2,54 +2,81 @@ load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load(
     "//internal:linux_objects.bzl",
     "linux_archive",
-    "linux_config",
+    "linux_compile_environment_index",
     "linux_object",
+    "linux_source_input_index",
     "linux_source_tree",
 )
 load(":source_include_closure_test.bzl", "source_include_closure_test")
 
 package(default_visibility = ["//:__subpackages__"])
 
-linux_config(
-    name = "fixture_config",
-    config_flags = {
-        "CONFIG_FIXTURE": "y",
-        "CONFIG_FIXTURE_MODULE": "m",
-        "CONFIG_FIXTURE_VALUE": "7",
-        "CONFIG_LOCALVERSION": "\"-native\"",
+_COMPILE_ENVIRONMENT_ID = "1111111111111111111111111111111111111111111111111111111111111111"
+
+_CONFIG_PAYLOAD_ID = "2222222222222222222222222222222222222222222222222222222222222222"
+
+linux_compile_environment_index(
+    name = "fixture_compile_environment_index",
+    compile_environments = {
+        _COMPILE_ENVIRONMENT_ID: "{\"abi\":\"tests/compile/x86\",\"config_payload\":\"%s\",\"generated_header_families\":[]}" % _CONFIG_PAYLOAD_ID,
     },
+    config_payloads = {
+        _CONFIG_PAYLOAD_ID: "\n".join([
+            "CONFIG_FIXTURE=y",
+            "CONFIG_FIXTURE_MODULE=m",
+            "CONFIG_FIXTURE_VALUE=7",
+            "CONFIG_LOCALVERSION=\"-native\"",
+            "",
+        ]),
+    },
+    expected_abi = "tests/compile/x86",
     version = "6.18.2",
 )
 
 linux_source_tree(
     name = "fixture_source_tree",
-    all_files = ["fixture.c"] + glob(["source/**"]),
-    global_headers = glob(["source/include/**/*.h"]),
-    headers = glob(["source/**/*.h"]),
-    local_include_files = ["fixture.c"] + glob([
-        "source/**/*.c",
-        "source/**/*.inc",
-    ]),
     root = "source/Kconfig",
+)
+
+linux_source_input_index(
+    name = "fixture_source_input_index",
+    srcs = [
+        "fixture.c",
+        "source/cross_tree/leaf.c",
+        "source/include/linux/compiler-version.h",
+        "source/include/linux/compiler_types.h",
+        "source/include/linux/kconfig.h",
+        "source/shared/first.inc",
+        "source/shared/nested/second.inc",
+    ],
+    groups = [
+        "1,2,3,4,5,6",
+        "2,3,4,7",
+    ],
+    source_tree_info = ":fixture_source_tree",
 )
 
 linux_object(
     name = "fixture_object",
-    src = "fixture.c",
-    config = ":fixture_config",
+    compile_environment_id = _COMPILE_ENVIRONMENT_ID,
+    compile_environment_index = ":fixture_compile_environment_index",
+    content_id = "3333333333333333333333333333333333333333333333333333333333333333",
     flags = [
         "-Werror",
         "-Wall",
     ],
     mode = "y",
     object = "fixture.o",
-    source_tree_info = ":fixture_source_tree",
+    source_input_file = 7,
+    source_input_group = 2,
+    source_input_index = ":fixture_source_input_index",
 )
 
 linux_object(
     name = "fixture_module_object",
-    src = "fixture.c",
-    config = ":fixture_config",
+    compile_environment_id = _COMPILE_ENVIRONMENT_ID,
+    compile_environment_index = ":fixture_compile_environment_index",
+    content_id = "4444444444444444444444444444444444444444444444444444444444444444",
     flags = [
         "-DEXPECT_MODULE",
         "-Werror",
@@ -57,7 +84,9 @@ linux_object(
     ],
     mode = "m",
     object = "fixture_module.o",
-    source_tree_info = ":fixture_source_tree",
+    source_input_file = 7,
+    source_input_group = 2,
+    source_input_index = ":fixture_source_input_index",
 )
 
 linux_archive(
@@ -67,20 +96,18 @@ linux_archive(
 
 linux_object(
     name = "cross_tree_object",
-    src = "source/cross_tree/leaf.c",
-    config = ":fixture_config",
+    compile_environment_id = _COMPILE_ENVIRONMENT_ID,
+    compile_environment_index = ":fixture_compile_environment_index",
+    content_id = "5555555555555555555555555555555555555555555555555555555555555555",
     flags = [
         "-Werror",
         "-Wall",
     ],
     mode = "y",
     object = "cross_tree/leaf.o",
-    source_includes = [
-        "source/shared/first.inc",
-        "source/shared/nested/second.inc",
-    ],
-    source_includes_complete = True,
-    source_tree_info = ":fixture_source_tree",
+    source_input_file = 1,
+    source_input_group = 1,
+    source_input_index = ":fixture_source_input_index",
 )
 
 source_include_closure_test(
@@ -93,8 +120,9 @@ build_test(
     targets = [
         ":cross_tree_object",
         ":fixture_archive",
-        ":fixture_config",
+        ":fixture_compile_environment_index",
         ":fixture_module_object",
         ":fixture_object",
+        ":fixture_source_input_index",
     ],
 )

@@ -78,9 +78,9 @@ A release is ready only when:
 - Unsupported Kbuild constructs and toolchain/config mismatches fail with
   actionable diagnostics.
 
-Version 0.1 intentionally gives named variants independent object graphs.
-Cross-variant action sharing is not a release requirement until the config
-input model can prove it correct.
+Named variants must share content-identical object actions in one configured
+graph. Release CI verifies the maintained x86_64 base/BTF/debug/LZ4 invocation
+against the generated graph statistics and Bazel action metrics.
 
 Signing kernel images or modules, `MODULE_VERSION`/module source-version
 metadata, and device-tree artifacts are outside the current release contract.

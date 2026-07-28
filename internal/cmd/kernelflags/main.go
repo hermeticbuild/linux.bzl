@@ -1,19 +1,45 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
+
+type configPayloadManifest struct {
+	Arch     string            `json:"arch"`
+	Payloads map[string]string `json:"payloads"`
+	Version  string            `json:"version"`
+}
 
 func main() {
 	configPath := flag.String("config", "", "Resolved Linux .config file")
 	arch := flag.String("arch", "x86", "Linux ARCH value")
 	outPath := flag.String("out", "", "Output Clang response file")
 	asmOutPath := flag.String("asm_out", "", "Output assembler response file")
+	batchManifestPath := flag.String("batch_manifest", "", "JSON manifest of content-addressed config payloads")
+	batchOutDir := flag.String("batch_out_dir", "", "Output root for content-addressed config payloads")
 	flag.Parse()
+
+	if *batchManifestPath != "" || *batchOutDir != "" {
+		if *batchManifestPath == "" || *batchOutDir == "" || *configPath != "" || *outPath != "" || *asmOutPath != "" {
+			flag.PrintDefaults()
+			os.Exit(2)
+		}
+		if err := materializeConfigPayloads(*batchManifestPath, *batchOutDir); err != nil {
+			fmt.Fprintf(os.Stderr, "materialize config payloads: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *configPath == "" || *outPath == "" {
 		flag.PrintDefaults()
@@ -43,6 +69,208 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+func materializeConfigPayloads(manifestPath, outDir string) error {
+	file, err := os.Open(manifestPath)
+	if err != nil {
+		return fmt.Errorf("open manifest: %w", err)
+	}
+	defer file.Close()
+
+	var manifest configPayloadManifest
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&manifest); err != nil {
+		return fmt.Errorf("decode manifest: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("decode manifest: trailing JSON value")
+		}
+		return fmt.Errorf("decode manifest: %w", err)
+	}
+	if manifest.Payloads == nil {
+		return fmt.Errorf("manifest payloads must be an object")
+	}
+	if manifest.Arch != "" && manifest.Arch != "arm64" && manifest.Arch != "x86" {
+		return fmt.Errorf("unsupported Linux ARCH %q", manifest.Arch)
+	}
+
+	ids := make([]string, 0, len(manifest.Payloads))
+	for id := range manifest.Payloads {
+		if !isContentID(id) {
+			return fmt.Errorf("invalid payload ID %q", id)
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		config, err := parseConfigPayload(manifest.Payloads[id])
+		if err != nil {
+			return fmt.Errorf("parse payload %s: %w", id, err)
+		}
+		if err := materializeConfigPayload(outDir, id, config, manifest.Arch, manifest.Version); err != nil {
+			return fmt.Errorf("materialize payload %s: %w", id, err)
+		}
+	}
+	return nil
+}
+
+func parseConfigPayload(content string) (map[string]string, error) {
+	config := map[string]string{}
+	previousKey := ""
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		key := ""
+		value := ""
+		if strings.HasPrefix(line, "# CONFIG_") && strings.HasSuffix(line, " is not set") {
+			key = strings.TrimSuffix(strings.TrimPrefix(line, "# "), " is not set")
+			value = "n"
+		} else {
+			var found bool
+			key, value, found = strings.Cut(line, "=")
+			if !found {
+				return nil, fmt.Errorf("invalid line %q", line)
+			}
+		}
+		if !strings.HasPrefix(key, "CONFIG_") {
+			return nil, fmt.Errorf("invalid key %q", key)
+		}
+		if _, ok := config[key]; ok {
+			return nil, fmt.Errorf("repeated key %s", key)
+		}
+		if previousKey != "" && key < previousKey {
+			return nil, fmt.Errorf("payload is not sorted: %s follows %s", key, previousKey)
+		}
+		config[key] = value
+		previousKey = key
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan payload: %w", err)
+	}
+	return config, nil
+}
+
+func isContentID(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func materializeConfigPayload(outDir, id string, config map[string]string, arch, version string) error {
+	root := filepath.Join(outDir, id)
+	autoConf := filepath.Join(root, "include", "config", "auto.conf")
+	files := map[string]string{
+		filepath.Join(root, ".config"): configText(config),
+		autoConf:                       configText(config),
+		filepath.Join(root, "include", "config", "auto.conf.cmd"):              "'cmd_" + filepath.ToSlash(autoConf) + " := bazel linux_config'\n",
+		filepath.Join(root, "include", "config", "kernel.release"):             version + unquote(config["CONFIG_LOCALVERSION"]) + "\n",
+		filepath.Join(root, "include", "generated", "autoconf.h"):              autoconfText(config),
+		filepath.Join(root, "include", "generated", "integer-wrap.h"):          "",
+		filepath.Join(root, "include", "generated", "rustc_cfg"):               rustcConfigText(config),
+		filepath.Join(root, "include", "generated", "bazel_kbuild_aflags.rsp"): configFlagsResponse(config, arch, true),
+		filepath.Join(root, "include", "generated", "bazel_kbuild_cflags.rsp"): configFlagsResponse(config, arch, false),
+	}
+	paths := make([]string, 0, len(files))
+	for path := range files {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte(files[path]), 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func configText(config map[string]string) string {
+	keys := sortedConfigKeys(config)
+	var out strings.Builder
+	for _, key := range keys {
+		fmt.Fprintf(&out, "%s=%s\n", key, config[key])
+	}
+	return out.String()
+}
+
+func autoconfText(config map[string]string) string {
+	var out strings.Builder
+	out.WriteString("/* Generated by Bazel linux_config. */\n")
+	out.WriteString("#ifndef __GENERATED_AUTOCONF_H__\n")
+	out.WriteString("#define __GENERATED_AUTOCONF_H__\n")
+	for _, key := range sortedConfigKeys(config) {
+		value := config[key]
+		switch value {
+		case "y":
+			fmt.Fprintf(&out, "#define %s 1\n", key)
+		case "m":
+			fmt.Fprintf(&out, "#define %s_MODULE 1\n", key)
+		case "n":
+		default:
+			fmt.Fprintf(&out, "#define %s %s\n", key, value)
+		}
+	}
+	out.WriteString("#endif\n")
+	return out.String()
+}
+
+func rustcConfigText(config map[string]string) string {
+	var out strings.Builder
+	for _, key := range sortedConfigKeys(config) {
+		value := config[key]
+		if value == "y" || value == "m" {
+			fmt.Fprintf(&out, "--cfg=%s\n", key)
+		}
+		if value != "n" {
+			rendered := value
+			if !strings.HasPrefix(rendered, "\"") {
+				rendered = "\"" + rendered + "\""
+			}
+			fmt.Fprintf(&out, "--cfg=%s=%s\n", key, rendered)
+		}
+	}
+	return out.String()
+}
+
+func sortedConfigKeys(config map[string]string) []string {
+	keys := make([]string, 0, len(config))
+	for key := range config {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func configFlagsResponse(config map[string]string, arch string, assembly bool) string {
+	if arch == "" {
+		return ""
+	}
+	if assembly {
+		return responseFile(linuxAFlags(config, arch))
+	}
+	return responseFile(linuxCFlags(config, arch))
+}
+
+func unquote(value string) string {
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		return value[1 : len(value)-1]
+	}
+	return value
 }
 
 func linuxCFlags(config map[string]string, arch string) []string {

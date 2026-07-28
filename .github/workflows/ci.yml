@@ -55,7 +55,8 @@ jobs:
             targets+=(//internal/tests:path_mapping_test)
             path_mapping_args+=("${BAZEL_PATH_MAPPING}")
           fi
-          bazel --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+          bazel --host_jvm_args=-Xmx6g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test "${targets[@]}" \
             "${path_mapping_args[@]}" \
             --build_event_json_file="${BAZEL_BEP}" \
@@ -104,7 +105,7 @@ jobs:
             report_mnemonics: ""
           - batch: x86-64-variants
             title: x86_64 base + overlays
-            targets: "//:x86_64_kernel //:x86_64_debug_kernel //:x86_64_btf_vmlinux //:x86_64_lz4_kernel"
+            targets: "//:x86_64_kernel //:x86_64_debug_kernel //:x86_64_btf_vmlinux //:x86_64_lz4_kernel //:x86_64_shared_graph_metadata"
             report_name: x86-64-base
             report_target: "//:x86_64_kernel"
             report_title: x86_64 base
@@ -154,9 +155,14 @@ jobs:
         run: |
           set -euo pipefail
           read -r -a targets <<<"${BAZEL_TARGETS}"
-          bazel --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+          bazel --host_jvm_args=-Xmx6g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             build "${targets[@]}" \
             --config=path-mapping \
+            --notrack_incremental_state \
+            --nokeep_state_after_build \
+            --discard_analysis_cache \
+            --experimental_record_metrics_for_all_mnemonics \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -268,6 +274,19 @@ jobs:
             "${BAZEL_BEP}" \
             "${BAZEL_LOG}"
 
+      - name: Verify shared kernel graph
+        if: ${{ matrix.batch == 'x86-64-variants' }}
+        working-directory: examples
+        env:
+          BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.batch }}.bep.json
+        run: >-
+          ../.github/workflows/assert_shared_kernel_graph.sh
+          "${BAZEL_BEP}"
+          bazel-bin/x86_64_shared_graph_metadata.json
+          3519
+          4711
+          110000
+
       - name: Upload Bazel profile
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
@@ -341,9 +360,13 @@ jobs:
         run: |
           set -euo pipefail
           read -r -a targets <<<"${BAZEL_TARGETS}"
-          bazel --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+          bazel --host_jvm_args=-Xmx6g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test "${targets[@]}" \
             --config=path-mapping \
+            --notrack_incremental_state \
+            --nokeep_state_after_build \
+            --discard_analysis_cache \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -401,11 +424,15 @@ jobs:
           BAZEL_LOG: ${{ runner.temp }}/aya-e2e.log
           BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e.profile.gz
         run: |
-          set -o pipefail
-          bazel --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+          set -euo pipefail
+          bazel --host_jvm_args=-Xmx6g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test \
             '@aya//test/integration-test:vm_aarch64' \
             '@aya//test/integration-test:vm_x86_64' \
+            --notrack_incremental_state \
+            --nokeep_state_after_build \
+            --discard_analysis_cache \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
