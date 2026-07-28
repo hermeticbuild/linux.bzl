@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -27,25 +29,32 @@ func TestApplyRustToolchainProbe(t *testing.T) {
 	}
 }
 
-func TestGeneratedIncludeFlag(t *testing.T) {
-	values := generatedIncludeFlag{}
-	for _, value := range []string{
-		"generated/autoconf.h",
-		"asm/rwonce.h=include/asm-generic/rwonce.h",
-		"asm/errno.h=include/uapi/asm-generic/errno.h",
-	} {
-		if err := values.Set(value); err != nil {
-			t.Fatalf("Set(%q) failed: %v", value, err)
+func TestStartRuntimeProfilesWritesMemoryProfiles(t *testing.T) {
+	dir := t.TempDir()
+	heapPath := filepath.Join(dir, "heap.pprof")
+	allocsPath := filepath.Join(dir, "allocs.pprof")
+	stop, err := startRuntimeProfiles("", heapPath, allocsPath)
+	if err != nil {
+		t.Fatalf("startRuntimeProfiles() failed: %v", err)
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("stop profiles failed: %v", err)
+	}
+	for _, path := range []string{heapPath, allocsPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat(%q) failed: %v", path, err)
+		}
+		if info.Size() == 0 {
+			t.Fatalf("profile %q is empty", path)
 		}
 	}
-	if got := values["generated/autoconf.h"]; got != nil {
-		t.Fatalf("generated/autoconf.h backings = %v, want nil", got)
-	}
-	if got, want := strings.Join(values["asm/rwonce.h"], ","), "include/asm-generic/rwonce.h"; got != want {
-		t.Fatalf("asm/rwonce.h backings = %q, want %q", got, want)
-	}
-	if err := values.Set("missing="); err == nil {
-		t.Fatal("Set(missing=) succeeded")
+}
+
+func TestStartRuntimeProfilesRejectsInvalidCPUPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "cpu.pprof")
+	if _, err := startRuntimeProfiles(path, "", ""); err == nil {
+		t.Fatalf("startRuntimeProfiles(%q) succeeded, want an error", path)
 	}
 }
 
@@ -80,26 +89,6 @@ func TestKbuildVariablesForConfigUsesWrittenConfigView(t *testing.T) {
 		if got := vars[key]; got != want {
 			t.Fatalf("vars[%q] = %q, want %q", key, got, want)
 		}
-	}
-}
-
-func TestResolvedFlagLinesUsesWrittenConfigView(t *testing.T) {
-	resolved := &kconfig.ResolvedConfig{
-		Effective: map[string]string{
-			"CONFIG_Z":        "y",
-			"CONFIG_A":        "m",
-			"CONFIG_DISABLED": "n",
-			"CONFIG_HIDDEN":   "y",
-		},
-		Written: map[string]bool{
-			"CONFIG_A":        true,
-			"CONFIG_DISABLED": true,
-			"CONFIG_Z":        true,
-		},
-	}
-	got := strings.Join(resolvedFlagLines(resolved), "\n")
-	if want := "CONFIG_A=m\nCONFIG_Z=y"; got != want {
-		t.Fatalf("resolvedFlagLines() = %q, want %q", got, want)
 	}
 }
 
@@ -162,78 +151,5 @@ config HEX_PREFIXED
 	}, "\n")
 	if got != want {
 		t.Fatalf("rustcCfgLines() =\n%s\nwant:\n%s", got, want)
-	}
-}
-
-func TestCompactMetadataRejectsUnmatchedOverlay(t *testing.T) {
-	_, err := compactMetadata(
-		nil,
-		"",
-		"Kbuild",
-		[]namedPath{{Name: "base", Path: "base.config"}},
-		[]namedPath{{Name: "other", Path: "overlay.config"}},
-		"",
-		"default",
-		false,
-		nil,
-		nil,
-		nil,
-		nil,
-		false,
-		kconfig.CompactSchemaV012,
-	)
-	if err == nil || !strings.Contains(err.Error(), `config overlay "other" has no matching -config`) {
-		t.Fatalf("compactMetadata() error = %v, want unmatched overlay", err)
-	}
-}
-
-func TestCompactMetadataRejectsDuplicateOverlay(t *testing.T) {
-	_, err := compactMetadata(
-		nil,
-		"",
-		"Kbuild",
-		[]namedPath{{Name: "base", Path: "base.config"}},
-		[]namedPath{
-			{Name: "base", Path: "first.config"},
-			{Name: "base", Path: "second.config"},
-		},
-		"",
-		"default",
-		false,
-		nil,
-		nil,
-		nil,
-		nil,
-		false,
-		kconfig.CompactSchemaV012,
-	)
-	if err == nil || !strings.Contains(err.Error(), `duplicate config overlay name "base"`) {
-		t.Fatalf("compactMetadata() error = %v, want duplicate overlay", err)
-	}
-}
-
-func TestCompactMetadataRejectsUnsafeResolvedFlagsNames(t *testing.T) {
-	for _, name := range []string{"../outside", "nested/config", `nested\config`, ".", ".."} {
-		t.Run(name, func(t *testing.T) {
-			_, err := compactMetadata(
-				nil,
-				"",
-				"Kbuild",
-				[]namedPath{{Name: name, Path: "base.config"}},
-				nil,
-				t.TempDir(),
-				"default",
-				false,
-				nil,
-				nil,
-				nil,
-				nil,
-				false,
-				kconfig.CompactSchemaV012,
-			)
-			if err == nil || !strings.Contains(err.Error(), "must be a single path component") {
-				t.Fatalf("compactMetadata() error = %v, want unsafe name rejection", err)
-			}
-		})
 	}
 }

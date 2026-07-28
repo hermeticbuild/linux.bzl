@@ -63,51 +63,65 @@ def _linux_compact_outputs_impl(ctx):
     metadata = ctx.actions.declare_file(ctx.label.name + ".metadata.json")
     buildfile = ctx.actions.declare_file(ctx.label.name + ".BUILD.bazel")
 
+    configs = []
+    config_names = {}
+    inputs = [ctx.file.root, ctx.file.kbuild] + ctx.files.srcs
+    for target, name in ctx.attr.configs.items():
+        if not name:
+            fail("compact config names must be non-empty")
+        if name in config_names:
+            fail("duplicate compact config name %r" % name)
+        config_names[name] = True
+        file = _config_file(target, "configs")
+        configs.append((name, file))
+        inputs.append(file)
+    if not configs:
+        fail("configs must contain at least one compact config")
+    if ctx.attr.compact_base_config not in config_names:
+        fail(
+            "compact_base_config %r is not present in configs %s" %
+            (ctx.attr.compact_base_config, sorted(config_names.keys())),
+        )
+    if not ctx.attr.compile_environment_abi:
+        fail("compile_environment_abi must be non-empty")
+    header_config_names = sorted(ctx.attr.generated_headers_by_config.keys())
+    if header_config_names != sorted(config_names.keys()):
+        fail(
+            "generated_headers_by_config keys %s do not match compact config names %s" %
+            (header_config_names, sorted(config_names.keys())),
+        )
+    for config_name, label in ctx.attr.generated_headers_by_config.items():
+        if not label:
+            fail("generated_headers_by_config[%r] must be non-empty" % config_name)
+    if not ctx.attr.source_label_package:
+        fail("source_label_package must be non-empty")
+    if not ctx.attr.source_root_label:
+        fail("source_root_label must be non-empty")
+
     args = ctx.actions.args()
-    args.add("-compact_schema=v0.0.12")
+    args.add("-compact_base_config", ctx.attr.compact_base_config)
+    args.add("-compile_environment_abi", ctx.attr.compile_environment_abi)
+    for config_name, label in sorted(ctx.attr.generated_headers_by_config.items()):
+        args.add("-generated_headers_for_config", "%s=%s" % (config_name, label))
     args.add("-root", ctx.file.root)
     args.add("-kbuild", ctx.file.kbuild)
     args.add("-compact_metadata_out", metadata)
     args.add("-compact_buildfile_out", buildfile)
     for exported_file in ctx.attr.buildfile_exports:
         args.add("-compact_buildfile_export", exported_file)
-    if ctx.attr.generated_headers:
-        args.add("-generated_headers", ctx.attr.generated_headers)
     if ctx.attr.kbuild_tree:
         args.add("-compact_kbuild_tree")
-    if ctx.attr.config_mode:
-        args.add("-config_mode", ctx.attr.config_mode)
+    args.add("-config_mode", ctx.attr.config_mode)
+    args.add("-kernel_version", ctx.attr.kernel_version)
     args.add("-object_label_package", ctx.attr.object_label_package)
-    if ctx.attr.source_label_package:
-        args.add("-source_label_package", ctx.attr.source_label_package)
+    args.add("-source_label_package", ctx.attr.source_label_package)
     if ctx.attr.source_asn1_compiler:
         args.add("-source_asn1_compiler", ctx.attr.source_asn1_compiler)
+    if ctx.attr.source_objtool:
+        args.add("-source_objtool", ctx.attr.source_objtool)
     if ctx.attr.source_relacheck:
         args.add("-source_relacheck", ctx.attr.source_relacheck)
-    if ctx.attr.source_config:
-        args.add("-source_config", ctx.attr.source_config)
-    if ctx.attr.source_root_label:
-        args.add("-source_root_label", ctx.attr.source_root_label)
-    for label in ctx.attr.source_tree_all_files_labels:
-        args.add("-source_tree_all_files_label", label)
-    for label in ctx.attr.source_tree_arch_headers_labels:
-        args.add("-source_tree_arch_headers_label", label)
-    for label in ctx.attr.source_tree_dtb_sources_labels:
-        args.add("-source_tree_dtb_sources_label", label)
-    for label in ctx.attr.source_tree_global_headers_labels:
-        args.add("-source_tree_global_headers_label", label)
-    for label in ctx.attr.source_tree_headers_labels:
-        args.add("-source_tree_headers_label", label)
-    for label in ctx.attr.source_tree_kbuild_files_labels:
-        args.add("-source_tree_kbuild_files_label", label)
-    for label in ctx.attr.source_tree_scripts_headers_labels:
-        args.add("-source_tree_scripts_headers_label", label)
-    for label in ctx.attr.source_tree_uapi_headers_labels:
-        args.add("-source_tree_uapi_headers_label", label)
-    for include in ctx.attr.source_generated_includes:
-        args.add("-source_generated_include", include)
-    if ctx.attr.source_generated_includes_complete:
-        args.add("-source_generated_includes_complete")
+    args.add("-source_root_label", ctx.attr.source_root_label)
     args.add("-linux_objects_load", ctx.attr.linux_objects_load)
     env = dict(ctx.attr.env)
     vars = dict(ctx.attr.vars)
@@ -125,25 +139,6 @@ def _linux_compact_outputs_impl(ctx):
     for visibility in ctx.attr.generated_visibility:
         args.add("-visibility", visibility)
 
-    configs = []
-    inputs = [ctx.file.root, ctx.file.kbuild] + ctx.files.srcs
-    seen_config_names = {}
-    if ctx.attr.config:
-        if not ctx.attr.config_name:
-            fail("config_name must be set when config is set")
-        file = _config_file(ctx.attr.config, "config")
-        configs.append((ctx.attr.config_name, file))
-        inputs.append(file)
-        seen_config_names[ctx.attr.config_name] = True
-    for target, name in ctx.attr.configs.items():
-        if name in seen_config_names:
-            fail("duplicate compact config name %r" % name)
-        seen_config_names[name] = True
-        file = _config_file(target, "configs")
-        configs.append((name, file))
-        inputs.append(file)
-    if not configs:
-        fail("at least one compact config must be provided")
     for name, file in sorted(configs):
         args.add("-config")
         args.add(file, format = name + "=%s")
@@ -186,13 +181,6 @@ _linux_compact_outputs = rule(
         "buildfile_exports": attr.string_list(
             doc = "Source filenames exported by the generated compact BUILD file.",
         ),
-        "config": attr.label(
-            allow_files = True,
-            doc = "Single .config file label for the generated config name.",
-        ),
-        "config_name": attr.string(
-            doc = "Generated config name for the single config attr.",
-        ),
         "config_mode": attr.string(
             default = "default",
             doc = "Config resolver mode passed to kconfig_parse. Supported: default, allnoconfig.",
@@ -201,8 +189,17 @@ _linux_compact_outputs = rule(
                 "allnoconfig",
             ],
         ),
+        "compact_base_config": attr.string(
+            mandatory = True,
+            doc = "Base config name used to emit content-addressed delta image targets.",
+        ),
+        "compile_environment_abi": attr.string(
+            mandatory = True,
+            doc = "Toolchain and action ABI identity bound into content-addressed compile environments.",
+        ),
         "configs": attr.label_keyed_string_dict(
             allow_files = True,
+            mandatory = True,
             doc = "Map of .config file labels to generated config names.",
         ),
         "env": attr.string_dict(
@@ -212,8 +209,9 @@ _linux_compact_outputs = rule(
             default = ["//visibility:public"],
             doc = "Default visibility emitted into generated compact BUILD files.",
         ),
-        "generated_headers": attr.string(
-            doc = "Label for generated Linux headers emitted into source-backed compact object rules.",
+        "generated_headers_by_config": attr.string_dict(
+            mandatory = True,
+            doc = "Map of compact config names to generated-header labels.",
         ),
         "kbuild": attr.label(
             allow_single_file = True,
@@ -222,6 +220,10 @@ _linux_compact_outputs = rule(
         ),
         "kbuild_tree": attr.bool(
             doc = "Follow Kbuild directory descent from the kbuild root when generating compact metadata.",
+        ),
+        "kernel_version": attr.string(
+            default = "6.18.2",
+            doc = "Base kernel release used when materializing indexed config payloads.",
         ),
         "linux_objects_load": attr.string(
             default = "@linux.bzl//internal:linux_objects.bzl",
@@ -251,49 +253,21 @@ _linux_compact_outputs = rule(
             doc = "Additional Kconfig source files read through source statements.",
         ),
         "source_label_package": attr.string(
+            mandatory = True,
             doc = "Package label path used by generated object BUILD files to reference Linux source files.",
         ),
         "source_asn1_compiler": attr.string(
             doc = "Label for a scripts/asn1_compiler executable emitted into source-backed compact object rules.",
         ),
+        "source_objtool": attr.string(
+            doc = "Label for objtool emitted into x86 source-backed compact object rules.",
+        ),
         "source_relacheck": attr.string(
             doc = "Label for arch/arm64/kernel/pi/relacheck emitted into arm64 .pi.o object rules.",
         ),
-        "source_config": attr.string(
-            doc = "Label for a full linux_config target emitted into source-backed compact object rules.",
-        ),
         "source_root_label": attr.string(
+            mandatory = True,
             doc = "Label for a file in the Linux source root emitted into source-backed compact object rules.",
-        ),
-        "source_generated_includes": attr.string_list(
-            doc = "Generated include spellings, optionally mapped to source backings as INCLUDE=SOURCE.",
-        ),
-        "source_generated_includes_complete": attr.bool(
-            doc = "Whether source_generated_includes covers every generated header available to compact compile actions.",
-        ),
-        "source_tree_all_files_labels": attr.string_list(
-            doc = "Labels for explicit full source tree inputs emitted into source-backed compact object rules.",
-        ),
-        "source_tree_arch_headers_labels": attr.string_list(
-            doc = "Labels for architecture headers emitted into source-backed compact object rules.",
-        ),
-        "source_tree_dtb_sources_labels": attr.string_list(
-            doc = "Labels for devicetree source inputs emitted into source-backed compact object rules.",
-        ),
-        "source_tree_global_headers_labels": attr.string_list(
-            doc = "Labels for global headers emitted into source-backed compact object rules.",
-        ),
-        "source_tree_headers_labels": attr.string_list(
-            doc = "Labels for source tree headers emitted into source-backed compact object rules.",
-        ),
-        "source_tree_kbuild_files_labels": attr.string_list(
-            doc = "Labels for Kbuild and Makefile inputs emitted into source-backed compact object rules.",
-        ),
-        "source_tree_scripts_headers_labels": attr.string_list(
-            doc = "Labels for scripts headers emitted into source-backed compact object rules.",
-        ),
-        "source_tree_uapi_headers_labels": attr.string_list(
-            doc = "Labels for UAPI headers emitted into source-backed compact object rules.",
         ),
         "vars": attr.string_dict(
             doc = "Kconfig preprocessor variables.",
@@ -518,30 +492,21 @@ def linux_compact_buildfiles(
         name,
         root,
         kbuild,
-        configs = {},
-        config = None,
-        config_name = "",
+        configs,
+        compact_base_config,
+        compile_environment_abi,
+        generated_headers_by_config,
+        source_label_package,
+        source_root_label,
         config_mode = "default",
         srcs = [],
         object_label_package = None,
-        source_label_package = "",
         source_asn1_compiler = "",
+        source_objtool = "",
         source_relacheck = "",
-        source_config = "",
-        source_root_label = "",
-        source_generated_includes = [],
-        source_generated_includes_complete = False,
-        source_tree_all_files_labels = [],
-        source_tree_arch_headers_labels = [],
-        source_tree_dtb_sources_labels = [],
-        source_tree_global_headers_labels = [],
-        source_tree_headers_labels = [],
-        source_tree_kbuild_files_labels = [],
-        source_tree_scripts_headers_labels = [],
-        source_tree_uapi_headers_labels = [],
         linux_objects_load = "@linux.bzl//internal:linux_objects.bzl",
-        generated_headers = "",
         kbuild_tree = False,
+        kernel_version = "6.18.2",
         out_buildfile = None,
         out_metadata = None,
         generated_visibility = ["//visibility:public"],
@@ -566,15 +531,16 @@ def linux_compact_buildfiles(
         name = generated,
         allow_shell = allow_shell,
         buildfile_exports = buildfile_exports,
-        config = config,
-        config_name = config_name,
         config_mode = config_mode,
+        compact_base_config = compact_base_config,
+        compile_environment_abi = compile_environment_abi,
         configs = configs,
         env = env,
         generated_visibility = generated_visibility,
-        generated_headers = generated_headers,
+        generated_headers_by_config = generated_headers_by_config,
         kbuild = kbuild,
         kbuild_tree = kbuild_tree,
+        kernel_version = kernel_version,
         linux_objects_load = linux_objects_load,
         object_label_package = object_label_package,
         probe_config = probe_config,
@@ -583,19 +549,9 @@ def linux_compact_buildfiles(
         root = root,
         source_label_package = source_label_package,
         source_asn1_compiler = source_asn1_compiler,
+        source_objtool = source_objtool,
         source_relacheck = source_relacheck,
-        source_config = source_config,
-        source_generated_includes = source_generated_includes,
-        source_generated_includes_complete = source_generated_includes_complete,
         source_root_label = source_root_label,
-        source_tree_all_files_labels = source_tree_all_files_labels,
-        source_tree_arch_headers_labels = source_tree_arch_headers_labels,
-        source_tree_dtb_sources_labels = source_tree_dtb_sources_labels,
-        source_tree_global_headers_labels = source_tree_global_headers_labels,
-        source_tree_headers_labels = source_tree_headers_labels,
-        source_tree_kbuild_files_labels = source_tree_kbuild_files_labels,
-        source_tree_scripts_headers_labels = source_tree_scripts_headers_labels,
-        source_tree_uapi_headers_labels = source_tree_uapi_headers_labels,
         srcs = srcs,
         tags = tags,
         target_compatible_with = target_compatible_with,
@@ -609,6 +565,7 @@ def linux_compact_buildfiles(
         name = buildfile,
         output_group = "buildfile",
         srcs = [":" + generated],
+        tags = tags,
         target_compatible_with = target_compatible_with,
         visibility = visibility,
     )
@@ -616,6 +573,7 @@ def linux_compact_buildfiles(
         name = metadata,
         output_group = "metadata",
         srcs = [":" + generated],
+        tags = tags,
         target_compatible_with = target_compatible_with,
         visibility = visibility,
     )
