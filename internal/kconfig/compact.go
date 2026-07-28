@@ -1606,6 +1606,8 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 	case "drivers/scsi/scsi_sysfs.o":
 		footprint.sourceInputs = []string{"include/scsi/scsi_devinfo.h"}
 		footprint.providedIncludes = []string{"scsi_devinfo_tbl.c"}
+	case "drivers/tty/vt/consolemap_deftbl.o":
+		footprint.closureInputs = []string{"include/linux/types.h"}
 	case "lib/crc/crc32-main.o":
 		footprint.providedIncludes = []string{"crc32table.h"}
 	case "lib/crc32.o":

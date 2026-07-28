@@ -1741,30 +1741,35 @@ func TestCompactV013GeneratedObjectActionFootprints(t *testing.T) {
 	tests := []struct {
 		object          string
 		wantInput       string
+		wantClosure     string
 		wantInclude     string
 		wantConfig      string
 		additionalFlags []string
 	}{
-		{"drivers/tty/vt/ucs.o", "drivers/tty/vt/ucs_width_table.h_shipped", "ucs_width_table.h", "", nil},
-		{"drivers/scsi/scsi_sysfs.o", "include/scsi/scsi_devinfo.h", "scsi_devinfo_tbl.c", "", nil},
-		{"lib/crc/crc32-main.o", "", "crc32table.h", "", nil},
-		{"lib/crc32.o", "", "crc32table.h", "CONFIG_CRC32_SLICEBY4", nil},
-		{"lib/crc/crc64-main.o", "", "crc64table.h", "", nil},
-		{"lib/oid_registry.o", "include/linux/oid_registry.h", "oid_registry_data.c", "", nil},
-		{"arch/x86/lib/inat.o", "arch/x86/lib/x86-opcode-map.txt", "inat-tables.c", "", nil},
-		{"usr/initramfs_data.o", "usr/default_cpio_list", "", "", nil},
-		{"arch/x86/kernel/cpu/capflags.o", "arch/x86/include/asm/cpufeatures.h", "", "", nil},
-		{"arch/x86/realmode/rmpiggy.o", "", "pasyms.h", "", nil},
-		{"init/version.o", "init/version-timestamp.c", "", "", nil},
-		{"lib/fdt_ro.o", "scripts/dtc/libfdt/fdt_ro.c", "", "", nil},
-		{"crypto/example.asn1.o", "scripts/asn1_compiler.c", "", "", nil},
-		{"init/uts.o", "", "", "CONFIG_LOCALVERSION", []string{"-include", "$(obj)/utsversion-tmp.h"}},
+		{"drivers/tty/vt/ucs.o", "drivers/tty/vt/ucs_width_table.h_shipped", "", "ucs_width_table.h", "", nil},
+		{"drivers/scsi/scsi_sysfs.o", "include/scsi/scsi_devinfo.h", "", "scsi_devinfo_tbl.c", "", nil},
+		{"drivers/tty/vt/consolemap_deftbl.o", "", "include/linux/types.h", "", "", nil},
+		{"lib/crc/crc32-main.o", "", "", "crc32table.h", "", nil},
+		{"lib/crc32.o", "", "", "crc32table.h", "CONFIG_CRC32_SLICEBY4", nil},
+		{"lib/crc/crc64-main.o", "", "", "crc64table.h", "", nil},
+		{"lib/oid_registry.o", "include/linux/oid_registry.h", "", "oid_registry_data.c", "", nil},
+		{"arch/x86/lib/inat.o", "arch/x86/lib/x86-opcode-map.txt", "", "inat-tables.c", "", nil},
+		{"usr/initramfs_data.o", "usr/default_cpio_list", "", "", "", nil},
+		{"arch/x86/kernel/cpu/capflags.o", "arch/x86/include/asm/cpufeatures.h", "", "", "", nil},
+		{"arch/x86/realmode/rmpiggy.o", "", "", "pasyms.h", "", nil},
+		{"init/version.o", "init/version-timestamp.c", "", "", "", nil},
+		{"lib/fdt_ro.o", "scripts/dtc/libfdt/fdt_ro.c", "", "", "", nil},
+		{"crypto/example.asn1.o", "scripts/asn1_compiler.c", "", "", "", nil},
+		{"init/uts.o", "", "", "", "CONFIG_LOCALVERSION", []string{"-include", "$(obj)/utsversion-tmp.h"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.object, func(t *testing.T) {
 			got := compactObjectActionFootprintForObject(tc.object, tc.additionalFlags)
 			if tc.wantInput != "" && !slices.Contains(got.sourceInputs, tc.wantInput) {
 				t.Errorf("source inputs = %v, want %q", got.sourceInputs, tc.wantInput)
+			}
+			if tc.wantClosure != "" && !slices.Contains(got.closureInputs, tc.wantClosure) {
+				t.Errorf("closure inputs = %v, want %q", got.closureInputs, tc.wantClosure)
 			}
 			if tc.wantInclude != "" && !slices.Contains(got.providedIncludes, tc.wantInclude) {
 				t.Errorf("provided includes = %v, want %q", got.providedIncludes, tc.wantInclude)
@@ -1773,6 +1778,48 @@ func TestCompactV013GeneratedObjectActionFootprints(t *testing.T) {
 				t.Errorf("config symbols = %v, want %q", got.configSymbols, tc.wantConfig)
 			}
 		})
+	}
+}
+
+func TestCompactV013ConsoleMapGeneratedSourceBindsHeaderClosure(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	kb, err := ParseKbuild(strings.NewReader("obj-y += drivers/tty/vt/consolemap_deftbl.o\n"), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "drivers/tty/vt/cp437.uni", "0x00 U+0000\n")
+	mustWriteSource(t, sourceRoot, "include/linux/types.h", "#include <linux/types-nested.h>\n")
+	mustWriteSource(t, sourceRoot, "include/linux/types-nested.h", "#define TYPES_NESTED 1\n")
+	writeCompactV013ForcedInputs(t, sourceRoot)
+
+	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{Name: "base"}}, CompactMetadataOptions{
+		Schema:                CompactSchemaV013,
+		SourceRoot:            sourceRoot,
+		Srcarch:               "x86",
+		CompileEnvironmentABI: "object-abi-v1",
+	})
+	if err != nil {
+		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+	}
+	config := configByName(metadata, "base")
+	variant := variantByTarget(metadata, objectTarget(metadata, config, "drivers/tty/vt/consolemap_deftbl.o"))
+	inputs, err := metadata.expandedSourceInputGroup(
+		variant.SourceInputGroup,
+		variant.SourceInputs,
+		"consolemap_deftbl",
+	)
+	if err != nil {
+		t.Fatalf("expand consolemap source inputs: %v", err)
+	}
+	var paths []string
+	for _, input := range inputs {
+		paths = append(paths, input.Path)
+	}
+	for _, want := range []string{"include/linux/types.h", "include/linux/types-nested.h"} {
+		if !slices.Contains(paths, want) {
+			t.Errorf("consolemap source inputs = %v, want %q", paths, want)
+		}
 	}
 }
 

@@ -310,10 +310,14 @@ def _indexed_assembly_source_test_impl(ctx):
     ]
     asserts.equals(env, 1, len(actions))
     if actions:
-        argv = actions[0].argv
+        action = actions[0]
+        argv = action.argv
         asserts.true(env, "-D__ASSEMBLY__" in argv)
         compile_index = argv.index("-c")
         asserts.true(env, argv[compile_index + 1].endswith("/lib/crypto/x86/blake2s-core.S"))
+        input_basenames = [file.basename for file in action.inputs.to_list()]
+        asserts.true(env, "blake2s-core.S" in input_basenames)
+        asserts.false(env, "blake2s.h" in input_basenames)
     return analysistest.end(env)
 
 _indexed_assembly_source_test = analysistest.make(
@@ -930,10 +934,11 @@ def linux_objects_fail_closed_test_suite(name):
     assembly_source_input_index = name + "_assembly_source_input_index"
     linux_source_input_index(
         name = assembly_source_input_index,
-        groups = ["1,2"],
+        groups = ["1", "2"],
         srcs = [
-            "lib/crypto/x86/blake2s-core.S",
+            # keep
             "lib/crypto/x86/blake2s.h",
+            "lib/crypto/x86/blake2s-core.S",
         ],
         source_tree_info = ":" + source_tree,
         tags = fixture_tags,
