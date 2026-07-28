@@ -55,8 +55,7 @@ jobs:
             targets+=(//internal/tests:path_mapping_test)
             path_mapping_args+=("${BAZEL_PATH_MAPPING}")
           fi
-          bazel --host_jvm_args=-Xmx3g \
-            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+          bazel --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test "${targets[@]}" \
             "${path_mapping_args[@]}" \
             --build_event_json_file="${BAZEL_BEP}" \
@@ -155,8 +154,7 @@ jobs:
         run: |
           set -euo pipefail
           read -r -a targets <<<"${BAZEL_TARGETS}"
-          bazel --host_jvm_args=-Xmx3g \
-            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+          bazel --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             build "${targets[@]}" \
             --config=path-mapping \
             --build_event_json_file="${BAZEL_BEP}" \
@@ -179,21 +177,21 @@ jobs:
           mkdir -p "${report_dir}"
 
           execroot="$(
-            bazel --host_jvm_args=-Xmx3g \
+            bazel \
               --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
               info \
               --config=path-mapping \
               execution_root
           )"
 
-          bazel --host_jvm_args=-Xmx3g \
+          bazel \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             build \
             --config=path-mapping \
             --remote_download_toplevel \
             @linux.bzl//tools:linuxobjectinputreport
           reporter_output="$(
-            bazel --host_jvm_args=-Xmx3g \
+            bazel \
               --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
               cquery \
               --config=path-mapping \
@@ -202,14 +200,14 @@ jobs:
           )"
           install -m 0755 "${reporter_output}" "${reporter}"
 
-          bazel --host_jvm_args=-Xmx3g \
+          bazel \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             build \
             --config=path-mapping \
             --remote_download_all \
             "${BAZEL_REPORT_TARGET}"
 
-          bazel --host_jvm_args=-Xmx3g \
+          bazel \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             aquery \
             --config=path-mapping \
@@ -308,9 +306,15 @@ jobs:
           - batch: linux-6.18-rust-x86_64
             title: Linux 6.18 Rust x86_64
             targets: "//:linux_6_18_39_rust_module_test"
+          - batch: linux-6.18-rust-aarch64
+            title: Linux 6.18 Rust aarch64
+            targets: "//:linux_6_18_39_aarch64_rust_module_test"
           - batch: linux-6.12-rust-x86_64
             title: Linux 6.12 Rust x86_64
             targets: "//:linux_6_12_96_rust_module_test"
+          - batch: linux-6.12-rust-aarch64
+            title: Linux 6.12 Rust aarch64
+            targets: "//:linux_6_12_96_aarch64_rust_module_test"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -337,8 +341,7 @@ jobs:
         run: |
           set -euo pipefail
           read -r -a targets <<<"${BAZEL_TARGETS}"
-          bazel --host_jvm_args=-Xmx3g \
-            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+          bazel --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test "${targets[@]}" \
             --config=path-mapping \
             --build_event_json_file="${BAZEL_BEP}" \
@@ -371,17 +374,9 @@ jobs:
           retention-days: 14
 
   aya-e2e:
-    name: Aya eBPF VM (${{ matrix.arch }})
+    name: Aya eBPF VMs
     runs-on: ubuntu-latest
     timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: aarch64
-            target: "@aya//test/integration-test:vm_aarch64"
-          - arch: x86_64
-            target: "@aya//test/integration-test:vm_x86_64"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -390,7 +385,7 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-aya-e2e-${{ matrix.arch }}
+          disk-cache: ${{ github.workflow }}-aya-e2e
           module-root: aya_e2e
           repository-cache: |
             - aya_e2e/.bazelversion
@@ -402,14 +397,15 @@ jobs:
       - name: Run Aya integration VMs
         working-directory: aya_e2e
         env:
-          BAZEL_BEP: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.log
-          BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/aya-e2e.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/aya-e2e.log
+          BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e.profile.gz
         run: |
           set -o pipefail
-          bazel --host_jvm_args=-Xmx3g \
-            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-            test '${{ matrix.target }}' \
+          bazel --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            test \
+            '@aya//test/integration-test:vm_aarch64' \
+            '@aya//test/integration-test:vm_x86_64' \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -417,12 +413,12 @@ jobs:
       - name: Report cache efficiency
         if: ${{ !cancelled() }}
         env:
-          BAZEL_BEP: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.log
-          BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/aya-e2e.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/aya-e2e.log
+          BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e.profile.gz
         run: |
           .github/workflows/bazel_cache_report.sh \
-            "Aya eBPF VM (${{ matrix.arch }})" \
+            "Aya eBPF VMs" \
             "${BAZEL_PROFILE}" \
             "${BAZEL_BEP}" \
             "${BAZEL_LOG}"
@@ -431,10 +427,10 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: bazel-profile-aya-e2e-${{ matrix.arch }}
+          name: bazel-profile-aya-e2e
           path: |
-            ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.profile.gz
-            ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.bep.json
-            ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.log
+            ${{ runner.temp }}/aya-e2e.profile.gz
+            ${{ runner.temp }}/aya-e2e.bep.json
+            ${{ runner.temp }}/aya-e2e.log
           if-no-files-found: warn
           retention-days: 14

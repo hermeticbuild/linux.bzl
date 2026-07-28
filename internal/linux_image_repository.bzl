@@ -82,6 +82,61 @@ _PROBE_VALUES = {
 _REPOSITORY_GENERATOR_PROTOCOL = "compact-v3-rust-profile"
 _LLVM_VERSION = "22.1.8"
 
+def _linux_version_code(version):
+    parts = version.split(".")
+    if len(parts) != 3:
+        fail("expected semantic tool version MAJOR.MINOR.PATCH, got %r" % version)
+    numbers = []
+    for part in parts:
+        if not part:
+            fail("expected numeric semantic tool version, got %r" % version)
+        for character in part.elems():
+            if character < "0" or character > "9":
+                fail("expected numeric semantic tool version, got %r" % version)
+        numbers.append(int(part))
+    if numbers[1] > 999 or numbers[2] > 99:
+        fail("tool version cannot be represented by Linux: %r" % version)
+    return numbers[0] * 100000 + numbers[1] * 100 + numbers[2]
+
+def _minimum_tool_version(content, tool):
+    in_tool = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not in_tool:
+            if stripped == tool + ")":
+                in_tool = True
+            continue
+        if stripped == ";;":
+            break
+        if not stripped.startswith("echo "):
+            continue
+        version = stripped[len("echo "):].strip()
+        if (
+            len(version) >= 2 and
+            version[0] in ['"', "'"] and
+            version[-1] == version[0]
+        ):
+            version = version[1:-1]
+        _linux_version_code(version)
+        return version
+    fail("scripts/min-tool-version.sh does not declare a literal %s minimum" % tool)
+
+def _is_rust_toolchain_config(key):
+    return key in [
+        "CONFIG_RUSTC_VERSION",
+        "CONFIG_RUSTC_LLVM_VERSION",
+        "CONFIG_RUSTC_VERSION_TEXT",
+        "CONFIG_RUST_IS_AVAILABLE",
+        "CONFIG_HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC",
+    ] or key.startswith("CONFIG_RUSTC_HAS_")
+
+def _without_rust_toolchain_config(config):
+    return {
+        key: value
+        for key, value in config.items()
+        if not _is_rust_toolchain_config(key)
+    }
+
 def _linux_image_impl(rctx):
     source = rctx.attr.source
     if source.name != "Kconfig" or source.package != "":
@@ -100,6 +155,10 @@ def _linux_image_impl(rctx):
             ".linux-bzl-source.json marker",
         )
     version = _linux_makefile_version(rctx.read(makefile))
+    minimum_rustc_version = _minimum_tool_version(
+        rctx.read(source_root.get_child("scripts/min-tool-version.sh")),
+        "rustc",
+    )
     source_metadata = json.decode(rctx.read(marker))
     source_integrity = source_metadata.get("integrity", "") if type(source_metadata) == "dict" else ""
     if (
@@ -132,11 +191,13 @@ def _linux_image_impl(rctx):
         name = arch,
         raw = base_input,
         config_mode = rctx.attr.config_mode,
+        minimum_rustc_version = minimum_rustc_version,
     )
     if _config_arch(base, "resolved base config") != arch:
         fail("Kconfig resolution changed the selected Linux architecture")
     validate_config_features(base, "resolved base config")
     _validate_image_compression(base, arch, "resolved base config")
+    base = _without_rust_toolchain_config(base)
 
     configs = {
         arch: base,
@@ -166,11 +227,13 @@ def _linux_image_impl(rctx):
             name = name,
             raw = merged,
             config_mode = rctx.attr.config_mode,
+            minimum_rustc_version = minimum_rustc_version,
         )
         if _config_arch(resolved, "resolved overlay %s" % name) != arch:
             fail("Kconfig resolution changed the architecture for overlay %s" % name)
         validate_config_features(resolved, "resolved overlay %s" % name)
         _validate_image_compression(resolved, arch, "resolved overlay %s" % name)
+        resolved = _without_rust_toolchain_config(resolved)
         sanitized = _sanitize_target_name(name)
         if sanitized in sanitized_names:
             fail(
@@ -206,6 +269,7 @@ def _linux_image_impl(rctx):
         source_config = "//:_base_config",
         target_prefix = "_base",
         rules_repo = rules_repo,
+        minimum_rustc_version = minimum_rustc_version,
     )
     for name in sorted(variant_configs.keys()):
         _generate_config_graph(
@@ -221,6 +285,7 @@ def _linux_image_impl(rctx):
             source_config = "//:_variant_%s_config" % name,
             target_prefix = "_variant_%s" % name,
             rules_repo = rules_repo,
+            minimum_rustc_version = minimum_rustc_version,
         )
     rctx.delete(".linux_bzl_tools")
     rctx.delete(".linux_bzl_resolve")
@@ -233,6 +298,7 @@ def _linux_image_impl(rctx):
             arch = arch,
             version = version,
             source_repo = source_repo,
+            minimum_rustc_version = minimum_rustc_version,
             rust_profile_json = rust_profile_json,
             platform = platform,
             base_config = "//configs:%s" % arch,
@@ -263,7 +329,8 @@ def _linux_image_impl(rctx):
             "architecture": arch,
             "protocol": _REPOSITORY_GENERATOR_PROTOCOL,
             "rust_enabled": base_rust_enabled,
-            "rust_profile_schema": "linux-rust-profile-v1" if rust_profile_json else "",
+            "rust_profile_schema": "linux-rust-profile-v2" if rust_profile_json else "",
+            "minimum_rustc_version": minimum_rustc_version,
             "tool_version": KCONFIG_TOOL_VERSION,
             "variant_rust_enabled": variant_rust_enabled,
             "version": version,
@@ -366,7 +433,7 @@ def _parse_config(content, description):
         _set_config_value(values, key, value, description, line_number + 1)
     return values
 
-def _resolve_config(rctx, tool, source_root, arch, version, name, raw, config_mode):
+def _resolve_config(rctx, tool, source_root, arch, version, name, raw, config_mode, minimum_rustc_version):
     descriptor = _ARCHITECTURES[arch]
     directory = ".linux_bzl_resolve/" + name
     input_path = directory + "/input.config"
@@ -415,7 +482,7 @@ def _resolve_config(rctx, tool, source_root, arch, version, name, raw, config_mo
         "-linux_probe_model",
         "linux_llvm",
     ]
-    _add_generator_variables(args, descriptor)
+    _add_generator_variables(args, descriptor, minimum_rustc_version)
     result = rctx.execute(
         args,
         environment = {
@@ -633,8 +700,8 @@ def _generate_rust_profile(rctx, tool, source_root, descriptor):
     profile = json.decode(content)
     if (
         type(profile) != "dict" or
-        profile.get("schema") != "linux-rust-profile-v1" or
-        profile.get("architecture") != "x86_64"
+        profile.get("schema") != "linux-rust-profile-v2" or
+        profile.get("architecture") != descriptor.uts_machine
     ):
         fail("Linux graph generator emitted an invalid Rust profile")
     rctx.delete(output)
@@ -652,7 +719,8 @@ def _generate_config_graph(
         graph_dir,
         source_config,
         target_prefix,
-        rules_repo):
+        rules_repo,
+        minimum_rustc_version):
     _initialize_generator_outputs(rctx, graph_dir)
     descriptor = _ARCHITECTURES[arch]
     source_package = str(source).rsplit(":", 1)[0]
@@ -711,18 +779,14 @@ def _generate_config_graph(
         "-visibility",
         "//:__subpackages__",
     ]
-    if arch == "aarch64":
-        args.extend([
-            "-source_relacheck",
-            "//:%s_relacheck_tool" % target_prefix,
-        ])
+    args.extend(_graph_arch_tool_args(arch, target_prefix))
     args.extend(_graph_config_args(
         config_name,
         rctx.path(config_path),
         config_mode,
     ))
 
-    _add_generator_variables(args, descriptor)
+    _add_generator_variables(args, descriptor, minimum_rustc_version)
 
     result = rctx.execute(
         args,
@@ -750,10 +814,24 @@ def _graph_config_args(config_name, config_path, config_mode):
         config_mode,
     ]
 
-def _add_generator_variables(args, descriptor):
+def _graph_arch_tool_args(arch, target_prefix):
+    if arch == "x86_64":
+        return [
+            "-source_objtool",
+            "//:%s_x86_objtool" % target_prefix,
+        ]
+    if arch == "aarch64":
+        return [
+            "-source_relacheck",
+            "//:%s_relacheck_tool" % target_prefix,
+        ]
+    return []
+
+def _add_generator_variables(args, descriptor, minimum_rustc_version):
     variables = dict(descriptor.compact_vars)
     variables.update({
         "ARCH": descriptor.arch,
+        "RUSTC_VERSION_TEXT": "rustc " + minimum_rustc_version,
         "SRCARCH": descriptor.srcarch,
         "UTS_MACHINE": descriptor.uts_machine,
     })
@@ -764,8 +842,10 @@ def _add_generator_variables(args, descriptor):
     probe_env["SRCARCH"] = descriptor.srcarch
     for key in sorted(probe_env.keys()):
         args.extend(["-env", "%s=%s" % (key, probe_env[key])])
-    for key in sorted(_PROBE_VALUES.keys()):
-        args.extend(["-linux_probe_value", "%s=%s" % (key, _PROBE_VALUES[key])])
+    probe_values = dict(_PROBE_VALUES)
+    probe_values["rustc_version"] = str(_linux_version_code(minimum_rustc_version))
+    for key in sorted(probe_values.keys()):
+        args.extend(["-linux_probe_value", "%s=%s" % (key, probe_values[key])])
 
 def _validate_generated_metadata(rctx, graph_dir, config_name, source_root):
     metadata = json.decode(rctx.read(graph_dir + "/metadata.json"))
@@ -850,6 +930,7 @@ def _kernel_root_build(
         arch,
         version,
         source_repo,
+        minimum_rustc_version,
         rust_profile_json,
         platform,
         base_config,
@@ -869,6 +950,7 @@ linux_image_targets(
     arch = {arch},
     version = {version},
     source_repo = {source_repo},
+    minimum_rustc_version = {minimum_rustc_version},
     rust_profile_json = {rust_profile_json},
     platform = {platform},
     base_config = {base_config},
@@ -883,6 +965,7 @@ linux_image_targets(
         arch = repr(arch),
         version = repr(version),
         source_repo = repr(source_repo),
+        minimum_rustc_version = repr(minimum_rustc_version),
         rust_profile_json = repr(rust_profile_json),
         platform = repr(platform),
         base_config = repr(base_config),
@@ -896,9 +979,11 @@ linux_image_targets(
     )
 
 repositories_test_helpers = struct(
+    graph_arch_tool_args = _graph_arch_tool_args,
     graph_config_args = _graph_config_args,
     generator_protocol = _REPOSITORY_GENERATOR_PROTOCOL,
     kernel_root_build = _kernel_root_build,
+    without_rust_toolchain_config = _without_rust_toolchain_config,
 )
 
 def _variant_build(arch, graph, platform, rules_repo):

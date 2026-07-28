@@ -15,26 +15,63 @@ func main() {
 	config := flag.String("config", "", "resolved Linux .config")
 	objtool := flag.String("objtool", "", "objtool executable")
 	in := flag.String("in", "", "input vmlinux.o")
-	mode := flag.String("mode", "vmlinux", "objtool mode: builtin, module, or vmlinux")
+	mode := flag.String("mode", "vmlinux", "objtool mode: builtin, builtin-always, module, module-member, module-single, or vmlinux")
 	out := flag.String("out", "", "output vmlinux.o")
+	configValues := configValueFlag{}
+	extraArgs := stringValueFlag{}
+	force := flag.Bool("force", false, "Run builtin objtool even when normal translation-unit processing is delayed")
+	flag.Var(&configValues, "config_value", "Effective CONFIG_* override in KEY=VALUE form. May be repeated")
+	flag.Var(&extraArgs, "objtool_arg", "Additional Kbuild-derived objtool argument. May be repeated")
 	flag.Parse()
 
 	if *config == "" || *objtool == "" || *in == "" || *out == "" {
 		fmt.Fprintln(os.Stderr, "-config, -objtool, -in, and -out are required")
 		os.Exit(2)
 	}
-	if err := run(*config, *objtool, *in, *out, *mode); err != nil {
+	if err := run(*config, *objtool, *in, *out, *mode, configValues, *force, extraArgs); err != nil {
 		fmt.Fprintf(os.Stderr, "objtoolrun: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(configPath, objtoolPath, inPath, outPath, mode string) error {
+type configValueFlag map[string]string
+
+func (values *configValueFlag) Set(raw string) error {
+	key, value, ok := strings.Cut(raw, "=")
+	if !ok || key == "" {
+		return fmt.Errorf("expected KEY=VALUE, got %q", raw)
+	}
+	if *values == nil {
+		*values = configValueFlag{}
+	}
+	(*values)[key] = value
+	return nil
+}
+
+func (values *configValueFlag) String() string {
+	return ""
+}
+
+type stringValueFlag []string
+
+func (values *stringValueFlag) Set(value string) error {
+	*values = append(*values, value)
+	return nil
+}
+
+func (values *stringValueFlag) String() string {
+	return strings.Join(*values, " ")
+}
+
+func run(configPath, objtoolPath, inPath, outPath, mode string, configValues map[string]string, force bool, extraArgs []string) error {
 	config, err := readConfig(configPath)
 	if err != nil {
 		return err
 	}
-	args, enabled, err := objtoolArgs(config, mode)
+	for key, value := range configValues {
+		config[key] = value
+	}
+	args, enabled, err := objtoolArgsWithOptions(config, mode, force, extraArgs)
 	if err != nil {
 		return err
 	}
@@ -80,38 +117,65 @@ func readConfig(path string) (map[string]string, error) {
 }
 
 func objtoolArgs(config map[string]string, mode string) ([]string, bool, error) {
+	return objtoolArgsWithOptions(config, mode, false, nil)
+}
+
+func objtoolArgsWithOptions(config map[string]string, mode string, force bool, extraArgs []string) ([]string, bool, error) {
 	if !enabled(config, "CONFIG_OBJTOOL") {
 		return nil, false, nil
 	}
 
 	delayObjtool := enabled(config, "CONFIG_LTO_CLANG") || enabled(config, "CONFIG_X86_KERNEL_IBT")
-	mcountObjtool := enabled(config, "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL")
 	noinstrValidation := enabled(config, "CONFIG_NOINSTR_VALIDATION")
 	switch mode {
 	case "builtin":
-		if delayObjtool {
+		if delayObjtool && !force {
 			return nil, false, nil
 		}
-		return commonObjtoolArgs(config), true, nil
-	case "module":
+		args := []string{}
+		if !delayObjtool {
+			args = commonObjtoolArgs(config)
+		}
+		args = append(args, extraArgs...)
+		return args, true, nil
+	case "builtin-always":
 		args := commonObjtoolArgs(config)
 		if delayObjtool {
 			args = append(args, "--link")
 		}
+		args = append(args, extraArgs...)
+		return args, true, nil
+	case "module", "module-single":
+		args := commonObjtoolArgs(config)
+		if delayObjtool {
+			args = append(args, "--link")
+		}
+		args = append(args, extraArgs...)
+		args = append(args, "--module")
+		return args, true, nil
+	case "module-member":
+		if delayObjtool && !force {
+			return nil, false, nil
+		}
+		args := []string{}
+		if !delayObjtool {
+			args = commonObjtoolArgs(config)
+		} else if len(extraArgs) == 0 {
+			args = commonObjtoolArgs(config)
+			args = append(args, "--link")
+		}
+		args = append(args, extraArgs...)
 		args = append(args, "--module")
 		return args, true, nil
 	case "vmlinux":
-		if !delayObjtool && !mcountObjtool && !noinstrValidation {
+		if !delayObjtool && !noinstrValidation {
 			return nil, false, nil
 		}
 		args := []string{}
 		if delayObjtool {
 			args = commonObjtoolArgs(config)
-		} else {
-			args = append(args, mcountObjtoolArgs(config)...)
-			if enabled(config, "CONFIG_OBJTOOL_WERROR") {
-				args = append(args, "--Werror")
-			}
+		} else if enabled(config, "CONFIG_OBJTOOL_WERROR") {
+			args = append(args, "--Werror")
 		}
 		if noinstrValidation {
 			args = append(args, "--noinstr")

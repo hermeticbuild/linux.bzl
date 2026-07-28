@@ -171,7 +171,40 @@ are fixed to reproducible values.
 
 `linux_module(name, kernel, srcs, crate_root = None, deps = [])` builds one
 out-of-tree Rust-for-Linux loadable module. It is a normal BUILD rule loaded
-from the same root entry point:
+from the same root entry point.
+
+Rust-enabled kernels use the standard rules_rs/rules_rust toolchain registered
+by the consumer. `linux.bzl` does not select or register a production Rust
+toolchain, and C-only kernels do not require one:
+
+```starlark
+# MODULE.bazel
+bazel_dep(name = "rules_rs", version = "0.0.98")
+
+rust_toolchains = use_extension(
+    "@rules_rs//rs/toolchains:module_extension.bzl",
+    "toolchains",
+)
+rust_toolchains.toolchain(
+    version = "1.97.0",
+)
+use_repo(rust_toolchains, "default_rust_toolchains")
+
+register_toolchains("@default_rust_toolchains//:all")
+```
+
+The maintained kernels require at least Rust 1.78.0. A consumer may register
+any supported newer stable toolchain or a pinned nightly such as
+`version = "nightly/2026-06-24"`. The same rules_rs repository also registers
+the Rust-analyzer toolchain that exposes the matching `rustc_srcs`; omitting
+`rust_analyzer_version` keeps those sources on the compiler version.
+`linux.bzl` resolves both standard toolchain types, probes the selected rustc
+release and embedded LLVM version during actions, writes those exact values
+into the resolved kernel config, and applies source-derived version predicates.
+There is no separate checked-in Rust source archive or analysis-time compiler
+guess.
+
+Load the rule from the public entry point:
 
 ```starlark
 load("@linux.bzl", "linux_module")
@@ -192,12 +225,13 @@ built against the same configured kernel; cross-kernel dependencies are
 rejected.
 
 Rust-for-Linux support covers the cataloged Linux 6.12.x and 6.18.x kernels
-targeting x86_64. The repository generator derives each release's crate graph
-and flags from its kernel sources, while Bazel uses the exact stable Rust
-1.97.0 toolchain registered by `linux.bzl`. Unsupported architectures, symbol
-versioning, LTO/CFI, sanitizers, and Rust debug/BTF configurations fail during
-analysis with an explicit diagnostic. `MODULE_VERSION` and module `version=`
-or `srcversion=` metadata are not supported.
+targeting x86_64 and aarch64. The repository generator derives each release's
+crate graph, built-in or generated target specification, and compiler flags
+from its kernel sources. Full DWARF5 debug information, kernel BTF, and module
+BTF are supported together. DWARF4, toolchain-default/reduced/split/compressed
+debug information, symbol versioning, LTO/CFI, and sanitizers remain explicit
+errors. `MODULE_VERSION` and module `version=` or `srcversion=` metadata are
+not supported.
 
 The standalone end-to-end workspace compiles this path, boots the kernel under
 QEMU, inserts the resulting module, and checks its load marker:
@@ -205,7 +239,9 @@ QEMU, inserts the resulting module, and checks its load marker:
 ```sh
 cd e2e
 bazel test //:linux_6_12_96_rust_module_test \
+  //:linux_6_12_96_aarch64_rust_module_test \
   //:linux_6_18_39_rust_module_test \
+  //:linux_6_18_39_aarch64_rust_module_test \
   --test_output=streamed
 ```
 
@@ -248,8 +284,8 @@ graph rejects a non-Clang C/C++ toolchain.
 | Config variants | Base fragment plus named overlay fragments |
 | Initramfs | Deterministic root-owned `newc` archives |
 | In-tree modules | Loadable `.ko` files plus Kbuild module metadata |
-| Out-of-tree modules | Rust-for-Linux `.ko` files on cataloged x86_64 kernels through `linux_module` |
-| Kernel BPF/BTF | BPF syscall configurations and BTF-enabled `vmlinux` |
+| Out-of-tree modules | Rust-for-Linux `.ko` files on cataloged x86_64 and aarch64 kernels through `linux_module` |
+| Kernel BPF/BTF | BPF syscall configurations, BTF-enabled `vmlinux`, and module BTF with Rust+DWARF5 kernels |
 | VM verification | Hermetic QEMU boots with initramfs and module-load checks |
 
 The two LTS lines are the maintained compatibility catalog. Other
@@ -515,22 +551,23 @@ bazel test //:kernel_outputs_aarch64_build_test \
   //:linux_6_18_39_aarch64_module_test
 bazel shutdown
 bazel test //:linux_6_12_96_rust_module_test \
-  //:linux_6_18_39_rust_module_test
+  //:linux_6_12_96_aarch64_rust_module_test \
+  //:linux_6_18_39_rust_module_test \
+  //:linux_6_18_39_aarch64_rust_module_test
 bazel shutdown
 
 cd ../aya_e2e
-bazel test @aya//test/integration-test:vm_x86_64
-bazel shutdown
-bazel test @aya//test/integration-test:vm_aarch64
+bazel test @aya//test/integration-test:vm_aarch64 \
+  @aya//test/integration-test:vm_x86_64
 ```
 
 The e2e commands boot maintained kernels with a deterministic initramfs under
 hermetic QEMU, verify configured module loading, and keep each configured
-kernel graph in a fresh Bazel server to bound peak analysis memory. The final
-two commands apply the same isolation to Aya's x86_64 and aarch64 eBPF
-integration VMs. These are separate Bzlmod roots because Aya pins a nightly
-Rust toolchain, while Rust-for-Linux modules use the stable toolchain registered
-by `linux.bzl`.
+kernel graph in a fresh Bazel server to bound peak analysis memory. Aya's
+x86_64 and aarch64 VMs intentionally run in one Bazel invocation so CI can
+measure shared action-cache behavior and deduplication in one profile. These
+are separate Bzlmod roots because each consumer owns its Rust toolchain: the
+e2e workspace registers stable Rust 1.97.0, while Aya keeps its pinned nightly.
 
 ## Development
 

@@ -1,0 +1,13 @@
+mainmenu "linux.bzl resolved config test"
+
+config 64BIT
+	bool
+	default y
+
+config RUST
+	bool "Rust support"
+	default n
+
+config RUSTC_VERSION
+	int
+	default 107800

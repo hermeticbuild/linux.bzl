@@ -1,84 +1,59 @@
 diff --git a/MODULE.bazel b/MODULE.bazel
-index 00d93a2..e591333 100644
+index 2ae24cd..c5a560c 100644
 --- a/MODULE.bazel
 +++ b/MODULE.bazel
-@@ -33,14 +33,7 @@
- bazel_lib_toolchains.copy_to_directory()
- use_repo(bazel_lib_toolchains, "copy_to_directory_toolchains")
+@@ -13,14 +13,14 @@ bazel_dep(name = "linux.bzl", version = "0.0.0")
+ bazel_dep(name = "libbpf", version = "1.7.0")
  
--# Pin the linux.bzl revision that provides the deterministic C initramfs rule.
--archive_override(
--    module_name = "linux.bzl",
--    integrity = "sha256-2gveHVEG4EE5x3N4kDnUftB7ed/6RRFslFwDquObqRg=",
--    strip_prefix = "linux.bzl-e18628f3e177022c2ff0cf93a2e5f2d408f7d2fc",
--    urls = ["https://github.com/hermeticbuild/linux.bzl/archive/e18628f3e177022c2ff0cf93a2e5f2d408f7d2fc.tar.gz"],
--)
+ # The LLVM toolchain compiles C BPF objects and the integration VM kernels.
+-bazel_dep(name = "llvm", version = "0.8.9")
++bazel_dep(name = "llvm", version = "0.8.14")
  
- # @rules_rs creates @rules_rust here; generated BUILD files and .bazelrc labels
- # reference @rules_rust directly.
- rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
-@@ -50,10 +50,11 @@
- # core_intrinsics, so the hermetic Rust toolchain must be a pinned nightly.
- toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
- toolchains.toolchain(
-+    name = "aya_rust_toolchains",
-     edition = "2024",
-     version = "nightly/2026-06-24",
- )
--use_repo(toolchains, "default_rust_toolchains")
-+use_repo(toolchains, "aya_rust_toolchains")
+ # CONFIG_DEBUG_INFO_BTF requires pahole when linking the integration VM kernels.
+ bazel_dep(name = "pahole", version = "1.31")
+ bazel_dep(name = "platforms", version = "1.1.0")
+-bazel_dep(name = "rules_cc", version = "0.2.19")
++bazel_dep(name = "rules_cc", version = "0.2.20")
+ bazel_dep(name = "rules_qemu", version = "0.3.0")
+ bazel_dep(name = "rules_rs", version = "0.0.93")
  
- # Each qemu-system toolchain is compatible with the corresponding
- # //bazel:bpf_target_arch value. bazel/vm.bzl transitions that value for each
-@@ -74,7 +75,7 @@
+ # with_cfg.bzl applies the BPF target settings to Rust and C BPF targets.
+ bazel_dep(name = "with_cfg.bzl", version = "0.14.6")
+@@ -125,55 +133,36 @@ use_repo(crate, "crates")
  
- register_toolchains(
-     "@copy_to_directory_toolchains//:all",
--    "@default_rust_toolchains//:all",
-+    "@aya_rust_toolchains//:all",
-     "@llvm//toolchain:all",
-     "@qemu_system_toolchains//:all",
- )
-@@ -126,54 +126,34 @@ use_repo(crate, "crates")
  # Use one integrity-pinned Linux source archive for both integration VM
  # architectures.
 -linux_kernel = use_extension("@linux.bzl//:linux.bzl", "linux_kernel")
 -linux_kernel.archive(
+-    name = "aya_linux_6_18_2",
+-    integrity = "sha256-VYxrurdJSSs0+Zgn/oB7ADmnRGk8IdOn4Ds6SO2quWo=",
+-    strip_prefix = "linux-6.18.2",
+-    urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.2.tar.xz"],
 +linux_source_repository = use_repo_rule(
-+    "@linux.bzl//:linux.bzl",
++    "@linux.bzl",
 +    "linux_source_repository",
-+)
-+linux_source_repository(
-     name = "aya_linux_6_18_2",
-     integrity = "sha256-VYxrurdJSSs0+Zgn/oB7ADmnRGk8IdOn4Ds6SO2quWo=",
-     strip_prefix = "linux-6.18.2",
-     urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.2.tar.xz"],
-+    version = "6.18.2",
  )
  
 -# Convert each requested Kconfig fragment into a KconfigInfo repository.
 -linux_kernel.kconfig(
 -    name = "aya_aarch64_kconfig",
-+linux_image = use_repo_rule(
-+    "@linux.bzl//:linux.bzl",
-+    "linux_image",
-+)
-+
-+linux_image(
-+    name = "aya_aarch64_kernel",
-     config = "//test/kernel:aya_aarch64.config",
-+    config_mode = "allnoconfig",
-+    platform = "@llvm//platforms:linux_arm64",
-+    source = "@aya_linux_6_18_2//:Kconfig",
+-    config = "//test/kernel:aya_aarch64.config",
++linux_source_repository(
++    name = "aya_linux_6_18_39",
++    integrity = "sha256-p6fj0q6dledBlyI6jU619r56rCG25t4n6WhdABwfjLA=",
++    strip_prefix = "linux-6.18.39",
++    urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.39.tar.xz"],
++    version = "6.18.39",
  )
 -linux_kernel.kconfig(
 -    name = "aya_x86_64_kconfig",
+-    config = "//test/kernel:aya_x86_64.config",
 +
-+linux_image(
-+    name = "aya_x86_64_kernel",
-     config = "//test/kernel:aya_x86_64.config",
--)
--
++linux_image = use_repo_rule(
++    "@linux.bzl",
++    "linux_image",
+ )
+ 
 -# Generate architecture-specific compact Kbuild metadata from
 -# aya_aarch64.config and aya_x86_64.config.
 -# linux.bzl encodes pahole 1.31 as "131" for the CONFIG_DEBUG_INFO_BTF probe;
@@ -87,7 +62,9 @@ index 00d93a2..e591333 100644
 -# derive pahole_version from the pahole toolchain.
 -linux_kernel.compact(
 -    name = "aya_aarch64_compact",
--    config = "//test/kernel:aya_aarch64.config",
++linux_image(
++    name = "aya_aarch64_kernel",
+     config = "//test/kernel:aya_aarch64.config",
      config_mode = "allnoconfig",
 -    config_name = "aarch64",
 -    kernel_name = "aya_kernel",
@@ -97,8 +74,14 @@ index 00d93a2..e591333 100644
 -)
 -linux_kernel.compact(
 -    name = "aya_x86_64_compact",
--    config = "//test/kernel:aya_x86_64.config",
--    config_mode = "allnoconfig",
++    platform = "@llvm//platforms:linux_arm64",
++    source = "@aya_linux_6_18_39//:Kconfig",
++)
++
++linux_image(
++    name = "aya_x86_64_kernel",
+     config = "//test/kernel:aya_x86_64.config",
+     config_mode = "allnoconfig",
 -    config_name = "x86_64",
 -    kernel_name = "aya_kernel",
 -    kernel_package = "test/kernel",
@@ -113,19 +96,102 @@ index 00d93a2..e591333 100644
 -    "aya_x86_64_compact",
 -    "aya_x86_64_kconfig",
 +    platform = "@llvm//platforms:linux_x86_64",
-+    source = "@aya_linux_6_18_2//:Kconfig",
++    source = "@aya_linux_6_18_39//:Kconfig",
  )
+diff --git a/bazel/rust.bzl b/bazel/rust.bzl
+index ae5ce15..70e09ba 100644
+--- a/bazel/rust.bzl
++++ b/bazel/rust.bzl
+@@ -136,7 +136,7 @@ def aya_rust_crate(
+                 deps = test_rule_deps,
+                 edition = "2024",
+                 rustc_env = rustc_env,
+-                rustc_flags = rustc_flags + ["--test"],
++                rustc_flags = rustc_flags + binary_rustc_flags + ["--test"],
+                 srcs = lib_srcs,
+             )
+         else:
+diff --git a/test/integration-test/BUILD.bazel b/test/integration-test/BUILD.bazel
+index 2c6326c..bc829f6 100644
+--- a/test/integration-test/BUILD.bazel
++++ b/test/integration-test/BUILD.bazel
+@@ -1,5 +1,5 @@
+ load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+-load("@linux.bzl//:linux.bzl", "initramfs")
++load("@linux.bzl", "initramfs")
+ load("//bazel:bpf.bzl", "aya_c_bpf_objects")
+ load("//bazel:rust.bzl", "aya_rust_crate")
+ load("//bazel:vm.bzl", "aya_qemu_vm_test")
+@@ -59,6 +59,10 @@ copy_to_directory(
+ 
+ aya_rust_crate(
+     name = "integration-test",
++    binary_rustc_flags = [
++        "--cfg=aya_bazel_vm_test",
++        "--check-cfg=cfg(aya_bazel_vm_test)",
++    ],
+     build_script = False,
+     compile_data = [":bpf_out_dir"],
+     rustc_env = {
+@@ -79,7 +83,8 @@ initramfs(
+     },
+     files = {
+         "/boot/config": "//test/kernel:aya_kernel_config",
+-        "/boot/System.map-6.18.2": "//test/kernel:aya_kernel_system_map",
++        "/boot/System.map-6.18.39": "//test/kernel:aya_kernel_system_map",
++        "/aya_rust_btf.ko": "//test/kernel:aya_rust_btf",
+     },
+ )
+ 
+diff --git a/test/integration-test/Cargo.toml b/test/integration-test/Cargo.toml
+index db1b4be..f487fa0 100644
+--- a/test/integration-test/Cargo.toml
++++ b/test/integration-test/Cargo.toml
+@@ -29,7 +29,7 @@ integration-common = { path = "../integration-common", features = ["user"] }
+ libbpf-rs = { workspace = true, features = ["static", "vendored"] }
+ libc = { workspace = true }
+ log = { workspace = true }
+-nix = { workspace = true, features = ["mount", "sched"] }
++nix = { workspace = true, features = ["kmod", "mount", "sched"] }
+ object = { workspace = true, features = ["elf", "read_core", "std"] }
+ procfs = { workspace = true, features = ["flate2"] }
+ rand = { workspace = true, features = ["thread_rng"] }
+diff --git a/test/integration-test/build.rs b/test/integration-test/build.rs
+index 89781e7..74ed1c7 100644
+--- a/test/integration-test/build.rs
++++ b/test/integration-test/build.rs
+@@ -30,6 +30,7 @@ use xtask::{AYA_BUILD_INTEGRATION_BPF, LIBBPF_DIR, exec, install_libbpf_headers_
+ /// runtime because the stubs are inadequate for actually running the tests.
+ fn main() -> Result<()> {
+     println!("cargo:rerun-if-env-changed={AYA_BUILD_INTEGRATION_BPF}");
++    println!("cargo::rustc-check-cfg=cfg(aya_bazel_vm_test)");
+ 
+     // TODO(https://github.com/rust-lang/cargo/issues/4001): generalize this and move it to
+     // aya-build if we can determine that we're in a check build.
+diff --git a/test/integration-test/src/tests.rs b/test/integration-test/src/tests.rs
+index 02aade9..be25ad1 100644
+--- a/test/integration-test/src/tests.rs
++++ b/test/integration-test/src/tests.rs
+@@ -57,6 +57,8 @@ mod raw_tracepoint;
+ mod rbpf;
+ mod relocations;
+ mod ring_buf;
++#[cfg(aya_bazel_vm_test)]
++mod rust_kernel_module;
+ mod sk_lookup;
+ mod sk_reuseport;
+ mod sk_storage;
 diff --git a/test/kernel/BUILD.bazel b/test/kernel/BUILD.bazel
-index a8349f2..f645fd1 100644
+index 30608c9..0d7e1d9 100644
 --- a/test/kernel/BUILD.bazel
 +++ b/test/kernel/BUILD.bazel
-@@ -1,46 +1,30 @@
+@@ -1,4 +1,4 @@
 -load("@linux.bzl//:linux.bzl", "linux")
--
++load("@linux.bzl", "linux_module")
+ 
  package(default_visibility = ["//visibility:public"])
  
- exports_files([
-     "aya_aarch64.config",
+@@ -7,40 +7,35 @@ exports_files([
      "aya_x86_64.config",
  ])
  
@@ -135,7 +201,15 @@ index a8349f2..f645fd1 100644
 -
 -# MODULE.bazel declares this integrity-pinned Linux 6.18.2 repository.
 -_LINUX_SOURCE_REPOSITORY = "@aya_linux_6_18_2"
--
++linux_module(
++    name = "aya_rust_btf",
++    srcs = ["aya_rust_btf.rs"],
++    kernel = select({
++        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//:kernel",
++        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//:kernel",
++    }),
++)
+ 
 -linux(
 +alias(
      name = "aya_kernel",
@@ -180,3 +254,140 @@ index a8349f2..f645fd1 100644
 +        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//:system_map",
 +    }),
  )
+diff --git a/test/kernel/README.md b/test/kernel/README.md
+index 794c893..e6f08d0 100644
+--- a/test/kernel/README.md
++++ b/test/kernel/README.md
+@@ -1,9 +1,9 @@
+ # Integration VM kernel configuration
+ 
+ `aya_aarch64.config` and `aya_x86_64.config` are KCONFIG_ALLCONFIG request
+-fragments for the Linux 6.18.2 integration VM kernels declared in
++fragments for the Linux 6.18.39 integration VM kernels declared in
+ `MODULE.bazel`. `linux.bzl` resolves each fragment from `allnoconfig` with the
+-integrity-pinned Linux source archive and `pahole_version = "131"`.
++integrity-pinned Linux source archive.
+ 
+ The fragments contain requested values, not complete Linux `.config` files.
+ Linux Kconfig adds defaults and values derived through dependencies, `select`,
+@@ -11,30 +11,26 @@ and `imply`. Keep an assignment in a fragment when an integration VM requires
+ the value or when the assignment intentionally pins a Kconfig default. Do not
+ copy generated values from a resolved `.config` into a fragment.
+ 
++Both fragments enable Rust and module BTF. The integration initramfs includes a
++Rust-for-Linux module and the test binary verifies that loading it publishes
++the module's BTF under `/sys/kernel/btf`.
++
+ ## Reproduce the resolved configurations
+ 
+ From the repository root, resolve the aarch64 fragment with:
+ 
+ ```console
+ $ bazel build --lockfile_mode=error \
+-    --platforms=@rules_rs//rs/platforms:aarch64-unknown-linux-musl \
+-    //test/kernel:aya_kernel_aarch64_config
++    @aya_aarch64_kernel//:config
+ ```
+ 
+-The resolved configuration is
+-`bazel-bin/test/kernel/aya_kernel_aarch64_config.config_tree/.config`.
+-
+ Resolve the x86_64 fragment with:
+ 
+ ```console
+ $ bazel build --lockfile_mode=error \
+-    --platforms=@rules_rs//rs/platforms:x86_64-unknown-linux-musl \
+-    //test/kernel:aya_kernel_x86_64_config
++    @aya_x86_64_kernel//:config
+ ```
+ 
+-The resolved configuration is
+-`bazel-bin/test/kernel/aya_kernel_x86_64_config.config_tree/.config`.
+-
+ After changing either fragment, rebuild both resolved configurations and run:
+ 
+ ```console
+diff --git a/test/kernel/aya_aarch64.config b/test/kernel/aya_aarch64.config
+index d3936c5..52c6e70 100644
+--- a/test/kernel/aya_aarch64.config
++++ b/test/kernel/aya_aarch64.config
+@@ -25,6 +25,7 @@ CONFIG_DEBUG_KERNEL = y
+ CONFIG_DEBUG_FS = y
+ CONFIG_DEBUG_INFO = y
+ CONFIG_DEBUG_INFO_BTF = y
++CONFIG_DEBUG_INFO_BTF_MODULES = y
+ CONFIG_DEBUG_INFO_DWARF5 = y
+ CONFIG_FHANDLE = y
+ CONFIG_KALLSYMS = y
+@@ -97,6 +98,7 @@ CONFIG_UPROBES = y
+ CONFIG_UPROBE_EVENTS = y
+ 
+ # Module core support provides modprobe_path and /proc/sys/kernel/modprobe.
+-# The initrd still keeps modules empty unless a test provides them explicitly.
++# The integration initrd supplies only the explicit Rust BTF fixture module.
+ CONFIG_MODULES = y
+ CONFIG_MODPROBE_PATH = "/sbin/modprobe"
++CONFIG_RUST = y
+diff --git a/test/kernel/aya_x86_64.config b/test/kernel/aya_x86_64.config
+index 162a953..1ba8486 100644
+--- a/test/kernel/aya_x86_64.config
++++ b/test/kernel/aya_x86_64.config
+@@ -33,6 +33,7 @@ CONFIG_DEBUG_KERNEL = y
+ CONFIG_DEBUG_FS = y
+ CONFIG_DEBUG_INFO = y
+ CONFIG_DEBUG_INFO_BTF = y
++CONFIG_DEBUG_INFO_BTF_MODULES = y
+ CONFIG_DEBUG_INFO_DWARF5 = y
+ CONFIG_FHANDLE = y
+ CONFIG_KALLSYMS = y
+@@ -109,6 +110,7 @@ CONFIG_UPROBES = y
+ CONFIG_UPROBE_EVENTS = y
+ 
+ # Module core support provides modprobe_path and /proc/sys/kernel/modprobe.
+-# The initrd still keeps modules empty unless a test provides them explicitly.
++# The integration initrd supplies only the explicit Rust BTF fixture module.
+ CONFIG_MODULES = y
+ CONFIG_MODPROBE_PATH = "/sbin/modprobe"
++CONFIG_RUST = y
+diff --git a/test/integration-test/src/tests/rust_kernel_module.rs b/test/integration-test/src/tests/rust_kernel_module.rs
+new file mode 100644
+index 0000000..1ca67d7
+--- /dev/null
++++ b/test/integration-test/src/tests/rust_kernel_module.rs
+@@ -0,0 +1,10 @@
++use nix::kmod::init_module;
++
++#[test_log::test]
++fn rust_module_exposes_btf() {
++    let module = std::fs::read("/aya_rust_btf.ko").unwrap();
++    init_module(&module, c"").unwrap();
++
++    let btf = std::fs::read("/sys/kernel/btf/aya_rust_btf").unwrap();
++    assert!(!btf.is_empty());
++}
+diff --git a/test/kernel/aya_rust_btf.rs b/test/kernel/aya_rust_btf.rs
+new file mode 100644
+index 0000000..7970dc7
+--- /dev/null
++++ b/test/kernel/aya_rust_btf.rs
+@@ -0,0 +1,20 @@
++//! Rust-for-Linux and module BTF integration fixture.
++
++use kernel::prelude::*;
++
++module! {
++    type: AyaRustBtf,
++    name: "aya_rust_btf",
++    authors: ["Aya contributors"],
++    description: "Aya Rust-for-Linux BTF integration fixture",
++    license: "GPL",
++}
++
++struct AyaRustBtf;
++
++impl kernel::Module for AyaRustBtf {
++    fn init(_module: &'static ThisModule) -> Result<Self> {
++        pr_info!("Aya Rust-for-Linux BTF fixture loaded\n");
++        Ok(Self)
++    }
++}

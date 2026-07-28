@@ -7,7 +7,7 @@ import (
 )
 
 func TestObjtoolArgsDisabled(t *testing.T) {
-	for _, mode := range []string{"builtin", "module", "vmlinux"} {
+	for _, mode := range []string{"builtin", "builtin-always", "module", "module-member", "module-single", "vmlinux"} {
 		t.Run(mode, func(t *testing.T) {
 			args, run, err := objtoolArgs(map[string]string{}, mode)
 			if err != nil {
@@ -44,6 +44,47 @@ func TestObjtoolArgsBuiltin(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("forced_delayed_translation_unit", func(t *testing.T) {
+		config := commonArgsConfig()
+		config["CONFIG_X86_KERNEL_IBT"] = "y"
+		args, run, err := objtoolArgsWithOptions(config, "builtin", true, []string{"--noabs"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"--noabs"}
+		if !run || !reflect.DeepEqual(args, want) {
+			t.Fatalf("objtoolArgsWithOptions() = (%q, %t), want (%q, true)", args, run, want)
+		}
+	})
+}
+
+func TestObjtoolArgsBuiltinAlways(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		delayed bool
+	}{
+		{name: "translation_unit"},
+		{name: "delayed_link", delayed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := commonArgsConfig()
+			if tc.delayed {
+				config["CONFIG_X86_KERNEL_IBT"] = "y"
+			}
+			args, run, err := objtoolArgs(config, "builtin-always")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := commonArgs()
+			if tc.delayed {
+				want = append(commonArgsWithIBT(), "--link")
+			}
+			if !run || !reflect.DeepEqual(args, want) {
+				t.Fatalf("objtoolArgs() = (%q, %t), want (%q, true)", args, run, want)
+			}
+		})
+	}
 }
 
 func TestObjtoolArgsModule(t *testing.T) {
@@ -76,6 +117,58 @@ func TestObjtoolArgsModule(t *testing.T) {
 	}
 }
 
+func TestObjtoolArgsModuleMember(t *testing.T) {
+	t.Run("translation_unit", func(t *testing.T) {
+		config := commonArgsConfig()
+		args, run, err := objtoolArgs(config, "module-member")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := append(commonArgs(), "--module")
+		if !run || !reflect.DeepEqual(args, want) {
+			t.Fatalf("objtoolArgs() = (%q, %t), want (%q, true)", args, run, want)
+		}
+	})
+
+	t.Run("delayed", func(t *testing.T) {
+		config := commonArgsConfig()
+		config["CONFIG_LTO_CLANG"] = "y"
+		args, run, err := objtoolArgs(config, "module-member")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run || args != nil {
+			t.Fatalf("objtoolArgs() = (%q, %t), want (nil, false)", args, run)
+		}
+	})
+
+	t.Run("forced_delayed", func(t *testing.T) {
+		config := commonArgsConfig()
+		config["CONFIG_LTO_CLANG"] = "y"
+		args, run, err := objtoolArgsWithOptions(config, "module-member", true, []string{"--custom"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"--custom", "--module"}
+		if !run || !reflect.DeepEqual(args, want) {
+			t.Fatalf("objtoolArgsWithOptions() = (%q, %t), want (%q, true)", args, run, want)
+		}
+	})
+}
+
+func TestObjtoolArgsModuleSingleDelayed(t *testing.T) {
+	config := commonArgsConfig()
+	config["CONFIG_LTO_CLANG"] = "y"
+	args, run, err := objtoolArgs(config, "module-single")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(commonArgs(), "--link", "--module")
+	if !run || !reflect.DeepEqual(args, want) {
+		t.Fatalf("objtoolArgs() = (%q, %t), want (%q, true)", args, run, want)
+	}
+}
+
 func TestObjtoolArgsVmlinux(t *testing.T) {
 	t.Run("not_needed", func(t *testing.T) {
 		config := commonArgsConfig()
@@ -89,21 +182,19 @@ func TestObjtoolArgsVmlinux(t *testing.T) {
 		}
 	})
 
-	t.Run("mcount_without_delay", func(t *testing.T) {
+	t.Run("mcount_without_delay_already_processed", func(t *testing.T) {
 		config := commonArgsConfig()
 		args, run, err := objtoolArgs(config, "vmlinux")
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := []string{"--mcount", "--mnop", "--Werror", "--link"}
-		if !run || !reflect.DeepEqual(args, want) {
-			t.Fatalf("objtoolArgs() = (%q, %t), want (%q, true)", args, run, want)
+		if run || args != nil {
+			t.Fatalf("objtoolArgs() = (%q, %t), want (nil, false)", args, run)
 		}
 	})
 
 	t.Run("noinstr_without_delay", func(t *testing.T) {
 		config := commonArgsConfig()
-		delete(config, "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL")
 		config["CONFIG_NOINSTR_VALIDATION"] = "y"
 		config["CONFIG_MITIGATION_UNRET_ENTRY"] = "y"
 		args, run, err := objtoolArgs(config, "vmlinux")
@@ -130,6 +221,19 @@ func TestObjtoolArgsVmlinux(t *testing.T) {
 			t.Fatalf("objtoolArgs() = (%q, %t), want (%q, true)", args, run, want)
 		}
 	})
+}
+
+func TestConfigValueFlag(t *testing.T) {
+	values := configValueFlag{}
+	if err := values.Set("CONFIG_OBJTOOL=y"); err != nil {
+		t.Fatal(err)
+	}
+	if got := values["CONFIG_OBJTOOL"]; got != "y" {
+		t.Fatalf("CONFIG_OBJTOOL = %q, want y", got)
+	}
+	if err := values.Set("invalid"); err == nil {
+		t.Fatal("Set() accepted a value without '='")
+	}
 }
 
 func TestObjtoolArgsRejectsUnknownMode(t *testing.T) {

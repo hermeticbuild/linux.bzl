@@ -10,11 +10,11 @@ bazel_dep(name = "rules_rs", version = "0.0.98")
 
 archive_override(
     module_name = "aya",
-    integrity = "sha256-14eTTdmEA4dt2XJqlTGP0V9EiL8MvhJVGH1OhA2Iudo=",
+    integrity = "sha256-fSFEIuD1VE7ILcmda66J+au+TMNFsA5iXdJNoqMm2Jc=",
     patch_strip = 1,
     patches = ["//patches:aya_linux_bzl_api.patch"],
-    strip_prefix = "aya-412fe810cb9d933a3db42d7b427ad8290f969c3d",
-    urls = ["https://github.com/aya-rs/aya/archive/412fe810cb9d933a3db42d7b427ad8290f969c3d.tar.gz"],
+    strip_prefix = "aya-9e943b24ca2256eecce7db73de43c8d2b49c0c33",
+    urls = ["https://github.com/aya-rs/aya/archive/9e943b24ca2256eecce7db73de43c8d2b49c0c33.tar.gz"],
 )
 
 local_path_override(
@@ -25,14 +25,10 @@ local_path_override(
 rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
 use_repo(rules_rust, "rules_rust")
 
-aya_rust_toolchains = use_extension(
+toolchains = use_extension(
     "@rules_rs//rs/toolchains:module_extension.bzl",
     "toolchains",
 )
-use_repo(
-    aya_rust_toolchains,
-    "aya_rust_toolchains",
-    "default_rust_toolchains",
-)
+use_repo(toolchains, "default_rust_toolchains")
 
-register_toolchains("@aya_rust_toolchains//:all")
+register_toolchains("@default_rust_toolchains//:all")

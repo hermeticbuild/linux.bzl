@@ -17,6 +17,7 @@ load(":providers.bzl", "LinuxRustSdkInfo", "LinuxVmlinuxInfo")
 visibility("public")
 
 _PERL_TOOLCHAIN = "@rules_perl//perl:toolchain_type"
+_RUST_TOOLCHAIN_TYPE = Label("@rules_rust//rust:toolchain_type")
 
 LinuxCcContextInfo = provider(
     doc = "Linux-specific view of the configured Bazel C/C++ toolchain.",
@@ -44,6 +45,7 @@ LinuxConfigInfo = provider(
         "include_dir_anchor": "File-backed reference to include_dir for path-mapped actions.",
         "kernel_release": "include/config/kernel.release output.",
         "rustc_cfg": "include/generated/rustc_cfg output.",
+        "rustc_probe": "Action-generated JSON identity for the selected rustc, or None when Rust is disabled.",
     },
 )
 
@@ -56,7 +58,10 @@ LinuxObjectInfo = provider(
         "generated_include_dirs": "Include directories for generated headers exported by this object.",
         "generated_include_dir_anchors": "File-backed references to generated_include_dirs.",
         "mode": "Kbuild mode: y for built-in or m for module.",
+        "module_root_kind": "Empty for members/built-ins, or single/composite for an in-tree module root.",
         "object": "Object path relative to the kernel source tree.",
+        "objtool_args": "Kbuild target-specific objtool arguments carried to a delayed composite root.",
+        "objtool_force": "Whether Kbuild explicitly enables objtool for this object.",
         "output": "Object output file.",
         "source": "Source file short path.",
     },
@@ -2968,6 +2973,7 @@ def _linux_config_impl(ctx):
             include_dir_anchor = directory_anchor(autoconf_h, include_dir),
             kernel_release = kernel_release,
             rustc_cfg = rustc_cfg,
+            rustc_probe = None,
         ),
         OutputGroupInfo(config = depset([config])),
     ]
@@ -3015,7 +3021,35 @@ def _configure_linux_probe_env(allow_shell, env):
 def _linux_compiler_version_string():
     return "clang version 22.1.8None, LLD 22.1.8"
 
-def _linux_resolved_config_impl(ctx):
+def _materialize_rust_toolchain_probe(ctx):
+    target = ctx.toolchains[_RUST_TOOLCHAIN_TYPE]
+    host_target = ctx.attr._host_rust_toolchain
+    host = host_target[platform_common.ToolchainInfo]
+    out = ctx.actions.declare_file(ctx.label.name + ".rust_toolchain.json")
+    args = ctx.actions.args()
+    args.add("-rustc", target.rustc)
+    args.add("-host-rustc", host.rustc)
+    args.add("-out", out)
+    args.add("-minimum", ctx.attr.minimum_rustc_version)
+    for name in sorted(target.env.keys()):
+        args.add("-env", name + "=" + target.env[name])
+    for name in sorted(host.env.keys()):
+        args.add("-host-env", name + "=" + host.env[name])
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._rusttoolchainprobe,
+        inputs = depset(transitive = [
+            target.all_files,
+            host_target[DefaultInfo].files,
+        ]),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxRustToolchainProbe",
+        progress_message = "Validating selected target and host Rust toolchains %{label}",
+    )
+    return out
+
+def _resolve_linux_config(ctx, rust_toolchain_probe):
     config_dir = ctx.label.name + ".config_tree"
     config = ctx.actions.declare_file(config_dir + "/.config")
     auto_conf = ctx.actions.declare_file(config_dir + "/include/config/auto.conf")
@@ -3057,6 +3091,9 @@ def _linux_resolved_config_impl(ctx):
     args.add("-resolved_rustc_cfg_out", rustc_cfg)
     args.add("-resolved_kernel_release_out", kernel_release)
     args.add("-kernel_version", ctx.attr.version)
+    if rust_toolchain_probe:
+        args.add("-rust_toolchain_probe", rust_toolchain_probe)
+        args.add("-validate_config_equivalence")
     _add_linux_probe_args(args, ctx.attr.allow_shell, ctx.attr.probe_model, ctx.attr.probe_values)
     for key, value in sorted(vars.items()):
         args.add("-var", "%s=%s" % (key, value))
@@ -3064,6 +3101,8 @@ def _linux_resolved_config_impl(ctx):
         args.add("-env", "%s=%s" % (key, value))
 
     inputs = [ctx.file.root, fragment] + ctx.files.srcs + extra_kconfig_inputs
+    if rust_toolchain_probe:
+        inputs.append(rust_toolchain_probe)
     if ctx.file.source_root:
         inputs.append(ctx.file.source_root)
     path_mapped_run(
@@ -3111,77 +3150,125 @@ def _linux_resolved_config_impl(ctx):
             include_dir_anchor = directory_anchor(autoconf_h, include_dir),
             kernel_release = kernel_release,
             rustc_cfg = rustc_cfg,
+            rustc_probe = rust_toolchain_probe,
         ),
         OutputGroupInfo(config = depset([config])),
     ]
 
-linux_resolved_config = rule(
+def _linux_resolved_config_impl(ctx):
+    return _resolve_linux_config(ctx, None)
+
+def _linux_rust_resolved_config_impl(ctx):
+    return _resolve_linux_config(ctx, _materialize_rust_toolchain_probe(ctx))
+
+_LINUX_RESOLVED_CONFIG_ATTRS = {
+    "allow_shell": attr.bool(
+        default = True,
+        doc = "Allow deterministic $(shell,...) expansion while resolving Kconfig defaults.",
+    ),
+    "config": attr.label(
+        providers = [KconfigInfo],
+        mandatory = True,
+        doc = "Imported raw Linux .config fragment to resolve.",
+    ),
+    "config_name": attr.string(
+        doc = "Stable name passed to the Kconfig resolver. Defaults to the rule name.",
+    ),
+    "config_mode": attr.string(
+        default = "default",
+        doc = "Config resolver mode passed to kconfig_parse. Supported: default, allnoconfig.",
+        values = [
+            "default",
+            "allnoconfig",
+        ],
+    ),
+    "env": attr.string_dict(
+        doc = "Hermetic Kconfig preprocessor environment values.",
+    ),
+    "extra_kconfigs": attr.label_keyed_string_dict(
+        allow_files = True,
+        doc = "Map of extra Kconfig labels to virtual Linux source prefixes.",
+    ),
+    "probe_model": attr.string(
+        default = "linux_llvm",
+        doc = "Hermetic Linux Kconfig probe model used when allow_shell is set.",
+    ),
+    "probe_values": attr.string_dict(
+        doc = "Overrides for the selected Linux Kconfig probe model.",
+    ),
+    "root": attr.label(
+        allow_single_file = True,
+        mandatory = True,
+        doc = "Root Kconfig input.",
+    ),
+    "source_root": attr.label(
+        allow_single_file = True,
+        doc = "A file in the Linux source root; its directory is used as srctree.",
+    ),
+    "srcs": attr.label_list(
+        allow_files = True,
+        doc = "Additional Kconfig source files read through source statements.",
+    ),
+    "vars": attr.string_dict(
+        doc = "Kconfig preprocessor variables.",
+    ),
+    "version": attr.string(default = "6.18.2"),
+    "_kconfig_parse": attr.label(
+        cfg = "exec",
+        default = Label("//internal/cmd/kconfig_parse:kconfig_parse"),
+        executable = True,
+    ),
+    "_kernelflags": attr.label(
+        cfg = "exec",
+        default = Label("//internal/cmd/kernelflags:kernelflags"),
+        executable = True,
+    ),
+}
+
+_linux_resolved_config = rule(
     implementation = _linux_resolved_config_impl,
-    attrs = {
-        "allow_shell": attr.bool(
-            default = True,
-            doc = "Allow deterministic $(shell,...) expansion while resolving Kconfig defaults.",
-        ),
-        "config": attr.label(
-            providers = [KconfigInfo],
-            mandatory = True,
-            doc = "Imported raw Linux .config fragment to resolve.",
-        ),
-        "config_name": attr.string(
-            doc = "Stable name passed to the Kconfig resolver. Defaults to the rule name.",
-        ),
-        "config_mode": attr.string(
-            default = "default",
-            doc = "Config resolver mode passed to kconfig_parse. Supported: default, allnoconfig.",
-            values = [
-                "default",
-                "allnoconfig",
-            ],
-        ),
-        "env": attr.string_dict(
-            doc = "Hermetic Kconfig preprocessor environment values.",
-        ),
-        "extra_kconfigs": attr.label_keyed_string_dict(
-            allow_files = True,
-            doc = "Map of extra Kconfig labels to virtual Linux source prefixes.",
-        ),
-        "probe_model": attr.string(
-            default = "linux_llvm",
-            doc = "Hermetic Linux Kconfig probe model used when allow_shell is set.",
-        ),
-        "probe_values": attr.string_dict(
-            doc = "Overrides for the selected Linux Kconfig probe model.",
-        ),
-        "root": attr.label(
-            allow_single_file = True,
-            mandatory = True,
-            doc = "Root Kconfig input.",
-        ),
-        "source_root": attr.label(
-            allow_single_file = True,
-            doc = "A file in the Linux source root; its directory is used as srctree.",
-        ),
-        "srcs": attr.label_list(
-            allow_files = True,
-            doc = "Additional Kconfig source files read through source statements.",
-        ),
-        "vars": attr.string_dict(
-            doc = "Kconfig preprocessor variables.",
-        ),
-        "version": attr.string(default = "6.18.2"),
-        "_kconfig_parse": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/kconfig_parse:kconfig_parse"),
-            executable = True,
-        ),
-        "_kernelflags": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/kernelflags:kernelflags"),
-            executable = True,
-        ),
-    },
+    attrs = _LINUX_RESOLVED_CONFIG_ATTRS,
     doc = "Resolves an imported Linux .config fragment into Kbuild config outputs.",
 )
+
+_LINUX_RUST_RESOLVED_CONFIG_ATTRS = dict(_LINUX_RESOLVED_CONFIG_ATTRS)
+_LINUX_RUST_RESOLVED_CONFIG_ATTRS.update({
+    "minimum_rustc_version": attr.string(mandatory = True),
+    "_host_rust_toolchain": attr.label(
+        cfg = "exec",
+        default = Label("@rules_rust//rust/toolchain:current_rust_toolchain"),
+    ),
+    "_rusttoolchainprobe": attr.label(
+        cfg = "exec",
+        default = Label("//internal/cmd/rusttoolchainprobe"),
+        executable = True,
+    ),
+})
+
+_linux_rust_resolved_config = rule(
+    implementation = _linux_rust_resolved_config_impl,
+    attrs = _LINUX_RUST_RESOLVED_CONFIG_ATTRS,
+    toolchains = [_RUST_TOOLCHAIN_TYPE],
+    doc = "Resolves a Rust-enabled Linux config against the selected rules_rust toolchain.",
+)
+
+def linux_resolved_config(name, rust_enabled = False, minimum_rustc_version = "", **kwargs):
+    """Resolves an imported config without making C-only targets resolve Rust."""
+    if rust_enabled:
+        if not minimum_rustc_version:
+            fail("minimum_rustc_version is required when rust_enabled is true")
+        _linux_rust_resolved_config(
+            name = name,
+            minimum_rustc_version = minimum_rustc_version,
+            **kwargs
+        )
+    else:
+        if minimum_rustc_version:
+            fail("minimum_rustc_version is only valid when rust_enabled is true")
+        _linux_resolved_config(
+            name = name,
+            **kwargs
+        )
 
 def _linux_perl_runtime(ctx):
     perl_runtime = ctx.toolchains[_PERL_TOOLCHAIN].perl_runtime
@@ -3219,6 +3306,12 @@ def _linux_object_impl(ctx):
     base_flags = _linux_compile_flags(ctx, cc_toolchain, feature_configuration)
     config = ctx.attr.config[LinuxConfigInfo] if ctx.attr.config else None
     config_values = _make_config_values(config, ctx.attr.config_fragment)
+    if ctx.executable.objtool and not config:
+        fail("linux_object %s requires config when objtool is set" % ctx.label)
+    if ctx.attr.module_root and ctx.attr.mode != "m":
+        fail("linux_object %s marks a non-module object as a module root" % ctx.label)
+    if ctx.attr.module_root and not config:
+        fail("linux_object %s requires config when module_root is set" % ctx.label)
 
     out = ctx.actions.declare_file(ctx.label.name + ".o")
     cmd = ctx.actions.declare_file(ctx.label.name + ".cmd")
@@ -3227,9 +3320,31 @@ def _linux_object_impl(ctx):
     needs_relacheck = _linux_object_needs_relacheck(ctx.attr.object)
     if needs_relacheck and not ctx.executable.relacheck:
         fail("linux_object %s builds %s and requires relacheck" % (ctx.label, ctx.attr.object))
+    effective_config = {}
+    if config:
+        effective_config.update(config.config_flags)
+    effective_config.update(ctx.attr.config_fragment)
+    needs_module_lto_link = (
+        ctx.attr.mode == "m" and
+        effective_config.get("CONFIG_LTO_CLANG") == "y" and
+        not _is_assembly_source(ctx.file.src) and
+        not _linux_perlasm_kind(ctx.attr.object) and
+        not _is_dtb_source(ctx.file.src) and
+        (ctx.attr.module_root or (ctx.attr.objtool_force and ctx.executable.objtool))
+    )
     compile_out = out
     if objcopy_flags:
         compile_out = ctx.actions.declare_file(ctx.label.name + ".obj/" + compile_object)
+    elif ctx.executable.objtool or needs_module_lto_link:
+        compile_out = ctx.actions.declare_file(
+            ctx.label.name + ".obj/objtool-input/" + ctx.attr.object,
+        )
+    objtool_out = out
+    if ctx.executable.objtool:
+        if objcopy_flags:
+            objtool_out = ctx.actions.declare_file(
+                ctx.label.name + ".obj/objtool-output/" + compile_object,
+            )
     objcopy_out = out
     if objcopy_flags and needs_relacheck:
         objcopy_out = ctx.actions.declare_file(ctx.label.name + ".obj/" + ctx.attr.object)
@@ -3493,15 +3608,56 @@ def _linux_object_impl(ctx):
         progress_message = "Compiling Linux object %{label}",
     )
 
+    objtool_input = compile_out
+    if needs_module_lto_link:
+        objtool_input = _linux_link_relocatable(
+            ctx,
+            linker,
+            cc_toolchain,
+            feature_configuration,
+            "module-lto/" + compile_object,
+            [compile_out],
+            output = None if ctx.executable.objtool or objcopy_flags else out,
+        )
+
+    if ctx.executable.objtool:
+        objtool_args = ctx.actions.args()
+        objtool_args.add("-config", config.config)
+        for key in sorted(ctx.attr.config_fragment.keys()):
+            objtool_args.add("-config_value", "%s=%s" % (key, ctx.attr.config_fragment[key]))
+        if ctx.attr.objtool_force:
+            objtool_args.add("-force")
+        for arg in ctx.attr.objtool_args:
+            objtool_args.add("-objtool_arg=%s" % arg)
+        objtool_args.add("-objtool", ctx.executable.objtool)
+        objtool_args.add("-in", objtool_input)
+        objtool_mode = "builtin"
+        if ctx.attr.mode == "m":
+            objtool_mode = "module-single" if ctx.attr.module_root else "module-member"
+        objtool_args.add("-mode", objtool_mode)
+        objtool_args.add("-out", objtool_out)
+        path_mapped_run(
+            ctx.actions,
+            executable = ctx.attr._objtoolrun[DefaultInfo].files_to_run,
+            inputs = [config.config, objtool_input],
+            tools = [ctx.attr.objtool[DefaultInfo].files_to_run],
+            outputs = [objtool_out],
+            arguments = [objtool_args],
+            mnemonic = "LinuxObjectObjtool",
+            progress_message = "Processing Linux object with objtool %{label}",
+        )
+    else:
+        objtool_out = objtool_input
+
     if objcopy_flags:
         objcopy_args = ctx.actions.args()
         objcopy_args.add_all(objcopy_flags)
-        objcopy_args.add(compile_out)
+        objcopy_args.add(objtool_out)
         objcopy_args.add(objcopy_out)
         path_mapped_run(
             ctx.actions,
             executable = ctx.executable._llvm_objcopy,
-            inputs = [compile_out, ctx.executable._llvm_objcopy],
+            inputs = [objtool_out, ctx.executable._llvm_objcopy],
             outputs = [objcopy_out],
             arguments = [objcopy_args],
             mnemonic = "LinuxObjectObjcopy",
@@ -3538,7 +3694,10 @@ def _linux_object_impl(ctx):
         config_fragment = dict(ctx.attr.config_fragment),
         flags = list(ctx.attr.flags),
         mode = ctx.attr.mode,
+        module_root_kind = "single" if ctx.attr.module_root else "",
         object = ctx.attr.object,
+        objtool_args = list(ctx.attr.objtool_args),
+        objtool_force = ctx.attr.objtool_force,
         output = out,
         generated_headers = depset(exported_generated_headers),
         generated_include_dir_anchors = _directory_anchors(exported_generated_headers, exported_generated_include_dirs),
@@ -3566,8 +3725,22 @@ linux_object = rule(
         "generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
         "include_dirs": attr.string_list(),
         "mode": attr.string(values = ["y", "m"], mandatory = True),
+        "module_root": attr.bool(
+            doc = "Whether this leaf object is a single-object in-tree module root.",
+        ),
         "modname": attr.string(),
         "object": attr.string(mandatory = True),
+        "objtool": attr.label(
+            cfg = "exec",
+            doc = "Kernel-source-specific objtool executable. When set, processes this translation unit after compilation.",
+            executable = True,
+        ),
+        "objtool_args": attr.string_list(
+            doc = "Additional Kbuild-derived arguments for this translation unit's objtool action.",
+        ),
+        "objtool_force": attr.bool(
+            doc = "Run objtool when Kbuild explicitly enables this translation unit despite delayed processing.",
+        ),
         "src": attr.label(allow_single_file = True, mandatory = True),
         "srcarch": attr.string(),
         "source_includes": attr.label_list(
@@ -3639,6 +3812,11 @@ linux_object = rule(
         "_oidregistry": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/oidregistry"),
+            executable = True,
+        ),
+        "_objtoolrun": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/objtoolrun"),
             executable = True,
         ),
         "_scsidevinfo": attr.label(
@@ -3716,7 +3894,10 @@ def _linux_composite_object_impl(ctx):
         config_fragment = dict(ctx.attr.config_fragment),
         flags = [],
         mode = ctx.attr.mode,
+        module_root_kind = "composite" if ctx.attr.module_root else "",
         object = ctx.attr.object,
+        objtool_args = list(ctx.attr.objtool_args),
+        objtool_force = ctx.attr.objtool_force,
         output = out,
         generated_headers = depset(transitive = [info.generated_headers for info in object_infos]),
         generated_include_dir_anchors = _merged_generated_include_dir_anchors(object_infos),
@@ -3735,7 +3916,16 @@ linux_composite_object = rule(
         "arch": attr.string(default = "x86"),
         "config_fragment": attr.string_dict(),
         "mode": attr.string(values = ["y", "m"], mandatory = True),
+        "module_root": attr.bool(
+            doc = "Whether this composite object is an in-tree module root.",
+        ),
         "object": attr.string(mandatory = True),
+        "objtool_args": attr.string_list(
+            doc = "Kbuild target-specific arguments for delayed root objtool processing.",
+        ),
+        "objtool_force": attr.bool(
+            doc = "Whether Kbuild explicitly enables objtool for this composite.",
+        ),
         "objects": attr.label_list(providers = [LinuxObjectInfo], mandatory = True),
     },
     fragments = ["cpp"],
@@ -3783,8 +3973,8 @@ def _linux_arm64_nvhe_linker_script(ctx, compiler, cc_toolchain, feature_configu
     )
     return out
 
-def _linux_link_relocatable(ctx, linker, cc_toolchain, feature_configuration, out_relpath, objects, flags = [], extra_inputs = [], linker_script = None):
-    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
+def _linux_link_relocatable(ctx, linker, cc_toolchain, feature_configuration, out_relpath, objects, flags = [], extra_inputs = [], linker_script = None, output = None):
+    out = output if output else ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
     args = ctx.actions.args()
     args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
     args.add("-fuse-ld=lld")
@@ -3910,7 +4100,10 @@ def _linux_arm64_nvhe_object_impl(ctx):
         config_fragment = dict(ctx.attr.config_fragment),
         flags = [],
         mode = ctx.attr.mode,
+        module_root_kind = "",
         object = ctx.attr.object,
+        objtool_args = [],
+        objtool_force = False,
         output = out,
         generated_headers = depset(transitive = [info.generated_headers for info in object_infos]),
         generated_include_dir_anchors = _merged_generated_include_dir_anchors(object_infos),
@@ -4109,8 +4302,49 @@ def _linux_vmlinux_linker_script(ctx, compiler, cc_toolchain, feature_configurat
     )
     return out
 
-def _linux_vmlinux_compile_source(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, src, out_relpath, object_name, extra_flags = []):
+def _linux_version_at_least(version, major, minor):
+    parts = version.split(".")
+    if len(parts) < 2:
+        fail("invalid Linux version %r" % version)
+    return (int(parts[0]), int(parts[1])) >= (major, minor)
+
+def _linux_vmlinux_export_uses_objtool(config, version):
+    if not _linux_version_at_least(version, 6, 13):
+        return False
+    return _linux_version_at_least(version, 6, 18) or config.config_flags.get("CONFIG_MODULES") == "y"
+
+def _linux_vmlinux_compile_source(
+        ctx,
+        compiler,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        src,
+        out_relpath,
+        object_name,
+        extra_flags = [],
+        objtool_mode = ""):
+    if objtool_mode not in ["", "builtin", "builtin-always"]:
+        fail("unsupported vmlinux source objtool mode %r" % objtool_mode)
+
+    delay_objtool = (
+        config.config_flags.get("CONFIG_LTO_CLANG") == "y" or
+        config.config_flags.get("CONFIG_X86_KERNEL_IBT") == "y"
+    )
+    process_with_objtool = (
+        objtool_mode != "" and
+        ctx.executable.objtool and
+        config.config_flags.get("CONFIG_OBJTOOL") == "y" and
+        (objtool_mode == "builtin-always" or not delay_objtool)
+    )
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
+    compile_out = out
+    if process_with_objtool:
+        compile_out = ctx.actions.declare_file(
+            ctx.label.name + ".obj/" + out_relpath + ".objtool-input",
+        )
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
@@ -4125,7 +4359,7 @@ def _linux_vmlinux_compile_source(ctx, compiler, cc_toolchain, feature_configura
     args.add("-c")
     args.add(src)
     args.add("-o")
-    args.add(out)
+    args.add(compile_out)
 
     path_mapped_run(
         ctx.actions,
@@ -4134,10 +4368,44 @@ def _linux_vmlinux_compile_source(ctx, compiler, cc_toolchain, feature_configura
             _linux_source_tree_inputs(ctx, direct = [src]),
             transitive = [cc_toolchain.all_files, config.files, generated_headers.files],
         ),
-        outputs = [out],
+        outputs = [compile_out],
         arguments = [args],
         mnemonic = "LinuxVmlinuxCompile",
         progress_message = "Compiling Linux vmlinux support object %{label}",
+    )
+
+    if not process_with_objtool:
+        return out
+
+    objtool_input = compile_out
+    if objtool_mode == "builtin-always" and config.config_flags.get("CONFIG_LTO_CLANG") == "y":
+        objtool_input = _linux_link_relocatable(
+            ctx,
+            cc_common.get_tool_for_action(
+                feature_configuration = feature_configuration,
+                action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
+            ),
+            cc_toolchain,
+            feature_configuration,
+            out_relpath + ".objtool-linked.o",
+            [compile_out],
+        )
+
+    objtool_args = ctx.actions.args()
+    objtool_args.add("-config", config.config)
+    objtool_args.add("-objtool", ctx.executable.objtool)
+    objtool_args.add("-in", objtool_input)
+    objtool_args.add("-mode", objtool_mode)
+    objtool_args.add("-out", out)
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.attr._objtoolrun[DefaultInfo].files_to_run,
+        inputs = [config.config, objtool_input],
+        tools = [ctx.attr.objtool[DefaultInfo].files_to_run],
+        outputs = [out],
+        arguments = [objtool_args],
+        mnemonic = "LinuxVmlinuxObjectObjtool",
+        progress_message = "Processing Linux vmlinux support object with objtool %{label}",
     )
     return out
 
@@ -4163,6 +4431,7 @@ def _linux_vmlinux_export_object(ctx, compiler, cc_toolchain, feature_configurat
         src,
         ".vmlinux.export.o",
         ".vmlinux.export.o",
+        objtool_mode = "builtin-always" if _linux_vmlinux_export_uses_objtool(config, ctx.attr.version) else "",
     )
 
 def _linux_system_map(ctx, input, name):
@@ -4744,7 +5013,7 @@ def _linux_vmlinux_impl(ctx):
         _source_tree_file(ctx, "init/version-timestamp.c"),
         "init/version-timestamp.o",
         "init/version-timestamp.o",
-        ["-fno-function-sections", "-fno-data-sections", "-include", "generated/utsversion.h"],
+        extra_flags = ["-fno-function-sections", "-fno-data-sections", "-include", "generated/utsversion.h"],
     )
     image_object_inputs = depset([info.output for info in image.objects])
     image_object = _linux_vmlinux_objtool(
