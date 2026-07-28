@@ -6,48 +6,73 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
-const RustProfileSchema = "linux-rust-profile-v1"
+const RustProfileSchema = "linux-rust-profile-v2"
 
 type RustProfile struct {
-	Schema            string                  `json:"schema"`
-	Architecture      string                  `json:"architecture"`
-	SourceLayout      string                  `json:"source_layout"`
-	Target            RustTargetRecipe        `json:"target"`
-	CommonFlags       []string                `json:"common_flags"`
-	TargetFlags       RustFlagSet             `json:"target_flags"`
-	Module            RustModuleProfile       `json:"module"`
-	Bindgen           RustBindgenProfile      `json:"bindgen"`
-	ProcMacros        []RustProcMacroProfile  `json:"proc_macros"`
-	Crates            []RustCrateProfile      `json:"crates"`
-	GeneratedAssembly []RustGeneratedAssembly `json:"generated_assembly,omitempty"`
-	Exports           RustExportsProfile      `json:"exports"`
-	RuntimeObjects    []RustRuntimeObject     `json:"runtime_objects"`
+	Schema             string                  `json:"schema"`
+	Architecture       string                  `json:"architecture"`
+	SourceLayout       string                  `json:"source_layout"`
+	Target             RustTargetRecipe        `json:"target"`
+	CommonFlags        RustVersionedFlagSet    `json:"common_flags"`
+	TargetFlags        RustFlagSet             `json:"target_flags"`
+	Module             RustModuleProfile       `json:"module"`
+	Bindgen            RustBindgenProfile      `json:"bindgen"`
+	ProcMacros         []RustProcMacroProfile  `json:"proc_macros"`
+	Crates             []RustCrateProfile      `json:"crates"`
+	GeneratedAssembly  []RustGeneratedAssembly `json:"generated_assembly,omitempty"`
+	Exports            RustExportsProfile      `json:"exports"`
+	RuntimeObjects     []RustRuntimeObject     `json:"runtime_objects"`
+	UnsupportedConfigs []string                `json:"unsupported_configs"`
 }
 
 type RustTargetRecipe struct {
-	GeneratorSource string `json:"generator_source"`
-	Stdin           string `json:"stdin"`
-	Output          string `json:"output"`
+	Kind            string `json:"kind"`
+	GeneratorSource string `json:"generator_source,omitempty"`
+	Stdin           string `json:"stdin,omitempty"`
+	Output          string `json:"output,omitempty"`
+	BuiltinTriple   string `json:"builtin_triple,omitempty"`
+}
+
+type RustVersionedFlagSet struct {
+	Always            []string               `json:"always"`
+	VersionPredicates []RustVersionPredicate `json:"version_predicates"`
 }
 
 type RustFlagSet struct {
-	Always      []string               `json:"always"`
-	Conditional []RustConditionalFlags `json:"conditional"`
+	Always            []string               `json:"always"`
+	Conditional       []RustConditionalFlags `json:"conditional"`
+	VersionPredicates []RustVersionPredicate `json:"version_predicates"`
 }
 
+// RustVersionPredicate transforms a flag list in source order. Consumers remove
+// flags before adding flags from the selected semver branch.
+type RustVersionPredicate struct {
+	AtLeast    string   `json:"at_least"`
+	Add        []string `json:"add"`
+	Remove     []string `json:"remove"`
+	ElseAdd    []string `json:"else_add"`
+	ElseRemove []string `json:"else_remove"`
+}
+
+// VersionPredicates transform Flags only; ElseFlags describe the false branch.
+// UnlessConfig suppresses the true branch when that symbol is enabled.
 type RustConditionalFlags struct {
-	Config    string   `json:"config"`
-	Equals    string   `json:"equals,omitempty"`
-	Flags     []string `json:"flags"`
-	ElseFlags []string `json:"else_flags,omitempty"`
+	Config            string                 `json:"config"`
+	Equals            string                 `json:"equals,omitempty"`
+	UnlessConfig      string                 `json:"unless_config,omitempty"`
+	Flags             []string               `json:"flags"`
+	ElseFlags         []string               `json:"else_flags"`
+	VersionPredicates []RustVersionPredicate `json:"version_predicates"`
 }
 
 type RustModuleProfile struct {
-	AllowedFeatures []string `json:"allowed_features"`
-	Flags           []string `json:"flags"`
+	AllowedFeatures   []string               `json:"allowed_features"`
+	Flags             []string               `json:"flags"`
+	VersionPredicates []RustVersionPredicate `json:"version_predicates"`
 }
 
 type RustBindgenProfile struct {
@@ -68,16 +93,17 @@ type RustProcMacroProfile struct {
 }
 
 type RustCrateProfile struct {
-	Name            string   `json:"name"`
-	Source          string   `json:"source"`
-	SourcePrefixes  []string `json:"source_prefixes"`
-	SourceFiles     []string `json:"source_files"`
-	GeneratedInputs []string `json:"generated_inputs"`
-	Deps            []string `json:"deps"`
-	Externs         []string `json:"externs"`
-	Flags           []string `json:"flags"`
-	SkipFlags       []string `json:"skip_flags"`
-	ObjcopyFlags    []string `json:"objcopy_flags"`
+	Name              string                 `json:"name"`
+	Source            string                 `json:"source"`
+	SourcePrefixes    []string               `json:"source_prefixes"`
+	SourceFiles       []string               `json:"source_files"`
+	GeneratedInputs   []string               `json:"generated_inputs"`
+	Deps              []string               `json:"deps"`
+	Externs           []string               `json:"externs"`
+	Flags             []string               `json:"flags"`
+	SkipFlags         []string               `json:"skip_flags"`
+	ObjcopyFlags      []string               `json:"objcopy_flags"`
+	VersionPredicates []RustVersionPredicate `json:"version_predicates"`
 }
 
 type RustGeneratedAssembly struct {
@@ -108,19 +134,25 @@ func (p *RustProfile) JSON() ([]byte, error) {
 
 func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 	sourceRoot = filepath.Clean(sourceRoot)
-	if arch != "x86" && arch != "x86_64" {
-		return nil, fmt.Errorf("Rust profile generation supports only x86_64, got ARCH=%q", arch)
+	architecture, sourceArch, err := rustProfileArchitecture(arch)
+	if err != nil {
+		return nil, err
 	}
 
 	rootMake, err := readRustProfileFile(sourceRoot, "Makefile")
 	if err != nil {
 		return nil, err
 	}
-	archMake, err := readRustProfileFile(sourceRoot, "arch/x86/Makefile")
+	archMakePath := "arch/" + sourceArch + "/Makefile"
+	archMake, err := readRustProfileFile(sourceRoot, archMakePath)
 	if err != nil {
 		return nil, err
 	}
 	buildMake, err := readRustProfileFile(sourceRoot, "scripts/Makefile.build")
+	if err != nil {
+		return nil, err
+	}
+	debugMake, err := readRustProfileFile(sourceRoot, "scripts/Makefile.debug")
 	if err != nil {
 		return nil, err
 	}
@@ -227,10 +259,36 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, marker := range []string{"KernelConfig::from_stdin()", `cfg.has("X86_64")`} {
+	for _, marker := range []string{"KernelConfig::from_stdin()", "CONFIG_RUSTC_VERSION"} {
 		if !strings.Contains(targetGenerator, marker) {
 			return nil, fmt.Errorf("unsupported Rust target generator: missing %q", marker)
 		}
+	}
+	if architecture == "x86_64" {
+		for _, marker := range []string{
+			`cfg.has("X86_64")`,
+			"rustc_version_atleast(1, 86, 0)",
+			"rustc_version_atleast(1, 91, 0)",
+			"rustc_version_atleast(1, 98, 0)",
+		} {
+			if !strings.Contains(targetGenerator, marker) {
+				return nil, fmt.Errorf("unsupported x86 Rust target generator: missing %q", marker)
+			}
+		}
+	} else {
+		for _, marker := range []string{`cfg.has("ARM64")`, "aarch64-unknown-none"} {
+			if !strings.Contains(targetGenerator, marker) {
+				return nil, fmt.Errorf("unsupported arm64 Rust target generator: missing %q", marker)
+			}
+		}
+	}
+	coreEditionAtLeast, err := rustcMinimumVersion(
+		rustMake,
+		"core edition",
+		`(?m)^core-edition[ \t]*:=[ \t]*\$\(if[ \t]+\$\(call[ \t]+rustc-min-version,[ \t]*([0-9]+)\),2024,2021\)[ \t]*$`,
+	)
+	if err != nil {
+		return nil, err
 	}
 	procMacroUsesRustcCfg, err := rustProcMacroUsesRustcCfg(rustMake)
 	if err != nil {
@@ -240,7 +298,7 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 		return nil, fmt.Errorf("pin-init Rust layout requires proc macros to consume rustc_cfg")
 	}
 
-	redirects, err := makeWords(rustMake, "redirect-intrinsics")
+	redirects, err := rustRedirectIntrinsics(rustMake, architecture)
 	if err != nil {
 		return nil, err
 	}
@@ -252,21 +310,73 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 		coreObjcopy = append(coreObjcopy, "--redefine-sym", symbol+"=__rust"+symbol)
 	}
 
+	target := RustTargetRecipe{}
 	alwaysTargetFlags := append([]string(nil), baseFlags...)
-	for _, requiredFlag := range []string{
-		"--target=$(objtree)/scripts/target.json",
-		"-Ctarget-feature=-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2",
-		"-Cno-redzone=y",
-		"-Ccode-model=kernel",
-	} {
-		if !strings.Contains(archMake, "KBUILD_RUSTFLAGS += "+requiredFlag) {
-			return nil, fmt.Errorf("arch/x86/Makefile does not contain supported Rust flag %q", requiredFlag)
+	targetVersionPredicates := []RustVersionPredicate{}
+	unsupportedConfigs := []string{}
+	switch architecture {
+	case "x86_64":
+		target = RustTargetRecipe{
+			Kind:            "generated",
+			GeneratorSource: "scripts/generate_rust_target.rs",
+			Stdin:           "config_auto_conf",
+			Output:          "scripts/target.json",
 		}
-		alwaysTargetFlags = append(alwaysTargetFlags, strings.ReplaceAll(requiredFlag, "$(objtree)/scripts/target.json", "{target_spec}"))
+		for _, requiredFlag := range []string{
+			"--target=$(objtree)/scripts/target.json",
+			"-Ctarget-feature=-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2",
+			"-Cno-redzone=y",
+			"-Ccode-model=kernel",
+		} {
+			if !strings.Contains(archMake, "KBUILD_RUSTFLAGS += "+requiredFlag) {
+				return nil, fmt.Errorf("%s does not contain supported Rust flag %q", archMakePath, requiredFlag)
+			}
+			alwaysTargetFlags = append(alwaysTargetFlags, strings.ReplaceAll(requiredFlag, "$(objtree)/scripts/target.json", "{target_spec}"))
+		}
+	case "aarch64":
+		target = RustTargetRecipe{
+			Kind:          "builtin",
+			BuiltinTriple: "aarch64-unknown-none",
+		}
+		targetAtLeast, err := rustcMinimumVersion(
+			archMake,
+			"arm64 soft-float target",
+			`(?m)^ifeq[ \t]*\(\$\(call[ \t]+rustc-min-version,[ \t]*([0-9]+)\),y\)[ \t]*$`,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for _, marker := range []string{
+			"KBUILD_RUSTFLAGS += --target=aarch64-unknown-none-softfloat",
+			`KBUILD_RUSTFLAGS += --target=aarch64-unknown-none -Ctarget-feature="-neon"`,
+		} {
+			if !strings.Contains(archMake, marker) {
+				return nil, fmt.Errorf("%s does not contain supported Rust target marker %q", archMakePath, marker)
+			}
+		}
+		alwaysTargetFlags = append(alwaysTargetFlags,
+			"--target=aarch64-unknown-none",
+			"-Ctarget-feature=-neon",
+		)
+		targetVersionPredicates = append(targetVersionPredicates, newRustVersionPredicate(
+			targetAtLeast,
+			[]string{"--target=aarch64-unknown-none-softfloat"},
+			[]string{"--target=aarch64-unknown-none", "-Ctarget-feature=-neon"},
+			nil,
+			[]string{"--target=aarch64-unknown-none-softfloat"},
+		))
+		unsupportedConfigs = []string{
+			"CONFIG_CPU_BIG_ENDIAN",
+			"CONFIG_CFI",
+			"CONFIG_CFI_CLANG",
+			"CONFIG_KASAN",
+			"CONFIG_KCSAN",
+			"CONFIG_UBSAN",
+		}
 	}
 	alwaysTargetFlags = append(alwaysTargetFlags, "@{rustc_cfg}")
 
-	conditional, err := rustTargetConditionalFlags(rootMake, archMake)
+	conditional, err := rustTargetConditionalFlags(rootMake, debugMake, archMake, architecture)
 	if err != nil {
 		return nil, err
 	}
@@ -290,7 +400,7 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 		})
 	}
 
-	crates := rustCrateGraph(layout, coreObjcopy)
+	crates := rustCrateGraph(layout, coreObjcopy, coreEditionAtLeast)
 	generatedAssembly, err := rustGeneratedAssembly(sourceRoot, rustMake, layout)
 	if err != nil {
 		return nil, err
@@ -336,19 +446,18 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 		RustRuntimeObject{Path: "rust/exports.o"},
 	)
 
-	return &RustProfile{
+	profile := &RustProfile{
 		Schema:       RustProfileSchema,
-		Architecture: "x86_64",
+		Architecture: architecture,
 		SourceLayout: layout,
-		Target: RustTargetRecipe{
-			GeneratorSource: "scripts/generate_rust_target.rs",
-			Stdin:           "config_auto_conf",
-			Output:          "scripts/target.json",
+		Target:       target,
+		CommonFlags: RustVersionedFlagSet{
+			Always: commonFlags,
 		},
-		CommonFlags: commonFlags,
 		TargetFlags: RustFlagSet{
-			Always:      alwaysTargetFlags,
-			Conditional: conditional,
+			Always:            alwaysTargetFlags,
+			Conditional:       conditional,
+			VersionPredicates: targetVersionPredicates,
 		},
 		Module: RustModuleProfile{
 			AllowedFeatures: allowedFeatures,
@@ -376,11 +485,14 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 			Source: "rust/exports.c",
 			Crates: []string{"core", "helpers", "bindings", "kernel"},
 		},
-		RuntimeObjects: runtime,
-	}, nil
+		RuntimeObjects:     runtime,
+		UnsupportedConfigs: unsupportedConfigs,
+	}
+	normalizeRustProfile(profile)
+	return profile, nil
 }
 
-func rustCrateGraph(layout string, coreObjcopy []string) []RustCrateProfile {
+func rustCrateGraph(layout string, coreObjcopy []string, coreEditionAtLeast string) []RustCrateProfile {
 	empty := []string{}
 	crates := []RustCrateProfile{
 		{
@@ -391,9 +503,16 @@ func rustCrateGraph(layout string, coreObjcopy []string) []RustCrateProfile {
 			GeneratedInputs: empty,
 			Deps:            empty,
 			Externs:         empty,
-			Flags:           []string{"--edition=2024", "--cfg", "no_fp_fmt_parse"},
-			SkipFlags:       []string{"--edition=2021", "-Wunreachable_pub"},
+			Flags:           []string{"--cfg", "no_fp_fmt_parse"},
+			SkipFlags:       []string{"-Wunreachable_pub"},
 			ObjcopyFlags:    coreObjcopy,
+			VersionPredicates: []RustVersionPredicate{newRustVersionPredicate(
+				coreEditionAtLeast,
+				[]string{"--edition=2024"},
+				[]string{"--edition=2021"},
+				nil,
+				[]string{"--edition=2024"},
+			)},
 		},
 		{
 			Name:            "compiler_builtins",
@@ -493,45 +612,164 @@ func rustGeneratedAssembly(sourceRoot, rustMake, layout string) ([]RustGenerated
 	return entries, nil
 }
 
-func rustTargetConditionalFlags(rootMake, archMake string) ([]RustConditionalFlags, error) {
+func rustTargetConditionalFlags(rootMake, debugMake, archMake, architecture string) ([]RustConditionalFlags, error) {
 	required := []struct {
-		content string
-		marker  string
-		group   RustConditionalFlags
+		marker string
+		group  RustConditionalFlags
 	}{
-		{rootMake, "KBUILD_RUSTFLAGS += -Copt-level=s", RustConditionalFlags{Config: "CONFIG_CC_OPTIMIZE_FOR_SIZE", Equals: "y", Flags: []string{"-Copt-level=s"}, ElseFlags: []string{"-Copt-level=2"}}},
-		{rootMake, "CONFIG_RUST_DEBUG_ASSERTIONS", RustConditionalFlags{Config: "CONFIG_RUST_DEBUG_ASSERTIONS", Equals: "y", Flags: []string{"-Cdebug-assertions=y"}, ElseFlags: []string{"-Cdebug-assertions=n"}}},
-		{rootMake, "CONFIG_RUST_OVERFLOW_CHECKS", RustConditionalFlags{Config: "CONFIG_RUST_OVERFLOW_CHECKS", Equals: "y", Flags: []string{"-Coverflow-checks=y"}, ElseFlags: []string{"-Coverflow-checks=n"}}},
-		{rootMake, "ifdef CONFIG_FRAME_POINTER", RustConditionalFlags{Config: "CONFIG_FRAME_POINTER", Equals: "y", Flags: []string{"-Cforce-frame-pointers=y", "-Zllvm_module_flag=frame-pointer:u32:2:max"}}},
-		{archMake, "RETHUNK_RUSTFLAGS", RustConditionalFlags{Config: "CONFIG_MITIGATION_RETHUNK", Equals: "y", Flags: []string{"-Zfunction-return=thunk-extern"}}},
-		{archMake, "CONFIG_X86_KERNEL_IBT", RustConditionalFlags{Config: "CONFIG_X86_KERNEL_IBT", Equals: "y", Flags: []string{"-Zcf-protection=branch", "-Cjump-tables=n"}}},
-		{archMake, "PADDING_RUSTFLAGS", RustConditionalFlags{Config: "CONFIG_CALL_PADDING", Equals: "y", Flags: []string{"-Zpatchable-function-entry={CONFIG_FUNCTION_PADDING_BYTES},{CONFIG_FUNCTION_PADDING_BYTES}"}}},
+		{
+			"KBUILD_RUSTFLAGS += -Copt-level=s",
+			newRustConditionalFlags(
+				"CONFIG_CC_OPTIMIZE_FOR_SIZE",
+				[]string{"-Copt-level=s"},
+				[]string{"-Copt-level=2"},
+				nil,
+			),
+		},
+		{
+			"CONFIG_RUST_DEBUG_ASSERTIONS",
+			newRustConditionalFlags(
+				"CONFIG_RUST_DEBUG_ASSERTIONS",
+				[]string{"-Cdebug-assertions=y"},
+				[]string{"-Cdebug-assertions=n"},
+				nil,
+			),
+		},
+		{
+			"CONFIG_RUST_OVERFLOW_CHECKS",
+			newRustConditionalFlags(
+				"CONFIG_RUST_OVERFLOW_CHECKS",
+				[]string{"-Coverflow-checks=y"},
+				[]string{"-Coverflow-checks=n"},
+				nil,
+			),
+		},
+		{
+			"ifdef CONFIG_FRAME_POINTER",
+			newRustConditionalFlags(
+				"CONFIG_FRAME_POINTER",
+				[]string{"-Cforce-frame-pointers=y"},
+				nil,
+				nil,
+			),
+		},
 	}
-	out := make([]RustConditionalFlags, 0, len(required)+5)
+	out := make([]RustConditionalFlags, 0, len(required)+8)
 	for _, item := range required {
-		if !strings.Contains(item.content, item.marker) {
+		if !strings.Contains(rootMake, item.marker) {
 			return nil, fmt.Errorf("unsupported Rust flag layout: missing %q", item.marker)
 		}
 		out = append(out, item.group)
 	}
-	if strings.Contains(rootMake, "KBUILD_RUSTFLAGS-$(CONFIG_WERROR) += -Dwarnings") {
-		out = append(out, RustConditionalFlags{
-			Config: "CONFIG_WERROR",
-			Equals: "y",
-			Flags:  []string{"-Dwarnings"},
-		})
+	framePointerAtLeast, err := rustcMinimumVersion(
+		rootMake,
+		"frame-pointer module flag",
+		`(?m)^KBUILD_RUSTFLAGS[ \t]*\+=[ \t]*\$\(if[ \t]+\$\(call[ \t]+rustc-min-version,[ \t]*([0-9]+)\),,-Zllvm_module_flag=frame-pointer:u32:2:max\)[ \t]*$`,
+	)
+	if err != nil {
+		return nil, err
 	}
+	out[len(out)-1].VersionPredicates = []RustVersionPredicate{newRustVersionPredicate(
+		framePointerAtLeast,
+		nil,
+		[]string{"-Zllvm_module_flag=frame-pointer:u32:2:max"},
+		[]string{"-Zllvm_module_flag=frame-pointer:u32:2:max"},
+		nil,
+	)}
+	if strings.Contains(rootMake, "KBUILD_RUSTFLAGS-$(CONFIG_WERROR) += -Dwarnings") {
+		out = append(out, newRustConditionalFlags(
+			"CONFIG_WERROR",
+			[]string{"-Dwarnings"},
+			nil,
+			nil,
+		))
+	}
+	for _, marker := range []string{
+		"CONFIG_DEBUG_INFO",
+		"DEBUG_RUSTFLAGS",
+		"-Cdebuginfo=2",
+		"CONFIG_DEBUG_INFO_DWARF5",
+		"-Zdwarf-version=5",
+	} {
+		if !strings.Contains(debugMake, marker) {
+			return nil, fmt.Errorf("unsupported Rust debug flag layout: missing %q", marker)
+		}
+	}
+	out = append(out,
+		newRustConditionalFlags(
+			"CONFIG_DEBUG_INFO",
+			[]string{"-Cdebuginfo=2"},
+			nil,
+			nil,
+		),
+		newRustConditionalFlags(
+			"CONFIG_DEBUG_INFO_DWARF5",
+			[]string{"-Zdwarf-version=5"},
+			nil,
+			nil,
+		),
+	)
+
+	switch architecture {
+	case "x86_64":
+		return rustX86ConditionalFlags(archMake, out)
+	case "aarch64":
+		return rustArm64ConditionalFlags(archMake, out)
+	default:
+		return nil, fmt.Errorf("unsupported Rust profile architecture %q", architecture)
+	}
+}
+
+func rustX86ConditionalFlags(archMake string, out []RustConditionalFlags) ([]RustConditionalFlags, error) {
+	for _, marker := range []string{"RETHUNK_RUSTFLAGS", "CONFIG_X86_KERNEL_IBT", "PADDING_RUSTFLAGS"} {
+		if !strings.Contains(archMake, marker) {
+			return nil, fmt.Errorf("unsupported x86 Rust flag layout: missing %q", marker)
+		}
+	}
+	out = append(out, newRustConditionalFlags(
+		"CONFIG_MITIGATION_RETHUNK",
+		[]string{"-Zfunction-return=thunk-extern"},
+		nil,
+		nil,
+	))
+	jumpTablesAtLeast, err := rustcMinimumVersion(
+		archMake,
+		"x86 IBT jump-table flag",
+		`(?m)^KBUILD_RUSTFLAGS[ \t]*\+=[ \t]*-Zcf-protection=branch[ \t]+\$\(if[ \t]+\$\(call[ \t]+rustc-min-version,[ \t]*([0-9]+)\),-Cjump-tables=n,-Zno-jump-tables\)[ \t]*$`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, newRustConditionalFlags(
+		"CONFIG_X86_KERNEL_IBT",
+		[]string{"-Zcf-protection=branch"},
+		nil,
+		[]RustVersionPredicate{newRustVersionPredicate(
+			jumpTablesAtLeast,
+			[]string{"-Cjump-tables=n"},
+			[]string{"-Zno-jump-tables"},
+			[]string{"-Zno-jump-tables"},
+			[]string{"-Cjump-tables=n"},
+		)},
+	))
+	out = append(out, newRustConditionalFlags(
+		"CONFIG_CALL_PADDING",
+		[]string{"-Zpatchable-function-entry={CONFIG_FUNCTION_PADDING_BYTES},{CONFIG_FUNCTION_PADDING_BYTES}"},
+		nil,
+		nil,
+	))
 
 	if strings.Contains(archMake, "ifdef CONFIG_X86_NATIVE_CPU") {
 		if !strings.Contains(archMake, "KBUILD_RUSTFLAGS += -Ctarget-cpu=native") ||
 			!strings.Contains(archMake, "KBUILD_RUSTFLAGS += -Ctarget-cpu=x86-64 -Ztune-cpu=generic") {
 			return nil, fmt.Errorf("unsupported CONFIG_X86_NATIVE_CPU Rust flag layout")
 		}
-		out = append(out, RustConditionalFlags{
-			Config: "CONFIG_X86_NATIVE_CPU", Equals: "y",
-			Flags:     []string{"-Ctarget-cpu=native"},
-			ElseFlags: []string{"-Ctarget-cpu=x86-64", "-Ztune-cpu=generic"},
-		})
+		out = append(out, newRustConditionalFlags(
+			"CONFIG_X86_NATIVE_CPU",
+			[]string{"-Ctarget-cpu=native"},
+			[]string{"-Ctarget-cpu=x86-64", "-Ztune-cpu=generic"},
+			nil,
+		))
 		return out, nil
 	}
 
@@ -545,12 +783,76 @@ func rustTargetConditionalFlags(rootMake, archMake string) ([]RustConditionalFla
 		if err := rejectMakeWords("x86 Rust CPU flags", flags); err != nil {
 			return nil, err
 		}
-		out = append(out, RustConditionalFlags{
-			Config: "CONFIG_" + match[1],
-			Equals: "y",
-			Flags:  flags,
-		})
+		out = append(out, newRustConditionalFlags(
+			"CONFIG_"+match[1],
+			flags,
+			nil,
+			nil,
+		))
 	}
+	return out, nil
+}
+
+func rustArm64ConditionalFlags(archMake string, out []RustConditionalFlags) ([]RustConditionalFlags, error) {
+	for _, marker := range []string{
+		"CONFIG_UNWIND_TABLES",
+		"KBUILD_RUSTFLAGS += -Cforce-unwind-tables=n",
+		"KBUILD_RUSTFLAGS += -Cforce-unwind-tables=y -Zuse-sync-unwind=n",
+		"CONFIG_ARM64_BTI_KERNEL",
+		"-Zbranch-protection=bti,pac-ret",
+		"CONFIG_ARM64_PTR_AUTH_KERNEL",
+		"-Zbranch-protection=pac-ret",
+		"CONFIG_SHADOW_CALL_STACK",
+		"KBUILD_RUSTFLAGS += -Zfixed-x18",
+	} {
+		if !strings.Contains(archMake, marker) {
+			return nil, fmt.Errorf("unsupported arm64 Rust flag layout: missing %q", marker)
+		}
+	}
+	unwindAtLeast, err := rustcMinimumVersion(
+		archMake,
+		"arm64 unwind module flag",
+		`(?m)^KBUILD_RUSTFLAGS[ \t]*\+=[ \t]*\$\(if[ \t]+\$\(call[ \t]+rustc-min-version,[ \t]*([0-9]+)\),,-Zllvm_module_flag=uwtable:u32:2:max\)[ \t]*$`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, newRustConditionalFlags(
+		"CONFIG_UNWIND_TABLES",
+		[]string{"-Cforce-unwind-tables=y", "-Zuse-sync-unwind=n"},
+		[]string{"-Cforce-unwind-tables=n"},
+		[]RustVersionPredicate{newRustVersionPredicate(
+			unwindAtLeast,
+			nil,
+			[]string{"-Zllvm_module_flag=uwtable:u32:2:max"},
+			[]string{"-Zllvm_module_flag=uwtable:u32:2:max"},
+			nil,
+		)},
+	))
+	ptrAuth := newRustConditionalFlags(
+		"CONFIG_ARM64_PTR_AUTH_KERNEL",
+		[]string{"-Zbranch-protection=pac-ret"},
+		nil,
+		nil,
+	)
+	ptrAuth.UnlessConfig = "CONFIG_ARM64_BTI_KERNEL"
+	// Preserve the Makefile's if/else-if relationship: BTI includes PAC, so
+	// the pointer-authentication-only flag must not also be emitted.
+	out = append(out,
+		newRustConditionalFlags(
+			"CONFIG_ARM64_BTI_KERNEL",
+			[]string{"-Zbranch-protection=bti,pac-ret"},
+			nil,
+			nil,
+		),
+		ptrAuth,
+		newRustConditionalFlags(
+			"CONFIG_SHADOW_CALL_STACK",
+			[]string{"-Zfixed-x18"},
+			nil,
+			nil,
+		),
+	)
 	return out, nil
 }
 
@@ -564,6 +866,121 @@ func rustProcMacroUsesRustcCfg(rustMake string) (bool, error) {
 		block = block[:end]
 	}
 	return strings.Contains(block, "@$(objtree)/include/generated/rustc_cfg"), nil
+}
+
+func rustProfileArchitecture(arch string) (architecture, sourceArch string, err error) {
+	switch arch {
+	case "x86", "x86_64":
+		return "x86_64", "x86", nil
+	case "arm64", "aarch64":
+		return "aarch64", "arm64", nil
+	default:
+		return "", "", fmt.Errorf("Rust profile generation supports only x86_64 and arm64, got ARCH=%q", arch)
+	}
+}
+
+func rustRedirectIntrinsics(rustMake, architecture string) ([]string, error) {
+	redirects, err := makeWords(rustMake, "redirect-intrinsics")
+	if err != nil {
+		return nil, err
+	}
+	if architecture != "aarch64" {
+		return redirects, nil
+	}
+	for _, marker := range []string{
+		"ifneq ($(or $(CONFIG_ARM64)",
+		"__ashrti3",
+		"__ashlti3",
+		"__lshrti3",
+	} {
+		if !strings.Contains(rustMake, marker) {
+			return nil, fmt.Errorf("unsupported arm64 redirect-intrinsics layout: missing %q", marker)
+		}
+	}
+	return append(redirects, "__ashrti3", "__ashlti3", "__lshrti3"), nil
+}
+
+func rustcMinimumVersion(content, context, pattern string) (string, error) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return "", fmt.Errorf("compile %s rustc-version pattern: %w", context, err)
+	}
+	match := re.FindStringSubmatch(content)
+	if len(match) != 2 {
+		return "", fmt.Errorf("unsupported %s layout: missing rustc minimum-version predicate", context)
+	}
+	encoded, err := strconv.Atoi(match[1])
+	if err != nil {
+		return "", fmt.Errorf("parse %s rustc minimum version %q: %w", context, match[1], err)
+	}
+	major := encoded / 100000
+	minor := (encoded / 100) % 1000
+	patch := encoded % 100
+	if major < 1 || minor > 999 || patch > 99 {
+		return "", fmt.Errorf("unsupported %s rustc minimum version %q", context, match[1])
+	}
+	return fmt.Sprintf("%d.%d.%d", major, minor, patch), nil
+}
+
+func newRustVersionPredicate(atLeast string, add, remove, elseAdd, elseRemove []string) RustVersionPredicate {
+	return RustVersionPredicate{
+		AtLeast:    atLeast,
+		Add:        nonNilStrings(add),
+		Remove:     nonNilStrings(remove),
+		ElseAdd:    nonNilStrings(elseAdd),
+		ElseRemove: nonNilStrings(elseRemove),
+	}
+}
+
+func newRustConditionalFlags(config string, flags, elseFlags []string, predicates []RustVersionPredicate) RustConditionalFlags {
+	return RustConditionalFlags{
+		Config:            config,
+		Equals:            "y",
+		Flags:             nonNilStrings(flags),
+		ElseFlags:         nonNilStrings(elseFlags),
+		VersionPredicates: nonNilRustVersionPredicates(predicates),
+	}
+}
+
+func normalizeRustProfile(profile *RustProfile) {
+	profile.CommonFlags.Always = nonNilStrings(profile.CommonFlags.Always)
+	profile.CommonFlags.VersionPredicates = nonNilRustVersionPredicates(profile.CommonFlags.VersionPredicates)
+	profile.TargetFlags.Always = nonNilStrings(profile.TargetFlags.Always)
+	profile.TargetFlags.VersionPredicates = nonNilRustVersionPredicates(profile.TargetFlags.VersionPredicates)
+	for i := range profile.TargetFlags.Conditional {
+		condition := &profile.TargetFlags.Conditional[i]
+		condition.Flags = nonNilStrings(condition.Flags)
+		condition.ElseFlags = nonNilStrings(condition.ElseFlags)
+		condition.VersionPredicates = nonNilRustVersionPredicates(condition.VersionPredicates)
+	}
+	profile.Module.AllowedFeatures = nonNilStrings(profile.Module.AllowedFeatures)
+	profile.Module.Flags = nonNilStrings(profile.Module.Flags)
+	profile.Module.VersionPredicates = nonNilRustVersionPredicates(profile.Module.VersionPredicates)
+	for i := range profile.Crates {
+		crate := &profile.Crates[i]
+		crate.VersionPredicates = nonNilRustVersionPredicates(crate.VersionPredicates)
+	}
+	profile.UnsupportedConfigs = nonNilStrings(profile.UnsupportedConfigs)
+}
+
+func nonNilRustVersionPredicates(predicates []RustVersionPredicate) []RustVersionPredicate {
+	if predicates == nil {
+		return []RustVersionPredicate{}
+	}
+	for i := range predicates {
+		predicates[i].Add = nonNilStrings(predicates[i].Add)
+		predicates[i].Remove = nonNilStrings(predicates[i].Remove)
+		predicates[i].ElseAdd = nonNilStrings(predicates[i].ElseAdd)
+		predicates[i].ElseRemove = nonNilStrings(predicates[i].ElseRemove)
+	}
+	return predicates
+}
+
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func readRustProfileFile(root, path string) (string, error) {

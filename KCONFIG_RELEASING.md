@@ -13,27 +13,38 @@ requests another schema.
 Schema `v0.0.12` is opt-in. It emits classified source-tree inputs, exact
 source-like include closures, module object roots, and fail-closed source
 actions. Rust-owned objects are excluded from the ordinary object graph.
-`-rust_profile_out` additionally emits the source-derived
-`linux-rust-profile-v1` JSON profile and is valid only with
-`-compact_schema=v0.0.12`.
+`-rust_profile_out` additionally emits a source-derived Rust profile and is
+valid only with `-compact_schema=v0.0.12`.
 
 Generator `v0.0.13` keeps schema `v0.0.12` and adds config-sensitive
 KASAN/KCSAN/UBSAN instrumentation flags, including Kbuild per-object and
 per-directory overrides.
 
+Generator `v0.0.14` keeps compact schema `v0.0.12`, upgrades the separate Rust
+profile to `linux-rust-profile-v2`, and supports both x86_64 and arm64. The
+profile records source-derived rustc version gates and the architecture's
+built-in or generated Rust target specification. `kconfig_parse` also accepts
+the exact selected Rust toolchain probe so action-time config resolution can
+verify that dynamic rustc capabilities do not change the repository-generated
+structural snapshot. Compact object metadata preserves module roots and
+`OBJECT_FILES_NON_STANDARD` overrides, and can carry the source-built x86
+objtool label required for Kbuild-compatible post-processing.
+
 ## Prepare
 
-1. Run `go test ./internal/kconfig ./internal/cmd/kconfig ./internal/cmd/kconfig_parse`.
+1. Run `go test ./internal/kconfig ./internal/rusttoolchain ./internal/cmd/kconfig ./internal/cmd/kconfig_parse`.
 2. Run the Bazel generator, compact-golden, and prebuilt archive tests.
 3. Exercise v0.0.12 against maintained Linux 6.12 and 6.18 source trees with
-   `CONFIG_RUST=y`. Verify that the legacy and pin-init Rust layouts produce
-   valid profiles and that a modified but compatible source tree is accepted.
+   `CONFIG_RUST=y` on x86_64 and arm64. Verify that the legacy and pin-init Rust
+   layouts produce valid v2 profiles, that built-in and generated target
+   specifications are selected correctly, and that a modified but compatible
+   source tree is accepted.
 4. Exercise C sanitizer configs against maintained Linux 6.12 and 6.18 source
    trees. Verify KASAN/KCSAN/UBSAN object opt-outs, test-object opt-ins, arm64
    nVHE defaults, and integer-wrap inputs.
 5. Verify that unsupported source layouts, unresolved Make expressions,
-   incomplete leaf objects, and non-x86_64 Rust profiles fail with actionable
-   errors.
+   incomplete leaf objects, and unsupported Rust architectures fail with
+   actionable errors.
 6. Build the six platform archives twice from clean output trees and compare
    their SHA-256 digests.
 
@@ -47,7 +58,7 @@ version stream.
 After the release-preparation change is merged, tag that merge commit:
 
 ```sh
-VERSION=v0.0.13 ./release_kconfig.sh
+VERSION=v0.0.14 ./release_kconfig.sh
 ```
 
 The tag workflow publishes archives for Linux, macOS, and Windows on amd64 and

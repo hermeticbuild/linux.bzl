@@ -412,6 +412,178 @@ obj-y := $(patsubst %.o,%.pi.o,$(obj-y))
 	}
 }
 
+func TestCompactMetadataPreservesObjtoolSettings(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	kb, err := parseKbuild(strings.NewReader(`obj-y += startup.o
+pi-objs := $(patsubst %.o,$(obj)/%.o,$(obj-y))
+$(pi-objs): objtool-enabled = 1
+$(pi-objs): objtool-args = $(if $(delay-objtool),,$(objtool-args-y)) --noabs
+targets += $(obj-y)
+obj-y := $(patsubst %.o,%.pi.o,$(obj-y))
+obj-y += normal.o head.o ignored.pi.o efi.stub.o
+obj-m += module.o
+OBJECT_FILES_NON_STANDARD := y
+OBJECT_FILES_NON_STANDARD_normal.o := n
+OBJECT_FILES_NON_STANDARD_ignored.o := y
+OBJECT_FILES_NON_STANDARD_efi.o := n
+`), "Kbuild", map[string]string{"obj": "."}, "")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	for _, source := range []string{"normal.c", "head.c", "ignored.c", "efi.c", "startup.c", "module.c"} {
+		writeCompactSource(t, sourceRoot, source)
+	}
+	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{Name: "base"}}, CompactMetadataOptions{
+		Schema:     CompactSchemaV012,
+		SourceRoot: sourceRoot,
+	})
+	if err != nil {
+		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+	}
+	config := configByName(metadata, "base")
+	normal := variantByTarget(metadata, objectTarget(metadata, config, "normal.o"))
+	head := variantByTarget(metadata, objectTarget(metadata, config, "head.o"))
+	ignored := variantByTarget(metadata, objectTarget(metadata, config, "ignored.pi.o"))
+	efi := variantByTarget(metadata, objectTarget(metadata, config, "efi.stub.o"))
+	startup := variantByTarget(metadata, objectTarget(metadata, config, "startup.pi.o"))
+	module := variantByTarget(metadata, moduleObjectTarget(metadata, config, "module.o"))
+	if normal.ObjtoolDisabled {
+		t.Fatal("normal.o did not preserve its per-object override of the directory setting")
+	}
+	if !head.ObjtoolDisabled {
+		t.Fatal("head.o did not preserve directory OBJECT_FILES_NON_STANDARD")
+	}
+	if !ignored.ObjtoolDisabled {
+		t.Fatal("ignored.pi.o did not inherit OBJECT_FILES_NON_STANDARD_ignored.o")
+	}
+	if !efi.ObjtoolDisabled {
+		t.Fatal("efi.stub.o unexpectedly enabled objtool for its rewritten underlying efi.o")
+	}
+	if startup.ObjtoolDisabled || !startup.ObjtoolForce || !reflect.DeepEqual(startup.ObjtoolArgs, []string{"--noabs"}) {
+		t.Fatalf("startup.pi.o objtool settings = disabled:%t force:%t args:%q", startup.ObjtoolDisabled, startup.ObjtoolForce, startup.ObjtoolArgs)
+	}
+
+	objectBuild, err := metadata.ObjectBuildFile(CompactBuildFileOptions{
+		Schema:             CompactSchemaV012,
+		Arch:               "x86",
+		SourceLabelPackage: "@linux//",
+		SourceObjtool:      "//linux:objtool",
+		SourceRootLabel:    "@linux//:Kconfig",
+	})
+	if err != nil {
+		t.Fatalf("ObjectBuildFile() failed: %v", err)
+	}
+	parsed, err := build.ParseBuild("objects.BUILD.bazel", objectBuild)
+	if err != nil {
+		t.Fatalf("generated object BUILD did not parse: %v\n%s", err, objectBuild)
+	}
+	if got := parsed.RuleNamed(head.Target).AttrString("objtool"); got != "" {
+		t.Fatalf("head.o objtool = %q, want omitted", got)
+	}
+	if got := parsed.RuleNamed(normal.Target).AttrString("objtool"); got != "//linux:objtool" {
+		t.Fatalf("normal.o objtool = %q, want //linux:objtool", got)
+	}
+	if got := parsed.RuleNamed(module.Target).AttrString("objtool"); got != "" {
+		t.Fatalf("module.o objtool = %q, want module-root processing only", got)
+	}
+	if !module.ModuleRoot || parsed.RuleNamed(module.Target).AttrLiteral("module_root") != "True" {
+		t.Fatalf("module.o did not preserve its single-module root marker")
+	}
+	if got := parsed.RuleNamed(startup.Target).AttrStrings("objtool_args"); !reflect.DeepEqual(got, []string{"--noabs"}) {
+		t.Fatalf("startup.pi.o objtool_args = %q, want [--noabs]", got)
+	}
+	if !strings.Contains(string(objectBuild), "objtool_force = True") {
+		t.Fatalf("startup.pi.o BUILD rule is missing objtool_force:\n%s", objectBuild)
+	}
+}
+
+func TestCompactMetadataPreservesModuleObjtoolShape(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	kb, err := ParseKbuild(strings.NewReader(`obj-m += single.o multi.o
+multi-y := member.o skipped.o forced.o
+OBJECT_FILES_NON_STANDARD_skipped.o := y
+forced.o: objtool-enabled = 1
+forced.o: objtool-args = --custom
+`), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	for _, source := range []string{"single.c", "member.c", "skipped.c", "forced.c"} {
+		writeCompactSource(t, sourceRoot, source)
+	}
+	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{{Name: "base"}}, CompactMetadataOptions{
+		Schema:     CompactSchemaV012,
+		SourceRoot: sourceRoot,
+	})
+	if err != nil {
+		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+	}
+	config := configByName(metadata, "base")
+	single := variantByTarget(metadata, moduleObjectTarget(metadata, config, "single.o"))
+	multi := variantByTarget(metadata, moduleObjectTarget(metadata, config, "multi.o"))
+	members := map[string]CompactObjectVariant{}
+	for _, target := range multi.Members {
+		variant := variantByTarget(metadata, target)
+		members[variant.Object] = variant
+	}
+	member := members["member.o"]
+	skipped := members["skipped.o"]
+	forced := members["forced.o"]
+	if !single.ModuleRoot || len(single.Members) != 0 || single.ObjtoolDisabled {
+		t.Fatalf("single.o metadata = root:%t members:%q disabled:%t", single.ModuleRoot, single.Members, single.ObjtoolDisabled)
+	}
+	if !multi.ModuleRoot || len(multi.Members) != 3 {
+		t.Fatalf("multi.o metadata = root:%t members:%q", multi.ModuleRoot, multi.Members)
+	}
+	if member.ModuleRoot || member.ObjtoolDisabled {
+		t.Fatalf("member.o metadata = root:%t disabled:%t", member.ModuleRoot, member.ObjtoolDisabled)
+	}
+	if !skipped.ObjtoolDisabled {
+		t.Fatal("skipped.o did not preserve OBJECT_FILES_NON_STANDARD")
+	}
+	if !forced.ObjtoolForce || !reflect.DeepEqual(forced.ObjtoolArgs, []string{"--custom"}) {
+		t.Fatalf("forced.o objtool metadata = force:%t args:%q", forced.ObjtoolForce, forced.ObjtoolArgs)
+	}
+
+	objectBuild, err := metadata.ObjectBuildFile(CompactBuildFileOptions{
+		Schema:             CompactSchemaV012,
+		Arch:               "x86",
+		SourceLabelPackage: "@linux//",
+		SourceObjtool:      "//linux:objtool",
+		SourceRootLabel:    "@linux//:Kconfig",
+	})
+	if err != nil {
+		t.Fatalf("ObjectBuildFile() failed: %v", err)
+	}
+	parsed, err := build.ParseBuild("objects.BUILD.bazel", objectBuild)
+	if err != nil {
+		t.Fatalf("generated object BUILD did not parse: %v\n%s", err, objectBuild)
+	}
+	singleRule := parsed.RuleNamed(single.Target)
+	if singleRule.Kind() != "linux_object" ||
+		singleRule.AttrLiteral("module_root") != "True" ||
+		singleRule.AttrString("objtool") != "//linux:objtool" {
+		t.Fatalf("single.o rule does not carry single-module objtool metadata:\n%s", objectBuild)
+	}
+	multiRule := parsed.RuleNamed(multi.Target)
+	if multiRule.Kind() != "linux_composite_object" || multiRule.AttrLiteral("module_root") != "True" {
+		t.Fatalf("multi.o rule does not carry composite-module metadata:\n%s", objectBuild)
+	}
+	if got := parsed.RuleNamed(member.Target).AttrString("objtool"); got != "//linux:objtool" {
+		t.Fatalf("member.o objtool = %q, want //linux:objtool", got)
+	}
+	if got := parsed.RuleNamed(skipped.Target).AttrString("objtool"); got != "" {
+		t.Fatalf("skipped.o objtool = %q, want omitted", got)
+	}
+	forcedRule := parsed.RuleNamed(forced.Target)
+	if forcedRule.AttrLiteral("objtool_force") != "True" ||
+		!reflect.DeepEqual(forcedRule.AttrStrings("objtool_args"), []string{"--custom"}) {
+		t.Fatalf("forced.o rule does not preserve custom objtool settings:\n%s", objectBuild)
+	}
+}
+
 func TestCompactMetadataPreservesKbuildRootOrder(t *testing.T) {
 	tree := mustParseCompactFixture(t)
 	kb, err := ParseKbuild(strings.NewReader(`obj-y += z.o
@@ -1052,6 +1224,7 @@ func TestCompactObjectBuildFileEmitsSourceLabels(t *testing.T) {
 		Schema:             CompactSchemaV012,
 		Arch:               "x86",
 		SourceLabelPackage: "@linux//",
+		SourceObjtool:      "//linux:objtool",
 		SourceRootLabel:    "@linux//:Kconfig",
 	})
 	if err != nil {
@@ -1074,12 +1247,41 @@ func TestCompactObjectBuildFileEmitsSourceLabels(t *testing.T) {
 		`source_tree_info = ":_source_tree"`,
 		`name = "` + initTarget + `_config"`,
 		`config = ":` + initTarget + `_config"`,
+		`objtool = "//linux:objtool"`,
 		`src = "@linux//:subdir/init.c"`,
 		`src = "@linux//:subdir/net/core.c"`,
 	} {
 		if !strings.Contains(string(objectBuild), want) {
 			t.Fatalf("object BUILD missing %s:\n%s", want, objectBuild)
 		}
+	}
+}
+
+func TestCompactObjectBuildFileLimitsSourceObjtoolToX86(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	kb := mustParseKbuildFixture(t)
+	sourceRoot := t.TempDir()
+	writeCompactSource(t, sourceRoot, "subdir/init.c")
+	writeCompactSource(t, sourceRoot, "subdir/net/core.c")
+
+	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{
+		{Name: "base", Flags: map[string]string{"CONFIG_NET": "y"}},
+	}, CompactMetadataOptions{Schema: CompactSchemaV012, ObjectDir: "subdir", SourceRoot: sourceRoot})
+	if err != nil {
+		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+	}
+	objectBuild, err := metadata.ObjectBuildFile(CompactBuildFileOptions{
+		Schema:             CompactSchemaV012,
+		Arch:               "arm64",
+		SourceLabelPackage: "@linux//",
+		SourceObjtool:      "//linux:objtool",
+		SourceRootLabel:    "@linux//:Kconfig",
+	})
+	if err != nil {
+		t.Fatalf("ObjectBuildFile() failed: %v", err)
+	}
+	if strings.Contains(string(objectBuild), `objtool = "//linux:objtool"`) {
+		t.Fatalf("arm64 object BUILD unexpectedly contains x86 objtool:\n%s", objectBuild)
 	}
 }
 

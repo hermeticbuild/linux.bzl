@@ -31,6 +31,59 @@ config TARGET
 	})
 }
 
+func TestResolveConfigIgnoresImportedRustToolchainValues(t *testing.T) {
+	resolved := mustResolveConfig(t, `
+config RUSTC_VERSION
+	int
+	default 109800
+
+config RUSTC_HAS_FOO
+	bool
+	default y
+`, map[string]string{
+		"CONFIG_RUSTC_VERSION": "107800",
+		"CONFIG_RUSTC_HAS_FOO": "n",
+	})
+	if got := resolved.Value("CONFIG_RUSTC_VERSION"); got != "109800" {
+		t.Fatalf("CONFIG_RUSTC_VERSION = %q, want probe-derived default", got)
+	}
+	if got := resolved.Value("CONFIG_RUSTC_HAS_FOO"); got != "y" {
+		t.Fatalf("CONFIG_RUSTC_HAS_FOO = %q, want probe-derived default", got)
+	}
+	if len(resolved.Raw) != 0 {
+		t.Fatalf("raw toolchain values were retained: %#v", resolved.Raw)
+	}
+}
+
+func TestValidateRustToolchainEquivalence(t *testing.T) {
+	actual := &ResolvedConfig{
+		Effective: map[string]string{
+			"CONFIG_RUST":          "y",
+			"CONFIG_RUSTC_VERSION": "109800",
+			"CONFIG_RUSTC_HAS_FOO": "y",
+			"CONFIG_HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC": "y",
+			"CONFIG_STRUCTURAL_NEW":                          "n",
+		},
+		Written: map[string]bool{
+			"CONFIG_RUST":          true,
+			"CONFIG_RUSTC_VERSION": true,
+			"CONFIG_RUSTC_HAS_FOO": true,
+			"CONFIG_HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC": true,
+		},
+	}
+	if err := ValidateRustToolchainEquivalence(map[string]string{
+		"CONFIG_RUST":          "y",
+		"CONFIG_RUSTC_VERSION": "107800",
+	}, actual); err != nil {
+		t.Fatalf("ValidateRustToolchainEquivalence() rejected dynamic-only changes: %v", err)
+	}
+	actual.Effective["CONFIG_STRUCTURAL_NEW"] = "y"
+	actual.Written["CONFIG_STRUCTURAL_NEW"] = true
+	if err := ValidateRustToolchainEquivalence(map[string]string{"CONFIG_RUST": "y"}, actual); err == nil {
+		t.Fatal("ValidateRustToolchainEquivalence() accepted structural change")
+	}
+}
+
 func TestParseConfigSkipsUnsetComments(t *testing.T) {
 	raw, err := ParseConfig(strings.NewReader("# CONFIG_DEFAULT_ON is not set\n"))
 	if err != nil {

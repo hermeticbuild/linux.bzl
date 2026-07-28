@@ -5,7 +5,27 @@ import (
 	"testing"
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
+	"github.com/hermeticbuild/linux.bzl/internal/rusttoolchain"
 )
+
+func TestApplyRustToolchainProbe(t *testing.T) {
+	vars := stringMapFlag{"RUSTC_VERSION_TEXT": "repository baseline"}
+	probeValues := stringMapFlag{}
+	applyRustToolchainProbe(vars, probeValues, rusttoolchain.Probe{
+		VersionText:     "rustc 1.98.0-nightly (012345678 2026-06-24)",
+		VersionCode:     109800,
+		LLVMVersionCode: 220107,
+	})
+	if got, want := vars["RUSTC_VERSION_TEXT"], "rustc 1.98.0-nightly (012345678 2026-06-24)"; got != want {
+		t.Fatalf("RUSTC_VERSION_TEXT = %q, want %q", got, want)
+	}
+	if got, want := probeValues["rustc_version"], "109800"; got != want {
+		t.Fatalf("rustc_version = %q, want %q", got, want)
+	}
+	if got, want := probeValues["rustc_llvm_version"], "220107"; got != want {
+		t.Fatalf("rustc_llvm_version = %q, want %q", got, want)
+	}
+}
 
 func TestKbuildVariablesForConfigUsesWrittenConfigView(t *testing.T) {
 	vars := kbuildVariablesForConfig(

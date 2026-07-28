@@ -54,18 +54,22 @@ type CompactConfig struct {
 }
 
 type CompactObjectVariant struct {
-	Target         string            `json:"target"`
-	Package        string            `json:"package,omitempty"`
-	Object         string            `json:"object"`
-	Source         string            `json:"source,omitempty"`
-	SourceIncludes []string          `json:"source_includes,omitempty"`
-	Mode           string            `json:"mode"`
-	ModName        string            `json:"modname,omitempty"`
-	Flags          []string          `json:"flags,omitempty"`
-	RemoveFlags    []string          `json:"remove_flags,omitempty"`
-	ConfigFragment map[string]string `json:"config_fragment,omitempty"`
-	Deps           []string          `json:"deps,omitempty"`
-	Members        []string          `json:"members,omitempty"`
+	Target          string            `json:"target"`
+	Package         string            `json:"package,omitempty"`
+	Object          string            `json:"object"`
+	Source          string            `json:"source,omitempty"`
+	SourceIncludes  []string          `json:"source_includes,omitempty"`
+	Mode            string            `json:"mode"`
+	ModuleRoot      bool              `json:"module_root,omitempty"`
+	ModName         string            `json:"modname,omitempty"`
+	Flags           []string          `json:"flags,omitempty"`
+	RemoveFlags     []string          `json:"remove_flags,omitempty"`
+	ObjtoolArgs     []string          `json:"objtool_args,omitempty"`
+	ObjtoolDisabled bool              `json:"objtool_disabled,omitempty"`
+	ObjtoolForce    bool              `json:"objtool_force,omitempty"`
+	ConfigFragment  map[string]string `json:"config_fragment,omitempty"`
+	Deps            []string          `json:"deps,omitempty"`
+	Members         []string          `json:"members,omitempty"`
 }
 
 type CompactObjectPackage struct {
@@ -81,6 +85,7 @@ type CompactBuildFileOptions struct {
 	SourceLabelPackage       string
 	SourceLabelPackages      map[string]string
 	SourceASN1Compiler       string
+	SourceObjtool            string
 	SourceRelacheck          string
 	SourceRootLabel          string
 	SourceTreeAllFiles       []string
@@ -367,7 +372,7 @@ func cleanKbuildDir(dir string) string {
 }
 
 func (v CompactObjectVariant) equal(other CompactObjectVariant) bool {
-	if v.Target != other.Target || v.Package != other.Package || v.Object != other.Object || v.Source != other.Source || v.Mode != other.Mode || v.ModName != other.ModName || len(v.SourceIncludes) != len(other.SourceIncludes) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ConfigFragment) != len(other.ConfigFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
+	if v.Target != other.Target || v.Package != other.Package || v.Object != other.Object || v.Source != other.Source || v.Mode != other.Mode || v.ModuleRoot != other.ModuleRoot || v.ModName != other.ModName || v.ObjtoolDisabled != other.ObjtoolDisabled || v.ObjtoolForce != other.ObjtoolForce || len(v.SourceIncludes) != len(other.SourceIncludes) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ObjtoolArgs) != len(other.ObjtoolArgs) || len(v.ConfigFragment) != len(other.ConfigFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
 		return false
 	}
 	for i := range v.SourceIncludes {
@@ -382,6 +387,11 @@ func (v CompactObjectVariant) equal(other CompactObjectVariant) bool {
 	}
 	for i := range v.RemoveFlags {
 		if v.RemoveFlags[i] != other.RemoveFlags[i] {
+			return false
+		}
+	}
+	for i := range v.ObjtoolArgs {
+		if v.ObjtoolArgs[i] != other.ObjtoolArgs[i] {
 			return false
 		}
 	}
@@ -464,15 +474,18 @@ func compactShortStringArrays(data []byte, printWidth int) []byte {
 }
 
 type resolvedKbuildObject struct {
-	object    string
-	directory string
-	mode      string
-	modname   string
-	flags     []resolvedKbuildFlag
-	remove    []resolvedKbuildFlag
-	footprint map[string]bool
-	members   []string
-	root      bool
+	object          string
+	directory       string
+	mode            string
+	modname         string
+	flags           []resolvedKbuildFlag
+	remove          []resolvedKbuildFlag
+	objtoolArgs     []string
+	objtoolDisabled bool
+	objtoolForce    bool
+	footprint       map[string]bool
+	members         []string
+	root            bool
 }
 
 type resolvedKbuildFlag struct {
@@ -613,6 +626,7 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 			}
 		}
 		object.flags = append(object.flags, sanitizerKbuildFlags(config, kb.objectSettings, object)...)
+		object.objtoolDisabled, object.objtoolForce, object.objtoolArgs = kbuildObjtoolSettings(kb, object)
 	}
 
 	out := resolvedKbuildObjects{
@@ -629,6 +643,113 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 		}
 	}
 	return out
+}
+
+func kbuildObjtoolSettings(kb *KbuildFile, object *resolvedKbuildObject) (disabled, force bool, args []string) {
+	compileObject := kbuildCompileObjectName(object.object)
+	settingsObject := object
+	if compileObject != object.object {
+		settingsObject = &resolvedKbuildObject{
+			object:    compileObject,
+			directory: object.directory,
+		}
+	}
+	objectValue, directoryValue := kbuildObjectSettingValues(
+		kb.objectSettings,
+		settingsObject,
+		"OBJECT_FILES_NON_STANDARD",
+	)
+	nonStandardValue, hasNonStandardValue := kbuildTargetVariableValue(
+		kb.TargetVariables,
+		compileObject,
+		"OBJECT_FILES_NON_STANDARD",
+	)
+	nonStandard := firstKbuildSettingEnabled(
+		false,
+		conditionalSettingValue(nonStandardValue, hasNonStandardValue),
+		objectValue,
+		directoryValue,
+	)
+	enabledValue, hasEnabledValue := kbuildTargetVariableValue(
+		kb.TargetVariables,
+		compileObject,
+		"objtool-enabled",
+	)
+	enabled := !nonStandard && compileObject == object.object
+	if hasEnabledValue {
+		enabled = strings.TrimSpace(enabledValue) != ""
+		force = enabled
+	}
+	argsValue, hasArgsValue := kbuildTargetVariableValue(
+		kb.TargetVariables,
+		compileObject,
+		"objtool-args",
+	)
+	if hasArgsValue {
+		args = concreteKbuildFlags(kbuildFields(argsValue))
+	}
+	return !enabled, force, args
+}
+
+func conditionalSettingValue(value string, present bool) string {
+	if !present {
+		return ""
+	}
+	if strings.TrimSpace(value) == "" {
+		return "n"
+	}
+	return value
+}
+
+func kbuildCompileObjectName(object string) string {
+	for _, suffix := range []string{".pi.o", ".stub.o"} {
+		if strings.HasSuffix(object, suffix) {
+			return strings.TrimSuffix(object, suffix) + ".o"
+		}
+	}
+	return object
+}
+
+func kbuildTargetVariableValue(variables []KbuildTargetVariable, object, name string) (string, bool) {
+	value := ""
+	assigned := false
+	for _, variable := range variables {
+		if variable.Variable != name || !kbuildTargetVariableMatches(variable.Targets, object) {
+			continue
+		}
+		switch variable.Operator {
+		case "+=":
+			value = appendMakeValue(value, variable.Value)
+			assigned = true
+		case "?=":
+			if !assigned {
+				value = variable.Value
+				assigned = true
+			}
+		default:
+			value = variable.Value
+			assigned = true
+		}
+	}
+	return strings.TrimSpace(value), assigned
+}
+
+func kbuildTargetVariableMatches(targets []string, object string) bool {
+	object = filepath.ToSlash(strings.TrimPrefix(object, "./"))
+	for _, target := range targets {
+		target = filepath.ToSlash(strings.TrimPrefix(target, "./"))
+		prefix, suffix, pattern := strings.Cut(target, "%")
+		if !pattern && target == object {
+			return true
+		}
+		if pattern &&
+			len(object) >= len(prefix)+len(suffix) &&
+			strings.HasPrefix(object, prefix) &&
+			strings.HasSuffix(object, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (kb *KbuildFile) resolvedObjectEntries(config *ResolvedConfig) []KbuildObject {
@@ -972,20 +1093,38 @@ func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, sou
 	}
 	flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.flags, source), sourceRoot)
 	remove := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.remove, source), sourceRoot)
-	hash := objectVariantHash(o.object, o.mode, o.modname, flags, remove, fragment, sourceIncludes, deps, members)
+	hash := objectVariantHash(
+		o.object,
+		o.mode,
+		o.modname,
+		flags,
+		remove,
+		fragment,
+		sourceIncludes,
+		deps,
+		members,
+		o.root && o.mode == "m",
+		o.objtoolDisabled,
+		o.objtoolForce,
+		o.objtoolArgs,
+	)
 	return CompactObjectVariant{
-		Target:         sanitizeTargetName(strings.TrimSuffix(o.object, ".o")) + "__" + hash,
-		Package:        objectPackage(o.object),
-		Object:         o.object,
-		Source:         source,
-		SourceIncludes: append([]string(nil), sourceIncludes...),
-		Mode:           o.mode,
-		ModName:        o.modname,
-		Flags:          flags,
-		RemoveFlags:    remove,
-		ConfigFragment: fragment,
-		Deps:           append([]string(nil), deps...),
-		Members:        append([]string(nil), members...),
+		Target:          sanitizeTargetName(strings.TrimSuffix(o.object, ".o")) + "__" + hash,
+		Package:         objectPackage(o.object),
+		Object:          o.object,
+		Source:          source,
+		SourceIncludes:  append([]string(nil), sourceIncludes...),
+		Mode:            o.mode,
+		ModuleRoot:      o.root && o.mode == "m",
+		ModName:         o.modname,
+		Flags:           flags,
+		RemoveFlags:     remove,
+		ObjtoolArgs:     append([]string(nil), o.objtoolArgs...),
+		ObjtoolDisabled: o.objtoolDisabled,
+		ObjtoolForce:    o.objtoolForce,
+		ConfigFragment:  fragment,
+		Deps:            append([]string(nil), deps...),
+		Members:         append([]string(nil), members...),
 	}
 }
 
@@ -1243,7 +1382,7 @@ func objectPackage(object string) string {
 	return dir
 }
 
-func objectVariantHash(object, mode, modname string, flags, removeFlags []string, fragment map[string]string, sourceIncludes, deps, members []string) string {
+func objectVariantHash(object, mode, modname string, flags, removeFlags []string, fragment map[string]string, sourceIncludes, deps, members []string, moduleRoot, objtoolDisabled, objtoolForce bool, objtoolArgs []string) string {
 	var b strings.Builder
 	b.WriteString(object)
 	b.WriteByte('\n')
@@ -1258,6 +1397,20 @@ func objectVariantHash(object, mode, modname string, flags, removeFlags []string
 	for _, flag := range removeFlags {
 		b.WriteString("remove=")
 		b.WriteString(flag)
+		b.WriteByte('\n')
+	}
+	if moduleRoot {
+		b.WriteString("module_root=true\n")
+	}
+	if objtoolDisabled {
+		b.WriteString("objtool=disabled\n")
+	}
+	if objtoolForce {
+		b.WriteString("objtool=force\n")
+	}
+	for _, arg := range objtoolArgs {
+		b.WriteString("objtool_arg=")
+		b.WriteString(arg)
 		b.WriteByte('\n')
 	}
 	for _, key := range sortedConfigKeys(fragment) {
@@ -1379,6 +1532,15 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 			r.SetAttr("mode", variant.Mode)
 			r.SetAttr("tags", []string{"manual"})
 			r.SetAttr("objects", localLabels(variant.Members))
+			if variant.ModuleRoot {
+				r.SetAttr("module_root", true)
+			}
+			if variant.ObjtoolForce {
+				r.SetAttr("objtool_force", true)
+			}
+			if len(variant.ObjtoolArgs) != 0 {
+				r.SetAttr("objtool_args", variant.ObjtoolArgs)
+			}
 			if opts.Arch != "" {
 				r.SetAttr("arch", opts.Arch)
 			}
@@ -1458,9 +1620,21 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 			if opts.SourceASN1Compiler != "" && strings.HasSuffix(variant.Object, ".asn1.o") {
 				r.SetAttr("asn1_compiler", opts.SourceASN1Compiler)
 			}
+			if opts.Arch == "x86" && opts.SourceObjtool != "" && !variant.ObjtoolDisabled {
+				r.SetAttr("objtool", opts.SourceObjtool)
+				if variant.ObjtoolForce {
+					r.SetAttr("objtool_force", true)
+				}
+				if len(variant.ObjtoolArgs) != 0 {
+					r.SetAttr("objtool_args", variant.ObjtoolArgs)
+				}
+			}
 			if opts.SourceRelacheck != "" && strings.HasSuffix(variant.Object, ".pi.o") {
 				r.SetAttr("relacheck", opts.SourceRelacheck)
 			}
+		}
+		if variant.ModuleRoot {
+			r.SetAttr("module_root", true)
 		}
 		if len(variant.Flags) != 0 {
 			r.SetAttr("flags", variant.Flags)

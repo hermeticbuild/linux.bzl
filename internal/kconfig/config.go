@@ -176,6 +176,7 @@ func (t *Tree) ResolveConfig(name string, raw map[string]string) (*ResolvedConfi
 // ResolveConfigWithOptions computes effective Kconfig values for one imported
 // .config with explicit resolver semantics.
 func (t *Tree) ResolveConfigWithOptions(name string, raw map[string]string, opts ResolveConfigOptions) (*ResolvedConfig, error) {
+	raw = WithoutRustToolchainValues(raw)
 	resolver := &configResolver{
 		tree:        t,
 		rawFlags:    raw,
@@ -253,6 +254,62 @@ func (t *Tree) ResolveConfigWithOptions(name string, raw map[string]string, opts
 		}
 	}
 	return nil, fmt.Errorf("effective Kconfig values did not converge")
+}
+
+// IsRustToolchainValue reports hidden Kconfig values that must be derived from
+// the rustc selected by Bazel, never imported from a checked-in fragment.
+func IsRustToolchainValue(key string) bool {
+	switch key {
+	case "CONFIG_RUSTC_VERSION",
+		"CONFIG_RUSTC_LLVM_VERSION",
+		"CONFIG_RUSTC_VERSION_TEXT",
+		"CONFIG_RUST_IS_AVAILABLE",
+		"CONFIG_HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC":
+		return true
+	default:
+		return strings.HasPrefix(key, "CONFIG_RUSTC_HAS_")
+	}
+}
+
+// WithoutRustToolchainValues returns a copy with toolchain-owned values
+// removed. Kconfig then obtains them exclusively from its hermetic probe model.
+func WithoutRustToolchainValues(flags map[string]string) map[string]string {
+	filtered := make(map[string]string, len(flags))
+	for key, value := range flags {
+		if !IsRustToolchainValue(key) {
+			filtered[key] = value
+		}
+	}
+	return filtered
+}
+
+// ValidateRustToolchainEquivalence ensures action-time toolchain probing did
+// not change the repository-generated structural Kconfig snapshot. Dynamic
+// Rust toolchain symbols are intentionally ignored.
+func ValidateRustToolchainEquivalence(expected map[string]string, actual *ResolvedConfig) error {
+	expected = WithoutRustToolchainValues(expected)
+	var differences []string
+	for key, want := range expected {
+		if got := actual.Value(key); got != want {
+			differences = append(differences, fmt.Sprintf("%s=%s (generated %s)", key, got, want))
+		}
+	}
+	for key, got := range actual.Effective {
+		if IsRustToolchainValue(key) || !actual.ShouldWrite(key) || got == "" || got == "n" {
+			continue
+		}
+		if _, ok := expected[key]; !ok {
+			differences = append(differences, fmt.Sprintf("%s=%s (absent from generated snapshot)", key, got))
+		}
+	}
+	if len(differences) == 0 {
+		return nil
+	}
+	slices.Sort(differences)
+	if len(differences) > 20 {
+		differences = append(differences[:20], fmt.Sprintf("... and %d more", len(differences)-20))
+	}
+	return fmt.Errorf("selected Rust toolchain changes structural Kconfig values:\n  %s", strings.Join(differences, "\n  "))
 }
 
 type configResolver struct {

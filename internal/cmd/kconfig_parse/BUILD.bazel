@@ -5,7 +5,10 @@ go_library(
     srcs = ["main.go"],
     importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/kconfig_parse",
     visibility = ["//visibility:private"],
-    deps = ["//internal/kconfig"],
+    deps = [
+        "//internal/kconfig",
+        "//internal/rusttoolchain",
+    ],
 )
 
 go_binary(
@@ -19,5 +22,8 @@ go_test(
     name = "kconfig_parse_test",
     srcs = ["main_test.go"],
     embed = [":kconfig_parse_lib"],
-    deps = ["//internal/kconfig"],
+    deps = [
+        "//internal/kconfig",
+        "//internal/rusttoolchain",
+    ],
 )
