@@ -37,7 +37,9 @@ bazel test //:kernel_outputs_aarch64_build_test \
   //:linux_6_18_39_aarch64_module_test
 bazel shutdown
 bazel test //:linux_6_12_96_rust_module_test \
-  //:linux_6_18_39_rust_module_test
+  //:linux_6_12_96_aarch64_rust_module_test \
+  //:linux_6_18_39_rust_module_test \
+  //:linux_6_18_39_aarch64_rust_module_test
 ```
 
 The four `*_boot_test` targets pair each kernel with an initramfs containing a
@@ -49,20 +51,28 @@ starts. Run one matrix entry directly while debugging:
 bazel test //:linux_6_12_96_x86_64_boot_test --test_output=streamed
 ```
 
-The Rust fixtures enable `CONFIG_RUST` on Linux 6.12.x and 6.18.x targeting
-x86_64, build version-native module sources through the public `linux_module`
-rule, insert the resulting `.ko`, and check the module-load marker:
+The Rust fixtures enable `CONFIG_RUST`, DWARF5, kernel BTF, and module BTF on
+Linux 6.12.x and 6.18.x targeting x86_64 and aarch64. They build
+version-native module sources through the public `linux_module` rule, insert
+the resulting `.ko`, and check the module-load marker:
 
 ```sh
 bazel test //:linux_6_12_96_rust_module_test \
+  //:linux_6_12_96_aarch64_rust_module_test \
   //:linux_6_18_39_rust_module_test \
+  //:linux_6_18_39_aarch64_rust_module_test \
   --test_output=streamed
 ```
 
-Rust-for-Linux actions require a Linux x86_64 executor and the registered
-stable Rust 1.97.0 toolchain. They intentionally fail for other kernel
-target architectures, unsupported instrumentation paths, or module sources
-that emit `MODULE_VERSION`, `version=`, or `srcversion=` metadata.
+This consumer workspace declares and registers the standard rules_rs stable
+Rust 1.97.0 toolchains. Both maintained kernel lines enforce their upstream
+minimum of Rust 1.78.0 when the selected compiler is probed.
+`linux.bzl` consumes the selected compiler and the matching `rustc_srcs` from
+the resolved Rust-analyzer toolchain; it does not register a production Rust
+toolchain itself. Rust-for-Linux actions require a Linux x86_64 executor even
+when the kernel target is aarch64. They intentionally fail for unsupported
+debug/instrumentation paths or module sources that emit `MODULE_VERSION`,
+`version=`, or `srcversion=` metadata.
 
 Build one fixed output directly:
 

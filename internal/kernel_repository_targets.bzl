@@ -4,7 +4,11 @@ load(":architectures.bzl", "linux_architectures")
 load(":kernel_bundle.bzl", "linux_kernel_bundle", "linux_kernel_exports")
 load(":linux_modules.bzl", "linux_module_sdk")
 load(":linux_objects.bzl", "linux_compressed_image", "linux_resolved_config", "linux_vmlinux")
-load(":linux_rust.bzl", "linux_disabled_rust_kernel_sdk", "linux_rust_kernel_sdk")
+load(
+    ":linux_rust.bzl",
+    "linux_disabled_rust_kernel_sdk",
+    "linux_rust_kernel_sdk",
+)
 
 visibility("public")
 
@@ -28,6 +32,8 @@ def _define_config(
         config,
         config_mode,
         arch,
+        minimum_rustc_version,
+        rust_enabled,
         source_repo,
         version,
         visibility):
@@ -37,22 +43,26 @@ def _define_config(
         "SRCARCH": arch.srcarch,
         "UTS_MACHINE": arch.uts_machine,
     })
-    linux_resolved_config(
-        name = name,
-        config = config,
-        config_name = name,
-        config_mode = config_mode,
-        env = {
+    kwargs = {
+        "name": name,
+        "config": config,
+        "config_name": name,
+        "config_mode": config_mode,
+        "env": {
             "ARCH": arch.arch,
             "SRCARCH": arch.srcarch,
         },
-        root = _source_label(source_repo, "Kconfig"),
-        source_root = _source_label(source_repo, "Kconfig"),
-        srcs = [_source_label(source_repo, "kconfig_files")],
-        vars = compact_vars,
-        version = version,
-        visibility = visibility,
-    )
+        "root": _source_label(source_repo, "Kconfig"),
+        "rust_enabled": rust_enabled,
+        "source_root": _source_label(source_repo, "Kconfig"),
+        "srcs": [_source_label(source_repo, "kconfig_files")],
+        "vars": compact_vars,
+        "version": version,
+        "visibility": visibility,
+    }
+    if rust_enabled:
+        kwargs["minimum_rustc_version"] = minimum_rustc_version
+    linux_resolved_config(**kwargs)
 
 def _define_outputs(
         prefix,
@@ -60,6 +70,7 @@ def _define_outputs(
         config,
         compact_image,
         host_tools,
+        minimum_rustc_version,
         rust_profile_json,
         rust_enabled,
         source_repo,
@@ -84,6 +95,7 @@ def _define_outputs(
             "source_tree": _source_tree_inputs(source_repo),
             "srcarch": arch.srcarch,
             "target_compatible_with": [arch.platform],
+            "minimum_rustc_version": minimum_rustc_version,
             "visibility": visibility,
         }
         if hasattr(host_tools, "objtool"):
@@ -160,6 +172,7 @@ def linux_image_targets(
         arch,
         version,
         source_repo,
+        minimum_rustc_version,
         rust_profile_json,
         platform,
         base_config,
@@ -193,6 +206,8 @@ def linux_image_targets(
         config = base_config,
         config_mode = config_mode,
         arch = descriptor,
+        minimum_rustc_version = minimum_rustc_version,
+        rust_enabled = base_rust_enabled,
         source_repo = source_repo,
         version = version,
         visibility = internal_visibility,
@@ -216,6 +231,7 @@ def linux_image_targets(
         config = ":_base_config",
         compact_image = graph_image,
         host_tools = host_tools,
+        minimum_rustc_version = minimum_rustc_version,
         rust_profile_json = rust_profile_json,
         rust_enabled = base_rust_enabled,
         source_repo = source_repo,
@@ -249,6 +265,8 @@ def linux_image_targets(
             config = variant_configs[variant],
             config_mode = config_mode,
             arch = descriptor,
+            minimum_rustc_version = minimum_rustc_version,
+            rust_enabled = variant_rust_enabled[variant],
             source_repo = source_repo,
             version = version,
             visibility = internal_visibility,
@@ -272,6 +290,7 @@ def linux_image_targets(
             config = ":" + config_target,
             compact_image = variant_graph_images[variant],
             host_tools = variant_host_tools,
+            minimum_rustc_version = minimum_rustc_version,
             rust_profile_json = rust_profile_json,
             rust_enabled = variant_rust_enabled[variant],
             source_repo = source_repo,

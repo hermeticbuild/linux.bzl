@@ -27,10 +27,14 @@ LLVM version: 22.1.7
 	if probe.LLVMVersionCode != 220107 || probe.CommitDate != "2026-06-23" {
 		t.Fatalf("unexpected rustc details: %#v", probe)
 	}
+	if probe.CommitHash != "0123456789" {
+		t.Fatalf("commit hash = %q", probe.CommitHash)
+	}
 }
 
 func TestParseVerboseStable(t *testing.T) {
 	probe, err := ParseVerbose(`rustc 1.78.0 (9b00956e5 2024-04-29)
+commit-hash: 9b00956e56009bab2aa15d7bff10916599e3d6d6
 release: 1.78.0
 LLVM version: 18.1.2
 `)
@@ -48,6 +52,7 @@ LLVM version: 18.1.2
 
 func TestProbeRoundTrip(t *testing.T) {
 	probe, err := ParseVerbose(`rustc 1.97.0 (abc 2026-03-01)
+commit-hash: abcdef0123456789
 release: 1.97.0
 LLVM version: 22.1.6
 `)
@@ -76,6 +81,7 @@ func TestParseVerboseRejectsMissingLLVM(t *testing.T) {
 
 func TestProbeRejectsMismatchedVersionText(t *testing.T) {
 	probe, err := ParseVerbose(`rustc 1.98.0-nightly (012345678 2026-06-23)
+commit-hash: 0123456789
 release: 1.98.0-nightly
 LLVM version: 22.1.7
 `)
@@ -85,5 +91,15 @@ LLVM version: 22.1.7
 	probe.VersionText = "rustc 1.97.0"
 	if err := probe.Validate(); err == nil {
 		t.Fatal("Probe.Validate() accepted version text for another release")
+	}
+}
+
+func TestParseVerboseRejectsMissingCommitHash(t *testing.T) {
+	_, err := ParseVerbose(`rustc 1.78.0 (9b00956e5 2024-04-29)
+release: 1.78.0
+LLVM version: 18.1.2
+`)
+	if err == nil {
+		t.Fatal("ParseVerbose() succeeded without commit-hash")
 	}
 }

@@ -34,3 +34,48 @@ def _graph_config_args_test_impl(ctx):
     return unittest.end(env)
 
 graph_config_args_test = unittest.make(_graph_config_args_test_impl)
+
+def _graph_arch_tool_args_test_impl(ctx):
+    env = unittest.begin(ctx)
+    asserts.equals(
+        env,
+        [
+            "-source_objtool",
+            "//:_base_x86_objtool",
+        ],
+        repositories_test_helpers.graph_arch_tool_args("x86_64", "_base"),
+    )
+    asserts.equals(
+        env,
+        [
+            "-source_relacheck",
+            "//:_variant_debug_relacheck_tool",
+        ],
+        repositories_test_helpers.graph_arch_tool_args("aarch64", "_variant_debug"),
+    )
+    return unittest.end(env)
+
+graph_arch_tool_args_test = unittest.make(_graph_arch_tool_args_test_impl)
+
+def _without_rust_toolchain_config_test_impl(ctx):
+    env = unittest.begin(ctx)
+    asserts.equals(
+        env,
+        {
+            "CONFIG_CFI_CLANG": "y",
+            "CONFIG_RUST": "y",
+        },
+        repositories_test_helpers.without_rust_toolchain_config({
+            "CONFIG_CFI_CLANG": "y",
+            "CONFIG_HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC": "y",
+            "CONFIG_RUST": "y",
+            "CONFIG_RUSTC_HAS_COERCE_POINTEE": "y",
+            "CONFIG_RUSTC_LLVM_VERSION": "220106",
+            "CONFIG_RUSTC_VERSION": "109700",
+            "CONFIG_RUSTC_VERSION_TEXT": "rustc 1.97.0-nightly",
+            "CONFIG_RUST_IS_AVAILABLE": "y",
+        }),
+    )
+    return unittest.end(env)
+
+without_rust_toolchain_config_test = unittest.make(_without_rust_toolchain_config_test_impl)

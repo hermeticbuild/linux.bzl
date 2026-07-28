@@ -19,11 +19,19 @@ load("//internal:providers.bzl", "LinuxRustSdkInfo")
 visibility("private")
 
 _LEGACY_PROFILE_JSON = """{
-  "schema": "linux-rust-profile-v1",
+  "schema": "linux-rust-profile-v2",
   "architecture": "x86_64",
   "source_layout": "legacy",
-  "target": {},
-  "common_flags": ["--edition=2021"],
+  "target": {
+    "kind": "generated",
+    "generator_source": "scripts/generate_rust_target.rs",
+    "stdin": "config_auto_conf",
+    "output": "rust/target.json"
+  },
+  "common_flags": {
+    "always": ["--edition=2021"],
+    "version_predicates": []
+  },
   "target_flags": {
     "always": ["--target={target_spec}", "@{rustc_cfg}"],
     "conditional": [
@@ -31,38 +39,95 @@ _LEGACY_PROFILE_JSON = """{
         "config": "CONFIG_CC_OPTIMIZE_FOR_SIZE",
         "equals": "y",
         "flags": ["-Copt-level=s"],
-        "else_flags": ["-Copt-level=2"]
+        "else_flags": ["-Copt-level=2"],
+        "version_predicates": []
+      }
+    ],
+    "version_predicates": [
+      {
+        "at_least": "1.98.0",
+        "add": ["-Cnext-solver=coherence"],
+        "remove": [],
+        "else_add": [],
+        "else_remove": []
       }
     ]
   },
   "module": {
     "allowed_features": ["arbitrary_self_types"],
-    "flags": ["--extern", "kernel", "-L{rust_dir}"]
+    "flags": ["--extern", "kernel", "-L{rust_dir}"],
+    "version_predicates": []
   },
   "bindgen": {},
   "proc_macros": [],
   "crates": [],
   "exports": {},
-  "runtime_objects": []
+  "runtime_objects": [],
+  "unsupported_configs": []
 }"""
 
 _ENABLED_PROFILE_JSON = """{
-  "schema": "linux-rust-profile-v1",
+  "schema": "linux-rust-profile-v2",
   "architecture": "x86_64",
   "source_layout": "legacy",
   "target": {
+    "kind": "generated",
     "generator_source": "scripts/generate_rust_target.rs",
     "stdin": "config_auto_conf",
     "output": "rust/target.json"
   },
-  "common_flags": ["--edition=2021"],
+  "common_flags": {
+    "always": ["--edition=2021"],
+    "version_predicates": [
+      {
+        "at_least": "1.91.0",
+        "add": ["--cfg", "rustc_at_least_1_91"],
+        "remove": [],
+        "else_add": [],
+        "else_remove": []
+      }
+    ]
+  },
   "target_flags": {
     "always": ["--target={target_spec}", "@{rustc_cfg}"],
-    "conditional": []
+    "conditional": [
+      {
+        "config": "CONFIG_DEBUG_INFO",
+        "equals": "y",
+        "flags": ["-Cdebuginfo=2"],
+        "else_flags": [],
+        "version_predicates": []
+      },
+      {
+        "config": "CONFIG_DEBUG_INFO_DWARF5",
+        "equals": "y",
+        "flags": ["-Zdwarf-version=5"],
+        "else_flags": [],
+        "version_predicates": []
+      }
+    ],
+    "version_predicates": [
+      {
+        "at_least": "1.98.0",
+        "add": ["--cfg", "rustc_at_least_1_98"],
+        "remove": [],
+        "else_add": [],
+        "else_remove": []
+      }
+    ]
   },
   "module": {
     "allowed_features": [],
-    "flags": []
+    "flags": [],
+    "version_predicates": [
+      {
+        "at_least": "1.99.0",
+        "add": ["--cfg", "rustc_at_least_1_99"],
+        "remove": [],
+        "else_add": [],
+        "else_remove": []
+      }
+    ]
   },
   "bindgen": {
     "parameters": "rust/bindgen_parameters",
@@ -92,7 +157,8 @@ _ENABLED_PROFILE_JSON = """{
       "externs": [],
       "flags": [],
       "skip_flags": [],
-      "objcopy_flags": []
+      "objcopy_flags": [],
+      "version_predicates": []
     }
   ],
   "generated_assembly": [],
@@ -100,8 +166,28 @@ _ENABLED_PROFILE_JSON = """{
     "crates": [],
     "source": "rust/exports.c"
   },
-  "runtime_objects": []
+  "runtime_objects": [],
+  "unsupported_configs": []
 }"""
+
+_AARCH64_PROFILE_JSON = _ENABLED_PROFILE_JSON.replace(
+    '"architecture": "x86_64"',
+    '"architecture": "aarch64"',
+).replace(
+    """  "target": {
+    "kind": "generated",
+    "generator_source": "scripts/generate_rust_target.rs",
+    "stdin": "config_auto_conf",
+    "output": "rust/target.json"
+  },""",
+    """  "target": {
+    "kind": "builtin",
+    "builtin_triple": "aarch64-unknown-none"
+  },""",
+).replace(
+    "--target={target_spec}",
+    "--target=aarch64-unknown-none",
+)
 
 def _disabled_sdk_test_impl(ctx):
     env = analysistest.begin(ctx)
@@ -110,15 +196,17 @@ def _disabled_sdk_test_impl(ctx):
     asserts.false(env, sdk.enabled)
     asserts.equals(env, [], sdk.compile_inputs.to_list())
     asserts.equals(env, [], sdk.module_flags)
+    asserts.equals(env, [], sdk.module_version_predicates)
     asserts.equals(env, None, sdk.rustc)
     asserts.equals(env, {}, sdk.rustc_env)
     asserts.equals(env, [], sdk.rustc_files.to_list())
-    asserts.equals(env, "", sdk.rustc_version)
-    asserts.equals(env, None, sdk.rustc_version_runner)
+    asserts.equals(env, None, sdk.rustc_probe)
+    asserts.equals(env, "", sdk.minimum_rustc_version)
     asserts.equals(env, None, sdk.objtree_anchor)
     asserts.equals(env, [], sdk.runtime_objects)
     asserts.equals(env, None, sdk.rust_dir_anchor)
     asserts.equals(env, None, sdk.target_spec)
+    asserts.equals(env, 0, len(analysistest.target_actions(env)))
     return analysistest.end(env)
 
 _disabled_sdk_test = analysistest.make(_disabled_sdk_test_impl)
@@ -130,6 +218,7 @@ def _rust_config_fixture_impl(ctx):
     autoconf_h = ctx.actions.declare_file(ctx.label.name + ".include/generated/autoconf.h")
     rustc_cfg = ctx.actions.declare_file(ctx.label.name + ".include/generated/rustc_cfg")
     kernel_release = ctx.actions.declare_file(ctx.label.name + ".include/config/kernel.release")
+    rustc_probe = ctx.actions.declare_file(ctx.label.name + ".rust_toolchain.json")
     files = [
         config,
         cflags,
@@ -137,9 +226,25 @@ def _rust_config_fixture_impl(ctx):
         autoconf_h,
         rustc_cfg,
         kernel_release,
+        rustc_probe,
     ]
-    for file in files:
+    for file in files[:-1]:
         ctx.actions.write(file, "")
+    ctx.actions.write(
+        rustc_probe,
+        json.encode({
+            "channel": "stable",
+            "commit_hash": "0123456789abcdef",
+            "commit_date": "2026-03-01",
+            "llvm_version": "22.1.6",
+            "llvm_version_code": 220106,
+            "release": "1.97.0",
+            "schema": "linux-rust-toolchain-probe-v2",
+            "semver": "1.97.0",
+            "version_code": 109700,
+            "version_text": "rustc 1.97.0 (012345678 2026-03-01)",
+        }),
+    )
     include_dir = autoconf_h.dirname.rsplit("/", 1)[0]
     return [
         DefaultInfo(files = depset(files)),
@@ -150,33 +255,44 @@ def _rust_config_fixture_impl(ctx):
             autoconf_h = autoconf_h,
             cflags = cflags,
             config = config,
-            config_flags = {"CONFIG_RUST": "y"},
+            config_flags = {
+                "CONFIG_DEBUG_INFO": "y",
+                "CONFIG_DEBUG_INFO_BTF": "y",
+                "CONFIG_DEBUG_INFO_BTF_MODULES": "y",
+                "CONFIG_DEBUG_INFO_DWARF5": "y",
+                "CONFIG_RUST": "y",
+            },
             files = depset(files),
             include_dir = include_dir,
             include_dir_anchor = directory_anchor(autoconf_h, include_dir),
             kernel_release = kernel_release,
             rustc_cfg = rustc_cfg,
+            rustc_probe = rustc_probe,
         ),
     ]
 
 _rust_config_fixture = rule(implementation = _rust_config_fixture_impl)
 
-def _rust_generated_headers_fixture_impl(_ctx):
+def _rust_generated_headers_fixture_impl(ctx):
     return [
         DefaultInfo(files = depset()),
         LinuxGeneratedHeadersInfo(
-            arch = "x86",
+            arch = ctx.attr.arch,
             cflags = None,
             files = depset(),
             include_dirs = [],
             include_dir_anchors = {},
-            srcarch = "x86",
+            srcarch = ctx.attr.srcarch,
             vdsomunge = None,
         ),
     ]
 
 _rust_generated_headers_fixture = rule(
     implementation = _rust_generated_headers_fixture_impl,
+    attrs = {
+        "arch": attr.string(default = "x86"),
+        "srcarch": attr.string(default = "x86"),
+    },
 )
 
 def _rust_source_fixture_impl(ctx):
@@ -210,7 +326,10 @@ def _rust_host_link_outputs_fixture_impl(ctx):
             "expected one %s proc macro output, got %s" %
             (ctx.attr.proc_macro, proc_macros),
         )
-    return [DefaultInfo(files = depset([sdk.target_spec, proc_macros[0]]))]
+    outputs = [proc_macros[0]]
+    if sdk.target_spec != None:
+        outputs.append(sdk.target_spec)
+    return [DefaultInfo(files = depset(outputs))]
 
 _rust_host_link_outputs_fixture = rule(
     implementation = _rust_host_link_outputs_fixture_impl,
@@ -223,7 +342,37 @@ _rust_host_link_outputs_fixture = rule(
     },
 )
 
+def _path_mapping_key(path):
+    """Returns an execroot path identity independent of Bazel's config mapping."""
+    parts = path.replace("\\", "/").split("/")
+    if (
+        len(parts) >= 4 and
+        parts[0] == "bazel-out" and
+        parts[2] in ("bin", "genfiles")
+    ):
+        return "/".join([parts[0]] + parts[2:])
+    return "/".join(parts)
+
 def _assert_host_rust_runtime_link(env, action):
+    unstable_options_indices = [
+        index
+        for index in range(len(action.argv))
+        if action.argv[index] == "-Zunstable-options"
+    ]
+    link_self_contained_indices = [
+        index
+        for index in range(len(action.argv))
+        if action.argv[index] == "-Clink-self-contained=-linker"
+    ]
+    asserts.equals(env, 1, len(unstable_options_indices))
+    asserts.equals(env, 1, len(link_self_contained_indices))
+    if unstable_options_indices and link_self_contained_indices:
+        asserts.true(
+            env,
+            unstable_options_indices[0] < link_self_contained_indices[0],
+            "-Zunstable-options must precede the unstable link-self-contained value",
+        )
+
     runtime_prefix = "-Clink-arg="
     runtime_indices = [
         index
@@ -239,9 +388,21 @@ def _assert_host_rust_runtime_link(env, action):
         "expected static C++ runtime archives in %s" % action.argv,
     )
     input_paths = {
-        file.path: True
+        _path_mapping_key(file.path): True
         for file in action.inputs.to_list()
     }
+    for argument in action.argv:
+        if not argument.startswith("-Clink-arg="):
+            continue
+        path = argument[len("-Clink-arg="):]
+        if path.startswith("-L") or path.startswith("-B"):
+            path = path[2:]
+        if "bazel-out/" in path:
+            asserts.true(
+                env,
+                _path_mapping_key(path) in input_paths,
+                "host linker path %s is not an action input" % path,
+            )
     for index in runtime_indices:
         path = action.argv[index][len(runtime_prefix):]
         asserts.false(
@@ -251,7 +412,7 @@ def _assert_host_rust_runtime_link(env, action):
         )
         asserts.true(
             env,
-            path in input_paths,
+            _path_mapping_key(path) in input_paths,
             "runtime archive %s is not an action input" % path,
         )
 
@@ -279,11 +440,38 @@ def _action_has_input_suffix(action, suffix):
             return True
     return False
 
+def _action_has_argument_containing(action, value):
+    for argument in action.argv:
+        if value in argument:
+            return True
+    return False
+
+def _action_has_argument_ending_with(action, suffix):
+    for argument in action.argv:
+        if argument.replace("\\", "/").endswith(suffix):
+            return True
+    return False
+
 def _enabled_sdk_test_impl(ctx):
     env = analysistest.begin(ctx)
     target = analysistest.target_under_test(env)
     sdk = target[LinuxRustSdkInfo]
     asserts.true(env, sdk.enabled)
+    asserts.equals(env, "1.78.0", sdk.minimum_rustc_version)
+    asserts.true(env, sdk.rustc_probe != None)
+    asserts.true(env, sdk.target_spec != None)
+    asserts.equals(env, "1", sdk.rustc_env.get("RUSTC_BOOTSTRAP"))
+    asserts.true(env, sdk.rustc != None)
+    asserts.true(env, "-Zdwarf-version=5" in sdk.module_flags)
+    asserts.true(env, "-Cdebuginfo=2" in sdk.module_flags)
+    asserts.equals(
+        env,
+        ["1.91.0", "1.98.0", "1.99.0"],
+        [
+            predicate["at_least"]
+            for predicate in sdk.module_version_predicates
+        ],
+    )
     target_generator_actions = [
         action
         for action in analysistest.target_actions(env)
@@ -292,6 +480,21 @@ def _enabled_sdk_test_impl(ctx):
     asserts.equals(env, 1, len(target_generator_actions))
     if target_generator_actions:
         _assert_host_rust_runtime_link(env, target_generator_actions[0])
+        asserts.true(
+            env,
+            _action_has_argument_ending_with(target_generator_actions[0], "/rustc"),
+            "target generator must invoke the execution-platform rustc",
+        )
+        asserts.equals(
+            env,
+            1,
+            len([
+                arg
+                for arg in target_generator_actions[0].argv
+                if arg.startswith("--sysroot=")
+            ]),
+            "target generator must use the resolved execution-platform sysroot",
+        )
     core_actions = [
         action
         for action in analysistest.target_actions(env)
@@ -302,6 +505,28 @@ def _enabled_sdk_test_impl(ctx):
     ]
     asserts.equals(env, 1, len(core_actions))
     if core_actions:
+        asserts.true(
+            env,
+            _action_has_argument_containing(core_actions[0], sdk.rustc.path),
+            "kernel crates must invoke the target-platform rustc",
+        )
+        asserts.true(env, "-Zdwarf-version=5" in core_actions[0].argv)
+        asserts.true(env, "-Cdebuginfo=2" in core_actions[0].argv)
+        asserts.true(
+            env,
+            _action_has_argument_containing(core_actions[0], '"at_least":"1.91.0"'),
+            "core rustc action is missing the common rustc-version predicate",
+        )
+        asserts.true(
+            env,
+            _action_has_argument_containing(core_actions[0], '"at_least":"1.98.0"'),
+            "core rustc action is missing the target rustc-version predicate",
+        )
+        asserts.true(
+            env,
+            _action_has_input_suffix(core_actions[0], ".rust_toolchain.json"),
+            "core rustc action is missing the selected rustc probe",
+        )
         for suffix in [
             "/library/core/src/lib.rs",
             "/library/portable-simd/crates/core_simd/src/core_simd_docs.md",
@@ -327,6 +552,11 @@ def _enabled_sdk_test_impl(ctx):
     asserts.equals(env, 1, len(proc_macro_actions))
     if proc_macro_actions:
         _assert_host_rust_runtime_link(env, proc_macro_actions[0])
+        asserts.true(
+            env,
+            _action_has_argument_ending_with(proc_macro_actions[0], "/rustc"),
+            "procedural macros must invoke the execution-platform rustc",
+        )
         sysroots = [
             arg
             for arg in proc_macro_actions[0].argv
@@ -334,14 +564,32 @@ def _enabled_sdk_test_impl(ctx):
         ]
         asserts.equals(env, 1, len(sysroots))
         if sysroots:
-            asserts.true(
-                env,
-                sysroots[0].startswith("--sysroot=bazel-out/"),
-                "expected an execroot-relative Rust sysroot, got %s" % sysroots[0],
-            )
+            asserts.true(env, len(sysroots[0]) > len("--sysroot="))
     return analysistest.end(env)
 
 _enabled_sdk_test = analysistest.make(_enabled_sdk_test_impl)
+
+def _builtin_target_sdk_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    sdk = analysistest.target_under_test(env)[LinuxRustSdkInfo]
+    asserts.true(env, sdk.enabled)
+    asserts.equals(env, None, sdk.target_spec)
+    asserts.true(env, sdk.objtree_anchor != None)
+    asserts.true(env, "--target=aarch64-unknown-none" in sdk.module_flags)
+    asserts.true(env, "-Zdwarf-version=5" in sdk.module_flags)
+    asserts.true(env, "-Cdebuginfo=2" in sdk.module_flags)
+    target_generator_actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic in [
+            "LinuxRustTargetGeneratorCompile",
+            "LinuxRustTargetGenerate",
+        ]
+    ]
+    asserts.equals(env, 0, len(target_generator_actions))
+    return analysistest.end(env)
+
+_builtin_target_sdk_test = analysistest.make(_builtin_target_sdk_test_impl)
 
 def _repository_protocol_test_impl(ctx):
     env = unittest.begin(ctx)
@@ -349,6 +597,7 @@ def _repository_protocol_test_impl(ctx):
         arch = "x86_64",
         version = "6.18.39",
         source_repo = "@@linux_sources",
+        minimum_rustc_version = "1.78.0",
         rust_profile_json = _LEGACY_PROFILE_JSON,
         platform = "@@llvm//platforms:linux_x86_64",
         base_config = "//configs:x86_64",
@@ -367,6 +616,7 @@ def _repository_protocol_test_impl(ctx):
         repositories_test_helpers.generator_protocol,
     )
     asserts.true(env, "rust_profile_json = " in generated)
+    asserts.true(env, 'minimum_rustc_version = "1.78.0",' in generated)
     asserts.true(env, "base_rust_enabled = False," in generated)
     asserts.true(
         env,
@@ -385,7 +635,7 @@ def _legacy_profile_flags_test_impl(ctx):
     config = struct(config_flags = {
         "CONFIG_CC_OPTIMIZE_FOR_SIZE": "n",
     })
-    flags = linux_rust_test_helpers.profile_target_flags(
+    resolved = linux_rust_test_helpers.profile_target_flags(
         profile,
         config,
         {
@@ -401,11 +651,51 @@ def _legacy_profile_flags_test_impl(ctx):
             "@cfg",
             "-Copt-level=2",
         ],
-        flags,
+        resolved.flags,
     )
+    asserts.equals(env, ["1.98.0"], [
+        predicate["at_least"]
+        for predicate in resolved.predicates
+    ])
     return unittest.end(env)
 
 _legacy_profile_flags_test = unittest.make(_legacy_profile_flags_test_impl)
+
+def _conditional_unless_config_test_impl(ctx):
+    env = unittest.begin(ctx)
+    profile = linux_rust_test_helpers.decode_profile(
+        _LEGACY_PROFILE_JSON.replace(
+            '"config": "CONFIG_CC_OPTIMIZE_FOR_SIZE",',
+            '"config": "CONFIG_CC_OPTIMIZE_FOR_SIZE",\n        "unless_config": "CONFIG_FORCE_SPEED",',
+        ),
+        "x86",
+    )
+    replacements = {
+        "rustc_cfg": "cfg",
+        "target_spec": "target.json",
+    }
+    optimized = linux_rust_test_helpers.profile_target_flags(
+        profile,
+        struct(config_flags = {
+            "CONFIG_CC_OPTIMIZE_FOR_SIZE": "y",
+        }),
+        replacements,
+    )
+    forced_speed = linux_rust_test_helpers.profile_target_flags(
+        profile,
+        struct(config_flags = {
+            "CONFIG_CC_OPTIMIZE_FOR_SIZE": "y",
+            "CONFIG_FORCE_SPEED": "y",
+        }),
+        replacements,
+    )
+    asserts.true(env, "-Copt-level=s" in optimized.flags)
+    asserts.false(env, "-Copt-level=2" in optimized.flags)
+    asserts.false(env, "-Copt-level=s" in forced_speed.flags)
+    asserts.true(env, "-Copt-level=2" in forced_speed.flags)
+    return unittest.end(env)
+
+_conditional_unless_config_test = unittest.make(_conditional_unless_config_test_impl)
 
 def _rustc_source_prefixes_test_impl(ctx):
     env = unittest.begin(ctx)
@@ -461,6 +751,29 @@ _unsupported_dead_code_elimination_test = unittest.make(
     _unsupported_dead_code_elimination_test_impl,
 )
 
+def _unsupported_rust_hardening_test_impl(ctx):
+    env = unittest.begin(ctx)
+    asserts.equals(
+        env,
+        [
+            "CONFIG_CFI",
+            "CONFIG_SHADOW_CALL_STACK",
+            "CONFIG_UBSAN",
+        ],
+        linux_rust_test_helpers.unsupported_config_symbols(struct(
+            config_flags = {
+                "CONFIG_CFI": "y",
+                "CONFIG_SHADOW_CALL_STACK": "y",
+                "CONFIG_UBSAN": "y",
+            },
+        )),
+    )
+    return unittest.end(env)
+
+_unsupported_rust_hardening_test = unittest.make(
+    _unsupported_rust_hardening_test_impl,
+)
+
 def linux_rust_test_suite(name):
     disabled_sdk = name + "_disabled_sdk"
     linux_disabled_rust_kernel_sdk(
@@ -511,6 +824,7 @@ def linux_rust_test_suite(name):
         arch = "x86",
         config = ":" + config,
         generated_headers = ":" + generated_headers,
+        minimum_rustc_version = "1.78.0",
         profile_json = _ENABLED_PROFILE_JSON,
         source_root = source_files["Kconfig"],
         source_tree = [
@@ -533,12 +847,46 @@ def linux_rust_test_suite(name):
         tags = ["manual"],
     )
 
+    builtin_generated_headers = name + "_builtin_generated_headers"
+    _rust_generated_headers_fixture(
+        name = builtin_generated_headers,
+        arch = "arm64",
+        srcarch = "arm64",
+        tags = ["manual"],
+    )
+    builtin_sdk = name + "_builtin_sdk"
+    linux_rust_kernel_sdk(
+        name = builtin_sdk,
+        arch = "arm64",
+        config = ":" + config,
+        generated_headers = ":" + builtin_generated_headers,
+        minimum_rustc_version = "1.78.0",
+        profile_json = _AARCH64_PROFILE_JSON,
+        source_root = source_files["Kconfig"],
+        source_tree = [
+            source_files[path]
+            for path in sorted(source_files.keys())
+        ],
+        srcarch = "arm64",
+        tags = ["manual"],
+    )
+    builtin_test = builtin_sdk + "_test"
+    _builtin_target_sdk_test(
+        name = builtin_test,
+        tags = ["manual"],
+        target_under_test = ":" + builtin_sdk,
+    )
+
     protocol_test = name + "_repository_protocol_test"
     _repository_protocol_test(name = protocol_test)
     dead_code_test = name + "_dead_code_elimination_test"
     _unsupported_dead_code_elimination_test(name = dead_code_test)
+    hardening_test = name + "_unsupported_rust_hardening_test"
+    _unsupported_rust_hardening_test(name = hardening_test)
     legacy_profile_test = name + "_legacy_profile_flags_test"
     _legacy_profile_flags_test(name = legacy_profile_test)
+    conditional_unless_config_test = name + "_conditional_unless_config_test"
+    _conditional_unless_config_test(name = conditional_unless_config_test)
     source_prefixes_test = name + "_rustc_source_prefixes_test"
     _rustc_source_prefixes_test(name = source_prefixes_test)
     extend_flags_test = name + "_extend_kernel_c_flags_test"
@@ -547,11 +895,14 @@ def linux_rust_test_suite(name):
     native.test_suite(
         name = name,
         tests = [
+            ":" + builtin_test,
             ":" + disabled_test,
             ":" + enabled_test,
             ":" + protocol_test,
             ":" + dead_code_test,
+            ":" + conditional_unless_config_test,
             ":" + extend_flags_test,
+            ":" + hardening_test,
             ":" + legacy_profile_test,
             ":" + source_prefixes_test,
         ],

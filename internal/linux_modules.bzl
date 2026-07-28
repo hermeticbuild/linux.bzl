@@ -107,9 +107,11 @@ def _compile_external_rust(ctx, sdk, crate_root, crate_name):
         format = "OBJTREE={cwd}/%s",
     )
     args.add("--")
-    args.add(rust.rustc_version_runner)
-    args.add("-expected")
-    args.add(rust.rustc_version)
+    args.add(ctx.executable._rustcrun)
+    args.add("-probe")
+    args.add(rust.rustc_probe)
+    for predicate in rust.module_version_predicates:
+        args.add("-predicate", json.encode(predicate))
     args.add("--")
     args.add(rust.rustc)
     _add_rust_sdk_flags(args, sdk, rust.module_flags)
@@ -123,10 +125,10 @@ def _compile_external_rust(ctx, sdk, crate_root, crate_name):
         ctx.actions,
         executable = ctx.executable._runincwd,
         inputs = depset(
-            ctx.files.srcs,
+            ctx.files.srcs + [rust.rustc_probe],
             transitive = [rust.compile_inputs, rust.rustc_files],
         ),
-        tools = [rust.rustc_version_runner],
+        tools = [ctx.attr._rustcrun[DefaultInfo].files_to_run],
         outputs = [raw],
         arguments = [args],
         mnemonic = "LinuxRustModuleCompile",
@@ -148,7 +150,7 @@ def _compile_external_rust(ctx, sdk, crate_root, crate_name):
 def _add_rust_sdk_flags(args, sdk, flags):
     rust = sdk.rust
     for flag in flags:
-        if rust.target_spec.path in flag:
+        if rust.target_spec != None and rust.target_spec.path in flag:
             args.add(
                 rust.target_spec,
                 format = flag.replace("%", "%%").replace(rust.target_spec.path, "%s"),
@@ -279,11 +281,6 @@ def _linux_module_impl(ctx):
         fail("%s requires a kernel with CONFIG_MODULES=y" % ctx.label)
     if sdk.rust == None or not sdk.rust.enabled:
         fail("%s requires a kernel with CONFIG_RUST=y" % ctx.label)
-    if sdk.arch != "x86_64":
-        fail("%s supports Rust modules only for x86_64 kernels" % ctx.label)
-    if sdk.config.config_flags.get("CONFIG_DEBUG_INFO_BTF_MODULES") == "y":
-        fail("%s does not yet support Rust module BTF" % ctx.label)
-
     crate_root = _crate_root(ctx)
     crate_name = _crate_name(ctx)
     preliminary = _compile_external_rust(ctx, sdk, crate_root, crate_name)
@@ -307,7 +304,16 @@ def _linux_module_impl(ctx):
         target_link_flags = sdk.target_link_flags,
     )
     out = ctx.actions.declare_file(ctx.label.name + ".ko")
-    ctx.actions.symlink(output = out, target_file = linked)
+    _btf_module(
+        ctx,
+        sdk.config,
+        sdk.vmlinux,
+        linked,
+        out,
+        sdk.version,
+        sdk.btf_tools,
+        external_module = True,
+    )
     return [
         DefaultInfo(files = depset([out])),
         LinuxModuleInfo(
@@ -318,54 +324,56 @@ def _linux_module_impl(ctx):
         OutputGroupInfo(module_symvers = depset([module_symvers])),
     ]
 
-def _btf_module(ctx, vmlinux, linked, path, version):
-    if vmlinux.config.config_flags.get("CONFIG_DEBUG_INFO_BTF_MODULES") != "y":
-        out = ctx.actions.declare_file(ctx.label.name + ".modules/" + path[:-len(".o")] + ".ko")
+def _btf_module(ctx, config, vmlinux, linked, out, version, tools, external_module = False):
+    if config.config_flags.get("CONFIG_DEBUG_INFO_BTF_MODULES") != "y":
         ctx.actions.symlink(output = out, target_file = linked)
         return out
-    if not ctx.executable.pahole:
+    if not tools.pahole:
         fail("%s enables CONFIG_DEBUG_INFO_BTF_MODULES and requires pahole" % ctx.label)
-    if not ctx.executable.resolve_btfids_tool:
+    if not tools.resolve_btfids:
         fail("%s enables CONFIG_DEBUG_INFO_BTF_MODULES and requires resolve_btfids_tool" % ctx.label)
 
-    encoded = ctx.actions.declare_file(ctx.label.name + ".modules/" + path[:-len(".o")] + ".ko.btf")
+    encoded = ctx.actions.declare_file(out.basename + ".btf", sibling = out)
     pahole_args = ctx.actions.args()
     pahole_args.add("-input", linked)
     pahole_args.add("-output", encoded)
     pahole_args.add("-env")
-    pahole_args.add(ctx.executable._llvm_objcopy, format = "LLVM_OBJCOPY=%s")
+    pahole_args.add(tools.llvm_objcopy.executable, format = "LLVM_OBJCOPY=%s")
     pahole_args.add("--")
-    pahole_args.add(ctx.executable.pahole)
+    pahole_args.add(tools.pahole.executable)
     pahole_args.add("-J")
-    pahole_args.add_all(linux_module_actions.pahole_flags(vmlinux.config, version))
+    pahole_args.add_all(linux_module_actions.pahole_flags(
+        config,
+        version,
+        external_module = external_module,
+    ))
     pahole_args.add("--btf_base")
-    pahole_args.add(vmlinux.vmlinux)
+    pahole_args.add(vmlinux)
     pahole_args.add("{output}")
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._btfmutate,
-        inputs = [linked, vmlinux.vmlinux],
-        tools = [ctx.attr.pahole[DefaultInfo].files_to_run, ctx.attr._llvm_objcopy[DefaultInfo].files_to_run],
+        executable = tools.btfmutate,
+        inputs = [linked, vmlinux],
+        tools = [tools.pahole, tools.llvm_objcopy],
         outputs = [encoded],
         arguments = [pahole_args],
         mnemonic = "LinuxModuleBTF",
         progress_message = "Encoding Linux module BTF %{label}",
     )
 
-    out = ctx.actions.declare_file(ctx.label.name + ".modules/" + path[:-len(".o")] + ".ko")
     resolve_args = ctx.actions.args()
     resolve_args.add("-input", encoded)
     resolve_args.add("-output", out)
     resolve_args.add("--")
-    resolve_args.add(ctx.executable.resolve_btfids_tool)
+    resolve_args.add(tools.resolve_btfids.executable)
     resolve_args.add("-b")
-    resolve_args.add(vmlinux.vmlinux)
+    resolve_args.add(vmlinux)
     resolve_args.add("{output}")
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._btfmutate,
-        inputs = [encoded, vmlinux.vmlinux],
-        tools = [ctx.attr.resolve_btfids_tool[DefaultInfo].files_to_run],
+        executable = tools.btfmutate,
+        inputs = [encoded, vmlinux],
+        tools = [tools.resolve_btfids],
         outputs = [out],
         arguments = [resolve_args],
         mnemonic = "LinuxModuleResolveBTFIDs",
@@ -434,6 +442,12 @@ def _linux_module_sdk_impl(ctx):
 
     modules_builtin, modules_builtin_modinfo = _builtin_module_metadata(ctx, vmlinux)
     ko_files = []
+    btf_tools = struct(
+        btfmutate = ctx.attr._btfmutate[DefaultInfo].files_to_run,
+        llvm_objcopy = ctx.attr._llvm_objcopy[DefaultInfo].files_to_run,
+        pahole = ctx.attr.pahole[DefaultInfo].files_to_run if ctx.attr.pahole else None,
+        resolve_btfids = ctx.attr.resolve_btfids_tool[DefaultInfo].files_to_run if ctx.attr.resolve_btfids_tool else None,
+    )
 
     modules_enabled = vmlinux.config.config_flags.get("CONFIG_MODULES") == "y"
     if modules and not modules_enabled:
@@ -483,7 +497,16 @@ def _linux_module_sdk_impl(ctx):
                 module_lds,
                 path,
             )
-            ko_files.append(_btf_module(ctx, vmlinux, linked, path, ctx.attr.version))
+            out = ctx.actions.declare_file(ctx.label.name + ".modules/" + path[:-len(".o")] + ".ko")
+            ko_files.append(_btf_module(
+                ctx,
+                vmlinux.config,
+                vmlinux.vmlinux,
+                linked,
+                out,
+                ctx.attr.version,
+                btf_tools,
+            ))
     else:
         modules_order = _empty_file(ctx, "modules.order")
         module_symvers = _empty_file(ctx, "Module.symvers")
@@ -503,6 +526,7 @@ def _linux_module_sdk_impl(ctx):
         DefaultInfo(files = all_outputs),
         LinuxModuleSdkInfo(
             arch = vmlinux.arch,
+            btf_tools = btf_tools,
             config = vmlinux.config,
             generated_headers = vmlinux.generated_headers,
             kernel_key = str(ctx.label),
@@ -607,6 +631,11 @@ _linux_module = rule(
         "_runincwd": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/runincwd"),
+            executable = True,
+        ),
+        "_rustcrun": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/rustcrun"),
             executable = True,
         ),
     },

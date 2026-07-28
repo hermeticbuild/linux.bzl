@@ -10,11 +10,20 @@ bazel_dep(name = "llvm", version = "0.8.14", repo_name = "hermetic_llvm")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "rules_go", version = "0.62.0")
 bazel_dep(name = "rules_qemu", version = "0.3.0")
+bazel_dep(name = "rules_rs", version = "0.0.98")
 
 register_toolchains("@hermetic_llvm//toolchain:all")
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
 go_sdk.nogo(nogo = "@rules_go//:tools_nogo")
+
+rust_toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+rust_toolchains.toolchain(
+    version = "1.97.0",
+)
+use_repo(rust_toolchains, "default_rust_toolchains")
+
+register_toolchains("@default_rust_toolchains//:all")
 
 local_path_override(
     module_name = "linux.bzl",
@@ -80,6 +89,13 @@ linux_image(
 )
 
 linux_image(
+    name = "e2e_rust_6_12_96_aarch64",
+    config = "//:rust_arm64.config",
+    platform = "@hermetic_llvm//platforms:linux_arm64",
+    source = "@e2e_linux_6_12_96//:Kconfig",
+)
+
+linux_image(
     name = "e2e_x86_64",
     config = "//:tiny.config",
     platform = "@hermetic_llvm//platforms:linux_x86_64",
@@ -90,6 +106,13 @@ linux_image(
     name = "e2e_rust_x86_64",
     config = "//:rust.config",
     platform = "@hermetic_llvm//platforms:linux_x86_64",
+    source = "@e2e_linux_6_18_39//:Kconfig",
+)
+
+linux_image(
+    name = "e2e_rust_aarch64",
+    config = "//:rust_arm64.config",
+    platform = "@hermetic_llvm//platforms:linux_arm64",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
 

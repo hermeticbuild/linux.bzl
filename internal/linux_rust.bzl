@@ -17,11 +17,11 @@ load(":providers.bzl", "LinuxRustSdkInfo")
 visibility("//...")
 
 _RUST_TOOLCHAIN_TYPE = Label("@rules_rust//rust:toolchain_type")
+_RUST_SOURCE_TOOLCHAIN_TYPE = Label("@rules_rust//rust/rust_analyzer:toolchain_type")
 _BINDGEN_TOOLCHAIN_TYPE = Label("@rules_rs//rs:bindgen_toolchain_type")
-_RUSTC_VERSION = "1.97.0"
-_RUST_PROFILE_SCHEMA = "linux-rust-profile-v1"
+_RUST_PROFILE_SCHEMA = "linux-rust-profile-v2"
 _RUSTC_SOURCE_PREFIX_CLOSURE = {
-    # Rust 1.97 core imports these sibling trees with #[path].
+    # core imports these sibling trees with #[path] across supported releases.
     "rustc://library/core/": [
         "rustc://library/portable-simd/crates/core_simd/",
         "rustc://library/stdarch/crates/core_arch/",
@@ -119,7 +119,10 @@ def _decode_rust_profile(profile_json, arch):
     if profile.get("source_layout") not in ["legacy", "pin-init"]:
         fail("unsupported Rust profile source layout %r" % profile.get("source_layout"))
     architecture = profile.get("architecture")
-    expected_architecture = "x86_64" if arch == "x86" else arch
+    expected_architecture = {
+        "arm64": "aarch64",
+        "x86": "x86_64",
+    }.get(arch, arch)
     if architecture != expected_architecture:
         fail(
             "Rust profile architecture %r does not match Linux ARCH=%r" %
@@ -127,6 +130,7 @@ def _decode_rust_profile(profile_json, arch):
         )
     for field in [
         "target",
+        "common_flags",
         "target_flags",
         "module",
         "bindgen",
@@ -134,22 +138,66 @@ def _decode_rust_profile(profile_json, arch):
     ]:
         _required_profile_field(profile, field, "dict")
     for field in [
-        "common_flags",
         "proc_macros",
         "crates",
         "runtime_objects",
+        "unsupported_configs",
     ]:
         _required_profile_field(profile, field, "list")
     if type(profile.get("generated_assembly", [])) != "list":
         fail("Rust profile field generated_assembly must be a list")
     return profile
 
+def _profile_version_predicates(value, name, config, replacements):
+    predicates = _required_profile_field(value, "version_predicates", "list")
+    out = []
+    for index, predicate in enumerate(predicates):
+        if type(predicate) != "dict":
+            fail("Rust profile field %s.version_predicates[%d] must be an object" % (name, index))
+        at_least = _required_profile_field(predicate, "at_least", "string")
+        parts = at_least.split(".")
+        if len(parts) != 3:
+            fail("Rust profile version predicate %s must use MAJOR.MINOR.PATCH" % at_least)
+        for part in parts:
+            if not part:
+                fail("Rust profile version predicate %s is invalid" % at_least)
+            for character in part.elems():
+                if character < "0" or character > "9":
+                    fail("Rust profile version predicate %s is invalid" % at_least)
+        decoded = {"at_least": at_least}
+        for field in ["add", "remove", "else_add", "else_remove"]:
+            decoded[field] = _expand_profile_values(
+                _required_profile_field(predicate, field, "list"),
+                config,
+                replacements,
+            )
+        out.append(decoded)
+    return out
+
+def _profile_versioned_flags(value, name, config, replacements):
+    return struct(
+        flags = _expand_profile_values(
+            _required_profile_field(value, "always", "list"),
+            config,
+            replacements,
+        ),
+        predicates = _profile_version_predicates(value, name, config, replacements),
+    )
+
 def _condition_matches(config, condition):
     symbol = _required_profile_field(condition, "config", "string")
     expected = condition.get("equals", "y")
     if type(expected) != "string":
         fail("Rust profile conditional equals field must be a string")
-    return config.config_flags.get(symbol, "n") == expected
+    if config.config_flags.get(symbol, "n") != expected:
+        return False
+    unless_symbol = condition.get("unless_config")
+    if unless_symbol != None:
+        if type(unless_symbol) != "string" or not unless_symbol:
+            fail("Rust profile conditional unless_config field must be a non-empty string")
+        if config.config_flags.get(unless_symbol, "n") == "y":
+            return False
+    return True
 
 def _expand_profile_value(value, config, replacements):
     if type(value) != "string":
@@ -174,14 +222,47 @@ def _expand_profile_values(values, config, replacements):
 
 def _profile_target_flags(profile, config, replacements):
     target_flags = profile["target_flags"]
-    flags = list(profile["common_flags"])
-    flags.extend(_required_profile_field(target_flags, "always", "list"))
+    common = _profile_versioned_flags(
+        profile["common_flags"],
+        "common_flags",
+        config,
+        replacements,
+    )
+    flags = list(common.flags)
+    flags.extend(_expand_profile_values(
+        _required_profile_field(target_flags, "always", "list"),
+        config,
+        replacements,
+    ))
+    predicates = list(common.predicates)
+    predicates.extend(_profile_version_predicates(
+        target_flags,
+        "target_flags",
+        config,
+        replacements,
+    ))
     for condition in target_flags.get("conditional", []):
         if type(condition) != "dict":
             fail("Rust profile target_flags.conditional entries must be objects")
-        branch = "flags" if _condition_matches(config, condition) else "else_flags"
-        flags.extend(condition.get(branch, []))
-    return _expand_profile_values(flags, config, replacements)
+        if _condition_matches(config, condition):
+            flags.extend(_expand_profile_values(
+                _required_profile_field(condition, "flags", "list"),
+                config,
+                replacements,
+            ))
+            predicates.extend(_profile_version_predicates(
+                condition,
+                "target_flags.conditional",
+                config,
+                replacements,
+            ))
+        else:
+            flags.extend(_expand_profile_values(
+                _required_profile_field(condition, "else_flags", "list"),
+                config,
+                replacements,
+            ))
+    return struct(flags = flags, predicates = predicates)
 
 def _profile_inputs(source_files, prefixes, paths):
     inputs = {}
@@ -237,9 +318,24 @@ def _rust_env(rust_toolchain):
     env["RUSTC_BOOTSTRAP"] = "1"
     return env
 
+def _rustc_sources(ctx):
+    source_toolchain = ctx.toolchains[_RUST_SOURCE_TOOLCHAIN_TYPE]
+    if not hasattr(source_toolchain, "rustc_srcs"):
+        fail(
+            (
+                "%s selected a rules_rust rust-analyzer toolchain without rustc_srcs; " +
+                "register a rules_rs toolchain with the matching rust-src component"
+            ) % ctx.label,
+        )
+    rustc_srcs = source_toolchain.rustc_srcs[DefaultInfo].files
+    if not rustc_srcs.to_list():
+        fail("%s selected a Rust source toolchain without rust-src files" % ctx.label)
+    return rustc_srcs
+
 def _run_rustc(
         ctx,
-        rust_toolchain,
+        rustc_probe,
+        compiler,
         args,
         inputs,
         outputs,
@@ -248,10 +344,11 @@ def _run_rustc(
         mapped_files = [],
         mapped_directories = {},
         objtree_anchor = None,
-        transitive_tool_inputs = []):
+        transitive_tool_inputs = [],
+        version_predicates = []):
     runner_args = ctx.actions.args()
     runner_args.add("-cwd", ".")
-    env = _rust_env(rust_toolchain)
+    env = _rust_env(compiler)
     for name in sorted(env.keys()):
         runner_args.add("-env", name + "=" + env[name])
     if objtree_anchor != None:
@@ -262,11 +359,13 @@ def _run_rustc(
             format = "OBJTREE={cwd}/%s",
         )
     runner_args.add("--")
-    runner_args.add(ctx.executable._rustcversionrun)
-    runner_args.add("-expected")
-    runner_args.add(_RUSTC_VERSION)
+    runner_args.add(ctx.executable._rustcrun)
+    runner_args.add("-probe")
+    runner_args.add(rustc_probe)
+    for predicate in version_predicates:
+        runner_args.add("-predicate", json.encode(predicate))
     runner_args.add("--")
-    runner_args.add(rust_toolchain.rustc)
+    runner_args.add(compiler.rustc)
     add_mapped_values(
         runner_args,
         args,
@@ -277,12 +376,12 @@ def _run_rustc(
         ctx.actions,
         executable = ctx.executable._runincwd,
         inputs = depset(
-            inputs,
-            transitive = [rust_toolchain.all_files] + transitive_tool_inputs,
+            inputs + [rustc_probe],
+            transitive = [compiler.all_files] + transitive_tool_inputs,
         ),
         outputs = outputs,
         arguments = [runner_args],
-        tools = [ctx.attr._rustcversionrun[DefaultInfo].files_to_run],
+        tools = [ctx.attr._rustcrun[DefaultInfo].files_to_run],
         mnemonic = mnemonic,
         progress_message = progress_message,
     )
@@ -307,6 +406,7 @@ def _host_rust_link(host_cc, host_features):
         feature_configuration = host_features,
     )
     flags = [
+        "-Zunstable-options",
         "-Clink-self-contained=-linker",
         "-Clinker-flavor=gcc",
         "-Clinker=" + host_compiler,
@@ -318,18 +418,27 @@ def _host_rust_link(host_cc, host_features):
     flags.extend(["-Clink-arg=" + flag for flag in host_link_flags])
     return struct(
         flags = flags,
+        mapped_files = host_cc.all_files.to_list() + runtime_files.to_list(),
         runtime_files = runtime_files,
     )
 
 def _target_spec(
         ctx,
         profile,
-        rust_toolchain,
+        common_flags,
+        rustc_probe,
+        host_rust_toolchain,
         host_cc,
         host_features,
         config,
         source_files):
     target = profile["target"]
+    kind = _required_profile_field(target, "kind", "string")
+    if kind == "builtin":
+        _required_profile_field(target, "builtin_triple", "string")
+        return None
+    if kind != "generated":
+        fail("unsupported Rust target recipe kind %r" % kind)
     source_path = _validate_profile_path(
         _required_profile_field(target, "generator_source", "string"),
         "target.generator_source",
@@ -345,7 +454,8 @@ def _target_spec(
         ctx.label.name + ".rust_sdk/scripts/generate_rust_target",
     )
     host_link = _host_rust_link(host_cc, host_features)
-    args = list(profile["common_flags"])
+    args = list(common_flags.flags)
+    args.append("--sysroot=" + host_rust_toolchain.sysroot)
     args.extend(host_link.flags)
     args.extend([
         "--crate-name",
@@ -355,14 +465,22 @@ def _target_spec(
     ])
     _run_rustc(
         ctx,
-        rust_toolchain,
+        rustc_probe,
+        host_rust_toolchain,
         args,
         [source],
         [generator],
         "LinuxRustTargetGeneratorCompile",
         "Compiling the Linux Rust target generator %{label}",
-        mapped_files = [generator, source] + host_link.runtime_files.to_list(),
+        mapped_files = [generator, source] + host_link.mapped_files,
+        mapped_directories = {
+            host_rust_toolchain.sysroot: directory_anchor(
+                host_rust_toolchain.sysroot_anchor,
+                host_rust_toolchain.sysroot,
+            ),
+        },
         transitive_tool_inputs = [host_cc.all_files, host_link.runtime_files],
+        version_predicates = common_flags.predicates,
     )
 
     out = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/" + output_path)
@@ -383,7 +501,7 @@ def _target_spec(
     )
     return out
 
-def _unsupported_rust_config_symbols(config):
+def _unsupported_rust_config_symbols(config, profile = None):
     unsupported = []
     for symbol in [
         "CONFIG_MODVERSIONS",
@@ -393,24 +511,31 @@ def _unsupported_rust_config_symbols(config):
         "CONFIG_LTO_CLANG",
         "CONFIG_LTO_CLANG_THIN",
         "CONFIG_LTO_CLANG_FULL",
+        "CONFIG_CFI",
         "CONFIG_CFI_CLANG",
+        "CONFIG_SHADOW_CALL_STACK",
         "CONFIG_KASAN",
         "CONFIG_KCSAN",
+        "CONFIG_UBSAN",
         "CONFIG_KCOV",
-        "CONFIG_SHADOW_CALL_STACK",
-        "CONFIG_DEBUG_INFO_BTF",
         "CONFIG_DEBUG_INFO_DWARF4",
-        "CONFIG_DEBUG_INFO_DWARF5",
         "CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT",
+        "CONFIG_DEBUG_INFO_REDUCED",
+        "CONFIG_DEBUG_INFO_SPLIT",
+        "CONFIG_DEBUG_INFO_COMPRESSED",
+        "CONFIG_DEBUG_INFO_COMPRESSED_ZLIB",
+        "CONFIG_DEBUG_INFO_COMPRESSED_ZSTD",
     ]:
         if config.config_flags.get(symbol) in ["y", "m"]:
             unsupported.append(symbol)
+    if profile != None:
+        for symbol in _profile_string_list(profile, "unsupported_configs"):
+            if config.config_flags.get(symbol) in ["y", "m"] and symbol not in unsupported:
+                unsupported.append(symbol)
     return unsupported
 
-def _validate_rust_config(ctx, config):
-    if ctx.attr.arch != "x86":
-        fail("%s enables CONFIG_RUST, but the Rust toolchain supports only x86_64" % ctx.label)
-    unsupported = _unsupported_rust_config_symbols(config)
+def _validate_rust_config(ctx, config, profile):
+    unsupported = _unsupported_rust_config_symbols(config, profile)
     if unsupported:
         fail("%s enables Rust configuration paths not yet modeled: %s" % (ctx.label, unsupported))
 
@@ -700,11 +825,13 @@ def _objcopy(ctx, input, path, flags):
 def _rust_crate(
         ctx,
         rust_toolchain,
+        rustc_probe,
         config,
         objtree_anchor,
         rust_dir,
         rust_dir_anchor,
         target_flags,
+        version_predicates,
         crate,
         source,
         source_inputs,
@@ -734,6 +861,7 @@ def _rust_crate(
     ])
     _run_rustc(
         ctx,
+        rustc_probe,
         rust_toolchain,
         flags,
         source_inputs + dep_inputs + [config.rustc_cfg],
@@ -750,6 +878,7 @@ def _rust_crate(
             rust_dir: rust_dir_anchor,
         },
         objtree_anchor = objtree_anchor,
+        version_predicates = version_predicates,
     )
     processed = raw_object
     if objcopy_flags:
@@ -781,7 +910,8 @@ def _export_header(ctx, object, name):
 
 def _proc_macro(
         ctx,
-        rust_toolchain,
+        rustc_probe,
+        host_rust_toolchain,
         host_cc,
         host_features,
         config,
@@ -790,14 +920,15 @@ def _proc_macro(
         source,
         source_inputs,
         uses_rustc_cfg,
-        crate_flags = []):
-    extension = rust_toolchain.dylib_ext
+        crate_flags = [],
+        version_predicates = []):
+    extension = host_rust_toolchain.dylib_ext
     output = ctx.actions.declare_file(
         ctx.label.name + ".rust_sdk/rust/lib" + name + extension,
     )
     args = list(common_flags)
     args.extend(crate_flags)
-    args.append("--sysroot=" + rust_toolchain.sysroot)
+    args.append("--sysroot=" + host_rust_toolchain.sysroot)
     host_link = _host_rust_link(host_cc, host_features)
     args.extend(host_link.flags)
     args.extend([
@@ -816,20 +947,22 @@ def _proc_macro(
     args.append(source.path)
     _run_rustc(
         ctx,
-        rust_toolchain,
+        rustc_probe,
+        host_rust_toolchain,
         args,
         inputs,
         [output],
         "LinuxRustProcMacro",
         "Compiling Rust-for-Linux procedural macro %s %%{label}" % name,
-        mapped_files = [output, source, config.rustc_cfg] + host_link.runtime_files.to_list(),
+        mapped_files = [output, source, config.rustc_cfg] + host_link.mapped_files,
         mapped_directories = {
-            rust_toolchain.sysroot: directory_anchor(
-                rust_toolchain.sysroot_anchor,
-                rust_toolchain.sysroot,
+            host_rust_toolchain.sysroot: directory_anchor(
+                host_rust_toolchain.sysroot_anchor,
+                host_rust_toolchain.sysroot,
             ),
         },
         transitive_tool_inputs = [host_cc.all_files, host_link.runtime_files],
+        version_predicates = version_predicates,
     )
     return output
 
@@ -838,6 +971,7 @@ def _disabled_sdk():
         compile_inputs = depset(),
         enabled = False,
         module_flags = [],
+        module_version_predicates = [],
         objtool = None,
         objtree = "",
         objtree_anchor = None,
@@ -846,8 +980,8 @@ def _disabled_sdk():
         rustc = None,
         rustc_env = {},
         rustc_files = depset(),
-        rustc_version = "",
-        rustc_version_runner = None,
+        rustc_probe = None,
+        minimum_rustc_version = "",
         runtime_objects = [],
         target_spec = None,
     )
@@ -868,9 +1002,14 @@ def _linux_rust_kernel_sdk_impl(ctx):
     if config.config_flags.get("CONFIG_RUST") != "y":
         fail("%s requires CONFIG_RUST=y" % ctx.label)
 
-    _validate_rust_config(ctx, config)
     profile = _decode_rust_profile(ctx.attr.profile_json, ctx.attr.arch)
+    _validate_rust_config(ctx, config, profile)
     rust_toolchain = ctx.toolchains[_RUST_TOOLCHAIN_TYPE]
+    host_rust_toolchain = ctx.attr._host_rust[platform_common.ToolchainInfo]
+    rustc_srcs = _rustc_sources(ctx).to_list()
+    rustc_probe = config.rustc_probe
+    if rustc_probe == None:
+        fail("%s requires a Rust-enabled config with a compiler probe" % ctx.label)
     generated_headers = ctx.attr.generated_headers[LinuxGeneratedHeadersInfo]
     source_tree = depset(ctx.files.source_tree)
     source_files = _source_files(ctx.file.source_root, source_tree)
@@ -889,17 +1028,34 @@ def _linux_rust_kernel_sdk_impl(ctx):
         unsupported_features = [],
     )
     bindgen = ctx.toolchains[_BINDGEN_TOOLCHAIN_TYPE].bindgen
+    generator_common_flags = _profile_versioned_flags(
+        profile["common_flags"],
+        "common_flags",
+        config,
+        {},
+    )
     target_spec = _target_spec(
         ctx,
         profile,
-        rust_toolchain,
+        generator_common_flags,
+        rustc_probe,
+        host_rust_toolchain,
         host_cc,
         host_features,
         config,
         source_files,
     )
-    objtree = _relative_output_root(target_spec, profile["target"]["output"])
-    objtree_anchor = directory_anchor(target_spec, objtree)
+    target_metadata = []
+    if target_spec != None:
+        objtree = _relative_output_root(target_spec, profile["target"]["output"])
+        objtree_anchor = directory_anchor(target_spec, objtree)
+        target_metadata.append(target_spec)
+    else:
+        objtree_marker = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/.objtree")
+        ctx.actions.write(objtree_marker, "")
+        objtree = objtree_marker.dirname
+        objtree_anchor = directory_anchor(objtree_marker, objtree)
+        target_metadata.append(objtree_marker)
     rust_dir = objtree + "/rust"
     module = profile["module"]
     allowed_features = _profile_string_list(
@@ -912,10 +1068,12 @@ def _linux_rust_kernel_sdk_impl(ctx):
         "allowed_features_csv": ",".join(allowed_features),
         "rust_dir": rust_dir,
         "rustc_cfg": config.rustc_cfg.path,
-        "target_spec": target_spec.path,
     }
-    common_flags = _expand_profile_values(
+    if target_spec != None:
+        replacements["target_spec"] = target_spec.path
+    common_flags = _profile_versioned_flags(
         profile["common_flags"],
+        "common_flags",
         config,
         replacements,
     )
@@ -1073,11 +1231,12 @@ def _linux_rust_kernel_sdk_impl(ctx):
         )
         proc_macros[name] = _proc_macro(
             ctx,
-            rust_toolchain,
+            rustc_probe,
+            host_rust_toolchain,
             host_cc,
             host_features,
             config,
-            common_flags,
+            common_flags.flags,
             name,
             _source_file(source_files, source_path),
             source_inputs,
@@ -1087,11 +1246,11 @@ def _linux_rust_kernel_sdk_impl(ctx):
                 config,
                 replacements,
             ),
+            version_predicates = common_flags.predicates,
         )
 
     crates = {}
     crate_order = []
-    rustc_srcs = ctx.files._rustc_srcs
     for recipe in profile["crates"]:
         if type(recipe) != "dict":
             fail("Rust profile crates entries must be objects")
@@ -1137,7 +1296,7 @@ def _linux_rust_kernel_sdk_impl(ctx):
                 )
             source_inputs.append(generated)
 
-        dep_inputs = [target_spec]
+        dep_inputs = list(target_metadata)
         for dep in _profile_string_list(recipe, "deps"):
             if dep in crates:
                 dep_inputs.append(crates[dep].metadata)
@@ -1161,11 +1320,18 @@ def _linux_rust_kernel_sdk_impl(ctx):
         crates[name] = _rust_crate(
             ctx,
             rust_toolchain,
+            rustc_probe,
             config,
             objtree_anchor,
             rust_dir,
             rust_dir_anchor,
-            target_flags,
+            target_flags.flags,
+            target_flags.predicates + _profile_version_predicates(
+                recipe,
+                "crates",
+                config,
+                replacements,
+            ),
             name,
             source,
             source_inputs,
@@ -1252,8 +1418,7 @@ def _linux_rust_kernel_sdk_impl(ctx):
             fail("Rust profile references unavailable runtime object %r" % path)
         runtime_objects.append(object)
 
-    metadata = [
-        target_spec,
+    metadata = target_metadata + [
         config.rustc_cfg,
         bindings_generated,
         bindings_helpers_generated,
@@ -1265,8 +1430,14 @@ def _linux_rust_kernel_sdk_impl(ctx):
         metadata,
         transitive = [rust_toolchain.all_files],
     )
-    module_flags = target_flags + _expand_profile_values(
+    module_flags = target_flags.flags + _expand_profile_values(
         _required_profile_field(module, "flags", "list"),
+        config,
+        replacements,
+    )
+    module_version_predicates = target_flags.predicates + _profile_version_predicates(
+        module,
+        "module",
         config,
         replacements,
     )
@@ -1274,6 +1445,7 @@ def _linux_rust_kernel_sdk_impl(ctx):
         compile_inputs = compile_inputs,
         enabled = True,
         module_flags = module_flags,
+        module_version_predicates = module_version_predicates,
         objtool = ctx.executable.objtool,
         objtree = objtree,
         objtree_anchor = objtree_anchor,
@@ -1282,8 +1454,8 @@ def _linux_rust_kernel_sdk_impl(ctx):
         rustc = rust_toolchain.rustc,
         rustc_env = _rust_env(rust_toolchain),
         rustc_files = rust_toolchain.all_files,
-        rustc_version = _RUSTC_VERSION,
-        rustc_version_runner = ctx.executable._rustcversionrun,
+        rustc_probe = rustc_probe,
+        minimum_rustc_version = ctx.attr.minimum_rustc_version,
         runtime_objects = runtime_objects,
         target_spec = target_spec,
     )
@@ -1308,6 +1480,7 @@ linux_rust_kernel_sdk = rule(
             mandatory = True,
             providers = [LinuxGeneratedHeadersInfo],
         ),
+        "minimum_rustc_version": attr.string(mandatory = True),
         "objtool": attr.label(
             cfg = "exec",
             executable = True,
@@ -1319,6 +1492,10 @@ linux_rust_kernel_sdk = rule(
         ),
         "source_tree": attr.label_list(allow_files = True),
         "srcarch": attr.string(mandatory = True),
+        "_host_rust": attr.label(
+            cfg = "exec",
+            default = Label("@rules_rust//rust/toolchain:current_rust_toolchain"),
+        ),
         "_lineargsrun": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/lineargsrun"),
@@ -1362,19 +1539,17 @@ linux_rust_kernel_sdk = rule(
             default = Label("//internal/cmd/rustpostprocess"),
             executable = True,
         ),
-        "_rustc_srcs": attr.label(
-            default = Label("@linux_rust_sources//:rustc_srcs"),
-        ),
-        "_rustcversionrun": attr.label(
+        "_rustcrun": attr.label(
             cfg = "exec",
-            default = Label("//internal/cmd/rustcversionrun"),
+            default = Label("//internal/cmd/rustcrun"),
             executable = True,
         ),
     },
     fragments = ["cpp"],
     toolchains = [
-        _RUST_TOOLCHAIN_TYPE,
         _BINDGEN_TOOLCHAIN_TYPE,
+        _RUST_SOURCE_TOOLCHAIN_TYPE,
+        _RUST_TOOLCHAIN_TYPE,
     ] + use_cc_toolchain(),
     doc = "Builds the private configuration-specific Rust-for-Linux SDK.",
 )

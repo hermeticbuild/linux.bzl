@@ -503,7 +503,7 @@ def _version_at_least(version, major, minor):
         fail("invalid Linux version %r" % version)
     return (int(parts[0]), int(parts[1])) >= (major, minor)
 
-def _pahole_flags(config, version):
+def _pahole_flags(config, version, external_module = False):
     pahole_version = int(config.config_flags.get("CONFIG_PAHOLE_VERSION", "0"))
     flags = []
     if pahole_version <= 125:
@@ -522,6 +522,9 @@ def _pahole_flags(config, version):
             flags.append("--btf_features=attributes")
     if config.config_flags.get("CONFIG_PAHOLE_HAS_LANG_EXCLUDE") == "y":
         flags.append("--lang_exclude=rust")
+    distilled_base_minimum = 128 if _version_at_least(version, 6, 18) else 126
+    if external_module and pahole_version >= distilled_base_minimum:
+        flags.append("--btf_features=distilled_base")
     return flags
 
 def _check_module_modinfo(ctx, module, output):
@@ -538,8 +541,8 @@ def _check_module_modinfo(ctx, module, output):
         progress_message = "Checking Linux module metadata %{label}",
     )
 
-def _objtool_args(config, objtool, input, output, mode):
-    return [
+def _objtool_args(config, objtool, input, output, mode, force = False, extra_args = []):
+    args = [
         "-config",
         config,
         "-objtool",
@@ -551,8 +554,13 @@ def _objtool_args(config, objtool, input, output, mode):
         "-out",
         output,
     ]
+    if force:
+        args.append("-force")
+    for arg in extra_args:
+        args.append("-objtool_arg=%s" % arg)
+    return args
 
-def _process_objtool(ctx, config, objtool, input, output, mode, mnemonic, progress_message):
+def _process_objtool(ctx, config, objtool, input, output, mode, mnemonic, progress_message, force = False, extra_args = []):
     if objtool == None:
         ctx.actions.symlink(output = output, target_file = input)
         return output
@@ -564,6 +572,8 @@ def _process_objtool(ctx, config, objtool, input, output, mode, mnemonic, progre
         input,
         output,
         mode,
+        force,
+        extra_args,
     ))
     path_mapped_run(
         ctx.actions,
@@ -577,9 +587,24 @@ def _process_objtool(ctx, config, objtool, input, output, mode, mnemonic, progre
     )
     return output
 
+def _module_root_needs_objtool(config, info):
+    kind = info.module_root_kind if hasattr(info, "module_root_kind") else ""
+    if kind == "single":
+        return False
+    if kind == "composite":
+        return (
+            config.config_flags.get("CONFIG_LTO_CLANG") == "y" or
+            config.config_flags.get("CONFIG_X86_KERNEL_IBT") == "y"
+        )
+    return True
+
 def _process_module_roots(ctx, kernel, modules):
     outputs = {}
-    for path in [info.object for info in kernel.module_objects]:
+    for info in kernel.module_objects:
+        path = info.object
+        if not _module_root_needs_objtool(kernel.config, info):
+            outputs[path] = modules[path].output
+            continue
         output = ctx.actions.declare_file(
             ctx.label.name + ".module_prep/objtool/" + path,
         )
@@ -592,6 +617,8 @@ def _process_module_roots(ctx, kernel, modules):
             "module",
             "LinuxModuleObjtool",
             "Processing in-tree Linux module with objtool %{label}",
+            force = info.objtool_force if hasattr(info, "objtool_force") else False,
+            extra_args = info.objtool_args if hasattr(info, "objtool_args") else [],
         )
     return outputs
 
@@ -685,6 +712,7 @@ linux_module_actions = struct(
     module_metadata_sanitizer_flags = _module_metadata_sanitizer_flags,
     modpost_args = _modpost_args,
     module_map = _module_map,
+    module_root_needs_objtool = _module_root_needs_objtool,
     objtool_args = _objtool_args,
     pahole_flags = _pahole_flags,
     prepare = _prepare,

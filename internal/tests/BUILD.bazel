@@ -6,9 +6,10 @@ load(
 )
 load(":config_validation_test.bzl", "config_validation_test_suite")
 load(":host_cc_toolchain_test.bzl", "host_cc_toolchain_test")
-load(":kconfig_repositories_test.bzl", "graph_config_args_test", "kconfig_tool_filename_test")
+load(":kconfig_repositories_test.bzl", "graph_arch_tool_args_test", "graph_config_args_test", "kconfig_tool_filename_test", "without_rust_toolchain_config_test")
 load(":linux_compile_flags_test.bzl", "linux_compile_flags_test")
 load(":linux_modules_test.bzl", "linux_module_test_suite")
+load(":linux_object_objtool_test.bzl", "linux_object_objtool_test_suite")
 load(":linux_objects_failure_test.bzl", "linux_objects_fail_closed_test_suite")
 load(":linux_rust_test.bzl", "linux_rust_test_suite")
 load(":path_mapping_test.bzl", "path_mapping_test")
@@ -20,9 +21,13 @@ config_validation_test_suite(name = "config_validation_tests")
 
 graph_config_args_test(name = "graph_config_args_test")
 
+graph_arch_tool_args_test(name = "graph_arch_tool_args_test")
+
 host_cc_toolchain_test(name = "host_cc_toolchain_test")
 
 kconfig_tool_filename_test(name = "kconfig_tool_filename_test")
+
+without_rust_toolchain_config_test(name = "without_rust_toolchain_config_test")
 
 linux_cc_context(
     name = "cc_context_smoke",
@@ -51,6 +56,8 @@ build_test(
 )
 
 linux_objects_fail_closed_test_suite(name = "linux_objects_fail_closed_test")
+
+linux_object_objtool_test_suite(name = "linux_object_objtool_test")
 
 linux_module_test_suite(name = "linux_module_test")
 

@@ -1,0 +1,66 @@
+load("//internal:kconfig.bzl", "kconfig_file")
+load("//internal:linux_objects.bzl", "linux_resolved_config")
+load(":linux_resolved_config_test.bzl", "linux_resolved_config_test_suite")
+
+package(default_visibility = ["//visibility:private"])
+
+exports_files([
+    "Kconfig",
+    "c.config",
+    "rust.config",
+])
+
+kconfig_file(
+    name = "resolved_c_config_input",
+    config = "c.config",
+    config_flags = {
+        "CONFIG_64BIT": "y",
+    },
+)
+
+kconfig_file(
+    name = "resolved_rust_config_input",
+    config = "rust.config",
+    config_flags = {
+        "CONFIG_64BIT": "y",
+        "CONFIG_RUST": "y",
+    },
+)
+
+linux_resolved_config(
+    name = "resolved_c_config",
+    config = ":resolved_c_config_input",
+    config_name = "c",
+    env = {
+        "ARCH": "x86",
+        "SRCARCH": "x86",
+    },
+    root = "Kconfig",
+    source_root = "Kconfig",
+    vars = {
+        "ARCH": "x86",
+        "SRCARCH": "x86",
+        "UTS_MACHINE": "x86_64",
+    },
+)
+
+linux_resolved_config(
+    name = "resolved_rust_config",
+    config = ":resolved_rust_config_input",
+    config_name = "rust",
+    env = {
+        "ARCH": "x86",
+        "SRCARCH": "x86",
+    },
+    minimum_rustc_version = "1.78.0",
+    root = "Kconfig",
+    rust_enabled = True,
+    source_root = "Kconfig",
+    vars = {
+        "ARCH": "x86",
+        "SRCARCH": "x86",
+        "UTS_MACHINE": "x86_64",
+    },
+)
+
+linux_resolved_config_test_suite(name = "linux_resolved_config_test")

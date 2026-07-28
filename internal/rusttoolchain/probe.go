@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const ProbeSchema = "linux-rust-toolchain-probe-v1"
+const ProbeSchema = "linux-rust-toolchain-probe-v2"
 
 // Probe is the canonical identity of the rustc selected by Bazel toolchain
 // resolution. VersionCode fields use Linux's major*100000+minor*100+patch
@@ -19,6 +19,7 @@ type Probe struct {
 	Release         string `json:"release"`
 	Semver          string `json:"semver"`
 	Channel         string `json:"channel"`
+	CommitHash      string `json:"commit_hash"`
 	CommitDate      string `json:"commit_date,omitempty"`
 	LLVMVersion     string `json:"llvm_version"`
 	VersionCode     int    `json:"version_code"`
@@ -55,12 +56,17 @@ func ParseVerbose(output string) (Probe, error) {
 	if err != nil {
 		return Probe{}, fmt.Errorf("invalid rustc LLVM version %q: %w", llvmVersion, err)
 	}
+	commitHash := values["commit-hash"]
+	if commitHash == "" {
+		return Probe{}, fmt.Errorf("invalid rustc -vV output: missing commit-hash")
+	}
 	return Probe{
 		Schema:          ProbeSchema,
 		VersionText:     lines[0],
 		Release:         release,
 		Semver:          semver,
 		Channel:         channel,
+		CommitHash:      commitHash,
 		CommitDate:      values["commit-date"],
 		LLVMVersion:     llvmVersion,
 		VersionCode:     versionCode,
@@ -117,6 +123,9 @@ func (p Probe) Validate() error {
 	versionFields := strings.Fields(p.VersionText)
 	if len(versionFields) < 2 || versionFields[0] != "rustc" || versionFields[1] != p.Release {
 		return fmt.Errorf("invalid rustc version text %q for release %q", p.VersionText, p.Release)
+	}
+	if p.CommitHash == "" {
+		return fmt.Errorf("missing rustc commit hash")
 	}
 	semver, channel, code, err := ParseRelease(p.Release)
 	if err != nil {
