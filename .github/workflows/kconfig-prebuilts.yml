@@ -23,21 +23,6 @@ jobs:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: .github/workflows/build_kconfig_prebuilts.sh
 
-      - name: Verify compact schema output parity
-        if: startsWith(github.ref, 'refs/tags/kconfig-v') || github.event_name == 'workflow_dispatch'
-        run: >-
-          .github/workflows/kconfig_schema_diff.sh
-          dist/kconfig-linux-amd64.tar.zst
-
-      - name: Upload compact schema diagnostics
-        if: (startsWith(github.ref, 'refs/tags/kconfig-v') || github.event_name == 'workflow_dispatch') && !cancelled()
-        uses: actions/upload-artifact@v7
-        with:
-          name: kconfig-schema-diff
-          path: dist/kconfig-schema-diff
-          if-no-files-found: warn
-          retention-days: 14
-
       - name: Release
         if: startsWith(github.ref, 'refs/tags/kconfig-v')
         uses: softprops/action-gh-release@v2

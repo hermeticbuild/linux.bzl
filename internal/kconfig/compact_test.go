@@ -1125,6 +1125,12 @@ func TestCompactV013ObjectBuildUsesOneExactCompileEnvironmentIndex(t *testing.T)
 	if got := len(sourceIndex.AttrStrings("srcs")); got != len(metadata.SourceFiles) {
 		t.Fatalf("indexed source count = %d, want %d", got, len(metadata.SourceFiles))
 	}
+	if sourceIndex.Attr("source_paths") != nil {
+		t.Fatalf("source input index retains order-sensitive source_paths:\n%s", objectBuild)
+	}
+	if got := sourceIndex.AttrString("source_tree_info"); got != ":_source_tree" {
+		t.Fatalf("source input index source_tree_info = %q, want :_source_tree", got)
+	}
 	for _, input := range metadata.SourceFiles {
 		label := labelForSource(CompactBuildFileOptions{SourceLabelPackage: "@linux//"}, input.Path)
 		if count := strings.Count(text, fmt.Sprintf("%q", label)); count != 1 {

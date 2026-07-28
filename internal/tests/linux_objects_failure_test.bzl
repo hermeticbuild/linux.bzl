@@ -12,6 +12,7 @@ load(
     "LinuxGeneratedHeadersInfo",
     "LinuxImageInfo",
     "LinuxObjectInfo",
+    "LinuxSourceTreeInfo",
     "linux_arm64_nvhe_object",
     "linux_cache_shape_check",
     "linux_compact_delta_image",
@@ -164,7 +165,24 @@ _fake_arm64_generated_headers = rule(
     },
 )
 
+def _fake_source_tree_info(root):
+    empty = depset()
+    return LinuxSourceTreeInfo(
+        all_files = empty,
+        arch_headers = empty,
+        dtb_sources = empty,
+        global_headers = empty,
+        headers = empty,
+        kbuild_files = empty,
+        local_include_files = empty,
+        lookup_files = empty,
+        root = root,
+        scripts_headers = empty,
+        uapi_headers = empty,
+    )
+
 def _fake_nvhe_source_inputs_impl(ctx):
+    root = ctx.actions.declare_file(ctx.label.name + ".source/Kconfig")
     hyp_lds = ctx.actions.declare_file(
         ctx.label.name + ".source/arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
     )
@@ -174,14 +192,20 @@ def _fake_nvhe_source_inputs_impl(ctx):
     kconfig = ctx.actions.declare_file(
         ctx.label.name + ".source/include/linux/kconfig.h",
     )
+    ctx.actions.write(root, "")
     ctx.actions.write(hyp_lds, "")
     ctx.actions.write(compiler_version, "")
     ctx.actions.write(kconfig, "")
-    return [DefaultInfo(files = depset([hyp_lds, compiler_version, kconfig]))]
+    return [
+        DefaultInfo(files = depset([hyp_lds, compiler_version, kconfig])),
+        _fake_source_tree_info(root),
+    ]
 
 _fake_nvhe_source_inputs = rule(implementation = _fake_nvhe_source_inputs_impl)
 
 def _fake_vdso32_source_inputs_impl(ctx):
+    root = ctx.actions.declare_file(ctx.label.name + ".source/Kconfig")
+    ctx.actions.write(root, "")
     files = []
     for path in [
         "arch/arm64/kernel/vdso32-wrap.S",
@@ -196,7 +220,10 @@ def _fake_vdso32_source_inputs_impl(ctx):
         out = ctx.actions.declare_file(ctx.label.name + ".source/" + path)
         ctx.actions.write(out, "")
         files.append(out)
-    return [DefaultInfo(files = depset(files))]
+    return [
+        DefaultInfo(files = depset(files)),
+        _fake_source_tree_info(root),
+    ]
 
 _fake_vdso32_source_inputs = rule(implementation = _fake_vdso32_source_inputs_impl)
 
@@ -272,6 +299,25 @@ _content_addressed_object_test = analysistest.make(
         "unexpected_generated_headers": attr.string_list(),
         "unexpected_input": attr.string(mandatory = True),
     },
+)
+
+def _indexed_assembly_source_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxObjectCompile"
+    ]
+    asserts.equals(env, 1, len(actions))
+    if actions:
+        argv = actions[0].argv
+        asserts.true(env, "-D__ASSEMBLY__" in argv)
+        compile_index = argv.index("-c")
+        asserts.true(env, argv[compile_index + 1].endswith("/lib/crypto/x86/blake2s-core.S"))
+    return analysistest.end(env)
+
+_indexed_assembly_source_test = analysistest.make(
+    _indexed_assembly_source_test_impl,
 )
 
 _X86_PRECISE_HEADER_FAMILIES = [
@@ -872,19 +918,44 @@ def linux_objects_fail_closed_test_suite(name):
     linux_source_input_index(
         name = source_input_index,
         groups = ["1,2,3,4"],
-        source_paths = [
-            "include/linux/compiler-version.h",
-            "include/linux/compiler_types.h",
-            "include/linux/kconfig.h",
-            "linux_objects_test_fixture.c",
-        ],
         srcs = [
             "include/linux/compiler-version.h",
             "include/linux/compiler_types.h",
             "include/linux/kconfig.h",
             "linux_objects_test_fixture.c",
         ],
+        source_tree_info = ":" + source_tree,
         tags = fixture_tags,
+    )
+    assembly_source_input_index = name + "_assembly_source_input_index"
+    linux_source_input_index(
+        name = assembly_source_input_index,
+        groups = ["1,2"],
+        srcs = [
+            "lib/crypto/x86/blake2s-core.S",
+            "lib/crypto/x86/blake2s.h",
+        ],
+        source_tree_info = ":" + source_tree,
+        tags = fixture_tags,
+    )
+    indexed_assembly_object = name + "_indexed_assembly_object"
+    linux_object(
+        name = indexed_assembly_object,
+        compile_environment_id = environment_id,
+        compile_environment_index = ":" + compile_environment_index,
+        content_id = object_c_id,
+        mode = "y",
+        object = "lib/crypto/x86/blake2s-core.o",
+        source_input_file = 1,
+        source_input_group = 1,
+        source_input_index = ":" + assembly_source_input_index,
+        source_tree_info = ":" + source_tree,
+        tags = fixture_tags,
+    )
+    indexed_assembly_object_test = indexed_assembly_object + "_test"
+    _indexed_assembly_source_test(
+        name = indexed_assembly_object_test,
+        target_under_test = ":" + indexed_assembly_object,
     )
     nvhe_source_inputs = name + "_nvhe_source_inputs"
     _fake_nvhe_source_inputs(
@@ -895,12 +966,8 @@ def linux_objects_fail_closed_test_suite(name):
     linux_source_input_index(
         name = nvhe_source_input_index,
         groups = ["1,2,3"],
-        source_paths = [
-            "arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
-            "include/linux/compiler-version.h",
-            "include/linux/kconfig.h",
-        ],
         srcs = [":" + nvhe_source_inputs],
+        source_tree_info = ":" + nvhe_source_inputs,
         tags = fixture_tags,
     )
     vdso32_source_inputs = name + "_vdso32_source_inputs"
@@ -912,44 +979,24 @@ def linux_objects_fail_closed_test_suite(name):
     linux_source_input_index(
         name = vdso32_source_input_index,
         groups = ["1,2,3,4,5,6,7,8"],
-        source_paths = [
-            "arch/arm64/kernel/vdso32-wrap.S",
-            "arch/arm64/kernel/vdso32/note.c",
-            "arch/arm64/kernel/vdso32/vdso.lds.S",
-            "arch/arm64/kernel/vdso32/vgettimeofday.c",
-            "include/linux/compiler-version.h",
-            "include/linux/compiler_types.h",
-            "include/linux/kconfig.h",
-            "lib/vdso/gettimeofday.c",
-        ],
         srcs = [":" + vdso32_source_inputs],
+        source_tree_info = ":" + vdso32_source_inputs,
         tags = fixture_tags,
     )
     duplicate_source_group_index = name + "_duplicate_source_group_index"
     linux_source_input_index(
         name = duplicate_source_group_index,
         groups = ["1", "1"],
-        source_paths = ["linux_objects_test_fixture.c"],
         srcs = ["linux_objects_test_fixture.c"],
+        source_tree_info = ":" + source_tree,
         tags = fixture_tags,
     )
     out_of_range_source_file_index = name + "_out_of_range_source_file_index"
     linux_source_input_index(
         name = out_of_range_source_file_index,
         groups = ["2"],
-        source_paths = ["linux_objects_test_fixture.c"],
         srcs = ["linux_objects_test_fixture.c"],
-        tags = fixture_tags,
-    )
-    duplicate_source_file_index = name + "_duplicate_source_file_index"
-    linux_source_input_index(
-        name = duplicate_source_file_index,
-        groups = ["1,2"],
-        source_paths = ["duplicate.h", "duplicate.h"],
-        srcs = [
-            "include/linux/compiler-version.h",
-            "include/linux/compiler_types.h",
-        ],
+        source_tree_info = ":" + source_tree,
         tags = fixture_tags,
     )
     indexed_object = name + "_indexed_object"
@@ -1178,7 +1225,6 @@ def linux_objects_fail_closed_test_suite(name):
     failure_cases = [
         (empty_image, "requires at least one compiled object"),
         (certificate_object, "hermetic certificate embedding and signing are not implemented"),
-        (duplicate_source_file_index, "duplicate or non-canonical source path"),
         (duplicate_source_group_index, "duplicate or non-canonical group"),
         (empty_source_inputs_nvhe, "source_input_group 2 is out of range"),
         (incomplete_source_inputs_nvhe, "requires compile_environment_index and source_input_index together"),
@@ -1195,6 +1241,7 @@ def linux_objects_fail_closed_test_suite(name):
     ]
     tests = [
         ":" + equivalent_object_test,
+        ":" + indexed_assembly_object_test,
         ":" + indexed_object_test,
         ":" + precise_family_object_test,
     ]
@@ -1367,7 +1414,7 @@ def linux_objects_fail_closed_test_suite(name):
         objects = [object_targets["a"]],
         source_input_group = 1,
         source_input_index = ":" + nvhe_source_input_index,
-        source_tree_info = ":" + source_tree,
+        source_tree_info = ":" + nvhe_source_inputs,
         tags = fixture_tags,
     )
     exact_nvhe_test = exact_nvhe + "_test"
@@ -1388,7 +1435,7 @@ def linux_objects_fail_closed_test_suite(name):
         source_input_file = 1,
         source_input_group = 1,
         source_input_index = ":" + vdso32_source_input_index,
-        source_tree_info = ":" + source_tree,
+        source_tree_info = ":" + vdso32_source_inputs,
         tags = fixture_tags,
     )
     exact_vdso32_test = exact_vdso32 + "_test"

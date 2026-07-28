@@ -2361,16 +2361,14 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 		r.SetAttr("tags", []string{"manual"})
 	}
 	if sourceInputIndexTarget != "" {
-		sourcePaths := make([]string, 0, len(m.SourceFiles))
 		sourceLabels := make([]string, 0, len(m.SourceFiles))
 		for _, input := range m.SourceFiles {
-			sourcePaths = append(sourcePaths, input.Path)
 			sourceLabels = append(sourceLabels, labelForSource(opts, input.Path))
 		}
 		r := file.AddRule("linux_source_input_index", sourceInputIndexTarget)
 		r.SetAttr("groups", m.SourceInputGroups)
-		r.SetAttr("source_paths", sourcePaths)
 		r.SetAttr("srcs", sourceLabels)
+		r.SetAttr("source_tree_info", ":"+sourceTreeTarget)
 		r.SetAttr("tags", []string{"manual"})
 	}
 	if sourceTreeTarget != "" {

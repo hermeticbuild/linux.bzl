@@ -235,29 +235,33 @@ def _positive_decimal(value, context):
     return result
 
 def _linux_source_input_index_impl(ctx):
-    files = ctx.files.srcs
-    paths = ctx.attr.source_paths
-    if not files or len(files) != len(paths):
-        fail(
-            "linux_source_input_index %s requires equal non-empty srcs/source_paths, got %d/%d" %
-            (ctx.label, len(files), len(paths)),
-        )
-    file_indices = {}
+    if not ctx.files.srcs:
+        fail("linux_source_input_index %s requires non-empty srcs" % ctx.label)
+    source_root = ctx.attr.source_tree_info[LinuxSourceTreeInfo].root
+    if not source_root:
+        fail("linux_source_input_index %s requires a rooted source_tree_info" % ctx.label)
+    root_dir = _source_tree_root_dir(source_root)
+    files_by_path = {}
     seen_files = {}
-    previous_path = ""
-    for i in range(len(paths)):
-        path = paths[i]
-        if not path or (previous_path and previous_path >= path):
+    for file in ctx.files.srcs:
+        path = _source_tree_relpath(file, root_dir)
+        if not path or path in files_by_path:
             fail("linux_source_input_index %s has duplicate or non-canonical source path %r" % (ctx.label, path))
-        file = files[i]
         if file.path in seen_files:
             fail(
                 "linux_source_input_index %s repeats file %s for paths %s and %s" %
                 (ctx.label, file.path, seen_files[file.path], path),
             )
-        file_indices[path] = i + 1
+        files_by_path[path] = file
         seen_files[file.path] = path
-        previous_path = path
+
+    paths = sorted(files_by_path.keys())
+    files = [files_by_path[path] for path in paths]
+    file_indices = {}
+    for i in range(len(paths)):
+        path = paths[i]
+        file = files[i]
+        file_indices[path] = i + 1
 
     groups = []
     seen_groups = {}
@@ -311,14 +315,15 @@ linux_source_input_index = rule(
             mandatory = True,
             doc = "Canonical comma-separated one-based file indices for each exact input group.",
         ),
-        "source_paths": attr.string_list(
-            mandatory = True,
-            doc = "Canonical source-root-relative path parallel to each srcs entry.",
-        ),
         "srcs": attr.label_list(
             allow_files = True,
             mandatory = True,
-            doc = "Canonical exact source files, with each unique file labeled once.",
+            doc = "Exact source files, canonicalized by source-root-relative path during analysis.",
+        ),
+        "source_tree_info": attr.label(
+            mandatory = True,
+            providers = [LinuxSourceTreeInfo],
+            doc = "Linux source tree used to derive canonical paths for srcs.",
         ),
     },
     doc = "Indexes exact source files into shared depsets selected by content-addressed Linux actions.",
