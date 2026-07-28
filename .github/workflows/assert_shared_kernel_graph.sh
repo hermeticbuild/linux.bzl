@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 4 ]]; then
-  echo "usage: $0 BEP METADATA EXPECTED_ACTIONS EXPECTED_MEMBERSHIPS" >&2
+if [[ $# -ne 5 ]]; then
+  echo "usage: $0 BEP METADATA EXPECTED_ACTIONS EXPECTED_MEMBERSHIPS MAX_CONFIGURED_TARGETS" >&2
   exit 2
 fi
 
@@ -10,6 +10,7 @@ bep="$1"
 metadata="$2"
 expected_actions="$3"
 expected_memberships="$4"
+max_configured_targets="$5"
 
 expect() {
   local label="$1"
@@ -132,5 +133,28 @@ fi
 IFS=$'\t' read -r actions_created actions_executed <<<"${action_counts}"
 expect actions_created "${actions_created}" "${union_count}"
 
-printf '%s memberships deduplicated to %s LinuxObjectCompile actions (%s executed)\n' \
-  "${membership_count}" "${union_count}" "${actions_executed}"
+if ! configured_targets="$(
+  jq -ser '
+    [
+      .[]?
+      | .buildMetrics?
+      | select(. != null)
+      | .targetMetrics.targetsConfiguredNotIncludingAspects
+    ]
+    | if length != 1 then
+        error("expected exactly one configured-target metric")
+      else
+        .[0]
+      end
+  ' "${bep}"
+)"; then
+  echo "invalid configured-target metrics: ${bep}" >&2
+  exit 1
+fi
+if (( configured_targets > max_configured_targets )); then
+  echo "configured targets: got ${configured_targets}, maximum ${max_configured_targets}" >&2
+  exit 1
+fi
+
+printf '%s memberships deduplicated to %s LinuxObjectCompile actions (%s executed); %s configured targets\n' \
+  "${membership_count}" "${union_count}" "${actions_executed}" "${configured_targets}"
