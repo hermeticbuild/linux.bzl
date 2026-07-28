@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "linuxobjectinputreport_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/linuxobjectinputreport",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "linuxobjectinputreport",
+    embed = [":linuxobjectinputreport_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "linuxobjectinputreport_test",
+    srcs = ["main_test.go"],
+    embed = [":linuxobjectinputreport_lib"],
+)
