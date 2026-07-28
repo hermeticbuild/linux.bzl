@@ -436,6 +436,37 @@ variants currently use independent graphs and do not share object actions.
 Reducing that config input requires a future generator/schema revision and
 broader differential coverage of source-level `CONFIG_*` references.
 
+### Inspecting object inputs
+
+`@linux.bzl//tools:linuxobjectinputreport` summarizes the logical inputs
+attached to Linux compile actions. Generate the action graph with `deps(...)`
+so it contains the actions that produce generated compile inputs:
+
+```sh
+bazel build //path/to:kernel
+bazel aquery \
+  --output=jsonproto \
+  --include_artifacts \
+  --noinclude_commandline \
+  'deps(//path/to:kernel)' > /tmp/linux-object-inputs.json
+bazel run @linux.bzl//tools:linuxobjectinputreport -- \
+  -input /tmp/linux-object-inputs.json \
+  -execroot "$(bazel info execution_root)"
+```
+
+Use the same configuration and platform flags for the build and `aquery`.
+The report filters `LinuxObjectCompile` actions by default; pass `-mnemonic`
+to select another action class. Do not filter the `aquery` itself with
+`mnemonic(...)` when producer fanout is needed, because that removes the
+producer actions from the JSON graph.
+
+`-execroot` is optional. When present, it measures materialized input file
+bytes in the current local execution-root snapshot, deduplicated by local file
+identity. Build the target first to make more generated inputs available
+locally; unavailable inputs are reported as unknown rather than zero bytes.
+With remote execution or minimal output downloading, use
+`--remote_download_all` when complete local byte coverage is required.
+
 For x86 boot images, the resolved config must select either
 `CONFIG_KERNEL_GZIP=y` or `CONFIG_KERNEL_LZ4=y`. Other x86 payload compression
 modes fail during repository evaluation rather than producing a mismatched
