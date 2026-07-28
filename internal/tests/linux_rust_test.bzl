@@ -440,6 +440,50 @@ def _action_has_input_suffix(action, suffix):
             return True
     return False
 
+def _action_has_input_basename_containing(action, value):
+    for file in action.inputs.to_list():
+        if value in file.basename:
+            return True
+    return False
+
+def _action_has_rust_std_rlib(action):
+    for file in action.inputs.to_list():
+        if file.basename.startswith("libstd-") and file.basename.endswith(".rlib"):
+            return True
+    return False
+
+def _action_has_tool_input(action, name):
+    for file in action.inputs.to_list():
+        if file.basename in (name, name + ".exe"):
+            return True
+    return False
+
+def _assert_no_unrelated_rust_tools(env, action):
+    for name in [
+        "cargo",
+        "cargo-clippy",
+        "clippy-driver",
+        "rustdoc",
+        "rustfmt",
+    ]:
+        asserts.false(
+            env,
+            _action_has_tool_input(action, name),
+            "%s should not be an input to %s" % (name, action.mnemonic),
+        )
+
+def _assert_no_c_toolchain_inputs(env, action):
+    for name in [
+        "clang",
+        "ld.lld",
+        "llvm-ar",
+    ]:
+        asserts.false(
+            env,
+            _action_has_tool_input(action, name),
+            "%s should not be an input to %s" % (name, action.mnemonic),
+        )
+
 def _action_has_argument_containing(action, value):
     for argument in action.argv:
         if value in argument:
@@ -462,6 +506,37 @@ def _enabled_sdk_test_impl(ctx):
     asserts.true(env, sdk.target_spec != None)
     asserts.equals(env, "1", sdk.rustc_env.get("RUSTC_BOOTSTRAP"))
     asserts.true(env, sdk.rustc != None)
+    rustc_file_paths = {
+        file.path: True
+        for file in sdk.rustc_files.to_list()
+    }
+    asserts.true(env, sdk.rustc.path in rustc_file_paths)
+    asserts.true(
+        env,
+        any([
+            "rustc_driver" in file.basename
+            for file in sdk.rustc_files.to_list()
+        ]),
+        "external modules require the selected rustc runtime libraries",
+    )
+    asserts.false(
+        env,
+        any([
+            file.basename.endswith(".rlib")
+            for file in sdk.rustc_files.to_list()
+        ]),
+        "external modules use the kernel SDK crates instead of the toolchain standard library",
+    )
+    asserts.equals(
+        env,
+        [],
+        sorted([
+            file.path
+            for file in sdk.compile_inputs.to_list()
+            if file.path in rustc_file_paths
+        ]),
+        "Rust metadata and compiler runtime inputs must be disjoint",
+    )
     asserts.true(env, "-Zdwarf-version=5" in sdk.module_flags)
     asserts.true(env, "-Cdebuginfo=2" in sdk.module_flags)
     asserts.equals(
@@ -480,6 +555,12 @@ def _enabled_sdk_test_impl(ctx):
     asserts.equals(env, 1, len(target_generator_actions))
     if target_generator_actions:
         _assert_host_rust_runtime_link(env, target_generator_actions[0])
+        _assert_no_unrelated_rust_tools(env, target_generator_actions[0])
+        asserts.true(
+            env,
+            _action_has_rust_std_rlib(target_generator_actions[0]),
+            "target generator requires the execution-platform Rust standard library",
+        )
         asserts.true(
             env,
             _action_has_argument_ending_with(target_generator_actions[0], "/rustc"),
@@ -505,6 +586,18 @@ def _enabled_sdk_test_impl(ctx):
     ]
     asserts.equals(env, 1, len(core_actions))
     if core_actions:
+        _assert_no_unrelated_rust_tools(env, core_actions[0])
+        _assert_no_c_toolchain_inputs(env, core_actions[0])
+        asserts.true(
+            env,
+            _action_has_input_basename_containing(core_actions[0], "rustc_driver"),
+            "kernel crates require the selected rustc runtime libraries",
+        )
+        asserts.false(
+            env,
+            _action_has_rust_std_rlib(core_actions[0]),
+            "kernel crates use their configured core crate instead of the toolchain standard library",
+        )
         asserts.equals(
             env,
             [sdk.rustc],
@@ -562,6 +655,12 @@ def _enabled_sdk_test_impl(ctx):
     asserts.equals(env, 1, len(proc_macro_actions))
     if proc_macro_actions:
         _assert_host_rust_runtime_link(env, proc_macro_actions[0])
+        _assert_no_unrelated_rust_tools(env, proc_macro_actions[0])
+        asserts.true(
+            env,
+            _action_has_rust_std_rlib(proc_macro_actions[0]),
+            "procedural macros require the execution-platform Rust standard library",
+        )
         asserts.true(
             env,
             _action_has_argument_ending_with(proc_macro_actions[0], "/rustc"),

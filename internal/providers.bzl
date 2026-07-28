@@ -18,7 +18,7 @@ LinuxKernelInfo = provider(
 LinuxRustSdkInfo = provider(
     doc = "Private Rust-for-Linux SDK produced for one configured kernel.",
     fields = {
-        "compile_inputs": "Depset of Rust crate metadata, generated sources, and toolchain inputs.",
+        "compile_inputs": "Depset of Rust crate metadata and generated sources.",
         "enabled": "Whether CONFIG_RUST is enabled for this kernel.",
         "module_flags": "Rust compiler flags shared by external modules.",
         "module_version_predicates": "Ordered rustc-version predicates for external module flags.",
@@ -29,7 +29,7 @@ LinuxRustSdkInfo = provider(
         "rust_dir_anchor": "File-backed reference to rust_dir for path-mapped actions.",
         "rustc": "Exact rustc File used to build the SDK, or None when disabled.",
         "rustc_env": "Hermetic environment used to invoke rustc.",
-        "rustc_files": "Depset of rustc runtime/toolchain input Files.",
+        "rustc_files": "Depset containing rustc and its runtime library Files.",
         "rustc_probe": "Action-generated JSON identity for the selected rustc, or None when disabled.",
         "minimum_rustc_version": "Minimum upstream rustc release accepted by this kernel.",
         "runtime_objects": "Ordered list of Rust runtime object Files folded into vmlinux.o.",

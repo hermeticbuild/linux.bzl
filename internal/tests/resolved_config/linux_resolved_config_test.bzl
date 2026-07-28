@@ -21,6 +21,18 @@ def _has_input(action, file):
         for input_file in action.inputs.to_list()
     }
 
+def _has_input_basename_containing(action, value):
+    for file in action.inputs.to_list():
+        if value in file.basename:
+            return True
+    return False
+
+def _has_tool_input(action, name):
+    for file in action.inputs.to_list():
+        if file.basename in (name, name + ".exe"):
+            return True
+    return False
+
 def _c_config_test_impl(ctx):
     env = analysistest.begin(ctx)
     target = analysistest.target_under_test(env)
@@ -59,6 +71,26 @@ def _rust_config_test_impl(ctx):
         asserts.true(env, _has_argument(probes[0], "-host-rustc"))
         asserts.true(env, _has_argument(probes[0], "-minimum"))
         asserts.true(env, _has_argument(probes[0], "1.78.0"))
+        asserts.true(
+            env,
+            _has_input_basename_containing(probes[0], "rustc_driver"),
+            "the compiler probe requires rustc runtime libraries",
+        )
+        for name in [
+            "cargo",
+            "cargo-clippy",
+            "clang",
+            "clippy-driver",
+            "ld.lld",
+            "llvm-ar",
+            "rustdoc",
+            "rustfmt",
+        ]:
+            asserts.false(
+                env,
+                _has_tool_input(probes[0], name),
+                "%s should not be an input to the compiler identity probe" % name,
+            )
 
     resolved = _actions_with_mnemonic(actions, "LinuxResolvedConfig")
     asserts.equals(env, 1, len(resolved))
