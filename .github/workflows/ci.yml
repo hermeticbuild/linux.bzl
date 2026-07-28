@@ -59,9 +59,6 @@ jobs:
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test "${targets[@]}" \
             "${path_mapping_args[@]}" \
-            --notrack_incremental_state \
-            --nokeep_state_after_build \
-            --discard_analysis_cache \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"

@@ -374,6 +374,17 @@ build_test(
     ],
 )
 
+build_test(
+    name = "linux_source_root_package_build_test",
+    targets = [
+        "@e2e_linux_6_18_39//:tools/bpf/resolve_btfids/main.c",
+        "@e2e_linux_6_18_39//:tools/lib/subcmd/Build.linux-bzl",
+        "@e2e_linux_6_18_39//:tools/lib/subcmd/subcmd-config.c",
+        "@e2e_linux_6_18_39//:tools/objtool/arch/x86/decode.c",
+        "@e2e_linux_6_18_39//:tools/objtool/objtool.c",
+    ],
+)
+
 test_suite(
     name = "kernel_outputs_build_test",
     tests = [
