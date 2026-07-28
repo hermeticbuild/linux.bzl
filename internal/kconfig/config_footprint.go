@@ -448,12 +448,11 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 				return sourceClosure{}, err
 			}
 			// Linux wrappers define LIBFDT_ENV_H before entering the vendored
-			// libfdt subtree, so its userspace environment header is inactive.
-			if entry.linuxLibfdtEnvironmentGuarded &&
+			// libfdt subtree. The compiler still opens its environment header,
+			// but the header's userspace-only body is inactive.
+			guardedLinuxLibfdtEnvironment := entry.linuxLibfdtEnvironmentGuarded &&
 				strings.HasPrefix(treePath, "scripts/dtc/libfdt/") &&
-				filepath.ToSlash(strings.TrimSpace(inc.path)) == "libfdt_env.h" {
-				continue
-			}
+				filepath.ToSlash(strings.TrimSpace(inc.path)) == "libfdt_env.h"
 			resolvedIncludes := s.resolveInclude(treePath, inc.path, inc.kind, search)
 			if len(resolvedIncludes) == 0 {
 				includePath := filepath.ToSlash(strings.TrimSpace(inc.path))
@@ -484,6 +483,17 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 				if linuxLibfdtEnvironmentWrapper(treePath) &&
 					resolved == "include/linux/libfdt_env.h" {
 					linuxLibfdtEnvironmentIncluded = true
+				}
+				if guardedLinuxLibfdtEnvironment {
+					input, err := s.inputForTreePath(resolved)
+					if err != nil {
+						err = fmt.Errorf("%s:%d: %w", treePath, inc.line, err)
+						s.closure[key] = sourceClosure{}
+						s.closureErrs[key] = err
+						return sourceClosure{}, err
+					}
+					inputs[input.Path] = input
+					continue
 				}
 				if resolved != source && isSourceLikeInclude(resolved) {
 					includeSet[resolved] = true

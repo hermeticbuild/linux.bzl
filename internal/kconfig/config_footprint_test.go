@@ -237,6 +237,7 @@ func TestConfigSourceScannerContentGraphModelsLinuxLibfdtEnvironmentGuard(t *tes
 		"include/linux/libfdt_env.h",
 		"kernel/user.c",
 		"scripts/dtc/libfdt/libfdt.h",
+		"scripts/dtc/libfdt/libfdt_env.h",
 	}
 	if !reflect.DeepEqual(paths, want) {
 		t.Fatalf("Linux libfdt wrapper inputs = %v, want %v", paths, want)
@@ -267,6 +268,7 @@ func TestConfigSourceScannerContentGraphModelsLinuxLibfdtEnvironmentGuard(t *tes
 		"lib/fdt.c",
 		"scripts/dtc/libfdt/fdt.c",
 		"scripts/dtc/libfdt/libfdt.h",
+		"scripts/dtc/libfdt/libfdt_env.h",
 	}
 	if !reflect.DeepEqual(paths, want) {
 		t.Fatalf("Linux libfdt implementation inputs = %v, want %v", paths, want)
