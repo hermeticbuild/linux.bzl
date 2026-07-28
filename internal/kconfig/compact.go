@@ -307,6 +307,29 @@ func MergeCompactMetadata(parts ...*CompactMetadata) (*CompactMetadata, error) {
 }
 
 func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig, opts CompactMetadataOptions) (*CompactMetadata, error) {
+	return t.compactMetadataBatchWithOptions(configs, opts, func(*ResolvedConfig) (*KbuildFile, string, error) {
+		return kb, opts.GeneratedHeadersLabel, nil
+	})
+}
+
+// CompactMetadataBatchWithOptions resolves and emits multiple config-specific
+// Kbuild graphs while sharing immutable source scanning work for the invocation.
+func (t *Tree) CompactMetadataBatchWithOptions(
+	configs []NamedConfig,
+	opts CompactMetadataOptions,
+	kbuildForConfig func(*ResolvedConfig) (*KbuildFile, string, error),
+) (*CompactMetadata, error) {
+	if kbuildForConfig == nil {
+		return nil, fmt.Errorf("compact metadata Kbuild resolver must not be nil")
+	}
+	return t.compactMetadataBatchWithOptions(configs, opts, kbuildForConfig)
+}
+
+func (t *Tree) compactMetadataBatchWithOptions(
+	configs []NamedConfig,
+	opts CompactMetadataOptions,
+	kbuildForConfig func(*ResolvedConfig) (*KbuildFile, string, error),
+) (*CompactMetadata, error) {
 	if opts.Schema.isV013() && strings.TrimSpace(opts.CompileEnvironmentABI) == "" {
 		return nil, fmt.Errorf("compact schema %s requires a non-empty compile environment ABI", opts.Schema)
 	}
@@ -327,9 +350,9 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 	}
 	seenConfigs := map[string]bool{}
 	seenImageTargets := map[string]string{}
-	var scanner *configSourceScanner
+	var sourceCache *compactSourceCache
 	if opts.Schema.isV012() {
-		scanner = newConfigSourceScanner(opts)
+		sourceCache = newCompactSourceCache()
 	}
 	for _, named := range configs {
 		if named.Name == "" {
@@ -346,12 +369,23 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 		if err != nil {
 			return nil, err
 		}
+		kb, generatedHeadersLabel, err := kbuildForConfig(resolved)
+		if err != nil {
+			return nil, fmt.Errorf("resolve Kbuild for config %q: %w", named.Name, err)
+		}
+		if kb == nil {
+			return nil, fmt.Errorf("resolve Kbuild for config %q: nil Kbuild", named.Name)
+		}
+		var scanner *configSourceScanner
+		if sourceCache != nil {
+			scanner = newConfigSourceScannerWithCache(opts, sourceCache)
+		}
 		fullConfigPayload := CompactConfigPayload{}
 		headerGroupID := ""
 		if opts.Schema.isV013() {
 			fullConfigPayload = newCompactConfigPayload(compactFullConfigFragment(resolved))
 			configPayloads[fullConfigPayload.ID] = fullConfigPayload
-			if opts.GeneratedHeadersLabel != "" {
+			if generatedHeadersLabel != "" {
 				headerFragment, headerInputs, footprint, err := generatedHeaderFootprint(resolved, opts, scanner)
 				if err != nil {
 					return nil, fmt.Errorf("derive generated headers for config %q: %w", named.Name, err)
@@ -360,7 +394,7 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 				configPayloads[headerConfigPayload.ID] = headerConfigPayload
 				group := newCompactHeaderGroup(
 					headerConfigPayload.ID,
-					opts.GeneratedHeadersLabel,
+					generatedHeadersLabel,
 					opts.Srcarch,
 					footprint,
 					headerInputs,
@@ -491,7 +525,6 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 			return nil, err
 		}
 	}
-	sort.Slice(out.Configs, func(i, j int) bool { return out.Configs[i].Name < out.Configs[j].Name })
 	if err := out.validateContentIDs(); err != nil {
 		return nil, err
 	}
@@ -1688,7 +1721,7 @@ func (o resolvedKbuildObject) variant(
 			sourceInputs = nil
 		}
 	}
-	targetHash := objectVariantHash(o.object, o.mode, modname, flags, remove, fragment, sourceIncludes, deps, members)
+	targetHash := ""
 	contentID := ""
 	compileEnvironmentID := ""
 	if schema.isV013() {
@@ -1714,6 +1747,8 @@ func (o resolvedKbuildObject) variant(
 			compileEnvironmentABI,
 		)
 		targetHash = compactShortID(contentID)
+	} else {
+		targetHash = objectVariantHash(o.object, o.mode, modname, flags, remove, fragment, sourceIncludes, deps, members)
 	}
 	return CompactObjectVariant{
 		Target:             sanitizeTargetName(strings.TrimSuffix(o.object, ".o")) + "__" + targetHash,

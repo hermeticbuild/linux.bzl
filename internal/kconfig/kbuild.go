@@ -162,15 +162,30 @@ func parseKbuildFile(path string, vars map[string]string) (*KbuildFile, error) {
 }
 
 func ParseKbuildFileTree(path string, opts KbuildOptions) (*KbuildFile, error) {
+	return parseKbuildFileTree(path, opts, nil)
+}
+
+func parseKbuildFileTree(path string, opts KbuildOptions, variableOverrides map[string]string) (*KbuildFile, error) {
 	if opts.MaxIncludeDepth == 0 {
 		opts.MaxIncludeDepth = 64
 	}
-	treeParser := &kbuildTreeParser{
-		opts:    opts,
-		seen:    map[string]bool{},
-		parsing: map[string]bool{},
+	if opts.RootDir != "" {
+		if _, overridden := variableOverrides["srctree"]; !overridden {
+			if _, set := opts.Variables["srctree"]; !set {
+				if variableOverrides == nil {
+					variableOverrides = map[string]string{}
+				}
+				variableOverrides["srctree"] = opts.RootDir
+			}
+		}
 	}
-	parser := newKbuildParser(treeParser.variables(), "")
+	treeParser := &kbuildTreeParser{
+		opts:              opts,
+		variableOverrides: variableOverrides,
+		seen:              map[string]bool{},
+		parsing:           map[string]bool{},
+	}
+	parser := newKbuildParserWithOverrides(opts.Variables, variableOverrides, "")
 	parser.includeFunc = func(includes []KbuildInclude) error {
 		return treeParser.parseIncludes(parser, includes)
 	}
@@ -286,9 +301,16 @@ func parseKbuild(r io.Reader, filename string, vars map[string]string, baseDir s
 
 func (p *kbuildParser) finalizeObjectSettings() error {
 	names := make([]string, 0, len(p.vars))
-	for name := range p.vars {
-		names = append(names, name)
-	}
+	p.forEachVariableName(func(name string) {
+		if strings.HasPrefix(name, "CONFIG_") {
+			return
+		}
+		_, _, isObjectSetting := kbuildObjectSettingName(name)
+		_, language, isObjectFlags := perObjectFlagTarget(name)
+		if isObjectSetting || (isObjectFlags && language == "c") {
+			names = append(names, name)
+		}
+	})
 	sort.Strings(names)
 	for _, variable := range names {
 		name, object, ok := kbuildObjectSettingName(variable)
@@ -375,15 +397,17 @@ func (p *kbuildParser) parseReader(r io.Reader, filename string) error {
 func (p *kbuildParser) appendMakefileList(filename string) {
 	filename = filepath.ToSlash(filename)
 	current := ""
-	if variable, ok := p.vars["MAKEFILE_LIST"]; ok {
+	if variable, ok := p.lookupVariable("MAKEFILE_LIST"); ok {
 		current = variable.value
 	}
-	p.vars["MAKEFILE_LIST"] = kbuildVariable{value: appendMakeValue(current, filename)}
+	p.setVariable("MAKEFILE_LIST", kbuildVariable{value: appendMakeValue(current, filename)})
 }
 
 type kbuildParser struct {
 	kb           *KbuildFile
+	initialVars  map[string]string
 	vars         map[string]kbuildVariable
+	undefined    map[string]bool
 	locals       []map[string]string
 	expanding    map[string]bool
 	conds        []kbuildConditionalFrame
@@ -419,16 +443,58 @@ type kbuildConditionalFrame struct {
 }
 
 func newKbuildParser(vars map[string]string, baseDir string) *kbuildParser {
-	copied := map[string]kbuildVariable{}
-	for key, value := range vars {
-		copied[key] = kbuildVariable{value: value}
+	return newKbuildParserWithOverrides(vars, nil, baseDir)
+}
+
+func newKbuildParserWithOverrides(vars, overrides map[string]string, baseDir string) *kbuildParser {
+	local := make(map[string]kbuildVariable, len(overrides))
+	for key, value := range overrides {
+		local[key] = kbuildVariable{value: value}
 	}
 	return &kbuildParser{
 		kb:          &KbuildFile{},
-		vars:        copied,
+		initialVars: vars,
+		vars:        local,
 		expanding:   map[string]bool{},
 		baseDir:     baseDir,
 		currentRule: -1,
+	}
+}
+
+func (p *kbuildParser) lookupVariable(name string) (kbuildVariable, bool) {
+	if p.undefined[name] {
+		return kbuildVariable{}, false
+	}
+	if variable, ok := p.vars[name]; ok {
+		return variable, true
+	}
+	value, ok := p.initialVars[name]
+	return kbuildVariable{value: value}, ok
+}
+
+func (p *kbuildParser) setVariable(name string, variable kbuildVariable) {
+	delete(p.undefined, name)
+	p.vars[name] = variable
+}
+
+func (p *kbuildParser) undefineVariable(name string) {
+	delete(p.vars, name)
+	if p.undefined == nil {
+		p.undefined = map[string]bool{}
+	}
+	p.undefined[name] = true
+}
+
+func (p *kbuildParser) forEachVariableName(visit func(string)) {
+	for name := range p.initialVars {
+		if !p.undefined[name] {
+			visit(name)
+		}
+	}
+	for name := range p.vars {
+		if _, inherited := p.initialVars[name]; !inherited {
+			visit(name)
+		}
 	}
 }
 
@@ -739,7 +805,7 @@ func (p *kbuildParser) parseVariableDirective(line string) (bool, error) {
 			return true, err
 		}
 		for _, name := range names {
-			delete(p.vars, name)
+			p.undefineVariable(name)
 		}
 		return true, nil
 	}
@@ -755,8 +821,8 @@ func (p *kbuildParser) parseVariableDirective(line string) (bool, error) {
 			return true, err
 		}
 		for _, name := range names {
-			if _, ok := p.vars[name]; !ok {
-				p.vars[name] = kbuildVariable{}
+			if _, ok := p.lookupVariable(name); !ok {
+				p.setVariable(name, kbuildVariable{})
 			}
 		}
 		return true, nil
@@ -1139,25 +1205,25 @@ func (p *kbuildParser) expandPrerequisites(value string) ([]string, []string, er
 func (p *kbuildParser) assign(lhs, op, rhs, expandedRHS string) {
 	switch op {
 	case "+=":
-		current, ok := p.vars[lhs]
+		current, ok := p.lookupVariable(lhs)
 		switch {
 		case !ok:
-			p.vars[lhs] = kbuildVariable{value: rhs, recursive: true}
+			p.setVariable(lhs, kbuildVariable{value: rhs, recursive: true})
 		case current.recursive:
 			current.value = appendMakeValue(current.value, rhs)
-			p.vars[lhs] = current
+			p.setVariable(lhs, current)
 		default:
 			current.value = appendMakeValue(current.value, expandedRHS)
-			p.vars[lhs] = current
+			p.setVariable(lhs, current)
 		}
 	case "?=":
-		if _, ok := p.vars[lhs]; !ok {
-			p.vars[lhs] = kbuildVariable{value: rhs, recursive: true}
+		if _, ok := p.lookupVariable(lhs); !ok {
+			p.setVariable(lhs, kbuildVariable{value: rhs, recursive: true})
 		}
 	case "=":
-		p.vars[lhs] = kbuildVariable{value: rhs, recursive: true}
+		p.setVariable(lhs, kbuildVariable{value: rhs, recursive: true})
 	default:
-		p.vars[lhs] = kbuildVariable{value: expandedRHS}
+		p.setVariable(lhs, kbuildVariable{value: expandedRHS})
 	}
 }
 
@@ -1399,7 +1465,7 @@ func (p *kbuildParser) expandVariable(name, original string, depth int) (string,
 			return value, true, nil
 		}
 	}
-	variable, ok := p.vars[name]
+	variable, ok := p.lookupVariable(name)
 	if !ok {
 		return "", false, nil
 	}
@@ -1425,7 +1491,7 @@ func (p *kbuildParser) lookupRawVar(name string) (string, bool) {
 			return value, true
 		}
 	}
-	variable, ok := p.vars[name]
+	variable, ok := p.lookupVariable(name)
 	if !ok {
 		return "", false
 	}
@@ -1624,7 +1690,7 @@ func (p *kbuildParser) evalOrigin(args []string, original string, depth int) (st
 			return "automatic", nil
 		}
 	}
-	if _, ok := p.vars[name]; ok {
+	if _, ok := p.lookupVariable(name); ok {
 		return "file", nil
 	}
 	return "undefined", nil
@@ -1640,7 +1706,7 @@ func (p *kbuildParser) evalFlavor(args []string, original string, depth int) (st
 			return "simple", nil
 		}
 	}
-	variable, ok := p.vars[name]
+	variable, ok := p.lookupVariable(name)
 	if !ok {
 		return "undefined", nil
 	}
@@ -1731,9 +1797,10 @@ func (p *kbuildParser) evalOr(args []string, original string, depth int) (string
 }
 
 type kbuildTreeParser struct {
-	opts    KbuildOptions
-	seen    map[string]bool
-	parsing map[string]bool
+	opts              KbuildOptions
+	variableOverrides map[string]string
+	seen              map[string]bool
+	parsing           map[string]bool
 }
 
 func (p *kbuildTreeParser) parseInto(parser *kbuildParser, path string, depth int) error {
@@ -1834,25 +1901,21 @@ func (p *kbuildTreeParser) resolveInclude(path, baseDir string) (string, bool) {
 }
 
 func (p *kbuildTreeParser) expand(value string) string {
-	vars := p.variables()
-	for key, val := range vars {
+	if !containsMakeReference(value) {
+		return value
+	}
+	for key, val := range p.variableOverrides {
+		value = strings.ReplaceAll(value, "$("+key+")", val)
+		value = strings.ReplaceAll(value, "${"+key+"}", val)
+	}
+	for key, val := range p.opts.Variables {
+		if _, overridden := p.variableOverrides[key]; overridden {
+			continue
+		}
 		value = strings.ReplaceAll(value, "$("+key+")", val)
 		value = strings.ReplaceAll(value, "${"+key+"}", val)
 	}
 	return value
-}
-
-func (p *kbuildTreeParser) variables() map[string]string {
-	vars := map[string]string{}
-	for key, val := range p.opts.Variables {
-		vars[key] = val
-	}
-	if p.opts.RootDir != "" {
-		if _, ok := vars["srctree"]; !ok {
-			vars["srctree"] = p.opts.RootDir
-		}
-	}
-	return vars
 }
 
 func (kb *KbuildFile) merge(other *KbuildFile) {
@@ -1887,12 +1950,12 @@ func (p *kbuildDirectoryTreeParser) parsePath(path, objectDir string, gate Kbuil
 	}
 	local, ok := p.cache[abs]
 	if !ok {
-		vars := p.variables(objectDir)
-		parsed, err := ParseKbuildFileTree(abs, KbuildOptions{
+		variableOverrides := p.variableOverrides(objectDir)
+		parsed, err := parseKbuildFileTree(abs, KbuildOptions{
 			RootDir:         p.rootDir,
-			Variables:       vars,
+			Variables:       p.opts.Variables,
 			MaxIncludeDepth: p.opts.MaxIncludeDepth,
-		})
+		}, variableOverrides)
 		if err != nil {
 			return nil, err
 		}
@@ -2003,12 +2066,12 @@ func (p *kbuildDirectoryTreeParser) parseRootMakefile(path string) (*KbuildFile,
 	if ok {
 		return local, nil
 	}
-	vars := p.variables("")
-	parsed, err := ParseKbuildFileTree(abs, KbuildOptions{
+	variableOverrides := p.variableOverrides("")
+	parsed, err := parseKbuildFileTree(abs, KbuildOptions{
 		RootDir:         p.rootDir,
-		Variables:       vars,
+		Variables:       p.opts.Variables,
 		MaxIncludeDepth: p.opts.MaxIncludeDepth,
-	})
+	}, variableOverrides)
 	if err != nil {
 		return nil, err
 	}
@@ -2016,17 +2079,14 @@ func (p *kbuildDirectoryTreeParser) parseRootMakefile(path string) (*KbuildFile,
 	return parsed, nil
 }
 
-func (p *kbuildDirectoryTreeParser) variables(objectDir string) map[string]string {
-	vars := map[string]string{}
-	for key, value := range p.opts.Variables {
-		vars[key] = value
-	}
+func (p *kbuildDirectoryTreeParser) variableOverrides(objectDir string) map[string]string {
+	vars := make(map[string]string, 4)
 	vars["src"] = filepath.ToSlash(filepath.Join(p.rootDir, objectDir))
 	vars["obj"] = objectDir
-	if _, ok := vars["objtree"]; !ok {
+	if _, ok := p.opts.Variables["objtree"]; !ok {
 		vars["objtree"] = p.rootDir
 	}
-	if _, ok := vars["srctree"]; !ok {
+	if _, ok := p.opts.Variables["srctree"]; !ok {
 		vars["srctree"] = p.rootDir
 	}
 	return vars

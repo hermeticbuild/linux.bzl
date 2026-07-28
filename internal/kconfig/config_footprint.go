@@ -23,12 +23,19 @@ type configSourceScanner struct {
 	includeRoots []string
 	predefined   map[string]bool
 	exact        bool
+	sourceCache  *compactSourceCache
 
 	files       map[string]scannedSourceFile
 	fileErrors  map[string]error
 	closure     map[string]sourceClosure
 	closureErrs map[string]error
 	configIDs   map[*ResolvedConfig]string
+}
+
+type compactSourceCache struct {
+	exactFiles  map[string]exactSourceFile
+	exactErrors map[string]error
+	treePaths   map[string]sourceTreePathResolution
 }
 
 type sourceClosure struct {
@@ -41,6 +48,17 @@ type scannedSourceFile struct {
 	refs     []string
 	includes []sourceIncludeDirective
 	digest   string
+}
+
+type exactSourceFile struct {
+	lines        []sourceLogicalLine
+	digest       string
+	preprocessed bool
+}
+
+type sourceTreePathResolution struct {
+	abs    string
+	exists bool
 }
 
 type sourceLogicalLine struct {
@@ -98,6 +116,18 @@ func (s sourceIncludeSearch) roots(kind sourceIncludeKind) []string {
 }
 
 func newConfigSourceScanner(opts CompactMetadataOptions) *configSourceScanner {
+	return newConfigSourceScannerWithCache(opts, newCompactSourceCache())
+}
+
+func newCompactSourceCache() *compactSourceCache {
+	return &compactSourceCache{
+		exactFiles:  map[string]exactSourceFile{},
+		exactErrors: map[string]error{},
+		treePaths:   map[string]sourceTreePathResolution{},
+	}
+}
+
+func newConfigSourceScannerWithCache(opts CompactMetadataOptions, sourceCache *compactSourceCache) *configSourceScanner {
 	roots := []string{}
 	if opts.Srcarch != "" {
 		roots = append(roots,
@@ -115,6 +145,7 @@ func newConfigSourceScanner(opts CompactMetadataOptions) *configSourceScanner {
 		includeRoots: roots,
 		predefined:   sourcePredefinedSymbols(opts.Srcarch),
 		exact:        opts.Schema.isV013(),
+		sourceCache:  sourceCache,
 		files:        map[string]scannedSourceFile{},
 		fileErrors:   map[string]error{},
 		closure:      map[string]sourceClosure{},
@@ -233,6 +264,13 @@ func (s *configSourceScanner) inputForTreePath(path string) (CompactSourceInput,
 	abs, ok := s.absForTreePath(cleaned)
 	if !ok {
 		return CompactSourceInput{}, fmt.Errorf("source-tree input %q does not exist", cleaned)
+	}
+	if s.exact {
+		digest, err := s.loadExactSourceDigest(abs)
+		if err != nil {
+			return CompactSourceInput{}, fmt.Errorf("%s: %w", cleaned, err)
+		}
+		return CompactSourceInput{Path: cleaned, Digest: digest}, nil
 	}
 	data, err := os.ReadFile(abs)
 	if err != nil {
@@ -593,6 +631,7 @@ func (s *configSourceScanner) scanFile(
 		cacheKey += "\x00" + s.configID(config)
 	}
 	if s.exact {
+		cacheKey += "\x00tree-path=" + treePath
 		cacheKey += "\x00assembly=" + strconv.FormatBool(assembly)
 		cacheKey += "\x00profile=" + string(profile)
 		cacheKey += "\x00include-search=" + search.cacheKey()
@@ -600,17 +639,30 @@ func (s *configSourceScanner) scanFile(
 	if cached, ok := s.files[cacheKey]; ok {
 		return cached, s.fileErrors[cacheKey]
 	}
-	data, err := os.ReadFile(abs)
-	if err != nil {
-		s.fileErrors[cacheKey] = err
-		return scannedSourceFile{}, err
-	}
-	text := string(data)
-	lines := rawSourceLines(text)
+	var (
+		digest string
+		lines  []sourceLogicalLine
+		text   string
+	)
 	if s.exact {
-		lines, text = preprocessExactSource(text)
+		file, err := s.loadExactSourceFile(abs)
+		if err != nil {
+			s.fileErrors[cacheKey] = err
+			return scannedSourceFile{}, err
+		}
+		digest = file.digest
+		lines = file.lines
+	} else {
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			s.fileErrors[cacheKey] = err
+			return scannedSourceFile{}, err
+		}
+		text = string(data)
+		lines = rawSourceLines(text)
+		digest = fileContentDigest(data)
 	}
-	scanned := scannedSourceFile{digest: fileContentDigest(data)}
+	scanned := scannedSourceFile{digest: digest}
 	refset := map[string]bool{}
 	if !s.exact {
 		for _, ref := range configRefs(text) {
@@ -746,6 +798,46 @@ func (s *configSourceScanner) scanFile(
 	scanned.refs = sortedStringSet(refset)
 	s.files[cacheKey] = scanned
 	return scanned, nil
+}
+
+func (s *configSourceScanner) loadExactSourceFile(abs string) (exactSourceFile, error) {
+	if cached, ok := s.sourceCache.exactFiles[abs]; ok && cached.preprocessed {
+		return cached, s.sourceCache.exactErrors[abs]
+	}
+	if err, ok := s.sourceCache.exactErrors[abs]; ok {
+		return exactSourceFile{}, err
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		s.sourceCache.exactErrors[abs] = err
+		return exactSourceFile{}, err
+	}
+	lines, _ := preprocessExactSource(string(data))
+	file := exactSourceFile{
+		lines:        lines,
+		digest:       fileContentDigest(data),
+		preprocessed: true,
+	}
+	s.sourceCache.exactFiles[abs] = file
+	return file, nil
+}
+
+func (s *configSourceScanner) loadExactSourceDigest(abs string) (string, error) {
+	if cached, ok := s.sourceCache.exactFiles[abs]; ok && cached.digest != "" {
+		return cached.digest, s.sourceCache.exactErrors[abs]
+	}
+	if err, ok := s.sourceCache.exactErrors[abs]; ok {
+		return "", err
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		s.sourceCache.exactErrors[abs] = err
+		return "", err
+	}
+	file := s.sourceCache.exactFiles[abs]
+	file.digest = fileContentDigest(data)
+	s.sourceCache.exactFiles[abs] = file
+	return file.digest, nil
 }
 
 func (s *configSourceScanner) configID(config *ResolvedConfig) string {
@@ -1430,16 +1522,23 @@ func (s *configSourceScanner) absForTreePath(path string) (string, bool) {
 	if !ok {
 		return "", false
 	}
+	if cached, ok := s.sourceCache.treePaths[path]; ok {
+		return cached.abs, cached.exists
+	}
+	resolved := sourceTreePathResolution{}
 	if s.sourceRoot != "" {
 		abs := filepath.Join(s.sourceRoot, filepath.FromSlash(path))
 		if fileExists(abs) {
-			return abs, true
+			resolved = sourceTreePathResolution{abs: abs, exists: true}
+			s.sourceCache.treePaths[path] = resolved
+			return resolved.abs, resolved.exists
 		}
 	}
 	if mapped, ok := mappedSourceRootPath(path, s.sourceRoots); ok && fileExists(mapped) {
-		return mapped, true
+		resolved = sourceTreePathResolution{abs: mapped, exists: true}
 	}
-	return "", false
+	s.sourceCache.treePaths[path] = resolved
+	return resolved.abs, resolved.exists
 }
 
 func cleanSourceTreePath(path string) (string, bool) {

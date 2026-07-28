@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -256,6 +257,125 @@ func TestConfigSourceScannerV013ConfigGatesNonliteralInclude(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("closureForSourceConfig(on) error = %q, want substring %q", err, want)
 		}
+	}
+}
+
+func TestConfigSourceScannerV013CachesPreprocessingAcrossConfigs(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "drivers/config-gated.c", `#ifdef CONFIG_CUSTOM
+#include "enabled.h"
+#else
+#include "disabled.h"
+#endif
+`)
+	mustWriteSource(t, root, "drivers/enabled.h", "#define ENABLED 1\n")
+	mustWriteSource(t, root, "drivers/disabled.h", "#define DISABLED 1\n")
+
+	opts := CompactMetadataOptions{
+		Schema:     CompactSchemaV013,
+		SourceRoot: root,
+	}
+	sourceCache := newCompactSourceCache()
+	contextScans := 0
+	scans := 0
+	for _, test := range []struct {
+		name   string
+		state  string
+		header string
+	}{
+		{name: "off", state: "n", header: "drivers/disabled.h"},
+		{name: "on", state: "y", header: "drivers/enabled.h"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scanner := newConfigSourceScannerWithCache(opts, sourceCache)
+			config := &ResolvedConfig{
+				Effective: map[string]string{"CONFIG_CUSTOM": test.state},
+				Written:   map[string]bool{"CONFIG_CUSTOM": true},
+			}
+			closure, err := scanner.closureForSourceConfig("drivers/config-gated.c", nil, config)
+			if err != nil {
+				t.Fatalf("closureForSourceConfig() failed: %v", err)
+			}
+			var paths []string
+			for _, input := range closure.sourceInputs {
+				paths = append(paths, input.Path)
+			}
+			want := []string{"drivers/config-gated.c", test.header}
+			sort.Strings(want)
+			if !reflect.DeepEqual(paths, want) {
+				t.Fatalf("source inputs = %v, want %v", paths, want)
+			}
+			contextScans += len(scanner.files)
+			scans++
+			if scans == 1 {
+				mustWriteSource(t, root, "drivers/config-gated.c", "#include \"replacement.h\"\n")
+				mustWriteSource(t, root, "drivers/replacement.h", "#define REPLACEMENT 1\n")
+			}
+		})
+	}
+
+	if got, want := contextScans, 4; got != want {
+		t.Fatalf("context-specific scan cache entries = %d, want %d", got, want)
+	}
+	if got, want := len(sourceCache.exactFiles), 3; got != want {
+		t.Fatalf("preprocessed file cache size = %d, want %d", got, want)
+	}
+}
+
+func TestConfigSourceScannerCachesMissingTreePaths(t *testing.T) {
+	scanner := newConfigSourceScanner(CompactMetadataOptions{
+		Schema:     CompactSchemaV013,
+		SourceRoot: t.TempDir(),
+	})
+	for range 2 {
+		if path, ok := scanner.absForTreePath("include/missing.h"); ok || path != "" {
+			t.Fatalf("absForTreePath(missing) = (%q, %v), want (\"\", false)", path, ok)
+		}
+	}
+	if got, want := len(scanner.sourceCache.treePaths), 1; got != want {
+		t.Fatalf("tree path cache size = %d, want %d", got, want)
+	}
+}
+
+func TestConfigSourceScannerV013SeparatesVirtualTreePaths(t *testing.T) {
+	root := t.TempDir()
+	mapped := t.TempDir()
+	mustWriteSource(t, mapped, "alias.h", `#if __has_include("relative.h")
+#include "relative.h"
+#endif
+`)
+	mustWriteSource(t, root, "one/relative.h", "#define RELATIVE 1\n")
+
+	scanner := newConfigSourceScanner(CompactMetadataOptions{
+		Schema:     CompactSchemaV013,
+		SourceRoot: root,
+		SourceRoots: map[string]string{
+			"one": mapped,
+			"two": mapped,
+		},
+	})
+	for _, test := range []struct {
+		source string
+		want   []string
+	}{
+		{source: "one/alias.h", want: []string{"one/alias.h", "one/relative.h"}},
+		{source: "two/alias.h", want: []string{"two/alias.h"}},
+	} {
+		closure, err := scanner.exactClosureForSource(test.source, nil)
+		if err != nil {
+			t.Fatalf("exactClosureForSource(%q) failed: %v", test.source, err)
+		}
+		var paths []string
+		for _, input := range closure.sourceInputs {
+			paths = append(paths, input.Path)
+		}
+		if !reflect.DeepEqual(paths, test.want) {
+			t.Fatalf("exactClosureForSource(%q) inputs = %v, want %v", test.source, paths, test.want)
+		}
+	}
+
+	if got, want := len(scanner.sourceCache.exactFiles), 2; got != want {
+		t.Fatalf("shared physical file cache size = %d, want %d", got, want)
 	}
 }
 

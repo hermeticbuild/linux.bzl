@@ -1,11 +1,42 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
+
+func TestStartRuntimeProfilesWritesMemoryProfiles(t *testing.T) {
+	dir := t.TempDir()
+	heapPath := filepath.Join(dir, "heap.pprof")
+	allocsPath := filepath.Join(dir, "allocs.pprof")
+	stop, err := startRuntimeProfiles("", heapPath, allocsPath)
+	if err != nil {
+		t.Fatalf("startRuntimeProfiles() failed: %v", err)
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("stop profiles failed: %v", err)
+	}
+	for _, path := range []string{heapPath, allocsPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat(%q) failed: %v", path, err)
+		}
+		if info.Size() == 0 {
+			t.Fatalf("profile %q is empty", path)
+		}
+	}
+}
+
+func TestStartRuntimeProfilesRejectsInvalidCPUPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "cpu.pprof")
+	if _, err := startRuntimeProfiles(path, "", ""); err == nil {
+		t.Fatalf("startRuntimeProfiles(%q) succeeded, want an error", path)
+	}
+}
 
 func TestKbuildVariablesForConfigUsesWrittenConfigView(t *testing.T) {
 	vars := kbuildVariablesForConfig(

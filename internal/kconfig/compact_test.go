@@ -2,6 +2,8 @@ package kconfig
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1158,6 +1160,100 @@ func TestCompactV013ObjectBuildUsesOneExactCompileEnvironmentIndex(t *testing.T)
 	}
 }
 
+func TestCompactMetadataBatchMatchesMergedConfigGraphs(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	parseKbuild := func(name, content string) *KbuildFile {
+		t.Helper()
+		kb, err := ParseKbuild(strings.NewReader(content), name)
+		if err != nil {
+			t.Fatalf("ParseKbuild(%s) failed: %v", name, err)
+		}
+		return kb
+	}
+	baseKbuild := parseKbuild("base/Kbuild", "obj-y += init.o\n")
+	debugKbuild := parseKbuild("debug/Kbuild", "obj-y += init.o debug.o\n")
+	sourceRoot := t.TempDir()
+	writeCompactSource(t, sourceRoot, "init.c")
+	writeCompactSource(t, sourceRoot, "debug.c")
+	writeCompactV013ForcedInputs(t, sourceRoot)
+
+	configs := []NamedConfig{
+		{Name: "debug", Flags: map[string]string{"CONFIG_DEBUG": "y"}},
+		{Name: "base"},
+	}
+	opts := CompactMetadataOptions{
+		Schema:                CompactSchemaV013,
+		SourceRoot:            sourceRoot,
+		CompileEnvironmentABI: "object-abi-v1",
+	}
+	labels := map[string]string{
+		"base":  "//headers:base",
+		"debug": "//headers:debug",
+	}
+	kbuilds := map[string]*KbuildFile{
+		"base":  baseKbuild,
+		"debug": debugKbuild,
+	}
+
+	var singles []*CompactMetadata
+	for _, config := range configs {
+		configOpts := opts
+		configOpts.GeneratedHeadersLabel = labels[config.Name]
+		part, err := tree.CompactMetadataWithOptions(kbuilds[config.Name], []NamedConfig{config}, configOpts)
+		if err != nil {
+			t.Fatalf("CompactMetadataWithOptions(%s) failed: %v", config.Name, err)
+		}
+		singles = append(singles, part)
+	}
+	merged, err := MergeCompactMetadata(singles...)
+	if err != nil {
+		t.Fatalf("MergeCompactMetadata() failed: %v", err)
+	}
+
+	var calls []string
+	batch, err := tree.CompactMetadataBatchWithOptions(configs, opts, func(config *ResolvedConfig) (*KbuildFile, string, error) {
+		calls = append(calls, config.Name)
+		return kbuilds[config.Name], labels[config.Name], nil
+	})
+	if err != nil {
+		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
+	}
+	if want := []string{"debug", "base"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("Kbuild callback calls = %v, want %v", calls, want)
+	}
+	gotJSON, err := batch.JSON()
+	if err != nil {
+		t.Fatalf("batch.JSON() failed: %v", err)
+	}
+	wantJSON, err := merged.JSON()
+	if err != nil {
+		t.Fatalf("merged.JSON() failed: %v", err)
+	}
+	if !reflect.DeepEqual(gotJSON, wantJSON) {
+		t.Fatalf("batch metadata differs from merged single-config metadata")
+	}
+	if got, want := batch.HeaderGroups[0].Labels, []string{"//headers:base", "//headers:debug"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("batch header labels = %v, want %v", got, want)
+	}
+
+	t.Run("callback error", func(t *testing.T) {
+		_, err := tree.CompactMetadataBatchWithOptions(configs[:1], opts, func(*ResolvedConfig) (*KbuildFile, string, error) {
+			return nil, "", fmt.Errorf("sentinel")
+		})
+		if err == nil || !strings.Contains(err.Error(), `resolve Kbuild for config "debug": sentinel`) {
+			t.Fatalf("CompactMetadataBatchWithOptions() error = %v", err)
+		}
+	})
+	t.Run("nil Kbuild", func(t *testing.T) {
+		_, err := tree.CompactMetadataBatchWithOptions(configs[:1], opts, func(*ResolvedConfig) (*KbuildFile, string, error) {
+			return nil, "", nil
+		})
+		if err == nil || !strings.Contains(err.Error(), `resolve Kbuild for config "debug": nil Kbuild`) {
+			t.Fatalf("CompactMetadataBatchWithOptions() error = %v", err)
+		}
+	})
+}
+
 func TestCompactV013ContentIDsTrackOnlyTransitiveInputs(t *testing.T) {
 	tree := mustParseCompactFixture(t)
 	kb, err := ParseKbuild(strings.NewReader("obj-y += init.o\n"), "Kbuild")
@@ -1560,6 +1656,53 @@ func TestObjectVariantContentIDUsesFullChildIDs(t *testing.T) {
 	rightID := objectVariantContentID("composite.o", "y", "", nil, nil, "", "", nil, nil, []string{right}, "abi-v1")
 	if leftID == rightID {
 		t.Fatalf("full child content IDs with a shared presentation prefix produced the same parent ID %q", leftID)
+	}
+}
+
+func TestObjectVariantContentIDPreservesCanonicalFraming(t *testing.T) {
+	values := []string{
+		"object=drivers/example.o",
+		"mode=m",
+		"modname=example",
+		"compile_environment=environment-id",
+		"abi=abi-v1",
+		"source=drivers/example.c",
+		"flag=-Wall",
+		"flag=-DVALUE=1",
+		"remove_flag=-Werror",
+		"source_input=drivers/example.c\x00source-digest",
+		"source_input=include/example.h\x00header-digest",
+		"dep_content_id=dependency-id",
+		"member_content_id=member-id",
+	}
+	var canonical strings.Builder
+	canonical.WriteString(compactObjectContentDomain)
+	canonical.WriteByte(0)
+	for _, value := range values {
+		canonical.WriteString(value)
+		canonical.WriteByte(0)
+	}
+	sum := sha256.Sum256([]byte(canonical.String()))
+	want := hex.EncodeToString(sum[:])
+
+	got := objectVariantContentID(
+		"drivers/example.o",
+		"m",
+		"example",
+		[]string{"-Wall", "-DVALUE=1"},
+		[]string{"-Werror"},
+		"environment-id",
+		"drivers/example.c",
+		[]CompactSourceInput{
+			{Path: "drivers/example.c", Digest: "source-digest"},
+			{Path: "include/example.h", Digest: "header-digest"},
+		},
+		[]string{"dependency-id"},
+		[]string{"member-id"},
+		"abi-v1",
+	)
+	if got != want {
+		t.Fatalf("objectVariantContentID() = %q, want canonical hash %q", got, want)
 	}
 }
 

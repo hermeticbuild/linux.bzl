@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"reflect"
 	"sort"
 	"strconv"
@@ -18,15 +19,35 @@ const (
 	compactShortIDLength            = 24
 )
 
-func compactContentID(domain string, values ...string) string {
-	hash := sha256.New()
-	hash.Write([]byte(domain))
-	hash.Write([]byte{0})
-	for _, value := range values {
-		hash.Write([]byte(value))
-		hash.Write([]byte{0})
+var compactContentSeparator = []byte{0}
+
+type compactContentHasher struct {
+	hash hash.Hash
+}
+
+func newCompactContentHasher(domain string) *compactContentHasher {
+	hasher := &compactContentHasher{hash: sha256.New()}
+	hasher.writeValue(domain)
+	return hasher
+}
+
+func (h *compactContentHasher) writeValue(parts ...string) {
+	for _, part := range parts {
+		_, _ = h.hash.Write([]byte(part))
 	}
-	return hex.EncodeToString(hash.Sum(nil))
+	_, _ = h.hash.Write(compactContentSeparator)
+}
+
+func (h *compactContentHasher) id() string {
+	return hex.EncodeToString(h.hash.Sum(nil))
+}
+
+func compactContentID(domain string, values ...string) string {
+	hasher := newCompactContentHasher(domain)
+	for _, value := range values {
+		hasher.writeValue(value)
+	}
+	return hasher.id()
 }
 
 func compactShortID(id string) string {
@@ -114,30 +135,29 @@ func objectVariantContentID(
 	memberContentIDs []string,
 	abi string,
 ) string {
-	values := []string{
-		"object=" + object,
-		"mode=" + mode,
-		"modname=" + modname,
-		"compile_environment=" + compileEnvironmentID,
-		"abi=" + abi,
-		"source=" + source,
-	}
+	hasher := newCompactContentHasher(compactObjectContentDomain)
+	hasher.writeValue("object=", object)
+	hasher.writeValue("mode=", mode)
+	hasher.writeValue("modname=", modname)
+	hasher.writeValue("compile_environment=", compileEnvironmentID)
+	hasher.writeValue("abi=", abi)
+	hasher.writeValue("source=", source)
 	for _, flag := range flags {
-		values = append(values, "flag="+flag)
+		hasher.writeValue("flag=", flag)
 	}
 	for _, flag := range removeFlags {
-		values = append(values, "remove_flag="+flag)
+		hasher.writeValue("remove_flag=", flag)
 	}
 	for _, input := range sourceInputs {
-		values = append(values, "source_input="+input.Path+"\x00"+input.Digest)
+		hasher.writeValue("source_input=", input.Path, "\x00", input.Digest)
 	}
 	for _, contentID := range depContentIDs {
-		values = append(values, "dep_content_id="+contentID)
+		hasher.writeValue("dep_content_id=", contentID)
 	}
 	for _, contentID := range memberContentIDs {
-		values = append(values, "member_content_id="+contentID)
+		hasher.writeValue("member_content_id=", contentID)
 	}
-	return compactContentID(compactObjectContentDomain, values...)
+	return hasher.id()
 }
 
 func compactCompileEnvironmentValue(environment CompactCompileEnvironment) string {

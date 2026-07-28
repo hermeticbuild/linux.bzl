@@ -707,6 +707,68 @@ endif
 	}
 }
 
+func TestParseKbuildInitialVariablesUseMutableOverlay(t *testing.T) {
+	initial := map[string]string{
+		"objects":                    "initial.o",
+		"UBSAN_SANITIZE_inherited.o": "n",
+	}
+	kb, err := parseKbuild(strings.NewReader(`ifeq ("$(flavor objects)","simple")
+obj-y += initial-is-simple.o
+endif
+obj-y += $(objects)
+objects += appended.o
+obj-y += $(objects)
+objects ?= ignored.o
+undefine objects
+ifeq ("$(origin objects)","undefined")
+obj-y += initial-was-undefined.o
+endif
+objects ?= reset.o
+obj-y += $(objects)
+`), "Kbuild", initial, "")
+	if err != nil {
+		t.Fatalf("parseKbuild() failed: %v", err)
+	}
+
+	gotObjects := kbuildObjectSummaries(kb.Objects)
+	wantObjects := []kbuildObjectSummary{
+		{object: "initial-is-simple.o", kind: "const", state: "y", line: 2},
+		{object: "initial.o", kind: "const", state: "y", line: 4},
+		{object: "initial.o", kind: "const", state: "y", line: 6},
+		{object: "appended.o", kind: "const", state: "y", line: 6},
+		{object: "initial-was-undefined.o", kind: "const", state: "y", line: 10},
+		{object: "reset.o", kind: "const", state: "y", line: 13},
+	}
+	if !reflect.DeepEqual(gotObjects, wantObjects) {
+		t.Fatalf("objects mismatch\nwant: %#v\n got: %#v", wantObjects, gotObjects)
+	}
+
+	wantSettings := []kbuildObjectSetting{{
+		Name:   "UBSAN_SANITIZE",
+		Object: "inherited.o",
+		Value:  "n",
+	}}
+	if !reflect.DeepEqual(kb.objectSettings, wantSettings) {
+		t.Fatalf("object settings mismatch\nwant: %#v\n got: %#v", wantSettings, kb.objectSettings)
+	}
+	wantInitial := map[string]string{
+		"objects":                    "initial.o",
+		"UBSAN_SANITIZE_inherited.o": "n",
+	}
+	if !reflect.DeepEqual(initial, wantInitial) {
+		t.Fatalf("initial variables mutated\nwant: %#v\n got: %#v", wantInitial, initial)
+	}
+
+	second, err := parseKbuild(strings.NewReader("obj-y += $(objects)\n"), "second/Kbuild", initial, "")
+	if err != nil {
+		t.Fatalf("parseKbuild(second) failed: %v", err)
+	}
+	wantSecond := []kbuildObjectSummary{{object: "initial.o", kind: "const", state: "y", line: 1}}
+	if got := kbuildObjectSummaries(second.Objects); !reflect.DeepEqual(got, wantSecond) {
+		t.Fatalf("second parse objects mismatch\nwant: %#v\n got: %#v", wantSecond, got)
+	}
+}
+
 func TestParseKbuildExpandsMakeVariableIntrospection(t *testing.T) {
 	kb, err := ParseKbuild(strings.NewReader(`recursive = raw$(suffix)
 simple := simple.o
