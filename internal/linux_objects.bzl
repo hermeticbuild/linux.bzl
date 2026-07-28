@@ -3021,6 +3021,12 @@ def _configure_linux_probe_env(allow_shell, env):
 def _linux_compiler_version_string():
     return "clang version 22.1.8None, LLD 22.1.8"
 
+def _rustc_tool_inputs(toolchain):
+    transitive = []
+    if toolchain.rustc_lib != None:
+        transitive.append(toolchain.rustc_lib)
+    return depset([toolchain.rustc], transitive = transitive)
+
 def _materialize_rust_toolchain_probe(ctx):
     target = ctx.toolchains[_RUST_TOOLCHAIN_TYPE]
     host_target = ctx.attr._host_rust_toolchain
@@ -3039,8 +3045,8 @@ def _materialize_rust_toolchain_probe(ctx):
         ctx.actions,
         executable = ctx.executable._rusttoolchainprobe,
         inputs = depset(transitive = [
-            target.all_files,
-            host_target[DefaultInfo].files,
+            _rustc_tool_inputs(target),
+            _rustc_tool_inputs(host),
         ]),
         outputs = [out],
         arguments = [args],

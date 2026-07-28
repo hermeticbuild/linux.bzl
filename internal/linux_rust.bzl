@@ -317,6 +317,14 @@ def _rust_env(rust_toolchain):
     env["RUSTC_BOOTSTRAP"] = "1"
     return env
 
+def _rustc_tool_inputs(compiler, include_std = False):
+    transitive = []
+    if compiler.rustc_lib != None:
+        transitive.append(compiler.rustc_lib)
+    if include_std and compiler.rust_std != None:
+        transitive.append(compiler.rust_std)
+    return depset([compiler.rustc], transitive = transitive)
+
 def _rustc_sources(ctx):
     source_toolchain = ctx.attr._rust_source_toolchain[platform_common.ToolchainInfo]
     if not hasattr(source_toolchain, "rustc_srcs"):
@@ -344,6 +352,7 @@ def _run_rustc(
         mapped_directories = {},
         objtree_anchor = None,
         transitive_tool_inputs = [],
+        include_rust_std = False,
         version_predicates = []):
     runner_args = ctx.actions.args()
     runner_args.add("-cwd", ".")
@@ -376,7 +385,9 @@ def _run_rustc(
         executable = ctx.executable._runincwd,
         inputs = depset(
             inputs + [rustc_probe],
-            transitive = [compiler.all_files] + transitive_tool_inputs,
+            transitive = [
+                _rustc_tool_inputs(compiler, include_std = include_rust_std),
+            ] + transitive_tool_inputs,
         ),
         outputs = outputs,
         arguments = [runner_args],
@@ -479,6 +490,7 @@ def _target_spec(
             ),
         },
         transitive_tool_inputs = [host_cc.all_files, host_link.runtime_files],
+        include_rust_std = True,
         version_predicates = common_flags.predicates,
     )
 
@@ -961,6 +973,7 @@ def _proc_macro(
             ),
         },
         transitive_tool_inputs = [host_cc.all_files, host_link.runtime_files],
+        include_rust_std = True,
         version_predicates = version_predicates,
     )
     return output
@@ -1425,10 +1438,8 @@ def _linux_rust_kernel_sdk_impl(ctx):
     ] + generated_arch_sources
     metadata.extend([crates[name].metadata for name in crate_order])
     metadata.extend([proc_macros[name] for name in sorted(proc_macros.keys())])
-    compile_inputs = depset(
-        metadata,
-        transitive = [rust_toolchain.all_files],
-    )
+    compile_inputs = depset(metadata)
+    rustc_files = _rustc_tool_inputs(rust_toolchain)
     module_flags = target_flags.flags + _expand_profile_values(
         _required_profile_field(module, "flags", "list"),
         config,
@@ -1452,7 +1463,7 @@ def _linux_rust_kernel_sdk_impl(ctx):
         rust_dir_anchor = rust_dir_anchor,
         rustc = rust_toolchain.rustc,
         rustc_env = _rust_env(rust_toolchain),
-        rustc_files = rust_toolchain.all_files,
+        rustc_files = rustc_files,
         rustc_probe = rustc_probe,
         minimum_rustc_version = ctx.attr.minimum_rustc_version,
         runtime_objects = runtime_objects,
