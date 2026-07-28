@@ -505,10 +505,20 @@ def _enabled_sdk_test_impl(ctx):
     ]
     asserts.equals(env, 1, len(core_actions))
     if core_actions:
+        asserts.equals(
+            env,
+            [sdk.rustc],
+            [
+                file
+                for file in core_actions[0].inputs.to_list()
+                if file.basename == sdk.rustc.basename
+            ],
+            "kernel crates must use only the target-platform rustc",
+        )
         asserts.true(
             env,
-            _action_has_argument_containing(core_actions[0], sdk.rustc.path),
-            "kernel crates must invoke the target-platform rustc",
+            _action_has_argument_ending_with(core_actions[0], "/" + sdk.rustc.basename),
+            "kernel crates must invoke rustc",
         )
         asserts.true(env, "-Zdwarf-version=5" in core_actions[0].argv)
         asserts.true(env, "-Cdebuginfo=2" in core_actions[0].argv)
