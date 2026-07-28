@@ -1,14 +1,281 @@
 package main
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"testing"
 )
 
-func TestValidateMetadataV013(t *testing.T) {
-	meta := validV013Metadata()
-	stats, err := validateMetadata(meta, true)
+func TestDecodeMetadataAcceptsCurrentShape(t *testing.T) {
+	data, err := json.Marshal(validContentGraphMetadata())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeMetadata(data); err != nil {
+		t.Fatalf("decodeMetadata() rejected current metadata shape: %v", err)
+	}
+}
+
+func TestDecodeMetadataRejectsUnknownFieldsAtEveryLevel(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{
+			name: "top-level schema",
+			data: `{"schema":"v0.0.13"}`,
+			want: `"schema"`,
+		},
+		{
+			name: "top-level object packages",
+			data: `{"object_packages":[]}`,
+			want: `"object_packages"`,
+		},
+		{
+			name: "config package",
+			data: `{"configs":[{"package":"//graph"}]}`,
+			want: `"package"`,
+		},
+		{
+			name: "config image target",
+			data: `{"configs":[{"image_target":"base_image"}]}`,
+			want: `"image_target"`,
+		},
+		{
+			name: "config payload fragment",
+			data: `{"config_payloads":[{"fragment":{}}]}`,
+			want: `"fragment"`,
+		},
+		{
+			name: "compile environment schema",
+			data: `{"compile_environments":[{"schema":""}]}`,
+			want: `"schema"`,
+		},
+		{
+			name: "generated header inline inputs",
+			data: `{"generated_header_families":[{"source_inputs":[]}]}`,
+			want: `"source_inputs"`,
+		},
+		{
+			name: "source file package",
+			data: `{"source_files":[{"package":""}]}`,
+			want: `"package"`,
+		},
+		{
+			name: "object source includes",
+			data: `{"object_variants":[{"source_includes":[]}]}`,
+			want: `"source_includes"`,
+		},
+		{
+			name: "object empty inline inputs",
+			data: `{"object_variants":[{"source_inputs":[]}]}`,
+			want: `"source_inputs"`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := decodeMetadata([]byte(test.data))
+			if err == nil || !strings.Contains(err.Error(), "unknown field "+test.want) {
+				t.Fatalf("decodeMetadata() error = %v, want unknown field %s", err, test.want)
+			}
+		})
+	}
+}
+
+func sparseMetadataDocument() map[string]any {
+	return map[string]any{
+		"configs": []any{
+			map[string]any{
+				"name":           "base",
+				"object_targets": []any{},
+			},
+		},
+		"config_payloads": []any{
+			map[string]any{
+				"id":      strings.Repeat("1", 64),
+				"content": "",
+			},
+		},
+		"compile_environments": []any{
+			map[string]any{
+				"id":             strings.Repeat("2", 64),
+				"abi":            "llvm-test/x86",
+				"config_payload": strings.Repeat("1", 64),
+			},
+		},
+		"generated_header_families": []any{
+			map[string]any{
+				"id":             strings.Repeat("3", 64),
+				"name":           "static",
+				"config_payload": strings.Repeat("1", 64),
+				"srcarch":        "x86",
+			},
+		},
+		"source_files": []any{
+			map[string]any{
+				"path":   "init/main.c",
+				"digest": strings.Repeat("4", 64),
+			},
+		},
+		"source_input_groups": []any{"1"},
+		"object_variants": []any{
+			map[string]any{
+				"target": "init",
+				"object": "init/main.o",
+				"mode":   "y",
+			},
+		},
+	}
+}
+
+func firstMetadataObject(document map[string]any, collection string) map[string]any {
+	return document[collection].([]any)[0].(map[string]any)
+}
+
+func decodeMetadataDocument(document map[string]any) error {
+	data, err := json.Marshal(document)
+	if err != nil {
+		return err
+	}
+	_, err = decodeMetadata(data)
+	return err
+}
+
+func TestDecodeMetadataAcceptsSparseOptionalFields(t *testing.T) {
+	if err := decodeMetadataDocument(sparseMetadataDocument()); err != nil {
+		t.Fatalf("decodeMetadata() rejected omitted optional fields: %v", err)
+	}
+}
+
+func TestDecodeMetadataRejectsMissingNullAndWrongTypes(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+		want   string
+	}{
+		{
+			name: "missing top-level configs",
+			mutate: func(document map[string]any) {
+				delete(document, "configs")
+			},
+			want: `missing required field "configs"`,
+		},
+		{
+			name: "null top-level configs",
+			mutate: func(document map[string]any) {
+				document["configs"] = nil
+			},
+			want: "configs",
+		},
+		{
+			name: "wrong top-level configs type",
+			mutate: func(document map[string]any) {
+				document["configs"] = map[string]any{}
+			},
+			want: "configs",
+		},
+		{
+			name: "missing object targets",
+			mutate: func(document map[string]any) {
+				delete(firstMetadataObject(document, "configs"), "object_targets")
+			},
+			want: `missing required field "object_targets"`,
+		},
+		{
+			name: "null object targets",
+			mutate: func(document map[string]any) {
+				firstMetadataObject(document, "configs")["object_targets"] = nil
+			},
+			want: "object_targets",
+		},
+		{
+			name: "wrong object targets type",
+			mutate: func(document map[string]any) {
+				firstMetadataObject(document, "configs")["object_targets"] = ""
+			},
+			want: "object_targets",
+		},
+		{
+			name: "wrong object target item type",
+			mutate: func(document map[string]any) {
+				firstMetadataObject(document, "configs")["object_targets"] = []any{1}
+			},
+			want: "object_targets",
+		},
+		{
+			name: "null optional config payload",
+			mutate: func(document map[string]any) {
+				firstMetadataObject(document, "configs")["config_payload"] = nil
+			},
+			want: "config_payload",
+		},
+		{
+			name: "null optional module targets",
+			mutate: func(document map[string]any) {
+				firstMetadataObject(document, "configs")["module_object_targets"] = nil
+			},
+			want: "module_object_targets",
+		},
+		{
+			name: "null optional environment families",
+			mutate: func(document map[string]any) {
+				firstMetadataObject(document, "compile_environments")["generated_header_families"] = nil
+			},
+			want: "generated_header_families",
+		},
+		{
+			name: "null optional family labels",
+			mutate: func(document map[string]any) {
+				firstMetadataObject(document, "generated_header_families")["labels"] = nil
+			},
+			want: "labels",
+		},
+		{
+			name: "null optional family source input group",
+			mutate: func(document map[string]any) {
+				firstMetadataObject(document, "generated_header_families")["source_input_group"] = nil
+			},
+			want: "source_input_group",
+		},
+		{
+			name: "null optional object source",
+			mutate: func(document map[string]any) {
+				firstMetadataObject(document, "object_variants")["source"] = nil
+			},
+			want: "source",
+		},
+		{
+			name: "null optional object flags",
+			mutate: func(document map[string]any) {
+				firstMetadataObject(document, "object_variants")["flags"] = nil
+			},
+			want: "flags",
+		},
+		{
+			name: "wrong optional object group type",
+			mutate: func(document map[string]any) {
+				firstMetadataObject(document, "object_variants")["source_input_group"] = "1"
+			},
+			want: "source_input_group",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			document := sparseMetadataDocument()
+			test.mutate(document)
+			err := decodeMetadataDocument(document)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("decodeMetadata() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateMetadataContentGraph(t *testing.T) {
+	meta := validContentGraphMetadata()
+	stats, err := validateMetadata(meta)
 	if err != nil {
 		t.Fatalf("validateMetadata() error: %v", err)
 	}
@@ -17,7 +284,7 @@ func TestValidateMetadataV013(t *testing.T) {
 	}
 }
 
-func validV013Metadata() *metadata {
+func validContentGraphMetadata() *metadata {
 	payloadContent := "CONFIG_TEST=y\n"
 	payloadID := canonicalContentID(configPayloadDomain, payloadContent)
 	headerDigest := strings.Repeat("6", 64)
@@ -47,7 +314,6 @@ func validV013Metadata() *metadata {
 	)
 	target := "init__" + objectID[:24]
 	return &metadata{
-		Schema: "v0.0.13",
 		Configs: []config{{
 			Name:          "base",
 			ConfigPayload: payloadID,
@@ -88,7 +354,7 @@ func validV013Metadata() *metadata {
 	}
 }
 
-func TestValidateMetadataV013RejectsStaleContentIDs(t *testing.T) {
+func TestValidateMetadataContentGraphRejectsStaleContentIDs(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*metadata)
@@ -132,9 +398,9 @@ func TestValidateMetadataV013RejectsStaleContentIDs(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			meta := validV013Metadata()
+			meta := validContentGraphMetadata()
 			test.mutate(meta)
-			_, err := validateMetadata(meta, true)
+			_, err := validateMetadata(meta)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("validateMetadata() error = %v, want %q", err, test.want)
 			}
@@ -142,8 +408,8 @@ func TestValidateMetadataV013RejectsStaleContentIDs(t *testing.T) {
 	}
 }
 
-func TestValidateMetadataV013RejectsAllMixedWithPreciseFamilies(t *testing.T) {
-	meta := validV013Metadata()
+func TestValidateMetadataContentGraphRejectsAllMixedWithPreciseFamilies(t *testing.T) {
+	meta := validContentGraphMetadata()
 	payloadID := meta.ConfigPayloads[0].ID
 	allID := canonicalContentID(
 		generatedHeaderFamilyDomain,
@@ -164,14 +430,14 @@ func TestValidateMetadataV013RejectsAllMixedWithPreciseFamilies(t *testing.T) {
 	)
 	sort.Strings(meta.CompileEnvironments[0].GeneratedHeaderFamilies)
 
-	_, err := validateMetadata(meta, true)
+	_, err := validateMetadata(meta)
 	if err == nil || !strings.Contains(err.Error(), "mixes all with precise") {
 		t.Fatalf("validateMetadata() error = %v, want all/precise rejection", err)
 	}
 }
 
-func TestValidateMetadataV013RejectsUnknownFamilyDependency(t *testing.T) {
-	meta := validV013Metadata()
+func TestValidateMetadataContentGraphRejectsUnknownFamilyDependency(t *testing.T) {
+	meta := validContentGraphMetadata()
 	payloadID := meta.ConfigPayloads[0].ID
 	unknownID := strings.Repeat("a", 64)
 	familyID := canonicalContentID(
@@ -190,14 +456,14 @@ func TestValidateMetadataV013RejectsUnknownFamilyDependency(t *testing.T) {
 		Dependencies:  []string{unknownID},
 	})
 
-	_, err := validateMetadata(meta, true)
+	_, err := validateMetadata(meta)
 	if err == nil || !strings.Contains(err.Error(), "unknown dependency") {
 		t.Fatalf("validateMetadata() error = %v, want unknown dependency rejection", err)
 	}
 }
 
-func TestValidateMetadataV013RejectsNonCanonicalDependencyOrder(t *testing.T) {
-	meta := validV013Metadata()
+func TestValidateMetadataContentGraphRejectsNonCanonicalDependencyOrder(t *testing.T) {
+	meta := validContentGraphMetadata()
 	root := meta.ObjectVariants[0]
 	abi := meta.CompileEnvironments[0].ABI
 	source := meta.SourceFiles[1]
@@ -244,13 +510,13 @@ func TestValidateMetadataV013RejectsNonCanonicalDependencyOrder(t *testing.T) {
 	root.Target = "init__" + root.ContentID[:24]
 	meta.ObjectVariants[0] = root
 	meta.Configs[0].ObjectTargets[0] = root.Target
-	if _, err := validateMetadata(meta, true); err != nil {
+	if _, err := validateMetadata(meta); err != nil {
 		t.Fatalf("validateMetadata() rejected canonical dependencies: %v", err)
 	}
 
 	meta.ObjectVariants[0].Deps[0], meta.ObjectVariants[0].Deps[1] =
 		meta.ObjectVariants[0].Deps[1], meta.ObjectVariants[0].Deps[0]
-	_, err := validateMetadata(meta, true)
+	_, err := validateMetadata(meta)
 	if err == nil || !strings.Contains(err.Error(), "non-canonical dependencies") {
 		t.Fatalf("validateMetadata() error = %v, want non-canonical dependencies", err)
 	}
@@ -263,39 +529,17 @@ func TestValidateMetadataRejectsDuplicateContentID(t *testing.T) {
 			{Target: "left", Object: "left.o", ContentID: contentID},
 			{Target: "right", Object: "right.o", ContentID: contentID},
 		},
-	}, false)
+	})
 	if err == nil || !strings.Contains(err.Error(), "duplicate content ID") {
 		t.Fatalf("validateMetadata() error = %v, want duplicate content ID", err)
 	}
 }
 
 func TestValidateMetadataRejectsDanglingObjectTarget(t *testing.T) {
-	_, err := validateMetadata(&metadata{
-		Configs: []config{{
-			Name:          "base",
-			ObjectTargets: []string{"missing"},
-		}},
-	}, false)
+	meta := validContentGraphMetadata()
+	meta.Configs[0].ObjectTargets[0] = "missing"
+	_, err := validateMetadata(meta)
 	if err == nil || !strings.Contains(err.Error(), "unknown object target") {
 		t.Fatalf("validateMetadata() error = %v, want unknown object target", err)
-	}
-}
-
-func TestValidateMetadataLegacyStats(t *testing.T) {
-	stats, err := validateMetadata(&metadata{
-		Configs: []config{
-			{Name: "base", ObjectTargets: []string{"shared"}},
-			{Name: "overlay", ObjectTargets: []string{"shared", "added"}},
-		},
-		ObjectVariants: []objectVariant{
-			{Target: "shared", Object: "shared.o"},
-			{Target: "added", Object: "added.o"},
-		},
-	}, false)
-	if err != nil {
-		t.Fatalf("validateMetadata() error: %v", err)
-	}
-	if stats.objectMemberships != 3 || stats.objectVariants != 2 || stats.duplicateMemberships != 1 {
-		t.Fatalf("validateMetadata() stats = %+v", stats)
 	}
 }

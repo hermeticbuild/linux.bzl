@@ -59,10 +59,217 @@ def _graph_configs_args_test_impl(ctx):
             "default",
         ),
     )
-    asserts.equals(env, "v0.0.13", repositories_test_helpers.content_schema)
     return unittest.end(env)
 
 graph_configs_args_test = unittest.make(_graph_configs_args_test_impl)
+
+def _metadata_with_key(metadata, collection, key, value):
+    result = dict(metadata)
+    if collection:
+        items = list(result[collection])
+        item = dict(items[0])
+        item[key] = value
+        items[0] = item
+        result[collection] = items
+    else:
+        result[key] = value
+    return result
+
+def _metadata_without_key(metadata, collection, key):
+    result = dict(metadata)
+    if collection:
+        items = list(result[collection])
+        item = dict(items[0])
+        item.pop(key)
+        items[0] = item
+        result[collection] = items
+    else:
+        result.pop(key)
+    return result
+
+def _metadata_key_validation_test_impl(ctx):
+    env = unittest.begin(ctx)
+    metadata = {
+        "configs": [{
+            "config_payload": "",
+            "module_object_targets": [],
+            "name": "",
+            "object_targets": [],
+        }],
+        "config_payloads": [{
+            "content": "",
+            "id": "",
+        }],
+        "compile_environments": [{
+            "abi": "",
+            "config_payload": "",
+            "generated_header_families": [],
+            "id": "",
+        }],
+        "generated_header_families": [{
+            "config_payload": "",
+            "dependencies": [],
+            "id": "",
+            "labels": [],
+            "name": "",
+            "source_input_group": 0,
+            "srcarch": "",
+        }],
+        "object_variants": [{
+            "compile_environment": "",
+            "content_id": "",
+            "deps": [],
+            "flags": [],
+            "members": [],
+            "mode": "",
+            "modname": "",
+            "object": "",
+            "remove_flags": [],
+            "source": "",
+            "source_input_group": 0,
+            "target": "",
+        }],
+        "source_files": [{
+            "digest": "",
+            "path": "",
+        }],
+        "source_input_groups": [],
+    }
+    asserts.equals(
+        env,
+        "",
+        repositories_test_helpers.content_graph_metadata_structure_error(metadata),
+    )
+    cases = [
+        ("", "schema", "v0.0.13"),
+        ("", "object_packages", []),
+        ("configs", "package", ""),
+        ("configs", "image_target", "base_image"),
+        ("config_payloads", "fragment", {}),
+        ("compile_environments", "schema", ""),
+        ("generated_header_families", "source_inputs", []),
+        ("source_files", "package", ""),
+        ("object_variants", "source_includes", []),
+        ("object_variants", "source_includes_complete", False),
+        ("object_variants", "source_inputs", []),
+    ]
+    for collection, key, value in cases:
+        error = repositories_test_helpers.content_graph_metadata_structure_error(
+            _metadata_with_key(metadata, collection, key, value),
+        )
+        asserts.true(
+            env,
+            key in error,
+            "metadata with retired field %r should be rejected, got %r" % (key, error),
+        )
+    sparse = {
+        "configs": [{
+            "name": "base",
+            "object_targets": [],
+        }],
+        "config_payloads": [{
+            "content": "",
+            "id": "",
+        }],
+        "compile_environments": [{
+            "abi": "",
+            "config_payload": "",
+            "id": "",
+        }],
+        "generated_header_families": [{
+            "config_payload": "",
+            "id": "",
+            "name": "",
+            "srcarch": "",
+        }],
+        "object_variants": [{
+            "mode": "y",
+            "object": "init/main.o",
+            "target": "init",
+        }],
+        "source_files": [{
+            "digest": "",
+            "path": "",
+        }],
+        "source_input_groups": [],
+    }
+    asserts.equals(
+        env,
+        "",
+        repositories_test_helpers.content_graph_metadata_structure_error(sparse),
+    )
+    invalid = [
+        (
+            _metadata_without_key(metadata, "", "configs"),
+            "configs",
+        ),
+        (
+            _metadata_with_key(metadata, "", "configs", None),
+            "configs",
+        ),
+        (
+            _metadata_with_key(metadata, "", "configs", {}),
+            "configs",
+        ),
+        (
+            _metadata_without_key(metadata, "configs", "object_targets"),
+            "object_targets",
+        ),
+        (
+            _metadata_with_key(metadata, "configs", "object_targets", None),
+            "object_targets",
+        ),
+        (
+            _metadata_with_key(metadata, "configs", "object_targets", ""),
+            "object_targets",
+        ),
+        (
+            _metadata_with_key(metadata, "configs", "object_targets", [1]),
+            "object_targets",
+        ),
+        (
+            _metadata_with_key(metadata, "configs", "config_payload", None),
+            "config_payload",
+        ),
+        (
+            _metadata_with_key(metadata, "configs", "module_object_targets", None),
+            "module_object_targets",
+        ),
+        (
+            _metadata_with_key(metadata, "compile_environments", "generated_header_families", None),
+            "generated_header_families",
+        ),
+        (
+            _metadata_with_key(metadata, "generated_header_families", "labels", None),
+            "labels",
+        ),
+        (
+            _metadata_with_key(metadata, "generated_header_families", "source_input_group", None),
+            "source_input_group",
+        ),
+        (
+            _metadata_with_key(metadata, "object_variants", "source", None),
+            "source",
+        ),
+        (
+            _metadata_with_key(metadata, "object_variants", "flags", None),
+            "flags",
+        ),
+        (
+            _metadata_with_key(metadata, "object_variants", "source_input_group", "1"),
+            "source_input_group",
+        ),
+    ]
+    for candidate, want in invalid:
+        error = repositories_test_helpers.content_graph_metadata_structure_error(candidate)
+        asserts.true(
+            env,
+            want in error,
+            "invalid metadata should mention %r, got %r" % (want, error),
+        )
+    return unittest.end(env)
+
+metadata_key_validation_test = unittest.make(_metadata_key_validation_test_impl)
 
 def _generated_object_inputs_test_impl(ctx):
     env = unittest.begin(ctx)

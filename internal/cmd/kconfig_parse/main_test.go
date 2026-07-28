@@ -72,26 +72,6 @@ func TestKbuildVariablesForConfigUsesWrittenConfigView(t *testing.T) {
 	}
 }
 
-func TestResolvedFlagLinesUsesWrittenConfigView(t *testing.T) {
-	resolved := &kconfig.ResolvedConfig{
-		Effective: map[string]string{
-			"CONFIG_Z":        "y",
-			"CONFIG_A":        "m",
-			"CONFIG_DISABLED": "n",
-			"CONFIG_HIDDEN":   "y",
-		},
-		Written: map[string]bool{
-			"CONFIG_A":        true,
-			"CONFIG_DISABLED": true,
-			"CONFIG_Z":        true,
-		},
-	}
-	got := strings.Join(resolvedFlagLines(resolved), "\n")
-	if want := "CONFIG_A=m\nCONFIG_Z=y"; got != want {
-		t.Fatalf("resolvedFlagLines() = %q, want %q", got, want)
-	}
-}
-
 func TestRustcCfgLinesMatchKernelEncoding(t *testing.T) {
 	tree, err := kconfig.Parse(
 		t.Context(),
@@ -151,81 +131,5 @@ config HEX_PREFIXED
 	}, "\n")
 	if got != want {
 		t.Fatalf("rustcCfgLines() =\n%s\nwant:\n%s", got, want)
-	}
-}
-
-func TestCompactMetadataRejectsUnmatchedOverlay(t *testing.T) {
-	_, err := compactMetadata(
-		nil,
-		"",
-		"Kbuild",
-		[]namedPath{{Name: "base", Path: "base.config"}},
-		[]namedPath{{Name: "other", Path: "overlay.config"}},
-		"",
-		"default",
-		false,
-		nil,
-		nil,
-		nil,
-		nil,
-		"",
-		"",
-		kconfig.CompactSchemaV012,
-	)
-	if err == nil || !strings.Contains(err.Error(), `config overlay "other" has no matching -config`) {
-		t.Fatalf("compactMetadata() error = %v, want unmatched overlay", err)
-	}
-}
-
-func TestCompactMetadataRejectsDuplicateOverlay(t *testing.T) {
-	_, err := compactMetadata(
-		nil,
-		"",
-		"Kbuild",
-		[]namedPath{{Name: "base", Path: "base.config"}},
-		[]namedPath{
-			{Name: "base", Path: "first.config"},
-			{Name: "base", Path: "second.config"},
-		},
-		"",
-		"default",
-		false,
-		nil,
-		nil,
-		nil,
-		nil,
-		"",
-		"",
-		kconfig.CompactSchemaV012,
-	)
-	if err == nil || !strings.Contains(err.Error(), `duplicate config overlay name "base"`) {
-		t.Fatalf("compactMetadata() error = %v, want duplicate overlay", err)
-	}
-}
-
-func TestCompactMetadataRejectsUnsafeResolvedFlagsNames(t *testing.T) {
-	for _, name := range []string{"../outside", "nested/config", `nested\config`, ".", ".."} {
-		t.Run(name, func(t *testing.T) {
-			_, err := compactMetadata(
-				nil,
-				"",
-				"Kbuild",
-				[]namedPath{{Name: name, Path: "base.config"}},
-				nil,
-				t.TempDir(),
-				"default",
-				false,
-				nil,
-				nil,
-				nil,
-				nil,
-				"",
-				"",
-				kconfig.CompactSchemaV012,
-			)
-			if err == nil || !strings.Contains(err.Error(), "must be a single path component") {
-				t.Fatalf("compactMetadata() error = %v, want unsafe name rejection", err)
-			}
-		})
 	}
 }

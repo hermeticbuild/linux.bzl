@@ -79,13 +79,98 @@ _PROBE_VALUES = {
     "rustc_version": "109700",
 }
 
-_COMPACT_SCHEMA = "v0.0.13"
 _REPOSITORY_GENERATOR_PROTOCOL = "compact-v5-content-graph"
 _LLVM_VERSION = "22.1.8"
 _IMAGE_COMPRESSION_CONFIGS = {
     "CONFIG_KERNEL_GZIP": True,
     "CONFIG_KERNEL_LZ4": True,
 }
+
+_CONTENT_GRAPH_METADATA_FIELDS = {
+    "compile_environments": "list",
+    "config_payloads": "list",
+    "configs": "list",
+    "generated_header_families": "list",
+    "object_variants": "list",
+    "source_files": "list",
+    "source_input_groups": "string_list",
+}
+
+_CONTENT_GRAPH_OBJECT_KEYS = [
+    (
+        "configs",
+        {
+            "config_payload": "string",
+            "module_object_targets": "string_list",
+            "name": "string",
+            "object_targets": "string_list",
+        },
+        ["name", "object_targets"],
+        "config",
+    ),
+    (
+        "config_payloads",
+        {
+            "content": "string",
+            "id": "string",
+        },
+        ["content", "id"],
+        "config payload",
+    ),
+    (
+        "compile_environments",
+        {
+            "abi": "string",
+            "config_payload": "string",
+            "generated_header_families": "string_list",
+            "id": "string",
+        },
+        ["abi", "config_payload", "id"],
+        "compile environment",
+    ),
+    (
+        "generated_header_families",
+        {
+            "config_payload": "string",
+            "dependencies": "string_list",
+            "id": "string",
+            "labels": "string_list",
+            "name": "string",
+            "source_input_group": "int",
+            "srcarch": "string",
+        },
+        ["config_payload", "id", "name", "srcarch"],
+        "generated-header family",
+    ),
+    (
+        "source_files",
+        {
+            "digest": "string",
+            "path": "string",
+        },
+        ["digest", "path"],
+        "source file",
+    ),
+    (
+        "object_variants",
+        {
+            "compile_environment": "string",
+            "content_id": "string",
+            "deps": "string_list",
+            "flags": "string_list",
+            "members": "string_list",
+            "mode": "string",
+            "modname": "string",
+            "object": "string",
+            "remove_flags": "string_list",
+            "source": "string",
+            "source_input_group": "int",
+            "target": "string",
+        },
+        ["mode", "object", "target"],
+        "object variant",
+    ),
+]
 
 def _linux_image_impl(rctx):
     source = rctx.attr.source
@@ -294,7 +379,6 @@ def _linux_image_impl(rctx):
         ".linux-bzl-generator.json",
         json.encode({
             "architecture": arch,
-            "compact_schema": _COMPACT_SCHEMA,
             "graph_stats": graph_stats,
             "protocol": _REPOSITORY_GENERATOR_PROTOCOL,
             "rust_enabled": base_rust_enabled,
@@ -641,7 +725,6 @@ def _generate_rust_profile(rctx, tool, source_root, descriptor):
     rctx.file(output, "", executable = False)
     args = [
         str(tool),
-        "-compact_schema=" + _COMPACT_SCHEMA,
         "-rust_profile_out",
         str(rctx.path(output)),
         "-srctree",
@@ -696,10 +779,8 @@ def _generate_content_graph(
         descriptor.srcarch,
     )
     source_package = str(source).rsplit(":", 1)[0]
-    source_repo = _repository_prefix(source)
     args = [
         str(tool),
-        "-compact_schema=" + _COMPACT_SCHEMA,
         "-compact_base_config",
         base_config,
         "-compile_environment_abi",
@@ -727,24 +808,6 @@ def _generate_content_graph(
         source_package,
         "-source_root_label",
         str(source),
-        "-source_tree_arch_headers_label",
-        source_repo + "//:arch_headers",
-        "-source_tree_dtb_sources_label",
-        source_repo + "//:dtb_sources",
-        "-source_tree_global_headers_label",
-        source_repo + "//:global_headers",
-        "-source_tree_headers_label",
-        source_repo + "//:headers",
-        "-source_tree_kbuild_files_label",
-        source_repo + "//:kbuild_files",
-        "-source_tree_local_include_files_label",
-        source_repo + "//:local_include_files",
-        "-source_tree_lookup_files_label",
-        source_repo + "//:source_tree_lookup_files",
-        "-source_tree_scripts_headers_label",
-        source_repo + "//:scripts_headers",
-        "-source_tree_uapi_headers_label",
-        source_repo + "//:uapi_headers",
         "-source_asn1_compiler",
         "//:_base_asn1_compiler_tool",
         "-allow_shell",
@@ -1101,6 +1164,72 @@ def _metadata_source_input_group(source_index, group, context):
         )
     return source_index.groups[group - 1]
 
+def _metadata_value_type_error(value, expected_type, context):
+    if expected_type == "list":
+        if type(value) != "list":
+            return "%s must be a JSON array" % context
+        return ""
+    if expected_type == "string_list":
+        if type(value) != "list":
+            return "%s must be a JSON array" % context
+        for index in range(len(value)):
+            if type(value[index]) != "string":
+                return "%s item %d must be a JSON string" % (context, index + 1)
+        return ""
+    if type(value) != expected_type:
+        type_name = "integer" if expected_type == "int" else expected_type
+        return "%s must be a JSON %s" % (context, type_name)
+    return ""
+
+def _metadata_object_error(value, fields, required_keys, context):
+    if type(value) != "dict":
+        return "%s must be a JSON object" % context
+    unexpected = sorted([
+        key
+        for key in value.keys()
+        if key not in fields
+    ])
+    if unexpected:
+        return "%s has unsupported fields %s" % (context, unexpected)
+    missing = sorted([
+        key
+        for key in required_keys
+        if key not in value
+    ])
+    if missing:
+        return "%s is missing required fields %s" % (context, missing)
+    for key in sorted(value.keys()):
+        error = _metadata_value_type_error(
+            value[key],
+            fields[key],
+            "%s field %s" % (context, key),
+        )
+        if error:
+            return error
+    return ""
+
+def _content_graph_metadata_structure_error(metadata):
+    error = _metadata_object_error(
+        metadata,
+        _CONTENT_GRAPH_METADATA_FIELDS,
+        _CONTENT_GRAPH_METADATA_FIELDS.keys(),
+        "Linux content graph metadata",
+    )
+    if error:
+        return error
+    for collection, fields, required_keys, item_name in _CONTENT_GRAPH_OBJECT_KEYS:
+        items = metadata[collection]
+        for index in range(len(items)):
+            error = _metadata_object_error(
+                items[index],
+                fields,
+                required_keys,
+                "Linux content graph %s %d" % (item_name, index + 1),
+            )
+            if error:
+                return error
+    return ""
+
 def _validate_generated_metadata(
         rctx,
         graph_dir,
@@ -1109,15 +1238,14 @@ def _validate_generated_metadata(
         expected_compile_environment_abi,
         expected_srcarch):
     metadata = json.decode(rctx.read(graph_dir + "/metadata.json"))
-    if type(metadata) != "dict":
-        fail("Linux graph generator wrote invalid metadata")
+    structure_error = _content_graph_metadata_structure_error(metadata)
+    if structure_error:
+        fail("Linux graph generator wrote invalid metadata: %s" % structure_error)
     generated_configs = metadata.get("configs", [])
     names = sorted([config.get("name", "") for config in generated_configs])
     expected_names = sorted(config_names)
     if names != expected_names:
         fail("Linux graph generator emitted configs %s, expected %s" % (names, expected_names))
-    if metadata.get("schema") != _COMPACT_SCHEMA:
-        fail("Linux content graph generator emitted schema %r" % metadata.get("schema"))
     source_index = _metadata_source_input_index(metadata)
 
     variants = metadata.get("object_variants", [])
@@ -1141,8 +1269,6 @@ def _validate_generated_metadata(
         if target in variants_by_target:
             fail("Linux graph generator repeated object target %s" % target)
         variants_by_target[target] = variant
-        if "config_fragment" in variant:
-            fail("Linux content graph object %s retains redundant config_fragment" % object_path)
         if variant.get("members", []):
             continue
         source = variant.get("source", "")
@@ -1156,8 +1282,6 @@ def _validate_generated_metadata(
                 "Linux graph for configs %s resolved object %s to missing source %s" %
                 (expected_names, object_path, source),
             )
-        if variant.get("source_inputs", []):
-            fail("Linux content graph object %s retains inline source_inputs" % object_path)
         source_paths = _metadata_source_input_group(
             source_index,
             variant.get("source_input_group", 0),
@@ -1174,7 +1298,7 @@ def _validate_generated_metadata(
         payload_id = payload.get("id", "") if type(payload) == "dict" else ""
         if not _is_content_id(payload_id) or payload_id in payload_ids:
             fail("Linux content graph has invalid or duplicate config payload ID %r" % payload_id)
-        if "fragment" in payload or type(payload.get("content")) != "string":
+        if type(payload.get("content")) != "string":
             fail("Linux content graph config payload %s is not normalized" % payload_id)
         payload_ids[payload_id] = True
 
@@ -1187,7 +1311,6 @@ def _validate_generated_metadata(
         srcarch = family.get("srcarch", "") if type(family) == "dict" else ""
         dependencies = family.get("dependencies", []) if type(family) == "dict" else []
         source_input_group = family.get("source_input_group", 0) if type(family) == "dict" else 0
-        source_inputs = family.get("source_inputs", []) if type(family) == "dict" else []
         if not _is_content_id(family_id) or family_id in family_by_id:
             fail("Linux content graph has invalid or duplicate generated-header family ID %r" % family_id)
         if (
@@ -1201,9 +1324,7 @@ def _validate_generated_metadata(
             (expected_srcarch and srcarch != expected_srcarch) or
             type(dependencies) != "list" or
             type(source_input_group) != "int" or
-            source_input_group < 0 or
-            type(source_inputs) != "list" or
-            source_inputs
+            source_input_group < 0
         ):
             fail("Linux content graph generated-header family %s is invalid" % family_id)
         for label in labels:
@@ -1493,7 +1614,7 @@ linux_image_targets(
 
 repositories_test_helpers = struct(
     validate_compile_environment_abi = _validate_compile_environment_abi,
-    content_schema = _COMPACT_SCHEMA,
+    content_graph_metadata_structure_error = _content_graph_metadata_structure_error,
     core_config_aliases = _content_core_config_aliases,
     generated_object_block_has_buildable_inputs = _generated_object_block_has_buildable_inputs,
     graph_configs_args = _graph_configs_args,

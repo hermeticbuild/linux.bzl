@@ -444,10 +444,10 @@ repository-generated closure of source-like includes rather than the complete
 source archive.
 
 Repository generation resolves the base config and every named overlay in one
-compact-schema `v0.0.13` invocation. Compile environments, exact source inputs,
-and generated-header families are content-addressed, and variant images are
-emitted as deltas from one canonical base graph. Equivalent configs therefore
-reference the same object targets. Configs with only some identical generated
+graph invocation. Compile environments, exact source inputs, and
+generated-header families are content-addressed, and variant images are emitted
+as deltas from one canonical base graph. Equivalent configs therefore reference
+the same object targets. Configs with only some identical generated
 headers share those family inputs without conflating the remaining
 generated-header tree. The public `@repo//:kernel` and
 `@repo//variants/<name>:kernel` labels stay unchanged.

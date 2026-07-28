@@ -11,11 +11,11 @@ def linux_arm64_host_tools(
         name,
         config,
         source_repo,
+        generated_header_family_ids,
         target_prefix = None,
         source_root = None,
         source_tree = None,
         env = None,
-        generated_header_family_ids = {},
         visibility = None):
     """Defines the source-tree-specific host tools required by arm64 native builds."""
     if env == None:
@@ -93,9 +93,9 @@ def linux_arm64_configured_host_tools(
         config,
         shared,
         source_repo,
+        generated_header_family_ids,
         source_root = None,
         source_tree = None,
-        generated_header_family_ids = {},
         visibility = None):
     """Adds only the config-sensitive arm64 headers to a shared host-tool set."""
     if source_root == None:

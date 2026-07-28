@@ -67,7 +67,6 @@ linux_object(
     source_input_file = 1,
     source_input_group = 1,
     source_input_index = ":_source_input_index",
-    source_tree_info = ":_source_tree",
     srcarch = "x86",
     tags = ["manual"],
 )
@@ -87,7 +86,6 @@ linux_object(
     source_input_file = 2,
     source_input_group = 2,
     source_input_index = ":_source_input_index",
-    source_tree_info = ":_source_tree",
     srcarch = "x86",
     tags = ["manual"],
 )
@@ -104,7 +102,6 @@ linux_object(
     source_input_file = 6,
     source_input_group = 4,
     source_input_index = ":_source_input_index",
-    source_tree_info = ":_source_tree",
     srcarch = "x86",
     tags = ["manual"],
 )
@@ -124,7 +121,6 @@ linux_object(
     source_input_file = 6,
     source_input_group = 4,
     source_input_index = ":_source_input_index",
-    source_tree_info = ":_source_tree",
     srcarch = "x86",
     tags = ["manual"],
 )
@@ -145,7 +141,6 @@ linux_object(
     source_input_file = 7,
     source_input_group = 5,
     source_input_index = ":_source_input_index",
-    source_tree_info = ":_source_tree",
     srcarch = "x86",
     tags = ["manual"],
 )

@@ -1,4 +1,4 @@
-"""Native rules for compact, fragment-keyed Linux build units."""
+"""Native rules for compact, content-addressed Linux build units."""
 
 load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "CPP_LINK_STATIC_LIBRARY_ACTION_NAME", "C_COMPILE_ACTION_NAME")
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
@@ -49,18 +49,15 @@ LinuxConfigInfo = provider(
 )
 
 LinuxObjectInfo = provider(
-    doc = "Metadata for one Linux object variant keyed by a reduced Kconfig fragment.",
+    doc = "Metadata for one content-addressed Linux object variant.",
     fields = {
-        "content_id": "Stable content identity for this object action, or empty for legacy callers.",
-        "config_fragment": "Dictionary of CONFIG_* values that affect this object action.",
-        "flags": "Kbuild flags that affect this object action.",
+        "content_id": "Stable content identity for this object action.",
         "generated_headers": "Depset of generated headers exported by this object.",
         "generated_include_dirs": "Include directories for generated headers exported by this object.",
         "generated_include_dir_anchors": "File-backed references to generated_include_dirs.",
         "mode": "Kbuild mode: y for built-in or m for module.",
         "object": "Object path relative to the kernel source tree.",
         "output": "Object output file.",
-        "source": "Source file short path.",
     },
 )
 
@@ -90,10 +87,7 @@ LinuxGeneratedHeadersInfo = provider(
 LinuxCompileEnvironmentIndexInfo = provider(
     doc = "Content-addressed Linux compile environments materialized by one index target.",
     fields = {
-        "config_payloads": "Dictionary of config payload IDs to materialized LinuxConfigInfo values.",
         "environments": "Dictionary of compile environment IDs to selected config and generated-header values.",
-        "expected_abi": "Action ABI required for every indexed compile environment.",
-        "generated_header_families": "Dictionary of generated-header family content IDs to selected file subsets.",
     },
 )
 
@@ -103,6 +97,7 @@ LinuxSourceInputIndexInfo = provider(
         "file_indices": "Dictionary of source-root-relative paths to one-based file indices.",
         "files": "Canonical list of source files, each labeled exactly once by the index target.",
         "groups": "List of structs containing the depset and encoded membership for one exact input group.",
+        "source_tree_info": "Linux source tree used to root and interpret the indexed files.",
     },
 )
 
@@ -115,19 +110,9 @@ _LinuxCompactImageShapeInfo = provider(
 )
 
 LinuxSourceTreeInfo = provider(
-    doc = "Shared Linux source tree inputs consumed by generated object targets.",
+    doc = "Linux source tree root shared by exact source input indexes.",
     fields = {
-        "all_files": "Depset of all Linux source tree files; only explicit full-tree actions should consume this.",
-        "arch_headers": "Depset of architecture include headers under arch/*/include.",
-        "dtb_sources": "Depset of devicetree source and include files.",
-        "global_headers": "Depset of global include headers under include.",
-        "headers": "Depset of all header-like files in the Linux source tree.",
-        "kbuild_files": "Depset of Kbuild and Makefile files.",
-        "local_include_files": "Depset of source-like files that may be included from another source in the same directory.",
-        "lookup_files": "Bounded depset of special source files looked up by native Linux actions.",
         "root": "Root marker file for the Linux source tree, usually Kconfig.",
-        "scripts_headers": "Depset of headers under scripts.",
-        "uapi_headers": "Depset of UAPI headers.",
     },
 )
 
@@ -157,17 +142,7 @@ def _source_tree_root_dir(root):
 
 def _linux_source_tree_impl(ctx):
     return [LinuxSourceTreeInfo(
-        all_files = depset(ctx.files.all_files),
-        arch_headers = depset(ctx.files.arch_headers),
-        dtb_sources = depset(ctx.files.dtb_sources),
-        global_headers = depset(ctx.files.global_headers),
-        headers = depset(ctx.files.headers),
-        kbuild_files = depset(ctx.files.kbuild_files),
-        local_include_files = depset(ctx.files.local_include_files),
-        lookup_files = depset(ctx.files.lookup_files),
         root = ctx.file.root,
-        scripts_headers = depset(ctx.files.scripts_headers),
-        uapi_headers = depset(ctx.files.uapi_headers),
     )]
 
 linux_source_tree = rule(
@@ -175,50 +150,11 @@ linux_source_tree = rule(
     attrs = {
         "root": attr.label(
             allow_single_file = True,
+            mandatory = True,
             doc = "Root marker file for the Linux source tree, usually Kconfig.",
         ),
-        "all_files": attr.label_list(
-            allow_files = True,
-            doc = "Explicit full Linux source tree files. Normal object compiles should not request this class.",
-        ),
-        "arch_headers": attr.label_list(
-            allow_files = True,
-            doc = "Architecture include headers under arch/*/include.",
-        ),
-        "dtb_sources": attr.label_list(
-            allow_files = True,
-            doc = "Devicetree source and include files.",
-        ),
-        "global_headers": attr.label_list(
-            allow_files = True,
-            doc = "Global include headers under include.",
-        ),
-        "headers": attr.label_list(
-            allow_files = True,
-            doc = "All source tree header-like files.",
-        ),
-        "kbuild_files": attr.label_list(
-            allow_files = True,
-            doc = "Kbuild and Makefile files.",
-        ),
-        "local_include_files": attr.label_list(
-            allow_files = True,
-            doc = "Source-like files that may be included from another source in the same directory.",
-        ),
-        "lookup_files": attr.label_list(
-            allow_files = True,
-            doc = "Bounded special source inputs looked up by native Linux actions.",
-        ),
-        "scripts_headers": attr.label_list(
-            allow_files = True,
-            doc = "Headers under scripts.",
-        ),
-        "uapi_headers": attr.label_list(
-            allow_files = True,
-            doc = "UAPI headers.",
-        ),
     },
-    doc = "Provider wrapper for source tree inputs shared by generated Linux object targets.",
+    doc = "Provider wrapper for the source root shared by exact Linux source input indexes.",
 )
 
 def _positive_decimal(value, context):
@@ -237,7 +173,8 @@ def _positive_decimal(value, context):
 def _linux_source_input_index_impl(ctx):
     if not ctx.files.srcs:
         fail("linux_source_input_index %s requires non-empty srcs" % ctx.label)
-    source_root = ctx.attr.source_tree_info[LinuxSourceTreeInfo].root
+    source_tree_info = ctx.attr.source_tree_info[LinuxSourceTreeInfo]
+    source_root = source_tree_info.root
     if not source_root:
         fail("linux_source_input_index %s requires a rooted source_tree_info" % ctx.label)
     root_dir = _source_tree_root_dir(source_root)
@@ -306,6 +243,7 @@ def _linux_source_input_index_impl(ctx):
         file_indices = file_indices,
         files = files,
         groups = groups,
+        source_tree_info = source_tree_info,
     )]
 
 linux_source_input_index = rule(
@@ -410,7 +348,7 @@ def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
     return out
 
 def _linux_kbuild_target_triple(ctx):
-    arch = getattr(ctx.attr, "arch", "")
+    arch = ctx.attr.arch
     if arch == "arm64":
         return "aarch64-linux-gnu"
     if arch == "x86":
@@ -539,12 +477,6 @@ def _unquote(value):
         return value[1:-1]
     return value
 
-def _make_config_values(config, config_fragment):
-    values = dict(config_fragment)
-    if config:
-        values.update(config.config_flags)
-    return values
-
 def _expand_make_refs(value, replacements, object):
     for key in sorted(replacements.keys()):
         replacement = replacements[key]
@@ -672,12 +604,10 @@ def _add_directory_flags(args, directories, anchors = {}, format = "-I%s"):
             add_directory_arg(args, anchor, format = format)
 
 def _config_include_dir_anchor(config):
-    return config.include_dir_anchor if hasattr(config, "include_dir_anchor") else None
+    return config.include_dir_anchor
 
 def _generated_include_dir_anchors(generated_headers):
-    if generated_headers == None or not hasattr(generated_headers, "include_dir_anchors"):
-        return {}
-    return generated_headers.include_dir_anchors
+    return generated_headers.include_dir_anchors if generated_headers != None else {}
 
 def _add_config_include_flag(args, config):
     anchor = _config_include_dir_anchor(config)
@@ -710,16 +640,16 @@ def _add_linux_source_include_flags(ctx, args, generated_headers = None):
     )
 
 def _linux_rule_srcarch(ctx, generated_headers = None):
-    if hasattr(ctx.attr, "srcarch") and ctx.attr.srcarch:
+    if ctx.attr.srcarch:
         return ctx.attr.srcarch
-    if generated_headers != None and hasattr(generated_headers, "srcarch") and generated_headers.srcarch:
+    if generated_headers != None and generated_headers.srcarch:
         return generated_headers.srcarch
     return "x86"
 
 def _linux_rule_arch(ctx, generated_headers = None):
-    if hasattr(ctx.attr, "arch") and ctx.attr.arch:
+    if ctx.attr.arch:
         return ctx.attr.arch
-    if generated_headers != None and hasattr(generated_headers, "arch") and generated_headers.arch:
+    if generated_headers != None and generated_headers.arch:
         return generated_headers.arch
     return "x86"
 
@@ -842,8 +772,7 @@ def _unique_strings(values):
 def _merged_generated_include_dir_anchors(object_infos):
     anchors = {}
     for info in object_infos:
-        if hasattr(info, "generated_include_dir_anchors"):
-            anchors.update(info.generated_include_dir_anchors)
+        anchors.update(info.generated_include_dir_anchors)
     return anchors
 
 def _single_file(target, attr_name):
@@ -926,13 +855,13 @@ def _linux_object_directory(object):
     return object.rsplit("/", 1)[0]
 
 def _linux_source_tree_info(ctx):
-    if hasattr(ctx.attr, "source_tree_info") and ctx.attr.source_tree_info:
-        return ctx.attr.source_tree_info[LinuxSourceTreeInfo]
+    if hasattr(ctx.attr, "source_input_index"):
+        return ctx.attr.source_input_index[LinuxSourceInputIndexInfo].source_tree_info
     return None
 
 def _linux_source_root_file(ctx):
     info = _linux_source_tree_info(ctx)
-    if info and info.root:
+    if info:
         return info.root
     if hasattr(ctx.file, "source_root"):
         return ctx.file.source_root
@@ -955,16 +884,8 @@ def _linux_source_root_path(ctx):
     return _linux_execroot_dir(root)
 
 def _linux_source_input_group(ctx, rule_name):
-    has_index = hasattr(ctx.attr, "source_input_index") and bool(ctx.attr.source_input_index)
-    group_number = ctx.attr.source_input_group if hasattr(ctx.attr, "source_input_group") else 0
-    if has_index != bool(group_number):
-        fail(
-            "%s %s requires source_input_index and a positive source_input_group together" %
-            (rule_name, ctx.label),
-        )
-    if not has_index:
-        return None
     index = ctx.attr.source_input_index[LinuxSourceInputIndexInfo]
+    group_number = ctx.attr.source_input_group
     if group_number <= 0 or group_number > len(index.groups):
         fail(
             "%s %s source_input_group %d is out of range 1..%d" %
@@ -974,6 +895,11 @@ def _linux_source_input_group(ctx, rule_name):
         index = index,
         value = index.groups[group_number - 1],
     )
+
+def _optional_linux_source_input_group(ctx, rule_name):
+    if not hasattr(ctx.attr, "source_input_index"):
+        return None
+    return _linux_source_input_group(ctx, rule_name)
 
 def _linux_source_input_file(_ctx, selection, file_number, context):
     if selection == None:
@@ -991,7 +917,7 @@ def _linux_source_input_file(_ctx, selection, file_number, context):
     return selection.index.files[file_number - 1]
 
 def _linux_source_input_file_for_path(ctx, relpath):
-    selection = _linux_source_input_group(ctx, "Linux source lookup")
+    selection = _optional_linux_source_input_group(ctx, "Linux source lookup")
     if selection == None:
         return None
     file_number = selection.index.file_indices.get(relpath, 0)
@@ -1008,25 +934,21 @@ def _linux_source_tree_files(ctx):
     files = []
     if hasattr(ctx.files, "source_includes"):
         files.extend(ctx.files.source_includes)
-    info = _linux_source_tree_info(ctx)
-    if info:
-        files.extend(info.lookup_files.to_list())
     if hasattr(ctx.files, "source_tree"):
         files.extend(ctx.files.source_tree)
     return files
 
 def _linux_source_tree_inputs(ctx, direct = []):
-    return _linux_source_tree_class_inputs(
-        ctx,
-        classes = [
-            "headers",
-            "lookup_files",
-        ],
-        direct = direct,
-    )
+    root = _linux_source_root_file(ctx)
+    inputs = list(direct)
+    if root:
+        inputs.append(root)
+    if hasattr(ctx.files, "source_tree"):
+        inputs.extend(ctx.files.source_tree)
+    return inputs
 
 def _linux_action_source_inputs(ctx, rule_name, direct = []):
-    selection = _linux_source_input_group(ctx, rule_name)
+    selection = _optional_linux_source_input_group(ctx, rule_name)
     if selection != None:
         return struct(
             direct = list(direct),
@@ -1037,72 +959,15 @@ def _linux_action_source_inputs(ctx, rule_name, direct = []):
         transitive = [],
     )
 
-def _linux_source_tree_class_inputs(ctx, classes, direct = []):
-    root = _linux_source_root_file(ctx)
-    inputs = list(direct)
-    if root:
-        inputs.append(root)
-    info = _linux_source_tree_info(ctx)
-    if info:
-        for class_name in classes:
-            inputs.extend(getattr(info, class_name).to_list())
-    elif hasattr(ctx.files, "source_tree"):
-        inputs.extend(ctx.files.source_tree)
-    return inputs
-
 def _linux_source_tree_relpath_from_ctx(ctx, file):
     root = _linux_source_root_file(ctx)
     return _source_tree_relpath(file, _source_tree_root_dir(root))
 
-def _is_local_include_file(relpath):
-    return relpath.endswith(".c") or relpath.endswith(".S") or relpath.endswith(".inc")
-
-def _source_tree_local_include_files(ctx, dirs):
-    info = _linux_source_tree_info(ctx)
-    if not info:
-        return []
-    normalized_dirs = {}
-    for dir in dirs:
-        dir = dir.strip("/")
-        if dir:
-            normalized_dirs[dir] = True
-    if not normalized_dirs:
-        return []
-    inputs = []
-    for file in info.local_include_files.to_list():
-        relpath = _linux_source_tree_relpath_from_ctx(ctx, file)
-        if _linux_object_directory(relpath) in normalized_dirs and _is_local_include_file(relpath):
-            inputs.append(file)
-    return inputs
-
-def _linux_object_compile_source_tree_inputs(ctx, src, direct = []):
+def _linux_object_compile_source_tree_inputs(ctx, direct = []):
     selection = _linux_source_input_group(ctx, "linux_object")
-    if selection != None:
-        return struct(
-            direct = list(direct),
-            transitive = [selection.value.files],
-        )
-
-    object_dir = _linux_object_directory(ctx.attr.object)
-    source_dir = _linux_object_directory(_linux_source_tree_relpath_from_ctx(ctx, src))
-    inputs = _linux_source_tree_class_inputs(
-        ctx,
-        classes = [
-            "headers",
-            "lookup_files",
-        ],
-        direct = direct,
-    )
-    inputs.extend(ctx.files.source_includes)
-    if not ctx.attr.source_includes_complete:
-        inputs.extend(_source_tree_local_include_files(ctx, [object_dir, source_dir]))
-    if _is_dtb_source(src):
-        info = _linux_source_tree_info(ctx)
-        if info:
-            inputs.extend(info.dtb_sources.to_list())
     return struct(
-        direct = inputs,
-        transitive = [],
+        direct = list(direct),
+        transitive = [selection.value.files],
     )
 
 def _rewrite_utsversion_tmp_flags(flags, object, utsversion_tmp):
@@ -1183,7 +1048,7 @@ def _linux_purgatory_compile(ctx, compiler, cc_toolchain, feature_configuration,
     args.add("-o")
     args.add(out)
 
-    source_inputs = _linux_object_compile_source_tree_inputs(ctx, src, direct = [src])
+    source_inputs = _linux_object_compile_source_tree_inputs(ctx, direct = [src])
     transitive_inputs = [cc_toolchain.all_files]
     if config:
         transitive_inputs.append(config.files)
@@ -1296,7 +1161,7 @@ def _linux_realmode_compile(ctx, compiler, cc_toolchain, config, generated_heade
     args.add("-o")
     args.add(out)
 
-    source_inputs = _linux_object_compile_source_tree_inputs(ctx, src, direct = [src])
+    source_inputs = _linux_object_compile_source_tree_inputs(ctx, direct = [src])
     transitive_inputs = [cc_toolchain.all_files]
     if config:
         transitive_inputs.append(config.files)
@@ -1360,7 +1225,7 @@ def _linux_realmode_linker_script(ctx, compiler, cc_toolchain, config, generated
         transitive_inputs.append(config.files)
     if generated_headers:
         transitive_inputs.append(generated_headers.files)
-    source_inputs = _linux_object_compile_source_tree_inputs(ctx, src, direct = [src, pasyms])
+    source_inputs = _linux_object_compile_source_tree_inputs(ctx, direct = [src, pasyms])
     path_mapped_run(
         ctx.actions,
         executable = compiler,
@@ -1492,7 +1357,7 @@ def _linux_vdso_compile(ctx, compiler, cc_toolchain, feature_configuration, conf
     args.add("-o")
     args.add(out)
 
-    source_inputs = _linux_object_compile_source_tree_inputs(ctx, src, direct = [src])
+    source_inputs = _linux_object_compile_source_tree_inputs(ctx, direct = [src])
     transitive_inputs = [cc_toolchain.all_files]
     if config:
         transitive_inputs.append(config.files)
@@ -1540,7 +1405,7 @@ def _linux_vdso_linker_script(ctx, compiler, cc_toolchain, feature_configuration
         transitive_inputs.append(config.files)
     if generated_headers:
         transitive_inputs.append(generated_headers.files)
-    source_inputs = _linux_object_compile_source_tree_inputs(ctx, src, direct = [src])
+    source_inputs = _linux_object_compile_source_tree_inputs(ctx, direct = [src])
     path_mapped_run(
         ctx.actions,
         executable = compiler,
@@ -1996,51 +1861,6 @@ _X86_OFFSETS_HEADER_FAMILIES = [
     "rq_offsets",
     "kvm_offsets",
 ]
-
-_X86_LEGACY_OFFSETS_HEADER_DEPENDENCIES = {
-    "bounds": [
-        "static",
-        "timeconst",
-        "compile",
-        "version",
-        "utsrelease",
-        "utsversion",
-        "cpufeatures",
-    ],
-    "asm_offsets": [
-        "static",
-        "timeconst",
-        "compile",
-        "version",
-        "utsrelease",
-        "utsversion",
-        "cpufeatures",
-        "bounds",
-    ],
-    "rq_offsets": [
-        "static",
-        "timeconst",
-        "compile",
-        "version",
-        "utsrelease",
-        "utsversion",
-        "cpufeatures",
-        "bounds",
-        "asm_offsets",
-    ],
-    "kvm_offsets": [
-        "static",
-        "timeconst",
-        "compile",
-        "version",
-        "utsrelease",
-        "utsversion",
-        "cpufeatures",
-        "bounds",
-        "asm_offsets",
-        "rq_offsets",
-    ],
-}
 
 def _linux_offsets_header(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, src, out_path, guard, generated_inputs, include_dir_anchors = {}, srcarch = "x86", extra_include_dirs = [], extra_flags = []):
     compiler = cc_common.get_tool_for_action(
@@ -2568,8 +2388,6 @@ def _linux_x86_reusable_header_families(ctx):
                     "linux_x86_generated_headers reusable target %s publishes family %s under name %s" %
                     (target.label, family.name, name),
                 )
-            if not family.content_id:
-                continue
             _validate_content_id(
                 family.content_id,
                 "linux_x86_generated_headers reusable target %s family %s content ID" % (target.label, name),
@@ -2585,22 +2403,12 @@ def _linux_x86_reusable_header_families(ctx):
     return reusable
 
 def _linux_x86_reusable_header_family(ctx, reusable, name):
-    content_id = ctx.attr.family_content_ids.get(name, "")
-    if not content_id:
-        return None
-    return reusable.get((name, content_id))
+    return reusable.get((name, ctx.attr.family_content_ids[name]))
 
 def _linux_x86_header_family_base(ctx, name):
     return ctx.label.name + ".headers/" + name
 
 def _linux_x86_header_family_dependencies(ctx):
-    if not ctx.attr.family_content_ids:
-        if ctx.attr.family_dependency_ids:
-            fail("linux_x86_generated_headers family dependencies require family content IDs")
-        return {
-            name: list(dependencies)
-            for name, dependencies in _X86_LEGACY_OFFSETS_HEADER_DEPENDENCIES.items()
-        }
     generation_order = {
         name: index
         for index, name in enumerate(_X86_PRECISE_GENERATED_HEADER_FAMILIES)
@@ -2755,7 +2563,7 @@ def _linux_x86_static_header_family(ctx):
     return _generated_header_family_info(
         arch = "x86",
         cflags = None,
-        content_id = ctx.attr.family_content_ids.get("static", ""),
+        content_id = ctx.attr.family_content_ids["static"],
         files = headers,
         include_dirs = [arch_include_dir, uapi_include_dir],
         name = "static",
@@ -2781,7 +2589,7 @@ def _linux_x86_timeconst_header_family(ctx, config):
     return _generated_header_family_info(
         arch = "x86",
         cflags = None,
-        content_id = ctx.attr.family_content_ids.get("timeconst", ""),
+        content_id = ctx.attr.family_content_ids["timeconst"],
         files = [out],
         include_dirs = [out.dirname[:-len("/generated")]],
         name = "timeconst",
@@ -2827,7 +2635,7 @@ def _linux_x86_version_header_family(ctx, config, name, path, output_flag, mnemo
     return _generated_header_family_info(
         arch = "x86",
         cflags = None,
-        content_id = ctx.attr.family_content_ids.get(name, ""),
+        content_id = ctx.attr.family_content_ids[name],
         files = [out],
         include_dirs = include_dirs,
         name = name,
@@ -2858,7 +2666,7 @@ def _linux_x86_cpufeatures_header_family(ctx, config):
     return _generated_header_family_info(
         arch = "x86",
         cflags = None,
-        content_id = ctx.attr.family_content_ids.get("cpufeatures", ""),
+        content_id = ctx.attr.family_content_ids["cpufeatures"],
         files = [out],
         include_dirs = [out.dirname[:-len("/asm")]],
         name = "cpufeatures",
@@ -2883,7 +2691,7 @@ def _linux_x86_offsets_header_family(
         return _generated_header_family_info(
             arch = "x86",
             cflags = None,
-            content_id = ctx.attr.family_content_ids.get(name, ""),
+            content_id = ctx.attr.family_content_ids[name],
             files = [],
             include_dirs = [],
             name = name,
@@ -2917,7 +2725,7 @@ def _linux_x86_offsets_header_family(
     return _generated_header_family_info(
         arch = "x86",
         cflags = None,
-        content_id = ctx.attr.family_content_ids.get(name, ""),
+        content_id = ctx.attr.family_content_ids[name],
         files = [out],
         include_dirs = include_dirs,
         name = name,
@@ -2938,7 +2746,7 @@ def _linux_x86_generated_header_families_impl(ctx):
     config = ctx.attr.config[LinuxConfigInfo]
     source_root = _linux_source_root_path(ctx)
     family_dependencies = _linux_x86_header_family_dependencies(ctx)
-    reusable = _linux_x86_reusable_header_families(ctx) if ctx.attr.family_content_ids else {}
+    reusable = _linux_x86_reusable_header_families(ctx)
     families = {}
 
     family = _linux_x86_reusable_header_family(ctx, reusable, "static")
@@ -3029,7 +2837,7 @@ def _linux_x86_generated_header_families_impl(ctx):
     if all_family == None:
         all_family = _generated_header_family_aggregate(
             "all",
-            ctx.attr.family_content_ids.get("all", ""),
+            ctx.attr.family_content_ids["all"],
             [
                 families[name]
                 for name in _X86_PRECISE_GENERATED_HEADER_FAMILIES
@@ -3059,9 +2867,11 @@ linux_x86_generated_headers = rule(
         "config": attr.label(providers = [LinuxConfigInfo], mandatory = True),
         "cpufeatures_h": attr.label(allow_single_file = True, mandatory = True),
         "family_dependency_ids": attr.string_dict(
+            mandatory = True,
             doc = "Exact family:dependency edges to dependency family content IDs.",
         ),
         "family_content_ids": attr.string_dict(
+            mandatory = True,
             doc = "Map of generated-header family names to full SHA-256 content identities.",
         ),
         "kvm_asm_offsets_c": attr.label(allow_single_file = True, mandatory = True),
@@ -3428,7 +3238,7 @@ def _linux_arm64_generated_headers_impl(ctx):
         "all": _generated_header_family_info(
             arch = "arm64",
             cflags = generated_cflags,
-            content_id = ctx.attr.family_content_ids.get("all", ""),
+            content_id = ctx.attr.family_content_ids["all"],
             files = headers,
             include_dirs = include_dirs,
             name = "all",
@@ -3460,6 +3270,7 @@ linux_arm64_generated_headers = rule(
         "config": attr.label(providers = [LinuxConfigInfo], mandatory = True),
         "cpucaps": attr.label(allow_single_file = True, mandatory = True),
         "family_content_ids": attr.string_dict(
+            mandatory = True,
             doc = "Map of generated-header family names to full SHA-256 content identities.",
         ),
         "hyp_constants_c": attr.label(allow_single_file = True, mandatory = True),
@@ -3657,10 +3468,8 @@ linux_config = rule(
     doc = "Materializes Linux config files used by native compile and link actions.",
 )
 
-def _validate_content_id(content_id, what, allow_empty = False):
+def _validate_content_id(content_id, what):
     if not content_id:
-        if allow_empty:
-            return
         fail("%s must be a full lowercase SHA-256 content ID" % what)
     if len(content_id) != 64:
         fail("%s must be a full lowercase SHA-256 content ID, got %r" % (what, content_id))
@@ -3669,8 +3478,6 @@ def _validate_content_id(content_id, what, allow_empty = False):
             fail("%s must be a full lowercase SHA-256 content ID, got %r" % (what, content_id))
 
 def _validate_generated_header_family_content_ids(content_ids, expected_names, what):
-    if not content_ids:
-        return
     if sorted(content_ids.keys()) != sorted(expected_names):
         fail(
             "%s family_content_ids has families %s, expected %s" %
@@ -3770,8 +3577,7 @@ def _merge_compile_environment_generated_header_families(environment_id, family_
                 fail("compile environment %s has multiple vdsomunge tools" % environment_id)
             vdsomunge = info.vdsomunge
         include_dirs.extend(info.include_dirs)
-        if hasattr(info, "include_dir_anchors"):
-            include_dir_anchors.update(info.include_dir_anchors)
+        include_dir_anchors.update(info.include_dir_anchors)
     return LinuxGeneratedHeadersInfo(
         arch = first.arch,
         cflags = cflags,
@@ -3803,9 +3609,16 @@ def _linux_compile_environment_index_impl(ctx):
         ]
         if unknown_keys:
             fail("compile environment %s has unknown field(s): %s" % (environment_id, ", ".join(sorted(unknown_keys))))
-        payload_id = environment.get("config_payload")
-        family_ids = environment.get("generated_header_families", [])
-        abi = environment.get("abi")
+        missing_keys = [
+            key
+            for key in ["abi", "config_payload", "generated_header_families"]
+            if key not in environment
+        ]
+        if missing_keys:
+            fail("compile environment %s is missing field(s): %s" % (environment_id, ", ".join(missing_keys)))
+        payload_id = environment["config_payload"]
+        family_ids = environment["generated_header_families"]
+        abi = environment["abi"]
         if type(abi) != "string" or not abi:
             fail("compile environment %s abi must be a non-empty string" % environment_id)
         if abi != ctx.attr.expected_abi:
@@ -3822,7 +3635,6 @@ def _linux_compile_environment_index_impl(ctx):
             if type(family_id) != "string":
                 fail("compile environment %s generated-header family IDs must be strings" % environment_id)
         raw_environments[environment_id] = struct(
-            abi = abi,
             config_payload_id = payload_id,
             generated_header_family_ids = list(family_ids),
         )
@@ -3920,24 +3732,18 @@ def _linux_compile_environment_index_impl(ctx):
     for environment_id in sorted(raw_environments.keys()):
         raw = raw_environments[environment_id]
         environments[environment_id] = struct(
-            abi = raw.abi,
             config = config_payloads[raw.config_payload_id],
-            config_payload_id = raw.config_payload_id,
             generated_headers = _merge_compile_environment_generated_header_families(
                 environment_id,
                 raw.generated_header_family_ids,
                 generated_header_families,
             ),
-            generated_header_family_ids = raw.generated_header_family_ids,
         )
 
     return [
         DefaultInfo(files = depset(transitive = [info.files for info in config_payloads.values()])),
         LinuxCompileEnvironmentIndexInfo(
-            config_payloads = config_payloads,
             environments = environments,
-            expected_abi = ctx.attr.expected_abi,
-            generated_header_families = generated_header_families,
         ),
     ]
 
@@ -3948,9 +3754,11 @@ linux_compile_environment_index = rule(
             doc = "Linux ARCH used to derive compiler and assembler flags for materialized payloads.",
         ),
         "compile_environments": attr.string_dict(
+            mandatory = True,
             doc = "Map of full compile-environment SHA-256 IDs to JSON config-payload/generated-header-family references.",
         ),
         "config_payloads": attr.string_dict(
+            mandatory = True,
             doc = "Map of full config-payload SHA-256 IDs to canonical sorted .config text.",
         ),
         "generated_headers": attr.label_list(
@@ -4173,23 +3981,6 @@ def _linux_perl_runtime(ctx):
     )
 
 def _linux_compile_environment(ctx, rule_name):
-    has_index = bool(ctx.attr.compile_environment_index)
-    has_id = bool(ctx.attr.compile_environment_id)
-    if has_index != has_id:
-        fail(
-            "%s %s requires compile_environment_index and compile_environment_id together" %
-            (rule_name, ctx.label),
-        )
-    if not has_index:
-        return struct(
-            config = ctx.attr.config[LinuxConfigInfo] if ctx.attr.config else None,
-            generated_headers = ctx.attr.generated_headers[LinuxGeneratedHeadersInfo] if ctx.attr.generated_headers else None,
-        )
-    if ctx.attr.config or ctx.attr.generated_headers:
-        fail(
-            "%s %s compile environment attrs are mutually exclusive with legacy config/generated_headers" %
-            (rule_name, ctx.label),
-        )
     _validate_content_id(ctx.attr.compile_environment_id, "%s compile_environment_id" % rule_name)
     index = ctx.attr.compile_environment_index[LinuxCompileEnvironmentIndexInfo]
     if ctx.attr.compile_environment_id not in index.environments:
@@ -4200,29 +3991,14 @@ def _linux_compile_environment(ctx, rule_name):
     return index.environments[ctx.attr.compile_environment_id]
 
 def _linux_object_impl(ctx):
-    indexed = bool(ctx.attr.compile_environment_index)
-    _validate_content_id(ctx.attr.content_id, "linux_object content_id", allow_empty = not indexed)
+    _validate_content_id(ctx.attr.content_id, "linux_object content_id")
     source_selection = _linux_source_input_group(ctx, "linux_object")
-    if indexed != (source_selection != None):
-        fail(
-            "linux_object %s requires compile_environment_index and source_input_index together" %
-            ctx.label,
-        )
-    if source_selection != None:
-        if ctx.file.src or ctx.files.source_includes or ctx.attr.source_includes_complete:
-            fail("indexed linux_object %s cannot use legacy src/source_includes attrs" % ctx.label)
-        source_file = _linux_source_input_file(
-            ctx,
-            source_selection,
-            ctx.attr.source_input_file,
-            "linux_object %s" % ctx.label,
-        )
-    else:
-        if ctx.attr.source_input_file:
-            fail("linux_object %s source_input_file requires source_input_index" % ctx.label)
-        if not ctx.file.src:
-            fail("linux_object %s requires src or an indexed source file" % ctx.label)
-        source_file = ctx.file.src
+    source_file = _linux_source_input_file(
+        ctx,
+        source_selection,
+        ctx.attr.source_input_file,
+        "linux_object %s" % ctx.label,
+    )
     if ctx.attr.object in [
         "certs/blacklist_hashes.o",
         "certs/revocation_certificates.o",
@@ -4252,7 +4028,7 @@ def _linux_object_impl(ctx):
     compile_environment = _linux_compile_environment(ctx, "linux_object")
     config = compile_environment.config
     generated_headers = compile_environment.generated_headers
-    config_values = _make_config_values(config, ctx.attr.config_fragment)
+    config_values = config.config_flags
 
     out = ctx.actions.declare_file(ctx.label.name + ".o")
     cmd = ctx.actions.declare_file(ctx.label.name + ".cmd")
@@ -4475,7 +4251,7 @@ def _linux_object_impl(ctx):
         _add_directory_flags(
             args,
             dep_info.generated_include_dirs,
-            dep_info.generated_include_dir_anchors if hasattr(dep_info, "generated_include_dir_anchors") else {},
+            dep_info.generated_include_dir_anchors,
         )
         dep_generated_header_inputs.append(dep_info.generated_headers)
     add_directory_arg(args, directory_anchor(src), format = "-I%s")
@@ -4506,7 +4282,6 @@ def _linux_object_impl(ctx):
         direct_inputs.append(source_file)
     source_inputs = _linux_object_compile_source_tree_inputs(
         ctx,
-        src,
         direct = direct_inputs,
     )
     transitive_inputs = [cc_toolchain.all_files]
@@ -4569,15 +4344,12 @@ def _linux_object_impl(ctx):
 
     info = LinuxObjectInfo(
         content_id = ctx.attr.content_id,
-        config_fragment = dict(ctx.attr.config_fragment),
-        flags = list(ctx.attr.flags),
         mode = ctx.attr.mode,
         object = ctx.attr.object,
         output = out,
         generated_headers = depset(exported_generated_headers),
         generated_include_dir_anchors = _directory_anchors(exported_generated_headers, exported_generated_include_dirs),
         generated_include_dirs = exported_generated_include_dirs,
-        source = source_file.short_path,
     )
     return [
         DefaultInfo(files = depset([out, cmd])),
@@ -4593,50 +4365,38 @@ linux_object = rule(
     attrs = {
         "arch": attr.string(default = "x86"),
         "compile_environment_id": attr.string(
+            mandatory = True,
             doc = "Full SHA-256 ID selected from compile_environment_index.",
         ),
         "compile_environment_index": attr.label(
+            mandatory = True,
             providers = [LinuxCompileEnvironmentIndexInfo],
-            doc = "Content-addressed compile environment index, mutually exclusive with config/generated_headers.",
+            doc = "Content-addressed compile environment index.",
         ),
-        "config_fragment": attr.string_dict(),
-        "config": attr.label(providers = [LinuxConfigInfo]),
         "content_id": attr.string(
+            mandatory = True,
             doc = "Full SHA-256 content identity for this object action.",
         ),
         "deps": attr.label_list(providers = [LinuxObjectInfo]),
         "flags": attr.string_list(),
         "remove_flags": attr.string_list(),
-        "generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
         "include_dirs": attr.string_list(),
         "mode": attr.string(values = ["y", "m"], mandatory = True),
         "modname": attr.string(),
         "object": attr.string(mandatory = True),
-        "src": attr.label(
-            allow_single_file = True,
-            doc = "Legacy direct source file, mutually exclusive with source_input_index.",
-        ),
         "srcarch": attr.string(),
         "source_input_file": attr.int(
+            mandatory = True,
             doc = "One-based primary source file selected from source_input_index.",
         ),
         "source_input_group": attr.int(
+            mandatory = True,
             doc = "One-based exact input group selected from source_input_index.",
         ),
         "source_input_index": attr.label(
+            mandatory = True,
             providers = [LinuxSourceInputIndexInfo],
             doc = "Canonical exact source input index for content-addressed actions.",
-        ),
-        "source_includes": attr.label_list(
-            allow_files = True,
-            doc = "Exact recursive closure of all source-tree inputs read by this object compile.",
-        ),
-        "source_includes_complete": attr.bool(
-            doc = "Whether source_includes is complete for an indexed compile environment, including when it is empty.",
-        ),
-        "source_tree_info": attr.label(
-            providers = [LinuxSourceTreeInfo],
-            doc = "Shared Linux source tree provider required by source-backed objects.",
         ),
         "asn1_compiler": attr.label(
             cfg = "exec",
@@ -4738,11 +4498,11 @@ linux_object = rule(
     },
     fragments = ["cpp"],
     toolchains = use_cc_toolchain() + [_PERL_TOOLCHAIN],
-    doc = "Compiles one source-backed Linux object variant keyed by a reduced Kconfig fragment.",
+    doc = "Compiles one content-addressed, source-backed Linux object variant.",
 )
 
 def _linux_composite_object_impl(ctx):
-    _validate_content_id(ctx.attr.content_id, "linux_composite_object content_id", allow_empty = True)
+    _validate_content_id(ctx.attr.content_id, "linux_composite_object content_id")
     object_infos = [obj[LinuxObjectInfo] for obj in ctx.attr.objects]
     if not object_infos:
         fail("linux_composite_object %s requires at least one member object" % ctx.label)
@@ -4772,15 +4532,12 @@ def _linux_composite_object_impl(ctx):
     )
     info = LinuxObjectInfo(
         content_id = ctx.attr.content_id,
-        config_fragment = dict(ctx.attr.config_fragment),
-        flags = [],
         mode = ctx.attr.mode,
         object = ctx.attr.object,
         output = out,
         generated_headers = depset(transitive = [info.generated_headers for info in object_infos]),
         generated_include_dir_anchors = _merged_generated_include_dir_anchors(object_infos),
         generated_include_dirs = _unique_strings([include_dir for info in object_infos for include_dir in info.generated_include_dirs]),
-        source = "",
     )
     return [
         DefaultInfo(files = depset([out])),
@@ -4792,8 +4549,8 @@ linux_composite_object = rule(
     implementation = _linux_composite_object_impl,
     attrs = {
         "arch": attr.string(default = "x86"),
-        "config_fragment": attr.string_dict(),
         "content_id": attr.string(
+            mandatory = True,
             doc = "Full SHA-256 content identity for this composite object.",
         ),
         "mode": attr.string(values = ["y", "m"], mandatory = True),
@@ -4833,11 +4590,7 @@ def _linux_arm64_nvhe_linker_script(ctx, compiler, cc_toolchain, feature_configu
     args.add(out)
     source_selection = _linux_source_input_group(ctx, "linux_arm64_nvhe_object")
     direct_inputs = [src]
-    transitive_inputs = [cc_toolchain.all_files, config.files, generated_headers.files]
-    if source_selection != None:
-        transitive_inputs.append(source_selection.value.files)
-    else:
-        direct_inputs = _linux_source_tree_inputs(ctx, direct = direct_inputs + ctx.files.source_includes)
+    transitive_inputs = [cc_toolchain.all_files, config.files, generated_headers.files, source_selection.value.files]
     path_mapped_run(
         ctx.actions,
         executable = compiler,
@@ -4877,16 +4630,8 @@ def _linux_link_relocatable(ctx, linker, cc_toolchain, feature_configuration, ou
     return out
 
 def _linux_arm64_nvhe_object_impl(ctx):
-    indexed = bool(ctx.attr.compile_environment_index)
-    _validate_content_id(ctx.attr.content_id, "linux_arm64_nvhe_object content_id", allow_empty = not indexed)
-    source_selection = _linux_source_input_group(ctx, "linux_arm64_nvhe_object")
-    if indexed != (source_selection != None):
-        fail(
-            "linux_arm64_nvhe_object %s requires compile_environment_index and source_input_index together" %
-            ctx.label,
-        )
-    if source_selection != None and (ctx.files.source_includes or ctx.attr.source_includes_complete):
-        fail("indexed linux_arm64_nvhe_object %s cannot use legacy source_includes attrs" % ctx.label)
+    _validate_content_id(ctx.attr.content_id, "linux_arm64_nvhe_object content_id")
+    _linux_source_input_group(ctx, "linux_arm64_nvhe_object")
     object_infos = [obj[LinuxObjectInfo] for obj in ctx.attr.objects]
     if not object_infos:
         fail("linux_arm64_nvhe_object %s requires at least one member object" % ctx.label)
@@ -4988,15 +4733,12 @@ def _linux_arm64_nvhe_object_impl(ctx):
 
     info = LinuxObjectInfo(
         content_id = ctx.attr.content_id,
-        config_fragment = dict(ctx.attr.config_fragment),
-        flags = [],
         mode = ctx.attr.mode,
         object = ctx.attr.object,
         output = out,
         generated_headers = depset(transitive = [info.generated_headers for info in object_infos]),
         generated_include_dir_anchors = _merged_generated_include_dir_anchors(object_infos),
         generated_include_dirs = _unique_strings([include_dir for info in object_infos for include_dir in info.generated_include_dirs]),
-        source = "",
     )
     return [
         DefaultInfo(files = depset([out])),
@@ -5009,38 +4751,32 @@ linux_arm64_nvhe_object = rule(
     attrs = {
         "arch": attr.string(default = "arm64"),
         "compile_environment_id": attr.string(
+            mandatory = True,
             doc = "Full SHA-256 ID selected from compile_environment_index.",
         ),
         "compile_environment_index": attr.label(
+            mandatory = True,
             providers = [LinuxCompileEnvironmentIndexInfo],
             doc = "Content-addressed config and generated-header index.",
         ),
-        "config_fragment": attr.string_dict(),
-        "config": attr.label(providers = [LinuxConfigInfo]),
         "content_id": attr.string(
+            mandatory = True,
             doc = "Full SHA-256 content identity for this composite object.",
         ),
-        "generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
         "mode": attr.string(values = ["y", "m"], mandatory = True),
         "object": attr.string(mandatory = True),
-        "objects": attr.label_list(providers = [LinuxObjectInfo]),
+        "objects": attr.label_list(
+            mandatory = True,
+            providers = [LinuxObjectInfo],
+        ),
         "source_input_group": attr.int(
+            mandatory = True,
             doc = "One-based exact input group selected from source_input_index.",
         ),
         "source_input_index": attr.label(
+            mandatory = True,
             providers = [LinuxSourceInputIndexInfo],
             doc = "Canonical exact source input index for the nVHE linker-script action.",
-        ),
-        "source_includes": attr.label_list(
-            allow_files = True,
-            doc = "Exact recursive closure of source-tree inputs read by the nVHE linker-script action.",
-        ),
-        "source_includes_complete": attr.bool(
-            doc = "Whether source_includes is the complete nVHE linker-script source closure for an indexed compile environment.",
-        ),
-        "source_tree_info": attr.label(
-            providers = [LinuxSourceTreeInfo],
-            doc = "Shared Linux source tree provider.",
         ),
         "srcarch": attr.string(default = "arm64"),
         "_genhyprel": attr.label(
@@ -5165,11 +4901,11 @@ def _linux_compact_image_impl(ctx):
         info,
         _LinuxCompactImageShapeInfo(
             module_object_content_ids = [
-                obj.content_id if hasattr(obj, "content_id") else ""
+                obj.content_id
                 for obj in module_object_infos
             ],
             object_content_ids = [
-                obj.content_id if hasattr(obj, "content_id") else ""
+                obj.content_id
                 for obj in object_infos
             ],
         ),
@@ -5193,7 +4929,7 @@ def _compact_objects_by_content_id(objects, what, expected_mode):
     for obj in objects:
         if obj.mode != expected_mode:
             fail("%s object %s has mode %r, want %r" % (what, obj.object, obj.mode, expected_mode))
-        content_id = obj.content_id if hasattr(obj, "content_id") else ""
+        content_id = obj.content_id
         _validate_content_id(content_id, "%s object %s content_id" % (what, obj.object))
         if content_id in by_id:
             fail("%s repeats object content ID %s" % (what, content_id))
@@ -5243,7 +4979,7 @@ def _linux_compact_delta_image_impl(ctx):
     }
     for target in ctx.attr.add_objects:
         obj = target[LinuxObjectInfo]
-        content_id = obj.content_id if hasattr(obj, "content_id") else ""
+        content_id = obj.content_id
         _validate_content_id(content_id, "added object %s content_id" % target.label)
         if content_id in base_content_ids:
             fail("linux_compact_delta_image %s re-adds base content ID %s" % (ctx.label, content_id))

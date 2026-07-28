@@ -4,45 +4,38 @@ The `kconfig` and `kconfig_parse` binaries share an independent release stream
 because repository rules download them before the normal Bazel analysis phase.
 Generator releases are tagged as `kconfig-vX.Y.Z`.
 
-## Schema
+## Graph Format
 
-`-compact_schema` defaults to `v0.0.11` for direct tool invocations. Released
-rules use an explicitly pinned schema and generator version; repository
-generation does not negotiate or fall back between schemas.
+The generator emits one content-addressed graph for a base config and all
+overlays. The graph contains exact source-input digests, indexed config
+payloads and generated-header families, and canonical base/delta image rules.
+The rules repository pins the generator release that defines this format; the
+CLI and repository rule do not negotiate schemas or retain older emitters.
 
-Schema `v0.0.12` is opt-in. It emits classified source-tree inputs, exact
-source-like include closures, module object roots, and fail-closed source
-actions. Rust-owned objects are excluded from the ordinary object graph.
-`-rust_profile_out` additionally emits the source-derived
-`linux-rust-profile-v1` JSON profile and is valid with compact schema `v0.0.12`
-or `v0.0.13`.
-
-Generator `v0.0.13` keeps schema `v0.0.12` and adds config-sensitive
-KASAN/KCSAN/UBSAN instrumentation flags, including Kbuild per-object and
-per-directory overrides.
-
-Generator `v0.0.15` introduces schema `v0.0.13`. It emits one
-content-addressed graph for a base config and all overlays, exact source-input
-digests, indexed config payloads and generated-header families, and canonical
-base/delta image rules. The rules repository requires this schema and has no
-per-config graph fallback.
+The same binary emits the source-derived `linux-rust-profile-v1` JSON profile
+and config-sensitive KASAN/KCSAN/UBSAN instrumentation flags, including Kbuild
+per-object and per-directory overrides. Rust-owned objects remain excluded
+from the ordinary object graph.
 
 ## Prepare
 
 1. Run `go test ./internal/kconfig ./internal/cmd/kconfig
    ./internal/cmd/kconfig_parse ./internal/cmd/compact_metadata_check`.
 2. Run the Bazel generator, compact-golden, and prebuilt archive tests.
-3. Exercise the released schema against maintained Linux 6.12 and 6.18 source
-   trees with `CONFIG_RUST=y`. Verify that the supported Rust layouts produce
-   valid profiles and that a modified but compatible source tree is accepted.
-4. Exercise v0.0.13 with the base, debug/BTF, and compression overlays in one
-   invocation. Verify that identical object actions and generated-header
-   family identities have one content target, changed actions have distinct targets,
-   and unresolved potentially active includes fail closed.
+3. Exercise the released generator against maintained Linux 6.12 and 6.18
+   source trees with `CONFIG_RUST=y`. Verify that the supported Rust layouts
+   produce valid profiles and that a modified but compatible source tree is
+   accepted.
+4. Exercise the base, debug/BTF, and compression overlays in one invocation.
+   Verify that identical object actions and generated-header family identities
+   have one content target, changed actions have distinct targets, and
+   unresolved potentially active includes fail closed.
 5. Build all public kernel outputs from a clean repository graph and compare
    them with the previous release. For the maintained four-config x86 fixture,
    require 4,711 object memberships, 3,519 selected variants, and exactly
-   3,519 `LinuxObjectCompile` actions in the Bazel BEP.
+   3,519 `LinuxObjectCompile` actions in the Bazel BEP. Require the 23
+   generated-header families and their producer actions to retain the expected
+   base/overlay sharing partitions.
 6. Exercise C sanitizer configs against maintained Linux 6.12 and 6.18 source
    trees. Verify KASAN/KCSAN/UBSAN object opt-outs, test-object opt-ins, arm64
    nVHE defaults, and integer-wrap inputs.
@@ -70,5 +63,5 @@ arm64, plus `SHA256SUMS` and `kconfig_tool_releases.metadata`.
 
 Once all six assets are available, update the rules repository's
 `KCONFIG_TOOL_VERSION` and integrity table in a separate change. The consumer
-must use `-compact_schema=v0.0.13` and CI must verify that actual Bazel compile
-action counts match the graph's selected content targets.
+must use the release's only graph format, and CI must verify that actual Bazel
+compile action counts match the graph's selected content targets.

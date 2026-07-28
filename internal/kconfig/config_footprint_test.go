@@ -56,7 +56,7 @@ struct foo;
 
 	s := newConfigSourceScanner(CompactMetadataOptions{SourceRoot: root, Srcarch: "x86"})
 	got := s.refsForSource("drivers/foo.c", nil)
-	want := []string{"CONFIG_BAR_ANGLED", "CONFIG_DEEP", "CONFIG_FOO_DIRECT", "CONFIG_FOO_HEADER"}
+	want := []string{"CONFIG_DEEP", "CONFIG_FOO_DIRECT", "CONFIG_FOO_HEADER"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("refsForSource() = %v, want %v", got, want)
 	}
@@ -126,60 +126,37 @@ func TestIncludeDirsFromFlags(t *testing.T) {
 	}
 }
 
-func TestConfigSourceScannerV012PreservesLegacyCommentAndIncludeBehavior(t *testing.T) {
-	root := t.TempDir()
-	mustWriteSource(t, root, "drivers/legacy.c", "#if 0\n#include \"dead.inc\"\n#endif\n/* CONFIG_COMMENT_ONLY */\n")
-	mustWriteSource(t, root, "drivers/dead.inc", "#ifdef CONFIG_DEAD_INCLUDE\n#endif\n")
-
-	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV012,
-		SourceRoot: root,
-	})
-	closure, err := scanner.closureForSource("drivers/legacy.c", nil)
-	if err != nil {
-		t.Fatalf("closureForSource() failed: %v", err)
-	}
-	if want := []string{"CONFIG_COMMENT_ONLY", "CONFIG_DEAD_INCLUDE"}; !reflect.DeepEqual(closure.refs, want) {
-		t.Fatalf("closureForSource().refs = %v, want %v", closure.refs, want)
-	}
-	if want := []string{"drivers/dead.inc"}; !reflect.DeepEqual(closure.sourceIncludes, want) {
-		t.Fatalf("closureForSource().sourceIncludes = %v, want %v", closure.sourceIncludes, want)
-	}
-}
-
-func TestConfigSourceScannerV013StripsCommentsBeforeDirectives(t *testing.T) {
+func TestConfigSourceScannerContentGraphStripsCommentsBeforeDirectives(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/comments.c", "/*\n#include COMMENT_ONLY\n*/\n#include /* separator */ \"literal.h\"\n")
 	mustWriteSource(t, root, "drivers/literal.h", "#define LITERAL 1\n")
 
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
-	closure, err := scanner.exactClosureForSource("drivers/comments.c", nil)
+	closure, err := scanner.closureForSource("drivers/comments.c", nil)
 	if err != nil {
-		t.Fatalf("exactClosureForSource() failed: %v", err)
+		t.Fatalf("closureForSource() failed: %v", err)
 	}
 	got := make([]string, 0, len(closure.sourceInputs))
 	for _, input := range closure.sourceInputs {
 		got = append(got, input.Path)
 	}
 	if want := []string{"drivers/comments.c", "drivers/literal.h"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("exactClosureForSource().sourceInputs paths = %v, want %v", got, want)
+		t.Fatalf("closureForSource().sourceInputs paths = %v, want %v", got, want)
 	}
 }
 
-func TestConfigSourceScannerV013SplicesPreprocessorDirectives(t *testing.T) {
+func TestConfigSourceScannerContentGraphSplicesPreprocessorDirectives(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/spliced.c", "#inc\\\nlude HEADER_NAME\n")
 
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
-	_, err := scanner.exactClosureForSource("drivers/spliced.c", nil)
+	_, err := scanner.closureForSource("drivers/spliced.c", nil)
 	if err == nil {
-		t.Fatal("exactClosureForSource() succeeded, want a nonliteral include error")
+		t.Fatal("closureForSource() succeeded, want a nonliteral include error")
 	}
 	for _, want := range []string{
 		"drivers/spliced.c:1",
@@ -187,12 +164,12 @@ func TestConfigSourceScannerV013SplicesPreprocessorDirectives(t *testing.T) {
 		"HEADER_NAME",
 	} {
 		if !strings.Contains(err.Error(), want) {
-			t.Errorf("exactClosureForSource() error = %q, want substring %q", err, want)
+			t.Errorf("closureForSource() error = %q, want substring %q", err, want)
 		}
 	}
 }
 
-func TestConfigSourceScannerV013FailsClosedOnContextCarryingIncludeMacro(t *testing.T) {
+func TestConfigSourceScannerContentGraphFailsClosedOnContextCarryingIncludeMacro(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/block/drbd/drbd.c", "#include <linux/drbd_genl_api.h>\n")
 	mustWriteSource(t, root, "include/linux/drbd_genl_api.h", `
@@ -203,10 +180,9 @@ func TestConfigSourceScannerV013FailsClosedOnContextCarryingIncludeMacro(t *test
 	mustWriteSource(t, root, "include/linux/drbd_genl.h", "#define DRBD_GENL 1\n")
 
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
-	_, err := scanner.exactClosureForSource("drivers/block/drbd/drbd.c", nil)
+	_, err := scanner.closureForSource("drivers/block/drbd/drbd.c", nil)
 	if err == nil {
 		t.Fatal("context-carrying include macro scan succeeded without macro-state modeling")
 	}
@@ -221,7 +197,7 @@ func TestConfigSourceScannerV013FailsClosedOnContextCarryingIncludeMacro(t *test
 	}
 }
 
-func TestConfigSourceScannerV013ModelsLinuxLibfdtEnvironmentGuard(t *testing.T) {
+func TestConfigSourceScannerContentGraphModelsLinuxLibfdtEnvironmentGuard(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "kernel/user.c", "#include <linux/libfdt.h>\n")
 	mustWriteSource(t, root, "include/linux/libfdt.h", `
@@ -246,10 +222,9 @@ func TestConfigSourceScannerV013ModelsLinuxLibfdtEnvironmentGuard(t *testing.T) 
 #endif
 `)
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
-	closure, err := scanner.exactClosureForSource("kernel/user.c", nil)
+	closure, err := scanner.closureForSource("kernel/user.c", nil)
 	if err != nil {
 		t.Fatalf("Linux libfdt wrapper scan failed: %v", err)
 	}
@@ -276,7 +251,7 @@ func TestConfigSourceScannerV013ModelsLinuxLibfdtEnvironmentGuard(t *testing.T) 
 #include <libfdt.h>
 #define LIBFDT_IMPLEMENTATION 1
 `)
-	closure, err = scanner.exactClosureForSource(
+	closure, err = scanner.closureForSource(
 		"lib/fdt.c",
 		[]string{"scripts/dtc/libfdt"},
 	)
@@ -300,18 +275,17 @@ func TestConfigSourceScannerV013ModelsLinuxLibfdtEnvironmentGuard(t *testing.T) 
 	mustWriteSource(t, root, "kernel/direct.c", `
 #include "../scripts/dtc/libfdt/libfdt.h"
 `)
-	_, err = scanner.exactClosureForSource("kernel/direct.c", nil)
+	_, err = scanner.closureForSource("kernel/direct.c", nil)
 	if err == nil || !strings.Contains(err.Error(), "stdlib.h") {
 		t.Fatalf("direct scripts libfdt environment error = %v, want unresolved stdlib.h", err)
 	}
 }
 
-func TestConfigSourceScannerV013ConfigGatesNonliteralInclude(t *testing.T) {
+func TestConfigSourceScannerContentGraphConfigGatesNonliteralInclude(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/config-gated.c", "#ifdef CONFIG_CUSTOM\n#include CONFIG_CUSTOM_FILE\n#endif\n")
 
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
 	off := &ResolvedConfig{
@@ -345,7 +319,7 @@ func TestConfigSourceScannerV013ConfigGatesNonliteralInclude(t *testing.T) {
 	}
 }
 
-func TestConfigSourceScannerV013CachesPreprocessingAcrossConfigs(t *testing.T) {
+func TestConfigSourceScannerContentGraphCachesPreprocessingAcrossConfigs(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/config-gated.c", `#ifdef CONFIG_CUSTOM
 #include "enabled.h"
@@ -357,7 +331,6 @@ func TestConfigSourceScannerV013CachesPreprocessingAcrossConfigs(t *testing.T) {
 	mustWriteSource(t, root, "drivers/disabled.h", "#define DISABLED 1\n")
 
 	opts := CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	}
 	sourceCache := newCompactSourceCache()
@@ -409,7 +382,6 @@ func TestConfigSourceScannerV013CachesPreprocessingAcrossConfigs(t *testing.T) {
 
 func TestConfigSourceScannerCachesMissingTreePaths(t *testing.T) {
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: t.TempDir(),
 	})
 	for range 2 {
@@ -422,7 +394,7 @@ func TestConfigSourceScannerCachesMissingTreePaths(t *testing.T) {
 	}
 }
 
-func TestConfigSourceScannerV013SeparatesVirtualTreePaths(t *testing.T) {
+func TestConfigSourceScannerContentGraphSeparatesVirtualTreePaths(t *testing.T) {
 	root := t.TempDir()
 	mapped := t.TempDir()
 	mustWriteSource(t, mapped, "alias.h", `#if __has_include("relative.h")
@@ -432,7 +404,6 @@ func TestConfigSourceScannerV013SeparatesVirtualTreePaths(t *testing.T) {
 	mustWriteSource(t, root, "one/relative.h", "#define RELATIVE 1\n")
 
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 		SourceRoots: map[string]string{
 			"one": mapped,
@@ -446,16 +417,16 @@ func TestConfigSourceScannerV013SeparatesVirtualTreePaths(t *testing.T) {
 		{source: "one/alias.h", want: []string{"one/alias.h", "one/relative.h"}},
 		{source: "two/alias.h", want: []string{"two/alias.h"}},
 	} {
-		closure, err := scanner.exactClosureForSource(test.source, nil)
+		closure, err := scanner.closureForSource(test.source, nil)
 		if err != nil {
-			t.Fatalf("exactClosureForSource(%q) failed: %v", test.source, err)
+			t.Fatalf("closureForSource(%q) failed: %v", test.source, err)
 		}
 		var paths []string
 		for _, input := range closure.sourceInputs {
 			paths = append(paths, input.Path)
 		}
 		if !reflect.DeepEqual(paths, test.want) {
-			t.Fatalf("exactClosureForSource(%q) inputs = %v, want %v", test.source, paths, test.want)
+			t.Fatalf("closureForSource(%q) inputs = %v, want %v", test.source, paths, test.want)
 		}
 	}
 
@@ -464,7 +435,7 @@ func TestConfigSourceScannerV013SeparatesVirtualTreePaths(t *testing.T) {
 	}
 }
 
-func TestConfigSourceScannerV013ScansDirectoryFromSourceRootsOnly(t *testing.T) {
+func TestConfigSourceScannerContentGraphScansDirectoryFromSourceRootsOnly(t *testing.T) {
 	mapped := t.TempDir()
 	mustWriteSource(t, mapped, "payload/first.c", `
 #include "local.h"
@@ -474,14 +445,13 @@ func TestConfigSourceScannerV013ScansDirectoryFromSourceRootsOnly(t *testing.T) 
 	mustWriteSource(t, mapped, "payload/local.h", "#define MAPPED_LOCAL 1\n")
 	mustWriteSource(t, mapped, "payload/second.S", "#define MAPPED_ASSEMBLY 1\n")
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema: CompactSchemaV013,
 		SourceRoots: map[string]string{
 			"virtual": mapped,
 		},
 	})
-	closure, err := scanner.exactClosureForSourceDir("virtual/payload")
+	closure, err := scanner.closureForSourceDir("virtual/payload")
 	if err != nil {
-		t.Fatalf("exactClosureForSourceDir() failed: %v", err)
+		t.Fatalf("closureForSourceDir() failed: %v", err)
 	}
 	if want := []string{"CONFIG_MAPPED_DIRECTORY"}; !reflect.DeepEqual(closure.refs, want) {
 		t.Fatalf("mapped directory refs = %v, want %v", closure.refs, want)
@@ -500,7 +470,7 @@ func TestConfigSourceScannerV013ScansDirectoryFromSourceRootsOnly(t *testing.T) 
 	}
 }
 
-func TestConfigSourceScannerV013ResolvesConfigStringInclude(t *testing.T) {
+func TestConfigSourceScannerContentGraphResolvesConfigStringInclude(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/config-include.c", "#include CONFIG_CUSTOM_FILE\n")
 	mustWriteSource(t, root, "drivers/custom.h", "#define CUSTOM 1\n")
@@ -509,7 +479,6 @@ func TestConfigSourceScannerV013ResolvesConfigStringInclude(t *testing.T) {
 		Written:   map[string]bool{"CONFIG_CUSTOM_FILE": true},
 	}
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
 	closure, err := scanner.closureForSourceConfig("drivers/config-include.c", nil, config)
@@ -525,16 +494,15 @@ func TestConfigSourceScannerV013ResolvesConfigStringInclude(t *testing.T) {
 	}
 }
 
-func TestConfigSourceScannerV013RejectsUnresolvedLiteralInclude(t *testing.T) {
+func TestConfigSourceScannerContentGraphRejectsUnresolvedLiteralInclude(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/missing.c", "#include \"missing.h\"\n")
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
-	_, err := scanner.exactClosureForSource("drivers/missing.c", nil)
+	_, err := scanner.closureForSource("drivers/missing.c", nil)
 	if err == nil {
-		t.Fatal("exactClosureForSource() accepted an unresolved literal include")
+		t.Fatal("closureForSource() accepted an unresolved literal include")
 	}
 	for _, want := range []string{
 		`drivers/missing.c:1`,
@@ -542,22 +510,21 @@ func TestConfigSourceScannerV013RejectsUnresolvedLiteralInclude(t *testing.T) {
 		`"missing.h"`,
 	} {
 		if !strings.Contains(err.Error(), want) {
-			t.Errorf("exactClosureForSource() error = %q, want substring %q", err, want)
+			t.Errorf("closureForSource() error = %q, want substring %q", err, want)
 		}
 	}
 }
 
-func TestConfigSourceScannerV013ModelsTraceTemplateReinclude(t *testing.T) {
+func TestConfigSourceScannerContentGraphModelsTraceTemplateReinclude(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/trace.h", "#include <trace/define_trace.h>\n")
 	mustWriteSource(t, root, "include/trace/define_trace.h", "#include TRACE_INCLUDE(TRACE_INCLUDE_FILE)\n")
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
-	closure, err := scanner.exactClosureForSource("drivers/trace.h", nil)
+	closure, err := scanner.closureForSource("drivers/trace.h", nil)
 	if err != nil {
-		t.Fatalf("exactClosureForSource() failed on modeled trace reinclude: %v", err)
+		t.Fatalf("closureForSource() failed on modeled trace reinclude: %v", err)
 	}
 	var paths []string
 	for _, input := range closure.sourceInputs {
@@ -581,23 +548,22 @@ func TestPreprocessorSymbolDefinedDistinguishesModules(t *testing.T) {
 	}
 }
 
-func TestConfigSourceScannerV013KnowsKernelActionMacro(t *testing.T) {
+func TestConfigSourceScannerContentGraphKnowsKernelActionMacro(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "include/uapi/linux/if.h", "#ifndef __KERNEL__\n#include <sys/socket.h>\n#endif\n")
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
-	closure, err := scanner.exactClosureForSource("include/uapi/linux/if.h", nil)
+	closure, err := scanner.closureForSource("include/uapi/linux/if.h", nil)
 	if err != nil {
-		t.Fatalf("exactClosureForSource() followed userspace-only libc include: %v", err)
+		t.Fatalf("closureForSource() followed userspace-only libc include: %v", err)
 	}
 	if got := len(closure.sourceInputs); got != 1 || closure.sourceInputs[0].Path != "include/uapi/linux/if.h" {
 		t.Fatalf("kernel macro source inputs = %v, want only the UAPI header", closure.sourceInputs)
 	}
 }
 
-func TestConfigSourceScannerV013CollectsOnlyPotentiallyActiveRefs(t *testing.T) {
+func TestConfigSourceScannerContentGraphCollectsOnlyPotentiallyActiveRefs(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/active.c", `
 #if defined(CONFIG_GATE)
@@ -617,7 +583,6 @@ int nested_dead;
 		Written:   map[string]bool{"CONFIG_GATE": true},
 	}
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
 	closure, err := scanner.closureForSourceConfig("drivers/active.c", nil, config)
@@ -630,7 +595,7 @@ int nested_dead;
 	}
 }
 
-func TestConfigSourceScannerV013EvaluatesKernelConfigPredicates(t *testing.T) {
+func TestConfigSourceScannerContentGraphEvaluatesKernelConfigPredicates(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/predicates.c", `
 #if IS_BUILTIN(CONFIG_DRIVER)
@@ -657,7 +622,6 @@ func TestConfigSourceScannerV013EvaluatesKernelConfigPredicates(t *testing.T) {
 		mustWriteSource(t, root, "drivers/"+header, "#define TEST 1\n")
 	}
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
 	moduleConfig := &ResolvedConfig{
@@ -717,7 +681,7 @@ func TestConfigSourceScannerV013EvaluatesKernelConfigPredicates(t *testing.T) {
 	}
 }
 
-func TestConfigSourceScannerV013UsesCompilerIncludeOrder(t *testing.T) {
+func TestConfigSourceScannerContentGraphUsesCompilerIncludeOrder(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/main.c", `
 #include "duplicate.h"
@@ -728,7 +692,6 @@ func TestConfigSourceScannerV013UsesCompilerIncludeOrder(t *testing.T) {
 	mustWriteSource(t, root, "include/duplicate.h", "#define GENERIC_DUPLICATE 1\n")
 
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 		Srcarch:    "x86",
 	})
@@ -741,7 +704,7 @@ func TestConfigSourceScannerV013UsesCompilerIncludeOrder(t *testing.T) {
 		sourceScanKernel,
 	)
 	if err != nil {
-		t.Fatalf("exactClosureForSource() failed: %v", err)
+		t.Fatalf("closureForSource() failed: %v", err)
 	}
 	var paths []string
 	for _, input := range closure.sourceInputs {
@@ -756,7 +719,7 @@ func TestConfigSourceScannerV013UsesCompilerIncludeOrder(t *testing.T) {
 	}
 }
 
-func TestConfigSourceScannerV013PreservesActionIncludeClassesAndOrder(t *testing.T) {
+func TestConfigSourceScannerContentGraphPreservesActionIncludeClassesAndOrder(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/foo/main.c", `
 #include <wrapper.h>
@@ -776,7 +739,6 @@ func TestConfigSourceScannerV013PreservesActionIncludeClassesAndOrder(t *testing
 	mustWriteSource(t, root, "system/system-only.h", "#define SYSTEM 1\n")
 
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 		Srcarch:    "x86",
 	})
@@ -820,20 +782,19 @@ func TestConfigSourceScannerV013PreservesActionIncludeClassesAndOrder(t *testing
 	}
 }
 
-func TestConfigSourceScannerV013ResolvesIncludeNextAfterCurrentRoot(t *testing.T) {
+func TestConfigSourceScannerContentGraphResolvesIncludeNextAfterCurrentRoot(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/main.c", "#include <wrapper.h>\n")
 	mustWriteSource(t, root, "arch/x86/include/wrapper.h", "#include_next <wrapper.h>\n")
 	mustWriteSource(t, root, "include/wrapper.h", "#define GENERIC_WRAPPER 1\n")
 
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 		Srcarch:    "x86",
 	})
-	closure, err := scanner.exactClosureForSource("drivers/main.c", nil)
+	closure, err := scanner.closureForSource("drivers/main.c", nil)
 	if err != nil {
-		t.Fatalf("exactClosureForSource() failed: %v", err)
+		t.Fatalf("closureForSource() failed: %v", err)
 	}
 	var paths []string
 	for _, input := range closure.sourceInputs {
@@ -849,7 +810,7 @@ func TestConfigSourceScannerV013ResolvesIncludeNextAfterCurrentRoot(t *testing.T
 	}
 }
 
-func TestConfigSourceScannerV013EvaluatesLiteralHasInclude(t *testing.T) {
+func TestConfigSourceScannerContentGraphEvaluatesLiteralHasInclude(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "security/landlock/errata.h", `
 #if __has_include("errata/present.h")
@@ -867,12 +828,11 @@ func TestConfigSourceScannerV013EvaluatesLiteralHasInclude(t *testing.T) {
 	mustWriteSource(t, root, "security/landlock/errata/fallback.h", "#define FALLBACK 1\n")
 
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 	})
-	closure, err := scanner.exactClosureForSource("security/landlock/errata.h", nil)
+	closure, err := scanner.closureForSource("security/landlock/errata.h", nil)
 	if err != nil {
-		t.Fatalf("exactClosureForSource() failed: %v", err)
+		t.Fatalf("closureForSource() failed: %v", err)
 	}
 	var paths []string
 	for _, input := range closure.sourceInputs {
@@ -888,7 +848,7 @@ func TestConfigSourceScannerV013EvaluatesLiteralHasInclude(t *testing.T) {
 	}
 }
 
-func TestConfigSourceScannerV013ModelsClangLinuxPredefines(t *testing.T) {
+func TestConfigSourceScannerContentGraphModelsClangLinuxPredefines(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "include/acpi/platform/acenv.h", `
 #if defined(_MSC_VER)
@@ -919,13 +879,12 @@ func TestConfigSourceScannerV013ModelsClangLinuxPredefines(t *testing.T) {
 	mustWriteSource(t, root, "include/acpi/platform/aclinux.h", "#define ACPI_LINUX 1\n")
 
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 		Srcarch:    "x86",
 	})
-	closure, err := scanner.exactClosureForSource("include/acpi/platform/acenv.h", nil)
+	closure, err := scanner.closureForSource("include/acpi/platform/acenv.h", nil)
 	if err != nil {
-		t.Fatalf("exactClosureForSource() followed an inactive compiler branch: %v", err)
+		t.Fatalf("closureForSource() followed an inactive compiler branch: %v", err)
 	}
 	var paths []string
 	for _, input := range closure.sourceInputs {
@@ -941,7 +900,7 @@ func TestConfigSourceScannerV013ModelsClangLinuxPredefines(t *testing.T) {
 	}
 }
 
-func TestConfigSourceScannerV013TracksAssemblyPredefine(t *testing.T) {
+func TestConfigSourceScannerContentGraphTracksAssemblyPredefine(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "arch/x86/entry.S", `
 #ifdef __ASSEMBLY__
@@ -955,13 +914,12 @@ func TestConfigSourceScannerV013TracksAssemblyPredefine(t *testing.T) {
 `)
 	mustWriteSource(t, root, "arch/x86/assembly.h", "#define ASSEMBLY 1\n")
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 		Srcarch:    "x86",
 	})
-	closure, err := scanner.exactClosureForSource("arch/x86/entry.S", nil)
+	closure, err := scanner.closureForSource("arch/x86/entry.S", nil)
 	if err != nil {
-		t.Fatalf("exactClosureForSource() followed a C-only assembly branch: %v", err)
+		t.Fatalf("closureForSource() followed a C-only assembly branch: %v", err)
 	}
 	var paths []string
 	for _, input := range closure.sourceInputs {
@@ -1026,7 +984,6 @@ func TestGeneratedHeaderFootprintArm64BindsDirectInputsAndConfig(t *testing.T) {
 	generate := func() (map[string]string, []CompactSourceInput, string) {
 		t.Helper()
 		opts := CompactMetadataOptions{
-			Schema:     CompactSchemaV013,
 			SourceRoot: root,
 			Srcarch:    "arm64",
 		}
@@ -1135,7 +1092,6 @@ func TestGeneratedHeaderFootprintArm64HypConstantsUsesProducerIncludeRoot(t *tes
 		Written:   map[string]bool{"CONFIG_KVM": true},
 	}
 	opts := CompactMetadataOptions{
-		Schema:                CompactSchemaV013,
 		SourceRoot:            root,
 		Srcarch:               "arm64",
 		CompileEnvironmentABI: "test-abi",
@@ -1169,7 +1125,6 @@ func TestGeneratedHeaderCompilerVersionFeatureIncludesAreConfigExact(t *testing.
 #endif
 `)
 	opts := CompactMetadataOptions{
-		Schema:                CompactSchemaV013,
 		SourceRoot:            root,
 		Srcarch:               "x86",
 		CompileEnvironmentABI: "test-abi",
@@ -1310,7 +1265,6 @@ func TestGeneratedHeaderOffsetsBindForcedHeadersAndProducerABI(t *testing.T) {
 	generate := func(abi string) map[string]CompactGeneratedHeaderFamily {
 		t.Helper()
 		opts := CompactMetadataOptions{
-			Schema:                CompactSchemaV013,
 			SourceRoot:            root,
 			Srcarch:               "x86",
 			CompileEnvironmentABI: abi,
@@ -1358,10 +1312,10 @@ func TestGeneratedHeaderOffsetsBindForcedHeadersAndProducerABI(t *testing.T) {
 			"include/linux/compiler_types.h",
 			"include/linux/forced-detail.h",
 		} {
-			if !slices.ContainsFunc(family.SourceInputs, func(input CompactSourceInput) bool {
+			if !slices.ContainsFunc(family.sourceInputs, func(input CompactSourceInput) bool {
 				return input.Path == path
 			}) {
-				t.Errorf("%s source inputs missing %q: %#v", name, path, family.SourceInputs)
+				t.Errorf("%s source inputs missing %q: %#v", name, path, family.sourceInputs)
 			}
 		}
 	}
@@ -1406,7 +1360,6 @@ func TestGeneratedHeaderVersionFamiliesUseDeclaredInputsOnly(t *testing.T) {
 			},
 		}
 		opts := CompactMetadataOptions{
-			Schema:                CompactSchemaV013,
 			SourceRoot:            root,
 			Srcarch:               "x86",
 			CompileEnvironmentABI: "test-abi",
@@ -1490,7 +1443,6 @@ func TestExactClosureTracksOnlyActiveGeneratedIncludes(t *testing.T) {
 `)
 	mustWriteSource(t, root, "include/asm-generic/unistd.h", "#define GENERIC_UNISTD 1\n")
 	scanner := newConfigSourceScanner(CompactMetadataOptions{
-		Schema:     CompactSchemaV013,
 		SourceRoot: root,
 		Srcarch:    "x86",
 	})
@@ -1533,7 +1485,6 @@ func TestGeneratedHeaderFamilyDependenciesFollowActiveIncludes(t *testing.T) {
 #include <generated/bounds.h>
 `)
 	opts := CompactMetadataOptions{
-		Schema:                CompactSchemaV013,
 		SourceRoot:            root,
 		Srcarch:               "x86",
 		CompileEnvironmentABI: "test-abi",
@@ -1634,7 +1585,7 @@ func TestForcedSourceInputs(t *testing.T) {
 	}
 }
 
-func TestConfigSourceScannerV013TracksTransitiveInputDigests(t *testing.T) {
+func TestConfigSourceScannerContentGraphTracksTransitiveInputDigests(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/root.c", "#include \"nested.h\"\n")
 	mustWriteSource(t, root, "drivers/nested.h", "#include \"deep.inc\"\n")
@@ -1643,12 +1594,11 @@ func TestConfigSourceScannerV013TracksTransitiveInputDigests(t *testing.T) {
 	scan := func() sourceClosure {
 		t.Helper()
 		scanner := newConfigSourceScanner(CompactMetadataOptions{
-			Schema:     CompactSchemaV013,
 			SourceRoot: root,
 		})
-		closure, err := scanner.exactClosureForSource("drivers/root.c", nil)
+		closure, err := scanner.closureForSource("drivers/root.c", nil)
 		if err != nil {
-			t.Fatalf("exactClosureForSource() failed: %v", err)
+			t.Fatalf("closureForSource() failed: %v", err)
 		}
 		return closure
 	}
@@ -1667,7 +1617,7 @@ func TestConfigSourceScannerV013TracksTransitiveInputDigests(t *testing.T) {
 		paths = append(paths, input.Path)
 	}
 	if want := []string{"drivers/deep.inc", "drivers/nested.h", "drivers/root.c"}; !reflect.DeepEqual(paths, want) {
-		t.Fatalf("exactClosureForSource().sourceInputs paths = %v, want %v", paths, want)
+		t.Fatalf("closureForSource().sourceInputs paths = %v, want %v", paths, want)
 	}
 	before := digests(beforeClosure)
 	for _, path := range []string{"drivers/deep.inc", "drivers/nested.h", "drivers/root.c"} {
@@ -1689,7 +1639,7 @@ func TestConfigSourceScannerV013TracksTransitiveInputDigests(t *testing.T) {
 }
 
 func TestConfigSourceScannerCachesFullConfigID(t *testing.T) {
-	scanner := newConfigSourceScanner(CompactMetadataOptions{Schema: CompactSchemaV013})
+	scanner := newConfigSourceScanner(CompactMetadataOptions{})
 	config := &ResolvedConfig{
 		Effective: map[string]string{"CONFIG_ONE": "y"},
 		Written:   map[string]bool{"CONFIG_ONE": true},
@@ -1710,12 +1660,12 @@ func TestCompactFootprintSplitsOnSourceLevelConfig(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "init.c", "#ifdef CONFIG_DEBUG\nint debug;\n#endif\n")
 
-	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{
+	metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{
 		{Name: "off", Flags: map[string]string{"CONFIG_NET": "y"}},
 		{Name: "on", Flags: map[string]string{"CONFIG_NET": "y", "CONFIG_DEBUG": "y"}},
-	}, CompactMetadataOptions{Schema: CompactSchemaV012, SourceRoot: root, Srcarch: "x86"})
+	}, CompactMetadataOptions{SourceRoot: root, Srcarch: "x86"})
 	if err != nil {
-		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
 	}
 
 	off := objectTarget(metadata, configByName(metadata, "off"), "init.o")
@@ -1726,10 +1676,10 @@ func TestCompactFootprintSplitsOnSourceLevelConfig(t *testing.T) {
 	if off == on {
 		t.Fatalf("source-level CONFIG_DEBUG did not split init.o: both = %q", off)
 	}
-	if got := variantByTarget(metadata, on).ConfigFragment["CONFIG_DEBUG"]; got != "y" {
+	if got := variantByTarget(metadata, on).configFragment["CONFIG_DEBUG"]; got != "y" {
 		t.Fatalf("init.o (on) fragment CONFIG_DEBUG = %q, want y", got)
 	}
-	if got := variantByTarget(metadata, off).ConfigFragment["CONFIG_DEBUG"]; got != "n" {
+	if got := variantByTarget(metadata, off).configFragment["CONFIG_DEBUG"]; got != "n" {
 		t.Fatalf("init.o (off) fragment CONFIG_DEBUG = %q, want n", got)
 	}
 }
@@ -1740,12 +1690,12 @@ func TestCompactFootprintSharesWhenSourceConfigAgrees(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "init.c", "#ifdef CONFIG_DEBUG\nint debug;\n#endif\n")
 
-	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{
+	metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{
 		{Name: "a", Flags: map[string]string{"CONFIG_NET": "y"}},
 		{Name: "b", Flags: map[string]string{"CONFIG_NET": "y", "CONFIG_EFI_STUB": "y"}},
-	}, CompactMetadataOptions{Schema: CompactSchemaV012, SourceRoot: root, Srcarch: "x86"})
+	}, CompactMetadataOptions{SourceRoot: root, Srcarch: "x86"})
 	if err != nil {
-		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
 	}
 
 	a := objectTarget(metadata, configByName(metadata, "a"), "init.o")
@@ -1772,12 +1722,12 @@ config FRAME_POINTER
 	root := t.TempDir()
 	mustWriteSource(t, root, "init.c", "int init(void) { return 0; }\n")
 
-	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{
+	metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{
 		{Name: "off"},
 		{Name: "on", Flags: map[string]string{"CONFIG_FRAME_POINTER": "y"}},
-	}, CompactMetadataOptions{Schema: CompactSchemaV012, SourceRoot: root})
+	}, CompactMetadataOptions{SourceRoot: root})
 	if err != nil {
-		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
 	}
 
 	off := objectTarget(metadata, configByName(metadata, "off"), "init.o")

@@ -49,16 +49,13 @@ def _fake_linux_object_impl(ctx):
     return [
         DefaultInfo(files = depset([out])),
         LinuxObjectInfo(
-            config_fragment = {},
             content_id = ctx.attr.content_id,
-            flags = [],
             generated_headers = depset(),
             generated_include_dir_anchors = {},
             generated_include_dirs = [],
             mode = ctx.attr.mode,
             object = ctx.attr.object,
             output = out,
-            source = "",
         ),
     ]
 
@@ -74,10 +71,7 @@ _fake_linux_object = rule(
 def _fake_compile_environment_index_impl(_ctx):
     return [
         LinuxCompileEnvironmentIndexInfo(
-            config_payloads = {},
             environments = {},
-            expected_abi = "test-abi",
-            generated_header_families = {},
         ),
     ]
 
@@ -166,19 +160,8 @@ _fake_arm64_generated_headers = rule(
 )
 
 def _fake_source_tree_info(root):
-    empty = depset()
     return LinuxSourceTreeInfo(
-        all_files = empty,
-        arch_headers = empty,
-        dtb_sources = empty,
-        global_headers = empty,
-        headers = empty,
-        kbuild_files = empty,
-        local_include_files = empty,
-        lookup_files = empty,
         root = root,
-        scripts_headers = empty,
-        uapi_headers = empty,
     )
 
 def _fake_nvhe_source_inputs_impl(ctx):
@@ -477,91 +460,6 @@ _generated_header_family_reuse_test = analysistest.make(
     },
 )
 
-def _legacy_generated_header_dependencies_test_impl(ctx):
-    env = analysistest.begin(ctx)
-    info = analysistest.target_under_test(env)[LinuxGeneratedHeadersInfo]
-    expected_dependencies = {
-        "bounds": [
-            "static",
-            "timeconst",
-            "compile",
-            "version",
-            "utsrelease",
-            "utsversion",
-            "cpufeatures",
-        ],
-        "asm_offsets": [
-            "static",
-            "timeconst",
-            "compile",
-            "version",
-            "utsrelease",
-            "utsversion",
-            "cpufeatures",
-            "bounds",
-        ],
-        "rq_offsets": [
-            "static",
-            "timeconst",
-            "compile",
-            "version",
-            "utsrelease",
-            "utsversion",
-            "cpufeatures",
-            "bounds",
-            "asm_offsets",
-        ],
-        "kvm_offsets": [
-            "static",
-            "timeconst",
-            "compile",
-            "version",
-            "utsrelease",
-            "utsversion",
-            "cpufeatures",
-            "bounds",
-            "asm_offsets",
-            "rq_offsets",
-        ],
-    }
-    offsets_actions = [
-        action
-        for action in analysistest.target_actions(env)
-        if action.mnemonic == "LinuxOffsetsAsm"
-    ]
-    asserts.equals(env, 4, len(offsets_actions))
-    for family_name, dependency_names in expected_dependencies.items():
-        matching = [
-            action
-            for action in offsets_actions
-            if any([
-                (".headers/%s/" % family_name) in output.path
-                for output in action.outputs.to_list()
-            ])
-        ]
-        asserts.equals(env, 1, len(matching))
-        if matching:
-            input_paths = {
-                file.path: True
-                for file in matching[0].inputs.to_list()
-            }
-            for candidate in _X86_PRECISE_HEADER_FAMILIES:
-                if candidate == family_name:
-                    continue
-                for path in _family_paths(info.families[candidate]):
-                    asserts.equals(
-                        env,
-                        candidate in dependency_names,
-                        path in input_paths,
-                        "legacy %s dependency mismatch for %s input %s" %
-                        (family_name, candidate, path),
-                    )
-    return analysistest.end(env)
-
-_legacy_generated_header_dependencies_test = analysistest.make(
-    _legacy_generated_header_dependencies_test_impl,
-)
-
 def _generated_header_earliest_reuse_test_impl(ctx):
     env = analysistest.begin(ctx)
     selected = analysistest.target_under_test(env)[LinuxGeneratedHeadersInfo]
@@ -762,9 +660,14 @@ def linux_objects_fail_closed_test_suite(name):
     certificate_object = name + "_certificate_object"
     linux_object(
         name = certificate_object,
-        src = "linux_objects_test_fixture.c",
+        compile_environment_id = environment_id,
+        compile_environment_index = ":" + name + "_compile_environment_index",
+        content_id = object_a_id,
         mode = "y",
         object = "certs/system_certificates.o",
+        source_input_file = 4,
+        source_input_group = 1,
+        source_input_index = ":" + name + "_source_input_index",
         tags = fixture_tags,
     )
 
@@ -910,11 +813,6 @@ def linux_objects_fail_closed_test_suite(name):
     source_tree = name + "_source_tree"
     linux_source_tree(
         name = source_tree,
-        headers = [
-            "include/linux/compiler-version.h",
-            "include/linux/compiler_types.h",
-            "include/linux/kconfig.h",
-        ],
         root = "linux_modules_test_fixture.rs",
         tags = fixture_tags,
     )
@@ -954,7 +852,6 @@ def linux_objects_fail_closed_test_suite(name):
         source_input_file = 1,
         source_input_group = 1,
         source_input_index = ":" + assembly_source_input_index,
-        source_tree_info = ":" + source_tree,
         tags = fixture_tags,
     )
     indexed_assembly_object_test = indexed_assembly_object + "_test"
@@ -1015,7 +912,6 @@ def linux_objects_fail_closed_test_suite(name):
         source_input_file = 4,
         source_input_group = 1,
         source_input_index = ":" + source_input_index,
-        source_tree_info = ":" + source_tree,
         tags = fixture_tags,
     )
     indexed_object_test = indexed_object + "_test"
@@ -1039,7 +935,6 @@ def linux_objects_fail_closed_test_suite(name):
         source_input_file = 4,
         source_input_group = 1,
         source_input_index = ":" + source_input_index,
-        source_tree_info = ":" + source_tree,
         tags = fixture_tags,
     )
     precise_family_object_test = precise_family_object + "_test"
@@ -1074,29 +969,6 @@ def linux_objects_fail_closed_test_suite(name):
         source_input_index = ":" + source_input_index,
         tags = fixture_tags,
     )
-    missing_content_id_object = name + "_missing_content_id_object"
-    linux_object(
-        name = missing_content_id_object,
-        compile_environment_id = environment_id,
-        compile_environment_index = ":" + compile_environment_index,
-        mode = "y",
-        object = "missing-content-id.o",
-        source_input_file = 4,
-        source_input_group = 1,
-        source_input_index = ":" + source_input_index,
-        tags = fixture_tags,
-    )
-    incomplete_source_inputs_object = name + "_incomplete_source_inputs_object"
-    linux_object(
-        name = incomplete_source_inputs_object,
-        compile_environment_id = environment_id,
-        compile_environment_index = ":" + compile_environment_index,
-        content_id = object_c_id,
-        mode = "y",
-        object = "incomplete-source-inputs.o",
-        src = "linux_objects_test_fixture.c",
-        tags = fixture_tags,
-    )
     out_of_range_primary_source_object = name + "_out_of_range_primary_source_object"
     linux_object(
         name = out_of_range_primary_source_object,
@@ -1110,27 +982,6 @@ def linux_objects_fail_closed_test_suite(name):
         source_input_index = ":" + source_input_index,
         tags = fixture_tags,
     )
-    missing_content_id_nvhe = name + "_missing_content_id_nvhe"
-    linux_arm64_nvhe_object(
-        name = missing_content_id_nvhe,
-        compile_environment_id = environment_id,
-        compile_environment_index = ":" + compile_environment_index,
-        mode = "y",
-        object = "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o",
-        source_input_group = 1,
-        source_input_index = ":" + nvhe_source_input_index,
-        tags = fixture_tags,
-    )
-    incomplete_source_inputs_nvhe = name + "_incomplete_source_inputs_nvhe"
-    linux_arm64_nvhe_object(
-        name = incomplete_source_inputs_nvhe,
-        compile_environment_id = environment_id,
-        compile_environment_index = ":" + compile_environment_index,
-        content_id = object_c_id,
-        mode = "y",
-        object = "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o",
-        tags = fixture_tags,
-    )
     empty_source_inputs_nvhe = name + "_empty_source_inputs_nvhe"
     linux_arm64_nvhe_object(
         name = empty_source_inputs_nvhe,
@@ -1139,6 +990,7 @@ def linux_objects_fail_closed_test_suite(name):
         content_id = object_b_id,
         mode = "y",
         object = "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o",
+        objects = [":" + name + "_object_a"],
         source_input_group = 2,
         source_input_index = ":" + nvhe_source_input_index,
         tags = fixture_tags,
@@ -1159,11 +1011,6 @@ def linux_objects_fail_closed_test_suite(name):
         expected_abi = "expected-abi",
         tags = fixture_tags,
     )
-    legacy_config = name + "_legacy_config"
-    linux_config(
-        name = legacy_config,
-        tags = fixture_tags,
-    )
     equivalent_config = name + "_equivalent_config"
     linux_config(
         name = equivalent_config,
@@ -1172,80 +1019,19 @@ def linux_objects_fail_closed_test_suite(name):
         },
         tags = fixture_tags,
     )
-    indexed_equivalent_object = name + "_indexed_equivalent_object"
-    linux_object(
-        name = indexed_equivalent_object,
-        compile_environment_id = environment_id,
-        compile_environment_index = ":" + compile_environment_index,
-        content_id = object_b_id,
-        mode = "y",
-        object = "equivalent.o",
-        source_input_file = 4,
-        source_input_group = 1,
-        source_input_index = ":" + source_input_index,
-        source_tree_info = ":" + source_tree,
-        tags = fixture_tags,
-    )
-    legacy_equivalent_object = name + "_legacy_equivalent_object"
-    linux_object(
-        name = legacy_equivalent_object,
-        config = ":" + equivalent_config,
-        mode = "y",
-        object = "equivalent.o",
-        source_tree_info = ":" + source_tree,
-        src = "linux_objects_test_fixture.c",
-        tags = fixture_tags,
-    )
-    native.filegroup(
-        name = indexed_equivalent_object + "_output",
-        output_group = "object",
-        srcs = [":" + indexed_equivalent_object],
-    )
-    native.filegroup(
-        name = legacy_equivalent_object + "_output",
-        output_group = "object",
-        srcs = [":" + legacy_equivalent_object],
-    )
-    equivalent_object_test = name + "_indexed_object_output_test"
-    diff_test(
-        name = equivalent_object_test,
-        file1 = ":" + indexed_equivalent_object + "_output",
-        file2 = ":" + legacy_equivalent_object + "_output",
-    )
-    mixed_environment_object = name + "_mixed_environment_object"
-    linux_object(
-        name = mixed_environment_object,
-        compile_environment_id = environment_id,
-        compile_environment_index = ":" + empty_compile_environment_index,
-        config = ":" + legacy_config,
-        content_id = object_a_id,
-        mode = "y",
-        object = "mixed-environment.o",
-        source_input_file = 4,
-        source_input_group = 1,
-        source_input_index = ":" + source_input_index,
-        tags = fixture_tags,
-    )
-
     failure_cases = [
         (empty_image, "requires at least one compiled object"),
         (certificate_object, "hermetic certificate embedding and signing are not implemented"),
         (duplicate_source_group_index, "duplicate or non-canonical group"),
         (empty_source_inputs_nvhe, "source_input_group 2 is out of range"),
-        (incomplete_source_inputs_nvhe, "requires compile_environment_index and source_input_index together"),
-        (incomplete_source_inputs_object, "requires compile_environment_index and source_input_index together"),
         (invalid_environment_object, "must be a full lowercase SHA-256 content ID"),
         (mismatched_abi_index, "does not match expected_abi"),
-        (missing_content_id_nvhe, "linux_arm64_nvhe_object content_id must be a full lowercase SHA-256 content ID"),
-        (missing_content_id_object, "linux_object content_id must be a full lowercase SHA-256 content ID"),
         (mixed_header_family_index, "mixes all with precise generated-header families"),
-        (mixed_environment_object, "mutually exclusive with legacy config/generated_headers"),
         (out_of_range_primary_source_object, "source_input_file 5 is out of range"),
         (out_of_range_source_file_index, "file index 2 is out of range"),
         (unbound_header_index, "family all content ID must be a full lowercase SHA-256 content ID"),
     ]
     tests = [
-        ":" + equivalent_object_test,
         ":" + indexed_assembly_object_test,
         ":" + indexed_object_test,
         ":" + precise_family_object_test,
@@ -1304,14 +1090,17 @@ def linux_objects_fail_closed_test_suite(name):
         (non_earlier_header_dependency, "depends on non-earlier family kvm_offsets"),
         (mismatched_header_dependency_id, "content ID does not match selected family"),
     ])
-    legacy_generated_header_producer = name + "_legacy_generated_header_producer"
+    missing_header_family_ids = name + "_missing_header_family_ids"
     _x86_generated_headers_fixture(
-        name = legacy_generated_header_producer,
+        name = missing_header_family_ids,
         config = ":" + equivalent_config,
         family_content_ids = {},
         family_dependency_ids = {},
         reusable_generated_headers = [],
         tags = fixture_tags,
+    )
+    failure_cases.append(
+        (missing_header_family_ids, "family_content_ids has families [], expected"),
     )
     base_generated_header_producer = name + "_base_generated_header_producer"
     _x86_generated_headers_fixture(
@@ -1357,11 +1146,6 @@ def linux_objects_fail_closed_test_suite(name):
         name = generated_header_layout_test,
         target_under_test = ":" + base_generated_header_producer,
     )
-    legacy_generated_header_dependencies_test = legacy_generated_header_producer + "_test"
-    _legacy_generated_header_dependencies_test(
-        name = legacy_generated_header_dependencies_test,
-        target_under_test = ":" + legacy_generated_header_producer,
-    )
     generated_header_reuse_test = variant_generated_header_producer + "_test"
     _generated_header_family_reuse_test(
         name = generated_header_reuse_test,
@@ -1379,7 +1163,6 @@ def linux_objects_fail_closed_test_suite(name):
         ":" + generated_header_earliest_reuse_test,
         ":" + generated_header_layout_test,
         ":" + generated_header_reuse_test,
-        ":" + legacy_generated_header_dependencies_test,
     ])
     for target, expected_error in failure_cases:
         test_name = target + "_test"
@@ -1419,7 +1202,6 @@ def linux_objects_fail_closed_test_suite(name):
         objects = [object_targets["a"]],
         source_input_group = 1,
         source_input_index = ":" + nvhe_source_input_index,
-        source_tree_info = ":" + nvhe_source_inputs,
         tags = fixture_tags,
     )
     exact_nvhe_test = exact_nvhe + "_test"
@@ -1440,7 +1222,6 @@ def linux_objects_fail_closed_test_suite(name):
         source_input_file = 1,
         source_input_group = 1,
         source_input_index = ":" + vdso32_source_input_index,
-        source_tree_info = ":" + vdso32_source_inputs,
         tags = fixture_tags,
     )
     exact_vdso32_test = exact_vdso32 + "_test"

@@ -36,7 +36,6 @@ go_test(
     srcs = [
         "compact_test.go",
         "config_footprint_test.go",
-        "config_overlay_test.go",
         "config_test.go",
         "kbuild_test.go",
         "parser_test.go",

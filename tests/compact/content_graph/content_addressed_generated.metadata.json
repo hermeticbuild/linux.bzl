@@ -1,21 +1,17 @@
 {
-  "schema": "v0.0.13",
   "configs": [
     {
       "name": "base",
-      "image_target": "base_image",
       "config_payload": "17317bb1ec63ca3d2e87f7508ae976a2beefa9f8a575f944d7894793fbfe4651",
       "object_targets": ["init__4b7a1b0f7063f76b660a96de"]
     },
     {
       "name": "blocked_driver",
-      "image_target": "blocked_driver_image",
       "config_payload": "17317bb1ec63ca3d2e87f7508ae976a2beefa9f8a575f944d7894793fbfe4651",
       "object_targets": ["init__4b7a1b0f7063f76b660a96de"]
     },
     {
       "name": "debug",
-      "image_target": "debug_image",
       "config_payload": "d54fa7e50cedbdff324c0353601926df9fe5743fd822802651f21a64c4f5d043",
       "object_targets": [
         "init__4b7a1b0f7063f76b660a96de",
@@ -24,7 +20,6 @@
     },
     {
       "name": "force_net",
-      "image_target": "force_net_image",
       "config_payload": "d27e9650050f54b1ba2161668772d0e82e2f4b318a0709e2a8151fc9b458af65",
       "object_targets": [
         "init__7b08ccb89cb8866f745de6ea",
@@ -295,24 +290,6 @@
     }
   ],
   "source_input_groups": ["1,3,4,5", "2,3,4,5", "3,4,5", "3,4,5,6", "3,4,5,7"],
-  "object_packages": [
-    {
-      "package": "",
-      "object_targets": [
-        "debug__2a6ef5e3cc123d0327290647",
-        "init__4b7a1b0f7063f76b660a96de",
-        "init__7b08ccb89cb8866f745de6ea"
-      ]
-    },
-    {
-      "package": "drivers",
-      "object_targets": ["drivers_foo__b54f84a859d861efca5b8d3d"]
-    },
-    {
-      "package": "net",
-      "object_targets": ["net_core__0eaad31c1c8fff26994390cf"]
-    }
-  ],
   "object_variants": [
     {
       "target": "debug__2a6ef5e3cc123d0327290647",
@@ -328,7 +305,6 @@
       "target": "drivers_foo__b54f84a859d861efca5b8d3d",
       "content_id": "b54f84a859d861efca5b8d3dc59d668918e6974e7d0fdf7a815870fcf630b883",
       "compile_environment": "312201fc8dbcebef483c6d83402e51fce733c994e3810c531709d21ee538cd82",
-      "package": "drivers",
       "object": "drivers/foo.o",
       "source": "drivers/foo.c",
       "source_input_group": 2,
@@ -359,7 +335,6 @@
       "target": "net_core__0eaad31c1c8fff26994390cf",
       "content_id": "0eaad31c1c8fff26994390cf9feb2bc7bffbdcb20b5c99b265c8328c049329cf",
       "compile_environment": "803917b5603bcb75268d37b394679376035915c37ad88a5b9eba3aadf93b1611",
-      "package": "net",
       "object": "net/core.o",
       "source": "net/core.c",
       "source_input_group": 5,

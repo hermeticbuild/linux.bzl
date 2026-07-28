@@ -78,33 +78,10 @@ func namedPathMap(values []namedPath) map[string]string {
 	return out
 }
 
-func namedValueMap(values []namedPath) map[string]string {
-	out := map[string]string{}
-	for _, value := range values {
-		out[value.Name] = value.Path
-	}
-	return out
-}
-
 func compactGeneratedHeaderLabels(
 	configs []namedPath,
 	values []namedPath,
-	legacy string,
-	schema kconfig.CompactSchema,
 ) (map[string]string, error) {
-	if schema != kconfig.CompactSchemaV013 {
-		if len(values) != 0 {
-			return nil, fmt.Errorf("-generated_headers_for_config requires -compact_schema=v0.0.13")
-		}
-		out := map[string]string{}
-		for _, config := range configs {
-			out[config.Name] = legacy
-		}
-		return out, nil
-	}
-	if legacy != "" {
-		return nil, fmt.Errorf("-generated_headers is not supported with -compact_schema=v0.0.13; use -generated_headers_for_config")
-	}
 	configNames := map[string]bool{}
 	for _, config := range configs {
 		configNames[config.Name] = true
@@ -231,18 +208,13 @@ func run() (exitCode int) {
 		kbuildTreeRoot           = flag.String("kbuild_tree_root", "", "Linux source tree root to recursively validate Kbuild/Makefile/*.mk files")
 		kbuildTreeOut            = flag.String("kbuild_tree_out", "", "Path to write recursive Kbuild tree validation summary JSON")
 		kbuildTreeMinCount       = flag.Int("kbuild_tree_min_count", 0, "Minimum number of Kbuild-like files that must be parsed during -kbuild_tree_root validation")
-		resolvedFlagsDir         = flag.String("resolved_flags_dir", "", "Directory to write each compact config's overlay-resolved effective flags as <NAME>.flags")
 		compactMetadataOut       = flag.String("compact_metadata_out", "", "Path to write compact fragment-keyed Linux metadata JSON")
 		compactBuildfileOut      = flag.String("compact_buildfile_out", "", "Path to write a combined compact object/image BUILD file")
-		compactSchemaValue       = flag.String("compact_schema", string(kconfig.CompactSchemaV011), "Compact output schema. Supported: v0.0.11, v0.0.12, v0.0.13")
-		compactBaseConfig        = flag.String("compact_base_config", "", "Base config name for v0.0.13 delta image BUILD emission")
-		compileEnvironmentABI    = flag.String("compile_environment_abi", "", "Toolchain/action ABI bound into v0.0.13 compile environment content IDs")
-		rustProfileOut           = flag.String("rust_profile_out", "", "Path to write the v0.0.12 source-derived Rust profile JSON")
+		compactBaseConfig        = flag.String("compact_base_config", "", "Base config name for delta image BUILD emission")
+		compileEnvironmentABI    = flag.String("compile_environment_abi", "", "Toolchain/action ABI bound into compile environment content IDs")
+		rustProfileOut           = flag.String("rust_profile_out", "", "Path to write the source-derived Rust profile JSON")
 		compactKbuildTree        = flag.Bool("compact_kbuild_tree", false, "Follow active Kbuild directory descent when generating compact metadata")
-		objectBuildfileOut       = flag.String("object_buildfile_out", "", "Path to write compact shared object-variant BUILD file")
-		imageBuildfileOut        = flag.String("image_buildfile_out", "", "Path to write compact per-config image BUILD file")
 		resolveConfig            = flag.String("resolve_config", "", "Named .config input in NAME=PATH form to resolve through Kconfig defaults and dependencies")
-		resolveOverlay           = flag.String("resolve_overlay", "", "Optional .config overlay fragment merged onto -resolve_config before resolution")
 		configMode               = flag.String("config_mode", "default", "Config resolver mode. Supported: default, allnoconfig")
 		resolvedConfigOut        = flag.String("resolved_config_out", "", "Path to write the resolved .config")
 		resolvedAutoConfOut      = flag.String("resolved_auto_conf_out", "", "Path to write the resolved include/config/auto.conf")
@@ -250,14 +222,11 @@ func run() (exitCode int) {
 		resolvedAutoconfOut      = flag.String("resolved_autoconf_out", "", "Path to write the resolved include/generated/autoconf.h")
 		resolvedRustcCfgOut      = flag.String("resolved_rustc_cfg_out", "", "Path to write the resolved include/generated/rustc_cfg")
 		resolvedReleaseOut       = flag.String("resolved_kernel_release_out", "", "Path to write the resolved include/config/kernel.release")
-		resolvedFlagsOut         = flag.String("resolved_flags_out", "", "Path to write resolved effective CONFIG_* flags")
 		kernelVersion            = flag.String("kernel_version", "6.18.2", "Base kernel release used when writing resolved config outputs")
-		generatedHeaders         = flag.String("generated_headers", "", "Bazel label for generated Linux headers emitted into source-backed compact object rules")
-		objectLabelPackage       = flag.String("object_label_package", "", "Bazel package containing the compact object BUILD file. Defaults to -object_buildfile_out package")
+		objectLabelPackage       = flag.String("object_label_package", "", "Bazel package containing the compact object targets. Defaults to the -compact_buildfile_out package")
 		sourceLabelPackage       = flag.String("source_label_package", "", "Bazel package containing Linux source file labels for generated compact object BUILD files")
 		sourceASN1Compiler       = flag.String("source_asn1_compiler", "", "Bazel label for the kernel source tree's scripts/asn1_compiler tool emitted into source-backed compact object rules")
 		sourceRelacheck          = flag.String("source_relacheck", "", "Bazel label for the kernel source tree's arch/arm64/kernel/pi/relacheck tool emitted into arm64 .pi.o rules")
-		sourceConfig             = flag.String("source_config", "", "Bazel label for a full LinuxConfigInfo target emitted into source-backed compact object rules")
 		sourceRootLabel          = flag.String("source_root_label", "", "Bazel label for a file in the Linux source root, emitted into source-backed compact object rules")
 		linuxObjectsLoad         = flag.String("linux_objects_load", "", "Load label for the compact Linux object/image rules")
 		vars                     = stringMapFlag{}
@@ -266,23 +235,10 @@ func run() (exitCode int) {
 		visibility               = stringSliceFlag{}
 		kbuildTreeExcludes       = stringSliceFlag{}
 		compactConfigInputs      = namedPathFlag{}
-		compactConfigOverlays    = namedPathFlag{}
 		compactExports           = stringSliceFlag{}
 		sourceRootMaps           = namedPathFlag{}
 		kconfigExtras            = namedPathFlag{}
-		kbuildExtras             = namedPathFlag{}
-		sourceLabelMaps          = namedPathFlag{}
 		generatedHeadersByConfig = namedPathFlag{}
-		sourceTreeAllFiles       = stringSliceFlag{}
-		sourceTreeArchHeaders    = stringSliceFlag{}
-		sourceTreeDtbSources     = stringSliceFlag{}
-		sourceTreeGlobalHeaders  = stringSliceFlag{}
-		sourceTreeHeaders        = stringSliceFlag{}
-		sourceTreeKbuildFiles    = stringSliceFlag{}
-		sourceTreeLocalIncludes  = stringSliceFlag{}
-		sourceTreeLookupFiles    = stringSliceFlag{}
-		sourceTreeScriptsHeaders = stringSliceFlag{}
-		sourceTreeUapiHeaders    = stringSliceFlag{}
 		cpuProfile               = flag.String("cpu_profile", "", "Optional path to write a Go CPU profile")
 		heapProfile              = flag.String("heap_profile", "", "Optional path to write a Go live-heap profile")
 		allocsProfile            = flag.String("allocs_profile", "", "Optional path to write a Go cumulative-allocation profile")
@@ -293,23 +249,10 @@ func run() (exitCode int) {
 	flag.Var(&visibility, "visibility", "Default visibility for the generated BUILD file. May be repeated. Defaults to //visibility:public")
 	flag.Var(&kbuildTreeExcludes, "kbuild_tree_exclude", "Source-root-relative subtree to skip during -kbuild_tree_root validation. May be repeated")
 	flag.Var(&compactConfigInputs, "config", "Named .config input in NAME=PATH form for compact metadata generation. May be repeated")
-	flag.Var(&compactConfigOverlays, "config_overlay", "Optional .config overlay in NAME=PATH form merged onto the matching -config. May be repeated")
 	flag.Var(&compactExports, "compact_buildfile_export", "Source filename exported by the generated compact BUILD file. May be repeated")
 	flag.Var(&sourceRootMaps, "source_root_map", "Virtual source prefix to filesystem root in PREFIX=PATH form. May be repeated")
 	flag.Var(&kconfigExtras, "kconfig_extra", "Extra Kconfig source in PREFIX=PATH form. May be repeated")
-	flag.Var(&kbuildExtras, "kbuild_extra", "Extra Kbuild/Makefile source in PREFIX=PATH form. May be repeated")
-	flag.Var(&sourceLabelMaps, "source_label_map", "Virtual source prefix to Bazel label package in PREFIX=LABEL_PACKAGE form. May be repeated")
-	flag.Var(&generatedHeadersByConfig, "generated_headers_for_config", "v0.0.13 generated headers binding in NAME=LABEL form. May be repeated once per compact config")
-	flag.Var(&sourceTreeAllFiles, "source_tree_all_files_label", "Bazel label for explicit full source tree files emitted into source-backed compact object rules. May be repeated")
-	flag.Var(&sourceTreeArchHeaders, "source_tree_arch_headers_label", "Bazel label for architecture source headers emitted into source-backed compact object rules. May be repeated")
-	flag.Var(&sourceTreeDtbSources, "source_tree_dtb_sources_label", "Bazel label for devicetree source inputs emitted into source-backed compact object rules. May be repeated")
-	flag.Var(&sourceTreeGlobalHeaders, "source_tree_global_headers_label", "Bazel label for global source headers emitted into source-backed compact object rules. May be repeated")
-	flag.Var(&sourceTreeHeaders, "source_tree_headers_label", "Bazel label for source headers emitted into source-backed compact object rules. May be repeated")
-	flag.Var(&sourceTreeKbuildFiles, "source_tree_kbuild_files_label", "Bazel label for Kbuild/Makefile source inputs emitted into source-backed compact object rules. May be repeated")
-	flag.Var(&sourceTreeLocalIncludes, "source_tree_local_include_files_label", "Bazel label for source-like files that may be included from the same directory. May be repeated")
-	flag.Var(&sourceTreeLookupFiles, "source_tree_lookup_files_label", "Bazel label for bounded special source inputs looked up by native Linux actions. May be repeated")
-	flag.Var(&sourceTreeScriptsHeaders, "source_tree_scripts_headers_label", "Bazel label for scripts headers emitted into source-backed compact object rules. May be repeated")
-	flag.Var(&sourceTreeUapiHeaders, "source_tree_uapi_headers_label", "Bazel label for UAPI headers emitted into source-backed compact object rules. May be repeated")
+	flag.Var(&generatedHeadersByConfig, "generated_headers_for_config", "Generated headers binding in NAME=LABEL form. May be repeated once per compact config")
 	flag.Parse()
 
 	stopProfiles, err := startRuntimeProfiles(*cpuProfile, *heapProfile, *allocsProfile)
@@ -325,12 +268,6 @@ func run() (exitCode int) {
 			}
 		}
 	}()
-
-	compactSchema, err := kconfig.ParseCompactSchema(*compactSchemaValue)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
-	}
 
 	if *root == "" && *kbuildOut == "" && *kbuildTreeOut == "" && *rustProfileOut == "" {
 		flag.PrintDefaults()
@@ -431,10 +368,6 @@ func run() (exitCode int) {
 	}
 
 	if *rustProfileOut != "" {
-		if compactSchema != kconfig.CompactSchemaV012 && compactSchema != kconfig.CompactSchemaV013 {
-			fmt.Fprintln(os.Stderr, "-rust_profile_out requires -compact_schema=v0.0.12 or v0.0.13")
-			return 2
-		}
 		if *srctree == "" {
 			fmt.Fprintln(os.Stderr, "-srctree is required for -rust_profile_out")
 			return 2
@@ -456,13 +389,13 @@ func run() (exitCode int) {
 	}
 
 	resolvedConfigRequested := *resolveConfig != "" || *resolvedConfigOut != "" || *resolvedAutoConfOut != "" || *resolvedCmdOut != "" || *resolvedAutoconfOut != "" || *resolvedRustcCfgOut != "" || *resolvedReleaseOut != ""
-	if tree == nil && (*compactMetadataOut != "" || *objectBuildfileOut != "" || *imageBuildfileOut != "" || resolvedConfigRequested || *resolvedFlagsOut != "" || *out != "") {
+	if tree == nil && (*compactMetadataOut != "" || *compactBuildfileOut != "" || resolvedConfigRequested || *out != "") {
 		fmt.Fprintf(os.Stderr, "-root is required for Kconfig outputs\n")
 		return 2
 	}
 
 	if resolvedConfigRequested {
-		if err := writeResolvedConfig(tree, *resolveConfig, *resolveOverlay, *configMode, resolvedConfigOutputs{
+		if err := writeResolvedConfig(tree, *resolveConfig, *configMode, resolvedConfigOutputs{
 			config:        *resolvedConfigOut,
 			autoConf:      *resolvedAutoConfOut,
 			autoConfCmd:   *resolvedCmdOut,
@@ -475,19 +408,10 @@ func run() (exitCode int) {
 		}
 	}
 
-	if *resolvedFlagsOut != "" {
-		if err := writeResolvedFlags(tree, *resolveConfig, *resolveOverlay, *configMode, *resolvedFlagsOut); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write resolved flags: %v\n", err)
-			return 1
-		}
-	}
-
-	if *compactMetadataOut != "" || *compactBuildfileOut != "" || *objectBuildfileOut != "" || *imageBuildfileOut != "" {
+	if *compactMetadataOut != "" || *compactBuildfileOut != "" {
 		headerLabels, err := compactGeneratedHeaderLabels(
 			compactConfigInputs,
 			generatedHeadersByConfig,
-			*generatedHeaders,
-			compactSchema,
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to configure compact generated headers: %v\n", err)
@@ -498,17 +422,13 @@ func run() (exitCode int) {
 			*root,
 			*kbuildPath,
 			compactConfigInputs,
-			compactConfigOverlays,
-			*resolvedFlagsDir,
 			*configMode,
 			*compactKbuildTree,
 			vars,
-			kbuildExtras,
 			namedPathMap(sourceRootMaps),
 			headerLabels,
 			*kernelVersion,
 			*compileEnvironmentABI,
-			compactSchema,
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to generate compact metadata: %v\n", err)
@@ -525,118 +445,31 @@ func run() (exitCode int) {
 				return 1
 			}
 		}
-		if *objectBuildfileOut != "" {
-			data, err := metadata.ObjectBuildFile(kconfig.CompactBuildFileOptions{
-				Schema:                   compactSchema,
-				Arch:                     vars["ARCH"],
-				Version:                  *kernelVersion,
-				Visibility:               []string(visibility),
-				RuleLoadLabel:            *linuxObjectsLoad,
-				SourceLabelPackage:       *sourceLabelPackage,
-				SourceLabelPackages:      namedValueMap(sourceLabelMaps),
-				SourceASN1Compiler:       *sourceASN1Compiler,
-				SourceRelacheck:          *sourceRelacheck,
-				SourceConfig:             *sourceConfig,
-				SourceRootLabel:          *sourceRootLabel,
-				SourceTreeAllFiles:       []string(sourceTreeAllFiles),
-				SourceTreeArchHeaders:    []string(sourceTreeArchHeaders),
-				SourceTreeDtbSources:     []string(sourceTreeDtbSources),
-				SourceTreeGlobalHeaders:  []string(sourceTreeGlobalHeaders),
-				SourceTreeHeaders:        []string(sourceTreeHeaders),
-				SourceTreeKbuildFiles:    []string(sourceTreeKbuildFiles),
-				SourceTreeLocalIncludes:  []string(sourceTreeLocalIncludes),
-				SourceTreeLookupFiles:    []string(sourceTreeLookupFiles),
-				SourceTreeScriptsHeaders: []string(sourceTreeScriptsHeaders),
-				SourceTreeUapiHeaders:    []string(sourceTreeUapiHeaders),
-				GeneratedHeaders:         *generatedHeaders,
-				Srcarch:                  vars["SRCARCH"],
-			})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to generate compact object BUILD file: %v\n", err)
-				return 1
-			}
-			if err := os.WriteFile(workspacePath(*objectBuildfileOut), data, 0o644); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to write compact object BUILD file: %v\n", err)
-				return 1
-			}
-		}
-		if *imageBuildfileOut != "" {
-			objectPkg := *objectLabelPackage
-			if objectPkg == "" {
-				objectPkg = inferLabelPackage(*objectBuildfileOut)
-			}
-			data, err := metadata.ImageBuildFile(kconfig.CompactImageBuildFileOptions{
-				Schema:             compactSchema,
-				Arch:               vars["ARCH"],
-				BaseConfig:         *compactBaseConfig,
-				Visibility:         []string(visibility),
-				ObjectLabelPackage: objectPkg,
-				RequireReal:        *sourceConfig != "",
-				RuleLoadLabel:      *linuxObjectsLoad,
-			})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to generate compact image BUILD file: %v\n", err)
-				return 1
-			}
-			if err := os.WriteFile(workspacePath(*imageBuildfileOut), data, 0o644); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to write compact image BUILD file: %v\n", err)
-				return 1
-			}
-		}
 		if *compactBuildfileOut != "" {
-			objectBuild, err := metadata.ObjectBuildFile(kconfig.CompactBuildFileOptions{
-				Schema:                   compactSchema,
-				Arch:                     vars["ARCH"],
-				Version:                  *kernelVersion,
-				Visibility:               []string(visibility),
-				RuleLoadLabel:            *linuxObjectsLoad,
-				SourceLabelPackage:       *sourceLabelPackage,
-				SourceLabelPackages:      namedValueMap(sourceLabelMaps),
-				SourceASN1Compiler:       *sourceASN1Compiler,
-				SourceRelacheck:          *sourceRelacheck,
-				SourceConfig:             *sourceConfig,
-				SourceRootLabel:          *sourceRootLabel,
-				SourceTreeAllFiles:       []string(sourceTreeAllFiles),
-				SourceTreeArchHeaders:    []string(sourceTreeArchHeaders),
-				SourceTreeDtbSources:     []string(sourceTreeDtbSources),
-				SourceTreeGlobalHeaders:  []string(sourceTreeGlobalHeaders),
-				SourceTreeHeaders:        []string(sourceTreeHeaders),
-				SourceTreeKbuildFiles:    []string(sourceTreeKbuildFiles),
-				SourceTreeLocalIncludes:  []string(sourceTreeLocalIncludes),
-				SourceTreeLookupFiles:    []string(sourceTreeLookupFiles),
-				SourceTreeScriptsHeaders: []string(sourceTreeScriptsHeaders),
-				SourceTreeUapiHeaders:    []string(sourceTreeUapiHeaders),
-				GeneratedHeaders:         *generatedHeaders,
-				Srcarch:                  vars["SRCARCH"],
-			})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to generate compact object BUILD file: %v\n", err)
-				return 1
+			exports := []string(compactExports)
+			if len(exports) == 0 {
+				exports = compactBuildfileExports(*compactBuildfileOut, *compactMetadataOut)
 			}
 			objectPkg := *objectLabelPackage
 			if objectPkg == "" {
 				objectPkg = inferLabelPackage(*compactBuildfileOut)
 			}
-			imageBuild, err := metadata.ImageBuildFile(kconfig.CompactImageBuildFileOptions{
-				Schema:             compactSchema,
+			data, err := metadata.BuildFile(kconfig.CompactBuildFileOptions{
 				Arch:               vars["ARCH"],
-				BaseConfig:         *compactBaseConfig,
+				Version:            *kernelVersion,
 				Visibility:         []string(visibility),
-				ObjectLabelPackage: objectPkg,
-				RequireReal:        *sourceConfig != "",
 				RuleLoadLabel:      *linuxObjectsLoad,
+				BaseConfig:         *compactBaseConfig,
+				ObjectLabelPackage: objectPkg,
+				Exports:            exports,
+				SourceLabelPackage: *sourceLabelPackage,
+				SourceASN1Compiler: *sourceASN1Compiler,
+				SourceRelacheck:    *sourceRelacheck,
+				SourceRootLabel:    *sourceRootLabel,
+				Srcarch:            vars["SRCARCH"],
 			})
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to generate compact image BUILD file: %v\n", err)
-				return 1
-			}
-			exports := []string(compactExports)
-			if len(exports) == 0 {
-				exports = compactBuildfileExports(*compactBuildfileOut, *compactMetadataOut)
-			}
-			data, err := kconfig.MergeBuildFiles("compact.BUILD.bazel", exports, objectBuild, imageBuild)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to merge compact BUILD file: %v\n", err)
+				fmt.Fprintf(os.Stderr, "failed to generate compact BUILD file: %v\n", err)
 				return 1
 			}
 			if err := os.WriteFile(workspacePath(*compactBuildfileOut), data, 0o644); err != nil {
@@ -648,7 +481,7 @@ func run() (exitCode int) {
 
 	// Only emit the JSON dump when explicitly requested, or when no output was
 	// requested at all (preserves the prior default of dumping to stdout).
-	if *out == "" && (*kbuildOut != "" || *kbuildTreeOut != "" || *compactMetadataOut != "" || *compactBuildfileOut != "" || *objectBuildfileOut != "" || *imageBuildfileOut != "" || *rustProfileOut != "" || resolvedConfigRequested || *resolvedFlagsOut != "") {
+	if *out == "" && (*kbuildOut != "" || *kbuildTreeOut != "" || *compactMetadataOut != "" || *compactBuildfileOut != "" || *rustProfileOut != "" || resolvedConfigRequested) {
 		return 0
 	}
 
@@ -706,7 +539,7 @@ type resolvedConfigOutputs struct {
 	kernelRelease string
 }
 
-func writeResolvedConfig(tree *kconfig.Tree, input, overlay, configMode string, outputs resolvedConfigOutputs, kernelVersion string) error {
+func writeResolvedConfig(tree *kconfig.Tree, input, configMode string, outputs resolvedConfigOutputs, kernelVersion string) error {
 	if input == "" {
 		return fmt.Errorf("-resolve_config is required when resolved config outputs are requested")
 	}
@@ -742,9 +575,6 @@ func writeResolvedConfig(tree *kconfig.Tree, input, overlay, configMode string, 
 	if err != nil {
 		return err
 	}
-	if err := applyConfigOverlay(raw, overlay); err != nil {
-		return err
-	}
 	resolveOpts, err := resolveConfigOptions(configMode)
 	if err != nil {
 		return err
@@ -754,74 +584,6 @@ func writeResolvedConfig(tree *kconfig.Tree, input, overlay, configMode string, 
 		return err
 	}
 	return writeResolvedConfigOutputs(tree, resolved, outputs, kernelVersion)
-}
-
-func writeResolvedFlags(tree *kconfig.Tree, input, overlay, configMode, out string) error {
-	if input == "" {
-		return fmt.Errorf("-resolve_config is required for -resolved_flags_out")
-	}
-	name, path, ok := strings.Cut(input, "=")
-	if !ok || name == "" || path == "" {
-		return fmt.Errorf("-resolve_config expects NAME=PATH")
-	}
-	file, err := os.Open(workspacePath(path))
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	raw, err := kconfig.ParseConfig(file)
-	if err != nil {
-		return err
-	}
-	if err := applyConfigOverlay(raw, overlay); err != nil {
-		return err
-	}
-	resolveOpts, err := resolveConfigOptions(configMode)
-	if err != nil {
-		return err
-	}
-	resolved, err := tree.ResolveConfigWithOptions(name, raw, resolveOpts)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(workspacePath(out), []byte(strings.Join(resolvedFlagLines(resolved), "\n")+"\n"), 0o644)
-}
-
-func resolvedFlagLines(resolved *kconfig.ResolvedConfig) []string {
-	keys := make([]string, 0, len(resolved.Effective))
-	for key := range resolved.Effective {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	lines := make([]string, 0, len(keys))
-	for _, key := range keys {
-		if !resolved.ShouldWrite(key) {
-			continue
-		}
-		value := resolved.Effective[key]
-		if value == "" || value == "n" {
-			continue
-		}
-		lines = append(lines, key+"="+value)
-	}
-	return lines
-}
-
-func applyConfigOverlay(raw map[string]string, overlayPath string) error {
-	if overlayPath == "" {
-		return nil
-	}
-	file, err := os.Open(workspacePath(overlayPath))
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	overlay, err := kconfig.ParseConfigOverlay(file)
-	if err != nil {
-		return err
-	}
-	kconfig.MergeConfigOverlay(raw, overlay)
-	return nil
 }
 
 func resolveConfigOptions(mode string) (kconfig.ResolveConfigOptions, error) {
@@ -1043,29 +805,18 @@ func isKbuildValidationFile(name string) bool {
 	return name == "Kbuild" || name == "Makefile" || strings.HasSuffix(name, ".mk")
 }
 
-func validateResolvedFlagsName(name string) error {
-	if name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
-		return fmt.Errorf("compact config name %q must be a single path component when -resolved_flags_dir is set", name)
-	}
-	return nil
-}
-
 func compactMetadata(
 	tree *kconfig.Tree,
 	rootPath string,
 	kbuildPath string,
-	configInputs,
-	configOverlays []namedPath,
-	resolvedFlagsDir string,
+	configInputs []namedPath,
 	configMode string,
 	compactKbuildTree bool,
 	vars map[string]string,
-	kbuildExtras []namedPath,
 	sourceRoots map[string]string,
 	generatedHeadersByConfig map[string]string,
 	kernelVersion string,
 	compileEnvironmentABI string,
-	schema kconfig.CompactSchema,
 ) (*kconfig.CompactMetadata, error) {
 	if kbuildPath == "" {
 		return nil, fmt.Errorf("-kbuild is required")
@@ -1075,25 +826,10 @@ func compactMetadata(
 	}
 	configNames := map[string]bool{}
 	for _, input := range configInputs {
-		if resolvedFlagsDir != "" {
-			if err := validateResolvedFlagsName(input.Name); err != nil {
-				return nil, err
-			}
-		}
 		if configNames[input.Name] {
 			return nil, fmt.Errorf("duplicate compact config name %q", input.Name)
 		}
 		configNames[input.Name] = true
-	}
-	overlayPaths := map[string]string{}
-	for _, overlay := range configOverlays {
-		if !configNames[overlay.Name] {
-			return nil, fmt.Errorf("config overlay %q has no matching -config", overlay.Name)
-		}
-		if _, ok := overlayPaths[overlay.Name]; ok {
-			return nil, fmt.Errorf("duplicate config overlay name %q", overlay.Name)
-		}
-		overlayPaths[overlay.Name] = overlay.Path
 	}
 	resolveOpts, err := resolveConfigOptions(configMode)
 	if err != nil {
@@ -1113,9 +849,6 @@ func compactMetadata(
 		if closeErr != nil {
 			return nil, fmt.Errorf("%s: %w", input.Path, closeErr)
 		}
-		if err := applyConfigOverlay(flags, overlayPaths[input.Name]); err != nil {
-			return nil, fmt.Errorf("%s overlay: %w", input.Name, err)
-		}
 		configs = append(configs, kconfig.NamedConfig{Name: input.Name, Flags: flags, AllNoConfig: resolveOpts.AllNoConfig})
 	}
 	sourceRoot := ""
@@ -1132,7 +865,6 @@ func compactMetadata(
 		}
 	}
 	opts := kconfig.CompactMetadataOptions{
-		Schema:                schema,
 		ObjectDir:             objectDir,
 		SourceRoot:            sourceRoot,
 		SourceRoots:           sourceRoots,
@@ -1145,18 +877,7 @@ func compactMetadata(
 	if rootDir == "" {
 		rootDir = filepath.Dir(workspacePath(kbuildPath))
 	}
-	if resolvedFlagsDir != "" {
-		if err := os.MkdirAll(workspacePath(resolvedFlagsDir), 0o755); err != nil {
-			return nil, fmt.Errorf("create resolved flags dir: %w", err)
-		}
-	}
-	return tree.CompactMetadataBatchWithOptions(configs, opts, func(resolved *kconfig.ResolvedConfig) (*kconfig.KbuildFile, string, error) {
-		if resolvedFlagsDir != "" {
-			flagsPath := filepath.Join(workspacePath(resolvedFlagsDir), resolved.Name+".flags")
-			if err := os.WriteFile(flagsPath, []byte(strings.Join(resolvedFlagLines(resolved), "\n")+"\n"), 0o644); err != nil {
-				return nil, "", fmt.Errorf("write resolved flags for %s: %w", resolved.Name, err)
-			}
-		}
+	return tree.CompactMetadataBatchWithOptions(configs, opts, func(resolved *kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
 		kbuildOpts := kconfig.KbuildOptions{
 			Variables: kbuildVariablesForConfig(vars, resolved),
 		}
@@ -1170,24 +891,12 @@ func compactMetadata(
 			kb, parseErr = kconfig.ParseKbuildFileWithOptions(workspacePath(kbuildPath), kbuildOpts)
 		}
 		if parseErr != nil {
-			return nil, "", parseErr
+			return kconfig.CompactConfigGraph{}, parseErr
 		}
-		for _, extra := range kbuildExtras {
-			extraRoot := sourceRoots[extra.Name]
-			if extraRoot == "" {
-				extraRoot = filepath.Dir(workspacePath(extra.Path))
-			}
-			extraKb, err := kconfig.ParseKbuildDirectoryTree(workspacePath(extra.Path), kconfig.KbuildOptions{
-				RootDir:         extraRoot,
-				Variables:       kbuildVariablesForConfig(vars, resolved),
-				MaxIncludeDepth: 64,
-			})
-			if err != nil {
-				return nil, "", err
-			}
-			kb = kconfig.MergeKbuildFileAtDirectory(kb, extra.Name, kconfig.PrefixKbuildFile(extraKb, extra.Name))
-		}
-		return kb, generatedHeadersByConfig[resolved.Name], nil
+		return kconfig.CompactConfigGraph{
+			Kbuild:                kb,
+			GeneratedHeadersLabel: generatedHeadersByConfig[resolved.Name],
+		}, nil
 	})
 }
 

@@ -1,8 +1,6 @@
 package kconfig
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,56 +17,22 @@ type NamedConfig struct {
 	AllNoConfig bool
 }
 
-type CompactSchema string
-
-const (
-	CompactSchemaV011 CompactSchema = "v0.0.11"
-	CompactSchemaV012 CompactSchema = "v0.0.12"
-	CompactSchemaV013 CompactSchema = "v0.0.13"
-)
-
-func ParseCompactSchema(value string) (CompactSchema, error) {
-	schema := CompactSchema(value)
-	switch schema {
-	case CompactSchemaV011, CompactSchemaV012, CompactSchemaV013:
-		return schema, nil
-	default:
-		return "", fmt.Errorf(
-			"unsupported compact schema %q (want %q, %q, or %q)",
-			value,
-			CompactSchemaV011,
-			CompactSchemaV012,
-			CompactSchemaV013,
-		)
-	}
-}
-
-func (s CompactSchema) isV012() bool {
-	return s == CompactSchemaV012 || s == CompactSchemaV013
-}
-
-func (s CompactSchema) isV013() bool {
-	return s == CompactSchemaV013
-}
-
 type CompactMetadata struct {
-	Schema                  CompactSchema                  `json:"schema,omitempty"`
 	Configs                 []CompactConfig                `json:"configs"`
-	ConfigPayloads          []CompactConfigPayload         `json:"config_payloads,omitempty"`
-	CompileEnvironments     []CompactCompileEnvironment    `json:"compile_environments,omitempty"`
-	GeneratedHeaderFamilies []CompactGeneratedHeaderFamily `json:"generated_header_families,omitempty"`
-	SourceFiles             []CompactSourceInput           `json:"source_files,omitempty"`
-	SourceInputGroups       []string                       `json:"source_input_groups,omitempty"`
-	ObjectPackages          []CompactObjectPackage         `json:"object_packages,omitempty"`
+	ConfigPayloads          []CompactConfigPayload         `json:"config_payloads"`
+	CompileEnvironments     []CompactCompileEnvironment    `json:"compile_environments"`
+	GeneratedHeaderFamilies []CompactGeneratedHeaderFamily `json:"generated_header_families"`
+	SourceFiles             []CompactSourceInput           `json:"source_files"`
+	SourceInputGroups       []string                       `json:"source_input_groups"`
 	ObjectVariants          []CompactObjectVariant         `json:"object_variants"`
 }
 
 type CompactConfig struct {
 	Name                string   `json:"name"`
-	ImageTarget         string   `json:"image_target"`
 	ConfigPayload       string   `json:"config_payload,omitempty"`
 	ObjectTargets       []string `json:"object_targets"`
 	ModuleObjectTargets []string `json:"module_object_targets,omitempty"`
+	imageTarget         string
 }
 
 type CompactSourceInput struct {
@@ -77,9 +41,9 @@ type CompactSourceInput struct {
 }
 
 type CompactConfigPayload struct {
-	ID       string            `json:"id"`
-	Content  string            `json:"content"`
-	Fragment map[string]string `json:"fragment,omitempty"`
+	ID       string `json:"id"`
+	Content  string `json:"content"`
+	fragment map[string]string
 }
 
 type CompactCompileEnvironment struct {
@@ -90,97 +54,54 @@ type CompactCompileEnvironment struct {
 }
 
 type CompactGeneratedHeaderFamily struct {
-	ID               string               `json:"id"`
-	Name             string               `json:"name"`
-	ConfigPayload    string               `json:"config_payload"`
-	Labels           []string             `json:"labels,omitempty"`
-	Srcarch          string               `json:"srcarch"`
-	Dependencies     []string             `json:"dependencies,omitempty"`
-	SourceInputGroup int                  `json:"source_input_group,omitempty"`
-	SourceInputs     []CompactSourceInput `json:"source_inputs,omitempty"`
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	ConfigPayload    string   `json:"config_payload"`
+	Labels           []string `json:"labels,omitempty"`
+	Srcarch          string   `json:"srcarch"`
+	Dependencies     []string `json:"dependencies,omitempty"`
+	SourceInputGroup int      `json:"source_input_group,omitempty"`
+	sourceInputs     []CompactSourceInput
 }
 
 type CompactObjectVariant struct {
-	Target                   string               `json:"target"`
-	ContentID                string               `json:"content_id,omitempty"`
-	CompileEnvironment       string               `json:"compile_environment,omitempty"`
-	Package                  string               `json:"package,omitempty"`
-	Object                   string               `json:"object"`
-	Source                   string               `json:"source,omitempty"`
-	SourceIncludes           []string             `json:"source_includes,omitempty"`
-	SourceInputGroup         int                  `json:"source_input_group,omitempty"`
-	SourceInputs             []CompactSourceInput `json:"source_inputs,omitempty"`
-	Mode                     string               `json:"mode"`
-	ModName                  string               `json:"modname,omitempty"`
-	Flags                    []string             `json:"flags,omitempty"`
-	RemoveFlags              []string             `json:"remove_flags,omitempty"`
-	ConfigFragment           map[string]string    `json:"config_fragment,omitempty"`
-	Deps                     []string             `json:"deps,omitempty"`
-	Members                  []string             `json:"members,omitempty"`
+	Target                   string `json:"target"`
+	ContentID                string `json:"content_id,omitempty"`
+	CompileEnvironment       string `json:"compile_environment,omitempty"`
+	Object                   string `json:"object"`
+	Source                   string `json:"source,omitempty"`
+	SourceInputGroup         int    `json:"source_input_group,omitempty"`
+	sourceInputs             []CompactSourceInput
+	Mode                     string   `json:"mode"`
+	ModName                  string   `json:"modname,omitempty"`
+	Flags                    []string `json:"flags,omitempty"`
+	RemoveFlags              []string `json:"remove_flags,omitempty"`
+	configFragment           map[string]string
+	Deps                     []string `json:"deps,omitempty"`
+	Members                  []string `json:"members,omitempty"`
 	generatedHeaderFamilyIDs []string
 }
 
-type CompactObjectPackage struct {
-	Package       string   `json:"package"`
-	ObjectTargets []string `json:"object_targets"`
-}
-
 type CompactBuildFileOptions struct {
-	Schema                   CompactSchema
-	Arch                     string
-	Version                  string
-	Visibility               []string
-	RuleLoadLabel            string
-	SourceLabelPackage       string
-	SourceLabelPackages      map[string]string
-	SourceASN1Compiler       string
-	SourceRelacheck          string
-	SourceRootLabel          string
-	SourceTreeAllFiles       []string
-	SourceTreeArchHeaders    []string
-	SourceTreeDtbSources     []string
-	SourceTreeGlobalHeaders  []string
-	SourceTreeHeaders        []string
-	SourceTreeKbuildFiles    []string
-	SourceTreeLocalIncludes  []string
-	SourceTreeLookupFiles    []string
-	SourceTreeScriptsHeaders []string
-	SourceTreeUapiHeaders    []string
-	GeneratedHeaders         string
-	SourceConfig             string
-	Srcarch                  string
-}
-
-type CompactImageBuildFileOptions struct {
-	Schema             CompactSchema
 	Arch               string
-	BaseConfig         string
+	Version            string
 	Visibility         []string
-	ObjectLabelPackage string
-	RequireReal        bool
 	RuleLoadLabel      string
-}
-
-func (opts CompactBuildFileOptions) hasSourceTreeLabels() bool {
-	return len(opts.SourceTreeAllFiles) != 0 ||
-		len(opts.SourceTreeArchHeaders) != 0 ||
-		len(opts.SourceTreeDtbSources) != 0 ||
-		len(opts.SourceTreeGlobalHeaders) != 0 ||
-		len(opts.SourceTreeHeaders) != 0 ||
-		len(opts.SourceTreeKbuildFiles) != 0 ||
-		len(opts.SourceTreeLocalIncludes) != 0 ||
-		len(opts.SourceTreeLookupFiles) != 0 ||
-		len(opts.SourceTreeScriptsHeaders) != 0 ||
-		len(opts.SourceTreeUapiHeaders) != 0
+	BaseConfig         string
+	ObjectLabelPackage string
+	Exports            []string
+	SourceLabelPackage string
+	SourceASN1Compiler string
+	SourceRelacheck    string
+	SourceRootLabel    string
+	Srcarch            string
 }
 
 type CompactMetadataOptions struct {
-	Schema                CompactSchema
 	ObjectDir             string
 	SourceRoot            string
 	SourceRoots           map[string]string
 	LibraryDirs           []string
-	GeneratedHeadersLabel string
 	CompileEnvironmentABI string
 	KernelVersion         string
 	// Srcarch selects architecture include roots while scanning source files for
@@ -188,136 +109,11 @@ type CompactMetadataOptions struct {
 	Srcarch string
 }
 
-func (t *Tree) CompactMetadata(kb *KbuildFile, configs []NamedConfig) (*CompactMetadata, error) {
-	return t.CompactMetadataWithOptions(kb, configs, CompactMetadataOptions{})
-}
-
-func MergeCompactMetadata(parts ...*CompactMetadata) (*CompactMetadata, error) {
-	out := &CompactMetadata{}
-	seenConfigs := map[string]bool{}
-	variants := map[string]CompactObjectVariant{}
-	configPayloads := map[string]CompactConfigPayload{}
-	compileEnvironments := map[string]CompactCompileEnvironment{}
-	generatedHeaderFamilies := map[string]CompactGeneratedHeaderFamily{}
-	sourceInputInterner := newCompactSourceInputInterner()
-	for _, part := range parts {
-		if part == nil {
-			continue
-		}
-		if part.Schema != "" {
-			if out.Schema != "" && out.Schema != part.Schema {
-				return nil, fmt.Errorf("cannot merge compact metadata schemas %q and %q", out.Schema, part.Schema)
-			}
-			out.Schema = part.Schema
-		}
-		for _, config := range part.Configs {
-			if seenConfigs[config.Name] {
-				return nil, fmt.Errorf("duplicate compact config name %q", config.Name)
-			}
-			seenConfigs[config.Name] = true
-			out.Configs = append(out.Configs, config)
-		}
-		for _, original := range part.ObjectVariants {
-			variant := original
-			if part.Schema.isV013() {
-				sourceInputs, err := part.expandedSourceInputGroup(
-					variant.SourceInputGroup,
-					variant.SourceInputs,
-					fmt.Sprintf("object target %q", variant.Target),
-				)
-				if err != nil {
-					return nil, err
-				}
-				variant.SourceInputGroup, err = sourceInputInterner.intern(
-					sourceInputs,
-					fmt.Sprintf("object target %q", variant.Target),
-				)
-				if err != nil {
-					return nil, err
-				}
-				variant.SourceInputs = nil
-			}
-			if existing, ok := variants[variant.Target]; ok && !existing.equal(variant) {
-				return nil, fmt.Errorf("object variants %q and %q produce duplicate target %q", existing.Object, variant.Object, variant.Target)
-			}
-			variants[variant.Target] = variant
-		}
-		for _, payload := range part.ConfigPayloads {
-			if existing, ok := configPayloads[payload.ID]; ok && !existing.equal(payload) {
-				return nil, fmt.Errorf("config payloads with content ID %q differ", payload.ID)
-			}
-			configPayloads[payload.ID] = payload
-		}
-		for _, environment := range part.CompileEnvironments {
-			if existing, ok := compileEnvironments[environment.ID]; ok && !existing.equal(environment) {
-				return nil, fmt.Errorf("compile environments with content ID %q differ", environment.ID)
-			}
-			compileEnvironments[environment.ID] = environment
-		}
-		for _, original := range part.GeneratedHeaderFamilies {
-			family := original
-			if part.Schema.isV013() {
-				sourceInputs, err := part.expandedSourceInputGroup(
-					family.SourceInputGroup,
-					family.SourceInputs,
-					fmt.Sprintf("generated header family %q", family.ID),
-				)
-				if err != nil {
-					return nil, err
-				}
-				family.SourceInputGroup, err = sourceInputInterner.intern(
-					sourceInputs,
-					fmt.Sprintf("generated header family %q", family.ID),
-				)
-				if err != nil {
-					return nil, err
-				}
-				family.SourceInputs = nil
-			}
-			if existing, ok := generatedHeaderFamilies[family.ID]; ok {
-				if existing.Name != family.Name ||
-					existing.ConfigPayload != family.ConfigPayload ||
-					existing.Srcarch != family.Srcarch ||
-					!stringSlicesEqual(existing.Dependencies, family.Dependencies) ||
-					existing.SourceInputGroup != family.SourceInputGroup ||
-					!compactSourceInputsEqual(existing.SourceInputs, family.SourceInputs) {
-					return nil, fmt.Errorf("generated header families with content ID %q differ", family.ID)
-				}
-				existing.Labels = appendUniqueStrings(existing.Labels, family.Labels...)
-				generatedHeaderFamilies[family.ID] = existing
-				continue
-			}
-			generatedHeaderFamilies[family.ID] = family
-		}
-	}
-	targets := make([]string, 0, len(variants))
-	for target := range variants {
-		targets = append(targets, target)
-	}
-	sort.Strings(targets)
-	for _, target := range targets {
-		out.ObjectVariants = append(out.ObjectVariants, variants[target])
-	}
-	out.ConfigPayloads = sortedCompactConfigPayloads(configPayloads)
-	out.CompileEnvironments = sortedCompactCompileEnvironments(compileEnvironments)
-	out.GeneratedHeaderFamilies = sortedCompactGeneratedHeaderFamilies(generatedHeaderFamilies)
-	out.ObjectPackages = compactObjectPackages(out.ObjectVariants)
-	if out.Schema.isV013() {
-		sourceInputInterner.apply(out)
-		if err := out.canonicalizeSourceInputIndex(); err != nil {
-			return nil, err
-		}
-	}
-	if err := out.validateContentIDs(); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig, opts CompactMetadataOptions) (*CompactMetadata, error) {
-	return t.compactMetadataBatchWithOptions(configs, opts, func(*ResolvedConfig) (*KbuildFile, string, error) {
-		return kb, opts.GeneratedHeadersLabel, nil
-	})
+// CompactConfigGraph binds one resolved configuration to its Kbuild graph and
+// the Bazel target that produces that configuration's generated headers.
+type CompactConfigGraph struct {
+	Kbuild                *KbuildFile
+	GeneratedHeadersLabel string
 }
 
 // CompactMetadataBatchWithOptions resolves and emits multiple config-specific
@@ -325,43 +121,26 @@ func (t *Tree) CompactMetadataWithOptions(kb *KbuildFile, configs []NamedConfig,
 func (t *Tree) CompactMetadataBatchWithOptions(
 	configs []NamedConfig,
 	opts CompactMetadataOptions,
-	kbuildForConfig func(*ResolvedConfig) (*KbuildFile, string, error),
+	graphForConfig func(*ResolvedConfig) (CompactConfigGraph, error),
 ) (*CompactMetadata, error) {
-	if kbuildForConfig == nil {
-		return nil, fmt.Errorf("compact metadata Kbuild resolver must not be nil")
+	if graphForConfig == nil {
+		return nil, fmt.Errorf("compact metadata config graph resolver must not be nil")
 	}
-	return t.compactMetadataBatchWithOptions(configs, opts, kbuildForConfig)
-}
-
-func (t *Tree) compactMetadataBatchWithOptions(
-	configs []NamedConfig,
-	opts CompactMetadataOptions,
-	kbuildForConfig func(*ResolvedConfig) (*KbuildFile, string, error),
-) (*CompactMetadata, error) {
-	if opts.Schema.isV013() && strings.TrimSpace(opts.CompileEnvironmentABI) == "" {
-		return nil, fmt.Errorf("compact schema %s requires a non-empty compile environment ABI", opts.Schema)
+	if strings.TrimSpace(opts.CompileEnvironmentABI) == "" {
+		return nil, fmt.Errorf("compact metadata requires a non-empty compile environment ABI")
 	}
-	if opts.Schema.isV013() && opts.SourceRoot == "" && len(opts.SourceRoots) == 0 {
-		return nil, fmt.Errorf("compact schema %s requires a source root for exact input scanning", opts.Schema)
+	if opts.SourceRoot == "" && len(opts.SourceRoots) == 0 {
+		return nil, fmt.Errorf("compact metadata requires a source root for exact input scanning")
 	}
 	variants := map[string]CompactObjectVariant{}
 	out := &CompactMetadata{}
-	if opts.Schema.isV013() {
-		out.Schema = opts.Schema
-	}
 	configPayloads := map[string]CompactConfigPayload{}
 	compileEnvironments := map[string]CompactCompileEnvironment{}
 	generatedHeaderFamilies := map[string]CompactGeneratedHeaderFamily{}
-	var sourceInputInterner *compactSourceInputInterner
-	if opts.Schema.isV013() {
-		sourceInputInterner = newCompactSourceInputInterner()
-	}
+	sourceInputInterner := newCompactSourceInputInterner()
 	seenConfigs := map[string]bool{}
 	seenImageTargets := map[string]string{}
-	var sourceCache *compactSourceCache
-	if opts.Schema.isV012() {
-		sourceCache = newCompactSourceCache()
-	}
+	sourceCache := newCompactSourceCache()
 	for _, named := range configs {
 		if named.Name == "" {
 			return nil, fmt.Errorf("compact config name must not be empty")
@@ -377,75 +156,72 @@ func (t *Tree) compactMetadataBatchWithOptions(
 		if err != nil {
 			return nil, err
 		}
-		kb, generatedHeadersLabel, err := kbuildForConfig(resolved)
+		graph, err := graphForConfig(resolved)
 		if err != nil {
 			return nil, fmt.Errorf("resolve Kbuild for config %q: %w", named.Name, err)
 		}
-		if kb == nil {
+		if graph.Kbuild == nil {
 			return nil, fmt.Errorf("resolve Kbuild for config %q: nil Kbuild", named.Name)
 		}
-		var scanner *configSourceScanner
-		if sourceCache != nil {
-			scanner = newConfigSourceScannerWithCache(opts, sourceCache)
+		if strings.TrimSpace(graph.GeneratedHeadersLabel) == "" {
+			return nil, fmt.Errorf("resolve Kbuild for config %q: generated headers label must not be empty", named.Name)
 		}
-		fullConfigPayload := CompactConfigPayload{}
+		kb := graph.Kbuild
+		generatedHeadersLabel := graph.GeneratedHeadersLabel
+		scanner := newConfigSourceScannerWithCache(opts, sourceCache)
+		fullConfigPayload := newCompactConfigPayload(compactFullConfigFragment(resolved))
+		configPayloads[fullConfigPayload.ID] = fullConfigPayload
 		configHeaderFamilies := compactGeneratedHeaderFamilySet{}
-		if opts.Schema.isV013() {
-			fullConfigPayload = newCompactConfigPayload(compactFullConfigFragment(resolved))
-			configPayloads[fullConfigPayload.ID] = fullConfigPayload
-			if generatedHeadersLabel != "" {
-				footprints, err := generatedHeaderFamilyFootprints(resolved, opts, scanner)
-				if err != nil {
-					return nil, fmt.Errorf("derive generated headers for config %q: %w", named.Name, err)
-				}
-				for _, footprint := range footprints {
-					if _, ok := configHeaderFamilies[footprint.name]; ok {
-						return nil, fmt.Errorf(
-							"derive generated headers for config %q: duplicate family %q",
-							named.Name,
-							footprint.name,
-						)
-					}
-					dependencyIDs := make([]string, 0, len(footprint.dependencies))
-					for _, dependencyName := range footprint.dependencies {
-						dependency, ok := configHeaderFamilies[dependencyName]
-						if !ok {
-							return nil, fmt.Errorf(
-								"derive generated headers for config %q: family %q depends on unknown or later family %q",
-								named.Name,
-								footprint.name,
-								dependencyName,
-							)
-						}
-						dependencyIDs = append(dependencyIDs, dependency.ID)
-					}
-					payload := newCompactConfigPayload(footprint.fragment)
-					configPayloads[payload.ID] = payload
-					family := newCompactGeneratedHeaderFamily(
-						footprint.name,
-						payload.ID,
-						generatedHeadersLabel,
-						opts.Srcarch,
-						dependencyIDs,
-						footprint.sourceInputs,
-					)
-					family.SourceInputGroup, err = sourceInputInterner.intern(
-						family.SourceInputs,
-						fmt.Sprintf("generated header family %q", family.ID),
-					)
-					if err != nil {
-						return nil, err
-					}
-					family.SourceInputs = nil
-					if existing, ok := generatedHeaderFamilies[family.ID]; ok {
-						existing.Labels = appendUniqueStrings(existing.Labels, family.Labels...)
-						generatedHeaderFamilies[family.ID] = existing
-					} else {
-						generatedHeaderFamilies[family.ID] = family
-					}
-					configHeaderFamilies[family.Name] = family
-				}
+		footprints, err := generatedHeaderFamilyFootprints(resolved, opts, scanner)
+		if err != nil {
+			return nil, fmt.Errorf("derive generated headers for config %q: %w", named.Name, err)
+		}
+		for _, footprint := range footprints {
+			if _, ok := configHeaderFamilies[footprint.name]; ok {
+				return nil, fmt.Errorf(
+					"derive generated headers for config %q: duplicate family %q",
+					named.Name,
+					footprint.name,
+				)
 			}
+			dependencyIDs := make([]string, 0, len(footprint.dependencies))
+			for _, dependencyName := range footprint.dependencies {
+				dependency, ok := configHeaderFamilies[dependencyName]
+				if !ok {
+					return nil, fmt.Errorf(
+						"derive generated headers for config %q: family %q depends on unknown or later family %q",
+						named.Name,
+						footprint.name,
+						dependencyName,
+					)
+				}
+				dependencyIDs = append(dependencyIDs, dependency.ID)
+			}
+			payload := newCompactConfigPayload(footprint.fragment)
+			configPayloads[payload.ID] = payload
+			family := newCompactGeneratedHeaderFamily(
+				footprint.name,
+				payload.ID,
+				generatedHeadersLabel,
+				opts.Srcarch,
+				dependencyIDs,
+				footprint.sourceInputs,
+			)
+			family.SourceInputGroup, err = sourceInputInterner.intern(
+				family.sourceInputs,
+				fmt.Sprintf("generated header family %q", family.ID),
+			)
+			if err != nil {
+				return nil, err
+			}
+			family.sourceInputs = nil
+			if existing, ok := generatedHeaderFamilies[family.ID]; ok {
+				existing.Labels = appendUniqueStrings(existing.Labels, family.Labels...)
+				generatedHeaderFamilies[family.ID] = existing
+			} else {
+				generatedHeaderFamilies[family.ID] = family
+			}
+			configHeaderFamilies[family.Name] = family
 		}
 		imageTarget := sanitizeTargetName(named.Name) + "_image"
 		if existing := seenImageTargets[imageTarget]; existing != "" {
@@ -456,7 +232,7 @@ func (t *Tree) compactMetadataBatchWithOptions(
 		objects := kb.resolvedObjects(resolved)
 		resolvedVariants := compactVariantMemo{}
 		for _, object := range objects.all() {
-			if opts.Schema.isV012() && rustSDKOwnsObject(object.object) {
+			if rustSDKOwnsObject(object.object) {
 				continue
 			}
 			variant, err := resolvedVariants.variantFor(
@@ -470,23 +246,21 @@ func (t *Tree) compactMetadataBatchWithOptions(
 			if err != nil {
 				return nil, err
 			}
-			if sourceInputInterner != nil {
-				variant.SourceInputGroup, err = sourceInputInterner.intern(
-					variant.SourceInputs,
-					fmt.Sprintf("object target %q", variant.Target),
-				)
-				if err != nil {
-					return nil, err
-				}
-				variant.SourceInputs = nil
+			variant.SourceInputGroup, err = sourceInputInterner.intern(
+				variant.sourceInputs,
+				fmt.Sprintf("object target %q", variant.Target),
+			)
+			if err != nil {
+				return nil, err
 			}
+			variant.sourceInputs = nil
 			resolvedVariants[object.object] = variant
 			if existing, ok := variants[variant.Target]; ok && !existing.equal(variant) {
 				return nil, fmt.Errorf("object variants %q and %q produce duplicate target %q", existing.Object, variant.Object, variant.Target)
 			}
 			variants[variant.Target] = variant
-			if opts.Schema.isV013() && variant.CompileEnvironment != "" {
-				payload := newCompactConfigPayload(variant.ConfigFragment)
+			if variant.CompileEnvironment != "" {
+				payload := newCompactConfigPayload(variant.configFragment)
 				configPayloads[payload.ID] = payload
 				environment := newCompactCompileEnvironment(
 					opts.CompileEnvironmentABI,
@@ -514,7 +288,7 @@ func (t *Tree) compactMetadataBatchWithOptions(
 		moduleTargets := make([]string, 0, len(objects.roots))
 		appendRootTargets := func(roots []resolvedKbuildObject) error {
 			for _, object := range roots {
-				if opts.Schema.isV012() && rustSDKOwnsObject(object.object) {
+				if rustSDKOwnsObject(object.object) {
 					continue
 				}
 				variant, ok := resolvedVariants[object.object]
@@ -542,10 +316,10 @@ func (t *Tree) compactMetadataBatchWithOptions(
 		}
 		out.Configs = append(out.Configs, CompactConfig{
 			Name:                named.Name,
-			ImageTarget:         imageTarget,
 			ConfigPayload:       fullConfigPayload.ID,
 			ObjectTargets:       targets,
 			ModuleObjectTargets: moduleTargets,
+			imageTarget:         imageTarget,
 		})
 	}
 
@@ -560,12 +334,9 @@ func (t *Tree) compactMetadataBatchWithOptions(
 	out.ConfigPayloads = sortedCompactConfigPayloads(configPayloads)
 	out.CompileEnvironments = sortedCompactCompileEnvironments(compileEnvironments)
 	out.GeneratedHeaderFamilies = sortedCompactGeneratedHeaderFamilies(generatedHeaderFamilies)
-	out.ObjectPackages = compactObjectPackages(out.ObjectVariants)
-	if sourceInputInterner != nil {
-		sourceInputInterner.apply(out)
-		if err := out.canonicalizeSourceInputIndex(); err != nil {
-			return nil, err
-		}
+	sourceInputInterner.apply(out)
+	if err := out.canonicalizeSourceInputIndex(); err != nil {
+		return nil, err
 	}
 	if err := out.validateContentIDs(); err != nil {
 		return nil, err
@@ -668,16 +439,11 @@ func cleanKbuildDir(dir string) string {
 }
 
 func (v CompactObjectVariant) equal(other CompactObjectVariant) bool {
-	if v.Target != other.Target || v.ContentID != other.ContentID || v.CompileEnvironment != other.CompileEnvironment || v.Package != other.Package || v.Object != other.Object || v.Source != other.Source || v.SourceInputGroup != other.SourceInputGroup || v.Mode != other.Mode || v.ModName != other.ModName || len(v.SourceIncludes) != len(other.SourceIncludes) || len(v.SourceInputs) != len(other.SourceInputs) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ConfigFragment) != len(other.ConfigFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
+	if v.Target != other.Target || v.ContentID != other.ContentID || v.CompileEnvironment != other.CompileEnvironment || v.Object != other.Object || v.Source != other.Source || v.SourceInputGroup != other.SourceInputGroup || v.Mode != other.Mode || v.ModName != other.ModName || len(v.sourceInputs) != len(other.sourceInputs) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.configFragment) != len(other.configFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
 		return false
 	}
-	for i := range v.SourceIncludes {
-		if v.SourceIncludes[i] != other.SourceIncludes[i] {
-			return false
-		}
-	}
-	for i := range v.SourceInputs {
-		if v.SourceInputs[i] != other.SourceInputs[i] {
+	for i := range v.sourceInputs {
+		if v.sourceInputs[i] != other.sourceInputs[i] {
 			return false
 		}
 	}
@@ -701,30 +467,12 @@ func (v CompactObjectVariant) equal(other CompactObjectVariant) bool {
 			return false
 		}
 	}
-	for key, value := range v.ConfigFragment {
-		if other.ConfigFragment[key] != value {
+	for key, value := range v.configFragment {
+		if other.configFragment[key] != value {
 			return false
 		}
 	}
 	return true
-}
-
-type compactMetadataJSON CompactMetadata
-
-func (m CompactMetadata) MarshalJSON() ([]byte, error) {
-	normalized := compactMetadataJSON(m)
-	if !m.Schema.isV013() {
-		return json.Marshal(normalized)
-	}
-	normalized.ConfigPayloads = append([]CompactConfigPayload(nil), m.ConfigPayloads...)
-	for i := range normalized.ConfigPayloads {
-		normalized.ConfigPayloads[i].Fragment = nil
-	}
-	normalized.ObjectVariants = append([]CompactObjectVariant(nil), m.ObjectVariants...)
-	for i := range normalized.ObjectVariants {
-		normalized.ObjectVariants[i].ConfigFragment = nil
-	}
-	return json.Marshal(normalized)
 }
 
 func (m *CompactMetadata) JSON() ([]byte, error) {
@@ -734,7 +482,29 @@ func (m *CompactMetadata) JSON() ([]byte, error) {
 	if err := m.validateContentIDs(); err != nil {
 		return nil, err
 	}
-	data, err := json.MarshalIndent(m, "", "  ")
+	serializable := *m
+	if serializable.Configs == nil {
+		serializable.Configs = []CompactConfig{}
+	}
+	if serializable.ConfigPayloads == nil {
+		serializable.ConfigPayloads = []CompactConfigPayload{}
+	}
+	if serializable.CompileEnvironments == nil {
+		serializable.CompileEnvironments = []CompactCompileEnvironment{}
+	}
+	if serializable.GeneratedHeaderFamilies == nil {
+		serializable.GeneratedHeaderFamilies = []CompactGeneratedHeaderFamily{}
+	}
+	if serializable.SourceFiles == nil {
+		serializable.SourceFiles = []CompactSourceInput{}
+	}
+	if serializable.SourceInputGroups == nil {
+		serializable.SourceInputGroups = []string{}
+	}
+	if serializable.ObjectVariants == nil {
+		serializable.ObjectVariants = []CompactObjectVariant{}
+	}
+	data, err := json.MarshalIndent(&serializable, "", "  ")
 	if err != nil {
 		return nil, err
 	}
@@ -1278,17 +1048,14 @@ func (memo compactVariantMemo) variantForStack(
 	delete(stack, name)
 
 	source := sourceForObject(opts.SourceRoot, opts.ObjectDir, object.object, opts.SourceRoots)
-	specialSources := compactSpecialSourceInputs{}
-	if opts.Schema.isV013() {
-		specialSources = compactSpecialSourcesForObject(name)
-		if specialSources.primary != "" {
-			source = specialSources.primary
-		}
+	specialSources := compactSpecialSourcesForObject(name)
+	if specialSources.primary != "" {
+		source = specialSources.primary
 	}
 	if len(members) != 0 {
 		source = ""
 	}
-	if opts.Schema.isV013() && len(members) == 0 && source == "" {
+	if len(members) == 0 && source == "" {
 		return CompactObjectVariant{}, fmt.Errorf("exact input scan cannot resolve a source for leaf object %q", name)
 	}
 	deps := []string{}
@@ -1325,10 +1092,10 @@ func (memo compactVariantMemo) variantForStack(
 		sort.Strings(depContentIDs)
 	}
 
-	var sourceRefs, sourceIncludes, generatedIncludes []string
+	var sourceRefs, generatedIncludes []string
 	var sourceInputs []CompactSourceInput
 	forceAllGeneratedHeaders := false
-	if (opts.Schema == CompactSchemaV012 || opts.Schema == CompactSchemaV013) && source != "" {
+	if source != "" {
 		flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(object.flags, source), opts.SourceRoot)
 		includeDirs := includeDirsFromFlags(flags)
 		actionFootprint := compactObjectActionFootprintForObject(name, flags)
@@ -1340,113 +1107,123 @@ func (memo compactVariantMemo) variantForStack(
 		if object.mode == "m" {
 			profile = sourceScanKernelModule
 		}
-		var closure sourceClosure
-		var err error
-		if opts.Schema.isV013() {
-			closure, err = scanner.closureForSourceConfigInputsSearchProfile(
-				source,
+		closure, err := scanner.closureForSourceConfigInputsSearchProfile(
+			source,
+			scanner.actionIncludeSearch(source, flags),
+			config,
+			isAssemblySourcePath(source),
+			actionFootprint.providedIncludes,
+			profile,
+		)
+		if err != nil {
+			return CompactObjectVariant{}, fmt.Errorf("scan source inputs for %s: %w", name, err)
+		}
+		sourceRefs = append(sourceRefs, closure.refs...)
+		generatedIncludes = append(generatedIncludes, closure.generatedIncludes...)
+		forceAllGeneratedHeaders = actionFootprint.fullGeneratedHeaders ||
+			len(specialSources.inputs) != 0
+		sourceRefs = appendUniqueStrings(sourceRefs, actionFootprint.configSymbols...)
+		sourceInputs = append(sourceInputs, closure.sourceInputs...)
+		for _, path := range actionFootprint.sourceInputs {
+			input, err := scanner.inputForTreePath(path)
+			if err != nil {
+				return CompactObjectVariant{}, fmt.Errorf(
+					"record generated-input producer %s for %s: %w",
+					path,
+					name,
+					err,
+				)
+			}
+			sourceInputs = appendUniqueSourceInputs(sourceInputs, input)
+		}
+		for _, forcedSource := range forcedSourceInputs(flags, source) {
+			forcedClosure, err := scanner.closureForSourceConfigInputsSearchProfile(
+				forcedSource,
 				scanner.actionIncludeSearch(source, flags),
 				config,
 				isAssemblySourcePath(source),
 				actionFootprint.providedIncludes,
 				profile,
 			)
-		} else {
-			closure, err = scanner.closureForSourceConfigInputs(
-				source,
-				includeDirs,
+			if err != nil {
+				return CompactObjectVariant{}, fmt.Errorf(
+					"scan forced source input %s for %s: %w",
+					forcedSource,
+					name,
+					err,
+				)
+			}
+			sourceRefs = appendUniqueStrings(sourceRefs, forcedClosure.refs...)
+			generatedIncludes = appendUniqueStrings(
+				generatedIncludes,
+				forcedClosure.generatedIncludes...,
+			)
+			sourceInputs = appendUniqueSourceInputs(sourceInputs, forcedClosure.sourceInputs...)
+		}
+		for _, generatedSource := range actionFootprint.closureInputs {
+			generatedClosure, err := scanner.closureForSourceConfigInputsSearchProfile(
+				generatedSource,
+				scanner.actionIncludeSearch(source, flags),
 				config,
 				isAssemblySourcePath(source),
 				actionFootprint.providedIncludes,
+				profile,
 			)
-		}
-		if err != nil {
-			return CompactObjectVariant{}, fmt.Errorf("scan source inputs for %s: %w", name, err)
-		}
-		sourceRefs = append(sourceRefs, closure.refs...)
-		sourceIncludes = append(sourceIncludes, closure.sourceIncludes...)
-		generatedIncludes = append(generatedIncludes, closure.generatedIncludes...)
-		if opts.Schema.isV013() {
-			forceAllGeneratedHeaders = actionFootprint.fullGeneratedHeaders ||
-				len(specialSources.inputs) != 0
-			sourceRefs = appendUniqueStrings(sourceRefs, actionFootprint.configSymbols...)
-			sourceInputs = append(sourceInputs, closure.sourceInputs...)
-			for _, path := range actionFootprint.sourceInputs {
-				input, err := scanner.inputForTreePath(path)
-				if err != nil {
-					return CompactObjectVariant{}, fmt.Errorf(
-						"record generated-input producer %s for %s: %w",
-						path,
-						name,
-						err,
-					)
-				}
-				sourceInputs = appendUniqueSourceInputs(sourceInputs, input)
-			}
-			for _, forcedSource := range forcedSourceInputs(flags, source) {
-				forcedClosure, err := scanner.closureForSourceConfigInputsSearchProfile(
-					forcedSource,
-					scanner.actionIncludeSearch(source, flags),
-					config,
-					isAssemblySourcePath(source),
-					actionFootprint.providedIncludes,
-					profile,
-				)
-				if err != nil {
-					return CompactObjectVariant{}, fmt.Errorf(
-						"scan forced source input %s for %s: %w",
-						forcedSource,
-						name,
-						err,
-					)
-				}
-				sourceRefs = appendUniqueStrings(sourceRefs, forcedClosure.refs...)
-				sourceIncludes = appendUniqueStrings(sourceIncludes, forcedClosure.sourceIncludes...)
-				generatedIncludes = appendUniqueStrings(
-					generatedIncludes,
-					forcedClosure.generatedIncludes...,
-				)
-				sourceInputs = appendUniqueSourceInputs(sourceInputs, forcedClosure.sourceInputs...)
-			}
-			for _, generatedSource := range actionFootprint.closureInputs {
-				generatedClosure, err := scanner.closureForSourceConfigInputsSearchProfile(
+			if err != nil {
+				return CompactObjectVariant{}, fmt.Errorf(
+					"scan generated source input %s for %s: %w",
 					generatedSource,
-					scanner.actionIncludeSearch(source, flags),
-					config,
-					isAssemblySourcePath(source),
-					actionFootprint.providedIncludes,
-					profile,
+					name,
+					err,
 				)
-				if err != nil {
-					return CompactObjectVariant{}, fmt.Errorf(
-						"scan generated source input %s for %s: %w",
-						generatedSource,
-						name,
-						err,
-					)
-				}
-				sourceRefs = appendUniqueStrings(sourceRefs, generatedClosure.refs...)
-				sourceIncludes = appendUniqueStrings(sourceIncludes, generatedClosure.sourceIncludes...)
-				generatedIncludes = appendUniqueStrings(
-					generatedIncludes,
-					generatedClosure.generatedIncludes...,
-				)
-				sourceInputs = appendUniqueSourceInputs(sourceInputs, generatedClosure.sourceInputs...)
 			}
-			specialIncludeDirs := appendUniqueStrings(
-				append([]string(nil), includeDirs...),
-				specialSources.includeRoots...,
+			sourceRefs = appendUniqueStrings(sourceRefs, generatedClosure.refs...)
+			generatedIncludes = appendUniqueStrings(
+				generatedIncludes,
+				generatedClosure.generatedIncludes...,
 			)
-			for _, input := range specialSources.inputs {
-				if input.path == source {
-					continue
-				}
-				specialProfile := profile
-				if input.profile != sourceScanKernel {
-					specialProfile = input.profile
-				}
-				specialClosure, err := scanner.closureForSourceConfigInputsProfile(
+			sourceInputs = appendUniqueSourceInputs(sourceInputs, generatedClosure.sourceInputs...)
+		}
+		specialIncludeDirs := appendUniqueStrings(
+			append([]string(nil), includeDirs...),
+			specialSources.includeRoots...,
+		)
+		for _, input := range specialSources.inputs {
+			if input.path == source {
+				continue
+			}
+			specialProfile := profile
+			if input.profile != sourceScanKernel {
+				specialProfile = input.profile
+			}
+			specialClosure, err := scanner.closureForSourceConfigInputsProfile(
+				input.path,
+				specialIncludeDirs,
+				config,
+				isAssemblySourcePath(input.path),
+				actionFootprint.providedIncludes,
+				specialProfile,
+			)
+			if err != nil {
+				return CompactObjectVariant{}, fmt.Errorf(
+					"scan special source input %s for %s: %w",
 					input.path,
+					name,
+					err,
+				)
+			}
+			sourceRefs = appendUniqueStrings(sourceRefs, specialClosure.refs...)
+			generatedIncludes = appendUniqueStrings(
+				generatedIncludes,
+				specialClosure.generatedIncludes...,
+			)
+			sourceInputs = appendUniqueSourceInputs(sourceInputs, specialClosure.sourceInputs...)
+			if !input.compiled {
+				continue
+			}
+			for _, forcedSource := range forcedSourceInputs(nil, input.path) {
+				forcedClosure, err := scanner.closureForSourceConfigInputsProfile(
+					forcedSource,
 					specialIncludeDirs,
 					config,
 					isAssemblySourcePath(input.path),
@@ -1455,60 +1232,23 @@ func (memo compactVariantMemo) variantForStack(
 				)
 				if err != nil {
 					return CompactObjectVariant{}, fmt.Errorf(
-						"scan special source input %s for %s: %w",
+						"scan forced source input %s for special input %s of %s: %w",
+						forcedSource,
 						input.path,
 						name,
 						err,
 					)
 				}
-				sourceRefs = appendUniqueStrings(sourceRefs, specialClosure.refs...)
-				sourceIncludes = appendUniqueStrings(sourceIncludes, specialClosure.sourceIncludes...)
+				sourceRefs = appendUniqueStrings(sourceRefs, forcedClosure.refs...)
 				generatedIncludes = appendUniqueStrings(
 					generatedIncludes,
-					specialClosure.generatedIncludes...,
+					forcedClosure.generatedIncludes...,
 				)
-				sourceInputs = appendUniqueSourceInputs(sourceInputs, specialClosure.sourceInputs...)
-				if !input.compiled {
-					continue
-				}
-				for _, forcedSource := range forcedSourceInputs(nil, input.path) {
-					forcedClosure, err := scanner.closureForSourceConfigInputsProfile(
-						forcedSource,
-						specialIncludeDirs,
-						config,
-						isAssemblySourcePath(input.path),
-						actionFootprint.providedIncludes,
-						specialProfile,
-					)
-					if err != nil {
-						return CompactObjectVariant{}, fmt.Errorf(
-							"scan forced source input %s for special input %s of %s: %w",
-							forcedSource,
-							input.path,
-							name,
-							err,
-						)
-					}
-					sourceRefs = appendUniqueStrings(sourceRefs, forcedClosure.refs...)
-					sourceIncludes = appendUniqueStrings(sourceIncludes, forcedClosure.sourceIncludes...)
-					generatedIncludes = appendUniqueStrings(
-						generatedIncludes,
-						forcedClosure.generatedIncludes...,
-					)
-					sourceInputs = appendUniqueSourceInputs(sourceInputs, forcedClosure.sourceInputs...)
-				}
+				sourceInputs = appendUniqueSourceInputs(sourceInputs, forcedClosure.sourceInputs...)
 			}
-		}
-		if opts.Schema == CompactSchemaV012 && isMultiSourceImageObject(name) {
-			dirClosure, err := scanner.closureForSourceDirConfig(objectPackage(name), config)
-			if err != nil {
-				return CompactObjectVariant{}, fmt.Errorf("scan multi-source inputs for %s: %w", name, err)
-			}
-			sourceRefs = appendUniqueStrings(sourceRefs, dirClosure.refs...)
-			sourceIncludes = appendUniqueStrings(sourceIncludes, dirClosure.sourceIncludes...)
 		}
 	}
-	if opts.Schema.isV013() && isArm64NvheObject(name) {
+	if isArm64NvheObject(name) {
 		forceAllGeneratedHeaders = true
 		for _, actionSource := range []string{
 			"arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
@@ -1525,7 +1265,6 @@ func (memo compactVariantMemo) variantForStack(
 				)
 			}
 			sourceRefs = appendUniqueStrings(sourceRefs, closure.refs...)
-			sourceIncludes = appendUniqueStrings(sourceIncludes, closure.sourceIncludes...)
 			generatedIncludes = appendUniqueStrings(
 				generatedIncludes,
 				closure.generatedIncludes...,
@@ -1547,7 +1286,6 @@ func (memo compactVariantMemo) variantForStack(
 	variant := object.variant(
 		config,
 		source,
-		sourceIncludes,
 		sourceInputs,
 		members,
 		deps,
@@ -1555,18 +1293,11 @@ func (memo compactVariantMemo) variantForStack(
 		depContentIDs,
 		opts.SourceRoot,
 		sourceRefs,
-		opts.Schema,
 		opts.CompileEnvironmentABI,
 		generatedHeaderFamilyIDs,
 	)
 	memo[name] = variant
 	return variant, nil
-}
-
-func isMultiSourceImageObject(object string) bool {
-	return strings.HasPrefix(object, "arch/x86/entry/vdso/vdso-image-") ||
-		object == "arch/x86/realmode/rmpiggy.o" ||
-		object == "arch/x86/purgatory/kexec-purgatory.o"
 }
 
 type compactSpecialSourceInput struct {
@@ -1608,6 +1339,8 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 		footprint.providedIncludes = []string{"scsi_devinfo_tbl.c"}
 	case "drivers/tty/vt/consolemap_deftbl.o":
 		footprint.closureInputs = []string{"include/linux/types.h"}
+	case "drivers/of/empty_root.dtb.o":
+		footprint.closureInputs = []string{"include/asm-generic/vmlinux.lds.h"}
 	case "lib/crc/crc32-main.o":
 		footprint.providedIncludes = []string{"crc32table.h"}
 	case "lib/crc32.o":
@@ -1631,7 +1364,7 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 	case "usr/initramfs_data.o":
 		footprint.sourceInputs = []string{"usr/default_cpio_list"}
 	case "arch/x86/kernel/cpu/capflags.o":
-		footprint.sourceInputs = []string{
+		footprint.closureInputs = []string{
 			"arch/x86/include/asm/cpufeatures.h",
 			"arch/x86/include/asm/vmxfeatures.h",
 		}
@@ -1673,6 +1406,12 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 		footprint.fullGeneratedHeaders = true
 	}
 	return footprint
+}
+
+func isMultiSourceImageObject(object string) bool {
+	return strings.HasPrefix(object, "arch/x86/entry/vdso/vdso-image-") ||
+		object == "arch/x86/realmode/rmpiggy.o" ||
+		object == "arch/x86/purgatory/kexec-purgatory.o"
 }
 
 func flagsNeedUTSVersionTmp(flags []string) bool {
@@ -1830,7 +1569,6 @@ func forcedSourceInputs(flags []string, source string) []string {
 func (o resolvedKbuildObject) variant(
 	config *ResolvedConfig,
 	source string,
-	sourceIncludes []string,
 	sourceInputs []CompactSourceInput,
 	members []string,
 	deps []string,
@@ -1838,31 +1576,28 @@ func (o resolvedKbuildObject) variant(
 	depContentIDs []string,
 	sourceRoot string,
 	sourceRefs []string,
-	schema CompactSchema,
 	compileEnvironmentABI string,
 	generatedHeaderFamilyIDs []string,
 ) CompactObjectVariant {
 	fragment := map[string]string{}
 	refset := make(map[string]bool, len(o.footprint)+len(sourceRefs))
-	if !schema.isV013() || len(members) == 0 {
+	if len(members) == 0 {
 		for ref := range o.footprint {
 			refset[ref] = true
 		}
 	}
-	if schema == CompactSchemaV012 || schema == CompactSchemaV013 {
-		for _, ref := range sourceRefs {
+	for _, ref := range sourceRefs {
+		refset[ref] = true
+	}
+	if source != "" || isArm64NvheObject(o.object) {
+		for _, ref := range KernelFlagsConfigSymbols() {
 			refset[ref] = true
 		}
-		if source != "" || isArm64NvheObject(o.object) {
-			for _, ref := range KernelFlagsConfigSymbols() {
-				refset[ref] = true
-			}
-		}
-		if objectNeedsFullConfig(o.object) {
-			for key, written := range config.Written {
-				if written {
-					refset[key] = true
-				}
+	}
+	if objectNeedsFullConfig(o.object) {
+		for key, written := range config.Written {
+			if written {
+				refset[key] = true
 			}
 		}
 	}
@@ -1872,7 +1607,7 @@ func (o resolvedKbuildObject) variant(
 	}
 	sort.Strings(refs)
 	for _, ref := range refs {
-		if !schema.isV012() || config.ShouldWrite(ref) {
+		if config.ShouldWrite(ref) {
 			fragment[ref] = config.Value(ref)
 		} else {
 			fragment[ref] = "n"
@@ -1881,65 +1616,56 @@ func (o resolvedKbuildObject) variant(
 	flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.flags, source), sourceRoot)
 	remove := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.remove, source), sourceRoot)
 	modname := o.modname
-	compileComposite := schema.isV013() && isArm64NvheObject(o.object)
-	if schema.isV013() && len(members) != 0 {
+	compileComposite := isArm64NvheObject(o.object)
+	if len(members) != 0 {
 		modname = ""
 		flags = nil
 		remove = nil
-		sourceIncludes = nil
 		deps = nil
 		depContentIDs = nil
 		if !compileComposite {
 			sourceInputs = nil
 		}
 	}
-	targetHash := ""
 	contentID := ""
 	compileEnvironmentID := ""
-	if schema.isV013() {
-		usesCompileEnvironment := len(members) == 0 || compileComposite
-		if usesCompileEnvironment {
-			payload := newCompactConfigPayload(fragment)
-			environment := newCompactCompileEnvironment(
-				compileEnvironmentABI,
-				payload.ID,
-				generatedHeaderFamilyIDs,
-			)
-			compileEnvironmentID = environment.ID
-		} else {
-			fragment = map[string]string{}
-		}
-		contentID = objectVariantContentID(
-			o.object,
-			o.mode,
-			modname,
-			flags,
-			remove,
-			compileEnvironmentID,
-			source,
-			sourceInputs,
-			depContentIDs,
-			memberContentIDs,
+	usesCompileEnvironment := len(members) == 0 || compileComposite
+	if usesCompileEnvironment {
+		payload := newCompactConfigPayload(fragment)
+		environment := newCompactCompileEnvironment(
 			compileEnvironmentABI,
+			payload.ID,
+			generatedHeaderFamilyIDs,
 		)
-		targetHash = compactShortID(contentID)
+		compileEnvironmentID = environment.ID
 	} else {
-		targetHash = objectVariantHash(o.object, o.mode, modname, flags, remove, fragment, sourceIncludes, deps, members)
+		fragment = map[string]string{}
 	}
+	contentID = objectVariantContentID(
+		o.object,
+		o.mode,
+		modname,
+		flags,
+		remove,
+		compileEnvironmentID,
+		source,
+		sourceInputs,
+		depContentIDs,
+		memberContentIDs,
+		compileEnvironmentABI,
+	)
 	return CompactObjectVariant{
-		Target:             sanitizeTargetName(strings.TrimSuffix(o.object, ".o")) + "__" + targetHash,
+		Target:             sanitizeTargetName(strings.TrimSuffix(o.object, ".o")) + "__" + compactShortID(contentID),
 		ContentID:          contentID,
 		CompileEnvironment: compileEnvironmentID,
-		Package:            objectPackage(o.object),
 		Object:             o.object,
 		Source:             source,
-		SourceIncludes:     append([]string(nil), sourceIncludes...),
-		SourceInputs:       append([]CompactSourceInput(nil), sourceInputs...),
+		sourceInputs:       append([]CompactSourceInput(nil), sourceInputs...),
 		Mode:               o.mode,
 		ModName:            modname,
 		Flags:              flags,
 		RemoveFlags:        remove,
-		ConfigFragment:     fragment,
+		configFragment:     fragment,
 		Deps:               append([]string(nil), deps...),
 		Members:            append([]string(nil), members...),
 		generatedHeaderFamilyIDs: append(
@@ -2193,105 +1919,37 @@ func quotedInclude(line string) (string, bool) {
 	return line[:end], true
 }
 
-func compactObjectPackages(variants []CompactObjectVariant) []CompactObjectPackage {
-	byPackage := map[string][]string{}
-	for _, variant := range variants {
-		byPackage[variant.Package] = append(byPackage[variant.Package], variant.Target)
+func (m *CompactMetadata) BuildFile(opts CompactBuildFileOptions) ([]byte, error) {
+	objectBuild, err := m.objectBuildFile(opts)
+	if err != nil {
+		return nil, err
 	}
-	packages := make([]string, 0, len(byPackage))
-	for pkg := range byPackage {
-		packages = append(packages, pkg)
+	imageBuild, err := m.imageBuildFile(opts)
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(packages)
-	out := make([]CompactObjectPackage, 0, len(packages))
-	for _, pkg := range packages {
-		targets := byPackage[pkg]
-		sort.Strings(targets)
-		out = append(out, CompactObjectPackage{
-			Package:       pkg,
-			ObjectTargets: targets,
-		})
-	}
-	return out
+	return mergeBuildFiles("compact.BUILD.bazel", opts.Exports, objectBuild, imageBuild)
 }
 
-func objectPackage(object string) string {
-	dir := filepath.ToSlash(filepath.Dir(object))
-	if dir == "." {
-		return ""
+func (m *CompactMetadata) objectBuildFile(opts CompactBuildFileOptions) ([]byte, error) {
+	if err := m.validateContentIDs(); err != nil {
+		return nil, err
 	}
-	return dir
-}
-
-func objectVariantHash(object, mode, modname string, flags, removeFlags []string, fragment map[string]string, sourceIncludes, deps, members []string) string {
-	var b strings.Builder
-	b.WriteString(object)
-	b.WriteByte('\n')
-	b.WriteString(mode)
-	b.WriteByte('\n')
-	b.WriteString(modname)
-	b.WriteByte('\n')
-	for _, flag := range flags {
-		b.WriteString(flag)
-		b.WriteByte('\n')
+	if opts.SourceLabelPackage == "" {
+		return nil, fmt.Errorf("compact object BUILD emission requires a source label package")
 	}
-	for _, flag := range removeFlags {
-		b.WriteString("remove=")
-		b.WriteString(flag)
-		b.WriteByte('\n')
-	}
-	for _, key := range sortedConfigKeys(fragment) {
-		b.WriteString(key)
-		b.WriteByte('=')
-		b.WriteString(fragment[key])
-		b.WriteByte('\n')
-	}
-	for _, include := range sourceIncludes {
-		b.WriteString("source_include=")
-		b.WriteString(include)
-		b.WriteByte('\n')
-	}
-	for _, dep := range deps {
-		b.WriteString("dep=")
-		b.WriteString(dep)
-		b.WriteByte('\n')
-	}
-	for _, member := range members {
-		b.WriteString("member=")
-		b.WriteString(member)
-		b.WriteByte('\n')
-	}
-	sum := sha256.Sum256([]byte(b.String()))
-	return hex.EncodeToString(sum[:])[:16]
-}
-
-func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte, error) {
-	if opts.Schema.isV013() {
-		if err := m.validateContentIDs(); err != nil {
-			return nil, err
-		}
+	if opts.SourceRootLabel == "" {
+		return nil, fmt.Errorf("compact object BUILD emission requires a source root label")
 	}
 	visibility := opts.Visibility
 	if len(visibility) == 0 {
 		visibility = []string{"//visibility:public"}
 	}
 	file := buildgen.NewBuildFile("compact_objects.BUILD.bazel", "# Generated by kconfig_parse compact backend. Do not edit.")
-	loads := []string{"linux_object"}
-	compileEnvironmentIndexTarget := ""
-	sourceInputIndexTarget := ""
-	if opts.Schema.isV013() {
-		loads = append(loads, "linux_compile_environment_index", "linux_source_input_index")
-		compileEnvironmentIndexTarget = "_compile_environment_index"
-		sourceInputIndexTarget = "_source_input_index"
-	}
-	sourceTreeTarget := ""
-	if opts.SourceRootLabel != "" || opts.hasSourceTreeLabels() {
-		loads = append(loads, "linux_source_tree")
-		sourceTreeTarget = "_source_tree"
-	}
-	if m.objectBuildFileNeedsConfig(opts) {
-		loads = append(loads, "linux_config")
-	}
+	loads := []string{"linux_compile_environment_index", "linux_object", "linux_source_input_index", "linux_source_tree"}
+	compileEnvironmentIndexTarget := "_compile_environment_index"
+	sourceInputIndexTarget := "_source_input_index"
+	sourceTreeTarget := "_source_tree"
 	if m.objectBuildFileNeedsComposite() {
 		loads = append(loads, "linux_composite_object")
 	}
@@ -2301,117 +1959,78 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 	sort.Strings(loads)
 	file.AddLoad(compactRuleLoadLabel(opts.RuleLoadLabel), loads...)
 	file.AddPackage(visibility)
-	if compileEnvironmentIndexTarget != "" {
-		referencedPayloads := make(map[string]bool, len(m.CompileEnvironments))
-		expectedABI := ""
-		for _, environment := range m.CompileEnvironments {
-			referencedPayloads[environment.ConfigPayload] = true
-			if expectedABI == "" {
-				expectedABI = environment.ABI
-			} else if expectedABI != environment.ABI {
-				return nil, fmt.Errorf(
-					"compile environments use ABIs %q and %q",
-					expectedABI,
-					environment.ABI,
-				)
-			}
-		}
-		if opts.Schema.isV013() && expectedABI == "" {
-			return nil, fmt.Errorf("v0.0.13 compile environment index has no ABI")
-		}
-		configPayloads := make(map[string]string, len(referencedPayloads))
-		for _, payload := range m.ConfigPayloads {
-			if referencedPayloads[payload.ID] {
-				configPayloads[payload.ID] = payload.Content
-			}
-		}
-		compileEnvironments := make(map[string]string, len(m.CompileEnvironments))
-		for _, environment := range m.CompileEnvironments {
-			compileEnvironments[environment.ID] = compactCompileEnvironmentValue(environment)
-		}
-		generatedHeaders := []string{}
-		seenGeneratedHeaders := map[string]bool{}
-		for _, family := range m.GeneratedHeaderFamilies {
-			labels := append([]string(nil), family.Labels...)
-			sort.Strings(labels)
-			if len(labels) == 0 {
-				continue
-			}
-			label := labels[0]
-			if seenGeneratedHeaders[label] {
-				continue
-			}
-			seenGeneratedHeaders[label] = true
-			generatedHeaders = append(generatedHeaders, label)
-		}
-		sort.Strings(generatedHeaders)
-		r := file.AddRule("linux_compile_environment_index", compileEnvironmentIndexTarget)
-		r.SetAttr("config_payloads", configPayloads)
-		r.SetAttr("compile_environments", compileEnvironments)
-		if expectedABI != "" {
-			r.SetAttr("expected_abi", expectedABI)
-		}
-		if len(generatedHeaders) != 0 {
-			r.SetAttr("generated_headers", generatedHeaders)
-		}
-		if opts.Arch != "" {
-			r.SetAttr("arch", opts.Arch)
-		}
-		if opts.Version != "" {
-			r.SetAttr("version", opts.Version)
-		}
-		r.SetAttr("tags", []string{"manual"})
-	}
-	if sourceInputIndexTarget != "" {
-		sourceLabels := make([]string, 0, len(m.SourceFiles))
-		for _, input := range m.SourceFiles {
-			sourceLabels = append(sourceLabels, labelForSource(opts, input.Path))
-		}
-		r := file.AddRule("linux_source_input_index", sourceInputIndexTarget)
-		r.SetAttr("groups", m.SourceInputGroups)
-		r.SetAttr("srcs", sourceLabels)
-		r.SetAttr("source_tree_info", ":"+sourceTreeTarget)
-		r.SetAttr("tags", []string{"manual"})
-	}
-	if sourceTreeTarget != "" {
-		r := file.AddRule("linux_source_tree", sourceTreeTarget)
-		r.SetAttr("tags", []string{"manual"})
-		if opts.SourceRootLabel != "" {
-			r.SetAttr("root", opts.SourceRootLabel)
-		}
-		if !opts.Schema.isV013() {
-			if len(opts.SourceTreeAllFiles) != 0 {
-				r.SetAttr("all_files", opts.SourceTreeAllFiles)
-			}
-			if len(opts.SourceTreeArchHeaders) != 0 {
-				r.SetAttr("arch_headers", opts.SourceTreeArchHeaders)
-			}
-			if len(opts.SourceTreeDtbSources) != 0 {
-				r.SetAttr("dtb_sources", opts.SourceTreeDtbSources)
-			}
-			if len(opts.SourceTreeGlobalHeaders) != 0 {
-				r.SetAttr("global_headers", opts.SourceTreeGlobalHeaders)
-			}
-			if len(opts.SourceTreeHeaders) != 0 {
-				r.SetAttr("headers", opts.SourceTreeHeaders)
-			}
-			if len(opts.SourceTreeKbuildFiles) != 0 {
-				r.SetAttr("kbuild_files", opts.SourceTreeKbuildFiles)
-			}
-			if opts.Schema.isV012() && len(opts.SourceTreeLocalIncludes) != 0 {
-				r.SetAttr("local_include_files", opts.SourceTreeLocalIncludes)
-			}
-			if len(opts.SourceTreeScriptsHeaders) != 0 {
-				r.SetAttr("scripts_headers", opts.SourceTreeScriptsHeaders)
-			}
-			if len(opts.SourceTreeUapiHeaders) != 0 {
-				r.SetAttr("uapi_headers", opts.SourceTreeUapiHeaders)
-			}
-		}
-		if opts.Schema == CompactSchemaV012 && len(opts.SourceTreeLookupFiles) != 0 {
-			r.SetAttr("lookup_files", opts.SourceTreeLookupFiles)
+	referencedPayloads := make(map[string]bool, len(m.CompileEnvironments))
+	expectedABI := ""
+	for _, environment := range m.CompileEnvironments {
+		referencedPayloads[environment.ConfigPayload] = true
+		if expectedABI == "" {
+			expectedABI = environment.ABI
+		} else if expectedABI != environment.ABI {
+			return nil, fmt.Errorf(
+				"compile environments use ABIs %q and %q",
+				expectedABI,
+				environment.ABI,
+			)
 		}
 	}
+	if expectedABI == "" {
+		return nil, fmt.Errorf("compact compile environment index has no ABI")
+	}
+	configPayloads := make(map[string]string, len(referencedPayloads))
+	for _, payload := range m.ConfigPayloads {
+		if referencedPayloads[payload.ID] {
+			configPayloads[payload.ID] = payload.Content
+		}
+	}
+	compileEnvironments := make(map[string]string, len(m.CompileEnvironments))
+	for _, environment := range m.CompileEnvironments {
+		compileEnvironments[environment.ID] = compactCompileEnvironmentValue(environment)
+	}
+	generatedHeaders := []string{}
+	seenGeneratedHeaders := map[string]bool{}
+	for _, family := range m.GeneratedHeaderFamilies {
+		labels := append([]string(nil), family.Labels...)
+		sort.Strings(labels)
+		if len(labels) == 0 {
+			continue
+		}
+		label := labels[0]
+		if seenGeneratedHeaders[label] {
+			continue
+		}
+		seenGeneratedHeaders[label] = true
+		generatedHeaders = append(generatedHeaders, label)
+	}
+	sort.Strings(generatedHeaders)
+	r := file.AddRule("linux_compile_environment_index", compileEnvironmentIndexTarget)
+	r.SetAttr("config_payloads", configPayloads)
+	r.SetAttr("compile_environments", compileEnvironments)
+	r.SetAttr("expected_abi", expectedABI)
+	if len(generatedHeaders) != 0 {
+		r.SetAttr("generated_headers", generatedHeaders)
+	}
+	if opts.Arch != "" {
+		r.SetAttr("arch", opts.Arch)
+	}
+	if opts.Version != "" {
+		r.SetAttr("version", opts.Version)
+	}
+	r.SetAttr("tags", []string{"manual"})
+
+	sourceLabels := make([]string, 0, len(m.SourceFiles))
+	for _, input := range m.SourceFiles {
+		sourceLabels = append(sourceLabels, labelFor(opts.SourceLabelPackage, input.Path))
+	}
+	r = file.AddRule("linux_source_input_index", sourceInputIndexTarget)
+	r.SetAttr("groups", m.SourceInputGroups)
+	r.SetAttr("srcs", sourceLabels)
+	r.SetAttr("source_tree_info", ":"+sourceTreeTarget)
+	r.SetAttr("tags", []string{"manual"})
+
+	r = file.AddRule("linux_source_tree", sourceTreeTarget)
+	r.SetAttr("root", opts.SourceRootLabel)
+	r.SetAttr("tags", []string{"manual"})
+
 	for _, variant := range m.ObjectVariants {
 		if len(variant.Members) != 0 {
 			if variant.Object == "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o" {
@@ -2420,33 +2039,19 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 				r.SetAttr("mode", variant.Mode)
 				r.SetAttr("tags", []string{"manual"})
 				r.SetAttr("objects", localLabels(variant.Members))
-				if opts.Schema.isV013() {
-					r.SetAttr("content_id", variant.ContentID)
-					if variant.CompileEnvironment == "" {
-						return nil, fmt.Errorf("arm64 nVHE object %q has no compile environment", variant.Object)
-					}
-					r.SetAttr("compile_environment_index", ":"+compileEnvironmentIndexTarget)
-					r.SetAttr("compile_environment_id", variant.CompileEnvironment)
-					r.SetAttr("source_input_index", ":"+sourceInputIndexTarget)
-					r.SetAttr("source_input_group", variant.SourceInputGroup)
+				r.SetAttr("content_id", variant.ContentID)
+				if variant.CompileEnvironment == "" {
+					return nil, fmt.Errorf("arm64 nVHE object %q has no compile environment", variant.Object)
 				}
+				r.SetAttr("compile_environment_index", ":"+compileEnvironmentIndexTarget)
+				r.SetAttr("compile_environment_id", variant.CompileEnvironment)
+				r.SetAttr("source_input_index", ":"+sourceInputIndexTarget)
+				r.SetAttr("source_input_group", variant.SourceInputGroup)
 				if opts.Arch != "" {
 					r.SetAttr("arch", opts.Arch)
 				}
-				if !opts.Schema.isV013() && opts.SourceConfig != "" {
-					r.SetAttr("config", opts.SourceConfig)
-				}
-				if !opts.Schema.isV013() && opts.GeneratedHeaders != "" {
-					r.SetAttr("generated_headers", opts.GeneratedHeaders)
-				}
 				if opts.Srcarch != "" {
 					r.SetAttr("srcarch", opts.Srcarch)
-				}
-				if sourceTreeTarget != "" {
-					r.SetAttr("source_tree_info", ":"+sourceTreeTarget)
-				}
-				if len(variant.ConfigFragment) != 0 && !opts.Schema.isV013() {
-					r.SetAttr("config_fragment", variant.ConfigFragment)
 				}
 				continue
 			}
@@ -2455,115 +2060,48 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 			r.SetAttr("mode", variant.Mode)
 			r.SetAttr("tags", []string{"manual"})
 			r.SetAttr("objects", localLabels(variant.Members))
-			if opts.Schema.isV013() {
-				r.SetAttr("content_id", variant.ContentID)
-			}
+			r.SetAttr("content_id", variant.ContentID)
 			if opts.Arch != "" {
 				r.SetAttr("arch", opts.Arch)
 			}
-			if len(variant.ConfigFragment) != 0 && !opts.Schema.isV013() {
-				r.SetAttr("config_fragment", variant.ConfigFragment)
-			}
 			continue
 		}
-		emitSource := opts.SourceLabelPackage != "" && variant.sourceBuildReady()
-		if opts.Schema.isV012() {
-			if opts.SourceRootLabel == "" {
-				return nil, fmt.Errorf(
-					"cannot emit source-backed linux_object %q for %q: source root label is required",
-					variant.Target,
-					variant.Object,
-				)
-			}
-			if opts.SourceLabelPackage == "" {
-				return nil, fmt.Errorf(
-					"cannot emit source-backed linux_object %q for %q: source label package is required",
-					variant.Target,
-					variant.Object,
-				)
-			}
-			if reason := variant.sourceBuildError(); reason != "" {
-				return nil, fmt.Errorf(
-					"cannot emit source-backed linux_object %q for %q: %s",
-					variant.Target,
-					variant.Object,
-					reason,
-				)
-			}
-			emitSource = true
-		}
-		if emitSource && opts.SourceConfig == "" && !opts.Schema.isV013() {
-			r := file.AddRule("linux_config", variant.Target+"_config")
-			if opts.Schema.isV012() && opts.Arch != "" {
-				r.SetAttr("arch", opts.Arch)
-			}
-			if len(variant.ConfigFragment) != 0 {
-				r.SetAttr("config_flags", variant.ConfigFragment)
-			}
+		if reason := variant.sourceBuildError(); reason != "" {
+			return nil, fmt.Errorf(
+				"cannot emit source-backed linux_object %q for %q: %s",
+				variant.Target,
+				variant.Object,
+				reason,
+			)
 		}
 		r := file.AddRule("linux_object", variant.Target)
 		r.SetAttr("object", variant.Object)
 		r.SetAttr("mode", variant.Mode)
 		r.SetAttr("tags", []string{"manual"})
-		if opts.Schema.isV013() {
-			r.SetAttr("content_id", variant.ContentID)
-		}
+		r.SetAttr("content_id", variant.ContentID)
 		if opts.Arch != "" {
 			r.SetAttr("arch", opts.Arch)
 		}
-		if emitSource {
-			if opts.Schema.isV013() {
-				sourceFile, err := m.sourceFileIndex(variant.Source)
-				if err != nil {
-					return nil, fmt.Errorf("source-backed object %q: %w", variant.Object, err)
-				}
-				r.SetAttr("source_input_file", sourceFile)
-				r.SetAttr("source_input_group", variant.SourceInputGroup)
-				r.SetAttr("source_input_index", ":"+sourceInputIndexTarget)
-			} else {
-				r.SetAttr("src", labelForSource(opts, variant.Source))
-			}
-			var sourceInputPaths []string
-			switch opts.Schema {
-			case CompactSchemaV012:
-				sourceInputPaths = variant.SourceIncludes
-			}
-			if opts.Schema == CompactSchemaV012 {
-				r.SetAttr("source_includes_complete", true)
-				if len(sourceInputPaths) != 0 {
-					sourceIncludes := make([]string, 0, len(sourceInputPaths))
-					for _, include := range sourceInputPaths {
-						sourceIncludes = append(sourceIncludes, labelForSource(opts, include))
-					}
-					r.SetAttr("source_includes", sourceIncludes)
-				}
-			}
-			if opts.Schema.isV013() {
-				if variant.CompileEnvironment == "" {
-					return nil, fmt.Errorf("source-backed object %q has no compile environment", variant.Object)
-				}
-				r.SetAttr("compile_environment_index", ":"+compileEnvironmentIndexTarget)
-				r.SetAttr("compile_environment_id", variant.CompileEnvironment)
-			} else if opts.SourceConfig != "" {
-				r.SetAttr("config", opts.SourceConfig)
-			} else {
-				r.SetAttr("config", ":"+variant.Target+"_config")
-			}
-			if opts.Srcarch != "" {
-				r.SetAttr("srcarch", opts.Srcarch)
-			}
-			if sourceTreeTarget != "" {
-				r.SetAttr("source_tree_info", ":"+sourceTreeTarget)
-			}
-			if !opts.Schema.isV013() && opts.GeneratedHeaders != "" {
-				r.SetAttr("generated_headers", opts.GeneratedHeaders)
-			}
-			if opts.SourceASN1Compiler != "" && strings.HasSuffix(variant.Object, ".asn1.o") {
-				r.SetAttr("asn1_compiler", opts.SourceASN1Compiler)
-			}
-			if opts.SourceRelacheck != "" && strings.HasSuffix(variant.Object, ".pi.o") {
-				r.SetAttr("relacheck", opts.SourceRelacheck)
-			}
+		sourceFile, err := m.sourceFileIndex(variant.Source)
+		if err != nil {
+			return nil, fmt.Errorf("source-backed object %q: %w", variant.Object, err)
+		}
+		r.SetAttr("source_input_file", sourceFile)
+		r.SetAttr("source_input_group", variant.SourceInputGroup)
+		r.SetAttr("source_input_index", ":"+sourceInputIndexTarget)
+		if variant.CompileEnvironment == "" {
+			return nil, fmt.Errorf("source-backed object %q has no compile environment", variant.Object)
+		}
+		r.SetAttr("compile_environment_index", ":"+compileEnvironmentIndexTarget)
+		r.SetAttr("compile_environment_id", variant.CompileEnvironment)
+		if opts.Srcarch != "" {
+			r.SetAttr("srcarch", opts.Srcarch)
+		}
+		if opts.SourceASN1Compiler != "" && strings.HasSuffix(variant.Object, ".asn1.o") {
+			r.SetAttr("asn1_compiler", opts.SourceASN1Compiler)
+		}
+		if opts.SourceRelacheck != "" && strings.HasSuffix(variant.Object, ".pi.o") {
+			r.SetAttr("relacheck", opts.SourceRelacheck)
 		}
 		if len(variant.Flags) != 0 {
 			r.SetAttr("flags", variant.Flags)
@@ -2577,9 +2115,6 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 		if len(variant.Deps) != 0 {
 			r.SetAttr("deps", localLabels(variant.Deps))
 		}
-		if len(variant.ConfigFragment) != 0 && !opts.Schema.isV013() {
-			r.SetAttr("config_fragment", variant.ConfigFragment)
-		}
 	}
 	return file.Format(), nil
 }
@@ -2590,45 +2125,6 @@ func localLabels(targets []string) []string {
 		labels = append(labels, ":"+target)
 	}
 	return labels
-}
-
-func labelForSource(opts CompactBuildFileOptions, source string) string {
-	if len(opts.SourceLabelPackages) != 0 {
-		prefixes := make([]string, 0, len(opts.SourceLabelPackages))
-		for prefix := range opts.SourceLabelPackages {
-			prefix = strings.Trim(filepath.ToSlash(prefix), "/")
-			if prefix != "" && prefix != "." {
-				prefixes = append(prefixes, prefix)
-			}
-		}
-		sort.Slice(prefixes, func(i, j int) bool {
-			if len(prefixes[i]) == len(prefixes[j]) {
-				return prefixes[i] < prefixes[j]
-			}
-			return len(prefixes[i]) > len(prefixes[j])
-		})
-		for _, prefix := range prefixes {
-			if source != prefix && !strings.HasPrefix(source, prefix+"/") {
-				continue
-			}
-			target := strings.TrimPrefix(source, prefix)
-			target = strings.TrimPrefix(target, "/")
-			return labelFor(opts.SourceLabelPackages[prefix], target)
-		}
-	}
-	return labelFor(opts.SourceLabelPackage, source)
-}
-
-func (m *CompactMetadata) objectBuildFileNeedsConfig(opts CompactBuildFileOptions) bool {
-	if opts.Schema.isV013() || opts.SourceLabelPackage == "" || opts.SourceConfig != "" {
-		return false
-	}
-	for _, variant := range m.ObjectVariants {
-		if variant.sourceBuildReady() {
-			return true
-		}
-	}
-	return false
 }
 
 func (m *CompactMetadata) objectBuildFileNeedsComposite() bool {
@@ -2665,7 +2161,7 @@ func (v CompactObjectVariant) sourceBuildError() string {
 			if knownEmptyKbuildMakeRef(ref) {
 				continue
 			}
-			if _, ok := v.ConfigFragment[ref]; !ok {
+			if _, ok := v.configFragment[ref]; !ok {
 				return fmt.Sprintf("flag %q contains unsupported Kbuild make variable %q", flag, ref)
 			}
 		}
@@ -2678,7 +2174,7 @@ func (v CompactObjectVariant) sourceBuildError() string {
 			if knownEmptyKbuildMakeRef(ref) {
 				continue
 			}
-			if _, ok := v.ConfigFragment[ref]; !ok {
+			if _, ok := v.configFragment[ref]; !ok {
 				return fmt.Sprintf("remove flag %q contains unsupported Kbuild make variable %q", flag, ref)
 			}
 		}
@@ -2726,59 +2222,9 @@ func makeVariableRefs(value string) []string {
 	return out
 }
 
-func (m *CompactMetadata) ImageBuildFile(opts CompactImageBuildFileOptions) ([]byte, error) {
-	if opts.Schema.isV013() {
-		return m.compactDeltaImageBuildFile(opts)
-	}
-	visibility := opts.Visibility
-	if len(visibility) == 0 {
-		visibility = []string{"//visibility:public"}
-	}
-	file := buildgen.NewBuildFile("compact_images.BUILD.bazel", "# Generated by kconfig_parse compact backend. Do not edit.")
-	file.AddLoad(compactRuleLoadLabel(opts.RuleLoadLabel), "linux_compact_image")
-	file.AddPackage(visibility)
-	canonicalImages := map[string]string{}
-	for _, config := range m.Configs {
-		key := objectTargetsKey(config.ObjectTargets)
-		if opts.Schema.isV012() {
-			key += "\x01" + objectTargetsKey(config.ModuleObjectTargets)
-		}
-		if canonical, ok := canonicalImages[key]; ok {
-			r := file.AddRule("alias", config.ImageTarget)
-			r.SetAttr("actual", ":"+canonical)
-			r.SetAttr("tags", []string{"manual"})
-			continue
-		}
-		canonicalImages[key] = config.ImageTarget
-
-		labels := make([]string, len(config.ObjectTargets))
-		for i, target := range config.ObjectTargets {
-			labels[i] = labelFor(opts.ObjectLabelPackage, target)
-		}
-		r := file.AddRule("linux_compact_image", config.ImageTarget)
-		if opts.Arch != "" {
-			r.SetAttr("arch", opts.Arch)
-		}
-		r.SetAttr("objects", labels)
-		if opts.Schema.isV012() {
-			moduleLabels := make([]string, len(config.ModuleObjectTargets))
-			for i, target := range config.ModuleObjectTargets {
-				moduleLabels[i] = labelFor(opts.ObjectLabelPackage, target)
-			}
-			if len(moduleLabels) != 0 {
-				r.SetAttr("module_objects", moduleLabels)
-			}
-		} else if opts.RequireReal {
-			r.SetAttr("require_real", true)
-		}
-		r.SetAttr("tags", []string{"manual"})
-	}
-	return file.Format(), nil
-}
-
-func (m *CompactMetadata) compactDeltaImageBuildFile(opts CompactImageBuildFileOptions) ([]byte, error) {
+func (m *CompactMetadata) imageBuildFile(opts CompactBuildFileOptions) ([]byte, error) {
 	if opts.BaseConfig == "" {
-		return nil, fmt.Errorf("compact schema %s image BUILD emission requires a base config", opts.Schema)
+		return nil, fmt.Errorf("compact image BUILD emission requires a base config")
 	}
 	visibility := opts.Visibility
 	if len(visibility) == 0 {
@@ -2795,7 +2241,7 @@ func (m *CompactMetadata) compactDeltaImageBuildFile(opts CompactImageBuildFileO
 	variants := make(map[string]CompactObjectVariant, len(m.ObjectVariants))
 	for _, variant := range m.ObjectVariants {
 		if variant.ContentID == "" {
-			return nil, fmt.Errorf("object target %q has no v0.0.13 content ID", variant.Target)
+			return nil, fmt.Errorf("object target %q has no content ID", variant.Target)
 		}
 		variants[variant.Target] = variant
 	}
@@ -2816,7 +2262,7 @@ func (m *CompactMetadata) compactDeltaImageBuildFile(opts CompactImageBuildFileO
 		if err != nil {
 			return err
 		}
-		r := file.AddRule("linux_compact_image", config.ImageTarget)
+		r := file.AddRule("linux_compact_image", config.imageTarget)
 		if opts.Arch != "" {
 			r.SetAttr("arch", opts.Arch)
 		}
@@ -2882,8 +2328,8 @@ func (m *CompactMetadata) compactDeltaImageBuildFile(opts CompactImageBuildFileO
 			len(removeContentIDs) == 0 &&
 			stringSlicesEqual(baseObjectIDs, finalObjectIDs) &&
 			stringSlicesEqual(baseModuleIDs, finalModuleIDs) {
-			r := file.AddRule("alias", config.ImageTarget)
-			r.SetAttr("actual", ":"+base.ImageTarget)
+			r := file.AddRule("alias", config.imageTarget)
+			r.SetAttr("actual", ":"+base.imageTarget)
 			r.SetAttr("tags", []string{"manual"})
 			continue
 		}
@@ -2891,11 +2337,11 @@ func (m *CompactMetadata) compactDeltaImageBuildFile(opts CompactImageBuildFileO
 		if err != nil {
 			return nil, err
 		}
-		r := file.AddRule("linux_compact_delta_image", config.ImageTarget)
+		r := file.AddRule("linux_compact_delta_image", config.imageTarget)
 		if opts.Arch != "" {
 			r.SetAttr("arch", opts.Arch)
 		}
-		r.SetAttr("base_image", ":"+base.ImageTarget)
+		r.SetAttr("base_image", ":"+base.imageTarget)
 		if len(addLabels) != 0 {
 			r.SetAttr("add_objects", addLabels)
 		}
@@ -2953,10 +2399,6 @@ func stringSlicesEqual(left, right []string) bool {
 		}
 	}
 	return true
-}
-
-func objectTargetsKey(targets []string) string {
-	return strings.Join(targets, "\x00")
 }
 
 func configRefs(value string) []string {

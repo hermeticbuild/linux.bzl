@@ -27,12 +27,6 @@ if [[ ! -f "${metadata}" ]]; then
   exit 1
 fi
 
-schema="$(jq -er '.schema' "${metadata}")"
-if [[ "${schema}" != "v0.0.13" ]]; then
-  echo "generated compact schema ${schema}, expected v0.0.13" >&2
-  exit 1
-fi
-
 if ! graph_sets="$(
   jq -er '
     def raw_targets($doc; $name):
@@ -113,6 +107,70 @@ expect debug_btf_shared "${debug_btf}" "0"
 expect union "${union_count}" "${expected_actions}"
 expect memberships "${membership_count}" "${expected_memberships}"
 
+if ! header_families="$(
+  jq -er '
+    def family_names($labels):
+      [
+        .generated_header_families[]
+        | select(.labels == $labels)
+        | .name
+      ]
+      | sort
+      | join(",");
+    [
+      (.generated_header_families | length),
+      (
+        [.generated_header_families[].labels | join(",")]
+        | unique
+        | length
+      ),
+      family_names([
+        "//:_base_x86_generated_headers",
+        "//:_variant_btf_x86_generated_headers",
+        "//:_variant_debug_x86_generated_headers",
+        "//:_variant_lz4_x86_generated_headers"
+      ]),
+      family_names([
+        "//:_base_x86_generated_headers",
+        "//:_variant_btf_x86_generated_headers",
+        "//:_variant_lz4_x86_generated_headers"
+      ]),
+      family_names([
+        "//:_base_x86_generated_headers",
+        "//:_variant_lz4_x86_generated_headers"
+      ]),
+      family_names(["//:_variant_btf_x86_generated_headers"]),
+      family_names(["//:_variant_debug_x86_generated_headers"])
+    ]
+    | @tsv
+  ' "${metadata}"
+)"; then
+  echo "invalid generated-header family metadata: ${metadata}" >&2
+  exit 1
+fi
+IFS=$'\t' read -r \
+  family_count family_partitions \
+  shared_families base_btf_lz4_families \
+  base_lz4_families btf_families debug_families <<<"${header_families}"
+
+expect generated_header_families "${family_count}" "23"
+expect generated_header_family_partitions "${family_partitions}" "5"
+expect shared_generated_header_families \
+  "${shared_families}" \
+  "compile,cpufeatures,static,timeconst,utsversion,version"
+expect base_btf_lz4_generated_header_families \
+  "${base_btf_lz4_families}" \
+  "utsrelease"
+expect base_lz4_generated_header_families \
+  "${base_lz4_families}" \
+  "all,asm_offsets,bounds,kvm_offsets,rq_offsets"
+expect btf_generated_header_families \
+  "${btf_families}" \
+  "all,asm_offsets,bounds,kvm_offsets,rq_offsets"
+expect debug_generated_header_families \
+  "${debug_families}" \
+  "all,asm_offsets,bounds,kvm_offsets,rq_offsets,utsrelease"
+
 if ! action_counts="$(
   jq -ser '
     [
@@ -132,6 +190,49 @@ if ! action_counts="$(
 fi
 IFS=$'\t' read -r actions_created actions_executed <<<"${action_counts}"
 expect actions_created "${actions_created}" "${union_count}"
+
+if ! generated_header_actions="$(
+  jq -ser '
+    . as $events
+    |
+    def created($mnemonic):
+      [
+        $events[]?
+        | .buildMetrics.actionSummary.actionData[]?
+        | select(.mnemonic == $mnemonic)
+        | .actionsCreated
+      ]
+      | if length != 1 then
+          error("expected exactly one \($mnemonic) metric")
+        else
+          .[0]
+        end;
+    [
+      "LinuxCPUFeatureMasks",
+      "LinuxCompileHeader",
+      "LinuxModuleOffsetsAsm",
+      "LinuxModuleOffsetsHeader",
+      "LinuxORCHash",
+      "LinuxOffsetsAsm",
+      "LinuxOffsetsHeader",
+      "LinuxSyscallHeader",
+      "LinuxSyscallTableHeader",
+      "LinuxTimeconstHeader",
+      "LinuxUTSReleaseHeader",
+      "LinuxUTSVersionHeader",
+      "LinuxVersionHeader",
+      "LinuxXenHypercalls"
+    ]
+    | map("\(.)=\(created(.))")
+    | join(",")
+  ' "${bep}"
+)"; then
+  echo "invalid generated-header action metrics: ${bep}" >&2
+  exit 1
+fi
+expect generated_header_actions \
+  "${generated_header_actions}" \
+  "LinuxCPUFeatureMasks=1,LinuxCompileHeader=1,LinuxModuleOffsetsAsm=3,LinuxModuleOffsetsHeader=3,LinuxORCHash=1,LinuxOffsetsAsm=12,LinuxOffsetsHeader=12,LinuxSyscallHeader=5,LinuxSyscallTableHeader=3,LinuxTimeconstHeader=1,LinuxUTSReleaseHeader=2,LinuxUTSVersionHeader=1,LinuxVersionHeader=1,LinuxXenHypercalls=1"
 
 if ! configured_targets="$(
   jq -ser '

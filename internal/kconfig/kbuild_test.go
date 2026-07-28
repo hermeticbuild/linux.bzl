@@ -948,7 +948,7 @@ endif
 		t.Fatalf("ParseKbuild() failed: %v", err)
 	}
 
-	metadata, err := mustParseCompactFixture(t).CompactMetadata(kb, []NamedConfig{{Name: "base"}})
+	metadata, err := compactMetadataBatchForTest(t, mustParseCompactFixture(t), kb, []NamedConfig{{Name: "base"}})
 	if err != nil {
 		t.Fatalf("CompactMetadata() failed: %v", err)
 	}
@@ -1378,7 +1378,7 @@ always-y += generated.o
 		t.Fatalf("ParseKbuild() failed: %v", err)
 	}
 
-	metadata, err := tree.CompactMetadata(kb, []NamedConfig{
+	metadata, err := compactMetadataBatchForTest(t, tree, kb, []NamedConfig{
 		{Name: "base", Flags: map[string]string{"CONFIG_NET": "y"}},
 		{Name: "debug", Flags: map[string]string{"CONFIG_NET": "y", "CONFIG_DEBUG": "y"}},
 		{Name: "off", Flags: map[string]string{"CONFIG_DEBUG": "y"}},
@@ -1411,8 +1411,8 @@ always-y += generated.o
 	}
 	if target := objectTarget(metadata, debug, "net/selected.o"); target == "" {
 		t.Fatalf("debug config does not include ${CONFIG_NET} composite member")
-	} else if variant := variantByTarget(metadata, target); variant.ConfigFragment["CONFIG_NET"] != "y" {
-		t.Fatalf("net/selected.o CONFIG_NET footprint = %q, want y", variant.ConfigFragment["CONFIG_NET"])
+	} else if variant := variantByTarget(metadata, target); variant.configFragment["CONFIG_NET"] != "y" {
+		t.Fatalf("net/selected.o CONFIG_NET footprint = %q, want y", variant.configFragment["CONFIG_NET"])
 	}
 
 	off := configByName(metadata, "off")
@@ -1443,7 +1443,7 @@ net/stack-$(CONFIG_FEATURE) += net/debug.o
 		t.Fatalf("ParseKbuild() failed: %v", err)
 	}
 
-	metadata, err := tree.CompactMetadata(kb, []NamedConfig{
+	metadata, err := compactMetadataBatchForTest(t, tree, kb, []NamedConfig{
 		{Name: "module", Flags: map[string]string{"CONFIG_MODULES": "y", "CONFIG_STACK": "m", "CONFIG_FEATURE": "m"}},
 		{Name: "builtin", Flags: map[string]string{"CONFIG_MODULES": "y", "CONFIG_STACK": "y", "CONFIG_FEATURE": "m"}},
 	})

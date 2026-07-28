@@ -3,8 +3,9 @@
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
 load(
     "//internal:linux_objects.bzl",
-    "linux_config",
+    "linux_compile_environment_index",
     "linux_object",
+    "linux_source_input_index",
     "linux_source_tree",
 )
 
@@ -53,37 +54,60 @@ def _sanitizer_compile_action_test_impl(ctx):
 _sanitizer_compile_action_test = analysistest.make(_sanitizer_compile_action_test_impl)
 
 def sanitizer_actions_test(name):
-    config = name + "_config"
+    compile_environment_index = name + "_compile_environment_index"
     source_tree = name + "_source_tree"
+    source_input_index = name + "_source_input_index"
     object = name + "_object"
     fixture_tags = ["manual"]
+    config_payload_id = "1111111111111111111111111111111111111111111111111111111111111111"
+    compile_environment_id = "2222222222222222222222222222222222222222222222222222222222222222"
+    object_id = "3333333333333333333333333333333333333333333333333333333333333333"
 
-    linux_config(
-        name = config,
+    linux_compile_environment_index(
+        name = compile_environment_index,
         arch = "x86",
-        config_flags = {
-            "CONFIG_UBSAN": "y",
-            "CONFIG_UBSAN_INTEGER_WRAP": "y",
+        compile_environments = {
+            compile_environment_id: json.encode({
+                "abi": "tests/sanitizer/x86",
+                "config_payload": config_payload_id,
+                "generated_header_families": [],
+            }),
         },
+        config_payloads = {
+            config_payload_id: "CONFIG_UBSAN=y\nCONFIG_UBSAN_INTEGER_WRAP=y\n",
+        },
+        expected_abi = "tests/sanitizer/x86",
         tags = fixture_tags,
     )
     linux_source_tree(
         name = source_tree,
-        lookup_files = ["sanitizer_test_tree/scripts/integer-wrap-ignore.scl"],
         root = "sanitizer_test_tree/Kconfig",
+        tags = fixture_tags,
+    )
+    linux_source_input_index(
+        name = source_input_index,
+        groups = ["1,2"],
+        source_tree_info = ":" + source_tree,
+        srcs = [
+            "sanitizer_test_tree/scripts/integer-wrap-ignore.scl",
+            "sanitizer_test_tree/test.c",
+        ],
         tags = fixture_tags,
     )
     linux_object(
         name = object,
-        config = ":" + config,
+        compile_environment_id = compile_environment_id,
+        compile_environment_index = ":" + compile_environment_index,
+        content_id = object_id,
         flags = [
             "-DINTEGER_WRAP",
             "-fsanitize-ignorelist=$(srctree)/scripts/integer-wrap-ignore.scl",
         ],
         mode = "y",
         object = "test.o",
-        source_tree_info = ":" + source_tree,
-        src = "sanitizer_test_tree/test.c",
+        source_input_file = 2,
+        source_input_group = 1,
+        source_input_index = ":" + source_input_index,
         tags = fixture_tags,
     )
     _sanitizer_compile_action_test(

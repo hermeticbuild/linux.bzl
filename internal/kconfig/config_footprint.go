@@ -13,16 +13,13 @@ import (
 )
 
 // configSourceScanner follows each translation unit's transitive source-tree
-// include closure. The legacy scanner conservatively counts CONFIG_* tokens in
-// comments and inactive branches. V0.0.13 preprocesses logical directives,
-// evaluates direct CONFIG_* gates per resolved config, records file digests,
-// and fails when a potentially active include cannot be accounted for.
+// include closure, evaluates direct CONFIG_* gates per resolved config, records
+// file digests, and fails when a potentially active include is unaccounted for.
 type configSourceScanner struct {
 	sourceRoot   string
 	sourceRoots  map[string]string
 	includeRoots []string
 	predefined   map[string]bool
-	exact        bool
 	sourceCache  *compactSourceCache
 
 	files       map[string]scannedSourceFile
@@ -158,7 +155,6 @@ func newConfigSourceScannerWithCache(opts CompactMetadataOptions, sourceCache *c
 		sourceRoots:  opts.SourceRoots,
 		includeRoots: roots,
 		predefined:   sourcePredefinedSymbols(opts.Srcarch),
-		exact:        opts.Schema.isV013(),
 		sourceCache:  sourceCache,
 		files:        map[string]scannedSourceFile{},
 		fileErrors:   map[string]error{},
@@ -266,10 +262,6 @@ func (s *configSourceScanner) sourceIncludesForSource(source string, extraInclud
 	return append([]string(nil), closure.sourceIncludes...)
 }
 
-func (s *configSourceScanner) exactClosureForSource(source string, extraIncludeRoots []string) (sourceClosure, error) {
-	return s.closureForSourceConfig(source, extraIncludeRoots, nil)
-}
-
 func (s *configSourceScanner) inputForTreePath(path string) (CompactSourceInput, error) {
 	cleaned, ok := cleanSourceTreePath(path)
 	if !ok {
@@ -279,21 +271,11 @@ func (s *configSourceScanner) inputForTreePath(path string) (CompactSourceInput,
 	if !ok {
 		return CompactSourceInput{}, fmt.Errorf("source-tree input %q does not exist", cleaned)
 	}
-	if s.exact {
-		digest, err := s.loadExactSourceDigest(abs)
-		if err != nil {
-			return CompactSourceInput{}, fmt.Errorf("%s: %w", cleaned, err)
-		}
-		return CompactSourceInput{Path: cleaned, Digest: digest}, nil
-	}
-	data, err := os.ReadFile(abs)
+	digest, err := s.loadExactSourceDigest(abs)
 	if err != nil {
 		return CompactSourceInput{}, fmt.Errorf("%s: %w", cleaned, err)
 	}
-	return CompactSourceInput{
-		Path:   cleaned,
-		Digest: fileContentDigest(data),
-	}, nil
+	return CompactSourceInput{Path: cleaned, Digest: digest}, nil
 }
 
 func (s *configSourceScanner) closureForSource(source string, extraIncludeRoots []string) (sourceClosure, error) {
@@ -379,23 +361,21 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 	profile sourceScanProfile,
 ) (sourceClosure, error) {
 	if s == nil || source == "" {
-		if s != nil && s.exact {
+		if s != nil {
 			return sourceClosure{}, fmt.Errorf("exact input scan requires a source path")
 		}
 		return sourceClosure{}, nil
 	}
 	key := source + "\x00" + search.cacheKey()
-	if s.exact && config != nil {
+	if config != nil {
 		key += "\x00" + s.configID(config)
 	}
-	if s.exact {
-		key += "\x00assembly=" + strconv.FormatBool(assembly)
-		key += "\x00profile=" + string(profile)
-		if len(providedIncludes) != 0 {
-			providedIncludes = append([]string(nil), providedIncludes...)
-			sort.Strings(providedIncludes)
-			key += "\x00provided=" + strings.Join(providedIncludes, "\x00")
-		}
+	key += "\x00assembly=" + strconv.FormatBool(assembly)
+	key += "\x00profile=" + string(profile)
+	if len(providedIncludes) != 0 {
+		providedIncludes = append([]string(nil), providedIncludes...)
+		sort.Strings(providedIncludes)
+		key += "\x00provided=" + strings.Join(providedIncludes, "\x00")
 	}
 	if cached, ok := s.closure[key]; ok {
 		return cached, s.closureErrs[key]
@@ -404,22 +384,16 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 	source, ok := cleanSourceTreePath(source)
 	if !ok {
 		s.closure[key] = sourceClosure{}
-		if s.exact {
-			err := fmt.Errorf("invalid source-tree path %q", rawSource)
-			s.closureErrs[key] = err
-			return sourceClosure{}, err
-		}
-		return sourceClosure{}, nil
+		err := fmt.Errorf("invalid source-tree path %q", rawSource)
+		s.closureErrs[key] = err
+		return sourceClosure{}, err
 	}
 	_, ok = s.absForTreePath(source)
 	if !ok {
 		s.closure[key] = sourceClosure{}
-		if s.exact {
-			err := fmt.Errorf("source-tree input %q does not exist", source)
-			s.closureErrs[key] = err
-			return sourceClosure{}, err
-		}
-		return sourceClosure{}, nil
+		err := fmt.Errorf("source-tree input %q does not exist", source)
+		s.closureErrs[key] = err
+		return sourceClosure{}, err
 	}
 	refset := map[string]bool{}
 	includeSet := map[string]bool{}
@@ -445,30 +419,22 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 		}
 		scanned, err := s.scanFile(abs, treePath, search, config, assembly, profile)
 		if err != nil {
-			if !s.exact {
-				continue
-			}
 			err = fmt.Errorf("%s: %w", treePath, err)
 			s.closure[key] = sourceClosure{}
 			s.closureErrs[key] = err
 			return sourceClosure{}, err
 		}
-		if s.exact {
-			inputs[treePath] = CompactSourceInput{Path: treePath, Digest: scanned.digest}
-		}
+		inputs[treePath] = CompactSourceInput{Path: treePath, Digest: scanned.digest}
 		for _, ref := range scanned.refs {
 			refset[ref] = true
 		}
 		linuxLibfdtEnvironmentIncluded := false
 		for _, inc := range scanned.includes {
-			if s.exact && !inc.potentiallyActive {
+			if !inc.potentiallyActive {
 				continue
 			}
 			if !inc.literal {
 				if modeledRecursiveTemplateInclude(treePath, inc.spelling) {
-					continue
-				}
-				if !s.exact {
 					continue
 				}
 				err := fmt.Errorf(
@@ -498,7 +464,7 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 					generatedIncludeSet[includePath] = true
 					continue
 				}
-				if s.exact && !compilerProvidedInclude(includePath) {
+				if !compilerProvidedInclude(includePath) {
 					err := fmt.Errorf(
 						"%s:%d: unresolved potentially-active literal include %s",
 						treePath,
@@ -580,10 +546,6 @@ func (s *configSourceScanner) refsForSourceDir(dir string) []string {
 	return closure.refs
 }
 
-func (s *configSourceScanner) exactClosureForSourceDir(dir string) (sourceClosure, error) {
-	return s.closureForSourceDir(dir)
-}
-
 func (s *configSourceScanner) closureForSourceDir(dir string) (sourceClosure, error) {
 	return s.closureForSourceDirConfig(dir, nil)
 }
@@ -603,17 +565,11 @@ func (s *configSourceScanner) closureForSourceDirConfigProfile(
 	rawDir := dir
 	dir, ok := cleanSourceTreePath(dir)
 	if !ok {
-		if s.exact {
-			return sourceClosure{}, fmt.Errorf("invalid source-tree directory %q", rawDir)
-		}
-		return sourceClosure{}, nil
+		return sourceClosure{}, fmt.Errorf("invalid source-tree directory %q", rawDir)
 	}
 	base, ok := s.absForTreeDirectory(dir)
 	if !ok {
-		if s.exact {
-			return sourceClosure{}, fmt.Errorf("source-tree input directory %q does not exist", dir)
-		}
-		return sourceClosure{}, nil
+		return sourceClosure{}, fmt.Errorf("source-tree input directory %q does not exist", dir)
 	}
 	refset := map[string]bool{}
 	includeSet := map[string]bool{}
@@ -632,9 +588,6 @@ func (s *configSourceScanner) closureForSourceDirConfigProfile(
 			treePath := filepath.ToSlash(filepath.Join(dir, rel))
 			closure, closureErr := s.closureForSourceConfigProfile(treePath, nil, config, profile)
 			if closureErr != nil {
-				if !s.exact {
-					return nil
-				}
 				return closureErr
 			}
 			for _, ref := range closure.refs {
@@ -653,9 +606,6 @@ func (s *configSourceScanner) closureForSourceDirConfigProfile(
 		return nil
 	})
 	if err != nil {
-		if !s.exact {
-			return sourceClosure{refs: sortedStringSet(refset)}, nil
-		}
 		return sourceClosure{}, err
 	}
 	out := make([]string, 0, len(refset))
@@ -694,48 +644,24 @@ func (s *configSourceScanner) scanFile(
 	profile sourceScanProfile,
 ) (scannedSourceFile, error) {
 	cacheKey := abs
-	if s.exact && config != nil {
+	if config != nil {
 		cacheKey += "\x00" + s.configID(config)
 	}
-	if s.exact {
-		cacheKey += "\x00tree-path=" + treePath
-		cacheKey += "\x00assembly=" + strconv.FormatBool(assembly)
-		cacheKey += "\x00profile=" + string(profile)
-		cacheKey += "\x00include-search=" + search.cacheKey()
-	}
+	cacheKey += "\x00tree-path=" + treePath
+	cacheKey += "\x00assembly=" + strconv.FormatBool(assembly)
+	cacheKey += "\x00profile=" + string(profile)
+	cacheKey += "\x00include-search=" + search.cacheKey()
 	if cached, ok := s.files[cacheKey]; ok {
 		return cached, s.fileErrors[cacheKey]
 	}
-	var (
-		digest string
-		lines  []sourceLogicalLine
-		text   string
-	)
-	if s.exact {
-		file, err := s.loadExactSourceFile(abs)
-		if err != nil {
-			s.fileErrors[cacheKey] = err
-			return scannedSourceFile{}, err
-		}
-		digest = file.digest
-		lines = file.lines
-	} else {
-		data, err := os.ReadFile(abs)
-		if err != nil {
-			s.fileErrors[cacheKey] = err
-			return scannedSourceFile{}, err
-		}
-		text = string(data)
-		lines = rawSourceLines(text)
-		digest = fileContentDigest(data)
+	file, err := s.loadExactSourceFile(abs)
+	if err != nil {
+		s.fileErrors[cacheKey] = err
+		return scannedSourceFile{}, err
 	}
-	scanned := scannedSourceFile{digest: digest}
+	scanned := scannedSourceFile{digest: file.digest}
+	lines := file.lines
 	refset := map[string]bool{}
-	if !s.exact {
-		for _, ref := range configRefs(text) {
-			refset[ref] = true
-		}
-	}
 	predefined := make(map[string]bool, len(s.predefined)+1)
 	for symbol, defined := range s.predefined {
 		predefined[symbol] = defined
@@ -777,14 +703,14 @@ func (s *configSourceScanner) scanFile(
 	for _, line := range lines {
 		directive, rest, ok := preprocessorDirective(line.text)
 		if !ok {
-			if s.exact && potentiallyActive {
+			if potentiallyActive {
 				addRefs(line.text)
 			}
 			continue
 		}
 		switch directive {
 		case "if":
-			if s.exact && potentiallyActive {
+			if potentiallyActive {
 				addRefs(rest)
 			}
 			mayBeTrue, definitelyTrue := preprocessorCondition(rest, config, predefined, hasInclude)
@@ -794,7 +720,7 @@ func (s *configSourceScanner) scanFile(
 			})
 			potentiallyActive = potentiallyActive && mayBeTrue
 		case "ifdef", "ifndef":
-			if s.exact && potentiallyActive {
+			if potentiallyActive {
 				addRefs(rest)
 			}
 			defined, known := preprocessorSymbolDefined(strings.Fields(rest), config, predefined)
@@ -818,7 +744,7 @@ func (s *configSourceScanner) scanFile(
 			}
 			frame := &conditionals[len(conditionals)-1]
 			conditionPotentiallyEvaluated := frame.parentPotentiallyActive && !frame.definitelyTaken
-			if s.exact && conditionPotentiallyEvaluated {
+			if conditionPotentiallyEvaluated {
 				addRefs(rest)
 			}
 			mayBeTrue, definitelyTrue := preprocessorCondition(rest, config, predefined, hasInclude)
@@ -841,7 +767,7 @@ func (s *configSourceScanner) scanFile(
 			conditionals = conditionals[:len(conditionals)-1]
 			potentiallyActive = frame.parentPotentiallyActive
 		case "include", "include_next":
-			if s.exact && potentiallyActive {
+			if potentiallyActive {
 				addRefs(rest)
 			}
 			path, kind, literal := sourceIncludeOperand(rest)
@@ -863,7 +789,7 @@ func (s *configSourceScanner) scanFile(
 				potentiallyActive: potentiallyActive,
 			})
 		default:
-			if s.exact && potentiallyActive {
+			if potentiallyActive {
 				addRefs(line.text)
 			}
 		}
@@ -1482,9 +1408,7 @@ func fileContentDigest(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// resolveInclude preserves the v0.0.12 scanner's conservative all-match
-// behavior, while exact schemas stop at the first source-tree file in compiler
-// search order.
+// resolveInclude stops at the first source-tree file in compiler search order.
 func (s *configSourceScanner) resolveInclude(
 	fromTreePath string,
 	inc string,
@@ -1494,9 +1418,6 @@ func (s *configSourceScanner) resolveInclude(
 	inc = filepath.ToSlash(strings.TrimSpace(inc))
 	if inc == "" {
 		return nil
-	}
-	if !s.exact {
-		return s.resolveLegacyIncludes(fromTreePath, inc, search.roots(kind))
 	}
 	roots := search.roots(kind)
 	startRoot := 0
@@ -1531,35 +1452,6 @@ func (s *configSourceScanner) resolveInclude(
 		}
 	}
 	return nil
-}
-
-func (s *configSourceScanner) resolveLegacyIncludes(fromTreePath, inc string, roots []string) []string {
-	var out []string
-	seen := map[string]bool{}
-	add := func(treePath string) {
-		treePath, ok := cleanSourceTreePath(treePath)
-		if !ok || seen[treePath] {
-			return
-		}
-		if _, ok := s.absForTreePath(treePath); !ok {
-			return
-		}
-		seen[treePath] = true
-		out = append(out, treePath)
-	}
-	if fromTreePath != "" {
-		add(filepath.ToSlash(filepath.Join(filepath.Dir(fromTreePath), filepath.FromSlash(inc))))
-	}
-	for _, candidate := range includeCandidates(inc) {
-		for _, root := range roots {
-			if root == "" {
-				add(candidate)
-			} else {
-				add(root + "/" + candidate)
-			}
-		}
-	}
-	return out
 }
 
 func includeNextRootIndex(fromTreePath string, roots []string) int {

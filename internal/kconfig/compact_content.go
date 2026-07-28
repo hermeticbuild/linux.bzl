@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -78,7 +77,7 @@ func newCompactConfigPayload(fragment map[string]string) CompactConfigPayload {
 	return CompactConfigPayload{
 		ID:       compactContentID(compactConfigPayloadDomain, content),
 		Content:  content,
-		Fragment: copied,
+		fragment: copied,
 	}
 }
 
@@ -112,6 +111,40 @@ func newCompactGeneratedHeaderFamily(
 		}
 		return sourceInputs[i].Digest < sourceInputs[j].Digest
 	})
+	id := compactGeneratedHeaderFamilyContentID(
+		name,
+		configPayloadID,
+		srcarch,
+		dependencies,
+		sourceInputs,
+	)
+	return CompactGeneratedHeaderFamily{
+		ID:            id,
+		Name:          name,
+		ConfigPayload: configPayloadID,
+		Labels:        []string{label},
+		Srcarch:       srcarch,
+		Dependencies:  dependencies,
+		sourceInputs:  sourceInputs,
+	}
+}
+
+func compactGeneratedHeaderFamilyContentID(
+	name string,
+	configPayloadID string,
+	srcarch string,
+	dependencies []string,
+	sourceInputs []CompactSourceInput,
+) string {
+	dependencies = append([]string(nil), dependencies...)
+	sort.Strings(dependencies)
+	sourceInputs = append([]CompactSourceInput(nil), sourceInputs...)
+	sort.Slice(sourceInputs, func(i, j int) bool {
+		if sourceInputs[i].Path != sourceInputs[j].Path {
+			return sourceInputs[i].Path < sourceInputs[j].Path
+		}
+		return sourceInputs[i].Digest < sourceInputs[j].Digest
+	})
 	hasher := newCompactContentHasher(compactGeneratedHeaderFamilyDomain)
 	hasher.writeValue("name=", name)
 	hasher.writeValue("srcarch=", srcarch)
@@ -122,15 +155,7 @@ func newCompactGeneratedHeaderFamily(
 	for _, input := range sourceInputs {
 		hasher.writeValue("source_input=", input.Path, "\x00", input.Digest)
 	}
-	return CompactGeneratedHeaderFamily{
-		ID:            hasher.id(),
-		Name:          name,
-		ConfigPayload: configPayloadID,
-		Labels:        compactOptionalString(label),
-		Srcarch:       srcarch,
-		Dependencies:  dependencies,
-		SourceInputs:  sourceInputs,
-	}
+	return hasher.id()
 }
 
 func newCompactCompileEnvironment(abi, configPayloadID string, generatedHeaderFamilyIDs []string) CompactCompileEnvironment {
@@ -205,13 +230,6 @@ func compactCompileEnvironmentValue(environment CompactCompileEnvironment) strin
 	return out.String()
 }
 
-func compactOptionalString(value string) []string {
-	if value == "" {
-		return nil
-	}
-	return []string{value}
-}
-
 func appendUniqueStrings(values []string, additions ...string) []string {
 	seen := make(map[string]bool, len(values)+len(additions))
 	for _, value := range values {
@@ -250,18 +268,6 @@ func appendUniqueSourceInputs(values []CompactSourceInput, additions ...CompactS
 		return out[i].Path < out[j].Path
 	})
 	return out
-}
-
-func compactSourceInputsEqual(left, right []CompactSourceInput) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func encodeCompactSourceInputGroup(indices []int) string {
@@ -381,14 +387,10 @@ func (interner *compactSourceInputInterner) apply(metadata *CompactMetadata) {
 
 func (metadata *CompactMetadata) expandedSourceInputGroup(
 	group int,
-	inline []CompactSourceInput,
 	context string,
 ) ([]CompactSourceInput, error) {
-	if group != 0 && len(inline) != 0 {
-		return nil, fmt.Errorf("%s has both source_input_group and inline source_inputs", context)
-	}
 	if group == 0 {
-		return append([]CompactSourceInput(nil), inline...), nil
+		return nil, nil
 	}
 	if group < 0 || group > len(metadata.SourceInputGroups) {
 		return nil, fmt.Errorf(
@@ -439,200 +441,99 @@ func canonicalCompactSourceInputs(inputs []CompactSourceInput, context string) (
 }
 
 func (metadata *CompactMetadata) canonicalizeSourceInputIndex() error {
-	if metadata == nil || !metadata.Schema.isV013() {
+	if metadata == nil {
 		return nil
-	}
-
-	originalFiles := append([]CompactSourceInput(nil), metadata.SourceFiles...)
-	filesByPath := map[string]CompactSourceInput{}
-	for _, input := range originalFiles {
-		if err := validateCompactSourceInput(input, "source_files"); err != nil {
-			return err
-		}
-		if _, exists := filesByPath[input.Path]; exists {
-			return fmt.Errorf("source_files repeats source path %q", input.Path)
-		}
-		filesByPath[input.Path] = input
-	}
-	addInlineInputs := func(inputs []CompactSourceInput, context string) error {
-		canonical, err := canonicalCompactSourceInputs(inputs, context)
-		if err != nil {
-			return err
-		}
-		for _, input := range canonical {
-			if existing, ok := filesByPath[input.Path]; ok && existing.Digest != input.Digest {
-				return fmt.Errorf(
-					"source path %q has conflicting digests %q and %q",
-					input.Path,
-					existing.Digest,
-					input.Digest,
-				)
-			}
-			filesByPath[input.Path] = input
-		}
-		return nil
-	}
-
-	referencedOldGroups := map[int]bool{}
-	scanReference := func(group int, inline []CompactSourceInput, context string) error {
-		if group != 0 && len(inline) != 0 {
-			return fmt.Errorf("%s has both source_input_group and inline source_inputs", context)
-		}
-		if group != 0 {
-			if group < 0 || group > len(metadata.SourceInputGroups) {
-				return fmt.Errorf(
-					"%s references source input group %d, out of range 1..%d",
-					context,
-					group,
-					len(metadata.SourceInputGroups),
-				)
-			}
-			referencedOldGroups[group] = true
-			return nil
-		}
-		return addInlineInputs(inline, context)
 	}
 	for _, family := range metadata.GeneratedHeaderFamilies {
-		if err := scanReference(
-			family.SourceInputGroup,
-			family.SourceInputs,
-			fmt.Sprintf("generated header family %q", family.ID),
-		); err != nil {
-			return err
+		if len(family.sourceInputs) != 0 {
+			return fmt.Errorf("generated header family %q retains internal inline source inputs", family.ID)
 		}
 	}
 	for _, variant := range metadata.ObjectVariants {
-		if err := scanReference(
-			variant.SourceInputGroup,
-			variant.SourceInputs,
-			fmt.Sprintf("object target %q", variant.Target),
-		); err != nil {
+		if len(variant.sourceInputs) != 0 {
+			return fmt.Errorf("object target %q retains internal inline source inputs", variant.Target)
+		}
+	}
+
+	originalFiles := append([]CompactSourceInput(nil), metadata.SourceFiles...)
+	metadata.SourceFiles = append([]CompactSourceInput(nil), originalFiles...)
+	sort.Slice(metadata.SourceFiles, func(i, j int) bool {
+		return metadata.SourceFiles[i].Path < metadata.SourceFiles[j].Path
+	})
+	newFileIndices := make(map[string]int, len(metadata.SourceFiles))
+	for i, input := range metadata.SourceFiles {
+		if err := validateCompactSourceInput(input, "source_files"); err != nil {
 			return err
 		}
-	}
-	for group := range metadata.SourceInputGroups {
-		if !referencedOldGroups[group+1] {
-			return fmt.Errorf("source input group %d is not referenced", group+1)
+		if _, exists := newFileIndices[input.Path]; exists {
+			return fmt.Errorf("source_files repeats source path %q", input.Path)
 		}
+		newFileIndices[input.Path] = i + 1
 	}
 
-	paths := make([]string, 0, len(filesByPath))
-	for path := range filesByPath {
-		paths = append(paths, path)
-	}
-	sort.Strings(paths)
-	metadata.SourceFiles = make([]CompactSourceInput, 0, len(paths))
-	fileIndices := make(map[string]int, len(paths))
-	for _, path := range paths {
-		metadata.SourceFiles = append(metadata.SourceFiles, filesByPath[path])
-		fileIndices[path] = len(metadata.SourceFiles)
-	}
-
-	encodeInputs := func(inputs []CompactSourceInput, context string) (string, error) {
-		canonical, err := canonicalCompactSourceInputs(inputs, context)
-		if err != nil {
-			return "", err
-		}
-		indices := make([]int, 0, len(inputs))
-		for _, input := range canonical {
-			indices = append(indices, fileIndices[input.Path])
-		}
-		sort.Ints(indices)
-		return encodeCompactSourceInputGroup(indices), nil
-	}
-
-	groupSet := map[string]bool{}
-	oldGroupEncodings := make([]string, len(metadata.SourceInputGroups))
-	seenOldGroups := map[string]bool{}
+	canonicalGroups := make([]string, len(metadata.SourceInputGroups))
+	groupSet := make(map[string]bool, len(metadata.SourceInputGroups))
 	for i, encoded := range metadata.SourceInputGroups {
-		if seenOldGroups[encoded] {
-			return fmt.Errorf("source_input_groups repeats group %q", encoded)
-		}
-		seenOldGroups[encoded] = true
 		oldIndices, err := decodeCompactSourceInputGroup(encoded, len(originalFiles))
 		if err != nil {
 			return fmt.Errorf("source input group %d: %w", i+1, err)
 		}
-		indices := make([]int, 0, len(oldIndices))
+		newIndices := make([]int, 0, len(oldIndices))
 		for _, oldIndex := range oldIndices {
-			indices = append(indices, fileIndices[originalFiles[oldIndex-1].Path])
+			newIndices = append(newIndices, newFileIndices[originalFiles[oldIndex-1].Path])
 		}
-		sort.Ints(indices)
-		oldGroupEncodings[i] = encodeCompactSourceInputGroup(indices)
-		groupSet[oldGroupEncodings[i]] = true
+		sort.Ints(newIndices)
+		canonicalGroups[i] = encodeCompactSourceInputGroup(newIndices)
+		groupSet[canonicalGroups[i]] = true
 	}
-	addInlineGroup := func(inputs []CompactSourceInput, context string) (string, error) {
-		if len(inputs) == 0 {
-			return "", nil
-		}
-		encoded, err := encodeInputs(inputs, context)
-		if err != nil {
-			return "", err
-		}
-		groupSet[encoded] = true
-		return encoded, nil
-	}
-	familyInlineGroups := make([]string, len(metadata.GeneratedHeaderFamilies))
-	for i, family := range metadata.GeneratedHeaderFamilies {
-		if family.SourceInputGroup == 0 {
-			encoded, err := addInlineGroup(
-				family.SourceInputs,
-				fmt.Sprintf("generated header family %q", family.ID),
-			)
-			if err != nil {
-				return err
-			}
-			familyInlineGroups[i] = encoded
-		}
-	}
-	variantInlineGroups := make([]string, len(metadata.ObjectVariants))
-	for i, variant := range metadata.ObjectVariants {
-		if variant.SourceInputGroup == 0 {
-			encoded, err := addInlineGroup(variant.SourceInputs, fmt.Sprintf("object target %q", variant.Target))
-			if err != nil {
-				return err
-			}
-			variantInlineGroups[i] = encoded
-		}
-	}
-
 	metadata.SourceInputGroups = make([]string, 0, len(groupSet))
 	for encoded := range groupSet {
 		metadata.SourceInputGroups = append(metadata.SourceInputGroups, encoded)
 	}
 	sort.Strings(metadata.SourceInputGroups)
-	groupIndices := make(map[string]int, len(metadata.SourceInputGroups))
+	newGroupIndices := make(map[string]int, len(metadata.SourceInputGroups))
 	for i, encoded := range metadata.SourceInputGroups {
-		groupIndices[encoded] = i + 1
+		newGroupIndices[encoded] = i + 1
 	}
-
+	remapGroup := func(group int, context string) (int, error) {
+		if group == 0 {
+			return 0, nil
+		}
+		if group < 0 || group > len(canonicalGroups) {
+			return 0, fmt.Errorf(
+				"%s references source input group %d, out of range 1..%d",
+				context,
+				group,
+				len(canonicalGroups),
+			)
+		}
+		return newGroupIndices[canonicalGroups[group-1]], nil
+	}
 	for i := range metadata.GeneratedHeaderFamilies {
-		encoded := familyInlineGroups[i]
-		if metadata.GeneratedHeaderFamilies[i].SourceInputGroup != 0 {
-			encoded = oldGroupEncodings[metadata.GeneratedHeaderFamilies[i].SourceInputGroup-1]
+		group, err := remapGroup(
+			metadata.GeneratedHeaderFamilies[i].SourceInputGroup,
+			fmt.Sprintf("generated header family %q", metadata.GeneratedHeaderFamilies[i].ID),
+		)
+		if err != nil {
+			return err
 		}
-		metadata.GeneratedHeaderFamilies[i].SourceInputs = nil
-		metadata.GeneratedHeaderFamilies[i].SourceInputGroup = 0
-		if encoded != "" {
-			metadata.GeneratedHeaderFamilies[i].SourceInputGroup = groupIndices[encoded]
-		}
+		metadata.GeneratedHeaderFamilies[i].SourceInputGroup = group
 	}
 	for i := range metadata.ObjectVariants {
-		encoded := variantInlineGroups[i]
-		if metadata.ObjectVariants[i].SourceInputGroup != 0 {
-			encoded = oldGroupEncodings[metadata.ObjectVariants[i].SourceInputGroup-1]
+		group, err := remapGroup(
+			metadata.ObjectVariants[i].SourceInputGroup,
+			fmt.Sprintf("object target %q", metadata.ObjectVariants[i].Target),
+		)
+		if err != nil {
+			return err
 		}
-		metadata.ObjectVariants[i].SourceInputs = nil
-		metadata.ObjectVariants[i].SourceInputGroup = 0
-		if encoded != "" {
-			metadata.ObjectVariants[i].SourceInputGroup = groupIndices[encoded]
-		}
+		metadata.ObjectVariants[i].SourceInputGroup = group
 	}
 	return metadata.validateSourceInputIndex()
 }
 
 func (metadata *CompactMetadata) validateSourceInputIndex() error {
-	if metadata == nil || !metadata.Schema.isV013() {
+	if metadata == nil {
 		return nil
 	}
 	for i, input := range metadata.SourceFiles {
@@ -693,9 +594,9 @@ func (metadata *CompactMetadata) validateSourceInputIndex() error {
 	}
 
 	for _, family := range metadata.GeneratedHeaderFamilies {
-		if len(family.SourceInputs) != 0 {
+		if len(family.sourceInputs) != 0 {
 			return fmt.Errorf(
-				"generated header family %q retains inline source_inputs in v0.0.13 metadata",
+				"generated header family %q retains internal inline source inputs",
 				family.ID,
 			)
 		}
@@ -711,8 +612,8 @@ func (metadata *CompactMetadata) validateSourceInputIndex() error {
 		}
 	}
 	for _, variant := range metadata.ObjectVariants {
-		if len(variant.SourceInputs) != 0 {
-			return fmt.Errorf("object target %q retains inline source_inputs in v0.0.13 metadata", variant.Target)
+		if len(variant.sourceInputs) != 0 {
+			return fmt.Errorf("object target %q retains internal inline source inputs", variant.Target)
 		}
 		exactAction := len(variant.Members) == 0 || isArm64NvheObject(variant.Object)
 		if !exactAction {
@@ -748,19 +649,6 @@ func (metadata *CompactMetadata) validateSourceInputIndex() error {
 		}
 	}
 	return nil
-}
-
-func (payload CompactConfigPayload) equal(other CompactConfigPayload) bool {
-	return payload.ID == other.ID &&
-		payload.Content == other.Content &&
-		reflect.DeepEqual(payload.Fragment, other.Fragment)
-}
-
-func (environment CompactCompileEnvironment) equal(other CompactCompileEnvironment) bool {
-	return environment.ID == other.ID &&
-		environment.ABI == other.ABI &&
-		environment.ConfigPayload == other.ConfigPayload &&
-		reflect.DeepEqual(environment.GeneratedHeaderFamilies, other.GeneratedHeaderFamilies)
 }
 
 func sortedCompactConfigPayloads(values map[string]CompactConfigPayload) []CompactConfigPayload {
@@ -802,7 +690,7 @@ func sortedCompactIDs[T any](values map[string]T) []string {
 }
 
 func (metadata *CompactMetadata) validateContentIDs() error {
-	if metadata == nil || !metadata.Schema.isV013() {
+	if metadata == nil {
 		return nil
 	}
 	if err := metadata.validateSourceInputIndex(); err != nil {
@@ -833,8 +721,8 @@ func (metadata *CompactMetadata) validateContentIDs() error {
 		if err := check("config payload", payload.ID); err != nil {
 			return err
 		}
-		if payload.Fragment != nil {
-			canonical := canonicalConfigContent(payload.Fragment)
+		if payload.fragment != nil {
+			canonical := canonicalConfigContent(payload.fragment)
 			if payload.Content != canonical {
 				return fmt.Errorf(
 					"config payload %s content does not match its canonical fragment",
@@ -856,6 +744,17 @@ func (metadata *CompactMetadata) validateContentIDs() error {
 		if family.Name == "" || family.Srcarch == "" || len(family.Labels) == 0 {
 			return fmt.Errorf("generated header family %s has incomplete metadata", family.ID)
 		}
+		for i, label := range family.Labels {
+			if strings.TrimSpace(label) == "" {
+				return fmt.Errorf("generated header family %s has an empty label", family.ID)
+			}
+			if i != 0 && family.Labels[i-1] >= label {
+				return fmt.Errorf(
+					"generated header family %s has duplicate or non-canonical labels",
+					family.ID,
+				)
+			}
+		}
 		for i, dependency := range family.Dependencies {
 			if dependency == family.ID {
 				return fmt.Errorf("generated header family %s depends on itself", family.ID)
@@ -876,20 +775,18 @@ func (metadata *CompactMetadata) validateContentIDs() error {
 		}
 		inputs, err := metadata.expandedSourceInputGroup(
 			family.SourceInputGroup,
-			family.SourceInputs,
 			fmt.Sprintf("generated header family %q", family.ID),
 		)
 		if err != nil {
 			return err
 		}
-		expected := newCompactGeneratedHeaderFamily(
+		expected := compactGeneratedHeaderFamilyContentID(
 			family.Name,
 			family.ConfigPayload,
-			"",
 			family.Srcarch,
 			family.Dependencies,
 			inputs,
-		).ID
+		)
 		if family.ID != expected {
 			return fmt.Errorf(
 				"generated header family %s canonical inputs hash to %s",
@@ -1006,7 +903,6 @@ func (metadata *CompactMetadata) validateContentIDs() error {
 	for _, variant := range metadata.ObjectVariants {
 		inputs, err := metadata.expandedSourceInputGroup(
 			variant.SourceInputGroup,
-			variant.SourceInputs,
 			fmt.Sprintf("object target %q", variant.Target),
 		)
 		if err != nil {

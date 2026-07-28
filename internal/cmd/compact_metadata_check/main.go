@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,7 +30,6 @@ func (r *repeated) Set(value string) error {
 }
 
 type metadata struct {
-	Schema                  string                  `json:"schema"`
 	Configs                 []config                `json:"configs"`
 	ConfigPayloads          []configPayload         `json:"config_payloads"`
 	CompileEnvironments     []compileEnvironment    `json:"compile_environments"`
@@ -39,25 +41,24 @@ type metadata struct {
 
 type config struct {
 	Name                string   `json:"name"`
-	ConfigPayload       string   `json:"config_payload"`
+	ConfigPayload       string   `json:"config_payload,omitempty"`
 	ObjectTargets       []string `json:"object_targets"`
-	ModuleObjectTargets []string `json:"module_object_targets"`
+	ModuleObjectTargets []string `json:"module_object_targets,omitempty"`
 }
 
 type objectVariant struct {
-	Target             string        `json:"target"`
-	ContentID          string        `json:"content_id"`
-	CompileEnvironment string        `json:"compile_environment"`
-	Object             string        `json:"object"`
-	Source             string        `json:"source"`
-	SourceInputGroup   int           `json:"source_input_group"`
-	SourceInputs       []sourceInput `json:"source_inputs"`
-	Mode               string        `json:"mode"`
-	ModName            string        `json:"modname"`
-	Flags              []string      `json:"flags"`
-	RemoveFlags        []string      `json:"remove_flags"`
-	Deps               []string      `json:"deps"`
-	Members            []string      `json:"members"`
+	Target             string   `json:"target"`
+	ContentID          string   `json:"content_id,omitempty"`
+	CompileEnvironment string   `json:"compile_environment,omitempty"`
+	Object             string   `json:"object"`
+	Source             string   `json:"source,omitempty"`
+	SourceInputGroup   int      `json:"source_input_group,omitempty"`
+	Mode               string   `json:"mode"`
+	ModName            string   `json:"modname,omitempty"`
+	Flags              []string `json:"flags,omitempty"`
+	RemoveFlags        []string `json:"remove_flags,omitempty"`
+	Deps               []string `json:"deps,omitempty"`
+	Members            []string `json:"members,omitempty"`
 }
 
 type sourceInput struct {
@@ -74,30 +75,28 @@ type compileEnvironment struct {
 	ID                      string   `json:"id"`
 	ABI                     string   `json:"abi"`
 	ConfigPayload           string   `json:"config_payload"`
-	GeneratedHeaderFamilies []string `json:"generated_header_families"`
+	GeneratedHeaderFamilies []string `json:"generated_header_families,omitempty"`
 }
 
 type generatedHeaderFamily struct {
-	ID               string        `json:"id"`
-	Name             string        `json:"name"`
-	ConfigPayload    string        `json:"config_payload"`
-	Labels           []string      `json:"labels"`
-	Srcarch          string        `json:"srcarch"`
-	Dependencies     []string      `json:"dependencies"`
-	SourceInputGroup int           `json:"source_input_group"`
-	SourceInputs     []sourceInput `json:"source_inputs"`
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	ConfigPayload    string   `json:"config_payload"`
+	Labels           []string `json:"labels,omitempty"`
+	Srcarch          string   `json:"srcarch"`
+	Dependencies     []string `json:"dependencies,omitempty"`
+	SourceInputGroup int      `json:"source_input_group,omitempty"`
 }
 
 func main() {
 	var (
-		metadataPath   = flag.String("metadata", "", "Compact metadata JSON to validate")
-		maxVariants    = flag.Int("max_object_variants", -1, "Fail when unique object variants exceed this value")
-		requireContent = flag.Bool("require_content_ids", false, "Require the v0.0.13 content-addressed metadata contract")
-		printSummary   = flag.Bool("summary", false, "Print graph membership and deduplication metrics")
-		share          repeated
-		differ         repeated
-		present        repeated
-		absent         repeated
+		metadataPath = flag.String("metadata", "", "Compact metadata JSON to validate")
+		maxVariants  = flag.Int("max_object_variants", -1, "Fail when unique object variants exceed this value")
+		printSummary = flag.Bool("summary", false, "Print graph membership and deduplication metrics")
+		share        repeated
+		differ       repeated
+		present      repeated
+		absent       repeated
 	)
 	flag.Var(&share, "share", "Assert CONFIG_A:CONFIG_B:OBJECT use the same object target. May be repeated")
 	flag.Var(&differ, "differ", "Assert CONFIG_A:CONFIG_B:OBJECT use different object targets. May be repeated")
@@ -114,12 +113,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "read metadata: %v\n", err)
 		os.Exit(1)
 	}
-	var meta metadata
-	if err := json.Unmarshal(data, &meta); err != nil {
+	meta, err := decodeMetadata(data)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "parse metadata: %v\n", err)
 		os.Exit(1)
 	}
-	stats, err := validateMetadata(&meta, *requireContent)
+	stats, err := validateMetadata(meta)
 	if err != nil {
 		fail(err)
 	}
@@ -130,7 +129,7 @@ func main() {
 			*maxVariants,
 		))
 	}
-	index := newIndex(&meta)
+	index := newIndex(meta)
 
 	if err := checkPresence(index, present, true); err != nil {
 		fail(err)
@@ -157,6 +156,102 @@ func main() {
 	fmt.Println("compact metadata checks passed")
 }
 
+func decodeMetadata(data []byte) (*metadata, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var meta metadata
+	if err := decoder.Decode(&meta); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("multiple JSON values")
+		}
+		return nil, err
+	}
+	if err := validateJSONShape(data, reflect.TypeOf(metadata{}), "metadata"); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
+func validateJSONShape(data []byte, model reflect.Type, context string) error {
+	raw := bytes.TrimSpace(data)
+	if bytes.Equal(raw, []byte("null")) {
+		return fmt.Errorf("%s must not be null", context)
+	}
+	switch model.Kind() {
+	case reflect.Struct:
+		var value map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return fmt.Errorf("%s must be a JSON object: %w", context, err)
+		}
+		fields := make(map[string]reflect.StructField, model.NumField())
+		required := make(map[string]bool, model.NumField())
+		for index := 0; index < model.NumField(); index++ {
+			field := model.Field(index)
+			name, options, _ := strings.Cut(field.Tag.Get("json"), ",")
+			if name == "-" {
+				continue
+			}
+			if name == "" {
+				name = field.Name
+			}
+			fields[name] = field
+			required[name] = !strings.Contains(","+options+",", ",omitempty,")
+		}
+		keys := make([]string, 0, len(value))
+		for name := range value {
+			keys = append(keys, name)
+		}
+		sort.Strings(keys)
+		for _, name := range keys {
+			field, ok := fields[name]
+			if !ok {
+				return fmt.Errorf("%s has unknown field %q", context, name)
+			}
+			if err := validateJSONShape(value[name], field.Type, context+"."+name); err != nil {
+				return err
+			}
+		}
+		for name, isRequired := range required {
+			if _, ok := value[name]; isRequired && !ok {
+				return fmt.Errorf("%s is missing required field %q", context, name)
+			}
+		}
+		return nil
+	case reflect.Slice:
+		var values []json.RawMessage
+		if err := json.Unmarshal(raw, &values); err != nil {
+			return fmt.Errorf("%s must be a JSON array: %w", context, err)
+		}
+		for index, value := range values {
+			if err := validateJSONShape(
+				value,
+				model.Elem(),
+				fmt.Sprintf("%s[%d]", context, index),
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	case reflect.String:
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return fmt.Errorf("%s must be a JSON string: %w", context, err)
+		}
+		return nil
+	case reflect.Int:
+		var value int
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return fmt.Errorf("%s must be a JSON integer: %w", context, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%s uses unsupported validation type %s", context, model)
+	}
+}
+
 type metadataIndex struct {
 	targetObject map[string]string
 	objectsByCfg map[string]map[string]string
@@ -169,7 +264,7 @@ type metadataStats struct {
 	duplicateMemberships   int
 }
 
-func validateMetadata(meta *metadata, requireContent bool) (metadataStats, error) {
+func validateMetadata(meta *metadata) (metadataStats, error) {
 	stats := metadataStats{objectVariants: len(meta.ObjectVariants)}
 	targets := map[string]objectVariant{}
 	contentIDs := map[string]string{}
@@ -206,7 +301,7 @@ func validateMetadata(meta *metadata, requireContent bool) (metadataStats, error
 				)
 			}
 			contentIDs[variant.ContentID] = variant.Target
-		} else if requireContent || meta.Schema == "v0.0.13" {
+		} else {
 			return stats, fmt.Errorf("object target %q has no content ID", variant.Target)
 		}
 	}
@@ -222,17 +317,9 @@ func validateMetadata(meta *metadata, requireContent bool) (metadataStats, error
 		}
 	}
 
-	contentRequired := requireContent || meta.Schema == "v0.0.13"
-	configPayloads := map[string]bool{}
-	if contentRequired {
-		if meta.Schema != "v0.0.13" {
-			return stats, fmt.Errorf("content IDs require compact schema v0.0.13, got %q", meta.Schema)
-		}
-		var err error
-		configPayloads, err = validateContentAddressedMetadata(meta, targets)
-		if err != nil {
-			return stats, err
-		}
+	configPayloads, err := validateContentAddressedMetadata(meta, targets)
+	if err != nil {
+		return stats, err
 	}
 
 	configNames := map[string]bool{}
@@ -245,14 +332,14 @@ func validateMetadata(meta *metadata, requireContent bool) (metadataStats, error
 			return stats, fmt.Errorf("duplicate compact config name %q", cfg.Name)
 		}
 		configNames[cfg.Name] = true
-		if cfg.ConfigPayload != "" && contentRequired && !configPayloads[cfg.ConfigPayload] {
+		if cfg.ConfigPayload != "" && !configPayloads[cfg.ConfigPayload] {
 			return stats, fmt.Errorf(
 				"config %q references unknown config payload %s",
 				cfg.Name,
 				cfg.ConfigPayload,
 			)
 		}
-		if contentRequired && cfg.ConfigPayload == "" {
+		if cfg.ConfigPayload == "" {
 			return stats, fmt.Errorf("config %q has no full config payload", cfg.Name)
 		}
 		roots := append(
@@ -339,7 +426,7 @@ func validateContentAddressedMetadata(
 	targets map[string]objectVariant,
 ) (map[string]bool, error) {
 	if len(meta.ConfigPayloads) == 0 || len(meta.CompileEnvironments) == 0 {
-		return nil, fmt.Errorf("v0.0.13 metadata has no compile environments")
+		return nil, fmt.Errorf("content graph has no compile environments")
 	}
 
 	for i, input := range meta.SourceFiles {
@@ -442,12 +529,6 @@ func validateContentAddressedMetadata(
 					family.ID,
 				)
 			}
-		}
-		if len(family.SourceInputs) != 0 {
-			return nil, fmt.Errorf(
-				"generated header family %s retains inline source_inputs",
-				family.ID,
-			)
 		}
 		var inputs []sourceInput
 		if family.SourceInputGroup != 0 {
@@ -581,9 +662,6 @@ func validateContentAddressedMetadata(
 		}
 		if !strings.HasSuffix(variant.Target, "__"+variant.ContentID[:24]) {
 			return nil, fmt.Errorf("object target %q does not use its collision-checked content ID", variant.Target)
-		}
-		if len(variant.SourceInputs) != 0 {
-			return nil, fmt.Errorf("object target %q retains inline source_inputs", variant.Target)
 		}
 		exactAction := len(variant.Members) == 0 || variant.Object == "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o"
 		var inputs []sourceInput
