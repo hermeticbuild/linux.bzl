@@ -54,22 +54,23 @@ type CompactConfig struct {
 }
 
 type CompactObjectVariant struct {
-	Target          string            `json:"target"`
-	Package         string            `json:"package,omitempty"`
-	Object          string            `json:"object"`
-	Source          string            `json:"source,omitempty"`
-	SourceIncludes  []string          `json:"source_includes,omitempty"`
-	Mode            string            `json:"mode"`
-	ModuleRoot      bool              `json:"module_root,omitempty"`
-	ModName         string            `json:"modname,omitempty"`
-	Flags           []string          `json:"flags,omitempty"`
-	RemoveFlags     []string          `json:"remove_flags,omitempty"`
-	ObjtoolArgs     []string          `json:"objtool_args,omitempty"`
-	ObjtoolDisabled bool              `json:"objtool_disabled,omitempty"`
-	ObjtoolForce    bool              `json:"objtool_force,omitempty"`
-	ConfigFragment  map[string]string `json:"config_fragment,omitempty"`
-	Deps            []string          `json:"deps,omitempty"`
-	Members         []string          `json:"members,omitempty"`
+	Target                 string            `json:"target"`
+	Package                string            `json:"package,omitempty"`
+	Object                 string            `json:"object"`
+	Source                 string            `json:"source,omitempty"`
+	SourceIncludes         []string          `json:"source_includes,omitempty"`
+	SourceIncludesComplete bool              `json:"source_includes_complete,omitempty"`
+	Mode                   string            `json:"mode"`
+	ModuleRoot             bool              `json:"module_root,omitempty"`
+	ModName                string            `json:"modname,omitempty"`
+	Flags                  []string          `json:"flags,omitempty"`
+	RemoveFlags            []string          `json:"remove_flags,omitempty"`
+	ObjtoolArgs            []string          `json:"objtool_args,omitempty"`
+	ObjtoolDisabled        bool              `json:"objtool_disabled,omitempty"`
+	ObjtoolForce           bool              `json:"objtool_force,omitempty"`
+	ConfigFragment         map[string]string `json:"config_fragment,omitempty"`
+	Deps                   []string          `json:"deps,omitempty"`
+	Members                []string          `json:"members,omitempty"`
 }
 
 type CompactObjectPackage struct {
@@ -126,11 +127,15 @@ func (opts CompactBuildFileOptions) hasSourceTreeLabels() bool {
 }
 
 type CompactMetadataOptions struct {
-	Schema      CompactSchema
-	ObjectDir   string
-	SourceRoot  string
-	SourceRoots map[string]string
-	LibraryDirs []string
+	Schema                  CompactSchema
+	ObjectDir               string
+	SourceRoot              string
+	SourceRoots             map[string]string
+	SourceGeneratedIncludes map[string][]string
+	// SourceGeneratedIncludesComplete asserts that SourceGeneratedIncludes
+	// covers every generated header spelling provided to compile actions.
+	SourceGeneratedIncludesComplete bool
+	LibraryDirs                     []string
 	// Srcarch selects architecture include roots while scanning source files for
 	// CONFIG_* dependencies.
 	Srcarch string
@@ -372,7 +377,7 @@ func cleanKbuildDir(dir string) string {
 }
 
 func (v CompactObjectVariant) equal(other CompactObjectVariant) bool {
-	if v.Target != other.Target || v.Package != other.Package || v.Object != other.Object || v.Source != other.Source || v.Mode != other.Mode || v.ModuleRoot != other.ModuleRoot || v.ModName != other.ModName || v.ObjtoolDisabled != other.ObjtoolDisabled || v.ObjtoolForce != other.ObjtoolForce || len(v.SourceIncludes) != len(other.SourceIncludes) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ObjtoolArgs) != len(other.ObjtoolArgs) || len(v.ConfigFragment) != len(other.ConfigFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
+	if v.Target != other.Target || v.Package != other.Package || v.Object != other.Object || v.Source != other.Source || v.SourceIncludesComplete != other.SourceIncludesComplete || v.Mode != other.Mode || v.ModuleRoot != other.ModuleRoot || v.ModName != other.ModName || v.ObjtoolDisabled != other.ObjtoolDisabled || v.ObjtoolForce != other.ObjtoolForce || len(v.SourceIncludes) != len(other.SourceIncludes) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ObjtoolArgs) != len(other.ObjtoolArgs) || len(v.ConfigFragment) != len(other.ConfigFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
 		return false
 	}
 	for i := range v.SourceIncludes {
@@ -1011,15 +1016,35 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 	}
 
 	var sourceRefs, sourceIncludes []string
+	sourceIncludesComplete := false
 	if opts.Schema.isV012() {
 		flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(object.flags, source), opts.SourceRoot)
-		sourceRefs = scanner.refsForSource(source, includeDirsFromFlags(flags))
-		sourceIncludes = scanner.sourceIncludesForSource(source, includeDirsFromFlags(flags))
+		sourceSearchComplete := opts.SourceGeneratedIncludesComplete && sourceIncludeFlagsComplete(flags)
+		includeRoots := includeDirsFromFlags(flags, source)
+		closure := scanner.closureForSource(
+			source,
+			includeRoots,
+			forcedIncludesFromFlags(flags, source),
+			sourceSearchComplete,
+		)
+		sourceRefs = append([]string(nil), closure.refs...)
+		preincludes := scanner.closureForPreincludes(source, includeRoots, sourceSearchComplete)
+		sourceRefs = append(sourceRefs, preincludes.refs...)
+		sourceIncludes = append([]string(nil), closure.sourceIncludes...)
+		for _, include := range preincludes.sourceIncludes {
+			sourceIncludes = appendUnique(sourceIncludes, include)
+		}
+		sort.Strings(sourceIncludes)
+		sourceIncludesComplete = sourceSearchComplete && closure.sourceIncludesComplete && preincludes.sourceIncludesComplete
+		if objectUsesGeneratedCSource(name) {
+			sourceIncludesComplete = false
+		}
 		if isMultiSourceImageObject(name) {
 			sourceRefs = append(sourceRefs, scanner.refsForSourceDir(objectPackage(name))...)
+			sourceIncludesComplete = false
 		}
 	}
-	variant := object.variant(config, source, sourceIncludes, members, deps, opts.SourceRoot, sourceRefs, opts.Schema.isV012())
+	variant := object.variant(config, source, sourceIncludes, sourceIncludesComplete, members, deps, opts.SourceRoot, sourceRefs, opts.Schema.isV012())
 	memo[name] = variant
 	return variant, nil
 }
@@ -1030,33 +1055,182 @@ func isMultiSourceImageObject(object string) bool {
 		object == "arch/x86/purgatory/kexec-purgatory.o"
 }
 
+func objectUsesGeneratedCSource(object string) bool {
+	return strings.HasSuffix(object, ".asn1.o") ||
+		object == "arch/x86/kernel/cpu/capflags.o" ||
+		object == "drivers/tty/vt/consolemap_deftbl.o"
+}
+
 func objectNeedsFullConfig(object string) bool {
 	return object == "arch/x86/purgatory/kexec-purgatory.o"
 }
 
-func includeDirsFromFlags(flags []string) []string {
+func includeDirsFromFlags(flags []string, source string) []string {
 	var dirs []string
-	for i := 0; i < len(flags); i++ {
-		path := ""
-		if flags[i] == "-I" && i+1 < len(flags) {
-			path = flags[i+1]
-			i++
-		} else if rest, ok := strings.CutPrefix(flags[i], "-I"); ok {
-			path = rest
-		} else {
-			continue
-		}
-		path = strings.TrimSpace(path)
-		if path == "$(srctree)" {
-			dirs = append(dirs, "")
-		} else if rel, ok := strings.CutPrefix(path, "$(srctree)/"); ok {
-			dirs = append(dirs, rel)
+	for _, path := range flagOptionValues(flags, "-I", "-iquote", "-isystem", "-idirafter") {
+		for _, dir := range sourceTreeFlagPaths(path, source) {
+			dirs = appendUnique(dirs, dir)
 		}
 	}
 	return dirs
 }
 
-func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, sourceIncludes, members, deps []string, sourceRoot string, sourceRefs []string, v012 bool) CompactObjectVariant {
+func forcedIncludesFromFlags(flags []string, source string) []sourceForcedInclude {
+	var includes []sourceForcedInclude
+	for _, path := range flagOptionValues(flags, "-include", "-imacros") {
+		include := sourceForcedInclude{}
+		switch {
+		case path == "$(srctree)", path == "${srctree}":
+			include.path = ""
+			include.direct = true
+		case strings.HasPrefix(path, "$(srctree)/"):
+			include.path = strings.TrimPrefix(path, "$(srctree)/")
+			include.direct = true
+		case strings.HasPrefix(path, "${srctree}/"):
+			include.path = strings.TrimPrefix(path, "${srctree}/")
+			include.direct = true
+		case path == "$(src)", path == "${src}":
+			include.path = objectPackage(source)
+			include.direct = true
+		case strings.HasPrefix(path, "$(src)/"):
+			include.path = filepath.ToSlash(filepath.Join(objectPackage(source), strings.TrimPrefix(path, "$(src)/")))
+			include.direct = true
+		case strings.HasPrefix(path, "${src}/"):
+			include.path = filepath.ToSlash(filepath.Join(objectPackage(source), strings.TrimPrefix(path, "${src}/")))
+			include.direct = true
+		case strings.HasPrefix(path, "$(obj)/"), strings.HasPrefix(path, "${obj}/"):
+			rest := strings.TrimPrefix(strings.TrimPrefix(path, "$(obj)/"), "${obj}/")
+			include.path = filepath.ToSlash(filepath.Join(objectPackage(source), rest))
+			include.direct = true
+		default:
+			include.path = path
+		}
+		includes = append(includes, include)
+	}
+	return includes
+}
+
+func sourceIncludeFlagsComplete(flags []string) bool {
+	known := []string{"-I", "-iquote", "-isystem", "-idirafter", "-include", "-imacros"}
+	for i := 0; i < len(flags); i++ {
+		flag := flags[i]
+		matched := false
+		for _, option := range known {
+			if flag == option {
+				if i+1 >= len(flags) {
+					return false
+				}
+				value := flags[i+1]
+				if sourceFlagPathUnresolved(value) {
+					return false
+				}
+				i++
+				matched = true
+				break
+			}
+			if value, ok := strings.CutPrefix(flag, option); ok && value != "" {
+				if sourceFlagPathUnresolved(strings.TrimPrefix(value, "=")) {
+					return false
+				}
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+		for _, prefix := range []string{
+			"-F",
+			"-iframework",
+			"-iprefix",
+			"-iwithprefix",
+			"-Wp,-I",
+			"-Wp,-include",
+			"-Wp,-imacros",
+			"--include",
+			"--imacros",
+			"-Xclang",
+		} {
+			if strings.HasPrefix(flag, prefix) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sourceFlagPathUnresolved(path string) bool {
+	path = strings.TrimSpace(path)
+	if !strings.Contains(path, "$(") && !strings.Contains(path, "${") {
+		return false
+	}
+	for _, prefix := range []string{
+		"$(src)",
+		"$(srctree)",
+		"${src}",
+		"${srctree}",
+	} {
+		if path == prefix {
+			return false
+		}
+		if strings.HasPrefix(path, prefix+"/") {
+			rest := strings.TrimPrefix(path, prefix+"/")
+			return strings.Contains(rest, "$(") || strings.Contains(rest, "${")
+		}
+	}
+	return true
+}
+
+func flagOptionValues(flags []string, options ...string) []string {
+	var values []string
+	for i := 0; i < len(flags); i++ {
+		for _, option := range options {
+			if flags[i] == option {
+				if i+1 < len(flags) {
+					values = append(values, strings.TrimSpace(flags[i+1]))
+					i++
+				}
+				break
+			}
+			if value, ok := strings.CutPrefix(flags[i], option); ok && value != "" {
+				values = append(values, strings.TrimPrefix(strings.TrimSpace(value), "="))
+				break
+			}
+		}
+	}
+	return values
+}
+
+func sourceTreeFlagPaths(path, source string) []string {
+	path = strings.TrimSpace(path)
+	if sourceFlagPathUnresolved(path) {
+		return nil
+	}
+	switch {
+	case path == "$(srctree)", path == "${srctree}":
+		return []string{""}
+	case strings.HasPrefix(path, "$(srctree)/"):
+		return []string{strings.TrimPrefix(path, "$(srctree)/")}
+	case strings.HasPrefix(path, "${srctree}/"):
+		return []string{strings.TrimPrefix(path, "${srctree}/")}
+	case path == "$(src)", path == "${src}", path == "$(obj)", path == "${obj}":
+		return []string{objectPackage(source)}
+	case strings.HasPrefix(path, "$(src)/"):
+		return []string{filepath.ToSlash(filepath.Join(objectPackage(source), strings.TrimPrefix(path, "$(src)/")))}
+	case strings.HasPrefix(path, "${src}/"):
+		return []string{filepath.ToSlash(filepath.Join(objectPackage(source), strings.TrimPrefix(path, "${src}/")))}
+	case strings.HasPrefix(path, "$(obj)/"):
+		return []string{filepath.ToSlash(filepath.Join(objectPackage(source), strings.TrimPrefix(path, "$(obj)/")))}
+	case strings.HasPrefix(path, "${obj}/"):
+		return []string{filepath.ToSlash(filepath.Join(objectPackage(source), strings.TrimPrefix(path, "${obj}/")))}
+	case path == "" || strings.Contains(path, "$(") || strings.Contains(path, "${") || filepath.IsAbs(filepath.FromSlash(path)):
+		return nil
+	default:
+		return []string{filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))}
+	}
+}
+
+func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, sourceIncludes []string, sourceIncludesComplete bool, members, deps []string, sourceRoot string, sourceRefs []string, v012 bool) CompactObjectVariant {
 	fragment := map[string]string{}
 	refset := make(map[string]bool, len(o.footprint)+len(sourceRefs))
 	for ref := range o.footprint {
@@ -1071,7 +1245,7 @@ func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, sou
 				refset[ref] = true
 			}
 		}
-		if objectNeedsFullConfig(o.object) {
+		if objectNeedsFullConfig(o.object) || (source != "" && !sourceIncludesComplete) {
 			for key, written := range config.Written {
 				if written {
 					refset[key] = true
@@ -1093,6 +1267,8 @@ func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, sou
 	}
 	flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.flags, source), sourceRoot)
 	remove := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.remove, source), sourceRoot)
+	sourceIncludesTracked := v012 && source != ""
+	sourceIncludesIncomplete := sourceIncludesTracked && !sourceIncludesComplete
 	hash := objectVariantHash(
 		o.object,
 		o.mode,
@@ -1101,6 +1277,7 @@ func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, sou
 		remove,
 		fragment,
 		sourceIncludes,
+		sourceIncludesIncomplete,
 		deps,
 		members,
 		o.root && o.mode == "m",
@@ -1109,22 +1286,23 @@ func (o resolvedKbuildObject) variant(config *ResolvedConfig, source string, sou
 		o.objtoolArgs,
 	)
 	return CompactObjectVariant{
-		Target:          sanitizeTargetName(strings.TrimSuffix(o.object, ".o")) + "__" + hash,
-		Package:         objectPackage(o.object),
-		Object:          o.object,
-		Source:          source,
-		SourceIncludes:  append([]string(nil), sourceIncludes...),
-		Mode:            o.mode,
-		ModuleRoot:      o.root && o.mode == "m",
-		ModName:         o.modname,
-		Flags:           flags,
-		RemoveFlags:     remove,
-		ObjtoolArgs:     append([]string(nil), o.objtoolArgs...),
-		ObjtoolDisabled: o.objtoolDisabled,
-		ObjtoolForce:    o.objtoolForce,
-		ConfigFragment:  fragment,
-		Deps:            append([]string(nil), deps...),
-		Members:         append([]string(nil), members...),
+		Target:                 sanitizeTargetName(strings.TrimSuffix(o.object, ".o")) + "__" + hash,
+		Package:                objectPackage(o.object),
+		Object:                 o.object,
+		Source:                 source,
+		SourceIncludes:         append([]string(nil), sourceIncludes...),
+		SourceIncludesComplete: sourceIncludesTracked && sourceIncludesComplete,
+		Mode:                   o.mode,
+		ModuleRoot:             o.root && o.mode == "m",
+		ModName:                o.modname,
+		Flags:                  flags,
+		RemoveFlags:            remove,
+		ObjtoolArgs:            append([]string(nil), o.objtoolArgs...),
+		ObjtoolDisabled:        o.objtoolDisabled,
+		ObjtoolForce:           o.objtoolForce,
+		ConfigFragment:         fragment,
+		Deps:                   append([]string(nil), deps...),
+		Members:                append([]string(nil), members...),
 	}
 }
 
@@ -1159,7 +1337,7 @@ func normalizeSourceRootFlag(flag, sourceRoot string) string {
 	if strings.HasPrefix(flag, sourceRoot+"/") {
 		return "$(srctree)/" + strings.TrimPrefix(flag, sourceRoot+"/")
 	}
-	for _, prefix := range []string{"-I", "-iquote", "-isystem", "-include"} {
+	for _, prefix := range []string{"-I", "-iquote", "-isystem", "-idirafter", "-include", "-imacros"} {
 		path := strings.TrimPrefix(flag, prefix)
 		if path == flag {
 			continue
@@ -1382,7 +1560,7 @@ func objectPackage(object string) string {
 	return dir
 }
 
-func objectVariantHash(object, mode, modname string, flags, removeFlags []string, fragment map[string]string, sourceIncludes, deps, members []string, moduleRoot, objtoolDisabled, objtoolForce bool, objtoolArgs []string) string {
+func objectVariantHash(object, mode, modname string, flags, removeFlags []string, fragment map[string]string, sourceIncludes []string, sourceIncludesIncomplete bool, deps, members []string, moduleRoot, objtoolDisabled, objtoolForce bool, objtoolArgs []string) string {
 	var b strings.Builder
 	b.WriteString(object)
 	b.WriteByte('\n')
@@ -1423,6 +1601,9 @@ func objectVariantHash(object, mode, modname string, flags, removeFlags []string
 		b.WriteString("source_include=")
 		b.WriteString(include)
 		b.WriteByte('\n')
+	}
+	if sourceIncludesIncomplete {
+		b.WriteString("source_includes=incomplete\n")
 	}
 	for _, dep := range deps {
 		b.WriteString("dep=")
@@ -1594,13 +1775,20 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 		if emitSource {
 			r.SetAttr("src", labelForSource(opts, variant.Source))
 			if opts.Schema.isV012() {
-				r.SetAttr("source_includes_complete", true)
+				if variant.SourceIncludesComplete {
+					r.SetAttr("source_includes_complete", true)
+				}
 				if len(variant.SourceIncludes) != 0 {
 					sourceIncludes := make([]string, 0, len(variant.SourceIncludes))
 					for _, include := range variant.SourceIncludes {
+						if sourceIncludeCoveredByClasses(opts, include) {
+							continue
+						}
 						sourceIncludes = append(sourceIncludes, labelForSource(opts, include))
 					}
-					r.SetAttr("source_includes", sourceIncludes)
+					if len(sourceIncludes) != 0 {
+						r.SetAttr("source_includes", sourceIncludes)
+					}
 				}
 			}
 			if opts.SourceConfig != "" {
@@ -1688,6 +1876,18 @@ func labelForSource(opts CompactBuildFileOptions, source string) string {
 		}
 	}
 	return labelFor(opts.SourceLabelPackage, source)
+}
+
+func sourceIncludeCoveredByClasses(opts CompactBuildFileOptions, source string) bool {
+	if !strings.HasSuffix(source, ".h") {
+		return false
+	}
+	if len(opts.SourceTreeGlobalHeaders) != 0 && strings.HasPrefix(source, "include/") {
+		return true
+	}
+	return len(opts.SourceTreeArchHeaders) != 0 &&
+		opts.Srcarch != "" &&
+		strings.HasPrefix(source, "arch/"+opts.Srcarch+"/include/")
 }
 
 func (m *CompactMetadata) objectBuildFileNeedsConfig(opts CompactBuildFileOptions) bool {

@@ -1,6 +1,7 @@
 package kconfig
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -20,15 +21,23 @@ type configSourceScanner struct {
 	sourceRoot   string
 	sourceRoots  map[string]string
 	includeRoots []string
+	generated    map[string][]string
 
-	fileRefs map[string][]string
-	fileIncs map[string][]string
-	closure  map[string]sourceClosure
+	fileRefs        map[string][]string
+	fileIncs        map[string][]string
+	fileDynamicIncs map[string][]string
+	closure         map[string]sourceClosure
 }
 
 type sourceClosure struct {
-	refs           []string
-	sourceIncludes []string
+	refs                   []string
+	sourceIncludes         []string
+	sourceIncludesComplete bool
+}
+
+type sourceForcedInclude struct {
+	path   string
+	direct bool
 }
 
 func newConfigSourceScanner(opts CompactMetadataOptions) *configSourceScanner {
@@ -40,12 +49,14 @@ func newConfigSourceScanner(opts CompactMetadataOptions) *configSourceScanner {
 		)
 	}
 	return &configSourceScanner{
-		sourceRoot:   opts.SourceRoot,
-		sourceRoots:  opts.SourceRoots,
-		includeRoots: roots,
-		fileRefs:     map[string][]string{},
-		fileIncs:     map[string][]string{},
-		closure:      map[string]sourceClosure{},
+		sourceRoot:      opts.SourceRoot,
+		sourceRoots:     opts.SourceRoots,
+		includeRoots:    roots,
+		generated:       opts.SourceGeneratedIncludes,
+		fileRefs:        map[string][]string{},
+		fileIncs:        map[string][]string{},
+		fileDynamicIncs: map[string][]string{},
+		closure:         map[string]sourceClosure{},
 	}
 }
 
@@ -53,21 +64,67 @@ func newConfigSourceScanner(opts CompactMetadataOptions) *configSourceScanner {
 // extraIncludeRoots contains tree-relative directories extracted from the
 // object's Kbuild -I flags.
 func (s *configSourceScanner) refsForSource(source string, extraIncludeRoots []string) []string {
-	return append([]string(nil), s.closureForSource(source, extraIncludeRoots).refs...)
+	return append([]string(nil), s.closureForSource(source, extraIncludeRoots, nil, false).refs...)
 }
 
-// sourceIncludesForSource returns sorted source-like tree paths reached through
-// literal includes. It follows the full include graph so source fragments
-// included by a header are also explicit compile-action inputs.
-func (s *configSourceScanner) sourceIncludesForSource(source string, extraIncludeRoots []string) []string {
-	return append([]string(nil), s.closureForSource(source, extraIncludeRoots).sourceIncludes...)
+func (s *configSourceScanner) closureForPreincludes(source string, extraIncludeRoots []string, sourceSearchComplete bool) sourceClosure {
+	refset := map[string]bool{}
+	includeSet := map[string]bool{}
+	complete := true
+	for _, path := range sourcePreincludePaths(source) {
+		if _, ok := s.absForTreePath(path); !ok {
+			continue
+		}
+		closure := s.closureForSource(path, extraIncludeRoots, nil, sourceSearchComplete)
+		if !closure.sourceIncludesComplete {
+			complete = false
+		}
+		for _, ref := range closure.refs {
+			refset[ref] = true
+		}
+		for _, include := range closure.sourceIncludes {
+			includeSet[include] = true
+		}
+	}
+	refs := make([]string, 0, len(refset))
+	for ref := range refset {
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	includes := make([]string, 0, len(includeSet))
+	for include := range includeSet {
+		includes = append(includes, include)
+	}
+	sort.Strings(includes)
+	return sourceClosure{
+		refs:                   refs,
+		sourceIncludes:         includes,
+		sourceIncludesComplete: complete,
+	}
 }
 
-func (s *configSourceScanner) closureForSource(source string, extraIncludeRoots []string) sourceClosure {
+// sourceIncludesForSource returns sorted source-tree paths reached through
+// recursively resolved literal includes. The boolean is false when the closure
+// contains an unresolved computed include that requires the blanket fallback.
+func (s *configSourceScanner) sourceIncludesForSource(source string, extraIncludeRoots []string) ([]string, bool) {
+	closure := s.closureForSource(source, extraIncludeRoots, nil, false)
+	return append([]string(nil), closure.sourceIncludes...), closure.sourceIncludesComplete
+}
+
+// sourceSearchComplete means every source-tree include search root used by the
+// compile action is represented by extraIncludeRoots. An unresolved literal is
+// then generated, toolchain-provided, inactive, or a compile error rather than
+// an omitted source-tree input.
+func (s *configSourceScanner) closureForSource(source string, extraIncludeRoots []string, forcedIncludes []sourceForcedInclude, sourceSearchComplete bool) sourceClosure {
 	if s == nil || source == "" {
 		return sourceClosure{}
 	}
-	key := source + "\x00" + strings.Join(extraIncludeRoots, "\x00")
+	keyParts := append([]string{source}, extraIncludeRoots...)
+	for _, include := range forcedIncludes {
+		keyParts = append(keyParts, include.path, fmt.Sprintf("direct=%t", include.direct))
+	}
+	keyParts = append(keyParts, fmt.Sprintf("source_search_complete=%t", sourceSearchComplete))
+	key := strings.Join(keyParts, "\x00")
 	if cached, ok := s.closure[key]; ok {
 		return cached
 	}
@@ -84,7 +141,20 @@ func (s *configSourceScanner) closureForSource(source string, extraIncludeRoots 
 	refset := map[string]bool{}
 	includeSet := map[string]bool{}
 	visited := map[string]bool{}
+	sourceIncludesComplete := true
 	stack := []string{source}
+	for _, include := range forcedIncludes {
+		resolved, satisfied := s.resolveForcedInclude(source, include, extraIncludeRoots)
+		if !satisfied {
+			sourceIncludesComplete = false
+		}
+		for _, path := range resolved {
+			if path != source {
+				includeSet[path] = true
+			}
+			stack = append(stack, path)
+		}
+	}
 	for len(stack) > 0 {
 		treePath := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -96,13 +166,20 @@ func (s *configSourceScanner) closureForSource(source string, extraIncludeRoots 
 		if !ok {
 			continue
 		}
-		refs, rawIncludes := s.scanFile(abs)
+		refs, rawIncludes, dynamicIncludes := s.scanFile(abs)
+		if len(dynamicIncludes) != 0 {
+			sourceIncludesComplete = false
+		}
 		for _, ref := range refs {
 			refset[ref] = true
 		}
 		for _, inc := range rawIncludes {
-			for _, resolved := range s.resolveInclude(treePath, inc, extraIncludeRoots) {
-				if resolved != source && isSourceLikeInclude(resolved) {
+			resolvedIncludes, satisfied := s.resolveLiteralInclude(treePath, inc, extraIncludeRoots)
+			if !satisfied && !sourceSearchComplete {
+				sourceIncludesComplete = false
+			}
+			for _, resolved := range resolvedIncludes {
+				if resolved != source {
 					includeSet[resolved] = true
 				}
 				if !visited[resolved] {
@@ -122,18 +199,69 @@ func (s *configSourceScanner) closureForSource(source string, extraIncludeRoots 
 	}
 	sort.Strings(includes)
 	result := sourceClosure{
-		refs:           out,
-		sourceIncludes: includes,
+		refs:                   out,
+		sourceIncludes:         includes,
+		sourceIncludesComplete: sourceIncludesComplete,
 	}
 	s.closure[key] = result
 	return result
 }
 
-func isSourceLikeInclude(path string) bool {
-	return strings.HasSuffix(path, ".c") ||
-		strings.HasSuffix(path, ".S") ||
-		strings.HasSuffix(path, ".s") ||
-		strings.HasSuffix(path, ".inc")
+func sourcePreincludePaths(source string) []string {
+	paths := []string{
+		"include/linux/compiler-version.h",
+		"include/linux/kconfig.h",
+	}
+	if filepath.Ext(source) == ".c" || strings.HasSuffix(source, ".c_shipped") {
+		paths = append(paths, "include/linux/compiler_types.h")
+	}
+	return paths
+}
+
+func (s *configSourceScanner) resolveForcedInclude(source string, include sourceForcedInclude, extraRoots []string) ([]string, bool) {
+	if include.direct {
+		path, ok := cleanSourceTreePath(include.path)
+		if !ok {
+			return nil, false
+		}
+		if _, ok := s.absForTreePath(path); ok {
+			return []string{path}, true
+		}
+		return s.resolveGeneratedInclude(path)
+	}
+	return s.resolveLiteralInclude(source, include.path, extraRoots)
+}
+
+func (s *configSourceScanner) resolveLiteralInclude(fromTreePath, include string, extraRoots []string) ([]string, bool) {
+	resolved := s.resolveInclude(fromTreePath, include, extraRoots)
+	include = filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(include))))
+	generated, generatedSatisfied := s.resolveGeneratedInclude(include)
+	for _, path := range generated {
+		resolved = appendUnique(resolved, path)
+	}
+	return resolved, len(resolved) != 0 || generatedSatisfied
+}
+
+func (s *configSourceScanner) resolveGeneratedInclude(include string) ([]string, bool) {
+	backings, ok := s.generated[include]
+	if !ok {
+		return nil, false
+	}
+	if len(backings) == 0 {
+		return nil, true
+	}
+	resolved := make([]string, 0, len(backings))
+	for _, backing := range backings {
+		backing, ok := cleanSourceTreePath(backing)
+		if !ok {
+			return nil, false
+		}
+		if _, ok := s.absForTreePath(backing); !ok {
+			return nil, false
+		}
+		resolved = appendUnique(resolved, backing)
+	}
+	return resolved, true
 }
 
 // refsForSourceDir returns the union of CONFIG_* footprints of every C and
@@ -170,27 +298,36 @@ func (s *configSourceScanner) refsForSourceDir(dir string) []string {
 	return out
 }
 
-// scanFile returns the CONFIG_* tokens and raw include targets of one file.
-func (s *configSourceScanner) scanFile(abs string) (refs, rawIncludes []string) {
+// scanFile returns the CONFIG_* tokens and literal and computed include
+// targets of one file.
+func (s *configSourceScanner) scanFile(abs string) (refs, rawIncludes, dynamicIncludes []string) {
 	if cached, ok := s.fileRefs[abs]; ok {
-		return cached, s.fileIncs[abs]
+		return cached, s.fileIncs[abs], s.fileDynamicIncs[abs]
 	}
 	data, err := os.ReadFile(abs)
 	if err != nil {
 		s.fileRefs[abs] = nil
 		s.fileIncs[abs] = nil
-		return nil, nil
+		s.fileDynamicIncs[abs] = []string{""}
+		return nil, nil, []string{""}
 	}
 	text := string(data)
 	refs = configRefs(text)
-	for _, line := range strings.Split(text, "\n") {
-		if inc, ok := includePath(line); ok {
+	for _, line := range preprocessorLines(text) {
+		inc, literal, directive := includeDirective(line)
+		if literal {
 			rawIncludes = append(rawIncludes, inc)
+		} else if directive {
+			dynamicIncludes = append(dynamicIncludes, inc)
+		}
+		if assemblerIncbinDirective(line) {
+			dynamicIncludes = append(dynamicIncludes, ".incbin")
 		}
 	}
 	s.fileRefs[abs] = refs
 	s.fileIncs[abs] = rawIncludes
-	return refs, rawIncludes
+	s.fileDynamicIncs[abs] = dynamicIncludes
+	return refs, rawIncludes, dynamicIncludes
 }
 
 // resolveInclude returns every existing tree path an include could name.
@@ -217,32 +354,17 @@ func (s *configSourceScanner) resolveInclude(fromTreePath, inc string, extraRoot
 	if fromTreePath != "" {
 		add(filepath.ToSlash(filepath.Join(filepath.Dir(fromTreePath), filepath.FromSlash(inc))))
 	}
-	for _, candidate := range includeCandidates(inc) {
-		for _, root := range s.includeRoots {
-			add(root + "/" + candidate)
-		}
-		for _, root := range extraRoots {
-			if root == "" {
-				add(candidate)
-			} else {
-				add(root + "/" + candidate)
-			}
+	for _, root := range s.includeRoots {
+		add(root + "/" + inc)
+	}
+	for _, root := range extraRoots {
+		if root == "" {
+			add(inc)
+		} else {
+			add(root + "/" + inc)
 		}
 	}
 	return out
-}
-
-// includeCandidates maps generated per-arch asm wrappers to their source-tree
-// asm-generic counterparts as an additional conservative scan target.
-func includeCandidates(inc string) []string {
-	inc = filepath.ToSlash(inc)
-	candidates := []string{inc}
-	if rest, ok := strings.CutPrefix(inc, "asm/"); ok {
-		candidates = append(candidates, "asm-generic/"+rest)
-	} else if rest, ok := strings.CutPrefix(inc, "uapi/asm/"); ok {
-		candidates = append(candidates, "uapi/asm-generic/"+rest)
-	}
-	return candidates
 }
 
 func (s *configSourceScanner) absForTreePath(path string) (string, bool) {
@@ -270,26 +392,23 @@ func cleanSourceTreePath(path string) (string, bool) {
 	return path, true
 }
 
-// includePath extracts a literal quoted or angled C preprocessor include.
-func includePath(line string) (string, bool) {
+// includeDirective distinguishes literal and computed C preprocessor includes.
+func includeDirective(line string) (target string, literal, directive bool) {
 	line = strings.TrimSpace(line)
 	if !strings.HasPrefix(line, "#") {
-		return "", false
+		return "", false, false
 	}
 	line = strings.TrimSpace(line[1:])
-	if !strings.HasPrefix(line, "include") {
-		return "", false
+	if rest, ok := directiveKeywordRest(line, "include_next"); ok {
+		return strings.TrimSpace(rest), false, true
 	}
-	rest := line[len("include"):]
-	if rest == "" {
-		return "", false
-	}
-	if c := rest[0]; c != '"' && c != '<' && c != ' ' && c != '\t' {
-		return "", false
+	rest, ok := directiveKeywordRest(line, "include")
+	if !ok {
+		return "", false, false
 	}
 	rest = strings.TrimSpace(rest)
 	if rest == "" {
-		return "", false
+		return "", false, true
 	}
 	var closeByte byte
 	switch rest[0] {
@@ -298,12 +417,101 @@ func includePath(line string) (string, bool) {
 	case '<':
 		closeByte = '>'
 	default:
-		return "", false
+		return strings.TrimSpace(rest), false, true
 	}
 	rest = rest[1:]
 	end := strings.IndexByte(rest, closeByte)
 	if end < 0 {
+		return "", false, true
+	}
+	return rest[:end], true, true
+}
+
+func assemblerIncbinDirective(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, ".incbin") {
+		return false
+	}
+	rest := strings.TrimPrefix(line, ".incbin")
+	return rest == "" || strings.ContainsAny(rest[:1], " \t\v\f\r\"")
+}
+
+func directiveKeywordRest(line, keyword string) (string, bool) {
+	if !strings.HasPrefix(line, keyword) {
 		return "", false
 	}
-	return rest[:end], true
+	rest := line[len(keyword):]
+	if rest == "" {
+		return "", true
+	}
+	switch rest[0] {
+	case ' ', '\t', '\v', '\f', '\r', '/', '\\', '"', '<':
+		return rest, true
+	default:
+		return "", false
+	}
+}
+
+func preprocessorLines(text string) []string {
+	text = strings.ReplaceAll(text, "\\\r\n", "")
+	text = strings.ReplaceAll(text, "\\\n", "")
+	var out strings.Builder
+	out.Grow(len(text))
+	const (
+		normal = iota
+		lineComment
+		blockComment
+		stringLiteral
+		charLiteral
+	)
+	state := normal
+	for i := 0; i < len(text); i++ {
+		current := text[i]
+		next := byte(0)
+		if i+1 < len(text) {
+			next = text[i+1]
+		}
+		switch state {
+		case normal:
+			switch {
+			case current == '/' && next == '/':
+				out.WriteByte(' ')
+				i++
+				state = lineComment
+			case current == '/' && next == '*':
+				out.WriteByte(' ')
+				i++
+				state = blockComment
+			case current == '"':
+				out.WriteByte(current)
+				state = stringLiteral
+			case current == '\'':
+				out.WriteByte(current)
+				state = charLiteral
+			default:
+				out.WriteByte(current)
+			}
+		case lineComment:
+			if current == '\n' {
+				out.WriteByte(current)
+				state = normal
+			}
+		case blockComment:
+			if current == '*' && next == '/' {
+				i++
+				state = normal
+			} else if current == '\n' {
+				out.WriteByte(current)
+			}
+		case stringLiteral, charLiteral:
+			out.WriteByte(current)
+			if current == '\\' && i+1 < len(text) {
+				i++
+				out.WriteByte(text[i])
+			} else if (state == stringLiteral && current == '"') || (state == charLiteral && current == '\'') {
+				state = normal
+			}
+		}
+	}
+	return strings.Split(out.String(), "\n")
 }

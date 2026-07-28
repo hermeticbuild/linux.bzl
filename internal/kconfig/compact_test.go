@@ -2,6 +2,7 @@ package kconfig
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1184,10 +1185,17 @@ func TestCompactMetadataJSONMatchesPrettierArrayLayout(t *testing.T) {
 }
 
 func TestNormalizeSourceRootFlagsWindowsPaths(t *testing.T) {
+	root := `C:\users\runneradmin\execroot\external\linux`
 	got := normalizeSourceRootFlags([]string{
 		`-includeC:\users\runneradmin\execroot\external\linux\include\linux\hidden.h`,
-	}, `C:\users\runneradmin\execroot\external\linux`)
-	want := []string{`-include$(srctree)/include/linux/hidden.h`}
+		`-imacrosC:\users\runneradmin\execroot\external\linux\include\linux\macros.h`,
+		`-idirafterC:\users\runneradmin\execroot\external\linux\private`,
+	}, root)
+	want := []string{
+		`-include$(srctree)/include/linux/hidden.h`,
+		`-imacros$(srctree)/include/linux/macros.h`,
+		`-idirafter$(srctree)/private`,
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("normalizeSourceRootFlags() = %#v, want %#v", got, want)
 	}
@@ -1326,23 +1334,38 @@ func TestCompactObjectBuildFileEmitsSourceInputs(t *testing.T) {
 	}
 }
 
-func TestCompactObjectBuildFileEmitsQuotedIncludeClosure(t *testing.T) {
+func TestCompactObjectBuildFileEmitsLiteralIncludeClosure(t *testing.T) {
 	tree := mustParseCompactFixture(t)
-	kb, err := ParseKbuild(strings.NewReader("obj-y += init.o entry.o\n"), "Kbuild")
+	kb, err := ParseKbuild(strings.NewReader("obj-y += init.o entry.o dynamic.o\n"), "Kbuild")
 	if err != nil {
 		t.Fatalf("ParseKbuild() failed: %v", err)
 	}
 	sourceRoot := t.TempDir()
-	mustWriteSource(t, sourceRoot, "init.c", `#include "fragments/first.inc"`+"\n")
+	mustWriteSource(t, sourceRoot, "init.c", `
+#include "fragments/first.inc"
+#include "private/first.h"
+#include <linux/global.h>
+#include <asm/arch.h>
+`)
 	mustWriteSource(t, sourceRoot, "fragments/first.inc", `#include "../shared/second.inc"`+"\n")
+	mustWriteSource(t, sourceRoot, "private/first.h", `#include "nested/second.h"`+"\n")
+	mustWriteSource(t, sourceRoot, "private/nested/second.h", "int private_second;\n")
+	mustWriteSource(t, sourceRoot, "include/linux/global.h", "int global;\n")
+	mustWriteSource(t, sourceRoot, "arch/x86/include/asm/arch.h", "int arch;\n")
 	mustWriteSource(t, sourceRoot, "entry.S", `#include "asm/entry.inc"`+"\n")
 	mustWriteSource(t, sourceRoot, "asm/entry.inc", `#include "../shared/second.inc"`+"\n")
+	mustWriteSource(t, sourceRoot, "dynamic.c", `#include DYNAMIC_HEADER`+"\n")
 	mustWriteSource(t, sourceRoot, "shared/second.inc", "int second;\n")
 	mustWriteSource(t, sourceRoot, "shared/unrelated.inc", "int unrelated;\n")
 
 	metadata, err := tree.CompactMetadataWithOptions(kb, []NamedConfig{
 		{Name: "base", Flags: nil},
-	}, CompactMetadataOptions{Schema: CompactSchemaV012, SourceRoot: sourceRoot})
+	}, CompactMetadataOptions{
+		Schema:                          CompactSchemaV012,
+		SourceRoot:                      sourceRoot,
+		SourceGeneratedIncludesComplete: true,
+		Srcarch:                         "x86",
+	})
 	if err != nil {
 		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
 	}
@@ -1350,19 +1373,37 @@ func TestCompactObjectBuildFileEmitsQuotedIncludeClosure(t *testing.T) {
 	variants := map[string]CompactObjectVariant{}
 	for object, wantIncludes := range map[string][]string{
 		"entry.o": {"asm/entry.inc", "shared/second.inc"},
-		"init.o":  {"fragments/first.inc", "shared/second.inc"},
+		"init.o": {
+			"arch/x86/include/asm/arch.h",
+			"fragments/first.inc",
+			"include/linux/global.h",
+			"private/first.h",
+			"private/nested/second.h",
+			"shared/second.inc",
+		},
 	} {
 		variant := variantByTarget(metadata, objectTarget(metadata, config, object))
 		if !reflect.DeepEqual(variant.SourceIncludes, wantIncludes) {
 			t.Fatalf("%s SourceIncludes = %v, want %v", object, variant.SourceIncludes, wantIncludes)
 		}
+		if !variant.SourceIncludesComplete {
+			t.Fatalf("%s literal include closure is marked incomplete", object)
+		}
 		variants[object] = variant
 	}
+	dynamic := variantByTarget(metadata, objectTarget(metadata, config, "dynamic.o"))
+	if dynamic.SourceIncludesComplete {
+		t.Fatal("dynamic.o computed include closure is marked complete")
+	}
+	variants["dynamic.o"] = dynamic
 
 	objectBuild, err := metadata.ObjectBuildFile(CompactBuildFileOptions{
-		Schema:             CompactSchemaV012,
-		SourceLabelPackage: "@linux//",
-		SourceRootLabel:    "@linux//:Kconfig",
+		Schema:                  CompactSchemaV012,
+		SourceLabelPackage:      "@linux//",
+		SourceRootLabel:         "@linux//:Kconfig",
+		SourceTreeArchHeaders:   []string{"@linux//:x86_headers"},
+		SourceTreeGlobalHeaders: []string{"@linux//:global_headers"},
+		Srcarch:                 "x86",
 	})
 	if err != nil {
 		t.Fatalf("ObjectBuildFile() failed: %v", err)
@@ -1373,7 +1414,12 @@ func TestCompactObjectBuildFileEmitsQuotedIncludeClosure(t *testing.T) {
 	}
 	for object, wantIncludes := range map[string][]string{
 		"entry.o": {"@linux//:asm/entry.inc", "@linux//:shared/second.inc"},
-		"init.o":  {"@linux//:fragments/first.inc", "@linux//:shared/second.inc"},
+		"init.o": {
+			"@linux//:fragments/first.inc",
+			"@linux//:private/first.h",
+			"@linux//:private/nested/second.h",
+			"@linux//:shared/second.inc",
+		},
 	} {
 		rule := parsed.RuleNamed(variants[object].Target)
 		if rule == nil {
@@ -1385,6 +1431,50 @@ func TestCompactObjectBuildFileEmitsQuotedIncludeClosure(t *testing.T) {
 		if got := rule.AttrLiteral("source_includes_complete"); got != "True" {
 			t.Fatalf("%s source_includes_complete = %q, want True", object, got)
 		}
+	}
+	dynamicRule := parsed.RuleNamed(variants["dynamic.o"].Target)
+	if dynamicRule == nil {
+		t.Fatalf("generated object BUILD missing %q:\n%s", variants["dynamic.o"].Target, objectBuild)
+	}
+	if got := dynamicRule.AttrLiteral("source_includes_complete"); got != "" {
+		t.Fatalf("dynamic.o source_includes_complete = %q, want omitted fallback", got)
+	}
+}
+
+func TestSourceIncludeCoveredByClasses(t *testing.T) {
+	opts := CompactBuildFileOptions{
+		SourceTreeArchHeaders:   []string{"@linux//:x86_headers"},
+		SourceTreeGlobalHeaders: []string{"@linux//:global_headers"},
+		Srcarch:                 "x86",
+	}
+	for source, want := range map[string]bool{
+		"arch/arm64/include/asm/page.h": false,
+		"arch/x86/include/asm/page.h":   true,
+		"drivers/net/private.h":         false,
+		"include/linux/private.h":       true,
+		"include/linux/source.inc":      false,
+	} {
+		if got := sourceIncludeCoveredByClasses(opts, source); got != want {
+			t.Errorf("sourceIncludeCoveredByClasses(%q) = %v, want %v", source, got, want)
+		}
+	}
+	if sourceIncludeCoveredByClasses(CompactBuildFileOptions{Srcarch: "x86"}, "include/linux/private.h") {
+		t.Fatal("source include was filtered without a matching source-tree class")
+	}
+}
+
+func TestCompactObjectVariantMissingCompletenessFailsClosed(t *testing.T) {
+	var variant CompactObjectVariant
+	if err := json.Unmarshal([]byte(`{
+		"target": "init",
+		"object": "init.o",
+		"source": "init.c",
+		"mode": "y"
+	}`), &variant); err != nil {
+		t.Fatalf("json.Unmarshal() failed: %v", err)
+	}
+	if variant.SourceIncludesComplete {
+		t.Fatal("legacy compact metadata without completeness was treated as complete")
 	}
 }
 

@@ -48,6 +48,7 @@
       "target": "debug__2b9e2dc7323c658c",
       "object": "debug.o",
       "source": "debug.c",
+      "source_includes_complete": true,
       "mode": "y",
       "flags": ["-Wall"],
       "config_fragment": {
@@ -107,6 +108,7 @@
       "package": "drivers",
       "object": "drivers/foo.o",
       "source": "drivers/foo.c",
+      "source_includes_complete": true,
       "mode": "y",
       "flags": ["-Wall", "-DNET=y"],
       "config_fragment": {
@@ -165,6 +167,7 @@
       "target": "init__3f9f641f5763d521",
       "object": "init.o",
       "source": "init.c",
+      "source_includes_complete": true,
       "mode": "y",
       "flags": ["-Wall"],
       "config_fragment": {
@@ -222,6 +225,7 @@
       "target": "init__da4397a1c4ecd44a",
       "object": "init.o",
       "source": "init.c",
+      "source_includes_complete": true,
       "mode": "y",
       "flags": ["-Wall", "-DNET=y"],
       "config_fragment": {
@@ -280,6 +284,7 @@
       "package": "net",
       "object": "net/core.o",
       "source": "net/core.c",
+      "source_includes_complete": true,
       "mode": "y",
       "flags": ["-Wall", "-DNET=y", "-DNET_CORE"],
       "config_fragment": {

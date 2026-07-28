@@ -104,6 +104,10 @@ def _linux_compact_outputs_impl(ctx):
         args.add("-source_tree_scripts_headers_label", label)
     for label in ctx.attr.source_tree_uapi_headers_labels:
         args.add("-source_tree_uapi_headers_label", label)
+    for include in ctx.attr.source_generated_includes:
+        args.add("-source_generated_include", include)
+    if ctx.attr.source_generated_includes_complete:
+        args.add("-source_generated_includes_complete")
     args.add("-linux_objects_load", ctx.attr.linux_objects_load)
     env = dict(ctx.attr.env)
     vars = dict(ctx.attr.vars)
@@ -260,6 +264,12 @@ _linux_compact_outputs = rule(
         ),
         "source_root_label": attr.string(
             doc = "Label for a file in the Linux source root emitted into source-backed compact object rules.",
+        ),
+        "source_generated_includes": attr.string_list(
+            doc = "Generated include spellings, optionally mapped to source backings as INCLUDE=SOURCE.",
+        ),
+        "source_generated_includes_complete": attr.bool(
+            doc = "Whether source_generated_includes covers every generated header available to compact compile actions.",
         ),
         "source_tree_all_files_labels": attr.string_list(
             doc = "Labels for explicit full source tree inputs emitted into source-backed compact object rules.",
@@ -519,6 +529,8 @@ def linux_compact_buildfiles(
         source_relacheck = "",
         source_config = "",
         source_root_label = "",
+        source_generated_includes = [],
+        source_generated_includes_complete = False,
         source_tree_all_files_labels = [],
         source_tree_arch_headers_labels = [],
         source_tree_dtb_sources_labels = [],
@@ -573,6 +585,8 @@ def linux_compact_buildfiles(
         source_asn1_compiler = source_asn1_compiler,
         source_relacheck = source_relacheck,
         source_config = source_config,
+        source_generated_includes = source_generated_includes,
+        source_generated_includes_complete = source_generated_includes_complete,
         source_root_label = source_root_label,
         source_tree_all_files_labels = source_tree_all_files_labels,
         source_tree_arch_headers_labels = source_tree_arch_headers_labels,

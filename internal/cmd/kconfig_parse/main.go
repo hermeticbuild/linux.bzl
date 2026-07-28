@@ -53,6 +53,44 @@ func (f *stringSliceFlag) Set(value string) error {
 	return nil
 }
 
+type generatedIncludeFlag map[string][]string
+
+func (f generatedIncludeFlag) String() string {
+	keys := make([]string, 0, len(f))
+	for key := range f {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var entries []string
+	for _, key := range keys {
+		if len(f[key]) == 0 {
+			entries = append(entries, key)
+			continue
+		}
+		for _, backing := range f[key] {
+			entries = append(entries, key+"="+backing)
+		}
+	}
+	return strings.Join(entries, ",")
+}
+
+func (f generatedIncludeFlag) Set(value string) error {
+	include, backing, hasBacking := strings.Cut(value, "=")
+	include = strings.TrimSpace(include)
+	backing = strings.TrimSpace(backing)
+	if include == "" || (hasBacking && backing == "") {
+		return fmt.Errorf("expected INCLUDE or INCLUDE=SOURCE")
+	}
+	if !hasBacking {
+		if _, ok := f[include]; !ok {
+			f[include] = nil
+		}
+		return nil
+	}
+	f[include] = append(f[include], backing)
+	return nil
+}
+
 type namedPath struct {
 	Name string
 	Path string
@@ -168,6 +206,8 @@ func main() {
 		vars                     = stringMapFlag{}
 		env                      = stringMapFlag{}
 		linuxProbeValues         = stringMapFlag{}
+		sourceGeneratedIncludes  = generatedIncludeFlag{}
+		sourceGeneratedComplete  = flag.Bool("source_generated_includes_complete", false, "Assert that -source_generated_include covers every generated header spelling available to compact compile actions")
 		visibility               = stringSliceFlag{}
 		kbuildTreeExcludes       = stringSliceFlag{}
 		compactConfigInputs      = namedPathFlag{}
@@ -191,6 +231,7 @@ func main() {
 	flag.Var(vars, "var", "Preprocessor variable in KEY=VALUE form. May be repeated")
 	flag.Var(env, "env", "Hermetic environment variable in KEY=VALUE form. May be repeated")
 	flag.Var(linuxProbeValues, "linux_probe_value", "Linux probe override in KEY=VALUE form. May be repeated with -linux_probe_model")
+	flag.Var(sourceGeneratedIncludes, "source_generated_include", "Generated include spelling, optionally mapped to its source backing as INCLUDE=SOURCE. May be repeated")
 	flag.Var(&visibility, "visibility", "Default visibility for the generated BUILD file. May be repeated. Defaults to //visibility:public")
 	flag.Var(&kbuildTreeExcludes, "kbuild_tree_exclude", "Source-root-relative subtree to skip during -kbuild_tree_root validation. May be repeated")
 	flag.Var(&compactConfigInputs, "config", "Named .config input in NAME=PATH form for compact metadata generation. May be repeated")
@@ -387,7 +428,7 @@ func main() {
 	}
 
 	if *compactMetadataOut != "" || *compactBuildfileOut != "" || *objectBuildfileOut != "" || *imageBuildfileOut != "" {
-		metadata, err := compactMetadata(tree, *root, *kbuildPath, compactConfigInputs, compactConfigOverlays, *resolvedFlagsDir, *configMode, *compactKbuildTree, vars, kbuildExtras, namedPathMap(sourceRootMaps), compactSchema)
+		metadata, err := compactMetadata(tree, *root, *kbuildPath, compactConfigInputs, compactConfigOverlays, *resolvedFlagsDir, *configMode, *compactKbuildTree, vars, kbuildExtras, namedPathMap(sourceRootMaps), sourceGeneratedIncludes, *sourceGeneratedComplete, compactSchema)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to generate compact metadata: %v\n", err)
 			os.Exit(1)
@@ -930,7 +971,7 @@ func validateResolvedFlagsName(name string) error {
 	return nil
 }
 
-func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, configInputs, configOverlays []namedPath, resolvedFlagsDir string, configMode string, compactKbuildTree bool, vars map[string]string, kbuildExtras []namedPath, sourceRoots map[string]string, schema kconfig.CompactSchema) (*kconfig.CompactMetadata, error) {
+func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, configInputs, configOverlays []namedPath, resolvedFlagsDir string, configMode string, compactKbuildTree bool, vars map[string]string, kbuildExtras []namedPath, sourceRoots map[string]string, sourceGeneratedIncludes map[string][]string, sourceGeneratedIncludesComplete bool, schema kconfig.CompactSchema) (*kconfig.CompactMetadata, error) {
 	if kbuildPath == "" {
 		return nil, fmt.Errorf("-kbuild is required")
 	}
@@ -996,12 +1037,14 @@ func compactMetadata(tree *kconfig.Tree, rootPath string, kbuildPath string, con
 		}
 	}
 	opts := kconfig.CompactMetadataOptions{
-		Schema:      schema,
-		ObjectDir:   objectDir,
-		SourceRoot:  sourceRoot,
-		SourceRoots: sourceRoots,
-		LibraryDirs: kbuildLibraryDirs(vars),
-		Srcarch:     vars["SRCARCH"],
+		Schema:                          schema,
+		ObjectDir:                       objectDir,
+		SourceRoot:                      sourceRoot,
+		SourceRoots:                     sourceRoots,
+		SourceGeneratedIncludes:         sourceGeneratedIncludes,
+		SourceGeneratedIncludesComplete: sourceGeneratedIncludesComplete,
+		LibraryDirs:                     kbuildLibraryDirs(vars),
+		Srcarch:                         vars["SRCARCH"],
 	}
 	rootDir := sourceRoot
 	if rootDir == "" {

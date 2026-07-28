@@ -27,6 +27,28 @@ func TestApplyRustToolchainProbe(t *testing.T) {
 	}
 }
 
+func TestGeneratedIncludeFlag(t *testing.T) {
+	values := generatedIncludeFlag{}
+	for _, value := range []string{
+		"generated/autoconf.h",
+		"asm/rwonce.h=include/asm-generic/rwonce.h",
+		"asm/errno.h=include/uapi/asm-generic/errno.h",
+	} {
+		if err := values.Set(value); err != nil {
+			t.Fatalf("Set(%q) failed: %v", value, err)
+		}
+	}
+	if got := values["generated/autoconf.h"]; got != nil {
+		t.Fatalf("generated/autoconf.h backings = %v, want nil", got)
+	}
+	if got, want := strings.Join(values["asm/rwonce.h"], ","), "include/asm-generic/rwonce.h"; got != want {
+		t.Fatalf("asm/rwonce.h backings = %q, want %q", got, want)
+	}
+	if err := values.Set("missing="); err == nil {
+		t.Fatal("Set(missing=) succeeded")
+	}
+}
+
 func TestKbuildVariablesForConfigUsesWrittenConfigView(t *testing.T) {
 	vars := kbuildVariablesForConfig(
 		map[string]string{
@@ -156,6 +178,8 @@ func TestCompactMetadataRejectsUnmatchedOverlay(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		nil,
+		false,
 		kconfig.CompactSchemaV012,
 	)
 	if err == nil || !strings.Contains(err.Error(), `config overlay "other" has no matching -config`) {
@@ -179,6 +203,8 @@ func TestCompactMetadataRejectsDuplicateOverlay(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		nil,
+		false,
 		kconfig.CompactSchemaV012,
 	)
 	if err == nil || !strings.Contains(err.Error(), `duplicate config overlay name "base"`) {
@@ -201,6 +227,8 @@ func TestCompactMetadataRejectsUnsafeResolvedFlagsNames(t *testing.T) {
 				nil,
 				nil,
 				nil,
+				nil,
+				false,
 				kconfig.CompactSchemaV012,
 			)
 			if err == nil || !strings.Contains(err.Error(), "must be a single path component") {
