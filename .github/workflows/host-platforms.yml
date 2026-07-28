@@ -25,8 +25,10 @@ jobs:
         include:
           - host: macOS
             runner: macos-latest
+            heap: 4g
           - host: Windows
             runner: windows-latest
+            heap: 6g
     defaults:
       run:
         shell: bash
@@ -55,12 +57,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ../.ci-artifacts
-          bazel --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+          bazel --host_jvm_args=-Xmx${{ matrix.heap }} \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             build \
             //:x86_64_kernel \
             //:x86_64_debug_kernel \
             //:x86_64_lz4_kernel \
             --config=path-mapping \
+            --notrack_incremental_state \
+            --nokeep_state_after_build \
+            --discard_analysis_cache \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"

@@ -55,10 +55,13 @@ jobs:
             targets+=(//internal/tests:path_mapping_test)
             path_mapping_args+=("${BAZEL_PATH_MAPPING}")
           fi
-          bazel --host_jvm_args=-Xmx3g \
+          bazel --host_jvm_args=-Xmx6g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test "${targets[@]}" \
             "${path_mapping_args[@]}" \
+            --notrack_incremental_state \
+            --nokeep_state_after_build \
+            --discard_analysis_cache \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -131,10 +134,13 @@ jobs:
         run: |
           set -euo pipefail
           read -r -a targets <<<"${BAZEL_TARGETS}"
-          bazel --host_jvm_args=-Xmx3g \
+          bazel --host_jvm_args=-Xmx6g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             build "${targets[@]}" \
             --config=path-mapping \
+            --notrack_incremental_state \
+            --nokeep_state_after_build \
+            --discard_analysis_cache \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -219,10 +225,13 @@ jobs:
         run: |
           set -euo pipefail
           read -r -a targets <<<"${BAZEL_TARGETS}"
-          bazel --host_jvm_args=-Xmx3g \
+          bazel --host_jvm_args=-Xmx6g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test "${targets[@]}" \
             --config=path-mapping \
+            --notrack_incremental_state \
+            --nokeep_state_after_build \
+            --discard_analysis_cache \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -289,9 +298,12 @@ jobs:
           BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e-${{ matrix.arch }}.profile.gz
         run: |
           set -o pipefail
-          bazel --host_jvm_args=-Xmx3g \
+          bazel --host_jvm_args=-Xmx6g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test '${{ matrix.target }}' \
+            --notrack_incremental_state \
+            --nokeep_state_after_build \
+            --discard_analysis_cache \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"

@@ -16,7 +16,20 @@ Add `linux.bzl` and a hermetic C/C++ toolchain to `MODULE.bazel`:
 bazel_dep(name = "linux.bzl", version = "0.1.0")
 bazel_dep(name = "llvm", version = "0.8.14")
 
-register_toolchains("@llvm//toolchain:all")
+register_toolchains(
+    "@llvm//toolchain:linux_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:linux_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:linux_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:macos_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:macos_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:macos_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:macos_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:windows_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:windows_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:windows_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:windows_x86_64_to_linux_x86_64",
+)
 
 linux_source_repository = use_repo_rule(
     "@linux.bzl//:linux.bzl",

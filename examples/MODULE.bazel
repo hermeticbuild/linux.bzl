@@ -13,7 +13,23 @@ local_path_override(
     path = "..",
 )
 
-register_toolchains("@llvm//toolchain:all")
+# Register only the host/target pairs used by linux.bzl. The catch-all target
+# also registers every bootstrap stage and unrelated OS/CPU combination, which
+# makes Bazel analyze hundreds of toolchains before reaching the kernel graph.
+register_toolchains(
+    "@llvm//toolchain:linux_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:linux_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:linux_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:macos_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:macos_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:macos_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:macos_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:windows_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:windows_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:windows_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:windows_x86_64_to_linux_x86_64",
+)
 
 linux_source_repository = use_repo_rule(
     "@linux.bzl//:linux.bzl",

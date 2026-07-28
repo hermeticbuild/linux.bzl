@@ -30,13 +30,25 @@ index 00d93a2..e591333 100644
  
  # Each qemu-system toolchain is compatible with the corresponding
  # //bazel:bpf_target_arch value. bazel/vm.bzl transitions that value for each
-@@ -74,7 +75,7 @@
+@@ -74,7 +75,18 @@
  
  register_toolchains(
      "@copy_to_directory_toolchains//:all",
 -    "@default_rust_toolchains//:all",
 +    "@aya_rust_toolchains//:all",
-     "@llvm//toolchain:all",
+-    "@llvm//toolchain:all",
++    "@llvm//toolchain:linux_aarch64_to_linux_aarch64",
++    "@llvm//toolchain:linux_aarch64_to_linux_x86_64",
++    "@llvm//toolchain:linux_x86_64_to_linux_aarch64",
++    "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
++    "@llvm//toolchain:macos_aarch64_to_linux_aarch64",
++    "@llvm//toolchain:macos_aarch64_to_linux_x86_64",
++    "@llvm//toolchain:macos_x86_64_to_linux_aarch64",
++    "@llvm//toolchain:macos_x86_64_to_linux_x86_64",
++    "@llvm//toolchain:windows_aarch64_to_linux_aarch64",
++    "@llvm//toolchain:windows_aarch64_to_linux_x86_64",
++    "@llvm//toolchain:windows_x86_64_to_linux_aarch64",
++    "@llvm//toolchain:windows_x86_64_to_linux_x86_64",
      "@qemu_system_toolchains//:all",
  )
 @@ -126,54 +126,34 @@ use_repo(crate, "crates")

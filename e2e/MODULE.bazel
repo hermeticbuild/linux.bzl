@@ -11,7 +11,20 @@ bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "rules_go", version = "0.62.0")
 bazel_dep(name = "rules_qemu", version = "0.3.0")
 
-register_toolchains("@hermetic_llvm//toolchain:all")
+register_toolchains(
+    "@hermetic_llvm//toolchain:linux_aarch64_to_linux_aarch64",
+    "@hermetic_llvm//toolchain:linux_aarch64_to_linux_x86_64",
+    "@hermetic_llvm//toolchain:linux_x86_64_to_linux_aarch64",
+    "@hermetic_llvm//toolchain:linux_x86_64_to_linux_x86_64",
+    "@hermetic_llvm//toolchain:macos_aarch64_to_linux_aarch64",
+    "@hermetic_llvm//toolchain:macos_aarch64_to_linux_x86_64",
+    "@hermetic_llvm//toolchain:macos_x86_64_to_linux_aarch64",
+    "@hermetic_llvm//toolchain:macos_x86_64_to_linux_x86_64",
+    "@hermetic_llvm//toolchain:windows_aarch64_to_linux_aarch64",
+    "@hermetic_llvm//toolchain:windows_aarch64_to_linux_x86_64",
+    "@hermetic_llvm//toolchain:windows_x86_64_to_linux_aarch64",
+    "@hermetic_llvm//toolchain:windows_x86_64_to_linux_x86_64",
+)
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
 go_sdk.nogo(nogo = "@rules_go//:tools_nogo")
