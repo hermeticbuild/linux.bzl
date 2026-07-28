@@ -28,9 +28,12 @@ type artifact struct {
 }
 
 type action struct {
-	TargetID       int    `json:"targetId"`
-	Mnemonic       string `json:"mnemonic"`
-	InputDepSetIDs []int  `json:"inputDepSetIds"`
+	TargetID        int    `json:"targetId"`
+	ConfigurationID int    `json:"configurationId"`
+	Mnemonic        string `json:"mnemonic"`
+	InputDepSetIDs  []int  `json:"inputDepSetIds"`
+	OutputIDs       []int  `json:"outputIds"`
+	PrimaryOutputID int    `json:"primaryOutputId"`
 }
 
 type target struct {
@@ -67,6 +70,22 @@ type actionSummary struct {
 	count int
 }
 
+type producerID int
+
+type producer struct {
+	actionIndex       int
+	mnemonic          string
+	target            string
+	configurationID   int
+	primaryOutputPath string
+	outputCount       int
+}
+
+type producerUse struct {
+	producer  producer
+	consumers int
+}
+
 func main() {
 	opts := reportOptions{}
 	flag.StringVar(&opts.inputPath, "input", "", "Path to Bazel aquery JSON proto. Reads stdin when empty or -.")
@@ -99,7 +118,10 @@ func run(w io.Writer, opts reportOptions) error {
 	if err := json.Unmarshal(data, &aq); err != nil {
 		return fmt.Errorf("parse aquery JSON: %w", err)
 	}
-	model := newModel(&aq)
+	model, err := newModel(&aq)
+	if err != nil {
+		return fmt.Errorf("build aquery model: %w", err)
+	}
 	return writeReport(w, model, opts)
 }
 
@@ -119,18 +141,21 @@ func readInput(path string) ([]byte, error) {
 }
 
 type model struct {
-	aq           *aqueryOutput
-	artifactPath map[int]string
-	depSets      map[int]depSet
-	targetLabels map[int]string
+	aq               *aqueryOutput
+	artifactPath     map[int]string
+	depSets          map[int]depSet
+	targetLabels     map[int]string
+	artifactProducer map[int]producerID
+	producers        []producer
 }
 
-func newModel(aq *aqueryOutput) *model {
+func newModel(aq *aqueryOutput) (*model, error) {
 	m := &model{
-		aq:           aq,
-		artifactPath: map[int]string{},
-		depSets:      map[int]depSet{},
-		targetLabels: map[int]string{},
+		aq:               aq,
+		artifactPath:     map[int]string{},
+		depSets:          map[int]depSet{},
+		targetLabels:     map[int]string{},
+		artifactProducer: map[int]producerID{},
 	}
 	fragments := map[int]pathFragment{}
 	for _, fragment := range aq.PathFragments {
@@ -145,7 +170,76 @@ func newModel(aq *aqueryOutput) *model {
 	for _, target := range aq.Targets {
 		m.targetLabels[target.ID] = target.Label
 	}
-	return m
+	for actionIndex, action := range aq.Actions {
+		outputIDs := uniqueInts(action.OutputIDs)
+		if len(outputIDs) == 0 {
+			continue
+		}
+		for _, outputID := range outputIDs {
+			if existingID, ok := m.artifactProducer[outputID]; ok {
+				existing := m.producers[existingID]
+				return nil, fmt.Errorf(
+					"artifact %d is output by multiple actions (%d and %d)",
+					outputID,
+					existing.actionIndex,
+					actionIndex,
+				)
+			}
+		}
+		id := producerID(len(m.producers))
+		p := producer{
+			actionIndex:       actionIndex,
+			mnemonic:          action.Mnemonic,
+			target:            m.targetLabels[action.TargetID],
+			configurationID:   action.ConfigurationID,
+			primaryOutputPath: primaryOutputPath(action.PrimaryOutputID, outputIDs, m.artifactPath),
+			outputCount:       len(outputIDs),
+		}
+		m.producers = append(m.producers, p)
+		for _, outputID := range outputIDs {
+			m.artifactProducer[outputID] = id
+		}
+	}
+	return m, nil
+}
+
+func uniqueInts(values []int) []int {
+	out := make([]int, 0, len(values))
+	seen := make(map[int]bool, len(values))
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func primaryOutputPath(primaryOutputID int, outputIDs []int, artifactPaths map[int]string) string {
+	outputSet := make(map[int]bool, len(outputIDs))
+	for _, outputID := range outputIDs {
+		outputSet[outputID] = true
+	}
+	if outputSet[primaryOutputID] {
+		return artifactDisplay(primaryOutputID, artifactPaths)
+	}
+	candidates := make([]string, 0, len(outputIDs))
+	for _, outputID := range outputIDs {
+		candidates = append(candidates, artifactDisplay(outputID, artifactPaths))
+	}
+	sort.Strings(candidates)
+	if len(candidates) == 0 {
+		return ""
+	}
+	return candidates[0]
+}
+
+func artifactDisplay(artifactID int, artifactPaths map[int]string) string {
+	if path := artifactPaths[artifactID]; path != "" {
+		return path
+	}
+	return fmt.Sprintf("artifact#%d", artifactID)
 }
 
 func resolvePathFragment(fragments map[int]pathFragment, id int) string {
@@ -181,8 +275,10 @@ func writeReport(w io.Writer, m *model, opts reportOptions) error {
 	actionSummaries := make([]actionSummary, 0, len(actions))
 	inputCounts := make([]int, 0, len(actions))
 	inputUses := map[int]*inputUse{}
+	producerConsumerCounts := make([]int, len(m.producers))
+	producerSeenGeneration := make([]int, len(m.producers))
 
-	for _, action := range actions {
+	for actionIndex, action := range actions {
 		inputs := m.actionInputs(action)
 		for artifactID := range inputs {
 			path := m.artifactPath[artifactID]
@@ -192,6 +288,12 @@ func writeReport(w io.Writer, m *model, opts reportOptions) error {
 				inputUses[artifactID] = use
 			}
 			use.count++
+			if id, ok := m.artifactProducer[artifactID]; ok {
+				if producerSeenGeneration[id] != actionIndex+1 {
+					producerSeenGeneration[id] = actionIndex + 1
+					producerConsumerCounts[id]++
+				}
+			}
 		}
 		inputCounts = append(inputCounts, len(inputs))
 		actionSummaries = append(actionSummaries, actionSummary{
@@ -216,6 +318,20 @@ func writeReport(w io.Writer, m *model, opts reportOptions) error {
 	writeTopInputs(w, "high-fanout non-header source inputs", topInputs(inputUses, func(use *inputUse) bool {
 		return use.count >= threshold && isSourceLikeNonHeader(use.path)
 	}), opts.top, len(actions))
+	resolvedProducerInputs := 0
+	for artifactID := range inputUses {
+		if _, ok := m.artifactProducer[artifactID]; ok {
+			resolvedProducerInputs++
+		}
+	}
+	writeProducerUses(
+		w,
+		opts.mnemonic,
+		topProducerUses(m.producers, producerConsumerCounts),
+		opts.top,
+		resolvedProducerInputs,
+		len(inputUses),
+	)
 	writeActionSummaries(w, "largest actions by input count", topActionSummaries(actionSummaries), opts.top)
 	return nil
 }
@@ -280,6 +396,38 @@ func topActionSummaries(actions []actionSummary) []actionSummary {
 	return out
 }
 
+func topProducerUses(producers []producer, consumerCounts []int) []producerUse {
+	out := make([]producerUse, 0, len(producers))
+	for i, producer := range producers {
+		if consumerCounts[i] == 0 {
+			continue
+		}
+		out = append(out, producerUse{
+			producer:  producer,
+			consumers: consumerCounts[i],
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].consumers != out[j].consumers {
+			return out[i].consumers > out[j].consumers
+		}
+		if out[i].producer.mnemonic != out[j].producer.mnemonic {
+			return out[i].producer.mnemonic < out[j].producer.mnemonic
+		}
+		if out[i].producer.target != out[j].producer.target {
+			return out[i].producer.target < out[j].producer.target
+		}
+		if out[i].producer.primaryOutputPath != out[j].producer.primaryOutputPath {
+			return out[i].producer.primaryOutputPath < out[j].producer.primaryOutputPath
+		}
+		if out[i].producer.configurationID != out[j].producer.configurationID {
+			return out[i].producer.configurationID < out[j].producer.configurationID
+		}
+		return out[i].producer.actionIndex < out[j].producer.actionIndex
+	})
+	return out
+}
+
 func writeTopInputs(w io.Writer, title string, inputs []inputUse, limit int, actionCount int) {
 	fmt.Fprintf(w, "%s:\n", title)
 	if len(inputs) == 0 {
@@ -294,6 +442,52 @@ func writeTopInputs(w io.Writer, title string, inputs []inputUse, limit int, act
 		fmt.Fprintf(w, "  %5d %6.1f%%  %s\n", input.count, pct, input.path)
 	}
 	fmt.Fprintf(w, "\n")
+}
+
+func writeProducerUses(
+	w io.Writer,
+	consumerMnemonic string,
+	producers []producerUse,
+	limit int,
+	resolvedInputCount int,
+	inputCount int,
+) {
+	fmt.Fprintf(
+		w,
+		"producer fanout (unique %s consumer actions; producers present in aquery):\n",
+		consumerMnemonic,
+	)
+	fmt.Fprintf(w, "  producer-resolved input artifacts: %d / %d unique inputs\n", resolvedInputCount, inputCount)
+	if len(producers) == 0 {
+		fmt.Fprintf(w, "  none resolved\n")
+		fmt.Fprintf(
+			w,
+			"  hint: query deps(<target>) and let -mnemonic filter consumers; mnemonic(...) omits producer actions\n\n",
+		)
+		return
+	}
+	fmt.Fprintf(w, "  consumers  producer\n")
+	for i, use := range producers {
+		if i >= limit {
+			break
+		}
+		fmt.Fprintf(
+			w,
+			"  %9d  %s [primary: %s; outputs: %d]\n",
+			use.consumers,
+			producerName(use.producer),
+			use.producer.primaryOutputPath,
+			use.producer.outputCount,
+		)
+	}
+	fmt.Fprintf(w, "\n")
+}
+
+func producerName(producer producer) string {
+	if producer.target == "" {
+		return producer.mnemonic
+	}
+	return producer.mnemonic + " " + producer.target
 }
 
 func writeActionSummaries(w io.Writer, title string, actions []actionSummary, limit int) {
