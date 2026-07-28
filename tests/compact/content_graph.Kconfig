@@ -1,4 +1,4 @@
-mainmenu "Compact generator fixture"
+mainmenu "Content-addressed compact graph fixture"
 
 config MODULES
 	tristate "Modules"
@@ -23,3 +23,15 @@ config DRIVER
 
 config EXTRA_CFLAGS
 	bool "Extra compiler flags"
+
+config CC_IS_CLANG
+	bool
+	default y
+
+config FUNCTION_ALIGNMENT
+	int
+	default 16
+
+config X86_64
+	bool
+	default y

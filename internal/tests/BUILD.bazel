@@ -4,6 +4,7 @@ load(
     "linux_cc_context",
     "linux_config",
 )
+load(":compact_generator_test.bzl", "compact_generator_test_suite")
 load(":config_validation_test.bzl", "config_validation_test_suite")
 load(":host_cc_toolchain_test.bzl", "host_cc_toolchain_test")
 load(":kconfig_repositories_test.bzl", "graph_config_args_test", "kconfig_tool_filename_test")
@@ -15,6 +16,8 @@ load(":path_mapping_test.bzl", "path_mapping_test")
 load(":sanitizer_actions_test.bzl", "sanitizer_actions_test")
 
 package(default_visibility = ["//visibility:private"])
+
+compact_generator_test_suite(name = "compact_generator_tests")
 
 config_validation_test_suite(name = "config_validation_tests")
 

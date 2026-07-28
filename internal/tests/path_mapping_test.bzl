@@ -135,9 +135,48 @@ def _compact_path_mapping_test_impl(ctx):
     asserts.true(env, action != None)
     if action != None:
         _assert_mapped_srctree_var(env, action)
+        asserts.equals(env, "fixture", _argument_after(action.argv, "-compact_base_config"))
+        asserts.equals(env, "linux.bzl/test/x86", _argument_after(action.argv, "-compile_environment_abi"))
+        asserts.equals(env, "//internal/tests", _argument_after(action.argv, "-source_label_package"))
+        asserts.equals(
+            env,
+            "//internal/tests:" + ctx.attr.source_root_target,
+            _argument_after(action.argv, "-source_root_label"),
+        )
+        generated_headers = [
+            action.argv[index + 1]
+            for index in range(len(action.argv) - 1)
+            if action.argv[index] == "-generated_headers_for_config"
+        ]
+        asserts.equals(
+            env,
+            ["fixture=//internal/tests:fixture_generated_headers"],
+            generated_headers,
+        )
+        for removed_flag in [
+            "-compact_schema",
+            "-generated_headers",
+            "-source_config",
+            "-source_tree_all_files_label",
+            "-source_tree_arch_headers_label",
+            "-source_tree_dtb_sources_label",
+            "-source_tree_global_headers_label",
+            "-source_tree_headers_label",
+            "-source_tree_kbuild_files_label",
+            "-source_tree_local_include_files_label",
+            "-source_tree_lookup_files_label",
+            "-source_tree_scripts_headers_label",
+            "-source_tree_uapi_headers_label",
+        ]:
+            asserts.false(env, removed_flag in action.argv)
     return analysistest.end(env)
 
-_compact_path_mapping_test = analysistest.make(_compact_path_mapping_test_impl)
+_compact_path_mapping_test = analysistest.make(
+    _compact_path_mapping_test_impl,
+    attrs = {
+        "source_root_target": attr.string(mandatory = True),
+    },
+)
 
 def _parser_path_mapping_test_impl(ctx):
     env = analysistest.begin(ctx)
@@ -217,11 +256,16 @@ def path_mapping_test(name):
     compact = name + "_compact"
     linux_compact_buildfiles(
         name = compact,
-        config = ":" + config,
-        config_name = "fixture",
+        compact_base_config = "fixture",
+        compile_environment_abi = "linux.bzl/test/x86",
+        configs = {
+            ":" + config: "fixture",
+        },
+        generated_headers_by_config = {
+            "fixture": "//internal/tests:fixture_generated_headers",
+        },
         kbuild = ":" + kbuild,
         root = ":" + kconfig,
-        source_config = ":" + config,
         source_label_package = "//internal/tests",
         source_root_label = "//internal/tests:" + kconfig,
         srcs = [
@@ -234,6 +278,7 @@ def path_mapping_test(name):
     compact_test = compact + "_path_mapping_test"
     _compact_path_mapping_test(
         name = compact_test,
+        source_root_target = kconfig,
         tags = ["manual"],
         target_under_test = ":" + compact + "_generated",
     )

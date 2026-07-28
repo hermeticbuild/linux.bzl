@@ -707,6 +707,68 @@ endif
 	}
 }
 
+func TestParseKbuildInitialVariablesUseMutableOverlay(t *testing.T) {
+	initial := map[string]string{
+		"objects":                    "initial.o",
+		"UBSAN_SANITIZE_inherited.o": "n",
+	}
+	kb, err := parseKbuild(strings.NewReader(`ifeq ("$(flavor objects)","simple")
+obj-y += initial-is-simple.o
+endif
+obj-y += $(objects)
+objects += appended.o
+obj-y += $(objects)
+objects ?= ignored.o
+undefine objects
+ifeq ("$(origin objects)","undefined")
+obj-y += initial-was-undefined.o
+endif
+objects ?= reset.o
+obj-y += $(objects)
+`), "Kbuild", initial, "")
+	if err != nil {
+		t.Fatalf("parseKbuild() failed: %v", err)
+	}
+
+	gotObjects := kbuildObjectSummaries(kb.Objects)
+	wantObjects := []kbuildObjectSummary{
+		{object: "initial-is-simple.o", kind: "const", state: "y", line: 2},
+		{object: "initial.o", kind: "const", state: "y", line: 4},
+		{object: "initial.o", kind: "const", state: "y", line: 6},
+		{object: "appended.o", kind: "const", state: "y", line: 6},
+		{object: "initial-was-undefined.o", kind: "const", state: "y", line: 10},
+		{object: "reset.o", kind: "const", state: "y", line: 13},
+	}
+	if !reflect.DeepEqual(gotObjects, wantObjects) {
+		t.Fatalf("objects mismatch\nwant: %#v\n got: %#v", wantObjects, gotObjects)
+	}
+
+	wantSettings := []kbuildObjectSetting{{
+		Name:   "UBSAN_SANITIZE",
+		Object: "inherited.o",
+		Value:  "n",
+	}}
+	if !reflect.DeepEqual(kb.objectSettings, wantSettings) {
+		t.Fatalf("object settings mismatch\nwant: %#v\n got: %#v", wantSettings, kb.objectSettings)
+	}
+	wantInitial := map[string]string{
+		"objects":                    "initial.o",
+		"UBSAN_SANITIZE_inherited.o": "n",
+	}
+	if !reflect.DeepEqual(initial, wantInitial) {
+		t.Fatalf("initial variables mutated\nwant: %#v\n got: %#v", wantInitial, initial)
+	}
+
+	second, err := parseKbuild(strings.NewReader("obj-y += $(objects)\n"), "second/Kbuild", initial, "")
+	if err != nil {
+		t.Fatalf("parseKbuild(second) failed: %v", err)
+	}
+	wantSecond := []kbuildObjectSummary{{object: "initial.o", kind: "const", state: "y", line: 1}}
+	if got := kbuildObjectSummaries(second.Objects); !reflect.DeepEqual(got, wantSecond) {
+		t.Fatalf("second parse objects mismatch\nwant: %#v\n got: %#v", wantSecond, got)
+	}
+}
+
 func TestParseKbuildExpandsMakeVariableIntrospection(t *testing.T) {
 	kb, err := ParseKbuild(strings.NewReader(`recursive = raw$(suffix)
 simple := simple.o
@@ -886,7 +948,7 @@ endif
 		t.Fatalf("ParseKbuild() failed: %v", err)
 	}
 
-	metadata, err := mustParseCompactFixture(t).CompactMetadata(kb, []NamedConfig{{Name: "base"}})
+	metadata, err := compactMetadataBatchForTest(t, mustParseCompactFixture(t), kb, []NamedConfig{{Name: "base"}})
 	if err != nil {
 		t.Fatalf("CompactMetadata() failed: %v", err)
 	}
@@ -1087,10 +1149,51 @@ obj-y += init.o
 
 	got := kbuildFlagSummaries(kb.Flags)
 	want := []kbuildFlagSummary{
-		{scope: "global", flags: "-fpie -I" + tmp + "/scripts/dtc/libfdt -include " + tmp + "/include/linux/hidden.h", kind: "const", state: "y", line: 1},
+		{scope: "global", flags: "-fpie -I" + filepath.ToSlash(tmp) + "/scripts/dtc/libfdt -include " + filepath.ToSlash(tmp) + "/include/linux/hidden.h", kind: "const", state: "y", line: 1},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("flags mismatch\nwant: %#v\n got: %#v", want, got)
+	}
+}
+
+func TestParseKbuildNormalizesWindowsPathVariablesBeforeSplittingFlags(t *testing.T) {
+	const sourceRoot = `D:\_bazel\external\+linux_source_repository+linux_6_18_39`
+	for _, tc := range []struct {
+		name string
+		text string
+		vars map[string]string
+		line int
+	}{
+		{
+			name: "injected",
+			text: "KBUILD_CFLAGS += -include $(srctree)/include/linux/hidden.h\nobj-y += init.o\n",
+			vars: map[string]string{"srctree": sourceRoot},
+			line: 1,
+		},
+		{
+			name: "assigned",
+			text: "srctree := " + sourceRoot + "\nKBUILD_CFLAGS += -include $(srctree)/include/linux/hidden.h\nobj-y += init.o\n",
+			line: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kb, err := parseKbuild(strings.NewReader(tc.text), "Kbuild", tc.vars, ".")
+			if err != nil {
+				t.Fatalf("parseKbuild() failed: %v", err)
+			}
+
+			got := kbuildFlagSummaries(kb.Flags)
+			want := []kbuildFlagSummary{{
+				scope: "global",
+				flags: "-include D:/_bazel/external/+linux_source_repository+linux_6_18_39/include/linux/hidden.h",
+				kind:  "const",
+				state: "y",
+				line:  tc.line,
+			}}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("flags mismatch\nwant: %#v\n got: %#v", want, got)
+			}
+		})
 	}
 }
 
@@ -1275,7 +1378,7 @@ always-y += generated.o
 		t.Fatalf("ParseKbuild() failed: %v", err)
 	}
 
-	metadata, err := tree.CompactMetadata(kb, []NamedConfig{
+	metadata, err := compactMetadataBatchForTest(t, tree, kb, []NamedConfig{
 		{Name: "base", Flags: map[string]string{"CONFIG_NET": "y"}},
 		{Name: "debug", Flags: map[string]string{"CONFIG_NET": "y", "CONFIG_DEBUG": "y"}},
 		{Name: "off", Flags: map[string]string{"CONFIG_DEBUG": "y"}},
@@ -1308,8 +1411,8 @@ always-y += generated.o
 	}
 	if target := objectTarget(metadata, debug, "net/selected.o"); target == "" {
 		t.Fatalf("debug config does not include ${CONFIG_NET} composite member")
-	} else if variant := variantByTarget(metadata, target); variant.ConfigFragment["CONFIG_NET"] != "y" {
-		t.Fatalf("net/selected.o CONFIG_NET footprint = %q, want y", variant.ConfigFragment["CONFIG_NET"])
+	} else if variant := variantByTarget(metadata, target); variant.configFragment["CONFIG_NET"] != "y" {
+		t.Fatalf("net/selected.o CONFIG_NET footprint = %q, want y", variant.configFragment["CONFIG_NET"])
 	}
 
 	off := configByName(metadata, "off")
@@ -1340,7 +1443,7 @@ net/stack-$(CONFIG_FEATURE) += net/debug.o
 		t.Fatalf("ParseKbuild() failed: %v", err)
 	}
 
-	metadata, err := tree.CompactMetadata(kb, []NamedConfig{
+	metadata, err := compactMetadataBatchForTest(t, tree, kb, []NamedConfig{
 		{Name: "module", Flags: map[string]string{"CONFIG_MODULES": "y", "CONFIG_STACK": "m", "CONFIG_FEATURE": "m"}},
 		{Name: "builtin", Flags: map[string]string{"CONFIG_MODULES": "y", "CONFIG_STACK": "y", "CONFIG_FEATURE": "m"}},
 	})

@@ -11,9 +11,9 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig/buildgen"
 )
 
-// MergeBuildFiles combines generated BUILD files with compatible package()
+// mergeBuildFiles combines generated BUILD files with compatible package()
 // declarations, merged load() statements, and optional exports_files entries.
-func MergeBuildFiles(filename string, exportedFiles []string, inputs ...[]byte) ([]byte, error) {
+func mergeBuildFiles(filename string, exportedFiles []string, inputs ...[]byte) ([]byte, error) {
 	loads := map[string]map[string]bool{}
 	var packageStmt bzl.Expr
 	var packageText string
