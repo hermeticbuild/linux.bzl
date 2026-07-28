@@ -932,8 +932,6 @@ def _linux_source_input_file_for_path(ctx, relpath):
 
 def _linux_source_tree_files(ctx):
     files = []
-    if hasattr(ctx.files, "source_includes"):
-        files.extend(ctx.files.source_includes)
     if hasattr(ctx.files, "source_tree"):
         files.extend(ctx.files.source_tree)
     return files
