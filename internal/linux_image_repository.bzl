@@ -493,7 +493,7 @@ def _resolve_config(rctx, tool, source_root, arch, version, name, raw, config_mo
         "-linux_probe_model",
         "linux_llvm",
     ]
-    _add_generator_variables(args, descriptor)
+    _add_generator_variables(args, descriptor, source_root)
     result = rctx.execute(
         args,
         environment = {
@@ -794,7 +794,7 @@ def _generate_config_graph(
         config_mode,
     ))
 
-    _add_generator_variables(args, descriptor)
+    _add_generator_variables(args, descriptor, source_root)
 
     result = rctx.execute(
         args,
@@ -906,7 +906,7 @@ def _generate_content_graph(
             "-generated_headers_for_config",
             "%s=%s" % (name, generated_headers[name]),
         ])
-    _add_generator_variables(args, descriptor)
+    _add_generator_variables(args, descriptor, source_root)
 
     result = rctx.execute(
         args,
@@ -1170,15 +1170,22 @@ def _content_core_config_aliases(metadata, configs, rust_enabled, header_configs
             canonical_names.append(name)
     return aliases
 
-def _add_generator_variables(args, descriptor):
+def _generator_variable_args(variables, source_root):
+    variables = dict(variables)
+    variables["srctree"] = str(source_root).replace("\\", "/")
+    result = []
+    for key in sorted(variables.keys()):
+        result.extend(["-var", "%s=%s" % (key, variables[key])])
+    return result
+
+def _add_generator_variables(args, descriptor, source_root):
     variables = dict(descriptor.compact_vars)
     variables.update({
         "ARCH": descriptor.arch,
         "SRCARCH": descriptor.srcarch,
         "UTS_MACHINE": descriptor.uts_machine,
     })
-    for key in sorted(variables.keys()):
-        args.extend(["-var", "%s=%s" % (key, variables[key])])
+    args.extend(_generator_variable_args(variables, source_root))
     probe_env = dict(_PROBE_ENV)
     probe_env["ARCH"] = descriptor.arch
     probe_env["SRCARCH"] = descriptor.srcarch
@@ -1670,6 +1677,7 @@ repositories_test_helpers = struct(
     graph_config_args = _graph_config_args,
     graph_configs_args = _graph_configs_args,
     graph_host_tool_args = _graph_host_tool_args,
+    generator_variable_args = _generator_variable_args,
     generated_header_config_index = _content_generated_header_config_index,
     generator_protocol = _REPOSITORY_GENERATOR_PROTOCOL,
     kernel_root_build = _kernel_root_build,

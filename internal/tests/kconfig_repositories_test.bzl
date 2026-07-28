@@ -59,6 +59,30 @@ def _graph_host_tool_args_test_impl(ctx):
 
 graph_host_tool_args_test = unittest.make(_graph_host_tool_args_test_impl)
 
+def _generator_variable_args_test_impl(ctx):
+    env = unittest.begin(ctx)
+    asserts.equals(
+        env,
+        [
+            "-var",
+            "ARCH=x86",
+            "-var",
+            "SRCARCH=x86",
+            "-var",
+            "srctree=D:/_bazel/external/+linux_source_repository+linux_6_18_39",
+        ],
+        repositories_test_helpers.generator_variable_args(
+            {
+                "ARCH": "x86",
+                "SRCARCH": "x86",
+            },
+            "D:\\_bazel\\external\\+linux_source_repository+linux_6_18_39",
+        ),
+    )
+    return unittest.end(env)
+
+generator_variable_args_test = unittest.make(_generator_variable_args_test_impl)
+
 def _graph_configs_args_test_impl(ctx):
     env = unittest.begin(ctx)
     asserts.equals(

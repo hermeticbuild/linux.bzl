@@ -1971,24 +1971,29 @@ func normalizeSourceRootFlags(flags []string, sourceRoot string) []string {
 }
 
 func normalizeSourceRootFlag(flag, sourceRoot string) string {
-	flag = normalizeCompactPath(flag)
-	if flag == sourceRoot {
-		return "$(srctree)"
-	}
-	if strings.HasPrefix(flag, sourceRoot+"/") {
-		return "$(srctree)/" + strings.TrimPrefix(flag, sourceRoot+"/")
-	}
 	for _, prefix := range []string{"-I", "-iquote", "-isystem", "-include"} {
 		path := strings.TrimPrefix(flag, prefix)
 		if path == flag {
 			continue
 		}
+		if path == "" {
+			return flag
+		}
+		path = normalizeCompactPath(path)
 		if path == sourceRoot {
 			return prefix + "$(srctree)"
 		}
 		if strings.HasPrefix(path, sourceRoot+"/") {
 			return prefix + "$(srctree)/" + strings.TrimPrefix(path, sourceRoot+"/")
 		}
+		return prefix + path
+	}
+	flag = normalizeCompactPath(flag)
+	if flag == sourceRoot {
+		return "$(srctree)"
+	}
+	if strings.HasPrefix(flag, sourceRoot+"/") {
+		return "$(srctree)/" + strings.TrimPrefix(flag, sourceRoot+"/")
 	}
 	return flag
 }

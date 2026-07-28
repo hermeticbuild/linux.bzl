@@ -6,7 +6,7 @@ load(
 )
 load(":config_validation_test.bzl", "config_validation_test_suite")
 load(":host_cc_toolchain_test.bzl", "host_cc_toolchain_test")
-load(":kconfig_repositories_test.bzl", "compile_environment_abi_test", "core_config_aliases_test", "generated_header_config_index_test", "generated_object_inputs_test", "graph_config_args_test", "graph_configs_args_test", "graph_host_tool_args_test", "kconfig_tool_filename_test")
+load(":kconfig_repositories_test.bzl", "compile_environment_abi_test", "core_config_aliases_test", "generated_header_config_index_test", "generated_object_inputs_test", "generator_variable_args_test", "graph_config_args_test", "graph_configs_args_test", "graph_host_tool_args_test", "kconfig_tool_filename_test")
 load(":linux_compile_flags_test.bzl", "linux_compile_flags_test")
 load(":linux_modules_test.bzl", "linux_module_test_suite")
 load(":linux_objects_failure_test.bzl", "linux_objects_fail_closed_test_suite")
@@ -29,6 +29,8 @@ graph_config_args_test(name = "graph_config_args_test")
 graph_configs_args_test(name = "graph_configs_args_test")
 
 graph_host_tool_args_test(name = "graph_host_tool_args_test")
+
+generator_variable_args_test(name = "generator_variable_args_test")
 
 generated_header_config_index_test(name = "generated_header_config_index_test")
 

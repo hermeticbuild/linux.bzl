@@ -447,17 +447,30 @@ func newKbuildParser(vars map[string]string, baseDir string) *kbuildParser {
 }
 
 func newKbuildParserWithOverrides(vars, overrides map[string]string, baseDir string) *kbuildParser {
+	initial := make(map[string]string, len(vars))
+	for key, value := range vars {
+		initial[key] = normalizeKbuildPathVariable(key, value)
+	}
 	local := make(map[string]kbuildVariable, len(overrides))
 	for key, value := range overrides {
-		local[key] = kbuildVariable{value: value}
+		local[key] = kbuildVariable{value: normalizeKbuildPathVariable(key, value)}
 	}
 	return &kbuildParser{
 		kb:          &KbuildFile{},
-		initialVars: vars,
+		initialVars: initial,
 		vars:        local,
 		expanding:   map[string]bool{},
 		baseDir:     baseDir,
 		currentRule: -1,
+	}
+}
+
+func normalizeKbuildPathVariable(name, value string) string {
+	switch name {
+	case "obj", "objtree", "src", "srctree":
+		return strings.ReplaceAll(value, `\`, "/")
+	default:
+		return value
 	}
 }
 
@@ -474,6 +487,7 @@ func (p *kbuildParser) lookupVariable(name string) (kbuildVariable, bool) {
 
 func (p *kbuildParser) setVariable(name string, variable kbuildVariable) {
 	delete(p.undefined, name)
+	variable.value = normalizeKbuildPathVariable(name, variable.value)
 	p.vars[name] = variable
 }
 

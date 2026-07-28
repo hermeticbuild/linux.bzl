@@ -2285,12 +2285,71 @@ func TestCompactMetadataJSONMatchesPrettierArrayLayout(t *testing.T) {
 }
 
 func TestNormalizeSourceRootFlagsWindowsPaths(t *testing.T) {
-	got := normalizeSourceRootFlags([]string{
-		`-includeC:\users\runneradmin\execroot\external\linux\include\linux\hidden.h`,
-	}, `C:\users\runneradmin\execroot\external\linux`)
-	want := []string{`-include$(srctree)/include/linux/hidden.h`}
+	const sourceRoot = `D:\_bazel\external\+linux_source_repository+linux_6_18_39`
+	kb, err := parseKbuild(strings.NewReader(`
+KBUILD_CFLAGS += -include $(srctree)/include/linux/hidden.h
+obj-y += init.o
+`), "Kbuild", map[string]string{
+		"srctree": sourceRoot,
+	}, ".")
+	if err != nil {
+		t.Fatalf("parseKbuild() failed: %v", err)
+	}
+
+	got := normalizeSourceRootFlags(kb.Flags[0].Flags, sourceRoot)
+	want := []string{"-include", "$(srctree)/include/linux/hidden.h"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("normalizeSourceRootFlags() = %#v, want %#v", got, want)
+	}
+
+	got = normalizeSourceRootFlags([]string{
+		`-includeD:\_bazel\external\+linux_source_repository+linux_6_18_39/include/linux/hidden.h`,
+	}, sourceRoot)
+	want = []string{`-include$(srctree)/include/linux/hidden.h`}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeSourceRootFlags(joined) = %#v, want %#v", got, want)
+	}
+
+	variant := func(flags []string, root string) CompactObjectVariant {
+		t.Helper()
+		object := resolvedKbuildObject{
+			object: "arch/x86/boot/startup/gdt_idt.pi.o",
+			mode:   "y",
+			flags: []resolvedKbuildFlag{{
+				language: "c",
+				values:   flags,
+			}},
+			footprint: map[string]bool{},
+		}
+		return object.variant(
+			&ResolvedConfig{},
+			"",
+			nil,
+			nil,
+			nil,
+			nil,
+			nil,
+			nil,
+			root,
+			nil,
+			CompactSchemaV013,
+			"linux.bzl/compact-v5/test",
+			nil,
+		)
+	}
+	windowsVariant := variant(kb.Flags[0].Flags, sourceRoot)
+	unixVariant := variant(
+		[]string{"-include", "/workspace/linux/include/linux/hidden.h"},
+		"/workspace/linux",
+	)
+	if windowsVariant.ContentID == "" ||
+		windowsVariant.ContentID != unixVariant.ContentID ||
+		windowsVariant.Target != unixVariant.Target {
+		t.Fatalf(
+			"host path split compact identity:\nwindows=%#v\nunix=%#v",
+			windowsVariant,
+			unixVariant,
+		)
 	}
 }
 

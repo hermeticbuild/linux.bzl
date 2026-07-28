@@ -1149,10 +1149,51 @@ obj-y += init.o
 
 	got := kbuildFlagSummaries(kb.Flags)
 	want := []kbuildFlagSummary{
-		{scope: "global", flags: "-fpie -I" + tmp + "/scripts/dtc/libfdt -include " + tmp + "/include/linux/hidden.h", kind: "const", state: "y", line: 1},
+		{scope: "global", flags: "-fpie -I" + filepath.ToSlash(tmp) + "/scripts/dtc/libfdt -include " + filepath.ToSlash(tmp) + "/include/linux/hidden.h", kind: "const", state: "y", line: 1},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("flags mismatch\nwant: %#v\n got: %#v", want, got)
+	}
+}
+
+func TestParseKbuildNormalizesWindowsPathVariablesBeforeSplittingFlags(t *testing.T) {
+	const sourceRoot = `D:\_bazel\external\+linux_source_repository+linux_6_18_39`
+	for _, tc := range []struct {
+		name string
+		text string
+		vars map[string]string
+		line int
+	}{
+		{
+			name: "injected",
+			text: "KBUILD_CFLAGS += -include $(srctree)/include/linux/hidden.h\nobj-y += init.o\n",
+			vars: map[string]string{"srctree": sourceRoot},
+			line: 1,
+		},
+		{
+			name: "assigned",
+			text: "srctree := " + sourceRoot + "\nKBUILD_CFLAGS += -include $(srctree)/include/linux/hidden.h\nobj-y += init.o\n",
+			line: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kb, err := parseKbuild(strings.NewReader(tc.text), "Kbuild", tc.vars, ".")
+			if err != nil {
+				t.Fatalf("parseKbuild() failed: %v", err)
+			}
+
+			got := kbuildFlagSummaries(kb.Flags)
+			want := []kbuildFlagSummary{{
+				scope: "global",
+				flags: "-include D:/_bazel/external/+linux_source_repository+linux_6_18_39/include/linux/hidden.h",
+				kind:  "const",
+				state: "y",
+				line:  tc.line,
+			}}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("flags mismatch\nwant: %#v\n got: %#v", want, got)
+			}
+		})
 	}
 }
 
