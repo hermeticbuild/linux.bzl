@@ -57,6 +57,7 @@ func TestReportSharedInputs(t *testing.T) {
 	for _, want := range []string{
 		"actions: 2",
 		"input count min/p50/p95/max: 2 / 2 / 2 / 2",
+		"materialized input bytes: disabled (pass -execroot)",
 		"include/linux/kernel.h",
 		"high-fanout non-header source inputs",
 		"none",
@@ -200,21 +201,292 @@ func TestDuplicateProducerOwnershipFails(t *testing.T) {
 	}
 }
 
+func TestMaterializedBytesDeduplicateAliases(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "data", "12345")
+	writeFile(t, dir, "empty", "")
+	writeFile(t, dir, "copy", "12345")
+	if err := os.Link(filepath.Join(dir, "data"), filepath.Join(dir, "hardlink")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("data", filepath.Join(dir, "symlink")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := renderReportWithOptions(t, inputAquery(
+		inputArtifact{path: "data"},
+		inputArtifact{path: "empty"},
+		inputArtifact{path: "hardlink"},
+		inputArtifact{path: "symlink"},
+		inputArtifact{path: "copy"},
+	), reportOptions{
+		mnemonic:  "LinuxObjectCompile",
+		top:       10,
+		sharedPct: 100,
+		execroot:  dir,
+	})
+
+	for _, want := range []string{
+		"byte coverage: 1 / 1 actions complete; 0 distinct inputs unavailable (0 action uses)",
+		"materialized input bytes min/p50/p95/max (1 complete actions): 10 B / 10 B / 10 B / 10 B",
+		"largest complete actions by materialized input bytes:",
+		"10 B     5 inputs  //:consumer",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("report missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestMaterializedBytesReportMissingInputs(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "present", "data")
+	aq := inputAquery(
+		inputArtifact{path: "present"},
+		inputArtifact{path: "generated-missing"},
+		inputArtifact{path: "source-missing"},
+	)
+	aq.Actions = append([]action{{
+		TargetID:        2,
+		Mnemonic:        "Generate",
+		OutputIDs:       []int{2},
+		PrimaryOutputID: 2,
+	}}, aq.Actions...)
+	aq.Targets = append(aq.Targets, target{ID: 2, Label: "//:generator"})
+
+	got := renderReportWithOptions(t, aq, reportOptions{
+		mnemonic:  "LinuxObjectCompile",
+		top:       10,
+		sharedPct: 100,
+		execroot:  dir,
+	})
+
+	for _, want := range []string{
+		"byte coverage: 0 / 1 actions complete; 2 distinct inputs unavailable (2 action uses)",
+		"byte issues: not-found=1 unmaterialized=1",
+		"materialized input bytes: unavailable (no complete actions)",
+		"largest complete actions by materialized input bytes:\n  none",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("report missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestMaterializedByteStatsUseCompleteActions(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "present", "abc")
+	aq := inputAquery(
+		inputArtifact{path: "present"},
+		inputArtifact{path: "missing"},
+	)
+	aq.Actions = []action{
+		{TargetID: 1, Mnemonic: "LinuxObjectCompile", InputDepSetIDs: []int{1}},
+		{TargetID: 2, Mnemonic: "LinuxObjectCompile", InputDepSetIDs: []int{2}},
+	}
+	aq.Targets = []target{
+		{ID: 1, Label: "//:complete"},
+		{ID: 2, Label: "//:incomplete"},
+	}
+	aq.DepSetOfFiles = []depSet{
+		{ID: 1, DirectArtifactIDs: []int{1}},
+		{ID: 2, DirectArtifactIDs: []int{1, 2}},
+	}
+
+	got := renderReportWithOptions(t, aq, reportOptions{
+		mnemonic:  "LinuxObjectCompile",
+		top:       10,
+		sharedPct: 100,
+		execroot:  dir,
+	})
+
+	for _, want := range []string{
+		"byte coverage: 1 / 2 actions complete; 1 distinct inputs unavailable (1 action uses)",
+		"materialized input bytes min/p50/p95/max (1 complete actions): 3 B / 3 B / 3 B / 3 B",
+		"3 B     1 inputs  //:complete",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("report missing %q:\n%s", want, got)
+		}
+	}
+	byteSectionIndex := strings.Index(got, "largest complete actions by materialized input bytes:")
+	if byteSectionIndex < 0 {
+		t.Fatalf("byte ranking is missing:\n%s", got)
+	}
+	byteSection := got[byteSectionIndex:]
+	if strings.Contains(byteSection, "//:incomplete") {
+		t.Fatalf("incomplete action appeared in byte ranking:\n%s", got)
+	}
+}
+
+func TestMaterializedBytesScanTreeAndDirectoryInputs(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "tree/first", "abc")
+	writeFile(t, dir, "tree/nested/second", "de")
+	if err := os.Mkdir(filepath.Join(dir, "empty-tree"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, dir, "directory/value", "wxyz")
+
+	got := renderReportWithOptions(t, inputAquery(
+		inputArtifact{path: "tree", tree: true},
+		inputArtifact{path: "empty-tree", tree: true},
+		inputArtifact{path: "directory"},
+	), reportOptions{
+		mnemonic:  "LinuxObjectCompile",
+		top:       10,
+		sharedPct: 100,
+		execroot:  dir,
+	})
+
+	for _, want := range []string{
+		"byte coverage: 1 / 1 actions complete; 0 distinct inputs unavailable (0 action uses)",
+		"materialized input bytes min/p50/p95/max (1 complete actions): 9 B / 9 B / 9 B / 9 B",
+		"9 B     3 inputs  //:consumer",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("report missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestMaterializedBytesReportPartialTree(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "tree/known", "data")
+	if err := os.Symlink("missing", filepath.Join(dir, "tree/broken-first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("also-missing", filepath.Join(dir, "tree/broken-second")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := renderReportWithOptions(t, inputAquery(
+		inputArtifact{path: "tree", tree: true},
+	), reportOptions{
+		mnemonic:  "LinuxObjectCompile",
+		top:       10,
+		sharedPct: 100,
+		execroot:  dir,
+	})
+
+	for _, want := range []string{
+		"byte coverage: 0 / 1 actions complete; 1 distinct inputs unavailable (1 action uses)",
+		"byte issues: broken-symlink=2",
+		">=4 B  tree",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("report missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestMaterializedBytesReportSymlinkCycle(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Symlink("second", filepath.Join(dir, "first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("first", filepath.Join(dir, "second")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := renderReportWithOptions(t, inputAquery(
+		inputArtifact{path: "first"},
+	), reportOptions{
+		mnemonic:  "LinuxObjectCompile",
+		top:       10,
+		sharedPct: 100,
+		execroot:  dir,
+	})
+
+	if !strings.Contains(got, "byte issues: symlink-cycle=1") {
+		t.Fatalf("report does not classify the symlink cycle:\n%s", got)
+	}
+}
+
+func TestExecrootValidation(t *testing.T) {
+	aq := inputAquery(inputArtifact{path: "input"})
+	for name, execroot := range map[string]string{
+		"missing": filepath.Join(t.TempDir(), "missing"),
+		"file":    writeTempFile(t, "not-a-directory"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			model, err := newModel(aq)
+			if err != nil {
+				t.Fatalf("newModel() failed: %v", err)
+			}
+			err = writeReport(&bytes.Buffer{}, model, reportOptions{
+				mnemonic:  "LinuxObjectCompile",
+				top:       10,
+				sharedPct: 100,
+				execroot:  execroot,
+			})
+			if err == nil || !strings.Contains(err.Error(), "-execroot") {
+				t.Fatalf("writeReport() error = %v, want -execroot validation failure", err)
+			}
+		})
+	}
+}
+
+type inputArtifact struct {
+	path string
+	tree bool
+}
+
+func inputAquery(inputs ...inputArtifact) *aqueryOutput {
+	aq := &aqueryOutput{
+		Actions: []action{{
+			TargetID:       1,
+			Mnemonic:       "LinuxObjectCompile",
+			InputDepSetIDs: []int{1},
+		}},
+		Targets:       []target{{ID: 1, Label: "//:consumer"}},
+		DepSetOfFiles: []depSet{{ID: 1}},
+	}
+	for index, input := range inputs {
+		id := index + 1
+		aq.Artifacts = append(aq.Artifacts, artifact{
+			ID:             id,
+			PathFragmentID: id,
+			IsTreeArtifact: input.tree,
+		})
+		aq.DepSetOfFiles[0].DirectArtifactIDs = append(aq.DepSetOfFiles[0].DirectArtifactIDs, id)
+		aq.PathFragments = append(aq.PathFragments, pathFragment{
+			ID:    id,
+			Label: input.path,
+		})
+	}
+	return aq
+}
+
 func renderReport(t *testing.T, aq *aqueryOutput) string {
+	t.Helper()
+	return renderReportWithOptions(t, aq, reportOptions{
+		mnemonic:  "LinuxObjectCompile",
+		top:       10,
+		sharedPct: 100,
+	})
+}
+
+func renderReportWithOptions(t *testing.T, aq *aqueryOutput, opts reportOptions) string {
 	t.Helper()
 	model, err := newModel(aq)
 	if err != nil {
 		t.Fatalf("newModel() failed: %v", err)
 	}
 	var out bytes.Buffer
-	if err := writeReport(&out, model, reportOptions{
-		mnemonic:  "LinuxObjectCompile",
-		top:       10,
-		sharedPct: 100,
-	}); err != nil {
+	if err := writeReport(&out, model, opts); err != nil {
 		t.Fatalf("writeReport() failed: %v", err)
 	}
 	return out.String()
+}
+
+func writeTempFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func writeFile(t *testing.T, root, name, content string) {
