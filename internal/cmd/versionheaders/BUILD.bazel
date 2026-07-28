@@ -1,4 +1,4 @@
-load("@rules_go//go:def.bzl", "go_binary", "go_library")
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
     name = "versionheaders_lib",
@@ -12,4 +12,10 @@ go_binary(
     name = "versionheaders",
     embed = [":versionheaders_lib"],
     visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "versionheaders_test",
+    srcs = ["main_test.go"],
+    embed = [":versionheaders_lib"],
 )

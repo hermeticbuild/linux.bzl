@@ -17,4 +17,6 @@ go_test(
     name = "objtoolrun_test",
     srcs = ["main_test.go"],
     embed = [":objtoolrun_lib"],
+    embedsrcs = ["main.go"],
+    deps = ["//internal/kconfig"],
 )

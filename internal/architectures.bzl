@@ -1,7 +1,7 @@
 """Supported Linux architecture descriptors."""
 
-load(":arm64_host_tools.bzl", "linux_arm64_host_tools")
-load(":x86_host_tools.bzl", "linux_x86_host_tools")
+load(":arm64_host_tools.bzl", "linux_arm64_configured_host_tools", "linux_arm64_host_tools")
+load(":x86_host_tools.bzl", "linux_x86_configured_host_tools", "linux_x86_host_tools")
 
 visibility("//...")
 
@@ -21,6 +21,7 @@ def linux_architectures():
             config_name = "x86_64",
             extension = "bzImage",
             final_suffix = "bzimage",
+            configured_host_tools = linux_x86_configured_host_tools,
             host_tools = linux_x86_host_tools,
             platform = Label("@platforms//cpu:x86_64"),
             srcarch = "x86",
@@ -49,6 +50,7 @@ def linux_architectures():
             config_name = "aarch64",
             extension = "Image",
             final_suffix = "image",
+            configured_host_tools = linux_arm64_configured_host_tools,
             host_tools = linux_arm64_host_tools,
             platform = Label("@platforms//cpu:aarch64"),
             srcarch = "arm64",

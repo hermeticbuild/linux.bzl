@@ -16,7 +16,20 @@ Add `linux.bzl` and a hermetic C/C++ toolchain to `MODULE.bazel`:
 bazel_dep(name = "linux.bzl", version = "0.1.0")
 bazel_dep(name = "llvm", version = "0.8.14")
 
-register_toolchains("@llvm//toolchain:all")
+register_toolchains(
+    "@llvm//toolchain:linux_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:linux_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:linux_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:macos_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:macos_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:macos_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:macos_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:windows_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:windows_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:windows_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:windows_x86_64_to_linux_x86_64",
+)
 
 linux_source_repository = use_repo_rule(
     "@linux.bzl//:linux.bzl",
@@ -447,9 +460,9 @@ implementations are not part of the supported contract yet.
 
 Repository generation downloads the platform-specific, integrity-pinned
 Kconfig graph generator selected by the rules release's checked-in table. The
-Starlark rule adapts its legacy source and `require_real` declarations, checks
-their expected schema, and verifies that the emitted metadata names the
-requested config and contains object variants. The generator never consumes a
+Starlark rule requires indexed content-graph metadata, verifies exact source
+inputs and content identities, and checks every generated-header family and
+compile environment before exposing the graph. The generator never consumes a
 build output, which keeps module resolution valid and reproducible.
 
 The build does not read ambient host tools or environment variables. All tools
@@ -466,11 +479,20 @@ ordinary compiles receive headers, bounded special lookups, and the exact
 repository-generated closure of source-like includes rather than the complete
 source archive.
 
-Version 0.1 deliberately includes the resolved config artifact and generated
-header set in each object action. This is a conservative cache key: named
-variants currently use independent graphs and do not share object actions.
-Reducing that config input requires a future generator/schema revision and
-broader differential coverage of source-level `CONFIG_*` references.
+Repository generation resolves the base config and every named overlay in one
+graph invocation. Compile environments, exact source inputs, and
+generated-header families are content-addressed, and variant images are emitted
+as deltas from one canonical base graph. Equivalent configs therefore reference
+the same object targets. Configs with only some identical generated
+headers share those family inputs without conflating the remaining
+generated-header tree. The public `@repo//:kernel` and
+`@repo//variants/<name>:kernel` labels stay unchanged.
+
+For the maintained x86_64 base, BTF, debug, and LZ4 invocation, 4,711 config
+memberships resolve to 3,519 `LinuxObjectCompile` actions. Base and LZ4 share
+all 1,152 object actions; generated-header family identities additionally
+share 40 base/debug actions. BTF compiler flags differ, so BTF correctly shares
+generated-header producers but no object compile actions.
 
 ### Inspecting object inputs
 

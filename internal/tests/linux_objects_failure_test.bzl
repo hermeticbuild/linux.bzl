@@ -5,12 +5,25 @@ load(
     "analysistest",
     "asserts",
 )
+load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
 load(
     "//internal:linux_objects.bzl",
+    "LinuxCompileEnvironmentIndexInfo",
+    "LinuxGeneratedHeadersInfo",
     "LinuxImageInfo",
+    "LinuxObjectInfo",
+    "LinuxSourceTreeInfo",
+    "linux_arm64_nvhe_object",
+    "linux_cache_shape_check",
+    "linux_compact_delta_image",
     "linux_compact_image",
+    "linux_compile_environment_index",
     "linux_compressed_image",
+    "linux_config",
     "linux_object",
+    "linux_source_input_index",
+    "linux_source_tree",
+    "linux_x86_generated_headers",
 )
 
 visibility("private")
@@ -29,6 +42,173 @@ def _fake_linux_image_impl(ctx):
     ]
 
 _fake_linux_image = rule(implementation = _fake_linux_image_impl)
+
+def _fake_linux_object_impl(ctx):
+    out = ctx.actions.declare_file(ctx.label.name + ".o")
+    ctx.actions.write(out, "")
+    return [
+        DefaultInfo(files = depset([out])),
+        LinuxObjectInfo(
+            content_id = ctx.attr.content_id,
+            generated_headers = depset(),
+            generated_include_dir_anchors = {},
+            generated_include_dirs = [],
+            mode = ctx.attr.mode,
+            object = ctx.attr.object,
+            output = out,
+        ),
+    ]
+
+_fake_linux_object = rule(
+    implementation = _fake_linux_object_impl,
+    attrs = {
+        "content_id": attr.string(mandatory = True),
+        "mode": attr.string(mandatory = True, values = ["m", "y"]),
+        "object": attr.string(mandatory = True),
+    },
+)
+
+def _fake_compile_environment_index_impl(_ctx):
+    return [
+        LinuxCompileEnvironmentIndexInfo(
+            environments = {},
+        ),
+    ]
+
+_fake_compile_environment_index = rule(
+    implementation = _fake_compile_environment_index_impl,
+)
+
+def _fake_generated_headers_impl(ctx):
+    out = ctx.actions.declare_file(ctx.label.name + ".h")
+    ctx.actions.write(out, "")
+    family = struct(
+        arch = "x86",
+        cflags = None,
+        content_id = ctx.attr.family_content_id,
+        files = depset([out]),
+        include_dir_anchors = {},
+        include_dirs = [],
+        name = ctx.attr.family_name,
+        srcarch = "x86",
+        vdsomunge = None,
+    )
+    return [
+        DefaultInfo(files = depset([out])),
+        LinuxGeneratedHeadersInfo(
+            arch = "x86",
+            cflags = None,
+            families = {
+                ctx.attr.family_name: family,
+            },
+            files = depset([out]),
+            include_dir_anchors = {},
+            include_dirs = [],
+            srcarch = "x86",
+            vdsomunge = None,
+        ),
+    ]
+
+_fake_generated_headers = rule(
+    implementation = _fake_generated_headers_impl,
+    attrs = {
+        "family_content_id": attr.string(mandatory = True),
+        "family_name": attr.string(default = "all"),
+    },
+)
+
+def _fake_arm64_generated_headers_impl(ctx):
+    out = ctx.actions.declare_file(ctx.label.name + ".h")
+    ctx.actions.write(out, "")
+    family = struct(
+        arch = "arm64",
+        cflags = None,
+        content_id = ctx.attr.family_content_id,
+        files = depset([out]),
+        include_dir_anchors = {},
+        include_dirs = [],
+        name = "all",
+        srcarch = "arm64",
+        vdsomunge = ctx.executable._vdsomunge,
+    )
+    return [
+        DefaultInfo(files = depset([out])),
+        LinuxGeneratedHeadersInfo(
+            arch = "arm64",
+            cflags = None,
+            families = {
+                "all": family,
+            },
+            files = depset([out]),
+            include_dir_anchors = {},
+            include_dirs = [],
+            srcarch = "arm64",
+            vdsomunge = ctx.executable._vdsomunge,
+        ),
+    ]
+
+_fake_arm64_generated_headers = rule(
+    implementation = _fake_arm64_generated_headers_impl,
+    attrs = {
+        "family_content_id": attr.string(mandatory = True),
+        "_vdsomunge": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/runandwrite"),
+            executable = True,
+        ),
+    },
+)
+
+def _fake_source_tree_info(root):
+    return LinuxSourceTreeInfo(
+        root = root,
+    )
+
+def _fake_nvhe_source_inputs_impl(ctx):
+    root = ctx.actions.declare_file(ctx.label.name + ".source/Kconfig")
+    hyp_lds = ctx.actions.declare_file(
+        ctx.label.name + ".source/arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
+    )
+    compiler_version = ctx.actions.declare_file(
+        ctx.label.name + ".source/include/linux/compiler-version.h",
+    )
+    kconfig = ctx.actions.declare_file(
+        ctx.label.name + ".source/include/linux/kconfig.h",
+    )
+    ctx.actions.write(root, "")
+    ctx.actions.write(hyp_lds, "")
+    ctx.actions.write(compiler_version, "")
+    ctx.actions.write(kconfig, "")
+    return [
+        DefaultInfo(files = depset([hyp_lds, compiler_version, kconfig])),
+        _fake_source_tree_info(root),
+    ]
+
+_fake_nvhe_source_inputs = rule(implementation = _fake_nvhe_source_inputs_impl)
+
+def _fake_vdso32_source_inputs_impl(ctx):
+    root = ctx.actions.declare_file(ctx.label.name + ".source/Kconfig")
+    ctx.actions.write(root, "")
+    files = []
+    for path in [
+        "arch/arm64/kernel/vdso32-wrap.S",
+        "arch/arm64/kernel/vdso32/note.c",
+        "arch/arm64/kernel/vdso32/vdso.lds.S",
+        "arch/arm64/kernel/vdso32/vgettimeofday.c",
+        "include/linux/compiler-version.h",
+        "include/linux/compiler_types.h",
+        "include/linux/kconfig.h",
+        "lib/vdso/gettimeofday.c",
+    ]:
+        out = ctx.actions.declare_file(ctx.label.name + ".source/" + path)
+        ctx.actions.write(out, "")
+        files.append(out)
+    return [
+        DefaultInfo(files = depset(files)),
+        _fake_source_tree_info(root),
+    ]
+
+_fake_vdso32_source_inputs = rule(implementation = _fake_vdso32_source_inputs_impl)
 
 def _failure_test_impl(ctx):
     env = analysistest.begin(ctx)
@@ -53,10 +233,418 @@ def _image_output_groups_test_impl(ctx):
 
 _image_output_groups_test = analysistest.make(_image_output_groups_test_impl)
 
+def _content_addressed_object_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    target = analysistest.target_under_test(env)
+    info = target[LinuxObjectInfo]
+    asserts.equals(env, ctx.attr.expected_content_id, info.content_id)
+    compile_actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxObjectCompile"
+    ]
+    asserts.equals(env, 1, len(compile_actions))
+    if compile_actions:
+        config_inputs = [
+            file
+            for file in compile_actions[0].inputs.to_list()
+            if ctx.attr.expected_payload_id in file.short_path
+        ]
+        asserts.true(env, len(config_inputs) > 0, "compile action did not select indexed config payload")
+        for basename in ctx.attr.expected_generated_headers:
+            generated_header_inputs = [
+                file
+                for file in compile_actions[0].inputs.to_list()
+                if file.basename == basename
+            ]
+            asserts.equals(env, 1, len(generated_header_inputs))
+        for basename in ctx.attr.unexpected_generated_headers:
+            duplicate_header_inputs = [
+                file
+                for file in compile_actions[0].inputs.to_list()
+                if file.basename == basename
+            ]
+            asserts.equals(env, 0, len(duplicate_header_inputs))
+        unexpected_inputs = [
+            file
+            for file in compile_actions[0].inputs.to_list()
+            if file.basename == ctx.attr.unexpected_input
+        ]
+        asserts.equals(env, 0, len(unexpected_inputs))
+    return analysistest.end(env)
+
+_content_addressed_object_test = analysistest.make(
+    _content_addressed_object_test_impl,
+    attrs = {
+        "expected_content_id": attr.string(mandatory = True),
+        "expected_generated_headers": attr.string_list(),
+        "expected_payload_id": attr.string(mandatory = True),
+        "unexpected_generated_headers": attr.string_list(),
+        "unexpected_input": attr.string(mandatory = True),
+    },
+)
+
+def _indexed_assembly_source_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxObjectCompile"
+    ]
+    asserts.equals(env, 1, len(actions))
+    if actions:
+        action = actions[0]
+        argv = action.argv
+        asserts.true(env, "-D__ASSEMBLY__" in argv)
+        compile_index = argv.index("-c")
+        asserts.true(env, argv[compile_index + 1].endswith("/lib/crypto/x86/blake2s-core.S"))
+        input_basenames = [file.basename for file in action.inputs.to_list()]
+        asserts.true(env, "blake2s-core.S" in input_basenames)
+        asserts.false(env, "blake2s.h" in input_basenames)
+    return analysistest.end(env)
+
+_indexed_assembly_source_test = analysistest.make(
+    _indexed_assembly_source_test_impl,
+)
+
+_X86_PRECISE_HEADER_FAMILIES = [
+    "static",
+    "timeconst",
+    "compile",
+    "version",
+    "utsrelease",
+    "utsversion",
+    "cpufeatures",
+    "bounds",
+    "asm_offsets",
+    "rq_offsets",
+    "kvm_offsets",
+]
+
+def _family_paths(info):
+    return sorted([file.path for file in info.files.to_list()])
+
+def _generated_header_family_layout_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    target = analysistest.target_under_test(env)
+    info = target[LinuxGeneratedHeadersInfo]
+    precise_paths = []
+    precise_include_dirs = []
+    include_dir_owners = {}
+    for name in _X86_PRECISE_HEADER_FAMILIES:
+        paths = _family_paths(info.families[name])
+        asserts.true(env, len(paths) > 0, "%s family must publish files" % name)
+        for path in paths:
+            asserts.true(
+                env,
+                (".headers/%s/" % name) in path,
+                "%s family file is not isolated under its own root: %s" % (name, path),
+            )
+        precise_paths.extend(paths)
+        for include_dir in info.families[name].include_dirs:
+            asserts.true(
+                env,
+                (".headers/%s/" % name) in include_dir,
+                "%s family include directory is not isolated: %s" % (name, include_dir),
+            )
+            asserts.false(
+                env,
+                include_dir in include_dir_owners,
+                "%s and %s share include directory %s" %
+                (include_dir_owners.get(include_dir), name, include_dir),
+            )
+            include_dir_owners[include_dir] = name
+            precise_include_dirs.append(include_dir)
+    asserts.equals(env, sorted(precise_paths), _family_paths(info.families["all"]))
+    asserts.equals(env, _family_paths(info.families["all"]), _family_paths(info))
+    asserts.equals(env, sorted(precise_include_dirs), sorted(info.families["all"].include_dirs))
+    asserts.equals(env, sorted(info.families["all"].include_dirs), sorted(info.include_dirs))
+    asserts.equals(env, 52, len(info.families["static"].files.to_list()))
+    version_include_dirs = info.families["version"].include_dirs
+    asserts.equals(env, 2, len(version_include_dirs))
+    asserts.true(env, any([
+        include_dir.endswith(".headers/version/include")
+        for include_dir in version_include_dirs
+    ]))
+    asserts.true(env, any([
+        include_dir.endswith(".headers/version/include/generated/uapi")
+        for include_dir in version_include_dirs
+    ]))
+
+    actions = analysistest.target_actions(env)
+    version_mnemonics = {
+        "LinuxCompileHeader": "compile",
+        "LinuxUTSReleaseHeader": "utsrelease",
+        "LinuxUTSVersionHeader": "utsversion",
+        "LinuxVersionHeader": "version",
+    }
+    for mnemonic, family_name in version_mnemonics.items():
+        matching = [action for action in actions if action.mnemonic == mnemonic]
+        asserts.equals(env, 1, len(matching))
+        if matching:
+            action = matching[0]
+            outputs = action.outputs.to_list()
+            asserts.equals(env, 1, len(outputs))
+            if outputs:
+                asserts.true(env, (".headers/%s/" % family_name) in outputs[0].path)
+            input_basenames = [file.basename for file in action.inputs.to_list()]
+            asserts.equals(env, family_name == "utsversion", ".config" in input_basenames)
+            asserts.equals(env, family_name == "utsrelease", "kernel.release" in input_basenames)
+            asserts.equals(env, family_name == "utsversion", "-config" in action.argv)
+            asserts.equals(env, family_name == "utsrelease", "-kernel_release" in action.argv)
+            asserts.equals(env, family_name == "version", "-kernel_version" in action.argv)
+            if family_name == "version":
+                version_flag_index = action.argv.index("-kernel_version")
+                asserts.equals(env, "6.18.2", action.argv[version_flag_index + 1])
+    return analysistest.end(env)
+
+_generated_header_family_layout_test = analysistest.make(
+    _generated_header_family_layout_test_impl,
+)
+
+def _generated_header_family_reuse_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    variant = analysistest.target_under_test(env)[LinuxGeneratedHeadersInfo]
+    base = ctx.attr.base_generated_headers[LinuxGeneratedHeadersInfo]
+    for name in _X86_PRECISE_HEADER_FAMILIES[:-1]:
+        asserts.equals(
+            env,
+            _family_paths(base.families[name]),
+            _family_paths(variant.families[name]),
+            "%s family must reuse the canonical producer" % name,
+        )
+        asserts.equals(env, base.families[name].include_dirs, variant.families[name].include_dirs)
+    asserts.true(
+        env,
+        _family_paths(base.families["kvm_offsets"]) != _family_paths(variant.families["kvm_offsets"]),
+        "changed kvm_offsets family must use a local producer",
+    )
+    for path in _family_paths(variant.families["kvm_offsets"]):
+        asserts.true(env, ".headers/kvm_offsets/" in path)
+
+    precise_paths = []
+    for name in _X86_PRECISE_HEADER_FAMILIES:
+        precise_paths.extend(_family_paths(variant.families[name]))
+    asserts.equals(env, sorted(precise_paths), _family_paths(variant.families["all"]))
+    asserts.equals(env, _family_paths(variant.families["all"]), _family_paths(variant))
+
+    actions = analysistest.target_actions(env)
+    offsets_asm = [action for action in actions if action.mnemonic == "LinuxOffsetsAsm"]
+    offsets_header = [action for action in actions if action.mnemonic == "LinuxOffsetsHeader"]
+    asserts.equals(env, 1, len(offsets_asm))
+    asserts.equals(env, 1, len(offsets_header))
+    asserts.equals(env, 2, len(actions))
+    if offsets_asm:
+        input_paths = {
+            file.path: True
+            for file in offsets_asm[0].inputs.to_list()
+        }
+        dependency_names = [
+            "asm_offsets",
+            "utsrelease",
+        ]
+        for name in _X86_PRECISE_HEADER_FAMILIES[:-1]:
+            for path in _family_paths(variant.families[name]):
+                asserts.equals(
+                    env,
+                    name in dependency_names,
+                    path in input_paths,
+                    "local kvm_offsets action dependency mismatch for %s input %s" % (name, path),
+                )
+    return analysistest.end(env)
+
+_generated_header_family_reuse_test = analysistest.make(
+    _generated_header_family_reuse_test_impl,
+    attrs = {
+        "base_generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
+    },
+)
+
+def _generated_header_earliest_reuse_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    selected = analysistest.target_under_test(env)[LinuxGeneratedHeadersInfo]
+    earliest = ctx.attr.earliest_generated_headers[LinuxGeneratedHeadersInfo]
+    later = ctx.attr.later_generated_headers[LinuxGeneratedHeadersInfo]
+    for name in ["all"] + _X86_PRECISE_HEADER_FAMILIES:
+        asserts.equals(
+            env,
+            _family_paths(earliest.families[name]),
+            _family_paths(selected.families[name]),
+            "%s family must select the earliest reusable provider" % name,
+        )
+        asserts.true(
+            env,
+            _family_paths(later.families[name]) != _family_paths(selected.families[name]),
+            "%s family unexpectedly selected the later reusable provider" % name,
+        )
+    asserts.equals(env, 0, len(analysistest.target_actions(env)))
+    return analysistest.end(env)
+
+_generated_header_earliest_reuse_test = analysistest.make(
+    _generated_header_earliest_reuse_test_impl,
+    attrs = {
+        "earliest_generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
+        "later_generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
+    },
+)
+
+def _x86_generated_headers_fixture(
+        name,
+        config,
+        family_content_ids,
+        family_dependency_ids,
+        reusable_generated_headers,
+        tags):
+    linux_x86_generated_headers(
+        name = name,
+        asm_offsets_c = "linux_objects_test_fixture.c",
+        bounds_c = "linux_objects_test_fixture.c",
+        config = config,
+        cpufeatures_h = "linux_objects_test_fixture.c",
+        family_content_ids = family_content_ids,
+        family_dependency_ids = family_dependency_ids,
+        kvm_asm_offsets_c = "linux_objects_test_fixture.c",
+        orc_types_h = "linux_objects_test_fixture.c",
+        required_features_h = "linux_objects_test_fixture.c",
+        reusable_generated_headers = reusable_generated_headers,
+        rq_offsets_c = "linux_objects_test_fixture.c",
+        source_root = "linux_objects_test_fixture.c",
+        syscall_32_tbl = "linux_objects_test_fixture.c",
+        syscall_64_tbl = "linux_objects_test_fixture.c",
+        tags = tags,
+    )
+
+def _exact_nvhe_source_lookup_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    linker_actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxArm64NvheLinkerScript"
+    ]
+    compile_actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxVmlinuxCompile"
+    ]
+    asserts.equals(env, 1, len(linker_actions))
+    asserts.equals(env, 1, len(compile_actions))
+    for action in linker_actions + compile_actions:
+        inputs = [file.short_path for file in action.inputs.to_list()]
+        asserts.true(
+            env,
+            any([path.endswith("/arch/arm64/kvm/hyp/nvhe/hyp.lds.S") for path in inputs]),
+            "%s action did not consume hyp.lds.S from the exact source group" % action.mnemonic,
+        )
+        asserts.true(
+            env,
+            any([path.endswith("/include/linux/kconfig.h") for path in inputs]),
+            "%s action did not consume kconfig.h from the exact source group" % action.mnemonic,
+        )
+        asserts.true(
+            env,
+            any([path.endswith("/include/linux/compiler-version.h") for path in inputs]),
+            "%s action did not consume compiler-version.h from the exact source group" % action.mnemonic,
+        )
+        asserts.false(
+            env,
+            any([path.endswith("/include/linux/compiler_types.h") for path in inputs]),
+            "%s action retained a C-only legacy preinclude" % action.mnemonic,
+        )
+        asserts.false(
+            env,
+            any([path.endswith("/linux_modules_test_fixture.rs") for path in inputs]),
+            "%s action retained the legacy source-tree root marker" % action.mnemonic,
+        )
+    return analysistest.end(env)
+
+_exact_nvhe_source_lookup_test = analysistest.make(_exact_nvhe_source_lookup_test_impl)
+
+def _exact_vdso32_source_inputs_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    compile_actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxARM64VDSO32Compile"
+    ]
+    linker_script_actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxARM64VDSO32LinkerScript"
+    ]
+    asserts.equals(env, 2, len(compile_actions))
+    asserts.equals(env, 1, len(linker_script_actions))
+    for action in compile_actions + linker_script_actions:
+        inputs = [file.short_path for file in action.inputs.to_list()]
+        for suffix in [
+            "/arch/arm64/kernel/vdso32/note.c",
+            "/arch/arm64/kernel/vdso32/vdso.lds.S",
+            "/arch/arm64/kernel/vdso32/vgettimeofday.c",
+            "/lib/vdso/gettimeofday.c",
+        ]:
+            asserts.true(
+                env,
+                any([path.endswith(suffix) for path in inputs]),
+                "%s action did not consume %s from the exact source group" % (action.mnemonic, suffix),
+            )
+        asserts.false(
+            env,
+            any([path.endswith("/linux_modules_test_fixture.rs") for path in inputs]),
+            "%s action retained the legacy source-tree root marker" % action.mnemonic,
+        )
+    return analysistest.end(env)
+
+_exact_vdso32_source_inputs_test = analysistest.make(_exact_vdso32_source_inputs_test_impl)
+
+def _delta_order_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    image = analysistest.target_under_test(env)[LinuxImageInfo]
+    asserts.equals(
+        env,
+        ctx.attr.expected_objects,
+        [obj.content_id for obj in image.objects],
+    )
+    asserts.equals(
+        env,
+        ctx.attr.expected_modules,
+        [obj.content_id for obj in image.module_objects],
+    )
+    return analysistest.end(env)
+
+_delta_order_test = analysistest.make(
+    _delta_order_test_impl,
+    attrs = {
+        "expected_modules": attr.string_list(),
+        "expected_objects": attr.string_list(),
+    },
+)
+
+def _cache_shape_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = analysistest.target_actions(env)
+    asserts.equals(env, 1, len(actions))
+    return analysistest.end(env)
+
+_cache_shape_test = analysistest.make(_cache_shape_test_impl)
+
 def linux_objects_fail_closed_test_suite(name):
     """Instantiates analysis tests for supported Linux object/image rules."""
     image = name + "_input_image"
     fixture_tags = ["manual"]
+    object_a_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    object_b_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    object_c_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    module_m_id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    module_n_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    unknown_module_id = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    payload_id = "1111111111111111111111111111111111111111111111111111111111111111"
+    environment_id = "2222222222222222222222222222222222222222222222222222222222222222"
+    header_family_id = "3333333333333333333333333333333333333333333333333333333333333333"
+    arm64_environment_id = "4444444444444444444444444444444444444444444444444444444444444444"
+    arm64_header_family_id = "5555555555555555555555555555555555555555555555555555555555555555"
+    vdso32_object_id = "6666666666666666666666666666666666666666666666666666666666666666"
+    precise_header_family_id = "7777777777777777777777777777777777777777777777777777777777777777"
+    second_precise_header_family_id = "8888888888888888888888888888888888888888888888888888888888888888"
+    precise_environment_id = "9999999999999999999999999999999999999999999999999999999999999999"
 
     _fake_linux_image(
         name = image,
@@ -72,17 +660,510 @@ def linux_objects_fail_closed_test_suite(name):
     certificate_object = name + "_certificate_object"
     linux_object(
         name = certificate_object,
-        src = "linux_objects_test_fixture.c",
+        compile_environment_id = environment_id,
+        compile_environment_index = ":" + name + "_compile_environment_index",
+        content_id = object_a_id,
         mode = "y",
         object = "certs/system_certificates.o",
+        source_input_file = 4,
+        source_input_group = 1,
+        source_input_index = ":" + name + "_source_input_index",
         tags = fixture_tags,
     )
 
+    generated_headers = name + "_generated_headers_a"
+    duplicate_generated_headers = name + "_generated_headers_z"
+    _fake_generated_headers(
+        name = generated_headers,
+        family_content_id = header_family_id,
+        tags = fixture_tags,
+    )
+    _fake_generated_headers(
+        name = duplicate_generated_headers,
+        family_content_id = header_family_id,
+        tags = fixture_tags,
+    )
+    compile_environment_index = name + "_compile_environment_index"
+    linux_compile_environment_index(
+        name = compile_environment_index,
+        compile_environments = {
+            environment_id: json.encode({
+                "abi": "x86_64-linux-gnu",
+                "config_payload": payload_id,
+                "generated_header_families": [header_family_id],
+            }),
+        },
+        config_payloads = {
+            payload_id: "CONFIG_TEST=y\n",
+        },
+        expected_abi = "x86_64-linux-gnu",
+        generated_headers = [
+            ":" + generated_headers,
+            ":" + duplicate_generated_headers,
+        ],
+        tags = fixture_tags,
+    )
+    arm64_generated_headers = name + "_arm64_generated_headers"
+    _fake_arm64_generated_headers(
+        name = arm64_generated_headers,
+        family_content_id = arm64_header_family_id,
+        tags = fixture_tags,
+    )
+    arm64_compile_environment_index = name + "_arm64_compile_environment_index"
+    linux_compile_environment_index(
+        name = arm64_compile_environment_index,
+        arch = "arm64",
+        compile_environments = {
+            arm64_environment_id: json.encode({
+                "abi": "arm64-linux-gnu",
+                "config_payload": payload_id,
+                "generated_header_families": [arm64_header_family_id],
+            }),
+        },
+        config_payloads = {
+            payload_id: "CONFIG_TEST=y\n",
+        },
+        expected_abi = "arm64-linux-gnu",
+        generated_headers = [":" + arm64_generated_headers],
+        tags = fixture_tags,
+    )
+    unbound_generated_headers = name + "_unbound_generated_headers"
+    _fake_generated_headers(
+        name = unbound_generated_headers,
+        family_content_id = "",
+        tags = fixture_tags,
+    )
+    unbound_header_index = name + "_unbound_header_index"
+    linux_compile_environment_index(
+        name = unbound_header_index,
+        compile_environments = {
+            environment_id: json.encode({
+                "abi": "x86_64-linux-gnu",
+                "config_payload": payload_id,
+                "generated_header_families": [header_family_id],
+            }),
+        },
+        config_payloads = {
+            payload_id: "CONFIG_TEST=y\n",
+        },
+        expected_abi = "x86_64-linux-gnu",
+        generated_headers = [":" + unbound_generated_headers],
+        tags = fixture_tags,
+    )
+    precise_generated_headers = name + "_precise_generated_headers"
+    _fake_generated_headers(
+        name = precise_generated_headers,
+        family_content_id = precise_header_family_id,
+        family_name = "static",
+        tags = fixture_tags,
+    )
+    mixed_header_family_index = name + "_mixed_header_family_index"
+    linux_compile_environment_index(
+        name = mixed_header_family_index,
+        compile_environments = {
+            environment_id: json.encode({
+                "abi": "x86_64-linux-gnu",
+                "config_payload": payload_id,
+                "generated_header_families": [
+                    header_family_id,
+                    precise_header_family_id,
+                ],
+            }),
+        },
+        config_payloads = {
+            payload_id: "CONFIG_TEST=y\n",
+        },
+        expected_abi = "x86_64-linux-gnu",
+        generated_headers = [
+            ":" + generated_headers,
+            ":" + precise_generated_headers,
+        ],
+        tags = fixture_tags,
+    )
+    second_precise_generated_headers = name + "_second_precise_generated_headers"
+    _fake_generated_headers(
+        name = second_precise_generated_headers,
+        family_content_id = second_precise_header_family_id,
+        family_name = "asm_offsets",
+        tags = fixture_tags,
+    )
+    precise_header_family_index = name + "_precise_header_family_index"
+    linux_compile_environment_index(
+        name = precise_header_family_index,
+        compile_environments = {
+            precise_environment_id: json.encode({
+                "abi": "x86_64-linux-gnu",
+                "config_payload": payload_id,
+                "generated_header_families": [
+                    precise_header_family_id,
+                    second_precise_header_family_id,
+                ],
+            }),
+        },
+        config_payloads = {
+            payload_id: "CONFIG_TEST=y\n",
+        },
+        expected_abi = "x86_64-linux-gnu",
+        generated_headers = [
+            ":" + precise_generated_headers,
+            ":" + second_precise_generated_headers,
+        ],
+        tags = fixture_tags,
+    )
+    source_tree = name + "_source_tree"
+    linux_source_tree(
+        name = source_tree,
+        root = "linux_modules_test_fixture.rs",
+        tags = fixture_tags,
+    )
+    source_input_index = name + "_source_input_index"
+    linux_source_input_index(
+        name = source_input_index,
+        groups = ["1,2,3,4"],
+        srcs = [
+            "include/linux/compiler-version.h",
+            "include/linux/compiler_types.h",
+            "include/linux/kconfig.h",
+            "linux_objects_test_fixture.c",
+        ],
+        source_tree_info = ":" + source_tree,
+        tags = fixture_tags,
+    )
+    assembly_source_input_index = name + "_assembly_source_input_index"
+    linux_source_input_index(
+        name = assembly_source_input_index,
+        groups = ["1", "2"],
+        srcs = [
+            # keep
+            "lib/crypto/x86/blake2s.h",
+            "lib/crypto/x86/blake2s-core.S",
+        ],
+        source_tree_info = ":" + source_tree,
+        tags = fixture_tags,
+    )
+    indexed_assembly_object = name + "_indexed_assembly_object"
+    linux_object(
+        name = indexed_assembly_object,
+        compile_environment_id = environment_id,
+        compile_environment_index = ":" + compile_environment_index,
+        content_id = object_c_id,
+        mode = "y",
+        object = "lib/crypto/x86/blake2s-core.o",
+        source_input_file = 1,
+        source_input_group = 1,
+        source_input_index = ":" + assembly_source_input_index,
+        tags = fixture_tags,
+    )
+    indexed_assembly_object_test = indexed_assembly_object + "_test"
+    _indexed_assembly_source_test(
+        name = indexed_assembly_object_test,
+        target_under_test = ":" + indexed_assembly_object,
+    )
+    nvhe_source_inputs = name + "_nvhe_source_inputs"
+    _fake_nvhe_source_inputs(
+        name = nvhe_source_inputs,
+        tags = fixture_tags,
+    )
+    nvhe_source_input_index = name + "_nvhe_source_input_index"
+    linux_source_input_index(
+        name = nvhe_source_input_index,
+        groups = ["1,2,3"],
+        srcs = [":" + nvhe_source_inputs],
+        source_tree_info = ":" + nvhe_source_inputs,
+        tags = fixture_tags,
+    )
+    vdso32_source_inputs = name + "_vdso32_source_inputs"
+    _fake_vdso32_source_inputs(
+        name = vdso32_source_inputs,
+        tags = fixture_tags,
+    )
+    vdso32_source_input_index = name + "_vdso32_source_input_index"
+    linux_source_input_index(
+        name = vdso32_source_input_index,
+        groups = ["1,2,3,4,5,6,7,8"],
+        srcs = [":" + vdso32_source_inputs],
+        source_tree_info = ":" + vdso32_source_inputs,
+        tags = fixture_tags,
+    )
+    duplicate_source_group_index = name + "_duplicate_source_group_index"
+    linux_source_input_index(
+        name = duplicate_source_group_index,
+        groups = ["1", "1"],
+        srcs = ["linux_objects_test_fixture.c"],
+        source_tree_info = ":" + source_tree,
+        tags = fixture_tags,
+    )
+    out_of_range_source_file_index = name + "_out_of_range_source_file_index"
+    linux_source_input_index(
+        name = out_of_range_source_file_index,
+        groups = ["2"],
+        srcs = ["linux_objects_test_fixture.c"],
+        source_tree_info = ":" + source_tree,
+        tags = fixture_tags,
+    )
+    indexed_object = name + "_indexed_object"
+    linux_object(
+        name = indexed_object,
+        compile_environment_id = environment_id,
+        compile_environment_index = ":" + compile_environment_index,
+        content_id = object_a_id,
+        mode = "y",
+        object = "indexed.o",
+        source_input_file = 4,
+        source_input_group = 1,
+        source_input_index = ":" + source_input_index,
+        tags = fixture_tags,
+    )
+    indexed_object_test = indexed_object + "_test"
+    _content_addressed_object_test(
+        name = indexed_object_test,
+        expected_content_id = object_a_id,
+        expected_generated_headers = [generated_headers + ".h"],
+        expected_payload_id = payload_id,
+        target_under_test = ":" + indexed_object,
+        unexpected_generated_headers = [duplicate_generated_headers + ".h"],
+        unexpected_input = "linux_modules_test_fixture.rs",
+    )
+    precise_family_object = name + "_precise_family_object"
+    linux_object(
+        name = precise_family_object,
+        compile_environment_id = precise_environment_id,
+        compile_environment_index = ":" + precise_header_family_index,
+        content_id = object_b_id,
+        mode = "y",
+        object = "precise-family.o",
+        source_input_file = 4,
+        source_input_group = 1,
+        source_input_index = ":" + source_input_index,
+        tags = fixture_tags,
+    )
+    precise_family_object_test = precise_family_object + "_test"
+    _content_addressed_object_test(
+        name = precise_family_object_test,
+        expected_content_id = object_b_id,
+        expected_generated_headers = [
+            precise_generated_headers + ".h",
+            second_precise_generated_headers + ".h",
+        ],
+        expected_payload_id = payload_id,
+        target_under_test = ":" + precise_family_object,
+        unexpected_generated_headers = [generated_headers + ".h"],
+        unexpected_input = "linux_modules_test_fixture.rs",
+    )
+
+    empty_compile_environment_index = name + "_empty_compile_environment_index"
+    _fake_compile_environment_index(
+        name = empty_compile_environment_index,
+        tags = fixture_tags,
+    )
+    invalid_environment_object = name + "_invalid_environment_object"
+    linux_object(
+        name = invalid_environment_object,
+        compile_environment_id = "not-a-sha256",
+        compile_environment_index = ":" + empty_compile_environment_index,
+        content_id = object_a_id,
+        mode = "y",
+        object = "invalid-environment.o",
+        source_input_file = 4,
+        source_input_group = 1,
+        source_input_index = ":" + source_input_index,
+        tags = fixture_tags,
+    )
+    out_of_range_primary_source_object = name + "_out_of_range_primary_source_object"
+    linux_object(
+        name = out_of_range_primary_source_object,
+        compile_environment_id = environment_id,
+        compile_environment_index = ":" + compile_environment_index,
+        content_id = object_c_id,
+        mode = "y",
+        object = "out-of-range-primary-source.o",
+        source_input_file = 5,
+        source_input_group = 1,
+        source_input_index = ":" + source_input_index,
+        tags = fixture_tags,
+    )
+    empty_source_inputs_nvhe = name + "_empty_source_inputs_nvhe"
+    linux_arm64_nvhe_object(
+        name = empty_source_inputs_nvhe,
+        compile_environment_id = environment_id,
+        compile_environment_index = ":" + compile_environment_index,
+        content_id = object_b_id,
+        mode = "y",
+        object = "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o",
+        objects = [":" + name + "_object_a"],
+        source_input_group = 2,
+        source_input_index = ":" + nvhe_source_input_index,
+        tags = fixture_tags,
+    )
+    mismatched_abi_index = name + "_mismatched_abi_index"
+    linux_compile_environment_index(
+        name = mismatched_abi_index,
+        compile_environments = {
+            environment_id: json.encode({
+                "abi": "actual-abi",
+                "config_payload": payload_id,
+                "generated_header_families": [],
+            }),
+        },
+        config_payloads = {
+            payload_id: "CONFIG_TEST=y\n",
+        },
+        expected_abi = "expected-abi",
+        tags = fixture_tags,
+    )
+    equivalent_config = name + "_equivalent_config"
+    linux_config(
+        name = equivalent_config,
+        config_flags = {
+            "CONFIG_TEST": "y",
+        },
+        tags = fixture_tags,
+    )
     failure_cases = [
         (empty_image, "requires at least one compiled object"),
         (certificate_object, "hermetic certificate embedding and signing are not implemented"),
+        (duplicate_source_group_index, "duplicate or non-canonical group"),
+        (empty_source_inputs_nvhe, "source_input_group 2 is out of range"),
+        (invalid_environment_object, "must be a full lowercase SHA-256 content ID"),
+        (mismatched_abi_index, "does not match expected_abi"),
+        (mixed_header_family_index, "mixes all with precise generated-header families"),
+        (out_of_range_primary_source_object, "source_input_file 5 is out of range"),
+        (out_of_range_source_file_index, "file index 2 is out of range"),
+        (unbound_header_index, "family all content ID must be a full lowercase SHA-256 content ID"),
     ]
-    tests = []
+    tests = [
+        ":" + indexed_assembly_object_test,
+        ":" + indexed_object_test,
+        ":" + precise_family_object_test,
+    ]
+
+    base_header_family_ids = {
+        "all": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "asm_offsets": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "bounds": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "compile": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "cpufeatures": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "kvm_offsets": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "rq_offsets": "0000000000000000000000000000000000000000000000000000000000000000",
+        "static": "1111111111111111111111111111111111111111111111111111111111111111",
+        "timeconst": "2222222222222222222222222222222222222222222222222222222222222222",
+        "utsrelease": "3333333333333333333333333333333333333333333333333333333333333333",
+        "utsversion": "4444444444444444444444444444444444444444444444444444444444444444",
+        "version": "5555555555555555555555555555555555555555555555555555555555555555",
+    }
+    variant_header_family_ids = dict(base_header_family_ids)
+    variant_header_family_ids.update({
+        "all": "6666666666666666666666666666666666666666666666666666666666666666",
+        "kvm_offsets": "7777777777777777777777777777777777777777777777777777777777777777",
+    })
+    header_family_dependency_ids = {
+        "asm_offsets:bounds": base_header_family_ids["bounds"],
+        "bounds:cpufeatures": base_header_family_ids["cpufeatures"],
+        "kvm_offsets:asm_offsets": base_header_family_ids["asm_offsets"],
+        "kvm_offsets:utsrelease": base_header_family_ids["utsrelease"],
+        "rq_offsets:asm_offsets": base_header_family_ids["asm_offsets"],
+        "rq_offsets:timeconst": base_header_family_ids["timeconst"],
+    }
+    non_earlier_header_dependency = name + "_non_earlier_header_dependency"
+    _x86_generated_headers_fixture(
+        name = non_earlier_header_dependency,
+        config = ":" + equivalent_config,
+        family_content_ids = base_header_family_ids,
+        family_dependency_ids = {
+            "bounds:kvm_offsets": base_header_family_ids["kvm_offsets"],
+        },
+        reusable_generated_headers = [],
+        tags = fixture_tags,
+    )
+    mismatched_header_dependency_id = name + "_mismatched_header_dependency_id"
+    _x86_generated_headers_fixture(
+        name = mismatched_header_dependency_id,
+        config = ":" + equivalent_config,
+        family_content_ids = base_header_family_ids,
+        family_dependency_ids = {
+            "kvm_offsets:asm_offsets": base_header_family_ids["bounds"],
+        },
+        reusable_generated_headers = [],
+        tags = fixture_tags,
+    )
+    failure_cases.extend([
+        (non_earlier_header_dependency, "depends on non-earlier family kvm_offsets"),
+        (mismatched_header_dependency_id, "content ID does not match selected family"),
+    ])
+    missing_header_family_ids = name + "_missing_header_family_ids"
+    _x86_generated_headers_fixture(
+        name = missing_header_family_ids,
+        config = ":" + equivalent_config,
+        family_content_ids = {},
+        family_dependency_ids = {},
+        reusable_generated_headers = [],
+        tags = fixture_tags,
+    )
+    failure_cases.append(
+        (missing_header_family_ids, "family_content_ids has families [], expected"),
+    )
+    base_generated_header_producer = name + "_base_generated_header_producer"
+    _x86_generated_headers_fixture(
+        name = base_generated_header_producer,
+        config = ":" + equivalent_config,
+        family_content_ids = base_header_family_ids,
+        family_dependency_ids = header_family_dependency_ids,
+        reusable_generated_headers = [],
+        tags = fixture_tags,
+    )
+    variant_generated_header_producer = name + "_variant_generated_header_producer"
+    _x86_generated_headers_fixture(
+        name = variant_generated_header_producer,
+        config = ":" + equivalent_config,
+        family_content_ids = variant_header_family_ids,
+        family_dependency_ids = header_family_dependency_ids,
+        reusable_generated_headers = [":" + base_generated_header_producer],
+        tags = fixture_tags,
+    )
+    later_generated_header_producer = name + "_later_generated_header_producer"
+    _x86_generated_headers_fixture(
+        name = later_generated_header_producer,
+        config = ":" + equivalent_config,
+        family_content_ids = base_header_family_ids,
+        family_dependency_ids = header_family_dependency_ids,
+        reusable_generated_headers = [],
+        tags = fixture_tags,
+    )
+    earliest_reuse_generated_header_producer = name + "_earliest_reuse_generated_header_producer"
+    _x86_generated_headers_fixture(
+        name = earliest_reuse_generated_header_producer,
+        config = ":" + equivalent_config,
+        family_content_ids = base_header_family_ids,
+        family_dependency_ids = header_family_dependency_ids,
+        reusable_generated_headers = [
+            ":" + base_generated_header_producer,
+            ":" + later_generated_header_producer,
+        ],
+        tags = fixture_tags,
+    )
+    generated_header_layout_test = base_generated_header_producer + "_test"
+    _generated_header_family_layout_test(
+        name = generated_header_layout_test,
+        target_under_test = ":" + base_generated_header_producer,
+    )
+    generated_header_reuse_test = variant_generated_header_producer + "_test"
+    _generated_header_family_reuse_test(
+        name = generated_header_reuse_test,
+        base_generated_headers = ":" + base_generated_header_producer,
+        target_under_test = ":" + variant_generated_header_producer,
+    )
+    generated_header_earliest_reuse_test = earliest_reuse_generated_header_producer + "_test"
+    _generated_header_earliest_reuse_test(
+        name = generated_header_earliest_reuse_test,
+        earliest_generated_headers = ":" + base_generated_header_producer,
+        later_generated_headers = ":" + later_generated_header_producer,
+        target_under_test = ":" + earliest_reuse_generated_header_producer,
+    )
+    tests.extend([
+        ":" + generated_header_earliest_reuse_test,
+        ":" + generated_header_layout_test,
+        ":" + generated_header_reuse_test,
+    ])
     for target, expected_error in failure_cases:
         test_name = target + "_test"
         _failure_test(
@@ -91,6 +1172,280 @@ def linux_objects_fail_closed_test_suite(name):
             target_under_test = ":" + target,
         )
         tests.append(":" + test_name)
+
+    object_targets = {}
+    for suffix, content_id, mode in [
+        ("a", object_a_id, "y"),
+        ("b", object_b_id, "y"),
+        ("c", object_c_id, "y"),
+        ("m", module_m_id, "m"),
+        ("n", module_n_id, "m"),
+    ]:
+        target = name + "_object_" + suffix
+        _fake_linux_object(
+            name = target,
+            content_id = content_id,
+            mode = mode,
+            object = suffix + ".o",
+            tags = fixture_tags,
+        )
+        object_targets[suffix] = ":" + target
+
+    exact_nvhe = name + "_exact_nvhe"
+    linux_arm64_nvhe_object(
+        name = exact_nvhe,
+        compile_environment_id = environment_id,
+        compile_environment_index = ":" + compile_environment_index,
+        content_id = object_c_id,
+        mode = "y",
+        object = "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o",
+        objects = [object_targets["a"]],
+        source_input_group = 1,
+        source_input_index = ":" + nvhe_source_input_index,
+        tags = fixture_tags,
+    )
+    exact_nvhe_test = exact_nvhe + "_test"
+    _exact_nvhe_source_lookup_test(
+        name = exact_nvhe_test,
+        target_under_test = ":" + exact_nvhe,
+    )
+    tests.append(":" + exact_nvhe_test)
+
+    exact_vdso32 = name + "_exact_vdso32"
+    linux_object(
+        name = exact_vdso32,
+        compile_environment_id = arm64_environment_id,
+        compile_environment_index = ":" + arm64_compile_environment_index,
+        content_id = vdso32_object_id,
+        mode = "y",
+        object = "arch/arm64/kernel/vdso32-wrap.o",
+        source_input_file = 1,
+        source_input_group = 1,
+        source_input_index = ":" + vdso32_source_input_index,
+        tags = fixture_tags,
+    )
+    exact_vdso32_test = exact_vdso32 + "_test"
+    _exact_vdso32_source_inputs_test(
+        name = exact_vdso32_test,
+        target_under_test = ":" + exact_vdso32,
+    )
+    tests.append(":" + exact_vdso32_test)
+
+    compact_base = name + "_compact_base"
+    linux_compact_image(
+        name = compact_base,
+        module_objects = [
+            object_targets["m"],
+            object_targets["n"],
+        ],
+        objects = [
+            object_targets["a"],
+            object_targets["b"],
+        ],
+        tags = fixture_tags,
+    )
+    invalid_compact_base = name + "_invalid_compact_base_mode"
+    linux_compact_image(
+        name = invalid_compact_base,
+        objects = [object_targets["m"]],
+        tags = fixture_tags,
+    )
+    invalid_compact_base_test = invalid_compact_base + "_test"
+    _failure_test(
+        name = invalid_compact_base_test,
+        expected_error = "has mode \"m\", want \"y\"",
+        target_under_test = ":" + invalid_compact_base,
+    )
+    tests.append(":" + invalid_compact_base_test)
+
+    compact_delta = name + "_compact_delta"
+    linux_compact_delta_image(
+        name = compact_delta,
+        add_objects = [
+            object_targets["c"],
+        ],
+        base_image = ":" + compact_base,
+        ordered_content_ids = [
+            object_c_id,
+            object_a_id,
+        ],
+        ordered_module_content_ids = [
+            module_n_id,
+            module_m_id,
+        ],
+        remove_content_ids = [
+            object_b_id,
+        ],
+        tags = fixture_tags,
+    )
+    compact_delta_test = compact_delta + "_test"
+    _delta_order_test(
+        name = compact_delta_test,
+        expected_modules = [
+            module_n_id,
+            module_m_id,
+        ],
+        expected_objects = [
+            object_c_id,
+            object_a_id,
+        ],
+        target_under_test = ":" + compact_delta,
+    )
+    tests.append(":" + compact_delta_test)
+
+    compact_full = name + "_compact_full"
+    linux_compact_image(
+        name = compact_full,
+        module_objects = [
+            object_targets["n"],
+            object_targets["m"],
+        ],
+        objects = [
+            object_targets["c"],
+            object_targets["a"],
+        ],
+        tags = fixture_tags,
+    )
+    compact_delta_archive_test = compact_delta + "_archive_test"
+    diff_test(
+        name = compact_delta_archive_test,
+        file1 = ":" + compact_delta,
+        file2 = ":" + compact_full,
+    )
+    tests.append(":" + compact_delta_archive_test)
+
+    duplicate_base_object = name + "_duplicate_base_object"
+    _fake_linux_object(
+        name = duplicate_base_object,
+        content_id = object_a_id,
+        mode = "y",
+        object = "duplicate-a.o",
+        tags = fixture_tags,
+    )
+    readded_base_delta = name + "_readded_base_delta"
+    linux_compact_delta_image(
+        name = readded_base_delta,
+        add_objects = [":" + duplicate_base_object],
+        base_image = ":" + compact_base,
+        ordered_content_ids = [
+            object_a_id,
+            object_b_id,
+        ],
+        ordered_module_content_ids = [
+            module_m_id,
+            module_n_id,
+        ],
+        remove_content_ids = [object_a_id],
+        tags = fixture_tags,
+    )
+    readded_base_delta_test = readded_base_delta + "_test"
+    _failure_test(
+        name = readded_base_delta_test,
+        expected_error = "re-adds base content ID",
+        target_under_test = ":" + readded_base_delta,
+    )
+    tests.append(":" + readded_base_delta_test)
+
+    invalid_delta = name + "_invalid_delta_order"
+    linux_compact_delta_image(
+        name = invalid_delta,
+        base_image = ":" + compact_base,
+        ordered_content_ids = [object_a_id],
+        ordered_module_content_ids = [
+            module_m_id,
+            module_n_id,
+        ],
+        tags = fixture_tags,
+    )
+    invalid_delta_test = invalid_delta + "_test"
+    _failure_test(
+        name = invalid_delta_test,
+        expected_error = "omits built-in content ID(s)",
+        target_under_test = ":" + invalid_delta,
+    )
+    tests.append(":" + invalid_delta_test)
+
+    duplicate_module_order = name + "_duplicate_module_order"
+    linux_compact_delta_image(
+        name = duplicate_module_order,
+        base_image = ":" + compact_base,
+        ordered_content_ids = [
+            object_a_id,
+            object_b_id,
+        ],
+        ordered_module_content_ids = [
+            module_m_id,
+            module_m_id,
+            module_n_id,
+        ],
+        tags = fixture_tags,
+    )
+    duplicate_module_order_test = duplicate_module_order + "_test"
+    _failure_test(
+        name = duplicate_module_order_test,
+        expected_error = "repeats ordered module content ID",
+        target_under_test = ":" + duplicate_module_order,
+    )
+    tests.append(":" + duplicate_module_order_test)
+
+    unknown_module_order = name + "_unknown_module_order"
+    linux_compact_delta_image(
+        name = unknown_module_order,
+        base_image = ":" + compact_base,
+        ordered_content_ids = [
+            object_a_id,
+            object_b_id,
+        ],
+        ordered_module_content_ids = [
+            module_m_id,
+            module_n_id,
+            unknown_module_id,
+        ],
+        tags = fixture_tags,
+    )
+    unknown_module_order_test = unknown_module_order + "_test"
+    _failure_test(
+        name = unknown_module_order_test,
+        expected_error = "orders unknown module content ID",
+        target_under_test = ":" + unknown_module_order,
+    )
+    tests.append(":" + unknown_module_order_test)
+
+    omitted_module_order = name + "_omitted_module_order"
+    linux_compact_delta_image(
+        name = omitted_module_order,
+        base_image = ":" + compact_base,
+        ordered_content_ids = [
+            object_a_id,
+            object_b_id,
+        ],
+        ordered_module_content_ids = [module_m_id],
+        tags = fixture_tags,
+    )
+    omitted_module_order_test = omitted_module_order + "_test"
+    _failure_test(
+        name = omitted_module_order_test,
+        expected_error = "omits module content ID(s)",
+        target_under_test = ":" + omitted_module_order,
+    )
+    tests.append(":" + omitted_module_order_test)
+
+    cache_shape = name + "_cache_shape"
+    linux_cache_shape_check(
+        name = cache_shape,
+        images = [
+            ":" + compact_base,
+            ":" + compact_delta,
+        ],
+        shared_objects = ["a.o"],
+        tags = fixture_tags,
+    )
+    cache_shape_test = cache_shape + "_test"
+    _cache_shape_test(
+        name = cache_shape_test,
+        target_under_test = ":" + cache_shape,
+    )
+    tests.append(":" + cache_shape_test)
 
     real_arm64_image = name + "_real_arm64_image"
     linux_compressed_image(

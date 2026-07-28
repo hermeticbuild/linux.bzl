@@ -34,6 +34,17 @@ alias(
     actual = "@example_x86_64//variants/lz4:kernel",
 )
 
+genrule(
+    name = "x86_64_shared_graph_metadata",
+    srcs = ["@example_x86_64//graph:metadata.json"],
+    outs = ["x86_64_shared_graph_metadata.json"],
+    cmd = "cp $(location @example_x86_64//graph:metadata.json) $@",
+    tags = [
+        "local",
+        "manual",
+    ],
+)
+
 alias(
     name = "aarch64_kernel",
     actual = "@example_aarch64//:kernel",

@@ -24,15 +24,16 @@ if [[ ! -s "${bep}" ]]; then
   exit 0
 fi
 
-metrics="$(
+build_metrics="$(
   jq -c \
-    'select(.buildMetrics.actionSummary != null) | .buildMetrics.actionSummary' \
+    'select(.buildMetrics != null) | .buildMetrics' \
     "${bep}" 2>/dev/null | tail -n 1 || true
 )"
-if [[ -z "${metrics}" ]]; then
+if [[ -z "${build_metrics}" ]]; then
   write_missing_metrics
   exit 0
 fi
+metrics="$(jq -c '.actionSummary // {}' <<<"${build_metrics}")"
 
 values="$(
   jq -r '
@@ -55,6 +56,20 @@ values="$(
   ' <<<"${metrics}"
 )"
 IFS=$'\t' read -r local_hits local_misses shared_hits actions_created actions_executed <<<"${values}"
+
+analysis_values="$(
+  jq -r '
+    def integer: (. // 0) | tonumber;
+    [
+      (.timingMetrics.analysisPhaseTimeInMs | integer),
+      (.targetMetrics.targetsConfigured | integer),
+      (.packageMetrics.packagesLoaded | integer),
+      (.memoryMetrics.peakPostGcHeapSize | integer)
+    ]
+    | @tsv
+  ' <<<"${build_metrics}"
+)"
+IFS=$'\t' read -r analysis_ms targets_configured packages_loaded peak_heap_bytes <<<"${analysis_values}"
 
 cache_lookups=$((local_hits + local_misses))
 effective_hits=$((local_hits + shared_hits))
@@ -84,13 +99,55 @@ miss_reasons="$(
 )"
 runner_summary="$(
   jq -r '
-    [.runnerCount[]? | "\(.name): \(.count)"]
+    [.runnerCount[]? | select(.count != null) | "\(.name): \(.count)"]
     | join(", ")
   ' <<<"${metrics}"
 )"
 process_summary="$(
   grep -E '^INFO: .* processes:' "${log}" 2>/dev/null | tail -n 1 || true
 )"
+profile_values=""
+if [[ -s "${profile}" ]]; then
+  profile_values="$(
+    gzip -cd "${profile}" 2>/dev/null |
+      jq -r '
+        [
+          ([.traceEvents[]?
+            | select(
+                .cat == "Fetching repository"
+                and ((.name // "") | contains("linux_image"))
+              )
+            | {
+                name: .name,
+                duration: (.dur // 0)
+              }]
+            | group_by(.name)
+            | map([.[].duration] | max)
+            | add // 0),
+          ([.traceEvents[]?
+            | select(.name == "Memory usage (Bazel)")
+            | (.args.memory // 0)] | max // 0 | floor),
+          ([.traceEvents[]?
+            | select(.name == "_linux_object_impl")] | length),
+          ([.traceEvents[]?
+            | select(.name == "_linux_object_impl")
+            | (.dur // 0)] | add // 0)
+        ]
+        | @tsv
+      ' 2>/dev/null || true
+  )"
+fi
+linux_image_fetch_us=0
+profile_peak_memory_mib=0
+linux_object_analyses=0
+linux_object_analysis_us=0
+if [[ -n "${profile_values}" ]]; then
+  IFS=$'\t' read -r \
+    linux_image_fetch_us \
+    profile_peak_memory_mib \
+    linux_object_analyses \
+    linux_object_analysis_us <<<"${profile_values}"
+fi
 disk_cache_size="$(
   du -sh "${HOME}/.cache/bazel-disk" 2>/dev/null | awk '{ print $1 }' || true
 )"
@@ -110,6 +167,34 @@ disk_available="$(
   printf '| Effective action-cache hit rate | %s |\n' "${hit_rate}"
   printf '| Actions created | %s |\n' "${actions_created}"
   printf '| Actions executed | %s |\n' "${actions_executed}"
+  if ((analysis_ms > 0)); then
+    printf '| Analysis phase | %d.%03d s |\n' \
+      "$((analysis_ms / 1000))" "$((analysis_ms % 1000))"
+  fi
+  if ((targets_configured > 0)); then
+    printf '| Targets configured | %s |\n' "${targets_configured}"
+  fi
+  if ((packages_loaded > 0)); then
+    printf '| Packages loaded | %s |\n' "${packages_loaded}"
+  fi
+  if ((peak_heap_bytes > 0)); then
+    peak_heap_tenths=$((peak_heap_bytes * 10 / 1048576))
+    printf '| Peak post-GC heap | %d.%d MiB |\n' \
+      "$((peak_heap_tenths / 10))" "$((peak_heap_tenths % 10))"
+  fi
+  if ((profile_peak_memory_mib > 0)); then
+    printf '| Peak Bazel memory (profile) | %s MiB |\n' "${profile_peak_memory_mib}"
+  fi
+  if ((linux_object_analyses > 0)); then
+    printf '| Linux object analysis events (profile) | %s |\n' "${linux_object_analyses}"
+    printf '| Linux object aggregate analysis duration (profile) | %d.%03d s |\n' \
+      "$((linux_object_analysis_us / 1000000))" \
+      "$((linux_object_analysis_us % 1000000 / 1000))"
+  fi
+  if ((linux_image_fetch_us > 0)); then
+    printf '| Linux image repository generation | %d.%03d s |\n' \
+      "$((linux_image_fetch_us / 1000000))" "$((linux_image_fetch_us % 1000000 / 1000))"
+  fi
   if [[ -n "${disk_cache_size}" ]]; then
     printf '| Disk cache on runner | %s |\n' "${disk_cache_size}"
   fi

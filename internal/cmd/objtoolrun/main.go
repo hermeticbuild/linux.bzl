@@ -71,7 +71,7 @@ func run(configPath, objtoolPath, inPath, outPath, mode string, configValues map
 	for key, value := range configValues {
 		config[key] = value
 	}
-	args, enabled, err := objtoolArgsWithOptions(config, mode, force, extraArgs)
+	args, enabled, err := objtoolArgs(config, mode, force, extraArgs)
 	if err != nil {
 		return err
 	}
@@ -116,11 +116,7 @@ func readConfig(path string) (map[string]string, error) {
 	return config, scanner.Err()
 }
 
-func objtoolArgs(config map[string]string, mode string) ([]string, bool, error) {
-	return objtoolArgsWithOptions(config, mode, false, nil)
-}
-
-func objtoolArgsWithOptions(config map[string]string, mode string, force bool, extraArgs []string) ([]string, bool, error) {
+func objtoolArgs(config map[string]string, mode string, force bool, extraArgs []string) ([]string, bool, error) {
 	if !enabled(config, "CONFIG_OBJTOOL") {
 		return nil, false, nil
 	}

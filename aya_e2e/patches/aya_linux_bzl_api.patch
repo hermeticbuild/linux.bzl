@@ -20,21 +20,18 @@ index 2ae24cdd7eb524b18cbc37067f510b46e31adcd1..91c57fe5f4d2f8e3a22750153ee9b1bb
  
  # with_cfg.bzl applies the BPF target settings to Rust and C BPF targets.
  bazel_dep(name = "with_cfg.bzl", version = "0.14.6")
-@@ -33,12 +33,12 @@ bazel_lib_toolchains = use_extension("@bazel_lib//lib:extensions.bzl", "toolchai
+@@ -33,12 +33,6 @@ bazel_lib_toolchains = use_extension("@bazel_lib//lib:extensions.bzl", "toolchai
  bazel_lib_toolchains.copy_to_directory()
  use_repo(bazel_lib_toolchains, "copy_to_directory_toolchains")
  
 -# Pin the linux.bzl revision that provides the deterministic C initramfs rule.
-+# Pin the unpublished linux.bzl Rust-for-Linux toolchain revision.
- archive_override(
-     module_name = "linux.bzl",
+-archive_override(
+-    module_name = "linux.bzl",
 -    integrity = "sha256-2gveHVEG4EE5x3N4kDnUftB7ed/6RRFslFwDquObqRg=",
 -    strip_prefix = "linux.bzl-e18628f3e177022c2ff0cf93a2e5f2d408f7d2fc",
 -    urls = ["https://github.com/hermeticbuild/linux.bzl/archive/e18628f3e177022c2ff0cf93a2e5f2d408f7d2fc.tar.gz"],
-+    integrity = "sha256-/gzHJkSPNohRDCXyW4RB9Za+9xHDOn0DAlfBA5Z3G+A=",
-+    strip_prefix = "linux.bzl-d9202221f4d59678bea3114d7383a147a732d624",
-+    urls = ["https://github.com/hermeticbuild/linux.bzl/archive/d9202221f4d59678bea3114d7383a147a732d624.tar.gz"],
- )
+-)
++# The consuming root selects linux.bzl; dependency modules do not own overrides.
  
  # @rules_rs creates @rules_rust here; generated BUILD files and .bazelrc labels
 @@ -125,55 +125,36 @@ use_repo(crate, "crates")

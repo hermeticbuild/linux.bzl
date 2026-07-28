@@ -266,6 +266,7 @@ def _rust_config_fixture_impl(ctx):
             include_dir = include_dir,
             include_dir_anchor = directory_anchor(autoconf_h, include_dir),
             kernel_release = kernel_release,
+            kernel_version = "6.18.2",
             rustc_cfg = rustc_cfg,
             rustc_probe = rustc_probe,
         ),
@@ -279,6 +280,7 @@ def _rust_generated_headers_fixture_impl(ctx):
         LinuxGeneratedHeadersInfo(
             arch = ctx.attr.arch,
             cflags = None,
+            families = {},
             files = depset(),
             include_dirs = [],
             include_dir_anchors = {},
@@ -710,23 +712,51 @@ def _repository_protocol_test_impl(ctx):
         rust_profile_json = _LEGACY_PROFILE_JSON,
         platform = "@@llvm//platforms:linux_x86_64",
         base_config = "//configs:x86_64",
+        base_header_family_dependencies = {"all": {}},
+        base_header_family_ids = {
+            "all": "1111111111111111111111111111111111111111111111111111111111111111",
+        },
         base_rust_enabled = False,
         config_mode = "default",
-        graph_image = "//graph/base:x86_64_image",
+        graph_image = "//graph:x86_64_image",
         variant_configs = {"rust": "//configs:rust"},
-        variant_graph_images = {"rust": "//graph/rust:rust_image"},
+        variant_core_configs = {"rust": "rust"},
+        variant_graph_images = {"rust": "//graph:rust_image"},
+        variant_header_family_dependencies = {"rust": {"all": {}}},
+        variant_header_family_ids = {
+            "rust": {
+                "all": "2222222222222222222222222222222222222222222222222222222222222222",
+            },
+        },
+        variant_header_configs = {"rust": "rust"},
         variant_rust_enabled = {"rust": True},
         rules_repo = "@@linux_bzl",
     )
 
     asserts.equals(
         env,
-        "compact-v3-rust-profile",
+        "compact-v6-content-graph",
         repositories_test_helpers.generator_protocol,
     )
     asserts.true(env, "rust_profile_json = " in generated)
     asserts.true(env, 'minimum_rustc_version = "1.78.0",' in generated)
     asserts.true(env, "base_rust_enabled = False," in generated)
+    asserts.true(
+        env,
+        'base_header_family_dependencies = {\n        "all": {},\n    },' in generated,
+    )
+    asserts.true(
+        env,
+        'base_header_family_ids = {\n        "all": "1111111111111111111111111111111111111111111111111111111111111111",\n    },' in generated,
+    )
+    asserts.true(
+        env,
+        'variant_header_family_dependencies = {\n        "rust": {\n            "all": {},\n        },\n    },' in generated,
+    )
+    asserts.true(
+        env,
+        'variant_header_family_ids = {\n        "rust": {\n            "all": "2222222222222222222222222222222222222222222222222222222222222222",\n        },\n    },' in generated,
+    )
     asserts.true(
         env,
         'variant_rust_enabled = {\n        "rust": True,\n    },' in generated,

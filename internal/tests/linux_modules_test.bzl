@@ -171,14 +171,12 @@ def _module_root_objtool_policy_test_impl(ctx):
     ibt = struct(config_flags = {"CONFIG_X86_KERNEL_IBT": "y"})
     single = struct(module_root_kind = "single")
     composite = struct(module_root_kind = "composite")
-    legacy = struct(module_root_kind = "")
 
     asserts.false(env, linux_module_actions.module_root_needs_objtool(normal, single))
     asserts.false(env, linux_module_actions.module_root_needs_objtool(lto, single))
     asserts.false(env, linux_module_actions.module_root_needs_objtool(normal, composite))
     asserts.true(env, linux_module_actions.module_root_needs_objtool(lto, composite))
     asserts.true(env, linux_module_actions.module_root_needs_objtool(ibt, composite))
-    asserts.true(env, linux_module_actions.module_root_needs_objtool(normal, legacy))
     return unittest.end(env)
 
 _module_root_objtool_policy_test = unittest.make(_module_root_objtool_policy_test_impl)

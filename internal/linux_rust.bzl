@@ -570,11 +570,10 @@ def _kernel_c_flags(ctx, config, generated_headers, cc_toolchain, feature_config
         generated_headers.include_dirs,
     ))
     values.append("-fmacro-prefix-map=%s/=" % source_root)
-    directory_anchors = {}
-    if hasattr(config, "include_dir_anchor"):
-        directory_anchors[config.include_dir] = config.include_dir_anchor
-    if hasattr(generated_headers, "include_dir_anchors"):
-        directory_anchors.update(generated_headers.include_dir_anchors)
+    directory_anchors = {
+        config.include_dir: config.include_dir_anchor,
+    }
+    directory_anchors.update(generated_headers.include_dir_anchors)
     return struct(
         directory_anchors = directory_anchors,
         mapped_files = mapped_files,

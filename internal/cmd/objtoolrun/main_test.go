@@ -1,15 +1,34 @@
 package main
 
 import (
+	_ "embed"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
+
+//go:embed main.go
+var objtoolrunSource string
+
+func TestObjtoolConfigSymbolsCoverSource(t *testing.T) {
+	declared := map[string]bool{}
+	for _, symbol := range kconfig.ObjtoolConfigSymbols() {
+		declared[symbol] = true
+	}
+	for _, symbol := range regexp.MustCompile(`CONFIG_[A-Z0-9_]+`).FindAllString(objtoolrunSource, -1) {
+		if !declared[symbol] {
+			t.Errorf("objtoolrun reads %s, but ObjtoolConfigSymbols does not declare it", symbol)
+		}
+	}
+}
 
 func TestObjtoolArgsDisabled(t *testing.T) {
 	for _, mode := range []string{"builtin", "builtin-always", "module", "module-member", "module-single", "vmlinux"} {
 		t.Run(mode, func(t *testing.T) {
-			args, run, err := objtoolArgs(map[string]string{}, mode)
+			args, run, err := objtoolArgs(map[string]string{}, mode, false, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -22,7 +41,7 @@ func TestObjtoolArgsDisabled(t *testing.T) {
 
 func TestObjtoolArgsBuiltin(t *testing.T) {
 	config := commonArgsConfig()
-	args, run, err := objtoolArgs(config, "builtin")
+	args, run, err := objtoolArgs(config, "builtin", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +54,7 @@ func TestObjtoolArgsBuiltin(t *testing.T) {
 		t.Run("delayed_by_"+delayedBy, func(t *testing.T) {
 			config := commonArgsConfig()
 			config[delayedBy] = "y"
-			args, run, err := objtoolArgs(config, "builtin")
+			args, run, err := objtoolArgs(config, "builtin", false, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -48,13 +67,13 @@ func TestObjtoolArgsBuiltin(t *testing.T) {
 	t.Run("forced_delayed_translation_unit", func(t *testing.T) {
 		config := commonArgsConfig()
 		config["CONFIG_X86_KERNEL_IBT"] = "y"
-		args, run, err := objtoolArgsWithOptions(config, "builtin", true, []string{"--noabs"})
+		args, run, err := objtoolArgs(config, "builtin", true, []string{"--noabs"})
 		if err != nil {
 			t.Fatal(err)
 		}
 		want := []string{"--noabs"}
 		if !run || !reflect.DeepEqual(args, want) {
-			t.Fatalf("objtoolArgsWithOptions() = (%q, %t), want (%q, true)", args, run, want)
+			t.Fatalf("objtoolArgs() = (%q, %t), want (%q, true)", args, run, want)
 		}
 	})
 }
@@ -72,7 +91,7 @@ func TestObjtoolArgsBuiltinAlways(t *testing.T) {
 			if tc.delayed {
 				config["CONFIG_X86_KERNEL_IBT"] = "y"
 			}
-			args, run, err := objtoolArgs(config, "builtin-always")
+			args, run, err := objtoolArgs(config, "builtin-always", false, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -100,7 +119,7 @@ func TestObjtoolArgsModule(t *testing.T) {
 			if tc.delayed {
 				config["CONFIG_X86_KERNEL_IBT"] = "y"
 			}
-			args, run, err := objtoolArgs(config, "module")
+			args, run, err := objtoolArgs(config, "module", false, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -120,7 +139,7 @@ func TestObjtoolArgsModule(t *testing.T) {
 func TestObjtoolArgsModuleMember(t *testing.T) {
 	t.Run("translation_unit", func(t *testing.T) {
 		config := commonArgsConfig()
-		args, run, err := objtoolArgs(config, "module-member")
+		args, run, err := objtoolArgs(config, "module-member", false, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -133,7 +152,7 @@ func TestObjtoolArgsModuleMember(t *testing.T) {
 	t.Run("delayed", func(t *testing.T) {
 		config := commonArgsConfig()
 		config["CONFIG_LTO_CLANG"] = "y"
-		args, run, err := objtoolArgs(config, "module-member")
+		args, run, err := objtoolArgs(config, "module-member", false, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -145,13 +164,13 @@ func TestObjtoolArgsModuleMember(t *testing.T) {
 	t.Run("forced_delayed", func(t *testing.T) {
 		config := commonArgsConfig()
 		config["CONFIG_LTO_CLANG"] = "y"
-		args, run, err := objtoolArgsWithOptions(config, "module-member", true, []string{"--custom"})
+		args, run, err := objtoolArgs(config, "module-member", true, []string{"--custom"})
 		if err != nil {
 			t.Fatal(err)
 		}
 		want := []string{"--custom", "--module"}
 		if !run || !reflect.DeepEqual(args, want) {
-			t.Fatalf("objtoolArgsWithOptions() = (%q, %t), want (%q, true)", args, run, want)
+			t.Fatalf("objtoolArgs() = (%q, %t), want (%q, true)", args, run, want)
 		}
 	})
 }
@@ -159,7 +178,7 @@ func TestObjtoolArgsModuleMember(t *testing.T) {
 func TestObjtoolArgsModuleSingleDelayed(t *testing.T) {
 	config := commonArgsConfig()
 	config["CONFIG_LTO_CLANG"] = "y"
-	args, run, err := objtoolArgs(config, "module-single")
+	args, run, err := objtoolArgs(config, "module-single", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +192,7 @@ func TestObjtoolArgsVmlinux(t *testing.T) {
 	t.Run("not_needed", func(t *testing.T) {
 		config := commonArgsConfig()
 		delete(config, "CONFIG_FTRACE_MCOUNT_USE_OBJTOOL")
-		args, run, err := objtoolArgs(config, "vmlinux")
+		args, run, err := objtoolArgs(config, "vmlinux", false, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -184,7 +203,7 @@ func TestObjtoolArgsVmlinux(t *testing.T) {
 
 	t.Run("mcount_without_delay_already_processed", func(t *testing.T) {
 		config := commonArgsConfig()
-		args, run, err := objtoolArgs(config, "vmlinux")
+		args, run, err := objtoolArgs(config, "vmlinux", false, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -197,7 +216,7 @@ func TestObjtoolArgsVmlinux(t *testing.T) {
 		config := commonArgsConfig()
 		config["CONFIG_NOINSTR_VALIDATION"] = "y"
 		config["CONFIG_MITIGATION_UNRET_ENTRY"] = "y"
-		args, run, err := objtoolArgs(config, "vmlinux")
+		args, run, err := objtoolArgs(config, "vmlinux", false, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -212,7 +231,7 @@ func TestObjtoolArgsVmlinux(t *testing.T) {
 		config["CONFIG_X86_KERNEL_IBT"] = "y"
 		config["CONFIG_NOINSTR_VALIDATION"] = "y"
 		config["CONFIG_MITIGATION_SRSO"] = "y"
-		args, run, err := objtoolArgs(config, "vmlinux")
+		args, run, err := objtoolArgs(config, "vmlinux", false, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -237,7 +256,7 @@ func TestConfigValueFlag(t *testing.T) {
 }
 
 func TestObjtoolArgsRejectsUnknownMode(t *testing.T) {
-	_, _, err := objtoolArgs(map[string]string{"CONFIG_OBJTOOL": "y"}, "invalid")
+	_, _, err := objtoolArgs(map[string]string{"CONFIG_OBJTOOL": "y"}, "invalid", false, nil)
 	if err == nil || !strings.Contains(err.Error(), `unsupported -mode "invalid"`) {
 		t.Fatalf("objtoolArgs() error = %v, want unsupported mode", err)
 	}
