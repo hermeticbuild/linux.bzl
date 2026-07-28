@@ -47,7 +47,7 @@ func TestReportSharedInputs(t *testing.T) {
 	var out bytes.Buffer
 	if err := run(&out, reportOptions{
 		inputPath: aquery,
-		mnemonic:  "LinuxObjectCompile",
+		mnemonics: []string{"LinuxObjectCompile"},
 		top:       10,
 		sharedPct: 100,
 	}); err != nil {
@@ -61,7 +61,7 @@ func TestReportSharedInputs(t *testing.T) {
 		"include/linux/kernel.h",
 		"high-fanout non-header source inputs",
 		"none",
-		"producer fanout (unique LinuxObjectCompile consumer actions; producers present in aquery)",
+		"producer fanout (unique selected consumer actions; producers present in aquery)",
 		"producer-resolved input artifacts: 0 / 3 unique inputs",
 		"hint: query deps(<target>)",
 		"largest actions by input count",
@@ -70,6 +70,186 @@ func TestReportSharedInputs(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("report missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestParseOptionsMnemonics(t *testing.T) {
+	opts, err := parseOptions(nil)
+	if err != nil {
+		t.Fatalf("parseOptions() failed: %v", err)
+	}
+	if got, want := strings.Join(opts.mnemonics, ","), "LinuxObjectCompile"; got != want {
+		t.Fatalf("default mnemonics = %q, want %q", got, want)
+	}
+
+	opts, err = parseOptions([]string{
+		"-mnemonic", "LinuxRustc",
+		"-mnemonic", "LinuxVDSOCompile",
+		"-mnemonic", "LinuxRustc",
+	})
+	if err != nil {
+		t.Fatalf("parseOptions() failed: %v", err)
+	}
+	if got, want := strings.Join(opts.mnemonics, ","), "LinuxRustc,LinuxVDSOCompile"; got != want {
+		t.Fatalf("explicit mnemonics = %q, want %q", got, want)
+	}
+
+	if _, err := parseOptions([]string{"-mnemonic", ""}); err == nil {
+		t.Fatal("parseOptions() accepted an empty mnemonic")
+	}
+}
+
+func TestReportMultipleMnemonicsUseOneActionUnion(t *testing.T) {
+	aq := &aqueryOutput{
+		Artifacts: []artifact{
+			{ID: 1, PathFragmentID: 1},
+			{ID: 2, PathFragmentID: 2},
+			{ID: 3, PathFragmentID: 3},
+			{ID: 4, PathFragmentID: 4},
+			{ID: 5, PathFragmentID: 5},
+			{ID: 6, PathFragmentID: 6},
+			{ID: 7, PathFragmentID: 7},
+		},
+		Actions: []action{
+			{
+				TargetID:        1,
+				Mnemonic:        "Generate",
+				OutputIDs:       []int{1},
+				PrimaryOutputID: 1,
+			},
+			{
+				TargetID:        2,
+				Mnemonic:        "LinuxObjectCompile",
+				InputDepSetIDs:  []int{1},
+				OutputIDs:       []int{4},
+				PrimaryOutputID: 4,
+			},
+			{
+				TargetID:        2,
+				Mnemonic:        "LinuxRustc",
+				InputDepSetIDs:  []int{2},
+				OutputIDs:       []int{5},
+				PrimaryOutputID: 5,
+			},
+			{
+				TargetID:        3,
+				Mnemonic:        "CppCompile",
+				InputDepSetIDs:  []int{3},
+				OutputIDs:       []int{7},
+				PrimaryOutputID: 7,
+			},
+		},
+		Targets: []target{
+			{ID: 1, Label: "//:generated"},
+			{ID: 2, Label: "//:kernel"},
+			{ID: 3, Label: "//:unrelated"},
+		},
+		DepSetOfFiles: []depSet{
+			{ID: 1, DirectArtifactIDs: []int{1, 2}},
+			{ID: 2, DirectArtifactIDs: []int{1, 3}},
+			{ID: 3, DirectArtifactIDs: []int{6}},
+		},
+		PathFragments: []pathFragment{
+			{ID: 1, Label: "generated.inc"},
+			{ID: 2, Label: "object-only.c"},
+			{ID: 3, Label: "rust-only.rs"},
+			{ID: 4, Label: "bazel-out/object.o"},
+			{ID: 5, Label: "bazel-out/rust.o"},
+			{ID: 6, Label: "unrelated.c"},
+			{ID: 7, Label: "bazel-out/unrelated.o"},
+		},
+	}
+	opts := reportOptions{
+		mnemonics: []string{
+			"LinuxObjectCompile",
+			"LinuxRustc",
+			"LinuxARM64VDSOCompile",
+			"LinuxObjectCompile",
+		},
+		top:       20,
+		sharedPct: 50,
+	}
+
+	got := renderReportWithOptions(t, aq, opts)
+	for _, want := range []string{
+		"mnemonics: LinuxObjectCompile, LinuxRustc, LinuxARM64VDSOCompile",
+		"actions: 2",
+		"1   50.0%  object-only.c",
+		"1   50.0%  rust-only.rs",
+		"2  Generate //:generated",
+		"LinuxObjectCompile //:kernel [primary: bazel-out/object.o]",
+		"LinuxRustc //:kernel [primary: bazel-out/rust.o]",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("report missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "unrelated.c") || strings.Contains(got, "//:unrelated") {
+		t.Fatalf("report included an action outside the selected mnemonic union:\n%s", got)
+	}
+	if count := strings.Count(got, "Generate //:generated"); count != 1 {
+		t.Fatalf("producer emitted %d rows, want 1:\n%s", count, got)
+	}
+
+	opts.sharedPct = 51
+	got = renderReportWithOptions(t, aq, opts)
+	if strings.Contains(got, "object-only.c") || strings.Contains(got, "rust-only.rs") {
+		t.Fatalf("one-of-two inputs passed a 51%% union threshold:\n%s", got)
+	}
+}
+
+func TestReportRequiresOneSelectedAction(t *testing.T) {
+	model, err := newModel(inputAquery())
+	if err != nil {
+		t.Fatalf("newModel() failed: %v", err)
+	}
+	err = writeReport(&bytes.Buffer{}, model, reportOptions{
+		mnemonics: []string{"LinuxRustc", "LinuxVDSOCompile"},
+		sharedPct: 80,
+	})
+	if err == nil || !strings.Contains(err.Error(), "LinuxRustc, LinuxVDSOCompile") {
+		t.Fatalf("writeReport() error = %v, want empty selected-union error", err)
+	}
+}
+
+func TestSourceLikeNonHeaderExtensions(t *testing.T) {
+	for _, path := range []string{
+		"source.asn1",
+		"source.c",
+		"source.c_shipped",
+		"source.cc",
+		"source.cpp",
+		"source.dts",
+		"source.dtsi",
+		"source.dtso",
+		"source.inc",
+		"source.lds",
+		"source.lds.S",
+		"source.pl",
+		"source.rs",
+		"source.s",
+		"source.S",
+	} {
+		t.Run("positive/"+path, func(t *testing.T) {
+			if !isSourceLikeNonHeader(path) {
+				t.Fatalf("isSourceLikeNonHeader(%q) = false, want true", path)
+			}
+		})
+	}
+	for _, path := range []string{
+		"Kbuild",
+		"Makefile",
+		"source.h",
+		"source.o",
+		"source.c.tmp",
+		"source.dtso.bak",
+		"source.notinc",
+	} {
+		t.Run("negative/"+path, func(t *testing.T) {
+			if isSourceLikeNonHeader(path) {
+				t.Fatalf("isSourceLikeNonHeader(%q) = true, want false", path)
+			}
+		})
 	}
 }
 
@@ -220,7 +400,7 @@ func TestMaterializedBytesDeduplicateAliases(t *testing.T) {
 		inputArtifact{path: "symlink"},
 		inputArtifact{path: "copy"},
 	), reportOptions{
-		mnemonic:  "LinuxObjectCompile",
+		mnemonics: []string{"LinuxObjectCompile"},
 		top:       10,
 		sharedPct: 100,
 		execroot:  dir,
@@ -230,7 +410,7 @@ func TestMaterializedBytesDeduplicateAliases(t *testing.T) {
 		"byte coverage: 1 / 1 actions complete; 0 distinct inputs unavailable (0 action uses)",
 		"materialized input bytes min/p50/p95/max (1 complete actions): 10 B / 10 B / 10 B / 10 B",
 		"largest complete actions by materialized input bytes:",
-		"10 B     5 inputs  //:consumer",
+		"10 B     5 inputs  LinuxObjectCompile //:consumer",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("report missing %q:\n%s", want, got)
@@ -255,7 +435,7 @@ func TestMaterializedBytesReportMissingInputs(t *testing.T) {
 	aq.Targets = append(aq.Targets, target{ID: 2, Label: "//:generator"})
 
 	got := renderReportWithOptions(t, aq, reportOptions{
-		mnemonic:  "LinuxObjectCompile",
+		mnemonics: []string{"LinuxObjectCompile"},
 		top:       10,
 		sharedPct: 100,
 		execroot:  dir,
@@ -294,7 +474,7 @@ func TestMaterializedByteStatsUseCompleteActions(t *testing.T) {
 	}
 
 	got := renderReportWithOptions(t, aq, reportOptions{
-		mnemonic:  "LinuxObjectCompile",
+		mnemonics: []string{"LinuxObjectCompile"},
 		top:       10,
 		sharedPct: 100,
 		execroot:  dir,
@@ -303,7 +483,7 @@ func TestMaterializedByteStatsUseCompleteActions(t *testing.T) {
 	for _, want := range []string{
 		"byte coverage: 1 / 2 actions complete; 1 distinct inputs unavailable (1 action uses)",
 		"materialized input bytes min/p50/p95/max (1 complete actions): 3 B / 3 B / 3 B / 3 B",
-		"3 B     1 inputs  //:complete",
+		"3 B     1 inputs  LinuxObjectCompile //:complete",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("report missing %q:\n%s", want, got)
@@ -333,7 +513,7 @@ func TestMaterializedBytesScanTreeAndDirectoryInputs(t *testing.T) {
 		inputArtifact{path: "empty-tree", tree: true},
 		inputArtifact{path: "directory"},
 	), reportOptions{
-		mnemonic:  "LinuxObjectCompile",
+		mnemonics: []string{"LinuxObjectCompile"},
 		top:       10,
 		sharedPct: 100,
 		execroot:  dir,
@@ -342,7 +522,7 @@ func TestMaterializedBytesScanTreeAndDirectoryInputs(t *testing.T) {
 	for _, want := range []string{
 		"byte coverage: 1 / 1 actions complete; 0 distinct inputs unavailable (0 action uses)",
 		"materialized input bytes min/p50/p95/max (1 complete actions): 9 B / 9 B / 9 B / 9 B",
-		"9 B     3 inputs  //:consumer",
+		"9 B     3 inputs  LinuxObjectCompile //:consumer",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("report missing %q:\n%s", want, got)
@@ -363,7 +543,7 @@ func TestMaterializedBytesReportPartialTree(t *testing.T) {
 	got := renderReportWithOptions(t, inputAquery(
 		inputArtifact{path: "tree", tree: true},
 	), reportOptions{
-		mnemonic:  "LinuxObjectCompile",
+		mnemonics: []string{"LinuxObjectCompile"},
 		top:       10,
 		sharedPct: 100,
 		execroot:  dir,
@@ -392,7 +572,7 @@ func TestMaterializedBytesReportSymlinkCycle(t *testing.T) {
 	got := renderReportWithOptions(t, inputAquery(
 		inputArtifact{path: "first"},
 	), reportOptions{
-		mnemonic:  "LinuxObjectCompile",
+		mnemonics: []string{"LinuxObjectCompile"},
 		top:       10,
 		sharedPct: 100,
 		execroot:  dir,
@@ -415,7 +595,7 @@ func TestExecrootValidation(t *testing.T) {
 				t.Fatalf("newModel() failed: %v", err)
 			}
 			err = writeReport(&bytes.Buffer{}, model, reportOptions{
-				mnemonic:  "LinuxObjectCompile",
+				mnemonics: []string{"LinuxObjectCompile"},
 				top:       10,
 				sharedPct: 100,
 				execroot:  execroot,
@@ -461,7 +641,7 @@ func inputAquery(inputs ...inputArtifact) *aqueryOutput {
 func renderReport(t *testing.T, aq *aqueryOutput) string {
 	t.Helper()
 	return renderReportWithOptions(t, aq, reportOptions{
-		mnemonic:  "LinuxObjectCompile",
+		mnemonics: []string{"LinuxObjectCompile"},
 		top:       10,
 		sharedPct: 100,
 	})
