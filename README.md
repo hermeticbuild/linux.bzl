@@ -455,8 +455,9 @@ bazel run @linux.bzl//tools:linuxobjectinputreport -- \
 ```
 
 Use the same configuration and platform flags for the build and `aquery`.
-The report filters `LinuxObjectCompile` actions by default; pass `-mnemonic`
-to select another action class. Do not filter the `aquery` itself with
+The report filters `LinuxObjectCompile` actions by default. Passing
+`-mnemonic` replaces that default; repeat the flag to report several action
+classes as one population. Do not filter the `aquery` itself with
 `mnemonic(...)` when producer fanout is needed, because that removes the
 producer actions from the JSON graph.
 

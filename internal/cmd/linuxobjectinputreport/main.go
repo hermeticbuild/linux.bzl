@@ -60,7 +60,7 @@ type pathFragment struct {
 
 type reportOptions struct {
 	inputPath string
-	mnemonic  string
+	mnemonics []string
 	top       int
 	sharedPct int
 	execroot  string
@@ -95,14 +95,28 @@ type producerUse struct {
 	consumers int
 }
 
+const defaultCompileMnemonic = "LinuxObjectCompile"
+
+type mnemonicFlag []string
+
+func (m *mnemonicFlag) String() string {
+	return strings.Join(*m, ",")
+}
+
+func (m *mnemonicFlag) Set(value string) error {
+	*m = append(*m, value)
+	return nil
+}
+
 func main() {
-	opts := reportOptions{}
-	flag.StringVar(&opts.inputPath, "input", "", "Path to Bazel aquery JSON proto. Reads stdin when empty or -.")
-	flag.StringVar(&opts.mnemonic, "mnemonic", "LinuxObjectCompile", "Action mnemonic to report.")
-	flag.IntVar(&opts.top, "top", 20, "Number of top entries to print per section.")
-	flag.IntVar(&opts.sharedPct, "shared_pct", 80, "Minimum action percentage for high-fanout input sections.")
-	flag.StringVar(&opts.execroot, "execroot", "", "Optional Bazel execution root used to measure materialized input bytes.")
-	flag.Parse()
+	opts, err := parseOptions(os.Args[1:])
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "linuxobjectinputreport: %v\n", err)
+		os.Exit(2)
+	}
 
 	if err := run(os.Stdout, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "linuxobjectinputreport: %v\n", err)
@@ -110,9 +124,53 @@ func main() {
 	}
 }
 
+func parseOptions(args []string) (reportOptions, error) {
+	opts := reportOptions{}
+	flags := flag.NewFlagSet("linuxobjectinputreport", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.StringVar(&opts.inputPath, "input", "", "Path to Bazel aquery JSON proto. Reads stdin when empty or -.")
+	flags.Var((*mnemonicFlag)(&opts.mnemonics), "mnemonic", "Action mnemonic to include. Repeat to report a union; defaults to LinuxObjectCompile.")
+	flags.IntVar(&opts.top, "top", 20, "Number of top entries to print per section.")
+	flags.IntVar(&opts.sharedPct, "shared_pct", 80, "Minimum action percentage for high-fanout input sections.")
+	flags.StringVar(&opts.execroot, "execroot", "", "Optional Bazel execution root used to measure materialized input bytes.")
+	if err := flags.Parse(args); err != nil {
+		return reportOptions{}, err
+	}
+	if flags.NArg() != 0 {
+		return reportOptions{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	var err error
+	opts.mnemonics, err = normalizeMnemonics(opts.mnemonics)
+	if err != nil {
+		return reportOptions{}, err
+	}
+	return opts, nil
+}
+
+func normalizeMnemonics(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return []string{defaultCompileMnemonic}, nil
+	}
+	out := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		if value == "" {
+			return nil, fmt.Errorf("-mnemonic must not be empty")
+		}
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out, nil
+}
+
 func run(w io.Writer, opts reportOptions) error {
-	if opts.mnemonic == "" {
-		return fmt.Errorf("-mnemonic must not be empty")
+	var err error
+	opts.mnemonics, err = normalizeMnemonics(opts.mnemonics)
+	if err != nil {
+		return err
 	}
 	if opts.top <= 0 {
 		opts.top = 20
@@ -280,14 +338,17 @@ func resolvePathFragment(fragments map[int]pathFragment, id int) string {
 }
 
 func writeReport(w io.Writer, m *model, opts reportOptions) error {
-	actions := m.actionsByMnemonic(opts.mnemonic)
+	mnemonics, err := normalizeMnemonics(opts.mnemonics)
+	if err != nil {
+		return err
+	}
+	actions := m.actionsByMnemonics(mnemonics)
 	if len(actions) == 0 {
-		return fmt.Errorf("no actions with mnemonic %q", opts.mnemonic)
+		return fmt.Errorf("no actions with selected mnemonics %q", strings.Join(mnemonics, ", "))
 	}
 
 	var measurer *byteMeasurer
 	if opts.execroot != "" {
-		var err error
 		measurer, err = newByteMeasurer(opts.execroot, m)
 		if err != nil {
 			return err
@@ -338,7 +399,7 @@ func writeReport(w io.Writer, m *model, opts reportOptions) error {
 		}
 		inputCounts = append(inputCounts, len(inputs))
 		actionSummaries = append(actionSummaries, actionSummary{
-			label:         m.targetLabels[action.TargetID],
+			label:         m.actionName(action),
 			count:         len(inputs),
 			bytes:         actionFiles.bytes,
 			bytesComplete: bytesComplete,
@@ -349,7 +410,7 @@ func writeReport(w io.Writer, m *model, opts reportOptions) error {
 	}
 
 	fmt.Fprintf(w, "Linux object input report\n")
-	fmt.Fprintf(w, "mnemonic: %s\n", opts.mnemonic)
+	fmt.Fprintf(w, "mnemonics: %s\n", strings.Join(mnemonics, ", "))
 	fmt.Fprintf(w, "actions: %d\n", len(actions))
 	fmt.Fprintf(w, "input count min/p50/p95/max: %s\n", intStats(inputCounts))
 	if measurer == nil {
@@ -402,7 +463,6 @@ func writeReport(w io.Writer, m *model, opts reportOptions) error {
 	}
 	writeProducerUses(
 		w,
-		opts.mnemonic,
 		topProducerUses(m.producers, producerConsumerCounts),
 		opts.top,
 		resolvedProducerInputs,
@@ -420,14 +480,30 @@ func writeReport(w io.Writer, m *model, opts reportOptions) error {
 	return nil
 }
 
-func (m *model) actionsByMnemonic(mnemonic string) []action {
+func (m *model) actionsByMnemonics(mnemonics []string) []action {
+	selected := make(map[string]bool, len(mnemonics))
+	for _, mnemonic := range mnemonics {
+		selected[mnemonic] = true
+	}
 	var out []action
 	for _, action := range m.aq.Actions {
-		if action.Mnemonic == mnemonic {
+		if selected[action.Mnemonic] {
 			out = append(out, action)
 		}
 	}
 	return out
+}
+
+func (m *model) actionName(action action) string {
+	name := action.Mnemonic
+	if label := m.targetLabels[action.TargetID]; label != "" {
+		name += " " + label
+	}
+	outputIDs := uniqueInts(action.OutputIDs)
+	if len(outputIDs) != 0 {
+		name += " [primary: " + primaryOutputPath(action.PrimaryOutputID, outputIDs, m.artifactPath) + "]"
+	}
+	return name
 }
 
 func (m *model) actionInputs(action action) map[int]bool {
@@ -560,7 +636,6 @@ func writeTopInputs(w io.Writer, title string, inputs []inputUse, limit int, act
 
 func writeProducerUses(
 	w io.Writer,
-	consumerMnemonic string,
 	producers []producerUse,
 	limit int,
 	resolvedInputCount int,
@@ -568,8 +643,7 @@ func writeProducerUses(
 ) {
 	fmt.Fprintf(
 		w,
-		"producer fanout (unique %s consumer actions; producers present in aquery):\n",
-		consumerMnemonic,
+		"producer fanout (unique selected consumer actions; producers present in aquery):\n",
 	)
 	fmt.Fprintf(w, "  producer-resolved input artifacts: %d / %d unique inputs\n", resolvedInputCount, inputCount)
 	if len(producers) == 0 {
@@ -671,7 +745,7 @@ func measurementByteDisplay(measurement *byteMeasurement) string {
 
 func isSourceLikeNonHeader(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".c", ".cc", ".cpp", ".s", ".lds", ".dts", ".dtsi", ".asn1":
+	case ".asn1", ".c", ".c_shipped", ".cc", ".cpp", ".dts", ".dtsi", ".dtso", ".inc", ".lds", ".pl", ".rs", ".s":
 		return true
 	default:
 		return false
