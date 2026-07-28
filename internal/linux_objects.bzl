@@ -43,6 +43,7 @@ LinuxConfigInfo = provider(
         "include_dir": "Generated include directory path for compiler -I flags.",
         "include_dir_anchor": "File-backed reference to include_dir for path-mapped actions.",
         "kernel_release": "include/config/kernel.release output.",
+        "kernel_version": "Declared base kernel version, without the local release suffix.",
         "rustc_cfg": "include/generated/rustc_cfg output.",
     },
 )
@@ -77,7 +78,7 @@ LinuxGeneratedHeadersInfo = provider(
     fields = {
         "arch": "Linux ARCH value used to generate this header tree.",
         "cflags": "Optional response file with generated architecture C flags.",
-        "content_id": "Stable content identity for this generated header group, or empty for legacy callers.",
+        "families": "Dictionary of generated-header family names to content-addressed file subsets.",
         "files": "Depset of generated header files.",
         "include_dirs": "Include directories for the generated header tree.",
         "include_dir_anchors": "File-backed references to include_dirs for path-mapped actions.",
@@ -92,7 +93,7 @@ LinuxCompileEnvironmentIndexInfo = provider(
         "config_payloads": "Dictionary of config payload IDs to materialized LinuxConfigInfo values.",
         "environments": "Dictionary of compile environment IDs to selected config and generated-header values.",
         "expected_abi": "Action ABI required for every indexed compile environment.",
-        "header_groups": "Dictionary of generated-header content IDs to LinuxGeneratedHeadersInfo values.",
+        "generated_header_families": "Dictionary of generated-header family content IDs to selected file subsets.",
     },
 )
 
@@ -1955,6 +1956,87 @@ _X86_UAPI_ASM_GENERIC_WRAPPERS = [
     "unistd.h",
 ]
 
+_X86_GENERATED_HEADER_FAMILIES = [
+    "all",
+    "asm_offsets",
+    "bounds",
+    "compile",
+    "cpufeatures",
+    "kvm_offsets",
+    "rq_offsets",
+    "static",
+    "timeconst",
+    "utsrelease",
+    "utsversion",
+    "version",
+]
+
+_X86_PRECISE_GENERATED_HEADER_FAMILIES = [
+    "static",
+    "timeconst",
+    "compile",
+    "version",
+    "utsrelease",
+    "utsversion",
+    "cpufeatures",
+    "bounds",
+    "asm_offsets",
+    "rq_offsets",
+    "kvm_offsets",
+]
+
+_X86_OFFSETS_HEADER_FAMILIES = [
+    "bounds",
+    "asm_offsets",
+    "rq_offsets",
+    "kvm_offsets",
+]
+
+_X86_LEGACY_OFFSETS_HEADER_DEPENDENCIES = {
+    "bounds": [
+        "static",
+        "timeconst",
+        "compile",
+        "version",
+        "utsrelease",
+        "utsversion",
+        "cpufeatures",
+    ],
+    "asm_offsets": [
+        "static",
+        "timeconst",
+        "compile",
+        "version",
+        "utsrelease",
+        "utsversion",
+        "cpufeatures",
+        "bounds",
+    ],
+    "rq_offsets": [
+        "static",
+        "timeconst",
+        "compile",
+        "version",
+        "utsrelease",
+        "utsversion",
+        "cpufeatures",
+        "bounds",
+        "asm_offsets",
+    ],
+    "kvm_offsets": [
+        "static",
+        "timeconst",
+        "compile",
+        "version",
+        "utsrelease",
+        "utsversion",
+        "cpufeatures",
+        "bounds",
+        "asm_offsets",
+        "rq_offsets",
+    ],
+}
+
 def _linux_offsets_header(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, src, out_path, guard, generated_inputs, include_dir_anchors = {}, srcarch = "x86", extra_include_dirs = [], extra_flags = []):
     compiler = cc_common.get_tool_for_action(
         feature_configuration = feature_configuration,
@@ -2421,20 +2503,157 @@ def _linux_arm64_vdso32_outputs(ctx, cc_toolchain, feature_configuration, config
     )
     return struct(so = so)
 
-def _linux_x86_generated_headers_impl(ctx):
-    _validate_content_id(ctx.attr.content_id, "linux_x86_generated_headers content_id", allow_empty = True)
-    base = ctx.label.name + ".headers"
-    cc_toolchain = find_cpp_toolchain(ctx)
-    feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
-    config = ctx.attr.config[LinuxConfigInfo]
-    source_root = _linux_source_root_path(ctx)
+def _linux_generated_header_aggregate(infos):
+    if not infos:
+        fail("generated-header aggregate requires at least one family")
+    first = infos[0]
+    cflags = first.cflags
+    vdsomunge = first.vdsomunge
+    include_dirs = []
+    include_dir_anchors = {}
+    for info in infos:
+        if info.arch != first.arch or info.srcarch != first.srcarch:
+            fail("generated-header aggregate mixes architectures")
+        if info.cflags != None:
+            if cflags != None and info.cflags != cflags:
+                fail("generated-header aggregate has multiple cflags files")
+            cflags = info.cflags
+        if info.vdsomunge != None:
+            if vdsomunge != None and info.vdsomunge != vdsomunge:
+                fail("generated-header aggregate has multiple vdsomunge tools")
+            vdsomunge = info.vdsomunge
+        include_dirs.extend(info.include_dirs)
+        include_dir_anchors.update(info.include_dir_anchors)
+    return struct(
+        arch = first.arch,
+        cflags = cflags,
+        files = depset(transitive = [info.files for info in infos]),
+        include_dir_anchors = include_dir_anchors,
+        include_dirs = _unique_strings(include_dirs),
+        srcarch = first.srcarch,
+        vdsomunge = vdsomunge,
+    )
+
+def _generated_header_family_aggregate(name, content_id, infos):
+    aggregate = _linux_generated_header_aggregate(infos)
+    return struct(
+        arch = aggregate.arch,
+        cflags = aggregate.cflags,
+        content_id = content_id,
+        files = aggregate.files,
+        include_dir_anchors = aggregate.include_dir_anchors,
+        include_dirs = aggregate.include_dirs,
+        name = name,
+        srcarch = aggregate.srcarch,
+        vdsomunge = aggregate.vdsomunge,
+    )
+
+def _linux_x86_reusable_header_families(ctx):
+    reusable = {}
+    for target in ctx.attr.reusable_generated_headers:
+        provider = target[LinuxGeneratedHeadersInfo]
+        if provider.arch != "x86" or provider.srcarch != "x86":
+            fail("linux_x86_generated_headers reusable target %s has incompatible architecture" % target.label)
+        for name in sorted(provider.families.keys()):
+            if name not in _X86_GENERATED_HEADER_FAMILIES:
+                fail("linux_x86_generated_headers reusable target %s publishes unknown family %s" % (target.label, name))
+            family = provider.families[name]
+            if family.name != name:
+                fail(
+                    "linux_x86_generated_headers reusable target %s publishes family %s under name %s" %
+                    (target.label, family.name, name),
+                )
+            if not family.content_id:
+                continue
+            _validate_content_id(
+                family.content_id,
+                "linux_x86_generated_headers reusable target %s family %s content ID" % (target.label, name),
+            )
+            if family.arch != "x86" or family.srcarch != "x86":
+                fail(
+                    "linux_x86_generated_headers reusable target %s family %s has incompatible architecture" %
+                    (target.label, name),
+                )
+            key = (name, family.content_id)
+            if key not in reusable:
+                reusable[key] = family
+    return reusable
+
+def _linux_x86_reusable_header_family(ctx, reusable, name):
+    content_id = ctx.attr.family_content_ids.get(name, "")
+    if not content_id:
+        return None
+    return reusable.get((name, content_id))
+
+def _linux_x86_header_family_base(ctx, name):
+    return ctx.label.name + ".headers/" + name
+
+def _linux_x86_header_family_dependencies(ctx):
+    if not ctx.attr.family_content_ids:
+        if ctx.attr.family_dependency_ids:
+            fail("linux_x86_generated_headers family dependencies require family content IDs")
+        return {
+            name: list(dependencies)
+            for name, dependencies in _X86_LEGACY_OFFSETS_HEADER_DEPENDENCIES.items()
+        }
+    generation_order = {
+        name: index
+        for index, name in enumerate(_X86_PRECISE_GENERATED_HEADER_FAMILIES)
+    }
+    dependencies = {
+        name: {}
+        for name in _X86_OFFSETS_HEADER_FAMILIES
+    }
+    for edge, dependency_id in ctx.attr.family_dependency_ids.items():
+        names = edge.split(":")
+        if len(names) != 2:
+            fail("linux_x86_generated_headers has invalid family dependency edge %r" % edge)
+        family_name, dependency_name = names
+        if family_name not in dependencies:
+            fail("linux_x86_generated_headers family %s cannot consume generated-header dependencies" % family_name)
+        if dependency_name not in generation_order:
+            fail(
+                "linux_x86_generated_headers family %s depends on unknown family %s" %
+                (family_name, dependency_name),
+            )
+        if generation_order[dependency_name] >= generation_order[family_name]:
+            fail(
+                "linux_x86_generated_headers family %s depends on non-earlier family %s" %
+                (family_name, dependency_name),
+            )
+        _validate_content_id(
+            dependency_id,
+            "linux_x86_generated_headers family %s dependency %s content ID" %
+            (family_name, dependency_name),
+        )
+        if dependency_id != ctx.attr.family_content_ids[dependency_name]:
+            fail(
+                "linux_x86_generated_headers family %s dependency %s content ID does not match selected family" %
+                (family_name, dependency_name),
+            )
+        dependencies[family_name][dependency_name] = True
+    return {
+        family_name: [
+            dependency_name
+            for dependency_name in _X86_PRECISE_GENERATED_HEADER_FAMILIES
+            if dependency_name in dependencies[family_name]
+        ]
+        for family_name in _X86_OFFSETS_HEADER_FAMILIES
+    }
+
+def _linux_x86_static_header_family(ctx):
+    base = _linux_x86_header_family_base(ctx, "static")
     headers = []
+    arch_include_dir = None
+    uapi_include_dir = None
     for header in _X86_ASM_GENERIC_WRAPPERS:
         out = ctx.actions.declare_file(base + "/arch/x86/include/generated/asm/" + header)
         ctx.actions.write(
             output = out,
             content = "#include <asm-generic/%s>\n" % header,
         )
+        if arch_include_dir == None:
+            arch_include_dir = out.dirname[:-len("/asm")]
         headers.append(out)
     for header in _X86_UAPI_ASM_GENERIC_WRAPPERS:
         out = ctx.actions.declare_file(base + "/arch/x86/include/generated/uapi/asm/" + header)
@@ -2442,46 +2661,9 @@ def _linux_x86_generated_headers_impl(ctx):
             output = out,
             content = "#include <asm-generic/%s>\n" % header,
         )
+        if uapi_include_dir == None:
+            uapi_include_dir = out.dirname[:-len("/asm")]
         headers.append(out)
-
-    timeconst = ctx.actions.declare_file(base + "/include/generated/timeconst.h")
-    timeconst_args = ctx.actions.args()
-    timeconst_args.add("-config", config.config)
-    timeconst_args.add("-out", timeconst)
-    path_mapped_run(
-        ctx.actions,
-        executable = ctx.executable._timeconst,
-        inputs = depset([], transitive = [config.files]),
-        outputs = [timeconst],
-        arguments = [timeconst_args],
-        mnemonic = "LinuxTimeconstHeader",
-        progress_message = "Generating Linux time constants %{label}",
-    )
-    headers.append(timeconst)
-
-    compile_h = ctx.actions.declare_file(base + "/include/generated/compile.h")
-    linux_version_h = ctx.actions.declare_file(base + "/include/generated/uapi/linux/version.h")
-    utsrelease_h = ctx.actions.declare_file(base + "/include/generated/utsrelease.h")
-    utsversion_h = ctx.actions.declare_file(base + "/include/generated/utsversion.h")
-    version_args = ctx.actions.args()
-    version_args.add("-config", config.config)
-    version_args.add("-kernel_release", config.kernel_release)
-    version_args.add("-compile_out", compile_h)
-    version_args.add("-linux_version_out", linux_version_h)
-    version_args.add("-utsrelease_out", utsrelease_h)
-    version_args.add("-utsversion_out", utsversion_h)
-    version_args.add("-machine", "x86_64")
-    version_args.add("-compiler", _linux_compiler_version_string())
-    path_mapped_run(
-        ctx.actions,
-        executable = ctx.executable._versionheaders,
-        inputs = depset([], transitive = [config.files]),
-        outputs = [compile_h, linux_version_h, utsrelease_h, utsversion_h],
-        arguments = [version_args],
-        mnemonic = "LinuxVersionHeaders",
-        progress_message = "Generating Linux version headers %{label}",
-    )
-    headers.extend([compile_h, linux_version_h, utsrelease_h, utsversion_h])
 
     syscall_specs = [
         (ctx.file.syscall_32_tbl, base + "/arch/x86/include/generated/uapi/asm/unistd_32.h", "i386", True, "", ""),
@@ -2490,11 +2672,8 @@ def _linux_x86_generated_headers_impl(ctx):
         (ctx.file.syscall_32_tbl, base + "/arch/x86/include/generated/asm/unistd_32_ia32.h", "i386", True, "", "ia32_"),
         (ctx.file.syscall_64_tbl, base + "/arch/x86/include/generated/asm/unistd_64_x32.h", "x32", True, "", "x32_"),
     ]
-    uapi_include_dir = None
     for table, path, abis, emit_nr, offset, prefix in syscall_specs:
         out = ctx.actions.declare_file(path)
-        if uapi_include_dir == None and "/generated/uapi/asm/" in path:
-            uapi_include_dir = out.dirname[:-len("/asm")]
         args = ctx.actions.args()
         args.add("-in", table)
         args.add("-out", out)
@@ -2538,29 +2717,6 @@ def _linux_x86_generated_headers_impl(ctx):
         )
         headers.append(out)
 
-    cpufeaturemasks = ctx.actions.declare_file(base + "/arch/x86/include/generated/asm/cpufeaturemasks.h")
-    cpufeature_args = ctx.actions.args()
-    cpufeature_args.add("-cpufeatures", ctx.file.cpufeatures_h)
-    cpufeature_args.add("-config", config.config)
-    cpufeature_args.add("-out", cpufeaturemasks)
-    if len(ctx.files.required_features_h) > 1:
-        fail("linux_x86_generated_headers requires at most one required-features.h source")
-    if ctx.files.required_features_h:
-        cpufeature_args.add("-legacy")
-    path_mapped_run(
-        ctx.actions,
-        executable = ctx.executable._cpufeaturemasks,
-        inputs = depset(
-            [ctx.file.cpufeatures_h] + ctx.files.required_features_h,
-            transitive = [config.files],
-        ),
-        outputs = [cpufeaturemasks],
-        arguments = [cpufeature_args],
-        mnemonic = "LinuxCPUFeatureMasks",
-        progress_message = "Generating Linux x86 CPU feature masks %{label}",
-    )
-    headers.append(cpufeaturemasks)
-
     xen_hypercalls = ctx.actions.declare_file(base + "/arch/x86/include/generated/asm/xen-hypercalls.h")
     xen_args = ctx.actions.args()
     for header in ctx.files.xen_interface_headers:
@@ -2591,105 +2747,325 @@ def _linux_x86_generated_headers_impl(ctx):
         progress_message = "Generating Linux ORC hash header %{label}",
     )
     headers.append(orc_hash)
+    return _generated_header_family_info(
+        arch = "x86",
+        cflags = None,
+        content_id = ctx.attr.family_content_ids.get("static", ""),
+        files = headers,
+        include_dirs = [arch_include_dir, uapi_include_dir],
+        name = "static",
+        srcarch = "x86",
+        vdsomunge = None,
+    )
 
-    include_dirs = [
-        timeconst.dirname[:-len("/generated")],
-        linux_version_h.dirname[:-len("/linux")],
-        headers[0].dirname[:-len("/asm")],
-        uapi_include_dir,
-    ]
-    include_dir_anchors = _directory_anchors(headers, include_dirs)
-    bounds_h = _linux_offsets_header(
-        ctx,
-        cc_toolchain,
-        feature_configuration,
-        config,
-        source_root,
-        include_dirs,
-        ctx.file.bounds_c,
-        base + "/include/generated/bounds.h",
-        "__LINUX_BOUNDS_H__",
-        headers,
-        include_dir_anchors = include_dir_anchors,
+def _linux_x86_timeconst_header_family(ctx, config):
+    base = _linux_x86_header_family_base(ctx, "timeconst")
+    out = ctx.actions.declare_file(base + "/include/generated/timeconst.h")
+    args = ctx.actions.args()
+    args.add("-config", config.config)
+    args.add("-out", out)
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._timeconst,
+        inputs = [config.config],
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxTimeconstHeader",
+        progress_message = "Generating Linux time constants %{label}",
     )
-    headers.append(bounds_h)
-    asm_offsets_h = _linux_offsets_header(
-        ctx,
-        cc_toolchain,
-        feature_configuration,
-        config,
-        source_root,
-        include_dirs,
-        ctx.file.asm_offsets_c,
-        base + "/include/generated/asm-offsets.h",
-        "__ASM_OFFSETS_H__",
-        headers,
-        include_dir_anchors = include_dir_anchors,
+    return _generated_header_family_info(
+        arch = "x86",
+        cflags = None,
+        content_id = ctx.attr.family_content_ids.get("timeconst", ""),
+        files = [out],
+        include_dirs = [out.dirname[:-len("/generated")]],
+        name = "timeconst",
+        srcarch = "x86",
+        vdsomunge = None,
     )
-    headers.append(asm_offsets_h)
-    if len(ctx.files.rq_offsets_c) > 1:
-        fail("linux_x86_generated_headers requires at most one rq-offsets.c source")
-    if ctx.files.rq_offsets_c:
-        rq_offsets_h = _linux_offsets_header(
-            ctx,
-            cc_toolchain,
-            feature_configuration,
-            config,
-            source_root,
-            include_dirs,
-            ctx.files.rq_offsets_c[0],
-            base + "/include/generated/rq-offsets.h",
-            "__RQ_OFFSETS_H__",
-            headers,
-            include_dir_anchors = include_dir_anchors,
-        )
-        headers.append(rq_offsets_h)
-    kvm_asm_offsets_h = _linux_offsets_header(
-        ctx,
-        cc_toolchain,
-        feature_configuration,
-        config,
-        source_root,
-        include_dirs,
-        ctx.file.kvm_asm_offsets_c,
-        base + "/arch/x86/kvm/kvm-asm-offsets.h",
-        "__KVM_ASM_OFFSETS_H__",
-        headers,
-        include_dir_anchors = include_dir_anchors,
-        extra_include_dirs = [source_root + "/arch/x86/kvm"],
-    )
-    headers.append(kvm_asm_offsets_h)
 
-    include_dirs = include_dirs + [kvm_asm_offsets_h.dirname]
-    files = depset(headers)
-    return [
-        DefaultInfo(files = files),
-        LinuxGeneratedHeadersInfo(
+def _linux_x86_version_header_family(ctx, config, name, path, output_flag, mnemonic):
+    base = _linux_x86_header_family_base(ctx, name)
+    out = ctx.actions.declare_file(base + "/" + path)
+    args = ctx.actions.args()
+    args.add(output_flag, out)
+    inputs = []
+    if name == "compile":
+        args.add("-machine", "x86_64")
+        args.add("-compiler", _linux_compiler_version_string())
+    elif name == "version":
+        args.add("-kernel_version", config.kernel_version)
+    elif name == "utsrelease":
+        args.add("-kernel_release", config.kernel_release)
+        inputs.append(config.kernel_release)
+    elif name == "utsversion":
+        args.add("-config", config.config)
+        inputs.append(config.config)
+    else:
+        fail("unsupported x86 version-header family %s" % name)
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._versionheaders,
+        inputs = inputs,
+        outputs = [out],
+        arguments = [args],
+        mnemonic = mnemonic,
+        progress_message = "Generating Linux %s header %%{label}" % name,
+    )
+    if name == "version":
+        include_dirs = [
+            out.dirname[:-len("/generated/uapi/linux")],
+            out.dirname[:-len("/linux")],
+        ]
+    else:
+        include_dirs = [out.dirname[:-len("/generated")]]
+    return _generated_header_family_info(
+        arch = "x86",
+        cflags = None,
+        content_id = ctx.attr.family_content_ids.get(name, ""),
+        files = [out],
+        include_dirs = include_dirs,
+        name = name,
+        srcarch = "x86",
+        vdsomunge = None,
+    )
+
+def _linux_x86_cpufeatures_header_family(ctx, config):
+    base = _linux_x86_header_family_base(ctx, "cpufeatures")
+    out = ctx.actions.declare_file(base + "/arch/x86/include/generated/asm/cpufeaturemasks.h")
+    args = ctx.actions.args()
+    args.add("-cpufeatures", ctx.file.cpufeatures_h)
+    args.add("-config", config.config)
+    args.add("-out", out)
+    if len(ctx.files.required_features_h) > 1:
+        fail("linux_x86_generated_headers requires at most one required-features.h source")
+    if ctx.files.required_features_h:
+        args.add("-legacy")
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._cpufeaturemasks,
+        inputs = [ctx.file.cpufeatures_h, config.config] + ctx.files.required_features_h,
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxCPUFeatureMasks",
+        progress_message = "Generating Linux x86 CPU feature masks %{label}",
+    )
+    return _generated_header_family_info(
+        arch = "x86",
+        cflags = None,
+        content_id = ctx.attr.family_content_ids.get("cpufeatures", ""),
+        files = [out],
+        include_dirs = [out.dirname[:-len("/asm")]],
+        name = "cpufeatures",
+        srcarch = "x86",
+        vdsomunge = None,
+    )
+
+def _linux_x86_offsets_header_family(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        source_root,
+        families,
+        dependency_names,
+        name,
+        src,
+        path,
+        guard,
+        extra_include_dirs = []):
+    if src == None:
+        return _generated_header_family_info(
             arch = "x86",
             cflags = None,
-            content_id = ctx.attr.content_id,
-            files = files,
-            include_dir_anchors = _directory_anchors(headers, include_dirs),
-            include_dirs = include_dirs,
+            content_id = ctx.attr.family_content_ids.get(name, ""),
+            files = [],
+            include_dirs = [],
+            name = name,
             srcarch = "x86",
             vdsomunge = None,
+        )
+    dependencies = None
+    if dependency_names:
+        dependencies = _linux_generated_header_aggregate([
+            families[dependency]
+            for dependency in dependency_names
+        ])
+    out = _linux_offsets_header(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        source_root,
+        dependencies.include_dirs if dependencies != None else [],
+        src,
+        _linux_x86_header_family_base(ctx, name) + "/" + path,
+        guard,
+        dependencies.files.to_list() if dependencies != None else [],
+        include_dir_anchors = dependencies.include_dir_anchors if dependencies != None else {},
+        extra_include_dirs = extra_include_dirs,
+    )
+    if name == "kvm_offsets":
+        include_dirs = [out.dirname]
+    else:
+        include_dirs = [out.dirname[:-len("/generated")]]
+    return _generated_header_family_info(
+        arch = "x86",
+        cflags = None,
+        content_id = ctx.attr.family_content_ids.get(name, ""),
+        files = [out],
+        include_dirs = include_dirs,
+        name = name,
+        srcarch = "x86",
+        vdsomunge = None,
+    )
+
+def _linux_x86_generated_header_families_impl(ctx):
+    _validate_generated_header_family_content_ids(
+        ctx.attr.family_content_ids,
+        _X86_GENERATED_HEADER_FAMILIES,
+        "linux_x86_generated_headers",
+    )
+    if len(ctx.files.rq_offsets_c) > 1:
+        fail("linux_x86_generated_headers requires at most one rq-offsets.c source")
+    cc_toolchain = find_cpp_toolchain(ctx)
+    feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
+    config = ctx.attr.config[LinuxConfigInfo]
+    source_root = _linux_source_root_path(ctx)
+    family_dependencies = _linux_x86_header_family_dependencies(ctx)
+    reusable = _linux_x86_reusable_header_families(ctx) if ctx.attr.family_content_ids else {}
+    families = {}
+
+    family = _linux_x86_reusable_header_family(ctx, reusable, "static")
+    families["static"] = family if family != None else _linux_x86_static_header_family(ctx)
+    family = _linux_x86_reusable_header_family(ctx, reusable, "timeconst")
+    families["timeconst"] = family if family != None else _linux_x86_timeconst_header_family(ctx, config)
+
+    version_specs = [
+        ("compile", "include/generated/compile.h", "-compile_out", "LinuxCompileHeader"),
+        ("version", "include/generated/uapi/linux/version.h", "-linux_version_out", "LinuxVersionHeader"),
+        ("utsrelease", "include/generated/utsrelease.h", "-utsrelease_out", "LinuxUTSReleaseHeader"),
+        ("utsversion", "include/generated/utsversion.h", "-utsversion_out", "LinuxUTSVersionHeader"),
+    ]
+    for name, path, output_flag, mnemonic in version_specs:
+        family = _linux_x86_reusable_header_family(ctx, reusable, name)
+        families[name] = family if family != None else _linux_x86_version_header_family(
+            ctx,
+            config,
+            name,
+            path,
+            output_flag,
+            mnemonic,
+        )
+
+    family = _linux_x86_reusable_header_family(ctx, reusable, "cpufeatures")
+    families["cpufeatures"] = family if family != None else _linux_x86_cpufeatures_header_family(ctx, config)
+
+    family = _linux_x86_reusable_header_family(ctx, reusable, "bounds")
+    families["bounds"] = family if family != None else _linux_x86_offsets_header_family(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        source_root,
+        families,
+        family_dependencies["bounds"],
+        "bounds",
+        ctx.file.bounds_c,
+        "include/generated/bounds.h",
+        "__LINUX_BOUNDS_H__",
+    )
+    family = _linux_x86_reusable_header_family(ctx, reusable, "asm_offsets")
+    families["asm_offsets"] = family if family != None else _linux_x86_offsets_header_family(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        source_root,
+        families,
+        family_dependencies["asm_offsets"],
+        "asm_offsets",
+        ctx.file.asm_offsets_c,
+        "include/generated/asm-offsets.h",
+        "__ASM_OFFSETS_H__",
+    )
+    rq_offsets_c = ctx.files.rq_offsets_c[0] if ctx.files.rq_offsets_c else None
+    family = _linux_x86_reusable_header_family(ctx, reusable, "rq_offsets")
+    families["rq_offsets"] = family if family != None else _linux_x86_offsets_header_family(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        source_root,
+        families,
+        family_dependencies["rq_offsets"],
+        "rq_offsets",
+        rq_offsets_c,
+        "include/generated/rq-offsets.h",
+        "__RQ_OFFSETS_H__",
+    )
+    family = _linux_x86_reusable_header_family(ctx, reusable, "kvm_offsets")
+    families["kvm_offsets"] = family if family != None else _linux_x86_offsets_header_family(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        source_root,
+        families,
+        family_dependencies["kvm_offsets"],
+        "kvm_offsets",
+        ctx.file.kvm_asm_offsets_c,
+        "arch/x86/kvm/kvm-asm-offsets.h",
+        "__KVM_ASM_OFFSETS_H__",
+        extra_include_dirs = [source_root + "/arch/x86/kvm"],
+    )
+
+    all_family = _linux_x86_reusable_header_family(ctx, reusable, "all")
+    if all_family == None:
+        all_family = _generated_header_family_aggregate(
+            "all",
+            ctx.attr.family_content_ids.get("all", ""),
+            [
+                families[name]
+                for name in _X86_PRECISE_GENERATED_HEADER_FAMILIES
+            ],
+        )
+    families["all"] = all_family
+    return [
+        DefaultInfo(files = all_family.files),
+        LinuxGeneratedHeadersInfo(
+            arch = all_family.arch,
+            cflags = all_family.cflags,
+            families = families,
+            files = all_family.files,
+            include_dir_anchors = all_family.include_dir_anchors,
+            include_dirs = all_family.include_dirs,
+            srcarch = all_family.srcarch,
+            vdsomunge = all_family.vdsomunge,
         ),
     ]
 
 linux_x86_generated_headers = rule(
-    implementation = _linux_x86_generated_headers_impl,
+    implementation = _linux_x86_generated_header_families_impl,
     attrs = {
         "arch": attr.string(default = "x86"),
         "asm_offsets_c": attr.label(allow_single_file = True, mandatory = True),
         "bounds_c": attr.label(allow_single_file = True, mandatory = True),
         "config": attr.label(providers = [LinuxConfigInfo], mandatory = True),
         "cpufeatures_h": attr.label(allow_single_file = True, mandatory = True),
-        "content_id": attr.string(
-            doc = "Full SHA-256 content identity for this generated header group.",
+        "family_dependency_ids": attr.string_dict(
+            doc = "Exact family:dependency edges to dependency family content IDs.",
+        ),
+        "family_content_ids": attr.string_dict(
+            doc = "Map of generated-header family names to full SHA-256 content identities.",
         ),
         "kvm_asm_offsets_c": attr.label(allow_single_file = True, mandatory = True),
         "orc_types_h": attr.label(allow_single_file = True, mandatory = True),
         "required_features_h": attr.label(allow_files = True, mandatory = True),
+        "reusable_generated_headers": attr.label_list(
+            providers = [LinuxGeneratedHeadersInfo],
+            doc = "Earlier x86 generated-header providers eligible for family-level reuse.",
+        ),
         "rq_offsets_c": attr.label(allow_files = True, mandatory = True),
         "source_root": attr.label(allow_single_file = True, mandatory = True),
         "source_tree": attr.label_list(allow_files = True),
@@ -2800,7 +3176,11 @@ _ARM64_UAPI_ASM_GENERIC_WRAPPERS = [
 ]
 
 def _linux_arm64_generated_headers_impl(ctx):
-    _validate_content_id(ctx.attr.content_id, "linux_arm64_generated_headers content_id", allow_empty = True)
+    _validate_generated_header_family_content_ids(
+        ctx.attr.family_content_ids,
+        ["all"],
+        "linux_arm64_generated_headers",
+    )
     base = ctx.label.name + ".headers"
     cc_toolchain = find_cpp_toolchain(ctx)
     feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
@@ -2875,6 +3255,7 @@ def _linux_arm64_generated_headers_impl(ctx):
     version_args = ctx.actions.args()
     version_args.add("-config", config.config)
     version_args.add("-kernel_release", config.kernel_release)
+    version_args.add("-kernel_version", config.kernel_version)
     version_args.add("-compile_out", compile_h)
     version_args.add("-linux_version_out", linux_version_h)
     version_args.add("-utsrelease_out", utsrelease_h)
@@ -2884,7 +3265,7 @@ def _linux_arm64_generated_headers_impl(ctx):
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._versionheaders,
-        inputs = depset([], transitive = [config.files]),
+        inputs = [config.config, config.kernel_release],
         outputs = [compile_h, linux_version_h, utsrelease_h, utsversion_h],
         arguments = [version_args],
         mnemonic = "LinuxVersionHeaders",
@@ -3038,12 +3419,24 @@ def _linux_arm64_generated_headers_impl(ctx):
     headers.extend([vdso.offsets, vdso.so])
 
     files = depset(headers)
+    families = {
+        "all": _generated_header_family_info(
+            arch = "arm64",
+            cflags = generated_cflags,
+            content_id = ctx.attr.family_content_ids.get("all", ""),
+            files = headers,
+            include_dirs = include_dirs,
+            name = "all",
+            srcarch = "arm64",
+            vdsomunge = ctx.executable.vdsomunge,
+        ),
+    }
     return [
         DefaultInfo(files = files),
         LinuxGeneratedHeadersInfo(
             arch = "arm64",
             cflags = generated_cflags,
-            content_id = ctx.attr.content_id,
+            families = families,
             files = files,
             include_dir_anchors = _directory_anchors(headers, include_dirs),
             include_dirs = include_dirs,
@@ -3061,8 +3454,8 @@ linux_arm64_generated_headers = rule(
         "bounds_c": attr.label(allow_single_file = True, mandatory = True),
         "config": attr.label(providers = [LinuxConfigInfo], mandatory = True),
         "cpucaps": attr.label(allow_single_file = True, mandatory = True),
-        "content_id": attr.string(
-            doc = "Full SHA-256 content identity for this generated header group.",
+        "family_content_ids": attr.string_dict(
+            doc = "Map of generated-header family names to full SHA-256 content identities.",
         ),
         "hyp_constants_c": attr.label(allow_single_file = True, mandatory = True),
         "rq_offsets_c": attr.label(allow_files = True, mandatory = True),
@@ -3134,7 +3527,7 @@ linux_arm64_generated_headers = rule(
     doc = "Generates the arm64 header subset normally produced before compiling Linux C objects.",
 )
 
-def _declare_linux_config(ctx, config_dir, flags):
+def _declare_linux_config(ctx, config_dir, flags, kernel_version):
     config = ctx.actions.declare_file(config_dir + "/.config")
     auto_conf = ctx.actions.declare_file(config_dir + "/include/config/auto.conf")
     auto_conf_cmd = ctx.actions.declare_file(config_dir + "/include/config/auto.conf.cmd")
@@ -3163,6 +3556,7 @@ def _declare_linux_config(ctx, config_dir, flags):
             include_dir = include_dir,
             include_dir_anchor = directory_anchor(autoconf_h, include_dir),
             kernel_release = kernel_release,
+            kernel_version = kernel_version,
             rustc_cfg = rustc_cfg,
         ),
         integer_wrap_h = integer_wrap_h,
@@ -3170,7 +3564,7 @@ def _declare_linux_config(ctx, config_dir, flags):
     )
 
 def _materialize_linux_config(ctx, config_dir, flags, arch, version):
-    declared = _declare_linux_config(ctx, config_dir, flags)
+    declared = _declare_linux_config(ctx, config_dir, flags, version)
     info = declared.info
     config_lines = []
     header_lines = [
@@ -3269,6 +3663,43 @@ def _validate_content_id(content_id, what, allow_empty = False):
         if content_id[index] not in "0123456789abcdef":
             fail("%s must be a full lowercase SHA-256 content ID, got %r" % (what, content_id))
 
+def _validate_generated_header_family_content_ids(content_ids, expected_names, what):
+    if not content_ids:
+        return
+    if sorted(content_ids.keys()) != sorted(expected_names):
+        fail(
+            "%s family_content_ids has families %s, expected %s" %
+            (what, sorted(content_ids.keys()), sorted(expected_names)),
+        )
+    for name, content_id in content_ids.items():
+        _validate_content_id(content_id, "%s family %s content ID" % (what, name))
+
+def _generated_header_family_info(
+        arch,
+        cflags,
+        content_id,
+        files,
+        include_dirs,
+        name,
+        srcarch,
+        vdsomunge):
+    include_dir_anchors = _available_directory_anchors(files, include_dirs)
+    return struct(
+        arch = arch,
+        cflags = cflags,
+        content_id = content_id,
+        files = depset(files),
+        include_dir_anchors = include_dir_anchors,
+        include_dirs = [
+            include_dir
+            for include_dir in include_dirs
+            if include_dir in include_dir_anchors
+        ],
+        name = name,
+        srcarch = srcarch,
+        vdsomunge = vdsomunge,
+    )
+
 def _parse_config_payload(payload_id, content):
     flags = {}
     previous_key = ""
@@ -3294,22 +3725,29 @@ def _parse_config_payload(payload_id, content):
         previous_key = key
     return flags
 
-def _merge_compile_environment_headers(environment_id, header_group_ids, header_groups):
-    if not header_group_ids:
+def _merge_compile_environment_generated_header_families(environment_id, family_ids, families_by_id):
+    if not family_ids:
         return None
     infos = []
-    seen = {}
-    for group_id in header_group_ids:
-        _validate_content_id(group_id, "compile environment %s header group" % environment_id)
-        if group_id in seen:
-            fail("compile environment %s repeats header group %s" % (environment_id, group_id))
-        seen[group_id] = True
-        if group_id not in header_groups:
-            fail("compile environment %s references unknown header group %s" % (environment_id, group_id))
-        infos.append(header_groups[group_id])
-    if len(infos) == 1:
-        return infos[0]
-
+    seen_ids = {}
+    seen_names = {}
+    for family_id in family_ids:
+        _validate_content_id(family_id, "compile environment %s generated-header family" % environment_id)
+        if family_id in seen_ids:
+            fail("compile environment %s repeats generated-header family %s" % (environment_id, family_id))
+        seen_ids[family_id] = True
+        if family_id not in families_by_id:
+            fail(
+                "compile environment %s references unknown generated-header family %s" %
+                (environment_id, family_id),
+            )
+        info = families_by_id[family_id]
+        if info.name in seen_names:
+            fail("compile environment %s repeats generated-header family name %s" % (environment_id, info.name))
+        seen_names[info.name] = True
+        infos.append(info)
+    if "all" in seen_names and len(seen_names) != 1:
+        fail("compile environment %s mixes all with precise generated-header families" % environment_id)
     first = infos[0]
     cflags = first.cflags
     vdsomunge = first.vdsomunge
@@ -3332,7 +3770,10 @@ def _merge_compile_environment_headers(environment_id, header_group_ids, header_
     return LinuxGeneratedHeadersInfo(
         arch = first.arch,
         cflags = cflags,
-        content_id = "",
+        families = {
+            info.name: info
+            for info in infos
+        },
         files = depset(transitive = [info.files for info in infos]),
         include_dir_anchors = include_dir_anchors,
         include_dirs = _unique_strings(include_dirs),
@@ -3350,11 +3791,15 @@ def _linux_compile_environment_index_impl(ctx):
         environment = json.decode(encoded)
         if type(environment) != "dict":
             fail("compile environment %s must decode to an object" % environment_id)
-        unknown_keys = [key for key in environment.keys() if key not in ["abi", "config_payload", "header_groups"]]
+        unknown_keys = [
+            key
+            for key in environment.keys()
+            if key not in ["abi", "config_payload", "generated_header_families"]
+        ]
         if unknown_keys:
             fail("compile environment %s has unknown field(s): %s" % (environment_id, ", ".join(sorted(unknown_keys))))
         payload_id = environment.get("config_payload")
-        header_group_ids = environment.get("header_groups", [])
+        family_ids = environment.get("generated_header_families", [])
         abi = environment.get("abi")
         if type(abi) != "string" or not abi:
             fail("compile environment %s abi must be a non-empty string" % environment_id)
@@ -3365,16 +3810,16 @@ def _linux_compile_environment_index_impl(ctx):
             )
         if type(payload_id) != "string":
             fail("compile environment %s config_payload must be a content ID" % environment_id)
-        if type(header_group_ids) != "list":
-            fail("compile environment %s header_groups must be a list" % environment_id)
+        if type(family_ids) != "list":
+            fail("compile environment %s generated_header_families must be a list" % environment_id)
         _validate_content_id(payload_id, "compile environment %s config payload" % environment_id)
-        for group_id in header_group_ids:
-            if type(group_id) != "string":
-                fail("compile environment %s header group IDs must be strings" % environment_id)
+        for family_id in family_ids:
+            if type(family_id) != "string":
+                fail("compile environment %s generated-header family IDs must be strings" % environment_id)
         raw_environments[environment_id] = struct(
             abi = abi,
             config_payload_id = payload_id,
-            header_group_ids = list(header_group_ids),
+            generated_header_family_ids = list(family_ids),
         )
         referenced_payloads[payload_id] = True
 
@@ -3390,6 +3835,7 @@ def _linux_compile_environment_index_impl(ctx):
             ctx,
             ctx.label.name + ".config_payloads/" + payload_id,
             _parse_config_payload(payload_id, content),
+            ctx.attr.version,
         )
         bucket = payload_id[0]
         if bucket not in config_payload_contents_by_bucket:
@@ -3431,37 +3877,39 @@ def _linux_compile_environment_index_impl(ctx):
             progress_message = "Materializing Linux config payloads %{label}",
         )
 
-    header_groups = {}
+    generated_header_families = {}
     header_targets = {
-        str(target.label): struct(group_id = group_id, target = target)
-        for target, group_id in ctx.attr.generated_headers.items()
+        str(target.label): target
+        for target in ctx.attr.generated_headers
     }
     for label in sorted(header_targets.keys()):
-        entry = header_targets[label]
-        target = entry.target
-        group_id = entry.group_id
-        _validate_content_id(group_id, "generated header group ID")
+        target = header_targets[label]
         info = target[LinuxGeneratedHeadersInfo]
-        provider_id = info.content_id if hasattr(info, "content_id") else ""
-        if not provider_id:
-            fail(
-                "generated header target %s must publish content ID %s for an indexed compile environment" %
-                (target.label, group_id),
-            )
-        if provider_id != group_id:
-            fail(
-                "generated header target %s content ID %s does not match indexed ID %s" %
-                (target.label, provider_id, group_id),
-            )
-        if group_id in header_groups:
-            existing = header_groups[group_id]
-            if existing.arch != info.arch or existing.srcarch != info.srcarch:
+        for family_name in sorted(info.families.keys()):
+            family = info.families[family_name]
+            if family.name != family_name:
                 fail(
-                    "generated header group %s maps to incompatible targets including %s" %
-                    (group_id, target.label),
+                    "generated header target %s publishes family %s under name %s" %
+                    (target.label, family.name, family_name),
                 )
-            continue
-        header_groups[group_id] = info
+            family_id = family.content_id
+            _validate_content_id(
+                family_id,
+                "generated header target %s family %s content ID" % (target.label, family_name),
+            )
+            if family_id in generated_header_families:
+                existing = generated_header_families[family_id]
+                if (
+                    existing.name != family.name or
+                    existing.arch != family.arch or
+                    existing.srcarch != family.srcarch
+                ):
+                    fail(
+                        "generated-header family %s maps to incompatible targets including %s" %
+                        (family_id, target.label),
+                    )
+                continue
+            generated_header_families[family_id] = family
 
     environments = {}
     for environment_id in sorted(raw_environments.keys()):
@@ -3470,12 +3918,12 @@ def _linux_compile_environment_index_impl(ctx):
             abi = raw.abi,
             config = config_payloads[raw.config_payload_id],
             config_payload_id = raw.config_payload_id,
-            generated_headers = _merge_compile_environment_headers(
+            generated_headers = _merge_compile_environment_generated_header_families(
                 environment_id,
-                raw.header_group_ids,
-                header_groups,
+                raw.generated_header_family_ids,
+                generated_header_families,
             ),
-            header_group_ids = raw.header_group_ids,
+            generated_header_family_ids = raw.generated_header_family_ids,
         )
 
     return [
@@ -3484,7 +3932,7 @@ def _linux_compile_environment_index_impl(ctx):
             config_payloads = config_payloads,
             environments = environments,
             expected_abi = ctx.attr.expected_abi,
-            header_groups = header_groups,
+            generated_header_families = generated_header_families,
         ),
     ]
 
@@ -3495,14 +3943,14 @@ linux_compile_environment_index = rule(
             doc = "Linux ARCH used to derive compiler and assembler flags for materialized payloads.",
         ),
         "compile_environments": attr.string_dict(
-            doc = "Map of full compile-environment SHA-256 IDs to JSON config-payload/header-group references.",
+            doc = "Map of full compile-environment SHA-256 IDs to JSON config-payload/generated-header-family references.",
         ),
         "config_payloads": attr.string_dict(
             doc = "Map of full config-payload SHA-256 IDs to canonical sorted .config text.",
         ),
-        "generated_headers": attr.label_keyed_string_dict(
+        "generated_headers": attr.label_list(
             providers = [LinuxGeneratedHeadersInfo],
-            doc = "Map of generated-header provider labels to full header-group SHA-256 IDs.",
+            doc = "Generated-header providers whose content-addressed families are indexed.",
         ),
         "expected_abi": attr.string(
             mandatory = True,
@@ -3638,6 +4086,7 @@ def _linux_resolved_config_impl(ctx):
             include_dir = include_dir,
             include_dir_anchor = directory_anchor(autoconf_h, include_dir),
             kernel_release = kernel_release,
+            kernel_version = ctx.attr.version,
             rustc_cfg = rustc_cfg,
         ),
         OutputGroupInfo(config = depset([config])),
@@ -3897,14 +4346,13 @@ def _linux_object_impl(ctx):
         utsversion_tmp = ctx.actions.declare_file(ctx.label.name + ".obj/utsversion-tmp.h")
         uts_args = ctx.actions.args()
         uts_args.add("-config", config.config)
-        uts_args.add("-kernel_release", config.kernel_release)
         uts_args.add("-utsversion_out", utsversion_tmp)
         uts_args.add("-build_version=")
         uts_args.add("-build_timestamp=")
         path_mapped_run(
             ctx.actions,
             executable = ctx.executable._versionheaders,
-            inputs = depset([], transitive = [config.files]),
+            inputs = [config.config],
             outputs = [utsversion_tmp],
             arguments = [uts_args],
             mnemonic = "LinuxObjectVersionHeader",

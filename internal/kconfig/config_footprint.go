@@ -39,9 +39,10 @@ type compactSourceCache struct {
 }
 
 type sourceClosure struct {
-	refs           []string
-	sourceIncludes []string
-	sourceInputs   []CompactSourceInput
+	refs              []string
+	sourceIncludes    []string
+	generatedIncludes []string
+	sourceInputs      []CompactSourceInput
 }
 
 type scannedSourceFile struct {
@@ -75,6 +76,11 @@ type sourceIncludeDirective struct {
 	potentiallyActive bool
 }
 
+type sourceClosureStackEntry struct {
+	treePath                      string
+	linuxLibfdtEnvironmentGuarded bool
+}
+
 type sourceIncludeKind uint8
 
 const (
@@ -92,6 +98,14 @@ const (
 	sourceScanArm64VDSO       sourceScanProfile = "arm64-vdso"
 	sourceScanArm32CompatVDSO sourceScanProfile = "arm32-compat-vdso"
 )
+
+var sourceConfigPredefinedSymbols = []struct {
+	predefined string
+	config     string
+}{
+	{predefined: "GCC_PLUGINS", config: "CONFIG_GCC_PLUGINS"},
+	{predefined: "RANDSTRUCT", config: "CONFIG_RANDSTRUCT"},
+}
 
 type sourceIncludeSearch struct {
 	quoteRoots   []string
@@ -409,20 +423,22 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 	}
 	refset := map[string]bool{}
 	includeSet := map[string]bool{}
+	generatedIncludeSet := map[string]bool{}
 	inputs := map[string]CompactSourceInput{}
 	provided := make(map[string]bool, len(providedIncludes))
 	for _, include := range providedIncludes {
 		provided[filepath.ToSlash(include)] = true
 	}
-	visited := map[string]bool{}
-	stack := []string{source}
+	visited := map[sourceClosureStackEntry]bool{}
+	stack := []sourceClosureStackEntry{{treePath: source}}
 	for len(stack) > 0 {
-		treePath := stack[len(stack)-1]
+		entry := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if visited[treePath] {
+		if visited[entry] {
 			continue
 		}
-		visited[treePath] = true
+		visited[entry] = true
+		treePath := entry.treePath
 		abs, ok := s.absForTreePath(treePath)
 		if !ok {
 			continue
@@ -443,6 +459,7 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 		for _, ref := range scanned.refs {
 			refset[ref] = true
 		}
+		linuxLibfdtEnvironmentIncluded := false
 		for _, inc := range scanned.includes {
 			if s.exact && !inc.potentiallyActive {
 				continue
@@ -464,12 +481,24 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 				s.closureErrs[key] = err
 				return sourceClosure{}, err
 			}
+			// Linux wrappers define LIBFDT_ENV_H before entering the vendored
+			// libfdt subtree, so its userspace environment header is inactive.
+			if entry.linuxLibfdtEnvironmentGuarded &&
+				strings.HasPrefix(treePath, "scripts/dtc/libfdt/") &&
+				filepath.ToSlash(strings.TrimSpace(inc.path)) == "libfdt_env.h" {
+				continue
+			}
 			resolvedIncludes := s.resolveInclude(treePath, inc.path, inc.kind, search)
 			if len(resolvedIncludes) == 0 {
-				if provided[filepath.ToSlash(inc.path)] {
+				includePath := filepath.ToSlash(strings.TrimSpace(inc.path))
+				if provided[includePath] {
 					continue
 				}
-				if s.exact && !includeProvidedOutsideSourceTree(inc.path) {
+				if generatedHeaderInclude(includePath) {
+					generatedIncludeSet[includePath] = true
+					continue
+				}
+				if s.exact && !compilerProvidedInclude(includePath) {
 					err := fmt.Errorf(
 						"%s:%d: unresolved potentially-active literal include %s",
 						treePath,
@@ -482,12 +511,27 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 				}
 				continue
 			}
+			if includeUsesGeneratedAsmWrapper(inc.path, resolvedIncludes) {
+				generatedIncludeSet[filepath.ToSlash(strings.TrimSpace(inc.path))] = true
+			}
 			for _, resolved := range resolvedIncludes {
+				if linuxLibfdtEnvironmentWrapper(treePath) &&
+					resolved == "include/linux/libfdt_env.h" {
+					linuxLibfdtEnvironmentIncluded = true
+				}
 				if resolved != source && isSourceLikeInclude(resolved) {
 					includeSet[resolved] = true
 				}
-				if !visited[resolved] {
-					stack = append(stack, resolved)
+				child := sourceClosureStackEntry{
+					treePath: resolved,
+					linuxLibfdtEnvironmentGuarded: strings.HasPrefix(
+						resolved,
+						"scripts/dtc/libfdt/",
+					) && (entry.linuxLibfdtEnvironmentGuarded ||
+						linuxLibfdtEnvironmentIncluded),
+				}
+				if !visited[child] {
+					stack = append(stack, child)
 				}
 			}
 		}
@@ -502,6 +546,7 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 		includes = append(includes, include)
 	}
 	sort.Strings(includes)
+	generatedIncludes := sortedStringSet(generatedIncludeSet)
 	sourceInputs := make([]CompactSourceInput, 0, len(inputs))
 	for _, input := range inputs {
 		sourceInputs = append(sourceInputs, input)
@@ -510,9 +555,10 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 		return sourceInputs[i].Path < sourceInputs[j].Path
 	})
 	result := sourceClosure{
-		refs:           out,
-		sourceIncludes: includes,
-		sourceInputs:   sourceInputs,
+		refs:              out,
+		sourceIncludes:    includes,
+		generatedIncludes: generatedIncludes,
+		sourceInputs:      sourceInputs,
 	}
 	s.closure[key] = result
 	return result, nil
@@ -551,12 +597,27 @@ func (s *configSourceScanner) closureForSourceDirConfigProfile(
 	config *ResolvedConfig,
 	profile sourceScanProfile,
 ) (sourceClosure, error) {
-	if s == nil || s.sourceRoot == "" {
+	if s == nil {
 		return sourceClosure{}, nil
 	}
-	base := filepath.Join(s.sourceRoot, filepath.FromSlash(dir))
+	rawDir := dir
+	dir, ok := cleanSourceTreePath(dir)
+	if !ok {
+		if s.exact {
+			return sourceClosure{}, fmt.Errorf("invalid source-tree directory %q", rawDir)
+		}
+		return sourceClosure{}, nil
+	}
+	base, ok := s.absForTreeDirectory(dir)
+	if !ok {
+		if s.exact {
+			return sourceClosure{}, fmt.Errorf("source-tree input directory %q does not exist", dir)
+		}
+		return sourceClosure{}, nil
+	}
 	refset := map[string]bool{}
 	includeSet := map[string]bool{}
+	generatedIncludeSet := map[string]bool{}
 	inputs := map[string]CompactSourceInput{}
 	err := filepath.WalkDir(base, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {
@@ -564,11 +625,12 @@ func (s *configSourceScanner) closureForSourceDirConfigProfile(
 		}
 		switch filepath.Ext(entry.Name()) {
 		case ".c", ".S", ".s":
-			rel, relErr := filepath.Rel(s.sourceRoot, path)
+			rel, relErr := filepath.Rel(base, path)
 			if relErr != nil {
 				return relErr
 			}
-			closure, closureErr := s.closureForSourceConfigProfile(filepath.ToSlash(rel), nil, config, profile)
+			treePath := filepath.ToSlash(filepath.Join(dir, rel))
+			closure, closureErr := s.closureForSourceConfigProfile(treePath, nil, config, profile)
 			if closureErr != nil {
 				if !s.exact {
 					return nil
@@ -580,6 +642,9 @@ func (s *configSourceScanner) closureForSourceDirConfigProfile(
 			}
 			for _, include := range closure.sourceIncludes {
 				includeSet[include] = true
+			}
+			for _, include := range closure.generatedIncludes {
+				generatedIncludeSet[include] = true
 			}
 			for _, input := range closure.sourceInputs {
 				inputs[input.Path] = input
@@ -603,6 +668,7 @@ func (s *configSourceScanner) closureForSourceDirConfigProfile(
 		includes = append(includes, include)
 	}
 	sort.Strings(includes)
+	generatedIncludes := sortedStringSet(generatedIncludeSet)
 	sourceInputs := make([]CompactSourceInput, 0, len(inputs))
 	for _, input := range inputs {
 		sourceInputs = append(sourceInputs, input)
@@ -611,9 +677,10 @@ func (s *configSourceScanner) closureForSourceDirConfigProfile(
 		return sourceInputs[i].Path < sourceInputs[j].Path
 	})
 	return sourceClosure{
-		refs:           out,
-		sourceIncludes: includes,
-		sourceInputs:   sourceInputs,
+		refs:              out,
+		sourceIncludes:    includes,
+		generatedIncludes: generatedIncludes,
+		sourceInputs:      sourceInputs,
 	}, nil
 }
 
@@ -676,6 +743,12 @@ func (s *configSourceScanner) scanFile(
 	for symbol, defined := range sourceProfilePredefinedSymbols(profile) {
 		predefined[symbol] = defined
 	}
+	if config != nil {
+		for _, binding := range sourceConfigPredefinedSymbols {
+			predefined[binding.predefined] =
+				config.ShouldWrite(binding.config) && config.Value(binding.config) == "y"
+		}
+	}
 	predefined["__ASSEMBLY__"] = assembly
 	predefined["__ASSEMBLER__"] = assembly
 	hasInclude := func(operand string) preprocessorBoolean {
@@ -689,7 +762,7 @@ func (s *configSourceScanner) scanFile(
 		if path == "cet.h" {
 			return preprocessorTrue
 		}
-		if includeProvidedOutsideSourceTree(path) {
+		if generatedHeaderInclude(path) || compilerProvidedInclude(path) {
 			return preprocessorUnknown
 		}
 		return preprocessorFalse
@@ -1249,7 +1322,7 @@ func modeledRecursiveTemplateInclude(treePath, operand string) bool {
 		strings.TrimSpace(operand) == "TRACE_INCLUDE(TRACE_INCLUDE_FILE)"
 }
 
-func includeProvidedOutsideSourceTree(path string) bool {
+func generatedHeaderInclude(path string) bool {
 	path = filepath.ToSlash(strings.TrimSpace(path))
 	if strings.HasPrefix(path, "generated/") ||
 		strings.HasPrefix(path, "uapi/generated/") ||
@@ -1258,9 +1331,19 @@ func includeProvidedOutsideSourceTree(path string) bool {
 		return true
 	}
 	switch path {
+	case "kvm-asm-offsets.h", "linux/version.h", "linux/utsrelease.h":
+		return true
+	default:
+		return false
+	}
+}
+
+func compilerProvidedInclude(path string) bool {
+	path = filepath.ToSlash(strings.TrimSpace(path))
+	switch path {
 	case "float.h", "iso646.h", "limits.h", "stdalign.h", "stdarg.h",
 		"stdatomic.h", "stdbool.h", "stddef.h", "stdint.h", "stdnoreturn.h",
-		"cet.h", "linux/version.h":
+		"cet.h":
 		return true
 	default:
 		return false
@@ -1517,6 +1600,34 @@ func includeCandidates(inc string) []string {
 	return candidates
 }
 
+func includeUsesGeneratedAsmWrapper(inc string, resolved []string) bool {
+	inc = filepath.ToSlash(strings.TrimSpace(inc))
+	generic := ""
+	if rest, ok := strings.CutPrefix(inc, "asm/"); ok {
+		generic = "asm-generic/" + rest
+	} else if rest, ok := strings.CutPrefix(inc, "uapi/asm/"); ok {
+		generic = "uapi/asm-generic/" + rest
+	}
+	if generic == "" {
+		return false
+	}
+	for _, path := range resolved {
+		path = filepath.ToSlash(path)
+		if path == generic || strings.HasSuffix(path, "/"+generic) {
+			return true
+		}
+	}
+	return false
+}
+
+func linuxLibfdtEnvironmentWrapper(path string) bool {
+	path = filepath.ToSlash(path)
+	if path == "include/linux/libfdt.h" {
+		return true
+	}
+	return strings.HasPrefix(path, "lib/fdt") && strings.HasSuffix(path, ".c")
+}
+
 func (s *configSourceScanner) absForTreePath(path string) (string, bool) {
 	path, ok := cleanSourceTreePath(path)
 	if !ok {
@@ -1539,6 +1650,25 @@ func (s *configSourceScanner) absForTreePath(path string) (string, bool) {
 	}
 	s.sourceCache.treePaths[path] = resolved
 	return resolved.abs, resolved.exists
+}
+
+func (s *configSourceScanner) absForTreeDirectory(path string) (string, bool) {
+	path, ok := cleanSourceTreePath(path)
+	if !ok {
+		return "", false
+	}
+	if s.sourceRoot != "" {
+		abs := filepath.Join(s.sourceRoot, filepath.FromSlash(path))
+		if info, err := os.Stat(abs); err == nil && info.IsDir() {
+			return abs, true
+		}
+	}
+	if mapped, ok := mappedSourceRootPath(path, s.sourceRoots); ok {
+		if info, err := os.Stat(mapped); err == nil && info.IsDir() {
+			return mapped, true
+		}
+	}
+	return "", false
 }
 
 func cleanSourceTreePath(path string) (string, bool) {

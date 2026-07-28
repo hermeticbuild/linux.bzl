@@ -39,6 +39,31 @@ _X86_OBJTOOL_SRCS = [
     "tools/objtool/weak.c",
 ]
 
+def _generated_header_family_dependency_ids(family_ids, family_dependencies):
+    if not family_ids:
+        if family_dependencies:
+            fail("generated-header family dependencies require family content IDs")
+        return {}
+    if sorted(family_dependencies.keys()) != sorted(family_ids.keys()):
+        fail(
+            "generated-header dependency families %s do not match content-ID families %s" %
+            (sorted(family_dependencies.keys()), sorted(family_ids.keys())),
+        )
+    flattened = {}
+    for family_name, dependencies in family_dependencies.items():
+        if ":" in family_name or type(dependencies) != "dict":
+            fail("invalid generated-header dependency family %r" % family_name)
+        for dependency_name, dependency_id in dependencies.items():
+            if ":" in dependency_name or dependency_name not in family_ids:
+                fail("generated-header family %s has invalid dependency %r" % (family_name, dependency_name))
+            if family_ids[dependency_name] != dependency_id:
+                fail(
+                    "generated-header family %s dependency %s ID does not match selected family" %
+                    (family_name, dependency_name),
+                )
+            flattened["%s:%s" % (family_name, dependency_name)] = dependency_id
+    return flattened
+
 def linux_x86_host_tools(
         name,
         config,
@@ -47,7 +72,9 @@ def linux_x86_host_tools(
         source_root = None,
         source_tree = None,
         env = None,
-        generated_headers_content_id = "",
+        generated_header_family_dependencies = {},
+        generated_header_family_ids = {},
+        reusable_generated_headers = [],
         visibility = None):
     """Defines the source-tree-specific host tools required by x86 native builds."""
     if env == None:
@@ -79,11 +106,16 @@ def linux_x86_host_tools(
         asm_offsets_c = source_label(source_repo, "arch/x86/kernel/asm-offsets.c"),
         bounds_c = source_label(source_repo, "kernel/bounds.c"),
         config = config,
-        content_id = generated_headers_content_id,
+        family_dependency_ids = _generated_header_family_dependency_ids(
+            generated_header_family_ids,
+            generated_header_family_dependencies,
+        ),
+        family_content_ids = generated_header_family_ids,
         cpufeatures_h = source_label(source_repo, "arch/x86/include/asm/cpufeatures.h"),
         kvm_asm_offsets_c = source_label(source_repo, "arch/x86/kvm/kvm-asm-offsets.c"),
         orc_types_h = source_label(source_repo, "arch/x86/include/asm/orc_types.h"),
         required_features_h = source_label(source_repo, "x86_required_features_h"),
+        reusable_generated_headers = reusable_generated_headers if generated_header_family_ids else [],
         rq_offsets_c = source_label(source_repo, "rq_offsets_c"),
         source_root = common.source_root,
         source_tree = common.source_tree,
@@ -345,7 +377,9 @@ def linux_x86_configured_host_tools(
         source_repo,
         source_root = None,
         source_tree = None,
-        generated_headers_content_id = "",
+        generated_header_family_dependencies = {},
+        generated_header_family_ids = {},
+        reusable_generated_headers = [],
         visibility = None):
     """Adds only the config-sensitive x86 headers to a shared host-tool set."""
     if source_root == None:
@@ -358,11 +392,16 @@ def linux_x86_configured_host_tools(
         asm_offsets_c = source_label(source_repo, "arch/x86/kernel/asm-offsets.c"),
         bounds_c = source_label(source_repo, "kernel/bounds.c"),
         config = config,
-        content_id = generated_headers_content_id,
+        family_dependency_ids = _generated_header_family_dependency_ids(
+            generated_header_family_ids,
+            generated_header_family_dependencies,
+        ),
+        family_content_ids = generated_header_family_ids,
         cpufeatures_h = source_label(source_repo, "arch/x86/include/asm/cpufeatures.h"),
         kvm_asm_offsets_c = source_label(source_repo, "arch/x86/kvm/kvm-asm-offsets.c"),
         orc_types_h = source_label(source_repo, "arch/x86/include/asm/orc_types.h"),
         required_features_h = source_label(source_repo, "x86_required_features_h"),
+        reusable_generated_headers = reusable_generated_headers if generated_header_family_ids else [],
         rq_offsets_c = source_label(source_repo, "rq_offsets_c"),
         source_root = source_root,
         source_tree = source_tree,

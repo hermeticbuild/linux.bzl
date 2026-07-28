@@ -23,7 +23,7 @@ per-directory overrides.
 
 Generator `v0.0.14` introduces opt-in schema `v0.0.13`. It emits one
 content-addressed graph for a base config and all overlays, exact source-input
-digests, indexed config payloads and generated-header groups, and canonical
+digests, indexed config payloads and generated-header families, and canonical
 base/delta image rules. The rules repository must remain on schema `v0.0.12`
 until all six `v0.0.14` host archives have been published and pinned.
 
@@ -37,7 +37,7 @@ until all six `v0.0.14` host archives have been published and pinned.
    valid profiles and that a modified but compatible source tree is accepted.
 4. Exercise v0.0.13 with the base, debug/BTF, and compression overlays in one
    invocation. Verify that identical object actions and generated-header
-   footprints have one content target, changed actions have distinct targets,
+   family identities have one content target, changed actions have distinct targets,
    and unresolved potentially active includes fail closed.
 5. Build the v0.0.12 and v0.0.13 graphs from identical configs and compare
    kernel image, `vmlinux`, `System.map`, config, and module outputs bit for

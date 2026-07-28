@@ -2,25 +2,368 @@ package kconfig
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 )
 
+const (
+	compactGeneratedHeaderFamilyAll         = "all"
+	compactGeneratedHeaderFamilyStatic      = "static"
+	compactGeneratedHeaderFamilyTimeconst   = "timeconst"
+	compactGeneratedHeaderFamilyCompile     = "compile"
+	compactGeneratedHeaderFamilyVersion     = "version"
+	compactGeneratedHeaderFamilyUTSRelease  = "utsrelease"
+	compactGeneratedHeaderFamilyUTSVersion  = "utsversion"
+	compactGeneratedHeaderFamilyCPUFeatures = "cpufeatures"
+	compactGeneratedHeaderFamilyBounds      = "bounds"
+	compactGeneratedHeaderFamilyASMOffsets  = "asm_offsets"
+	compactGeneratedHeaderFamilyRQOffsets   = "rq_offsets"
+	compactGeneratedHeaderFamilyKVMOffsets  = "kvm_offsets"
+	generatedHeaderProducerABIKey           = "COMPILE_ENVIRONMENT_ABI"
+)
+
 var generatedHeaderConfigSymbols = []string{
+	"CONFIG_GCC_PLUGINS",
 	"CONFIG_HZ",
 	"CONFIG_LOCALVERSION",
 	"CONFIG_PREEMPT_BUILD",
 	"CONFIG_PREEMPT_DYNAMIC",
 	"CONFIG_PREEMPT_RT",
+	"CONFIG_RANDSTRUCT",
 	"CONFIG_SMP",
 	"CONFIG_STACKPROTECTOR_PER_TASK",
 }
 
-func generatedHeaderFootprint(
+var generatedHeaderOffsetsForcedSources = []compactGeneratedHeaderSource{
+	{path: "include/linux/compiler-version.h"},
+	{path: "include/linux/kconfig.h"},
+	{path: "include/linux/compiler_types.h"},
+}
+
+type compactGeneratedHeaderFamilyFootprint struct {
+	name         string
+	fragment     map[string]string
+	dependencies []string
+	sourceInputs []CompactSourceInput
+}
+
+type compactGeneratedHeaderSource struct {
+	path         string
+	includeRoots []string
+}
+
+func generatedHeaderOffsetsSources(sources ...compactGeneratedHeaderSource) []compactGeneratedHeaderSource {
+	out := append([]compactGeneratedHeaderSource(nil), generatedHeaderOffsetsForcedSources...)
+	return append(out, sources...)
+}
+
+func generatedHeaderFamilyFootprints(
 	config *ResolvedConfig,
 	opts CompactMetadataOptions,
 	scanner *configSourceScanner,
-) (map[string]string, []CompactSourceInput, string, error) {
+) ([]compactGeneratedHeaderFamilyFootprint, error) {
+	all, err := generatedHeaderAllFootprint(config, opts, scanner)
+	if err != nil {
+		return nil, err
+	}
+	if opts.Srcarch != "x86" {
+		return bindGeneratedHeaderProducerABI(
+			[]compactGeneratedHeaderFamilyFootprint{all},
+			opts.CompileEnvironmentABI,
+		), nil
+	}
+
+	kernelFlagSymbols := KernelFlagsConfigSymbols()
+	static, err := generatedHeaderFamilyFootprint(
+		config,
+		scanner,
+		compactGeneratedHeaderFamilyStatic,
+		nil,
+		nil,
+		[]string{
+			"arch/x86/include/asm/Kbuild",
+			"arch/x86/include/asm/orc_types.h",
+			"arch/x86/include/uapi/asm/Kbuild",
+			"arch/x86/entry/syscalls/syscall_32.tbl",
+			"arch/x86/entry/syscalls/syscall_64.tbl",
+			"include/xen/interface/xen-mca.h",
+			"include/xen/interface/xen.h",
+			"include/xen/interface/xenpmu.h",
+		},
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	timeconst, err := generatedHeaderFamilyFootprint(
+		config,
+		scanner,
+		compactGeneratedHeaderFamilyTimeconst,
+		[]string{"CONFIG_HZ"},
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	compile, err := generatedHeaderFamilyFootprint(
+		config,
+		scanner,
+		compactGeneratedHeaderFamilyCompile,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	version, err := generatedHeaderFamilyFootprint(
+		config,
+		scanner,
+		compactGeneratedHeaderFamilyVersion,
+		nil,
+		nil,
+		nil,
+		nil,
+		map[string]string{"KERNEL_VERSION": opts.KernelVersion},
+	)
+	if err != nil {
+		return nil, err
+	}
+	utsrelease, err := generatedHeaderFamilyFootprint(
+		config,
+		scanner,
+		compactGeneratedHeaderFamilyUTSRelease,
+		[]string{"CONFIG_LOCALVERSION"},
+		nil,
+		nil,
+		nil,
+		map[string]string{"KERNEL_VERSION": opts.KernelVersion},
+	)
+	if err != nil {
+		return nil, err
+	}
+	utsversion, err := generatedHeaderFamilyFootprint(
+		config,
+		scanner,
+		compactGeneratedHeaderFamilyUTSVersion,
+		[]string{
+			"CONFIG_PREEMPT_BUILD",
+			"CONFIG_PREEMPT_DYNAMIC",
+			"CONFIG_PREEMPT_RT",
+			"CONFIG_SMP",
+		},
+		nil,
+		nil,
+		nil,
+		map[string]string{
+			"KBUILD_BUILD_TIMESTAMP": "1970-01-01T00:00:00Z",
+			"KBUILD_BUILD_VERSION":   "1",
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	cpufeatureSymbols := []string{}
+	for symbol := range config.Effective {
+		if strings.HasPrefix(symbol, "CONFIG_X86_REQUIRED_FEATURE_") ||
+			strings.HasPrefix(symbol, "CONFIG_X86_DISABLED_FEATURE_") {
+			cpufeatureSymbols = append(cpufeatureSymbols, symbol)
+		}
+	}
+	cpufeatures, err := generatedHeaderFamilyFootprint(
+		config,
+		scanner,
+		compactGeneratedHeaderFamilyCPUFeatures,
+		cpufeatureSymbols,
+		nil,
+		[]string{
+			"arch/x86/include/asm/cpufeatures.h",
+			"arch/x86/include/asm/required-features.h",
+		},
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	bounds, err := generatedHeaderFamilyFootprint(
+		config,
+		scanner,
+		compactGeneratedHeaderFamilyBounds,
+		kernelFlagSymbols,
+		generatedHeaderOffsetsSources(compactGeneratedHeaderSource{path: "kernel/bounds.c"}),
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	asmOffsets, err := generatedHeaderFamilyFootprint(
+		config,
+		scanner,
+		compactGeneratedHeaderFamilyASMOffsets,
+		kernelFlagSymbols,
+		generatedHeaderOffsetsSources(compactGeneratedHeaderSource{path: "arch/x86/kernel/asm-offsets.c"}),
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	rqOffsets, err := generatedHeaderFamilyFootprint(
+		config,
+		scanner,
+		compactGeneratedHeaderFamilyRQOffsets,
+		kernelFlagSymbols,
+		generatedHeaderOffsetsSources(compactGeneratedHeaderSource{path: "kernel/sched/rq-offsets.c"}),
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	kvmOffsets, err := generatedHeaderFamilyFootprint(
+		config,
+		scanner,
+		compactGeneratedHeaderFamilyKVMOffsets,
+		kernelFlagSymbols,
+		generatedHeaderOffsetsSources(compactGeneratedHeaderSource{
+			path:         "arch/x86/kvm/kvm-asm-offsets.c",
+			includeRoots: []string{"arch/x86/kvm"},
+		}),
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return bindGeneratedHeaderProducerABI([]compactGeneratedHeaderFamilyFootprint{
+		static,
+		timeconst,
+		compile,
+		version,
+		utsrelease,
+		utsversion,
+		cpufeatures,
+		bounds,
+		asmOffsets,
+		rqOffsets,
+		kvmOffsets,
+		all,
+	}, opts.CompileEnvironmentABI), nil
+}
+
+func bindGeneratedHeaderProducerABI(
+	families []compactGeneratedHeaderFamilyFootprint,
+	abi string,
+) []compactGeneratedHeaderFamilyFootprint {
+	for i := range families {
+		families[i].fragment[generatedHeaderProducerABIKey] = abi
+	}
+	return families
+}
+
+func generatedHeaderFamilyFootprint(
+	config *ResolvedConfig,
+	scanner *configSourceScanner,
+	name string,
+	symbols []string,
+	sources []compactGeneratedHeaderSource,
+	digestOnlyPaths []string,
+	dependencies []string,
+	synthetic map[string]string,
+) (compactGeneratedHeaderFamilyFootprint, error) {
+	refs := map[string]bool{}
+	dependencySet := map[string]bool{}
+	for _, dependency := range dependencies {
+		dependencySet[dependency] = true
+	}
+	for _, symbol := range symbols {
+		refs[symbol] = true
+	}
+	sourceInputs := []CompactSourceInput{}
+	for _, source := range sources {
+		if _, ok := scanner.absForTreePath(source.path); !ok {
+			continue
+		}
+		closure, err := scanner.closureForSourceConfig(source.path, source.includeRoots, config)
+		if err != nil {
+			return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
+				"scan generated-header family %s input %s: %w",
+				name,
+				source.path,
+				err,
+			)
+		}
+		for _, ref := range closure.refs {
+			refs[ref] = true
+		}
+		for _, include := range closure.generatedIncludes {
+			dependency, precise := generatedHeaderFamilyNameForInclude(include)
+			if dependency == "" {
+				continue
+			}
+			if !precise || dependency == compactGeneratedHeaderFamilyAll {
+				return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
+					"generated-header family %s input %s has unclassified generated include %q",
+					name,
+					source.path,
+					include,
+				)
+			}
+			if generatedHeaderFamilyGenerationOrder(dependency) >=
+				generatedHeaderFamilyGenerationOrder(name) {
+				continue
+			}
+			dependencySet[dependency] = true
+		}
+		sourceInputs = appendUniqueSourceInputs(sourceInputs, closure.sourceInputs...)
+	}
+	for _, path := range digestOnlyPaths {
+		if _, ok := scanner.absForTreePath(path); !ok {
+			continue
+		}
+		input, err := scanner.inputForTreePath(path)
+		if err != nil {
+			return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
+				"digest generated-header family %s input %s: %w",
+				name,
+				path,
+				err,
+			)
+		}
+		sourceInputs = appendUniqueSourceInputs(sourceInputs, input)
+	}
+	fragment := generatedHeaderConfigFragment(config, refs)
+	for key, value := range synthetic {
+		fragment[key] = value
+	}
+	dependencies = sortedStringSet(dependencySet)
+	return compactGeneratedHeaderFamilyFootprint{
+		name:         name,
+		fragment:     fragment,
+		dependencies: dependencies,
+		sourceInputs: sourceInputs,
+	}, nil
+}
+
+func generatedHeaderAllFootprint(
+	config *ResolvedConfig,
+	opts CompactMetadataOptions,
+	scanner *configSourceScanner,
+) (compactGeneratedHeaderFamilyFootprint, error) {
 	refs := map[string]bool{}
 	for _, symbol := range generatedHeaderConfigSymbols {
 		refs[symbol] = true
@@ -38,22 +381,19 @@ func generatedHeaderFootprint(
 	}
 
 	sourceInputs := []CompactSourceInput{}
-	sourcePaths := []string{
-		"include/linux/compiler-version.h",
-		"include/linux/compiler_types.h",
-		"include/linux/kconfig.h",
-		"kernel/bounds.c",
-		"kernel/sched/rq-offsets.c",
-	}
-	digestOnlyPaths := []string{
-		"Makefile",
-		"scripts/setlocalversion",
-	}
+	sourcePaths := generatedHeaderOffsetsSources(
+		compactGeneratedHeaderSource{path: "kernel/bounds.c"},
+		compactGeneratedHeaderSource{path: "kernel/sched/rq-offsets.c"},
+	)
+	digestOnlyPaths := []string{}
 	switch opts.Srcarch {
 	case "x86":
 		sourcePaths = append(sourcePaths,
-			"arch/x86/kernel/asm-offsets.c",
-			"arch/x86/kvm/kvm-asm-offsets.c",
+			compactGeneratedHeaderSource{path: "arch/x86/kernel/asm-offsets.c"},
+			compactGeneratedHeaderSource{
+				path:         "arch/x86/kvm/kvm-asm-offsets.c",
+				includeRoots: []string{"arch/x86/kvm"},
+			},
 		)
 		digestOnlyPaths = append(digestOnlyPaths,
 			"arch/x86/Makefile",
@@ -72,8 +412,11 @@ func generatedHeaderFootprint(
 		)
 	case "arm64":
 		sourcePaths = append(sourcePaths,
-			"arch/arm64/kernel/asm-offsets.c",
-			"arch/arm64/kvm/hyp/hyp-constants.c",
+			compactGeneratedHeaderSource{path: "arch/arm64/kernel/asm-offsets.c"},
+			compactGeneratedHeaderSource{
+				path:         "arch/arm64/kvm/hyp/hyp-constants.c",
+				includeRoots: []string{"arch/arm64/kvm/hyp/include"},
+			},
 		)
 		digestOnlyPaths = append(digestOnlyPaths,
 			"arch/arm/vdso/vdsomunge.c",
@@ -87,19 +430,28 @@ func generatedHeaderFootprint(
 		}
 	}
 	for _, source := range sourcePaths {
-		if _, ok := scanner.absForTreePath(source); !ok {
+		if _, ok := scanner.absForTreePath(source.path); !ok {
 			continue
 		}
-		var includeRoots []string
-		if source == "arch/x86/kvm/kvm-asm-offsets.c" {
-			includeRoots = []string{"arch/x86/kvm"}
-		}
-		closure, err := scanner.closureForSourceConfig(source, includeRoots, config)
+		closure, err := scanner.closureForSourceConfig(source.path, source.includeRoots, config)
 		if err != nil {
-			return nil, nil, "", fmt.Errorf("scan generated-header input %s: %w", source, err)
+			return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
+				"scan generated-header all-family input %s: %w",
+				source.path,
+				err,
+			)
 		}
 		for _, ref := range closure.refs {
 			refs[ref] = true
+		}
+		for _, include := range closure.generatedIncludes {
+			if _, precise := generatedHeaderFamilyNameForInclude(include); !precise {
+				return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
+					"generated-header all-family input %s has unclassified generated include %q",
+					source.path,
+					include,
+				)
+			}
 		}
 		sourceInputs = appendUniqueSourceInputs(sourceInputs, closure.sourceInputs...)
 	}
@@ -109,7 +461,11 @@ func generatedHeaderFootprint(
 		}
 		input, err := scanner.inputForTreePath(path)
 		if err != nil {
-			return nil, nil, "", fmt.Errorf("digest generated-header input %s: %w", path, err)
+			return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
+				"digest generated-header all-family input %s: %w",
+				path,
+				err,
+			)
 		}
 		sourceInputs = appendUniqueSourceInputs(sourceInputs, input)
 	}
@@ -123,7 +479,11 @@ func generatedHeaderFootprint(
 		} {
 			closure, err := scanner.closureForSourceDirConfigProfile(scan.dir, config, scan.profile)
 			if err != nil {
-				return nil, nil, "", fmt.Errorf("scan generated-header input directory %s: %w", scan.dir, err)
+				return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
+					"scan generated-header all-family input directory %s: %w",
+					scan.dir,
+					err,
+				)
 			}
 			for _, ref := range closure.refs {
 				refs[ref] = true
@@ -141,10 +501,15 @@ func generatedHeaderFootprint(
 			if _, ok := scanner.absForTreePath(scan.source); !ok {
 				continue
 			}
-			closure, err := scanner.closureForSourceConfigProfile(scan.source, nil, config, scan.profile)
+			closure, err := scanner.closureForSourceConfigProfile(
+				scan.source,
+				nil,
+				config,
+				scan.profile,
+			)
 			if err != nil {
-				return nil, nil, "", fmt.Errorf(
-					"scan generated-header forced input %s (%s): %w",
+				return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
+					"scan generated-header all-family forced input %s (%s): %w",
 					scan.source,
 					scan.profile,
 					err,
@@ -157,11 +522,19 @@ func generatedHeaderFootprint(
 		}
 	}
 
-	keys := make([]string, 0, len(refs))
-	for key := range refs {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	fragment := generatedHeaderConfigFragment(config, refs)
+	fragment["KBUILD_BUILD_TIMESTAMP"] = "1970-01-01T00:00:00Z"
+	fragment["KBUILD_BUILD_VERSION"] = "1"
+	fragment["KERNEL_VERSION"] = opts.KernelVersion
+	return compactGeneratedHeaderFamilyFootprint{
+		name:         compactGeneratedHeaderFamilyAll,
+		fragment:     fragment,
+		sourceInputs: sourceInputs,
+	}, nil
+}
+
+func generatedHeaderConfigFragment(config *ResolvedConfig, refs map[string]bool) map[string]string {
+	keys := sortedStringSet(refs)
 	fragment := make(map[string]string, len(keys))
 	for _, key := range keys {
 		if config.ShouldWrite(key) {
@@ -170,5 +543,68 @@ func generatedHeaderFootprint(
 			fragment[key] = "n"
 		}
 	}
-	return fragment, sourceInputs, "exact", nil
+	return fragment
+}
+
+func generatedHeaderFamilyNameForInclude(path string) (string, bool) {
+	path = strings.TrimSpace(strings.TrimPrefix(strings.ReplaceAll(path, "\\", "/"), "./"))
+	switch path {
+	case "generated/autoconf.h",
+		"generated/integer-wrap.h",
+		"generated/rustc_cfg":
+		return "", true
+	case "generated/timeconst.h":
+		return compactGeneratedHeaderFamilyTimeconst, true
+	case "generated/compile.h":
+		return compactGeneratedHeaderFamilyCompile, true
+	case "linux/version.h", "generated/uapi/linux/version.h":
+		return compactGeneratedHeaderFamilyVersion, true
+	case "linux/utsrelease.h", "generated/utsrelease.h":
+		return compactGeneratedHeaderFamilyUTSRelease, true
+	case "generated/utsversion.h":
+		return compactGeneratedHeaderFamilyUTSVersion, true
+	case "asm/cpufeaturemasks.h", "generated/asm/cpufeaturemasks.h":
+		return compactGeneratedHeaderFamilyCPUFeatures, true
+	case "generated/bounds.h":
+		return compactGeneratedHeaderFamilyBounds, true
+	case "generated/asm-offsets.h":
+		return compactGeneratedHeaderFamilyASMOffsets, true
+	case "generated/rq-offsets.h":
+		return compactGeneratedHeaderFamilyRQOffsets, true
+	case "kvm-asm-offsets.h", "generated/kvm-asm-offsets.h":
+		return compactGeneratedHeaderFamilyKVMOffsets, true
+	}
+	if strings.HasPrefix(path, "asm/") || strings.HasPrefix(path, "uapi/asm/") {
+		return compactGeneratedHeaderFamilyStatic, true
+	}
+	if generatedHeaderInclude(path) {
+		return compactGeneratedHeaderFamilyAll, false
+	}
+	return "", false
+}
+
+func generatedHeaderFamilyGenerationOrder(name string) int {
+	switch name {
+	case compactGeneratedHeaderFamilyStatic:
+		return 0
+	case compactGeneratedHeaderFamilyTimeconst:
+		return 1
+	case compactGeneratedHeaderFamilyCompile,
+		compactGeneratedHeaderFamilyVersion,
+		compactGeneratedHeaderFamilyUTSRelease,
+		compactGeneratedHeaderFamilyUTSVersion:
+		return 2
+	case compactGeneratedHeaderFamilyCPUFeatures:
+		return 3
+	case compactGeneratedHeaderFamilyBounds:
+		return 4
+	case compactGeneratedHeaderFamilyASMOffsets:
+		return 5
+	case compactGeneratedHeaderFamilyRQOffsets:
+		return 6
+	case compactGeneratedHeaderFamilyKVMOffsets:
+		return 7
+	default:
+		return -1
+	}
 }

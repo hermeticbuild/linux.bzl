@@ -12,11 +12,11 @@ import (
 )
 
 const (
-	compactConfigPayloadDomain      = "linux-compact-config-payload-v1"
-	compactCompileEnvironmentDomain = "linux-compact-compile-environment-v1"
-	compactHeaderGroupDomain        = "linux-compact-generated-headers-v1"
-	compactObjectContentDomain      = "linux-compact-object-v1"
-	compactShortIDLength            = 24
+	compactConfigPayloadDomain         = "linux-compact-config-payload-v1"
+	compactCompileEnvironmentDomain    = "linux-compact-compile-environment-v2"
+	compactGeneratedHeaderFamilyDomain = "linux-compact-generated-header-family-v1"
+	compactObjectContentDomain         = "linux-compact-object-v1"
+	compactShortIDLength               = 24
 )
 
 var compactContentSeparator = []byte{0}
@@ -95,30 +95,58 @@ func compactFullConfigFragment(config *ResolvedConfig) map[string]string {
 	return fragment
 }
 
-func newCompactHeaderGroup(configPayloadID, label, srcarch, footprint string, sourceInputs []CompactSourceInput) CompactHeaderGroup {
-	values := []string{srcarch, configPayloadID, footprint}
-	for _, input := range sourceInputs {
-		values = append(values, input.Path+"\x00"+input.Digest)
+func newCompactGeneratedHeaderFamily(
+	name string,
+	configPayloadID string,
+	label string,
+	srcarch string,
+	dependencies []string,
+	sourceInputs []CompactSourceInput,
+) CompactGeneratedHeaderFamily {
+	dependencies = append([]string(nil), dependencies...)
+	sort.Strings(dependencies)
+	sourceInputs = append([]CompactSourceInput(nil), sourceInputs...)
+	sort.Slice(sourceInputs, func(i, j int) bool {
+		if sourceInputs[i].Path != sourceInputs[j].Path {
+			return sourceInputs[i].Path < sourceInputs[j].Path
+		}
+		return sourceInputs[i].Digest < sourceInputs[j].Digest
+	})
+	hasher := newCompactContentHasher(compactGeneratedHeaderFamilyDomain)
+	hasher.writeValue("name=", name)
+	hasher.writeValue("srcarch=", srcarch)
+	hasher.writeValue("config_payload=", configPayloadID)
+	for _, dependency := range dependencies {
+		hasher.writeValue("dependency=", dependency)
 	}
-	return CompactHeaderGroup{
-		ID:            compactContentID(compactHeaderGroupDomain, values...),
+	for _, input := range sourceInputs {
+		hasher.writeValue("source_input=", input.Path, "\x00", input.Digest)
+	}
+	return CompactGeneratedHeaderFamily{
+		ID:            hasher.id(),
+		Name:          name,
 		ConfigPayload: configPayloadID,
 		Labels:        compactOptionalString(label),
 		Srcarch:       srcarch,
-		Footprint:     footprint,
-		SourceInputs:  append([]CompactSourceInput(nil), sourceInputs...),
+		Dependencies:  dependencies,
+		SourceInputs:  sourceInputs,
 	}
 }
 
-func newCompactCompileEnvironment(abi, configPayloadID string, headerGroupIDs []string) CompactCompileEnvironment {
-	headerGroupIDs = append([]string(nil), headerGroupIDs...)
-	sort.Strings(headerGroupIDs)
-	values := append([]string{abi, configPayloadID}, headerGroupIDs...)
+func newCompactCompileEnvironment(abi, configPayloadID string, generatedHeaderFamilyIDs []string) CompactCompileEnvironment {
+	generatedHeaderFamilyIDs = append([]string(nil), generatedHeaderFamilyIDs...)
+	sort.Strings(generatedHeaderFamilyIDs)
+	hasher := newCompactContentHasher(compactCompileEnvironmentDomain)
+	hasher.writeValue("abi=", abi)
+	hasher.writeValue("config_payload=", configPayloadID)
+	for _, familyID := range generatedHeaderFamilyIDs {
+		hasher.writeValue("generated_header_family=", familyID)
+	}
 	return CompactCompileEnvironment{
-		ID:            compactContentID(compactCompileEnvironmentDomain, values...),
-		ABI:           abi,
-		ConfigPayload: configPayloadID,
-		HeaderGroups:  headerGroupIDs,
+		ID:                      hasher.id(),
+		ABI:                     abi,
+		ConfigPayload:           configPayloadID,
+		GeneratedHeaderFamilies: generatedHeaderFamilyIDs,
 	}
 }
 
@@ -166,8 +194,8 @@ func compactCompileEnvironmentValue(environment CompactCompileEnvironment) strin
 	out.WriteString(fmt.Sprintf("%q", environment.ABI))
 	out.WriteString(`,"config_payload":`)
 	out.WriteString(fmt.Sprintf("%q", environment.ConfigPayload))
-	out.WriteString(`,"header_groups":[`)
-	for i, id := range environment.HeaderGroups {
+	out.WriteString(`,"generated_header_families":[`)
+	for i, id := range environment.GeneratedHeaderFamilies {
 		if i != 0 {
 			out.WriteByte(',')
 		}
@@ -464,11 +492,11 @@ func (metadata *CompactMetadata) canonicalizeSourceInputIndex() error {
 		}
 		return addInlineInputs(inline, context)
 	}
-	for _, group := range metadata.HeaderGroups {
+	for _, family := range metadata.GeneratedHeaderFamilies {
 		if err := scanReference(
-			group.SourceInputGroup,
-			group.SourceInputs,
-			fmt.Sprintf("header group %q", group.ID),
+			family.SourceInputGroup,
+			family.SourceInputs,
+			fmt.Sprintf("generated header family %q", family.ID),
 		); err != nil {
 			return err
 		}
@@ -544,14 +572,17 @@ func (metadata *CompactMetadata) canonicalizeSourceInputIndex() error {
 		groupSet[encoded] = true
 		return encoded, nil
 	}
-	headerInlineGroups := make([]string, len(metadata.HeaderGroups))
-	for i, group := range metadata.HeaderGroups {
-		if group.SourceInputGroup == 0 {
-			encoded, err := addInlineGroup(group.SourceInputs, fmt.Sprintf("header group %q", group.ID))
+	familyInlineGroups := make([]string, len(metadata.GeneratedHeaderFamilies))
+	for i, family := range metadata.GeneratedHeaderFamilies {
+		if family.SourceInputGroup == 0 {
+			encoded, err := addInlineGroup(
+				family.SourceInputs,
+				fmt.Sprintf("generated header family %q", family.ID),
+			)
 			if err != nil {
 				return err
 			}
-			headerInlineGroups[i] = encoded
+			familyInlineGroups[i] = encoded
 		}
 	}
 	variantInlineGroups := make([]string, len(metadata.ObjectVariants))
@@ -575,15 +606,15 @@ func (metadata *CompactMetadata) canonicalizeSourceInputIndex() error {
 		groupIndices[encoded] = i + 1
 	}
 
-	for i := range metadata.HeaderGroups {
-		encoded := headerInlineGroups[i]
-		if metadata.HeaderGroups[i].SourceInputGroup != 0 {
-			encoded = oldGroupEncodings[metadata.HeaderGroups[i].SourceInputGroup-1]
+	for i := range metadata.GeneratedHeaderFamilies {
+		encoded := familyInlineGroups[i]
+		if metadata.GeneratedHeaderFamilies[i].SourceInputGroup != 0 {
+			encoded = oldGroupEncodings[metadata.GeneratedHeaderFamilies[i].SourceInputGroup-1]
 		}
-		metadata.HeaderGroups[i].SourceInputs = nil
-		metadata.HeaderGroups[i].SourceInputGroup = 0
+		metadata.GeneratedHeaderFamilies[i].SourceInputs = nil
+		metadata.GeneratedHeaderFamilies[i].SourceInputGroup = 0
 		if encoded != "" {
-			metadata.HeaderGroups[i].SourceInputGroup = groupIndices[encoded]
+			metadata.GeneratedHeaderFamilies[i].SourceInputGroup = groupIndices[encoded]
 		}
 	}
 	for i := range metadata.ObjectVariants {
@@ -661,11 +692,21 @@ func (metadata *CompactMetadata) validateSourceInputIndex() error {
 		return nil
 	}
 
-	for _, group := range metadata.HeaderGroups {
-		if len(group.SourceInputs) != 0 {
-			return fmt.Errorf("header group %q retains inline source_inputs in v0.0.13 metadata", group.ID)
+	for _, family := range metadata.GeneratedHeaderFamilies {
+		if len(family.SourceInputs) != 0 {
+			return fmt.Errorf(
+				"generated header family %q retains inline source_inputs in v0.0.13 metadata",
+				family.ID,
+			)
 		}
-		if err := validateReference(group.SourceInputGroup, fmt.Sprintf("header group %q", group.ID), ""); err != nil {
+		if family.SourceInputGroup == 0 {
+			continue
+		}
+		if err := validateReference(
+			family.SourceInputGroup,
+			fmt.Sprintf("generated header family %q", family.ID),
+			"",
+		); err != nil {
 			return err
 		}
 	}
@@ -719,7 +760,7 @@ func (environment CompactCompileEnvironment) equal(other CompactCompileEnvironme
 	return environment.ID == other.ID &&
 		environment.ABI == other.ABI &&
 		environment.ConfigPayload == other.ConfigPayload &&
-		reflect.DeepEqual(environment.HeaderGroups, other.HeaderGroups)
+		reflect.DeepEqual(environment.GeneratedHeaderFamilies, other.GeneratedHeaderFamilies)
 }
 
 func sortedCompactConfigPayloads(values map[string]CompactConfigPayload) []CompactConfigPayload {
@@ -740,11 +781,13 @@ func sortedCompactCompileEnvironments(values map[string]CompactCompileEnvironmen
 	return out
 }
 
-func sortedCompactHeaderGroups(values map[string]CompactHeaderGroup) []CompactHeaderGroup {
+func sortedCompactGeneratedHeaderFamilies(values map[string]CompactGeneratedHeaderFamily) []CompactGeneratedHeaderFamily {
 	ids := sortedCompactIDs(values)
-	out := make([]CompactHeaderGroup, 0, len(ids))
+	out := make([]CompactGeneratedHeaderFamily, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, values[id])
+		family := values[id]
+		sort.Strings(family.Labels)
+		out = append(out, family)
 	}
 	return out
 }
@@ -805,33 +848,90 @@ func (metadata *CompactMetadata) validateContentIDs() error {
 		}
 		payloads[payload.ID] = payload
 	}
-	headerGroups := make(map[string]CompactHeaderGroup, len(metadata.HeaderGroups))
-	for _, group := range metadata.HeaderGroups {
-		if err := check("header group", group.ID); err != nil {
+	generatedHeaderFamilies := make(map[string]CompactGeneratedHeaderFamily, len(metadata.GeneratedHeaderFamilies))
+	for _, family := range metadata.GeneratedHeaderFamilies {
+		if err := check("generated header family", family.ID); err != nil {
 			return err
 		}
-		if _, ok := payloads[group.ConfigPayload]; !ok {
-			return fmt.Errorf("header group %s references unknown config payload %s", group.ID, group.ConfigPayload)
+		if family.Name == "" || family.Srcarch == "" || len(family.Labels) == 0 {
+			return fmt.Errorf("generated header family %s has incomplete metadata", family.ID)
+		}
+		for i, dependency := range family.Dependencies {
+			if dependency == family.ID {
+				return fmt.Errorf("generated header family %s depends on itself", family.ID)
+			}
+			if i != 0 && family.Dependencies[i-1] >= dependency {
+				return fmt.Errorf(
+					"generated header family %s has duplicate or non-canonical dependencies",
+					family.ID,
+				)
+			}
+		}
+		if _, ok := payloads[family.ConfigPayload]; !ok {
+			return fmt.Errorf(
+				"generated header family %s references unknown config payload %s",
+				family.ID,
+				family.ConfigPayload,
+			)
 		}
 		inputs, err := metadata.expandedSourceInputGroup(
-			group.SourceInputGroup,
-			group.SourceInputs,
-			fmt.Sprintf("header group %q", group.ID),
+			family.SourceInputGroup,
+			family.SourceInputs,
+			fmt.Sprintf("generated header family %q", family.ID),
 		)
 		if err != nil {
 			return err
 		}
-		expected := newCompactHeaderGroup(
-			group.ConfigPayload,
+		expected := newCompactGeneratedHeaderFamily(
+			family.Name,
+			family.ConfigPayload,
 			"",
-			group.Srcarch,
-			group.Footprint,
+			family.Srcarch,
+			family.Dependencies,
 			inputs,
 		).ID
-		if group.ID != expected {
-			return fmt.Errorf("header group %s canonical inputs hash to %s", group.ID, expected)
+		if family.ID != expected {
+			return fmt.Errorf(
+				"generated header family %s canonical inputs hash to %s",
+				family.ID,
+				expected,
+			)
 		}
-		headerGroups[group.ID] = group
+		generatedHeaderFamilies[family.ID] = family
+	}
+	for _, family := range metadata.GeneratedHeaderFamilies {
+		for _, dependency := range family.Dependencies {
+			if _, ok := generatedHeaderFamilies[dependency]; !ok {
+				return fmt.Errorf(
+					"generated header family %s references unknown dependency %s",
+					family.ID,
+					dependency,
+				)
+			}
+		}
+	}
+	familyStates := map[string]uint8{}
+	var validateFamilyDependencies func(string) error
+	validateFamilyDependencies = func(familyID string) error {
+		switch familyStates[familyID] {
+		case 1:
+			return fmt.Errorf("generated header family dependency cycle at %s", familyID)
+		case 2:
+			return nil
+		}
+		familyStates[familyID] = 1
+		for _, dependency := range generatedHeaderFamilies[familyID].Dependencies {
+			if err := validateFamilyDependencies(dependency); err != nil {
+				return err
+			}
+		}
+		familyStates[familyID] = 2
+		return nil
+	}
+	for familyID := range generatedHeaderFamilies {
+		if err := validateFamilyDependencies(familyID); err != nil {
+			return err
+		}
 	}
 	environments := make(map[string]CompactCompileEnvironment, len(metadata.CompileEnvironments))
 	abi := ""
@@ -846,25 +946,41 @@ func (metadata *CompactMetadata) validateContentIDs() error {
 				environment.ConfigPayload,
 			)
 		}
-		for i, groupID := range environment.HeaderGroups {
-			if _, ok := headerGroups[groupID]; !ok {
+		familyNames := map[string]bool{}
+		for i, familyID := range environment.GeneratedHeaderFamilies {
+			family, ok := generatedHeaderFamilies[familyID]
+			if !ok {
 				return fmt.Errorf(
-					"compile environment %s references unknown header group %s",
+					"compile environment %s references unknown generated header family %s",
 					environment.ID,
-					groupID,
+					familyID,
 				)
 			}
-			if i != 0 && environment.HeaderGroups[i-1] >= groupID {
+			if i != 0 && environment.GeneratedHeaderFamilies[i-1] >= familyID {
 				return fmt.Errorf(
-					"compile environment %s has duplicate or non-canonical header groups",
+					"compile environment %s has duplicate or non-canonical generated header families",
 					environment.ID,
 				)
 			}
+			if familyNames[family.Name] {
+				return fmt.Errorf(
+					"compile environment %s repeats generated header family %q",
+					environment.ID,
+					family.Name,
+				)
+			}
+			familyNames[family.Name] = true
+		}
+		if familyNames[compactGeneratedHeaderFamilyAll] && len(familyNames) != 1 {
+			return fmt.Errorf(
+				"compile environment %s mixes all with precise generated header families",
+				environment.ID,
+			)
 		}
 		expected := newCompactCompileEnvironment(
 			environment.ABI,
 			environment.ConfigPayload,
-			environment.HeaderGroups,
+			environment.GeneratedHeaderFamilies,
 		).ID
 		if environment.ID != expected {
 			return fmt.Errorf("compile environment %s canonical fields hash to %s", environment.ID, expected)

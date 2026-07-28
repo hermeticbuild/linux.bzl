@@ -164,7 +164,7 @@ def compile_environment_abi_test(name):
     _compile_environment_abi_subject(
         name = subject,
         actual = "unexpected-abi",
-        expected = "linux.bzl/compact-v4/llvm-22.1.8/x86/x86",
+        expected = "linux.bzl/compact-v5/llvm-22.1.8/x86/x86",
         tags = ["manual"],
     )
     _compile_environment_abi_failure_test(
@@ -172,20 +172,42 @@ def compile_environment_abi_test(name):
         target_under_test = ":" + subject,
     )
 
-def _header_config_aliases_test_impl(ctx):
+def _generated_header_config_index_test_impl(ctx):
     env = unittest.begin(ctx)
     metadata = {
-        "header_groups": [
+        "generated_header_families": [
             {
                 "id": "1111111111111111111111111111111111111111111111111111111111111111",
+                "name": "static",
+                "labels": [
+                    "//:_base_x86_generated_headers",
+                    "//:_variant_debug_x86_generated_headers",
+                    "//:_variant_lz4_x86_generated_headers",
+                ],
+            },
+            {
+                "dependencies": ["1111111111111111111111111111111111111111111111111111111111111111"],
+                "id": "2222222222222222222222222222222222222222222222222222222222222222",
+                "name": "asm_offsets",
                 "labels": [
                     "//:_base_x86_generated_headers",
                     "//:_variant_lz4_x86_generated_headers",
                 ],
             },
             {
-                "id": "2222222222222222222222222222222222222222222222222222222222222222",
+                "dependencies": ["1111111111111111111111111111111111111111111111111111111111111111"],
+                "id": "3333333333333333333333333333333333333333333333333333333333333333",
+                "name": "asm_offsets",
                 "labels": ["//:_variant_debug_x86_generated_headers"],
+            },
+            {
+                "id": "4444444444444444444444444444444444444444444444444444444444444444",
+                "name": "all",
+                "labels": [
+                    "//:_base_x86_generated_headers",
+                    "//:_variant_debug_x86_generated_headers",
+                    "//:_variant_lz4_x86_generated_headers",
+                ],
             },
         ],
     }
@@ -194,7 +216,7 @@ def _header_config_aliases_test_impl(ctx):
         "debug": "//:_variant_debug_x86_generated_headers",
         "lz4": "//:_variant_lz4_x86_generated_headers",
     }
-    aliases = repositories_test_helpers.header_config_aliases(
+    index = repositories_test_helpers.generated_header_config_index(
         metadata,
         generated_headers,
         "x86_64",
@@ -206,25 +228,59 @@ def _header_config_aliases_test_impl(ctx):
             "debug": "debug",
             "lz4": "x86_64",
         },
-        aliases,
-    )
-    index = repositories_test_helpers.header_config_index(
-        metadata,
-        generated_headers,
-        "x86_64",
+        index.aliases,
     )
     asserts.equals(
         env,
         {
-            "x86_64": "1111111111111111111111111111111111111111111111111111111111111111",
-            "debug": "2222222222222222222222222222222222222222222222222222222222222222",
-            "lz4": "1111111111111111111111111111111111111111111111111111111111111111",
+            "x86_64": {
+                "all": "4444444444444444444444444444444444444444444444444444444444444444",
+                "asm_offsets": "2222222222222222222222222222222222222222222222222222222222222222",
+                "static": "1111111111111111111111111111111111111111111111111111111111111111",
+            },
+            "debug": {
+                "all": "4444444444444444444444444444444444444444444444444444444444444444",
+                "asm_offsets": "3333333333333333333333333333333333333333333333333333333333333333",
+                "static": "1111111111111111111111111111111111111111111111111111111111111111",
+            },
+            "lz4": {
+                "all": "4444444444444444444444444444444444444444444444444444444444444444",
+                "asm_offsets": "2222222222222222222222222222222222222222222222222222222222222222",
+                "static": "1111111111111111111111111111111111111111111111111111111111111111",
+            },
         },
-        index.content_ids,
+        index.family_ids,
+    )
+    asserts.equals(
+        env,
+        {
+            "x86_64": {
+                "all": {},
+                "asm_offsets": {
+                    "static": "1111111111111111111111111111111111111111111111111111111111111111",
+                },
+                "static": {},
+            },
+            "debug": {
+                "all": {},
+                "asm_offsets": {
+                    "static": "1111111111111111111111111111111111111111111111111111111111111111",
+                },
+                "static": {},
+            },
+            "lz4": {
+                "all": {},
+                "asm_offsets": {
+                    "static": "1111111111111111111111111111111111111111111111111111111111111111",
+                },
+                "static": {},
+            },
+        },
+        index.family_dependencies,
     )
     return unittest.end(env)
 
-header_config_aliases_test = unittest.make(_header_config_aliases_test_impl)
+generated_header_config_index_test = unittest.make(_generated_header_config_index_test_impl)
 
 def _core_config_aliases_test_impl(ctx):
     env = unittest.begin(ctx)
@@ -298,14 +354,36 @@ def _core_config_aliases_test_impl(ctx):
         rust_profile_json = "",
         platform = "@@llvm//platforms:linux_x86_64",
         base_config = "//configs:x86_64",
-        base_header_content_id = "1111111111111111111111111111111111111111111111111111111111111111",
+        base_header_family_dependencies = {
+            "asm_offsets": {
+                "static": "1111111111111111111111111111111111111111111111111111111111111111",
+            },
+            "static": {},
+        },
+        base_header_family_ids = {
+            "asm_offsets": "2222222222222222222222222222222222222222222222222222222222222222",
+            "static": "1111111111111111111111111111111111111111111111111111111111111111",
+        },
         base_rust_enabled = False,
         config_mode = "default",
         graph_image = "//graph:x86_64_image",
         variant_configs = {"lz4": "//configs:lz4"},
         variant_core_configs = {"lz4": "x86_64"},
         variant_graph_images = {"lz4": "//graph:lz4_image"},
-        variant_header_content_ids = {"lz4": "1111111111111111111111111111111111111111111111111111111111111111"},
+        variant_header_family_dependencies = {
+            "lz4": {
+                "asm_offsets": {
+                    "static": "1111111111111111111111111111111111111111111111111111111111111111",
+                },
+                "static": {},
+            },
+        },
+        variant_header_family_ids = {
+            "lz4": {
+                "asm_offsets": "2222222222222222222222222222222222222222222222222222222222222222",
+                "static": "1111111111111111111111111111111111111111111111111111111111111111",
+            },
+        },
         variant_header_configs = {"lz4": "x86_64"},
         variant_rust_enabled = {"lz4": False},
         rules_repo = "@@linux_bzl",
@@ -316,11 +394,19 @@ def _core_config_aliases_test_impl(ctx):
     )
     asserts.true(
         env,
-        'base_header_content_id = "1111111111111111111111111111111111111111111111111111111111111111",' in generated,
+        'base_header_family_dependencies = {\n        "asm_offsets": {\n            "static": "1111111111111111111111111111111111111111111111111111111111111111",\n        },\n        "static": {},\n    },' in generated,
     )
     asserts.true(
         env,
-        'variant_header_content_ids = {\n        "lz4": "1111111111111111111111111111111111111111111111111111111111111111",\n    },' in generated,
+        'base_header_family_ids = {\n        "asm_offsets": "2222222222222222222222222222222222222222222222222222222222222222",\n        "static": "1111111111111111111111111111111111111111111111111111111111111111",\n    },' in generated,
+    )
+    asserts.true(
+        env,
+        'variant_header_family_dependencies = {\n        "lz4": {\n            "asm_offsets": {\n                "static": "1111111111111111111111111111111111111111111111111111111111111111",\n            },\n            "static": {},\n        },\n    },' in generated,
+    )
+    asserts.true(
+        env,
+        'variant_header_family_ids = {\n        "lz4": {\n            "asm_offsets": "2222222222222222222222222222222222222222222222222222222222222222",\n            "static": "1111111111111111111111111111111111111111111111111111111111111111",\n        },\n    },' in generated,
     )
     return unittest.end(env)
 

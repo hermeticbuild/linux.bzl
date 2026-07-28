@@ -979,11 +979,18 @@ func TestCompactV013ObjectBuildUsesOneExactCompileEnvironmentIndex(t *testing.T)
 		t.Fatalf("MergeCompactMetadata() failed: %v", err)
 	}
 
-	if got := len(metadata.HeaderGroups); got != 1 {
-		t.Fatalf("header group count = %d, want 1: %#v", got, metadata.HeaderGroups)
+	if got := len(metadata.GeneratedHeaderFamilies); got != 12 {
+		t.Fatalf("generated header family count = %d, want 12: %#v", got, metadata.GeneratedHeaderFamilies)
 	}
-	if want := []string{"//headers:a_debug", "//headers:z_base"}; !reflect.DeepEqual(metadata.HeaderGroups[0].Labels, want) {
-		t.Fatalf("shared header group labels = %v, want %v", metadata.HeaderGroups[0].Labels, want)
+	for _, family := range metadata.GeneratedHeaderFamilies {
+		if want := []string{"//headers:a_debug", "//headers:z_base"}; !reflect.DeepEqual(family.Labels, want) {
+			t.Fatalf(
+				"shared generated header family %s labels = %v, want %v",
+				family.Name,
+				family.Labels,
+				want,
+			)
+		}
 	}
 	baseInit := objectTarget(metadata, configByName(metadata, "base"), "init.o")
 	debugInit := objectTarget(metadata, configByName(metadata, "debug"), "init.o")
@@ -1073,6 +1080,9 @@ func TestCompactV013ObjectBuildUsesOneExactCompileEnvironmentIndex(t *testing.T)
 	if got := index.AttrString("expected_abi"); got != common.CompileEnvironmentABI {
 		t.Fatalf("compile environment index expected_abi = %q, want %q", got, common.CompileEnvironmentABI)
 	}
+	if got, want := index.AttrStrings("generated_headers"), []string{"//headers:a_debug"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("compile environment generated_headers = %v, want label list %v", got, want)
+	}
 	referencedPayloads := map[string]bool{}
 	for _, environment := range metadata.CompileEnvironments {
 		referencedPayloads[environment.ConfigPayload] = true
@@ -1160,6 +1170,241 @@ func TestCompactV013ObjectBuildUsesOneExactCompileEnvironmentIndex(t *testing.T)
 	}
 }
 
+func TestCompactV013GeneratedHeaderFamiliesDeduplicateAcrossConfigs(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "Generated header families"
+
+config LOCALVERSION
+	string "Local version"
+	default ""
+`)
+	kb, err := ParseKbuild(strings.NewReader("obj-y += init.o\n"), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "init.c", "#include <asm/unistd.h>\n")
+	writeCompactV013ForcedInputs(t, sourceRoot)
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"include/asm-generic/unistd.h",
+		"#define GENERIC_UNISTD 1\n",
+	)
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"include/linux/compiler-version.h",
+		`#ifdef GCC_PLUGINS
+#include <generated/gcc-plugins.h>
+#endif
+#ifdef RANDSTRUCT
+#include <generated/randstruct_hash.h>
+#endif
+#ifdef INTEGER_WRAP
+#include <generated/integer-wrap.h>
+#endif
+`,
+	)
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"include/linux/kconfig.h",
+		"#include <generated/autoconf.h>\n",
+	)
+
+	configs := []NamedConfig{
+		{Name: "base", Flags: map[string]string{"CONFIG_LOCALVERSION": `"-base"`}},
+		{Name: "debug", Flags: map[string]string{"CONFIG_LOCALVERSION": `"-debug"`}},
+	}
+	labels := map[string]string{
+		"base":  "//headers:base",
+		"debug": "//headers:debug",
+	}
+	metadata, err := tree.CompactMetadataBatchWithOptions(
+		configs,
+		CompactMetadataOptions{
+			Schema:                CompactSchemaV013,
+			SourceRoot:            sourceRoot,
+			Srcarch:               "x86",
+			CompileEnvironmentABI: "object-abi-v1",
+			KernelVersion:         "6.18.0",
+		},
+		func(config *ResolvedConfig) (*KbuildFile, string, error) {
+			return kb, labels[config.Name], nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
+	}
+
+	families := func(name string) []CompactGeneratedHeaderFamily {
+		t.Helper()
+		var out []CompactGeneratedHeaderFamily
+		for _, family := range metadata.GeneratedHeaderFamilies {
+			if family.Name == name {
+				out = append(out, family)
+			}
+		}
+		return out
+	}
+	staticFamilies := families(compactGeneratedHeaderFamilyStatic)
+	if len(staticFamilies) != 1 {
+		t.Fatalf("static families = %#v, want one shared family", staticFamilies)
+	}
+	if want := []string{"//headers:base", "//headers:debug"}; !reflect.DeepEqual(
+		staticFamilies[0].Labels,
+		want,
+	) {
+		t.Fatalf("shared static labels = %v, want %v", staticFamilies[0].Labels, want)
+	}
+	if got := len(families(compactGeneratedHeaderFamilyUTSRelease)); got != 2 {
+		t.Fatalf("utsrelease family count = %d, want 2", got)
+	}
+	if got := len(families(compactGeneratedHeaderFamilyASMOffsets)); got != 1 {
+		t.Fatalf("asm_offsets family count = %d, want 1", got)
+	}
+
+	baseTarget := objectTarget(metadata, configByName(metadata, "base"), "init.o")
+	debugTarget := objectTarget(metadata, configByName(metadata, "debug"), "init.o")
+	if baseTarget == "" || baseTarget != debugTarget {
+		t.Fatalf("base/debug init targets = %q/%q, want one shared target", baseTarget, debugTarget)
+	}
+	variant := variantByTarget(metadata, baseTarget)
+	var environment CompactCompileEnvironment
+	for _, candidate := range metadata.CompileEnvironments {
+		if candidate.ID == variant.CompileEnvironment {
+			environment = candidate
+			break
+		}
+	}
+	if want := []string{staticFamilies[0].ID}; !reflect.DeepEqual(
+		environment.GeneratedHeaderFamilies,
+		want,
+	) {
+		t.Fatalf(
+			"init generated header families = %v, want shared static %v",
+			environment.GeneratedHeaderFamilies,
+			want,
+		)
+	}
+}
+
+func TestGeneratedHeaderFamilySelectionFailsClosed(t *testing.T) {
+	families := compactGeneratedHeaderFamilySet{
+		compactGeneratedHeaderFamilyAll: {
+			ID:   "all-id",
+			Name: compactGeneratedHeaderFamilyAll,
+		},
+		compactGeneratedHeaderFamilyStatic: {
+			ID:   "static-id",
+			Name: compactGeneratedHeaderFamilyStatic,
+		},
+	}
+	if got, err := families.selectForAction(nil, true); err != nil ||
+		!reflect.DeepEqual(got, []string{"all-id"}) {
+		t.Fatalf("force-all selection = %v, %v, want [all-id], nil", got, err)
+	}
+	if got, err := families.selectForAction(
+		[]string{"generated/autoconf.h", "asm/unistd.h"},
+		false,
+	); err != nil || !reflect.DeepEqual(got, []string{"static-id"}) {
+		t.Fatalf("precise selection = %v, %v, want [static-id], nil", got, err)
+	}
+	if _, err := families.selectForAction(
+		[]string{"generated/not-an-output.h"},
+		false,
+	); err == nil || !strings.Contains(err.Error(), "is unclassified") {
+		t.Fatalf("unclassified selection error = %v, want fail-closed error", err)
+	}
+	if _, err := families.selectForAction(
+		[]string{"generated/timeconst.h"},
+		false,
+	); err == nil || !strings.Contains(err.Error(), `unavailable family "timeconst"`) {
+		t.Fatalf("missing precise-family error = %v, want unavailable family", err)
+	}
+
+	arm64Families := compactGeneratedHeaderFamilySet{
+		compactGeneratedHeaderFamilyAll: {
+			ID:   "arm64-all-id",
+			Name: compactGeneratedHeaderFamilyAll,
+		},
+	}
+	if got, err := arm64Families.selectForAction(
+		[]string{"generated/autoconf.h"},
+		false,
+	); err != nil || len(got) != 0 {
+		t.Fatalf("arm64 config-owned selection = %v, %v, want empty, nil", got, err)
+	}
+	for _, include := range []string{
+		"generated/timeconst.h",
+		"generated/arm64-provider-output.h",
+		"asm/unistd.h",
+	} {
+		got, err := arm64Families.selectForAction([]string{include}, false)
+		if err != nil || !reflect.DeepEqual(got, []string{"arm64-all-id"}) {
+			t.Errorf("arm64 selection for %q = %v, %v, want [arm64-all-id], nil", include, got, err)
+		}
+	}
+}
+
+func TestCompactV013Arm64GeneratedIncludeSelectsMonolithicFamily(t *testing.T) {
+	tree := mustParseString(t, "mainmenu \"arm64 generated-header selection\"\n")
+	kb, err := ParseKbuild(strings.NewReader("obj-y += init.o\n"), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	for _, dir := range []string{
+		"arch/arm64/kernel/vdso",
+		"arch/arm64/kernel/vdso32",
+	} {
+		if err := os.MkdirAll(filepath.Join(sourceRoot, filepath.FromSlash(dir)), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q) failed: %v", dir, err)
+		}
+	}
+	mustWriteSource(t, sourceRoot, "init.c", "#include <generated/timeconst.h>\n")
+	writeCompactV013ForcedInputs(t, sourceRoot)
+	metadata, err := tree.CompactMetadataWithOptions(
+		kb,
+		[]NamedConfig{{Name: "arm64"}},
+		CompactMetadataOptions{
+			Schema:                CompactSchemaV013,
+			SourceRoot:            sourceRoot,
+			Srcarch:               "arm64",
+			CompileEnvironmentABI: "arm64-object-abi-v1",
+			GeneratedHeadersLabel: "//headers:arm64",
+		},
+	)
+	if err != nil {
+		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+	}
+	if len(metadata.GeneratedHeaderFamilies) != 1 ||
+		metadata.GeneratedHeaderFamilies[0].Name != compactGeneratedHeaderFamilyAll {
+		t.Fatalf(
+			"arm64 generated-header families = %#v, want one all family",
+			metadata.GeneratedHeaderFamilies,
+		)
+	}
+	config := configByName(metadata, "arm64")
+	variant := variantByTarget(metadata, objectTarget(metadata, config, "init.o"))
+	var environment CompactCompileEnvironment
+	for _, candidate := range metadata.CompileEnvironments {
+		if candidate.ID == variant.CompileEnvironment {
+			environment = candidate
+			break
+		}
+	}
+	want := []string{metadata.GeneratedHeaderFamilies[0].ID}
+	if !reflect.DeepEqual(environment.GeneratedHeaderFamilies, want) {
+		t.Fatalf(
+			"arm64 init generated-header families = %v, want monolithic %v",
+			environment.GeneratedHeaderFamilies,
+			want,
+		)
+	}
+}
+
 func TestCompactMetadataBatchMatchesMergedConfigGraphs(t *testing.T) {
 	tree := mustParseCompactFixture(t)
 	parseKbuild := func(name, content string) *KbuildFile {
@@ -1184,6 +1429,7 @@ func TestCompactMetadataBatchMatchesMergedConfigGraphs(t *testing.T) {
 	opts := CompactMetadataOptions{
 		Schema:                CompactSchemaV013,
 		SourceRoot:            sourceRoot,
+		Srcarch:               "x86",
 		CompileEnvironmentABI: "object-abi-v1",
 	}
 	labels := map[string]string{
@@ -1232,7 +1478,7 @@ func TestCompactMetadataBatchMatchesMergedConfigGraphs(t *testing.T) {
 	if !reflect.DeepEqual(gotJSON, wantJSON) {
 		t.Fatalf("batch metadata differs from merged single-config metadata")
 	}
-	if got, want := batch.HeaderGroups[0].Labels, []string{"//headers:base", "//headers:debug"}; !reflect.DeepEqual(got, want) {
+	if got, want := batch.GeneratedHeaderFamilies[0].Labels, []string{"//headers:base", "//headers:debug"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("batch header labels = %v, want %v", got, want)
 	}
 
@@ -1337,13 +1583,23 @@ func TestCompactV013ValidationRecomputesContentIDs(t *testing.T) {
 	})
 	t.Run("header source digest", func(t *testing.T) {
 		metadata := generate(t)
-		group := metadata.HeaderGroups[0]
-		inputs, err := metadata.expandedSourceInputGroup(group.SourceInputGroup, nil, "header")
+		var family CompactGeneratedHeaderFamily
+		for _, candidate := range metadata.GeneratedHeaderFamilies {
+			if candidate.SourceInputGroup != 0 {
+				family = candidate
+				break
+			}
+		}
+		inputs, err := metadata.expandedSourceInputGroup(
+			family.SourceInputGroup,
+			nil,
+			"generated header family",
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
 		mutateDigest(t, metadata, inputs[0].Path)
-		assertRejected(t, metadata, "header group")
+		assertRejected(t, metadata, "generated header family")
 	})
 	t.Run("compile ABI", func(t *testing.T) {
 		metadata := generate(t)
@@ -1736,7 +1992,7 @@ func TestCompactV013CompositeIdentityIgnoresNonActionMetadata(t *testing.T) {
 			nil,
 			CompactSchemaV013,
 			"linker-abi-v1",
-			"",
+			nil,
 		)
 	}
 	left := variant("-DLEFT", "left")

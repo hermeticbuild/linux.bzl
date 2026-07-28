@@ -15,7 +15,7 @@ def linux_arm64_host_tools(
         source_root = None,
         source_tree = None,
         env = None,
-        generated_headers_content_id = "",
+        generated_header_family_ids = {},
         visibility = None):
     """Defines the source-tree-specific host tools required by arm64 native builds."""
     if env == None:
@@ -59,7 +59,7 @@ def linux_arm64_host_tools(
         asm_offsets_c = source_label(source_repo, "arch/arm64/kernel/asm-offsets.c"),
         bounds_c = source_label(source_repo, "kernel/bounds.c"),
         config = config,
-        content_id = generated_headers_content_id,
+        family_content_ids = generated_header_family_ids,
         cpucaps = source_label(source_repo, "arch/arm64/tools/cpucaps"),
         hyp_constants_c = source_label(source_repo, "arch/arm64/kvm/hyp/hyp-constants.c"),
         rq_offsets_c = source_label(source_repo, "rq_offsets_c"),
@@ -95,7 +95,7 @@ def linux_arm64_configured_host_tools(
         source_repo,
         source_root = None,
         source_tree = None,
-        generated_headers_content_id = "",
+        generated_header_family_ids = {},
         visibility = None):
     """Adds only the config-sensitive arm64 headers to a shared host-tool set."""
     if source_root == None:
@@ -109,7 +109,7 @@ def linux_arm64_configured_host_tools(
         asm_offsets_c = source_label(source_repo, "arch/arm64/kernel/asm-offsets.c"),
         bounds_c = source_label(source_repo, "kernel/bounds.c"),
         config = config,
-        content_id = generated_headers_content_id,
+        family_content_ids = generated_header_family_ids,
         cpucaps = source_label(source_repo, "arch/arm64/tools/cpucaps"),
         hyp_constants_c = source_label(source_repo, "arch/arm64/kvm/hyp/hyp-constants.c"),
         rq_offsets_c = source_label(source_repo, "rq_offsets_c"),

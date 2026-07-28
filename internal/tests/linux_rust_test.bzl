@@ -155,6 +155,7 @@ def _rust_config_fixture_impl(ctx):
             include_dir = include_dir,
             include_dir_anchor = directory_anchor(autoconf_h, include_dir),
             kernel_release = kernel_release,
+            kernel_version = "6.18.2",
             rustc_cfg = rustc_cfg,
         ),
     ]
@@ -167,7 +168,7 @@ def _rust_generated_headers_fixture_impl(_ctx):
         LinuxGeneratedHeadersInfo(
             arch = "x86",
             cflags = None,
-            content_id = "",
+            families = {},
             files = depset(),
             include_dirs = [],
             include_dir_anchors = {},
@@ -353,7 +354,8 @@ def _repository_protocol_test_impl(ctx):
         rust_profile_json = _LEGACY_PROFILE_JSON,
         platform = "@@llvm//platforms:linux_x86_64",
         base_config = "//configs:x86_64",
-        base_header_content_id = "",
+        base_header_family_dependencies = {},
+        base_header_family_ids = {},
         base_rust_enabled = False,
         config_mode = "default",
         graph_image = "//graph/base:x86_64_image",
@@ -370,6 +372,10 @@ def _repository_protocol_test_impl(ctx):
     )
     asserts.true(env, "rust_profile_json = " in generated)
     asserts.true(env, "base_rust_enabled = False," in generated)
+    asserts.true(env, "base_header_family_dependencies = {}," in generated)
+    asserts.true(env, "base_header_family_ids = {}," in generated)
+    asserts.true(env, "variant_header_family_dependencies = {}," in generated)
+    asserts.true(env, "variant_header_family_ids = {}," in generated)
     asserts.true(
         env,
         'variant_rust_enabled = {\n        "rust": True,\n    },' in generated,

@@ -506,6 +506,7 @@ func run() (exitCode int) {
 			kbuildExtras,
 			namedPathMap(sourceRootMaps),
 			headerLabels,
+			*kernelVersion,
 			*compileEnvironmentABI,
 			compactSchema,
 		)
@@ -1062,6 +1063,7 @@ func compactMetadata(
 	kbuildExtras []namedPath,
 	sourceRoots map[string]string,
 	generatedHeadersByConfig map[string]string,
+	kernelVersion string,
 	compileEnvironmentABI string,
 	schema kconfig.CompactSchema,
 ) (*kconfig.CompactMetadata, error) {
@@ -1136,6 +1138,7 @@ func compactMetadata(
 		SourceRoots:           sourceRoots,
 		LibraryDirs:           kbuildLibraryDirs(vars),
 		CompileEnvironmentABI: compileEnvironmentABI,
+		KernelVersion:         kernelVersion,
 		Srcarch:               vars["SRCARCH"],
 	}
 	rootDir := sourceRoot

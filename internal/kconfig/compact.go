@@ -52,15 +52,15 @@ func (s CompactSchema) isV013() bool {
 }
 
 type CompactMetadata struct {
-	Schema              CompactSchema               `json:"schema,omitempty"`
-	Configs             []CompactConfig             `json:"configs"`
-	ConfigPayloads      []CompactConfigPayload      `json:"config_payloads,omitempty"`
-	CompileEnvironments []CompactCompileEnvironment `json:"compile_environments,omitempty"`
-	HeaderGroups        []CompactHeaderGroup        `json:"header_groups,omitempty"`
-	SourceFiles         []CompactSourceInput        `json:"source_files,omitempty"`
-	SourceInputGroups   []string                    `json:"source_input_groups,omitempty"`
-	ObjectPackages      []CompactObjectPackage      `json:"object_packages,omitempty"`
-	ObjectVariants      []CompactObjectVariant      `json:"object_variants"`
+	Schema                  CompactSchema                  `json:"schema,omitempty"`
+	Configs                 []CompactConfig                `json:"configs"`
+	ConfigPayloads          []CompactConfigPayload         `json:"config_payloads,omitempty"`
+	CompileEnvironments     []CompactCompileEnvironment    `json:"compile_environments,omitempty"`
+	GeneratedHeaderFamilies []CompactGeneratedHeaderFamily `json:"generated_header_families,omitempty"`
+	SourceFiles             []CompactSourceInput           `json:"source_files,omitempty"`
+	SourceInputGroups       []string                       `json:"source_input_groups,omitempty"`
+	ObjectPackages          []CompactObjectPackage         `json:"object_packages,omitempty"`
+	ObjectVariants          []CompactObjectVariant         `json:"object_variants"`
 }
 
 type CompactConfig struct {
@@ -83,39 +83,41 @@ type CompactConfigPayload struct {
 }
 
 type CompactCompileEnvironment struct {
-	ID            string   `json:"id"`
-	ABI           string   `json:"abi"`
-	ConfigPayload string   `json:"config_payload"`
-	HeaderGroups  []string `json:"header_groups,omitempty"`
+	ID                      string   `json:"id"`
+	ABI                     string   `json:"abi"`
+	ConfigPayload           string   `json:"config_payload"`
+	GeneratedHeaderFamilies []string `json:"generated_header_families,omitempty"`
 }
 
-type CompactHeaderGroup struct {
+type CompactGeneratedHeaderFamily struct {
 	ID               string               `json:"id"`
+	Name             string               `json:"name"`
 	ConfigPayload    string               `json:"config_payload"`
 	Labels           []string             `json:"labels,omitempty"`
 	Srcarch          string               `json:"srcarch"`
-	Footprint        string               `json:"footprint"`
+	Dependencies     []string             `json:"dependencies,omitempty"`
 	SourceInputGroup int                  `json:"source_input_group,omitempty"`
 	SourceInputs     []CompactSourceInput `json:"source_inputs,omitempty"`
 }
 
 type CompactObjectVariant struct {
-	Target             string               `json:"target"`
-	ContentID          string               `json:"content_id,omitempty"`
-	CompileEnvironment string               `json:"compile_environment,omitempty"`
-	Package            string               `json:"package,omitempty"`
-	Object             string               `json:"object"`
-	Source             string               `json:"source,omitempty"`
-	SourceIncludes     []string             `json:"source_includes,omitempty"`
-	SourceInputGroup   int                  `json:"source_input_group,omitempty"`
-	SourceInputs       []CompactSourceInput `json:"source_inputs,omitempty"`
-	Mode               string               `json:"mode"`
-	ModName            string               `json:"modname,omitempty"`
-	Flags              []string             `json:"flags,omitempty"`
-	RemoveFlags        []string             `json:"remove_flags,omitempty"`
-	ConfigFragment     map[string]string    `json:"config_fragment,omitempty"`
-	Deps               []string             `json:"deps,omitempty"`
-	Members            []string             `json:"members,omitempty"`
+	Target                   string               `json:"target"`
+	ContentID                string               `json:"content_id,omitempty"`
+	CompileEnvironment       string               `json:"compile_environment,omitempty"`
+	Package                  string               `json:"package,omitempty"`
+	Object                   string               `json:"object"`
+	Source                   string               `json:"source,omitempty"`
+	SourceIncludes           []string             `json:"source_includes,omitempty"`
+	SourceInputGroup         int                  `json:"source_input_group,omitempty"`
+	SourceInputs             []CompactSourceInput `json:"source_inputs,omitempty"`
+	Mode                     string               `json:"mode"`
+	ModName                  string               `json:"modname,omitempty"`
+	Flags                    []string             `json:"flags,omitempty"`
+	RemoveFlags              []string             `json:"remove_flags,omitempty"`
+	ConfigFragment           map[string]string    `json:"config_fragment,omitempty"`
+	Deps                     []string             `json:"deps,omitempty"`
+	Members                  []string             `json:"members,omitempty"`
+	generatedHeaderFamilyIDs []string
 }
 
 type CompactObjectPackage struct {
@@ -180,6 +182,7 @@ type CompactMetadataOptions struct {
 	LibraryDirs           []string
 	GeneratedHeadersLabel string
 	CompileEnvironmentABI string
+	KernelVersion         string
 	// Srcarch selects architecture include roots while scanning source files for
 	// CONFIG_* dependencies.
 	Srcarch string
@@ -195,7 +198,7 @@ func MergeCompactMetadata(parts ...*CompactMetadata) (*CompactMetadata, error) {
 	variants := map[string]CompactObjectVariant{}
 	configPayloads := map[string]CompactConfigPayload{}
 	compileEnvironments := map[string]CompactCompileEnvironment{}
-	headerGroups := map[string]CompactHeaderGroup{}
+	generatedHeaderFamilies := map[string]CompactGeneratedHeaderFamily{}
 	sourceInputInterner := newCompactSourceInputInterner()
 	for _, part := range parts {
 		if part == nil {
@@ -251,35 +254,40 @@ func MergeCompactMetadata(parts ...*CompactMetadata) (*CompactMetadata, error) {
 			}
 			compileEnvironments[environment.ID] = environment
 		}
-		for _, original := range part.HeaderGroups {
-			group := original
+		for _, original := range part.GeneratedHeaderFamilies {
+			family := original
 			if part.Schema.isV013() {
 				sourceInputs, err := part.expandedSourceInputGroup(
-					group.SourceInputGroup,
-					group.SourceInputs,
-					fmt.Sprintf("header group %q", group.ID),
+					family.SourceInputGroup,
+					family.SourceInputs,
+					fmt.Sprintf("generated header family %q", family.ID),
 				)
 				if err != nil {
 					return nil, err
 				}
-				group.SourceInputGroup, err = sourceInputInterner.intern(
+				family.SourceInputGroup, err = sourceInputInterner.intern(
 					sourceInputs,
-					fmt.Sprintf("header group %q", group.ID),
+					fmt.Sprintf("generated header family %q", family.ID),
 				)
 				if err != nil {
 					return nil, err
 				}
-				group.SourceInputs = nil
+				family.SourceInputs = nil
 			}
-			if existing, ok := headerGroups[group.ID]; ok {
-				if existing.ConfigPayload != group.ConfigPayload || existing.Srcarch != group.Srcarch || existing.Footprint != group.Footprint || existing.SourceInputGroup != group.SourceInputGroup || !compactSourceInputsEqual(existing.SourceInputs, group.SourceInputs) {
-					return nil, fmt.Errorf("header groups with content ID %q differ", group.ID)
+			if existing, ok := generatedHeaderFamilies[family.ID]; ok {
+				if existing.Name != family.Name ||
+					existing.ConfigPayload != family.ConfigPayload ||
+					existing.Srcarch != family.Srcarch ||
+					!stringSlicesEqual(existing.Dependencies, family.Dependencies) ||
+					existing.SourceInputGroup != family.SourceInputGroup ||
+					!compactSourceInputsEqual(existing.SourceInputs, family.SourceInputs) {
+					return nil, fmt.Errorf("generated header families with content ID %q differ", family.ID)
 				}
-				existing.Labels = appendUniqueStrings(existing.Labels, group.Labels...)
-				headerGroups[group.ID] = existing
+				existing.Labels = appendUniqueStrings(existing.Labels, family.Labels...)
+				generatedHeaderFamilies[family.ID] = existing
 				continue
 			}
-			headerGroups[group.ID] = group
+			generatedHeaderFamilies[family.ID] = family
 		}
 	}
 	targets := make([]string, 0, len(variants))
@@ -292,7 +300,7 @@ func MergeCompactMetadata(parts ...*CompactMetadata) (*CompactMetadata, error) {
 	}
 	out.ConfigPayloads = sortedCompactConfigPayloads(configPayloads)
 	out.CompileEnvironments = sortedCompactCompileEnvironments(compileEnvironments)
-	out.HeaderGroups = sortedCompactHeaderGroups(headerGroups)
+	out.GeneratedHeaderFamilies = sortedCompactGeneratedHeaderFamilies(generatedHeaderFamilies)
 	out.ObjectPackages = compactObjectPackages(out.ObjectVariants)
 	if out.Schema.isV013() {
 		sourceInputInterner.apply(out)
@@ -343,7 +351,7 @@ func (t *Tree) compactMetadataBatchWithOptions(
 	}
 	configPayloads := map[string]CompactConfigPayload{}
 	compileEnvironments := map[string]CompactCompileEnvironment{}
-	headerGroups := map[string]CompactHeaderGroup{}
+	generatedHeaderFamilies := map[string]CompactGeneratedHeaderFamily{}
 	var sourceInputInterner *compactSourceInputInterner
 	if opts.Schema.isV013() {
 		sourceInputInterner = newCompactSourceInputInterner()
@@ -381,39 +389,62 @@ func (t *Tree) compactMetadataBatchWithOptions(
 			scanner = newConfigSourceScannerWithCache(opts, sourceCache)
 		}
 		fullConfigPayload := CompactConfigPayload{}
-		headerGroupID := ""
+		configHeaderFamilies := compactGeneratedHeaderFamilySet{}
 		if opts.Schema.isV013() {
 			fullConfigPayload = newCompactConfigPayload(compactFullConfigFragment(resolved))
 			configPayloads[fullConfigPayload.ID] = fullConfigPayload
 			if generatedHeadersLabel != "" {
-				headerFragment, headerInputs, footprint, err := generatedHeaderFootprint(resolved, opts, scanner)
+				footprints, err := generatedHeaderFamilyFootprints(resolved, opts, scanner)
 				if err != nil {
 					return nil, fmt.Errorf("derive generated headers for config %q: %w", named.Name, err)
 				}
-				headerConfigPayload := newCompactConfigPayload(headerFragment)
-				configPayloads[headerConfigPayload.ID] = headerConfigPayload
-				group := newCompactHeaderGroup(
-					headerConfigPayload.ID,
-					generatedHeadersLabel,
-					opts.Srcarch,
-					footprint,
-					headerInputs,
-				)
-				group.SourceInputGroup, err = sourceInputInterner.intern(
-					group.SourceInputs,
-					fmt.Sprintf("header group %q", group.ID),
-				)
-				if err != nil {
-					return nil, err
+				for _, footprint := range footprints {
+					if _, ok := configHeaderFamilies[footprint.name]; ok {
+						return nil, fmt.Errorf(
+							"derive generated headers for config %q: duplicate family %q",
+							named.Name,
+							footprint.name,
+						)
+					}
+					dependencyIDs := make([]string, 0, len(footprint.dependencies))
+					for _, dependencyName := range footprint.dependencies {
+						dependency, ok := configHeaderFamilies[dependencyName]
+						if !ok {
+							return nil, fmt.Errorf(
+								"derive generated headers for config %q: family %q depends on unknown or later family %q",
+								named.Name,
+								footprint.name,
+								dependencyName,
+							)
+						}
+						dependencyIDs = append(dependencyIDs, dependency.ID)
+					}
+					payload := newCompactConfigPayload(footprint.fragment)
+					configPayloads[payload.ID] = payload
+					family := newCompactGeneratedHeaderFamily(
+						footprint.name,
+						payload.ID,
+						generatedHeadersLabel,
+						opts.Srcarch,
+						dependencyIDs,
+						footprint.sourceInputs,
+					)
+					family.SourceInputGroup, err = sourceInputInterner.intern(
+						family.SourceInputs,
+						fmt.Sprintf("generated header family %q", family.ID),
+					)
+					if err != nil {
+						return nil, err
+					}
+					family.SourceInputs = nil
+					if existing, ok := generatedHeaderFamilies[family.ID]; ok {
+						existing.Labels = appendUniqueStrings(existing.Labels, family.Labels...)
+						generatedHeaderFamilies[family.ID] = existing
+					} else {
+						generatedHeaderFamilies[family.ID] = family
+					}
+					configHeaderFamilies[family.Name] = family
 				}
-				group.SourceInputs = nil
-				if existing, ok := headerGroups[group.ID]; ok {
-					existing.Labels = appendUniqueStrings(existing.Labels, group.Labels...)
-					headerGroups[group.ID] = existing
-				} else {
-					headerGroups[group.ID] = group
-				}
-				headerGroupID = group.ID
 			}
 		}
 		imageTarget := sanitizeTargetName(named.Name) + "_image"
@@ -428,7 +459,14 @@ func (t *Tree) compactMetadataBatchWithOptions(
 			if opts.Schema.isV012() && rustSDKOwnsObject(object.object) {
 				continue
 			}
-			variant, err := resolvedVariants.variantFor(object.object, resolved, opts, objects, scanner, headerGroupID)
+			variant, err := resolvedVariants.variantFor(
+				object.object,
+				resolved,
+				opts,
+				objects,
+				scanner,
+				configHeaderFamilies,
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -450,7 +488,11 @@ func (t *Tree) compactMetadataBatchWithOptions(
 			if opts.Schema.isV013() && variant.CompileEnvironment != "" {
 				payload := newCompactConfigPayload(variant.ConfigFragment)
 				configPayloads[payload.ID] = payload
-				environment := newCompactCompileEnvironment(opts.CompileEnvironmentABI, payload.ID, compactOptionalString(headerGroupID))
+				environment := newCompactCompileEnvironment(
+					opts.CompileEnvironmentABI,
+					payload.ID,
+					variant.generatedHeaderFamilyIDs,
+				)
 				if environment.ID != variant.CompileEnvironment {
 					return nil, fmt.Errorf(
 						"internal error: object %q compile environment is %q, want %q",
@@ -517,7 +559,7 @@ func (t *Tree) compactMetadataBatchWithOptions(
 	}
 	out.ConfigPayloads = sortedCompactConfigPayloads(configPayloads)
 	out.CompileEnvironments = sortedCompactCompileEnvironments(compileEnvironments)
-	out.HeaderGroups = sortedCompactHeaderGroups(headerGroups)
+	out.GeneratedHeaderFamilies = sortedCompactGeneratedHeaderFamilies(generatedHeaderFamilies)
 	out.ObjectPackages = compactObjectPackages(out.ObjectVariants)
 	if sourceInputInterner != nil {
 		sourceInputInterner.apply(out)
@@ -1129,11 +1171,81 @@ func (objects resolvedKbuildObjects) all() []resolvedKbuildObject {
 
 type compactVariantMemo map[string]CompactObjectVariant
 
-func (memo compactVariantMemo) variantFor(name string, config *ResolvedConfig, opts CompactMetadataOptions, objects resolvedKbuildObjects, scanner *configSourceScanner, headerGroupID string) (CompactObjectVariant, error) {
-	return memo.variantForStack(name, config, opts, objects, scanner, headerGroupID, map[string]bool{})
+type compactGeneratedHeaderFamilySet map[string]CompactGeneratedHeaderFamily
+
+func (families compactGeneratedHeaderFamilySet) selectForAction(
+	generatedIncludes []string,
+	forceAll bool,
+) ([]string, error) {
+	if len(families) == 0 {
+		return nil, nil
+	}
+	all, hasAll := families[compactGeneratedHeaderFamilyAll]
+	monolithic := hasAll && len(families) == 1
+	if forceAll {
+		if !hasAll {
+			return nil, fmt.Errorf("generated-header action requires the all family, but it is unavailable")
+		}
+		return []string{all.ID}, nil
+	}
+
+	names := map[string]bool{}
+	for _, include := range generatedIncludes {
+		name, precise := generatedHeaderFamilyNameForInclude(include)
+		if name == "" {
+			continue
+		}
+		if monolithic {
+			return []string{all.ID}, nil
+		}
+		if !precise {
+			return nil, fmt.Errorf("generated include %q is unclassified", include)
+		}
+		if _, ok := families[name]; !ok {
+			return nil, fmt.Errorf(
+				"generated include %q requires unavailable family %q",
+				include,
+				name,
+			)
+		}
+		names[name] = true
+	}
+	ids := make([]string, 0, len(names))
+	for name := range names {
+		ids = append(ids, families[name].ID)
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
-func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConfig, opts CompactMetadataOptions, objects resolvedKbuildObjects, scanner *configSourceScanner, headerGroupID string, stack map[string]bool) (CompactObjectVariant, error) {
+func (memo compactVariantMemo) variantFor(
+	name string,
+	config *ResolvedConfig,
+	opts CompactMetadataOptions,
+	objects resolvedKbuildObjects,
+	scanner *configSourceScanner,
+	generatedHeaderFamilies compactGeneratedHeaderFamilySet,
+) (CompactObjectVariant, error) {
+	return memo.variantForStack(
+		name,
+		config,
+		opts,
+		objects,
+		scanner,
+		generatedHeaderFamilies,
+		map[string]bool{},
+	)
+}
+
+func (memo compactVariantMemo) variantForStack(
+	name string,
+	config *ResolvedConfig,
+	opts CompactMetadataOptions,
+	objects resolvedKbuildObjects,
+	scanner *configSourceScanner,
+	generatedHeaderFamilies compactGeneratedHeaderFamilySet,
+	stack map[string]bool,
+) (CompactObjectVariant, error) {
 	if variant, ok := memo[name]; ok {
 		return variant, nil
 	}
@@ -1148,7 +1260,15 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 	members := make([]string, 0, len(object.members))
 	memberContentIDs := make([]string, 0, len(object.members))
 	for _, member := range object.members {
-		variant, err := memo.variantForStack(member, config, opts, objects, scanner, headerGroupID, stack)
+		variant, err := memo.variantForStack(
+			member,
+			config,
+			opts,
+			objects,
+			scanner,
+			generatedHeaderFamilies,
+			stack,
+		)
 		if err != nil {
 			return CompactObjectVariant{}, err
 		}
@@ -1182,7 +1302,15 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 			if _, ok := objects.byName[dep.object]; !ok {
 				continue
 			}
-			variant, err := memo.variantForStack(dep.object, config, opts, objects, scanner, headerGroupID, stack)
+			variant, err := memo.variantForStack(
+				dep.object,
+				config,
+				opts,
+				objects,
+				scanner,
+				generatedHeaderFamilies,
+				stack,
+			)
 			if err != nil {
 				return CompactObjectVariant{}, err
 			}
@@ -1197,8 +1325,9 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 		sort.Strings(depContentIDs)
 	}
 
-	var sourceRefs, sourceIncludes []string
+	var sourceRefs, sourceIncludes, generatedIncludes []string
 	var sourceInputs []CompactSourceInput
+	forceAllGeneratedHeaders := false
 	if (opts.Schema == CompactSchemaV012 || opts.Schema == CompactSchemaV013) && source != "" {
 		flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(object.flags, source), opts.SourceRoot)
 		includeDirs := includeDirsFromFlags(flags)
@@ -1236,7 +1365,10 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 		}
 		sourceRefs = append(sourceRefs, closure.refs...)
 		sourceIncludes = append(sourceIncludes, closure.sourceIncludes...)
+		generatedIncludes = append(generatedIncludes, closure.generatedIncludes...)
 		if opts.Schema.isV013() {
+			forceAllGeneratedHeaders = actionFootprint.fullGeneratedHeaders ||
+				len(specialSources.inputs) != 0
 			sourceRefs = appendUniqueStrings(sourceRefs, actionFootprint.configSymbols...)
 			sourceInputs = append(sourceInputs, closure.sourceInputs...)
 			for _, path := range actionFootprint.sourceInputs {
@@ -1270,6 +1402,10 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 				}
 				sourceRefs = appendUniqueStrings(sourceRefs, forcedClosure.refs...)
 				sourceIncludes = appendUniqueStrings(sourceIncludes, forcedClosure.sourceIncludes...)
+				generatedIncludes = appendUniqueStrings(
+					generatedIncludes,
+					forcedClosure.generatedIncludes...,
+				)
 				sourceInputs = appendUniqueSourceInputs(sourceInputs, forcedClosure.sourceInputs...)
 			}
 			for _, generatedSource := range actionFootprint.closureInputs {
@@ -1291,6 +1427,10 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 				}
 				sourceRefs = appendUniqueStrings(sourceRefs, generatedClosure.refs...)
 				sourceIncludes = appendUniqueStrings(sourceIncludes, generatedClosure.sourceIncludes...)
+				generatedIncludes = appendUniqueStrings(
+					generatedIncludes,
+					generatedClosure.generatedIncludes...,
+				)
 				sourceInputs = appendUniqueSourceInputs(sourceInputs, generatedClosure.sourceInputs...)
 			}
 			specialIncludeDirs := appendUniqueStrings(
@@ -1323,6 +1463,10 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 				}
 				sourceRefs = appendUniqueStrings(sourceRefs, specialClosure.refs...)
 				sourceIncludes = appendUniqueStrings(sourceIncludes, specialClosure.sourceIncludes...)
+				generatedIncludes = appendUniqueStrings(
+					generatedIncludes,
+					specialClosure.generatedIncludes...,
+				)
 				sourceInputs = appendUniqueSourceInputs(sourceInputs, specialClosure.sourceInputs...)
 				if !input.compiled {
 					continue
@@ -1347,6 +1491,10 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 					}
 					sourceRefs = appendUniqueStrings(sourceRefs, forcedClosure.refs...)
 					sourceIncludes = appendUniqueStrings(sourceIncludes, forcedClosure.sourceIncludes...)
+					generatedIncludes = appendUniqueStrings(
+						generatedIncludes,
+						forcedClosure.generatedIncludes...,
+					)
 					sourceInputs = appendUniqueSourceInputs(sourceInputs, forcedClosure.sourceInputs...)
 				}
 			}
@@ -1361,6 +1509,7 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 		}
 	}
 	if opts.Schema.isV013() && isArm64NvheObject(name) {
+		forceAllGeneratedHeaders = true
 		for _, actionSource := range []string{
 			"arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
 			"include/linux/compiler-version.h",
@@ -1377,8 +1526,23 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 			}
 			sourceRefs = appendUniqueStrings(sourceRefs, closure.refs...)
 			sourceIncludes = appendUniqueStrings(sourceIncludes, closure.sourceIncludes...)
+			generatedIncludes = appendUniqueStrings(
+				generatedIncludes,
+				closure.generatedIncludes...,
+			)
 			sourceInputs = appendUniqueSourceInputs(sourceInputs, closure.sourceInputs...)
 		}
+	}
+	generatedHeaderFamilyIDs, err := generatedHeaderFamilies.selectForAction(
+		generatedIncludes,
+		forceAllGeneratedHeaders,
+	)
+	if err != nil {
+		return CompactObjectVariant{}, fmt.Errorf(
+			"select generated-header families for %s: %w",
+			name,
+			err,
+		)
 	}
 	variant := object.variant(
 		config,
@@ -1393,7 +1557,7 @@ func (memo compactVariantMemo) variantForStack(name string, config *ResolvedConf
 		sourceRefs,
 		opts.Schema,
 		opts.CompileEnvironmentABI,
-		headerGroupID,
+		generatedHeaderFamilyIDs,
 	)
 	memo[name] = variant
 	return variant, nil
@@ -1418,10 +1582,11 @@ type compactSpecialSourceInputs struct {
 }
 
 type compactObjectActionFootprint struct {
-	sourceInputs     []string
-	closureInputs    []string
-	providedIncludes []string
-	configSymbols    []string
+	sourceInputs         []string
+	closureInputs        []string
+	providedIncludes     []string
+	configSymbols        []string
+	fullGeneratedHeaders bool
 }
 
 func compactObjectActionFootprintForObject(object string, flags []string) compactObjectActionFootprint {
@@ -1499,6 +1664,11 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 			"CONFIG_PREEMPT_RT",
 			"CONFIG_SMP",
 		)
+	}
+	if isMultiSourceImageObject(object) ||
+		object == "arch/arm64/kernel/vdso32-wrap.o" ||
+		isArm64NvheObject(object) {
+		footprint.fullGeneratedHeaders = true
 	}
 	return footprint
 }
@@ -1668,7 +1838,7 @@ func (o resolvedKbuildObject) variant(
 	sourceRefs []string,
 	schema CompactSchema,
 	compileEnvironmentABI string,
-	headerGroupID string,
+	generatedHeaderFamilyIDs []string,
 ) CompactObjectVariant {
 	fragment := map[string]string{}
 	refset := make(map[string]bool, len(o.footprint)+len(sourceRefs))
@@ -1728,7 +1898,11 @@ func (o resolvedKbuildObject) variant(
 		usesCompileEnvironment := len(members) == 0 || compileComposite
 		if usesCompileEnvironment {
 			payload := newCompactConfigPayload(fragment)
-			environment := newCompactCompileEnvironment(compileEnvironmentABI, payload.ID, compactOptionalString(headerGroupID))
+			environment := newCompactCompileEnvironment(
+				compileEnvironmentABI,
+				payload.ID,
+				generatedHeaderFamilyIDs,
+			)
 			compileEnvironmentID = environment.ID
 		} else {
 			fragment = map[string]string{}
@@ -1766,6 +1940,10 @@ func (o resolvedKbuildObject) variant(
 		ConfigFragment:     fragment,
 		Deps:               append([]string(nil), deps...),
 		Members:            append([]string(nil), members...),
+		generatedHeaderFamilyIDs: append(
+			[]string(nil),
+			generatedHeaderFamilyIDs...,
+		),
 	}
 }
 
@@ -2144,24 +2322,22 @@ func (m *CompactMetadata) ObjectBuildFile(opts CompactBuildFileOptions) ([]byte,
 		for _, environment := range m.CompileEnvironments {
 			compileEnvironments[environment.ID] = compactCompileEnvironmentValue(environment)
 		}
-		generatedHeaders := make(map[string]string, len(m.HeaderGroups))
-		for _, group := range m.HeaderGroups {
-			labels := append([]string(nil), group.Labels...)
+		generatedHeaders := []string{}
+		seenGeneratedHeaders := map[string]bool{}
+		for _, family := range m.GeneratedHeaderFamilies {
+			labels := append([]string(nil), family.Labels...)
 			sort.Strings(labels)
 			if len(labels) == 0 {
 				continue
 			}
 			label := labels[0]
-			if existing, ok := generatedHeaders[label]; ok && existing != group.ID {
-				return nil, fmt.Errorf(
-					"generated headers label %q maps to header groups %q and %q",
-					label,
-					existing,
-					group.ID,
-				)
+			if seenGeneratedHeaders[label] {
+				continue
 			}
-			generatedHeaders[label] = group.ID
+			seenGeneratedHeaders[label] = true
+			generatedHeaders = append(generatedHeaders, label)
 		}
+		sort.Strings(generatedHeaders)
 		r := file.AddRule("linux_compile_environment_index", compileEnvironmentIndexTarget)
 		r.SetAttr("config_payloads", configPayloads)
 		r.SetAttr("compile_environments", compileEnvironments)

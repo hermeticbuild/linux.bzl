@@ -27,14 +27,14 @@ func (r *repeated) Set(value string) error {
 }
 
 type metadata struct {
-	Schema              string               `json:"schema"`
-	Configs             []config             `json:"configs"`
-	ConfigPayloads      []configPayload      `json:"config_payloads"`
-	CompileEnvironments []compileEnvironment `json:"compile_environments"`
-	HeaderGroups        []headerGroup        `json:"header_groups"`
-	SourceFiles         []sourceInput        `json:"source_files"`
-	SourceInputGroups   []string             `json:"source_input_groups"`
-	ObjectVariants      []objectVariant      `json:"object_variants"`
+	Schema                  string                  `json:"schema"`
+	Configs                 []config                `json:"configs"`
+	ConfigPayloads          []configPayload         `json:"config_payloads"`
+	CompileEnvironments     []compileEnvironment    `json:"compile_environments"`
+	GeneratedHeaderFamilies []generatedHeaderFamily `json:"generated_header_families"`
+	SourceFiles             []sourceInput           `json:"source_files"`
+	SourceInputGroups       []string                `json:"source_input_groups"`
+	ObjectVariants          []objectVariant         `json:"object_variants"`
 }
 
 type config struct {
@@ -71,18 +71,19 @@ type configPayload struct {
 }
 
 type compileEnvironment struct {
-	ID            string   `json:"id"`
-	ABI           string   `json:"abi"`
-	ConfigPayload string   `json:"config_payload"`
-	HeaderGroups  []string `json:"header_groups"`
+	ID                      string   `json:"id"`
+	ABI                     string   `json:"abi"`
+	ConfigPayload           string   `json:"config_payload"`
+	GeneratedHeaderFamilies []string `json:"generated_header_families"`
 }
 
-type headerGroup struct {
+type generatedHeaderFamily struct {
 	ID               string        `json:"id"`
+	Name             string        `json:"name"`
 	ConfigPayload    string        `json:"config_payload"`
 	Labels           []string      `json:"labels"`
 	Srcarch          string        `json:"srcarch"`
-	Footprint        string        `json:"footprint"`
+	Dependencies     []string      `json:"dependencies"`
 	SourceInputGroup int           `json:"source_input_group"`
 	SourceInputs     []sourceInput `json:"source_inputs"`
 }
@@ -293,10 +294,10 @@ func validateMetadata(meta *metadata, requireContent bool) (metadataStats, error
 }
 
 const (
-	configPayloadDomain      = "linux-compact-config-payload-v1"
-	compileEnvironmentDomain = "linux-compact-compile-environment-v1"
-	headerGroupDomain        = "linux-compact-generated-headers-v1"
-	objectContentDomain      = "linux-compact-object-v1"
+	configPayloadDomain         = "linux-compact-config-payload-v1"
+	compileEnvironmentDomain    = "linux-compact-compile-environment-v2"
+	generatedHeaderFamilyDomain = "linux-compact-generated-header-family-v1"
+	objectContentDomain         = "linux-compact-object-v1"
 )
 
 func canonicalContentID(domain string, values ...string) string {
@@ -392,38 +393,124 @@ func validateContentAddressedMetadata(
 		payloadIDs[payload.ID] = true
 	}
 
-	headerIDs := map[string]bool{}
-	for _, group := range meta.HeaderGroups {
-		if !isContentID(group.ID) || headerIDs[group.ID] {
-			return nil, fmt.Errorf("invalid or duplicate header group ID %q", group.ID)
+	familyByID := map[string]generatedHeaderFamily{}
+	for _, family := range meta.GeneratedHeaderFamilies {
+		if !isContentID(family.ID) {
+			return nil, fmt.Errorf("invalid generated header family ID %q", family.ID)
 		}
-		if !payloadIDs[group.ConfigPayload] {
-			return nil, fmt.Errorf("header group %s references unknown config payload %s", group.ID, group.ConfigPayload)
+		if _, exists := familyByID[family.ID]; exists {
+			return nil, fmt.Errorf("duplicate generated header family ID %q", family.ID)
 		}
-		if group.Srcarch == "" || group.Footprint != "exact" || len(group.Labels) == 0 {
-			return nil, fmt.Errorf("header group %s has incomplete exact metadata", group.ID)
+		if !payloadIDs[family.ConfigPayload] {
+			return nil, fmt.Errorf(
+				"generated header family %s references unknown config payload %s",
+				family.ID,
+				family.ConfigPayload,
+			)
 		}
-		for _, label := range group.Labels {
+		if family.Name == "" || family.Srcarch == "" || len(family.Labels) == 0 {
+			return nil, fmt.Errorf(
+				"generated header family %s has incomplete metadata",
+				family.ID,
+			)
+		}
+		for i, label := range family.Labels {
 			if label == "" {
-				return nil, fmt.Errorf("header group %s has an empty generated-header label", group.ID)
+				return nil, fmt.Errorf(
+					"generated header family %s has an empty label",
+					family.ID,
+				)
+			}
+			if i != 0 && family.Labels[i-1] >= label {
+				return nil, fmt.Errorf(
+					"generated header family %s has duplicate or non-canonical labels",
+					family.ID,
+				)
 			}
 		}
-		if len(group.SourceInputs) != 0 {
-			return nil, fmt.Errorf("header group %s retains inline source_inputs", group.ID)
+		for i, dependency := range family.Dependencies {
+			if !isContentID(dependency) || dependency == family.ID {
+				return nil, fmt.Errorf(
+					"generated header family %s has invalid dependency %q",
+					family.ID,
+					dependency,
+				)
+			}
+			if i != 0 && family.Dependencies[i-1] >= dependency {
+				return nil, fmt.Errorf(
+					"generated header family %s has duplicate or non-canonical dependencies",
+					family.ID,
+				)
+			}
 		}
-		inputs, err := groupInputs(group.SourceInputGroup, "header group "+group.ID)
-		if err != nil {
+		if len(family.SourceInputs) != 0 {
+			return nil, fmt.Errorf(
+				"generated header family %s retains inline source_inputs",
+				family.ID,
+			)
+		}
+		var inputs []sourceInput
+		if family.SourceInputGroup != 0 {
+			var err error
+			inputs, err = groupInputs(
+				family.SourceInputGroup,
+				"generated header family "+family.ID,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
+		values := []string{
+			"name=" + family.Name,
+			"srcarch=" + family.Srcarch,
+			"config_payload=" + family.ConfigPayload,
+		}
+		for _, dependency := range family.Dependencies {
+			values = append(values, "dependency="+dependency)
+		}
+		for _, input := range inputs {
+			values = append(values, "source_input="+input.Path+"\x00"+input.Digest)
+		}
+		expected := canonicalContentID(generatedHeaderFamilyDomain, values...)
+		if family.ID != expected {
+			return nil, fmt.Errorf(
+				"generated header family %s canonical fields hash to %s",
+				family.ID,
+				expected,
+			)
+		}
+		familyByID[family.ID] = family
+	}
+	familyState := map[string]uint8{}
+	var validateFamilyDependencies func(string) error
+	validateFamilyDependencies = func(familyID string) error {
+		switch familyState[familyID] {
+		case 1:
+			return fmt.Errorf("generated header family dependency cycle at %s", familyID)
+		case 2:
+			return nil
+		}
+		familyState[familyID] = 1
+		family := familyByID[familyID]
+		for _, dependency := range family.Dependencies {
+			if _, ok := familyByID[dependency]; !ok {
+				return fmt.Errorf(
+					"generated header family %s references unknown dependency %s",
+					familyID,
+					dependency,
+				)
+			}
+			if err := validateFamilyDependencies(dependency); err != nil {
+				return err
+			}
+		}
+		familyState[familyID] = 2
+		return nil
+	}
+	for familyID := range familyByID {
+		if err := validateFamilyDependencies(familyID); err != nil {
 			return nil, err
 		}
-		values := []string{group.Srcarch, group.ConfigPayload, group.Footprint}
-		for _, input := range inputs {
-			values = append(values, input.Path+"\x00"+input.Digest)
-		}
-		expected := canonicalContentID(headerGroupDomain, values...)
-		if group.ID != expected {
-			return nil, fmt.Errorf("header group %s canonical fields hash to %s", group.ID, expected)
-		}
-		headerIDs[group.ID] = true
 	}
 
 	environments := map[string]compileEnvironment{}
@@ -438,15 +525,44 @@ func validateContentAddressedMetadata(
 		if environment.ABI == "" || !payloadIDs[environment.ConfigPayload] {
 			return nil, fmt.Errorf("compile environment %s has invalid ABI or config payload", environment.ID)
 		}
-		for i, groupID := range environment.HeaderGroups {
-			if !headerIDs[groupID] {
-				return nil, fmt.Errorf("compile environment %s references unknown header group %s", environment.ID, groupID)
+		familyNames := map[string]bool{}
+		for i, familyID := range environment.GeneratedHeaderFamilies {
+			family, ok := familyByID[familyID]
+			if !ok {
+				return nil, fmt.Errorf(
+					"compile environment %s references unknown generated header family %s",
+					environment.ID,
+					familyID,
+				)
 			}
-			if i != 0 && environment.HeaderGroups[i-1] >= groupID {
-				return nil, fmt.Errorf("compile environment %s has duplicate or non-canonical header groups", environment.ID)
+			if i != 0 && environment.GeneratedHeaderFamilies[i-1] >= familyID {
+				return nil, fmt.Errorf(
+					"compile environment %s has duplicate or non-canonical generated header families",
+					environment.ID,
+				)
 			}
+			if familyNames[family.Name] {
+				return nil, fmt.Errorf(
+					"compile environment %s repeats generated header family %q",
+					environment.ID,
+					family.Name,
+				)
+			}
+			familyNames[family.Name] = true
 		}
-		values := append([]string{environment.ABI, environment.ConfigPayload}, environment.HeaderGroups...)
+		if familyNames["all"] && len(familyNames) != 1 {
+			return nil, fmt.Errorf(
+				"compile environment %s mixes all with precise generated header families",
+				environment.ID,
+			)
+		}
+		values := []string{
+			"abi=" + environment.ABI,
+			"config_payload=" + environment.ConfigPayload,
+		}
+		for _, familyID := range environment.GeneratedHeaderFamilies {
+			values = append(values, "generated_header_family="+familyID)
+		}
 		expected := canonicalContentID(compileEnvironmentDomain, values...)
 		if environment.ID != expected {
 			return nil, fmt.Errorf("compile environment %s canonical fields hash to %s", environment.ID, expected)

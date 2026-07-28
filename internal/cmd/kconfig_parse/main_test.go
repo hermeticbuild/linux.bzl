@@ -169,6 +169,7 @@ func TestCompactMetadataRejectsUnmatchedOverlay(t *testing.T) {
 		nil,
 		nil,
 		"",
+		"",
 		kconfig.CompactSchemaV012,
 	)
 	if err == nil || !strings.Contains(err.Error(), `config overlay "other" has no matching -config`) {
@@ -194,6 +195,7 @@ func TestCompactMetadataRejectsDuplicateOverlay(t *testing.T) {
 		nil,
 		nil,
 		"",
+		"",
 		kconfig.CompactSchemaV012,
 	)
 	if err == nil || !strings.Contains(err.Error(), `duplicate config overlay name "base"`) {
@@ -217,6 +219,7 @@ func TestCompactMetadataRejectsUnsafeResolvedFlagsNames(t *testing.T) {
 				nil,
 				nil,
 				nil,
+				"",
 				"",
 				kconfig.CompactSchemaV012,
 			)

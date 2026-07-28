@@ -10,15 +10,30 @@ load(
 visibility("private")
 
 def _fake_linux_generated_headers_impl(ctx):
-    header = ctx.actions.declare_file(ctx.label.name + ".h")
-    ctx.actions.write(header, "")
+    families = {}
+    headers = []
+    for name in sorted(ctx.attr.family_content_ids.keys()):
+        header = ctx.actions.declare_file(ctx.label.name + "." + name + ".h")
+        ctx.actions.write(header, "")
+        headers.append(header)
+        families[name] = struct(
+            arch = "x86",
+            cflags = None,
+            content_id = ctx.attr.family_content_ids[name],
+            files = depset([header]),
+            include_dir_anchors = {},
+            include_dirs = [],
+            name = name,
+            srcarch = "x86",
+            vdsomunge = None,
+        )
     return [
-        DefaultInfo(files = depset([header])),
+        DefaultInfo(files = depset(headers)),
         LinuxGeneratedHeadersInfo(
             arch = "x86",
             cflags = None,
-            content_id = ctx.attr.content_id,
-            files = depset([header]),
+            families = families,
+            files = depset(headers),
             include_dir_anchors = {},
             include_dirs = [],
             srcarch = "x86",
@@ -29,7 +44,7 @@ def _fake_linux_generated_headers_impl(ctx):
 fake_linux_generated_headers = rule(
     implementation = _fake_linux_generated_headers_impl,
     attrs = {
-        "content_id": attr.string(mandatory = True),
+        "family_content_ids": attr.string_dict(mandatory = True),
     },
 )
 

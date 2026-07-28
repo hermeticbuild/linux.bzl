@@ -22,6 +22,7 @@ load(
     "linux_object",
     "linux_source_input_index",
     "linux_source_tree",
+    "linux_x86_generated_headers",
 )
 
 visibility("private")
@@ -75,7 +76,7 @@ def _fake_compile_environment_index_impl(_ctx):
             config_payloads = {},
             environments = {},
             expected_abi = "test-abi",
-            header_groups = {},
+            generated_header_families = {},
         ),
     ]
 
@@ -86,12 +87,25 @@ _fake_compile_environment_index = rule(
 def _fake_generated_headers_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".h")
     ctx.actions.write(out, "")
+    family = struct(
+        arch = "x86",
+        cflags = None,
+        content_id = ctx.attr.family_content_id,
+        files = depset([out]),
+        include_dir_anchors = {},
+        include_dirs = [],
+        name = ctx.attr.family_name,
+        srcarch = "x86",
+        vdsomunge = None,
+    )
     return [
         DefaultInfo(files = depset([out])),
         LinuxGeneratedHeadersInfo(
             arch = "x86",
             cflags = None,
-            content_id = ctx.attr.content_id,
+            families = {
+                ctx.attr.family_name: family,
+            },
             files = depset([out]),
             include_dir_anchors = {},
             include_dirs = [],
@@ -103,19 +117,33 @@ def _fake_generated_headers_impl(ctx):
 _fake_generated_headers = rule(
     implementation = _fake_generated_headers_impl,
     attrs = {
-        "content_id": attr.string(mandatory = True),
+        "family_content_id": attr.string(mandatory = True),
+        "family_name": attr.string(default = "all"),
     },
 )
 
 def _fake_arm64_generated_headers_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".h")
     ctx.actions.write(out, "")
+    family = struct(
+        arch = "arm64",
+        cflags = None,
+        content_id = ctx.attr.family_content_id,
+        files = depset([out]),
+        include_dir_anchors = {},
+        include_dirs = [],
+        name = "all",
+        srcarch = "arm64",
+        vdsomunge = ctx.executable._vdsomunge,
+    )
     return [
         DefaultInfo(files = depset([out])),
         LinuxGeneratedHeadersInfo(
             arch = "arm64",
             cflags = None,
-            content_id = ctx.attr.content_id,
+            families = {
+                "all": family,
+            },
             files = depset([out]),
             include_dir_anchors = {},
             include_dirs = [],
@@ -127,7 +155,7 @@ def _fake_arm64_generated_headers_impl(ctx):
 _fake_arm64_generated_headers = rule(
     implementation = _fake_arm64_generated_headers_impl,
     attrs = {
-        "content_id": attr.string(mandatory = True),
+        "family_content_id": attr.string(mandatory = True),
         "_vdsomunge": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/runandwrite"),
@@ -213,18 +241,20 @@ def _content_addressed_object_test_impl(ctx):
             if ctx.attr.expected_payload_id in file.short_path
         ]
         asserts.true(env, len(config_inputs) > 0, "compile action did not select indexed config payload")
-        generated_header_inputs = [
-            file
-            for file in compile_actions[0].inputs.to_list()
-            if file.basename == ctx.attr.expected_generated_header
-        ]
-        asserts.equals(env, 1, len(generated_header_inputs))
-        duplicate_header_inputs = [
-            file
-            for file in compile_actions[0].inputs.to_list()
-            if file.basename == ctx.attr.unexpected_generated_header
-        ]
-        asserts.equals(env, 0, len(duplicate_header_inputs))
+        for basename in ctx.attr.expected_generated_headers:
+            generated_header_inputs = [
+                file
+                for file in compile_actions[0].inputs.to_list()
+                if file.basename == basename
+            ]
+            asserts.equals(env, 1, len(generated_header_inputs))
+        for basename in ctx.attr.unexpected_generated_headers:
+            duplicate_header_inputs = [
+                file
+                for file in compile_actions[0].inputs.to_list()
+                if file.basename == basename
+            ]
+            asserts.equals(env, 0, len(duplicate_header_inputs))
         unexpected_inputs = [
             file
             for file in compile_actions[0].inputs.to_list()
@@ -237,12 +267,304 @@ _content_addressed_object_test = analysistest.make(
     _content_addressed_object_test_impl,
     attrs = {
         "expected_content_id": attr.string(mandatory = True),
-        "expected_generated_header": attr.string(mandatory = True),
+        "expected_generated_headers": attr.string_list(),
         "expected_payload_id": attr.string(mandatory = True),
-        "unexpected_generated_header": attr.string(mandatory = True),
+        "unexpected_generated_headers": attr.string_list(),
         "unexpected_input": attr.string(mandatory = True),
     },
 )
+
+_X86_PRECISE_HEADER_FAMILIES = [
+    "static",
+    "timeconst",
+    "compile",
+    "version",
+    "utsrelease",
+    "utsversion",
+    "cpufeatures",
+    "bounds",
+    "asm_offsets",
+    "rq_offsets",
+    "kvm_offsets",
+]
+
+def _family_paths(info):
+    return sorted([file.path for file in info.files.to_list()])
+
+def _generated_header_family_layout_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    target = analysistest.target_under_test(env)
+    info = target[LinuxGeneratedHeadersInfo]
+    precise_paths = []
+    precise_include_dirs = []
+    include_dir_owners = {}
+    for name in _X86_PRECISE_HEADER_FAMILIES:
+        paths = _family_paths(info.families[name])
+        asserts.true(env, len(paths) > 0, "%s family must publish files" % name)
+        for path in paths:
+            asserts.true(
+                env,
+                (".headers/%s/" % name) in path,
+                "%s family file is not isolated under its own root: %s" % (name, path),
+            )
+        precise_paths.extend(paths)
+        for include_dir in info.families[name].include_dirs:
+            asserts.true(
+                env,
+                (".headers/%s/" % name) in include_dir,
+                "%s family include directory is not isolated: %s" % (name, include_dir),
+            )
+            asserts.false(
+                env,
+                include_dir in include_dir_owners,
+                "%s and %s share include directory %s" %
+                (include_dir_owners.get(include_dir), name, include_dir),
+            )
+            include_dir_owners[include_dir] = name
+            precise_include_dirs.append(include_dir)
+    asserts.equals(env, sorted(precise_paths), _family_paths(info.families["all"]))
+    asserts.equals(env, _family_paths(info.families["all"]), _family_paths(info))
+    asserts.equals(env, sorted(precise_include_dirs), sorted(info.families["all"].include_dirs))
+    asserts.equals(env, sorted(info.families["all"].include_dirs), sorted(info.include_dirs))
+    asserts.equals(env, 52, len(info.families["static"].files.to_list()))
+    version_include_dirs = info.families["version"].include_dirs
+    asserts.equals(env, 2, len(version_include_dirs))
+    asserts.true(env, any([
+        include_dir.endswith(".headers/version/include")
+        for include_dir in version_include_dirs
+    ]))
+    asserts.true(env, any([
+        include_dir.endswith(".headers/version/include/generated/uapi")
+        for include_dir in version_include_dirs
+    ]))
+
+    actions = analysistest.target_actions(env)
+    version_mnemonics = {
+        "LinuxCompileHeader": "compile",
+        "LinuxUTSReleaseHeader": "utsrelease",
+        "LinuxUTSVersionHeader": "utsversion",
+        "LinuxVersionHeader": "version",
+    }
+    for mnemonic, family_name in version_mnemonics.items():
+        matching = [action for action in actions if action.mnemonic == mnemonic]
+        asserts.equals(env, 1, len(matching))
+        if matching:
+            action = matching[0]
+            outputs = action.outputs.to_list()
+            asserts.equals(env, 1, len(outputs))
+            if outputs:
+                asserts.true(env, (".headers/%s/" % family_name) in outputs[0].path)
+            input_basenames = [file.basename for file in action.inputs.to_list()]
+            asserts.equals(env, family_name == "utsversion", ".config" in input_basenames)
+            asserts.equals(env, family_name == "utsrelease", "kernel.release" in input_basenames)
+            asserts.equals(env, family_name == "utsversion", "-config" in action.argv)
+            asserts.equals(env, family_name == "utsrelease", "-kernel_release" in action.argv)
+            asserts.equals(env, family_name == "version", "-kernel_version" in action.argv)
+            if family_name == "version":
+                version_flag_index = action.argv.index("-kernel_version")
+                asserts.equals(env, "6.18.2", action.argv[version_flag_index + 1])
+    return analysistest.end(env)
+
+_generated_header_family_layout_test = analysistest.make(
+    _generated_header_family_layout_test_impl,
+)
+
+def _generated_header_family_reuse_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    variant = analysistest.target_under_test(env)[LinuxGeneratedHeadersInfo]
+    base = ctx.attr.base_generated_headers[LinuxGeneratedHeadersInfo]
+    for name in _X86_PRECISE_HEADER_FAMILIES[:-1]:
+        asserts.equals(
+            env,
+            _family_paths(base.families[name]),
+            _family_paths(variant.families[name]),
+            "%s family must reuse the canonical producer" % name,
+        )
+        asserts.equals(env, base.families[name].include_dirs, variant.families[name].include_dirs)
+    asserts.true(
+        env,
+        _family_paths(base.families["kvm_offsets"]) != _family_paths(variant.families["kvm_offsets"]),
+        "changed kvm_offsets family must use a local producer",
+    )
+    for path in _family_paths(variant.families["kvm_offsets"]):
+        asserts.true(env, ".headers/kvm_offsets/" in path)
+
+    precise_paths = []
+    for name in _X86_PRECISE_HEADER_FAMILIES:
+        precise_paths.extend(_family_paths(variant.families[name]))
+    asserts.equals(env, sorted(precise_paths), _family_paths(variant.families["all"]))
+    asserts.equals(env, _family_paths(variant.families["all"]), _family_paths(variant))
+
+    actions = analysistest.target_actions(env)
+    offsets_asm = [action for action in actions if action.mnemonic == "LinuxOffsetsAsm"]
+    offsets_header = [action for action in actions if action.mnemonic == "LinuxOffsetsHeader"]
+    asserts.equals(env, 1, len(offsets_asm))
+    asserts.equals(env, 1, len(offsets_header))
+    asserts.equals(env, 2, len(actions))
+    if offsets_asm:
+        input_paths = {
+            file.path: True
+            for file in offsets_asm[0].inputs.to_list()
+        }
+        dependency_names = [
+            "asm_offsets",
+            "utsrelease",
+        ]
+        for name in _X86_PRECISE_HEADER_FAMILIES[:-1]:
+            for path in _family_paths(variant.families[name]):
+                asserts.equals(
+                    env,
+                    name in dependency_names,
+                    path in input_paths,
+                    "local kvm_offsets action dependency mismatch for %s input %s" % (name, path),
+                )
+    return analysistest.end(env)
+
+_generated_header_family_reuse_test = analysistest.make(
+    _generated_header_family_reuse_test_impl,
+    attrs = {
+        "base_generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
+    },
+)
+
+def _legacy_generated_header_dependencies_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    info = analysistest.target_under_test(env)[LinuxGeneratedHeadersInfo]
+    expected_dependencies = {
+        "bounds": [
+            "static",
+            "timeconst",
+            "compile",
+            "version",
+            "utsrelease",
+            "utsversion",
+            "cpufeatures",
+        ],
+        "asm_offsets": [
+            "static",
+            "timeconst",
+            "compile",
+            "version",
+            "utsrelease",
+            "utsversion",
+            "cpufeatures",
+            "bounds",
+        ],
+        "rq_offsets": [
+            "static",
+            "timeconst",
+            "compile",
+            "version",
+            "utsrelease",
+            "utsversion",
+            "cpufeatures",
+            "bounds",
+            "asm_offsets",
+        ],
+        "kvm_offsets": [
+            "static",
+            "timeconst",
+            "compile",
+            "version",
+            "utsrelease",
+            "utsversion",
+            "cpufeatures",
+            "bounds",
+            "asm_offsets",
+            "rq_offsets",
+        ],
+    }
+    offsets_actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxOffsetsAsm"
+    ]
+    asserts.equals(env, 4, len(offsets_actions))
+    for family_name, dependency_names in expected_dependencies.items():
+        matching = [
+            action
+            for action in offsets_actions
+            if any([
+                (".headers/%s/" % family_name) in output.path
+                for output in action.outputs.to_list()
+            ])
+        ]
+        asserts.equals(env, 1, len(matching))
+        if matching:
+            input_paths = {
+                file.path: True
+                for file in matching[0].inputs.to_list()
+            }
+            for candidate in _X86_PRECISE_HEADER_FAMILIES:
+                if candidate == family_name:
+                    continue
+                for path in _family_paths(info.families[candidate]):
+                    asserts.equals(
+                        env,
+                        candidate in dependency_names,
+                        path in input_paths,
+                        "legacy %s dependency mismatch for %s input %s" %
+                        (family_name, candidate, path),
+                    )
+    return analysistest.end(env)
+
+_legacy_generated_header_dependencies_test = analysistest.make(
+    _legacy_generated_header_dependencies_test_impl,
+)
+
+def _generated_header_earliest_reuse_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    selected = analysistest.target_under_test(env)[LinuxGeneratedHeadersInfo]
+    earliest = ctx.attr.earliest_generated_headers[LinuxGeneratedHeadersInfo]
+    later = ctx.attr.later_generated_headers[LinuxGeneratedHeadersInfo]
+    for name in ["all"] + _X86_PRECISE_HEADER_FAMILIES:
+        asserts.equals(
+            env,
+            _family_paths(earliest.families[name]),
+            _family_paths(selected.families[name]),
+            "%s family must select the earliest reusable provider" % name,
+        )
+        asserts.true(
+            env,
+            _family_paths(later.families[name]) != _family_paths(selected.families[name]),
+            "%s family unexpectedly selected the later reusable provider" % name,
+        )
+    asserts.equals(env, 0, len(analysistest.target_actions(env)))
+    return analysistest.end(env)
+
+_generated_header_earliest_reuse_test = analysistest.make(
+    _generated_header_earliest_reuse_test_impl,
+    attrs = {
+        "earliest_generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
+        "later_generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
+    },
+)
+
+def _x86_generated_headers_fixture(
+        name,
+        config,
+        family_content_ids,
+        family_dependency_ids,
+        reusable_generated_headers,
+        tags):
+    linux_x86_generated_headers(
+        name = name,
+        asm_offsets_c = "linux_objects_test_fixture.c",
+        bounds_c = "linux_objects_test_fixture.c",
+        config = config,
+        cpufeatures_h = "linux_objects_test_fixture.c",
+        family_content_ids = family_content_ids,
+        family_dependency_ids = family_dependency_ids,
+        kvm_asm_offsets_c = "linux_objects_test_fixture.c",
+        orc_types_h = "linux_objects_test_fixture.c",
+        required_features_h = "linux_objects_test_fixture.c",
+        reusable_generated_headers = reusable_generated_headers,
+        rq_offsets_c = "linux_objects_test_fixture.c",
+        source_root = "linux_objects_test_fixture.c",
+        syscall_32_tbl = "linux_objects_test_fixture.c",
+        syscall_64_tbl = "linux_objects_test_fixture.c",
+        tags = tags,
+    )
 
 def _exact_nvhe_source_lookup_test_impl(ctx):
     env = analysistest.begin(ctx)
@@ -368,10 +690,13 @@ def linux_objects_fail_closed_test_suite(name):
     unknown_module_id = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
     payload_id = "1111111111111111111111111111111111111111111111111111111111111111"
     environment_id = "2222222222222222222222222222222222222222222222222222222222222222"
-    header_group_id = "3333333333333333333333333333333333333333333333333333333333333333"
+    header_family_id = "3333333333333333333333333333333333333333333333333333333333333333"
     arm64_environment_id = "4444444444444444444444444444444444444444444444444444444444444444"
-    arm64_header_group_id = "5555555555555555555555555555555555555555555555555555555555555555"
+    arm64_header_family_id = "5555555555555555555555555555555555555555555555555555555555555555"
     vdso32_object_id = "6666666666666666666666666666666666666666666666666666666666666666"
+    precise_header_family_id = "7777777777777777777777777777777777777777777777777777777777777777"
+    second_precise_header_family_id = "8888888888888888888888888888888888888888888888888888888888888888"
+    precise_environment_id = "9999999999999999999999999999999999999999999999999999999999999999"
 
     _fake_linux_image(
         name = image,
@@ -397,12 +722,12 @@ def linux_objects_fail_closed_test_suite(name):
     duplicate_generated_headers = name + "_generated_headers_z"
     _fake_generated_headers(
         name = generated_headers,
-        content_id = header_group_id,
+        family_content_id = header_family_id,
         tags = fixture_tags,
     )
     _fake_generated_headers(
         name = duplicate_generated_headers,
-        content_id = header_group_id,
+        family_content_id = header_family_id,
         tags = fixture_tags,
     )
     compile_environment_index = name + "_compile_environment_index"
@@ -412,23 +737,23 @@ def linux_objects_fail_closed_test_suite(name):
             environment_id: json.encode({
                 "abi": "x86_64-linux-gnu",
                 "config_payload": payload_id,
-                "header_groups": [header_group_id],
+                "generated_header_families": [header_family_id],
             }),
         },
         config_payloads = {
             payload_id: "CONFIG_TEST=y\n",
         },
         expected_abi = "x86_64-linux-gnu",
-        generated_headers = {
-            ":" + generated_headers: header_group_id,
-            ":" + duplicate_generated_headers: header_group_id,
-        },
+        generated_headers = [
+            ":" + generated_headers,
+            ":" + duplicate_generated_headers,
+        ],
         tags = fixture_tags,
     )
     arm64_generated_headers = name + "_arm64_generated_headers"
     _fake_arm64_generated_headers(
         name = arm64_generated_headers,
-        content_id = arm64_header_group_id,
+        family_content_id = arm64_header_family_id,
         tags = fixture_tags,
     )
     arm64_compile_environment_index = name + "_arm64_compile_environment_index"
@@ -439,22 +764,20 @@ def linux_objects_fail_closed_test_suite(name):
             arm64_environment_id: json.encode({
                 "abi": "arm64-linux-gnu",
                 "config_payload": payload_id,
-                "header_groups": [arm64_header_group_id],
+                "generated_header_families": [arm64_header_family_id],
             }),
         },
         config_payloads = {
             payload_id: "CONFIG_TEST=y\n",
         },
         expected_abi = "arm64-linux-gnu",
-        generated_headers = {
-            ":" + arm64_generated_headers: arm64_header_group_id,
-        },
+        generated_headers = [":" + arm64_generated_headers],
         tags = fixture_tags,
     )
     unbound_generated_headers = name + "_unbound_generated_headers"
     _fake_generated_headers(
         name = unbound_generated_headers,
-        content_id = "",
+        family_content_id = "",
         tags = fixture_tags,
     )
     unbound_header_index = name + "_unbound_header_index"
@@ -464,16 +787,74 @@ def linux_objects_fail_closed_test_suite(name):
             environment_id: json.encode({
                 "abi": "x86_64-linux-gnu",
                 "config_payload": payload_id,
-                "header_groups": [header_group_id],
+                "generated_header_families": [header_family_id],
             }),
         },
         config_payloads = {
             payload_id: "CONFIG_TEST=y\n",
         },
         expected_abi = "x86_64-linux-gnu",
-        generated_headers = {
-            ":" + unbound_generated_headers: header_group_id,
+        generated_headers = [":" + unbound_generated_headers],
+        tags = fixture_tags,
+    )
+    precise_generated_headers = name + "_precise_generated_headers"
+    _fake_generated_headers(
+        name = precise_generated_headers,
+        family_content_id = precise_header_family_id,
+        family_name = "static",
+        tags = fixture_tags,
+    )
+    mixed_header_family_index = name + "_mixed_header_family_index"
+    linux_compile_environment_index(
+        name = mixed_header_family_index,
+        compile_environments = {
+            environment_id: json.encode({
+                "abi": "x86_64-linux-gnu",
+                "config_payload": payload_id,
+                "generated_header_families": [
+                    header_family_id,
+                    precise_header_family_id,
+                ],
+            }),
         },
+        config_payloads = {
+            payload_id: "CONFIG_TEST=y\n",
+        },
+        expected_abi = "x86_64-linux-gnu",
+        generated_headers = [
+            ":" + generated_headers,
+            ":" + precise_generated_headers,
+        ],
+        tags = fixture_tags,
+    )
+    second_precise_generated_headers = name + "_second_precise_generated_headers"
+    _fake_generated_headers(
+        name = second_precise_generated_headers,
+        family_content_id = second_precise_header_family_id,
+        family_name = "asm_offsets",
+        tags = fixture_tags,
+    )
+    precise_header_family_index = name + "_precise_header_family_index"
+    linux_compile_environment_index(
+        name = precise_header_family_index,
+        compile_environments = {
+            precise_environment_id: json.encode({
+                "abi": "x86_64-linux-gnu",
+                "config_payload": payload_id,
+                "generated_header_families": [
+                    precise_header_family_id,
+                    second_precise_header_family_id,
+                ],
+            }),
+        },
+        config_payloads = {
+            payload_id: "CONFIG_TEST=y\n",
+        },
+        expected_abi = "x86_64-linux-gnu",
+        generated_headers = [
+            ":" + precise_generated_headers,
+            ":" + second_precise_generated_headers,
+        ],
         tags = fixture_tags,
     )
     source_tree = name + "_source_tree"
@@ -589,10 +970,37 @@ def linux_objects_fail_closed_test_suite(name):
     _content_addressed_object_test(
         name = indexed_object_test,
         expected_content_id = object_a_id,
-        expected_generated_header = generated_headers + ".h",
+        expected_generated_headers = [generated_headers + ".h"],
         expected_payload_id = payload_id,
         target_under_test = ":" + indexed_object,
-        unexpected_generated_header = duplicate_generated_headers + ".h",
+        unexpected_generated_headers = [duplicate_generated_headers + ".h"],
+        unexpected_input = "linux_modules_test_fixture.rs",
+    )
+    precise_family_object = name + "_precise_family_object"
+    linux_object(
+        name = precise_family_object,
+        compile_environment_id = precise_environment_id,
+        compile_environment_index = ":" + precise_header_family_index,
+        content_id = object_b_id,
+        mode = "y",
+        object = "precise-family.o",
+        source_input_file = 4,
+        source_input_group = 1,
+        source_input_index = ":" + source_input_index,
+        source_tree_info = ":" + source_tree,
+        tags = fixture_tags,
+    )
+    precise_family_object_test = precise_family_object + "_test"
+    _content_addressed_object_test(
+        name = precise_family_object_test,
+        expected_content_id = object_b_id,
+        expected_generated_headers = [
+            precise_generated_headers + ".h",
+            second_precise_generated_headers + ".h",
+        ],
+        expected_payload_id = payload_id,
+        target_under_test = ":" + precise_family_object,
+        unexpected_generated_headers = [generated_headers + ".h"],
         unexpected_input = "linux_modules_test_fixture.rs",
     )
 
@@ -690,7 +1098,7 @@ def linux_objects_fail_closed_test_suite(name):
             environment_id: json.encode({
                 "abi": "actual-abi",
                 "config_payload": payload_id,
-                "header_groups": [],
+                "generated_header_families": [],
             }),
         },
         config_payloads = {
@@ -779,15 +1187,148 @@ def linux_objects_fail_closed_test_suite(name):
         (mismatched_abi_index, "does not match expected_abi"),
         (missing_content_id_nvhe, "linux_arm64_nvhe_object content_id must be a full lowercase SHA-256 content ID"),
         (missing_content_id_object, "linux_object content_id must be a full lowercase SHA-256 content ID"),
+        (mixed_header_family_index, "mixes all with precise generated-header families"),
         (mixed_environment_object, "mutually exclusive with legacy config/generated_headers"),
         (out_of_range_primary_source_object, "source_input_file 5 is out of range"),
         (out_of_range_source_file_index, "file index 2 is out of range"),
-        (unbound_header_index, "must publish content ID"),
+        (unbound_header_index, "family all content ID must be a full lowercase SHA-256 content ID"),
     ]
     tests = [
         ":" + equivalent_object_test,
         ":" + indexed_object_test,
+        ":" + precise_family_object_test,
     ]
+
+    base_header_family_ids = {
+        "all": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "asm_offsets": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "bounds": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "compile": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "cpufeatures": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "kvm_offsets": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "rq_offsets": "0000000000000000000000000000000000000000000000000000000000000000",
+        "static": "1111111111111111111111111111111111111111111111111111111111111111",
+        "timeconst": "2222222222222222222222222222222222222222222222222222222222222222",
+        "utsrelease": "3333333333333333333333333333333333333333333333333333333333333333",
+        "utsversion": "4444444444444444444444444444444444444444444444444444444444444444",
+        "version": "5555555555555555555555555555555555555555555555555555555555555555",
+    }
+    variant_header_family_ids = dict(base_header_family_ids)
+    variant_header_family_ids.update({
+        "all": "6666666666666666666666666666666666666666666666666666666666666666",
+        "kvm_offsets": "7777777777777777777777777777777777777777777777777777777777777777",
+    })
+    header_family_dependency_ids = {
+        "asm_offsets:bounds": base_header_family_ids["bounds"],
+        "bounds:cpufeatures": base_header_family_ids["cpufeatures"],
+        "kvm_offsets:asm_offsets": base_header_family_ids["asm_offsets"],
+        "kvm_offsets:utsrelease": base_header_family_ids["utsrelease"],
+        "rq_offsets:asm_offsets": base_header_family_ids["asm_offsets"],
+        "rq_offsets:timeconst": base_header_family_ids["timeconst"],
+    }
+    non_earlier_header_dependency = name + "_non_earlier_header_dependency"
+    _x86_generated_headers_fixture(
+        name = non_earlier_header_dependency,
+        config = ":" + equivalent_config,
+        family_content_ids = base_header_family_ids,
+        family_dependency_ids = {
+            "bounds:kvm_offsets": base_header_family_ids["kvm_offsets"],
+        },
+        reusable_generated_headers = [],
+        tags = fixture_tags,
+    )
+    mismatched_header_dependency_id = name + "_mismatched_header_dependency_id"
+    _x86_generated_headers_fixture(
+        name = mismatched_header_dependency_id,
+        config = ":" + equivalent_config,
+        family_content_ids = base_header_family_ids,
+        family_dependency_ids = {
+            "kvm_offsets:asm_offsets": base_header_family_ids["bounds"],
+        },
+        reusable_generated_headers = [],
+        tags = fixture_tags,
+    )
+    failure_cases.extend([
+        (non_earlier_header_dependency, "depends on non-earlier family kvm_offsets"),
+        (mismatched_header_dependency_id, "content ID does not match selected family"),
+    ])
+    legacy_generated_header_producer = name + "_legacy_generated_header_producer"
+    _x86_generated_headers_fixture(
+        name = legacy_generated_header_producer,
+        config = ":" + equivalent_config,
+        family_content_ids = {},
+        family_dependency_ids = {},
+        reusable_generated_headers = [],
+        tags = fixture_tags,
+    )
+    base_generated_header_producer = name + "_base_generated_header_producer"
+    _x86_generated_headers_fixture(
+        name = base_generated_header_producer,
+        config = ":" + equivalent_config,
+        family_content_ids = base_header_family_ids,
+        family_dependency_ids = header_family_dependency_ids,
+        reusable_generated_headers = [],
+        tags = fixture_tags,
+    )
+    variant_generated_header_producer = name + "_variant_generated_header_producer"
+    _x86_generated_headers_fixture(
+        name = variant_generated_header_producer,
+        config = ":" + equivalent_config,
+        family_content_ids = variant_header_family_ids,
+        family_dependency_ids = header_family_dependency_ids,
+        reusable_generated_headers = [":" + base_generated_header_producer],
+        tags = fixture_tags,
+    )
+    later_generated_header_producer = name + "_later_generated_header_producer"
+    _x86_generated_headers_fixture(
+        name = later_generated_header_producer,
+        config = ":" + equivalent_config,
+        family_content_ids = base_header_family_ids,
+        family_dependency_ids = header_family_dependency_ids,
+        reusable_generated_headers = [],
+        tags = fixture_tags,
+    )
+    earliest_reuse_generated_header_producer = name + "_earliest_reuse_generated_header_producer"
+    _x86_generated_headers_fixture(
+        name = earliest_reuse_generated_header_producer,
+        config = ":" + equivalent_config,
+        family_content_ids = base_header_family_ids,
+        family_dependency_ids = header_family_dependency_ids,
+        reusable_generated_headers = [
+            ":" + base_generated_header_producer,
+            ":" + later_generated_header_producer,
+        ],
+        tags = fixture_tags,
+    )
+    generated_header_layout_test = base_generated_header_producer + "_test"
+    _generated_header_family_layout_test(
+        name = generated_header_layout_test,
+        target_under_test = ":" + base_generated_header_producer,
+    )
+    legacy_generated_header_dependencies_test = legacy_generated_header_producer + "_test"
+    _legacy_generated_header_dependencies_test(
+        name = legacy_generated_header_dependencies_test,
+        target_under_test = ":" + legacy_generated_header_producer,
+    )
+    generated_header_reuse_test = variant_generated_header_producer + "_test"
+    _generated_header_family_reuse_test(
+        name = generated_header_reuse_test,
+        base_generated_headers = ":" + base_generated_header_producer,
+        target_under_test = ":" + variant_generated_header_producer,
+    )
+    generated_header_earliest_reuse_test = earliest_reuse_generated_header_producer + "_test"
+    _generated_header_earliest_reuse_test(
+        name = generated_header_earliest_reuse_test,
+        earliest_generated_headers = ":" + base_generated_header_producer,
+        later_generated_headers = ":" + later_generated_header_producer,
+        target_under_test = ":" + earliest_reuse_generated_header_producer,
+    )
+    tests.extend([
+        ":" + generated_header_earliest_reuse_test,
+        ":" + generated_header_layout_test,
+        ":" + generated_header_reuse_test,
+        ":" + legacy_generated_header_dependencies_test,
+    ])
     for target, expected_error in failure_cases:
         test_name = target + "_test"
         _failure_test(

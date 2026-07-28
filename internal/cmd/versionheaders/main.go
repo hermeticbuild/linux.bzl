@@ -12,80 +12,105 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "", "Resolved Linux .config file")
-	kernelReleasePath := flag.String("kernel_release", "", "include/config/kernel.release input")
-	compileOut := flag.String("compile_out", "", "include/generated/compile.h output")
-	linuxVersionOut := flag.String("linux_version_out", "", "include/generated/uapi/linux/version.h output")
-	utsreleaseOut := flag.String("utsrelease_out", "", "include/generated/utsrelease.h output")
-	utsversionOut := flag.String("utsversion_out", "", "UTS_VERSION header output")
-	machine := flag.String("machine", "x86_64", "UTS_MACHINE value")
-	compileBy := flag.String("compile_by", "bazel", "LINUX_COMPILE_BY value")
-	compileHost := flag.String("compile_host", "bazel", "LINUX_COMPILE_HOST value")
-	compiler := flag.String("compiler", "clang", "LINUX_COMPILER value")
-	buildVersion := flag.String("build_version", "1", "KBUILD_BUILD_VERSION value")
-	buildTimestamp := flag.String("build_timestamp", "1970-01-01T00:00:00Z", "KBUILD_BUILD_TIMESTAMP value")
-	flag.Parse()
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
 
-	if *configPath == "" || *kernelReleasePath == "" {
-		flag.PrintDefaults()
-		os.Exit(2)
+func run(args []string) error {
+	flags := flag.NewFlagSet("versionheaders", flag.ContinueOnError)
+	configPath := flags.String("config", "", "Resolved Linux .config file")
+	kernelReleasePath := flags.String("kernel_release", "", "include/config/kernel.release input")
+	kernelVersion := flags.String(
+		"kernel_version",
+		"",
+		"Declared MAJOR.PATCHLEVEL.SUBLEVEL[EXTRAVERSION] kernel version",
+	)
+	compileOut := flags.String("compile_out", "", "include/generated/compile.h output")
+	linuxVersionOut := flags.String("linux_version_out", "", "include/generated/uapi/linux/version.h output")
+	utsreleaseOut := flags.String("utsrelease_out", "", "include/generated/utsrelease.h output")
+	utsversionOut := flags.String("utsversion_out", "", "UTS_VERSION header output")
+	machine := flags.String("machine", "x86_64", "UTS_MACHINE value")
+	compileBy := flags.String("compile_by", "bazel", "LINUX_COMPILE_BY value")
+	compileHost := flags.String("compile_host", "bazel", "LINUX_COMPILE_HOST value")
+	compiler := flags.String("compiler", "clang", "LINUX_COMPILER value")
+	buildVersion := flags.String("build_version", "1", "KBUILD_BUILD_VERSION value")
+	buildTimestamp := flags.String("build_timestamp", "1970-01-01T00:00:00Z", "KBUILD_BUILD_TIMESTAMP value")
+	if err := flags.Parse(args); err != nil {
+		return err
 	}
 	if *compileOut == "" && *linuxVersionOut == "" && *utsreleaseOut == "" && *utsversionOut == "" {
-		fmt.Fprintln(os.Stderr, "at least one output flag is required")
-		os.Exit(2)
+		return fmt.Errorf("at least one output flag is required")
+	}
+	if *linuxVersionOut != "" && *kernelVersion == "" {
+		return fmt.Errorf("-kernel_version is required with -linux_version_out")
+	}
+	if *utsreleaseOut != "" && *kernelReleasePath == "" {
+		return fmt.Errorf("-kernel_release is required with -utsrelease_out")
+	}
+	if *utsversionOut != "" && *configPath == "" {
+		return fmt.Errorf("-config is required with -utsversion_out")
 	}
 
-	configFile, err := os.Open(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "open config: %v\n", err)
-		os.Exit(1)
-	}
-	config, err := kconfig.ParseConfig(configFile)
-	closeErr := configFile.Close()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "parse config: %v\n", err)
-		os.Exit(1)
-	}
-	if closeErr != nil {
-		fmt.Fprintf(os.Stderr, "close config: %v\n", closeErr)
-		os.Exit(1)
+	var linuxVersionContent string
+	if *linuxVersionOut != "" {
+		content, err := linuxVersionHeader(*kernelVersion)
+		if err != nil {
+			return fmt.Errorf("generate linux version header: %w", err)
+		}
+		linuxVersionContent = content
 	}
 
-	releaseData, err := os.ReadFile(*kernelReleasePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "read kernel release: %v\n", err)
-		os.Exit(1)
+	release := ""
+	if *utsreleaseOut != "" {
+		releaseData, err := os.ReadFile(*kernelReleasePath)
+		if err != nil {
+			return fmt.Errorf("read kernel release: %w", err)
+		}
+		release = strings.TrimSpace(string(releaseData))
+		if release == "" {
+			return fmt.Errorf("kernel release is empty")
+		}
 	}
-	release := strings.TrimSpace(string(releaseData))
-	if release == "" {
-		fmt.Fprintln(os.Stderr, "kernel release is empty")
-		os.Exit(1)
+
+	var config map[string]string
+	if *utsversionOut != "" {
+		configFile, err := os.Open(*configPath)
+		if err != nil {
+			return fmt.Errorf("open config: %w", err)
+		}
+		config, err = kconfig.ParseConfig(configFile)
+		closeErr := configFile.Close()
+		if err != nil {
+			return fmt.Errorf("parse config: %w", err)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close config: %w", closeErr)
+		}
 	}
 
 	if *compileOut != "" {
 		if err := writeFile(*compileOut, compileHeader(*machine, *compileBy, *compileHost, *compiler)); err != nil {
-			fmt.Fprintf(os.Stderr, "write compile header: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("write compile header: %w", err)
 		}
 	}
 	if *linuxVersionOut != "" {
-		if err := writeFile(*linuxVersionOut, linuxVersionHeader(release)); err != nil {
-			fmt.Fprintf(os.Stderr, "write linux version header: %v\n", err)
-			os.Exit(1)
+		if err := writeFile(*linuxVersionOut, linuxVersionContent); err != nil {
+			return fmt.Errorf("write linux version header: %w", err)
 		}
 	}
 	if *utsreleaseOut != "" {
 		if err := writeFile(*utsreleaseOut, utsreleaseHeader(release)); err != nil {
-			fmt.Fprintf(os.Stderr, "write utsrelease header: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("write utsrelease header: %w", err)
 		}
 	}
 	if *utsversionOut != "" {
 		if err := writeFile(*utsversionOut, utsversionHeader(config, *buildVersion, *buildTimestamp)); err != nil {
-			fmt.Fprintf(os.Stderr, "write utsversion header: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("write utsversion header: %w", err)
 		}
 	}
+	return nil
 }
 
 func writeFile(path, content string) error {
@@ -109,8 +134,11 @@ func utsreleaseHeader(release string) string {
 	return fmt.Sprintf("/* Automatically generated by Bazel versionheaders. */\n#define UTS_RELEASE %q\n", release)
 }
 
-func linuxVersionHeader(release string) string {
-	major, patch, sublevel := kernelVersion(release)
+func linuxVersionHeader(version string) (string, error) {
+	major, patch, sublevel, err := parseKernelVersion(version)
+	if err != nil {
+		return "", err
+	}
 	code := (major << 16) + (patch << 8)
 	if sublevel > 255 {
 		code += 255
@@ -123,24 +151,52 @@ func linuxVersionHeader(release string) string {
 #define LINUX_VERSION_SUBLEVEL %d
 #define LINUX_VERSION_CODE %d
 #define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + ((c) > 255 ? 255 : (c)))
-`, major, patch, sublevel, code)
+`, major, patch, sublevel, code), nil
 }
 
-func kernelVersion(release string) (int, int, int) {
-	parts := strings.SplitN(release, "-", 2)
-	fields := strings.Split(parts[0], ".")
-	values := [3]int{}
-	for i := range values {
-		if i >= len(fields) {
-			continue
+func parseKernelVersion(version string) (int, int, int, error) {
+	fields := strings.SplitN(version, ".", 3)
+	if len(fields) != 3 {
+		return 0, 0, 0, fmt.Errorf(
+			"kernel version %q must begin with MAJOR.PATCHLEVEL.SUBLEVEL",
+			version,
+		)
+	}
+	sublevelEnd := 0
+	for sublevelEnd < len(fields[2]) {
+		char := fields[2][sublevelEnd]
+		if char < '0' || char > '9' {
+			break
 		}
-		value, err := strconv.Atoi(fields[i])
+		sublevelEnd++
+	}
+	fields[2] = fields[2][:sublevelEnd]
+	values := [3]int{}
+	for i, field := range fields {
+		if field == "" {
+			return 0, 0, 0, fmt.Errorf("kernel version %q has an empty component", version)
+		}
+		for _, char := range field {
+			if char < '0' || char > '9' {
+				return 0, 0, 0, fmt.Errorf(
+					"kernel version %q has non-decimal component %q",
+					version,
+					field,
+				)
+			}
+		}
+		value, err := strconv.Atoi(field)
 		if err != nil {
-			continue
+			return 0, 0, 0, fmt.Errorf(
+				"parse kernel version %q component %q: %w",
+				version,
+				field,
+				err,
+			)
 		}
 		values[i] = value
 	}
-	return values[0], values[1], values[2]
+	return values[0], values[1], values[2], nil
 }
 
 func utsversionHeader(config map[string]string, buildVersion, buildTimestamp string) string {

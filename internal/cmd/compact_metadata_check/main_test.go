@@ -22,17 +22,17 @@ func validV013Metadata() *metadata {
 	payloadID := canonicalContentID(configPayloadDomain, payloadContent)
 	headerDigest := strings.Repeat("6", 64)
 	headerID := canonicalContentID(
-		headerGroupDomain,
-		"x86",
-		payloadID,
-		"exact",
-		"include/generated.h\x00"+headerDigest,
+		generatedHeaderFamilyDomain,
+		"name=static",
+		"srcarch=x86",
+		"config_payload="+payloadID,
+		"source_input=include/generated.h\x00"+headerDigest,
 	)
 	environmentID := canonicalContentID(
 		compileEnvironmentDomain,
-		"llvm-test/x86",
-		payloadID,
-		headerID,
+		"abi=llvm-test/x86",
+		"config_payload="+payloadID,
+		"generated_header_family="+headerID,
 	)
 	sourceDigest := strings.Repeat("5", 64)
 	objectID := canonicalContentID(
@@ -62,19 +62,19 @@ func validV013Metadata() *metadata {
 			{Path: "init/main.c", Digest: sourceDigest},
 		},
 		SourceInputGroups: []string{"1", "2"},
-		HeaderGroups: []headerGroup{{
+		GeneratedHeaderFamilies: []generatedHeaderFamily{{
 			ID:               headerID,
+			Name:             "static",
 			ConfigPayload:    payloadID,
 			Labels:           []string{"//:generated_headers"},
 			Srcarch:          "x86",
-			Footprint:        "exact",
 			SourceInputGroup: 1,
 		}},
 		CompileEnvironments: []compileEnvironment{{
-			ID:            environmentID,
-			ABI:           "llvm-test/x86",
-			ConfigPayload: payloadID,
-			HeaderGroups:  []string{headerID},
+			ID:                      environmentID,
+			ABI:                     "llvm-test/x86",
+			ConfigPayload:           payloadID,
+			GeneratedHeaderFamilies: []string{headerID},
 		}},
 		ObjectVariants: []objectVariant{{
 			Target:             target,
@@ -106,7 +106,7 @@ func TestValidateMetadataV013RejectsStaleContentIDs(t *testing.T) {
 			mutate: func(meta *metadata) {
 				meta.SourceFiles[0].Digest = strings.Repeat("a", 64)
 			},
-			want: "header group",
+			want: "generated header family",
 		},
 		{
 			name: "ABI",
@@ -139,6 +139,60 @@ func TestValidateMetadataV013RejectsStaleContentIDs(t *testing.T) {
 				t.Fatalf("validateMetadata() error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestValidateMetadataV013RejectsAllMixedWithPreciseFamilies(t *testing.T) {
+	meta := validV013Metadata()
+	payloadID := meta.ConfigPayloads[0].ID
+	allID := canonicalContentID(
+		generatedHeaderFamilyDomain,
+		"name=all",
+		"srcarch=x86",
+		"config_payload="+payloadID,
+	)
+	meta.GeneratedHeaderFamilies = append(meta.GeneratedHeaderFamilies, generatedHeaderFamily{
+		ID:            allID,
+		Name:          "all",
+		ConfigPayload: payloadID,
+		Labels:        []string{"//:generated_headers"},
+		Srcarch:       "x86",
+	})
+	meta.CompileEnvironments[0].GeneratedHeaderFamilies = append(
+		meta.CompileEnvironments[0].GeneratedHeaderFamilies,
+		allID,
+	)
+	sort.Strings(meta.CompileEnvironments[0].GeneratedHeaderFamilies)
+
+	_, err := validateMetadata(meta, true)
+	if err == nil || !strings.Contains(err.Error(), "mixes all with precise") {
+		t.Fatalf("validateMetadata() error = %v, want all/precise rejection", err)
+	}
+}
+
+func TestValidateMetadataV013RejectsUnknownFamilyDependency(t *testing.T) {
+	meta := validV013Metadata()
+	payloadID := meta.ConfigPayloads[0].ID
+	unknownID := strings.Repeat("a", 64)
+	familyID := canonicalContentID(
+		generatedHeaderFamilyDomain,
+		"name=bounds",
+		"srcarch=x86",
+		"config_payload="+payloadID,
+		"dependency="+unknownID,
+	)
+	meta.GeneratedHeaderFamilies = append(meta.GeneratedHeaderFamilies, generatedHeaderFamily{
+		ID:            familyID,
+		Name:          "bounds",
+		ConfigPayload: payloadID,
+		Labels:        []string{"//:generated_headers"},
+		Srcarch:       "x86",
+		Dependencies:  []string{unknownID},
+	})
+
+	_, err := validateMetadata(meta, true)
+	if err == nil || !strings.Contains(err.Error(), "unknown dependency") {
+		t.Fatalf("validateMetadata() error = %v, want unknown dependency rejection", err)
 	}
 }
 

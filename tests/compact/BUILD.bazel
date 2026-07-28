@@ -10,7 +10,20 @@ load(
 
 package(default_visibility = ["//:__subpackages__"])
 
-_CONTENT_GRAPH_HEADER_ID = "11aedeac94f8b7fd5b8eae40aea8086ab0422ac026d3888a65415344ee650f31"
+_CONTENT_GRAPH_HEADER_FAMILY_IDS = {
+    "all": "9a2f9c3cb46e2ff5959f7b21012560bb2c01c04d34d28e57012262467f808fde",
+    "asm_offsets": "1144abafa792f9c0030e91409cce4905af0017afe4599e7d578d0b7784850901",
+    "bounds": "4affe3f300eecf287337136fc18c75b410a883ded9603ae3f06d4039b8c6a631",
+    "compile": "91d2cb49ae568498e7f0a5e76deecf663141746006c85df3ebc5e24fd37b5f1f",
+    "cpufeatures": "b2ddc503c291e4d5f9cbb338fbd3669fb0f627136a3220a7403bcfb9306a65b3",
+    "kvm_offsets": "01c312f8cce1ed7759b859a5212b9fa94000941642970cfb7c72fc667f2cd3db",
+    "rq_offsets": "e48e51c262cd64287237a04fd13e4bb6ceaf1727969968e5585e6f0d2b63f5cf",
+    "static": "e0a8d8a19f8d90c6ead42aa7b92145cd6e71aa238e3f2e228ee0607ea8ad7a75",
+    "timeconst": "bd5261a5a87c487dd48b9c5fd1cb428d8a26b7e5dfa3555f1e8415a27d27df32",
+    "utsrelease": "58553bbe716386362e4c387c9a6177bfa0efd943a10623146c5dad141bddadac",
+    "utsversion": "ddf5a8035033d3776be5ebc99c19b70558c3fd7b942267aa4045df55bd5e394b",
+    "version": "8e2a050b03b520017624bb4b42f771beda2e70a6734d128e1dc5ed4a47e64853",
+}
 
 linux_config(
     name = "source_config",
@@ -19,30 +32,30 @@ linux_config(
 
 fake_linux_generated_headers(
     name = "base_generated_headers",
-    content_id = _CONTENT_GRAPH_HEADER_ID,
+    family_content_ids = _CONTENT_GRAPH_HEADER_FAMILY_IDS,
 )
 
 fake_linux_generated_headers(
     name = "blocked_driver_generated_headers",
-    content_id = _CONTENT_GRAPH_HEADER_ID,
+    family_content_ids = _CONTENT_GRAPH_HEADER_FAMILY_IDS,
 )
 
 fake_linux_generated_headers(
     name = "debug_generated_headers",
-    content_id = _CONTENT_GRAPH_HEADER_ID,
+    family_content_ids = _CONTENT_GRAPH_HEADER_FAMILY_IDS,
 )
 
 fake_linux_generated_headers(
     name = "force_net_generated_headers",
-    content_id = _CONTENT_GRAPH_HEADER_ID,
+    family_content_ids = _CONTENT_GRAPH_HEADER_FAMILY_IDS,
 )
 
 linux_compile_environment_index(
     name = "same_bucket_compile_environment_index",
     arch = "x86",
     compile_environments = {
-        "3a733110d9038a56a767f64fcfa34872d59321a030d19acd443d907a00156113": "{\"abi\":\"linux.bzl/test/x86\",\"config_payload\":\"1a226ac103531b584f6be3869bfa92729b70da6caf45823e0d60ca2cac02363c\",\"header_groups\":[]}",
-        "be8a81d2989ebc4ed07cd253908d3fadfe54617eef8b6c5092a9962c5fea32ec": "{\"abi\":\"linux.bzl/test/x86\",\"config_payload\":\"10fe42875cfee06b63d6852484acaa3dd5293596b28c21f495db183814f217d2\",\"header_groups\":[]}",
+        "3a733110d9038a56a767f64fcfa34872d59321a030d19acd443d907a00156113": "{\"abi\":\"linux.bzl/test/x86\",\"config_payload\":\"1a226ac103531b584f6be3869bfa92729b70da6caf45823e0d60ca2cac02363c\",\"generated_header_families\":[]}",
+        "be8a81d2989ebc4ed07cd253908d3fadfe54617eef8b6c5092a9962c5fea32ec": "{\"abi\":\"linux.bzl/test/x86\",\"config_payload\":\"10fe42875cfee06b63d6852484acaa3dd5293596b28c21f495db183814f217d2\",\"generated_header_families\":[]}",
     },
     config_payloads = {
         "10fe42875cfee06b63d6852484acaa3dd5293596b28c21f495db183814f217d2": "CONFIG_BATCH_VALUE=2\n",

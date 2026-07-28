@@ -450,13 +450,14 @@ graphs.
 
 The in-tree `v0.0.13` schema prepares the replacement: all named configs are
 resolved in one generator invocation, compile environments and generated
-header groups are content-addressed, source inputs are scanned exactly, and
+header families are content-addressed, source inputs are scanned exactly, and
 variant images are emitted as deltas from one canonical base graph. Equivalent
-configs therefore reference the same object and generated-header targets while
-the public `@repo//:kernel` and `@repo//variants/<name>:kernel` labels stay
-unchanged. Repository activation is intentionally gated on publishing the next
-generator release for all six supported host platforms and passing the
-differential output checks.
+configs therefore reference the same object targets. Configs with only some
+identical generated headers share those family inputs without conflating the
+remaining generated-header tree. The public `@repo//:kernel` and
+`@repo//variants/<name>:kernel` labels stay unchanged. Repository activation is
+intentionally gated on publishing the next generator release for all six
+supported host platforms and passing the differential output checks.
 
 For x86 boot images, the resolved config must select either
 `CONFIG_KERNEL_GZIP=y` or `CONFIG_KERNEL_LZ4=y`. Other x86 payload compression

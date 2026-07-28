@@ -23,6 +23,30 @@ def _source_tree_inputs(source_repo):
         _source_label(source_repo, "source_tree_lookup_files"),
     ]
 
+def _validate_header_family_dependencies(family_ids, family_dependencies, what):
+    if not family_ids:
+        if family_dependencies:
+            fail("%s dependencies require generated-header family IDs" % what)
+        return
+    if sorted(family_dependencies.keys()) != sorted(family_ids.keys()):
+        fail(
+            "%s dependency families %s do not match generated-header families %s" %
+            (what, sorted(family_dependencies.keys()), sorted(family_ids.keys())),
+        )
+    for family_name, dependencies in family_dependencies.items():
+        if type(dependencies) != "dict":
+            fail("%s family %s dependencies must be a dictionary" % (what, family_name))
+        for dependency_name, dependency_id in dependencies.items():
+            if dependency_name == family_name:
+                fail("%s family %s depends on itself" % (what, family_name))
+            if dependency_name not in family_ids:
+                fail("%s family %s depends on unknown family %s" % (what, family_name, dependency_name))
+            if family_ids[dependency_name] != dependency_id:
+                fail(
+                    "%s family %s dependency %s ID %s does not match selected ID %s" %
+                    (what, family_name, dependency_name, dependency_id, family_ids[dependency_name]),
+                )
+
 def _define_config(
         name,
         config,
@@ -173,12 +197,14 @@ def linux_image_targets(
         base_config,
         base_rust_enabled,
         graph_image,
-        base_header_content_id = "",
+        base_header_family_dependencies = {},
+        base_header_family_ids = {},
         config_mode = "default",
         variant_configs = {},
         variant_core_configs = {},
         variant_graph_images = {},
-        variant_header_content_ids = {},
+        variant_header_family_dependencies = {},
+        variant_header_family_ids = {},
         variant_header_configs = {},
         variant_rust_enabled = {}):
     """Defines private kernel graphs and the base stable exports."""
@@ -194,10 +220,29 @@ def linux_image_targets(
         fail("variant_core_configs must contain exactly the variant config names when set")
     if variant_header_configs and sorted(variant_configs.keys()) != sorted(variant_header_configs.keys()):
         fail("variant_header_configs must contain exactly the variant config names when set")
-    if variant_header_content_ids and sorted(variant_configs.keys()) != sorted(variant_header_content_ids.keys()):
-        fail("variant_header_content_ids must contain exactly the variant config names when set")
-    if variant_header_content_ids and not base_header_content_id:
-        fail("base_header_content_id is required with variant_header_content_ids")
+    if variant_header_family_ids and sorted(variant_configs.keys()) != sorted(variant_header_family_ids.keys()):
+        fail("variant_header_family_ids must contain exactly the variant config names when set")
+    if variant_header_family_dependencies and sorted(variant_configs.keys()) != sorted(variant_header_family_dependencies.keys()):
+        fail("variant_header_family_dependencies must contain exactly the variant config names when set")
+    if bool(base_header_family_ids) != bool(base_header_family_dependencies):
+        fail("base_header_family_ids and base_header_family_dependencies must be set together")
+    if bool(variant_header_family_ids) != bool(variant_header_family_dependencies):
+        fail("variant_header_family_ids and variant_header_family_dependencies must be set together")
+    if variant_header_family_ids and not base_header_family_ids:
+        fail("base_header_family_ids is required with variant_header_family_ids")
+    if variant_header_family_dependencies and not base_header_family_dependencies:
+        fail("base_header_family_dependencies is required with variant_header_family_dependencies")
+    _validate_header_family_dependencies(
+        base_header_family_ids,
+        base_header_family_dependencies,
+        "base generated headers",
+    )
+    for variant in sorted(variant_header_family_ids.keys()):
+        _validate_header_family_dependencies(
+            variant_header_family_ids[variant],
+            variant_header_family_dependencies.get(variant, {}),
+            "variant %s generated headers" % variant,
+        )
     descriptor = _architecture(arch)
     variant_packages = [
         "//variants/%s:__pkg__" % name
@@ -217,20 +262,23 @@ def linux_image_targets(
         version = version,
         visibility = internal_visibility,
     )
-    host_tools = descriptor.host_tools(
-        name = "_base_tools",
-        config = ":_base_config",
-        env = {
+    host_tools_kwargs = {
+        "name": "_base_tools",
+        "config": ":_base_config",
+        "env": {
             "ARCH": descriptor.arch,
             "SRCARCH": descriptor.srcarch,
         },
-        source_repo = source_repo,
-        source_root = _source_label(source_repo, "Kconfig"),
-        source_tree = _source_tree_inputs(source_repo),
-        target_prefix = "_base",
-        generated_headers_content_id = base_header_content_id,
-        visibility = internal_visibility,
-    )
+        "source_repo": source_repo,
+        "source_root": _source_label(source_repo, "Kconfig"),
+        "source_tree": _source_tree_inputs(source_repo),
+        "target_prefix": "_base",
+        "generated_header_family_ids": base_header_family_ids,
+        "visibility": internal_visibility,
+    }
+    if descriptor.srcarch == "x86" and base_header_family_ids:
+        host_tools_kwargs["generated_header_family_dependencies"] = base_header_family_dependencies
+    host_tools = descriptor.host_tools(**host_tools_kwargs)
     core_outputs = _define_core_outputs(
         prefix = "_base",
         arch = descriptor,
@@ -272,6 +320,8 @@ def linux_image_targets(
     host_tools_by_config = {
         arch: host_tools,
     }
+    reuse_generated_header_families = descriptor.srcarch == "x86" and bool(base_header_family_ids)
+    reusable_generated_headers = [host_tools.generated_headers] if reuse_generated_header_families else []
     core_outputs_by_config = {
         arch: core_outputs,
     }
@@ -291,16 +341,22 @@ def linux_image_targets(
         )
         header_config = variant_header_configs.get(variant, variant)
         if header_config == variant:
-            variant_host_tools = descriptor.configured_host_tools(
-                name = prefix,
-                config = ":" + config_target,
-                shared = host_tools,
-                source_repo = source_repo,
-                source_root = _source_label(source_repo, "Kconfig"),
-                source_tree = _source_tree_inputs(source_repo),
-                generated_headers_content_id = variant_header_content_ids.get(variant, ""),
-                visibility = internal_visibility,
-            )
+            configured_host_tools_kwargs = {
+                "name": prefix,
+                "config": ":" + config_target,
+                "shared": host_tools,
+                "source_repo": source_repo,
+                "source_root": _source_label(source_repo, "Kconfig"),
+                "source_tree": _source_tree_inputs(source_repo),
+                "generated_header_family_ids": variant_header_family_ids.get(variant, {}),
+                "visibility": internal_visibility,
+            }
+            if reuse_generated_header_families:
+                configured_host_tools_kwargs["generated_header_family_dependencies"] = variant_header_family_dependencies[variant]
+                configured_host_tools_kwargs["reusable_generated_headers"] = list(reusable_generated_headers)
+            variant_host_tools = descriptor.configured_host_tools(**configured_host_tools_kwargs)
+            if reuse_generated_header_families:
+                reusable_generated_headers.append(variant_host_tools.generated_headers)
         elif header_config in host_tools_by_config:
             variant_host_tools = host_tools_by_config[header_config]
         else:

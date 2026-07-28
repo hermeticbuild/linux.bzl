@@ -203,9 +203,11 @@ def _linux_image_impl(rctx):
 
     _write_configs(rctx, arch, configs, rules_repo)
     graph_stats = {}
-    base_header_content_id = ""
+    base_header_family_dependencies = {}
+    base_header_family_ids = {}
     variant_core_configs = {}
-    variant_header_content_ids = {}
+    variant_header_family_dependencies = {}
+    variant_header_family_ids = {}
     variant_header_configs = {}
     if _REPOSITORY_COMPACT_SCHEMA == _CONTENT_COMPACT_SCHEMA:
         config_paths = {
@@ -234,9 +236,14 @@ def _linux_image_impl(rctx):
             version = version,
         )
         graph_stats = content_graph.stats
-        base_header_content_id = content_graph.header_content_ids[arch]
-        variant_header_content_ids = {
-            name: content_graph.header_content_ids[name]
+        base_header_family_dependencies = content_graph.header_family_dependencies[arch]
+        base_header_family_ids = content_graph.header_family_ids[arch]
+        variant_header_family_dependencies = {
+            name: content_graph.header_family_dependencies[name]
+            for name in variant_configs.keys()
+        }
+        variant_header_family_ids = {
+            name: content_graph.header_family_ids[name]
             for name in variant_configs.keys()
         }
         variant_header_configs = content_graph.variant_header_configs
@@ -299,14 +306,16 @@ def _linux_image_impl(rctx):
             rust_profile_json = rust_profile_json,
             platform = platform,
             base_config = "//configs:%s" % arch,
-            base_header_content_id = base_header_content_id,
+            base_header_family_dependencies = base_header_family_dependencies,
+            base_header_family_ids = base_header_family_ids,
             base_rust_enabled = base_rust_enabled,
             config_mode = rctx.attr.config_mode,
             graph_image = graph_image,
             variant_configs = variant_configs,
             variant_core_configs = variant_core_configs,
             variant_graph_images = variant_graph_images,
-            variant_header_content_ids = variant_header_content_ids,
+            variant_header_family_dependencies = variant_header_family_dependencies,
+            variant_header_family_ids = variant_header_family_ids,
             variant_header_configs = variant_header_configs,
             variant_rust_enabled = variant_rust_enabled,
             rules_repo = rules_repo,
@@ -820,7 +829,7 @@ def _generate_content_graph(
     graph_dir = "graph"
     _initialize_generator_outputs(rctx, graph_dir)
     descriptor = _ARCHITECTURES[arch]
-    compile_environment_abi = "linux.bzl/compact-v4/llvm-%s/%s/%s" % (
+    compile_environment_abi = "linux.bzl/compact-v5/llvm-%s/%s/%s" % (
         _LLVM_VERSION,
         descriptor.arch,
         descriptor.srcarch,
@@ -921,6 +930,7 @@ def _generate_content_graph(
         source_root,
         schema = _CONTENT_COMPACT_SCHEMA,
         expected_compile_environment_abi = compile_environment_abi,
+        expected_srcarch = descriptor.srcarch,
     )
     _validate_generated_build(
         rctx,
@@ -929,14 +939,15 @@ def _generate_content_graph(
         schema = _CONTENT_COMPACT_SCHEMA,
     )
     metadata = validated.metadata
-    header_index = _content_header_config_index(
+    header_index = _content_generated_header_config_index(
         metadata,
         generated_headers,
         base_config,
     )
     return struct(
         header_configs = header_index.aliases,
-        header_content_ids = header_index.content_ids,
+        header_family_dependencies = header_index.family_dependencies,
+        header_family_ids = header_index.family_ids,
         metadata = metadata,
         stats = validated.stats,
         variant_header_configs = {
@@ -979,7 +990,9 @@ def _graph_configs_args(config_paths, config_mode):
     ])
     return args
 
-def _content_header_config_index(metadata, generated_headers, base_config):
+def _content_generated_header_config_index(metadata, generated_headers, base_config):
+    if base_config not in generated_headers:
+        fail("Linux content graph base generated-header config %r is absent" % base_config)
     config_by_label = {}
     for name, label in generated_headers.items():
         if label in config_by_label:
@@ -989,42 +1002,101 @@ def _content_header_config_index(metadata, generated_headers, base_config):
             )
         config_by_label[label] = name
 
-    aliases = {}
-    content_ids = {}
-    seen_labels = {}
-    for group in metadata.get("header_groups", []):
-        labels = group.get("labels", []) if type(group) == "dict" else []
-        content_id = group.get("id", "") if type(group) == "dict" else ""
+    family_ids = {
+        name: {}
+        for name in generated_headers.keys()
+    }
+    family_by_id = {}
+    for family in metadata.get("generated_header_families", []):
+        labels = family.get("labels", []) if type(family) == "dict" else []
+        family_name = family.get("name", "") if type(family) == "dict" else ""
+        content_id = family.get("id", "") if type(family) == "dict" else ""
+        dependencies = family.get("dependencies", []) if type(family) == "dict" else []
         if not _is_content_id(content_id):
-            fail("Linux content graph header group has invalid content ID %r" % content_id)
-        names = []
+            fail("Linux content graph generated-header family has invalid content ID %r" % content_id)
+        if content_id in family_by_id:
+            fail("Linux content graph repeats generated-header family content ID %s" % content_id)
+        if type(family_name) != "string" or not family_name:
+            fail("Linux content graph generated-header family %s has invalid name %r" % (content_id, family_name))
+        if type(dependencies) != "list":
+            fail("Linux content graph generated-header family %s has invalid dependencies" % content_id)
+        family_by_id[content_id] = struct(
+            dependencies = list(dependencies),
+            name = family_name,
+        )
         for label in labels:
             if label not in config_by_label:
-                fail("Linux content graph header group references unknown generated-header label %s" % label)
-            if label in seen_labels:
-                fail("Linux content graph repeats generated-header label %s across header groups" % label)
-            seen_labels[label] = True
-            names.append(config_by_label[label])
-        names = sorted(names)
-        if not names:
-            continue
-        canonical = base_config if base_config in names else names[0]
-        for name in names:
-            aliases[name] = canonical
-            content_ids[name] = content_id
+                fail("Linux content graph generated-header family references unknown label %s" % label)
+            config_name = config_by_label[label]
+            if family_name in family_ids[config_name]:
+                fail(
+                    "Linux content graph repeats generated-header family %s for config %s" %
+                    (family_name, config_name),
+                )
+            family_ids[config_name][family_name] = content_id
 
-    if sorted(aliases.keys()) != sorted(generated_headers.keys()):
-        fail(
-            "Linux content graph generated-header configs %s do not match expected configs %s" %
-            (sorted(aliases.keys()), sorted(generated_headers.keys())),
-        )
+    for name in sorted(family_ids.keys()):
+        if not family_ids[name]:
+            fail("Linux content graph has no generated-header families for config %s" % name)
+    expected_family_names = sorted(family_ids[base_config].keys())
+    if "all" not in family_ids[base_config]:
+        fail("Linux content graph generated-header config %s has no all family" % base_config)
+    for name in sorted(family_ids.keys()):
+        if sorted(family_ids[name].keys()) != expected_family_names:
+            fail(
+                "Linux content graph generated-header config %s has families %s, expected %s" %
+                (name, sorted(family_ids[name].keys()), expected_family_names),
+            )
+
+    family_dependencies = {}
+    for config_name in sorted(family_ids.keys()):
+        selected_ids = family_ids[config_name]
+        config_dependencies = {}
+        for family_name in expected_family_names:
+            family_id = selected_ids[family_name]
+            dependencies = {}
+            for dependency_id in family_by_id[family_id].dependencies:
+                if not _is_content_id(dependency_id) or dependency_id not in family_by_id:
+                    fail(
+                        "Linux content graph generated-header family %s references unknown dependency %s" %
+                        (family_id, dependency_id),
+                    )
+                dependency_name = family_by_id[dependency_id].name
+                if dependency_name in dependencies:
+                    fail(
+                        "Linux content graph generated-header family %s repeats dependency family %s" %
+                        (family_id, dependency_name),
+                    )
+                if selected_ids.get(dependency_name) != dependency_id:
+                    fail(
+                        "Linux content graph generated-header family %s config %s dependency %s does not match selected family ID %s" %
+                        (family_id, config_name, dependency_name, selected_ids.get(dependency_name)),
+                    )
+                dependencies[dependency_name] = dependency_id
+            config_dependencies[family_name] = dependencies
+        family_dependencies[config_name] = config_dependencies
+
+    ordered_names = [base_config] + [
+        name
+        for name in sorted(generated_headers.keys())
+        if name != base_config
+    ]
+    aliases = {}
+    canonical_names = []
+    for name in ordered_names:
+        canonical = name
+        for candidate in canonical_names:
+            if family_ids[name] == family_ids[candidate]:
+                canonical = candidate
+                break
+        aliases[name] = canonical
+        if canonical == name:
+            canonical_names.append(name)
     return struct(
         aliases = aliases,
-        content_ids = content_ids,
+        family_dependencies = family_dependencies,
+        family_ids = family_ids,
     )
-
-def _content_header_config_aliases(metadata, generated_headers, base_config):
-    return _content_header_config_index(metadata, generated_headers, base_config).aliases
 
 def _config_without_image_compression(config):
     return {
@@ -1189,7 +1261,8 @@ def _validate_generated_metadata(
         config_names,
         source_root,
         schema = "v0.0.12",
-        expected_compile_environment_abi = ""):
+        expected_compile_environment_abi = "",
+        expected_srcarch = ""):
     metadata = json.decode(rctx.read(graph_dir + "/metadata.json"))
     if type(metadata) != "dict":
         fail("Linux graph generator wrote invalid metadata")
@@ -1273,48 +1346,110 @@ def _validate_generated_metadata(
             fail("Linux content graph config payload %s is not normalized" % payload_id)
         payload_ids[payload_id] = True
 
-    header_ids = {}
-    for group in metadata.get("header_groups", []):
-        group_id = group.get("id", "") if type(group) == "dict" else ""
-        payload_id = group.get("config_payload", "") if type(group) == "dict" else ""
-        labels = group.get("labels", []) if type(group) == "dict" else []
-        footprint = group.get("footprint", "") if type(group) == "dict" else ""
-        source_input_group = group.get("source_input_group", 0) if type(group) == "dict" else 0
-        source_inputs = group.get("source_inputs", []) if type(group) == "dict" else []
-        if not _is_content_id(group_id) or group_id in header_ids:
-            fail("Linux content graph has invalid or duplicate header group ID %r" % group_id)
-        if payload_id not in payload_ids or type(labels) != "list" or not labels:
-            fail("Linux content graph header group %s has invalid payload or labels" % group_id)
-        if footprint != "exact" or source_inputs:
-            fail("Linux content graph header group %s has incomplete exact inputs" % group_id)
+    family_by_id = {}
+    for family in metadata.get("generated_header_families", []):
+        family_id = family.get("id", "") if type(family) == "dict" else ""
+        name = family.get("name", "") if type(family) == "dict" else ""
+        payload_id = family.get("config_payload", "") if type(family) == "dict" else ""
+        labels = family.get("labels", []) if type(family) == "dict" else []
+        srcarch = family.get("srcarch", "") if type(family) == "dict" else ""
+        dependencies = family.get("dependencies", []) if type(family) == "dict" else []
+        source_input_group = family.get("source_input_group", 0) if type(family) == "dict" else 0
+        source_inputs = family.get("source_inputs", []) if type(family) == "dict" else []
+        if not _is_content_id(family_id) or family_id in family_by_id:
+            fail("Linux content graph has invalid or duplicate generated-header family ID %r" % family_id)
+        if (
+            type(name) != "string" or
+            not name or
+            payload_id not in payload_ids or
+            type(labels) != "list" or
+            not labels or
+            type(srcarch) != "string" or
+            not srcarch or
+            (expected_srcarch and srcarch != expected_srcarch) or
+            type(dependencies) != "list" or
+            type(source_input_group) != "int" or
+            source_input_group < 0 or
+            type(source_inputs) != "list" or
+            source_inputs
+        ):
+            fail("Linux content graph generated-header family %s is invalid" % family_id)
         for label in labels:
             if type(label) != "string" or not label:
-                fail("Linux content graph header group %s has invalid label %r" % (group_id, label))
-        _metadata_source_input_group(
-            source_index,
-            source_input_group,
-            "Linux content graph header group %s" % group_id,
+                fail("Linux content graph generated-header family %s has invalid label %r" % (family_id, label))
+        if source_input_group:
+            _metadata_source_input_group(
+                source_index,
+                source_input_group,
+                "Linux content graph generated-header family %s" % family_id,
+            )
+        family_by_id[family_id] = family
+
+    for family_id, family in family_by_id.items():
+        seen_dependencies = {}
+        for dependency_id in family.get("dependencies", []):
+            if type(dependency_id) != "string" or dependency_id not in family_by_id:
+                fail(
+                    "Linux content graph generated-header family %s references unknown dependency %s" %
+                    (family_id, dependency_id),
+                )
+            if dependency_id == family_id or dependency_id in seen_dependencies:
+                fail(
+                    "Linux content graph generated-header family %s has duplicate or self dependency %s" %
+                    (family_id, dependency_id),
+                )
+            seen_dependencies[dependency_id] = True
+    resolved_family_ids = {}
+    for _ in range(len(family_by_id)):
+        for family_id, family in family_by_id.items():
+            if family_id in resolved_family_ids:
+                continue
+            if all([
+                dependency_id in resolved_family_ids
+                for dependency_id in family.get("dependencies", [])
+            ]):
+                resolved_family_ids[family_id] = True
+    if len(resolved_family_ids) != len(family_by_id):
+        fail(
+            "Linux content graph generated-header families contain a dependency cycle involving %s" %
+            sorted([
+                family_id
+                for family_id in family_by_id.keys()
+                if family_id not in resolved_family_ids
+            ]),
         )
-        header_ids[group_id] = True
 
     environment_ids = {}
     for environment in metadata.get("compile_environments", []):
         environment_id = environment.get("id", "") if type(environment) == "dict" else ""
         payload_id = environment.get("config_payload", "") if type(environment) == "dict" else ""
         abi = environment.get("abi", "") if type(environment) == "dict" else ""
-        groups = environment.get("header_groups", []) if type(environment) == "dict" else []
+        family_ids = environment.get("generated_header_families", []) if type(environment) == "dict" else []
         if not _is_content_id(environment_id) or environment_id in environment_ids:
             fail("Linux content graph has invalid or duplicate compile environment ID %r" % environment_id)
-        if payload_id not in payload_ids or type(abi) != "string" or not abi or type(groups) != "list":
+        if payload_id not in payload_ids or type(abi) != "string" or not abi or type(family_ids) != "list":
             fail("Linux content graph compile environment %s is invalid" % environment_id)
         _validate_compile_environment_abi(
             abi,
             expected_compile_environment_abi,
             environment_id,
         )
-        for group_id in groups:
-            if group_id not in header_ids:
-                fail("Linux content graph compile environment %s references unknown header group %s" % (environment_id, group_id))
+        family_names = {}
+        for family_id in family_ids:
+            if type(family_id) != "string" or family_id not in family_by_id:
+                fail(
+                    "Linux content graph compile environment %s references unknown generated-header family %s" %
+                    (environment_id, family_id),
+                )
+            family_name = family_by_id[family_id]["name"]
+            if family_name in family_names:
+                fail(
+                    "Linux content graph compile environment %s repeats generated-header family %s" %
+                    (environment_id, family_name),
+                )
+            family_names[family_name] = True
+        if "all" in family_names and len(family_names) != 1:
+            fail("Linux content graph compile environment %s mixes all with precise generated-header families" % environment_id)
         environment_ids[environment_id] = True
 
     for variant in variants:
@@ -1380,7 +1515,7 @@ def _validate_generated_metadata(
             "config_count": len(generated_configs),
             "config_payloads": len(payload_ids),
             "duplicate_memberships": duplicate_memberships,
-            "header_groups": len(header_ids),
+            "generated_header_families": len(family_by_id),
             "object_definitions": len(variants),
             "object_memberships": memberships,
             "selected_object_variants": len(selected_targets),
@@ -1467,7 +1602,8 @@ def _kernel_root_build(
         rust_profile_json,
         platform,
         base_config,
-        base_header_content_id,
+        base_header_family_dependencies,
+        base_header_family_ids,
         base_rust_enabled,
         config_mode,
         graph_image,
@@ -1476,7 +1612,8 @@ def _kernel_root_build(
         variant_rust_enabled,
         rules_repo,
         variant_core_configs = {},
-        variant_header_content_ids = {},
+        variant_header_family_dependencies = {},
+        variant_header_family_ids = {},
         variant_header_configs = {}):
     return """load("{rules_repo}//internal:kernel_repository_targets.bzl", "linux_image_targets")
 
@@ -1490,14 +1627,16 @@ linux_image_targets(
     rust_profile_json = {rust_profile_json},
     platform = {platform},
     base_config = {base_config},
-    base_header_content_id = {base_header_content_id},
+    base_header_family_dependencies = {base_header_family_dependencies},
+    base_header_family_ids = {base_header_family_ids},
     base_rust_enabled = {base_rust_enabled},
     config_mode = {config_mode},
     graph_image = {graph_image},
     variant_configs = {variant_configs},
     variant_core_configs = {variant_core_configs},
     variant_graph_images = {variant_graph_images},
-    variant_header_content_ids = {variant_header_content_ids},
+    variant_header_family_dependencies = {variant_header_family_dependencies},
+    variant_header_family_ids = {variant_header_family_ids},
     variant_header_configs = {variant_header_configs},
     variant_rust_enabled = {variant_rust_enabled},
 )
@@ -1508,14 +1647,16 @@ linux_image_targets(
         rust_profile_json = repr(rust_profile_json),
         platform = repr(platform),
         base_config = repr(base_config),
-        base_header_content_id = repr(base_header_content_id),
+        base_header_family_dependencies = _starlark_nested_dict(base_header_family_dependencies, indent = "        "),
+        base_header_family_ids = _starlark_dict(base_header_family_ids, indent = "        "),
         base_rust_enabled = repr(base_rust_enabled),
         config_mode = repr(config_mode),
         graph_image = repr(graph_image),
         variant_configs = _starlark_dict(variant_configs, indent = "        "),
         variant_core_configs = _starlark_dict(variant_core_configs, indent = "        "),
         variant_graph_images = _starlark_dict(variant_graph_images, indent = "        "),
-        variant_header_content_ids = _starlark_dict(variant_header_content_ids, indent = "        "),
+        variant_header_family_dependencies = _starlark_triple_nested_dict(variant_header_family_dependencies, indent = "        "),
+        variant_header_family_ids = _starlark_nested_dict(variant_header_family_ids, indent = "        "),
         variant_header_configs = _starlark_dict(variant_header_configs, indent = "        "),
         variant_rust_enabled = _starlark_dict(variant_rust_enabled, indent = "        "),
         rules_repo = rules_repo,
@@ -1529,8 +1670,7 @@ repositories_test_helpers = struct(
     graph_config_args = _graph_config_args,
     graph_configs_args = _graph_configs_args,
     graph_host_tool_args = _graph_host_tool_args,
-    header_config_aliases = _content_header_config_aliases,
-    header_config_index = _content_header_config_index,
+    generated_header_config_index = _content_generated_header_config_index,
     generator_protocol = _REPOSITORY_GENERATOR_PROTOCOL,
     kernel_root_build = _kernel_root_build,
 )
@@ -1559,5 +1699,29 @@ def _starlark_dict(values, indent = "    "):
     lines = ["{"]
     for key in sorted(values.keys()):
         lines.append("%s%r: %r," % (indent, key, values[key]))
+    lines.append(indent[:-4] + "}")
+    return "\n".join(lines)
+
+def _starlark_nested_dict(values, indent = "    "):
+    if not values:
+        return "{}"
+    lines = ["{"]
+    for key in sorted(values.keys()):
+        lines.append(
+            "%s%r: %s," %
+            (indent, key, _starlark_dict(values[key], indent = indent + "    ")),
+        )
+    lines.append(indent[:-4] + "}")
+    return "\n".join(lines)
+
+def _starlark_triple_nested_dict(values, indent = "    "):
+    if not values:
+        return "{}"
+    lines = ["{"]
+    for key in sorted(values.keys()):
+        lines.append(
+            "%s%r: %s," %
+            (indent, key, _starlark_nested_dict(values[key], indent = indent + "    ")),
+        )
     lines.append(indent[:-4] + "}")
     return "\n".join(lines)

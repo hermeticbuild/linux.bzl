@@ -221,6 +221,91 @@ func TestConfigSourceScannerV013FailsClosedOnContextCarryingIncludeMacro(t *test
 	}
 }
 
+func TestConfigSourceScannerV013ModelsLinuxLibfdtEnvironmentGuard(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "kernel/user.c", "#include <linux/libfdt.h>\n")
+	mustWriteSource(t, root, "include/linux/libfdt.h", `
+#include <linux/libfdt_env.h>
+#include "../../scripts/dtc/libfdt/libfdt.h"
+`)
+	mustWriteSource(t, root, "include/linux/libfdt_env.h", `
+#ifndef LIBFDT_ENV_H
+#define LIBFDT_ENV_H
+#define KERNEL_LIBFDT_ENV 1
+#endif
+`)
+	mustWriteSource(t, root, "scripts/dtc/libfdt/libfdt.h", `
+#include "libfdt_env.h"
+#define LIBFDT_API 1
+`)
+	mustWriteSource(t, root, "scripts/dtc/libfdt/libfdt_env.h", `
+#ifndef LIBFDT_ENV_H
+#define LIBFDT_ENV_H
+#include <stdlib.h>
+#include <string.h>
+#endif
+`)
+	scanner := newConfigSourceScanner(CompactMetadataOptions{
+		Schema:     CompactSchemaV013,
+		SourceRoot: root,
+	})
+	closure, err := scanner.exactClosureForSource("kernel/user.c", nil)
+	if err != nil {
+		t.Fatalf("Linux libfdt wrapper scan failed: %v", err)
+	}
+	var paths []string
+	for _, input := range closure.sourceInputs {
+		paths = append(paths, input.Path)
+	}
+	want := []string{
+		"include/linux/libfdt.h",
+		"include/linux/libfdt_env.h",
+		"kernel/user.c",
+		"scripts/dtc/libfdt/libfdt.h",
+	}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("Linux libfdt wrapper inputs = %v, want %v", paths, want)
+	}
+
+	mustWriteSource(t, root, "lib/fdt.c", `
+#include <linux/libfdt_env.h>
+#include "../scripts/dtc/libfdt/fdt.c"
+`)
+	mustWriteSource(t, root, "scripts/dtc/libfdt/fdt.c", `
+#include "libfdt_env.h"
+#include <libfdt.h>
+#define LIBFDT_IMPLEMENTATION 1
+`)
+	closure, err = scanner.exactClosureForSource(
+		"lib/fdt.c",
+		[]string{"scripts/dtc/libfdt"},
+	)
+	if err != nil {
+		t.Fatalf("Linux libfdt implementation wrapper scan failed: %v", err)
+	}
+	paths = paths[:0]
+	for _, input := range closure.sourceInputs {
+		paths = append(paths, input.Path)
+	}
+	want = []string{
+		"include/linux/libfdt_env.h",
+		"lib/fdt.c",
+		"scripts/dtc/libfdt/fdt.c",
+		"scripts/dtc/libfdt/libfdt.h",
+	}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("Linux libfdt implementation inputs = %v, want %v", paths, want)
+	}
+
+	mustWriteSource(t, root, "kernel/direct.c", `
+#include "../scripts/dtc/libfdt/libfdt.h"
+`)
+	_, err = scanner.exactClosureForSource("kernel/direct.c", nil)
+	if err == nil || !strings.Contains(err.Error(), "stdlib.h") {
+		t.Fatalf("direct scripts libfdt environment error = %v, want unresolved stdlib.h", err)
+	}
+}
+
 func TestConfigSourceScannerV013ConfigGatesNonliteralInclude(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/config-gated.c", "#ifdef CONFIG_CUSTOM\n#include CONFIG_CUSTOM_FILE\n#endif\n")
@@ -376,6 +461,42 @@ func TestConfigSourceScannerV013SeparatesVirtualTreePaths(t *testing.T) {
 
 	if got, want := len(scanner.sourceCache.exactFiles), 2; got != want {
 		t.Fatalf("shared physical file cache size = %d, want %d", got, want)
+	}
+}
+
+func TestConfigSourceScannerV013ScansDirectoryFromSourceRootsOnly(t *testing.T) {
+	mapped := t.TempDir()
+	mustWriteSource(t, mapped, "payload/first.c", `
+#include "local.h"
+#ifdef CONFIG_MAPPED_DIRECTORY
+#endif
+`)
+	mustWriteSource(t, mapped, "payload/local.h", "#define MAPPED_LOCAL 1\n")
+	mustWriteSource(t, mapped, "payload/second.S", "#define MAPPED_ASSEMBLY 1\n")
+	scanner := newConfigSourceScanner(CompactMetadataOptions{
+		Schema: CompactSchemaV013,
+		SourceRoots: map[string]string{
+			"virtual": mapped,
+		},
+	})
+	closure, err := scanner.exactClosureForSourceDir("virtual/payload")
+	if err != nil {
+		t.Fatalf("exactClosureForSourceDir() failed: %v", err)
+	}
+	if want := []string{"CONFIG_MAPPED_DIRECTORY"}; !reflect.DeepEqual(closure.refs, want) {
+		t.Fatalf("mapped directory refs = %v, want %v", closure.refs, want)
+	}
+	var paths []string
+	for _, input := range closure.sourceInputs {
+		paths = append(paths, input.Path)
+	}
+	want := []string{
+		"virtual/payload/first.c",
+		"virtual/payload/local.h",
+		"virtual/payload/second.S",
+	}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("mapped directory inputs = %v, want %v", paths, want)
 	}
 }
 
@@ -910,13 +1031,25 @@ func TestGeneratedHeaderFootprintArm64BindsDirectInputsAndConfig(t *testing.T) {
 			Srcarch:    "arm64",
 		}
 		scanner := newConfigSourceScanner(opts)
-		fragment, inputs, footprint, err := generatedHeaderFootprint(config, opts, scanner)
+		families, err := generatedHeaderFamilyFootprints(config, opts, scanner)
 		if err != nil {
-			t.Fatalf("generatedHeaderFootprint() failed: %v", err)
+			t.Fatalf("generatedHeaderFamilyFootprints() failed: %v", err)
 		}
+		if len(families) != 1 || families[0].name != compactGeneratedHeaderFamilyAll {
+			t.Fatalf("arm64 generated header families = %#v, want only all", families)
+		}
+		fragment := families[0].fragment
+		inputs := families[0].sourceInputs
 		payload := newCompactConfigPayload(fragment)
-		group := newCompactHeaderGroup(payload.ID, "//headers:arm64", "arm64", footprint, inputs)
-		return fragment, inputs, group.ID
+		family := newCompactGeneratedHeaderFamily(
+			compactGeneratedHeaderFamilyAll,
+			payload.ID,
+			"//headers:arm64",
+			"arm64",
+			nil,
+			inputs,
+		)
+		return fragment, inputs, family.ID
 	}
 
 	fragment, inputs, beforeID := generate()
@@ -957,24 +1090,512 @@ func TestGeneratedHeaderFootprintArm64BindsDirectInputsAndConfig(t *testing.T) {
 	mustWriteSource(t, root, "arch/arm64/include/asm/vdso/compat_gettimeofday.h", "#define COMPAT_GETTIMEOFDAY 2\n")
 	_, _, compatChangedID := generate()
 	if compatChangedID == beforeID {
-		t.Fatalf("compat gettimeofday change did not change arm64 header group ID %q", beforeID)
+		t.Fatalf("compat gettimeofday change did not change arm64 generated-header family ID %q", beforeID)
 	}
 	beforeID = compatChangedID
 	mustWriteSource(t, root, "arch/arm64/tools/cpucaps", "CAP_TWO\n")
 	_, _, changedID := generate()
 	if changedID == beforeID {
-		t.Fatalf("cpucaps change did not change arm64 header group ID %q", beforeID)
+		t.Fatalf("cpucaps change did not change arm64 generated-header family ID %q", beforeID)
 	}
 	if err := os.Remove(filepath.Join(root, "arch/arm64/include/asm/cfi.h")); err != nil {
 		t.Fatalf("Remove(cfi.h) failed: %v", err)
 	}
 	_, absentInputs, absentID := generate()
 	if absentID == changedID {
-		t.Fatalf("arm64 cfi.h presence did not change header group ID %q", absentID)
+		t.Fatalf("arm64 cfi.h presence did not change generated-header family ID %q", absentID)
 	}
 	for _, input := range absentInputs {
 		if input.Path == "arch/arm64/include/asm/cfi.h" {
 			t.Fatalf("absent cfi.h remained in inputs: %v", absentInputs)
+		}
+	}
+}
+
+func TestGeneratedHeaderFootprintArm64HypConstantsUsesProducerIncludeRoot(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{
+		"arch/arm64/kernel/vdso",
+		"arch/arm64/kernel/vdso32",
+	} {
+		if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(dir)), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q) failed: %v", dir, err)
+		}
+	}
+	mustWriteSource(t, root, "arch/arm64/kvm/hyp/hyp-constants.c", `
+#include <nvhe/memory.h>
+`)
+	mustWriteSource(t, root, "arch/arm64/kvm/hyp/include/nvhe/memory.h", `
+#ifdef CONFIG_KVM
+#define HYP_MEMORY 1
+#endif
+`)
+	config := &ResolvedConfig{
+		Effective: map[string]string{"CONFIG_KVM": "y"},
+		Written:   map[string]bool{"CONFIG_KVM": true},
+	}
+	opts := CompactMetadataOptions{
+		Schema:                CompactSchemaV013,
+		SourceRoot:            root,
+		Srcarch:               "arm64",
+		CompileEnvironmentABI: "test-abi",
+	}
+	families, err := generatedHeaderFamilyFootprints(
+		config,
+		opts,
+		newConfigSourceScanner(opts),
+	)
+	if err != nil {
+		t.Fatalf("generatedHeaderFamilyFootprints() failed: %v", err)
+	}
+	if got := families[0].fragment["CONFIG_KVM"]; got != "y" {
+		t.Fatalf("arm64 all-family CONFIG_KVM = %q, want y", got)
+	}
+	if !slices.ContainsFunc(families[0].sourceInputs, func(input CompactSourceInput) bool {
+		return input.Path == "arch/arm64/kvm/hyp/include/nvhe/memory.h"
+	}) {
+		t.Fatalf("arm64 hyp include root input missing from %#v", families[0].sourceInputs)
+	}
+}
+
+func TestGeneratedHeaderCompilerVersionFeatureIncludesAreConfigExact(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "include/linux/compiler-version.h", `
+#ifdef GCC_PLUGINS
+#include <generated/gcc-plugins.h>
+#endif
+#ifdef RANDSTRUCT
+#include <generated/randstruct_hash.h>
+#endif
+`)
+	opts := CompactMetadataOptions{
+		Schema:                CompactSchemaV013,
+		SourceRoot:            root,
+		Srcarch:               "x86",
+		CompileEnvironmentABI: "test-abi",
+	}
+	config := func(gccPlugins, randstruct string) *ResolvedConfig {
+		return &ResolvedConfig{
+			Effective: map[string]string{
+				"CONFIG_GCC_PLUGINS": gccPlugins,
+				"CONFIG_RANDSTRUCT":  randstruct,
+			},
+			Written: map[string]bool{
+				"CONFIG_GCC_PLUGINS": true,
+				"CONFIG_RANDSTRUCT":  true,
+			},
+		}
+	}
+	if _, err := generatedHeaderFamilyFootprints(
+		config("n", "n"),
+		opts,
+		newConfigSourceScanner(opts),
+	); err != nil {
+		t.Fatalf("disabled compiler-version feature scan failed: %v", err)
+	}
+	for _, tc := range []struct {
+		name       string
+		gccPlugins string
+		randstruct string
+		want       string
+	}{
+		{
+			name:       "gcc plugins",
+			gccPlugins: "y",
+			randstruct: "n",
+			want:       "generated/gcc-plugins.h",
+		},
+		{
+			name:       "randstruct",
+			gccPlugins: "n",
+			randstruct: "y",
+			want:       "generated/randstruct_hash.h",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := generatedHeaderFamilyFootprints(
+				config(tc.gccPlugins, tc.randstruct),
+				opts,
+				newConfigSourceScanner(opts),
+			)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("active compiler-version feature error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestGeneratedHeaderFamilyClassifierUsesOwnedSpellings(t *testing.T) {
+	for _, tc := range []struct {
+		path    string
+		name    string
+		precise bool
+	}{
+		{path: "generated/autoconf.h", precise: true},
+		{path: "generated/integer-wrap.h", precise: true},
+		{path: "generated/rustc_cfg", precise: true},
+		{
+			path:    "generated/rustc_cfg.h",
+			name:    compactGeneratedHeaderFamilyAll,
+			precise: false,
+		},
+		{
+			path:    "generated/gcc-plugins.h",
+			name:    compactGeneratedHeaderFamilyAll,
+			precise: false,
+		},
+		{
+			path:    "generated/randstruct_hash.h",
+			name:    compactGeneratedHeaderFamilyAll,
+			precise: false,
+		},
+		{
+			path:    "generated/timeconst.h",
+			name:    compactGeneratedHeaderFamilyTimeconst,
+			precise: true,
+		},
+		{
+			path:    "linux/version.h",
+			name:    compactGeneratedHeaderFamilyVersion,
+			precise: true,
+		},
+		{
+			path:    "generated/uapi/linux/version.h",
+			name:    compactGeneratedHeaderFamilyVersion,
+			precise: true,
+		},
+		{
+			path:    "asm/unistd.h",
+			name:    compactGeneratedHeaderFamilyStatic,
+			precise: true,
+		},
+		{path: "linux/kernel.h"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			name, precise := generatedHeaderFamilyNameForInclude(tc.path)
+			if name != tc.name || precise != tc.precise {
+				t.Fatalf(
+					"generatedHeaderFamilyNameForInclude(%q) = (%q, %t), want (%q, %t)",
+					tc.path,
+					name,
+					precise,
+					tc.name,
+					tc.precise,
+				)
+			}
+		})
+	}
+}
+
+func TestGeneratedHeaderOffsetsBindForcedHeadersAndProducerABI(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "include/linux/compiler-version.h", "#define COMPILER_VERSION_INPUT 1\n")
+	mustWriteSource(t, root, "include/linux/kconfig.h", "#include <generated/autoconf.h>\n")
+	mustWriteSource(t, root, "include/linux/compiler_types.h", `
+#include "forced-detail.h"
+#include <generated/timeconst.h>
+`)
+	mustWriteSource(t, root, "include/linux/forced-detail.h", "#define FORCED_DETAIL 1\n")
+	mustWriteSource(t, root, "kernel/bounds.c", "int bounds;\n")
+	config := &ResolvedConfig{
+		Effective: map[string]string{
+			"CONFIG_GCC_PLUGINS": "n",
+			"CONFIG_RANDSTRUCT":  "n",
+		},
+		Written: map[string]bool{
+			"CONFIG_GCC_PLUGINS": true,
+			"CONFIG_RANDSTRUCT":  true,
+		},
+	}
+	generate := func(abi string) map[string]CompactGeneratedHeaderFamily {
+		t.Helper()
+		opts := CompactMetadataOptions{
+			Schema:                CompactSchemaV013,
+			SourceRoot:            root,
+			Srcarch:               "x86",
+			CompileEnvironmentABI: abi,
+		}
+		footprints, err := generatedHeaderFamilyFootprints(
+			config,
+			opts,
+			newConfigSourceScanner(opts),
+		)
+		if err != nil {
+			t.Fatalf("generatedHeaderFamilyFootprints() failed: %v", err)
+		}
+		out := make(map[string]CompactGeneratedHeaderFamily, len(footprints))
+		for _, footprint := range footprints {
+			if got := footprint.fragment[generatedHeaderProducerABIKey]; got != abi {
+				t.Fatalf("%s producer ABI = %q, want %q", footprint.name, got, abi)
+			}
+			payload := newCompactConfigPayload(footprint.fragment)
+			out[footprint.name] = newCompactGeneratedHeaderFamily(
+				footprint.name,
+				payload.ID,
+				"//headers:test",
+				"x86",
+				footprint.dependencies,
+				footprint.sourceInputs,
+			)
+		}
+		return out
+	}
+
+	before := generate("abi-one")
+	for _, name := range []string{
+		compactGeneratedHeaderFamilyBounds,
+		compactGeneratedHeaderFamilyASMOffsets,
+		compactGeneratedHeaderFamilyRQOffsets,
+		compactGeneratedHeaderFamilyKVMOffsets,
+	} {
+		family := before[name]
+		if !slices.Contains(family.Dependencies, compactGeneratedHeaderFamilyTimeconst) {
+			t.Errorf("%s dependencies = %v, want forced-header %q", name, family.Dependencies, compactGeneratedHeaderFamilyTimeconst)
+		}
+		for _, path := range []string{
+			"include/linux/compiler-version.h",
+			"include/linux/kconfig.h",
+			"include/linux/compiler_types.h",
+			"include/linux/forced-detail.h",
+		} {
+			if !slices.ContainsFunc(family.SourceInputs, func(input CompactSourceInput) bool {
+				return input.Path == path
+			}) {
+				t.Errorf("%s source inputs missing %q: %#v", name, path, family.SourceInputs)
+			}
+		}
+	}
+
+	changedABI := generate("abi-two")
+	for name, family := range before {
+		if got := changedABI[name].ID; got == family.ID {
+			t.Errorf("%s family ID did not change with producer ABI %q", name, got)
+		}
+	}
+
+	mustWriteSource(t, root, "include/linux/forced-detail.h", "#define FORCED_DETAIL 2\n")
+	changedHeader := generate("abi-one")
+	for _, name := range []string{
+		compactGeneratedHeaderFamilyBounds,
+		compactGeneratedHeaderFamilyASMOffsets,
+		compactGeneratedHeaderFamilyRQOffsets,
+		compactGeneratedHeaderFamilyKVMOffsets,
+	} {
+		if got := changedHeader[name].ID; got == before[name].ID {
+			t.Errorf("%s family ID did not change with forced-header closure %q", name, got)
+		}
+	}
+}
+
+func TestGeneratedHeaderVersionFamiliesUseDeclaredInputsOnly(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "Makefile", "VERSION = 1\n")
+	mustWriteSource(t, root, "scripts/setlocalversion", "#!/bin/sh\necho unowned\n")
+	generate := func(kernelVersion, localVersion string) map[string]CompactGeneratedHeaderFamily {
+		t.Helper()
+		config := &ResolvedConfig{
+			Effective: map[string]string{
+				"CONFIG_GCC_PLUGINS":  "n",
+				"CONFIG_LOCALVERSION": localVersion,
+				"CONFIG_RANDSTRUCT":   "n",
+			},
+			Written: map[string]bool{
+				"CONFIG_GCC_PLUGINS":  true,
+				"CONFIG_LOCALVERSION": true,
+				"CONFIG_RANDSTRUCT":   true,
+			},
+		}
+		opts := CompactMetadataOptions{
+			Schema:                CompactSchemaV013,
+			SourceRoot:            root,
+			Srcarch:               "x86",
+			CompileEnvironmentABI: "test-abi",
+			KernelVersion:         kernelVersion,
+		}
+		footprints, err := generatedHeaderFamilyFootprints(
+			config,
+			opts,
+			newConfigSourceScanner(opts),
+		)
+		if err != nil {
+			t.Fatalf("generatedHeaderFamilyFootprints() failed: %v", err)
+		}
+		out := make(map[string]CompactGeneratedHeaderFamily, len(footprints))
+		for _, footprint := range footprints {
+			for _, input := range footprint.sourceInputs {
+				if input.Path == "Makefile" || input.Path == "scripts/setlocalversion" {
+					t.Errorf("%s family retained unowned input %q", footprint.name, input.Path)
+				}
+			}
+			payload := newCompactConfigPayload(footprint.fragment)
+			out[footprint.name] = newCompactGeneratedHeaderFamily(
+				footprint.name,
+				payload.ID,
+				"//headers:test",
+				"x86",
+				footprint.dependencies,
+				footprint.sourceInputs,
+			)
+		}
+		return out
+	}
+
+	before := generate("6.18.39", `"-base"`)
+	mustWriteSource(t, root, "Makefile", "VERSION = 999\n")
+	mustWriteSource(t, root, "scripts/setlocalversion", "#!/bin/sh\necho changed\n")
+	changedUnowned := generate("6.18.39", `"-base"`)
+	for _, name := range []string{
+		compactGeneratedHeaderFamilyVersion,
+		compactGeneratedHeaderFamilyUTSRelease,
+		compactGeneratedHeaderFamilyAll,
+	} {
+		if got := changedUnowned[name].ID; got != before[name].ID {
+			t.Errorf("%s family ID changed with unowned release scripts: %q != %q", name, got, before[name].ID)
+		}
+	}
+
+	changedVersion := generate("6.18.40", `"-base"`)
+	for _, name := range []string{
+		compactGeneratedHeaderFamilyVersion,
+		compactGeneratedHeaderFamilyUTSRelease,
+		compactGeneratedHeaderFamilyAll,
+	} {
+		if got := changedVersion[name].ID; got == before[name].ID {
+			t.Errorf("%s family ID did not change with declared kernel version %q", name, got)
+		}
+	}
+
+	changedLocal := generate("6.18.39", `"-debug"`)
+	if got := changedLocal[compactGeneratedHeaderFamilyVersion].ID; got != before[compactGeneratedHeaderFamilyVersion].ID {
+		t.Errorf("version family ID changed with CONFIG_LOCALVERSION: %q != %q", got, before[compactGeneratedHeaderFamilyVersion].ID)
+	}
+	for _, name := range []string{
+		compactGeneratedHeaderFamilyUTSRelease,
+		compactGeneratedHeaderFamilyAll,
+	} {
+		if got := changedLocal[name].ID; got == before[name].ID {
+			t.Errorf("%s family ID did not change with CONFIG_LOCALVERSION %q", name, got)
+		}
+	}
+}
+
+func TestExactClosureTracksOnlyActiveGeneratedIncludes(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "active.c", `
+#ifdef CONFIG_STATIC_WRAPPER
+#include <asm/unistd.h>
+#else
+#include <generated/asm-offsets.h>
+#endif
+`)
+	mustWriteSource(t, root, "include/asm-generic/unistd.h", "#define GENERIC_UNISTD 1\n")
+	scanner := newConfigSourceScanner(CompactMetadataOptions{
+		Schema:     CompactSchemaV013,
+		SourceRoot: root,
+		Srcarch:    "x86",
+	})
+	config := &ResolvedConfig{
+		Effective: map[string]string{"CONFIG_STATIC_WRAPPER": "y"},
+		Written:   map[string]bool{"CONFIG_STATIC_WRAPPER": true},
+	}
+	closure, err := scanner.closureForSourceConfig("active.c", nil, config)
+	if err != nil {
+		t.Fatalf("closureForSourceConfig() failed: %v", err)
+	}
+	if want := []string{"asm/unistd.h"}; !reflect.DeepEqual(closure.generatedIncludes, want) {
+		t.Fatalf("active generated includes = %v, want %v", closure.generatedIncludes, want)
+	}
+
+	disabled := &ResolvedConfig{
+		Effective: map[string]string{"CONFIG_STATIC_WRAPPER": "n"},
+		Written:   map[string]bool{"CONFIG_STATIC_WRAPPER": true},
+	}
+	closure, err = scanner.closureForSourceConfig("active.c", nil, disabled)
+	if err != nil {
+		t.Fatalf("closureForSourceConfig(disabled) failed: %v", err)
+	}
+	if want := []string{"generated/asm-offsets.h"}; !reflect.DeepEqual(closure.generatedIncludes, want) {
+		t.Fatalf("disabled generated includes = %v, want %v", closure.generatedIncludes, want)
+	}
+}
+
+func TestGeneratedHeaderFamilyDependenciesFollowActiveIncludes(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "kernel/bounds.c", `
+#include <generated/timeconst.h>
+#include <generated/bounds.h>
+#include <generated/rq-offsets.h>
+#ifdef CONFIG_INCLUDE_VERSION
+#include <linux/version.h>
+#endif
+`)
+	mustWriteSource(t, root, "arch/x86/kernel/asm-offsets.c", `
+#include <generated/bounds.h>
+`)
+	opts := CompactMetadataOptions{
+		Schema:                CompactSchemaV013,
+		SourceRoot:            root,
+		Srcarch:               "x86",
+		CompileEnvironmentABI: "test-abi",
+		KernelVersion:         "6.18.0",
+	}
+	config := &ResolvedConfig{
+		Effective: map[string]string{"CONFIG_INCLUDE_VERSION": "n"},
+		Written:   map[string]bool{"CONFIG_INCLUDE_VERSION": true},
+	}
+	families, err := generatedHeaderFamilyFootprints(
+		config,
+		opts,
+		newConfigSourceScanner(opts),
+	)
+	if err != nil {
+		t.Fatalf("generatedHeaderFamilyFootprints() failed: %v", err)
+	}
+	byName := map[string]compactGeneratedHeaderFamilyFootprint{}
+	for _, family := range families {
+		byName[family.name] = family
+	}
+	if want := []string{compactGeneratedHeaderFamilyTimeconst}; !reflect.DeepEqual(
+		byName[compactGeneratedHeaderFamilyBounds].dependencies,
+		want,
+	) {
+		t.Fatalf(
+			"bounds dependencies = %v, want %v",
+			byName[compactGeneratedHeaderFamilyBounds].dependencies,
+			want,
+		)
+	}
+	if want := []string{compactGeneratedHeaderFamilyBounds}; !reflect.DeepEqual(
+		byName[compactGeneratedHeaderFamilyASMOffsets].dependencies,
+		want,
+	) {
+		t.Fatalf(
+			"asm_offsets dependencies = %v, want %v",
+			byName[compactGeneratedHeaderFamilyASMOffsets].dependencies,
+			want,
+		)
+	}
+
+	config = &ResolvedConfig{
+		Effective: map[string]string{"CONFIG_INCLUDE_VERSION": "y"},
+		Written:   map[string]bool{"CONFIG_INCLUDE_VERSION": true},
+	}
+	families, err = generatedHeaderFamilyFootprints(
+		config,
+		opts,
+		newConfigSourceScanner(opts),
+	)
+	if err != nil {
+		t.Fatalf("generatedHeaderFamilyFootprints(enabled) failed: %v", err)
+	}
+	for _, family := range families {
+		if family.name == compactGeneratedHeaderFamilyBounds {
+			if want := []string{
+				compactGeneratedHeaderFamilyTimeconst,
+				compactGeneratedHeaderFamilyVersion,
+			}; !reflect.DeepEqual(family.dependencies, want) {
+				t.Fatalf("enabled bounds dependencies = %v, want %v", family.dependencies, want)
+			}
 		}
 	}
 }
