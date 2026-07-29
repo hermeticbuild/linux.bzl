@@ -4,9 +4,87 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestApplyLinuxProbeCCProfileUsesCheckedInIdentity(t *testing.T) {
+	config, err := LinuxProbeConfigForModel(LinuxProbeModelLLVM)
+	if err != nil {
+		t.Fatalf("LinuxProbeConfigForModel() failed: %v", err)
+	}
+	config.RustcVersion = 109900
+	config.PaholeVersion = 140
+
+	profile := testCCProfile()
+	profile.KconfigIdentity.CCVersion = 210002
+	profile.KconfigIdentity.CCVersionText = "clang version 21.0.2"
+	profile.KconfigIdentity.ASVersion = 210002
+	profile.KconfigIdentity.LDVersion = 210002
+	profile.KconfigIdentity.CanLink = false
+	profile.KconfigIdentity.BuiltinMacros = map[string]string{
+		"__PROFILE_MACRO__": "7",
+	}
+	if err := ApplyLinuxProbeCCProfile(&config, *profile); err != nil {
+		t.Fatalf("ApplyLinuxProbeCCProfile() failed: %v", err)
+	}
+
+	if got, want := config.CCVersion, 210002; got != want {
+		t.Fatalf("CCVersion = %d, want %d", got, want)
+	}
+	if got, want := config.CCVersionText, "clang version 21.0.2"; got != want {
+		t.Fatalf("CCVersionText = %q, want %q", got, want)
+	}
+	if got, want := config.ASVersion, 210002; got != want {
+		t.Fatalf("ASVersion = %d, want %d", got, want)
+	}
+	if got, want := config.LDVersion, 210002; got != want {
+		t.Fatalf("LDVersion = %d, want %d", got, want)
+	}
+	if config.CanLink {
+		t.Fatal("CanLink = true, want profile value false")
+	}
+	if got, want := config.CCBuiltinMacros, map[string]string{"__PROFILE_MACRO__": "7"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("CCBuiltinMacros = %v, want %v", got, want)
+	}
+	if got, want := config.RustcVersion, 109900; got != want {
+		t.Fatalf("RustcVersion = %d, want preserved value %d", got, want)
+	}
+	if got, want := config.PaholeVersion, 140; got != want {
+		t.Fatalf("PaholeVersion = %d, want preserved value %d", got, want)
+	}
+
+	profile.KconfigIdentity.BuiltinMacros["__PROFILE_MACRO__"] = "changed"
+	if got, want := config.CCBuiltinMacros["__PROFILE_MACRO__"], "7"; got != want {
+		t.Fatalf("CCBuiltinMacros alias profile map: got %q, want %q", got, want)
+	}
+}
+
+func TestLinuxProbeShellUsesGCCProfileVersionText(t *testing.T) {
+	config, err := LinuxProbeConfigForModel(LinuxProbeModelLLVM)
+	if err != nil {
+		t.Fatalf("LinuxProbeConfigForModel() failed: %v", err)
+	}
+	profile := testCCProfile()
+	profile.AnalysisIdentity.Compiler = "gcc"
+	profile.KconfigIdentity.CCName = "GCC"
+	profile.KconfigIdentity.CCVersionText = "gcc (GCC) 15.1.0"
+	if err := ApplyLinuxProbeCCProfile(&config, *profile); err != nil {
+		t.Fatalf("ApplyLinuxProbeCCProfile() failed: %v", err)
+	}
+
+	out, err := LinuxProbeShellFromConfig(config)(
+		t.Context(),
+		"x86_64-linux-gnu-gcc --version",
+	)
+	if err != nil {
+		t.Fatalf("GCC version probe failed: %v", err)
+	}
+	if got, want := out, "gcc (GCC) 15.1.0"; got != want {
+		t.Fatalf("GCC version text = %q, want %q", got, want)
+	}
+}
 
 func TestLinuxLLVMProbeProfile(t *testing.T) {
 	config, err := LinuxProbeConfigForModel(LinuxProbeModelLLVM)

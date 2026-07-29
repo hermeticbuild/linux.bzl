@@ -1,9 +1,16 @@
 """Analysis tests for the compact generator's strict content-graph contract."""
 
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
-load("//internal:compact_generator.bzl", "linux_compact_buildfiles")
+load(
+    "//internal:compact_generator.bzl",
+    "LinuxCompactV7Info",
+    "linux_compact_buildfiles",
+    "linux_compact_v7_metadata",
+)
 
 visibility("private")
+
+_CC_PROFILE_ID = "9c5a251ef14dfa9a0fa4db464d32db226f09b0ab7cfe36e4f18f08385768cb22"
 
 def _failure_test_impl(ctx):
     env = analysistest.begin(ctx)
@@ -17,6 +24,79 @@ _failure_test = analysistest.make(
     },
     expect_failure = True,
 )
+
+def _argument_after(argv, flag):
+    for index in range(len(argv) - 1):
+        if argv[index] == flag:
+            return argv[index + 1]
+    return ""
+
+def _v7_action_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    target = analysistest.target_under_test(env)
+    info = target[LinuxCompactV7Info]
+    asserts.equals(env, "compact-v7-lazy-action-graph", info.protocol)
+    asserts.equals(env, _CC_PROFILE_ID, info.toolchain_profile_id)
+    asserts.equals(env, "linux.bzl/test/x86", info.compile_environment_abi)
+    asserts.true(env, info.metadata.basename.endswith(".metadata.json"))
+
+    actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxCompactV7Kconfig"
+    ]
+    asserts.equals(env, 1, len(actions))
+    if actions:
+        argv = actions[0].argv
+        asserts.equals(
+            env,
+            "compact-v7-lazy-action-graph",
+            _argument_after(argv, "-compact_protocol"),
+        )
+        asserts.equals(
+            env,
+            _CC_PROFILE_ID,
+            _argument_after(argv, "-toolchain_profile_id"),
+        )
+        cc_profile = _argument_after(argv, "-cc_profile")
+        asserts.true(
+            env,
+            cc_profile.endswith("internal/tests/cc_profile.json"),
+            "unexpected -cc_profile path %r" % cc_profile,
+        )
+        asserts.true(
+            env,
+            "cc_profile.json" in [file.basename for file in actions[0].inputs.to_list()],
+            "checked-in CC profile must be an action input",
+        )
+        asserts.equals(
+            env,
+            "linux.bzl/test/x86",
+            _argument_after(argv, "-compile_environment_abi"),
+        )
+        asserts.true(env, "-compact_metadata_out" in argv)
+        asserts.false(env, "-compact_buildfile_out" in argv)
+    return analysistest.end(env)
+
+_v7_action_test = analysistest.make(_v7_action_test_impl)
+
+def _v7_derived_profile_id_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    target = analysistest.target_under_test(env)
+    info = target[LinuxCompactV7Info]
+    asserts.equals(env, "", info.toolchain_profile_id)
+    actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxCompactV7Kconfig"
+    ]
+    asserts.equals(env, 1, len(actions))
+    if actions:
+        asserts.false(env, "-toolchain_profile_id" in actions[0].argv)
+        asserts.true(env, "-cc_profile" in actions[0].argv)
+    return analysistest.end(env)
+
+_v7_derived_profile_id_test = analysistest.make(_v7_derived_profile_id_test_impl)
 
 def _subject(
         name,
@@ -39,6 +119,23 @@ def _subject(
         source_label_package = source_label_package,
         source_root_label = source_root_label,
         tags = ["manual"],
+    )
+
+def _v7_subject(name, toolchain_profile_id):
+    linux_compact_v7_metadata(
+        name = name,
+        cc_profile = ":cc_profile.json",
+        compile_environment_abi = "linux.bzl/test/x86",
+        configs = {
+            "//tests/compact:base.config": "base",
+        },
+        generated_headers_by_config = {
+            "base": "//internal/tests:base_generated_headers",
+        },
+        kbuild = "//tests/compact:Kbuild",
+        root = "//tests/compact:content_graph.Kconfig",
+        tags = ["manual"],
+        toolchain_profile_id = toolchain_profile_id,
     )
 
 def compact_generator_test_suite(name):
@@ -153,6 +250,30 @@ def compact_generator_test_suite(name):
             target_under_test = ":" + subject + "_generated",
         )
         tests.append(":" + test)
+
+    v7_subject = name + "_v7_subject"
+    _v7_subject(
+        name = v7_subject,
+        toolchain_profile_id = _CC_PROFILE_ID,
+    )
+    v7_test = name + "_v7_action_test"
+    _v7_action_test(
+        name = v7_test,
+        target_under_test = ":" + v7_subject,
+    )
+    tests.append(":" + v7_test)
+
+    derived_v7_profile_subject = name + "_derived_v7_profile_subject"
+    _v7_subject(
+        name = derived_v7_profile_subject,
+        toolchain_profile_id = "",
+    )
+    derived_v7_profile_test = name + "_derived_v7_profile_test"
+    _v7_derived_profile_id_test(
+        name = derived_v7_profile_test,
+        target_under_test = ":" + derived_v7_profile_subject,
+    )
+    tests.append(":" + derived_v7_profile_test)
 
     native.test_suite(
         name = name,

@@ -1,0 +1,505 @@
+{
+  "schema": "linux.bzl/cc-structural-probe-requests-v1",
+  "structural_probes": [
+    {
+      "id": "00a524f441fa3018abd4b8322ee443239fb214b7672f5fc03c7d4fc38a595207",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-mabi=altivec"
+      ]
+    },
+    {
+      "id": "0cf7187c5a98c33c06b080650fbb90e6416b18d5757b73b7acbe7e2a00ee8f85",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "psabi"
+      ]
+    },
+    {
+      "id": "19d1eaf875294426ceef53bc23628ed564b1bfd805a231e3613a3ce7fdd9e777",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "unused-but-set-variable"
+      ]
+    },
+    {
+      "id": "1ebfd230aae573a391ec5e124fd251e5df4d9d2f3c5623ff333a588574138bb0",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mgeneral-regs-only",
+        "-Wno-psabi",
+        "-fno-asynchronous-unwind-tables",
+        "-fno-unwind-tables",
+        "-fasynchronous-unwind-tables",
+        "-mbranch-protection=pac-ret+bti",
+        "-mbranch-protection=pac-ret",
+        "-msign-return-address=non-leaf"
+      ],
+      "argv": [
+        "-mbranch-protection=none"
+      ]
+    },
+    {
+      "id": "248008c650a9f68bcb85f1b3924f7662927547da4b34d61e73737d7df26fa606",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "tautological-constant-out-of-range-compare"
+      ]
+    },
+    {
+      "id": "366dab43cc5db2b54c6191090982349941f60756afe404a740567a80e1338974",
+      "kind": "ld-option",
+      "language": "link",
+      "prefix_argv": [],
+      "argv": [
+        "-maarch64elfb"
+      ]
+    },
+    {
+      "id": "3693bd0445629eea47e736fe23723658375998e761eb5b87bfb809620b281c28",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wold-style-declaration"
+      ]
+    },
+    {
+      "id": "37071676757765c036e379c9efa6ca840bcd91a99c54e1279a8af5638bcb2f51",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "switch-unreachable"
+      ]
+    },
+    {
+      "id": "3bbd13da4b8ecc19b4ffbfb869ce387027fbe00dfe2b7df6cc2041771bd8e801",
+      "kind": "ld-option",
+      "language": "link",
+      "prefix_argv": [
+        "-EB",
+        "-maarch64elfb"
+      ],
+      "argv": [
+        "-maarch64elf"
+      ]
+    },
+    {
+      "id": "3f6e1d9b7197a0dc368b787b85ee1371315b97bb42384797d4f6dc9c1d14d67d",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wmaybe-uninitialized"
+      ]
+    },
+    {
+      "id": "4b232098c67ada62417037d59a00613cc568f48b2885e92a00a4ad4723df7293",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wformat-truncation"
+      ]
+    },
+    {
+      "id": "5f38ebeed7391b0f1bdfda0beee62b6a8887e1e03e24b18edfb0025792b6d9ac",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wvla-larger-than=1"
+      ]
+    },
+    {
+      "id": "67f867fc05abe0b8f8f0e0f272be6dbf90232ba38edd38883b166d39acd3a531",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wformat-overflow"
+      ]
+    },
+    {
+      "id": "6b39a9aad6ae0b21d58544c3f91b25c7ee5508075548f34673fa52e92ef4dbec",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wstringop-overflow"
+      ]
+    },
+    {
+      "id": "6dcceef3ec60b083c81a93e063f5590bbf71435abdc08f5eb49cfe1186eaa209",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-fpie",
+        "-Os",
+        "-DDISABLE_BRANCH_PROFILING",
+        "-mbranch-protection=none",
+        "-I__LINUX_BZL_SRCTREE__/scripts/dtc/libfdt",
+        "-fno-stack-protector",
+        "-include",
+        "__LINUX_BZL_SRCTREE__/include/linux/hidden.h",
+        "-D__DISABLE_EXPORTS",
+        "-ffreestanding",
+        "-D__NO_FORTIFY",
+        "-fno-asynchronous-unwind-tables",
+        "-fno-unwind-tables",
+        "-fno-addrsig"
+      ],
+      "argv": [
+        "-mbranch-protection=none"
+      ]
+    },
+    {
+      "id": "7bd3b19aa61b00aa2065ab1d181ac6fcca6c539c65bceced243a8b5ffa4ae5eb",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "stringop-overread"
+      ]
+    },
+    {
+      "id": "7efee54f368f733b7df0f529b3f0de9ed7324c0f8bc0a3fdf1fd2216f67f184d",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fno-code-hoisting"
+      ]
+    },
+    {
+      "id": "82de319175dc119dbaab60746de609fed12596904668395d61e82f4d1213bf92",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-femit-struct-debug-detailed=any"
+      ]
+    },
+    {
+      "id": "859140c2d08249e442b0340b72abf22e02694a500caef7e57cdadf24b6ae8ab1",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "gnu"
+      ]
+    },
+    {
+      "id": "896de8589bdeaefa167cae357f2e200672075736bd4bcbcdfe3c7acb3edeb72a",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "unsequenced"
+      ]
+    },
+    {
+      "id": "8975d0099770cc71b3ec0bc16e5a33e330e229cfc8be3cb1b7cbc73931f3a3bd",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fsched-pressure"
+      ]
+    },
+    {
+      "id": "8a918aaa06d6c70590af1407ed0b768d4df2b3809587a739c0863c377ae3da4a",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-mno-outline-atomics"
+      ]
+    },
+    {
+      "id": "91380b63097fc95631b41b9009c6d57a025eaf5fe7caeb162196529fabeb7c91",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mgeneral-regs-only"
+      ],
+      "argv": [
+        "psabi"
+      ]
+    },
+    {
+      "id": "a50944c4af3067e574954b48a1b6665a386b367aaedbec9d0dbe250bf180066b",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-fpie",
+        "-Os",
+        "-DDISABLE_BRANCH_PROFILING",
+        "-mbranch-protection=none",
+        "-I__LINUX_BZL_SRCTREE__/scripts/dtc/libfdt",
+        "-fno-stack-protector",
+        "-include",
+        "__LINUX_BZL_SRCTREE__/include/linux/hidden.h",
+        "-D__DISABLE_EXPORTS",
+        "-ffreestanding",
+        "-D__NO_FORTIFY",
+        "-fno-asynchronous-unwind-tables",
+        "-fno-unwind-tables",
+        "-fno-addrsig"
+      ],
+      "argv": [
+        "-fno-addrsig"
+      ]
+    },
+    {
+      "id": "ab699b90b23a8306beb2dd78aad7d9b329d44d16513a1e4f4ea82714fa6dee58",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-mno-single-pic-base"
+      ]
+    },
+    {
+      "id": "afd45b7fe4b8e11035ea250a064ffd113b4dd3921c2f949069116e1b172fc1b4",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "stringop-truncation"
+      ]
+    },
+    {
+      "id": "b49fa05b0e288399bc52ddc1af24d980f15ca3ee9df394cf985e229b43f18e0c",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-mgeneral-regs-only"
+      ]
+    },
+    {
+      "id": "c36b79db589e7388cd60c258a7cd0c0d73f521cea39b7bf8d673dc43f6f3f315",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-mbranch-protection=none"
+      ]
+    },
+    {
+      "id": "c45063325820c96c0dd1e217b2ec352a4455bac2240969c70f4b14c67c1179fd",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wrestrict"
+      ]
+    },
+    {
+      "id": "c941841779df0f2e11aeed08d046c9e7ffed2d14aa19772f34bcbac897ddf630",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "address-of-packed-member"
+      ]
+    },
+    {
+      "id": "d065ff846e0f19e12344e9ad6801ba4cfc7e19c698ca12fde52b7919371f50b0",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fno-schedule-insns"
+      ]
+    },
+    {
+      "id": "db2da502ad831076529d08c666bca67b406392018002959e640a8a8171d888a6",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fno-conserve-stack"
+      ]
+    },
+    {
+      "id": "de8fc58ddbc4924b05c6f8ab67e6358c201538b5cf6fa2e8136acbf478efb35c",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fno-addrsig"
+      ]
+    },
+    {
+      "id": "df192fdbd8d7913739d9645ed34f94ec2e2e9db3796079fd277f68a33ce29ea5",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mgeneral-regs-only",
+        "-Wno-psabi"
+      ],
+      "argv": [
+        "-mabi=lp64"
+      ]
+    },
+    {
+      "id": "df578cc616763dd481b22bf234850d8e6ab67267883afaf35bd64e73afa85f26",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wpacked-not-aligned"
+      ]
+    },
+    {
+      "id": "e520152fe8c160e94f6bf1ce2b7b9269733b5cb845152bdb8704fca7b2ae0469",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-mabi=lp64"
+      ]
+    },
+    {
+      "id": "e73308a84e26453266ba7392e78b3eeb47b58bebd47ba0380dc30d06347e72cb",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wstringop-truncation"
+      ]
+    },
+    {
+      "id": "e81787bd1559fa632ddb3af41690d11bd785d44ce4232a72adf0d8f29abde02b",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wunused-const-variable"
+      ]
+    },
+    {
+      "id": "ef5460e4947a354beebcf90f94614fca47f04b494aa3419f9b415a00fa5b30ce",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "uninitialized"
+      ]
+    },
+    {
+      "id": "f26f2addf514fbf24edafcce6918c4ecaf8edc15d4de76322ad45324d02194dd",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "missing-prototypes"
+      ]
+    },
+    {
+      "id": "f32a0a7e770f7dafe4cd3b802a85e9ae9fb1cac44d31e77cdb05d842adda3cf8",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wunused-but-set-variable"
+      ]
+    },
+    {
+      "id": "fda276825b9bc9debb8dca3938844dc738306ee74b078ffd5ca1cb5d6dd5097a",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "fortify-source"
+      ]
+    }
+  ]
+}

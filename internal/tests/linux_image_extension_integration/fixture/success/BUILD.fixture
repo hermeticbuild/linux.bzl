@@ -1,0 +1,12 @@
+exports_files([
+    "Kconfig",
+    "base.config",
+    "cc_profile.json",
+    "debug.config",
+    "platform",
+])
+
+filegroup(
+    name = "graph_metadata",
+    srcs = ["@fixture_kernel//graph:metadata.json"],
+)

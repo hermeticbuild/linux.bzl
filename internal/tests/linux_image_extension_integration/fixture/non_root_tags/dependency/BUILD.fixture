@@ -1,0 +1,6 @@
+exports_files([
+    "Kconfig",
+    "base.config",
+    "cc_profile.json",
+    "platform",
+])

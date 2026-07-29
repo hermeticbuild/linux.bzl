@@ -1,6 +1,7 @@
 """Private target graph emitted by linux_image."""
 
 load(":architectures.bzl", "linux_architectures")
+load(":cc_profile.bzl", "linux_cc_profile_context")
 load(":kernel_bundle.bzl", "linux_kernel_bundle", "linux_kernel_exports")
 load(":linux_modules.bzl", "linux_module_sdk")
 load(":linux_objects.bzl", "linux_compressed_image", "linux_resolved_config", "linux_vmlinux")
@@ -21,7 +22,18 @@ def _architecture(config_name):
 def _source_label(source_repo, path):
     return "%s//:%s" % (source_repo, path)
 
-def _source_tree_inputs(source_repo):
+def _core_source_tree_inputs(source_repo, exact_sources, legacy_source_compat):
+    inputs = [
+        exact_sources,
+        _source_label(source_repo, "source_tree_lookup_files"),
+    ]
+
+    # compact-v6 cannot describe config-level final-action header closures.
+    if legacy_source_compat:
+        inputs.append(_source_label(source_repo, "headers"))
+    return inputs
+
+def _module_source_tree_inputs(source_repo):
     return [
         _source_label(source_repo, "headers"),
         _source_label(source_repo, "source_tree_lookup_files"),
@@ -86,7 +98,7 @@ def _define_config(
         kwargs["minimum_rustc_version"] = minimum_rustc_version
     linux_resolved_config(**kwargs)
 
-def _define_core_outputs(
+def _define_vmlinux_output(
         prefix,
         arch,
         config,
@@ -96,11 +108,11 @@ def _define_core_outputs(
         rust_profile_json,
         rust_enabled,
         source_repo,
+        source_tree,
         version,
         visibility):
     rust_sdk = prefix + "_rust_sdk"
     vmlinux = prefix + "_vmlinux"
-    module_sdk = prefix + "_module_sdk"
     if rust_enabled:
         rust_sdk_kwargs = {
             "name": rust_sdk,
@@ -113,7 +125,7 @@ def _define_core_outputs(
             "generated_headers": host_tools.generated_headers,
             "profile_json": rust_profile_json,
             "source_root": _source_label(source_repo, "Kconfig"),
-            "source_tree": _source_tree_inputs(source_repo),
+            "source_tree": source_tree,
             "srcarch": arch.srcarch,
             "target_compatible_with": [arch.platform],
             "minimum_rustc_version": minimum_rustc_version,
@@ -144,7 +156,7 @@ def _define_core_outputs(
         "rust_sdk": ":" + rust_sdk,
         "sorttable_tool": host_tools.sorttable_tool,
         "source_root": _source_label(source_repo, "Kconfig"),
-        "source_tree": _source_tree_inputs(source_repo),
+        "source_tree": source_tree,
         "srcarch": arch.srcarch,
         "target_compatible_with": [arch.platform],
         "visibility": visibility,
@@ -153,21 +165,35 @@ def _define_core_outputs(
     if hasattr(host_tools, "objtool"):
         vmlinux_kwargs["objtool"] = host_tools.objtool
     linux_vmlinux(**vmlinux_kwargs)
+    return ":" + vmlinux
 
-    linux_module_sdk(
-        name = module_sdk,
-        arch = arch.arch,
-        pahole = Label("@pahole//:pahole"),
-        resolve_btfids_tool = host_tools.resolve_btfids_tool,
-        target_compatible_with = [arch.platform],
-        version = version,
-        visibility = visibility,
-        vmlinux = ":" + vmlinux,
-    )
-    return struct(
-        module_sdk = ":" + module_sdk,
-        vmlinux = ":" + vmlinux,
-    )
+def _define_module_sdk(
+        prefix,
+        arch,
+        compact_modules,
+        host_tools,
+        source_repo,
+        version,
+        visibility,
+        vmlinux):
+    module_sdk = prefix + "_module_sdk"
+    module_sdk_kwargs = {
+        "name": module_sdk,
+        "arch": arch.arch,
+        "modules": compact_modules,
+        "pahole": Label("@pahole//:pahole"),
+        "resolve_btfids_tool": host_tools.resolve_btfids_tool,
+        "source_root": _source_label(source_repo, "Kconfig"),
+        "source_tree": _module_source_tree_inputs(source_repo),
+        "target_compatible_with": [arch.platform],
+        "version": version,
+        "visibility": visibility,
+        "vmlinux": vmlinux,
+    }
+    if hasattr(host_tools, "objtool"):
+        module_sdk_kwargs["objtool"] = host_tools.objtool
+    linux_module_sdk(**module_sdk_kwargs)
+    return ":" + module_sdk
 
 def _define_compressed_output(
         prefix,
@@ -175,6 +201,7 @@ def _define_compressed_output(
         config,
         host_tools,
         source_repo,
+        source_tree,
         vmlinux,
         visibility):
     image = prefix + "_image"
@@ -187,7 +214,7 @@ def _define_compressed_output(
         "generated_headers": host_tools.generated_headers,
         "image": vmlinux,
         "source_root": _source_label(source_repo, "Kconfig"),
-        "source_tree": _source_tree_inputs(source_repo),
+        "source_tree": source_tree,
         "srcarch": arch.srcarch,
         "target_compatible_with": [arch.platform],
         "visibility": visibility,
@@ -207,20 +234,29 @@ def linux_image_targets(
         platform,
         base_config,
         base_rust_enabled,
+        cc_profile,
         graph_image,
+        graph_modules,
+        graph_sources,
         base_header_family_dependencies,
         base_header_family_ids,
         variant_configs,
         variant_core_configs,
         variant_graph_images,
+        variant_graph_modules,
+        variant_graph_sources,
+        variant_module_sdk_configs,
         variant_header_family_dependencies,
         variant_header_family_ids,
         variant_header_configs,
         variant_rust_enabled,
-        config_mode):
+        config_mode,
+        legacy_source_compat = False):
     """Defines private kernel graphs and the base stable exports."""
     if type(base_rust_enabled) != "bool":
         fail("base_rust_enabled must be a bool")
+    if type(legacy_source_compat) != "bool":
+        fail("legacy_source_compat must be a bool")
     if type(rust_profile_json) != "string":
         fail("rust_profile_json must be a string")
     if (base_rust_enabled or True in variant_rust_enabled.values()) and not rust_profile_json:
@@ -230,6 +266,9 @@ def linux_image_targets(
     for values, what in [
         (variant_core_configs, "variant_core_configs"),
         (variant_graph_images, "variant_graph_images"),
+        (variant_graph_modules, "variant_graph_modules"),
+        (variant_graph_sources, "variant_graph_sources"),
+        (variant_module_sdk_configs, "variant_module_sdk_configs"),
         (variant_header_configs, "variant_header_configs"),
         (variant_header_family_ids, "variant_header_family_ids"),
         (variant_header_family_dependencies, "variant_header_family_dependencies"),
@@ -256,6 +295,18 @@ def linux_image_targets(
         "//:__pkg__",
         "//graph:__subpackages__",
     ] + variant_packages
+    base_source_tree = _core_source_tree_inputs(
+        source_repo,
+        graph_sources,
+        legacy_source_compat,
+    )
+    linux_cc_profile_context(
+        name = "_cc_profile",
+        arch = arch,
+        profile = cc_profile,
+        target_compatible_with = [descriptor.platform],
+        visibility = internal_visibility,
+    )
 
     _define_config(
         name = "_base_config",
@@ -277,7 +328,7 @@ def linux_image_targets(
         },
         "source_repo": source_repo,
         "source_root": _source_label(source_repo, "Kconfig"),
-        "source_tree": _source_tree_inputs(source_repo),
+        "source_tree": base_source_tree,
         "target_prefix": "_base",
         "generated_header_family_ids": base_header_family_ids,
         "visibility": internal_visibility,
@@ -285,7 +336,7 @@ def linux_image_targets(
     if descriptor.srcarch == "x86":
         host_tools_kwargs["generated_header_family_dependencies"] = base_header_family_dependencies
     host_tools = descriptor.host_tools(**host_tools_kwargs)
-    core_outputs = _define_core_outputs(
+    vmlinux = _define_vmlinux_output(
         prefix = "_base",
         arch = descriptor,
         config = ":_base_config",
@@ -295,8 +346,19 @@ def linux_image_targets(
         rust_profile_json = rust_profile_json,
         rust_enabled = base_rust_enabled,
         source_repo = source_repo,
+        source_tree = base_source_tree,
         version = version,
         visibility = internal_visibility,
+    )
+    module_sdk = _define_module_sdk(
+        prefix = "_base",
+        arch = descriptor,
+        compact_modules = graph_modules,
+        host_tools = host_tools,
+        source_repo = source_repo,
+        version = version,
+        visibility = internal_visibility,
+        vmlinux = vmlinux,
     )
     image = _define_compressed_output(
         prefix = "_base",
@@ -304,7 +366,8 @@ def linux_image_targets(
         config = ":_base_config",
         host_tools = host_tools,
         source_repo = source_repo,
-        vmlinux = core_outputs.vmlinux,
+        source_tree = base_source_tree,
+        vmlinux = vmlinux,
         visibility = internal_visibility,
     )
     linux_kernel_bundle(
@@ -312,14 +375,14 @@ def linux_image_targets(
         arch = arch,
         config = ":_base_config",
         image = image,
-        module_sdk = core_outputs.module_sdk,
         version = version,
-        vmlinux = core_outputs.vmlinux,
+        vmlinux = vmlinux,
         visibility = ["//:__pkg__"],
     )
     linux_kernel_exports(
         name = "kernel",
         graph = ":" + name,
+        module_sdk_graph = module_sdk,
         platform = platform,
         arch = arch,
     )
@@ -329,8 +392,11 @@ def linux_image_targets(
     }
     reuse_generated_header_families = descriptor.srcarch == "x86"
     reusable_generated_headers = [host_tools.generated_headers] if reuse_generated_header_families else []
-    core_outputs_by_config = {
-        arch: core_outputs,
+    vmlinux_by_config = {
+        arch: vmlinux,
+    }
+    module_sdk_by_config = {
+        arch: module_sdk,
     }
     for variant in sorted(variant_configs.keys()):
         prefix = "_variant_" + variant
@@ -346,6 +412,11 @@ def linux_image_targets(
             version = version,
             visibility = internal_visibility,
         )
+        variant_source_tree = _core_source_tree_inputs(
+            source_repo,
+            variant_graph_sources[variant],
+            legacy_source_compat,
+        )
         header_config = variant_header_configs[variant]
         if header_config == variant:
             configured_host_tools_kwargs = {
@@ -354,7 +425,7 @@ def linux_image_targets(
                 "shared": host_tools,
                 "source_repo": source_repo,
                 "source_root": _source_label(source_repo, "Kconfig"),
-                "source_tree": _source_tree_inputs(source_repo),
+                "source_tree": variant_source_tree,
                 "generated_header_family_ids": variant_header_family_ids[variant],
                 "visibility": internal_visibility,
             }
@@ -374,7 +445,7 @@ def linux_image_targets(
         host_tools_by_config[variant] = variant_host_tools
         core_config = variant_core_configs[variant]
         if core_config == variant:
-            variant_core_outputs = _define_core_outputs(
+            variant_vmlinux = _define_vmlinux_output(
                 prefix = prefix,
                 arch = descriptor,
                 config = ":" + config_target,
@@ -384,24 +455,46 @@ def linux_image_targets(
                 rust_profile_json = rust_profile_json,
                 rust_enabled = variant_rust_enabled[variant],
                 source_repo = source_repo,
+                source_tree = variant_source_tree,
                 version = version,
                 visibility = internal_visibility,
             )
-        elif core_config in core_outputs_by_config:
-            variant_core_outputs = core_outputs_by_config[core_config]
+        elif core_config in vmlinux_by_config:
+            variant_vmlinux = vmlinux_by_config[core_config]
         else:
             fail(
                 "variant %r core outputs alias unavailable config %r; aliases must point to the base or an earlier variant" %
                 (variant, core_config),
             )
-        core_outputs_by_config[variant] = variant_core_outputs
+        vmlinux_by_config[variant] = variant_vmlinux
+        module_sdk_config = variant_module_sdk_configs[variant]
+        if module_sdk_config == variant:
+            variant_module_sdk = _define_module_sdk(
+                prefix = prefix,
+                arch = descriptor,
+                compact_modules = variant_graph_modules[variant],
+                host_tools = variant_host_tools,
+                source_repo = source_repo,
+                version = version,
+                visibility = internal_visibility,
+                vmlinux = variant_vmlinux,
+            )
+        elif module_sdk_config in module_sdk_by_config:
+            variant_module_sdk = module_sdk_by_config[module_sdk_config]
+        else:
+            fail(
+                "variant %r module SDK aliases unavailable config %r; aliases must point to the base or an earlier variant" %
+                (variant, module_sdk_config),
+            )
+        module_sdk_by_config[variant] = variant_module_sdk
         variant_image = _define_compressed_output(
             prefix = prefix,
             arch = descriptor,
             config = ":" + config_target,
             host_tools = variant_host_tools,
             source_repo = source_repo,
-            vmlinux = variant_core_outputs.vmlinux,
+            source_tree = variant_source_tree,
+            vmlinux = variant_vmlinux,
             visibility = internal_visibility,
         )
         linux_kernel_bundle(
@@ -409,8 +502,12 @@ def linux_image_targets(
             arch = arch,
             config = ":" + config_target,
             image = variant_image,
-            module_sdk = variant_core_outputs.module_sdk,
             version = version,
-            vmlinux = variant_core_outputs.vmlinux,
+            vmlinux = variant_vmlinux,
+            visibility = ["//variants/%s:__pkg__" % variant],
+        )
+        native.alias(
+            name = prefix + "_module_sdk_graph",
+            actual = variant_module_sdk,
             visibility = ["//variants/%s:__pkg__" % variant],
         )

@@ -25,6 +25,51 @@ local_path_override(
     path = "..",
 )
 
+linux_source_repository = use_repo_rule(
+    "@linux.bzl//:linux.bzl",
+    "linux_source_repository",
+)
+
+linux_source_repository(
+    name = "aya_linux_6_18_39",
+    version = "6.18.39",
+)
+
+linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
+linux_images.image(
+    name = "aya_aarch64_kernel",
+    arch = "aarch64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_aarch64.json",
+    config = "@aya//test/kernel:aya_aarch64.config",
+    config_mode = "allnoconfig",
+    platform = "@llvm//platforms:linux_arm64",
+    source = "@aya_linux_6_18_39//:Kconfig",
+)
+linux_images.image(
+    name = "aya_x86_64_kernel",
+    arch = "x86_64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.json",
+    config = "@aya//test/kernel:aya_x86_64.config",
+    config_mode = "allnoconfig",
+    platform = "@llvm//platforms:linux_x86_64",
+    source = "@aya_linux_6_18_39//:Kconfig",
+)
+linux_images.overlay(
+    name = "rust_btf",
+    config = "@aya//test/kernel:linux_bzl_rust_btf.config",
+    image = "aya_aarch64_kernel",
+)
+linux_images.overlay(
+    name = "rust_btf",
+    config = "@aya//test/kernel:linux_bzl_rust_btf.config",
+    image = "aya_x86_64_kernel",
+)
+use_repo(
+    linux_images,
+    "aya_aarch64_kernel",
+    "aya_x86_64_kernel",
+)
+
 rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
 use_repo(rules_rust, "rules_rust")
 

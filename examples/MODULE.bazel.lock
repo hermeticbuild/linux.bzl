@@ -286,6 +286,65 @@
         }
       }
     },
+    "@@linux.bzl+//:extensions.bzl%linux_images": {
+      "general": {
+        "bzlTransitiveDigest": "x9hWua1rWp3Z7NHlUdANBYRFQxzfZILxGgqyOUlp2zc=",
+        "usagesDigest": "7gJ0EA4Rsgv4To3K4+yacOthgnA41JN4QuAD586zS2k=",
+        "recordedInputs": [
+          "REPO_MAPPING:,linux.bzl linux.bzl+",
+          "REPO_MAPPING:,linux_6_18_39 +linux_source_repository+linux_6_18_39",
+          "REPO_MAPPING:,llvm llvm+"
+        ],
+        "generatedRepoSpecs": {
+          "example_aarch64__linux_graph": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
+            "attributes": {
+              "arch": "aarch64",
+              "cc_profile": "@@linux.bzl+//profiles:llvm_22_1_8_aarch64.json",
+              "config": "@@//configs:aarch64.config",
+              "config_mode": "default",
+              "overlays": {},
+              "platform": "@@llvm+//platforms:linux_arm64",
+              "source": "@@+linux_source_repository+linux_6_18_39//:Kconfig"
+            }
+          },
+          "example_aarch64": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_extension.bzl%_linux_image_facade_repository",
+            "attributes": {
+              "graph_repo": "example_aarch64__linux_graph",
+              "variants": []
+            }
+          },
+          "example_x86_64__linux_graph": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
+            "attributes": {
+              "arch": "x86_64",
+              "cc_profile": "@@linux.bzl+//profiles:llvm_22_1_8_x86_64.json",
+              "config": "@@//configs:x86_64.config",
+              "config_mode": "default",
+              "overlays": {
+                "btf": "@@//configs:btf.config",
+                "debug": "@@//configs:debug.config",
+                "lz4": "@@//configs:lz4.config"
+              },
+              "platform": "@@llvm+//platforms:linux_x86_64",
+              "source": "@@+linux_source_repository+linux_6_18_39//:Kconfig"
+            }
+          },
+          "example_x86_64": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_extension.bzl%_linux_image_facade_repository",
+            "attributes": {
+              "graph_repo": "example_x86_64__linux_graph",
+              "variants": [
+                "btf",
+                "debug",
+                "lz4"
+              ]
+            }
+          }
+        }
+      }
+    },
     "@@protobuf+//python/dist:system_python.bzl%system_python_extension": {
       "general": {
         "bzlTransitiveDigest": "pmsA+awieucfllLc2n7k8xEoPp0i5LF9Hw6mGX0cqSQ=",

@@ -1,40 +1,3 @@
-diff --git a/MODULE.bazel b/MODULE.bazel
-index f017a0f3325ecb6b2b04d6f1aaad8c82dc7b7b57..7fa7003e21e9b00464917757f915323669a130dd 100644
---- a/MODULE.bazel
-+++ b/MODULE.bazel
-@@ -131,11 +131,11 @@ linux_source_repository = use_repo_rule(
- )
- 
- linux_source_repository(
--    name = "aya_linux_6_18_2",
--    integrity = "sha256-VYxrurdJSSs0+Zgn/oB7ADmnRGk8IdOn4Ds6SO2quWo=",
--    strip_prefix = "linux-6.18.2",
--    urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.2.tar.xz"],
--    version = "6.18.2",
-+    name = "aya_linux_6_18_39",
-+    integrity = "sha256-p6fj0q6dledBlyI6jU619r56rCG25t4n6WhdABwfjLA=",
-+    strip_prefix = "linux-6.18.39",
-+    urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.39.tar.xz"],
-+    version = "6.18.39",
- )
- 
- linux_image = use_repo_rule(
-@@ -148,7 +148,7 @@ linux_image(
-     config = "//test/kernel:aya_aarch64.config",
-     config_mode = "allnoconfig",
-     platform = "@llvm//platforms:linux_arm64",
--    source = "@aya_linux_6_18_2//:Kconfig",
-+    source = "@aya_linux_6_18_39//:Kconfig",
- )
- 
- linux_image(
-@@ -156,5 +156,5 @@ linux_image(
-     config = "//test/kernel:aya_x86_64.config",
-     config_mode = "allnoconfig",
-     platform = "@llvm//platforms:linux_x86_64",
--    source = "@aya_linux_6_18_2//:Kconfig",
-+    source = "@aya_linux_6_18_39//:Kconfig",
- )
 diff --git a/test/integration-test/BUILD.bazel b/test/integration-test/BUILD.bazel
 index 4ff63e3a7e2a46254f9dfc49d52d0583cdb49002..d8f701d1e0ed5439af2f49948e1f24149395e9dd 100644
 --- a/test/integration-test/BUILD.bazel
@@ -110,7 +73,7 @@ index 0000000000000000000000000000000000000000..47535cfdf585d81c82a2000658c96d45
 +    assert!(!btf.is_empty());
 +}
 diff --git a/test/kernel/BUILD.bazel b/test/kernel/BUILD.bazel
-index dc6f27f564dad63b60174477abffbbbdad6bef52..1555cadc2c3b6809ffd110543966e58ad2699660 100644
+index 543463e26a02a5de5cff2fb935a80981cb576c18..cb09828d328f81f6c911dbfad6d8d3b8d9c833fa 100644
 --- a/test/kernel/BUILD.bazel
 +++ b/test/kernel/BUILD.bazel
 @@ -1,3 +1,5 @@
@@ -119,24 +82,25 @@ index dc6f27f564dad63b60174477abffbbbdad6bef52..1555cadc2c3b6809ffd110543966e58a
  package(default_visibility = ["//visibility:public"])
  
  exports_files([
-@@ -5,6 +7,15 @@ exports_files([
+@@ -5,6 +7,16 @@ exports_files([
      "aya_x86_64.config",
++    "linux_bzl_rust_btf.config",
  ])
  
 +linux_module(
 +    name = "linux_bzl_rust_btf",
-+    srcs = ["@@//:linux_bzl_rust_btf.rs"],
-+    kernel = select({
-+        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//:kernel",
-+        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//:kernel",
++    module_sdk = select({
++        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//variants/rust_btf:module_sdk",
++        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//variants/rust_btf:module_sdk",
 +    }),
++    srcs = ["@@//:linux_bzl_rust_btf.rs"],
 +)
 +
  alias(
      name = "aya_kernel",
      actual = select({
 diff --git a/test/kernel/README.md b/test/kernel/README.md
-index 9cc8103cabda2f348fd4f5dfa133cd3fe9f2a3fe..2f51bb779e03727bd30559808bb698b2dc8b7fe6 100644
+index d5cbbdd1c1a5fcd0cb5e13db7ba2bc7171a5760d..f0bfed0a1fc98a34c4e7749cef6b26f075c4d762 100644
 --- a/test/kernel/README.md
 +++ b/test/kernel/README.md
 @@ -1,7 +1,7 @@
@@ -152,52 +116,18 @@ index 9cc8103cabda2f348fd4f5dfa133cd3fe9f2a3fe..2f51bb779e03727bd30559808bb698b2
  the value or when the assignment intentionally pins a Kconfig default. Do not
  copy generated values from a resolved `.config` into a fragment.
  
-+linux.bzl's consumer-only e2e patch enables Rust and module BTF. Its initramfs
-+contains a Rust-for-Linux module, and the VM test verifies that loading it
-+publishes module BTF under `/sys/kernel/btf`.
++linux.bzl's consumer-only `rust_btf` overlay enables Rust and module BTF. Its
++initramfs contains a Rust-for-Linux module, and the VM test verifies that
++loading it publishes module BTF under `/sys/kernel/btf`.
 +
  ## Reproduce the resolved configurations
  
  From the repository root, resolve the aarch64 fragment with:
-diff --git a/test/kernel/aya_aarch64.config b/test/kernel/aya_aarch64.config
-index d3936c5f5c91a715ac8c8119a787764411e13137..50417e1e541921d29c3b2590c6906d9dd6cc9725 100644
---- a/test/kernel/aya_aarch64.config
-+++ b/test/kernel/aya_aarch64.config
-@@ -25,6 +25,7 @@ CONFIG_DEBUG_KERNEL = y
- CONFIG_DEBUG_FS = y
- CONFIG_DEBUG_INFO = y
- CONFIG_DEBUG_INFO_BTF = y
-+CONFIG_DEBUG_INFO_BTF_MODULES = y
- CONFIG_DEBUG_INFO_DWARF5 = y
- CONFIG_FHANDLE = y
- CONFIG_KALLSYMS = y
-@@ -97,6 +98,7 @@ CONFIG_UPROBES = y
- CONFIG_UPROBE_EVENTS = y
- 
- # Module core support provides modprobe_path and /proc/sys/kernel/modprobe.
--# The initrd still keeps modules empty unless a test provides them explicitly.
-+# The linux.bzl e2e initrd supplies only its explicit Rust BTF fixture module.
- CONFIG_MODULES = y
- CONFIG_MODPROBE_PATH = "/sbin/modprobe"
-+CONFIG_RUST = y
-diff --git a/test/kernel/aya_x86_64.config b/test/kernel/aya_x86_64.config
-index 162a953a163b042bd30fd3d1d29a0f9fe6cd6b6f..0d5c4b838ac0ddbd438fa272aa68f670bd735e2f 100644
---- a/test/kernel/aya_x86_64.config
-+++ b/test/kernel/aya_x86_64.config
-@@ -33,6 +33,7 @@ CONFIG_DEBUG_KERNEL = y
- CONFIG_DEBUG_FS = y
- CONFIG_DEBUG_INFO = y
- CONFIG_DEBUG_INFO_BTF = y
-+CONFIG_DEBUG_INFO_BTF_MODULES = y
- CONFIG_DEBUG_INFO_DWARF5 = y
- CONFIG_FHANDLE = y
- CONFIG_KALLSYMS = y
-@@ -109,6 +110,7 @@ CONFIG_UPROBES = y
- CONFIG_UPROBE_EVENTS = y
- 
- # Module core support provides modprobe_path and /proc/sys/kernel/modprobe.
--# The initrd still keeps modules empty unless a test provides them explicitly.
-+# The linux.bzl e2e initrd supplies only its explicit Rust BTF fixture module.
- CONFIG_MODULES = y
- CONFIG_MODPROBE_PATH = "/sbin/modprobe"
-+CONFIG_RUST = y
+diff --git a/test/kernel/linux_bzl_rust_btf.config b/test/kernel/linux_bzl_rust_btf.config
+new file mode 100644
+index 0000000000000000000000000000000000000000..d348dfdf074bf89633d0aa82d3a0747ef598b408
+--- /dev/null
++++ b/test/kernel/linux_bzl_rust_btf.config
+@@ -0,0 +1,2 @@
++CONFIG_DEBUG_INFO_BTF_MODULES=y
++CONFIG_RUST=y

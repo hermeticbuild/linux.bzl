@@ -1,0 +1,1023 @@
+{
+  "schema": "linux.bzl/cc-structural-probe-requests-v1",
+  "structural_probes": [
+    {
+      "id": "00a524f441fa3018abd4b8322ee443239fb214b7672f5fc03c7d4fc38a595207",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-mabi=altivec"
+      ]
+    },
+    {
+      "id": "0211f1b09c63637b3ba0fa581e18ab693df34cd79abb2c0fe06d8f4c512542a6",
+      "kind": "ld-option",
+      "language": "link",
+      "prefix_argv": [
+        "-m",
+        "elf_x86_64"
+      ],
+      "argv": [
+        "--no-dynamic-linker"
+      ]
+    },
+    {
+      "id": "147e71275f7e146cbaa7f707f63a03ed1ec9452a93e9466498fd8832e3492720",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-mtune=pentium2"
+      ]
+    },
+    {
+      "id": "15e7219f3548f0a0ce8905daafad6ef5e3a7979e8a91cbca4677107b36e733ae",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-m64",
+        "-O2",
+        "-std=gnu11",
+        "-fno-strict-aliasing",
+        "-fPIE",
+        "-Wundef",
+        "-DDISABLE_BRANCH_PROFILING",
+        "-mcmodel=small",
+        "-mno-red-zone",
+        "-mno-mmx",
+        "-mno-sse",
+        "-ffreestanding",
+        "-fshort-wchar",
+        "-fno-stack-protector",
+        "-Wno-address-of-packed-member"
+      ],
+      "argv": [
+        "gnu"
+      ]
+    },
+    {
+      "id": "16077263c85b3fea1ae13537646a695cb8073d968ba144f528d621e01cdf2e3a",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a"
+      ],
+      "argv": [
+        "-fcf-protection=branch",
+        "-fno-jump-tables"
+      ]
+    },
+    {
+      "id": "19d1eaf875294426ceef53bc23628ed564b1bfd805a231e3613a3ce7fdd9e777",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "unused-but-set-variable"
+      ]
+    },
+    {
+      "id": "1d6e7d9f5adfd5c6da656dfd224e06d4b70f493bf32a04f613491450f12fec40",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-m64",
+        "-O2",
+        "-std=gnu11",
+        "-fno-strict-aliasing",
+        "-fPIE",
+        "-Wundef",
+        "-DDISABLE_BRANCH_PROFILING",
+        "-mcmodel=small",
+        "-mno-red-zone",
+        "-mno-mmx",
+        "-mno-sse",
+        "-ffreestanding",
+        "-fshort-wchar",
+        "-fno-stack-protector"
+      ],
+      "argv": [
+        "address-of-packed-member"
+      ]
+    },
+    {
+      "id": "215addc5b96362097d0b7c61c7193a699a0b09d6f4dd3b7b9ce91fd7708ee655",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-falign-loops=0"
+      ]
+    },
+    {
+      "id": "2377d06b4995c32a55ba40fb6ae184f584b34aa040d9c0884adaaa7818627f0d",
+      "kind": "ld-option",
+      "language": "link",
+      "prefix_argv": [
+        "-m",
+        "elf_x86_64"
+      ],
+      "argv": [
+        "--no-warn-rwx-segments"
+      ]
+    },
+    {
+      "id": "248008c650a9f68bcb85f1b3924f7662927547da4b34d61e73737d7df26fa606",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "tautological-constant-out-of-range-compare"
+      ]
+    },
+    {
+      "id": "3693bd0445629eea47e736fe23723658375998e761eb5b87bfb809620b281c28",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wold-style-declaration"
+      ]
+    },
+    {
+      "id": "37071676757765c036e379c9efa6ca840bcd91a99c54e1279a8af5638bcb2f51",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "switch-unreachable"
+      ]
+    },
+    {
+      "id": "3f6e1d9b7197a0dc368b787b85ee1371315b97bb42384797d4f6dc9c1d14d67d",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wmaybe-uninitialized"
+      ]
+    },
+    {
+      "id": "4136ea380a64f348fec89f58d9806b3c83e90973966ffb277550babf06d7e5a1",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-mtune=i686"
+      ]
+    },
+    {
+      "id": "43e9014ed22072dbe2be70f6f18906bc8c3ac376b5208afbd452d034f208b3f6",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-march=geode"
+      ]
+    },
+    {
+      "id": "494cf47b60342358865aab5b0899eacfccec38ceb971d82789ee6315c0a69faf",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-mtune=pentium3"
+      ]
+    },
+    {
+      "id": "4b232098c67ada62417037d59a00613cc568f48b2885e92a00a4ad4723df7293",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wformat-truncation"
+      ]
+    },
+    {
+      "id": "4b798e5687a0e0c871cfbaff12cad79bb9b8b93f134997e91e7691226ef8dd1e",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4",
+        "-ffreestanding",
+        "-m64"
+      ],
+      "argv": [
+        "-falign-loops=1"
+      ]
+    },
+    {
+      "id": "582682d1a87a46a0ca43041378007f98ea629695aaf6fa8106a24ee2025b6475",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fcf-protection=branch",
+        "-fno-jump-tables"
+      ]
+    },
+    {
+      "id": "5df929263e9564ebb29e908cb0518e40d771e847162aa7d299339f63733a0ad3",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-Wa,-mtune=generic32"
+      ]
+    },
+    {
+      "id": "5f38ebeed7391b0f1bdfda0beee62b6a8887e1e03e24b18edfb0025792b6d9ac",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wvla-larger-than=1"
+      ]
+    },
+    {
+      "id": "6634362dd3353c74d33e4e56e437bcdcfc07513fa3583685c12106290f613cd1",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4",
+        "-ffreestanding",
+        "-m64",
+        "-falign-loops=1",
+        "-mno-80387",
+        "-mno-fp-ret-in-387",
+        "-mstack-alignment=8",
+        "-mskip-rax-setup",
+        "-march=x86-64",
+        "-mtune=generic",
+        "-mno-red-zone",
+        "-mcmodel=kernel",
+        "-mstack-protector-guard-reg=gs",
+        "-mstack-protector-guard-symbol=__ref_stack_chk_guard",
+        "-mstack-protector-guard=global"
+      ],
+      "argv": [
+        "-maccumulate-outgoing-args"
+      ]
+    },
+    {
+      "id": "67f867fc05abe0b8f8f0e0f272be6dbf90232ba38edd38883b166d39acd3a531",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wformat-overflow"
+      ]
+    },
+    {
+      "id": "68853955ec9179f9408ccfb6bf833ab94d1cf2d757f12971af885e4fc627070d",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-mtune=generic"
+      ]
+    },
+    {
+      "id": "6b39a9aad6ae0b21d58544c3f91b25c7ee5508075548f34673fa52e92ef4dbec",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wstringop-overflow"
+      ]
+    },
+    {
+      "id": "6f0126e1e50d10e47c9dad0029b6436b8deedd6387aa741f83917c2ea5a5e39b",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-march=winchip2"
+      ]
+    },
+    {
+      "id": "75e3019093b0df767d6d87bc8e53f07676a8ceaf6482a759bfc52d9df99537c0",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-march=c3"
+      ]
+    },
+    {
+      "id": "7bd3b19aa61b00aa2065ab1d181ac6fcca6c539c65bceced243a8b5ffa4ae5eb",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "stringop-overread"
+      ]
+    },
+    {
+      "id": "7efee54f368f733b7df0f529b3f0de9ed7324c0f8bc0a3fdf1fd2216f67f184d",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fno-code-hoisting"
+      ]
+    },
+    {
+      "id": "82de319175dc119dbaab60746de609fed12596904668395d61e82f4d1213bf92",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-femit-struct-debug-detailed=any"
+      ]
+    },
+    {
+      "id": "84960f905447f125e4469a4fb67059cf5ad1f0c126b7bed27c66bb24c1d6b5ec",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-march=winchip-c6"
+      ]
+    },
+    {
+      "id": "859140c2d08249e442b0340b72abf22e02694a500caef7e57cdadf24b6ae8ab1",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "gnu"
+      ]
+    },
+    {
+      "id": "896de8589bdeaefa167cae357f2e200672075736bd4bcbcdfe3c7acb3edeb72a",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "unsequenced"
+      ]
+    },
+    {
+      "id": "8975d0099770cc71b3ec0bc16e5a33e330e229cfc8be3cb1b7cbc73931f3a3bd",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fsched-pressure"
+      ]
+    },
+    {
+      "id": "89c37e94fe198df0c7a33908feb536d00e8084246a5234d92837db9f95fb8dec",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables"
+      ],
+      "argv": [
+        "-fcf-protection=none"
+      ]
+    },
+    {
+      "id": "8a918aaa06d6c70590af1407ed0b768d4df2b3809587a739c0863c377ae3da4a",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-mno-outline-atomics"
+      ]
+    },
+    {
+      "id": "8cbf7e2c553aa05160ebcab02029ff7cf9782d0f416a0389265cfeea3c548b40",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-mindirect-branch-cs-prefix"
+      ]
+    },
+    {
+      "id": "8d2b862be2235da95cc976e51f4360d3a9853c42c48b486c091a479d997230a9",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-march=c3-2"
+      ]
+    },
+    {
+      "id": "a73011409175a8239c4b631c457c507294216ff62259299da434193bb0be04c6",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wa,-mtune=generic32"
+      ]
+    },
+    {
+      "id": "ab699b90b23a8306beb2dd78aad7d9b329d44d16513a1e4f4ea82714fa6dee58",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-mno-single-pic-base"
+      ]
+    },
+    {
+      "id": "afd45b7fe4b8e11035ea250a064ffd113b4dd3921c2f949069116e1b172fc1b4",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "stringop-truncation"
+      ]
+    },
+    {
+      "id": "b49fa05b0e288399bc52ddc1af24d980f15ca3ee9df394cf985e229b43f18e0c",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-mgeneral-regs-only"
+      ]
+    },
+    {
+      "id": "c1e35381f00c7b8bcf2c4e1b780754ee28ec54fdbddc044df380da62e3659fd9",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-m64",
+        "-O2",
+        "-std=gnu11",
+        "-fno-strict-aliasing",
+        "-fPIE",
+        "-Wundef",
+        "-DDISABLE_BRANCH_PROFILING",
+        "-mcmodel=small",
+        "-mno-red-zone",
+        "-mno-mmx",
+        "-mno-sse",
+        "-ffreestanding",
+        "-fshort-wchar",
+        "-fno-stack-protector",
+        "-Wno-address-of-packed-member",
+        "-Wno-gnu",
+        "-Wno-pointer-sign",
+        "-fno-asynchronous-unwind-tables",
+        "-D__DISABLE_EXPORTS"
+      ],
+      "argv": [
+        "-Wa,-mrelax-relocations=no"
+      ]
+    },
+    {
+      "id": "c45063325820c96c0dd1e217b2ec352a4455bac2240969c70f4b14c67c1179fd",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wrestrict"
+      ]
+    },
+    {
+      "id": "c80bd2f2ccb73b0d255309c944b02569c1f0a050d02642bdd5ed1f1f6003dc32",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-falign-jumps=1"
+      ]
+    },
+    {
+      "id": "c941841779df0f2e11aeed08d046c9e7ffed2d14aa19772f34bcbac897ddf630",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "address-of-packed-member"
+      ]
+    },
+    {
+      "id": "caeaa42a46cfaacf120dc75d21b131bfe81dd365b88f112419f9a278251129c4",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-foptimize-sibling-calls"
+      ]
+    },
+    {
+      "id": "cb65ef136c10d0f3d6b2b86f2c505dfcf067e76079b29073c4b9e7a4e30911ac",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-falign-jumps=0"
+      ]
+    },
+    {
+      "id": "cf94faf44cbcf0d5456c5ebeaf11c9c638314e8a8c05b9626944f85fb89dd6a9",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "argv": [
+        "-mtune=pentium4"
+      ]
+    },
+    {
+      "id": "d065ff846e0f19e12344e9ad6801ba4cfc7e19c698ca12fde52b7919371f50b0",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fno-schedule-insns"
+      ]
+    },
+    {
+      "id": "da372212af793547d5ce9a4235e91e5445d2bc498681f47ec9040e885ef4c4d9",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fcf-protection=none"
+      ]
+    },
+    {
+      "id": "db06f0366c8666860a40c253e6c94c971127146f5630cdea1c81210a27d1d433",
+      "kind": "ld-option",
+      "language": "link",
+      "prefix_argv": [
+        "-m",
+        "elf_x86_64"
+      ],
+      "argv": [
+        "--no-ld-generated-unwind-info"
+      ]
+    },
+    {
+      "id": "db2da502ad831076529d08c666bca67b406392018002959e640a8a8171d888a6",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fno-conserve-stack"
+      ]
+    },
+    {
+      "id": "de8fc58ddbc4924b05c6f8ab67e6358c201538b5cf6fa2e8136acbf478efb35c",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-fno-addrsig"
+      ]
+    },
+    {
+      "id": "df578cc616763dd481b22bf234850d8e6ab67267883afaf35bd64e73afa85f26",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wpacked-not-aligned"
+      ]
+    },
+    {
+      "id": "e73308a84e26453266ba7392e78b3eeb47b58bebd47ba0380dc30d06347e72cb",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wstringop-truncation"
+      ]
+    },
+    {
+      "id": "e7f8057af0d4b10c11a642dfc99744ddec2c485defa065e2aa2bf94d80c4b1b3",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4",
+        "-ffreestanding",
+        "-m64"
+      ],
+      "argv": [
+        "-falign-jumps=1"
+      ]
+    },
+    {
+      "id": "e81787bd1559fa632ddb3af41690d11bd785d44ce4232a72adf0d8f29abde02b",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wunused-const-variable"
+      ]
+    },
+    {
+      "id": "e93e8953184ea6c0775e908b12609bffa959d873dd2f0976800caff9d585fe7d",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-falign-loops=1"
+      ]
+    },
+    {
+      "id": "ef5460e4947a354beebcf90f94614fca47f04b494aa3419f9b415a00fa5b30ce",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "uninitialized"
+      ]
+    },
+    {
+      "id": "f26f2addf514fbf24edafcce6918c4ecaf8edc15d4de76322ad45324d02194dd",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "missing-prototypes"
+      ]
+    },
+    {
+      "id": "f32a0a7e770f7dafe4cd3b802a85e9ae9fb1cac44d31e77cdb05d842adda3cf8",
+      "kind": "cc-option",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "-Wunused-but-set-variable"
+      ]
+    },
+    {
+      "id": "fda276825b9bc9debb8dca3938844dc738306ee74b078ffd5ca1cb5d6dd5097a",
+      "kind": "cc-disable-warning",
+      "language": "c",
+      "prefix_argv": [
+        "-Werror"
+      ],
+      "argv": [
+        "fortify-source"
+      ]
+    }
+  ]
+}

@@ -1,12 +1,15 @@
 package kconfig
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/ccprofile"
 )
 
 func TestParseKbuildCommonObjectPatterns(t *testing.T) {
@@ -200,6 +203,414 @@ CFLAGS_core.o := $(call cc-option,-fno-conserve-stack) \
 				t.Fatalf("KCSAN runtime flags = %#v, want %#v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestKbuildStructuralProbesUseExactCCProfileRecords(t *testing.T) {
+	ccPrefix := []string{"-Werror", "-DCTX=1", "-mcmodel=kernel"}
+	asPrefix := []string{"-Werror", "-DCTX=1", "-DASSEMBLY"}
+	ldPrefix := []string{"-m", "elf_x86_64"}
+	profile := testCCProfile(
+		ccprofile.StructuralProbe{
+			Kind:       "cc-option",
+			Language:   "c",
+			PrefixArgv: ccPrefix,
+			Argv:       []string{"-fgood"},
+			Supported:  true,
+		},
+		ccprofile.StructuralProbe{
+			Kind:       "cc-option",
+			Language:   "c",
+			PrefixArgv: ccPrefix,
+			Argv:       []string{"-fbad"},
+			Supported:  false,
+		},
+		ccprofile.StructuralProbe{
+			Kind:       "cc-option-yn",
+			Language:   "c",
+			PrefixArgv: ccPrefix,
+			Argv:       []string{"-fyes"},
+			Supported:  true,
+		},
+		ccprofile.StructuralProbe{
+			Kind:       "cc-disable-warning",
+			Language:   "c",
+			PrefixArgv: ccPrefix,
+			Argv:       []string{"unused"},
+			Supported:  true,
+		},
+		ccprofile.StructuralProbe{
+			Kind:       "as-option",
+			Language:   "asm",
+			PrefixArgv: asPrefix,
+			Argv:       []string{"-masm-good"},
+			Supported:  true,
+		},
+		ccprofile.StructuralProbe{
+			Kind:       "ld-option",
+			Language:   "link",
+			PrefixArgv: ldPrefix,
+			Argv:       []string{"--ld-good"},
+			Supported:  true,
+		},
+	)
+
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`KBUILD_CPPFLAGS := -DCTX=1
+KBUILD_CFLAGS := -mcmodel=kernel
+KBUILD_AFLAGS := -DASSEMBLY
+KBUILD_LDFLAGS := -m elf_x86_64
+obj-y += core.o
+ccflags-y += $(call cc-option,-fgood) $(call cc-option,-fbad,-ffallback)
+ccflags-y += $(call cc-disable-warning, unused)
+ccflags-y += $(call cc-option-yn,-fyes)
+asflags-y += $(call as-option,-masm-good)
+ccflags-y += $(call ld-option,--ld-good)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile() failed: %v", err)
+	}
+	recorder := NewStructuralProbeRecorder()
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		CCProfile:     profile,
+		ProbeRecorder: recorder,
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+
+	flagsByLine := map[int][]string{}
+	for _, flags := range kb.Flags {
+		flagsByLine[flags.Position.Line] = append(
+			flagsByLine[flags.Position.Line],
+			flags.Flags...,
+		)
+	}
+	for line, want := range map[int][]string{
+		6:  {"-fgood", "-ffallback"},
+		7:  {"-Wno-unused"},
+		8:  {"y"},
+		9:  {"-masm-good"},
+		10: {"--ld-good"},
+	} {
+		if got := flagsByLine[line]; !reflect.DeepEqual(got, want) {
+			t.Errorf("line %d flags = %v, want %v", line, got, want)
+		}
+	}
+	if got, want := len(recorder.Requests()), len(profile.StructuralProbes); got != want {
+		t.Fatalf("profile-backed request count = %d, want %d", got, want)
+	}
+}
+
+func TestKbuildStructuralProbeFailsClosedOnMissingPrefix(t *testing.T) {
+	profile := testCCProfile(ccprofile.StructuralProbe{
+		Kind:       "cc-option",
+		Language:   "c",
+		PrefixArgv: []string{"-Werror", "-DOTHER=1"},
+		Argv:       []string{"-fgood"},
+		Supported:  true,
+	})
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`KBUILD_CPPFLAGS := -DCTX=1
+obj-y += core.o
+ccflags-y += $(call cc-option,-fgood)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile() failed: %v", err)
+	}
+
+	_, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		CCProfile: profile,
+	})
+	if err == nil {
+		t.Fatal("ParseKbuildFileWithOptions() succeeded without an exact structural probe")
+	}
+	for _, want := range []string{
+		"missing CC profile structural probe",
+		`kind="cc-option"`,
+		`language="c"`,
+		`prefix_argv=["-Werror" "-DCTX=1"]`,
+		`argv=["-fgood"]`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestKbuildStructuralProbeRecorderBootstrapsMissingProfileRecords(t *testing.T) {
+	profile := testCCProfile()
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`ccflags-y += $(call cc-option,-fno-conserve-stack,-ffallback)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile() failed: %v", err)
+	}
+	recorder := NewStructuralProbeRecorder()
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		CCProfile:     profile,
+		ProbeRecorder: recorder,
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+	if got, want := kb.Flags[0].Flags, []string{"-ffallback"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy bootstrap fallback = %v, want %v", got, want)
+	}
+	requests := recorder.Requests()
+	if got, want := len(requests), 1; got != want {
+		t.Fatalf("missing request count = %d, want %d: %#v", got, want, requests)
+	}
+	if got, want := requests[0].Argv, []string{"-fno-conserve-stack"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("missing request argv = %v, want %v", got, want)
+	}
+}
+
+func TestKbuildStructuralProbeUsesCCOptionCFLAGSWhenDefined(t *testing.T) {
+	profile := testCCProfile(ccprofile.StructuralProbe{
+		Kind:       "cc-option",
+		Language:   "c",
+		PrefixArgv: []string{"-Werror", "-DPROFILE_CONTEXT=1"},
+		Argv:       []string{"-fgood"},
+		Supported:  true,
+	})
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`KBUILD_CFLAGS := -DLEGACY_CONTEXT=1
+CC_OPTION_CFLAGS := -DPROFILE_CONTEXT=1
+obj-y += core.o
+ccflags-y += $(call cc-option,-fgood)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile() failed: %v", err)
+	}
+
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		CCProfile: profile,
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+	var got []string
+	for _, flags := range kb.Flags {
+		if flags.Position.Line == 4 {
+			got = append(got, flags.Flags...)
+		}
+	}
+	if want := []string{"-fgood"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("CC_OPTION_CFLAGS probe result = %v, want %v", got, want)
+	}
+}
+
+func TestKbuildStructuralProbeRecorderCapturesCanonicalRequests(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`KBUILD_CPPFLAGS := -DCTX=1
+KBUILD_CFLAGS := -mcmodel=kernel
+KBUILD_AFLAGS := -DASSEMBLY
+KBUILD_LDFLAGS := -m elf_x86_64
+obj-y += core.o
+ccflags-y += $(call cc-option,-fgood) $(call cc-option,-fno-conserve-stack,-ffallback)
+ccflags-y += $(call cc-disable-warning, unused)
+ccflags-y += $(call cc-option-yn,-mrecord-mcount)
+asflags-y += $(call as-option,-masm-good)
+ccflags-y += $(call ld-option,--ld-good)
+ccflags-y += $(call cc-option,-fgood)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile() failed: %v", err)
+	}
+	recorder := NewStructuralProbeRecorder()
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		ProbeRecorder: recorder,
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+
+	flagsByLine := map[int][]string{}
+	for _, flags := range kb.Flags {
+		flagsByLine[flags.Position.Line] = append(
+			flagsByLine[flags.Position.Line],
+			flags.Flags...,
+		)
+	}
+	if got, want := flagsByLine[6], []string{"-fgood", "-ffallback"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy cc-option fallback flags = %v, want %v", got, want)
+	}
+	if got, want := flagsByLine[8], []string{"n"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy cc-option-yn result = %v, want %v", got, want)
+	}
+
+	requests := recorder.Requests()
+	if got, want := len(requests), 6; got != want {
+		t.Fatalf("request count = %d, want %d: %#v", got, want, requests)
+	}
+	for index, request := range requests {
+		if index != 0 && requests[index-1].ID >= request.ID {
+			t.Fatalf("requests are not canonically ordered: %#v", requests)
+		}
+		probe := ccprofile.StructuralProbe{
+			Kind:       request.Kind,
+			Language:   request.Language,
+			PrefixArgv: request.PrefixArgv,
+			Argv:       request.Argv,
+			Supported:  true,
+		}
+		if got, want := request.ID, ccprofile.StructuralProbeID(probe); got != want {
+			t.Errorf("request ID = %s, want %s for %#v", got, want, request)
+		}
+	}
+
+	firstJSON, err := recorder.JSON()
+	if err != nil {
+		t.Fatalf("JSON() failed: %v", err)
+	}
+	secondJSON, err := recorder.JSON()
+	if err != nil {
+		t.Fatalf("second JSON() failed: %v", err)
+	}
+	if string(firstJSON) != string(secondJSON) {
+		t.Fatalf("recorder JSON is nondeterministic:\n%s\n%s", firstJSON, secondJSON)
+	}
+	if strings.Contains(string(firstJSON), `"supported"`) {
+		t.Fatalf("bootstrap requests contain an unmeasured supported result:\n%s", firstJSON)
+	}
+	var manifest StructuralProbeRequestManifest
+	if err := json.Unmarshal(firstJSON, &manifest); err != nil {
+		t.Fatalf("Unmarshal() failed: %v", err)
+	}
+	if got, want := manifest.Schema, StructuralProbeRequestsSchema; got != want {
+		t.Fatalf("manifest schema = %q, want %q", got, want)
+	}
+	if !reflect.DeepEqual(manifest.StructuralProbes, requests) {
+		t.Fatalf("manifest requests = %#v, want %#v", manifest.StructuralProbes, requests)
+	}
+}
+
+func TestKbuildStructuralProbeRecorderDefersRecursiveMacroCalls(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`tune = $(call cc-option,-mtune=$(1),$(2))
+ccflags-y += $(call tune,generic,fallback)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile() failed: %v", err)
+	}
+
+	recorder := NewStructuralProbeRecorder()
+	if _, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		ProbeRecorder: recorder,
+	}); err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+	requests := recorder.Requests()
+	if got, want := len(requests), 1; got != want {
+		t.Fatalf("request count = %d, want %d: %#v", got, want, requests)
+	}
+	if got, want := requests[0].Argv, []string{"-mtune=generic"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("request argv = %v, want %v", got, want)
+	}
+}
+
+func TestKbuildStructuralProbeRecorderCanonicalizesMakeContext(t *testing.T) {
+	parse := func(dir string) []StructuralProbeRequest {
+		t.Helper()
+		kbuild := filepath.Join(dir, "Kbuild")
+		if err := os.WriteFile(kbuild, []byte(`KBUILD_CFLAGS := $(KBUILD_CFLAGS) -DLOCAL $(unknown) \
+	$(call try-run,echo int main(void) { return 0; },-DPROBED)
+KBUILD_CPPFLAGS += -I$(srctree)/include -I$(objtree)/include
+ccflags-y += $(call cc-option,-Wa$(comma)-mrelax-relocations=no)
+`), 0o644); err != nil {
+			t.Fatalf("WriteFile() failed: %v", err)
+		}
+		recorder := NewStructuralProbeRecorder()
+		if _, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+			RootDir: dir,
+			Variables: map[string]string{
+				"objtree": filepath.Join(dir, "out"),
+				"srctree": dir,
+			},
+			ProbeRecorder: recorder,
+		}); err != nil {
+			t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+		}
+		return recorder.Requests()
+	}
+
+	left := parse(t.TempDir())
+	right := parse(t.TempDir())
+	if !reflect.DeepEqual(left, right) {
+		t.Fatalf("checkout-dependent requests:\nleft:  %#v\nright: %#v", left, right)
+	}
+	if got, want := len(left), 1; got != want {
+		t.Fatalf("request count = %d, want %d: %#v", got, want, left)
+	}
+	if got, want := left[0].PrefixArgv, []string{
+		"-Werror",
+		"-I" + StructuralProbeSourceRoot + "/include",
+		"-I" + StructuralProbeObjectRoot + "/include",
+		"-DLOCAL",
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonical prefix argv = %v, want %v", got, want)
+	}
+	if got, want := left[0].Argv, []string{"-Wa,-mrelax-relocations=no"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonical argv = %v, want %v", got, want)
+	}
+	for _, arg := range append(append([]string{}, left[0].PrefixArgv...), left[0].Argv...) {
+		if containsMakeReference(arg) {
+			t.Fatalf("canonical request contains unresolved Make syntax: %q", arg)
+		}
+	}
+}
+
+func TestStructuralProbeRecorderJSONUsesEmptyArrays(t *testing.T) {
+	recorder := NewStructuralProbeRecorder()
+	if err := recorder.Record(ccprofile.StructuralProbe{
+		Kind:     "ld-option",
+		Language: "link",
+		Argv:     []string{"--build-id"},
+	}); err != nil {
+		t.Fatalf("Record() failed: %v", err)
+	}
+	data, err := recorder.JSON()
+	if err != nil {
+		t.Fatalf("JSON() failed: %v", err)
+	}
+	if strings.Contains(string(data), "null") {
+		t.Fatalf("canonical request JSON contains null arrays:\n%s", data)
+	}
+	if !strings.Contains(string(data), `"prefix_argv": []`) {
+		t.Fatalf("canonical request JSON omits an empty prefix array:\n%s", data)
+	}
+}
+
+func TestKbuildDirectoryTreeSharesStructuralProbeRecorder(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Kbuild"), []byte(`obj-y += root.o child/
+ccflags-y += $(call cc-option,-fgood)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "child"), 0o755); err != nil {
+		t.Fatalf("Mkdir(child) failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "child", "Makefile"), []byte(`obj-y += child.o
+ccflags-y += $(call cc-option,-fgood)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(child/Makefile) failed: %v", err)
+	}
+
+	recorder := NewStructuralProbeRecorder()
+	if _, err := ParseKbuildDirectoryTree(filepath.Join(dir, "Kbuild"), KbuildOptions{
+		RootDir:       dir,
+		ProbeRecorder: recorder,
+	}); err != nil {
+		t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+	}
+	requests := recorder.Requests()
+	if got, want := len(requests), 1; got != want {
+		t.Fatalf("shared recursive request count = %d, want %d: %#v", got, want, requests)
+	}
+	if got, want := requests[0].Argv, []string{"-fgood"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("recursive request argv = %v, want %v", got, want)
 	}
 }
 

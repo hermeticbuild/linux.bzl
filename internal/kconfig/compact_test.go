@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 
@@ -1029,6 +1030,419 @@ obj-$(CONFIG_RUST) += rust/
 		if strings.HasPrefix(variant.Object, "rust/") {
 			t.Fatalf("dedicated Rust SDK object leaked into compact graph: %#v", variant)
 		}
+	}
+}
+
+func TestCompactConfigSupportSourcesOwnVmlinuxLinkerClosure(t *testing.T) {
+	tests := []struct {
+		name       string
+		srcarch    string
+		include    string
+		headerPath string
+	}{
+		{
+			name:       "arm64 asm kexec",
+			srcarch:    "arm64",
+			include:    "asm/kexec.h",
+			headerPath: "arch/arm64/include/asm/kexec.h",
+		},
+		{
+			name:       "x86 generic linker header",
+			srcarch:    "x86",
+			include:    "asm-generic/vmlinux.lds.h",
+			headerPath: "include/asm-generic/vmlinux.lds.h",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tree := mustParseString(t, `
+mainmenu "Support source ownership"
+
+config EXTRA_LINKER_HEADER
+	bool "Extra linker header"
+`)
+			kb, err := ParseKbuild(strings.NewReader("obj-y += init.o\n"), "Kbuild")
+			if err != nil {
+				t.Fatalf("ParseKbuild() failed: %v", err)
+			}
+			sourceRoot := t.TempDir()
+			writeCompactContentGraphForcedInputs(t, sourceRoot)
+			mustWriteSource(t, sourceRoot, "init.c", "int init_value;\n")
+			linkerScript := "arch/" + test.srcarch + "/kernel/vmlinux.lds.S"
+			mustWriteSource(
+				t,
+				sourceRoot,
+				linkerScript,
+				"#ifdef LINKER_SCRIPT\n#ifdef CONFIG_EXTRA_LINKER_HEADER\n#include <"+test.include+">\n#endif\n#else\n#include <inactive-linker.h>\n#endif\n",
+			)
+			mustWriteSource(t, sourceRoot, test.headerPath, "#define LINKER_HEADER 1\n")
+			mustWriteSource(t, sourceRoot, "include/inactive-linker.h", "#define INACTIVE_LINKER_HEADER 1\n")
+
+			metadata, err := compactMetadataBatchWithOptionsForTest(
+				t,
+				tree,
+				kb,
+				[]NamedConfig{
+					{Name: "off"},
+					{
+						Name: "on",
+						Flags: map[string]string{
+							"CONFIG_EXTRA_LINKER_HEADER": "y",
+						},
+					},
+				},
+				CompactMetadataOptions{
+					SourceRoot:                 sourceRoot,
+					Srcarch:                    test.srcarch,
+					CompileEnvironmentABI:      "support-source-test",
+					collectSupportSourceInputs: true,
+				},
+			)
+			if err != nil {
+				t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
+			}
+
+			off := configByName(metadata, "off")
+			on := configByName(metadata, "on")
+			if reflect.DeepEqual(off.supportSourceInputs, on.supportSourceInputs) {
+				t.Fatalf(
+					"config-aware linker closure did not split support inputs: %v",
+					off.supportSourceInputs,
+				)
+			}
+			for _, config := range []*CompactConfig{off, on} {
+				supportInputs := config.supportSourceInputs
+				for _, path := range []string{linkerScript, "include/linux/kconfig.h"} {
+					if sourceInputByPath(supportInputs, path).Path == "" {
+						t.Errorf("%s support inputs omit %q: %v", config.Name, path, supportInputs)
+					}
+				}
+				gotHeader := sourceInputByPath(supportInputs, test.headerPath).Path != ""
+				if wantHeader := config.Name == "on"; gotHeader != wantHeader {
+					t.Errorf(
+						"%s support inputs contain %q = %t, want %t: %v",
+						config.Name,
+						test.headerPath,
+						gotHeader,
+						wantHeader,
+						supportInputs,
+					)
+				}
+				if sourceInputByPath(supportInputs, "include/inactive-linker.h").Path != "" {
+					t.Errorf(
+						"%s support inputs retain inactive !LINKER_SCRIPT branch: %v",
+						config.Name,
+						supportInputs,
+					)
+				}
+
+				init := variantByTarget(metadata, objectTarget(metadata, config, "init.o"))
+				objectInputs, err := metadata.expandedSourceInputGroup(
+					init.SourceInputGroup,
+					"init.o source ownership test",
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, path := range []string{linkerScript, test.headerPath} {
+					if sourceInputByPath(objectInputs, path).Path != "" {
+						t.Errorf("init.o incidentally owns final-action source %q: %v", path, objectInputs)
+					}
+				}
+			}
+			data, err := metadata.JSON()
+			if err != nil {
+				t.Fatalf("compact-v6 JSON() failed: %v", err)
+			}
+			if strings.Contains(string(data), "support_source") {
+				t.Fatalf("compact-v6 JSON leaked v7-only support ownership: %s", data)
+			}
+		})
+	}
+}
+
+func TestCompactConfigSupportSourcesOwnRustSDKActionClosures(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "Rust support source ownership"
+
+config RUST
+	bool "Rust"
+
+config JUMP_LABEL
+	bool "Jump labels"
+
+config BUG
+	bool "Bug support"
+`)
+	kb, err := ParseKbuild(strings.NewReader("obj-y += init.o\n"), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := rustProfileFixture(t, true)
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	mustWriteSource(t, sourceRoot, "init.c", "int init_value;\n")
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"include/linux/kconfig.h",
+		"#include <generated/autoconf.h>\n",
+	)
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"rust/bindings/bindings_helper.h",
+		`#ifdef __BINDGEN__
+#include <linux/rust_bindings_only.h>
+#else
+#include <linux/rust_bindings_wrong_profile.h>
+#endif
+`,
+	)
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"rust/uapi/uapi_helper.h",
+		"#include <linux/rust_uapi_only.h>\n",
+	)
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"rust/helpers/helpers.c",
+		`#include <linux/auxiliary_bus.h>
+#ifdef __BINDGEN__
+#include <linux/rust_bindgen_only.h>
+#else
+#include <linux/rust_compile_only.h>
+#endif
+`,
+	)
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"rust/exports.c",
+		`#include "exports_core_generated.h"
+#ifdef __BINDGEN__
+#include <linux/rust_exports_wrong_profile.h>
+#else
+#include <linux/rust_exports_only.h>
+#endif
+`,
+	)
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"rust/kernel/generated_arch_static_branch_asm.rs.S",
+		`#ifdef __ASSEMBLY__
+#include <linux/rust_generated_wrong_profile.h>
+#else
+#include <linux/rust_generated_static.h>
+#endif
+`,
+	)
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"rust/kernel/generated_arch_warn_asm.rs.S",
+		"#include <linux/rust_generated_warn.h>\n",
+	)
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"rust/kernel/generated_arch_reachable_asm.rs.S",
+		"#include <linux/rust_generated_reachable.h>\n",
+	)
+	mustWriteSource(
+		t,
+		sourceRoot,
+		"include/linux/auxiliary_bus.h",
+		"#define AUXILIARY_BUS 1\n",
+	)
+	mustWriteSource(t, sourceRoot, "include/linux/rust_bindgen_only.h", "\n")
+	mustWriteSource(t, sourceRoot, "include/linux/rust_compile_only.h", "\n")
+	for _, path := range []string{
+		"include/linux/rust_bindings_only.h",
+		"include/linux/rust_bindings_wrong_profile.h",
+		"include/linux/rust_uapi_only.h",
+		"include/linux/rust_exports_only.h",
+		"include/linux/rust_exports_wrong_profile.h",
+		"include/linux/rust_generated_static.h",
+		"include/linux/rust_generated_warn.h",
+		"include/linux/rust_generated_reachable.h",
+		"include/linux/rust_generated_wrong_profile.h",
+	} {
+		mustWriteSource(t, sourceRoot, path, "\n")
+	}
+
+	configs := []NamedConfig{
+		{Name: "off"},
+		{Name: "rust", Flags: map[string]string{"CONFIG_RUST": "y"}},
+		{Name: "generated", Flags: map[string]string{
+			"CONFIG_BUG":        "y",
+			"CONFIG_JUMP_LABEL": "y",
+			"CONFIG_RUST":       "y",
+		}},
+	}
+	opts := CompactMetadataOptions{
+		SourceRoot:                 sourceRoot,
+		Srcarch:                    "x86",
+		CompileEnvironmentABI:      "rust-support-source-test",
+		collectSupportSourceInputs: true,
+	}
+	metadata, err := compactMetadataBatchWithOptionsForTest(
+		t,
+		tree,
+		kb,
+		configs,
+		opts,
+	)
+	if err != nil {
+		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
+	}
+
+	off := configByName(metadata, "off")
+	rust := configByName(metadata, "rust")
+	generated := configByName(metadata, "generated")
+	if reflect.DeepEqual(off.supportSourceInputs, rust.supportSourceInputs) {
+		t.Fatalf(
+			"Rust enablement did not split support inputs: %v",
+			off.supportSourceInputs,
+		)
+	}
+	for _, config := range []*CompactConfig{off, rust, generated} {
+		supportInputs := config.supportSourceInputs
+		for _, path := range []string{
+			"rust/bindings/bindings_helper.h",
+			"rust/uapi/uapi_helper.h",
+			"rust/bindgen_parameters",
+			"rust/helpers/helpers.c",
+			"rust/exports.c",
+			"include/linux/auxiliary_bus.h",
+			"include/linux/rust_bindings_only.h",
+			"include/linux/rust_uapi_only.h",
+			"include/linux/rust_bindgen_only.h",
+			"include/linux/rust_compile_only.h",
+			"include/linux/rust_exports_only.h",
+		} {
+			got := sourceInputByPath(supportInputs, path).Path != ""
+			if want := config.Name != "off"; got != want {
+				t.Errorf(
+					"%s support inputs contain %q = %t, want %t: %v",
+					config.Name,
+					path,
+					got,
+					want,
+					supportInputs,
+				)
+			}
+		}
+		for _, path := range []string{
+			"rust/kernel/generated_arch_static_branch_asm.rs.S",
+			"rust/kernel/generated_arch_warn_asm.rs.S",
+			"rust/kernel/generated_arch_reachable_asm.rs.S",
+			"include/linux/rust_generated_static.h",
+			"include/linux/rust_generated_warn.h",
+			"include/linux/rust_generated_reachable.h",
+		} {
+			got := sourceInputByPath(supportInputs, path).Path != ""
+			if want := config.Name == "generated"; got != want {
+				t.Errorf(
+					"%s support inputs contain generated path %q = %t, want %t: %v",
+					config.Name,
+					path,
+					got,
+					want,
+					supportInputs,
+				)
+			}
+		}
+		for _, path := range []string{
+			"include/linux/rust_bindings_wrong_profile.h",
+			"include/linux/rust_exports_wrong_profile.h",
+			"include/linux/rust_generated_wrong_profile.h",
+		} {
+			if sourceInputByPath(supportInputs, path).Path != "" {
+				t.Errorf("%s support inputs contain inactive profile path %q: %v", config.Name, path, supportInputs)
+			}
+		}
+		if sourceInputByPath(supportInputs, "include/linux/kconfig.h").Path == "" {
+			t.Errorf("%s support inputs omit forced Kconfig header: %v", config.Name, supportInputs)
+		}
+		if sourceInputByPath(supportInputs, "include/linux/compiler_types.h").Path == "" &&
+			config.Name != "off" {
+			t.Errorf("%s support inputs omit forced C compiler types header: %v", config.Name, supportInputs)
+		}
+		init := variantByTarget(metadata, objectTarget(metadata, config, "init.o"))
+		objectInputs, err := metadata.expandedSourceInputGroup(
+			init.SourceInputGroup,
+			"Rust support init.o ownership test",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sourceInputByPath(objectInputs, "include/linux/auxiliary_bus.h").Path != "" {
+			t.Errorf("init.o incidentally owns Rust helper header: %v", objectInputs)
+		}
+	}
+
+	v7Options := opts
+	v7Options.collectSupportSourceInputs = false
+	v7, err := tree.CompactMetadataBatchV7WithOptions(
+		configs,
+		CompactMetadataV7Options{
+			CompactMetadataOptions: v7Options,
+			ToolchainProfileID:     "llvm-test/x86",
+		},
+		func(config *ResolvedConfig) (CompactConfigGraph, error) {
+			return CompactConfigGraph{
+				Kbuild:                kb,
+				GeneratedHeadersLabel: "//internal/kconfig:test_generated_headers_" + sanitizeTargetName(config.Name),
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("CompactMetadataBatchV7WithOptions() failed: %v", err)
+	}
+	for _, config := range v7.Configs {
+		files := compactV7ExpandedSetForTest(t, v7, config.SupportSourceSet)
+		hasAuxiliaryBus := false
+		for index := range files {
+			if v7.SourceFiles[index-1].Path == "include/linux/auxiliary_bus.h" {
+				hasAuxiliaryBus = true
+				break
+			}
+		}
+		if want := config.Name != "off"; hasAuxiliaryBus != want {
+			t.Errorf(
+				"compact-v7 %s support set contains auxiliary_bus.h = %t, want %t",
+				config.Name,
+				hasAuxiliaryBus,
+				want,
+			)
+		}
+	}
+
+	savedSet := v7.Configs[0].SupportSourceSet
+	v7.Configs[0].SupportSourceSet = strings.Repeat("f", 64)
+	if err := v7.validate(); err == nil ||
+		!strings.Contains(err.Error(), "references unknown support source set") {
+		t.Fatalf("compact-v7 unknown support set validation error = %v", err)
+	}
+	v7.Configs[0].SupportSourceSet = savedSet
+
+	deadInput := CompactSourceInput{
+		Path:   "zzzz/dead-support.h",
+		Digest: strings.Repeat("d", 64),
+	}
+	v7.SourceFiles = append(v7.SourceFiles, deadInput)
+	deadSet := CompactSourceSet{Files: []int{len(v7.SourceFiles)}}
+	deadSet.ID = compactV7SourceSetContentID([]CompactSourceInput{deadInput}, nil)
+	v7.SourceSets = append(v7.SourceSets, deadSet)
+	sort.Slice(v7.SourceSets, func(i, j int) bool {
+		return v7.SourceSets[i].ID < v7.SourceSets[j].ID
+	})
+	if err := v7.validate(); err == nil ||
+		!strings.Contains(err.Error(), "source set "+deadSet.ID+" is not referenced") {
+		t.Fatalf("compact-v7 dead support set liveness error = %v", err)
 	}
 }
 
@@ -3011,6 +3425,12 @@ func TestCompactContentGraphImageBuildEmitsBaseRelativeDelta(t *testing.T) {
 				imageTarget:         "module_reorder_image",
 			},
 			{
+				Name:                "add_only",
+				ObjectTargets:       []string{"a", "c", "b"},
+				ModuleObjectTargets: []string{"m", "n"},
+				imageTarget:         "add_only_image",
+			},
+			{
 				Name:                "overlay",
 				ObjectTargets:       []string{"b", "c", "a"},
 				ModuleObjectTargets: []string{"n"},
@@ -3044,38 +3464,48 @@ func TestCompactContentGraphImageBuildEmitsBaseRelativeDelta(t *testing.T) {
 	if got, want := base.AttrStrings("objects"), []string{"//objects:a", "//objects:b"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("base objects = %v, want %v", got, want)
 	}
-	if got, want := base.AttrStrings("module_objects"), []string{"//objects:m", "//objects:n"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("base module_objects = %v, want %v", got, want)
+	baseModules := parsed.RuleNamed("base_modules")
+	if baseModules == nil || baseModules.Kind() != "linux_compact_modules" {
+		t.Fatalf("base modules are not a linux_compact_modules target:\n%s", imageBuild)
+	}
+	if got, want := baseModules.AttrStrings("objects"), []string{"//objects:m", "//objects:n"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("base module objects = %v, want %v", got, want)
 	}
 	copyRule := parsed.RuleNamed("copy_image")
 	if copyRule == nil || copyRule.Kind() != "alias" || copyRule.AttrString("actual") != ":base_image" {
 		t.Fatalf("identical config did not alias the base image:\n%s", imageBuild)
 	}
 	moduleReorder := parsed.RuleNamed("module_reorder_image")
-	if moduleReorder == nil || moduleReorder.Kind() != "linux_compact_delta_image" {
-		t.Fatalf("module reorder with the same membership incorrectly aliased the base image:\n%s", imageBuild)
+	if moduleReorder == nil || moduleReorder.Kind() != "alias" || moduleReorder.AttrString("actual") != ":base_image" {
+		t.Fatalf("module-only reorder should alias the base image:\n%s", imageBuild)
 	}
-	if got, want := moduleReorder.AttrStrings("ordered_module_content_ids"), []string{id("e"), id("d")}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("module reorder ordered_module_content_ids = %v, want %v", got, want)
+	moduleReorderModules := parsed.RuleNamed("module_reorder_modules")
+	if moduleReorderModules == nil || moduleReorderModules.Kind() != "linux_compact_modules" {
+		t.Fatalf("module reorder should emit a direct module aggregate:\n%s", imageBuild)
+	}
+	if got, want := moduleReorderModules.AttrStrings("objects"), []string{"//objects:n", "//objects:m"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("module reorder objects = %v, want %v", got, want)
+	}
+	addOnly := parsed.RuleNamed("add_only_image")
+	if addOnly == nil || addOnly.Kind() != "linux_compact_delta_image" {
+		t.Fatalf("order-preserving addition is not a linux_compact_delta_image:\n%s", imageBuild)
+	}
+	if got, want := addOnly.AttrStrings("add_objects"), []string{"//objects:c"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("add-only add_objects = %v, want %v", got, want)
 	}
 	overlay := parsed.RuleNamed("overlay_image")
-	if overlay == nil || overlay.Kind() != "linux_compact_delta_image" {
-		t.Fatalf("overlay is not a linux_compact_delta_image:\n%s", imageBuild)
+	if overlay == nil || overlay.Kind() != "linux_compact_image" {
+		t.Fatalf("subtractive overlay should be emitted directly:\n%s", imageBuild)
 	}
-	if got := overlay.AttrString("base_image"); got != ":base_image" {
-		t.Fatalf("overlay base_image = %q, want :base_image", got)
+	if got, want := overlay.AttrStrings("objects"), []string{"//objects:b", "//objects:c", "//objects:a"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("overlay objects = %v, want %v", got, want)
 	}
-	if got, want := overlay.AttrStrings("add_objects"), []string{"//objects:c"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("overlay add_objects = %v, want %v", got, want)
+	overlayModules := parsed.RuleNamed("overlay_modules")
+	if overlayModules == nil || overlayModules.Kind() != "linux_compact_modules" {
+		t.Fatalf("overlay modules are not emitted directly:\n%s", imageBuild)
 	}
-	if got, want := overlay.AttrStrings("remove_content_ids"), []string{id("d")}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("overlay remove_content_ids = %v, want %v", got, want)
-	}
-	if got, want := overlay.AttrStrings("ordered_content_ids"), []string{id("b"), id("c"), id("a")}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("overlay ordered_content_ids = %v, want built-ins only %v", got, want)
-	}
-	if got, want := overlay.AttrStrings("ordered_module_content_ids"), []string{id("e")}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("overlay ordered_module_content_ids = %v, want %v", got, want)
+	if got, want := overlayModules.AttrStrings("objects"), []string{"//objects:n"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("overlay module objects = %v, want %v", got, want)
 	}
 }
 
@@ -3304,6 +3734,8 @@ func writeCompactSource(t *testing.T, root, rel string) {
 func writeCompactContentGraphForcedInputs(t *testing.T, root string) {
 	t.Helper()
 	for _, path := range []string{
+		"arch/arm64/kernel/vmlinux.lds.S",
+		"arch/x86/kernel/vmlinux.lds.S",
 		"include/linux/compiler-version.h",
 		"include/linux/compiler_types.h",
 		"include/linux/kconfig.h",
@@ -3375,8 +3807,13 @@ func compactMetadataBatchWithOptionsForTest(
 				}
 				writeCompactSource(t, opts.SourceRoot, filepath.ToSlash(filepath.Join(opts.ObjectDir, source)))
 			}
+			if configYes(resolved, "CONFIG_RUST") &&
+				!fileExists(filepath.Join(opts.SourceRoot, "rust", "helpers", "helpers.c")) {
+				writeCompactSource(t, opts.SourceRoot, "rust/helpers/helpers.c")
+			}
 		}
 		for _, path := range []string{
+			"arch/" + opts.Srcarch + "/kernel/vmlinux.lds.S",
 			"include/linux/compiler-version.h",
 			"include/linux/compiler_types.h",
 			"include/linux/kconfig.h",

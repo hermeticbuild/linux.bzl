@@ -1,5 +1,5 @@
 diff --git a/MODULE.bazel b/MODULE.bazel
-index 2ae24cdd7eb524b18cbc37067f510b46e31adcd1..f017a0f3325ecb6b2b04d6f1aaad8c82dc7b7b57 100644
+index 2ae24cdd7eb524b18cbc37067f510b46e31adcd1..6c4c5c4832f260ff26ab9306e8b97d4a4b71a31b 100644
 --- a/MODULE.bazel
 +++ b/MODULE.bazel
 @@ -13,14 +13,14 @@ bazel_dep(name = "linux.bzl", version = "0.0.0")
@@ -37,25 +37,20 @@ index 2ae24cdd7eb524b18cbc37067f510b46e31adcd1..f017a0f3325ecb6b2b04d6f1aaad8c82
  )
  
  # @rules_rs creates @rules_rust here; generated BUILD files and .bazelrc labels
-@@ -125,55 +125,36 @@ use_repo(crate, "crates")
+@@ -123,57 +123,11 @@ exports_files(
+ )
+ use_repo(crate, "crates")
  
- # Use one integrity-pinned Linux source archive for both integration VM
- # architectures.
+-# Use one integrity-pinned Linux source archive for both integration VM
+-# architectures.
 -linux_kernel = use_extension("@linux.bzl//:linux.bzl", "linux_kernel")
 -linux_kernel.archive(
-+linux_source_repository = use_repo_rule(
-+    "@linux.bzl",
-+    "linux_source_repository",
-+)
-+
-+linux_source_repository(
-     name = "aya_linux_6_18_2",
-     integrity = "sha256-VYxrurdJSSs0+Zgn/oB7ADmnRGk8IdOn4Ds6SO2quWo=",
-     strip_prefix = "linux-6.18.2",
-     urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.2.tar.xz"],
-+    version = "6.18.2",
- )
- 
+-    name = "aya_linux_6_18_2",
+-    integrity = "sha256-VYxrurdJSSs0+Zgn/oB7ADmnRGk8IdOn4Ds6SO2quWo=",
+-    strip_prefix = "linux-6.18.2",
+-    urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.2.tar.xz"],
+-)
+-
 -# Convert each requested Kconfig fragment into a KconfigInfo repository.
 -linux_kernel.kconfig(
 -    name = "aya_aarch64_kconfig",
@@ -64,11 +59,8 @@ index 2ae24cdd7eb524b18cbc37067f510b46e31adcd1..f017a0f3325ecb6b2b04d6f1aaad8c82
 -linux_kernel.kconfig(
 -    name = "aya_x86_64_kconfig",
 -    config = "//test/kernel:aya_x86_64.config",
-+linux_image = use_repo_rule(
-+    "@linux.bzl",
-+    "linux_image",
- )
- 
+-)
+-
 -# Generate architecture-specific compact Kbuild metadata from
 -# aya_aarch64.config and aya_x86_64.config.
 -# linux.bzl encodes pahole 1.31 as "131" for the CONFIG_DEBUG_INFO_BTF probe;
@@ -77,40 +69,37 @@ index 2ae24cdd7eb524b18cbc37067f510b46e31adcd1..f017a0f3325ecb6b2b04d6f1aaad8c82
 -# derive pahole_version from the pahole toolchain.
 -linux_kernel.compact(
 -    name = "aya_aarch64_compact",
-+linux_image(
-+    name = "aya_aarch64_kernel",
-     config = "//test/kernel:aya_aarch64.config",
-     config_mode = "allnoconfig",
+-    config = "//test/kernel:aya_aarch64.config",
+-    config_mode = "allnoconfig",
 -    config_name = "aarch64",
 -    kernel_name = "aya_kernel",
 -    kernel_package = "test/kernel",
 -    probe_values = {"pahole_version": "131"},
 -    source_repo = "aya_linux_6_18_2",
-+    platform = "@llvm//platforms:linux_arm64",
-+    source = "@aya_linux_6_18_2//:Kconfig",
- )
+-)
 -linux_kernel.compact(
 -    name = "aya_x86_64_compact",
-+
-+linux_image(
-+    name = "aya_x86_64_kernel",
-     config = "//test/kernel:aya_x86_64.config",
-     config_mode = "allnoconfig",
+-    config = "//test/kernel:aya_x86_64.config",
+-    config_mode = "allnoconfig",
 -    config_name = "x86_64",
 -    kernel_name = "aya_kernel",
 -    kernel_package = "test/kernel",
 -    probe_values = {"pahole_version": "131"},
 -    source_repo = "aya_linux_6_18_2",
 -)
--use_repo(
++# The root consumer owns the configured images. Import its generated facade
++# repositories into Aya's repository mapping.
++linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
+ use_repo(
 -    linux_kernel,
 -    "aya_aarch64_compact",
 -    "aya_aarch64_kconfig",
 -    "aya_linux_6_18_2",
 -    "aya_x86_64_compact",
 -    "aya_x86_64_kconfig",
-+    platform = "@llvm//platforms:linux_x86_64",
-+    source = "@aya_linux_6_18_2//:Kconfig",
++    linux_images,
++    "aya_aarch64_kernel",
++    "aya_x86_64_kernel",
  )
 diff --git a/MODULE.bazel.lock b/MODULE.bazel.lock
 index 97ce202557e5737c0257367dc775e85fca092bbc..856d4070cedf2135487716047c17d3bfaa5a38e6 100644
@@ -251,7 +240,7 @@ index 2c6326c57371e212ba7d3da0a3044486beeb2369..4ff63e3a7e2a46254f9dfc49d52d0583
  load("//bazel:rust.bzl", "aya_rust_crate")
  load("//bazel:vm.bzl", "aya_qemu_vm_test")
 diff --git a/test/kernel/BUILD.bazel b/test/kernel/BUILD.bazel
-index 30608c9a92b0692d91bbfac40bfb8f168e5e2f14..dc6f27f564dad63b60174477abffbbbdad6bef52 100644
+index 30608c9a92b0692d91bbfac40bfb8f168e5e2f14..543463e26a02a5de5cff2fb935a80981cb576c18 100644
 --- a/test/kernel/BUILD.bazel
 +++ b/test/kernel/BUILD.bazel
 @@ -1,5 +1,3 @@
@@ -287,8 +276,8 @@ index 30608c9a92b0692d91bbfac40bfb8f168e5e2f14..dc6f27f564dad63b60174477abffbbbd
 -    probe_values = {"pahole_version": _PAHOLE_VERSION},
 -    source_repo = _LINUX_SOURCE_REPOSITORY,
 +    actual = select({
-+        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//:kernel",
-+        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//:kernel",
++        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//variants/rust_btf:kernel",
++        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//variants/rust_btf:kernel",
 +    }),
  )
  
@@ -299,8 +288,8 @@ index 30608c9a92b0692d91bbfac40bfb8f168e5e2f14..dc6f27f564dad63b60174477abffbbbd
 -        "@platforms//cpu:aarch64": [":aya_kernel_aarch64_config"],
 -        "@platforms//cpu:x86_64": [":aya_kernel_x86_64_config"],
 +    actual = select({
-+        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//:config",
-+        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//:config",
++        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//variants/rust_btf:config",
++        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//variants/rust_btf:config",
      }),
 -    output_group = "config",
  )
@@ -311,12 +300,12 @@ index 30608c9a92b0692d91bbfac40bfb8f168e5e2f14..dc6f27f564dad63b60174477abffbbbd
 -    srcs = [":aya_kernel.vm_linux"],
 -    output_group = "system_map",
 +    actual = select({
-+        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//:system_map",
-+        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//:system_map",
++        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//variants/rust_btf:system_map",
++        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//variants/rust_btf:system_map",
 +    }),
  )
 diff --git a/test/kernel/README.md b/test/kernel/README.md
-index 794c893765e3a075245483698576b35a41f05489..9cc8103cabda2f348fd4f5dfa133cd3fe9f2a3fe 100644
+index 794c893765e3a075245483698576b35a41f05489..d5cbbdd1c1a5fcd0cb5e13db7ba2bc7171a5760d 100644
 --- a/test/kernel/README.md
 +++ b/test/kernel/README.md
 @@ -3,7 +3,7 @@
@@ -334,7 +323,7 @@ index 794c893765e3a075245483698576b35a41f05489..9cc8103cabda2f348fd4f5dfa133cd3f
  $ bazel build --lockfile_mode=error \
 -    --platforms=@rules_rs//rs/platforms:aarch64-unknown-linux-musl \
 -    //test/kernel:aya_kernel_aarch64_config
-+    @aya_aarch64_kernel//:config
++    @aya_aarch64_kernel//variants/rust_btf:config
  ```
  
 -The resolved configuration is
@@ -346,7 +335,7 @@ index 794c893765e3a075245483698576b35a41f05489..9cc8103cabda2f348fd4f5dfa133cd3f
  $ bazel build --lockfile_mode=error \
 -    --platforms=@rules_rs//rs/platforms:x86_64-unknown-linux-musl \
 -    //test/kernel:aya_kernel_x86_64_config
-+    @aya_x86_64_kernel//:config
++    @aya_x86_64_kernel//variants/rust_btf:config
  ```
  
 -The resolved configuration is

@@ -6,6 +6,9 @@ go_library(
         "buildmerge.go",
         "compact.go",
         "compact_content.go",
+        "compact_v7.go",
+        "compact_v7_convert.go",
+        "compact_v7_validate.go",
         "config.go",
         "config_footprint.go",
         "dump.go",
@@ -27,6 +30,7 @@ go_library(
     importpath = "github.com/hermeticbuild/linux.bzl/internal/kconfig",
     visibility = ["//internal:__subpackages__"],
     deps = [
+        "//internal/ccprofile",
         "//internal/kconfig/buildgen",
         "@com_github_bazelbuild_buildtools//build",
     ],
@@ -36,6 +40,7 @@ go_test(
     name = "kconfig_test",
     srcs = [
         "compact_test.go",
+        "compact_v7_test.go",
         "config_footprint_test.go",
         "config_test.go",
         "kbuild_test.go",
@@ -48,5 +53,8 @@ go_test(
     ],
     data = glob(["testdata/**"]),
     embed = [":kconfig"],
-    deps = ["@com_github_bazelbuild_buildtools//build"],
+    deps = [
+        "//internal/ccprofile",
+        "@com_github_bazelbuild_buildtools//build",
+    ],
 )

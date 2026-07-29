@@ -34,6 +34,13 @@ LinuxObjectInfo = provider(
     },
 )
 
+LinuxModuleObjectsInfo = provider(
+    "Module object fixture data for strict compact graph tests.",
+    fields = {
+        "objects": "",
+    },
+)
+
 def _linux_compile_environment_index_impl(ctx):
     outputs = []
     payloads_by_bucket = {}
@@ -157,6 +164,20 @@ linux_compact_image = rule(
     attrs = {
         "arch": attr.string(),
         "module_objects": attr.label_list(providers = [LinuxObjectInfo]),
+        "objects": attr.label_list(providers = [LinuxObjectInfo]),
+    },
+)
+
+def _linux_compact_modules_impl(ctx):
+    objects = [target[LinuxObjectInfo] for target in ctx.attr.objects]
+    return [
+        DefaultInfo(files = depset([obj.output for obj in objects])),
+        LinuxModuleObjectsInfo(objects = objects),
+    ]
+
+linux_compact_modules = rule(
+    implementation = _linux_compact_modules_impl,
+    attrs = {
         "objects": attr.label_list(providers = [LinuxObjectInfo]),
     },
 )

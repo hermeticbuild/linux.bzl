@@ -1,0 +1,5 @@
+exports_files([
+    "linux_aarch64",
+    "linux_arm64",
+    "linux_x86_64",
+])

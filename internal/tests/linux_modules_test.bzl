@@ -314,7 +314,7 @@ def linux_module_test_suite(name):
     linux_module(
         name = module,
         deps = [":" + dependency],
-        kernel = ":" + kernel,
+        module_sdk = ":" + kernel,
         srcs = ["linux_modules_test_fixture.rs"],
         tags = ["manual"],
     )

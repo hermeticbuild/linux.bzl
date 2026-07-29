@@ -9,7 +9,10 @@ load("@gazelle//:def.bzl", "gazelle", "gazelle_test")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["linux.bzl"])
+exports_files([
+    "extensions.bzl",
+    "linux.bzl",
+])
 
 gazelle(
     name = "gazelle",

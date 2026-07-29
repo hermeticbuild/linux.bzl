@@ -34,7 +34,6 @@ def _linux_kernel_bundle_impl(ctx):
     vmlinux = _one_file(vmlinux_groups.vmlinux, "%s vmlinux" % ctx.label)
     system_map = _one_file(vmlinux_groups.system_map, "%s System.map" % ctx.label)
     config = ctx.attr.config[LinuxConfigInfo]
-    module_sdk = ctx.attr.module_sdk[LinuxModuleSdkInfo]
 
     info = LinuxKernelInfo(
         arch = ctx.attr.arch,
@@ -48,16 +47,10 @@ def _linux_kernel_bundle_impl(ctx):
     return [
         DefaultInfo(files = depset([image])),
         info,
-        module_sdk,
         OutputGroupInfo(
             config = depset([config.config]),
             image = depset([image]),
             kernel_release = depset([config.kernel_release]),
-            module_symvers = depset([module_sdk.module_symvers]),
-            modules = module_sdk.modules,
-            modules_builtin = depset([module_sdk.modules_builtin]),
-            modules_builtin_modinfo = depset([module_sdk.modules_builtin_modinfo]),
-            modules_order = depset([module_sdk.modules_order]),
             system_map = depset([system_map]),
             vmlinux = depset([vmlinux]),
         ),
@@ -75,10 +68,6 @@ linux_kernel_bundle = rule(
             providers = [LinuxConfigInfo],
         ),
         "image": attr.label(mandatory = True),
-        "module_sdk": attr.label(
-            mandatory = True,
-            providers = [LinuxModuleSdkInfo],
-        ),
         "version": attr.string(mandatory = True),
         "vmlinux": attr.label(mandatory = True),
     },
@@ -125,6 +114,7 @@ _linux_module_projection = rule(
 def linux_kernel_exports(
         name,
         graph,
+        module_sdk_graph,
         platform,
         arch,
         visibility = ["//visibility:public"]):
@@ -133,6 +123,13 @@ def linux_kernel_exports(
         name = name,
         arch = arch,
         graph = graph,
+        platform = platform,
+        visibility = visibility,
+    )
+    linux_platform_gateway(
+        name = "module_sdk",
+        arch = arch,
+        graph = module_sdk_graph,
         platform = platform,
         visibility = visibility,
     )
@@ -147,6 +144,6 @@ def linux_kernel_exports(
         _linux_module_projection(
             name = field,
             field = field,
-            kernel = ":" + name,
+            kernel = ":module_sdk",
             visibility = visibility,
         )

@@ -20,21 +20,47 @@ type configPayloadManifest struct {
 	Version  string            `json:"version"`
 }
 
+type repeatedStringFlag []string
+
+func (values *repeatedStringFlag) String() string {
+	return strings.Join(*values, ",")
+}
+
+func (values *repeatedStringFlag) Set(value string) error {
+	*values = append(*values, value)
+	return nil
+}
+
 func main() {
 	configPath := flag.String("config", "", "Resolved Linux .config file")
 	arch := flag.String("arch", "x86", "Linux ARCH value")
+	version := flag.String("version", "", "Linux kernel version")
 	outPath := flag.String("out", "", "Output Clang response file")
 	asmOutPath := flag.String("asm_out", "", "Output assembler response file")
 	batchManifestPath := flag.String("batch_manifest", "", "JSON manifest of content-addressed config payloads")
 	batchOutDir := flag.String("batch_out_dir", "", "Output root for content-addressed config payloads")
+	var batchPayloads repeatedStringFlag
+	flag.Var(&batchPayloads, "batch_payload", "Content-addressed config payload as ID=path; repeat for batching")
 	flag.Parse()
 
-	if *batchManifestPath != "" || *batchOutDir != "" {
-		if *batchManifestPath == "" || *batchOutDir == "" || *configPath != "" || *outPath != "" || *asmOutPath != "" {
+	if *batchManifestPath != "" || *batchOutDir != "" || len(batchPayloads) != 0 {
+		if *batchOutDir == "" || *configPath != "" || *outPath != "" || *asmOutPath != "" ||
+			(*batchManifestPath == "") == (len(batchPayloads) == 0) {
 			flag.PrintDefaults()
 			os.Exit(2)
 		}
-		if err := materializeConfigPayloads(*batchManifestPath, *batchOutDir); err != nil {
+		var err error
+		if *batchManifestPath != "" {
+			err = materializeConfigPayloads(*batchManifestPath, *batchOutDir)
+		} else {
+			err = materializeConfigPayloadFiles(
+				batchPayloads,
+				*batchOutDir,
+				*arch,
+				*version,
+			)
+		}
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "materialize config payloads: %v\n", err)
 			os.Exit(1)
 		}
@@ -69,6 +95,50 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+func materializeConfigPayloadFiles(
+	encoded []string,
+	outDir string,
+	arch string,
+	version string,
+) error {
+	if arch != "" && arch != "arm64" && arch != "x86" {
+		return fmt.Errorf("unsupported Linux ARCH %q", arch)
+	}
+	payloads := make(map[string]string, len(encoded))
+	for _, value := range encoded {
+		id, path, ok := strings.Cut(value, "=")
+		if !ok || path == "" {
+			return fmt.Errorf("invalid batch payload %q; want ID=path", value)
+		}
+		if !isContentID(id) {
+			return fmt.Errorf("invalid payload ID %q", id)
+		}
+		if _, ok := payloads[id]; ok {
+			return fmt.Errorf("repeated payload ID %s", id)
+		}
+		payloads[id] = path
+	}
+	ids := make([]string, 0, len(payloads))
+	for id := range payloads {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		content, err := os.ReadFile(payloads[id])
+		if err != nil {
+			return fmt.Errorf("read payload %s: %w", id, err)
+		}
+		config, err := parseConfigPayload(string(content))
+		if err != nil {
+			return fmt.Errorf("parse payload %s: %w", id, err)
+		}
+		if err := materializeConfigPayload(outDir, id, config, arch, version); err != nil {
+			return fmt.Errorf("materialize payload %s: %w", id, err)
+		}
+	}
+	return nil
 }
 
 func materializeConfigPayloads(manifestPath, outDir string) error {
