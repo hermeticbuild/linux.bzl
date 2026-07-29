@@ -118,6 +118,54 @@ func TestMaterializeConfigPayloadsRejectsInvalidID(t *testing.T) {
 	}
 }
 
+func TestMaterializeConfigPayloadFiles(t *testing.T) {
+	const id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	tempDir := t.TempDir()
+	payloadPath := filepath.Join(tempDir, "payload.config")
+	if err := os.WriteFile(
+		payloadPath,
+		[]byte("CONFIG_ALPHA=y\nCONFIG_LOCALVERSION=\"-files\"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	outDir := filepath.Join(tempDir, "payloads")
+	if err := materializeConfigPayloadFiles(
+		[]string{id + "=" + payloadPath},
+		outDir,
+		"arm64",
+		"6.18.39",
+	); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(outDir, id)
+	for path, want := range map[string]string{
+		filepath.Join(root, ".config"):                             "CONFIG_ALPHA=y\nCONFIG_LOCALVERSION=\"-files\"\n",
+		filepath.Join(root, "include", "config", "kernel.release"): "6.18.39-files\n",
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if string(got) != want {
+			t.Fatalf("%s = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestMaterializeConfigPayloadFilesRejectsDuplicateID(t *testing.T) {
+	const id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	err := materializeConfigPayloadFiles(
+		[]string{id + "=/first", id + "=/second"},
+		t.TempDir(),
+		"x86",
+		"6.18.39",
+	)
+	if err == nil || !strings.Contains(err.Error(), "repeated payload ID") {
+		t.Fatalf("materializeConfigPayloadFiles() error = %v, want repeated payload ID", err)
+	}
+}
+
 func TestLinuxAFlagsX86IncludeFtraceUsingDefines(t *testing.T) {
 	config := map[string]string{
 		"CONFIG_FUNCTION_TRACER":      "y",

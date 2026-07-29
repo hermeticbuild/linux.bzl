@@ -717,11 +717,17 @@ def _repository_protocol_test_impl(ctx):
             "all": "1111111111111111111111111111111111111111111111111111111111111111",
         },
         base_rust_enabled = False,
+        cc_profile = "@@linux_profiles//:x86_64.json",
         config_mode = "default",
         graph_image = "//graph:x86_64_image",
+        graph_modules = "//partitions:x86_64_modules",
+        graph_sources = "//sources:x86_64_core",
         variant_configs = {"rust": "//configs:rust"},
         variant_core_configs = {"rust": "rust"},
         variant_graph_images = {"rust": "//graph:rust_image"},
+        variant_graph_modules = {"rust": "//partitions:rust_modules"},
+        variant_graph_sources = {"rust": "//sources:rust_core"},
+        variant_module_sdk_configs = {"rust": "rust"},
         variant_header_family_dependencies = {"rust": {"all": {}}},
         variant_header_family_ids = {
             "rust": {
@@ -731,6 +737,7 @@ def _repository_protocol_test_impl(ctx):
         variant_header_configs = {"rust": "rust"},
         variant_rust_enabled = {"rust": True},
         rules_repo = "@@linux_bzl",
+        legacy_source_compat = True,
     )
 
     asserts.equals(
@@ -741,6 +748,7 @@ def _repository_protocol_test_impl(ctx):
     asserts.true(env, "rust_profile_json = " in generated)
     asserts.true(env, 'minimum_rustc_version = "1.78.0",' in generated)
     asserts.true(env, "base_rust_enabled = False," in generated)
+    asserts.true(env, "legacy_source_compat = True," in generated)
     asserts.true(
         env,
         'base_header_family_dependencies = {\n        "all": {},\n    },' in generated,

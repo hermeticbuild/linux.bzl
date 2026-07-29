@@ -131,6 +131,13 @@ LinuxImageInfo = provider(
     },
 )
 
+LinuxModuleObjectsInfo = provider(
+    doc = "Configured in-tree module roots kept outside the kernel image graph.",
+    fields = {
+        "objects": "Ordered configured module-root LinuxObjectInfo values.",
+    },
+)
+
 def _source_tree_relpath(file, root_dir):
     path = file.short_path
     if root_dir and (path == root_dir or path.startswith(root_dir + "/")):
@@ -244,12 +251,15 @@ def _linux_source_input_index_impl(ctx):
         previous_group = encoded
     if not groups:
         fail("linux_source_input_index %s requires at least one source input group" % ctx.label)
-    return [LinuxSourceInputIndexInfo(
-        file_indices = file_indices,
-        files = files,
-        groups = groups,
-        source_tree_info = source_tree_info,
-    )]
+    return [
+        DefaultInfo(files = depset(files)),
+        LinuxSourceInputIndexInfo(
+            file_indices = file_indices,
+            files = files,
+            groups = groups,
+            source_tree_info = source_tree_info,
+        ),
+    ]
 
 linux_source_input_index = rule(
     implementation = _linux_source_input_index_impl,
@@ -3644,44 +3654,70 @@ def _linux_compile_environment_index_impl(ctx):
         )
         referenced_payloads[payload_id] = True
 
-    config_payload_contents_by_bucket = {}
-    config_payload_outputs_by_bucket = {}
+    config_payload_files = {}
+    for target, payload_id in ctx.attr.config_payload_files.items():
+        _validate_content_id(payload_id, "config payload file ID")
+        if payload_id in config_payload_files:
+            fail(
+                "config payload ID %s is provided by both %s and %s" %
+                (payload_id, config_payload_files[payload_id].owner, target.label),
+            )
+        config_payload_files[payload_id] = _single_file(target, "config_payload_files")
+    for payload_id, content in ctx.attr.config_payload_values.items():
+        _validate_content_id(payload_id, "config payload value ID")
+        if payload_id not in config_payload_files:
+            fail("config_payload_values contains %s without a matching config_payload_files entry" % payload_id)
+        _parse_config_payload(payload_id, content)
+    for payload_id in ctx.attr.config_payloads.keys():
+        _validate_content_id(payload_id, "config payload ID")
+        if payload_id in config_payload_files:
+            fail("config payload %s is provided as both inline content and a file" % payload_id)
+
+    inline_payload_contents_by_bucket = {}
+    inline_payload_outputs_by_bucket = {}
+    file_payload_inputs_by_bucket = {}
+    file_payload_outputs_by_bucket = {}
     config_payloads = {}
     for payload_id in sorted(referenced_payloads.keys()):
-        if payload_id not in ctx.attr.config_payloads:
+        content = ctx.attr.config_payloads.get(payload_id)
+        payload_file = config_payload_files.get(payload_id)
+        if content == None and payload_file == None:
             fail("compile environment index %s references unknown config payload %s" % (ctx.label, payload_id))
         _validate_content_id(payload_id, "config payload ID")
-        content = ctx.attr.config_payloads[payload_id]
+        config_flags = {}
+        if content != None:
+            config_flags = _parse_config_payload(payload_id, content)
+        elif payload_id in ctx.attr.config_payload_values:
+            config_flags = _parse_config_payload(payload_id, ctx.attr.config_payload_values[payload_id])
         declared = _declare_linux_config(
             ctx,
             ctx.label.name + ".config_payloads/" + payload_id,
-            _parse_config_payload(payload_id, content),
+            config_flags,
             ctx.attr.version,
         )
         bucket = payload_id[0]
-        if bucket not in config_payload_contents_by_bucket:
-            config_payload_contents_by_bucket[bucket] = {}
-            config_payload_outputs_by_bucket[bucket] = []
-        config_payload_contents_by_bucket[bucket][payload_id] = content
-        config_payload_outputs_by_bucket[bucket].extend(declared.outputs)
+        if content != None:
+            inline_payload_contents_by_bucket.setdefault(bucket, {})[payload_id] = content
+            inline_payload_outputs_by_bucket.setdefault(bucket, []).extend(declared.outputs)
+        else:
+            file_payload_inputs_by_bucket.setdefault(bucket, {})[payload_id] = payload_file
+            file_payload_outputs_by_bucket.setdefault(bucket, []).extend(declared.outputs)
         config_payloads[payload_id] = declared.info
-    for payload_id in ctx.attr.config_payloads.keys():
-        _validate_content_id(payload_id, "config payload ID")
 
-    for bucket in sorted(config_payload_contents_by_bucket.keys()):
+    for bucket in sorted(inline_payload_contents_by_bucket.keys()):
         manifest = ctx.actions.declare_file(ctx.label.name + ".config_payloads_%s_manifest.json" % bucket)
         ctx.actions.write(
             manifest,
             json.encode({
                 "arch": ctx.attr.arch,
-                "payloads": config_payload_contents_by_bucket[bucket],
+                "payloads": inline_payload_contents_by_bucket[bucket],
                 "version": ctx.attr.version,
             }) + "\n",
         )
         payload_args = ctx.actions.args()
         payload_args.add("-batch_manifest", manifest)
         payload_args.add("-batch_out_dir")
-        first_payload_id = sorted(config_payload_contents_by_bucket[bucket].keys())[0]
+        first_payload_id = sorted(inline_payload_contents_by_bucket[bucket].keys())[0]
         first_payload = config_payloads[first_payload_id]
         payload_root = first_payload.config.dirname.rsplit("/", 1)[0]
         add_directory_arg(
@@ -3692,7 +3728,34 @@ def _linux_compile_environment_index_impl(ctx):
             ctx.actions,
             executable = ctx.executable._kernelflags,
             inputs = [manifest],
-            outputs = config_payload_outputs_by_bucket[bucket],
+            outputs = inline_payload_outputs_by_bucket[bucket],
+            arguments = [payload_args],
+            mnemonic = "LinuxConfigPayloads",
+            progress_message = "Materializing Linux config payloads %{label}",
+        )
+
+    for bucket in sorted(file_payload_inputs_by_bucket.keys()):
+        payload_args = ctx.actions.args()
+        payload_args.add("-batch_out_dir")
+        first_payload_id = sorted(file_payload_inputs_by_bucket[bucket].keys())[0]
+        first_payload = config_payloads[first_payload_id]
+        payload_root = first_payload.config.dirname.rsplit("/", 1)[0]
+        add_directory_arg(
+            payload_args,
+            directory_anchor(first_payload.config, payload_root),
+        )
+        payload_args.add("-arch", ctx.attr.arch)
+        payload_args.add("-version", ctx.attr.version)
+        inputs = []
+        for payload_id in sorted(file_payload_inputs_by_bucket[bucket].keys()):
+            payload_file = file_payload_inputs_by_bucket[bucket][payload_id]
+            payload_args.add(payload_file, format = "-batch_payload=%s=%%s" % payload_id)
+            inputs.append(payload_file)
+        path_mapped_run(
+            ctx.actions,
+            executable = ctx.executable._kernelflags,
+            inputs = inputs,
+            outputs = file_payload_outputs_by_bucket[bucket],
             arguments = [payload_args],
             mnemonic = "LinuxConfigPayloads",
             progress_message = "Materializing Linux config payloads %{label}",
@@ -3762,8 +3825,14 @@ linux_compile_environment_index = rule(
             doc = "Map of full compile-environment SHA-256 IDs to JSON config-payload/generated-header-family references.",
         ),
         "config_payloads": attr.string_dict(
-            mandatory = True,
-            doc = "Map of full config-payload SHA-256 IDs to canonical sorted .config text.",
+            doc = "Legacy map of full config-payload SHA-256 IDs to canonical sorted .config text.",
+        ),
+        "config_payload_files": attr.label_keyed_string_dict(
+            allow_files = True,
+            doc = "Map of one-file config payload targets to their full SHA-256 IDs.",
+        ),
+        "config_payload_values": attr.string_dict(
+            doc = "Analysis-visible payload text for file-backed configurations that require CONFIG_* branching.",
         ),
         "generated_headers": attr.label_list(
             providers = [LinuxGeneratedHeadersInfo],
@@ -5111,6 +5180,27 @@ linux_compact_image = rule(
     doc = "Archives compact Linux object variants into one relocatable image object.",
 )
 
+def _linux_compact_modules_impl(ctx):
+    objects = [target[LinuxObjectInfo] for target in ctx.attr.objects]
+    for info in objects:
+        if info.mode != "m":
+            fail(
+                "linux_compact_modules %s object %s has mode %r, want \"m\"" %
+                (ctx.label, info.object, info.mode),
+            )
+    return [
+        DefaultInfo(files = depset([info.output for info in objects])),
+        LinuxModuleObjectsInfo(objects = objects),
+    ]
+
+linux_compact_modules = rule(
+    implementation = _linux_compact_modules_impl,
+    attrs = {
+        "objects": attr.label_list(providers = [LinuxObjectInfo]),
+    },
+    doc = "Collects configured in-tree module roots outside the kernel image graph.",
+)
+
 def _compact_objects_by_content_id(objects, what, expected_mode):
     by_id = {}
     order = []
@@ -6057,13 +6147,12 @@ def _linux_vmlinux_impl(ctx):
         image_object_inputs,
         rust_sdk.runtime_objects,
     )
-    module_prep = linux_module_actions.prepare(
+    module_prep = linux_module_actions.prepare_vmlinux(
         ctx,
         linux_module_cc_helpers,
         struct(
             config = config,
             generated_headers = generated_headers,
-            module_objects = image.module_objects,
             source_root = _linux_source_root_file(ctx),
             source_tree = depset(ctx.files.source_tree),
             srcarch = ctx.attr.srcarch,
@@ -6141,13 +6230,7 @@ def _linux_vmlinux_impl(ctx):
             arch = "aarch64" if ctx.attr.arch == "arm64" else "x86_64",
             config = config,
             generated_headers = generated_headers,
-            module_common = module_prep.module_common if module_prep != None else None,
-            module_lds = module_prep.module_lds if module_prep != None else None,
-            module_objects = image.module_objects,
-            module_outputs = module_prep.module_outputs if module_prep != None else {},
-            module_sources = module_prep.module_sources if module_prep != None else {},
             module_symvers = module_prep.module_symvers if module_prep != None else None,
-            modules_order = module_prep.modules_order if module_prep != None else None,
             modpost = module_prep.modpost if module_prep != None else None,
             source_root = _linux_source_root_file(ctx),
             source_tree = depset(ctx.files.source_tree),

@@ -1,0 +1,23 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+package(default_visibility = ["//visibility:private"])
+
+go_library(
+    name = "ccprofile_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/ccprofile",
+    deps = ["//internal/ccprofile"],
+)
+
+go_binary(
+    name = "ccprofile",
+    embed = [":ccprofile_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "ccprofile_test",
+    srcs = ["main_test.go"],
+    embed = [":ccprofile_lib"],
+    deps = ["//internal/ccprofile"],
+)

@@ -75,63 +75,79 @@ linux_source_repository(
     version = "6.18.39",
 )
 
-linux_image = use_repo_rule(
-    "@linux.bzl//:linux.bzl",
-    "linux_image",
-)
-
-linux_image(
+linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
+linux_images.image(
     name = "e2e_6_12_96_x86_64",
+    arch = "x86_64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.json",
     config = "//:tiny.config",
     platform = "@hermetic_llvm//platforms:linux_x86_64",
     source = "@e2e_linux_6_12_96//:Kconfig",
 )
-
-linux_image(
+linux_images.image(
     name = "e2e_6_12_96_aarch64",
+    arch = "aarch64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_aarch64.json",
     config = "//:tiny_arm64.config",
     platform = "@hermetic_llvm//platforms:linux_arm64",
     source = "@e2e_linux_6_12_96//:Kconfig",
 )
-
-linux_image(
+linux_images.image(
     name = "e2e_rust_6_12_96_x86_64",
+    arch = "x86_64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.json",
     config = "//:rust.config",
     platform = "@hermetic_llvm//platforms:linux_x86_64",
     source = "@e2e_linux_6_12_96//:Kconfig",
 )
-
-linux_image(
+linux_images.image(
     name = "e2e_rust_6_12_96_aarch64",
+    arch = "aarch64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_aarch64.json",
     config = "//:rust_arm64.config",
     platform = "@hermetic_llvm//platforms:linux_arm64",
     source = "@e2e_linux_6_12_96//:Kconfig",
 )
-
-linux_image(
+linux_images.image(
     name = "e2e_x86_64",
+    arch = "x86_64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.json",
     config = "//:tiny.config",
     platform = "@hermetic_llvm//platforms:linux_x86_64",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
-
-linux_image(
+linux_images.image(
     name = "e2e_rust_x86_64",
+    arch = "x86_64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.json",
     config = "//:rust.config",
     platform = "@hermetic_llvm//platforms:linux_x86_64",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
-
-linux_image(
+linux_images.image(
     name = "e2e_rust_aarch64",
+    arch = "aarch64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_aarch64.json",
     config = "//:rust_arm64.config",
     platform = "@hermetic_llvm//platforms:linux_arm64",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
-
-linux_image(
+linux_images.image(
     name = "e2e_aarch64",
+    arch = "aarch64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_aarch64.json",
     config = "//:tiny_arm64.config",
     platform = "@hermetic_llvm//platforms:linux_arm64",
     source = "@e2e_linux_6_18_39//:Kconfig",
+)
+use_repo(
+    linux_images,
+    "e2e_6_12_96_aarch64",
+    "e2e_6_12_96_x86_64",
+    "e2e_aarch64",
+    "e2e_rust_6_12_96_aarch64",
+    "e2e_rust_6_12_96_x86_64",
+    "e2e_rust_aarch64",
+    "e2e_rust_x86_64",
+    "e2e_x86_64",
 )

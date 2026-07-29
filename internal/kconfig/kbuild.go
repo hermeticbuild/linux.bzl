@@ -2,6 +2,7 @@ package kconfig
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
@@ -11,7 +12,107 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+
+	"github.com/hermeticbuild/linux.bzl/internal/ccprofile"
 )
+
+const (
+	StructuralProbeRequestsSchema = "linux.bzl/cc-structural-probe-requests-v1"
+	StructuralProbeSourceRoot     = ccprofile.StructuralProbeSourceRoot
+	StructuralProbeObjectRoot     = ccprofile.StructuralProbeObjectRoot
+)
+
+type StructuralProbeRequest struct {
+	ID         string   `json:"id"`
+	Kind       string   `json:"kind"`
+	Language   string   `json:"language"`
+	PrefixArgv []string `json:"prefix_argv"`
+	Argv       []string `json:"argv"`
+}
+
+type StructuralProbeRequestManifest struct {
+	Schema           string                   `json:"schema"`
+	StructuralProbes []StructuralProbeRequest `json:"structural_probes"`
+}
+
+// StructuralProbeRecorder collects unique compiler capability requests across
+// every Kbuild parser participating in one bootstrap operation.
+type StructuralProbeRecorder struct {
+	mu     sync.Mutex
+	probes map[string]StructuralProbeRequest
+}
+
+func NewStructuralProbeRecorder() *StructuralProbeRecorder {
+	return &StructuralProbeRecorder{
+		probes: map[string]StructuralProbeRequest{},
+	}
+}
+
+func (recorder *StructuralProbeRecorder) Record(probe ccprofile.StructuralProbe) error {
+	if recorder == nil {
+		return nil
+	}
+	request := StructuralProbeRequest{
+		Kind:       probe.Kind,
+		Language:   probe.Language,
+		PrefixArgv: append([]string{}, probe.PrefixArgv...),
+		Argv:       append([]string{}, probe.Argv...),
+	}
+	request.ID = ccprofile.StructuralProbeID(ccprofile.StructuralProbe{
+		Kind:       request.Kind,
+		Language:   request.Language,
+		PrefixArgv: request.PrefixArgv,
+		Argv:       request.Argv,
+	})
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.probes == nil {
+		recorder.probes = map[string]StructuralProbeRequest{}
+	}
+	if existing, ok := recorder.probes[request.ID]; ok {
+		if existing.Kind != request.Kind ||
+			existing.Language != request.Language ||
+			!slices.Equal(existing.PrefixArgv, request.PrefixArgv) ||
+			!slices.Equal(existing.Argv, request.Argv) {
+			return fmt.Errorf("structural probe request ID collision at %s", request.ID)
+		}
+		return nil
+	}
+	recorder.probes[request.ID] = request
+	return nil
+}
+
+func (recorder *StructuralProbeRecorder) Requests() []StructuralProbeRequest {
+	if recorder == nil {
+		return []StructuralProbeRequest{}
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	requests := make([]StructuralProbeRequest, 0, len(recorder.probes))
+	for _, request := range recorder.probes {
+		request.PrefixArgv = append([]string{}, request.PrefixArgv...)
+		request.Argv = append([]string{}, request.Argv...)
+		requests = append(requests, request)
+	}
+	sort.Slice(requests, func(i, j int) bool {
+		return requests[i].ID < requests[j].ID
+	})
+	return requests
+}
+
+func (recorder *StructuralProbeRecorder) JSON() ([]byte, error) {
+	manifest := StructuralProbeRequestManifest{
+		Schema:           StructuralProbeRequestsSchema,
+		StructuralProbes: recorder.Requests(),
+	}
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encode structural probe requests: %w", err)
+	}
+	return append(data, '\n'), nil
+}
 
 type KbuildFile struct {
 	Objects          []KbuildObject         `json:"objects"`
@@ -137,6 +238,9 @@ type KbuildOptions struct {
 	SourceRoots     map[string]string
 	Variables       map[string]string
 	MaxIncludeDepth int
+	CCProfile       *ccprofile.Profile
+	ProbeRecorder   *StructuralProbeRecorder
+	ccProbes        map[string]ccprofile.StructuralProbe
 }
 
 func ParseKbuildFile(path string) (*KbuildFile, error) {
@@ -144,12 +248,16 @@ func ParseKbuildFile(path string) (*KbuildFile, error) {
 }
 
 func ParseKbuildFileWithOptions(path string, opts KbuildOptions) (*KbuildFile, error) {
+	opts, err := prepareKbuildOptions(opts)
+	if err != nil {
+		return nil, err
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	return parseKbuild(file, path, opts.Variables, filepath.Dir(path))
+	return parseKbuildWithOptions(file, path, opts, filepath.Dir(path))
 }
 
 func parseKbuildFile(path string, vars map[string]string) (*KbuildFile, error) {
@@ -162,6 +270,10 @@ func parseKbuildFile(path string, vars map[string]string) (*KbuildFile, error) {
 }
 
 func ParseKbuildFileTree(path string, opts KbuildOptions) (*KbuildFile, error) {
+	opts, err := prepareKbuildOptions(opts)
+	if err != nil {
+		return nil, err
+	}
 	return parseKbuildFileTree(path, opts, nil)
 }
 
@@ -185,7 +297,7 @@ func parseKbuildFileTree(path string, opts KbuildOptions, variableOverrides map[
 		seen:              map[string]bool{},
 		parsing:           map[string]bool{},
 	}
-	parser := newKbuildParserWithOverrides(opts.Variables, variableOverrides, "")
+	parser := newKbuildParserWithOptions(opts, variableOverrides, "")
 	parser.includeFunc = func(includes []KbuildInclude) error {
 		return treeParser.parseIncludes(parser, includes)
 	}
@@ -199,6 +311,10 @@ func parseKbuildFileTree(path string, opts KbuildOptions, variableOverrides map[
 }
 
 func ParseKbuildDirectoryTree(path string, opts KbuildOptions) (*KbuildFile, error) {
+	opts, err := prepareKbuildOptions(opts)
+	if err != nil {
+		return nil, err
+	}
 	rootDir := opts.RootDir
 	if rootDir == "" {
 		rootDir = filepath.Dir(path)
@@ -217,7 +333,11 @@ func ParseKbuild(r io.Reader, filename string) (*KbuildFile, error) {
 }
 
 func parseKbuild(r io.Reader, filename string, vars map[string]string, baseDir string) (*KbuildFile, error) {
-	parser := newKbuildParser(vars, baseDir)
+	return parseKbuildWithOptions(r, filename, KbuildOptions{Variables: vars}, baseDir)
+}
+
+func parseKbuildWithOptions(r io.Reader, filename string, opts KbuildOptions, baseDir string) (*KbuildFile, error) {
+	parser := newKbuildParserWithOptions(opts, nil, baseDir)
 	if err := parser.parseReader(r, filename); err != nil {
 		return nil, err
 	}
@@ -225,6 +345,20 @@ func parseKbuild(r io.Reader, filename string, vars map[string]string, baseDir s
 		return nil, err
 	}
 	return parser.kb, nil
+}
+
+func prepareKbuildOptions(opts KbuildOptions) (KbuildOptions, error) {
+	if opts.CCProfile == nil {
+		return opts, nil
+	}
+	if err := ccprofile.Validate(*opts.CCProfile); err != nil {
+		return KbuildOptions{}, fmt.Errorf("validate Kbuild CC profile: %w", err)
+	}
+	opts.ccProbes = make(map[string]ccprofile.StructuralProbe, len(opts.CCProfile.StructuralProbes))
+	for _, probe := range opts.CCProfile.StructuralProbes {
+		opts.ccProbes[probe.ID] = probe
+	}
+	return opts, nil
 }
 
 func (p *kbuildParser) finalizeObjectSettings() error {
@@ -332,28 +466,37 @@ func (p *kbuildParser) appendMakefileList(filename string) {
 }
 
 type kbuildParser struct {
-	kb           *KbuildFile
-	initialVars  map[string]string
-	vars         map[string]kbuildVariable
-	undefined    map[string]bool
-	locals       []map[string]string
-	expanding    map[string]bool
-	conds        []kbuildConditionalFrame
-	baseDir      string
-	currentPos   Position
-	defineName   string
-	defineOp     string
-	definePos    Position
-	defineBody   []string
-	currentRule  int
-	order        int
-	includeFunc  func([]KbuildInclude) error
-	includeDepth int
+	kb            *KbuildFile
+	initialVars   map[string]string
+	vars          map[string]kbuildVariable
+	undefined     map[string]bool
+	locals        []map[string]string
+	expanding     map[string]bool
+	conds         []kbuildConditionalFrame
+	baseDir       string
+	currentPos    Position
+	defineName    string
+	defineOp      string
+	definePos     Position
+	defineBody    []string
+	currentRule   int
+	order         int
+	includeFunc   func([]KbuildInclude) error
+	includeDepth  int
+	ccProfile     *ccprofile.Profile
+	ccProbes      map[string]ccprofile.StructuralProbe
+	probeRecorder *StructuralProbeRecorder
+	probePaths    []kbuildProbePathReplacement
 }
 
 type kbuildVariable struct {
 	value     string
 	recursive bool
+}
+
+type kbuildProbePathReplacement struct {
+	path  string
+	token string
 }
 
 type kbuildConditionalFrame struct {
@@ -371,26 +514,84 @@ type kbuildConditionalFrame struct {
 }
 
 func newKbuildParser(vars map[string]string, baseDir string) *kbuildParser {
-	return newKbuildParserWithOverrides(vars, nil, baseDir)
+	return newKbuildParserWithOptions(KbuildOptions{Variables: vars}, nil, baseDir)
 }
 
-func newKbuildParserWithOverrides(vars, overrides map[string]string, baseDir string) *kbuildParser {
-	initial := make(map[string]string, len(vars))
-	for key, value := range vars {
+func newKbuildParserWithOptions(opts KbuildOptions, overrides map[string]string, baseDir string) *kbuildParser {
+	initial := make(map[string]string, len(opts.Variables)+4)
+	for key, value := range opts.Variables {
 		initial[key] = normalizeKbuildPathVariable(key, value)
+	}
+	for key, value := range map[string]string{
+		"comma": ",",
+		"empty": "",
+		"pound": "#",
+		"space": " ",
+	} {
+		if _, ok := initial[key]; !ok {
+			initial[key] = value
+		}
 	}
 	local := make(map[string]kbuildVariable, len(overrides))
 	for key, value := range overrides {
 		local[key] = kbuildVariable{value: normalizeKbuildPathVariable(key, value)}
 	}
-	return &kbuildParser{
-		kb:          &KbuildFile{},
-		initialVars: initial,
-		vars:        local,
-		expanding:   map[string]bool{},
-		baseDir:     baseDir,
-		currentRule: -1,
+	parser := &kbuildParser{
+		kb:            &KbuildFile{},
+		initialVars:   initial,
+		vars:          local,
+		expanding:     map[string]bool{},
+		baseDir:       baseDir,
+		currentRule:   -1,
+		ccProfile:     opts.CCProfile,
+		probeRecorder: opts.ProbeRecorder,
+		probePaths:    kbuildProbePathReplacements(opts),
 	}
+	parser.ccProbes = opts.ccProbes
+	return parser
+}
+
+func kbuildProbePathReplacements(opts KbuildOptions) []kbuildProbePathReplacement {
+	pathsByToken := []struct {
+		token string
+		paths []string
+	}{
+		{
+			token: StructuralProbeSourceRoot,
+			paths: []string{
+				opts.RootDir,
+				opts.Variables["srctree"],
+			},
+		},
+		{
+			token: StructuralProbeObjectRoot,
+			paths: []string{
+				opts.Variables["objtree"],
+			},
+		},
+	}
+	seen := map[string]bool{}
+	var replacements []kbuildProbePathReplacement
+	for _, group := range pathsByToken {
+		for _, path := range group.paths {
+			path = strings.TrimSuffix(
+				filepath.ToSlash(filepath.Clean(normalizeKbuildPathVariable("srctree", path))),
+				"/",
+			)
+			if path == "" || path == "." || path == "/" || seen[path] {
+				continue
+			}
+			seen[path] = true
+			replacements = append(replacements, kbuildProbePathReplacement{
+				path:  path,
+				token: group.token,
+			})
+		}
+	}
+	sort.Slice(replacements, func(i, j int) bool {
+		return len(replacements[i].path) > len(replacements[j].path)
+	})
+	return replacements
 }
 
 func normalizeKbuildPathVariable(name, value string) string {
@@ -801,6 +1002,12 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 	if !containsMakeReference(expandedLHS) {
 		lhs = strings.TrimSpace(expandedLHS)
 	}
+	if (op == "=" || op == "?=") &&
+		!kbuildAssignmentEmitsMetadata(rawLHS) &&
+		!kbuildAssignmentEmitsMetadata(lhs) {
+		p.assign(lhs, op, rhs, rhs)
+		return nil
+	}
 	expandedRHS, err := p.expand(rhs)
 	if err != nil {
 		return err
@@ -891,6 +1098,31 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 		return p.parseCompositeMemberAssignment(composite, cond, op, values, pos)
 	}
 	return nil
+}
+
+func kbuildAssignmentEmitsMetadata(lhs string) bool {
+	if _, ok := localKbuildFlagVariable(lhs); ok {
+		return true
+	}
+	if _, _, ok := collectionCondition(lhs); ok {
+		return true
+	}
+	if _, _, ok := generatedTargetCondition(lhs); ok {
+		return true
+	}
+	if _, _, _, ok := globalFlagCondition(lhs); ok {
+		return true
+	}
+	if _, _, ok := removeFlagTarget(lhs); ok {
+		return true
+	}
+	if _, _, ok := perObjectFlagTarget(lhs); ok {
+		return true
+	}
+	if _, _, ok := compositeMemberCondition(lhs); ok {
+		return true
+	}
+	return false
 }
 
 func (p *kbuildParser) parseCollectionAssignment(kind string, cond KbuildCondition, op string, values []string, pos Position) error {
@@ -1348,40 +1580,241 @@ func (p *kbuildParser) evalReference(original, clause string, depth int) (string
 	return value, nil
 }
 
-func kbuildKnownCall(name string, args []string, original, srcarch string) (string, bool) {
+func (p *kbuildParser) kbuildKnownCall(
+	name string,
+	args []string,
+	original string,
+	srcarch string,
+	depth int,
+) (string, bool, error) {
 	switch name {
 	case "cc-disable-warning":
 		if len(args) != 1 {
-			return original, true
+			return original, true, nil
 		}
 		warning := strings.Join(strings.Fields(args[0]), "")
 		if warning == "" {
-			return "", true
+			return "", true, nil
 		}
-		return "-Wno-" + warning, true
+		if p.ccProfile == nil {
+			if err := p.recordKbuildProbe(name, []string{warning}, depth); err != nil {
+				return "", true, err
+			}
+			return "-Wno-" + warning, true, nil
+		}
+		supported, err := p.kbuildProbeSupported(name, []string{warning}, depth)
+		if err != nil {
+			return "", true, err
+		}
+		if supported {
+			return "-Wno-" + warning, true, nil
+		}
+		return "", true, nil
 	case "cc-option", "as-option", "ld-option":
 		if len(args) < 1 || len(args) > 2 {
-			return original, true
+			return original, true, nil
 		}
 		option := strings.TrimSpace(args[0])
-		if !linuxLLVMKbuildProbeSupportsOption(option, srcarch) {
-			if len(args) == 2 {
-				return strings.TrimSpace(args[1]), true
+		supported := false
+		var err error
+		if p.ccProfile == nil {
+			if option != "" {
+				if err := p.recordKbuildProbe(name, kbuildFields(option), depth); err != nil {
+					return "", true, err
+				}
 			}
-			return "", true
+			supported = linuxLLVMKbuildProbeSupportsOption(option, srcarch)
+		} else if option != "" {
+			supported, err = p.kbuildProbeSupported(name, kbuildFields(option), depth)
+			if err != nil {
+				return "", true, err
+			}
 		}
-		return option, true
+		if !supported {
+			if len(args) == 2 {
+				return strings.TrimSpace(args[1]), true, nil
+			}
+			return "", true, nil
+		}
+		return option, true, nil
 	case "cc-option-yn":
 		if len(args) != 1 {
-			return original, true
+			return original, true, nil
 		}
-		if linuxLLVMKbuildProbeSupportsOption(strings.TrimSpace(args[0]), srcarch) {
-			return "y", true
+		option := strings.TrimSpace(args[0])
+		supported := false
+		var err error
+		if p.ccProfile == nil {
+			if option != "" {
+				if err := p.recordKbuildProbe(name, kbuildFields(option), depth); err != nil {
+					return "", true, err
+				}
+			}
+			supported = linuxLLVMKbuildProbeSupportsOption(option, srcarch)
+		} else if option != "" {
+			supported, err = p.kbuildProbeSupported(name, kbuildFields(option), depth)
+			if err != nil {
+				return "", true, err
+			}
 		}
-		return "n", true
+		if supported {
+			return "y", true, nil
+		}
+		return "n", true, nil
 	default:
-		return "", false
+		return "", false, nil
 	}
+}
+
+func (p *kbuildParser) recordKbuildProbe(
+	kind string,
+	argv []string,
+	depth int,
+) error {
+	if p.probeRecorder == nil || p.ccProfile != nil {
+		return nil
+	}
+	probe, err := p.kbuildProbe(kind, argv, depth)
+	if err != nil {
+		return err
+	}
+	return p.probeRecorder.Record(probe)
+}
+
+func (p *kbuildParser) kbuildProbeSupported(
+	kind string,
+	argv []string,
+	depth int,
+) (bool, error) {
+	probe, err := p.kbuildProbe(kind, argv, depth)
+	if err != nil {
+		return false, err
+	}
+	if p.probeRecorder != nil {
+		if err := p.probeRecorder.Record(probe); err != nil {
+			return false, err
+		}
+	}
+	record, ok := p.ccProbes[probe.ID]
+	if !ok {
+		if p.probeRecorder != nil {
+			srcarch, _ := p.lookupRawVar("SRCARCH")
+			if kind == "cc-disable-warning" {
+				return true, nil
+			}
+			return linuxLLVMKbuildProbeSupportsOption(strings.Join(argv, " "), srcarch), nil
+		}
+		return false, fmt.Errorf(
+			"missing CC profile structural probe %s: kind=%q language=%q prefix_argv=%q argv=%q",
+			probe.ID,
+			probe.Kind,
+			probe.Language,
+			probe.PrefixArgv,
+			probe.Argv,
+		)
+	}
+	return record.Supported, nil
+}
+
+func (p *kbuildParser) kbuildProbe(
+	kind string,
+	argv []string,
+	depth int,
+) (ccprofile.StructuralProbe, error) {
+	language := "c"
+	switch kind {
+	case "as-option":
+		language = "asm"
+	case "ld-option":
+		language = "link"
+	}
+	prefixArgv, err := p.kbuildProbePrefixArgv(kind, depth)
+	if err != nil {
+		return ccprofile.StructuralProbe{}, err
+	}
+	argv = p.canonicalizeKbuildProbeArgv(argv)
+	for _, arg := range argv {
+		if containsMakeReference(arg) {
+			return ccprofile.StructuralProbe{}, fmt.Errorf(
+				"%s structural probe argument contains unresolved Make syntax: %q",
+				kind,
+				arg,
+			)
+		}
+	}
+	probe := ccprofile.StructuralProbe{
+		Kind:       kind,
+		Language:   language,
+		PrefixArgv: prefixArgv,
+		Argv:       argv,
+	}
+	probe.ID = ccprofile.StructuralProbeID(probe)
+	return probe, nil
+}
+
+func (p *kbuildParser) kbuildProbePrefixArgv(kind string, depth int) ([]string, error) {
+	var prefix []string
+	varNames := []string{}
+	switch kind {
+	case "cc-option", "cc-option-yn", "cc-disable-warning":
+		prefix = append(prefix, "-Werror")
+		varNames = append(varNames, "KBUILD_CPPFLAGS")
+		if _, ok := p.lookupVariable("CC_OPTION_CFLAGS"); ok {
+			varNames = append(varNames, "CC_OPTION_CFLAGS")
+		} else {
+			varNames = append(varNames, "KBUILD_CFLAGS")
+		}
+	case "as-option":
+		prefix = append(prefix, "-Werror")
+		varNames = append(varNames, "KBUILD_CPPFLAGS", "KBUILD_AFLAGS")
+	case "ld-option":
+		varNames = append(varNames, "KBUILD_LDFLAGS")
+	}
+	for _, name := range varNames {
+		value, ok, err := p.expandVariable(name, "$("+name+")", depth)
+		if err != nil {
+			return nil, fmt.Errorf("expand %s for %s structural probe: %w", name, kind, err)
+		}
+		if !ok || strings.TrimSpace(value) == "" {
+			continue
+		}
+		value, err = removeUnresolvedKbuildReferences(value)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalize %s for %s structural probe: %w", name, kind, err)
+		}
+		prefix = append(prefix, kbuildFields(value)...)
+	}
+	return p.canonicalizeKbuildProbeArgv(prefix), nil
+}
+
+func removeUnresolvedKbuildReferences(value string) (string, error) {
+	var out strings.Builder
+	for index := 0; index < len(value); {
+		if index+1 < len(value) && value[index] == '$' &&
+			(value[index+1] == '(' || value[index+1] == '{') {
+			end, err := matchingKbuildReference(value, index+1)
+			if err != nil {
+				return "", err
+			}
+			index = end + 1
+			continue
+		}
+		out.WriteByte(value[index])
+		index++
+	}
+	return out.String(), nil
+}
+
+func (p *kbuildParser) canonicalizeKbuildProbeArgv(argv []string) []string {
+	canonical := make([]string, len(argv))
+	for index, arg := range argv {
+		arg = normalizeKbuildPathVariable("srctree", arg)
+		for _, replacement := range p.probePaths {
+			arg = strings.ReplaceAll(arg, replacement.path, replacement.token)
+		}
+		canonical[index] = arg
+	}
+	return canonical
 }
 
 func linuxLLVMProbeSupportsOption(option string) bool {
@@ -1496,8 +1929,8 @@ func (p *kbuildParser) evalCall(args []string, original string, depth int) (stri
 		callArgs = append(callArgs, expanded)
 	}
 	srcarch, _ := p.lookupRawVar("SRCARCH")
-	if value, ok := kbuildKnownCall(name, callArgs, original, srcarch); ok {
-		return value, nil
+	if value, ok, err := p.kbuildKnownCall(name, callArgs, original, srcarch, depth); ok {
+		return value, err
 	}
 	body, ok := p.lookupRawVar(name)
 	if !ok || name == "" {
@@ -1897,6 +2330,9 @@ func (p *kbuildDirectoryTreeParser) parsePath(path, objectDir string, gate Kbuil
 			RootDir:         p.rootDir,
 			Variables:       p.opts.Variables,
 			MaxIncludeDepth: p.opts.MaxIncludeDepth,
+			CCProfile:       p.opts.CCProfile,
+			ProbeRecorder:   p.opts.ProbeRecorder,
+			ccProbes:        p.opts.ccProbes,
 		}, variableOverrides)
 		if err != nil {
 			return nil, err
@@ -2013,6 +2449,9 @@ func (p *kbuildDirectoryTreeParser) parseRootMakefile(path string) (*KbuildFile,
 		RootDir:         p.rootDir,
 		Variables:       p.opts.Variables,
 		MaxIncludeDepth: p.opts.MaxIncludeDepth,
+		CCProfile:       p.opts.CCProfile,
+		ProbeRecorder:   p.opts.ProbeRecorder,
+		ccProbes:        p.opts.ccProbes,
 	}, variableOverrides)
 	if err != nil {
 		return nil, err

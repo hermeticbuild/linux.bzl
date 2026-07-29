@@ -41,17 +41,16 @@ linux_source_repository(
     version = "6.18.39",
 )
 
-linux_image = use_repo_rule(
-    "@linux.bzl//:linux.bzl",
-    "linux_image",
-)
-
-linux_image(
+linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
+linux_images.image(
     name = "example_kernel",
+    arch = "x86_64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.json",
     config = "//kernel:x86_64.config",
     platform = "@llvm//platforms:linux_x86_64",
     source = "@linux_6_18_39//:Kconfig",
 )
+use_repo(linux_images, "example_kernel")
 ```
 
 The `bazel_dep` coordinates apply once `0.1.0` is published. When developing
@@ -81,9 +80,9 @@ CONFIG_KERNEL_GZIP=y
 ```
 
 The source rule knows the pinned URL and integrity for maintained catalog
-versions. The kernel rule derives the architecture from the supported target
-platform, resolves the config fragment through Kconfig, and verifies that its
-architecture selection agrees.
+versions. The image extension resolves the config fragment through Kconfig and
+verifies that its architecture selection, checked-in compiler capability
+profile, and declared architecture agree.
 
 Build the boot image:
 
@@ -103,19 +102,23 @@ per-object Bazel graph.
 
 ## Public API
 
-Every public symbol is loaded directly from the root `linux.bzl`. The source
-and image repository rules are intended for the root module: kernel source and
-product configs are application choices, not transitive dependency resolution.
+Public build rules and providers are loaded from the root `linux.bzl`.
+Configured image repositories are declared through the `linux_images` module
+extension in `extensions.bzl`. Source and image declarations are intended for
+the root module: kernel source and product configs are application choices, not
+transitive dependency resolution.
 
-Because the module repository and its public file have the same name, Starlark
-outside `MODULE.bazel` can use Bazel's shorthand label:
+Because the module repository and its public file have the same name, BUILD
+files can use Bazel's shorthand label:
 
 ```starlark
-load("@linux.bzl", "linux_image")
+load("@linux.bzl", "initramfs", "linux_module")
 ```
 
-Inside `MODULE.bazel`, use the `use_repo_rule("@linux.bzl//:linux.bzl", ...)`
-form shown above.
+Inside `MODULE.bazel`, use
+`use_repo_rule("@linux.bzl//:linux.bzl", "linux_source_repository")` for source
+archives and `use_extension("@linux.bzl//:extensions.bzl", "linux_images")`
+for configured images, as shown above.
 
 `linux_source_repository` has this public surface:
 
@@ -129,7 +132,8 @@ form shown above.
 | `patches` | Deterministic patch files |
 | `patch_strip` | Strip count for `patches` |
 
-`linux_image` is the kernel-graph repository rule and has this public surface:
+`linux_images.image` declares a configured kernel image with this public
+surface:
 
 | Attribute | Meaning |
 | --- | --- |
@@ -137,22 +141,31 @@ form shown above.
 | `source` | Root `Kconfig` from `linux_source_repository` |
 | `config` | Base Kconfig fragment |
 | `config_mode` | Kconfig baseline: `default` or `allnoconfig` |
-| `platform` | Hermetic LLVM Linux target platform |
-| `overlays` | Named config fragments |
+| `arch` | Canonical Linux architecture: `x86_64` or `aarch64` |
+| `cc_profile` | Checked-in compiler capability profile matching `arch`; maintained profiles describe Hermetic LLVM 22.1.8 |
+| `platform` | Target platform applied at the public kernel gateway |
 
-There is intentionally no `arch` attribute. `platform` accepts exactly the
-Hermetic LLVM `linux_x86_64`, `linux_aarch64`, or `linux_arm64` platform
-targets. With the default module repository name these are under
-`@llvm//platforms`; a consumer repository mapping may give `@llvm` a different
-apparent name. Architecture is derived from the canonical target, and the
-config must select the same architecture. There are also no compiler paths,
-host probe overrides, image-format switches, or signing keys in the public API.
+`linux_images.overlay` adds a named config fragment to an image:
+
+| Attribute | Meaning |
+| --- | --- |
+| `image` | Name of a `linux_images.image` declaration |
+| `name` | Stable variant name used below `variants/` |
+| `config` | Overlay Kconfig fragment |
+
+Import every declared facade repository explicitly with `use_repo`. `arch`,
+`cc_profile`, and `platform` are separate, mandatory inputs. Repository
+generation validates the profile schema and architecture alongside the Kconfig
+selection. The active compile path requires the registered Hermetic LLVM 22.1.8
+Clang toolchain matching the maintained profile. Compiler paths, host probe
+overrides, image-format switches, and signing keys are not part of the public
+API.
 
 ### Initramfs
 
 `initramfs` constructs a deterministic, root-owned `newc` archive. It is a
-normal build rule, independent of `linux_image`, so the same archive can be
-paired with any compatible kernel or VM rule:
+normal build rule, independent of configured image repositories, so the same
+archive can be paired with any compatible kernel or VM rule:
 
 ```starlark
 load("@linux.bzl", "initramfs")
@@ -182,7 +195,7 @@ are fixed to reproducible values.
 
 ### Rust-for-Linux modules
 
-`linux_module(name, kernel, srcs, crate_root = None, deps = [])` builds one
+`linux_module(name, module_sdk, srcs, crate_root = None, deps = [])` builds one
 out-of-tree Rust-for-Linux loadable module. It is a normal BUILD rule loaded
 from the same root entry point.
 
@@ -224,14 +237,14 @@ load("@linux.bzl", "linux_module")
 
 linux_module(
     name = "hello",
-    kernel = "@example_kernel//:kernel",
+    module_sdk = "@example_kernel//:module_sdk",
     srcs = ["hello.rs"],
 )
 ```
 
-The target's default output is `hello.ko`. `kernel` identifies the configured
-kernel and supplies its generated headers, Rust SDK, symbol versions, and
-module linker inputs. The rule follows that kernel's target platform, so there
+The target's default output is `hello.ko`. `module_sdk` supplies the configured
+kernel's generated headers, Rust SDK, symbol versions, and module linker
+inputs. The rule follows that SDK's target platform, so there
 is no separate architecture attribute. Set `crate_root` when `srcs` does not
 make the crate root unambiguous. `deps` accepts other `linux_module` targets
 built against the same configured kernel; cross-kernel dependencies are
@@ -273,17 +286,17 @@ cannot cache or schedule the individual compile steps.
 `linux.bzl` instead:
 
 - evaluates the relevant Kconfig and Kbuild language without invoking `make`;
-- emits a Bazel target for each supported generated file, object, archive, and
-  final image step;
+- declares one Bazel compile action for each object while grouping their
+  analysis ownership;
 - obtains compilers and binary utilities from registered Bazel toolchains;
 - declares source, generated-header, tool, and response-file inputs explicitly;
   and
 - lets Bazel schedule and cache compilation at object granularity.
 
-Repository generation resolves Kconfig with a deterministic probe profile for
-Hermetic LLVM 22.1.8. The kernel repository requires that exact profile, rather
-than treating module `llvm` 0.8.14 as a minimum version, and the transitioned
-graph rejects a non-Clang C/C++ toolchain.
+Each image declaration names an explicit, checked-in compiler capability
+profile. The released generator resolves Kconfig against its pinned Hermetic
+LLVM probe values and validates that the declared profile has the requested
+architecture. Repository evaluation does not read ambient host compilers.
 
 ## Supported configurations
 
@@ -292,7 +305,7 @@ graph rejects a non-Clang C/C++ toolchain.
 | Catalog releases | 6.12.96 and 6.18.39 |
 | Target architectures | x86_64 and aarch64 |
 | Repository evaluation | Pinned generator archives for Linux, macOS, and Windows on amd64 and arm64 |
-| Build toolchain | Hermetic LLVM 22.1.8 through module `llvm` 0.8.14 |
+| Build toolchain | Hermetic LLVM 22.1.8 through module `llvm` 0.8.14, matching the declared maintained profile |
 | Images | x86 `bzImage`, arm64 `Image`, and `vmlinux` |
 | Config variants | Base fragment plus named overlay fragments |
 | Initramfs | Deterministic root-owned `newc` archives |
@@ -304,8 +317,8 @@ graph rejects a non-Clang C/C++ toolchain.
 The two LTS lines are the maintained compatibility catalog. Other
 integrity-pinned Linux 6.x releases may work, but are experimental until added
 to that catalog and its release checks. The repository generator is published
-for each host listed above; kernel compile actions still target the registered
-Linux Hermetic LLVM toolchain.
+for each host listed above; kernel compile actions target the registered
+toolchain selected for the image's platform.
 
 The public kernel contract includes resolved configs, boot images, `vmlinux`,
 `System.map`, kernel release metadata, configured in-tree modules, and their
@@ -368,8 +381,8 @@ and license material, remains available in the repository.
 The base input is a Kconfig fragment. It must select exactly one supported
 architecture, for example `CONFIG_X86_64=y` or `CONFIG_ARM64=y`. Repository
 generation applies Kconfig defaults, dependencies, selects, and implies using
-the pinned LLVM probe profile. An absent symbol follows Kconfig semantics; use
-`# CONFIG_NAME is not set` for a deliberate unset.
+the declared compiler capability profile. An absent symbol follows Kconfig
+semantics; use `# CONFIG_NAME is not set` for a deliberate unset.
 
 Named overlays contain only deliberate assignments and unsets:
 
@@ -378,18 +391,24 @@ CONFIG_DEBUG_KERNEL=y
 # CONFIG_RANDOMIZE_BASE is not set
 ```
 
-Declare them on the same kernel graph repository:
+Declare them on the same image extension:
 
 ```starlark
-linux_image(
+linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
+linux_images.image(
     name = "example_kernel",
+    arch = "x86_64",
+    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.json",
     config = "//kernel:x86_64.config",
-    overlays = {
-        "debug": "//kernel:debug.config",
-    },
     platform = "@llvm//platforms:linux_x86_64",
     source = "@linux_6_18_39//:Kconfig",
 )
+linux_images.overlay(
+    name = "debug",
+    config = "//kernel:debug.config",
+    image = "example_kernel",
+)
+use_repo(linux_images, "example_kernel")
 ```
 
 Each overlay is merged onto the base fragment and resolved independently.
@@ -422,6 +441,7 @@ Every base and variant package exposes the same projection labels:
 | `:modules_order` | Deterministic Kbuild module load order |
 | `:modules_builtin` | Deterministic built-in module inventory |
 | `:modules_builtin_modinfo` | Deterministic built-in module metadata |
+| `:module_sdk` | Generated headers, Rust SDK, symbol versions, and linker inputs for out-of-tree modules |
 
 The `:kernel` target's `DefaultInfo` contains only the boot image, so it can be
 used directly by packaging and VM rules without selecting an output group.
@@ -452,11 +472,18 @@ system_map
 
 ## Toolchains and hermeticity
 
-`platform` is mandatory on every kernel repository. The initial API accepts the
-canonical Hermetic LLVM Linux x86_64 and aarch64/arm64 platforms and applies
-that platform once at the public `:kernel` gateway. The configured rules
-consume the standard rules_cc toolchain interface, but other toolchain
-implementations are not part of the supported contract yet.
+`arch`, `cc_profile`, and `platform` are mandatory on every
+`linux_images.image` tag. The extension applies the platform once at the
+public `:kernel` gateway. Configured compile rules consume the standard
+rules_cc toolchain interface and currently require the registered Hermetic LLVM
+22.1.8 Clang toolchain.
+
+The checked-in `@linux.bzl//profiles:llvm_22_1_8_x86_64.json` and
+`@linux.bzl//profiles:llvm_22_1_8_aarch64.json` profiles match the Hermetic
+LLVM 22.1.8 toolchains supplied by module `llvm` 0.8.14. Profiles for other
+toolchains are not part of the supported contract until the lazy graph
+generator that consumes their analysis identity, Kconfig identity, and
+structural probe results is released and activated.
 
 Repository generation downloads the platform-specific, integrity-pinned
 Kconfig graph generator selected by the rules release's checked-in table. The

@@ -1,0 +1,16 @@
+module(
+    name = "linux_image_tagging_dependency",
+    version = "1.0.0",
+)
+
+bazel_dep(name = "linux.bzl", version = "0.1.0")
+
+linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
+linux_images.image(
+    name = "dependency_kernel",
+    arch = "x86_64",
+    cc_profile = "//:cc_profile.json",
+    config = "//:base.config",
+    platform = "//:platform",
+    source = "//:Kconfig",
+)

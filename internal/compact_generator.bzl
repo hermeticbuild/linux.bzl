@@ -30,6 +30,18 @@ LinuxCompactInfo = provider(
     },
 )
 
+LinuxCompactV7Info = provider(
+    doc = "Generated compact-v7 lazy action-graph metadata.",
+    fields = {
+        "compile_environment_abi": "Toolchain/action ABI bound into compile environment content IDs.",
+        "metadata": "Validated compact-v7 metadata JSON artifact.",
+        "protocol": "Compact metadata protocol identifier.",
+        "toolchain_profile_id": "Optional asserted toolchain profile identity referenced by the metadata.",
+    },
+)
+
+_COMPACT_METADATA_PROTOCOL_V7 = "compact-v7-lazy-action-graph"
+
 def _linux_probe_config_impl(ctx):
     return [LinuxProbeInfo(
         allow_shell = ctx.attr.allow_shell,
@@ -278,6 +290,171 @@ _linux_compact_outputs = rule(
             executable = True,
         ),
     },
+)
+
+def _linux_compact_v7_metadata_impl(ctx):
+    metadata = ctx.actions.declare_file(ctx.label.name + ".metadata.json")
+
+    configs = []
+    config_names = {}
+    inputs = [ctx.file.root, ctx.file.kbuild, ctx.file.cc_profile] + ctx.files.srcs
+    for target, name in ctx.attr.configs.items():
+        if not name:
+            fail("compact config names must be non-empty")
+        if name in config_names:
+            fail("duplicate compact config name %r" % name)
+        config_names[name] = True
+        file = _config_file(target, "configs")
+        configs.append((name, file))
+        inputs.append(file)
+    if not configs:
+        fail("configs must contain at least one compact config")
+    if not ctx.attr.compile_environment_abi:
+        fail("compile_environment_abi must be non-empty")
+    header_config_names = sorted(ctx.attr.generated_headers_by_config.keys())
+    if header_config_names != sorted(config_names.keys()):
+        fail(
+            "generated_headers_by_config keys %s do not match compact config names %s" %
+            (header_config_names, sorted(config_names.keys())),
+        )
+    for config_name, label in ctx.attr.generated_headers_by_config.items():
+        if not label:
+            fail("generated_headers_by_config[%r] must be non-empty" % config_name)
+
+    args = ctx.actions.args()
+    args.add("-compact_protocol", _COMPACT_METADATA_PROTOCOL_V7)
+    args.add("-cc_profile", ctx.file.cc_profile)
+    if ctx.attr.toolchain_profile_id:
+        args.add("-toolchain_profile_id", ctx.attr.toolchain_profile_id)
+    args.add("-compile_environment_abi", ctx.attr.compile_environment_abi)
+    for config_name, label in sorted(ctx.attr.generated_headers_by_config.items()):
+        args.add("-generated_headers_for_config", "%s=%s" % (config_name, label))
+    args.add("-root", ctx.file.root)
+    args.add("-kbuild", ctx.file.kbuild)
+    args.add("-compact_metadata_out", metadata)
+    if ctx.attr.kbuild_tree:
+        args.add("-compact_kbuild_tree")
+    args.add("-config_mode", ctx.attr.config_mode)
+    args.add("-kernel_version", ctx.attr.kernel_version)
+
+    env = dict(ctx.attr.env)
+    vars = dict(ctx.attr.vars)
+    directory_vars = {}
+    if "srctree" not in vars:
+        vars["srctree"] = ""
+        directory_vars["srctree"] = directory_anchor(ctx.file.root)
+
+    probe = _probe_settings(ctx, env)
+    _add_probe_args(args, probe.allow_shell, probe.model, probe.values)
+    _add_var_args(args, vars, directory_vars)
+    for key, value in sorted(env.items()):
+        args.add("-env", "%s=%s" % (key, value))
+
+    for name, file in sorted(configs):
+        args.add("-config")
+        args.add(file, format = name + "=%s")
+
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._kconfig_parse,
+        inputs = depset(inputs),
+        outputs = [metadata],
+        arguments = [args],
+        mnemonic = "LinuxCompactV7Kconfig",
+        progress_message = "Generating compact-v7 Linux metadata for %{label}",
+    )
+
+    return [
+        DefaultInfo(files = depset([metadata])),
+        LinuxCompactV7Info(
+            compile_environment_abi = ctx.attr.compile_environment_abi,
+            metadata = metadata,
+            protocol = _COMPACT_METADATA_PROTOCOL_V7,
+            toolchain_profile_id = ctx.attr.toolchain_profile_id,
+        ),
+        OutputGroupInfo(metadata = depset([metadata])),
+    ]
+
+linux_compact_v7_metadata = rule(
+    implementation = _linux_compact_v7_metadata_impl,
+    attrs = {
+        "allow_shell": attr.bool(
+            doc = "Allow $(shell,...) expansion while parsing Kconfig files.",
+        ),
+        "config_mode": attr.string(
+            default = "default",
+            doc = "Config resolver mode passed to kconfig_parse. Supported: default, allnoconfig.",
+            values = [
+                "default",
+                "allnoconfig",
+            ],
+        ),
+        "compile_environment_abi": attr.string(
+            mandatory = True,
+            doc = "Toolchain and action ABI identity bound into content-addressed compile environments.",
+        ),
+        "cc_profile": attr.label(
+            allow_single_file = [".json"],
+            mandatory = True,
+            doc = "Checked-in CC capability profile used to derive and verify the compact-v7 toolchain identity.",
+        ),
+        "configs": attr.label_keyed_string_dict(
+            allow_files = True,
+            mandatory = True,
+            doc = "Map of .config file labels to compact config names.",
+        ),
+        "env": attr.string_dict(
+            doc = "Hermetic Kconfig preprocessor environment values.",
+        ),
+        "generated_headers_by_config": attr.string_dict(
+            mandatory = True,
+            doc = "Map of compact config names to generated-header labels.",
+        ),
+        "kbuild": attr.label(
+            allow_single_file = True,
+            mandatory = True,
+            doc = "Kbuild/Makefile input for compact object metadata.",
+        ),
+        "kbuild_tree": attr.bool(
+            doc = "Follow Kbuild directory descent from the kbuild root when generating compact metadata.",
+        ),
+        "kernel_version": attr.string(
+            default = "6.18.2",
+            doc = "Base kernel release used when materializing indexed config payloads.",
+        ),
+        "probe_config": attr.label(
+            providers = [LinuxProbeInfo],
+            doc = "Optional provider carrying Linux probe values derived from Bazel configuration/toolchain wrapper targets.",
+        ),
+        "probe_model": attr.string(
+            default = "linux_llvm",
+            doc = "Hermetic Linux Kconfig probe model used when allow_shell is set. Set empty to use only the explicit shell environment.",
+        ),
+        "probe_values": attr.string_dict(
+            doc = "Overrides for the selected Linux Kconfig probe model, for example cc_version or pahole_version.",
+        ),
+        "root": attr.label(
+            allow_single_file = True,
+            mandatory = True,
+            doc = "Root Kconfig input.",
+        ),
+        "srcs": attr.label_list(
+            allow_files = True,
+            doc = "Additional Kconfig source files read through source statements.",
+        ),
+        "toolchain_profile_id": attr.string(
+            doc = "Optional expected canonical CC profile digest; kconfig_parse derives the identity from cc_profile.",
+        ),
+        "vars": attr.string_dict(
+            doc = "Kconfig preprocessor variables.",
+        ),
+        "_kconfig_parse": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/kconfig_parse:kconfig_parse"),
+            executable = True,
+        ),
+    },
+    doc = "Generates validated compact-v7 lazy action-graph metadata without a legacy BUILD file.",
 )
 
 def _linux_parser_validation_impl(ctx):

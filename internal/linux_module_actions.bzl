@@ -678,10 +678,7 @@ def _run_modpost(ctx, kernel, modpost, module_outputs):
         modules_order = modules_order,
     )
 
-def _prepare(ctx, helpers, kernel):
-    modules = _module_map(kernel.module_objects)
-    if modules and kernel.config.config_flags.get("CONFIG_MODULES") != "y":
-        fail("%s has configured module objects but CONFIG_MODULES is disabled" % ctx.label)
+def _prepare_vmlinux(ctx, helpers, kernel):
     modules_enabled = kernel.config.config_flags.get("CONFIG_MODULES") == "y"
     if not modules_enabled and not _version_at_least(kernel.version, 6, 18):
         return None
@@ -689,19 +686,59 @@ def _prepare(ctx, helpers, kernel):
     target = _target_context(ctx, helpers)
     source_files = _source_files(kernel)
     modpost = _build_modpost(ctx, helpers, kernel, target, source_files)
-    module_lds = _module_linker_script(ctx, helpers, kernel, target, source_files) if modules_enabled else None
-    module_common = _module_common(ctx, helpers, kernel, target, source_files) if modules_enabled else None
-    module_outputs = _process_module_roots(ctx, kernel, modules)
-    outputs = _run_modpost(ctx, kernel, modpost, module_outputs)
+    outputs = _run_modpost(
+        ctx,
+        struct(
+            config = kernel.config,
+            module_objects = [],
+            vmlinux_object = kernel.vmlinux_object,
+        ),
+        modpost,
+        {},
+    )
     return struct(
         export_source = outputs.export_source,
+        module_symvers = outputs.module_symvers,
+        modpost = modpost,
+    )
+
+def _prepare_modules(ctx, helpers, kernel):
+    modules = _module_map(kernel.module_objects)
+    modules_enabled = kernel.config.config_flags.get("CONFIG_MODULES") == "y"
+    if modules and not modules_enabled:
+        fail("%s has configured module objects but CONFIG_MODULES is disabled" % ctx.label)
+    if not modules_enabled:
+        return None
+    if kernel.modpost == None or kernel.module_symvers == None:
+        fail("%s requires core vmlinux modpost outputs" % ctx.label)
+
+    target = _target_context(ctx, helpers)
+    source_files = _source_files(kernel)
+    module_lds = _module_linker_script(ctx, helpers, kernel, target, source_files)
+    module_common = _module_common(ctx, helpers, kernel, target, source_files)
+    if not modules:
+        modules_order = ctx.actions.declare_file(ctx.label.name + ".modpost/modules.order")
+        ctx.actions.write(modules_order, "")
+        return struct(
+            module_common = module_common,
+            module_lds = module_lds,
+            module_outputs = {},
+            module_sources = {},
+            module_symvers = kernel.module_symvers,
+            modules_order = modules_order,
+            modpost = kernel.modpost,
+        )
+
+    module_outputs = _process_module_roots(ctx, kernel, modules)
+    outputs = _run_modpost(ctx, kernel, kernel.modpost, module_outputs)
+    return struct(
         module_common = module_common,
         module_lds = module_lds,
         module_outputs = module_outputs,
         module_sources = outputs.module_sources,
         module_symvers = outputs.module_symvers,
         modules_order = outputs.modules_order,
-        modpost = modpost,
+        modpost = kernel.modpost,
     )
 
 linux_module_actions = struct(
@@ -712,7 +749,8 @@ linux_module_actions = struct(
     module_root_needs_objtool = _module_root_needs_objtool,
     objtool_args = _objtool_args,
     pahole_flags = _pahole_flags,
-    prepare = _prepare,
+    prepare_modules = _prepare_modules,
+    prepare_vmlinux = _prepare_vmlinux,
     process_objtool = _process_objtool,
     target_c_flags = _target_c_flags,
     add_target_c_flags = _add_target_c_flags,

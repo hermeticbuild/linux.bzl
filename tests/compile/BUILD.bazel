@@ -11,6 +11,13 @@ load(":source_include_closure_test.bzl", "source_include_closure_test")
 
 package(default_visibility = ["//:__subpackages__"])
 
+exports_files([
+    "source/arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
+    "source/cross_tree/second.c",
+    "source/cross_tree/unrelated.inc",
+    "source/lib/fdt_ro.c",
+])
+
 _COMPILE_ENVIRONMENT_ID = "1111111111111111111111111111111111111111111111111111111111111111"
 
 _CONFIG_PAYLOAD_ID = "2222222222222222222222222222222222222222222222222222222222222222"

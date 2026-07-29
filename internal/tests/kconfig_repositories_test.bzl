@@ -39,6 +39,70 @@ def _generator_variable_args_test_impl(ctx):
 
 generator_variable_args_test = unittest.make(_generator_variable_args_test_impl)
 
+def _generator_probe_value_args_test_impl(ctx):
+    env = unittest.begin(ctx)
+    values = {
+        "bindgen_version": "bindgen 0.72.1",
+        "cc_builtin_macro.__SIZEOF_INT128__": "16",
+        "cc_version": "220108",
+        "cc_version_text": "clang version 22.1.8",
+        "ld_version": "220108",
+        "rustc_version": "109700",
+    }
+    asserts.equals(
+        env,
+        [
+            "-linux_probe_value",
+            "bindgen_version=bindgen 0.72.1",
+            "-linux_probe_value",
+            "rustc_version=109700",
+        ],
+        repositories_test_helpers.generator_probe_value_args(
+            values,
+            use_cc_profile = True,
+        ),
+    )
+    unprofiled = repositories_test_helpers.generator_probe_value_args(
+        values,
+        use_cc_profile = False,
+    )
+    asserts.true(env, "cc_version=220108" in unprofiled)
+    asserts.true(env, "cc_builtin_macro.__SIZEOF_INT128__=16" in unprofiled)
+    return unittest.end(env)
+
+generator_probe_value_args_test = unittest.make(_generator_probe_value_args_test_impl)
+
+def _compact_v7_repository_contract_test_impl(ctx):
+    env = unittest.begin(ctx)
+    asserts.equals(
+        env,
+        "linux.bzl/compact-v7/cc-profile-v1/x86/x86",
+        repositories_test_helpers.compact_v7_compile_environment_abi(
+            struct(arch = "x86", srcarch = "x86"),
+        ),
+    )
+    targets = repositories_test_helpers.compact_v7_config_targets(
+        {
+            "debug": struct(
+                image = "_config_0_image",
+                modules = "_config_0_modules",
+                sources = "_config_0_sources",
+            ),
+        },
+        "graph",
+    )
+    asserts.equals(env, "//graph:_config_0_image", targets["debug"].image)
+    asserts.equals(env, "//graph:_config_0_modules", targets["debug"].modules)
+    asserts.equals(env, "//graph:_config_0_sources", targets["debug"].sources)
+    asserts.equals(
+        env,
+        "compact-v7-lazy-action-graph",
+        repositories_test_helpers.generator_protocol_v7,
+    )
+    return unittest.end(env)
+
+compact_v7_repository_contract_test = unittest.make(_compact_v7_repository_contract_test_impl)
+
 def _graph_configs_args_test_impl(ctx):
     env = unittest.begin(ctx)
     asserts.equals(
@@ -457,6 +521,7 @@ def _core_config_aliases_test_impl(ctx):
         "header_split",
         "lz4",
         "module_order",
+        "module_roots",
         "noncompression",
         "object_order",
         "rust_split",
@@ -468,7 +533,9 @@ def _core_config_aliases_test_impl(ctx):
                 "object_targets": (
                     ["b", "a"] if name == "object_order" else ["a", "c"] if name == "debug" else ["a", "b"]
                 ),
-                "module_object_targets": ["n", "m"] if name == "module_order" else ["m", "n"],
+                "module_object_targets": (
+                    ["n", "m"] if name == "module_order" else ["m", "o"] if name == "module_roots" else ["m", "n"]
+                ),
             }
             for name in names
         ],
@@ -506,7 +573,8 @@ def _core_config_aliases_test_impl(ctx):
             "debug": "debug",
             "header_split": "header_split",
             "lz4": "x86_64",
-            "module_order": "module_order",
+            "module_order": "x86_64",
+            "module_roots": "x86_64",
             "noncompression": "noncompression",
             "object_order": "object_order",
             "rust_split": "rust_split",
@@ -533,11 +601,17 @@ def _core_config_aliases_test_impl(ctx):
             "static": "1111111111111111111111111111111111111111111111111111111111111111",
         },
         base_rust_enabled = False,
+        cc_profile = "@@linux_profiles//:x86_64.json",
         config_mode = "default",
         graph_image = "//graph:x86_64_image",
+        graph_modules = "//partitions:x86_64_modules",
+        graph_sources = "//sources:x86_64_core",
         variant_configs = {"lz4": "//configs:lz4"},
         variant_core_configs = {"lz4": "x86_64"},
         variant_graph_images = {"lz4": "//graph:lz4_image"},
+        variant_graph_modules = {"lz4": "//partitions:lz4_modules"},
+        variant_graph_sources = {"lz4": "//sources:lz4_core"},
+        variant_module_sdk_configs = {"lz4": "x86_64"},
         variant_header_family_dependencies = {
             "lz4": {
                 "asm_offsets": {
@@ -579,6 +653,195 @@ def _core_config_aliases_test_impl(ctx):
     return unittest.end(env)
 
 core_config_aliases_test = unittest.make(_core_config_aliases_test_impl)
+
+def _module_sdk_aliases_test_impl(ctx):
+    env = unittest.begin(ctx)
+    base_modules = ["module_a", "module_b"]
+    metadata = {
+        "configs": [
+            {
+                "module_object_targets": (
+                    ["module_b", "module_a"] if name == "module_order" else ["module_a", "module_c"] if name == "module_roots" else base_modules
+                ),
+                "name": name,
+            }
+            for name in [
+                "x86_64",
+                "different_core",
+                "lz4",
+                "module_order",
+                "module_roots",
+                "same_modules",
+            ]
+        ],
+    }
+    aliases = repositories_test_helpers.module_sdk_aliases(
+        metadata,
+        {
+            "x86_64": "x86_64",
+            "different_core": "different_core",
+            "lz4": "x86_64",
+            "module_order": "x86_64",
+            "module_roots": "x86_64",
+            "same_modules": "x86_64",
+        },
+        "x86_64",
+    )
+    asserts.equals(
+        env,
+        {
+            "x86_64": "x86_64",
+            "different_core": "different_core",
+            "lz4": "x86_64",
+            "module_order": "module_order",
+            "module_roots": "module_roots",
+            "same_modules": "x86_64",
+        },
+        aliases,
+    )
+    return unittest.end(env)
+
+module_sdk_aliases_test = unittest.make(_module_sdk_aliases_test_impl)
+
+def _content_partition_build_test_impl(ctx):
+    env = unittest.begin(ctx)
+    generated = repositories_test_helpers.content_partition_build(
+        {
+            "configs": [
+                {
+                    "module_object_targets": ["module_a"],
+                    "name": "x86_64",
+                    "object_targets": ["builtin_a", "builtin_b"],
+                },
+                {
+                    "module_object_targets": ["module_a", "module_b"],
+                    "name": "module_overlay",
+                    "object_targets": ["builtin_a", "builtin_b"],
+                },
+                {
+                    "module_object_targets": ["module_a"],
+                    "name": "image_overlay",
+                    "object_targets": ["builtin_a", "builtin_c"],
+                },
+                {
+                    "module_object_targets": ["module_a"],
+                    "name": "identical",
+                    "object_targets": ["builtin_a", "builtin_b"],
+                },
+            ],
+        },
+        "x86_64",
+        "@@linux_bzl",
+    )
+
+    asserts.equals(env, 2, len(generated.split("\nlinux_compact_image(\n")) - 1)
+    asserts.equals(env, 2, len(generated.split("\nlinux_compact_modules(\n")) - 1)
+    asserts.false(env, "module_objects" in generated)
+    for fragment in [
+        'name = "module_overlay_image",\n    actual = ":x86_64_image"',
+        'name = "image_overlay_modules",\n    actual = ":x86_64_modules"',
+        'name = "identical_image",\n    actual = ":x86_64_image"',
+        'name = "identical_modules",\n    actual = ":x86_64_modules"',
+    ]:
+        asserts.true(
+            env,
+            fragment in generated,
+            "generated content partitions omitted %r:\n%s" % (fragment, generated),
+        )
+    return unittest.end(env)
+
+content_partition_build_test = unittest.make(_content_partition_build_test_impl)
+
+def _content_source_partition_build_test_impl(ctx):
+    env = unittest.begin(ctx)
+    generated = repositories_test_helpers.content_source_partition_build(
+        {
+            "compile_environments": [],
+            "configs": [
+                {
+                    "module_object_targets": ["module_a", "module_b"],
+                    "name": "x86_64",
+                    "object_targets": ["builtin"],
+                },
+                {
+                    "module_object_targets": ["module_b", "module_a"],
+                    "name": "lz4",
+                    "object_targets": ["builtin"],
+                },
+                {
+                    "module_object_targets": ["module_a", "module_b"],
+                    "name": "changed",
+                    "object_targets": ["builtin", "changed_builtin"],
+                },
+            ],
+            "generated_header_families": [],
+            "object_variants": [
+                {
+                    "deps": [],
+                    "members": [],
+                    "source_input_group": 1,
+                    "target": "builtin",
+                },
+                {
+                    "deps": [],
+                    "members": [],
+                    "source_input_group": 2,
+                    "target": "module_a",
+                },
+                {
+                    "deps": [],
+                    "members": [],
+                    "source_input_group": 2,
+                    "target": "module_b",
+                },
+                {
+                    "deps": [],
+                    "members": [],
+                    "source_input_group": 3,
+                    "target": "changed_builtin",
+                },
+            ],
+            "source_files": [
+                {"path": "core/base.c"},
+                {"path": "include/core.h"},
+                {"path": "drivers/module_only.c"},
+                {"path": "core/changed.c"},
+            ],
+            "source_input_groups": [
+                "1,2",
+                "3",
+                "4",
+            ],
+        },
+        "x86_64",
+        "@@linux_sources//",
+    )
+
+    asserts.equals(env, 2, len(generated.split("\nfilegroup(\n")) - 1)
+    asserts.equals(env, 1, len(generated.split("\nalias(\n")) - 1)
+    asserts.true(
+        env,
+        'name = "lz4_core",\n    actual = ":x86_64_core"' in generated,
+        "identical lz4 core sources did not alias the base:\n%s" % generated,
+    )
+    for path in [
+        "@@linux_sources//:core/base.c",
+        "@@linux_sources//:include/core.h",
+        "@@linux_sources//:core/changed.c",
+    ]:
+        asserts.true(
+            env,
+            path in generated,
+            "generated core source partitions omitted %r:\n%s" % (path, generated),
+        )
+    asserts.false(
+        env,
+        "drivers/module_only.c" in generated,
+        "generated core source partitions included a module-only source:\n%s" % generated,
+    )
+    return unittest.end(env)
+
+content_source_partition_build_test = unittest.make(_content_source_partition_build_test_impl)
 
 def _graph_arch_tool_args_test_impl(ctx):
     env = unittest.begin(ctx)

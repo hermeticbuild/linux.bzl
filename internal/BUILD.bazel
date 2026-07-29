@@ -1,1 +1,15 @@
 package(default_visibility = ["//:__subpackages__"])
+
+filegroup(
+    name = "linux_image_extension_integration_files",
+    srcs = [
+        "compact_v7_repository.bzl",
+        "config_validation.bzl",
+        "kconfig_tool_filename.bzl",
+        "kconfig_tool_releases.bzl",
+        "linux_image_extension.bzl",
+        "linux_image_repository.bzl",
+        "repository_utils.bzl",
+    ],
+    visibility = ["//internal/tests/linux_image_extension_integration:__pkg__"],
+)

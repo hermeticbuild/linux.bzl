@@ -33,6 +33,7 @@ type CompactConfig struct {
 	ObjectTargets       []string `json:"object_targets"`
 	ModuleObjectTargets []string `json:"module_object_targets,omitempty"`
 	imageTarget         string
+	supportSourceInputs []CompactSourceInput
 }
 
 type CompactSourceInput struct {
@@ -111,7 +112,8 @@ type CompactMetadataOptions struct {
 	KernelVersion         string
 	// Srcarch selects architecture include roots while scanning source files for
 	// CONFIG_* dependencies.
-	Srcarch string
+	Srcarch                    string
+	collectSupportSourceInputs bool
 }
 
 // CompactConfigGraph binds one resolved configuration to its Kbuild graph and
@@ -146,6 +148,7 @@ func (t *Tree) CompactMetadataBatchWithOptions(
 	seenConfigs := map[string]bool{}
 	seenImageTargets := map[string]string{}
 	sourceCache := newCompactSourceCache()
+	var rustProfile *RustProfile
 	for _, named := range configs {
 		if named.Name == "" {
 			return nil, fmt.Errorf("compact config name must not be empty")
@@ -174,6 +177,43 @@ func (t *Tree) CompactMetadataBatchWithOptions(
 		kb := graph.Kbuild
 		generatedHeadersLabel := graph.GeneratedHeadersLabel
 		scanner := newConfigSourceScannerWithCache(opts, sourceCache)
+		var supportSourceInputs []CompactSourceInput
+		if opts.collectSupportSourceInputs {
+			if configYes(resolved, "CONFIG_RUST") && rustProfile == nil {
+				rootMakefile, ok := scanner.absForTreePath("Makefile")
+				if !ok {
+					return nil, fmt.Errorf(
+						"derive support source inputs for config %q: source-tree Makefile does not exist",
+						named.Name,
+					)
+				}
+				rustArch := opts.Srcarch
+				if rustArch == "" {
+					rustArch = "x86"
+				}
+				rustProfile, err = GenerateRustProfile(filepath.Dir(rootMakefile), rustArch)
+				if err != nil {
+					return nil, fmt.Errorf(
+						"derive support source inputs for config %q: generate Rust profile: %w",
+						named.Name,
+						err,
+					)
+				}
+			}
+			supportSourceInputs, err = compactConfigSupportSourceInputs(
+				resolved,
+				opts,
+				scanner,
+				rustProfile,
+			)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"derive support source inputs for config %q: %w",
+					named.Name,
+					err,
+				)
+			}
+		}
 		fullConfigPayload := newCompactConfigPayload(compactFullConfigFragment(resolved))
 		configPayloads[fullConfigPayload.ID] = fullConfigPayload
 		configHeaderFamilies := compactGeneratedHeaderFamilySet{}
@@ -325,6 +365,7 @@ func (t *Tree) CompactMetadataBatchWithOptions(
 			ObjectTargets:       targets,
 			ModuleObjectTargets: moduleTargets,
 			imageTarget:         imageTarget,
+			supportSourceInputs: supportSourceInputs,
 		})
 	}
 
@@ -347,6 +388,131 @@ func (t *Tree) CompactMetadataBatchWithOptions(
 		return nil, err
 	}
 	return out, nil
+}
+
+// compactConfigSupportSourceInputs owns exact source closures shared by
+// config-level vmlinux and Rust SDK actions. Architecture boot-image generators
+// remain on their explicit legacy lookup inputs.
+func compactConfigSupportSourceInputs(
+	config *ResolvedConfig,
+	opts CompactMetadataOptions,
+	scanner *configSourceScanner,
+	rustProfile *RustProfile,
+) ([]CompactSourceInput, error) {
+	srcarch := opts.Srcarch
+	if srcarch == "" {
+		srcarch = "x86"
+	}
+	type actionSource struct {
+		path          string
+		assembly      bool
+		forcedSources []string
+		provided      []string
+		profile       sourceScanProfile
+	}
+	sources := []actionSource{{
+		path:          "arch/" + srcarch + "/kernel/vmlinux.lds.S",
+		assembly:      true,
+		forcedSources: []string{"include/linux/kconfig.h"},
+		profile:       sourceScanVmlinuxLinker,
+	}}
+	var directSources []string
+	if configYes(config, "CONFIG_RUST") {
+		if rustProfile == nil {
+			return nil, fmt.Errorf("CONFIG_RUST=y requires a generated Rust profile")
+		}
+		rustCForcedSources := []string{
+			"include/linux/compiler-version.h",
+			"include/linux/compiler_types.h",
+			"include/linux/kconfig.h",
+		}
+		for _, path := range []string{
+			rustProfile.Bindgen.BindingsHeader,
+			rustProfile.Bindgen.UAPIHeader,
+			rustProfile.Bindgen.HelpersSource,
+		} {
+			sources = append(sources, actionSource{
+				path:          path,
+				forcedSources: rustCForcedSources,
+				profile:       sourceScanRustBindgen,
+			})
+		}
+		for _, path := range []string{
+			rustProfile.Bindgen.HelpersSource,
+			rustProfile.Exports.Source,
+		} {
+			provided := []string(nil)
+			if path == rustProfile.Exports.Source {
+				for _, crate := range rustProfile.Exports.Crates {
+					provided = append(provided, "exports_"+crate+"_generated.h")
+				}
+			}
+			sources = append(sources, actionSource{
+				path:          path,
+				forcedSources: rustCForcedSources,
+				provided:      provided,
+				profile:       sourceScanRustKernelC,
+			})
+		}
+		for _, generated := range rustProfile.GeneratedAssembly {
+			expected := generated.Equals
+			if expected == "" {
+				expected = "y"
+			}
+			if !config.ShouldWrite(generated.Config) || config.Value(generated.Config) != expected {
+				continue
+			}
+			sources = append(sources, actionSource{
+				path:          generated.Source,
+				forcedSources: rustCForcedSources,
+				profile:       sourceScanRustKernelC,
+			})
+		}
+		directSources = append(directSources, rustProfile.Bindgen.Parameters)
+	}
+
+	var inputs []CompactSourceInput
+	for _, source := range sources {
+		closure, err := scanner.closureForSourceConfigInputsProfile(
+			source.path,
+			nil,
+			config,
+			source.assembly,
+			source.provided,
+			source.profile,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan support source %s: %w", source.path, err)
+		}
+		inputs = appendUniqueSourceInputs(inputs, closure.sourceInputs...)
+		for _, forcedSource := range source.forcedSources {
+			forcedClosure, err := scanner.closureForSourceConfigInputsProfile(
+				forcedSource,
+				nil,
+				config,
+				source.assembly,
+				nil,
+				source.profile,
+			)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"scan forced support source %s for %s: %w",
+					forcedSource,
+					source.path,
+					err,
+				)
+			}
+			inputs = appendUniqueSourceInputs(inputs, forcedClosure.sourceInputs...)
+		}
+	}
+	for _, path := range directSources {
+		input, err := scanner.inputForTreePath(path)
+		if err != nil {
+			return nil, fmt.Errorf("record direct support source %s: %w", path, err)
+		}
+		inputs = appendUniqueSourceInputs(inputs, input)
+	}
+	return inputs, nil
 }
 
 // The Rust-for-Linux support crates have a configuration-specific build graph
@@ -2490,14 +2656,11 @@ func (m *CompactMetadata) imageBuildFile(opts CompactBuildFileOptions) ([]byte, 
 		compactRuleLoadLabel(opts.RuleLoadLabel),
 		"linux_compact_delta_image",
 		"linux_compact_image",
+		"linux_compact_modules",
 	)
 	file.AddPackage(visibility)
-	emitBase := func(config CompactConfig) error {
+	emitDirect := func(config CompactConfig) error {
 		objectLabels, err := compactTargetLabels(config.ObjectTargets, variants, opts.ObjectLabelPackage)
-		if err != nil {
-			return err
-		}
-		moduleLabels, err := compactTargetLabels(config.ModuleObjectTargets, variants, opts.ObjectLabelPackage)
 		if err != nil {
 			return err
 		}
@@ -2506,23 +2669,34 @@ func (m *CompactMetadata) imageBuildFile(opts CompactBuildFileOptions) ([]byte, 
 			r.SetAttr("arch", opts.Arch)
 		}
 		r.SetAttr("objects", objectLabels)
+		r.SetAttr("tags", []string{"manual"})
+		return nil
+	}
+	moduleTarget := func(config CompactConfig) string {
+		return strings.TrimSuffix(config.imageTarget, "_image") + "_modules"
+	}
+	emitModules := func(config CompactConfig) error {
+		moduleLabels, err := compactTargetLabels(config.ModuleObjectTargets, variants, opts.ObjectLabelPackage)
+		if err != nil {
+			return err
+		}
+		r := file.AddRule("linux_compact_modules", moduleTarget(config))
 		if len(moduleLabels) != 0 {
-			r.SetAttr("module_objects", moduleLabels)
+			r.SetAttr("objects", moduleLabels)
 		}
 		r.SetAttr("tags", []string{"manual"})
 		return nil
 	}
-	if err := emitBase(base); err != nil {
+	if err := emitDirect(base); err != nil {
+		return nil, err
+	}
+	if err := emitModules(base); err != nil {
 		return nil, err
 	}
 
-	baseTargets := append(append([]string(nil), base.ObjectTargets...), base.ModuleObjectTargets...)
+	baseTargets := append([]string(nil), base.ObjectTargets...)
 	baseSet := compactTargetSet(baseTargets)
 	baseObjectIDs, err := compactContentIDs(base.ObjectTargets, variants)
-	if err != nil {
-		return nil, err
-	}
-	baseModuleIDs, err := compactContentIDs(base.ModuleObjectTargets, variants)
 	if err != nil {
 		return nil, err
 	}
@@ -2535,14 +2709,17 @@ func (m *CompactMetadata) imageBuildFile(opts CompactBuildFileOptions) ([]byte, 
 	sort.Strings(names)
 	for _, name := range names {
 		config := configs[name]
-		finalTargets := append(append([]string(nil), config.ObjectTargets...), config.ModuleObjectTargets...)
+		finalTargets := append([]string(nil), config.ObjectTargets...)
 		finalSet := compactTargetSet(finalTargets)
 		finalObjectIDs, err := compactContentIDs(config.ObjectTargets, variants)
 		if err != nil {
 			return nil, err
 		}
-		finalModuleIDs, err := compactContentIDs(config.ModuleObjectTargets, variants)
-		if err != nil {
+		if stringSlicesEqual(base.ModuleObjectTargets, config.ModuleObjectTargets) {
+			r := file.AddRule("alias", moduleTarget(config))
+			r.SetAttr("actual", ":"+moduleTarget(base))
+			r.SetAttr("tags", []string{"manual"})
+		} else if err := emitModules(config); err != nil {
 			return nil, err
 		}
 		addTargets := make([]string, 0)
@@ -2565,11 +2742,17 @@ func (m *CompactMetadata) imageBuildFile(opts CompactBuildFileOptions) ([]byte, 
 		sort.Strings(removeContentIDs)
 		if len(addTargets) == 0 &&
 			len(removeContentIDs) == 0 &&
-			stringSlicesEqual(baseObjectIDs, finalObjectIDs) &&
-			stringSlicesEqual(baseModuleIDs, finalModuleIDs) {
+			stringSlicesEqual(baseObjectIDs, finalObjectIDs) {
 			r := file.AddRule("alias", config.imageTarget)
 			r.SetAttr("actual", ":"+base.imageTarget)
 			r.SetAttr("tags", []string{"manual"})
+			continue
+		}
+		if len(removeContentIDs) != 0 ||
+			!compactOrderedSubset(baseObjectIDs, finalObjectIDs) {
+			if err := emitDirect(config); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		addLabels, err := compactTargetLabels(addTargets, variants, opts.ObjectLabelPackage)
@@ -2588,10 +2771,23 @@ func (m *CompactMetadata) imageBuildFile(opts CompactBuildFileOptions) ([]byte, 
 			r.SetAttr("remove_content_ids", removeContentIDs)
 		}
 		r.SetAttr("ordered_content_ids", finalObjectIDs)
-		r.SetAttr("ordered_module_content_ids", finalModuleIDs)
+		r.SetAttr("ordered_module_content_ids", []string{})
 		r.SetAttr("tags", []string{"manual"})
 	}
 	return file.Format(), nil
+}
+
+func compactOrderedSubset(base, final []string) bool {
+	if len(base) > len(final) {
+		return false
+	}
+	next := 0
+	for _, id := range final {
+		if next < len(base) && id == base[next] {
+			next++
+		}
+	}
+	return next == len(base)
 }
 
 func compactTargetSet(targets []string) map[string]bool {

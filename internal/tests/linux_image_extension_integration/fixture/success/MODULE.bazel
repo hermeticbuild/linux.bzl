@@ -1,0 +1,31 @@
+module(
+    name = "linux_image_extension_success",
+    version = "1.0.0",
+)
+
+bazel_dep(name = "linux.bzl", version = "0.1.0")
+local_path_override(
+    module_name = "linux.bzl",
+    path = "../linux_bzl",
+)
+
+local_path_override(
+    module_name = "llvm",
+    path = "../llvm",
+)
+
+linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
+linux_images.image(
+    name = "fixture_kernel",
+    arch = "x86_64",
+    cc_profile = "//:cc_profile.json",
+    config = "//:base.config",
+    platform = "//:platform",
+    source = "//:Kconfig",
+)
+linux_images.overlay(
+    name = "debug",
+    config = "//:debug.config",
+    image = "fixture_kernel",
+)
+use_repo(linux_images, "fixture_kernel")

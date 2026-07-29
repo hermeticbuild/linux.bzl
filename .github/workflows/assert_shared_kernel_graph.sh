@@ -107,6 +107,72 @@ expect debug_btf_shared "${debug_btf}" "0"
 expect union "${union_count}" "${expected_actions}"
 expect memberships "${membership_count}" "${expected_memberships}"
 
+if [[ "$(jq -r '.protocol' "${metadata}")" == "compact-v7-lazy-action-graph" ]]; then
+  if ! group_sets="$(
+    jq -er '
+      def config_names($document; $reachability):
+        [
+          $document.reachability_signatures[]
+          | select(.id == $reachability)
+          | .configs
+        ][0];
+      def groups($document; $name):
+        [
+          $document.action_recipe_groups[]
+          | select((config_names($document; .reachability) | index($name)) != null)
+          | .id
+        ]
+        | sort;
+      def shared($left; $right):
+        ($right | reduce .[] as $group ({}; .[$group] = true)) as $right_set
+        | [$left[] | select($right_set[.] == true)]
+        | length;
+      . as $document
+      | groups($document; "x86_64") as $base
+      | groups($document; "lz4") as $lz4
+      | groups($document; "debug") as $debug
+      | groups($document; "btf") as $btf
+      | [
+          ($base | length),
+          ($lz4 | length),
+          ($debug | length),
+          ($btf | length),
+          ($base == $lz4),
+          shared($base; $debug),
+          shared($base; $btf),
+          shared($debug; $btf),
+          (($base + $lz4 + $debug + $btf) | unique | length),
+          (
+            [
+              $document.action_recipe_groups[].objects[]
+            ]
+            | length
+          )
+        ]
+      | @tsv
+    ' "${metadata}"
+  )"; then
+    echo "invalid lazy action-group metadata: ${metadata}" >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r \
+    base_groups lz4_groups debug_groups btf_groups \
+    base_lz4_groups_equal \
+    base_debug_groups base_btf_groups debug_btf_groups \
+    group_union group_objects <<<"${group_sets}"
+
+  expect base_groups "${base_groups}" "63"
+  expect lz4_groups "${lz4_groups}" "63"
+  expect debug_groups "${debug_groups}" "67"
+  expect btf_groups "${btf_groups}" "67"
+  expect base_lz4_group_identity "${base_lz4_groups_equal}" "true"
+  expect base_debug_shared_groups "${base_debug_groups}" "4"
+  expect base_btf_shared_groups "${base_btf_groups}" "0"
+  expect debug_btf_shared_groups "${debug_btf_groups}" "0"
+  expect group_union "${group_union}" "193"
+  expect group_object_variants "${group_objects}" "${expected_actions}"
+fi
+
 if ! header_families="$(
   jq -er '
     def family_names($labels):
