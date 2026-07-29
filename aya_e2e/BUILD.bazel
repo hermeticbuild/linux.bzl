@@ -1,5 +1,7 @@
 package(default_visibility = ["//visibility:public"])
 
+exports_files(["linux_bzl_rust_btf.rs"])
+
 test_suite(
     name = "aya_vm_tests",
     tests = [

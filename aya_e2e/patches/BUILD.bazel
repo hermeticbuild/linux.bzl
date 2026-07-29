@@ -1,1 +1,4 @@
-exports_files(["aya_linux_bzl_api.patch"])
+exports_files([
+    "aya_linux_bzl_api.patch",
+    "aya_rust_kernel_module_e2e.patch",
+])

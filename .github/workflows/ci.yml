@@ -414,7 +414,9 @@ jobs:
             - aya_e2e/.bazelversion
             - aya_e2e/MODULE.bazel
             - aya_e2e/MODULE.bazel.lock
+            - aya_e2e/patches/BUILD.bazel
             - aya_e2e/patches/aya_linux_bzl_api.patch
+            - aya_e2e/patches/aya_rust_kernel_module_e2e.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Run Aya integration VMs

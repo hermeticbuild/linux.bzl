@@ -25,8 +25,9 @@ the rules module.
    This builds and loads version-native Rust-for-Linux modules for the
    cataloged x86_64 kernels. Also verify that cross-kernel dependencies and
    `MODULE_VERSION`/module source-version metadata are rejected.
-7. From `aya_e2e`, run the pinned Aya x86_64 and aarch64 VM targets separately,
-   shutting down Bazel between targets to bound the configured graph.
+7. From `aya_e2e`, run the pinned Aya x86_64 and aarch64 VM targets in one
+   Bazel invocation. This exercises the shared action graph and records
+   cross-target action deduplication in one profile and BEP.
 8. Audit the pinned source URLs and integrities in the catalog.
 9. Audit `KCONFIG_TOOL_VERSION` and all six entries in
    `internal/kconfig_tool_releases.bzl`.

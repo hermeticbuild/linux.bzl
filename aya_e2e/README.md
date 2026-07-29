@@ -2,9 +2,14 @@
 
 This standalone module pins
 [`aya-rs/aya`](https://github.com/aya-rs/aya) at
-`9e943b24ca2256eecce7db73de43c8d2b49c0c33` and runs Aya's upstream
+`05d5269f848e3565e964690fc7111817a2258033` and runs Aya's upstream
 x86_64 and aarch64 integration VMs against the adjacent `linux.bzl`
 checkout.
+
+`patches/aya_linux_bzl_api.patch` mirrors the upstream repository-rule
+migration. `patches/aya_rust_kernel_module_e2e.patch` is deliberately owned by
+linux.bzl: it wires this module's `linux_bzl_rust_btf.rs` fixture into the Aya
+VMs without adding the fixture to Aya's pull request.
 
 Aya keeps its existing rules_rs `default_rust_toolchains` declaration pinned to
 `nightly/2026-06-24`. As the root consumer, Aya registers that toolchain for
