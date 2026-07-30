@@ -4,6 +4,7 @@ load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "CPP_L
 load("@rules_cc//cc:find_cc_toolchain.bzl", "CC_TOOLCHAIN_TYPE", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load(":flag_programs.bzl", "LinuxFlagProgramsInfo")
+load(":graph_profile.bzl", "LinuxGraphProfileInfo")
 load(":host_cc_toolchain.bzl", "host_cc_toolchain_attr")
 load(":kconfig.bzl", "KconfigInfo")
 load(":linux_module_actions.bzl", "linux_module_actions")
@@ -3778,27 +3779,18 @@ linux_compile_environment_index = rule(
     doc = "Materializes and indexes content-addressed Linux compile environments without per-environment targets.",
 )
 
-def _add_linux_probe_args(args, allow_shell, model, values):
-    if not allow_shell:
-        return
-    args.add("-allow_shell")
-    if model:
-        args.add("-linux_probe_model", model)
-    for key, value in sorted(values.items()):
-        args.add("-linux_probe_value", "%s=%s" % (key, value))
-
-def _configure_linux_probe_env(allow_shell, env):
-    if not allow_shell:
-        return
+def _configure_linux_probe_env(env):
     env.setdefault("CC", "clang")
     env.setdefault("CC_VERSION_TEXT", "clang version 22.1.8None")
     env.setdefault("LD", "ld.lld")
     env.setdefault("NM", "llvm-nm")
+    env.setdefault("OBJCOPY", "llvm-objcopy")
     env.setdefault("AR", "llvm-ar")
     env.setdefault("CLANG_FLAGS", "-fintegrated-as")
-    env.setdefault("RUSTC", "rustc")
+    env["RUSTC"] = "rustc"
     env.setdefault("PAHOLE", "pahole")
     env.setdefault("BINDGEN", "bindgen")
+    env.setdefault("PYTHON3", "python3")
 
 def _linux_compiler_version_string():
     return "clang version 22.1.8None, LLD 22.1.8"
@@ -3853,7 +3845,7 @@ def _resolve_linux_config(ctx, rust_toolchain_probe):
     vars = dict(ctx.attr.vars)
     vars.setdefault("srctree", source_root)
     env = dict(ctx.attr.env)
-    _configure_linux_probe_env(ctx.attr.allow_shell, env)
+    _configure_linux_probe_env(env)
 
     fragment = ctx.attr.config[KconfigInfo].config
     args = ctx.actions.args()
@@ -3879,16 +3871,22 @@ def _resolve_linux_config(ctx, rust_toolchain_probe):
     args.add("-resolved_rustc_cfg_out", rustc_cfg)
     args.add("-resolved_kernel_release_out", kernel_release)
     args.add("-kernel_version", ctx.attr.version)
+    graph_profile = ctx.attr.graph_profile[LinuxGraphProfileInfo]
+    args.add("-graph_profile_projection", graph_profile.projection)
     if rust_toolchain_probe:
         args.add("-rust_toolchain_probe", rust_toolchain_probe)
         args.add("-validate_config_equivalence")
-    _add_linux_probe_args(args, ctx.attr.allow_shell, ctx.attr.probe_model, ctx.attr.probe_values)
     for key, value in sorted(vars.items()):
         args.add("-var", "%s=%s" % (key, value))
     for key, value in sorted(env.items()):
         args.add("-env", "%s=%s" % (key, value))
 
-    inputs = [ctx.file.root, fragment] + ctx.files.srcs + extra_kconfig_inputs
+    inputs = [
+        ctx.file.root,
+        fragment,
+        graph_profile.projection,
+        graph_profile.validation,
+    ] + ctx.files.srcs + extra_kconfig_inputs
     if rust_toolchain_probe:
         inputs.append(rust_toolchain_probe)
     if ctx.file.source_root:
@@ -3896,7 +3894,10 @@ def _resolve_linux_config(ctx, rust_toolchain_probe):
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._kconfig_parse,
-        inputs = depset(inputs),
+        inputs = depset(
+            direct = inputs,
+            transitive = [graph_profile.source_inputs],
+        ),
         outputs = [config, auto_conf, auto_conf_cmd, autoconf_h, rustc_cfg, kernel_release],
         arguments = [args],
         mnemonic = "LinuxResolvedConfig",
@@ -3951,10 +3952,6 @@ def _linux_rust_resolved_config_impl(ctx):
     return _resolve_linux_config(ctx, _materialize_rust_toolchain_probe(ctx))
 
 _LINUX_RESOLVED_CONFIG_ATTRS = {
-    "allow_shell": attr.bool(
-        default = True,
-        doc = "Allow deterministic $(shell,...) expansion while resolving Kconfig defaults.",
-    ),
     "config": attr.label(
         providers = [KconfigInfo],
         mandatory = True,
@@ -3978,12 +3975,10 @@ _LINUX_RESOLVED_CONFIG_ATTRS = {
         allow_files = True,
         doc = "Map of extra Kconfig labels to virtual Linux source prefixes.",
     ),
-    "probe_model": attr.string(
-        default = "linux_llvm",
-        doc = "Hermetic Linux Kconfig probe model used when allow_shell is set.",
-    ),
-    "probe_values": attr.string_dict(
-        doc = "Overrides for the selected Linux Kconfig probe model.",
+    "graph_profile": attr.label(
+        mandatory = True,
+        providers = [LinuxGraphProfileInfo],
+        doc = "Validated consumed C/tool graph projection used during config replay.",
     ),
     "root": attr.label(
         allow_single_file = True,
@@ -6560,6 +6555,7 @@ def _linux_x86_inat_tables(ctx):
 
 def _linux_x86_compressed_compile(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, src, object, extra_inputs = [], extra_include_dirs = []):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + object)
+    hidden_header = _source_tree_file(ctx, "include/linux/hidden.h")
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
@@ -6591,7 +6587,7 @@ def _linux_x86_compressed_compile(ctx, compiler, cc_toolchain, feature_configura
     args.add_all(_linux_object_name_flags(object))
     args.add_all(_linux_source_preinclude_flags_for_root(source_root, assembly))
     args.add("-include")
-    args.add(source_root + "/include/linux/hidden.h")
+    args.add(hidden_header)
     _linux_x86_add_include_flags(
         args,
         config,
@@ -6610,7 +6606,7 @@ def _linux_x86_compressed_compile(ctx, compiler, cc_toolchain, feature_configura
     path_mapped_run(
         ctx.actions,
         executable = compiler,
-        inputs = _linux_x86_boot_inputs(ctx, cc_toolchain, config, generated_headers, extra = [src] + extra_inputs),
+        inputs = _linux_x86_boot_inputs(ctx, cc_toolchain, config, generated_headers, extra = [src, hidden_header] + extra_inputs),
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxX86CompressedCompile",
@@ -6651,6 +6647,7 @@ def _linux_x86_compressed_linker_script(ctx, compiler, cc_toolchain, feature_con
 
 def _linux_x86_efi_stub_compile(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, src_relpath, object):
     src = _source_tree_file_for_root(ctx, source_root, src_relpath)
+    hidden_header = _source_tree_file(ctx, "include/linux/hidden.h")
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + object)
     compile_out = ctx.actions.declare_file(ctx.label.name + ".obj/" + object[:-len(".stub.o")] + ".o")
     args = ctx.actions.args()
@@ -6682,7 +6679,7 @@ def _linux_x86_efi_stub_compile(ctx, compiler, cc_toolchain, feature_configurati
     args.add_all(_linux_object_name_flags(_linux_compile_object_name(object)))
     args.add_all(_linux_source_preinclude_flags_for_root(source_root, False))
     args.add("-include")
-    args.add(source_root + "/include/linux/hidden.h")
+    args.add(hidden_header)
     _linux_x86_add_include_flags(
         args,
         config,
@@ -6697,7 +6694,7 @@ def _linux_x86_efi_stub_compile(ctx, compiler, cc_toolchain, feature_configurati
     path_mapped_run(
         ctx.actions,
         executable = compiler,
-        inputs = _linux_x86_boot_inputs(ctx, cc_toolchain, config, generated_headers, extra = [src]),
+        inputs = _linux_x86_boot_inputs(ctx, cc_toolchain, config, generated_headers, extra = [src, hidden_header]),
         outputs = [compile_out],
         arguments = [args],
         mnemonic = "LinuxX86EFIStubCompile",

@@ -35,6 +35,7 @@ linux_resolved_config(
         "ARCH": "x86",
         "SRCARCH": "x86",
     },
+    graph_profile = "//internal/tests:graph_profile_context_test_target",
     root = "Kconfig",
     source_root = "Kconfig",
     vars = {
@@ -52,6 +53,7 @@ linux_resolved_config(
         "ARCH": "x86",
         "SRCARCH": "x86",
     },
+    graph_profile = "//internal/tests:graph_profile_context_test_target",
     minimum_rustc_version = "1.78.0",
     root = "Kconfig",
     rust_enabled = True,

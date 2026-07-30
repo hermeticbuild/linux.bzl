@@ -35,12 +35,57 @@ func (f stringMapFlag) Set(value string) error {
 }
 
 func applyRustToolchainProbe(
-	vars, linuxProbeValues stringMapFlag,
+	vars stringMapFlag,
 	probe rusttoolchain.Probe,
 ) {
 	vars["RUSTC_VERSION_TEXT"] = probe.VersionText
-	linuxProbeValues["rustc_version"] = strconv.Itoa(probe.VersionCode)
-	linuxProbeValues["rustc_llvm_version"] = strconv.Itoa(probe.LLVMVersionCode)
+}
+
+type rustToolchainVersionResolver func(
+	context.Context,
+	kconfig.RustToolchainVersionCommand,
+) (string, error)
+
+func newRustToolchainVersionResolver(
+	probe rusttoolchain.Probe,
+) rustToolchainVersionResolver {
+	return func(
+		ctx context.Context,
+		command kconfig.RustToolchainVersionCommand,
+	) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		switch {
+		case command == kconfig.RustToolchainVersionCommandRustc:
+			return strconv.Itoa(probe.VersionCode), nil
+		case command == kconfig.RustToolchainVersionCommandLLVM:
+			return strconv.Itoa(probe.LLVMVersionCode), nil
+		default:
+			return "", fmt.Errorf(
+				"unsupported selected Rust toolchain version command %d",
+				command,
+			)
+		}
+	}
+}
+
+func combineGraphProfileAndRustProbeShells(
+	graphShell func(context.Context, string) (string, error),
+	rustResolver rustToolchainVersionResolver,
+) (func(context.Context, string) (string, error), error) {
+	if graphShell == nil {
+		return nil, fmt.Errorf("graph profile shell is required")
+	}
+	if rustResolver == nil {
+		return nil, fmt.Errorf("Rust toolchain version resolver is required")
+	}
+	return func(ctx context.Context, command string) (string, error) {
+		if kind := kconfig.ClassifyRustToolchainVersionCommand(command); kind != kconfig.RustToolchainVersionCommandUnknown {
+			return rustResolver(ctx, kind)
+		}
+		return graphShell(ctx, command)
+	}, nil
 }
 
 type stringSliceFlag []string
@@ -54,6 +99,55 @@ func (f *stringSliceFlag) Set(value string) error {
 		return fmt.Errorf("empty value")
 	}
 	*f = append(*f, value)
+	return nil
+}
+
+type graphProfileMode struct {
+	profile              string
+	projection           string
+	projectionOut        string
+	recordOut            string
+	resolveConfig        string
+	rustToolchainProbe   string
+	linuxProbeModel      string
+	hasLinuxProbeValues  bool
+	allowShell           bool
+	otherGraphOutputMode bool
+}
+
+func validateGraphProfileMode(mode graphProfileMode) error {
+	if mode.profile != "" && mode.projection != "" {
+		return fmt.Errorf("-graph_profile and -graph_profile_projection are mutually exclusive")
+	}
+	if mode.rustToolchainProbe != "" {
+		if mode.profile == "" && mode.projection == "" {
+			return fmt.Errorf("-rust_toolchain_probe requires -graph_profile or -graph_profile_projection")
+		}
+		if mode.recordOut != "" {
+			return fmt.Errorf("-rust_toolchain_probe cannot be used with -graph_profile_record_out")
+		}
+		if mode.resolveConfig == "" || mode.otherGraphOutputMode {
+			return fmt.Errorf("-rust_toolchain_probe is only valid for resolved config replay")
+		}
+	}
+	if mode.projection == "" {
+		return nil
+	}
+	if mode.recordOut != "" {
+		return fmt.Errorf("-graph_profile_projection cannot be extended with -graph_profile_record_out")
+	}
+	if mode.projectionOut != "" {
+		return fmt.Errorf("-graph_profile_projection cannot be used with -graph_profile_projection_out")
+	}
+	if mode.linuxProbeModel != "" || mode.hasLinuxProbeValues {
+		return fmt.Errorf("-graph_profile_projection cannot be used with -linux_probe_model or -linux_probe_value")
+	}
+	if mode.allowShell {
+		return fmt.Errorf("-graph_profile_projection enables exact shell replay and cannot be used with -allow_shell")
+	}
+	if mode.resolveConfig == "" || mode.otherGraphOutputMode {
+		return fmt.Errorf("-graph_profile_projection is only valid for resolved config replay")
+	}
 	return nil
 }
 
@@ -212,6 +306,7 @@ func run() (exitCode int) {
 		allowShell                = flag.Bool("allow_shell", false, "Allow $(shell,...) expansion")
 		linuxProbeModel           = flag.String("linux_probe_model", "", "Hermetic Linux Kconfig probe model to use for $(shell,...) expansion. Supported: linux_llvm")
 		graphProfilePath          = flag.String("graph_profile", "", "Checked-in exact-command toolchain graph profile used by Kconfig")
+		graphProfileProjection    = flag.String("graph_profile_projection", "", "Consumed exact-command graph projection used to replay repository C/tool decisions")
 		graphProfileProjectionOut = flag.String("graph_profile_projection_out", "", "Path to write the canonical consumed graph-profile projection")
 		graphProfileRecordOut     = flag.String("graph_profile_record_out", "", "Maintenance-only path to record or extend an exact graph-profile superset")
 		graphProfileArchitecture  = flag.String("graph_profile_architecture", "", "Canonical architecture for -graph_profile_record_out")
@@ -272,6 +367,26 @@ func run() (exitCode int) {
 	flag.Var(&generatedHeadersByConfig, "generated_headers_for_config", "Generated headers binding in NAME=LABEL form. May be repeated once per compact config")
 	flag.Parse()
 
+	if err := validateGraphProfileMode(graphProfileMode{
+		profile:             *graphProfilePath,
+		projection:          *graphProfileProjection,
+		projectionOut:       *graphProfileProjectionOut,
+		recordOut:           *graphProfileRecordOut,
+		resolveConfig:       *resolveConfig,
+		rustToolchainProbe:  *rustToolchainProbe,
+		linuxProbeModel:     *linuxProbeModel,
+		hasLinuxProbeValues: len(linuxProbeValues) != 0,
+		allowShell:          *allowShell,
+		otherGraphOutputMode: *compactMetadataOut != "" ||
+			*kbuildOut != "" ||
+			*kbuildTreeOut != "" ||
+			*rustProfileOut != "" ||
+			*out != "",
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
 	stopProfiles, err := startRuntimeProfiles(*cpuProfile, *heapProfile, *allocsProfile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start runtime profiles: %v\n", err)
@@ -296,10 +411,18 @@ func run() (exitCode int) {
 		fmt.Fprintf(os.Stderr, "failed to load graph profile: %v\n", err)
 		return 1
 	}
+	if *graphProfileProjection != "" {
+		graphProfile, err = loadGraphProfileProjection(*graphProfileProjection)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load graph profile projection: %v\n", err)
+			return 1
+		}
+	}
 	var graphProfileShell *kconfig.GraphProfileShell
 	var tree *kconfig.Tree
 	if *root != "" {
 		var err error
+		var selectedRustResolver rustToolchainVersionResolver
 		if *rustToolchainProbe != "" {
 			probeFile, openErr := os.Open(workspacePath(*rustToolchainProbe))
 			if openErr != nil {
@@ -316,7 +439,8 @@ func run() (exitCode int) {
 				fmt.Fprintf(os.Stderr, "failed to close Rust toolchain probe: %v\n", closeErr)
 				return 1
 			}
-			applyRustToolchainProbe(vars, linuxProbeValues, probe)
+			applyRustToolchainProbe(vars, probe)
+			selectedRustResolver = newRustToolchainVersionResolver(probe)
 		}
 		sourceRoots := namedPathMap(sourceRootMaps)
 		resolvedRoot := *root
@@ -407,7 +531,18 @@ func run() (exitCode int) {
 				fmt.Fprintf(os.Stderr, "failed to configure graph profile: %v\n", err)
 				return 2
 			}
-			shell = graphProfileShell.Run
+			if *rustToolchainProbe != "" {
+				shell, err = combineGraphProfileAndRustProbeShells(
+					graphProfileShell.Run,
+					selectedRustResolver,
+				)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "failed to combine graph profile and Rust toolchain probes: %v\n", err)
+					return 2
+				}
+			} else {
+				shell = graphProfileShell.Run
+			}
 		} else if *graphProfileRecordOut != "" {
 			if shell == nil {
 				fmt.Fprintln(os.Stderr, "-graph_profile_record_out requires -linux_probe_model")
@@ -698,6 +833,28 @@ func loadGraphProfile(path string) (*ccprofile.GraphProfile, error) {
 		return nil, err
 	}
 	return &profile, nil
+}
+
+func loadGraphProfileProjection(path string) (*ccprofile.GraphProfile, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(workspacePath(path))
+	if err != nil {
+		return nil, err
+	}
+	projection, err := ccprofile.DecodeGraphProjection(data)
+	if err != nil {
+		return nil, err
+	}
+	return &ccprofile.GraphProfile{
+		Schema:            ccprofile.GraphProfileSchema,
+		Architecture:      projection.Architecture,
+		DriverContract:    projection.DriverContract,
+		AnalysisIdentity:  projection.AnalysisIdentity,
+		KconfigCommands:   projection.KconfigCommands,
+		KbuildGraphProbes: projection.KbuildGraphProbes,
+	}, nil
 }
 
 func linuxProbeShell(

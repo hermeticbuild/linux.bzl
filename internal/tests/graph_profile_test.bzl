@@ -28,6 +28,11 @@ def _graph_profile_context_test_impl(ctx):
     asserts.equals(env, "ld.lld", info.kbuild_linker.basename)
     asserts.true(
         env,
+        "compiler-version.h" in [file.basename for file in info.source_inputs.to_list()],
+        "graph profile must expose source inputs needed for configured replay",
+    )
+    asserts.true(
+        env,
         info.compiler in info.toolchain_files.to_list(),
         "selected compiler must be a declared C toolchain input",
     )
@@ -84,11 +89,14 @@ def _graph_profile_context_test_impl(ctx):
             1,
             len([arg for arg in validate.argv if arg.startswith("-archiver=")]),
         )
-        asserts.equals(
-            env,
-            1,
-            len([arg for arg in validate.argv if arg.startswith("-nm=")]),
-        )
+        nm_args = [arg.removeprefix("-nm=") for arg in validate.argv if arg.startswith("-nm=")]
+        asserts.equals(env, 1, len(nm_args))
+        if nm_args:
+            asserts.true(
+                env,
+                nm_args[0].endswith("/llvm-nm") or nm_args[0].endswith("/llvm-nm.exe"),
+                "expected declared llvm-nm tool, got %s" % nm_args[0],
+            )
         asserts.equals(
             env,
             1,
@@ -129,7 +137,9 @@ def graph_profile_context_test(name):
         graph_projection = ":graph_projection.json",
         kbuild_linker = "@llvm//tools:ld.lld",
         source_root = "//tests/compile:source/Kconfig",
+        srcs = ["//tests/compile:source/include/linux/compiler-version.h"],
         tags = ["manual"],
+        visibility = ["//internal/tests/resolved_config:__pkg__"],
     )
     _graph_profile_context_test(
         name = name,

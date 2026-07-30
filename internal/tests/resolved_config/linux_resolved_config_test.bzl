@@ -48,11 +48,44 @@ def _c_config_test_impl(ctx):
     resolved = _actions_with_mnemonic(actions, "LinuxResolvedConfig")
     asserts.equals(env, 1, len(resolved))
     if resolved:
+        asserts.false(env, _has_argument(resolved[0], "-allow_shell"))
+        asserts.false(env, _has_argument(resolved[0], "-linux_probe_model"))
+        asserts.false(env, _has_argument(resolved[0], "-linux_probe_value"))
         asserts.false(
             env,
             _has_argument(resolved[0], "-rust_toolchain_probe"),
             "C-only config action must not consume a Rust compiler probe",
         )
+        asserts.true(
+            env,
+            _has_argument(resolved[0], "-graph_profile_projection"),
+            "C-only config action must consume the repository C graph projection",
+        )
+        asserts.true(
+            env,
+            _has_input_basename_containing(resolved[0], "graph_projection"),
+            "C-only config action must consume the repository graph projection",
+        )
+        asserts.true(
+            env,
+            _has_input_basename_containing(resolved[0], "graph_profile.validated"),
+            "C-only config action must depend on configured C graph validation",
+        )
+        asserts.true(
+            env,
+            _has_input_basename_containing(resolved[0], "compiler-version.h"),
+            "C-only config action must declare graph-profile source inputs",
+        )
+        for value in [
+            "OBJCOPY=llvm-objcopy",
+            "PYTHON3=python3",
+            "RUSTC=rustc",
+        ]:
+            asserts.true(
+                env,
+                _has_argument(resolved[0], value),
+                "config replay must preserve graph-profile identity environment %s" % value,
+            )
     return analysistest.end(env)
 
 _c_config_test = analysistest.make(_c_config_test_impl)
@@ -96,8 +129,27 @@ def _rust_config_test_impl(ctx):
     asserts.equals(env, 1, len(resolved))
     if resolved:
         asserts.true(env, _has_argument(resolved[0], "-rust_toolchain_probe"))
+        asserts.true(env, _has_argument(resolved[0], "-graph_profile_projection"))
         asserts.true(env, _has_argument(resolved[0], "-validate_config_equivalence"))
+        asserts.false(env, _has_argument(resolved[0], "-linux_probe_model"))
+        asserts.false(env, _has_argument(resolved[0], "-linux_probe_value"))
+        asserts.true(env, _has_argument(resolved[0], "RUSTC=rustc"))
         asserts.true(env, _has_input(resolved[0], info.rustc_probe))
+        asserts.true(
+            env,
+            _has_input_basename_containing(resolved[0], "graph_projection"),
+            "Rust config action must consume the repository graph projection",
+        )
+        asserts.true(
+            env,
+            _has_input_basename_containing(resolved[0], "graph_profile.validated"),
+            "Rust config action must depend on configured C graph validation",
+        )
+        asserts.true(
+            env,
+            _has_input_basename_containing(resolved[0], "compiler-version.h"),
+            "Rust config action must declare graph-profile source inputs",
+        )
     return analysistest.end(env)
 
 _rust_config_test = analysistest.make(_rust_config_test_impl)
