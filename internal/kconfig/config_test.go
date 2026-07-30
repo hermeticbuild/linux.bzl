@@ -203,6 +203,107 @@ config TARGET
 	})
 }
 
+// A symbol may be defined in several places. dir_dep is the OR of every
+// definition's inherited menu dependency (see finalizeMenu), so a symbol with
+// one definition inside a dead "if" block and another that applies carries the
+// dead block's condition in dir_dep. scripts/kconfig/symbol.c:sym_calc_value()
+// gates the user value and the default on the prompt/default condition, and
+// uses dir_dep only to bound "imply", so the live definition still wins.
+//
+// arch/Kconfig defines CPU_MITIGATIONS inside "if
+// !ARCH_CONFIGURES_CPU_MITIGATIONS" while arch/x86/Kconfig defines it as a
+// plain "menuconfig ... default y"; x86 selects ARCH_CONFIGURES_CPU_MITIGATIONS,
+// so clamping by dir_dep disabled CPU_MITIGATIONS and every MITIGATION_* symbol
+// guarded by it.
+func TestResolveConfigRedefinedSymbolIgnoresDeadDefinitionDependency(t *testing.T) {
+	fixture := `
+mainmenu "Test"
+
+config ARCH_CONFIGURES_IT
+	bool
+
+config ARCH
+	bool "Arch"
+	default y
+	select ARCH_CONFIGURES_IT
+
+if !ARCH_CONFIGURES_IT
+
+config FEATURE
+	def_bool y
+
+endif
+
+config FEATURE
+	bool "Feature"
+	default y
+
+if FEATURE
+
+config FEATURE_CHILD
+	bool "Child"
+	default y
+
+endif
+`
+
+	t.Run("default", func(t *testing.T) {
+		resolved := mustResolveConfig(t, fixture, map[string]string{})
+		wantConfigValues(t, resolved, map[string]string{
+			"CONFIG_ARCH_CONFIGURES_IT": "y",
+			"CONFIG_FEATURE":            "y",
+			"CONFIG_FEATURE_CHILD":      "y",
+		})
+	})
+
+	t.Run("explicit user value", func(t *testing.T) {
+		resolved := mustResolveConfig(t, fixture, map[string]string{
+			"CONFIG_FEATURE": "y",
+		})
+		wantConfigValues(t, resolved, map[string]string{
+			"CONFIG_FEATURE":       "y",
+			"CONFIG_FEATURE_CHILD": "y",
+		})
+	})
+
+	t.Run("explicit user n still wins", func(t *testing.T) {
+		resolved := mustResolveConfig(t, fixture, map[string]string{
+			"CONFIG_FEATURE": "n",
+		})
+		wantConfigValues(t, resolved, map[string]string{
+			"CONFIG_FEATURE":       "n",
+			"CONFIG_FEATURE_CHILD": "n",
+		})
+	})
+}
+
+// The counterpart to the above: a symbol whose only definition sits in a dead
+// "if" block has no live definition, so it must stay disabled even when the
+// imported config asks for it.
+func TestResolveConfigSoleDefinitionInDeadIfStaysDisabled(t *testing.T) {
+	resolved := mustResolveConfig(t, `
+mainmenu "Test"
+
+config GATE
+	bool "Gate"
+
+if GATE
+
+config TARGET
+	bool "Target"
+	default y
+
+endif
+`, map[string]string{
+		"CONFIG_TARGET": "y",
+	})
+
+	wantConfigValues(t, resolved, map[string]string{
+		"CONFIG_GATE":   "n",
+		"CONFIG_TARGET": "n",
+	})
+}
+
 func TestResolveConfigRawValueConstrainedByTargetDepends(t *testing.T) {
 	resolved := mustResolveConfig(t, `
 mainmenu "Test"
