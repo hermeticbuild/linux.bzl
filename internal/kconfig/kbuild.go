@@ -1457,6 +1457,9 @@ func (p *kbuildParser) linuxLLVMKbuildProbeSupportsOption(
 	key := normalizeLinuxProbeCandidate(candidate)
 	context := p.linuxLLVMKbuildProbeContext(kind)
 
+	if kind == "cc_option" && len(candidate) == 1 && linuxLLVMKbuildSupportsMacroPrefixMap(candidate[0]) {
+		return true, nil
+	}
 	if kind == "cc_option" && architecture == "x86_64" && linuxLLVMKbuildX86ContextCandidates[key] {
 		switch {
 		case slices.Contains(context, "-mpreferred-stack-boundary=2"):
@@ -1490,6 +1493,14 @@ func (p *kbuildParser) linuxLLVMKbuildProbeSupportsOption(
 		return false, p.unsupportedLinuxLLVMKbuildProbe(kind, candidate, architecture, context)
 	}
 	return supported, nil
+}
+
+func linuxLLVMKbuildSupportsMacroPrefixMap(candidate string) bool {
+	const prefix = "-fmacro-prefix-map="
+	const suffix = "/="
+	return strings.HasPrefix(candidate, prefix) &&
+		strings.HasSuffix(candidate, suffix) &&
+		len(candidate) > len(prefix)+len(suffix)
 }
 
 func (p *kbuildParser) linuxLLVMKbuildProbeContext(kind string) []string {
@@ -1719,6 +1730,7 @@ var linuxLLVMKbuildCommonOptions = map[string]bool{
 	"cc_option\x00-Wno-fortify-source":                             true,
 	"cc_option\x00-Wno-gnu":                                        true,
 	"cc_option\x00-Wno-missing-prototypes":                         true,
+	"cc_option\x00-Wno-psabi":                                      true,
 	"cc_option\x00-Wno-stringop-overread":                          false,
 	"cc_option\x00-Wno-stringop-truncation":                        false,
 	"cc_option\x00-Wno-switch-unreachable":                         false,
@@ -1726,6 +1738,7 @@ var linuxLLVMKbuildCommonOptions = map[string]bool{
 	"cc_option\x00-Wno-uninitialized":                              true,
 	"cc_option\x00-Wno-unsequenced":                                true,
 	"cc_option\x00-Wno-unused-but-set-variable":                    true,
+	"cc_option\x00-Wno-unused-const-variable":                      true,
 	"cc_option\x00-Wno-vla":                                        true,
 	"cc_option\x00-Wold-style-declaration":                         false,
 	"cc_option\x00-Wout-of-line-declaration":                       true,
@@ -1761,8 +1774,10 @@ var linuxLLVMKbuildX86Options = map[string]bool{
 	"cc_option\x00-foptimize-sibling-calls":                   true,
 	"cc_option\x00-maccumulate-outgoing-args":                 false,
 	"cc_option\x00-mindirect-branch-cs-prefix":                true,
+	"cc_option\x00-mno-fp-ret-in-387":                         true,
 	"cc_option\x00-mno-outline-atomics":                       false,
 	"cc_option\x00-mpreferred-stack-boundary=4":               false,
+	"cc_option\x00-mskip-rax-setup":                           true,
 	"cc_option\x00-mstack-alignment=16":                       true,
 	"as_option\x00-Wa,-mtune=generic32":                       false,
 	"ld_option\x00--no-ld-generated-unwind-info":              false,
@@ -1771,6 +1786,8 @@ var linuxLLVMKbuildX86Options = map[string]bool{
 }
 
 var linuxLLVMKbuildARM64Options = map[string]bool{
+	"cc_option\x00-mabi=lp64":                false,
+	"cc_option\x00-mbranch-protection=none":  true,
 	"cc_option\x00-mno-outline-atomics":      true,
 	"as_option\x00-Wa,-march=armv8.2-a":      true,
 	"as_option\x00-Wa,-march=armv8.3-a":      true,
