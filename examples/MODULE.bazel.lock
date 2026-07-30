@@ -288,10 +288,9 @@
     },
     "@@linux.bzl+//:extensions.bzl%linux_images": {
       "general": {
-        "bzlTransitiveDigest": "NDCr4r/bGD7At8rQL2jFfOlDlfL7cC/v1ZiacHnyMEE=",
-        "usagesDigest": "ARCjiUnQs/AjF/vdzZBfA5tv6j5+104WtDigJTlo7Jg=",
+        "bzlTransitiveDigest": "/ixqOYWqmuvHrVCsblVINZFzNMzqiBS1f4dMpH49/6Y=",
+        "usagesDigest": "e+vMswoLMFhZTZBOPj/u6dxDllDqKp7btmBZJfnFwew=",
         "recordedInputs": [
-          "REPO_MAPPING:,linux.bzl linux.bzl+",
           "REPO_MAPPING:,linux_6_18_39 +linux_source_repository+linux_6_18_39",
           "REPO_MAPPING:,llvm llvm+"
         ],
@@ -299,9 +298,6 @@
           "example_aarch64__linux_graph": {
             "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
             "attributes": {
-              "arch": "aarch64",
-              "graph_profile": "@@linux.bzl+//profiles:llvm_22_1_8_aarch64.graph.json",
-              "kbuild_linker": "@@llvm+//tools:ld.lld",
               "config": "@@//configs:aarch64.config",
               "config_mode": "default",
               "overlays": {},
@@ -319,9 +315,6 @@
           "example_x86_64__linux_graph": {
             "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
             "attributes": {
-              "arch": "x86_64",
-              "graph_profile": "@@linux.bzl+//profiles:llvm_22_1_8_x86_64.graph.json",
-              "kbuild_linker": "@@llvm+//tools:ld.lld",
               "config": "@@//configs:x86_64.config",
               "config_mode": "default",
               "overlays": {

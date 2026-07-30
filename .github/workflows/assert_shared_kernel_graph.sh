@@ -107,311 +107,103 @@ expect debug_btf_shared "${debug_btf}" "0"
 expect union "${union_count}" "${expected_actions}"
 expect memberships "${membership_count}" "${expected_memberships}"
 
-if ! metadata_protocol="$(jq -er '.protocol' "${metadata}")"; then
-  echo "invalid metadata protocol: ${metadata}" >&2
-  exit 1
-fi
-expect metadata_protocol "${metadata_protocol}" "compact-v7-lazy-action-graph"
-
-if ! group_sets="$(
+if ! action_group_stats="$(
   jq -er '
-      def config_names($document; $reachability):
-        [
-          $document.reachability_signatures[]
-          | select(.id == $reachability)
-          | .configs
-        ][0];
-      def groups($document; $name):
-        [
-          $document.action_recipe_groups[]
-          | select((config_names($document; .reachability) | index($name)) != null)
-          | .id
-        ]
-        | sort;
-      def shared($left; $right):
-        ($right | reduce .[] as $group ({}; .[$group] = true)) as $right_set
-        | [$left[] | select($right_set[.] == true)]
-        | length;
-      . as $document
-      | groups($document; "x86_64") as $base
-      | groups($document; "lz4") as $lz4
-      | groups($document; "debug") as $debug
-      | groups($document; "btf") as $btf
-      | [
-          ($base | length),
-          ($lz4 | length),
-          ($debug | length),
-          ($btf | length),
-          ($base == $lz4),
-          shared($base; $debug),
-          shared($base; $btf),
-          shared($debug; $btf),
-          (($base + $lz4 + $debug + $btf) | unique | length),
-          (
-            [
-              $document.action_recipe_groups[].objects[]
-            ]
-            | length
-          )
-      ]
-      | @tsv
-  ' "${metadata}"
-)"; then
-  echo "invalid lazy action-group metadata: ${metadata}" >&2
-  exit 1
-fi
-IFS=$'\t' read -r \
-  base_groups lz4_groups debug_groups btf_groups \
-  base_lz4_groups_equal \
-  base_debug_groups base_btf_groups debug_btf_groups \
-  group_union group_objects <<<"${group_sets}"
-
-expect base_groups "${base_groups}" "63"
-expect lz4_groups "${lz4_groups}" "63"
-expect debug_groups "${debug_groups}" "67"
-expect btf_groups "${btf_groups}" "65"
-expect base_lz4_group_identity "${base_lz4_groups_equal}" "true"
-expect base_debug_shared_groups "${base_debug_groups}" "4"
-expect base_btf_shared_groups "${base_btf_groups}" "0"
-expect debug_btf_shared_groups "${debug_btf_groups}" "0"
-expect group_union "${group_union}" "191"
-expect group_object_variants "${group_objects}" "${expected_actions}"
-
-# Resolve every configured target through its content-addressed object variant.
-# The graph key mirrors the variant fields that define action-graph identity,
-# so equal graph nodes with different target names or content IDs fail here.
-if ! graph_identities="$(
-  jq -er '
-    def graph_key:
-      [
-        .object,
-        .recipe,
-        (.compile_environment // ""),
-        (.action_source_group // ""),
-        (.deps // []),
-        (.members // [])
-      ]
-      | tojson;
-    def targets($document; $name):
-      [
-        $document.configs[]
-        | select(.name == $name)
-        | ((.object_targets // []) + (.module_object_targets // []))[]
-      ];
-    def shared($left; $right):
-      ($right | reduce .[] as $id ({}; .[$id] = true)) as $right_set
-      | [$left[] | select($right_set[.] == true)]
-      | length;
     . as $document
-    | (
-        reduce $document.object_variants[] as $variant
-          ({};
-            if has($variant.target) then
-              error("duplicate object target " + $variant.target)
-            else
-              .[$variant.target] = $variant
-            end
-          )
-      ) as $by_target
-    | def content_ids($name):
+    | ($document.action_groups // error("missing action_groups")) as $groups
+    | ([ $document.configs[].name ] | sort | unique) as $config_names
+    | [
+        $document.configs[] as $config
+        | (($config.object_targets // []) + ($config.module_object_targets // []))[]
+        | {config: $config.name, target: .}
+      ]
+      | sort_by(.target, .config)
+      | group_by(.target)
+      | map({
+          configs: (map(.config) | sort | unique),
+          target: .[0].target
+        }) as $expected
+    | [
+        $groups[] as $group
+        | $group.object_targets[]
+        | {
+            configs: $group.reachable_configs,
+            group_id: $group.id,
+            recipe_id: $group.recipe_id,
+            target: .
+          }
+      ] as $owners
+    | ([ $document.object_variants[].target ] | sort | unique) as $variant_targets
+    | if ($groups | type) != "array" or ($groups | length) == 0 then
+        error("action_groups must be a non-empty array")
+      elif any($groups[]; (keys | sort) != ["id", "object_targets", "reachable_configs", "recipe_id"]) then
+        error("action group has unsupported or missing fields")
+      elif any($groups[]; (.id | test("^[0-9a-f]{64}$")) | not) then
+        error("action group has invalid ID")
+      elif any($groups[]; (.recipe_id | test("^[0-9a-f]{64}$")) | not) then
+        error("action group has invalid recipe ID")
+      elif ([ $groups[].id ] != ([ $groups[].id ] | sort)) then
+        error("action groups are not sorted by ID")
+      elif ([ $groups[].id ] | length) != ([ $groups[].id ] | unique | length) then
+        error("action group IDs are not unique")
+      elif any(
+        $groups[];
+        (.reachable_configs | length) == 0 or
+        .reachable_configs != (.reachable_configs | sort | unique) or
+        (.object_targets | length) == 0 or
+        .object_targets != (.object_targets | sort | unique)
+      ) then
+        error("action group members are empty, duplicated, or unsorted")
+      elif any($groups[].reachable_configs[]; . as $name | ($config_names | index($name)) == null) then
+        error("action group references an unknown config")
+      elif ([ $groups[] | [.recipe_id, .reachable_configs] | tojson ] | length) !=
+           ([ $groups[] | [.recipe_id, .reachable_configs] | tojson ] | unique | length) then
+        error("action groups repeat a recipe/reachability pair")
+      elif any($owners[]; .target as $target | ($variant_targets | index($target)) == null) then
+        error("action group references an unknown object target")
+      elif ($owners | length) != ($owners | map(.target) | unique | length) then
+        error("an object target has multiple action-group owners")
+      elif (
+        $owners
+        | sort_by(.target)
+        | map({configs, target})
+      ) != $expected then
+        error("action-group ownership or reachability does not match the concrete graph")
+      elif any(
+        $groups[];
+        ((.reachable_configs | index("x86_64")) != null) !=
+        ((.reachable_configs | index("lz4")) != null)
+      ) then
+        error("base and LZ4 do not share exact action-group ownership")
+      else
         [
-          targets($document; $name)[] as $target
-          | ($by_target[$target] // error("missing object variant for " + $target))
-          | .content_id
+          ($groups | length),
+          ([ $groups[].recipe_id ] | unique | length),
+          ([ $groups[].reachable_configs | tojson ] | unique | length),
+          ($owners | length),
+          ([ $groups[].object_targets | length ] | max),
+          ([ $groups[] | select((.reachable_configs | length) > 1) ] | length)
         ]
-        | sort;
-      ($document.object_variants | length) as $variants
-    | ([$document.object_variants[].target] | unique | length) as $targets
-    | ([$document.object_variants[].content_id] | unique | length) as $contents
-    | ([$document.object_variants[] | graph_key] | unique | length) as $graph_keys
-    | ([
-        $document.configs[]
-        | ((.object_targets // []) + (.module_object_targets // []))[]
-      ]) as $memberships
-    | content_ids("x86_64") as $base
-    | content_ids("lz4") as $lz4
-    | content_ids("debug") as $debug
-    | content_ids("btf") as $btf
-    | [
-        $variants,
-        $targets,
-        $contents,
-        $graph_keys,
-        ($memberships | length),
-        ($memberships | unique | length),
-        ($base | length),
-        ($lz4 | length),
-        ($debug | length),
-        ($btf | length),
-        ($base == $lz4),
-        shared($base; $debug),
-        shared($base; $btf),
-        shared($debug; $btf),
-        (($base + $lz4 + $debug + $btf) | unique | length)
-      ]
-    | @tsv
+        | @tsv
+      end
   ' "${metadata}"
 )"; then
-  echo "invalid configured graph-target identities: ${metadata}" >&2
+  echo "invalid concrete action-group metadata: ${metadata}" >&2
   exit 1
 fi
 IFS=$'\t' read -r \
-  variant_count target_identity_count content_identity_count graph_key_count \
-  identity_memberships identity_union \
-  base_identities lz4_identities debug_identities btf_identities \
-  base_lz4_content_equal \
-  base_debug_content base_btf_content debug_btf_content \
-  content_union <<<"${graph_identities}"
+  action_group_count recipe_count reachability_count \
+  owned_object_count largest_action_group shared_action_groups <<<"${action_group_stats}"
 
-expect object_variant_identities \
-  "${variant_count}/${target_identity_count}/${content_identity_count}/${graph_key_count}" \
-  "${expected_actions}/${expected_actions}/${expected_actions}/${expected_actions}"
-expect configured_graph_memberships \
-  "${identity_memberships}/${identity_union}" \
-  "${expected_memberships}/${expected_actions}"
-expect base_configured_graph_targets "${base_identities}" "1152"
-expect lz4_configured_graph_targets "${lz4_identities}" "1152"
-expect debug_configured_graph_targets "${debug_identities}" "1182"
-expect btf_configured_graph_targets "${btf_identities}" "1225"
-expect base_lz4_graph_content_identity "${base_lz4_content_equal}" "true"
-expect base_debug_shared_graph_content "${base_debug_content}" "40"
-expect base_btf_shared_graph_content "${base_btf_content}" "0"
-expect debug_btf_shared_graph_content "${debug_btf_content}" "0"
-expect configured_graph_content_union "${content_union}" "${expected_actions}"
-
-# Check both sides of interning: semantic payloads are unique in each table,
-# while references from nodes and configured object recipes reuse those IDs.
-if ! flag_dag="$(
-  jq -er '
-    def terminal_key:
-      [(.argv // [])]
-      | tojson;
-    def probe_key:
-      [
-        .kind,
-        (.candidate_argv // []),
-        (.context_program // ""),
-        (.language // ""),
-        (.srcarch // "")
-      ]
-      | tojson;
-    def node_key:
-      [
-        .kind,
-        (.children // []),
-        (.probe // ""),
-        (.when_true // ""),
-        (.when_false // "")
-      ]
-      | tojson;
-    def program_key:
-      [.root, (.effects // [])]
-      | tojson;
-    . as $document
-    | (
-        reduce ($document.flag_terminals[], $document.flag_nodes[]) as $value
-          ({}; .[$value.id] = true)
-      ) as $values
-    | (
-        reduce $document.flag_programs[] as $program
-          ({}; .[$program.id] = true)
-      ) as $programs
-    | (
-        reduce $document.kbuild_probes[] as $probe
-          ({}; .[$probe.id] = true)
-      ) as $probes
-    | (
-        reduce $document.action_recipes[] as $recipe
-          ({}; .[$recipe.id] = $recipe)
-      ) as $recipes
-    | ([
-        $document.flag_nodes[] as $node
-        | ($node.children // [])[],
-          ($node.when_true // empty),
-          ($node.when_false // empty)
-      ]) as $node_value_refs
-    | ([$document.flag_programs[].root] + $node_value_refs) as $value_refs
-    | ([$document.flag_nodes[] | .probe // empty]) as $probe_refs
-    | ([
-        $document.action_recipes[]
-        | .flag_program,
-          .remove_flag_program
-      ] + [
-        $document.kbuild_probes[]
-        | .context_program // empty
-      ]) as $declared_program_refs
-    | ([
-        $document.object_variants[]
-        | ($recipes[.recipe] // error("missing action recipe " + .recipe))
-        | .flag_program,
-          .remove_flag_program
-      ] + [
-        $document.kbuild_probes[]
-        | .context_program // empty
-      ]) as $configured_program_refs
-    | [
-        ($document.kbuild_probes | length),
-        ([$document.kbuild_probes[].id] | unique | length),
-        ([$document.kbuild_probes[] | probe_key] | unique | length),
-        ($document.flag_terminals | length),
-        ([$document.flag_terminals[].id] | unique | length),
-        ([$document.flag_terminals[] | terminal_key] | unique | length),
-        ($document.flag_nodes | length),
-        ([$document.flag_nodes[].id] | unique | length),
-        ([$document.flag_nodes[] | node_key] | unique | length),
-        ($document.flag_programs | length),
-        ([$document.flag_programs[].id] | unique | length),
-        ([$document.flag_programs[] | program_key] | unique | length),
-        ($document.action_recipes | length),
-        ([$value_refs[] | select($values[.] != true)] | length),
-        ([$probe_refs[] | select($probes[.] != true)] | length),
-        ([$declared_program_refs[] | select($programs[.] != true)] | length),
-        ($value_refs | length),
-        ($value_refs | unique | length),
-        ($value_refs | group_by(.) | map(select(length > 1)) | length),
-        ($configured_program_refs | length),
-        ($configured_program_refs | unique | length),
-        ($configured_program_refs | group_by(.) | map(select(length > 1)) | length)
-      ]
-    | @tsv
-  ' "${metadata}"
-)"; then
-  echo "invalid lazy flag DAG metadata: ${metadata}" >&2
+if (( action_group_count > 200 )); then
+  echo "action groups: got ${action_group_count}, maximum 200" >&2
   exit 1
 fi
-IFS=$'\t' read -r \
-  probe_count probe_id_count probe_payload_count \
-  terminal_count terminal_id_count terminal_payload_count \
-  node_count node_id_count node_payload_count \
-  program_count program_id_count program_payload_count \
-  recipe_count \
-  missing_value_refs missing_probe_refs missing_program_refs \
-  value_ref_count unique_value_refs reused_value_ids \
-  configured_program_ref_count unique_configured_program_refs reused_program_ids \
-  <<<"${flag_dag}"
-
-expect lazy_probe_interning \
-  "${probe_count}/${probe_id_count}/${probe_payload_count}" \
-  "2/2/2"
-expect lazy_terminal_interning \
-  "${terminal_count}/${terminal_id_count}/${terminal_payload_count}" \
-  "24/24/24"
-expect lazy_node_interning \
-  "${node_count}/${node_id_count}/${node_payload_count}" \
-  "7/7/7"
-expect lazy_program_interning \
-  "${program_count}/${program_id_count}/${program_payload_count}" \
-  "25/25/25"
-expect lazy_action_recipes "${recipe_count}" "65"
-expect lazy_dag_missing_references \
-  "${missing_value_refs}/${missing_probe_refs}/${missing_program_refs}" \
-  "0/0/0"
-expect lazy_value_reference_reuse \
-  "${value_ref_count}/${unique_value_refs}/${reused_value_ids}" \
-  "42/31/6"
-expect configured_flag_program_reuse \
-  "${configured_program_ref_count}/${unique_configured_program_refs}/${reused_program_ids}" \
-  "7040/25/25"
+expect action_group_ownership "${owned_object_count}" "${union_count}"
+if (( recipe_count == 0 || reachability_count == 0 || largest_action_group < 2 || shared_action_groups == 0 )); then
+  echo "action groups did not demonstrate concrete recipe/reachability sharing" >&2
+  exit 1
+fi
 
 if ! header_families="$(
   jq -er '
@@ -497,33 +289,6 @@ fi
 IFS=$'\t' read -r actions_created actions_executed <<<"${action_counts}"
 expect actions_created "${actions_created}" "${union_count}"
 
-if ! flag_actions="$(
-  jq -ser '
-    . as $events
-    |
-    def created($mnemonic):
-      [
-        $events[]?
-        | .buildMetrics.actionSummary.actionData[]?
-        | select(.mnemonic == $mnemonic)
-        | .actionsCreated
-      ]
-      | if length != 1 then
-          error("expected exactly one \($mnemonic) metric")
-        else
-          .[0]
-        end;
-    [created("LinuxFlagSelect"), created("LinuxFlagConcat")]
-    | @tsv
-  ' "${bep}"
-)"; then
-  echo "invalid lazy flag action metrics: ${bep}" >&2
-  exit 1
-fi
-IFS=$'\t' read -r flag_select_actions flag_concat_actions <<<"${flag_actions}"
-expect flag_select_actions "${flag_select_actions}" "2"
-expect flag_concat_actions "${flag_concat_actions}" "5"
-
 if ! generated_header_actions="$(
   jq -ser '
     . as $events
@@ -590,5 +355,5 @@ if (( configured_targets > max_configured_targets )); then
   exit 1
 fi
 
-printf '%s memberships deduplicated to %s LinuxObjectCompile actions (%s executed); %s configured targets\n' \
-  "${membership_count}" "${union_count}" "${actions_executed}" "${configured_targets}"
+printf '%s memberships deduplicated to %s LinuxObjectCompile actions (%s executed) in %s action groups; %s configured targets\n' \
+  "${membership_count}" "${union_count}" "${actions_executed}" "${action_group_count}" "${configured_targets}"

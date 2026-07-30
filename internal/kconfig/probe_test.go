@@ -8,99 +8,43 @@ import (
 	"testing"
 )
 
-func TestLinuxProbeShellUsesExplicitGCCVersionText(t *testing.T) {
-	config, err := LinuxProbeConfigForModel(LinuxProbeModelLLVM)
-	if err != nil {
-		t.Fatalf("LinuxProbeConfigForModel() failed: %v", err)
-	}
-	for key, value := range map[string]string{
-		"cc_name":         "GCC",
-		"cc_version_text": "gcc (GCC) 15.1.0",
-	} {
-		if err := ApplyLinuxProbeValue(&config, key, value); err != nil {
-			t.Fatalf("ApplyLinuxProbeValue(%q) failed: %v", key, err)
-		}
-	}
-
-	out, err := LinuxProbeShellFromConfig(config)(
-		t.Context(),
-		"x86_64-linux-gnu-gcc --version",
+func testLinuxProbeShell(
+	t *testing.T,
+	architecture string,
+) func(context.Context, string) (string, error) {
+	t.Helper()
+	shell, err := LinuxProbeShell(
+		architecture,
+		LinuxProbeDefaultRustcVersion,
+		LinuxProbeDefaultRustcLLVMVersion,
 	)
 	if err != nil {
-		t.Fatalf("GCC version probe failed: %v", err)
+		t.Fatalf("LinuxProbeShell() failed: %v", err)
 	}
-	if got, want := out, "gcc (GCC) 15.1.0"; got != want {
-		t.Fatalf("GCC version text = %q, want %q", got, want)
-	}
+	return shell
 }
 
-func TestLinuxLLVMProbeProfile(t *testing.T) {
-	config, err := LinuxProbeConfigForModel(LinuxProbeModelLLVM)
-	if err != nil {
-		t.Fatalf("LinuxProbeConfigForModel() failed: %v", err)
-	}
-	if config.CCVersion != 220108 || config.LDVersion != 220108 {
-		t.Fatalf("LLVM probe versions = clang %d, lld %d; want 220108", config.CCVersion, config.LDVersion)
-	}
-	if config.RustcVersion != 109700 || config.RustcLLVMVersion != 220106 {
-		t.Fatalf(
-			"Rust probe versions = rustc %d, LLVM %d; want 109700 and 220106",
-			config.RustcVersion,
-			config.RustcLLVMVersion,
-		)
-	}
-	if config.PaholeVersion != 131 || config.BindgenVersion != "bindgen 0.72.1" {
-		t.Fatalf(
-			"host probes = pahole %d, %q; want 131 and bindgen 0.72.1",
-			config.PaholeVersion,
-			config.BindgenVersion,
-		)
-	}
-	if !config.RustAvailable || !config.RustOptions {
-		t.Fatalf(
-			"Rust probe support = available %t, options %t; want both true",
-			config.RustAvailable,
-			config.RustOptions,
-		)
-	}
-}
-
-func TestClassifyRustToolchainVersionCommand(t *testing.T) {
+func TestLinuxLLVMProbePolicy(t *testing.T) {
+	shell := testLinuxProbeShell(t, "x86_64")
 	for _, test := range []struct {
 		command string
-		want    RustToolchainVersionCommand
+		want    string
 	}{
-		{
-			command: `/src/scripts/rustc-version.sh rustc`,
-			want:    RustToolchainVersionCommandRustc,
-		},
-		{
-			command: `C:\src\scripts\rustc-llvm-version.sh rustc`,
-			want:    RustToolchainVersionCommandLLVM,
-		},
-		{command: `/src/scripts/cc-version.sh clang`},
-		{command: `/src/scripts/cc-can-link.sh clang`},
-		{command: `echo /src/scripts/rustc-version.sh`},
-		{command: `/src/scripts/rustc-version.sh-old rustc`},
-		{command: `/src/scripts/rustc-version.sh clang`},
-		{command: `/src/scripts/rustc-version.sh rustc extra`},
-		{command: `/src/scripts/rustc-version.sh rustc;`},
-		{command: "/src/scripts/rustc-version.sh\nrustc"},
-		{command: `/src/scripts/rustc-version.sh rust?`},
-		{command: `/src/scripts/rustc-version.sh rustc#comment`},
-		{command: `{ /src/scripts/rustc-version.sh rustc; } >/dev/null 2>&1 && echo "y" || echo "n"`},
-		{command: `{ /src/scripts/rust_is_available.sh; } >/dev/null 2>&1 && echo "y" || echo "n"`},
-		{command: `{ trap "rm -rf .tmp_$" EXIT; rustc -Copt-level=2 --crate-type=rlib /dev/null; } >/dev/null 2>&1 && echo "y" || echo "n"`},
-		{command: `bindgen --version workaround-for-0.69.0 2>/dev/null`},
-		{command: `{ clang -Werror -c -x c /dev/null; } >/dev/null 2>&1 && echo "y" || echo "n"`},
+		{command: "/src/scripts/cc-version.sh clang", want: "Clang 220108"},
+		{command: "clang --version", want: "clang version 22.1.8None"},
+		{command: "/src/scripts/as-version.sh clang -fintegrated-as", want: "LLVM 0"},
+		{command: "/src/scripts/ld-version.sh ld.lld", want: "LLD 220108"},
+		{command: "/src/scripts/pahole-version.sh pahole", want: "131"},
+		{command: "bindgen --version workaround-for-0.69.0 2>/dev/null", want: "bindgen 0.72.1"},
+		{command: "/src/scripts/rustc-version.sh rustc", want: "109700"},
+		{command: "/src/scripts/rustc-llvm-version.sh rustc", want: "220106"},
 	} {
-		if got := ClassifyRustToolchainVersionCommand(test.command); got != test.want {
-			t.Errorf(
-				"ClassifyRustToolchainVersionCommand(%q) = %d, want %d",
-				test.command,
-				got,
-				test.want,
-			)
+		got, err := shell(context.Background(), test.command)
+		if err != nil {
+			t.Fatalf("shell(%q) failed: %v", test.command, err)
+		}
+		if got != test.want {
+			t.Fatalf("shell(%q) = %q, want %q", test.command, got, test.want)
 		}
 	}
 }
@@ -144,10 +88,7 @@ config CC_IS_CLANG
 		t.Fatalf("WriteFile() failed: %v", err)
 	}
 
-	shell, err := LinuxProbeShell(LinuxProbeModelLLVM)
-	if err != nil {
-		t.Fatalf("LinuxProbeShell() failed: %v", err)
-	}
+	shell := testLinuxProbeShell(t, "x86_64")
 	tree, err := Parse(context.Background(), strings.NewReader(`
 srctree := `+rootDir+`
 CC := clang
@@ -215,13 +156,13 @@ config BINDGEN_VERSION_TEXT
 }
 
 func TestLinuxLLVMProbeShellSupportsLLVMNmAndArProbes(t *testing.T) {
-	shell, err := LinuxProbeShell(LinuxProbeModelLLVM)
-	if err != nil {
-		t.Fatalf("LinuxProbeShell() failed: %v", err)
-	}
+	shell := testLinuxProbeShell(t, "x86_64")
 	for _, command := range []string{
 		"llvm-nm --help | head -n 1 | grep -qi llvm",
 		"llvm-ar --help | head -n 1 | grep -qi llvm",
+		`ld.lld -v --gc-sections`,
+		`printf "%b\n" ".arch_extension lse" | clang -fintegrated-as -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -`,
+		`echo 'int __seg_fs fs; int __seg_gs gs;' | clang -x c - -S -o /dev/null`,
 	} {
 		out, err := shell(context.Background(), "{ "+command+"; } >/dev/null 2>&1 && echo \"y\" || echo \"n\"")
 		if err != nil {
@@ -250,10 +191,7 @@ m64-flag := $(cc-option-bit,-m64)
 	}
 
 	var commands []string
-	baseShell, err := LinuxProbeShell(LinuxProbeModelLLVM)
-	if err != nil {
-		t.Fatalf("LinuxProbeShell() failed: %v", err)
-	}
+	baseShell := testLinuxProbeShell(t, "x86_64")
 	shell := func(ctx context.Context, command string) (string, error) {
 		commands = append(commands, command)
 		return baseShell(ctx, command)
@@ -287,38 +225,11 @@ config CC_HAS_INT128
 	}
 }
 
-func TestLinuxLLVMProbeShellRejectsNativeCPUOption(t *testing.T) {
-	shell, err := LinuxProbeShell(LinuxProbeModelLLVM)
+func TestLinuxProbeShellKeepsCompilerAndHostFactsFixed(t *testing.T) {
+	shell, err := LinuxProbeShell("x86_64", 109900, 230001)
 	if err != nil {
 		t.Fatalf("LinuxProbeShell() failed: %v", err)
 	}
-	command := `{ clang -Werror -fintegrated-as -march=native -c -x c /dev/null -o /dev/null; } >/dev/null 2>&1 && echo "y" || echo "n"`
-	got, err := shell(t.Context(), command)
-	if err != nil {
-		t.Fatalf("shell(%q) failed: %v", command, err)
-	}
-	if got != "n" {
-		t.Fatalf("shell(%q) = %q, want n", command, got)
-	}
-}
-
-func TestLinuxProbeShellSupportsValueOverrides(t *testing.T) {
-	config, err := LinuxProbeConfigForModel(LinuxProbeModelLLVM)
-	if err != nil {
-		t.Fatalf("LinuxProbeConfigForModel() failed: %v", err)
-	}
-	for key, value := range map[string]string{
-		"bindgen_version": "bindgen 0.71.1",
-		"ld_version":      "210000",
-		"pahole_version":  "124",
-		"rust_available":  "yes",
-	} {
-		if err := ApplyLinuxProbeValue(&config, key, value); err != nil {
-			t.Fatalf("ApplyLinuxProbeValue(%q, %q) failed: %v", key, value, err)
-		}
-	}
-
-	shell := LinuxProbeShellFromConfig(config)
 	for _, test := range []struct {
 		name    string
 		command string
@@ -327,22 +238,27 @@ func TestLinuxProbeShellSupportsValueOverrides(t *testing.T) {
 		{
 			name:    "linker version",
 			command: "/src/scripts/ld-version.sh ld.lld",
-			want:    "LLD 210000",
+			want:    "LLD 220108",
 		},
 		{
 			name:    "pahole version",
 			command: "/src/scripts/pahole-version.sh pahole",
-			want:    "124",
+			want:    "131",
 		},
 		{
 			name:    "bindgen version",
 			command: "bindgen --version workaround-for-0.69.0 2>/dev/null",
-			want:    "bindgen 0.71.1",
+			want:    "bindgen 0.72.1",
 		},
 		{
-			name:    "rust availability",
-			command: `{ /src/scripts/rust_is_available.sh rustc; } >/dev/null 2>&1 && echo "y" || echo "n"`,
-			want:    "y",
+			name:    "selected rustc version",
+			command: "/src/scripts/rustc-version.sh rustc",
+			want:    "109900",
+		},
+		{
+			name:    "selected Rust LLVM version",
+			command: "/src/scripts/rustc-llvm-version.sh rustc",
+			want:    "230001",
 		},
 		{
 			name:    "generic compiler option",
@@ -379,5 +295,72 @@ func TestLinuxProbeShellSupportsValueOverrides(t *testing.T) {
 				t.Fatalf("shell(%q) = %q, want %q", test.command, got, test.want)
 			}
 		})
+	}
+}
+
+func TestLinuxLLVMProbeShellUsesArchitectureCapabilityBaseline(t *testing.T) {
+	command := `{ clang -Werror -fintegrated-as -fsanitize=kernel-memory -c -x c /dev/null -o /tmp/tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`
+	for _, test := range []struct {
+		architecture string
+		want         string
+	}{
+		{architecture: "x86_64", want: "y"},
+		{architecture: "arm64", want: "n"},
+	} {
+		t.Run(test.architecture, func(t *testing.T) {
+			shell := testLinuxProbeShell(t, test.architecture)
+			got, err := shell(context.Background(), command)
+			if err != nil {
+				t.Fatalf("shell(%q) failed: %v", command, err)
+			}
+			if got != test.want {
+				t.Fatalf("shell(%q) = %q, want %q", command, got, test.want)
+			}
+		})
+	}
+}
+
+func TestLinuxLLVMProbeShellRejectsUnknownCompilerCandidate(t *testing.T) {
+	shell := testLinuxProbeShell(t, "x86_64")
+	command := `{ clang -Werror -fbrand-new-kernel-flag -c -x c /dev/null -o /tmp/tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`
+	_, err := shell(context.Background(), command)
+	if err == nil {
+		t.Fatalf("shell(%q) unexpectedly succeeded", command)
+	}
+	for _, want := range []string{"-fbrand-new-kernel-flag", "x86_64", "Clang 22.1.8"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("shell(%q) error %q does not contain %q", command, err, want)
+		}
+	}
+}
+
+func TestLinuxLLVMProbeShellRejectsUnknownProbeCommand(t *testing.T) {
+	shell := testLinuxProbeShell(t, "x86_64")
+	command := `{ custom-kernel-probe --answer; } >/dev/null 2>&1 && echo "y" || echo "n"`
+	_, err := shell(context.Background(), command)
+	if err == nil || !strings.Contains(err.Error(), "custom-kernel-probe --answer") {
+		t.Fatalf("shell(%q) error = %v, want contextual unsupported-probe error", command, err)
+	}
+}
+
+func TestLinuxLLVMProbeShellKeepsRustFactsDynamic(t *testing.T) {
+	shell, err := LinuxProbeShell("arm64", 109900, 230001)
+	if err != nil {
+		t.Fatalf("LinuxProbeShell() failed: %v", err)
+	}
+	for _, test := range []struct {
+		command string
+		want    string
+	}{
+		{command: "/src/scripts/rustc-version.sh rustc", want: "109900"},
+		{command: "/src/scripts/rustc-llvm-version.sh rustc", want: "230001"},
+	} {
+		got, err := shell(context.Background(), test.command)
+		if err != nil {
+			t.Fatalf("shell(%q) failed: %v", test.command, err)
+		}
+		if got != test.want {
+			t.Fatalf("shell(%q) = %q, want %q", test.command, got, test.want)
+		}
 	}
 }

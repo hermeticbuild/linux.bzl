@@ -38,21 +38,15 @@ linux_source_repository(
 linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
 linux_images.image(
     name = "aya_aarch64_kernel",
-    arch = "aarch64",
     config = "@aya//test/kernel:aya_aarch64.config",
     config_mode = "allnoconfig",
-    graph_profile = "@linux.bzl//profiles:llvm_22_1_8_aarch64.graph.json",
-    kbuild_linker = "@llvm//tools:ld.lld",
     platform = "@llvm//platforms:linux_arm64",
     source = "@aya_linux_6_18_39//:Kconfig",
 )
 linux_images.image(
     name = "aya_x86_64_kernel",
-    arch = "x86_64",
     config = "@aya//test/kernel:aya_x86_64.config",
     config_mode = "allnoconfig",
-    graph_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.graph.json",
-    kbuild_linker = "@llvm//tools:ld.lld",
     platform = "@llvm//platforms:linux_x86_64",
     source = "@aya_linux_6_18_39//:Kconfig",
 )

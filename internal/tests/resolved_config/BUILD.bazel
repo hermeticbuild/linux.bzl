@@ -35,13 +35,29 @@ linux_resolved_config(
         "ARCH": "x86",
         "SRCARCH": "x86",
     },
-    graph_profile = "//internal/tests:graph_profile_context_test_target",
     root = "Kconfig",
     source_root = "Kconfig",
     vars = {
         "ARCH": "x86",
         "SRCARCH": "x86",
         "UTS_MACHINE": "x86_64",
+    },
+)
+
+linux_resolved_config(
+    name = "resolved_arm64_config",
+    config = ":resolved_c_config_input",
+    config_name = "arm64",
+    env = {
+        "ARCH": "arm64",
+        "SRCARCH": "arm64",
+    },
+    root = "Kconfig",
+    source_root = "Kconfig",
+    vars = {
+        "ARCH": "arm64",
+        "SRCARCH": "arm64",
+        "UTS_MACHINE": "aarch64",
     },
 )
 
@@ -53,7 +69,6 @@ linux_resolved_config(
         "ARCH": "x86",
         "SRCARCH": "x86",
     },
-    graph_profile = "//internal/tests:graph_profile_context_test_target",
     minimum_rustc_version = "1.78.0",
     root = "Kconfig",
     rust_enabled = True,

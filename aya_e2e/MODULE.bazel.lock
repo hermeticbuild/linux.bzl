@@ -294,21 +294,17 @@
     },
     "@@linux.bzl+//:extensions.bzl%linux_images": {
       "general": {
-        "bzlTransitiveDigest": "NDCr4r/bGD7At8rQL2jFfOlDlfL7cC/v1ZiacHnyMEE=",
-        "usagesDigest": "VlH/k0X2YQCBsHcqU6GBKGffSxnPkICYUsPI8uIO5tM=",
+        "bzlTransitiveDigest": "WKOasfrm+E7kHeJ3Cvvh3ZVJvD0FUOQfqZ/9umcw4kE=",
+        "usagesDigest": "p6VHWgr+rKdEcDiu5ssG/Jdd/e/tM3ukNrv9zsJ2ua4=",
         "recordedInputs": [
           "REPO_MAPPING:,aya aya+",
           "REPO_MAPPING:,aya_linux_6_18_39 +linux_source_repository+aya_linux_6_18_39",
-          "REPO_MAPPING:,linux.bzl linux.bzl+",
           "REPO_MAPPING:,llvm llvm+"
         ],
         "generatedRepoSpecs": {
           "aya_aarch64_kernel__linux_graph": {
             "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
             "attributes": {
-              "arch": "aarch64",
-              "graph_profile": "@@linux.bzl+//profiles:llvm_22_1_8_aarch64.graph.json",
-              "kbuild_linker": "@@llvm+//tools:ld.lld",
               "config": "@@aya+//test/kernel:aya_aarch64.config",
               "config_mode": "allnoconfig",
               "overlays": {
@@ -330,9 +326,6 @@
           "aya_x86_64_kernel__linux_graph": {
             "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
             "attributes": {
-              "arch": "x86_64",
-              "graph_profile": "@@linux.bzl+//profiles:llvm_22_1_8_x86_64.graph.json",
-              "kbuild_linker": "@@llvm+//tools:ld.lld",
               "config": "@@aya+//test/kernel:aya_x86_64.config",
               "config_mode": "allnoconfig",
               "overlays": {

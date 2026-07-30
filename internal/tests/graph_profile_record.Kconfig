@@ -1,5 +1,0 @@
-mainmenu "Graph profile recording fixture"
-
-config X86_64
-	bool
-	default y

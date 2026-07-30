@@ -8,8 +8,9 @@ readonly WORK_ROOT="${TEST_TMPDIR}/linux_image_extension"
 readonly MODULE_UNDER_TEST="${WORK_ROOT}/linux_bzl"
 readonly BAZEL_BIN="${BAZEL:-bazel}"
 readonly SUCCESS_OUTPUT="${TEST_TMPDIR}/success-output"
-readonly MISSING_GRAPH_PROFILE_OUTPUT="${TEST_TMPDIR}/missing-graph-profile-output"
+readonly REMOVED_ATTR_OUTPUT="${TEST_TMPDIR}/removed-attr-output"
 readonly NON_ROOT_TAGS_OUTPUT="${TEST_TMPDIR}/non-root-tags-output"
+readonly REPOSITORY_NAME_COLLISION_OUTPUT="${TEST_TMPDIR}/repository-name-collision-output"
 
 fail() {
   echo "linux_image_extension_integration_test: $*" >&2
@@ -28,7 +29,6 @@ prepare_fixture() {
   cp "${RUNFILES_ROOT}/extensions.bzl" "${MODULE_UNDER_TEST}/extensions.bzl"
   mkdir -p "${MODULE_UNDER_TEST}/internal"
   for source in \
-    compact_v7_repository.bzl \
     config_validation.bzl \
     kconfig_tool_filename.bzl \
     kconfig_tool_releases.bzl \
@@ -69,8 +69,9 @@ shutdown_bazel() {
 
 cleanup() {
   shutdown_bazel "${SUCCESS_OUTPUT}"
-  shutdown_bazel "${MISSING_GRAPH_PROFILE_OUTPUT}"
+  shutdown_bazel "${REMOVED_ATTR_OUTPUT}"
   shutdown_bazel "${NON_ROOT_TAGS_OUTPUT}"
+  shutdown_bazel "${REPOSITORY_NAME_COLLISION_OUTPUT}"
 }
 
 expect_failure() {
@@ -106,7 +107,6 @@ for target in \
   image \
   kernel \
   kernel_release \
-  module_sdk \
   module_symvers \
   modules \
   modules_builtin \
@@ -144,12 +144,6 @@ run_bazel \
 grep -E 'fixture_kernel__linux_graph//graph:metadata.json",$' "${METADATA_BUILD_OUTPUT}" >/dev/null ||
   fail "metadata alias does not use the hidden sibling graph repository"
 
-run_bazel \
-  "${SUCCESS}" \
-  "${SUCCESS_OUTPUT}" \
-  query \
-  '//:graph_metadata'
-
 expect_failure \
   "${SUCCESS}" \
   "${SUCCESS_OUTPUT}" \
@@ -160,26 +154,17 @@ expect_failure \
 expect_failure \
   "${SUCCESS}" \
   "${SUCCESS_OUTPUT}" \
-  "No repository visible as '@fixture_kernel__linux_graph'" \
-  query \
-  '@fixture_kernel__linux_graph//graph:metadata.json'
-
-expect_failure \
-  "${SUCCESS}" \
-  "${SUCCESS_OUTPUT}" \
   "source must be in a dedicated external repository" \
   build \
   --nobuild \
   '@fixture_kernel//:image'
 
 expect_failure \
-  "${WORK_ROOT}/missing_graph_profile" \
-  "${MISSING_GRAPH_PROFILE_OUTPUT}" \
-  "mandatory attribute" \
+  "${WORK_ROOT}/removed_attr" \
+  "${REMOVED_ATTR_OUTPUT}" \
+  "arch" \
   query \
   '@fixture_kernel//:image'
-grep -F "graph_profile" "${MISSING_GRAPH_PROFILE_OUTPUT}.log" >/dev/null ||
-  fail "missing mandatory attribute error did not identify graph_profile"
 
 expect_failure \
   "${WORK_ROOT}/non_root_tags" \
@@ -187,3 +172,10 @@ expect_failure \
   "linux_images tags are root-module application choices" \
   query \
   '@dependency_kernel//:image'
+
+expect_failure \
+  "${WORK_ROOT}/repository_name_collision" \
+  "${REPOSITORY_NAME_COLLISION_OUTPUT}" \
+  "generate conflicting repository" \
+  query \
+  '@fixture_kernel//:image'

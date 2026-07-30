@@ -296,8 +296,8 @@ def _indexed_assembly_source_test_impl(ctx):
         action = actions[0]
         argv = action.argv
         asserts.true(env, "-D__ASSEMBLY__" in argv)
-        source_index = argv.index("-source")
-        asserts.true(env, argv[source_index + 1].endswith("/lib/crypto/x86/blake2s-core.S"))
+        compile_index = argv.index("-c")
+        asserts.true(env, argv[compile_index + 1].endswith("/lib/crypto/x86/blake2s-core.S"))
         input_basenames = [file.basename for file in action.inputs.to_list()]
         asserts.true(env, "blake2s-core.S" in input_basenames)
         asserts.false(env, "blake2s.h" in input_basenames)
@@ -626,12 +626,7 @@ def _cache_shape_test_impl(ctx):
 
 _cache_shape_test = analysistest.make(_cache_shape_test_impl)
 
-def linux_objects_fail_closed_test_suite(
-        name,
-        aarch64_empty_program,
-        aarch64_flag_programs,
-        empty_program,
-        flag_programs):
+def linux_objects_fail_closed_test_suite(name):
     """Instantiates analysis tests for supported Linux object/image rules."""
     image = name + "_input_image"
     fixture_tags = ["manual"]
@@ -668,13 +663,8 @@ def linux_objects_fail_closed_test_suite(
         compile_environment_id = environment_id,
         compile_environment_index = ":" + name + "_compile_environment_index",
         content_id = object_a_id,
-        flag_program = empty_program,
-        flag_programs = flag_programs,
         mode = "y",
-        needs_object_dir = False,
-        needs_utsversion_tmp = False,
         object = "certs/system_certificates.o",
-        remove_flag_program = empty_program,
         source_input_file = 4,
         source_input_group = 1,
         source_input_index = ":" + name + "_source_input_index",
@@ -857,13 +847,8 @@ def linux_objects_fail_closed_test_suite(
         compile_environment_id = environment_id,
         compile_environment_index = ":" + compile_environment_index,
         content_id = object_c_id,
-        flag_program = empty_program,
-        flag_programs = flag_programs,
         mode = "y",
-        needs_object_dir = False,
-        needs_utsversion_tmp = False,
         object = "lib/crypto/x86/blake2s-core.o",
-        remove_flag_program = empty_program,
         source_input_file = 1,
         source_input_group = 1,
         source_input_index = ":" + assembly_source_input_index,
@@ -922,13 +907,8 @@ def linux_objects_fail_closed_test_suite(
         compile_environment_id = environment_id,
         compile_environment_index = ":" + compile_environment_index,
         content_id = object_a_id,
-        flag_program = empty_program,
-        flag_programs = flag_programs,
         mode = "y",
-        needs_object_dir = False,
-        needs_utsversion_tmp = False,
         object = "indexed.o",
-        remove_flag_program = empty_program,
         source_input_file = 4,
         source_input_group = 1,
         source_input_index = ":" + source_input_index,
@@ -950,13 +930,8 @@ def linux_objects_fail_closed_test_suite(
         compile_environment_id = precise_environment_id,
         compile_environment_index = ":" + precise_header_family_index,
         content_id = object_b_id,
-        flag_program = empty_program,
-        flag_programs = flag_programs,
         mode = "y",
-        needs_object_dir = False,
-        needs_utsversion_tmp = False,
         object = "precise-family.o",
-        remove_flag_program = empty_program,
         source_input_file = 4,
         source_input_group = 1,
         source_input_index = ":" + source_input_index,
@@ -987,13 +962,8 @@ def linux_objects_fail_closed_test_suite(
         compile_environment_id = "not-a-sha256",
         compile_environment_index = ":" + empty_compile_environment_index,
         content_id = object_a_id,
-        flag_program = empty_program,
-        flag_programs = flag_programs,
         mode = "y",
-        needs_object_dir = False,
-        needs_utsversion_tmp = False,
         object = "invalid-environment.o",
-        remove_flag_program = empty_program,
         source_input_file = 4,
         source_input_group = 1,
         source_input_index = ":" + source_input_index,
@@ -1005,13 +975,8 @@ def linux_objects_fail_closed_test_suite(
         compile_environment_id = environment_id,
         compile_environment_index = ":" + compile_environment_index,
         content_id = object_c_id,
-        flag_program = empty_program,
-        flag_programs = flag_programs,
         mode = "y",
-        needs_object_dir = False,
-        needs_utsversion_tmp = False,
         object = "out-of-range-primary-source.o",
-        remove_flag_program = empty_program,
         source_input_file = 5,
         source_input_group = 1,
         source_input_index = ":" + source_input_index,
@@ -1249,17 +1214,11 @@ def linux_objects_fail_closed_test_suite(
     exact_vdso32 = name + "_exact_vdso32"
     linux_object(
         name = exact_vdso32,
-        arch = "arm64",
         compile_environment_id = arm64_environment_id,
         compile_environment_index = ":" + arm64_compile_environment_index,
         content_id = vdso32_object_id,
-        flag_program = aarch64_empty_program,
-        flag_programs = aarch64_flag_programs,
         mode = "y",
-        needs_object_dir = False,
-        needs_utsversion_tmp = False,
         object = "arch/arm64/kernel/vdso32-wrap.o",
-        remove_flag_program = aarch64_empty_program,
         source_input_file = 1,
         source_input_group = 1,
         source_input_index = ":" + vdso32_source_input_index,

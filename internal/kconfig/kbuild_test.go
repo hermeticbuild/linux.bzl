@@ -1,17 +1,12 @@
 package kconfig
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
-
-	"github.com/hermeticbuild/linux.bzl/internal/ccprofile"
 )
 
 func TestParseKbuildCommonObjectPatterns(t *testing.T) {
@@ -208,384 +203,345 @@ CFLAGS_core.o := $(call cc-option,-fno-conserve-stack) \
 	}
 }
 
-func TestKbuildUnprofiledProbeFailsClosedBeforeGraphSelection(t *testing.T) {
+func TestKbuildClangCapabilityPolicyResolvesKnownCallsEagerly(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`comma := ,
+obj-y += core.o
+CFLAGS_core.o := $(call cc-option,-Wno-gnu) \
+	$(call cc-option,-Wmaybe-uninitialized,-Wno-uninitialized) \
+	$(call as-option,-Wa$(comma)-march=armv8.5-a) \
+	$(call ld-option,-maarch64elf)
+obj-$(call cc-option-yn,-Wno-vla) += supported.o
+obj-$(call cc-option-yn,-Wrestrict) += unsupported.o
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{"SRCARCH": "arm64"},
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+	var gotFlags []string
+	for _, flag := range kb.Flags {
+		if flag.Scope == "object" && flag.Object == "core.o" {
+			gotFlags = append(gotFlags, flag.Flags...)
+		}
+	}
+	wantFlags := []string{
+		"-Wno-gnu",
+		"-Wno-uninitialized",
+		"-Wa,-march=armv8.5-a",
+		"-maarch64elf",
+	}
+	if !reflect.DeepEqual(gotFlags, wantFlags) {
+		t.Fatalf("resolved Clang flags = %#v, want %#v", gotFlags, wantFlags)
+	}
+	gotObjects := kbuildObjectSummaries(kb.Objects)
+	if !slices.ContainsFunc(gotObjects, func(object kbuildObjectSummary) bool {
+		return object.object == "supported.o" && object.state == "y"
+	}) {
+		t.Fatalf("known supported cc-option-yn object missing from %#v", gotObjects)
+	}
+	if slices.ContainsFunc(gotObjects, func(object kbuildObjectSummary) bool {
+		return object.object == "unsupported.o"
+	}) {
+		t.Fatalf("known unsupported cc-option-yn object unexpectedly present in %#v", gotObjects)
+	}
+}
+
+func TestKbuildClangCapabilityPolicyUsesRelevantContext(t *testing.T) {
 	for _, test := range []struct {
-		name string
-		text string
+		name    string
+		context string
+		want    string
 	}{
 		{
-			name: "immediate graph variable",
-			text: `
-has_feature := $(call cc-option-yn,-mrecord-mcount)
-ifeq ($(has_feature),y)
-obj-y += feature.o
-endif
-`,
+			name:    "supported stack alignment context",
+			context: "-m32 -mstack-alignment=4",
+			want:    "-march=atom",
 		},
 		{
-			name: "symbolic flag leaks to graph",
-			text: `
-ccflags-y += $(call cc-option-yn,-mrecord-mcount)
-ifeq ($(ccflags-y),y)
-obj-y += feature.o
-endif
-`,
-		},
-		{
-			name: "object collection",
-			text: `
-obj-y += $(call cc-option-yn,-mrecord-mcount)
-`,
-		},
-		{
-			name: "directory descent",
-			text: `
-obj-y += $(call cc-option,-fplugin-enabled,drivers/)
-`,
+			name:    "unsupported preferred boundary context",
+			context: "-m32 -mpreferred-stack-boundary=2",
+			want:    "-march=i386",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := ParseKbuild(strings.NewReader(test.text), "Kbuild")
-			if err == nil {
-				t.Fatal("ParseKbuild() accepted an unprofiled graph-sensitive probe")
+			dir := t.TempDir()
+			kbuild := filepath.Join(dir, "Kbuild")
+			content := "obj-y += core.o\n" +
+				"KBUILD_CFLAGS := " + test.context + "\n" +
+				"CFLAGS_core.o := $(call cc-option,-march=atom,-march=i386)\n"
+			if err := os.WriteFile(kbuild, []byte(content), 0o644); err != nil {
+				t.Fatalf("WriteFile(Kbuild) failed: %v", err)
 			}
-			for _, want := range []string{
-				"unsupported dynamic Kbuild graph",
-			} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("error %q does not contain %q", err, want)
+			kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+				Variables: map[string]string{"SRCARCH": "x86"},
+			})
+			if err != nil {
+				t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+			}
+			var got []string
+			for _, flag := range kb.Flags {
+				if flag.Scope == "object" && flag.Object == "core.o" {
+					got = append(got, flag.Flags...)
 				}
+			}
+			if !reflect.DeepEqual(got, []string{test.want}) {
+				t.Fatalf("contextual cc-option flags = %#v, want %q", got, test.want)
 			}
 		})
 	}
 }
 
-func TestKbuildFlagSinksRetainAllKnownProbeKinds(t *testing.T) {
-	kb, err := ParseKbuild(strings.NewReader(`
-KBUILD_CPPFLAGS := -DCTX=1
-KBUILD_CFLAGS := -mcmodel=kernel
-KBUILD_AFLAGS := -DASSEMBLY
-KBUILD_LDFLAGS := -m elf_x86_64
-obj-y += core.o
-ccflags-y += $(call cc-option,-fgood,-ffallback)
-ccflags-y += $(call cc-option-yn,-mrecord-mcount)
-ccflags-y += $(call cc-disable-warning,unused)
-asflags-y += $(call as-option,-masm-good)
-ccflags-y += $(call ld-option,--ld-good)
-CFLAGS_REMOVE_core.o += $(call cc-option,-fomit-frame-pointer)
-`), "Kbuild")
-	if err != nil {
-		t.Fatalf("ParseKbuild() failed: %v", err)
-	}
-
-	counts := map[string]int{}
-	sawYN := false
-	seen := map[string]bool{}
-	var visit func(*kbuildFlagExpr)
-	visit = func(expression *kbuildFlagExpr) {
-		if expression == nil || seen[expression.id] {
-			return
-		}
-		seen[expression.id] = true
-		switch expression.kind {
-		case kbuildFlagConcat:
-			for _, child := range expression.children {
-				visit(child)
-			}
-		case kbuildFlagSelect:
-			counts[expression.probe.kind]++
-			if reflect.DeepEqual(expression.probe.candidateArgv, []string{"-mrecord-mcount"}) {
-				sawYN = reflect.DeepEqual(expression.whenTrue.argv, []string{"y"}) &&
-					reflect.DeepEqual(expression.whenFalse.argv, []string{"n"})
-			}
-			if expression.probe.context == nil {
-				t.Errorf("probe %v has no context program", expression.probe.candidateArgv)
-			}
-			visit(expression.probe.context)
-			visit(expression.whenTrue)
-			visit(expression.whenFalse)
-		}
-	}
-	for _, group := range append(append([]KbuildFlag(nil), kb.Flags...), kb.RemoveFlags...) {
-		visit(group.program)
-	}
-	if got, want := counts, map[string]int{
-		"as_option": 1,
-		"cc_option": 4,
-		"ld_option": 1,
-	}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("symbolic probe kinds = %v, want %v", got, want)
-	}
-	if !sawYN {
-		t.Fatal("cc-option-yn did not retain y/n branches")
-	}
-}
-
-func TestKbuildSymbolicFilterOutTransformsOnlyEmittedFlags(t *testing.T) {
-	kb, err := ParseKbuild(strings.NewReader(`
-KBUILD_CFLAGS := -fkeep -fdrop $(call cc-option,-fsymbolic,-ffallback)
-KBUILD_CFLAGS := $(filter-out -fdrop -Werror,$(KBUILD_CFLAGS))
-obj-y += core.o
-`), "Kbuild")
-	if err != nil {
-		t.Fatalf("ParseKbuild() failed: %v", err)
-	}
-	if got, want := len(kb.Flags), 1; got != want {
-		t.Fatalf("flag groups = %d, want %d: %#v", got, want, kb.Flags)
-	}
-	for _, flag := range kb.Flags[0].Flags {
-		if flag == "-fdrop" || flag == "-Werror" {
-			t.Fatalf("concrete filtered flags still contain %q: %v", flag, kb.Flags[0].Flags)
-		}
-	}
-
-	var selectExpression *kbuildFlagExpr
-	var visit func(*kbuildFlagExpr)
-	visit = func(expression *kbuildFlagExpr) {
-		if expression == nil || selectExpression != nil {
-			return
-		}
-		switch expression.kind {
-		case kbuildFlagConcat:
-			for _, child := range expression.children {
-				visit(child)
-			}
-		case kbuildFlagSelect:
-			selectExpression = expression
-		}
-	}
-	visit(kb.Flags[0].program)
-	if selectExpression == nil {
-		t.Fatal("filtered program lost its compiler-option select")
-	}
-	if got, want := selectExpression.probe.candidateArgv, []string{"-fsymbolic"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("probe candidate = %v, want %v", got, want)
-	}
-	if !kbuildFlagExpressionContainsArg(selectExpression.probe.context, "-Werror") {
-		t.Fatalf("filter-out rewrote probe context: %#v", selectExpression.probe.context)
-	}
-	if got, want := selectExpression.whenTrue.argv, []string{"-fsymbolic"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("true output = %v, want %v", got, want)
-	}
-	if got, want := selectExpression.whenFalse.argv, []string{"-ffallback"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("false output = %v, want %v", got, want)
-	}
-}
-
-func TestKbuildSymbolicFilterOutMayReduceProbe(t *testing.T) {
-	kb, err := ParseKbuild(strings.NewReader(`
-KBUILD_CFLAGS := -fkeep $(call cc-option,-fsymbolic,-ffallback)
-KBUILD_CFLAGS := $(filter-out -fsymbolic -ffallback,$(KBUILD_CFLAGS))
-obj-y += core.o
-`), "Kbuild")
-	if err != nil {
-		t.Fatalf("ParseKbuild() failed: %v", err)
-	}
-	if got, want := len(kb.Flags), 1; got != want {
-		t.Fatalf("flag groups = %d, want %d: %#v", got, want, kb.Flags)
-	}
-	if got, want := kb.Flags[0].Flags, []string{"-fkeep"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("concrete flags = %v, want %v", got, want)
-	}
-	if kbuildFlagExpressionContainsSelect(kb.Flags[0].program) {
-		t.Fatalf("fully filtered probe was not reduced: %#v", kb.Flags[0].program)
-	}
-}
-
-func TestKbuildFilterOutInheritedFlagsEmitsExactRemovals(t *testing.T) {
+func TestKbuildClangCapabilityPolicyResolvesLinux618X8664AlignmentOptions(t *testing.T) {
 	dir := t.TempDir()
 	kbuild := filepath.Join(dir, "Kbuild")
-	if err := os.WriteFile(kbuild, []byte(`
-KBUILD_CFLAGS := $(filter-out -fprofile-sample-use=% -fprofile-use=%,$(KBUILD_CFLAGS))
+	if err := os.WriteFile(kbuild, []byte(`cc_stack_align4 := -mstack-alignment=4
 obj-y += core.o
+CFLAGS_core.o := $(call cc-option,-falign-jumps=1) $(call cc-option,-falign-loops=1)
 `), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
 	}
 	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
 		Variables: map[string]string{
-			"KBUILD_CFLAGS": "-O2 -fprofile-sample-use=sample.prof -fprofile-use=default.prof -fkeep",
+			"KBUILD_CFLAGS": "-mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-sse4a $(call cc-option,-fcf-protection=branch -fno-jump-tables) $(call cc-option,-fcf-protection=none) -m32 -msoft-float -mregparm=3 -freg-struct-return -fno-pic $(cc_stack_align4) $(cflags-y) -ffreestanding -m64",
+			"SRCARCH":       "x86",
 		},
 	})
 	if err != nil {
 		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
 	}
-	if len(kb.Flags) != 0 {
-		t.Fatalf("inherited filter emitted duplicate additions: %#v", kb.Flags)
-	}
-	if got, want := len(kb.RemoveFlags), 1; got != want {
-		t.Fatalf("removal groups = %d, want %d: %#v", got, want, kb.RemoveFlags)
-	}
-	if got, want := kb.RemoveFlags[0].Flags, []string{
-		"-fprofile-sample-use=sample.prof",
-		"-fprofile-use=default.prof",
-	}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("inherited removals = %v, want %v", got, want)
-	}
-}
-
-func TestKbuildFilterOutSelfReferenceRetainsSuffixAdditions(t *testing.T) {
-	kb, err := ParseKbuild(strings.NewReader(`
-KBUILD_CFLAGS := -fkeep -fdrop $(call cc-option,-fsymbolic)
-KBUILD_CFLAGS := $(filter-out -fdrop,$(KBUILD_CFLAGS)) -fadded
-obj-y += core.o
-`), "Kbuild")
-	if err != nil {
-		t.Fatalf("ParseKbuild() failed: %v", err)
-	}
-	if got, want := len(kb.Flags), 2; got != want {
-		t.Fatalf("flag groups = %d, want %d: %#v", got, want, kb.Flags)
-	}
-	if slices.Contains(kb.Flags[0].Flags, "-fdrop") ||
-		kbuildFlagExpressionContainsArg(kb.Flags[0].program, "-fdrop") {
-		t.Fatalf("filtered group retained -fdrop: %#v", kb.Flags[0])
-	}
-	if got, want := kb.Flags[1].Flags, []string{"-fadded"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("suffix additions = %v, want %v", got, want)
-	}
-	if kbuildFlagExpressionContainsSelect(kb.Flags[1].program) {
-		t.Fatalf("suffix group duplicated the inherited select: %#v", kb.Flags[1].program)
-	}
-}
-
-func kbuildFlagExpressionContainsArg(expression *kbuildFlagExpr, want string) bool {
-	if expression == nil {
-		return false
-	}
-	switch expression.kind {
-	case kbuildFlagLiteral:
-		return slices.Contains(expression.argv, want)
-	case kbuildFlagConcat:
-		for _, child := range expression.children {
-			if kbuildFlagExpressionContainsArg(child, want) {
-				return true
-			}
+	var got []string
+	for _, flag := range kb.Flags {
+		if flag.Scope == "object" && flag.Object == "core.o" {
+			got = append(got, flag.Flags...)
 		}
-	case kbuildFlagSelect:
-		return kbuildFlagExpressionContainsArg(expression.whenTrue, want) ||
-			kbuildFlagExpressionContainsArg(expression.whenFalse, want)
 	}
-	return false
-}
-
-func TestKbuildSymbolicFlagUnsupportedTransformsFailClosed(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		text string
-		want string
-	}{
-		{
-			name: "embedded argument",
-			text: "ccflags-y += -DHAS_FEATURE=$(call cc-option-yn,-mrecord-mcount)\n",
-			want: "embedded in argument",
-		},
-		{
-			name: "dynamic make condition",
-			text: "ccflags-y += $(if $(call cc-option-yn,-mrecord-mcount),-DFEATURE,-DNO_FEATURE)\n",
-			want: "Make if condition",
-		},
-		{
-			name: "dynamic filter patterns",
-			text: "ccflags-y += $(filter-out $(call cc-option,-fpattern),-fkeep)\n",
-			want: "symbolic Kbuild flag patterns",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			_, err := ParseKbuild(strings.NewReader(test.text), "Kbuild")
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("ParseKbuild() error = %v, want %q", err, test.want)
-			}
-		})
+	if !reflect.DeepEqual(got, []string{"-falign-loops=1"}) {
+		t.Fatalf("x86_64 alignment flags = %#v, want -falign-loops=1", got)
 	}
 }
 
-func TestKbuildGraphProfileRecordsCanonicalProbeWithInputs(t *testing.T) {
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "include"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	header := []byte("#define GRAPH_PROBE_CONTEXT 1\n")
-	if err := os.WriteFile(filepath.Join(root, "include", "probe.h"), header, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	kbuild := filepath.Join(root, "Kbuild")
-	if err := os.WriteFile(kbuild, []byte(`
-KBUILD_CPPFLAGS := -include $(srctree)/include/probe.h
-has_feature := $(call cc-option-yn,-fgood)
-ifeq ($(has_feature),y)
-obj-y += feature.o
-endif
+func TestKbuildClangCapabilityPolicyResolvesLinux618X8664MakefileOptions(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Makefile")
+	if err := os.WriteFile(kbuild, []byte(`obj-y += core.o
+CFLAGS_core.o := $(call cc-option,-Wa$(comma)-mtune=generic32,) \
+	$(call cc-option,-maccumulate-outgoing-args,)
 `), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("WriteFile(Makefile) failed: %v", err)
 	}
-	identity := ccprofile.GraphProfileIdentity{
-		Architecture:   "x86_64",
-		DriverContract: ccprofile.DriverContract,
-		AnalysisIdentity: ccprofile.AnalysisIdentity{
-			Compiler:            "clang",
-			TargetGNUSystemName: "x86_64-unknown-linux-gnu",
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{
+			"KBUILD_CFLAGS": "-m64",
+			"SRCARCH":       "x86",
+			"comma":         ",",
 		},
-	}
-	recording, err := NewGraphProfileRecordingShell(
-		identity,
-		root,
-		nil,
-		func(context.Context, string) (string, error) { return "", nil },
-	)
+	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
 	}
-	opts := KbuildOptions{
-		RootDir:      root,
-		Variables:    map[string]string{"srctree": root},
-		GraphProfile: recording,
+	for _, flag := range kb.Flags {
+		if flag.Scope == "object" && flag.Object == "core.o" && len(flag.Flags) != 0 {
+			t.Fatalf("unsupported x86_64 Clang flags unexpectedly emitted: %#v", flag.Flags)
+		}
 	}
-	kb, err := ParseKbuildFileWithOptions(kbuild, opts)
-	if err != nil {
-		t.Fatalf("recording parse failed: %v", err)
-	}
-	if got, want := len(kb.Objects), 1; got != want {
-		t.Fatalf("recording objects = %#v, want %d", kb.Objects, want)
-	}
-	profile, err := recording.RecordedProfile()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := len(profile.KbuildGraphProbes), 1; got != want {
-		t.Fatalf("recorded probes = %#v, want %d", profile.KbuildGraphProbes, want)
-	}
-	probe := profile.KbuildGraphProbes[0]
-	if got, want := probe.Kind, ccprofile.KbuildGraphProbeKindCCOption; got != want {
-		t.Fatalf("probe kind = %q, want %q", got, want)
-	}
-	if got, want := probe.CandidateArgv, []string{"-fgood"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("candidate argv = %v, want %v", got, want)
-	}
-	sum := sha256.Sum256(header)
-	if got, want := probe.Inputs["include/probe.h"], hex.EncodeToString(sum[:]); got != want {
-		t.Fatalf("header digest = %q, want %q", got, want)
-	}
+}
 
-	resolving, err := NewGraphProfileShell(profile, root, nil)
+func TestKbuildClangCapabilityPolicyResolvesLinux618X8664SubtreeOptions(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Makefile")
+	if err := os.WriteFile(kbuild, []byte(`obj-y += core.o
+CFLAGS_core.o := $(call cc-option,-Wa$(comma)-mrelax-relocations=no) \
+	$(call ld-option,--eh-frame-hdr)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Makefile) failed: %v", err)
+	}
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{
+			"KBUILD_CFLAGS":  "-m64",
+			"KBUILD_LDFLAGS": "-m elf_x86_64",
+			"SRCARCH":        "x86",
+			"comma":          ",",
+		},
+	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
 	}
-	opts.GraphProfile = resolving
-	if _, err := ParseKbuildFileWithOptions(kbuild, opts); err != nil {
-		t.Fatalf("resolving parse failed: %v", err)
+	var got []string
+	for _, flag := range kb.Flags {
+		if flag.Scope == "object" && flag.Object == "core.o" {
+			got = append(got, flag.Flags...)
+		}
 	}
-	projection, err := resolving.Projection()
+	want := []string{"-Wa,-mrelax-relocations=no", "--eh-frame-hdr"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolved x86_64 subtree flags = %#v, want %#v", got, want)
+	}
+}
+
+func TestKbuildClangCapabilityPolicyResolvesLinux618SharedTreeOptions(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Makefile")
+	if err := os.WriteFile(kbuild, []byte(`obj-y += core.o
+CFLAGS_core.o := $(call cc-option,-fno-schedule-insns) \
+	$(call cc-option,-fsched-pressure) \
+	$(call cc-option,-femit-struct-debug-detailed=any) \
+	$(call cc-disable-warning,stringop-truncation) \
+	$(call cc-option,-fno-addrsig) \
+	$(call cc-option,-Wold-style-declaration,-Wout-of-line-declaration) \
+	$(call cc-option,-mgeneral-regs-only) \
+	$(call cc-disable-warning,unused-but-set-variable) \
+	$(call cc-disable-warning,fortify-source) \
+	$(call cc-disable-warning,unsequenced) \
+	$(call cc-option,-Wvla-larger-than=1) \
+	$(call cc-disable-warning,uninitialized) \
+	$(call cc-disable-warning,missing-prototypes) \
+	$(call cc-disable-warning,stringop-overread) \
+	$(call cc-disable-warning,switch-unreachable) \
+	$(call cc-disable-warning,tautological-constant-out-of-range-compare)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Makefile) failed: %v", err)
+	}
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{
+			"KBUILD_CFLAGS": "-m64 -fintegrated-as",
+			"SRCARCH":       "x86",
+		},
+	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
 	}
-	if got, want := len(projection.KbuildGraphProbes), 1; got != want {
-		t.Fatalf("projected probes = %#v, want %d", projection.KbuildGraphProbes, want)
+	var got []string
+	for _, flag := range kb.Flags {
+		if flag.Scope == "object" && flag.Object == "core.o" {
+			got = append(got, flag.Flags...)
+		}
 	}
-	if projection.KbuildGraphProbes[0].ID != probe.ID {
-		t.Fatalf(
-			"projected probe ID = %q, want %q",
-			projection.KbuildGraphProbes[0].ID,
-			probe.ID,
-		)
+	want := []string{
+		"-fno-addrsig",
+		"-Wout-of-line-declaration",
+		"-mgeneral-regs-only",
+		"-Wno-unused-but-set-variable",
+		"-Wno-fortify-source",
+		"-Wno-unsequenced",
+		"-Wno-uninitialized",
+		"-Wno-missing-prototypes",
+		"-Wno-tautological-constant-out-of-range-compare",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolved shared-tree flags = %#v, want %#v", got, want)
+	}
+}
+
+func TestKbuildClangCapabilityPolicyDefersRecursiveCallArguments(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`tune = $(call cc-option,-mtune=$(1),$(2))
+cc_stack_align4 := -mstack-alignment=4
+KBUILD_CFLAGS += $(cc_stack_align4)
+obj-y += core.o
+CFLAGS_core.o := $(call tune,pentium4)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{"SRCARCH": "x86"},
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+	var got []string
+	for _, flag := range kb.Flags {
+		if flag.Scope == "object" && flag.Object == "core.o" {
+			got = append(got, flag.Flags...)
+		}
+	}
+	if !reflect.DeepEqual(got, []string{"-mtune=pentium4"}) {
+		t.Fatalf("recursive capability-call flags = %#v, want -mtune=pentium4", got)
+	}
+}
+
+func TestKbuildClangCapabilityPolicyResolvesNestedTuneFallback(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`cc_stack_align4 := -mstack-alignment=4
+tune = $(call cc-option,-mtune=$(1),$(2))
+tune-i686 = $(call tune,i686,$(call tune,generic))
+KBUILD_CFLAGS += $(cc_stack_align4)
+obj-y += core.o
+CFLAGS_core.o := $(call tune-i686)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{"SRCARCH": "x86"},
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+	var got []string
+	for _, flag := range kb.Flags {
+		if flag.Scope == "object" && flag.Object == "core.o" {
+			got = append(got, flag.Flags...)
+		}
+	}
+	if !reflect.DeepEqual(got, []string{"-mtune=i686"}) {
+		t.Fatalf("nested capability-call flags = %#v, want -mtune=i686", got)
+	}
+}
+
+func TestKbuildClangCapabilityPolicyRejectsUnknownCandidate(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`obj-y += core.o
+CFLAGS_core.o := $(call cc-option,-fbrand-new-kernel-flag)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	_, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{
+			"KBUILD_CFLAGS": "-m64",
+			"SRCARCH":       "x86",
+		},
+	})
+	if err == nil {
+		t.Fatal("ParseKbuildFileWithOptions() unexpectedly succeeded")
+	}
+	for _, want := range []string{
+		"Kbuild:2",
+		"-fbrand-new-kernel-flag",
+		`architecture "x86_64"`,
+		`context "-Werror -m64"`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("unknown-candidate error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestKbuildClangCapabilityPolicyRejectsUnresolvedNonPositionalCandidate(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Kbuild")
+	if err := os.WriteFile(kbuild, []byte(`obj-y += core.o
+CFLAGS_core.o := $(call cc-option,$(UNKNOWN_COMPILER_FLAG))
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	_, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{
+			"KBUILD_CFLAGS": "-m64",
+			"SRCARCH":       "x86",
+		},
+	})
+	if err == nil {
+		t.Fatal("ParseKbuildFileWithOptions() unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "UNKNOWN_COMPILER_FLAG") {
+		t.Fatalf("unresolved-candidate error %q does not identify the unresolved variable", err)
 	}
 }
 

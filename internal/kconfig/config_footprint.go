@@ -101,11 +101,8 @@ type sourceScanProfile string
 const (
 	sourceScanKernel          sourceScanProfile = ""
 	sourceScanKernelModule    sourceScanProfile = "kernel-module"
-	sourceScanVmlinuxLinker   sourceScanProfile = "vmlinux-linker"
 	sourceScanArm64VDSO       sourceScanProfile = "arm64-vdso"
 	sourceScanArm32CompatVDSO sourceScanProfile = "arm32-compat-vdso"
-	sourceScanRustKernelC     sourceScanProfile = "rust-kernel-c"
-	sourceScanRustBindgen     sourceScanProfile = "rust-bindgen"
 )
 
 var sourceConfigPredefinedSymbols = []struct {
@@ -1395,10 +1392,6 @@ func sourceProfilePredefinedSymbols(profile sourceScanProfile) map[string]bool {
 		return map[string]bool{
 			"MODULE": true,
 		}
-	case sourceScanVmlinuxLinker:
-		return map[string]bool{
-			"LINKER_SCRIPT": true,
-		}
 	case sourceScanArm64VDSO:
 		return map[string]bool{
 			"BUILD_VDSO":               true,
@@ -1411,16 +1404,6 @@ func sourceProfilePredefinedSymbols(profile sourceScanProfile) map[string]bool {
 			"__ILP32__":                true,
 			"BUILD_VDSO":               true,
 			"DISABLE_BRANCH_PROFILING": true,
-		}
-	case sourceScanRustKernelC:
-		return map[string]bool{
-			"MODULE":      false,
-			"__BINDGEN__": false,
-		}
-	case sourceScanRustBindgen:
-		return map[string]bool{
-			"MODULE":      true,
-			"__BINDGEN__": true,
 		}
 	default:
 		return nil

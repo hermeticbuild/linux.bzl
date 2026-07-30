@@ -17,25 +17,25 @@ exports_files([
 linux_module(
     name = "rust_test_module",
     srcs = ["rust_test_module.rs"],
-    module_sdk = "@e2e_rust_x86_64//:module_sdk",
+    kernel = "@e2e_rust_x86_64//:kernel",
 )
 
 linux_module(
     name = "rust_test_module_6_12_96",
     srcs = ["rust_test_module_6_12.rs"],
-    module_sdk = "@e2e_rust_6_12_96_x86_64//:module_sdk",
+    kernel = "@e2e_rust_6_12_96_x86_64//:kernel",
 )
 
 linux_module(
     name = "rust_test_module_6_12_96_aarch64",
     srcs = ["rust_test_module_6_12.rs"],
-    module_sdk = "@e2e_rust_6_12_96_aarch64//:module_sdk",
+    kernel = "@e2e_rust_6_12_96_aarch64//:kernel",
 )
 
 linux_module(
     name = "rust_test_module_6_18_39_aarch64",
     srcs = ["rust_test_module.rs"],
-    module_sdk = "@e2e_rust_aarch64//:module_sdk",
+    kernel = "@e2e_rust_aarch64//:kernel",
 )
 
 qemu_system_target(

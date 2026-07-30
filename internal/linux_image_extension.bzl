@@ -4,14 +4,12 @@ load(":linux_image_repository.bzl", _linux_image_repository = "linux_image")
 
 visibility("//...")
 
-_ARCHITECTURES = ["aarch64", "x86_64"]
 _IMAGE_NAME_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_-"
 _PROJECTION_TARGETS = [
     "config",
     "image",
     "kernel",
     "kernel_release",
-    "module_sdk",
     "module_symvers",
     "modules",
     "modules_builtin",
@@ -107,8 +105,6 @@ def _root_tags(module_ctx):
             _validate_name(tag.name, "Linux image name")
             if tag.name in images:
                 fail("duplicate Linux image %r" % tag.name)
-            if tag.arch not in _ARCHITECTURES:
-                fail("Linux image %r has unsupported architecture %r" % (tag.name, tag.arch))
             images[tag.name] = tag
         for tag in module.tags.overlay:
             _validate_name(tag.image, "Linux overlay image name")
@@ -119,6 +115,19 @@ def _root_tags(module_ctx):
             if key in overlays:
                 fail("duplicate Linux overlay %r for image %r" % (tag.name, tag.image))
             overlays[key] = tag
+    generated_repositories = {}
+    for name in sorted(images):
+        for repository in [
+            name,
+            name + "__linux_graph",
+        ]:
+            owner = generated_repositories.get(repository)
+            if owner != None:
+                fail(
+                    "Linux images %r and %r generate conflicting repository %r" %
+                    (owner, name, repository),
+                )
+            generated_repositories[repository] = name
     return images, overlays
 
 def _linux_images_impl(module_ctx):
@@ -132,27 +141,22 @@ def _linux_images_impl(module_ctx):
     for name in sorted(images):
         image = images[name]
         graph_repo = name + "__linux_graph"
+        image_overlays = overlays_by_image.get(name, {})
         _linux_image_repository(
             name = graph_repo,
-            arch = image.arch,
-            graph_profile = image.graph_profile,
-            kbuild_linker = image.kbuild_linker,
             config = image.config,
             config_mode = image.config_mode,
-            overlays = overlays_by_image.get(name, {}),
+            overlays = image_overlays,
             platform = image.platform,
             source = image.source,
         )
         _linux_image_facade_repository(
             name = name,
             graph_repo = graph_repo,
-            variants = sorted(overlays_by_image.get(name, {}).keys()),
+            variants = sorted(image_overlays.keys()),
         )
 
 _image = tag_class(attrs = {
-    "arch": attr.string(mandatory = True),
-    "graph_profile": attr.label(mandatory = True),
-    "kbuild_linker": attr.label(mandatory = True),
     "config": attr.label(mandatory = True),
     "config_mode": attr.string(default = "default", values = ["allnoconfig", "default"]),
     "name": attr.string(mandatory = True),

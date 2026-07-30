@@ -1,9 +1,11 @@
 module(
-    name = "linux_image_extension_missing_graph_profile",
+    name = "linux_image_extension_removed_attr",
     version = "1.0.0",
 )
 
 bazel_dep(name = "linux.bzl", version = "0.1.0")
+bazel_dep(name = "llvm", version = "0.8.14")
+
 local_path_override(
     module_name = "linux.bzl",
     path = "../linux_bzl",
@@ -19,7 +21,7 @@ linux_images.image(
     name = "fixture_kernel",
     arch = "x86_64",
     config = "//:base.config",
-    platform = "//:platform",
+    platform = "@llvm//platforms:linux_x86_64",
     source = "//:Kconfig",
 )
 use_repo(linux_images, "fixture_kernel")

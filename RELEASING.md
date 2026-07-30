@@ -16,8 +16,9 @@ the rules module.
    configurations, also verify that the selected in-tree `.ko` loads.
 4. Build a named overlay and verify its kernel release and fixed output
    contract.
-5. Test a consumer that uses the canonical `@linux.bzl` repository and loads
-   `linux_image` only from the root `linux.bzl` entry point.
+5. Test a consumer that uses the canonical `@linux.bzl` repository, declares
+   configured images through `linux_images` from `extensions.bzl`, and imports
+   each facade repository explicitly with `use_repo`.
 6. On a Linux x86_64 executor with the registered stable Rust 1.97.0
    toolchain, run
    `bazel test //:linux_6_12_96_rust_module_test

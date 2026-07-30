@@ -1,9 +1,8 @@
 """Private configured-kernel module finalization rule."""
 
 load("@rules_cc//cc:find_cc_toolchain.bzl", "use_cc_toolchain")
-load(":host_cc_toolchain.bzl", "host_cc_toolchain_attr")
 load(":linux_module_actions.bzl", "linux_module_actions")
-load(":linux_objects.bzl", "LinuxModuleObjectsInfo", "linux_module_cc_helpers")
+load(":linux_objects.bzl", "linux_module_cc_helpers")
 load(
     ":path_mapping.bzl",
     "add_directory_arg",
@@ -427,25 +426,7 @@ def _builtin_module_metadata(ctx, vmlinux):
 
 def _linux_module_sdk_impl(ctx):
     vmlinux = ctx.attr.vmlinux[LinuxVmlinuxInfo]
-    module_objects = ctx.attr.modules[LinuxModuleObjectsInfo].objects
-    module_kernel = struct(
-        config = vmlinux.config,
-        generated_headers = vmlinux.generated_headers,
-        module_objects = module_objects,
-        module_symvers = vmlinux.module_symvers,
-        modpost = vmlinux.modpost,
-        source_root = ctx.file.source_root,
-        source_tree = depset(ctx.files.source_tree),
-        srcarch = vmlinux.srcarch,
-        version = ctx.attr.version,
-        vmlinux_object = vmlinux.vmlinux_object,
-    )
-    module_prep = linux_module_actions.prepare_modules(
-        ctx,
-        linux_module_cc_helpers,
-        module_kernel,
-    )
-    modules = linux_module_actions.module_map(module_objects)
+    modules = linux_module_actions.module_map(vmlinux.module_objects)
     target = linux_module_actions.target_context(ctx, linux_module_cc_helpers)
     target_c_flags = linux_module_actions.target_c_flags(
         ctx,
@@ -472,21 +453,25 @@ def _linux_module_sdk_impl(ctx):
     if modules and not modules_enabled:
         fail("%s has configured module objects but CONFIG_MODULES is disabled" % ctx.label)
     if modules_enabled:
-        if module_prep == None:
-            fail("%s did not prepare an enabled module SDK" % ctx.label)
-        for field in ["module_common", "module_lds", "module_symvers", "modules_order", "modpost"]:
-            if getattr(module_prep, field) == None:
+        for field in [
+            "module_common",
+            "module_lds",
+            "module_symvers",
+            "modules_order",
+            "modpost",
+        ]:
+            if getattr(vmlinux, field) == None:
                 fail("%s is missing prepared module field %s" % (ctx.label, field))
 
-        module_common = module_prep.module_common
-        module_lds = module_prep.module_lds
-        module_symvers = module_prep.module_symvers
-        modules_order = module_prep.modules_order
-        modpost = module_prep.modpost
+        module_common = vmlinux.module_common
+        module_lds = vmlinux.module_lds
+        module_symvers = vmlinux.module_symvers
+        modules_order = vmlinux.modules_order
+        modpost = vmlinux.modpost
 
-        for info in module_objects:
+        for info in vmlinux.module_objects:
             path = info.object
-            mod_source = module_prep.module_sources.get(path)
+            mod_source = vmlinux.module_sources.get(path)
             if mod_source == None:
                 fail("%s is missing modpost source for module %s" % (ctx.label, path))
             mod_object = ctx.actions.declare_file(
@@ -506,7 +491,7 @@ def _linux_module_sdk_impl(ctx):
             linked = _link_module(
                 ctx,
                 target,
-                module_prep.module_outputs[path],
+                vmlinux.module_outputs[path],
                 mod_object,
                 module_common,
                 module_lds,
@@ -554,8 +539,8 @@ def _linux_module_sdk_impl(ctx):
             modules_builtin_modinfo = modules_builtin_modinfo,
             modules_order = modules_order,
             modpost = modpost,
-            source_root = ctx.file.source_root,
-            source_tree = depset(ctx.files.source_tree),
+            source_root = vmlinux.source_root,
+            source_tree = vmlinux.source_tree,
             srcarch = vmlinux.srcarch,
             rust = vmlinux.rust,
             target = target,
@@ -581,14 +566,6 @@ linux_module_sdk = rule(
             mandatory = True,
             values = ["arm64", "x86"],
         ),
-        "modules": attr.label(
-            mandatory = True,
-            providers = [LinuxModuleObjectsInfo],
-        ),
-        "objtool": attr.label(
-            cfg = "exec",
-            executable = True,
-        ),
         "pahole": attr.label(
             cfg = "exec",
             executable = True,
@@ -596,14 +573,6 @@ linux_module_sdk = rule(
         "resolve_btfids_tool": attr.label(
             cfg = "exec",
             executable = True,
-        ),
-        "source_root": attr.label(
-            allow_single_file = True,
-            mandatory = True,
-        ),
-        "source_tree": attr.label_list(
-            allow_files = True,
-            mandatory = True,
         ),
         "version": attr.string(mandatory = True),
         "vmlinux": attr.label(
@@ -615,30 +584,9 @@ linux_module_sdk = rule(
             default = Label("//internal/cmd/btfmutate"),
             executable = True,
         ),
-        "_host_cc_toolchain": host_cc_toolchain_attr(exec_group = "host_cc"),
         "_builtinmodinfo": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/builtinmodinfo"),
-            executable = True,
-        ),
-        "_modulemodinfo": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/modulemodinfo"),
-            executable = True,
-        ),
-        "_objtoolrun": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/objtoolrun"),
-            executable = True,
-        ),
-        "_offsetsheader": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/offsetsheader"),
-            executable = True,
-        ),
-        "_runincwd": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/runincwd"),
             executable = True,
         ),
         "_llvm_objcopy": attr.label(
@@ -647,9 +595,6 @@ linux_module_sdk = rule(
             default = Label("@llvm//tools:llvm-objcopy"),
             executable = True,
         ),
-    },
-    exec_groups = {
-        "host_cc": exec_group(toolchains = use_cc_toolchain()),
     },
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
@@ -699,12 +644,12 @@ _linux_module = rule(
 
 def linux_module(
         name,
-        module_sdk,
+        kernel,
         srcs,
         crate_root = None,
         deps = [],
         **kwargs):
-    """Builds a Rust-for-Linux module against an explicit kernel module SDK."""
+    """Builds a Rust-for-Linux module on the supported Linux executor."""
     _linux_module(
         name = name,
         crate_root = crate_root,
@@ -713,7 +658,7 @@ def linux_module(
             "@platforms//cpu:x86_64",
             "@platforms//os:linux",
         ],
-        kernel = module_sdk,
+        kernel = kernel,
         srcs = srcs,
         **kwargs
     )

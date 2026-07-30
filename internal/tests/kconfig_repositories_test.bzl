@@ -39,70 +39,6 @@ def _generator_variable_args_test_impl(ctx):
 
 generator_variable_args_test = unittest.make(_generator_variable_args_test_impl)
 
-def _generator_probe_value_args_test_impl(ctx):
-    env = unittest.begin(ctx)
-    values = {
-        "bindgen_version": "bindgen 0.72.1",
-        "cc_builtin_macro.__SIZEOF_INT128__": "16",
-        "cc_version": "220108",
-        "cc_version_text": "clang version 22.1.8",
-        "ld_version": "220108",
-        "rustc_version": "109700",
-    }
-    asserts.equals(
-        env,
-        [
-            "-linux_probe_value",
-            "bindgen_version=bindgen 0.72.1",
-            "-linux_probe_value",
-            "rustc_version=109700",
-        ],
-        repositories_test_helpers.generator_probe_value_args(
-            values,
-            use_graph_profile = True,
-        ),
-    )
-    unprofiled = repositories_test_helpers.generator_probe_value_args(
-        values,
-        use_graph_profile = False,
-    )
-    asserts.true(env, "cc_version=220108" in unprofiled)
-    asserts.true(env, "cc_builtin_macro.__SIZEOF_INT128__=16" in unprofiled)
-    return unittest.end(env)
-
-generator_probe_value_args_test = unittest.make(_generator_probe_value_args_test_impl)
-
-def _compact_v7_repository_contract_test_impl(ctx):
-    env = unittest.begin(ctx)
-    asserts.equals(
-        env,
-        "linux.bzl/compact-v7/graph-profile-v1/x86/x86",
-        repositories_test_helpers.compact_v7_compile_environment_abi(
-            struct(arch = "x86", srcarch = "x86"),
-        ),
-    )
-    targets = repositories_test_helpers.compact_v7_config_targets(
-        {
-            "debug": struct(
-                image = "_config_0_image",
-                modules = "_config_0_modules",
-                sources = "_config_0_sources",
-            ),
-        },
-        "graph",
-    )
-    asserts.equals(env, "//graph:_config_0_image", targets["debug"].image)
-    asserts.equals(env, "//graph:_config_0_modules", targets["debug"].modules)
-    asserts.equals(env, "//graph:_config_0_sources", targets["debug"].sources)
-    asserts.equals(
-        env,
-        "compact-v7-lazy-action-graph",
-        repositories_test_helpers.generator_protocol_v7,
-    )
-    return unittest.end(env)
-
-compact_v7_repository_contract_test = unittest.make(_compact_v7_repository_contract_test_impl)
-
 def _graph_configs_args_test_impl(ctx):
     env = unittest.begin(ctx)
     asserts.equals(
@@ -126,43 +62,6 @@ def _graph_configs_args_test_impl(ctx):
     return unittest.end(env)
 
 graph_configs_args_test = unittest.make(_graph_configs_args_test_impl)
-
-def _graph_validation_source_paths_test_impl(ctx):
-    env = unittest.begin(ctx)
-    asserts.equals(
-        env,
-        [
-            "arch/x86/include/asm/probe.h",
-            "scripts/cc-version.sh",
-            "scripts/probe.rsp",
-        ],
-        repositories_test_helpers.graph_validation_source_paths({
-            "kconfig_commands": [
-                {
-                    "inputs": {
-                        "scripts/cc-version.sh": "digest-c",
-                        "scripts/probe.rsp": "digest-a",
-                    },
-                },
-            ],
-            "kbuild_graph_probes": [
-                {
-                    "inputs": {
-                        "scripts/probe.rsp": "digest-a",
-                    },
-                },
-                {
-                    "inputs": {
-                        "arch/x86/include/asm/probe.h": "digest-b",
-                        "scripts/probe.rsp": "digest-a",
-                    },
-                },
-            ],
-        }),
-    )
-    return unittest.end(env)
-
-graph_validation_source_paths_test = unittest.make(_graph_validation_source_paths_test_impl)
 
 def _metadata_with_key(metadata, collection, key, value):
     result = dict(metadata)
@@ -191,6 +90,12 @@ def _metadata_without_key(metadata, collection, key):
 def _metadata_key_validation_test_impl(ctx):
     env = unittest.begin(ctx)
     metadata = {
+        "action_groups": [{
+            "id": "",
+            "object_targets": [],
+            "reachable_configs": [],
+            "recipe_id": "",
+        }],
         "configs": [{
             "config_payload": "",
             "module_object_targets": [],
@@ -244,6 +149,7 @@ def _metadata_key_validation_test_impl(ctx):
     cases = [
         ("", "schema", "v0.0.13"),
         ("", "object_packages", []),
+        ("action_groups", "reachability_id", ""),
         ("configs", "package", ""),
         ("configs", "image_target", "base_image"),
         ("config_payloads", "fragment", {}),
@@ -264,6 +170,12 @@ def _metadata_key_validation_test_impl(ctx):
             "metadata with retired field %r should be rejected, got %r" % (key, error),
         )
     sparse = {
+        "action_groups": [{
+            "id": "",
+            "object_targets": [],
+            "reachable_configs": [],
+            "recipe_id": "",
+        }],
         "configs": [{
             "name": "base",
             "object_targets": [],
@@ -300,6 +212,26 @@ def _metadata_key_validation_test_impl(ctx):
         repositories_test_helpers.content_graph_metadata_structure_error(sparse),
     )
     invalid = [
+        (
+            _metadata_without_key(metadata, "", "action_groups"),
+            "action_groups",
+        ),
+        (
+            _metadata_with_key(metadata, "", "action_groups", None),
+            "action_groups",
+        ),
+        (
+            _metadata_without_key(metadata, "action_groups", "recipe_id"),
+            "recipe_id",
+        ),
+        (
+            _metadata_with_key(metadata, "action_groups", "reachable_configs", [1]),
+            "reachable_configs",
+        ),
+        (
+            _metadata_with_key(metadata, "action_groups", "object_targets", None),
+            "object_targets",
+        ),
         (
             _metadata_without_key(metadata, "", "configs"),
             "configs",
@@ -372,6 +304,211 @@ def _metadata_key_validation_test_impl(ctx):
 
 metadata_key_validation_test = unittest.make(_metadata_key_validation_test_impl)
 
+def _action_group_metadata():
+    recipe_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    return {
+        "action_groups": [
+            {
+                "id": "1111111111111111111111111111111111111111111111111111111111111111",
+                "object_targets": ["a"],
+                "reachable_configs": ["base"],
+                "recipe_id": recipe_id,
+            },
+            {
+                "id": "2222222222222222222222222222222222222222222222222222222222222222",
+                "object_targets": ["b"],
+                "reachable_configs": ["debug"],
+                "recipe_id": recipe_id,
+            },
+            {
+                "id": "3333333333333333333333333333333333333333333333333333333333333333",
+                "object_targets": ["shared_a", "shared_b"],
+                "reachable_configs": ["base", "debug"],
+                "recipe_id": recipe_id,
+            },
+        ],
+        "configs": [
+            {
+                "name": "base",
+                "object_targets": ["a"],
+            },
+            {
+                "name": "debug",
+                "object_targets": ["b"],
+            },
+        ],
+        "object_variants": [
+            {
+                "deps": ["shared_a", "shared_b"],
+                "mode": "y",
+                "object": "a.o",
+                "source": "a.c",
+                "target": "a",
+            },
+            {
+                "deps": ["shared_a", "shared_b"],
+                "mode": "y",
+                "object": "b.o",
+                "source": "b.c",
+                "target": "b",
+            },
+            {
+                "mode": "y",
+                "object": "shared_a.o",
+                "source": "shared_a.c",
+                "target": "shared_a",
+            },
+            {
+                "mode": "y",
+                "object": "shared_b.o",
+                "source": "shared_b.c",
+                "target": "shared_b",
+            },
+            {
+                "flags": ["-DUNREACHABLE"],
+                "mode": "y",
+                "object": "unused.o",
+                "source": "unused.c",
+                "target": "unused",
+            },
+        ],
+    }
+
+def _replace_item(metadata, collection, index, updates):
+    result = dict(metadata)
+    items = list(result[collection])
+    item = dict(items[index])
+    item.update(updates)
+    items[index] = item
+    result[collection] = items
+    return result
+
+def _action_group_validation_test_impl(ctx):
+    env = unittest.begin(ctx)
+    metadata = _action_group_metadata()
+    validation = repositories_test_helpers.action_group_validation(metadata)
+    asserts.equals(env, "", validation.error)
+    asserts.equals(
+        env,
+        {
+            "action_group_objects": 4,
+            "action_group_reachability_sets": 3,
+            "action_group_recipes": 1,
+            "action_groups": 3,
+            "largest_action_group": 2,
+            "object_memberships": 6,
+            "selected_object_variants": 4,
+        },
+        validation.stats,
+    )
+
+    duplicate_id = _replace_item(
+        metadata,
+        "action_groups",
+        1,
+        {"id": metadata["action_groups"][0]["id"]},
+    )
+    invalid_recipe = _replace_item(
+        metadata,
+        "action_groups",
+        0,
+        {"recipe_id": "not-a-content-id"},
+    )
+    unknown_config = _replace_item(
+        metadata,
+        "action_groups",
+        0,
+        {"reachable_configs": ["unknown"]},
+    )
+    unknown_target = _replace_item(
+        metadata,
+        "action_groups",
+        0,
+        {"object_targets": ["unknown"]},
+    )
+    wrong_reachability = _replace_item(
+        metadata,
+        "action_groups",
+        0,
+        {"reachable_configs": ["base", "debug"]},
+    )
+    duplicate_owner = _replace_item(
+        metadata,
+        "action_groups",
+        1,
+        {"object_targets": ["a"]},
+    )
+    mixed_recipes = _replace_item(
+        metadata,
+        "object_variants",
+        3,
+        {"flags": ["-DMIXED"]},
+    )
+    recipe_collision = _replace_item(
+        metadata,
+        "object_variants",
+        1,
+        {"flags": ["-DCOLLISION"]},
+    )
+    duplicate_recipe_identity = _replace_item(
+        metadata,
+        "action_groups",
+        1,
+        {"recipe_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    )
+    incomplete = dict(metadata)
+    incomplete["action_groups"] = metadata["action_groups"][:-1]
+    unsorted = dict(metadata)
+    unsorted["action_groups"] = list(reversed(metadata["action_groups"]))
+
+    split = dict(metadata)
+    split_groups = list(metadata["action_groups"])
+    split_groups[2] = dict(split_groups[2])
+    split_groups[2]["object_targets"] = ["shared_a"]
+    split_groups.append({
+        "id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "object_targets": ["shared_b"],
+        "reachable_configs": ["base", "debug"],
+        "recipe_id": metadata["action_groups"][2]["recipe_id"],
+    })
+    split["action_groups"] = split_groups
+
+    unreachable = dict(metadata)
+    unreachable_groups = list(metadata["action_groups"])
+    unreachable_groups.append({
+        "id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "object_targets": ["unused"],
+        "reachable_configs": ["base"],
+        "recipe_id": metadata["action_groups"][0]["recipe_id"],
+    })
+    unreachable["action_groups"] = unreachable_groups
+
+    cases = [
+        (duplicate_id, "repeats action group ID"),
+        (invalid_recipe, "invalid recipe ID"),
+        (unknown_config, "unknown config"),
+        (unknown_target, "unknown object target"),
+        (wrong_reachability, "reachability"),
+        (duplicate_owner, "both own object target"),
+        (mixed_recipes, "mixes concrete action recipes"),
+        (recipe_collision, "identifies multiple concrete action recipes"),
+        (duplicate_recipe_identity, "concrete action recipe has IDs"),
+        (incomplete, "ownership is incomplete"),
+        (unsorted, "sorted by ID"),
+        (split, "repeat recipe/reachability ownership"),
+        (unreachable, "reachability"),
+    ]
+    for candidate, want in cases:
+        error = repositories_test_helpers.action_group_validation(candidate).error
+        asserts.true(
+            env,
+            want in error,
+            "invalid action groups should mention %r, got %r" % (want, error),
+        )
+    return unittest.end(env)
+
+action_group_validation_test = unittest.make(_action_group_validation_test_impl)
+
 def _generated_object_inputs_test_impl(ctx):
     env = unittest.begin(ctx)
     indexed = """
@@ -432,7 +569,7 @@ def compile_environment_abi_test(name):
     _compile_environment_abi_subject(
         name = subject,
         actual = "unexpected-abi",
-        expected = "linux.bzl/compact-v7/graph-profile-v1/x86/x86",
+        expected = "linux.bzl/compact-v6/clang-baseline-22.1.8/x86/x86",
         tags = ["manual"],
     )
     _compile_environment_abi_failure_test(
@@ -558,7 +695,6 @@ def _core_config_aliases_test_impl(ctx):
         "header_split",
         "lz4",
         "module_order",
-        "module_roots",
         "noncompression",
         "object_order",
         "rust_split",
@@ -570,9 +706,7 @@ def _core_config_aliases_test_impl(ctx):
                 "object_targets": (
                     ["b", "a"] if name == "object_order" else ["a", "c"] if name == "debug" else ["a", "b"]
                 ),
-                "module_object_targets": (
-                    ["n", "m"] if name == "module_order" else ["m", "o"] if name == "module_roots" else ["m", "n"]
-                ),
+                "module_object_targets": ["n", "m"] if name == "module_order" else ["m", "n"],
             }
             for name in names
         ],
@@ -610,8 +744,7 @@ def _core_config_aliases_test_impl(ctx):
             "debug": "debug",
             "header_split": "header_split",
             "lz4": "x86_64",
-            "module_order": "x86_64",
-            "module_roots": "x86_64",
+            "module_order": "module_order",
             "noncompression": "noncompression",
             "object_order": "object_order",
             "rust_split": "rust_split",
@@ -640,17 +773,9 @@ def _core_config_aliases_test_impl(ctx):
         base_rust_enabled = False,
         config_mode = "default",
         graph_image = "//graph:x86_64_image",
-        graph_modules = "//partitions:x86_64_modules",
-        graph_projection = "//graph:graph_profile_projection.json",
-        graph_sources = "//sources:x86_64_core",
-        graph_validation_sources = ["@@linux_sources//:scripts/cc-version.sh"],
-        kbuild_linker = "@@llvm//tools:ld.lld",
         variant_configs = {"lz4": "//configs:lz4"},
         variant_core_configs = {"lz4": "x86_64"},
         variant_graph_images = {"lz4": "//graph:lz4_image"},
-        variant_graph_modules = {"lz4": "//partitions:lz4_modules"},
-        variant_graph_sources = {"lz4": "//sources:lz4_core"},
-        variant_module_sdk_configs = {"lz4": "x86_64"},
         variant_header_family_dependencies = {
             "lz4": {
                 "asm_offsets": {
@@ -675,14 +800,6 @@ def _core_config_aliases_test_impl(ctx):
     )
     asserts.true(
         env,
-        'graph_projection = "//graph:graph_profile_projection.json",' in generated,
-    )
-    asserts.true(
-        env,
-        'kbuild_linker = "@@llvm//tools:ld.lld",' in generated,
-    )
-    asserts.true(
-        env,
         'base_header_family_dependencies = {\n        "asm_offsets": {\n            "static": "1111111111111111111111111111111111111111111111111111111111111111",\n        },\n        "static": {},\n    },' in generated,
     )
     asserts.true(
@@ -701,194 +818,27 @@ def _core_config_aliases_test_impl(ctx):
 
 core_config_aliases_test = unittest.make(_core_config_aliases_test_impl)
 
-def _module_sdk_aliases_test_impl(ctx):
+def _graph_arch_tool_args_test_impl(ctx):
     env = unittest.begin(ctx)
-    base_modules = ["module_a", "module_b"]
-    metadata = {
-        "configs": [
-            {
-                "module_object_targets": (
-                    ["module_b", "module_a"] if name == "module_order" else ["module_a", "module_c"] if name == "module_roots" else base_modules
-                ),
-                "name": name,
-            }
-            for name in [
-                "x86_64",
-                "different_core",
-                "lz4",
-                "module_order",
-                "module_roots",
-                "same_modules",
-            ]
+    asserts.equals(
+        env,
+        [
+            "-source_objtool",
+            "//:_base_x86_objtool",
         ],
-    }
-    aliases = repositories_test_helpers.module_sdk_aliases(
-        metadata,
-        {
-            "x86_64": "x86_64",
-            "different_core": "different_core",
-            "lz4": "x86_64",
-            "module_order": "x86_64",
-            "module_roots": "x86_64",
-            "same_modules": "x86_64",
-        },
-        "x86_64",
+        repositories_test_helpers.graph_arch_tool_args("x86_64"),
     )
     asserts.equals(
         env,
-        {
-            "x86_64": "x86_64",
-            "different_core": "different_core",
-            "lz4": "x86_64",
-            "module_order": "module_order",
-            "module_roots": "module_roots",
-            "same_modules": "x86_64",
-        },
-        aliases,
+        [
+            "-source_relacheck",
+            "//:_base_relacheck_tool",
+        ],
+        repositories_test_helpers.graph_arch_tool_args("aarch64"),
     )
     return unittest.end(env)
 
-module_sdk_aliases_test = unittest.make(_module_sdk_aliases_test_impl)
-
-def _content_partition_build_test_impl(ctx):
-    env = unittest.begin(ctx)
-    generated = repositories_test_helpers.content_partition_build(
-        {
-            "configs": [
-                {
-                    "module_object_targets": ["module_a"],
-                    "name": "x86_64",
-                    "object_targets": ["builtin_a", "builtin_b"],
-                },
-                {
-                    "module_object_targets": ["module_a", "module_b"],
-                    "name": "module_overlay",
-                    "object_targets": ["builtin_a", "builtin_b"],
-                },
-                {
-                    "module_object_targets": ["module_a"],
-                    "name": "image_overlay",
-                    "object_targets": ["builtin_a", "builtin_c"],
-                },
-                {
-                    "module_object_targets": ["module_a"],
-                    "name": "identical",
-                    "object_targets": ["builtin_a", "builtin_b"],
-                },
-            ],
-        },
-        "x86_64",
-        "@@linux_bzl",
-    )
-
-    asserts.equals(env, 2, len(generated.split("\nlinux_compact_image(\n")) - 1)
-    asserts.equals(env, 2, len(generated.split("\nlinux_compact_modules(\n")) - 1)
-    asserts.false(env, "module_objects" in generated)
-    for fragment in [
-        'name = "module_overlay_image",\n    actual = ":x86_64_image"',
-        'name = "image_overlay_modules",\n    actual = ":x86_64_modules"',
-        'name = "identical_image",\n    actual = ":x86_64_image"',
-        'name = "identical_modules",\n    actual = ":x86_64_modules"',
-    ]:
-        asserts.true(
-            env,
-            fragment in generated,
-            "generated content partitions omitted %r:\n%s" % (fragment, generated),
-        )
-    return unittest.end(env)
-
-content_partition_build_test = unittest.make(_content_partition_build_test_impl)
-
-def _content_source_partition_build_test_impl(ctx):
-    env = unittest.begin(ctx)
-    generated = repositories_test_helpers.content_source_partition_build(
-        {
-            "compile_environments": [],
-            "configs": [
-                {
-                    "module_object_targets": ["module_a", "module_b"],
-                    "name": "x86_64",
-                    "object_targets": ["builtin"],
-                },
-                {
-                    "module_object_targets": ["module_b", "module_a"],
-                    "name": "lz4",
-                    "object_targets": ["builtin"],
-                },
-                {
-                    "module_object_targets": ["module_a", "module_b"],
-                    "name": "changed",
-                    "object_targets": ["builtin", "changed_builtin"],
-                },
-            ],
-            "generated_header_families": [],
-            "object_variants": [
-                {
-                    "deps": [],
-                    "members": [],
-                    "source_input_group": 1,
-                    "target": "builtin",
-                },
-                {
-                    "deps": [],
-                    "members": [],
-                    "source_input_group": 2,
-                    "target": "module_a",
-                },
-                {
-                    "deps": [],
-                    "members": [],
-                    "source_input_group": 2,
-                    "target": "module_b",
-                },
-                {
-                    "deps": [],
-                    "members": [],
-                    "source_input_group": 3,
-                    "target": "changed_builtin",
-                },
-            ],
-            "source_files": [
-                {"path": "core/base.c"},
-                {"path": "include/core.h"},
-                {"path": "drivers/module_only.c"},
-                {"path": "core/changed.c"},
-            ],
-            "source_input_groups": [
-                "1,2",
-                "3",
-                "4",
-            ],
-        },
-        "x86_64",
-        "@@linux_sources//",
-    )
-
-    asserts.equals(env, 2, len(generated.split("\nfilegroup(\n")) - 1)
-    asserts.equals(env, 1, len(generated.split("\nalias(\n")) - 1)
-    asserts.true(
-        env,
-        'name = "lz4_core",\n    actual = ":x86_64_core"' in generated,
-        "identical lz4 core sources did not alias the base:\n%s" % generated,
-    )
-    for path in [
-        "@@linux_sources//:core/base.c",
-        "@@linux_sources//:include/core.h",
-        "@@linux_sources//:core/changed.c",
-    ]:
-        asserts.true(
-            env,
-            path in generated,
-            "generated core source partitions omitted %r:\n%s" % (path, generated),
-        )
-    asserts.false(
-        env,
-        "drivers/module_only.c" in generated,
-        "generated core source partitions included a module-only source:\n%s" % generated,
-    )
-    return unittest.end(env)
-
-content_source_partition_build_test = unittest.make(_content_source_partition_build_test_impl)
+graph_arch_tool_args_test = unittest.make(_graph_arch_tool_args_test_impl)
 
 def _without_rust_toolchain_config_test_impl(ctx):
     env = unittest.begin(ctx)

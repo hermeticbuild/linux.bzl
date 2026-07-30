@@ -36,6 +36,7 @@ type metadata struct {
 	GeneratedHeaderFamilies []generatedHeaderFamily `json:"generated_header_families"`
 	SourceFiles             []sourceInput           `json:"source_files"`
 	SourceInputGroups       []string                `json:"source_input_groups"`
+	ActionGroups            []actionGroup           `json:"action_groups"`
 	ObjectVariants          []objectVariant         `json:"object_variants"`
 }
 
@@ -90,6 +91,13 @@ type generatedHeaderFamily struct {
 	Srcarch          string   `json:"srcarch"`
 	Dependencies     []string `json:"dependencies,omitempty"`
 	SourceInputGroup int      `json:"source_input_group,omitempty"`
+}
+
+type actionGroup struct {
+	ID               string   `json:"id"`
+	RecipeID         string   `json:"recipe_id"`
+	ReachableConfigs []string `json:"reachable_configs"`
+	ObjectTargets    []string `json:"object_targets"`
 }
 
 func main() {

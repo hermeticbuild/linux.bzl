@@ -44,10 +44,7 @@ linux_source_repository(
 linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
 linux_images.image(
     name = "example_kernel",
-    arch = "x86_64",
     config = "//kernel:x86_64.config",
-    graph_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.graph.json",
-    kbuild_linker = "@llvm//tools:ld.lld",
     platform = "@llvm//platforms:linux_x86_64",
     source = "@linux_6_18_39//:Kconfig",
 )
@@ -81,9 +78,9 @@ CONFIG_KERNEL_GZIP=y
 ```
 
 The source rule knows the pinned URL and integrity for maintained catalog
-versions. The image extension resolves the config fragment through Kconfig and
-verifies that its architecture selection, checked-in graph profile, and
-declared architecture agree.
+versions. The image extension derives the architecture from the base config,
+resolves the fragment through Kconfig, and verifies the selected platform
+architecture during analysis.
 
 Build the boot image:
 
@@ -109,8 +106,8 @@ extension in `extensions.bzl`. Source and image declarations are intended for
 the root module: kernel source and product configs are application choices, not
 transitive dependency resolution.
 
-Because the module repository and its public file have the same name, BUILD
-files can use Bazel's shorthand label:
+Because the module repository and its public file have the same name, Starlark
+outside `MODULE.bazel` can use Bazel's shorthand label:
 
 ```starlark
 load("@linux.bzl", "initramfs", "linux_module")
@@ -138,14 +135,11 @@ surface:
 
 | Attribute | Meaning |
 | --- | --- |
-| `name` | Generated kernel graph repository name |
+| `name` | Generated image facade repository name |
 | `source` | Root `Kconfig` from `linux_source_repository` |
 | `config` | Base Kconfig fragment |
 | `config_mode` | Kconfig baseline: `default` or `allnoconfig` |
-| `arch` | Canonical Linux architecture: `x86_64` or `aarch64` |
-| `graph_profile` | Checked-in toolchain graph profile matching `arch`; maintained profiles describe Hermetic LLVM 22.1.8 |
-| `kbuild_linker` | Existing raw linker executable target used by Kbuild link actions and linker-option probes |
-| `platform` | Target platform applied at the public kernel gateway |
+| `platform` | Linux x86_64 or aarch64 target platform selecting Clang |
 
 `linux_images.overlay` adds a named config fragment to an image:
 
@@ -155,13 +149,13 @@ surface:
 | `name` | Stable variant name used below `variants/` |
 | `config` | Overlay Kconfig fragment |
 
-Import every declared facade repository explicitly with `use_repo`. `arch`,
-`graph_profile`, `kbuild_linker`, and `platform` are separate, mandatory inputs.
-Repository generation validates the profile schema and architecture alongside
-the Kconfig selection. The active compile path requires a registered C
-toolchain whose analysis identity matches the selected profile. Compiler paths,
-host probe overrides, image-format switches, and signing keys are not part of
-the public API.
+There is intentionally no `arch` attribute. Architecture is derived from the
+base config, while the platform must carry the matching x86_64 or aarch64 CPU
+constraint and select a matching Clang toolchain. It does not have to come from
+a particular module or use a prescribed label. There are also no graph
+profiles, explicit Kbuild linker labels, compiler paths, host probe overrides,
+image-format switches, or signing keys in the public API. Import each declared
+facade repository explicitly with `use_repo`.
 
 ### Initramfs
 
@@ -197,7 +191,7 @@ are fixed to reproducible values.
 
 ### Rust-for-Linux modules
 
-`linux_module(name, module_sdk, srcs, crate_root = None, deps = [])` builds one
+`linux_module(name, kernel, srcs, crate_root = None, deps = [])` builds one
 out-of-tree Rust-for-Linux loadable module. It is a normal BUILD rule loaded
 from the same root entry point.
 
@@ -239,14 +233,14 @@ load("@linux.bzl", "linux_module")
 
 linux_module(
     name = "hello",
-    module_sdk = "@example_kernel//:module_sdk",
+    kernel = "@example_kernel//:kernel",
     srcs = ["hello.rs"],
 )
 ```
 
-The target's default output is `hello.ko`. `module_sdk` supplies the configured
-kernel's generated headers, Rust SDK, symbol versions, and module linker
-inputs. The rule follows that SDK's target platform, so there
+The target's default output is `hello.ko`. `kernel` identifies the configured
+kernel and supplies its generated headers, Rust SDK, symbol versions, and
+module linker inputs. The rule follows that kernel's target platform, so there
 is no separate architecture attribute. Set `crate_root` when `srcs` does not
 make the crate root unambiguous. `deps` accepts other `linux_module` targets
 built against the same configured kernel; cross-kernel dependencies are
@@ -288,17 +282,18 @@ cannot cache or schedule the individual compile steps.
 `linux.bzl` instead:
 
 - evaluates the relevant Kconfig and Kbuild language without invoking `make`;
-- declares one Bazel compile action for each object while grouping their
-  analysis ownership;
+- emits a Bazel target for each supported generated file, object, archive, and
+  final image step;
 - obtains compilers and binary utilities from registered Bazel toolchains;
 - declares source, generated-header, tool, and response-file inputs explicitly;
   and
 - lets Bazel schedule and cache compilation at object granularity.
 
-Each image declaration names an explicit, checked-in compiler capability
-profile. The released generator resolves Kconfig against its pinned Hermetic
-LLVM probe values and validates that the declared profile has the requested
-architecture. Repository evaluation does not read ambient host compilers.
+Repository generation resolves Kconfig and Kbuild against a deterministic
+LLVM 22.1.8 capability baseline. Consumers may select a newer Clang toolchain;
+doing so opts into treating it as compatible with that baseline rather than
+probing it. The transitioned graph rejects a non-Clang toolchain or a target
+architecture that disagrees with the platform and config.
 
 ## Supported configurations
 
@@ -307,7 +302,7 @@ architecture. Repository evaluation does not read ambient host compilers.
 | Catalog releases | 6.12.96 and 6.18.39 |
 | Target architectures | x86_64 and aarch64 |
 | Repository evaluation | Pinned generator archives for Linux, macOS, and Windows on amd64 and arm64 |
-| Build toolchain | Hermetic LLVM 22.1.8 through module `llvm` 0.8.14, matching the declared maintained profile |
+| Build toolchain | Clang with LLVM 22.1.8 baseline semantics; CI uses Hermetic LLVM module `llvm` 0.8.14 |
 | Images | x86 `bzImage`, arm64 `Image`, and `vmlinux` |
 | Config variants | Base fragment plus named overlay fragments |
 | Initramfs | Deterministic root-owned `newc` archives |
@@ -319,8 +314,8 @@ architecture. Repository evaluation does not read ambient host compilers.
 The two LTS lines are the maintained compatibility catalog. Other
 integrity-pinned Linux 6.x releases may work, but are experimental until added
 to that catalog and its release checks. The repository generator is published
-for each host listed above; kernel compile actions target the registered
-toolchain selected for the image's platform.
+for each host listed above; kernel compile actions target the registered Clang
+toolchain selected by the image platform.
 
 The public kernel contract includes resolved configs, boot images, `vmlinux`,
 `System.map`, kernel release metadata, configured in-tree modules, and their
@@ -383,8 +378,8 @@ and license material, remains available in the repository.
 The base input is a Kconfig fragment. It must select exactly one supported
 architecture, for example `CONFIG_X86_64=y` or `CONFIG_ARM64=y`. Repository
 generation applies Kconfig defaults, dependencies, selects, and implies using
-the declared toolchain graph profile. An absent symbol follows Kconfig
-semantics; use `# CONFIG_NAME is not set` for a deliberate unset.
+the fixed LLVM capability baseline. An absent symbol follows Kconfig semantics;
+use `# CONFIG_NAME is not set` for a deliberate unset.
 
 Named overlays contain only deliberate assignments and unsets:
 
@@ -399,10 +394,7 @@ Declare them on the same image extension:
 linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
 linux_images.image(
     name = "example_kernel",
-    arch = "x86_64",
     config = "//kernel:x86_64.config",
-    graph_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.graph.json",
-    kbuild_linker = "@llvm//tools:ld.lld",
     platform = "@llvm//platforms:linux_x86_64",
     source = "@linux_6_18_39//:Kconfig",
 )
@@ -444,7 +436,6 @@ Every base and variant package exposes the same projection labels:
 | `:modules_order` | Deterministic Kbuild module load order |
 | `:modules_builtin` | Deterministic built-in module inventory |
 | `:modules_builtin_modinfo` | Deterministic built-in module metadata |
-| `:module_sdk` | Generated headers, Rust SDK, symbol versions, and linker inputs for out-of-tree modules |
 
 The `:kernel` target's `DefaultInfo` contains only the boot image, so it can be
 used directly by packaging and VM rules without selecting an output group.
@@ -475,29 +466,13 @@ system_map
 
 ## Toolchains and hermeticity
 
-`arch`, `graph_profile`, `kbuild_linker`, and `platform` are mandatory on every
-`linux_images.image` tag. The extension applies the platform once at the public
-`:kernel` gateway. Configured compile rules consume the standard rules_cc
-toolchain interface. The linker label names an executable that already exists;
-declaring it does not build or configure another linker.
-
-The checked-in `@linux.bzl//profiles:llvm_22_1_8_x86_64.graph.json` and
-`@linux.bzl//profiles:llvm_22_1_8_aarch64.graph.json` profiles match the
-Hermetic LLVM 22.1.8 toolchains supplied by module `llvm` 0.8.14. A graph
-profile is a reviewed toolchain-and-architecture superset of exact Kconfig
-command results and graph-shaping Kbuild probe decisions. Repository generation
-fails closed when a consumed identity is missing. The configured build replays
-consumed compiler/linker Kconfig commands and graph-shaping probes before any
-kernel action can run. Only the consumed projection contributes to the
-content-addressed graph identity, so adding unused profile coverage does not
-invalidate an existing graph.
-
-Flag-shaping `cc-option`, `as-option`, and `ld-option` calls are not resolved in
-the profile. Compact-v7 emits them as one content-addressed flag DAG shared by
-all image configs. Bazel evaluates each distinct probe/context pair once
-against the selected compiler or linker, then compile and link actions consume
-the resulting argv files. Graph-shaping uses remain in the checked profile
-because their result decides which targets exist.
+`platform` is mandatory on every `linux_images.image` tag. It must carry a
+Linux x86_64 or aarch64 CPU constraint and select a matching Clang toolchain.
+The extension applies it once at the public `:kernel` gateway. Analysis rejects
+non-Clang compilers and target platforms that disagree with the config; it does
+not require a particular platform label, module repository, or exact Clang
+version. Kconfig and Kbuild capability decisions remain fixed to LLVM 22.1.8,
+so selecting a newer Clang asserts compatibility with those decisions.
 
 Repository generation downloads the platform-specific, integrity-pinned
 Kconfig graph generator selected by the rules release's checked-in table. The
@@ -506,13 +481,11 @@ inputs and content identities, and checks every generated-header family and
 compile environment before exposing the graph. The generator never consumes a
 build output, which keeps module resolution valid and reproducible.
 
-Compiler, linker, and kernel build tools are Bazel inputs; temporary paths are
-action-local, timestamps and release metadata are normalized, and source
-downloads require integrity. Configured graph validation runs upstream Linux
-probe scripts through Bazel's execution-platform shell toolchain. Those scripts
-expect the platform's standard shell utilities (`rm`, `mkdir`, `head`, `grep`,
-and `env`). Remote cache and executor settings belong to the consuming
-workspace or CI environment; this repository does not prescribe a service.
+The build does not read ambient host tools or environment variables. All tools
+are Bazel inputs, temporary paths are action-local, timestamps and release
+metadata are normalized, and source downloads require integrity. Remote cache
+and executor settings belong to the consuming workspace or CI environment;
+this repository does not prescribe a service.
 
 ## Cache behavior
 

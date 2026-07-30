@@ -1,5 +1,5 @@
 module(
-    name = "linux_image_extension_success",
+    name = "linux_image_extension_repository_name_collision",
     version = "1.0.0",
 )
 
@@ -23,9 +23,14 @@ linux_images.image(
     platform = "@llvm//platforms:linux_x86_64",
     source = "//:Kconfig",
 )
-linux_images.overlay(
-    name = "debug",
-    config = "//:debug.config",
-    image = "fixture_kernel",
+linux_images.image(
+    name = "fixture_kernel__linux_graph",
+    config = "//:base.config",
+    platform = "@llvm//platforms:linux_x86_64",
+    source = "//:Kconfig",
 )
-use_repo(linux_images, "fixture_kernel")
+use_repo(
+    linux_images,
+    "fixture_kernel",
+    "fixture_kernel__linux_graph",
+)

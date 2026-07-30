@@ -1,6 +1,5 @@
 """Hermetic Linux image repository rule."""
 
-load(":compact_v7_repository.bzl", "compact_v7_repository_build", "compact_v7_repository_model")
 load(":config_validation.bzl", "validate_config_features")
 load(":kconfig_tool_filename.bzl", "kconfig_tool_filename")
 load(":kconfig_tool_releases.bzl", "KCONFIG_TOOL_RELEASES", "KCONFIG_TOOL_VERSION")
@@ -54,55 +53,15 @@ _ARCH_CONFIGS = {
     "CONFIG_X86_64": "x86_64",
 }
 
-_PROBE_ENV = {
-    "ARCH": "",
-    "AR": "llvm-ar",
-    "BINDGEN": "bindgen",
-    "CC": "clang",
-    "CC_VERSION_TEXT": "clang version 22.1.8None",
-    "CLANG_FLAGS": "-fintegrated-as",
-    "LD": "ld.lld",
-    "NM": "llvm-nm",
-    "OBJCOPY": "llvm-objcopy",
-    "PAHOLE": "pahole",
-    "PYTHON3": "python3",
-    "RUSTC": "rustc",
-    "SRCARCH": "",
-}
-
-_PROBE_VALUES = {
-    "bindgen_version": "bindgen 0.72.1",
-    "cc_version": "220108",
-    "cc_version_text": "clang version 22.1.8None",
-    "ld_version": "220108",
-    "pahole_version": "131",
-    "rust_available": "true",
-    "rust_options": "true",
-    "rustc_llvm_version": "220106",
-    "rustc_version": "109700",
-}
-
-_REPOSITORY_GENERATOR_PROTOCOL_V7 = "compact-v7-lazy-action-graph"
-
-_REPOSITORY_GENERATOR_PROTOCOL = _REPOSITORY_GENERATOR_PROTOCOL_V7
-_GRAPH_PROFILE_PROBE_VALUES = {
-    "as_instr": True,
-    "as_name": True,
-    "as_version": True,
-    "can_link": True,
-    "cc_name": True,
-    "cc_options": True,
-    "cc_version": True,
-    "cc_version_text": True,
-    "ld_name": True,
-    "ld_version": True,
-}
+_REPOSITORY_GENERATOR_PROTOCOL = "compact-v6-content-graph"
+_CLANG_BASELINE_VERSION = "22.1.8"
 _IMAGE_COMPRESSION_CONFIGS = {
     "CONFIG_KERNEL_GZIP": True,
     "CONFIG_KERNEL_LZ4": True,
 }
 
 _CONTENT_GRAPH_METADATA_FIELDS = {
+    "action_groups": "list",
     "compile_environments": "list",
     "config_payloads": "list",
     "configs": "list",
@@ -113,6 +72,17 @@ _CONTENT_GRAPH_METADATA_FIELDS = {
 }
 
 _CONTENT_GRAPH_OBJECT_KEYS = [
+    (
+        "action_groups",
+        {
+            "id": "string",
+            "object_targets": "string_list",
+            "reachable_configs": "string_list",
+            "recipe_id": "string",
+        },
+        ["id", "object_targets", "reachable_configs", "recipe_id"],
+        "action group",
+    ),
     (
         "configs",
         {
@@ -280,21 +250,10 @@ def _linux_image_impl(rctx):
     ):
         fail("source repository has invalid or incompatible linux.bzl metadata")
     rules_repo = _repository_prefix(rctx.attr._self_linux_bzl)
-    arch = rctx.attr.arch
-    if arch not in _ARCHITECTURES:
-        fail("unsupported Linux architecture %r" % arch)
-    _validate_graph_profile(rctx, arch)
-
     base_input = _read_config(rctx, rctx.attr.config, "base config")
-    config_arch = _config_arch(base_input, "base config")
-    if config_arch != arch:
-        fail(
-            "base config selects %s, but arch selects %s" %
-            (config_arch, arch),
-        )
+    arch = _config_arch(base_input, "base config")
     validate_config_features(base_input, "base config")
     tool = _download_generator(rctx)
-    graph_profile = rctx.path(rctx.attr.graph_profile)
     base = _resolve_config(
         rctx = rctx,
         tool = tool,
@@ -305,7 +264,6 @@ def _linux_image_impl(rctx):
         raw = base_input,
         config_mode = rctx.attr.config_mode,
         minimum_rustc_version = minimum_rustc_version,
-        graph_profile = graph_profile,
     )
     if _config_arch(base, "resolved base config") != arch:
         fail("Kconfig resolution changed the selected Linux architecture")
@@ -318,6 +276,7 @@ def _linux_image_impl(rctx):
     }
     base_rust_enabled = base.get("CONFIG_RUST") == "y"
     variant_configs = {}
+    variant_graph_images = {}
     variant_rust_enabled = {}
     sanitized_names = {
         _sanitize_target_name(arch): arch,
@@ -341,7 +300,6 @@ def _linux_image_impl(rctx):
             raw = merged,
             config_mode = rctx.attr.config_mode,
             minimum_rustc_version = minimum_rustc_version,
-            graph_profile = graph_profile,
         )
         if _config_arch(resolved, "resolved overlay %s" % name) != arch:
             fail("Kconfig resolution changed the architecture for overlay %s" % name)
@@ -357,6 +315,7 @@ def _linux_image_impl(rctx):
         sanitized_names[sanitized] = name
         configs[name] = resolved
         variant_configs[name] = "//configs:%s" % name
+        variant_graph_images[name] = "//graph:%s_image" % sanitized
         variant_rust_enabled[name] = resolved.get("CONFIG_RUST") == "y"
 
     rust_profile_json = ""
@@ -394,7 +353,6 @@ def _linux_image_impl(rctx):
         rules_repo = rules_repo,
         version = version,
         minimum_rustc_version = minimum_rustc_version,
-        graph_profile = rctx.path(rctx.attr.graph_profile),
     )
     graph_stats = content_graph.stats
     base_header_family_dependencies = content_graph.header_family_dependencies[arch]
@@ -421,38 +379,11 @@ def _linux_image_impl(rctx):
         name: core_configs[name]
         for name in variant_configs.keys()
     }
-    module_sdk_configs = _content_module_sdk_aliases(
-        content_graph.metadata,
-        core_configs,
-        arch,
-    )
-    variant_module_sdk_configs = {
-        name: module_sdk_configs[name]
-        for name in variant_configs.keys()
-    }
-    graph_image = content_graph.config_targets[arch].image
-    graph_modules = content_graph.config_targets[arch].modules
-    graph_sources = content_graph.config_targets[arch].sources
-    variant_graph_images = {
-        name: content_graph.config_targets[name].image
-        for name in variant_configs.keys()
-    }
-    variant_graph_modules = {
-        name: content_graph.config_targets[name].modules
-        for name in variant_configs.keys()
-    }
-    variant_graph_sources = {
-        name: content_graph.config_targets[name].sources
-        for name in variant_configs.keys()
-    }
+    graph_image = "//graph:%s_image" % _sanitize_target_name(arch)
     rctx.delete(".linux_bzl_tools")
     rctx.delete(".linux_bzl_resolve")
 
     source_repo = _repository_prefix(source)
-    graph_validation_sources = [
-        "%s//:%s" % (source_repo, path)
-        for path in content_graph.validation_source_paths
-    ]
     platform = str(rctx.attr.platform)
     rctx.file(
         "BUILD.bazel",
@@ -469,17 +400,9 @@ def _linux_image_impl(rctx):
             base_rust_enabled = base_rust_enabled,
             config_mode = rctx.attr.config_mode,
             graph_image = graph_image,
-            graph_modules = graph_modules,
-            graph_sources = graph_sources,
-            graph_projection = "//graph:graph_profile_projection.json",
-            graph_validation_sources = graph_validation_sources,
-            kbuild_linker = str(rctx.attr.kbuild_linker),
             variant_configs = variant_configs,
             variant_core_configs = variant_core_configs,
             variant_graph_images = variant_graph_images,
-            variant_graph_modules = variant_graph_modules,
-            variant_graph_sources = variant_graph_sources,
-            variant_module_sdk_configs = variant_module_sdk_configs,
             variant_header_family_dependencies = variant_header_family_dependencies,
             variant_header_family_ids = variant_header_family_ids,
             variant_header_configs = variant_header_configs,
@@ -494,7 +417,6 @@ def _linux_image_impl(rctx):
             _variant_build(
                 arch = arch,
                 graph = "//:_variant_%s_graph" % name,
-                module_sdk_graph = "//:_variant_%s_module_sdk_graph" % name,
                 platform = platform,
                 rules_repo = rules_repo,
             ),
@@ -520,24 +442,10 @@ def _linux_image_impl(rctx):
 linux_image = repository_rule(
     implementation = _linux_image_impl,
     attrs = {
-        "arch": attr.string(
-            mandatory = True,
-            values = sorted(_ARCHITECTURES.keys()),
-            doc = "Canonical Linux target architecture.",
-        ),
-        "graph_profile": attr.label(
-            allow_single_file = [".json"],
-            mandatory = True,
-            doc = "Checked-in toolchain graph profile used only during repository graph generation.",
-        ),
-        "kbuild_linker": attr.label(
-            mandatory = True,
-            doc = "Explicit raw linker executable used by configured Kbuild actions.",
-        ),
         "config": attr.label(
             allow_single_file = True,
             mandatory = True,
-            doc = "Base Linux Kconfig fragment. Its architecture selection must match arch.",
+            doc = "Base Linux Kconfig fragment. Its architecture selection must match platform.",
         ),
         "config_mode": attr.string(
             default = "default",
@@ -550,7 +458,7 @@ linux_image = repository_rule(
         ),
         "platform": attr.label(
             mandatory = True,
-            doc = "Target platform applied once at the public kernel gateway.",
+            doc = "Target platform applied once at the public kernel gateway. It must select a matching Clang toolchain.",
         ),
         "source": attr.label(
             allow_single_file = True,
@@ -561,22 +469,8 @@ linux_image = repository_rule(
             default = Label("//:linux.bzl"),
         ),
     },
-    doc = "Generates a config-specific Bazel Linux kernel graph.",
+    doc = "Generates a config-specific, per-object Bazel Linux kernel graph.",
 )
-
-def _validate_graph_profile(rctx, arch):
-    profile = json.decode(rctx.read(rctx.attr.graph_profile))
-    if type(profile) != "dict":
-        fail("graph_profile must contain a JSON object")
-    if profile.get("schema") != "linux.bzl/toolchain-graph-profile-v1":
-        fail("graph_profile has unsupported schema %r" % profile.get("schema"))
-    if profile.get("architecture") != arch:
-        fail(
-            "graph_profile architecture %r does not match image arch %r" %
-            (profile.get("architecture"), arch),
-        )
-    if profile.get("driver_contract") != "gnu-cc-response-v1":
-        fail("graph_profile has unsupported driver contract %r" % profile.get("driver_contract"))
 
 def _read_config(rctx, label, description):
     return _parse_config(rctx.read(label), description)
@@ -602,17 +496,7 @@ def _parse_config(content, description):
         _set_config_value(values, key, value, description, line_number + 1)
     return values
 
-def _resolve_config(
-        rctx,
-        tool,
-        source_root,
-        arch,
-        version,
-        name,
-        raw,
-        config_mode,
-        minimum_rustc_version,
-        graph_profile = None):
+def _resolve_config(rctx, tool, source_root, arch, version, name, raw, config_mode, minimum_rustc_version):
     descriptor = _ARCHITECTURES[arch]
     directory = ".linux_bzl_resolve/" + name
     input_path = directory + "/input.config"
@@ -658,21 +542,8 @@ def _resolve_config(
         "-kernel_version",
         version,
         "-allow_shell",
-        "-linux_probe_model",
-        "linux_llvm",
     ]
-    if graph_profile != None:
-        args.extend([
-            "-graph_profile",
-            str(graph_profile),
-        ])
-    _add_generator_variables(
-        args,
-        descriptor,
-        source_root,
-        minimum_rustc_version,
-        use_graph_profile = graph_profile != None,
-    )
+    _add_generator_variables(args, descriptor, source_root, minimum_rustc_version)
     result = rctx.execute(
         args,
         environment = {
@@ -814,6 +685,10 @@ def _write_configs(rctx, arch, configs, rules_repo):
         ])
     rctx.file("configs/BUILD.bazel", "\n".join(rules), executable = False)
 
+def _initialize_generator_outputs(rctx, graph_dir):
+    rctx.file(graph_dir + "/BUILD.bazel", "", executable = False)
+    rctx.file(graph_dir + "/metadata.json", "{}\n", executable = False)
+
 def _host_platform(rctx):
     os_name = rctx.os.name.lower()
     if os_name.startswith("linux"):
@@ -904,92 +779,20 @@ def _generate_content_graph(
         generated_headers,
         rules_repo,
         version,
-        minimum_rustc_version,
-        graph_profile):
-    return _generate_lazy_content_graph(
-        rctx = rctx,
-        tool = tool,
-        source = source,
-        source_root = source_root,
-        arch = arch,
-        base_config = base_config,
-        config_paths = config_paths,
-        config_mode = config_mode,
-        generated_headers = generated_headers,
-        rules_repo = rules_repo,
-        version = version,
-        minimum_rustc_version = minimum_rustc_version,
-        graph_profile = graph_profile,
-    )
-
-def _compact_v7_compile_environment_abi(descriptor):
-    return "linux.bzl/compact-v7/graph-profile-v1/%s/%s" % (
+        minimum_rustc_version):
+    graph_dir = "graph"
+    _initialize_generator_outputs(rctx, graph_dir)
+    descriptor = _ARCHITECTURES[arch]
+    compile_environment_abi = "linux.bzl/compact-v6/clang-baseline-%s/%s/%s" % (
+        _CLANG_BASELINE_VERSION,
         descriptor.arch,
         descriptor.srcarch,
     )
-
-def _compact_v7_generator_stats(model, emitted):
-    stats = model.graph_stats
-    duplicate_memberships = stats.config_object_memberships - stats.object_count
-    if duplicate_memberships < 0:
-        duplicate_memberships = 0
-    return {
-        "action_recipe_groups": stats.recipe_group_count,
-        "action_source_groups": stats.action_source_group_count,
-        "analysis_config_payloads": len(emitted.analysis_config_payload_ids),
-        "compile_environments": stats.compile_environment_count,
-        "config_count": stats.config_count,
-        "config_payloads": stats.config_payload_count,
-        "duplicate_memberships": duplicate_memberships,
-        "fallback_objects": len(emitted.fallback_targets),
-        "flag_programs": stats.flag_program_count,
-        "generated_header_families": stats.generated_header_family_count,
-        "object_definitions": stats.object_count,
-        "object_memberships": stats.config_object_memberships,
-        "selected_object_variants": stats.object_count,
-        "source_files": stats.source_file_count,
-        "source_sets": stats.source_set_count,
-    }
-
-def _compact_v7_config_targets(config_targets, graph_dir):
-    result = {}
-    for name in sorted(config_targets.keys()):
-        targets = config_targets[name]
-        result[name] = struct(
-            image = "//%s:%s" % (graph_dir, targets.image),
-            modules = "//%s:%s" % (graph_dir, targets.modules),
-            sources = "//%s:%s" % (graph_dir, targets.sources),
-        )
-    return result
-
-def _generate_lazy_content_graph(
-        rctx,
-        tool,
-        source,
-        source_root,
-        arch,
-        base_config,
-        config_paths,
-        config_mode,
-        generated_headers,
-        rules_repo,
-        version,
-        minimum_rustc_version,
-        graph_profile):
-    graph_dir = "graph"
-    metadata_path = graph_dir + "/metadata.json"
-    graph_projection_path = graph_dir + "/graph_profile_projection.json"
-    rctx.file(metadata_path, "{}\n", executable = False)
-    rctx.file(graph_projection_path, "{}\n", executable = False)
-    descriptor = _ARCHITECTURES[arch]
-    compile_environment_abi = _compact_v7_compile_environment_abi(descriptor)
     source_package = str(source).rsplit(":", 1)[0]
     args = [
         str(tool),
-        "-graph_profile",
-        str(graph_profile),
-        "-graph_profile_projection_out",
-        str(rctx.path(graph_projection_path)),
+        "-compact_base_config",
+        base_config,
         "-compile_environment_abi",
         compile_environment_abi,
         "-kernel_version",
@@ -1001,12 +804,27 @@ def _generate_lazy_content_graph(
         "-kbuild",
         str(source_root.get_child("Kbuild")),
         "-compact_kbuild_tree",
+        "-compact_buildfile_out",
+        str(rctx.path(graph_dir + "/BUILD.bazel")),
         "-compact_metadata_out",
-        str(rctx.path(metadata_path)),
+        str(rctx.path(graph_dir + "/metadata.json")),
+        "-compact_buildfile_export",
+        "metadata.json",
+        "-linux_objects_load",
+        rules_repo + "//internal:linux_objects.bzl",
+        "-object_label_package",
+        "//" + graph_dir,
+        "-source_label_package",
+        source_package,
+        "-source_root_label",
+        str(source),
+        "-source_asn1_compiler",
+        "//:_base_asn1_compiler_tool",
         "-allow_shell",
-        "-linux_probe_model",
-        "linux_llvm",
+        "-visibility",
+        "//:__subpackages__",
     ]
+    args.extend(_graph_arch_tool_args(arch))
     args.extend(_graph_configs_args({
         name: rctx.path(config_paths[name])
         for name in config_paths.keys()
@@ -1016,13 +834,7 @@ def _generate_lazy_content_graph(
             "-generated_headers_for_config",
             "%s=%s" % (name, generated_headers[name]),
         ])
-    _add_generator_variables(
-        args,
-        descriptor,
-        source_root,
-        minimum_rustc_version,
-        use_graph_profile = True,
-    )
+    _add_generator_variables(args, descriptor, source_root, minimum_rustc_version)
 
     result = rctx.execute(
         args,
@@ -1036,95 +848,34 @@ def _generate_lazy_content_graph(
     )
     if result.return_code != 0:
         fail(
-            "Linux lazy content graph generation failed for %s configs %s\nstdout:\n%s\nstderr:\n%s" %
+            "Linux content graph generation failed for %s configs %s\nstdout:\n%s\nstderr:\n%s" %
             (rctx.original_name, sorted(config_paths.keys()), result.stdout, result.stderr),
         )
-
-    metadata = json.decode(rctx.read(metadata_path))
-    graph_projection = json.decode(rctx.read(graph_projection_path))
-    if (
-        type(graph_projection) != "dict" or
-        graph_projection.get("schema") != "linux.bzl/consumed-graph-projection-v1" or
-        graph_projection.get("architecture") != arch
-    ):
-        fail("Linux lazy content graph emitted an invalid graph-profile projection")
-    graph_validation_source_paths = _graph_validation_source_paths(graph_projection)
+    validated = _validate_generated_metadata(
+        rctx,
+        graph_dir,
+        sorted(config_paths.keys()),
+        source_root,
+        expected_compile_environment_abi = compile_environment_abi,
+        expected_srcarch = descriptor.srcarch,
+    )
+    _validate_generated_build(
+        rctx,
+        graph_dir,
+        "content-addressed configs",
+    )
+    metadata = validated.metadata
     header_index = _content_generated_header_config_index(
         metadata,
         generated_headers,
         base_config,
     )
-    canonical_header_labels = {
-        label: generated_headers[header_index.aliases[name]]
-        for name, label in generated_headers.items()
-    }
-    model_metadata = dict(metadata)
-    model_families = []
-    for raw_family in metadata.get("generated_header_families", []):
-        family = dict(raw_family)
-        family["labels"] = sorted({
-            canonical_header_labels[label]: True
-            for label in family.get("labels", [])
-        }.keys())
-        model_families.append(family)
-    model_metadata["generated_header_families"] = model_families
-    expected_profile = metadata.get("toolchain_profile", "") if type(metadata) == "dict" else ""
-    model = compact_v7_repository_model(
-        model_metadata,
-        expected_toolchain_profile = expected_profile,
-        expected_compile_environment_abi = compile_environment_abi,
-    )
-    expected_names = sorted(config_paths.keys())
-    if sorted(model.configs.keys()) != expected_names:
-        fail(
-            "Linux lazy content graph emitted configs %s, expected %s" %
-            (sorted(model.configs.keys()), expected_names),
-        )
-    for source_file in model.source_files:
-        if not source_root.get_child(source_file.path).exists:
-            fail(
-                "Linux lazy content graph references missing source %s" %
-                source_file.path,
-            )
-
-    emitted = compact_v7_repository_build(
-        model,
-        arch = descriptor.arch,
-        srcarch = descriptor.srcarch,
-        rules_repo = rules_repo,
-        source_label_package = source_package,
-        source_root_label = str(source),
-        graph_profile = "//:_graph_profile",
-        version = version,
-        source_objtool = "//:_base_x86_objtool" if arch == "x86_64" else "",
-        source_asn1_compiler = "//:_base_asn1_compiler_tool",
-        source_relacheck = "//:_base_relacheck_tool" if arch == "aarch64" else "",
-        source_objcopy = "@llvm//tools:llvm-objcopy" if arch == "aarch64" else "",
-        visibility = ["//:__subpackages__"],
-    )
-    rctx.file(
-        graph_dir + "/BUILD.bazel",
-        emitted.build_file,
-        executable = False,
-    )
-    for path in sorted(emitted.config_payload_files.keys()):
-        rctx.file(
-            graph_dir + "/" + path,
-            emitted.config_payload_files[path],
-            executable = False,
-        )
-
     return struct(
-        config_targets = _compact_v7_config_targets(
-            emitted.config_targets,
-            graph_dir,
-        ),
         header_configs = header_index.aliases,
         header_family_dependencies = header_index.family_dependencies,
         header_family_ids = header_index.family_ids,
         metadata = metadata,
-        stats = _compact_v7_generator_stats(model, emitted),
-        validation_source_paths = graph_validation_source_paths,
+        stats = validated.stats,
         variant_header_configs = {
             name: header_index.aliases[name]
             for name in header_index.aliases.keys()
@@ -1144,21 +895,6 @@ def _graph_configs_args(config_paths, config_mode):
         config_mode,
     ])
     return args
-
-def _graph_validation_source_paths(graph_projection):
-    paths = {}
-    for collection in ["kconfig_commands", "kbuild_graph_probes"]:
-        records = graph_projection.get(collection, [])
-        if type(records) != "list":
-            fail("graph projection %s must be a list" % collection)
-        for index, record in enumerate(records):
-            if type(record) != "dict" or type(record.get("inputs")) != "dict":
-                fail("graph projection %s[%d].inputs must be a dict" % (collection, index))
-            for path in record["inputs"].keys():
-                if type(path) != "string" or not path:
-                    fail("graph projection input paths must be non-empty strings")
-                paths[path] = True
-    return sorted(paths.keys())
 
 def _content_generated_header_config_index(metadata, generated_headers, base_config):
     if base_config not in generated_headers:
@@ -1328,41 +1064,10 @@ def _content_core_config_aliases(metadata, configs, rust_enabled, header_configs
             candidate_graph = graph_configs[candidate]
             if (
                 graph.object_targets == candidate_graph.object_targets and
+                graph.module_object_targets == candidate_graph.module_object_targets and
                 config == _config_without_image_compression(configs[candidate]) and
                 rust_enabled[name] == rust_enabled[candidate] and
                 header_configs[name] == header_configs[candidate]
-            ):
-                canonical = candidate
-                break
-        aliases[name] = canonical
-        if canonical == name:
-            canonical_names.append(name)
-    return aliases
-
-def _content_module_sdk_aliases(metadata, core_configs, base_config):
-    modules = {}
-    for config in metadata.get("configs", []):
-        name = config.get("name", "") if type(config) == "dict" else ""
-        roots = config.get("module_object_targets", []) if type(config) == "dict" else None
-        if not name or type(roots) != "list" or name in modules:
-            fail("Linux content graph emitted invalid module SDK roots")
-        modules[name] = list(roots)
-    if sorted(modules.keys()) != sorted(core_configs.keys()) or base_config not in modules:
-        fail("Linux content graph module SDK configs do not match core configs")
-
-    ordered_names = [base_config] + [
-        name
-        for name in sorted(modules.keys())
-        if name != base_config
-    ]
-    aliases = {}
-    canonical_names = []
-    for name in ordered_names:
-        canonical = name
-        for candidate in canonical_names:
-            if (
-                modules[name] == modules[candidate] and
-                core_configs[name] == core_configs[candidate]
             ):
                 canonical = candidate
                 break
@@ -1379,23 +1084,20 @@ def _generator_variable_args(variables, source_root):
         result.extend(["-var", "%s=%s" % (key, variables[key])])
     return result
 
-def _graph_profile_owns_probe_value(key):
-    return key in _GRAPH_PROFILE_PROBE_VALUES or key.startswith("cc_builtin_macro.")
+def _graph_arch_tool_args(arch):
+    if arch == "x86_64":
+        return [
+            "-source_objtool",
+            "//:_base_x86_objtool",
+        ]
+    if arch == "aarch64":
+        return [
+            "-source_relacheck",
+            "//:_base_relacheck_tool",
+        ]
+    return []
 
-def _generator_probe_value_args(probe_values, use_graph_profile):
-    args = []
-    for key in sorted(probe_values.keys()):
-        if use_graph_profile and _graph_profile_owns_probe_value(key):
-            continue
-        args.extend(["-linux_probe_value", "%s=%s" % (key, probe_values[key])])
-    return args
-
-def _add_generator_variables(
-        args,
-        descriptor,
-        source_root,
-        minimum_rustc_version,
-        use_graph_profile = False):
+def _add_generator_variables(args, descriptor, source_root, minimum_rustc_version):
     variables = dict(descriptor.compact_vars)
     variables.update({
         "ARCH": descriptor.arch,
@@ -1404,14 +1106,85 @@ def _add_generator_variables(
         "UTS_MACHINE": descriptor.uts_machine,
     })
     args.extend(_generator_variable_args(variables, source_root))
-    probe_env = dict(_PROBE_ENV)
-    probe_env["ARCH"] = descriptor.arch
-    probe_env["SRCARCH"] = descriptor.srcarch
-    for key in sorted(probe_env.keys()):
-        args.extend(["-env", "%s=%s" % (key, probe_env[key])])
-    probe_values = dict(_PROBE_VALUES)
-    probe_values["rustc_version"] = str(_linux_version_code(minimum_rustc_version))
-    args.extend(_generator_probe_value_args(probe_values, use_graph_profile))
+    for key, value in [
+        ("ARCH", descriptor.arch),
+        ("SRCARCH", descriptor.srcarch),
+    ]:
+        args.extend(["-env", "%s=%s" % (key, value)])
+    args.extend([
+        "-linux_probe_arch",
+        descriptor.arch,
+        "-linux_probe_rustc_version",
+        str(_linux_version_code(minimum_rustc_version)),
+    ])
+
+def _metadata_positive_decimal(value, context):
+    if not value or (len(value) > 1 and value.startswith("0")):
+        fail("%s has invalid positive decimal %r" % (context, value))
+    result = 0
+    for i in range(len(value)):
+        char = value[i]
+        if char < "0" or char > "9":
+            fail("%s has invalid positive decimal %r" % (context, value))
+        result = result * 10 + int(char)
+    if result <= 0:
+        fail("%s has invalid positive decimal %r" % (context, value))
+    return result
+
+def _metadata_source_input_index(metadata):
+    files = metadata.get("source_files", [])
+    groups = metadata.get("source_input_groups", [])
+    if type(files) != "list" or not files or type(groups) != "list" or not groups:
+        fail("Linux content graph requires non-empty source_files and source_input_groups")
+    paths = []
+    previous_path = ""
+    for index in range(len(files)):
+        source_file = files[index]
+        path = source_file.get("path", "") if type(source_file) == "dict" else ""
+        digest = source_file.get("digest", "") if type(source_file) == "dict" else ""
+        if (
+            type(path) != "string" or
+            not path or
+            not _is_content_id(digest) or
+            (previous_path and previous_path >= path)
+        ):
+            fail("Linux content graph source file %d is invalid or non-canonical" % (index + 1))
+        paths.append(path)
+        previous_path = path
+    decoded_groups = []
+    previous_group = ""
+    for group_index in range(len(groups)):
+        encoded = groups[group_index]
+        if type(encoded) != "string" or not encoded or (previous_group and previous_group >= encoded):
+            fail("Linux content graph source input group %d is invalid or non-canonical" % (group_index + 1))
+        group_paths = {}
+        previous_file = 0
+        for value in encoded.split(","):
+            file_index = _metadata_positive_decimal(
+                value,
+                "Linux content graph source input group %d" % (group_index + 1),
+            )
+            if file_index <= previous_file or file_index > len(paths):
+                fail(
+                    "Linux content graph source input group %d has duplicate or out-of-range file index %d" %
+                    (group_index + 1, file_index),
+                )
+            group_paths[paths[file_index - 1]] = True
+            previous_file = file_index
+        decoded_groups.append(group_paths)
+        previous_group = encoded
+    return struct(
+        files = files,
+        groups = decoded_groups,
+    )
+
+def _metadata_source_input_group(source_index, group, context):
+    if type(group) != "int" or group <= 0 or group > len(source_index.groups):
+        fail(
+            "%s source_input_group %r is out of range 1..%d" %
+            (context, group, len(source_index.groups)),
+        )
+    return source_index.groups[group - 1]
 
 def _metadata_value_type_error(value, expected_type, context):
     if expected_type == "list":
@@ -1479,6 +1252,484 @@ def _content_graph_metadata_structure_error(metadata):
                 return error
     return ""
 
+def _action_recipe_key(variant):
+    source = variant.get("source", "")
+    language = ""
+    if source.endswith(".c"):
+        language = "c"
+    elif source.endswith(".S") or source.endswith(".s"):
+        language = "asm"
+    kind = "compile"
+    if variant.get("members", []):
+        kind = "arm64_nvhe" if variant.get("object", "") == "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o" else "composite"
+    return json.encode([
+        kind,
+        language,
+        variant.get("mode", ""),
+        variant.get("modname", ""),
+        variant.get("module_root", False),
+        variant.get("objtool_disabled", False),
+        variant.get("objtool_force", False),
+        variant.get("flags", []),
+        variant.get("remove_flags", []),
+        variant.get("objtool_args", []),
+    ])
+
+def _canonical_nonempty_strings_error(values, context):
+    if type(values) != "list" or not values:
+        return "%s must be a non-empty JSON string array" % context
+    if values != sorted(values):
+        return "%s must be sorted" % context
+    seen = {}
+    for value in values:
+        if type(value) != "string" or not value:
+            return "%s has invalid item %r" % (context, value)
+        if value in seen:
+            return "%s repeats %r" % (context, value)
+        seen[value] = True
+    return ""
+
+def _action_group_validation(metadata):
+    configs = metadata.get("configs", [])
+    variants = metadata.get("object_variants", [])
+    groups = metadata.get("action_groups", [])
+
+    config_names = {}
+    for config in configs:
+        name = config.get("name", "") if type(config) == "dict" else ""
+        if not name:
+            return struct(error = "Linux content graph has an unnamed config", stats = {})
+        if name in config_names:
+            return struct(error = "Linux content graph repeats config %r" % name, stats = {})
+        config_names[name] = True
+
+    variants_by_target = {}
+    for variant in variants:
+        target = variant.get("target", "") if type(variant) == "dict" else ""
+        if not target:
+            return struct(error = "Linux content graph has an unnamed object variant", stats = {})
+        if target in variants_by_target:
+            return struct(error = "Linux content graph repeats object target %s" % target, stats = {})
+        variants_by_target[target] = variant
+
+    reachable_configs_by_target = {}
+    memberships = 0
+    for config in configs:
+        name = config["name"]
+        pending = config.get("object_targets", []) + config.get("module_object_targets", [])
+        selected = {}
+        for _ in range(len(variants_by_target) + 1):
+            next_pending = []
+            for target in pending:
+                variant = variants_by_target.get(target)
+                if variant == None:
+                    return struct(
+                        error = "Linux content graph config %s references unknown object target %s" % (name, target),
+                        stats = {},
+                    )
+                if target in selected:
+                    continue
+                selected[target] = True
+                next_pending.extend(variant.get("deps", []))
+                next_pending.extend(variant.get("members", []))
+            pending = next_pending
+            if not pending:
+                break
+        if pending:
+            return struct(
+                error = "Linux content graph config %s object traversal did not converge" % name,
+                stats = {},
+            )
+        memberships += len(selected)
+        for target in selected.keys():
+            if target not in reachable_configs_by_target:
+                reachable_configs_by_target[target] = {}
+            reachable_configs_by_target[target][name] = True
+
+    group_ids = {}
+    group_keys = {}
+    owned_targets = {}
+    recipe_key_by_id = {}
+    recipe_id_by_key = {}
+    reachability_sets = {}
+    group_objects = 0
+    largest_group = 0
+    ordered_group_ids = []
+    for group in groups:
+        group_id = group.get("id", "") if type(group) == "dict" else ""
+        recipe_id = group.get("recipe_id", "") if type(group) == "dict" else ""
+        reachable_configs = group.get("reachable_configs", []) if type(group) == "dict" else []
+        object_targets = group.get("object_targets", []) if type(group) == "dict" else []
+        if not _is_content_id(group_id):
+            return struct(error = "Linux content graph action group has invalid ID %r" % group_id, stats = {})
+        if group_id in group_ids:
+            return struct(error = "Linux content graph repeats action group ID %s" % group_id, stats = {})
+        if not _is_content_id(recipe_id):
+            return struct(
+                error = "Linux content graph action group %s has invalid recipe ID %r" % (group_id, recipe_id),
+                stats = {},
+            )
+        error = _canonical_nonempty_strings_error(
+            reachable_configs,
+            "Linux content graph action group %s reachable configs" % group_id,
+        )
+        if error:
+            return struct(error = error, stats = {})
+        error = _canonical_nonempty_strings_error(
+            object_targets,
+            "Linux content graph action group %s object targets" % group_id,
+        )
+        if error:
+            return struct(error = error, stats = {})
+        for name in reachable_configs:
+            if name not in config_names:
+                return struct(
+                    error = "Linux content graph action group %s references unknown config %s" % (group_id, name),
+                    stats = {},
+                )
+
+        group_key = json.encode([recipe_id, reachable_configs])
+        if group_key in group_keys:
+            return struct(
+                error = "Linux content graph action groups %s and %s repeat recipe/reachability ownership" %
+                        (group_keys[group_key], group_id),
+                stats = {},
+            )
+        group_keys[group_key] = group_id
+        group_ids[group_id] = True
+        ordered_group_ids.append(group_id)
+        reachability_sets[json.encode(reachable_configs)] = True
+        group_objects += len(object_targets)
+        largest_group = max(largest_group, len(object_targets))
+
+        concrete_recipe_key = None
+        for target in object_targets:
+            variant = variants_by_target.get(target)
+            if variant == None:
+                return struct(
+                    error = "Linux content graph action group %s references unknown object target %s" %
+                            (group_id, target),
+                    stats = {},
+                )
+            if target in owned_targets:
+                return struct(
+                    error = "Linux content graph action groups %s and %s both own object target %s" %
+                            (owned_targets[target], group_id, target),
+                    stats = {},
+                )
+            actual_reachability = sorted(reachable_configs_by_target.get(target, {}).keys())
+            if actual_reachability != reachable_configs:
+                return struct(
+                    error = "Linux content graph action group %s gives object target %s reachability %s, expected %s" %
+                            (group_id, target, reachable_configs, actual_reachability),
+                    stats = {},
+                )
+            target_recipe_key = _action_recipe_key(variant)
+            if concrete_recipe_key == None:
+                concrete_recipe_key = target_recipe_key
+            elif target_recipe_key != concrete_recipe_key:
+                return struct(
+                    error = "Linux content graph action group %s mixes concrete action recipes" % group_id,
+                    stats = {},
+                )
+            owned_targets[target] = group_id
+
+        previous_recipe_key = recipe_key_by_id.get(recipe_id)
+        if previous_recipe_key != None and previous_recipe_key != concrete_recipe_key:
+            return struct(
+                error = "Linux content graph recipe ID %s identifies multiple concrete action recipes" % recipe_id,
+                stats = {},
+            )
+        previous_recipe_id = recipe_id_by_key.get(concrete_recipe_key)
+        if previous_recipe_id != None and previous_recipe_id != recipe_id:
+            return struct(
+                error = "Linux content graph concrete action recipe has IDs %s and %s" %
+                        (previous_recipe_id, recipe_id),
+                stats = {},
+            )
+        recipe_key_by_id[recipe_id] = concrete_recipe_key
+        recipe_id_by_key[concrete_recipe_key] = recipe_id
+
+    if ordered_group_ids != sorted(ordered_group_ids):
+        return struct(error = "Linux content graph action groups must be sorted by ID", stats = {})
+
+    selected_targets = sorted(reachable_configs_by_target.keys())
+    owned = sorted(owned_targets.keys())
+    if owned != selected_targets:
+        missing = [target for target in selected_targets if target not in owned_targets]
+        extra = [target for target in owned_targets.keys() if target not in reachable_configs_by_target]
+        return struct(
+            error = "Linux content graph action-group ownership is incomplete (missing %s, extra %s)" %
+                    (missing, sorted(extra)),
+            stats = {},
+        )
+
+    return struct(
+        error = "",
+        stats = {
+            "action_group_objects": group_objects,
+            "action_group_reachability_sets": len(reachability_sets),
+            "action_group_recipes": len(recipe_key_by_id),
+            "action_groups": len(groups),
+            "largest_action_group": largest_group,
+            "object_memberships": memberships,
+            "selected_object_variants": len(selected_targets),
+        },
+    )
+
+def _validate_generated_metadata(
+        rctx,
+        graph_dir,
+        config_names,
+        source_root,
+        expected_compile_environment_abi,
+        expected_srcarch):
+    metadata = json.decode(rctx.read(graph_dir + "/metadata.json"))
+    structure_error = _content_graph_metadata_structure_error(metadata)
+    if structure_error:
+        fail("Linux graph generator wrote invalid metadata: %s" % structure_error)
+    generated_configs = metadata.get("configs", [])
+    names = sorted([config.get("name", "") for config in generated_configs])
+    expected_names = sorted(config_names)
+    if names != expected_names:
+        fail("Linux graph generator emitted configs %s, expected %s" % (names, expected_names))
+    source_index = _metadata_source_input_index(metadata)
+
+    variants = metadata.get("object_variants", [])
+    if type(variants) != "list" or not variants:
+        fail("Linux graph generator produced no object variants")
+    variants_by_target = {}
+    content_ids = {}
+    for variant in variants:
+        if type(variant) != "dict":
+            fail("Linux graph generator emitted invalid object metadata")
+        target = variant.get("target", "")
+        object_path = variant.get("object", "")
+        mode = variant.get("mode", "")
+        if type(target) != "string" or not target or type(object_path) != "string" or not object_path:
+            fail("Linux graph generator emitted an unnamed object variant")
+        if mode not in ["y", "m"]:
+            fail(
+                "Linux graph for configs %s selects object %s with invalid Kbuild mode %r" %
+                (expected_names, object_path, mode),
+            )
+        if target in variants_by_target:
+            fail("Linux graph generator repeated object target %s" % target)
+        variants_by_target[target] = variant
+        if variant.get("members", []):
+            continue
+        source = variant.get("source", "")
+        if type(source) != "string" or not source:
+            fail(
+                "Linux graph for configs %s cannot resolve a concrete source for leaf object %s" %
+                (expected_names, object_path),
+            )
+        if not source_root.get_child(source).exists:
+            fail(
+                "Linux graph for configs %s resolved object %s to missing source %s" %
+                (expected_names, object_path, source),
+            )
+        source_paths = _metadata_source_input_group(
+            source_index,
+            variant.get("source_input_group", 0),
+            "Linux content graph object %s" % object_path,
+        )
+        if source not in source_paths:
+            fail("Linux content graph object %s exact inputs omit %s" % (object_path, source))
+
+    if not expected_compile_environment_abi:
+        fail("Linux content graph validation requires an expected compile environment ABI")
+
+    payload_ids = {}
+    for payload in metadata.get("config_payloads", []):
+        payload_id = payload.get("id", "") if type(payload) == "dict" else ""
+        if not _is_content_id(payload_id) or payload_id in payload_ids:
+            fail("Linux content graph has invalid or duplicate config payload ID %r" % payload_id)
+        if type(payload.get("content")) != "string":
+            fail("Linux content graph config payload %s is not normalized" % payload_id)
+        payload_ids[payload_id] = True
+
+    family_by_id = {}
+    for family in metadata.get("generated_header_families", []):
+        family_id = family.get("id", "") if type(family) == "dict" else ""
+        name = family.get("name", "") if type(family) == "dict" else ""
+        payload_id = family.get("config_payload", "") if type(family) == "dict" else ""
+        labels = family.get("labels", []) if type(family) == "dict" else []
+        srcarch = family.get("srcarch", "") if type(family) == "dict" else ""
+        dependencies = family.get("dependencies", []) if type(family) == "dict" else []
+        source_input_group = family.get("source_input_group", 0) if type(family) == "dict" else 0
+        if not _is_content_id(family_id) or family_id in family_by_id:
+            fail("Linux content graph has invalid or duplicate generated-header family ID %r" % family_id)
+        if (
+            type(name) != "string" or
+            not name or
+            payload_id not in payload_ids or
+            type(labels) != "list" or
+            not labels or
+            type(srcarch) != "string" or
+            not srcarch or
+            (expected_srcarch and srcarch != expected_srcarch) or
+            type(dependencies) != "list" or
+            type(source_input_group) != "int" or
+            source_input_group < 0
+        ):
+            fail("Linux content graph generated-header family %s is invalid" % family_id)
+        for label in labels:
+            if type(label) != "string" or not label:
+                fail("Linux content graph generated-header family %s has invalid label %r" % (family_id, label))
+        if source_input_group:
+            _metadata_source_input_group(
+                source_index,
+                source_input_group,
+                "Linux content graph generated-header family %s" % family_id,
+            )
+        family_by_id[family_id] = family
+
+    for family_id, family in family_by_id.items():
+        seen_dependencies = {}
+        for dependency_id in family.get("dependencies", []):
+            if type(dependency_id) != "string" or dependency_id not in family_by_id:
+                fail(
+                    "Linux content graph generated-header family %s references unknown dependency %s" %
+                    (family_id, dependency_id),
+                )
+            if dependency_id == family_id or dependency_id in seen_dependencies:
+                fail(
+                    "Linux content graph generated-header family %s has duplicate or self dependency %s" %
+                    (family_id, dependency_id),
+                )
+            seen_dependencies[dependency_id] = True
+    resolved_family_ids = {}
+    for _ in range(len(family_by_id)):
+        for family_id, family in family_by_id.items():
+            if family_id in resolved_family_ids:
+                continue
+            if all([
+                dependency_id in resolved_family_ids
+                for dependency_id in family.get("dependencies", [])
+            ]):
+                resolved_family_ids[family_id] = True
+    if len(resolved_family_ids) != len(family_by_id):
+        fail(
+            "Linux content graph generated-header families contain a dependency cycle involving %s" %
+            sorted([
+                family_id
+                for family_id in family_by_id.keys()
+                if family_id not in resolved_family_ids
+            ]),
+        )
+
+    environment_ids = {}
+    for environment in metadata.get("compile_environments", []):
+        environment_id = environment.get("id", "") if type(environment) == "dict" else ""
+        payload_id = environment.get("config_payload", "") if type(environment) == "dict" else ""
+        abi = environment.get("abi", "") if type(environment) == "dict" else ""
+        family_ids = environment.get("generated_header_families", []) if type(environment) == "dict" else []
+        if not _is_content_id(environment_id) or environment_id in environment_ids:
+            fail("Linux content graph has invalid or duplicate compile environment ID %r" % environment_id)
+        if payload_id not in payload_ids or type(abi) != "string" or not abi or type(family_ids) != "list":
+            fail("Linux content graph compile environment %s is invalid" % environment_id)
+        _validate_compile_environment_abi(
+            abi,
+            expected_compile_environment_abi,
+            environment_id,
+        )
+        family_names = {}
+        for family_id in family_ids:
+            if type(family_id) != "string" or family_id not in family_by_id:
+                fail(
+                    "Linux content graph compile environment %s references unknown generated-header family %s" %
+                    (environment_id, family_id),
+                )
+            family_name = family_by_id[family_id]["name"]
+            if family_name in family_names:
+                fail(
+                    "Linux content graph compile environment %s repeats generated-header family %s" %
+                    (environment_id, family_name),
+                )
+            family_names[family_name] = True
+        if "all" in family_names and len(family_names) != 1:
+            fail("Linux content graph compile environment %s mixes all with precise generated-header families" % environment_id)
+        environment_ids[environment_id] = True
+
+    for variant in variants:
+        target = variant["target"]
+        content_id = variant.get("content_id", "")
+        if not _is_content_id(content_id):
+            fail("Linux content graph target %s has invalid content ID %r" % (target, content_id))
+        if content_id in content_ids:
+            fail("Linux content graph targets %s and %s duplicate content ID %s" % (content_ids[content_id], target, content_id))
+        content_ids[content_id] = target
+        if not target.endswith("__" + content_id[:24]):
+            fail("Linux content graph target %s does not use its collision-checked content ID" % target)
+        for dependency in variant.get("deps", []) + variant.get("members", []):
+            if dependency not in variants_by_target:
+                fail("Linux content graph target %s references unknown object target %s" % (target, dependency))
+        is_nvhe = variant.get("object", "") == "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o"
+        if variant.get("source", "") or is_nvhe:
+            environment_id = variant.get("compile_environment", "")
+            if environment_id not in environment_ids:
+                fail("Linux content graph target %s references unknown compile environment %s" % (target, environment_id))
+        if is_nvhe:
+            source_paths = _metadata_source_input_group(
+                source_index,
+                variant.get("source_input_group", 0),
+                "Linux content graph nVHE object %s" % target,
+            )
+            if "arch/arm64/kvm/hyp/nvhe/hyp.lds.S" not in source_paths:
+                fail("Linux content graph nVHE object %s omits hyp.lds.S" % target)
+        elif variant.get("members", []) and variant.get("source_input_group", 0):
+            fail("Linux content graph composite object %s unexpectedly has source inputs" % target)
+
+    memberships = 0
+    selected_targets = {}
+    for config in generated_configs:
+        payload_id = config.get("config_payload", "")
+        if payload_id not in payload_ids:
+            fail("Linux content graph config %s references unknown config payload %s" % (config.get("name", ""), payload_id))
+        pending = config.get("object_targets", []) + config.get("module_object_targets", [])
+        selected_for_config = {}
+        for _ in variants:
+            next_pending = []
+            for target in pending:
+                if target not in variants_by_target:
+                    fail("Linux content graph config %s references unknown object target %s" % (config.get("name", ""), target))
+                if target in selected_for_config:
+                    continue
+                selected_for_config[target] = True
+                selected_targets[target] = True
+                variant = variants_by_target[target]
+                next_pending.extend(variant.get("deps", []))
+                next_pending.extend(variant.get("members", []))
+            pending = next_pending
+            if not pending:
+                break
+        memberships += len(selected_for_config)
+    duplicate_memberships = memberships - len(selected_targets)
+    if duplicate_memberships < 0:
+        duplicate_memberships = 0
+    action_groups = _action_group_validation(metadata)
+    if action_groups.error:
+        fail(action_groups.error)
+    return struct(
+        metadata = metadata,
+        stats = {
+            "action_group_objects": action_groups.stats["action_group_objects"],
+            "action_group_reachability_sets": action_groups.stats["action_group_reachability_sets"],
+            "action_group_recipes": action_groups.stats["action_group_recipes"],
+            "action_groups": action_groups.stats["action_groups"],
+            "compile_environments": len(environment_ids),
+            "config_count": len(generated_configs),
+            "config_payloads": len(payload_ids),
+            "duplicate_memberships": duplicate_memberships,
+            "generated_header_families": len(family_by_id),
+            "object_definitions": len(variants),
+            "object_memberships": memberships,
+            "largest_action_group": action_groups.stats["largest_action_group"],
+            "selected_object_variants": len(selected_targets),
+        },
+    )
+
 def _is_content_id(value):
     if type(value) != "string" or len(value) != 64:
         return False
@@ -1502,256 +1753,52 @@ def _generated_object_block_has_buildable_inputs(block):
         "\n    source_input_index = " in block_with_prefix
     )
 
-def _content_partition_build(metadata, base_config, rules_repo):
-    configs = {}
-    for config in metadata.get("configs", []):
-        if type(config) != "dict":
-            fail("Linux content graph emitted an invalid config while deriving content partitions")
-        name = config.get("name", "")
-        objects = config.get("object_targets", [])
-        modules = config.get("module_object_targets", [])
-        if (
-            type(name) != "string" or
-            not name or
-            type(objects) != "list" or
-            type(modules) != "list"
-        ):
-            fail("Linux content graph emitted invalid content partitions")
-        if name in configs:
-            fail("Linux content graph repeated config %r while deriving content partitions" % name)
-        configs[name] = struct(
-            modules = list(modules),
-            objects = list(objects),
-        )
-    if base_config not in configs:
-        fail("Linux content graph base config %r is absent while deriving content partitions" % base_config)
-
-    lines = [
-        'load("%s//internal:linux_objects.bzl", "linux_compact_image", "linux_compact_modules")' % rules_repo,
-        "",
-        'package(default_visibility = ["//visibility:public"])',
-        "",
+def _validate_generated_build(
+        rctx,
+        graph_dir,
+        config_name):
+    content = rctx.read(graph_dir + "/BUILD.bazel")
+    unsupported_rules = [
+        "linux_dtb",
+        "linux_generated_file",
+        "linux_install",
+        "linux_modpost",
+        "linux_module",
     ]
-    canonical_images = {}
-    canonical_modules = {}
-    ordered_names = [base_config] + [
-        name
-        for name in sorted(configs.keys())
-        if name != base_config
-    ]
-    for name in ordered_names:
-        target_name = _sanitize_target_name(name) + "_modules"
-        module_key = json.encode(configs[name].modules)
-        if module_key in canonical_modules:
-            lines.extend([
-                "alias(",
-                "    name = %r," % target_name,
-                "    actual = %r," % (":" + canonical_modules[module_key]),
-                '    tags = ["manual"],',
-                ")",
-                "",
-            ])
-        else:
-            canonical_modules[module_key] = target_name
-            lines.extend([
-                "linux_compact_modules(",
-                "    name = %r," % target_name,
-                "    objects = %s," % repr([
-                    "//graph:" + target
-                    for target in configs[name].modules
-                ]),
-                '    tags = ["manual"],',
-                ")",
-                "",
-            ])
+    for rule_name in unsupported_rules:
+        if "\n%s(\n" % rule_name in content:
+            fail(
+                "Linux graph for config %s requires unsupported generated rule %s" %
+                (config_name, rule_name),
+            )
 
-        image_target = _sanitize_target_name(name) + "_image"
-        image_key = json.encode(configs[name].objects)
-        if image_key in canonical_images:
-            lines.extend([
-                "alias(",
-                "    name = %r," % image_target,
-                "    actual = %r," % (":" + canonical_images[image_key]),
-                '    tags = ["manual"],',
-                ")",
-                "",
-            ])
-        else:
-            canonical_images[image_key] = image_target
-            lines.extend([
-                "linux_compact_image(",
-                "    name = %r," % image_target,
-                "    objects = %s," % repr([
-                    "//graph:" + target
-                    for target in configs[name].objects
-                ]),
-                '    tags = ["manual"],',
-                ")",
-                "",
-            ])
-    return "\n".join(lines)
-
-def _source_group_indices(encoded, source_count, context):
-    if type(encoded) != "string" or not encoded:
-        fail("%s has an invalid source input group" % context)
-    indices = []
-    previous = 0
-    for raw in encoded.split(","):
-        if not raw:
-            fail("%s has an invalid source input group entry" % context)
-        index = int(raw)
-        if str(index) != raw or index <= previous or index > source_count:
-            fail("%s has an invalid source input index %r" % (context, raw))
-        indices.append(index)
-        previous = index
-    return indices
-
-def _select_source_group(selected_sources, source_groups, source_count, group, context):
-    if group == 0:
-        return
-    if type(group) != "int" or group < 1 or group > len(source_groups):
-        fail("%s references invalid source input group %r" % (context, group))
-    for index in _source_group_indices(
-        source_groups[group - 1],
-        source_count,
-        context,
-    ):
-        selected_sources[index] = True
-
-def _content_core_source_paths(metadata, roots, config_name):
-    source_files = metadata.get("source_files", [])
-    source_groups = metadata.get("source_input_groups", [])
-    variants = {
-        variant.get("target", ""): variant
-        for variant in metadata.get("object_variants", [])
-    }
-    environments = {
-        environment.get("id", ""): environment
-        for environment in metadata.get("compile_environments", [])
-    }
-    families = {
-        family.get("id", ""): family
-        for family in metadata.get("generated_header_families", [])
-    }
-    selected_sources = {}
-    selected_families = {}
-    visited_objects = {}
-    family_queue = []
-    object_queue = list(roots)
-    queued_objects = {target: True for target in roots}
-    queued_families = {}
-    for _ in range(len(variants)):
-        if not object_queue:
-            break
-        target = object_queue.pop()
-        if target in visited_objects:
+    blocks = content.split("\nlinux_object(\n")
+    for raw_block in blocks[1:]:
+        end = raw_block.find("\n)\n")
+        if end < 0:
+            fail("Linux graph generator emitted a malformed linux_object rule")
+        block = raw_block[:end]
+        if _generated_object_block_has_buildable_inputs(block):
             continue
-        variant = variants.get(target)
-        if variant == None:
-            fail("config %r references unknown object target %r" % (config_name, target))
-        visited_objects[target] = True
-        _select_source_group(
-            selected_sources,
-            source_groups,
-            len(source_files),
-            variant.get("source_input_group", 0),
-            "object target %s" % target,
+        name = "<unknown>"
+        name_prefix = '    name = "'
+        name_start = block.find(name_prefix)
+        if name_start >= 0:
+            name_rest = block[name_start + len(name_prefix):]
+            name_end = name_rest.find('"')
+            if name_end >= 0:
+                name = name_rest[:name_end]
+        fail(
+            (
+                "Linux graph for config %s emitted leaf object %s without buildable %s inputs; " +
+                "its Kbuild source or flag expressions are not implemented"
+            ) %
+            (
+                config_name,
+                name,
+                "indexed",
+            ),
         )
-        environment_id = variant.get("compile_environment", "")
-        if environment_id:
-            environment = environments.get(environment_id)
-            if environment == None:
-                fail("object target %r references unknown compile environment %r" % (target, environment_id))
-            for family_id in environment.get("generated_header_families", []):
-                if family_id not in queued_families:
-                    queued_families[family_id] = True
-                    family_queue.append(family_id)
-        for dependency in variant.get("deps", []) + variant.get("members", []):
-            if dependency not in queued_objects:
-                queued_objects[dependency] = True
-                object_queue.append(dependency)
-    if object_queue:
-        fail("config %r object graph traversal did not converge" % config_name)
-
-    for _ in range(len(families)):
-        if not family_queue:
-            break
-        family_id = family_queue.pop()
-        if family_id in selected_families:
-            continue
-        family = families.get(family_id)
-        if family == None:
-            fail("config %r references unknown generated-header family %r" % (config_name, family_id))
-        selected_families[family_id] = True
-        _select_source_group(
-            selected_sources,
-            source_groups,
-            len(source_files),
-            family.get("source_input_group", 0),
-            "generated-header family %s" % family_id,
-        )
-        for dependency in family.get("dependencies", []):
-            if dependency not in queued_families:
-                queued_families[dependency] = True
-                family_queue.append(dependency)
-    if family_queue:
-        fail("config %r generated-header family traversal did not converge" % config_name)
-
-    paths = []
-    for index in sorted(selected_sources.keys()):
-        source = source_files[index - 1]
-        if type(source) != "dict" or type(source.get("path")) != "string":
-            fail("config %r references invalid source file %d" % (config_name, index))
-        paths.append(source["path"])
-    return paths
-
-def _content_source_partition_build(metadata, base_config, source_package):
-    configs = {}
-    for config in metadata.get("configs", []):
-        name = config.get("name", "") if type(config) == "dict" else ""
-        roots = config.get("object_targets", []) if type(config) == "dict" else None
-        if not name or type(roots) != "list" or name in configs:
-            fail("Linux content graph emitted invalid config source partitions")
-        configs[name] = _content_core_source_paths(metadata, roots, name)
-    if base_config not in configs:
-        fail("Linux content graph base config %r is absent while deriving source partitions" % base_config)
-
-    lines = [
-        'package(default_visibility = ["//visibility:public"])',
-        "",
-    ]
-    canonical = {}
-    ordered_names = [base_config] + [
-        name
-        for name in sorted(configs.keys())
-        if name != base_config
-    ]
-    for name in ordered_names:
-        target = _sanitize_target_name(name) + "_core"
-        key = json.encode(configs[name])
-        if key in canonical:
-            lines.extend([
-                "alias(",
-                "    name = %r," % target,
-                "    actual = %r," % (":" + canonical[key]),
-                '    tags = ["manual"],',
-                ")",
-                "",
-            ])
-            continue
-        canonical[key] = target
-        lines.extend([
-            "filegroup(",
-            "    name = %r," % target,
-            "    srcs = %s," % repr([
-                source_package + ":" + path
-                for path in configs[name]
-            ]),
-            '    tags = ["manual"],',
-            ")",
-            "",
-        ])
-    return "\n".join(lines)
 
 def _kernel_root_build(
         arch,
@@ -1764,19 +1811,11 @@ def _kernel_root_build(
         base_header_family_dependencies,
         base_header_family_ids,
         base_rust_enabled,
-        graph_projection,
-        graph_validation_sources,
-        kbuild_linker,
         config_mode,
         graph_image,
-        graph_modules,
-        graph_sources,
         variant_configs,
         variant_core_configs,
         variant_graph_images,
-        variant_graph_modules,
-        variant_graph_sources,
-        variant_module_sdk_configs,
         variant_header_family_dependencies,
         variant_header_family_ids,
         variant_header_configs,
@@ -1798,19 +1837,11 @@ linux_image_targets(
     base_header_family_dependencies = {base_header_family_dependencies},
     base_header_family_ids = {base_header_family_ids},
     base_rust_enabled = {base_rust_enabled},
-    graph_projection = {graph_projection},
-    graph_validation_sources = {graph_validation_sources},
-    kbuild_linker = {kbuild_linker},
     config_mode = {config_mode},
     graph_image = {graph_image},
-    graph_modules = {graph_modules},
-    graph_sources = {graph_sources},
     variant_configs = {variant_configs},
     variant_core_configs = {variant_core_configs},
     variant_graph_images = {variant_graph_images},
-    variant_graph_modules = {variant_graph_modules},
-    variant_graph_sources = {variant_graph_sources},
-    variant_module_sdk_configs = {variant_module_sdk_configs},
     variant_header_family_dependencies = {variant_header_family_dependencies},
     variant_header_family_ids = {variant_header_family_ids},
     variant_header_configs = {variant_header_configs},
@@ -1827,19 +1858,11 @@ linux_image_targets(
         base_header_family_dependencies = _starlark_nested_dict(base_header_family_dependencies, indent = "        "),
         base_header_family_ids = _starlark_dict(base_header_family_ids, indent = "        "),
         base_rust_enabled = repr(base_rust_enabled),
-        graph_projection = repr(graph_projection),
-        graph_validation_sources = repr(graph_validation_sources),
-        kbuild_linker = repr(kbuild_linker),
         config_mode = repr(config_mode),
         graph_image = repr(graph_image),
-        graph_modules = repr(graph_modules),
-        graph_sources = repr(graph_sources),
         variant_configs = _starlark_dict(variant_configs, indent = "        "),
         variant_core_configs = _starlark_dict(variant_core_configs, indent = "        "),
         variant_graph_images = _starlark_dict(variant_graph_images, indent = "        "),
-        variant_graph_modules = _starlark_dict(variant_graph_modules, indent = "        "),
-        variant_graph_sources = _starlark_dict(variant_graph_sources, indent = "        "),
-        variant_module_sdk_configs = _starlark_dict(variant_module_sdk_configs, indent = "        "),
         variant_header_family_dependencies = _starlark_triple_nested_dict(variant_header_family_dependencies, indent = "        "),
         variant_header_family_ids = _starlark_nested_dict(variant_header_family_ids, indent = "        "),
         variant_header_configs = _starlark_dict(variant_header_configs, indent = "        "),
@@ -1848,27 +1871,21 @@ linux_image_targets(
     )
 
 repositories_test_helpers = struct(
-    compact_v7_compile_environment_abi = _compact_v7_compile_environment_abi,
-    compact_v7_config_targets = _compact_v7_config_targets,
+    action_group_validation = _action_group_validation,
     validate_compile_environment_abi = _validate_compile_environment_abi,
     content_graph_metadata_structure_error = _content_graph_metadata_structure_error,
     core_config_aliases = _content_core_config_aliases,
-    module_sdk_aliases = _content_module_sdk_aliases,
-    content_partition_build = _content_partition_build,
-    content_source_partition_build = _content_source_partition_build,
     generated_object_block_has_buildable_inputs = _generated_object_block_has_buildable_inputs,
     graph_configs_args = _graph_configs_args,
-    graph_validation_source_paths = _graph_validation_source_paths,
-    generator_probe_value_args = _generator_probe_value_args,
+    graph_arch_tool_args = _graph_arch_tool_args,
     generator_variable_args = _generator_variable_args,
     generated_header_config_index = _content_generated_header_config_index,
     generator_protocol = _REPOSITORY_GENERATOR_PROTOCOL,
-    generator_protocol_v7 = _REPOSITORY_GENERATOR_PROTOCOL_V7,
     kernel_root_build = _kernel_root_build,
     without_rust_toolchain_config = _without_rust_toolchain_config,
 )
 
-def _variant_build(arch, graph, module_sdk_graph, platform, rules_repo):
+def _variant_build(arch, graph, platform, rules_repo):
     return """load("{rules_repo}//internal:kernel_bundle.bzl", "linux_kernel_exports")
 
 package(default_visibility = ["//visibility:private"])
@@ -1876,14 +1893,12 @@ package(default_visibility = ["//visibility:private"])
 linux_kernel_exports(
     name = "kernel",
     graph = {graph},
-    module_sdk_graph = {module_sdk_graph},
     platform = {platform},
     arch = {arch},
 )
 """.format(
         arch = repr(arch),
         graph = repr(graph),
-        module_sdk_graph = repr(module_sdk_graph),
         platform = repr(platform),
         rules_repo = rules_repo,
     )
