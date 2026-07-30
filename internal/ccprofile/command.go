@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +56,15 @@ func NewCommandTemplate(
 	sentinels CompileSentinels,
 ) (CommandTemplate, error) {
 	mutableArgv, err := ExtractMutableCompileArgv(argv, sentinels)
+	if err != nil {
+		return CommandTemplate{}, err
+	}
+	mutableArgv, err = normalizeLinuxCompileArgv(
+		architecture,
+		analysisIdentity,
+		mutableArgv,
+		sentinels.KbuildFlags,
+	)
 	if err != nil {
 		return CommandTemplate{}, err
 	}
@@ -211,6 +221,18 @@ func ValidateCommandTemplate(template CommandTemplate) error {
 	if sentinelCount != 1 {
 		return fmt.Errorf("mutable_argv must contain exactly one Kbuild flags sentinel, got %d", sentinelCount)
 	}
+	normalized, err := normalizeLinuxCompileArgv(
+		template.Architecture,
+		template.AnalysisIdentity,
+		template.MutableArgv,
+		template.KbuildFlagsSentinel,
+	)
+	if err != nil {
+		return err
+	}
+	if !slices.Equal(template.MutableArgv, normalized) {
+		return fmt.Errorf("mutable_argv is not a canonical Linux compile command")
+	}
 	if template.Environment == nil {
 		return fmt.Errorf("environment is required")
 	}
@@ -223,6 +245,157 @@ func ValidateCommandTemplate(template CommandTemplate) error {
 		}
 	}
 	return nil
+}
+
+func normalizeLinuxCompileArgv(
+	architecture string,
+	analysisIdentity AnalysisIdentity,
+	argv []string,
+	kbuildFlagsSentinel string,
+) ([]string, error) {
+	if err := validateArchitecture(architecture); err != nil {
+		return nil, err
+	}
+	if err := validateAnalysisIdentity(analysisIdentity); err != nil {
+		return nil, err
+	}
+	base := make([]string, 0, len(argv))
+	sentinelCount := 0
+	for _, arg := range argv {
+		if arg == kbuildFlagsSentinel {
+			sentinelCount++
+			continue
+		}
+		base = append(base, arg)
+	}
+	if sentinelCount != 1 {
+		return nil, fmt.Errorf(
+			"mutable argv must contain exactly one Kbuild flags sentinel, got %d",
+			sentinelCount,
+		)
+	}
+	if analysisIdentity.Compiler == "clang" {
+		base = rewriteLinuxClangTargetArgv(base, linuxKbuildTargetTriple(architecture))
+	}
+
+	out := make([]string, 0, len(base)+3)
+	for index := 0; index < len(base); index++ {
+		arg := base[index]
+		if arg == "-Xclang" && index+1 < len(base) {
+			switch base[index+1] {
+			case "-internal-isystem":
+				index += 3
+				continue
+			case "-fno-cxx-modules":
+				index++
+				continue
+			}
+		}
+		if arg == "-I" || arg == "-iquote" || arg == "-isystem" {
+			if index+1 < len(base) && linuxDropToolchainInclude(base[index+1]) {
+				index++
+				continue
+			}
+		}
+		if linuxDropToolchainCompileArg(arg) {
+			continue
+		}
+		if arg == "--sysroot" {
+			if index+1 < len(base) {
+				index++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--sysroot=") {
+			continue
+		}
+		if strings.HasPrefix(arg, "-I") &&
+			linuxDropToolchainInclude(strings.TrimPrefix(arg, "-I")) {
+			continue
+		}
+		if strings.HasPrefix(arg, "-iquote") &&
+			linuxDropToolchainInclude(strings.TrimPrefix(arg, "-iquote")) {
+			continue
+		}
+		if strings.HasPrefix(arg, "-isystem") &&
+			linuxDropToolchainInclude(strings.TrimPrefix(arg, "-isystem")) {
+			continue
+		}
+		out = append(out, arg)
+	}
+	if !slices.Contains(out, "-nostdinc") {
+		out = append(out, "-nostdinc")
+	}
+	if analysisIdentity.Compiler == "clang" &&
+		!slices.Contains(out, "-fintegrated-as") {
+		out = append(out, "-fintegrated-as")
+	}
+	out = append(out, kbuildFlagsSentinel)
+	return out, nil
+}
+
+func rewriteLinuxClangTargetArgv(argv []string, target string) []string {
+	out := make([]string, 0, len(argv)+1)
+	inserted := false
+	for index := 0; index < len(argv); index++ {
+		arg := argv[index]
+		if arg == "-target" || arg == "--target" {
+			if index+1 < len(argv) {
+				index++
+			}
+			if !inserted {
+				out = append(out, "--target="+target)
+				inserted = true
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-target=") ||
+			strings.HasPrefix(arg, "--target=") {
+			if !inserted {
+				out = append(out, "--target="+target)
+				inserted = true
+			}
+			continue
+		}
+		out = append(out, arg)
+	}
+	if !inserted {
+		out = append([]string{"--target=" + target}, out...)
+	}
+	return out
+}
+
+func linuxKbuildTargetTriple(architecture string) string {
+	if architecture == "aarch64" {
+		return "aarch64-linux-gnu"
+	}
+	return "x86_64-linux-gnu"
+}
+
+func linuxDropToolchainCompileArg(arg string) bool {
+	switch arg {
+	case "-fcolor-diagnostics",
+		"-fstack-protector",
+		"-no-canonical-prefixes",
+		"-nostdlibinc",
+		"-Werror=incomplete-umbrella",
+		"-Wall",
+		"-Wno-free-nonheap-object",
+		"-Wno-module-import-in-extern-c",
+		"-Wno-modules-import-nested-redundant",
+		"-Wself-assign",
+		"-Wthread-safety",
+		"-Wunused-but-set-parameter":
+		return true
+	default:
+		return false
+	}
+}
+
+func linuxDropToolchainInclude(path string) bool {
+	return strings.Contains(path, "llvm++musl+musl_libc/") ||
+		strings.Contains(path, `llvm++musl+musl_libc\`) ||
+		strings.Contains(path, "llvm++kernel_headers+linux_kernel_headers_")
 }
 
 func CanonicalCommandTemplateJSON(template CommandTemplate) ([]byte, error) {

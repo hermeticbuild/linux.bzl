@@ -1,5 +1,6 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("//:linux.bzl", "linux_graph_profile")
+load("//internal:flag_programs.bzl", "linux_flag_programs")
 load("//internal:graph_profile.bzl", "linux_graph_profile_context")
 load(
     "//internal:linux_objects.bzl",
@@ -33,6 +34,63 @@ compact_v7_repository_build_test_suite(name = "compact_v7_repository_build_tests
 
 graph_profile_context_test(name = "graph_profile_context_test")
 
+linux_flag_programs(
+    name = "linux_object_test_flag_programs",
+    graph_profile = ":graph_profile_context_test_target",
+    nodes = {},
+    probes = {},
+    programs = {
+        "4141414141414141414141414141414141414141414141414141414141414141": "4040404040404040404040404040404040404040404040404040404040404040",
+        "4343434343434343434343434343434343434343434343434343434343434343": "4242424242424242424242424242424242424242424242424242424242424242",
+        "4545454545454545454545454545454545454545454545454545454545454545": "4444444444444444444444444444444444444444444444444444444444444444",
+        "4747474747474747474747474747474747474747474747474747474747474747": "4646464646464646464646464646464646464646464646464646464646464646",
+        "5151515151515151515151515151515151515151515151515151515151515151": "5050505050505050505050505050505050505050505050505050505050505050",
+    },
+    source_root = "//tests/compile:source/Kconfig",
+    tags = ["manual"],
+    terminals = {
+        "4040404040404040404040404040404040404040404040404040404040404040": json.encode([]),
+        "4242424242424242424242424242424242424242424242424242424242424242": json.encode([
+            "-DCONFIG_REF_Y=$(CONFIG_FIXTURE)",
+            "-DCONFIG_REF_M=${CONFIG_FIXTURE_MODULE}",
+            "-DCONFIG_REF_N=$(CONFIG_FIXTURE_DISABLED)",
+            "-DCONFIG_REF_NUMBER=$(CONFIG_FIXTURE_VALUE)",
+            "-DCONFIG_REF_STRING=$(CONFIG_LOCALVERSION)",
+            "-DREMOVE_CONFIG_REF_Y=$(CONFIG_FIXTURE)",
+            "-DREMOVE_CONFIG_REF_M=${CONFIG_FIXTURE_MODULE}",
+            "-DREMOVE_CONFIG_REF_N=$(CONFIG_FIXTURE_DISABLED)",
+            "-DREMOVE_CONFIG_REF_STRING=$(CONFIG_LOCALVERSION)",
+            "-Werror",
+            "-Wall",
+        ]),
+        "4444444444444444444444444444444444444444444444444444444444444444": json.encode([
+            "-DCONFIG_REF_Y=$(CONFIG_FIXTURE)",
+            "-DCONFIG_REF_M=${CONFIG_FIXTURE_MODULE}",
+            "-DCONFIG_REF_N=$(CONFIG_FIXTURE_DISABLED)",
+            "-DCONFIG_REF_NUMBER=$(CONFIG_FIXTURE_VALUE)",
+            "-DCONFIG_REF_STRING=$(CONFIG_LOCALVERSION)",
+            "-DREMOVE_CONFIG_REF_Y=$(CONFIG_FIXTURE)",
+            "-DREMOVE_CONFIG_REF_M=${CONFIG_FIXTURE_MODULE}",
+            "-DREMOVE_CONFIG_REF_N=$(CONFIG_FIXTURE_DISABLED)",
+            "-DREMOVE_CONFIG_REF_STRING=$(CONFIG_LOCALVERSION)",
+            "-DEXPECT_MODULE",
+            "-Werror",
+            "-Wall",
+        ]),
+        "4646464646464646464646464646464646464646464646464646464646464646": json.encode([
+            "-DINTEGER_WRAP",
+            "-fsanitize-ignorelist=$(srctree)/scripts/integer-wrap-ignore.scl",
+        ]),
+        "5050505050505050505050505050505050505050505050505050505050505050": json.encode([
+            "-DREMOVE_CONFIG_REF_Y=$(CONFIG_FIXTURE)",
+            "-DREMOVE_CONFIG_REF_M=${CONFIG_FIXTURE_MODULE}",
+            "-DREMOVE_CONFIG_REF_N=$(CONFIG_FIXTURE_DISABLED)",
+            "-DREMOVE_CONFIG_REF_STRING=$(CONFIG_LOCALVERSION)",
+        ]),
+    },
+    visibility = ["//visibility:public"],
+)
+
 linux_graph_profile_context(
     name = "graph_profile_context_aarch64_refresh",
     arch = "aarch64",
@@ -40,6 +98,21 @@ linux_graph_profile_context(
     kbuild_linker = "@llvm//tools:ld.lld",
     source_root = "//tests/compile:source/Kconfig",
     tags = ["manual"],
+)
+
+linux_flag_programs(
+    name = "linux_object_test_flag_programs_aarch64",
+    graph_profile = ":graph_profile_context_aarch64_refresh",
+    nodes = {},
+    probes = {},
+    programs = {
+        "4949494949494949494949494949494949494949494949494949494949494949": "4848484848484848484848484848484848484848484848484848484848484848",
+    },
+    source_root = "//tests/compile:source/Kconfig",
+    tags = ["manual"],
+    terminals = {
+        "4848484848484848484848484848484848484848484848484848484848484848": json.encode([]),
+    },
 )
 
 flag_programs_test(name = "flag_programs_test")
@@ -176,9 +249,19 @@ build_test(
     ],
 )
 
-linux_objects_fail_closed_test_suite(name = "linux_objects_fail_closed_test")
+linux_objects_fail_closed_test_suite(
+    name = "linux_objects_fail_closed_test",
+    aarch64_empty_program = "4949494949494949494949494949494949494949494949494949494949494949",
+    aarch64_flag_programs = ":linux_object_test_flag_programs_aarch64",
+    empty_program = "4141414141414141414141414141414141414141414141414141414141414141",
+    flag_programs = ":linux_object_test_flag_programs",
+)
 
-linux_object_objtool_test_suite(name = "linux_object_objtool_test")
+linux_object_objtool_test_suite(
+    name = "linux_object_objtool_test",
+    empty_program = "4141414141414141414141414141414141414141414141414141414141414141",
+    flag_programs = ":linux_object_test_flag_programs",
+)
 
 linux_object_groups_test_suite(name = "linux_object_groups_test")
 
@@ -193,4 +276,9 @@ build_test(
 
 path_mapping_test(name = "path_mapping_test")
 
-sanitizer_actions_test(name = "sanitizer_actions_test")
+sanitizer_actions_test(
+    name = "sanitizer_actions_test",
+    empty_program = "4141414141414141414141414141414141414141414141414141414141414141",
+    flag_program = "4747474747474747474747474747474747474747474747474747474747474747",
+    flag_programs = ":linux_object_test_flag_programs",
+)

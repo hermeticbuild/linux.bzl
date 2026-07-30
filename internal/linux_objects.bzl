@@ -1,8 +1,9 @@
 """Native rules for compact, content-addressed Linux build units."""
 
 load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "CPP_LINK_STATIC_LIBRARY_ACTION_NAME", "C_COMPILE_ACTION_NAME")
-load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
+load("@rules_cc//cc:find_cc_toolchain.bzl", "CC_TOOLCHAIN_TYPE", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+load(":flag_programs.bzl", "LinuxFlagProgramsInfo")
 load(":host_cc_toolchain.bzl", "host_cc_toolchain_attr")
 load(":kconfig.bzl", "KconfigInfo")
 load(":linux_module_actions.bzl", "linux_module_actions")
@@ -492,56 +493,6 @@ def _unquote(value):
         return value[1:-1]
     return value
 
-def _expand_make_refs(value, replacements, object):
-    for key in sorted(replacements.keys()):
-        replacement = replacements[key]
-        value = value.replace("$(%s)" % key, replacement)
-        value = value.replace("${%s}" % key, replacement)
-    if "$(" in value or "${" in value:
-        fail("unexpanded Kbuild Make reference in flags for %s: %s" % (object, value))
-    return value
-
-def _expand_flag_refs(flags, config_values, make_values, object):
-    replacements = dict(config_values)
-    replacements.update(make_values)
-    for key in [
-        "CC_FLAGS_CFI",
-        "CC_FLAGS_FTRACE",
-        "CC_FLAGS_LTO",
-        "CC_FLAGS_SCS",
-        "CLANG_FLAGS",
-        "DISABLE_KSTACK_ERASE",
-        "DISABLE_LATENT_ENTROPY_PLUGIN",
-        "DISABLE_STACKLEAK_PLUGIN",
-        "RANDSTRUCT_CFLAGS",
-        "cflags-nogcse-yy",
-    ]:
-        replacements[key] = ""
-    return [_expand_make_refs(flag, replacements, object) for flag in flags]
-
-def _rewrite_source_root_flags(flags, source_root):
-    if not source_root:
-        return flags
-    marker = "/" + source_root
-    out = []
-    for flag in flags:
-        index = flag.find(marker)
-        if index < 0:
-            out.append(flag)
-            continue
-        if flag.startswith("/"):
-            out.append(flag[index + 1:])
-            continue
-        replaced = False
-        for prefix in ["-I", "-iquote", "-isystem", "-include"]:
-            if flag.startswith(prefix + "/"):
-                out.append(prefix + flag[index + 1:])
-                replaced = True
-                break
-        if not replaced:
-            out.append(flag)
-    return out
-
 def _linux_generated_include_groups(include_dirs, srcarch):
     arch_generated = []
     arch_generated_uapi = []
@@ -852,18 +803,6 @@ def _linux_non_lto_config_flags_for_source(ctx, config, src, out_suffix = "nolto
         out_suffix = out_suffix,
     )
 
-def _flags_need_obj_dir(flags):
-    for flag in flags:
-        if "$(obj)" in flag or "${obj}" in flag:
-            return True
-    return False
-
-def _flags_need_utsversion_tmp(flags):
-    for flag in flags:
-        if "utsversion-tmp.h" in flag:
-            return True
-    return False
-
 def _linux_object_directory(object):
     if "/" not in object:
         return ""
@@ -982,19 +921,6 @@ def _linux_object_compile_source_tree_inputs(ctx, direct = []):
         direct = list(direct),
         transitive = [selection.value.files],
     )
-
-def _rewrite_utsversion_tmp_flags(flags, object, utsversion_tmp):
-    object_dir = _linux_object_directory(object)
-    candidates = ["utsversion-tmp.h"]
-    if object_dir:
-        candidates.append(object_dir + "/utsversion-tmp.h")
-    rewritten = []
-    for flag in flags:
-        if flag in candidates:
-            rewritten.append(utsversion_tmp)
-        else:
-            rewritten.append(flag)
-    return rewritten
 
 def _source_tree_file(ctx, relpath):
     indexed = _linux_source_input_file_for_path(ctx, relpath)
@@ -4150,8 +4076,45 @@ def _linux_compile_environment(ctx, rule_name):
         )
     return index.environments[ctx.attr.compile_environment_id]
 
+def _linux_object_flag_programs(ctx):
+    program_info = ctx.attr.flag_programs[LinuxFlagProgramsInfo]
+    programs = program_info.programs
+    for program_id, what in [
+        (ctx.attr.flag_program, "flag_program"),
+        (ctx.attr.remove_flag_program, "remove_flag_program"),
+    ]:
+        _validate_content_id(program_id, "linux_object " + what)
+        if program_id not in programs:
+            fail(
+                "linux_object %s references unknown %s %s" %
+                (ctx.label, what, program_id),
+            )
+    profile = program_info.graph_profile
+    expected_arch = {
+        "arm64": "aarch64",
+        "x86": "x86_64",
+    }.get(ctx.attr.arch)
+    if expected_arch == None:
+        fail("linux_object %s has unsupported lazy arch %r" % (ctx.label, ctx.attr.arch))
+    if profile.arch != expected_arch:
+        fail(
+            "linux_object %s profile arch %r does not match Linux arch %r" %
+            (ctx.label, profile.arch, ctx.attr.arch),
+        )
+    return struct(
+        flags = programs[ctx.attr.flag_program],
+        profile = profile,
+        removals = programs[ctx.attr.remove_flag_program],
+    )
+
 def _linux_object_impl(ctx):
     _validate_content_id(ctx.attr.content_id, "linux_object content_id")
+    flag_programs = _linux_object_flag_programs(ctx)
+    if ctx.attr.needs_utsversion_tmp and not ctx.attr.needs_object_dir:
+        fail(
+            "linux_object %s needs_utsversion_tmp requires needs_object_dir" %
+            ctx.label,
+        )
     source_selection = _linux_source_input_group(ctx, "linux_object")
     source_file = _linux_source_input_file(
         ctx,
@@ -4184,7 +4147,6 @@ def _linux_object_impl(ctx):
         feature_configuration = feature_configuration,
         action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
     )
-    base_flags = _linux_compile_flags(ctx, cc_toolchain, feature_configuration)
     compile_environment = _linux_compile_environment(ctx, "linux_object")
     config = compile_environment.config
     generated_headers = compile_environment.generated_headers
@@ -4227,10 +4189,8 @@ def _linux_object_impl(ctx):
     exported_generated_include_dirs = []
     generated_sources = []
     utsversion_tmp = None
+    object_root_file = None
     src = source_file
-    make_values = {
-        "src": _linux_execroot_dir(source_file),
-    }
     if _is_shipped_c_source(source_file):
         src = ctx.actions.declare_file(ctx.label.name + ".obj/" + ctx.attr.object[:-len(".o")] + ".c")
         ctx.actions.expand_template(
@@ -4302,7 +4262,7 @@ def _linux_object_impl(ctx):
             )
         src = generated
         generated_sources.append(generated)
-    if config and _flags_need_utsversion_tmp(ctx.attr.flags):
+    if config and ctx.attr.needs_utsversion_tmp:
         utsversion_tmp = ctx.actions.declare_file(ctx.label.name + ".obj/utsversion-tmp.h")
         uts_args = ctx.actions.args()
         uts_args.add("-config", config.config)
@@ -4319,16 +4279,14 @@ def _linux_object_impl(ctx):
             progress_message = "Generating Linux object version header %{label}",
         )
         generated_object_headers.append(utsversion_tmp)
-        make_values["obj"] = utsversion_tmp.dirname
-    elif _flags_need_obj_dir(ctx.attr.flags):
+        object_root_file = utsversion_tmp
+    elif ctx.attr.needs_object_dir:
         obj_marker = ctx.actions.declare_file(ctx.label.name + ".obj/.bazel-dir")
         ctx.actions.write(obj_marker, "")
         generated_object_headers.append(obj_marker)
-        make_values["obj"] = obj_marker.dirname
+        object_root_file = obj_marker
 
     source_root = _linux_source_root_path(ctx)
-    if source_root:
-        make_values["srctree"] = source_root
     if _is_dtb_source(source_file):
         if not source_root:
             fail("linux_object %s builds a devicetree blob and requires source_root" % ctx.label)
@@ -4403,7 +4361,7 @@ def _linux_object_impl(ctx):
         generated_headers,
         source_root,
     )
-    expanded_remove_flags = _rewrite_source_root_flags(_expand_flag_refs(ctx.attr.remove_flags, config_values, make_values, ctx.attr.object), source_root)
+    expanded_remove_flags = []
     if ctx.attr.arch == "arm64" and ctx.attr.object.startswith("arch/arm64/kernel/pi/") and ctx.attr.object.endswith(".pi.o"):
         expanded_remove_flags = expanded_remove_flags + _linux_ftrace_remove_flags() + ["-flto=thin", "-flto", "-fsplit-lto-unit", "-fvisibility=hidden"]
     if ctx.attr.arch == "x86" and ctx.attr.object.startswith("arch/x86/boot/startup/") and ctx.attr.object.endswith(".pi.o"):
@@ -4411,7 +4369,6 @@ def _linux_object_impl(ctx):
     config_flag_inputs = _linux_filtered_config_flags_for_source(ctx, config, src, expanded_remove_flags)
 
     args = ctx.actions.args()
-    args.add_all(base_flags)
     args.add_all(config_flag_inputs.flags, format_each = "@%s")
     args.add_all(_linux_generated_header_cflags(generated_headers), format_each = "@%s")
     args.add_all(_linux_module_flags(ctx.attr.mode))
@@ -4447,15 +4404,6 @@ def _linux_object_impl(ctx):
             generated_inputs.assembler_include_root_anchors,
             format = "-Wa,-I,%s",
         )
-    expanded_flags = _rewrite_source_root_flags(_expand_flag_refs(ctx.attr.flags, config_values, make_values, ctx.attr.object), source_root)
-    if utsversion_tmp != None:
-        expanded_flags = _rewrite_utsversion_tmp_flags(expanded_flags, ctx.attr.object, utsversion_tmp)
-    args.add_all(expanded_flags)
-    args.add("-c")
-    args.add(src)
-    args.add("-o")
-    args.add(compile_out)
-
     direct_inputs = [src] + generated_object_headers + generated_sources + generated_inputs.files + config_flag_inputs.inputs
     if src != source_file:
         direct_inputs.append(source_file)
@@ -4470,14 +4418,58 @@ def _linux_object_impl(ctx):
         transitive_inputs.append(generated_headers.files)
     transitive_inputs.extend(dep_generated_header_inputs)
 
+    profile = flag_programs.profile
+    compile_args = ctx.actions.args()
+    compile_args.add("compile")
+    compile_args.add("-template", profile.command_template)
+    compile_args.add("-validation", profile.validation)
+    compile_args.add("-source", src)
+    compile_args.add("-kbuild_source", source_file)
+    compile_args.add("-output", compile_out)
+    compile_args.add("-config", config.config)
+    compile_args.add("-flags_file", flag_programs.flags)
+    compile_args.add("-remove_flags_file", flag_programs.removals)
+    add_directory_arg(
+        compile_args,
+        directory_anchor(_linux_source_root_file(ctx)),
+        format = "-source_root=%s",
+    )
+    compile_args.add("-object_path=" + ctx.attr.object)
+    if object_root_file != None:
+        add_directory_arg(
+            compile_args,
+            directory_anchor(object_root_file),
+            format = "-object_root=%s",
+        )
+    if utsversion_tmp != None:
+        compile_args.add(utsversion_tmp, format = "-utsversion_tmp=%s")
+    compile_args.add_all(
+        _unique_strings(expanded_remove_flags),
+        before_each = "-remove",
+    )
+    compile_args.add("--")
     path_mapped_run(
         ctx.actions,
-        executable = compiler,
-        inputs = depset(source_inputs.direct, transitive = source_inputs.transitive + transitive_inputs),
+        executable = ctx.executable._ccprofile,
+        inputs = depset(
+            source_inputs.direct + [
+                flag_programs.flags,
+                flag_programs.removals,
+                profile.command_template,
+                profile.validation,
+            ],
+            transitive = (
+                source_inputs.transitive +
+                transitive_inputs +
+                [profile.toolchain_files]
+            ),
+        ),
         outputs = [compile_out],
-        arguments = [args],
+        arguments = [compile_args, args],
+        execution_requirements = profile.execution_requirements,
         mnemonic = "LinuxObjectCompile",
         progress_message = "Compiling Linux object %{label}",
+        toolchain = CC_TOOLCHAIN_TYPE,
     )
 
     objtool_input = compile_out
@@ -4550,14 +4542,21 @@ def _linux_object_impl(ctx):
                 progress_message = "Checking Linux arm64 PI relocations %{label}",
             )
 
+    command_lines = [
+        "compiler=%s" % compiler,
+        "source=%s" % source_file.short_path,
+        "object=%s" % ctx.attr.object,
+        "output=%s" % out.short_path,
+    ]
+    command_lines.extend([
+        "flag_program=%s" % ctx.attr.flag_program,
+        "flag_program_file=%s" % flag_programs.flags.short_path,
+        "remove_flag_program=%s" % ctx.attr.remove_flag_program,
+        "remove_flag_program_file=%s" % flag_programs.removals.short_path,
+    ])
     ctx.actions.write(
         output = cmd,
-        content = "\n".join([
-            "compiler=%s" % compiler,
-            "source=%s" % source_file.short_path,
-            "object=%s" % ctx.attr.object,
-            "output=%s" % out.short_path,
-        ] + ["flag=%s" % flag for flag in ctx.attr.flags] + ["remove_flag=%s" % flag for flag in ctx.attr.remove_flags]) + "\n",
+        content = "\n".join(command_lines) + "\n",
     )
 
     info = LinuxObjectInfo(
@@ -4599,8 +4598,27 @@ linux_object = rule(
             doc = "Full SHA-256 content identity for this object action.",
         ),
         "deps": attr.label_list(providers = [LinuxObjectInfo]),
-        "flags": attr.string_list(),
-        "remove_flags": attr.string_list(),
+        "flag_program": attr.string(
+            mandatory = True,
+            doc = "Resolved compact-v7 flag program ID. Requires flag_programs and graph_profile.",
+        ),
+        "flag_programs": attr.label(
+            mandatory = True,
+            providers = [LinuxFlagProgramsInfo],
+            doc = "Shared compact-v7 flag program DAG for lazy object compilation.",
+        ),
+        "needs_object_dir": attr.bool(
+            mandatory = True,
+            doc = "Whether any possible flag branch references the object-local directory.",
+        ),
+        "needs_utsversion_tmp": attr.bool(
+            mandatory = True,
+            doc = "Whether any possible flag branch consumes object-local utsversion-tmp.h.",
+        ),
+        "remove_flag_program": attr.string(
+            mandatory = True,
+            doc = "Resolved compact-v7 removal program ID. Requires flag_programs and graph_profile.",
+        ),
         "include_dirs": attr.string_list(),
         "mode": attr.string(values = ["y", "m"], mandatory = True),
         "module_root": attr.bool(
@@ -4651,6 +4669,11 @@ linux_object = rule(
         "_capflags": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/capflags"),
+            executable = True,
+        ),
+        "_ccprofile": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/ccprofile"),
             executable = True,
         ),
         "_copyandrun": attr.label(

@@ -3658,6 +3658,14 @@ func TestCompactSourceBuildReadyRejectsUnknownMakeRefs(t *testing.T) {
 		t.Fatalf("sourceBuildReady() rejected intrinsic obj make ref")
 	}
 
+	knownEmpty := CompactObjectVariant{
+		Source: "core.c",
+		Flags:  []string{"$(cflags-nogcse-yy)"},
+	}
+	if !knownEmpty.sourceBuildReady() {
+		t.Fatalf("sourceBuildReady() rejected known-empty Kbuild make ref")
+	}
+
 	unknown := CompactObjectVariant{
 		Source: "broken.c",
 		Flags:  []string{"-I$(unsupported_dir)"},
@@ -3667,6 +3675,14 @@ func TestCompactSourceBuildReadyRejectsUnknownMakeRefs(t *testing.T) {
 	}
 	if got := unknown.sourceBuildError(); !strings.Contains(got, "unsupported_dir") {
 		t.Fatalf("sourceBuildError() = %q, want unsupported variable context", got)
+	}
+
+	unknownNoGCSE := CompactObjectVariant{
+		Source: "broken.c",
+		Flags:  []string{"$(cflags-nogcse-yn)"},
+	}
+	if unknownNoGCSE.sourceBuildReady() {
+		t.Fatalf("sourceBuildReady() accepted noncanonical cflags-nogcse ref")
 	}
 }
 

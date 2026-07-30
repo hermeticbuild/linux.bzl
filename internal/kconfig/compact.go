@@ -871,6 +871,9 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 					object.footprint[ref] = true
 				}
 			}
+			for _, ref := range kbuildFlagExpressionOutputConfigRefs(flag.program) {
+				object.footprint[ref] = true
+			}
 		}
 		for _, flag := range kb.RemoveFlags {
 			if flag.Scope == "object" && flag.Object != object.object {
@@ -894,6 +897,9 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 				for _, ref := range configRefs(value) {
 					object.footprint[ref] = true
 				}
+			}
+			for _, ref := range kbuildFlagExpressionOutputConfigRefs(flag.program) {
+				object.footprint[ref] = true
 			}
 		}
 		object.flags = append(object.flags, sanitizerKbuildFlags(config, kb.objectSettings, object)...)
@@ -2637,11 +2643,8 @@ func (v CompactObjectVariant) sourceBuildError() string {
 }
 
 func knownEmptyKbuildMakeRef(ref string) bool {
-	if strings.HasPrefix(ref, "cflags-nogcse-") {
-		return true
-	}
 	switch ref {
-	case "CC_FLAGS_CFI", "CC_FLAGS_FTRACE", "CC_FLAGS_LTO", "CC_FLAGS_SCS", "CLANG_FLAGS", "DISABLE_KSTACK_ERASE", "DISABLE_LATENT_ENTROPY_PLUGIN", "DISABLE_STACKLEAK_PLUGIN", "RANDSTRUCT_CFLAGS":
+	case "CC_FLAGS_CFI", "CC_FLAGS_FTRACE", "CC_FLAGS_LTO", "CC_FLAGS_SCS", "CLANG_FLAGS", "DISABLE_KSTACK_ERASE", "DISABLE_LATENT_ENTROPY_PLUGIN", "DISABLE_STACKLEAK_PLUGIN", "RANDSTRUCT_CFLAGS", "cflags-nogcse-yy":
 		return true
 	default:
 		return false

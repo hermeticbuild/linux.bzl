@@ -31,7 +31,7 @@ func TestCheckedInGraphProfiles(t *testing.T) {
 		{
 			architecture: "aarch64",
 			profile:      "llvm_22_1_8_aarch64.graph.json",
-			commands:     121,
+			commands:     122,
 			graphProbes:  18,
 			inputFiles:   13,
 		},

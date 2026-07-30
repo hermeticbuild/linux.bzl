@@ -662,8 +662,6 @@ def _profile_compile_flags(ctx, profile):
 def _relocatable_link(
         ctx,
         profile,
-        flags,
-        removals,
         output,
         objects,
         extra_inputs = [],
@@ -674,8 +672,6 @@ def _relocatable_link(
     args.add("link")
     args.add("-linker", profile.kbuild_linker)
     args.add("-validation", profile.validation)
-    args.add("-flags_file", flags)
-    args.add("-remove_flags_file", removals)
     args.add("-output", output)
     args.add_all(ctx.attr.relocatable_link_flags, before_each = "-base_arg")
     if linker_script != None:
@@ -686,10 +682,8 @@ def _relocatable_link(
         executable = ctx.executable._ccprofile,
         inputs = depset(
             [
-                flags,
                 profile.kbuild_linker,
                 profile.validation,
-                removals,
             ] + objects + extra_inputs,
             transitive = [profile.toolchain_files],
         ),
@@ -734,9 +728,6 @@ def _compile_arguments(
     if ctx.attr.mode == "m":
         object_args.append("-DMODULE")
     object_args.extend(_object_name_flags(spec.object, ctx.attr.modname))
-    object_args.append("-nostdinc")
-    if profile.cc_toolchain.compiler.lower().find("clang") >= 0:
-        object_args.append("-fintegrated-as")
 
     root = ctx.file.source_root.dirname
     if ctx.attr.language == "asm":
@@ -775,6 +766,7 @@ def _compile_arguments(
     args.add("-validation", profile.validation)
     args.add("-source", source)
     args.add("-output", output)
+    args.add("-config", config.config)
     args.add("-flags_file", flags)
     args.add("-remove_flags_file", removals)
     add_directory_arg(
@@ -793,11 +785,6 @@ def _compile_arguments(
         args,
         ["-arg=" + value for value in object_args],
         files = mapping_files,
-        directory_anchors = anchors,
-    )
-    add_mapped_values(
-        args,
-        ["-remove=" + value for value in ctx.attr.toolchain_remove_flags],
         directory_anchors = anchors,
     )
     return args
@@ -834,7 +821,8 @@ def _linux_object_action_group_impl(ctx):
     sources = _single_source_files(ctx)
     source_files = sources.files
 
-    profile = ctx.attr.graph_profile[LinuxGraphProfileInfo]
+    program_info = ctx.attr.flag_programs[LinuxFlagProgramsInfo]
+    profile = program_info.graph_profile
     expected_profile_arch = _PROFILE_ARCH_FOR_LINUX_ARCH[ctx.attr.arch]
     if profile.arch != expected_profile_arch:
         fail(
@@ -842,7 +830,7 @@ def _linux_object_action_group_impl(ctx):
             (ctx.label, profile.arch, ctx.attr.arch),
         )
     environment_index = ctx.attr.compile_environment_index[LinuxCompileEnvironmentIndexInfo]
-    flag_programs = ctx.attr.flag_programs[LinuxFlagProgramsInfo].programs
+    flag_programs = program_info.programs
     for program_id, what in [
         (ctx.attr.flag_program, "flag_program"),
         (ctx.attr.remove_flag_program, "remove_flag_program"),
@@ -989,10 +977,6 @@ linux_object_action_group = rule(
             mandatory = True,
             providers = [LinuxFlagProgramsInfo],
         ),
-        "graph_profile": attr.label(
-            mandatory = True,
-            providers = [LinuxGraphProfileInfo],
-        ),
         "compile_environment_index": attr.label(
             mandatory = True,
             providers = [LinuxCompileEnvironmentIndexInfo],
@@ -1050,9 +1034,6 @@ linux_object_action_group = rule(
             allow_files = True,
             mandatory = True,
             doc = "Union of exact source files used by objects in this group.",
-        ),
-        "toolchain_remove_flags": attr.string_list(
-            doc = "Exact top-level mutable toolchain arguments removed by ccprofile compile.",
         ),
         "_ccprofile": attr.label(
             cfg = "exec",
@@ -1154,19 +1135,6 @@ def _linux_composite_object_action_group_impl(ctx):
             "linux_composite_object_action_group %s profile arch %r does not match Linux arch %r" %
             (ctx.label, profile.arch, ctx.attr.arch),
         )
-    flag_programs = ctx.attr.flag_programs[LinuxFlagProgramsInfo].programs
-    for program_id, what in [
-        (ctx.attr.flag_program, "flag_program"),
-        (ctx.attr.remove_flag_program, "remove_flag_program"),
-    ]:
-        _validate_content_id(program_id, what)
-        if program_id not in flag_programs:
-            fail(
-                "linux_composite_object_action_group %s references unknown %s %s" %
-                (ctx.label, what, program_id),
-            )
-    flags = flag_programs[ctx.attr.flag_program]
-    removals = flag_programs[ctx.attr.remove_flag_program]
     dependency_groups = [
         target[LinuxObjectActionGroupInfo]
         for target in ctx.attr.member_groups
@@ -1207,8 +1175,6 @@ def _linux_composite_object_action_group_impl(ctx):
             _relocatable_link(
                 ctx,
                 profile,
-                flags,
-                removals,
                 out,
                 [info.output for info in member_infos],
                 mnemonic = "LinuxCompositeObject",
@@ -1259,11 +1225,6 @@ linux_composite_object_action_group = rule(
             mandatory = True,
             values = ["arm64", "x86"],
         ),
-        "flag_program": attr.string(mandatory = True),
-        "flag_programs": attr.label(
-            mandatory = True,
-            providers = [LinuxFlagProgramsInfo],
-        ),
         "graph_profile": attr.label(
             mandatory = True,
             providers = [LinuxGraphProfileInfo],
@@ -1287,7 +1248,6 @@ linux_composite_object_action_group = rule(
         "reachable_configs": attr.string_list(mandatory = True),
         "reachability_id": attr.string(mandatory = True),
         "recipe_id": attr.string(mandatory = True),
-        "remove_flag_program": attr.string(mandatory = True),
         "relocatable_link_flags": attr.string_list(
             mandatory = True,
             doc = "Profile-selected driver arguments for a hermetic relocatable link.",
@@ -1387,8 +1347,6 @@ def _nvhe_compile_reloc(
         "",
     ))
     object_args.extend([
-        "-nostdinc",
-        "-fintegrated-as",
         "-D__KERNEL__",
         "-D__ASSEMBLY__",
         "-include",
@@ -1413,6 +1371,7 @@ def _nvhe_compile_reloc(
     args.add("-validation", profile.validation)
     args.add("-source", source)
     args.add("-output", output)
+    args.add("-config", config.config)
     anchors = _directory_anchors(
         ctx.file.source_root,
         source,
@@ -1423,11 +1382,6 @@ def _nvhe_compile_reloc(
         args,
         ["-arg=" + value for value in object_args],
         files = mapping_files,
-        directory_anchors = anchors,
-    )
-    add_mapped_values(
-        args,
-        ["-remove=" + value for value in ctx.attr.toolchain_remove_flags],
         directory_anchors = anchors,
     )
     path_mapped_run(
@@ -1468,19 +1422,6 @@ def _linux_arm64_nvhe_object_action_group_impl(ctx):
             "linux_arm64_nvhe_object_action_group %s requires an aarch64 profile, got %r" %
             (ctx.label, profile.arch),
         )
-    flag_programs = ctx.attr.flag_programs[LinuxFlagProgramsInfo].programs
-    for program_id, what in [
-        (ctx.attr.flag_program, "flag_program"),
-        (ctx.attr.remove_flag_program, "remove_flag_program"),
-    ]:
-        _validate_content_id(program_id, what)
-        if program_id not in flag_programs:
-            fail(
-                "linux_arm64_nvhe_object_action_group %s references unknown %s %s" %
-                (ctx.label, what, program_id),
-            )
-    flags = flag_programs[ctx.attr.flag_program]
-    removals = flag_programs[ctx.attr.remove_flag_program]
     environment_index = ctx.attr.compile_environment_index[LinuxCompileEnvironmentIndexInfo]
 
     dependency_groups = [
@@ -1572,8 +1513,6 @@ def _linux_arm64_nvhe_object_action_group_impl(ctx):
         _relocatable_link(
             ctx,
             profile,
-            flags,
-            removals,
             tmp,
             member_outputs,
             extra_inputs = [linker_script],
@@ -1620,8 +1559,6 @@ def _linux_arm64_nvhe_object_action_group_impl(ctx):
         _relocatable_link(
             ctx,
             profile,
-            flags,
-            removals,
             rel,
             [tmp, hyp_reloc],
         )
@@ -1668,11 +1605,6 @@ linux_arm64_nvhe_object_action_group = rule(
     implementation = _linux_arm64_nvhe_object_action_group_impl,
     attrs = {
         "arch": attr.string(default = "arm64", values = ["arm64"]),
-        "flag_program": attr.string(mandatory = True),
-        "flag_programs": attr.label(
-            mandatory = True,
-            providers = [LinuxFlagProgramsInfo],
-        ),
         "graph_profile": attr.label(
             mandatory = True,
             providers = [LinuxGraphProfileInfo],
@@ -1696,7 +1628,6 @@ linux_arm64_nvhe_object_action_group = rule(
         "reachable_configs": attr.string_list(mandatory = True),
         "reachability_id": attr.string(mandatory = True),
         "recipe_id": attr.string(mandatory = True),
-        "remove_flag_program": attr.string(mandatory = True),
         "relocatable_link_flags": attr.string_list(
             mandatory = True,
             doc = "Profile-selected driver arguments for a hermetic relocatable link.",
@@ -1710,7 +1641,6 @@ linux_arm64_nvhe_object_action_group = rule(
             allow_files = True,
             mandatory = True,
         ),
-        "toolchain_remove_flags": attr.string_list(),
         "_ccprofile": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/ccprofile"),

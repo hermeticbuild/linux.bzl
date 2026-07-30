@@ -515,6 +515,15 @@ func (metadata *CompactMetadataV7) validateCompactV7Programs() (
 				expected,
 			)
 		}
+		for _, arg := range terminal.Argv {
+			if compactV7ArgumentStartsResponseFile(arg) {
+				return nil, fmt.Errorf(
+					"compact-v7 flag terminal %s contains unsupported response-file argument %q",
+					terminal.ID,
+					arg,
+				)
+			}
+		}
 		terminals[terminal.ID] = terminal
 	}
 
@@ -542,6 +551,25 @@ func (metadata *CompactMetadataV7) validateCompactV7Programs() (
 				"compact-v7 Kbuild probe %s has no candidate argv",
 				probe.ID,
 			)
+		}
+		for _, arg := range probe.CandidateArgv {
+			if compactV7ArgumentStartsResponseFile(arg) {
+				return nil, fmt.Errorf(
+					"compact-v7 Kbuild probe %s contains unsupported response-file candidate %q",
+					probe.ID,
+					arg,
+				)
+			}
+			for _, ref := range makeVariableRefs(arg) {
+				if !compactV7ProbeMakeRefAllowed(ref) {
+					return nil, fmt.Errorf(
+						"compact-v7 Kbuild probe %s candidate %q contains unsupported Make reference %q",
+						probe.ID,
+						arg,
+						ref,
+					)
+				}
+			}
 		}
 		expected := compactV7ProbeContentID(probe)
 		if probe.ID != expected {
@@ -727,6 +755,53 @@ func (metadata *CompactMetadataV7) validateCompactV7Programs() (
 			)
 		}
 	}
+	rootReferences := map[string][]string{}
+	var evaluateRootReferences func(string) ([]string, error)
+	evaluateRootReferences = func(root string) ([]string, error) {
+		if refs, ok := rootReferences[root]; ok {
+			return refs, nil
+		}
+		if terminal, ok := terminals[root]; ok {
+			refset := map[string]bool{}
+			for _, arg := range terminal.Argv {
+				for _, ref := range makeVariableRefs(arg) {
+					refset[ref] = true
+				}
+			}
+			refs := make([]string, 0, len(refset))
+			for ref := range refset {
+				refs = append(refs, ref)
+			}
+			sort.Strings(refs)
+			rootReferences[root] = refs
+			return refs, nil
+		}
+		node, ok := nodes[root]
+		if !ok {
+			return nil, fmt.Errorf("compact-v7 references unknown flag root %s", root)
+		}
+		children := node.Children
+		if node.Kind == "select" {
+			children = []string{node.WhenTrue, node.WhenFalse}
+		}
+		refset := map[string]bool{}
+		for _, child := range children {
+			refs, err := evaluateRootReferences(child)
+			if err != nil {
+				return nil, err
+			}
+			for _, ref := range refs {
+				refset[ref] = true
+			}
+		}
+		refs := make([]string, 0, len(refset))
+		for ref := range refset {
+			refs = append(refs, ref)
+		}
+		sort.Strings(refs)
+		rootReferences[root] = refs
+		return refs, nil
+	}
 	for _, probe := range metadata.KbuildProbes {
 		if probe.ContextProgram == "" {
 			return nil, fmt.Errorf(
@@ -741,8 +816,44 @@ func (metadata *CompactMetadataV7) validateCompactV7Programs() (
 				probe.ContextProgram,
 			)
 		}
+		context := programs[probe.ContextProgram]
+		refs, err := evaluateRootReferences(context.Root)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"compact-v7 Kbuild probe %s context program: %w",
+				probe.ID,
+				err,
+			)
+		}
+		for _, ref := range refs {
+			if !compactV7ProbeMakeRefAllowed(ref) {
+				return nil, fmt.Errorf(
+					"compact-v7 Kbuild probe %s context program contains unsupported Make reference %q",
+					probe.ID,
+					ref,
+				)
+			}
+		}
 	}
 	return programs, nil
+}
+
+func compactV7ArgumentStartsResponseFile(arg string) bool {
+	for _, ref := range makeVariableRefs(arg) {
+		if !knownEmptyKbuildMakeRef(ref) {
+			continue
+		}
+		arg = strings.ReplaceAll(arg, "$("+ref+")", "")
+		arg = strings.ReplaceAll(arg, "${"+ref+"}", "")
+	}
+	return strings.HasPrefix(arg, "@")
+}
+
+func compactV7ProbeMakeRefAllowed(ref string) bool {
+	if ref == "obj" || ref == "srctree" {
+		return true
+	}
+	return knownEmptyKbuildMakeRef(ref)
 }
 
 func (metadata *CompactMetadataV7) validateCompactV7Reachability() (
@@ -803,8 +914,7 @@ func (metadata *CompactMetadataV7) validateCompactV7Recipes(
 					recipe.Language,
 				)
 			}
-		case "arm64_nvhe":
-		case "composite":
+		case "arm64_nvhe", "composite":
 			if recipe.Language != "" {
 				return nil, fmt.Errorf(
 					"compact-v7 composite recipe %s has compile-only metadata",
@@ -838,6 +948,17 @@ func (metadata *CompactMetadataV7) validateCompactV7Recipes(
 				recipe.ID,
 				recipe.RemoveFlagProgram,
 			)
+		}
+		if recipe.Kind != "compile" {
+			emptyRoot := compactV7FlagTerminalContentID(nil)
+			if programs[recipe.FlagProgram].Root != emptyRoot ||
+				programs[recipe.RemoveFlagProgram].Root != emptyRoot {
+				return nil, fmt.Errorf(
+					"compact-v7 %s recipe %s must use the canonical empty flag program",
+					recipe.Kind,
+					recipe.ID,
+				)
+			}
 		}
 		expected := compactV7ActionRecipeContentID(
 			recipe,

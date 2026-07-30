@@ -12,6 +12,21 @@
 #endif
 #endif
 
+#define STRINGIFY_INNER(value) #value
+#define STRINGIFY(value) STRINGIFY_INNER(value)
+
+_Static_assert(sizeof(STRINGIFY(CONFIG_REF_Y)) == sizeof("y"), "CONFIG y reference");
+_Static_assert(sizeof(STRINGIFY(CONFIG_REF_M)) == sizeof("m"), "CONFIG m reference");
+_Static_assert(sizeof(STRINGIFY(CONFIG_REF_N)) == sizeof("n"), "CONFIG n reference");
+_Static_assert(CONFIG_REF_NUMBER == 7, "CONFIG numeric reference");
+
+_Static_assert(sizeof(CONFIG_REF_STRING) == sizeof("-native"), "CONFIG string reference");
+
+#if defined(REMOVE_CONFIG_REF_Y) || defined(REMOVE_CONFIG_REF_M) || \
+    defined(REMOVE_CONFIG_REF_N) || defined(REMOVE_CONFIG_REF_STRING)
+#error CONFIG-expanded removal flags must be removed exactly
+#endif
+
 int linux_fixture_value(void) {
     return CONFIG_FIXTURE_VALUE;
 }

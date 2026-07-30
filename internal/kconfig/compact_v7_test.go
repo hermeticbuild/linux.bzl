@@ -161,6 +161,78 @@ func TestCompactV7DecisionProgramValidation(t *testing.T) {
 	}
 }
 
+func TestCompactV7FlagProgramsRejectResponseFileArguments(t *testing.T) {
+	for _, arg := range []string{
+		"@flags.rsp",
+		"$(CLANG_FLAGS)@flags.rsp",
+	} {
+		terminal := CompactKbuildFlagTerminal{
+			Argv: []string{arg},
+		}
+		terminal.ID = compactV7FlagTerminalContentID(terminal.Argv)
+		metadata := &CompactMetadataV7{
+			FlagTerminals: []CompactKbuildFlagTerminal{terminal},
+		}
+		if _, err := metadata.validateCompactV7Programs(); err == nil ||
+			!strings.Contains(err.Error(), "unsupported response-file argument") {
+			t.Fatalf(
+				"validateCompactV7Programs(%q) error = %v, want response-file error",
+				arg,
+				err,
+			)
+		}
+	}
+
+	interner := newCompactV7ProgramInterner()
+	contextID := interner.internLiteral(nil)
+	metadata := &CompactMetadataV7{}
+	interner.apply(metadata)
+	probe := CompactKbuildProbe{
+		Kind:           "cc_option",
+		CandidateArgv:  []string{"$(CLANG_FLAGS)@candidate.rsp"},
+		ContextProgram: contextID,
+		Language:       "c",
+		Srcarch:        "x86",
+	}
+	probe.ID = compactV7ProbeContentID(probe)
+	metadata.KbuildProbes = []CompactKbuildProbe{probe}
+	if _, err := metadata.validateCompactV7Programs(); err == nil ||
+		!strings.Contains(err.Error(), "unsupported response-file candidate") {
+		t.Fatalf("validateCompactV7Programs() error = %v, want response-file candidate error", err)
+	}
+}
+
+func TestCompactV7StaticLinkRecipesRequireEmptyFlagPrograms(t *testing.T) {
+	interner := newCompactV7ProgramInterner()
+	emptyID := interner.internLiteral(nil)
+	flagsID := interner.internLiteral([]string{"-Wl,--build-id=none"})
+	metadata := &CompactMetadataV7{
+		ToolchainProfile:      "llvm-test/x86",
+		CompileEnvironmentABI: "linux.bzl/compact-v7/test",
+	}
+	interner.apply(metadata)
+	programs := make(map[string]CompactKbuildFlagProgram, len(metadata.FlagPrograms))
+	for _, program := range metadata.FlagPrograms {
+		programs[program.ID] = program
+	}
+	recipe := CompactActionRecipe{
+		Kind:              "composite",
+		Mode:              "y",
+		FlagProgram:       flagsID,
+		RemoveFlagProgram: emptyID,
+	}
+	recipe.ID = compactV7ActionRecipeContentID(
+		recipe,
+		metadata.ToolchainProfile,
+		metadata.CompileEnvironmentABI,
+	)
+	metadata.ActionRecipes = []CompactActionRecipe{recipe}
+	if _, err := metadata.validateCompactV7Recipes(programs); err == nil ||
+		!strings.Contains(err.Error(), "must use the canonical empty flag program") {
+		t.Fatalf("validateCompactV7Recipes() error = %v, want empty-program error", err)
+	}
+}
+
 func TestCompactV7SymbolicKbuildProbesPreserveContextAndInputUnion(t *testing.T) {
 	tree := mustParseString(t, "mainmenu \"symbolic Kbuild flags\"\n")
 	sourceRoot := t.TempDir()

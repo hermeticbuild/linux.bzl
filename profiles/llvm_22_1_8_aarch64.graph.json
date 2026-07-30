@@ -335,7 +335,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": false
+      "success": true
     },
     {
       "id": "24f2fc584b3fb34179a8ea4312a18c520a4d35679ae82136a009633ef9b78835",
@@ -511,7 +511,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": false
+      "success": true
     },
     {
       "id": "2e6237938d80d85f76f3703da7e5a041e5e5547e311b33c80ef46ebb1fe33f5a",
@@ -533,7 +533,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": false
+      "success": true
     },
     {
       "id": "31cffa804c7bd9054e7b564b121c321873dc23041c1f0675edf9094b76f19c6d",
@@ -695,7 +695,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": true
+      "success": false
     },
     {
       "id": "3e4e6d0e6f1c65137a472075d40df292034293013e89761c9aeae597ca6b5ce5",
@@ -805,7 +805,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": false
+      "success": true
     },
     {
       "id": "4d8c8f5f72ce90a93855d126c67856fafc11ccd59423ce2b1ec4ae9d13cf1c5e",
@@ -985,7 +985,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": false
+      "success": true
     },
     {
       "id": "58fd3350bf5b76431b6191d5b48ce0706ff4403d246c9f288e2c873383e173a9",
@@ -1097,7 +1097,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": false
+      "success": true
     },
     {
       "id": "5f3447ef5b5b7be628a9341eb64141b9b908d1507c3a312392f82e53b05e13a2",
@@ -1163,7 +1163,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": true
+      "success": false
     },
     {
       "id": "654d2afb90b78b78decf302db314cafd784fbf9b1ad1554de38b76d5c627d7fa",
@@ -1769,7 +1769,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": false
+      "success": true
     },
     {
       "id": "9bd981c29782e83140b5bcd84cdfea968bf9d889e2ea69d772017ba3d777e9cf",
@@ -1937,7 +1937,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": true
+      "success": false
     },
     {
       "id": "b144f79517ac631c64a7060d30dca32b41867089f21663af08d46c89b05ee7f1",
@@ -2275,6 +2275,30 @@
       "success": true
     },
     {
+      "id": "d96d6446e1be3bcd49c2fa8ea5c987623af76dc97c8f2a17ebff5afdcf66264f",
+      "kind": "success",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/cc-can-link.sh clang -fintegrated-as",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "arm64",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "arm64"
+      },
+      "inputs": {
+        "scripts/cc-can-link.sh": "15d4a43559eb0be77fc23ddc4144f4b041417bbc19c5b009312558d7068d5f7d"
+      },
+      "success": false
+    },
+    {
       "id": "d9a5c57b4f268aefa659ab5c88078f09d564ad23e45f6040c2fc8ffcc18c21cc",
       "kind": "stdout",
       "command": "clang -print-file-name=plugin",
@@ -2561,7 +2585,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": true
+      "success": false
     },
     {
       "id": "f6b84e3a6614156e0d0f65601cb6685b2e0903b700f199506e091cbe735a7193",
@@ -2673,7 +2697,7 @@
         "SRCARCH": "arm64"
       },
       "inputs": {},
-      "success": false
+      "success": true
     },
     {
       "id": "fe2320661eb8267298133f98aa1876f3095066e0f8e995dd159cb0d6e5bd171f",

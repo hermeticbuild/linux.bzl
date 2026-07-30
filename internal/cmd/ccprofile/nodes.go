@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -8,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/hermeticbuild/linux.bzl/internal/ccprofile"
@@ -65,6 +68,22 @@ func runResolveNode(args []string) error {
 	if err != nil {
 		return fmt.Errorf("read context program: %w", err)
 	}
+	contextArgv, err = expandKbuildProbeMakeRefs(
+		contextArgv,
+		*sourceRoot,
+		*objectRoot,
+	)
+	if err != nil {
+		return fmt.Errorf("expand context program: %w", err)
+	}
+	candidateArgv, err = expandKbuildProbeMakeRefs(
+		candidateArgv,
+		*sourceRoot,
+		*objectRoot,
+	)
+	if err != nil {
+		return fmt.Errorf("expand candidate argv: %w", err)
+	}
 	whenTrue, err := readArgvFile(*whenTruePath)
 	if err != nil {
 		return fmt.Errorf("read true branch: %w", err)
@@ -72,6 +91,12 @@ func runResolveNode(args []string) error {
 	whenFalse, err := readArgvFile(*whenFalsePath)
 	if err != nil {
 		return fmt.Errorf("read false branch: %w", err)
+	}
+	if len(candidateArgv) == 0 {
+		if err := writeArgvFile(*out, whenFalse); err != nil {
+			return fmt.Errorf("write selected false branch for empty candidate: %w", err)
+		}
+		return nil
 	}
 	request, err := ccprofile.NewKbuildGraphProbeIdentity(
 		*kind,
@@ -85,14 +110,12 @@ func runResolveNode(args []string) error {
 	}
 	supported, err := ccprofile.EvaluateKbuildGraphProbe(
 		context.Background(),
-		template.AnalysisIdentity,
 		request,
 		ccprofile.KbuildGraphProbeTools{
-			Compiler:    template.Compiler,
-			Linker:      *linker,
-			SourceRoot:  *sourceRoot,
-			ObjectRoot:  *objectRoot,
-			Environment: template.Environment,
+			CommandTemplate: template,
+			Linker:          *linker,
+			SourceRoot:      *sourceRoot,
+			ObjectRoot:      *objectRoot,
 		},
 	)
 	if err != nil {
@@ -106,6 +129,61 @@ func runResolveNode(args []string) error {
 		return fmt.Errorf("write selected branch: %w", err)
 	}
 	return nil
+}
+
+func expandKbuildProbeMakeRefs(
+	argv []string,
+	sourceRoot string,
+	objectRoot string,
+) ([]string, error) {
+	replacements := map[string]string{
+		"obj":     filepath.ToSlash(objectRoot),
+		"srctree": filepath.ToSlash(sourceRoot),
+	}
+	for _, name := range kbuildKnownEmptyMakeRefs {
+		replacements[name] = ""
+	}
+	names := make([]string, 0, len(replacements))
+	for name := range replacements {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]string, 0, len(argv))
+	for index, original := range argv {
+		value := original
+		for _, name := range names {
+			replacement := replacements[name]
+			for _, reference := range []string{"$(" + name + ")", "${" + name + "}"} {
+				if strings.Contains(value, reference) && replacement == "" &&
+					(name == "srctree" || name == "obj") {
+					return nil, fmt.Errorf(
+						"argument %d requires a path for Make reference %s",
+						index,
+						reference,
+					)
+				}
+				value = strings.ReplaceAll(value, reference, replacement)
+			}
+		}
+		if strings.Contains(value, "$(") || strings.Contains(value, "${") {
+			return nil, fmt.Errorf(
+				"argument %d has unsupported Kbuild Make reference: %q",
+				index,
+				value,
+			)
+		}
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	if err := validateArgv(out, "expanded Kbuild probe argv"); err != nil {
+		return nil, err
+	}
+	if err := rejectResponseFileArguments(out, "expanded Kbuild probe argv"); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func runConcatNode(args []string) error {
@@ -137,8 +215,6 @@ func runLink(args []string) error {
 	flags := newFlagSet("ccprofile link")
 	linker := flags.String("linker", "", "selected raw linker")
 	validationPath := flags.String("validation", "", "graph profile validation stamp")
-	flagsPath := flags.String("flags_file", "", "newline-delimited resolved linker arguments")
-	removeFlagsPath := flags.String("remove_flags_file", "", "newline-delimited exact removals")
 	output := flags.String("output", "", "link output")
 	linkerScript := flags.String("linker_script", "", "optional raw linker script")
 	var inputs repeatedStringFlag
@@ -151,23 +227,13 @@ func runLink(args []string) error {
 	if flags.NArg() != 0 ||
 		*linker == "" ||
 		*validationPath == "" ||
-		*flagsPath == "" ||
-		*removeFlagsPath == "" ||
 		*output == "" {
 		return fmt.Errorf(
-			"ccprofile link requires linker, validation, flags_file, remove_flags_file, output, and no positional arguments",
+			"ccprofile link requires linker, validation, output, and no positional arguments",
 		)
 	}
 	if err := readValidationStamp(*validationPath); err != nil {
 		return err
-	}
-	resolved, err := readArgvFile(*flagsPath)
-	if err != nil {
-		return fmt.Errorf("read resolved linker flags: %w", err)
-	}
-	removals, err := readArgvFile(*removeFlagsPath)
-	if err != nil {
-		return fmt.Errorf("read linker removals: %w", err)
 	}
 	if err := validateArgv(baseArgv, "base linker argv"); err != nil {
 		return err
@@ -183,14 +249,7 @@ func runLink(args []string) error {
 			return err
 		}
 	}
-	filtered, err := filterExactArgs(
-		append(append([]string(nil), baseArgv...), resolved...),
-		removals,
-	)
-	if err != nil {
-		return err
-	}
-	linkArgv := filtered
+	linkArgv := append([]string(nil), baseArgv...)
 	if *linkerScript != "" {
 		linkArgv = append(linkArgv, "-T", *linkerScript)
 	}
@@ -279,6 +338,69 @@ func readArgvFile(path string) ([]string, error) {
 	return argv, nil
 }
 
+func readGNUResponseFile(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if bytes.IndexByte(data, 0) >= 0 {
+		return nil, fmt.Errorf("response file %s contains NUL", path)
+	}
+
+	var argv []string
+	var token strings.Builder
+	for index := 0; index < len(data); index++ {
+		if token.Len() == 0 {
+			for index < len(data) && isClangResponseWhitespace(data[index]) {
+				index++
+			}
+			if index == len(data) {
+				break
+			}
+		}
+		value := data[index]
+		if value == '\\' && index+1 < len(data) {
+			index++
+			token.WriteByte(data[index])
+			continue
+		}
+		if value == '\'' || value == '"' {
+			quote := value
+			index++
+			for index < len(data) && data[index] != quote {
+				if data[index] == '\\' && index+1 < len(data) {
+					index++
+				}
+				token.WriteByte(data[index])
+				index++
+			}
+			if index == len(data) {
+				break
+			}
+			continue
+		}
+		if isClangResponseWhitespace(value) {
+			if token.Len() != 0 {
+				argv = append(argv, token.String())
+				token.Reset()
+			}
+			continue
+		}
+		token.WriteByte(value)
+	}
+	if token.Len() != 0 {
+		argv = append(argv, token.String())
+	}
+	if err := validateArgv(argv, "response file "+path); err != nil {
+		return nil, err
+	}
+	return argv, nil
+}
+
+func isClangResponseWhitespace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\r' || value == '\n'
+}
+
 func writeArgvFile(path string, argv []string) error {
 	if err := validateArgv(argv, "output argv"); err != nil {
 		return err
@@ -310,37 +432,90 @@ func validatePathToken(value, context string) error {
 	return nil
 }
 
-func filterExactArgs(argv, removals []string) ([]string, error) {
-	if err := validateArgv(argv, "linker argv"); err != nil {
-		return nil, err
-	}
-	if err := validateArgv(removals, "linker removals"); err != nil {
-		return nil, err
-	}
-	removeSet := make(map[string]bool, len(removals))
-	for _, removal := range removals {
-		if removeSet[removal] {
-			return nil, fmt.Errorf("linker removal %q is repeated", removal)
-		}
-		removeSet[removal] = true
-	}
-	filtered := make([]string, 0, len(argv))
-	for _, arg := range argv {
-		if !removeSet[arg] {
-			filtered = append(filtered, arg)
-		}
-	}
-	return filtered, nil
-}
-
-func expandArgvResponseFiles(argv []string) ([]string, error) {
-	return expandArgvResponseFilesWithStack(argv, map[string]bool{})
-}
-
-func expandArgvResponseFilesWithStack(
+func expandKbuildResponseFiles(
 	argv []string,
+	configValues map[string]string,
+	source string,
+	sourceRoot string,
+	objectPath string,
+	objectRoot string,
+	utsversionTmp string,
+) ([]string, error) {
+	return expandKbuildResponseFilesWithStack(
+		argv,
+		configValues,
+		source,
+		sourceRoot,
+		objectPath,
+		objectRoot,
+		utsversionTmp,
+		map[string]bool{},
+	)
+}
+
+func expandKbuildProgramArgv(
+	argv []string,
+	configValues map[string]string,
+	source string,
+	sourceRoot string,
+	objectPath string,
+	objectRoot string,
+	utsversionTmp string,
+) ([]string, error) {
+	expanded, err := expandKbuildArgv(
+		argv,
+		configValues,
+		source,
+		sourceRoot,
+		objectPath,
+		objectRoot,
+		utsversionTmp,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectResponseFileArguments(expanded, "expanded Kbuild flag program"); err != nil {
+		return nil, err
+	}
+	return expanded, nil
+}
+
+func rejectResponseFileArguments(argv []string, context string) error {
+	for index, arg := range argv {
+		if strings.HasPrefix(arg, "@") {
+			return fmt.Errorf(
+				"%s[%d] contains unsupported response-file argument %q",
+				context,
+				index,
+				arg,
+			)
+		}
+	}
+	return nil
+}
+
+func expandKbuildResponseFilesWithStack(
+	argv []string,
+	configValues map[string]string,
+	source string,
+	sourceRoot string,
+	objectPath string,
+	objectRoot string,
+	utsversionTmp string,
 	stack map[string]bool,
 ) ([]string, error) {
+	argv, err := expandKbuildArgv(
+		argv,
+		configValues,
+		source,
+		sourceRoot,
+		objectPath,
+		objectRoot,
+		utsversionTmp,
+	)
+	if err != nil {
+		return nil, err
+	}
 	var expanded []string
 	for _, arg := range argv {
 		if !strings.HasPrefix(arg, "@") {
@@ -356,12 +531,21 @@ func expandArgvResponseFilesWithStack(
 			return nil, fmt.Errorf("response-file cycle at %s", path)
 		}
 		stack[path] = true
-		nested, err := readArgvFile(path)
+		nested, err := readGNUResponseFile(path)
 		if err != nil {
 			delete(stack, path)
 			return nil, fmt.Errorf("read response file %s: %w", path, err)
 		}
-		nested, err = expandArgvResponseFilesWithStack(nested, stack)
+		nested, err = expandKbuildResponseFilesWithStack(
+			nested,
+			configValues,
+			source,
+			sourceRoot,
+			objectPath,
+			objectRoot,
+			utsversionTmp,
+			stack,
+		)
 		delete(stack, path)
 		if err != nil {
 			return nil, err
@@ -373,9 +557,12 @@ func expandArgvResponseFilesWithStack(
 
 func expandKbuildArgv(
 	argv []string,
+	configValues map[string]string,
 	source string,
 	sourceRoot string,
 	objectPath string,
+	objectRoot string,
+	utsversionTmp string,
 ) ([]string, error) {
 	if err := validatePathToken(source, "compile source"); err != nil {
 		return nil, err
@@ -390,32 +577,41 @@ func expandKbuildArgv(
 			return nil, err
 		}
 	}
-	replacements := map[string]string{
-		"src":     filepath.ToSlash(filepath.Dir(source)),
-		"srctree": filepath.ToSlash(sourceRoot),
+	if objectRoot != "" {
+		if err := validatePathToken(objectRoot, "object root"); err != nil {
+			return nil, err
+		}
 	}
-	if objectPath != "" {
+	if utsversionTmp != "" {
+		if err := validatePathToken(utsversionTmp, "utsversion-tmp.h"); err != nil {
+			return nil, err
+		}
+	}
+	replacements := make(map[string]string, len(configValues)+12)
+	for name, value := range configValues {
+		replacements[name] = value
+	}
+	replacements["src"] = filepath.ToSlash(filepath.Dir(source))
+	replacements["srctree"] = filepath.ToSlash(sourceRoot)
+	if objectRoot != "" {
+		replacements["obj"] = filepath.ToSlash(objectRoot)
+	} else if objectPath != "" {
 		replacements["obj"] = filepath.ToSlash(filepath.Dir(objectPath))
 	}
-	for _, name := range []string{
-		"CC_FLAGS_CFI",
-		"CC_FLAGS_FTRACE",
-		"CC_FLAGS_LTO",
-		"CC_FLAGS_SCS",
-		"CLANG_FLAGS",
-		"DISABLE_KSTACK_ERASE",
-		"DISABLE_LATENT_ENTROPY_PLUGIN",
-		"DISABLE_STACKLEAK_PLUGIN",
-		"RANDSTRUCT_CFLAGS",
-		"cflags-nogcse-yy",
-	} {
+	for _, name := range kbuildKnownEmptyMakeRefs {
 		replacements[name] = ""
 	}
+	replacementNames := make([]string, 0, len(replacements))
+	for name := range replacements {
+		replacementNames = append(replacementNames, name)
+	}
+	sort.Strings(replacementNames)
 
 	out := make([]string, 0, len(argv))
 	for index, original := range argv {
 		value := original
-		for name, replacement := range replacements {
+		for _, name := range replacementNames {
+			replacement := replacements[name]
 			for _, reference := range []string{"$(" + name + ")", "${" + name + "}"} {
 				if strings.Contains(value, reference) && replacement == "" &&
 					(name == "srctree" || name == "obj") {
@@ -437,11 +633,20 @@ func expandKbuildArgv(
 			)
 		}
 		if strings.Contains(value, "utsversion-tmp.h") {
-			return nil, fmt.Errorf(
-				"argument %d requires an object-local utsversion-tmp.h: %q",
-				index,
+			rewritten, ok := rewriteUTSVersionTmp(
 				value,
+				objectPath,
+				objectRoot,
+				utsversionTmp,
 			)
+			if !ok {
+				return nil, fmt.Errorf(
+					"argument %d requires an object-local utsversion-tmp.h: %q",
+					index,
+					value,
+				)
+			}
+			value = rewritten
 		}
 		if value != "" {
 			out = append(out, value)
@@ -451,4 +656,107 @@ func expandKbuildArgv(
 		return nil, err
 	}
 	return out, nil
+}
+
+var kbuildKnownEmptyMakeRefs = []string{
+	"CC_FLAGS_CFI",
+	"CC_FLAGS_FTRACE",
+	"CC_FLAGS_LTO",
+	"CC_FLAGS_SCS",
+	"CLANG_FLAGS",
+	"DISABLE_KSTACK_ERASE",
+	"DISABLE_LATENT_ENTROPY_PLUGIN",
+	"DISABLE_STACKLEAK_PLUGIN",
+	"RANDSTRUCT_CFLAGS",
+	"cflags-nogcse-yy",
+}
+
+func readKbuildConfig(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	values := map[string]string{}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	for lineNumber := 1; scanner.Scan(); lineNumber++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var name, value string
+		switch {
+		case strings.HasPrefix(line, "# CONFIG_") &&
+			strings.HasSuffix(line, " is not set"):
+			name = strings.TrimSuffix(
+				strings.TrimPrefix(line, "# "),
+				" is not set",
+			)
+			value = "n"
+		case strings.HasPrefix(line, "#"):
+			continue
+		default:
+			var ok bool
+			name, value, ok = strings.Cut(line, "=")
+			if !ok {
+				return nil, fmt.Errorf(
+					"%s:%d: expected CONFIG_* assignment",
+					path,
+					lineNumber,
+				)
+			}
+			name = strings.TrimSpace(name)
+			value = strings.TrimSpace(value)
+		}
+		if !strings.HasPrefix(name, "CONFIG_") ||
+			len(name) == len("CONFIG_") {
+			return nil, fmt.Errorf(
+				"%s:%d: expected CONFIG_* key, got %q",
+				path,
+				lineNumber,
+				name,
+			)
+		}
+		if _, exists := values[name]; exists {
+			return nil, fmt.Errorf(
+				"%s:%d: duplicate config key %q",
+				path,
+				lineNumber,
+				name,
+			)
+		}
+		values[name] = value
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+func rewriteUTSVersionTmp(
+	value string,
+	objectPath string,
+	objectRoot string,
+	utsversionTmp string,
+) (string, bool) {
+	if utsversionTmp == "" {
+		return "", false
+	}
+	candidates := map[string]bool{
+		"utsversion-tmp.h": true,
+	}
+	if objectPath != "" {
+		objectDir := filepath.ToSlash(filepath.Dir(objectPath))
+		if objectDir != "." {
+			candidates[objectDir+"/utsversion-tmp.h"] = true
+		}
+	}
+	if objectRoot != "" {
+		candidates[filepath.ToSlash(filepath.Join(objectRoot, "utsversion-tmp.h"))] = true
+	}
+	if !candidates[filepath.ToSlash(value)] {
+		return "", false
+	}
+	return utsversionTmp, true
 }

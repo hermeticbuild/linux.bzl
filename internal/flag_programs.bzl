@@ -9,11 +9,12 @@ load(
     "path_mapped_run",
 )
 
-visibility("//...")
+visibility("public")
 
 LinuxFlagProgramsInfo = provider(
     doc = "Resolved compact-v7 flag programs shared by lazy Linux actions.",
     fields = {
+        "graph_profile": "Exact LinuxGraphProfileInfo used to resolve every dynamic node.",
         "programs": "Dictionary from full compact-v7 program ID to its resolved argv File.",
     },
 )
@@ -364,7 +365,10 @@ def _linux_flag_programs_impl(ctx):
         program_files[program_id] = files[root]
     return [
         DefaultInfo(files = depset(program_files.values())),
-        LinuxFlagProgramsInfo(programs = program_files),
+        LinuxFlagProgramsInfo(
+            graph_profile = profile,
+            programs = program_files,
+        ),
         OutputGroupInfo(nodes = depset(files.values())),
     ]
 

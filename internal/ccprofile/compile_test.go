@@ -20,11 +20,14 @@ func validCommandTemplate(compiler string) CommandTemplate {
 		},
 		Compiler: compiler,
 		MutableArgv: []string{
+			"--target=x86_64-linux-gnu",
+			"-nostdinc",
+			"-fintegrated-as",
 			"-toolchain-keep",
 			"-toolchain-drop",
 			"-drop-everywhere",
-			"__LINUX_BZL_KBUILD_FLAGS__",
 			"-toolchain-suffix",
+			"__LINUX_BZL_KBUILD_FLAGS__",
 		},
 		Environment:         map[string]string{},
 		KbuildFlagsSentinel: "__LINUX_BZL_KBUILD_FLAGS__",
@@ -46,6 +49,7 @@ func TestPrepareCompileArgvFiltersAllTopLevelMutableArguments(t *testing.T) {
 		[]string{
 			"-toolchain-drop",
 			"-DOBJECT_DROP",
+			"-DOBJECT_DROP",
 			"-drop-everywhere",
 		},
 	)
@@ -53,10 +57,13 @@ func TestPrepareCompileArgvFiltersAllTopLevelMutableArguments(t *testing.T) {
 		t.Fatalf("PrepareCompileArgv() failed: %v", err)
 	}
 	want := []string{
+		"--target=x86_64-linux-gnu",
+		"-nostdinc",
+		"-fintegrated-as",
 		"-toolchain-keep",
+		"-toolchain-suffix",
 		"-DOBJECT_KEEP",
 		"@config-cflags.params",
-		"-toolchain-suffix",
 		"-c",
 		"source.c",
 		"-o",
@@ -219,9 +226,12 @@ done
 	}
 	got := strings.Split(strings.TrimSuffix(string(argvData), "\n"), "\n")
 	want := []string{
+		"--target=x86_64-linux-gnu",
+		"-nostdinc",
+		"-fintegrated-as",
 		"-toolchain-keep",
-		"-DOBJECT_KEEP",
 		"-toolchain-suffix",
+		"-DOBJECT_KEEP",
 		"-c",
 		source,
 		"-o",
