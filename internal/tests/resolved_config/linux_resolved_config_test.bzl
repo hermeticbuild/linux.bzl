@@ -86,6 +86,19 @@ def _c_config_test_impl(ctx):
                 _has_argument(resolved[0], value),
                 "config replay must preserve graph-profile identity environment %s" % value,
             )
+    kernel_flags = _actions_with_mnemonic(actions, "LinuxKernelCFlags")
+    asserts.equals(env, 1, len(kernel_flags))
+    if kernel_flags:
+        asserts.true(
+            env,
+            _has_argument(kernel_flags[0], "-version"),
+            "kernel flag generation must receive the source version",
+        )
+        asserts.true(
+            env,
+            _has_argument(kernel_flags[0], "6.18.2"),
+            "kernel flag generation must receive the exact source version",
+        )
     return analysistest.end(env)
 
 _c_config_test = analysistest.make(_c_config_test_impl)

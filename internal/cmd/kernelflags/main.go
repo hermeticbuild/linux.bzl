@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
@@ -85,12 +86,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := os.WriteFile(*outPath, []byte(responseFile(linuxCFlags(config, *arch))), 0o644); err != nil {
+	if err := os.WriteFile(*outPath, []byte(responseFile(linuxCFlags(config, *arch, *version))), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "write flags: %v\n", err)
 		os.Exit(1)
 	}
 	if *asmOutPath != "" {
-		if err := os.WriteFile(*asmOutPath, []byte(responseFile(linuxAFlags(config, *arch))), 0o644); err != nil {
+		if err := os.WriteFile(*asmOutPath, []byte(responseFile(linuxAFlags(config, *arch, *version))), 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "write assembler flags: %v\n", err)
 			os.Exit(1)
 		}
@@ -250,8 +251,8 @@ func materializeConfigPayload(outDir, id string, config map[string]string, arch,
 		filepath.Join(root, "include", "generated", "autoconf.h"):              autoconfText(config),
 		filepath.Join(root, "include", "generated", "integer-wrap.h"):          "",
 		filepath.Join(root, "include", "generated", "rustc_cfg"):               rustcConfigText(config),
-		filepath.Join(root, "include", "generated", "bazel_kbuild_aflags.rsp"): configFlagsResponse(config, arch, true),
-		filepath.Join(root, "include", "generated", "bazel_kbuild_cflags.rsp"): configFlagsResponse(config, arch, false),
+		filepath.Join(root, "include", "generated", "bazel_kbuild_aflags.rsp"): configFlagsResponse(config, arch, version, true),
+		filepath.Join(root, "include", "generated", "bazel_kbuild_cflags.rsp"): configFlagsResponse(config, arch, version, false),
 	}
 	paths := make([]string, 0, len(files))
 	for path := range files {
@@ -326,14 +327,14 @@ func sortedConfigKeys(config map[string]string) []string {
 	return keys
 }
 
-func configFlagsResponse(config map[string]string, arch string, assembly bool) string {
+func configFlagsResponse(config map[string]string, arch, version string, assembly bool) string {
 	if arch == "" {
 		return ""
 	}
 	if assembly {
-		return responseFile(linuxAFlags(config, arch))
+		return responseFile(linuxAFlags(config, arch, version))
 	}
-	return responseFile(linuxCFlags(config, arch))
+	return responseFile(linuxCFlags(config, arch, version))
 }
 
 func unquote(value string) string {
@@ -343,7 +344,7 @@ func unquote(value string) string {
 	return value
 }
 
-func linuxCFlags(config map[string]string, arch string) []string {
+func linuxCFlags(config map[string]string, arch, version string) []string {
 	flags := []string{
 		"-std=gnu11",
 		"-fshort-wchar",
@@ -439,7 +440,7 @@ func linuxCFlags(config map[string]string, arch string) []string {
 		flags = append(flags, "-fconserve-stack")
 	}
 	if arch == "x86" {
-		flags = append(flags, x86CFlags(config)...)
+		flags = append(flags, x86CFlags(config, version)...)
 	}
 	if arch == "arm64" {
 		flags = append(flags, arm64CFlags(config)...)
@@ -499,7 +500,7 @@ func debugInfoFlags(config map[string]string) []string {
 	return flags
 }
 
-func x86CFlags(config map[string]string) []string {
+func x86CFlags(config map[string]string, version string) []string {
 	flags := []string{
 		"-mno-sse",
 		"-mno-mmx",
@@ -529,24 +530,14 @@ func x86CFlags(config map[string]string) []string {
 		} else {
 			flags = append(flags, "-march=x86-64", "-mtune=generic")
 		}
-		if enabled(config, "CONFIG_STACKPROTECTOR") && enabled(config, "CONFIG_SMP") {
-			flags = append(flags,
-				"-mstack-protector-guard-reg=gs",
-				"-mstack-protector-guard-symbol=__ref_stack_chk_guard",
-			)
-		} else if enabled(config, "CONFIG_STACKPROTECTOR") {
-			flags = append(flags, "-mstack-protector-guard=global")
+		// Linux 6.15 converted the fixed %gs:40 canary into a normal
+		// per-CPU symbol and began overriding the compiler's guard location.
+		if kernelVersionAtLeast(version, 6, 15) {
+			flags = append(flags, x86StackProtectorGuardFlags(config, "gs")...)
 		}
 	} else {
 		flags = append(flags, "-m32", "-msoft-float", "-mregparm=3", "-freg-struct-return", "-fno-pic")
-		if enabled(config, "CONFIG_STACKPROTECTOR") && enabled(config, "CONFIG_SMP") {
-			flags = append(flags,
-				"-mstack-protector-guard-reg=fs",
-				"-mstack-protector-guard-symbol=__ref_stack_chk_guard",
-			)
-		} else if enabled(config, "CONFIG_STACKPROTECTOR") {
-			flags = append(flags, "-mstack-protector-guard=global")
-		}
+		flags = append(flags, x86StackProtectorGuardFlags(config, "fs")...)
 	}
 	flags = append(flags, "-Wno-sign-compare", "-fno-asynchronous-unwind-tables")
 	if enabled(config, "CONFIG_MITIGATION_RETPOLINE") {
@@ -571,12 +562,46 @@ func x86CFlags(config map[string]string) []string {
 	return flags
 }
 
-func linuxAFlags(config map[string]string, arch string) []string {
+func x86StackProtectorGuardFlags(config map[string]string, register string) []string {
+	if !enabled(config, "CONFIG_STACKPROTECTOR") {
+		return nil
+	}
+	if !enabled(config, "CONFIG_SMP") {
+		return []string{"-mstack-protector-guard=global"}
+	}
+	return []string{
+		"-mstack-protector-guard-reg=" + register,
+		"-mstack-protector-guard-symbol=__ref_stack_chk_guard",
+	}
+}
+
+func kernelVersionAtLeast(version string, wantMajor, wantMinor int) bool {
+	version = strings.TrimPrefix(version, "v")
+	majorText, rest, ok := strings.Cut(version, ".")
+	if !ok {
+		return false
+	}
+	minorEnd := 0
+	for minorEnd < len(rest) && rest[minorEnd] >= '0' && rest[minorEnd] <= '9' {
+		minorEnd++
+	}
+	if minorEnd == 0 {
+		return false
+	}
+	major, majorErr := strconv.Atoi(majorText)
+	minor, minorErr := strconv.Atoi(rest[:minorEnd])
+	if majorErr != nil || minorErr != nil {
+		return false
+	}
+	return major > wantMajor || (major == wantMajor && minor >= wantMinor)
+}
+
+func linuxAFlags(config map[string]string, arch, version string) []string {
 	switch arch {
 	case "arm64":
 		return append(arm64AFlags(config), debugInfoFlags(config)...)
 	case "x86":
-		return append(append(x86CFlags(config), ftraceUsingFlags(config)...), debugInfoFlags(config)...)
+		return append(append(x86CFlags(config, version), ftraceUsingFlags(config)...), debugInfoFlags(config)...)
 	default:
 		return nil
 	}

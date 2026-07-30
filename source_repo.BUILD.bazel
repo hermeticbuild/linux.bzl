@@ -36,6 +36,7 @@ filegroup(
         "arch/x86/xen/xen-head.S",
         "drivers/firmware/efi/libstub/**/*.c",
         "drivers/tty/vt/*_shipped",
+        "include/linux/decompress/mm.h",
         "include/linux/export-internal.h",
         "include/linux/hidden.h",
         "include/linux/license.h",

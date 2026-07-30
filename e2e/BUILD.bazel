@@ -103,6 +103,12 @@ select_file(
     subpath = "test_module.ko",
 )
 
+select_file(
+    name = "x86_decompress_mm_lookup",
+    srcs = "@e2e_linux_6_18_39//:source_tree_lookup_files",
+    subpath = "include/linux/decompress/mm.h",
+)
+
 initramfs(
     name = "initramfs_6_12_96_rust_module",
     character_devices = {
@@ -442,6 +448,7 @@ build_test(
         "@e2e_x86_64//:system_map",
         ":kernel_image_x86_64",
         ":kernel_vmlinux_x86_64",
+        ":x86_decompress_mm_lookup",
     ],
 )
 

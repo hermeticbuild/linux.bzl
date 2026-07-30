@@ -21,6 +21,8 @@ def _fragment_flags_action_test_impl(ctx):
         argv = actions[0].argv
         asserts.true(env, "-arch" in argv)
         asserts.true(env, "x86" in argv)
+        asserts.true(env, "-version" in argv)
+        asserts.true(env, "6.18.2" in argv)
         asserts.true(env, "-config" in argv)
         asserts.true(env, "-out" in argv)
         asserts.true(env, "-asm_out" in argv)
