@@ -4,7 +4,10 @@ package(default_visibility = ["//visibility:private"])
 
 go_library(
     name = "ccprofile_lib",
-    srcs = ["main.go"],
+    srcs = [
+        "main.go",
+        "nodes.go",
+    ],
     importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/ccprofile",
     deps = ["//internal/ccprofile"],
 )
@@ -17,7 +20,10 @@ go_binary(
 
 go_test(
     name = "ccprofile_test",
-    srcs = ["main_test.go"],
+    srcs = [
+        "main_test.go",
+        "nodes_test.go",
+    ],
     embed = [":ccprofile_lib"],
     deps = ["//internal/ccprofile"],
 )

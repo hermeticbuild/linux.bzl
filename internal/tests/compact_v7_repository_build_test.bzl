@@ -35,6 +35,10 @@ _DEBUG_SOURCE_GROUP_ID = "b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5
 _DEBUG_CONTENT_ID = "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6"
 _DEBUG_FAMILY_ID = "b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7"
 _SUPPORT_SOURCE_SET_ID = "b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8"
+_FLAG_TERMINAL_ID = "b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9"
+_REMOVE_TERMINAL_ID = "babebabebabebabebabebabebabebabebabebabebabebabebabebabebabebabe"
+_FLAG_PROGRAM_ID = "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc"
+_REMOVE_PROGRAM_ID = "bdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbd"
 
 def _source(index, path):
     return struct(index = index, path = path)
@@ -48,10 +52,15 @@ def _source_group(group_id, files, primary):
         source_files = files,
     )
 
-def _program(argv = ["-O2"]):
+def _program(
+        argv = ["-O2"],
+        program_id = _FLAG_PROGRAM_ID,
+        root = _FLAG_TERMINAL_ID):
     return struct(
         argv = argv,
         effects = ["argv"],
+        id = program_id,
+        root = root,
     )
 
 def _recipe(
@@ -61,8 +70,15 @@ def _recipe(
         mode = "y",
         module_root = False,
         objtool_disabled = True):
+    flag_program = _program()
+    remove_flag_program = _program(
+        argv = [],
+        program_id = _REMOVE_PROGRAM_ID,
+        root = _REMOVE_TERMINAL_ID,
+    )
     return struct(
-        flag_program = _program(),
+        flag_program = flag_program,
+        flag_program_id = flag_program.id,
         id = recipe_id,
         kind = kind,
         language = language,
@@ -72,7 +88,8 @@ def _recipe(
         objtool_args = [],
         objtool_disabled = objtool_disabled,
         objtool_force = False,
-        remove_flag_program = _program(argv = []),
+        remove_flag_program = remove_flag_program,
+        remove_flag_program_id = remove_flag_program.id,
     )
 
 def _environment(payload, families = [], environment_id = _ENVIRONMENT_ID):
@@ -263,7 +280,17 @@ def _x86_model(
         compile_environments = {_ENVIRONMENT_ID: environment},
         config_payloads = {_PAYLOAD_ID: payload},
         configs = configs,
+        flag_nodes = {},
+        flag_programs = {
+            _FLAG_PROGRAM_ID: direct_recipe.flag_program,
+            _REMOVE_PROGRAM_ID: direct_recipe.remove_flag_program,
+        },
+        flag_terminals = {
+            _FLAG_TERMINAL_ID: struct(argv = ["-O2"]),
+            _REMOVE_TERMINAL_ID: struct(argv = []),
+        },
         generated_header_families = {},
+        kbuild_probes = {},
         object_variants = {obj.target: obj for obj in objects},
         recipe_groups = recipe_groups,
         source_files = source_files,
@@ -345,7 +372,17 @@ def _arm64_model():
         compile_environments = {_ENVIRONMENT_ID: environment},
         config_payloads = {_PAYLOAD_ID: payload},
         configs = {"base": config},
+        flag_nodes = {},
+        flag_programs = {
+            _FLAG_PROGRAM_ID: member_recipe.flag_program,
+            _REMOVE_PROGRAM_ID: member_recipe.remove_flag_program,
+        },
+        flag_terminals = {
+            _FLAG_TERMINAL_ID: struct(argv = ["-O2"]),
+            _REMOVE_TERMINAL_ID: struct(argv = []),
+        },
         generated_header_families = {_FAMILY_ID: family},
+        kbuild_probes = {},
         object_variants = {obj.target: obj for obj in objects},
         recipe_groups = {
             _DIRECT_GROUP_ID: _recipe_group(
@@ -482,10 +519,20 @@ def _partitioned_x86_model():
             _DEBUG_PAYLOAD_ID: debug_payload,
         },
         configs = configs,
+        flag_nodes = {},
+        flag_programs = {
+            _FLAG_PROGRAM_ID: recipe.flag_program,
+            _REMOVE_PROGRAM_ID: recipe.remove_flag_program,
+        },
+        flag_terminals = {
+            _FLAG_TERMINAL_ID: struct(argv = ["-O2"]),
+            _REMOVE_TERMINAL_ID: struct(argv = []),
+        },
         generated_header_families = {
             _FAMILY_ID: shared_family,
             _DEBUG_FAMILY_ID: debug_family,
         },
+        kbuild_probes = {},
         object_variants = {
             base.target: base,
             debug.target: debug,
@@ -515,7 +562,7 @@ def _emit(model, arch, source_objtool = "", source_objcopy = ""):
         rules_repo = "@linux_bzl",
         source_label_package = "@linux//",
         source_root_label = "@linux//:Kconfig",
-        cc_profile = "//:_cc_profile",
+        graph_profile = "//:_graph_profile",
         version = "6.18.2",
         source_objcopy = source_objcopy,
         source_objtool = source_objtool,
@@ -550,7 +597,7 @@ def _split_fallback_test_impl(ctx):
     asserts.true(env, "linux_object_action_group(" in result.build_file)
     asserts.true(
         env,
-        'exports_files(["metadata.json"], visibility = ["//visibility:public"])' in result.build_file,
+        'exports_files(["graph_profile_projection.json", "metadata.json"], visibility = ["//visibility:public"])' in result.build_file,
     )
     asserts.true(env, "linux_object(" in result.build_file)
     asserts.true(env, "linux_object_action_group_import(" in result.build_file)

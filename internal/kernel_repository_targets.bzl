@@ -1,7 +1,7 @@
 """Private target graph emitted by linux_image."""
 
 load(":architectures.bzl", "linux_architectures")
-load(":cc_profile.bzl", "linux_cc_profile_context")
+load(":graph_profile.bzl", "linux_graph_profile_context")
 load(":kernel_bundle.bzl", "linux_kernel_bundle", "linux_kernel_exports")
 load(":linux_modules.bzl", "linux_module_sdk")
 load(":linux_objects.bzl", "linux_compressed_image", "linux_resolved_config", "linux_vmlinux")
@@ -22,16 +22,11 @@ def _architecture(config_name):
 def _source_label(source_repo, path):
     return "%s//:%s" % (source_repo, path)
 
-def _core_source_tree_inputs(source_repo, exact_sources, legacy_source_compat):
-    inputs = [
+def _core_source_tree_inputs(source_repo, exact_sources):
+    return [
         exact_sources,
         _source_label(source_repo, "source_tree_lookup_files"),
     ]
-
-    # compact-v6 cannot describe config-level final-action header closures.
-    if legacy_source_compat:
-        inputs.append(_source_label(source_repo, "headers"))
-    return inputs
 
 def _module_source_tree_inputs(source_repo):
     return [
@@ -234,7 +229,9 @@ def linux_image_targets(
         platform,
         base_config,
         base_rust_enabled,
-        cc_profile,
+        graph_projection,
+        graph_validation_sources,
+        kbuild_linker,
         graph_image,
         graph_modules,
         graph_sources,
@@ -250,13 +247,10 @@ def linux_image_targets(
         variant_header_family_ids,
         variant_header_configs,
         variant_rust_enabled,
-        config_mode,
-        legacy_source_compat = False):
+        config_mode):
     """Defines private kernel graphs and the base stable exports."""
     if type(base_rust_enabled) != "bool":
         fail("base_rust_enabled must be a bool")
-    if type(legacy_source_compat) != "bool":
-        fail("legacy_source_compat must be a bool")
     if type(rust_profile_json) != "string":
         fail("rust_profile_json must be a string")
     if (base_rust_enabled or True in variant_rust_enabled.values()) and not rust_profile_json:
@@ -298,12 +292,14 @@ def linux_image_targets(
     base_source_tree = _core_source_tree_inputs(
         source_repo,
         graph_sources,
-        legacy_source_compat,
     )
-    linux_cc_profile_context(
-        name = "_cc_profile",
+    linux_graph_profile_context(
+        name = "_graph_profile",
         arch = arch,
-        profile = cc_profile,
+        graph_projection = graph_projection,
+        kbuild_linker = kbuild_linker,
+        source_root = _source_label(source_repo, "Kconfig"),
+        srcs = graph_validation_sources,
         target_compatible_with = [descriptor.platform],
         visibility = internal_visibility,
     )
@@ -415,7 +411,6 @@ def linux_image_targets(
         variant_source_tree = _core_source_tree_inputs(
             source_repo,
             variant_graph_sources[variant],
-            legacy_source_compat,
         )
         header_config = variant_header_configs[variant]
         if header_config == variant:

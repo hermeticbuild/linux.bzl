@@ -447,57 +447,6 @@ func DecodeCompilerIdentity(data []byte) (CompilerIdentity, error) {
 	return identity, nil
 }
 
-func ValidateProfileIdentity(expected Profile, actual CompilerIdentity) error {
-	if err := Validate(expected); err != nil {
-		return err
-	}
-	if err := ValidateCompilerIdentity(actual); err != nil {
-		return err
-	}
-	if expected.Architecture != actual.Architecture {
-		return fmt.Errorf("architecture mismatch: expected %q, got %q", expected.Architecture, actual.Architecture)
-	}
-	if expected.DriverContract != actual.DriverContract {
-		return fmt.Errorf("driver_contract mismatch: expected %q, got %q", expected.DriverContract, actual.DriverContract)
-	}
-	if !analysisIdentityEqual(expected.AnalysisIdentity, actual.AnalysisIdentity) {
-		return fmt.Errorf(
-			"analysis_identity mismatch: expected %#v, got %#v",
-			expected.AnalysisIdentity,
-			actual.AnalysisIdentity,
-		)
-	}
-	if expected.KconfigIdentity.CCName != actual.CCName {
-		return fmt.Errorf("cc_name mismatch: expected %q, got %q", expected.KconfigIdentity.CCName, actual.CCName)
-	}
-	if expected.KconfigIdentity.CCVersion != actual.CCVersion {
-		return fmt.Errorf("cc_version mismatch: expected %d, got %d", expected.KconfigIdentity.CCVersion, actual.CCVersion)
-	}
-	if expected.KconfigIdentity.CCVersionText != actual.CCVersionText {
-		return fmt.Errorf(
-			"cc_version_text mismatch: expected %q, got %q",
-			expected.KconfigIdentity.CCVersionText,
-			actual.CCVersionText,
-		)
-	}
-	macroNames := make([]string, 0, len(expected.KconfigIdentity.BuiltinMacros))
-	for name := range expected.KconfigIdentity.BuiltinMacros {
-		macroNames = append(macroNames, name)
-	}
-	sort.Strings(macroNames)
-	for _, name := range macroNames {
-		expectedValue := expected.KconfigIdentity.BuiltinMacros[name]
-		actualValue, ok := actual.BuiltinMacros[name]
-		if !ok {
-			return fmt.Errorf("builtin macro %s is missing", name)
-		}
-		if actualValue != expectedValue {
-			return fmt.Errorf("builtin macro %s mismatch: expected %q, got %q", name, expectedValue, actualValue)
-		}
-	}
-	return nil
-}
-
 func CompilerIdentityDigest(identity CompilerIdentity) (string, error) {
 	data, err := CanonicalCompilerIdentityJSON(identity)
 	if err != nil {

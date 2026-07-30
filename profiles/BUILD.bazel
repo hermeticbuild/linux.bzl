@@ -3,26 +3,20 @@ load("@rules_go//go:def.bzl", "go_test")
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
-    "llvm_22_1_8_aarch64.requests.json",
-    "llvm_22_1_8_aarch64.json",
-    "llvm_22_1_8_x86_64.requests.json",
-    "llvm_22_1_8_x86_64.json",
+    "llvm_22_1_8_aarch64.graph.json",
+    "llvm_22_1_8_x86_64.graph.json",
 ])
 
 go_test(
     name = "profiles_test",
     srcs = ["profiles_test.go"],
     args = [
-        "$(rlocationpath :llvm_22_1_8_x86_64.json)",
-        "$(rlocationpath :llvm_22_1_8_x86_64.requests.json)",
-        "$(rlocationpath :llvm_22_1_8_aarch64.json)",
-        "$(rlocationpath :llvm_22_1_8_aarch64.requests.json)",
+        "$(rlocationpath :llvm_22_1_8_x86_64.graph.json)",
+        "$(rlocationpath :llvm_22_1_8_aarch64.graph.json)",
     ],
     data = [
-        ":llvm_22_1_8_aarch64.json",
-        ":llvm_22_1_8_aarch64.requests.json",
-        ":llvm_22_1_8_x86_64.json",
-        ":llvm_22_1_8_x86_64.requests.json",
+        ":llvm_22_1_8_aarch64.graph.json",
+        ":llvm_22_1_8_x86_64.graph.json",
     ],
     deps = [
         "//internal/ccprofile",

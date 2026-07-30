@@ -3,6 +3,7 @@ package kconfig
 import (
 	"encoding/json"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -116,11 +117,12 @@ func TestCompactV7DecisionProgramValidation(t *testing.T) {
 	}
 	probe.ID = compactV7ProbeContentID(probe)
 	node := CompactKbuildFlagNode{
+		Kind:      "select",
 		Probe:     probe.ID,
 		WhenTrue:  whenTrue.ID,
 		WhenFalse: whenFalse.ID,
 	}
-	node.ID = compactV7FlagNodeContentID(node.Probe, node.WhenTrue, node.WhenFalse)
+	node.ID = compactV7FlagSelectContentID(node.Probe, node.WhenTrue, node.WhenFalse)
 	effects := []string{compactV7EffectArgv, compactV7EffectInput}
 	program := CompactKbuildFlagProgram{
 		Root:    node.ID,
@@ -148,7 +150,7 @@ func TestCompactV7DecisionProgramValidation(t *testing.T) {
 	}
 
 	metadata.FlagNodes[0].WhenFalse = metadata.FlagNodes[0].WhenTrue
-	metadata.FlagNodes[0].ID = compactV7FlagNodeContentID(
+	metadata.FlagNodes[0].ID = compactV7FlagSelectContentID(
 		metadata.FlagNodes[0].Probe,
 		metadata.FlagNodes[0].WhenTrue,
 		metadata.FlagNodes[0].WhenFalse,
@@ -156,6 +158,123 @@ func TestCompactV7DecisionProgramValidation(t *testing.T) {
 	if _, err := metadata.validateCompactV7Programs(); err == nil ||
 		!strings.Contains(err.Error(), "not reduced") {
 		t.Fatalf("validateCompactV7Programs() error = %v, want reduction error", err)
+	}
+}
+
+func TestCompactV7SymbolicKbuildProbesPreserveContextAndInputUnion(t *testing.T) {
+	tree := mustParseString(t, "mainmenu \"symbolic Kbuild flags\"\n")
+	sourceRoot := t.TempDir()
+	for _, path := range []string{
+		"main.c",
+		"candidate.h",
+		"fallback-one.h",
+		"fallback-two.h",
+	} {
+		mustWriteSource(t, sourceRoot, path, "int value;\n")
+	}
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+
+	kb, err := parseKbuildWithOptions(
+		strings.NewReader(`
+obj-y += main.o
+KBUILD_CFLAGS := -DPROBE_CONTEXT=one
+ccflags-y += $(call cc-option,-include $(srctree)/candidate.h,-include $(srctree)/fallback-one.h)
+KBUILD_CFLAGS := -DPROBE_CONTEXT=two
+ccflags-y += $(call cc-option,-include $(srctree)/candidate.h,-include $(srctree)/fallback-two.h)
+`),
+		"Kbuild",
+		KbuildOptions{Variables: map[string]string{
+			"SRCARCH": "x86",
+			"srctree": sourceRoot,
+		}},
+		sourceRoot,
+	)
+	if err != nil {
+		t.Fatalf("parseKbuildWithOptions() failed: %v", err)
+	}
+	metadata, err := tree.CompactMetadataBatchV7WithOptions(
+		[]NamedConfig{{Name: "base"}},
+		CompactMetadataV7Options{
+			CompactMetadataOptions: CompactMetadataOptions{
+				SourceRoot:            sourceRoot,
+				Srcarch:               "x86",
+				CompileEnvironmentABI: "linux.bzl/compact-v7/test",
+			},
+			ToolchainProfileID: "llvm-test/x86",
+		},
+		func(config *ResolvedConfig) (CompactConfigGraph, error) {
+			return CompactConfigGraph{
+				Kbuild:                kb,
+				GeneratedHeadersLabel: "//headers:" + config.Name,
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("CompactMetadataBatchV7WithOptions() failed: %v", err)
+	}
+	if got, want := len(metadata.KbuildProbes), 2; got != want {
+		t.Fatalf("Kbuild probe count = %d, want %d: %#v", got, want, metadata.KbuildProbes)
+	}
+	first, second := metadata.KbuildProbes[0], metadata.KbuildProbes[1]
+	if !reflect.DeepEqual(first.CandidateArgv, second.CandidateArgv) {
+		t.Fatalf(
+			"same candidate changed across contexts: %v/%v",
+			first.CandidateArgv,
+			second.CandidateArgv,
+		)
+	}
+	if first.ContextProgram == second.ContextProgram || first.ID == second.ID {
+		t.Fatalf(
+			"context-sensitive probes collapsed: contexts=%s/%s ids=%s/%s",
+			first.ContextProgram,
+			second.ContextProgram,
+			first.ID,
+			second.ID,
+		)
+	}
+	selectIDs := map[string]bool{}
+	for _, node := range metadata.FlagNodes {
+		if node.Kind == "select" {
+			selectIDs[node.ID] = true
+		}
+	}
+	if got, want := len(selectIDs), 2; got != want {
+		t.Fatalf("select node count = %d, want %d: %#v", got, want, metadata.FlagNodes)
+	}
+
+	object := compactV7SingleObject(
+		t,
+		compactV7ObjectsByName(metadata.ObjectVariants),
+		"main.o",
+	)
+	recipe := compactV7RecipeByID(metadata, object.Recipe)
+	program := compactV7ProgramByID(metadata, recipe.FlagProgram)
+	if !slices.Contains(program.Effects, compactV7EffectInput) {
+		t.Fatalf("symbolic flag program effects = %v, want input", program.Effects)
+	}
+	sourceSet := ""
+	for _, group := range metadata.ActionSourceGroups {
+		if group.ID == object.ActionSourceGroup {
+			sourceSet = group.SourceSet
+			break
+		}
+	}
+	if sourceSet == "" {
+		t.Fatalf("object action source group %s is missing", object.ActionSourceGroup)
+	}
+	files := compactV7ExpandedSetForTest(t, metadata, sourceSet)
+	paths := map[string]bool{}
+	for index := range files {
+		paths[metadata.SourceFiles[index-1].Path] = true
+	}
+	for _, path := range []string{
+		"candidate.h",
+		"fallback-one.h",
+		"fallback-two.h",
+	} {
+		if !paths[path] {
+			t.Errorf("symbolic source input union omits %q: %v", path, paths)
+		}
 	}
 }
 
@@ -270,7 +389,7 @@ CFLAGS_first.o += -DFIRST
 		}, nil
 	}
 
-	v6Before, err := tree.CompactMetadataBatchWithOptions(
+	eagerBefore, err := tree.CompactMetadataBatchWithOptions(
 		configs,
 		opts.CompactMetadataOptions,
 		graphForConfig,
@@ -278,15 +397,15 @@ CFLAGS_first.o += -DFIRST
 	if err != nil {
 		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
 	}
-	v6BeforeJSON, err := v6Before.JSON()
+	eagerBeforeJSON, err := eagerBefore.JSON()
 	if err != nil {
-		t.Fatalf("v6 JSON() failed: %v", err)
+		t.Fatalf("eager metadata JSON() failed: %v", err)
 	}
 	metadata, err := tree.CompactMetadataBatchV7WithOptions(configs, opts, graphForConfig)
 	if err != nil {
 		t.Fatalf("CompactMetadataBatchV7WithOptions() failed: %v", err)
 	}
-	v6After, err := tree.CompactMetadataBatchWithOptions(
+	eagerAfter, err := tree.CompactMetadataBatchWithOptions(
 		configs,
 		opts.CompactMetadataOptions,
 		graphForConfig,
@@ -294,18 +413,18 @@ CFLAGS_first.o += -DFIRST
 	if err != nil {
 		t.Fatalf("second CompactMetadataBatchWithOptions() failed: %v", err)
 	}
-	v6AfterJSON, err := v6After.JSON()
+	eagerAfterJSON, err := eagerAfter.JSON()
 	if err != nil {
-		t.Fatalf("second v6 JSON() failed: %v", err)
+		t.Fatalf("second eager metadata JSON() failed: %v", err)
 	}
-	if !reflect.DeepEqual(v6BeforeJSON, v6AfterJSON) {
-		t.Fatal("compact-v7 conversion changed compact-v6 output")
+	if !reflect.DeepEqual(eagerBeforeJSON, eagerAfterJSON) {
+		t.Fatal("compact-v7 conversion mutated eager metadata")
 	}
 	v7Families := make(map[string]bool, len(metadata.GeneratedHeaderFamilies))
 	for _, family := range metadata.GeneratedHeaderFamilies {
 		v7Families[family.ID] = true
 	}
-	for _, family := range v6Before.GeneratedHeaderFamilies {
+	for _, family := range eagerBefore.GeneratedHeaderFamilies {
 		if !v7Families[family.ID] {
 			t.Fatalf("compact-v7 pruned generated-header family %s (%s)", family.Name, family.ID)
 		}
@@ -386,9 +505,9 @@ CFLAGS_first.o += -DFIRST
 	if got, want := terminal.Argv, []string{"-Wall", "-O2"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("common flags = %v, want %v", got, want)
 	}
-	if len(metadata.KbuildProbes) != 0 || len(metadata.FlagNodes) != 0 {
+	if len(metadata.KbuildProbes) != 0 {
 		t.Fatalf(
-			"v6 bridge emitted symbolic probes/nodes: probes=%v nodes=%v",
+			"probe-free Kbuild emitted symbolic probes: probes=%v nodes=%v",
 			metadata.KbuildProbes,
 			metadata.FlagNodes,
 		)

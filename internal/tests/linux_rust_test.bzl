@@ -717,11 +717,13 @@ def _repository_protocol_test_impl(ctx):
             "all": "1111111111111111111111111111111111111111111111111111111111111111",
         },
         base_rust_enabled = False,
-        cc_profile = "@@linux_profiles//:x86_64.json",
         config_mode = "default",
         graph_image = "//graph:x86_64_image",
         graph_modules = "//partitions:x86_64_modules",
+        graph_projection = "//graph:graph_profile_projection.json",
         graph_sources = "//sources:x86_64_core",
+        graph_validation_sources = ["@@linux_sources//:scripts/cc-version.sh"],
+        kbuild_linker = "@@llvm//tools:ld.lld",
         variant_configs = {"rust": "//configs:rust"},
         variant_core_configs = {"rust": "rust"},
         variant_graph_images = {"rust": "//graph:rust_image"},
@@ -737,18 +739,16 @@ def _repository_protocol_test_impl(ctx):
         variant_header_configs = {"rust": "rust"},
         variant_rust_enabled = {"rust": True},
         rules_repo = "@@linux_bzl",
-        legacy_source_compat = True,
     )
 
     asserts.equals(
         env,
-        "compact-v6-content-graph",
+        "compact-v7-lazy-action-graph",
         repositories_test_helpers.generator_protocol,
     )
     asserts.true(env, "rust_profile_json = " in generated)
     asserts.true(env, 'minimum_rustc_version = "1.78.0",' in generated)
     asserts.true(env, "base_rust_enabled = False," in generated)
-    asserts.true(env, "legacy_source_compat = True," in generated)
     asserts.true(
         env,
         'base_header_family_dependencies = {\n        "all": {},\n    },' in generated,

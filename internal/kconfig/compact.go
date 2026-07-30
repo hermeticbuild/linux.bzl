@@ -78,6 +78,8 @@ type CompactObjectVariant struct {
 	ModName                  string   `json:"modname,omitempty"`
 	Flags                    []string `json:"flags,omitempty"`
 	RemoveFlags              []string `json:"remove_flags,omitempty"`
+	flagProgram              *kbuildFlagExpr
+	removeFlagProgram        *kbuildFlagExpr
 	ObjtoolArgs              []string `json:"objtool_args,omitempty"`
 	ObjtoolDisabled          bool     `json:"objtool_disabled,omitempty"`
 	ObjtoolForce             bool     `json:"objtool_force,omitempty"`
@@ -610,7 +612,7 @@ func cleanKbuildDir(dir string) string {
 }
 
 func (v CompactObjectVariant) equal(other CompactObjectVariant) bool {
-	if v.Target != other.Target || v.ContentID != other.ContentID || v.CompileEnvironment != other.CompileEnvironment || v.Object != other.Object || v.Source != other.Source || v.SourceInputGroup != other.SourceInputGroup || v.Mode != other.Mode || v.ModuleRoot != other.ModuleRoot || v.ModName != other.ModName || v.ObjtoolDisabled != other.ObjtoolDisabled || v.ObjtoolForce != other.ObjtoolForce || len(v.sourceInputs) != len(other.sourceInputs) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ObjtoolArgs) != len(other.ObjtoolArgs) || len(v.configFragment) != len(other.configFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
+	if v.Target != other.Target || v.ContentID != other.ContentID || v.CompileEnvironment != other.CompileEnvironment || v.Object != other.Object || v.Source != other.Source || v.SourceInputGroup != other.SourceInputGroup || v.Mode != other.Mode || v.ModuleRoot != other.ModuleRoot || v.ModName != other.ModName || v.ObjtoolDisabled != other.ObjtoolDisabled || v.ObjtoolForce != other.ObjtoolForce || kbuildFlagExpressionID(v.flagProgram) != kbuildFlagExpressionID(other.flagProgram) || kbuildFlagExpressionID(v.removeFlagProgram) != kbuildFlagExpressionID(other.removeFlagProgram) || len(v.sourceInputs) != len(other.sourceInputs) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ObjtoolArgs) != len(other.ObjtoolArgs) || len(v.configFragment) != len(other.configFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
 		return false
 	}
 	for i := range v.sourceInputs {
@@ -757,6 +759,7 @@ type resolvedKbuildObject struct {
 type resolvedKbuildFlag struct {
 	language string
 	values   []string
+	program  *kbuildFlagExpr
 }
 
 type resolvedKbuildObjects struct {
@@ -861,6 +864,7 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 			object.flags = append(object.flags, resolvedKbuildFlag{
 				language: flag.Language,
 				values:   append([]string(nil), flag.Flags...),
+				program:  flag.program,
 			})
 			for _, value := range flag.Flags {
 				for _, ref := range configRefs(value) {
@@ -884,6 +888,7 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 			object.remove = append(object.remove, resolvedKbuildFlag{
 				language: flag.Language,
 				values:   append([]string(nil), flag.Flags...),
+				program:  flag.program,
 			})
 			for _, value := range flag.Flags {
 				for _, ref := range configRefs(value) {
@@ -1384,7 +1389,19 @@ func (memo compactVariantMemo) variantForStack(
 	forceAllGeneratedHeaders := false
 	if source != "" {
 		flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(object.flags, source), opts.SourceRoot)
-		includeDirs, err := includeDirsFromFlags(flags, source)
+		flagProgram := filterResolvedKbuildFlagExpression(object.flags, source)
+		flagProgram = mapKbuildFlagExpression(flagProgram, func(argv []string) []string {
+			return normalizeSourceRootFlags(argv, opts.SourceRoot)
+		})
+		scanFlags, err := appendKbuildFlagExpressionSourceInputs(flags, flagProgram)
+		if err != nil {
+			return CompactObjectVariant{}, fmt.Errorf(
+				"model symbolic source input flags for %s: %w",
+				name,
+				err,
+			)
+		}
+		includeDirs, err := includeDirsFromFlags(scanFlags, source)
 		if err != nil {
 			return CompactObjectVariant{}, fmt.Errorf(
 				"model source include flags for %s: %w",
@@ -1392,7 +1409,7 @@ func (memo compactVariantMemo) variantForStack(
 				err,
 			)
 		}
-		actionIncludeSearch, err := scanner.actionIncludeSearch(source, flags)
+		actionIncludeSearch, err := scanner.actionIncludeSearch(source, scanFlags)
 		if err != nil {
 			return CompactObjectVariant{}, fmt.Errorf(
 				"model source include search for %s: %w",
@@ -1400,7 +1417,7 @@ func (memo compactVariantMemo) variantForStack(
 				err,
 			)
 		}
-		forcedSources, err := forcedSourceInputs(flags, source, name)
+		forcedSources, err := forcedSourceInputs(scanFlags, source, name)
 		if err != nil {
 			return CompactObjectVariant{}, fmt.Errorf(
 				"model forced source inputs for %s: %w",
@@ -1408,7 +1425,7 @@ func (memo compactVariantMemo) variantForStack(
 				err,
 			)
 		}
-		actionFootprint := compactObjectActionFootprintForObject(name, flags)
+		actionFootprint := compactObjectActionFootprintForObject(name, scanFlags)
 		if opts.Srcarch == "x86" && !object.objtoolDisabled {
 			actionFootprint.configSymbols = appendUniqueStrings(
 				actionFootprint.configSymbols,
@@ -1990,6 +2007,15 @@ func (o resolvedKbuildObject) variant(
 	}
 	flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.flags, source), sourceRoot)
 	remove := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.remove, source), sourceRoot)
+	flagProgram := filterResolvedKbuildFlagExpression(o.flags, source)
+	removeFlagProgram := filterResolvedKbuildFlagExpression(o.remove, source)
+	normalizeProgram := func(expression *kbuildFlagExpr) *kbuildFlagExpr {
+		return mapKbuildFlagExpression(expression, func(argv []string) []string {
+			return normalizeSourceRootFlags(argv, sourceRoot)
+		})
+	}
+	flagProgram = normalizeProgram(flagProgram)
+	removeFlagProgram = normalizeProgram(removeFlagProgram)
 	modname := o.modname
 	moduleRoot := o.root && o.mode == "m"
 	compileComposite := isArm64NvheObject(o.object)
@@ -1997,6 +2023,8 @@ func (o resolvedKbuildObject) variant(
 		modname = ""
 		flags = nil
 		remove = nil
+		flagProgram = nil
+		removeFlagProgram = nil
 		deps = nil
 		depContentIDs = nil
 		if !compileComposite {
@@ -2046,6 +2074,8 @@ func (o resolvedKbuildObject) variant(
 		ModName:            modname,
 		Flags:              flags,
 		RemoveFlags:        remove,
+		flagProgram:        flagProgram,
+		removeFlagProgram:  removeFlagProgram,
 		ObjtoolArgs:        append([]string(nil), o.objtoolArgs...),
 		ObjtoolDisabled:    o.objtoolDisabled,
 		ObjtoolForce:       o.objtoolForce,
@@ -2123,6 +2153,25 @@ func filterResolvedKbuildFlags(groups []resolvedKbuildFlag, source string) []str
 		out = append(out, group.values...)
 	}
 	return out
+}
+
+func filterResolvedKbuildFlagExpression(
+	groups []resolvedKbuildFlag,
+	source string,
+) *kbuildFlagExpr {
+	interner := newKbuildFlagExprInterner()
+	parts := make([]*kbuildFlagExpr, 0, len(groups))
+	for _, group := range groups {
+		if !kbuildFlagLanguageMatchesSource(group.language, source) {
+			continue
+		}
+		if group.program != nil {
+			parts = append(parts, group.program)
+		} else {
+			parts = append(parts, interner.literal(group.values))
+		}
+	}
+	return interner.concat(parts...)
 }
 
 func kbuildFlagLanguageMatchesSource(language string, source string) bool {

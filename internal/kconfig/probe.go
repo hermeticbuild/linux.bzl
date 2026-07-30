@@ -6,8 +6,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-
-	"github.com/hermeticbuild/linux.bzl/internal/ccprofile"
 )
 
 const LinuxProbeModelLLVM = "linux_llvm"
@@ -79,31 +77,6 @@ func LinuxProbeConfigForModel(model string) (LinuxProbeConfig, error) {
 	default:
 		return LinuxProbeConfig{}, fmt.Errorf("unknown Linux probe model %q", model)
 	}
-}
-
-// ApplyLinuxProbeCCProfile makes the checked-in compiler profile authoritative
-// for Kconfig's compiler, assembler, linker, and link-capability probes.
-func ApplyLinuxProbeCCProfile(config *LinuxProbeConfig, profile ccprofile.Profile) error {
-	if config == nil {
-		return fmt.Errorf("apply Linux probe CC profile to nil config")
-	}
-	if err := ccprofile.Validate(profile); err != nil {
-		return fmt.Errorf("validate Linux probe CC profile: %w", err)
-	}
-	identity := profile.KconfigIdentity
-	config.CCName = identity.CCName
-	config.CCVersion = identity.CCVersion
-	config.CCVersionText = identity.CCVersionText
-	config.ASName = identity.ASName
-	config.ASVersion = identity.ASVersion
-	config.LDName = identity.LDName
-	config.LDVersion = identity.LDVersion
-	config.CanLink = identity.CanLink
-	config.CCBuiltinMacros = make(map[string]string, len(identity.BuiltinMacros))
-	for name, value := range identity.BuiltinMacros {
-		config.CCBuiltinMacros[name] = value
-	}
-	return nil
 }
 
 // LinuxProbeShellFromConfig returns a shell hook backed by explicit probe

@@ -18,8 +18,9 @@ linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
 linux_images.image(
     name = "fixture_kernel",
     arch = "x86_64",
-    cc_profile = "//:cc_profile.json",
     config = "//:base.config",
+    graph_profile = "//:graph_profile.json",
+    kbuild_linker = "//:Kconfig",
     platform = "//:platform",
     source = "//:Kconfig",
 )

@@ -1,0 +1,11 @@
+{
+  "schema": "linux.bzl/toolchain-graph-profile-v1",
+  "architecture": "x86_64",
+  "driver_contract": "gnu-cc-response-v1",
+  "analysis_identity": {
+    "compiler": "clang",
+    "target_gnu_system_name": "x86_64-unknown-linux-gnu"
+  },
+  "kconfig_commands": [],
+  "kbuild_graph_probes": []
+}

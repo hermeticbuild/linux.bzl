@@ -2,13 +2,13 @@
 
 load(
     "@rules_cc//cc:action_names.bzl",
-    "CPP_LINK_EXECUTABLE_ACTION_NAME",
     "CPP_LINK_STATIC_LIBRARY_ACTION_NAME",
     "C_COMPILE_ACTION_NAME",
 )
 load("@rules_cc//cc:find_cc_toolchain.bzl", "CC_TOOLCHAIN_TYPE", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
-load(":cc_profile.bzl", "LinuxCcProfileInfo")
+load(":flag_programs.bzl", "LinuxFlagProgramsInfo")
+load(":graph_profile.bzl", "LinuxGraphProfileInfo")
 load(
     ":linux_objects.bzl",
     "LinuxCompileEnvironmentIndexInfo",
@@ -18,6 +18,7 @@ load(
 )
 load(
     ":path_mapping.bzl",
+    "add_directory_arg",
     "add_mapped_values",
     "directory_anchor",
     "path_mapped_run",
@@ -58,19 +59,6 @@ _EFFECT_ORDER = [
     "input",
     "output",
     "graph",
-]
-
-_KNOWN_EMPTY_MAKE_REFS = [
-    "CC_FLAGS_CFI",
-    "CC_FLAGS_FTRACE",
-    "CC_FLAGS_LTO",
-    "CC_FLAGS_SCS",
-    "CLANG_FLAGS",
-    "DISABLE_KSTACK_ERASE",
-    "DISABLE_LATENT_ENTROPY_PLUGIN",
-    "DISABLE_STACKLEAK_PLUGIN",
-    "RANDSTRUCT_CFLAGS",
-    "cflags-nogcse-yy",
 ]
 
 _SPECIAL_DIRECT_OBJECTS = [
@@ -396,34 +384,6 @@ def _object_name_flags(object_path, modname):
         "-DKBUILD_MODFILE=\"%s\"" % modfile,
     ]
 
-def _replace_make_refs(value, replacements, object_path):
-    for key in sorted(replacements.keys()):
-        value = value.replace("$(%s)" % key, replacements[key])
-        value = value.replace("${%s}" % key, replacements[key])
-    if "$(" in value or "${" in value:
-        fail("unresolved Kbuild Make reference in flags for %s: %s" % (object_path, value))
-    return value
-
-def _expanded_recipe_flags(values, config_values, source_root, source, object_path):
-    replacements = dict(config_values)
-    replacements.update({
-        "src": source.dirname,
-        "srctree": source_root.dirname,
-    })
-    for key in _KNOWN_EMPTY_MAKE_REFS:
-        replacements[key] = ""
-    out = []
-    for value in values:
-        if "$(obj)" in value or "${obj}" in value or "utsversion-tmp.h" in value:
-            fail(
-                "direct action group object %s needs an object-local generated directory for flag %r" %
-                (object_path, value),
-            )
-        expanded = _replace_make_refs(value, replacements, object_path)
-        if expanded:
-            out.append(expanded)
-    return out
-
 def _generated_include_groups(include_dirs, srcarch):
     groups = struct(
         arch = [],
@@ -522,27 +482,6 @@ def _required_preinclude_paths(language):
     if language == "c":
         paths.append("include/linux/compiler_types.h")
     return paths
-
-def _filtered_config_response(ctx, name, base, removals):
-    if not removals:
-        return base
-    out = ctx.actions.declare_file(
-        ctx.label.name + ".config_flags/" + name + ".rsp",
-    )
-    args = ctx.actions.args()
-    args.add("-in", base)
-    args.add("-out", out)
-    args.add_all(removals, before_each = "-remove")
-    path_mapped_run(
-        ctx.actions,
-        executable = ctx.executable._flagfilter,
-        inputs = [base],
-        outputs = [out],
-        arguments = [args],
-        mnemonic = "LinuxFlagFilter",
-        progress_message = "Filtering Linux flags for %{label}",
-    )
-    return out
 
 def _grouped_objtool(ctx, config, input_file, output):
     args = ctx.actions.args()
@@ -720,51 +659,38 @@ def _profile_compile_flags(ctx, profile):
         out.append("-fintegrated-as")
     return out
 
-def _profile_target_flags(ctx, profile):
-    flags = _profile_compile_flags(ctx, profile)
-    out = []
-    skip_next = False
-    for index in range(len(flags)):
-        if skip_next:
-            skip_next = False
-            continue
-        flag = flags[index]
-        if flag in ["-target", "--target"]:
-            if index + 1 < len(flags):
-                out.extend([flag, flags[index + 1]])
-                skip_next = True
-        elif flag.startswith("-target=") or flag.startswith("--target="):
-            out.append(flag)
-    return out
-
 def _relocatable_link(
         ctx,
         profile,
+        flags,
+        removals,
         output,
         objects,
         extra_inputs = [],
         linker_script = None,
         mnemonic = "LinuxRelocatableLink",
         progress_message = "Linking Linux relocatable object %{label}"):
-    linker = cc_common.get_tool_for_action(
-        feature_configuration = profile.feature_configuration,
-        action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
-    )
     args = ctx.actions.args()
-    args.add_all(_profile_target_flags(ctx, profile))
-    args.add_all(ctx.attr.relocatable_link_flags)
-    args.add("-nostdlib")
-    args.add("-r")
+    args.add("link")
+    args.add("-linker", profile.kbuild_linker)
+    args.add("-validation", profile.validation)
+    args.add("-flags_file", flags)
+    args.add("-remove_flags_file", removals)
+    args.add("-output", output)
+    args.add_all(ctx.attr.relocatable_link_flags, before_each = "-base_arg")
     if linker_script != None:
-        args.add(linker_script, format = "-Wl,-T,%s")
-    args.add("-o")
-    args.add(output)
-    args.add_all(objects)
+        args.add("-linker_script", linker_script)
+    args.add_all(objects, before_each = "-input")
     path_mapped_run(
         ctx.actions,
-        executable = linker,
+        executable = ctx.executable._ccprofile,
         inputs = depset(
-            objects + extra_inputs,
+            [
+                flags,
+                profile.kbuild_linker,
+                profile.validation,
+                removals,
+            ] + objects + extra_inputs,
             transitive = [profile.toolchain_files],
         ),
         outputs = [output],
@@ -843,14 +769,20 @@ def _compile_arguments(
             generated_headers,
         )
     ])
-    object_args.extend(flags)
-
     args = ctx.actions.args()
     args.add("compile")
     args.add("-template", profile.command_template)
     args.add("-validation", profile.validation)
     args.add("-source", source)
     args.add("-output", output)
+    args.add("-flags_file", flags)
+    args.add("-remove_flags_file", removals)
+    add_directory_arg(
+        args,
+        directory_anchor(ctx.file.source_root),
+        format = "-source_root=%s",
+    )
+    args.add("-object_path", spec.object)
     anchors = _directory_anchors(
         ctx.file.source_root,
         source,
@@ -865,7 +797,7 @@ def _compile_arguments(
     )
     add_mapped_values(
         args,
-        ["-remove=" + value for value in removals],
+        ["-remove=" + value for value in ctx.attr.toolchain_remove_flags],
         directory_anchors = anchors,
     )
     return args
@@ -902,7 +834,7 @@ def _linux_object_action_group_impl(ctx):
     sources = _single_source_files(ctx)
     source_files = sources.files
 
-    profile = ctx.attr.cc_profile[LinuxCcProfileInfo]
+    profile = ctx.attr.graph_profile[LinuxGraphProfileInfo]
     expected_profile_arch = _PROFILE_ARCH_FOR_LINUX_ARCH[ctx.attr.arch]
     if profile.arch != expected_profile_arch:
         fail(
@@ -910,6 +842,19 @@ def _linux_object_action_group_impl(ctx):
             (ctx.label, profile.arch, ctx.attr.arch),
         )
     environment_index = ctx.attr.compile_environment_index[LinuxCompileEnvironmentIndexInfo]
+    flag_programs = ctx.attr.flag_programs[LinuxFlagProgramsInfo].programs
+    for program_id, what in [
+        (ctx.attr.flag_program, "flag_program"),
+        (ctx.attr.remove_flag_program, "remove_flag_program"),
+    ]:
+        _validate_content_id(program_id, what)
+        if program_id not in flag_programs:
+            fail(
+                "linux_object_action_group %s references unknown %s %s" %
+                (ctx.label, what, program_id),
+            )
+    flags = flag_programs[ctx.attr.flag_program]
+    recipe_removals = flag_programs[ctx.attr.remove_flag_program]
 
     targets = sorted(ctx.attr.objects.keys())
     if not targets:
@@ -917,7 +862,6 @@ def _linux_object_action_group_impl(ctx):
     objects = {}
     outputs = []
     content_ids = {}
-    filtered_config_responses = {}
     for target in targets:
         if not target:
             fail("linux_object_action_group %s has an empty object target name" % ctx.label)
@@ -951,31 +895,7 @@ def _linux_object_action_group_impl(ctx):
                     (ctx.label, target, required),
                 )
 
-        flags = _expanded_recipe_flags(
-            ctx.attr.flags,
-            config.config_flags,
-            ctx.file.source_root,
-            source,
-            spec.object,
-        )
-        recipe_removals = _expanded_recipe_flags(
-            ctx.attr.remove_flags,
-            config.config_flags,
-            ctx.file.source_root,
-            source,
-            spec.object,
-        )
         config_response = config.aflags if ctx.attr.language == "asm" else config.cflags
-        removal_key = spec.compile_environment + ":" + json.encode(recipe_removals)
-        if removal_key not in filtered_config_responses:
-            filtered_config_responses[removal_key] = _filtered_config_response(
-                ctx,
-                str(len(filtered_config_responses)),
-                config_response,
-                recipe_removals,
-            )
-        config_response = filtered_config_responses[removal_key]
-        removals = _unique_values(ctx.attr.toolchain_remove_flags + recipe_removals)
         out = ctx.actions.declare_file(
             ctx.label.name + ".objects/" + spec.content_id + "/" + spec.object,
         )
@@ -1004,6 +924,8 @@ def _linux_object_action_group_impl(ctx):
                     ctx.file.source_root,
                     profile.command_template,
                     profile.validation,
+                    flags,
+                    recipe_removals,
                 ],
                 transitive = transitive_inputs,
             ),
@@ -1018,7 +940,7 @@ def _linux_object_action_group_impl(ctx):
                 generated_headers,
                 config_response,
                 flags,
-                removals,
+                recipe_removals,
             )],
             execution_requirements = profile.execution_requirements,
             mnemonic = "LinuxObjectCompile",
@@ -1062,15 +984,19 @@ linux_object_action_group = rule(
             mandatory = True,
             values = ["arm64", "x86"],
         ),
-        "cc_profile": attr.label(
+        "flag_program": attr.string(mandatory = True),
+        "flag_programs": attr.label(
             mandatory = True,
-            providers = [LinuxCcProfileInfo],
+            providers = [LinuxFlagProgramsInfo],
+        ),
+        "graph_profile": attr.label(
+            mandatory = True,
+            providers = [LinuxGraphProfileInfo],
         ),
         "compile_environment_index": attr.label(
             mandatory = True,
             providers = [LinuxCompileEnvironmentIndexInfo],
         ),
-        "flags": attr.string_list(),
         "flag_effects": attr.string_list(
             mandatory = True,
             doc = "Canonical compact-v7 effects of the resolved flag program.",
@@ -1106,7 +1032,7 @@ linux_object_action_group = rule(
         "reachable_configs": attr.string_list(mandatory = True),
         "reachability_id": attr.string(mandatory = True),
         "recipe_id": attr.string(mandatory = True),
-        "remove_flags": attr.string_list(),
+        "remove_flag_program": attr.string(mandatory = True),
         "remove_flag_effects": attr.string_list(
             mandatory = True,
             doc = "Canonical compact-v7 effects of the resolved remove-flag program.",
@@ -1131,11 +1057,6 @@ linux_object_action_group = rule(
         "_ccprofile": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/ccprofile"),
-            executable = True,
-        ),
-        "_flagfilter": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/flagfilter"),
             executable = True,
         ),
         "_objtoolrun": attr.label(
@@ -1226,13 +1147,26 @@ def _linux_composite_object_action_group_impl(ctx):
     if ctx.attr.module_root and ctx.attr.mode != "m":
         fail("linux_composite_object_action_group %s marks built-in objects as module roots" % ctx.label)
 
-    profile = ctx.attr.cc_profile[LinuxCcProfileInfo]
+    profile = ctx.attr.graph_profile[LinuxGraphProfileInfo]
     expected_profile_arch = _PROFILE_ARCH_FOR_LINUX_ARCH[ctx.attr.arch]
     if profile.arch != expected_profile_arch:
         fail(
             "linux_composite_object_action_group %s profile arch %r does not match Linux arch %r" %
             (ctx.label, profile.arch, ctx.attr.arch),
         )
+    flag_programs = ctx.attr.flag_programs[LinuxFlagProgramsInfo].programs
+    for program_id, what in [
+        (ctx.attr.flag_program, "flag_program"),
+        (ctx.attr.remove_flag_program, "remove_flag_program"),
+    ]:
+        _validate_content_id(program_id, what)
+        if program_id not in flag_programs:
+            fail(
+                "linux_composite_object_action_group %s references unknown %s %s" %
+                (ctx.label, what, program_id),
+            )
+    flags = flag_programs[ctx.attr.flag_program]
+    removals = flag_programs[ctx.attr.remove_flag_program]
     dependency_groups = [
         target[LinuxObjectActionGroupInfo]
         for target in ctx.attr.member_groups
@@ -1273,6 +1207,8 @@ def _linux_composite_object_action_group_impl(ctx):
             _relocatable_link(
                 ctx,
                 profile,
+                flags,
+                removals,
                 out,
                 [info.output for info in member_infos],
                 mnemonic = "LinuxCompositeObject",
@@ -1323,9 +1259,14 @@ linux_composite_object_action_group = rule(
             mandatory = True,
             values = ["arm64", "x86"],
         ),
-        "cc_profile": attr.label(
+        "flag_program": attr.string(mandatory = True),
+        "flag_programs": attr.label(
             mandatory = True,
-            providers = [LinuxCcProfileInfo],
+            providers = [LinuxFlagProgramsInfo],
+        ),
+        "graph_profile": attr.label(
+            mandatory = True,
+            providers = [LinuxGraphProfileInfo],
         ),
         "member_groups": attr.label_list(
             mandatory = True,
@@ -1346,9 +1287,15 @@ linux_composite_object_action_group = rule(
         "reachable_configs": attr.string_list(mandatory = True),
         "reachability_id": attr.string(mandatory = True),
         "recipe_id": attr.string(mandatory = True),
+        "remove_flag_program": attr.string(mandatory = True),
         "relocatable_link_flags": attr.string_list(
             mandatory = True,
             doc = "Profile-selected driver arguments for a hermetic relocatable link.",
+        ),
+        "_ccprofile": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/ccprofile"),
+            executable = True,
         ),
     },
     fragments = ["cpp"],
@@ -1515,12 +1462,25 @@ def _linux_arm64_nvhe_object_action_group_impl(ctx):
     _validate_canonical_strings(ctx.attr.reachable_configs, "reachable_configs")
     sources = _single_source_files(ctx)
 
-    profile = ctx.attr.cc_profile[LinuxCcProfileInfo]
+    profile = ctx.attr.graph_profile[LinuxGraphProfileInfo]
     if profile.arch != "aarch64":
         fail(
             "linux_arm64_nvhe_object_action_group %s requires an aarch64 profile, got %r" %
             (ctx.label, profile.arch),
         )
+    flag_programs = ctx.attr.flag_programs[LinuxFlagProgramsInfo].programs
+    for program_id, what in [
+        (ctx.attr.flag_program, "flag_program"),
+        (ctx.attr.remove_flag_program, "remove_flag_program"),
+    ]:
+        _validate_content_id(program_id, what)
+        if program_id not in flag_programs:
+            fail(
+                "linux_arm64_nvhe_object_action_group %s references unknown %s %s" %
+                (ctx.label, what, program_id),
+            )
+    flags = flag_programs[ctx.attr.flag_program]
+    removals = flag_programs[ctx.attr.remove_flag_program]
     environment_index = ctx.attr.compile_environment_index[LinuxCompileEnvironmentIndexInfo]
 
     dependency_groups = [
@@ -1612,6 +1572,8 @@ def _linux_arm64_nvhe_object_action_group_impl(ctx):
         _relocatable_link(
             ctx,
             profile,
+            flags,
+            removals,
             tmp,
             member_outputs,
             extra_inputs = [linker_script],
@@ -1658,6 +1620,8 @@ def _linux_arm64_nvhe_object_action_group_impl(ctx):
         _relocatable_link(
             ctx,
             profile,
+            flags,
+            removals,
             rel,
             [tmp, hyp_reloc],
         )
@@ -1704,9 +1668,14 @@ linux_arm64_nvhe_object_action_group = rule(
     implementation = _linux_arm64_nvhe_object_action_group_impl,
     attrs = {
         "arch": attr.string(default = "arm64", values = ["arm64"]),
-        "cc_profile": attr.label(
+        "flag_program": attr.string(mandatory = True),
+        "flag_programs": attr.label(
             mandatory = True,
-            providers = [LinuxCcProfileInfo],
+            providers = [LinuxFlagProgramsInfo],
+        ),
+        "graph_profile": attr.label(
+            mandatory = True,
+            providers = [LinuxGraphProfileInfo],
         ),
         "compile_environment_index": attr.label(
             mandatory = True,
@@ -1727,6 +1696,7 @@ linux_arm64_nvhe_object_action_group = rule(
         "reachable_configs": attr.string_list(mandatory = True),
         "reachability_id": attr.string(mandatory = True),
         "recipe_id": attr.string(mandatory = True),
+        "remove_flag_program": attr.string(mandatory = True),
         "relocatable_link_flags": attr.string_list(
             mandatory = True,
             doc = "Profile-selected driver arguments for a hermetic relocatable link.",
@@ -1838,7 +1808,7 @@ def _linux_grouped_image_impl(ctx):
         fail("linux_grouped_image %s requires a built-in object projection" % ctx.label)
     if not projection.objects:
         fail("linux_grouped_image %s requires at least one built-in object" % ctx.label)
-    profile = ctx.attr.cc_profile[LinuxCcProfileInfo]
+    profile = ctx.attr.graph_profile[LinuxGraphProfileInfo]
     archiver = cc_common.get_tool_for_action(
         feature_configuration = profile.feature_configuration,
         action_name = CPP_LINK_STATIC_LIBRARY_ACTION_NAME,
@@ -1873,9 +1843,9 @@ def _linux_grouped_image_impl(ctx):
 linux_grouped_image = rule(
     implementation = _linux_grouped_image_impl,
     attrs = {
-        "cc_profile": attr.label(
+        "graph_profile": attr.label(
             mandatory = True,
-            providers = [LinuxCcProfileInfo],
+            providers = [LinuxGraphProfileInfo],
         ),
         "objects": attr.label(
             mandatory = True,

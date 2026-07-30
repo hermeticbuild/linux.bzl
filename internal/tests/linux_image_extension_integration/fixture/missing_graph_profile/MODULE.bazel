@@ -1,5 +1,5 @@
 module(
-    name = "linux_image_extension_missing_cc_profile",
+    name = "linux_image_extension_missing_graph_profile",
     version = "1.0.0",
 )
 

@@ -19,8 +19,6 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/rusttoolchain"
 )
 
-const compactMetadataProtocolV6 = "compact-v6-content-graph"
-
 type stringMapFlag map[string]string
 
 func (f stringMapFlag) String() string {
@@ -209,67 +207,61 @@ func main() {
 
 func run() (exitCode int) {
 	var (
-		root                     = flag.String("root", "", "Root Kconfig file to parse")
-		srctree                  = flag.String("srctree", "", "Source tree used to resolve source statements")
-		allowShell               = flag.Bool("allow_shell", false, "Allow $(shell,...) expansion")
-		linuxProbeModel          = flag.String("linux_probe_model", "", "Hermetic Linux Kconfig probe model to use for $(shell,...) expansion. Supported: linux_llvm")
-		ccProfilePath            = flag.String("cc_profile", "", "Checked-in CC capability profile used for Kconfig identity and exact Kbuild structural probes")
-		ccProbeRequestsOut       = flag.String("cc_probe_requests_out", "", "Path to write canonical structural-probe requests collected while parsing Kbuild")
-		rustToolchainProbe       = flag.String("rust_toolchain_probe", "", "JSON identity produced from the selected rustc -vV output")
-		validateConfigEquivalent = flag.Bool("validate_config_equivalence", false, "Require action-time config to match the repository-generated structural snapshot")
-		out                      = flag.String("out", "", "Path to write the parsed Kconfig as JSON. Defaults to stdout when no other output is set")
-		kbuildPath               = flag.String("kbuild", "", "Kbuild/Makefile path for compact object metadata generation")
-		kbuildRecursive          = flag.Bool("kbuild_recursive", false, "Follow static Kbuild include directives when writing -kbuild_out")
-		kbuildSrctree            = flag.String("kbuild_srctree", "", "Source tree used to resolve recursive Kbuild includes. Defaults to -srctree")
-		kbuildOut                = flag.String("kbuild_out", "", "Path to write the parsed Kbuild/Makefile as JSON")
-		kbuildTreeRoot           = flag.String("kbuild_tree_root", "", "Linux source tree root to recursively validate Kbuild/Makefile/*.mk files")
-		kbuildTreeOut            = flag.String("kbuild_tree_out", "", "Path to write recursive Kbuild tree validation summary JSON")
-		kbuildTreeMinCount       = flag.Int("kbuild_tree_min_count", 0, "Minimum number of Kbuild-like files that must be parsed during -kbuild_tree_root validation")
-		compactMetadataOut       = flag.String("compact_metadata_out", "", "Path to write compact fragment-keyed Linux metadata JSON")
-		compactBuildfileOut      = flag.String("compact_buildfile_out", "", "Path to write a combined compact object/image BUILD file")
-		compactProtocol          = flag.String("compact_protocol", compactMetadataProtocolV6, "Compact metadata protocol. Supported: compact-v6-content-graph, compact-v7-lazy-action-graph")
-		compactBaseConfig        = flag.String("compact_base_config", "", "Base config name for delta image BUILD emission")
-		compileEnvironmentABI    = flag.String("compile_environment_abi", "", "Toolchain/action ABI bound into compile environment content IDs")
-		toolchainProfileID       = flag.String("toolchain_profile_id", "", "Declarative toolchain profile identity required by compact-v7 metadata")
-		rustProfileOut           = flag.String("rust_profile_out", "", "Path to write the source-derived Rust profile JSON")
-		compactKbuildTree        = flag.Bool("compact_kbuild_tree", false, "Follow active Kbuild directory descent when generating compact metadata")
-		resolveConfig            = flag.String("resolve_config", "", "Named .config input in NAME=PATH form to resolve through Kconfig defaults and dependencies")
-		configMode               = flag.String("config_mode", "default", "Config resolver mode. Supported: default, allnoconfig")
-		resolvedConfigOut        = flag.String("resolved_config_out", "", "Path to write the resolved .config")
-		resolvedAutoConfOut      = flag.String("resolved_auto_conf_out", "", "Path to write the resolved include/config/auto.conf")
-		resolvedCmdOut           = flag.String("resolved_auto_conf_cmd_out", "", "Path to write the resolved include/config/auto.conf.cmd")
-		resolvedAutoconfOut      = flag.String("resolved_autoconf_out", "", "Path to write the resolved include/generated/autoconf.h")
-		resolvedRustcCfgOut      = flag.String("resolved_rustc_cfg_out", "", "Path to write the resolved include/generated/rustc_cfg")
-		resolvedReleaseOut       = flag.String("resolved_kernel_release_out", "", "Path to write the resolved include/config/kernel.release")
-		kernelVersion            = flag.String("kernel_version", "6.18.2", "Base kernel release used when writing resolved config outputs")
-		objectLabelPackage       = flag.String("object_label_package", "", "Bazel package containing the compact object targets. Defaults to the -compact_buildfile_out package")
-		sourceLabelPackage       = flag.String("source_label_package", "", "Bazel package containing Linux source file labels for generated compact object BUILD files")
-		sourceASN1Compiler       = flag.String("source_asn1_compiler", "", "Bazel label for the kernel source tree's scripts/asn1_compiler tool emitted into source-backed compact object rules")
-		sourceObjtool            = flag.String("source_objtool", "", "Bazel label for the kernel source tree's objtool executable emitted into x86 source-backed compact object rules")
-		sourceRelacheck          = flag.String("source_relacheck", "", "Bazel label for the kernel source tree's arch/arm64/kernel/pi/relacheck tool emitted into arm64 .pi.o rules")
-		sourceRootLabel          = flag.String("source_root_label", "", "Bazel label for a file in the Linux source root, emitted into source-backed compact object rules")
-		linuxObjectsLoad         = flag.String("linux_objects_load", "", "Load label for the compact Linux object/image rules")
-		vars                     = stringMapFlag{}
-		env                      = stringMapFlag{}
-		linuxProbeValues         = stringMapFlag{}
-		visibility               = stringSliceFlag{}
-		kbuildTreeExcludes       = stringSliceFlag{}
-		compactConfigInputs      = namedPathFlag{}
-		compactExports           = stringSliceFlag{}
-		sourceRootMaps           = namedPathFlag{}
-		kconfigExtras            = namedPathFlag{}
-		generatedHeadersByConfig = namedPathFlag{}
-		cpuProfile               = flag.String("cpu_profile", "", "Optional path to write a Go CPU profile")
-		heapProfile              = flag.String("heap_profile", "", "Optional path to write a Go live-heap profile")
-		allocsProfile            = flag.String("allocs_profile", "", "Optional path to write a Go cumulative-allocation profile")
+		root                      = flag.String("root", "", "Root Kconfig file to parse")
+		srctree                   = flag.String("srctree", "", "Source tree used to resolve source statements")
+		allowShell                = flag.Bool("allow_shell", false, "Allow $(shell,...) expansion")
+		linuxProbeModel           = flag.String("linux_probe_model", "", "Hermetic Linux Kconfig probe model to use for $(shell,...) expansion. Supported: linux_llvm")
+		graphProfilePath          = flag.String("graph_profile", "", "Checked-in exact-command toolchain graph profile used by Kconfig")
+		graphProfileProjectionOut = flag.String("graph_profile_projection_out", "", "Path to write the canonical consumed graph-profile projection")
+		graphProfileRecordOut     = flag.String("graph_profile_record_out", "", "Maintenance-only path to record or extend an exact graph-profile superset")
+		graphProfileArchitecture  = flag.String("graph_profile_architecture", "", "Canonical architecture for -graph_profile_record_out")
+		graphProfileCompiler      = flag.String("graph_profile_compiler", "", "Analysis compiler family for -graph_profile_record_out")
+		graphProfileTarget        = flag.String("graph_profile_target_gnu_system_name", "", "Analysis GNU target for -graph_profile_record_out")
+		graphProfileTemplate      = flag.String("graph_profile_template", "", "Configured compiler command template used to extend -graph_profile")
+		graphProfileLinker        = flag.String("graph_profile_linker", "", "Configured raw linker used to extend -graph_profile")
+		graphProfileShellPath     = flag.String("graph_profile_shell", "", "Execution-platform shell used to extend -graph_profile")
+		graphProfileObjectRoot    = flag.String("graph_profile_object_root", "", "Optional Linux object root used to extend -graph_profile")
+		rustToolchainProbe        = flag.String("rust_toolchain_probe", "", "JSON identity produced from the selected rustc -vV output")
+		validateConfigEquivalent  = flag.Bool("validate_config_equivalence", false, "Require action-time config to match the repository-generated structural snapshot")
+		out                       = flag.String("out", "", "Path to write the parsed Kconfig as JSON. Defaults to stdout when no other output is set")
+		kbuildPath                = flag.String("kbuild", "", "Kbuild/Makefile path for compact object metadata generation")
+		kbuildRecursive           = flag.Bool("kbuild_recursive", false, "Follow static Kbuild include directives when writing -kbuild_out")
+		kbuildSrctree             = flag.String("kbuild_srctree", "", "Source tree used to resolve recursive Kbuild includes. Defaults to -srctree")
+		kbuildOut                 = flag.String("kbuild_out", "", "Path to write the parsed Kbuild/Makefile as JSON")
+		kbuildTreeRoot            = flag.String("kbuild_tree_root", "", "Linux source tree root to recursively validate Kbuild/Makefile/*.mk files")
+		kbuildTreeOut             = flag.String("kbuild_tree_out", "", "Path to write recursive Kbuild tree validation summary JSON")
+		kbuildTreeMinCount        = flag.Int("kbuild_tree_min_count", 0, "Minimum number of Kbuild-like files that must be parsed during -kbuild_tree_root validation")
+		compactMetadataOut        = flag.String("compact_metadata_out", "", "Path to write compact fragment-keyed Linux metadata JSON")
+		compileEnvironmentABI     = flag.String("compile_environment_abi", "", "Toolchain/action ABI bound into compile environment content IDs")
+		toolchainProfileID        = flag.String("toolchain_profile_id", "", "Optional assertion of the consumed graph-profile projection digest")
+		rustProfileOut            = flag.String("rust_profile_out", "", "Path to write the source-derived Rust profile JSON")
+		compactKbuildTree         = flag.Bool("compact_kbuild_tree", false, "Follow active Kbuild directory descent when generating compact metadata")
+		resolveConfig             = flag.String("resolve_config", "", "Named .config input in NAME=PATH form to resolve through Kconfig defaults and dependencies")
+		configMode                = flag.String("config_mode", "default", "Config resolver mode. Supported: default, allnoconfig")
+		resolvedConfigOut         = flag.String("resolved_config_out", "", "Path to write the resolved .config")
+		resolvedAutoConfOut       = flag.String("resolved_auto_conf_out", "", "Path to write the resolved include/config/auto.conf")
+		resolvedCmdOut            = flag.String("resolved_auto_conf_cmd_out", "", "Path to write the resolved include/config/auto.conf.cmd")
+		resolvedAutoconfOut       = flag.String("resolved_autoconf_out", "", "Path to write the resolved include/generated/autoconf.h")
+		resolvedRustcCfgOut       = flag.String("resolved_rustc_cfg_out", "", "Path to write the resolved include/generated/rustc_cfg")
+		resolvedReleaseOut        = flag.String("resolved_kernel_release_out", "", "Path to write the resolved include/config/kernel.release")
+		kernelVersion             = flag.String("kernel_version", "6.18.2", "Base kernel release used when writing resolved config outputs")
+		vars                      = stringMapFlag{}
+		env                       = stringMapFlag{}
+		linuxProbeValues          = stringMapFlag{}
+		kbuildTreeExcludes        = stringSliceFlag{}
+		compactConfigInputs       = namedPathFlag{}
+		sourceRootMaps            = namedPathFlag{}
+		kconfigExtras             = namedPathFlag{}
+		generatedHeadersByConfig  = namedPathFlag{}
+		cpuProfile                = flag.String("cpu_profile", "", "Optional path to write a Go CPU profile")
+		heapProfile               = flag.String("heap_profile", "", "Optional path to write a Go live-heap profile")
+		allocsProfile             = flag.String("allocs_profile", "", "Optional path to write a Go cumulative-allocation profile")
 	)
 	flag.Var(vars, "var", "Preprocessor variable in KEY=VALUE form. May be repeated")
 	flag.Var(env, "env", "Hermetic environment variable in KEY=VALUE form. May be repeated")
 	flag.Var(linuxProbeValues, "linux_probe_value", "Linux probe override in KEY=VALUE form. May be repeated with -linux_probe_model")
-	flag.Var(&visibility, "visibility", "Default visibility for the generated BUILD file. May be repeated. Defaults to //visibility:public")
 	flag.Var(&kbuildTreeExcludes, "kbuild_tree_exclude", "Source-root-relative subtree to skip during -kbuild_tree_root validation. May be repeated")
 	flag.Var(&compactConfigInputs, "config", "Named .config input in NAME=PATH form for compact metadata generation. May be repeated")
-	flag.Var(&compactExports, "compact_buildfile_export", "Source filename exported by the generated compact BUILD file. May be repeated")
 	flag.Var(&sourceRootMaps, "source_root_map", "Virtual source prefix to filesystem root in PREFIX=PATH form. May be repeated")
 	flag.Var(&kconfigExtras, "kconfig_extra", "Extra Kconfig source in PREFIX=PATH form. May be repeated")
 	flag.Var(&generatedHeadersByConfig, "generated_headers_for_config", "Generated headers binding in NAME=LABEL form. May be repeated once per compact config")
@@ -294,16 +286,12 @@ func run() (exitCode int) {
 		return 2
 	}
 
-	ccProfile, err := loadCCProfile(*ccProfilePath)
+	graphProfile, err := loadGraphProfile(*graphProfilePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load CC profile: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to load graph profile: %v\n", err)
 		return 1
 	}
-	var ccProbeRecorder *kconfig.StructuralProbeRecorder
-	if *ccProbeRequestsOut != "" {
-		ccProbeRecorder = kconfig.NewStructuralProbeRecorder()
-	}
-
+	var graphProfileShell *kconfig.GraphProfileShell
 	var tree *kconfig.Tree
 	if *root != "" {
 		var err error
@@ -325,17 +313,121 @@ func run() (exitCode int) {
 			}
 			applyRustToolchainProbe(vars, linuxProbeValues, probe)
 		}
-		shell, err := linuxProbeShell(*linuxProbeModel, linuxProbeValues, ccProfile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to configure Linux probe model: %v\n", err)
-			return 2
-		}
 		sourceRoots := namedPathMap(sourceRootMaps)
 		resolvedRoot := *root
 		if *srctree == "" {
 			resolvedRoot = workspacePath(*root)
 		}
 		resolvedSrctree := workspacePath(*srctree)
+		shell, err := linuxProbeShell(*linuxProbeModel, linuxProbeValues)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to configure Linux probe model: %v\n", err)
+			return 2
+		}
+		if graphProfile != nil && *graphProfileRecordOut != "" {
+			if *graphProfileTemplate == "" ||
+				*graphProfileLinker == "" ||
+				*graphProfileShellPath == "" {
+				fmt.Fprintln(
+					os.Stderr,
+					"extending -graph_profile requires -graph_profile_template, -graph_profile_linker, and -graph_profile_shell",
+				)
+				return 2
+			}
+			templateData, readErr := os.ReadFile(workspacePath(*graphProfileTemplate))
+			if readErr != nil {
+				fmt.Fprintf(os.Stderr, "failed to read graph profile command template: %v\n", readErr)
+				return 1
+			}
+			template, decodeErr := ccprofile.DecodeCommandTemplate(templateData)
+			if decodeErr != nil {
+				fmt.Fprintf(os.Stderr, "failed to decode graph profile command template: %v\n", decodeErr)
+				return 1
+			}
+			if template.Architecture != graphProfile.Architecture ||
+				template.DriverContract != graphProfile.DriverContract ||
+				template.AnalysisIdentity != graphProfile.AnalysisIdentity {
+				fmt.Fprintln(os.Stderr, "graph profile and compiler command template identities disagree")
+				return 2
+			}
+			tools := ccprofile.KbuildGraphProbeTools{
+				Compiler:    template.Compiler,
+				Linker:      workspacePath(*graphProfileLinker),
+				Shell:       workspacePath(*graphProfileShellPath),
+				SourceRoot:  resolvedSrctree,
+				ObjectRoot:  workspacePath(*graphProfileObjectRoot),
+				Environment: template.Environment,
+			}
+			graphProfileShell, err = kconfig.NewGraphProfileExtensionShell(
+				*graphProfile,
+				resolvedSrctree,
+				env,
+				func(ctx context.Context, command string) (string, error) {
+					return ccprofile.EvaluateConfiguredKconfigCommand(
+						ctx,
+						command,
+						env,
+						tools,
+					)
+				},
+				func(request ccprofile.KbuildGraphProbeIdentity) (bool, error) {
+					return ccprofile.EvaluateKbuildGraphProbe(
+						context.Background(),
+						graphProfile.AnalysisIdentity,
+						request,
+						tools,
+					)
+				},
+			)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to configure graph profile extension: %v\n", err)
+				return 2
+			}
+			shell = graphProfileShell.Run
+		} else if graphProfile != nil {
+			graphProfileShell, err = kconfig.NewGraphProfileShell(
+				*graphProfile,
+				resolvedSrctree,
+				env,
+			)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to configure graph profile: %v\n", err)
+				return 2
+			}
+			shell = graphProfileShell.Run
+		} else if *graphProfileRecordOut != "" {
+			if shell == nil {
+				fmt.Fprintln(os.Stderr, "-graph_profile_record_out requires -linux_probe_model")
+				return 2
+			}
+			if *graphProfileArchitecture == "" ||
+				*graphProfileCompiler == "" ||
+				*graphProfileTarget == "" {
+				fmt.Fprintln(
+					os.Stderr,
+					"-graph_profile_record_out requires -graph_profile_architecture, -graph_profile_compiler, and -graph_profile_target_gnu_system_name",
+				)
+				return 2
+			}
+			graphProfileShell, err = kconfig.NewGraphProfileRecordingShell(
+				ccprofile.GraphProfileIdentity{
+					Architecture:   *graphProfileArchitecture,
+					DriverContract: ccprofile.DriverContract,
+					AnalysisIdentity: ccprofile.AnalysisIdentity{
+						Compiler:            *graphProfileCompiler,
+						TargetGNUSystemName: *graphProfileTarget,
+					},
+				},
+				resolvedSrctree,
+				env,
+				shell,
+			)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to configure graph profile recorder: %v\n", err)
+				return 2
+			}
+			shell = graphProfileShell.Run
+		}
 		if len(kconfigExtras) != 0 {
 			synthetic, cleanup, err := syntheticKconfigRoot(resolvedRoot, kconfigExtras)
 			if err != nil {
@@ -370,8 +462,7 @@ func run() (exitCode int) {
 			*kbuildSrctree,
 			*srctree,
 			vars,
-			ccProfile,
-			ccProbeRecorder,
+			graphProfileShell,
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to parse Kbuild: %v\n", err)
@@ -406,8 +497,7 @@ func run() (exitCode int) {
 			resolvedRoot,
 			kbuildTreeExcludes,
 			treeVars,
-			ccProfile,
-			ccProbeRecorder,
+			graphProfileShell,
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to validate Kbuild tree: %v\n", err)
@@ -451,7 +541,7 @@ func run() (exitCode int) {
 	}
 
 	resolvedConfigRequested := *resolveConfig != "" || *resolvedConfigOut != "" || *resolvedAutoConfOut != "" || *resolvedCmdOut != "" || *resolvedAutoconfOut != "" || *resolvedRustcCfgOut != "" || *resolvedReleaseOut != ""
-	if tree == nil && (*compactMetadataOut != "" || *compactBuildfileOut != "" || resolvedConfigRequested || *out != "") {
+	if tree == nil && (*compactMetadataOut != "" || resolvedConfigRequested || *out != "") {
 		fmt.Fprintf(os.Stderr, "-root is required for Kconfig outputs\n")
 		return 2
 	}
@@ -470,15 +560,10 @@ func run() (exitCode int) {
 		}
 	}
 
-	if *compactMetadataOut != "" || *compactBuildfileOut != "" {
-		resolvedToolchainProfileID, err := compactToolchainProfileID(
-			*compactProtocol,
-			*toolchainProfileID,
-			*compactBuildfileOut,
-			ccProfile,
-		)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to configure compact protocol: %v\n", err)
+	if *compactMetadataOut != "" {
+		requestedToolchainProfileID := *toolchainProfileID
+		if graphProfile == nil && *graphProfileRecordOut == "" {
+			fmt.Fprintln(os.Stderr, "-compact_metadata_out requires -graph_profile or -graph_profile_record_out")
 			return 2
 		}
 		headerLabels, err := compactGeneratedHeaderLabels(
@@ -489,115 +574,80 @@ func run() (exitCode int) {
 			fmt.Fprintf(os.Stderr, "failed to configure compact generated headers: %v\n", err)
 			return 2
 		}
-		if *compactProtocol == kconfig.CompactMetadataProtocolV7 {
-			metadata, err := compactMetadataV7(
-				tree,
-				*root,
-				*kbuildPath,
-				compactConfigInputs,
-				*configMode,
-				*compactKbuildTree,
-				vars,
-				namedPathMap(sourceRootMaps),
-				headerLabels,
-				*kernelVersion,
-				*compileEnvironmentABI,
-				resolvedToolchainProfileID,
-				ccProfile,
-				ccProbeRecorder,
-			)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to generate compact-v7 metadata: %v\n", err)
-				return 1
-			}
-			if *compactMetadataOut != "" {
-				data, err := metadata.JSON()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "failed to encode compact-v7 metadata: %v\n", err)
-					return 1
-				}
-				if err := os.WriteFile(workspacePath(*compactMetadataOut), data, 0o644); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to write compact-v7 metadata: %v\n", err)
-					return 1
-				}
-			}
-		} else {
-			metadata, err := compactMetadata(
-				tree,
-				*root,
-				*kbuildPath,
-				compactConfigInputs,
-				*configMode,
-				*compactKbuildTree,
-				vars,
-				namedPathMap(sourceRootMaps),
-				headerLabels,
-				*kernelVersion,
-				*compileEnvironmentABI,
-				ccProfile,
-				ccProbeRecorder,
-			)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to generate compact metadata: %v\n", err)
-				return 1
-			}
-			if *compactMetadataOut != "" {
-				data, err := metadata.JSON()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "failed to encode compact metadata: %v\n", err)
-					return 1
-				}
-				if err := os.WriteFile(workspacePath(*compactMetadataOut), data, 0o644); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to write compact metadata: %v\n", err)
-					return 1
-				}
-			}
-			if *compactBuildfileOut != "" {
-				exports := []string(compactExports)
-				if len(exports) == 0 {
-					exports = compactBuildfileExports(*compactBuildfileOut, *compactMetadataOut)
-				}
-				objectPkg := *objectLabelPackage
-				if objectPkg == "" {
-					objectPkg = inferLabelPackage(*compactBuildfileOut)
-				}
-				data, err := metadata.BuildFile(kconfig.CompactBuildFileOptions{
-					Arch:               vars["ARCH"],
-					Version:            *kernelVersion,
-					Visibility:         []string(visibility),
-					RuleLoadLabel:      *linuxObjectsLoad,
-					BaseConfig:         *compactBaseConfig,
-					ObjectLabelPackage: objectPkg,
-					Exports:            exports,
-					SourceLabelPackage: *sourceLabelPackage,
-					SourceASN1Compiler: *sourceASN1Compiler,
-					SourceObjtool:      *sourceObjtool,
-					SourceRelacheck:    *sourceRelacheck,
-					SourceRootLabel:    *sourceRootLabel,
-					Srcarch:            vars["SRCARCH"],
-				})
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "failed to generate compact BUILD file: %v\n", err)
-					return 1
-				}
-				if err := os.WriteFile(workspacePath(*compactBuildfileOut), data, 0o644); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to write compact BUILD file: %v\n", err)
-					return 1
-				}
-			}
+		metadata, err := compactMetadataV7(
+			tree,
+			*root,
+			*kbuildPath,
+			compactConfigInputs,
+			*configMode,
+			*compactKbuildTree,
+			vars,
+			namedPathMap(sourceRootMaps),
+			headerLabels,
+			*kernelVersion,
+			*compileEnvironmentABI,
+			requestedToolchainProfileID,
+			graphProfileShell,
+		)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to generate compact-v7 metadata: %v\n", err)
+			return 1
+		}
+		data, err := metadata.JSON()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to encode compact-v7 metadata: %v\n", err)
+			return 1
+		}
+		if err := os.WriteFile(workspacePath(*compactMetadataOut), data, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write compact-v7 metadata: %v\n", err)
+			return 1
 		}
 	}
 
-	if *ccProbeRequestsOut != "" {
-		if err := writeCCProbeRequests(*ccProbeRequestsOut, ccProbeRecorder); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write CC probe requests: %v\n", err)
+	if *graphProfileProjectionOut != "" {
+		if graphProfile == nil || graphProfileShell == nil {
+			fmt.Fprintln(os.Stderr, "-graph_profile_projection_out requires -graph_profile")
+			return 2
+		}
+		projection, err := graphProfileShell.Projection()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to project consumed graph profile: %v\n", err)
+			return 1
+		}
+		data, err := ccprofile.CanonicalGraphProjectionJSON(projection)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to encode consumed graph profile: %v\n", err)
+			return 1
+		}
+		if err := os.WriteFile(workspacePath(*graphProfileProjectionOut), data, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write consumed graph profile: %v\n", err)
+			return 1
+		}
+	}
+	if *graphProfileRecordOut != "" {
+		if graphProfileShell == nil {
+			fmt.Fprintln(os.Stderr, "-graph_profile_record_out requires -root")
+			return 2
+		}
+		recorded, err := graphProfileShell.RecordedProfile()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to collect graph profile: %v\n", err)
+			return 1
+		}
+		data, err := ccprofile.CanonicalGraphProfileJSON(recorded)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to encode graph profile: %v\n", err)
+			return 1
+		}
+		if err := os.WriteFile(workspacePath(*graphProfileRecordOut), data, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write graph profile: %v\n", err)
 			return 1
 		}
 	}
 
 	// Only emit the JSON dump when explicitly requested, or when no output was
 	// requested at all (preserves the prior default of dumping to stdout).
-	if *out == "" && (*kbuildOut != "" || *kbuildTreeOut != "" || *compactMetadataOut != "" || *compactBuildfileOut != "" || *rustProfileOut != "" || *ccProbeRequestsOut != "" || resolvedConfigRequested) {
+	if *out == "" && (*kbuildOut != "" || *kbuildTreeOut != "" || *compactMetadataOut != "" || *rustProfileOut != "" || *graphProfileProjectionOut != "" || *graphProfileRecordOut != "" || resolvedConfigRequested) {
 		return 0
 	}
 
@@ -622,7 +672,7 @@ func run() (exitCode int) {
 	return 0
 }
 
-func loadCCProfile(path string) (*ccprofile.Profile, error) {
+func loadGraphProfile(path string) (*ccprofile.GraphProfile, error) {
 	if path == "" {
 		return nil, nil
 	}
@@ -630,46 +680,26 @@ func loadCCProfile(path string) (*ccprofile.Profile, error) {
 	if err != nil {
 		return nil, err
 	}
-	profile, err := ccprofile.Decode(data)
+	profile, err := ccprofile.DecodeGraphProfile(data)
 	if err != nil {
 		return nil, err
 	}
 	return &profile, nil
 }
 
-func writeCCProbeRequests(
-	path string,
-	recorder *kconfig.StructuralProbeRecorder,
-) error {
-	data, err := recorder.JSON()
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(workspacePath(path), data, 0o644)
-}
-
 func linuxProbeShell(
 	model string,
 	values map[string]string,
-	ccProfile *ccprofile.Profile,
 ) (func(context.Context, string) (string, error), error) {
 	if model == "" {
-		if ccProfile == nil && len(values) > 0 {
+		if len(values) > 0 {
 			return nil, fmt.Errorf("-linux_probe_value requires -linux_probe_model")
 		}
-		if ccProfile == nil {
-			return nil, nil
-		}
-		model = kconfig.LinuxProbeModelLLVM
+		return nil, nil
 	}
 	config, err := kconfig.LinuxProbeConfigForModel(model)
 	if err != nil {
 		return nil, err
-	}
-	if ccProfile != nil {
-		if err := kconfig.ApplyLinuxProbeCCProfile(&config, *ccProfile); err != nil {
-			return nil, err
-		}
 	}
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -677,35 +707,11 @@ func linuxProbeShell(
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		if ccProfile != nil && linuxProbeValueOwnedByCCProfile(key) {
-			return nil, fmt.Errorf(
-				"-linux_probe_value %q cannot override checked-in -cc_profile identity",
-				key,
-			)
-		}
 		if err := kconfig.ApplyLinuxProbeValue(&config, key, values[key]); err != nil {
 			return nil, err
 		}
 	}
 	return kconfig.LinuxProbeShellFromConfig(config), nil
-}
-
-func linuxProbeValueOwnedByCCProfile(key string) bool {
-	switch key {
-	case "cc_name",
-		"cc_version",
-		"cc_version_text",
-		"as_name",
-		"as_version",
-		"ld_name",
-		"ld_version",
-		"can_link",
-		"cc_options",
-		"as_instr":
-		return true
-	default:
-		return strings.HasPrefix(key, "cc_builtin_macro.")
-	}
 }
 
 type resolvedConfigOutputs struct {
@@ -899,16 +905,14 @@ func parseKbuild(
 	kbuildSrctree string,
 	srctree string,
 	vars map[string]string,
-	ccProfile *ccprofile.Profile,
-	probeRecorder *kconfig.StructuralProbeRecorder,
+	graphProfile *kconfig.GraphProfileShell,
 ) (*kconfig.KbuildFile, error) {
 	path = workspacePath(path)
 	if !recursive {
-		if ccProfile != nil || probeRecorder != nil {
+		if graphProfile != nil {
 			return kconfig.ParseKbuildFileWithOptions(path, kconfig.KbuildOptions{
-				Variables:     vars,
-				CCProfile:     ccProfile,
-				ProbeRecorder: probeRecorder,
+				Variables:    vars,
+				GraphProfile: graphProfile,
 			})
 		}
 		return kconfig.ParseKbuildFile(path)
@@ -918,10 +922,9 @@ func parseKbuild(
 		rootDir = srctree
 	}
 	return kconfig.ParseKbuildFileTree(path, kconfig.KbuildOptions{
-		RootDir:       workspacePath(rootDir),
-		Variables:     vars,
-		CCProfile:     ccProfile,
-		ProbeRecorder: probeRecorder,
+		RootDir:      workspacePath(rootDir),
+		Variables:    vars,
+		GraphProfile: graphProfile,
 	})
 }
 
@@ -934,8 +937,7 @@ func validateKbuildTree(
 	root string,
 	excludes []string,
 	vars map[string]string,
-	ccProfile *ccprofile.Profile,
-	probeRecorder *kconfig.StructuralProbeRecorder,
+	graphProfile *kconfig.GraphProfileShell,
 ) (*kbuildTreeSummary, error) {
 	var files []string
 	var failures []string
@@ -967,9 +969,8 @@ func validateKbuildTree(
 		fileVars["src"] = dir
 		fileVars["obj"] = dir
 		if _, err := kconfig.ParseKbuildFileWithOptions(path, kconfig.KbuildOptions{
-			Variables:     fileVars,
-			CCProfile:     ccProfile,
-			ProbeRecorder: probeRecorder,
+			Variables:    fileVars,
+			GraphProfile: graphProfile,
 		}); err != nil {
 			failures = append(failures, fmt.Sprintf("%s: %v", rel, err))
 			return nil
@@ -1015,102 +1016,10 @@ func isKbuildValidationFile(name string) bool {
 	return name == "Kbuild" || name == "Makefile" || strings.HasSuffix(name, ".mk")
 }
 
-func compactToolchainProfileID(
-	protocol string,
-	toolchainProfileID string,
-	buildfileOut string,
-	ccProfile *ccprofile.Profile,
-) (string, error) {
-	switch protocol {
-	case compactMetadataProtocolV6:
-		if toolchainProfileID != "" {
-			return "", fmt.Errorf(
-				"-toolchain_profile_id is only supported with -compact_protocol=%s",
-				kconfig.CompactMetadataProtocolV7,
-			)
-		}
-	case kconfig.CompactMetadataProtocolV7:
-		if buildfileOut != "" {
-			return "", fmt.Errorf(
-				"-compact_buildfile_out is not supported with -compact_protocol=%s; compact-v7 emits metadata only",
-				kconfig.CompactMetadataProtocolV7,
-			)
-		}
-		if ccProfile != nil {
-			digest, err := ccprofile.Digest(*ccProfile)
-			if err != nil {
-				return "", fmt.Errorf("digest -cc_profile: %w", err)
-			}
-			if toolchainProfileID != "" && toolchainProfileID != digest {
-				return "", fmt.Errorf(
-					"-toolchain_profile_id %q does not match canonical -cc_profile digest %s",
-					toolchainProfileID,
-					digest,
-				)
-			}
-			return digest, nil
-		}
-		if strings.TrimSpace(toolchainProfileID) == "" {
-			return "", fmt.Errorf(
-				"-toolchain_profile_id is required with -compact_protocol=%s when -cc_profile is not set",
-				kconfig.CompactMetadataProtocolV7,
-			)
-		}
-		return toolchainProfileID, nil
-	default:
-		return "", fmt.Errorf(
-			"unsupported -compact_protocol %q; supported protocols are %s and %s",
-			protocol,
-			compactMetadataProtocolV6,
-			kconfig.CompactMetadataProtocolV7,
-		)
-	}
-	return "", nil
-}
-
 type compactMetadataRequest struct {
 	configs        []kconfig.NamedConfig
 	options        kconfig.CompactMetadataOptions
 	graphForConfig func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error)
-}
-
-func compactMetadata(
-	tree *kconfig.Tree,
-	rootPath string,
-	kbuildPath string,
-	configInputs []namedPath,
-	configMode string,
-	compactKbuildTree bool,
-	vars map[string]string,
-	sourceRoots map[string]string,
-	generatedHeadersByConfig map[string]string,
-	kernelVersion string,
-	compileEnvironmentABI string,
-	ccProfile *ccprofile.Profile,
-	probeRecorder *kconfig.StructuralProbeRecorder,
-) (*kconfig.CompactMetadata, error) {
-	request, err := prepareCompactMetadata(
-		rootPath,
-		kbuildPath,
-		configInputs,
-		configMode,
-		compactKbuildTree,
-		vars,
-		sourceRoots,
-		generatedHeadersByConfig,
-		kernelVersion,
-		compileEnvironmentABI,
-		ccProfile,
-		probeRecorder,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return tree.CompactMetadataBatchWithOptions(
-		request.configs,
-		request.options,
-		request.graphForConfig,
-	)
 }
 
 func compactMetadataV7(
@@ -1126,8 +1035,7 @@ func compactMetadataV7(
 	kernelVersion string,
 	compileEnvironmentABI string,
 	toolchainProfileID string,
-	ccProfile *ccprofile.Profile,
-	probeRecorder *kconfig.StructuralProbeRecorder,
+	graphProfile *kconfig.GraphProfileShell,
 ) (*kconfig.CompactMetadataV7, error) {
 	request, err := prepareCompactMetadata(
 		rootPath,
@@ -1140,11 +1048,31 @@ func compactMetadataV7(
 		generatedHeadersByConfig,
 		kernelVersion,
 		compileEnvironmentABI,
-		ccProfile,
-		probeRecorder,
+		graphProfile,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if graphProfile != nil {
+		if err := request.preloadGraphs(tree); err != nil {
+			return nil, err
+		}
+		if graphProfile.IsResolving() {
+			projectedID, err := graphProfile.ProjectionDigest()
+			if err != nil {
+				return nil, fmt.Errorf("digest consumed graph profile: %w", err)
+			}
+			if toolchainProfileID != "" && toolchainProfileID != projectedID {
+				return nil, fmt.Errorf(
+					"toolchain profile ID %q does not match consumed graph profile digest %s",
+					toolchainProfileID,
+					projectedID,
+				)
+			}
+			toolchainProfileID = projectedID
+		} else if graphProfile.IsRecording() && toolchainProfileID == "" {
+			toolchainProfileID = "graph-profile-recording"
+		}
 	}
 	return tree.CompactMetadataBatchV7WithOptions(
 		request.configs,
@@ -1154,6 +1082,36 @@ func compactMetadataV7(
 		},
 		request.graphForConfig,
 	)
+}
+
+func (request *compactMetadataRequest) preloadGraphs(tree *kconfig.Tree) error {
+	graphs := make(map[string]kconfig.CompactConfigGraph, len(request.configs))
+	for _, named := range request.configs {
+		resolved, err := tree.ResolveConfigWithOptions(
+			named.Name,
+			named.Flags,
+			kconfig.ResolveConfigOptions{AllNoConfig: named.AllNoConfig},
+		)
+		if err != nil {
+			return err
+		}
+		graph, err := request.graphForConfig(resolved)
+		if err != nil {
+			return fmt.Errorf("resolve Kbuild for config %q: %w", named.Name, err)
+		}
+		graphs[named.Name] = graph
+	}
+	request.graphForConfig = func(resolved *kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
+		graph, ok := graphs[resolved.Name]
+		if !ok {
+			return kconfig.CompactConfigGraph{}, fmt.Errorf(
+				"no preloaded Kbuild graph for config %q",
+				resolved.Name,
+			)
+		}
+		return graph, nil
+	}
+	return nil
 }
 
 func prepareCompactMetadata(
@@ -1167,8 +1125,7 @@ func prepareCompactMetadata(
 	generatedHeadersByConfig map[string]string,
 	kernelVersion string,
 	compileEnvironmentABI string,
-	ccProfile *ccprofile.Profile,
-	probeRecorder *kconfig.StructuralProbeRecorder,
+	graphProfile *kconfig.GraphProfileShell,
 ) (*compactMetadataRequest, error) {
 	if kbuildPath == "" {
 		return nil, fmt.Errorf("-kbuild is required")
@@ -1234,9 +1191,8 @@ func prepareCompactMetadata(
 		options: opts,
 		graphForConfig: func(resolved *kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
 			kbuildOpts := kconfig.KbuildOptions{
-				Variables:     kbuildVariablesForConfig(vars, resolved),
-				CCProfile:     ccProfile,
-				ProbeRecorder: probeRecorder,
+				Variables:    kbuildVariablesForConfig(vars, resolved),
+				GraphProfile: graphProfile,
 			}
 			var kb *kconfig.KbuildFile
 			var parseErr error
@@ -1291,16 +1247,6 @@ func linuxRootMakefiles(rootDir string, vars map[string]string) []string {
 	return nil
 }
 
-func compactBuildfileExports(buildfileOut, metadataOut string) []string {
-	if buildfileOut == "" || metadataOut == "" {
-		return nil
-	}
-	if filepath.Dir(buildfileOut) != filepath.Dir(metadataOut) {
-		return nil
-	}
-	return []string{filepath.Base(metadataOut)}
-}
-
 func kbuildVariablesForConfig(base map[string]string, config *kconfig.ResolvedConfig) map[string]string {
 	vars := map[string]string{}
 	for key, value := range base {
@@ -1325,15 +1271,4 @@ func workspacePath(path string) string {
 		return path
 	}
 	return filepath.Join(workspace, path)
-}
-
-func inferLabelPackage(path string) string {
-	if path == "" || filepath.IsAbs(path) {
-		return ""
-	}
-	dir := filepath.Dir(path)
-	if dir == "." {
-		return ""
-	}
-	return filepath.ToSlash(dir)
 }

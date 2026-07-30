@@ -2,7 +2,8 @@
 
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
-load("//internal:cc_profile.bzl", "linux_cc_profile_context")
+load("//internal:flag_programs.bzl", "linux_flag_programs")
+load("//internal:graph_profile.bzl", "linux_graph_profile_context")
 load(
     "//internal:linux_object_groups.bzl",
     "LinuxObjectActionGroupInfo",
@@ -56,6 +57,12 @@ _IMPORT_RECIPE_ID = "23232323232323232323232323232323232323232323232323232323232
 _IMPORT_FIRST_CONTENT_ID = "2424242424242424242424242424242424242424242424242424242424242424"
 _IMPORT_SECOND_CONTENT_ID = "2525252525252525252525252525252525252525252525252525252525252525"
 _IMPORT_MODULE_CONTENT_ID = "2626262626262626262626262626262626262626262626262626262626262626"
+_FLAGS_TERMINAL_ID = "2727272727272727272727272727272727272727272727272727272727272727"
+_REMOVE_TERMINAL_ID = "2828282828282828282828282828282828282828282828282828282828282828"
+_EMPTY_TERMINAL_ID = "2929292929292929292929292929292929292929292929292929292929292929"
+_FLAGS_PROGRAM_ID = "3030303030303030303030303030303030303030303030303030303030303030"
+_REMOVE_PROGRAM_ID = "3131313131313131313131313131313131313131313131313131313131313131"
+_EMPTY_PROGRAM_ID = "3232323232323232323232323232323232323232323232323232323232323232"
 
 _SOURCE_PATHS = [
     "cross_tree/leaf.c",
@@ -217,7 +224,7 @@ def _group_test_impl(ctx):
     asserts.equals(env, 2, len(info.objects))
     asserts.equals(env, 2, len(compiles))
     asserts.equals(env, 2, len(objtools))
-    asserts.equals(env, 2, len(_actions_with_mnemonic(actions, "LinuxFlagFilter")))
+    asserts.equals(env, 0, len(_actions_with_mnemonic(actions, "LinuxFlagFilter")))
 
     outputs = {}
     for action in compiles:
@@ -225,8 +232,8 @@ def _group_test_impl(ctx):
         if action.outputs.to_list():
             outputs[action.outputs.to_list()[0].path] = action
         asserts.true(env, "compile" in action.argv)
-        asserts.true(env, "-arg=-DNO_GCSE=" in action.argv)
-        asserts.true(env, "-remove=-Werror" in action.argv)
+        asserts.true(env, "-flags_file" in action.argv)
+        asserts.true(env, "-remove_flags_file" in action.argv)
         asserts.true(env, "-remove=-fcolor-diagnostics" in action.argv)
     asserts.equals(env, 2, len(outputs))
     objtool_inputs = {}
@@ -308,7 +315,7 @@ def _composite_group_test_impl(ctx):
         inputs = [file.basename for file in links[0].inputs.to_list()]
         asserts.true(env, "first.o" in inputs)
         asserts.true(env, "second.o" in inputs)
-        asserts.true(env, "-fuse-ld=lld" in links[0].argv)
+        asserts.true(env, "-base_arg" in links[0].argv)
         asserts.true(env, "-r" in links[0].argv)
     return analysistest.end(env)
 
@@ -426,6 +433,30 @@ _failure_test = analysistest.make(
     expect_failure = True,
 )
 
+def _static_flag_programs(name, graph_profile):
+    linux_flag_programs(
+        name = name,
+        graph_profile = graph_profile,
+        nodes = {},
+        probes = {},
+        programs = {
+            _EMPTY_PROGRAM_ID: _EMPTY_TERMINAL_ID,
+            _FLAGS_PROGRAM_ID: _FLAGS_TERMINAL_ID,
+            _REMOVE_PROGRAM_ID: _REMOVE_TERMINAL_ID,
+        },
+        source_root = "//tests/compile:source/Kconfig",
+        terminals = {
+            _EMPTY_TERMINAL_ID: json.encode([]),
+            _FLAGS_TERMINAL_ID: json.encode([
+                "-DNO_GCSE=$(cflags-nogcse-yy)",
+                "-Wall",
+                "-Werror",
+            ]),
+            _REMOVE_TERMINAL_ID: json.encode(["-Werror"]),
+        },
+        tags = ["manual"],
+    )
+
 def linux_object_groups_test_suite(name):
     fake_objtool = name + "_fake_objtool"
     native.genrule(
@@ -437,12 +468,19 @@ def linux_object_groups_test_suite(name):
         tags = ["manual"],
     )
 
-    profile = name + "_cc_profile"
-    linux_cc_profile_context(
+    profile = name + "_graph_profile"
+    linux_graph_profile_context(
         name = profile,
         arch = "x86_64",
-        profile = ":cc_profile.json",
+        graph_projection = ":graph_projection.json",
+        kbuild_linker = "@llvm//tools:ld.lld",
+        source_root = "//tests/compile:source/Kconfig",
         tags = ["manual"],
+    )
+    flag_programs = name + "_flag_programs"
+    _static_flag_programs(
+        name = flag_programs,
+        graph_profile = ":" + profile,
     )
 
     environments = name + "_compile_environments"
@@ -473,14 +511,11 @@ def linux_object_groups_test_suite(name):
     linux_object_action_group(
         name = group,
         arch = "x86",
-        cc_profile = ":" + profile,
         compile_environment_index = ":" + environments,
-        flags = [
-            "-DNO_GCSE=$(cflags-nogcse-yy)",
-            "-Wall",
-            "-Werror",
-        ],
+        flag_program = _FLAGS_PROGRAM_ID,
+        flag_programs = ":" + flag_programs,
         flag_effects = ["argv"],
+        graph_profile = ":" + profile,
         language = "c",
         mode = "y",
         objtool = ":" + fake_objtool,
@@ -507,7 +542,7 @@ def linux_object_groups_test_suite(name):
         ],
         reachability_id = _REACHABILITY_ID,
         recipe_id = _RECIPE_ID,
-        remove_flags = ["-Werror"],
+        remove_flag_program = _REMOVE_PROGRAM_ID,
         remove_flag_effects = ["argv"],
         source_paths = _SOURCE_PATHS,
         source_root = "//tests/compile:source/Kconfig",
@@ -532,9 +567,11 @@ def linux_object_groups_test_suite(name):
     linux_object_action_group(
         name = fdt_group,
         arch = "x86",
-        cc_profile = ":" + profile,
         compile_environment_index = ":" + environments,
+        flag_program = _EMPTY_PROGRAM_ID,
+        flag_programs = ":" + flag_programs,
         flag_effects = ["argv"],
+        graph_profile = ":" + profile,
         language = "c",
         mode = "y",
         objtool = ":" + fake_objtool,
@@ -550,6 +587,7 @@ def linux_object_groups_test_suite(name):
         reachable_configs = ["base"],
         reachability_id = _REACHABILITY_ID,
         recipe_id = _FDT_RECIPE_ID,
+        remove_flag_program = _EMPTY_PROGRAM_ID,
         remove_flag_effects = ["argv"],
         source_paths = [
             "include/linux/compiler-version.h",
@@ -731,7 +769,7 @@ def linux_object_groups_test_suite(name):
     grouped_image = name + "_grouped_image"
     linux_grouped_image(
         name = grouped_image,
-        cc_profile = ":" + profile,
+        graph_profile = ":" + profile,
         objects = ":" + image_projection,
         tags = ["manual"],
     )
@@ -745,7 +783,9 @@ def linux_object_groups_test_suite(name):
     linux_composite_object_action_group(
         name = composite_group,
         arch = "x86",
-        cc_profile = ":" + profile,
+        flag_program = _EMPTY_PROGRAM_ID,
+        flag_programs = ":" + flag_programs,
+        graph_profile = ":" + profile,
         member_groups = [":" + group],
         mode = "y",
         objects = {
@@ -764,7 +804,8 @@ def linux_object_groups_test_suite(name):
         ],
         reachability_id = _REACHABILITY_ID,
         recipe_id = _COMPOSITE_RECIPE_ID,
-        relocatable_link_flags = ["-fuse-ld=lld"],
+        remove_flag_program = _EMPTY_PROGRAM_ID,
+        relocatable_link_flags = ["-r"],
         tags = ["manual"],
     )
     composite_group_test = name + "_composite_group_test"
@@ -798,9 +839,11 @@ def linux_object_groups_test_suite(name):
     linux_object_action_group(
         name = module_group,
         arch = "x86",
-        cc_profile = ":" + profile,
         compile_environment_index = ":" + environments,
+        flag_program = _EMPTY_PROGRAM_ID,
+        flag_programs = ":" + flag_programs,
         flag_effects = ["argv"],
+        graph_profile = ":" + profile,
         language = "c",
         mode = "m",
         module_root = True,
@@ -815,6 +858,7 @@ def linux_object_groups_test_suite(name):
         reachable_configs = ["base"],
         reachability_id = _REACHABILITY_ID,
         recipe_id = _MODULE_RECIPE_ID,
+        remove_flag_program = _EMPTY_PROGRAM_ID,
         remove_flag_effects = ["argv"],
         source_paths = _SOURCE_PATHS,
         source_root = "//tests/compile:source/Kconfig",
@@ -850,12 +894,19 @@ def linux_object_groups_test_suite(name):
         target_under_test = ":" + grouped_modules,
     )
 
-    nvhe_profile = name + "_nvhe_cc_profile"
-    linux_cc_profile_context(
+    nvhe_profile = name + "_nvhe_graph_profile"
+    linux_graph_profile_context(
         name = nvhe_profile,
         arch = "aarch64",
-        profile = ":cc_profile_aarch64.json",
+        graph_projection = ":graph_projection_aarch64.json",
+        kbuild_linker = "@llvm//tools:ld.lld",
+        source_root = "//tests/compile:source/Kconfig",
         tags = ["manual"],
+    )
+    nvhe_flag_programs = name + "_nvhe_flag_programs"
+    _static_flag_programs(
+        name = nvhe_flag_programs,
+        graph_profile = ":" + nvhe_profile,
     )
     nvhe_headers = name + "_nvhe_generated_headers"
     _fake_arm64_generated_headers(
@@ -884,9 +935,11 @@ def linux_object_groups_test_suite(name):
     linux_object_action_group(
         name = nvhe_member_group,
         arch = "arm64",
-        cc_profile = ":" + nvhe_profile,
         compile_environment_index = ":" + nvhe_environments,
+        flag_program = _EMPTY_PROGRAM_ID,
+        flag_programs = ":" + nvhe_flag_programs,
         flag_effects = ["argv"],
+        graph_profile = ":" + nvhe_profile,
         language = "c",
         mode = "y",
         objects = {
@@ -900,6 +953,7 @@ def linux_object_groups_test_suite(name):
         reachable_configs = ["base"],
         reachability_id = _NVHE_REACHABILITY_ID,
         recipe_id = _NVHE_MEMBER_RECIPE_ID,
+        remove_flag_program = _EMPTY_PROGRAM_ID,
         remove_flag_effects = ["argv"],
         source_paths = _NVHE_MEMBER_SOURCE_PATHS,
         source_root = "//tests/compile:source/Kconfig",
@@ -910,8 +964,10 @@ def linux_object_groups_test_suite(name):
     nvhe_group = name + "_nvhe_group"
     linux_arm64_nvhe_object_action_group(
         name = nvhe_group,
-        cc_profile = ":" + nvhe_profile,
         compile_environment_index = ":" + nvhe_environments,
+        flag_program = _EMPTY_PROGRAM_ID,
+        flag_programs = ":" + nvhe_flag_programs,
+        graph_profile = ":" + nvhe_profile,
         member_groups = [":" + nvhe_member_group],
         objcopy = "@llvm//tools:llvm-objcopy",
         objects = {
@@ -929,7 +985,8 @@ def linux_object_groups_test_suite(name):
         reachable_configs = ["base"],
         reachability_id = _NVHE_REACHABILITY_ID,
         recipe_id = _NVHE_RECIPE_ID,
-        relocatable_link_flags = ["-fuse-ld=lld"],
+        remove_flag_program = _EMPTY_PROGRAM_ID,
+        relocatable_link_flags = ["-r"],
         source_paths = _NVHE_SOURCE_PATHS,
         source_root = "//tests/compile:source/Kconfig",
         srcs = _NVHE_SRCS,

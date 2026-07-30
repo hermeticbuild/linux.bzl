@@ -1,0 +1,4435 @@
+{
+  "schema": "linux.bzl/toolchain-graph-profile-v1",
+  "architecture": "x86_64",
+  "driver_contract": "gnu-cc-response-v1",
+  "analysis_identity": {
+    "compiler": "clang",
+    "target_gnu_system_name": "x86_64-unknown-linux-gnu"
+  },
+  "kconfig_commands": [
+    {
+      "id": "0053befc7dc098ed041dc1fe6d2b4352b4a5782c1e366eda6c3fa00887042623",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=alignment -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "01438d2b964dc4177952d2f69caefdf55b70697602d8cd5374e95d2581581581",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize-coverage=trace-cmp -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "034c17197f63a305eae67301815fc44b23e9a3d6e42dbf2abd34333cdeb99b54",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -mharden-sls=all -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "03b1d5c1938e25e48dfbb0f3e19259839700343a81e811eccc27e76176e87c59",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=thread --param tsan-compound-read-before-write=1 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "04fbbabbf9e8b53b904b7449de576f05371594ec958ba4841329a93bd1cf2af3",
+      "kind": "success",
+      "command": "test -z \"Clang 220108\"",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "07fd3c222cf9fe5fa558da59c782313bb905b1b6750491b7e532c2fb95df1108",
+      "kind": "success",
+      "command": "test \"LLD\" = LLD",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "086fb5b4a37c98204079fe878c3bc71a4e797acd94dacafd34b771c3453585b9",
+      "kind": "success",
+      "command": "ld.lld -v --compress-debug-sections=zlib",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "0b29481d8963562709d3b3cd9d0c43b483d5170e81ffa97f432d90428eb17237",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as  -fmin-function-alignment=8 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "0c565537f6c670c223f3392bb437415f906b3bdfae15008581f9cd02ae05e789",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as  -fcf-protection=branch -mindirect-branch-register -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "0d8ea3ad6960a24302e91eaaf01d4b82d3b3c102986b1125b45264520ed934ca",
+      "kind": "success",
+      "command": "test \"LLD\" = BFD",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "109a96fc414ca3a39add0bfa167abaad47fce47d8c66270a61ab88c55cf52e89",
+      "kind": "stdout",
+      "command": "set -- Clang 220108 \u0026\u0026 echo $2",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "stdout": "220108"
+    },
+    {
+      "id": "11128329bf29de684f68b03058fbfbcdfb8799f470cc1863ef275dcd650e7424",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize-ignorelist=/dev/null -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "1680fe2d7f463c2ecadc90b0864d4367e4c73d8405e8dee123b80c7dee67b25a",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -Wunreachable-code-fallthrough -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "17eedc13d7b6b44aa84927df426052cc9163399394f3de94175b13ac8ef231e8",
+      "kind": "success",
+      "command": "test -e /include/plugin-version.h",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "1af9d6d62a263f43c96322e624c345d2eec4cd878bdd4ba748a5ff6e885341a8",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=thread -mllvm -tsan-compound-read-before-write=1 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "1d4098108da6610edd39a30cb50db1cb98a77a1227aab36e3e684020a5888c89",
+      "kind": "stdout",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/pahole-version.sh pahole",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/pahole-version.sh": "7640978c9f22186f8305f7574c5713a731ce5ad9dca6dc2e762f214208208ecc"
+      },
+      "stdout": "131"
+    },
+    {
+      "id": "1d6666cdc247704493063e92da3dd09e60ff0274ae7d08cab764c4ca1bc16c66",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -ffunction-sections -fdata-sections -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "22b47a20cbfcc0ac992a15a26605c4c59c9465d20d3837f07198a27e0d27dae9",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as  -fsanitize=kernel-address -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "256e745af56f06cab26cdccc989c5c906c225df172905e5b46aa56f134c3fa54",
+      "kind": "success",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/cc-can-link.sh clang -fintegrated-as   -m64 -static",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/cc-can-link.sh": "f7adbb3ca747604e365f268ec5acddf877d2e599193f03f6d8ebb550f7d0330d"
+      },
+      "success": false
+    },
+    {
+      "id": "264efc72e16373669c6fb253f5322ff54f6e03a69a64787045959712bd9fdf4b",
+      "kind": "success",
+      "command": "printf \"%b\\n\" \"wrussq %rax,(%rbx)\" | clang -fintegrated-as -m64 -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "26e3117bc8f9483b52b62742e9aa96339ca59538eec699fa99e97b62056d7e15",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -gz=zstd -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "2a6271341df09b7138068595bd4491fe7a4c6f1cb50b52f6c7ee3ca6e909d69f",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=unreachable -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "2ae286b024ade74433ad3227835d91fba5d8908380a82a6e18f8de6f90b8bed1",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fstack-protector-strong -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "2e277cb63513942fc38a0d5a1e6d2a1c331f6ffc23b1f7f2dae626b87b52496d",
+      "kind": "success",
+      "command": "ld.lld -v --compress-debug-sections=zstd",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "3007c8a568d1755d9dc58059688101c8144a86895235d2963de37873fee774ab",
+      "kind": "success",
+      "command": "test \"LLVM\" = LLVM",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "38752905e2a19cc6203066868b6931ad5fe07d6b14b8a12ba4774841f9435907",
+      "kind": "success",
+      "command": "test -z \"LLD 220108\"",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "3c529bf79b43c6b7aa659954c7263ad460d3729180b0a1bb9cd2521d479b6454",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=kcfi -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "3d33d6ddf0f9432543bb7db2da9c8aba28a88f84dd34fe049b39030b9c23f33d",
+      "kind": "success",
+      "command": "test \"Clang\" = Clang",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "3d6f975667b2e02eebc62c070151674f5702a01fcfc5ab80d738d8c1eb4a449d",
+      "kind": "success",
+      "command": "printf \"%b\\n\" \"vpclmulqdq \\$0x10,%ymm0,%ymm1,%ymm2\" | clang -fintegrated-as  -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "3d71230a57089a06e98c3e22201c0755ed29bf512f8e099413b9eab14b07946d",
+      "kind": "success",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/cc-can-link.sh clang -fintegrated-as   -m64",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/cc-can-link.sh": "f7adbb3ca747604e365f268ec5acddf877d2e599193f03f6d8ebb550f7d0330d"
+      },
+      "success": false
+    },
+    {
+      "id": "3daceac4b621de3c9eec5f98956f388e23a501341d178d2d29cde36923bc3124",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize-coverage=trace-pc -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "3e1db0f4afaea1427890de47c59bb6788fb72b52ca73d70833458153b7d45bbc",
+      "kind": "stdout",
+      "command": "set -- LLD 220108 \u0026\u0026 echo $2",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "stdout": "220108"
+    },
+    {
+      "id": "40633e8c58935c59d868b67f7bafdaf43cefa736a3dc68a1402fe84e542b0dfb",
+      "kind": "success",
+      "command": "command -v ld.lld",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "40971500da44f6146deec7288b80425c908f2a15599019b57f7c9255d378beb8",
+      "kind": "stdout",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/ld-version.sh ld.lld",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/ld-version.sh": "2760ed371a6465b365a0a251a879c14d5de21451d6fe99c6090be69845c23c8a",
+        "scripts/min-tool-version.sh": "24b28bb8c3aaef69c00aac6273bf2b914c7bc452f68f9c4dc671d6670c1a3ffe"
+      },
+      "stdout": "LLD 220108"
+    },
+    {
+      "id": "40f4d79ef641651074888395cff0b28b35b95bdc2ffd164776b602c8cb60cbe9",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=thread -mllvm -tsan-distinguish-volatile=1 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "42507602bf69fe49fc39d5fe4078e2e1576abc288db47a82f97b3087147d9575",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=array-bounds -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "470b93e6b855664d92860f45c69223c371f8e56370ef80e62e8c61cb298907d5",
+      "kind": "success",
+      "command": "echo 'char tag[][4] __attribute__((__nonstring__)) = { };' | clang -fintegrated-as -x c - -c -o /dev/null -Werror",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "47e46084fce05792cdfd023f6ecc024d5bcac3720f8451ba023fd13283adcf84",
+      "kind": "success",
+      "command": "echo 'int __seg_fs fs; int __seg_gs gs;' | clang -x c - -S -o /dev/null",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "4943d86b3e20dc9512fc5afaefd25b6a41f38470e504518c9dde068ffe6563a0",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=integer-divide-by-zero -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "4daf5008a9ac5c20fd69d27d2986ac7101f04799371d9754c57f257960da5806",
+      "kind": "stdout",
+      "command": "set -- LLVM 0 \u0026\u0026 echo $1",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "stdout": "LLVM"
+    },
+    {
+      "id": "5244701121860304c934ec4b86733411af3f7c8e0c25cb8421ed08c2b6820d2a",
+      "kind": "success",
+      "command": "printf \"%b\\n\" \"sha1msg1 %xmm0,%xmm1\" | clang -fintegrated-as  -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "5516af6bc9d8a12ee46a61745399c47f324e2150aac3486d4566b608ceb46a0b",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -gz=zlib -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "587a5161cd70fbfd8dfba9bf3f8c613a583eee65958c6da03d3aa0af73bdecf9",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=bool -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "58ed52335f56a581cb375ea22d1c5960043dbbbd5513b2291d195bce64ca0656",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=kernel-memory -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "59791bbf37c1eaef1c8b7e14bfdba5cb06624a82fd4ae5fa63c743528ff1881e",
+      "kind": "stdout",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/rustc-llvm-version.sh rustc",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/rustc-llvm-version.sh": "ac22cc2339c4df97062f47574f4bb97c939b09e1d0cd9648df8c65a7fd10aaac"
+      },
+      "stdout": "220106"
+    },
+    {
+      "id": "5a0247b7a24979f09c623fb836303ee10d492e424941ea2ae29d5a68acb1dc93",
+      "kind": "success",
+      "command": "echo 'int foo(int *x) { asm goto (\".long (%l[bar]) - .\": \"+m\"(*x) ::: bar); return *x; bar: return 0; }' | $CC -x c - -c -o /dev/null",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "6339f1aa1f7ba0ecb117ffb3de2dae79707fdf7c263083cf1af480fed4b898f5",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize-undefined-ignore-overflow-pattern=all -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "6400ef461a2c760fffd492564802868a2a4bb6217b60660bbe1153693f226578",
+      "kind": "stdout",
+      "command": "clang -print-file-name=plugin",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "stdout": "plugin"
+    },
+    {
+      "id": "6481a4b62d130db4b9e5338c56e14e80ab393cef651658c3b108c834e78133b9",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=thread --param tsan-distinguish-volatile=1 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "679ef53574bfb327a8c8aa14529ddab4b6059f5f36f9379c3855cafcf2b579c2",
+      "kind": "success",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/gcc-x86_64-has-stack-protector.sh clang -fintegrated-as",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/gcc-x86_64-has-stack-protector.sh": "ee2f2a268824702b4426dc1cef605297f50d81451fe02e5d60b0be43a1f18401"
+      },
+      "success": true
+    },
+    {
+      "id": "6bac57b61158190caddd6a65d0da1a70720a4bb17999bb1bee2f99a2486f819b",
+      "kind": "success",
+      "command": "clang -Werror -m32 -E -x c /dev/null -o /dev/null",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "6d7b485940e9c8252b763a3ca091e2ca817ba513c6ce81c2dd7bcb0fc60fecf4",
+      "kind": "success",
+      "command": "printf \"%b\\n\" \"vgf2p8mulb %xmm0,%xmm1,%xmm2\" | clang -fintegrated-as  -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "6fef6d64a7b9cdf8021df2f0e6ac23f3259f8d79fbf6955e809aa3eeaab4f1aa",
+      "kind": "stdout",
+      "command": "set -- LLVM 0 \u0026\u0026 echo $2",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "stdout": "0"
+    },
+    {
+      "id": "727ad78581a6965424857bf3dc6557b42d9b2cc7d7d69f18dddcbdac3c0912d2",
+      "kind": "success",
+      "command": "llvm-objcopy --version | head -n1 | grep -qv llvm",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "7496678ab1035177b687b6bec63944682e97afe3a02c1bca39c36cccf202b1ff",
+      "kind": "success",
+      "command": "test -e plugin/include/plugin-version.h",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "75664cfca8fea9c043a7f8bf1bb0284f037b1891a4012333bce2fc5a85788500",
+      "kind": "success",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/cc-can-link.sh clang -fintegrated-as   -m32",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/cc-can-link.sh": "15d4a43559eb0be77fc23ddc4144f4b041417bbc19c5b009312558d7068d5f7d"
+      },
+      "success": false
+    },
+    {
+      "id": "786da99abfb9a5a0385b3297725348ce92323d250c30a4b8617c034e92cad345",
+      "kind": "success",
+      "command": "env \"CC=clang\" \"LD=ld.lld\" \"NM=llvm-nm\" \"OBJCOPY=llvm-objcopy\" __LINUX_BZL_SRCTREE__/scripts/tools-support-relr.sh",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/tools-support-relr.sh": "b52d3e808bcee5720643472ebe4101ff5d3774dec42f0efe2699878a2b5bfede"
+      },
+      "success": true
+    },
+    {
+      "id": "7e2daad6681a87d6698f8a64b5305010830bd0002f0036f99bc1c454809118cd",
+      "kind": "success",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/cc-can-link.sh clang -fintegrated-as   -m64",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/cc-can-link.sh": "15d4a43559eb0be77fc23ddc4144f4b041417bbc19c5b009312558d7068d5f7d"
+      },
+      "success": false
+    },
+    {
+      "id": "7f852221cb7c0d72cc588d90ed7ed5b5fb58fbc1e0881bbd656a91c51da5967e",
+      "kind": "success",
+      "command": "echo 'void foo(void) { asm inline (\"\"); }' | clang -x c - -c -o /dev/null",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "84c342a044cfe3b90a0dc77de5e6a166cc6743f270cc66b0b497012828591ea1",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=kernel-address -mllvm -asan-kernel-mem-intrinsic-prefix=1 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "859e27f7a77d0f5920a0aa74977496c98670c47bee9f1ad44ae980438afdbbbe",
+      "kind": "success",
+      "command": "echo 'int foo(int x) { asm goto (\"\": \"=r\"(x) ::: bar); return x; bar: return 0; }' | clang -x c - -c -o /dev/null",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "86d841c96ec71290e1def8466f7424491e67fbc027e4aa6e9a02719a9460defa",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=shift -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "86ed880cb5ae19f92b61e28eb387531fccde4f55850f84791f3054c2b16307f7",
+      "kind": "success",
+      "command": "echo 'void b(void **);void* c(void);int f(void){{asm goto(\"\"::::l0);return 0;l0:return 1;}void *x __attribute__((cleanup(b)))=c();{asm goto(\"\"::::l1);return 2;l1:return 3;}}' | clang -x c - -c -o /dev/null",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "8725428f79d658c3bd025e859a50b7f6c16c83f1155e7a0155c72f00e3f67740",
+      "kind": "success",
+      "command": "printf \"%b\\n\" \"endbr64\" | clang -fintegrated-as  -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "892474743900bbe7ea0cbf293b1ad34ccf2109da4e7edcb741e080433b6f576e",
+      "kind": "stdout",
+      "command": "set -- Clang 220108 \u0026\u0026 echo $1",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "stdout": "Clang"
+    },
+    {
+      "id": "895cb530a2fda995976828571efc6e42ffef279398bb121800185887a6756312",
+      "kind": "success",
+      "command": "clang -Werror -m64 -E -x c /dev/null -o /dev/null",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "8bb492016057ab6ff58513226891aa55738156a4ad2536bc6321d0be38595f70",
+      "kind": "stdout",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/ld-version.sh ld.lld",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/ld-version.sh": "2760ed371a6465b365a0a251a879c14d5de21451d6fe99c6090be69845c23c8a",
+        "scripts/min-tool-version.sh": "6c71a37dccde47bc2e7ea27776f0a37128d0d3a9742235dd59ec55b918332f02"
+      },
+      "stdout": "LLD 220108"
+    },
+    {
+      "id": "8c21c0120505b905d978475ca378c34db6c5b9b5b57d74d4aaf767c643c78c8d",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as  -fsanitize=kernel-hwaddress -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "8e2fab3985296f825b872e586db32adaa8faedf5d392991e90a0a382353bcb5a",
+      "kind": "success",
+      "command": "printf \"%b\\n\" \"sha256msg1 %xmm0,%xmm1\" | clang -fintegrated-as  -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "9229705213f6fcd6eda92c18b07d1ae1544a129b889f6517dc24f6432a035021",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fpatchable-function-entry=16 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "96ef0fc0d08da6526cf5cf4c3155d6014746ebbc0c107b7973aebddbd3e0bf36",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -ftrivial-auto-var-init=pattern -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "9870b6887dd3dd20cb72a868f3fce642d524180a6aac53090eb111912a42297b",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=implicit-signed-integer-truncation -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "9c85cd1f7df026192ec56e6030df6097fd2c4e9f9fafbde4febf3f88e3e7b549",
+      "kind": "success",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/cc-can-link.sh clang -fintegrated-as   -m32 -static",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/cc-can-link.sh": "f7adbb3ca747604e365f268ec5acddf877d2e599193f03f6d8ebb550f7d0330d"
+      },
+      "success": false
+    },
+    {
+      "id": "9e73011d2a6c3fa3b9cc8f66ecd6d235e4292e87004b4b60425a5be2e1e089a3",
+      "kind": "success",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/gcc-x86_32-has-stack-protector.sh clang -fintegrated-as",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/gcc-x86_32-has-stack-protector.sh": "b3f3577b3265aaa44907a678975c04e2f4b10aff072abbc6d48c516a6f1ce6ae"
+      },
+      "success": true
+    },
+    {
+      "id": "9e9f4baf204ae2b8b658a22d35ecc478a67aed8d50761d91c598487a7fd3ffce",
+      "kind": "success",
+      "command": "ld.lld -v --orphan-handling=error",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "a4d2fed904cdb5c907dab0d2dc674e66cdfb1eb1ede29c3b54b0fdbdf983ed6b",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -ftrivial-auto-var-init=zero -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "a586c111131283a7861f2e46736e9cf22a6cb3adb89b59660599c4dae02865e1",
+      "kind": "success",
+      "command": "echo 'struct flex { int count; int array[] __attribute__((__counted_by__(count))); };' | clang -fintegrated-as -x c - -c -o /dev/null -Werror",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "a7fe7484ae2f91276b35f316e31ef8a5701b30a4a268cb652553264b7ea3cd97",
+      "kind": "success",
+      "command": "python3 -c \"import lxml\"",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "ab1783ad988d19ac9b1f90712fe8889c271c437fa596388b20626deecb9217f1",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fzero-call-used-regs=used-gpr -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "ab786fabf37280869358ebf936701353b625849347a37aacbfe00c108eb61866",
+      "kind": "success",
+      "command": "ld.lld -v --orphan-handling=warn",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "ac22cca3fdb160cb0b09b4c35162e3319e5057dcb1a926b706aee8e0aa69a11f",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=unsigned-integer-overflow -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "ad0448356b02af0c3c17e291f9f57226a74022c98725b47218111d6a3fac063f",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize-coverage-stack-depth-callback-min=1 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "b0d033b0e796a8823f71953aeea139ebe329d2940ebbc8d8bdbf156c085c3365",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -ftrivial-auto-var-init=zero -enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "b37f3383a10cbf1f30b99ab0118a633a74b3cfa9cd9607092f29f1e5a75533bf",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=kernel-memory -fsanitize-memory-param-retval -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "b4f3fdf121d82cb3f73d1d89a9f7ed3bfa03fa15b7234c664a947d5f36ef45e7",
+      "kind": "success",
+      "command": "printf \"%b\\n\" \".uleb128 .Lexpr_end4 - .Lexpr_start3\\n.Lexpr_start3:\\n.Lexpr_end4:\" | clang -fintegrated-as  -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "b63a2b726b0685687690f983883e6b41a16f83303a43ebd8f8f8f09f1aa35111",
+      "kind": "success",
+      "command": "printf \"%b\\n\" \"vaesenc %ymm0,%ymm1,%ymm2\" | clang -fintegrated-as  -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "b708dd8bf54ad842dfabb4e4c36b47794fbd3a0e629dc45b6353f74dd7922fb7",
+      "kind": "stdout",
+      "command": "set -- LLD 220108 \u0026\u0026 echo $1",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "stdout": "LLD"
+    },
+    {
+      "id": "b79aa1a6606d7ad2a7c46415313b9d4533fcb2394619dd06fad2074addaec1ce",
+      "kind": "stdout",
+      "command": "bindgen --version workaround-for-0.69.0 2\u003e/dev/null",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "stdout": "bindgen 0.72.1"
+    },
+    {
+      "id": "b8d071a2c869282fcc0b222f89cc5a8327dde0c5bc619919c2be76ef5b336a1a",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -Wimplicit-fallthrough=5 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "bae8b334001407db5afbb76fddb9ddd5a3e1d3380bc0be06f80cb0525c9ce003",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=kernel-address --param asan-kernel-mem-intrinsic-prefix=1 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "bbb9ecd3d1f334cf6b1cf1bb1a4006fe760ec1806799ec862ee27fdbdb3c5b6a",
+      "kind": "success",
+      "command": "command -v clang",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "bee5d7dd7a35c871b12b5d76d8c90c7e832a3efc6733d65b7d590a6b0e008773",
+      "kind": "success",
+      "command": "llvm-ar --help | head -n 1 | grep -qi llvm",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "bfd9a1bb287a72c30e11e3fcbb330fd062c16389f18afbe55b74d10ed4badc57",
+      "kind": "stdout",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/as-version.sh clang -fintegrated-as",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/as-version.sh": "431def986dc25a7228c54f0be86bb6e787bf0b0b85f361baa8fcba38320b779d",
+        "scripts/min-tool-version.sh": "6c71a37dccde47bc2e7ea27776f0a37128d0d3a9742235dd59ec55b918332f02"
+      },
+      "stdout": "LLVM 0"
+    },
+    {
+      "id": "c08f1c2519785a581d768681038429e9ab492b6cd5d3791cd32eab55eeee4a33",
+      "kind": "success",
+      "command": "test \"LLVM\" = GNU",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "c18c388baf594c8c5d9294a51b0e216799d4c735f93c9323b55b2394be7be50c",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=bounds-strict -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "c2eb266ae44578d339fc0aa43603f37942bc7bbbb77ffa06f07db9f955ff2145",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=signed-integer-overflow -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "c2fa8d45f681bf839660c88eda548f82bf4cde82bffc3299ac5885125e7d33a1",
+      "kind": "stdout",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/cc-version.sh clang",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/cc-version.sh": "2e7a69d846a36a3aa79db0e3d4910a38d1d1d4627bd69f7498b446b52069ca73",
+        "scripts/min-tool-version.sh": "6c71a37dccde47bc2e7ea27776f0a37128d0d3a9742235dd59ec55b918332f02"
+      },
+      "stdout": "Clang 220108"
+    },
+    {
+      "id": "c37fb9365dfa4dd3496e2ae0c1c20869fa3f502a40d23a7d2bce8fc5499a968a",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -frandomize-layout-seed-file=/dev/null -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "ca89806442651b637b4878f21c28b2cc359262d86180178acf8900a81cfd7182",
+      "kind": "stdout",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/as-version.sh clang -fintegrated-as",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/as-version.sh": "431def986dc25a7228c54f0be86bb6e787bf0b0b85f361baa8fcba38320b779d",
+        "scripts/min-tool-version.sh": "24b28bb8c3aaef69c00aac6273bf2b914c7bc452f68f9c4dc671d6670c1a3ffe"
+      },
+      "stdout": "LLVM 0"
+    },
+    {
+      "id": "cbef532653302f45b4ac56e599334b76fd72cd789bd37ce022d50ebf1f0414a7",
+      "kind": "success",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/rust_is_available.sh",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/cc-version.sh": "2e7a69d846a36a3aa79db0e3d4910a38d1d1d4627bd69f7498b446b52069ca73",
+        "scripts/min-tool-version.sh": "24b28bb8c3aaef69c00aac6273bf2b914c7bc452f68f9c4dc671d6670c1a3ffe",
+        "scripts/rust_is_available.sh": "746e99804970eef59d173937af48e1ab3bec31236a131c74d6262311e6d769ad",
+        "scripts/rust_is_available_bindgen_0_66.h": "80dc61b7867f6daa9c23e9b5ecf471dedc373018ac735775df527d18f20be84d",
+        "scripts/rust_is_available_bindgen_libclang.h": "bf71d14ea244116ab8c6d61c593d37be3c9c346e13d0569a10acdfec63739e21",
+        "scripts/rust_is_available_bindgen_libclang_concat.h": "16cf96b3179a6b47d2fab9a43958498317fcba8524a475697167ec9f641b1778"
+      },
+      "success": true
+    },
+    {
+      "id": "cfed9de07047724c7c29ecd00f3477a73bafe8e7db05c71d7ab6cc92a6afb155",
+      "kind": "success",
+      "command": "printf \"%b\\n\" \"vpmovm2b %k1,%zmm5\" | clang -fintegrated-as  -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "d0c1d6473a31fa7c81873dc34ae3910b136b1acac35408cd01ee2e04d0ecb461",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=kcfi -fsanitize-cfi-icall-experimental-normalize-integers -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "d3436eaa0c5f1e285059f431b299bda6181a6a9c2ff7646880fc577a7b736f03",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=enum -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "d3d4795d49ace605a5b0a543bbdd6da4e79e0a2dfba7a30c582bc3be5af3d156",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -m64 -D__SIZEOF_INT128__=0 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "d4251f40d212a09abb921da6df2af0fb615a56ce05b76a78e57583f599bcfd51",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=kcfi -fsanitize-kcfi-arity -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "d6c9fcc509c2767a3b84712a60509bfdb4eb94b70243172ee4021653229e5a25",
+      "kind": "stdout",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/cc-version.sh clang",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/cc-version.sh": "2e7a69d846a36a3aa79db0e3d4910a38d1d1d4627bd69f7498b446b52069ca73",
+        "scripts/min-tool-version.sh": "24b28bb8c3aaef69c00aac6273bf2b914c7bc452f68f9c4dc671d6670c1a3ffe"
+      },
+      "stdout": "Clang 220108"
+    },
+    {
+      "id": "d7b5c559ddbd1b004d10b4be76dd5f5d7d44f1e83b040c757bc9fb90d4749a27",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -mrecord-mcount -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "d880b0a4de987e106d34d26afcca9a3c4a8884c53b36a24bf1b7c7cc3020b1bf",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=implicit-unsigned-integer-truncation -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "da6a8e2adfc6e0fb045707caa07507364ae7b8c86bf9658b9ff02292f71692f1",
+      "kind": "success",
+      "command": "llvm-nm --help | head -n 1 | grep -qi llvm",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "dd314c0d91ed49d331513c39503133c1f285d82220314552980bdaf967565b8a",
+      "kind": "success",
+      "command": "echo '__attribute__((no_profile_instrument_function)) int x();' | clang -x c - -c -o /dev/null -Werror",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "e5399449f7dd37a577863f458750123f5171f5c0b62d9572f2a2d93eaa834836",
+      "kind": "success",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/rust_is_available.sh",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/cc-version.sh": "2e7a69d846a36a3aa79db0e3d4910a38d1d1d4627bd69f7498b446b52069ca73",
+        "scripts/min-tool-version.sh": "6c71a37dccde47bc2e7ea27776f0a37128d0d3a9742235dd59ec55b918332f02",
+        "scripts/rust_is_available.sh": "edee50618ccba0f03bce184ce678ef73bf1f7794560c4f0cc429f78594f990f7",
+        "scripts/rust_is_available_bindgen_0_66.h": "80dc61b7867f6daa9c23e9b5ecf471dedc373018ac735775df527d18f20be84d",
+        "scripts/rust_is_available_bindgen_libclang.h": "bf71d14ea244116ab8c6d61c593d37be3c9c346e13d0569a10acdfec63739e21",
+        "scripts/rust_is_available_bindgen_libclang_concat.h": "16cf96b3179a6b47d2fab9a43958498317fcba8524a475697167ec9f641b1778"
+      },
+      "success": true
+    },
+    {
+      "id": "e54a91f96139df34036aad106214ada6045219dc68e6a755c1d9ab91422f07be",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fstack-protector -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "e69f5434465b9698c808e64db4d630dcabd07aef176d0d8ed6451d130c5b186c",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -gsplit-dwarf -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "e9fdba861a1d521d2d260023162802af87f8caaba1296702a7e965a9fdd38bfa",
+      "kind": "success",
+      "command": "test \"Clang\" = GCC",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "ed8b6b44246a820ccdce903a4c29a97df56655744fa1f22ffba23fddb10cf7b6",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fsanitize=kernel-memory -mllvm -msan-disable-checks=1 -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "efc2af1abb545916ea9a144fe7edd2fd92b358289b2b55aa7f9d2d596e526f7a",
+      "kind": "success",
+      "command": "ld.lld -v --gc-sections",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "f1dc05d359e9c765433ecba3bbc364948735cae6c457981d28c4cb2d3205f47a",
+      "kind": "success",
+      "command": "printf \"%b\\n\" \"tpause %ecx\" | clang -fintegrated-as  -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "f9cbdb9f6d178710f7c8095a2c4184261da89d660b255132ff54b472dd3fb915",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -mfunction-return=thunk-extern -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "fabd887bd5dce0c38e9cc461043103a824c1d804c4ed24ae354116f185fcab86",
+      "kind": "stdout",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/rustc-version.sh rustc",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/rustc-version.sh": "ec495ec0fe8a9b53f17d73c9bdd00e3d1d8fca875f3de1cfe19b68dc80e0db3a"
+      },
+      "stdout": "107800"
+    },
+    {
+      "id": "fbcfada6822d19997203c7aa3d2121d697fd4859ce8d928897d152fdb327c29a",
+      "kind": "success",
+      "command": "trap \"rm -rf .tmp_$$\" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as  -march=native -c -x c /dev/null -o .tmp_$$/tmp.o",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": true
+    },
+    {
+      "id": "fe73233d3f2135b08e2b90c207a895ae87fc937331969cd4451cc4e8d3b400ee",
+      "kind": "success",
+      "command": "test -z \"LLVM 0\"",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {},
+      "success": false
+    },
+    {
+      "id": "ff12884fb4c9857dfc6ca8daced71debbe53ed936941a1bd282c0666d24eb4fe",
+      "kind": "success",
+      "command": "__LINUX_BZL_SRCTREE__/scripts/cc-can-link.sh clang -fintegrated-as   -m32",
+      "environment": {
+        "AR": "llvm-ar",
+        "ARCH": "x86",
+        "BINDGEN": "bindgen",
+        "CC": "clang",
+        "CC_VERSION_TEXT": "clang version 22.1.8None",
+        "CLANG_FLAGS": "-fintegrated-as",
+        "LD": "ld.lld",
+        "NM": "llvm-nm",
+        "OBJCOPY": "llvm-objcopy",
+        "PAHOLE": "pahole",
+        "PYTHON3": "python3",
+        "RUSTC": "rustc",
+        "SRCARCH": "x86"
+      },
+      "inputs": {
+        "scripts/cc-can-link.sh": "f7adbb3ca747604e365f268ec5acddf877d2e599193f03f6d8ebb550f7d0330d"
+      },
+      "success": false
+    }
+  ],
+  "kbuild_graph_probes": [
+    {
+      "id": "0582e1ccc5036ae7021097f3b1160263d0c01232739c50f90305a41f2186b978",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wno-gnu"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "06b17b084d2e46f42fb0fe50bbab62c3955ecb7858c74850ba6e54b78fcd3f7c",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=winchip2"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "0737de96e6701cc7af04500268a9e649a5ddb3a1f14845c988c5c4a0129553dd",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-mtune=pentium3"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "08c3c2730e3af6f4106f151ff3605323d9e2fa2269c52fa7536078fe6cf4cdd1",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=generic"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "0ae047eec50c2b2477bc8f51363f50d922a2df807346ad45e3018e7aee0b86bb",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-mstack-alignment=16"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "11ff56f0c531cbe1af251f0b29c26efbb764fcdb722aa17b6d4905c0437f5e6f",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wformat-truncation"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "163f3a98040879153f1a6d66caa5863209cc8f5b7de7377ba843b365bb443e82",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=core2"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "17e6a9b1dd6a58b8a01e52d05a484542920facfce09051b96f5013bcda106955",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-fno-conserve-stack"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "197d89e8fe54d38220b2dbd4b2c3e3d0f8e76d0ebd7a03524fb37d4cb39b5957",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wno-vla"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "243003a99cc3015d057321e147ae37902894d920cfd3967d70d22562ca98310f",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=c3"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "2d05dc0a45dde4eab9f9b7d59a477868c56d2b644f9627b016537709f318d3e0",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-march=winchip2"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "321d68e9f588e81c2c49762c10edecff78455a2613df204d3148fe8789e209dd",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-march=atom"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "35dc8fd72b8d0ab28f353e3c4d37aeae00f9aa5a04a3d8a23113d6fb550cbd64",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=k8"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "3b6f8e7af2785935a6d64a3cb38fd1fda2eb365db7ca0c3bf4a8b3d8b63357af",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=c3"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "3c5da9712d284b39c07ffa489986d9ba7c10df1c237028b44649489ed98c0a27",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wrestrict"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "3d2bdc1ab11e6c0a77545f4a63d3a2444e342015a79f4d0b891afa08e0afc5fd",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-mtune=core2"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "43a7add15df329ddfa8be38af86d7ae9888da8b70df0bd07e207f8a0e64a0897",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-fcf-protection=none"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "486d43f18b4fed2dec84f00d69f994a73a797ed15ab63bf309672f431ad6dcd9",
+      "kind": "ld_option",
+      "language": "link",
+      "context_argv": [
+        "-m",
+        "elf_x86_64"
+      ],
+      "candidate_argv": [
+        "--no-warn-rwx-segments"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "49c59f9b88f42ef53b8cd364e8f5f049eb6c85421857b780c6ef625e6ca27dde",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=pentium3"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "4ac4d53f76e1089b5baa85fb0ce1a5f9eca428bfd68bea1abc6b4b9c33061f3b",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-falign-loops=0"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "4ddc9dfc9df5855b974290e91d9cb9b577db72435f42ad22f97fda7064460a9c",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-falign-loops=0"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "4ec9292d672961b1d0e51c61880e88f3d630e4a51185ed39c1033ddf0ef3f54b",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=generic"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "56e83786c05a6847296b80631cddeaa8379d11bb6e9a6aa95962195dd7ab1118",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=winchip-c6"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "5a4fbb36162746637bf2f0eca460af993d7f132fcc31487eb80096952213e4d3",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-march=winchip-c6"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "600caa96b5f9caacf322542a8615f3a54af93c6fcefad065c4e9a7aa6905e424",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wmaybe-uninitialized"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "601fce699b04b9ec26b8a82ee34fa0655f32d3847f25c7be195a2ccc99efe9a0",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=pentium2"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "62882f6d476a40bca4f37ec8dd2ceb07e5b0364fbe99d744e20806a737b43d3b",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=winchip2"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "65b11bf1203759328511ff3a14f2908d207b347a02f4a4217a0feea992ac1834",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wunused-but-set-variable"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "6715a1cccfeef0d318a1521ef3bc69156450ed360eb07b81e033ed2e87d997dd",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-Wa,-mtune=generic32"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "69849d1983890ad518eeb96dec030c851189e660e6321e761c897e2f84922fc8",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=winchip-c6"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "69b706dadf6cfa391a55e4b8e3b5d1c4652d241d363cd6025074eaa57e6fc2af",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=c3-2"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "6c55a4cd57e312d95d9a47e2bfe2eec6f21db961bd6b2b188840f5cc146dc79c",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wformat-overflow"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "731398f6fd38954ca9a9e2b502d03186db67afa851e8e55ae266e31250c42d01",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=atom"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "741f5d2e210b9791935e9ccf652a9080d6a9a82a959817a99060ce21c1f2d3af",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-march=core2"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "75cba7531a6a338efda1680da30266b8f932787d6fc2caaa7b35e412c5eafa6d",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-falign-jumps=0"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "7849c721d67b01466a81d449279ae5de2bec04736fdb881fdc1748f48bc1aa1e",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-mtune=pentium2"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "7b04000d4fca5895e10271d2b5d580bd1551b4723fd8839deb16ff8682ff8ae9",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-march=c3-2"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "7c12efb6ab488800805c206ec9acfd702d2303b641f14e926d91c6a4e258478c",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-falign-loops=0"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "7caa83e7be2e70ab0cd95c2c1b8156b963ef5a71e3f89df0299a0d6024ad640f",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=i686"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "7ce5565b6827944ac4a9402e627f53d7c71f77bb021092da79bb6fa44185224b",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=pentium4"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "7f9beb5e1f5f5b272a48eca71b98edec0daac04d4f5a01b445002ef69d1dcc1c",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=pentium3"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "8296b0f11178bee329868fe34abc0fc0ed4c6b5f2c77499ead7909c4860b4390",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-march=geode"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "8310b7cc909a44403a7dc761aaed5e04bdc4b2c1a791a8df9b79da44f2d1aaf9",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-fcf-protection=branch",
+        "-fno-jump-tables"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "833005c844752ebab0abb73da24f12aa833b0f77234de555d2a1aecada7a10e2",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=i686"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "85c99ae1d1042c9a980cadb4f6d4c2e23068aea8acca6a0436dbd93dac28e085",
+      "kind": "ld_option",
+      "language": "link",
+      "context_argv": [
+        "-m",
+        "elf_x86_64"
+      ],
+      "candidate_argv": [
+        "--no-ld-generated-unwind-info"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "85d6bfb30c8451d9183899b00cd6c2d41001eacb4c7d9d37821ce1219bd61f9b",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=geode"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "8affff4809c95734c39ac016e64ad05a8d0bf68a26d30b56765c45a7c313deba",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-march=k8"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "8feb77f187a7e0b0b33847260fb0369636028ffce0508be6150397add9714cd2",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wstringop-truncation"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "95d645bb2848e724d62c726c14fdfa05faae879192a9e9278574ac41b480aeb2",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wno-address-of-packed-member"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "9b4c1d992c8cc883806b6b45e5833bfe7ea1bb9ace239292d6c68f5bd0d973e9",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-mindirect-branch-cs-prefix"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "9e53f88cd50c391bc157dac4fa5557c6a540eeebb30433c2b13dced872e1bdf5",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=c3-2"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "a0fe9ee84005d037c14a39a8e858dad82865d5c4b08263fd3968c32b024d5a62",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-mpreferred-stack-boundary=4"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "a2ab5ff462c41d02a0ddea8d36f0053f9113bb06692d2312711bba69e5196c76",
+      "kind": "ld_option",
+      "language": "link",
+      "context_argv": [
+        "-m",
+        "elf_x86_64",
+        "--no-ld-generated-unwind-info"
+      ],
+      "candidate_argv": [
+        "--no-dynamic-linker"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "a3046879a1a56ad111c424047f54501bdd68c34c742318a283a8b8c75b999688",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-Wa,-mtune=generic32"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "a323cef092ad75890489560dac70e4b0c5bad5ab4d18f49c5a1d8031ae9d0b73",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=geode"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "a43e4971f67fa28235c586dd0f3b0bebef6e1c671b7082762447302bf6ef9534",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-Wa,-mtune=generic32"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "b7324c8895f67f7db700a0d174019a8a8e589fd003e25a1b0683fcb8074e3c1c",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-mtune=atom"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "b8782d8e750aeee649f25ee49a84115af4294e0bc0ba8ecc6e90b402e30fd2ba",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-falign-jumps=0"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "bdcd5600412af911179643d10e14f3a040b20988028eb8092e57fc55964bdfef",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-mabi=altivec"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "becd8a60d10957dafe7dffa30e990ecce95010f7859def1082539d9b68001804",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=atom"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "c16c57be193c93ac755f16bf30babc19fa3738554448db8c845049adc494d76c",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-march=core2"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "c3051fcb3bfe2f25a00a1e3de54eed7bdeeae041d8dbcb21c6280672d96685f7",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=pentium2"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "c62078e04ddf08ad73f05ac5393f63f6c2a9b7fd4b544007ac5f825ed5a55ffd",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-mtune=generic"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "c6ad92a8f3b1491050eea97a39e745ec5f2840857586e27a1f4ebd96fde02dd6",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-mtune=pentium4"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "ce75bb324daa771ce7cda6c679b9b7345e1f2064476b07619f11093c1853d125",
+      "kind": "ld_option",
+      "language": "link",
+      "context_argv": [
+        "-m",
+        "elf_x86_64",
+        "--no-ld-generated-unwind-info"
+      ],
+      "candidate_argv": [
+        "--no-warn-rwx-segments"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "d7532a714cc59d90be7b49f7923aa318f0630de11555349e7080dbccf408443f",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-march=c3"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "d86a9354769711faffa68691f32edcdd578fd3c510e75ecf512146aa521245ae",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wpacked-not-aligned"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "dff87b7b6eade6e7056acd7a7c785ec240c9ab3972a407c6e7b1cf68de7d5b01",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-foptimize-sibling-calls"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "e61732f3440d99299fd3bb0ed69a0006a1a39a4a4f976f087cb5fe7529916ce1",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wstringop-overflow"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "e7e1129727a613b90f4e17d3da8f905d4344546b510ace6a8be510f90a2a140e",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-falign-jumps=0"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "f228f1c95f833240553e3cac3706747e68b8d31099e96a631a8a152e0151921d",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mpreferred-stack-boundary=2"
+      ],
+      "candidate_argv": [
+        "-mtune=i686"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "f33436b02feedeff6c1ed090cc82bf75f08979df8b174192e8465b13437cf693",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror",
+        "-mno-sse",
+        "-mno-mmx",
+        "-mno-sse2",
+        "-mno-3dnow",
+        "-mno-avx",
+        "-mno-sse4a",
+        "-fcf-protection=branch",
+        "-fno-jump-tables",
+        "-fcf-protection=none",
+        "-m32",
+        "-msoft-float",
+        "-mregparm=3",
+        "-freg-struct-return",
+        "-fno-pic",
+        "-mstack-alignment=4"
+      ],
+      "candidate_argv": [
+        "-mtune=pentium4"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "fd530588669db8768ac0aaf0cfaa71196084cbed6f2545ef553bc1c6655f2992",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-mno-single-pic-base"
+      ],
+      "inputs": {},
+      "supported": false
+    },
+    {
+      "id": "ffa6362e480f8e2a7520b276093de2f8f9de38aaab17e64cb3afe38590560727",
+      "kind": "cc_option",
+      "language": "c",
+      "context_argv": [
+        "-Werror"
+      ],
+      "candidate_argv": [
+        "-Wunused-const-variable"
+      ],
+      "inputs": {},
+      "supported": true
+    },
+    {
+      "id": "ffd622b712ddc5ce6fd28c06a0fe6572bfb2dbc04d4214938b891a8791cc3e2a",
+      "kind": "ld_option",
+      "language": "link",
+      "context_argv": [
+        "-m",
+        "elf_x86_64"
+      ],
+      "candidate_argv": [
+        "--no-dynamic-linker"
+      ],
+      "inputs": {},
+      "supported": true
+    }
+  ]
+}

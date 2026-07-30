@@ -62,8 +62,12 @@ func DecodeValidationStamp(data []byte) (ValidationStamp, error) {
 	if err := validateDigest(compilerIdentityDigest, "compiler_identity_digest"); err != nil {
 		return ValidationStamp{}, err
 	}
-	if validationScope != "compiler" {
-		return ValidationStamp{}, fmt.Errorf("validation_scope %q, want %q", validationScope, "compiler")
+	if validationScope != "configured-graph" {
+		return ValidationStamp{}, fmt.Errorf(
+			"validation_scope %q, want %q",
+			validationScope,
+			"configured-graph",
+		)
 	}
 	return ValidationStamp{
 		ProfileDigest:          profileDigest,

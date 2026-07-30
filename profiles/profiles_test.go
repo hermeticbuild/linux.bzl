@@ -2,7 +2,6 @@ package profiles_test
 
 import (
 	"bytes"
-	"encoding/json"
 	"flag"
 	"os"
 	"path/filepath"
@@ -13,57 +12,48 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/ccprofile"
 )
 
-const structuralProbeRequestsSchema = "linux.bzl/cc-structural-probe-requests-v1"
-
-type requestManifest struct {
-	Schema           string                      `json:"schema"`
-	StructuralProbes []ccprofile.StructuralProbe `json:"structural_probes"`
-}
-
-func TestCheckedInProfilesCoverExampleRequests(t *testing.T) {
+func TestCheckedInGraphProfiles(t *testing.T) {
 	type profileCase struct {
 		architecture string
 		profile      string
-		requests     string
-		total        int
-		supported    int
+		commands     int
+		graphProbes  int
+		inputFiles   int
 	}
 	cases := []profileCase{
 		{
 			architecture: "x86_64",
-			profile:      "llvm_22_1_8_x86_64.json",
-			requests:     "llvm_22_1_8_x86_64.requests.json",
-			total:        63,
-			supported:    36,
+			profile:      "llvm_22_1_8_x86_64.graph.json",
+			commands:     122,
+			graphProbes:  75,
+			inputFiles:   15,
 		},
 		{
 			architecture: "aarch64",
-			profile:      "llvm_22_1_8_aarch64.json",
-			requests:     "llvm_22_1_8_aarch64.requests.json",
-			total:        42,
-			supported:    23,
+			profile:      "llvm_22_1_8_aarch64.graph.json",
+			commands:     121,
+			graphProbes:  18,
+			inputFiles:   13,
 		},
 	}
 	if paths := flag.Args(); len(paths) != 0 {
-		if len(paths) != 4 {
-			t.Fatalf("got %d profile test paths, want 4", len(paths))
+		if len(paths) != 2 {
+			t.Fatalf("got %d profile test paths, want 2", len(paths))
 		}
 		cases[0].profile = paths[0]
-		cases[0].requests = paths[1]
-		cases[1].profile = paths[2]
-		cases[1].requests = paths[3]
+		cases[1].profile = paths[1]
 	}
 
 	for _, test := range cases {
 		t.Run(test.architecture, func(t *testing.T) {
 			profileData := readProfileTestData(t, test.profile)
-			profile, err := ccprofile.Decode(profileData)
+			profile, err := ccprofile.DecodeGraphProfile(profileData)
 			if err != nil {
-				t.Fatalf("Decode(profile) failed: %v", err)
+				t.Fatalf("DecodeGraphProfile(profile) failed: %v", err)
 			}
-			canonical, err := ccprofile.CanonicalJSON(profile)
+			canonical, err := ccprofile.CanonicalGraphProfileJSON(profile)
 			if err != nil {
-				t.Fatalf("CanonicalJSON(profile) failed: %v", err)
+				t.Fatalf("CanonicalGraphProfileJSON(profile) failed: %v", err)
 			}
 			if !bytes.Equal(profileData, canonical) {
 				t.Fatal("checked-in profile is not canonical JSON")
@@ -71,51 +61,67 @@ func TestCheckedInProfilesCoverExampleRequests(t *testing.T) {
 			if got, want := profile.Architecture, test.architecture; got != want {
 				t.Fatalf("profile architecture = %q, want %q", got, want)
 			}
+			if got, want := len(profile.KconfigCommands), test.commands; got != want {
+				t.Fatalf("profile command count = %d, want %d", got, want)
+			}
+			if got, want := len(profile.KbuildGraphProbes), test.graphProbes; got != want {
+				t.Fatalf("profile Kbuild graph probe count = %d, want %d", got, want)
+			}
+			if bytes.Contains(profileData, []byte("/home/")) ||
+				bytes.Contains(profileData, []byte("/workspace/")) {
+				t.Fatal("profile contains a machine-local absolute path")
+			}
 
-			requestData := readProfileTestData(t, test.requests)
-			if bytes.Contains(requestData, []byte("null")) {
-				t.Fatal("request manifest contains null")
-			}
-			if bytes.Contains(requestData, []byte("$(")) ||
-				bytes.Contains(requestData, []byte("${")) {
-				t.Fatal("request manifest contains unresolved Make syntax")
-			}
-			var manifest requestManifest
-			if err := json.Unmarshal(requestData, &manifest); err != nil {
-				t.Fatalf("Unmarshal(requests) failed: %v", err)
-			}
-			if got, want := manifest.Schema, structuralProbeRequestsSchema; got != want {
-				t.Fatalf("request schema = %q, want %q", got, want)
-			}
-			if got, want := len(manifest.StructuralProbes), test.total; got != want {
-				t.Fatalf("request count = %d, want %d", got, want)
-			}
-			for _, probe := range manifest.StructuralProbes {
-				for _, arg := range append(
-					append([]string{}, probe.PrefixArgv...),
-					probe.Argv...,
-				) {
-					if strings.Contains(arg, "/") &&
-						!strings.Contains(arg, ccprofile.StructuralProbeSourceRoot) &&
-						!strings.Contains(arg, ccprofile.StructuralProbeObjectRoot) {
-						t.Fatalf("request %s contains a non-canonical path in %q", probe.ID, arg)
+			inputs := map[string]bool{}
+			minToolVersions := map[string]bool{}
+			for _, command := range profile.KconfigCommands {
+				for _, name := range []string{"CC", "LD", "OBJCOPY", "PYTHON3"} {
+					if _, ok := command.Environment[name]; !ok {
+						t.Fatalf("command %s has no %s environment entry", command.ID, name)
+					}
+				}
+				for path, digest := range command.Inputs {
+					if filepath.IsAbs(path) ||
+						path == ".." ||
+						strings.HasPrefix(path, "../") ||
+						strings.Contains(path, "\\") {
+						t.Fatalf("command %s has unsafe input path %q", command.ID, path)
+					}
+					inputs[path] = true
+					if path == "scripts/min-tool-version.sh" {
+						minToolVersions[digest] = true
 					}
 				}
 			}
-			if err := ccprofile.ValidateStructuralProbeCoverage(
-				profile,
-				manifest.StructuralProbes,
-			); err != nil {
-				t.Fatalf("profile request coverage failed: %v", err)
-			}
-			supported := 0
-			for _, probe := range profile.StructuralProbes {
-				if probe.Supported {
-					supported++
+			for _, probe := range profile.KbuildGraphProbes {
+				for path := range probe.Inputs {
+					if filepath.IsAbs(path) ||
+						path == ".." ||
+						strings.HasPrefix(path, "../") ||
+						strings.Contains(path, "\\") {
+						t.Fatalf("Kbuild graph probe %s has unsafe input path %q", probe.ID, path)
+					}
 				}
 			}
-			if got, want := supported, test.supported; got != want {
-				t.Fatalf("supported request count = %d, want %d", got, want)
+			if got, want := len(inputs), test.inputFiles; got != want {
+				t.Fatalf("profile source input count = %d, want %d", got, want)
+			}
+			for _, required := range []string{
+				"scripts/cc-version.sh",
+				"scripts/min-tool-version.sh",
+				"scripts/rust_is_available.sh",
+				"scripts/rust_is_available_bindgen_libclang.h",
+			} {
+				if !inputs[required] {
+					t.Fatalf("profile does not contain transitive source input %q", required)
+				}
+			}
+			if got, want := len(minToolVersions), 2; got != want {
+				t.Fatalf(
+					"profile covers %d min-tool-version.sh contents, want %d kernel-version variants",
+					got,
+					want,
+				)
 			}
 		})
 	}

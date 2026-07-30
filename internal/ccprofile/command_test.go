@@ -123,28 +123,3 @@ func TestParseBuiltinMacrosAndCompilerVersion(t *testing.T) {
 		t.Fatal("function-like macro was retained")
 	}
 }
-
-func TestValidateProfileIdentityUsesExpectedMacroSubset(t *testing.T) {
-	profile := validProfile()
-	actual := CompilerIdentity{
-		Schema:           CompilerIdentitySchema,
-		Architecture:     profile.Architecture,
-		DriverContract:   profile.DriverContract,
-		AnalysisIdentity: profile.AnalysisIdentity,
-		CCName:           profile.KconfigIdentity.CCName,
-		CCVersion:        profile.KconfigIdentity.CCVersion,
-		CCVersionText:    profile.KconfigIdentity.CCVersionText,
-		BuiltinMacros: map[string]string{
-			"__SIZEOF_INT128__": "16",
-			"UNPROFILED_MACRO":  "allowed",
-		},
-	}
-	if err := ValidateProfileIdentity(profile, actual); err != nil {
-		t.Fatalf("ValidateProfileIdentity() failed: %v", err)
-	}
-	actual.BuiltinMacros["__SIZEOF_INT128__"] = "8"
-	if err := ValidateProfileIdentity(profile, actual); err == nil ||
-		!strings.Contains(err.Error(), "__SIZEOF_INT128__") {
-		t.Fatalf("ValidateProfileIdentity(mismatch) error = %v", err)
-	}
-}
