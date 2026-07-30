@@ -171,7 +171,15 @@ func (t *Tree) ResolveConfigWithOptions(name string, raw map[string]string, opts
 				continue
 			}
 			deps := resolver.evalDepExprDefault(sym.DirDep, triY)
-			rawAllowed := minResolvedTri(resolver.baseTri(sym), deps)
+			// scripts/kconfig/symbol.c:sym_calc_value() clamps the user
+			// value and the default by prop->visible.tri (the prompt/
+			// default condition), NOT by sym->dir_dep.tri. dir_dep is the
+			// OR of every definition's inherited menu dependency, so a
+			// symbol defined twice -- once in a dead "if" block, once
+			// unconditionally -- carries the dead block's condition in
+			// dir_dep. ANDing it here disables the symbol even though its
+			// live definition applies. dir_dep only bounds "implied".
+			rawAllowed := resolver.baseTri(sym)
 			impliedAllowed := triN
 			if !resolver.visibleUserValue(sym) {
 				impliedAllowed = minResolvedTri(resolver.evalDepExprDefault(sym.Implied, triN), deps)
