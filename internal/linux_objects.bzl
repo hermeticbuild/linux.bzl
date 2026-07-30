@@ -3360,6 +3360,7 @@ def _materialize_linux_config(ctx, config_dir, flags, arch, version):
         cflags_args = ctx.actions.args()
         cflags_args.add("-config", info.config)
         cflags_args.add("-arch", arch)
+        cflags_args.add("-version", version)
         cflags_args.add("-out", info.cflags)
         cflags_args.add("-asm_out", info.aflags)
         path_mapped_run(
@@ -3908,6 +3909,7 @@ def _resolve_linux_config(ctx, rust_toolchain_probe):
     cflags_args = ctx.actions.args()
     cflags_args.add("-config", config)
     cflags_args.add("-arch", env.get("ARCH", "x86"))
+    cflags_args.add("-version", ctx.attr.version)
     cflags_args.add("-out", cflags)
     cflags_args.add("-asm_out", aflags)
     path_mapped_run(
@@ -6555,6 +6557,7 @@ def _linux_x86_inat_tables(ctx):
 
 def _linux_x86_compressed_compile(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, src, object, extra_inputs = [], extra_include_dirs = []):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + object)
+    decompress_mm_header = _source_tree_file(ctx, "include/linux/decompress/mm.h")
     hidden_header = _source_tree_file(ctx, "include/linux/hidden.h")
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
@@ -6606,7 +6609,7 @@ def _linux_x86_compressed_compile(ctx, compiler, cc_toolchain, feature_configura
     path_mapped_run(
         ctx.actions,
         executable = compiler,
-        inputs = _linux_x86_boot_inputs(ctx, cc_toolchain, config, generated_headers, extra = [src, hidden_header] + extra_inputs),
+        inputs = _linux_x86_boot_inputs(ctx, cc_toolchain, config, generated_headers, extra = [src, decompress_mm_header, hidden_header] + extra_inputs),
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxX86CompressedCompile",

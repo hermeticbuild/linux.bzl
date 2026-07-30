@@ -15,6 +15,8 @@ import (
 //go:embed main.go
 var kernelflagsSource string
 
+const testKernelVersion = "6.18.2"
+
 func TestKernelFlagsConfigSymbolsCoverSource(t *testing.T) {
 	known := map[string]bool{}
 	for _, symbol := range kconfig.KernelFlagsConfigSymbols() {
@@ -87,8 +89,8 @@ func TestMaterializeConfigPayloads(t *testing.T) {
 			"--cfg=CONFIG_STRING=\"value\"",
 			"",
 		}, "\n"),
-		filepath.Join(root, "include", "generated", "bazel_kbuild_aflags.rsp"): responseFile(linuxAFlags(config, "x86")),
-		filepath.Join(root, "include", "generated", "bazel_kbuild_cflags.rsp"): responseFile(linuxCFlags(config, "x86")),
+		filepath.Join(root, "include", "generated", "bazel_kbuild_aflags.rsp"): responseFile(linuxAFlags(config, "x86", "6.18.39")),
+		filepath.Join(root, "include", "generated", "bazel_kbuild_cflags.rsp"): responseFile(linuxCFlags(config, "x86", "6.18.39")),
 	}
 	for path, want := range expected {
 		got, err := os.ReadFile(path)
@@ -173,7 +175,7 @@ func TestLinuxAFlagsX86IncludeFtraceUsingDefines(t *testing.T) {
 		"CONFIG_HAVE_FENTRY":          "y",
 		"CONFIG_X86_64":               "y",
 	}
-	flags := linuxAFlags(config, "x86")
+	flags := linuxAFlags(config, "x86", testKernelVersion)
 	if !contains(flags, "-DCC_USING_FENTRY") {
 		t.Fatalf("linuxAFlags() missing -DCC_USING_FENTRY: %v", flags)
 	}
@@ -189,7 +191,7 @@ func TestLinuxCFlagsX86IncludeFtraceCompilerAndUsingFlags(t *testing.T) {
 		"CONFIG_HAVE_FENTRY":          "y",
 		"CONFIG_X86_64":               "y",
 	}
-	flags := linuxCFlags(config, "x86")
+	flags := linuxCFlags(config, "x86", testKernelVersion)
 	for _, want := range []string{"-pg", "-mrecord-mcount", "-mfentry", "-DCC_USING_FENTRY"} {
 		if !contains(flags, want) {
 			t.Fatalf("linuxCFlags() missing %s: %v", want, flags)
@@ -198,23 +200,32 @@ func TestLinuxCFlagsX86IncludeFtraceCompilerAndUsingFlags(t *testing.T) {
 }
 
 func TestLinuxCFlagsX86ExcludeGCCOnlyAlignmentFlag(t *testing.T) {
-	flags := linuxCFlags(map[string]string{"CONFIG_X86_64": "y"}, "x86")
+	flags := linuxCFlags(map[string]string{"CONFIG_X86_64": "y"}, "x86", testKernelVersion)
 	if contains(flags, "-falign-jumps=1") {
 		t.Fatalf("linuxCFlags() contains GCC-only -falign-jumps=1: %v", flags)
 	}
 }
 
 func TestLinuxCFlagsX86UPUseGlobalStackProtectorGuard(t *testing.T) {
-	for _, config := range []map[string]string{
+	for _, test := range []struct {
+		config  map[string]string
+		version string
+	}{
 		{
-			"CONFIG_STACKPROTECTOR": "y",
-			"CONFIG_X86_64":         "y",
+			config: map[string]string{
+				"CONFIG_STACKPROTECTOR": "y",
+				"CONFIG_X86_64":         "y",
+			},
+			version: "6.15",
 		},
 		{
-			"CONFIG_STACKPROTECTOR": "y",
+			config: map[string]string{
+				"CONFIG_STACKPROTECTOR": "y",
+			},
+			version: "6.12.96",
 		},
 	} {
-		flags := linuxCFlags(config, "x86")
+		flags := linuxCFlags(test.config, "x86", test.version)
 		if !contains(flags, "-mstack-protector-guard=global") {
 			t.Fatalf("linuxCFlags() missing global stack-protector guard: %v", flags)
 		}
@@ -230,10 +241,35 @@ func TestLinuxCFlagsX86UPUseGlobalStackProtectorGuard(t *testing.T) {
 	}
 }
 
+func TestLinuxCFlagsX8664Before615UsesFixedStackProtectorCanary(t *testing.T) {
+	for _, smp := range []bool{false, true} {
+		config := map[string]string{
+			"CONFIG_STACKPROTECTOR":        "y",
+			"CONFIG_STACKPROTECTOR_STRONG": "y",
+			"CONFIG_X86_64":                "y",
+		}
+		if smp {
+			config["CONFIG_SMP"] = "y"
+		}
+		for _, version := range []string{"6.12.96", "6.14.11", "v6.14"} {
+			flags := linuxCFlags(config, "x86", version)
+			if !contains(flags, "-fstack-protector-strong") {
+				t.Fatalf("linuxCFlags(%q, SMP=%t) disabled stack protection: %v", version, smp, flags)
+			}
+			for _, flag := range flags {
+				if strings.HasPrefix(flag, "-mstack-protector-guard") {
+					t.Fatalf("linuxCFlags(%q, SMP=%t) overrides the fixed %%gs:40 canary with %s: %v", version, smp, flag, flags)
+				}
+			}
+		}
+	}
+}
+
 func TestLinuxCFlagsX86SMPUsePerCPUStackProtectorGuard(t *testing.T) {
 	for _, test := range []struct {
-		config map[string]string
-		reg    string
+		config  map[string]string
+		reg     string
+		version string
 	}{
 		{
 			config: map[string]string{
@@ -241,17 +277,19 @@ func TestLinuxCFlagsX86SMPUsePerCPUStackProtectorGuard(t *testing.T) {
 				"CONFIG_STACKPROTECTOR": "y",
 				"CONFIG_X86_64":         "y",
 			},
-			reg: "gs",
+			reg:     "gs",
+			version: "6.15-rc1",
 		},
 		{
 			config: map[string]string{
 				"CONFIG_SMP":            "y",
 				"CONFIG_STACKPROTECTOR": "y",
 			},
-			reg: "fs",
+			reg:     "fs",
+			version: "6.12.96",
 		},
 	} {
-		flags := linuxCFlags(test.config, "x86")
+		flags := linuxCFlags(test.config, "x86", test.version)
 		for _, want := range []string{
 			"-mstack-protector-guard-reg=" + test.reg,
 			"-mstack-protector-guard-symbol=__ref_stack_chk_guard",
@@ -266,12 +304,31 @@ func TestLinuxCFlagsX86SMPUsePerCPUStackProtectorGuard(t *testing.T) {
 	}
 }
 
+func TestKernelVersionAtLeast(t *testing.T) {
+	for _, test := range []struct {
+		version string
+		want    bool
+	}{
+		{version: "6.12.96", want: false},
+		{version: "v6.14", want: false},
+		{version: "6.15-rc1", want: true},
+		{version: "6.15.0", want: true},
+		{version: "7.0", want: true},
+		{version: "", want: false},
+		{version: "test", want: false},
+	} {
+		if got := kernelVersionAtLeast(test.version, 6, 15); got != test.want {
+			t.Errorf("kernelVersionAtLeast(%q, 6, 15) = %t, want %t", test.version, got, test.want)
+		}
+	}
+}
+
 func TestLinuxCFlagsIncludeClangThinLTO(t *testing.T) {
 	config := map[string]string{
 		"CONFIG_CC_IS_CLANG":    "y",
 		"CONFIG_LTO_CLANG_THIN": "y",
 	}
-	flags := linuxCFlags(config, "arm64")
+	flags := linuxCFlags(config, "arm64", testKernelVersion)
 	for _, want := range []string{"-fno-lto", "-flto=thin", "-fsplit-lto-unit", "-fvisibility=hidden"} {
 		if !contains(flags, want) {
 			t.Fatalf("linuxCFlags() missing %s: %v", want, flags)
@@ -284,7 +341,7 @@ func TestLinuxCFlagsIncludeClangFullLTO(t *testing.T) {
 		"CONFIG_CC_IS_CLANG":    "y",
 		"CONFIG_LTO_CLANG_FULL": "y",
 	}
-	flags := linuxCFlags(config, "arm64")
+	flags := linuxCFlags(config, "arm64", testKernelVersion)
 	for _, want := range []string{"-fno-lto", "-flto", "-fvisibility=hidden"} {
 		if !contains(flags, want) {
 			t.Fatalf("linuxCFlags() missing %s: %v", want, flags)
@@ -296,7 +353,7 @@ func TestLinuxCFlagsUseSectionSplittingForDeadCodeElimination(t *testing.T) {
 	config := map[string]string{
 		"CONFIG_LD_DEAD_CODE_DATA_ELIMINATION": "y",
 	}
-	flags := linuxCFlags(config, "arm64")
+	flags := linuxCFlags(config, "arm64", testKernelVersion)
 	for _, want := range []string{"-ffunction-sections", "-fdata-sections"} {
 		if !contains(flags, want) {
 			t.Fatalf("linuxCFlags() missing %s: %v", want, flags)
@@ -313,7 +370,7 @@ func TestLinuxCFlagsUseO2ForPerformanceOptimization(t *testing.T) {
 	config := map[string]string{
 		"CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE": "y",
 	}
-	flags := linuxCFlags(config, "arm64")
+	flags := linuxCFlags(config, "arm64", testKernelVersion)
 	if !contains(flags, "-O2") {
 		t.Fatalf("linuxCFlags() missing -O2: %v", flags)
 	}
@@ -326,7 +383,7 @@ func TestLinuxCFlagsUseOsForSizeOptimization(t *testing.T) {
 	config := map[string]string{
 		"CONFIG_CC_OPTIMIZE_FOR_SIZE": "y",
 	}
-	flags := linuxCFlags(config, "arm64")
+	flags := linuxCFlags(config, "arm64", testKernelVersion)
 	if !contains(flags, "-Os") {
 		t.Fatalf("linuxCFlags() missing -Os: %v", flags)
 	}
