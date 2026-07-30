@@ -7,7 +7,7 @@ visibility("//...")
 
 KCONFIG_TOOL_VERSION = "v0.0.20"
 
-_RELEASE_BASE_URL = "https://github.com/hermeticbuild/linux.bzl/releases/download/kconfig-{version}".format(
+_RELEASE_BASE_URL = "https://github.com/fionera/linux.bzl/releases/download/kconfig-{version}".format(
     version = KCONFIG_TOOL_VERSION,
 )
 
