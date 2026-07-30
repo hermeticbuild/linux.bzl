@@ -703,7 +703,15 @@ func ensureCompilerShim(
 	for index, arg := range suffix {
 		suffixQuoted[index] = quoteShellWord(arg)
 	}
-	script := "#!" + shell + "\nexec " + strings.Join(quoted, " ") + " \"$@\""
+	// Native CPU discovery is host-dependent and cannot define a reusable
+	// target graph. linux.bzl rejects the corresponding kernel config.
+	script := "#!" + shell + `
+for arg in "$@"; do
+  if [ "$arg" = "-march=native" ]; then
+    exit 1
+  fi
+done
+exec ` + strings.Join(quoted, " ") + ` "$@"`
 	if len(suffixQuoted) != 0 {
 		script += " " + strings.Join(suffixQuoted, " ")
 	}

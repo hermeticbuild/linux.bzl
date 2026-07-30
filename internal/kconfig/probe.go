@@ -86,6 +86,37 @@ func LinuxProbeShellFromConfig(config LinuxProbeConfig) func(context.Context, st
 	return (&linuxProbeShell{config: config}).run
 }
 
+type RustToolchainVersionCommand uint8
+
+const (
+	RustToolchainVersionCommandUnknown RustToolchainVersionCommand = iota
+	RustToolchainVersionCommandRustc
+	RustToolchainVersionCommandLLVM
+)
+
+// ClassifyRustToolchainVersionCommand recognizes the two exact upstream script
+// invocation shapes answerable from the selected Rust compiler identity.
+func ClassifyRustToolchainVersionCommand(command string) RustToolchainVersionCommand {
+	if strings.ContainsAny(command, "\r\n") {
+		return RustToolchainVersionCommandUnknown
+	}
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) != 2 ||
+		fields[1] != "rustc" ||
+		strings.ContainsAny(fields[0]+fields[1], "\"'`;|&<>(){}$*?[]#") {
+		return RustToolchainVersionCommandUnknown
+	}
+	script := strings.ReplaceAll(fields[0], `\`, "/")
+	switch {
+	case strings.HasSuffix(script, "/scripts/rustc-version.sh"):
+		return RustToolchainVersionCommandRustc
+	case strings.HasSuffix(script, "/scripts/rustc-llvm-version.sh"):
+		return RustToolchainVersionCommandLLVM
+	default:
+		return RustToolchainVersionCommandUnknown
+	}
+}
+
 // ApplyLinuxProbeValue applies a single string-keyed override. The key names
 // are intentionally stable CLI/Bazel-facing API, while LinuxProbeConfig remains
 // idiomatic Go.

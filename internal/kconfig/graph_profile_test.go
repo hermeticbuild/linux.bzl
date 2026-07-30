@@ -92,6 +92,62 @@ func TestGraphProfileShellResolvesAndProjectsExactCommand(t *testing.T) {
 	}
 }
 
+func TestGraphProfileShellResolvesRelativeSourceRoot(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "source")
+	script := filepath.Join(root, "scripts", "probe.sh")
+	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("#!/bin/sh\necho ok\n")
+	if err := os.WriteFile(script, content, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	environment := map[string]string{"CC": "clang"}
+	identity, err := ccprofile.NewKconfigCommandIdentity(
+		ccprofile.KconfigCommandKindStdout,
+		graphProfileSourceRoot+"/scripts/probe.sh",
+		environment,
+		map[string]string{
+			"scripts/probe.sh": hex.EncodeToString(sum[:]),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := "ok"
+	profile := ccprofile.GraphProfile{
+		Schema:         ccprofile.GraphProfileSchema,
+		Architecture:   "x86_64",
+		DriverContract: ccprofile.DriverContract,
+		AnalysisIdentity: ccprofile.AnalysisIdentity{
+			Compiler:            "clang",
+			TargetGNUSystemName: "x86_64-unknown-linux-gnu",
+		},
+		KconfigCommands: []ccprofile.KconfigCommand{{
+			ID:          identity.ID,
+			Kind:        identity.Kind,
+			Command:     identity.Command,
+			Environment: identity.Environment,
+			Inputs:      identity.Inputs,
+			Stdout:      &stdout,
+		}},
+	}
+	t.Chdir(parent)
+	shell, err := NewGraphProfileShell(profile, "source", environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := shell.Run(context.Background(), "source/scripts/probe.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != stdout {
+		t.Fatalf("Run() = %q, want %q", got, stdout)
+	}
+}
+
 func TestGraphProfileShellTracksTransitiveSiblingInputChange(t *testing.T) {
 	root := t.TempDir()
 	scripts := filepath.Join(root, "scripts")
@@ -143,6 +199,32 @@ func TestGraphProfileShellTracksTransitiveSiblingInputChange(t *testing.T) {
 	_, err = resolving.Run(context.Background(), command)
 	if err == nil || !strings.Contains(err.Error(), "missing from graph profile") {
 		t.Fatalf("Run() after helper change error = %v", err)
+	}
+}
+
+func TestCanonicalGraphProfileCommandPreservesUnrelatedBackslashes(t *testing.T) {
+	const sourceRoot = `C:\src`
+	for _, test := range []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{
+			name:    "native source root",
+			command: `printf '\n' C:\src\scripts\probe.sh`,
+			want:    `printf '\n' ` + graphProfileSourceRoot + `/scripts/probe.sh`,
+		},
+		{
+			name:    "slash source root",
+			command: `printf '\n' C:/src/scripts/probe.sh`,
+			want:    `printf '\n' ` + graphProfileSourceRoot + `/scripts/probe.sh`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := canonicalGraphProfileCommand(test.command, sourceRoot); got != test.want {
+				t.Fatalf("canonicalGraphProfileCommand() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

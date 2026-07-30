@@ -31,7 +31,7 @@ func TestCheckedInGraphProfiles(t *testing.T) {
 		{
 			architecture: "aarch64",
 			profile:      "llvm_22_1_8_aarch64.graph.json",
-			commands:     122,
+			commands:     124,
 			graphProbes:  18,
 			inputFiles:   13,
 		},
@@ -74,6 +74,7 @@ func TestCheckedInGraphProfiles(t *testing.T) {
 
 			inputs := map[string]bool{}
 			minToolVersions := map[string]bool{}
+			nativeCPUDisabled := false
 			for _, command := range profile.KconfigCommands {
 				for _, name := range []string{"CC", "LD", "OBJCOPY", "PYTHON3"} {
 					if _, ok := command.Environment[name]; !ok {
@@ -91,6 +92,11 @@ func TestCheckedInGraphProfiles(t *testing.T) {
 					if path == "scripts/min-tool-version.sh" {
 						minToolVersions[digest] = true
 					}
+				}
+				if strings.Contains(command.Command, " -march=native ") &&
+					command.Success != nil &&
+					!*command.Success {
+					nativeCPUDisabled = true
 				}
 			}
 			for _, probe := range profile.KbuildGraphProbes {
@@ -122,6 +128,9 @@ func TestCheckedInGraphProfiles(t *testing.T) {
 					got,
 					want,
 				)
+			}
+			if test.architecture == "x86_64" && !nativeCPUDisabled {
+				t.Fatal("x86_64 profile must disable the host-dependent -march=native probe")
 			}
 		})
 	}

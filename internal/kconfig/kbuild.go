@@ -2024,7 +2024,7 @@ func (p *kbuildParser) canonicalizeKbuildProbeArgv(argv []string) []string {
 
 func linuxLLVMProbeSupportsOption(option string) bool {
 	switch option {
-	case "", "-fno-code-hoisting", "-fno-conserve-stack", "-fmin-function-alignment=8", "-fsanitize=kernel-memory", "-mrecord-mcount":
+	case "", "-fno-code-hoisting", "-fno-conserve-stack", "-fmin-function-alignment=8", "-fsanitize=kernel-memory", "-march=native", "-mrecord-mcount":
 		return false
 	default:
 		return true

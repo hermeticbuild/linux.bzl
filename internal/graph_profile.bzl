@@ -38,6 +38,7 @@ LinuxGraphProfileInfo = provider(
         "kbuild_linker": "Explicit raw linker executable used by Kbuild link actions and flag probes.",
         "kbuild_flags_sentinel": "Unique mutable-argv insertion token for resolved Kbuild flags.",
         "projection": "Repository-emitted GraphProjection used to validate the configured toolchain.",
+        "source_inputs": "Exact source files that graph-profile command identities may read.",
         "toolchain_files": "All files required by the selected C toolchain.",
         "validation": "Stamp proving that the selected compiler identity matches the projection.",
     },
@@ -54,12 +55,15 @@ def _compiler_family(cc_toolchain):
         cc_toolchain.compiler,
     )
 
-def _toolchain_file(cc_toolchain, tool_name, tool_path):
-    matches = [
+def _matching_toolchain_files(cc_toolchain, tool_path):
+    return [
         file
         for file in cc_toolchain.all_files.to_list()
         if file.path == tool_path
     ]
+
+def _toolchain_file(cc_toolchain, tool_name, tool_path):
+    matches = _matching_toolchain_files(cc_toolchain, tool_path)
     if len(matches) != 1:
         fail(
             "selected C toolchain %s %r must resolve to exactly one declared toolchain file, got %d" %
@@ -69,19 +73,26 @@ def _toolchain_file(cc_toolchain, tool_name, tool_path):
 
 def _nm_toolchain_file(cc_toolchain, objcopy):
     if cc_toolchain.nm_executable:
-        return _toolchain_file(
+        # Bazel 8 may synthesize a legacy nm path even when no such tool is declared.
+        matches = _matching_toolchain_files(
             cc_toolchain,
-            "nm",
             cc_toolchain.nm_executable,
         )
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            fail(
+                "selected C toolchain nm %r must resolve to at most one declared toolchain file, got %d" %
+                (cc_toolchain.nm_executable, len(matches)),
+            )
     suffix = ".exe" if objcopy.basename.endswith(".exe") else ""
     stem = objcopy.basename.removesuffix(suffix)
     if not stem.endswith("objcopy"):
         fail(
             (
-                "selected C toolchain does not declare nm_executable and objcopy %r cannot " +
+                "selected C toolchain nm_executable %r does not resolve to a declared file and objcopy %r cannot " +
                 "provide the conventional fallback; expected a basename ending in objcopy%s"
-            ) % (objcopy.path, suffix),
+            ) % (cc_toolchain.nm_executable, objcopy.path, suffix),
         )
     nm_basename = stem.removesuffix("objcopy") + "nm" + suffix
     matches = [
@@ -92,9 +103,9 @@ def _nm_toolchain_file(cc_toolchain, objcopy):
     if len(matches) != 1:
         fail(
             (
-                "selected C toolchain does not declare nm_executable and fallback nm %r, " +
+                "selected C toolchain nm_executable %r does not resolve to a declared file and fallback nm %r, " +
                 "derived from objcopy %r, must resolve to exactly one declared toolchain file, got %d"
-            ) % (nm_basename, objcopy.path, len(matches)),
+            ) % (cc_toolchain.nm_executable, nm_basename, objcopy.path, len(matches)),
         )
     return matches[0]
 
@@ -447,6 +458,7 @@ def _linux_graph_profile_context_impl(ctx):
             kbuild_linker = ctx.file.kbuild_linker,
             kbuild_flags_sentinel = _KBUILD_FLAGS_SENTINEL,
             projection = ctx.file.graph_projection,
+            source_inputs = depset(ctx.files.srcs),
             toolchain_files = cc_toolchain.all_files,
             validation = validation,
         ),

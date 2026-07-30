@@ -639,6 +639,45 @@ func TestReplayConfiguredKconfigCommandsInjectsClangTarget(t *testing.T) {
 	}
 }
 
+func TestReplayConfiguredKconfigCommandsRejectsNativeCPUProbe(t *testing.T) {
+	root := t.TempDir()
+	compiler := filepath.Join(root, "selected-compiler")
+	writeProbeTool(t, compiler, "#!/bin/sh\nexit 0\n")
+	unsupported := false
+	command := configuredKconfigCommand(t, KconfigCommand{
+		Kind:        KconfigCommandKindSuccess,
+		Command:     "$CC -Werror -march=native -c -x c /dev/null -o /dev/null",
+		Environment: map[string]string{"CC": "clang", "LD": "ld.lld"},
+		Inputs:      map[string]string{},
+		Success:     &unsupported,
+	})
+	replayed, err := ReplayConfiguredKconfigCommands(
+		context.Background(),
+		[]KconfigCommand{command},
+		KbuildGraphProbeTools{
+			CommandTemplate: testProbeCommandTemplate(
+				compiler,
+				"x86_64-unknown-linux-gnu",
+				nil,
+			),
+			Archiver:   compiler,
+			Coreutils:  compiler,
+			Grep:       compiler,
+			Linker:     compiler,
+			NM:         compiler,
+			Objcopy:    compiler,
+			Shell:      "/bin/sh",
+			SourceRoot: root,
+		},
+	)
+	if err != nil {
+		t.Fatalf("ReplayConfiguredKconfigCommands() failed: %v", err)
+	}
+	if replayed != 1 {
+		t.Fatalf("replayed commands = %d, want 1", replayed)
+	}
+}
+
 func TestReplayConfiguredKconfigCommandsAbsolutizesTemplateInputs(t *testing.T) {
 	executionRoot := t.TempDir()
 	t.Chdir(executionRoot)

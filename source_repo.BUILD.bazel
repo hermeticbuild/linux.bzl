@@ -37,6 +37,7 @@ filegroup(
         "drivers/firmware/efi/libstub/**/*.c",
         "drivers/tty/vt/*_shipped",
         "include/linux/export-internal.h",
+        "include/linux/hidden.h",
         "include/linux/license.h",
         "include/linux/mod_devicetable.h",
         "include/linux/module_symbol.h",

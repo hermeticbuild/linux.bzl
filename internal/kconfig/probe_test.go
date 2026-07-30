@@ -65,6 +65,46 @@ func TestLinuxLLVMProbeProfile(t *testing.T) {
 	}
 }
 
+func TestClassifyRustToolchainVersionCommand(t *testing.T) {
+	for _, test := range []struct {
+		command string
+		want    RustToolchainVersionCommand
+	}{
+		{
+			command: `/src/scripts/rustc-version.sh rustc`,
+			want:    RustToolchainVersionCommandRustc,
+		},
+		{
+			command: `C:\src\scripts\rustc-llvm-version.sh rustc`,
+			want:    RustToolchainVersionCommandLLVM,
+		},
+		{command: `/src/scripts/cc-version.sh clang`},
+		{command: `/src/scripts/cc-can-link.sh clang`},
+		{command: `echo /src/scripts/rustc-version.sh`},
+		{command: `/src/scripts/rustc-version.sh-old rustc`},
+		{command: `/src/scripts/rustc-version.sh clang`},
+		{command: `/src/scripts/rustc-version.sh rustc extra`},
+		{command: `/src/scripts/rustc-version.sh rustc;`},
+		{command: "/src/scripts/rustc-version.sh\nrustc"},
+		{command: `/src/scripts/rustc-version.sh rust?`},
+		{command: `/src/scripts/rustc-version.sh rustc#comment`},
+		{command: `{ /src/scripts/rustc-version.sh rustc; } >/dev/null 2>&1 && echo "y" || echo "n"`},
+		{command: `{ /src/scripts/rust_is_available.sh; } >/dev/null 2>&1 && echo "y" || echo "n"`},
+		{command: `{ trap "rm -rf .tmp_$" EXIT; rustc -Copt-level=2 --crate-type=rlib /dev/null; } >/dev/null 2>&1 && echo "y" || echo "n"`},
+		{command: `bindgen --version workaround-for-0.69.0 2>/dev/null`},
+		{command: `{ clang -Werror -c -x c /dev/null; } >/dev/null 2>&1 && echo "y" || echo "n"`},
+	} {
+		if got := ClassifyRustToolchainVersionCommand(test.command); got != test.want {
+			t.Errorf(
+				"ClassifyRustToolchainVersionCommand(%q) = %d, want %d",
+				test.command,
+				got,
+				test.want,
+			)
+		}
+	}
+}
+
 func TestLinuxLLVMProbeShellSupportsKconfigIncludeProbes(t *testing.T) {
 	rootDir := t.TempDir()
 	scriptsDir := filepath.Join(rootDir, "scripts")
@@ -244,6 +284,21 @@ config CC_HAS_INT128
 	}
 	if got := resolved.Value("CONFIG_CC_HAS_INT128"); got != "y" {
 		t.Fatalf("CONFIG_CC_HAS_INT128 = %q, want y; commands=%q", got, commands)
+	}
+}
+
+func TestLinuxLLVMProbeShellRejectsNativeCPUOption(t *testing.T) {
+	shell, err := LinuxProbeShell(LinuxProbeModelLLVM)
+	if err != nil {
+		t.Fatalf("LinuxProbeShell() failed: %v", err)
+	}
+	command := `{ clang -Werror -fintegrated-as -march=native -c -x c /dev/null -o /dev/null; } >/dev/null 2>&1 && echo "y" || echo "n"`
+	got, err := shell(t.Context(), command)
+	if err != nil {
+		t.Fatalf("shell(%q) failed: %v", command, err)
+	}
+	if got != "n" {
+		t.Fatalf("shell(%q) = %q, want n", command, got)
 	}
 }
 

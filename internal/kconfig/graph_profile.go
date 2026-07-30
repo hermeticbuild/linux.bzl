@@ -21,6 +21,10 @@ var graphProfileSourceInputPattern = regexp.MustCompile(
 	regexp.QuoteMeta(graphProfileSourceRoot) + `/[A-Za-z0-9_./+@-]+`,
 )
 
+var graphProfileNativeSourceInputPattern = regexp.MustCompile(
+	regexp.QuoteMeta(graphProfileSourceRoot) + `[\\/][A-Za-z0-9_.\\/+@-]+`,
+)
+
 var graphProfileSiblingInputPattern = regexp.MustCompile(
 	`\$\(dirname\s+(?:"\$0"|'\$0'|\$0)\)/([A-Za-z0-9_./+@-]+)`,
 )
@@ -28,10 +32,11 @@ var graphProfileSiblingInputPattern = regexp.MustCompile(
 // GraphProfileShell resolves Kconfig's tool-dependent shell calls from an
 // exact checked-in profile and records the subset consumed by one parse.
 type GraphProfileShell struct {
-	sourceRoot  string
-	environment map[string]string
-	resolver    *ccprofile.GraphProfileResolver
-	baseProfile *ccprofile.GraphProfile
+	sourceRoot        string
+	sourceRootAliases []string
+	environment       map[string]string
+	resolver          *ccprofile.GraphProfileResolver
+	baseProfile       *ccprofile.GraphProfile
 
 	recordIdentity ccprofile.GraphProfileIdentity
 	fallback       func(context.Context, string) (string, error)
@@ -57,14 +62,15 @@ func NewGraphProfileShell(
 	if err != nil {
 		return nil, err
 	}
-	root, err := canonicalGraphProfileSourceRoot(sourceRoot)
+	root, aliases, err := graphProfileSourceRootPaths(sourceRoot)
 	if err != nil {
 		return nil, err
 	}
 	return &GraphProfileShell{
-		sourceRoot:  root,
-		environment: cloneGraphProfileStrings(environment),
-		resolver:    resolver,
+		sourceRoot:        root,
+		sourceRootAliases: aliases,
+		environment:       cloneGraphProfileStrings(environment),
+		resolver:          resolver,
 	}, nil
 }
 
@@ -89,21 +95,22 @@ func NewGraphProfileExtensionShell(
 	if err != nil {
 		return nil, err
 	}
-	root, err := canonicalGraphProfileSourceRoot(sourceRoot)
+	root, aliases, err := graphProfileSourceRootPaths(sourceRoot)
 	if err != nil {
 		return nil, err
 	}
 	return &GraphProfileShell{
-		sourceRoot:     root,
-		environment:    cloneGraphProfileStrings(environment),
-		resolver:       resolver,
-		baseProfile:    &baseProfile,
-		recordIdentity: baseProfile.Identity(),
-		fallback:       fallback,
-		probeFallback:  probeFallback,
-		extend:         true,
-		recorded:       map[string]ccprofile.KconfigCommand{},
-		recordedProbes: map[string]ccprofile.KbuildGraphProbe{},
+		sourceRoot:        root,
+		sourceRootAliases: aliases,
+		environment:       cloneGraphProfileStrings(environment),
+		resolver:          resolver,
+		baseProfile:       &baseProfile,
+		recordIdentity:    baseProfile.Identity(),
+		fallback:          fallback,
+		probeFallback:     probeFallback,
+		extend:            true,
+		recorded:          map[string]ccprofile.KconfigCommand{},
+		recordedProbes:    map[string]ccprofile.KbuildGraphProbe{},
 	}, nil
 }
 
@@ -118,29 +125,47 @@ func NewGraphProfileRecordingShell(
 	if fallback == nil {
 		return nil, fmt.Errorf("graph profile recording shell requires a fallback")
 	}
-	root, err := canonicalGraphProfileSourceRoot(sourceRoot)
+	root, aliases, err := graphProfileSourceRootPaths(sourceRoot)
 	if err != nil {
 		return nil, err
 	}
 	return &GraphProfileShell{
-		sourceRoot:     root,
-		environment:    cloneGraphProfileStrings(environment),
-		recordIdentity: identity,
-		fallback:       fallback,
-		recorded:       map[string]ccprofile.KconfigCommand{},
-		recordedProbes: map[string]ccprofile.KbuildGraphProbe{},
+		sourceRoot:        root,
+		sourceRootAliases: aliases,
+		environment:       cloneGraphProfileStrings(environment),
+		recordIdentity:    identity,
+		fallback:          fallback,
+		recorded:          map[string]ccprofile.KconfigCommand{},
+		recordedProbes:    map[string]ccprofile.KbuildGraphProbe{},
 	}, nil
 }
 
-func canonicalGraphProfileSourceRoot(sourceRoot string) (string, error) {
+func graphProfileSourceRootPaths(sourceRoot string) (string, []string, error) {
 	if strings.TrimSpace(sourceRoot) == "" {
-		return "", fmt.Errorf("graph profile source root must not be empty")
+		return "", nil, fmt.Errorf("graph profile source root must not be empty")
 	}
 	root, err := filepath.Abs(sourceRoot)
 	if err != nil {
-		return "", fmt.Errorf("resolve graph profile source root: %w", err)
+		return "", nil, fmt.Errorf("resolve graph profile source root: %w", err)
 	}
-	return filepath.Clean(root), nil
+	root = filepath.Clean(root)
+	aliases := []string{root}
+	for _, alias := range []string{filepath.Clean(sourceRoot), sourceRoot} {
+		if alias == "" {
+			continue
+		}
+		duplicate := false
+		for _, existing := range aliases {
+			if alias == existing {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			aliases = append(aliases, alias)
+		}
+	}
+	return root, aliases, nil
 }
 
 func (shell *GraphProfileShell) Run(ctx context.Context, command string) (string, error) {
@@ -461,9 +486,7 @@ func sameGraphProfileResult(
 func (shell *GraphProfileShell) commandIdentity(
 	command string,
 ) (string, map[string]string, error) {
-	canonical := filepath.ToSlash(command)
-	root := filepath.ToSlash(shell.sourceRoot)
-	canonical = strings.ReplaceAll(canonical, root, graphProfileSourceRoot)
+	canonical := canonicalGraphProfileCommand(command, shell.sourceRootAliases...)
 	inputs := map[string]string{}
 	for _, match := range graphProfileSourceInputPattern.FindAllString(canonical, -1) {
 		relative := strings.TrimPrefix(match, graphProfileSourceRoot+"/")
@@ -473,6 +496,42 @@ func (shell *GraphProfileShell) commandIdentity(
 		}
 	}
 	return canonical, inputs, nil
+}
+
+func canonicalGraphProfileCommand(command string, sourceRoots ...string) string {
+	canonical := command
+	roots := []string{}
+	seen := map[string]bool{}
+	for _, sourceRoot := range sourceRoots {
+		for _, root := range []string{
+			strings.TrimRight(sourceRoot, `/\`),
+			strings.TrimRight(strings.ReplaceAll(sourceRoot, `\`, "/"), "/"),
+		} {
+			if root == "" || seen[root] {
+				continue
+			}
+			seen[root] = true
+			roots = append(roots, root)
+		}
+	}
+	sort.SliceStable(roots, func(i, j int) bool {
+		return len(roots[i]) > len(roots[j])
+	})
+	for _, root := range roots {
+		for _, separator := range []string{"/", `\`} {
+			canonical = strings.ReplaceAll(
+				canonical,
+				root+separator,
+				graphProfileSourceRoot+"/",
+			)
+		}
+	}
+	return graphProfileNativeSourceInputPattern.ReplaceAllStringFunc(
+		canonical,
+		func(input string) string {
+			return strings.ReplaceAll(input, `\`, "/")
+		},
+	)
 }
 
 func (shell *GraphProfileShell) addGraphProfileInputClosure(
