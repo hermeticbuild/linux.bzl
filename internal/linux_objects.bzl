@@ -6378,6 +6378,32 @@ linux_vmlinux = rule(
 def _linux_x86_config_enabled(config, key):
     return config.config_flags.get(key) == "y"
 
+def _linux_x86_decompressor_inputs(ctx, config):
+    paths = ["include/linux/decompress/mm.h"]
+    if _linux_x86_config_enabled(config, "CONFIG_KERNEL_GZIP"):
+        paths.extend([
+            "include/linux/zconf.h",
+            "include/linux/zlib.h",
+            "include/linux/zutil.h",
+            "lib/decompress_inflate.c",
+            "lib/zlib_inflate/inffast.c",
+            "lib/zlib_inflate/inffast.h",
+            "lib/zlib_inflate/inffixed.h",
+            "lib/zlib_inflate/inflate.c",
+            "lib/zlib_inflate/inflate.h",
+            "lib/zlib_inflate/inftrees.c",
+            "lib/zlib_inflate/inftrees.h",
+            "lib/zlib_inflate/infutil.h",
+        ])
+    elif _linux_x86_config_enabled(config, "CONFIG_KERNEL_LZ4"):
+        paths.extend([
+            "include/linux/lz4.h",
+            "lib/decompress_unlz4.c",
+            "lib/lz4/lz4_decompress.c",
+            "lib/lz4/lz4defs.h",
+        ])
+    return [_source_tree_file(ctx, path) for path in paths]
+
 def _linux_x86_generated_header(generated_headers, suffix):
     return _linux_generated_header(generated_headers, suffix)
 
@@ -6557,7 +6583,6 @@ def _linux_x86_inat_tables(ctx):
 
 def _linux_x86_compressed_compile(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, src, object, extra_inputs = [], extra_include_dirs = []):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + object)
-    decompress_mm_header = _source_tree_file(ctx, "include/linux/decompress/mm.h")
     hidden_header = _source_tree_file(ctx, "include/linux/hidden.h")
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
@@ -6609,7 +6634,7 @@ def _linux_x86_compressed_compile(ctx, compiler, cc_toolchain, feature_configura
     path_mapped_run(
         ctx.actions,
         executable = compiler,
-        inputs = _linux_x86_boot_inputs(ctx, cc_toolchain, config, generated_headers, extra = [src, decompress_mm_header, hidden_header] + extra_inputs),
+        inputs = _linux_x86_boot_inputs(ctx, cc_toolchain, config, generated_headers, extra = [src, hidden_header] + extra_inputs),
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxX86CompressedCompile",
@@ -6756,11 +6781,12 @@ def _linux_x86_compressed_vmlinux(ctx, compiler, linker, archiver, cc_toolchain,
     compressed_with_size = _linux_x86_append_size(ctx, [compressed], [payload], "arch/x86/boot/compressed/vmlinux.bin.compressed")
     piggy = _linux_x86_piggy(ctx, compressed_with_size)
     inat_tables = _linux_x86_inat_tables(ctx)
+    decompressor_inputs = _linux_x86_decompressor_inputs(ctx, config)
 
     source_specs = [
         ("arch/x86/boot/compressed/kernel_info.S", "arch/x86/boot/compressed/kernel_info.o", [], []),
         ("arch/x86/boot/compressed/head_64.S", "arch/x86/boot/compressed/head_64.o", [], []),
-        ("arch/x86/boot/compressed/misc.c", "arch/x86/boot/compressed/misc.o", [voffset], [voffset.dirname + "/compressed"]),
+        ("arch/x86/boot/compressed/misc.c", "arch/x86/boot/compressed/misc.o", [voffset] + decompressor_inputs, [voffset.dirname + "/compressed"]),
         ("arch/x86/boot/compressed/string.c", "arch/x86/boot/compressed/string.o", [], []),
         ("arch/x86/boot/compressed/cmdline.c", "arch/x86/boot/compressed/cmdline.o", [], []),
         ("arch/x86/boot/compressed/error.c", "arch/x86/boot/compressed/error.o", [], []),
