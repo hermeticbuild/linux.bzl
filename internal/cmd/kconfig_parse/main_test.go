@@ -12,109 +12,6 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/rusttoolchain"
 )
 
-func TestCompactToolchainProfileID(t *testing.T) {
-	profile := kconfigParseTestCCProfile()
-	profileDigest, err := ccprofile.Digest(*profile)
-	if err != nil {
-		t.Fatalf("Digest() failed: %v", err)
-	}
-	tests := []struct {
-		name               string
-		protocol           string
-		toolchainProfileID string
-		buildfileOut       string
-		ccProfile          *ccprofile.Profile
-		wantID             string
-		wantError          string
-	}{
-		{
-			name:         "v6 metadata and buildfile",
-			protocol:     compactMetadataProtocolV6,
-			buildfileOut: "BUILD.bazel",
-		},
-		{
-			name:      "v6 permits CC profile without v7 identity",
-			protocol:  compactMetadataProtocolV6,
-			ccProfile: profile,
-		},
-		{
-			name:               "v6 rejects toolchain profile",
-			protocol:           compactMetadataProtocolV6,
-			toolchainProfileID: "llvm/x86",
-			wantError:          "only supported with",
-		},
-		{
-			name:               "v7 metadata",
-			protocol:           kconfig.CompactMetadataProtocolV7,
-			toolchainProfileID: "llvm/x86",
-			wantID:             "llvm/x86",
-		},
-		{
-			name:      "v7 derives CC profile digest",
-			protocol:  kconfig.CompactMetadataProtocolV7,
-			ccProfile: profile,
-			wantID:    profileDigest,
-		},
-		{
-			name:               "v7 accepts matching CC profile digest",
-			protocol:           kconfig.CompactMetadataProtocolV7,
-			toolchainProfileID: profileDigest,
-			ccProfile:          profile,
-			wantID:             profileDigest,
-		},
-		{
-			name:               "v7 rejects mismatching CC profile digest",
-			protocol:           kconfig.CompactMetadataProtocolV7,
-			toolchainProfileID: strings.Repeat("0", 64),
-			ccProfile:          profile,
-			wantError:          "does not match canonical -cc_profile digest",
-		},
-		{
-			name:      "v7 without CC profile requires explicit identity",
-			protocol:  kconfig.CompactMetadataProtocolV7,
-			wantError: "-toolchain_profile_id is required",
-		},
-		{
-			name:               "v7 rejects buildfile",
-			protocol:           kconfig.CompactMetadataProtocolV7,
-			toolchainProfileID: "llvm/x86",
-			buildfileOut:       "BUILD.bazel",
-			wantError:          "compact-v7 emits metadata only",
-		},
-		{
-			name:      "unknown protocol",
-			protocol:  "compact-v99",
-			wantError: "unsupported -compact_protocol",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got, err := compactToolchainProfileID(
-				test.protocol,
-				test.toolchainProfileID,
-				test.buildfileOut,
-				test.ccProfile,
-			)
-			if test.wantError == "" {
-				if err != nil {
-					t.Fatalf("compactToolchainProfileID() failed: %v", err)
-				}
-				if got != test.wantID {
-					t.Fatalf("compactToolchainProfileID() = %q, want %q", got, test.wantID)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), test.wantError) {
-				t.Fatalf(
-					"compactToolchainProfileID() error = %v, want substring %q",
-					err,
-					test.wantError,
-				)
-			}
-		})
-	}
-}
-
 func TestCompactMetadataV7EmitsSelectedProtocol(t *testing.T) {
 	root := t.TempDir()
 	for path, content := range map[string]string{
@@ -129,22 +26,7 @@ func TestCompactMetadataV7EmitsSelectedProtocol(t *testing.T) {
 	} {
 		writeKconfigParseTestFile(t, root, path, content)
 	}
-	profile := kconfigParseTestCCProfile(ccprofile.StructuralProbe{
-		Kind:       "cc-option",
-		Language:   "c",
-		PrefixArgv: []string{"-Werror"},
-		Argv:       []string{"-fprofile-supported"},
-		Supported:  true,
-	})
-	profileID, err := compactToolchainProfileID(
-		kconfig.CompactMetadataProtocolV7,
-		"",
-		"",
-		profile,
-	)
-	if err != nil {
-		t.Fatalf("compactToolchainProfileID() failed: %v", err)
-	}
+	const profileID = "test-graph-profile"
 
 	kconfigPath := filepath.Join(root, "Kconfig")
 	tree, err := kconfig.ParseFile(t.Context(), kconfigPath, kconfig.Options{
@@ -152,35 +34,6 @@ func TestCompactMetadataV7EmitsSelectedProtocol(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("ParseFile() failed: %v", err)
-	}
-	v6, err := compactMetadata(
-		tree,
-		kconfigPath,
-		filepath.Join(root, "Kbuild"),
-		[]namedPath{{
-			Name: "base",
-			Path: filepath.Join(root, "base.config"),
-		}},
-		"default",
-		false,
-		map[string]string{
-			"ARCH":    "x86",
-			"SRCARCH": "x86",
-		},
-		nil,
-		map[string]string{
-			"base": "//headers:base",
-		},
-		"6.18.2",
-		"linux.bzl/test/x86",
-		profile,
-		nil,
-	)
-	if err != nil {
-		t.Fatalf("compactMetadata() with CC profile failed: %v", err)
-	}
-	if len(v6.ObjectVariants) == 0 {
-		t.Fatal("compactMetadata() with CC profile emitted no object variants")
 	}
 	metadata, err := compactMetadataV7(
 		tree,
@@ -203,7 +56,6 @@ func TestCompactMetadataV7EmitsSelectedProtocol(t *testing.T) {
 		"6.18.2",
 		"linux.bzl/test/x86",
 		profileID,
-		profile,
 		nil,
 	)
 	if err != nil {
@@ -232,164 +84,17 @@ func TestCompactMetadataV7EmitsSelectedProtocol(t *testing.T) {
 	}
 }
 
-func TestParseKbuildRecordsCCProbeRequests(t *testing.T) {
-	root := t.TempDir()
-	kbuildPath := filepath.Join(root, "Kbuild")
-	writeKconfigParseTestFile(t, root, "Kbuild", `KBUILD_CPPFLAGS := -DSTANDALONE
-obj-y += init.o
-ccflags-y += $(call cc-option,-fstandalone)
-`)
-
-	recorder := kconfig.NewStructuralProbeRecorder()
-	if _, err := parseKbuild(
-		kbuildPath,
-		false,
-		"",
-		"",
-		nil,
-		nil,
-		recorder,
-	); err != nil {
-		t.Fatalf("parseKbuild() failed: %v", err)
-	}
-	requests := recorder.Requests()
-	if got, want := len(requests), 1; got != want {
-		t.Fatalf("request count = %d, want %d: %#v", got, want, requests)
-	}
-	if got, want := strings.Join(requests[0].PrefixArgv, " "), "-Werror -DSTANDALONE"; got != want {
-		t.Fatalf("prefix argv = %q, want %q", got, want)
-	}
-	if got, want := strings.Join(requests[0].Argv, " "), "-fstandalone"; got != want {
-		t.Fatalf("argv = %q, want %q", got, want)
-	}
-}
-
-func TestValidateKbuildTreeSharesCCProbeRecorder(t *testing.T) {
-	root := t.TempDir()
-	writeKconfigParseTestFile(t, root, "Kbuild", `ccflags-y += $(call cc-option,-fshared)
-`)
-	writeKconfigParseTestFile(t, root, "drivers/example/Makefile", `ccflags-y += $(call cc-option,-fshared)
-`)
-
-	recorder := kconfig.NewStructuralProbeRecorder()
-	summary, err := validateKbuildTree(root, nil, nil, nil, recorder)
-	if err != nil {
-		t.Fatalf("validateKbuildTree() failed: %v", err)
-	}
-	if got, want := summary.Count, 2; got != want {
-		t.Fatalf("parsed file count = %d, want %d", got, want)
-	}
-	requests := recorder.Requests()
-	if got, want := len(requests), 1; got != want {
-		t.Fatalf("deduplicated request count = %d, want %d: %#v", got, want, requests)
-	}
-}
-
-func TestCompactMetadataV7RecordsPerConfigCCProbeRequests(t *testing.T) {
-	root := t.TempDir()
-	for path, content := range map[string]string{
-		"Kconfig": `config ALT
-	bool "alternate"
-`,
-		"Kbuild": `obj-y += init.o
-KBUILD_CFLAGS += $(if $(CONFIG_ALT),-DALT,-DBASE)
-ccflags-y += $(call cc-option,-fcompact)
-`,
-		"base.config":                      "# CONFIG_ALT is not set\n",
-		"alt.config":                       "CONFIG_ALT=y\n",
-		"arch/x86/kernel/vmlinux.lds.S":    "\n",
-		"init.c":                           "int init_value;\n",
-		"include/linux/compiler-version.h": "\n",
-		"include/linux/compiler_types.h":   "\n",
-		"include/linux/kconfig.h":          "\n",
-	} {
-		writeKconfigParseTestFile(t, root, path, content)
-	}
-
-	kconfigPath := filepath.Join(root, "Kconfig")
-	tree, err := kconfig.ParseFile(t.Context(), kconfigPath, kconfig.Options{
-		RootDir: root,
-	})
-	if err != nil {
-		t.Fatalf("ParseFile() failed: %v", err)
-	}
-	recorder := kconfig.NewStructuralProbeRecorder()
-	_, err = compactMetadataV7(
-		tree,
-		kconfigPath,
-		filepath.Join(root, "Kbuild"),
-		[]namedPath{
-			{Name: "base", Path: filepath.Join(root, "base.config")},
-			{Name: "alt", Path: filepath.Join(root, "alt.config")},
-		},
-		"default",
-		false,
-		map[string]string{
-			"ARCH":    "x86",
-			"SRCARCH": "x86",
-		},
-		nil,
-		map[string]string{
-			"base": "//headers:base",
-			"alt":  "//headers:alt",
-		},
-		"6.18.2",
-		"linux.bzl/test/x86",
-		"bootstrap-profile",
-		nil,
-		recorder,
-	)
-	if err != nil {
-		t.Fatalf("compactMetadataV7() failed: %v", err)
-	}
-
-	requests := recorder.Requests()
-	if got, want := len(requests), 2; got != want {
-		t.Fatalf("per-config request count = %d, want %d: %#v", got, want, requests)
-	}
-	prefixes := map[string]bool{}
-	for _, request := range requests {
-		prefixes[strings.Join(request.PrefixArgv, " ")] = true
-	}
-	for _, want := range []string{"-Werror -DBASE", "-Werror -DALT"} {
-		if !prefixes[want] {
-			t.Errorf("missing expanded prefix %q in %#v", want, requests)
-		}
-	}
-
-	out := filepath.Join(root, "cc_probe_requests.json")
-	if err := writeCCProbeRequests(out, recorder); err != nil {
-		t.Fatalf("writeCCProbeRequests() failed: %v", err)
-	}
-	written, err := os.ReadFile(out)
-	if err != nil {
-		t.Fatalf("ReadFile() failed: %v", err)
-	}
-	wantJSON, err := recorder.JSON()
-	if err != nil {
-		t.Fatalf("recorder.JSON() failed: %v", err)
-	}
-	if string(written) != string(wantJSON) {
-		t.Fatalf("written requests differ from canonical JSON:\n%s\nwant:\n%s", written, wantJSON)
-	}
-	if strings.Contains(string(written), `"supported"`) {
-		t.Fatalf("request manifest contains an unmeasured supported result:\n%s", written)
-	}
-}
-
-func TestLinuxProbeShellUsesCCProfileAndNonCCOverrides(t *testing.T) {
-	profile := kconfigParseTestCCProfile()
-	profile.KconfigIdentity.CCVersion = 210002
-	profile.KconfigIdentity.CCVersionText = "clang version 21.0.2"
-	profile.KconfigIdentity.LDVersion = 210002
+func TestLinuxProbeShellUsesExplicitModelOverrides(t *testing.T) {
 	shell, err := linuxProbeShell(
-		"",
+		kconfig.LinuxProbeModelLLVM,
 		map[string]string{
 			"bindgen_version": "bindgen 0.73.0",
+			"cc_version":      "210002",
+			"cc_version_text": "clang version 21.0.2",
+			"ld_version":      "210002",
 			"pahole_version":  "140",
 			"rustc_version":   "109900",
 		},
-		profile,
 	)
 	if err != nil {
 		t.Fatalf("linuxProbeShell() failed: %v", err)
@@ -428,61 +133,34 @@ func TestLinuxProbeShellUsesCCProfileAndNonCCOverrides(t *testing.T) {
 		}
 	}
 
-	_, err = linuxProbeShell(
-		kconfig.LinuxProbeModelLLVM,
-		map[string]string{"cc_version": "999999"},
-		profile,
-	)
-	if err == nil || !strings.Contains(err.Error(), "cannot override checked-in -cc_profile identity") {
-		t.Fatalf("CC identity override error = %v, want checked-in profile rejection", err)
-	}
 }
 
-func TestLoadCCProfileDecodesCheckedInInput(t *testing.T) {
-	profile := kconfigParseTestCCProfile()
-	data, err := ccprofile.CanonicalJSON(*profile)
-	if err != nil {
-		t.Fatalf("CanonicalJSON() failed: %v", err)
-	}
-	path := filepath.Join(t.TempDir(), "cc_profile.json")
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatalf("WriteFile() failed: %v", err)
-	}
-	loaded, err := loadCCProfile(path)
-	if err != nil {
-		t.Fatalf("loadCCProfile() failed: %v", err)
-	}
-	if err := ccprofile.Compare(*profile, *loaded); err != nil {
-		t.Fatalf("loaded profile mismatch: %v", err)
-	}
-}
-
-func kconfigParseTestCCProfile(probes ...ccprofile.StructuralProbe) *ccprofile.Profile {
-	if probes == nil {
-		probes = []ccprofile.StructuralProbe{}
-	}
-	for index := range probes {
-		probes[index].ID = ccprofile.StructuralProbeID(probes[index])
-	}
-	return &ccprofile.Profile{
-		Schema:         ccprofile.Schema,
+func TestLoadGraphProfileDecodesCheckedInInput(t *testing.T) {
+	profile := ccprofile.GraphProfile{
+		Schema:         ccprofile.GraphProfileSchema,
 		Architecture:   "x86_64",
 		DriverContract: ccprofile.DriverContract,
 		AnalysisIdentity: ccprofile.AnalysisIdentity{
 			Compiler:            "clang",
 			TargetGNUSystemName: "x86_64-unknown-linux-gnu",
 		},
-		KconfigIdentity: ccprofile.KconfigIdentity{
-			CCName:        "Clang",
-			CCVersion:     220108,
-			CCVersionText: "clang version 22.1.8",
-			ASName:        "LLVM",
-			LDName:        "LLD",
-			LDVersion:     220108,
-			CanLink:       true,
-			BuiltinMacros: map[string]string{"__SIZEOF_INT128__": "16"},
-		},
-		StructuralProbes: probes,
+		KconfigCommands:   []ccprofile.KconfigCommand{},
+		KbuildGraphProbes: []ccprofile.KbuildGraphProbe{},
+	}
+	data, err := ccprofile.CanonicalGraphProfileJSON(profile)
+	if err != nil {
+		t.Fatalf("CanonicalGraphProfileJSON() failed: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "graph_profile.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile() failed: %v", err)
+	}
+	loaded, err := loadGraphProfile(path)
+	if err != nil {
+		t.Fatalf("loadGraphProfile() failed: %v", err)
+	}
+	if err := ccprofile.CompareGraphProfiles(profile, *loaded); err != nil {
+		t.Fatalf("loaded profile mismatch: %v", err)
 	}
 }
 

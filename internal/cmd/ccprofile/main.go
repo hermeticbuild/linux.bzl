@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"slices"
 	"strings"
 
 	"github.com/hermeticbuild/linux.bzl/internal/ccprofile"
@@ -22,39 +21,144 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: ccprofile <check|compare|compile|inspect|probe|validate> [flags]")
+		return fmt.Errorf("usage: ccprofile <compile|concat-node|inspect|link|merge-graph|refresh-graph|resolve-node|validate-graph> [flags]")
 	}
 	switch args[0] {
-	case "check":
-		return runCheck(args[1:])
-	case "compare":
-		return runCompare(args[1:])
 	case "compile":
 		return runCompile(args[1:])
+	case "concat-node":
+		return runConcatNode(args[1:])
 	case "inspect":
 		return runInspect(args[1:])
-	case "probe":
-		return runProbe(args[1:])
-	case "validate":
-		return runValidate(args[1:])
+	case "link":
+		return runLink(args[1:])
+	case "merge-graph":
+		return runMergeGraph(args[1:])
+	case "refresh-graph":
+		return runRefreshGraph(args[1:])
+	case "resolve-node":
+		return runResolveNode(args[1:])
+	case "validate-graph":
+		return runValidateGraph(args[1:])
 	default:
 		return fmt.Errorf("unsupported ccprofile command %q", args[0])
 	}
 }
 
-const structuralProbeRequestsSchema = "linux.bzl/cc-structural-probe-requests-v1"
-
-type structuralProbeRequestManifest struct {
-	Schema           string                   `json:"schema"`
-	StructuralProbes []structuralProbeRequest `json:"structural_probes"`
+func runRefreshGraph(args []string) error {
+	flags := flag.NewFlagSet("ccprofile refresh-graph", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	profilePath := flags.String("profile", "", "recorded toolchain graph profile")
+	identityPath := flags.String("identity", "", "inspected compiler identity")
+	templatePath := flags.String("template", "", "configured compiler command template")
+	linker := flags.String("linker", "", "configured raw linker")
+	shell := flags.String("shell", "", "execution-platform shell")
+	sourceRoot := flags.String("source_root", "", "Linux source root")
+	objectRoot := flags.String("object_root", "", "optional Linux object root")
+	out := flags.String("out", "", "canonical refreshed graph profile")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 ||
+		*profilePath == "" ||
+		*identityPath == "" ||
+		*templatePath == "" ||
+		*linker == "" ||
+		*shell == "" ||
+		*sourceRoot == "" ||
+		*out == "" {
+		return fmt.Errorf(
+			"ccprofile refresh-graph requires -profile, -identity, -template, -linker, -shell, -source_root, -out, and no positional arguments",
+		)
+	}
+	identity, err := readCompilerIdentity(*identityPath)
+	if err != nil {
+		return err
+	}
+	template, err := readCommandTemplate(*templatePath)
+	if err != nil {
+		return err
+	}
+	if template.Architecture != identity.Architecture ||
+		template.DriverContract != identity.DriverContract ||
+		template.AnalysisIdentity != identity.AnalysisIdentity {
+		return fmt.Errorf("compiler template and inspected identity disagree")
+	}
+	data, err := os.ReadFile(*profilePath)
+	if err != nil {
+		return fmt.Errorf("read graph profile %s: %w", *profilePath, err)
+	}
+	profile, err := ccprofile.DecodeGraphProfile(data)
+	if err != nil {
+		return fmt.Errorf("decode graph profile %s: %w", *profilePath, err)
+	}
+	if profile.Architecture != identity.Architecture ||
+		profile.DriverContract != identity.DriverContract ||
+		profile.AnalysisIdentity != identity.AnalysisIdentity {
+		return fmt.Errorf("recorded graph profile and inspected compiler identity disagree")
+	}
+	refreshed, err := ccprofile.RefreshConfiguredGraphProfile(
+		context.Background(),
+		profile,
+		ccprofile.KbuildGraphProbeTools{
+			Compiler:    template.Compiler,
+			Linker:      *linker,
+			Shell:       *shell,
+			SourceRoot:  *sourceRoot,
+			ObjectRoot:  *objectRoot,
+			Environment: template.Environment,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("refresh configured graph profile: %w", err)
+	}
+	refreshedData, err := ccprofile.CanonicalGraphProfileJSON(refreshed)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(*out, refreshedData, 0o644); err != nil {
+		return fmt.Errorf("write refreshed graph profile: %w", err)
+	}
+	return nil
 }
 
-type structuralProbeRequest struct {
-	ID         string   `json:"id"`
-	Kind       string   `json:"kind"`
-	Language   string   `json:"language"`
-	PrefixArgv []string `json:"prefix_argv"`
-	Argv       []string `json:"argv"`
+func runMergeGraph(args []string) error {
+	flags := flag.NewFlagSet("ccprofile merge-graph", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	out := flags.String("out", "", "canonical merged toolchain graph profile")
+	var inputs repeatedStringFlag
+	flags.Var(&inputs, "input", "canonical toolchain graph profile; repeat in merge order")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || len(inputs) == 0 || *out == "" {
+		return fmt.Errorf(
+			"ccprofile merge-graph requires at least one -input, -out, and no positional arguments",
+		)
+	}
+	profiles := make([]ccprofile.GraphProfile, len(inputs))
+	for index, path := range inputs {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read graph profile input %d %s: %w", index, path, err)
+		}
+		profiles[index], err = ccprofile.DecodeGraphProfile(data)
+		if err != nil {
+			return fmt.Errorf("decode graph profile input %d %s: %w", index, path, err)
+		}
+	}
+	merged, err := ccprofile.MergeGraphProfiles(profiles...)
+	if err != nil {
+		return fmt.Errorf("merge graph profiles: %w", err)
+	}
+	data, err := ccprofile.CanonicalGraphProfileJSON(merged)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(*out, data, 0o644); err != nil {
+		return fmt.Errorf("write merged graph profile: %w", err)
+	}
+	return nil
 }
 
 type repeatedStringFlag []string
@@ -68,83 +172,17 @@ func (values *repeatedStringFlag) Set(value string) error {
 	return nil
 }
 
-func runCheck(args []string) error {
-	flags := flag.NewFlagSet("ccprofile check", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	profilePath := flags.String("profile", "", "CC capability profile")
-	canonicalOut := flags.String("canonical_out", "", "canonical JSON output")
-	digestOut := flags.String("digest_out", "", "profile digest output")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 || *profilePath == "" {
-		return fmt.Errorf("ccprofile check requires -profile and no positional arguments")
-	}
-	profile, err := readProfile(*profilePath)
-	if err != nil {
-		return err
-	}
-	if *canonicalOut != "" {
-		data, err := ccprofile.CanonicalJSON(profile)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(*canonicalOut, data, 0o644); err != nil {
-			return fmt.Errorf("write canonical profile: %w", err)
-		}
-	}
-	if *digestOut != "" {
-		digest, err := ccprofile.Digest(profile)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(*digestOut, []byte(digest+"\n"), 0o644); err != nil {
-			return fmt.Errorf("write profile digest: %w", err)
-		}
-	}
-	return nil
-}
-
-func runCompare(args []string) error {
-	flags := flag.NewFlagSet("ccprofile compare", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	expectedPath := flags.String("expected", "", "expected CC capability profile")
-	actualPath := flags.String("actual", "", "actual CC capability profile")
-	out := flags.String("out", "", "validation stamp")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 || *expectedPath == "" || *actualPath == "" || *out == "" {
-		return fmt.Errorf("ccprofile compare requires -expected, -actual, -out and no positional arguments")
-	}
-	expected, err := readProfile(*expectedPath)
-	if err != nil {
-		return fmt.Errorf("expected profile: %w", err)
-	}
-	actual, err := readProfile(*actualPath)
-	if err != nil {
-		return fmt.Errorf("actual profile: %w", err)
-	}
-	if err := ccprofile.Compare(expected, actual); err != nil {
-		return err
-	}
-	digest, err := ccprofile.Digest(expected)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(*out, []byte("profile_digest="+digest+"\n"), 0o644); err != nil {
-		return fmt.Errorf("write validation stamp: %w", err)
-	}
-	return nil
-}
-
 func runCompile(args []string) error {
 	flags := flag.NewFlagSet("ccprofile compile", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	templatePath := flags.String("template", "", "validated CC command template")
-	validationPath := flags.String("validation", "", "CC profile validation stamp")
+	validationPath := flags.String("validation", "", "configured graph validation stamp")
 	source := flags.String("source", "", "compile source")
 	output := flags.String("output", "", "compile output")
+	flagsFile := flags.String("flags_file", "", "newline-delimited object arguments")
+	removeFlagsFile := flags.String("remove_flags_file", "", "newline-delimited exact removals")
+	sourceRoot := flags.String("source_root", "", "Linux source directory for Kbuild reference expansion")
+	objectPath := flags.String("object_path", "", "source-root-relative object output path")
 	var objectArgs repeatedStringFlag
 	var removals repeatedStringFlag
 	flags.Var(&objectArgs, "arg", "mutable object compile argument; repeat in command-line order")
@@ -175,6 +213,42 @@ func runCompile(args []string) error {
 	template, err := ccprofile.DecodeCommandTemplate(templateData)
 	if err != nil {
 		return fmt.Errorf("decode command template %s: %w", *templatePath, err)
+	}
+	if *flagsFile != "" {
+		fileArgv, err := readArgvFile(*flagsFile)
+		if err != nil {
+			return fmt.Errorf("read compile flags file: %w", err)
+		}
+		fileArgv, err = expandArgvResponseFiles(fileArgv)
+		if err != nil {
+			return fmt.Errorf("expand compile response files: %w", err)
+		}
+		fileArgv, err = expandKbuildArgv(
+			fileArgv,
+			*source,
+			*sourceRoot,
+			*objectPath,
+		)
+		if err != nil {
+			return fmt.Errorf("expand compile flags: %w", err)
+		}
+		objectArgs = append(objectArgs, fileArgv...)
+	}
+	if *removeFlagsFile != "" {
+		fileRemovals, err := readArgvFile(*removeFlagsFile)
+		if err != nil {
+			return fmt.Errorf("read compile remove-flags file: %w", err)
+		}
+		fileRemovals, err = expandKbuildArgv(
+			fileRemovals,
+			*source,
+			*sourceRoot,
+			*objectPath,
+		)
+		if err != nil {
+			return fmt.Errorf("expand compile removals: %w", err)
+		}
+		removals = append(removals, fileRemovals...)
 	}
 	if err := ccprofile.Compile(
 		context.Background(),
@@ -267,168 +341,150 @@ func runInspect(args []string) error {
 	return nil
 }
 
-func runProbe(args []string) error {
-	flags := flag.NewFlagSet("ccprofile probe", flag.ContinueOnError)
+func runValidateGraph(args []string) error {
+	flags := flag.NewFlagSet("ccprofile validate-graph", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	profilePath := flags.String("profile", "", "base CC capability profile")
-	requestsPath := flags.String("requests", "", "canonical structural-probe requests")
-	compiler := flags.String("compiler", "", "selected compiler executable")
-	linker := flags.String("linker", "", "selected linker executable")
-	sourceRoot := flags.String("source_root", "", "Linux source root for canonical request path expansion")
-	objectRoot := flags.String("object_root", "", "Linux object root for canonical request path expansion")
-	replace := flags.Bool("replace", false, "replace existing structural probes instead of merging requests")
-	out := flags.String("out", "", "canonical populated CC capability profile")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 ||
-		*profilePath == "" ||
-		*requestsPath == "" ||
-		*compiler == "" ||
-		*linker == "" ||
-		*out == "" {
-		return fmt.Errorf(
-			"ccprofile probe requires profile, requests, compiler, linker, out, and no positional arguments",
-		)
-	}
-	profile, err := readProfile(*profilePath)
-	if err != nil {
-		return fmt.Errorf("base profile: %w", err)
-	}
-	requests, err := readStructuralProbeRequests(*requestsPath)
-	if err != nil {
-		return err
-	}
-
-	probesByID := make(map[string]ccprofile.StructuralProbe, len(profile.StructuralProbes)+len(requests))
-	if !*replace {
-		for _, probe := range profile.StructuralProbes {
-			probesByID[probe.ID] = probe
-		}
-	}
-	for index := range requests {
-		supported, err := ccprofile.EvaluateStructuralProbe(
-			context.Background(),
-			profile,
-			requests[index],
-			ccprofile.StructuralProbeTools{
-				Compiler:   *compiler,
-				Linker:     *linker,
-				SourceRoot: *sourceRoot,
-				ObjectRoot: *objectRoot,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("evaluate structural_probes[%d]: %w", index, err)
-		}
-		requests[index].Supported = supported
-		probesByID[requests[index].ID] = requests[index]
-	}
-	probes := make([]ccprofile.StructuralProbe, 0, len(probesByID))
-	for _, probe := range probesByID {
-		probes = append(probes, probe)
-	}
-	slices.SortFunc(probes, func(left, right ccprofile.StructuralProbe) int {
-		return strings.Compare(left.ID, right.ID)
-	})
-	profile.StructuralProbes = probes
-	data, err := ccprofile.CanonicalJSON(profile)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(*out, data, 0o644); err != nil {
-		return fmt.Errorf("write populated CC profile: %w", err)
-	}
-	return nil
-}
-
-func readStructuralProbeRequests(path string) ([]ccprofile.StructuralProbe, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open structural probe requests: %w", err)
-	}
-	defer file.Close()
-	decoder := json.NewDecoder(file)
-	decoder.DisallowUnknownFields()
-	var manifest structuralProbeRequestManifest
-	if err := decoder.Decode(&manifest); err != nil {
-		return nil, fmt.Errorf("decode structural probe requests: %w", err)
-	}
-	if manifest.Schema != structuralProbeRequestsSchema {
-		return nil, fmt.Errorf(
-			"structural probe requests schema %q, want %q",
-			manifest.Schema,
-			structuralProbeRequestsSchema,
-		)
-	}
-	if manifest.StructuralProbes == nil {
-		return nil, fmt.Errorf("structural probe requests must contain structural_probes")
-	}
-	requests := make([]ccprofile.StructuralProbe, len(manifest.StructuralProbes))
-	previousID := ""
-	for index, request := range manifest.StructuralProbes {
-		requests[index] = ccprofile.StructuralProbe{
-			ID:         request.ID,
-			Kind:       request.Kind,
-			Language:   request.Language,
-			PrefixArgv: request.PrefixArgv,
-			Argv:       request.Argv,
-		}
-		if request.ID != ccprofile.StructuralProbeID(requests[index]) {
-			return nil, fmt.Errorf(
-				"structural_probes[%d] ID %q, want %q",
-				index,
-				request.ID,
-				ccprofile.StructuralProbeID(requests[index]),
-			)
-		}
-		if request.ID <= previousID {
-			return nil, fmt.Errorf("structural probe requests must be sorted by unique ID")
-		}
-		previousID = request.ID
-	}
-	if decoder.Decode(&struct{}{}) != io.EOF {
-		return nil, fmt.Errorf("structural probe requests contain trailing JSON")
-	}
-	return requests, nil
-}
-
-func runValidate(args []string) error {
-	flags := flag.NewFlagSet("ccprofile validate", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	profilePath := flags.String("profile", "", "expected CC capability profile")
+	profilePath := flags.String("profile", "", "checked-in toolchain graph profile")
+	projectionPath := flags.String("projection", "", "consumed graph projection")
 	identityPath := flags.String("identity", "", "inspected compiler identity")
+	templatePath := flags.String("template", "", "configured compiler command template")
+	linker := flags.String("linker", "", "configured raw linker")
+	shell := flags.String("shell", "", "execution-platform shell")
+	sourceRoot := flags.String("source_root", "", "Linux source root")
+	objectRoot := flags.String("object_root", "", "optional Linux object root")
 	out := flags.String("out", "", "validation stamp")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *profilePath == "" || *identityPath == "" || *out == "" {
-		return fmt.Errorf("ccprofile validate requires -profile, -identity, -out and no positional arguments")
-	}
-	profile, err := readProfile(*profilePath)
-	if err != nil {
-		return fmt.Errorf("expected profile: %w", err)
+	if flags.NArg() != 0 ||
+		(*profilePath == "") == (*projectionPath == "") ||
+		*identityPath == "" ||
+		*templatePath == "" ||
+		*linker == "" ||
+		*shell == "" ||
+		*sourceRoot == "" ||
+		*out == "" {
+		return fmt.Errorf(
+			"ccprofile validate-graph requires exactly one of -profile or -projection, plus -identity, -template, -linker, -shell, -source_root, -out, and no positional arguments",
+		)
 	}
 	identity, err := readCompilerIdentity(*identityPath)
 	if err != nil {
 		return err
 	}
-	if err := ccprofile.ValidateProfileIdentity(profile, identity); err != nil {
-		return fmt.Errorf("validate compiler identity: %w", err)
-	}
-	profileDigest, err := ccprofile.Digest(profile)
+	template, err := readCommandTemplate(*templatePath)
 	if err != nil {
 		return err
+	}
+	if template.Architecture != identity.Architecture ||
+		template.DriverContract != identity.DriverContract ||
+		template.AnalysisIdentity != identity.AnalysisIdentity {
+		return fmt.Errorf("compiler template and inspected identity disagree")
+	}
+	graphPath := *profilePath
+	if graphPath == "" {
+		graphPath = *projectionPath
+	}
+	graphData, err := os.ReadFile(graphPath)
+	if err != nil {
+		return fmt.Errorf("read graph identity input %s: %w", graphPath, err)
+	}
+	var schemaHeader struct {
+		Schema string `json:"schema"`
+	}
+	if err := json.Unmarshal(graphData, &schemaHeader); err != nil {
+		return fmt.Errorf("decode graph identity input %s: %w", graphPath, err)
+	}
+	var digest string
+	var kconfigCommands []ccprofile.KconfigCommand
+	var graphProbes []ccprofile.KbuildGraphProbe
+	switch schemaHeader.Schema {
+	case ccprofile.GraphProfileSchema:
+		if *projectionPath != "" {
+			return fmt.Errorf(
+				"-projection input has graph profile schema %q",
+				schemaHeader.Schema,
+			)
+		}
+		profile, err := ccprofile.DecodeGraphProfile(graphData)
+		if err != nil {
+			return fmt.Errorf("decode graph profile %s: %w", graphPath, err)
+		}
+		if err := ccprofile.ValidateGraphProfileCompilerIdentity(profile, identity); err != nil {
+			return fmt.Errorf("validate graph profile compiler identity: %w", err)
+		}
+		digest, err = ccprofile.GraphProfileDigest(profile)
+		if err != nil {
+			return err
+		}
+		kconfigCommands = profile.KconfigCommands
+		graphProbes = profile.KbuildGraphProbes
+	case ccprofile.GraphProjectionSchema:
+		projection, err := ccprofile.DecodeGraphProjection(graphData)
+		if err != nil {
+			return fmt.Errorf("decode graph projection %s: %w", graphPath, err)
+		}
+		if err := ccprofile.ValidateGraphProjectionCompilerIdentity(projection, identity); err != nil {
+			return fmt.Errorf("validate graph projection compiler identity: %w", err)
+		}
+		digest, err = ccprofile.GraphProjectionDigest(projection)
+		if err != nil {
+			return err
+		}
+		kconfigCommands = projection.KconfigCommands
+		graphProbes = projection.KbuildGraphProbes
+	default:
+		return fmt.Errorf(
+			"graph identity input schema %q is unsupported",
+			schemaHeader.Schema,
+		)
+	}
+	if _, err := ccprofile.ReplayConfiguredKconfigCommands(
+		context.Background(),
+		kconfigCommands,
+		ccprofile.KbuildGraphProbeTools{
+			Compiler:   template.Compiler,
+			Linker:     *linker,
+			Shell:      *shell,
+			SourceRoot: *sourceRoot,
+		},
+	); err != nil {
+		return fmt.Errorf("replay configured Kconfig commands: %w", err)
+	}
+	for _, expected := range graphProbes {
+		supported, err := ccprofile.EvaluateKbuildGraphProbe(
+			context.Background(),
+			template.AnalysisIdentity,
+			expected.Identity(),
+			ccprofile.KbuildGraphProbeTools{
+				Compiler:    template.Compiler,
+				Linker:      *linker,
+				SourceRoot:  *sourceRoot,
+				ObjectRoot:  *objectRoot,
+				Environment: template.Environment,
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("replay Kbuild graph probe %s: %w", expected.ID, err)
+		}
+		if supported != expected.Supported {
+			return fmt.Errorf(
+				"Kbuild graph probe %s result mismatch: profile recorded supported=%t, configured tools returned supported=%t",
+				expected.ID,
+				expected.Supported,
+				supported,
+			)
+		}
 	}
 	identityDigest, err := ccprofile.CompilerIdentityDigest(identity)
 	if err != nil {
 		return err
 	}
-	stamp := "profile_digest=" + profileDigest + "\n" +
+	stamp := "profile_digest=" + digest + "\n" +
 		"compiler_identity_digest=" + identityDigest + "\n" +
-		"validation_scope=compiler\n"
+		"validation_scope=configured-graph\n"
 	if err := os.WriteFile(*out, []byte(stamp), 0o644); err != nil {
-		return fmt.Errorf("write validation stamp: %w", err)
+		return fmt.Errorf("write graph validation stamp: %w", err)
 	}
 	return nil
 }
@@ -446,18 +502,6 @@ func parseEnvironment(entries []string) (map[string]string, error) {
 		environment[name] = value
 	}
 	return environment, nil
-}
-
-func readProfile(path string) (ccprofile.Profile, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ccprofile.Profile{}, fmt.Errorf("read %s: %w", path, err)
-	}
-	profile, err := ccprofile.Decode(data)
-	if err != nil {
-		return ccprofile.Profile{}, fmt.Errorf("decode %s: %w", path, err)
-	}
-	return profile, nil
 }
 
 func readCompilerIdentity(path string) (ccprofile.CompilerIdentity, error) {

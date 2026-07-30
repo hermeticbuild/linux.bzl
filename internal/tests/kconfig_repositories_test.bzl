@@ -59,12 +59,12 @@ def _generator_probe_value_args_test_impl(ctx):
         ],
         repositories_test_helpers.generator_probe_value_args(
             values,
-            use_cc_profile = True,
+            use_graph_profile = True,
         ),
     )
     unprofiled = repositories_test_helpers.generator_probe_value_args(
         values,
-        use_cc_profile = False,
+        use_graph_profile = False,
     )
     asserts.true(env, "cc_version=220108" in unprofiled)
     asserts.true(env, "cc_builtin_macro.__SIZEOF_INT128__=16" in unprofiled)
@@ -76,7 +76,7 @@ def _compact_v7_repository_contract_test_impl(ctx):
     env = unittest.begin(ctx)
     asserts.equals(
         env,
-        "linux.bzl/compact-v7/cc-profile-v1/x86/x86",
+        "linux.bzl/compact-v7/graph-profile-v1/x86/x86",
         repositories_test_helpers.compact_v7_compile_environment_abi(
             struct(arch = "x86", srcarch = "x86"),
         ),
@@ -126,6 +126,43 @@ def _graph_configs_args_test_impl(ctx):
     return unittest.end(env)
 
 graph_configs_args_test = unittest.make(_graph_configs_args_test_impl)
+
+def _graph_validation_source_paths_test_impl(ctx):
+    env = unittest.begin(ctx)
+    asserts.equals(
+        env,
+        [
+            "arch/x86/include/asm/probe.h",
+            "scripts/cc-version.sh",
+            "scripts/probe.rsp",
+        ],
+        repositories_test_helpers.graph_validation_source_paths({
+            "kconfig_commands": [
+                {
+                    "inputs": {
+                        "scripts/cc-version.sh": "digest-c",
+                        "scripts/probe.rsp": "digest-a",
+                    },
+                },
+            ],
+            "kbuild_graph_probes": [
+                {
+                    "inputs": {
+                        "scripts/probe.rsp": "digest-a",
+                    },
+                },
+                {
+                    "inputs": {
+                        "arch/x86/include/asm/probe.h": "digest-b",
+                        "scripts/probe.rsp": "digest-a",
+                    },
+                },
+            ],
+        }),
+    )
+    return unittest.end(env)
+
+graph_validation_source_paths_test = unittest.make(_graph_validation_source_paths_test_impl)
 
 def _metadata_with_key(metadata, collection, key, value):
     result = dict(metadata)
@@ -395,7 +432,7 @@ def compile_environment_abi_test(name):
     _compile_environment_abi_subject(
         name = subject,
         actual = "unexpected-abi",
-        expected = "linux.bzl/compact-v6/llvm-22.1.8/x86/x86",
+        expected = "linux.bzl/compact-v7/graph-profile-v1/x86/x86",
         tags = ["manual"],
     )
     _compile_environment_abi_failure_test(
@@ -601,11 +638,13 @@ def _core_config_aliases_test_impl(ctx):
             "static": "1111111111111111111111111111111111111111111111111111111111111111",
         },
         base_rust_enabled = False,
-        cc_profile = "@@linux_profiles//:x86_64.json",
         config_mode = "default",
         graph_image = "//graph:x86_64_image",
         graph_modules = "//partitions:x86_64_modules",
+        graph_projection = "//graph:graph_profile_projection.json",
         graph_sources = "//sources:x86_64_core",
+        graph_validation_sources = ["@@linux_sources//:scripts/cc-version.sh"],
+        kbuild_linker = "@@llvm//tools:ld.lld",
         variant_configs = {"lz4": "//configs:lz4"},
         variant_core_configs = {"lz4": "x86_64"},
         variant_graph_images = {"lz4": "//graph:lz4_image"},
@@ -633,6 +672,14 @@ def _core_config_aliases_test_impl(ctx):
     asserts.true(
         env,
         'variant_core_configs = {\n        "lz4": "x86_64",\n    },' in generated,
+    )
+    asserts.true(
+        env,
+        'graph_projection = "//graph:graph_profile_projection.json",' in generated,
+    )
+    asserts.true(
+        env,
+        'kbuild_linker = "@@llvm//tools:ld.lld",' in generated,
     )
     asserts.true(
         env,
@@ -842,28 +889,6 @@ def _content_source_partition_build_test_impl(ctx):
     return unittest.end(env)
 
 content_source_partition_build_test = unittest.make(_content_source_partition_build_test_impl)
-
-def _graph_arch_tool_args_test_impl(ctx):
-    env = unittest.begin(ctx)
-    asserts.equals(
-        env,
-        [
-            "-source_objtool",
-            "//:_base_x86_objtool",
-        ],
-        repositories_test_helpers.graph_arch_tool_args("x86_64"),
-    )
-    asserts.equals(
-        env,
-        [
-            "-source_relacheck",
-            "//:_base_relacheck_tool",
-        ],
-        repositories_test_helpers.graph_arch_tool_args("aarch64"),
-    )
-    return unittest.end(env)
-
-graph_arch_tool_args_test = unittest.make(_graph_arch_tool_args_test_impl)
 
 def _without_rust_toolchain_config_test_impl(ctx):
     env = unittest.begin(ctx)

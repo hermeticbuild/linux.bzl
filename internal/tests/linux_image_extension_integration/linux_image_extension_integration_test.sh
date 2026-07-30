@@ -8,7 +8,7 @@ readonly WORK_ROOT="${TEST_TMPDIR}/linux_image_extension"
 readonly MODULE_UNDER_TEST="${WORK_ROOT}/linux_bzl"
 readonly BAZEL_BIN="${BAZEL:-bazel}"
 readonly SUCCESS_OUTPUT="${TEST_TMPDIR}/success-output"
-readonly MISSING_CC_PROFILE_OUTPUT="${TEST_TMPDIR}/missing-cc-profile-output"
+readonly MISSING_GRAPH_PROFILE_OUTPUT="${TEST_TMPDIR}/missing-graph-profile-output"
 readonly NON_ROOT_TAGS_OUTPUT="${TEST_TMPDIR}/non-root-tags-output"
 
 fail() {
@@ -69,7 +69,7 @@ shutdown_bazel() {
 
 cleanup() {
   shutdown_bazel "${SUCCESS_OUTPUT}"
-  shutdown_bazel "${MISSING_CC_PROFILE_OUTPUT}"
+  shutdown_bazel "${MISSING_GRAPH_PROFILE_OUTPUT}"
   shutdown_bazel "${NON_ROOT_TAGS_OUTPUT}"
 }
 
@@ -173,13 +173,13 @@ expect_failure \
   '@fixture_kernel//:image'
 
 expect_failure \
-  "${WORK_ROOT}/missing_cc_profile" \
-  "${MISSING_CC_PROFILE_OUTPUT}" \
+  "${WORK_ROOT}/missing_graph_profile" \
+  "${MISSING_GRAPH_PROFILE_OUTPUT}" \
   "mandatory attribute" \
   query \
   '@fixture_kernel//:image'
-grep -F "cc_profile" "${MISSING_CC_PROFILE_OUTPUT}.log" >/dev/null ||
-  fail "missing mandatory attribute error did not identify cc_profile"
+grep -F "graph_profile" "${MISSING_GRAPH_PROFILE_OUTPUT}.log" >/dev/null ||
+  fail "missing mandatory attribute error did not identify graph_profile"
 
 expect_failure \
   "${WORK_ROOT}/non_root_tags" \

@@ -8,133 +8,208 @@ import (
 	"testing"
 )
 
-func TestEvaluateStructuralProbeUsesLinuxSemantics(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "commands.log")
-	t.Setenv("PROBE_LOG", logPath)
-	compiler := filepath.Join(dir, "clang")
-	linker := filepath.Join(dir, "ld.lld")
-	writeProbeTool := func(path, name string) {
-		t.Helper()
-		script := "#!/bin/sh\n" +
-			"printf '%s:%s\\n' '" + name + "' \"$*\" >> \"$PROBE_LOG\"\n" +
-			"case \" $* \" in *' -funsupported '*) exit 1;; esac\n"
-		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-			t.Fatalf("WriteFile(%q) failed: %v", path, err)
-		}
-	}
-	writeProbeTool(compiler, "compiler")
-	writeProbeTool(linker, "linker")
+func TestReplayConfiguredKconfigCommandsUsesSelectedTools(t *testing.T) {
+	root := t.TempDir()
+	compiler := filepath.Join(root, "selected-compiler")
+	linker := filepath.Join(root, "selected-linker")
+	writeProbeTool(t, compiler, `#!/bin/sh
+case "$1" in
+  --supported) exit 0 ;;
+  --identity) printf 'configured\ncompiler\n'; exit 0 ;;
+esac
+exit 1
+`)
+	writeProbeTool(t, linker, "#!/bin/sh\nexit 0\n")
 
-	profile := Profile{
-		AnalysisIdentity: AnalysisIdentity{
-			TargetGNUSystemName: "aarch64-unknown-linux-gnu",
-		},
+	success := true
+	stdout := "configured compiler"
+	commands := []KconfigCommand{
+		configuredKconfigCommand(t, KconfigCommand{
+			Kind:        KconfigCommandKindSuccess,
+			Command:     "clang --supported",
+			Environment: map[string]string{"CC": "clang", "LD": "ld.lld"},
+			Inputs:      map[string]string{},
+			Success:     &success,
+		}),
+		configuredKconfigCommand(t, KconfigCommand{
+			Kind:        KconfigCommandKindStdout,
+			Command:     "$CC --identity",
+			Environment: map[string]string{"CC": "clang", "LD": "ld.lld"},
+			Inputs:      map[string]string{},
+			Stdout:      &stdout,
+		}),
 	}
-	tools := StructuralProbeTools{
-		Compiler:   compiler,
-		Linker:     linker,
-		SourceRoot: filepath.Join(dir, "linux"),
-	}
-	tests := []struct {
-		probe StructuralProbe
-		want  bool
-	}{
-		{
-			probe: StructuralProbe{
-				Kind:       "cc-option",
-				Language:   "c",
-				PrefixArgv: []string{"-Werror", "-I" + StructuralProbeSourceRoot + "/include"},
-				Argv:       []string{"-Wno-unused"},
-			},
-			want: true,
+	got, err := ReplayConfiguredKconfigCommands(
+		context.Background(),
+		commands,
+		KbuildGraphProbeTools{
+			Compiler:   compiler,
+			Linker:     linker,
+			Shell:      "/bin/sh",
+			SourceRoot: root,
 		},
-		{
-			probe: StructuralProbe{
-				Kind:     "cc-disable-warning",
-				Language: "c",
-				Argv:     []string{"packed"},
-			},
-			want: true,
-		},
-		{
-			probe: StructuralProbe{
-				Kind:     "cc-option-yn",
-				Language: "c",
-				Argv:     []string{"-funsupported"},
-			},
-			want: false,
-		},
-		{
-			probe: StructuralProbe{
-				Kind:     "as-option",
-				Language: "asm",
-				Argv:     []string{"-Wa,--fatal-warnings"},
-			},
-			want: true,
-		},
-		{
-			probe: StructuralProbe{
-				Kind:     "ld-option",
-				Language: "link",
-				Argv:     []string{"--build-id"},
-			},
-			want: true,
-		},
-	}
-	for index := range tests {
-		tests[index].probe.ID = StructuralProbeID(tests[index].probe)
-		got, err := EvaluateStructuralProbe(
-			context.Background(),
-			profile,
-			tests[index].probe,
-			tools,
-		)
-		if err != nil {
-			t.Fatalf("EvaluateStructuralProbe(%d) failed: %v", index, err)
-		}
-		if got != tests[index].want {
-			t.Errorf("EvaluateStructuralProbe(%d) = %t, want %t", index, got, tests[index].want)
-		}
-	}
-
-	log, err := os.ReadFile(logPath)
+	)
 	if err != nil {
-		t.Fatalf("ReadFile() failed: %v", err)
+		t.Fatalf("ReplayConfiguredKconfigCommands() failed: %v", err)
 	}
-	for _, want := range []string{
-		"--target=aarch64-unknown-linux-gnu",
-		"-I" + filepath.ToSlash(filepath.Join(dir, "linux")) + "/include",
-		"-Wunused",
-		"-Wpacked",
-		"-x assembler-with-cpp",
-		"linker:--build-id -v",
-	} {
-		if !strings.Contains(string(log), want) {
-			t.Errorf("probe commands omit %q:\n%s", want, log)
-		}
-	}
-	if strings.Contains(string(log), "-Wno-unused") {
-		t.Fatalf("cc-option warning probe did not enable the warning:\n%s", log)
+	if got != 2 {
+		t.Fatalf("replayed commands = %d, want 2", got)
 	}
 }
 
-func TestEvaluateStructuralProbeRejectsWrongID(t *testing.T) {
-	_, err := EvaluateStructuralProbe(
+func TestReplayConfiguredKconfigCommandsRejectsStaleResult(t *testing.T) {
+	root := t.TempDir()
+	compiler := filepath.Join(root, "selected-compiler")
+	linker := filepath.Join(root, "selected-linker")
+	writeProbeTool(t, compiler, "#!/bin/sh\nexit 1\n")
+	writeProbeTool(t, linker, "#!/bin/sh\nexit 0\n")
+	supported := true
+	command := configuredKconfigCommand(t, KconfigCommand{
+		Kind:        KconfigCommandKindSuccess,
+		Command:     "clang --unsupported",
+		Environment: map[string]string{"CC": "clang", "LD": "ld.lld"},
+		Inputs:      map[string]string{},
+		Success:     &supported,
+	})
+	_, err := ReplayConfiguredKconfigCommands(
 		context.Background(),
-		Profile{},
-		StructuralProbe{
-			ID:       strings.Repeat("0", 64),
-			Kind:     "cc-option",
-			Language: "c",
-			Argv:     []string{"-fno-pic"},
-		},
-		StructuralProbeTools{
-			Compiler: "clang",
-			Linker:   "ld.lld",
+		[]KconfigCommand{command},
+		KbuildGraphProbeTools{
+			Compiler:   compiler,
+			Linker:     linker,
+			Shell:      "/bin/sh",
+			SourceRoot: root,
 		},
 	)
-	if err == nil || !strings.Contains(err.Error(), "request ID") {
-		t.Fatalf("EvaluateStructuralProbe() error = %v, want request ID rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "result mismatch") {
+		t.Fatalf("ReplayConfiguredKconfigCommands() error = %v, want result mismatch", err)
 	}
+}
+
+func TestEvaluateConfiguredKconfigCommandRunsFromSourceRoot(t *testing.T) {
+	root := t.TempDir()
+	writeProbeTool(t, filepath.Join(root, "compiler"), "#!/bin/sh\nexit 0\n")
+	writeProbeTool(t, filepath.Join(root, "linker"), "#!/bin/sh\nexit 0\n")
+	if err := os.MkdirAll(filepath.Join(root, "plugin", "include"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, "plugin", "include", "plugin-version.h"),
+		[]byte("#define PLUGIN_VERSION 1\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	got, err := EvaluateConfiguredKconfigCommand(
+		context.Background(),
+		`{ test -e plugin/include/plugin-version.h; } >/dev/null 2>&1 && echo "y" || echo "n"`,
+		map[string]string{"CC": "clang", "LD": "ld.lld"},
+		KbuildGraphProbeTools{
+			Compiler:   filepath.Join(root, "compiler"),
+			Linker:     filepath.Join(root, "linker"),
+			Shell:      "/bin/sh",
+			SourceRoot: root,
+		},
+	)
+	if err != nil {
+		t.Fatalf("EvaluateConfiguredKconfigCommand() failed: %v", err)
+	}
+	if got != "y" {
+		t.Fatalf("EvaluateConfiguredKconfigCommand() = %q, want y", got)
+	}
+}
+
+func TestRefreshConfiguredGraphProfileUpdatesResultsAndPreservesIDs(t *testing.T) {
+	root := t.TempDir()
+	compiler := filepath.Join(root, "selected-compiler")
+	linker := filepath.Join(root, "selected-linker")
+	writeProbeTool(t, compiler, `#!/bin/sh
+case " $* " in
+  *" -fgood "*) exit 0 ;;
+esac
+exit 1
+`)
+	writeProbeTool(t, linker, "#!/bin/sh\nexit 1\n")
+	unsupported := false
+	command := configuredKconfigCommand(t, KconfigCommand{
+		Kind:        KconfigCommandKindSuccess,
+		Command:     "clang -fgood",
+		Environment: map[string]string{"CC": "clang", "LD": "ld.lld"},
+		Inputs:      map[string]string{},
+		Success:     &unsupported,
+	})
+	probeIdentity, err := NewKbuildGraphProbeIdentity(
+		KbuildGraphProbeKindCCOption,
+		"c",
+		nil,
+		[]string{"-fgood"},
+		map[string]string{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := KbuildGraphProbe{
+		ID:            probeIdentity.ID,
+		Kind:          probeIdentity.Kind,
+		Language:      probeIdentity.Language,
+		ContextArgv:   probeIdentity.ContextArgv,
+		CandidateArgv: probeIdentity.CandidateArgv,
+		Inputs:        probeIdentity.Inputs,
+		Supported:     false,
+	}
+	profile := GraphProfile{
+		Schema:         GraphProfileSchema,
+		Architecture:   "x86_64",
+		DriverContract: DriverContract,
+		AnalysisIdentity: AnalysisIdentity{
+			Compiler:            "clang",
+			TargetGNUSystemName: "x86_64-unknown-linux-gnu",
+		},
+		KconfigCommands:   []KconfigCommand{command},
+		KbuildGraphProbes: []KbuildGraphProbe{probe},
+	}
+	refreshed, err := RefreshConfiguredGraphProfile(
+		context.Background(),
+		profile,
+		KbuildGraphProbeTools{
+			Compiler:   compiler,
+			Linker:     linker,
+			Shell:      "/bin/sh",
+			SourceRoot: root,
+		},
+	)
+	if err != nil {
+		t.Fatalf("RefreshConfiguredGraphProfile() failed: %v", err)
+	}
+	if refreshed.KconfigCommands[0].ID != command.ID ||
+		refreshed.KconfigCommands[0].Success == nil ||
+		!*refreshed.KconfigCommands[0].Success {
+		t.Fatalf("refreshed command = %#v", refreshed.KconfigCommands[0])
+	}
+	if refreshed.KbuildGraphProbes[0].ID != probe.ID ||
+		!refreshed.KbuildGraphProbes[0].Supported {
+		t.Fatalf("refreshed probe = %#v", refreshed.KbuildGraphProbes[0])
+	}
+}
+
+func writeProbeTool(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
+		t.Fatalf("write probe tool: %v", err)
+	}
+}
+
+func configuredKconfigCommand(t *testing.T, command KconfigCommand) KconfigCommand {
+	t.Helper()
+	identity, err := NewKconfigCommandIdentity(
+		command.Kind,
+		command.Command,
+		command.Environment,
+		command.Inputs,
+	)
+	if err != nil {
+		t.Fatalf("NewKconfigCommandIdentity() failed: %v", err)
+	}
+	command.ID = identity.ID
+	return command
 }

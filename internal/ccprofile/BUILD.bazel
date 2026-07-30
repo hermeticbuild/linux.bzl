@@ -7,9 +7,11 @@ go_library(
     srcs = [
         "command.go",
         "compile.go",
+        "graph.go",
+        "graph_json.go",
+        "identity.go",
         "json.go",
         "probe.go",
-        "profile.go",
     ],
     importpath = "github.com/hermeticbuild/linux.bzl/internal/ccprofile",
     visibility = [
@@ -25,8 +27,8 @@ go_test(
     srcs = [
         "command_test.go",
         "compile_test.go",
+        "graph_test.go",
         "probe_test.go",
-        "profile_test.go",
     ],
     embed = [":ccprofile"],
 )

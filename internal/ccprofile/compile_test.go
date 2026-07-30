@@ -115,17 +115,17 @@ func TestPrepareCompileArgvRejectsSkeletonMutation(t *testing.T) {
 func TestDecodeValidationStamp(t *testing.T) {
 	valid := "profile_digest=" + strings.Repeat("a", 64) + "\n" +
 		"compiler_identity_digest=" + strings.Repeat("b", 64) + "\n" +
-		"validation_scope=compiler\n"
+		"validation_scope=configured-graph\n"
 	stamp, err := DecodeValidationStamp([]byte(valid))
 	if err != nil {
 		t.Fatalf("DecodeValidationStamp() failed: %v", err)
 	}
-	if stamp.ValidationScope != "compiler" {
+	if stamp.ValidationScope != "configured-graph" {
 		t.Fatalf("validation scope = %q", stamp.ValidationScope)
 	}
 	for _, invalid := range []string{
 		strings.TrimSuffix(valid, "\n"),
-		strings.Replace(valid, "validation_scope=compiler", "validation_scope=all", 1),
+		strings.Replace(valid, "validation_scope=configured-graph", "validation_scope=all", 1),
 		strings.Replace(valid, "profile_digest=", "unknown=", 1),
 		valid + "extra=true\n",
 	} {

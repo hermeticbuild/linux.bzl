@@ -8,8 +8,8 @@ import (
 )
 
 // CompactMetadataBatchV7WithOptions emits the isolated compact-v7 contract.
-// The initial implementation deliberately bridges through compact-v6 so current
-// callers and BUILD generation remain unchanged while the new schema matures.
+// Collection uses a private eager representation before content-addressing the
+// lazy v7 graph.
 func (t *Tree) CompactMetadataBatchV7WithOptions(
 	configs []NamedConfig,
 	opts CompactMetadataV7Options,
@@ -18,30 +18,30 @@ func (t *Tree) CompactMetadataBatchV7WithOptions(
 	if strings.TrimSpace(opts.ToolchainProfileID) == "" {
 		return nil, fmt.Errorf("compact-v7 metadata requires a non-empty toolchain profile ID")
 	}
-	v6Options := opts.CompactMetadataOptions
-	v6Options.collectSupportSourceInputs = true
-	v6, err := t.CompactMetadataBatchWithOptions(
+	eagerOptions := opts.CompactMetadataOptions
+	eagerOptions.collectSupportSourceInputs = true
+	eager, err := t.CompactMetadataBatchWithOptions(
 		configs,
-		v6Options,
+		eagerOptions,
 		graphForConfig,
 	)
 	if err != nil {
 		return nil, err
 	}
 	return newCompactMetadataV7(
-		v6,
+		eager,
 		opts.CompileEnvironmentABI,
 		opts.ToolchainProfileID,
 	)
 }
 
 func newCompactMetadataV7(
-	v6 *CompactMetadata,
+	eager *CompactMetadata,
 	compileEnvironmentABI string,
 	toolchainProfile string,
 ) (*CompactMetadataV7, error) {
-	if v6 == nil {
-		return nil, fmt.Errorf("compact-v7 conversion requires compact-v6 metadata")
+	if eager == nil {
+		return nil, fmt.Errorf("compact-v7 conversion requires eager metadata")
 	}
 	if strings.TrimSpace(compileEnvironmentABI) == "" {
 		return nil, fmt.Errorf("compact-v7 conversion requires a non-empty compile environment ABI")
@@ -49,21 +49,21 @@ func newCompactMetadataV7(
 	if strings.TrimSpace(toolchainProfile) == "" {
 		return nil, fmt.Errorf("compact-v7 conversion requires a non-empty toolchain profile ID")
 	}
-	if err := v6.validateContentIDs(); err != nil {
-		return nil, fmt.Errorf("validate compact-v6 input: %w", err)
+	if err := eager.validateContentIDs(); err != nil {
+		return nil, fmt.Errorf("validate eager metadata input: %w", err)
 	}
 
-	variants := make(map[string]CompactObjectVariant, len(v6.ObjectVariants))
-	for _, variant := range v6.ObjectVariants {
+	variants := make(map[string]CompactObjectVariant, len(eager.ObjectVariants))
+	for _, variant := range eager.ObjectVariants {
 		variants[variant.Target] = variant
 	}
-	reachability, err := compactV7Reachability(v6.Configs, variants)
+	reachability, err := compactV7Reachability(eager.Configs, variants)
 	if err != nil {
 		return nil, err
 	}
 
-	environmentsByID := make(map[string]CompactCompileEnvironment, len(v6.CompileEnvironments))
-	for _, environment := range v6.CompileEnvironments {
+	environmentsByID := make(map[string]CompactCompileEnvironment, len(eager.CompileEnvironments))
+	for _, environment := range eager.CompileEnvironments {
 		if environment.ABI != compileEnvironmentABI {
 			return nil, fmt.Errorf(
 				"compact-v7 compile environment %s uses ABI %q, want %q",
@@ -74,8 +74,8 @@ func newCompactMetadataV7(
 		}
 		environmentsByID[environment.ID] = environment
 	}
-	familiesByID := make(map[string]CompactGeneratedHeaderFamily, len(v6.GeneratedHeaderFamilies))
-	for _, family := range v6.GeneratedHeaderFamilies {
+	familiesByID := make(map[string]CompactGeneratedHeaderFamily, len(eager.GeneratedHeaderFamilies))
+	for _, family := range eager.GeneratedHeaderFamilies {
 		familiesByID[family.ID] = family
 	}
 
@@ -110,7 +110,7 @@ func newCompactMetadataV7(
 	}
 
 	sourceFiles, err := compactV7ReachableSourceFiles(
-		v6,
+		eager,
 		variants,
 		reachability,
 		familiesByID,
@@ -129,7 +129,7 @@ func newCompactMetadataV7(
 	}
 
 	referencedPayloads := map[string]bool{}
-	configs := append([]CompactConfig(nil), v6.Configs...)
+	configs := append([]CompactConfig(nil), eager.Configs...)
 	sort.Slice(configs, func(i, j int) bool {
 		return configs[i].Name < configs[j].Name
 	})
@@ -145,7 +145,7 @@ func newCompactMetadataV7(
 
 	for _, id := range sortedCompactIDs(usedFamilies) {
 		family := familiesByID[id]
-		inputs, err := v6.expandedSourceInputGroup(
+		inputs, err := eager.expandedSourceInputGroup(
 			family.SourceInputGroup,
 			fmt.Sprintf("compact-v7 generated header family %q", family.ID),
 		)
@@ -175,8 +175,8 @@ func newCompactMetadataV7(
 		referencedPayloads[family.ConfigPayload] = true
 	}
 
-	payloadsByID := make(map[string]CompactConfigPayload, len(v6.ConfigPayloads))
-	for _, payload := range v6.ConfigPayloads {
+	payloadsByID := make(map[string]CompactConfigPayload, len(eager.ConfigPayloads))
+	for _, payload := range eager.ConfigPayloads {
 		payloadsByID[payload.ID] = payload
 	}
 	for _, id := range sortedCompactIDs(referencedPayloads) {
@@ -226,7 +226,7 @@ func newCompactMetadataV7(
 		old, ok := variants[oldTarget]
 		if !ok {
 			return CompactObjectVariantV7{}, fmt.Errorf(
-				"compact-v7 references unknown compact-v6 object target %q",
+				"compact-v7 references unknown eager object target %q",
 				oldTarget,
 			)
 		}
@@ -266,7 +266,7 @@ func newCompactMetadataV7(
 
 		actionSourceGroup := ""
 		if old.SourceInputGroup != 0 {
-			inputs, err := v6.expandedSourceInputGroup(
+			inputs, err := eager.expandedSourceInputGroup(
 				old.SourceInputGroup,
 				fmt.Sprintf("compact-v7 object %q", old.Object),
 			)
@@ -303,8 +303,14 @@ func newCompactMetadataV7(
 			}
 		}
 
-		flagProgram := programInterner.internLiteral(old.Flags)
-		removeFlagProgram := programInterner.internLiteral(old.RemoveFlags)
+		flagProgram := programInterner.internExpression(old.flagProgram)
+		if old.flagProgram == nil {
+			flagProgram = programInterner.internLiteral(old.Flags)
+		}
+		removeFlagProgram := programInterner.internExpression(old.removeFlagProgram)
+		if old.removeFlagProgram == nil {
+			removeFlagProgram = programInterner.internLiteral(old.RemoveFlags)
+		}
 		recipe := CompactActionRecipe{
 			Kind:              compactV7ActionKind(old),
 			Language:          compactV7SourceLanguage(old.Source),
@@ -558,7 +564,7 @@ func compactV7MarkFamily(
 }
 
 func compactV7ReachableSourceFiles(
-	v6 *CompactMetadata,
+	eager *CompactMetadata,
 	variants map[string]CompactObjectVariant,
 	reachability map[string]map[string]bool,
 	families map[string]CompactGeneratedHeaderFamily,
@@ -583,7 +589,7 @@ func compactV7ReachableSourceFiles(
 		if group == 0 {
 			return nil
 		}
-		inputs, err := v6.expandedSourceInputGroup(group, context)
+		inputs, err := eager.expandedSourceInputGroup(group, context)
 		if err != nil {
 			return err
 		}
@@ -598,7 +604,7 @@ func compactV7ReachableSourceFiles(
 			return nil, err
 		}
 	}
-	for _, config := range v6.Configs {
+	for _, config := range eager.Configs {
 		if err := addInputs(config.supportSourceInputs); err != nil {
 			return nil, err
 		}

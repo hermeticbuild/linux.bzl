@@ -2,7 +2,6 @@ package kconfig
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
@@ -12,107 +11,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/hermeticbuild/linux.bzl/internal/ccprofile"
 )
 
 const (
-	StructuralProbeRequestsSchema = "linux.bzl/cc-structural-probe-requests-v1"
-	StructuralProbeSourceRoot     = ccprofile.StructuralProbeSourceRoot
-	StructuralProbeObjectRoot     = ccprofile.StructuralProbeObjectRoot
+	KbuildGraphProbeSourceRoot = ccprofile.GraphProfileSourceRoot
+	KbuildGraphProbeObjectRoot = ccprofile.GraphProfileObjectRoot
 )
-
-type StructuralProbeRequest struct {
-	ID         string   `json:"id"`
-	Kind       string   `json:"kind"`
-	Language   string   `json:"language"`
-	PrefixArgv []string `json:"prefix_argv"`
-	Argv       []string `json:"argv"`
-}
-
-type StructuralProbeRequestManifest struct {
-	Schema           string                   `json:"schema"`
-	StructuralProbes []StructuralProbeRequest `json:"structural_probes"`
-}
-
-// StructuralProbeRecorder collects unique compiler capability requests across
-// every Kbuild parser participating in one bootstrap operation.
-type StructuralProbeRecorder struct {
-	mu     sync.Mutex
-	probes map[string]StructuralProbeRequest
-}
-
-func NewStructuralProbeRecorder() *StructuralProbeRecorder {
-	return &StructuralProbeRecorder{
-		probes: map[string]StructuralProbeRequest{},
-	}
-}
-
-func (recorder *StructuralProbeRecorder) Record(probe ccprofile.StructuralProbe) error {
-	if recorder == nil {
-		return nil
-	}
-	request := StructuralProbeRequest{
-		Kind:       probe.Kind,
-		Language:   probe.Language,
-		PrefixArgv: append([]string{}, probe.PrefixArgv...),
-		Argv:       append([]string{}, probe.Argv...),
-	}
-	request.ID = ccprofile.StructuralProbeID(ccprofile.StructuralProbe{
-		Kind:       request.Kind,
-		Language:   request.Language,
-		PrefixArgv: request.PrefixArgv,
-		Argv:       request.Argv,
-	})
-
-	recorder.mu.Lock()
-	defer recorder.mu.Unlock()
-	if recorder.probes == nil {
-		recorder.probes = map[string]StructuralProbeRequest{}
-	}
-	if existing, ok := recorder.probes[request.ID]; ok {
-		if existing.Kind != request.Kind ||
-			existing.Language != request.Language ||
-			!slices.Equal(existing.PrefixArgv, request.PrefixArgv) ||
-			!slices.Equal(existing.Argv, request.Argv) {
-			return fmt.Errorf("structural probe request ID collision at %s", request.ID)
-		}
-		return nil
-	}
-	recorder.probes[request.ID] = request
-	return nil
-}
-
-func (recorder *StructuralProbeRecorder) Requests() []StructuralProbeRequest {
-	if recorder == nil {
-		return []StructuralProbeRequest{}
-	}
-	recorder.mu.Lock()
-	defer recorder.mu.Unlock()
-	requests := make([]StructuralProbeRequest, 0, len(recorder.probes))
-	for _, request := range recorder.probes {
-		request.PrefixArgv = append([]string{}, request.PrefixArgv...)
-		request.Argv = append([]string{}, request.Argv...)
-		requests = append(requests, request)
-	}
-	sort.Slice(requests, func(i, j int) bool {
-		return requests[i].ID < requests[j].ID
-	})
-	return requests
-}
-
-func (recorder *StructuralProbeRecorder) JSON() ([]byte, error) {
-	manifest := StructuralProbeRequestManifest{
-		Schema:           StructuralProbeRequestsSchema,
-		StructuralProbes: recorder.Requests(),
-	}
-	data, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("encode structural probe requests: %w", err)
-	}
-	return append(data, '\n'), nil
-}
 
 type KbuildFile struct {
 	Objects          []KbuildObject         `json:"objects"`
@@ -148,6 +54,8 @@ type KbuildFlag struct {
 	Flags     []string        `json:"flags"`
 	Condition KbuildCondition `json:"condition"`
 	Position  Position        `json:"position"`
+	program   *kbuildFlagExpr
+	variable  string
 }
 
 type KbuildDir struct {
@@ -238,9 +146,7 @@ type KbuildOptions struct {
 	SourceRoots     map[string]string
 	Variables       map[string]string
 	MaxIncludeDepth int
-	CCProfile       *ccprofile.Profile
-	ProbeRecorder   *StructuralProbeRecorder
-	ccProbes        map[string]ccprofile.StructuralProbe
+	GraphProfile    *GraphProfileShell
 }
 
 func ParseKbuildFile(path string) (*KbuildFile, error) {
@@ -248,10 +154,6 @@ func ParseKbuildFile(path string) (*KbuildFile, error) {
 }
 
 func ParseKbuildFileWithOptions(path string, opts KbuildOptions) (*KbuildFile, error) {
-	opts, err := prepareKbuildOptions(opts)
-	if err != nil {
-		return nil, err
-	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -270,10 +172,6 @@ func parseKbuildFile(path string, vars map[string]string) (*KbuildFile, error) {
 }
 
 func ParseKbuildFileTree(path string, opts KbuildOptions) (*KbuildFile, error) {
-	opts, err := prepareKbuildOptions(opts)
-	if err != nil {
-		return nil, err
-	}
 	return parseKbuildFileTree(path, opts, nil)
 }
 
@@ -311,10 +209,6 @@ func parseKbuildFileTree(path string, opts KbuildOptions, variableOverrides map[
 }
 
 func ParseKbuildDirectoryTree(path string, opts KbuildOptions) (*KbuildFile, error) {
-	opts, err := prepareKbuildOptions(opts)
-	if err != nil {
-		return nil, err
-	}
 	rootDir := opts.RootDir
 	if rootDir == "" {
 		rootDir = filepath.Dir(path)
@@ -347,20 +241,6 @@ func parseKbuildWithOptions(r io.Reader, filename string, opts KbuildOptions, ba
 	return parser.kb, nil
 }
 
-func prepareKbuildOptions(opts KbuildOptions) (KbuildOptions, error) {
-	if opts.CCProfile == nil {
-		return opts, nil
-	}
-	if err := ccprofile.Validate(*opts.CCProfile); err != nil {
-		return KbuildOptions{}, fmt.Errorf("validate Kbuild CC profile: %w", err)
-	}
-	opts.ccProbes = make(map[string]ccprofile.StructuralProbe, len(opts.CCProfile.StructuralProbes))
-	for _, probe := range opts.CCProfile.StructuralProbes {
-		opts.ccProbes[probe.ID] = probe
-	}
-	return opts, nil
-}
-
 func (p *kbuildParser) finalizeObjectSettings() error {
 	names := make([]string, 0, len(p.vars))
 	p.forEachVariableName(func(name string) {
@@ -379,7 +259,7 @@ func (p *kbuildParser) finalizeObjectSettings() error {
 		if !ok {
 			continue
 		}
-		value, err := p.expand("$(" + variable + ")")
+		value, err := p.expandConcreteFlagSink("$(" + variable + ")")
 		if err != nil {
 			return err
 		}
@@ -398,7 +278,7 @@ func (p *kbuildParser) finalizeObjectSettings() error {
 		if !ok || language != "c" {
 			continue
 		}
-		value, err := p.expand("$(" + variable + ")")
+		value, err := p.expandConcreteFlagSink("$(" + variable + ")")
 		if err != nil {
 			return err
 		}
@@ -483,10 +363,15 @@ type kbuildParser struct {
 	order         int
 	includeFunc   func([]KbuildInclude) error
 	includeDepth  int
-	ccProfile     *ccprofile.Profile
-	ccProbes      map[string]ccprofile.StructuralProbe
-	probeRecorder *StructuralProbeRecorder
+	graphProfile  *GraphProfileShell
 	probePaths    []kbuildProbePathReplacement
+	flagInterner  *kbuildFlagExprInterner
+	flagExpansion *kbuildFlagExpansion
+	flagVars      map[string]*kbuildFlagExpr
+	dynamicVars   map[string]bool
+	localFlagBase map[string][]string
+	localFlagSeen map[string]bool
+	flagSink      bool
 }
 
 type kbuildVariable struct {
@@ -497,6 +382,12 @@ type kbuildVariable struct {
 type kbuildProbePathReplacement struct {
 	path  string
 	token string
+}
+
+type kbuildGraphProbeRequest struct {
+	language      string
+	contextArgv   []string
+	candidateArgv []string
 }
 
 type kbuildConditionalFrame struct {
@@ -543,11 +434,14 @@ func newKbuildParserWithOptions(opts KbuildOptions, overrides map[string]string,
 		expanding:     map[string]bool{},
 		baseDir:       baseDir,
 		currentRule:   -1,
-		ccProfile:     opts.CCProfile,
-		probeRecorder: opts.ProbeRecorder,
+		graphProfile:  opts.GraphProfile,
 		probePaths:    kbuildProbePathReplacements(opts),
+		flagInterner:  newKbuildFlagExprInterner(),
+		flagVars:      map[string]*kbuildFlagExpr{},
+		dynamicVars:   map[string]bool{},
+		localFlagBase: map[string][]string{},
+		localFlagSeen: map[string]bool{},
 	}
-	parser.ccProbes = opts.ccProbes
 	return parser
 }
 
@@ -557,14 +451,14 @@ func kbuildProbePathReplacements(opts KbuildOptions) []kbuildProbePathReplacemen
 		paths []string
 	}{
 		{
-			token: StructuralProbeSourceRoot,
+			token: KbuildGraphProbeSourceRoot,
 			paths: []string{
 				opts.RootDir,
 				opts.Variables["srctree"],
 			},
 		},
 		{
-			token: StructuralProbeObjectRoot,
+			token: KbuildGraphProbeObjectRoot,
 			paths: []string{
 				opts.Variables["objtree"],
 			},
@@ -764,6 +658,9 @@ func (p *kbuildParser) parseConditional(line string, pos Position) (bool, error)
 	for _, keyword := range []string{"ifeq", "ifneq", "ifdef", "ifndef"} {
 		if rest, ok := makeDirectiveRest(line, keyword); ok {
 			result := p.evalConditional(keyword, rest)
+			if result.err != nil {
+				return true, fmt.Errorf("%s: %w", pos, result.err)
+			}
 			p.pushConditional(result)
 			return true, nil
 		}
@@ -787,7 +684,9 @@ func (p *kbuildParser) parseConditional(line string, pos Position) (bool, error)
 				if frame.sawElse {
 					return true, fmt.Errorf("%s: else conditional after else", pos)
 				}
-				p.activateElseIf(frame, keyword, nestedRest)
+				if err := p.activateElseIf(frame, keyword, nestedRest); err != nil {
+					return true, fmt.Errorf("%s: %w", pos, err)
+				}
 				return true, nil
 			}
 		}
@@ -850,22 +749,29 @@ func (p *kbuildParser) activateElse(frame *kbuildConditionalFrame) {
 	}
 }
 
-func (p *kbuildParser) activateElseIf(frame *kbuildConditionalFrame, keyword, rest string) {
+func (p *kbuildParser) activateElseIf(
+	frame *kbuildConditionalFrame,
+	keyword string,
+	rest string,
+) error {
 	if !frame.parentActive {
 		frame.active = false
 		frame.definitelyActive = false
 		frame.condition = KbuildCondition{}
 		frame.hasCondition = false
-		return
+		return nil
 	}
 	if !frame.previousKnown {
 		result := p.evalConditional(keyword, rest)
+		if result.err != nil {
+			return result.err
+		}
 		if result.known && !result.value {
 			frame.active = false
 			frame.definitelyActive = false
 			frame.condition = KbuildCondition{}
 			frame.hasCondition = false
-			return
+			return nil
 		}
 		conditions := []KbuildCondition{}
 		if frame.hasPreviousCondition {
@@ -884,16 +790,19 @@ func (p *kbuildParser) activateElseIf(frame *kbuildConditionalFrame, keyword, re
 		}
 		frame.previousCondition = combineKbuildAny(frame.previousCondition, branchCondition)
 		frame.hasPreviousCondition = true
-		return
+		return nil
 	}
 	if frame.previousTaken {
 		frame.active = false
 		frame.definitelyActive = false
 		frame.condition = KbuildCondition{}
 		frame.hasCondition = false
-		return
+		return nil
 	}
 	result := p.evalConditional(keyword, rest)
+	if result.err != nil {
+		return result.err
+	}
 	frame.previousKnown = result.known
 	frame.previousTaken = result.known && result.value
 	frame.active = frame.parentActive && (!result.known || result.value)
@@ -902,6 +811,7 @@ func (p *kbuildParser) activateElseIf(frame *kbuildConditionalFrame, keyword, re
 	frame.hasCondition = !result.known && result.hasCondition
 	frame.previousCondition = result.condition
 	frame.hasPreviousCondition = !result.known && result.hasCondition
+	return nil
 }
 
 func (p *kbuildParser) parseKbuildInclude(line string, pos Position) (bool, error) {
@@ -1002,24 +912,104 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 	if !containsMakeReference(expandedLHS) {
 		lhs = strings.TrimSpace(expandedLHS)
 	}
+	if _, ok := localKbuildFlagVariable(lhs); ok && !p.localFlagSeen[lhs] {
+		p.localFlagSeen[lhs] = true
+		if _, exists := p.lookupVariable(lhs); exists {
+			previous, err := p.expandConcreteFlagSink("$(" + lhs + ")")
+			if err != nil {
+				return fmt.Errorf("%s: expand inherited %s: %w", pos, lhs, err)
+			}
+			p.localFlagBase[lhs] = concreteKbuildFlags(kbuildFields(previous))
+		}
+	}
 	if (op == "=" || op == "?=") &&
 		!kbuildAssignmentEmitsMetadata(rawLHS) &&
 		!kbuildAssignmentEmitsMetadata(lhs) {
 		p.assign(lhs, op, rhs, rhs)
 		return nil
 	}
+	previousFlagSink := p.flagSink
+	p.flagSink = kbuildAssignmentEmitsFlags(rawLHS) ||
+		kbuildAssignmentEmitsFlags(lhs)
 	expandedRHS, err := p.expand(rhs)
+	p.flagSink = previousFlagSink
 	if err != nil {
 		return err
 	}
+	_, variableExisted := p.lookupVariable(lhs)
+	var flagProgram *kbuildFlagExpr
+	var flagAdditions *kbuildFlagExpr
+	var selfFilter *localKbuildSelfFilter
+	if kbuildAssignmentEmitsFlags(rawLHS) || kbuildAssignmentEmitsFlags(lhs) {
+		flagProgram, err = p.expandKbuildFlagExpression(rhs, 0)
+		if err != nil {
+			return fmt.Errorf("%s: model symbolic Kbuild flags: %w", pos, err)
+		}
+		if op == ":=" {
+			selfFilter = parseLocalKbuildSelfFilter(rhs, lhs)
+			if selfFilter != nil {
+				selfFilter.patterns, err = p.expandConcreteFlagSink(selfFilter.patterns)
+				if err != nil {
+					return fmt.Errorf("%s: expand local Kbuild flag filter: %w", pos, err)
+				}
+			}
+		}
+		if _, ok := localKbuildFlagVariable(lhs); ok &&
+			assignmentReferencesVariable(rhs, lhs) {
+			stripped, stripErr := stripKbuildSelfReferences(rhs, lhs)
+			if stripErr != nil {
+				return stripErr
+			}
+			flagAdditions, err = p.expandKbuildFlagExpression(stripped, 0)
+			if err != nil {
+				return fmt.Errorf("%s: model symbolic Kbuild flag additions: %w", pos, err)
+			}
+		}
+	}
 	p.assign(lhs, op, rhs, expandedRHS)
-
-	values := kbuildFields(expandedRHS)
-	if len(values) == 0 {
-		return nil
+	if flagProgram != nil {
+		p.assignKbuildFlagVariable(lhs, op, flagProgram, variableExisted)
+		p.assignDynamicKbuildVariable(
+			lhs,
+			op,
+			kbuildFlagExpressionContainsSelect(flagProgram),
+			variableExisted,
+		)
 	}
 
+	values := kbuildFields(expandedRHS)
+
 	if language, ok := localKbuildFlagVariable(lhs); ok {
+		if selfFilter != nil {
+			if !p.definitelyActive() {
+				return fmt.Errorf(
+					"%s: unsupported conditional rewrite of local Kbuild flag variable %q",
+					pos,
+					lhs,
+				)
+			}
+			p.applyLocalKbuildSelfFilter(lhs, selfFilter.patterns, selfFilter.invert)
+			base := p.localFlagBase[lhs]
+			removed := filterMakeWordSlice(selfFilter.patterns, base, !selfFilter.invert)
+			p.localFlagBase[lhs] = filterMakeWordSlice(
+				selfFilter.patterns,
+				base,
+				selfFilter.invert,
+			)
+			if len(removed) != 0 {
+				p.kb.RemoveFlags = append(p.kb.RemoveFlags, KbuildFlag{
+					Scope:     "global",
+					Language:  language,
+					Flags:     removed,
+					Condition: p.withActiveCondition(KbuildCondition{Kind: "const", State: "y"}),
+					Position:  pos,
+					program:   p.flagInterner.literal(removed),
+				})
+			}
+		}
+		if (op == ":=" || op == "=") && !assignmentReferencesVariable(rhs, lhs) {
+			p.localFlagBase[lhs] = nil
+		}
 		flagValues := values
 		if assignmentReferencesVariable(rhs, lhs) {
 			additions, err := p.localKbuildFlagAdditions(lhs, rhs)
@@ -1027,16 +1017,25 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 				return err
 			}
 			flagValues = additions
+			flagProgram = flagAdditions
 		}
-		if flags := concreteKbuildFlags(flagValues); len(flags) != 0 {
+		flags := concreteKbuildFlags(flagValues)
+		flagProgram = filterKbuildFlagExpression(flagProgram, concreteKbuildFlags)
+		if len(flags) != 0 || kbuildFlagExpressionMayEmit(flagProgram) {
 			p.kb.Flags = append(p.kb.Flags, KbuildFlag{
 				Scope:     "global",
 				Language:  language,
 				Flags:     flags,
 				Condition: p.withActiveCondition(KbuildCondition{Kind: "const", State: "y"}),
 				Position:  pos,
+				program:   flagProgram,
+				variable:  lhs,
 			})
 		}
+		return nil
+	}
+
+	if len(values) == 0 && !kbuildFlagExpressionMayEmit(flagProgram) {
 		return nil
 	}
 
@@ -1055,13 +1054,14 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 	}
 
 	if recursive, language, cond, ok := globalFlagCondition(rawLHS); ok {
-		return p.parseGlobalFlagAssignment(recursive, language, cond, values, pos)
+		return p.parseGlobalFlagAssignment(recursive, language, cond, values, flagProgram, pos)
 	}
 	if recursive, language, cond, ok := globalFlagCondition(lhs); ok {
-		return p.parseGlobalFlagAssignment(recursive, language, cond, values, pos)
+		return p.parseGlobalFlagAssignment(recursive, language, cond, values, flagProgram, pos)
 	}
 
 	if object, language, ok := removeFlagTarget(lhs); ok {
+		flagProgram = filterKbuildFlagExpression(flagProgram, concreteKbuildFlags)
 		p.kb.RemoveFlags = append(p.kb.RemoveFlags, KbuildFlag{
 			Scope:     "object",
 			Object:    object,
@@ -1069,6 +1069,7 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 			Flags:     values,
 			Condition: p.withActiveCondition(KbuildCondition{Kind: "const", State: "y"}),
 			Position:  pos,
+			program:   flagProgram,
 		})
 		return nil
 	}
@@ -1076,9 +1077,16 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 	if object, language, ok := perObjectFlagTarget(lhs); ok {
 		if language == "c" {
 			values = withoutExplicitSanitizerFlagReferences(values)
+			flagProgram = filterKbuildFlagExpression(
+				flagProgram,
+				withoutExplicitSanitizerFlagReferences,
+			)
 		}
+		flagProgram = filterKbuildFlagExpression(flagProgram, concreteKbuildFlags)
 		if len(values) == 0 {
-			return nil
+			if !kbuildFlagExpressionMayEmit(flagProgram) {
+				return nil
+			}
 		}
 		p.kb.Flags = append(p.kb.Flags, KbuildFlag{
 			Scope:     "object",
@@ -1087,6 +1095,7 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 			Flags:     values,
 			Condition: p.withActiveCondition(KbuildCondition{Kind: "const", State: "y"}),
 			Position:  pos,
+			program:   flagProgram,
 		})
 		return nil
 	}
@@ -1123,6 +1132,111 @@ func kbuildAssignmentEmitsMetadata(lhs string) bool {
 		return true
 	}
 	return false
+}
+
+func kbuildAssignmentEmitsFlags(lhs string) bool {
+	if _, ok := localKbuildFlagVariable(lhs); ok {
+		return true
+	}
+	if _, _, _, ok := globalFlagCondition(lhs); ok {
+		return true
+	}
+	if _, _, ok := removeFlagTarget(lhs); ok {
+		return true
+	}
+	if _, _, ok := perObjectFlagTarget(lhs); ok {
+		return true
+	}
+	return false
+}
+
+func (p *kbuildParser) assignKbuildFlagVariable(
+	name string,
+	op string,
+	expression *kbuildFlagExpr,
+	existed bool,
+) {
+	if expression == nil {
+		return
+	}
+	switch op {
+	case "+=":
+		p.flagVars[name] = p.flagInterner.concat(p.flagVars[name], expression)
+	case "?=":
+		if !existed {
+			p.flagVars[name] = expression
+		}
+	default:
+		p.flagVars[name] = expression
+	}
+}
+
+func (p *kbuildParser) assignDynamicKbuildVariable(
+	name string,
+	op string,
+	dynamic bool,
+	existed bool,
+) {
+	switch op {
+	case "+=":
+		p.dynamicVars[name] = p.dynamicVars[name] || dynamic
+	case "?=":
+		if !existed {
+			p.dynamicVars[name] = dynamic
+		}
+	default:
+		p.dynamicVars[name] = dynamic
+	}
+}
+
+func filterKbuildFlagExpression(
+	expression *kbuildFlagExpr,
+	filter func([]string) []string,
+) *kbuildFlagExpr {
+	return mapKbuildFlagExpressionOutput(expression, filter)
+}
+
+func kbuildFlagExpressionMayEmit(expression *kbuildFlagExpr) bool {
+	if expression == nil {
+		return false
+	}
+	switch expression.kind {
+	case kbuildFlagLiteral:
+		return len(expression.argv) != 0
+	case kbuildFlagConcat:
+		for _, child := range expression.children {
+			if kbuildFlagExpressionMayEmit(child) {
+				return true
+			}
+		}
+		return false
+	case kbuildFlagSelect:
+		return kbuildFlagExpressionMayEmit(expression.whenTrue) ||
+			kbuildFlagExpressionMayEmit(expression.whenFalse)
+	default:
+		return false
+	}
+}
+
+func kbuildFlagExpressionContainsSelect(expression *kbuildFlagExpr) bool {
+	if expression == nil {
+		return false
+	}
+	switch expression.kind {
+	case kbuildFlagLiteral:
+		return false
+	case kbuildFlagConcat:
+		for _, child := range expression.children {
+			if kbuildFlagExpressionContainsSelect(child) {
+				return true
+			}
+		}
+		return false
+	case kbuildFlagSelect:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *kbuildParser) parseCollectionAssignment(kind string, cond KbuildCondition, op string, values []string, pos Position) error {
@@ -1214,9 +1328,18 @@ func (p *kbuildParser) parseGeneratedTargetAssignment(kind string, cond KbuildCo
 	return nil
 }
 
-func (p *kbuildParser) parseGlobalFlagAssignment(recursive bool, language string, cond KbuildCondition, values []string, pos Position) error {
+func (p *kbuildParser) parseGlobalFlagAssignment(
+	recursive bool,
+	language string,
+	cond KbuildCondition,
+	values []string,
+	program *kbuildFlagExpr,
+	pos Position,
+) error {
 	cond = p.withActiveCondition(cond)
-	if flags := concreteKbuildFlags(values); len(flags) != 0 {
+	flags := concreteKbuildFlags(values)
+	program = filterKbuildFlagExpression(program, concreteKbuildFlags)
+	if len(flags) != 0 || kbuildFlagExpressionMayEmit(program) {
 		p.kb.Flags = append(p.kb.Flags, KbuildFlag{
 			Scope:     "global",
 			Recursive: recursive,
@@ -1224,6 +1347,7 @@ func (p *kbuildParser) parseGlobalFlagAssignment(recursive bool, language string
 			Flags:     flags,
 			Condition: cond,
 			Position:  pos,
+			program:   program,
 		})
 	}
 	return nil
@@ -1268,7 +1392,7 @@ func (p *kbuildParser) localKbuildFlagAdditions(lhs, rhs string) ([]string, erro
 	if strings.TrimSpace(stripped) == "" {
 		return nil, nil
 	}
-	expanded, err := p.expand(stripped)
+	expanded, err := p.expandConcreteFlagSink(stripped)
 	if err != nil {
 		return nil, err
 	}
@@ -1451,6 +1575,14 @@ func (p *kbuildParser) expand(value string) (string, error) {
 	return p.expandDepth(value, 0)
 }
 
+func (p *kbuildParser) expandConcreteFlagSink(value string) (string, error) {
+	previous := p.flagSink
+	p.flagSink = true
+	expanded, err := p.expand(value)
+	p.flagSink = previous
+	return expanded, err
+}
+
 func (p *kbuildParser) expandDepth(value string, depth int) (string, error) {
 	if depth > 100 {
 		return "", fmt.Errorf("too deep Kbuild variable expansion")
@@ -1528,11 +1660,30 @@ func (p *kbuildParser) evalReference(original, clause string, depth int) (string
 				}
 				args[i] = expanded
 			}
+			if p.kbuildFlagArgsContainMarker(args) {
+				if name == "filter" || name == "filter-out" {
+					return p.evalSymbolicKbuildFilter(name, args)
+				}
+				return "", fmt.Errorf(
+					"unsupported symbolic Kbuild flag expression through Make function %q",
+					name,
+				)
+			}
 			return p.evalMakeFunction(name, args, original), nil
 		}
 	}
 	if variable, pattern, replacement, ok := splitMakeSubstitution(clause); ok {
-		value, ok, err := p.expandVariable(strings.TrimSpace(variable), original, depth)
+		varName := strings.TrimSpace(variable)
+		if p.flagExpansion != nil && p.dynamicVars[varName] {
+			return "", fmt.Errorf(
+				"unsupported symbolic Kbuild flag expression through substitution reference %q",
+				varName,
+			)
+		}
+		if err := p.rejectDynamicKbuildVariable(varName); err != nil {
+			return "", err
+		}
+		value, ok, err := p.expandVariable(varName, original, depth)
 		if err != nil {
 			return "", err
 		}
@@ -1567,6 +1718,15 @@ func (p *kbuildParser) evalReference(original, clause string, depth int) (string
 		computedName = true
 		varName = strings.TrimSpace(expandedName)
 	}
+	if p.flagExpansion != nil {
+		if expression := p.flagVars[varName]; expression != nil &&
+			kbuildFlagExpressionContainsSelect(expression) {
+			return p.flagExpansion.marker(expression), nil
+		}
+	}
+	if err := p.rejectDynamicKbuildVariable(varName); err != nil {
+		return "", err
+	}
 	value, ok, err := p.expandVariable(varName, original, depth)
 	if err != nil {
 		return "", err
@@ -1580,6 +1740,16 @@ func (p *kbuildParser) evalReference(original, clause string, depth int) (string
 	return value, nil
 }
 
+func (p *kbuildParser) rejectDynamicKbuildVariable(name string) error {
+	if p.flagExpansion != nil || p.flagSink || !p.dynamicVars[name] {
+		return nil
+	}
+	return fmt.Errorf(
+		"unsupported dynamic Kbuild graph: symbolic flag variable %q reached a non-flag expansion",
+		name,
+	)
+}
+
 func (p *kbuildParser) kbuildKnownCall(
 	name string,
 	args []string,
@@ -1587,6 +1757,18 @@ func (p *kbuildParser) kbuildKnownCall(
 	srcarch string,
 	depth int,
 ) (string, bool, error) {
+	if p.flagExpansion != nil {
+		return p.symbolicKbuildKnownCall(name, args, original, srcarch, depth)
+	}
+	switch name {
+	case "cc-disable-warning", "cc-option", "cc-option-yn", "as-option", "ld-option":
+		if p.graphProfile == nil && !p.flagSink {
+			return "", true, fmt.Errorf(
+				"unsupported dynamic Kbuild graph: %s requires an exact graph profile outside a flag assignment",
+				name,
+			)
+		}
+	}
 	switch name {
 	case "cc-disable-warning":
 		if len(args) != 1 {
@@ -1596,13 +1778,15 @@ func (p *kbuildParser) kbuildKnownCall(
 		if warning == "" {
 			return "", true, nil
 		}
-		if p.ccProfile == nil {
-			if err := p.recordKbuildProbe(name, []string{warning}, depth); err != nil {
-				return "", true, err
-			}
+		if p.flagSink {
 			return "-Wno-" + warning, true, nil
 		}
-		supported, err := p.kbuildProbeSupported(name, []string{warning}, depth)
+		supported, err := p.kbuildGraphProbeSupported(
+			name,
+			[]string{warning},
+			depth,
+			true,
+		)
 		if err != nil {
 			return "", true, err
 		}
@@ -1617,18 +1801,18 @@ func (p *kbuildParser) kbuildKnownCall(
 		option := strings.TrimSpace(args[0])
 		supported := false
 		var err error
-		if p.ccProfile == nil {
-			if option != "" {
-				if err := p.recordKbuildProbe(name, kbuildFields(option), depth); err != nil {
-					return "", true, err
-				}
-			}
-			supported = linuxLLVMKbuildProbeSupportsOption(option, srcarch)
-		} else if option != "" {
-			supported, err = p.kbuildProbeSupported(name, kbuildFields(option), depth)
+		if option != "" && !p.flagSink {
+			supported, err = p.kbuildGraphProbeSupported(
+				name,
+				kbuildFields(option),
+				depth,
+				linuxLLVMKbuildProbeSupportsOption(option, srcarch),
+			)
 			if err != nil {
 				return "", true, err
 			}
+		} else if option != "" {
+			supported = linuxLLVMKbuildProbeSupportsOption(option, srcarch)
 		}
 		if !supported {
 			if len(args) == 2 {
@@ -1644,18 +1828,18 @@ func (p *kbuildParser) kbuildKnownCall(
 		option := strings.TrimSpace(args[0])
 		supported := false
 		var err error
-		if p.ccProfile == nil {
-			if option != "" {
-				if err := p.recordKbuildProbe(name, kbuildFields(option), depth); err != nil {
-					return "", true, err
-				}
-			}
-			supported = linuxLLVMKbuildProbeSupportsOption(option, srcarch)
-		} else if option != "" {
-			supported, err = p.kbuildProbeSupported(name, kbuildFields(option), depth)
+		if option != "" && !p.flagSink {
+			supported, err = p.kbuildGraphProbeSupported(
+				name,
+				kbuildFields(option),
+				depth,
+				linuxLLVMKbuildProbeSupportsOption(option, srcarch),
+			)
 			if err != nil {
 				return "", true, err
 			}
+		} else if option != "" {
+			supported = linuxLLVMKbuildProbeSupportsOption(option, srcarch)
 		}
 		if supported {
 			return "y", true, nil
@@ -1666,61 +1850,85 @@ func (p *kbuildParser) kbuildKnownCall(
 	}
 }
 
-func (p *kbuildParser) recordKbuildProbe(
+func (p *kbuildParser) kbuildGraphProbeSupported(
 	kind string,
 	argv []string,
 	depth int,
-) error {
-	if p.probeRecorder == nil || p.ccProfile != nil {
-		return nil
-	}
-	probe, err := p.kbuildProbe(kind, argv, depth)
-	if err != nil {
-		return err
-	}
-	return p.probeRecorder.Record(probe)
-}
-
-func (p *kbuildParser) kbuildProbeSupported(
-	kind string,
-	argv []string,
-	depth int,
+	fallback bool,
 ) (bool, error) {
 	probe, err := p.kbuildProbe(kind, argv, depth)
 	if err != nil {
 		return false, err
 	}
-	if p.probeRecorder != nil {
-		if err := p.probeRecorder.Record(probe); err != nil {
-			return false, err
-		}
+	graphKind := ccprofile.KbuildGraphProbeKindCCOption
+	candidateArgv := probe.candidateArgv
+	switch kind {
+	case "as-option":
+		graphKind = ccprofile.KbuildGraphProbeKindASOption
+	case "ld-option":
+		graphKind = ccprofile.KbuildGraphProbeKindLDOption
+	case "cc-disable-warning":
+		candidateArgv = []string{"-Wno-" + strings.Join(probe.candidateArgv, "")}
 	}
-	record, ok := p.ccProbes[probe.ID]
-	if !ok {
-		if p.probeRecorder != nil {
-			srcarch, _ := p.lookupRawVar("SRCARCH")
-			if kind == "cc-disable-warning" {
-				return true, nil
-			}
-			return linuxLLVMKbuildProbeSupportsOption(strings.Join(argv, " "), srcarch), nil
-		}
+	if p.graphProfile == nil {
 		return false, fmt.Errorf(
-			"missing CC profile structural probe %s: kind=%q language=%q prefix_argv=%q argv=%q",
-			probe.ID,
-			probe.Kind,
-			probe.Language,
-			probe.PrefixArgv,
-			probe.Argv,
+			"%s Kbuild graph probe requires a resolving or recording graph profile",
+			kind,
 		)
 	}
-	return record.Supported, nil
+	inputs, err := p.graphProfile.kbuildGraphProbeInputs(
+		probe.contextArgv,
+		candidateArgv,
+	)
+	if err != nil {
+		return false, fmt.Errorf("identify %s Kbuild graph probe inputs: %w", kind, err)
+	}
+	if p.graphProfile != nil && p.graphProfile.resolver != nil {
+		supported, err := p.graphProfile.resolveKbuildGraphProbe(
+			graphKind,
+			probe.language,
+			probe.contextArgv,
+			candidateArgv,
+			inputs,
+			fallback,
+		)
+		if err != nil {
+			return false, fmt.Errorf(
+				"resolve %s Kbuild graph probe: %w",
+				kind,
+				err,
+			)
+		}
+		return supported, nil
+	}
+	if p.graphProfile != nil && p.graphProfile.fallback != nil {
+		if err := p.graphProfile.recordKbuildGraphProbe(
+			graphKind,
+			probe.language,
+			probe.contextArgv,
+			candidateArgv,
+			inputs,
+			fallback,
+		); err != nil {
+			return false, fmt.Errorf(
+				"record %s Kbuild graph probe: %w",
+				kind,
+				err,
+			)
+		}
+		return fallback, nil
+	}
+	return false, fmt.Errorf(
+		"%s Kbuild graph probe requires a resolving or recording graph profile",
+		kind,
+	)
 }
 
 func (p *kbuildParser) kbuildProbe(
 	kind string,
 	argv []string,
 	depth int,
-) (ccprofile.StructuralProbe, error) {
+) (kbuildGraphProbeRequest, error) {
 	language := "c"
 	switch kind {
 	case "as-option":
@@ -1730,26 +1938,23 @@ func (p *kbuildParser) kbuildProbe(
 	}
 	prefixArgv, err := p.kbuildProbePrefixArgv(kind, depth)
 	if err != nil {
-		return ccprofile.StructuralProbe{}, err
+		return kbuildGraphProbeRequest{}, err
 	}
 	argv = p.canonicalizeKbuildProbeArgv(argv)
 	for _, arg := range argv {
 		if containsMakeReference(arg) {
-			return ccprofile.StructuralProbe{}, fmt.Errorf(
-				"%s structural probe argument contains unresolved Make syntax: %q",
+			return kbuildGraphProbeRequest{}, fmt.Errorf(
+				"%s Kbuild graph probe argument contains unresolved Make syntax: %q",
 				kind,
 				arg,
 			)
 		}
 	}
-	probe := ccprofile.StructuralProbe{
-		Kind:       kind,
-		Language:   language,
-		PrefixArgv: prefixArgv,
-		Argv:       argv,
-	}
-	probe.ID = ccprofile.StructuralProbeID(probe)
-	return probe, nil
+	return kbuildGraphProbeRequest{
+		language:      language,
+		contextArgv:   prefixArgv,
+		candidateArgv: argv,
+	}, nil
 }
 
 func (p *kbuildParser) kbuildProbePrefixArgv(kind string, depth int) ([]string, error) {
@@ -1773,14 +1978,14 @@ func (p *kbuildParser) kbuildProbePrefixArgv(kind string, depth int) ([]string, 
 	for _, name := range varNames {
 		value, ok, err := p.expandVariable(name, "$("+name+")", depth)
 		if err != nil {
-			return nil, fmt.Errorf("expand %s for %s structural probe: %w", name, kind, err)
+			return nil, fmt.Errorf("expand %s for %s Kbuild graph probe: %w", name, kind, err)
 		}
 		if !ok || strings.TrimSpace(value) == "" {
 			continue
 		}
 		value, err = removeUnresolvedKbuildReferences(value)
 		if err != nil {
-			return nil, fmt.Errorf("canonicalize %s for %s structural probe: %w", name, kind, err)
+			return nil, fmt.Errorf("canonicalize %s for %s Kbuild graph probe: %w", name, kind, err)
 		}
 		prefix = append(prefix, kbuildFields(value)...)
 	}
@@ -1958,6 +2163,11 @@ func (p *kbuildParser) evalForeach(args []string, original string, depth int) (s
 	if err != nil {
 		return "", err
 	}
+	if p.kbuildFlagValueContainsMarker(list) {
+		return "", fmt.Errorf(
+			"unsupported symbolic Kbuild flag expression in Make foreach list",
+		)
+	}
 	if name == "" || containsMakeReference(name) || containsMakeReference(list) {
 		return original, nil
 	}
@@ -1989,6 +2199,11 @@ func (p *kbuildParser) evalLet(args []string, original string, depth int) (strin
 	valuesText, err := p.expandDepth(args[1], depth)
 	if err != nil {
 		return "", err
+	}
+	if p.kbuildFlagValueContainsMarker(valuesText) {
+		return "", fmt.Errorf(
+			"unsupported symbolic Kbuild flag expression in Make let bindings",
+		)
 	}
 	namesText := strings.TrimSpace(args[0])
 	if containsMakeReference(namesText) || containsMakeReference(valuesText) {
@@ -2026,6 +2241,11 @@ func (p *kbuildParser) evalEval(args []string, original string, depth int) (stri
 	expanded, err := p.expandDepth(args[0], depth)
 	if err != nil {
 		return "", err
+	}
+	if p.kbuildFlagValueContainsMarker(expanded) {
+		return "", fmt.Errorf(
+			"unsupported symbolic Kbuild flag expression in Make eval",
+		)
 	}
 	for _, line := range strings.Split(expanded, "\n") {
 		if strings.TrimSpace(line) == "" {
@@ -2096,6 +2316,12 @@ func (p *kbuildParser) evalValue(args []string, original string, depth int) (str
 	if err != nil || !ok {
 		return original, err
 	}
+	if p.flagExpansion != nil && p.dynamicVars[name] {
+		return "", fmt.Errorf(
+			"unsupported symbolic Kbuild flag expression through Make value for %q",
+			name,
+		)
+	}
 	value, ok := p.lookupRawVar(name)
 	if !ok {
 		return "", nil
@@ -2125,6 +2351,11 @@ func (p *kbuildParser) evalIf(args []string, original string, depth int) (string
 	if err != nil {
 		return "", err
 	}
+	if p.kbuildFlagValueContainsMarker(condition) {
+		return "", fmt.Errorf(
+			"unsupported symbolic Kbuild flag expression in Make if condition",
+		)
+	}
 	if containsMakeReference(condition) {
 		return original, nil
 	}
@@ -2144,6 +2375,11 @@ func (p *kbuildParser) evalAnd(args []string, original string, depth int) (strin
 		if err != nil {
 			return "", err
 		}
+		if p.kbuildFlagValueContainsMarker(expanded) {
+			return "", fmt.Errorf(
+				"unsupported symbolic Kbuild flag expression in Make and condition",
+			)
+		}
 		if i < len(args)-1 && containsMakeReference(expanded) {
 			return original, nil
 		}
@@ -2160,6 +2396,11 @@ func (p *kbuildParser) evalOr(args []string, original string, depth int) (string
 		expanded, err := p.expandDepth(arg, depth)
 		if err != nil {
 			return "", err
+		}
+		if p.kbuildFlagValueContainsMarker(expanded) {
+			return "", fmt.Errorf(
+				"unsupported symbolic Kbuild flag expression in Make or condition",
+			)
 		}
 		if containsMakeReference(expanded) {
 			return original, nil
@@ -2330,9 +2571,7 @@ func (p *kbuildDirectoryTreeParser) parsePath(path, objectDir string, gate Kbuil
 			RootDir:         p.rootDir,
 			Variables:       p.opts.Variables,
 			MaxIncludeDepth: p.opts.MaxIncludeDepth,
-			CCProfile:       p.opts.CCProfile,
-			ProbeRecorder:   p.opts.ProbeRecorder,
-			ccProbes:        p.opts.ccProbes,
+			GraphProfile:    p.opts.GraphProfile,
 		}, variableOverrides)
 		if err != nil {
 			return nil, err
@@ -2449,9 +2688,7 @@ func (p *kbuildDirectoryTreeParser) parseRootMakefile(path string) (*KbuildFile,
 		RootDir:         p.rootDir,
 		Variables:       p.opts.Variables,
 		MaxIncludeDepth: p.opts.MaxIncludeDepth,
-		CCProfile:       p.opts.CCProfile,
-		ProbeRecorder:   p.opts.ProbeRecorder,
-		ccProbes:        p.opts.ccProbes,
+		GraphProfile:    p.opts.GraphProfile,
 	}, variableOverrides)
 	if err != nil {
 		return nil, err
@@ -2828,6 +3065,7 @@ type kbuildConditionalEval struct {
 	value        bool
 	condition    KbuildCondition
 	hasCondition bool
+	err          error
 }
 
 func (p *kbuildParser) evalConditional(keyword, rest string) kbuildConditionalEval {
@@ -2842,7 +3080,13 @@ func (p *kbuildParser) evalConditional(keyword, rest string) kbuildConditionalEv
 		}
 		leftExpanded, leftErr := p.expand(left)
 		rightExpanded, rightErr := p.expand(right)
-		if leftErr != nil || rightErr != nil || containsMakeReference(leftExpanded) || containsMakeReference(rightExpanded) {
+		if leftErr != nil {
+			return kbuildConditionalEval{err: fmt.Errorf("expand %s left operand: %w", keyword, leftErr)}
+		}
+		if rightErr != nil {
+			return kbuildConditionalEval{err: fmt.Errorf("expand %s right operand: %w", keyword, rightErr)}
+		}
+		if containsMakeReference(leftExpanded) || containsMakeReference(rightExpanded) {
 			return kbuildConditionalEval{}
 		}
 		equal := strings.TrimSpace(leftExpanded) == strings.TrimSpace(rightExpanded)
@@ -2852,7 +3096,10 @@ func (p *kbuildParser) evalConditional(keyword, rest string) kbuildConditionalEv
 		return kbuildConditionalEval{known: true, value: equal}
 	case "ifdef", "ifndef":
 		name, err := p.expand(strings.TrimSpace(rest))
-		if err != nil || containsMakeReference(name) {
+		if err != nil {
+			return kbuildConditionalEval{err: fmt.Errorf("expand %s operand: %w", keyword, err)}
+		}
+		if containsMakeReference(name) {
 			rawName := strings.TrimSpace(rest)
 			if strings.HasPrefix(rawName, "CONFIG_") {
 				condition := KbuildCondition{Kind: "config_ne", Symbol: rawName, State: "n"}
@@ -3301,9 +3548,13 @@ func mapMakeWordsDropEmpty(value string, mapWord func(string) string) string {
 }
 
 func filterMakeWords(patterns string, words string, invert bool) string {
+	return strings.Join(filterMakeWordSlice(patterns, strings.Fields(words), invert), " ")
+}
+
+func filterMakeWordSlice(patterns string, words []string, invert bool) []string {
 	patternList := strings.Fields(patterns)
-	var out []string
-	for _, word := range strings.Fields(words) {
+	out := make([]string, 0, len(words))
+	for _, word := range words {
 		matched := false
 		for _, pattern := range patternList {
 			if makePatternMatch(pattern, word) {
@@ -3315,7 +3566,7 @@ func filterMakeWords(patterns string, words string, invert bool) string {
 			out = append(out, word)
 		}
 	}
-	return strings.Join(out, " ")
+	return out
 }
 
 func makePatternMatch(pattern, word string) bool {
@@ -3499,6 +3750,70 @@ func localKbuildFlagVariable(lhs string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+type localKbuildSelfFilter struct {
+	patterns string
+	invert   bool
+}
+
+func parseLocalKbuildSelfFilter(rhs, variable string) *localKbuildSelfFilter {
+	rhs = strings.TrimSpace(rhs)
+	if len(rhs) < 4 || rhs[0] != '$' || (rhs[1] != '(' && rhs[1] != '{') {
+		return nil
+	}
+	end, err := matchingKbuildReference(rhs, 1)
+	if err != nil {
+		return nil
+	}
+	name, args, ok := splitMakeFunction(rhs[2:end])
+	if !ok || (name != "filter" && name != "filter-out") || len(args) != 2 {
+		return nil
+	}
+	if !exactKbuildVariableReference(args[1], variable) {
+		return nil
+	}
+	return &localKbuildSelfFilter{
+		patterns: args[0],
+		invert:   name == "filter-out",
+	}
+}
+
+func exactKbuildVariableReference(value, variable string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 4 || value[0] != '$' || (value[1] != '(' && value[1] != '{') {
+		return false
+	}
+	end, err := matchingKbuildReference(value, 1)
+	if err != nil || end != len(value)-1 {
+		return false
+	}
+	return strings.TrimSpace(value[2:end]) == variable
+}
+
+func (p *kbuildParser) applyLocalKbuildSelfFilter(
+	variable string,
+	patterns string,
+	invert bool,
+) {
+	filtered := p.kb.Flags[:0]
+	for i := range p.kb.Flags {
+		flag := p.kb.Flags[i]
+		if flag.variable == variable {
+			flag.Flags = filterMakeWordSlice(patterns, flag.Flags, invert)
+			flag.program = mapKbuildFlagExpressionOutput(
+				flag.program,
+				func(argv []string) []string {
+					return filterMakeWordSlice(patterns, argv, invert)
+				},
+			)
+			if len(flag.Flags) == 0 && !kbuildFlagExpressionMayEmit(flag.program) {
+				continue
+			}
+		}
+		filtered = append(filtered, flag)
+	}
+	p.kb.Flags = filtered
 }
 
 func assignmentReferencesVariable(rhs, name string) bool {

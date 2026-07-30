@@ -1,16 +1,19 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("//:linux.bzl", "linux_graph_profile")
+load("//internal:graph_profile.bzl", "linux_graph_profile_context")
 load(
     "//internal:linux_objects.bzl",
     "linux_cc_context",
     "linux_config",
 )
-load(":cc_profile_test.bzl", "cc_profile_test")
 load(":compact_generator_test.bzl", "compact_generator_test_suite")
 load(":compact_v7_repository_build_test.bzl", "compact_v7_repository_build_test_suite")
 load(":compact_v7_repository_test.bzl", "compact_v7_repository_test_suite")
 load(":config_validation_test.bzl", "config_validation_test_suite")
+load(":flag_programs_test.bzl", "flag_programs_test")
+load(":graph_profile_test.bzl", "graph_profile_context_test")
 load(":host_cc_toolchain_test.bzl", "host_cc_toolchain_test")
-load(":kconfig_repositories_test.bzl", "compact_v7_repository_contract_test", "compile_environment_abi_test", "content_partition_build_test", "content_source_partition_build_test", "core_config_aliases_test", "generated_header_config_index_test", "generated_object_inputs_test", "generator_probe_value_args_test", "generator_variable_args_test", "graph_arch_tool_args_test", "graph_configs_args_test", "kconfig_tool_filename_test", "metadata_key_validation_test", "module_sdk_aliases_test", "without_rust_toolchain_config_test")
+load(":kconfig_repositories_test.bzl", "compact_v7_repository_contract_test", "compile_environment_abi_test", "content_partition_build_test", "content_source_partition_build_test", "core_config_aliases_test", "generated_header_config_index_test", "generated_object_inputs_test", "generator_probe_value_args_test", "generator_variable_args_test", "graph_configs_args_test", "graph_validation_source_paths_test", "kconfig_tool_filename_test", "metadata_key_validation_test", "module_sdk_aliases_test", "without_rust_toolchain_config_test")
 load(":linux_compile_flags_test.bzl", "linux_compile_flags_test")
 load(":linux_modules_test.bzl", "linux_module_test_suite")
 load(":linux_object_groups_test.bzl", "linux_object_groups_test_suite")
@@ -28,11 +31,89 @@ compact_v7_repository_test_suite(name = "compact_v7_repository_tests")
 
 compact_v7_repository_build_test_suite(name = "compact_v7_repository_build_tests")
 
-cc_profile_test(name = "cc_profile_test")
+graph_profile_context_test(name = "graph_profile_context_test")
+
+linux_graph_profile_context(
+    name = "graph_profile_context_aarch64_refresh",
+    arch = "aarch64",
+    graph_projection = ":graph_projection_aarch64.json",
+    kbuild_linker = "@llvm//tools:ld.lld",
+    source_root = "//tests/compile:source/Kconfig",
+    tags = ["manual"],
+)
+
+flag_programs_test(name = "flag_programs_test")
 
 build_test(
-    name = "cc_profile_action_build_test",
-    targets = [":cc_profile_test_target"],
+    name = "graph_profile_context_build_test",
+    targets = [":graph_profile_context_test_target"],
+)
+
+linux_graph_profile(
+    name = "graph_profile_record_test_target",
+    srcs = [
+        ":arch/x86/kernel/vmlinux.lds.S",
+        ":graph_profile_record.Kbuild",
+        ":graph_profile_record.c",
+        ":include/linux/compiler-version.h",
+        ":include/linux/compiler_types.h",
+        ":include/linux/kconfig.h",
+    ],
+    arch = "x86_64",
+    compile_environment_abi = "linux.bzl/test/graph-profile/x86",
+    configs = {
+        ":graph_profile_record.config": "base",
+    },
+    generated_headers_by_config = {
+        "base": "//headers:base",
+    },
+    kbuild = ":graph_profile_record.Kbuild",
+    kbuild_linker = "@llvm//tools:ld.lld",
+    kernel_version = "6.18.39",
+    root = ":graph_profile_record.Kconfig",
+    tags = ["manual"],
+    vars = {
+        "ARCH": "x86",
+        "SRCARCH": "x86",
+    },
+)
+
+build_test(
+    name = "graph_profile_record_build_test",
+    targets = [":graph_profile_record_test_target"],
+)
+
+filegroup(
+    name = "graph_profile_record_json",
+    srcs = [":graph_profile_record_test_target"],
+    output_group = "profile",
+)
+
+filegroup(
+    name = "graph_profile_record_validation",
+    srcs = [":graph_profile_record_test_target"],
+    output_group = "validation",
+)
+
+genrule(
+    name = "graph_profile_record_assert",
+    srcs = [
+        ":graph_profile_record_json",
+        ":graph_profile_record_validation",
+    ],
+    outs = ["graph_profile_record_asserted"],
+    cmd = """
+grep -q '"kbuild_graph_probes": \\[' $(location :graph_profile_record_json)
+grep -q '"kind": "cc_option"' $(location :graph_profile_record_json)
+grep -q '"supported": false' $(location :graph_profile_record_json)
+grep -q '^validation_scope=configured-graph$$' $(location :graph_profile_record_validation)
+touch $@
+""",
+)
+
+build_test(
+    name = "graph_profile_record_test",
+    targets = [":graph_profile_record_assert"],
 )
 
 config_validation_test_suite(name = "config_validation_tests")
@@ -51,13 +132,13 @@ generated_object_inputs_test(name = "generated_object_inputs_test")
 
 graph_configs_args_test(name = "graph_configs_args_test")
 
+graph_validation_source_paths_test(name = "graph_validation_source_paths_test")
+
 generator_variable_args_test(name = "generator_variable_args_test")
 
 generator_probe_value_args_test(name = "generator_probe_value_args_test")
 
 generated_header_config_index_test(name = "generated_header_config_index_test")
-
-graph_arch_tool_args_test(name = "graph_arch_tool_args_test")
 
 host_cc_toolchain_test(name = "host_cc_toolchain_test")
 

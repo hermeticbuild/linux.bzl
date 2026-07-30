@@ -1152,10 +1152,10 @@ config EXTRA_LINKER_HEADER
 			}
 			data, err := metadata.JSON()
 			if err != nil {
-				t.Fatalf("compact-v6 JSON() failed: %v", err)
+				t.Fatalf("eager metadata JSON() failed: %v", err)
 			}
 			if strings.Contains(string(data), "support_source") {
-				t.Fatalf("compact-v6 JSON leaked v7-only support ownership: %s", data)
+				t.Fatalf("eager metadata JSON leaked v7-only support ownership: %s", data)
 			}
 		})
 	}
@@ -3200,7 +3200,7 @@ obj-y += init.o
 			nil,
 			root,
 			nil,
-			"linux.bzl/compact-v6/test",
+			"linux.bzl/eager-metadata/test",
 			nil,
 		)
 	}

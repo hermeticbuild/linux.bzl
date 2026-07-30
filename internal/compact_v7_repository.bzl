@@ -2,6 +2,8 @@
 
 visibility("//...")
 
+_NUL = json.decode('"\\u0000"')
+
 _PROTOCOL = "compact-v7-lazy-action-graph"
 _HEX = "0123456789abcdef"
 _EFFECT_ORDER = ["argv", "input", "output", "graph"]
@@ -601,13 +603,6 @@ def _classify_terminal_effects(argv):
     return [effect for effect in _EFFECT_ORDER if effect in effects]
 
 def _index_flag_programs(metadata):
-    probes = _list(metadata["kbuild_probes"], "kbuild_probes")
-    nodes = _list(metadata["flag_nodes"], "flag_nodes")
-    if probes:
-        fail("compact-v7 repository execution does not support dynamic Kbuild probes")
-    if nodes:
-        fail("compact-v7 repository execution does not support dynamic flag nodes")
-
     terminal_records, _ = _ordered_records(
         metadata["flag_terminals"],
         "flag_terminals",
@@ -619,9 +614,145 @@ def _index_flag_programs(metadata):
         path = "flag_terminals[%d]" % index
         record = _record(terminal_records[index], path, ["argv", "id"])
         argv = _string_list(record["argv"], path + ".argv")
+        for arg_index in range(len(argv)):
+            if "\n" in argv[arg_index] or "\r" in argv[arg_index] or _NUL in argv[arg_index]:
+                fail("%s.argv[%d] contains a newline or NUL" % (path, arg_index))
         terminals[record["id"]] = struct(
             argv = argv,
             id = record["id"],
+        )
+
+    probe_records, _ = _ordered_records(
+        metadata["kbuild_probes"],
+        "kbuild_probes",
+        "id",
+        validate_id = True,
+    )
+    probes = {}
+    for index in range(len(probe_records)):
+        path = "kbuild_probes[%d]" % index
+        record = _record(
+            probe_records[index],
+            path,
+            ["candidate_argv", "context_program", "id", "kind"],
+            ["language", "srcarch"],
+        )
+        kind = _string(record["kind"], path + ".kind")
+        if kind not in ["as_option", "cc_option", "ld_option"]:
+            fail("%s has unsupported kind %r" % (path, kind))
+        candidate_argv = _string_list(
+            record["candidate_argv"],
+            path + ".candidate_argv",
+            allow_empty = False,
+        )
+        for arg_index in range(len(candidate_argv)):
+            if "\n" in candidate_argv[arg_index] or "\r" in candidate_argv[arg_index] or _NUL in candidate_argv[arg_index]:
+                fail("%s.candidate_argv[%d] contains a newline or NUL" % (path, arg_index))
+        context_program = _full_id(
+            record["context_program"],
+            path + ".context_program",
+        )
+        probes[record["id"]] = struct(
+            candidate_argv = candidate_argv,
+            context_program = context_program,
+            id = record["id"],
+            kind = kind,
+            language = _string(
+                record.get("language", ""),
+                path + ".language",
+                allow_empty = True,
+            ),
+            srcarch = _string(
+                record.get("srcarch", ""),
+                path + ".srcarch",
+                allow_empty = True,
+            ),
+        )
+
+    node_records, _ = _ordered_records(
+        metadata["flag_nodes"],
+        "flag_nodes",
+        "id",
+        validate_id = True,
+    )
+    nodes = {}
+    for index in range(len(node_records)):
+        path = "flag_nodes[%d]" % index
+        raw = node_records[index]
+        kind = raw.get("kind", "select")
+        _string(kind, path + ".kind")
+        if kind == "select":
+            record = _record(
+                raw,
+                path,
+                ["id", "probe", "when_false", "when_true"],
+                ["kind"],
+            )
+            probe_id = _full_id(record["probe"], path + ".probe")
+            if probe_id not in probes:
+                fail("%s references unknown probe %s" % (path, probe_id))
+            when_true = _full_id(record["when_true"], path + ".when_true")
+            when_false = _full_id(record["when_false"], path + ".when_false")
+            if when_true == when_false:
+                fail("%s is not reduced" % path)
+            nodes[record["id"]] = struct(
+                children = [when_true, when_false],
+                id = record["id"],
+                kind = kind,
+                probe = probe_id,
+                when_false = when_false,
+                when_true = when_true,
+            )
+        elif kind == "concat":
+            record = _record(raw, path, ["children", "id", "kind"])
+            children = [
+                _full_id(child, "%s.children[%d]" % (path, child_index))
+                for child_index, child in enumerate(_list(record["children"], path + ".children"))
+            ]
+            if not children:
+                fail("%s.children must not be empty" % path)
+            nodes[record["id"]] = struct(
+                children = children,
+                id = record["id"],
+                kind = kind,
+            )
+        else:
+            fail("%s has unsupported kind %r" % (path, kind))
+
+    root_effects = {
+        terminal_id: _classify_terminal_effects(terminal.argv)
+        for terminal_id, terminal in terminals.items()
+    }
+    root_argv = {
+        terminal_id: terminal.argv
+        for terminal_id, terminal in terminals.items()
+    }
+    pending_nodes = dict(nodes)
+    for _ in range(len(nodes) + 1):
+        progressed = False
+        for node_id in sorted(pending_nodes.keys()):
+            node = pending_nodes[node_id]
+            if any([child not in root_effects for child in node.children]):
+                continue
+            effects = []
+            for child in node.children:
+                effects.extend(root_effects[child])
+            argv = []
+            for child in node.children:
+                argv.extend(root_argv[child])
+            root_effects[node_id] = _canonical_effects(
+                effects,
+                "flag node %s effects" % node_id,
+            )
+            root_argv[node_id] = argv
+            pending_nodes.pop(node_id)
+            progressed = True
+        if not pending_nodes or not progressed:
+            break
+    if pending_nodes:
+        fail(
+            "flag node graph has unknown references or a cycle at: %s" %
+            ", ".join(sorted(pending_nodes.keys())),
         )
 
     program_records, _ = _ordered_records(
@@ -635,26 +766,36 @@ def _index_flag_programs(metadata):
         path = "flag_programs[%d]" % index
         record = _record(program_records[index], path, ["effects", "id", "root"])
         root = _full_id(record["root"], path + ".root")
-        if root not in terminals:
-            fail("%s root %s is not a supported flag terminal" % (path, root))
+        if root not in root_effects:
+            fail("%s references unknown flag root %s" % (path, root))
         effects = _string_list(record["effects"], path + ".effects")
         canonical_effects = _canonical_effects(effects, path + ".effects")
         if effects != canonical_effects:
             fail("%s.effects must be canonical" % path)
-        actual_effects = _classify_terminal_effects(terminals[root].argv)
+        actual_effects = root_effects[root]
         if effects != actual_effects:
             fail(
-                "%s effects %r do not match terminal effects %r" %
+                "%s effects %r do not match root effects %r" %
                 (path, effects, actual_effects),
             )
         programs[record["id"]] = struct(
-            argv = terminals[root].argv,
+            argv = root_argv[root],
             effects = effects,
             id = record["id"],
             root = root,
-            terminal = terminals[root],
         )
-    return terminals, programs
+    for probe_id, probe in probes.items():
+        if probe.context_program not in programs:
+            fail(
+                "Kbuild probe %s references unknown context program %s" %
+                (probe_id, probe.context_program),
+            )
+    return struct(
+        nodes = nodes,
+        probes = probes,
+        programs = programs,
+        terminals = terminals,
+    )
 
 def _config_support_srcarch(families):
     srcarches = {
@@ -1094,6 +1235,8 @@ def _validate_referenced_tables(
         source_sets,
         source_files,
         action_source_groups,
+        probes,
+        nodes,
         terminals,
         programs,
         reachability,
@@ -1111,6 +1254,8 @@ def _validate_referenced_tables(
         for config in configs.values()
     }
     used_action_source_groups = {}
+    used_probes = {}
+    used_nodes = {}
     used_programs = {}
     used_terminals = {}
     used_reachability = {}
@@ -1129,8 +1274,36 @@ def _validate_referenced_tables(
         recipe = recipes[recipe_id]
         used_programs[recipe.flag_program_id] = True
         used_programs[recipe.remove_flag_program_id] = True
-    for program_id in used_programs:
-        used_terminals[programs[program_id].root] = True
+    expanded_programs = {}
+    expanded_roots = {}
+    for _ in range(len(programs) + len(nodes) + 1):
+        progressed = False
+        for program_id in sorted(used_programs.keys()):
+            if program_id in expanded_programs:
+                continue
+            expanded_programs[program_id] = True
+            root = programs[program_id].root
+            expanded_roots.setdefault(root, True)
+            progressed = True
+        for root in sorted(expanded_roots.keys()):
+            if expanded_roots[root] == False:
+                continue
+            expanded_roots[root] = False
+            progressed = True
+            if root in terminals:
+                used_terminals[root] = True
+                continue
+            if root not in nodes:
+                fail("compact-v7 references unknown flag root %s" % root)
+            node = nodes[root]
+            used_nodes[root] = True
+            for child in node.children:
+                expanded_roots.setdefault(child, True)
+            if node.kind == "select":
+                used_probes[node.probe] = True
+                used_programs[probes[node.probe].context_program] = True
+        if not progressed:
+            break
     for environment_id in used_environments:
         environment = environments[environment_id]
         used_payloads[environment.config_payload_id] = True
@@ -1160,6 +1333,8 @@ def _validate_referenced_tables(
     _require_all_used("generated header family", families, used_families)
     _require_all_used("source set", source_sets, used_source_sets)
     _require_all_used("action source group", action_source_groups, used_action_source_groups)
+    _require_all_used("Kbuild probe", probes, used_probes)
+    _require_all_used("flag node", nodes, used_nodes)
     _require_all_used("flag terminal", terminals, used_terminals)
     _require_all_used("flag program", programs, used_programs)
     _require_all_used("reachability signature", reachability, used_reachability)
@@ -1190,7 +1365,11 @@ def compact_v7_repository_model(
     )
     families = _index_generated_header_families(metadata, payloads, source_sets)
     environments = _index_compile_environments(metadata, abi, payloads, families)
-    terminals, programs = _index_flag_programs(metadata)
+    program_index = _index_flag_programs(metadata)
+    terminals = program_index.terminals
+    probes = program_index.probes
+    nodes = program_index.nodes
+    programs = program_index.programs
     raw_configs = _index_configs(metadata, payloads, source_sets, families)
     reachability = _index_reachability(metadata, raw_configs)
     recipes = _index_recipes(metadata, programs)
@@ -1217,6 +1396,8 @@ def compact_v7_repository_model(
         source_sets,
         source_files,
         action_source_groups,
+        probes,
+        nodes,
         terminals,
         programs,
         reachability,
@@ -1245,7 +1426,9 @@ def compact_v7_repository_model(
         config_root_memberships = config_roots,
         dependency_edge_count = object_index.dependency_edges,
         flag_program_count = len(programs),
+        flag_node_count = len(nodes),
         flag_terminal_count = len(terminals),
+        kbuild_probe_count = len(probes),
         generated_header_family_count = len(families),
         max_object_depth = object_index.max_depth,
         max_source_set_depth = source_set_index.max_depth,
@@ -1268,6 +1451,7 @@ def compact_v7_repository_model(
         config_payloads = payloads,
         configs = configs,
         flag_programs = programs,
+        flag_nodes = nodes,
         flag_terminals = terminals,
         generated_header_families = families,
         graph_stats = graph_stats,
@@ -1281,6 +1465,7 @@ def compact_v7_repository_model(
         source_files = source_files,
         source_files_by_path = source_files_by_path,
         source_sets = source_sets,
+        kbuild_probes = probes,
         toolchain_profile = profile,
     )
 
@@ -1730,6 +1915,45 @@ def _emitter_member_group_labels(objects, own_name, group_targets):
                 labels[":" + name] = True
     return sorted(labels.keys())
 
+def _emitter_flag_program_attrs(model):
+    terminals = {
+        terminal_id: json.encode(terminal.argv)
+        for terminal_id, terminal in model.flag_terminals.items()
+    }
+    probes = {}
+    for probe_id, probe in model.kbuild_probes.items():
+        probes[probe_id] = json.encode({
+            "candidate_argv": probe.candidate_argv,
+            "context_program": probe.context_program,
+            "kind": probe.kind,
+            "language": probe.language,
+            "srcarch": probe.srcarch,
+        })
+    nodes = {}
+    for node_id, node in model.flag_nodes.items():
+        if node.kind == "select":
+            value = {
+                "kind": node.kind,
+                "probe": node.probe,
+                "when_false": node.when_false,
+                "when_true": node.when_true,
+            }
+        else:
+            value = {
+                "children": node.children,
+                "kind": node.kind,
+            }
+        nodes[node_id] = json.encode(value)
+    return struct(
+        nodes = nodes,
+        probes = probes,
+        programs = {
+            program_id: program.root
+            for program_id, program in model.flag_programs.items()
+        },
+        terminals = terminals,
+    )
+
 def _emitter_emit_grouped_rules(
         lines,
         model,
@@ -1739,7 +1963,8 @@ def _emitter_emit_grouped_rules(
         srcarch,
         source_label_package,
         source_root_label,
-        cc_profile,
+        graph_profile,
+        flag_programs,
         source_objtool,
         source_objcopy,
         relocatable_link_flags,
@@ -1761,10 +1986,11 @@ def _emitter_emit_grouped_rules(
             attrs = dict(common)
             attrs.update({
                 "arch": arch,
-                "cc_profile": cc_profile,
+                "flag_program": recipe.flag_program_id,
+                "flag_programs": flag_programs,
+                "graph_profile": graph_profile,
                 "compile_environment_index": ":" + compile_environment_index.name,
                 "flag_effects": recipe.flag_program.effects,
-                "flags": recipe.flag_program.argv,
                 "language": recipe.language,
                 "mode": recipe.mode,
                 "modname": recipe.modname,
@@ -1778,7 +2004,7 @@ def _emitter_emit_grouped_rules(
                 "objtool_disabled": recipe.objtool_disabled,
                 "objtool_force": recipe.objtool_force,
                 "remove_flag_effects": recipe.remove_flag_program.effects,
-                "remove_flags": recipe.remove_flag_program.argv,
+                "remove_flag_program": recipe.remove_flag_program_id,
                 "source_paths": local_sources.paths,
                 "source_root": source_root_label,
                 "srcarch": srcarch,
@@ -1794,7 +2020,9 @@ def _emitter_emit_grouped_rules(
             attrs = dict(common)
             attrs.update({
                 "arch": arch,
-                "cc_profile": cc_profile,
+                "flag_program": recipe.flag_program_id,
+                "flag_programs": flag_programs,
+                "graph_profile": graph_profile,
                 "member_groups": _emitter_member_group_labels(
                     emitted.objects,
                     emitted.name,
@@ -1809,6 +2037,7 @@ def _emitter_emit_grouped_rules(
                 ),
                 "objtool_args": recipe.objtool_args,
                 "objtool_force": recipe.objtool_force,
+                "remove_flag_program": recipe.remove_flag_program_id,
                 "relocatable_link_flags": relocatable_link_flags,
             })
             _emitter_rule(lines, "linux_composite_object_action_group", emitted.name, attrs)
@@ -1819,7 +2048,9 @@ def _emitter_emit_grouped_rules(
             compile_environment_index = compile_environment_partitions[group.reachability_id]
             attrs = dict(common)
             attrs.update({
-                "cc_profile": cc_profile,
+                "flag_program": recipe.flag_program_id,
+                "flag_programs": flag_programs,
+                "graph_profile": graph_profile,
                 "compile_environment_index": ":" + compile_environment_index.name,
                 "member_groups": _emitter_member_group_labels(
                     emitted.objects,
@@ -1833,6 +2064,7 @@ def _emitter_emit_grouped_rules(
                     include_action_source = True,
                 ),
                 "relocatable_link_flags": relocatable_link_flags,
+                "remove_flag_program": recipe.remove_flag_program_id,
                 "source_paths": local_sources.paths,
                 "source_root": source_root_label,
                 "srcs": _emitter_source_labels(source_label_package, local_sources.paths),
@@ -1859,6 +2091,14 @@ def _emitter_emit_legacy_rules(
     for target in sorted(fallback_reasons.keys()):
         obj = model.object_variants[target]
         recipe = obj.recipe
+        if (
+            recipe.flag_program.root in model.flag_nodes or
+            recipe.remove_flag_program.root in model.flag_nodes
+        ):
+            fail(
+                "compact-v7 legacy fallback object %s cannot consume a dynamic flag program" %
+                target,
+            )
         attrs = {
             "arch": arch,
             "content_id": obj.content_id,
@@ -1976,7 +2216,7 @@ def _emitter_emit_config_targets(
         model,
         group_targets,
         source_label_package,
-        cc_profile):
+        graph_profile):
     result = {}
     config_names = sorted(model.configs.keys())
     for index in range(len(config_names)):
@@ -2025,7 +2265,7 @@ def _emitter_emit_config_targets(
             "linux_grouped_image",
             image,
             {
-                "cc_profile": cc_profile,
+                "graph_profile": graph_profile,
                 "objects": ":" + image_projection,
                 "tags": ["manual"],
             },
@@ -2070,7 +2310,7 @@ def compact_v7_repository_build(
         rules_repo,
         source_label_package,
         source_root_label,
-        cc_profile,
+        graph_profile,
         version,
         source_objtool = "",
         source_asn1_compiler = "",
@@ -2095,13 +2335,13 @@ def compact_v7_repository_build(
     for value, name in [
         (source_label_package, "source_label_package"),
         (source_root_label, "source_root_label"),
-        (cc_profile, "cc_profile"),
+        (graph_profile, "graph_profile"),
         (version, "version"),
     ]:
         if not value:
             fail("compact-v7 emitter requires %s" % name)
     if relocatable_link_flags == None:
-        relocatable_link_flags = ["-fuse-ld=lld"]
+        relocatable_link_flags = ["-r"]
     if toolchain_remove_flags == None:
         toolchain_remove_flags = []
     if visibility == None:
@@ -2142,12 +2382,37 @@ def compact_v7_repository_build(
             "linux_source_input_index",
             "linux_source_tree",
         ),
+        "load(%r, %r)" % (
+            _emitter_rules_label(rules_repo, "flag_programs.bzl"),
+            "linux_flag_programs",
+        ),
         "",
         "package(default_visibility = %r)" % visibility,
         "",
-        'exports_files(["metadata.json"], visibility = ["//visibility:public"])',
+        'exports_files(["graph_profile_projection.json", "metadata.json"], visibility = ["//visibility:public"])',
         "",
     ]
+
+    flag_program_attrs = _emitter_flag_program_attrs(model)
+    _emitter_rule(
+        lines,
+        "linux_flag_programs",
+        "_flag_programs",
+        {
+            "nodes": flag_program_attrs.nodes,
+            "probes": flag_program_attrs.probes,
+            "graph_profile": graph_profile,
+            "programs": flag_program_attrs.programs,
+            "source_root": source_root_label,
+            "source_paths": [source.path for source in model.source_files],
+            "srcs": _emitter_source_labels(
+                source_label_package,
+                [source.path for source in model.source_files],
+            ),
+            "tags": ["manual"],
+            "terminals": flag_program_attrs.terminals,
+        },
+    )
 
     for reachability_id in sorted(compile_environment_partitions.keys()):
         partition = compile_environment_partitions[reachability_id]
@@ -2202,7 +2467,8 @@ def compact_v7_repository_build(
         srcarch,
         source_label_package,
         source_root_label,
-        cc_profile,
+        graph_profile,
+        ":_flag_programs",
         source_objtool,
         source_objcopy,
         relocatable_link_flags,
@@ -2227,7 +2493,7 @@ def compact_v7_repository_build(
         model,
         group_targets,
         source_label_package,
-        cc_profile,
+        graph_profile,
     )
     analysis_config_payload_ids = {}
     for partition in compile_environment_partitions.values():

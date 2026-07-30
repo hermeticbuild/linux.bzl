@@ -21,6 +21,9 @@ _RECIPE = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 _RECIPE_GROUP = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 _CONTENT = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 _UNKNOWN = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+_PROBE = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+_NODE = "8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f"
+_DYNAMIC_PROGRAM = "afafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafaf"
 _TARGET = "kernel_obj__" + _CONTENT[:24]
 _ABI = "linux.bzl/compact-v7/test-abi"
 
@@ -184,6 +187,34 @@ def _model_test_impl(ctx):
     asserts.equals(env, 5, model.graph_stats.source_set_expanded_file_memberships)
     asserts.equals(env, 2, model.graph_stats.max_source_set_depth)
 
+    dynamic_metadata = _valid_metadata()
+    dynamic_metadata["kbuild_probes"] = [{
+        "candidate_argv": ["-mrecord-mcount"],
+        "context_program": _FLAGS_PROGRAM,
+        "id": _PROBE,
+        "kind": "cc_option",
+        "language": "c",
+        "srcarch": "x86",
+    }]
+    dynamic_metadata["flag_nodes"] = [{
+        "id": _NODE,
+        "kind": "select",
+        "probe": _PROBE,
+        "when_false": _REMOVE_TERMINAL,
+        "when_true": _FLAGS_TERMINAL,
+    }]
+    dynamic_metadata["flag_programs"] = dynamic_metadata["flag_programs"] + [{
+        "effects": ["argv"],
+        "id": _DYNAMIC_PROGRAM,
+        "root": _NODE,
+    }]
+    dynamic_recipe = dict(dynamic_metadata["action_recipes"][0])
+    dynamic_recipe["flag_program"] = _DYNAMIC_PROGRAM
+    dynamic_metadata["action_recipes"] = [dynamic_recipe]
+    dynamic_model = compact_v7_repository_model(dynamic_metadata, _PROFILE, _ABI)
+    asserts.equals(env, _NODE, dynamic_model.flag_programs[_DYNAMIC_PROGRAM].root)
+    asserts.equals(env, _PROBE, dynamic_model.flag_nodes[_NODE].probe)
+
     arm64_metadata = _valid_metadata()
     arm64_sources = list(arm64_metadata["source_files"])
     arm64_linker_script = dict(arm64_sources[0])
@@ -276,7 +307,7 @@ def compact_v7_repository_test_suite(name):
     probes = _valid_metadata()
     probes["kbuild_probes"] = [{"id": _UNKNOWN}]
     test_name = name + "_dynamic_probe"
-    _failure_case(test_name, probes, "does not support dynamic Kbuild probes")
+    _failure_case(test_name, probes, "missing required field")
     tests.append(test_name)
 
     environment = _replace_record(
@@ -304,7 +335,7 @@ def compact_v7_repository_test_suite(name):
     programs[0] = program
     effects["flag_programs"] = programs
     test_name = name + "_terminal_effects"
-    _failure_case(test_name, effects, "do not match terminal effects")
+    _failure_case(test_name, effects, "do not match root effects")
     tests.append(test_name)
 
     support_sources = _replace_record(

@@ -45,8 +45,9 @@ linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
 linux_images.image(
     name = "example_x86_64",
     arch = "x86_64",
-    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.json",
     config = "//configs:x86_64.config",
+    graph_profile = "@linux.bzl//profiles:llvm_22_1_8_x86_64.graph.json",
+    kbuild_linker = "@llvm//tools:ld.lld",
     platform = "@llvm//platforms:linux_x86_64",
     source = "@linux_6_18_39//:Kconfig",
 )
@@ -68,8 +69,9 @@ linux_images.overlay(
 linux_images.image(
     name = "example_aarch64",
     arch = "aarch64",
-    cc_profile = "@linux.bzl//profiles:llvm_22_1_8_aarch64.json",
     config = "//configs:aarch64.config",
+    graph_profile = "@linux.bzl//profiles:llvm_22_1_8_aarch64.graph.json",
+    kbuild_linker = "@llvm//tools:ld.lld",
     platform = "@llvm//platforms:linux_arm64",
     source = "@linux_6_18_39//:Kconfig",
 )

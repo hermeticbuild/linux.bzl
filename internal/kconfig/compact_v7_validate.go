@@ -564,24 +564,50 @@ func (metadata *CompactMetadataV7) validateCompactV7Programs() (
 			)
 		}
 		previous = node.ID
-		if _, ok := probes[node.Probe]; !ok {
-			return nil, fmt.Errorf(
-				"compact-v7 flag node %s references unknown probe %s",
-				node.ID,
+		expected := ""
+		switch node.Kind {
+		case "concat":
+			if len(node.Children) < 2 ||
+				node.Probe != "" || node.WhenTrue != "" || node.WhenFalse != "" {
+				return nil, fmt.Errorf(
+					"compact-v7 flag concat node %s is not reduced",
+					node.ID,
+				)
+			}
+			expected = compactV7FlagConcatContentID(node.Children)
+		case "select":
+			if len(node.Children) != 0 {
+				return nil, fmt.Errorf(
+					"compact-v7 flag select node %s has concat children",
+					node.ID,
+				)
+			}
+			if _, ok := probes[node.Probe]; !ok {
+				return nil, fmt.Errorf(
+					"compact-v7 flag node %s references unknown probe %s",
+					node.ID,
+					node.Probe,
+				)
+			}
+			if node.WhenTrue == "" || node.WhenFalse == "" ||
+				node.WhenTrue == node.WhenFalse {
+				return nil, fmt.Errorf(
+					"compact-v7 flag select node %s is not reduced",
+					node.ID,
+				)
+			}
+			expected = compactV7FlagSelectContentID(
 				node.Probe,
+				node.WhenTrue,
+				node.WhenFalse,
 			)
-		}
-		if node.WhenTrue == node.WhenFalse {
+		default:
 			return nil, fmt.Errorf(
-				"compact-v7 flag node %s is not reduced",
+				"compact-v7 flag node %s has unknown kind %q",
 				node.ID,
+				node.Kind,
 			)
 		}
-		expected := compactV7FlagNodeContentID(
-			node.Probe,
-			node.WhenTrue,
-			node.WhenFalse,
-		)
 		if node.ID != expected {
 			return nil, fmt.Errorf(
 				"compact-v7 flag node %s canonical fields hash to %s",
@@ -623,8 +649,9 @@ func (metadata *CompactMetadataV7) validateCompactV7Programs() (
 
 	rootEffects := map[string][]string{}
 	rootStates := map[string]uint8{}
-	var evaluateRoot func(string, string) ([]string, error)
-	evaluateRoot = func(root, parentProbe string) ([]string, error) {
+	emptyTerminal := compactV7FlagTerminalContentID(nil)
+	var evaluateRoot func(string) ([]string, error)
+	evaluateRoot = func(root string) ([]string, error) {
 		if terminal, ok := terminals[root]; ok {
 			if effects, ok := rootEffects[root]; ok {
 				return effects, nil
@@ -637,13 +664,6 @@ func (metadata *CompactMetadataV7) validateCompactV7Programs() (
 		if !ok {
 			return nil, fmt.Errorf("compact-v7 references unknown flag root %s", root)
 		}
-		if parentProbe != "" && parentProbe >= node.Probe {
-			return nil, fmt.Errorf(
-				"compact-v7 flag node %s violates probe order after %s",
-				node.ID,
-				parentProbe,
-			)
-		}
 		if effects, ok := rootEffects[root]; ok {
 			return effects, nil
 		}
@@ -651,15 +671,41 @@ func (metadata *CompactMetadataV7) validateCompactV7Programs() (
 			return nil, fmt.Errorf("compact-v7 flag node cycle at %s", root)
 		}
 		rootStates[root] = 1
-		whenTrue, err := evaluateRoot(node.WhenTrue, node.Probe)
-		if err != nil {
-			return nil, err
+		var effectLists [][]string
+		switch node.Kind {
+		case "concat":
+			for _, child := range node.Children {
+				if child == emptyTerminal {
+					return nil, fmt.Errorf(
+						"compact-v7 flag concat node %s contains an empty child",
+						node.ID,
+					)
+				}
+				if childNode, ok := nodes[child]; ok && childNode.Kind == "concat" {
+					return nil, fmt.Errorf(
+						"compact-v7 flag concat node %s contains concat child %s",
+						node.ID,
+						child,
+					)
+				}
+				childEffects, err := evaluateRoot(child)
+				if err != nil {
+					return nil, err
+				}
+				effectLists = append(effectLists, childEffects)
+			}
+		case "select":
+			whenTrue, err := evaluateRoot(node.WhenTrue)
+			if err != nil {
+				return nil, err
+			}
+			whenFalse, err := evaluateRoot(node.WhenFalse)
+			if err != nil {
+				return nil, err
+			}
+			effectLists = append(effectLists, whenTrue, whenFalse)
 		}
-		whenFalse, err := evaluateRoot(node.WhenFalse, node.Probe)
-		if err != nil {
-			return nil, err
-		}
-		effects, err := canonicalCompactV7Effects(whenTrue, whenFalse)
+		effects, err := canonicalCompactV7Effects(effectLists...)
 		if err != nil {
 			return nil, err
 		}
@@ -668,7 +714,7 @@ func (metadata *CompactMetadataV7) validateCompactV7Programs() (
 		return effects, nil
 	}
 	for _, program := range metadata.FlagPrograms {
-		effects, err := evaluateRoot(program.Root, "")
+		effects, err := evaluateRoot(program.Root)
 		if err != nil {
 			return nil, fmt.Errorf("compact-v7 flag program %s: %w", program.ID, err)
 		}
@@ -1397,15 +1443,31 @@ func (metadata *CompactMetadataV7) validateCompactV7ProgramReferences(
 		if !ok {
 			return fmt.Errorf("compact-v7 references unknown flag root %s", root)
 		}
-		usedProbes[node.Probe] = true
-		probe := probes[node.Probe]
-		if err := useProgram(probe.ContextProgram); err != nil {
-			return err
+		switch node.Kind {
+		case "concat":
+			for _, child := range node.Children {
+				if err := useRoot(child); err != nil {
+					return err
+				}
+			}
+			return nil
+		case "select":
+			usedProbes[node.Probe] = true
+			probe := probes[node.Probe]
+			if err := useProgram(probe.ContextProgram); err != nil {
+				return err
+			}
+			if err := useRoot(node.WhenTrue); err != nil {
+				return err
+			}
+			return useRoot(node.WhenFalse)
+		default:
+			return fmt.Errorf(
+				"compact-v7 flag node %s has unknown kind %q",
+				node.ID,
+				node.Kind,
+			)
 		}
-		if err := useRoot(node.WhenTrue); err != nil {
-			return err
-		}
-		return useRoot(node.WhenFalse)
 	}
 	useProgram = func(id string) error {
 		if programStates[id] == 2 {

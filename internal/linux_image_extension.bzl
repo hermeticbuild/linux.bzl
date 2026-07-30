@@ -135,7 +135,8 @@ def _linux_images_impl(module_ctx):
         _linux_image_repository(
             name = graph_repo,
             arch = image.arch,
-            cc_profile = image.cc_profile,
+            graph_profile = image.graph_profile,
+            kbuild_linker = image.kbuild_linker,
             config = image.config,
             config_mode = image.config_mode,
             overlays = overlays_by_image.get(name, {}),
@@ -150,7 +151,8 @@ def _linux_images_impl(module_ctx):
 
 _image = tag_class(attrs = {
     "arch": attr.string(mandatory = True),
-    "cc_profile": attr.label(mandatory = True),
+    "graph_profile": attr.label(mandatory = True),
+    "kbuild_linker": attr.label(mandatory = True),
     "config": attr.label(mandatory = True),
     "config_mode": attr.string(default = "default", values = ["allnoconfig", "default"]),
     "name": attr.string(mandatory = True),

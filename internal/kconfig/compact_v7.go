@@ -15,7 +15,8 @@ const CompactMetadataProtocolV7 = "compact-v7-lazy-action-graph"
 const (
 	compactV7ProbeDomain             = "linux-compact-v7-kbuild-probe-v1"
 	compactV7FlagTerminalDomain      = "linux-compact-v7-kbuild-flag-terminal-v1"
-	compactV7FlagNodeDomain          = "linux-compact-v7-kbuild-flag-node-v1"
+	compactV7FlagConcatDomain        = "linux-compact-v7-kbuild-flag-concat-v1"
+	compactV7FlagSelectDomain        = "linux-compact-v7-kbuild-flag-select-v1"
 	compactV7FlagProgramDomain       = "linux-compact-v7-kbuild-flag-program-v1"
 	compactV7SourceSetDomain         = "linux-compact-v7-source-set-v1"
 	compactV7ActionSourceGroupDomain = "linux-compact-v7-action-source-group-v1"
@@ -40,7 +41,7 @@ var compactV7EffectOrder = map[string]int{
 }
 
 // CompactMetadataV7Options selects the isolated compact-v7 metadata protocol.
-// The embedded v6 options preserve the existing repository-generation inputs.
+// The embedded eager options preserve the existing repository-generation inputs.
 type CompactMetadataV7Options struct {
 	CompactMetadataOptions
 	ToolchainProfileID string
@@ -87,7 +88,7 @@ type CompactGeneratedHeaderFamilyV7 struct {
 }
 
 // CompactSourceSet is an interned exact set. Children permit future scanners to
-// preserve shared closure structure; the v6 bridge emits flat nodes.
+// preserve shared closure structure; the eager metadata bridge emits flat nodes.
 type CompactSourceSet struct {
 	ID       string   `json:"id"`
 	Files    []int    `json:"files,omitempty"`
@@ -115,10 +116,12 @@ type CompactKbuildFlagTerminal struct {
 }
 
 type CompactKbuildFlagNode struct {
-	ID        string `json:"id"`
-	Probe     string `json:"probe"`
-	WhenTrue  string `json:"when_true"`
-	WhenFalse string `json:"when_false"`
+	ID        string   `json:"id"`
+	Kind      string   `json:"kind"`
+	Children  []string `json:"children,omitempty"`
+	Probe     string   `json:"probe,omitempty"`
+	WhenTrue  string   `json:"when_true,omitempty"`
+	WhenFalse string   `json:"when_false,omitempty"`
 }
 
 type CompactKbuildFlagProgram struct {
@@ -189,9 +192,17 @@ func compactV7FlagTerminalContentID(argv []string) string {
 	return hasher.id()
 }
 
-func compactV7FlagNodeContentID(probe, whenTrue, whenFalse string) string {
+func compactV7FlagConcatContentID(children []string) string {
+	hasher := newCompactContentHasher(compactV7FlagConcatDomain)
+	for _, child := range children {
+		hasher.writeValue("child=", child)
+	}
+	return hasher.id()
+}
+
+func compactV7FlagSelectContentID(probe, whenTrue, whenFalse string) string {
 	return compactContentID(
-		compactV7FlagNodeDomain,
+		compactV7FlagSelectDomain,
 		"probe="+probe,
 		"when_true="+whenTrue,
 		"when_false="+whenFalse,
@@ -462,26 +473,103 @@ func mapsKeys(values map[string]bool) []string {
 
 type compactV7ProgramInterner struct {
 	terminals map[string]CompactKbuildFlagTerminal
+	probes    map[string]CompactKbuildProbe
+	nodes     map[string]CompactKbuildFlagNode
 	programs  map[string]CompactKbuildFlagProgram
+	effects   map[string][]string
+	exprRoots map[string]string
 }
 
 func newCompactV7ProgramInterner() *compactV7ProgramInterner {
 	return &compactV7ProgramInterner{
 		terminals: map[string]CompactKbuildFlagTerminal{},
+		probes:    map[string]CompactKbuildProbe{},
+		nodes:     map[string]CompactKbuildFlagNode{},
 		programs:  map[string]CompactKbuildFlagProgram{},
+		effects:   map[string][]string{},
+		exprRoots: map[string]string{},
 	}
 }
 
 func (interner *compactV7ProgramInterner) internLiteral(argv []string) string {
+	return interner.internRoot(interner.internTerminal(argv))
+}
+
+func (interner *compactV7ProgramInterner) internTerminal(argv []string) string {
 	argv = append([]string{}, argv...)
 	terminal := CompactKbuildFlagTerminal{
 		ID:   compactV7FlagTerminalContentID(argv),
 		Argv: argv,
 	}
 	interner.terminals[terminal.ID] = terminal
-	effects := classifyCompactV7FlagEffects(argv)
+	interner.effects[terminal.ID] = classifyCompactV7FlagEffects(argv)
+	return terminal.ID
+}
+
+func (interner *compactV7ProgramInterner) internConcat(children ...string) string {
+	empty := compactV7FlagTerminalContentID(nil)
+	flattened := make([]string, 0, len(children))
+	for _, child := range children {
+		if child == "" || child == empty {
+			continue
+		}
+		if node, ok := interner.nodes[child]; ok && node.Kind == "concat" {
+			flattened = append(flattened, node.Children...)
+			continue
+		}
+		flattened = append(flattened, child)
+	}
+	switch len(flattened) {
+	case 0:
+		return interner.internTerminal(nil)
+	case 1:
+		return flattened[0]
+	}
+	node := CompactKbuildFlagNode{
+		Kind:     "concat",
+		Children: flattened,
+	}
+	node.ID = compactV7FlagConcatContentID(node.Children)
+	interner.nodes[node.ID] = node
+	effectLists := make([][]string, 0, len(node.Children))
+	for _, child := range node.Children {
+		effectLists = append(effectLists, interner.effects[child])
+	}
+	nodeEffects, _ := canonicalCompactV7Effects(effectLists...)
+	interner.effects[node.ID] = nodeEffects
+	return node.ID
+}
+
+func (interner *compactV7ProgramInterner) internSelect(
+	probe CompactKbuildProbe,
+	whenTrue string,
+	whenFalse string,
+) string {
+	if whenTrue == whenFalse {
+		return whenTrue
+	}
+	probe.ID = compactV7ProbeContentID(probe)
+	interner.probes[probe.ID] = probe
+	node := CompactKbuildFlagNode{
+		Kind:      "select",
+		Probe:     probe.ID,
+		WhenTrue:  whenTrue,
+		WhenFalse: whenFalse,
+	}
+	node.ID = compactV7FlagSelectContentID(node.Probe, node.WhenTrue, node.WhenFalse)
+	interner.nodes[node.ID] = node
+	nodeEffects, _ := canonicalCompactV7Effects(
+		interner.effects[whenTrue],
+		interner.effects[whenFalse],
+	)
+	interner.effects[node.ID] = nodeEffects
+	return node.ID
+}
+
+func (interner *compactV7ProgramInterner) internRoot(root string) string {
+	effects := append([]string(nil), interner.effects[root]...)
 	program := CompactKbuildFlagProgram{
-		Root:    terminal.ID,
+		Root:    root,
 		Effects: effects,
 	}
 	program.ID = compactV7FlagProgramContentID(program.Root, program.Effects)
@@ -489,9 +577,62 @@ func (interner *compactV7ProgramInterner) internLiteral(argv []string) string {
 	return program.ID
 }
 
+func (interner *compactV7ProgramInterner) internExpression(
+	expression *kbuildFlagExpr,
+) string {
+	return interner.internRoot(interner.internExpressionRoot(expression))
+}
+
+func (interner *compactV7ProgramInterner) internExpressionRoot(
+	expression *kbuildFlagExpr,
+) string {
+	if expression == nil {
+		return interner.internTerminal(nil)
+	}
+	if root := interner.exprRoots[expression.id]; root != "" {
+		return root
+	}
+	root := ""
+	switch expression.kind {
+	case kbuildFlagLiteral:
+		root = interner.internTerminal(expression.argv)
+	case kbuildFlagConcat:
+		children := make([]string, 0, len(expression.children))
+		for _, child := range expression.children {
+			children = append(children, interner.internExpressionRoot(child))
+		}
+		root = interner.internConcat(children...)
+	case kbuildFlagSelect:
+		contextProgram := interner.internExpression(expression.probe.context)
+		whenTrue := interner.internExpressionRoot(expression.whenTrue)
+		whenFalse := interner.internExpressionRoot(expression.whenFalse)
+		root = interner.internSelect(
+			CompactKbuildProbe{
+				Kind:           expression.probe.kind,
+				CandidateArgv:  append([]string(nil), expression.probe.candidateArgv...),
+				ContextProgram: contextProgram,
+				Language:       expression.probe.language,
+				Srcarch:        expression.probe.srcarch,
+			},
+			whenTrue,
+			whenFalse,
+		)
+	default:
+		root = interner.internTerminal(nil)
+	}
+	interner.exprRoots[expression.id] = root
+	return root
+}
+
 func (interner *compactV7ProgramInterner) apply(metadata *CompactMetadataV7) {
 	for _, id := range sortedCompactIDs(interner.terminals) {
 		metadata.FlagTerminals = append(metadata.FlagTerminals, interner.terminals[id])
+	}
+	for _, id := range sortedCompactIDs(interner.probes) {
+		metadata.KbuildProbes = append(metadata.KbuildProbes, interner.probes[id])
+	}
+	for _, id := range sortedCompactIDs(interner.nodes) {
+		metadata.FlagNodes = append(metadata.FlagNodes, interner.nodes[id])
 	}
 	for _, id := range sortedCompactIDs(interner.programs) {
 		metadata.FlagPrograms = append(metadata.FlagPrograms, interner.programs[id])

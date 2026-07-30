@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,85 +9,7 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/ccprofile"
 )
 
-func testProfile(t *testing.T, dir string) string {
-	t.Helper()
-	probe := ccprofile.StructuralProbe{
-		Kind:      "cc-option",
-		Language:  "c",
-		Argv:      []string{"-fno-omit-frame-pointer"},
-		Supported: true,
-	}
-	probe.ID = ccprofile.StructuralProbeID(probe)
-	profile := ccprofile.Profile{
-		Schema:         ccprofile.Schema,
-		Architecture:   "x86_64",
-		DriverContract: ccprofile.DriverContract,
-		AnalysisIdentity: ccprofile.AnalysisIdentity{
-			Compiler:            "clang",
-			TargetGNUSystemName: "x86_64-unknown-linux-gnu",
-		},
-		KconfigIdentity: ccprofile.KconfigIdentity{
-			CCName:        "Clang",
-			CCVersion:     220108,
-			CCVersionText: "clang version 22.1.8",
-			ASName:        "LLVM",
-			LDName:        "LLD",
-			LDVersion:     220108,
-			CanLink:       true,
-			BuiltinMacros: map[string]string{},
-		},
-		StructuralProbes: []ccprofile.StructuralProbe{probe},
-	}
-	data, err := ccprofile.CanonicalJSON(profile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, "profile.json")
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-func TestCheckAndCompare(t *testing.T) {
-	dir := t.TempDir()
-	profile := testProfile(t, dir)
-	canonical := filepath.Join(dir, "canonical.json")
-	digest := filepath.Join(dir, "digest")
-	if err := run([]string{
-		"check",
-		"-profile", profile,
-		"-canonical_out", canonical,
-		"-digest_out", digest,
-	}); err != nil {
-		t.Fatalf("check failed: %v", err)
-	}
-	digestData, err := os.ReadFile(digest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(strings.TrimSpace(string(digestData))) != 64 {
-		t.Fatalf("digest = %q", digestData)
-	}
-	stamp := filepath.Join(dir, "stamp")
-	if err := run([]string{
-		"compare",
-		"-expected", profile,
-		"-actual", canonical,
-		"-out", stamp,
-	}); err != nil {
-		t.Fatalf("compare failed: %v", err)
-	}
-	stampData, err := os.ReadFile(stamp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(string(stampData), "profile_digest=") {
-		t.Fatalf("stamp = %q", stampData)
-	}
-}
-
-func TestInspectAndValidate(t *testing.T) {
+func TestInspect(t *testing.T) {
 	dir := t.TempDir()
 	compiler := filepath.Join(dir, "clang")
 	script := `#!/bin/sh
@@ -146,90 +67,6 @@ printf '%s\n' \
 		t.Fatalf("command template omitted flags sentinel:\n%s", templateData)
 	}
 
-	stamp := filepath.Join(dir, "validated")
-	if err := run([]string{
-		"validate",
-		"-profile", testProfile(t, dir),
-		"-identity", identity,
-		"-out", stamp,
-	}); err != nil {
-		t.Fatalf("validate failed: %v", err)
-	}
-	stampData, err := os.ReadFile(stamp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, line := range []string{
-		"profile_digest=",
-		"compiler_identity_digest=",
-		"validation_scope=compiler\n",
-	} {
-		if !strings.Contains(string(stampData), line) {
-			t.Fatalf("validation stamp omits %q:\n%s", line, stampData)
-		}
-	}
-}
-
-func TestProbePopulatesCanonicalProfile(t *testing.T) {
-	dir := t.TempDir()
-	tool := filepath.Join(dir, "tool")
-	if err := os.WriteFile(tool, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("WriteFile(tool) failed: %v", err)
-	}
-	request := ccprofile.StructuralProbe{
-		Kind:       "cc-option",
-		Language:   "c",
-		PrefixArgv: []string{"-Werror"},
-		Argv:       []string{"-fno-pic"},
-	}
-	request.ID = ccprofile.StructuralProbeID(request)
-	requestData, err := json.MarshalIndent(structuralProbeRequestManifest{
-		Schema: structuralProbeRequestsSchema,
-		StructuralProbes: []structuralProbeRequest{{
-			ID:         request.ID,
-			Kind:       request.Kind,
-			Language:   request.Language,
-			PrefixArgv: request.PrefixArgv,
-			Argv:       request.Argv,
-		}},
-	}, "", "  ")
-	if err != nil {
-		t.Fatalf("MarshalIndent(requests) failed: %v", err)
-	}
-	requestsPath := filepath.Join(dir, "requests.json")
-	if err := os.WriteFile(requestsPath, append(requestData, '\n'), 0o644); err != nil {
-		t.Fatalf("WriteFile(requests) failed: %v", err)
-	}
-	out := filepath.Join(dir, "populated.json")
-	if err := run([]string{
-		"probe",
-		"-profile", testProfile(t, dir),
-		"-requests", requestsPath,
-		"-compiler", tool,
-		"-linker", tool,
-		"-out", out,
-	}); err != nil {
-		t.Fatalf("probe failed: %v", err)
-	}
-	profile, err := readProfile(out)
-	if err != nil {
-		t.Fatalf("readProfile(output) failed: %v", err)
-	}
-	if got, want := len(profile.StructuralProbes), 2; got != want {
-		t.Fatalf("probe count = %d, want %d", got, want)
-	}
-	found := false
-	for _, probe := range profile.StructuralProbes {
-		if probe.ID == request.ID {
-			found = true
-			if !probe.Supported {
-				t.Fatal("successful structural probe was recorded as unsupported")
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("populated profile omits request %s", request.ID)
-	}
 }
 
 func TestInspectRejectsAmbiguousSkeleton(t *testing.T) {
@@ -400,7 +237,7 @@ printf '%s\n' invoked > "$COUNT_PATH"
 		t.Fatal(err)
 	}
 	validationPath := filepath.Join(dir, "invalid.validation")
-	if err := os.WriteFile(validationPath, []byte("validation_scope=compiler\n"), 0o644); err != nil {
+	if err := os.WriteFile(validationPath, []byte("validation_scope=configured-graph\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	err = run([]string{
@@ -423,7 +260,7 @@ func writeValidationStamp(t *testing.T, dir string) string {
 	path := filepath.Join(dir, "validated")
 	data := "profile_digest=" + strings.Repeat("a", 64) + "\n" +
 		"compiler_identity_digest=" + strings.Repeat("b", 64) + "\n" +
-		"validation_scope=compiler\n"
+		"validation_scope=configured-graph\n"
 	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
