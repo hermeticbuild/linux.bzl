@@ -25,8 +25,13 @@ func writeTestCommandTemplate(
 			Compiler:            "clang",
 			TargetGNUSystemName: "x86_64-unknown-linux-gnu",
 		},
-		Compiler:            compiler,
-		MutableArgv:         []string{"__LINUX_BZL_KBUILD_FLAGS__"},
+		Compiler: compiler,
+		MutableArgv: []string{
+			"--target=x86_64-linux-gnu",
+			"-nostdinc",
+			"-fintegrated-as",
+			"__LINUX_BZL_KBUILD_FLAGS__",
+		},
 		Environment:         environment,
 		KbuildFlagsSentinel: "__LINUX_BZL_KBUILD_FLAGS__",
 	}
@@ -45,6 +50,107 @@ func writeTestArgv(t *testing.T, path string, argv ...string) {
 	t.Helper()
 	if err := writeArgvFile(path, argv); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReadGNUResponseFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flags.rsp")
+	data := `-DARM64_ASM_ARCH=\"armv8.5-a\"`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readGNUResponseFile(path)
+	if err != nil {
+		t.Fatalf("readGNUResponseFile failed: %v", err)
+	}
+	want := []string{
+		`-DARM64_ASM_ARCH="armv8.5-a"`,
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("response argv = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadGNUResponseFileMatchesClangGNUQuoting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flags.rsp")
+	data := "foo\\ bar \"foo bar\" 'foo bar' 'foo\\\\bar' -DFOO=bar\\(\\) " +
+		"foo\"bar\"baz C:\\\\src\\\\foo.cpp \"C:\\src\\foo.cpp\""
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readGNUResponseFile(path)
+	if err != nil {
+		t.Fatalf("readGNUResponseFile failed: %v", err)
+	}
+	want := []string{
+		"foo bar",
+		"foo bar",
+		"foo bar",
+		`foo\bar`,
+		"-DFOO=bar()",
+		"foobarbaz",
+		`C:\src\foo.cpp`,
+		"C:srcfoo.cpp",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("response argv = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadGNUResponseFileMatchesClangEdges(t *testing.T) {
+	for name, test := range map[string]struct {
+		data string
+		want []string
+	}{
+		"whitespace": {
+			data: " \t\"\" '' first\r\nsecond\\ value",
+			want: []string{"first", "second value"},
+		},
+		"terminal escape": {
+			data: `tail\`,
+			want: []string{`tail\`},
+		},
+		"unterminated quote": {
+			data: `"unterminated`,
+			want: []string{"unterminated"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "flags.rsp")
+			if err := os.WriteFile(path, []byte(test.data), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got, err := readGNUResponseFile(path)
+			if err != nil {
+				t.Fatalf("readGNUResponseFile failed: %v", err)
+			}
+			if strings.Join(got, "\x00") != strings.Join(test.want, "\x00") {
+				t.Fatalf("response argv = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestReadGNUResponseFileRejectsNUL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flags.rsp")
+	if err := os.WriteFile(path, []byte{'a', 0, 'b'}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readGNUResponseFile(path); err == nil {
+		t.Fatal("readGNUResponseFile succeeded, want NUL error")
+	}
+}
+
+func TestReadArgvFilePreservesResponseEscapes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flags.argv")
+	want := []string{`-DARM64_ASM_ARCH=\"armv8.5-a\"`}
+	writeTestArgv(t, path, want...)
+	got, err := readArgvFile(path)
+	if err != nil {
+		t.Fatalf("readArgvFile failed: %v", err)
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("internal argv = %#v, want %#v", got, want)
 	}
 }
 
@@ -82,7 +188,7 @@ func TestResolveNodeSelectsBranchFromKbuildGraphProbe(t *testing.T) {
 	logPath := filepath.Join(dir, "compiler.argv")
 	compiler := filepath.Join(dir, "compiler")
 	script := `#!/bin/sh
-printf '%s\n' "$@" > "$LOG_PATH"
+printf '%s\n' "$@" >> "$LOG_PATH"
 case " $* " in
   *" -funsupported "*) exit 1 ;;
 esac
@@ -101,7 +207,14 @@ exit 0
 	contextPath := filepath.Join(dir, "context.argv")
 	truePath := filepath.Join(dir, "true.argv")
 	falsePath := filepath.Join(dir, "false.argv")
-	writeTestArgv(t, contextPath, "-Werror")
+	objectRoot := filepath.Join(dir, "objects")
+	writeTestArgv(
+		t,
+		contextPath,
+		"-Werror",
+		"-I$(srctree)/include",
+		"-I${obj}",
+	)
 	writeTestArgv(t, truePath, "-DSELECTED_TRUE")
 	writeTestArgv(t, falsePath, "-DSELECTED_FALSE")
 
@@ -114,13 +227,19 @@ exit 0
 		{
 			name:      "supported compact kind",
 			kind:      "cc_option",
-			candidate: "-fno-pic",
+			candidate: "-I$(srctree)/candidate",
 			want:      "-DSELECTED_TRUE\n",
 		},
 		{
 			name:      "unsupported",
 			kind:      "cc_option",
 			candidate: "-funsupported",
+			want:      "-DSELECTED_FALSE\n",
+		},
+		{
+			name:      "empty after intrinsic expansion",
+			kind:      "cc_option",
+			candidate: "$(CLANG_FLAGS)",
 			want:      "-DSELECTED_FALSE\n",
 		},
 	} {
@@ -139,6 +258,7 @@ exit 0
 				"-when_true", truePath,
 				"-when_false", falsePath,
 				"-source_root", dir,
+				"-object_root", objectRoot,
 				"-out", out,
 			})
 			if err != nil {
@@ -157,9 +277,61 @@ exit 0
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(log), "--target=x86_64-unknown-linux-gnu") ||
-		!strings.Contains(string(log), "-Werror") {
+	if !strings.Contains(string(log), "--target=x86_64-linux-gnu") ||
+		!strings.Contains(string(log), "-nostdinc") ||
+		!strings.Contains(string(log), "-fintegrated-as") ||
+		!strings.Contains(string(log), "-Werror") ||
+		!strings.Contains(string(log), "-I"+filepath.Join(dir, "include")) ||
+		!strings.Contains(string(log), "-I"+objectRoot) ||
+		!strings.Contains(string(log), "-I"+filepath.Join(dir, "candidate")) {
 		t.Fatalf("probe argv omitted template identity/context:\n%s", log)
+	}
+}
+
+func TestExpandKbuildProbeMakeRefsRejectsConfigAndUnknownRefs(t *testing.T) {
+	for _, arg := range []string{
+		"$(CONFIG_CC_IS_CLANG)",
+		"${CONFIG_X86_64}",
+		"$(UNKNOWN)",
+	} {
+		t.Run(arg, func(t *testing.T) {
+			_, err := expandKbuildProbeMakeRefs(
+				[]string{arg},
+				t.TempDir(),
+				t.TempDir(),
+			)
+			if err == nil || !strings.Contains(err.Error(), "unsupported") {
+				t.Fatalf(
+					"expandKbuildProbeMakeRefs(%q) error = %v, want unsupported reference",
+					arg,
+					err,
+				)
+			}
+		})
+	}
+}
+
+func TestKbuildProgramExpansionRejectsExposedResponseFiles(t *testing.T) {
+	_, err := expandKbuildProbeMakeRefs(
+		[]string{"$(CLANG_FLAGS)@probe.rsp"},
+		t.TempDir(),
+		t.TempDir(),
+	)
+	if err == nil || !strings.Contains(err.Error(), "response-file") {
+		t.Fatalf("expandKbuildProbeMakeRefs() error = %v, want response-file error", err)
+	}
+
+	_, err = expandKbuildProgramArgv(
+		[]string{"$(CLANG_FLAGS)@compile.rsp"},
+		map[string]string{},
+		filepath.Join(t.TempDir(), "source.c"),
+		t.TempDir(),
+		"source.o",
+		"",
+		"",
+	)
+	if err == nil || !strings.Contains(err.Error(), "response-file") {
+		t.Fatalf("expandKbuildProgramArgv() error = %v, want response-file error", err)
 	}
 }
 
@@ -231,7 +403,7 @@ func TestConcatNodePreservesInputOrder(t *testing.T) {
 	}
 }
 
-func TestLinkFiltersExactArgumentsAndUsesRawLDOrder(t *testing.T) {
+func TestLinkUsesRawLDOrder(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "link.argv")
 	linker := filepath.Join(dir, "ld")
@@ -239,10 +411,6 @@ func TestLinkFiltersExactArgumentsAndUsesRawLDOrder(t *testing.T) {
 	if err := os.WriteFile(linker, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	add := filepath.Join(dir, "add.argv")
-	remove := filepath.Join(dir, "remove.argv")
-	writeTestArgv(t, add, "--add-keep", "--drop")
-	writeTestArgv(t, remove, "--drop")
 	out := filepath.Join(dir, "linked.o")
 	linkerScript := filepath.Join(dir, "layout.lds")
 	inputA := filepath.Join(dir, "a.o")
@@ -251,10 +419,8 @@ func TestLinkFiltersExactArgumentsAndUsesRawLDOrder(t *testing.T) {
 		"link",
 		"-linker", linker,
 		"-validation", writeValidationStamp(t, dir),
-		"-flags_file", add,
-		"-remove_flags_file", remove,
 		"-base_arg=-r",
-		"-base_arg=--drop",
+		"-base_arg=--add-keep",
 		"-linker_script", linkerScript,
 		"-output", out,
 		"-input", inputA,
@@ -282,7 +448,7 @@ func TestLinkFiltersExactArgumentsAndUsesRawLDOrder(t *testing.T) {
 	}
 }
 
-func TestCompileExpandsFileProgramsAndNestedResponses(t *testing.T) {
+func TestCompileExpandsFlagProgramsAndDeclaredResponses(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "compile.argv")
 	compiler := filepath.Join(dir, "compiler")
@@ -318,11 +484,23 @@ done
 		"-I$(src)",
 		"-I${srctree}/include",
 		"-I$(obj)",
+		"-DY=$(CONFIG_Y)",
+		"-DM=${CONFIG_M}",
+		"-DN=$(CONFIG_N)",
+		"-DSTRING=$(CONFIG_STRING)",
+		"-DREMOVE=$(CONFIG_Y)",
 		"$(CLANG_FLAGS)",
-		"@"+response,
 	)
 	removePath := filepath.Join(dir, "remove.argv")
-	writeTestArgv(t, removePath, "-DRESPONSE_DROP")
+	writeTestArgv(t, removePath, "-DREMOVE=$(CONFIG_Y)", "-DRESPONSE_DROP")
+	configPath := filepath.Join(dir, ".config")
+	if err := os.WriteFile(
+		configPath,
+		[]byte("CONFIG_M=m\nCONFIG_N=n\nCONFIG_STRING=\"configured value\"\nCONFIG_Y=y\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
 	sourceDir := filepath.Join(dir, "source", "kernel")
 	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -338,10 +516,12 @@ done
 		"-validation", writeValidationStamp(t, dir),
 		"-source", source,
 		"-output", output,
+		"-config", configPath,
 		"-flags_file", flagsPath,
 		"-remove_flags_file", removePath,
 		"-source_root", filepath.Join(dir, "source"),
 		"-object_path", "kernel/value.o",
+		"-arg", "@" + response,
 	}); err != nil {
 		t.Fatalf("compile failed: %v", err)
 	}
@@ -351,10 +531,17 @@ done
 	}
 	got := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
 	want := []string{
+		"--target=x86_64-linux-gnu",
+		"-nostdinc",
+		"-fintegrated-as",
+		"-DRESPONSE_KEEP",
 		"-I" + sourceDir,
 		"-I" + filepath.Join(dir, "source", "include"),
 		"-Ikernel",
-		"-DRESPONSE_KEEP",
+		"-DY=y",
+		"-DM=m",
+		"-DN=n",
+		"-DSTRING=\"configured value\"",
 		"-c",
 		source,
 		"-o",
@@ -362,6 +549,96 @@ done
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("compile argv = %#v, want %#v", got, want)
+	}
+}
+
+func TestExpandKbuildResponseFilesMapsObjectLocalVersionHeader(t *testing.T) {
+	dir := t.TempDir()
+	sourceRoot := filepath.Join(dir, "source")
+	sourceDir := filepath.Join(sourceRoot, "init")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	response := filepath.Join(sourceRoot, "flags.argv")
+	writeTestArgv(
+		t,
+		response,
+		"-I$(src)",
+		"-I$(obj)",
+		"-include",
+		"init/utsversion-tmp.h",
+	)
+	objectRoot := filepath.Join(dir, "objects", "init")
+	utsversionTmp := filepath.Join(objectRoot, "utsversion-tmp.h")
+	got, err := expandKbuildResponseFiles(
+		[]string{"@$(srctree)/flags.argv"},
+		map[string]string{},
+		filepath.Join(sourceDir, "version.c"),
+		sourceRoot,
+		"init/version.o",
+		objectRoot,
+		utsversionTmp,
+	)
+	if err != nil {
+		t.Fatalf("expandKbuildResponseFiles failed: %v", err)
+	}
+	want := []string{
+		"-I" + sourceDir,
+		"-I" + objectRoot,
+		"-include",
+		utsversionTmp,
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("expanded argv = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadKbuildConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".config")
+	if err := os.WriteFile(
+		path,
+		[]byte(strings.Join([]string{
+			"# generated",
+			"CONFIG_Y=y",
+			"CONFIG_M=m",
+			"CONFIG_N=n",
+			`CONFIG_STRING="value"`,
+			"# CONFIG_UNSET is not set",
+			"",
+		}, "\n")),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readKbuildConfig(path)
+	if err != nil {
+		t.Fatalf("readKbuildConfig() failed: %v", err)
+	}
+	want := map[string]string{
+		"CONFIG_M":      "m",
+		"CONFIG_N":      "n",
+		"CONFIG_STRING": `"value"`,
+		"CONFIG_UNSET":  "n",
+		"CONFIG_Y":      "y",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("readKbuildConfig() = %#v, want %#v", got, want)
+	}
+
+	for name, contents := range map[string]string{
+		"duplicate": "CONFIG_X=y\nCONFIG_X=n\n",
+		"invalid":   "NOT_CONFIG=y\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), ".config")
+			if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readKbuildConfig(path); err == nil {
+				t.Fatal("readKbuildConfig() succeeded, want error")
+			}
+		})
 	}
 }
 
@@ -402,7 +679,12 @@ func TestValidateGraphAcceptsConsumedProjectionThroughProfileFlag(t *testing.T) 
 		"-profile", projectionPath,
 		"-identity", identityPath,
 		"-template", template,
+		"-archiver", compiler,
 		"-linker", compiler,
+		"-nm", compiler,
+		"-objcopy", compiler,
+		"-coreutils", compiler,
+		"-grep", compiler,
 		"-shell", "/bin/sh",
 		"-source_root", dir,
 		"-out", out,
@@ -485,7 +767,12 @@ exit 1
 			"-projection", projection,
 			"-identity", identityPath,
 			"-template", template,
+			"-archiver", compiler,
 			"-linker", compiler,
+			"-nm", compiler,
+			"-objcopy", compiler,
+			"-coreutils", compiler,
+			"-grep", compiler,
 			"-shell", "/bin/sh",
 			"-source_root", dir,
 			"-out", out,
@@ -554,7 +841,12 @@ func TestRefreshGraphCommandWritesConfiguredResults(t *testing.T) {
 		"-profile", profilePath,
 		"-identity", identityPath,
 		"-template", template,
+		"-archiver", compiler,
 		"-linker", compiler,
+		"-nm", compiler,
+		"-objcopy", compiler,
+		"-coreutils", compiler,
+		"-grep", compiler,
 		"-shell", "/bin/sh",
 		"-source_root", dir,
 		"-out", out,

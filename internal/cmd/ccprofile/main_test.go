@@ -66,6 +66,19 @@ printf '%s\n' \
 	if !strings.Contains(string(templateData), flagsSentinel) {
 		t.Fatalf("command template omitted flags sentinel:\n%s", templateData)
 	}
+	decoded, err := ccprofile.DecodeCommandTemplate(templateData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgv := []string{
+		"--target=x86_64-linux-gnu",
+		"-nostdinc",
+		"-fintegrated-as",
+		flagsSentinel,
+	}
+	if strings.Join(decoded.MutableArgv, "\x00") != strings.Join(wantArgv, "\x00") {
+		t.Fatalf("normalized template argv = %#v, want %#v", decoded.MutableArgv, wantArgv)
+	}
 
 }
 
@@ -134,10 +147,13 @@ done
 		},
 		Compiler: compiler,
 		MutableArgv: []string{
+			"--target=x86_64-linux-gnu",
+			"-nostdinc",
+			"-fintegrated-as",
 			"-toolchain-keep",
 			"-toolchain-drop",
-			sentinel,
 			"-drop-everywhere",
+			sentinel,
 		},
 		Environment: map[string]string{
 			"ARGV_PATH":  argvPath,
@@ -159,16 +175,25 @@ done
 	if err := os.WriteFile(source, []byte("int value;\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	configPath := filepath.Join(dir, ".config")
+	if err := os.WriteFile(configPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	configFlags := filepath.Join(dir, "config-cflags.params")
+	if err := os.WriteFile(configFlags, []byte("-DCONFIG_KEEP\n-DOBJECT_DROP\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := run([]string{
 		"compile",
 		"-template", templatePath,
 		"-validation", validationPath,
 		"-source", source,
+		"-config", configPath,
 		"-output", output,
 		"-arg=-DOBJECT_KEEP",
 		"-arg=-DOBJECT_DROP",
 		"-arg=-drop-everywhere",
-		"-arg=@config-cflags.params",
+		"-arg=@" + configFlags,
 		"-remove=-toolchain-drop",
 		"-remove=-DOBJECT_DROP",
 		"-remove=-drop-everywhere",
@@ -188,9 +213,12 @@ done
 	}
 	got := strings.Split(strings.TrimSuffix(string(argvData), "\n"), "\n")
 	want := []string{
+		"--target=x86_64-linux-gnu",
+		"-nostdinc",
+		"-fintegrated-as",
 		"-toolchain-keep",
 		"-DOBJECT_KEEP",
-		"@config-cflags.params",
+		"-DCONFIG_KEEP",
 		"-c",
 		source,
 		"-o",
@@ -223,8 +251,13 @@ printf '%s\n' invoked > "$COUNT_PATH"
 			Compiler:            "clang",
 			TargetGNUSystemName: "x86_64-unknown-linux-gnu",
 		},
-		Compiler:            compiler,
-		MutableArgv:         []string{sentinel},
+		Compiler: compiler,
+		MutableArgv: []string{
+			"--target=x86_64-linux-gnu",
+			"-nostdinc",
+			"-fintegrated-as",
+			sentinel,
+		},
 		Environment:         map[string]string{"COUNT_PATH": countPath},
 		KbuildFlagsSentinel: sentinel,
 	}
@@ -240,11 +273,16 @@ printf '%s\n' invoked > "$COUNT_PATH"
 	if err := os.WriteFile(validationPath, []byte("validation_scope=configured-graph\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	configPath := filepath.Join(dir, ".config")
+	if err := os.WriteFile(configPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	err = run([]string{
 		"compile",
 		"-template", templatePath,
 		"-validation", validationPath,
 		"-source", filepath.Join(dir, "source.c"),
+		"-config", configPath,
 		"-output", filepath.Join(dir, "output.o"),
 	})
 	if err == nil || !strings.Contains(err.Error(), "validation stamp") {

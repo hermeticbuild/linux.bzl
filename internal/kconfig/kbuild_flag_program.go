@@ -504,6 +504,40 @@ func concatKbuildFlagExpressions(expressions ...*kbuildFlagExpr) *kbuildFlagExpr
 	return newKbuildFlagExprInterner().concat(expressions...)
 }
 
+func kbuildFlagExpressionOutputConfigRefs(expression *kbuildFlagExpr) []string {
+	refs := map[string]bool{}
+	visited := map[string]bool{}
+	var visit func(*kbuildFlagExpr)
+	visit = func(current *kbuildFlagExpr) {
+		if current == nil || visited[current.id] {
+			return
+		}
+		visited[current.id] = true
+		switch current.kind {
+		case kbuildFlagLiteral:
+			for _, arg := range current.argv {
+				for _, ref := range configRefs(arg) {
+					refs[ref] = true
+				}
+			}
+		case kbuildFlagConcat:
+			for _, child := range current.children {
+				visit(child)
+			}
+		case kbuildFlagSelect:
+			visit(current.whenTrue)
+			visit(current.whenFalse)
+		}
+	}
+	visit(expression)
+	out := make([]string, 0, len(refs))
+	for ref := range refs {
+		out = append(out, ref)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // kbuildFlagExpressionSourcePathFlags computes the union of explicit source
 // inputs across every branch without enumerating the cross product of selects.
 func kbuildFlagExpressionSourcePathFlags(

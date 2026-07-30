@@ -218,7 +218,12 @@ func run() (exitCode int) {
 		graphProfileCompiler      = flag.String("graph_profile_compiler", "", "Analysis compiler family for -graph_profile_record_out")
 		graphProfileTarget        = flag.String("graph_profile_target_gnu_system_name", "", "Analysis GNU target for -graph_profile_record_out")
 		graphProfileTemplate      = flag.String("graph_profile_template", "", "Configured compiler command template used to extend -graph_profile")
+		graphProfileArchiver      = flag.String("graph_profile_archiver", "", "Configured archiver used to extend -graph_profile")
 		graphProfileLinker        = flag.String("graph_profile_linker", "", "Configured raw linker used to extend -graph_profile")
+		graphProfileNM            = flag.String("graph_profile_nm", "", "Configured symbol table tool used to extend -graph_profile")
+		graphProfileObjcopy       = flag.String("graph_profile_objcopy", "", "Configured object copy tool used to extend -graph_profile")
+		graphProfileCoreutils     = flag.String("graph_profile_coreutils", "", "Hermetic coreutils multicall binary used to extend -graph_profile")
+		graphProfileGrep          = flag.String("graph_profile_grep", "", "Hermetic grep executable used to extend -graph_profile")
 		graphProfileShellPath     = flag.String("graph_profile_shell", "", "Execution-platform shell used to extend -graph_profile")
 		graphProfileObjectRoot    = flag.String("graph_profile_object_root", "", "Optional Linux object root used to extend -graph_profile")
 		rustToolchainProbe        = flag.String("rust_toolchain_probe", "", "JSON identity produced from the selected rustc -vV output")
@@ -326,11 +331,16 @@ func run() (exitCode int) {
 		}
 		if graphProfile != nil && *graphProfileRecordOut != "" {
 			if *graphProfileTemplate == "" ||
+				*graphProfileArchiver == "" ||
 				*graphProfileLinker == "" ||
+				*graphProfileNM == "" ||
+				*graphProfileObjcopy == "" ||
+				*graphProfileCoreutils == "" ||
+				*graphProfileGrep == "" ||
 				*graphProfileShellPath == "" {
 				fmt.Fprintln(
 					os.Stderr,
-					"extending -graph_profile requires -graph_profile_template, -graph_profile_linker, and -graph_profile_shell",
+					"extending -graph_profile requires -graph_profile_template, -graph_profile_archiver, -graph_profile_linker, -graph_profile_nm, -graph_profile_objcopy, -graph_profile_coreutils, -graph_profile_grep, and -graph_profile_shell",
 				)
 				return 2
 			}
@@ -351,12 +361,16 @@ func run() (exitCode int) {
 				return 2
 			}
 			tools := ccprofile.KbuildGraphProbeTools{
-				Compiler:    template.Compiler,
-				Linker:      workspacePath(*graphProfileLinker),
-				Shell:       workspacePath(*graphProfileShellPath),
-				SourceRoot:  resolvedSrctree,
-				ObjectRoot:  workspacePath(*graphProfileObjectRoot),
-				Environment: template.Environment,
+				CommandTemplate: template,
+				Archiver:        workspacePath(*graphProfileArchiver),
+				Coreutils:       workspacePath(*graphProfileCoreutils),
+				Grep:            workspacePath(*graphProfileGrep),
+				Linker:          workspacePath(*graphProfileLinker),
+				NM:              workspacePath(*graphProfileNM),
+				Objcopy:         workspacePath(*graphProfileObjcopy),
+				Shell:           workspacePath(*graphProfileShellPath),
+				SourceRoot:      resolvedSrctree,
+				ObjectRoot:      workspacePath(*graphProfileObjectRoot),
 			}
 			graphProfileShell, err = kconfig.NewGraphProfileExtensionShell(
 				*graphProfile,
@@ -373,7 +387,6 @@ func run() (exitCode int) {
 				func(request ccprofile.KbuildGraphProbeIdentity) (bool, error) {
 					return ccprofile.EvaluateKbuildGraphProbe(
 						context.Background(),
-						graphProfile.AnalysisIdentity,
 						request,
 						tools,
 					)

@@ -94,6 +94,62 @@ func TestExtractMutableCompileArgvRejectsAmbiguousSkeleton(t *testing.T) {
 	}
 }
 
+func TestNewCommandTemplateNormalizesLinuxCompileArgv(t *testing.T) {
+	sentinels := testSentinels()
+	template, err := NewCommandTemplate(
+		"aarch64",
+		AnalysisIdentity{
+			Compiler:            "clang",
+			TargetGNUSystemName: "aarch64-unknown-linux-gnu",
+		},
+		"/compiler",
+		[]string{
+			"-target",
+			"aarch64-unknown-linux-gnu",
+			"-no-canonical-prefixes",
+			"-Wno-builtin-macro-redefined",
+			`-D__DATE__="redacted"`,
+			"-Xclang",
+			"-fno-cxx-modules",
+			"-Xclang",
+			"-internal-isystem",
+			"-Xclang",
+			"external/llvm/lib/clang/22/include",
+			"-isystem",
+			"external/llvm++kernel_headers+linux_kernel_headers_arm64/include",
+			"-isystem",
+			"external/llvm++glibc+glibc_headers_aarch64/include",
+			"--sysroot=/dev/null",
+			"-nostdlibinc",
+			"-fstack-protector",
+			"-Wall",
+			sentinels.KbuildFlags,
+			"-c",
+			sentinels.Source,
+			"-o",
+			sentinels.Output,
+		},
+		map[string]string{},
+		sentinels,
+	)
+	if err != nil {
+		t.Fatalf("NewCommandTemplate() failed: %v", err)
+	}
+	want := []string{
+		"--target=aarch64-linux-gnu",
+		"-Wno-builtin-macro-redefined",
+		`-D__DATE__="redacted"`,
+		"-isystem",
+		"external/llvm++glibc+glibc_headers_aarch64/include",
+		"-nostdinc",
+		"-fintegrated-as",
+		sentinels.KbuildFlags,
+	}
+	if strings.Join(template.MutableArgv, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("mutable argv = %#v, want %#v", template.MutableArgv, want)
+	}
+}
+
 func TestParseBuiltinMacrosAndCompilerVersion(t *testing.T) {
 	macros, err := ParseBuiltinMacros([]byte(strings.Join([]string{
 		"#define __GNUC__ 4",

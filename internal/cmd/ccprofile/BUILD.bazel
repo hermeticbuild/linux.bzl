@@ -5,6 +5,7 @@ package(default_visibility = ["//visibility:private"])
 go_library(
     name = "ccprofile_lib",
     srcs = [
+        "grep.go",
         "main.go",
         "nodes.go",
     ],
@@ -21,6 +22,7 @@ go_binary(
 go_test(
     name = "ccprofile_test",
     srcs = [
+        "grep_test.go",
         "main_test.go",
         "nodes_test.go",
     ],

@@ -158,9 +158,6 @@ func PrepareCompileArgv(
 		); err != nil {
 			return nil, err
 		}
-		if removeSet[value] {
-			return nil, fmt.Errorf("removal %q is repeated", value)
-		}
 		removeSet[value] = true
 	}
 

@@ -1,6 +1,11 @@
 """Toolchain graph-profile recording and configured action context."""
 
-load("@rules_cc//cc:action_names.bzl", "C_COMPILE_ACTION_NAME")
+load(
+    "@rules_cc//cc:action_names.bzl",
+    "CPP_LINK_STATIC_LIBRARY_ACTION_NAME",
+    "C_COMPILE_ACTION_NAME",
+    "OBJ_COPY_ACTION_NAME",
+)
 load("@rules_cc//cc:find_cc_toolchain.bzl", "CC_TOOLCHAIN_TYPE", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load(
@@ -17,6 +22,7 @@ _SOURCE_SENTINEL = "__LINUX_BZL_GRAPH_PROFILE_SOURCE__.c"
 _OUTPUT_SENTINEL = "__LINUX_BZL_GRAPH_PROFILE_OUTPUT__.o"
 _KBUILD_FLAGS_SENTINEL = "__LINUX_BZL_KBUILD_FLAGS_v1__"
 _SH_TOOLCHAIN_TYPE = "@bazel_tools//tools/sh:toolchain_type"
+_COREUTILS_TOOLCHAIN_TYPE = "@bazel_lib//lib:coreutils_toolchain_type"
 
 LinuxGraphProfileInfo = provider(
     doc = "Validated graph projection and mutable command template for lazy Linux actions.",
@@ -48,18 +54,72 @@ def _compiler_family(cc_toolchain):
         cc_toolchain.compiler,
     )
 
-def _compiler_file(cc_toolchain, compiler_path):
+def _toolchain_file(cc_toolchain, tool_name, tool_path):
     matches = [
         file
         for file in cc_toolchain.all_files.to_list()
-        if file.path == compiler_path
+        if file.path == tool_path
     ]
     if len(matches) != 1:
         fail(
-            "selected C compiler %r must resolve to exactly one declared toolchain file, got %d" %
-            (compiler_path, len(matches)),
+            "selected C toolchain %s %r must resolve to exactly one declared toolchain file, got %d" %
+            (tool_name, tool_path, len(matches)),
         )
     return matches[0]
+
+def _nm_toolchain_file(cc_toolchain, objcopy):
+    if cc_toolchain.nm_executable:
+        return _toolchain_file(
+            cc_toolchain,
+            "nm",
+            cc_toolchain.nm_executable,
+        )
+    suffix = ".exe" if objcopy.basename.endswith(".exe") else ""
+    stem = objcopy.basename.removesuffix(suffix)
+    if not stem.endswith("objcopy"):
+        fail(
+            (
+                "selected C toolchain does not declare nm_executable and objcopy %r cannot " +
+                "provide the conventional fallback; expected a basename ending in objcopy%s"
+            ) % (objcopy.path, suffix),
+        )
+    nm_basename = stem.removesuffix("objcopy") + "nm" + suffix
+    matches = [
+        file
+        for file in cc_toolchain.all_files.to_list()
+        if file.dirname == objcopy.dirname and file.basename == nm_basename
+    ]
+    if len(matches) != 1:
+        fail(
+            (
+                "selected C toolchain does not declare nm_executable and fallback nm %r, " +
+                "derived from objcopy %r, must resolve to exactly one declared toolchain file, got %d"
+            ) % (nm_basename, objcopy.path, len(matches)),
+        )
+    return matches[0]
+
+def _graph_profile_tool_files(cc_toolchain, feature_configuration):
+    archiver = _toolchain_file(
+        cc_toolchain,
+        "archiver",
+        cc_common.get_tool_for_action(
+            feature_configuration = feature_configuration,
+            action_name = CPP_LINK_STATIC_LIBRARY_ACTION_NAME,
+        ),
+    )
+    objcopy = _toolchain_file(
+        cc_toolchain,
+        "objcopy",
+        cc_common.get_tool_for_action(
+            feature_configuration = feature_configuration,
+            action_name = OBJ_COPY_ACTION_NAME,
+        ),
+    )
+    return struct(
+        archiver = archiver,
+        nm = _nm_toolchain_file(cc_toolchain, objcopy),
+        objcopy = objcopy,
+    )
 
 def _toolchain_directory_anchors(files):
     anchors = {}
@@ -126,6 +186,10 @@ def _validate_args(
         graph,
         source_root,
         linker,
+        archiver,
+        nm,
+        objcopy,
+        coreutils,
         shell,
         command_template,
         identity,
@@ -136,6 +200,11 @@ def _validate_args(
     args.add(identity, format = "-identity=%s")
     args.add(command_template, format = "-template=%s")
     args.add(linker, format = "-linker=%s")
+    args.add(archiver, format = "-archiver=%s")
+    args.add(nm, format = "-nm=%s")
+    args.add(objcopy, format = "-objcopy=%s")
+    args.add(coreutils, format = "-coreutils=%s")
+    args.add(ctx.executable._ccprofile, format = "-grep=%s")
     args.add("-shell=" + shell)
     add_directory_arg(
         args,
@@ -150,6 +219,10 @@ def _refresh_args(
         recorded,
         source_root,
         linker,
+        archiver,
+        nm,
+        objcopy,
+        coreutils,
         shell,
         command_template,
         identity,
@@ -160,6 +233,11 @@ def _refresh_args(
     args.add(identity, format = "-identity=%s")
     args.add(command_template, format = "-template=%s")
     args.add(linker, format = "-linker=%s")
+    args.add(archiver, format = "-archiver=%s")
+    args.add(nm, format = "-nm=%s")
+    args.add(objcopy, format = "-objcopy=%s")
+    args.add(coreutils, format = "-coreutils=%s")
+    args.add(ctx.executable._ccprofile, format = "-grep=%s")
     args.add("-shell=" + shell)
     add_directory_arg(
         args,
@@ -178,6 +256,10 @@ def _record_args(
         compiler,
         seed = None,
         command_template = None,
+        archiver = None,
+        nm = None,
+        objcopy = None,
+        coreutils = None,
         shell = None):
     args = ctx.actions.args()
     args.add("-root", root)
@@ -198,6 +280,11 @@ def _record_args(
         args.add("-graph_profile", seed)
         args.add("-graph_profile_template", command_template)
         args.add("-graph_profile_linker", ctx.file.kbuild_linker)
+        args.add(archiver, format = "-graph_profile_archiver=%s")
+        args.add(nm, format = "-graph_profile_nm=%s")
+        args.add(objcopy, format = "-graph_profile_objcopy=%s")
+        args.add("-graph_profile_coreutils", coreutils)
+        args.add("-graph_profile_grep", ctx.executable._ccprofile)
         args.add("-graph_profile_shell=" + shell)
     else:
         args.add("-linux_probe_model", ctx.attr.probe_model)
@@ -233,6 +320,7 @@ def _record_args(
 
 def _linux_graph_profile_context_impl(ctx):
     cc_toolchain = find_cpp_toolchain(ctx)
+    coreutils = ctx.toolchains[_COREUTILS_TOOLCHAIN_TYPE].coreutils_info.bin
     shell = ctx.toolchains[_SH_TOOLCHAIN_TYPE].path
     feature_configuration = cc_common.configure_features(
         ctx = ctx,
@@ -270,7 +358,11 @@ def _linux_graph_profile_context_impl(ctx):
         feature_configuration = feature_configuration,
         action_name = C_COMPILE_ACTION_NAME,
     )
-    compiler = _compiler_file(cc_toolchain, compiler_path)
+    tools = _graph_profile_tool_files(cc_toolchain, feature_configuration)
+    archiver = tools.archiver
+    compiler = _toolchain_file(cc_toolchain, "C compiler", compiler_path)
+    nm = tools.nm
+    objcopy = tools.objcopy
     analysis_compiler = _compiler_family(cc_toolchain)
     analysis_target = cc_toolchain.target_gnu_system_name
     toolchain_files = cc_toolchain.all_files.to_list()
@@ -311,6 +403,10 @@ def _linux_graph_profile_context_impl(ctx):
             ctx.file.graph_projection,
             ctx.file.source_root,
             ctx.file.kbuild_linker,
+            archiver,
+            nm,
+            objcopy,
+            coreutils,
             shell,
             command_template,
             identity,
@@ -318,11 +414,15 @@ def _linux_graph_profile_context_impl(ctx):
         )],
         inputs = depset(
             direct = [
+                archiver,
                 command_template,
+                coreutils,
                 ctx.file.graph_projection,
                 ctx.file.kbuild_linker,
                 ctx.file.source_root,
                 identity,
+                nm,
+                objcopy,
             ] + ctx.files.srcs,
             transitive = [cc_toolchain.all_files],
         ),
@@ -367,6 +467,7 @@ linux_graph_profile_context = rule(
         ),
         "kbuild_linker": attr.label(
             allow_single_file = True,
+            cfg = "exec",
             mandatory = True,
             doc = "Explicit raw linker executable used by Kbuild.",
         ),
@@ -387,11 +488,15 @@ linux_graph_profile_context = rule(
     },
     doc = "Captures and validates the selected C toolchain used by lazy kernel actions.",
     fragments = ["cpp"],
-    toolchains = use_cc_toolchain() + [_SH_TOOLCHAIN_TYPE],
+    toolchains = use_cc_toolchain() + [
+        _COREUTILS_TOOLCHAIN_TYPE,
+        _SH_TOOLCHAIN_TYPE,
+    ],
 )
 
 def _linux_graph_profile_impl(ctx):
     cc_toolchain = find_cpp_toolchain(ctx)
+    coreutils = ctx.toolchains[_COREUTILS_TOOLCHAIN_TYPE].coreutils_info.bin
     shell = ctx.toolchains[_SH_TOOLCHAIN_TYPE].path
     compiler = _compiler_family(cc_toolchain)
     root = ctx.file.root
@@ -475,7 +580,11 @@ def _linux_graph_profile_impl(ctx):
         feature_configuration = feature_configuration,
         action_name = C_COMPILE_ACTION_NAME,
     )
-    compiler_file = _compiler_file(cc_toolchain, compiler_path)
+    tools = _graph_profile_tool_files(cc_toolchain, feature_configuration)
+    archiver = tools.archiver
+    compiler_file = _toolchain_file(cc_toolchain, "C compiler", compiler_path)
+    nm = tools.nm
+    objcopy = tools.objcopy
     toolchain_files = cc_toolchain.all_files.to_list()
     path_mapping_files = [file for file in toolchain_files if not file.is_source]
     directory_anchors = _toolchain_directory_anchors(path_mapping_files)
@@ -513,6 +622,10 @@ def _linux_graph_profile_impl(ctx):
             recorded,
             root,
             ctx.file.kbuild_linker,
+            archiver,
+            nm,
+            objcopy,
+            coreutils,
             shell,
             command_template,
             identity,
@@ -520,9 +633,13 @@ def _linux_graph_profile_impl(ctx):
         )],
         inputs = depset(
             direct = [
+                archiver,
                 command_template,
+                coreutils,
                 ctx.file.kbuild_linker,
                 identity,
+                nm,
+                objcopy,
                 recorded,
                 root,
             ] + ctx.files.srcs,
@@ -546,13 +663,22 @@ def _linux_graph_profile_impl(ctx):
             compiler,
             seed = refreshed,
             command_template = command_template,
+            archiver = archiver,
+            nm = nm,
+            objcopy = objcopy,
+            coreutils = coreutils,
             shell = shell,
         )],
         inputs = depset(
             direct = [
+                archiver,
                 command_template,
+                coreutils,
+                ctx.executable._ccprofile,
                 ctx.file.kbuild_linker,
                 identity,
+                nm,
+                objcopy,
                 refreshed,
             ] + inputs,
             transitive = [cc_toolchain.all_files],
@@ -571,6 +697,10 @@ def _linux_graph_profile_impl(ctx):
             output,
             root,
             ctx.file.kbuild_linker,
+            archiver,
+            nm,
+            objcopy,
+            coreutils,
             shell,
             command_template,
             identity,
@@ -578,10 +708,14 @@ def _linux_graph_profile_impl(ctx):
         )],
         inputs = depset(
             direct = [
+                archiver,
                 command_template,
+                coreutils,
                 ctx.file.kbuild,
                 ctx.file.kbuild_linker,
                 identity,
+                nm,
+                objcopy,
                 output,
                 root,
             ] + ctx.files.srcs,
@@ -639,6 +773,7 @@ linux_graph_profile = rule(
         ),
         "kbuild_linker": attr.label(
             allow_single_file = True,
+            cfg = "exec",
             mandatory = True,
             doc = "Raw linker used to replay every recorded Kbuild graph probe.",
         ),
@@ -678,5 +813,8 @@ linux_graph_profile = rule(
     },
     doc = "Records and toolchain-validates a complete Kconfig/Kbuild graph profile for maintenance.",
     fragments = ["cpp"],
-    toolchains = use_cc_toolchain() + [_SH_TOOLCHAIN_TYPE],
+    toolchains = use_cc_toolchain() + [
+        _COREUTILS_TOOLCHAIN_TYPE,
+        _SH_TOOLCHAIN_TYPE,
+    ],
 )

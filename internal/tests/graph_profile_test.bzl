@@ -69,7 +69,36 @@ def _graph_profile_context_test_impl(ctx):
             1,
             len([arg for arg in validate.argv if arg.startswith("-shell=")]),
         )
+        asserts.equals(
+            env,
+            1,
+            len([arg for arg in validate.argv if arg.startswith("-coreutils=")]),
+        )
+        asserts.equals(
+            env,
+            1,
+            len([arg for arg in validate.argv if arg.startswith("-grep=")]),
+        )
+        asserts.equals(
+            env,
+            1,
+            len([arg for arg in validate.argv if arg.startswith("-archiver=")]),
+        )
+        asserts.equals(
+            env,
+            1,
+            len([arg for arg in validate.argv if arg.startswith("-nm=")]),
+        )
+        asserts.equals(
+            env,
+            1,
+            len([arg for arg in validate.argv if arg.startswith("-objcopy=")]),
+        )
         input_basenames = [file.basename for file in validate.inputs.to_list()]
+        asserts.true(env, "coreutils" in input_basenames)
+        asserts.true(env, "llvm-ar" in input_basenames)
+        asserts.true(env, "llvm-nm" in input_basenames)
+        asserts.true(env, "llvm-objcopy" in input_basenames)
         asserts.true(env, "graph_projection.json" in input_basenames)
         asserts.false(env, "graph_profile.json" in input_basenames)
 

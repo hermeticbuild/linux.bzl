@@ -3,6 +3,7 @@ package ccprofile
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -12,12 +13,26 @@ import (
 )
 
 type KbuildGraphProbeTools struct {
-	Compiler    string
-	Linker      string
-	Shell       string
-	SourceRoot  string
-	ObjectRoot  string
-	Environment map[string]string
+	CommandTemplate CommandTemplate
+	Archiver        string
+	Coreutils       string
+	Grep            string
+	Linker          string
+	NM              string
+	Objcopy         string
+	Shell           string
+	SourceRoot      string
+	ObjectRoot      string
+}
+
+var configuredKconfigCoreutils = []string{
+	"cat",
+	"dirname",
+	"env",
+	"head",
+	"mkdir",
+	"mktemp",
+	"rm",
 }
 
 // EvaluateConfiguredKconfigCommand executes one command missing from a seeded
@@ -29,11 +44,8 @@ func EvaluateConfiguredKconfigCommand(
 	environment map[string]string,
 	tools KbuildGraphProbeTools,
 ) (string, error) {
-	if tools.Compiler == "" {
-		return "", fmt.Errorf("configured Kconfig command compiler must be non-empty")
-	}
-	if tools.Linker == "" {
-		return "", fmt.Errorf("configured Kconfig command linker must be non-empty")
+	if err := validateConfiguredKconfigTools(tools); err != nil {
+		return "", fmt.Errorf("configured Kconfig command: %w", err)
 	}
 	if tools.Shell == "" {
 		return "", fmt.Errorf("configured Kconfig command shell must be non-empty")
@@ -51,41 +63,38 @@ func EvaluateConfiguredKconfigCommand(
 		return "", fmt.Errorf("create configured Kconfig command tool directory: %w", err)
 	}
 	createdShims := map[string]string{}
-	for _, tool := range []struct {
-		alias  string
-		target string
-	}{
-		{alias: strings.TrimSpace(environment["CC"]), target: tools.Compiler},
-		{alias: strings.TrimSpace(environment["LD"]), target: tools.Linker},
-	} {
-		if tool.alias == "" {
-			continue
-		}
-		if err := ensureToolShim(shimDir, createdShims, tool.alias, tool.target); err != nil {
+	for _, utility := range configuredKconfigCoreutils {
+		if err := ensureToolShim(shimDir, createdShims, utility, tools.Coreutils); err != nil {
 			return "", err
 		}
 	}
+	if err := ensureToolShim(shimDir, createdShims, "grep", tools.Grep); err != nil {
+		return "", err
+	}
+	if err := ensureConfiguredKconfigToolShims(
+		shimDir,
+		createdShims,
+		environment,
+		tools,
+	); err != nil {
+		return "", err
+	}
+	sourceRoot := absolutePathOrOriginal(tools.SourceRoot)
 	commandText = strings.ReplaceAll(
 		commandText,
 		GraphProfileSourceRoot,
-		filepath.ToSlash(filepath.Clean(tools.SourceRoot)),
+		filepath.ToSlash(filepath.Clean(sourceRoot)),
 	)
 	command := exec.CommandContext(ctx, tools.Shell, "-c", commandText)
-	command.Dir = tools.SourceRoot
-	runtimeEnvironment := cloneStringMap(tools.Environment)
+	command.Dir = sourceRoot
+	runtimeEnvironment := cloneStringMap(tools.CommandTemplate.Environment)
 	for name, value := range environment {
 		runtimeEnvironment[name] = value
 	}
-	searchPath := []string{
-		shimDir,
-		filepath.Dir(absolutePathOrOriginal(tools.Compiler)),
-		filepath.Dir(absolutePathOrOriginal(tools.Linker)),
-	}
-	if hostPath := os.Getenv("PATH"); hostPath != "" {
-		searchPath = append(searchPath, hostPath)
-	}
-	runtimeEnvironment["PATH"] = strings.Join(searchPath, string(os.PathListSeparator))
+	runtimeEnvironment["PATH"] = shimDir
 	command.Env = environmentList(runtimeEnvironment)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
 	output, commandErr := command.Output()
 	if commandErr != nil {
 		var exitError *exec.ExitError
@@ -107,11 +116,17 @@ func RefreshConfiguredKconfigCommands(
 	commands []KconfigCommand,
 	tools KbuildGraphProbeTools,
 ) ([]KconfigCommand, int, error) {
-	if tools.Compiler == "" {
-		return nil, 0, fmt.Errorf("configured Kconfig replay compiler must be non-empty")
-	}
-	if tools.Linker == "" {
-		return nil, 0, fmt.Errorf("configured Kconfig replay linker must be non-empty")
+	return refreshConfiguredKconfigCommands(ctx, commands, tools, false)
+}
+
+func refreshConfiguredKconfigCommands(
+	ctx context.Context,
+	commands []KconfigCommand,
+	tools KbuildGraphProbeTools,
+	requireMatchingInputs bool,
+) ([]KconfigCommand, int, error) {
+	if err := validateConfiguredKconfigTools(tools); err != nil {
+		return nil, 0, fmt.Errorf("configured Kconfig replay: %w", err)
 	}
 	if tools.Shell == "" {
 		return nil, 0, fmt.Errorf("configured Kconfig replay shell must be non-empty")
@@ -129,46 +144,65 @@ func RefreshConfiguredKconfigCommands(
 		return nil, 0, fmt.Errorf("create configured Kconfig replay tool directory: %w", err)
 	}
 	createdShims := map[string]string{}
+	for _, utility := range configuredKconfigCoreutils {
+		if err := ensureToolShim(shimDir, createdShims, utility, tools.Coreutils); err != nil {
+			return nil, 0, err
+		}
+	}
+	if err := ensureToolShim(shimDir, createdShims, "grep", tools.Grep); err != nil {
+		return nil, 0, err
+	}
 	refreshed := make([]KconfigCommand, len(commands))
 	replayed := 0
 	for index, expected := range commands {
 		refreshed[index] = cloneKconfigCommand(expected)
-		ccAlias := strings.TrimSpace(expected.Environment["CC"])
-		ldAlias := strings.TrimSpace(expected.Environment["LD"])
-		if !isConfiguredKconfigCommand(expected.Command, ccAlias, ldAlias) {
+		if !isConfiguredKconfigCommand(expected.Command, expected.Environment) {
 			continue
 		}
-		for _, tool := range []struct {
-			alias  string
-			target string
-		}{
-			{alias: ccAlias, target: tools.Compiler},
-			{alias: ldAlias, target: tools.Linker},
-		} {
-			if err := ensureToolShim(shimDir, createdShims, tool.alias, tool.target); err != nil {
-				return nil, replayed, err
-			}
+		inputsMatch, err := configuredGraphInputsMatch(
+			expected.Inputs,
+			tools.SourceRoot,
+		)
+		if err != nil {
+			return nil, replayed, fmt.Errorf(
+				"match configured Kconfig command %s inputs: %w",
+				expected.ID,
+				err,
+			)
 		}
+		if !inputsMatch {
+			if requireMatchingInputs {
+				return nil, replayed, fmt.Errorf(
+					"configured Kconfig command %s inputs do not match the current source tree",
+					expected.ID,
+				)
+			}
+			continue
+		}
+		if err := ensureConfiguredKconfigToolShims(
+			shimDir,
+			createdShims,
+			expected.Environment,
+			tools,
+		); err != nil {
+			return nil, replayed, err
+		}
+		sourceRoot := absolutePathOrOriginal(tools.SourceRoot)
 		commandText := strings.ReplaceAll(
 			expected.Command,
 			GraphProfileSourceRoot,
-			filepath.ToSlash(filepath.Clean(tools.SourceRoot)),
+			filepath.ToSlash(filepath.Clean(sourceRoot)),
 		)
 		command := exec.CommandContext(ctx, tools.Shell, "-c", commandText)
 		command.Dir = workDir
-		environment := cloneStringMap(expected.Environment)
-		environment["CC"] = ccAlias
-		environment["LD"] = ldAlias
-		searchPath := []string{
-			shimDir,
-			filepath.Dir(absolutePathOrOriginal(tools.Compiler)),
-			filepath.Dir(absolutePathOrOriginal(tools.Linker)),
+		environment := cloneStringMap(tools.CommandTemplate.Environment)
+		for name, value := range expected.Environment {
+			environment[name] = value
 		}
-		if hostPath := os.Getenv("PATH"); hostPath != "" {
-			searchPath = append(searchPath, hostPath)
-		}
-		environment["PATH"] = strings.Join(searchPath, string(os.PathListSeparator))
+		environment["PATH"] = shimDir
 		command.Env = environmentList(environment)
+		var stderr bytes.Buffer
+		command.Stderr = &stderr
 		output, commandErr := command.Output()
 		replayed++
 		switch expected.Kind {
@@ -185,6 +219,15 @@ func RefreshConfiguredKconfigCommands(
 			refreshed[index].Success = &succeeded
 		case KconfigCommandKindStdout:
 			if commandErr != nil {
+				detail := strings.TrimSpace(stderr.String())
+				if detail != "" {
+					return nil, replayed, fmt.Errorf(
+						"replay configured Kconfig stdout command %s: %w: %s",
+						expected.ID,
+						commandErr,
+						detail,
+					)
+				}
 				return nil, replayed, fmt.Errorf(
 					"replay configured Kconfig stdout command %s: %w",
 					expected.ID,
@@ -204,13 +247,42 @@ func RefreshConfiguredKconfigCommands(
 	return refreshed, replayed, nil
 }
 
-// ReplayConfiguredKconfigCommands rejects stale configured-tool results.
-func ReplayConfiguredKconfigCommands(
+func configuredGraphInputsMatch(inputs map[string]string, sourceRoot string) (bool, error) {
+	for path, expected := range inputs {
+		clean := filepath.Clean(filepath.FromSlash(path))
+		if clean == "." ||
+			filepath.IsAbs(clean) ||
+			clean == ".." ||
+			strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return false, fmt.Errorf("input path %q must stay beneath the source root", path)
+		}
+		data, err := os.ReadFile(filepath.Join(sourceRoot, clean))
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("read input %q: %w", path, err)
+		}
+		actual := fmt.Sprintf("%x", sha256.Sum256(data))
+		if actual != expected {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func replayConfiguredKconfigCommands(
 	ctx context.Context,
 	commands []KconfigCommand,
 	tools KbuildGraphProbeTools,
+	requireMatchingInputs bool,
 ) (int, error) {
-	refreshed, replayed, err := RefreshConfiguredKconfigCommands(ctx, commands, tools)
+	refreshed, replayed, err := refreshConfiguredKconfigCommands(
+		ctx,
+		commands,
+		tools,
+		requireMatchingInputs,
+	)
 	if err != nil {
 		return replayed, err
 	}
@@ -238,6 +310,122 @@ func ReplayConfiguredKconfigCommands(
 		}
 	}
 	return replayed, nil
+}
+
+// ReplayConfiguredKconfigCommands rejects source-input and configured-tool
+// drift for a consumed graph projection.
+func ReplayConfiguredKconfigCommands(
+	ctx context.Context,
+	commands []KconfigCommand,
+	tools KbuildGraphProbeTools,
+) (int, error) {
+	return replayConfiguredKconfigCommands(ctx, commands, tools, true)
+}
+
+// ReplayMatchingConfiguredKconfigCommands validates the entries in a
+// multi-source profile whose recorded inputs match the selected source tree.
+func ReplayMatchingConfiguredKconfigCommands(
+	ctx context.Context,
+	commands []KconfigCommand,
+	tools KbuildGraphProbeTools,
+) (int, error) {
+	return replayConfiguredKconfigCommands(ctx, commands, tools, false)
+}
+
+func refreshConfiguredKbuildGraphProbes(
+	ctx context.Context,
+	probes []KbuildGraphProbe,
+	tools KbuildGraphProbeTools,
+	requireMatchingInputs bool,
+) ([]KbuildGraphProbe, int, error) {
+	refreshed := make([]KbuildGraphProbe, len(probes))
+	replayed := 0
+	for index, expected := range probes {
+		refreshed[index] = cloneKbuildGraphProbe(expected)
+		inputsMatch, err := configuredGraphInputsMatch(
+			expected.Inputs,
+			tools.SourceRoot,
+		)
+		if err != nil {
+			return nil, replayed, fmt.Errorf(
+				"match Kbuild graph probe %s inputs: %w",
+				expected.ID,
+				err,
+			)
+		}
+		if !inputsMatch {
+			if requireMatchingInputs {
+				return nil, replayed, fmt.Errorf(
+					"Kbuild graph probe %s inputs do not match the current source tree",
+					expected.ID,
+				)
+			}
+			continue
+		}
+		supported, err := EvaluateKbuildGraphProbe(
+			ctx,
+			expected.Identity(),
+			tools,
+		)
+		replayed++
+		if err != nil {
+			return nil, replayed, fmt.Errorf(
+				"replay Kbuild graph probe %s: %w",
+				expected.ID,
+				err,
+			)
+		}
+		refreshed[index].Supported = supported
+	}
+	return refreshed, replayed, nil
+}
+
+func replayConfiguredKbuildGraphProbes(
+	ctx context.Context,
+	probes []KbuildGraphProbe,
+	tools KbuildGraphProbeTools,
+	requireMatchingInputs bool,
+) (int, error) {
+	refreshed, replayed, err := refreshConfiguredKbuildGraphProbes(
+		ctx,
+		probes,
+		tools,
+		requireMatchingInputs,
+	)
+	if err != nil {
+		return replayed, err
+	}
+	for index, expected := range probes {
+		if refreshed[index].Supported != expected.Supported {
+			return replayed, fmt.Errorf(
+				"Kbuild graph probe %s result mismatch: profile recorded supported=%t, configured tools returned supported=%t",
+				expected.ID,
+				expected.Supported,
+				refreshed[index].Supported,
+			)
+		}
+	}
+	return replayed, nil
+}
+
+// ReplayConfiguredKbuildGraphProbes rejects source-input and configured-tool
+// drift for a consumed graph projection.
+func ReplayConfiguredKbuildGraphProbes(
+	ctx context.Context,
+	probes []KbuildGraphProbe,
+	tools KbuildGraphProbeTools,
+) (int, error) {
+	return replayConfiguredKbuildGraphProbes(ctx, probes, tools, true)
+}
+
+// ReplayMatchingConfiguredKbuildGraphProbes validates the entries in a
+// multi-source profile whose recorded inputs match the selected source tree.
+func ReplayMatchingConfiguredKbuildGraphProbes(
+	ctx context.Context,
+	probes []KbuildGraphProbe,
+	tools KbuildGraphProbeTools,
+) (int, error) {
+	return replayConfiguredKbuildGraphProbes(ctx, probes, tools, false)
 }
 
 func sameKconfigCommandResult(left, right KconfigCommand) bool {
@@ -268,6 +456,14 @@ func RefreshConfiguredGraphProfile(
 	if err := ValidateGraphProfile(profile); err != nil {
 		return GraphProfile{}, err
 	}
+	if !analysisIdentityEqual(
+		profile.AnalysisIdentity,
+		tools.CommandTemplate.AnalysisIdentity,
+	) {
+		return GraphProfile{}, fmt.Errorf(
+			"configured graph profile analysis identity does not match selected tools",
+		)
+	}
 	commands, _, err := RefreshConfiguredKconfigCommands(
 		ctx,
 		profile.KconfigCommands,
@@ -276,23 +472,14 @@ func RefreshConfiguredGraphProfile(
 	if err != nil {
 		return GraphProfile{}, err
 	}
-	probes := make([]KbuildGraphProbe, len(profile.KbuildGraphProbes))
-	for index, expected := range profile.KbuildGraphProbes {
-		probes[index] = cloneKbuildGraphProbe(expected)
-		supported, err := EvaluateKbuildGraphProbe(
-			ctx,
-			profile.AnalysisIdentity,
-			expected.Identity(),
-			tools,
-		)
-		if err != nil {
-			return GraphProfile{}, fmt.Errorf(
-				"refresh Kbuild graph probe %s: %w",
-				expected.ID,
-				err,
-			)
-		}
-		probes[index].Supported = supported
+	probes, _, err := refreshConfiguredKbuildGraphProbes(
+		ctx,
+		profile.KbuildGraphProbes,
+		tools,
+		false,
+	)
+	if err != nil {
+		return GraphProfile{}, err
 	}
 	refreshed := GraphProfile{
 		Schema:            profile.Schema,
@@ -316,12 +503,21 @@ func absolutePathOrOriginal(path string) string {
 	return absolute
 }
 
-func isConfiguredKconfigCommand(command, ccAlias, ldAlias string) bool {
+func isConfiguredKconfigCommand(
+	command string,
+	environment map[string]string,
+) bool {
 	for _, marker := range []string{
 		"$CC",
 		"${CC}",
 		"$LD",
 		"${LD}",
+		"$AR",
+		"${AR}",
+		"$NM",
+		"${NM}",
+		"$OBJCOPY",
+		"${OBJCOPY}",
 		"/scripts/cc-",
 		"/scripts/as-",
 		"/scripts/ld-",
@@ -331,7 +527,68 @@ func isConfiguredKconfigCommand(command, ccAlias, ldAlias string) bool {
 			return true
 		}
 	}
-	return containsShellWord(command, ccAlias) || containsShellWord(command, ldAlias)
+	for _, name := range []string{"CC", "LD", "AR", "NM", "OBJCOPY"} {
+		if containsShellWord(command, strings.TrimSpace(environment[name])) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateConfiguredKconfigTools(tools KbuildGraphProbeTools) error {
+	if err := ValidateCommandTemplate(tools.CommandTemplate); err != nil {
+		return fmt.Errorf("command template: %w", err)
+	}
+	for _, tool := range []struct {
+		name string
+		path string
+	}{
+		{name: "archiver", path: tools.Archiver},
+		{name: "coreutils", path: tools.Coreutils},
+		{name: "grep", path: tools.Grep},
+		{name: "linker", path: tools.Linker},
+		{name: "nm", path: tools.NM},
+		{name: "objcopy", path: tools.Objcopy},
+	} {
+		if tool.path == "" {
+			return fmt.Errorf("%s must be non-empty", tool.name)
+		}
+	}
+	return nil
+}
+
+func ensureConfiguredKconfigToolShims(
+	shimDir string,
+	created map[string]string,
+	environment map[string]string,
+	tools KbuildGraphProbeTools,
+) error {
+	for _, binding := range []struct {
+		name     string
+		target   string
+		compiler bool
+	}{
+		{name: "CC", target: tools.CommandTemplate.Compiler, compiler: true},
+		{name: "LD", target: tools.Linker},
+		{name: "AR", target: tools.Archiver},
+		{name: "NM", target: tools.NM},
+		{name: "OBJCOPY", target: tools.Objcopy},
+	} {
+		alias := strings.TrimSpace(environment[binding.name])
+		if alias == "" {
+			continue
+		}
+		var err error
+		if binding.compiler {
+			err = ensureCompilerShim(shimDir, created, alias, tools)
+		} else {
+			err = ensureToolShim(shimDir, created, alias, binding.target)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func containsShellWord(command, word string) bool {
@@ -387,6 +644,81 @@ func ensureToolShim(
 	return nil
 }
 
+func ensureCompilerShim(
+	shimDir string,
+	created map[string]string,
+	alias string,
+	tools KbuildGraphProbeTools,
+) error {
+	if alias == "" {
+		return fmt.Errorf("configured Kconfig command tool alias must be non-empty")
+	}
+	if filepath.Base(alias) != alias {
+		return fmt.Errorf("configured Kconfig command tool alias %q must be a basename", alias)
+	}
+	compiler, err := filepath.Abs(tools.CommandTemplate.Compiler)
+	if err != nil {
+		return fmt.Errorf(
+			"resolve configured compiler %q: %w",
+			tools.CommandTemplate.Compiler,
+			err,
+		)
+	}
+	shell, err := filepath.Abs(tools.Shell)
+	if err != nil {
+		return fmt.Errorf("resolve configured shell %q: %w", tools.Shell, err)
+	}
+	executionRoot, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("resolve configured compiler execution root: %w", err)
+	}
+	prefix, suffix := splitCommandTemplateKbuildArgv(tools.CommandTemplate)
+	prefix = absolutizeCompilerTemplatePaths(prefix, executionRoot)
+	suffix = absolutizeCompilerTemplatePaths(suffix, executionRoot)
+	signatureArgv := make([]string, 0, len(prefix)+len(suffix)+2)
+	signatureArgv = append(signatureArgv, compiler)
+	signatureArgv = append(signatureArgv, prefix...)
+	signatureArgv = append(signatureArgv, "\x1fKBUILD_ARGV\x1f")
+	signatureArgv = append(signatureArgv, suffix...)
+	signature := strings.Join(signatureArgv, "\x00")
+	if previous, ok := created[alias]; ok {
+		if previous != signature {
+			return fmt.Errorf(
+				"configured tool alias %q maps to both %q and %q",
+				alias,
+				previous,
+				signature,
+			)
+		}
+		return nil
+	}
+	command := make([]string, 0, len(prefix)+1)
+	command = append(command, compiler)
+	command = append(command, prefix...)
+	quoted := make([]string, len(command))
+	for index, arg := range command {
+		quoted[index] = quoteShellWord(arg)
+	}
+	suffixQuoted := make([]string, len(suffix))
+	for index, arg := range suffix {
+		suffixQuoted[index] = quoteShellWord(arg)
+	}
+	script := "#!" + shell + "\nexec " + strings.Join(quoted, " ") + " \"$@\""
+	if len(suffixQuoted) != 0 {
+		script += " " + strings.Join(suffixQuoted, " ")
+	}
+	script += "\n"
+	if err := os.WriteFile(filepath.Join(shimDir, alias), []byte(script), 0o755); err != nil {
+		return fmt.Errorf("create configured compiler alias %q: %w", alias, err)
+	}
+	created[alias] = signature
+	return nil
+}
+
+func quoteShellWord(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
 func normalizeKconfigCommandOutput(output []byte) string {
 	output = bytes.TrimRight(output, "\n")
 	output = bytes.ReplaceAll(output, []byte("\n"), []byte(" "))
@@ -404,12 +736,11 @@ func valueOrEmpty(value *string) string {
 // against the configured compiler or linker.
 func EvaluateKbuildGraphProbe(
 	ctx context.Context,
-	analysisIdentity AnalysisIdentity,
 	request KbuildGraphProbeIdentity,
 	tools KbuildGraphProbeTools,
 ) (bool, error) {
-	if tools.Compiler == "" {
-		return false, fmt.Errorf("Kbuild graph probe compiler must be non-empty")
+	if err := ValidateCommandTemplate(tools.CommandTemplate); err != nil {
+		return false, fmt.Errorf("Kbuild graph probe command template: %w", err)
 	}
 	if tools.Linker == "" {
 		return false, fmt.Errorf("Kbuild graph probe linker must be non-empty")
@@ -440,14 +771,14 @@ func EvaluateKbuildGraphProbe(
 				request.Kind,
 			)
 		}
-		executable = tools.Compiler
+		executable = tools.CommandTemplate.Compiler
 		for index, arg := range candidateArgv {
 			if strings.HasPrefix(arg, "-Wno-") {
 				candidateArgv[index] = "-W" + strings.TrimPrefix(arg, "-Wno-")
 			}
 		}
 		candidateArgv = compilerKbuildGraphProbeArgv(
-			analysisIdentity,
+			tools.CommandTemplate,
 			append(contextArgv, candidateArgv...),
 			"c",
 		)
@@ -457,9 +788,9 @@ func EvaluateKbuildGraphProbe(
 				"as_option Kbuild graph probe requires asm language and non-empty candidate argv",
 			)
 		}
-		executable = tools.Compiler
+		executable = tools.CommandTemplate.Compiler
 		candidateArgv = compilerKbuildGraphProbeArgv(
-			analysisIdentity,
+			tools.CommandTemplate,
 			append(contextArgv, candidateArgv...),
 			"assembler-with-cpp",
 		)
@@ -476,8 +807,8 @@ func EvaluateKbuildGraphProbe(
 	}
 
 	command := exec.CommandContext(ctx, executable, candidateArgv...)
-	if tools.Environment != nil {
-		command.Env = environmentList(tools.Environment)
+	if tools.CommandTemplate.Environment != nil {
+		command.Env = environmentList(tools.CommandTemplate.Environment)
 	}
 	err = command.Run()
 	if err == nil {
@@ -491,18 +822,88 @@ func EvaluateKbuildGraphProbe(
 }
 
 func compilerKbuildGraphProbeArgv(
-	analysisIdentity AnalysisIdentity,
+	template CommandTemplate,
 	argv []string,
 	language string,
 ) []string {
-	out := make([]string, 0, len(argv)+8)
-	if target := analysisIdentity.TargetGNUSystemName; target != "" {
-		out = append(out, "--target="+target)
-	}
+	prefix, suffix := splitCommandTemplateKbuildArgv(template)
+	out := make([]string, 0, len(prefix)+len(argv)+len(suffix)+6)
+	out = append(out, prefix...)
 	out = append(out, argv...)
+	out = append(out, suffix...)
 	out = append(out, "-c", "-x", language, os.DevNull)
 	out = append(out, "-o", os.DevNull)
 	return out
+}
+
+func splitCommandTemplateKbuildArgv(
+	template CommandTemplate,
+) (prefix []string, suffix []string) {
+	for index, arg := range template.MutableArgv {
+		if arg == template.KbuildFlagsSentinel {
+			return append([]string(nil), template.MutableArgv[:index]...),
+				append([]string(nil), template.MutableArgv[index+1:]...)
+		}
+	}
+	return append([]string(nil), template.MutableArgv...), nil
+}
+
+func absolutizeCompilerTemplatePaths(argv []string, executionRoot string) []string {
+	out := append([]string(nil), argv...)
+	separate := map[string]bool{
+		"-B":              true,
+		"-I":              true,
+		"-idirafter":      true,
+		"-imacros":        true,
+		"-include":        true,
+		"-iquote":         true,
+		"-isystem":        true,
+		"-isysroot":       true,
+		"-resource-dir":   true,
+		"--gcc-toolchain": true,
+		"--sysroot":       true,
+	}
+	joined := []string{
+		"--gcc-toolchain=",
+		"--sysroot=",
+		"-fmodule-map-file=",
+		"-idirafter",
+		"-iquote",
+		"-isystem",
+		"-isysroot",
+		"-resource-dir=",
+		"-B",
+		"-I",
+	}
+	for index := 0; index < len(out); index++ {
+		arg := out[index]
+		if separate[arg] && index+1 < len(out) {
+			index++
+			out[index] = absoluteCompilerTemplatePath(out[index], executionRoot)
+			continue
+		}
+		if strings.HasPrefix(arg, "@") && len(arg) > 1 {
+			out[index] = "@" + absoluteCompilerTemplatePath(arg[1:], executionRoot)
+			continue
+		}
+		for _, prefix := range joined {
+			value, ok := strings.CutPrefix(arg, prefix)
+			if !ok || value == "" {
+				continue
+			}
+			out[index] = prefix + absoluteCompilerTemplatePath(value, executionRoot)
+			break
+		}
+	}
+	return out
+}
+
+func absoluteCompilerTemplatePath(value string, executionRoot string) string {
+	path := filepath.FromSlash(value)
+	if value == "" || filepath.IsAbs(path) {
+		return value
+	}
+	return filepath.ToSlash(filepath.Join(executionRoot, path))
 }
 
 func expandKbuildGraphProbePaths(

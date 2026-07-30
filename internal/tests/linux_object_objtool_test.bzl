@@ -116,7 +116,7 @@ _linux_object_objtool_action_test = analysistest.make(
     },
 )
 
-def linux_object_objtool_test_suite(name):
+def linux_object_objtool_test_suite(name, empty_program, flag_programs):
     compile_environment_index = name + "_compile_environment_index"
     source_tree = name + "_source_tree"
     source_input_index = name + "_source_input_index"
@@ -181,12 +181,17 @@ def linux_object_objtool_test_suite(name):
             compile_environment_id = delayed_environment if delayed else base_environment,
             compile_environment_index = ":" + compile_environment_index,
             content_id = "5555555555555555555555555555555555555555555555555555555555555555",
+            flag_program = empty_program,
+            flag_programs = flag_programs,
             mode = object_mode,
             module_root = module_root,
+            needs_object_dir = False,
+            needs_utsversion_tmp = False,
             object = "arch/x86/boot/startup/test.pi.o" if transformed else "test.o",
             objtool = "//internal/cmd/runandwrite" if use_objtool else None,
             objtool_args = ["--noabs"] if force else [],
             objtool_force = force,
+            remove_flag_program = empty_program,
             source_input_file = 1 if assembly else 2,
             source_input_group = 1 if assembly else 2,
             source_input_index = ":" + source_input_index,

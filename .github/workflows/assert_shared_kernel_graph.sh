@@ -96,12 +96,12 @@ IFS=$'\t' read -r \
 expect configs "${config_names}" "btf,debug,lz4,x86_64"
 expect base_count "${base_raw}/${base_count}" "1152/1152"
 expect lz4_count "${lz4_raw}/${lz4_count}" "1152/1152"
-expect debug_count "${debug_raw}/${debug_count}" "1184/1184"
+expect debug_count "${debug_raw}/${debug_count}" "1182/1182"
 expect btf_count "${btf_raw}/${btf_count}" "1225/1225"
 expect base_lz4_exact "${base_lz4_equal}" "true"
-expect base_debug_shared "${base_debug}" "43"
+expect base_debug_shared "${base_debug}" "40"
 expect base_btf_shared "${base_btf}" "0"
-expect lz4_debug_shared "${lz4_debug}" "43"
+expect lz4_debug_shared "${lz4_debug}" "40"
 expect lz4_btf_shared "${lz4_btf}" "0"
 expect debug_btf_shared "${debug_btf}" "0"
 expect union "${union_count}" "${expected_actions}"
@@ -171,10 +171,10 @@ expect lz4_groups "${lz4_groups}" "63"
 expect debug_groups "${debug_groups}" "67"
 expect btf_groups "${btf_groups}" "65"
 expect base_lz4_group_identity "${base_lz4_groups_equal}" "true"
-expect base_debug_shared_groups "${base_debug_groups}" "5"
+expect base_debug_shared_groups "${base_debug_groups}" "4"
 expect base_btf_shared_groups "${base_btf_groups}" "0"
 expect debug_btf_shared_groups "${debug_btf_groups}" "0"
-expect group_union "${group_union}" "190"
+expect group_union "${group_union}" "191"
 expect group_object_variants "${group_objects}" "${expected_actions}"
 
 # Resolve every configured target through its content-addressed object variant.
@@ -271,10 +271,10 @@ expect configured_graph_memberships \
   "${expected_memberships}/${expected_actions}"
 expect base_configured_graph_targets "${base_identities}" "1152"
 expect lz4_configured_graph_targets "${lz4_identities}" "1152"
-expect debug_configured_graph_targets "${debug_identities}" "1184"
+expect debug_configured_graph_targets "${debug_identities}" "1182"
 expect btf_configured_graph_targets "${btf_identities}" "1225"
 expect base_lz4_graph_content_identity "${base_lz4_content_equal}" "true"
-expect base_debug_shared_graph_content "${base_debug_content}" "43"
+expect base_debug_shared_graph_content "${base_debug_content}" "40"
 expect base_btf_shared_graph_content "${base_btf_content}" "0"
 expect debug_btf_shared_graph_content "${debug_btf_content}" "0"
 expect configured_graph_content_union "${content_union}" "${expected_actions}"
@@ -411,7 +411,7 @@ expect lazy_value_reference_reuse \
   "42/31/6"
 expect configured_flag_program_reuse \
   "${configured_program_ref_count}/${unique_configured_program_refs}/${reused_program_ids}" \
-  "7038/25/25"
+  "7040/25/25"
 
 if ! header_families="$(
   jq -er '

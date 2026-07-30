@@ -7,12 +7,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/hermeticbuild/linux.bzl/internal/ccprofile"
 )
 
 func main() {
+	if filepath.Base(os.Args[0]) == "grep" {
+		os.Exit(runGrep(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	}
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -51,7 +55,12 @@ func runRefreshGraph(args []string) error {
 	profilePath := flags.String("profile", "", "recorded toolchain graph profile")
 	identityPath := flags.String("identity", "", "inspected compiler identity")
 	templatePath := flags.String("template", "", "configured compiler command template")
+	archiver := flags.String("archiver", "", "configured archiver")
 	linker := flags.String("linker", "", "configured raw linker")
+	nm := flags.String("nm", "", "configured symbol table tool")
+	objcopy := flags.String("objcopy", "", "configured object copy tool")
+	coreutils := flags.String("coreutils", "", "hermetic coreutils multicall binary")
+	grep := flags.String("grep", "", "hermetic grep executable")
 	shell := flags.String("shell", "", "execution-platform shell")
 	sourceRoot := flags.String("source_root", "", "Linux source root")
 	objectRoot := flags.String("object_root", "", "optional Linux object root")
@@ -63,12 +72,17 @@ func runRefreshGraph(args []string) error {
 		*profilePath == "" ||
 		*identityPath == "" ||
 		*templatePath == "" ||
+		*archiver == "" ||
 		*linker == "" ||
+		*nm == "" ||
+		*objcopy == "" ||
+		*coreutils == "" ||
+		*grep == "" ||
 		*shell == "" ||
 		*sourceRoot == "" ||
 		*out == "" {
 		return fmt.Errorf(
-			"ccprofile refresh-graph requires -profile, -identity, -template, -linker, -shell, -source_root, -out, and no positional arguments",
+			"ccprofile refresh-graph requires -profile, -identity, -template, -archiver, -linker, -nm, -objcopy, -coreutils, -grep, -shell, -source_root, -out, and no positional arguments",
 		)
 	}
 	identity, err := readCompilerIdentity(*identityPath)
@@ -101,12 +115,16 @@ func runRefreshGraph(args []string) error {
 		context.Background(),
 		profile,
 		ccprofile.KbuildGraphProbeTools{
-			Compiler:    template.Compiler,
-			Linker:      *linker,
-			Shell:       *shell,
-			SourceRoot:  *sourceRoot,
-			ObjectRoot:  *objectRoot,
-			Environment: template.Environment,
+			CommandTemplate: template,
+			Archiver:        *archiver,
+			Coreutils:       *coreutils,
+			Grep:            *grep,
+			Linker:          *linker,
+			NM:              *nm,
+			Objcopy:         *objcopy,
+			Shell:           *shell,
+			SourceRoot:      *sourceRoot,
+			ObjectRoot:      *objectRoot,
 		},
 	)
 	if err != nil {
@@ -178,11 +196,15 @@ func runCompile(args []string) error {
 	templatePath := flags.String("template", "", "validated CC command template")
 	validationPath := flags.String("validation", "", "configured graph validation stamp")
 	source := flags.String("source", "", "compile source")
+	kbuildSource := flags.String("kbuild_source", "", "original Kbuild source used for $(src) expansion")
 	output := flags.String("output", "", "compile output")
 	flagsFile := flags.String("flags_file", "", "newline-delimited object arguments")
 	removeFlagsFile := flags.String("remove_flags_file", "", "newline-delimited exact removals")
+	configPath := flags.String("config", "", "resolved Linux .config used for CONFIG_* Make references")
 	sourceRoot := flags.String("source_root", "", "Linux source directory for Kbuild reference expansion")
 	objectPath := flags.String("object_path", "", "source-root-relative object output path")
+	objectRoot := flags.String("object_root", "", "execution-time object directory for Kbuild $(obj) references")
+	utsversionTmp := flags.String("utsversion_tmp", "", "generated object-local utsversion-tmp.h")
 	var objectArgs repeatedStringFlag
 	var removals repeatedStringFlag
 	flags.Var(&objectArgs, "arg", "mutable object compile argument; repeat in command-line order")
@@ -190,14 +212,19 @@ func runCompile(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 ||
-		*templatePath == "" ||
+	if *templatePath == "" ||
 		*validationPath == "" ||
 		*source == "" ||
+		*configPath == "" ||
 		*output == "" {
 		return fmt.Errorf(
-			"ccprofile compile requires -template, -validation, -source, -output and no positional arguments",
+			"ccprofile compile requires -template, -validation, -source, -config, and -output",
 		)
+	}
+	objectArgs = append(objectArgs, flags.Args()...)
+	expansionSource := *source
+	if *kbuildSource != "" {
+		expansionSource = *kbuildSource
 	}
 	validationData, err := os.ReadFile(*validationPath)
 	if err != nil {
@@ -214,23 +241,38 @@ func runCompile(args []string) error {
 	if err != nil {
 		return fmt.Errorf("decode command template %s: %w", *templatePath, err)
 	}
+	configValues, err := readKbuildConfig(*configPath)
+	if err != nil {
+		return fmt.Errorf("read compile config: %w", err)
+	}
+	objectArgs, err = expandKbuildResponseFiles(
+		objectArgs,
+		configValues,
+		expansionSource,
+		*sourceRoot,
+		*objectPath,
+		*objectRoot,
+		*utsversionTmp,
+	)
+	if err != nil {
+		return fmt.Errorf("expand compile flags and response files: %w", err)
+	}
 	if *flagsFile != "" {
 		fileArgv, err := readArgvFile(*flagsFile)
 		if err != nil {
 			return fmt.Errorf("read compile flags file: %w", err)
 		}
-		fileArgv, err = expandArgvResponseFiles(fileArgv)
-		if err != nil {
-			return fmt.Errorf("expand compile response files: %w", err)
-		}
-		fileArgv, err = expandKbuildArgv(
+		fileArgv, err = expandKbuildProgramArgv(
 			fileArgv,
-			*source,
+			configValues,
+			expansionSource,
 			*sourceRoot,
 			*objectPath,
+			*objectRoot,
+			*utsversionTmp,
 		)
 		if err != nil {
-			return fmt.Errorf("expand compile flags: %w", err)
+			return fmt.Errorf("expand compile flag program: %w", err)
 		}
 		objectArgs = append(objectArgs, fileArgv...)
 	}
@@ -239,14 +281,17 @@ func runCompile(args []string) error {
 		if err != nil {
 			return fmt.Errorf("read compile remove-flags file: %w", err)
 		}
-		fileRemovals, err = expandKbuildArgv(
+		fileRemovals, err = expandKbuildProgramArgv(
 			fileRemovals,
-			*source,
+			configValues,
+			expansionSource,
 			*sourceRoot,
 			*objectPath,
+			*objectRoot,
+			*utsversionTmp,
 		)
 		if err != nil {
-			return fmt.Errorf("expand compile removals: %w", err)
+			return fmt.Errorf("expand compile remove-flag program: %w", err)
 		}
 		removals = append(removals, fileRemovals...)
 	}
@@ -348,7 +393,12 @@ func runValidateGraph(args []string) error {
 	projectionPath := flags.String("projection", "", "consumed graph projection")
 	identityPath := flags.String("identity", "", "inspected compiler identity")
 	templatePath := flags.String("template", "", "configured compiler command template")
+	archiver := flags.String("archiver", "", "configured archiver")
 	linker := flags.String("linker", "", "configured raw linker")
+	nm := flags.String("nm", "", "configured symbol table tool")
+	objcopy := flags.String("objcopy", "", "configured object copy tool")
+	coreutils := flags.String("coreutils", "", "hermetic coreutils multicall binary")
+	grep := flags.String("grep", "", "hermetic grep executable")
 	shell := flags.String("shell", "", "execution-platform shell")
 	sourceRoot := flags.String("source_root", "", "Linux source root")
 	objectRoot := flags.String("object_root", "", "optional Linux object root")
@@ -360,12 +410,17 @@ func runValidateGraph(args []string) error {
 		(*profilePath == "") == (*projectionPath == "") ||
 		*identityPath == "" ||
 		*templatePath == "" ||
+		*archiver == "" ||
 		*linker == "" ||
+		*nm == "" ||
+		*objcopy == "" ||
+		*coreutils == "" ||
+		*grep == "" ||
 		*shell == "" ||
 		*sourceRoot == "" ||
 		*out == "" {
 		return fmt.Errorf(
-			"ccprofile validate-graph requires exactly one of -profile or -projection, plus -identity, -template, -linker, -shell, -source_root, -out, and no positional arguments",
+			"ccprofile validate-graph requires exactly one of -profile or -projection, plus -identity, -template, -archiver, -linker, -nm, -objcopy, -coreutils, -grep, -shell, -source_root, -out, and no positional arguments",
 		)
 	}
 	identity, err := readCompilerIdentity(*identityPath)
@@ -398,6 +453,8 @@ func runValidateGraph(args []string) error {
 	var digest string
 	var kconfigCommands []ccprofile.KconfigCommand
 	var graphProbes []ccprofile.KbuildGraphProbe
+	replayKconfigCommands := ccprofile.ReplayConfiguredKconfigCommands
+	replayKbuildProbes := ccprofile.ReplayConfiguredKbuildGraphProbes
 	switch schemaHeader.Schema {
 	case ccprofile.GraphProfileSchema:
 		if *projectionPath != "" {
@@ -419,6 +476,8 @@ func runValidateGraph(args []string) error {
 		}
 		kconfigCommands = profile.KconfigCommands
 		graphProbes = profile.KbuildGraphProbes
+		replayKconfigCommands = ccprofile.ReplayMatchingConfiguredKconfigCommands
+		replayKbuildProbes = ccprofile.ReplayMatchingConfiguredKbuildGraphProbes
 	case ccprofile.GraphProjectionSchema:
 		projection, err := ccprofile.DecodeGraphProjection(graphData)
 		if err != nil {
@@ -439,42 +498,34 @@ func runValidateGraph(args []string) error {
 			schemaHeader.Schema,
 		)
 	}
-	if _, err := ccprofile.ReplayConfiguredKconfigCommands(
+	if _, err := replayKconfigCommands(
 		context.Background(),
 		kconfigCommands,
 		ccprofile.KbuildGraphProbeTools{
-			Compiler:   template.Compiler,
-			Linker:     *linker,
-			Shell:      *shell,
-			SourceRoot: *sourceRoot,
+			CommandTemplate: template,
+			Archiver:        *archiver,
+			Coreutils:       *coreutils,
+			Grep:            *grep,
+			Linker:          *linker,
+			NM:              *nm,
+			Objcopy:         *objcopy,
+			Shell:           *shell,
+			SourceRoot:      *sourceRoot,
 		},
 	); err != nil {
 		return fmt.Errorf("replay configured Kconfig commands: %w", err)
 	}
-	for _, expected := range graphProbes {
-		supported, err := ccprofile.EvaluateKbuildGraphProbe(
-			context.Background(),
-			template.AnalysisIdentity,
-			expected.Identity(),
-			ccprofile.KbuildGraphProbeTools{
-				Compiler:    template.Compiler,
-				Linker:      *linker,
-				SourceRoot:  *sourceRoot,
-				ObjectRoot:  *objectRoot,
-				Environment: template.Environment,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("replay Kbuild graph probe %s: %w", expected.ID, err)
-		}
-		if supported != expected.Supported {
-			return fmt.Errorf(
-				"Kbuild graph probe %s result mismatch: profile recorded supported=%t, configured tools returned supported=%t",
-				expected.ID,
-				expected.Supported,
-				supported,
-			)
-		}
+	if _, err := replayKbuildProbes(
+		context.Background(),
+		graphProbes,
+		ccprofile.KbuildGraphProbeTools{
+			CommandTemplate: template,
+			Linker:          *linker,
+			SourceRoot:      *sourceRoot,
+			ObjectRoot:      *objectRoot,
+		},
+	); err != nil {
+		return fmt.Errorf("replay Kbuild graph probes: %w", err)
 	}
 	identityDigest, err := ccprofile.CompilerIdentityDigest(identity)
 	if err != nil {

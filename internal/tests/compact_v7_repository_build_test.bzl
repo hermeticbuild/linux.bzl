@@ -39,6 +39,8 @@ _FLAG_TERMINAL_ID = "b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b
 _REMOVE_TERMINAL_ID = "babebabebabebabebabebabebabebabebabebabebabebabebabebabebabebabe"
 _FLAG_PROGRAM_ID = "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc"
 _REMOVE_PROGRAM_ID = "bdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbd"
+_DYNAMIC_PROBE_ID = "bebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebe"
+_DYNAMIC_SELECT_ID = "bfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbf"
 
 def _source(index, path):
     return struct(index = index, path = path)
@@ -69,10 +71,18 @@ def _recipe(
         language = "",
         mode = "y",
         module_root = False,
-        objtool_disabled = True):
-    flag_program = _program()
+        objtool_disabled = True,
+        flag_argv = ["-O2"],
+        flag_program_id = _FLAG_PROGRAM_ID,
+        flag_root = _FLAG_TERMINAL_ID,
+        remove_argv = []):
+    flag_program = _program(
+        argv = flag_argv,
+        program_id = flag_program_id,
+        root = flag_root,
+    )
     remove_flag_program = _program(
-        argv = [],
+        argv = remove_argv,
         program_id = _REMOVE_PROGRAM_ID,
         root = _REMOVE_TERMINAL_ID,
     )
@@ -148,7 +158,11 @@ def _x86_model(
         include_fallback = True,
         include_module = False,
         fallback_object_path = "lib/oid_registry.o",
-        config_names = ["base"]):
+        config_names = ["base"],
+        dynamic_flags = False,
+        flag_argv = ["-O2"],
+        probe_candidate_argv = ["-Wunknown-test-option"],
+        remove_argv = []):
     source_files = [
         _source(1, "include/linux/compiler-version.h"),
         _source(2, "include/linux/compiler_types.h"),
@@ -182,6 +196,9 @@ def _x86_model(
         "compile",
         language = "c",
         objtool_disabled = False,
+        flag_argv = flag_argv,
+        flag_root = _DYNAMIC_SELECT_ID if dynamic_flags else _FLAG_TERMINAL_ID,
+        remove_argv = remove_argv,
     )
     direct = _object(
         "direct",
@@ -208,7 +225,13 @@ def _x86_model(
             environment = environment,
             source_group = special_sources,
         )
-        composite_recipe = _recipe(_COMPOSITE_RECIPE_ID, "composite")
+        composite_recipe = _recipe(
+            _COMPOSITE_RECIPE_ID,
+            "composite",
+            flag_argv = [],
+            flag_program_id = _REMOVE_PROGRAM_ID,
+            flag_root = _REMOVE_TERMINAL_ID,
+        )
         composite = _object(
             "composite",
             _COMPOSITE_CONTENT_ID,
@@ -280,17 +303,35 @@ def _x86_model(
         compile_environments = {_ENVIRONMENT_ID: environment},
         config_payloads = {_PAYLOAD_ID: payload},
         configs = configs,
-        flag_nodes = {},
+        flag_nodes = {
+            _DYNAMIC_SELECT_ID: struct(
+                children = [_FLAG_TERMINAL_ID, _REMOVE_TERMINAL_ID],
+                id = _DYNAMIC_SELECT_ID,
+                kind = "select",
+                probe = _DYNAMIC_PROBE_ID,
+                when_false = _REMOVE_TERMINAL_ID,
+                when_true = _FLAG_TERMINAL_ID,
+            ),
+        } if dynamic_flags else {},
         flag_programs = {
             _FLAG_PROGRAM_ID: direct_recipe.flag_program,
             _REMOVE_PROGRAM_ID: direct_recipe.remove_flag_program,
         },
         flag_terminals = {
-            _FLAG_TERMINAL_ID: struct(argv = ["-O2"]),
-            _REMOVE_TERMINAL_ID: struct(argv = []),
+            _FLAG_TERMINAL_ID: struct(argv = flag_argv),
+            _REMOVE_TERMINAL_ID: struct(argv = remove_argv),
         },
         generated_header_families = {},
-        kbuild_probes = {},
+        kbuild_probes = {
+            _DYNAMIC_PROBE_ID: struct(
+                candidate_argv = probe_candidate_argv,
+                context_program = _REMOVE_PROGRAM_ID,
+                id = _DYNAMIC_PROBE_ID,
+                kind = "cc_option",
+                language = "c",
+                srcarch = "x86",
+            ),
+        } if dynamic_flags else {},
         object_variants = {obj.target: obj for obj in objects},
         recipe_groups = recipe_groups,
         source_files = source_files,
@@ -345,7 +386,13 @@ def _arm64_model():
         environment = environment,
         source_group = member_sources,
     )
-    nvhe_recipe = _recipe(_NVHE_RECIPE_ID, "arm64_nvhe")
+    nvhe_recipe = _recipe(
+        _NVHE_RECIPE_ID,
+        "arm64_nvhe",
+        flag_argv = [],
+        flag_program_id = _REMOVE_PROGRAM_ID,
+        flag_root = _REMOVE_TERMINAL_ID,
+    )
     nvhe = _object(
         "nvhe",
         _NVHE_CONTENT_ID,
@@ -614,6 +661,38 @@ def _split_fallback_test_impl(ctx):
 
 _split_fallback_test = unittest.make(_split_fallback_test_impl)
 
+def _dynamic_fallback_program_test_impl(ctx):
+    env = unittest.begin(ctx)
+    result = _emit(
+        _x86_model(
+            dynamic_flags = True,
+            fallback_object_path = "init/version.o",
+            flag_argv = ["-include", "$(obj)/utsversion-tmp.h"],
+            probe_candidate_argv = [
+                "-include",
+                "__LINUX_BZL_SRCTREE__/include/linux/compiler-version.h",
+            ],
+        ),
+        "x86",
+        source_objtool = "//:_base_x86_objtool",
+    )
+    fallback = _rule_block(result.build_file, "_legacy_special")
+    flag_programs = _rule_block(result.build_file, "_flag_programs")
+
+    asserts.true(env, "flag_program = %r" % _FLAG_PROGRAM_ID in fallback)
+    asserts.true(env, 'flag_programs = ":_flag_programs"' in fallback)
+    asserts.true(env, "remove_flag_program = %r" % _REMOVE_PROGRAM_ID in fallback)
+    asserts.true(env, "needs_object_dir = True" in fallback)
+    asserts.true(env, "needs_utsversion_tmp = True" in fallback)
+    asserts.false(env, "\n    flags =" in fallback)
+    asserts.false(env, "\n    remove_flags =" in fallback)
+    asserts.true(env, '"include/linux/compiler-version.h"' in flag_programs)
+    asserts.false(env, '"kernel/a.c"' in flag_programs)
+    asserts.false(env, '"lib/oid_registry.c"' in flag_programs)
+    return unittest.end(env)
+
+_dynamic_fallback_program_test = unittest.make(_dynamic_fallback_program_test_impl)
+
 def _file_only_payload_test_impl(ctx):
     env = unittest.begin(ctx)
     result = _emit(
@@ -662,6 +741,11 @@ def _shared_group_dedup_test_impl(ctx):
         _x86_model(
             include_fallback = False,
             config_names = ["base", "lz4"],
+            flag_argv = [
+                "-DCC=$(CONFIG_CC_IS_CLANG)",
+                "-DARCH=${CONFIG_X86_64}",
+            ],
+            remove_argv = ["-DREMOVE=$(CONFIG_CC_IS_CLANG)"],
         ),
         "x86",
         source_objtool = "//:_base_x86_objtool",
@@ -675,6 +759,10 @@ def _shared_group_dedup_test_impl(ctx):
         1,
         len(result.build_file.split("linux_object_action_group(")) - 1,
     )
+    asserts.equals(env, [], result.fallback_targets)
+    asserts.true(env, "-DCC=$(CONFIG_CC_IS_CLANG)" in result.build_file)
+    asserts.true(env, "-DARCH=${CONFIG_X86_64}" in result.build_file)
+    asserts.true(env, "-DREMOVE=$(CONFIG_CC_IS_CLANG)" in result.build_file)
     asserts.equals(
         env,
         2,
@@ -812,6 +900,8 @@ _arm64_nvhe_test = unittest.make(_arm64_nvhe_test_impl)
 def compact_v7_repository_build_test_suite(name):
     split = name + "_split_fallback"
     _split_fallback_test(name = split)
+    dynamic_fallback = name + "_dynamic_fallback_program"
+    _dynamic_fallback_program_test(name = dynamic_fallback)
     file_only = name + "_file_only_payload"
     _file_only_payload_test(name = file_only)
     shared_group_dedup = name + "_shared_group_dedup"
@@ -828,6 +918,7 @@ def compact_v7_repository_build_test_suite(name):
         name = name,
         tests = [
             split,
+            dynamic_fallback,
             file_only,
             shared_group_dedup,
             reachability_partition,

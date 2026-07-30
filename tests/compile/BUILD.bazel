@@ -22,6 +22,16 @@ _COMPILE_ENVIRONMENT_ID = "11111111111111111111111111111111111111111111111111111
 
 _CONFIG_PAYLOAD_ID = "2222222222222222222222222222222222222222222222222222222222222222"
 
+_EMPTY_PROGRAM_ID = "4141414141414141414141414141414141414141414141414141414141414141"
+
+_FLAGS_PROGRAM_ID = "4343434343434343434343434343434343434343434343434343434343434343"
+
+_MODULE_FLAGS_PROGRAM_ID = "4545454545454545454545454545454545454545454545454545454545454545"
+
+_REMOVE_PROGRAM_ID = "5151515151515151515151515151515151515151515151515151515151515151"
+
+_FLAG_PROGRAMS = "//internal/tests:linux_object_test_flag_programs"
+
 linux_compile_environment_index(
     name = "fixture_compile_environment_index",
     compile_environments = {
@@ -30,6 +40,7 @@ linux_compile_environment_index(
     config_payloads = {
         _CONFIG_PAYLOAD_ID: "\n".join([
             "CONFIG_FIXTURE=y",
+            "CONFIG_FIXTURE_DISABLED=n",
             "CONFIG_FIXTURE_MODULE=m",
             "CONFIG_FIXTURE_VALUE=7",
             "CONFIG_LOCALVERSION=\"-native\"",
@@ -68,12 +79,13 @@ linux_object(
     compile_environment_id = _COMPILE_ENVIRONMENT_ID,
     compile_environment_index = ":fixture_compile_environment_index",
     content_id = "3333333333333333333333333333333333333333333333333333333333333333",
-    flags = [
-        "-Werror",
-        "-Wall",
-    ],
+    flag_program = _FLAGS_PROGRAM_ID,
+    flag_programs = _FLAG_PROGRAMS,
     mode = "y",
+    needs_object_dir = False,
+    needs_utsversion_tmp = False,
     object = "fixture.o",
+    remove_flag_program = _REMOVE_PROGRAM_ID,
     source_input_file = 7,
     source_input_group = 2,
     source_input_index = ":fixture_source_input_index",
@@ -84,13 +96,13 @@ linux_object(
     compile_environment_id = _COMPILE_ENVIRONMENT_ID,
     compile_environment_index = ":fixture_compile_environment_index",
     content_id = "4444444444444444444444444444444444444444444444444444444444444444",
-    flags = [
-        "-DEXPECT_MODULE",
-        "-Werror",
-        "-Wall",
-    ],
+    flag_program = _MODULE_FLAGS_PROGRAM_ID,
+    flag_programs = _FLAG_PROGRAMS,
     mode = "m",
+    needs_object_dir = False,
+    needs_utsversion_tmp = False,
     object = "fixture_module.o",
+    remove_flag_program = _REMOVE_PROGRAM_ID,
     source_input_file = 7,
     source_input_group = 2,
     source_input_index = ":fixture_source_input_index",
@@ -106,12 +118,13 @@ linux_object(
     compile_environment_id = _COMPILE_ENVIRONMENT_ID,
     compile_environment_index = ":fixture_compile_environment_index",
     content_id = "5555555555555555555555555555555555555555555555555555555555555555",
-    flags = [
-        "-Werror",
-        "-Wall",
-    ],
+    flag_program = _FLAGS_PROGRAM_ID,
+    flag_programs = _FLAG_PROGRAMS,
     mode = "y",
+    needs_object_dir = False,
+    needs_utsversion_tmp = False,
     object = "cross_tree/leaf.o",
+    remove_flag_program = _EMPTY_PROGRAM_ID,
     source_input_file = 1,
     source_input_group = 1,
     source_input_index = ":fixture_source_input_index",

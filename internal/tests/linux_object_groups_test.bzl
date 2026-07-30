@@ -234,7 +234,8 @@ def _group_test_impl(ctx):
         asserts.true(env, "compile" in action.argv)
         asserts.true(env, "-flags_file" in action.argv)
         asserts.true(env, "-remove_flags_file" in action.argv)
-        asserts.true(env, "-remove=-fcolor-diagnostics" in action.argv)
+        asserts.false(env, "-arg=-nostdinc" in action.argv)
+        asserts.false(env, "-arg=-fintegrated-as" in action.argv)
     asserts.equals(env, 2, len(outputs))
     objtool_inputs = {}
     objtool_outputs = {}
@@ -515,7 +516,6 @@ def linux_object_groups_test_suite(name):
         flag_program = _FLAGS_PROGRAM_ID,
         flag_programs = ":" + flag_programs,
         flag_effects = ["argv"],
-        graph_profile = ":" + profile,
         language = "c",
         mode = "y",
         objtool = ":" + fake_objtool,
@@ -549,7 +549,6 @@ def linux_object_groups_test_suite(name):
         srcarch = "x86",
         srcs = _SRCS,
         tags = ["manual"],
-        toolchain_remove_flags = ["-fcolor-diagnostics"],
     )
 
     group_test = name + "_group_test"
@@ -571,7 +570,6 @@ def linux_object_groups_test_suite(name):
         flag_program = _EMPTY_PROGRAM_ID,
         flag_programs = ":" + flag_programs,
         flag_effects = ["argv"],
-        graph_profile = ":" + profile,
         language = "c",
         mode = "y",
         objtool = ":" + fake_objtool,
@@ -783,8 +781,6 @@ def linux_object_groups_test_suite(name):
     linux_composite_object_action_group(
         name = composite_group,
         arch = "x86",
-        flag_program = _EMPTY_PROGRAM_ID,
-        flag_programs = ":" + flag_programs,
         graph_profile = ":" + profile,
         member_groups = [":" + group],
         mode = "y",
@@ -804,7 +800,6 @@ def linux_object_groups_test_suite(name):
         ],
         reachability_id = _REACHABILITY_ID,
         recipe_id = _COMPOSITE_RECIPE_ID,
-        remove_flag_program = _EMPTY_PROGRAM_ID,
         relocatable_link_flags = ["-r"],
         tags = ["manual"],
     )
@@ -843,7 +838,6 @@ def linux_object_groups_test_suite(name):
         flag_program = _EMPTY_PROGRAM_ID,
         flag_programs = ":" + flag_programs,
         flag_effects = ["argv"],
-        graph_profile = ":" + profile,
         language = "c",
         mode = "m",
         module_root = True,
@@ -939,7 +933,6 @@ def linux_object_groups_test_suite(name):
         flag_program = _EMPTY_PROGRAM_ID,
         flag_programs = ":" + nvhe_flag_programs,
         flag_effects = ["argv"],
-        graph_profile = ":" + nvhe_profile,
         language = "c",
         mode = "y",
         objects = {
@@ -965,8 +958,6 @@ def linux_object_groups_test_suite(name):
     linux_arm64_nvhe_object_action_group(
         name = nvhe_group,
         compile_environment_index = ":" + nvhe_environments,
-        flag_program = _EMPTY_PROGRAM_ID,
-        flag_programs = ":" + nvhe_flag_programs,
         graph_profile = ":" + nvhe_profile,
         member_groups = [":" + nvhe_member_group],
         objcopy = "@llvm//tools:llvm-objcopy",
@@ -985,7 +976,6 @@ def linux_object_groups_test_suite(name):
         reachable_configs = ["base"],
         reachability_id = _NVHE_REACHABILITY_ID,
         recipe_id = _NVHE_RECIPE_ID,
-        remove_flag_program = _EMPTY_PROGRAM_ID,
         relocatable_link_flags = ["-r"],
         source_paths = _NVHE_SOURCE_PATHS,
         source_root = "//tests/compile:source/Kconfig",

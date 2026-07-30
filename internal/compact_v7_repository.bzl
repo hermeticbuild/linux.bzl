@@ -617,6 +617,11 @@ def _index_flag_programs(metadata):
         for arg_index in range(len(argv)):
             if "\n" in argv[arg_index] or "\r" in argv[arg_index] or _NUL in argv[arg_index]:
                 fail("%s.argv[%d] contains a newline or NUL" % (path, arg_index))
+            if _emitter_argument_starts_response_file(argv[arg_index]):
+                fail(
+                    "%s.argv[%d] contains unsupported response-file argument %r" %
+                    (path, arg_index, argv[arg_index]),
+                )
         terminals[record["id"]] = struct(
             argv = argv,
             id = record["id"],
@@ -648,6 +653,18 @@ def _index_flag_programs(metadata):
         for arg_index in range(len(candidate_argv)):
             if "\n" in candidate_argv[arg_index] or "\r" in candidate_argv[arg_index] or _NUL in candidate_argv[arg_index]:
                 fail("%s.candidate_argv[%d] contains a newline or NUL" % (path, arg_index))
+            if _emitter_argument_starts_response_file(candidate_argv[arg_index]):
+                fail(
+                    "%s.candidate_argv[%d] contains unsupported response-file argument %r" %
+                    (path, arg_index, candidate_argv[arg_index]),
+                )
+            refs = _emitter_make_refs(candidate_argv[arg_index])
+            for ref in refs:
+                if not _emitter_probe_make_ref_allowed(ref):
+                    fail(
+                        "%s.candidate_argv[%d] contains unsupported Make reference %s" %
+                        (path, arg_index, ref),
+                    )
         context_program = _full_id(
             record["context_program"],
             path + ".context_program",
@@ -783,6 +800,7 @@ def _index_flag_programs(metadata):
             effects = effects,
             id = record["id"],
             root = root,
+            static_empty = root in terminals and not terminals[root].argv,
         )
     for probe_id, probe in probes.items():
         if probe.context_program not in programs:
@@ -790,6 +808,14 @@ def _index_flag_programs(metadata):
                 "Kbuild probe %s references unknown context program %s" %
                 (probe_id, probe.context_program),
             )
+        for arg_index in range(len(programs[probe.context_program].argv)):
+            refs = _emitter_make_refs(programs[probe.context_program].argv[arg_index])
+            for ref in refs:
+                if not _emitter_probe_make_ref_allowed(ref):
+                    fail(
+                        "Kbuild probe %s context argv[%d] contains unsupported Make reference %s" %
+                        (probe_id, arg_index, ref),
+                    )
     return struct(
         nodes = nodes,
         probes = probes,
@@ -935,8 +961,8 @@ def _index_recipes(metadata, programs):
         _string(language, path + ".language", allow_empty = True)
         if kind == "compile" and language not in ["asm", "c"]:
             fail("%s has invalid compile language %r" % (path, language))
-        if kind == "composite" and language:
-            fail("%s composite recipe has compile language %r" % (path, language))
+        if kind != "compile" and language:
+            fail("%s %s recipe has compile language %r" % (path, kind, language))
         mode = _string(record["mode"], path + ".mode")
         if mode not in ["m", "y"]:
             fail("%s has invalid mode %r" % (path, mode))
@@ -949,6 +975,11 @@ def _index_recipes(metadata, programs):
             fail("%s references unknown flag program %s" % (path, flag_program_id))
         if remove_program_id not in programs:
             fail("%s references unknown remove-flag program %s" % (path, remove_program_id))
+        if kind != "compile" and (
+            not programs[flag_program_id].static_empty or
+            not programs[remove_program_id].static_empty
+        ):
+            fail("%s %s recipe must use the canonical empty flag program" % (path, kind))
         module_root = record.get("module_root", False)
         objtool_disabled = record.get("objtool_disabled", False)
         objtool_force = record.get("objtool_force", False)
@@ -1502,6 +1533,15 @@ _EMITTER_KNOWN_EMPTY_MAKE_REFS = {
     "cflags-nogcse-yy": True,
 }
 
+def _emitter_argument_starts_response_file(arg):
+    for ref in _EMITTER_KNOWN_EMPTY_MAKE_REFS:
+        arg = arg.replace("$(%s)" % ref, "")
+        arg = arg.replace("${%s}" % ref, "")
+    return arg.startswith("@")
+
+def _emitter_probe_make_ref_allowed(ref):
+    return ref in ["obj", "srctree"] or ref in _EMITTER_KNOWN_EMPTY_MAKE_REFS
+
 def _emitter_label(label_package, target):
     if not label_package:
         return "//:" + target
@@ -1542,20 +1582,43 @@ def _emitter_make_refs(value):
         refs.append(value[index + 2:end] if end >= 0 else value[index:])
     return refs
 
-def _emitter_config_enabled(content, names):
-    enabled = {name: True for name in names}
+def _emitter_object_flag_planning(recipe):
+    argv = recipe.flag_program.argv + recipe.remove_flag_program.argv
+    needs_utsversion_tmp = any([
+        "utsversion-tmp.h" in value
+        for value in argv
+    ])
+    needs_object_dir = needs_utsversion_tmp or any([
+        "$(obj)" in value or "${obj}" in value
+        for value in argv
+    ])
+    return struct(
+        needs_object_dir = needs_object_dir,
+        needs_utsversion_tmp = needs_utsversion_tmp,
+    )
+
+def _emitter_config_values(content):
+    values = {}
     for line in content.splitlines():
-        if not line.startswith("CONFIG_") or "=" not in line:
+        if line.startswith("# CONFIG_") and line.endswith(" is not set"):
+            values[line[len("# "):-len(" is not set")]] = "n"
             continue
-        name, value = line.split("=", 1)
-        if name in enabled and value == "y":
-            return True
-    return False
+        if line.startswith("CONFIG_") and "=" in line:
+            name, value = line.split("=", 1)
+            values[name] = value
+    return values
+
+def _emitter_config_enabled(content, names):
+    values = _emitter_config_values(content)
+    return any([values.get(name) == "y" for name in names])
 
 def _emitter_direct_fallback_reason(obj):
     recipe = obj.recipe
     source_group = obj.action_source_group
     source = source_group.primary_source.path
+    config_values = _emitter_config_values(
+        obj.compile_environment.config_payload.content,
+    )
     if obj.dependency_targets:
         return "has generated-header object dependencies"
     if "output" in recipe.flag_program.effects or "graph" in recipe.flag_program.effects:
@@ -1592,6 +1655,8 @@ def _emitter_direct_fallback_reason(obj):
         if "$(obj)" in value or "${obj}" in value or "utsversion-tmp.h" in value:
             return "requires an object-local generated directory"
         for ref in _emitter_make_refs(value):
+            if ref.startswith("CONFIG_") and ref in config_values:
+                continue
             if ref not in ["src", "srctree"] and ref not in _EMITTER_KNOWN_EMPTY_MAKE_REFS:
                 return "contains analysis-time Make reference " + ref
     use_objtool = not recipe.objtool_disabled
@@ -1954,6 +2019,18 @@ def _emitter_flag_program_attrs(model):
         terminals = terminals,
     )
 
+def _emitter_flag_program_source_paths(model):
+    referenced = {}
+    for probe in model.kbuild_probes.values():
+        argv = (
+            probe.candidate_argv +
+            model.flag_programs[probe.context_program].argv
+        )
+        for source in model.source_files:
+            if any([source.path in arg for arg in argv]):
+                referenced[source.path] = True
+    return sorted(referenced.keys())
+
 def _emitter_emit_grouped_rules(
         lines,
         model,
@@ -1967,8 +2044,7 @@ def _emitter_emit_grouped_rules(
         flag_programs,
         source_objtool,
         source_objcopy,
-        relocatable_link_flags,
-        toolchain_remove_flags):
+        relocatable_link_flags):
     for group_id in sorted(group_targets.grouped.keys()):
         emitted = group_targets.grouped[group_id]
         group = model.recipe_groups[group_id]
@@ -1986,11 +2062,10 @@ def _emitter_emit_grouped_rules(
             attrs = dict(common)
             attrs.update({
                 "arch": arch,
-                "flag_program": recipe.flag_program_id,
-                "flag_programs": flag_programs,
-                "graph_profile": graph_profile,
                 "compile_environment_index": ":" + compile_environment_index.name,
                 "flag_effects": recipe.flag_program.effects,
+                "flag_program": recipe.flag_program_id,
+                "flag_programs": flag_programs,
                 "language": recipe.language,
                 "mode": recipe.mode,
                 "modname": recipe.modname,
@@ -2009,7 +2084,6 @@ def _emitter_emit_grouped_rules(
                 "source_root": source_root_label,
                 "srcarch": srcarch,
                 "srcs": _emitter_source_labels(source_label_package, local_sources.paths),
-                "toolchain_remove_flags": toolchain_remove_flags,
             })
             if arch == "x86" and not recipe.objtool_disabled:
                 if not source_objtool:
@@ -2020,8 +2094,6 @@ def _emitter_emit_grouped_rules(
             attrs = dict(common)
             attrs.update({
                 "arch": arch,
-                "flag_program": recipe.flag_program_id,
-                "flag_programs": flag_programs,
                 "graph_profile": graph_profile,
                 "member_groups": _emitter_member_group_labels(
                     emitted.objects,
@@ -2037,7 +2109,6 @@ def _emitter_emit_grouped_rules(
                 ),
                 "objtool_args": recipe.objtool_args,
                 "objtool_force": recipe.objtool_force,
-                "remove_flag_program": recipe.remove_flag_program_id,
                 "relocatable_link_flags": relocatable_link_flags,
             })
             _emitter_rule(lines, "linux_composite_object_action_group", emitted.name, attrs)
@@ -2048,10 +2119,8 @@ def _emitter_emit_grouped_rules(
             compile_environment_index = compile_environment_partitions[group.reachability_id]
             attrs = dict(common)
             attrs.update({
-                "flag_program": recipe.flag_program_id,
-                "flag_programs": flag_programs,
-                "graph_profile": graph_profile,
                 "compile_environment_index": ":" + compile_environment_index.name,
+                "graph_profile": graph_profile,
                 "member_groups": _emitter_member_group_labels(
                     emitted.objects,
                     emitted.name,
@@ -2064,11 +2133,9 @@ def _emitter_emit_grouped_rules(
                     include_action_source = True,
                 ),
                 "relocatable_link_flags": relocatable_link_flags,
-                "remove_flag_program": recipe.remove_flag_program_id,
                 "source_paths": local_sources.paths,
                 "source_root": source_root_label,
                 "srcs": _emitter_source_labels(source_label_package, local_sources.paths),
-                "toolchain_remove_flags": toolchain_remove_flags,
             })
             _emitter_rule(lines, "linux_arm64_nvhe_object_action_group", emitted.name, attrs)
 
@@ -2081,6 +2148,7 @@ def _emitter_emit_legacy_rules(
         source_partitions,
         arch,
         srcarch,
+        flag_programs,
         source_objtool,
         source_asn1_compiler,
         source_relacheck):
@@ -2091,14 +2159,6 @@ def _emitter_emit_legacy_rules(
     for target in sorted(fallback_reasons.keys()):
         obj = model.object_variants[target]
         recipe = obj.recipe
-        if (
-            recipe.flag_program.root in model.flag_nodes or
-            recipe.remove_flag_program.root in model.flag_nodes
-        ):
-            fail(
-                "compact-v7 legacy fallback object %s cannot consume a dynamic flag program" %
-                target,
-            )
         attrs = {
             "arch": arch,
             "content_id": obj.content_id,
@@ -2108,18 +2168,22 @@ def _emitter_emit_legacy_rules(
         }
         if recipe.kind == "compile":
             group = obj.action_source_group
+            flag_planning = _emitter_object_flag_planning(recipe)
             compile_environment_index = compile_environment_partitions[obj.reachability_id]
             source_index = source_partitions[obj.reachability_id]
             attrs.update({
                 "compile_environment_id": obj.compile_environment_id,
                 "compile_environment_index": ":" + compile_environment_index.name,
                 "deps": [":" + legacy_names[dependency] for dependency in obj.dependency_targets],
-                "flags": recipe.flag_program.argv,
+                "flag_program": recipe.flag_program_id,
+                "flag_programs": flag_programs,
                 "modname": recipe.modname,
                 "module_root": recipe.module_root,
+                "needs_object_dir": flag_planning.needs_object_dir,
+                "needs_utsversion_tmp": flag_planning.needs_utsversion_tmp,
                 "objtool_args": recipe.objtool_args,
                 "objtool_force": recipe.objtool_force,
-                "remove_flags": recipe.remove_flag_program.argv,
+                "remove_flag_program": recipe.remove_flag_program_id,
                 "source_input_file": source_index.local_by_global[group.primary_source_index],
                 "source_input_group": source_index.group_by_target[target],
                 "source_input_index": ":" + source_index.name,
@@ -2317,7 +2381,6 @@ def compact_v7_repository_build(
         source_relacheck = "",
         source_objcopy = "",
         relocatable_link_flags = None,
-        toolchain_remove_flags = None,
         visibility = None):
     """Emits a deterministic lazy compact-v7 graph package.
 
@@ -2342,8 +2405,6 @@ def compact_v7_repository_build(
             fail("compact-v7 emitter requires %s" % name)
     if relocatable_link_flags == None:
         relocatable_link_flags = ["-r"]
-    if toolchain_remove_flags == None:
-        toolchain_remove_flags = []
     if visibility == None:
         visibility = ["//:__subpackages__"]
 
@@ -2394,6 +2455,7 @@ def compact_v7_repository_build(
     ]
 
     flag_program_attrs = _emitter_flag_program_attrs(model)
+    flag_program_source_paths = _emitter_flag_program_source_paths(model)
     _emitter_rule(
         lines,
         "linux_flag_programs",
@@ -2404,10 +2466,10 @@ def compact_v7_repository_build(
             "graph_profile": graph_profile,
             "programs": flag_program_attrs.programs,
             "source_root": source_root_label,
-            "source_paths": [source.path for source in model.source_files],
+            "source_paths": flag_program_source_paths,
             "srcs": _emitter_source_labels(
                 source_label_package,
-                [source.path for source in model.source_files],
+                flag_program_source_paths,
             ),
             "tags": ["manual"],
             "terminals": flag_program_attrs.terminals,
@@ -2472,7 +2534,6 @@ def compact_v7_repository_build(
         source_objtool,
         source_objcopy,
         relocatable_link_flags,
-        toolchain_remove_flags,
     )
     if fallback_reasons:
         _emitter_emit_legacy_rules(
@@ -2484,6 +2545,7 @@ def compact_v7_repository_build(
             fallback_source_partitions,
             arch,
             srcarch,
+            ":_flag_programs",
             source_objtool,
             source_asn1_compiler,
             source_relacheck,
