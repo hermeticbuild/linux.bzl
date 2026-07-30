@@ -13,27 +13,27 @@ _RELEASE_BASE_URL = "https://github.com/fionera/linux.bzl/releases/download/kcon
 
 KCONFIG_TOOL_RELEASES = {
     "darwin_amd64": struct(
-        integrity = "sha256-K/b6RAE8j+aFK5DN3pWPTYbInJnH4qlWDJkZFdxXlns=",
+        integrity = "sha256-4a9XxbGk1UuJ9STpmc6QzeDAXabaqLBaWKesuoufABk=",
         urls = ["{}/kconfig-darwin-amd64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "darwin_arm64": struct(
-        integrity = "sha256-VcyBGWR1NEd+RkeT4t5+P1OMXlKwwwENPHI7FrY2txs=",
+        integrity = "sha256-+MjTu9AhSrcE9ivRLeuKXJ3sdkn+6EpjGncFwhwRjag=",
         urls = ["{}/kconfig-darwin-arm64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "linux_amd64": struct(
-        integrity = "sha256-lt4hrI0G9ILvyz9rcf+7YVhk7r0lzAdf6mHKe7v52o8=",
+        integrity = "sha256-+24xsB4RTcS4GIDGYbL527AIeBmZCcOktqt4IMb7Jc4=",
         urls = ["{}/kconfig-linux-amd64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "linux_arm64": struct(
-        integrity = "sha256-w86SoFlVz0DyFAVhweo1eiomKAjkcnuU1k40JbOxWdg=",
+        integrity = "sha256-l+w2S8Kn1FYdGo5N1dbBZzPSl9y9qPR2MxB2MaUtqaA=",
         urls = ["{}/kconfig-linux-arm64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "windows_amd64": struct(
-        integrity = "sha256-sJYFeX8OX7g5wzu0FxWInyknd8VGai9h0MhEUtpNYEE=",
+        integrity = "sha256-3hME3J123pADposTnrlkH4/v94yDjGg805+Z0aA6wzs=",
         urls = ["{}/kconfig-windows-amd64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "windows_arm64": struct(
-        integrity = "sha256-EZoUtfKeyBB5h7twDbkOxADihDyyaNZIzaCfpQvQU30=",
+        integrity = "sha256-7QwTpD8rF5tpsm0A7PQZWqJgAvXnaY94hTK/1ab3cAU=",
         urls = ["{}/kconfig-windows-arm64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
 }

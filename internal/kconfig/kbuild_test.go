@@ -209,6 +209,9 @@ func TestKbuildClangCapabilityPolicyResolvesKnownCallsEagerly(t *testing.T) {
 	if err := os.WriteFile(kbuild, []byte(`comma := ,
 obj-y += core.o
 CFLAGS_core.o := $(call cc-option,-Wno-gnu) \
+	$(call cc-option,-Wno-psabi) \
+	$(call cc-option,-mabi=lp64) \
+	$(call cc-option,-mbranch-protection=none) \
 	$(call cc-option,-Wmaybe-uninitialized,-Wno-uninitialized) \
 	$(call as-option,-Wa$(comma)-march=armv8.5-a) \
 	$(call ld-option,-maarch64elf)
@@ -231,6 +234,8 @@ obj-$(call cc-option-yn,-Wrestrict) += unsupported.o
 	}
 	wantFlags := []string{
 		"-Wno-gnu",
+		"-Wno-psabi",
+		"-mbranch-protection=none",
 		"-Wno-uninitialized",
 		"-Wa,-march=armv8.5-a",
 		"-maarch64elf",
@@ -296,12 +301,15 @@ func TestKbuildClangCapabilityPolicyUsesRelevantContext(t *testing.T) {
 	}
 }
 
-func TestKbuildClangCapabilityPolicyResolvesLinux618X8664AlignmentOptions(t *testing.T) {
+func TestKbuildClangCapabilityPolicyResolvesLinuxX8664MakefileOptions(t *testing.T) {
 	dir := t.TempDir()
 	kbuild := filepath.Join(dir, "Kbuild")
 	if err := os.WriteFile(kbuild, []byte(`cc_stack_align4 := -mstack-alignment=4
 obj-y += core.o
-CFLAGS_core.o := $(call cc-option,-falign-jumps=1) $(call cc-option,-falign-loops=1)
+CFLAGS_core.o := $(call cc-option,-falign-jumps=1) \
+	$(call cc-option,-falign-loops=1) \
+	$(call cc-option,-mno-fp-ret-in-387) \
+	$(call cc-option,-mskip-rax-setup)
 `), 0o644); err != nil {
 		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
 	}
@@ -320,8 +328,9 @@ CFLAGS_core.o := $(call cc-option,-falign-jumps=1) $(call cc-option,-falign-loop
 			got = append(got, flag.Flags...)
 		}
 	}
-	if !reflect.DeepEqual(got, []string{"-falign-loops=1"}) {
-		t.Fatalf("x86_64 alignment flags = %#v, want -falign-loops=1", got)
+	want := []string{"-falign-loops=1", "-mno-fp-ret-in-387", "-mskip-rax-setup"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("x86_64 Makefile flags = %#v, want %#v", got, want)
 	}
 }
 
@@ -394,7 +403,9 @@ CFLAGS_core.o := $(call cc-option,-fno-schedule-insns) \
 	$(call cc-option,-fno-addrsig) \
 	$(call cc-option,-Wold-style-declaration,-Wout-of-line-declaration) \
 	$(call cc-option,-mgeneral-regs-only) \
+	$(call cc-disable-warning,psabi) \
 	$(call cc-disable-warning,unused-but-set-variable) \
+	$(call cc-disable-warning,unused-const-variable) \
 	$(call cc-disable-warning,fortify-source) \
 	$(call cc-disable-warning,unsequenced) \
 	$(call cc-option,-Wvla-larger-than=1) \
@@ -425,7 +436,9 @@ CFLAGS_core.o := $(call cc-option,-fno-schedule-insns) \
 		"-fno-addrsig",
 		"-Wout-of-line-declaration",
 		"-mgeneral-regs-only",
+		"-Wno-psabi",
 		"-Wno-unused-but-set-variable",
+		"-Wno-unused-const-variable",
 		"-Wno-fortify-source",
 		"-Wno-unsequenced",
 		"-Wno-uninitialized",
@@ -434,6 +447,36 @@ CFLAGS_core.o := $(call cc-option,-fno-schedule-insns) \
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("resolved shared-tree flags = %#v, want %#v", got, want)
+	}
+}
+
+func TestKbuildClangCapabilityPolicyResolvesDynamicMacroPrefixMap(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Makefile")
+	if err := os.WriteFile(kbuild, []byte(`obj-y += core.o
+CFLAGS_core.o := $(call cc-option,-fmacro-prefix-map=$(srctree)/=)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Makefile) failed: %v", err)
+	}
+	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{
+			"KBUILD_CFLAGS": "-m64",
+			"SRCARCH":       "x86",
+			"srctree":       dir,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+	var got []string
+	for _, flag := range kb.Flags {
+		if flag.Scope == "object" && flag.Object == "core.o" {
+			got = append(got, flag.Flags...)
+		}
+	}
+	want := []string{"-fmacro-prefix-map=" + dir + "/="}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("dynamic macro prefix-map flags = %#v, want %#v", got, want)
 	}
 }
 
