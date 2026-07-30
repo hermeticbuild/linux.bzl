@@ -1,9 +1,13 @@
 package(default_visibility = ["//:__subpackages__"])
 
+exports_files(
+    ["linux_object_groups.bzl"],
+    visibility = ["//visibility:public"],
+)
+
 filegroup(
     name = "linux_image_extension_integration_files",
     srcs = [
-        "compact_v7_repository.bzl",
         "config_validation.bzl",
         "kconfig_tool_filename.bzl",
         "kconfig_tool_releases.bzl",

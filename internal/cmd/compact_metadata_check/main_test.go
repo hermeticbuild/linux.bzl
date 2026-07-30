@@ -120,6 +120,7 @@ func sparseMetadataDocument() map[string]any {
 			},
 		},
 		"source_input_groups": []any{"1"},
+		"action_groups":       []any{},
 		"object_variants": []any{
 			map[string]any{
 				"target": "init",
@@ -328,6 +329,7 @@ func validContentGraphMetadata() *metadata {
 			{Path: "init/main.c", Digest: sourceDigest},
 		},
 		SourceInputGroups: []string{"1", "2"},
+		ActionGroups:      []actionGroup{},
 		GeneratedHeaderFamilies: []generatedHeaderFamily{{
 			ID:               headerID,
 			Name:             "static",

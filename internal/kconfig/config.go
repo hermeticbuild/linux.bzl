@@ -212,8 +212,7 @@ func IsRustToolchainValue(key string) bool {
 }
 
 // WithoutRustToolchainValues returns a copy with toolchain-owned values
-// removed. Kconfig then obtains them exclusively from configured graph replay
-// and the selected Rust compiler identity.
+// removed. Kconfig then obtains them exclusively from the selected Rust facts.
 func WithoutRustToolchainValues(flags map[string]string) map[string]string {
 	filtered := make(map[string]string, len(flags))
 	for key, value := range flags {

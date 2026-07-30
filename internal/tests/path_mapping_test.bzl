@@ -3,7 +3,7 @@
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
 load(
     "//internal:compact_generator.bzl",
-    "linux_compact_v7_metadata",
+    "linux_compact_buildfiles",
     "linux_kbuild_tree_validation",
     "linux_parser_validation",
 )
@@ -130,15 +130,19 @@ def _compact_path_mapping_test_impl(ctx):
     env = analysistest.begin(ctx)
     action = _action_with_mnemonic(
         analysistest.target_actions(env),
-        "LinuxCompactV7Kconfig",
+        "LinuxCompactKconfig",
     )
     asserts.true(env, action != None)
     if action != None:
-        _assert_mapped_directory_argument(env, action, "-srctree")
         _assert_mapped_srctree_var(env, action)
+        asserts.equals(env, "fixture", _argument_after(action.argv, "-compact_base_config"))
         asserts.equals(env, "linux.bzl/test/x86", _argument_after(action.argv, "-compile_environment_abi"))
-        asserts.true(env, _argument_after(action.argv, "-graph_profile").endswith("graph_profile.json"))
-        asserts.true(env, "-graph_profile_projection_out" in action.argv)
+        asserts.equals(env, "//internal/tests", _argument_after(action.argv, "-source_label_package"))
+        asserts.equals(
+            env,
+            "//internal/tests:" + ctx.attr.source_root_target,
+            _argument_after(action.argv, "-source_root_label"),
+        )
         generated_headers = [
             action.argv[index + 1]
             for index in range(len(action.argv) - 1)
@@ -167,7 +171,12 @@ def _compact_path_mapping_test_impl(ctx):
             asserts.false(env, removed_flag in action.argv)
     return analysistest.end(env)
 
-_compact_path_mapping_test = analysistest.make(_compact_path_mapping_test_impl)
+_compact_path_mapping_test = analysistest.make(
+    _compact_path_mapping_test_impl,
+    attrs = {
+        "source_root_target": attr.string(mandatory = True),
+    },
+)
 
 def _parser_path_mapping_test_impl(ctx):
     env = analysistest.begin(ctx)
@@ -245,18 +254,20 @@ def path_mapping_test(name):
     )
 
     compact = name + "_compact"
-    linux_compact_v7_metadata(
+    linux_compact_buildfiles(
         name = compact,
+        compact_base_config = "fixture",
         compile_environment_abi = "linux.bzl/test/x86",
         configs = {
             ":" + config: "fixture",
         },
-        graph_profile = ":graph_profile.json",
         generated_headers_by_config = {
             "fixture": "//internal/tests:fixture_generated_headers",
         },
         kbuild = ":" + kbuild,
         root = ":" + kconfig,
+        source_label_package = "//internal/tests",
+        source_root_label = "//internal/tests:" + kconfig,
         srcs = [
             ":" + kbuild,
             ":" + kconfig,
@@ -267,8 +278,9 @@ def path_mapping_test(name):
     compact_test = compact + "_path_mapping_test"
     _compact_path_mapping_test(
         name = compact_test,
+        source_root_target = kconfig,
         tags = ["manual"],
-        target_under_test = ":" + compact,
+        target_under_test = ":" + compact + "_generated",
     )
 
     parser = name + "_parser"

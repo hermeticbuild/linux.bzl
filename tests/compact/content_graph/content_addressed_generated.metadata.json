@@ -290,6 +290,35 @@
     }
   ],
   "source_input_groups": ["1,3,4,5", "2,3,4,5", "3,4,5", "3,4,5,6", "3,4,5,7"],
+  "action_groups": [
+    {
+      "id": "136e15e3935ffb89750539713378dd8e1729101c08c480baabcb24927fac8345",
+      "recipe_id": "6712c4dfa25061b874d366183353452e032670841acd7a5d6f3a37281e280ccc",
+      "reachable_configs": ["force_net"],
+      "object_targets": [
+        "drivers_foo__f873ac2a90bc06ca39f68ece",
+        "init__47bf742428be7f1de1adcbd7"
+      ]
+    },
+    {
+      "id": "a7a0b05b3ea1dcc2ba5d66b4fad47a8035408a371b62828d4307766b4f5c6581",
+      "recipe_id": "3b64299886ccbe56198b5b9c7fd58c02b67b0fbfda4276dde235aca709ce2587",
+      "reachable_configs": ["base", "blocked_driver", "debug"],
+      "object_targets": ["init__82c27b17dd3cdf913f91be73"]
+    },
+    {
+      "id": "bb0b00eb039d2d1aa27ac1cb023b7eca129b34bd120c20d1183ba99e53300463",
+      "recipe_id": "3b64299886ccbe56198b5b9c7fd58c02b67b0fbfda4276dde235aca709ce2587",
+      "reachable_configs": ["debug"],
+      "object_targets": ["debug__1c4db1321d2f6cf86c0e0aa6"]
+    },
+    {
+      "id": "d77aeda41a64f791478548cd89dd569cdf68fdbb87f5525bea28b365a5d664c7",
+      "recipe_id": "801331f2d5c5b8ed4866ad1e8f311e025b2b973e74e8e75aa4db0c599f6d95d5",
+      "reachable_configs": ["force_net"],
+      "object_targets": ["net_core__5e56eb57a5c6a218965d3d01"]
+    }
+  ],
   "object_variants": [
     {
       "target": "debug__1c4db1321d2f6cf86c0e0aa6",

@@ -27,7 +27,18 @@ def _sanitizer_compile_action_test_impl(ctx):
     asserts.equals(env, 1, len(actions))
     if actions:
         action = actions[0]
-        asserts.true(env, "-flags_file" in action.argv)
+        ignorelist_flags = [
+            arg
+            for arg in action.argv
+            if arg.startswith("-fsanitize-ignorelist=")
+        ]
+        asserts.equals(env, 1, len(ignorelist_flags))
+        if ignorelist_flags:
+            asserts.true(
+                env,
+                ignorelist_flags[0].endswith("/scripts/integer-wrap-ignore.scl"),
+                "unexpected integer-wrap ignorelist flag %s" % ignorelist_flags[0],
+            )
         asserts.true(
             env,
             _has_input_suffix(action, "/scripts/integer-wrap-ignore.scl"),
@@ -42,7 +53,7 @@ def _sanitizer_compile_action_test_impl(ctx):
 
 _sanitizer_compile_action_test = analysistest.make(_sanitizer_compile_action_test_impl)
 
-def sanitizer_actions_test(name, empty_program, flag_program, flag_programs):
+def sanitizer_actions_test(name):
     compile_environment_index = name + "_compile_environment_index"
     source_tree = name + "_source_tree"
     source_input_index = name + "_source_input_index"
@@ -88,13 +99,12 @@ def sanitizer_actions_test(name, empty_program, flag_program, flag_programs):
         compile_environment_id = compile_environment_id,
         compile_environment_index = ":" + compile_environment_index,
         content_id = object_id,
-        flag_program = flag_program,
-        flag_programs = flag_programs,
+        flags = [
+            "-DINTEGER_WRAP",
+            "-fsanitize-ignorelist=$(srctree)/scripts/integer-wrap-ignore.scl",
+        ],
         mode = "y",
-        needs_object_dir = False,
-        needs_utsversion_tmp = False,
         object = "test.o",
-        remove_flag_program = empty_program,
         source_input_file = 2,
         source_input_group = 1,
         source_input_index = ":" + source_input_index,

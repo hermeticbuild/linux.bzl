@@ -1,9 +1,7 @@
 exports_files([
     "Kconfig",
     "base.config",
-    "graph_profile.json",
     "debug.config",
-    "platform",
 ])
 
 filegroup(

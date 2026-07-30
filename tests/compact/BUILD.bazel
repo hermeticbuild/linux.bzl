@@ -1,4 +1,5 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("//internal:compact_generator.bzl", "linux_compact_buildfiles")
 load(
     ":content_graph_test.bzl",
     "config_payload_batch_test",
@@ -8,27 +9,6 @@ load(
 load(":fake_linux_objects.bzl", "linux_compile_environment_index")
 
 package(default_visibility = ["//:__subpackages__"])
-
-exports_files(
-    [
-        "Kbuild",
-        "arch/x86/kernel/vmlinux.lds.S",
-        "base.config",
-        "content_graph.Kconfig",
-        "debug.c",
-        "debug.config",
-        "drivers/foo.c",
-        "include/linux/compiler-version.h",
-        "include/linux/compiler_types.h",
-        "include/linux/kconfig.h",
-        "init.c",
-        "net/core.c",
-    ],
-    visibility = [
-        "//internal/tests:__pkg__",
-        "//tests/compact:__subpackages__",
-    ],
-)
 
 _CONTENT_GRAPH_HEADER_FAMILY_IDS = {
     "all": "9a2f9c3cb46e2ff5959f7b21012560bb2c01c04d34d28e57012262467f808fde",
@@ -78,6 +58,66 @@ linux_compile_environment_index(
     },
     expected_abi = "linux.bzl/test/x86",
     tags = ["manual"],
+)
+
+linux_compact_buildfiles(
+    name = "content_addressed",
+    srcs = [
+        "debug.c",
+        "drivers/foo.c",
+        "include/linux/compiler-version.h",
+        "include/linux/compiler_types.h",
+        "include/linux/kconfig.h",
+        "init.c",
+        "net/core.c",
+    ],
+    compact_base_config = "base",
+    compile_environment_abi = "linux.bzl/test/x86",
+    configs = {
+        "base.config": "base",
+        "blocked_driver.config": "blocked_driver",
+        "debug.config": "debug",
+        "force_net.config": "force_net",
+    },
+    generated_headers_by_config = {
+        "base": "//tests/compact:base_generated_headers",
+        "blocked_driver": "//tests/compact:blocked_driver_generated_headers",
+        "debug": "//tests/compact:debug_generated_headers",
+        "force_net": "//tests/compact:force_net_generated_headers",
+    },
+    kbuild = "Kbuild",
+    linux_objects_load = "//tests/compact:fake_linux_objects.bzl",
+    object_label_package = "tests/compact/content_graph",
+    out_buildfile = "content_graph/BUILD.bazel",
+    out_metadata = "content_graph/content_addressed_generated.metadata.json",
+    root = "content_graph.Kconfig",
+    source_label_package = "//tests/compact",
+    source_root_label = "//tests/compact:content_graph.Kconfig",
+    vars = {
+        "ARCH": "x86",
+        "SRCARCH": "x86",
+    },
+)
+
+genrule(
+    name = "content_addressed_check",
+    srcs = [":content_addressed_metadata"],
+    outs = ["content_addressed_check.txt"],
+    cmd = "$(location //internal/cmd/compact_metadata_check) " +
+          "-metadata $(location :content_addressed_metadata) " +
+          "-summary " +
+          "-max_object_variants 5 " +
+          "-share base:blocked_driver:init.o " +
+          "-share base:debug:init.o " +
+          "-differ base:force_net:init.o " +
+          "-absent base:debug.o " +
+          "-present debug:debug.o > $@",
+    tools = ["//internal/cmd/compact_metadata_check"],
+)
+
+build_test(
+    name = "content_addressed_check_test",
+    targets = [":content_addressed_check"],
 )
 
 build_test(

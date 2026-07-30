@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
-	"sort"
 	"strings"
 	"testing"
 
@@ -87,6 +86,127 @@ func TestCompactMetadataSharesUnrelatedObjectVariants(t *testing.T) {
 	}
 	if objectTarget(metadata, debug, "debug.o") == "" {
 		t.Fatalf("debug config does not include debug.o")
+	}
+}
+
+func TestCompactActionGroupsUseConcreteRecipeAndReachability(t *testing.T) {
+	variant := func(target, contentID, flags string) CompactObjectVariant {
+		return CompactObjectVariant{
+			Target:    target,
+			ContentID: strings.Repeat(contentID, 64),
+			Object:    target + ".o",
+			Source:    target + ".c",
+			Mode:      "y",
+			Flags:     []string{flags},
+		}
+	}
+	metadata := &CompactMetadata{
+		Configs: []CompactConfig{
+			{Name: "base", ObjectTargets: []string{"shared_a", "shared_b"}},
+			{Name: "lz4", ObjectTargets: []string{"shared_a", "shared_b"}},
+			{Name: "debug", ObjectTargets: []string{"shared_a", "shared_b", "debug"}},
+			{Name: "btf", ObjectTargets: []string{"btf"}},
+		},
+		ObjectVariants: []CompactObjectVariant{
+			variant("shared_a", "1", "-DCOMMON"),
+			variant("shared_b", "2", "-DCOMMON"),
+			variant("debug", "3", "-DCOMMON"),
+			variant("btf", "4", "-DBTF"),
+			variant("unreachable", "5", "-DCOMMON"),
+		},
+	}
+	groups, err := metadata.deriveActionGroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(groups), 3; got != want {
+		t.Fatalf("action group count = %d, want %d: %#v", got, want, groups)
+	}
+	owners := map[string]CompactActionGroup{}
+	for _, group := range groups {
+		for _, target := range group.ObjectTargets {
+			owners[target] = group
+		}
+	}
+	if _, ok := owners["unreachable"]; ok {
+		t.Fatal("unreachable object received an action group")
+	}
+	if owners["shared_a"].ID != owners["shared_b"].ID {
+		t.Fatalf("same concrete recipe/reachability did not group: %#v", groups)
+	}
+	if got, want := owners["shared_a"].ReachableConfigs, []string{"base", "debug", "lz4"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("shared reachability = %v, want %v", got, want)
+	}
+	if owners["debug"].ID == owners["shared_a"].ID {
+		t.Fatal("different reachability collapsed into one action group")
+	}
+	if owners["btf"].RecipeID == owners["shared_a"].RecipeID {
+		t.Fatal("different concrete flags collapsed into one recipe")
+	}
+}
+
+func TestCompactActionGroupRuleNameIgnoresMembership(t *testing.T) {
+	first := CompactActionGroup{
+		ID:               strings.Repeat("a", 64),
+		RecipeID:         strings.Repeat("1", 64),
+		ReachableConfigs: []string{"base", "lz4"},
+		ObjectTargets:    []string{"first"},
+	}
+	second := CompactActionGroup{
+		ID:               strings.Repeat("b", 64),
+		RecipeID:         first.RecipeID,
+		ReachableConfigs: append([]string(nil), first.ReachableConfigs...),
+		ObjectTargets:    []string{"first", "second"},
+	}
+	if got, want := compactActionGroupRuleName(second), compactActionGroupRuleName(first); got != want {
+		t.Fatalf("membership change renamed action group: got %q, want %q", got, want)
+	}
+
+	second.RecipeID = strings.Repeat("2", 64)
+	if compactActionGroupRuleName(second) == compactActionGroupRuleName(first) {
+		t.Fatal("different recipes produced the same action-group rule name")
+	}
+}
+
+func TestCompactGroupedCompileFallbackCoversSpecialActionShapes(t *testing.T) {
+	base := CompactObjectVariant{
+		Target: "object",
+		Object: "object.o",
+		Source: "object.c",
+		Mode:   "y",
+		Flags:  []string{"-Wall"},
+	}
+	tests := map[string]func(*CompactObjectVariant){
+		"generated header dependency": func(v *CompactObjectVariant) { v.Deps = []string{"generated"} },
+		"remove flags":                func(v *CompactObjectVariant) { v.RemoveFlags = []string{"-pg"} },
+		"generated object":            func(v *CompactObjectVariant) { v.Object = "arch/x86/kernel/cpu/capflags.o" },
+		"certificate fail closed":     func(v *CompactObjectVariant) { v.Object = "certs/system_certificates.o" },
+		"perlasm":                     func(v *CompactObjectVariant) { v.Object = "lib/crypto/arm64/sha256-core.o" },
+		"asn1":                        func(v *CompactObjectVariant) { v.Object = "security/keys/foo.asn1.o" },
+		"post compile objcopy":        func(v *CompactObjectVariant) { v.Object = "arch/arm64/kernel/foo.pi.o" },
+		"shipped source":              func(v *CompactObjectVariant) { v.Source = "object.c_shipped" },
+		"unsupported source":          func(v *CompactObjectVariant) { v.Source = "object.dts" },
+		"object local directory":      func(v *CompactObjectVariant) { v.Flags = []string{"-I$(obj)"} },
+		"temporary version header":    func(v *CompactObjectVariant) { v.Flags = []string{"-include", "utsversion-tmp.h"} },
+		"module LTO root": func(v *CompactObjectVariant) {
+			v.Mode = "m"
+			v.ModuleRoot = true
+			v.configFragment = map[string]string{"CONFIG_LTO_CLANG": "y"}
+		},
+		"forced module LTO objtool": func(v *CompactObjectVariant) {
+			v.Mode = "m"
+			v.ObjtoolForce = true
+			v.configFragment = map[string]string{"CONFIG_LTO_CLANG": "y"}
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			variant := base
+			mutate(&variant)
+			if reason := (&CompactMetadata{}).groupedCompileFallbackReason(variant); reason == "" {
+				t.Fatalf("special action shape was incorrectly accepted for direct grouping: %#v", variant)
+			}
+		})
 	}
 }
 
@@ -489,19 +609,29 @@ OBJECT_FILES_NON_STANDARD_efi.o := n
 	if err != nil {
 		t.Fatalf("generated object BUILD did not parse: %v\n%s", err, objectBuild)
 	}
-	if got := parsed.RuleNamed(head.Target).AttrString("objtool"); got != "" {
+	plan, err := metadata.actionGraphPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleFor := func(target string) *build.Rule {
+		if plan.LegacyTargets[target] {
+			return parsed.RuleNamed(target)
+		}
+		return parsed.RuleNamed(plan.GroupNameByTarget[target])
+	}
+	if got := ruleFor(head.Target).AttrString("objtool"); got != "" {
 		t.Fatalf("head.o objtool = %q, want omitted", got)
 	}
-	if got := parsed.RuleNamed(normal.Target).AttrString("objtool"); got != "//linux:objtool" {
+	if got := ruleFor(normal.Target).AttrString("objtool"); got != "//linux:objtool" {
 		t.Fatalf("normal.o objtool = %q, want //linux:objtool", got)
 	}
-	if got := parsed.RuleNamed(module.Target).AttrString("objtool"); got != "" {
+	if got := ruleFor(module.Target).AttrString("objtool"); got != "" {
 		t.Fatalf("module.o objtool = %q, want module-root processing only", got)
 	}
-	if !module.ModuleRoot || parsed.RuleNamed(module.Target).AttrLiteral("module_root") != "True" {
+	if !module.ModuleRoot || ruleFor(module.Target).AttrLiteral("module_root") != "True" {
 		t.Fatalf("module.o did not preserve its single-module root marker")
 	}
-	if got := parsed.RuleNamed(startup.Target).AttrStrings("objtool_args"); !reflect.DeepEqual(got, []string{"--noabs"}) {
+	if got := ruleFor(startup.Target).AttrStrings("objtool_args"); !reflect.DeepEqual(got, []string{"--noabs"}) {
 		t.Fatalf("startup.pi.o objtool_args = %q, want [--noabs]", got)
 	}
 	if !strings.Contains(string(objectBuild), "objtool_force = True") {
@@ -725,23 +855,33 @@ forced.o: objtool-args = --custom
 	if err != nil {
 		t.Fatalf("generated object BUILD did not parse: %v\n%s", err, objectBuild)
 	}
-	singleRule := parsed.RuleNamed(single.Target)
-	if singleRule.Kind() != "linux_object" ||
+	plan, err := metadata.actionGraphPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleFor := func(target string) *build.Rule {
+		if plan.LegacyTargets[target] {
+			return parsed.RuleNamed(target)
+		}
+		return parsed.RuleNamed(plan.GroupNameByTarget[target])
+	}
+	singleRule := ruleFor(single.Target)
+	if singleRule.Kind() != "linux_object_action_group" ||
 		singleRule.AttrLiteral("module_root") != "True" ||
 		singleRule.AttrString("objtool") != "//linux:objtool" {
 		t.Fatalf("single.o rule does not carry single-module objtool metadata:\n%s", objectBuild)
 	}
-	multiRule := parsed.RuleNamed(multi.Target)
-	if multiRule.Kind() != "linux_composite_object" || multiRule.AttrLiteral("module_root") != "True" {
+	multiRule := ruleFor(multi.Target)
+	if multiRule.Kind() != "linux_composite_object_action_group" || multiRule.AttrLiteral("module_root") != "True" {
 		t.Fatalf("multi.o rule does not carry composite-module metadata:\n%s", objectBuild)
 	}
-	if got := parsed.RuleNamed(member.Target).AttrString("objtool"); got != "//linux:objtool" {
+	if got := ruleFor(member.Target).AttrString("objtool"); got != "//linux:objtool" {
 		t.Fatalf("member.o objtool = %q, want //linux:objtool", got)
 	}
-	if got := parsed.RuleNamed(skipped.Target).AttrString("objtool"); got != "" {
+	if got := ruleFor(skipped.Target).AttrString("objtool"); got != "" {
 		t.Fatalf("skipped.o objtool = %q, want omitted", got)
 	}
-	forcedRule := parsed.RuleNamed(forced.Target)
+	forcedRule := ruleFor(forced.Target)
 	if forcedRule.AttrLiteral("objtool_force") != "True" ||
 		!reflect.DeepEqual(forcedRule.AttrStrings("objtool_args"), []string{"--custom"}) {
 		t.Fatalf("forced.o rule does not preserve custom objtool settings:\n%s", objectBuild)
@@ -1033,419 +1173,6 @@ obj-$(CONFIG_RUST) += rust/
 	}
 }
 
-func TestCompactConfigSupportSourcesOwnVmlinuxLinkerClosure(t *testing.T) {
-	tests := []struct {
-		name       string
-		srcarch    string
-		include    string
-		headerPath string
-	}{
-		{
-			name:       "arm64 asm kexec",
-			srcarch:    "arm64",
-			include:    "asm/kexec.h",
-			headerPath: "arch/arm64/include/asm/kexec.h",
-		},
-		{
-			name:       "x86 generic linker header",
-			srcarch:    "x86",
-			include:    "asm-generic/vmlinux.lds.h",
-			headerPath: "include/asm-generic/vmlinux.lds.h",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			tree := mustParseString(t, `
-mainmenu "Support source ownership"
-
-config EXTRA_LINKER_HEADER
-	bool "Extra linker header"
-`)
-			kb, err := ParseKbuild(strings.NewReader("obj-y += init.o\n"), "Kbuild")
-			if err != nil {
-				t.Fatalf("ParseKbuild() failed: %v", err)
-			}
-			sourceRoot := t.TempDir()
-			writeCompactContentGraphForcedInputs(t, sourceRoot)
-			mustWriteSource(t, sourceRoot, "init.c", "int init_value;\n")
-			linkerScript := "arch/" + test.srcarch + "/kernel/vmlinux.lds.S"
-			mustWriteSource(
-				t,
-				sourceRoot,
-				linkerScript,
-				"#ifdef LINKER_SCRIPT\n#ifdef CONFIG_EXTRA_LINKER_HEADER\n#include <"+test.include+">\n#endif\n#else\n#include <inactive-linker.h>\n#endif\n",
-			)
-			mustWriteSource(t, sourceRoot, test.headerPath, "#define LINKER_HEADER 1\n")
-			mustWriteSource(t, sourceRoot, "include/inactive-linker.h", "#define INACTIVE_LINKER_HEADER 1\n")
-
-			metadata, err := compactMetadataBatchWithOptionsForTest(
-				t,
-				tree,
-				kb,
-				[]NamedConfig{
-					{Name: "off"},
-					{
-						Name: "on",
-						Flags: map[string]string{
-							"CONFIG_EXTRA_LINKER_HEADER": "y",
-						},
-					},
-				},
-				CompactMetadataOptions{
-					SourceRoot:                 sourceRoot,
-					Srcarch:                    test.srcarch,
-					CompileEnvironmentABI:      "support-source-test",
-					collectSupportSourceInputs: true,
-				},
-			)
-			if err != nil {
-				t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
-			}
-
-			off := configByName(metadata, "off")
-			on := configByName(metadata, "on")
-			if reflect.DeepEqual(off.supportSourceInputs, on.supportSourceInputs) {
-				t.Fatalf(
-					"config-aware linker closure did not split support inputs: %v",
-					off.supportSourceInputs,
-				)
-			}
-			for _, config := range []*CompactConfig{off, on} {
-				supportInputs := config.supportSourceInputs
-				for _, path := range []string{linkerScript, "include/linux/kconfig.h"} {
-					if sourceInputByPath(supportInputs, path).Path == "" {
-						t.Errorf("%s support inputs omit %q: %v", config.Name, path, supportInputs)
-					}
-				}
-				gotHeader := sourceInputByPath(supportInputs, test.headerPath).Path != ""
-				if wantHeader := config.Name == "on"; gotHeader != wantHeader {
-					t.Errorf(
-						"%s support inputs contain %q = %t, want %t: %v",
-						config.Name,
-						test.headerPath,
-						gotHeader,
-						wantHeader,
-						supportInputs,
-					)
-				}
-				if sourceInputByPath(supportInputs, "include/inactive-linker.h").Path != "" {
-					t.Errorf(
-						"%s support inputs retain inactive !LINKER_SCRIPT branch: %v",
-						config.Name,
-						supportInputs,
-					)
-				}
-
-				init := variantByTarget(metadata, objectTarget(metadata, config, "init.o"))
-				objectInputs, err := metadata.expandedSourceInputGroup(
-					init.SourceInputGroup,
-					"init.o source ownership test",
-				)
-				if err != nil {
-					t.Fatal(err)
-				}
-				for _, path := range []string{linkerScript, test.headerPath} {
-					if sourceInputByPath(objectInputs, path).Path != "" {
-						t.Errorf("init.o incidentally owns final-action source %q: %v", path, objectInputs)
-					}
-				}
-			}
-			data, err := metadata.JSON()
-			if err != nil {
-				t.Fatalf("eager metadata JSON() failed: %v", err)
-			}
-			if strings.Contains(string(data), "support_source") {
-				t.Fatalf("eager metadata JSON leaked v7-only support ownership: %s", data)
-			}
-		})
-	}
-}
-
-func TestCompactConfigSupportSourcesOwnRustSDKActionClosures(t *testing.T) {
-	tree := mustParseString(t, `
-mainmenu "Rust support source ownership"
-
-config RUST
-	bool "Rust"
-
-config JUMP_LABEL
-	bool "Jump labels"
-
-config BUG
-	bool "Bug support"
-`)
-	kb, err := ParseKbuild(strings.NewReader("obj-y += init.o\n"), "Kbuild")
-	if err != nil {
-		t.Fatalf("ParseKbuild() failed: %v", err)
-	}
-	sourceRoot := rustProfileFixture(t, true)
-	writeCompactContentGraphForcedInputs(t, sourceRoot)
-	mustWriteSource(t, sourceRoot, "init.c", "int init_value;\n")
-	mustWriteSource(
-		t,
-		sourceRoot,
-		"include/linux/kconfig.h",
-		"#include <generated/autoconf.h>\n",
-	)
-	mustWriteSource(
-		t,
-		sourceRoot,
-		"rust/bindings/bindings_helper.h",
-		`#ifdef __BINDGEN__
-#include <linux/rust_bindings_only.h>
-#else
-#include <linux/rust_bindings_wrong_profile.h>
-#endif
-`,
-	)
-	mustWriteSource(
-		t,
-		sourceRoot,
-		"rust/uapi/uapi_helper.h",
-		"#include <linux/rust_uapi_only.h>\n",
-	)
-	mustWriteSource(
-		t,
-		sourceRoot,
-		"rust/helpers/helpers.c",
-		`#include <linux/auxiliary_bus.h>
-#ifdef __BINDGEN__
-#include <linux/rust_bindgen_only.h>
-#else
-#include <linux/rust_compile_only.h>
-#endif
-`,
-	)
-	mustWriteSource(
-		t,
-		sourceRoot,
-		"rust/exports.c",
-		`#include "exports_core_generated.h"
-#ifdef __BINDGEN__
-#include <linux/rust_exports_wrong_profile.h>
-#else
-#include <linux/rust_exports_only.h>
-#endif
-`,
-	)
-	mustWriteSource(
-		t,
-		sourceRoot,
-		"rust/kernel/generated_arch_static_branch_asm.rs.S",
-		`#ifdef __ASSEMBLY__
-#include <linux/rust_generated_wrong_profile.h>
-#else
-#include <linux/rust_generated_static.h>
-#endif
-`,
-	)
-	mustWriteSource(
-		t,
-		sourceRoot,
-		"rust/kernel/generated_arch_warn_asm.rs.S",
-		"#include <linux/rust_generated_warn.h>\n",
-	)
-	mustWriteSource(
-		t,
-		sourceRoot,
-		"rust/kernel/generated_arch_reachable_asm.rs.S",
-		"#include <linux/rust_generated_reachable.h>\n",
-	)
-	mustWriteSource(
-		t,
-		sourceRoot,
-		"include/linux/auxiliary_bus.h",
-		"#define AUXILIARY_BUS 1\n",
-	)
-	mustWriteSource(t, sourceRoot, "include/linux/rust_bindgen_only.h", "\n")
-	mustWriteSource(t, sourceRoot, "include/linux/rust_compile_only.h", "\n")
-	for _, path := range []string{
-		"include/linux/rust_bindings_only.h",
-		"include/linux/rust_bindings_wrong_profile.h",
-		"include/linux/rust_uapi_only.h",
-		"include/linux/rust_exports_only.h",
-		"include/linux/rust_exports_wrong_profile.h",
-		"include/linux/rust_generated_static.h",
-		"include/linux/rust_generated_warn.h",
-		"include/linux/rust_generated_reachable.h",
-		"include/linux/rust_generated_wrong_profile.h",
-	} {
-		mustWriteSource(t, sourceRoot, path, "\n")
-	}
-
-	configs := []NamedConfig{
-		{Name: "off"},
-		{Name: "rust", Flags: map[string]string{"CONFIG_RUST": "y"}},
-		{Name: "generated", Flags: map[string]string{
-			"CONFIG_BUG":        "y",
-			"CONFIG_JUMP_LABEL": "y",
-			"CONFIG_RUST":       "y",
-		}},
-	}
-	opts := CompactMetadataOptions{
-		SourceRoot:                 sourceRoot,
-		Srcarch:                    "x86",
-		CompileEnvironmentABI:      "rust-support-source-test",
-		collectSupportSourceInputs: true,
-	}
-	metadata, err := compactMetadataBatchWithOptionsForTest(
-		t,
-		tree,
-		kb,
-		configs,
-		opts,
-	)
-	if err != nil {
-		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
-	}
-
-	off := configByName(metadata, "off")
-	rust := configByName(metadata, "rust")
-	generated := configByName(metadata, "generated")
-	if reflect.DeepEqual(off.supportSourceInputs, rust.supportSourceInputs) {
-		t.Fatalf(
-			"Rust enablement did not split support inputs: %v",
-			off.supportSourceInputs,
-		)
-	}
-	for _, config := range []*CompactConfig{off, rust, generated} {
-		supportInputs := config.supportSourceInputs
-		for _, path := range []string{
-			"rust/bindings/bindings_helper.h",
-			"rust/uapi/uapi_helper.h",
-			"rust/bindgen_parameters",
-			"rust/helpers/helpers.c",
-			"rust/exports.c",
-			"include/linux/auxiliary_bus.h",
-			"include/linux/rust_bindings_only.h",
-			"include/linux/rust_uapi_only.h",
-			"include/linux/rust_bindgen_only.h",
-			"include/linux/rust_compile_only.h",
-			"include/linux/rust_exports_only.h",
-		} {
-			got := sourceInputByPath(supportInputs, path).Path != ""
-			if want := config.Name != "off"; got != want {
-				t.Errorf(
-					"%s support inputs contain %q = %t, want %t: %v",
-					config.Name,
-					path,
-					got,
-					want,
-					supportInputs,
-				)
-			}
-		}
-		for _, path := range []string{
-			"rust/kernel/generated_arch_static_branch_asm.rs.S",
-			"rust/kernel/generated_arch_warn_asm.rs.S",
-			"rust/kernel/generated_arch_reachable_asm.rs.S",
-			"include/linux/rust_generated_static.h",
-			"include/linux/rust_generated_warn.h",
-			"include/linux/rust_generated_reachable.h",
-		} {
-			got := sourceInputByPath(supportInputs, path).Path != ""
-			if want := config.Name == "generated"; got != want {
-				t.Errorf(
-					"%s support inputs contain generated path %q = %t, want %t: %v",
-					config.Name,
-					path,
-					got,
-					want,
-					supportInputs,
-				)
-			}
-		}
-		for _, path := range []string{
-			"include/linux/rust_bindings_wrong_profile.h",
-			"include/linux/rust_exports_wrong_profile.h",
-			"include/linux/rust_generated_wrong_profile.h",
-		} {
-			if sourceInputByPath(supportInputs, path).Path != "" {
-				t.Errorf("%s support inputs contain inactive profile path %q: %v", config.Name, path, supportInputs)
-			}
-		}
-		if sourceInputByPath(supportInputs, "include/linux/kconfig.h").Path == "" {
-			t.Errorf("%s support inputs omit forced Kconfig header: %v", config.Name, supportInputs)
-		}
-		if sourceInputByPath(supportInputs, "include/linux/compiler_types.h").Path == "" &&
-			config.Name != "off" {
-			t.Errorf("%s support inputs omit forced C compiler types header: %v", config.Name, supportInputs)
-		}
-		init := variantByTarget(metadata, objectTarget(metadata, config, "init.o"))
-		objectInputs, err := metadata.expandedSourceInputGroup(
-			init.SourceInputGroup,
-			"Rust support init.o ownership test",
-		)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if sourceInputByPath(objectInputs, "include/linux/auxiliary_bus.h").Path != "" {
-			t.Errorf("init.o incidentally owns Rust helper header: %v", objectInputs)
-		}
-	}
-
-	v7Options := opts
-	v7Options.collectSupportSourceInputs = false
-	v7, err := tree.CompactMetadataBatchV7WithOptions(
-		configs,
-		CompactMetadataV7Options{
-			CompactMetadataOptions: v7Options,
-			ToolchainProfileID:     "llvm-test/x86",
-		},
-		func(config *ResolvedConfig) (CompactConfigGraph, error) {
-			return CompactConfigGraph{
-				Kbuild:                kb,
-				GeneratedHeadersLabel: "//internal/kconfig:test_generated_headers_" + sanitizeTargetName(config.Name),
-			}, nil
-		},
-	)
-	if err != nil {
-		t.Fatalf("CompactMetadataBatchV7WithOptions() failed: %v", err)
-	}
-	for _, config := range v7.Configs {
-		files := compactV7ExpandedSetForTest(t, v7, config.SupportSourceSet)
-		hasAuxiliaryBus := false
-		for index := range files {
-			if v7.SourceFiles[index-1].Path == "include/linux/auxiliary_bus.h" {
-				hasAuxiliaryBus = true
-				break
-			}
-		}
-		if want := config.Name != "off"; hasAuxiliaryBus != want {
-			t.Errorf(
-				"compact-v7 %s support set contains auxiliary_bus.h = %t, want %t",
-				config.Name,
-				hasAuxiliaryBus,
-				want,
-			)
-		}
-	}
-
-	savedSet := v7.Configs[0].SupportSourceSet
-	v7.Configs[0].SupportSourceSet = strings.Repeat("f", 64)
-	if err := v7.validate(); err == nil ||
-		!strings.Contains(err.Error(), "references unknown support source set") {
-		t.Fatalf("compact-v7 unknown support set validation error = %v", err)
-	}
-	v7.Configs[0].SupportSourceSet = savedSet
-
-	deadInput := CompactSourceInput{
-		Path:   "zzzz/dead-support.h",
-		Digest: strings.Repeat("d", 64),
-	}
-	v7.SourceFiles = append(v7.SourceFiles, deadInput)
-	deadSet := CompactSourceSet{Files: []int{len(v7.SourceFiles)}}
-	deadSet.ID = compactV7SourceSetContentID([]CompactSourceInput{deadInput}, nil)
-	v7.SourceSets = append(v7.SourceSets, deadSet)
-	sort.Slice(v7.SourceSets, func(i, j int) bool {
-		return v7.SourceSets[i].ID < v7.SourceSets[j].ID
-	})
-	if err := v7.validate(); err == nil ||
-		!strings.Contains(err.Error(), "source set "+deadSet.ID+" is not referenced") {
-		t.Fatalf("compact-v7 dead support set liveness error = %v", err)
-	}
-}
-
 func TestCompactMetadataKeepsNestedArchiveDirectoriesRootRelative(t *testing.T) {
 	tree := mustParseCompactFixture(t)
 	dir := t.TempDir()
@@ -1577,9 +1304,21 @@ func TestCompactBuildFilesParse(t *testing.T) {
 	}
 
 	if !strings.Contains(string(objectBuild), `load("//rules:linux_objects.bzl"`) ||
-		!strings.Contains(string(objectBuild), `"linux_object"`) ||
-		!strings.Contains(string(objectBuild), `"linux_compact_image"`) {
+		!strings.Contains(string(objectBuild), `load("//rules:linux_object_groups.bzl"`) ||
+		!strings.Contains(string(objectBuild), `"linux_object_action_group"`) ||
+		!strings.Contains(string(objectBuild), `"linux_grouped_compact_image"`) {
 		t.Fatalf("object BUILD does not use custom compact rule load label:\n%s", objectBuild)
+	}
+	for _, unused := range []string{
+		`"linux_arm64_nvhe_object"`,
+		`"linux_composite_object"`,
+		`"linux_composite_object_action_group"`,
+		`"linux_object"`,
+		`"linux_object_action_group_import"`,
+	} {
+		if strings.Contains(string(objectBuild), unused) {
+			t.Fatalf("object BUILD loads unused rule %s:\n%s", unused, objectBuild)
+		}
 	}
 
 	imageBuild, err := metadata.imageBuildFile(CompactBuildFileOptions{
@@ -1596,8 +1335,8 @@ func TestCompactBuildFilesParse(t *testing.T) {
 	if !strings.Contains(string(imageBuild), `"//linux/objects:`) {
 		t.Fatalf("image BUILD does not reference object package:\n%s", imageBuild)
 	}
-	if !strings.Contains(string(imageBuild), `load("//rules:linux_objects.bzl"`) ||
-		!strings.Contains(string(imageBuild), `"linux_compact_image"`) {
+	if !strings.Contains(string(imageBuild), `load("//rules:linux_object_groups.bzl"`) ||
+		!strings.Contains(string(imageBuild), `"linux_grouped_compact_image"`) {
 		t.Fatalf("image BUILD does not use custom compact rule load label:\n%s", imageBuild)
 	}
 	if strings.Contains(string(imageBuild), "require_real") {
@@ -1799,9 +1538,16 @@ func TestCompactContentGraphObjectBuildUsesOneExactCompileEnvironmentIndex(t *te
 	if !strings.Contains(text, `"//headers:a_debug"`) || strings.Contains(text, `"//headers:z_base"`) {
 		t.Fatalf("generated headers did not select the canonical shared label:\n%s", objectBuild)
 	}
-	initRule := parsed.RuleNamed(baseInit)
+	plan, err := metadata.actionGraphPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initRule := parsed.RuleNamed(plan.GroupNameByTarget[baseInit])
 	if initRule == nil {
-		t.Fatalf("generated object BUILD has no init rule %q:\n%s", baseInit, objectBuild)
+		t.Fatalf("generated object BUILD has no init action group for %q:\n%s", baseInit, objectBuild)
+	}
+	if initRule.Kind() != "linux_object_action_group" {
+		t.Fatalf("init action owner kind = %q, want linux_object_action_group", initRule.Kind())
 	}
 	for _, attr := range []string{"src", "source_includes", "source_includes_complete", "config_fragment"} {
 		if initRule.Attr(attr) != nil {
@@ -1811,24 +1557,22 @@ func TestCompactContentGraphObjectBuildUsesOneExactCompileEnvironmentIndex(t *te
 	if got := initRule.AttrString("source_input_index"); got != ":_source_input_index" {
 		t.Fatalf("init source_input_index = %q", got)
 	}
-	if got := initRule.AttrLiteral("source_input_group"); got != fmt.Sprintf("%d", initVariant.SourceInputGroup) {
-		t.Fatalf("init source_input_group = %q, want %d", got, initVariant.SourceInputGroup)
-	}
 	sourceFile, err := metadata.sourceFileIndex(initVariant.Source)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := initRule.AttrLiteral("source_input_file"); got != fmt.Sprintf("%d", sourceFile) {
-		t.Fatalf("init source_input_file = %q, want %d", got, sourceFile)
-	}
 	if got := initRule.AttrString("compile_environment_index"); got != ":_compile_environment_index" {
 		t.Fatalf("init compile_environment_index = %q", got)
 	}
-	if got := initRule.AttrString("compile_environment_id"); got != initVariant.CompileEnvironment {
-		t.Fatalf("init compile_environment_id = %q, want %q", got, initVariant.CompileEnvironment)
-	}
-	if got := initRule.AttrString("content_id"); got != initVariant.ContentID {
-		t.Fatalf("init content_id = %q, want %q", got, initVariant.ContentID)
+	for _, want := range []string{
+		initVariant.CompileEnvironment,
+		initVariant.ContentID,
+		fmt.Sprintf(`\"source_input_file\":%d`, sourceFile),
+		fmt.Sprintf(`\"source_input_group\":%d`, initVariant.SourceInputGroup),
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("grouped init object spec omits %q:\n%s", want, objectBuild)
+		}
 	}
 }
 
@@ -3200,7 +2944,7 @@ obj-y += init.o
 			nil,
 			root,
 			nil,
-			"linux.bzl/eager-metadata/test",
+			"linux.bzl/compact-v6/test",
 			nil,
 		)
 	}
@@ -3399,7 +3143,7 @@ func TestCompactImageRulesAliasesDuplicateObjectSets(t *testing.T) {
 	}
 }
 
-func TestCompactContentGraphImageBuildEmitsBaseRelativeDelta(t *testing.T) {
+func TestCompactContentGraphImageBuildEmitsGroupedConfigProjections(t *testing.T) {
 	id := func(value string) string {
 		t.Helper()
 		return strings.Repeat(value, 64)
@@ -3423,12 +3167,6 @@ func TestCompactContentGraphImageBuildEmitsBaseRelativeDelta(t *testing.T) {
 				ObjectTargets:       []string{"a", "b"},
 				ModuleObjectTargets: []string{"n", "m"},
 				imageTarget:         "module_reorder_image",
-			},
-			{
-				Name:                "add_only",
-				ObjectTargets:       []string{"a", "c", "b"},
-				ModuleObjectTargets: []string{"m", "n"},
-				imageTarget:         "add_only_image",
 			},
 			{
 				Name:                "overlay",
@@ -3458,54 +3196,35 @@ func TestCompactContentGraphImageBuildEmitsBaseRelativeDelta(t *testing.T) {
 		t.Fatalf("generated image BUILD did not parse: %v\n%s", err, imageBuild)
 	}
 	base := parsed.RuleNamed("base_image")
-	if base == nil || base.Kind() != "linux_compact_image" {
-		t.Fatalf("base image is not a linux_compact_image:\n%s", imageBuild)
+	if base == nil || base.Kind() != "linux_grouped_compact_image" {
+		t.Fatalf("base image is not a linux_grouped_compact_image:\n%s", imageBuild)
 	}
-	if got, want := base.AttrStrings("objects"), []string{"//objects:a", "//objects:b"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("base objects = %v, want %v", got, want)
+	if got, want := base.AttrStrings("object_targets"), []string{"a", "b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("base object_targets = %v, want %v", got, want)
 	}
-	baseModules := parsed.RuleNamed("base_modules")
-	if baseModules == nil || baseModules.Kind() != "linux_compact_modules" {
-		t.Fatalf("base modules are not a linux_compact_modules target:\n%s", imageBuild)
-	}
-	if got, want := baseModules.AttrStrings("objects"), []string{"//objects:m", "//objects:n"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("base module objects = %v, want %v", got, want)
+	if got, want := base.AttrStrings("module_object_targets"), []string{"m", "n"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("base module_object_targets = %v, want %v", got, want)
 	}
 	copyRule := parsed.RuleNamed("copy_image")
 	if copyRule == nil || copyRule.Kind() != "alias" || copyRule.AttrString("actual") != ":base_image" {
 		t.Fatalf("identical config did not alias the base image:\n%s", imageBuild)
 	}
 	moduleReorder := parsed.RuleNamed("module_reorder_image")
-	if moduleReorder == nil || moduleReorder.Kind() != "alias" || moduleReorder.AttrString("actual") != ":base_image" {
-		t.Fatalf("module-only reorder should alias the base image:\n%s", imageBuild)
+	if moduleReorder == nil || moduleReorder.Kind() != "linux_grouped_compact_image" {
+		t.Fatalf("module reorder with the same membership incorrectly aliased the base image:\n%s", imageBuild)
 	}
-	moduleReorderModules := parsed.RuleNamed("module_reorder_modules")
-	if moduleReorderModules == nil || moduleReorderModules.Kind() != "linux_compact_modules" {
-		t.Fatalf("module reorder should emit a direct module aggregate:\n%s", imageBuild)
-	}
-	if got, want := moduleReorderModules.AttrStrings("objects"), []string{"//objects:n", "//objects:m"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("module reorder objects = %v, want %v", got, want)
-	}
-	addOnly := parsed.RuleNamed("add_only_image")
-	if addOnly == nil || addOnly.Kind() != "linux_compact_delta_image" {
-		t.Fatalf("order-preserving addition is not a linux_compact_delta_image:\n%s", imageBuild)
-	}
-	if got, want := addOnly.AttrStrings("add_objects"), []string{"//objects:c"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("add-only add_objects = %v, want %v", got, want)
+	if got, want := moduleReorder.AttrStrings("module_object_targets"), []string{"n", "m"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("module reorder module_object_targets = %v, want %v", got, want)
 	}
 	overlay := parsed.RuleNamed("overlay_image")
-	if overlay == nil || overlay.Kind() != "linux_compact_image" {
-		t.Fatalf("subtractive overlay should be emitted directly:\n%s", imageBuild)
+	if overlay == nil || overlay.Kind() != "linux_grouped_compact_image" {
+		t.Fatalf("overlay is not a linux_grouped_compact_image:\n%s", imageBuild)
 	}
-	if got, want := overlay.AttrStrings("objects"), []string{"//objects:b", "//objects:c", "//objects:a"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("overlay objects = %v, want %v", got, want)
+	if got, want := overlay.AttrStrings("object_targets"), []string{"b", "c", "a"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("overlay object_targets = %v, want %v", got, want)
 	}
-	overlayModules := parsed.RuleNamed("overlay_modules")
-	if overlayModules == nil || overlayModules.Kind() != "linux_compact_modules" {
-		t.Fatalf("overlay modules are not emitted directly:\n%s", imageBuild)
-	}
-	if got, want := overlayModules.AttrStrings("objects"), []string{"//objects:n"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("overlay module objects = %v, want %v", got, want)
+	if got, want := overlay.AttrStrings("module_object_targets"), []string{"n"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("overlay module_object_targets = %v, want %v", got, want)
 	}
 }
 
@@ -3658,14 +3377,6 @@ func TestCompactSourceBuildReadyRejectsUnknownMakeRefs(t *testing.T) {
 		t.Fatalf("sourceBuildReady() rejected intrinsic obj make ref")
 	}
 
-	knownEmpty := CompactObjectVariant{
-		Source: "core.c",
-		Flags:  []string{"$(cflags-nogcse-yy)"},
-	}
-	if !knownEmpty.sourceBuildReady() {
-		t.Fatalf("sourceBuildReady() rejected known-empty Kbuild make ref")
-	}
-
 	unknown := CompactObjectVariant{
 		Source: "broken.c",
 		Flags:  []string{"-I$(unsupported_dir)"},
@@ -3675,14 +3386,6 @@ func TestCompactSourceBuildReadyRejectsUnknownMakeRefs(t *testing.T) {
 	}
 	if got := unknown.sourceBuildError(); !strings.Contains(got, "unsupported_dir") {
 		t.Fatalf("sourceBuildError() = %q, want unsupported variable context", got)
-	}
-
-	unknownNoGCSE := CompactObjectVariant{
-		Source: "broken.c",
-		Flags:  []string{"$(cflags-nogcse-yn)"},
-	}
-	if unknownNoGCSE.sourceBuildReady() {
-		t.Fatalf("sourceBuildReady() accepted noncanonical cflags-nogcse ref")
 	}
 }
 
@@ -3750,8 +3453,6 @@ func writeCompactSource(t *testing.T, root, rel string) {
 func writeCompactContentGraphForcedInputs(t *testing.T, root string) {
 	t.Helper()
 	for _, path := range []string{
-		"arch/arm64/kernel/vmlinux.lds.S",
-		"arch/x86/kernel/vmlinux.lds.S",
 		"include/linux/compiler-version.h",
 		"include/linux/compiler_types.h",
 		"include/linux/kconfig.h",
@@ -3823,13 +3524,8 @@ func compactMetadataBatchWithOptionsForTest(
 				}
 				writeCompactSource(t, opts.SourceRoot, filepath.ToSlash(filepath.Join(opts.ObjectDir, source)))
 			}
-			if configYes(resolved, "CONFIG_RUST") &&
-				!fileExists(filepath.Join(opts.SourceRoot, "rust", "helpers", "helpers.c")) {
-				writeCompactSource(t, opts.SourceRoot, "rust/helpers/helpers.c")
-			}
 		}
 		for _, path := range []string{
-			"arch/" + opts.Srcarch + "/kernel/vmlinux.lds.S",
 			"include/linux/compiler-version.h",
 			"include/linux/compiler_types.h",
 			"include/linux/kconfig.h",

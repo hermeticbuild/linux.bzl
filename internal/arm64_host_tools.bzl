@@ -15,17 +15,10 @@ def linux_arm64_host_tools(
         target_prefix = None,
         source_root = None,
         source_tree = None,
-        env = None,
         visibility = None):
     """Defines the source-tree-specific host tools required by arm64 native builds."""
-    if env == None:
-        env = {
-            "ARCH": "arm64",
-            "SRCARCH": "arm64",
-        }
     common = linux_common_host_tools(
         name = name,
-        env = env,
         source_repo = source_repo,
         source_root = source_root,
         source_tree = source_tree,
@@ -76,7 +69,6 @@ def linux_arm64_host_tools(
         asn1_compiler = common.asn1_compiler,
         generated_headers = package_label(generated_headers),
         kallsyms_tool = common.kallsyms_tool,
-        probe_config = common.probe_config,
         relacheck_tool = package_label(relacheck_tool),
         resolve_btfids_tool = common.resolve_btfids_tool,
         source_asn1_compiler = common.source_asn1_compiler,
@@ -125,7 +117,6 @@ def linux_arm64_configured_host_tools(
         asn1_compiler = shared.asn1_compiler,
         generated_headers = package_label(generated_headers),
         kallsyms_tool = shared.kallsyms_tool,
-        probe_config = shared.probe_config,
         relacheck_tool = shared.relacheck_tool,
         resolve_btfids_tool = shared.resolve_btfids_tool,
         source_asn1_compiler = shared.source_asn1_compiler,

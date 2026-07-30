@@ -73,18 +73,11 @@ def linux_x86_host_tools(
         target_prefix = None,
         source_root = None,
         source_tree = None,
-        env = None,
         reusable_generated_headers = [],
         visibility = None):
     """Defines the source-tree-specific host tools required by x86 native builds."""
-    if env == None:
-        env = {
-            "ARCH": "x86",
-            "SRCARCH": "x86",
-        }
     common = linux_common_host_tools(
         name = name,
-        env = env,
         source_repo = source_repo,
         source_root = source_root,
         source_tree = source_tree,
@@ -359,7 +352,6 @@ def linux_x86_host_tools(
         generated_headers = package_label(generated_headers),
         kallsyms_tool = common.kallsyms_tool,
         objtool = package_label(objtool),
-        probe_config = common.probe_config,
         resolve_btfids_tool = common.resolve_btfids_tool,
         source_asn1_compiler = common.source_asn1_compiler,
         source_label_package = common.source_label_package,
@@ -419,7 +411,6 @@ def linux_x86_configured_host_tools(
         generated_headers = package_label(generated_headers),
         kallsyms_tool = shared.kallsyms_tool,
         objtool = shared.objtool,
-        probe_config = shared.probe_config,
         resolve_btfids_tool = shared.resolve_btfids_tool,
         source_asn1_compiler = shared.source_asn1_compiler,
         source_label_package = shared.source_label_package,

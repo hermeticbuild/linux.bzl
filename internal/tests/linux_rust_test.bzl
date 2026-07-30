@@ -719,17 +719,9 @@ def _repository_protocol_test_impl(ctx):
         base_rust_enabled = False,
         config_mode = "default",
         graph_image = "//graph:x86_64_image",
-        graph_modules = "//partitions:x86_64_modules",
-        graph_projection = "//graph:graph_profile_projection.json",
-        graph_sources = "//sources:x86_64_core",
-        graph_validation_sources = ["@@linux_sources//:scripts/cc-version.sh"],
-        kbuild_linker = "@@llvm//tools:ld.lld",
         variant_configs = {"rust": "//configs:rust"},
         variant_core_configs = {"rust": "rust"},
         variant_graph_images = {"rust": "//graph:rust_image"},
-        variant_graph_modules = {"rust": "//partitions:rust_modules"},
-        variant_graph_sources = {"rust": "//sources:rust_core"},
-        variant_module_sdk_configs = {"rust": "rust"},
         variant_header_family_dependencies = {"rust": {"all": {}}},
         variant_header_family_ids = {
             "rust": {
@@ -743,7 +735,7 @@ def _repository_protocol_test_impl(ctx):
 
     asserts.equals(
         env,
-        "compact-v7-lazy-action-graph",
+        "compact-v6-content-graph",
         repositories_test_helpers.generator_protocol,
     )
     asserts.true(env, "rust_profile_json = " in generated)

@@ -5,6 +5,7 @@ module(
 
 bazel_dep(name = "linux.bzl", version = "0.1.0")
 bazel_dep(name = "linux_image_tagging_dependency", version = "1.0.0")
+bazel_dep(name = "llvm", version = "0.8.14")
 
 local_path_override(
     module_name = "linux.bzl",

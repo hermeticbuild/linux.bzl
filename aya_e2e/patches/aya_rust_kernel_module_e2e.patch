@@ -89,18 +89,18 @@ index 543463e26a02a5de5cff2fb935a80981cb576c18..cb09828d328f81f6c911dbfad6d8d3b8
  
 +linux_module(
 +    name = "linux_bzl_rust_btf",
-+    module_sdk = select({
-+        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//variants/rust_btf:module_sdk",
-+        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//variants/rust_btf:module_sdk",
-+    }),
 +    srcs = ["@@//:linux_bzl_rust_btf.rs"],
++    kernel = select({
++        "@platforms//cpu:aarch64": "@aya_aarch64_kernel//variants/rust_btf:kernel",
++        "@platforms//cpu:x86_64": "@aya_x86_64_kernel//variants/rust_btf:kernel",
++    }),
 +)
 +
  alias(
      name = "aya_kernel",
      actual = select({
 diff --git a/test/kernel/README.md b/test/kernel/README.md
-index d5cbbdd1c1a5fcd0cb5e13db7ba2bc7171a5760d..f0bfed0a1fc98a34c4e7749cef6b26f075c4d762 100644
+index 9cc8103cabda2f348fd4f5dfa133cd3fe9f2a3fe..2f51bb779e03727bd30559808bb698b2dc8b7fe6 100644
 --- a/test/kernel/README.md
 +++ b/test/kernel/README.md
 @@ -1,7 +1,7 @@

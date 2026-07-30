@@ -1,7 +1,6 @@
 """Common source-tree-specific host tools for Linux builds."""
 
 load("@rules_cc//cc:defs.bzl", "cc_binary")
-load(":compact_generator.bzl", "linux_probe_config")
 load(":source_utils.bzl", "package_label", "source_label", "source_label_package", "source_labels")
 
 visibility("//...")
@@ -40,7 +39,6 @@ def linux_common_host_tools(
         target_prefix = None,
         source_root = None,
         source_tree = None,
-        env = None,
         visibility = None):
     """Defines host tools shared by all native Linux architecture builds."""
     if target_prefix == None:
@@ -49,20 +47,10 @@ def linux_common_host_tools(
         source_root = source_label(source_repo, "Kconfig")
     if source_tree == None:
         source_tree = [source_label(source_repo, "all_files")]
-    if env == None:
-        env = {}
-
-    probe_config = target_prefix + "_linux_probe"
     asn1_compiler = target_prefix + "_asn1_compiler_tool"
     kallsyms_tool = target_prefix + "_kallsyms_tool"
     resolve_btfids_tool = target_prefix + "_resolve_btfids_tool"
     sorttable_tool = target_prefix + "_sorttable_tool"
-
-    linux_probe_config(
-        name = probe_config,
-        env = env,
-        visibility = visibility,
-    )
 
     cc_binary(
         name = asn1_compiler,
@@ -106,7 +94,6 @@ def linux_common_host_tools(
     return struct(
         asn1_compiler = package_label(asn1_compiler),
         kallsyms_tool = package_label(kallsyms_tool),
-        probe_config = package_label(probe_config),
         resolve_btfids_tool = package_label(resolve_btfids_tool),
         sorttable_tool = package_label(sorttable_tool),
         source_asn1_compiler = package_label(asn1_compiler),
