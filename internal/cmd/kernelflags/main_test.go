@@ -500,3 +500,30 @@ func contains(values []string, want string) bool {
 	}
 	return false
 }
+
+func TestLinuxCFlagsX86RetpolineUsesIndirectBranchCSPrefix(t *testing.T) {
+	// arch/x86/Makefile:23 appends -mindirect-branch-cs-prefix to
+	// RETPOLINE_CFLAGS for both compilers, so it applies whenever
+	// CONFIG_MITIGATION_RETPOLINE is set. Without it the compiler emits
+	// 5-byte thunk branches, and arch/x86/kernel/alternative.c
+	// emit_indirect() pads the rewritten indirect branch with a NOP instead
+	// of the CS prefixes it sizes for.
+	for _, compiler := range []string{"CONFIG_CC_IS_CLANG", "CONFIG_CC_IS_GCC"} {
+		config := map[string]string{
+			"CONFIG_X86_64":               "y",
+			"CONFIG_MITIGATION_RETPOLINE": "y",
+			compiler:                      "y",
+		}
+		flags := linuxCFlags(config, "x86")
+		if !contains(flags, "-mindirect-branch-cs-prefix") {
+			t.Fatalf("linuxCFlags() with %s missing -mindirect-branch-cs-prefix: %v", compiler, flags)
+		}
+	}
+	flags := linuxCFlags(map[string]string{
+		"CONFIG_X86_64":      "y",
+		"CONFIG_CC_IS_CLANG": "y",
+	}, "x86")
+	if contains(flags, "-mindirect-branch-cs-prefix") {
+		t.Fatalf("linuxCFlags() without CONFIG_MITIGATION_RETPOLINE contains -mindirect-branch-cs-prefix: %v", flags)
+	}
+}

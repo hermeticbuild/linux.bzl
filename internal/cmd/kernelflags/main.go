@@ -494,6 +494,10 @@ func x86CFlags(config map[string]string, version string) []string {
 		} else {
 			flags = append(flags, "-mindirect-branch=thunk-extern", "-mindirect-branch-register")
 		}
+		// arch/x86/Makefile:23 appends this to RETPOLINE_CFLAGS for both
+		// compilers, guarded by cc-option. Every compiler new enough to build
+		// the kernel accepts it, so the cc-option always succeeds.
+		flags = append(flags, "-mindirect-branch-cs-prefix")
 	}
 	if enabled(config, "CONFIG_MITIGATION_RETHUNK") {
 		flags = append(flags, "-mfunction-return=thunk-extern")
