@@ -39,7 +39,11 @@ _ARCHITECTURES = {
         arch = "x86",
         compact_vars = {
             "ARCH_CORE": "",
-            "ARCH_DRIVERS": "arch/x86/pci/ arch/x86/power/",
+            # Deliberately empty: arch/x86/Makefile's drivers-$(CONFIG_PCI)
+            # and drivers-$(CONFIG_PM) lines are already descended into with
+            # their config gates, so naming those directories here again would
+            # add them a second time, unconditionally.
+            "ARCH_DRIVERS": "",
             "ARCH_LIB": "lib/ arch/x86/lib/",
             "BITS": "64",
             "CFLAGS_UBSAN_TRAP": "-fsanitize-trap=undefined",
