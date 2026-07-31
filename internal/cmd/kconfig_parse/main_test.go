@@ -91,20 +91,47 @@ func TestStartRuntimeProfilesRejectsInvalidCPUPath(t *testing.T) {
 }
 
 func TestKbuildVariablesForConfigUsesWrittenConfigView(t *testing.T) {
+	tree, err := kconfig.Parse(
+		t.Context(),
+		strings.NewReader(`
+config DISABLED
+	bool
+config HIDDEN
+	bool
+config MODULE
+	tristate
+config WRITTEN
+	bool
+config STRING
+	string
+config EMPTY
+	string
+`),
+		"Kconfig",
+		kconfig.Options{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	vars := kbuildVariablesForConfig(
 		map[string]string{
 			"ARCH":        "arm64",
 			"CONFIG_BASE": "base",
 		},
+		tree,
 		&kconfig.ResolvedConfig{
 			Effective: map[string]string{
 				"CONFIG_DISABLED": "n",
+				"CONFIG_EMPTY":    `""`,
 				"CONFIG_HIDDEN":   "y",
 				"CONFIG_MODULE":   "m",
+				"CONFIG_STRING":   `"one two"`,
 				"CONFIG_WRITTEN":  "y",
 			},
 			Written: map[string]bool{
+				"CONFIG_EMPTY":   true,
 				"CONFIG_MODULE":  true,
+				"CONFIG_STRING":  true,
 				"CONFIG_WRITTEN": true,
 			},
 		},
@@ -114,13 +141,105 @@ func TestKbuildVariablesForConfigUsesWrittenConfigView(t *testing.T) {
 		"ARCH":            "arm64",
 		"CONFIG_BASE":     "base",
 		"CONFIG_DISABLED": "",
+		"CONFIG_EMPTY":    "",
 		"CONFIG_HIDDEN":   "",
 		"CONFIG_MODULE":   "m",
+		"CONFIG_STRING":   "one two",
 		"CONFIG_WRITTEN":  "y",
 		"comma":           ",",
 	} {
 		if got := vars[key]; got != want {
 			t.Fatalf("vars[%q] = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestKbuildVariablesForConfigDoesNotInventEmptyFirmwareObject(t *testing.T) {
+	tree, err := kconfig.Parse(
+		t.Context(),
+		strings.NewReader(`
+config EXTRA_FIRMWARE
+	string "External firmware"
+`),
+		"Kconfig",
+		kconfig.Options{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved := &kconfig.ResolvedConfig{
+		Effective: map[string]string{"CONFIG_EXTRA_FIRMWARE": `""`},
+		Written:   map[string]bool{"CONFIG_EXTRA_FIRMWARE": true},
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Makefile")
+	if err := os.WriteFile(path, []byte(`firmware := $(addsuffix .gen.o, $(CONFIG_EXTRA_FIRMWARE))
+obj-y += $(firmware)
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	kb, err := kconfig.ParseKbuildFileWithOptions(path, kconfig.KbuildOptions{
+		Variables: kbuildVariablesForConfig(nil, tree, resolved),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kb.Objects) != 0 {
+		t.Fatalf("empty CONFIG_EXTRA_FIRMWARE produced objects: %#v", kb.Objects)
+	}
+}
+
+func TestWriteResolvedConfigOutputsUsesAutoConfStringEncoding(t *testing.T) {
+	tree, err := kconfig.Parse(
+		t.Context(),
+		strings.NewReader(`
+config ENABLED
+	bool
+config EXTRA_FIRMWARE
+	string
+config FIRMWARE_LIST
+	string
+`),
+		"Kconfig",
+		kconfig.Options{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	outputs := resolvedConfigOutputs{
+		config:        filepath.Join(dir, ".config"),
+		autoConf:      filepath.Join(dir, "auto.conf"),
+		autoConfCmd:   filepath.Join(dir, "auto.conf.cmd"),
+		autoconf:      filepath.Join(dir, "autoconf.h"),
+		rustcCfg:      filepath.Join(dir, "rustc_cfg"),
+		kernelRelease: filepath.Join(dir, "kernel.release"),
+	}
+	resolved := &kconfig.ResolvedConfig{
+		Effective: map[string]string{
+			"CONFIG_ENABLED":        "y",
+			"CONFIG_EXTRA_FIRMWARE": `""`,
+			"CONFIG_FIRMWARE_LIST":  `"one.bin two.bin"`,
+		},
+		Written: map[string]bool{
+			"CONFIG_ENABLED":        true,
+			"CONFIG_EXTRA_FIRMWARE": true,
+			"CONFIG_FIRMWARE_LIST":  true,
+		},
+	}
+	if err := writeResolvedConfigOutputs(tree, resolved, outputs, "6.18.39"); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{
+		outputs.config:   "CONFIG_ENABLED=y\nCONFIG_EXTRA_FIRMWARE=\"\"\nCONFIG_FIRMWARE_LIST=\"one.bin two.bin\"\n",
+		outputs.autoConf: "CONFIG_ENABLED=y\nCONFIG_EXTRA_FIRMWARE=\nCONFIG_FIRMWARE_LIST=one.bin two.bin\n",
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Fatalf("%s =\n%s\nwant:\n%s", filepath.Base(path), got, want)
 		}
 	}
 }
