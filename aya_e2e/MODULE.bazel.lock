@@ -294,7 +294,7 @@
     },
     "@@linux.bzl+//:extensions.bzl%linux_images": {
       "general": {
-        "bzlTransitiveDigest": "uavzYvzMompVjfsWqcLsEAXWUQgugbXy+6YO+fXYBkA=",
+        "bzlTransitiveDigest": "oKCHmcVy8vnv8t2DXupUBkSLIxmaGLY9kyBVAlhLeFQ=",
         "usagesDigest": "p6VHWgr+rKdEcDiu5ssG/Jdd/e/tM3ukNrv9zsJ2ua4=",
         "recordedInputs": [
           "REPO_MAPPING:,aya aya+",

@@ -38,8 +38,8 @@ label required for Kbuild-compatible post-processing.
    unresolved potentially active includes fail closed.
 5. Build all public kernel outputs from a clean repository graph and compare
    them with the previous release. For the maintained four-config x86 fixture,
-   require 4,711 object memberships, 3,519 selected variants, and exactly
-   3,519 `LinuxObjectCompile` actions in the Bazel BEP. Require the 23
+   require 4,727 object memberships, 3,533 selected variants, and exactly
+   3,533 `LinuxObjectCompile` actions in the Bazel BEP. Require the 23
    generated-header families and their producer actions to retain the expected
    base/overlay sharing partitions.
 6. Exercise C sanitizer configs against maintained Linux 6.12 and 6.18 source
