@@ -288,7 +288,7 @@
     },
     "@@linux.bzl+//:extensions.bzl%linux_images": {
       "general": {
-        "bzlTransitiveDigest": "oKCHmcVy8vnv8t2DXupUBkSLIxmaGLY9kyBVAlhLeFQ=",
+        "bzlTransitiveDigest": "pJ9URG4nhgjVaY/UsS33uwvr5Ef6KtgPOPTd4pWhX2Q=",
         "usagesDigest": "e+vMswoLMFhZTZBOPj/u6dxDllDqKp7btmBZJfnFwew=",
         "recordedInputs": [
           "REPO_MAPPING:,linux_6_18_39 +linux_source_repository+linux_6_18_39",
