@@ -1,6 +1,5 @@
 module(
     name = "linux.bzl",
-    version = "0.0.4",
 )
 
 bazel_dep(name = "bazel_lib", version = "3.2.2")
