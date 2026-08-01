@@ -3,7 +3,7 @@ module(
     version = "1.0.0",
 )
 
-bazel_dep(name = "linux.bzl", version = "0.1.0")
+bazel_dep(name = "linux.bzl", version = "0.0.1")
 bazel_dep(name = "llvm", version = "0.8.14")
 
 linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")

@@ -13,7 +13,7 @@ execution, and reusable action-cache entries.
 Add `linux.bzl` and a hermetic C/C++ toolchain to `MODULE.bazel`:
 
 ```starlark
-bazel_dep(name = "linux.bzl", version = "0.1.0")
+bazel_dep(name = "linux.bzl", version = "0.0.1")
 bazel_dep(name = "llvm", version = "0.8.14")
 
 register_toolchains(
@@ -51,8 +51,7 @@ linux_images.image(
 use_repo(linux_images, "example_kernel")
 ```
 
-The `bazel_dep` coordinates apply once `0.1.0` is published. When developing
-against a checkout, add:
+When developing against a checkout, add:
 
 ```starlark
 local_path_override(
