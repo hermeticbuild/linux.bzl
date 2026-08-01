@@ -504,10 +504,10 @@ headers share those family inputs without conflating the remaining
 generated-header tree. The public `@repo//:kernel` and
 `@repo//variants/<name>:kernel` labels stay unchanged.
 
-For the maintained x86_64 base, BTF, debug, and LZ4 invocation, 4,711 config
-memberships resolve to 3,519 `LinuxObjectCompile` actions. Base and LZ4 share
-all 1,152 object actions; generated-header family identities additionally
-share 40 base/debug actions. BTF compiler flags differ, so BTF correctly shares
+For the maintained x86_64 base, BTF, debug, and LZ4 invocation, 4,727 config
+memberships resolve to 3,533 `LinuxObjectCompile` actions. Base and LZ4 share
+all 1,156 object actions; generated-header family identities additionally
+share 38 base/debug actions. BTF compiler flags differ, so BTF correctly shares
 generated-header producers but no object compile actions.
 
 ### Inspecting object inputs
