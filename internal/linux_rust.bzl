@@ -815,15 +815,16 @@ def _compile_kernel_c(
     )
     return _process_objtool(ctx, config, raw, object_path)
 
-def _objcopy(ctx, input, path, flags):
+def _objcopy(ctx, cc_toolchain, input, path, flags):
     out = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/" + path)
+    llvm_objcopy = linux_module_cc_helpers.llvm_objcopy(cc_toolchain)
     args = ctx.actions.args()
     args.add_all(flags)
     args.add(input)
     args.add(out)
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
+        executable = llvm_objcopy,
         inputs = [input],
         outputs = [out],
         arguments = [args],
@@ -834,6 +835,7 @@ def _objcopy(ctx, input, path, flags):
 
 def _rust_crate(
         ctx,
+        cc_toolchain,
         rust_toolchain,
         rustc_probe,
         config,
@@ -892,23 +894,24 @@ def _rust_crate(
     )
     processed = raw_object
     if objcopy_flags:
-        processed = _objcopy(ctx, raw_object, "rust/" + crate + ".objcopy.o", objcopy_flags)
+        processed = _objcopy(ctx, cc_toolchain, raw_object, "rust/" + crate + ".objcopy.o", objcopy_flags)
     return struct(
         metadata = metadata,
         object = _process_objtool(ctx, config, processed, "rust/" + crate + ".o"),
     )
 
-def _export_header(ctx, object, name):
+def _export_header(ctx, cc_toolchain, object, name):
     symbols = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/rust/." + name + ".nm")
+    llvm_nm = linux_module_cc_helpers.llvm_nm(cc_toolchain)
     nm_args = ctx.actions.args()
-    nm_args.add("-nm", ctx.executable._llvm_nm)
+    nm_args.add("-nm", llvm_nm)
     nm_args.add("-in", object)
     nm_args.add("-out", symbols)
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._nmrun,
         inputs = [object],
-        tools = [ctx.executable._llvm_nm],
+        tools = [llvm_nm],
         outputs = [symbols],
         arguments = [nm_args],
         mnemonic = "LinuxRustNm",
@@ -1330,6 +1333,7 @@ def _linux_rust_kernel_sdk_impl(ctx):
             crate_flags.extend(["--extern", extern])
         crates[name] = _rust_crate(
             ctx,
+            cc_toolchain,
             rust_toolchain,
             rustc_probe,
             config,
@@ -1380,9 +1384,9 @@ def _linux_rust_kernel_sdk_impl(ctx):
     export_headers = []
     for name in _profile_string_list(export_profile, "crates"):
         if name == "helpers":
-            export_headers.append(_export_header(ctx, helpers, name))
+            export_headers.append(_export_header(ctx, cc_toolchain, helpers, name))
         elif name in crates:
-            export_headers.append(_export_header(ctx, crates[name].object, name))
+            export_headers.append(_export_header(ctx, cc_toolchain, crates[name].object, name))
         else:
             fail("Rust profile exports unavailable crate %r" % name)
     exports_source_path = _validate_profile_path(
@@ -1515,18 +1519,6 @@ linux_rust_kernel_sdk = rule(
             executable = True,
         ),
         "_host_cc_toolchain": host_cc_toolchain_attr(),
-        "_llvm_nm": attr.label(
-            allow_single_file = True,
-            cfg = "exec",
-            default = Label("@llvm//tools:llvm-nm"),
-            executable = True,
-        ),
-        "_llvm_objcopy": attr.label(
-            allow_single_file = True,
-            cfg = "exec",
-            default = Label("@llvm//tools:llvm-objcopy"),
-            executable = True,
-        ),
         "_nmrun": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/nmrun"),
