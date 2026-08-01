@@ -79,10 +79,16 @@ Build one fixed output directly:
 ```sh
 bazel build @e2e_x86_64//:kernel
 bazel build //:hello_c_module
+bazel test //:kvm_verity_kernel_build_test
 ```
 
 The C module target uses the existing module-enabled `@e2e_x86_64//:kernel`
 directly; it does not introduce a separate kernel configuration.
+
+The KVM fixture enables the generic, Intel, and AMD KVM implementations. The
+verity fixture enables the device-mapper verity target. Signed root-hash
+verification remains outside the supported configuration surface because it
+selects the kernel trusted-key and certificate path.
 
 Each generated kernel repository owns its mandatory target platform, so these
 commands do not need a caller-supplied `--platforms` flag. Add

@@ -4,8 +4,6 @@ exports_files([
     "aarch64.config",
     "btf.config",
     "debug.config",
-    "kvm.config",
     "lz4.config",
-    "verity.config",
     "x86_64.config",
 ])

@@ -96,6 +96,18 @@ linux_images.image(
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
 linux_images.image(
+    name = "e2e_kvm_x86_64",
+    config = "//:kvm.config",
+    platform = "@hermetic_llvm//platforms:linux_x86_64",
+    source = "@e2e_linux_6_18_39//:Kconfig",
+)
+linux_images.image(
+    name = "e2e_verity_x86_64",
+    config = "//:verity.config",
+    platform = "@hermetic_llvm//platforms:linux_x86_64",
+    source = "@e2e_linux_6_18_39//:Kconfig",
+)
+linux_images.image(
     name = "e2e_rust_x86_64",
     config = "//:rust.config",
     platform = "@hermetic_llvm//platforms:linux_x86_64",
@@ -118,9 +130,11 @@ use_repo(
     "e2e_6_12_96_aarch64",
     "e2e_6_12_96_x86_64",
     "e2e_aarch64",
+    "e2e_kvm_x86_64",
     "e2e_rust_6_12_96_aarch64",
     "e2e_rust_6_12_96_x86_64",
     "e2e_rust_aarch64",
     "e2e_rust_x86_64",
+    "e2e_verity_x86_64",
     "e2e_x86_64",
 )

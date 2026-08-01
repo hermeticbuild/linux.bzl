@@ -292,7 +292,7 @@
     "@@linux.bzl+//:extensions.bzl%linux_images": {
       "general": {
         "bzlTransitiveDigest": "2wze+p/HlP8MYa3yH/96l4VDlJZ3yM5F6BV1T8Ajkr0=",
-        "usagesDigest": "IIcEQVbq6PKLoo6IBe7juO0Bt+UflfLvfk61Vz/4qV0=",
+        "usagesDigest": "64hi6msYtB0mmEBIbIYZ2oqciGMCuk6nXAWu6WDh6u4=",
         "recordedInputs": [
           "REPO_MAPPING:,e2e_linux_6_12_96 +linux_source_repository+e2e_linux_6_12_96",
           "REPO_MAPPING:,e2e_linux_6_18_39 +linux_source_repository+e2e_linux_6_18_39",
@@ -347,6 +347,23 @@
             "repoRuleId": "@@linux.bzl+//internal:linux_image_extension.bzl%_linux_image_facade_repository",
             "attributes": {
               "graph_repo": "e2e_aarch64__linux_graph",
+              "variants": []
+            }
+          },
+          "e2e_kvm_x86_64__linux_graph": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
+            "attributes": {
+              "config": "@@//:kvm.config",
+              "config_mode": "default",
+              "overlays": {},
+              "platform": "@@llvm+//platforms:linux_x86_64",
+              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig"
+            }
+          },
+          "e2e_kvm_x86_64": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_extension.bzl%_linux_image_facade_repository",
+            "attributes": {
+              "graph_repo": "e2e_kvm_x86_64__linux_graph",
               "variants": []
             }
           },
@@ -415,6 +432,23 @@
             "repoRuleId": "@@linux.bzl+//internal:linux_image_extension.bzl%_linux_image_facade_repository",
             "attributes": {
               "graph_repo": "e2e_rust_x86_64__linux_graph",
+              "variants": []
+            }
+          },
+          "e2e_verity_x86_64__linux_graph": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
+            "attributes": {
+              "config": "@@//:verity.config",
+              "config_mode": "default",
+              "overlays": {},
+              "platform": "@@llvm+//platforms:linux_x86_64",
+              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig"
+            }
+          },
+          "e2e_verity_x86_64": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_extension.bzl%_linux_image_facade_repository",
+            "attributes": {
+              "graph_repo": "e2e_verity_x86_64__linux_graph",
               "variants": []
             }
           },
