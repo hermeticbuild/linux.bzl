@@ -283,8 +283,8 @@ jobs:
           ../.github/workflows/assert_shared_kernel_graph.sh
           "${BAZEL_BEP}"
           bazel-bin/x86_64_shared_graph_metadata.json
-          3519
-          4711
+          3533
+          4727
           110000
 
       - name: Upload Bazel profile
