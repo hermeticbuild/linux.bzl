@@ -48,9 +48,10 @@ VERSION=vX.Y.Z ./release_kconfig.sh
 
 ## Publish
 
-1. Tag the verified release commit as `vX.Y.Z`.
-2. Publish the module source archive and verify it against the release
-   integrity.
+1. Tag the verified release commit as `vX.Y.Z` and push the tag. The release
+   workflow creates the module source archive and starts the BCR publishing
+   workflow using the configuration under `.bcr/`.
+2. Verify the release archive and the generated BCR pull request.
 3. Test a clean consumer module using the tag, without `local_path_override` or
    a locally built generator.
 
