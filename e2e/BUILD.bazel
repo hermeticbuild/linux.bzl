@@ -8,16 +8,26 @@ load(":qemu_boot_test.bzl", "qemu_boot_test", "qemu_system_target")
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
+    "kvm.config",
     "rust.config",
     "rust_arm64.config",
     "tiny.config",
     "tiny_arm64.config",
+    "verity.config",
 ])
 
 linux_cc_module(
     name = "hello_c_module",
     srcs = ["hello_module.c"],
     kernel = "@e2e_x86_64//:kernel",
+)
+
+build_test(
+    name = "kvm_verity_kernel_build_test",
+    targets = [
+        "@e2e_kvm_x86_64//:kernel",
+        "@e2e_verity_x86_64//:kernel",
+    ],
 )
 
 linux_module(

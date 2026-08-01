@@ -49,16 +49,6 @@ linux_images.overlay(
     config = "//configs:lz4.config",
     image = "example_x86_64",
 )
-linux_images.overlay(
-    name = "kvm",
-    config = "//configs:kvm.config",
-    image = "example_x86_64",
-)
-linux_images.overlay(
-    name = "verity",
-    config = "//configs:verity.config",
-    image = "example_x86_64",
-)
 linux_images.image(
     name = "example_aarch64",
     config = "//configs:aarch64.config",

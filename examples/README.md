@@ -24,13 +24,7 @@ Build the named config variant:
 bazel build //:x86_64_debug_kernel
 bazel build //:x86_64_btf_vmlinux
 bazel build //:x86_64_lz4_kernel
-bazel build //:x86_64_kvm_kernel
-bazel build //:x86_64_verity_kernel
 ```
-
-The verity variant enables the device-mapper verity target. Signed root-hash
-verification remains outside the supported configuration surface because it
-selects the kernel trusted-key and certificate path.
 
 The BTF variant builds `vmlinux` with `CONFIG_DEBUG_INFO_BTF=y`. This consumer
 does not declare a direct `pahole` dependency; the build exercises the
