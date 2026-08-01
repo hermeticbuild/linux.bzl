@@ -263,6 +263,24 @@ programs through the kernel's BPF subsystem; the standalone
 [`aya_e2e/`](aya_e2e/) workspace verifies that separate consumer workflow
 against kernels produced by `linux.bzl`.
 
+### C modules
+
+`linux_cc_module(name, kernel, srcs, copts = [], deps = [])` builds one
+out-of-tree C loadable module against a configured kernel with
+`CONFIG_MODULES=y`. The initial public surface accepts exactly one `.c` source;
+`deps` may reference other external modules built against the same configured
+kernel.
+
+```starlark
+load("@linux.bzl", "linux_cc_module")
+
+linux_cc_module(
+    name = "hello_module",
+    kernel = "@example_kernel//:kernel",
+    srcs = ["hello_module.c"],
+)
+```
+
 ## Why
 
 Wrapping `make` in one Bazel action hides the kernel build graph from Bazel.
@@ -297,7 +315,7 @@ architecture that disagrees with the platform and config.
 | Config variants | Base fragment plus named overlay fragments |
 | Initramfs | Deterministic root-owned `newc` archives |
 | In-tree modules | Loadable `.ko` files plus Kbuild module metadata |
-| Out-of-tree modules | Rust-for-Linux `.ko` files on cataloged x86_64 and aarch64 kernels through `linux_module` |
+| Out-of-tree modules | C `.ko` files through `linux_cc_module` and Rust-for-Linux `.ko` files through `linux_module` |
 | Kernel BPF/BTF | BPF syscall configurations, BTF-enabled `vmlinux`, and module BTF with Rust+DWARF5 kernels |
 | VM verification | Hermetic QEMU boots with initramfs and module-load checks |
 

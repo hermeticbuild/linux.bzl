@@ -49,6 +49,11 @@ linux_images.overlay(
     config = "//configs:lz4.config",
     image = "example_x86_64",
 )
+linux_images.overlay(
+    name = "c_modules",
+    config = "//configs:c_modules.config",
+    image = "example_x86_64",
+)
 linux_images.image(
     name = "example_aarch64",
     config = "//configs:aarch64.config",

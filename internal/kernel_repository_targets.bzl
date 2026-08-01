@@ -154,16 +154,19 @@ def _define_core_outputs(
         vmlinux_kwargs["objtool"] = host_tools.objtool
     linux_vmlinux(**vmlinux_kwargs)
 
-    linux_module_sdk(
-        name = module_sdk,
-        arch = arch.arch,
-        pahole = Label("@pahole//:pahole"),
-        resolve_btfids_tool = host_tools.resolve_btfids_tool,
-        target_compatible_with = [arch.platform],
-        version = version,
-        visibility = visibility,
-        vmlinux = ":" + vmlinux,
-    )
+    module_sdk_kwargs = {
+        "name": module_sdk,
+        "arch": arch.arch,
+        "pahole": Label("@pahole//:pahole"),
+        "resolve_btfids_tool": host_tools.resolve_btfids_tool,
+        "target_compatible_with": [arch.platform],
+        "version": version,
+        "visibility": visibility,
+        "vmlinux": ":" + vmlinux,
+    }
+    if hasattr(host_tools, "objtool"):
+        module_sdk_kwargs["objtool"] = host_tools.objtool
+    linux_module_sdk(**module_sdk_kwargs)
     return struct(
         module_sdk = ":" + module_sdk,
         vmlinux = ":" + vmlinux,
