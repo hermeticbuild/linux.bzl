@@ -1,4 +1,4 @@
-load("@linux.bzl", "initramfs")
+load("@linux.bzl", "initramfs", "linux_cc_module")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -32,6 +32,17 @@ alias(
 alias(
     name = "x86_64_lz4_kernel",
     actual = "@example_x86_64//variants/lz4:kernel",
+)
+
+alias(
+    name = "x86_64_c_modules",
+    actual = "@example_x86_64//variants/c_modules:modules",
+)
+
+linux_cc_module(
+    name = "hello_c_module",
+    srcs = ["hello_module.c"],
+    kernel = "@example_x86_64//variants/c_modules:kernel",
 )
 
 genrule(

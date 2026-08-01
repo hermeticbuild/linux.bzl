@@ -54,6 +54,7 @@ LinuxModuleSdkInfo = provider(
         "modules_builtin_modinfo": "Deterministic modules.builtin.modinfo File.",
         "modules_order": "Deterministic modules.order File.",
         "modpost": "Hermetic host modpost executable File.",
+        "objtool": "Configured objtool executable File, or None when objtool is disabled.",
         "source_root": "Kernel source root marker File.",
         "source_tree": "Depset of source inputs needed by external module actions.",
         "srcarch": "Linux SRCARCH value.",

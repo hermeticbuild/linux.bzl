@@ -147,6 +147,48 @@ def _compile_external_rust(ctx, sdk, crate_root, crate_name):
         "Processing Rust-for-Linux module with objtool %{label}",
     )
 
+def _compile_external_c(ctx, sdk, source, module_name):
+    raw = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o.raw")
+    args = ctx.actions.args()
+    linux_module_actions.add_target_c_flags(args, sdk.target_c_flags)
+    args.add_all(linux_module_cc_helpers.module_flags("m"))
+    args.add_all(linux_module_cc_helpers.object_name_flags(
+        module_name + ".o",
+        module_name + ".o",
+    ))
+    args.add_all(linux_module_actions.module_metadata_sanitizer_flags(
+        sdk.config,
+        sdk.target_c_flags.source_root,
+        sdk.version,
+    ))
+    add_directory_arg(args, directory_anchor(source), format = "-I%s")
+    args.add_all(ctx.attr.copts)
+    args.add("-c")
+    args.add(source)
+    args.add("-o")
+    args.add(raw)
+    path_mapped_run(
+        ctx.actions,
+        executable = sdk.target.compiler,
+        inputs = _sdk_target_inputs(sdk, ctx.files.srcs),
+        outputs = [raw],
+        arguments = [args],
+        mnemonic = "LinuxCModuleCompile",
+        progress_message = "Compiling out-of-tree C Linux module %{label}",
+    )
+
+    out = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o")
+    return linux_module_actions.process_objtool(
+        ctx,
+        sdk.config,
+        sdk.objtool,
+        raw,
+        out,
+        "module",
+        "LinuxCModuleObjtool",
+        "Processing out-of-tree C Linux module with objtool %{label}",
+    )
+
 def _add_rust_sdk_flags(args, sdk, flags):
     rust = sdk.rust
     for flag in flags:
@@ -182,8 +224,8 @@ def _check_external_modinfo(ctx, preliminary, crate_name):
         inputs = [preliminary],
         outputs = [checked],
         arguments = [check_args],
-        mnemonic = "LinuxRustModuleModinfoCheck",
-        progress_message = "Checking Rust-for-Linux module metadata %{label}",
+        mnemonic = "LinuxExternalModuleModinfoCheck",
+        progress_message = "Checking external Linux module metadata %{label}",
     )
     return checked
 
@@ -301,6 +343,55 @@ def _linux_module_impl(ctx):
         sdk.module_common,
         sdk.module_lds,
         crate_name + ".o",
+        target_link_flags = sdk.target_link_flags,
+    )
+    out = ctx.actions.declare_file(ctx.label.name + ".ko")
+    _btf_module(
+        ctx,
+        sdk.config,
+        sdk.vmlinux,
+        linked,
+        out,
+        sdk.version,
+        sdk.btf_tools,
+        external_module = True,
+    )
+    return [
+        DefaultInfo(files = depset([out])),
+        LinuxModuleInfo(
+            kernel_key = sdk.kernel_key,
+            ko = out,
+            module_symvers = module_symvers,
+        ),
+        OutputGroupInfo(module_symvers = depset([module_symvers])),
+    ]
+
+def _linux_cc_module_impl(ctx):
+    sdk = ctx.attr.kernel[LinuxModuleSdkInfo]
+    if sdk.config.config_flags.get("CONFIG_MODULES") != "y":
+        fail("%s requires a kernel with CONFIG_MODULES=y" % ctx.label)
+    if len(ctx.files.srcs) != 1:
+        fail("%s requires exactly one C source" % ctx.label)
+    source = ctx.files.srcs[0]
+    module_name = _crate_name(ctx)
+    preliminary = _compile_external_c(ctx, sdk, source, module_name)
+    modinfo_check = _check_external_modinfo(ctx, preliminary, module_name)
+    mod_source, module_symvers = _external_modpost(
+        ctx,
+        sdk,
+        preliminary,
+        module_name,
+        modinfo_check,
+    )
+    mod_object = _compile_external_mod_source(ctx, sdk, mod_source, module_name)
+    linked = _link_module(
+        ctx,
+        sdk.target,
+        preliminary,
+        mod_object,
+        sdk.module_common,
+        sdk.module_lds,
+        module_name + ".o",
         target_link_flags = sdk.target_link_flags,
     )
     out = ctx.actions.declare_file(ctx.label.name + ".ko")
@@ -540,6 +631,7 @@ def _linux_module_sdk_impl(ctx):
             modules_builtin_modinfo = modules_builtin_modinfo,
             modules_order = modules_order,
             modpost = modpost,
+            objtool = ctx.executable.objtool,
             source_root = vmlinux.source_root,
             source_tree = vmlinux.source_tree,
             srcarch = vmlinux.srcarch,
@@ -566,6 +658,10 @@ linux_module_sdk = rule(
         "arch": attr.string(
             mandatory = True,
             values = ["arm64", "x86"],
+        ),
+        "objtool": attr.label(
+            cfg = "exec",
+            executable = True,
         ),
         "pahole": attr.label(
             cfg = "exec",
@@ -637,6 +733,40 @@ _linux_module = rule(
     doc = "Builds one out-of-tree Rust-for-Linux loadable module.",
 )
 
+_linux_cc_module = rule(
+    implementation = _linux_cc_module_impl,
+    attrs = {
+        "copts": attr.string_list(),
+        "deps": attr.label_list(
+            providers = [LinuxModuleInfo],
+        ),
+        "kernel": attr.label(
+            mandatory = True,
+            providers = [LinuxModuleSdkInfo],
+        ),
+        "srcs": attr.label_list(
+            allow_files = [".c"],
+            mandatory = True,
+        ),
+        "_modulemodinfo": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/modulemodinfo"),
+            executable = True,
+        ),
+        "_objtoolrun": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/objtoolrun"),
+            executable = True,
+        ),
+        "_runincwd": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/runincwd"),
+            executable = True,
+        ),
+    },
+    doc = "Builds one out-of-tree C Linux loadable module.",
+)
+
 def linux_module(
         name,
         kernel,
@@ -650,8 +780,29 @@ def linux_module(
         crate_root = crate_root,
         deps = deps,
         exec_compatible_with = [
-            "@platforms//cpu:x86_64",
-            "@platforms//os:linux",
+            Label("@platforms//cpu:x86_64"),
+            Label("@platforms//os:linux"),
+        ],
+        kernel = kernel,
+        srcs = srcs,
+        **kwargs
+    )
+
+def linux_cc_module(
+        name,
+        kernel,
+        srcs,
+        copts = [],
+        deps = [],
+        **kwargs):
+    """Builds one out-of-tree C Linux module on the supported Linux executor."""
+    _linux_cc_module(
+        name = name,
+        copts = copts,
+        deps = deps,
+        exec_compatible_with = [
+            Label("@platforms//cpu:x86_64"),
+            Label("@platforms//os:linux"),
         ],
         kernel = kernel,
         srcs = srcs,
