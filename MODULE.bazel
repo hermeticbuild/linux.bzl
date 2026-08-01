@@ -5,7 +5,9 @@ module(
 
 bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
-bazel_dep(name = "buildifier_prebuilt", version = "8.2.1.1")
+
+bazel_dep(name = "buildifier_prebuilt", version = "8.2.1.1", dev_dependency = True)
+
 bazel_dep(name = "elfutils", version = "0.195")
 bazel_dep(name = "gazelle", version = "0.51.3")
 bazel_dep(name = "libbpf", version = "1.7.0")
@@ -43,44 +45,25 @@ use_repo(bindgen_toolchains, "rules_rust_bindgen")
 tar_toolchains = use_extension("@tar.bzl//tar:extensions.bzl", "toolchains", dev_dependency = True)
 use_repo(tar_toolchains, "bsd_tar_toolchains")
 
-llvm_toolchains = use_extension("@llvm//extensions:toolchain.bzl", "toolchain")
-llvm_toolchains.target(
-    arch = "x86_64",
-    os = "linux",
-)
-llvm_toolchains.target(
-    arch = "aarch64",
-    os = "linux",
-)
-use_repo(llvm_toolchains, "llvm_toolchains")
-
-register_toolchains(
-    "@default_rust_toolchains//:all",
-    dev_dependency = True,
-)
-
 register_toolchains(
     "@rules_rust_bindgen//:linux_amd64",
 )
 
 register_toolchains(
+    "@default_rust_toolchains//:all",
     "@bsd_tar_toolchains//:all",
-    dev_dependency = True,
-)
-
-register_toolchains(
-    "@llvm_toolchains//:linux_aarch64_to_linux_aarch64",
-    "@llvm_toolchains//:linux_aarch64_to_linux_x86_64",
-    "@llvm_toolchains//:linux_x86_64_to_linux_aarch64",
-    "@llvm_toolchains//:linux_x86_64_to_linux_x86_64",
-    "@llvm_toolchains//:macos_aarch64_to_linux_aarch64",
-    "@llvm_toolchains//:macos_aarch64_to_linux_x86_64",
-    "@llvm_toolchains//:macos_x86_64_to_linux_aarch64",
-    "@llvm_toolchains//:macos_x86_64_to_linux_x86_64",
-    "@llvm_toolchains//:windows_aarch64_to_linux_aarch64",
-    "@llvm_toolchains//:windows_aarch64_to_linux_x86_64",
-    "@llvm_toolchains//:windows_x86_64_to_linux_aarch64",
-    "@llvm_toolchains//:windows_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:linux_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:linux_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:linux_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:macos_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:macos_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:macos_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:macos_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:windows_aarch64_to_linux_aarch64",
+    "@llvm//toolchain:windows_aarch64_to_linux_x86_64",
+    "@llvm//toolchain:windows_x86_64_to_linux_aarch64",
+    "@llvm//toolchain:windows_x86_64_to_linux_x86_64",
     dev_dependency = True,
 )
 
