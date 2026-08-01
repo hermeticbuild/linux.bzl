@@ -2,7 +2,7 @@
 
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@bazel_skylib//rules:select_file.bzl", "select_file")
-load("@linux.bzl", "initramfs", "linux_module")
+load("@linux.bzl", "initramfs", "linux_cc_module", "linux_module")
 load(":qemu_boot_test.bzl", "qemu_boot_test", "qemu_system_target")
 
 package(default_visibility = ["//visibility:public"])
@@ -13,6 +13,12 @@ exports_files([
     "tiny.config",
     "tiny_arm64.config",
 ])
+
+linux_cc_module(
+    name = "hello_c_module",
+    srcs = ["hello_module.c"],
+    kernel = "@e2e_x86_64//:kernel",
+)
 
 linux_module(
     name = "rust_test_module",
@@ -482,6 +488,7 @@ build_test(
         "@e2e_x86_64//:modules_builtin_modinfo",
         "@e2e_x86_64//:modules_order",
         "@e2e_x86_64//:system_map",
+        ":hello_c_module",
         ":kernel_image_x86_64",
         ":kernel_vmlinux_x86_64",
         ":x86_decompress_inffixed_lookup",
