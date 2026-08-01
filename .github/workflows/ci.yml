@@ -285,7 +285,7 @@ jobs:
           bazel-bin/x86_64_shared_graph_metadata.json
           3533
           4727
-          110000
+          115000
 
       - name: Upload Bazel profile
         if: ${{ !cancelled() }}
