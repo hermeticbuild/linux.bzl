@@ -17,18 +17,7 @@ bazel_dep(name = "linux.bzl", version = "0.0.1")
 bazel_dep(name = "llvm", version = "0.8.14")
 
 register_toolchains(
-    "@llvm//toolchain:linux_aarch64_to_linux_aarch64",
-    "@llvm//toolchain:linux_aarch64_to_linux_x86_64",
-    "@llvm//toolchain:linux_x86_64_to_linux_aarch64",
-    "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
-    "@llvm//toolchain:macos_aarch64_to_linux_aarch64",
-    "@llvm//toolchain:macos_aarch64_to_linux_x86_64",
-    "@llvm//toolchain:macos_x86_64_to_linux_aarch64",
-    "@llvm//toolchain:macos_x86_64_to_linux_x86_64",
-    "@llvm//toolchain:windows_aarch64_to_linux_aarch64",
-    "@llvm//toolchain:windows_aarch64_to_linux_x86_64",
-    "@llvm//toolchain:windows_x86_64_to_linux_aarch64",
-    "@llvm//toolchain:windows_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:all",
 )
 
 linux_source_repository = use_repo_rule(
@@ -150,11 +139,13 @@ surface:
 
 There is intentionally no `arch` attribute. Architecture is derived from the
 base config, while the platform must carry the matching x86_64 or aarch64 CPU
-constraint and select a matching Clang toolchain. It does not have to come from
-a particular module or use a prescribed label. There are also no graph
-profiles, explicit Kbuild linker labels, compiler paths, host probe overrides,
-image-format switches, or signing keys in the public API. Import each declared
-facade repository explicitly with `use_repo`.
+constraint and select a matching LLVM/Clang toolchain. The toolchain must expose
+`llvm-nm` and `llvm-objcopy` through `CcToolchainInfo.all_files`; the supported
+setup is the `llvm` module shown above. Repository and platform labels may be
+renamed. There are also no graph profiles, explicit Kbuild linker labels,
+compiler paths, host probe overrides, image-format switches, or signing keys in
+the public API. Import each declared facade repository explicitly with
+`use_repo`.
 
 ### Initramfs
 
@@ -466,12 +457,13 @@ system_map
 ## Toolchains and hermeticity
 
 `platform` is mandatory on every `linux_images.image` tag. It must carry a
-Linux x86_64 or aarch64 CPU constraint and select a matching Clang toolchain.
-The extension applies it once at the public `:kernel` gateway. Analysis rejects
-non-Clang compilers and target platforms that disagree with the config; it does
-not require a particular platform label, module repository, or exact Clang
-version. Kconfig and Kbuild capability decisions remain fixed to LLVM 22.1.8,
-so selecting a newer Clang asserts compatibility with those decisions.
+Linux x86_64 or aarch64 CPU constraint and select a matching LLVM/Clang
+toolchain. The extension applies it once at the public `:kernel` gateway.
+Analysis rejects non-Clang compilers, target platforms that disagree with the
+config, and toolchains that do not expose `llvm-nm` and `llvm-objcopy` through
+`CcToolchainInfo.all_files`. The supported toolchain is provided by `llvm`
+0.8.14 and uses LLVM 22.1.8. Repository and platform labels may be renamed, but
+using another LLVM packaging or version is outside the supported contract.
 
 Repository generation downloads the platform-specific, integrity-pinned
 Kconfig graph generator selected by the rules release's checked-in table. The

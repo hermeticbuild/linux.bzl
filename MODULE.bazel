@@ -7,11 +7,11 @@ bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 
 bazel_dep(name = "buildifier_prebuilt", version = "8.2.1.1", dev_dependency = True)
+bazel_dep(name = "llvm", version = "0.8.14", dev_dependency = True)
 
 bazel_dep(name = "elfutils", version = "0.195")
 bazel_dep(name = "gazelle", version = "0.51.3")
 bazel_dep(name = "libbpf", version = "1.7.0")
-bazel_dep(name = "llvm", version = "0.8.14")
 bazel_dep(name = "lz4", version = "1.10.0.bcr.1")
 bazel_dep(name = "pahole", version = "1.31")
 bazel_dep(name = "platforms", version = "1.0.0")
@@ -52,18 +52,7 @@ register_toolchains(
 register_toolchains(
     "@default_rust_toolchains//:all",
     "@bsd_tar_toolchains//:all",
-    "@llvm//toolchain:linux_aarch64_to_linux_aarch64",
-    "@llvm//toolchain:linux_aarch64_to_linux_x86_64",
-    "@llvm//toolchain:linux_x86_64_to_linux_aarch64",
-    "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
-    "@llvm//toolchain:macos_aarch64_to_linux_aarch64",
-    "@llvm//toolchain:macos_aarch64_to_linux_x86_64",
-    "@llvm//toolchain:macos_x86_64_to_linux_aarch64",
-    "@llvm//toolchain:macos_x86_64_to_linux_x86_64",
-    "@llvm//toolchain:windows_aarch64_to_linux_aarch64",
-    "@llvm//toolchain:windows_aarch64_to_linux_x86_64",
-    "@llvm//toolchain:windows_x86_64_to_linux_aarch64",
-    "@llvm//toolchain:windows_x86_64_to_linux_x86_64",
+    "@llvm//toolchain:all",
     dev_dependency = True,
 )
 

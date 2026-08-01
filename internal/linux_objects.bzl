@@ -280,6 +280,29 @@ def _cc_feature_configuration(ctx, cc_toolchain):
         unsupported_features = ctx.disabled_features,
     )
 
+def _llvm_tool(cc_toolchain, name):
+    basenames = [name, name + ".exe"]
+    matches = [
+        file
+        for file in cc_toolchain.all_files.to_list()
+        if file.basename in basenames
+    ]
+    if len(matches) != 1:
+        fail(
+            "selected C/C++ toolchain must provide exactly one %s (%s), found: %s" % (
+                name,
+                ", ".join(basenames),
+                ", ".join(sorted([file.path for file in matches])) or "none",
+            ),
+        )
+    return matches[0]
+
+def _llvm_nm(cc_toolchain):
+    return _llvm_tool(cc_toolchain, "llvm-nm")
+
+def _llvm_objcopy(cc_toolchain):
+    return _llvm_tool(cc_toolchain, "llvm-objcopy")
+
 def _cc_compile_flags(ctx, cc_toolchain, feature_configuration):
     variables = cc_common.create_compile_variables(
         feature_configuration = feature_configuration,
@@ -1196,17 +1219,18 @@ def _linux_realmode_compile(ctx, compiler, cc_toolchain, config, generated_heade
     )
     return out
 
-def _linux_realmode_pasyms(ctx, objects):
+def _linux_realmode_pasyms(ctx, cc_toolchain, objects):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/realmode/rm/pasyms.h")
+    llvm_nm = _llvm_nm(cc_toolchain)
     args = ctx.actions.args()
-    args.add("-nm", ctx.executable._llvm_nm)
+    args.add("-nm", llvm_nm)
     args.add("-out", out)
     args.add_all(objects)
     path_mapped_run(
         ctx.actions,
         executable = ctx.attr._pasyms[DefaultInfo].files_to_run,
         inputs = objects,
-        tools = [ctx.attr._llvm_nm[DefaultInfo].files_to_run],
+        tools = [llvm_nm],
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxRealmodePASYMS",
@@ -1312,7 +1336,7 @@ def _linux_realmode_outputs(ctx, compiler, linker, cc_toolchain, config, generat
             out_relpath,
         ))
 
-    pasyms = _linux_realmode_pasyms(ctx, objects)
+    pasyms = _linux_realmode_pasyms(ctx, cc_toolchain, objects)
     linker_script = _linux_realmode_linker_script(ctx, compiler, cc_toolchain, config, generated_headers, source_root, pasyms)
     elf = _linux_realmode_link(ctx, linker, cc_toolchain, objects, linker_script)
 
@@ -1324,8 +1348,8 @@ def _linux_realmode_outputs(ctx, compiler, linker, cc_toolchain, config, generat
     objcopy_args.add(bin)
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
-        inputs = [elf, ctx.executable._llvm_objcopy],
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [elf],
         outputs = [bin],
         arguments = [objcopy_args],
         mnemonic = "LinuxRealmodeObjcopy",
@@ -1501,8 +1525,8 @@ def _linux_vdso_image_source(ctx, compiler, linker, cc_toolchain, feature_config
     objcopy_args.add(stripped)
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
-        inputs = [dbg, ctx.executable._llvm_objcopy],
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [dbg],
         outputs = [stripped],
         arguments = [objcopy_args],
         mnemonic = "LinuxVDSOObjcopy",
@@ -2099,6 +2123,8 @@ def _linux_arm64_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, 
         progress_message = "Linking Linux arm64 vDSO %{label}",
     )
 
+    llvm_nm = _llvm_nm(cc_toolchain)
+    llvm_objcopy = _llvm_objcopy(cc_toolchain)
     so = ctx.actions.declare_file(base + "/arch/arm64/kernel/vdso/vdso.so")
     objcopy_args = ctx.actions.args()
     objcopy_args.add("-S")
@@ -2106,8 +2132,8 @@ def _linux_arm64_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, 
     objcopy_args.add(so)
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
-        inputs = [dbg, ctx.executable._llvm_objcopy],
+        executable = llvm_objcopy,
+        inputs = [dbg],
         outputs = [so],
         arguments = [objcopy_args],
         mnemonic = "LinuxARM64VDSOObjcopy",
@@ -2117,13 +2143,13 @@ def _linux_arm64_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, 
     nm = ctx.actions.declare_file(base + "/arch/arm64/kernel/vdso/vdso.so.dbg.nm")
     nm_args = ctx.actions.args()
     nm_args.add(nm)
-    nm_args.add(ctx.executable._llvm_nm)
+    nm_args.add(llvm_nm)
     nm_args.add(dbg)
     path_mapped_run(
         ctx.actions,
         executable = ctx.attr._runandwrite[DefaultInfo].files_to_run,
         inputs = [dbg],
-        tools = [ctx.attr._llvm_nm[DefaultInfo].files_to_run],
+        tools = [llvm_nm],
         outputs = [nm],
         arguments = [nm_args],
         mnemonic = "LinuxARM64VDSONM",
@@ -2337,8 +2363,8 @@ def _linux_arm64_vdso32_outputs(ctx, cc_toolchain, feature_configuration, config
     objcopy_args.add(so)
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
-        inputs = [dbg, ctx.executable._llvm_objcopy],
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [dbg],
         outputs = [so],
         arguments = [objcopy_args],
         mnemonic = "LinuxARM64VDSO32Objcopy",
@@ -3306,18 +3332,6 @@ linux_arm64_generated_headers = rule(
         "_arm64headers": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/arm64headers"),
-            executable = True,
-        ),
-        "_llvm_nm": attr.label(
-            allow_single_file = True,
-            cfg = "exec",
-            default = Label("@llvm//tools:llvm-nm"),
-            executable = True,
-        ),
-        "_llvm_objcopy": attr.label(
-            allow_single_file = True,
-            cfg = "exec",
-            default = Label("@llvm//tools:llvm-objcopy"),
             executable = True,
         ),
         "_runandwrite": attr.label(
@@ -4459,8 +4473,8 @@ def _linux_object_impl(ctx):
         objcopy_args.add(objcopy_out)
         path_mapped_run(
             ctx.actions,
-            executable = ctx.executable._llvm_objcopy,
-            inputs = [objtool_out, ctx.executable._llvm_objcopy],
+            executable = _llvm_objcopy(cc_toolchain),
+            inputs = [objtool_out],
             outputs = [objcopy_out],
             arguments = [objcopy_args],
             mnemonic = "LinuxObjectObjcopy",
@@ -4634,18 +4648,6 @@ linux_object = rule(
         "_scsidevinfo": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/scsidevinfo"),
-            executable = True,
-        ),
-        "_llvm_nm": attr.label(
-            allow_single_file = True,
-            cfg = "exec",
-            default = Label("@llvm//tools:llvm-nm"),
-            executable = True,
-        ),
-        "_llvm_objcopy": attr.label(
-            allow_single_file = True,
-            cfg = "exec",
-            default = Label("@llvm//tools:llvm-objcopy"),
             executable = True,
         ),
         "_pasyms": attr.label(
@@ -4910,8 +4912,8 @@ def _linux_arm64_nvhe_object_impl(ctx):
     objcopy_args.add(out)
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
-        inputs = [rel, ctx.executable._llvm_objcopy],
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [rel],
         outputs = [out],
         arguments = [objcopy_args],
         mnemonic = "LinuxArm64NvheObjcopy",
@@ -4972,12 +4974,6 @@ linux_arm64_nvhe_object = rule(
         "_genhyprel": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/genhyprel"),
-            executable = True,
-        ),
-        "_llvm_objcopy": attr.label(
-            allow_single_file = True,
-            cfg = "exec",
-            default = Label("@llvm//tools:llvm-objcopy"),
             executable = True,
         ),
         "_runandwrite": attr.label(
@@ -5467,17 +5463,18 @@ def _linux_vmlinux_export_object(ctx, compiler, cc_toolchain, feature_configurat
         objtool_mode = "builtin-always" if _linux_vmlinux_export_uses_objtool(config, ctx.attr.version) else "",
     )
 
-def _linux_system_map(ctx, input, name):
+def _linux_system_map(ctx, cc_toolchain, input, name):
     nm_out = ctx.actions.declare_file(ctx.label.name + ".obj/" + name + ".nm")
+    llvm_nm = _llvm_nm(cc_toolchain)
     nm_args = ctx.actions.args()
-    nm_args.add("-nm", ctx.executable._llvm_nm)
+    nm_args.add("-nm", llvm_nm)
     nm_args.add("-in", input)
     nm_args.add("-out", nm_out)
     path_mapped_run(
         ctx.actions,
         executable = ctx.attr._nmrun[DefaultInfo].files_to_run,
         inputs = [input],
-        tools = [ctx.attr._llvm_nm[DefaultInfo].files_to_run],
+        tools = [llvm_nm],
         outputs = [nm_out],
         arguments = [nm_args],
         mnemonic = "LinuxVmlinuxNM",
@@ -5499,16 +5496,16 @@ def _linux_system_map(ctx, input, name):
     )
     return out
 
-def _linux_sorttable(ctx, config, input):
+def _linux_sorttable(ctx, cc_toolchain, config, input):
     out = ctx.actions.declare_file(ctx.label.name + ".sorted.vmlinux")
     nm_out = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux.nm-sort")
-    inputs = [input, config.config]
-    tools = [ctx.attr._llvm_nm[DefaultInfo].files_to_run]
+    llvm_nm = _llvm_nm(cc_toolchain)
+    tools = [llvm_nm]
     if ctx.executable.sorttable_tool:
         tools.append(ctx.attr.sorttable_tool[DefaultInfo].files_to_run)
     args = ctx.actions.args()
     args.add("-config", config.config)
-    args.add("-nm", ctx.executable._llvm_nm)
+    args.add("-nm", llvm_nm)
     if ctx.executable.sorttable_tool:
         args.add("-sorttable")
         args.add(ctx.executable.sorttable_tool)
@@ -5518,7 +5515,7 @@ def _linux_sorttable(ctx, config, input):
     path_mapped_run(
         ctx.actions,
         executable = ctx.attr._sorttablerun[DefaultInfo].files_to_run,
-        inputs = inputs,
+        inputs = [input, config.config],
         tools = tools,
         outputs = [out, nm_out],
         arguments = [args],
@@ -5527,7 +5524,7 @@ def _linux_sorttable(ctx, config, input):
     )
     return out
 
-def _linux_strip_vmlinux(ctx, config, input, out):
+def _linux_strip_vmlinux(ctx, cc_toolchain, config, input, out):
     set_flags = ["--set-section-flags", ".modinfo=noload"]
     remove_flags = [
         "--remove-section=.modinfo",
@@ -5549,6 +5546,7 @@ def _linux_strip_vmlinux(ctx, config, input, out):
             "--remove-section=.rel.*",
         ])
 
+    llvm_objcopy = _llvm_objcopy(cc_toolchain)
     prepared = ctx.actions.declare_file(ctx.label.name + ".obj/vmlinux.strip-prepared")
     prepare_args = ctx.actions.args()
     prepare_args.add_all(set_flags)
@@ -5556,8 +5554,8 @@ def _linux_strip_vmlinux(ctx, config, input, out):
     prepare_args.add(prepared)
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
-        inputs = [input, ctx.executable._llvm_objcopy],
+        executable = llvm_objcopy,
+        inputs = [input],
         outputs = [prepared],
         arguments = [prepare_args],
         mnemonic = "LinuxVmlinuxPrepareStrip",
@@ -5569,8 +5567,8 @@ def _linux_strip_vmlinux(ctx, config, input, out):
     strip_args.add(out)
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
-        inputs = [prepared, ctx.executable._llvm_objcopy],
+        executable = llvm_objcopy,
+        inputs = [prepared],
         outputs = [out],
         arguments = [strip_args],
         mnemonic = "LinuxVmlinuxStrip",
@@ -5613,18 +5611,19 @@ def _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, c
         name + ".kallsyms.o",
     )
 
-def _linux_btf_object(ctx, config, input):
+def _linux_btf_object(ctx, cc_toolchain, config, input):
     if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") != "y":
         return None
     if not ctx.executable.pahole:
         fail("linux_vmlinux %s has DEBUG_INFO_BTF enabled and requires pahole" % ctx.label)
 
+    llvm_objcopy = _llvm_objcopy(cc_toolchain)
     btf_vmlinux = ctx.actions.declare_file(ctx.label.name + ".obj/" + input.basename + ".btf")
     pahole_args = ctx.actions.args()
     pahole_args.add("-input", input)
     pahole_args.add("-output", btf_vmlinux)
     pahole_args.add("-env")
-    pahole_args.add(ctx.executable._llvm_objcopy, format = "LLVM_OBJCOPY=%s")
+    pahole_args.add(llvm_objcopy, format = "LLVM_OBJCOPY=%s")
     pahole_args.add("--")
     pahole_args.add(ctx.executable.pahole)
     pahole_args.add("-J")
@@ -5636,7 +5635,7 @@ def _linux_btf_object(ctx, config, input):
         inputs = [input],
         tools = [
             ctx.attr.pahole[DefaultInfo].files_to_run,
-            ctx.attr._llvm_objcopy[DefaultInfo].files_to_run,
+            llvm_objcopy,
         ],
         outputs = [btf_vmlinux],
         arguments = [pahole_args],
@@ -5653,7 +5652,7 @@ def _linux_btf_object(ctx, config, input):
         "big" if config.config_flags.get("CONFIG_CPU_BIG_ENDIAN") == "y" else "little",
     )
     extract_args.add("--")
-    extract_args.add(ctx.executable._llvm_objcopy)
+    extract_args.add(llvm_objcopy)
     extract_args.add("--only-section=.BTF")
     extract_args.add("--set-section-flags")
     extract_args.add(".BTF=alloc,readonly")
@@ -5664,7 +5663,7 @@ def _linux_btf_object(ctx, config, input):
         ctx.actions,
         executable = ctx.executable._btfmutate,
         inputs = [btf_vmlinux],
-        tools = [ctx.attr._llvm_objcopy[DefaultInfo].files_to_run],
+        tools = [llvm_objcopy],
         outputs = [out],
         arguments = [extract_args],
         mnemonic = "LinuxBTFExtract",
@@ -6114,22 +6113,22 @@ def _linux_vmlinux_impl(ctx):
             btf_base,
             False,
         )
-        btf_object = _linux_btf_object(ctx, config, btf_base)
+        btf_object = _linux_btf_object(ctx, cc_toolchain, config, btf_base)
 
     if kallsyms_enabled:
         for i in range(1, 5):
             tmp = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux%d" % i)
             _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, tmp, True)
-            system_map = _linux_system_map(ctx, tmp, ".tmp_vmlinux%d" % i)
+            system_map = _linux_system_map(ctx, cc_toolchain, tmp, ".tmp_vmlinux%d" % i)
             kallsyms_object = _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, system_map, ".tmp_vmlinux%d" % i, ctx.executable.kallsyms_tool)
 
     unstripped = ctx.actions.declare_file(ctx.label.name + ".vmlinux.unstripped")
     linked = _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, unstripped, False)
     linked = _linux_resolve_btfids(ctx, config, linked)
-    unstripped = _linux_sorttable(ctx, config, linked)
+    unstripped = _linux_sorttable(ctx, cc_toolchain, config, linked)
     out = ctx.actions.declare_file(ctx.label.name + ".vmlinux")
-    out = _linux_strip_vmlinux(ctx, config, unstripped, out)
-    system_map = _linux_system_map(ctx, out, "System.map")
+    out = _linux_strip_vmlinux(ctx, cc_toolchain, config, unstripped, out)
+    system_map = _linux_system_map(ctx, cc_toolchain, out, "System.map")
     info = LinuxImageInfo(
         archives = image.archives,
         module_objects = image.module_objects,
@@ -6207,24 +6206,12 @@ linux_vmlinux = rule(
             doc = "Kernel-source-specific scripts/sorttable executable. Required when BUILDTIME_TABLE_SORT is enabled.",
             executable = True,
         ),
-        "_llvm_nm": attr.label(
-            allow_single_file = True,
-            cfg = "exec",
-            default = Label("@llvm//tools:llvm-nm"),
-            executable = True,
-        ),
         "_btfmutate": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/btfmutate"),
             executable = True,
         ),
         "_host_cc_toolchain": host_cc_toolchain_attr(exec_group = "host_cc"),
-        "_llvm_objcopy": attr.label(
-            allow_single_file = True,
-            cfg = "exec",
-            default = Label("@llvm//tools:llvm-objcopy"),
-            executable = True,
-        ),
         "_modulemodinfo": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/modulemodinfo"),
@@ -6349,7 +6336,7 @@ def _linux_x86_tool_sibling(tool, name):
         return name
     return parts[0] + "/" + name
 
-def _linux_x86_objcopy(ctx, input, out_relpath, flags):
+def _linux_x86_objcopy(ctx, cc_toolchain, input, out_relpath, flags):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
     args = ctx.actions.args()
     args.add_all(flags)
@@ -6357,8 +6344,8 @@ def _linux_x86_objcopy(ctx, input, out_relpath, flags):
     args.add(out)
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
-        inputs = [input, ctx.executable._llvm_objcopy],
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [input],
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxX86Objcopy",
@@ -6632,8 +6619,8 @@ def _linux_x86_efi_stub_compile(ctx, compiler, cc_toolchain, feature_configurati
     objcopy_args.add(out)
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
-        inputs = [compile_out, ctx.executable._llvm_objcopy],
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [compile_out],
         outputs = [out],
         arguments = [objcopy_args],
         mnemonic = "LinuxX86EFIStubObjcopy",
@@ -6669,7 +6656,7 @@ def _linux_x86_image_object_outputs(image, exact = [], prefix = ""):
     return out
 
 def _linux_x86_compressed_vmlinux(ctx, compiler, linker, archiver, cc_toolchain, feature_configuration, config, generated_headers, source_root, image, voffset):
-    stripped = _linux_x86_objcopy(ctx, image.output, "arch/x86/boot/compressed/vmlinux.bin", ["-R", ".comment", "-S"])
+    stripped = _linux_x86_objcopy(ctx, cc_toolchain, image.output, "arch/x86/boot/compressed/vmlinux.bin", ["-R", ".comment", "-S"])
     payload_inputs = [stripped]
     if ctx.executable.x86_relocs_tool:
         payload_inputs.append(_linux_x86_relocs(ctx, image.output))
@@ -6974,7 +6961,7 @@ def _linux_x86_setup_bin(ctx, compiler, linker, cc_toolchain, feature_configurat
         mnemonic = "LinuxX86SetupLink",
         progress_message = "Linking Linux x86 setup ELF %{label}",
     )
-    return _linux_x86_objcopy(ctx, setup_elf, "arch/x86/boot/setup.bin", ["-O", "binary"])
+    return _linux_x86_objcopy(ctx, cc_toolchain, setup_elf, "arch/x86/boot/setup.bin", ["-O", "binary"])
 
 def _linux_x86_bzimage_impl(ctx):
     if not ctx.attr.config:
@@ -7018,7 +7005,7 @@ def _linux_x86_bzimage_impl(ctx):
         voffset,
     )
     zoffset = _linux_x86_offsets(ctx, compressed_vmlinux, "zoffset", "arch/x86/boot/zoffset.h")
-    vmlinux_bin = _linux_x86_objcopy(ctx, compressed_vmlinux, "arch/x86/boot/vmlinux.bin", ["-O", "binary", "-R", ".note", "-R", ".comment", "-S"])
+    vmlinux_bin = _linux_x86_objcopy(ctx, cc_toolchain, compressed_vmlinux, "arch/x86/boot/vmlinux.bin", ["-O", "binary", "-R", ".note", "-R", ".comment", "-S"])
     setup_bin = _linux_x86_setup_bin(ctx, compiler, linker, cc_toolchain, feature_configuration, config, generated_headers, source_root, voffset, zoffset)
     out = _linux_x86_bzimage(ctx, setup_bin, vmlinux_bin)
     info = LinuxImageInfo(
@@ -7057,6 +7044,7 @@ def _linux_compressed_image_impl(ctx):
 
 def _linux_objcopy_image_impl(ctx, objcopy_flags):
     image = ctx.attr.image[LinuxImageInfo]
+    cc_toolchain = find_cpp_toolchain(ctx)
     out = ctx.actions.declare_file(ctx.label.name + "." + ctx.attr.extension)
     args = ctx.actions.args()
     args.add_all(objcopy_flags)
@@ -7064,8 +7052,8 @@ def _linux_objcopy_image_impl(ctx, objcopy_flags):
     args.add(out)
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
-        inputs = [image.output, ctx.executable._llvm_objcopy],
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [image.output],
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxKernelObjcopyImage",
@@ -7108,12 +7096,6 @@ linux_compressed_image = rule(
         "_insnattr": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/insnattr"),
-            executable = True,
-        ),
-        "_llvm_objcopy": attr.label(
-            allow_single_file = True,
-            cfg = "exec",
-            default = Label("@llvm//tools:llvm-objcopy"),
             executable = True,
         ),
         "_lz4": attr.label(
@@ -7173,13 +7155,14 @@ linux_cache_shape_check = rule(
     doc = "Analysis-time check that shared object variants keep the same provider output across image targets.",
 )
 
-# Narrow private helper surface shared with internal/linux_modules.bzl. Keeping
-# these functions behind one struct avoids making the implementation helpers
-# individual loadable symbols or part of the root public API.
+# Narrow private helper surface shared with sibling internal rules. Keeping these
+# functions behind one struct avoids making them part of the root public API.
 linux_module_cc_helpers = struct(
     compile_flags = _linux_compile_flags,
     configure_features = _cc_feature_configuration,
     cpp_undef_flags = _linux_cpp_undef_flags,
+    llvm_nm = _llvm_nm,
+    llvm_objcopy = _llvm_objcopy,
     module_flags = _linux_module_flags,
     object_name_flags = _linux_object_name_flags,
     source_include_dirs = _linux_ordered_include_dirs,

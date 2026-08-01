@@ -338,7 +338,7 @@ def _btf_module(ctx, config, vmlinux, linked, out, version, tools, external_modu
     pahole_args.add("-input", linked)
     pahole_args.add("-output", encoded)
     pahole_args.add("-env")
-    pahole_args.add(tools.llvm_objcopy.executable, format = "LLVM_OBJCOPY=%s")
+    pahole_args.add(tools.llvm_objcopy, format = "LLVM_OBJCOPY=%s")
     pahole_args.add("--")
     pahole_args.add(tools.pahole.executable)
     pahole_args.add("-J")
@@ -386,8 +386,9 @@ def _empty_file(ctx, path):
     ctx.actions.write(out, "")
     return out
 
-def _builtin_module_metadata(ctx, vmlinux):
+def _builtin_module_metadata(ctx, cc_toolchain, vmlinux):
     raw = ctx.actions.declare_file(ctx.label.name + ".sdk/modules.builtin.modinfo.raw")
+    llvm_objcopy = linux_module_cc_helpers.llvm_objcopy(cc_toolchain)
     objcopy_args = ctx.actions.args()
     objcopy_args.add_all([
         "-j",
@@ -399,7 +400,7 @@ def _builtin_module_metadata(ctx, vmlinux):
     ])
     path_mapped_run(
         ctx.actions,
-        executable = ctx.executable._llvm_objcopy,
+        executable = llvm_objcopy,
         inputs = [vmlinux.vmlinux_unstripped],
         outputs = [raw],
         arguments = [objcopy_args],
@@ -440,11 +441,11 @@ def _linux_module_sdk_impl(ctx):
         target,
     )
 
-    modules_builtin, modules_builtin_modinfo = _builtin_module_metadata(ctx, vmlinux)
+    modules_builtin, modules_builtin_modinfo = _builtin_module_metadata(ctx, target.cc_toolchain, vmlinux)
     ko_files = []
     btf_tools = struct(
         btfmutate = ctx.attr._btfmutate[DefaultInfo].files_to_run,
-        llvm_objcopy = ctx.attr._llvm_objcopy[DefaultInfo].files_to_run,
+        llvm_objcopy = linux_module_cc_helpers.llvm_objcopy(target.cc_toolchain),
         pahole = ctx.attr.pahole[DefaultInfo].files_to_run if ctx.attr.pahole else None,
         resolve_btfids = ctx.attr.resolve_btfids_tool[DefaultInfo].files_to_run if ctx.attr.resolve_btfids_tool else None,
     )
@@ -587,12 +588,6 @@ linux_module_sdk = rule(
         "_builtinmodinfo": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/builtinmodinfo"),
-            executable = True,
-        ),
-        "_llvm_objcopy": attr.label(
-            allow_single_file = True,
-            cfg = "exec",
-            default = Label("@llvm//tools:llvm-objcopy"),
             executable = True,
         ),
     },
