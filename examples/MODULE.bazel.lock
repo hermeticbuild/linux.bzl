@@ -287,7 +287,7 @@
     "@@linux.bzl+//:extensions.bzl%linux_images": {
       "general": {
         "bzlTransitiveDigest": "2wze+p/HlP8MYa3yH/96l4VDlJZ3yM5F6BV1T8Ajkr0=",
-        "usagesDigest": "+beeDhR/ASuapVzgIhN8Xe0EpsrTZ+29LQ/xSZI8TyY=",
+        "usagesDigest": "e+vMswoLMFhZTZBOPj/u6dxDllDqKp7btmBZJfnFwew=",
         "recordedInputs": [
           "REPO_MAPPING:,linux_6_18_39 +linux_source_repository+linux_6_18_39",
           "REPO_MAPPING:,llvm llvm+"
@@ -318,8 +318,7 @@
               "overlays": {
                 "btf": "@@//configs:btf.config",
                 "debug": "@@//configs:debug.config",
-                "lz4": "@@//configs:lz4.config",
-                "c_modules": "@@//configs:c_modules.config"
+                "lz4": "@@//configs:lz4.config"
               },
               "platform": "@@llvm+//platforms:linux_x86_64",
               "source": "@@+linux_source_repository+linux_6_18_39//:Kconfig"
@@ -331,7 +330,6 @@
               "graph_repo": "example_x86_64__linux_graph",
               "variants": [
                 "btf",
-                "c_modules",
                 "debug",
                 "lz4"
               ]

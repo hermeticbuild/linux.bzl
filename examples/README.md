@@ -26,12 +26,6 @@ bazel build //:x86_64_btf_vmlinux
 bazel build //:x86_64_lz4_kernel
 ```
 
-Build the out-of-tree C module against the module-enabled x86_64 variant:
-
-```sh
-bazel build //:hello_c_module
-```
-
 The BTF variant builds `vmlinux` with `CONFIG_DEBUG_INFO_BTF=y`. This consumer
 does not declare a direct `pahole` dependency; the build exercises the
 tool supplied transitively by `linux.bzl`.
@@ -46,10 +40,10 @@ bazel build @example_x86_64//:modules_builtin
 bazel build @example_x86_64//:modules_builtin_modinfo
 ```
 
-The base example configurations set `CONFIG_MODULES=n`, so their `:modules`
-projection is an empty file set. The `c_modules` overlay and
-`//:hello_c_module` exercise in-tree and out-of-tree C module compilation;
-runtime module-load coverage lives in `e2e`.
+The example configurations set `CONFIG_MODULES=n`, so the `:modules`
+projection is an empty file set; these commands exercise the fixed label
+contract rather than compiling a module. Module build and load coverage lives
+in `e2e`.
 
 These examples focus on repository-rule configuration and deterministic
 packaging. Runtime coverage lives in the sibling `e2e` workspace, which boots
