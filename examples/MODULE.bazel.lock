@@ -287,7 +287,7 @@
     "@@linux.bzl+//:extensions.bzl%linux_images": {
       "general": {
         "bzlTransitiveDigest": "2wze+p/HlP8MYa3yH/96l4VDlJZ3yM5F6BV1T8Ajkr0=",
-        "usagesDigest": "e+vMswoLMFhZTZBOPj/u6dxDllDqKp7btmBZJfnFwew=",
+        "usagesDigest": "o0EPBDa1hbAsEqsj94Jkm3cS4I96FslvZLwgcx2VLaE=",
         "recordedInputs": [
           "REPO_MAPPING:,linux_6_18_39 +linux_source_repository+linux_6_18_39",
           "REPO_MAPPING:,llvm llvm+"
@@ -318,7 +318,9 @@
               "overlays": {
                 "btf": "@@//configs:btf.config",
                 "debug": "@@//configs:debug.config",
-                "lz4": "@@//configs:lz4.config"
+                "lz4": "@@//configs:lz4.config",
+                "kvm": "@@//configs:kvm.config",
+                "verity": "@@//configs:verity.config"
               },
               "platform": "@@llvm+//platforms:linux_x86_64",
               "source": "@@+linux_source_repository+linux_6_18_39//:Kconfig"
@@ -331,7 +333,9 @@
               "variants": [
                 "btf",
                 "debug",
-                "lz4"
+                "kvm",
+                "lz4",
+                "verity"
               ]
             }
           }

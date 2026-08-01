@@ -34,6 +34,16 @@ alias(
     actual = "@example_x86_64//variants/lz4:kernel",
 )
 
+alias(
+    name = "x86_64_kvm_kernel",
+    actual = "@example_x86_64//variants/kvm:kernel",
+)
+
+alias(
+    name = "x86_64_verity_kernel",
+    actual = "@example_x86_64//variants/verity:kernel",
+)
+
 genrule(
     name = "x86_64_shared_graph_metadata",
     srcs = ["@example_x86_64//graph:metadata.json"],
