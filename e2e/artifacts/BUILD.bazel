@@ -1,0 +1,84 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+package(default_visibility = ["//visibility:public"])
+
+go_test(
+    name = "armv7_test",
+    srcs = ["artifact_test.go"],
+    data = [
+        "//:hello_c_module_armv7",
+        "//:openbmc_armv7.config",
+        "@e2e_armv7//:config",
+        "@e2e_armv7//:image",
+        "@e2e_armv7//:vmlinux",
+    ],
+    env = {
+        "ARCH": "armv7",
+        "ELF_CLASS": "32",
+        "ELF_MACHINE": "arm",
+        "IMAGE_FORMAT": "arm-zimage",
+        "INFERRED_CONFIG": "CONFIG_ARM",
+        "INPUT_CONFIG": "$(location //:openbmc_armv7.config)",
+        "KERNEL_CONFIG": "$(location @e2e_armv7//:config)",
+        "KERNEL_IMAGE": "$(location @e2e_armv7//:image)",
+        "KERNEL_MODULE": "$(location //:hello_c_module_armv7)",
+        "KERNEL_VMLINUX": "$(location @e2e_armv7//:vmlinux)",
+        "REQUIRED_CONFIGS": "CONFIG_SYSVIPC,CONFIG_HIGH_RES_TIMERS,CONFIG_BPF_SYSCALL,CONFIG_ARCH_ASPEED,CONFIG_MACH_ASPEED_G6,CONFIG_ARCH_NPCM,CONFIG_MODULES",
+    },
+    pure = "on",
+    rundir = ".",
+)
+
+go_test(
+    name = "ppc64le_test",
+    srcs = ["artifact_test.go"],
+    data = [
+        "//:hello_c_module_ppc64le",
+        "//:tiny_ppc64le.config",
+        "@e2e_ppc64le//:config",
+        "@e2e_ppc64le//:image",
+        "@e2e_ppc64le//:vmlinux",
+    ],
+    env = {
+        "ARCH": "ppc64le",
+        "ELF_CLASS": "64",
+        "ELF_MACHINE": "ppc64",
+        "IMAGE_FORMAT": "elf",
+        "INFERRED_CONFIG": "CONFIG_PPC64",
+        "INPUT_CONFIG": "$(location //:tiny_ppc64le.config)",
+        "KERNEL_CONFIG": "$(location @e2e_ppc64le//:config)",
+        "KERNEL_IMAGE": "$(location @e2e_ppc64le//:image)",
+        "KERNEL_MODULE": "$(location //:hello_c_module_ppc64le)",
+        "KERNEL_VMLINUX": "$(location @e2e_ppc64le//:vmlinux)",
+        "REQUIRED_CONFIGS": "CONFIG_MODULES",
+    },
+    pure = "on",
+    rundir = ".",
+)
+
+go_test(
+    name = "riscv64_test",
+    srcs = ["artifact_test.go"],
+    data = [
+        "//:hello_c_module_riscv64",
+        "//:tiny_riscv64.config",
+        "@e2e_riscv64//:config",
+        "@e2e_riscv64//:image",
+        "@e2e_riscv64//:vmlinux",
+    ],
+    env = {
+        "ARCH": "riscv64",
+        "ELF_CLASS": "64",
+        "ELF_MACHINE": "riscv",
+        "IMAGE_FORMAT": "elf",
+        "INFERRED_CONFIG": "CONFIG_RISCV",
+        "INPUT_CONFIG": "$(location //:tiny_riscv64.config)",
+        "KERNEL_CONFIG": "$(location @e2e_riscv64//:config)",
+        "KERNEL_IMAGE": "$(location @e2e_riscv64//:image)",
+        "KERNEL_MODULE": "$(location //:hello_c_module_riscv64)",
+        "KERNEL_VMLINUX": "$(location @e2e_riscv64//:vmlinux)",
+        "REQUIRED_CONFIGS": "CONFIG_MODULES",
+    },
+    pure = "on",
+    rundir = ".",
+)
