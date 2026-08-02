@@ -8,12 +8,13 @@ load(":qemu_boot_test.bzl", "qemu_boot_test", "qemu_system_target")
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
-    "kvm.config",
+    "openbmc_armv7.config",
     "rust.config",
     "rust_arm64.config",
     "tiny.config",
     "tiny_arm64.config",
-    "verity.config",
+    "tiny_ppc64le.config",
+    "tiny_riscv64.config",
 ])
 
 linux_cc_module(
@@ -22,12 +23,28 @@ linux_cc_module(
     kernel = "@e2e_x86_64//:kernel",
 )
 
-build_test(
-    name = "kvm_verity_kernel_build_test",
-    targets = [
-        "@e2e_kvm_x86_64//:kernel",
-        "@e2e_verity_x86_64//:kernel",
-    ],
+linux_cc_module(
+    name = "hello_c_module_aarch64",
+    srcs = ["hello_module.c"],
+    kernel = "@e2e_aarch64//:kernel",
+)
+
+linux_cc_module(
+    name = "hello_c_module_armv7",
+    srcs = ["hello_module.c"],
+    kernel = "@e2e_armv7//:kernel",
+)
+
+linux_cc_module(
+    name = "hello_c_module_ppc64le",
+    srcs = ["hello_module.c"],
+    kernel = "@e2e_ppc64le//:kernel",
+)
+
+linux_cc_module(
+    name = "hello_c_module_riscv64",
+    srcs = ["hello_module.c"],
+    kernel = "@e2e_riscv64//:kernel",
 )
 
 linux_module(
@@ -481,6 +498,7 @@ build_test(
         "@e2e_aarch64//:modules_builtin_modinfo",
         "@e2e_aarch64//:modules_order",
         "@e2e_aarch64//:system_map",
+        ":hello_c_module_aarch64",
         ":kernel_image_aarch64",
         ":kernel_vmlinux_aarch64",
     ],
@@ -512,6 +530,45 @@ build_test(
 )
 
 build_test(
+    name = "kernel_outputs_armv7_build_test",
+    targets = [
+        "@e2e_armv7//:config",
+        "@e2e_armv7//:image",
+        "@e2e_armv7//:kernel_release",
+        "@e2e_armv7//:modules",
+        "@e2e_armv7//:system_map",
+        "@e2e_armv7//:vmlinux",
+        ":hello_c_module_armv7",
+    ],
+)
+
+build_test(
+    name = "kernel_outputs_ppc64le_build_test",
+    targets = [
+        "@e2e_ppc64le//:config",
+        "@e2e_ppc64le//:image",
+        "@e2e_ppc64le//:kernel_release",
+        "@e2e_ppc64le//:modules",
+        "@e2e_ppc64le//:system_map",
+        "@e2e_ppc64le//:vmlinux",
+        ":hello_c_module_ppc64le",
+    ],
+)
+
+build_test(
+    name = "kernel_outputs_riscv64_build_test",
+    targets = [
+        "@e2e_riscv64//:config",
+        "@e2e_riscv64//:image",
+        "@e2e_riscv64//:kernel_release",
+        "@e2e_riscv64//:modules",
+        "@e2e_riscv64//:system_map",
+        "@e2e_riscv64//:vmlinux",
+        ":hello_c_module_riscv64",
+    ],
+)
+
+build_test(
     name = "linux_source_root_package_build_test",
     targets = [
         "@e2e_linux_6_18_39//:tools/bpf/resolve_btfids/main.c",
@@ -526,6 +583,9 @@ test_suite(
     name = "kernel_outputs_build_test",
     tests = [
         ":kernel_outputs_aarch64_build_test",
+        ":kernel_outputs_armv7_build_test",
+        ":kernel_outputs_ppc64le_build_test",
+        ":kernel_outputs_riscv64_build_test",
         ":kernel_outputs_x86_64_build_test",
     ],
 )

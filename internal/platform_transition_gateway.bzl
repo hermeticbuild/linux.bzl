@@ -1,12 +1,13 @@
 """Private platform transition boundary for generated Linux build graphs."""
 
+load(":architecture_profiles.bzl", "linux_architecture_profiles")
 load(":providers.bzl", "LinuxKernelInfo", "LinuxModuleSdkInfo")
 
 visibility("//...")
 
 _ARCH_CPU_CONSTRAINTS = {
-    "aarch64": Label("@platforms//cpu:aarch64"),
-    "x86_64": Label("@platforms//cpu:x86_64"),
+    profile.name: profile.cpu
+    for profile in linux_architecture_profiles()
 }
 
 def _platform_transition_impl(_settings, attr):
@@ -95,7 +96,7 @@ def linux_platform_gateway(
       name: Public gateway target name.
       graph: Private aggregate kernel graph target.
       platform: Target platform label used for toolchain resolution.
-      arch: Canonical Linux architecture, x86_64 or aarch64.
+      arch: Canonical Linux target profile.
       visibility: Optional public gateway visibility.
       tags: Optional public gateway tags.
     """
@@ -128,6 +129,21 @@ def linux_platform_gateway(
     _platform_gateway(
         name = name,
         graph = ":" + guarded_graph,
+        platform = platform,
+        tags = tags,
+        visibility = visibility,
+    )
+
+def linux_platform_transition(
+        name,
+        graph,
+        platform,
+        visibility = None,
+        tags = None):
+    """Transitions graph to platform without preselecting an architecture."""
+    _platform_gateway(
+        name = name,
+        graph = graph,
         platform = platform,
         tags = tags,
         visibility = visibility,

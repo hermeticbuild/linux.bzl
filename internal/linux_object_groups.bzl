@@ -8,6 +8,7 @@ load(
 )
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+load(":architecture_profiles.bzl", "linux_arch_values", "linux_architecture_profile_for_arch")
 load(
     ":linux_objects.bzl",
     "LinuxCompileEnvironmentIndexInfo",
@@ -116,11 +117,7 @@ def _feature_configuration(ctx, cc_toolchain):
     )
 
 def _target_triple(arch):
-    if arch == "arm64":
-        return "aarch64-linux-gnu"
-    if arch == "x86":
-        return "x86_64-linux-gnu"
-    return ""
+    return linux_architecture_profile_for_arch(arch).target_triple
 
 def _rewrite_target_flags(flags, target_triple):
     if not target_triple:
@@ -587,7 +584,7 @@ def _linux_object_action_group_impl(ctx):
 linux_object_action_group = rule(
     implementation = _linux_object_action_group_impl,
     attrs = {
-        "arch": attr.string(mandatory = True, values = ["arm64", "x86"]),
+        "arch": attr.string(mandatory = True, values = linux_arch_values()),
         "compile_environment_index": attr.label(
             mandatory = True,
             providers = [LinuxCompileEnvironmentIndexInfo],
@@ -770,7 +767,7 @@ def _linux_composite_object_action_group_impl(ctx):
 linux_composite_object_action_group = rule(
     implementation = _linux_composite_object_action_group_impl,
     attrs = {
-        "arch": attr.string(mandatory = True, values = ["arm64", "x86"]),
+        "arch": attr.string(mandatory = True, values = linux_arch_values()),
         "member_groups": attr.label_list(
             mandatory = True,
             providers = [LinuxObjectActionGroupInfo],

@@ -1,28 +1,13 @@
 """Module extension and facade repositories for configured Linux images."""
 
 load("@llvm//toolchain:selects.bzl", "platform_module_map")
-load(
-    ":linux_image_repository.bzl",
-    _linux_image_repository = "linux_image",
-    _linux_target_profile_for_platform = "linux_target_profile_for_platform",
-)
+load(":architecture_profiles.bzl", "linux_architecture_profiles")
+load(":linux_image_repository.bzl", _linux_image_repository = "linux_image")
+load(":repository_utils.bzl", _repository_prefix = "repository_prefix")
 
 visibility("//...")
 
 _IMAGE_NAME_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_-"
-_PROJECTION_TARGETS = [
-    "config",
-    "image",
-    "kernel",
-    "kernel_release",
-    "module_symvers",
-    "modules",
-    "modules_builtin",
-    "modules_builtin_modinfo",
-    "modules_order",
-    "system_map",
-    "vmlinux",
-]
 
 def _llvm_probe_tools(module_ctx):
     os_name = module_ctx.os.name.lower()
@@ -58,58 +43,96 @@ def _validate_name(value, what):
         if char not in _IMAGE_NAME_CHARS:
             fail("%s %r contains unsupported character %r" % (what, value, char))
 
-def _facade_build(graph_repo):
-    lines = [
-        'package(default_visibility = ["//visibility:public"])',
-        "",
-    ]
-    for target in _PROJECTION_TARGETS:
-        lines.extend([
-            "alias(",
-            '    name = "%s",' % target,
-            '    actual = "@%s//:%s",' % (graph_repo, target),
-            ")",
-            "",
-        ])
+def _profile_labels(graph_repos, target):
+    return {
+        profile.name: "@%s//:%s" % (graph_repos[profile.name], target)
+        for profile in linux_architecture_profiles()
+    }
+
+def _format_dict(values, indent = "    "):
+    lines = ["{"]
+    for key in sorted(values.keys()):
+        lines.append("%s%r: %r," % (indent, key, values[key]))
+    lines.append(indent[:-4] + "}")
     return "\n".join(lines)
 
-def _variant_facade_build(graph_repo, variant):
-    lines = [
-        'package(default_visibility = ["//visibility:public"])',
-        "",
-    ]
-    for target in _PROJECTION_TARGETS:
-        lines.extend([
-            "alias(",
-            '    name = "%s",' % target,
-            '    actual = "@%s//variants/%s:%s",' % (graph_repo, variant, target),
-            ")",
-            "",
-        ])
-    return "\n".join(lines)
+def _facade_build(graph_repos, platform, rules_repo):
+    return """load("{rules_repo}//internal:multiarch_facade.bzl", "linux_multiarch_kernel_exports")
 
-def _graph_facade_build(graph_repo):
-    return "\n".join([
-        'package(default_visibility = ["//visibility:public"])',
-        "",
-        "alias(",
-        '    name = "metadata.json",',
-        '    actual = "@%s//graph:metadata.json",' % graph_repo,
-        ")",
-        "",
-    ])
+package(default_visibility = ["//visibility:public"])
+
+linux_multiarch_kernel_exports(
+    name = "kernel",
+    graphs = {graphs},
+    platform = {platform},
+)
+""".format(
+        graphs = _format_dict(_profile_labels(graph_repos, "_kernel_graph"), indent = "        "),
+        platform = repr(platform),
+        rules_repo = rules_repo,
+    )
+
+def _variant_facade_build(graph_repos, variant, platform, rules_repo):
+    graphs = {
+        profile.name: "@%s//:_variant_%s_graph" % (graph_repos[profile.name], variant)
+        for profile in linux_architecture_profiles()
+    }
+    return """load("{rules_repo}//internal:multiarch_facade.bzl", "linux_multiarch_kernel_exports")
+
+package(default_visibility = ["//visibility:public"])
+
+linux_multiarch_kernel_exports(
+    name = "kernel",
+    graphs = {graphs},
+    platform = {platform},
+)
+""".format(
+        graphs = _format_dict(graphs, indent = "        "),
+        platform = repr(platform),
+        rules_repo = rules_repo,
+    )
+
+def _graph_facade_build(graph_repos, platform, rules_repo):
+    files = {
+        profile.name: "@%s//graph:metadata.json" % graph_repos[profile.name]
+        for profile in linux_architecture_profiles()
+    }
+    return """load("{rules_repo}//internal:multiarch_facade.bzl", "linux_multiarch_file")
+
+package(default_visibility = ["//visibility:public"])
+
+linux_multiarch_file(
+    name = "metadata.json",
+    files = {files},
+    platform = {platform},
+)
+""".format(
+        files = _format_dict(files, indent = "        "),
+        platform = repr(platform),
+        rules_repo = rules_repo,
+    )
 
 def _linux_image_facade_repository_impl(rctx):
-    rctx.file("BUILD.bazel", _facade_build(rctx.attr.graph_repo), executable = False)
+    rules_repo = _repository_prefix(rctx.attr._self_linux_bzl)
+    rctx.file(
+        "BUILD.bazel",
+        _facade_build(rctx.attr.graph_repos, str(rctx.attr.platform), rules_repo),
+        executable = False,
+    )
     rctx.file(
         "graph/BUILD.bazel",
-        _graph_facade_build(rctx.attr.graph_repo),
+        _graph_facade_build(rctx.attr.graph_repos, str(rctx.attr.platform), rules_repo),
         executable = False,
     )
     for variant in sorted(rctx.attr.variants):
         rctx.file(
             "variants/%s/BUILD.bazel" % variant,
-            _variant_facade_build(rctx.attr.graph_repo, variant),
+            _variant_facade_build(
+                rctx.attr.graph_repos,
+                variant,
+                str(rctx.attr.platform),
+                rules_repo,
+            ),
             executable = False,
         )
     return rctx.repo_metadata(reproducible = True)
@@ -117,8 +140,10 @@ def _linux_image_facade_repository_impl(rctx):
 _linux_image_facade_repository = repository_rule(
     implementation = _linux_image_facade_repository_impl,
     attrs = {
-        "graph_repo": attr.string(mandatory = True),
+        "graph_repos": attr.string_dict(mandatory = True),
+        "platform": attr.label(mandatory = True),
         "variants": attr.string_list(),
+        "_self_linux_bzl": attr.label(default = Label("//:linux.bzl")),
     },
 )
 
@@ -146,10 +171,12 @@ def _root_tags(module_ctx):
             overlays[key] = tag
     generated_repositories = {}
     for name in sorted(images):
-        for repository in [
-            name,
-            name + "__linux_graph",
-        ]:
+        repositories = [name]
+        repositories.extend([
+            name + "__linux_graph__" + profile.name
+            for profile in linux_architecture_profiles()
+        ])
+        for repository in repositories:
             owner = generated_repositories.get(repository)
             if owner != None:
                 fail(
@@ -170,25 +197,28 @@ def _linux_images_impl(module_ctx):
 
     for name in sorted(images):
         image = images[name]
-        graph_repo = name + "__linux_graph"
         image_overlays = overlays_by_image.get(name, {})
-        target_profile = _linux_target_profile_for_platform(image.platform)
-        _linux_image_repository(
-            name = graph_repo,
-            config = image.config,
-            config_mode = image.config_mode,
-            overlays = image_overlays,
-            platform = image.platform,
-            probe_cc = probe_tools.cc,
-            probe_ld = probe_tools.ld,
-            source = image.source,
-            target_profile = target_profile.name,
-            linux_arch = target_profile.linux_arch,
-            target_triple = target_profile.target_triple,
-        )
+        graph_repos = {}
+        for profile in linux_architecture_profiles():
+            graph_repo = name + "__linux_graph__" + profile.name
+            graph_repos[profile.name] = graph_repo
+            _linux_image_repository(
+                name = graph_repo,
+                config = image.config,
+                config_mode = image.config_mode,
+                overlays = image_overlays,
+                platform = image.platform,
+                probe_cc = probe_tools.cc,
+                probe_ld = probe_tools.ld,
+                source = image.source,
+                target_profile = profile.name,
+                linux_arch = profile.linux_arch,
+                target_triple = profile.target_triple,
+            )
         _linux_image_facade_repository(
             name = name,
-            graph_repo = graph_repo,
+            graph_repos = graph_repos,
+            platform = image.platform,
             variants = sorted(image_overlays.keys()),
         )
 

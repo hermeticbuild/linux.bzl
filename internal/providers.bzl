@@ -5,7 +5,7 @@ visibility("//...")
 LinuxKernelInfo = provider(
     doc = "Outputs and metadata for one configured Linux kernel.",
     fields = {
-        "arch": "Canonical Linux target architecture: x86_64 or aarch64.",
+        "arch": "Canonical platform-derived Linux target profile.",
         "version": "Upstream Linux source version.",
         "kernel_release": "File containing the resolved kernel release.",
         "image": "Architecture boot image File.",
