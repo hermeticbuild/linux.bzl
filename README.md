@@ -14,7 +14,13 @@ Add `linux.bzl` and a hermetic C/C++ toolchain to `MODULE.bazel`:
 
 ```starlark
 bazel_dep(name = "linux.bzl", version = "0.0.1")
-bazel_dep(name = "llvm", version = "<HERMETIC_LLVM_MULTIARCH_VERSION>")
+bazel_dep(name = "llvm", version = "0.8.14")
+
+git_override(
+    module_name = "llvm",
+    commit = "d088194981c8d9775cc7dc3d81d9ea08f9ece90b",
+    remote = "https://github.com/fionera/hermetic-llvm.git",
+)
 
 register_toolchains(
     "@llvm//toolchain:all",
@@ -40,10 +46,9 @@ linux_images.image(
 use_repo(linux_images, "example_kernel")
 ```
 
-Replace `<HERMETIC_LLVM_MULTIARCH_VERSION>` with the first Hermetic LLVM
-release that includes the freestanding five-profile kernel toolchains. The
-version is intentionally left explicit until that prerequisite release is
-published.
+The temporary `git_override` pins the preview of the Hermetic LLVM
+freestanding five-profile kernel toolchains. Remove it once that prerequisite
+is available in a published Hermetic LLVM release.
 
 When developing against a checkout, add:
 
