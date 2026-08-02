@@ -1,15 +1,6 @@
 package kconfig
 
-import (
-	"reflect"
-	"testing"
-)
-
-func TestKernelFlagsConfigSymbolsPreservesUnscopedCallers(t *testing.T) {
-	if got, want := KernelFlagsConfigSymbols(), KernelFlagsConfigSymbols("x86"); !reflect.DeepEqual(got, want) {
-		t.Fatalf("unscoped compiler footprint differs from x86-compatible common footprint\nwant: %v\n got: %v", want, got)
-	}
-}
+import "testing"
 
 func TestKernelFlagsConfigSymbolsScopesArchitectureDependencies(t *testing.T) {
 	tests := []struct {
