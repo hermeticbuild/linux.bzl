@@ -635,6 +635,7 @@ def _arm_compressed_flagfilter_test_impl(ctx):
     ]
     asserts.true(env, len(filter_actions) > 0, "ARM compressed image did not filter Kbuild flags")
     zstd_actions = [action for action in actions if action.mnemonic == "LinuxARMZSTD"]
+    decompressor_actions = [action for action in actions if action.mnemonic == "LinuxARMDecompressor"]
     append_actions = [
         action
         for action in actions
@@ -649,6 +650,7 @@ def _arm_compressed_flagfilter_test_impl(ctx):
         ])
     ]
     asserts.equals(env, 1, len(zstd_actions))
+    asserts.equals(env, 1, len(decompressor_actions))
     asserts.equals(env, 1, len(append_actions))
     asserts.equals(env, 1, len(piggy_actions))
     if zstd_actions:
@@ -664,11 +666,29 @@ def _arm_compressed_flagfilter_test_impl(ctx):
             output.path.endswith("/arch/arm/boot/compressed/piggy_data")
             for output in append_actions[0].outputs.to_list()
         ]))
+    if decompressor_actions:
+        asserts.true(env, any([
+            input.path.endswith("/arch/arm/boot/compressed/decompress.c")
+            for input in decompressor_actions[0].inputs.to_list()
+        ]))
+        asserts.true(env, any([
+            output.path.endswith("/arch/arm/boot/compressed/decompress.adaptive.c")
+            for output in decompressor_actions[0].outputs.to_list()
+        ]))
     if piggy_actions:
         asserts.true(env, any([
             input.path.endswith("/arch/arm/boot/compressed/piggy_data")
             for input in piggy_actions[0].inputs.to_list()
         ]))
+    decompressor_compiles = [
+        action
+        for action in actions
+        if action.mnemonic == "LinuxARMCompressedCompile" and any([
+            input.path.endswith("/arch/arm/boot/compressed/decompress.adaptive.c")
+            for input in action.inputs.to_list()
+        ])
+    ]
+    asserts.equals(env, 1, len(decompressor_compiles))
     asserts.true(env, any([
         output.path.endswith(".zImage")
         for output in target[DefaultInfo].files.to_list()

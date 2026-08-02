@@ -8904,6 +8904,21 @@ def _linux_arm_compressed_source_specs(config):
     ])
     return specs
 
+def _linux_arm_adaptive_decompressor(ctx, src):
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/arm/boot/compressed/decompress.adaptive.c")
+    args = ctx.actions.args()
+    args.add_all(["-in", src, "-out", out])
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._armdecompress,
+        inputs = [src],
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxARMDecompressor",
+        progress_message = "Adapting Linux ARM ZSTD decompressor %{label}",
+    )
+    return out
+
 def _linux_arm_zimage_impl(ctx):
     if not ctx.attr.config:
         fail("linux_compressed_image with arm_zimage format requires config")
@@ -8967,6 +8982,9 @@ def _linux_arm_zimage_impl(ctx):
     )
     objects = [head, piggy]
     for source, extra_flags in _linux_arm_compressed_source_specs(config):
+        src = _source_tree_file(ctx, "arch/arm/boot/compressed/" + source)
+        if source == "decompress.c" and _linux_x86_config_enabled(config, "CONFIG_KERNEL_ZSTD"):
+            src = _linux_arm_adaptive_decompressor(ctx, src)
         objects.append(_linux_arm_compressed_compile(
             ctx,
             compiler,
@@ -8975,7 +8993,7 @@ def _linux_arm_zimage_impl(ctx):
             config,
             generated_headers,
             source_root,
-            _source_tree_file(ctx, "arch/arm/boot/compressed/" + source),
+            src,
             "arch/arm/boot/compressed/" + source.rsplit(".", 1)[0] + ".o",
             extra_flags = extra_flags,
         ))
@@ -9127,6 +9145,11 @@ linux_compressed_image = rule(
         "_archheaders": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/archheaders"),
+            executable = True,
+        ),
+        "_armdecompress": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/armdecompress"),
             executable = True,
         ),
         "_flagfilter": attr.label(

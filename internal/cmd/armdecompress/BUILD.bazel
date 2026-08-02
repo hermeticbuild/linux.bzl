@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "armdecompress_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/armdecompress",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "armdecompress",
+    embed = [":armdecompress_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "armdecompress_test",
+    srcs = ["main_test.go"],
+    embed = [":armdecompress_lib"],
+)
