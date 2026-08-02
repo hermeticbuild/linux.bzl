@@ -57,11 +57,11 @@ linux_multiarch_kernel_exports(
 linux_multiarch_file(
     name = "selected_file",
     files = {
-        "aarch64": ":multiarch_facade_test.bzl",
+        "aarch64": ":BUILD.bazel",
         "armv7": ":multiarch_facade_test.bzl",
-        "ppc64le": ":multiarch_facade_test.bzl",
-        "riscv64": ":multiarch_facade_test.bzl",
-        "x86_64": ":multiarch_facade_test.bzl",
+        "ppc64le": ":BUILD.bazel",
+        "riscv64": ":BUILD.bazel",
+        "x86_64": ":BUILD.bazel",
     },
     platform = ":linux_armv7",
 )

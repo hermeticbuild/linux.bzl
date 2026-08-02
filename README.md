@@ -343,8 +343,8 @@ for each host listed above; kernel compile actions target the registered Clang
 toolchain selected by the image platform.
 
 The public kernel contract includes resolved configs, native boot images or the
-documented `vmlinux` fallback, `vmlinux`,
-`System.map`, kernel release metadata, configured in-tree modules, and their
+documented `vmlinux` fallback, `System.map`, kernel release metadata,
+configured in-tree modules, and their
 installation metadata. The separate `initramfs` rule supplies boot userspace
 archives, while `linux_cc_module` and `linux_module` build out-of-tree C and
 Rust-for-Linux modules respectively.

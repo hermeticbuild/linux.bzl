@@ -62,15 +62,34 @@ func TestPrepareTargetConfigDoesNotSeedRootArchitectureSymbol(t *testing.T) {
 }
 
 func TestPrepareTargetConfigRejectsContradiction(t *testing.T) {
-	profile, _ := LinuxTargetProfileByName("armv7")
-	for _, raw := range []map[string]string{
-		{"CONFIG_ARM64": "y"},
-		{"CONFIG_ARM": "n"},
-		{"CONFIG_64BIT": "y"},
+	for _, test := range []struct {
+		profile  string
+		foreign  string
+		required string
+	}{
+		{profile: "x86_64", foreign: "CONFIG_ARM", required: "CONFIG_X86_64"},
+		{profile: "aarch64", foreign: "CONFIG_X86_64", required: "CONFIG_ARM64"},
+		{profile: "armv7", foreign: "CONFIG_ARM64", required: "CONFIG_ARM"},
 	} {
-		if _, err := profile.PrepareTargetConfig(raw); err == nil {
-			t.Fatalf("PrepareTargetConfig(%#v) unexpectedly succeeded", raw)
-		}
+		t.Run(test.profile, func(t *testing.T) {
+			profile, err := LinuxTargetProfileByName(test.profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, raw := range []map[string]string{
+				{test.foreign: "y"},
+				{test.required: "n"},
+			} {
+				if _, err := profile.PrepareTargetConfig(raw); err == nil {
+					t.Errorf("PrepareTargetConfig(%#v) unexpectedly succeeded", raw)
+				}
+			}
+		})
+	}
+
+	armv7, _ := LinuxTargetProfileByName("armv7")
+	if _, err := armv7.PrepareTargetConfig(map[string]string{"CONFIG_64BIT": "y"}); err == nil {
+		t.Fatal("PrepareTargetConfig(CONFIG_64BIT=y) unexpectedly succeeded for armv7")
 	}
 }
 
