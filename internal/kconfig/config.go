@@ -243,7 +243,7 @@ func ValidateRustToolchainEquivalence(expected map[string]string, actual *Resolv
 		}
 	}
 	for key, got := range actual.Effective {
-		if IsRustToolchainValue(key) || !actual.ShouldWrite(key) || got == "" || got == "n" {
+		if IsRustToolchainValue(key) || !actual.ShouldWrite(key) || got == "" || got == `""` || got == "n" {
 			continue
 		}
 		if _, ok := expected[key]; !ok {

@@ -62,6 +62,7 @@ func TestValidateRustToolchainEquivalence(t *testing.T) {
 			"CONFIG_RUSTC_VERSION": "109800",
 			"CONFIG_RUSTC_HAS_FOO": "y",
 			"CONFIG_HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC": "y",
+			"CONFIG_EMPTY_STRING_DEFAULT":                    `""`,
 			"CONFIG_STRUCTURAL_NEW":                          "n",
 		},
 		Written: map[string]bool{
@@ -69,6 +70,7 @@ func TestValidateRustToolchainEquivalence(t *testing.T) {
 			"CONFIG_RUSTC_VERSION": true,
 			"CONFIG_RUSTC_HAS_FOO": true,
 			"CONFIG_HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC": true,
+			"CONFIG_EMPTY_STRING_DEFAULT":                    true,
 		},
 	}
 	if err := ValidateRustToolchainEquivalence(map[string]string{
