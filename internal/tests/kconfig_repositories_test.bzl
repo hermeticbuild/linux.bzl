@@ -186,15 +186,6 @@ def _metadata_key_validation_test_impl(ctx):
             "path": "",
         }],
         "source_input_groups": [],
-        "schema": "compact-v7-adaptive-content-graph",
-        "target": {
-            "linux_arch": "x86",
-            "probe_identity": "sha256:test",
-            "profile": "x86_64",
-            "srcarch": "x86",
-            "target_triple": "x86_64-linux-gnu",
-            "uts_machine": "x86_64",
-        },
     }
     asserts.equals(
         env,
@@ -269,15 +260,6 @@ def _metadata_key_validation_test_impl(ctx):
             "path": "",
         }],
         "source_input_groups": [],
-        "schema": "compact-v7-adaptive-content-graph",
-        "target": {
-            "linux_arch": "x86",
-            "probe_identity": "sha256:test",
-            "profile": "x86_64",
-            "srcarch": "x86",
-            "target_triple": "x86_64-linux-gnu",
-            "uts_machine": "x86_64",
-        },
     }
     asserts.equals(
         env,
