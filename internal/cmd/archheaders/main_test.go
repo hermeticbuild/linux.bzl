@@ -2,6 +2,7 @@ package main
 
 import (
 	"debug/elf"
+	"encoding/binary"
 	"strings"
 	"testing"
 )
@@ -118,5 +119,44 @@ func TestRISCVVDSOOffsets(t *testing.T) {
 	}
 	if !strings.Contains(string(compat), "compat__vdso_getcpu_offset") {
 		t.Fatalf("compat RISC-V vDSO offsets have wrong prefix: %q", compat)
+	}
+}
+
+func TestPowerPCVDSOOffsets(t *testing.T) {
+	symbols := []elf.Symbol{
+		{Name: "VDSO_sigtramp_rt64", Value: 0x40, Section: 1},
+		{Name: "VDSO_zero", Value: 0, Section: 1},
+		{Name: "VDSO_top_bit", Value: 0x8000000000000000, Section: 1},
+		{Name: "ignored", Value: 1, Section: 1},
+		{Name: "VDSO_undefined", Value: 0, Section: elf.SHN_UNDEF},
+		{Name: "VDSO_ftr_fixup_start", Value: 0x20, Section: elf.SHN_ABS},
+	}
+	out, err := powerPCVDSOOffsets(symbols, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "#define vdso64_offset_ftr_fixup_start\t0x020\n#define vdso64_offset_sigtramp_rt64\t0x040\n#define vdso64_offset_top_bit\t0x8000000000000000\n#define vdso64_offset_zero\t0x0\n"
+	if string(out) != want {
+		t.Fatalf("powerPCVDSOOffsets() = %q, want %q", out, want)
+	}
+	if _, err := powerPCVDSOOffsets(symbols, 16); err == nil {
+		t.Fatal("powerPCVDSOOffsets() unexpectedly accepted 16-bit PowerPC")
+	}
+}
+
+func TestValidateVDSORelocationData(t *testing.T) {
+	none := make([]byte, 24)
+	if err := validateVDSORelocationData(none, elf.ELFCLASS64, elf.SHT_RELA, binary.LittleEndian); err != nil {
+		t.Fatalf("NONE relocation rejected: %v", err)
+	}
+
+	nonNone := make([]byte, 16)
+	binary.BigEndian.PutUint64(nonNone[8:16], 42)
+	if err := validateVDSORelocationData(nonNone, elf.ELFCLASS64, elf.SHT_REL, binary.BigEndian); err == nil {
+		t.Fatal("non-NONE relocation unexpectedly accepted")
+	}
+
+	if err := validateVDSORelocationData(make([]byte, 7), elf.ELFCLASS32, elf.SHT_REL, binary.LittleEndian); err == nil {
+		t.Fatal("malformed relocation data unexpectedly accepted")
 	}
 }

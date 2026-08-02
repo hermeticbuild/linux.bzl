@@ -385,7 +385,7 @@ func linuxCFlags(config map[string]string, arch, version string) []string {
 	case "powerpc":
 		flags = append(flags, powerPCCFlags(config)...)
 	case "riscv":
-		flags = append(flags, riscvCFlags(config)...)
+		flags = append(flags, riscvCFlags(config, version)...)
 	case "x86":
 		flags = append(flags, x86CFlags(config, version)...)
 	}
@@ -739,7 +739,7 @@ func riscvMarch(config map[string]string, assembly bool) string {
 	return march
 }
 
-func riscvCFlags(config map[string]string) []string {
+func riscvCFlags(config map[string]string, version string) []string {
 	flags := []string{
 		"-mabi=lp64",
 		"-march=" + riscvMarch(config, false),
@@ -764,10 +764,16 @@ func riscvCFlags(config map[string]string) []string {
 	}
 	if enabled(config, "CONFIG_DYNAMIC_FTRACE") {
 		flags = append(flags, "-DCC_USING_PATCHABLE_FUNCTION_ENTRY")
-		if enabled(config, "CONFIG_RISCV_ISA_C") {
-			flags = append(flags, "-fpatchable-function-entry=8,4")
+		if kernelVersionAtLeast(version, 6, 16) {
+			if enabled(config, "CONFIG_RISCV_ISA_C") {
+				flags = append(flags, "-fpatchable-function-entry=8,4")
+			} else {
+				flags = append(flags, "-fpatchable-function-entry=4,2")
+			}
+		} else if enabled(config, "CONFIG_RISCV_ISA_C") {
+			flags = append(flags, "-fpatchable-function-entry=4")
 		} else {
-			flags = append(flags, "-fpatchable-function-entry=4,2")
+			flags = append(flags, "-fpatchable-function-entry=2")
 		}
 	}
 	return flags

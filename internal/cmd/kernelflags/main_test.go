@@ -409,6 +409,31 @@ func TestLinuxFlagsRISCV64(t *testing.T) {
 	}
 }
 
+func TestLinuxFlagsRISCVFtraceVersion(t *testing.T) {
+	for _, test := range []struct {
+		version    string
+		compressed bool
+		want       string
+	}{
+		{version: "6.12.0", compressed: true, want: "-fpatchable-function-entry=4"},
+		{version: "6.12.0", compressed: false, want: "-fpatchable-function-entry=2"},
+		{version: "6.16.0", compressed: true, want: "-fpatchable-function-entry=8,4"},
+		{version: "6.16.0", compressed: false, want: "-fpatchable-function-entry=4,2"},
+	} {
+		config := map[string]string{
+			"CONFIG_ARCH_RV64I":     "y",
+			"CONFIG_DYNAMIC_FTRACE": "y",
+		}
+		if test.compressed {
+			config["CONFIG_RISCV_ISA_C"] = "y"
+		}
+		flags := linuxCFlags(config, "riscv", test.version)
+		if !contains(flags, test.want) {
+			t.Errorf("RISC-V %s C flags missing %s: %v", test.version, test.want, flags)
+		}
+	}
+}
+
 func TestLinuxFlagsPPC64LE(t *testing.T) {
 	config := map[string]string{
 		"CONFIG_CPU_LITTLE_ENDIAN": "y",

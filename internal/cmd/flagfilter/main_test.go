@@ -9,8 +9,21 @@ func TestFilterFlagsRemovesExactTokens(t *testing.T) {
 	got := filterFlags(
 		[]string{"-O2", "-mgeneral-regs-only", "-Wno-psabi", "-mgeneral-regs-only"},
 		[]string{"-mgeneral-regs-only"},
+		nil,
 	)
 	want := []string{"-O2", "-Wno-psabi"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("filterFlags() = %#v, want %#v", got, want)
+	}
+}
+
+func TestFilterFlagsRemovesPrefixes(t *testing.T) {
+	got := filterFlags(
+		[]string{"-O2", "-fprofile-use=kernel.profdata", "-fprofile-sample-use=sample.profdata", "-fprofile-generate"},
+		nil,
+		[]string{"-fprofile-use=", "-fprofile-sample-use="},
+	)
+	want := []string{"-O2", "-fprofile-generate"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("filterFlags() = %#v, want %#v", got, want)
 	}

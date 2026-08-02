@@ -769,6 +769,11 @@ def _linux_ftrace_remove_flags():
         "-mrecord-mcount",
         "-mnop-mcount",
         "-mfentry",
+        "-mprofile-kernel",
+        "-fpatchable-function-entry=1",
+        "-fpatchable-function-entry=3,1",
+        "-fpatchable-function-entry=8,4",
+        "-fpatchable-function-entry=4",
         "-fpatchable-function-entry=4,2",
         "-fpatchable-function-entry=2",
     ]
@@ -851,11 +856,11 @@ def _linux_generated_header_cflags(generated_headers):
         return [generated_headers.cflags]
     return []
 
-def _linux_filtered_config_flags_for_source(ctx, config, src, remove_flags, out_suffix = "filtered"):
+def _linux_filtered_config_flags_for_source(ctx, config, src, remove_flags, out_suffix = "filtered", remove_prefixes = []):
     if not config:
         return struct(flags = [], inputs = [])
     base = config.aflags if _is_assembly_source(src) else config.cflags
-    if not remove_flags:
+    if not remove_flags and not remove_prefixes:
         return struct(flags = [base], inputs = [])
 
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + base.basename + "." + out_suffix + ".rsp")
@@ -863,6 +868,7 @@ def _linux_filtered_config_flags_for_source(ctx, config, src, remove_flags, out_
     args.add("-in", base)
     args.add("-out", out)
     args.add_all(remove_flags, before_each = "-remove")
+    args.add_all(remove_prefixes, before_each = "-remove_prefix")
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._flagfilter,
@@ -1162,6 +1168,260 @@ def _linux_purgatory_outputs(ctx, compiler, linker, cc_toolchain, feature_config
         ))
     ro = _linux_purgatory_link(ctx, linker, cc_toolchain, objects, "arch/x86/purgatory/purgatory.ro", True)
     chk = _linux_purgatory_link(ctx, linker, cc_toolchain, [ro], "arch/x86/purgatory/purgatory.chk", False)
+    return struct(check = chk, ro = ro)
+
+def _linux_powerpc_purgatory_outputs(
+        ctx,
+        compiler,
+        linker,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root):
+    src = _source_tree_file(ctx, "arch/powerpc/purgatory/trampoline_64.S")
+    obj_relpath = "arch/powerpc/purgatory/trampoline_64.o"
+    obj = ctx.actions.declare_file(ctx.label.name + ".obj/" + obj_relpath)
+    args = ctx.actions.args()
+    args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all(_linux_config_aflags(config), format_each = "@%s")
+    args.add_all(_linux_object_name_flags(obj_relpath))
+    args.add_all(_linux_source_preinclude_flags_for_root(source_root, True))
+    _add_config_include_flag(args, config)
+    add_directory_arg(args, directory_anchor(src), format = "-I%s")
+    _add_linux_source_include_flags(ctx, args, generated_headers)
+    args.add_all(["-c", src, "-o", obj])
+    source_inputs = _linux_object_compile_source_tree_inputs(ctx, direct = [src])
+    path_mapped_run(
+        ctx.actions,
+        executable = compiler,
+        inputs = depset(
+            source_inputs.direct,
+            transitive = source_inputs.transitive + [cc_toolchain.all_files, config.files, generated_headers.files],
+        ),
+        outputs = [obj],
+        arguments = [args],
+        mnemonic = "LinuxPowerPCPurgatoryCompile",
+        progress_message = "Compiling Linux PowerPC purgatory trampoline %{label}",
+    )
+
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/powerpc/purgatory/purgatory.ro")
+    ld = _linux_x86_tool_sibling(linker, "ld.lld")
+    link_args = ctx.actions.args()
+    little_endian = config.config_flags.get("CONFIG_CPU_BIG_ENDIAN") != "y"
+    link_args.add("-EL" if little_endian else "-EB")
+    link_args.add_all([
+        "-m",
+        "elf64lppc" if little_endian else "elf64ppc",
+        "-z",
+        "noexecstack",
+    ])
+    if config.config_flags.get("CONFIG_LTO_CLANG") == "y":
+        link_args.add_all(["-mllvm", "-import-instr-limit=5"])
+    link_args.add_all([
+        "-e",
+        "purgatory_start",
+        "-r",
+        "--no-undefined",
+        "-o",
+        out,
+        obj,
+    ])
+    path_mapped_run(
+        ctx.actions,
+        executable = ld,
+        inputs = depset([obj], transitive = [cc_toolchain.all_files]),
+        outputs = [out],
+        arguments = [link_args],
+        mnemonic = "LinuxPowerPCPurgatoryLink",
+        progress_message = "Linking Linux PowerPC purgatory binary %{label}",
+    )
+    return out
+
+def _linux_riscv_purgatory_compile(
+        ctx,
+        compiler,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        src,
+        out_relpath,
+        extra_flags = []):
+    assembly = _is_assembly_source(src)
+    remove_flags = [
+        "-g",
+        "-gdwarf-4",
+        "-gdwarf-5",
+        "-Wa,-g",
+        "-Wa,-gdwarf-4",
+        "-Wa,-gdwarf-5",
+    ] if assembly else _linux_ftrace_remove_flags() + [
+        "-mcmodel=kernel",
+        "-fstack-protector",
+        "-fstack-protector-strong",
+        "-fPIE",
+        "-fsanitize=kcfi",
+        "-fsanitize-cfi-icall-experimental-normalize-integers",
+        "-fsanitize-kcfi-arity",
+        "-fsanitize=shadow-call-stack",
+    ]
+    remove_prefixes = [] if assembly else [
+        "-fprofile-sample-use=",
+        "-fprofile-use=",
+    ]
+    if not assembly and config.config_flags.get("CONFIG_KSTACK_ERASE") == "y" and config.config_flags.get("CONFIG_CC_IS_CLANG") == "y":
+        remove_flags.append("-fsanitize-coverage=stack-depth")
+        remove_prefixes.append("-fsanitize-coverage-stack-depth-callback-min=")
+    filtered = _linux_filtered_config_flags_for_source(
+        ctx,
+        config,
+        src,
+        remove_flags,
+        out_suffix = "riscv-purgatory-" + src.basename,
+        remove_prefixes = remove_prefixes,
+    )
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
+    args = ctx.actions.args()
+    args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all(filtered.flags, format_each = "@%s")
+    args.add_all(_linux_object_name_flags(out_relpath))
+    if not assembly:
+        args.add_all([
+            "-mcmodel=medany",
+            "-ffreestanding",
+            "-fno-zero-initialized-in-bss",
+            "-DDISABLE_BRANCH_PROFILING",
+            "-fno-stack-protector",
+            "-g0",
+        ])
+        if config.config_flags.get("CONFIG_KSTACK_ERASE") == "y" and config.config_flags.get("CONFIG_CC_IS_CLANG") == "y":
+            args.add("-fno-sanitize-coverage=stack-depth")
+    args.add_all(extra_flags)
+    args.add_all(_linux_source_preinclude_flags_for_root(source_root, assembly))
+    _add_config_include_flag(args, config)
+    add_directory_arg(args, directory_anchor(src), format = "-I%s")
+    _add_linux_source_include_flags(ctx, args, generated_headers)
+    args.add("-c")
+    args.add(src)
+    args.add("-o")
+    args.add(out)
+
+    source_inputs = _linux_object_compile_source_tree_inputs(ctx, direct = [src] + filtered.inputs)
+    path_mapped_run(
+        ctx.actions,
+        executable = compiler,
+        inputs = depset(
+            source_inputs.direct,
+            transitive = source_inputs.transitive + [cc_toolchain.all_files, config.files, generated_headers.files],
+        ),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxRISCVPurgatoryCompile",
+        progress_message = "Compiling Linux RISC-V purgatory object %{label}",
+    )
+    return out
+
+def _linux_riscv_purgatory_link(ctx, linker, cc_toolchain, config, objects, out_relpath, relocatable):
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
+    ld = _linux_x86_tool_sibling(linker, "ld.lld")
+    args = ctx.actions.args()
+    args.add_all([
+        "-m",
+        "elf64lriscv",
+        "-z",
+        "noexecstack",
+    ])
+    if config.config_flags.get("CONFIG_LTO_CLANG") == "y":
+        args.add_all([
+            "-mllvm",
+            "-import-instr-limit=5",
+            "-mllvm",
+            "-mattr=+c",
+            "-mllvm",
+            "-mattr=+relax",
+        ])
+    if config.config_flags.get("CONFIG_SHADOW_CALL_STACK") == "y":
+        args.add("--no-relax-gp")
+    if relocatable:
+        args.add("-r")
+    args.add_all([
+        "-e",
+        "purgatory_start",
+        "-z",
+        "nodefaultlib",
+        "-o",
+        out,
+    ])
+    args.add_all(objects)
+    path_mapped_run(
+        ctx.actions,
+        executable = ld,
+        inputs = depset(objects, transitive = [cc_toolchain.all_files]),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxRISCVPurgatoryCheck" if not relocatable else "LinuxRISCVPurgatoryLink",
+        progress_message = "Checking Linux RISC-V purgatory binary %{label}" if not relocatable else "Linking Linux RISC-V purgatory binary %{label}",
+    )
+    return out
+
+def _linux_riscv_purgatory_outputs(
+        ctx,
+        compiler,
+        linker,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root):
+    sources = [
+        ("arch/riscv/purgatory/purgatory.c", "purgatory.o", []),
+        ("lib/crypto/sha256.c", "sha256.o", ["-D__DISABLE_EXPORTS", "-D__NO_FORTIFY"]),
+        ("arch/riscv/purgatory/entry.S", "entry.o", []),
+        ("lib/string.c", "string.o", ["-D__DISABLE_EXPORTS"]),
+        ("lib/ctype.c", "ctype.o", ["-D__DISABLE_EXPORTS"]),
+        ("arch/riscv/lib/memcpy.S", "memcpy.o", []),
+        ("arch/riscv/lib/memset.S", "memset.o", []),
+    ]
+    if config.config_flags.get("CONFIG_KASAN_GENERIC") != "y" and config.config_flags.get("CONFIG_KASAN_SW_TAGS") != "y":
+        sources.extend([
+            ("arch/riscv/lib/strcmp.S", "strcmp.o", []),
+            ("arch/riscv/lib/strlen.S", "strlen.o", []),
+            ("arch/riscv/lib/strncmp.S", "strncmp.o", []),
+        ])
+    objects = []
+    for src_relpath, basename, extra_flags in sources:
+        objects.append(_linux_riscv_purgatory_compile(
+            ctx,
+            compiler,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+            _source_tree_file(ctx, src_relpath),
+            "arch/riscv/purgatory/" + basename,
+            extra_flags,
+        ))
+    ro = _linux_riscv_purgatory_link(
+        ctx,
+        linker,
+        cc_toolchain,
+        config,
+        objects,
+        "arch/riscv/purgatory/purgatory.ro",
+        True,
+    )
+    chk = _linux_riscv_purgatory_link(
+        ctx,
+        linker,
+        cc_toolchain,
+        config,
+        [ro],
+        "arch/riscv/purgatory/purgatory.chk",
+        False,
+    )
     return struct(check = chk, ro = ro)
 
 def _linux_realmode_compile(ctx, compiler, cc_toolchain, config, generated_headers, source_root, src, out_relpath):
@@ -1721,6 +1981,36 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         assembler_include_roots.append(purgatory.ro.dirname[:-len("/arch/x86/purgatory")])
         assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(purgatory.ro, assembler_include_roots[-1])
 
+    if ctx.attr.object == "arch/riscv/purgatory/kexec-purgatory.o":
+        purgatory = _linux_riscv_purgatory_outputs(
+            ctx,
+            compiler,
+            linker,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+        )
+        files.extend([purgatory.ro, purgatory.check])
+        assembler_include_roots.append(purgatory.ro.dirname[:-len("/arch/riscv/purgatory")])
+        assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(purgatory.ro, assembler_include_roots[-1])
+
+    if ctx.attr.object == "arch/powerpc/purgatory/kexec-purgatory.o":
+        purgatory = _linux_powerpc_purgatory_outputs(
+            ctx,
+            compiler,
+            linker,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+        )
+        files.append(purgatory)
+        assembler_include_roots.append(purgatory.dirname[:-len("/arch/powerpc/purgatory")])
+        assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(purgatory, assembler_include_roots[-1])
+
     if ctx.attr.object == "arch/x86/realmode/rmpiggy.o":
         realmode = _linux_realmode_outputs(
             ctx,
@@ -1757,6 +2047,18 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         vdso = _linux_generated_header(generated_headers, "arch/riscv/kernel/compat_vdso/compat_vdso.so")
         files.append(vdso)
         assembler_include_roots.append(vdso.dirname[:-len("/arch/riscv/kernel/compat_vdso")])
+        assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(vdso, assembler_include_roots[-1])
+
+    if ctx.attr.object == "arch/powerpc/kernel/vdso64_wrapper.o" and generated_headers:
+        vdso = _linux_generated_header(generated_headers, "arch/powerpc/kernel/vdso/vdso64.so.dbg")
+        files.append(vdso)
+        assembler_include_roots.append(vdso.dirname[:-len("/arch/powerpc/kernel/vdso")])
+        assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(vdso, assembler_include_roots[-1])
+
+    if ctx.attr.object == "arch/powerpc/kernel/vdso32_wrapper.o" and generated_headers:
+        vdso = _linux_generated_header(generated_headers, "arch/powerpc/kernel/vdso/vdso32.so.dbg")
+        files.append(vdso)
+        assembler_include_roots.append(vdso.dirname[:-len("/arch/powerpc/kernel/vdso")])
         assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(vdso, assembler_include_roots[-1])
 
     if ctx.attr.object == "arch/arm64/kernel/vdso32-wrap.o" and generated_headers:
@@ -4062,6 +4364,293 @@ def _linux_riscv_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, 
         ))
     return outputs
 
+def _linux_powerpc_vdso_compile(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        src,
+        out_relpath,
+        bits,
+        force_include = None,
+        extra_flags = []):
+    compiler = cc_common.get_tool_for_action(
+        feature_configuration = feature_configuration,
+        action_name = C_COMPILE_ACTION_NAME,
+    )
+    out = ctx.actions.declare_file(out_relpath)
+    remove_flags = []
+    remove_prefixes = []
+    if not _is_assembly_source(src):
+        remove_flags.extend(_linux_ftrace_remove_flags() + [
+            "-fstack-protector",
+            "-fstack-protector-strong",
+            "-fno-asynchronous-unwind-tables",
+        ])
+    if bits == 32:
+        remove_flags.extend([
+            "-m64",
+            "-mabi=elfv1",
+            "-mabi=elfv2",
+            "-mcall-aixdesc",
+            "-mcmodel=medium",
+            "-mpcrel",
+            "-fno-stack-clash-protection",
+        ])
+        remove_prefixes.append("-mstack-protector-guard")
+    filtered = _linux_filtered_config_flags_for_source(
+        ctx,
+        config,
+        src,
+        remove_flags,
+        out_suffix = "powerpc-vdso%d-%s" % (bits, src.basename),
+        remove_prefixes = remove_prefixes,
+    )
+    args = ctx.actions.args()
+    args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all(filtered.flags, format_each = "@%s")
+    args.add("-m%d" % bits)
+    args.add("-D__VDSO%d__" % bits)
+    args.add("-DBUILD_VDSO")
+    args.add("-DDISABLE_BRANCH_PROFILING")
+    if not _is_assembly_source(src):
+        args.add_all([
+            "-fno-common",
+            "-fno-builtin",
+            "-fno-stack-protector",
+            "-ffreestanding",
+            "-fasynchronous-unwind-tables",
+        ])
+    args.add_all(extra_flags)
+    args.add_all(_linux_source_preinclude_flags_for_root(source_root, _is_assembly_source(src)))
+    if force_include:
+        args.add_all(["-include", force_include])
+    _add_config_include_flag(args, config)
+    _add_linux_source_include_flags_for_root(
+        args,
+        source_root,
+        "powerpc",
+        generated_headers.include_dirs,
+        _generated_include_dir_anchors(generated_headers),
+    )
+    args.add("-I" + source_root + "/arch/powerpc")
+    args.add("-I" + source_root + "/arch/powerpc/kernel/vdso")
+    args.add("-I" + source_root + "/lib/vdso")
+    args.add("-c")
+    args.add(src)
+    args.add("-o")
+    args.add(out)
+    extra_inputs = filtered.inputs
+    if force_include:
+        extra_inputs = extra_inputs + [_source_tree_file_for_root(ctx, source_root, force_include[len(source_root) + 1:])]
+    path_mapped_run(
+        ctx.actions,
+        executable = compiler,
+        inputs = depset(
+            _linux_source_tree_inputs(ctx, direct = [src] + extra_inputs),
+            transitive = [cc_toolchain.all_files, config.files, generated_headers.files],
+        ),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxPowerPCVDSO%dCompile" % bits,
+        progress_message = "Compiling Linux PowerPC %d-bit vDSO object %%{label}" % bits,
+    )
+    return out
+
+def _linux_powerpc_vdso_linker_script(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        base,
+        bits):
+    compiler = cc_common.get_tool_for_action(
+        feature_configuration = feature_configuration,
+        action_name = C_COMPILE_ACTION_NAME,
+    )
+    src = _source_tree_file(ctx, "arch/powerpc/kernel/vdso/vdso%d.lds.S" % bits)
+    out = ctx.actions.declare_file(base + "/arch/powerpc/kernel/vdso/vdso%d.lds" % bits)
+    args = ctx.actions.args()
+    args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all([
+        "-m%d" % bits,
+        "-E",
+        "-P",
+        "-C",
+    ])
+    if bits == 32:
+        args.add("-Upowerpc")
+    args.add_all([
+        "-D__KERNEL__",
+        "-D__ASSEMBLY__",
+        "-DLINKER_SCRIPT",
+        "-include",
+        source_root + "/include/linux/kconfig.h",
+    ])
+    _add_config_include_flag(args, config)
+    _add_linux_source_include_flags_for_root(
+        args,
+        source_root,
+        "powerpc",
+        generated_headers.include_dirs,
+        _generated_include_dir_anchors(generated_headers),
+    )
+    args.add("-I" + source_root + "/arch/powerpc")
+    args.add("-I" + source_root + "/arch/powerpc/kernel/vdso")
+    args.add(src)
+    args.add("-o")
+    args.add(out)
+    path_mapped_run(
+        ctx.actions,
+        executable = compiler,
+        inputs = depset(
+            _linux_source_tree_inputs(ctx, direct = [src]),
+            transitive = [cc_toolchain.all_files, config.files, generated_headers.files],
+        ),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxPowerPCVDSO%dLinkerScript" % bits,
+        progress_message = "Preprocessing Linux PowerPC %d-bit vDSO linker script %%{label}" % bits,
+    )
+    return out
+
+def _linux_powerpc_vdso_offsets(ctx, dbg, base, bits):
+    out = ctx.actions.declare_file(base + "/include/generated/vdso%d-offsets.h" % bits)
+    args = ctx.actions.args()
+    args.add_all([
+        "-powerpc_vdso_elf",
+        dbg,
+        "-powerpc_vdso_offsets_out",
+        out,
+        "-powerpc_vdso_bits",
+        bits,
+    ])
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._archheaders,
+        inputs = [dbg],
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxPowerPCVDSO%dOffsets" % bits,
+        progress_message = "Generating Linux PowerPC %d-bit vDSO offsets %%{label}" % bits,
+    )
+    return out
+
+def _linux_powerpc_vdso_outputs(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        base,
+        bits):
+    directory = "arch/powerpc/kernel/vdso/"
+    assembly_sources = [
+        "sigtramp%d.S" % bits,
+        "gettimeofday.S",
+        "datapage.S",
+        "cacheflush.S",
+        "note.S",
+        "getcpu.S",
+        "getrandom.S",
+        "vgetrandom-chacha.S",
+    ]
+    objects = []
+    for source in assembly_sources:
+        objects.append(_linux_powerpc_vdso_compile(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+            _source_tree_file(ctx, directory + source),
+            base + "/" + directory + source[:-len(".S")] + "-%d.o" % bits,
+            bits,
+        ))
+    for source, config_symbol, generic_source, extra_flags in [
+        ("vgettimeofday.c", "CONFIG_GENERIC_GETTIMEOFDAY", "gettimeofday.c", ["-ffixed-r30"] if bits == 64 and config.config_flags.get("CONFIG_GENERIC_GETTIMEOFDAY") == "y" else []),
+        ("vgetrandom.c", "CONFIG_VDSO_GETRANDOM", "getrandom.c", []),
+    ]:
+        force_include = None
+        if config.config_flags.get(config_symbol) == "y":
+            force_include = source_root + "/lib/vdso/" + generic_source
+        objects.append(_linux_powerpc_vdso_compile(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+            _source_tree_file(ctx, directory + source),
+            base + "/" + directory + source[:-len(".c")] + "-%d.o" % bits,
+            bits,
+            force_include = force_include,
+            extra_flags = extra_flags,
+        ))
+    if bits == 32:
+        objects.append(_linux_powerpc_vdso_compile(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+            _source_tree_file(ctx, "arch/powerpc/lib/crtsavres.S"),
+            base + "/arch/powerpc/kernel/vdso/crtsavres-32.o",
+            bits,
+        ))
+    linker_script = _linux_powerpc_vdso_linker_script(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        base,
+        bits,
+    )
+    linker = _linux_x86_tool_sibling(
+        cc_common.get_tool_for_action(
+            feature_configuration = feature_configuration,
+            action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
+        ),
+        "ld.lld",
+    )
+    dbg = ctx.actions.declare_file(base + "/arch/powerpc/kernel/vdso/vdso%d.so.dbg" % bits)
+    link_args = ctx.actions.args()
+    little_endian = config.config_flags.get("CONFIG_CPU_BIG_ENDIAN") != "y"
+    link_args.add("-EL" if little_endian else "-EB")
+    link_args.add_all([
+        "-m",
+        "elf%dlppc" % bits if little_endian else "elf%dppc" % bits,
+        "--hash-style=both",
+        "--eh-frame-hdr",
+        "-shared",
+        "-z",
+        "noexecstack",
+        "-soname=linux-vdso%d.so.1" % bits,
+    ])
+    if config.config_flags.get("CONFIG_LD_ORPHAN_WARN") == "y":
+        link_args.add("--orphan-handling=" + _unquote(config.config_flags.get("CONFIG_LD_ORPHAN_WARN_LEVEL", "warn")))
+    link_args.add_all(["-T", linker_script, "-o", dbg])
+    link_args.add_all(objects)
+    path_mapped_run(
+        ctx.actions,
+        executable = linker,
+        inputs = depset(objects + [linker_script], transitive = [cc_toolchain.all_files]),
+        outputs = [dbg],
+        arguments = [link_args],
+        mnemonic = "LinuxPowerPCVDSO%dLink" % bits,
+        progress_message = "Linking Linux PowerPC %d-bit vDSO %%{label}" % bits,
+    )
+    return [dbg, _linux_powerpc_vdso_offsets(ctx, dbg, base, bits)]
+
 def _linux_generic_generated_headers_impl(ctx):
     _validate_generated_header_family_content_ids(
         ctx.attr.family_content_ids,
@@ -4284,6 +4873,29 @@ def _linux_generic_generated_headers_impl(ctx):
             source_root,
             base,
         ))
+    if arch == "powerpc":
+        if config.config_flags.get("CONFIG_PPC64") == "y":
+            headers.extend(_linux_powerpc_vdso_outputs(
+                ctx,
+                cc_toolchain,
+                feature_configuration,
+                config,
+                generated_headers,
+                source_root,
+                base,
+                64,
+            ))
+        if config.config_flags.get("CONFIG_VDSO32") == "y":
+            headers.extend(_linux_powerpc_vdso_outputs(
+                ctx,
+                cc_toolchain,
+                feature_configuration,
+                config,
+                generated_headers,
+                source_root,
+                base,
+                32,
+            ))
 
     files = depset(headers)
     families = {

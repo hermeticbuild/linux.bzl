@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"debug/elf"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"os"
@@ -26,6 +27,9 @@ func main() {
 	vdsoELF := flag.String("riscv_vdso_elf", "", "RISC-V vDSO ELF used to derive symbol offsets")
 	vdsoOffsetsOut := flag.String("riscv_vdso_offsets_out", "", "Generated RISC-V vDSO offsets header")
 	vdsoCompat := flag.Bool("riscv_vdso_compat", false, "Prefix RISC-V vDSO offsets for the compat image")
+	powerPCVDSOELF := flag.String("powerpc_vdso_elf", "", "PowerPC vDSO ELF used to derive symbol offsets")
+	powerPCVDSOOffsetsOut := flag.String("powerpc_vdso_offsets_out", "", "Generated PowerPC vDSO offsets header")
+	powerPCVDSOBits := flag.Int("powerpc_vdso_bits", 0, "PowerPC vDSO word size (32 or 64)")
 	machTypes := flag.String("mach_types", "", "arch/arm/tools/mach-types input")
 	machTypesOut := flag.String("mach_types_out", "", "Generated asm/mach-types.h output")
 	syscallTable := flag.String("syscall_table", "", "arch/arm/tools/syscall.tbl input")
@@ -36,11 +40,13 @@ func main() {
 	armMode := *machTypes != "" || *machTypesOut != "" || *syscallTable != "" || *syscallNROut != ""
 	armLinkMode := *armVmlinux != "" || *armLinkFlagsOut != ""
 	vdsoOffsetsMode := *vdsoELF != "" || *vdsoOffsetsOut != "" || *vdsoCompat
+	powerPCVDSOOffsetsMode := *powerPCVDSOELF != "" || *powerPCVDSOOffsetsOut != "" || *powerPCVDSOBits != 0
 	if cflagsMode != (*arch != "" && *asmOffsets != "" && *configPath != "" && *cflagsOut != "") ||
 		armMode != (*machTypes != "" && *machTypesOut != "" && *syscallTable != "" && *syscallNROut != "") ||
 		armLinkMode != (*armVmlinux != "" && *armLinkFlagsOut != "" && *configPath != "") ||
 		vdsoOffsetsMode != (*vdsoELF != "" && *vdsoOffsetsOut != "") ||
-		(!cflagsMode && !armMode && !armLinkMode && !vdsoOffsetsMode) {
+		powerPCVDSOOffsetsMode != (*powerPCVDSOELF != "" && *powerPCVDSOOffsetsOut != "" && (*powerPCVDSOBits == 32 || *powerPCVDSOBits == 64)) ||
+		(!cflagsMode && !armMode && !armLinkMode && !vdsoOffsetsMode && !powerPCVDSOOffsetsMode) {
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
@@ -103,6 +109,16 @@ func main() {
 		}
 		if err := writeFile(*vdsoOffsetsOut, generated); err != nil {
 			fatal("write RISC-V vDSO offsets", err)
+		}
+	}
+
+	if powerPCVDSOOffsetsMode {
+		generated, err := generatePowerPCVDSOOffsets(*powerPCVDSOELF, *powerPCVDSOBits)
+		if err != nil {
+			fatal("generate PowerPC vDSO offsets", err)
+		}
+		if err := writeFile(*powerPCVDSOOffsetsOut, generated); err != nil {
+			fatal("write PowerPC vDSO offsets", err)
 		}
 	}
 }
@@ -326,6 +342,9 @@ func generateRISCVVDSOOffsets(vdsoPath string, compat bool) ([]byte, error) {
 		return nil, fmt.Errorf("open vDSO ELF: %w", err)
 	}
 	defer file.Close()
+	if err := validateVDSORelocations(file); err != nil {
+		return nil, fmt.Errorf("validate vDSO relocations: %w", err)
+	}
 	symbols, err := file.Symbols()
 	if err != nil {
 		return nil, fmt.Errorf("read vDSO symbols: %w", err)
@@ -350,6 +369,118 @@ func riscvVDSOOffsets(symbols []elf.Symbol, compat bool) ([]byte, error) {
 	}
 	sort.Strings(lines)
 	return []byte(strings.Join(lines, "\n") + "\n"), nil
+}
+
+func generatePowerPCVDSOOffsets(vdsoPath string, bits int) ([]byte, error) {
+	file, err := elf.Open(vdsoPath)
+	if err != nil {
+		return nil, fmt.Errorf("open vDSO ELF: %w", err)
+	}
+	defer file.Close()
+	if err := validateVDSORelocations(file); err != nil {
+		return nil, fmt.Errorf("validate vDSO relocations: %w", err)
+	}
+	symbols, err := file.Symbols()
+	if err != nil {
+		return nil, fmt.Errorf("read vDSO symbols: %w", err)
+	}
+	return powerPCVDSOOffsets(symbols, bits)
+}
+
+func validateVDSORelocations(file *elf.File) error {
+	for _, section := range file.Sections {
+		if section.Type != elf.SHT_REL && section.Type != elf.SHT_RELA {
+			continue
+		}
+		data, err := section.Data()
+		if err != nil {
+			return fmt.Errorf("read relocation section %s: %w", section.Name, err)
+		}
+		if err := validateVDSORelocationData(data, file.Class, section.Type, file.ByteOrder); err != nil {
+			return fmt.Errorf("relocation section %s: %w", section.Name, err)
+		}
+	}
+	return nil
+}
+
+func validateVDSORelocationData(data []byte, class elf.Class, sectionType elf.SectionType, order binary.ByteOrder) error {
+	entrySize := 0
+	infoOffset := 0
+	infoSize := 0
+	switch class {
+	case elf.ELFCLASS32:
+		infoOffset = 4
+		infoSize = 4
+		if sectionType == elf.SHT_REL {
+			entrySize = 8
+		} else if sectionType == elf.SHT_RELA {
+			entrySize = 12
+		}
+	case elf.ELFCLASS64:
+		infoOffset = 8
+		infoSize = 8
+		if sectionType == elf.SHT_REL {
+			entrySize = 16
+		} else if sectionType == elf.SHT_RELA {
+			entrySize = 24
+		}
+	}
+	if entrySize == 0 || order == nil {
+		return fmt.Errorf("unsupported ELF relocation encoding class=%s section_type=%s", class, sectionType)
+	}
+	if len(data)%entrySize != 0 {
+		return fmt.Errorf("malformed relocation data size %d for %d-byte entries", len(data), entrySize)
+	}
+	for offset := 0; offset < len(data); offset += entrySize {
+		info := data[offset+infoOffset : offset+infoOffset+infoSize]
+		var relocationType uint64
+		if class == elf.ELFCLASS32 {
+			relocationType = uint64(elf.R_TYPE32(order.Uint32(info)))
+		} else {
+			relocationType = uint64(elf.R_TYPE64(order.Uint64(info)))
+		}
+		if relocationType != 0 {
+			return fmt.Errorf("entry %d has non-NONE relocation type %d", offset/entrySize, relocationType)
+		}
+	}
+	return nil
+}
+
+func powerPCVDSOOffsets(symbols []elf.Symbol, bits int) ([]byte, error) {
+	if bits != 32 && bits != 64 {
+		return nil, fmt.Errorf("unsupported PowerPC vDSO word size %d", bits)
+	}
+	lines := []string{}
+	for _, symbol := range symbols {
+		if symbol.Section == elf.SHN_UNDEF || !validPowerPCVDSOSymbol(symbol.Name) {
+			continue
+		}
+		name := strings.TrimPrefix(symbol.Name, "VDSO_")
+		hexValue := fmt.Sprintf("%0*x", bits/4, symbol.Value)
+		trimmed := strings.TrimLeft(hexValue, "0")
+		if len(trimmed) < len(hexValue) {
+			hexValue = "0" + trimmed
+		}
+		lines = append(lines, fmt.Sprintf("#define vdso%d_offset_%s\t0x%s", bits, name, hexValue))
+	}
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("vDSO ELF contains no VDSO_* symbols")
+	}
+	sort.Strings(lines)
+	return []byte(strings.Join(lines, "\n") + "\n"), nil
+}
+
+func validPowerPCVDSOSymbol(name string) bool {
+	const prefix = "VDSO_"
+	if !strings.HasPrefix(name, prefix) || len(name) == len(prefix) {
+		return false
+	}
+	for _, char := range name[len(prefix):] {
+		if char != '_' && !unicode.IsLetter(char) && !unicode.IsDigit(char) {
+			return false
+		}
+	}
+	return true
 }
 
 func validVDSOSymbol(name string) bool {
