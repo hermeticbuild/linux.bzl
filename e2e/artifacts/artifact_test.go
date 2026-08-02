@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/bazelbuild/rules_go/go/runfiles"
 )
 
 type artifactIdentity struct {
@@ -21,6 +23,16 @@ func requiredEnv(t *testing.T, name string) string {
 		t.Fatalf("%s is not set", name)
 	}
 	return value
+}
+
+func requiredRunfile(t *testing.T, name string) string {
+	t.Helper()
+	logicalPath := requiredEnv(t, name)
+	path, err := runfiles.Rlocation(logicalPath)
+	if err != nil {
+		t.Fatalf("resolve %s runfile %q: %v", name, logicalPath, err)
+	}
+	return path
 }
 
 func expectedIdentity(t *testing.T) artifactIdentity {
@@ -96,11 +108,11 @@ func readConfig(t *testing.T, path string) map[string]string {
 func checkConfig(t *testing.T) {
 	t.Helper()
 	inferred := requiredEnv(t, "INFERRED_CONFIG")
-	input := readConfig(t, requiredEnv(t, "INPUT_CONFIG"))
+	input := readConfig(t, requiredRunfile(t, "INPUT_CONFIG"))
 	if _, found := input[inferred]; found {
 		t.Fatalf("input config unexpectedly supplies inferred architecture symbol %s", inferred)
 	}
-	generated := readConfig(t, requiredEnv(t, "KERNEL_CONFIG"))
+	generated := readConfig(t, requiredRunfile(t, "KERNEL_CONFIG"))
 	if generated[inferred] != "y" {
 		t.Errorf("generated config has %s=%q, want y", inferred, generated[inferred])
 	}
@@ -113,7 +125,7 @@ func checkConfig(t *testing.T) {
 
 func checkImage(t *testing.T, identity artifactIdentity) {
 	t.Helper()
-	path := requiredEnv(t, "KERNEL_IMAGE")
+	path := requiredRunfile(t, "KERNEL_IMAGE")
 	switch format := requiredEnv(t, "IMAGE_FORMAT"); format {
 	case "elf":
 		checkELF(t, path, identity, elf.ET_EXEC)
@@ -142,10 +154,10 @@ func TestKernelArtifacts(t *testing.T) {
 	identity := expectedIdentity(t)
 	t.Run("config", checkConfig)
 	t.Run("vmlinux", func(t *testing.T) {
-		checkELF(t, requiredEnv(t, "KERNEL_VMLINUX"), identity, elf.ET_EXEC)
+		checkELF(t, requiredRunfile(t, "KERNEL_VMLINUX"), identity, elf.ET_EXEC)
 	})
 	t.Run("module", func(t *testing.T) {
-		checkELF(t, requiredEnv(t, "KERNEL_MODULE"), identity, elf.ET_REL)
+		checkELF(t, requiredRunfile(t, "KERNEL_MODULE"), identity, elf.ET_REL)
 	})
 	t.Run("image", func(t *testing.T) {
 		checkImage(t, identity)
