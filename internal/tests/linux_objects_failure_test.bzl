@@ -211,6 +211,31 @@ def _fake_vdso32_source_inputs_impl(ctx):
 
 _fake_vdso32_source_inputs = rule(implementation = _fake_vdso32_source_inputs_impl)
 
+def _fake_arm_compressed_source_inputs_impl(ctx):
+    files = []
+    for path in [
+        "arch/arm/boot/compressed/ashldi3.S",
+        "arch/arm/boot/compressed/bswapsdi2.S",
+        "arch/arm/boot/compressed/decompress.c",
+        "arch/arm/boot/compressed/head.S",
+        "arch/arm/boot/compressed/lib1funcs.S",
+        "arch/arm/boot/compressed/misc.c",
+        "arch/arm/boot/compressed/piggy.S",
+        "arch/arm/boot/compressed/string.c",
+        "arch/arm/boot/compressed/vmlinux.lds.S",
+        "include/linux/compiler-version.h",
+        "include/linux/compiler_types.h",
+        "include/linux/kconfig.h",
+    ]:
+        out = ctx.actions.declare_file(ctx.label.name + ".source/" + path)
+        ctx.actions.write(out, "")
+        files.append(out)
+    return [DefaultInfo(files = depset(files))]
+
+_fake_arm_compressed_source_inputs = rule(
+    implementation = _fake_arm_compressed_source_inputs_impl,
+)
+
 def _failure_test_impl(ctx):
     env = analysistest.begin(ctx)
     asserts.expect_failure(env, ctx.attr.expected_error)
@@ -512,6 +537,20 @@ _generic_generated_header_anchors_test = analysistest.make(
     attrs = {
         "arch": attr.string(mandatory = True),
     },
+)
+
+def _arm_compressed_flagfilter_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxFlagFilter"
+    ]
+    asserts.true(env, len(actions) > 0, "ARM compressed image did not filter Kbuild flags")
+    return analysistest.end(env)
+
+_arm_compressed_flagfilter_test = analysistest.make(
+    _arm_compressed_flagfilter_test_impl,
 )
 
 def _generic_generated_headers_fixture(name, arch, config, tags):
@@ -1084,6 +1123,49 @@ def linux_objects_fail_closed_test_suite(name):
             target_under_test = ":" + generic_headers,
         )
         generic_header_tests.append(":" + generic_headers_test)
+
+    arm_compressed_config = name + "_arm_compressed_config"
+    linux_config(
+        name = arm_compressed_config,
+        arch = "arm",
+        config_flags = {
+            "CONFIG_ARM": "y",
+            "CONFIG_AUTO_ZRELADDR": "y",
+            "CONFIG_KERNEL_GZIP": "y",
+        },
+        tags = fixture_tags,
+    )
+    arm_compressed_headers = name + "_arm_compressed_headers"
+    _fake_generated_headers(
+        name = arm_compressed_headers,
+        family_content_id = header_family_id,
+        tags = fixture_tags,
+    )
+    arm_compressed_sources = name + "_arm_compressed_sources"
+    _fake_arm_compressed_source_inputs(
+        name = arm_compressed_sources,
+        tags = fixture_tags,
+    )
+    arm_compressed_image = name + "_arm_compressed_image"
+    linux_compressed_image(
+        name = arm_compressed_image,
+        arch = "arm",
+        config = ":" + arm_compressed_config,
+        extension = "zImage",
+        format = "arm_zimage",
+        generated_headers = ":" + arm_compressed_headers,
+        image = ":" + image,
+        source_root = "linux_objects_test_fixture.c",
+        source_tree = [":" + arm_compressed_sources],
+        srcarch = "arm",
+        tags = fixture_tags,
+    )
+    arm_compressed_image_test = arm_compressed_image + "_flagfilter_test"
+    _arm_compressed_flagfilter_test(
+        name = arm_compressed_image_test,
+        target_under_test = ":" + arm_compressed_image,
+    )
+    generic_header_tests.append(":" + arm_compressed_image_test)
     failure_cases = [
         (empty_image, "requires at least one compiled object"),
         (certificate_object, "hermetic certificate embedding and signing are not implemented"),
