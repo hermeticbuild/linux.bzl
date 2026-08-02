@@ -621,6 +621,290 @@ KCSAN_INSTRUMENT_BARRIERS := y
 	}
 }
 
+func TestParseKbuildDirectoryTreePropagatesProbeOptionToRootMakefiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Kbuild"), []byte("obj-y += root.o child/\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	childDir := filepath.Join(dir, "child")
+	if err := os.MkdirAll(childDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(child) failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(childDir, "Makefile"), []byte(`obj-y += child.o
+CFLAGS_child.o := $(call cc-option,-fchild-probe)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(child/Makefile) failed: %v", err)
+	}
+	archDir := filepath.Join(dir, "arch", "arm")
+	if err := os.MkdirAll(archDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(arch/arm) failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(archDir, "Makefile"), []byte(`obj-y += arch.o
+CFLAGS_arch.o := $(call cc-option,-fno-dwarf2-cfi-asm)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(arch/arm/Makefile) failed: %v", err)
+	}
+
+	probeCalls := map[string]int{}
+	kb, err := ParseKbuildDirectoryTree(filepath.Join(dir, "Kbuild"), KbuildOptions{
+		RootDir:       dir,
+		RootMakefiles: []string{"arch/arm/Makefile"},
+		Variables:     map[string]string{"SRCARCH": "arm"},
+		ProbeOption: func(kind string, candidate, context []string) (bool, error) {
+			if kind != "cc_option" || len(candidate) != 1 {
+				t.Fatalf("probe = %q, %#v; want one cc-option candidate", kind, candidate)
+			}
+			probeCalls[candidate[0]]++
+			return true, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+	}
+	wantProbeCalls := map[string]int{"-fchild-probe": 1, "-fno-dwarf2-cfi-asm": 1}
+	if !reflect.DeepEqual(probeCalls, wantProbeCalls) {
+		t.Fatalf("ProbeOption calls = %#v, want %#v", probeCalls, wantProbeCalls)
+	}
+	got := map[string][]string{}
+	for _, flag := range kb.Flags {
+		if flag.Scope == "object" {
+			got[flag.Object] = append(got[flag.Object], flag.Flags...)
+		}
+	}
+	want := map[string][]string{
+		"arch.o":        {"-fno-dwarf2-cfi-asm"},
+		"child/child.o": {"-fchild-probe"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("probed directory-tree flags = %#v, want %#v", got, want)
+	}
+}
+
+func TestMeasuredKbuildProbeContextUsesEarlierConcreteResults(t *testing.T) {
+	dir := t.TempDir()
+	kbuild := filepath.Join(dir, "Makefile")
+	if err := os.WriteFile(kbuild, []byte(`KBUILD_CFLAGS += $(call cc-option,-fno-dwarf2-cfi-asm)
+KBUILD_CFLAGS += $(call cc-option,-mno-fdpic)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(Makefile) failed: %v", err)
+	}
+
+	var contexts [][]string
+	_, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
+		Variables: map[string]string{"SRCARCH": "arm"},
+		ProbeOption: func(kind string, candidate, context []string) (bool, error) {
+			if kind != "cc_option" || len(candidate) != 1 {
+				t.Fatalf("probe = %q, %#v; want one cc-option candidate", kind, candidate)
+			}
+			contexts = append(contexts, append([]string(nil), context...))
+			return true, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+	}
+	want := [][]string{
+		{"-Werror"},
+		{"-Werror", "-fno-dwarf2-cfi-asm"},
+	}
+	if !reflect.DeepEqual(contexts, want) {
+		t.Fatalf("probe contexts = %#v, want %#v", contexts, want)
+	}
+}
+
+func TestMeasuredKbuildProbeContextDropsWholeUnresolvedTryRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "Makefile")
+	if err := os.WriteFile(path, []byte(`cc_has_k_constraint := $(call try-run,echo \
+	'int main(void) { \
+		asm volatile("and w0, w0, %w0" :: "K" (4294967295)); \
+		return 0; \
+	}' | $(CC) -S -x c -o "$$TMP" -,,-DCONFIG_CC_HAS_K_CONSTRAINT=1)
+KBUILD_CFLAGS += -mgeneral-regs-only $(cc_has_k_constraint)
+KBUILD_CFLAGS += $(call cc-option,-mabi=lp64)
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	_, err := ParseKbuildFileWithOptions(path, KbuildOptions{
+		Variables: map[string]string{"SRCARCH": "arm64"},
+		ProbeOption: func(kind string, candidate, context []string) (bool, error) {
+			if kind == "cc_option" && reflect.DeepEqual(candidate, []string{"-mabi=lp64"}) {
+				got = append([]string(nil), context...)
+			}
+			return true, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"-Werror", "-mgeneral-regs-only"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("cc-option context = %#v, want %#v", got, want)
+	}
+}
+
+func TestMeasuredKbuildProbeContextExpandsMakeExpressions(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		content          string
+		finalCandidate   string
+		wantFinalContext []string
+	}{
+		{
+			name: "riscv subst self reference",
+			content: `CC_FLAGS_FTRACE := -pg
+KBUILD_CFLAGS := $(subst $(CC_FLAGS_FTRACE),,$(KBUILD_CFLAGS)) -fpie $(call cc-option,-mbranch-protection=none)
+KBUILD_CFLAGS += $(call cc-option,-fno-addrsig)
+`,
+			finalCandidate:   "-fno-addrsig",
+			wantFinalContext: []string{"-Werror", "-fpie", "-mbranch-protection=none"},
+		},
+		{
+			name: "powerpc recursive calls",
+			content: `KBUILD_CFLAGS = $(call cc-option,-mno-sched-epilog)
+CC_OPTION_CFLAGS = $(KBUILD_CFLAGS) $(call cc-option,-mno-string)
+ccflags-y += $(call cc-option,-fno-stack-protector)
+`,
+			finalCandidate:   "-fno-stack-protector",
+			wantFinalContext: []string{"-Werror", "-mno-sched-epilog", "-mno-string"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "Makefile")
+			if err := os.WriteFile(path, []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var finalContext []string
+			_, err := ParseKbuildFileWithOptions(path, KbuildOptions{
+				Variables: map[string]string{"SRCARCH": "riscv"},
+				ProbeOption: func(kind string, candidate, context []string) (bool, error) {
+					for _, arg := range context {
+						if containsMakeReference(arg) {
+							t.Fatalf("probe %q retained make expression in context %q", candidate, context)
+						}
+					}
+					if len(candidate) == 1 && candidate[0] == tc.finalCandidate {
+						finalContext = append([]string(nil), context...)
+					}
+					return true, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+			}
+			if !reflect.DeepEqual(finalContext, tc.wantFinalContext) {
+				t.Fatalf("final probe context = %#v, want %#v", finalContext, tc.wantFinalContext)
+			}
+		})
+	}
+}
+
+func TestMeasuredKbuildAsInstrUsesSourceProbeAndConcreteResult(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Kbuild"), []byte("obj-y += root.o\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archDir := filepath.Join(dir, "arch", "powerpc")
+	if err := os.MkdirAll(archDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(archDir, "Makefile"), []byte(`comma := ,
+CLANG_FLAGS := -fintegrated-as
+KBUILD_AFLAGS := -m64 -I /kernel/arch/powerpc
+asinstr := $(call as-instr,lis 9$(comma)foo@high,-DHAVE_AS_ATHIGH=1)
+KBUILD_CPPFLAGS += $(asinstr)
+KBUILD_CFLAGS += $(call cc-option,-mno-sched-epilog)
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var sourceCalls int
+	var optionContext []string
+	_, err := ParseKbuildDirectoryTree(filepath.Join(dir, "Kbuild"), KbuildOptions{
+		RootDir:       dir,
+		RootMakefiles: []string{"arch/powerpc/Makefile"},
+		Variables:     map[string]string{"SRCARCH": "powerpc"},
+		ProbeSource: func(language, source string, context []string) (bool, error) {
+			sourceCalls++
+			if language != "assembler-with-cpp" || source != "lis 9,foo@high" {
+				t.Fatalf("source probe = %q, %q; want PowerPC as-instr source", language, source)
+			}
+			wantContext := []string{"-fintegrated-as", "-m64", "-I", "/kernel/arch/powerpc"}
+			if !reflect.DeepEqual(context, wantContext) {
+				t.Fatalf("source probe context = %#v, want %#v", context, wantContext)
+			}
+			return true, nil
+		},
+		ProbeOption: func(kind string, candidate, context []string) (bool, error) {
+			if kind == "cc_option" && reflect.DeepEqual(candidate, []string{"-mno-sched-epilog"}) {
+				optionContext = append([]string(nil), context...)
+			}
+			return true, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+	}
+	if sourceCalls != 1 {
+		t.Fatalf("source probe calls = %d, want 1", sourceCalls)
+	}
+	if !slices.Contains(optionContext, "-DHAVE_AS_ATHIGH=1") {
+		t.Fatalf("later cc-option context = %#v, want measured as-instr result", optionContext)
+	}
+	for _, arg := range optionContext {
+		if containsMakeReference(arg) || strings.Contains(arg, "as-instr") {
+			t.Fatalf("later cc-option context retained raw as-instr expression: %#v", optionContext)
+		}
+	}
+}
+
+func TestParseKbuildExpandsConfigurationIndexedFlagFamilies(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		thumb2 string
+		want   []string
+	}{
+		{name: "disabled", thumb2: "", want: nil},
+		{name: "enabled", thumb2: "y", want: []string{"-U__thumb2__", "-D__thumb2__=1"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "Makefile")
+			if err := os.WriteFile(path, []byte(`aflags-thumb2-$(CONFIG_THUMB2_KERNEL) := -U__thumb2__ -D__thumb2__=1
+obj-y += arm/sha256-core.o other.o
+AFLAGS_arm/sha256-core.o += $(aflags-thumb2-y)
+AFLAGS_other.o += $(unrelated-y)
+`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			kb, err := ParseKbuildFileWithOptions(path, KbuildOptions{
+				Variables: map[string]string{
+					"CONFIG_THUMB2_KERNEL": test.thumb2,
+					"SRCARCH":              "arm",
+				},
+			})
+			if err != nil {
+				t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+			}
+			var got, unrelated []string
+			for _, flag := range kb.Flags {
+				switch flag.Object {
+				case "arm/sha256-core.o":
+					got = append(got, flag.Flags...)
+				case "other.o":
+					unrelated = append(unrelated, flag.Flags...)
+				}
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("Thumb-2 flags = %#v, want %#v", got, test.want)
+			}
+			if !reflect.DeepEqual(unrelated, []string{"$(unrelated-y)"}) {
+				t.Fatalf("unrelated unknown family was silently erased: %#v", unrelated)
+			}
+		})
+	}
+}
+
 func TestParseKbuildExpandsAdditionalPureMakeFunctions(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "existing.o"), nil, 0o644); err != nil {
@@ -1346,6 +1630,64 @@ endif
 	}
 }
 
+func TestParseKbuildCompleteConfigDoesNotLeakConditionalAppend(t *testing.T) {
+	for _, condition := range []struct {
+		name string
+		open string
+	}{
+		{name: "ifdef", open: "ifdef CONFIG_64BIT"},
+		{name: "ifeq", open: "ifeq ($(CONFIG_64BIT),y)"},
+		{name: "filtered ifneq", open: "ifneq ($(filter y,$(CONFIG_64BIT)),)"},
+	} {
+		t.Run(condition.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "Makefile")
+			content := "mmu-$(CONFIG_MMU) := memory.o\n" +
+				condition.open + "\n" +
+				"mmu-$(CONFIG_MMU) += mseal.o\n" +
+				"endif\n" +
+				"obj-y := $(mmu-y)\n"
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			for _, config := range []struct {
+				name      string
+				variables map[string]string
+				wantMseal bool
+			}{
+				{name: "missing is unset", variables: map[string]string{"CONFIG_MMU": "y"}},
+				{name: "defined empty is unset", variables: map[string]string{
+					"CONFIG_64BIT": "",
+					"CONFIG_MMU":   "y",
+				}},
+				{name: "enabled", variables: map[string]string{
+					"CONFIG_64BIT": "y",
+					"CONFIG_MMU":   "y",
+				}, wantMseal: true},
+			} {
+				t.Run(config.name, func(t *testing.T) {
+					kb, err := ParseKbuildFileWithOptions(path, KbuildOptions{
+						Variables:               config.variables,
+						ConfigVariablesComplete: true,
+					})
+					if err != nil {
+						t.Fatalf("ParseKbuildFileWithOptions() failed: %v", err)
+					}
+					want := []kbuildObjectSummary{
+						{object: "memory.o", kind: "const", state: "y", line: 5},
+					}
+					if config.wantMseal {
+						want = append(want, kbuildObjectSummary{object: "mseal.o", kind: "const", state: "y", line: 5})
+					}
+					if got := kbuildObjectSummaries(kb.Objects); !reflect.DeepEqual(got, want) {
+						t.Fatalf("objects mismatch\nwant: %#v\n got: %#v", want, got)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestParseKbuildEvaluatesElseIfChains(t *testing.T) {
 	kb, err := ParseKbuild(strings.NewReader(`selector := second
 ifeq ($(selector),first)
@@ -1595,8 +1937,7 @@ obj-y += init.o
 	kb, err := ParseKbuildFileWithOptions(kbuild, KbuildOptions{
 		RootDir: tmp,
 		Variables: map[string]string{
-			"CC_FLAGS_FTRACE": "",
-			"srctree":         tmp,
+			"srctree": tmp,
 		},
 	})
 	if err != nil {
@@ -1743,6 +2084,236 @@ obj-y += main.o
 	wantFlags := []kbuildFlagSummary{
 		{scope: "global", directory: "init", flags: "-DINIT", kind: "const", state: "y", line: 1},
 	}
+	if !reflect.DeepEqual(gotFlags, wantFlags) {
+		t.Fatalf("flags mismatch\nwant: %#v\n got: %#v", wantFlags, gotFlags)
+	}
+}
+
+func TestParseKbuildDirectoryTreeScopesFlagsByTraversalRatherThanPath(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"Kbuild": `KBUILD_AFLAGS += -m64
+obj-y += arch/x86/boot/startup/
+subdir- += arch/x86/boot
+`,
+		"arch/x86/boot/Makefile": `KBUILD_AFLAGS := -m16 -D_SETUP
+subdir- += compressed
+obj-y += setup.o startup/la57toggle.o
+`,
+		"arch/x86/boot/compressed/Makefile": "obj-y += head.o\n",
+		"arch/x86/boot/startup/Makefile": `KBUILD_AFLAGS += -D__DISABLE_EXPORTS
+lib-y += la57toggle.o
+`,
+	}
+	for path, content := range files {
+		fullPath := filepath.Join(dir, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q) failed: %v", filepath.Dir(fullPath), err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q) failed: %v", path, err)
+		}
+	}
+
+	kb, err := ParseKbuildDirectoryTree(filepath.Join(dir, "Kbuild"), KbuildOptions{RootDir: dir})
+	if err != nil {
+		t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+	}
+	objects := kb.resolvedObjects(&ResolvedConfig{})
+	flagsFor := func(name string) []string {
+		t.Helper()
+		object := objects.byName[name]
+		if object == nil {
+			t.Fatalf("resolved object %q is missing", name)
+		}
+		var flags []string
+		for _, group := range object.flags {
+			flags = append(flags, group.values...)
+		}
+		return flags
+	}
+
+	startupFlags := flagsFor("arch/x86/boot/startup/la57toggle.o")
+	for _, want := range []string{"-m64", "-D__DISABLE_EXPORTS"} {
+		if !slices.Contains(startupFlags, want) {
+			t.Errorf("startup flags = %#v, want %q", startupFlags, want)
+		}
+	}
+	for _, unwanted := range []string{"-m16", "-D_SETUP"} {
+		if slices.Contains(startupFlags, unwanted) {
+			t.Errorf("startup flags = %#v, unexpectedly contain discovery-only %q", startupFlags, unwanted)
+		}
+	}
+
+	for _, object := range []string{
+		"arch/x86/boot/setup.o",
+		"arch/x86/boot/compressed/head.o",
+	} {
+		flags := flagsFor(object)
+		for _, want := range []string{"-m64", "-m16", "-D_SETUP"} {
+			if !slices.Contains(flags, want) {
+				t.Errorf("%s flags = %#v, want %q", object, flags, want)
+			}
+		}
+	}
+}
+
+func TestParseKbuildDirectoryTreeFiltersActionTimeRootMakefileKbuildFlags(t *testing.T) {
+	tests := []struct {
+		name     string
+		srcarch  string
+		makefile string
+		kept     []string
+	}{
+		{
+			name:    "riscv-empty-march",
+			srcarch: "riscv",
+			makefile: `riscv-march-y :=
+KBUILD_CFLAGS += -march=$(riscv-march-y)
+KBUILD_CFLAGS += -mno-save-restore -mstrict-align
+KBUILD_CPPFLAGS += -I $(srctree)/arch/riscv -DKEEP_RISCV_ROOT
+`,
+			kept: []string{"-I", "$(srctree)/arch/riscv", "-DKEEP_RISCV_ROOT"},
+		},
+		{
+			name:    "powerpc-empty-canary-offset",
+			srcarch: "powerpc",
+			makefile: `canary-offset :=
+KBUILD_CFLAGS += -mstack-protector-guard=tls
+KBUILD_CFLAGS += -mstack-protector-guard-offset=$(canary-offset)
+KBUILD_CPPFLAGS += -I $(srctree)/arch/powerpc -DKEEP_POWERPC_ROOT
+`,
+			kept: []string{"-I", "$(srctree)/arch/powerpc", "-DKEEP_POWERPC_ROOT"},
+		},
+		{
+			name:    "arm64-action-time-defines",
+			srcarch: "arm64",
+			makefile: `asm-arch := armv8.4-a
+KASAN_SHADOW_SCALE_SHIFT := 3
+KBUILD_CFLAGS += -DARM64_ASM_ARCH='"$(asm-arch)"'
+KBUILD_CFLAGS += -DKASAN_SHADOW_SCALE_SHIFT=$(KASAN_SHADOW_SCALE_SHIFT)
+KBUILD_CPPFLAGS += -DKASAN_SHADOW_SCALE_SHIFT=$(KASAN_SHADOW_SCALE_SHIFT)
+KBUILD_AFLAGS += -DKASAN_SHADOW_SCALE_SHIFT=$(KASAN_SHADOW_SCALE_SHIFT)
+KBUILD_AFLAGS += -include $(srctree)/arch/arm64/include/asm/keep.h
+`,
+			kept: []string{"-include", "$(srctree)/arch/arm64/include/asm/keep.h"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "Kbuild"), []byte(`KBUILD_CFLAGS += -fprimary
+obj-y += child/
+`), 0o644); err != nil {
+				t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Join(dir, "child"), 0o755); err != nil {
+				t.Fatalf("MkdirAll(child) failed: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "child", "Makefile"), []byte(`KBUILD_CFLAGS += -flocal
+obj-y += local.o
+`), 0o644); err != nil {
+				t.Fatalf("WriteFile(child/Makefile) failed: %v", err)
+			}
+			archDir := filepath.Join(dir, "arch", tt.srcarch)
+			if err := os.MkdirAll(archDir, 0o755); err != nil {
+				t.Fatalf("MkdirAll(arch/%s) failed: %v", tt.srcarch, err)
+			}
+			archMakefile := filepath.Join(archDir, "Makefile")
+			if err := os.WriteFile(archMakefile, []byte(tt.makefile+"ccflags-y += -farch-directory\n"), 0o644); err != nil {
+				t.Fatalf("WriteFile(arch/%s/Makefile) failed: %v", tt.srcarch, err)
+			}
+
+			kb, err := ParseKbuildDirectoryTree(filepath.Join(dir, "Kbuild"), KbuildOptions{
+				RootDir:       dir,
+				RootMakefiles: []string{archMakefile},
+				Variables: map[string]string{
+					"ARCH":    tt.srcarch,
+					"SRCARCH": tt.srcarch,
+				},
+			})
+			if err != nil {
+				t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+			}
+
+			got := map[string]string{}
+			for _, flag := range kb.Flags {
+				for _, value := range flag.Flags {
+					got[value] = flag.Directory
+				}
+			}
+			want := map[string]string{
+				"-fprimary":        "",
+				"-farch-directory": "",
+				"-flocal":          "child",
+			}
+			for _, value := range tt.kept {
+				value = strings.ReplaceAll(value, "$(srctree)", filepath.ToSlash(dir))
+				want[value] = ""
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("flags mismatch\nwant: %#v\n got: %#v", want, got)
+			}
+		})
+	}
+}
+
+func TestParseKbuildDirectoryTreePropagatesExportedRootVariables(t *testing.T) {
+	dir := t.TempDir()
+	for _, child := range []string{"kernel", "mm"} {
+		if err := os.MkdirAll(filepath.Join(dir, "arch", "arm", child), 0o755); err != nil {
+			t.Fatalf("MkdirAll(arch/arm/%s) failed: %v", child, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Kbuild"), []byte("obj-y += arch/arm/kernel/ arch/arm/mm/\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(Kbuild) failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "arch", "arm", "Makefile"), []byte(`MMUEXT := -nommu
+ifeq ($(CONFIG_MMU),y)
+MMUEXT :=
+endif
+TEXT_OFFSET := 0x00008000
+export TEXT_OFFSET MMUEXT
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(arch/arm/Makefile) failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "arch", "arm", "kernel", "Makefile"), []byte(`obj-y += head$(MMUEXT).o
+AFLAGS_head$(MMUEXT).o := -DTEXT_OFFSET=$(TEXT_OFFSET)
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(arch/arm/kernel/Makefile) failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "arch", "arm", "mm", "Makefile"), []byte("obj-y += dma-mapping$(MMUEXT).o\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(arch/arm/mm/Makefile) failed: %v", err)
+	}
+
+	kb, err := ParseKbuildDirectoryTree(filepath.Join(dir, "Kbuild"), KbuildOptions{
+		RootDir:                 dir,
+		RootMakefiles:           []string{"arch/arm/Makefile"},
+		Variables:               map[string]string{"CONFIG_MMU": "y"},
+		ConfigVariablesComplete: true,
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+	}
+
+	gotObjects := kbuildObjectSummaries(kb.Objects)
+	wantObjects := []kbuildObjectSummary{
+		{object: "arch/arm/kernel/head.o", kind: "const", state: "y", line: 1},
+		{object: "arch/arm/mm/dma-mapping.o", kind: "const", state: "y", line: 1},
+	}
+	if !reflect.DeepEqual(gotObjects, wantObjects) {
+		t.Fatalf("objects mismatch\nwant: %#v\n got: %#v", wantObjects, gotObjects)
+	}
+	gotFlags := kbuildFlagSummaries(kb.Flags)
+	wantFlags := []kbuildFlagSummary{{
+		scope:  "object",
+		object: "arch/arm/kernel/head.o",
+		flags:  "-DTEXT_OFFSET=0x00008000",
+		kind:   "const",
+		state:  "y",
+		line:   2,
+	}}
 	if !reflect.DeepEqual(gotFlags, wantFlags) {
 		t.Fatalf("flags mismatch\nwant: %#v\n got: %#v", wantFlags, gotFlags)
 	}

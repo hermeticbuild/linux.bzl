@@ -792,7 +792,6 @@ func (p *parser) finalizeMenu(menu *Menu, parentDep Expr, parentVisibility Expr,
 	if menu.Symbol != nil && menu.Type != MenuChoice {
 		menu.Symbol.DirDep = orExpr(menu.Symbol.DirDep, menu.Dep)
 	}
-	p.createAutomaticSubmenus(menu, insideChoice)
 	childInsideChoice := insideChoice || menu.Type == MenuChoice
 	childVisibility := parentVisibility
 	if menu.Type == MenuMenu && menu.Visibility != nil {
@@ -801,6 +800,13 @@ func (p *parser) finalizeMenu(menu *Menu, parentDep Expr, parentVisibility Expr,
 	for _, child := range menu.Children {
 		p.finalizeMenu(child, menu.Dep, childVisibility, childInsideChoice)
 	}
+	// Automatic submenus are a presentation hierarchy inferred from a
+	// following symbol's prompt dependency. They are not an enclosing Kconfig
+	// dependency like an explicit menu/if/choice block. Move the entries only
+	// after their properties have inherited the real lexical dependencies, or
+	// the inferred parent symbol's own `depends on` constraints incorrectly
+	// hide otherwise applicable defaults on the child.
+	p.createAutomaticSubmenus(menu, insideChoice)
 }
 
 func (p *parser) createAutomaticSubmenus(parent *Menu, insideChoice bool) {

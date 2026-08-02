@@ -101,8 +101,13 @@ type sourceScanProfile string
 const (
 	sourceScanKernel          sourceScanProfile = ""
 	sourceScanKernelModule    sourceScanProfile = "kernel-module"
+	sourceScanARMVDSO         sourceScanProfile = "arm-vdso"
 	sourceScanArm64VDSO       sourceScanProfile = "arm64-vdso"
 	sourceScanArm32CompatVDSO sourceScanProfile = "arm32-compat-vdso"
+	sourceScanRISCVVDSO       sourceScanProfile = "riscv-vdso"
+	sourceScanRISCVCompatVDSO sourceScanProfile = "riscv-compat-vdso"
+	sourceScanPPC64VDSO       sourceScanProfile = "ppc64-vdso"
+	sourceScanPPC32VDSO       sourceScanProfile = "ppc32-vdso"
 )
 
 var sourceConfigPredefinedSymbols = []struct {
@@ -636,6 +641,9 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 				continue
 			}
 			if !inc.literal {
+				if modeledProvidedNonliteralBinaryInclude(source, treePath, inc.spelling, provided) {
+					continue
+				}
 				err := fmt.Errorf(
 					"%s:%d: unresolved potentially-active .incbin operand %s",
 					treePath,
@@ -700,6 +708,26 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 	}
 	s.closure[key] = result
 	return result, nil
+}
+
+func modeledProvidedNonliteralBinaryInclude(
+	rootSource string,
+	treePath string,
+	spelling string,
+	provided map[string]bool,
+) bool {
+	if strings.TrimSpace(spelling) != ".incbin __VDSO_PATH" ||
+		treePath != "arch/riscv/kernel/vdso/vdso.S" {
+		return false
+	}
+	switch rootSource {
+	case "arch/riscv/kernel/vdso/vdso.S":
+		return provided["arch/riscv/kernel/vdso/vdso.so"]
+	case "arch/riscv/kernel/compat_vdso/compat_vdso.S":
+		return provided["arch/riscv/kernel/compat_vdso/compat_vdso.so"]
+	default:
+		return false
+	}
 }
 
 func isSourceLikeInclude(path string) bool {
@@ -1343,9 +1371,13 @@ func sourcePredefinedSymbols(srcarch string) map[string]bool {
 	// !__KERNEL__ branch. Record that kernel-action consequence explicitly so
 	// scanning acenv.h does not treat libc includes as potentially active.
 	symbols := map[string]bool{
-		"__KERNEL__":                true,
-		"__GNUC__":                  true,
-		"__clang__":                 true,
+		"__KERNEL__": true,
+		"__GNUC__":   true,
+		"__clang__":  true,
+		// Linux kernel C actions never enable AVX2. The x86 architecture
+		// Makefile explicitly adds -mno-avx, and non-x86 target compilers do
+		// not define this target builtin.
+		"__AVX2__":                  false,
 		"__ELF__":                   true,
 		"__has_include":             true,
 		"__linux__":                 true,
@@ -1360,6 +1392,7 @@ func sourcePredefinedSymbols(srcarch string) map[string]bool {
 		"__NetBSD__":                false,
 		"__sun":                     false,
 		"__CYGWIN__":                false,
+		"__ECOS":                    false,
 		"ACPI_APPLICATION":          false,
 		"ACPI_ASL_COMPILER":         false,
 		"ACPI_DISASSEMBLER":         false,
@@ -1367,6 +1400,7 @@ func sourcePredefinedSymbols(srcarch string) map[string]bool {
 		"ACPI_LIBRARY":              false,
 		"ACPI_USE_SYSTEM_CLIBRARY":  true,
 		"ACPI_USE_STANDARD_HEADERS": false,
+		"DEBUG_ZLIB":                false,
 		"MODULE":                    false,
 	}
 	switch srcarch {
@@ -1382,6 +1416,12 @@ func sourcePredefinedSymbols(srcarch string) map[string]bool {
 		symbols["__aarch64__"] = true
 		symbols["__arm__"] = false
 		symbols["__ILP32__"] = false
+	case "arm":
+		symbols["__x86_64__"] = false
+		symbols["__amd64__"] = false
+		symbols["__aarch64__"] = false
+		symbols["__arm__"] = true
+		symbols["__ILP32__"] = true
 	}
 	return symbols
 }
@@ -1391,6 +1431,14 @@ func sourceProfilePredefinedSymbols(profile sourceScanProfile) map[string]bool {
 	case sourceScanKernelModule:
 		return map[string]bool{
 			"MODULE": true,
+		}
+	case sourceScanARMVDSO:
+		return map[string]bool{
+			"__aarch64__":              false,
+			"__arm__":                  true,
+			"__ILP32__":                true,
+			"BUILD_VDSO32":             true,
+			"DISABLE_BRANCH_PROFILING": true,
 		}
 	case sourceScanArm64VDSO:
 		return map[string]bool{
@@ -1404,6 +1452,43 @@ func sourceProfilePredefinedSymbols(profile sourceScanProfile) map[string]bool {
 			"__ILP32__":                true,
 			"BUILD_VDSO":               true,
 			"DISABLE_BRANCH_PROFILING": true,
+		}
+	case sourceScanRISCVVDSO:
+		return map[string]bool{
+			"COMPAT_VDSO":              false,
+			"DISABLE_BRANCH_PROFILING": true,
+			"__ILP32__":                false,
+			"__LP64__":                 true,
+			"__riscv":                  true,
+		}
+	case sourceScanRISCVCompatVDSO:
+		return map[string]bool{
+			"COMPAT_VDSO": true,
+			"__ILP32__":   true,
+			"__LP64__":    false,
+			"__riscv":     true,
+		}
+	case sourceScanPPC64VDSO:
+		return map[string]bool{
+			"BUILD_VDSO":               true,
+			"DISABLE_BRANCH_PROFILING": true,
+			"__ILP32__":                false,
+			"__LP64__":                 true,
+			"__VDSO32__":               false,
+			"__VDSO64__":               true,
+			"__powerpc__":              true,
+			"__powerpc64__":            true,
+		}
+	case sourceScanPPC32VDSO:
+		return map[string]bool{
+			"BUILD_VDSO":               true,
+			"DISABLE_BRANCH_PROFILING": true,
+			"__ILP32__":                true,
+			"__LP64__":                 false,
+			"__VDSO32__":               true,
+			"__VDSO64__":               false,
+			"__powerpc__":              true,
+			"__powerpc64__":            false,
 		}
 	default:
 		return nil
@@ -1444,7 +1529,8 @@ func generatedHeaderInclude(path string) bool {
 		return true
 	}
 	switch path {
-	case "kvm-asm-offsets.h", "linux/version.h", "linux/utsrelease.h":
+	case "calls-eabi.S", "calls-oabi.S",
+		"kvm-asm-offsets.h", "linux/version.h", "linux/utsrelease.h":
 		return true
 	default:
 		return false

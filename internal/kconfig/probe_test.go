@@ -225,6 +225,186 @@ config CC_HAS_INT128
 	}
 }
 
+func TestLinuxLLVMProbeShellHandlesCanonicalM32PreprocessorProbeByProfile(t *testing.T) {
+	const command = `{ clang -Werror -m32 -E -x c /dev/null -o /dev/null; } >/dev/null 2>&1 && echo "y" || echo "n"`
+	for profile, want := range map[string]string{
+		"x86_64":  "y",
+		"aarch64": "n",
+		"armv7":   "y",
+		"riscv64": "y",
+		"ppc64le": "y",
+	} {
+		t.Run(profile, func(t *testing.T) {
+			shell := testLinuxProbeShell(t, profile)
+			got, err := shell(context.Background(), command)
+			if err != nil || got != want {
+				t.Fatalf("shell(%q) = %q, %v; want %q", command, got, err, want)
+			}
+		})
+	}
+}
+
+func TestLinuxLLVMProbeShellHandlesCanonicalM64PreprocessorProbeByProfile(t *testing.T) {
+	const command = `{ clang -Werror -m64 -E -x c /dev/null -o /dev/null; } >/dev/null 2>&1 && echo "y" || echo "n"`
+	for profile, want := range map[string]string{
+		"x86_64":  "y",
+		"aarch64": "y",
+		"armv7":   "n",
+		"riscv64": "y",
+		"ppc64le": "y",
+	} {
+		t.Run(profile, func(t *testing.T) {
+			shell := testLinuxProbeShell(t, profile)
+			got, err := shell(context.Background(), command)
+			if err != nil || got != want {
+				t.Fatalf("shell(%q) = %q, %v; want %q", command, got, err, want)
+			}
+		})
+	}
+}
+
+func TestLinuxLLVMProbeShellHandlesWrappedPatchableEntryProbeByProfile(t *testing.T) {
+	const command = `{ trap "rm -rf .tmp_$$" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -fpatchable-function-entry=8 -c -x c /dev/null -o .tmp_$$/tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`
+	for profile, want := range map[string]string{
+		"x86_64":  "y",
+		"aarch64": "y",
+		"armv7":   "n",
+		"riscv64": "y",
+		"ppc64le": "y",
+	} {
+		t.Run(profile, func(t *testing.T) {
+			shell := testLinuxProbeShell(t, profile)
+			got, err := shell(context.Background(), command)
+			if err != nil || got != want {
+				t.Fatalf("shell(%q) = %q, %v; want %q", command, got, err, want)
+			}
+		})
+	}
+}
+
+func TestLinuxLLVMProbeShellHandlesGroupedARMStackGuardProbeByProfile(t *testing.T) {
+	const command = `{ trap "rm -rf .tmp_$$" EXIT; mkdir .tmp_$$; clang -Werror -fintegrated-as -mtp=cp15 -mstack-protector-guard=tls -mstack-protector-guard-offset=0 -c -x c /dev/null -o .tmp_$$/tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`
+	for profile, want := range map[string]string{
+		"x86_64":  "n",
+		"aarch64": "n",
+		"armv7":   "y",
+		"riscv64": "n",
+		"ppc64le": "n",
+	} {
+		t.Run(profile, func(t *testing.T) {
+			shell := testLinuxProbeShell(t, profile)
+			got, err := shell(context.Background(), command)
+			if err != nil || got != want {
+				t.Fatalf("shell(%q) = %q, %v; want %q", command, got, err, want)
+			}
+		})
+	}
+}
+
+func TestLinuxLLVMProbeShellRejectsExactARMV7KMSANCandidates(t *testing.T) {
+	shell := testLinuxProbeShell(t, "armv7")
+	for _, candidate := range []string{
+		"-fsanitize=kernel-memory",
+		"-fsanitize=kernel-memory -fsanitize-memory-param-retval",
+		"-fsanitize=kernel-memory -mllvm -msan-disable-checks=1",
+	} {
+		command := `{ clang -Werror -fintegrated-as ` + candidate + ` -c -x c /dev/null -o .tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`
+		got, err := shell(context.Background(), command)
+		if err != nil || got != "n" {
+			t.Errorf("shell(%q) = %q, %v; want n", command, got, err)
+		}
+	}
+}
+
+func TestLinuxLLVMProbeShellSupportsExactRISCVKconfigCandidates(t *testing.T) {
+	shell := testLinuxProbeShell(t, "riscv64")
+	for _, candidate := range []string{
+		"-fsanitize=shadow-call-stack",
+		"-mabi=lp64 -march=rv64imv",
+		"-mabi=ilp32 -march=rv32imv",
+		"-mabi=lp64 -march=rv64ima_zabha",
+		"-mabi=ilp32 -march=rv32ima_zabha",
+		"-mabi=lp64 -march=rv64ima_zacas",
+		"-mabi=ilp32 -march=rv32ima_zacas",
+		"-mabi=lp64 -march=rv64ima_zbb",
+		"-mabi=ilp32 -march=rv32ima_zbb",
+		"-mabi=lp64 -march=rv64ima_zba",
+		"-mabi=ilp32 -march=rv32ima_zba",
+		"-mabi=lp64 -march=rv64ima_zbc",
+		"-mabi=ilp32 -march=rv32ima_zbc",
+		"-mabi=lp64 -march=rv64ima_zbkb",
+		"-mabi=ilp32 -march=rv32ima_zbkb",
+		"-mstack-protector-guard=tls -mstack-protector-guard-reg=tp -mstack-protector-guard-offset=0",
+	} {
+		command := `{ clang -Werror -fintegrated-as ` + candidate + ` -c -x c /dev/null -o .tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`
+		got, err := shell(context.Background(), command)
+		if err != nil || got != "y" {
+			t.Errorf("shell(%q) = %q, %v; want y", command, got, err)
+		}
+	}
+	for _, candidate := range []string{
+		"-fsanitize=kernel-memory",
+		"-fsanitize=kernel-memory -fsanitize-memory-param-retval",
+		"-fsanitize=kernel-memory -mllvm -msan-disable-checks=1",
+	} {
+		command := `{ clang -Werror -fintegrated-as ` + candidate + ` -c -x c /dev/null -o .tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`
+		got, err := shell(context.Background(), command)
+		if err != nil || got != "n" {
+			t.Errorf("shell(%q) = %q, %v; want n", command, got, err)
+		}
+	}
+	const linkerCommand = `ld.lld -v --no-relax-gp`
+	got, err := shell(context.Background(), `{ `+linkerCommand+`; } >/dev/null 2>&1 && echo "y" || echo "n"`)
+	if err != nil || got != "y" {
+		t.Errorf("shell(%q) = %q, %v; want y", linkerCommand, got, err)
+	}
+}
+
+func TestLinuxLLVMProbeShellSupportsExactRISCVAssemblerCandidates(t *testing.T) {
+	shell := testLinuxProbeShell(t, "riscv64")
+	for _, source := range []string{
+		`.insn 0x100000f`,
+		`.option arch, +m`,
+		`.option arch, +v, +zvkb`,
+		`.reloc label, R_RISCV_SET_ULEB128, 127\n.reloc label, R_RISCV_SUB_ULEB128, 127\nlabel:\n.word 0`,
+	} {
+		command := `printf "%b\n" "` + source + `" | clang -fintegrated-as -Wa,--fatal-warnings -c -x assembler-with-cpp -o /dev/null -`
+		got, err := shell(context.Background(), `{ `+command+`; } >/dev/null 2>&1 && echo "y" || echo "n"`)
+		if err != nil || got != "y" {
+			t.Errorf("shell(%q) = %q, %v; want y", command, got, err)
+		}
+	}
+}
+
+func TestLinuxLLVMProbeShellSupportsExactPPC64LEKconfigCandidates(t *testing.T) {
+	shell := testLinuxProbeShell(t, "ppc64le")
+	for _, candidate := range []string{
+		"-mabi=elfv2",
+		"-mcpu=power10 -mprefixed",
+		"-mcpu=power10 -mpcrel",
+		"-fpatchable-function-entry=2",
+		"-mtune=power10",
+		"-mtune=power9",
+		"-mtune=power8",
+		"-fsanitize=kernel-memory",
+		"-fsanitize=kernel-memory -fsanitize-memory-param-retval",
+		"-fsanitize=kernel-memory -mllvm -msan-disable-checks=1",
+		"-m64 -mstack-protector-guard=tls -mstack-protector-guard-reg=r13 -mstack-protector-guard-offset=0",
+	} {
+		command := `{ clang -Werror -fintegrated-as ` + candidate + ` -c -x c /dev/null -o .tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`
+		got, err := shell(context.Background(), command)
+		if err != nil || got != "y" {
+			t.Errorf("shell(%q) = %q, %v; want y", command, got, err)
+		}
+	}
+	const unsupportedPPC32Guard = "-m32 -mstack-protector-guard=tls -mstack-protector-guard-reg=r2 -mstack-protector-guard-offset=0"
+	command := `{ clang -Werror -fintegrated-as ` + unsupportedPPC32Guard + ` -c -x c /dev/null -o .tmp.o; } >/dev/null 2>&1 && echo "y" || echo "n"`
+	got, err := shell(context.Background(), command)
+	if err != nil || got != "n" {
+		t.Errorf("shell(%q) = %q, %v; want n", command, got, err)
+	}
+}
+
 func TestLinuxProbeShellKeepsCompilerAndHostFactsFixed(t *testing.T) {
 	shell, err := LinuxProbeShell("x86_64", 109900, 230001)
 	if err != nil {

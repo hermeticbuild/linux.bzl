@@ -51,10 +51,34 @@ func LinuxProbeShell(
 	}).run, nil
 }
 
+// LinuxProbeShellWithTools uses actual integrity-pinned LLVM tools for
+// capability and version probes while retaining the small set of pure shell
+// expressions needed by Kconfig.include. Probe commands are parsed and mapped
+// to direct argv execution; no command shell is used.
+func LinuxProbeShellWithTools(
+	probe *LinuxToolProbe,
+	rustcVersion int,
+	rustcLLVMVersion int,
+) (func(context.Context, string) (string, error), error) {
+	if probe == nil {
+		return nil, fmt.Errorf("Linux tool probe is required")
+	}
+	if rustcVersion <= 0 || rustcLLVMVersion <= 0 {
+		return nil, fmt.Errorf("invalid Linux Rust compiler identity")
+	}
+	return (&linuxProbeShell{
+		architecture:     probe.profile.Name,
+		rustcVersion:     rustcVersion,
+		rustcLLVMVersion: rustcLLVMVersion,
+		toolProbe:        probe,
+	}).run, nil
+}
+
 type linuxProbeShell struct {
 	architecture     string
 	rustcVersion     int
 	rustcLLVMVersion int
+	toolProbe        *LinuxToolProbe
 }
 
 func (s *linuxProbeShell) run(ctx context.Context, command string) (string, error) {
@@ -63,7 +87,7 @@ func (s *linuxProbeShell) run(ctx context.Context, command string) (string, erro
 	}
 	command = strings.TrimSpace(command)
 	if match := ifSuccessPattern.FindStringSubmatch(command); match != nil {
-		success, err := s.commandSucceeds(match[1])
+		success, err := s.commandSucceeds(ctx, match[1])
 		if err != nil {
 			return "", err
 		}
@@ -78,12 +102,21 @@ func (s *linuxProbeShell) run(ctx context.Context, command string) (string, erro
 func (s *linuxProbeShell) output(command string) (string, error) {
 	switch {
 	case isKnownLinuxProbeScript(command, "cc-version.sh", "clang"):
+		if s.toolProbe != nil {
+			return fmt.Sprintf("Clang %d", s.toolProbe.clangCode), nil
+		}
 		return fmt.Sprintf("%s %d", linuxProbeCCName, linuxProbeCCVersion), nil
 	case isLinuxProbeToolVersionCommand(command, "clang"):
+		if s.toolProbe != nil {
+			return s.toolProbe.clangVersion, nil
+		}
 		return linuxProbeCCVersionText, nil
 	case isKnownLinuxProbeScript(command, "as-version.sh", "clang", "-fintegrated-as"):
 		return fmt.Sprintf("%s %d", linuxProbeASName, linuxProbeASVersion), nil
 	case isKnownLinuxProbeScript(command, "ld-version.sh", "ld.lld"):
+		if s.toolProbe != nil {
+			return fmt.Sprintf("LLD %d", s.toolProbe.lldCode), nil
+		}
 		return fmt.Sprintf("%s %d", linuxProbeLDName, linuxProbeLDVersion), nil
 	case isKnownLinuxProbeScript(command, "pahole-version.sh", "pahole"):
 		return strconv.Itoa(linuxProbePaholeVersion), nil
@@ -104,7 +137,7 @@ func (s *linuxProbeShell) output(command string) (string, error) {
 	}
 }
 
-func (s *linuxProbeShell) commandSucceeds(command string) (bool, error) {
+func (s *linuxProbeShell) commandSucceeds(ctx context.Context, command string) (bool, error) {
 	command = strings.TrimSpace(command)
 	switch {
 	case strings.HasPrefix(command, "command -v "):
@@ -131,16 +164,19 @@ func (s *linuxProbeShell) commandSucceeds(command string) (bool, error) {
 	case command == `python3 -c "import lxml"`:
 		return false, nil
 	}
-	if supported, recognized := s.knownClangSourceProbe(command); recognized {
-		return supported, nil
+	if supported, recognized, err := s.knownPowerPCCompilerScriptProbe(ctx, command); recognized || err != nil {
+		return supported, err
 	}
-	if supported, recognized := s.knownClangAssemblerProbe(command); recognized {
-		return supported, nil
+	if supported, recognized, err := s.knownClangSourceProbe(ctx, command); recognized || err != nil {
+		return supported, err
 	}
-	if supported, recognized := s.knownLLDOptionProbe(command); recognized {
-		return supported, nil
+	if supported, recognized, err := s.knownClangAssemblerProbe(ctx, command); recognized || err != nil {
+		return supported, err
 	}
-	if supported, recognized, err := s.knownClangOptionProbe(command); recognized || err != nil {
+	if supported, recognized, err := s.knownLLDOptionProbe(ctx, command); recognized || err != nil {
+		return supported, err
+	}
+	if supported, recognized, err := s.knownClangOptionProbe(ctx, command); recognized || err != nil {
 		return supported, err
 	}
 	return false, s.unsupportedCommand(command)
@@ -167,6 +203,9 @@ func linuxProbeToolName(value string) string {
 	if index := strings.LastIndexAny(value, `/\`); index >= 0 {
 		value = value[index+1:]
 	}
+	if len(value) > len(".exe") && strings.EqualFold(value[len(value)-len(".exe"):], ".exe") {
+		value = value[:len(value)-len(".exe")]
+	}
 	return value
 }
 
@@ -185,6 +224,44 @@ func linuxProbeScriptArgs(command, script string) ([]string, bool) {
 func isLinuxProbeScriptPath(path, script string) bool {
 	path = filepath.ToSlash(path)
 	return path == "scripts/"+script || strings.HasSuffix(path, "/scripts/"+script)
+}
+
+func linuxProbeArchitectureScriptArgs(command, architecture, script string) ([]string, bool) {
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return nil, false
+	}
+	path := filepath.ToSlash(strings.Trim(fields[0], `"'`))
+	want := "arch/" + architecture + "/tools/" + script
+	if path != want && !strings.HasSuffix(path, "/"+want) {
+		return nil, false
+	}
+	return fields[1:], true
+}
+
+func (s *linuxProbeShell) knownPowerPCCompilerScriptProbe(ctx context.Context, command string) (bool, bool, error) {
+	for _, script := range []string{
+		"gcc-check-mprofile-kernel.sh",
+		"gcc-check-fpatchable-function-entry.sh",
+	} {
+		args, recognized := linuxProbeArchitectureScriptArgs(command, "powerpc", script)
+		if !recognized {
+			continue
+		}
+		if s.architecture != "ppc64le" || len(args) != 2 ||
+			linuxProbeToolName(args[0]) != "clang" ||
+			(args[1] != "-mlittle-endian" && args[1] != "-mbig-endian") {
+			return false, true, s.unsupportedCommand(command)
+		}
+		if s.toolProbe != nil {
+			supported, err := s.toolProbe.supportsPowerPCCompilerScript(ctx, script, args[1])
+			return supported, true, err
+		}
+		// Pinned Clang 22 does not implement -mprofile-kernel, while its
+		// ELFv2 patchable-function-entry layout has the two required nops.
+		return script == "gcc-check-fpatchable-function-entry.sh", true, nil
+	}
+	return false, false, nil
 }
 
 func isKnownLinuxProbeScript(command, script string, expected ...string) bool {
@@ -262,14 +339,19 @@ func isKnownRELRProbe(command string) bool {
 	if len(fields) != 6 || fields[0] != "env" {
 		return false
 	}
-	want := []string{
-		"CC=clang",
-		"LD=ld.lld",
-		"NM=llvm-nm",
-		"OBJCOPY=llvm-objcopy",
+	want := []struct {
+		name string
+		tool string
+	}{
+		{name: "CC", tool: "clang"},
+		{name: "LD", tool: "ld.lld"},
+		{name: "NM", tool: "llvm-nm"},
+		{name: "OBJCOPY", tool: "llvm-objcopy"},
 	}
 	for i, expected := range want {
-		if strings.Trim(fields[i+1], `"'`) != expected {
+		assignment := strings.Trim(fields[i+1], `"'`)
+		name, value, ok := strings.Cut(assignment, "=")
+		if !ok || name != expected.name || linuxProbeToolName(value) != expected.tool {
 			return false
 		}
 	}
@@ -277,12 +359,11 @@ func isKnownRELRProbe(command string) bool {
 	return isLinuxProbeScriptPath(path, "tools-support-relr.sh")
 }
 
-func (s *linuxProbeShell) knownClangOptionProbe(command string) (bool, bool, error) {
+func (s *linuxProbeShell) knownClangOptionProbe(ctx context.Context, command string) (bool, bool, error) {
 	fields := strings.Fields(command)
 	compiler := -1
 	for i, field := range fields {
-		name := linuxProbeToolName(field)
-		if name == "clang" || field == "$CC" {
+		if isLinuxProbeCompilerToken(field) {
 			compiler = i
 			break
 		}
@@ -299,6 +380,8 @@ func (s *linuxProbeShell) knownClangOptionProbe(command string) (bool, bool, err
 		case "-c", "-E":
 			hasCompileMode = true
 		case "-Werror", "-fintegrated-as":
+		case "$CLANG_FLAGS", "$(CLANG_FLAGS)":
+			candidate = append(candidate, "-fintegrated-as")
 		case "-x", "-o":
 			i++
 		case "/dev/null", "-":
@@ -315,12 +398,63 @@ func (s *linuxProbeShell) knownClangOptionProbe(command string) (bool, bool, err
 		return false, false, nil
 	}
 	key := normalizeLinuxProbeCandidate(candidate)
+	if s.toolProbe != nil {
+		supported, err := s.toolProbe.SupportsOption(ctx, "cc_option", candidate, nil)
+		return supported, true, err
+	}
 	var supported, known bool
+	if key == normalizeLinuxProbeCandidate([]string{"-m32"}) {
+		// Kconfig.include uses this canonical preprocessing probe on every
+		// architecture. Pinned Clang accepts the compatibility switch for all
+		// supported profiles except AArch64, where it is an unknown option.
+		supported = s.architecture != "aarch64"
+		known = true
+	}
+	if key == normalizeLinuxProbeCandidate([]string{"-m64"}) {
+		// Kconfig.include also probes the 64-bit compatibility switch on every
+		// architecture. Pinned Clang accepts it for each supported 64-bit
+		// profile, but rejects it for the 32-bit ARM profile.
+		supported = s.architecture != "armv7"
+		known = true
+	}
+	if key == normalizeLinuxProbeCandidate([]string{"-fpatchable-function-entry=8"}) {
+		// RISC-V Kconfig probes this exact entry padding. Pinned Clang's
+		// driver supports patchable entries for every supported profile here
+		// except 32-bit ARM.
+		supported = s.architecture != "armv7"
+		known = true
+	}
+	if key == normalizeLinuxProbeCandidate([]string{
+		"-mtp=cp15",
+		"-mstack-protector-guard=tls",
+		"-mstack-protector-guard-offset=0",
+	}) {
+		// ARM Kconfig probes these as one inseparable capability: Clang
+		// requires both the TLS guard offset and the CP15 thread-pointer mode.
+		supported = s.architecture == "armv7"
+		known = true
+	}
 	switch s.architecture {
 	case "x86_64":
-		supported, known = linuxLLVMKconfigCCOptionsX86[key]
+		if !known {
+			supported, known = linuxLLVMKconfigCCOptionsX86[key]
+		}
 	case "aarch64":
-		supported, known = linuxLLVMKconfigCCOptionsARM64[key]
+		if !known {
+			supported, known = linuxLLVMKconfigCCOptionsARM64[key]
+		}
+	case "armv7":
+		if !known {
+			supported, known = linuxLLVMKconfigCCOptionsARMV7[key]
+		}
+	case "riscv64":
+		if !known {
+			supported, known = linuxLLVMKconfigCCOptionsRISCV64[key]
+		}
+	case "ppc64le":
+		if !known {
+			supported, known = linuxLLVMKconfigCCOptionsPPC64LE[key]
+		}
 	}
 	if !known {
 		supported, known = linuxLLVMKconfigCCOptionsCommon[key]
@@ -340,41 +474,162 @@ func normalizeLinuxProbeCandidate(argv []string) string {
 	return strings.Join(argv, "\x00")
 }
 
-func (s *linuxProbeShell) knownClangSourceProbe(command string) (bool, bool) {
+func (s *linuxProbeShell) knownClangSourceProbe(ctx context.Context, command string) (bool, bool, error) {
 	if !strings.Contains(command, "|") ||
 		!strings.Contains(command, " -x c - ") ||
 		(!strings.Contains(command, " -c ") && !strings.Contains(command, " -S ")) {
-		return false, false
+		return false, false, nil
 	}
 	for _, fragment := range linuxLLVMKnownCSourceFragments {
 		if strings.Contains(command, fragment) {
-			return true, true
+			if s.toolProbe == nil {
+				return true, true, nil
+			}
+			source, candidate, err := parseLinuxSourceProbe(command)
+			if err != nil {
+				return false, true, err
+			}
+			supported, err := s.toolProbe.SupportsSource(ctx, "c", candidate, source)
+			return supported, true, err
 		}
 	}
-	return false, false
+	return false, false, nil
 }
 
-func (s *linuxProbeShell) knownClangAssemblerProbe(command string) (bool, bool) {
+func (s *linuxProbeShell) knownClangAssemblerProbe(ctx context.Context, command string) (bool, bool, error) {
 	if !strings.HasPrefix(command, `printf "%b\n" `) ||
 		!strings.Contains(command, " -x assembler-with-cpp ") {
-		return false, false
+		return false, false, nil
 	}
 	for _, fragment := range linuxLLVMKnownAssemblerFragments {
 		if strings.Contains(command, fragment) {
-			return true, true
+			if s.toolProbe == nil {
+				return true, true, nil
+			}
+			source, candidate, err := parseLinuxSourceProbe(command)
+			if err != nil {
+				return false, true, err
+			}
+			source, err = decodeKbuildPrintfB(source)
+			if err != nil {
+				return false, true, fmt.Errorf("invalid Linux assembler source probe: %w", err)
+			}
+			supported, err := s.toolProbe.SupportsSource(ctx, "assembler-with-cpp", candidate, source)
+			return supported, true, err
 		}
 	}
-	return false, false
+	return false, false, nil
 }
 
-func (s *linuxProbeShell) knownLLDOptionProbe(command string) (bool, bool) {
+func parseLinuxSourceProbe(command string) (string, []string, error) {
+	left, right, ok := strings.Cut(command, "|")
+	if !ok {
+		return "", nil, fmt.Errorf("unsupported Linux source probe %q", command)
+	}
+	left = strings.TrimSpace(left)
+	var quoted string
+	if strings.HasPrefix(left, "echo ") {
+		quoted = strings.TrimSpace(strings.TrimPrefix(left, "echo "))
+	} else if strings.HasPrefix(left, `printf "%b\n" `) {
+		quoted = strings.TrimSpace(strings.TrimPrefix(left, `printf "%b\n" `))
+	} else {
+		return "", nil, fmt.Errorf("unsupported Linux source producer %q", left)
+	}
+	source, err := unquoteLinuxProbeSource(quoted)
+	if err != nil {
+		return "", nil, err
+	}
+	fields := strings.Fields(strings.TrimSpace(right))
+	compiler := -1
+	for i, field := range fields {
+		if isLinuxProbeCompilerToken(field) {
+			compiler = i
+			break
+		}
+	}
+	if compiler < 0 {
+		return "", nil, fmt.Errorf("Linux source probe has no clang invocation")
+	}
+	var candidate []string
+	for i := compiler + 1; i < len(fields); i++ {
+		field := strings.TrimSuffix(fields[i], ";")
+		switch field {
+		case "-c", "-S", "-", "/dev/null":
+			continue
+		case "$CLANG_FLAGS", "$(CLANG_FLAGS)":
+			candidate = append(candidate, "-fintegrated-as")
+			continue
+		case "-x", "-o":
+			i++
+			continue
+		}
+		candidate = append(candidate, field)
+	}
+	return source, candidate, nil
+}
+
+func unquoteLinuxProbeSource(quoted string) (string, error) {
+	if len(quoted) < 2 || (quoted[0] != '\'' && quoted[0] != '"') || quoted[len(quoted)-1] != quoted[0] {
+		return "", fmt.Errorf("unsupported Linux source quoting %q", quoted)
+	}
+	body := quoted[1 : len(quoted)-1]
+	if quoted[0] == '\'' {
+		if strings.ContainsRune(body, '\'') {
+			return "", fmt.Errorf("unsupported Linux source quoting %q", quoted)
+		}
+		return body, nil
+	}
+
+	var out strings.Builder
+	out.Grow(len(body))
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '"':
+			return "", fmt.Errorf("unsupported Linux source quoting %q", quoted)
+		case '\\':
+			if i+1 == len(body) {
+				return "", fmt.Errorf("unsupported Linux source quoting %q", quoted)
+			}
+			next := body[i+1]
+			switch next {
+			case '$', '`', '"', '\\':
+				out.WriteByte(next)
+				i++
+			case '\n':
+				i++
+			default:
+				// Within double quotes, the shell preserves backslashes before
+				// characters other than $, `, ", \\, and a newline. printf %b
+				// interprets those remaining escapes in the following step.
+				out.WriteByte('\\')
+			}
+		default:
+			out.WriteByte(body[i])
+		}
+	}
+	return out.String(), nil
+}
+
+func isLinuxProbeCompilerToken(field string) bool {
+	field = strings.Trim(field, `"'`)
+	return linuxProbeToolName(field) == "clang" || field == "$CC" || field == "$(CC)"
+}
+
+func (s *linuxProbeShell) knownLLDOptionProbe(ctx context.Context, command string) (bool, bool, error) {
 	fields := strings.Fields(command)
 	if len(fields) < 3 || linuxProbeToolName(fields[0]) != "ld.lld" || fields[1] != "-v" {
-		return false, false
+		return false, false, nil
 	}
 	candidate := strings.Join(fields[2:], " ")
+	if s.toolProbe != nil {
+		supported, err := s.toolProbe.SupportsOption(ctx, "ld_option", fields[2:], nil)
+		return supported, true, err
+	}
 	supported, ok := linuxLLVMKconfigLDOptions[candidate]
-	return supported, ok
+	if !ok && s.architecture == "riscv64" {
+		supported, ok = linuxLLVMKconfigLDOptionsRISCV64[candidate]
+	}
+	return supported, ok, nil
 }
 
 func (s *linuxProbeShell) unsupportedCommand(command string) error {
@@ -459,8 +714,14 @@ func normalizeLinuxProbeArchitecture(value string) (string, error) {
 		return "x86_64", nil
 	case "arm64", "aarch64":
 		return "aarch64", nil
+	case "arm", "armv7", "armv7l":
+		return "armv7", nil
+	case "riscv", "riscv64":
+		return "riscv64", nil
+	case "powerpc", "ppc64le":
+		return "ppc64le", nil
 	default:
-		return "", fmt.Errorf("unsupported architecture %q; expected x86_64 or aarch64", value)
+		return "", fmt.Errorf("unsupported architecture %q; expected x86_64, aarch64, armv7, riscv64, or ppc64le", value)
 	}
 }
 
@@ -552,6 +813,49 @@ var linuxLLVMKconfigCCOptionsARM64 = map[string]bool{
 	normalizeLinuxProbeCandidate([]string{"-mstack-protector-guard=sysreg", "-mstack-protector-guard-reg=sp_el0", "-mstack-protector-guard-offset=0"}): true,
 }
 
+var linuxLLVMKconfigCCOptionsARMV7 = map[string]bool{
+	normalizeLinuxProbeCandidate([]string{"-fsanitize=kernel-memory"}):                                     false,
+	normalizeLinuxProbeCandidate([]string{"-fsanitize=kernel-memory", "-fsanitize-memory-param-retval"}):   false,
+	normalizeLinuxProbeCandidate([]string{"-fsanitize=kernel-memory", "-mllvm", "-msan-disable-checks=1"}): false,
+}
+
+var linuxLLVMKconfigCCOptionsRISCV64 = map[string]bool{
+	normalizeLinuxProbeCandidate([]string{"-fsanitize=kernel-memory"}):                                                                          false,
+	normalizeLinuxProbeCandidate([]string{"-fsanitize=kernel-memory", "-fsanitize-memory-param-retval"}):                                        false,
+	normalizeLinuxProbeCandidate([]string{"-fsanitize=kernel-memory", "-mllvm", "-msan-disable-checks=1"}):                                      false,
+	normalizeLinuxProbeCandidate([]string{"-fsanitize=shadow-call-stack"}):                                                                      true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=lp64", "-march=rv64imv"}):                                                                      true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=ilp32", "-march=rv32imv"}):                                                                     true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=lp64", "-march=rv64ima_zabha"}):                                                                true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=ilp32", "-march=rv32ima_zabha"}):                                                               true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=lp64", "-march=rv64ima_zacas"}):                                                                true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=ilp32", "-march=rv32ima_zacas"}):                                                               true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=lp64", "-march=rv64ima_zbb"}):                                                                  true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=ilp32", "-march=rv32ima_zbb"}):                                                                 true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=lp64", "-march=rv64ima_zba"}):                                                                  true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=ilp32", "-march=rv32ima_zba"}):                                                                 true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=lp64", "-march=rv64ima_zbc"}):                                                                  true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=ilp32", "-march=rv32ima_zbc"}):                                                                 true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=lp64", "-march=rv64ima_zbkb"}):                                                                 true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=ilp32", "-march=rv32ima_zbkb"}):                                                                true,
+	normalizeLinuxProbeCandidate([]string{"-mstack-protector-guard=tls", "-mstack-protector-guard-reg=tp", "-mstack-protector-guard-offset=0"}): true,
+}
+
+var linuxLLVMKconfigCCOptionsPPC64LE = map[string]bool{
+	normalizeLinuxProbeCandidate([]string{"-fpatchable-function-entry=2"}):                                                                               true,
+	normalizeLinuxProbeCandidate([]string{"-fsanitize=kernel-memory"}):                                                                                   true,
+	normalizeLinuxProbeCandidate([]string{"-fsanitize=kernel-memory", "-fsanitize-memory-param-retval"}):                                                 true,
+	normalizeLinuxProbeCandidate([]string{"-fsanitize=kernel-memory", "-mllvm", "-msan-disable-checks=1"}):                                               true,
+	normalizeLinuxProbeCandidate([]string{"-m32", "-mstack-protector-guard=tls", "-mstack-protector-guard-reg=r2", "-mstack-protector-guard-offset=0"}):  false,
+	normalizeLinuxProbeCandidate([]string{"-m64", "-mstack-protector-guard=tls", "-mstack-protector-guard-reg=r13", "-mstack-protector-guard-offset=0"}): true,
+	normalizeLinuxProbeCandidate([]string{"-mabi=elfv2"}):                                                                                                true,
+	normalizeLinuxProbeCandidate([]string{"-mcpu=power10", "-mpcrel"}):                                                                                   true,
+	normalizeLinuxProbeCandidate([]string{"-mcpu=power10", "-mprefixed"}):                                                                                true,
+	normalizeLinuxProbeCandidate([]string{"-mtune=power10"}):                                                                                             true,
+	normalizeLinuxProbeCandidate([]string{"-mtune=power8"}):                                                                                              true,
+	normalizeLinuxProbeCandidate([]string{"-mtune=power9"}):                                                                                              true,
+}
+
 var linuxLLVMKconfigLDOptions = map[string]bool{
 	"--compress-debug-sections=zlib": true,
 	"--compress-debug-sections=zstd": true,
@@ -559,6 +863,10 @@ var linuxLLVMKconfigLDOptions = map[string]bool{
 	"--gc-sections":                  true,
 	"--orphan-handling=error":        true,
 	"--orphan-handling=warn":         true,
+}
+
+var linuxLLVMKconfigLDOptionsRISCV64 = map[string]bool{
+	"--no-relax-gp": true,
 }
 
 var linuxLLVMKnownCSourceFragments = []string{
@@ -573,6 +881,10 @@ var linuxLLVMKnownCSourceFragments = []string{
 }
 
 var linuxLLVMKnownAssemblerFragments = []string{
+	`.insn 0x100000f`,
+	`.option arch, +m`,
+	`.option arch, +v, +zvkb`,
+	`R_RISCV_SET_ULEB128`,
 	`.arch armv8.2-a+sha3`,
 	`.arch armv8.5-a+memtag`,
 	`.arch_extension lse`,

@@ -1097,6 +1097,88 @@ func TestConfigSourceScannerContentGraphTracksAssemblyPredefine(t *testing.T) {
 	}
 }
 
+func TestConfigSourceScannerSelectsLinuxJFFS2Port(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "fs/jffs2/acl.c", "#include \"nodelist.h\"\n")
+	mustWriteSource(t, root, "fs/jffs2/nodelist.h", `
+#ifdef __ECOS
+#include "os-ecos.h"
+#else
+#include "os-linux.h"
+#endif
+`)
+	mustWriteSource(t, root, "fs/jffs2/os-linux.h", "#define JFFS2_LINUX_PORT 1\n")
+	scanner := newConfigSourceScanner(CompactMetadataOptions{SourceRoot: root})
+	closure, err := scanner.closureForSource("fs/jffs2/acl.c", nil)
+	if err != nil {
+		t.Fatalf("closureForSource() followed inactive eCos port: %v", err)
+	}
+	paths := sourceInputPaths(closure.sourceInputs)
+	if !slices.Contains(paths, "fs/jffs2/os-linux.h") {
+		t.Fatalf("JFFS2 source inputs = %v, want Linux port header", paths)
+	}
+	if slices.Contains(paths, "fs/jffs2/os-ecos.h") {
+		t.Fatalf("JFFS2 source inputs selected eCos port: %v", paths)
+	}
+}
+
+func TestConfigSourceScannerSelectsKernelZlibDeflateMode(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "lib/zlib_deflate/deftree.c", `
+#include "defutil.h"
+#ifdef DEBUG_ZLIB
+#include <ctype.h>
+#endif
+int kernel_deftree;
+`)
+	mustWriteSource(t, root, "lib/zlib_deflate/defutil.h", "#define KERNEL_ZLIB_DEFLATE 1\n")
+	scanner := newConfigSourceScanner(CompactMetadataOptions{SourceRoot: root})
+	closure, err := scanner.closureForSource("lib/zlib_deflate/deftree.c", nil)
+	if err != nil {
+		t.Fatalf("closureForSource() followed inactive userspace zlib debug branch: %v", err)
+	}
+	paths := sourceInputPaths(closure.sourceInputs)
+	if !slices.Contains(paths, "lib/zlib_deflate/defutil.h") {
+		t.Fatalf("zlib deflate inputs = %v, want kernel defutil.h", paths)
+	}
+	for _, path := range paths {
+		if filepath.Base(path) == "ctype.h" {
+			t.Fatalf("zlib deflate inputs selected userspace debug header: %v", paths)
+		}
+	}
+}
+
+func TestConfigSourceScannerExcludesZstdAVX2ForArmKernel(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "lib/zstd/compress/zstd_compress.c", `
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+#ifdef __arm__
+#include "arm-kernel.h"
+#endif
+int zstd_compress;
+`)
+	mustWriteSource(t, root, "lib/zstd/compress/arm-kernel.h", "#define ZSTD_ARM_KERNEL 1\n")
+	scanner := newConfigSourceScanner(CompactMetadataOptions{
+		SourceRoot: root,
+		Srcarch:    "arm",
+	})
+	closure, err := scanner.closureForSource("lib/zstd/compress/zstd_compress.c", nil)
+	if err != nil {
+		t.Fatalf("closureForSource() followed inactive AVX2 branch on ARM: %v", err)
+	}
+	paths := sourceInputPaths(closure.sourceInputs)
+	if !slices.Contains(paths, "lib/zstd/compress/arm-kernel.h") {
+		t.Fatalf("ARM zstd inputs = %v, want target-selected ARM input", paths)
+	}
+	for _, path := range paths {
+		if filepath.Base(path) == "immintrin.h" {
+			t.Fatalf("ARM zstd inputs selected x86 intrinsic header: %v", paths)
+		}
+	}
+}
+
 func TestGeneratedHeaderFootprintArm64BindsDirectInputsAndConfig(t *testing.T) {
 	root := t.TempDir()
 	for _, dir := range []string{
@@ -1388,6 +1470,16 @@ func TestGeneratedHeaderFamilyClassifierUsesOwnedSpellings(t *testing.T) {
 		{
 			path:    "asm/unistd.h",
 			name:    compactGeneratedHeaderFamilyStatic,
+			precise: true,
+		},
+		{
+			path:    "calls-eabi.S",
+			name:    compactGeneratedHeaderFamilyAll,
+			precise: true,
+		},
+		{
+			path:    "calls-oabi.S",
+			name:    compactGeneratedHeaderFamilyAll,
 			precise: true,
 		},
 		{path: "linux/kernel.h"},

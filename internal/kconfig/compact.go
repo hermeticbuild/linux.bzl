@@ -18,6 +18,8 @@ type NamedConfig struct {
 }
 
 type CompactMetadata struct {
+	Schema                  string                         `json:"schema,omitempty"`
+	Target                  *CompactTarget                 `json:"target,omitempty"`
 	Configs                 []CompactConfig                `json:"configs"`
 	ConfigPayloads          []CompactConfigPayload         `json:"config_payloads"`
 	CompileEnvironments     []CompactCompileEnvironment    `json:"compile_environments"`
@@ -26,6 +28,17 @@ type CompactMetadata struct {
 	SourceInputGroups       []string                       `json:"source_input_groups"`
 	ActionGroups            []CompactActionGroup           `json:"action_groups"`
 	ObjectVariants          []CompactObjectVariant         `json:"object_variants"`
+}
+
+// CompactTarget binds a generated graph to the platform-selected architecture
+// and to the exact compiler identity used for capability probes.
+type CompactTarget struct {
+	Profile       string `json:"profile"`
+	LinuxArch     string `json:"linux_arch"`
+	Srcarch       string `json:"srcarch"`
+	UTSMachine    string `json:"uts_machine"`
+	TargetTriple  string `json:"target_triple"`
+	ProbeIdentity string `json:"probe_identity"`
 }
 
 type CompactConfig struct {
@@ -123,6 +136,7 @@ type CompactMetadataOptions struct {
 	// Srcarch selects architecture include roots while scanning source files for
 	// CONFIG_* dependencies.
 	Srcarch string
+	Target  *CompactTarget
 }
 
 // CompactConfigGraph binds one resolved configuration to its Kbuild graph and
@@ -150,6 +164,21 @@ func (t *Tree) CompactMetadataBatchWithOptions(
 	}
 	variants := map[string]CompactObjectVariant{}
 	out := &CompactMetadata{}
+	if opts.Target != nil {
+		profile, err := LinuxTargetProfileByName(opts.Target.Profile)
+		if err != nil {
+			return nil, err
+		}
+		if err := profile.ValidateTargetIdentity(opts.Target.LinuxArch, opts.Target.TargetTriple); err != nil {
+			return nil, err
+		}
+		if opts.Target.Srcarch != profile.Srcarch || opts.Target.UTSMachine != profile.UTSMachine || opts.Target.ProbeIdentity == "" {
+			return nil, fmt.Errorf("compact metadata has incomplete or inconsistent target identity %#v", opts.Target)
+		}
+		copy := *opts.Target
+		out.Schema = "compact-v7-adaptive-content-graph"
+		out.Target = &copy
+	}
 	configPayloads := map[string]CompactConfigPayload{}
 	compileEnvironments := map[string]CompactCompileEnvironment{}
 	generatedHeaderFamilies := map[string]CompactGeneratedHeaderFamily{}
@@ -171,6 +200,12 @@ func (t *Tree) CompactMetadataBatchWithOptions(
 		})
 		if err != nil {
 			return nil, err
+		}
+		if opts.Target != nil {
+			profile, _ := LinuxTargetProfileByName(opts.Target.Profile)
+			if err := profile.ValidateResolvedArchitecture(resolved); err != nil {
+				return nil, fmt.Errorf("resolve config %q: %w", named.Name, err)
+			}
 		}
 		graph, err := graphForConfig(resolved)
 		if err != nil {
@@ -805,6 +840,7 @@ type resolvedKbuildObject struct {
 	footprint       map[string]bool
 	members         []string
 	root            bool
+	traversals      []kbuildTraversal
 }
 
 type resolvedKbuildFlag struct {
@@ -842,6 +878,7 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 		if object.directory == "" {
 			object.directory = entry.Directory
 		}
+		object.addTraversal(entry.traversal)
 		if entry.Root {
 			object.root = true
 			if entry.Kind == "lib" {
@@ -867,6 +904,9 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 		if parent == nil {
 			continue
 		}
+		if member.traversal.scope != 0 && !parent.hasActiveTraversal(member.traversal) {
+			continue
+		}
 		mode := compositeMemberMode(parent.mode, member.Mode)
 		if mode == "n" {
 			continue
@@ -886,6 +926,7 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 		if object.directory == "" {
 			object.directory = member.Directory
 		}
+		object.addTraversal(member.traversal)
 		if modePrecedence(mode) > modePrecedence(object.mode) {
 			object.mode = mode
 		}
@@ -899,7 +940,7 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 
 	for _, object := range byObject {
 		for _, flag := range kb.Flags {
-			if flag.Scope == "object" && flag.Object != object.object {
+			if flag.Scope == "object" && !kbuildObjectFlagMatches(flag.Object, object.object) {
 				continue
 			}
 			if flag.Scope == "global" && !globalFlagAppliesToObject(flag, object) {
@@ -922,7 +963,7 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 			}
 		}
 		for _, flag := range kb.RemoveFlags {
-			if flag.Scope == "object" && flag.Object != object.object {
+			if flag.Scope == "object" && !kbuildObjectFlagMatches(flag.Object, object.object) {
 				continue
 			}
 			if flag.Scope == "global" && !globalFlagAppliesToObject(flag, object) {
@@ -962,6 +1003,10 @@ func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObje
 		}
 	}
 	return out
+}
+
+func kbuildObjectFlagMatches(flagObject, object string) bool {
+	return flagObject == object || flagObject == kbuildCompileObjectName(object)
 }
 
 func kbuildObjtoolSettings(kb *KbuildFile, object *resolvedKbuildObject) (disabled, force bool, args []string) {
@@ -1080,6 +1125,7 @@ func (kb *KbuildFile) resolvedObjectEntries(config *ResolvedConfig) []KbuildObje
 		directory string
 		kind      string
 		mode      string
+		traversal int
 	}
 	type assignmentRecord struct {
 		key    bucketKey
@@ -1095,7 +1141,12 @@ func (kb *KbuildFile) resolvedObjectEntries(config *ResolvedConfig) []KbuildObje
 		if mode == "n" {
 			continue
 		}
-		key := bucketKey{directory: assignment.Directory, kind: assignment.Kind, mode: mode}
+		key := bucketKey{
+			directory: assignment.Directory,
+			kind:      assignment.Kind,
+			mode:      mode,
+			traversal: assignment.traversal.scope,
+		}
 		values := make([]KbuildObject, 0, len(assignment.Objects))
 		for _, object := range assignment.Objects {
 			values = append(values, KbuildObject{
@@ -1105,6 +1156,7 @@ func (kb *KbuildFile) resolvedObjectEntries(config *ResolvedConfig) []KbuildObje
 				Condition: assignment.Condition,
 				Root:      assignment.Root,
 				Position:  assignment.Position,
+				traversal: assignment.traversal,
 			})
 		}
 		addRecord := func() {
@@ -1149,12 +1201,14 @@ type resolvedCompositeMember struct {
 	Directory string
 	Mode      string
 	Condition KbuildCondition
+	traversal kbuildTraversal
 }
 
 type compositeMemberValue struct {
 	object    string
 	directory string
 	condition KbuildCondition
+	traversal kbuildTraversal
 }
 
 func (kb *KbuildFile) resolvedCompositeMembers(config *ResolvedConfig, parents map[string]*resolvedKbuildObject) []resolvedCompositeMember {
@@ -1167,6 +1221,7 @@ func (kb *KbuildFile) resolvedCompositeMembers(config *ResolvedConfig, parents m
 				Directory: member.Directory,
 				Mode:      member.Condition.Mode(config),
 				Condition: member.Condition,
+				traversal: member.traversal,
 			})
 		}
 		return out
@@ -1175,19 +1230,25 @@ func (kb *KbuildFile) resolvedCompositeMembers(config *ResolvedConfig, parents m
 	type bucketKey struct {
 		composite string
 		mode      string
+		traversal int
 	}
 	buckets := map[bucketKey][]compositeMemberValue{}
 	var bucketOrder []bucketKey
 	assigned := map[bucketKey]bool{}
 	for _, assignment := range kb.compositeAssigns {
-		if parents[assignment.Composite] == nil {
+		parent := parents[assignment.Composite]
+		if parent == nil || (assignment.traversal.scope != 0 && !parent.hasActiveTraversal(assignment.traversal)) {
 			continue
 		}
 		mode := assignment.Condition.Mode(config)
 		if mode == "n" {
 			continue
 		}
-		key := bucketKey{composite: assignment.Composite, mode: mode}
+		key := bucketKey{
+			composite: assignment.Composite,
+			mode:      mode,
+			traversal: assignment.traversal.scope,
+		}
 		if _, ok := buckets[key]; !ok {
 			bucketOrder = append(bucketOrder, key)
 		}
@@ -1197,6 +1258,7 @@ func (kb *KbuildFile) resolvedCompositeMembers(config *ResolvedConfig, parents m
 				object:    object,
 				directory: assignment.Directory,
 				condition: assignment.Condition,
+				traversal: assignment.traversal,
 			})
 		}
 		switch assignment.Operator {
@@ -1222,6 +1284,7 @@ func (kb *KbuildFile) resolvedCompositeMembers(config *ResolvedConfig, parents m
 				Directory: value.directory,
 				Mode:      key.mode,
 				Condition: value.condition,
+				traversal: value.traversal,
 			})
 		}
 	}
@@ -1235,6 +1298,37 @@ func appendUnique(values []string, value string) []string {
 		}
 	}
 	return append(values, value)
+}
+
+func (object *resolvedKbuildObject) addTraversal(traversal kbuildTraversal) {
+	if traversal.scope == 0 {
+		return
+	}
+	for _, existing := range object.traversals {
+		if existing.scope == traversal.scope {
+			return
+		}
+	}
+	object.traversals = append(object.traversals, traversal)
+}
+
+func (object *resolvedKbuildObject) hasActiveTraversal(want kbuildTraversal) bool {
+	hasLinked := false
+	for _, traversal := range object.traversals {
+		if traversal.linked {
+			hasLinked = true
+			break
+		}
+	}
+	for _, traversal := range object.traversals {
+		if hasLinked && !traversal.linked {
+			continue
+		}
+		if traversal.scope == want.scope {
+			return true
+		}
+	}
+	return false
 }
 
 func appendModName(existing, value string) string {
@@ -1252,6 +1346,25 @@ func appendModName(existing, value string) string {
 }
 
 func globalFlagAppliesToObject(flag KbuildFlag, object *resolvedKbuildObject) bool {
+	if flag.traversalStart != 0 {
+		hasLinked := false
+		for _, traversal := range object.traversals {
+			if traversal.linked {
+				hasLinked = true
+				break
+			}
+		}
+		for _, traversal := range object.traversals {
+			if hasLinked && !traversal.linked {
+				continue
+			}
+			if traversal.scope == flag.traversalStart ||
+				(flag.Recursive && traversal.scope > flag.traversalStart && traversal.scope <= flag.traversalEnd) {
+				return true
+			}
+		}
+		return false
+	}
 	flagDir := strings.TrimSuffix(flag.Directory, "/")
 	objectDir := strings.TrimSuffix(object.directory, "/")
 	if objectDir == flagDir {
@@ -1453,6 +1566,12 @@ func (memo compactVariantMemo) variantForStack(
 				err,
 			)
 		}
+		intrinsicIncludeRoots := compactIntrinsicIncludeRoots(source)
+		includeDirs = appendUniqueStrings(includeDirs, intrinsicIncludeRoots...)
+		actionIncludeSearch.includeRoots = appendUniqueStrings(
+			actionIncludeSearch.includeRoots,
+			intrinsicIncludeRoots...,
+		)
 		forcedSources, err := forcedSourceInputs(flags, source, name)
 		if err != nil {
 			return CompactObjectVariant{}, fmt.Errorf(
@@ -1670,6 +1789,7 @@ func (memo compactVariantMemo) variantForStack(
 		sourceRefs,
 		opts.CompileEnvironmentABI,
 		generatedHeaderFamilyIDs,
+		opts.Srcarch,
 	)
 	memo[name] = variant
 	return variant, nil
@@ -1748,6 +1868,14 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 		footprint.providedIncludes = []string{
 			"arch/x86/purgatory/purgatory.ro",
 		}
+	case "arch/riscv/purgatory/kexec-purgatory.o":
+		footprint.providedIncludes = []string{
+			"arch/riscv/purgatory/purgatory.ro",
+		}
+	case "arch/powerpc/purgatory/kexec-purgatory.o":
+		footprint.providedIncludes = []string{
+			"arch/powerpc/purgatory/purgatory.ro",
+		}
 	case "arch/x86/realmode/rmpiggy.o":
 		footprint.providedIncludes = []string{
 			"arch/x86/realmode/rm/realmode.bin",
@@ -1758,9 +1886,29 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 		footprint.providedIncludes = []string{
 			"arch/arm64/kernel/vdso/vdso.so",
 		}
+	case "arch/arm/vdso/vdso.o":
+		footprint.providedIncludes = []string{
+			"arch/arm/vdso/vdso.so",
+		}
 	case "arch/arm64/kernel/vdso32-wrap.o":
 		footprint.providedIncludes = []string{
 			"arch/arm64/kernel/vdso32/vdso.so",
+		}
+	case "arch/riscv/kernel/vdso/vdso.o":
+		footprint.providedIncludes = []string{
+			"arch/riscv/kernel/vdso/vdso.so",
+		}
+	case "arch/riscv/kernel/compat_vdso/compat_vdso.o":
+		footprint.providedIncludes = []string{
+			"arch/riscv/kernel/compat_vdso/compat_vdso.so",
+		}
+	case "arch/powerpc/kernel/vdso64_wrapper.o":
+		footprint.providedIncludes = []string{
+			"arch/powerpc/kernel/vdso/vdso64.so.dbg",
+		}
+	case "arch/powerpc/kernel/vdso32_wrapper.o":
+		footprint.providedIncludes = []string{
+			"arch/powerpc/kernel/vdso/vdso32.so.dbg",
 		}
 	case "init/version.o":
 		footprint.sourceInputs = []string{"init/version-timestamp.c"}
@@ -1793,8 +1941,13 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 		)
 	}
 	if isMultiSourceImageObject(object) ||
+		object == "arch/arm/vdso/vdso.o" ||
 		object == "arch/arm64/kernel/vdso-wrap.o" ||
 		object == "arch/arm64/kernel/vdso32-wrap.o" ||
+		object == "arch/riscv/kernel/vdso/vdso.o" ||
+		object == "arch/riscv/kernel/compat_vdso/compat_vdso.o" ||
+		object == "arch/powerpc/kernel/vdso64_wrapper.o" ||
+		object == "arch/powerpc/kernel/vdso32_wrapper.o" ||
 		isArm64NvheObject(object) {
 		footprint.fullGeneratedHeaders = true
 	}
@@ -1804,7 +1957,9 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 func isMultiSourceImageObject(object string) bool {
 	return strings.HasPrefix(object, "arch/x86/entry/vdso/vdso-image-") ||
 		object == "arch/x86/realmode/rmpiggy.o" ||
-		object == "arch/x86/purgatory/kexec-purgatory.o"
+		object == "arch/x86/purgatory/kexec-purgatory.o" ||
+		object == "arch/riscv/purgatory/kexec-purgatory.o" ||
+		object == "arch/powerpc/purgatory/kexec-purgatory.o"
 }
 
 func flagsNeedUTSVersionTmp(flags []string) bool {
@@ -1876,6 +2031,27 @@ func compactSpecialSourcesForObject(object string) compactSpecialSourceInputs {
 				"lib/crypto/sha256.c",
 			),
 		}
+	case "arch/riscv/purgatory/kexec-purgatory.o":
+		return compactSpecialSourceInputs{
+			inputs: compiled(
+				"arch/riscv/purgatory/purgatory.c",
+				"arch/riscv/purgatory/entry.S",
+				"lib/crypto/sha256.c",
+				"lib/string.c",
+				"lib/ctype.c",
+				"arch/riscv/lib/memcpy.S",
+				"arch/riscv/lib/memset.S",
+				"arch/riscv/lib/strcmp.S",
+				"arch/riscv/lib/strlen.S",
+				"arch/riscv/lib/strncmp.S",
+			),
+		}
+	case "arch/powerpc/purgatory/kexec-purgatory.o":
+		return compactSpecialSourceInputs{
+			inputs: compiled(
+				"arch/powerpc/purgatory/trampoline_64.S",
+			),
+		}
 	case "arch/arm64/kernel/vdso32-wrap.o":
 		profile := func(path string, compiled bool) compactSpecialSourceInput {
 			return compactSpecialSourceInput{
@@ -1901,12 +2077,22 @@ func compactSpecialSourcesForObject(object string) compactSpecialSourceInputs {
 	}
 }
 
+func compactIntrinsicIncludeRoots(source string) []string {
+	source = filepath.ToSlash(filepath.Clean(source))
+	if strings.HasPrefix(source, "lib/fdt") && strings.HasSuffix(source, ".c") {
+		return []string{"scripts/dtc/libfdt"}
+	}
+	return nil
+}
+
 func isArm64NvheObject(object string) bool {
 	return object == "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o"
 }
 
 func objectNeedsFullConfig(object string) bool {
-	return object == "arch/x86/purgatory/kexec-purgatory.o"
+	return object == "arch/x86/purgatory/kexec-purgatory.o" ||
+		object == "arch/riscv/purgatory/kexec-purgatory.o" ||
+		object == "arch/powerpc/purgatory/kexec-purgatory.o"
 }
 
 func includeDirsFromFlags(flags []string, source string) ([]string, error) {
@@ -2006,6 +2192,7 @@ func (o resolvedKbuildObject) variant(
 	sourceRefs []string,
 	compileEnvironmentABI string,
 	generatedHeaderFamilyIDs []string,
+	srcarch string,
 ) CompactObjectVariant {
 	fragment := map[string]string{}
 	refset := make(map[string]bool, len(o.footprint)+len(sourceRefs))
@@ -2018,7 +2205,7 @@ func (o resolvedKbuildObject) variant(
 		refset[ref] = true
 	}
 	if source != "" || isArm64NvheObject(o.object) {
-		for _, ref := range KernelFlagsConfigSymbols() {
+		for _, ref := range KernelFlagsConfigSymbols(srcarch) {
 			refset[ref] = true
 		}
 	}
@@ -2185,7 +2372,15 @@ func kbuildFlagLanguageMatchesSource(language string, source string) bool {
 	switch filepath.Ext(source) {
 	case ".c":
 		return language == "c"
+	case ".asn1", ".c_shipped", ".sh", ".uni":
+		// These source paths are explicit generator mappings whose outputs
+		// are compiled as C.
+		return language == "c"
 	case ".S", ".s":
+		return language == "asm"
+	case ".dts", ".dtso", ".pl":
+		// Kbuild turns DTB inputs into generated assembly wrappers, while
+		// the explicit perlasm source mappings emit assembly sources.
 		return language == "asm"
 	default:
 		return true
@@ -2258,6 +2453,10 @@ func sourceCandidatesForObject(object string) []string {
 		out = append(out, base+".dtso")
 	}
 	switch object {
+	case "arch/riscv/kernel/pi/ctype.pi.o":
+		out = append(out, "lib/ctype.c")
+	case "arch/riscv/kernel/pi/string.pi.o":
+		out = append(out, "lib/string.c")
 	case "arch/x86/entry/vdso/vdso-image-64.o":
 		out = append(out, "arch/x86/entry/vdso/vdso2c.c")
 	case "arch/x86/kernel/cpu/capflags.o":
@@ -2274,6 +2473,14 @@ func sourceCandidatesForObject(object string) []string {
 		out = append(out, "lib/crypto/arm64/poly1305-armv8.pl")
 	case "lib/crypto/arm64/sha256-core.o", "lib/crypto/arm64/sha512-core.o":
 		out = append(out, "lib/crypto/arm64/sha2-armv8.pl")
+	case "lib/crypto/arm/poly1305-core.o":
+		out = append(out, "lib/crypto/arm/poly1305-armv4.pl")
+	case "lib/crypto/arm/sha256-core.o":
+		out = append(out, "lib/crypto/arm/sha256-armv4.pl")
+	case "lib/crypto/arm/sha512-core.o":
+		out = append(out, "lib/crypto/arm/sha512-armv4.pl")
+	case "lib/crypto/riscv/poly1305-core.o":
+		out = append(out, "lib/crypto/riscv/poly1305-riscv.pl")
 	case "lib/crypto/x86/poly1305-x86_64-cryptogams.o":
 		out = append(out, "lib/crypto/x86/poly1305-x86_64-cryptogams.pl")
 	}
@@ -2357,8 +2564,15 @@ func quotedInclude(line string) (string, bool) {
 }
 
 var compactGroupedSpecialObjects = map[string]bool{
+	"arch/arm/vdso/vdso.o":                        true,
 	"arch/arm64/kernel/vdso-wrap.o":               true,
 	"arch/arm64/kernel/vdso32-wrap.o":             true,
+	"arch/riscv/kernel/vdso/vdso.o":               true,
+	"arch/riscv/kernel/compat_vdso/compat_vdso.o": true,
+	"arch/riscv/purgatory/kexec-purgatory.o":      true,
+	"arch/powerpc/purgatory/kexec-purgatory.o":    true,
+	"arch/powerpc/kernel/vdso64_wrapper.o":        true,
+	"arch/powerpc/kernel/vdso32_wrapper.o":        true,
 	"arch/x86/entry/vdso/vdso-image-64.o":         true,
 	"arch/x86/kernel/cpu/capflags.o":              true,
 	"arch/x86/lib/inat.o":                         true,
@@ -2375,9 +2589,13 @@ var compactGroupedSpecialObjects = map[string]bool{
 	"lib/crc/crc64-main.o":                        true,
 	"lib/crc32.o":                                 true,
 	"lib/crc64.o":                                 true,
+	"lib/crypto/arm/poly1305-core.o":              true,
+	"lib/crypto/arm/sha256-core.o":                true,
+	"lib/crypto/arm/sha512-core.o":                true,
 	"lib/crypto/arm64/poly1305-core.o":            true,
 	"lib/crypto/arm64/sha256-core.o":              true,
 	"lib/crypto/arm64/sha512-core.o":              true,
+	"lib/crypto/riscv/poly1305-core.o":            true,
 	"lib/crypto/x86/poly1305-x86_64-cryptogams.o": true,
 	"lib/oid_registry.o":                          true,
 	"usr/initramfs_data.o":                        true,
