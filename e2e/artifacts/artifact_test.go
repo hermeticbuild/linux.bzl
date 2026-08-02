@@ -116,7 +116,7 @@ func checkImage(t *testing.T, identity artifactIdentity) {
 	path := requiredEnv(t, "KERNEL_IMAGE")
 	switch format := requiredEnv(t, "IMAGE_FORMAT"); format {
 	case "elf":
-		checkELF(t, path, identity, elf.ET_NONE)
+		checkELF(t, path, identity, elf.ET_EXEC)
 	case "arm-zimage":
 		file, err := os.Open(path)
 		if err != nil {
@@ -142,7 +142,7 @@ func TestKernelArtifacts(t *testing.T) {
 	identity := expectedIdentity(t)
 	t.Run("config", checkConfig)
 	t.Run("vmlinux", func(t *testing.T) {
-		checkELF(t, requiredEnv(t, "KERNEL_VMLINUX"), identity, elf.ET_NONE)
+		checkELF(t, requiredEnv(t, "KERNEL_VMLINUX"), identity, elf.ET_EXEC)
 	})
 	t.Run("module", func(t *testing.T) {
 		checkELF(t, requiredEnv(t, "KERNEL_MODULE"), identity, elf.ET_REL)
