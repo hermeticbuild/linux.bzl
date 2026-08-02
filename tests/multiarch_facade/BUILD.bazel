@@ -32,23 +32,11 @@ multiarch_graph_fixture(
     arch = "armv7",
 )
 
-multiarch_graph_fixture(
-    name = "riscv64_graph",
-    arch = "riscv64",
-)
-
-multiarch_graph_fixture(
-    name = "ppc64le_graph",
-    arch = "ppc64le",
-)
-
 linux_multiarch_kernel_exports(
     name = "kernel",
     graphs = {
         "aarch64": ":aarch64_graph",
         "armv7": ":armv7_graph",
-        "ppc64le": ":ppc64le_graph",
-        "riscv64": ":riscv64_graph",
         "x86_64": ":x86_64_graph",
     },
     platform = ":linux_armv7",
@@ -59,8 +47,6 @@ linux_multiarch_file(
     files = {
         "aarch64": ":BUILD.bazel",
         "armv7": ":multiarch_facade_test.bzl",
-        "ppc64le": ":BUILD.bazel",
-        "riscv64": ":BUILD.bazel",
         "x86_64": ":BUILD.bazel",
     },
     platform = ":linux_armv7",

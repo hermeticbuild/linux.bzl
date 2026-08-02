@@ -42,9 +42,7 @@ func expectedIdentity(t *testing.T) artifactIdentity {
 		"64": elf.ELFCLASS64,
 	}
 	machines := map[string]elf.Machine{
-		"arm":   elf.EM_ARM,
-		"ppc64": elf.EM_PPC64,
-		"riscv": elf.EM_RISCV,
+		"arm": elf.EM_ARM,
 	}
 	className := requiredEnv(t, "ELF_CLASS")
 	machineName := requiredEnv(t, "ELF_MACHINE")

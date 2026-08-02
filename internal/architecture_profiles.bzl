@@ -30,25 +30,25 @@ _PROFILES = [
         target_triple = "arm-linux-gnueabi",
         uts_machine = "armv7l",
     ),
-    struct(
-        config_symbol = "CONFIG_RISCV",
-        cpu = Label("@platforms//cpu:riscv64"),
-        linux_arch = "riscv",
-        name = "riscv64",
-        srcarch = "riscv",
-        target_triple = "riscv64-linux-gnu",
-        uts_machine = "riscv64",
-    ),
-    struct(
-        config_symbol = "CONFIG_PPC64",
-        cpu = Label("@platforms//cpu:ppc64le"),
+]
+
+# Low-level graph rules retain these identities so their architecture-generic
+# behavior remains testable. They are deliberately absent from _PROFILES and
+# therefore cannot be selected by a public image facade.
+_INTERNAL_ARCH_PROFILES = {
+    "powerpc": struct(
         linux_arch = "powerpc",
         name = "ppc64le",
         srcarch = "powerpc",
         target_triple = "powerpc64le-linux-gnu",
-        uts_machine = "ppc64le",
     ),
-]
+    "riscv": struct(
+        linux_arch = "riscv",
+        name = "riscv64",
+        srcarch = "riscv",
+        target_triple = "riscv64-linux-gnu",
+    ),
+}
 
 def linux_architecture_profiles():
     """Returns canonical profiles in stable public-selection order."""
@@ -69,10 +69,12 @@ def linux_architecture_profile_for_arch(linux_arch):
     for profile in _PROFILES:
         if profile.linux_arch == linux_arch:
             return profile
+    if linux_arch in _INTERNAL_ARCH_PROFILES:
+        return _INTERNAL_ARCH_PROFILES[linux_arch]
     fail(
         "unsupported Linux ARCH %r; expected one of %s" %
         (linux_arch, [profile.linux_arch for profile in _PROFILES]),
     )
 
 def linux_arch_values():
-    return [profile.linux_arch for profile in _PROFILES]
+    return [profile.linux_arch for profile in _PROFILES] + sorted(_INTERNAL_ARCH_PROFILES.keys())

@@ -9,13 +9,6 @@ bazel_dep(name = "linux.bzl", version = "0.0.1")
 bazel_dep(name = "llvm", version = "0.8.14", repo_name = "hermetic_llvm")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "rules_go", version = "0.62.0")
-
-git_override(
-    module_name = "llvm",
-    commit = "fe2001260e1aa1e65395aca437c2aa14b4522e7b",
-    remote = "https://github.com/fionera/hermetic-llvm.git",
-)
-
 bazel_dep(name = "rules_qemu", version = "0.3.0")
 bazel_dep(name = "rules_rs", version = "0.0.98")
 
@@ -103,6 +96,18 @@ linux_images.image(
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
 linux_images.image(
+    name = "e2e_kvm_x86_64",
+    config = "//:kvm.config",
+    platform = "//:linux_x86_64",
+    source = "@e2e_linux_6_18_39//:Kconfig",
+)
+linux_images.image(
+    name = "e2e_verity_x86_64",
+    config = "//:verity.config",
+    platform = "//:linux_x86_64",
+    source = "@e2e_linux_6_18_39//:Kconfig",
+)
+linux_images.image(
     name = "e2e_rust_x86_64",
     config = "//:rust.config",
     platform = "@hermetic_llvm//platforms:linux_x86_64",
@@ -126,29 +131,17 @@ linux_images.image(
     platform = "//:linux_armv7",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
-linux_images.image(
-    name = "e2e_riscv64",
-    config = "//:tiny_riscv64.config",
-    platform = "//:linux_riscv64",
-    source = "@e2e_linux_6_18_39//:Kconfig",
-)
-linux_images.image(
-    name = "e2e_ppc64le",
-    config = "//:tiny_ppc64le.config",
-    platform = "//:linux_ppc64le",
-    source = "@e2e_linux_6_18_39//:Kconfig",
-)
 use_repo(
     linux_images,
     "e2e_6_12_96_aarch64",
     "e2e_6_12_96_x86_64",
     "e2e_aarch64",
     "e2e_armv7",
-    "e2e_ppc64le",
-    "e2e_riscv64",
+    "e2e_kvm_x86_64",
     "e2e_rust_6_12_96_aarch64",
     "e2e_rust_6_12_96_x86_64",
     "e2e_rust_aarch64",
     "e2e_rust_x86_64",
+    "e2e_verity_x86_64",
     "e2e_x86_64",
 )
