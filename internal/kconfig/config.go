@@ -853,6 +853,8 @@ func defaultScalarValue(typ SymbolType) string {
 		return "0"
 	case SymbolHex:
 		return "0x0"
+	case SymbolString:
+		return `""`
 	default:
 		return ""
 	}

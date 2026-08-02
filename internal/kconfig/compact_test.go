@@ -1816,6 +1816,68 @@ func TestCompactContentGraphArm64GeneratedIncludeSelectsMonolithicFamily(t *test
 	}
 }
 
+func TestCompactContentGraphARMGeneratedSyscallIncludeSelectsMonolithicFamily(t *testing.T) {
+	tree := mustParseString(t, `
+config AEABI
+	bool
+`)
+	kb, err := ParseKbuild(strings.NewReader("obj-y += arch/arm/kernel/entry-common.o\n"), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "arch/arm/kernel/entry-common.S", `
+#ifdef CONFIG_AEABI
+#include <calls-eabi.S>
+#else
+#include <calls-oabi.S>
+#endif
+`)
+	mustWriteSource(t, sourceRoot, "arch/arm/tools/syscall.tbl", "0 common restart_syscall sys_restart_syscall\n")
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	metadata, err := tree.CompactMetadataBatchWithOptions(
+		[]NamedConfig{{Name: "arm", Flags: map[string]string{"CONFIG_AEABI": "y"}}},
+		CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "arm",
+			CompileEnvironmentABI: "arm-object-abi-v1",
+		},
+		func(*ResolvedConfig) (CompactConfigGraph, error) {
+			return CompactConfigGraph{
+				Kbuild:                kb,
+				GeneratedHeadersLabel: "//headers:arm",
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
+	}
+	if len(metadata.GeneratedHeaderFamilies) != 1 ||
+		metadata.GeneratedHeaderFamilies[0].Name != compactGeneratedHeaderFamilyAll {
+		t.Fatalf("ARM generated header families = %#v, want one all family", metadata.GeneratedHeaderFamilies)
+	}
+	family := metadata.GeneratedHeaderFamilies[0]
+	inputs, err := metadata.expandedSourceInputGroup(family.SourceInputGroup, "ARM generated headers")
+	if err != nil {
+		t.Fatalf("expand ARM generated-header inputs: %v", err)
+	}
+	if got := sourceInputByPath(inputs, "arch/arm/tools/syscall.tbl").Path; got == "" {
+		t.Fatalf("ARM generated-header inputs = %v, want arch/arm/tools/syscall.tbl", inputs)
+	}
+	config := configByName(metadata, "arm")
+	variant := variantByTarget(metadata, objectTarget(metadata, config, "arch/arm/kernel/entry-common.o"))
+	var environment CompactCompileEnvironment
+	for _, candidate := range metadata.CompileEnvironments {
+		if candidate.ID == variant.CompileEnvironment {
+			environment = candidate
+			break
+		}
+	}
+	if want := []string{family.ID}; !reflect.DeepEqual(environment.GeneratedHeaderFamilies, want) {
+		t.Fatalf("ARM entry-common generated-header families = %v, want %v", environment.GeneratedHeaderFamilies, want)
+	}
+}
+
 func TestCompactMetadataBatchEmitsConfigGraphs(t *testing.T) {
 	tree := mustParseCompactFixture(t)
 	parseKbuild := func(name, content string) *KbuildFile {
@@ -2216,14 +2278,35 @@ func TestCompactContentGraphGeneratedObjectActionFootprints(t *testing.T) {
 		})
 	}
 	for object, want := range map[string][]string{
+		"arch/arm/vdso/vdso.o": {
+			"arch/arm/vdso/vdso.so",
+		},
 		"arch/arm64/kernel/vdso-wrap.o": {
 			"arch/arm64/kernel/vdso/vdso.so",
 		},
 		"arch/arm64/kernel/vdso32-wrap.o": {
 			"arch/arm64/kernel/vdso32/vdso.so",
 		},
+		"arch/riscv/kernel/vdso/vdso.o": {
+			"arch/riscv/kernel/vdso/vdso.so",
+		},
+		"arch/riscv/kernel/compat_vdso/compat_vdso.o": {
+			"arch/riscv/kernel/compat_vdso/compat_vdso.so",
+		},
+		"arch/powerpc/kernel/vdso64_wrapper.o": {
+			"arch/powerpc/kernel/vdso/vdso64.so.dbg",
+		},
+		"arch/powerpc/kernel/vdso32_wrapper.o": {
+			"arch/powerpc/kernel/vdso/vdso32.so.dbg",
+		},
 		"arch/x86/purgatory/kexec-purgatory.o": {
 			"arch/x86/purgatory/purgatory.ro",
+		},
+		"arch/riscv/purgatory/kexec-purgatory.o": {
+			"arch/riscv/purgatory/purgatory.ro",
+		},
+		"arch/powerpc/purgatory/kexec-purgatory.o": {
+			"arch/powerpc/purgatory/purgatory.ro",
 		},
 		"arch/x86/realmode/rmpiggy.o": {
 			"arch/x86/realmode/rm/realmode.bin",
@@ -2239,6 +2322,491 @@ func TestCompactContentGraphGeneratedObjectActionFootprints(t *testing.T) {
 				t.Errorf("%s provided action inputs = %v, want %q", object, got.providedIncludes, input)
 			}
 		}
+	}
+}
+
+func TestCompactContentGraphPowerPCVDSOWrappersBindDebugImages(t *testing.T) {
+	tree := mustParseString(t, "mainmenu \"PowerPC vDSO debug-image identity\"\n")
+	kb, err := ParseKbuild(strings.NewReader(`
+obj-y := arch/powerpc/kernel/vdso64_wrapper.o
+obj-y += arch/powerpc/kernel/vdso32_wrapper.o
+`), "Makefile")
+	if err != nil {
+		t.Fatalf("parseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	for path, content := range map[string]string{
+		"arch/powerpc/kernel/vdso64_wrapper.S":         ".incbin \"arch/powerpc/kernel/vdso/vdso64.so.dbg\"\n",
+		"arch/powerpc/kernel/vdso32_wrapper.S":         ".incbin \"arch/powerpc/kernel/vdso/vdso32.so.dbg\"\n",
+		"arch/powerpc/kernel/vdso/cacheflush.S":        "nop\n",
+		"arch/powerpc/kernel/vdso/datapage.S":          "nop\n",
+		"arch/powerpc/kernel/vdso/getcpu.S":            "nop\n",
+		"arch/powerpc/kernel/vdso/getrandom.S":         "nop\n",
+		"arch/powerpc/kernel/vdso/gettimeofday.S":      "nop\n",
+		"arch/powerpc/kernel/vdso/note.S":              "nop\n",
+		"arch/powerpc/kernel/vdso/vgetrandom-chacha.S": "nop\n",
+		"arch/powerpc/kernel/vdso/vgetrandom.c":        "int ppc_vgetrandom;\n",
+		"arch/powerpc/kernel/vdso/vgettimeofday.c":     "int ppc_vgettimeofday_v1;\n",
+		"arch/powerpc/kernel/vdso/sigtramp64.S":        "nop\n",
+		"arch/powerpc/kernel/vdso/vdso64.lds.S":        "SECTIONS { .text : { *(.text*) } }\n",
+		"arch/powerpc/kernel/vdso/sigtramp32.S":        "nop\n",
+		"arch/powerpc/kernel/vdso/vdso32.lds.S":        "SECTIONS { .text : { *(.text*) } }\n",
+		"arch/powerpc/lib/crtsavres.S":                 "nop\n",
+		"lib/vdso/getrandom.c":                         "int generic_getrandom;\n",
+		"lib/vdso/gettimeofday.c":                      "int generic_gettimeofday;\n",
+	} {
+		mustWriteSource(t, sourceRoot, path, content)
+	}
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	generate := func(name string) (*CompactMetadata, map[string]CompactObjectVariant) {
+		t.Helper()
+		metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{{Name: name}}, CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "powerpc",
+			CompileEnvironmentABI: "powerpc-vdso-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataBatchWithOptions(%s) failed: %v", name, err)
+		}
+		config := configByName(metadata, name)
+		return metadata, map[string]CompactObjectVariant{
+			"64": variantByTarget(metadata, objectTarget(metadata, config, "arch/powerpc/kernel/vdso64_wrapper.o")),
+			"32": variantByTarget(metadata, objectTarget(metadata, config, "arch/powerpc/kernel/vdso32_wrapper.o")),
+		}
+	}
+
+	metadata, before := generate("before")
+	if len(metadata.GeneratedHeaderFamilies) != 1 ||
+		metadata.GeneratedHeaderFamilies[0].Name != compactGeneratedHeaderFamilyAll {
+		t.Fatalf("PowerPC vDSO generated-header families = %#v, want one all family", metadata.GeneratedHeaderFamilies)
+	}
+	family := metadata.GeneratedHeaderFamilies[0]
+	inputs, err := metadata.expandedSourceInputGroup(family.SourceInputGroup, "PowerPC vDSO producers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := sourceInputPaths(inputs)
+	for _, want := range []string{
+		"arch/powerpc/kernel/vdso/vgettimeofday.c",
+		"arch/powerpc/kernel/vdso/vdso64.lds.S",
+		"arch/powerpc/kernel/vdso/vdso32.lds.S",
+		"arch/powerpc/lib/crtsavres.S",
+		"lib/vdso/gettimeofday.c",
+	} {
+		if !slices.Contains(paths, want) {
+			t.Errorf("PowerPC vDSO producer inputs = %v, want %q", paths, want)
+		}
+	}
+	for bits, variant := range before {
+		var environment CompactCompileEnvironment
+		for _, candidate := range metadata.CompileEnvironments {
+			if candidate.ID == variant.CompileEnvironment {
+				environment = candidate
+				break
+			}
+		}
+		if !slices.Contains(environment.GeneratedHeaderFamilies, family.ID) {
+			t.Errorf("PowerPC %s-bit wrapper does not bind generated family %q", bits, family.ID)
+		}
+	}
+
+	mustWriteSource(t, sourceRoot, "arch/powerpc/kernel/vdso/vgettimeofday.c", "int ppc_vgettimeofday_v2;\n")
+	changedMetadata, changed := generate("changed")
+	if changedMetadata.GeneratedHeaderFamilies[0].ID == family.ID {
+		t.Fatalf("PowerPC vDSO producer source did not change generated family %q", family.ID)
+	}
+	for bits := range before {
+		if changed[bits].ContentID == before[bits].ContentID {
+			t.Errorf("PowerPC %s-bit wrapper content ID did not change with producer", bits)
+		}
+	}
+}
+
+func TestCompactContentGraphPowerPCVDSOFamilyBindsMakefileSelection(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "PowerPC vDSO Makefile selection"
+
+config PPC64
+	bool "64-bit PowerPC"
+
+config VDSO32
+	bool "32-bit vDSO"
+
+config GENERIC_GETTIMEOFDAY
+	bool "generic gettimeofday"
+
+config VDSO_GETRANDOM
+	bool "vDSO getrandom"
+`)
+	kb, err := ParseKbuild(strings.NewReader("obj-y := init/main.o\n"), "Makefile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "init/main.c", "int main_v1;\n")
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	familyID := func(name string, flags map[string]string) string {
+		t.Helper()
+		metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{{Name: name, Flags: flags}}, CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "powerpc",
+			CompileEnvironmentABI: "powerpc-vdso-config-abi-v1",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(metadata.GeneratedHeaderFamilies) != 1 {
+			t.Fatalf("generated-header families = %#v, want one all family", metadata.GeneratedHeaderFamilies)
+		}
+		return metadata.GeneratedHeaderFamilies[0].ID
+	}
+
+	base := familyID("base", nil)
+	for _, symbol := range []string{
+		"CONFIG_PPC64",
+		"CONFIG_VDSO32",
+		"CONFIG_GENERIC_GETTIMEOFDAY",
+		"CONFIG_VDSO_GETRANDOM",
+	} {
+		if got := familyID(symbol, map[string]string{symbol: "y"}); got == base {
+			t.Errorf("%s did not change PowerPC generated-family identity %q", symbol, base)
+		}
+	}
+}
+
+func TestCompactContentGraphRISCVVDSOWrappersBindExactGeneratedBinaries(t *testing.T) {
+	tree := mustParseString(t, "mainmenu \"RISC-V vDSO exact identity\"\n")
+	kb, err := ParseKbuild(strings.NewReader(`
+obj-y := arch/riscv/kernel/vdso/vdso.o
+obj-y += arch/riscv/kernel/compat_vdso/compat_vdso.o
+`), "Makefile")
+	if err != nil {
+		t.Fatalf("parseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	for path, content := range map[string]string{
+		"arch/riscv/kernel/vdso/vdso.S":                   ".incbin __VDSO_PATH\n",
+		"arch/riscv/kernel/compat_vdso/compat_vdso.S":     "#define __VDSO_PATH \"arch/riscv/kernel/compat_vdso/compat_vdso.so\"\n#include \"../vdso/vdso.S\"\n",
+		"arch/riscv/kernel/vdso/flush_icache.S":           "nop\n",
+		"arch/riscv/kernel/vdso/getcpu.S":                 "nop\n",
+		"arch/riscv/kernel/vdso/getrandom.c":              "int getrandom;\n",
+		"arch/riscv/kernel/vdso/hwprobe.c":                "int hwprobe;\n",
+		"arch/riscv/kernel/vdso/note.S":                   "nop\n",
+		"arch/riscv/kernel/vdso/rt_sigreturn.S":           "nop\n",
+		"arch/riscv/kernel/vdso/sys_hwprobe.S":            "nop\n",
+		"arch/riscv/kernel/vdso/vdso.lds.S":               "SECTIONS { .text : { *(.text*) } }\n",
+		"arch/riscv/kernel/vdso/vgetrandom-chacha.S":      "nop\n",
+		"arch/riscv/kernel/vdso/vgettimeofday.c":          "int gettimeofday;\n",
+		"arch/riscv/kernel/compat_vdso/compat_vdso.lds.S": "SECTIONS { .text : { *(.text*) } }\n",
+		"arch/riscv/kernel/compat_vdso/flush_icache.S":    "nop\n",
+		"arch/riscv/kernel/compat_vdso/getcpu.S":          "nop\n",
+		"arch/riscv/kernel/compat_vdso/note.S":            "nop\n",
+		"arch/riscv/kernel/compat_vdso/rt_sigreturn.S":    "nop\n",
+		"lib/vdso/getrandom.c":                            "int generic_getrandom;\n",
+		"lib/vdso/gettimeofday.c":                         "int generic_gettimeofday;\n",
+	} {
+		mustWriteSource(t, sourceRoot, path, content)
+	}
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	generate := func(name string) (*CompactMetadata, map[string]CompactObjectVariant) {
+		t.Helper()
+		metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{{Name: name}}, CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "riscv",
+			CompileEnvironmentABI: "riscv-object-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataBatchWithOptions(%s) failed: %v", name, err)
+		}
+		config := configByName(metadata, name)
+		return metadata, map[string]CompactObjectVariant{
+			"native": variantByTarget(metadata, objectTarget(metadata, config, "arch/riscv/kernel/vdso/vdso.o")),
+			"compat": variantByTarget(metadata, objectTarget(metadata, config, "arch/riscv/kernel/compat_vdso/compat_vdso.o")),
+		}
+	}
+
+	metadata, before := generate("before")
+	if len(metadata.GeneratedHeaderFamilies) != 1 ||
+		metadata.GeneratedHeaderFamilies[0].Name != compactGeneratedHeaderFamilyAll {
+		t.Fatalf("RISC-V vDSO generated-header families = %#v, want one all family", metadata.GeneratedHeaderFamilies)
+	}
+	family := metadata.GeneratedHeaderFamilies[0]
+	familyInputs, err := metadata.expandedSourceInputGroup(family.SourceInputGroup, "RISC-V generated headers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := sourceInputPaths(familyInputs)
+	for _, want := range []string{
+		"arch/riscv/kernel/vdso/hwprobe.c",
+		"arch/riscv/kernel/vdso/vdso.lds.S",
+		"arch/riscv/kernel/compat_vdso/compat_vdso.lds.S",
+		"lib/vdso/gettimeofday.c",
+	} {
+		if !slices.Contains(paths, want) {
+			t.Errorf("RISC-V vDSO producer inputs = %v, want %q", paths, want)
+		}
+	}
+	for name, variant := range before {
+		var environment CompactCompileEnvironment
+		for _, candidate := range metadata.CompileEnvironments {
+			if candidate.ID == variant.CompileEnvironment {
+				environment = candidate
+				break
+			}
+		}
+		if !slices.Contains(environment.GeneratedHeaderFamilies, family.ID) {
+			t.Errorf("%s RISC-V wrapper environment = %#v, want family %q", name, environment, family.ID)
+		}
+	}
+
+	mustWriteSource(t, sourceRoot, "arch/riscv/kernel/vdso/hwprobe.c", "int hwprobe_changed;\n")
+	changedMetadata, changed := generate("changed")
+	if changedMetadata.GeneratedHeaderFamilies[0].ID == family.ID {
+		t.Fatalf("RISC-V vDSO producer source did not change generated-header identity %q", family.ID)
+	}
+	for name := range before {
+		if changed[name].ContentID == before[name].ContentID {
+			t.Errorf("%s RISC-V wrapper content ID did not change with producer", name)
+		}
+	}
+}
+
+func TestCompactContentGraphRISCVPurgatoryBindsGeneratedImageAndProducers(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "RISC-V purgatory image identity"
+
+config KASAN_GENERIC
+	bool "generic KASAN"
+
+config KASAN_SW_TAGS
+	bool "software-tag KASAN"
+`)
+	kb, err := ParseKbuild(strings.NewReader(
+		"obj-y := arch/riscv/purgatory/kexec-purgatory.o\n",
+	), "Makefile")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	for path, content := range map[string]string{
+		"arch/riscv/purgatory/kexec-purgatory.S": ".incbin \"arch/riscv/purgatory/purgatory.ro\"\n",
+		"arch/riscv/purgatory/purgatory.c":       "int purgatory;\n",
+		"arch/riscv/purgatory/entry.S":           "nop\n",
+		"lib/crypto/sha256.c":                    "int sha256;\n",
+		"lib/string.c":                           "int string;\n",
+		"lib/ctype.c":                            "int ctype;\n",
+		"arch/riscv/lib/memcpy.S":                "nop\n",
+		"arch/riscv/lib/memset.S":                "nop\n",
+		"arch/riscv/lib/strcmp.S":                "nop\n",
+		"arch/riscv/lib/strlen.S":                "nop\n",
+		"arch/riscv/lib/strncmp.S":               "nop\n",
+	} {
+		mustWriteSource(t, sourceRoot, path, content)
+	}
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	generate := func(name string, flags map[string]string) (*CompactMetadata, CompactObjectVariant) {
+		t.Helper()
+		metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{{Name: name, Flags: flags}}, CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "riscv",
+			CompileEnvironmentABI: "riscv-purgatory-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataBatchWithOptions(%s) failed: %v", name, err)
+		}
+		config := configByName(metadata, name)
+		return metadata, variantByTarget(metadata, objectTarget(metadata, config, "arch/riscv/purgatory/kexec-purgatory.o"))
+	}
+
+	metadata, before := generate("before", nil)
+	if len(metadata.GeneratedHeaderFamilies) != 1 ||
+		metadata.GeneratedHeaderFamilies[0].Name != compactGeneratedHeaderFamilyAll {
+		t.Fatalf("RISC-V purgatory generated-header families = %#v, want one all family", metadata.GeneratedHeaderFamilies)
+	}
+	family := metadata.GeneratedHeaderFamilies[0]
+	inputs, err := metadata.expandedSourceInputGroup(family.SourceInputGroup, "RISC-V purgatory producers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := sourceInputPaths(inputs)
+	for _, want := range []string{
+		"arch/riscv/purgatory/purgatory.c",
+		"arch/riscv/purgatory/entry.S",
+		"lib/crypto/sha256.c",
+		"lib/string.c",
+		"lib/ctype.c",
+		"arch/riscv/lib/memcpy.S",
+		"arch/riscv/lib/memset.S",
+		"arch/riscv/lib/strcmp.S",
+		"arch/riscv/lib/strlen.S",
+		"arch/riscv/lib/strncmp.S",
+	} {
+		if !slices.Contains(paths, want) {
+			t.Errorf("RISC-V purgatory producer inputs = %v, want %q", paths, want)
+		}
+	}
+	var environment CompactCompileEnvironment
+	for _, candidate := range metadata.CompileEnvironments {
+		if candidate.ID == before.CompileEnvironment {
+			environment = candidate
+			break
+		}
+	}
+	if !slices.Contains(environment.GeneratedHeaderFamilies, family.ID) {
+		t.Fatalf("RISC-V purgatory environment = %#v, want family %q", environment, family.ID)
+	}
+	kasanMetadata, _ := generate("kasan", map[string]string{"CONFIG_KASAN_GENERIC": "y"})
+	if kasanMetadata.GeneratedHeaderFamilies[0].ID == family.ID {
+		t.Fatalf("RISC-V KASAN membership did not change generated purgatory identity %q", family.ID)
+	}
+
+	mustWriteSource(t, sourceRoot, "lib/crypto/sha256.c", "int sha256_changed;\n")
+	changedMetadata, changed := generate("changed", nil)
+	if changedMetadata.GeneratedHeaderFamilies[0].ID == family.ID {
+		t.Fatalf("RISC-V purgatory producer did not change generated image identity %q", family.ID)
+	}
+	if changed.ContentID == before.ContentID {
+		t.Fatalf("RISC-V purgatory wrapper content ID did not change with producer %q", before.ContentID)
+	}
+}
+
+func TestCompactContentGraphPowerPCPurgatoryBindsGeneratedImageAndProducer(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "PowerPC purgatory image identity"
+
+config PPC64
+	bool "64-bit PowerPC"
+
+config KEXEC_FILE
+	bool "file-based kexec"
+`)
+	kb, err := ParseKbuild(strings.NewReader(
+		"obj-$(CONFIG_KEXEC_FILE) := arch/powerpc/purgatory/kexec-purgatory.o\n",
+	), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	for path, content := range map[string]string{
+		"arch/powerpc/purgatory/kexec-purgatory.S": ".incbin \"arch/powerpc/purgatory/purgatory.ro\"\n",
+		"arch/powerpc/purgatory/trampoline_64.S":   "nop\n",
+	} {
+		mustWriteSource(t, sourceRoot, path, content)
+	}
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	generate := func(name string, flags map[string]string) (*CompactMetadata, CompactObjectVariant) {
+		t.Helper()
+		metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{{Name: name, Flags: flags}}, CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "powerpc",
+			CompileEnvironmentABI: "powerpc-purgatory-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataBatchWithOptions(%s) failed: %v", name, err)
+		}
+		config := configByName(metadata, name)
+		return metadata, variantByTarget(metadata, objectTarget(metadata, config, "arch/powerpc/purgatory/kexec-purgatory.o"))
+	}
+
+	offMetadata, _ := generate("off", map[string]string{"CONFIG_PPC64": "y"})
+	if target := objectTarget(offMetadata, configByName(offMetadata, "off"), "arch/powerpc/purgatory/kexec-purgatory.o"); target != "" {
+		t.Fatalf("PowerPC purgatory target %q exists without CONFIG_KEXEC_FILE", target)
+	}
+	metadata, before := generate("before", map[string]string{
+		"CONFIG_PPC64":      "y",
+		"CONFIG_KEXEC_FILE": "y",
+	})
+	if before.Target == "" {
+		t.Fatal("PowerPC purgatory target is absent with CONFIG_KEXEC_FILE=y")
+	}
+	if len(metadata.GeneratedHeaderFamilies) != 1 ||
+		metadata.GeneratedHeaderFamilies[0].Name != compactGeneratedHeaderFamilyAll {
+		t.Fatalf("PowerPC purgatory generated-header families = %#v, want one all family", metadata.GeneratedHeaderFamilies)
+	}
+	family := metadata.GeneratedHeaderFamilies[0]
+	inputs, err := metadata.expandedSourceInputGroup(family.SourceInputGroup, "PowerPC purgatory producer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := sourceInputPaths(inputs)
+	if want := "arch/powerpc/purgatory/trampoline_64.S"; !slices.Contains(paths, want) {
+		t.Fatalf("PowerPC purgatory producer inputs = %v, want %q", paths, want)
+	}
+	var environment CompactCompileEnvironment
+	for _, candidate := range metadata.CompileEnvironments {
+		if candidate.ID == before.CompileEnvironment {
+			environment = candidate
+			break
+		}
+	}
+	if !slices.Contains(environment.GeneratedHeaderFamilies, family.ID) {
+		t.Fatalf("PowerPC purgatory environment = %#v, want family %q", environment, family.ID)
+	}
+
+	mustWriteSource(t, sourceRoot, "arch/powerpc/purgatory/trampoline_64.S", "nop\nnop\n")
+	changedMetadata, changed := generate("changed", map[string]string{
+		"CONFIG_PPC64":      "y",
+		"CONFIG_KEXEC_FILE": "y",
+	})
+	if changedMetadata.GeneratedHeaderFamilies[0].ID == family.ID {
+		t.Fatalf("PowerPC purgatory producer did not change generated image identity %q", family.ID)
+	}
+	if changed.ContentID == before.ContentID {
+		t.Fatalf("PowerPC purgatory wrapper content ID did not change with producer %q", before.ContentID)
+	}
+}
+
+func TestCompactContentGraphPowerPCArchRootIncludeIsRecursive(t *testing.T) {
+	tree := mustParseString(t, "mainmenu \"PowerPC architecture include root\"\n")
+	sourceRoot := t.TempDir()
+	for path, content := range map[string]string{
+		"Kbuild":                       "obj-y += arch/powerpc/kernel/\n",
+		"arch/powerpc/Makefile":        "KBUILD_CPPFLAGS += -I $(srctree)/arch/powerpc\n",
+		"arch/powerpc/kernel/Makefile": "obj-y += prom.o\n",
+		"arch/powerpc/kernel/prom.c":   "#include <mm/mmu_decl.h>\nint powerpc_prom;\n",
+		"arch/powerpc/mm/mmu_decl.h":   "#define POWERPC_MMU_DECL 1\n",
+	} {
+		mustWriteSource(t, sourceRoot, path, content)
+	}
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	kb, err := ParseKbuildDirectoryTree(filepath.Join(sourceRoot, "Kbuild"), KbuildOptions{
+		RootDir:       sourceRoot,
+		RootMakefiles: []string{"arch/powerpc/Makefile"},
+		Variables:     map[string]string{"SRCARCH": "powerpc"},
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+	}
+	generate := func(name string) (*CompactMetadata, CompactObjectVariant) {
+		t.Helper()
+		metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{{Name: name}}, CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "powerpc",
+			CompileEnvironmentABI: "powerpc-object-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataBatchWithOptions(%s) failed: %v", name, err)
+		}
+		config := configByName(metadata, name)
+		return metadata, variantByTarget(metadata, objectTarget(metadata, config, "arch/powerpc/kernel/prom.o"))
+	}
+
+	metadata, before := generate("before")
+	if !reflect.DeepEqual(before.Flags, []string{"-I", "$(srctree)/arch/powerpc"}) {
+		t.Fatalf("PowerPC prom flags = %#v, want recursive architecture include root", before.Flags)
+	}
+	inputs, err := metadata.expandedSourceInputGroup(before.SourceInputGroup, "PowerPC prom")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(sourceInputPaths(inputs), "arch/powerpc/mm/mmu_decl.h") {
+		t.Fatalf("PowerPC prom inputs = %v, want arch-relative mmu_decl.h", sourceInputPaths(inputs))
+	}
+
+	mustWriteSource(t, sourceRoot, "arch/powerpc/mm/mmu_decl.h", "#define POWERPC_MMU_DECL 2\n")
+	_, changed := generate("changed")
+	if changed.ContentID == before.ContentID {
+		t.Fatalf("PowerPC arch-relative header did not change prom content ID %q", before.ContentID)
 	}
 }
 
@@ -2633,6 +3201,7 @@ func TestCompactContentGraphCompositeIdentityIgnoresNonActionMetadata(t *testing
 			nil,
 			"linker-abi-v1",
 			nil,
+			"x86",
 		)
 	}
 	left := variant("-DLEFT", "left")
@@ -2873,6 +3442,78 @@ obj-y := arch/arm64/kernel/vdso-wrap.o
 	}
 }
 
+func TestCompactContentGraphARMVDSOBindsExactGeneratedBinaryAndProducerInputs(t *testing.T) {
+	tree := mustParseString(t, "mainmenu \"ARM vDSO exact identity\"\n")
+	kb, err := ParseKbuild(strings.NewReader("obj-y := arch/arm/vdso/vdso.o\n"), "Makefile")
+	if err != nil {
+		t.Fatalf("parseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	for path, content := range map[string]string{
+		"arch/arm/vdso/vdso.S":          ".incbin \"arch/arm/vdso/vdso.so\"\n",
+		"arch/arm/vdso/note.c":          "int note;\n",
+		"arch/arm/vdso/vgettimeofday.c": "#ifdef BUILD_VDSO32\nint vdso_time;\n#endif\n",
+		"arch/arm/vdso/vdso.lds.S":      "SECTIONS { .text : { *(.text*) } }\n",
+		"arch/arm/vdso/vdsomunge.c":     "int host_vdsomunge;\n",
+		"lib/vdso/gettimeofday.c":       "int generic_vdso_time;\n",
+	} {
+		mustWriteSource(t, sourceRoot, path, content)
+	}
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	generate := func(name string) (*CompactMetadata, CompactObjectVariant) {
+		t.Helper()
+		metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{{Name: name}}, CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "arm",
+			CompileEnvironmentABI: "arm-object-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataBatchWithOptions(%s) failed: %v", name, err)
+		}
+		config := configByName(metadata, name)
+		return metadata, variantByTarget(metadata, objectTarget(metadata, config, "arch/arm/vdso/vdso.o"))
+	}
+
+	metadata, before := generate("before")
+	if len(metadata.GeneratedHeaderFamilies) != 1 ||
+		metadata.GeneratedHeaderFamilies[0].Name != compactGeneratedHeaderFamilyAll {
+		t.Fatalf("ARM vDSO generated-header families = %#v, want one all family", metadata.GeneratedHeaderFamilies)
+	}
+	family := metadata.GeneratedHeaderFamilies[0]
+	inputs, err := metadata.expandedSourceInputGroup(family.SourceInputGroup, "ARM generated headers")
+	if err != nil {
+		t.Fatalf("expand ARM generated-header inputs: %v", err)
+	}
+	paths := sourceInputPaths(inputs)
+	for _, want := range []string{
+		"arch/arm/vdso/note.c",
+		"arch/arm/vdso/vdso.lds.S",
+		"arch/arm/vdso/vdsomunge.c",
+		"arch/arm/vdso/vgettimeofday.c",
+		"lib/vdso/gettimeofday.c",
+	} {
+		if !slices.Contains(paths, want) {
+			t.Errorf("ARM generated-header inputs = %v, want %q", paths, want)
+		}
+	}
+	var environment CompactCompileEnvironment
+	for _, candidate := range metadata.CompileEnvironments {
+		if candidate.ID == before.CompileEnvironment {
+			environment = candidate
+			break
+		}
+	}
+	if want := []string{family.ID}; !reflect.DeepEqual(environment.GeneratedHeaderFamilies, want) {
+		t.Fatalf("ARM vDSO generated-header families = %v, want %v", environment.GeneratedHeaderFamilies, want)
+	}
+
+	mustWriteSource(t, sourceRoot, "lib/vdso/gettimeofday.c", "int generic_vdso_time_changed;\n")
+	_, changed := generate("changed")
+	if changed.ContentID == before.ContentID {
+		t.Fatalf("ARM vDSO producer source digest did not change content ID %q", before.ContentID)
+	}
+}
+
 func TestCompactContentGraphSpecialSourceManifestExcludesHostTools(t *testing.T) {
 	inputs := compactSpecialSourcesForObject("arch/x86/entry/vdso/vdso-image-64.o")
 	if inputs.primary != "arch/x86/entry/vdso/vdso-note.S" {
@@ -2894,6 +3535,80 @@ func TestCompactContentGraphSpecialSourceManifestExcludesHostTools(t *testing.T)
 	}
 	if slices.Contains(paths, "arch/x86/entry/vdso/vdso2c.c") {
 		t.Fatalf("vDSO source manifest includes host tool vdso2c.c: %v", paths)
+	}
+}
+
+func TestCompactMappedGeneratedSourcesUseOutputLanguageFlags(t *testing.T) {
+	for _, tc := range []struct {
+		object    string
+		source    string
+		wantFlags []string
+	}{
+		{
+			object:    "drivers/of/base.dtb.o",
+			source:    "drivers/of/base.dts",
+			wantFlags: []string{"-DANY", "-DASM_ONLY"},
+		},
+		{
+			object:    "drivers/of/overlay.dtbo.o",
+			source:    "drivers/of/overlay.dtso",
+			wantFlags: []string{"-DANY", "-DASM_ONLY"},
+		},
+		{
+			object:    "lib/crypto/arm/sha256-core.o",
+			source:    "lib/crypto/arm/sha256-armv4.pl",
+			wantFlags: []string{"-DANY", "-DASM_ONLY"},
+		},
+		{
+			object:    "crypto/example.asn1.o",
+			source:    "crypto/example.asn1",
+			wantFlags: []string{"-DANY", "-DC_ONLY"},
+		},
+		{
+			object:    "drivers/tty/vt/defkeymap.o",
+			source:    "drivers/tty/vt/defkeymap.c_shipped",
+			wantFlags: []string{"-DANY", "-DC_ONLY"},
+		},
+		{
+			object:    "drivers/tty/vt/consolemap_deftbl.o",
+			source:    "drivers/tty/vt/cp437.uni",
+			wantFlags: []string{"-DANY", "-DC_ONLY"},
+		},
+		{
+			object:    "arch/x86/kernel/cpu/capflags.o",
+			source:    "arch/x86/kernel/cpu/mkcapflags.sh",
+			wantFlags: []string{"-DANY", "-DC_ONLY"},
+		},
+	} {
+		t.Run(filepath.Ext(tc.source), func(t *testing.T) {
+			object := resolvedKbuildObject{
+				object: tc.object,
+				mode:   "y",
+				flags: []resolvedKbuildFlag{
+					{language: "any", values: []string{"-DANY"}},
+					{language: "c", values: []string{"-DC_ONLY"}},
+					{language: "asm", values: []string{"-DASM_ONLY"}},
+				},
+				footprint: map[string]bool{},
+			}
+			variant := object.variant(
+				&ResolvedConfig{},
+				tc.source,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				"",
+				nil,
+				"linux.bzl/compact-v6/test",
+				nil,
+				"x86",
+			)
+			if got := variant.Flags; !reflect.DeepEqual(got, tc.wantFlags) {
+				t.Fatalf("%s flags = %v, want %v", tc.source, got, tc.wantFlags)
+			}
+		})
 	}
 }
 
@@ -2946,6 +3661,7 @@ obj-y += init.o
 			nil,
 			"linux.bzl/compact-v6/test",
 			nil,
+			"x86",
 		)
 	}
 	windowsVariant := variant(kb.Flags[0].Flags, sourceRoot)
@@ -3389,11 +4105,20 @@ func TestCompactSourceBuildReadyRejectsUnknownMakeRefs(t *testing.T) {
 	}
 }
 
-func TestSourceCandidatesForGeneratedArm64Objects(t *testing.T) {
+func TestSourceCandidatesForGeneratedArchitectureObjects(t *testing.T) {
 	tests := map[string][]string{
 		"arch/arm64/kernel/pi/lib-fdt.pi.o": {
 			"lib/fdt.c",
 			"arch/arm64/kernel/pi/fdt.c",
+		},
+		"arch/riscv/kernel/pi/ctype.pi.o": {
+			"lib/ctype.c",
+		},
+		"arch/riscv/kernel/pi/string.pi.o": {
+			"lib/string.c",
+		},
+		"arch/riscv/kernel/pi/lib-fdt.pi.o": {
+			"lib/fdt.c",
 		},
 		"drivers/of/empty_root.dtb.o": {
 			"drivers/of/empty_root.dts",
@@ -3410,6 +4135,18 @@ func TestSourceCandidatesForGeneratedArm64Objects(t *testing.T) {
 		"lib/crypto/arm64/sha512-core.o": {
 			"lib/crypto/arm64/sha2-armv8.pl",
 		},
+		"lib/crypto/arm/poly1305-core.o": {
+			"lib/crypto/arm/poly1305-armv4.pl",
+		},
+		"lib/crypto/arm/sha256-core.o": {
+			"lib/crypto/arm/sha256-armv4.pl",
+		},
+		"lib/crypto/arm/sha512-core.o": {
+			"lib/crypto/arm/sha512-armv4.pl",
+		},
+		"lib/crypto/riscv/poly1305-core.o": {
+			"lib/crypto/riscv/poly1305-riscv.pl",
+		},
 	}
 	for object, wantCandidates := range tests {
 		got := sourceCandidatesForObject(object)
@@ -3418,6 +4155,199 @@ func TestSourceCandidatesForGeneratedArm64Objects(t *testing.T) {
 				t.Fatalf("sourceCandidatesForObject(%q) = %v, want candidate %q", object, got, want)
 			}
 		}
+	}
+}
+
+func TestCompactContentGraphEFILibstubLibFDTUsesVendoredIncludeRoot(t *testing.T) {
+	tree := mustParseString(t, "mainmenu \"EFI libstub libfdt closure\"\n")
+	kb, err := ParseKbuild(strings.NewReader(
+		"obj-y := drivers/firmware/efi/libstub/lib-fdt.stub.o\n",
+	), "Makefile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceRoot := t.TempDir()
+	for path, content := range map[string]string{
+		"lib/fdt.c":                            "#include <linux/libfdt_env.h>\n#include \"../scripts/dtc/libfdt/fdt.c\"\n",
+		"include/linux/libfdt_env.h":           "#define LIBFDT_ENV_H 1\n",
+		"scripts/dtc/libfdt/fdt.c":             "#include \"libfdt_env.h\"\n#include <libfdt.h>\n#include \"libfdt_internal.h\"\n",
+		"scripts/dtc/libfdt/libfdt_env.h":      "#ifndef LIBFDT_ENV_H\n#include <stddef.h>\n#endif\n",
+		"scripts/dtc/libfdt/libfdt.h":          "#include <fdt.h>\n",
+		"scripts/dtc/libfdt/fdt.h":             "#define FDT_MAGIC 1\n",
+		"scripts/dtc/libfdt/libfdt_internal.h": "#define FDT_INTERNAL 1\n",
+	} {
+		mustWriteSource(t, sourceRoot, path, content)
+	}
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	generate := func(name string) (*CompactMetadata, CompactObjectVariant) {
+		t.Helper()
+		metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{{Name: name}}, CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "riscv",
+			CompileEnvironmentABI: "riscv-efi-stub-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataBatchWithOptions(%s) failed: %v", name, err)
+		}
+		config := configByName(metadata, name)
+		return metadata, variantByTarget(metadata, objectTarget(metadata, config, "drivers/firmware/efi/libstub/lib-fdt.stub.o"))
+	}
+
+	metadata, before := generate("before")
+	if before.Source != "lib/fdt.c" {
+		t.Fatalf("EFI libstub lib-fdt source = %q, want lib/fdt.c", before.Source)
+	}
+	inputs, err := metadata.expandedSourceInputGroup(before.SourceInputGroup, "EFI libstub libfdt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := sourceInputPaths(inputs)
+	for _, want := range []string{
+		"lib/fdt.c",
+		"include/linux/libfdt_env.h",
+		"scripts/dtc/libfdt/fdt.c",
+		"scripts/dtc/libfdt/libfdt_env.h",
+		"scripts/dtc/libfdt/libfdt.h",
+		"scripts/dtc/libfdt/fdt.h",
+		"scripts/dtc/libfdt/libfdt_internal.h",
+	} {
+		if !slices.Contains(paths, want) {
+			t.Errorf("EFI libstub libfdt inputs = %v, want %q", paths, want)
+		}
+	}
+
+	mustWriteSource(t, sourceRoot, "scripts/dtc/libfdt/fdt.h", "#define FDT_MAGIC 2\n")
+	_, changed := generate("changed")
+	if changed.ContentID == before.ContentID {
+		t.Fatalf("vendored fdt.h did not change EFI stub content ID %q", before.ContentID)
+	}
+}
+
+func TestCompactContentGraphRISCVPIObjectsBindPreparedSources(t *testing.T) {
+	tree := mustParseString(t, "mainmenu \"RISC-V PI object preparation\"\n")
+	sourceRoot := t.TempDir()
+	for path, content := range map[string]string{
+		"Kbuild": "obj-y += arch/riscv/kernel/pi/\n",
+		"arch/riscv/kernel/pi/Makefile": `KBUILD_CFLAGS := -fpie -Os -I$(srctree)/scripts/dtc/libfdt
+CFLAGS_ctype.o += -D__NO_FORTIFY
+obj-y := ctype.pi.o string.pi.o lib-fdt.pi.o
+`,
+		"lib/ctype.c":  "int kernel_ctype_v1;\n",
+		"lib/string.c": "int kernel_string;\n",
+		"lib/fdt.c":    "int kernel_fdt;\n",
+	} {
+		mustWriteSource(t, sourceRoot, path, content)
+	}
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	kb, err := ParseKbuildDirectoryTree(filepath.Join(sourceRoot, "Kbuild"), KbuildOptions{
+		RootDir:   sourceRoot,
+		Variables: map[string]string{"SRCARCH": "riscv"},
+	})
+	if err != nil {
+		t.Fatalf("ParseKbuildDirectoryTree() failed: %v", err)
+	}
+	generate := func(name string) (*CompactMetadata, map[string]CompactObjectVariant) {
+		t.Helper()
+		metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{{Name: name}}, CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "riscv",
+			CompileEnvironmentABI: "riscv-pi-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataBatchWithOptions(%s) failed: %v", name, err)
+		}
+		config := configByName(metadata, name)
+		variants := map[string]CompactObjectVariant{}
+		for _, object := range []string{
+			"arch/riscv/kernel/pi/ctype.pi.o",
+			"arch/riscv/kernel/pi/string.pi.o",
+			"arch/riscv/kernel/pi/lib-fdt.pi.o",
+		} {
+			variants[object] = variantByTarget(metadata, objectTarget(metadata, config, object))
+		}
+		return metadata, variants
+	}
+
+	metadata, before := generate("before")
+	wantSources := map[string]string{
+		"arch/riscv/kernel/pi/ctype.pi.o":   "lib/ctype.c",
+		"arch/riscv/kernel/pi/string.pi.o":  "lib/string.c",
+		"arch/riscv/kernel/pi/lib-fdt.pi.o": "lib/fdt.c",
+	}
+	for object, wantSource := range wantSources {
+		variant := before[object]
+		if variant.Source != wantSource {
+			t.Errorf("%s source = %q, want %q", object, variant.Source, wantSource)
+		}
+		inputs, err := metadata.expandedSourceInputGroup(variant.SourceInputGroup, object)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(sourceInputPaths(inputs), wantSource) {
+			t.Errorf("%s inputs = %v, want %q", object, sourceInputPaths(inputs), wantSource)
+		}
+		if !slices.Contains(variant.Flags, "-fpie") {
+			t.Errorf("%s flags = %v, want PI compilation", object, variant.Flags)
+		}
+	}
+	ctypeObject := "arch/riscv/kernel/pi/ctype.pi.o"
+	if !slices.Contains(before[ctypeObject].Flags, "-D__NO_FORTIFY") {
+		t.Fatalf("ctype PI flags = %v, want compile-intermediate CFLAGS_ctype.o", before[ctypeObject].Flags)
+	}
+	if slices.Contains(before["arch/riscv/kernel/pi/string.pi.o"].Flags, "-D__NO_FORTIFY") {
+		t.Fatalf("string PI inherited ctype-only flags: %v", before["arch/riscv/kernel/pi/string.pi.o"].Flags)
+	}
+
+	mustWriteSource(t, sourceRoot, "lib/ctype.c", "int kernel_ctype_v2;\n")
+	_, changed := generate("changed")
+	if changed[ctypeObject].ContentID == before[ctypeObject].ContentID {
+		t.Fatalf("RISC-V ctype PI source digest did not change content ID %q", before[ctypeObject].ContentID)
+	}
+	stringObject := "arch/riscv/kernel/pi/string.pi.o"
+	if changed[stringObject].ContentID != before[stringObject].ContentID {
+		t.Fatalf("ctype source change perturbed unrelated string PI object")
+	}
+}
+
+func TestCompactContentGraphGeneratedARMPerlasmSourceIdentity(t *testing.T) {
+	tree := mustParseString(t, "mainmenu \"ARM perlasm identity\"\n")
+	kb, err := ParseKbuild(strings.NewReader("obj-y := lib/crypto/arm/sha256-core.o\n"), "Makefile")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	const generator = "lib/crypto/arm/sha256-armv4.pl"
+	mustWriteSource(t, sourceRoot, generator, "# ARM SHA-256 generator v1\n")
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	generate := func() (*CompactMetadata, CompactObjectVariant) {
+		t.Helper()
+		metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{{Name: "arm"}}, CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "arm",
+			CompileEnvironmentABI: "arm-object-abi-v1",
+		})
+		if err != nil {
+			t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
+		}
+		config := configByName(metadata, "arm")
+		return metadata, variantByTarget(metadata, objectTarget(metadata, config, "lib/crypto/arm/sha256-core.o"))
+	}
+
+	metadata, before := generate()
+	if before.Source != generator {
+		t.Fatalf("ARM SHA-256 source = %q, want %q", before.Source, generator)
+	}
+	inputs, err := metadata.expandedSourceInputGroup(before.SourceInputGroup, "ARM SHA-256")
+	if err != nil {
+		t.Fatalf("expand ARM SHA-256 source inputs: %v", err)
+	}
+	if got := sourceInputByPath(inputs, generator).Path; got == "" {
+		t.Fatalf("ARM SHA-256 source inputs = %v, want %q", inputs, generator)
+	}
+	mustWriteSource(t, sourceRoot, generator, "# ARM SHA-256 generator v2\n")
+	_, changed := generate()
+	if changed.ContentID == before.ContentID {
+		t.Fatalf("ARM SHA-256 generator change did not change content ID %q", before.ContentID)
 	}
 }
 

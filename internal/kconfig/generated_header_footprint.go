@@ -49,6 +49,7 @@ type compactGeneratedHeaderFamilyFootprint struct {
 type compactGeneratedHeaderSource struct {
 	path         string
 	includeRoots []string
+	profile      sourceScanProfile
 }
 
 func generatedHeaderOffsetsSources(sources ...compactGeneratedHeaderSource) []compactGeneratedHeaderSource {
@@ -72,7 +73,7 @@ func generatedHeaderFamilyFootprints(
 		), nil
 	}
 
-	kernelFlagSymbols := KernelFlagsConfigSymbols()
+	kernelFlagSymbols := KernelFlagsConfigSymbols(opts.Srcarch)
 	static, err := generatedHeaderFamilyFootprint(
 		config,
 		scanner,
@@ -298,7 +299,7 @@ func generatedHeaderFamilyFootprint(
 		if _, ok := scanner.absForTreePath(source.path); !ok {
 			continue
 		}
-		closure, err := scanner.closureForSourceConfig(source.path, source.includeRoots, config)
+		closure, err := scanner.closureForSourceConfigProfile(source.path, source.includeRoots, config, source.profile)
 		if err != nil {
 			return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
 				"scan generated-header family %s input %s: %w",
@@ -368,7 +369,7 @@ func generatedHeaderAllFootprint(
 	for _, symbol := range generatedHeaderConfigSymbols {
 		refs[symbol] = true
 	}
-	for _, symbol := range KernelFlagsConfigSymbols() {
+	for _, symbol := range KernelFlagsConfigSymbols(opts.Srcarch) {
 		refs[symbol] = true
 	}
 	if opts.Srcarch == "x86" {
@@ -428,12 +429,124 @@ func generatedHeaderAllFootprint(
 		if _, ok := scanner.absForTreePath("arch/arm64/include/asm/cfi.h"); ok {
 			digestOnlyPaths = append(digestOnlyPaths, "arch/arm64/include/asm/cfi.h")
 		}
+	case "arm":
+		for _, path := range []string{
+			"arch/arm/vdso/note.c",
+			"arch/arm/vdso/vgettimeofday.c",
+			"arch/arm/vdso/vdso.lds.S",
+			"lib/vdso/gettimeofday.c",
+		} {
+			sourcePaths = append(sourcePaths, compactGeneratedHeaderSource{
+				path:    path,
+				profile: sourceScanARMVDSO,
+			})
+		}
+		digestOnlyPaths = append(digestOnlyPaths,
+			"arch/arm/vdso/vdsomunge.c",
+			"arch/arm/tools/syscall.tbl",
+		)
+	case "riscv":
+		// The purgatory link omits its local string routines while either KASAN
+		// implementation is enabled, so these symbols are part of the generated
+		// purgatory.ro action identity even though no producer source references
+		// them directly.
+		refs["CONFIG_KASAN_GENERIC"] = true
+		refs["CONFIG_KASAN_SW_TAGS"] = true
+		for _, path := range []string{
+			"arch/riscv/kernel/vdso/flush_icache.S",
+			"arch/riscv/kernel/vdso/getcpu.S",
+			"arch/riscv/kernel/vdso/getrandom.c",
+			"arch/riscv/kernel/vdso/hwprobe.c",
+			"arch/riscv/kernel/vdso/note.S",
+			"arch/riscv/kernel/vdso/rt_sigreturn.S",
+			"arch/riscv/kernel/vdso/sys_hwprobe.S",
+			"arch/riscv/kernel/vdso/vdso.lds.S",
+			"arch/riscv/kernel/vdso/vgetrandom-chacha.S",
+			"arch/riscv/kernel/vdso/vgettimeofday.c",
+			"lib/vdso/getrandom.c",
+			"lib/vdso/gettimeofday.c",
+		} {
+			sourcePaths = append(sourcePaths, compactGeneratedHeaderSource{
+				path:    path,
+				profile: sourceScanRISCVVDSO,
+			})
+		}
+		for _, path := range []string{
+			"arch/riscv/kernel/compat_vdso/compat_vdso.lds.S",
+			"arch/riscv/kernel/compat_vdso/flush_icache.S",
+			"arch/riscv/kernel/compat_vdso/getcpu.S",
+			"arch/riscv/kernel/compat_vdso/note.S",
+			"arch/riscv/kernel/compat_vdso/rt_sigreturn.S",
+		} {
+			sourcePaths = append(sourcePaths, compactGeneratedHeaderSource{
+				path:    path,
+				profile: sourceScanRISCVCompatVDSO,
+			})
+		}
+		for _, path := range []string{
+			"arch/riscv/purgatory/purgatory.c",
+			"arch/riscv/purgatory/entry.S",
+			"lib/crypto/sha256.c",
+			"lib/string.c",
+			"lib/ctype.c",
+			"arch/riscv/lib/memcpy.S",
+			"arch/riscv/lib/memset.S",
+			"arch/riscv/lib/strcmp.S",
+			"arch/riscv/lib/strlen.S",
+			"arch/riscv/lib/strncmp.S",
+		} {
+			sourcePaths = append(sourcePaths, compactGeneratedHeaderSource{path: path})
+		}
+	case "powerpc":
+		for _, symbol := range []string{
+			"CONFIG_PPC64",
+			"CONFIG_VDSO32",
+			"CONFIG_GENERIC_GETTIMEOFDAY",
+			"CONFIG_VDSO_GETRANDOM",
+		} {
+			// These symbols select vDSO output images or producer objects in
+			// arch/powerpc/kernel/vdso/Makefile rather than in source #if gates.
+			refs[symbol] = true
+		}
+		shared := []string{
+			"arch/powerpc/kernel/vdso/cacheflush.S",
+			"arch/powerpc/kernel/vdso/datapage.S",
+			"arch/powerpc/kernel/vdso/getcpu.S",
+			"arch/powerpc/kernel/vdso/getrandom.S",
+			"arch/powerpc/kernel/vdso/gettimeofday.S",
+			"arch/powerpc/kernel/vdso/note.S",
+			"arch/powerpc/kernel/vdso/vgetrandom-chacha.S",
+			"arch/powerpc/kernel/vdso/vgetrandom.c",
+			"arch/powerpc/kernel/vdso/vgettimeofday.c",
+			"lib/vdso/getrandom.c",
+			"lib/vdso/gettimeofday.c",
+		}
+		for _, profile := range []sourceScanProfile{sourceScanPPC64VDSO, sourceScanPPC32VDSO} {
+			for _, path := range shared {
+				sourcePaths = append(sourcePaths, compactGeneratedHeaderSource{
+					path:    path,
+					profile: profile,
+				})
+			}
+		}
+		for _, source := range []compactGeneratedHeaderSource{
+			// CONFIG_KEXEC_FILE is only available for PPC64, whose purgatory
+			// image is linked from trampoline_64.o and embedded by the wrapper.
+			{path: "arch/powerpc/purgatory/trampoline_64.S"},
+			{path: "arch/powerpc/kernel/vdso/sigtramp64.S", profile: sourceScanPPC64VDSO},
+			{path: "arch/powerpc/kernel/vdso/vdso64.lds.S", profile: sourceScanPPC64VDSO},
+			{path: "arch/powerpc/kernel/vdso/sigtramp32.S", profile: sourceScanPPC32VDSO},
+			{path: "arch/powerpc/kernel/vdso/vdso32.lds.S", profile: sourceScanPPC32VDSO},
+			{path: "arch/powerpc/lib/crtsavres.S", profile: sourceScanPPC32VDSO},
+		} {
+			sourcePaths = append(sourcePaths, source)
+		}
 	}
 	for _, source := range sourcePaths {
 		if _, ok := scanner.absForTreePath(source.path); !ok {
 			continue
 		}
-		closure, err := scanner.closureForSourceConfig(source.path, source.includeRoots, config)
+		closure, err := scanner.closureForSourceConfigProfile(source.path, source.includeRoots, config, source.profile)
 		if err != nil {
 			return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
 				"scan generated-header all-family input %s: %w",
@@ -573,6 +686,8 @@ func generatedHeaderFamilyNameForInclude(path string) (string, bool) {
 		return compactGeneratedHeaderFamilyRQOffsets, true
 	case "kvm-asm-offsets.h", "generated/kvm-asm-offsets.h":
 		return compactGeneratedHeaderFamilyKVMOffsets, true
+	case "calls-eabi.S", "calls-oabi.S":
+		return compactGeneratedHeaderFamilyAll, true
 	}
 	if strings.HasPrefix(path, "asm/") || strings.HasPrefix(path, "uapi/asm/") {
 		return compactGeneratedHeaderFamilyStatic, true

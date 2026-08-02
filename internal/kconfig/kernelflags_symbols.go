@@ -2,11 +2,10 @@ package kconfig
 
 import "sort"
 
-// kernelFlagsConfigSymbols is the set of CONFIG_* symbols consulted by
-// //internal/cmd/kernelflags when computing global compiler and assembler
-// flags. These symbols affect every source-backed object, independent of its
-// per-source CONFIG_* references.
-var kernelFlagsConfigSymbols = []string{
+// commonKernelFlagsConfigSymbols preserves the existing x86/arm64 compiler
+// payload ABI. New architecture-specific dependencies live below so adding an
+// ARM, PowerPC, or RISC-V flag cannot perturb an unrelated x86 payload ID.
+var commonKernelFlagsConfigSymbols = []string{
 	"CONFIG_ARM64_BTI_KERNEL",
 	"CONFIG_ARM64_PTR_AUTH_KERNEL",
 	"CONFIG_AS_HAS_ARMV8_5",
@@ -55,10 +54,79 @@ var kernelFlagsConfigSymbols = []string{
 	"CONFIG_ZERO_CALL_USED_REGS",
 }
 
-// KernelFlagsConfigSymbols returns a sorted copy of the global flag footprint.
-func KernelFlagsConfigSymbols() []string {
-	out := make([]string, len(kernelFlagsConfigSymbols))
-	copy(out, kernelFlagsConfigSymbols)
+var architectureKernelFlagsConfigSymbols = map[string][]string{
+	"arm": {
+		"CONFIG_AEABI",
+		"CONFIG_ARM_UNWIND",
+		"CONFIG_CPU_32v3",
+		"CONFIG_CPU_32v4",
+		"CONFIG_CPU_32v4T",
+		"CONFIG_CPU_32v5",
+		"CONFIG_CPU_32v6",
+		"CONFIG_CPU_32v6K",
+		"CONFIG_CPU_32v7",
+		"CONFIG_CPU_32v7M",
+		"CONFIG_CPU_ARM720T",
+		"CONFIG_CPU_ARM740T",
+		"CONFIG_CPU_ARM7TDMI",
+		"CONFIG_CPU_ARM920T",
+		"CONFIG_CPU_ARM922T",
+		"CONFIG_CPU_ARM925T",
+		"CONFIG_CPU_ARM926T",
+		"CONFIG_CPU_ARM940T",
+		"CONFIG_CPU_ARM946E",
+		"CONFIG_CPU_ARM9TDMI",
+		"CONFIG_CPU_FA526",
+		"CONFIG_CPU_FEROCEON",
+		"CONFIG_CPU_SA110",
+		"CONFIG_CPU_SA1100",
+		"CONFIG_CPU_V6",
+		"CONFIG_CPU_V6K",
+		"CONFIG_CPU_XSCALE",
+		"CONFIG_CPU_XSC3",
+		"CONFIG_CURRENT_POINTER_IN_TPIDRURO",
+		"CONFIG_MMU",
+		"CONFIG_THUMB2_KERNEL",
+	},
+	"powerpc": {
+		"CONFIG_ARCH_USING_PATCHABLE_FUNCTION_ENTRY",
+		"CONFIG_MPROFILE_KERNEL",
+		"CONFIG_PPC64_ELF_ABI_V1",
+		"CONFIG_PPC64_ELF_ABI_V2",
+		"CONFIG_PPC_FTRACE_OUT_OF_LINE",
+		"CONFIG_PPC_KERNEL_PCREL",
+		"CONFIG_PPC_KERNEL_PREFIXED",
+		"CONFIG_TARGET_CPU",
+		"CONFIG_TARGET_CPU_BOOL",
+		"CONFIG_TUNE_CPU",
+	},
+	"riscv": {
+		"CONFIG_CMODEL_MEDANY",
+		"CONFIG_CMODEL_MEDLOW",
+		"CONFIG_DYNAMIC_FTRACE",
+		"CONFIG_FPU",
+		"CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS",
+		"CONFIG_RELOCATABLE",
+		"CONFIG_RISCV_ISA_C",
+		"CONFIG_RISCV_ISA_V",
+		"CONFIG_TOOLCHAIN_HAS_ZABHA",
+		"CONFIG_TOOLCHAIN_HAS_ZACAS",
+		"CONFIG_TOOLCHAIN_NEEDS_EXPLICIT_ZICSR_ZIFENCEI",
+		"CONFIG_TOOLCHAIN_NEEDS_OLD_ISA_SPEC",
+	},
+}
+
+// KernelFlagsConfigSymbols returns a sorted copy of the compiler flag
+// footprint for one Linux SRCARCH. Omitting srcarch preserves the original
+// common footprint for callers that predate architecture-scoped flags. The
+// common prefix is intentionally stable for content-addressing compatibility.
+func KernelFlagsConfigSymbols(srcarch ...string) []string {
+	arch := ""
+	if len(srcarch) != 0 {
+		arch = srcarch[0]
+	}
+	out := append([]string(nil), commonKernelFlagsConfigSymbols...)
+	out = append(out, architectureKernelFlagsConfigSymbols[arch]...)
 	sort.Strings(out)
 	return out
 }

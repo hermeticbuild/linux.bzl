@@ -78,6 +78,28 @@ func fixedLinuxProbeShell(
 	return kconfig.LinuxProbeShell(architecture, rustcVersion, rustcLLVMVersion)
 }
 
+func measuredLinuxProbeShell(
+	probe *kconfig.LinuxToolProbe,
+	ccPath string,
+	ldPath string,
+	rustcVersion int,
+	rustcLLVMVersion int,
+	env stringMapFlag,
+) (func(context.Context, string) (string, error), error) {
+	for name, value := range fixedLinuxProbeEnvironment {
+		if name == "CC" {
+			value = ccPath
+		} else if name == "LD" {
+			value = ldPath
+		}
+		if configured, ok := env[name]; ok && configured != value {
+			return nil, fmt.Errorf("measured Linux probe requires %s=%q, got %q", name, value, configured)
+		}
+		env[name] = value
+	}
+	return kconfig.LinuxProbeShellWithTools(probe, rustcVersion, rustcLLVMVersion)
+}
+
 type stringSliceFlag []string
 
 func (f *stringSliceFlag) String() string {
@@ -246,6 +268,11 @@ func run() (exitCode int) {
 		srctree                  = flag.String("srctree", "", "Source tree used to resolve source statements")
 		allowShell               = flag.Bool("allow_shell", false, "Allow $(shell,...) expansion")
 		linuxProbeArch           = flag.String("linux_probe_arch", "", "Linux architecture for the fixed Clang 22.1.8 Kconfig probe policy")
+		targetProfile            = flag.String("target_profile", "", "Canonical platform-selected Linux target profile")
+		linuxArch                = flag.String("linux_arch", "", "Linux ARCH required by -target_profile")
+		targetTriple             = flag.String("target_triple", "", "Canonical LLVM target triple required by -target_profile")
+		probeCC                  = flag.String("probe_cc", "", "Path to the integrity-pinned clang used for real repository-time probes")
+		probeLD                  = flag.String("probe_ld", "", "Path to the integrity-pinned ld.lld used for real repository-time probes")
 		linuxProbeRustcVersion   = flag.Int("linux_probe_rustc_version", kconfig.LinuxProbeDefaultRustcVersion, "Linux-encoded Rust compiler version for repository-time Kconfig resolution")
 		linuxProbeRustcLLVM      = flag.Int("linux_probe_rustc_llvm_version", kconfig.LinuxProbeDefaultRustcLLVMVersion, "Linux-encoded Rust LLVM version for repository-time Kconfig resolution")
 		rustToolchainProbe       = flag.String("rust_toolchain_probe", "", "JSON identity produced from the selected rustc -vV output")
@@ -304,6 +331,48 @@ func run() (exitCode int) {
 	flag.Var(&generatedHeadersByConfig, "generated_headers_for_config", "Generated headers binding in NAME=LABEL form. May be repeated once per compact config")
 	flag.Parse()
 
+	var selectedProfile *kconfig.LinuxTargetProfile
+	var toolProbe *kconfig.LinuxToolProbe
+	adaptiveValues := []string{*targetProfile, *linuxArch, *targetTriple, *probeCC, *probeLD}
+	adaptiveCount := 0
+	for _, value := range adaptiveValues {
+		if value != "" {
+			adaptiveCount++
+		}
+	}
+	if adaptiveCount != 0 && adaptiveCount != len(adaptiveValues) {
+		fmt.Fprintln(os.Stderr, "-target_profile, -linux_arch, -target_triple, -probe_cc, and -probe_ld must be supplied together")
+		return 2
+	}
+	if adaptiveCount != 0 {
+		profile, err := kconfig.LinuxTargetProfileByName(*targetProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid Linux target profile: %v\n", err)
+			return 2
+		}
+		if err := profile.ValidateTargetIdentity(*linuxArch, *targetTriple); err != nil {
+			fmt.Fprintf(os.Stderr, "invalid Linux target identity: %v\n", err)
+			return 2
+		}
+		for name, value := range map[string]string{"ARCH": profile.Arch, "SRCARCH": profile.Srcarch, "UTS_MACHINE": profile.UTSMachine} {
+			if configured, ok := vars[name]; ok && configured != value {
+				fmt.Fprintf(os.Stderr, "Linux target profile %q requires %s=%q, got %q\n", profile.Name, name, value, configured)
+				return 2
+			}
+			vars[name] = value
+		}
+		probe, err := kconfig.NewLinuxToolProbe(kconfig.LinuxToolProbeOptions{
+			Profile: profile.Name, Architecture: profile.Arch, TargetTriple: profile.TargetTriple,
+			ClangPath: workspacePath(*probeCC), LLDPath: workspacePath(*probeLD),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to configure measured Linux tools: %v\n", err)
+			return 2
+		}
+		selectedProfile = &profile
+		toolProbe = probe
+	}
+
 	stopProfiles, err := startRuntimeProfiles(*cpuProfile, *heapProfile, *allocsProfile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start runtime profiles: %v\n", err)
@@ -348,12 +417,12 @@ func run() (exitCode int) {
 			}
 			*linuxProbeRustcVersion, *linuxProbeRustcLLVM = applyRustToolchainProbe(vars, probe)
 		}
-		shell, err := fixedLinuxProbeShell(
-			*linuxProbeArch,
-			*linuxProbeRustcVersion,
-			*linuxProbeRustcLLVM,
-			env,
-		)
+		var shell func(context.Context, string) (string, error)
+		if toolProbe != nil {
+			shell, err = measuredLinuxProbeShell(toolProbe, workspacePath(*probeCC), workspacePath(*probeLD), *linuxProbeRustcVersion, *linuxProbeRustcLLVM, env)
+		} else {
+			shell, err = fixedLinuxProbeShell(*linuxProbeArch, *linuxProbeRustcVersion, *linuxProbeRustcLLVM, env)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to configure fixed Linux probe: %v\n", err)
 			return 2
@@ -471,7 +540,7 @@ func run() (exitCode int) {
 	}
 
 	if resolvedConfigRequested {
-		if err := writeResolvedConfig(tree, *resolveConfig, *configMode, resolvedConfigOutputs{
+		if err := writeResolvedConfig(tree, selectedProfile, *resolveConfig, *configMode, resolvedConfigOutputs{
 			config:        *resolvedConfigOut,
 			autoConf:      *resolvedAutoConfOut,
 			autoConfCmd:   *resolvedCmdOut,
@@ -505,6 +574,8 @@ func run() (exitCode int) {
 			headerLabels,
 			*kernelVersion,
 			*compileEnvironmentABI,
+			selectedProfile,
+			toolProbe,
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to generate compact metadata: %v\n", err)
@@ -592,7 +663,7 @@ type resolvedConfigOutputs struct {
 	kernelRelease string
 }
 
-func writeResolvedConfig(tree *kconfig.Tree, input, configMode string, outputs resolvedConfigOutputs, kernelVersion string, validateEquivalent bool) error {
+func writeResolvedConfig(tree *kconfig.Tree, profile *kconfig.LinuxTargetProfile, input, configMode string, outputs resolvedConfigOutputs, kernelVersion string, validateEquivalent bool) error {
 	if input == "" {
 		return fmt.Errorf("-resolve_config is required when resolved config outputs are requested")
 	}
@@ -628,6 +699,12 @@ func writeResolvedConfig(tree *kconfig.Tree, input, configMode string, outputs r
 	if err != nil {
 		return err
 	}
+	if profile != nil {
+		raw, err = profile.PrepareTargetConfig(raw)
+		if err != nil {
+			return err
+		}
+	}
 	resolveOpts, err := resolveConfigOptions(configMode)
 	if err != nil {
 		return err
@@ -635,6 +712,11 @@ func writeResolvedConfig(tree *kconfig.Tree, input, configMode string, outputs r
 	resolved, err := tree.ResolveConfigWithOptions(name, raw, resolveOpts)
 	if err != nil {
 		return err
+	}
+	if profile != nil {
+		if err := profile.ValidateResolvedArchitecture(resolved); err != nil {
+			return err
+		}
 	}
 	if validateEquivalent {
 		if err := kconfig.ValidateRustToolchainEquivalence(raw, resolved); err != nil {
@@ -890,7 +972,12 @@ func compactMetadata(
 	generatedHeadersByConfig map[string]string,
 	kernelVersion string,
 	compileEnvironmentABI string,
+	profile *kconfig.LinuxTargetProfile,
+	toolProbe *kconfig.LinuxToolProbe,
 ) (*kconfig.CompactMetadata, error) {
+	if profile != nil && toolProbe == nil {
+		return nil, fmt.Errorf("adaptive compact metadata requires measured Linux tool probes")
+	}
 	if kbuildPath == "" {
 		return nil, fmt.Errorf("-kbuild is required")
 	}
@@ -922,6 +1009,12 @@ func compactMetadata(
 		if closeErr != nil {
 			return nil, fmt.Errorf("%s: %w", input.Path, closeErr)
 		}
+		if profile != nil {
+			flags, parseErr = profile.PrepareTargetConfig(flags)
+			if parseErr != nil {
+				return nil, fmt.Errorf("%s: %w", input.Path, parseErr)
+			}
+		}
 		configs = append(configs, kconfig.NamedConfig{Name: input.Name, Flags: flags, AllNoConfig: resolveOpts.AllNoConfig})
 	}
 	sourceRoot := ""
@@ -946,13 +1039,32 @@ func compactMetadata(
 		KernelVersion:         kernelVersion,
 		Srcarch:               vars["SRCARCH"],
 	}
+	if profile != nil {
+		opts.CompileEnvironmentABI += "/probe-" + toolProbe.Identity()
+		opts.Target = &kconfig.CompactTarget{
+			Profile: profile.Name, LinuxArch: profile.Arch, Srcarch: profile.Srcarch,
+			UTSMachine: profile.UTSMachine, TargetTriple: profile.TargetTriple,
+		}
+		if toolProbe != nil {
+			opts.Target.ProbeIdentity = toolProbe.Identity()
+		}
+	}
 	rootDir := sourceRoot
 	if rootDir == "" {
 		rootDir = filepath.Dir(workspacePath(kbuildPath))
 	}
 	return tree.CompactMetadataBatchWithOptions(configs, opts, func(resolved *kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
 		kbuildOpts := kconfig.KbuildOptions{
-			Variables: kbuildVariablesForConfig(vars, tree, resolved),
+			Variables:               kbuildVariablesForConfig(vars, tree, resolved),
+			ConfigVariablesComplete: true,
+		}
+		if toolProbe != nil {
+			kbuildOpts.ProbeOption = func(kind string, candidate, probeContext []string) (bool, error) {
+				return toolProbe.SupportsOption(context.Background(), kind, candidate, probeContext)
+			}
+			kbuildOpts.ProbeSource = func(language, source string, probeContext []string) (bool, error) {
+				return toolProbe.SupportsKbuildSource(context.Background(), language, source, probeContext)
+			}
 		}
 		var kb *kconfig.KbuildFile
 		var parseErr error

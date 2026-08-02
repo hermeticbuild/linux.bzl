@@ -277,6 +277,53 @@ endif
 	})
 }
 
+// An automatic submenu is inferred when a symbol's prompt depends on the
+// preceding symbol. That inferred display hierarchy must not behave like an
+// explicit enclosing `if`: the child's defaults remain governed by their own
+// conditions even when the prompt and inferred parent are hidden.
+//
+// arch/powerpc/Kconfig uses this shape for DATA_SHIFT. DATA_SHIFT_BOOL has
+// 32-bit-only dependencies, while DATA_SHIFT has an unconditional PPC64
+// default that is consumed by the linker script.
+func TestResolveConfigAutomaticSubmenuDoesNotHideScalarDefaults(t *testing.T) {
+	resolved := mustResolveConfig(t, `
+mainmenu "Test"
+
+config ADVANCED_OPTIONS
+	bool
+
+config STRICT_KERNEL_RWX
+	bool
+	default y
+
+config PPC64
+	bool
+	default y
+
+config DATA_SHIFT_BOOL
+	bool "Set custom data alignment"
+	depends on ADVANCED_OPTIONS
+	depends on STRICT_KERNEL_RWX
+
+config PAGE_SHIFT
+	int
+	default 16
+
+config DATA_SHIFT
+	int "Data shift" if DATA_SHIFT_BOOL
+	default 24 if STRICT_KERNEL_RWX && PPC64
+	default PAGE_SHIFT
+`, nil)
+
+	wantConfigValues(t, resolved, map[string]string{
+		"CONFIG_DATA_SHIFT_BOOL": "n",
+		"CONFIG_DATA_SHIFT":      "24",
+	})
+	wantConfigWriteSet(t, resolved, map[string]bool{
+		"CONFIG_DATA_SHIFT": true,
+	})
+}
+
 // The counterpart to the above: a symbol whose only definition sits in a dead
 // "if" block has no live definition, so it must stay disabled even when the
 // imported config asks for it.
@@ -585,6 +632,20 @@ config ADDRESS
 			"CONFIG_MODE":          `"manual"`,
 			"CONFIG_PROMPT_HIDDEN": "y",
 		})
+	})
+}
+
+func TestResolveConfigWritesEmptyVisibleString(t *testing.T) {
+	resolved := mustResolveConfig(t, `
+config CMDLINE
+	string "Built-in kernel command line"
+`, nil)
+
+	wantConfigValues(t, resolved, map[string]string{
+		"CONFIG_CMDLINE": `""`,
+	})
+	wantConfigWriteSet(t, resolved, map[string]bool{
+		"CONFIG_CMDLINE": true,
 	})
 }
 
