@@ -11,6 +11,10 @@ filegroup(
     name = "source_tree_lookup_files",
     srcs = glob([
         "Documentation/Kconfig",
+        "arch/arm/boot/compressed/**",
+        "arch/arm/kernel/hyp-stub.S",
+        "arch/arm/lib/*.S",
+        "arch/arm/vdso/**",
         "arch/arm64/kernel/vdso/**",
         "arch/arm64/kernel/vdso32/**",
         "arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
@@ -54,6 +58,7 @@ filegroup(
         "lib/crypto/sha256.c",
         "lib/ctype.c",
         "lib/decompress_*.c",
+        "lib/fdt*.c",
         "lib/lz4/lz4_decompress.c",
         "lib/lz4/lz4defs.h",
         "lib/lzo/lzo1x_decompress_safe.c",

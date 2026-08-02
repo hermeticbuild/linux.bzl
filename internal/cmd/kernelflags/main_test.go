@@ -26,7 +26,7 @@ func TestKernelFlagsConfigSymbolsCoverSource(t *testing.T) {
 	// is already tracked with the generated-header inputs rather than global
 	// compiler flags.
 	known["CONFIG_LOCALVERSION"] = true
-	for _, token := range regexp.MustCompile(`CONFIG_[A-Z0-9_]+`).FindAllString(kernelflagsSource, -1) {
+	for _, token := range regexp.MustCompile(`CONFIG_[A-Za-z0-9_]+`).FindAllString(kernelflagsSource, -1) {
 		if !known[token] {
 			t.Errorf("kernelflags reads %s but it is absent from kconfig.KernelFlagsConfigSymbols()", token)
 		}
@@ -341,6 +341,61 @@ func TestLinuxCFlagsUseOsForSizeOptimization(t *testing.T) {
 	}
 	if contains(flags, "-O2") {
 		t.Fatalf("linuxCFlags() unexpectedly contains -O2: %v", flags)
+	}
+}
+
+func TestLinuxFlagsARM(t *testing.T) {
+	config := map[string]string{
+		"CONFIG_AEABI":       "y",
+		"CONFIG_CC_IS_CLANG": "y",
+		"CONFIG_CPU_32v7":    "y",
+		"CONFIG_MMU":         "y",
+	}
+	for _, want := range []string{"-mabi=aapcs-linux", "-march=armv7-a", "-D__LINUX_ARM_ARCH__=7", "-mlittle-endian", "-msoft-float"} {
+		if flags := linuxCFlags(config, "arm", testKernelVersion); !contains(flags, want) {
+			t.Errorf("ARM C flags missing %s: %v", want, flags)
+		}
+	}
+	for _, want := range []string{"-Wa,-march=armv7-a", "-D__ASSEMBLY__"} {
+		if flags := linuxAFlags(config, "arm", testKernelVersion); !contains(flags, want) {
+			t.Errorf("ARM assembler flags missing %s: %v", want, flags)
+		}
+	}
+}
+
+func TestLinuxFlagsRISCV64(t *testing.T) {
+	config := map[string]string{
+		"CONFIG_ARCH_RV64I":  "y",
+		"CONFIG_FPU":         "y",
+		"CONFIG_RISCV_ISA_C": "y",
+		"CONFIG_RISCV_ISA_V": "y",
+	}
+	cflags := linuxCFlags(config, "riscv", testKernelVersion)
+	aflags := linuxAFlags(config, "riscv", testKernelVersion)
+	for _, want := range []string{"-mabi=lp64", "-march=rv64imac", "-mno-save-restore"} {
+		if !contains(cflags, want) {
+			t.Errorf("RISC-V C flags missing %s: %v", want, cflags)
+		}
+	}
+	if !contains(aflags, "-march=rv64imafdcv") {
+		t.Errorf("RISC-V assembler flags missing full ISA string: %v", aflags)
+	}
+}
+
+func TestLinuxFlagsPPC64LE(t *testing.T) {
+	config := map[string]string{
+		"CONFIG_CPU_LITTLE_ENDIAN": "y",
+		"CONFIG_PPC64":             "y",
+		"CONFIG_PPC64_ELF_ABI_V2":  "y",
+		"CONFIG_TARGET_CPU":        `"power8"`,
+		"CONFIG_TARGET_CPU_BOOL":   "y",
+		"CONFIG_TUNE_CPU":          `"-mtune=power9"`,
+	}
+	flags := linuxCFlags(config, "powerpc", testKernelVersion)
+	for _, want := range []string{"-m64", "-mlittle-endian", "-mabi=elfv2", "-mcpu=power8", "-mtune=power9", "-msoft-float"} {
+		if !contains(flags, want) {
+			t.Errorf("PowerPC C flags missing %s: %v", want, flags)
+		}
 	}
 }
 

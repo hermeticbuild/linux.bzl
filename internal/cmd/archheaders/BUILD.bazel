@@ -1,0 +1,21 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "archheaders_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/archheaders",
+    visibility = ["//visibility:private"],
+    deps = ["//internal/kconfig"],
+)
+
+go_binary(
+    name = "archheaders",
+    embed = [":archheaders_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "archheaders_test",
+    srcs = ["main_test.go"],
+    embed = [":archheaders_lib"],
+)

@@ -117,16 +117,11 @@ var architectureKernelFlagsConfigSymbols = map[string][]string{
 }
 
 // KernelFlagsConfigSymbols returns a sorted copy of the compiler flag
-// footprint for one Linux SRCARCH. Omitting srcarch preserves the original
-// common footprint for callers that predate architecture-scoped flags. The
-// common prefix is intentionally stable for content-addressing compatibility.
-func KernelFlagsConfigSymbols(srcarch ...string) []string {
-	arch := ""
-	if len(srcarch) != 0 {
-		arch = srcarch[0]
-	}
+// footprint for one Linux SRCARCH. The common prefix is intentionally stable
+// for content-addressing compatibility.
+func KernelFlagsConfigSymbols(srcarch string) []string {
 	out := append([]string(nil), commonKernelFlagsConfigSymbols...)
-	out = append(out, architectureKernelFlagsConfigSymbols[arch]...)
+	out = append(out, architectureKernelFlagsConfigSymbols[srcarch]...)
 	sort.Strings(out)
 	return out
 }
