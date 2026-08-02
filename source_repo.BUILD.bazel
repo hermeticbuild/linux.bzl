@@ -115,9 +115,8 @@ filegroup(
 filegroup(
     name = "kconfig_files",
     srcs = glob([
-        "Kconfig",
-        "**/Kconfig",
-        "**/Kconfig.*",
+        "Kconfig*",
+        "**/Kconfig*",
     ], allow_empty = True),
 )
 

@@ -290,13 +290,15 @@
       }
     },
     "@@linux.bzl+//:extensions.bzl%linux_images": {
-      "general": {
-        "bzlTransitiveDigest": "2wze+p/HlP8MYa3yH/96l4VDlJZ3yM5F6BV1T8Ajkr0=",
+      "os:linux,arch:amd64": {
+        "bzlTransitiveDigest": "w5CX2I8vWgHp0clD2MEJ/IYx5jz4BIoykJ4ait1JyeI=",
         "usagesDigest": "64hi6msYtB0mmEBIbIYZ2oqciGMCuk6nXAWu6WDh6u4=",
         "recordedInputs": [
           "REPO_MAPPING:,e2e_linux_6_12_96 +linux_source_repository+e2e_linux_6_12_96",
           "REPO_MAPPING:,e2e_linux_6_18_39 +linux_source_repository+e2e_linux_6_18_39",
-          "REPO_MAPPING:,hermetic_llvm llvm+"
+          "REPO_MAPPING:,hermetic_llvm llvm+",
+          "REPO_MAPPING:linux.bzl+,llvm llvm+",
+          "REPO_MAPPING:llvm+,llvm-toolchain-minimal-22.1.8-linux-amd64 llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64"
         ],
         "generatedRepoSpecs": {
           "e2e_6_12_96_aarch64__linux_graph": {
@@ -306,7 +308,12 @@
               "config_mode": "default",
               "overlays": {},
               "platform": "@@llvm+//platforms:linux_arm64",
-              "source": "@@+linux_source_repository+e2e_linux_6_12_96//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_12_96//:Kconfig",
+              "target_profile": "aarch64",
+              "linux_arch": "arm64",
+              "target_triple": "aarch64-linux-gnu"
             }
           },
           "e2e_6_12_96_aarch64": {
@@ -323,7 +330,12 @@
               "config_mode": "default",
               "overlays": {},
               "platform": "@@llvm+//platforms:linux_x86_64",
-              "source": "@@+linux_source_repository+e2e_linux_6_12_96//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_12_96//:Kconfig",
+              "target_profile": "x86_64",
+              "linux_arch": "x86",
+              "target_triple": "x86_64-linux-gnu"
             }
           },
           "e2e_6_12_96_x86_64": {
@@ -340,7 +352,12 @@
               "config_mode": "default",
               "overlays": {},
               "platform": "@@llvm+//platforms:linux_arm64",
-              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig",
+              "target_profile": "aarch64",
+              "linux_arch": "arm64",
+              "target_triple": "aarch64-linux-gnu"
             }
           },
           "e2e_aarch64": {
@@ -357,7 +374,12 @@
               "config_mode": "default",
               "overlays": {},
               "platform": "@@llvm+//platforms:linux_x86_64",
-              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig",
+              "target_profile": "x86_64",
+              "linux_arch": "x86",
+              "target_triple": "x86_64-linux-gnu"
             }
           },
           "e2e_kvm_x86_64": {
@@ -374,7 +396,12 @@
               "config_mode": "default",
               "overlays": {},
               "platform": "@@llvm+//platforms:linux_arm64",
-              "source": "@@+linux_source_repository+e2e_linux_6_12_96//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_12_96//:Kconfig",
+              "target_profile": "aarch64",
+              "linux_arch": "arm64",
+              "target_triple": "aarch64-linux-gnu"
             }
           },
           "e2e_rust_6_12_96_aarch64": {
@@ -391,7 +418,12 @@
               "config_mode": "default",
               "overlays": {},
               "platform": "@@llvm+//platforms:linux_x86_64",
-              "source": "@@+linux_source_repository+e2e_linux_6_12_96//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_12_96//:Kconfig",
+              "target_profile": "x86_64",
+              "linux_arch": "x86",
+              "target_triple": "x86_64-linux-gnu"
             }
           },
           "e2e_rust_6_12_96_x86_64": {
@@ -408,7 +440,12 @@
               "config_mode": "default",
               "overlays": {},
               "platform": "@@llvm+//platforms:linux_arm64",
-              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig",
+              "target_profile": "aarch64",
+              "linux_arch": "arm64",
+              "target_triple": "aarch64-linux-gnu"
             }
           },
           "e2e_rust_aarch64": {
@@ -425,7 +462,12 @@
               "config_mode": "default",
               "overlays": {},
               "platform": "@@llvm+//platforms:linux_x86_64",
-              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig",
+              "target_profile": "x86_64",
+              "linux_arch": "x86",
+              "target_triple": "x86_64-linux-gnu"
             }
           },
           "e2e_rust_x86_64": {
@@ -442,7 +484,12 @@
               "config_mode": "default",
               "overlays": {},
               "platform": "@@llvm+//platforms:linux_x86_64",
-              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig",
+              "target_profile": "x86_64",
+              "linux_arch": "x86",
+              "target_triple": "x86_64-linux-gnu"
             }
           },
           "e2e_verity_x86_64": {
@@ -459,7 +506,12 @@
               "config_mode": "default",
               "overlays": {},
               "platform": "@@llvm+//platforms:linux_x86_64",
-              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig",
+              "target_profile": "x86_64",
+              "linux_arch": "x86",
+              "target_triple": "x86_64-linux-gnu"
             }
           },
           "e2e_x86_64": {

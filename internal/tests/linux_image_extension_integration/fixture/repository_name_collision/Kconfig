@@ -1,3 +1,0 @@
-config X86_64
-    bool
-    default y

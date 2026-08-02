@@ -735,7 +735,7 @@ def _repository_protocol_test_impl(ctx):
 
     asserts.equals(
         env,
-        "compact-v6-content-graph",
+        "compact-v7-adaptive-content-graph",
         repositories_test_helpers.generator_protocol,
     )
     asserts.true(env, "rust_profile_json = " in generated)

@@ -285,12 +285,14 @@
       }
     },
     "@@linux.bzl+//:extensions.bzl%linux_images": {
-      "general": {
-        "bzlTransitiveDigest": "2wze+p/HlP8MYa3yH/96l4VDlJZ3yM5F6BV1T8Ajkr0=",
+      "os:linux,arch:amd64": {
+        "bzlTransitiveDigest": "w5CX2I8vWgHp0clD2MEJ/IYx5jz4BIoykJ4ait1JyeI=",
         "usagesDigest": "e+vMswoLMFhZTZBOPj/u6dxDllDqKp7btmBZJfnFwew=",
         "recordedInputs": [
           "REPO_MAPPING:,linux_6_18_39 +linux_source_repository+linux_6_18_39",
-          "REPO_MAPPING:,llvm llvm+"
+          "REPO_MAPPING:,llvm llvm+",
+          "REPO_MAPPING:linux.bzl+,llvm llvm+",
+          "REPO_MAPPING:llvm+,llvm-toolchain-minimal-22.1.8-linux-amd64 llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64"
         ],
         "generatedRepoSpecs": {
           "example_aarch64__linux_graph": {
@@ -300,7 +302,12 @@
               "config_mode": "default",
               "overlays": {},
               "platform": "@@llvm+//platforms:linux_arm64",
-              "source": "@@+linux_source_repository+linux_6_18_39//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+linux_6_18_39//:Kconfig",
+              "target_profile": "aarch64",
+              "linux_arch": "arm64",
+              "target_triple": "aarch64-linux-gnu"
             }
           },
           "example_aarch64": {
@@ -321,7 +328,12 @@
                 "lz4": "@@//configs:lz4.config"
               },
               "platform": "@@llvm+//platforms:linux_x86_64",
-              "source": "@@+linux_source_repository+linux_6_18_39//:Kconfig"
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+linux_6_18_39//:Kconfig",
+              "target_profile": "x86_64",
+              "linux_arch": "x86",
+              "target_triple": "x86_64-linux-gnu"
             }
           },
           "example_x86_64": {

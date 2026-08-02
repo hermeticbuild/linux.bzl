@@ -65,9 +65,8 @@ var architectureSelectorOwners = map[string]string{
 	"CONFIG_X86_64": "x86_64",
 	"CONFIG_ARM64":  "aarch64",
 	"CONFIG_ARM":    "armv7",
-	// linux.bzl does not expose a 32-bit x86 target profile. Keep the
-	// selector owned by its real architecture so every supported profile,
-	// including x86_64, rejects it.
+	// x86_32 is intentionally unsupported. Owning its selector separately
+	// makes CONFIG_X86_32=y fail closed for every public target profile.
 	"CONFIG_X86_32": "x86_32",
 }
 
