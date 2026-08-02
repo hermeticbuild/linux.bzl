@@ -95,7 +95,14 @@ func materializeConfigPayloads(manifestPath, outDir string) error {
 	if manifest.Payloads == nil {
 		return fmt.Errorf("manifest payloads must be an object")
 	}
-	if manifest.Arch != "" && manifest.Arch != "arm64" && manifest.Arch != "x86" {
+	supportedArchitectures := map[string]bool{
+		"arm":     true,
+		"arm64":   true,
+		"powerpc": true,
+		"riscv":   true,
+		"x86":     true,
+	}
+	if manifest.Arch != "" && !supportedArchitectures[manifest.Arch] {
 		return fmt.Errorf("unsupported Linux ARCH %q", manifest.Arch)
 	}
 
@@ -370,11 +377,17 @@ func linuxCFlags(config map[string]string, arch, version string) []string {
 	if !enabled(config, "CONFIG_CC_IS_CLANG") {
 		flags = append(flags, "-fconserve-stack")
 	}
-	if arch == "x86" {
-		flags = append(flags, x86CFlags(config, version)...)
-	}
-	if arch == "arm64" {
+	switch arch {
+	case "arm":
+		flags = append(flags, armCFlags(config)...)
+	case "arm64":
 		flags = append(flags, arm64CFlags(config)...)
+	case "powerpc":
+		flags = append(flags, powerPCCFlags(config)...)
+	case "riscv":
+		flags = append(flags, riscvCFlags(config)...)
+	case "x86":
+		flags = append(flags, x86CFlags(config, version)...)
 	}
 	return flags
 }
@@ -384,7 +397,11 @@ func ftraceFlags(config map[string]string, arch string) []string {
 		return nil
 	}
 	flags := []string{}
-	if !(arch == "arm64" && (enabled(config, "CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS") || enabled(config, "CONFIG_DYNAMIC_FTRACE_WITH_ARGS"))) {
+	usesPatchableEntry :=
+		(arch == "arm64" && (enabled(config, "CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS") || enabled(config, "CONFIG_DYNAMIC_FTRACE_WITH_ARGS"))) ||
+			(arch == "riscv" && enabled(config, "CONFIG_DYNAMIC_FTRACE")) ||
+			(arch == "powerpc" && enabled(config, "CONFIG_ARCH_USING_PATCHABLE_FUNCTION_ENTRY"))
+	if !usesPatchableEntry {
 		flags = append(flags, "-pg")
 	}
 	if enabled(config, "CONFIG_FTRACE_MCOUNT_USE_CC") {
@@ -529,13 +546,310 @@ func kernelVersionAtLeast(version string, wantMajor, wantMinor int) bool {
 
 func linuxAFlags(config map[string]string, arch, version string) []string {
 	switch arch {
+	case "arm":
+		return append(armAFlags(config), debugInfoFlags(config)...)
 	case "arm64":
 		return append(arm64AFlags(config), debugInfoFlags(config)...)
+	case "powerpc":
+		return append(powerPCAFlags(config), debugInfoFlags(config)...)
+	case "riscv":
+		return append(riscvAFlags(config), debugInfoFlags(config)...)
 	case "x86":
 		return append(append(x86CFlags(config, version), ftraceUsingFlags(config)...), debugInfoFlags(config)...)
 	default:
 		return nil
 	}
+}
+
+func armArchitecture(config map[string]string) (string, string) {
+	march := ""
+	version := ""
+	// Keep the assignments in arch/arm/Makefile order. Multi-platform
+	// configurations can select more than one CPU generation, and Kbuild's
+	// later assignment intentionally chooses their common denominator.
+	for _, spec := range []struct {
+		key     string
+		march   string
+		version string
+	}{
+		{"CONFIG_CPU_32v7M", "armv7-m", "7"},
+		{"CONFIG_CPU_32v7", "armv7-a", "7"},
+		{"CONFIG_CPU_32v6", "armv6", "6"},
+	} {
+		if enabled(config, spec.key) {
+			march = spec.march
+			version = spec.version
+		}
+	}
+	if enabled(config, "CONFIG_CPU_32v6") && enabled(config, "CONFIG_CPU_32v6K") {
+		march = "armv6k"
+		version = "6"
+	}
+	for _, spec := range []struct {
+		key     string
+		march   string
+		version string
+	}{
+		{"CONFIG_CPU_32v5", "armv5te", "5"},
+		{"CONFIG_CPU_32v4T", "armv4t", "4"},
+		{"CONFIG_CPU_32v4", "armv4", "4"},
+		{"CONFIG_CPU_32v3", "armv3m", "3"},
+	} {
+		if enabled(config, spec.key) {
+			march = spec.march
+			version = spec.version
+		}
+	}
+	return march, version
+}
+
+func armTune(config map[string]string) string {
+	for _, spec := range []struct {
+		key  string
+		tune string
+	}{
+		{"CONFIG_CPU_V6K", "arm1136j-s"},
+		{"CONFIG_CPU_V6", "arm1136j-s"},
+		{"CONFIG_CPU_FEROCEON", "xscale"},
+		{"CONFIG_CPU_XSC3", "xscale"},
+		{"CONFIG_CPU_XSCALE", "xscale"},
+		{"CONFIG_CPU_SA1100", "strongarm1100"},
+		{"CONFIG_CPU_SA110", "strongarm110"},
+		{"CONFIG_CPU_FA526", "arm9tdmi"},
+		{"CONFIG_CPU_ARM926T", "arm9tdmi"},
+		{"CONFIG_CPU_ARM925T", "arm9tdmi"},
+		{"CONFIG_CPU_ARM922T", "arm9tdmi"},
+		{"CONFIG_CPU_ARM920T", "arm9tdmi"},
+		{"CONFIG_CPU_ARM946E", "arm9e"},
+		{"CONFIG_CPU_ARM940T", "arm9tdmi"},
+		{"CONFIG_CPU_ARM9TDMI", "arm9tdmi"},
+		{"CONFIG_CPU_ARM740T", "arm7tdmi"},
+		{"CONFIG_CPU_ARM720T", "arm7tdmi"},
+		{"CONFIG_CPU_ARM7TDMI", "arm7tdmi"},
+	} {
+		if enabled(config, spec.key) {
+			return spec.tune
+		}
+	}
+	return ""
+}
+
+func armABIFlags(config map[string]string) []string {
+	flags := []string{}
+	if enabled(config, "CONFIG_AEABI") {
+		flags = append(flags, "-mabi=aapcs-linux", "-mfpu=vfp")
+	} else {
+		flags = append(flags, "-mabi=apcs-gnu", "-mno-thumb-interwork")
+	}
+	if enabled(config, "CONFIG_ARM_UNWIND") {
+		flags = append(flags, "-funwind-tables")
+	}
+	if enabled(config, "CONFIG_CC_IS_CLANG") {
+		flags = append(flags, "-meabi", "gnu")
+	}
+	return flags
+}
+
+func armISAFlags(config map[string]string, assembly bool) []string {
+	flags := []string{"-Wa,-W"}
+	if enabled(config, "CONFIG_THUMB2_KERNEL") {
+		flags = append(flags, "-Wa,-mimplicit-it=always")
+		if assembly {
+			flags = append(flags, "-Wa,-mthumb")
+		} else {
+			flags = append(flags, "-mthumb")
+		}
+	} else {
+		flags = append(flags, "-marm")
+	}
+	return flags
+}
+
+func armCFlags(config map[string]string) []string {
+	flags := []string{
+		"-fno-dwarf2-cfi-asm",
+	}
+	if enabled(config, "CONFIG_CPU_BIG_ENDIAN") {
+		flags = append(flags, "-mbig-endian")
+	} else {
+		flags = append(flags, "-mlittle-endian")
+	}
+	if !enabled(config, "CONFIG_MMU") {
+		flags = append(flags, "-mno-unaligned-access")
+	}
+	if enabled(config, "CONFIG_FRAME_POINTER") && !enabled(config, "CONFIG_CC_IS_CLANG") {
+		flags = append(flags, "-mapcs", "-mno-sched-prolog")
+	}
+	if enabled(config, "CONFIG_CURRENT_POINTER_IN_TPIDRURO") {
+		flags = append(flags, "-mtp=cp15")
+	}
+	flags = append(flags, armABIFlags(config)...)
+	flags = append(flags, armISAFlags(config, false)...)
+	march, version := armArchitecture(config)
+	if march != "" {
+		flags = append(flags, "-march="+march)
+	}
+	if version != "" {
+		flags = append(flags, "-D__LINUX_ARM_ARCH__="+version)
+	}
+	if tune := armTune(config); tune != "" {
+		flags = append(flags, "-mtune="+tune)
+	}
+	return append(flags, "-msoft-float", "-Uarm")
+}
+
+func armAFlags(config map[string]string) []string {
+	flags := []string{"-D__ASSEMBLY__", "-fno-PIE"}
+	if enabled(config, "CONFIG_CPU_BIG_ENDIAN") {
+		flags = append(flags, "-mbig-endian")
+	} else {
+		flags = append(flags, "-mlittle-endian")
+	}
+	flags = append(flags, armABIFlags(config)...)
+	flags = append(flags, armISAFlags(config, true)...)
+	if march, _ := armArchitecture(config); march != "" {
+		flags = append(flags, "-Wa,-march="+march)
+	}
+	if tune := armTune(config); tune != "" {
+		flags = append(flags, "-mtune="+tune)
+	}
+	return append(flags, "-msoft-float")
+}
+
+func riscvMarch(config map[string]string, assembly bool) string {
+	march := "rv64ima"
+	if assembly && enabled(config, "CONFIG_FPU") {
+		march += "fd"
+	}
+	if enabled(config, "CONFIG_RISCV_ISA_C") {
+		march += "c"
+	}
+	if assembly && enabled(config, "CONFIG_RISCV_ISA_V") {
+		march += "v"
+	}
+	if !enabled(config, "CONFIG_TOOLCHAIN_NEEDS_OLD_ISA_SPEC") && enabled(config, "CONFIG_TOOLCHAIN_NEEDS_EXPLICIT_ZICSR_ZIFENCEI") {
+		march += "_zicsr_zifencei"
+	}
+	if enabled(config, "CONFIG_TOOLCHAIN_HAS_ZACAS") {
+		march += "_zacas"
+	}
+	if enabled(config, "CONFIG_TOOLCHAIN_HAS_ZABHA") {
+		march += "_zabha"
+	}
+	return march
+}
+
+func riscvCFlags(config map[string]string) []string {
+	flags := []string{
+		"-mabi=lp64",
+		"-march=" + riscvMarch(config, false),
+		"-mno-save-restore",
+		"-fno-asynchronous-unwind-tables",
+		"-fno-unwind-tables",
+	}
+	if enabled(config, "CONFIG_TOOLCHAIN_NEEDS_OLD_ISA_SPEC") {
+		flags = append(flags, "-Wa,-misa-spec=2.2")
+	}
+	if enabled(config, "CONFIG_RELOCATABLE") {
+		flags = append(flags, "-fPIE")
+	}
+	if enabled(config, "CONFIG_CMODEL_MEDLOW") {
+		flags = append(flags, "-mcmodel=medlow")
+	}
+	if enabled(config, "CONFIG_CMODEL_MEDANY") {
+		flags = append(flags, "-mcmodel=medany")
+	}
+	if !enabled(config, "CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS") {
+		flags = append(flags, "-mstrict-align")
+	}
+	if enabled(config, "CONFIG_DYNAMIC_FTRACE") {
+		flags = append(flags, "-DCC_USING_PATCHABLE_FUNCTION_ENTRY")
+		if enabled(config, "CONFIG_RISCV_ISA_C") {
+			flags = append(flags, "-fpatchable-function-entry=8,4")
+		} else {
+			flags = append(flags, "-fpatchable-function-entry=4,2")
+		}
+	}
+	return flags
+}
+
+func riscvAFlags(config map[string]string) []string {
+	flags := []string{
+		"-D__ASSEMBLY__",
+		"-fno-PIE",
+		"-mabi=lp64",
+		"-march=" + riscvMarch(config, true),
+	}
+	if enabled(config, "CONFIG_TOOLCHAIN_NEEDS_OLD_ISA_SPEC") {
+		flags = append(flags, "-Wa,-misa-spec=2.2")
+	}
+	return flags
+}
+
+func powerPCCommonFlags(config map[string]string) []string {
+	flags := []string{"-m64"}
+	if enabled(config, "CONFIG_CPU_BIG_ENDIAN") {
+		flags = append(flags, "-mbig-endian")
+	} else {
+		flags = append(flags, "-mlittle-endian")
+	}
+	if enabled(config, "CONFIG_PPC64_ELF_ABI_V2") {
+		flags = append(flags, "-mabi=elfv2")
+	} else if enabled(config, "CONFIG_PPC64_ELF_ABI_V1") {
+		flags = append(flags, "-mabi=elfv1")
+	}
+	if enabled(config, "CONFIG_TARGET_CPU_BOOL") {
+		if cpu := unquote(config["CONFIG_TARGET_CPU"]); cpu != "" {
+			flags = append(flags, "-mcpu="+cpu)
+		}
+	}
+	return flags
+}
+
+func powerPCCFlags(config map[string]string) []string {
+	flags := powerPCCommonFlags(config)
+	flags = append(flags,
+		"-mcmodel=medium",
+		"-mlong-double-128",
+		"-msoft-float",
+		"-mno-altivec",
+		"-mno-vsx",
+		"-mno-mma",
+		"-mno-spe",
+		"-fno-asynchronous-unwind-tables",
+	)
+	if tune := unquote(config["CONFIG_TUNE_CPU"]); tune != "" {
+		flags = append(flags, tune)
+	}
+	if enabled(config, "CONFIG_PPC_KERNEL_PREFIXED") {
+		flags = append(flags, "-mprefixed")
+	} else {
+		flags = append(flags, "-mno-prefixed")
+	}
+	if enabled(config, "CONFIG_PPC_KERNEL_PCREL") {
+		flags = append(flags, "-mpcrel")
+	} else {
+		flags = append(flags, "-mno-pcrel")
+	}
+	if enabled(config, "CONFIG_FUNCTION_TRACER") {
+		if enabled(config, "CONFIG_ARCH_USING_PATCHABLE_FUNCTION_ENTRY") {
+			flags = append(flags, "-DCC_USING_PATCHABLE_FUNCTION_ENTRY")
+			if enabled(config, "CONFIG_PPC_FTRACE_OUT_OF_LINE") {
+				flags = append(flags, "-fpatchable-function-entry=1")
+			} else if enabled(config, "CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS") {
+				flags = append(flags, "-fpatchable-function-entry=3,1")
+			} else {
+				flags = append(flags, "-fpatchable-function-entry=2")
+			}
+		} else if enabled(config, "CONFIG_MPROFILE_KERNEL") {
+			flags = append(flags, "-mprofile-kernel")
+		}
+	}
+	return flags
+}
+
+func powerPCAFlags(config map[string]string) []string {
+	return append([]string{"-D__ASSEMBLY__", "-fno-PIE"}, powerPCCommonFlags(config)...)
 }
 
 func arm64CFlags(config map[string]string) []string {

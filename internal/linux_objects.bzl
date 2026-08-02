@@ -3,6 +3,7 @@
 load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "CPP_LINK_STATIC_LIBRARY_ACTION_NAME", "C_COMPILE_ACTION_NAME")
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+load(":architecture_linking.bzl", "linux_vmlinux_link_spec")
 load(":architecture_profiles.bzl", "linux_architecture_profile_for_arch")
 load(":host_cc_toolchain.bzl", "host_cc_toolchain_attr")
 load(":kconfig.bzl", "KconfigInfo")
@@ -772,11 +773,19 @@ def _linux_ftrace_remove_flags():
 
 def _linux_perlasm_kind(object):
     if object in [
+        "lib/crypto/arm/poly1305-core.o",
+        "lib/crypto/arm/sha256-core.o",
+        "lib/crypto/arm/sha512-core.o",
+    ]:
+        return "stdout"
+    if object in [
         "lib/crypto/arm64/poly1305-core.o",
         "lib/crypto/arm64/sha256-core.o",
         "lib/crypto/arm64/sha512-core.o",
     ]:
         return "arm64_with_args"
+    if object == "lib/crypto/riscv/poly1305-core.o":
+        return "riscv64_with_args"
     if object == "lib/crypto/x86/poly1305-x86_64-cryptogams.o":
         return "stdout"
     return ""
@@ -1728,6 +1737,12 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         vdso = _linux_generated_header(generated_headers, "arch/arm64/kernel/vdso/vdso.so")
         files.append(vdso)
         assembler_include_roots.append(vdso.dirname[:-len("/arch/arm64/kernel/vdso")])
+        assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(vdso, assembler_include_roots[-1])
+
+    if ctx.attr.object == "arch/arm/vdso/vdso.o" and generated_headers:
+        vdso = _linux_generated_header(generated_headers, "arch/arm/vdso/vdso.so")
+        files.append(vdso)
+        assembler_include_roots.append(vdso.dirname[:-len("/arch/arm/vdso")])
         assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(vdso, assembler_include_roots[-1])
 
     if ctx.attr.object == "arch/arm64/kernel/vdso32-wrap.o" and generated_headers:
@@ -3371,6 +3386,663 @@ linux_arm64_generated_headers = rule(
     doc = "Generates the arm64 header subset normally produced before compiling Linux C objects.",
 )
 
+_GENERIC_ASM_WRAPPERS = {
+    "arm": [
+        "cfi.h",
+        "compat.h",
+        "dma-mapping.h",
+        "early_ioremap.h",
+        "emergency-restart.h",
+        "exec.h",
+        "extable.h",
+        "flat.h",
+        "irq_regs.h",
+        "kdebug.h",
+        "kmap_size.h",
+        "local.h",
+        "local64.h",
+        "mmiowb.h",
+        "msi.h",
+        "parport.h",
+        "preempt.h",
+        "ring_buffer.h",
+        "rqspinlock.h",
+        "runtime-const.h",
+        "rwonce.h",
+        "serial.h",
+        "softirq_stack.h",
+        "trace_clock.h",
+        "unwind_user.h",
+        "video.h",
+    ],
+    "powerpc": [
+        "agp.h",
+        "cfi.h",
+        "div64.h",
+        "dma-mapping.h",
+        "early_ioremap.h",
+        "irq_regs.h",
+        "kmap_size.h",
+        "local64.h",
+        "mcs_spinlock.h",
+        "msi.h",
+        "qrwlock.h",
+        "ring_buffer.h",
+        "rqspinlock.h",
+        "runtime-const.h",
+        "rwonce.h",
+        "simd.h",
+        "softirq_stack.h",
+        "unwind_user.h",
+    ],
+    "riscv": [
+        "device.h",
+        "div64.h",
+        "dma-mapping.h",
+        "dma.h",
+        "early_ioremap.h",
+        "emergency-restart.h",
+        "flat.h",
+        "fprobe.h",
+        "hardirq.h",
+        "hw_irq.h",
+        "irq_regs.h",
+        "kmap_size.h",
+        "kvm_para.h",
+        "local.h",
+        "local64.h",
+        "mcs_spinlock.h",
+        "mmzone.h",
+        "msi.h",
+        "parport.h",
+        "percpu.h",
+        "preempt.h",
+        "qrwlock.h",
+        "qrwlock_types.h",
+        "qspinlock.h",
+        "ring_buffer.h",
+        "rqspinlock.h",
+        "rwonce.h",
+        "serial.h",
+        "shmparam.h",
+        "softirq_stack.h",
+        "spinlock_types.h",
+        "ticket_spinlock.h",
+        "trace_clock.h",
+        "unwind_user.h",
+        "user.h",
+        "vga.h",
+        "video.h",
+        "vmlinux.lds.h",
+    ],
+}
+
+_GENERIC_UAPI_ASM_WRAPPERS = {
+    "arm": [
+        "bitsperlong.h",
+        "bpf_perf_event.h",
+        "errno.h",
+        "ioctl.h",
+        "ipcbuf.h",
+        "kvm_para.h",
+        "msgbuf.h",
+        "param.h",
+        "poll.h",
+        "resource.h",
+        "sembuf.h",
+        "shmbuf.h",
+        "siginfo.h",
+        "socket.h",
+        "sockios.h",
+        "termbits.h",
+        "termios.h",
+    ],
+    "powerpc": [
+        "bpf_perf_event.h",
+        "param.h",
+        "poll.h",
+        "resource.h",
+        "siginfo.h",
+        "sockios.h",
+        "statfs.h",
+    ],
+    "riscv": [
+        "errno.h",
+        "fcntl.h",
+        "ioctl.h",
+        "ioctls.h",
+        "ipcbuf.h",
+        "mman.h",
+        "msgbuf.h",
+        "param.h",
+        "poll.h",
+        "posix_types.h",
+        "resource.h",
+        "sembuf.h",
+        "shmbuf.h",
+        "siginfo.h",
+        "signal.h",
+        "socket.h",
+        "sockios.h",
+        "stat.h",
+        "statfs.h",
+        "swab.h",
+        "termbits.h",
+        "termios.h",
+        "types.h",
+    ],
+}
+
+def _linux_generic_syscall_specs(arch, base, table):
+    generated = base + "/arch/" + arch + "/include/generated"
+    if arch == "arm":
+        return [
+            struct(abis = "common,oabi", emit_nr = False, offset = "__NR_SYSCALL_BASE", out = generated + "/uapi/asm/unistd-oabi.h", table = table, table_header = False),
+            struct(abis = "common,eabi", emit_nr = False, offset = "__NR_SYSCALL_BASE", out = generated + "/uapi/asm/unistd-eabi.h", table = table, table_header = False),
+            struct(abis = "common,oabi", emit_nr = False, offset = "", out = generated + "/calls-oabi.S", table = table, table_header = True),
+            struct(abis = "common,eabi", emit_nr = False, offset = "", out = generated + "/calls-eabi.S", table = table, table_header = True),
+        ]
+    if arch == "riscv":
+        return [
+            struct(abis = "common,32,riscv,memfd_secret", emit_nr = True, offset = "", out = generated + "/uapi/asm/unistd_32.h", table = table, table_header = False),
+            struct(abis = "common,64,riscv,rlimit,memfd_secret", emit_nr = True, offset = "", out = generated + "/uapi/asm/unistd_64.h", table = table, table_header = False),
+            struct(abis = "common,32,riscv,memfd_secret", emit_nr = False, offset = "", out = generated + "/asm/syscall_table_32.h", table = table, table_header = True),
+            struct(abis = "common,64,riscv,rlimit,memfd_secret", emit_nr = False, offset = "", out = generated + "/asm/syscall_table_64.h", table = table, table_header = True),
+        ]
+    return [
+        struct(abis = "common,nospu,32", emit_nr = True, offset = "", out = generated + "/uapi/asm/unistd_32.h", table = table, table_header = False),
+        struct(abis = "common,nospu,64", emit_nr = True, offset = "", out = generated + "/uapi/asm/unistd_64.h", table = table, table_header = False),
+        struct(abis = "common,nospu,32", emit_nr = False, offset = "", out = generated + "/asm/syscall_table_32.h", table = table, table_header = True),
+        struct(abis = "common,nospu,64", emit_nr = False, offset = "", out = generated + "/asm/syscall_table_64.h", table = table, table_header = True),
+        struct(abis = "common,spu", emit_nr = False, offset = "", out = generated + "/asm/syscall_table_spu.h", table = table, table_header = True),
+    ]
+
+def _linux_arm_vdso_compile(ctx, cc_toolchain, feature_configuration, config, generated_headers, source_root, src, out_relpath):
+    compiler = cc_common.get_tool_for_action(
+        feature_configuration = feature_configuration,
+        action_name = C_COMPILE_ACTION_NAME,
+    )
+    out = ctx.actions.declare_file(out_relpath)
+    filtered = _linux_filtered_config_flags_for_source(
+        ctx,
+        config,
+        src,
+        _linux_ftrace_remove_flags() + [
+            "-O2",
+            "-Os",
+            "-fstack-protector",
+            "-fstack-protector-strong",
+        ],
+        out_suffix = "arm-vdso-" + src.basename,
+    )
+    args = ctx.actions.args()
+    args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all(filtered.flags, format_each = "@%s")
+    args.add_all([
+        "-O2",
+        "-fPIC",
+        "-fno-common",
+        "-fno-builtin",
+        "-fno-stack-protector",
+        "-DDISABLE_BRANCH_PROFILING",
+        "-DBUILD_VDSO32",
+    ])
+    args.add_all(_linux_source_preinclude_flags_for_root(source_root))
+    _add_config_include_flag(args, config)
+    _add_linux_source_include_flags_for_root(
+        args,
+        source_root,
+        "arm",
+        generated_headers.include_dirs,
+        _generated_include_dir_anchors(generated_headers),
+    )
+    args.add("-I" + source_root + "/arch/arm/vdso")
+    args.add("-I" + source_root + "/lib/vdso")
+    args.add("-c")
+    args.add(src)
+    args.add("-o")
+    args.add(out)
+    path_mapped_run(
+        ctx.actions,
+        executable = compiler,
+        inputs = depset(
+            _linux_source_tree_inputs(ctx, direct = [src] + filtered.inputs),
+            transitive = [cc_toolchain.all_files, config.files, generated_headers.files],
+        ),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxARMVDSOCompile",
+        progress_message = "Compiling Linux ARM vDSO object %{label}",
+    )
+    return out
+
+def _linux_arm_vdso_linker_script(ctx, cc_toolchain, feature_configuration, config, generated_headers, source_root, out_relpath):
+    compiler = cc_common.get_tool_for_action(
+        feature_configuration = feature_configuration,
+        action_name = C_COMPILE_ACTION_NAME,
+    )
+    src = _source_tree_file(ctx, "arch/arm/vdso/vdso.lds.S")
+    out = ctx.actions.declare_file(out_relpath)
+    args = ctx.actions.args()
+    args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all([
+        "-E",
+        "-P",
+        "-C",
+        "-Uarm",
+        "-D__KERNEL__",
+        "-D__ASSEMBLY__",
+        "-DLINKER_SCRIPT",
+        "-include",
+        source_root + "/include/linux/kconfig.h",
+    ])
+    _add_config_include_flag(args, config)
+    _add_linux_source_include_flags_for_root(
+        args,
+        source_root,
+        "arm",
+        generated_headers.include_dirs,
+        _generated_include_dir_anchors(generated_headers),
+    )
+    args.add("-I" + source_root + "/arch/arm/vdso")
+    args.add(src)
+    args.add("-o")
+    args.add(out)
+    path_mapped_run(
+        ctx.actions,
+        executable = compiler,
+        inputs = depset(
+            _linux_source_tree_inputs(ctx, direct = [src]),
+            transitive = [cc_toolchain.all_files, config.files, generated_headers.files],
+        ),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxARMVDSOLinkerScript",
+        progress_message = "Preprocessing Linux ARM vDSO linker script %{label}",
+    )
+    return out
+
+def _linux_arm_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, generated_headers, source_root, base):
+    objects = []
+    for source in ["vgettimeofday.c", "note.c"]:
+        objects.append(_linux_arm_vdso_compile(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+            _source_tree_file(ctx, "arch/arm/vdso/" + source),
+            base + "/arch/arm/vdso/" + source[:-len(".c")] + ".o",
+        ))
+    linker_script = _linux_arm_vdso_linker_script(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        base + "/arch/arm/vdso/vdso.lds",
+    )
+    raw = ctx.actions.declare_file(base + "/arch/arm/vdso/vdso.so.raw")
+    linker = _linux_x86_tool_sibling(
+        cc_common.get_tool_for_action(
+            feature_configuration = feature_configuration,
+            action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
+        ),
+        "ld.lld",
+    )
+    link_args = ctx.actions.args()
+    link_args.add_all([
+        "-EL",
+        "-m",
+        "armelf_linux_eabi",
+        "-Bsymbolic",
+        "--no-undefined",
+        "-soname=linux-vdso.so.1",
+        "-z",
+        "max-page-size=4096",
+        "-shared",
+        "--hash-style=sysv",
+        "--build-id=sha1",
+        "-T",
+        linker_script,
+        "-o",
+        raw,
+    ])
+    link_args.add_all(objects)
+    path_mapped_run(
+        ctx.actions,
+        executable = linker,
+        inputs = depset(objects + [linker_script], transitive = [cc_toolchain.all_files]),
+        outputs = [raw],
+        arguments = [link_args],
+        mnemonic = "LinuxARMVDSOLink",
+        progress_message = "Linking Linux ARM vDSO %{label}",
+    )
+    dbg = ctx.actions.declare_file(base + "/arch/arm/vdso/vdso.so.dbg")
+    munge_args = ctx.actions.args()
+    munge_args.add(raw)
+    munge_args.add(dbg)
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable.vdsomunge,
+        inputs = [raw],
+        outputs = [dbg],
+        arguments = [munge_args],
+        mnemonic = "LinuxARMVDSOMunge",
+        progress_message = "Normalizing Linux ARM vDSO ABI flags %{label}",
+    )
+    so = ctx.actions.declare_file(base + "/arch/arm/vdso/vdso.so")
+    objcopy_args = ctx.actions.args()
+    objcopy_args.add("-S")
+    objcopy_args.add(dbg)
+    objcopy_args.add(so)
+    path_mapped_run(
+        ctx.actions,
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [dbg],
+        outputs = [so],
+        arguments = [objcopy_args],
+        mnemonic = "LinuxARMVDSOObjcopy",
+        progress_message = "Stripping Linux ARM vDSO %{label}",
+    )
+    return so
+
+def _linux_generic_generated_headers_impl(ctx):
+    _validate_generated_header_family_content_ids(
+        ctx.attr.family_content_ids,
+        ["all"],
+        "linux_generic_generated_headers",
+    )
+    arch = ctx.attr.arch
+    if arch not in _GENERIC_ASM_WRAPPERS:
+        fail("linux_generic_generated_headers does not support Linux ARCH %r" % arch)
+    if arch == "arm" and len(ctx.files.mach_types) != 1:
+        fail("linux_generic_generated_headers for arm requires one mach_types input")
+    if arch != "arm" and ctx.files.mach_types:
+        fail("linux_generic_generated_headers mach_types is arm-only")
+    if arch == "arm" and not ctx.executable.vdsomunge:
+        fail("linux_generic_generated_headers for arm requires vdsomunge")
+    if arch != "arm" and ctx.executable.vdsomunge:
+        fail("linux_generic_generated_headers vdsomunge is arm-only")
+
+    base = ctx.label.name + ".headers"
+    cc_toolchain = find_cpp_toolchain(ctx)
+    feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
+    config = ctx.attr.config[LinuxConfigInfo]
+    source_root = _linux_source_root_path(ctx)
+    headers = []
+    arch_generated = base + "/arch/" + arch + "/include/generated"
+
+    for header in _GENERIC_ASM_WRAPPERS[arch]:
+        out = ctx.actions.declare_file(arch_generated + "/asm/" + header)
+        ctx.actions.write(out, "#include <asm-generic/%s>\n" % header)
+        headers.append(out)
+    for header in _GENERIC_UAPI_ASM_WRAPPERS[arch]:
+        out = ctx.actions.declare_file(arch_generated + "/uapi/asm/" + header)
+        ctx.actions.write(out, "#include <asm-generic/%s>\n" % header)
+        headers.append(out)
+
+    syscall_table = ctx.file.syscall_tbl
+    for spec in _linux_generic_syscall_specs(arch, base, syscall_table):
+        out = ctx.actions.declare_file(spec.out)
+        args = ctx.actions.args()
+        args.add("-in", spec.table)
+        args.add("-out", out)
+        args.add("-abis", spec.abis)
+        if spec.emit_nr:
+            args.add("-emit-nr")
+        if spec.offset:
+            args.add("-offset", spec.offset)
+        path_mapped_run(
+            ctx.actions,
+            executable = ctx.executable._syscalltbl if spec.table_header else ctx.executable._syscallhdr,
+            inputs = [spec.table],
+            outputs = [out],
+            arguments = [args],
+            mnemonic = "LinuxSyscallTableHeader" if spec.table_header else "LinuxSyscallHeader",
+            progress_message = "Generating Linux architecture syscall header %{label}",
+        )
+        headers.append(out)
+
+    if arch == "arm":
+        mach_types_h = ctx.actions.declare_file(arch_generated + "/asm/mach-types.h")
+        unistd_nr_h = ctx.actions.declare_file(arch_generated + "/asm/unistd-nr.h")
+        arm_args = ctx.actions.args()
+        arm_args.add("-mach_types", ctx.files.mach_types[0])
+        arm_args.add("-mach_types_out", mach_types_h)
+        arm_args.add("-syscall_table", syscall_table)
+        arm_args.add("-syscall_nr_out", unistd_nr_h)
+        path_mapped_run(
+            ctx.actions,
+            executable = ctx.executable._archheaders,
+            inputs = [ctx.files.mach_types[0], syscall_table],
+            outputs = [mach_types_h, unistd_nr_h],
+            arguments = [arm_args],
+            mnemonic = "LinuxARMGeneratedHeaders",
+            progress_message = "Generating Linux ARM machine headers %{label}",
+        )
+        headers.extend([mach_types_h, unistd_nr_h])
+
+    timeconst = ctx.actions.declare_file(base + "/include/generated/timeconst.h")
+    timeconst_args = ctx.actions.args()
+    timeconst_args.add("-config", config.config)
+    timeconst_args.add("-out", timeconst)
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._timeconst,
+        inputs = depset([], transitive = [config.files]),
+        outputs = [timeconst],
+        arguments = [timeconst_args],
+        mnemonic = "LinuxTimeconstHeader",
+        progress_message = "Generating Linux time constants %{label}",
+    )
+    headers.append(timeconst)
+
+    compile_h = ctx.actions.declare_file(base + "/include/generated/compile.h")
+    linux_version_h = ctx.actions.declare_file(base + "/include/generated/uapi/linux/version.h")
+    utsrelease_h = ctx.actions.declare_file(base + "/include/generated/utsrelease.h")
+    utsversion_h = ctx.actions.declare_file(base + "/include/generated/utsversion.h")
+    version_args = ctx.actions.args()
+    version_args.add("-config", config.config)
+    version_args.add("-kernel_release", config.kernel_release)
+    version_args.add("-kernel_version", config.kernel_version)
+    version_args.add("-compile_out", compile_h)
+    version_args.add("-linux_version_out", linux_version_h)
+    version_args.add("-utsrelease_out", utsrelease_h)
+    version_args.add("-utsversion_out", utsversion_h)
+    version_args.add("-machine", ctx.attr.uts_machine)
+    version_args.add("-compiler", _linux_compiler_version_string())
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._versionheaders,
+        inputs = [config.config, config.kernel_release],
+        outputs = [compile_h, linux_version_h, utsrelease_h, utsversion_h],
+        arguments = [version_args],
+        mnemonic = "LinuxVersionHeaders",
+        progress_message = "Generating Linux version headers %{label}",
+    )
+    headers.extend([compile_h, linux_version_h, utsrelease_h, utsversion_h])
+
+    include_dirs = [
+        headers[0].dirname[:-len("/asm")],
+        timeconst.dirname[:-len("/generated")],
+        linux_version_h.dirname[:-len("/linux")],
+        base + "/arch/" + arch + "/include/generated/uapi",
+    ]
+    include_dir_anchors = _directory_anchors(headers, include_dirs)
+    bounds_h = _linux_offsets_header(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        source_root,
+        include_dirs,
+        ctx.file.bounds_c,
+        base + "/include/generated/bounds.h",
+        "__LINUX_BOUNDS_H__",
+        headers,
+        include_dir_anchors = include_dir_anchors,
+        srcarch = arch,
+    )
+    headers.append(bounds_h)
+    asm_offsets_h = _linux_offsets_header(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        source_root,
+        include_dirs,
+        ctx.file.asm_offsets_c,
+        base + "/include/generated/asm-offsets.h",
+        "__ASM_OFFSETS_H__",
+        headers,
+        include_dir_anchors = include_dir_anchors,
+        srcarch = arch,
+    )
+    headers.append(asm_offsets_h)
+
+    generated_cflags = ctx.actions.declare_file(base + "/include/generated/bazel_%s_cflags.rsp" % arch)
+    cflags_args = ctx.actions.args()
+    cflags_args.add("-arch", arch)
+    cflags_args.add("-asm_offsets", asm_offsets_h)
+    cflags_args.add("-config", config.config)
+    cflags_args.add("-cflags_out", generated_cflags)
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._archheaders,
+        inputs = depset([asm_offsets_h], transitive = [config.files]),
+        outputs = [generated_cflags],
+        arguments = [cflags_args],
+        mnemonic = "LinuxArchitectureCFlags",
+        progress_message = "Generating Linux architecture C flags %{label}",
+    )
+    headers.append(generated_cflags)
+
+    if len(ctx.files.rq_offsets_c) > 1:
+        fail("linux_generic_generated_headers requires at most one rq-offsets.c source")
+    if ctx.files.rq_offsets_c:
+        headers.append(_linux_offsets_header(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            source_root,
+            include_dirs,
+            ctx.files.rq_offsets_c[0],
+            base + "/include/generated/rq-offsets.h",
+            "__RQ_OFFSETS_H__",
+            headers,
+            include_dir_anchors = include_dir_anchors,
+            srcarch = arch,
+        ))
+
+    generated_headers = struct(
+        files = depset(headers),
+        include_dir_anchors = _directory_anchors(headers, include_dirs),
+        include_dirs = include_dirs,
+    )
+    if arch == "arm" and config.config_flags.get("CONFIG_VDSO") == "y":
+        headers.append(_linux_arm_vdso_outputs(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+            base,
+        ))
+
+    files = depset(headers)
+    families = {
+        "all": _generated_header_family_info(
+            arch = arch,
+            cflags = generated_cflags,
+            content_id = ctx.attr.family_content_ids["all"],
+            files = headers,
+            include_dirs = include_dirs,
+            name = "all",
+            srcarch = arch,
+            vdsomunge = ctx.executable.vdsomunge,
+        ),
+    }
+    return [
+        DefaultInfo(files = files),
+        LinuxGeneratedHeadersInfo(
+            arch = arch,
+            cflags = generated_cflags,
+            families = families,
+            files = files,
+            include_dir_anchors = _directory_anchors(headers, include_dirs),
+            include_dirs = include_dirs,
+            srcarch = arch,
+            vdsomunge = ctx.executable.vdsomunge,
+        ),
+    ]
+
+linux_generic_generated_headers = rule(
+    implementation = _linux_generic_generated_headers_impl,
+    attrs = {
+        "arch": attr.string(mandatory = True, values = ["arm", "powerpc", "riscv"]),
+        "asm_offsets_c": attr.label(allow_single_file = True, mandatory = True),
+        "bounds_c": attr.label(allow_single_file = True, mandatory = True),
+        "config": attr.label(providers = [LinuxConfigInfo], mandatory = True),
+        "family_content_ids": attr.string_dict(
+            mandatory = True,
+            doc = "Map of generated-header family names to full SHA-256 content identities.",
+        ),
+        "mach_types": attr.label(allow_files = True),
+        "rq_offsets_c": attr.label(allow_files = True, mandatory = True),
+        "source_root": attr.label(allow_single_file = True, mandatory = True),
+        "source_tree": attr.label_list(allow_files = True),
+        "syscall_tbl": attr.label(allow_single_file = True, mandatory = True),
+        "uts_machine": attr.string(mandatory = True),
+        "vdsomunge": attr.label(
+            cfg = "exec",
+            executable = True,
+        ),
+        "_archheaders": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/archheaders"),
+            executable = True,
+        ),
+        "_flagfilter": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/flagfilter"),
+            executable = True,
+        ),
+        "_offsetsheader": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/offsetsheader"),
+            executable = True,
+        ),
+        "_syscallhdr": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/syscallhdr"),
+            executable = True,
+        ),
+        "_syscalltbl": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/syscalltbl"),
+            executable = True,
+        ),
+        "_timeconst": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/timeconst"),
+            executable = True,
+        ),
+        "_versionheaders": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/versionheaders"),
+            executable = True,
+        ),
+    },
+    fragments = ["cpp"],
+    toolchains = use_cc_toolchain(),
+    doc = "Generates the monolithic preparatory header tree for arm, RISC-V, or PowerPC.",
+)
+
 def _declare_linux_config(ctx, config_dir, flags, kernel_version):
     config = ctx.actions.declare_file(config_dir + "/.config")
     auto_conf = ctx.actions.declare_file(config_dir + "/include/config/auto.conf")
@@ -4209,10 +4881,10 @@ def _linux_object_impl(ctx):
     if perlasm_kind:
         generated = ctx.actions.declare_file(ctx.label.name + ".obj/" + ctx.attr.object[:-len(".o")] + ".S")
         perl_runtime = _linux_perl_runtime(ctx)
-        if perlasm_kind == "arm64_with_args":
+        if perlasm_kind in ["arm64_with_args", "riscv64_with_args"]:
             perlasm_args = ctx.actions.args()
             perlasm_args.add(source_file)
-            perlasm_args.add("void")
+            perlasm_args.add("void" if perlasm_kind == "arm64_with_args" else "64")
             perlasm_args.add(generated)
             path_mapped_run(
                 ctx.actions,
@@ -4363,6 +5035,9 @@ def _linux_object_impl(ctx):
         args.add("-include")
         args.add(config.autoconf_h)
     args.add_all(_linux_source_preinclude_flags_for_root(source_root, _is_assembly_source(src)))
+    if source_root and _is_assembly_source(src) and ctx.attr.arch == "arm":
+        args.add("-include")
+        args.add(source_root + "/arch/arm/include/asm/unified.h")
     if config:
         _add_config_include_flag(args, config)
     if source_root:
@@ -4381,6 +5056,8 @@ def _linux_object_impl(ctx):
         add_directory_arg(args, directory_anchor(source_file), format = "-I%s")
     _add_directory_flags(args, generated_inputs.include_dirs, generated_inputs.include_dir_anchors)
     _add_linux_source_include_flags(ctx, args, generated_headers)
+    if source_root and ctx.attr.arch == "powerpc":
+        args.add("-I" + source_root + "/arch/powerpc")
     for include in ctx.attr.include_dirs:
         args.add("-I" + include)
     if _is_assembly_source(src):
@@ -5701,9 +6378,10 @@ def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_
     )
     executable = linker
     args = ctx.actions.args()
-    if ctx.attr.format == "arm64":
+    spec = linux_vmlinux_link_spec(ctx.attr.arch)
+    if spec.direct_lld:
         executable = _linux_x86_tool_sibling(linker, "ld.lld")
-        args.add_all(_linux_arm64_vmlinux_ld_flags(ctx.attr.config[LinuxConfigInfo]))
+        args.add_all(_linux_vmlinux_ld_flags(ctx.attr.arch, ctx.attr.config[LinuxConfigInfo]))
         args.add(linker_script, format = "--script=%s")
         if strip_debug:
             args.add("--strip-debug")
@@ -5724,7 +6402,7 @@ def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_
     args.add(export_object)
     args.add(version_object)
     args.add(no_whole_archive)
-    if ctx.attr.format == "arm64":
+    if spec.direct_lld:
         args.add("--start-group")
         args.add("--end-group")
     else:
@@ -5748,20 +6426,32 @@ def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_
     )
     return out
 
-def _linux_arm64_vmlinux_ld_flags(config):
-    flags = [
-        "-EL",
-        "-maarch64elf",
-        "--no-undefined",
-        "-X",
-        "--pic-veneer",
-        "-z",
-        "norelro",
+def _linux_link_endian_flags(arch, config):
+    if arch in ["arm", "arm64"]:
+        return ["-EB"] if config.config_flags.get("CONFIG_CPU_BIG_ENDIAN") == "y" else ["-EL"]
+    return linux_vmlinux_link_spec(arch).endian_flags
+
+def _linux_vmlinux_ld_flags(arch, config):
+    spec = linux_vmlinux_link_spec(arch)
+    flags = _linux_link_endian_flags(arch, config) + [
+        "-m",
+        spec.emulation,
+    ]
+    if arch == "powerpc" and config.config_flags.get("CONFIG_RELOCATABLE") == "y":
+        flags.extend([
+            "-pie",
+            "--no-dynamic-linker",
+            "-z",
+            "notext",
+        ])
+    else:
+        flags.extend(spec.vmlinux_flags)
+    flags.extend([
         "-z",
         "noexecstack",
         "--build-id=sha1",
         "--orphan-handling=warn",
-    ]
+    ])
     if config.config_flags.get("CONFIG_LD_DEAD_CODE_DATA_ELIMINATION") == "y":
         flags.append("--gc-sections")
     if config.config_flags.get("CONFIG_ARCH_VMLINUX_NEEDS_RELOCS") == "y":
@@ -5769,7 +6459,7 @@ def _linux_arm64_vmlinux_ld_flags(config):
             "--emit-relocs",
             "--discard-none",
         ])
-    if config.config_flags.get("CONFIG_RELOCATABLE") == "y":
+    if arch == "arm64" and config.config_flags.get("CONFIG_RELOCATABLE") == "y":
         flags.extend([
             "-shared",
             "-Bsymbolic",
@@ -5777,60 +6467,36 @@ def _linux_arm64_vmlinux_ld_flags(config):
             "notext",
             "--no-apply-dynamic-relocs",
         ])
+    elif arch == "riscv" and config.config_flags.get("CONFIG_RELOCATABLE") == "y":
+        flags.extend([
+            "-shared",
+            "-Bsymbolic",
+            "-z",
+            "notext",
+        ])
+    if arch == "arm" and config.config_flags.get("CONFIG_CPU_ENDIAN_BE8") == "y":
+        flags.append("--be8")
+    if arch == "riscv" and config.config_flags.get("CONFIG_DYNAMIC_FTRACE") == "y":
+        flags.append("--no-relax")
+    if arch == "riscv" and config.config_flags.get("CONFIG_SHADOW_CALL_STACK") == "y":
+        flags.append("--no-relax-gp")
+    if arch == "riscv" and config.config_flags.get("CONFIG_LTO_CLANG") == "y":
+        flags.extend(["-mllvm", "-mattr=+c", "-mllvm", "-mattr=+relax"])
     return flags
 
 def _linux_vmlinux_link_flags(ctx, config):
-    if ctx.attr.format == "arm64":
-        flags = [
-            "-fuse-ld=lld",
-            "-nostdlib",
-            "-Wl,--no-undefined",
-            "-Wl,-X",
-            "-Wl,--pic-veneer",
-            "-Wl,-EL",
-            "-Wl,-maarch64elf",
-            "-Wl,-z,norelro",
-            "-Wl,-z,noexecstack",
-            "-Wl,--build-id=sha1",
-            "-Wl,--orphan-handling=warn",
-        ]
-        if config.config_flags.get("CONFIG_LD_DEAD_CODE_DATA_ELIMINATION") == "y":
-            flags.append("-Wl,--gc-sections")
-        if config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y":
-            flags.extend([
-                "-flto=thin",
-                "-Wl,-mllvm,-import-instr-limit=5",
-            ])
-        elif config.config_flags.get("CONFIG_LTO_CLANG_FULL") == "y":
-            flags.extend([
-                "-flto",
-                "-Wl,-mllvm,-import-instr-limit=5",
-            ])
-        if config.config_flags.get("CONFIG_ARCH_VMLINUX_NEEDS_RELOCS") == "y":
-            flags.extend([
-                "-Wl,--emit-relocs",
-                "-Wl,--discard-none",
-            ])
-        if config.config_flags.get("CONFIG_RELOCATABLE") == "y":
-            flags.extend([
-                "-shared",
-                "-Wl,-Bsymbolic",
-                "-Wl,-z,notext",
-                "-Wl,--no-apply-dynamic-relocs",
-            ])
-        else:
-            flags.append("-no-pie")
-        return flags
+    spec = linux_vmlinux_link_spec(ctx.attr.arch)
     flags = [
         "-fuse-ld=lld",
         "-nostdlib",
         "-no-pie",
-        "-Wl,-m,elf_x86_64",
+        "-Wl,-m," + spec.emulation,
         "-Wl,-z,noexecstack",
-        "-Wl,-z,max-page-size=0x200000",
         "-Wl,--build-id=sha1",
         "-Wl,--orphan-handling=warn",
     ]
+    for index in range(0, len(spec.vmlinux_flags), 2):
+        flags.append("-Wl,%s,%s" % (spec.vmlinux_flags[index], spec.vmlinux_flags[index + 1]))
     if config.config_flags.get("CONFIG_LD_DEAD_CODE_DATA_ELIMINATION") == "y":
         flags.append("-Wl,--gc-sections")
     if config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y":
@@ -5883,13 +6549,13 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
     out = ctx.actions.declare_file(ctx.label.name + ".obj/vmlinux.o")
     initcalls_linker_script = _linux_vmlinux_initcalls_linker_script(ctx, config)
     args = ctx.actions.args()
-    if ctx.attr.format == "arm64":
+    spec = linux_vmlinux_link_spec(ctx.attr.arch)
+    if spec.direct_lld:
         executable = _linux_x86_tool_sibling(linker, "ld.lld")
-        flags = [
-            "-EL",
-            "-maarch64elf",
-            "-z",
-            "norelro",
+        flags = _linux_link_endian_flags(ctx.attr.arch, config) + [
+            "-m",
+            spec.emulation,
+        ] + spec.relocatable_flags + [
             "-z",
             "noexecstack",
             "-r",
@@ -5924,7 +6590,7 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
             "-nostdlib",
             "-no-pie",
             "-Wl,-r",
-            "-Wl,-m,elf_x86_64",
+            "-Wl,-m," + spec.emulation,
         ]
         if config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y":
             flags.extend([
@@ -6166,7 +6832,10 @@ linux_vmlinux = rule(
             default = "x86_64",
             values = [
                 "arm64",
+                "armv7",
                 "generic",
+                "ppc64le",
+                "riscv64",
                 "x86_64",
             ],
         ),
@@ -7017,6 +7686,380 @@ def _linux_x86_bzimage_impl(ctx):
         OutputGroupInfo(bzimage = depset([out])),
     ]
 
+def _linux_arm_text_offset(config):
+    if _linux_x86_config_enabled(config, "CONFIG_ARCH_AXXIA"):
+        return "0x00308000"
+    if (
+        _linux_x86_config_enabled(config, "CONFIG_ARCH_QCOM_RESERVE_SMEM") or
+        _linux_x86_config_enabled(config, "CONFIG_ARCH_MESON") or
+        (_linux_x86_config_enabled(config, "CONFIG_ARCH_SA1100") and
+         _linux_x86_config_enabled(config, "CONFIG_SA1111"))
+    ):
+        return "0x00208000"
+    if _linux_x86_config_enabled(config, "CONFIG_ARCH_REALTEK"):
+        return "0x00108000"
+    return "0x00008000"
+
+def _linux_arm_compressed_compile(
+        ctx,
+        compiler,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        src,
+        object,
+        extra_inputs = [],
+        extra_include_dirs = [],
+        extra_flags = []):
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + object)
+    assembly = _is_assembly_source(src)
+    filtered = _linux_filtered_config_flags_for_source(
+        ctx,
+        config,
+        src,
+        _linux_ftrace_remove_flags() + [
+            "-flto",
+            "-flto=thin",
+            "-fsplit-lto-unit",
+            "-fvisibility=hidden",
+            "-fstack-protector",
+            "-fstack-protector-strong",
+        ],
+        out_suffix = "arm-compressed-" + src.basename,
+    )
+    args = ctx.actions.args()
+    args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all(filtered.flags, format_each = "@%s")
+    args.add_all([
+        "-DDISABLE_BRANCH_PROFILING",
+        "-fpic",
+        "-fno-builtin",
+        "-fno-stack-protector",
+        "-Wno-unused-command-line-argument",
+    ])
+    if assembly:
+        args.add("-DZIMAGE")
+    args.add_all(_linux_object_name_flags(object))
+    args.add_all(_linux_source_preinclude_flags_for_root(source_root, assembly))
+    if assembly:
+        args.add_all(["-include", source_root + "/arch/arm/include/asm/unified.h"])
+    _add_config_include_flag(args, config)
+    _add_linux_source_include_flags_for_root(
+        args,
+        source_root,
+        "arm",
+        generated_headers.include_dirs,
+        _generated_include_dir_anchors(generated_headers),
+    )
+    include_dirs = [
+        source_root + "/arch/arm/boot/compressed",
+        source_root + "/scripts/dtc/libfdt",
+    ] + extra_include_dirs
+    _add_directory_flags(
+        args,
+        include_dirs,
+        _available_directory_anchors([out] + extra_inputs, include_dirs),
+    )
+    args.add_all(extra_flags)
+    args.add("-c")
+    args.add(src)
+    args.add("-o")
+    args.add(out)
+    path_mapped_run(
+        ctx.actions,
+        executable = compiler,
+        inputs = depset(
+            _linux_source_tree_inputs(ctx, direct = [src] + extra_inputs + filtered.inputs),
+            transitive = [cc_toolchain.all_files, config.files, generated_headers.files],
+        ),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxARMCompressedCompile",
+        progress_message = "Compiling Linux ARM compressed boot object %{label}",
+    )
+    return out
+
+def _linux_arm_compressed_linker_script(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root):
+    src = _source_tree_file(ctx, "arch/arm/boot/compressed/vmlinux.lds.S")
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/arm/boot/compressed/vmlinux.lds")
+    text_offset = _linux_arm_text_offset(config)
+    text_start = "0"
+    bss_start = "ALIGN(8)"
+    if _linux_x86_config_enabled(config, "CONFIG_ZBOOT_ROM"):
+        text_start = _unquote(config.config_flags.get("CONFIG_ZBOOT_ROM_TEXT", ""))
+        bss_start = _unquote(config.config_flags.get("CONFIG_ZBOOT_ROM_BSS", ""))
+        if not text_start or not bss_start:
+            fail("ARM CONFIG_ZBOOT_ROM requires CONFIG_ZBOOT_ROM_TEXT and CONFIG_ZBOOT_ROM_BSS")
+    args = ctx.actions.args()
+    args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all([
+        "-E",
+        "-P",
+        "-Uarm",
+        "-D__KERNEL__",
+        "-D__ASSEMBLY__",
+        "-DLINKER_SCRIPT",
+        "-DTEXT_START=" + text_start,
+        "-DBSS_START=" + bss_start,
+        "-DTEXT_OFFSET=" + text_offset,
+        "-DMALLOC_SIZE=65536",
+        "-include",
+        source_root + "/include/linux/kconfig.h",
+    ])
+    _add_config_include_flag(args, config)
+    _add_linux_source_include_flags_for_root(
+        args,
+        source_root,
+        "arm",
+        generated_headers.include_dirs,
+        _generated_include_dir_anchors(generated_headers),
+    )
+    args.add("-I" + source_root + "/arch/arm/boot/compressed")
+    args.add(src)
+    args.add("-o")
+    args.add(out)
+    path_mapped_run(
+        ctx.actions,
+        executable = compiler,
+        inputs = depset(
+            _linux_source_tree_inputs(ctx, direct = [src]),
+            transitive = [cc_toolchain.all_files, config.files, generated_headers.files],
+        ),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxARMCompressedLinkerScript",
+        progress_message = "Preprocessing Linux ARM compressed linker script %{label}",
+    )
+    return out
+
+def _linux_arm_compressed_link_flags(ctx, config, vmlinux):
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/arm/boot/compressed/link_flags.rsp")
+    args = ctx.actions.args()
+    args.add_all([
+        "-config",
+        config.config,
+        "-arm_vmlinux",
+        vmlinux,
+        "-arm_link_flags_out",
+        out,
+    ])
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._archheaders,
+        inputs = depset([vmlinux], transitive = [config.files]),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxARMCompressedLinkFlags",
+        progress_message = "Deriving Linux ARM compressed image symbols %{label}",
+    )
+    return out
+
+def _linux_arm_compressed_payload(ctx, cc_toolchain, config, vmlinux):
+    image = _linux_x86_objcopy(
+        ctx,
+        cc_toolchain,
+        vmlinux,
+        "arch/arm/boot/Image",
+        ["-O", "binary", "-R", ".comment", "-S"],
+    )
+    if _linux_x86_config_enabled(config, "CONFIG_KERNEL_GZIP"):
+        return _linux_x86_gzip(ctx, image, "arch/arm/boot/compressed/piggy_data")
+    if _linux_x86_config_enabled(config, "CONFIG_KERNEL_LZ4"):
+        compressed = _linux_x86_lz4(ctx, image, "arch/arm/boot/compressed/piggy_data.lz4")
+        return _linux_x86_append_size(
+            ctx,
+            [compressed],
+            [image],
+            "arch/arm/boot/compressed/piggy_data",
+        )
+    selected = [
+        name
+        for name in ["BZIP2", "LZMA", "LZO", "XZ", "ZSTD"]
+        if _linux_x86_config_enabled(config, "CONFIG_KERNEL_" + name)
+    ]
+    fail(
+        "ARM zImage compression requires CONFIG_KERNEL_GZIP=y or CONFIG_KERNEL_LZ4=y; " +
+        "unsupported resolved selection: %s" % (selected or ["none"]),
+    )
+
+def _linux_arm_compressed_source_specs(config):
+    specs = [
+        ("misc.c", []),
+        ("decompress.c", []),
+        ("string.c", ["-Os"]),
+    ]
+    if _linux_x86_config_enabled(config, "CONFIG_DEBUG_UNCOMPRESS"):
+        specs.append(("debug.S", []))
+    if _linux_x86_config_enabled(config, "CONFIG_ARM_VIRT_EXT"):
+        specs.append(("hyp-stub.S", []))
+    if _linux_x86_config_enabled(config, "CONFIG_ARCH_ACORN"):
+        specs.extend([("ll_char_wr.S", []), ("font.c", ["-Dstatic="])])
+    if _linux_x86_config_enabled(config, "CONFIG_ARCH_SA1100"):
+        specs.append(("head-sa1100.S", []))
+    if _linux_x86_config_enabled(config, "CONFIG_CPU_XSCALE"):
+        specs.append(("head-xscale.S", []))
+    if _linux_x86_config_enabled(config, "CONFIG_PXA_SHARPSL_DETECT_MACH_ID"):
+        specs.append(("head-sharpsl.S", []))
+    if (
+        _linux_x86_config_enabled(config, "CONFIG_CPU_ENDIAN_BE32") and
+        _linux_x86_config_enabled(config, "CONFIG_CPU_CP15")
+    ):
+        specs.append(("big-endian.S", []))
+    needs_fdt = (
+        _linux_x86_config_enabled(config, "CONFIG_ARM_ATAG_DTB_COMPAT") or
+        _linux_x86_config_enabled(config, "CONFIG_USE_OF")
+    )
+    if needs_fdt:
+        specs.extend([
+            ("fdt_rw.c", []),
+            ("fdt_ro.c", []),
+            ("fdt_wip.c", []),
+            ("fdt.c", []),
+        ])
+    if _linux_x86_config_enabled(config, "CONFIG_ARM_ATAG_DTB_COMPAT"):
+        specs.append(("atags_to_fdt.c", ["-Wframe-larger-than=1280"]))
+    if _linux_x86_config_enabled(config, "CONFIG_USE_OF"):
+        specs.append(("fdt_check_mem_start.c", []))
+    specs.extend([
+        ("lib1funcs.S", []),
+        ("ashldi3.S", []),
+        ("bswapsdi2.S", []),
+    ])
+    return specs
+
+def _linux_arm_zimage_impl(ctx):
+    if not ctx.attr.config:
+        fail("linux_compressed_image with arm_zimage format requires config")
+    if not ctx.attr.generated_headers:
+        fail("linux_compressed_image with arm_zimage format requires generated_headers")
+    if not ctx.file.source_root:
+        fail("linux_compressed_image with arm_zimage format requires source_root")
+
+    image = ctx.attr.image[LinuxImageInfo]
+    config = ctx.attr.config[LinuxConfigInfo]
+    if _linux_x86_config_enabled(config, "CONFIG_XIP_KERNEL"):
+        fail("ARM CONFIG_XIP_KERNEL does not provide the native zImage target")
+    if _linux_x86_config_enabled(config, "CONFIG_EFI_STUB"):
+        fail("ARM zImage CONFIG_EFI_STUB support is not yet modeled")
+
+    generated_headers = ctx.attr.generated_headers[LinuxGeneratedHeadersInfo]
+    cc_toolchain = find_cpp_toolchain(ctx)
+    feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
+    compiler = cc_common.get_tool_for_action(
+        feature_configuration = feature_configuration,
+        action_name = C_COMPILE_ACTION_NAME,
+    )
+    linker = _linux_x86_tool_sibling(
+        cc_common.get_tool_for_action(
+            feature_configuration = feature_configuration,
+            action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
+        ),
+        "ld.lld",
+    )
+    source_root = _linux_source_root_path(ctx)
+    payload = _linux_arm_compressed_payload(ctx, cc_toolchain, config, image.output)
+    output_root = payload.dirname[:-len("/arch/arm/boot/compressed")]
+
+    head = _linux_arm_compressed_compile(
+        ctx,
+        compiler,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        _source_tree_file(ctx, "arch/arm/boot/compressed/head.S"),
+        "arch/arm/boot/compressed/head.o",
+        extra_flags = [
+            "-DTEXT_OFFSET=" + _linux_arm_text_offset(config),
+            "-DMALLOC_SIZE=65536",
+        ] + (["-DDEBUG"] if _linux_x86_config_enabled(config, "CONFIG_DEBUG_UNCOMPRESS") else []),
+    )
+    piggy = _linux_arm_compressed_compile(
+        ctx,
+        compiler,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        _source_tree_file(ctx, "arch/arm/boot/compressed/piggy.S"),
+        "arch/arm/boot/compressed/piggy.o",
+        extra_inputs = [payload],
+        extra_include_dirs = [output_root],
+    )
+    objects = [head, piggy]
+    for source, extra_flags in _linux_arm_compressed_source_specs(config):
+        objects.append(_linux_arm_compressed_compile(
+            ctx,
+            compiler,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+            _source_tree_file(ctx, "arch/arm/boot/compressed/" + source),
+            "arch/arm/boot/compressed/" + source.rsplit(".", 1)[0] + ".o",
+            extra_flags = extra_flags,
+        ))
+
+    linker_script = _linux_arm_compressed_linker_script(
+        ctx,
+        compiler,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+    )
+    link_flags = _linux_arm_compressed_link_flags(ctx, config, image.output)
+    compressed_vmlinux = ctx.actions.declare_file(ctx.label.name + ".obj/arch/arm/boot/compressed/vmlinux")
+    args = ctx.actions.args()
+    args.add("-EB" if _linux_x86_config_enabled(config, "CONFIG_CPU_BIG_ENDIAN") else "-EL")
+    args.add_all(["-m", "armelf_linux_eabi"])
+    args.add(link_flags, format = "@%s")
+    if _linux_x86_config_enabled(config, "CONFIG_CPU_ENDIAN_BE8"):
+        args.add("--be8")
+    args.add_all(["--no-undefined", "-X", "-z", "noexecstack"])
+    if _linux_x86_config_enabled(config, "CONFIG_LD_ORPHAN_WARN"):
+        args.add("--orphan-handling=" + _unquote(config.config_flags.get("CONFIG_LD_ORPHAN_WARN_LEVEL", "warn")))
+    args.add_all(["-T", linker_script, "-o", compressed_vmlinux])
+    args.add_all(objects)
+    path_mapped_run(
+        ctx.actions,
+        executable = linker,
+        inputs = depset(objects + [linker_script, link_flags], transitive = [cc_toolchain.all_files]),
+        outputs = [compressed_vmlinux],
+        arguments = [args],
+        mnemonic = "LinuxARMCompressedLink",
+        progress_message = "Linking Linux ARM compressed kernel %{label}",
+    )
+    out = ctx.actions.declare_file(ctx.label.name + "." + ctx.attr.extension)
+    objcopy_args = ctx.actions.args()
+    objcopy_args.add_all(["-O", "binary", "-R", ".comment", "-S", compressed_vmlinux, out])
+    path_mapped_run(
+        ctx.actions,
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [compressed_vmlinux],
+        outputs = [out],
+        arguments = [objcopy_args],
+        mnemonic = "LinuxARMZImage",
+        progress_message = "Objcopying Linux ARM zImage %{label}",
+    )
+    info = LinuxImageInfo(
+        archives = image.archives,
+        module_objects = image.module_objects,
+        objects = image.objects,
+        output = out,
+    )
+    return [
+        DefaultInfo(files = depset([out])),
+        info,
+        OutputGroupInfo(zimage = depset([out])),
+    ]
+
 def _linux_compressed_image_impl(ctx):
     if ctx.attr.format == "vmlinux":
         image = ctx.attr.image[LinuxImageInfo]
@@ -7027,6 +8070,8 @@ def _linux_compressed_image_impl(ctx):
         ]
     if ctx.attr.format == "x86_bzimage":
         return _linux_x86_bzimage_impl(ctx)
+    if ctx.attr.format == "arm_zimage":
+        return _linux_arm_zimage_impl(ctx)
     if ctx.attr.format == "arm64_image":
         return _linux_objcopy_image_impl(ctx, [
             "-O",
@@ -7042,7 +8087,7 @@ def _linux_compressed_image_impl(ctx):
             "-S",
         ])
     fail(
-        "linux_compressed_image %s requires format \"x86_bzimage\", \"arm64_image\", or \"vmlinux\"" %
+        "linux_compressed_image %s requires a supported native Linux image format" %
         ctx.label,
     )
 
@@ -7085,6 +8130,7 @@ linux_compressed_image = rule(
             mandatory = True,
             values = [
                 "arm64_image",
+                "arm_zimage",
                 "vmlinux",
                 "x86_bzimage",
             ],
@@ -7103,6 +8149,11 @@ linux_compressed_image = rule(
             default = Label("//internal/cmd/insnattr"),
             executable = True,
         ),
+        "_archheaders": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/archheaders"),
+            executable = True,
+        ),
         "_lz4": attr.label(
             cfg = "exec",
             default = Label("@lz4//programs:lz4"),
@@ -7116,7 +8167,7 @@ linux_compressed_image = rule(
     },
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
-    doc = "Builds an x86 bzImage or arm64 Image from a linked kernel.",
+    doc = "Builds the architecture-native image artifact from a linked kernel.",
 )
 
 def _collect_image_objects(image):

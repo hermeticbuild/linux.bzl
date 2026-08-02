@@ -1,6 +1,15 @@
 """Supported Linux architecture descriptors."""
 
 load(":arm64_host_tools.bzl", "linux_arm64_configured_host_tools", "linux_arm64_host_tools")
+load(
+    ":generic_host_tools.bzl",
+    "linux_arm_configured_host_tools",
+    "linux_arm_host_tools",
+    "linux_powerpc_configured_host_tools",
+    "linux_powerpc_host_tools",
+    "linux_riscv_configured_host_tools",
+    "linux_riscv_host_tools",
+)
 load(":x86_host_tools.bzl", "linux_x86_configured_host_tools", "linux_x86_host_tools")
 
 visibility("//...")
@@ -57,5 +66,71 @@ def linux_architectures():
             uts_machine = "aarch64",
             vmlinux_format = "arm64",
             vmlinux_linker_script = "arch/arm64/kernel/vmlinux.lds.S",
+        ),
+        struct(
+            arch = "arm",
+            compact_vars = {
+                "ARCH_CORE": "",
+                "ARCH_DRIVERS": "",
+                "ARCH_LIB": "arch/arm/lib/ lib/",
+                "BITS": "32",
+                "CFLAGS_UBSAN_TRAP": "-fsanitize-trap=undefined",
+                "PROFILING": "",
+            },
+            compressed_format = "arm_zimage",
+            config_name = "armv7",
+            extension = "zImage",
+            final_suffix = "zimage",
+            configured_host_tools = linux_arm_configured_host_tools,
+            host_tools = linux_arm_host_tools,
+            platform = Label("@platforms//cpu:armv7"),
+            srcarch = "arm",
+            uts_machine = "armv7l",
+            vmlinux_format = "armv7",
+            vmlinux_linker_script = "arch/arm/kernel/vmlinux.lds.S",
+        ),
+        struct(
+            arch = "riscv",
+            compact_vars = {
+                "ARCH_CORE": "",
+                "ARCH_DRIVERS": "",
+                "ARCH_LIB": "arch/riscv/lib/ lib/",
+                "BITS": "64",
+                "CFLAGS_UBSAN_TRAP": "-fsanitize-trap=undefined",
+                "PROFILING": "",
+            },
+            compressed_format = "vmlinux",
+            config_name = "riscv64",
+            extension = "vmlinux",
+            final_suffix = "vmlinux",
+            configured_host_tools = linux_riscv_configured_host_tools,
+            host_tools = linux_riscv_host_tools,
+            platform = Label("@platforms//cpu:riscv64"),
+            srcarch = "riscv",
+            uts_machine = "riscv64",
+            vmlinux_format = "riscv64",
+            vmlinux_linker_script = "arch/riscv/kernel/vmlinux.lds.S",
+        ),
+        struct(
+            arch = "powerpc",
+            compact_vars = {
+                "ARCH_CORE": "",
+                "ARCH_DRIVERS": "",
+                "ARCH_LIB": "arch/powerpc/lib/ lib/",
+                "BITS": "64",
+                "CFLAGS_UBSAN_TRAP": "-fsanitize-trap=undefined",
+                "PROFILING": "",
+            },
+            compressed_format = "vmlinux",
+            config_name = "ppc64le",
+            extension = "vmlinux",
+            final_suffix = "vmlinux",
+            configured_host_tools = linux_powerpc_configured_host_tools,
+            host_tools = linux_powerpc_host_tools,
+            platform = Label("@platforms//cpu:ppc64le"),
+            srcarch = "powerpc",
+            uts_machine = "ppc64le",
+            vmlinux_format = "ppc64le",
+            vmlinux_linker_script = "arch/powerpc/kernel/vmlinux.lds.S",
         ),
     ]
