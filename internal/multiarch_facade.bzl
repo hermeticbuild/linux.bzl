@@ -23,7 +23,12 @@ _MODULE_FIELDS = [
 ]
 
 def _forward(target):
-    providers = [target[DefaultInfo]]
+    default = target[DefaultInfo]
+    providers = [DefaultInfo(
+        files = default.files,
+        data_runfiles = default.data_runfiles,
+        default_runfiles = default.default_runfiles,
+    )]
     if LinuxKernelInfo in target:
         providers.append(target[LinuxKernelInfo])
     if LinuxModuleSdkInfo in target:
@@ -37,7 +42,7 @@ def _selector_impl(ctx):
 
 _selector = rule(
     implementation = _selector_impl,
-    attrs = {"target": attr.label(mandatory = True)},
+    attrs = {"target": attr.label(allow_files = True, mandatory = True)},
 )
 
 def _profile_select(name, targets, visibility):

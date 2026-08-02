@@ -67,3 +67,13 @@ def _projection_test_impl(ctx):
     return analysistest.end(env)
 
 projection_test = analysistest.make(_projection_test_impl)
+
+def _selected_file_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    files = analysistest.target_under_test(env)[DefaultInfo].files.to_list()
+
+    asserts.equals(env, 1, len(files))
+    asserts.equals(env, "multiarch_facade_test.bzl", files[0].basename)
+    return analysistest.end(env)
+
+selected_file_test = analysistest.make(_selected_file_test_impl)
