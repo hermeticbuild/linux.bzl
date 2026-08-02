@@ -14,7 +14,7 @@ Add `linux.bzl` and a hermetic C/C++ toolchain to `MODULE.bazel`:
 
 ```starlark
 bazel_dep(name = "linux.bzl", version = "0.0.1")
-bazel_dep(name = "llvm", version = "0.8.14")
+bazel_dep(name = "llvm", version = "<HERMETIC_LLVM_MULTIARCH_VERSION>")
 
 register_toolchains(
     "@llvm//toolchain:all",
@@ -33,12 +33,17 @@ linux_source_repository(
 linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
 linux_images.image(
     name = "example_kernel",
-    config = "//kernel:x86_64.config",
+    config = "//kernel:kernel.config",
     platform = "@llvm//platforms:linux_x86_64",
     source = "@linux_6_18_39//:Kconfig",
 )
 use_repo(linux_images, "example_kernel")
 ```
+
+Replace `<HERMETIC_LLVM_MULTIARCH_VERSION>` with the first Hermetic LLVM
+release that includes the freestanding five-profile kernel toolchains. The
+version is intentionally left explicit until that prerequisite release is
+published.
 
 When developing against a checkout, add:
 
@@ -53,22 +58,20 @@ The referenced config is a normal exported source file:
 
 ```starlark
 # kernel/BUILD.bazel
-exports_files(["x86_64.config"])
+exports_files(["kernel.config"])
 ```
 
 ```text
-# kernel/x86_64.config
-CONFIG_64BIT=y
-CONFIG_X86=y
-CONFIG_X86_64=y
+# kernel/kernel.config
 CONFIG_KERNEL_GZIP=y
 # CONFIG_MODULES is not set
 ```
 
 The source rule knows the pinned URL and integrity for maintained catalog
-versions. The image extension derives the architecture from the base config,
-resolves the fragment through Kconfig, and verifies the selected platform
-architecture during analysis.
+versions. The image extension derives the Linux target profile from the
+selected platform, supplies its architecture symbols while resolving the
+fragment through Kconfig, and rejects explicit config assignments that
+contradict the platform.
 
 Build the boot image:
 
@@ -127,7 +130,7 @@ surface:
 | `source` | Root `Kconfig` from `linux_source_repository` |
 | `config` | Base Kconfig fragment |
 | `config_mode` | Kconfig baseline: `default` or `allnoconfig` |
-| `platform` | Linux x86_64 or aarch64 target platform selecting Clang |
+| `platform` | Linux x86_64, aarch64, armv7, riscv64, or ppc64le target platform selecting Clang |
 
 `linux_images.overlay` adds a named config fragment to an image:
 
@@ -137,15 +140,18 @@ surface:
 | `name` | Stable variant name used below `variants/` |
 | `config` | Overlay Kconfig fragment |
 
-There is intentionally no `arch` attribute. Architecture is derived from the
-base config, while the platform must carry the matching x86_64 or aarch64 CPU
-constraint and select a matching LLVM/Clang toolchain. The toolchain must expose
-`llvm-nm` and `llvm-objcopy` through `CcToolchainInfo.all_files`; the supported
-setup is the `llvm` module shown above. Repository and platform labels may be
-renamed. There are also no graph profiles, explicit Kbuild linker labels,
-compiler paths, host probe overrides, image-format switches, or signing keys in
-the public API. Import each declared facade repository explicitly with
-`use_repo`.
+There is intentionally no `arch` attribute. The platform is the sole source of
+the target profile and must carry Linux plus exactly one supported CPU
+constraint: x86_64, aarch64, armv7, riscv64, or ppc64le. The base config does
+not need to repeat `CONFIG_X86`, `CONFIG_X86_64`, `CONFIG_ARM64`, `CONFIG_ARM`,
+`CONFIG_RISCV`, `CONFIG_PPC`, or `CONFIG_PPC64`; repository generation supplies
+the platform-selected architecture to Kconfig. An explicit architecture
+selection or unset that contradicts the platform is rejected. The platform
+also selects a matching LLVM/Clang toolchain, which must expose `llvm-nm` and
+`llvm-objcopy` through `CcToolchainInfo.all_files`. Repository and platform
+labels may be renamed. There are no public graph-profile, explicit Kbuild
+linker, compiler-path, host-probe, image-format, or signing-key attributes.
+Import each declared facade repository explicitly with `use_repo`.
 
 ### Initramfs
 
@@ -281,6 +287,12 @@ linux_cc_module(
 )
 ```
 
+The module consumes the default configured kernel directly; it does not need a
+module-specific image or config overlay. The same rule and source shape are
+supported for x86_64, aarch64, armv7, riscv64, and ppc64le kernels. As with
+Rust modules, the `kernel` provider fixes the target platform and rejects
+cross-kernel dependencies.
+
 ## Why
 
 Wrapping `make` in one Bazel action hides the kernel build graph from Bazel.
@@ -300,22 +312,22 @@ cannot cache or schedule the individual compile steps.
 Repository generation resolves Kconfig and Kbuild against a deterministic
 LLVM 22.1.8 capability baseline. Consumers may select a newer Clang toolchain;
 doing so opts into treating it as compatible with that baseline rather than
-probing it. The transitioned graph rejects a non-Clang toolchain or a target
-architecture that disagrees with the platform and config.
+probing it. The transitioned graph rejects a non-Clang toolchain or an explicit
+config architecture that disagrees with the platform-selected target profile.
 
 ## Supported configurations
 
 | Area | Supported |
 | --- | --- |
 | Catalog releases | 6.12.96 and 6.18.39 |
-| Target architectures | x86_64 and aarch64 |
+| Target architectures | x86_64, aarch64, armv7, riscv64, and ppc64le, inferred from the target platform |
 | Repository evaluation | Pinned generator archives for Linux, macOS, and Windows on amd64 and arm64 |
-| Build toolchain | Clang with LLVM 22.1.8 baseline semantics; CI uses Hermetic LLVM module `llvm` 0.8.14 |
-| Images | x86 `bzImage`, arm64 `Image`, and `vmlinux` |
+| Build toolchain | Clang with LLVM 22.1.8 baseline semantics and a Hermetic LLVM release containing the five freestanding kernel profiles |
+| Images | x86_64 `bzImage`, aarch64 `Image`, armv7 `zImage`, and conservative `vmlinux` fallbacks for riscv64 and ppc64le |
 | Config variants | Base fragment plus named overlay fragments |
 | Initramfs | Deterministic root-owned `newc` archives |
 | In-tree modules | Loadable `.ko` files plus Kbuild module metadata |
-| Out-of-tree modules | C `.ko` files through `linux_cc_module` and Rust-for-Linux `.ko` files through `linux_module` |
+| Out-of-tree modules | C `.ko` files through `linux_cc_module` on all five profiles; Rust-for-Linux `.ko` files through `linux_module` on x86_64 and aarch64 |
 | Kernel BPF/BTF | BPF syscall configurations, BTF-enabled `vmlinux`, and module BTF with Rust+DWARF5 kernels |
 | VM verification | Hermetic QEMU boots with initramfs and module-load checks |
 
@@ -325,10 +337,12 @@ to that catalog and its release checks. The repository generator is published
 for each host listed above; kernel compile actions target the registered Clang
 toolchain selected by the image platform.
 
-The public kernel contract includes resolved configs, boot images, `vmlinux`,
+The public kernel contract includes resolved configs, native boot images or the
+documented `vmlinux` fallback, `vmlinux`,
 `System.map`, kernel release metadata, configured in-tree modules, and their
 installation metadata. The separate `initramfs` rule supplies boot userspace
-archives, while `linux_module` builds out-of-tree Rust-for-Linux modules.
+archives, while `linux_cc_module` and `linux_module` build out-of-tree C and
+Rust-for-Linux modules respectively.
 BPF-syscall and BTF-enabled kernel configurations are supported; eBPF program
 compilation remains the responsibility of consumers such as Aya.
 
@@ -383,11 +397,16 @@ and license material, remains available in the repository.
 
 ## Configs and variants
 
-The base input is a Kconfig fragment. It must select exactly one supported
-architecture, for example `CONFIG_X86_64=y` or `CONFIG_ARM64=y`. Repository
-generation applies Kconfig defaults, dependencies, selects, and implies using
-the fixed LLVM capability baseline. An absent symbol follows Kconfig semantics;
-use `# CONFIG_NAME is not set` for a deliberate unset.
+The base input is a Kconfig fragment. Its architecture comes from the
+`linux_images.image` platform, so the fragment can stay architecture-neutral
+and need not set `CONFIG_X86`, `CONFIG_X86_64`, `CONFIG_ARM64`, `CONFIG_ARM`,
+`CONFIG_RISCV`, `CONFIG_PPC`, or `CONFIG_PPC64`. Repository generation supplies
+the selected architecture and then applies Kconfig defaults, dependencies,
+selects, and implies using the fixed LLVM capability baseline. Explicit
+architecture assignments are still validated: selecting another profile, or
+deliberately unsetting a symbol required by the platform, is an error. For
+other symbols, an absent assignment follows Kconfig semantics; use
+`# CONFIG_NAME is not set` for a deliberate unset.
 
 Named overlays contain only deliberate assignments and unsets:
 
@@ -433,8 +452,8 @@ Every base and variant package exposes the same projection labels:
 
 | Label | Current contents |
 | --- | --- |
-| `:kernel` | Real architecture boot image and `LinuxKernelInfo` |
-| `:image` | Real architecture boot image |
+| `:kernel` | Profile image (or documented fallback) and `LinuxKernelInfo` |
+| `:image` | Profile image or documented fallback |
 | `:vmlinux` | Real linked ELF kernel |
 | `:config` | Resolved kernel configuration |
 | `:system_map` | Real `System.map` |
@@ -445,10 +464,13 @@ Every base and variant package exposes the same projection labels:
 | `:modules_builtin` | Deterministic built-in module inventory |
 | `:modules_builtin_modinfo` | Deterministic built-in module metadata |
 
-The `:kernel` target's `DefaultInfo` contains only the boot image, so it can be
-used directly by packaging and VM rules without selecting an output group.
-When no loadable in-tree modules are configured, `:modules` is an empty file
-set; the metadata labels remain available.
+The `:kernel` target's `DefaultInfo` contains one profile-native image: x86_64
+uses `bzImage`, aarch64 uses `Image`, and armv7 uses `zImage`. RISC-V and
+little-endian PowerPC currently use the linked `vmlinux` as a conservative
+fallback until their native boot wrappers are modeled. This output can be used
+directly by packaging and VM rules without selecting an output group. When no
+loadable in-tree modules are configured, `:modules` is an empty file set; the
+metadata labels remain available.
 
 ### Providers
 
@@ -475,13 +497,17 @@ system_map
 ## Toolchains and hermeticity
 
 `platform` is mandatory on every `linux_images.image` tag. It must carry a
-Linux x86_64 or aarch64 CPU constraint and select a matching LLVM/Clang
-toolchain. The extension applies it once at the public `:kernel` gateway.
-Analysis rejects non-Clang compilers, target platforms that disagree with the
-config, and toolchains that do not expose `llvm-nm` and `llvm-objcopy` through
-`CcToolchainInfo.all_files`. The supported toolchain is provided by `llvm`
-0.8.14 and uses LLVM 22.1.8. Repository and platform labels may be renamed, but
-using another LLVM packaging or version is outside the supported contract.
+Linux OS constraint and exactly one of the x86_64, aarch64, armv7, riscv64, or
+ppc64le CPU constraints, and it must select a matching LLVM/Clang toolchain.
+The extension applies that platform transition once at the public facade,
+selects only the corresponding architecture graph, and leaves the selected
+private graph transition-free. Analysis rejects non-Clang compilers,
+contradictory config architecture assignments, and toolchains that do not
+expose `llvm-nm` and `llvm-objcopy` through `CcToolchainInfo.all_files`. The
+supported toolchain uses LLVM 22.1.8 and comes from the forthcoming Hermetic
+LLVM multiarch release referenced in the quick start. Repository and platform
+labels may be renamed, but using another LLVM packaging or version is outside
+the supported contract.
 
 Repository generation downloads the platform-specific, integrity-pinned
 Kconfig graph generator selected by the rules release's checked-in table. The

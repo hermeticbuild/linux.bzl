@@ -1,0 +1,78 @@
+load("//internal:multiarch_facade.bzl", "linux_multiarch_kernel_exports")
+load(
+    ":multiarch_facade_test.bzl",
+    "facade_provider_test",
+    "multiarch_graph_fixture",
+    "projection_test",
+)
+
+package(default_visibility = ["//visibility:private"])
+
+platform(
+    name = "linux_armv7",
+    constraint_values = [
+        "@platforms//cpu:armv7",
+        "@platforms//os:linux",
+    ],
+)
+
+multiarch_graph_fixture(
+    name = "x86_64_graph",
+    arch = "x86_64",
+)
+
+multiarch_graph_fixture(
+    name = "aarch64_graph",
+    arch = "aarch64",
+)
+
+multiarch_graph_fixture(
+    name = "armv7_graph",
+    arch = "armv7",
+)
+
+multiarch_graph_fixture(
+    name = "riscv64_graph",
+    arch = "riscv64",
+)
+
+multiarch_graph_fixture(
+    name = "ppc64le_graph",
+    arch = "ppc64le",
+)
+
+linux_multiarch_kernel_exports(
+    name = "kernel",
+    graphs = {
+        "aarch64": ":aarch64_graph",
+        "armv7": ":armv7_graph",
+        "ppc64le": ":ppc64le_graph",
+        "riscv64": ":riscv64_graph",
+        "x86_64": ":x86_64_graph",
+    },
+    platform = ":linux_armv7",
+)
+
+facade_provider_test(
+    name = "armv7_facade_provider_test",
+    target_under_test = ":kernel",
+)
+
+projection_test(
+    name = "armv7_config_projection_test",
+    target_under_test = ":config",
+)
+
+projection_test(
+    name = "armv7_modules_projection_test",
+    target_under_test = ":modules",
+)
+
+test_suite(
+    name = "tests",
+    tests = [
+        ":armv7_config_projection_test",
+        ":armv7_facade_provider_test",
+        ":armv7_modules_projection_test",
+    ],
+)
