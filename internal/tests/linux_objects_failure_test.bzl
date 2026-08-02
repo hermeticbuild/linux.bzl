@@ -83,11 +83,17 @@ _fake_compile_environment_index = rule(
 def _fake_generated_headers_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".h")
     ctx.actions.write(out, "")
+    cflags = None
+    files = [out]
+    if ctx.attr.emit_cflags:
+        cflags = ctx.actions.declare_file(ctx.label.name + ".cflags.rsp")
+        ctx.actions.write(cflags, "-mstack-protector-guard=tls\n")
+        files.append(cflags)
     family = struct(
         arch = ctx.attr.arch,
-        cflags = None,
+        cflags = cflags,
         content_id = ctx.attr.family_content_id,
-        files = depset([out]),
+        files = depset(files),
         include_dir_anchors = {},
         include_dirs = [],
         name = ctx.attr.family_name,
@@ -98,11 +104,11 @@ def _fake_generated_headers_impl(ctx):
         DefaultInfo(files = depset([out])),
         LinuxGeneratedHeadersInfo(
             arch = ctx.attr.arch,
-            cflags = None,
+            cflags = cflags,
             families = {
                 ctx.attr.family_name: family,
             },
-            files = depset([out]),
+            files = depset(files),
             include_dir_anchors = {},
             include_dirs = [],
             srcarch = ctx.attr.arch,
@@ -114,6 +120,7 @@ _fake_generated_headers = rule(
     implementation = _fake_generated_headers_impl,
     attrs = {
         "arch": attr.string(default = "x86"),
+        "emit_cflags": attr.bool(),
         "family_content_id": attr.string(mandatory = True),
         "family_name": attr.string(default = "all"),
     },
@@ -396,6 +403,13 @@ def _content_addressed_object_test_impl(ctx):
                 if file.basename == basename
             ]
             asserts.equals(env, 0, len(duplicate_header_inputs))
+        if ctx.attr.expected_generated_cflags:
+            generated_cflags = [
+                arg
+                for arg in compile_actions[0].argv
+                if arg.endswith("/" + ctx.attr.expected_generated_cflags)
+            ]
+            asserts.equals(env, 1, len(generated_cflags))
         unexpected_inputs = [
             file
             for file in compile_actions[0].inputs.to_list()
@@ -408,6 +422,7 @@ _content_addressed_object_test = analysistest.make(
     _content_addressed_object_test_impl,
     attrs = {
         "expected_content_id": attr.string(mandatory = True),
+        "expected_generated_cflags": attr.string(),
         "expected_generated_headers": attr.string_list(),
         "expected_payload_id": attr.string(mandatory = True),
         "unexpected_generated_headers": attr.string_list(),
@@ -432,10 +447,19 @@ def _indexed_assembly_source_test_impl(ctx):
         input_basenames = [file.basename for file in action.inputs.to_list()]
         asserts.true(env, "blake2s-core.S" in input_basenames)
         asserts.false(env, "blake2s.h" in input_basenames)
+        generated_cflags = [
+            arg
+            for arg in argv
+            if arg.endswith("/" + ctx.attr.unexpected_generated_cflags)
+        ]
+        asserts.equals(env, 0, len(generated_cflags))
     return analysistest.end(env)
 
 _indexed_assembly_source_test = analysistest.make(
     _indexed_assembly_source_test_impl,
+    attrs = {
+        "unexpected_generated_cflags": attr.string(mandatory = True),
+    },
 )
 
 _X86_PRECISE_HEADER_FAMILIES = [
@@ -1039,6 +1063,7 @@ def linux_objects_fail_closed_test_suite(name):
     duplicate_generated_headers = name + "_generated_headers_z"
     _fake_generated_headers(
         name = generated_headers,
+        emit_cflags = True,
         family_content_id = header_family_id,
         tags = fixture_tags,
     )
@@ -1222,6 +1247,7 @@ def linux_objects_fail_closed_test_suite(name):
     _indexed_assembly_source_test(
         name = indexed_assembly_object_test,
         target_under_test = ":" + indexed_assembly_object,
+        unexpected_generated_cflags = generated_headers + ".cflags.rsp",
     )
     nvhe_source_inputs = name + "_nvhe_source_inputs"
     _fake_nvhe_source_inputs(
@@ -1282,6 +1308,7 @@ def linux_objects_fail_closed_test_suite(name):
     _content_addressed_object_test(
         name = indexed_object_test,
         expected_content_id = object_a_id,
+        expected_generated_cflags = generated_headers + ".cflags.rsp",
         expected_generated_headers = [generated_headers + ".h"],
         expected_payload_id = payload_id,
         target_under_test = ":" + indexed_object,
