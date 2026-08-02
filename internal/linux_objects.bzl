@@ -3873,7 +3873,7 @@ def _linux_generic_syscall_specs(arch, base, table):
         struct(abis = "common,spu", emit_nr = False, offset = "", out = generated + "/asm/syscall_table_spu.h", table = table, table_header = True),
     ]
 
-def _linux_arm_vdso_compile(ctx, cc_toolchain, feature_configuration, config, generated_headers, source_root, src, out_relpath):
+def _linux_arm_vdso_compile(ctx, cc_toolchain, feature_configuration, config, generated_headers, source_root, src, out_relpath, force_include = None):
     compiler = cc_common.get_tool_for_action(
         feature_configuration = feature_configuration,
         action_name = C_COMPILE_ACTION_NAME,
@@ -3904,6 +3904,8 @@ def _linux_arm_vdso_compile(ctx, cc_toolchain, feature_configuration, config, ge
         "-DBUILD_VDSO32",
     ])
     args.add_all(_linux_source_preinclude_flags_for_root(source_root))
+    if force_include:
+        args.add_all(["-include", force_include])
     _add_config_include_flag(args, config)
     _add_linux_source_include_flags_for_root(
         args,
@@ -3918,11 +3920,14 @@ def _linux_arm_vdso_compile(ctx, cc_toolchain, feature_configuration, config, ge
     args.add(src)
     args.add("-o")
     args.add(out)
+    extra_inputs = filtered.inputs
+    if force_include:
+        extra_inputs = extra_inputs + [_source_tree_file_for_root(ctx, source_root, force_include[len(source_root) + 1:])]
     path_mapped_run(
         ctx.actions,
         executable = compiler,
         inputs = depset(
-            _linux_source_tree_inputs(ctx, direct = [src] + filtered.inputs),
+            _linux_source_tree_inputs(ctx, direct = [src] + extra_inputs),
             transitive = [cc_toolchain.all_files, config.files, generated_headers.files],
         ),
         outputs = [out],
@@ -3981,6 +3986,9 @@ def _linux_arm_vdso_linker_script(ctx, cc_toolchain, feature_configuration, conf
 def _linux_arm_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, generated_headers, source_root, base):
     objects = []
     for source in ["vgettimeofday.c", "note.c"]:
+        force_include = None
+        if source == "vgettimeofday.c" and config.config_flags.get("CONFIG_GENERIC_GETTIMEOFDAY") == "y":
+            force_include = source_root + "/lib/vdso/gettimeofday.c"
         objects.append(_linux_arm_vdso_compile(
             ctx,
             cc_toolchain,
@@ -3990,6 +3998,7 @@ def _linux_arm_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, ge
             source_root,
             _source_tree_file(ctx, "arch/arm/vdso/" + source),
             base + "/arch/arm/vdso/" + source[:-len(".c")] + ".o",
+            force_include = force_include,
         ))
     linker_script = _linux_arm_vdso_linker_script(
         ctx,
