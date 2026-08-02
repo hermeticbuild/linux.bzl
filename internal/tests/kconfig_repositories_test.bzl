@@ -65,13 +65,29 @@ target_profiles_test = unittest.make(_target_profiles_test_impl)
 
 def _fragment_arch_preflight_test_impl(ctx):
     env = unittest.begin(ctx)
-    for symbol in ["CONFIG_X86_32", "CONFIG_ARM64"]:
+    for profile, foreign, required in [
+        ("x86_64", "CONFIG_ARM", "CONFIG_X86_64"),
+        ("aarch64", "CONFIG_X86_64", "CONFIG_ARM64"),
+        ("armv7", "CONFIG_ARM64", "CONFIG_ARM"),
+    ]:
         error = repositories_test_helpers.fragment_arch_error(
-            "x86_64",
-            {symbol: "y"},
+            profile,
+            {foreign: "y"},
             "test fragment",
         )
-        asserts.true(env, symbol in error, "%s should be rejected, got %r" % (symbol, error))
+        asserts.true(env, foreign in error, "%s should reject %s=y, got %r" % (profile, foreign, error))
+        error = repositories_test_helpers.fragment_arch_error(
+            profile,
+            {required: "n"},
+            "test fragment",
+        )
+        asserts.true(env, required in error, "%s should reject %s=n, got %r" % (profile, required, error))
+    error = repositories_test_helpers.fragment_arch_error(
+        "x86_64",
+        {"CONFIG_X86_32": "y"},
+        "test fragment",
+    )
+    asserts.true(env, "CONFIG_X86_32" in error, "x86_64 should reject CONFIG_X86_32=y, got %r" % error)
     return unittest.end(env)
 
 fragment_arch_preflight_test = unittest.make(_fragment_arch_preflight_test_impl)

@@ -99,7 +99,7 @@ linux_images.image(
 linux_images.image(
     name = "e2e_x86_64",
     config = "//:tiny.config",
-    platform = "@hermetic_llvm//platforms:linux_x86_64",
+    platform = "//:linux_x86_64",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
 linux_images.image(
@@ -117,25 +117,25 @@ linux_images.image(
 linux_images.image(
     name = "e2e_aarch64",
     config = "//:tiny_arm64.config",
-    platform = "@hermetic_llvm//platforms:linux_arm64",
+    platform = "//:linux_aarch64",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
 linux_images.image(
     name = "e2e_armv7",
     config = "//:openbmc_armv7.config",
-    platform = "@hermetic_llvm//platforms:linux_armv7",
+    platform = "//:linux_armv7",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
 linux_images.image(
     name = "e2e_riscv64",
     config = "//:tiny_riscv64.config",
-    platform = "@hermetic_llvm//platforms:linux_riscv64",
+    platform = "//:linux_riscv64",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
 linux_images.image(
     name = "e2e_ppc64le",
     config = "//:tiny_ppc64le.config",
-    platform = "@hermetic_llvm//platforms:linux_ppc64le",
+    platform = "//:linux_ppc64le",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
 use_repo(
