@@ -7667,6 +7667,7 @@ def _linux_vmlinux_impl(ctx):
         ctx,
         linux_module_cc_helpers,
         struct(
+            arch = linux_architecture_profile_for_arch(ctx.attr.arch).name,
             config = config,
             generated_headers = generated_headers,
             module_objects = image.module_objects,
@@ -8019,6 +8020,29 @@ def _linux_x86_gzip(ctx, input, out_relpath):
         [out],
         ["gzip", "-in", input, "-out", out],
         inputs = [input],
+    )
+    return out
+
+def _linux_arm_zstd(ctx, input, out_relpath):
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
+    args = ctx.actions.args()
+    args.add_all([
+        "-stdin",
+        input,
+        out,
+        ctx.executable._zstd,
+        "-22",
+        "--ultra",
+    ])
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._runandwrite,
+        inputs = [input],
+        tools = [ctx.attr._zstd[DefaultInfo].files_to_run],
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxARMZSTD",
+        progress_message = "Compressing Linux ARM kernel payload with ZSTD %{label}",
     )
     return out
 
@@ -8817,13 +8841,21 @@ def _linux_arm_compressed_payload(ctx, cc_toolchain, config, vmlinux):
             [image],
             "arch/arm/boot/compressed/piggy_data",
         )
+    if _linux_x86_config_enabled(config, "CONFIG_KERNEL_ZSTD"):
+        compressed = _linux_arm_zstd(ctx, image, "arch/arm/boot/compressed/piggy_data.zst")
+        return _linux_x86_append_size(
+            ctx,
+            [compressed],
+            [image],
+            "arch/arm/boot/compressed/piggy_data",
+        )
     selected = [
         name
         for name in ["BZIP2", "LZMA", "LZO", "XZ", "ZSTD"]
         if _linux_x86_config_enabled(config, "CONFIG_KERNEL_" + name)
     ]
     fail(
-        "ARM zImage compression requires CONFIG_KERNEL_GZIP=y or CONFIG_KERNEL_LZ4=y; " +
+        "ARM zImage compression requires CONFIG_KERNEL_GZIP=y, CONFIG_KERNEL_LZ4=y, or CONFIG_KERNEL_ZSTD=y; " +
         "unsupported resolved selection: %s" % (selected or ["none"]),
     )
 
@@ -9107,9 +9139,19 @@ linux_compressed_image = rule(
             default = Label("@lz4//programs:lz4"),
             executable = True,
         ),
+        "_runandwrite": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/runandwrite"),
+            executable = True,
+        ),
         "_x86boot": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/x86boot"),
+            executable = True,
+        ),
+        "_zstd": attr.label(
+            cfg = "exec",
+            default = Label("@zstd//:zstd_cli"),
             executable = True,
         ),
     },

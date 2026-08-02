@@ -626,12 +626,53 @@ _generic_generated_header_anchors_test = analysistest.make(
 
 def _arm_compressed_flagfilter_test_impl(ctx):
     env = analysistest.begin(ctx)
-    actions = [
+    target = analysistest.target_under_test(env)
+    actions = analysistest.target_actions(env)
+    filter_actions = [
         action
-        for action in analysistest.target_actions(env)
+        for action in actions
         if action.mnemonic == "LinuxFlagFilter"
     ]
-    asserts.true(env, len(actions) > 0, "ARM compressed image did not filter Kbuild flags")
+    asserts.true(env, len(filter_actions) > 0, "ARM compressed image did not filter Kbuild flags")
+    zstd_actions = [action for action in actions if action.mnemonic == "LinuxARMZSTD"]
+    append_actions = [
+        action
+        for action in actions
+        if action.mnemonic == "LinuxX86BootTool" and "append-size" in action.argv
+    ]
+    piggy_actions = [
+        action
+        for action in actions
+        if action.mnemonic == "LinuxARMCompressedCompile" and any([
+            output.path.endswith("/arch/arm/boot/compressed/piggy.o")
+            for output in action.outputs.to_list()
+        ])
+    ]
+    asserts.equals(env, 1, len(zstd_actions))
+    asserts.equals(env, 1, len(append_actions))
+    asserts.equals(env, 1, len(piggy_actions))
+    if zstd_actions:
+        asserts.true(env, "-22" in zstd_actions[0].argv)
+        asserts.true(env, "--ultra" in zstd_actions[0].argv)
+        asserts.true(env, "-stdin" in zstd_actions[0].argv)
+        asserts.true(env, any([
+            output.path.endswith("/arch/arm/boot/compressed/piggy_data.zst")
+            for output in zstd_actions[0].outputs.to_list()
+        ]))
+    if append_actions:
+        asserts.true(env, any([
+            output.path.endswith("/arch/arm/boot/compressed/piggy_data")
+            for output in append_actions[0].outputs.to_list()
+        ]))
+    if piggy_actions:
+        asserts.true(env, any([
+            input.path.endswith("/arch/arm/boot/compressed/piggy_data")
+            for input in piggy_actions[0].inputs.to_list()
+        ]))
+    asserts.true(env, any([
+        output.path.endswith(".zImage")
+        for output in target[DefaultInfo].files.to_list()
+    ]))
     return analysistest.end(env)
 
 _arm_compressed_flagfilter_test = analysistest.make(
@@ -1295,7 +1336,7 @@ def linux_objects_fail_closed_test_suite(name):
         config_flags = {
             "CONFIG_ARM": "y",
             "CONFIG_AUTO_ZRELADDR": "y",
-            "CONFIG_KERNEL_GZIP": "y",
+            "CONFIG_KERNEL_ZSTD": "y",
         },
         tags = fixture_tags,
     )

@@ -1,7 +1,7 @@
 """Private configured-kernel module finalization rule."""
 
 load("@rules_cc//cc:find_cc_toolchain.bzl", "use_cc_toolchain")
-load(":architecture_profiles.bzl", "linux_arch_values")
+load(":architecture_profiles.bzl", "linux_arch_values", "linux_architecture_profile_for_arch")
 load(":linux_module_actions.bzl", "linux_module_actions")
 load(":linux_objects.bzl", "linux_module_cc_helpers")
 load(
@@ -519,6 +519,19 @@ def _builtin_module_metadata(ctx, cc_toolchain, vmlinux):
 
 def _linux_module_sdk_impl(ctx):
     vmlinux = ctx.attr.vmlinux[LinuxVmlinuxInfo]
+    profile = linux_architecture_profile_for_arch(ctx.attr.arch)
+    if vmlinux.arch != profile.name or vmlinux.srcarch != profile.srcarch:
+        fail(
+            "%s declares Linux ARCH %s (profile %s, SRCARCH %s), but %s provides profile %s and SRCARCH %s" % (
+                ctx.label,
+                ctx.attr.arch,
+                profile.name,
+                profile.srcarch,
+                ctx.attr.vmlinux.label,
+                vmlinux.arch,
+                vmlinux.srcarch,
+            ),
+        )
     modules = linux_module_actions.module_map(vmlinux.module_objects)
     target = linux_module_actions.target_context(ctx, linux_module_cc_helpers)
     target_c_flags = linux_module_actions.target_c_flags(

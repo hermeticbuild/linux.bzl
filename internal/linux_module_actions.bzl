@@ -23,6 +23,13 @@ _MODPOST_SOURCES = [
 
 _PAHOLE_BTF_FEATURES = "encode_force,var,float,enum64,decl_tag,type_tag,optimized_func,consistent_func,decl_tag_kfuncs"
 
+def _kernel_elf_class(arch):
+    if arch == "armv7":
+        return "ELFCLASS32"
+    if arch in ["aarch64", "ppc64le", "riscv64", "x86_64"]:
+        return "ELFCLASS64"
+    fail("unsupported configured Linux architecture for modpost ELF class: %s" % arch)
+
 def _execroot_path(file):
     path = file.short_path.replace("\\", "/")
     if path.startswith("../"):
@@ -269,7 +276,7 @@ def _devicetable_offsets(ctx, helpers, kernel, target, source_files):
 def _build_modpost(ctx, helpers, kernel, target, source_files):
     devicetable_offsets = _devicetable_offsets(ctx, helpers, kernel, target, source_files)
     elfconfig = ctx.actions.declare_file(ctx.label.name + ".module_prep/scripts/mod/elfconfig.h")
-    ctx.actions.write(elfconfig, "#define KERNEL_ELFCLASS ELFCLASS64\n")
+    ctx.actions.write(elfconfig, "#define KERNEL_ELFCLASS %s\n" % _kernel_elf_class(kernel.arch))
 
     host_cc = host_cc_toolchain(ctx)
     host_features = cc_common.configure_features(
@@ -706,6 +713,7 @@ def _prepare(ctx, helpers, kernel):
 
 linux_module_actions = struct(
     compile_module_c = _compile_module_c,
+    kernel_elf_class = _kernel_elf_class,
     module_metadata_sanitizer_flags = _module_metadata_sanitizer_flags,
     modpost_args = _modpost_args,
     module_map = _module_map,

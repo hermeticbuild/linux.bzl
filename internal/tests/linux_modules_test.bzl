@@ -2,8 +2,8 @@
 
 load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts", "unittest")
 load("//internal:linux_module_actions.bzl", "linux_module_actions")
-load("//internal:linux_modules.bzl", "linux_module")
-load("//internal:providers.bzl", "LinuxModuleInfo", "LinuxModuleSdkInfo")
+load("//internal:linux_modules.bzl", "linux_module", "linux_module_sdk")
+load("//internal:providers.bzl", "LinuxModuleInfo", "LinuxModuleSdkInfo", "LinuxVmlinuxInfo")
 
 visibility("private")
 
@@ -76,6 +76,22 @@ _fake_module_kernel = rule(
     implementation = _fake_module_kernel_impl,
     attrs = {
         "kernel_key": attr.string(mandatory = True),
+    },
+)
+
+def _fake_vmlinux_impl(ctx):
+    return [
+        LinuxVmlinuxInfo(
+            arch = ctx.attr.arch,
+            srcarch = ctx.attr.srcarch,
+        ),
+    ]
+
+_fake_vmlinux = rule(
+    implementation = _fake_vmlinux_impl,
+    attrs = {
+        "arch": attr.string(mandatory = True),
+        "srcarch": attr.string(mandatory = True),
     },
 )
 
@@ -160,6 +176,9 @@ def _module_command_flags_test_impl(ctx):
             extra_args = ["--custom"],
         ),
     )
+    asserts.equals(env, "ELFCLASS32", linux_module_actions.kernel_elf_class("armv7"))
+    for arch in ["aarch64", "ppc64le", "riscv64", "x86_64"]:
+        asserts.equals(env, "ELFCLASS64", linux_module_actions.kernel_elf_class(arch))
     return unittest.end(env)
 
 _module_command_flags_test = unittest.make(_module_command_flags_test_impl)
@@ -296,10 +315,22 @@ def _module_sanitizer_flags_test_impl(ctx):
 
 _module_sanitizer_flags_test = unittest.make(_module_sanitizer_flags_test_impl)
 
+def _module_sdk_arch_failure_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    asserts.expect_failure(env, "declares Linux ARCH arm (profile armv7, SRCARCH arm), but")
+    return analysistest.end(env)
+
+_module_sdk_arch_failure_test = analysistest.make(
+    _module_sdk_arch_failure_test_impl,
+    expect_failure = True,
+)
+
 def linux_module_test_suite(name):
     kernel = name + "_kernel"
     dependency = name + "_foreign_dependency"
     module = name + "_module"
+    mismatched_vmlinux = name + "_mismatched_vmlinux"
+    mismatched_sdk = name + "_mismatched_sdk"
 
     _fake_module_kernel(
         name = kernel,
@@ -309,6 +340,19 @@ def linux_module_test_suite(name):
     _fake_linux_module(
         name = dependency,
         kernel_key = "kernel-b",
+        tags = ["manual"],
+    )
+    _fake_vmlinux(
+        name = mismatched_vmlinux,
+        arch = "x86_64",
+        srcarch = "x86",
+        tags = ["manual"],
+    )
+    linux_module_sdk(
+        name = mismatched_sdk,
+        arch = "arm",
+        version = "6.18.39",
+        vmlinux = ":" + mismatched_vmlinux,
         tags = ["manual"],
     )
     linux_module(
@@ -330,6 +374,11 @@ def linux_module_test_suite(name):
     _module_btf_flags_test(name = btf_flags_test)
     sanitizer_flags_test = name + "_sanitizer_flags_test"
     _module_sanitizer_flags_test(name = sanitizer_flags_test)
+    sdk_arch_failure_test = name + "_sdk_arch_failure_test"
+    _module_sdk_arch_failure_test(
+        name = sdk_arch_failure_test,
+        target_under_test = ":" + mismatched_sdk,
+    )
 
     native.test_suite(
         name = name,
@@ -339,5 +388,6 @@ def linux_module_test_suite(name):
             ":" + command_flags_test,
             ":" + root_objtool_policy_test,
             ":" + sanitizer_flags_test,
+            ":" + sdk_arch_failure_test,
         ],
     )
