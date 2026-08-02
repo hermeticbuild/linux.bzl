@@ -20,6 +20,7 @@ load(
     "linux_compile_environment_index",
     "linux_compressed_image",
     "linux_config",
+    "linux_generic_generated_headers",
     "linux_object",
     "linux_source_input_index",
     "linux_source_tree",
@@ -487,6 +488,54 @@ _generated_header_earliest_reuse_test = analysistest.make(
         "later_generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
     },
 )
+
+def _generic_generated_header_anchors_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    info = analysistest.target_under_test(env)[LinuxGeneratedHeadersInfo]
+    arch_uapi_suffix = "/arch/%s/include/generated/uapi" % ctx.attr.arch
+    arch_uapi_dirs = [
+        include_dir
+        for include_dir in info.include_dirs
+        if include_dir.endswith(arch_uapi_suffix)
+    ]
+    asserts.equals(env, 1, len(arch_uapi_dirs))
+    for include_dir in info.include_dirs:
+        asserts.true(
+            env,
+            include_dir in info.include_dir_anchors,
+            "generated include directory lacks a file-backed anchor: %s" % include_dir,
+        )
+    return analysistest.end(env)
+
+_generic_generated_header_anchors_test = analysistest.make(
+    _generic_generated_header_anchors_test_impl,
+    attrs = {
+        "arch": attr.string(mandatory = True),
+    },
+)
+
+def _generic_generated_headers_fixture(name, arch, config, tags):
+    kwargs = {
+        "name": name,
+        "arch": arch,
+        "asm_offsets_c": "linux_objects_test_fixture.c",
+        "bounds_c": "linux_objects_test_fixture.c",
+        "config": config,
+        "family_content_ids": {
+            "all": "abababababababababababababababababababababababababababababababab",
+        },
+        "rq_offsets_c": "linux_objects_test_fixture.c",
+        "source_root": "linux_objects_test_fixture.c",
+        "syscall_tbl": "linux_objects_test_fixture.c",
+        "tags": tags,
+        "uts_machine": arch,
+    }
+    if arch == "arm":
+        kwargs.update({
+            "mach_types": "linux_objects_test_fixture.c",
+            "vdsomunge": "//internal/cmd/runandwrite",
+        })
+    linux_generic_generated_headers(**kwargs)
 
 def _x86_generated_headers_fixture(
         name,
@@ -1019,6 +1068,22 @@ def linux_objects_fail_closed_test_suite(name):
         },
         tags = fixture_tags,
     )
+    generic_header_tests = []
+    for arch in ["arm", "powerpc"]:
+        generic_headers = name + "_%s_generated_headers" % arch
+        _generic_generated_headers_fixture(
+            name = generic_headers,
+            arch = arch,
+            config = ":" + equivalent_config,
+            tags = fixture_tags,
+        )
+        generic_headers_test = generic_headers + "_anchors_test"
+        _generic_generated_header_anchors_test(
+            name = generic_headers_test,
+            arch = arch,
+            target_under_test = ":" + generic_headers,
+        )
+        generic_header_tests.append(":" + generic_headers_test)
     failure_cases = [
         (empty_image, "requires at least one compiled object"),
         (certificate_object, "hermetic certificate embedding and signing are not implemented"),
@@ -1035,7 +1100,7 @@ def linux_objects_fail_closed_test_suite(name):
         ":" + indexed_assembly_object_test,
         ":" + indexed_object_test,
         ":" + precise_family_object_test,
-    ]
+    ] + generic_header_tests
 
     base_header_family_ids = {
         "all": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

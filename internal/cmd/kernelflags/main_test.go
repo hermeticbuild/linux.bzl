@@ -19,8 +19,10 @@ const testKernelVersion = "6.18.2"
 
 func TestKernelFlagsConfigSymbolsCoverSource(t *testing.T) {
 	known := map[string]bool{}
-	for _, symbol := range kconfig.KernelFlagsConfigSymbols() {
-		known[symbol] = true
+	for _, arch := range []string{"arm", "arm64", "powerpc", "riscv", "x86"} {
+		for _, symbol := range kconfig.KernelFlagsConfigSymbols(arch) {
+			known[symbol] = true
+		}
 	}
 	// Batch payload materialization reproduces kernel.release, whose footprint
 	// is already tracked with the generated-header inputs rather than global
@@ -29,6 +31,31 @@ func TestKernelFlagsConfigSymbolsCoverSource(t *testing.T) {
 	for _, token := range regexp.MustCompile(`CONFIG_[A-Za-z0-9_]+`).FindAllString(kernelflagsSource, -1) {
 		if !known[token] {
 			t.Errorf("kernelflags reads %s but it is absent from kconfig.KernelFlagsConfigSymbols()", token)
+		}
+	}
+}
+
+func TestKernelFlagsConfigSymbolsAreArchitectureScoped(t *testing.T) {
+	x86 := map[string]bool{}
+	for _, symbol := range kconfig.KernelFlagsConfigSymbols("x86") {
+		x86[symbol] = true
+	}
+	for _, unwanted := range []string{"CONFIG_AEABI", "CONFIG_PPC64_ELF_ABI_V2", "CONFIG_RISCV_ISA_C"} {
+		if x86[unwanted] {
+			t.Errorf("x86 compiler footprint unexpectedly contains %s", unwanted)
+		}
+	}
+	for arch, want := range map[string]string{
+		"arm":     "CONFIG_AEABI",
+		"powerpc": "CONFIG_PPC64_ELF_ABI_V2",
+		"riscv":   "CONFIG_RISCV_ISA_C",
+	} {
+		found := false
+		for _, symbol := range kconfig.KernelFlagsConfigSymbols(arch) {
+			found = found || symbol == want
+		}
+		if !found {
+			t.Errorf("%s compiler footprint is missing %s", arch, want)
 		}
 	}
 }

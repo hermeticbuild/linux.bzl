@@ -18,6 +18,8 @@ filegroup(
         "arch/arm64/kernel/vdso/**",
         "arch/arm64/kernel/vdso32/**",
         "arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
+        "arch/riscv/kernel/compat_vdso/**",
+        "arch/riscv/kernel/vdso/**",
         "arch/x86/boot/**",
         "arch/x86/entry/vdso/**",
         "arch/x86/coco/sev/vc-shared.c",
