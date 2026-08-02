@@ -22,8 +22,6 @@ def _architecture_linking_test_impl(ctx):
     descriptors = {descriptor.config_name: descriptor for descriptor in linux_architectures()}
     asserts.equals(env, "arm_zimage", descriptors["armv7"].compressed_format)
     asserts.equals(env, "zImage", descriptors["armv7"].extension)
-    asserts.equals(env, "vmlinux", descriptors["riscv64"].compressed_format)
-    asserts.equals(env, "vmlinux", descriptors["ppc64le"].compressed_format)
     return unittest.end(env)
 
 architecture_linking_test = unittest.make(_architecture_linking_test_impl)

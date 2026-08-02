@@ -177,7 +177,7 @@ def _module_command_flags_test_impl(ctx):
         ),
     )
     asserts.equals(env, "ELFCLASS32", linux_module_actions.kernel_elf_class("armv7"))
-    for arch in ["aarch64", "ppc64le", "riscv64", "x86_64"]:
+    for arch in ["aarch64", "x86_64"]:
         asserts.equals(env, "ELFCLASS64", linux_module_actions.kernel_elf_class(arch))
     return unittest.end(env)
 
