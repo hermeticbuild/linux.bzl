@@ -163,6 +163,31 @@ func TestLinuxAFlagsX86IncludeFtraceUsingDefines(t *testing.T) {
 	}
 }
 
+func TestLinuxX86ArchitectureCompilerFlagsAreCOnly(t *testing.T) {
+	config := map[string]string{"CONFIG_X86_64": "y"}
+	cflags := linuxCFlags(config, "x86", testKernelVersion)
+	aflags := linuxAFlags(config, "x86", testKernelVersion)
+	for _, flag := range []string{
+		"-mcmodel=kernel",
+		"-march=x86-64",
+		"-mtune=generic",
+		"-mno-red-zone",
+		"-mno-sse",
+	} {
+		if !contains(cflags, flag) {
+			t.Errorf("linuxCFlags() missing %s", flag)
+		}
+		if contains(aflags, flag) {
+			t.Errorf("linuxAFlags() contains C-only %s", flag)
+		}
+	}
+	for _, flag := range []string{"-D__ASSEMBLY__", "-fno-PIE", "-m64"} {
+		if !contains(aflags, flag) {
+			t.Errorf("linuxAFlags() missing %s", flag)
+		}
+	}
+}
+
 func TestLinuxCFlagsX86IncludeFtraceCompilerAndUsingFlags(t *testing.T) {
 	config := map[string]string{
 		"CONFIG_FUNCTION_TRACER":      "y",

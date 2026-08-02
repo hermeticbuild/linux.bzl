@@ -555,10 +555,20 @@ func linuxAFlags(config map[string]string, arch, version string) []string {
 	case "riscv":
 		return append(riscvAFlags(config), debugInfoFlags(config)...)
 	case "x86":
-		return append(append(x86CFlags(config, version), ftraceUsingFlags(config)...), debugInfoFlags(config)...)
+		return append(x86AFlags(config), debugInfoFlags(config)...)
 	default:
 		return nil
 	}
+}
+
+func x86AFlags(config map[string]string) []string {
+	flags := []string{"-D__ASSEMBLY__", "-fno-PIE"}
+	if enabled(config, "CONFIG_X86_64") {
+		flags = append(flags, "-m64")
+	} else {
+		flags = append(flags, "-m32")
+	}
+	return append(flags, ftraceUsingFlags(config)...)
 }
 
 func armArchitecture(config map[string]string) (string, string) {
