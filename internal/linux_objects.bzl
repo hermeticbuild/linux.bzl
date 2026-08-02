@@ -856,6 +856,11 @@ def _linux_generated_header_cflags(generated_headers):
         return [generated_headers.cflags]
     return []
 
+def _linux_generated_header_cflags_for_source(generated_headers, src):
+    if _is_assembly_source(src):
+        return []
+    return _linux_generated_header_cflags(generated_headers)
+
 def _linux_filtered_config_flags_for_source(ctx, config, src, remove_flags, out_suffix = "filtered", remove_prefixes = []):
     if not config:
         return struct(flags = [], inputs = [])
@@ -1689,7 +1694,7 @@ def _linux_vdso_linker_script(ctx, compiler, cc_toolchain, feature_configuration
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
     args.add_all(_linux_config_cflags(config), format_each = "@%s")
-    args.add_all(_linux_generated_header_cflags(generated_headers), format_each = "@%s")
+    args.add_all(_linux_generated_header_cflags_for_source(generated_headers, src), format_each = "@%s")
     args.add_all([
         "-E",
         "-P",
@@ -5980,7 +5985,7 @@ def _linux_object_impl(ctx):
     args = ctx.actions.args()
     args.add_all(base_flags)
     args.add_all(config_flag_inputs.flags, format_each = "@%s")
-    args.add_all(_linux_generated_header_cflags(generated_headers), format_each = "@%s")
+    args.add_all(_linux_generated_header_cflags_for_source(generated_headers, src), format_each = "@%s")
     args.add_all(_linux_module_flags(ctx.attr.mode))
     args.add_all(_linux_object_name_flags(compile_object, ctx.attr.modname))
     if config and not source_root:
@@ -6998,7 +7003,7 @@ def _linux_vmlinux_compile_source(
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
     args.add_all(_linux_config_flags_for_source(config, src), format_each = "@%s")
-    args.add_all(_linux_generated_header_cflags(generated_headers), format_each = "@%s")
+    args.add_all(_linux_generated_header_cflags_for_source(generated_headers, src), format_each = "@%s")
     args.add_all(_linux_object_name_flags(object_name))
     args.add_all(_linux_source_preinclude_flags_for_root(source_root, assembly))
     _add_config_include_flag(args, config)
