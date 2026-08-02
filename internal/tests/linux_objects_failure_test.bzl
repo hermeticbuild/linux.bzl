@@ -237,6 +237,26 @@ _fake_arm_compressed_source_inputs = rule(
     implementation = _fake_arm_compressed_source_inputs_impl,
 )
 
+def _fake_arm_vdso_source_inputs_impl(ctx):
+    files = []
+    for path in [
+        "arch/arm/vdso/note.c",
+        "arch/arm/vdso/vdso.lds.S",
+        "arch/arm/vdso/vgettimeofday.c",
+        "include/linux/compiler-version.h",
+        "include/linux/compiler_types.h",
+        "include/linux/kconfig.h",
+        "lib/vdso/gettimeofday.c",
+    ]:
+        out = ctx.actions.declare_file(ctx.label.name + ".source/" + path)
+        ctx.actions.write(out, "")
+        files.append(out)
+    return [DefaultInfo(files = depset(files))]
+
+_fake_arm_vdso_source_inputs = rule(
+    implementation = _fake_arm_vdso_source_inputs_impl,
+)
+
 def _fake_powerpc_vdso_source_inputs_impl(ctx):
     files = []
     for path in [
@@ -697,6 +717,37 @@ def _arm_compressed_flagfilter_test_impl(ctx):
 
 _arm_compressed_flagfilter_test = analysistest.make(
     _arm_compressed_flagfilter_test_impl,
+)
+
+def _arm_vdso_actions_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = analysistest.target_actions(env)
+    compile_actions = [
+        action
+        for action in actions
+        if action.mnemonic == "LinuxARMVDSOCompile" and any([
+            output.path.endswith("/arch/arm/vdso/vgettimeofday.o")
+            for output in action.outputs.to_list()
+        ])
+    ]
+    asserts.equals(env, 1, len(compile_actions))
+    if compile_actions:
+        action = compile_actions[0]
+        generic_source = "/lib/vdso/gettimeofday.c"
+        force_include_indices = [
+            index
+            for index in range(len(action.argv) - 1)
+            if action.argv[index] == "-include" and action.argv[index + 1].endswith(generic_source)
+        ]
+        asserts.equals(env, 1, len(force_include_indices))
+        asserts.true(env, any([
+            input.path.endswith(generic_source)
+            for input in action.inputs.to_list()
+        ]))
+    return analysistest.end(env)
+
+_arm_vdso_actions_test = analysistest.make(
+    _arm_vdso_actions_test_impl,
 )
 
 def _powerpc_vdso_actions_test_impl(ctx):
@@ -1391,6 +1442,48 @@ def linux_objects_fail_closed_test_suite(name):
         target_under_test = ":" + arm_compressed_image,
     )
     generic_header_tests.append(":" + arm_compressed_image_test)
+
+    arm_vdso_config = name + "_arm_vdso_config"
+    linux_config(
+        name = arm_vdso_config,
+        arch = "arm",
+        config_flags = {
+            "CONFIG_ARM": "y",
+            "CONFIG_GENERIC_GETTIMEOFDAY": "y",
+            "CONFIG_VDSO": "y",
+        },
+        tags = fixture_tags,
+    )
+    arm_vdso_sources = name + "_arm_vdso_sources"
+    _fake_arm_vdso_source_inputs(
+        name = arm_vdso_sources,
+        tags = fixture_tags,
+    )
+    arm_vdso_headers = name + "_arm_vdso_headers"
+    linux_generic_generated_headers(
+        name = arm_vdso_headers,
+        arch = "arm",
+        asm_offsets_c = "linux_objects_test_fixture.c",
+        bounds_c = "linux_objects_test_fixture.c",
+        config = ":" + arm_vdso_config,
+        family_content_ids = {
+            "all": "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc",
+        },
+        mach_types = "linux_objects_test_fixture.c",
+        rq_offsets_c = "linux_objects_test_fixture.c",
+        source_root = "linux_objects_test_fixture.c",
+        source_tree = [":" + arm_vdso_sources],
+        syscall_tbl = "linux_objects_test_fixture.c",
+        tags = fixture_tags,
+        uts_machine = "armv7l",
+        vdsomunge = "//internal/cmd/runandwrite",
+    )
+    arm_vdso_headers_test = arm_vdso_headers + "_actions_test"
+    _arm_vdso_actions_test(
+        name = arm_vdso_headers_test,
+        target_under_test = ":" + arm_vdso_headers,
+    )
+    generic_header_tests.append(":" + arm_vdso_headers_test)
 
     powerpc_vdso_config = name + "_powerpc_vdso_config"
     linux_config(
