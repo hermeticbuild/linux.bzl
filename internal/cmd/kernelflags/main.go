@@ -923,11 +923,6 @@ func arm64AFlags(config map[string]string) []string {
 	} else {
 		flags = append(flags, "-fno-asynchronous-unwind-tables", "-fno-unwind-tables")
 	}
-	asmArch := "armv8.4-a"
-	if enabled(config, "CONFIG_AS_HAS_ARMV8_5") {
-		asmArch = "armv8.5-a"
-	}
-	flags = append(flags, "-Wa,-march="+asmArch, "-DARM64_ASM_ARCH=\\\""+asmArch+"\\\"")
 	if enabled(config, "CONFIG_SHADOW_CALL_STACK") {
 		flags = append(flags, "-ffixed-x18")
 	}

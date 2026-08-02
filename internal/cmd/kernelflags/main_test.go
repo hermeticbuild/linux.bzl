@@ -315,6 +315,22 @@ func TestLinuxCFlagsIncludeClangThinLTO(t *testing.T) {
 	}
 }
 
+func TestLinuxArm64ArchitectureFlagsAreCOnly(t *testing.T) {
+	config := map[string]string{"CONFIG_AS_HAS_ARMV8_5": "y"}
+	want := []string{
+		"-Wa,-march=armv8.5-a",
+		"-DARM64_ASM_ARCH=\\\"armv8.5-a\\\"",
+	}
+	for _, flag := range want {
+		if !contains(linuxCFlags(config, "arm64", testKernelVersion), flag) {
+			t.Errorf("linuxCFlags() missing %s", flag)
+		}
+		if contains(linuxAFlags(config, "arm64", testKernelVersion), flag) {
+			t.Errorf("linuxAFlags() contains C-only %s", flag)
+		}
+	}
+}
+
 func TestLinuxCFlagsIncludeClangFullLTO(t *testing.T) {
 	config := map[string]string{
 		"CONFIG_CC_IS_CLANG":    "y",

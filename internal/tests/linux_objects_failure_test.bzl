@@ -24,8 +24,10 @@ load(
     "linux_object",
     "linux_source_input_index",
     "linux_source_tree",
+    "linux_vmlinux",
     "linux_x86_generated_headers",
 )
+load("//internal:linux_rust.bzl", "linux_disabled_rust_kernel_sdk")
 
 visibility("private")
 
@@ -43,6 +45,17 @@ def _fake_linux_image_impl(ctx):
     ]
 
 _fake_linux_image = rule(implementation = _fake_linux_image_impl)
+
+def _fake_vmlinux_source_inputs_impl(ctx):
+    version = ctx.actions.declare_file(
+        ctx.label.name + ".source/init/version-timestamp.c",
+    )
+    ctx.actions.write(version, "")
+    return [DefaultInfo(files = depset([version]))]
+
+_fake_vmlinux_source_inputs = rule(
+    implementation = _fake_vmlinux_source_inputs_impl,
+)
 
 def _fake_linux_object_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".o")
@@ -370,6 +383,30 @@ def _image_output_groups_test_impl(ctx):
     return analysistest.end(env)
 
 _image_output_groups_test = analysistest.make(_image_output_groups_test_impl)
+
+def _arm_vmlinux_text_offset_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxVmlinuxLinkerScript"
+    ]
+    asserts.equals(env, 1, len(actions))
+    if actions:
+        offsets = [
+            arg
+            for arg in actions[0].argv
+            if arg.startswith("-DTEXT_OFFSET=")
+        ]
+        asserts.equals(env, ["-DTEXT_OFFSET=" + ctx.attr.expected], offsets)
+    return analysistest.end(env)
+
+_arm_vmlinux_text_offset_test = analysistest.make(
+    _arm_vmlinux_text_offset_test_impl,
+    attrs = {
+        "expected": attr.string(mandatory = True),
+    },
+)
 
 def _content_addressed_object_test_impl(ctx):
     env = analysistest.begin(ctx)
@@ -798,6 +835,8 @@ def _powerpc_vdso_actions_test_impl(ctx):
     asserts.equals(env, 10, len(compile64))
     asserts.equals(env, 1, len(link32))
     asserts.equals(env, 1, len(link64))
+    for action in compile64:
+        asserts.false(env, "-ffixed-r30" in action.argv)
     if link32:
         asserts.true(env, "elf32lppc" in link32[0].argv)
         asserts.true(env, "--eh-frame-hdr" in link32[0].argv)
@@ -1441,6 +1480,7 @@ def linux_objects_fail_closed_test_suite(name):
     arm_compressed_headers = name + "_arm_compressed_headers"
     _fake_generated_headers(
         name = arm_compressed_headers,
+        arch = "arm",
         family_content_id = header_family_id,
         tags = fixture_tags,
     )
@@ -1469,6 +1509,60 @@ def linux_objects_fail_closed_test_suite(name):
         target_under_test = ":" + arm_compressed_image,
     )
     generic_header_tests.append(":" + arm_compressed_image_test)
+
+    arm_vmlinux_sources = name + "_arm_vmlinux_sources"
+    _fake_vmlinux_source_inputs(
+        name = arm_vmlinux_sources,
+        tags = fixture_tags,
+    )
+    arm_vmlinux_rust_sdk = name + "_arm_vmlinux_rust_sdk"
+    linux_disabled_rust_kernel_sdk(
+        name = arm_vmlinux_rust_sdk,
+        tags = fixture_tags,
+    )
+    for suffix, expected_offset, extra_config_flags in [
+        ("default", "0x00008000", {}),
+        ("realtek", "0x00108000", {"CONFIG_ARCH_REALTEK": "y"}),
+    ]:
+        config_flags = {"CONFIG_ARM": "y"}
+        config_flags.update(extra_config_flags)
+        arm_vmlinux_config = name + "_arm_vmlinux_" + suffix + "_config"
+        linux_config(
+            name = arm_vmlinux_config,
+            arch = "arm",
+            config_flags = config_flags,
+            tags = fixture_tags,
+            version = "6.12.0",
+        )
+        arm_vmlinux = name + "_arm_vmlinux_" + suffix
+        linux_vmlinux(
+            name = arm_vmlinux,
+            arch = "arm",
+            config = ":" + arm_vmlinux_config,
+            format = "armv7",
+            generated_headers = ":" + arm_compressed_headers,
+            image = ":" + image,
+            kallsyms = "false",
+            linker_script = "linux_objects_test_fixture.S",
+            rust_sdk = ":" + arm_vmlinux_rust_sdk,
+            source_root = "linux_objects_test_fixture.c",
+            source_tree = [
+                ":" + arm_vmlinux_sources,
+                "include/linux/compiler-version.h",
+                "include/linux/compiler_types.h",
+                "include/linux/kconfig.h",
+            ],
+            srcarch = "arm",
+            tags = fixture_tags,
+            version = "6.12.0",
+        )
+        arm_vmlinux_test = arm_vmlinux + "_text_offset_test"
+        _arm_vmlinux_text_offset_test(
+            name = arm_vmlinux_test,
+            expected = expected_offset,
+            target_under_test = ":" + arm_vmlinux,
+        )
+        generic_header_tests.append(":" + arm_vmlinux_test)
 
     arm_vdso_config = name + "_arm_vdso_config"
     linux_config(
