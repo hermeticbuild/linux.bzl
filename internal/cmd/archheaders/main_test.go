@@ -57,9 +57,9 @@ func TestGenerateArchitectureCFlags(t *testing.T) {
 
 func TestARMKernelBSSSize(t *testing.T) {
 	size, err := armKernelBSSSize([]elf.Symbol{
-		{Name: "__bss_stop", Value: 0x1240},
+		{Name: "__bss_stop", Value: 0x1240, Section: 1},
 		{Name: "unrelated", Value: 7},
-		{Name: "__bss_start", Value: 0x1000},
+		{Name: "__bss_start", Value: 0x1000, Section: 1},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -71,8 +71,8 @@ func TestARMKernelBSSSize(t *testing.T) {
 
 func TestARMKernelBSSSizeRejectsInvalidSymbols(t *testing.T) {
 	for _, symbols := range [][]elf.Symbol{
-		{{Name: "__bss_start", Value: 1}},
-		{{Name: "__bss_start", Value: 2}, {Name: "__bss_stop", Value: 1}},
+		{{Name: "__bss_start", Value: 1, Section: 1}},
+		{{Name: "__bss_start", Value: 2, Section: 1}, {Name: "__bss_stop", Value: 1, Section: 1}},
 	} {
 		if _, err := armKernelBSSSize(symbols); err == nil {
 			t.Fatalf("armKernelBSSSize(%v) unexpectedly succeeded", symbols)
@@ -94,5 +94,29 @@ func TestARMTextOffset(t *testing.T) {
 		if got := armTextOffset(test.config); got != test.want {
 			t.Errorf("armTextOffset(%v) = %#x, want %#x", test.config, got, test.want)
 		}
+	}
+}
+
+func TestRISCVVDSOOffsets(t *testing.T) {
+	symbols := []elf.Symbol{
+		{Name: "__vdso_rt_sigreturn", Value: 0x40, Section: 1},
+		{Name: "ignored", Value: 1, Section: 1},
+		{Name: "__vdso_undefined", Value: 0, Section: elf.SHN_UNDEF},
+		{Name: "__vdso_getcpu", Value: 0x20, Section: 1},
+	}
+	out, err := riscvVDSOOffsets(symbols, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "#define __vdso_getcpu_offset\t0x20\n#define __vdso_rt_sigreturn_offset\t0x40\n"
+	if string(out) != want {
+		t.Fatalf("riscvVDSOOffsets() = %q, want %q", out, want)
+	}
+	compat, err := riscvVDSOOffsets(symbols, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(compat), "compat__vdso_getcpu_offset") {
+		t.Fatalf("compat RISC-V vDSO offsets have wrong prefix: %q", compat)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -22,6 +23,9 @@ func main() {
 	cflagsOut := flag.String("cflags_out", "", "Generated architecture C flags response file")
 	armVmlinux := flag.String("arm_vmlinux", "", "ARM vmlinux ELF used to derive compressed-image link symbols")
 	armLinkFlagsOut := flag.String("arm_link_flags_out", "", "Generated ARM compressed-image linker response file")
+	vdsoELF := flag.String("riscv_vdso_elf", "", "RISC-V vDSO ELF used to derive symbol offsets")
+	vdsoOffsetsOut := flag.String("riscv_vdso_offsets_out", "", "Generated RISC-V vDSO offsets header")
+	vdsoCompat := flag.Bool("riscv_vdso_compat", false, "Prefix RISC-V vDSO offsets for the compat image")
 	machTypes := flag.String("mach_types", "", "arch/arm/tools/mach-types input")
 	machTypesOut := flag.String("mach_types_out", "", "Generated asm/mach-types.h output")
 	syscallTable := flag.String("syscall_table", "", "arch/arm/tools/syscall.tbl input")
@@ -31,10 +35,12 @@ func main() {
 	cflagsMode := *arch != "" || *asmOffsets != "" || *cflagsOut != ""
 	armMode := *machTypes != "" || *machTypesOut != "" || *syscallTable != "" || *syscallNROut != ""
 	armLinkMode := *armVmlinux != "" || *armLinkFlagsOut != ""
+	vdsoOffsetsMode := *vdsoELF != "" || *vdsoOffsetsOut != "" || *vdsoCompat
 	if cflagsMode != (*arch != "" && *asmOffsets != "" && *configPath != "" && *cflagsOut != "") ||
 		armMode != (*machTypes != "" && *machTypesOut != "" && *syscallTable != "" && *syscallNROut != "") ||
 		armLinkMode != (*armVmlinux != "" && *armLinkFlagsOut != "" && *configPath != "") ||
-		(!cflagsMode && !armMode && !armLinkMode) {
+		vdsoOffsetsMode != (*vdsoELF != "" && *vdsoOffsetsOut != "") ||
+		(!cflagsMode && !armMode && !armLinkMode && !vdsoOffsetsMode) {
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
@@ -87,6 +93,16 @@ func main() {
 		}
 		if err := writeFile(*armLinkFlagsOut, generated); err != nil {
 			fatal("write ARM compressed-image link flags", err)
+		}
+	}
+
+	if vdsoOffsetsMode {
+		generated, err := generateRISCVVDSOOffsets(*vdsoELF, *vdsoCompat)
+		if err != nil {
+			fatal("generate RISC-V vDSO offsets", err)
+		}
+		if err := writeFile(*vdsoOffsetsOut, generated); err != nil {
+			fatal("write RISC-V vDSO offsets", err)
 		}
 	}
 }
@@ -304,10 +320,56 @@ func generateARMCompressedLinkFlags(vmlinuxPath string, config map[string]string
 	return []byte(strings.Join(flags, "\n") + "\n"), nil
 }
 
+func generateRISCVVDSOOffsets(vdsoPath string, compat bool) ([]byte, error) {
+	file, err := elf.Open(vdsoPath)
+	if err != nil {
+		return nil, fmt.Errorf("open vDSO ELF: %w", err)
+	}
+	defer file.Close()
+	symbols, err := file.Symbols()
+	if err != nil {
+		return nil, fmt.Errorf("read vDSO symbols: %w", err)
+	}
+	return riscvVDSOOffsets(symbols, compat)
+}
+
+func riscvVDSOOffsets(symbols []elf.Symbol, compat bool) ([]byte, error) {
+	lines := []string{}
+	for _, symbol := range symbols {
+		if symbol.Section == elf.SHN_UNDEF || !validVDSOSymbol(symbol.Name) {
+			continue
+		}
+		name := symbol.Name
+		if compat {
+			name = "compat" + name
+		}
+		lines = append(lines, fmt.Sprintf("#define %s_offset\t0x%x", name, symbol.Value))
+	}
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("vDSO ELF contains no __vdso_* symbols")
+	}
+	sort.Strings(lines)
+	return []byte(strings.Join(lines, "\n") + "\n"), nil
+}
+
+func validVDSOSymbol(name string) bool {
+	const prefix = "__vdso_"
+	if !strings.HasPrefix(name, prefix) || len(name) == len(prefix) {
+		return false
+	}
+	for _, char := range name[len(prefix):] {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') && char != '_' {
+			return false
+		}
+	}
+	return true
+}
+
 func armKernelBSSSize(symbols []elf.Symbol) (uint64, error) {
 	values := map[string]uint64{}
 	for _, symbol := range symbols {
-		if symbol.Name == "__bss_start" || symbol.Name == "__bss_stop" {
+		if symbol.Section != elf.SHN_UNDEF && (symbol.Name == "__bss_start" || symbol.Name == "__bss_stop") {
 			values[symbol.Name] = symbol.Value
 		}
 	}

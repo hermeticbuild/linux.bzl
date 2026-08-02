@@ -737,7 +737,9 @@ def _linux_objcopy_flags_for_object(object, arch = ""):
             "--prefix-symbols=__pi_",
             "--remove-section=.note.gnu.property",
         ]
-        if object.split("/")[-1].startswith("lib-"):
+        if arch == "riscv":
+            flags.append("--prefix-alloc-sections=.init.pi")
+        elif object.split("/")[-1].startswith("lib-"):
             flags.append("--prefix-alloc-sections=.init")
         return flags
     if object.endswith(".stub.o"):
@@ -1743,6 +1745,18 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         vdso = _linux_generated_header(generated_headers, "arch/arm/vdso/vdso.so")
         files.append(vdso)
         assembler_include_roots.append(vdso.dirname[:-len("/arch/arm/vdso")])
+        assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(vdso, assembler_include_roots[-1])
+
+    if ctx.attr.object == "arch/riscv/kernel/vdso/vdso.o" and generated_headers:
+        vdso = _linux_generated_header(generated_headers, "arch/riscv/kernel/vdso/vdso.so")
+        files.append(vdso)
+        assembler_include_roots.append(vdso.dirname[:-len("/arch/riscv/kernel/vdso")])
+        assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(vdso, assembler_include_roots[-1])
+
+    if ctx.attr.object == "arch/riscv/kernel/compat_vdso/compat_vdso.o" and generated_headers:
+        vdso = _linux_generated_header(generated_headers, "arch/riscv/kernel/compat_vdso/compat_vdso.so")
+        files.append(vdso)
+        assembler_include_roots.append(vdso.dirname[:-len("/arch/riscv/kernel/compat_vdso")])
         assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(vdso, assembler_include_roots[-1])
 
     if ctx.attr.object == "arch/arm64/kernel/vdso32-wrap.o" and generated_headers:
@@ -3694,7 +3708,7 @@ def _linux_arm_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, ge
     )
     link_args = ctx.actions.args()
     link_args.add_all([
-        "-EL",
+        "-EB" if config.config_flags.get("CONFIG_CPU_BIG_ENDIAN") == "y" else "-EL",
         "-m",
         "armelf_linux_eabi",
         "-Bsymbolic",
@@ -3710,6 +3724,8 @@ def _linux_arm_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, ge
         "-o",
         raw,
     ])
+    if config.config_flags.get("CONFIG_CPU_ENDIAN_BE8") == "y":
+        link_args.add("--be8")
     link_args.add_all(objects)
     path_mapped_run(
         ctx.actions,
@@ -3749,6 +3765,303 @@ def _linux_arm_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, ge
     )
     return so
 
+def _linux_riscv_vdso_compile(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        src,
+        out_relpath,
+        compat = False,
+        force_include = None):
+    compiler = cc_common.get_tool_for_action(
+        feature_configuration = feature_configuration,
+        action_name = C_COMPILE_ACTION_NAME,
+    )
+    out = ctx.actions.declare_file(out_relpath)
+    filtered = struct(flags = [], inputs = [])
+    if not compat:
+        filtered = _linux_filtered_config_flags_for_source(
+            ctx,
+            config,
+            src,
+            _linux_ftrace_remove_flags() + [
+                "-flto",
+                "-flto=thin",
+                "-fsplit-lto-unit",
+                "-fvisibility=hidden",
+                "-fstack-protector",
+                "-fstack-protector-strong",
+            ],
+            out_suffix = "riscv-vdso-" + src.basename,
+        )
+    args = ctx.actions.args()
+    if compat:
+        args.add_all(_linux_compile_flags_without_target(ctx, cc_toolchain, feature_configuration))
+        args.add("--target=riscv32-linux-gnu")
+        args.add("-march=rv32g" if config.config_flags.get("CONFIG_TOOLCHAIN_NEEDS_EXPLICIT_ZICSR_ZIFENCEI") == "y" else "-march=rv32imafd")
+        args.add("-mabi=ilp32")
+    else:
+        args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+        args.add_all(filtered.flags, format_each = "@%s")
+    args.add_all([
+        "-fno-stack-protector",
+        "-DDISABLE_BRANCH_PROFILING",
+        "-fno-builtin",
+    ])
+    if not _is_assembly_source(src):
+        args.add("-fPIC")
+    args.add_all(_linux_source_preinclude_flags_for_root(source_root, _is_assembly_source(src)))
+    if force_include:
+        args.add_all(["-include", force_include])
+    _add_config_include_flag(args, config)
+    _add_linux_source_include_flags_for_root(
+        args,
+        source_root,
+        "riscv",
+        generated_headers.include_dirs,
+        _generated_include_dir_anchors(generated_headers),
+    )
+    args.add("-I" + source_root + "/arch/riscv/kernel/vdso")
+    args.add("-I" + source_root + "/arch/riscv/kernel/compat_vdso")
+    args.add("-I" + source_root + "/lib/vdso")
+    args.add("-c")
+    args.add(src)
+    args.add("-o")
+    args.add(out)
+    extra_inputs = filtered.inputs
+    if force_include:
+        extra_inputs = extra_inputs + [_source_tree_file_for_root(ctx, source_root, force_include[len(source_root) + 1:])]
+    path_mapped_run(
+        ctx.actions,
+        executable = compiler,
+        inputs = depset(
+            _linux_source_tree_inputs(ctx, direct = [src] + extra_inputs),
+            transitive = [cc_toolchain.all_files, config.files, generated_headers.files],
+        ),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxRISCVCompatVDSOCompile" if compat else "LinuxRISCVVDSOCompile",
+        progress_message = "Compiling Linux RISC-V vDSO object %{label}",
+    )
+    return out
+
+def _linux_riscv_vdso_linker_script(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        base,
+        compat):
+    compiler = cc_common.get_tool_for_action(
+        feature_configuration = feature_configuration,
+        action_name = C_COMPILE_ACTION_NAME,
+    )
+    directory = "compat_vdso" if compat else "vdso"
+    name = "compat_vdso" if compat else "vdso"
+    src = _source_tree_file(ctx, "arch/riscv/kernel/%s/%s.lds.S" % (directory, name))
+    out = ctx.actions.declare_file(base + "/arch/riscv/kernel/%s/%s.lds" % (directory, name))
+    args = ctx.actions.args()
+    if compat:
+        args.add_all(_linux_compile_flags_without_target(ctx, cc_toolchain, feature_configuration))
+        args.add("--target=riscv32-linux-gnu")
+    else:
+        args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all([
+        "-E",
+        "-P",
+        "-C",
+        "-Uriscv",
+        "-D__KERNEL__",
+        "-D__ASSEMBLY__",
+        "-DLINKER_SCRIPT",
+    ])
+    if compat:
+        args.add("-DCOMPAT_VDSO")
+    else:
+        args.add("-DHAS_VGETTIMEOFDAY")
+    args.add_all(["-include", source_root + "/include/linux/kconfig.h"])
+    _add_config_include_flag(args, config)
+    _add_linux_source_include_flags_for_root(
+        args,
+        source_root,
+        "riscv",
+        generated_headers.include_dirs,
+        _generated_include_dir_anchors(generated_headers),
+    )
+    args.add("-I" + source_root + "/arch/riscv/kernel/vdso")
+    args.add(src)
+    args.add("-o")
+    args.add(out)
+    path_mapped_run(
+        ctx.actions,
+        executable = compiler,
+        inputs = depset(
+            _linux_source_tree_inputs(ctx, direct = [src]),
+            transitive = [cc_toolchain.all_files, config.files, generated_headers.files],
+        ),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxRISCVCompatVDSOLinkerScript" if compat else "LinuxRISCVVDSOLinkerScript",
+        progress_message = "Preprocessing Linux RISC-V vDSO linker script %{label}",
+    )
+    return out
+
+def _linux_riscv_vdso_offsets(ctx, dbg, base, compat):
+    basename = "compat_vdso-offsets.h" if compat else "vdso-offsets.h"
+    out = ctx.actions.declare_file(base + "/include/generated/" + basename)
+    args = ctx.actions.args()
+    args.add_all([
+        "-riscv_vdso_elf",
+        dbg,
+        "-riscv_vdso_offsets_out",
+        out,
+    ])
+    if compat:
+        args.add("-riscv_vdso_compat")
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._archheaders,
+        inputs = [dbg],
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxRISCVCompatVDSOOffsets" if compat else "LinuxRISCVVDSOOffsets",
+        progress_message = "Generating Linux RISC-V vDSO offsets %{label}",
+    )
+    return out
+
+def _linux_riscv_vdso_link(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        base,
+        compat):
+    directory = "compat_vdso" if compat else "vdso"
+    name = "compat_vdso" if compat else "vdso"
+    symbols = ["rt_sigreturn", "getcpu", "flush_icache"]
+    sources = [symbol + ".S" for symbol in symbols]
+    force_includes = {}
+    if not compat:
+        symbols.extend(["vgettimeofday", "hwprobe", "sys_hwprobe"])
+        sources.extend(["vgettimeofday.c", "hwprobe.c", "sys_hwprobe.S"])
+        if config.config_flags.get("CONFIG_GENERIC_GETTIMEOFDAY") == "y":
+            force_includes["vgettimeofday.c"] = source_root + "/lib/vdso/gettimeofday.c"
+        if config.config_flags.get("CONFIG_VDSO_GETRANDOM") == "y":
+            symbols.append("getrandom")
+            sources.extend(["getrandom.c", "vgetrandom-chacha.S"])
+            force_includes["getrandom.c"] = source_root + "/lib/vdso/getrandom.c"
+    sources.append("note.S")
+    objects = []
+    for source in sources:
+        objects.append(_linux_riscv_vdso_compile(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+            _source_tree_file(ctx, "arch/riscv/kernel/%s/%s" % (directory, source)),
+            base + "/arch/riscv/kernel/%s/%s.o" % (directory, source.rsplit(".", 1)[0]),
+            compat = compat,
+            force_include = force_includes.get(source),
+        ))
+    linker_script = _linux_riscv_vdso_linker_script(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        base,
+        compat,
+    )
+    linker = _linux_x86_tool_sibling(
+        cc_common.get_tool_for_action(
+            feature_configuration = feature_configuration,
+            action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
+        ),
+        "ld.lld",
+    )
+    raw = ctx.actions.declare_file(base + "/arch/riscv/kernel/%s/%s.so.raw" % (directory, name))
+    link_args = ctx.actions.args()
+    link_args.add_all(["-m", "elf32lriscv" if compat else "elf64lriscv", "-shared"])
+    if compat:
+        link_args.add("-S")
+    link_args.add("-soname=linux-compat-vdso.so.1" if compat else "-soname=linux-vdso.so.1")
+    link_args.add_all(["--build-id=sha1", "--eh-frame-hdr"])
+    if compat:
+        link_args.add("--hash-style=both")
+    link_args.add_all(["-T", linker_script, "-o", raw])
+    link_args.add_all(objects)
+    path_mapped_run(
+        ctx.actions,
+        executable = linker,
+        inputs = depset(objects + [linker_script], transitive = [cc_toolchain.all_files]),
+        outputs = [raw],
+        arguments = [link_args],
+        mnemonic = "LinuxRISCVCompatVDSOLink" if compat else "LinuxRISCVVDSOLink",
+        progress_message = "Linking Linux RISC-V vDSO %{label}",
+    )
+    dbg = ctx.actions.declare_file(base + "/arch/riscv/kernel/%s/%s.so.dbg" % (directory, name))
+    keep_args = ctx.actions.args()
+    for symbol in symbols:
+        keep_args.add("-G")
+        keep_args.add(("__compat_vdso_" if compat else "__vdso_") + symbol)
+    keep_args.add_all([raw, dbg])
+    path_mapped_run(
+        ctx.actions,
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [raw],
+        outputs = [dbg],
+        arguments = [keep_args],
+        mnemonic = "LinuxRISCVCompatVDSOSymbols" if compat else "LinuxRISCVVDSOSymbols",
+        progress_message = "Localizing Linux RISC-V vDSO symbols %{label}",
+    )
+    so = ctx.actions.declare_file(base + "/arch/riscv/kernel/%s/%s.so" % (directory, name))
+    strip_args = ctx.actions.args()
+    strip_args.add_all(["-S", dbg, so])
+    path_mapped_run(
+        ctx.actions,
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [dbg],
+        outputs = [so],
+        arguments = [strip_args],
+        mnemonic = "LinuxRISCVCompatVDSOStrip" if compat else "LinuxRISCVVDSOStrip",
+        progress_message = "Stripping Linux RISC-V vDSO %{label}",
+    )
+    return [so, _linux_riscv_vdso_offsets(ctx, dbg, base, compat)]
+
+def _linux_riscv_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, generated_headers, source_root, base):
+    outputs = _linux_riscv_vdso_link(
+        ctx,
+        cc_toolchain,
+        feature_configuration,
+        config,
+        generated_headers,
+        source_root,
+        base,
+        False,
+    )
+    if config.config_flags.get("CONFIG_COMPAT") == "y":
+        outputs.extend(_linux_riscv_vdso_link(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+            base,
+            True,
+        ))
+    return outputs
+
 def _linux_generic_generated_headers_impl(ctx):
     _validate_generated_header_family_content_ids(
         ctx.attr.family_content_ids,
@@ -3774,19 +4087,27 @@ def _linux_generic_generated_headers_impl(ctx):
     source_root = _linux_source_root_path(ctx)
     headers = []
     arch_generated = base + "/arch/" + arch + "/include/generated"
+    arch_include_dir = None
+    arch_uapi_include_dir = None
 
     for header in _GENERIC_ASM_WRAPPERS[arch]:
         out = ctx.actions.declare_file(arch_generated + "/asm/" + header)
         ctx.actions.write(out, "#include <asm-generic/%s>\n" % header)
+        if arch_include_dir == None:
+            arch_include_dir = out.dirname[:-len("/asm")]
         headers.append(out)
     for header in _GENERIC_UAPI_ASM_WRAPPERS[arch]:
         out = ctx.actions.declare_file(arch_generated + "/uapi/asm/" + header)
         ctx.actions.write(out, "#include <asm-generic/%s>\n" % header)
+        if arch_uapi_include_dir == None:
+            arch_uapi_include_dir = out.dirname[:-len("/asm")]
         headers.append(out)
 
     syscall_table = ctx.file.syscall_tbl
     for spec in _linux_generic_syscall_specs(arch, base, syscall_table):
         out = ctx.actions.declare_file(spec.out)
+        if arch_uapi_include_dir == None and "/generated/uapi/asm/" in spec.out:
+            arch_uapi_include_dir = out.dirname[:-len("/asm")]
         args = ctx.actions.args()
         args.add("-in", spec.table)
         args.add("-out", out)
@@ -3866,10 +4187,10 @@ def _linux_generic_generated_headers_impl(ctx):
     headers.extend([compile_h, linux_version_h, utsrelease_h, utsversion_h])
 
     include_dirs = [
-        headers[0].dirname[:-len("/asm")],
+        arch_include_dir,
         timeconst.dirname[:-len("/generated")],
         linux_version_h.dirname[:-len("/linux")],
-        base + "/arch/" + arch + "/include/generated/uapi",
+        arch_uapi_include_dir,
     ]
     include_dir_anchors = _directory_anchors(headers, include_dirs)
     bounds_h = _linux_offsets_header(
@@ -3945,6 +4266,16 @@ def _linux_generic_generated_headers_impl(ctx):
     )
     if arch == "arm" and config.config_flags.get("CONFIG_VDSO") == "y":
         headers.append(_linux_arm_vdso_outputs(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+            config,
+            generated_headers,
+            source_root,
+            base,
+        ))
+    if arch == "riscv" and config.config_flags.get("CONFIG_MMU") == "y":
+        headers.extend(_linux_riscv_vdso_outputs(
             ctx,
             cc_toolchain,
             feature_configuration,
