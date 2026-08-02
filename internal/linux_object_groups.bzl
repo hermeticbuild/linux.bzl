@@ -369,7 +369,7 @@ def _compile_arguments(ctx, base_flags, spec, source, output, config, generated_
     config_response = config.aflags if ctx.attr.language == "asm" else config.cflags
     object_args.append("@" + config_response.path)
     mapping_files = [config_response]
-    if generated_headers != None and generated_headers.cflags != None:
+    if ctx.attr.language != "asm" and generated_headers != None and generated_headers.cflags != None:
         object_args.append("@" + generated_headers.cflags.path)
         mapping_files.append(generated_headers.cflags)
     if ctx.attr.mode == "m":
