@@ -1,6 +1,7 @@
 """Private configured-kernel module finalization rule."""
 
 load("@rules_cc//cc:find_cc_toolchain.bzl", "use_cc_toolchain")
+load(":architecture_profiles.bzl", "linux_arch_values")
 load(":linux_module_actions.bzl", "linux_module_actions")
 load(":linux_objects.bzl", "linux_module_cc_helpers")
 load(
@@ -657,7 +658,7 @@ linux_module_sdk = rule(
     attrs = {
         "arch": attr.string(
             mandatory = True,
-            values = ["arm64", "x86"],
+            values = linux_arch_values(),
         ),
         "objtool": attr.label(
             cfg = "exec",

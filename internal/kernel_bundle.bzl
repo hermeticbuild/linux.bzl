@@ -1,5 +1,6 @@
 """Private aggregate and projection rules for generated kernel repositories."""
 
+load(":architecture_profiles.bzl", "linux_architecture_profiles")
 load(":linux_objects.bzl", "LinuxConfigInfo")
 load(":platform_transition_gateway.bzl", "linux_platform_gateway")
 load(":providers.bzl", "LinuxKernelInfo", "LinuxModuleSdkInfo")
@@ -68,7 +69,7 @@ linux_kernel_bundle = rule(
     attrs = {
         "arch": attr.string(
             mandatory = True,
-            values = ["aarch64", "x86_64"],
+            values = [profile.name for profile in linux_architecture_profiles()],
         ),
         "config": attr.label(
             mandatory = True,

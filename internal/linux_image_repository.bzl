@@ -1,5 +1,6 @@
 """Hermetic Linux image repository rule."""
 
+load(":architecture_profiles.bzl", "linux_architecture_profile", "linux_architecture_profiles")
 load(":config_validation.bzl", "validate_config_features")
 load(":kconfig_tool_filename.bzl", "kconfig_tool_filename")
 load(":kconfig_tool_releases.bzl", "KCONFIG_TOOL_RELEASES", "KCONFIG_TOOL_VERSION")
@@ -119,6 +120,15 @@ _CONTENT_GRAPH_METADATA_FIELDS = {
     "source_input_groups": "string_list",
     "schema": "string",
     "target": "dict",
+}
+
+_CONTENT_GRAPH_TARGET_FIELDS = {
+    "linux_arch": "string",
+    "probe_identity": "string",
+    "profile": "string",
+    "srcarch": "string",
+    "target_triple": "string",
+    "uts_machine": "string",
 }
 
 _CONTENT_GRAPH_OBJECT_KEYS = [
@@ -304,6 +314,14 @@ def _linux_image_impl(rctx):
     descriptor = _ARCHITECTURES.get(arch)
     if descriptor == None:
         fail("unsupported Linux target profile %r" % arch)
+    profile = linux_architecture_profile(arch)
+    if (
+        descriptor.arch != profile.linux_arch or
+        descriptor.srcarch != profile.srcarch or
+        descriptor.target_triple != profile.target_triple or
+        descriptor.uts_machine != profile.uts_machine
+    ):
+        fail("internal Linux target profile %r is inconsistent" % arch)
     if rctx.attr.linux_arch != descriptor.arch or rctx.attr.target_triple != descriptor.target_triple:
         fail(
             "Linux target profile %r requires linux_arch=%r and target_triple=%r; got %r and %r" %
@@ -333,6 +351,8 @@ def _linux_image_impl(rctx):
         arch: base,
     }
     base_rust_enabled = base.get("CONFIG_RUST") == "y"
+    if base_rust_enabled and arch not in ["aarch64", "x86_64"]:
+        fail("CONFIG_RUST is currently supported only for x86_64 and aarch64 profiles, got %s" % arch)
     variant_configs = {}
     variant_graph_images = {}
     variant_rust_enabled = {}
@@ -372,6 +392,11 @@ def _linux_image_impl(rctx):
         variant_configs[name] = "//configs:%s" % name
         variant_graph_images[name] = "//graph:%s_image" % sanitized
         variant_rust_enabled[name] = resolved.get("CONFIG_RUST") == "y"
+        if variant_rust_enabled[name] and arch not in ["aarch64", "x86_64"]:
+            fail(
+                "overlay %s enables CONFIG_RUST for unsupported profile %s; expected x86_64 or aarch64" %
+                (name, arch),
+            )
 
     rust_profile_json = ""
     if base_rust_enabled or True in variant_rust_enabled.values():
@@ -519,7 +544,7 @@ linux_image = repository_rule(
         ),
         "target_profile": attr.string(
             default = "x86_64",
-            values = sorted(_ARCHITECTURES.keys()),
+            values = [profile.name for profile in linux_architecture_profiles()],
             doc = "Canonical target profile derived from the transitioned Bazel platform. Defaults to x86_64 for legacy direct callers.",
         ),
         "linux_arch": attr.string(
@@ -688,6 +713,7 @@ def _validate_resolved_arch(profile, config, description):
             "%s did not derive %s=y from platform-selected Linux target profile %r" %
             (description, symbol, profile),
         )
+    _validate_fragment_arch(profile, config, description)
 
 def _validate_image_compression(config, arch, description):
     if arch != "x86_64":
@@ -1351,16 +1377,9 @@ def _content_graph_metadata_structure_error(metadata):
     if metadata.get("schema") != _REPOSITORY_GENERATOR_PROTOCOL:
         return "Linux content graph metadata has unsupported schema %r" % metadata.get("schema")
     error = _metadata_object_error(
-        metadata.get("target"),
-        {
-            "linux_arch": "string",
-            "probe_identity": "string",
-            "profile": "string",
-            "srcarch": "string",
-            "target_triple": "string",
-            "uts_machine": "string",
-        },
-        ["linux_arch", "probe_identity", "profile", "srcarch", "target_triple", "uts_machine"],
+        metadata["target"],
+        _CONTENT_GRAPH_TARGET_FIELDS,
+        _CONTENT_GRAPH_TARGET_FIELDS.keys(),
         "Linux content graph target",
     )
     if error:

@@ -3,6 +3,7 @@
 load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "CPP_LINK_STATIC_LIBRARY_ACTION_NAME", "C_COMPILE_ACTION_NAME")
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+load(":architecture_profiles.bzl", "linux_architecture_profile_for_arch")
 load(":host_cc_toolchain.bzl", "host_cc_toolchain_attr")
 load(":kconfig.bzl", "KconfigInfo")
 load(":linux_module_actions.bzl", "linux_module_actions")
@@ -376,12 +377,7 @@ def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
     return out
 
 def _linux_kbuild_target_triple(ctx):
-    arch = ctx.attr.arch
-    if arch == "arm64":
-        return "aarch64-linux-gnu"
-    if arch == "x86":
-        return "x86_64-linux-gnu"
-    return ""
+    return linux_architecture_profile_for_arch(ctx.attr.arch).target_triple
 
 def _linux_rewrite_target_flags(flags, target_triple):
     if not target_triple:
@@ -6139,7 +6135,7 @@ def _linux_vmlinux_impl(ctx):
         DefaultInfo(files = depset([out, system_map])),
         info,
         LinuxVmlinuxInfo(
-            arch = "aarch64" if ctx.attr.arch == "arm64" else "x86_64",
+            arch = linux_architecture_profile_for_arch(ctx.attr.arch).name,
             config = config,
             generated_headers = generated_headers,
             module_common = module_prep.module_common if module_prep != None else None,
@@ -6170,6 +6166,7 @@ linux_vmlinux = rule(
             default = "x86_64",
             values = [
                 "arm64",
+                "generic",
                 "x86_64",
             ],
         ),
@@ -7021,6 +7018,13 @@ def _linux_x86_bzimage_impl(ctx):
     ]
 
 def _linux_compressed_image_impl(ctx):
+    if ctx.attr.format == "vmlinux":
+        image = ctx.attr.image[LinuxImageInfo]
+        return [
+            DefaultInfo(files = depset([image.output])),
+            image,
+            OutputGroupInfo(image = depset([image.output])),
+        ]
     if ctx.attr.format == "x86_bzimage":
         return _linux_x86_bzimage_impl(ctx)
     if ctx.attr.format == "arm64_image":
@@ -7038,7 +7042,7 @@ def _linux_compressed_image_impl(ctx):
             "-S",
         ])
     fail(
-        "linux_compressed_image %s requires format \"x86_bzimage\" or \"arm64_image\"" %
+        "linux_compressed_image %s requires format \"x86_bzimage\", \"arm64_image\", or \"vmlinux\"" %
         ctx.label,
     )
 
@@ -7081,6 +7085,7 @@ linux_compressed_image = rule(
             mandatory = True,
             values = [
                 "arm64_image",
+                "vmlinux",
                 "x86_bzimage",
             ],
         ),
