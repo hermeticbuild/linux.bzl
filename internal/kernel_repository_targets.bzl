@@ -314,7 +314,7 @@ def linux_image_targets(
         module_sdk = core_outputs.module_sdk,
         version = version,
         vmlinux = core_outputs.vmlinux,
-        visibility = ["//:__pkg__"],
+        visibility = ["//visibility:public"],
     )
     linux_kernel_exports(
         name = "kernel",
@@ -411,5 +411,5 @@ def linux_image_targets(
             module_sdk = variant_core_outputs.module_sdk,
             version = version,
             vmlinux = variant_core_outputs.vmlinux,
-            visibility = ["//variants/%s:__pkg__" % variant],
+            visibility = ["//visibility:public"],
         )
