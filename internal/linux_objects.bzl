@@ -4587,9 +4587,9 @@ def _linux_powerpc_vdso_outputs(
             base + "/" + directory + source[:-len(".S")] + "-%d.o" % bits,
             bits,
         ))
-    for source, config_symbol, generic_source, extra_flags in [
-        ("vgettimeofday.c", "CONFIG_GENERIC_GETTIMEOFDAY", "gettimeofday.c", ["-ffixed-r30"] if bits == 64 and config.config_flags.get("CONFIG_GENERIC_GETTIMEOFDAY") == "y" else []),
-        ("vgetrandom.c", "CONFIG_VDSO_GETRANDOM", "getrandom.c", []),
+    for source, config_symbol, generic_source in [
+        ("vgettimeofday.c", "CONFIG_GENERIC_GETTIMEOFDAY", "gettimeofday.c"),
+        ("vgetrandom.c", "CONFIG_VDSO_GETRANDOM", "getrandom.c"),
     ]:
         force_include = None
         if config.config_flags.get(config_symbol) == "y":
@@ -4605,7 +4605,6 @@ def _linux_powerpc_vdso_outputs(
             base + "/" + directory + source[:-len(".c")] + "-%d.o" % bits,
             bits,
             force_include = force_include,
-            extra_flags = extra_flags,
         ))
     if bits == 32:
         objects.append(_linux_powerpc_vdso_compile(
@@ -6929,6 +6928,8 @@ def _linux_vmlinux_linker_script(ctx, compiler, cc_toolchain, feature_configurat
         "-include",
         source_root + "/include/linux/kconfig.h",
     ])
+    if arch == "arm":
+        args.add("-DTEXT_OFFSET=" + _linux_arm_text_offset(config))
     args.add_all(_linux_cpp_undef_flags(arch, srcarch))
     _add_config_include_flag(args, config)
     _add_linux_source_include_flags_for_root(
