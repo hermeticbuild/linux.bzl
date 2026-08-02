@@ -59,6 +59,20 @@ func expectedIdentity(t *testing.T) artifactIdentity {
 	return artifactIdentity{class: class, machine: machine}
 }
 
+func expectedKernelELFType(t *testing.T) elf.Type {
+	t.Helper()
+	types := map[string]elf.Type{
+		"dyn":  elf.ET_DYN,
+		"exec": elf.ET_EXEC,
+	}
+	typeName := requiredEnv(t, "KERNEL_ELF_TYPE")
+	typeID, ok := types[typeName]
+	if !ok {
+		t.Fatalf("unsupported KERNEL_ELF_TYPE %q", typeName)
+	}
+	return typeID
+}
+
 func checkELF(t *testing.T, path string, identity artifactIdentity, wantType elf.Type) {
 	t.Helper()
 	file, err := elf.Open(path)
@@ -123,12 +137,12 @@ func checkConfig(t *testing.T) {
 	}
 }
 
-func checkImage(t *testing.T, identity artifactIdentity) {
+func checkImage(t *testing.T, identity artifactIdentity, kernelType elf.Type) {
 	t.Helper()
 	path := requiredRunfile(t, "KERNEL_IMAGE")
 	switch format := requiredEnv(t, "IMAGE_FORMAT"); format {
 	case "elf":
-		checkELF(t, path, identity, elf.ET_EXEC)
+		checkELF(t, path, identity, kernelType)
 	case "arm-zimage":
 		file, err := os.Open(path)
 		if err != nil {
@@ -152,15 +166,16 @@ func checkImage(t *testing.T, identity artifactIdentity) {
 
 func TestKernelArtifacts(t *testing.T) {
 	identity := expectedIdentity(t)
+	kernelType := expectedKernelELFType(t)
 	t.Run("config", checkConfig)
 	t.Run("vmlinux", func(t *testing.T) {
-		checkELF(t, requiredRunfile(t, "KERNEL_VMLINUX"), identity, elf.ET_EXEC)
+		checkELF(t, requiredRunfile(t, "KERNEL_VMLINUX"), identity, kernelType)
 	})
 	t.Run("module", func(t *testing.T) {
 		checkELF(t, requiredRunfile(t, "KERNEL_MODULE"), identity, elf.ET_REL)
 	})
 	t.Run("image", func(t *testing.T) {
-		checkImage(t, identity)
+		checkImage(t, identity, kernelType)
 	})
 	if t.Failed() {
 		t.Logf("artifact verification failed for %q", requiredEnv(t, "ARCH"))
