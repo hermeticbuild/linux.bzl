@@ -8485,6 +8485,11 @@ linux_compressed_image = rule(
             default = Label("//internal/cmd/archheaders"),
             executable = True,
         ),
+        "_flagfilter": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/flagfilter"),
+            executable = True,
+        ),
         "_lz4": attr.label(
             cfg = "exec",
             default = Label("@lz4//programs:lz4"),
