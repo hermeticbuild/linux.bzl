@@ -18,7 +18,7 @@ bazel_dep(name = "llvm", version = "0.8.14")
 
 git_override(
     module_name = "llvm",
-    commit = "d088194981c8d9775cc7dc3d81d9ea08f9ece90b",
+    commit = "fe2001260e1aa1e65395aca437c2aa14b4522e7b",
     remote = "https://github.com/fionera/hermetic-llvm.git",
 )
 
