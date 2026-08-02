@@ -12,6 +12,7 @@ load(
 )
 load(
     "//internal:linux_objects.bzl",
+    "LinuxGeneratedHeadersInfo",
     "LinuxImageInfo",
     "LinuxObjectInfo",
     "linux_compile_environment_index",
@@ -31,6 +32,42 @@ _MODULE_CONTENT_ID = "7777777777777777777777777777777777777777777777777777777777
 _MODULE_RECIPE_ID = "8888888888888888888888888888888888888888888888888888888888888888"
 _COMPOSITE_CONTENT_ID = "9999999999999999999999999999999999999999999999999999999999999999"
 _COMPOSITE_RECIPE_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_HEADER_FAMILY_ID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_ASM_RECIPE_ID = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+_ASM_CONTENT_ID = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+
+def _fake_generated_headers_impl(ctx):
+    header = ctx.actions.declare_file(ctx.label.name + ".h")
+    cflags = ctx.actions.declare_file(ctx.label.name + ".cflags.rsp")
+    ctx.actions.write(header, "")
+    ctx.actions.write(cflags, "-mstack-protector-guard=tls\n")
+    files = depset([header, cflags])
+    family = struct(
+        arch = "x86",
+        cflags = cflags,
+        content_id = _HEADER_FAMILY_ID,
+        files = files,
+        include_dir_anchors = {},
+        include_dirs = [],
+        name = "all",
+        srcarch = "x86",
+        vdsomunge = None,
+    )
+    return [
+        DefaultInfo(files = files),
+        LinuxGeneratedHeadersInfo(
+            arch = "x86",
+            cflags = cflags,
+            families = {"all": family},
+            files = files,
+            include_dir_anchors = {},
+            include_dirs = [],
+            srcarch = "x86",
+            vdsomunge = None,
+        ),
+    ]
+
+_fake_generated_headers = rule(implementation = _fake_generated_headers_impl)
 
 def _fake_object_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".o")
@@ -72,9 +109,25 @@ def _compile_group_test_impl(ctx):
     asserts.equals(env, ["base", "lz4"], info.reachable_configs)
     asserts.equals(env, 2, len(_actions_with_mnemonic(actions, "LinuxObjectCompile")))
     asserts.equals(env, 0, len(_actions_with_mnemonic(actions, "LinuxFlagFilter")))
+    for action in _actions_with_mnemonic(actions, "LinuxObjectCompile"):
+        generated_cflags = [arg for arg in action.argv if arg.endswith(".cflags.rsp")]
+        asserts.equals(env, 1, len(generated_cflags))
     return analysistest.end(env)
 
 _compile_group_test = analysistest.make(_compile_group_test_impl)
+
+def _asm_compile_group_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = _actions_with_mnemonic(analysistest.target_actions(env), "LinuxObjectCompile")
+    asserts.equals(env, 1, len(actions))
+    if actions:
+        generated_cflags = [arg for arg in actions[0].argv if arg.endswith(".cflags.rsp")]
+        assembler_config = [arg for arg in actions[0].argv if arg.endswith("/bazel_kbuild_aflags.rsp")]
+        asserts.equals(env, 0, len(generated_cflags))
+        asserts.equals(env, 1, len(assembler_config))
+    return analysistest.end(env)
+
+_asm_compile_group_test = analysistest.make(_asm_compile_group_test_impl)
 
 def _composite_group_test_impl(ctx):
     env = analysistest.begin(ctx)
@@ -106,19 +159,21 @@ def linux_object_groups_test_suite(name):
     Args:
       name: Target-name prefix for the test suite.
     """
+    _fake_generated_headers(name = name + "_generated_headers")
     linux_compile_environment_index(
         name = name + "_compile_environments",
         compile_environments = {
             _COMPILE_ENVIRONMENT_ID: json.encode({
                 "abi": "tests/grouped/x86",
                 "config_payload": _CONFIG_PAYLOAD_ID,
-                "generated_header_families": [],
+                "generated_header_families": [_HEADER_FAMILY_ID],
             }),
         },
         config_payloads = {
             _CONFIG_PAYLOAD_ID: "CONFIG_TEST=y\n",
         },
         expected_abi = "tests/grouped/x86",
+        generated_headers = [":" + name + "_generated_headers"],
     )
     linux_source_tree(
         name = name + "_source_tree",
@@ -126,7 +181,7 @@ def linux_object_groups_test_suite(name):
     )
     linux_source_input_index(
         name = name + "_source_inputs",
-        groups = ["1,2,3,4,5,6"],
+        groups = ["1,2,3,4,5,6,7"],
         source_tree_info = ":" + name + "_source_tree",
         srcs = [
             "//tests/compile:source/cross_tree/leaf.c",
@@ -135,6 +190,7 @@ def linux_object_groups_test_suite(name):
             "//tests/compile:source/include/linux/kconfig.h",
             "//tests/compile:source/shared/first.inc",
             "//tests/compile:source/shared/nested/second.inc",
+            "//tests/compile:source/cross_tree/leaf.S",
         ],
     )
     linux_object_action_group(
@@ -149,20 +205,41 @@ def linux_object_groups_test_suite(name):
                 "compile_environment": _COMPILE_ENVIRONMENT_ID,
                 "content_id": _FIRST_CONTENT_ID,
                 "object": "first.o",
-                "source_input_file": 1,
+                "source_input_file": 2,
                 "source_input_group": 1,
             }),
             "second": json.encode({
                 "compile_environment": _COMPILE_ENVIRONMENT_ID,
                 "content_id": _SECOND_CONTENT_ID,
                 "object": "second.o",
-                "source_input_file": 1,
+                "source_input_file": 2,
                 "source_input_group": 1,
             }),
         },
         reachable_configs = ["base", "lz4"],
         reachability_id = _REACHABILITY_ID,
         recipe_id = _RECIPE_ID,
+        source_input_index = ":" + name + "_source_inputs",
+        srcarch = "x86",
+    )
+    linux_object_action_group(
+        name = name + "_asm_compile_group",
+        arch = "x86",
+        compile_environment_index = ":" + name + "_compile_environments",
+        language = "asm",
+        mode = "y",
+        objects = {
+            "assembly": json.encode({
+                "compile_environment": _COMPILE_ENVIRONMENT_ID,
+                "content_id": _ASM_CONTENT_ID,
+                "object": "assembly.o",
+                "source_input_file": 1,
+                "source_input_group": 1,
+            }),
+        },
+        reachable_configs = ["base", "lz4"],
+        reachability_id = _REACHABILITY_ID,
+        recipe_id = _ASM_RECIPE_ID,
         source_input_index = ":" + name + "_source_inputs",
         srcarch = "x86",
     )
@@ -216,6 +293,10 @@ def linux_object_groups_test_suite(name):
     _compile_group_test(
         name = name + "_compile_group_test",
         target_under_test = ":" + name + "_compile_group",
+    )
+    _asm_compile_group_test(
+        name = name + "_asm_compile_group_test",
+        target_under_test = ":" + name + "_asm_compile_group",
     )
     _composite_group_test(
         name = name + "_composite_group_test",
