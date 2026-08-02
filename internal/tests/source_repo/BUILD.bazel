@@ -1,0 +1,7 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+go_test(
+    name = "source_repo_test",
+    srcs = ["source_repo_test.go"],
+    data = ["//:source_repo.BUILD.bazel"],
+)

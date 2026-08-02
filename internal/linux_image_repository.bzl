@@ -31,6 +31,7 @@ _ARCHITECTURES = {
             "PROFILING": "",
         },
         srcarch = "arm64",
+        target_triple = "aarch64-linux-gnu",
         uts_machine = "aarch64",
     ),
     "x86_64": struct(
@@ -44,16 +45,63 @@ _ARCHITECTURES = {
             "PROFILING": "",
         },
         srcarch = "x86",
+        target_triple = "x86_64-linux-gnu",
         uts_machine = "x86_64",
+    ),
+    "armv7": struct(
+        arch = "arm",
+        compact_vars = {
+            "ARCH_CORE": "",
+            "ARCH_DRIVERS": "",
+            "ARCH_LIB": "arch/arm/lib/ lib/",
+            "BITS": "32",
+            "CFLAGS_UBSAN_TRAP": "-fsanitize-trap=undefined",
+            "PROFILING": "",
+        },
+        srcarch = "arm",
+        target_triple = "arm-linux-gnueabi",
+        uts_machine = "armv7l",
     ),
 }
 
+_TOOLCHAIN_PLATFORM_PROFILES = {
+    Label("@llvm//platforms:linux_arm64"): "aarch64",
+    Label("@llvm//platforms:linux_armv7"): "armv7",
+    Label("@llvm//platforms:linux_x86_64"): "x86_64",
+}
+
+def linux_target_profile_for_platform(platform):
+    """Returns repository metadata for a canonical LLVM target platform."""
+    name = _TOOLCHAIN_PLATFORM_PROFILES.get(platform)
+    if name == None:
+        fail(
+            "unsupported Linux target platform %s; expected one of %s" %
+            (platform, sorted([str(label) for label in _TOOLCHAIN_PLATFORM_PROFILES])),
+        )
+    descriptor = _ARCHITECTURES[name]
+    return struct(
+        linux_arch = descriptor.arch,
+        name = name,
+        target_triple = descriptor.target_triple,
+    )
+
 _ARCH_CONFIGS = {
+    "CONFIG_ARM": "armv7",
     "CONFIG_ARM64": "aarch64",
+    "CONFIG_X86": "x86_64",
+    # x86_32 is intentionally unsupported. Owning its selector separately
+    # makes CONFIG_X86_32=y fail closed for every public target profile.
+    "CONFIG_X86_32": "x86_32",
     "CONFIG_X86_64": "x86_64",
 }
 
-_REPOSITORY_GENERATOR_PROTOCOL = "compact-v6-content-graph"
+_REQUIRED_ARCH_CONFIGS = {
+    "aarch64": ["CONFIG_ARM64"],
+    "armv7": ["CONFIG_ARM"],
+    "x86_64": ["CONFIG_X86", "CONFIG_X86_64"],
+}
+
+_REPOSITORY_GENERATOR_PROTOCOL = "compact-v7-adaptive-content-graph"
 _CLANG_BASELINE_VERSION = "22.1.8"
 _IMAGE_COMPRESSION_CONFIGS = {
     "CONFIG_KERNEL_GZIP": True,
@@ -69,6 +117,8 @@ _CONTENT_GRAPH_METADATA_FIELDS = {
     "object_variants": "list",
     "source_files": "list",
     "source_input_groups": "string_list",
+    "schema": "string",
+    "target": "dict",
 }
 
 _CONTENT_GRAPH_OBJECT_KEYS = [
@@ -250,8 +300,17 @@ def _linux_image_impl(rctx):
     ):
         fail("source repository has invalid or incompatible linux.bzl metadata")
     rules_repo = _repository_prefix(rctx.attr._self_linux_bzl)
+    arch = rctx.attr.target_profile
+    descriptor = _ARCHITECTURES.get(arch)
+    if descriptor == None:
+        fail("unsupported Linux target profile %r" % arch)
+    if rctx.attr.linux_arch != descriptor.arch or rctx.attr.target_triple != descriptor.target_triple:
+        fail(
+            "Linux target profile %r requires linux_arch=%r and target_triple=%r; got %r and %r" %
+            (arch, descriptor.arch, descriptor.target_triple, rctx.attr.linux_arch, rctx.attr.target_triple),
+        )
     base_input = _read_config(rctx, rctx.attr.config, "base config")
-    arch = _config_arch(base_input, "base config")
+    _validate_fragment_arch(arch, base_input, "base config")
     validate_config_features(base_input, "base config")
     tool = _download_generator(rctx)
     base = _resolve_config(
@@ -265,8 +324,7 @@ def _linux_image_impl(rctx):
         config_mode = rctx.attr.config_mode,
         minimum_rustc_version = minimum_rustc_version,
     )
-    if _config_arch(base, "resolved base config") != arch:
-        fail("Kconfig resolution changed the selected Linux architecture")
+    _validate_resolved_arch(arch, base, "resolved base config")
     validate_config_features(base, "resolved base config")
     _validate_image_compression(base, arch, "resolved base config")
     base = _without_rust_toolchain_config(base)
@@ -284,11 +342,9 @@ def _linux_image_impl(rctx):
     for name in sorted(rctx.attr.overlays.keys()):
         _validate_variant_name(name)
         overlay = _read_config(rctx, rctx.attr.overlays[name], "overlay %s" % name)
-        _validate_overlay_arch(name, base_input, overlay)
+        _validate_fragment_arch(arch, overlay, "overlay %s" % name)
         merged = dict(base_input)
         merged.update(overlay)
-        if _config_arch(merged, "overlay %s" % name) != arch:
-            fail("overlay %s changes the configured Linux architecture" % name)
         validate_config_features(merged, "overlay %s" % name)
         resolved = _resolve_config(
             rctx = rctx,
@@ -301,8 +357,7 @@ def _linux_image_impl(rctx):
             config_mode = rctx.attr.config_mode,
             minimum_rustc_version = minimum_rustc_version,
         )
-        if _config_arch(resolved, "resolved overlay %s" % name) != arch:
-            fail("Kconfig resolution changed the architecture for overlay %s" % name)
+        _validate_resolved_arch(arch, resolved, "resolved overlay %s" % name)
         validate_config_features(resolved, "resolved overlay %s" % name)
         _validate_image_compression(resolved, arch, "resolved overlay %s" % name)
         resolved = _without_rust_toolchain_config(resolved)
@@ -426,6 +481,8 @@ def _linux_image_impl(rctx):
         ".linux-bzl-generator.json",
         json.encode({
             "architecture": arch,
+            "linux_arch": descriptor.arch,
+            "target_triple": descriptor.target_triple,
             "graph_stats": graph_stats,
             "protocol": _REPOSITORY_GENERATOR_PROTOCOL,
             "rust_enabled": base_rust_enabled,
@@ -445,7 +502,7 @@ linux_image = repository_rule(
         "config": attr.label(
             allow_single_file = True,
             mandatory = True,
-            doc = "Base Linux Kconfig fragment. Its architecture selection must match platform.",
+            doc = "Base Linux Kconfig fragment. Architecture is selected by target_profile, not CONFIG_* lines.",
         ),
         "config_mode": attr.string(
             default = "default",
@@ -459,6 +516,29 @@ linux_image = repository_rule(
         "platform": attr.label(
             mandatory = True,
             doc = "Target platform applied once at the public kernel gateway. It must select a matching Clang toolchain.",
+        ),
+        "target_profile": attr.string(
+            default = "x86_64",
+            values = sorted(_ARCHITECTURES.keys()),
+            doc = "Canonical target profile derived from the transitioned Bazel platform. Defaults to x86_64 for legacy direct callers.",
+        ),
+        "linux_arch": attr.string(
+            default = "x86",
+            doc = "Linux ARCH bound to target_profile. Defaults to x86 for legacy direct callers.",
+        ),
+        "target_triple": attr.string(
+            default = "x86_64-linux-gnu",
+            doc = "Canonical LLVM target triple bound to target_profile. Defaults to x86_64-linux-gnu for legacy direct callers.",
+        ),
+        "probe_cc": attr.label(
+            allow_single_file = True,
+            mandatory = True,
+            doc = "Clang from the declared LLVM module used for repository-time probes.",
+        ),
+        "probe_ld": attr.label(
+            allow_single_file = True,
+            mandatory = True,
+            doc = "LLD from the declared LLVM module used for repository-time probes.",
         ),
         "source": attr.label(
             allow_single_file = True,
@@ -543,7 +623,7 @@ def _resolve_config(rctx, tool, source_root, arch, version, name, raw, config_mo
         version,
         "-allow_shell",
     ]
-    _add_generator_variables(args, descriptor, source_root, minimum_rustc_version)
+    _add_generator_variables(args, rctx, arch, descriptor, source_root, minimum_rustc_version)
     result = rctx.execute(
         args,
         environment = {
@@ -577,26 +657,37 @@ def _set_config_value(values, key, value, description, line_number):
         fail("%s line %d: duplicate config key %s" % (description, line_number, key))
     values[key] = value
 
-def _config_arch(config, description):
-    selected = [
-        arch
-        for symbol, arch in _ARCH_CONFIGS.items()
-        if config.get(symbol, "n") == "y"
-    ]
-    if len(selected) != 1:
-        fail(
-            "%s must select exactly one supported architecture with CONFIG_X86_64=y or CONFIG_ARM64=y; got %s" %
-            (description, selected),
-        )
-    return selected[0]
-
-def _validate_overlay_arch(name, base, overlay):
-    for symbol in sorted(_ARCH_CONFIGS.keys()):
-        if symbol in overlay and overlay[symbol] != base.get(symbol, "n"):
-            fail(
-                "overlay %s cannot change %s from %s to %s" %
-                (name, symbol, base.get(symbol, "n"), overlay[symbol]),
+def _fragment_arch_error(profile, config, description):
+    for symbol, owner in sorted(_ARCH_CONFIGS.items()):
+        if config.get(symbol) == "y" and owner != profile:
+            return (
+                "%s sets %s=y for Linux target profile %r, but the target platform selects %r" %
+                (description, symbol, owner, profile)
             )
+    for symbol in _REQUIRED_ARCH_CONFIGS[profile]:
+        if symbol in config and config[symbol] != "y":
+            return (
+                "%s sets %s=%s, which contradicts Linux target profile %r" %
+                (description, symbol, config[symbol], profile)
+            )
+    return ""
+
+def _validate_fragment_arch(profile, config, description):
+    error = _fragment_arch_error(profile, config, description)
+    if error:
+        fail(error)
+
+def _validate_resolved_arch(profile, config, description):
+    symbol = {
+        "aarch64": "CONFIG_ARM64",
+        "armv7": "CONFIG_ARM",
+        "x86_64": "CONFIG_X86",
+    }[profile]
+    if config.get(symbol, "n") != "y":
+        fail(
+            "%s did not derive %s=y from platform-selected Linux target profile %r" %
+            (description, symbol, profile),
+        )
 
 def _validate_image_compression(config, arch, description):
     if arch != "x86_64":
@@ -783,8 +874,9 @@ def _generate_content_graph(
     graph_dir = "graph"
     _initialize_generator_outputs(rctx, graph_dir)
     descriptor = _ARCHITECTURES[arch]
-    compile_environment_abi = "linux.bzl/compact-v6/clang-baseline-%s/%s/%s" % (
+    compile_environment_abi = "linux.bzl/compact-v7/clang-%s/%s/%s/%s" % (
         _CLANG_BASELINE_VERSION,
+        arch,
         descriptor.arch,
         descriptor.srcarch,
     )
@@ -834,7 +926,7 @@ def _generate_content_graph(
             "-generated_headers_for_config",
             "%s=%s" % (name, generated_headers[name]),
         ])
-    _add_generator_variables(args, descriptor, source_root, minimum_rustc_version)
+    _add_generator_variables(args, rctx, arch, descriptor, source_root, minimum_rustc_version)
 
     result = rctx.execute(
         args,
@@ -858,6 +950,13 @@ def _generate_content_graph(
         source_root,
         expected_compile_environment_abi = compile_environment_abi,
         expected_srcarch = descriptor.srcarch,
+        expected_target = struct(
+            linux_arch = descriptor.arch,
+            profile = arch,
+            srcarch = descriptor.srcarch,
+            target_triple = descriptor.target_triple,
+            uts_machine = descriptor.uts_machine,
+        ),
     )
     _validate_generated_build(
         rctx,
@@ -1097,7 +1196,7 @@ def _graph_arch_tool_args(arch):
         ]
     return []
 
-def _add_generator_variables(args, descriptor, source_root, minimum_rustc_version):
+def _add_generator_variables(args, rctx, profile, descriptor, source_root, minimum_rustc_version):
     variables = dict(descriptor.compact_vars)
     variables.update({
         "ARCH": descriptor.arch,
@@ -1116,6 +1215,16 @@ def _add_generator_variables(args, descriptor, source_root, minimum_rustc_versio
         descriptor.arch,
         "-linux_probe_rustc_version",
         str(_linux_version_code(minimum_rustc_version)),
+        "-target_profile",
+        profile,
+        "-linux_arch",
+        descriptor.arch,
+        "-target_triple",
+        descriptor.target_triple,
+        "-probe_cc",
+        str(rctx.path(rctx.attr.probe_cc)),
+        "-probe_ld",
+        str(rctx.path(rctx.attr.probe_ld)),
     ])
 
 def _metadata_positive_decimal(value, context):
@@ -1236,6 +1345,23 @@ def _content_graph_metadata_structure_error(metadata):
         _CONTENT_GRAPH_METADATA_FIELDS,
         _CONTENT_GRAPH_METADATA_FIELDS.keys(),
         "Linux content graph metadata",
+    )
+    if error:
+        return error
+    if metadata.get("schema") != _REPOSITORY_GENERATOR_PROTOCOL:
+        return "Linux content graph metadata has unsupported schema %r" % metadata.get("schema")
+    error = _metadata_object_error(
+        metadata.get("target"),
+        {
+            "linux_arch": "string",
+            "probe_identity": "string",
+            "profile": "string",
+            "srcarch": "string",
+            "target_triple": "string",
+            "uts_machine": "string",
+        },
+        ["linux_arch", "probe_identity", "profile", "srcarch", "target_triple", "uts_machine"],
+        "Linux content graph target",
     )
     if error:
         return error
@@ -1483,11 +1609,21 @@ def _validate_generated_metadata(
         config_names,
         source_root,
         expected_compile_environment_abi,
-        expected_srcarch):
+        expected_srcarch,
+        expected_target):
     metadata = json.decode(rctx.read(graph_dir + "/metadata.json"))
     structure_error = _content_graph_metadata_structure_error(metadata)
     if structure_error:
         fail("Linux graph generator wrote invalid metadata: %s" % structure_error)
+    target = metadata["target"]
+    for key in ["linux_arch", "profile", "srcarch", "target_triple", "uts_machine"]:
+        if target[key] != getattr(expected_target, key):
+            fail(
+                "Linux graph generator target %s=%r, expected %r" %
+                (key, target[key], getattr(expected_target, key)),
+            )
+    if not target["probe_identity"].startswith("sha256-"):
+        fail("Linux graph generator emitted invalid probe identity %r" % target["probe_identity"])
     generated_configs = metadata.get("configs", [])
     names = sorted([config.get("name", "") for config in generated_configs])
     expected_names = sorted(config_names)
@@ -1631,7 +1767,7 @@ def _validate_generated_metadata(
             fail("Linux content graph compile environment %s is invalid" % environment_id)
         _validate_compile_environment_abi(
             abi,
-            expected_compile_environment_abi,
+            expected_compile_environment_abi + "/probe-" + metadata["target"]["probe_identity"],
             environment_id,
         )
         family_names = {}
@@ -1881,7 +2017,15 @@ repositories_test_helpers = struct(
     generator_variable_args = _generator_variable_args,
     generated_header_config_index = _content_generated_header_config_index,
     generator_protocol = _REPOSITORY_GENERATOR_PROTOCOL,
+    fragment_arch_error = _fragment_arch_error,
     kernel_root_build = _kernel_root_build,
+    target_profile_identity = lambda name: (
+        _ARCHITECTURES[name].arch,
+        _ARCHITECTURES[name].srcarch,
+        _ARCHITECTURES[name].uts_machine,
+        _ARCHITECTURES[name].target_triple,
+    ),
+    target_profile_for_platform = linux_target_profile_for_platform,
     without_rust_toolchain_config = _without_rust_toolchain_config,
 )
 

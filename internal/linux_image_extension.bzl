@@ -1,6 +1,11 @@
 """Module extension and facade repositories for configured Linux images."""
 
-load(":linux_image_repository.bzl", _linux_image_repository = "linux_image")
+load("@llvm//toolchain:selects.bzl", "platform_module_map")
+load(
+    ":linux_image_repository.bzl",
+    _linux_image_repository = "linux_image",
+    _linux_target_profile_for_platform = "linux_target_profile_for_platform",
+)
 
 visibility("//...")
 
@@ -18,6 +23,30 @@ _PROJECTION_TARGETS = [
     "system_map",
     "vmlinux",
 ]
+
+def _llvm_probe_tools(module_ctx):
+    os_name = module_ctx.os.name.lower()
+    if os_name in ["mac os x", "macos"]:
+        os_name = "macos"
+    elif os_name.startswith("windows"):
+        os_name = "windows"
+    elif os_name != "linux":
+        fail("unsupported LLVM probe host operating system %r" % module_ctx.os.name)
+
+    arch = module_ctx.os.arch.lower()
+    if arch in ["amd64", "x86_64", "x64"]:
+        arch = "x86_64"
+    elif arch in ["aarch64", "arm64"]:
+        arch = "aarch64"
+    else:
+        fail("unsupported LLVM probe host architecture %r" % module_ctx.os.arch)
+
+    anchor = platform_module_map(os_name, arch)
+    suffix = ".exe" if os_name == "windows" else ""
+    return struct(
+        cc = anchor.relative(":bin/clang%s" % suffix),
+        ld = anchor.relative(":bin/ld.lld%s" % suffix),
+    )
 
 def _validate_name(value, what):
     if not value:
@@ -132,6 +161,7 @@ def _root_tags(module_ctx):
 
 def _linux_images_impl(module_ctx):
     images, overlays = _root_tags(module_ctx)
+    probe_tools = _llvm_probe_tools(module_ctx)
     overlays_by_image = {}
     for (image, name), tag in overlays.items():
         if image not in images:
@@ -142,13 +172,19 @@ def _linux_images_impl(module_ctx):
         image = images[name]
         graph_repo = name + "__linux_graph"
         image_overlays = overlays_by_image.get(name, {})
+        target_profile = _linux_target_profile_for_platform(image.platform)
         _linux_image_repository(
             name = graph_repo,
             config = image.config,
             config_mode = image.config_mode,
             overlays = image_overlays,
             platform = image.platform,
+            probe_cc = probe_tools.cc,
+            probe_ld = probe_tools.ld,
             source = image.source,
+            target_profile = target_profile.name,
+            linux_arch = target_profile.linux_arch,
+            target_triple = target_profile.target_triple,
         )
         _linux_image_facade_repository(
             name = name,
@@ -171,7 +207,9 @@ _overlay = tag_class(attrs = {
 })
 
 linux_images = module_extension(
+    arch_dependent = True,
     implementation = _linux_images_impl,
+    os_dependent = True,
     tag_classes = {
         "image": _image,
         "overlay": _overlay,

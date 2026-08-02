@@ -12,6 +12,7 @@ package(default_visibility = ["//visibility:public"])
 exports_files([
     "extensions.bzl",
     "linux.bzl",
+    "source_repo.BUILD.bazel",
 ])
 
 gazelle(
