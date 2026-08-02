@@ -707,8 +707,11 @@ func armAFlags(config map[string]string) []string {
 	}
 	flags = append(flags, armABIFlags(config)...)
 	flags = append(flags, armISAFlags(config, true)...)
-	if march, _ := armArchitecture(config); march != "" {
+	if march, version := armArchitecture(config); march != "" {
 		flags = append(flags, "-Wa,-march="+march)
+		if version != "" {
+			flags = append(flags, "-D__LINUX_ARM_ARCH__="+version)
+		}
 	}
 	if tune := armTune(config); tune != "" {
 		flags = append(flags, "-mtune="+tune)

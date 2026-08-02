@@ -383,7 +383,7 @@ func TestLinuxFlagsARM(t *testing.T) {
 			t.Errorf("ARM C flags missing %s: %v", want, flags)
 		}
 	}
-	for _, want := range []string{"-Wa,-march=armv7-a", "-D__ASSEMBLY__"} {
+	for _, want := range []string{"-Wa,-march=armv7-a", "-D__LINUX_ARM_ARCH__=7", "-D__ASSEMBLY__"} {
 		if flags := linuxAFlags(config, "arm", testKernelVersion); !contains(flags, want) {
 			t.Errorf("ARM assembler flags missing %s: %v", want, flags)
 		}
