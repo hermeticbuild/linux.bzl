@@ -325,6 +325,15 @@ jobs:
           - batch: linux-6.18-aarch64
             title: Linux 6.18 aarch64
             targets: "//:kernel_outputs_aarch64_build_test //:linux_6_18_39_aarch64_boot_test //:linux_6_18_39_aarch64_module_test"
+          - batch: linux-6.18-armv7
+            title: Linux 6.18 ARMv7
+            targets: "//:kernel_outputs_armv7_build_test //artifacts:armv7_test"
+          - batch: linux-6.18-ppc64le
+            title: Linux 6.18 ppc64le
+            targets: "//:kernel_outputs_ppc64le_build_test //artifacts:ppc64le_test"
+          - batch: linux-6.18-riscv64
+            title: Linux 6.18 RISC-V 64
+            targets: "//:kernel_outputs_riscv64_build_test //artifacts:riscv64_test"
           - batch: linux-6.18-rust-x86_64
             title: Linux 6.18 Rust x86_64
             targets: "//:linux_6_18_39_rust_module_test"
