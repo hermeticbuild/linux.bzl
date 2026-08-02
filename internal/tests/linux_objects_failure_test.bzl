@@ -84,20 +84,20 @@ def _fake_generated_headers_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".h")
     ctx.actions.write(out, "")
     family = struct(
-        arch = "x86",
+        arch = ctx.attr.arch,
         cflags = None,
         content_id = ctx.attr.family_content_id,
         files = depset([out]),
         include_dir_anchors = {},
         include_dirs = [],
         name = ctx.attr.family_name,
-        srcarch = "x86",
+        srcarch = ctx.attr.arch,
         vdsomunge = None,
     )
     return [
         DefaultInfo(files = depset([out])),
         LinuxGeneratedHeadersInfo(
-            arch = "x86",
+            arch = ctx.attr.arch,
             cflags = None,
             families = {
                 ctx.attr.family_name: family,
@@ -105,7 +105,7 @@ def _fake_generated_headers_impl(ctx):
             files = depset([out]),
             include_dir_anchors = {},
             include_dirs = [],
-            srcarch = "x86",
+            srcarch = ctx.attr.arch,
             vdsomunge = None,
         ),
     ]
@@ -113,6 +113,7 @@ def _fake_generated_headers_impl(ctx):
 _fake_generated_headers = rule(
     implementation = _fake_generated_headers_impl,
     attrs = {
+        "arch": attr.string(default = "x86"),
         "family_content_id": attr.string(mandatory = True),
         "family_name": attr.string(default = "all"),
     },
@@ -234,6 +235,90 @@ def _fake_arm_compressed_source_inputs_impl(ctx):
 
 _fake_arm_compressed_source_inputs = rule(
     implementation = _fake_arm_compressed_source_inputs_impl,
+)
+
+def _fake_powerpc_vdso_source_inputs_impl(ctx):
+    files = []
+    for path in [
+        "arch/powerpc/kernel/vdso/cacheflush.S",
+        "arch/powerpc/kernel/vdso/datapage.S",
+        "arch/powerpc/kernel/vdso/getcpu.S",
+        "arch/powerpc/kernel/vdso/getrandom.S",
+        "arch/powerpc/kernel/vdso/gettimeofday.S",
+        "arch/powerpc/kernel/vdso/note.S",
+        "arch/powerpc/kernel/vdso/sigtramp32.S",
+        "arch/powerpc/kernel/vdso/sigtramp64.S",
+        "arch/powerpc/kernel/vdso/vdso32.lds.S",
+        "arch/powerpc/kernel/vdso/vdso64.lds.S",
+        "arch/powerpc/kernel/vdso/vgetrandom-chacha.S",
+        "arch/powerpc/kernel/vdso/vgetrandom.c",
+        "arch/powerpc/kernel/vdso/vgettimeofday.c",
+        "arch/powerpc/lib/crtsavres.S",
+        "lib/vdso/getrandom.c",
+        "lib/vdso/gettimeofday.c",
+    ]:
+        out = ctx.actions.declare_file(ctx.label.name + ".source/" + path)
+        ctx.actions.write(out, "")
+        files.append(out)
+    return [DefaultInfo(files = depset(files))]
+
+_fake_powerpc_vdso_source_inputs = rule(
+    implementation = _fake_powerpc_vdso_source_inputs_impl,
+)
+
+def _fake_powerpc_purgatory_source_inputs_impl(ctx):
+    root = ctx.actions.declare_file(ctx.label.name + ".source/Kconfig")
+    ctx.actions.write(root, "")
+    files = []
+    for path in [
+        "arch/powerpc/purgatory/kexec-purgatory.S",
+        "arch/powerpc/purgatory/trampoline_64.S",
+        "include/linux/compiler-version.h",
+        "include/linux/compiler_types.h",
+        "include/linux/kconfig.h",
+    ]:
+        out = ctx.actions.declare_file(ctx.label.name + ".source/" + path)
+        ctx.actions.write(out, "")
+        files.append(out)
+    return [
+        DefaultInfo(files = depset(files)),
+        _fake_source_tree_info(root),
+    ]
+
+_fake_powerpc_purgatory_source_inputs = rule(
+    implementation = _fake_powerpc_purgatory_source_inputs_impl,
+)
+
+def _fake_riscv_purgatory_source_inputs_impl(ctx):
+    root = ctx.actions.declare_file(ctx.label.name + ".source/Kconfig")
+    ctx.actions.write(root, "")
+    files = []
+    for path in [
+        "arch/riscv/purgatory/kexec-purgatory.S",
+        "arch/riscv/purgatory/purgatory.c",
+        "arch/riscv/purgatory/entry.S",
+        "lib/crypto/sha256.c",
+        "lib/string.c",
+        "lib/ctype.c",
+        "arch/riscv/lib/memcpy.S",
+        "arch/riscv/lib/memset.S",
+        "arch/riscv/lib/strcmp.S",
+        "arch/riscv/lib/strlen.S",
+        "arch/riscv/lib/strncmp.S",
+        "include/linux/compiler-version.h",
+        "include/linux/compiler_types.h",
+        "include/linux/kconfig.h",
+    ]:
+        out = ctx.actions.declare_file(ctx.label.name + ".source/" + path)
+        ctx.actions.write(out, "")
+        files.append(out)
+    return [
+        DefaultInfo(files = depset(files)),
+        _fake_source_tree_info(root),
+    ]
+
+_fake_riscv_purgatory_source_inputs = rule(
+    implementation = _fake_riscv_purgatory_source_inputs_impl,
 )
 
 def _failure_test_impl(ctx):
@@ -551,6 +636,85 @@ def _arm_compressed_flagfilter_test_impl(ctx):
 
 _arm_compressed_flagfilter_test = analysistest.make(
     _arm_compressed_flagfilter_test_impl,
+)
+
+def _powerpc_vdso_actions_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    target = analysistest.target_under_test(env)
+    output_paths = [file.path for file in target[DefaultInfo].files.to_list()]
+    for suffix in [
+        "/arch/powerpc/kernel/vdso/vdso32.so.dbg",
+        "/arch/powerpc/kernel/vdso/vdso64.so.dbg",
+        "/include/generated/vdso32-offsets.h",
+        "/include/generated/vdso64-offsets.h",
+    ]:
+        asserts.true(
+            env,
+            any([path.endswith(suffix) for path in output_paths]),
+            "PowerPC generated headers omit %s" % suffix,
+        )
+    actions = analysistest.target_actions(env)
+    compile32 = [action for action in actions if action.mnemonic == "LinuxPowerPCVDSO32Compile"]
+    compile64 = [action for action in actions if action.mnemonic == "LinuxPowerPCVDSO64Compile"]
+    link32 = [action for action in actions if action.mnemonic == "LinuxPowerPCVDSO32Link"]
+    link64 = [action for action in actions if action.mnemonic == "LinuxPowerPCVDSO64Link"]
+    asserts.equals(env, 11, len(compile32))
+    asserts.equals(env, 10, len(compile64))
+    asserts.equals(env, 1, len(link32))
+    asserts.equals(env, 1, len(link64))
+    if link32:
+        asserts.true(env, "elf32lppc" in link32[0].argv)
+        asserts.true(env, "--eh-frame-hdr" in link32[0].argv)
+    if link64:
+        asserts.true(env, "elf64lppc" in link64[0].argv)
+        asserts.true(env, "--eh-frame-hdr" in link64[0].argv)
+    return analysistest.end(env)
+
+_powerpc_vdso_actions_test = analysistest.make(
+    _powerpc_vdso_actions_test_impl,
+)
+
+def _powerpc_purgatory_actions_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = analysistest.target_actions(env)
+    compile_actions = [action for action in actions if action.mnemonic == "LinuxPowerPCPurgatoryCompile"]
+    link_actions = [action for action in actions if action.mnemonic == "LinuxPowerPCPurgatoryLink"]
+    object_actions = [action for action in actions if action.mnemonic == "LinuxObjectCompile"]
+    asserts.equals(env, 1, len(compile_actions))
+    asserts.equals(env, 1, len(link_actions))
+    asserts.equals(env, 1, len(object_actions))
+    if link_actions:
+        asserts.true(env, "-EL" in link_actions[0].argv)
+        asserts.true(env, "elf64lppc" in link_actions[0].argv)
+        asserts.true(env, "--no-undefined" in link_actions[0].argv)
+    if object_actions:
+        input_paths = [file.path for file in object_actions[0].inputs.to_list()]
+        asserts.true(env, any([path.endswith("/arch/powerpc/purgatory/purgatory.ro") for path in input_paths]))
+    return analysistest.end(env)
+
+_powerpc_purgatory_actions_test = analysistest.make(
+    _powerpc_purgatory_actions_test_impl,
+)
+
+def _riscv_purgatory_actions_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = analysistest.target_actions(env)
+    compile_actions = [action for action in actions if action.mnemonic == "LinuxRISCVPurgatoryCompile"]
+    link_actions = [action for action in actions if action.mnemonic == "LinuxRISCVPurgatoryLink"]
+    check_actions = [action for action in actions if action.mnemonic == "LinuxRISCVPurgatoryCheck"]
+    object_actions = [action for action in actions if action.mnemonic == "LinuxObjectCompile"]
+    asserts.equals(env, 10, len(compile_actions))
+    asserts.equals(env, 1, len(link_actions))
+    asserts.equals(env, 1, len(check_actions))
+    asserts.equals(env, 1, len(object_actions))
+    if object_actions:
+        input_paths = [file.path for file in object_actions[0].inputs.to_list()]
+        asserts.true(env, any([path.endswith("/arch/riscv/purgatory/purgatory.ro") for path in input_paths]))
+        asserts.true(env, any([path.endswith("/arch/riscv/purgatory/purgatory.chk") for path in input_paths]))
+    return analysistest.end(env)
+
+_riscv_purgatory_actions_test = analysistest.make(
+    _riscv_purgatory_actions_test_impl,
 )
 
 def _generic_generated_headers_fixture(name, arch, config, tags):
@@ -1166,6 +1330,173 @@ def linux_objects_fail_closed_test_suite(name):
         target_under_test = ":" + arm_compressed_image,
     )
     generic_header_tests.append(":" + arm_compressed_image_test)
+
+    powerpc_vdso_config = name + "_powerpc_vdso_config"
+    linux_config(
+        name = powerpc_vdso_config,
+        arch = "powerpc",
+        config_flags = {
+            "CONFIG_CPU_LITTLE_ENDIAN": "y",
+            "CONFIG_GENERIC_GETTIMEOFDAY": "y",
+            "CONFIG_PPC64": "y",
+            "CONFIG_PPC64_ELF_ABI_V2": "y",
+            "CONFIG_VDSO32": "y",
+            "CONFIG_VDSO_GETRANDOM": "y",
+        },
+        tags = fixture_tags,
+    )
+    powerpc_vdso_sources = name + "_powerpc_vdso_sources"
+    _fake_powerpc_vdso_source_inputs(
+        name = powerpc_vdso_sources,
+        tags = fixture_tags,
+    )
+    powerpc_vdso_headers = name + "_powerpc_vdso_headers"
+    linux_generic_generated_headers(
+        name = powerpc_vdso_headers,
+        arch = "powerpc",
+        asm_offsets_c = "linux_objects_test_fixture.c",
+        bounds_c = "linux_objects_test_fixture.c",
+        config = ":" + powerpc_vdso_config,
+        family_content_ids = {
+            "all": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        },
+        rq_offsets_c = "linux_objects_test_fixture.c",
+        source_root = "linux_objects_test_fixture.c",
+        source_tree = [":" + powerpc_vdso_sources],
+        syscall_tbl = "linux_objects_test_fixture.c",
+        tags = fixture_tags,
+        uts_machine = "ppc64le",
+    )
+    powerpc_vdso_headers_test = powerpc_vdso_headers + "_actions_test"
+    _powerpc_vdso_actions_test(
+        name = powerpc_vdso_headers_test,
+        target_under_test = ":" + powerpc_vdso_headers,
+    )
+    generic_header_tests.append(":" + powerpc_vdso_headers_test)
+
+    powerpc_purgatory_headers = name + "_powerpc_purgatory_headers"
+    _fake_generated_headers(
+        name = powerpc_purgatory_headers,
+        arch = "powerpc",
+        family_content_id = "3434343434343434343434343434343434343434343434343434343434343434",
+        tags = fixture_tags,
+    )
+    powerpc_purgatory_sources = name + "_powerpc_purgatory_sources"
+    _fake_powerpc_purgatory_source_inputs(
+        name = powerpc_purgatory_sources,
+        tags = fixture_tags,
+    )
+    powerpc_purgatory_source_index = name + "_powerpc_purgatory_source_index"
+    linux_source_input_index(
+        name = powerpc_purgatory_source_index,
+        groups = [",".join([str(index) for index in range(1, 6)])],
+        srcs = [":" + powerpc_purgatory_sources],
+        source_tree_info = ":" + powerpc_purgatory_sources,
+        tags = fixture_tags,
+    )
+    powerpc_purgatory_environment_id = "4545454545454545454545454545454545454545454545454545454545454545"
+    powerpc_purgatory_payload_id = "5656565656565656565656565656565656565656565656565656565656565656"
+    powerpc_purgatory_environment_index = name + "_powerpc_purgatory_environment_index"
+    linux_compile_environment_index(
+        name = powerpc_purgatory_environment_index,
+        arch = "powerpc",
+        compile_environments = {
+            powerpc_purgatory_environment_id: json.encode({
+                "abi": "powerpc64le-linux-gnu",
+                "config_payload": powerpc_purgatory_payload_id,
+                "generated_header_families": ["3434343434343434343434343434343434343434343434343434343434343434"],
+            }),
+        },
+        config_payloads = {
+            powerpc_purgatory_payload_id: "CONFIG_64BIT=y\nCONFIG_CC_IS_CLANG=y\nCONFIG_CPU_LITTLE_ENDIAN=y\nCONFIG_PPC64=y\nCONFIG_PPC64_ELF_ABI_V2=y\n",
+        },
+        expected_abi = "powerpc64le-linux-gnu",
+        generated_headers = [":" + powerpc_purgatory_headers],
+        tags = fixture_tags,
+    )
+    powerpc_purgatory_object = name + "_powerpc_purgatory_object"
+    linux_object(
+        name = powerpc_purgatory_object,
+        arch = "powerpc",
+        compile_environment_id = powerpc_purgatory_environment_id,
+        compile_environment_index = ":" + powerpc_purgatory_environment_index,
+        content_id = "6767676767676767676767676767676767676767676767676767676767676767",
+        mode = "y",
+        object = "arch/powerpc/purgatory/kexec-purgatory.o",
+        source_input_file = 1,
+        source_input_group = 1,
+        source_input_index = ":" + powerpc_purgatory_source_index,
+        srcarch = "powerpc",
+        tags = fixture_tags,
+    )
+    powerpc_purgatory_object_test = powerpc_purgatory_object + "_actions_test"
+    _powerpc_purgatory_actions_test(
+        name = powerpc_purgatory_object_test,
+        target_under_test = ":" + powerpc_purgatory_object,
+    )
+    generic_header_tests.append(":" + powerpc_purgatory_object_test)
+
+    riscv_purgatory_headers = name + "_riscv_purgatory_headers"
+    _fake_generated_headers(
+        name = riscv_purgatory_headers,
+        arch = "riscv",
+        family_content_id = "dededededededededededededededededededededededededededededededede",
+        tags = fixture_tags,
+    )
+    riscv_purgatory_sources = name + "_riscv_purgatory_sources"
+    _fake_riscv_purgatory_source_inputs(
+        name = riscv_purgatory_sources,
+        tags = fixture_tags,
+    )
+    riscv_purgatory_source_index = name + "_riscv_purgatory_source_index"
+    linux_source_input_index(
+        name = riscv_purgatory_source_index,
+        groups = [",".join([str(index) for index in range(1, 15)])],
+        srcs = [":" + riscv_purgatory_sources],
+        source_tree_info = ":" + riscv_purgatory_sources,
+        tags = fixture_tags,
+    )
+    riscv_purgatory_environment_id = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+    riscv_purgatory_payload_id = "1212121212121212121212121212121212121212121212121212121212121212"
+    riscv_purgatory_environment_index = name + "_riscv_purgatory_environment_index"
+    linux_compile_environment_index(
+        name = riscv_purgatory_environment_index,
+        arch = "riscv",
+        compile_environments = {
+            riscv_purgatory_environment_id: json.encode({
+                "abi": "riscv64-linux-gnu",
+                "config_payload": riscv_purgatory_payload_id,
+                "generated_header_families": ["dededededededededededededededededededededededededededededededede"],
+            }),
+        },
+        config_payloads = {
+            riscv_purgatory_payload_id: "CONFIG_64BIT=y\nCONFIG_ARCH_RV64I=y\nCONFIG_RISCV=y\n",
+        },
+        expected_abi = "riscv64-linux-gnu",
+        generated_headers = [":" + riscv_purgatory_headers],
+        tags = fixture_tags,
+    )
+    riscv_purgatory_object = name + "_riscv_purgatory_object"
+    linux_object(
+        name = riscv_purgatory_object,
+        arch = "riscv",
+        compile_environment_id = riscv_purgatory_environment_id,
+        compile_environment_index = ":" + riscv_purgatory_environment_index,
+        content_id = "1313131313131313131313131313131313131313131313131313131313131313",
+        mode = "y",
+        object = "arch/riscv/purgatory/kexec-purgatory.o",
+        source_input_file = 1,
+        source_input_group = 1,
+        source_input_index = ":" + riscv_purgatory_source_index,
+        srcarch = "riscv",
+        tags = fixture_tags,
+    )
+    riscv_purgatory_object_test = riscv_purgatory_object + "_actions_test"
+    _riscv_purgatory_actions_test(
+        name = riscv_purgatory_object_test,
+        target_under_test = ":" + riscv_purgatory_object,
+    )
+    generic_header_tests.append(":" + riscv_purgatory_object_test)
     failure_cases = [
         (empty_image, "requires at least one compiled object"),
         (certificate_object, "hermetic certificate embedding and signing are not implemented"),

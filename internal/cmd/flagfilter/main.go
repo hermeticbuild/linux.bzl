@@ -23,7 +23,9 @@ func main() {
 	inPath := flag.String("in", "", "Input response file")
 	outPath := flag.String("out", "", "Output response file")
 	var remove repeatedFlag
+	var removePrefix repeatedFlag
 	flag.Var(&remove, "remove", "Flag token to remove. May be repeated.")
+	flag.Var(&removePrefix, "remove_prefix", "Flag token prefix to remove. May be repeated.")
 	flag.Parse()
 
 	if *inPath == "" || *outPath == "" {
@@ -37,7 +39,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	filtered := filterFlags(flags, remove)
+	filtered := filterFlags(flags, remove, removePrefix)
 	if err := os.WriteFile(*outPath, []byte(responseFile(filtered)), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "write output: %v\n", err)
 		os.Exit(1)
@@ -65,8 +67,8 @@ func readResponseFile(path string) ([]string, error) {
 	return flags, nil
 }
 
-func filterFlags(flags []string, remove []string) []string {
-	if len(remove) == 0 {
+func filterFlags(flags []string, remove, removePrefix []string) []string {
+	if len(remove) == 0 && len(removePrefix) == 0 {
 		return append([]string(nil), flags...)
 	}
 	removeSet := map[string]bool{}
@@ -77,7 +79,16 @@ func filterFlags(flags []string, remove []string) []string {
 	}
 	out := make([]string, 0, len(flags))
 	for _, flag := range flags {
-		if !removeSet[flag] {
+		shouldRemove := removeSet[flag]
+		if !shouldRemove {
+			for _, prefix := range removePrefix {
+				if prefix != "" && strings.HasPrefix(flag, prefix) {
+					shouldRemove = true
+					break
+				}
+			}
+		}
+		if !shouldRemove {
 			out = append(out, flag)
 		}
 	}
