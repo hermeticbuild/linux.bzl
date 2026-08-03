@@ -2113,6 +2113,21 @@ func TestCompactContentGraphValidationRecomputesContentIDs(t *testing.T) {
 		metadata.ObjectVariants[0].ObjtoolArgs = []string{"--mutated"}
 		assertRejected(t, metadata, "object target")
 	})
+	t.Run("symversions", func(t *testing.T) {
+		metadata := generate(t)
+		metadata.ObjectVariants[0].Symversions = true
+		assertRejected(t, metadata, "object target")
+	})
+	t.Run("symversion flags", func(t *testing.T) {
+		metadata := generate(t)
+		metadata.ObjectVariants[0].SymversionFlags = []string{"-DMUTATED"}
+		assertRejected(t, metadata, "object target")
+	})
+	t.Run("symversion remove flags", func(t *testing.T) {
+		metadata := generate(t)
+		metadata.ObjectVariants[0].SymversionRemoveFlags = []string{"-DMUTATED"}
+		assertRejected(t, metadata, "object target")
+	})
 	t.Run("dependency order", func(t *testing.T) {
 		metadata := generate(t)
 		root := metadata.ObjectVariants[0]
@@ -2142,6 +2157,9 @@ func TestCompactContentGraphValidationRecomputesContentIDs(t *testing.T) {
 				false,
 				false,
 				nil,
+				false,
+				nil,
+				nil,
 			)
 			dependency.Target = sanitizeTargetName(strings.TrimSuffix(object, ".o")) + "__" + compactShortID(dependency.ContentID)
 			dependencies = append(dependencies, dependency)
@@ -2169,6 +2187,9 @@ func TestCompactContentGraphValidationRecomputesContentIDs(t *testing.T) {
 			root.ObjtoolDisabled,
 			root.ObjtoolForce,
 			root.ObjtoolArgs,
+			root.Symversions,
+			root.SymversionFlags,
+			root.SymversionRemoveFlags,
 		)
 		root.Target = sanitizeTargetName(strings.TrimSuffix(root.Object, ".o")) + "__" + compactShortID(root.ContentID)
 		metadata.ObjectVariants[0] = root
@@ -2253,6 +2274,7 @@ func TestCompactContentGraphGeneratedObjectActionFootprints(t *testing.T) {
 		{"lib/oid_registry.o", "include/linux/oid_registry.h", "", "oid_registry_data.c", "", nil},
 		{"arch/x86/lib/inat.o", "arch/x86/lib/x86-opcode-map.txt", "", "inat-tables.c", "", nil},
 		{"usr/initramfs_data.o", "usr/default_cpio_list", "", "", "", nil},
+		{"certs/system_certificates.o", "", "", "certs/signing_key.x509", "", nil},
 		{"arch/x86/kernel/cpu/capflags.o", "", "arch/x86/include/asm/cpufeatures.h", "", "", nil},
 		{"arch/x86/realmode/rmpiggy.o", "", "", "pasyms.h", "", nil},
 		{"init/version.o", "init/version-timestamp.c", "", "", "", nil},
@@ -2314,6 +2336,10 @@ func TestCompactContentGraphGeneratedObjectActionFootprints(t *testing.T) {
 		},
 		"usr/initramfs_data.o": {
 			"usr/initramfs_inc_data",
+		},
+		"certs/system_certificates.o": {
+			"certs/signing_key.x509",
+			"certs/x509_certificate_list",
 		},
 	} {
 		got := compactObjectActionFootprintForObject(object, nil)
@@ -3019,14 +3045,15 @@ func TestCompactContentGraphASN1GeneratedParserBindsEmittedHeaderClosures(t *tes
 	}
 }
 
-func TestCompactContentGraphASN1ConsumerRequiresResolvedParserObject(t *testing.T) {
+func TestCompactContentGraphASN1ConsumerBindsResolvedParserHeaderClosure(t *testing.T) {
 	tree := mustParseCompactFixture(t)
 	sourceRoot := t.TempDir()
 	mustWriteSource(t, sourceRoot, "crypto/consumer.c", "#include \"parser.asn1.h\"\n")
 	mustWriteSource(t, sourceRoot, "crypto/parser.asn1", "Parser ::= INTEGER\n")
 	mustWriteSource(t, sourceRoot, "scripts/asn1_compiler.c", "int asn1_compiler;\n")
 	mustWriteSource(t, sourceRoot, "include/linux/asn1_ber_bytecode.h", "#define ASN1_BER 1\n")
-	mustWriteSource(t, sourceRoot, "include/linux/asn1_decoder.h", "#define ASN1_DECODER 1\n")
+	mustWriteSource(t, sourceRoot, "include/linux/asn1_decoder.h", "#include <linux/asn1_nested.h>\n")
+	mustWriteSource(t, sourceRoot, "include/linux/asn1_nested.h", "#define ASN1_NESTED 1\n")
 	writeCompactContentGraphForcedInputs(t, sourceRoot)
 	opts := CompactMetadataOptions{
 		SourceRoot:            sourceRoot,
@@ -3041,14 +3068,42 @@ obj-y += crypto/parser.asn1.o
 	if err != nil {
 		t.Fatalf("ParseKbuild(with parser) failed: %v", err)
 	}
-	metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, withParser, []NamedConfig{{Name: "base"}}, opts)
-	if err != nil {
-		t.Fatalf("resolved ASN.1 consumer scan failed: %v", err)
+	generateConsumer := func() (CompactObjectVariant, []CompactSourceInput) {
+		t.Helper()
+		metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, withParser, []NamedConfig{{Name: "base"}}, opts)
+		if err != nil {
+			t.Fatalf("resolved ASN.1 consumer scan failed: %v", err)
+		}
+		config := configByName(metadata, "base")
+		consumer := variantByTarget(metadata, objectTarget(metadata, config, "crypto/consumer.o"))
+		inputs, err := metadata.expandedSourceInputGroup(consumer.SourceInputGroup, "ASN.1 consumer")
+		if err != nil {
+			t.Fatalf("expand ASN.1 consumer source inputs: %v", err)
+		}
+		return consumer, inputs
 	}
-	config := configByName(metadata, "base")
-	consumer := variantByTarget(metadata, objectTarget(metadata, config, "crypto/consumer.o"))
+
+	consumer, beforeInputs := generateConsumer()
 	if len(consumer.Deps) != 1 {
 		t.Fatalf("ASN.1 consumer deps = %v, want one generated parser dependency", consumer.Deps)
+	}
+	for _, path := range []string{
+		"include/linux/asn1_decoder.h",
+		"include/linux/asn1_nested.h",
+	} {
+		if sourceInputByPath(beforeInputs, path).Path == "" {
+			t.Errorf("ASN.1 consumer source inputs omit generated-header dependency %q: %v", path, beforeInputs)
+		}
+	}
+	if sourceInputByPath(beforeInputs, "include/linux/asn1_ber_bytecode.h").Path != "" {
+		t.Fatalf("ASN.1 consumer source inputs include producer-only BER header: %v", beforeInputs)
+	}
+	beforeNested := sourceInputByPath(beforeInputs, "include/linux/asn1_nested.h")
+	mustWriteSource(t, sourceRoot, "include/linux/asn1_nested.h", "#define ASN1_NESTED 2\n")
+	_, afterInputs := generateConsumer()
+	afterNested := sourceInputByPath(afterInputs, "include/linux/asn1_nested.h")
+	if beforeNested.Digest == afterNested.Digest {
+		t.Fatalf("ASN.1 consumer nested header digest did not change: %q", beforeNested.Digest)
 	}
 
 	withoutParser, err := ParseKbuild(strings.NewReader("obj-y += crypto/consumer.o\n"), "Kbuild")
@@ -3114,8 +3169,8 @@ func TestObjectVariantContentIDUsesFullChildIDs(t *testing.T) {
 	prefix := strings.Repeat("a", compactShortIDLength)
 	left := prefix + strings.Repeat("b", 64-compactShortIDLength)
 	right := prefix + strings.Repeat("c", 64-compactShortIDLength)
-	leftID := objectVariantContentID("composite.o", "y", "", nil, nil, "", "", nil, nil, []string{left}, "abi-v1", false, false, false, nil)
-	rightID := objectVariantContentID("composite.o", "y", "", nil, nil, "", "", nil, nil, []string{right}, "abi-v1", false, false, false, nil)
+	leftID := objectVariantContentID("composite.o", "y", "", nil, nil, "", "", nil, nil, []string{left}, "abi-v1", false, false, false, nil, false, nil, nil)
+	rightID := objectVariantContentID("composite.o", "y", "", nil, nil, "", "", nil, nil, []string{right}, "abi-v1", false, false, false, nil, false, nil, nil)
 	if leftID == rightID {
 		t.Fatalf("full child content IDs with a shared presentation prefix produced the same parent ID %q", leftID)
 	}
@@ -3166,6 +3221,9 @@ func TestObjectVariantContentIDPreservesCanonicalFraming(t *testing.T) {
 		false,
 		false,
 		nil,
+		false,
+		nil,
+		nil,
 	)
 	if got != want {
 		t.Fatalf("objectVariantContentID() = %q, want canonical hash %q", got, want)
@@ -3202,6 +3260,9 @@ func TestCompactContentGraphCompositeIdentityIgnoresNonActionMetadata(t *testing
 			"linker-abi-v1",
 			nil,
 			"x86",
+			false,
+			nil,
+			nil,
 		)
 	}
 	left := variant("-DLEFT", "left")
@@ -3604,6 +3665,9 @@ func TestCompactMappedGeneratedSourcesUseOutputLanguageFlags(t *testing.T) {
 				"linux.bzl/compact-v6/test",
 				nil,
 				"x86",
+				false,
+				nil,
+				nil,
 			)
 			if got := variant.Flags; !reflect.DeepEqual(got, tc.wantFlags) {
 				t.Fatalf("%s flags = %v, want %v", tc.source, got, tc.wantFlags)
@@ -3662,6 +3726,9 @@ obj-y += init.o
 			"linux.bzl/compact-v6/test",
 			nil,
 			"x86",
+			false,
+			nil,
+			nil,
 		)
 	}
 	windowsVariant := variant(kb.Flags[0].Flags, sourceRoot)
@@ -4348,6 +4415,272 @@ func TestCompactContentGraphGeneratedARMPerlasmSourceIdentity(t *testing.T) {
 	_, changed := generate()
 	if changed.ContentID == before.ContentID {
 		t.Fatalf("ARM SHA-256 generator change did not change content ID %q", before.ContentID)
+	}
+}
+
+func TestCompactContentGraphModelsBasicGenksymsActions(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "genksyms"
+config MODVERSIONS
+	bool "module versions"
+config GENKSYMS
+	bool "genksyms"
+config BASIC_MODVERSIONS
+	bool "basic module versions"
+config ASM_MODVERSIONS
+	bool "assembly module versions"
+`)
+	kb, err := ParseKbuild(strings.NewReader(`
+KBUILD_CFLAGS += -DGLOBAL_C
+KBUILD_AFLAGS += -DGLOBAL_ASM
+CFLAGS_c_export.o += -DC_OBJECT
+CFLAGS_asm_export.o += -DASM_DUMMY_C
+AFLAGS_asm_export.o += -DASM_OBJECT
+obj-y += c_export.o asm_export.o
+`), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "c_export.c", `
+#ifdef __GENKSYMS__
+#include "genksyms-only.h"
+#else
+#include "runtime-only.h"
+#endif
+`)
+	mustWriteSource(t, sourceRoot, "runtime-only.h", "#define RUNTIME_ONLY 1\n")
+	mustWriteSource(t, sourceRoot, "genksyms-only.h", "#define GENKSYMS_ONLY 1\n")
+	mustWriteSource(t, sourceRoot, "asm_export.S", "/* assembly export */\n")
+	mustWriteSource(t, sourceRoot, "include/linux/kernel.h", "#define KERNEL_H 1\n")
+	mustWriteSource(t, sourceRoot, "include/linux/string.h", "#include <linux/string-nested.h>\n")
+	mustWriteSource(t, sourceRoot, "include/linux/string-nested.h", "#define STRING_NESTED 1\n")
+	mustWriteSource(t, sourceRoot, "arch/x86/include/asm/asm-prototypes.h", "#define ASM_PROTOTYPES 1\n")
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+
+	metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{
+		{
+			Name: "base",
+			Flags: map[string]string{
+				"CONFIG_ASM_MODVERSIONS":   "n",
+				"CONFIG_BASIC_MODVERSIONS": "n",
+				"CONFIG_GENKSYMS":          "n",
+				"CONFIG_MODVERSIONS":       "n",
+			},
+		},
+		{
+			Name: "modversions",
+			Flags: map[string]string{
+				"CONFIG_ASM_MODVERSIONS":   "y",
+				"CONFIG_BASIC_MODVERSIONS": "y",
+				"CONFIG_GENKSYMS":          "y",
+				"CONFIG_MODVERSIONS":       "y",
+			},
+		},
+	}, CompactMetadataOptions{
+		SourceRoot:            sourceRoot,
+		Srcarch:               "x86",
+		KernelVersion:         "6.18.41",
+		CompileEnvironmentABI: "linux.bzl/compact-v8/test",
+	})
+	if err != nil {
+		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
+	}
+	base := configByName(metadata, "base")
+	modversions := configByName(metadata, "modversions")
+	baseC := variantByTarget(metadata, objectTarget(metadata, base, "c_export.o"))
+	modC := variantByTarget(metadata, objectTarget(metadata, modversions, "c_export.o"))
+	modASM := variantByTarget(metadata, objectTarget(metadata, modversions, "asm_export.o"))
+	if baseC.Symversions {
+		t.Fatalf("base C object unexpectedly enables symversions: %#v", baseC)
+	}
+	if !modC.Symversions || !modASM.Symversions {
+		t.Fatalf("modversion object flags = C:%t ASM:%t, want both enabled", modC.Symversions, modASM.Symversions)
+	}
+	if got, want := modC.SymversionFlags, []string{"-DGLOBAL_C", "-DC_OBJECT"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("C symversion flags = %v, want %v", got, want)
+	}
+	if got, want := modASM.Flags, []string{"-DGLOBAL_ASM", "-DASM_OBJECT"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("assembly compile flags = %v, want %v", got, want)
+	}
+	if got, want := modASM.SymversionFlags, []string{"-DGLOBAL_C", "-DASM_DUMMY_C"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("assembly symversion flags = %v, want %v", got, want)
+	}
+	baseInputs, err := metadata.expandedSourceInputGroup(baseC.SourceInputGroup, "base C")
+	if err != nil {
+		t.Fatal(err)
+	}
+	modCInputs, err := metadata.expandedSourceInputGroup(modC.SourceInputGroup, "modversions C")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceInputByPath(baseInputs, "genksyms-only.h").Path != "" {
+		t.Fatalf("disabled C source footprint includes __GENKSYMS__ branch: %v", baseInputs)
+	}
+	if sourceInputByPath(modCInputs, "genksyms-only.h").Path == "" || sourceInputByPath(modCInputs, "runtime-only.h").Path == "" {
+		t.Fatalf("enabled C source footprint does not union compile and genksyms branches: %v", modCInputs)
+	}
+	asmInputs, err := metadata.expandedSourceInputGroup(modASM.SourceInputGroup, "modversions assembly")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"arch/x86/include/asm/asm-prototypes.h",
+		"include/linux/kernel.h",
+		"include/linux/string-nested.h",
+		"include/linux/string.h",
+	} {
+		if sourceInputByPath(asmInputs, path).Path == "" {
+			t.Errorf("assembly genksyms footprint omits %q: %v", path, asmInputs)
+		}
+	}
+
+	buildFile, err := metadata.BuildFile(CompactBuildFileOptions{
+		Arch:               "x86",
+		Version:            "6.18.41",
+		BaseConfig:         "base",
+		SourceLabelPackage: "@linux//",
+		SourceRootLabel:    "@linux//:Kconfig",
+		SourceGenksyms:     "//tools:genksyms",
+		Srcarch:            "x86",
+	})
+	if err != nil {
+		t.Fatalf("BuildFile() failed: %v", err)
+	}
+	parsed, err := build.ParseBuild("genksyms.BUILD.bazel", buildFile)
+	if err != nil {
+		t.Fatalf("generated BUILD did not parse: %v\n%s", err, buildFile)
+	}
+	plan, err := metadata.actionGraphPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := parsed.RuleNamed(plan.GroupNameByTarget[modASM.Target])
+	if rule == nil || rule.Kind() != "linux_object_action_group" {
+		t.Fatalf("assembly owner = %#v, want linux_object_action_group", rule)
+	}
+	if rule.Attr("symversions") == nil || rule.AttrString("genksyms") != "//tools:genksyms" || rule.AttrString("version") != "6.18.41" {
+		t.Fatalf("assembly group omits genksyms attrs:\n%s", buildFile)
+	}
+	if got := rule.AttrStrings("symversion_flags"); !reflect.DeepEqual(got, modASM.SymversionFlags) {
+		t.Fatalf("emitted assembly symversion flags = %v, want %v", got, modASM.SymversionFlags)
+	}
+}
+
+func TestCompactGenksymsAssemblyHeadersAreVersionSpecific(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		want    []string
+	}{
+		{"6.12.96", []string{"linux/kernel.h", "asm/asm-prototypes.h"}},
+		{"6.18.41", []string{"linux/kernel.h", "linux/string.h", "asm/asm-prototypes.h"}},
+	} {
+		got, err := compactGenksymsAssemblyHeaders(tc.version)
+		if err != nil {
+			t.Fatalf("compactGenksymsAssemblyHeaders(%q) failed: %v", tc.version, err)
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("compactGenksymsAssemblyHeaders(%q) = %v, want %v", tc.version, got, tc.want)
+		}
+	}
+}
+
+func TestCompactContentGraphEnablesGenksymsForGeneratedCSources(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "generated C genksyms"
+config MODVERSIONS
+	bool "module versions"
+config GENKSYMS
+	bool "genksyms"
+config BASIC_MODVERSIONS
+	bool "basic module versions"
+`)
+	kb, err := ParseKbuild(strings.NewReader(`
+KBUILD_CFLAGS += -DGENERATED_C
+obj-y += drivers/tty/vt/defkeymap.o certs/parser.asn1.o
+`), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "drivers/tty/vt/defkeymap.c_shipped", `
+#ifdef __GENKSYMS__
+#include "defkeymap-genksyms.h"
+#endif
+`)
+	mustWriteSource(t, sourceRoot, "drivers/tty/vt/defkeymap-genksyms.h", "#define DEFKEYMAP_GENKSYMS 1\n")
+	mustWriteSource(t, sourceRoot, "certs/parser.asn1", "Parser ::= INTEGER\n")
+	mustWriteSource(t, sourceRoot, "scripts/asn1_compiler.c", "int main(void) { return 0; }\n")
+	mustWriteSource(t, sourceRoot, "include/linux/asn1_ber_bytecode.h", "#define ASN1_BER 1\n")
+	mustWriteSource(t, sourceRoot, "include/linux/asn1_decoder.h", "#define ASN1_DECODER 1\n")
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+
+	metadata, err := compactMetadataBatchWithOptionsForTest(t, tree, kb, []NamedConfig{{
+		Name: "modversions",
+		Flags: map[string]string{
+			"CONFIG_BASIC_MODVERSIONS": "y",
+			"CONFIG_GENKSYMS":          "y",
+			"CONFIG_MODVERSIONS":       "y",
+		},
+	}}, CompactMetadataOptions{
+		SourceRoot:            sourceRoot,
+		Srcarch:               "x86",
+		KernelVersion:         "6.18.41",
+		CompileEnvironmentABI: "linux.bzl/compact-v8/test",
+	})
+	if err != nil {
+		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
+	}
+	config := configByName(metadata, "modversions")
+	shipped := variantByTarget(metadata, objectTarget(metadata, config, "drivers/tty/vt/defkeymap.o"))
+	asn1 := variantByTarget(metadata, objectTarget(metadata, config, "certs/parser.asn1.o"))
+	for _, variant := range []CompactObjectVariant{shipped, asn1} {
+		if !variant.Symversions {
+			t.Errorf("generated C object %q does not enable symversions", variant.Object)
+		}
+		if got, want := variant.SymversionFlags, []string{"-DGENERATED_C"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("generated C object %q symversion flags = %v, want %v", variant.Object, got, want)
+		}
+	}
+	shippedInputs, err := metadata.expandedSourceInputGroup(shipped.SourceInputGroup, "shipped C")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceInputByPath(shippedInputs, "drivers/tty/vt/defkeymap-genksyms.h").Path == "" {
+		t.Fatalf("shipped C footprint omits __GENKSYMS__ include: %v", shippedInputs)
+	}
+	asn1Inputs, err := metadata.expandedSourceInputGroup(asn1.SourceInputGroup, "ASN.1 C")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"include/linux/asn1_ber_bytecode.h", "include/linux/asn1_decoder.h", "scripts/asn1_compiler.c"} {
+		if sourceInputByPath(asn1Inputs, path).Path == "" {
+			t.Errorf("ASN.1 genksyms footprint omits %q: %v", path, asn1Inputs)
+		}
+	}
+
+	buildFile, err := metadata.BuildFile(CompactBuildFileOptions{
+		Arch:               "x86",
+		Version:            "6.18.41",
+		BaseConfig:         "modversions",
+		SourceLabelPackage: "@linux//",
+		SourceRootLabel:    "@linux//:Kconfig",
+		SourceASN1Compiler: "//tools:asn1_compiler",
+		SourceGenksyms:     "//tools:genksyms",
+		Srcarch:            "x86",
+	})
+	if err != nil {
+		t.Fatalf("BuildFile() failed: %v", err)
+	}
+	parsed, err := build.ParseBuild("generated-c-genksyms.BUILD.bazel", buildFile)
+	if err != nil {
+		t.Fatalf("generated BUILD did not parse: %v\n%s", err, buildFile)
+	}
+	for _, variant := range []CompactObjectVariant{shipped, asn1} {
+		rule := parsed.RuleNamed(variant.Target)
+		if rule == nil || rule.Kind() != "linux_object" || rule.Attr("symversions") == nil {
+			t.Errorf("generated C object %q did not emit legacy linux_object symversion attrs", variant.Object)
+		}
 	}
 }
 

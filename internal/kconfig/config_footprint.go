@@ -101,6 +101,8 @@ type sourceScanProfile string
 const (
 	sourceScanKernel          sourceScanProfile = ""
 	sourceScanKernelModule    sourceScanProfile = "kernel-module"
+	sourceScanKernelGenksyms  sourceScanProfile = "kernel-genksyms"
+	sourceScanModuleGenksyms  sourceScanProfile = "kernel-module-genksyms"
 	sourceScanARMVDSO         sourceScanProfile = "arm-vdso"
 	sourceScanArm64VDSO       sourceScanProfile = "arm64-vdso"
 	sourceScanArm32CompatVDSO sourceScanProfile = "arm32-compat-vdso"
@@ -1371,9 +1373,10 @@ func sourcePredefinedSymbols(srcarch string) map[string]bool {
 	// !__KERNEL__ branch. Record that kernel-action consequence explicitly so
 	// scanning acenv.h does not treat libc includes as potentially active.
 	symbols := map[string]bool{
-		"__KERNEL__": true,
-		"__GNUC__":   true,
-		"__clang__":  true,
+		"__KERNEL__":   true,
+		"__GNUC__":     true,
+		"__clang__":    true,
+		"__GENKSYMS__": false,
 		// Linux kernel C actions never enable AVX2. The x86 architecture
 		// Makefile explicitly adds -mno-avx, and non-x86 target compilers do
 		// not define this target builtin.
@@ -1431,6 +1434,15 @@ func sourceProfilePredefinedSymbols(profile sourceScanProfile) map[string]bool {
 	case sourceScanKernelModule:
 		return map[string]bool{
 			"MODULE": true,
+		}
+	case sourceScanKernelGenksyms:
+		return map[string]bool{
+			"__GENKSYMS__": true,
+		}
+	case sourceScanModuleGenksyms:
+		return map[string]bool{
+			"MODULE":       true,
+			"__GENKSYMS__": true,
 		}
 	case sourceScanARMVDSO:
 		return map[string]bool{

@@ -52,6 +52,7 @@ linux_object_action_group = rule(
         "arch": attr.string(),
         "compile_environment_index": attr.label(mandatory = True),
         "flags": attr.string_list(),
+        "genksyms": attr.label(executable = True, cfg = "exec"),
         "include_dirs": attr.string_list(),
         "language": attr.string(mandatory = True),
         "mode": attr.string(mandatory = True),
@@ -66,6 +67,10 @@ linux_object_action_group = rule(
         "recipe_id": attr.string(mandatory = True),
         "source_input_index": attr.label(mandatory = True),
         "srcarch": attr.string(),
+        "symversion_flags": attr.string_list(),
+        "symversion_remove_flags": attr.string_list(),
+        "symversions": attr.bool(),
+        "version": attr.string(),
     },
 )
 

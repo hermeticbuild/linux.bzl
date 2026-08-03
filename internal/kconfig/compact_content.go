@@ -191,6 +191,9 @@ func objectVariantContentID(
 	objtoolDisabled bool,
 	objtoolForce bool,
 	objtoolArgs []string,
+	symversions bool,
+	symversionFlags []string,
+	symversionRemoveFlags []string,
 ) string {
 	hasher := newCompactContentHasher(compactObjectContentDomain)
 	hasher.writeValue("object=", object)
@@ -225,6 +228,15 @@ func objectVariantContentID(
 	}
 	for _, arg := range objtoolArgs {
 		hasher.writeValue("objtool_arg=", arg)
+	}
+	if symversions {
+		hasher.writeValue("symversions=true")
+	}
+	for _, flag := range symversionFlags {
+		hasher.writeValue("symversion_flag=", flag)
+	}
+	for _, flag := range symversionRemoveFlags {
+		hasher.writeValue("symversion_remove_flag=", flag)
 	}
 	return hasher.id()
 }
@@ -972,6 +984,9 @@ func (metadata *CompactMetadata) validateContentIDs() error {
 			variant.ObjtoolDisabled,
 			variant.ObjtoolForce,
 			variant.ObjtoolArgs,
+			variant.Symversions,
+			variant.SymversionFlags,
+			variant.SymversionRemoveFlags,
 		)
 		if variant.ContentID != expected {
 			return fmt.Errorf("object target %q canonical fields hash to %s, got %s", variant.Target, expected, variant.ContentID)

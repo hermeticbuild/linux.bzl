@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig/buildgen"
@@ -94,13 +95,16 @@ type CompactObjectVariant struct {
 	ObjtoolArgs              []string `json:"objtool_args,omitempty"`
 	ObjtoolDisabled          bool     `json:"objtool_disabled,omitempty"`
 	ObjtoolForce             bool     `json:"objtool_force,omitempty"`
+	Symversions              bool     `json:"symversions,omitempty"`
+	SymversionFlags          []string `json:"symversion_flags,omitempty"`
+	SymversionRemoveFlags    []string `json:"symversion_remove_flags,omitempty"`
 	configFragment           map[string]string
 	Deps                     []string `json:"deps,omitempty"`
 	Members                  []string `json:"members,omitempty"`
 	generatedHeaderFamilyIDs []string
 }
 
-// CompactActionGroup is the only lazy graph metadata layered on compact-v6.
+// CompactActionGroup is the lazy grouping layer over concrete compact objects.
 // Objects share one configured rule when their concrete action recipe and the
 // set of configs that can reach them are identical.
 type CompactActionGroup struct {
@@ -120,6 +124,7 @@ type CompactBuildFileOptions struct {
 	Exports            []string
 	SourceLabelPackage string
 	SourceASN1Compiler string
+	SourceGenksyms     string
 	SourceObjtool      string
 	SourceRelacheck    string
 	SourceRootLabel    string
@@ -176,7 +181,7 @@ func (t *Tree) CompactMetadataBatchWithOptions(
 			return nil, fmt.Errorf("compact metadata has incomplete or inconsistent target identity %#v", opts.Target)
 		}
 		copy := *opts.Target
-		out.Schema = "compact-v7-adaptive-content-graph"
+		out.Schema = "compact-v8-adaptive-content-graph"
 		out.Target = &copy
 	}
 	configPayloads := map[string]CompactConfigPayload{}
@@ -489,6 +494,15 @@ func compactConcreteRecipeID(variant CompactObjectVariant) string {
 	for _, arg := range variant.ObjtoolArgs {
 		hasher.writeValue("objtool_arg=", arg)
 	}
+	if variant.Symversions {
+		hasher.writeValue("symversions=true")
+	}
+	for _, flag := range variant.SymversionFlags {
+		hasher.writeValue("symversion_flag=", flag)
+	}
+	for _, flag := range variant.SymversionRemoveFlags {
+		hasher.writeValue("symversion_remove_flag=", flag)
+	}
 	return hasher.id()
 }
 
@@ -692,7 +706,7 @@ func cleanKbuildDir(dir string) string {
 }
 
 func (v CompactObjectVariant) equal(other CompactObjectVariant) bool {
-	if v.Target != other.Target || v.ContentID != other.ContentID || v.CompileEnvironment != other.CompileEnvironment || v.Object != other.Object || v.Source != other.Source || v.SourceInputGroup != other.SourceInputGroup || v.Mode != other.Mode || v.ModuleRoot != other.ModuleRoot || v.ModName != other.ModName || v.ObjtoolDisabled != other.ObjtoolDisabled || v.ObjtoolForce != other.ObjtoolForce || len(v.sourceInputs) != len(other.sourceInputs) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ObjtoolArgs) != len(other.ObjtoolArgs) || len(v.configFragment) != len(other.configFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
+	if v.Target != other.Target || v.ContentID != other.ContentID || v.CompileEnvironment != other.CompileEnvironment || v.Object != other.Object || v.Source != other.Source || v.SourceInputGroup != other.SourceInputGroup || v.Mode != other.Mode || v.ModuleRoot != other.ModuleRoot || v.ModName != other.ModName || v.ObjtoolDisabled != other.ObjtoolDisabled || v.ObjtoolForce != other.ObjtoolForce || v.Symversions != other.Symversions || len(v.sourceInputs) != len(other.sourceInputs) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ObjtoolArgs) != len(other.ObjtoolArgs) || len(v.SymversionFlags) != len(other.SymversionFlags) || len(v.SymversionRemoveFlags) != len(other.SymversionRemoveFlags) || len(v.configFragment) != len(other.configFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
 		return false
 	}
 	for i := range v.sourceInputs {
@@ -712,6 +726,16 @@ func (v CompactObjectVariant) equal(other CompactObjectVariant) bool {
 	}
 	for i := range v.ObjtoolArgs {
 		if v.ObjtoolArgs[i] != other.ObjtoolArgs[i] {
+			return false
+		}
+	}
+	for i := range v.SymversionFlags {
+		if v.SymversionFlags[i] != other.SymversionFlags[i] {
+			return false
+		}
+	}
+	for i := range v.SymversionRemoveFlags {
+		if v.SymversionRemoveFlags[i] != other.SymversionRemoveFlags[i] {
 			return false
 		}
 	}
@@ -1511,9 +1535,22 @@ func (memo compactVariantMemo) variantForStack(
 	if len(members) == 0 && source == "" {
 		return CompactObjectVariant{}, fmt.Errorf("exact input scan cannot resolve a source for leaf object %q", name)
 	}
+	symversions := compactSymversionsEnabled(config, source)
+	var symversionFlags, symversionRemoveFlags []string
+	if symversions {
+		symversionFlags = normalizeSourceRootFlags(
+			filterResolvedKbuildFlagsForLanguage(object.flags, "c"),
+			opts.SourceRoot,
+		)
+		symversionRemoveFlags = normalizeSourceRootFlags(
+			filterResolvedKbuildFlagsForLanguage(object.remove, "c"),
+			opts.SourceRoot,
+		)
+	}
 	deps := []string{}
 	depContentIDs := []string{}
 	asn1ProvidedIncludes := []string{}
+	asn1HeaderClosureInputs := []string{}
 	if source != "" {
 		for _, dep := range asn1HeaderDepsForSource(opts.SourceRoot, source) {
 			if dep.object == name {
@@ -1540,6 +1577,10 @@ func (memo compactVariantMemo) variantForStack(
 				depContentIDs = append(depContentIDs, variant.ContentID)
 			}
 			asn1ProvidedIncludes = appendUniqueStrings(asn1ProvidedIncludes, dep.include)
+			asn1HeaderClosureInputs = appendUniqueStrings(
+				asn1HeaderClosureInputs,
+				dep.headerClosureInputs...,
+			)
 		}
 		sort.Strings(deps)
 		sort.Strings(depContentIDs)
@@ -1581,6 +1622,14 @@ func (memo compactVariantMemo) variantForStack(
 			)
 		}
 		actionFootprint := compactObjectActionFootprintForObject(name, flags)
+		actionFootprint.closureInputs = appendUniqueStrings(
+			actionFootprint.closureInputs,
+			asn1HeaderClosureInputs...,
+		)
+		actionFootprint.configSymbols = appendUniqueStrings(
+			actionFootprint.configSymbols,
+			compactSymversionConfigSymbols...,
+		)
 		if opts.Srcarch == "x86" && !object.objtoolDisabled {
 			actionFootprint.configSymbols = appendUniqueStrings(
 				actionFootprint.configSymbols,
@@ -1741,6 +1790,127 @@ func (memo compactVariantMemo) variantForStack(
 				sourceInputs = appendUniqueSourceInputs(sourceInputs, forcedClosure.sourceInputs...)
 			}
 		}
+		if symversions {
+			symversionSearch, err := scanner.actionIncludeSearch(source, symversionFlags)
+			if err != nil {
+				return CompactObjectVariant{}, fmt.Errorf(
+					"model genksyms include search for %s: %w",
+					name,
+					err,
+				)
+			}
+			symversionProfile := compactGenksymsProfile(object.mode == "m")
+			appendSymversionClosure := func(closure sourceClosure) {
+				sourceRefs = appendUniqueStrings(sourceRefs, closure.refs...)
+				generatedIncludes = appendUniqueStrings(
+					generatedIncludes,
+					closure.generatedIncludes...,
+				)
+				sourceInputs = appendUniqueSourceInputs(sourceInputs, closure.sourceInputs...)
+			}
+			effectiveLanguage := compactEffectiveSourceLanguage(source)
+			if effectiveLanguage == "c" &&
+				(strings.HasSuffix(source, ".c") || strings.HasSuffix(source, ".c_shipped")) {
+				closure, err := scanner.closureForSourceConfigInputsSearchProfile(
+					source,
+					symversionSearch,
+					config,
+					false,
+					actionFootprint.providedIncludes,
+					symversionProfile,
+				)
+				if err != nil {
+					return CompactObjectVariant{}, fmt.Errorf(
+						"scan genksyms source inputs for %s: %w",
+						name,
+						err,
+					)
+				}
+				appendSymversionClosure(closure)
+			}
+			if effectiveLanguage == "c" {
+				for _, generatedSource := range actionFootprint.closureInputs {
+					closure, err := scanner.closureForSourceConfigInputsSearchProfile(
+						generatedSource,
+						symversionSearch,
+						config,
+						false,
+						actionFootprint.providedIncludes,
+						symversionProfile,
+					)
+					if err != nil {
+						return CompactObjectVariant{}, fmt.Errorf(
+							"scan genksyms generated input %s for %s: %w",
+							generatedSource,
+							name,
+							err,
+						)
+					}
+					appendSymversionClosure(closure)
+				}
+			}
+			if effectiveLanguage == "asm" {
+				headers, err := compactGenksymsAssemblyHeaders(opts.KernelVersion)
+				if err != nil {
+					return CompactObjectVariant{}, fmt.Errorf("model genksyms assembly inputs for %s: %w", name, err)
+				}
+				for _, include := range headers {
+					resolved := scanner.resolveInclude(source, include, sourceIncludeAngled, symversionSearch)
+					if len(resolved) == 0 {
+						return CompactObjectVariant{}, fmt.Errorf(
+							"model genksyms assembly inputs for %s: include <%s> does not resolve",
+							name,
+							include,
+						)
+					}
+					closure, err := scanner.closureForSourceConfigInputsSearchProfile(
+						resolved[0],
+						symversionSearch,
+						config,
+						false,
+						actionFootprint.providedIncludes,
+						symversionProfile,
+					)
+					if err != nil {
+						return CompactObjectVariant{}, fmt.Errorf(
+							"scan genksyms assembly include <%s> for %s: %w",
+							include,
+							name,
+							err,
+						)
+					}
+					appendSymversionClosure(closure)
+				}
+			}
+			genksymsForcedSources, err := forcedSourceInputs(symversionFlags, source, name)
+			if err != nil {
+				return CompactObjectVariant{}, fmt.Errorf("model genksyms forced inputs for %s: %w", name, err)
+			}
+			genksymsForcedSources = appendUnique(
+				genksymsForcedSources,
+				"include/linux/compiler_types.h",
+			)
+			sort.Strings(genksymsForcedSources)
+			for _, forcedSource := range genksymsForcedSources {
+				closure, err := scanner.closureForSourceConfigInputsSearchProfile(
+					forcedSource,
+					symversionSearch,
+					config,
+					false,
+					actionFootprint.providedIncludes,
+					symversionProfile,
+				)
+				if err != nil {
+					return CompactObjectVariant{}, fmt.Errorf(
+						"scan genksyms forced input %s for %s: %w",
+						forcedSource,
+						name,
+						err,
+					)
+				}
+				appendSymversionClosure(closure)
+			}
+		}
 	}
 	if isArm64NvheObject(name) {
 		forceAllGeneratedHeaders = true
@@ -1790,6 +1960,9 @@ func (memo compactVariantMemo) variantForStack(
 		opts.CompileEnvironmentABI,
 		generatedHeaderFamilyIDs,
 		opts.Srcarch,
+		symversions,
+		symversionFlags,
+		symversionRemoveFlags,
 	)
 	memo[name] = variant
 	return variant, nil
@@ -1859,6 +2032,11 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 	case "usr/initramfs_data.o":
 		footprint.sourceInputs = []string{"usr/default_cpio_list"}
 		footprint.providedIncludes = []string{"usr/initramfs_inc_data"}
+	case "certs/system_certificates.o":
+		footprint.providedIncludes = []string{
+			"certs/signing_key.x509",
+			"certs/x509_certificate_list",
+		}
 	case "arch/x86/kernel/cpu/capflags.o":
 		footprint.closureInputs = []string{
 			"arch/x86/include/asm/cpufeatures.h",
@@ -2193,6 +2371,9 @@ func (o resolvedKbuildObject) variant(
 	compileEnvironmentABI string,
 	generatedHeaderFamilyIDs []string,
 	srcarch string,
+	symversions bool,
+	symversionFlags []string,
+	symversionRemoveFlags []string,
 ) CompactObjectVariant {
 	fragment := map[string]string{}
 	refset := make(map[string]bool, len(o.footprint)+len(sourceRefs))
@@ -2273,6 +2454,9 @@ func (o resolvedKbuildObject) variant(
 		o.objtoolDisabled,
 		o.objtoolForce,
 		o.objtoolArgs,
+		symversions,
+		symversionFlags,
+		symversionRemoveFlags,
 	)
 	return CompactObjectVariant{
 		Target:             sanitizeTargetName(strings.TrimSuffix(o.object, ".o")) + "__" + compactShortID(contentID),
@@ -2289,9 +2473,15 @@ func (o resolvedKbuildObject) variant(
 		ObjtoolArgs:        append([]string(nil), o.objtoolArgs...),
 		ObjtoolDisabled:    o.objtoolDisabled,
 		ObjtoolForce:       o.objtoolForce,
-		configFragment:     fragment,
-		Deps:               append([]string(nil), deps...),
-		Members:            append([]string(nil), members...),
+		Symversions:        symversions,
+		SymversionFlags:    append([]string(nil), symversionFlags...),
+		SymversionRemoveFlags: append(
+			[]string(nil),
+			symversionRemoveFlags...,
+		),
+		configFragment: fragment,
+		Deps:           append([]string(nil), deps...),
+		Members:        append([]string(nil), members...),
 		generatedHeaderFamilyIDs: append(
 			[]string(nil),
 			generatedHeaderFamilyIDs...,
@@ -2363,6 +2553,76 @@ func filterResolvedKbuildFlags(groups []resolvedKbuildFlag, source string) []str
 		out = append(out, group.values...)
 	}
 	return out
+}
+
+func filterResolvedKbuildFlagsForLanguage(groups []resolvedKbuildFlag, language string) []string {
+	out := []string{}
+	for _, group := range groups {
+		if group.language != "" && group.language != "any" && group.language != language {
+			continue
+		}
+		out = append(out, group.values...)
+	}
+	return out
+}
+
+var compactSymversionConfigSymbols = []string{
+	"CONFIG_ASM_MODVERSIONS",
+	"CONFIG_BASIC_MODVERSIONS",
+	"CONFIG_GENKSYMS",
+	"CONFIG_MODVERSIONS",
+}
+
+func compactSymversionsEnabled(config *ResolvedConfig, source string) bool {
+	if config == nil || !config.ShouldWrite("CONFIG_MODVERSIONS") || config.Value("CONFIG_MODVERSIONS") != "y" {
+		return false
+	}
+	switch compactEffectiveSourceLanguage(source) {
+	case "c":
+		return true
+	case "asm":
+		return config.ShouldWrite("CONFIG_ASM_MODVERSIONS") && config.Value("CONFIG_ASM_MODVERSIONS") == "y"
+	default:
+		return false
+	}
+}
+
+func compactEffectiveSourceLanguage(source string) string {
+	switch filepath.Ext(source) {
+	case ".S", ".s", ".dts", ".dtso", ".pl":
+		return "asm"
+	case ".c", ".asn1", ".c_shipped", ".sh", ".uni":
+		return "c"
+	default:
+		return ""
+	}
+}
+
+func compactGenksymsProfile(module bool) sourceScanProfile {
+	if module {
+		return sourceScanModuleGenksyms
+	}
+	return sourceScanKernelGenksyms
+}
+
+func compactGenksymsAssemblyHeaders(version string) ([]string, error) {
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("kernel version %q does not contain a major and minor version", version)
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("kernel version %q has an invalid major version", version)
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("kernel version %q has an invalid minor version", version)
+	}
+	headers := []string{"linux/kernel.h"}
+	if major > 6 || (major == 6 && minor >= 18) {
+		headers = append(headers, "linux/string.h")
+	}
+	return append(headers, "asm/asm-prototypes.h"), nil
 }
 
 func kbuildFlagLanguageMatchesSource(language string, source string) bool {
@@ -2499,8 +2759,9 @@ func fileExists(path string) bool {
 }
 
 type asn1HeaderDep struct {
-	include string
-	object  string
+	include             string
+	object              string
+	headerClosureInputs []string
 }
 
 func asn1HeaderDepsForSource(sourceRoot, source string) []asn1HeaderDep {
@@ -2531,6 +2792,8 @@ func asn1HeaderDepsForSource(sourceRoot, source string) []asn1HeaderDep {
 		out = append(out, asn1HeaderDep{
 			include: filepath.ToSlash(include),
 			object:  object,
+			// scripts/asn1_compiler.c emits this include in every public .asn1.h.
+			headerClosureInputs: []string{"include/linux/asn1_decoder.h"},
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -3002,6 +3265,22 @@ func (m *CompactMetadata) objectBuildFile(opts CompactBuildFileOptions) ([]byte,
 		if opts.SourceASN1Compiler != "" && strings.HasSuffix(variant.Object, ".asn1.o") {
 			r.SetAttr("asn1_compiler", opts.SourceASN1Compiler)
 		}
+		if opts.Version != "" {
+			r.SetAttr("version", opts.Version)
+		}
+		if variant.Symversions {
+			if opts.SourceGenksyms == "" {
+				return nil, fmt.Errorf("source-backed object %q enables symbol versions without a genksyms label", variant.Object)
+			}
+			r.SetAttr("genksyms", opts.SourceGenksyms)
+			r.SetAttr("symversions", true)
+			if len(variant.SymversionFlags) != 0 {
+				r.SetAttr("symversion_flags", variant.SymversionFlags)
+			}
+			if len(variant.SymversionRemoveFlags) != 0 {
+				r.SetAttr("symversion_remove_flags", variant.SymversionRemoveFlags)
+			}
+		}
 		if opts.SourceRelacheck != "" && strings.HasSuffix(variant.Object, ".pi.o") {
 			r.SetAttr("relacheck", opts.SourceRelacheck)
 		}
@@ -3067,6 +3346,9 @@ func (m *CompactMetadata) objectBuildFile(opts CompactBuildFileOptions) ([]byte,
 				r.SetAttr("compile_environment_index", ":"+compileEnvironmentIndexTarget)
 				r.SetAttr("source_input_index", ":"+sourceInputIndexTarget)
 				r.SetAttr("tags", []string{"manual"})
+				if opts.Version != "" {
+					r.SetAttr("version", opts.Version)
+				}
 				if opts.Arch != "" {
 					r.SetAttr("arch", opts.Arch)
 				}
@@ -3078,6 +3360,19 @@ func (m *CompactMetadata) objectBuildFile(opts CompactBuildFileOptions) ([]byte,
 				}
 				if first.ModName != "" {
 					r.SetAttr("modname", first.ModName)
+				}
+				if first.Symversions {
+					if opts.SourceGenksyms == "" {
+						return nil, fmt.Errorf("grouped source-backed objects enable symbol versions without a genksyms label")
+					}
+					r.SetAttr("genksyms", opts.SourceGenksyms)
+					r.SetAttr("symversions", true)
+					if len(first.SymversionFlags) != 0 {
+						r.SetAttr("symversion_flags", first.SymversionFlags)
+					}
+					if len(first.SymversionRemoveFlags) != 0 {
+						r.SetAttr("symversion_remove_flags", first.SymversionRemoveFlags)
+					}
 				}
 				if first.ObjtoolDisabled {
 					r.SetAttr("objtool_disabled", true)
