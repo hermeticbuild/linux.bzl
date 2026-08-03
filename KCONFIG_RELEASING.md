@@ -11,6 +11,8 @@ overlays. The graph contains exact source-input digests, indexed config
 payloads and generated-header families, and canonical base/delta image rules.
 The rules repository pins the generator release that defines this format; the
 CLI and repository rule do not negotiate schemas or retain older emitters.
+The current `compact-v8-adaptive-content-graph` schema also records the exact
+`__GENKSYMS__` source closure and compile flags for basic module versioning.
 
 The same binary emits the source-derived `linux-rust-profile-v2` JSON profile
 and config-sensitive KASAN/KCSAN/UBSAN instrumentation flags, including Kbuild
@@ -45,10 +47,18 @@ label required for Kbuild-compatible post-processing.
 6. Exercise C sanitizer configs against maintained Linux 6.12 and 6.18 source
    trees. Verify KASAN/KCSAN/UBSAN object opt-outs, test-object opt-ins, arm64
    nVHE defaults, and integer-wrap inputs.
-7. Verify that unsupported source layouts, unresolved Make expressions,
+7. Exercise `CONFIG_MODVERSIONS=y` against maintained Linux 6.12 and 6.18
+   source trees on x86_64 and arm64. Cover C and assembly exports, generated C
+   sources, built-in and external C modules, and verify that extended, DWARF,
+   and Rust module-versioning paths fail closed.
+8. Exercise an empty `CONFIG_SYSTEM_TRUSTED_KEYS` configuration with
+   `CONFIG_SYSTEM_TRUSTED_KEYRING=y`, including dm-verity root-hash signature
+   verification. Verify that non-empty certificate, revocation, blacklist,
+   and module-signing inputs still fail closed.
+9. Verify that unsupported source layouts, unresolved Make expressions,
    incomplete leaf objects, and unsupported Rust profiles fail with actionable
    errors.
-8. Build the six platform archives twice from clean output trees and compare
+10. Build the six platform archives twice from clean output trees and compare
    their SHA-256 digests.
 
 Each deterministic `.tar.zst` archive must contain exactly two executables at
@@ -61,7 +71,7 @@ version stream.
 After the release-preparation change is merged, tag that merge commit:
 
 ```sh
-VERSION=v0.0.15 ./release_kconfig.sh
+VERSION=vX.Y.Z ./release_kconfig.sh
 ```
 
 The tag workflow publishes archives for Linux, macOS, and Windows on amd64 and

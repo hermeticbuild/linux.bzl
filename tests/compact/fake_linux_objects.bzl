@@ -124,6 +124,7 @@ linux_object = rule(
         "content_id": attr.string(mandatory = True),
         "deps": attr.label_list(),
         "flags": attr.string_list(),
+        "genksyms": attr.label(executable = True, cfg = "exec"),
         "include_dirs": attr.string_list(),
         "mode": attr.string(mandatory = True),
         "modname": attr.string(),
@@ -137,6 +138,10 @@ linux_object = rule(
         "source_input_group": attr.int(mandatory = True),
         "source_input_index": attr.label(mandatory = True),
         "srcarch": attr.string(),
+        "symversion_flags": attr.string_list(),
+        "symversion_remove_flags": attr.string_list(),
+        "symversions": attr.bool(),
+        "version": attr.string(),
     },
 )
 

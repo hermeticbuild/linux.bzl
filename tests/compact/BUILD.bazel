@@ -132,7 +132,7 @@ build_test(
 
 config_payload_batch_test(
     name = "config_payload_batch_test",
-    expected_actions = 3,
+    expected_actions = 4,
     expected_outputs = 36,
     target = "//tests/compact/content_graph:_compile_environment_index",
 )
