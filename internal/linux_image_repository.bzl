@@ -102,7 +102,7 @@ _REQUIRED_ARCH_CONFIGS = {
     "x86_64": ["CONFIG_X86", "CONFIG_X86_64"],
 }
 
-_REPOSITORY_GENERATOR_PROTOCOL = "compact-v7-adaptive-content-graph"
+_REPOSITORY_GENERATOR_PROTOCOL = "compact-v8-adaptive-content-graph"
 _CLANG_BASELINE_VERSION = "22.1.8"
 _IMAGE_COMPRESSION_CONFIGS = {
     "CONFIG_KERNEL_GZIP": True,
@@ -215,6 +215,9 @@ _CONTENT_GRAPH_OBJECT_KEYS = [
             "remove_flags": "string_list",
             "source": "string",
             "source_input_group": "int",
+            "symversion_flags": "string_list",
+            "symversion_remove_flags": "string_list",
+            "symversions": "bool",
             "target": "string",
         },
         ["mode", "object", "target"],
@@ -900,7 +903,7 @@ def _generate_content_graph(
     graph_dir = "graph"
     _initialize_generator_outputs(rctx, graph_dir)
     descriptor = _ARCHITECTURES[arch]
-    compile_environment_abi = "linux.bzl/compact-v7/clang-%s/%s/%s/%s" % (
+    compile_environment_abi = "linux.bzl/compact-v8/clang-%s/%s/%s/%s" % (
         _CLANG_BASELINE_VERSION,
         arch,
         descriptor.arch,
@@ -938,6 +941,8 @@ def _generate_content_graph(
         str(source),
         "-source_asn1_compiler",
         "//:_base_asn1_compiler_tool",
+        "-source_genksyms",
+        "//:_base_genksyms_tool",
         "-allow_shell",
         "-visibility",
         "//:__subpackages__",
@@ -1418,6 +1423,9 @@ def _action_recipe_key(variant):
         variant.get("flags", []),
         variant.get("remove_flags", []),
         variant.get("objtool_args", []),
+        variant.get("symversions", False),
+        variant.get("symversion_flags", []),
+        variant.get("symversion_remove_flags", []),
     ])
 
 def _canonical_nonempty_strings_error(values, context):

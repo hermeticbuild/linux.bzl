@@ -483,6 +483,79 @@ def _module_map(module_objects):
         modules[path] = info
     return modules
 
+def _symversion_cmd_path(object):
+    components = object.split("/")
+    if object.startswith("/") or any([component in ["", ".", ".."] for component in components]):
+        fail("invalid Linux symbol-version object path %r" % object)
+    if not object.endswith(".o"):
+        fail("Linux symbol-version object path must end in .o, got %r" % object)
+    if "/" not in object:
+        return "." + object + ".cmd"
+    directory, basename = object.rsplit("/", 1)
+    return directory + "/." + basename + ".cmd"
+
+def _object_symversion_records(info):
+    if not hasattr(info, "symversion_records") or not info.symversion_records:
+        return []
+    records = []
+    seen = {}
+    for record in info.symversion_records:
+        path = _symversion_cmd_path(record.object)
+        if record.object in seen:
+            fail("Linux object %s repeats symbol-version leaf %s" % (info.object, record.object))
+        seen[record.object] = True
+        records.append(struct(
+            cmd = record.cmd,
+            object = record.object,
+            path = path,
+        ))
+    return records
+
+def _stage_symversion_inputs(ctx, kernel, stage, module_paths):
+    if kernel.config.config_flags.get("CONFIG_MODVERSIONS") != "y":
+        return []
+
+    built_in_records = []
+    for info in kernel.objects:
+        built_in_records.extend(_object_symversion_records(info))
+    module_records = {
+        info.object: _object_symversion_records(info)
+        for info in kernel.module_objects
+    }
+
+    staged_by_path = {}
+    inputs = []
+    for owner, records in [("vmlinux", built_in_records)] + [
+        (path, module_records[path])
+        for path in module_paths
+    ]:
+        for record in records:
+            previous = staged_by_path.get(record.path)
+            if previous != None:
+                fail(
+                    "Linux symbol-version leaf %s is owned by both %s and %s" %
+                    (record.object, previous, owner),
+                )
+            staged = ctx.actions.declare_file(stage + "/" + record.path)
+            ctx.actions.symlink(output = staged, target_file = record.cmd)
+            staged_by_path[record.path] = owner
+            inputs.append(staged)
+
+    vmlinux_objects = ctx.actions.declare_file(stage + "/.vmlinux.objs")
+    ctx.actions.write(
+        vmlinux_objects,
+        "".join([record.object + "\n" for record in built_in_records]),
+    )
+    inputs.append(vmlinux_objects)
+    for path in module_paths:
+        manifest = ctx.actions.declare_file(stage + "/" + path[:-len(".o")] + ".mod")
+        ctx.actions.write(
+            manifest,
+            "".join([record.object + "\n" for record in module_records[path]]),
+        )
+        inputs.append(manifest)
+    return inputs
+
 def _modpost_args(config):
     args = []
     if config.config_flags.get("CONFIG_MODULES") == "y":
@@ -649,6 +722,12 @@ def _run_modpost(ctx, kernel, modpost, module_outputs):
         modules_order,
         "".join([path + "\n" for path in module_paths]),
     )
+    symversion_inputs = _stage_symversion_inputs(
+        ctx,
+        kernel,
+        stage,
+        module_paths,
+    )
     module_symvers = ctx.actions.declare_file(stage + "/Module.symvers")
     vmlinux_export = ctx.actions.declare_file(stage + "/.vmlinux.export.c")
     outputs = [module_symvers, vmlinux_export] + [
@@ -671,7 +750,7 @@ def _run_modpost(ctx, kernel, modpost, module_outputs):
         ctx.actions,
         executable = ctx.executable._runincwd,
         exec_group = "host_cc",
-        inputs = [staged_vmlinux, modules_order] + staged_modules + module_checks,
+        inputs = [staged_vmlinux, modules_order] + staged_modules + module_checks + symversion_inputs,
         tools = [modpost],
         outputs = outputs,
         arguments = [args],
@@ -726,4 +805,6 @@ linux_module_actions = struct(
     add_target_c_flags = _add_target_c_flags,
     target_context = _target_context,
     target_link_flags = _target_link_flags,
+    symversion_cmd_path = _symversion_cmd_path,
+    version_at_least = _version_at_least,
 )

@@ -143,7 +143,7 @@ def _metadata_without_key(metadata, collection, key):
 def _metadata_key_validation_test_impl(ctx):
     env = unittest.begin(ctx)
     metadata = {
-        "schema": "compact-v7-adaptive-content-graph",
+        "schema": "compact-v8-adaptive-content-graph",
         "target": {
             "linux_arch": "x86",
             "probe_identity": "sha256-test",
@@ -232,7 +232,7 @@ def _metadata_key_validation_test_impl(ctx):
             "metadata with retired field %r should be rejected, got %r" % (key, error),
         )
     sparse = {
-        "schema": "compact-v7-adaptive-content-graph",
+        "schema": "compact-v8-adaptive-content-graph",
         "target": {
             "linux_arch": "x86",
             "probe_identity": "sha256-test",
@@ -473,6 +473,26 @@ def _action_group_validation_test_impl(ctx):
         validation.stats,
     )
 
+    modversions = _replace_item(
+        metadata,
+        "action_groups",
+        1,
+        {"recipe_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    )
+    modversions = _replace_item(
+        modversions,
+        "object_variants",
+        1,
+        {
+            "symversion_flags": ["-D__GENKSYMS__"],
+            "symversion_remove_flags": ["-fno-symversions"],
+            "symversions": True,
+        },
+    )
+    modversions_validation = repositories_test_helpers.action_group_validation(modversions)
+    asserts.equals(env, "", modversions_validation.error)
+    asserts.equals(env, 2, modversions_validation.stats.get("action_group_recipes"))
+
     duplicate_id = _replace_item(
         metadata,
         "action_groups",
@@ -640,7 +660,7 @@ def compile_environment_abi_test(name):
     _compile_environment_abi_subject(
         name = subject,
         actual = "unexpected-abi",
-        expected = "linux.bzl/compact-v7/clang-22.1.8/x86_64/x86/x86/probe-sha256-test",
+        expected = "linux.bzl/compact-v8/clang-22.1.8/x86_64/x86/x86/probe-sha256-test",
         tags = ["manual"],
     )
     _compile_environment_abi_failure_test(

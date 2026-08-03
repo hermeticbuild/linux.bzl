@@ -10,6 +10,7 @@ package(default_visibility = ["//visibility:public"])
 exports_files([
     "kvm.config",
     "armv7.config",
+    "modversions.config",
     "rust.config",
     "rust_arm64.config",
     "tiny.config",
@@ -65,6 +66,51 @@ linux_cc_module(
     name = "hello_c_module_armv7",
     srcs = ["hello_module.c"],
     kernel = "@e2e_armv7//:kernel",
+)
+
+linux_cc_module(
+    name = "hello_c_module_6_12_96_modversions",
+    srcs = ["hello_module.c"],
+    kernel = "@e2e_6_12_96_x86_64//variants/modversions:kernel",
+)
+
+linux_cc_module(
+    name = "hello_c_module_x86_64_modversions",
+    srcs = ["hello_module.c"],
+    kernel = "@e2e_x86_64//variants/modversions:kernel",
+)
+
+linux_cc_module(
+    name = "hello_c_module_aarch64_modversions",
+    srcs = ["hello_module.c"],
+    kernel = "@e2e_aarch64//variants/modversions:kernel",
+)
+
+build_test(
+    name = "modversions_6_12_96_x86_64_build_test",
+    targets = [
+        "@e2e_6_12_96_x86_64//variants/modversions:kernel",
+        "@e2e_6_12_96_x86_64//variants/modversions:modules",
+        ":hello_c_module_6_12_96_modversions",
+    ],
+)
+
+build_test(
+    name = "modversions_6_18_39_x86_64_build_test",
+    targets = [
+        "@e2e_x86_64//variants/modversions:kernel",
+        "@e2e_x86_64//variants/modversions:modules",
+        ":hello_c_module_x86_64_modversions",
+    ],
+)
+
+build_test(
+    name = "modversions_6_18_39_aarch64_build_test",
+    targets = [
+        "@e2e_aarch64//variants/modversions:kernel",
+        "@e2e_aarch64//variants/modversions:modules",
+        ":hello_c_module_aarch64_modversions",
+    ],
 )
 
 linux_module(
@@ -565,6 +611,9 @@ build_test(
 build_test(
     name = "linux_source_root_package_build_test",
     targets = [
+        "@e2e_linux_6_18_39//:arch/arm/boot/dts",
+        "@e2e_linux_6_18_39//:dtb_sources",
+        "@e2e_linux_6_18_39//:include",
         "@e2e_linux_6_18_39//:tools/bpf/resolve_btfids/main.c",
         "@e2e_linux_6_18_39//:tools/lib/subcmd/Build.linux-bzl",
         "@e2e_linux_6_18_39//:tools/lib/subcmd/subcmd-config.c",

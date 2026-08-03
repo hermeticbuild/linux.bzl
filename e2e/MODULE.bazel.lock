@@ -47,6 +47,7 @@
     "https://bcr.bazel.build/modules/bazel_features/1.43.0/MODULE.bazel": "defa2226f06ba20550d6548c3a2ea2a7929634437a52973869c20c225450eb91",
     "https://bcr.bazel.build/modules/bazel_features/1.45.0/MODULE.bazel": "7daec6d87ab0703417486d4cb948af0b06f55d4d7c08cbb5978c80e79b538edf",
     "https://bcr.bazel.build/modules/bazel_features/1.47.0/MODULE.bazel": "e34df3cb35b1684cfa69923a61ae3803595babd3942cd306a488d51400886b30",
+    "https://bcr.bazel.build/modules/bazel_features/1.47.1/MODULE.bazel": "e6be691539341681678a68c2076771f6a73fcdc9823c5b6bf280d2e916d1ad80",
     "https://bcr.bazel.build/modules/bazel_features/1.50.0/MODULE.bazel": "2083ef9c7a469f520890483ccf8e0189d6e71e2117e7752e15e6554433d5ae3e",
     "https://bcr.bazel.build/modules/bazel_features/1.50.0/source.json": "e0ee3debde2789ff56e4452e612d126925ba9ab64d4bde79c67f099d2902df9b",
     "https://bcr.bazel.build/modules/bazel_features/1.9.0/MODULE.bazel": "885151d58d90d8d9c811eb75e3288c11f850e1d6b481a8c9f766adee4712358b",
@@ -70,12 +71,16 @@
     "https://bcr.bazel.build/modules/bazel_skylib/1.8.2/MODULE.bazel": "69ad6927098316848b34a9142bcc975e018ba27f08c4ff403f50c1b6e646ca67",
     "https://bcr.bazel.build/modules/bazel_skylib/1.9.0/MODULE.bazel": "72997b29dfd95c3fa0d0c48322d05590418edef451f8db8db5509c57875fb4b7",
     "https://bcr.bazel.build/modules/bazel_skylib/1.9.0/source.json": "7ad77c1e8c1b84222d9b3f3cae016a76639435744c19330b0b37c0a3c9da7dc0",
+    "https://bcr.bazel.build/modules/bison/3.8.2.bcr.7/MODULE.bazel": "92dd6e702fb01134ff70c8d035ac437b68d79371bb1b0181cd78e8c1cf90af05",
+    "https://bcr.bazel.build/modules/bison/3.8.2.bcr.7/source.json": "c37d58def4305e8d243511d8d823611847a228a8c6186794498f5d30f003430a",
     "https://bcr.bazel.build/modules/buildozer/8.5.1/MODULE.bazel": "a35d9561b3fc5b18797c330793e99e3b834a473d5fbd3d7d7634aafc9bdb6f8f",
     "https://bcr.bazel.build/modules/buildozer/8.5.1/source.json": "e3386e6ff4529f2442800dee47ad28d3e6487f36a1f75ae39ae56c70f0cd2fbd",
     "https://bcr.bazel.build/modules/bzip2/1.0.8.bcr.3/MODULE.bazel": "29ecf4babfd3c762be00d7573c288c083672ab60e79c833ff7f49ee662e54471",
     "https://bcr.bazel.build/modules/bzip2/1.0.8.bcr.3/source.json": "8be4a3ef2599693f759e5c0990a4cc5a246ac08db4c900a38f852ba25b5c39be",
     "https://bcr.bazel.build/modules/elfutils/0.195/MODULE.bazel": "e76f1f423235a390e29c649f266a960a7563270cbffac9cdfb02136d449fc161",
     "https://bcr.bazel.build/modules/elfutils/0.195/source.json": "3375293960b28396fc6e403ceebae20cca34537de22e1ad2acf586c3b8780c9f",
+    "https://bcr.bazel.build/modules/flex/2.6.4.bcr.5/MODULE.bazel": "72575f9a1926e50e7a9c7a61a98394390c36a22f28ba16c7d94b51534cfb974c",
+    "https://bcr.bazel.build/modules/flex/2.6.4.bcr.5/source.json": "58ea819b72b59020743c12c11799624dcea18efcdbc4b3f0b470f43c7ea24d5e",
     "https://bcr.bazel.build/modules/gawk/5.3.2.bcr.3/MODULE.bazel": "f1b7bb2dd53e8f2ef984b39485ec8a44e9076dda5c4b8efd2fb4c6a6e856a31d",
     "https://bcr.bazel.build/modules/gawk/5.3.2.bcr.3/source.json": "ebe931bfe362e4b41e59ee00a528db6074157ff2ced92eb9e970acab2e1089c9",
     "https://bcr.bazel.build/modules/gazelle/0.32.0/MODULE.bazel": "b499f58a5d0d3537f3cf5b76d8ada18242f64ec474d8391247438bf04f58c7b8",
@@ -105,6 +110,11 @@
     "https://bcr.bazel.build/modules/llvm/0.8.9/MODULE.bazel": "9e35ff5bcac996f9edc1b44b8f8baa58c7855e742c5608b07d925dcdbe642100",
     "https://bcr.bazel.build/modules/lz4/1.10.0.bcr.1/MODULE.bazel": "701a49c6304d1f836604dbfbb1642a0c89320c8bd2fbe5a768ae97b48c8df1d4",
     "https://bcr.bazel.build/modules/lz4/1.10.0.bcr.1/source.json": "33ed2bd01e038792015c2097fdbd4f4ce4f00c2046e9ea62e7fff1ab151754e4",
+    "https://bcr.bazel.build/modules/m4/1.4.21.bcr.4/MODULE.bazel": "40fef4b9091aea8e97b76a5706b3490b8d731ba008b02a883751ee2abf84daf4",
+    "https://bcr.bazel.build/modules/m4/1.4.21.bcr.4/source.json": "c4add456cedd43c0c0d1329bd52120f8eedb6191c6d8299448bce1ed81be60a4",
+    "https://bcr.bazel.build/modules/m4/1.4.21/MODULE.bazel": "f0228f83067f5b7c3ecb5dd5269ca4337e935c31305e26d5a60a8876f6fc2620",
+    "https://bcr.bazel.build/modules/nlohmann_json/3.12.0.bcr.1/MODULE.bazel": "a1c8bb07b5b91d971727c635f449d05623ac9608f6fe4f5f04254ea12f08e349",
+    "https://bcr.bazel.build/modules/nlohmann_json/3.12.0.bcr.1/source.json": "93f82a5ae985eb935c539bfee95e04767187818189241ac956f3ccadbdb8fb02",
     "https://bcr.bazel.build/modules/nlohmann_json/3.6.1/MODULE.bazel": "6f7b417dcc794d9add9e556673ad25cb3ba835224290f4f848f8e2db1e1fca74",
     "https://bcr.bazel.build/modules/package_metadata/0.0.3/MODULE.bazel": "77890552ecea9e284b5424c9de827a58099348763a4359e975c359a83d4faa83",
     "https://bcr.bazel.build/modules/package_metadata/0.0.5/MODULE.bazel": "ef4f9439e3270fdd6b9fd4dbc3d2f29d13888e44c529a1b243f7a31dfbc2e8e4",
@@ -172,6 +182,10 @@
     "https://bcr.bazel.build/modules/rules_cc/0.2.20/source.json": "1155433dc6b8161bc339ce94095b337ed95feb1f048b014e10b62339d4b4239c",
     "https://bcr.bazel.build/modules/rules_cc/0.2.4/MODULE.bazel": "1ff1223dfd24f3ecf8f028446d4a27608aa43c3f41e346d22838a4223980b8cc",
     "https://bcr.bazel.build/modules/rules_cc/0.2.8/MODULE.bazel": "f1df20f0bf22c28192a794f29b501ee2018fa37a3862a1a2132ae2940a23a642",
+    "https://bcr.bazel.build/modules/rules_cc_autoconf/0.10.0/MODULE.bazel": "1b289095784d6d4253b45de18e380ee5f5c179b35223ad067ae1b17d8a537429",
+    "https://bcr.bazel.build/modules/rules_cc_autoconf/0.13.2/MODULE.bazel": "3ec13b93183a28b7088563e0fef1a51835dde06c272a1dabc5900e8bc26b2188",
+    "https://bcr.bazel.build/modules/rules_cc_autoconf/0.13.2/source.json": "e56c70d9525a6512263c562962d9087091da968945a0196f568d61866f23667a",
+    "https://bcr.bazel.build/modules/rules_cc_autoconf/0.9.0/MODULE.bazel": "cd81eb3ceb1e92326aa48c205937dcb79229222e1364c58166d0fdec27352c5d",
     "https://bcr.bazel.build/modules/rules_foreign_cc/0.9.0/MODULE.bazel": "c9e8c682bf75b0e7c704166d79b599f93b72cfca5ad7477df596947891feeef6",
     "https://bcr.bazel.build/modules/rules_fuzzing/0.5.2/MODULE.bazel": "40c97d1144356f52905566c55811f13b299453a14ac7769dfba2ac38192337a8",
     "https://bcr.bazel.build/modules/rules_go/0.41.0/MODULE.bazel": "55861d8e8bb0e62cbd2896f60ff303f62ffcb0eddb74ecb0e5c0cbe36fc292c8",
@@ -293,8 +307,8 @@
     },
     "@@linux.bzl+//:extensions.bzl%linux_images": {
       "os:linux,arch:amd64": {
-        "bzlTransitiveDigest": "2qkg4FRhhatGj72M7ut8P9yyE4izMadI81z3DpQOKu0=",
-        "usagesDigest": "JsKQ8wWjwipPH2RgDZwSVW/NAG4ASuRnNNffnUUeUkI=",
+        "bzlTransitiveDigest": "n4Zfq8imQsKB5+2n8klMWe7vCDIVfZ6BUyn6ZL4Ge8o=",
+        "usagesDigest": "tbh+HgXV+3aLkVonNGYZwseHj2p7IBJe2RmuCjsCaCo=",
         "recordedInputs": [
           "REPO_MAPPING:,e2e_linux_6_12_96 +linux_source_repository+e2e_linux_6_12_96",
           "REPO_MAPPING:,e2e_linux_6_18_39 +linux_source_repository+e2e_linux_6_18_39",
@@ -366,7 +380,9 @@
             "attributes": {
               "config": "@@//:tiny.config",
               "config_mode": "default",
-              "overlays": {},
+              "overlays": {
+                "modversions": "@@//:modversions.config"
+              },
               "platform": "@@llvm+//platforms:linux_x86_64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
               "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
@@ -381,7 +397,9 @@
             "attributes": {
               "config": "@@//:tiny.config",
               "config_mode": "default",
-              "overlays": {},
+              "overlays": {
+                "modversions": "@@//:modversions.config"
+              },
               "platform": "@@llvm+//platforms:linux_x86_64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
               "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
@@ -396,7 +414,9 @@
             "attributes": {
               "config": "@@//:tiny.config",
               "config_mode": "default",
-              "overlays": {},
+              "overlays": {
+                "modversions": "@@//:modversions.config"
+              },
               "platform": "@@llvm+//platforms:linux_x86_64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
               "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
@@ -415,7 +435,9 @@
                 "armv7": "e2e_6_12_96_x86_64__linux_graph__armv7"
               },
               "platform": "@@llvm+//platforms:linux_x86_64",
-              "variants": []
+              "variants": [
+                "modversions"
+              ]
             }
           },
           "e2e_aarch64__linux_graph__x86_64": {
@@ -423,7 +445,9 @@
             "attributes": {
               "config": "@@//:tiny_arm64.config",
               "config_mode": "default",
-              "overlays": {},
+              "overlays": {
+                "modversions": "@@//:modversions.config"
+              },
               "platform": "@@//:linux_aarch64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
               "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
@@ -438,7 +462,9 @@
             "attributes": {
               "config": "@@//:tiny_arm64.config",
               "config_mode": "default",
-              "overlays": {},
+              "overlays": {
+                "modversions": "@@//:modversions.config"
+              },
               "platform": "@@//:linux_aarch64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
               "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
@@ -453,7 +479,9 @@
             "attributes": {
               "config": "@@//:tiny_arm64.config",
               "config_mode": "default",
-              "overlays": {},
+              "overlays": {
+                "modversions": "@@//:modversions.config"
+              },
               "platform": "@@//:linux_aarch64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
               "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
@@ -472,7 +500,9 @@
                 "armv7": "e2e_aarch64__linux_graph__armv7"
               },
               "platform": "@@//:linux_aarch64",
-              "variants": []
+              "variants": [
+                "modversions"
+              ]
             }
           },
           "e2e_armv7__linux_graph__x86_64": {
@@ -879,7 +909,9 @@
             "attributes": {
               "config": "@@//:tiny.config",
               "config_mode": "default",
-              "overlays": {},
+              "overlays": {
+                "modversions": "@@//:modversions.config"
+              },
               "platform": "@@//:linux_x86_64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
               "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
@@ -894,7 +926,9 @@
             "attributes": {
               "config": "@@//:tiny.config",
               "config_mode": "default",
-              "overlays": {},
+              "overlays": {
+                "modversions": "@@//:modversions.config"
+              },
               "platform": "@@//:linux_x86_64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
               "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
@@ -909,7 +943,9 @@
             "attributes": {
               "config": "@@//:tiny.config",
               "config_mode": "default",
-              "overlays": {},
+              "overlays": {
+                "modversions": "@@//:modversions.config"
+              },
               "platform": "@@//:linux_x86_64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
               "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
@@ -928,7 +964,9 @@
                 "armv7": "e2e_x86_64__linux_graph__armv7"
               },
               "platform": "@@//:linux_x86_64",
-              "variants": []
+              "variants": [
+                "modversions"
+              ]
             }
           }
         }

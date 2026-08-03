@@ -179,6 +179,21 @@ def _module_command_flags_test_impl(ctx):
     asserts.equals(env, "ELFCLASS32", linux_module_actions.kernel_elf_class("armv7"))
     for arch in ["aarch64", "x86_64"]:
         asserts.equals(env, "ELFCLASS64", linux_module_actions.kernel_elf_class(arch))
+    asserts.equals(env, ".root.o.cmd", linux_module_actions.symversion_cmd_path("root.o"))
+    asserts.equals(
+        env,
+        "drivers/example/.leaf.o.cmd",
+        linux_module_actions.symversion_cmd_path("drivers/example/leaf.o"),
+    )
+    asserts.equals(
+        env,
+        ["-M", "-m", "-b", "-E"],
+        linux_module_actions.modpost_args(struct(config_flags = {
+            "CONFIG_BASIC_MODVERSIONS": "y",
+            "CONFIG_MODULES": "y",
+            "CONFIG_MODVERSIONS": "y",
+        })),
+    )
     return unittest.end(env)
 
 _module_command_flags_test = unittest.make(_module_command_flags_test_impl)

@@ -15,6 +15,7 @@ load(
     "LinuxImageInfo",
     "LinuxObjectInfo",
     "LinuxSourceInputIndexInfo",
+    "linux_module_cc_helpers",
 )
 load(
     ":path_mapping.bzl",
@@ -118,6 +119,12 @@ def _feature_configuration(ctx, cc_toolchain):
 
 def _target_triple(arch):
     return linux_architecture_profile_for_arch(arch).target_triple
+
+def _version_at_least(version, major, minor):
+    parts = version.split(".")
+    if len(parts) < 2:
+        fail("invalid Linux version %r" % version)
+    return (int(parts[0]), int(parts[1])) >= (major, minor)
 
 def _rewrite_target_flags(flags, target_triple):
     if not target_triple:
@@ -433,6 +440,101 @@ def _compile_arguments(ctx, base_flags, spec, source, output, config, generated_
     args.add(output)
     return args
 
+def _symversion_config_response(ctx, config, spec, source, source_root):
+    if not ctx.attr.symversion_remove_flags:
+        return struct(file = config.cflags, inputs = [])
+    out = ctx.actions.declare_file(
+        ctx.label.name + ".objects/" + spec.content_id + "/bazel_kbuild_cflags.symversions.rsp",
+    )
+    args = ctx.actions.args()
+    args.add("-in", config.cflags)
+    args.add("-out", out)
+    replacements = dict(config.config_flags)
+    replacements.update({
+        "src": source.dirname,
+        "srctree": source_root,
+    })
+    args.add_all([
+        _rewrite_source_root_flag(
+            _expand_make_refs(flag, replacements, spec.object),
+            source_root,
+        )
+        for flag in ctx.attr.symversion_remove_flags
+    ], before_each = "-remove")
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._flagfilter,
+        inputs = [config.cflags],
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxFlagFilter",
+        progress_message = "Filtering grouped Linux symbol-version flags %{label}",
+    )
+    return struct(file = out, inputs = [out])
+
+def _symversion_arguments(ctx, base_flags, spec, source, config, generated_headers, source_root, config_response):
+    replacements = dict(config.config_flags)
+    replacements.update({
+        "src": source.dirname,
+        "srctree": source_root,
+    })
+    object_args = ["@" + config_response.path]
+    mapping_files = [config_response]
+    if generated_headers != None and generated_headers.cflags != None:
+        object_args.append("@" + generated_headers.cflags.path)
+        mapping_files.append(generated_headers.cflags)
+    if ctx.attr.mode == "m":
+        object_args.append("-DMODULE")
+    object_args.extend(_object_name_flags(spec.object, ctx.attr.modname))
+    object_args.extend([
+        "-D__KERNEL__",
+        "-include",
+        source_root + "/include/linux/compiler-version.h",
+        "-include",
+        source_root + "/include/linux/kconfig.h",
+        "-include",
+        source_root + "/include/linux/compiler_types.h",
+        "-I" + config.include_dir,
+        "-fmacro-prefix-map=%s/=" % source_root,
+        "-I" + source.dirname,
+    ])
+    object_args.extend([
+        "-I" + include_dir
+        for include_dir in _source_include_dirs(source_root, ctx.attr.srcarch, generated_headers)
+    ])
+    object_args.extend([
+        _rewrite_source_root_flag(
+            _expand_make_refs(flag, replacements, spec.object),
+            source_root,
+        )
+        for flag in ctx.attr.symversion_flags
+    ])
+    object_args.extend(["-E", "-D__GENKSYMS__"])
+    if ctx.attr.language == "asm":
+        object_args.extend(["-xc", "-"])
+
+    source_root_file = ctx.attr.source_input_index[LinuxSourceInputIndexInfo].source_tree_info.root
+    anchors = {
+        source.dirname: directory_anchor(source),
+        source_root: directory_anchor(source_root_file, source_root),
+    }
+    if config.include_dir_anchor != None:
+        anchors[config.include_dir] = config.include_dir_anchor
+    if generated_headers != None:
+        anchors.update(generated_headers.include_dir_anchors)
+
+    args = ctx.actions.args()
+    args.add_all(base_flags)
+    add_mapped_values(
+        args,
+        object_args,
+        files = mapping_files,
+        directory_anchors = anchors,
+    )
+    if ctx.attr.language == "c":
+        args.add(source)
+    return args
+
 def _grouped_objtool(ctx, config, input_file, output):
     args = ctx.actions.args()
     args.add("-config", config.config)
@@ -459,6 +561,11 @@ def _grouped_objtool(ctx, config, input_file, output):
     )
 
 def _group_providers(ctx, objects, outputs):
+    symversion_files = []
+    for target in sorted(objects.keys()):
+        info = objects[target]
+        if hasattr(info, "symversion_records") and info.symversion_records:
+            symversion_files.extend([record.cmd for record in info.symversion_records])
     return [
         DefaultInfo(files = depset(outputs)),
         LinuxObjectActionGroupInfo(
@@ -469,7 +576,10 @@ def _group_providers(ctx, objects, outputs):
             reachability_id = ctx.attr.reachability_id,
             recipe_id = ctx.attr.recipe_id,
         ),
-        OutputGroupInfo(object = depset(outputs)),
+        OutputGroupInfo(
+            object = depset(outputs),
+            symversions = depset(symversion_files),
+        ),
     ]
 
 def _linux_object_action_group_impl(ctx):
@@ -505,6 +615,8 @@ def _linux_object_action_group_impl(ctx):
     outputs = []
     content_ids = {}
     use_objtool = ctx.executable.objtool != None and not ctx.attr.objtool_disabled
+    if ctx.attr.symversions and not ctx.executable.genksyms:
+        fail("%s requires genksyms when symversions are enabled" % ctx.label)
     for target in targets:
         spec = _decode_compile_spec(target, ctx.attr.objects[target])
         if spec.content_id in content_ids:
@@ -565,6 +677,72 @@ def _linux_object_action_group_impl(ctx):
         )
         if use_objtool:
             _grouped_objtool(ctx, config, compile_out, out)
+        symversion_records = []
+        if ctx.attr.symversions:
+            if config.config_flags.get("CONFIG_MODVERSIONS") != "y":
+                fail("%s enables symversions without CONFIG_MODVERSIONS=y" % ctx.label)
+            if _version_at_least(ctx.attr.version, 6, 18) and config.config_flags.get("CONFIG_GENKSYMS") != "y":
+                fail("%s requires CONFIG_GENKSYMS=y for symbol versions" % ctx.label)
+            config_response = _symversion_config_response(
+                ctx,
+                config,
+                spec,
+                source,
+                source_root,
+            )
+            symversion_cmd = ctx.actions.declare_file(
+                ctx.label.name + ".symversions/" + spec.content_id + "/" + spec.object + ".cmd",
+            )
+            runner_args = ctx.actions.args()
+            runner_args.add("-mode", ctx.attr.language)
+            llvm_nm = linux_module_cc_helpers.llvm_nm(cc_toolchain)
+            runner_args.add("-nm", llvm_nm)
+            runner_args.add("-object", compile_out)
+            runner_args.add("-compiler", compiler)
+            runner_args.add("-genksyms", ctx.executable.genksyms)
+            runner_args.add("-out", symversion_cmd)
+            runner_args.add("-linux-version", ctx.attr.version)
+            symversion_extra_inputs = []
+            if not _version_at_least(ctx.attr.version, 6, 18):
+                reference = ctx.actions.declare_file(
+                    ctx.label.name + ".symversions/" + spec.content_id + "/" + spec.object + ".symref",
+                )
+                ctx.actions.write(reference, "")
+                runner_args.add("-reference", reference)
+                symversion_extra_inputs.append(reference)
+            runner_args.add("--")
+            path_mapped_run(
+                ctx.actions,
+                executable = ctx.executable._genksymsrun,
+                inputs = depset(
+                    [compile_out, source, source_root_file] + config_response.inputs + symversion_extra_inputs,
+                    transitive = transitive_inputs,
+                ),
+                tools = [
+                    llvm_nm,
+                    ctx.attr.genksyms[DefaultInfo].files_to_run,
+                ],
+                outputs = [symversion_cmd],
+                arguments = [
+                    runner_args,
+                    _symversion_arguments(
+                        ctx,
+                        base_flags,
+                        spec,
+                        source,
+                        config,
+                        generated_headers,
+                        source_root,
+                        config_response.file,
+                    ),
+                ],
+                mnemonic = "LinuxGenksyms",
+                progress_message = "Generating grouped Linux symbol versions %s" % spec.object,
+            )
+            symversion_records.append(struct(
+                cmd = symversion_cmd,
+                object = spec.object,
+            ))
         info = LinuxObjectInfo(
             content_id = spec.content_id,
             generated_headers = depset([]),
@@ -576,6 +754,7 @@ def _linux_object_action_group_impl(ctx):
             objtool_args = list(ctx.attr.objtool_args) if use_objtool else [],
             objtool_force = ctx.attr.objtool_force if use_objtool else False,
             output = out,
+            symversion_records = symversion_records,
         )
         objects[target] = info
         outputs.append(out)
@@ -590,6 +769,7 @@ linux_object_action_group = rule(
             providers = [LinuxCompileEnvironmentIndexInfo],
         ),
         "flags": attr.string_list(),
+        "genksyms": attr.label(cfg = "exec", executable = True),
         "language": attr.string(mandatory = True, values = ["asm", "c"]),
         "mode": attr.string(mandatory = True, values = ["m", "y"]),
         "modname": attr.string(),
@@ -603,11 +783,25 @@ linux_object_action_group = rule(
         "reachability_id": attr.string(mandatory = True),
         "recipe_id": attr.string(mandatory = True),
         "remove_flags": attr.string_list(),
+        "symversion_flags": attr.string_list(),
+        "symversion_remove_flags": attr.string_list(),
+        "symversions": attr.bool(),
         "source_input_index": attr.label(
             mandatory = True,
             providers = [LinuxSourceInputIndexInfo],
         ),
         "srcarch": attr.string(mandatory = True),
+        "version": attr.string(default = "6.18.0"),
+        "_flagfilter": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/flagfilter"),
+            executable = True,
+        ),
+        "_genksymsrun": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/genksymsrun"),
+            executable = True,
+        ),
         "_objtoolrun": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/objtoolrun"),
@@ -670,6 +864,13 @@ def _merged_generated_include_dir_anchors(infos):
     for info in infos:
         anchors.update(info.generated_include_dir_anchors)
     return anchors
+
+def _merged_symversion_records(infos):
+    records = []
+    for info in infos:
+        if hasattr(info, "symversion_records") and info.symversion_records:
+            records.extend(info.symversion_records)
+    return records
 
 def _unique_generated_include_dirs(infos):
     seen = {}
@@ -745,6 +946,7 @@ def _linux_composite_object_action_group_impl(ctx):
                 objtool_args = list(ctx.attr.objtool_args),
                 objtool_force = ctx.attr.objtool_force,
                 output = out,
+                symversion_records = _merged_symversion_records(member_infos),
             )
             available[target] = info
             objects[target] = info

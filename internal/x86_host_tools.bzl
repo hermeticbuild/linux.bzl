@@ -349,6 +349,7 @@ def linux_x86_host_tools(
 
     return struct(
         asn1_compiler = common.asn1_compiler,
+        genksyms_tool = common.genksyms_tool,
         generated_headers = package_label(generated_headers),
         kallsyms_tool = common.kallsyms_tool,
         objtool = package_label(objtool),
@@ -408,6 +409,7 @@ def linux_x86_configured_host_tools(
     )
     return struct(
         asn1_compiler = shared.asn1_compiler,
+        genksyms_tool = shared.genksyms_tool,
         generated_headers = package_label(generated_headers),
         kallsyms_tool = shared.kallsyms_tool,
         objtool = shared.objtool,

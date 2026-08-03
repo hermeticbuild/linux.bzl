@@ -148,8 +148,7 @@ def _compile_external_rust(ctx, sdk, crate_root, crate_name):
         "Processing Rust-for-Linux module with objtool %{label}",
     )
 
-def _compile_external_c(ctx, sdk, source, module_name):
-    raw = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o.raw")
+def _external_c_arguments(ctx, sdk, source, module_name, output = None, preprocess = False):
     args = ctx.actions.args()
     linux_module_actions.add_target_c_flags(args, sdk.target_c_flags)
     args.add_all(linux_module_cc_helpers.module_flags("m"))
@@ -164,22 +163,36 @@ def _compile_external_c(ctx, sdk, source, module_name):
     ))
     add_directory_arg(args, directory_anchor(source), format = "-I%s")
     args.add_all(ctx.attr.copts)
-    args.add("-c")
+    if preprocess:
+        args.add_all(["-E", "-D__GENKSYMS__"])
+    else:
+        args.add("-c")
     args.add(source)
-    args.add("-o")
-    args.add(raw)
+    if output != None:
+        args.add("-o")
+        args.add(output)
+    return args
+
+def _compile_external_c(ctx, sdk, source, module_name):
+    raw = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o.raw")
     path_mapped_run(
         ctx.actions,
         executable = sdk.target.compiler,
         inputs = _sdk_target_inputs(sdk, ctx.files.srcs),
         outputs = [raw],
-        arguments = [args],
+        arguments = [_external_c_arguments(
+            ctx,
+            sdk,
+            source,
+            module_name,
+            output = raw,
+        )],
         mnemonic = "LinuxCModuleCompile",
         progress_message = "Compiling out-of-tree C Linux module %{label}",
     )
 
     out = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o")
-    return linux_module_actions.process_objtool(
+    out = linux_module_actions.process_objtool(
         ctx,
         sdk.config,
         sdk.objtool,
@@ -188,6 +201,60 @@ def _compile_external_c(ctx, sdk, source, module_name):
         "module",
         "LinuxCModuleObjtool",
         "Processing out-of-tree C Linux module with objtool %{label}",
+    )
+    symversion_record = None
+    if sdk.config.config_flags.get("CONFIG_MODVERSIONS") == "y":
+        if linux_module_actions.version_at_least(sdk.version, 6, 18) and sdk.config.config_flags.get("CONFIG_GENKSYMS") != "y":
+            fail("%s requires CONFIG_GENKSYMS=y for symbol versions" % ctx.label)
+        if not sdk.genksyms:
+            fail("%s requires a configured genksyms tool for CONFIG_MODVERSIONS=y" % ctx.label)
+        cmd = ctx.actions.declare_file(
+            ctx.label.name + ".external/symversions/" + module_name + ".o.cmd",
+        )
+        runner_args = ctx.actions.args()
+        runner_args.add("-mode", "c")
+        llvm_nm = linux_module_cc_helpers.llvm_nm(sdk.target.cc_toolchain)
+        runner_args.add("-nm", llvm_nm)
+        runner_args.add("-object", raw)
+        runner_args.add("-compiler", sdk.target.compiler)
+        runner_args.add("-genksyms", sdk.genksyms)
+        runner_args.add("-out", cmd)
+        runner_args.add("-linux-version", sdk.version)
+        extra_inputs = []
+        if not linux_module_actions.version_at_least(sdk.version, 6, 18):
+            reference = ctx.actions.declare_file(
+                ctx.label.name + ".external/symversions/" + module_name + ".symref",
+            )
+            ctx.actions.write(reference, "")
+            runner_args.add("-reference", reference)
+            extra_inputs.append(reference)
+        runner_args.add("--")
+        path_mapped_run(
+            ctx.actions,
+            executable = ctx.executable._genksymsrun,
+            inputs = _sdk_target_inputs(sdk, ctx.files.srcs + [raw] + extra_inputs),
+            tools = [llvm_nm, sdk.genksyms],
+            outputs = [cmd],
+            arguments = [
+                runner_args,
+                _external_c_arguments(
+                    ctx,
+                    sdk,
+                    source,
+                    module_name,
+                    preprocess = True,
+                ),
+            ],
+            mnemonic = "LinuxGenksyms",
+            progress_message = "Generating external Linux module symbol versions %{label}",
+        )
+        symversion_record = struct(
+            cmd = cmd,
+            object = module_name + ".o",
+        )
+    return struct(
+        object = out,
+        symversion_record = symversion_record,
     )
 
 def _add_rust_sdk_flags(args, sdk, flags):
@@ -230,12 +297,21 @@ def _check_external_modinfo(ctx, preliminary, crate_name):
     )
     return checked
 
-def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check):
+def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check, symversion_record = None):
     stage = ctx.label.name + ".external/modpost"
     staged_object = ctx.actions.declare_file(stage + "/" + crate_name + ".o")
     ctx.actions.symlink(output = staged_object, target_file = preliminary)
     manifest = ctx.actions.declare_file(stage + "/" + crate_name + ".mod")
     ctx.actions.write(manifest, crate_name + ".o\n")
+    symversion_inputs = []
+    if sdk.config.config_flags.get("CONFIG_MODVERSIONS") == "y":
+        if symversion_record == None:
+            fail("%s requires C symbol-version records for CONFIG_MODVERSIONS=y" % ctx.label)
+        staged_cmd = ctx.actions.declare_file(
+            stage + "/" + linux_module_actions.symversion_cmd_path(symversion_record.object),
+        )
+        ctx.actions.symlink(output = staged_cmd, target_file = symversion_record.cmd)
+        symversion_inputs.append(staged_cmd)
     modules_order = ctx.actions.declare_file(stage + "/modules.order")
     ctx.actions.write(modules_order, crate_name + ".o\n")
     kernel_symvers = ctx.actions.declare_file(stage + "/Kernel.symvers")
@@ -280,7 +356,7 @@ def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check):
             modules_order,
             kernel_symvers,
             modinfo_check,
-        ] + dep_symvers,
+        ] + dep_symvers + symversion_inputs,
         tools = [sdk.modpost],
         outputs = [mod_source, module_symvers],
         arguments = [args],
@@ -322,6 +398,8 @@ def _linux_module_impl(ctx):
     sdk = ctx.attr.kernel[LinuxModuleSdkInfo]
     if sdk.config.config_flags.get("CONFIG_MODULES") != "y":
         fail("%s requires a kernel with CONFIG_MODULES=y" % ctx.label)
+    if sdk.config.config_flags.get("CONFIG_MODVERSIONS") == "y":
+        fail("%s does not support Rust modules with CONFIG_MODVERSIONS=y" % ctx.label)
     if sdk.rust == None or not sdk.rust.enabled:
         fail("%s requires a kernel with CONFIG_RUST=y" % ctx.label)
     crate_root = _crate_root(ctx)
@@ -375,7 +453,8 @@ def _linux_cc_module_impl(ctx):
         fail("%s requires exactly one C source" % ctx.label)
     source = ctx.files.srcs[0]
     module_name = _crate_name(ctx)
-    preliminary = _compile_external_c(ctx, sdk, source, module_name)
+    compiled = _compile_external_c(ctx, sdk, source, module_name)
+    preliminary = compiled.object
     modinfo_check = _check_external_modinfo(ctx, preliminary, module_name)
     mod_source, module_symvers = _external_modpost(
         ctx,
@@ -383,6 +462,7 @@ def _linux_cc_module_impl(ctx):
         preliminary,
         module_name,
         modinfo_check,
+        symversion_record = compiled.symversion_record,
     )
     mod_object = _compile_external_mod_source(ctx, sdk, mod_source, module_name)
     linked = _link_module(
@@ -635,6 +715,7 @@ def _linux_module_sdk_impl(ctx):
             btf_tools = btf_tools,
             config = vmlinux.config,
             generated_headers = vmlinux.generated_headers,
+            genksyms = vmlinux.genksyms,
             kernel_key = str(ctx.label),
             kernel_release = vmlinux.config.kernel_release,
             module_common = module_common,
@@ -765,6 +846,11 @@ _linux_cc_module = rule(
         "_modulemodinfo": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/modulemodinfo"),
+            executable = True,
+        ),
+        "_genksymsrun": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/genksymsrun"),
             executable = True,
         ),
         "_objtoolrun": attr.label(
