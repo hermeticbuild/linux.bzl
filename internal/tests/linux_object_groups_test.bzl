@@ -153,6 +153,17 @@ def _composite_group_test_impl(ctx):
 
 _composite_group_test = analysistest.make(_composite_group_test_impl)
 
+def _path_mapping_key(path):
+    """Returns an execroot path identity independent of Bazel's config mapping."""
+    parts = path.replace("\\", "/").split("/")
+    if (
+        len(parts) >= 4 and
+        parts[0] == "bazel-out" and
+        parts[2] in ("bin", "genfiles")
+    ):
+        return "/".join([parts[0]] + parts[2:])
+    return "/".join(parts)
+
 def _symversion_group_test_impl(ctx):
     env = analysistest.begin(ctx)
     target = analysistest.target_under_test(env)
@@ -174,7 +185,7 @@ def _symversion_group_test_impl(ctx):
             compile_output = compile_actions[0].outputs.to_list()[0].path
             objtool_output = objtool_actions[0].outputs.to_list()[0].path
             inspected_object = _argument_after(actions[0].argv, "-object")
-            asserts.equals(env, compile_output, inspected_object)
+            asserts.equals(env, _path_mapping_key(compile_output), _path_mapping_key(inspected_object))
             asserts.true(env, compile_output in [file.path for file in actions[0].inputs.to_list()])
             asserts.false(env, objtool_output == inspected_object)
     return analysistest.end(env)
