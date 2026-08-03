@@ -15,11 +15,6 @@ common --repo_contents_cache=~/.cache/bazel-repo/contents
 # docs: https://bazel.build/reference/command-line-reference#flag--remote_download_outputs
 common --remote_download_outputs=minimal
 
-# Autoconf probes and the headers assembled from their results describe the
-# execution host. Keep both local and out of shared remote caches.
-build:ci --modify_execution_info=^CcAutoconf(Check|Hdr)$=+no-remote
-build:ci --modify_execution_info=^CcAutoconf(Check|Hdr)$=+no-cache
-
 # Allows tests to run bazelisk-in-bazel, since this is the cache folder used.
 # docs: https://bazel.build/reference/command-line-reference#flag--test_env
 test --test_env=XDG_CACHE_HOME
