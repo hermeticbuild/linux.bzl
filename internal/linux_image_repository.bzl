@@ -304,6 +304,7 @@ def _linux_image_impl(rctx):
     )
     source_metadata = json.decode(rctx.read(marker))
     source_integrity = source_metadata.get("integrity", "") if type(source_metadata) == "dict" else ""
+    module_make_vars = source_metadata.get("module_make_vars", {}) if type(source_metadata) == "dict" else {}
     if (
         type(source_metadata) != "dict" or
         source_metadata.get("protocol") != _SOURCE_REPOSITORY_PROTOCOL or
@@ -312,6 +313,15 @@ def _linux_image_impl(rctx):
         not source_integrity.startswith("sha256-")
     ):
         fail("source repository has invalid or incompatible linux.bzl metadata")
+    if type(module_make_vars) != "dict":
+        fail("source repository has invalid module_make_vars metadata")
+    for name, value in module_make_vars.items():
+        if type(name) != "string" or not name or type(value) != "string":
+            fail("source repository module_make_vars must be a string dictionary")
+    repository_module_make_vars = {
+        name: value.replace("$(srctree)", str(source_root)).replace("${srctree}", str(source_root))
+        for name, value in module_make_vars.items()
+    }
     rules_repo = _repository_prefix(rctx.attr._self_linux_bzl)
     arch = rctx.attr.target_profile
     descriptor = _ARCHITECTURES.get(arch)
@@ -344,6 +354,7 @@ def _linux_image_impl(rctx):
         raw = base_input,
         config_mode = rctx.attr.config_mode,
         minimum_rustc_version = minimum_rustc_version,
+        module_make_vars = repository_module_make_vars,
     )
     _validate_resolved_arch(arch, base, "resolved base config")
     validate_config_features(base, "resolved base config")
@@ -379,6 +390,7 @@ def _linux_image_impl(rctx):
             raw = merged,
             config_mode = rctx.attr.config_mode,
             minimum_rustc_version = minimum_rustc_version,
+            module_make_vars = repository_module_make_vars,
         )
         _validate_resolved_arch(arch, resolved, "resolved overlay %s" % name)
         validate_config_features(resolved, "resolved overlay %s" % name)
@@ -436,6 +448,7 @@ def _linux_image_impl(rctx):
         rules_repo = rules_repo,
         version = version,
         minimum_rustc_version = minimum_rustc_version,
+        module_make_vars = repository_module_make_vars,
     )
     graph_stats = content_graph.stats
     base_header_family_dependencies = content_graph.header_family_dependencies[arch]
@@ -483,6 +496,7 @@ def _linux_image_impl(rctx):
             base_rust_enabled = base_rust_enabled,
             config_mode = rctx.attr.config_mode,
             graph_image = graph_image,
+            module_make_vars = module_make_vars,
             variant_configs = variant_configs,
             variant_core_configs = variant_core_configs,
             variant_graph_images = variant_graph_images,
@@ -604,7 +618,7 @@ def _parse_config(content, description):
         _set_config_value(values, key, value, description, line_number + 1)
     return values
 
-def _resolve_config(rctx, tool, source_root, arch, version, name, raw, config_mode, minimum_rustc_version):
+def _resolve_config(rctx, tool, source_root, arch, version, name, raw, config_mode, minimum_rustc_version, module_make_vars = {}):
     descriptor = _ARCHITECTURES[arch]
     directory = ".linux_bzl_resolve/" + name
     input_path = directory + "/input.config"
@@ -651,7 +665,7 @@ def _resolve_config(rctx, tool, source_root, arch, version, name, raw, config_mo
         version,
         "-allow_shell",
     ]
-    _add_generator_variables(args, rctx, arch, descriptor, source_root, minimum_rustc_version)
+    _add_generator_variables(args, rctx, arch, descriptor, source_root, minimum_rustc_version, module_make_vars)
     result = rctx.execute(
         args,
         environment = {
@@ -899,7 +913,8 @@ def _generate_content_graph(
         generated_headers,
         rules_repo,
         version,
-        minimum_rustc_version):
+        minimum_rustc_version,
+        module_make_vars):
     graph_dir = "graph"
     _initialize_generator_outputs(rctx, graph_dir)
     descriptor = _ARCHITECTURES[arch]
@@ -957,7 +972,7 @@ def _generate_content_graph(
             "-generated_headers_for_config",
             "%s=%s" % (name, generated_headers[name]),
         ])
-    _add_generator_variables(args, rctx, arch, descriptor, source_root, minimum_rustc_version)
+    _add_generator_variables(args, rctx, arch, descriptor, source_root, minimum_rustc_version, module_make_vars)
 
     result = rctx.execute(
         args,
@@ -1227,7 +1242,7 @@ def _graph_arch_tool_args(arch):
         ]
     return []
 
-def _add_generator_variables(args, rctx, profile, descriptor, source_root, minimum_rustc_version):
+def _add_generator_variables(args, rctx, profile, descriptor, source_root, minimum_rustc_version, module_make_vars = {}):
     variables = dict(descriptor.compact_vars)
     variables.update({
         "ARCH": descriptor.arch,
@@ -1235,6 +1250,10 @@ def _add_generator_variables(args, rctx, profile, descriptor, source_root, minim
         "SRCARCH": descriptor.srcarch,
         "UTS_MACHINE": descriptor.uts_machine,
     })
+    for name, value in module_make_vars.items():
+        if name in variables or name == "srctree":
+            fail("module_make_vars cannot override reserved generator variable %r" % name)
+        variables[name] = value
     args.extend(_generator_variable_args(variables, source_root))
     for key, value in [
         ("ARCH", descriptor.arch),
@@ -1976,6 +1995,7 @@ def _kernel_root_build(
         base_rust_enabled,
         config_mode,
         graph_image,
+        module_make_vars,
         variant_configs,
         variant_core_configs,
         variant_graph_images,
@@ -2002,6 +2022,7 @@ linux_image_targets(
     base_rust_enabled = {base_rust_enabled},
     config_mode = {config_mode},
     graph_image = {graph_image},
+    module_make_vars = {module_make_vars},
     variant_configs = {variant_configs},
     variant_core_configs = {variant_core_configs},
     variant_graph_images = {variant_graph_images},
@@ -2023,6 +2044,7 @@ linux_image_targets(
         base_rust_enabled = repr(base_rust_enabled),
         config_mode = repr(config_mode),
         graph_image = repr(graph_image),
+        module_make_vars = _starlark_dict(module_make_vars, indent = "        "),
         variant_configs = _starlark_dict(variant_configs, indent = "        "),
         variant_core_configs = _starlark_dict(variant_core_configs, indent = "        "),
         variant_graph_images = _starlark_dict(variant_graph_images, indent = "        "),

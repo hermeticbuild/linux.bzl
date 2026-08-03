@@ -719,6 +719,7 @@ def _repository_protocol_test_impl(ctx):
         base_rust_enabled = False,
         config_mode = "default",
         graph_image = "//graph:x86_64_image",
+        module_make_vars = {},
         variant_configs = {"rust": "//configs:rust"},
         variant_core_configs = {"rust": "rust"},
         variant_graph_images = {"rust": "//graph:rust_image"},

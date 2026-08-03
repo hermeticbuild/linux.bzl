@@ -469,3 +469,67 @@ jobs:
             ${{ runner.temp }}/aya-e2e.log
           if-no-files-found: warn
           retention-days: 14
+
+  sonic-e2e:
+    name: SONiC linux_ngbde module
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-sonic-e2e
+          module-root: sonic_e2e
+          repository-cache: |
+            - sonic_e2e/.bazelversion
+            - sonic_e2e/MODULE.bazel
+            - sonic_e2e/MODULE.bazel.lock
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build SONiC linux_ngbde module
+        working-directory: sonic_e2e
+        env:
+          BAZEL_BEP: ${{ runner.temp }}/sonic-e2e.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/sonic-e2e.log
+          BAZEL_PROFILE: ${{ runner.temp }}/sonic-e2e.profile.gz
+        run: |
+          set -euo pipefail
+          bazel --host_jvm_args=-Xmx6g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            test //:sonic_linux_ngbde_module_test \
+            --config=path-mapping \
+            --notrack_incremental_state \
+            --nokeep_state_after_build \
+            --discard_analysis_cache \
+            --build_event_json_file="${BAZEL_BEP}" \
+            --profile="${BAZEL_PROFILE}" \
+            2>&1 | tee "${BAZEL_LOG}"
+
+      - name: Report cache efficiency
+        if: ${{ !cancelled() }}
+        env:
+          BAZEL_BEP: ${{ runner.temp }}/sonic-e2e.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/sonic-e2e.log
+          BAZEL_PROFILE: ${{ runner.temp }}/sonic-e2e.profile.gz
+        run: |
+          .github/workflows/bazel_cache_report.sh \
+            "SONiC linux_ngbde module" \
+            "${BAZEL_PROFILE}" \
+            "${BAZEL_BEP}" \
+            "${BAZEL_LOG}"
+
+      - name: Upload Bazel profile
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bazel-profile-sonic-e2e
+          path: |
+            ${{ runner.temp }}/sonic-e2e.profile.gz
+            ${{ runner.temp }}/sonic-e2e.bep.json
+            ${{ runner.temp }}/sonic-e2e.log
+          if-no-files-found: warn
+          retention-days: 14

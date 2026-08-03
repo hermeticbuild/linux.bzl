@@ -115,6 +115,10 @@ for configured images, as shown above.
 | `strip_prefix` | Archive prefix; overrides the catalog default when set |
 | `patches` | Deterministic patch files |
 | `patch_strip` | Strip count for `patches` |
+| `source_overlays` | In-tree destination directories mapped to marker files in external source roots |
+| `module_kbuild_roots` | Overlaid directories added to the kernel Kbuild graph |
+| `module_kconfig_roots` | Overlaid Kconfig files sourced by the root Kconfig |
+| `module_make_vars` | Deterministic variables needed while parsing overlaid Kconfig/Kbuild files |
 
 `linux_images.image` declares a configured kernel image with this public
 surface:
@@ -292,6 +296,48 @@ GENKSYMS CRCs for C and assembly exports and carries them through in-tree and
 out-of-tree C module modpost actions. Linux 6.18's basic format is supported;
 extended/DWARF formats and Rust modules with symbol versioning remain explicit
 errors.
+
+### Vendor Kbuild modules
+
+Vendor modules that expect to live in the kernel tree are overlaid into the
+Linux source repository. Their Kconfig and Kbuild roots then flow through the
+same resolver and compact graph generator as every upstream in-tree module;
+there is no separate module rule or Make invocation.
+
+```starlark
+# MODULE.bazel
+http_archive = use_repo_rule(
+    "@bazel_tools//tools/build_defs/repo:http.bzl",
+    "http_archive",
+)
+http_archive(
+    name = "sai_bcm_modules",
+    urls = ["https://github.com/sonic-net/sonic-buildimage/archive/0058681761a86abd324514d817faf0720aa27405.tar.gz"],
+    integrity = "sha256-W907LnUlUHP0wluU7aIaD2pm6LTn2o74T310/ePHeIQ=",
+    strip_prefix = "sonic-buildimage-0058681761a86abd324514d817faf0720aa27405",
+    build_file_content = 'exports_files(glob(["**"]))',
+)
+
+linux_source_repository(
+    name = "linux_6_18_39",
+    version = "6.18.39",
+    source_overlays = {
+        "drivers/net/ethernet/broadcom/sdklt": "@sai_bcm_modules//:platform/broadcom/saibcm-modules/sdklt/Makefile",
+    },
+    module_kbuild_roots = [
+        "drivers/net/ethernet/broadcom/sdklt/linux/bde",
+    ],
+    module_make_vars = {
+        "BDE_CPPFLAGS": "-UBCMDRD_INCLUDE_CUSTOM_CONFIG",
+        "SDK": "$(srctree)/drivers/net/ethernet/broadcom/sdklt",
+    },
+)
+```
+
+If a vendor tree has Kconfig entry points, list their in-tree paths in
+`module_kconfig_roots`. Selecting the vendor symbol as `m` makes its module a
+normal output of `@configured_kernel//:modules`, including the usual objtool,
+modpost, module-link, and optional BTF stages.
 
 ## Why
 
