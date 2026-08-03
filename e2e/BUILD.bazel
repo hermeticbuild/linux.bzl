@@ -9,7 +9,7 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "kvm.config",
-    "openbmc_armv7.config",
+    "armv7.config",
     "rust.config",
     "rust_arm64.config",
     "tiny.config",

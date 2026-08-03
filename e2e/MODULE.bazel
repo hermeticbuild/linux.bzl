@@ -127,7 +127,7 @@ linux_images.image(
 )
 linux_images.image(
     name = "e2e_armv7",
-    config = "//:openbmc_armv7.config",
+    config = "//:armv7.config",
     platform = "//:linux_armv7",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )

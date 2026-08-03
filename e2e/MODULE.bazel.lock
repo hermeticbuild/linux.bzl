@@ -294,7 +294,7 @@
     "@@linux.bzl+//:extensions.bzl%linux_images": {
       "os:linux,arch:amd64": {
         "bzlTransitiveDigest": "2qkg4FRhhatGj72M7ut8P9yyE4izMadI81z3DpQOKu0=",
-        "usagesDigest": "oedrIYD2KCVlUOqJzzltx1vGh7UMw2zoniy52FA4zCk=",
+        "usagesDigest": "JsKQ8wWjwipPH2RgDZwSVW/NAG4ASuRnNNffnUUeUkI=",
         "recordedInputs": [
           "REPO_MAPPING:,e2e_linux_6_12_96 +linux_source_repository+e2e_linux_6_12_96",
           "REPO_MAPPING:,e2e_linux_6_18_39 +linux_source_repository+e2e_linux_6_18_39",
@@ -478,7 +478,7 @@
           "e2e_armv7__linux_graph__x86_64": {
             "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
             "attributes": {
-              "config": "@@//:openbmc_armv7.config",
+              "config": "@@//:armv7.config",
               "config_mode": "default",
               "overlays": {},
               "platform": "@@//:linux_armv7",
@@ -493,7 +493,7 @@
           "e2e_armv7__linux_graph__aarch64": {
             "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
             "attributes": {
-              "config": "@@//:openbmc_armv7.config",
+              "config": "@@//:armv7.config",
               "config_mode": "default",
               "overlays": {},
               "platform": "@@//:linux_armv7",
@@ -508,7 +508,7 @@
           "e2e_armv7__linux_graph__armv7": {
             "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
             "attributes": {
-              "config": "@@//:openbmc_armv7.config",
+              "config": "@@//:armv7.config",
               "config_mode": "default",
               "overlays": {},
               "platform": "@@//:linux_armv7",

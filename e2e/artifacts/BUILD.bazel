@@ -7,7 +7,7 @@ go_test(
     srcs = ["artifact_test.go"],
     data = [
         "//:hello_c_module_armv7",
-        "//:openbmc_armv7.config",
+        "//:armv7.config",
         "@e2e_armv7//:config",
         "@e2e_armv7//:image",
         "@e2e_armv7//:vmlinux",
@@ -18,7 +18,7 @@ go_test(
         "ELF_MACHINE": "arm",
         "IMAGE_FORMAT": "arm-zimage",
         "INFERRED_CONFIG": "CONFIG_ARM",
-        "INPUT_CONFIG": "$(rlocationpath //:openbmc_armv7.config)",
+        "INPUT_CONFIG": "$(rlocationpath //:armv7.config)",
         "KERNEL_ELF_TYPE": "exec",
         "KERNEL_CONFIG": "$(rlocationpath @e2e_armv7//:config)",
         "KERNEL_IMAGE": "$(rlocationpath @e2e_armv7//:image)",
