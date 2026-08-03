@@ -864,6 +864,7 @@ def _core_config_aliases_test_impl(ctx):
         base_rust_enabled = False,
         config_mode = "default",
         graph_image = "//graph:x86_64_image",
+        module_make_vars = {},
         variant_configs = {"lz4": "//configs:lz4"},
         variant_core_configs = {"lz4": "x86_64"},
         variant_graph_images = {"lz4": "//graph:lz4_image"},

@@ -1,0 +1,17 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@bazel_skylib//rules:select_file.bzl", "select_file")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["sonic.config"])
+
+select_file(
+    name = "linux_ngbde_ko",
+    srcs = "@sonic_kernel//:modules",
+    subpath = "linux_ngbde.ko",
+)
+
+build_test(
+    name = "sonic_linux_ngbde_module_test",
+    targets = [":linux_ngbde_ko"],
+)

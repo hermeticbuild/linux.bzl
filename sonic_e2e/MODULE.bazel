@@ -1,0 +1,60 @@
+module(
+    name = "linux_bzl_sonic_e2e",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "linux.bzl", version = "0.0.1")
+bazel_dep(name = "llvm", version = "0.8.14")
+
+local_path_override(
+    module_name = "linux.bzl",
+    path = "..",
+)
+
+http_archive = use_repo_rule(
+    "@bazel_tools//tools/build_defs/repo:http.bzl",
+    "http_archive",
+)
+
+http_archive(
+    name = "sai_bcm_modules",
+    build_file_content = 'exports_files(glob(["**"]))',
+    integrity = "sha256-W907LnUlUHP0wluU7aIaD2pm6LTn2o74T310/ePHeIQ=",
+    strip_prefix = "sonic-buildimage-0058681761a86abd324514d817faf0720aa27405",
+    urls = ["https://github.com/sonic-net/sonic-buildimage/archive/0058681761a86abd324514d817faf0720aa27405.tar.gz"],
+)
+
+linux_source_repository = use_repo_rule(
+    "@linux.bzl//:linux.bzl",
+    "linux_source_repository",
+)
+
+linux_source_repository(
+    name = "sonic_linux_6_18_39",
+    module_kbuild_roots = [
+        "drivers/net/ethernet/broadcom/sdklt/linux/bde",
+    ],
+    module_make_vars = {
+        "BDE_CPPFLAGS": "-UBCMDRD_INCLUDE_CUSTOM_CONFIG",
+        "SDK": "$(srctree)/drivers/net/ethernet/broadcom/sdklt",
+    },
+    source_overlays = {
+        "drivers/net/ethernet/broadcom/sdklt": "@sai_bcm_modules//:platform/broadcom/saibcm-modules/sdklt/Makefile",
+    },
+    version = "6.18.39",
+)
+
+register_toolchains(
+    "@llvm//toolchain:all",
+)
+
+linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
+linux_images.image(
+    name = "sonic_kernel",
+    config = "//:sonic.config",
+    config_mode = "allnoconfig",
+    platform = "@llvm//platforms:linux_x86_64",
+    source = "@sonic_linux_6_18_39//:Kconfig",
+)
+use_repo(linux_images, "sonic_kernel")

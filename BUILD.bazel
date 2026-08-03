@@ -2,6 +2,7 @@
 # gazelle:exclude aya_e2e
 # gazelle:exclude e2e
 # gazelle:exclude examples
+# gazelle:exclude sonic_e2e
 # gazelle:resolve go github.com/bazelbuild/bazel-gazelle/rule @gazelle//rule
 
 load("@buildifier_prebuilt//:rules.bzl", "buildifier", "buildifier_test")

@@ -56,6 +56,7 @@ def _define_config(
         arch,
         minimum_rustc_version,
         rust_enabled,
+        module_make_vars,
         source_repo,
         version,
         visibility):
@@ -65,6 +66,7 @@ def _define_config(
         "SRCARCH": arch.srcarch,
         "UTS_MACHINE": arch.uts_machine,
     })
+    compact_vars.update(module_make_vars)
     kwargs = {
         "name": name,
         "config": config,
@@ -214,6 +216,7 @@ def linux_image_targets(
         graph_image,
         base_header_family_dependencies,
         base_header_family_ids,
+        module_make_vars,
         variant_configs,
         variant_core_configs,
         variant_graph_images,
@@ -268,6 +271,7 @@ def linux_image_targets(
         arch = descriptor,
         minimum_rustc_version = minimum_rustc_version,
         rust_enabled = base_rust_enabled,
+        module_make_vars = module_make_vars,
         source_repo = source_repo,
         version = version,
         visibility = internal_visibility,
@@ -342,6 +346,7 @@ def linux_image_targets(
             arch = descriptor,
             minimum_rustc_version = minimum_rustc_version,
             rust_enabled = variant_rust_enabled[variant],
+            module_make_vars = module_make_vars,
             source_repo = source_repo,
             version = version,
             visibility = internal_visibility,

@@ -32,6 +32,83 @@ _TOOLS_BUILD_FILE = "Build"
 _TOOLS_BUILD_FILE_RELOCATED = "Build.linux-bzl"
 _TOOLS_MAX_DEPTH = 64
 
+def _in_tree_path(path, what):
+    normalized = path.replace("\\", "/").strip("/")
+    if not normalized or normalized == ".":
+        fail("%s must be a non-empty source-root-relative path" % what)
+    if normalized != path.replace("\\", "/") or "//" in normalized:
+        fail("%s must be a normalized source-root-relative path, got %r" % (what, path))
+    for component in normalized.split("/"):
+        if component in ["", ".", ".."]:
+            fail("%s must not escape or alias the Linux source root, got %r" % (what, path))
+    return normalized
+
+def _stage_source_overlays(rctx):
+    destinations = []
+    for destination in sorted(rctx.attr.source_overlays.keys()):
+        normalized = _in_tree_path(destination, "source_overlays destination")
+        marker = rctx.path(rctx.attr.source_overlays[destination])
+        if not marker.exists or marker.is_dir:
+            fail("source_overlays[%r] must name a marker file in the overlay root" % destination)
+        source = marker.dirname
+        rctx.watch_tree(source)
+        output = rctx.path(normalized)
+        if output.exists:
+            fail("source_overlays destination %r already exists in the Linux source tree" % normalized)
+        pending = [(source, "")]
+        files = {}
+        for _ in range(_TOOLS_MAX_DEPTH):
+            if not pending:
+                break
+            current = pending
+            pending = []
+            for directory, relative in current:
+                for name in sorted([child.basename for child in directory.readdir()]):
+                    child = directory.get_child(name)
+                    child_relative = relative + "/" + name if relative else name
+                    if child.is_dir:
+                        pending.append((child, child_relative))
+                    else:
+                        files[child_relative] = child
+        if pending:
+            fail("source_overlays[%r] exceeds maximum directory depth %d" % (destination, _TOOLS_MAX_DEPTH))
+        if not files:
+            fail("source_overlays[%r] identifies an empty source tree" % destination)
+        for relative in sorted(files.keys()):
+            rctx.symlink(files[relative], normalized + "/" + relative)
+        destinations.append(normalized)
+    return destinations
+
+def _integrate_in_tree_modules(rctx):
+    kbuild_roots = []
+    for path in rctx.attr.module_kbuild_roots:
+        path = _in_tree_path(path, "module_kbuild_roots entry")
+        if path in kbuild_roots:
+            fail("duplicate module_kbuild_roots entry %r" % path)
+        if not rctx.path(path + "/Kbuild").exists and not rctx.path(path + "/Makefile").exists:
+            fail("module Kbuild root %r contains neither Kbuild nor Makefile" % path)
+        kbuild_roots.append(path)
+
+    kconfig_roots = []
+    for path in rctx.attr.module_kconfig_roots:
+        path = _in_tree_path(path, "module_kconfig_roots entry")
+        if path in kconfig_roots:
+            fail("duplicate module_kconfig_roots entry %r" % path)
+        if not rctx.path(path).exists:
+            fail("module Kconfig root %r does not exist" % path)
+        kconfig_roots.append(path)
+
+    if kbuild_roots:
+        root = rctx.path("Kbuild")
+        content = rctx.read(root).rstrip() + "\n\n# In-tree module roots added by linux.bzl.\n"
+        content += "\n".join(["obj-y += %s/" % path for path in kbuild_roots]) + "\n"
+        rctx.file(root, content, executable = False)
+    if kconfig_roots:
+        root = rctx.path("Kconfig")
+        content = rctx.read(root).rstrip() + "\n\n# In-tree module Kconfig roots added by linux.bzl.\n"
+        content += "\n".join(['source "%s"' % path for path in kconfig_roots]) + "\n"
+        rctx.file(root, content, executable = False)
+
 def _relocate_tools_build_files(rctx, tools):
     relocated = 0
     directories = [tools]
@@ -115,6 +192,8 @@ def _linux_source_repository_impl(rctx):
     for patch in rctx.attr.patches:
         rctx.patch(patch, strip = rctx.attr.patch_strip)
     _normalize_tools_build_files(rctx)
+    overlay_destinations = _stage_source_overlays(rctx)
+    _integrate_in_tree_modules(rctx)
 
     makefile = rctx.path("Makefile")
     kconfig = rctx.path("Kconfig")
@@ -144,6 +223,8 @@ def _linux_source_repository_impl(rctx):
         ".linux-bzl-source.json",
         json.encode({
             "integrity": integrity,
+            "module_make_vars": rctx.attr.module_make_vars,
+            "overlay_destinations": overlay_destinations,
             "protocol": LINUX_SOURCE_REPOSITORY_PROTOCOL,
             "version": actual_version,
         }) + "\n",
@@ -157,6 +238,15 @@ linux_source_repository = repository_rule(
         "integrity": attr.string(
             doc = "SHA-256 SRI digest required with explicit urls.",
         ),
+        "module_kbuild_roots": attr.string_list(
+            doc = "In-tree directories whose Kbuild or Makefile roots are added to the kernel object graph.",
+        ),
+        "module_kconfig_roots": attr.string_list(
+            doc = "In-tree Kconfig files sourced by the kernel root Kconfig.",
+        ),
+        "module_make_vars": attr.string_dict(
+            doc = "Additional deterministic Make variables used while parsing overlaid Kconfig and Kbuild files.",
+        ),
         "patch_strip": attr.int(
             default = 1,
             doc = "Number of leading path components stripped from patches.",
@@ -164,6 +254,10 @@ linux_source_repository = repository_rule(
         "patches": attr.label_list(
             allow_files = True,
             doc = "Deterministic unified-diff patches applied with Bazel's native patcher.",
+        ),
+        "source_overlays": attr.string_keyed_label_dict(
+            allow_files = True,
+            doc = "Map from in-tree destination directories to marker files identifying source overlay roots.",
         ),
         "strip_prefix": attr.string(
             doc = "Archive directory prefix to remove. Catalog entries provide a default.",
