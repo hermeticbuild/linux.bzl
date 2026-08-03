@@ -1,8 +1,8 @@
 """Common source-tree-specific host tools for Linux builds."""
 
-load("@bison//:bison.bzl", "bison")
-load("@flex//:flex.bzl", "flex")
+load("@rules_bison//bison:bison.bzl", "bison")
 load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_flex//flex:flex.bzl", "flex")
 load(":source_utils.bzl", "package_label", "source_label", "source_label_package", "source_labels")
 
 visibility("//...")
@@ -50,44 +50,32 @@ def linux_common_host_tools(
     if source_tree == None:
         source_tree = [source_label(source_repo, "all_files")]
     asn1_compiler = target_prefix + "_asn1_compiler_tool"
-    genksyms_parser = target_prefix + "_genksyms_parser"
-    genksyms_lexer = target_prefix + "_genksyms_lexer"
     genksyms_tool = target_prefix + "_genksyms_tool"
     kallsyms_tool = target_prefix + "_kallsyms_tool"
     resolve_btfids_tool = target_prefix + "_resolve_btfids_tool"
     sorttable_tool = target_prefix + "_sorttable_tool"
 
     genksyms_dir = target_prefix + ".genksyms"
-    parse_c = genksyms_dir + "/parse.tab.c"
-    parse_h = genksyms_dir + "/parse.tab.h"
+    genksyms_parser = genksyms_dir + "/parse.tab"
+    genksyms_lexer = genksyms_dir + "/lex.lex"
     parse_y = source_label(source_repo, "scripts/genksyms/parse.y")
-    lex_c = genksyms_dir + "/lex.lex.c"
     lex_l = source_label(source_repo, "scripts/genksyms/lex.l")
 
     bison(
         name = genksyms_parser,
-        srcs = [parse_y],
-        outs = [parse_c, parse_h],
-        args = [
-            "-o",
-            "$(execpath %s)" % parse_c,
-            "--defines=$(execpath %s)" % parse_h,
+        src = parse_y,
+        bison_options = [
             "-t",
             "-l",
-            "$(execpath %s)" % parse_y,
         ],
         visibility = visibility,
     )
 
     flex(
         name = genksyms_lexer,
-        srcs = [lex_l],
-        outs = [lex_c],
-        args = [
-            "-o",
-            "$(execpath %s)" % lex_c,
+        src = lex_l,
+        flex_options = [
             "-L",
-            "$(execpath %s)" % lex_l,
         ],
         visibility = visibility,
     )
