@@ -499,6 +499,35 @@ _indexed_assembly_source_test = analysistest.make(
     },
 )
 
+def _empty_system_certificates_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = [
+        action
+        for action in analysistest.target_actions(env)
+        if action.mnemonic == "LinuxObjectCompile"
+    ]
+    asserts.equals(env, 1, len(actions))
+    if actions:
+        action = actions[0]
+        input_paths = [file.short_path for file in action.inputs.to_list()]
+        for suffix in [
+            "/certs/signing_key.x509",
+            "/certs/x509_certificate_list",
+        ]:
+            asserts.true(
+                env,
+                any([path.endswith(suffix) for path in input_paths]),
+                "system certificates compile action is missing %s" % suffix,
+            )
+        asserts.true(
+            env,
+            any([arg.startswith("-Wa,-I,") for arg in action.argv]),
+            "system certificates compile action is missing its generated assembler include root",
+        )
+    return analysistest.end(env)
+
+_empty_system_certificates_test = analysistest.make(_empty_system_certificates_test_impl)
+
 _X86_PRECISE_HEADER_FAMILIES = [
     "static",
     "timeconst",
@@ -1092,9 +1121,9 @@ def linux_objects_fail_closed_test_suite(name):
         content_id = object_a_id,
         mode = "y",
         object = "certs/system_certificates.o",
-        source_input_file = 4,
+        source_input_file = 1,
         source_input_group = 1,
-        source_input_index = ":" + name + "_source_input_index",
+        source_input_index = ":" + name + "_certificate_source_input_index",
         tags = fixture_tags,
     )
 
@@ -1254,6 +1283,14 @@ def linux_objects_fail_closed_test_suite(name):
             "include/linux/kconfig.h",
             "linux_objects_test_fixture.c",
         ],
+        source_tree_info = ":" + source_tree,
+        tags = fixture_tags,
+    )
+    certificate_source_input_index = name + "_certificate_source_input_index"
+    linux_source_input_index(
+        name = certificate_source_input_index,
+        groups = ["1"],
+        srcs = ["linux_objects_test_fixture.S"],
         source_tree_info = ":" + source_tree,
         tags = fixture_tags,
     )
@@ -1774,7 +1811,6 @@ def linux_objects_fail_closed_test_suite(name):
     generic_header_tests.append(":" + riscv_purgatory_object_test)
     failure_cases = [
         (empty_image, "requires at least one compiled object"),
-        (certificate_object, "hermetic certificate embedding and signing are not implemented"),
         (duplicate_source_group_index, "duplicate or non-canonical group"),
         (empty_source_inputs_nvhe, "source_input_group 2 is out of range"),
         (invalid_environment_object, "must be a full lowercase SHA-256 content ID"),
@@ -1785,10 +1821,15 @@ def linux_objects_fail_closed_test_suite(name):
         (unbound_header_index, "family all content ID must be a full lowercase SHA-256 content ID"),
     ]
     tests = [
+        ":" + certificate_object + "_test",
         ":" + indexed_assembly_object_test,
         ":" + indexed_object_test,
         ":" + precise_family_object_test,
     ] + generic_header_tests
+    _empty_system_certificates_test(
+        name = certificate_object + "_test",
+        target_under_test = ":" + certificate_object,
+    )
 
     base_header_family_ids = {
         "all": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

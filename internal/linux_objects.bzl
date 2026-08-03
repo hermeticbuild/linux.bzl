@@ -65,6 +65,7 @@ LinuxObjectInfo = provider(
         "objtool_args": "Kbuild target-specific objtool arguments carried to a delayed composite root.",
         "objtool_force": "Whether Kbuild explicitly enables objtool for this object.",
         "output": "Object output file.",
+        "symversion_records": "Ordered per-leaf symbol-version records as structs with object and cmd fields.",
     },
 )
 
@@ -830,6 +831,13 @@ def _merged_generated_include_dir_anchors(object_infos):
         anchors.update(info.generated_include_dir_anchors)
     return anchors
 
+def _merged_symversion_records(object_infos):
+    records = []
+    for info in object_infos:
+        if hasattr(info, "symversion_records") and info.symversion_records:
+            records.extend(info.symversion_records)
+    return records
+
 def _single_file(target, attr_name):
     files = target.files.to_list()
     if len(files) != 1:
@@ -861,10 +869,17 @@ def _linux_generated_header_cflags_for_source(generated_headers, src):
         return []
     return _linux_generated_header_cflags(generated_headers)
 
-def _linux_filtered_config_flags_for_source(ctx, config, src, remove_flags, out_suffix = "filtered", remove_prefixes = []):
+def _linux_filtered_config_flags_for_source(
+        ctx,
+        config,
+        src,
+        remove_flags,
+        out_suffix = "filtered",
+        remove_prefixes = [],
+        force_c = False):
     if not config:
         return struct(flags = [], inputs = [])
-    base = config.aflags if _is_assembly_source(src) else config.cflags
+    base = config.aflags if _is_assembly_source(src) and not force_c else config.cflags
     if not remove_flags and not remove_prefixes:
         return struct(flags = [base], inputs = [])
 
@@ -1970,6 +1985,16 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         files.append(out)
         assembler_include_roots.append(out.dirname[:-len("/usr")])
         assembler_include_root_anchors[assembler_include_roots[-1]] = directory_anchor(out, assembler_include_roots[-1])
+
+    if ctx.attr.object == "certs/system_certificates.o":
+        signing_key = ctx.actions.declare_file(ctx.label.name + ".obj/certs/signing_key.x509")
+        trusted_keys = ctx.actions.declare_file(ctx.label.name + ".obj/certs/x509_certificate_list")
+        ctx.actions.write(signing_key, "")
+        ctx.actions.write(trusted_keys, "")
+        files.extend([signing_key, trusted_keys])
+        assembler_root = signing_key.dirname[:-len("/certs")]
+        assembler_include_roots.append(assembler_root)
+        assembler_include_root_anchors[assembler_root] = directory_anchor(signing_key, assembler_root)
 
     if ctx.attr.object == "arch/x86/purgatory/kexec-purgatory.o":
         purgatory = _linux_purgatory_outputs(
@@ -5733,7 +5758,6 @@ def _linux_object_impl(ctx):
     if ctx.attr.object in [
         "certs/blacklist_hashes.o",
         "certs/revocation_certificates.o",
-        "certs/system_certificates.o",
     ]:
         fail(
             "linux_object %s builds %s, but hermetic certificate embedding and signing are not implemented" %
@@ -5760,6 +5784,17 @@ def _linux_object_impl(ctx):
     config = compile_environment.config
     generated_headers = compile_environment.generated_headers
     config_values = config.config_flags
+    if ctx.attr.object == "certs/system_certificates.o":
+        for symbol in [
+            "CONFIG_IMA_APPRAISE_MODSIG",
+            "CONFIG_MODULE_SIG",
+            "CONFIG_MODULE_SIG_ALL",
+        ]:
+            if config_values.get(symbol) in ["y", "m"]:
+                fail("linux_object %s does not support certificate signing path %s" % (ctx.label, symbol))
+        trusted_keys = config_values.get("CONFIG_SYSTEM_TRUSTED_KEYS", "")
+        if trusted_keys not in ["", "\"\""]:
+            fail("linux_object %s does not support CONFIG_SYSTEM_TRUSTED_KEYS=%s" % (ctx.label, trusted_keys))
     if ctx.attr.module_root and ctx.attr.mode != "m":
         fail("linux_object %s marks a non-module object as a module root" % ctx.label)
 
@@ -5873,7 +5908,10 @@ def _linux_object_impl(ctx):
             )
         src = generated
         generated_sources.append(generated)
-    if config and _flags_need_utsversion_tmp(ctx.attr.flags):
+    action_flags = list(ctx.attr.flags)
+    if ctx.attr.symversions:
+        action_flags.extend(ctx.attr.symversion_flags)
+    if config and _flags_need_utsversion_tmp(action_flags):
         utsversion_tmp = ctx.actions.declare_file(ctx.label.name + ".obj/utsversion-tmp.h")
         uts_args = ctx.actions.args()
         uts_args.add("-config", config.config)
@@ -5891,7 +5929,7 @@ def _linux_object_impl(ctx):
         )
         generated_object_headers.append(utsversion_tmp)
         make_values["obj"] = utsversion_tmp.dirname
-    elif _flags_need_obj_dir(ctx.attr.flags):
+    elif _flags_need_obj_dir(action_flags):
         obj_marker = ctx.actions.declare_file(ctx.label.name + ".obj/.bazel-dir")
         ctx.actions.write(obj_marker, "")
         generated_object_headers.append(obj_marker)
@@ -5980,6 +6018,37 @@ def _linux_object_impl(ctx):
     if ctx.attr.arch == "x86" and ctx.attr.object.startswith("arch/x86/boot/startup/") and ctx.attr.object.endswith(".pi.o"):
         expanded_remove_flags = expanded_remove_flags + _linux_ftrace_remove_flags() + ["-flto=thin", "-flto", "-fsplit-lto-unit", "-fvisibility=hidden"]
     config_flag_inputs = _linux_filtered_config_flags_for_source(ctx, config, src, expanded_remove_flags)
+    symversion_config_flag_inputs = struct(flags = [], inputs = [])
+    expanded_symversion_flags = []
+    if ctx.attr.symversions:
+        if not config or config_values.get("CONFIG_MODVERSIONS") != "y":
+            fail("linux_object %s enables symversions without CONFIG_MODVERSIONS=y" % ctx.label)
+        if _linux_version_at_least(ctx.attr.version, 6, 18) and config_values.get("CONFIG_GENKSYMS") != "y":
+            fail("linux_object %s requires CONFIG_GENKSYMS=y for symbol versions" % ctx.label)
+        if not ctx.executable.genksyms:
+            fail("linux_object %s requires genksyms when symversions are enabled" % ctx.label)
+        expanded_symversion_remove_flags = _rewrite_source_root_flags(
+            _expand_flag_refs(ctx.attr.symversion_remove_flags, config_values, make_values, ctx.attr.object),
+            source_root,
+        )
+        symversion_config_flag_inputs = _linux_filtered_config_flags_for_source(
+            ctx,
+            config,
+            src,
+            expanded_symversion_remove_flags,
+            out_suffix = "symversions",
+            force_c = True,
+        )
+        expanded_symversion_flags = _rewrite_source_root_flags(
+            _expand_flag_refs(ctx.attr.symversion_flags, config_values, make_values, ctx.attr.object),
+            source_root,
+        )
+        if utsversion_tmp != None:
+            expanded_symversion_flags = _rewrite_utsversion_tmp_flags(
+                expanded_symversion_flags,
+                ctx.attr.object,
+                utsversion_tmp,
+            )
 
     args = ctx.actions.args()
     args.add_all(base_flags)
@@ -6126,6 +6195,88 @@ def _linux_object_impl(ctx):
                 progress_message = "Checking Linux arm64 PI relocations %{label}",
             )
 
+    symversion_records = []
+    if ctx.attr.symversions:
+        symversion_cmd = ctx.actions.declare_file(
+            ctx.label.name + ".symversions/" + ctx.attr.object + ".cmd",
+        )
+        symversion_args = ctx.actions.args()
+        symversion_args.add_all(base_flags)
+        symversion_args.add_all(symversion_config_flag_inputs.flags, format_each = "@%s")
+        symversion_args.add_all(_linux_generated_header_cflags(generated_headers), format_each = "@%s")
+        symversion_args.add_all(_linux_module_flags(ctx.attr.mode))
+        symversion_args.add_all(_linux_object_name_flags(compile_object, ctx.attr.modname))
+        if config and not source_root:
+            symversion_args.add("-include")
+            symversion_args.add(config.autoconf_h)
+        symversion_args.add_all(_linux_source_preinclude_flags_for_root(source_root))
+        if config:
+            _add_config_include_flag(symversion_args, config)
+        if source_root:
+            symversion_args.add("-fmacro-prefix-map=%s/=" % source_root)
+        for dep in ctx.attr.deps:
+            dep_info = dep[LinuxObjectInfo]
+            _add_directory_flags(
+                symversion_args,
+                dep_info.generated_include_dirs,
+                dep_info.generated_include_dir_anchors,
+            )
+        add_directory_arg(symversion_args, directory_anchor(src), format = "-I%s")
+        if src.dirname != source_file.dirname:
+            add_directory_arg(symversion_args, directory_anchor(source_file), format = "-I%s")
+        _add_directory_flags(symversion_args, generated_inputs.include_dirs, generated_inputs.include_dir_anchors)
+        _add_linux_source_include_flags(ctx, symversion_args, generated_headers)
+        if source_root and ctx.attr.arch == "powerpc":
+            symversion_args.add("-I" + source_root + "/arch/powerpc")
+        for include in ctx.attr.include_dirs:
+            symversion_args.add("-I" + include)
+        symversion_args.add_all(expanded_symversion_flags)
+        symversion_args.add_all(["-E", "-D__GENKSYMS__"])
+        mode = "asm" if _is_assembly_source(src) else "c"
+        if mode == "asm":
+            symversion_args.add_all(["-xc", "-"])
+        else:
+            symversion_args.add(src)
+
+        runner_args = ctx.actions.args()
+        runner_args.add("-mode", mode)
+        llvm_nm = _llvm_nm(cc_toolchain)
+        runner_args.add("-nm", llvm_nm)
+        runner_args.add("-object", compile_out)
+        runner_args.add("-compiler", compiler)
+        runner_args.add("-genksyms", ctx.executable.genksyms)
+        runner_args.add("-out", symversion_cmd)
+        runner_args.add("-linux-version", ctx.attr.version)
+        symversion_extra_inputs = []
+        if not _linux_version_at_least(ctx.attr.version, 6, 18):
+            reference = ctx.actions.declare_file(
+                ctx.label.name + ".symversions/" + ctx.attr.object + ".symref",
+            )
+            ctx.actions.write(reference, "")
+            runner_args.add("-reference", reference)
+            symversion_extra_inputs.append(reference)
+        runner_args.add("--")
+        path_mapped_run(
+            ctx.actions,
+            executable = ctx.executable._genksymsrun,
+            inputs = depset(
+                [compile_out] + source_inputs.direct + symversion_config_flag_inputs.inputs + symversion_extra_inputs,
+                transitive = source_inputs.transitive + transitive_inputs,
+            ),
+            tools = [
+                llvm_nm,
+                ctx.attr.genksyms[DefaultInfo].files_to_run,
+            ],
+            outputs = [symversion_cmd],
+            arguments = [runner_args, symversion_args],
+            mnemonic = "LinuxGenksyms",
+            progress_message = "Generating Linux symbol versions %{label}",
+        )
+        symversion_records.append(struct(
+            cmd = symversion_cmd,
+            object = ctx.attr.object,
+        ))
+
     ctx.actions.write(
         output = cmd,
         content = "\n".join([
@@ -6144,6 +6295,7 @@ def _linux_object_impl(ctx):
         objtool_args = list(ctx.attr.objtool_args),
         objtool_force = ctx.attr.objtool_force,
         output = out,
+        symversion_records = symversion_records,
         generated_headers = depset(exported_generated_headers),
         generated_include_dir_anchors = _directory_anchors(exported_generated_headers, exported_generated_include_dirs),
         generated_include_dirs = exported_generated_include_dirs,
@@ -6154,6 +6306,7 @@ def _linux_object_impl(ctx):
         OutputGroupInfo(
             command = depset([cmd]),
             object = depset([out]),
+            symversions = depset([record.cmd for record in symversion_records]),
         ),
     ]
 
@@ -6177,6 +6330,9 @@ linux_object = rule(
         "deps": attr.label_list(providers = [LinuxObjectInfo]),
         "flags": attr.string_list(),
         "remove_flags": attr.string_list(),
+        "symversion_flags": attr.string_list(),
+        "symversion_remove_flags": attr.string_list(),
+        "symversions": attr.bool(),
         "include_dirs": attr.string_list(),
         "mode": attr.string(values = ["y", "m"], mandatory = True),
         "module_root": attr.bool(
@@ -6184,6 +6340,11 @@ linux_object = rule(
         ),
         "modname": attr.string(),
         "object": attr.string(mandatory = True),
+        "genksyms": attr.label(
+            cfg = "exec",
+            doc = "Kernel-source-specific scripts/genksyms/genksyms executable.",
+            executable = True,
+        ),
         "objtool": attr.label(
             cfg = "exec",
             doc = "Kernel-source-specific objtool executable. When set, processes this translation unit after compilation.",
@@ -6196,6 +6357,7 @@ linux_object = rule(
             doc = "Run objtool when Kbuild explicitly enables this translation unit despite delayed processing.",
         ),
         "srcarch": attr.string(),
+        "version": attr.string(default = "6.18.0"),
         "source_input_file": attr.int(
             mandatory = True,
             doc = "One-based primary source file selected from source_input_index.",
@@ -6252,6 +6414,11 @@ linux_object = rule(
         "_flagfilter": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/flagfilter"),
+            executable = True,
+        ),
+        "_genksymsrun": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/genksymsrun"),
             executable = True,
         ),
         "_objtoolrun": attr.label(
@@ -6344,6 +6511,7 @@ def _linux_composite_object_impl(ctx):
         objtool_args = list(ctx.attr.objtool_args),
         objtool_force = ctx.attr.objtool_force,
         output = out,
+        symversion_records = _merged_symversion_records(object_infos),
         generated_headers = depset(transitive = [info.generated_headers for info in object_infos]),
         generated_include_dir_anchors = _merged_generated_include_dir_anchors(object_infos),
         generated_include_dirs = _unique_strings([include_dir for info in object_infos for include_dir in info.generated_include_dirs]),
@@ -6557,6 +6725,7 @@ def _linux_arm64_nvhe_object_impl(ctx):
         objtool_args = [],
         objtool_force = False,
         output = out,
+        symversion_records = _merged_symversion_records(object_infos),
         generated_headers = depset(transitive = [info.generated_headers for info in object_infos]),
         generated_include_dir_anchors = _merged_generated_include_dir_anchors(object_infos),
         generated_include_dirs = _unique_strings([include_dir for info in object_infos for include_dir in info.generated_include_dirs]),
@@ -7686,6 +7855,7 @@ def _linux_vmlinux_impl(ctx):
             config = config,
             generated_headers = generated_headers,
             module_objects = image.module_objects,
+            objects = image.objects,
             source_root = _linux_source_root_file(ctx),
             source_tree = depset(ctx.files.source_tree),
             srcarch = ctx.attr.srcarch,
@@ -7763,6 +7933,7 @@ def _linux_vmlinux_impl(ctx):
             arch = linux_architecture_profile_for_arch(ctx.attr.arch).name,
             config = config,
             generated_headers = generated_headers,
+            genksyms = ctx.executable.genksyms,
             module_common = module_prep.module_common if module_prep != None else None,
             module_lds = module_prep.module_lds if module_prep != None else None,
             module_objects = image.module_objects,
@@ -7799,6 +7970,11 @@ linux_vmlinux = rule(
             ],
         ),
         "generated_headers": attr.label(providers = [LinuxGeneratedHeadersInfo]),
+        "genksyms": attr.label(
+            cfg = "exec",
+            doc = "Kernel-source-specific scripts/genksyms/genksyms executable.",
+            executable = True,
+        ),
         "image": attr.label(providers = [LinuxImageInfo], mandatory = True),
         "kallsyms": attr.string(default = "auto", values = ["auto", "false", "true"]),
         "kallsyms_all": attr.bool(),

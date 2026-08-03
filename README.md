@@ -287,6 +287,12 @@ supported for x86_64, aarch64, and armv7 kernels. As with
 Rust modules, the `kernel` provider fixes the target platform and rejects
 cross-kernel dependencies.
 
+When the configured kernel enables `CONFIG_MODVERSIONS`, linux.bzl generates
+GENKSYMS CRCs for C and assembly exports and carries them through in-tree and
+out-of-tree C module modpost actions. Linux 6.18's basic format is supported;
+extended/DWARF formats and Rust modules with symbol versioning remain explicit
+errors.
+
 ## Why
 
 Wrapping `make` in one Bazel action hides the kernel build graph from Bazel.
@@ -322,6 +328,8 @@ config architecture that disagrees with the platform-selected target profile.
 | Initramfs | Deterministic root-owned `newc` archives |
 | In-tree modules | Loadable `.ko` files plus Kbuild module metadata |
 | Out-of-tree modules | C `.ko` files through `linux_cc_module` on all three profiles; Rust-for-Linux `.ko` files through `linux_module` on x86_64 and aarch64 |
+| Module symbol versions | Classic Linux 6.12 and Linux 6.18 basic GENKSYMS for C and assembly objects and C modules |
+| Trusted keyrings | Empty built-in trusted keyring for verification consumers; no embedded certificates or signing keys |
 | Kernel BPF/BTF | BPF syscall configurations, BTF-enabled `vmlinux`, and module BTF with Rust+DWARF5 kernels |
 | VM verification | Hermetic QEMU boots with initramfs and module-load checks |
 
@@ -340,9 +348,10 @@ Rust-for-Linux modules respectively.
 BPF-syscall and BTF-enabled kernel configurations are supported; eBPF program
 compilation remains the responsibility of consumers such as Aya.
 
-Kernel and module signing, `MODULE_VERSION`/module source-version metadata,
-device-tree artifacts, and other unimplemented Kbuild products remain outside
-the supported contract.
+Kernel and module signing, embedded trusted or revocation certificates,
+extended or DWARF module versions, `MODULE_VERSION`/module source-version
+metadata, compiled device-tree artifacts, and other unimplemented Kbuild
+products remain outside the supported contract.
 `CONFIG_X86_NATIVE_CPU` is rejected because `-march=native` would make an action
 depend on worker CPU features that are absent from its cache key. Generated
 graphs that require an unsupported artifact rule are rejected with an
@@ -388,6 +397,13 @@ Deterministic source patches may be supplied with `patches` and `patch_strip`.
 Arbitrary patch commands and host patch tools are intentionally not part of the
 API. The complete upstream source archive, including documentation, samples,
 and license material, remains available in the repository.
+
+Every source file and directory in the root package is a public target. This
+allows consumer rules to use directory labels such as `@linux_custom//:include`
+and `@linux_custom//:arch/arm/boot/dts` as include roots. The `:dtb_sources`
+filegroup contains the upstream `.dts`, `.dtsi`, and DT binding headers for
+consumers such as `rules_devicetree`; linux.bzl does not compile those sources
+itself.
 
 ## Configs and variants
 

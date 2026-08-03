@@ -29,15 +29,25 @@ config_validation_failure_test = analysistest.make(
     expect_failure = True,
 )
 
-def _config_validation_kcsan_test_impl(ctx):
+def _config_validation_supported_test_impl(ctx):
     env = unittest.begin(ctx)
-    validate_config_features(
+    for config in [
         {"CONFIG_KCSAN": "y"},
-        str(ctx.label),
-    )
+        {"CONFIG_MODVERSIONS": "y"},
+        {
+            "CONFIG_BASIC_MODVERSIONS": "y",
+            "CONFIG_MODVERSIONS": "y",
+        },
+        {
+            "CONFIG_SYSTEM_TRUSTED_KEYRING": "y",
+            "CONFIG_SYSTEM_TRUSTED_KEYS": "\"\"",
+        },
+        {"CONFIG_TRUSTED_KEYS": "y"},
+    ]:
+        validate_config_features(config, str(ctx.label))
     return unittest.end(env)
 
-config_validation_kcsan_test = unittest.make(_config_validation_kcsan_test_impl)
+config_validation_supported_test = unittest.make(_config_validation_supported_test_impl)
 
 def config_validation_test_suite(name):
     cases = {
@@ -57,9 +67,13 @@ def config_validation_test_suite(name):
             {"CONFIG_GENDWARFKSYMS": "y"},
             "module versioning",
         ),
-        "modversions": (
-            {"CONFIG_MODVERSIONS": "y"},
-            "module versioning",
+        "ima_modsigning": (
+            {"CONFIG_IMA_APPRAISE_MODSIG": "y"},
+            "certificate or signing",
+        ),
+        "module_signing": (
+            {"CONFIG_MODULE_SIG": "y"},
+            "certificate or signing",
         ),
         "native_cpu": (
             {"CONFIG_X86_NATIVE_CPU": "y"},
@@ -72,6 +86,10 @@ def config_validation_test_suite(name):
         "trim_unused_ksyms": (
             {"CONFIG_TRIM_UNUSED_KSYMS": "y"},
             "module versioning",
+        ),
+        "trusted_certificates": (
+            {"CONFIG_SYSTEM_TRUSTED_KEYS": "\"certs/trusted.pem\""},
+            "unsupported certificate input",
         ),
     }
     tests = []
@@ -90,9 +108,9 @@ def config_validation_test_suite(name):
         )
         tests.append(":" + test)
 
-    kcsan_test = name + "_kcsan_test"
-    config_validation_kcsan_test(name = kcsan_test)
-    tests.append(":" + kcsan_test)
+    supported_test = name + "_supported_test"
+    config_validation_supported_test(name = supported_test)
+    tests.append(":" + supported_test)
 
     native.test_suite(
         name = name,

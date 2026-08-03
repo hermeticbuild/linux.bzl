@@ -78,6 +78,8 @@ def _linux_compact_outputs_impl(ctx):
     args.add("-source_label_package", ctx.attr.source_label_package)
     if ctx.attr.source_asn1_compiler:
         args.add("-source_asn1_compiler", ctx.attr.source_asn1_compiler)
+    if ctx.attr.source_genksyms:
+        args.add("-source_genksyms", ctx.attr.source_genksyms)
     if ctx.attr.source_objtool:
         args.add("-source_objtool", ctx.attr.source_objtool)
     if ctx.attr.source_relacheck:
@@ -207,6 +209,9 @@ _linux_compact_outputs = rule(
         ),
         "source_asn1_compiler": attr.string(
             doc = "Label for a scripts/asn1_compiler executable emitted into source-backed compact object rules.",
+        ),
+        "source_genksyms": attr.string(
+            doc = "Label for a scripts/genksyms executable emitted into source-backed compact object rules.",
         ),
         "source_objtool": attr.string(
             doc = "Label for objtool emitted into x86 source-backed compact object rules.",
@@ -438,6 +443,7 @@ def linux_compact_buildfiles(
         srcs = [],
         object_label_package = None,
         source_asn1_compiler = "",
+        source_genksyms = "",
         source_objtool = "",
         source_relacheck = "",
         linux_objects_load = "@linux.bzl//internal:linux_objects.bzl",
@@ -479,6 +485,7 @@ def linux_compact_buildfiles(
         root = root,
         source_label_package = source_label_package,
         source_asn1_compiler = source_asn1_compiler,
+        source_genksyms = source_genksyms,
         source_objtool = source_objtool,
         source_relacheck = source_relacheck,
         source_root_label = source_root_label,

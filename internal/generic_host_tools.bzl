@@ -102,6 +102,7 @@ def _linux_generic_host_tools(
     )
     result = {
         "asn1_compiler": common.asn1_compiler,
+        "genksyms_tool": common.genksyms_tool,
         "generated_headers": package_label(generated_headers),
         "kallsyms_tool": common.kallsyms_tool,
         "resolve_btfids_tool": common.resolve_btfids_tool,
@@ -144,6 +145,7 @@ def _linux_generic_configured_host_tools(
     )
     result = {
         "asn1_compiler": shared.asn1_compiler,
+        "genksyms_tool": shared.genksyms_tool,
         "generated_headers": package_label(generated_headers),
         "kallsyms_tool": shared.kallsyms_tool,
         "resolve_btfids_tool": shared.resolve_btfids_tool,

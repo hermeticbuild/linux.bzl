@@ -134,6 +134,7 @@ def _define_core_outputs(
         "arch": arch.arch,
         "config": config,
         "format": arch.vmlinux_format,
+        "genksyms": host_tools.genksyms_tool,
         "generated_headers": host_tools.generated_headers,
         "image": compact_image,
         "kallsyms": "auto",

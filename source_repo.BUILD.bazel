@@ -3,7 +3,7 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 package(default_visibility = ["//visibility:public"])
 
 exports_files(
-    glob(["**"]),
+    glob(["**"], exclude_directories = 0),
     visibility = ["//visibility:public"],
 )
 
@@ -202,6 +202,14 @@ cc_library(
     name = "scripts_headers_cc",
     hdrs = glob(["scripts/include/**/*.h"]),
     includes = ["scripts/include"],
+)
+
+cc_library(
+    name = "genksyms_headers_cc",
+    hdrs = ["scripts/genksyms/genksyms.h"],
+    textual_hdrs = ["scripts/genksyms/keywords.c"],
+    includes = ["scripts/genksyms"],
+    deps = [":scripts_headers_cc"],
 )
 
 cc_library(

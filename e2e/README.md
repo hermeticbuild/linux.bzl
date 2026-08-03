@@ -86,9 +86,10 @@ The C module target uses the existing module-enabled `@e2e_x86_64//:kernel`
 directly; it does not introduce a separate kernel configuration.
 
 The KVM fixture enables the generic, Intel, and AMD KVM implementations. The
-verity fixture enables the device-mapper verity target. Signed root-hash
-verification remains outside the supported configuration surface because it
-selects the kernel trusted-key and certificate path.
+verity fixture enables the device-mapper verity target and signed root-hash
+verification with an empty built-in trusted keyring. Supplying embedded
+certificates or signing keys remains outside the supported configuration
+surface.
 
 Each generated kernel repository owns its mandatory target platform, so these
 commands do not need a caller-supplied `--platforms` flag. Add

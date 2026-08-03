@@ -131,6 +131,21 @@ linux_images.image(
     platform = "//:linux_armv7",
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
+linux_images.overlay(
+    name = "modversions",
+    config = "//:modversions.config",
+    image = "e2e_6_12_96_x86_64",
+)
+linux_images.overlay(
+    name = "modversions",
+    config = "//:modversions.config",
+    image = "e2e_x86_64",
+)
+linux_images.overlay(
+    name = "modversions",
+    config = "//:modversions.config",
+    image = "e2e_aarch64",
+)
 use_repo(
     linux_images,
     "e2e_6_12_96_aarch64",

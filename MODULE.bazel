@@ -4,11 +4,13 @@ module(
 
 bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "bison", version = "3.8.2.bcr.7")
 
 bazel_dep(name = "buildifier_prebuilt", version = "8.2.1.1", dev_dependency = True)
 
 bazel_dep(name = "llvm", version = "0.8.14")
 bazel_dep(name = "elfutils", version = "0.195")
+bazel_dep(name = "flex", version = "2.6.4.bcr.5")
 bazel_dep(name = "gazelle", version = "0.51.3")
 bazel_dep(name = "libbpf", version = "1.7.0")
 bazel_dep(name = "lz4", version = "1.10.0.bcr.1")

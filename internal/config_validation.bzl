@@ -10,8 +10,6 @@ def validate_config_features(config, description):
             description,
         )
     for symbol in [
-        "CONFIG_MODVERSIONS",
-        "CONFIG_BASIC_MODVERSIONS",
         "CONFIG_EXTENDED_MODVERSIONS",
         "CONFIG_GENDWARFKSYMS",
         "CONFIG_MODULE_SRCVERSION_ALL",
@@ -30,13 +28,14 @@ def validate_config_features(config, description):
     for symbol in [
         "CONFIG_MODULE_SIG",
         "CONFIG_MODULE_SIG_ALL",
+        "CONFIG_IMA_APPRAISE_MODSIG",
         "CONFIG_SYSTEM_REVOCATION_LIST",
-        "CONFIG_SYSTEM_TRUSTED_KEYRING",
     ]:
         if config.get(symbol, "n") in ["y", "m"]:
             fail("%s enables unsupported certificate or signing path %s" % (description, symbol))
 
     for symbol in [
+        "CONFIG_SYSTEM_BLACKLIST_HASH_LIST",
         "CONFIG_SYSTEM_REVOCATION_KEYS",
         "CONFIG_SYSTEM_TRUSTED_KEYS",
     ]:

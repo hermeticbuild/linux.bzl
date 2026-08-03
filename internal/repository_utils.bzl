@@ -2,7 +2,7 @@
 
 visibility("//internal")
 
-LINUX_SOURCE_REPOSITORY_PROTOCOL = "linux-source-v1"
+LINUX_SOURCE_REPOSITORY_PROTOCOL = "linux-source-v2"
 
 def repository_prefix(label):
     return "@@" + label.repo_name

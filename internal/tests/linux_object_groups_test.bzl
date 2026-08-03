@@ -35,6 +35,12 @@ _COMPOSITE_RECIPE_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 _HEADER_FAMILY_ID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 _ASM_RECIPE_ID = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 _ASM_CONTENT_ID = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+_MODVERSION_CONFIG_PAYLOAD_ID = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+_MODVERSION_COMPILE_ENVIRONMENT_ID = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+_MODVERSION_RECIPE_ID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+_MODVERSION_CONTENT_ID = "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
+_MODVERSION_COMPOSITE_ID = "23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01"
+_MODVERSION_COMPOSITE_RECIPE_ID = "3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012"
 
 def _fake_generated_headers_impl(ctx):
     header = ctx.actions.declare_file(ctx.label.name + ".h")
@@ -100,6 +106,12 @@ _fake_object = rule(
 def _actions_with_mnemonic(actions, mnemonic):
     return [action for action in actions if action.mnemonic == mnemonic]
 
+def _argument_after(argv, flag):
+    for index in range(len(argv) - 1):
+        if argv[index] == flag:
+            return argv[index + 1]
+    return ""
+
 def _compile_group_test_impl(ctx):
     env = analysistest.begin(ctx)
     target = analysistest.target_under_test(env)
@@ -141,6 +153,43 @@ def _composite_group_test_impl(ctx):
 
 _composite_group_test = analysistest.make(_composite_group_test_impl)
 
+def _symversion_group_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    target = analysistest.target_under_test(env)
+    info = target[LinuxObjectActionGroupInfo].objects["versioned"]
+    actions = _actions_with_mnemonic(analysistest.target_actions(env), "LinuxGenksyms")
+    asserts.equals(env, 1, len(actions))
+    asserts.equals(env, 1, len(info.symversion_records))
+    asserts.equals(env, "kernel/versioned.o", info.symversion_records[0].object)
+    if actions:
+        asserts.true(env, "-mode" in actions[0].argv)
+        asserts.true(env, "c" in actions[0].argv)
+        asserts.true(env, "-D__GENKSYMS__" in actions[0].argv)
+        asserts.true(env, "6.18.39" in actions[0].argv)
+        compile_actions = _actions_with_mnemonic(analysistest.target_actions(env), "LinuxObjectCompile")
+        objtool_actions = _actions_with_mnemonic(analysistest.target_actions(env), "LinuxObjectObjtool")
+        asserts.equals(env, 1, len(compile_actions))
+        asserts.equals(env, 1, len(objtool_actions))
+        if compile_actions and objtool_actions:
+            compile_output = compile_actions[0].outputs.to_list()[0].path
+            objtool_output = objtool_actions[0].outputs.to_list()[0].path
+            inspected_object = _argument_after(actions[0].argv, "-object")
+            asserts.equals(env, compile_output, inspected_object)
+            asserts.true(env, compile_output in [file.path for file in actions[0].inputs.to_list()])
+            asserts.false(env, objtool_output == inspected_object)
+    return analysistest.end(env)
+
+_symversion_group_test = analysistest.make(_symversion_group_test_impl)
+
+def _symversion_composite_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    info = analysistest.target_under_test(env)[LinuxObjectActionGroupInfo].objects["versioned_composite"]
+    asserts.equals(env, 1, len(info.symversion_records))
+    asserts.equals(env, "kernel/versioned.o", info.symversion_records[0].object)
+    return analysistest.end(env)
+
+_symversion_composite_test = analysistest.make(_symversion_composite_test_impl)
+
 def _image_test_impl(ctx):
     env = analysistest.begin(ctx)
     target = analysistest.target_under_test(env)
@@ -168,9 +217,15 @@ def linux_object_groups_test_suite(name):
                 "config_payload": _CONFIG_PAYLOAD_ID,
                 "generated_header_families": [_HEADER_FAMILY_ID],
             }),
+            _MODVERSION_COMPILE_ENVIRONMENT_ID: json.encode({
+                "abi": "tests/grouped/x86",
+                "config_payload": _MODVERSION_CONFIG_PAYLOAD_ID,
+                "generated_header_families": [_HEADER_FAMILY_ID],
+            }),
         },
         config_payloads = {
             _CONFIG_PAYLOAD_ID: "CONFIG_TEST=y\n",
+            _MODVERSION_CONFIG_PAYLOAD_ID: "CONFIG_GENKSYMS=y\nCONFIG_MODVERSIONS=y\n",
         },
         expected_abi = "tests/grouped/x86",
         generated_headers = [":" + name + "_generated_headers"],
@@ -243,6 +298,32 @@ def linux_object_groups_test_suite(name):
         source_input_index = ":" + name + "_source_inputs",
         srcarch = "x86",
     )
+    linux_object_action_group(
+        name = name + "_symversion_group",
+        arch = "x86",
+        compile_environment_index = ":" + name + "_compile_environments",
+        genksyms = "//internal/cmd/runandwrite",
+        language = "c",
+        mode = "y",
+        objtool = "//internal/cmd/runandwrite",
+        objects = {
+            "versioned": json.encode({
+                "compile_environment": _MODVERSION_COMPILE_ENVIRONMENT_ID,
+                "content_id": _MODVERSION_CONTENT_ID,
+                "object": "kernel/versioned.o",
+                "source_input_file": 2,
+                "source_input_group": 1,
+            }),
+        },
+        reachable_configs = ["base", "lz4"],
+        reachability_id = _REACHABILITY_ID,
+        recipe_id = _MODVERSION_RECIPE_ID,
+        source_input_index = ":" + name + "_source_inputs",
+        srcarch = "x86",
+        symversion_flags = ["-Werror"],
+        symversions = True,
+        version = "6.18.39",
+    )
     _fake_object(
         name = name + "_module_fallback",
         content_id = _MODULE_CONTENT_ID,
@@ -274,6 +355,22 @@ def linux_object_groups_test_suite(name):
         reachability_id = _REACHABILITY_ID,
         recipe_id = _COMPOSITE_RECIPE_ID,
     )
+    linux_composite_object_action_group(
+        name = name + "_symversion_composite_group",
+        arch = "x86",
+        member_groups = [":" + name + "_symversion_group"],
+        mode = "y",
+        objects = {
+            "versioned_composite": json.encode({
+                "content_id": _MODVERSION_COMPOSITE_ID,
+                "members": ["versioned"],
+                "object": "kernel/versioned_composite.o",
+            }),
+        },
+        reachable_configs = ["base", "lz4"],
+        reachability_id = _REACHABILITY_ID,
+        recipe_id = _MODVERSION_COMPOSITE_RECIPE_ID,
+    )
     linux_grouped_compact_image(
         name = name + "_image",
         config = "base",
@@ -301,6 +398,14 @@ def linux_object_groups_test_suite(name):
     _composite_group_test(
         name = name + "_composite_group_test",
         target_under_test = ":" + name + "_composite_group",
+    )
+    _symversion_group_test(
+        name = name + "_symversion_group_test",
+        target_under_test = ":" + name + "_symversion_group",
+    )
+    _symversion_composite_test(
+        name = name + "_symversion_composite_test",
+        target_under_test = ":" + name + "_symversion_composite_group",
     )
     _image_test(
         name = name + "_image_test",
