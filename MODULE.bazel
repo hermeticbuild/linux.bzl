@@ -19,7 +19,7 @@ bazel_dep(name = "rules_bison", version = "0.4.bcr.1")
 bazel_dep(name = "rules_flex", version = "0.4.1")
 bazel_dep(name = "rules_go", version = "0.62.0")
 bazel_dep(name = "rules_perl", version = "0.5.0")
-bazel_dep(name = "rules_rs", version = "0.0.98")
+bazel_dep(name = "rules_rs", version = "0.0.102")
 bazel_dep(name = "zstd", version = "1.5.7.bcr.1")
 
 bazel_dep(name = "tar.bzl", version = "0.9.0", dev_dependency = True)
@@ -41,18 +41,15 @@ use_repo(
     "default_rust_toolchains",
 )
 
-bindgen_toolchains = use_extension("@rules_rs//rs:rules_rust_bindgen.bzl", "rules_rust_bindgen")
+bindgen_toolchains = use_extension("@rules_rs//rs:rules_rust_bindgen.bzl", "rules_rust_bindgen", dev_dependency = True)
 use_repo(bindgen_toolchains, "rules_rust_bindgen")
 
 tar_toolchains = use_extension("@tar.bzl//tar:extensions.bzl", "toolchains", dev_dependency = True)
 use_repo(tar_toolchains, "bsd_tar_toolchains")
 
 register_toolchains(
-    "@rules_rust_bindgen//:linux_amd64",
-)
-
-register_toolchains(
     "@default_rust_toolchains//:all",
+    "@rules_rust_bindgen//:all",
     "@bsd_tar_toolchains//:all",
     "@llvm//toolchain:all",
     dev_dependency = True,
