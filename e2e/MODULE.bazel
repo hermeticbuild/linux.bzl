@@ -10,7 +10,7 @@ bazel_dep(name = "llvm", version = "0.8.14", repo_name = "hermetic_llvm")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "rules_go", version = "0.62.0")
 bazel_dep(name = "rules_qemu", version = "0.3.0")
-bazel_dep(name = "rules_rs", version = "0.0.98")
+bazel_dep(name = "rules_rs", version = "0.0.102")
 
 register_toolchains(
     "@hermetic_llvm//toolchain:all",
@@ -26,6 +26,11 @@ rust_toolchains.toolchain(
 use_repo(rust_toolchains, "default_rust_toolchains")
 
 register_toolchains("@default_rust_toolchains//:all")
+
+bindgen_toolchains = use_extension("@rules_rs//rs:rules_rust_bindgen.bzl", "rules_rust_bindgen")
+use_repo(bindgen_toolchains, "rules_rust_bindgen")
+
+register_toolchains("@rules_rust_bindgen//:all")
 
 local_path_override(
     module_name = "linux.bzl",
