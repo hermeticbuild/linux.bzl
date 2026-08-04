@@ -36,6 +36,28 @@ func TestIncludePath(t *testing.T) {
 	}
 }
 
+func TestSourceFlagPredefinedSymbols(t *testing.T) {
+	got := sourceFlagPredefinedSymbols([]string{
+		"-DFEATURE",
+		"-DVALUE=7",
+		"-UOPTIONAL_HEADER",
+		"-D",
+		"FUNCTION(x)=x",
+		"-U",
+		"LEGACY",
+	})
+	want := map[string]bool{
+		"FEATURE":         true,
+		"FUNCTION":        true,
+		"LEGACY":          false,
+		"OPTIONAL_HEADER": false,
+		"VALUE":           true,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sourceFlagPredefinedSymbols() = %v, want %v", got, want)
+	}
+}
+
 func TestConfigSourceScannerFollowsIncludeClosure(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/foo.c", `
@@ -657,6 +679,27 @@ func TestConfigSourceScannerContentGraphRejectsUnresolvedLiteralInclude(t *testi
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("closureForSource() error = %q, want substring %q", err, want)
 		}
+	}
+}
+
+func TestConfigSourceScannerUsesCommandLineUndefines(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "drivers/module.c", "#include \"module.h\"\n")
+	mustWriteSource(t, root, "drivers/module.h", "#ifdef OPTIONAL_VENDOR_CONFIG\n#include <missing-vendor-config.h>\n#endif\n")
+	scanner := newConfigSourceScanner(CompactMetadataOptions{SourceRoot: root})
+	search, err := scanner.actionIncludeSearch("drivers/module.c", []string{"-UOPTIONAL_VENDOR_CONFIG"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scanner.closureForSourceConfigInputsSearchProfile(
+		"drivers/module.c",
+		search,
+		nil,
+		false,
+		nil,
+		sourceScanKernel,
+	); err != nil {
+		t.Fatalf("closure with command-line undefine failed: %v", err)
 	}
 }
 
