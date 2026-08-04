@@ -125,13 +125,20 @@ type sourceIncludeSearch struct {
 	includeRoots []string
 	systemRoots  []string
 	afterRoots   []string
+	predefined   map[string]bool
 }
 
 func (s sourceIncludeSearch) cacheKey() string {
-	return "quote=" + strings.Join(s.quoteRoots, "\x00") +
+	key := "quote=" + strings.Join(s.quoteRoots, "\x00") +
 		"\x01include=" + strings.Join(s.includeRoots, "\x00") +
 		"\x01system=" + strings.Join(s.systemRoots, "\x00") +
 		"\x01after=" + strings.Join(s.afterRoots, "\x00")
+	var symbols []string
+	for symbol, defined := range s.predefined {
+		symbols = append(symbols, symbol+"="+strconv.FormatBool(defined))
+	}
+	sort.Strings(symbols)
+	return key + "\x01predefined=" + strings.Join(symbols, "\x00")
 }
 
 func (s sourceIncludeSearch) roots(kind sourceIncludeKind) []string {
@@ -199,11 +206,12 @@ func (s *configSourceScanner) actionIncludeSearch(source string, flags []string)
 		includeRoots: includeRoots,
 		systemRoots:  flagSearch.systemRoots,
 		afterRoots:   flagSearch.afterRoots,
+		predefined:   flagSearch.predefined,
 	}, nil
 }
 
 func sourceIncludeSearchFromFlags(flags []string, source string) (sourceIncludeSearch, error) {
-	search := sourceIncludeSearch{}
+	search := sourceIncludeSearch{predefined: sourceFlagPredefinedSymbols(flags)}
 	pathFlags, err := sourcePathFlags(flags)
 	if err != nil {
 		return sourceIncludeSearch{}, err
@@ -231,6 +239,40 @@ func sourceIncludeSearchFromFlags(flags []string, source string) (sourceIncludeS
 		}
 	}
 	return search, nil
+}
+
+func sourceFlagPredefinedSymbols(flags []string) map[string]bool {
+	result := map[string]bool{}
+	for index := 0; index < len(flags); index++ {
+		flag := flags[index]
+		kind := byte(0)
+		value := ""
+		if flag == "-D" || flag == "-U" {
+			kind = flag[1]
+			if index+1 >= len(flags) {
+				continue
+			}
+			index++
+			value = flags[index]
+		} else if len(flag) > 2 && (strings.HasPrefix(flag, "-D") || strings.HasPrefix(flag, "-U")) {
+			kind = flag[1]
+			value = flag[2:]
+		}
+		if kind == 0 {
+			continue
+		}
+		if name, _, ok := strings.Cut(value, "="); ok {
+			value = name
+		}
+		if name, _, ok := strings.Cut(value, "("); ok {
+			value = name
+		}
+		value = strings.TrimSpace(value)
+		if sourceIdentifier(value) {
+			result[value] = kind == 'D'
+		}
+	}
+	return result
 }
 
 type sourcePathFlag struct {
@@ -869,6 +911,9 @@ func (s *configSourceScanner) scanFile(
 		predefined[symbol] = defined
 	}
 	for symbol, defined := range sourceProfilePredefinedSymbols(profile) {
+		predefined[symbol] = defined
+	}
+	for symbol, defined := range search.predefined {
 		predefined[symbol] = defined
 	}
 	if config != nil {
