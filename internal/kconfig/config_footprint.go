@@ -217,6 +217,9 @@ func sourceIncludeSearchFromFlags(flags []string, source string) (sourceIncludeS
 		return sourceIncludeSearch{}, err
 	}
 	for _, flag := range pathFlags {
+		if flag.compilerProvided {
+			continue
+		}
 		if flag.option == "-include" || flag.option == "-imacros" {
 			continue
 		}
@@ -276,8 +279,9 @@ func sourceFlagPredefinedSymbols(flags []string) map[string]bool {
 }
 
 type sourcePathFlag struct {
-	option string
-	path   string
+	option           string
+	path             string
+	compilerProvided bool
 }
 
 type sourceFlagPathClass uint8
@@ -312,6 +316,18 @@ func sourcePathFlags(flags []string) ([]sourcePathFlag, error) {
 					return nil, fmt.Errorf("%s requires a path", option)
 				}
 				i++
+				if option == "-isystem" {
+					if path, last, ok := compilerBuiltinIncludeDirectoryShell(flags, i); ok {
+						result = append(result, sourcePathFlag{
+							option:           option,
+							path:             path,
+							compilerProvided: true,
+						})
+						i = last
+						matched = true
+						break
+					}
+				}
 				path := strings.TrimSpace(flags[i])
 				if path == "" {
 					return nil, fmt.Errorf("%s requires a non-empty path", option)
@@ -340,6 +356,27 @@ func sourcePathFlags(flags []string) ([]sourcePathFlag, error) {
 		}
 	}
 	return result, nil
+}
+
+const compilerBuiltinIncludeDirectoryShellExpression = "$(shell $(CC) -print-file-name=include)"
+
+// Linux uses this exact query for the compiler resource-header directory.
+// Consume it without executing a shell; every other make/shell expression
+// remains unresolved and is rejected by resolveSourceFlagPath.
+func compilerBuiltinIncludeDirectoryShell(flags []string, first int) (string, int, bool) {
+	if flags[first] == compilerBuiltinIncludeDirectoryShellExpression {
+		return compilerBuiltinIncludeDirectoryShellExpression, first, true
+	}
+	parts := []string{"$(shell", "$(CC)", "-print-file-name=include)"}
+	if first+len(parts) > len(flags) {
+		return "", first, false
+	}
+	for i, part := range parts {
+		if flags[first+i] != part {
+			return "", first, false
+		}
+	}
+	return compilerBuiltinIncludeDirectoryShellExpression, first + len(parts) - 1, true
 }
 
 func resolveSourceFlagPath(path, source string) (sourceFlagPathClass, string, error) {
@@ -1449,7 +1486,11 @@ func sourcePredefinedSymbols(srcarch string) map[string]bool {
 		"ACPI_USE_SYSTEM_CLIBRARY":  true,
 		"ACPI_USE_STANDARD_HEADERS": false,
 		"DEBUG_ZLIB":                false,
-		"MODULE":                    false,
+		// Legacy kernels gate <linux/modversions.h> with this non-CONFIG
+		// preprocessor symbol. Normal kernel compile actions do not define it;
+		// the scanner's action context still lets an explicit -D/-U override it.
+		"MODVERSIONS": false,
+		"MODULE":      false,
 	}
 	switch srcarch {
 	case "x86":
@@ -1587,7 +1628,7 @@ func generatedHeaderInclude(path string) bool {
 	}
 	switch path {
 	case "calls-eabi.S", "calls-oabi.S",
-		"kvm-asm-offsets.h", "linux/version.h", "linux/utsrelease.h":
+		"hyp_constants.h", "kvm-asm-offsets.h", "linux/version.h", "linux/utsrelease.h":
 		return true
 	default:
 		return false
@@ -1599,7 +1640,7 @@ func compilerProvidedInclude(path string) bool {
 	switch path {
 	case "float.h", "iso646.h", "limits.h", "stdalign.h", "stdarg.h",
 		"stdatomic.h", "stdbool.h", "stddef.h", "stdint.h", "stdnoreturn.h",
-		"cet.h":
+		"arm_neon.h", "cet.h":
 		return true
 	default:
 		return false

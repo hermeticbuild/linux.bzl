@@ -46,11 +46,7 @@ type compactGeneratedHeaderFamilyFootprint struct {
 	sourceInputs []CompactSourceInput
 }
 
-type compactGeneratedHeaderSource struct {
-	path         string
-	includeRoots []string
-	profile      sourceScanProfile
-}
+type compactGeneratedHeaderSource = compactSourceAction
 
 func generatedHeaderOffsetsSources(sources ...compactGeneratedHeaderSource) []compactGeneratedHeaderSource {
 	out := append([]compactGeneratedHeaderSource(nil), generatedHeaderOffsetsForcedSources...)
@@ -299,7 +295,28 @@ func generatedHeaderFamilyFootprint(
 		if _, ok := scanner.absForTreePath(source.path); !ok {
 			continue
 		}
-		closure, err := scanner.closureForSourceConfigProfile(source.path, source.includeRoots, config, source.profile)
+		search, err := compactSourceActionIncludeSearch(
+			scanner,
+			source.path,
+			source.flags,
+			source.includeRoots,
+		)
+		if err != nil {
+			return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
+				"model generated-header family %s input %s include search: %w",
+				name,
+				source.path,
+				err,
+			)
+		}
+		closure, err := scanner.closureForSourceConfigInputsSearchProfile(
+			source.path,
+			search,
+			config,
+			isAssemblySourcePath(source.path),
+			nil,
+			source.profile,
+		)
 		if err != nil {
 			return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
 				"scan generated-header family %s input %s: %w",
@@ -483,20 +500,7 @@ func generatedHeaderAllFootprint(
 				profile: sourceScanRISCVCompatVDSO,
 			})
 		}
-		for _, path := range []string{
-			"arch/riscv/purgatory/purgatory.c",
-			"arch/riscv/purgatory/entry.S",
-			"lib/crypto/sha256.c",
-			"lib/string.c",
-			"lib/ctype.c",
-			"arch/riscv/lib/memcpy.S",
-			"arch/riscv/lib/memset.S",
-			"arch/riscv/lib/strcmp.S",
-			"arch/riscv/lib/strlen.S",
-			"arch/riscv/lib/strncmp.S",
-		} {
-			sourcePaths = append(sourcePaths, compactGeneratedHeaderSource{path: path})
-		}
+		sourcePaths = append(sourcePaths, compactPurgatorySourceActions("riscv")...)
 	case "powerpc":
 		for _, symbol := range []string{
 			"CONFIG_PPC64",
@@ -529,10 +533,10 @@ func generatedHeaderAllFootprint(
 				})
 			}
 		}
+		// CONFIG_KEXEC_FILE is only available for PPC64, whose purgatory
+		// image is linked from trampoline_64.o and embedded by the wrapper.
+		sourcePaths = append(sourcePaths, compactPurgatorySourceActions("powerpc")...)
 		for _, source := range []compactGeneratedHeaderSource{
-			// CONFIG_KEXEC_FILE is only available for PPC64, whose purgatory
-			// image is linked from trampoline_64.o and embedded by the wrapper.
-			{path: "arch/powerpc/purgatory/trampoline_64.S"},
 			{path: "arch/powerpc/kernel/vdso/sigtramp64.S", profile: sourceScanPPC64VDSO},
 			{path: "arch/powerpc/kernel/vdso/vdso64.lds.S", profile: sourceScanPPC64VDSO},
 			{path: "arch/powerpc/kernel/vdso/sigtramp32.S", profile: sourceScanPPC32VDSO},
@@ -546,7 +550,27 @@ func generatedHeaderAllFootprint(
 		if _, ok := scanner.absForTreePath(source.path); !ok {
 			continue
 		}
-		closure, err := scanner.closureForSourceConfigProfile(source.path, source.includeRoots, config, source.profile)
+		search, err := compactSourceActionIncludeSearch(
+			scanner,
+			source.path,
+			source.flags,
+			source.includeRoots,
+		)
+		if err != nil {
+			return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
+				"model generated-header all-family input %s include search: %w",
+				source.path,
+				err,
+			)
+		}
+		closure, err := scanner.closureForSourceConfigInputsSearchProfile(
+			source.path,
+			search,
+			config,
+			isAssemblySourcePath(source.path),
+			nil,
+			source.profile,
+		)
 		if err != nil {
 			return compactGeneratedHeaderFamilyFootprint{}, fmt.Errorf(
 				"scan generated-header all-family input %s: %w",
@@ -686,7 +710,7 @@ func generatedHeaderFamilyNameForInclude(path string) (string, bool) {
 		return compactGeneratedHeaderFamilyRQOffsets, true
 	case "kvm-asm-offsets.h", "generated/kvm-asm-offsets.h":
 		return compactGeneratedHeaderFamilyKVMOffsets, true
-	case "calls-eabi.S", "calls-oabi.S":
+	case "calls-eabi.S", "calls-oabi.S", "hyp_constants.h":
 		return compactGeneratedHeaderFamilyAll, true
 	}
 	if strings.HasPrefix(path, "asm/") || strings.HasPrefix(path, "uapi/asm/") {
