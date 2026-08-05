@@ -527,6 +527,35 @@ _indexed_assembly_source_test = analysistest.make(
     },
 )
 
+def _object_remove_flags_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = analysistest.target_actions(env)
+    compile_actions = [action for action in actions if action.mnemonic == "LinuxObjectCompile"]
+    symversion_actions = [action for action in actions if action.mnemonic == "LinuxGenksyms"]
+    filter_actions = [action for action in actions if action.mnemonic == "LinuxFlagFilter"]
+    asserts.equals(env, 1, len(compile_actions))
+    asserts.equals(env, 1, len(symversion_actions))
+    asserts.equals(env, 2, len(filter_actions))
+    if compile_actions:
+        argv = compile_actions[0].argv
+        asserts.false(env, "-mgeneral-regs-only" in argv)
+        asserts.false(env, "-DREMOVE" in argv)
+        asserts.true(env, "-DKEEP_COMPILE" in argv)
+        asserts.true(env, "-DREMOVE_SUFFIX" in argv)
+    if symversion_actions:
+        argv = symversion_actions[0].argv
+        asserts.false(env, "-mgeneral-regs-only" in argv)
+        asserts.false(env, "-DREMOVE" in argv)
+        asserts.true(env, "-DKEEP_SYMVERSION" in argv)
+        asserts.true(env, "-DREMOVE_SUFFIX" in argv)
+    for action in filter_actions:
+        asserts.true(env, "-remove" in action.argv)
+        asserts.true(env, "-mgeneral-regs-only" in action.argv)
+        asserts.true(env, "-DREMOVE" in action.argv)
+    return analysistest.end(env)
+
+_object_remove_flags_test = analysistest.make(_object_remove_flags_test_impl)
+
 def _empty_system_certificates_test_impl(ctx):
     env = analysistest.begin(ctx)
     actions = [
@@ -1469,6 +1498,66 @@ def linux_objects_fail_closed_test_suite(name):
         unexpected_generated_headers = [duplicate_generated_headers + ".h"],
         unexpected_input = "linux_modules_test_fixture.rs",
     )
+    remove_flags_payload_id = "1818181818181818181818181818181818181818181818181818181818181818"
+    remove_flags_environment_id = "1919191919191919191919191919191919191919191919191919191919191919"
+    remove_flags_environment_index = name + "_remove_flags_environment_index"
+    linux_compile_environment_index(
+        name = remove_flags_environment_index,
+        compile_environments = {
+            remove_flags_environment_id: json.encode({
+                "abi": "x86_64-linux-gnu",
+                "config_payload": remove_flags_payload_id,
+                "generated_header_families": [header_family_id],
+            }),
+        },
+        config_payloads = {
+            remove_flags_payload_id: "CONFIG_GENKSYMS=y\nCONFIG_MODVERSIONS=y\n",
+        },
+        expected_abi = "x86_64-linux-gnu",
+        generated_headers = [":" + generated_headers],
+        tags = fixture_tags,
+    )
+    remove_flags_object = name + "_remove_flags_object"
+    linux_object(
+        name = remove_flags_object,
+        compile_environment_id = remove_flags_environment_id,
+        compile_environment_index = ":" + remove_flags_environment_index,
+        content_id = "2020202020202020202020202020202020202020202020202020202020202020",
+        flags = [
+            "-mgeneral-regs-only",
+            "-DREMOVE",
+            "-DKEEP_COMPILE",
+            "-DREMOVE_SUFFIX",
+        ],
+        genksyms = "//internal/cmd/runandwrite",
+        mode = "m",
+        object = "crypto/aegis128-neon-inner.o",
+        remove_flags = [
+            "-mgeneral-regs-only",
+            "-DREMOVE",
+        ],
+        source_input_file = 4,
+        source_input_group = 1,
+        source_input_index = ":" + source_input_index,
+        symversion_flags = [
+            "-mgeneral-regs-only",
+            "-DREMOVE",
+            "-DKEEP_SYMVERSION",
+            "-DREMOVE_SUFFIX",
+        ],
+        symversion_remove_flags = [
+            "-mgeneral-regs-only",
+            "-DREMOVE",
+        ],
+        symversions = True,
+        tags = fixture_tags,
+        version = "6.18.39",
+    )
+    remove_flags_object_test = remove_flags_object + "_test"
+    _object_remove_flags_test(
+        name = remove_flags_object_test,
+        target_under_test = ":" + remove_flags_object,
+    )
     precise_family_object = name + "_precise_family_object"
     linux_object(
         name = precise_family_object,
@@ -1965,6 +2054,7 @@ def linux_objects_fail_closed_test_suite(name):
         ":" + indexed_assembly_object_test,
         ":" + indexed_object_test,
         ":" + precise_family_object_test,
+        ":" + remove_flags_object_test,
     ] + generic_header_tests
     _empty_system_certificates_test(
         name = certificate_object + "_test",

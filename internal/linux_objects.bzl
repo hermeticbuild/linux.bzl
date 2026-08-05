@@ -852,6 +852,13 @@ def _unique_strings(values):
         out.append(value)
     return out
 
+def _remove_exact_flags(flags, remove_flags):
+    """Applies Kbuild's exact CFLAGS_REMOVE/AFLAGS_REMOVE word filtering."""
+    if not remove_flags:
+        return flags
+    removed = {flag: True for flag in remove_flags}
+    return [flag for flag in flags if flag not in removed]
+
 def _merged_generated_include_dir_anchors(object_infos):
     anchors = {}
     for info in object_infos:
@@ -6160,6 +6167,10 @@ def _linux_object_impl(ctx):
             _expand_flag_refs(ctx.attr.symversion_flags, config_values, make_values, ctx.attr.object),
             source_root,
         )
+        expanded_symversion_flags = _remove_exact_flags(
+            expanded_symversion_flags,
+            expanded_symversion_remove_flags,
+        )
         if utsversion_tmp != None:
             expanded_symversion_flags = _rewrite_utsversion_tmp_flags(
                 expanded_symversion_flags,
@@ -6210,6 +6221,7 @@ def _linux_object_impl(ctx):
             format = "-Wa,-I,%s",
         )
     expanded_flags = _rewrite_source_root_flags(_expand_flag_refs(ctx.attr.flags, config_values, make_values, ctx.attr.object), source_root)
+    expanded_flags = _remove_exact_flags(expanded_flags, expanded_remove_flags)
     if utsversion_tmp != None:
         expanded_flags = _rewrite_utsversion_tmp_flags(expanded_flags, ctx.attr.object, utsversion_tmp)
     args.add_all(expanded_flags)
