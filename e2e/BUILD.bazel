@@ -10,6 +10,7 @@ package(default_visibility = ["//visibility:public"])
 exports_files([
     "cnic.config",
     "kvm.config",
+    "kvm_arm64.config",
     "armv7.config",
     "modversions.config",
     "rust.config",
@@ -55,6 +56,14 @@ build_test(
     targets = [
         "@e2e_kvm_x86_64//:kernel",
         "@e2e_verity_x86_64//:kernel",
+    ],
+)
+
+build_test(
+    name = "kvm_arm64_neon_kernel_build_test",
+    targets = [
+        "@e2e_kvm_aarch64//:kernel",
+        "@e2e_kvm_aarch64//:vmlinux",
     ],
 )
 
