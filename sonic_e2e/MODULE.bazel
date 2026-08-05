@@ -32,9 +32,9 @@ linux_source_repository = use_repo_rule(
 
 linux_source_repository(
     name = "sonic_linux_6_18_39",
-    module_kbuild_roots = [
-        "drivers/net/ethernet/broadcom/sdklt/linux/bde",
-    ],
+    module_kbuild_roots = {
+        "drivers/net/ethernet/broadcom/sdklt/linux/bde": "X86",
+    },
     module_make_vars = {
         "BDE_CPPFLAGS": "-UBCMDRD_INCLUDE_CUSTOM_CONFIG",
         "SDK": "$(srctree)/drivers/net/ethernet/broadcom/sdklt",
@@ -57,4 +57,15 @@ linux_images.image(
     platform = "@llvm//platforms:linux_x86_64",
     source = "@sonic_linux_6_18_39//:Kconfig",
 )
-use_repo(linux_images, "sonic_kernel")
+linux_images.image(
+    name = "sonic_arm64_kernel",
+    config = "//:sonic.config",
+    config_mode = "allnoconfig",
+    platform = "@llvm//platforms:linux_arm64",
+    source = "@sonic_linux_6_18_39//:Kconfig",
+)
+use_repo(
+    linux_images,
+    "sonic_arm64_kernel",
+    "sonic_kernel",
+)

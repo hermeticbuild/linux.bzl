@@ -31,6 +31,7 @@ _KERNEL_RELEASES = {
 _TOOLS_BUILD_FILE = "Build"
 _TOOLS_BUILD_FILE_RELOCATED = "Build.linux-bzl"
 _TOOLS_MAX_DEPTH = 64
+_SOURCE_OVERLAY_FILES_MARKER = "    # __LINUX_BZL_SOURCE_OVERLAY_FILES__"
 
 def _in_tree_path(path, what):
     normalized = path.replace("\\", "/").strip("/")
@@ -45,6 +46,7 @@ def _in_tree_path(path, what):
 
 def _stage_source_overlays(rctx):
     destinations = []
+    staged_files = []
     for destination in sorted(rctx.attr.source_overlays.keys()):
         normalized = _in_tree_path(destination, "source_overlays destination")
         marker = rctx.path(rctx.attr.source_overlays[destination])
@@ -75,19 +77,47 @@ def _stage_source_overlays(rctx):
         if not files:
             fail("source_overlays[%r] identifies an empty source tree" % destination)
         for relative in sorted(files.keys()):
-            rctx.symlink(files[relative], normalized + "/" + relative)
+            staged = normalized + "/" + relative
+            rctx.symlink(files[relative], staged)
+            staged_files.append(staged)
         destinations.append(normalized)
-    return destinations
+    return struct(
+        destinations = sorted(destinations),
+        files = sorted(staged_files),
+    )
 
-def _integrate_in_tree_modules(rctx):
-    kbuild_roots = []
-    for path in rctx.attr.module_kbuild_roots:
-        path = _in_tree_path(path, "module_kbuild_roots entry")
-        if path in kbuild_roots:
-            fail("duplicate module_kbuild_roots entry %r" % path)
+def _module_kbuild_root_symbol(path):
+    normalized = []
+    previous_was_separator = False
+    for character in path.upper().elems():
+        if (
+            (character >= "A" and character <= "Z") or
+            (character >= "0" and character <= "9")
+        ):
+            normalized.append(character)
+            previous_was_separator = False
+        elif not previous_was_separator:
+            normalized.append("_")
+            previous_was_separator = True
+    return "LINUX_BZL_MODULE_KBUILD_ROOT_" + "".join(normalized).strip("_")
+
+def _module_kbuild_roots(rctx):
+    roots = {}
+    for raw_path, expression in rctx.attr.module_kbuild_roots.items():
+        path = _in_tree_path(raw_path, "module_kbuild_roots key")
+        if path in roots:
+            fail("duplicate normalized module_kbuild_roots key %r" % path)
+        if not expression.strip():
+            fail("module_kbuild_roots[%r] must be a non-empty Kconfig expression" % raw_path)
+        if "\n" in expression or "\r" in expression:
+            fail("module_kbuild_roots[%r] must be a single-line Kconfig expression" % raw_path)
         if not rctx.path(path + "/Kbuild").exists and not rctx.path(path + "/Makefile").exists:
             fail("module Kbuild root %r contains neither Kbuild nor Makefile" % path)
-        kbuild_roots.append(path)
+        roots[path] = expression
+    return roots
+
+def _integrate_in_tree_modules(rctx):
+    kbuild_roots = _module_kbuild_roots(rctx)
 
     kconfig_roots = []
     for path in rctx.attr.module_kconfig_roots:
@@ -101,8 +131,36 @@ def _integrate_in_tree_modules(rctx):
     if kbuild_roots:
         root = rctx.path("Kbuild")
         content = rctx.read(root).rstrip() + "\n\n# In-tree module roots added by linux.bzl.\n"
-        content += "\n".join(["obj-y += %s/" % path for path in kbuild_roots]) + "\n"
+        root_lines = []
+        selectors = []
+        selector_paths = {}
+        for path in sorted(kbuild_roots.keys()):
+            expression = kbuild_roots[path]
+            if expression == "y":
+                root_lines.append("obj-y += %s/" % path)
+                continue
+            selector = _module_kbuild_root_symbol(path)
+            previous_path = selector_paths.get(selector)
+            if previous_path != None:
+                fail(
+                    "module_kbuild_roots keys %r and %r generate the same hidden Kconfig symbol %s" %
+                    (previous_path, path, selector),
+                )
+            selector_paths[selector] = path
+            selectors.append((selector, expression))
+            root_lines.append("obj-$(CONFIG_%s) += %s/" % (selector, path))
+        content += "\n".join(root_lines) + "\n"
         rctx.file(root, content, executable = False)
+
+        if selectors:
+            root = rctx.path("Kconfig")
+            content = rctx.read(root).rstrip() + "\n\n# In-tree module root selectors added by linux.bzl.\n"
+            content += "\n\n".join([
+                "config %s\n\tdef_tristate %s" % (selector, expression)
+                for selector, expression in selectors
+            ]) + "\n"
+            rctx.file(root, content, executable = False)
+
     if kconfig_roots:
         root = rctx.path("Kconfig")
         content = rctx.read(root).rstrip() + "\n\n# In-tree module Kconfig roots added by linux.bzl.\n"
@@ -192,7 +250,7 @@ def _linux_source_repository_impl(rctx):
     for patch in rctx.attr.patches:
         rctx.patch(patch, strip = rctx.attr.patch_strip)
     _normalize_tools_build_files(rctx)
-    overlay_destinations = _stage_source_overlays(rctx)
+    overlays = _stage_source_overlays(rctx)
     _integrate_in_tree_modules(rctx)
 
     makefile = rctx.path("Makefile")
@@ -218,13 +276,19 @@ def _linux_source_repository_impl(rctx):
         "@platforms",
         repository_prefix(rctx.attr._platforms_x86_64),
     )
+    if _SOURCE_OVERLAY_FILES_MARKER not in source_build:
+        fail("source repository BUILD template is missing the overlay files marker")
+    source_build = source_build.replace(
+        _SOURCE_OVERLAY_FILES_MARKER,
+        "\n".join(["    %r," % path for path in overlays.files]),
+    )
     rctx.file("BUILD.bazel", source_build, executable = False)
     rctx.file(
         ".linux-bzl-source.json",
         json.encode({
             "integrity": integrity,
             "module_make_vars": rctx.attr.module_make_vars,
-            "overlay_destinations": overlay_destinations,
+            "overlay_destinations": overlays.destinations,
             "protocol": LINUX_SOURCE_REPOSITORY_PROTOCOL,
             "version": actual_version,
         }) + "\n",
@@ -238,8 +302,8 @@ linux_source_repository = repository_rule(
         "integrity": attr.string(
             doc = "SHA-256 SRI digest required with explicit urls.",
         ),
-        "module_kbuild_roots": attr.string_list(
-            doc = "In-tree directories whose Kbuild or Makefile roots are added to the kernel object graph.",
+        "module_kbuild_roots": attr.string_dict(
+            doc = "In-tree Kbuild or Makefile roots mapped to Kconfig expressions controlling their inclusion; use y for unconditional roots.",
         ),
         "module_kconfig_roots": attr.string_list(
             doc = "In-tree Kconfig files sourced by the kernel root Kconfig.",
