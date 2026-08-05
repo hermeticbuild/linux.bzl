@@ -977,7 +977,9 @@ def _x86_purgatory_actions_test_impl(ctx):
                 "-fstack-protector-strong",
                 "-mretpoline",
                 "-mfunction-return=thunk-extern",
+                "-fsanitize-cfi-icall-experimental-normalize-integers",
                 "-fsanitize=kcfi",
+                "-fsanitize-kcfi-arity",
                 "-flto=thin",
                 "-fsplit-lto-unit",
             ]:

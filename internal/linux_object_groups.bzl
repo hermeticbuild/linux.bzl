@@ -467,10 +467,20 @@ def _cmd_path(object):
     directory, basename = object.rsplit("/", 1)
     return directory + "/." + basename + ".cmd"
 
-def _source_version_record(ctx, selection, spec, depfile, symversions = None):
+def _source_version_record(ctx, selection, spec, depfile, generated_path_files = [], symversions = None):
+    path_files_by_path = {}
+    for path_file in selection.path_files + generated_path_files:
+        previous = path_files_by_path.get(path_file.path)
+        if previous != None and previous.file.path != path_file.file.path:
+            fail(
+                "grouped source-version path %s names both %s and %s" %
+                (path_file.path, previous.file.path, path_file.file.path),
+            )
+        path_files_by_path[path_file.path] = path_file
+    path_files = [path_files_by_path[path] for path in sorted(path_files_by_path.keys())]
     object_dir = spec.object.rsplit("/", 1)[0] if "/" in spec.object else ""
     staged_path_files = []
-    for path_file in selection.path_files:
+    for path_file in path_files:
         path_dir = path_file.path.rsplit("/", 1)[0] if "/" in path_file.path else ""
         if path_file.path == selection.source_path or path_dir == object_dir:
             staged_path_files.append(path_file)
@@ -487,14 +497,14 @@ def _source_version_record(ctx, selection, spec, depfile, symversions = None):
     if symversions != None:
         args.add("-symversions", symversions)
         inputs.append(symversions)
-    for path_file in selection.path_files:
+    for path_file in path_files:
         args.add("-physical")
         args.add(path_file.file)
         args.add("-canonical", path_file.path)
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._sourceversioncmd,
-        inputs = depset(inputs, transitive = [selection.files]),
+        inputs = depset(inputs + [path_file.file for path_file in generated_path_files], transitive = [selection.files]),
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxSourceVersionCmd",
@@ -718,9 +728,18 @@ def _linux_object_action_group_impl(ctx):
                 ctx.label.name + ".objects/" + spec.content_id + "/.objtool-input/" + spec.object,
             )
         source_version_depfile = None
-        if ctx.attr.mode == "m":
+        if ctx.attr.mode == "m" and (ctx.attr.language == "c" or source.basename.endswith(".S")):
             source_version_depfile = ctx.actions.declare_file(
                 ctx.label.name + ".source_versions/" + spec.content_id + "/" + spec.object + ".d",
+            )
+        elif (
+            ctx.attr.mode == "m" and
+            source.basename.endswith(".s") and
+            config.config_flags.get("CONFIG_MODULE_SRCVERSION_ALL") == "y"
+        ):
+            fail(
+                "%s builds raw assembler module leaf %s from %s, but CONFIG_MODULE_SRCVERSION_ALL=y requires depfile-capable C or preprocessed assembly (.S)" %
+                (ctx.label, spec.object, source.basename),
             )
         transitive_inputs = [
             selection.files,
@@ -825,19 +844,25 @@ def _linux_object_action_group_impl(ctx):
             ))
         source_version_records = []
         if source_version_depfile != None:
+            generated_path_files = []
+            if generated_headers != None and hasattr(generated_headers, "path_files") and generated_headers.path_files:
+                generated_path_files = generated_headers.path_files
             source_version_records.append(_source_version_record(
                 ctx,
                 selection,
                 spec,
                 source_version_depfile,
+                generated_path_files = generated_path_files,
                 symversions = symversion_cmd,
             ))
         info = LinuxObjectInfo(
             content_id = spec.content_id,
             generated_headers = depset([]),
+            generated_header_path_files = [],
             generated_include_dir_anchors = {},
             generated_include_dirs = [],
             mode = ctx.attr.mode,
+            module_leaf_objects = [spec.object] if ctx.attr.mode == "m" else [],
             module_root_kind = "single" if ctx.attr.module_root else "",
             object = spec.object,
             objtool_args = list(ctx.attr.objtool_args) if use_objtool else [],
@@ -960,6 +985,21 @@ def _merged_generated_include_dir_anchors(infos):
         anchors.update(info.generated_include_dir_anchors)
     return anchors
 
+def _merged_generated_header_path_files(infos):
+    by_path = {}
+    for info in infos:
+        if not hasattr(info, "generated_header_path_files") or not info.generated_header_path_files:
+            continue
+        for path_file in info.generated_header_path_files:
+            previous = by_path.get(path_file.path)
+            if previous != None and previous.file.path != path_file.file.path:
+                fail(
+                    "generated header path %s names both %s and %s" %
+                    (path_file.path, previous.file.path, path_file.file.path),
+                )
+            by_path[path_file.path] = path_file
+    return [by_path[path] for path in sorted(by_path.keys())]
+
 def _merged_symversion_records(infos):
     records = []
     for info in infos:
@@ -973,6 +1013,17 @@ def _merged_source_version_records(infos):
         if hasattr(info, "source_version_records") and info.source_version_records:
             records.extend(info.source_version_records)
     return records
+
+def _merged_module_leaf_objects(infos):
+    seen = {}
+    objects = []
+    for info in infos:
+        if hasattr(info, "module_leaf_objects") and info.module_leaf_objects:
+            for object in info.module_leaf_objects:
+                if object not in seen:
+                    seen[object] = True
+                    objects.append(object)
+    return objects
 
 def _unique_generated_include_dirs(infos):
     seen = {}
@@ -1040,9 +1091,11 @@ def _linux_composite_object_action_group_impl(ctx):
                 generated_headers = depset(
                     transitive = [member.generated_headers for member in member_infos],
                 ),
+                generated_header_path_files = _merged_generated_header_path_files(member_infos),
                 generated_include_dir_anchors = _merged_generated_include_dir_anchors(member_infos),
                 generated_include_dirs = _unique_generated_include_dirs(member_infos),
                 mode = ctx.attr.mode,
+                module_leaf_objects = _merged_module_leaf_objects(member_infos),
                 module_root_kind = "composite" if ctx.attr.module_root else "",
                 object = spec.object,
                 objtool_args = list(ctx.attr.objtool_args),
