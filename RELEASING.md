@@ -25,7 +25,9 @@ the rules module.
    //:linux_6_18_39_rust_module_test --test_output=streamed` from `e2e`.
    This builds and loads version-native Rust-for-Linux modules for the
    cataloged x86_64 kernels. Also verify that cross-kernel dependencies and
-   `MODULE_VERSION`/module source-version metadata are rejected.
+   Rust `MODULE_VERSION`/module source-version metadata are rejected. Build the
+   C source-version fixture to verify `MODULE_VERSION` and
+   `CONFIG_MODULE_SRCVERSION_ALL` through modpost.
 7. From `aya_e2e`, run the pinned Aya x86_64 and aarch64 VM targets in one
    Bazel invocation. This exercises the shared action graph and records
    cross-target action deduplication in one profile and BEP.
@@ -71,7 +73,10 @@ A release is ready only when:
 - Rust-for-Linux modules build for the cataloged x86_64 Linux targets
   on a Linux x86_64 executor with stable Rust 1.97.0 through the public
   `linux_module` API. Cross-kernel module dependencies and
-  `MODULE_VERSION`/module source-version metadata fail explicitly.
+  Rust `MODULE_VERSION`/module source-version metadata fail explicitly.
+- C modules support `MODULE_VERSION`; in-tree C/assembly modules and
+  out-of-tree C modules support `CONFIG_MODULE_SRCVERSION_ALL`, while direct
+  authored `srcversion=` metadata fails explicitly.
 - The pinned Aya x86_64 and aarch64 VM tests pass from the standalone
   `aya_e2e` module root.
 - BPF-syscall and BTF-enabled configurations are covered by a compatibility
@@ -85,5 +90,6 @@ Named variants must share content-identical object actions in one configured
 graph. Release CI verifies the maintained x86_64 base/BTF/debug/LZ4 invocation
 against the generated graph statistics and Bazel action metrics.
 
-Signing kernel images or modules, `MODULE_VERSION`/module source-version
-metadata, and device-tree artifacts are outside the current release contract.
+Signing kernel images or modules, Rust module source versions, direct authored
+`srcversion=` metadata, and device-tree artifacts are outside the current
+release contract.

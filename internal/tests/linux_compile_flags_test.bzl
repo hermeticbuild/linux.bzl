@@ -25,6 +25,18 @@ def _linux_compile_flags_test_impl(ctx):
             "expected reproducible compile flag %s in %s" % (flag, flags),
         )
 
+    resource_includes = [
+        flag
+        for flag in flags
+        if "/lib/clang/" in flag.replace("\\", "/") and flag.replace("\\", "/").endswith("/include")
+    ]
+    asserts.equals(env, 1, len(resource_includes))
+    asserts.true(env, "-internal-isystem" in flags)
+    asserts.false(env, any([
+        "glibc_headers" in flag or "musl_libc" in flag
+        for flag in flags
+    ]))
+
     return analysistest.end(env)
 
 linux_compile_flags_test = analysistest.make(_linux_compile_flags_test_impl)

@@ -148,7 +148,7 @@ def _compile_external_rust(ctx, sdk, crate_root, crate_name):
         "Processing Rust-for-Linux module with objtool %{label}",
     )
 
-def _external_c_arguments(ctx, sdk, source, module_name, output = None, preprocess = False):
+def _external_c_arguments(ctx, sdk, source, module_name, output = None, preprocess = False, depfile = None):
     args = ctx.actions.args()
     linux_module_actions.add_target_c_flags(args, sdk.target_c_flags)
     args.add_all(linux_module_cc_helpers.module_flags("m"))
@@ -166,6 +166,10 @@ def _external_c_arguments(ctx, sdk, source, module_name, output = None, preproce
     if preprocess:
         args.add_all(["-E", "-D__GENKSYMS__"])
     else:
+        if depfile != None:
+            args.add("-MD")
+            args.add("-MF")
+            args.add(depfile)
         args.add("-c")
     args.add(source)
     if output != None:
@@ -175,17 +179,19 @@ def _external_c_arguments(ctx, sdk, source, module_name, output = None, preproce
 
 def _compile_external_c(ctx, sdk, source, module_name):
     raw = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o.raw")
+    depfile = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o.d")
     path_mapped_run(
         ctx.actions,
         executable = sdk.target.compiler,
         inputs = _sdk_target_inputs(sdk, ctx.files.srcs),
-        outputs = [raw],
+        outputs = [raw, depfile],
         arguments = [_external_c_arguments(
             ctx,
             sdk,
             source,
             module_name,
             output = raw,
+            depfile = depfile,
         )],
         mnemonic = "LinuxCModuleCompile",
         progress_message = "Compiling out-of-tree C Linux module %{label}",
@@ -203,6 +209,7 @@ def _compile_external_c(ctx, sdk, source, module_name):
         "Processing out-of-tree C Linux module with objtool %{label}",
     )
     symversion_record = None
+    symversion_cmd = None
     if sdk.config.config_flags.get("CONFIG_MODVERSIONS") == "y":
         if linux_module_actions.version_at_least(sdk.version, 6, 18) and sdk.config.config_flags.get("CONFIG_GENKSYMS") != "y":
             fail("%s requires CONFIG_GENKSYMS=y for symbol versions" % ctx.label)
@@ -252,8 +259,39 @@ def _compile_external_c(ctx, sdk, source, module_name):
             cmd = cmd,
             object = module_name + ".o",
         )
+        symversion_cmd = cmd
+    source_cmd = ctx.actions.declare_file(
+        ctx.label.name + ".external/source_versions/." + module_name + ".o.cmd",
+    )
+    source_path = module_name + ".c"
+    source_args = ctx.actions.args()
+    source_args.add("-depfile", depfile)
+    source_args.add("-object", module_name + ".o")
+    source_args.add("-out", source_cmd)
+    source_args.add("-primary", source_path)
+    source_inputs = [depfile, source]
+    if symversion_cmd != None:
+        source_args.add("-symversions", symversion_cmd)
+        source_inputs.append(symversion_cmd)
+    source_args.add("-physical")
+    source_args.add(source)
+    source_args.add("-canonical", source_path)
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._sourceversioncmd,
+        inputs = source_inputs,
+        outputs = [source_cmd],
+        arguments = [source_args],
+        mnemonic = "LinuxSourceVersionCmd",
+        progress_message = "Generating external Linux module source-version data %{label}",
+    )
     return struct(
         object = out,
+        source_version_record = struct(
+            cmd = source_cmd,
+            object = module_name + ".o",
+            path_files = [struct(file = source, path = source_path)],
+        ),
         symversion_record = symversion_record,
     )
 
@@ -279,13 +317,15 @@ def _add_rust_sdk_flags(args, sdk, flags):
         else:
             args.add(flag)
 
-def _check_external_modinfo(ctx, preliminary, crate_name):
+def _check_external_modinfo(ctx, preliminary, crate_name, allow_version = False):
     checked = ctx.actions.declare_file(
         ctx.label.name + ".external/" + crate_name + ".modinfo.checked",
     )
     check_args = ctx.actions.args()
     check_args.add("-in", preliminary)
     check_args.add("-out", checked)
+    if allow_version:
+        check_args.add("-allow-version")
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._modulemodinfo,
@@ -297,21 +337,29 @@ def _check_external_modinfo(ctx, preliminary, crate_name):
     )
     return checked
 
-def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check, symversion_record = None):
+def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check, source_version_record = None, symversion_record = None):
     stage = ctx.label.name + ".external/modpost"
     staged_object = ctx.actions.declare_file(stage + "/" + crate_name + ".o")
     ctx.actions.symlink(output = staged_object, target_file = preliminary)
     manifest = ctx.actions.declare_file(stage + "/" + crate_name + ".mod")
     ctx.actions.write(manifest, crate_name + ".o\n")
+    source_version_inputs = []
+    if source_version_record != None:
+        staged_source_cmd = ctx.actions.declare_file(
+            stage + "/" + linux_module_actions.symversion_cmd_path(source_version_record.object),
+        )
+        ctx.actions.symlink(output = staged_source_cmd, target_file = source_version_record.cmd)
+        source_version_inputs.append(staged_source_cmd)
+        for path_file in source_version_record.path_files:
+            staged_source = ctx.actions.declare_file(stage + "/" + path_file.path)
+            ctx.actions.symlink(output = staged_source, target_file = path_file.file)
+            source_version_inputs.append(staged_source)
     symversion_inputs = []
     if sdk.config.config_flags.get("CONFIG_MODVERSIONS") == "y":
         if symversion_record == None:
             fail("%s requires C symbol-version records for CONFIG_MODVERSIONS=y" % ctx.label)
-        staged_cmd = ctx.actions.declare_file(
-            stage + "/" + linux_module_actions.symversion_cmd_path(symversion_record.object),
-        )
-        ctx.actions.symlink(output = staged_cmd, target_file = symversion_record.cmd)
-        symversion_inputs.append(staged_cmd)
+        if source_version_record == None:
+            fail("%s requires combined source and symbol-version records for CONFIG_MODVERSIONS=y" % ctx.label)
     modules_order = ctx.actions.declare_file(stage + "/modules.order")
     ctx.actions.write(modules_order, crate_name + ".o\n")
     kernel_symvers = ctx.actions.declare_file(stage + "/Kernel.symvers")
@@ -356,7 +404,7 @@ def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check, symversi
             modules_order,
             kernel_symvers,
             modinfo_check,
-        ] + dep_symvers + symversion_inputs,
+        ] + dep_symvers + source_version_inputs + symversion_inputs,
         tools = [sdk.modpost],
         outputs = [mod_source, module_symvers],
         arguments = [args],
@@ -400,6 +448,8 @@ def _linux_module_impl(ctx):
         fail("%s requires a kernel with CONFIG_MODULES=y" % ctx.label)
     if sdk.config.config_flags.get("CONFIG_MODVERSIONS") == "y":
         fail("%s does not support Rust modules with CONFIG_MODVERSIONS=y" % ctx.label)
+    if sdk.config.config_flags.get("CONFIG_MODULE_SRCVERSION_ALL") == "y":
+        fail("%s does not support Rust module source versions; use a C module or disable CONFIG_MODULE_SRCVERSION_ALL" % ctx.label)
     if sdk.rust == None or not sdk.rust.enabled:
         fail("%s requires a kernel with CONFIG_RUST=y" % ctx.label)
     crate_root = _crate_root(ctx)
@@ -455,13 +505,14 @@ def _linux_cc_module_impl(ctx):
     module_name = _crate_name(ctx)
     compiled = _compile_external_c(ctx, sdk, source, module_name)
     preliminary = compiled.object
-    modinfo_check = _check_external_modinfo(ctx, preliminary, module_name)
+    modinfo_check = _check_external_modinfo(ctx, preliminary, module_name, allow_version = True)
     mod_source, module_symvers = _external_modpost(
         ctx,
         sdk,
         preliminary,
         module_name,
         modinfo_check,
+        source_version_record = compiled.source_version_record,
         symversion_record = compiled.symversion_record,
     )
     mod_object = _compile_external_mod_source(ctx, sdk, mod_source, module_name)
@@ -861,6 +912,11 @@ _linux_cc_module = rule(
         "_runincwd": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/runincwd"),
+            executable = True,
+        ),
+        "_sourceversioncmd": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/sourceversioncmd"),
             executable = True,
         ),
     },

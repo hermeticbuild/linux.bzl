@@ -40,14 +40,23 @@ def _linux_object_objtool_action_test_impl(ctx):
         for action in actions
         if action.mnemonic == "LinuxRelocatableLink"
     ]
+    source_version_actions = [
+        action
+        for action in actions
+        if action.mnemonic == "LinuxSourceVersionCmd"
+    ]
     asserts.equals(env, 1, len(compile_actions))
     asserts.equals(env, 1 if ctx.attr.expect_objtool else 0, len(objtool_actions))
     asserts.equals(env, 1 if ctx.attr.expect_objcopy else 0, len(objcopy_actions))
     asserts.equals(env, 1 if ctx.attr.expect_link else 0, len(link_actions))
+    asserts.equals(env, 1 if ctx.attr.expect_source_version else 0, len(source_version_actions))
     compile_outputs = []
     if compile_actions:
-        compile_outputs = [file.path for file in compile_actions[0].outputs.to_list()]
+        all_compile_outputs = [file.path for file in compile_actions[0].outputs.to_list()]
+        compile_outputs = [path for path in all_compile_outputs if not path.endswith(".d")]
+        depfiles = [path for path in all_compile_outputs if path.endswith(".d")]
         asserts.equals(env, 1, len(compile_outputs))
+        asserts.equals(env, 1 if ctx.attr.expect_source_version else 0, len(depfiles))
     link_outputs = []
     if compile_outputs and ctx.attr.expect_link and link_actions:
         link_inputs = [file.path for file in link_actions[0].inputs.to_list()]
@@ -113,6 +122,7 @@ _linux_object_objtool_action_test = analysistest.make(
         "expect_link": attr.bool(),
         "expect_objcopy": attr.bool(),
         "expect_objtool": attr.bool(default = True),
+        "expect_source_version": attr.bool(),
     },
 )
 
@@ -200,6 +210,7 @@ def linux_object_objtool_test_suite(name):
             expect_link = delayed and not assembly and object_mode == "m" and (module_root or force),
             expect_objcopy = transformed,
             expect_objtool = use_objtool,
+            expect_source_version = object_mode == "m",
             target_under_test = ":" + object_target,
         )
         tests.append(":" + test)

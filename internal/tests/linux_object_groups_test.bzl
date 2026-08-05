@@ -124,6 +124,17 @@ def _compile_group_test_impl(ctx):
     for action in _actions_with_mnemonic(actions, "LinuxObjectCompile"):
         generated_cflags = [arg for arg in action.argv if arg.endswith(".cflags.rsp")]
         asserts.equals(env, 1, len(generated_cflags))
+        resource_includes = [
+            arg
+            for arg in action.argv
+            if "/lib/clang/" in arg.replace("\\", "/") and arg.replace("\\", "/").endswith("/include")
+        ]
+        asserts.equals(env, 1, len(resource_includes))
+        asserts.true(env, "-internal-isystem" in action.argv)
+        asserts.false(env, any([
+            "glibc_headers" in arg or "musl_libc" in arg
+            for arg in action.argv
+        ]))
     return analysistest.end(env)
 
 _compile_group_test = analysistest.make(_compile_group_test_impl)
@@ -172,6 +183,10 @@ def _symversion_group_test_impl(ctx):
     asserts.equals(env, 1, len(actions))
     asserts.equals(env, 1, len(info.symversion_records))
     asserts.equals(env, "kernel/versioned.o", info.symversion_records[0].object)
+    asserts.equals(env, 1, len(info.source_version_records))
+    asserts.equals(env, "kernel/versioned.o", info.source_version_records[0].object)
+    source_version_actions = _actions_with_mnemonic(analysistest.target_actions(env), "LinuxSourceVersionCmd")
+    asserts.equals(env, 1, len(source_version_actions))
     if actions:
         asserts.true(env, "-mode" in actions[0].argv)
         asserts.true(env, "c" in actions[0].argv)
@@ -182,6 +197,13 @@ def _symversion_group_test_impl(ctx):
         asserts.equals(env, 1, len(compile_actions))
         asserts.equals(env, 1, len(objtool_actions))
         if compile_actions and objtool_actions:
+            asserts.true(env, "-MD" in compile_actions[0].argv)
+            asserts.true(env, "-MF" in compile_actions[0].argv)
+            depfiles = [file.path for file in compile_actions[0].outputs.to_list() if file.path.endswith(".d")]
+            asserts.equals(env, 1, len(depfiles))
+            if depfiles and source_version_actions:
+                asserts.true(env, depfiles[0] in [file.path for file in source_version_actions[0].inputs.to_list()])
+                asserts.true(env, info.symversion_records[0].cmd.path in [file.path for file in source_version_actions[0].inputs.to_list()])
             compile_output = compile_actions[0].outputs.to_list()[0].path
             objtool_output = objtool_actions[0].outputs.to_list()[0].path
             inspected_object = _argument_after(actions[0].argv, "-object")
@@ -197,6 +219,8 @@ def _symversion_composite_test_impl(ctx):
     info = analysistest.target_under_test(env)[LinuxObjectActionGroupInfo].objects["versioned_composite"]
     asserts.equals(env, 1, len(info.symversion_records))
     asserts.equals(env, "kernel/versioned.o", info.symversion_records[0].object)
+    asserts.equals(env, 1, len(info.source_version_records))
+    asserts.equals(env, "kernel/versioned.o", info.source_version_records[0].object)
     return analysistest.end(env)
 
 _symversion_composite_test = analysistest.make(_symversion_composite_test_impl)
@@ -315,7 +339,7 @@ def linux_object_groups_test_suite(name):
         compile_environment_index = ":" + name + "_compile_environments",
         genksyms = "//internal/cmd/runandwrite",
         language = "c",
-        mode = "y",
+        mode = "m",
         objtool = "//internal/cmd/runandwrite",
         objects = {
             "versioned": json.encode({
@@ -370,7 +394,7 @@ def linux_object_groups_test_suite(name):
         name = name + "_symversion_composite_group",
         arch = "x86",
         member_groups = [":" + name + "_symversion_group"],
-        mode = "y",
+        mode = "m",
         objects = {
             "versioned_composite": json.encode({
                 "content_id": _MODVERSION_COMPOSITE_ID,

@@ -12,19 +12,20 @@ import (
 func main() {
 	in := flag.String("in", "", "input module ELF")
 	out := flag.String("out", "", "validation marker output")
+	allowVersion := flag.Bool("allow-version", false, "allow MODULE_VERSION metadata")
 	flag.Parse()
 
 	if *in == "" || *out == "" {
 		fmt.Fprintln(os.Stderr, "-in and -out are required")
 		os.Exit(2)
 	}
-	if err := run(*in, *out); err != nil {
+	if err := run(*in, *out, *allowVersion); err != nil {
 		fmt.Fprintf(os.Stderr, "modulemodinfo: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(inPath, outPath string) error {
+func run(inPath, outPath string, allowVersion bool) error {
 	module, err := elf.Open(inPath)
 	if err != nil {
 		return fmt.Errorf("open module ELF %q: %w", inPath, err)
@@ -36,7 +37,7 @@ func run(inPath, outPath string) error {
 		if err != nil {
 			return fmt.Errorf("read .modinfo from %q: %w", inPath, err)
 		}
-		if err := checkModuleModinfo(data); err != nil {
+		if err := checkModuleModinfo(data, allowVersion); err != nil {
 			return fmt.Errorf("%s: %w", inPath, err)
 		}
 	}
@@ -47,18 +48,21 @@ func run(inPath, outPath string) error {
 	return os.WriteFile(outPath, []byte("ok\n"), 0o600)
 }
 
-func checkModuleModinfo(data []byte) error {
+func checkModuleModinfo(data []byte, allowVersion bool) error {
 	for _, entry := range bytes.Split(data, []byte{0}) {
 		key, value, found := bytes.Cut(entry, []byte{'='})
 		if !found {
 			continue
 		}
-		if bytes.Equal(key, []byte("version")) || bytes.Equal(key, []byte("srcversion")) {
+		if bytes.Equal(key, []byte("srcversion")) {
 			return fmt.Errorf(
-				"module source-version metadata is not supported: %s=%s",
+				"user-authored srcversion metadata is not supported; modpost generates it from module sources: %s=%s",
 				key,
 				value,
 			)
+		}
+		if bytes.Equal(key, []byte("version")) && !allowVersion {
+			return fmt.Errorf("MODULE_VERSION metadata is not supported for this module language: %s=%s", key, value)
 		}
 	}
 	return nil

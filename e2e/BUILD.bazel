@@ -8,11 +8,13 @@ load(":qemu_boot_test.bzl", "qemu_boot_test", "qemu_system_target")
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
+    "cnic.config",
     "kvm.config",
     "armv7.config",
     "modversions.config",
     "rust.config",
     "rust_arm64.config",
+    "srcversions.config",
     "tiny.config",
     "tiny_arm64.config",
     "verity.config",
@@ -56,6 +58,17 @@ build_test(
     ],
 )
 
+select_file(
+    name = "cnic_module",
+    srcs = "@e2e_cnic_x86_64//:modules",
+    subpath = "cnic.ko",
+)
+
+build_test(
+    name = "cnic_module_version_build_test",
+    targets = [":cnic_module"],
+)
+
 linux_cc_module(
     name = "hello_c_module_aarch64",
     srcs = ["hello_module.c"],
@@ -84,6 +97,21 @@ linux_cc_module(
     name = "hello_c_module_aarch64_modversions",
     srcs = ["hello_module.c"],
     kernel = "@e2e_aarch64//variants/modversions:kernel",
+)
+
+linux_cc_module(
+    name = "hello_c_module_srcversions",
+    srcs = ["hello_module.c"],
+    kernel = "@e2e_x86_64//variants/srcversions:kernel",
+)
+
+build_test(
+    name = "srcversions_6_18_39_x86_64_build_test",
+    targets = [
+        "@e2e_x86_64//variants/srcversions:kernel",
+        "@e2e_x86_64//variants/srcversions:modules",
+        ":hello_c_module_srcversions",
+    ],
 )
 
 build_test(

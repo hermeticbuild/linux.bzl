@@ -12,7 +12,6 @@ def validate_config_features(config, description):
     for symbol in [
         "CONFIG_EXTENDED_MODVERSIONS",
         "CONFIG_GENDWARFKSYMS",
-        "CONFIG_MODULE_SRCVERSION_ALL",
         "CONFIG_TRIM_UNUSED_KSYMS",
     ]:
         if config.get(symbol, "n") in ["y", "m"]:

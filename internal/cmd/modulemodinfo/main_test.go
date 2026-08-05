@@ -8,23 +8,26 @@ import (
 	"testing"
 )
 
-func TestCheckModuleModinfoRejectsSourceVersions(t *testing.T) {
-	for _, entry := range []string{
-		"version=1.0",
-		"srcversion=0123456789ABCDEF",
-	} {
-		t.Run(entry, func(t *testing.T) {
-			err := checkModuleModinfo([]byte("license=GPL\x00" + entry + "\x00"))
-			if err == nil || !strings.Contains(err.Error(), "source-version metadata") {
-				t.Fatalf("checkModuleModinfo() error = %v, want source-version rejection", err)
-			}
-		})
+func TestCheckModuleModinfoAllowsVersionWhenRequested(t *testing.T) {
+	data := []byte("license=GPL\x00version=1.0\x00")
+	if err := checkModuleModinfo(data, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkModuleModinfo(data, false); err == nil || !strings.Contains(err.Error(), "module language") {
+		t.Fatalf("checkModuleModinfo() error = %v, want language-specific version rejection", err)
+	}
+}
+
+func TestCheckModuleModinfoAlwaysRejectsAuthoredSrcversion(t *testing.T) {
+	err := checkModuleModinfo([]byte("srcversion=0123456789ABCDEF\x00"), true)
+	if err == nil || !strings.Contains(err.Error(), "user-authored srcversion") {
+		t.Fatalf("checkModuleModinfo() error = %v, want authored srcversion rejection", err)
 	}
 }
 
 func TestCheckModuleModinfoAllowsOtherMetadata(t *testing.T) {
 	data := []byte("license=GPL\x00description=example\x00myversion=1.0\x00")
-	if err := checkModuleModinfo(data); err != nil {
+	if err := checkModuleModinfo(data, false); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -35,7 +38,7 @@ func TestRunAcceptsELFWithoutModinfo(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := filepath.Join(t.TempDir(), "checked")
-	if err := run(executable, out); err != nil {
+	if err := run(executable, out, false); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(out)
@@ -52,9 +55,12 @@ func TestRunRejectsELFWithVersionModinfo(t *testing.T) {
 	in := filepath.Join(dir, "module.o")
 	writeELFWithModinfo(t, in, []byte("license=GPL\x00version=1.0\x00"))
 
-	err := run(in, filepath.Join(dir, "checked"))
-	if err == nil || !strings.Contains(err.Error(), "source-version metadata") {
-		t.Fatalf("run() error = %v, want source-version rejection", err)
+	err := run(in, filepath.Join(dir, "checked"), false)
+	if err == nil || !strings.Contains(err.Error(), "module language") {
+		t.Fatalf("run() error = %v, want MODULE_VERSION rejection", err)
+	}
+	if err := run(in, filepath.Join(dir, "allowed"), true); err != nil {
+		t.Fatalf("run() with allow-version: %v", err)
 	}
 }
 
@@ -64,7 +70,7 @@ func TestRunRejectsNonELF(t *testing.T) {
 	if err := os.WriteFile(in, []byte("not an ELF"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := run(in, filepath.Join(dir, "checked"))
+	err := run(in, filepath.Join(dir, "checked"), false)
 	if err == nil || !strings.Contains(err.Error(), "open module ELF") {
 		t.Fatalf("run() error = %v, want invalid ELF rejection", err)
 	}

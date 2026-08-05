@@ -65,6 +65,7 @@ LinuxObjectInfo = provider(
         "objtool_args": "Kbuild target-specific objtool arguments carried to a delayed composite root.",
         "objtool_force": "Whether Kbuild explicitly enables objtool for this object.",
         "output": "Object output file.",
+        "source_version_records": "Ordered per-leaf source-version records used by modpost.",
         "symversion_records": "Ordered per-leaf symbol-version records as structs with object and cmd fields.",
     },
 )
@@ -105,6 +106,7 @@ LinuxSourceInputIndexInfo = provider(
         "file_indices": "Dictionary of source-root-relative paths to one-based file indices.",
         "files": "Canonical list of source files, each labeled exactly once by the index target.",
         "groups": "List of structs containing the depset and encoded membership for one exact input group.",
+        "paths": "Canonical source-root-relative paths aligned with files.",
         "source_tree_info": "Linux source tree used to root and interpret the indexed files.",
     },
 )
@@ -221,6 +223,8 @@ def _linux_source_input_index_impl(ctx):
         if encoded in seen_groups:
             fail("linux_source_input_index %s repeats group %r" % (ctx.label, encoded))
         group_files = []
+        group_paths = []
+        group_path_files = []
         previous_index = 0
         for value in encoded.split(","):
             index = _positive_decimal(
@@ -238,10 +242,17 @@ def _linux_source_input_index_impl(ctx):
                     (ctx.label, group_number + 1, index, len(files)),
                 )
             group_files.append(files[index - 1])
+            group_paths.append(paths[index - 1])
+            group_path_files.append(struct(
+                file = files[index - 1],
+                path = paths[index - 1],
+            ))
             previous_index = index
         groups.append(struct(
             encoded_membership = "," + encoded + ",",
             files = depset(group_files),
+            path_files = group_path_files,
+            paths = group_paths,
         ))
         seen_groups[encoded] = True
         previous_group = encoded
@@ -251,6 +262,7 @@ def _linux_source_input_index_impl(ctx):
         file_indices = file_indices,
         files = files,
         groups = groups,
+        paths = paths,
         source_tree_info = source_tree_info,
     )]
 
@@ -334,8 +346,12 @@ def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
         flag = flags[index]
         if flag == "-Xclang":
             if index + 1 < len(flags) and flags[index + 1] == "-internal-isystem":
-                drop_count = 3
-                continue
+                resource_path = ""
+                if index + 3 < len(flags) and flags[index + 2] == "-Xclang":
+                    resource_path = flags[index + 3]
+                if not _linux_clang_resource_include(resource_path):
+                    drop_count = 3
+                    continue
             if index + 1 < len(flags) and flags[index + 1] == "-fno-cxx-modules":
                 drop_count = 1
                 continue
@@ -410,10 +426,21 @@ def _linux_rewrite_target_flags(flags, target_triple):
 
 def _linux_drop_toolchain_include(path):
     return (
+        "llvm++glibc+" in path or
         "llvm++musl+musl_libc/" in path or
         "llvm++musl+musl_libc\\" in path or
         "llvm++kernel_headers+linux_kernel_headers_" in path
     )
+
+def _linux_clang_resource_include(path):
+    """Whether path is Clang's compiler-provided resource header directory."""
+    normalized = path.replace("\\", "/")
+    marker = "/lib/clang/"
+    marker_index = normalized.rfind(marker)
+    if marker_index < 0:
+        return False
+    suffix = normalized[marker_index + len(marker):].split("/")
+    return len(suffix) == 2 and bool(suffix[0]) and suffix[1] == "include"
 
 def _cc_target_flags(ctx, cc_toolchain, feature_configuration):
     flags = _linux_compile_flags(ctx, cc_toolchain, feature_configuration)
@@ -838,6 +865,13 @@ def _merged_symversion_records(object_infos):
             records.extend(info.symversion_records)
     return records
 
+def _merged_source_version_records(object_infos):
+    records = []
+    for info in object_infos:
+        if hasattr(info, "source_version_records") and info.source_version_records:
+            records.extend(info.source_version_records)
+    return records
+
 def _single_file(target, attr_name):
     files = target.files.to_list()
     if len(files) != 1:
@@ -929,6 +963,12 @@ def _linux_object_directory(object):
     if "/" not in object:
         return ""
     return object.rsplit("/", 1)[0]
+
+def _linux_object_cmd_path(object):
+    if "/" not in object:
+        return "." + object + ".cmd"
+    directory, basename = object.rsplit("/", 1)
+    return directory + "/." + basename + ".cmd"
 
 def _linux_source_tree_info(ctx):
     if hasattr(ctx.attr, "source_input_index"):
@@ -1044,6 +1084,47 @@ def _linux_object_compile_source_tree_inputs(ctx, direct = []):
         transitive = [selection.value.files],
     )
 
+def _linux_source_version_record(ctx, selection, primary_file_number, object, depfile, symversions = None):
+    """Creates the Kbuild .cmd data consumed by modpost source versions."""
+    primary_path = selection.index.paths[primary_file_number - 1]
+    object_dir = _linux_object_directory(object)
+    staged_path_files = []
+    for path_file in selection.value.path_files:
+        path_dir = path_file.path.rsplit("/", 1)[0] if "/" in path_file.path else ""
+        if path_file.path == primary_path or path_dir == object_dir:
+            staged_path_files.append(path_file)
+
+    out = ctx.actions.declare_file(
+        ctx.label.name + ".source_versions/" + _linux_object_cmd_path(object),
+    )
+    args = ctx.actions.args()
+    args.add("-depfile", depfile)
+    args.add("-object", object)
+    args.add("-out", out)
+    args.add("-primary", primary_path)
+    inputs = [depfile]
+    if symversions != None:
+        args.add("-symversions", symversions)
+        inputs.append(symversions)
+    for path_file in selection.value.path_files:
+        args.add("-physical")
+        args.add(path_file.file)
+        args.add("-canonical", path_file.path)
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._sourceversioncmd,
+        inputs = depset(inputs, transitive = [selection.value.files]),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxSourceVersionCmd",
+        progress_message = "Generating Linux module source-version data %{label}",
+    )
+    return struct(
+        cmd = out,
+        object = object,
+        path_files = staged_path_files,
+    )
+
 def _rewrite_utsversion_tmp_flags(flags, object, utsversion_tmp):
     object_dir = _linux_object_directory(object)
     candidates = ["utsversion-tmp.h"]
@@ -1088,6 +1169,37 @@ def _copy_source_tree_file(ctx, out_relpath, in_relpath):
     return out
 
 def _linux_purgatory_compile(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, src, out_relpath, extra_flags = []):
+    assembly = _is_assembly_source(src)
+    remove_flags = [
+        "-g",
+        "-gdwarf-4",
+        "-gdwarf-5",
+        "-Wa,-g",
+        "-Wa,-gdwarf-4",
+        "-Wa,-gdwarf-5",
+    ] if assembly else _linux_ftrace_remove_flags() + [
+        "-mcmodel=kernel",
+        "-fstack-protector",
+        "-fstack-protector-strong",
+        "-mretpoline",
+        "-mretpoline-external-thunk",
+        "-mfunction-return=thunk-extern",
+        "-fsanitize=kcfi",
+        "-flto=thin",
+        "-flto",
+        "-fsplit-lto-unit",
+    ]
+    filtered = _linux_filtered_config_flags_for_source(
+        ctx,
+        config,
+        src,
+        remove_flags,
+        out_suffix = "x86-purgatory-" + out_relpath.replace("/", "-") + "-" + ("asm" if assembly else "c"),
+        remove_prefixes = [] if assembly else [
+            "-fprofile-sample-use=",
+            "-fprofile-use=",
+        ],
+    )
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
@@ -1105,7 +1217,7 @@ def _linux_purgatory_compile(ctx, compiler, cc_toolchain, feature_configuration,
     ])
     args.add_all(_linux_object_name_flags(out_relpath))
     args.add_all(extra_flags)
-    args.add_all(_linux_config_flags_for_source(config, src), format_each = "@%s")
+    args.add_all(filtered.flags, format_each = "@%s")
     args.add_all([
         "-mcmodel=small",
         "-fno-stack-protector",
@@ -1122,7 +1234,7 @@ def _linux_purgatory_compile(ctx, compiler, cc_toolchain, feature_configuration,
     args.add("-o")
     args.add(out)
 
-    source_inputs = _linux_object_compile_source_tree_inputs(ctx, direct = [src])
+    source_inputs = _linux_object_compile_source_tree_inputs(ctx, direct = [src] + filtered.inputs)
     transitive_inputs = [cc_toolchain.all_files]
     if config:
         transitive_inputs.append(config.files)
@@ -5828,6 +5940,11 @@ def _linux_object_impl(ctx):
     objcopy_out = out
     if objcopy_flags and needs_relacheck:
         objcopy_out = ctx.actions.declare_file(ctx.label.name + ".obj/" + ctx.attr.object)
+    source_version_depfile = None
+    if ctx.attr.mode == "m" and (_is_assembly_source(source_file) or source_file.basename.endswith(".c")):
+        source_version_depfile = ctx.actions.declare_file(
+            ctx.label.name + ".source_versions/" + ctx.attr.object + ".d",
+        )
     generated_object_headers = []
     exported_generated_headers = []
     exported_generated_include_dirs = []
@@ -6096,6 +6213,10 @@ def _linux_object_impl(ctx):
     if utsversion_tmp != None:
         expanded_flags = _rewrite_utsversion_tmp_flags(expanded_flags, ctx.attr.object, utsversion_tmp)
     args.add_all(expanded_flags)
+    if source_version_depfile != None:
+        args.add("-MD")
+        args.add("-MF")
+        args.add(source_version_depfile)
     args.add("-c")
     args.add(src)
     args.add("-o")
@@ -6115,11 +6236,14 @@ def _linux_object_impl(ctx):
         transitive_inputs.append(generated_headers.files)
     transitive_inputs.extend(dep_generated_header_inputs)
 
+    compile_outputs = [compile_out]
+    if source_version_depfile != None:
+        compile_outputs.append(source_version_depfile)
     path_mapped_run(
         ctx.actions,
         executable = compiler,
         inputs = depset(source_inputs.direct, transitive = source_inputs.transitive + transitive_inputs),
-        outputs = [compile_out],
+        outputs = compile_outputs,
         arguments = [args],
         mnemonic = "LinuxObjectCompile",
         progress_message = "Compiling Linux object %{label}",
@@ -6196,6 +6320,7 @@ def _linux_object_impl(ctx):
             )
 
     symversion_records = []
+    symversion_cmd = None
     if ctx.attr.symversions:
         symversion_cmd = ctx.actions.declare_file(
             ctx.label.name + ".symversions/" + ctx.attr.object + ".cmd",
@@ -6277,6 +6402,17 @@ def _linux_object_impl(ctx):
             object = ctx.attr.object,
         ))
 
+    source_version_records = []
+    if source_version_depfile != None:
+        source_version_records.append(_linux_source_version_record(
+            ctx,
+            source_selection,
+            ctx.attr.source_input_file,
+            ctx.attr.object,
+            source_version_depfile,
+            symversions = symversion_cmd,
+        ))
+
     ctx.actions.write(
         output = cmd,
         content = "\n".join([
@@ -6295,6 +6431,7 @@ def _linux_object_impl(ctx):
         objtool_args = list(ctx.attr.objtool_args),
         objtool_force = ctx.attr.objtool_force,
         output = out,
+        source_version_records = source_version_records,
         symversion_records = symversion_records,
         generated_headers = depset(exported_generated_headers),
         generated_include_dir_anchors = _directory_anchors(exported_generated_headers, exported_generated_include_dirs),
@@ -6306,6 +6443,7 @@ def _linux_object_impl(ctx):
         OutputGroupInfo(
             command = depset([cmd]),
             object = depset([out]),
+            source_versions = depset([record.cmd for record in source_version_records]),
             symversions = depset([record.cmd for record in symversion_records]),
         ),
     ]
@@ -6461,6 +6599,11 @@ linux_object = rule(
             default = Label("//internal/cmd/runandwrite"),
             executable = True,
         ),
+        "_sourceversioncmd": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/sourceversioncmd"),
+            executable = True,
+        ),
         "_vdso2c": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/vdso2c"),
@@ -6511,6 +6654,7 @@ def _linux_composite_object_impl(ctx):
         objtool_args = list(ctx.attr.objtool_args),
         objtool_force = ctx.attr.objtool_force,
         output = out,
+        source_version_records = _merged_source_version_records(object_infos),
         symversion_records = _merged_symversion_records(object_infos),
         generated_headers = depset(transitive = [info.generated_headers for info in object_infos]),
         generated_include_dir_anchors = _merged_generated_include_dir_anchors(object_infos),
@@ -6725,6 +6869,7 @@ def _linux_arm64_nvhe_object_impl(ctx):
         objtool_args = [],
         objtool_force = False,
         output = out,
+        source_version_records = _merged_source_version_records(object_infos),
         symversion_records = _merged_symversion_records(object_infos),
         generated_headers = depset(transitive = [info.generated_headers for info in object_infos]),
         generated_include_dir_anchors = _merged_generated_include_dir_anchors(object_infos),

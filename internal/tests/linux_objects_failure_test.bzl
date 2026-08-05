@@ -329,6 +329,34 @@ _fake_powerpc_purgatory_source_inputs = rule(
     implementation = _fake_powerpc_purgatory_source_inputs_impl,
 )
 
+def _fake_x86_purgatory_source_inputs_impl(ctx):
+    root = ctx.actions.declare_file(ctx.label.name + ".source/Kconfig")
+    ctx.actions.write(root, "")
+    files = []
+    for path in [
+        "arch/x86/boot/compressed/string.c",
+        "arch/x86/purgatory/entry64.S",
+        "arch/x86/purgatory/kexec-purgatory.S",
+        "arch/x86/purgatory/purgatory.c",
+        "arch/x86/purgatory/setup-x86_64.S",
+        "arch/x86/purgatory/stack.S",
+        "include/linux/compiler-version.h",
+        "include/linux/compiler_types.h",
+        "include/linux/kconfig.h",
+        "lib/crypto/sha256.c",
+    ]:
+        out = ctx.actions.declare_file(ctx.label.name + ".source/" + path)
+        ctx.actions.write(out, "")
+        files.append(out)
+    return [
+        DefaultInfo(files = depset(files)),
+        _fake_source_tree_info(root),
+    ]
+
+_fake_x86_purgatory_source_inputs = rule(
+    implementation = _fake_x86_purgatory_source_inputs_impl,
+)
+
 def _fake_riscv_purgatory_source_inputs_impl(ctx):
     root = ctx.actions.declare_file(ctx.label.name + ".source/Kconfig")
     ctx.actions.write(root, "")
@@ -898,6 +926,56 @@ def _powerpc_purgatory_actions_test_impl(ctx):
 
 _powerpc_purgatory_actions_test = analysistest.make(
     _powerpc_purgatory_actions_test_impl,
+)
+
+def _x86_purgatory_actions_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = analysistest.target_actions(env)
+    compile_actions = [action for action in actions if action.mnemonic == "LinuxPurgatoryCompile"]
+    filter_actions = [action for action in actions if action.mnemonic == "LinuxFlagFilter"]
+    asserts.equals(env, 6, len(compile_actions))
+    asserts.equals(env, 6, len(filter_actions))
+    filter_outputs = []
+    for action in filter_actions:
+        outputs = action.outputs.to_list()
+        asserts.equals(env, 1, len(outputs))
+        if outputs:
+            filter_outputs.append(outputs[0].path)
+        if any([output.path.endswith("-c.rsp") for output in outputs]):
+            for flag in [
+                "-pg",
+                "-mcmodel=kernel",
+                "-fstack-protector-strong",
+                "-mretpoline",
+                "-mfunction-return=thunk-extern",
+                "-fsanitize=kcfi",
+                "-flto=thin",
+                "-fsplit-lto-unit",
+            ]:
+                asserts.true(env, flag in action.argv)
+            asserts.true(env, "-fprofile-use=" in action.argv)
+        else:
+            asserts.true(env, "-gdwarf-5" in action.argv)
+            asserts.true(env, "-Wa,-gdwarf-5" in action.argv)
+    asserts.equals(env, 6, len({path: True for path in filter_outputs}))
+    for action in compile_actions:
+        response_indices = [
+            index
+            for index in range(len(action.argv))
+            if "x86-purgatory-" in action.argv[index] and action.argv[index].endswith(".rsp")
+        ]
+        asserts.equals(env, 1, len(response_indices))
+        if response_indices:
+            response_index = response_indices[0]
+            for positive in ["-mcmodel=small", "-fno-stack-protector", "-fpic", "-fvisibility=hidden"]:
+                positive_indices = [index for index in range(len(action.argv)) if action.argv[index] == positive]
+                asserts.true(env, any([index > response_index for index in positive_indices]))
+            input_paths = [file.path for file in action.inputs.to_list()]
+            asserts.true(env, action.argv[response_index][1:] in input_paths)
+    return analysistest.end(env)
+
+_x86_purgatory_actions_test = analysistest.make(
+    _x86_purgatory_actions_test_impl,
 )
 
 def _riscv_purgatory_actions_test_impl(ctx):
@@ -1685,6 +1763,68 @@ def linux_objects_fail_closed_test_suite(name):
         target_under_test = ":" + powerpc_vdso_headers,
     )
     generic_header_tests.append(":" + powerpc_vdso_headers_test)
+
+    x86_purgatory_headers = name + "_x86_purgatory_headers"
+    _fake_generated_headers(
+        name = x86_purgatory_headers,
+        arch = "x86",
+        family_content_id = "1414141414141414141414141414141414141414141414141414141414141414",
+        tags = fixture_tags,
+    )
+    x86_purgatory_sources = name + "_x86_purgatory_sources"
+    _fake_x86_purgatory_source_inputs(
+        name = x86_purgatory_sources,
+        tags = fixture_tags,
+    )
+    x86_purgatory_source_index = name + "_x86_purgatory_source_index"
+    linux_source_input_index(
+        name = x86_purgatory_source_index,
+        groups = [",".join([str(index) for index in range(1, 11)])],
+        srcs = [":" + x86_purgatory_sources],
+        source_tree_info = ":" + x86_purgatory_sources,
+        tags = fixture_tags,
+    )
+    x86_purgatory_environment_id = "1515151515151515151515151515151515151515151515151515151515151515"
+    x86_purgatory_payload_id = "1616161616161616161616161616161616161616161616161616161616161616"
+    x86_purgatory_environment_index = name + "_x86_purgatory_environment_index"
+    linux_compile_environment_index(
+        name = x86_purgatory_environment_index,
+        arch = "x86",
+        compile_environments = {
+            x86_purgatory_environment_id: json.encode({
+                "abi": "x86_64-linux-gnu",
+                "config_payload": x86_purgatory_payload_id,
+                "generated_header_families": ["1414141414141414141414141414141414141414141414141414141414141414"],
+            }),
+        },
+        config_payloads = {
+            x86_purgatory_payload_id: "CONFIG_64BIT=y\nCONFIG_CC_IS_CLANG=y\nCONFIG_X86_64=y\n",
+        },
+        expected_abi = "x86_64-linux-gnu",
+        generated_headers = [":" + x86_purgatory_headers],
+        tags = fixture_tags,
+    )
+    x86_purgatory_object = name + "_x86_purgatory_object"
+    linux_object(
+        name = x86_purgatory_object,
+        arch = "x86",
+        compile_environment_id = x86_purgatory_environment_id,
+        compile_environment_index = ":" + x86_purgatory_environment_index,
+        content_id = "1717171717171717171717171717171717171717171717171717171717171717",
+        mode = "y",
+        object = "arch/x86/purgatory/kexec-purgatory.o",
+        source_input_file = 3,
+        source_input_group = 1,
+        source_input_index = ":" + x86_purgatory_source_index,
+        srcarch = "x86",
+        tags = fixture_tags,
+    )
+    x86_purgatory_object_test = x86_purgatory_object + "_actions_test"
+    _x86_purgatory_actions_test(
+        name = x86_purgatory_object_test,
+        target_under_test = ":" + x86_purgatory_object,
+    )
+    generic_header_tests.append(":" + x86_purgatory_object_test)
 
     powerpc_purgatory_headers = name + "_powerpc_purgatory_headers"
     _fake_generated_headers(
