@@ -321,7 +321,7 @@ jobs:
             targets: "//:kernel_outputs_x86_64_build_test //:linux_6_18_39_x86_64_boot_test //:linux_6_18_39_x86_64_module_test //:modversions_6_18_39_x86_64_build_test //:srcversions_6_18_39_x86_64_build_test"
           - batch: linux-6.18-kvm-verity
             title: Linux 6.18 KVM and dm-verity
-            targets: "//:kvm_verity_kernel_build_test //:cnic_module_version_build_test"
+            targets: "//:kvm_verity_kernel_build_test //:kvm_arm64_neon_kernel_build_test //:cnic_module_version_build_test"
           - batch: linux-6.18-aarch64
             title: Linux 6.18 aarch64
             targets: "//:kernel_outputs_aarch64_build_test //:linux_6_18_39_aarch64_boot_test //:linux_6_18_39_aarch64_module_test //:modversions_6_18_39_aarch64_build_test"

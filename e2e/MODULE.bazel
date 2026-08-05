@@ -107,6 +107,13 @@ linux_images.image(
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
 linux_images.image(
+    name = "e2e_kvm_aarch64",
+    config = "//:kvm_arm64.config",
+    config_mode = "allnoconfig",
+    platform = "//:linux_aarch64",
+    source = "@e2e_linux_6_18_39//:Kconfig",
+)
+linux_images.image(
     name = "e2e_cnic_x86_64",
     config = "//:cnic.config",
     config_mode = "allnoconfig",
@@ -170,6 +177,7 @@ use_repo(
     "e2e_aarch64",
     "e2e_armv7",
     "e2e_cnic_x86_64",
+    "e2e_kvm_aarch64",
     "e2e_kvm_x86_64",
     "e2e_rust_6_12_96_aarch64",
     "e2e_rust_6_12_96_x86_64",
