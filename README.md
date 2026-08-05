@@ -116,7 +116,7 @@ for configured images, as shown above.
 | `patches` | Deterministic patch files |
 | `patch_strip` | Strip count for `patches` |
 | `source_overlays` | In-tree destination directories mapped to marker files in external source roots |
-| `module_kbuild_roots` | Overlaid directories added to the kernel Kbuild graph |
+| `module_kbuild_roots` | Overlaid Kbuild directories mapped to Kconfig expressions controlling graph inclusion; use `"y"` for an unconditional root |
 | `module_kconfig_roots` | Overlaid Kconfig files sourced by the root Kconfig |
 | `module_make_vars` | Deterministic variables needed while parsing overlaid Kconfig/Kbuild files |
 
@@ -324,9 +324,9 @@ linux_source_repository(
     source_overlays = {
         "drivers/net/ethernet/broadcom/sdklt": "@sai_bcm_modules//:platform/broadcom/saibcm-modules/sdklt/Makefile",
     },
-    module_kbuild_roots = [
-        "drivers/net/ethernet/broadcom/sdklt/linux/bde",
-    ],
+    module_kbuild_roots = {
+        "drivers/net/ethernet/broadcom/sdklt/linux/bde": "X86",
+    },
     module_make_vars = {
         "BDE_CPPFLAGS": "-UBCMDRD_INCLUDE_CUSTOM_CONFIG",
         "SDK": "$(srctree)/drivers/net/ethernet/broadcom/sdklt",
@@ -338,6 +338,11 @@ If a vendor tree has Kconfig entry points, list their in-tree paths in
 `module_kconfig_roots`. Selecting the vendor symbol as `m` makes its module a
 normal output of `@configured_kernel//:modules`, including the usual objtool,
 modpost, module-link, and optional BTF stages.
+
+`module_kbuild_roots` values use Kconfig expression syntax (`X86`, not
+`CONFIG_X86`). linux.bzl lowers conditional expressions to hidden tristate
+selectors before adding the directory to the root Kbuild. Use `"y"` when the
+root must be traversed for every configured architecture.
 
 ## Why
 

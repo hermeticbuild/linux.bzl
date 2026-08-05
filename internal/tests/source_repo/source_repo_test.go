@@ -32,8 +32,29 @@ func TestSourceRepositoryExportsDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(content), `glob(["**"], exclude_directories = 0)`) {
+	if !strings.Contains(string(content), `exclude_directories = 0`) {
 		t.Fatal("source repository exports must include directories for consumer include-path labels")
+	}
+}
+
+func TestSourceRepositoryExplicitlyExportsOverlayFiles(t *testing.T) {
+	path := filepath.Join(
+		os.Getenv("TEST_SRCDIR"),
+		os.Getenv("TEST_WORKSPACE"),
+		"source_repo.BUILD.bazel",
+	)
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`_SOURCE_OVERLAY_FILES = [`,
+		`exclude = _SOURCE_OVERLAY_FILES`,
+		`) + _SOURCE_OVERLAY_FILES`,
+	} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("source repository overlay export contract is missing %s", want)
+		}
 	}
 }
 

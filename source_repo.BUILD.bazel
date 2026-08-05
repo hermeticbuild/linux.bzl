@@ -2,8 +2,16 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 
 package(default_visibility = ["//visibility:public"])
 
+_SOURCE_OVERLAY_FILES = [
+    # __LINUX_BZL_SOURCE_OVERLAY_FILES__
+]
+
 exports_files(
-    glob(["**"], exclude_directories = 0),
+    glob(
+        ["**"],
+        exclude = _SOURCE_OVERLAY_FILES,
+        exclude_directories = 0,
+    ) + _SOURCE_OVERLAY_FILES,
     visibility = ["//visibility:public"],
 )
 

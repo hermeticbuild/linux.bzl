@@ -5,6 +5,11 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files(["sonic.config"])
 
+filegroup(
+    name = "ngbde_main_source",
+    srcs = ["@sonic_linux_6_18_39//:drivers/net/ethernet/broadcom/sdklt/linux/bde/ngbde_main.c"],
+)
+
 select_file(
     name = "linux_ngbde_ko",
     srcs = "@sonic_kernel//:modules",
@@ -13,5 +18,9 @@ select_file(
 
 build_test(
     name = "sonic_linux_ngbde_module_test",
-    targets = [":linux_ngbde_ko"],
+    targets = [
+        ":linux_ngbde_ko",
+        ":ngbde_main_source",
+        "@sonic_arm64_kernel//:modules",
+    ],
 )
