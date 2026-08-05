@@ -5,7 +5,7 @@ Each archive must extract the requested host executables at its root.
 
 visibility("//...")
 
-KCONFIG_TOOL_VERSION = "v0.0.24"
+KCONFIG_TOOL_VERSION = "v0.0.25"
 
 _RELEASE_BASE_URL = "https://github.com/hermeticbuild/linux.bzl/releases/download/kconfig-{version}".format(
     version = KCONFIG_TOOL_VERSION,
@@ -13,27 +13,27 @@ _RELEASE_BASE_URL = "https://github.com/hermeticbuild/linux.bzl/releases/downloa
 
 KCONFIG_TOOL_RELEASES = {
     "darwin_amd64": struct(
-        integrity = "sha256-ysaULgkGzB8t0LL5mo6FuDSrXWPdrz6ib/YBkyEtF1Y=",
+        integrity = "sha256-GhR5hIM7YJUX5AO9Mno6bz0JdIN7Wc3j79bzEOAegSs=",
         urls = ["{}/kconfig-darwin-amd64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "darwin_arm64": struct(
-        integrity = "sha256-Af2lWA49NKvstmkl55zU0QB0wZ8GxxTe77ST/9JtG/8=",
+        integrity = "sha256-tYpRGmPlI5UgW0ef3Y0Ta6BhJyob1ZepfOLPI6pF7Bg=",
         urls = ["{}/kconfig-darwin-arm64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "linux_amd64": struct(
-        integrity = "sha256-C4NSGytF5/ucu9xJaUYTTNmMdkOCnUp/rx0W2MuCqns=",
+        integrity = "sha256-rNDGHeN5JvJYS/m1D6Gny7smOVtl7liAGmw1VgGEAC8=",
         urls = ["{}/kconfig-linux-amd64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "linux_arm64": struct(
-        integrity = "sha256-3kRUMbP9MdNJXU54rNCuiGt2p+BWvcNA4465uzJFlQA=",
+        integrity = "sha256-yGLkjLqRbSTul3+VP+J6Ll1KaS8kGDNG63YLhDmy0Jk=",
         urls = ["{}/kconfig-linux-arm64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "windows_amd64": struct(
-        integrity = "sha256-c85cB7iDgUR+8D7z8YRtDZpnpKhaSKlsHhUY8dBB7YM=",
+        integrity = "sha256-x822heO9F88N9Qrjjat7wMmD6T4Is2uv6ysCr6duZ/Y=",
         urls = ["{}/kconfig-windows-amd64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
     "windows_arm64": struct(
-        integrity = "sha256-cj0s3Egbu+9IjH8AR0RNX69eOtD/odjejkRYwd1iit0=",
+        integrity = "sha256-yShDQNvgmwbhZjyX2prDIVMolMWfnR9nBleEiZp6SEw=",
         urls = ["{}/kconfig-windows-arm64.tar.zst".format(_RELEASE_BASE_URL)],
     ),
 }
