@@ -41,6 +41,17 @@ def _argument_after(argv, flag):
             return argv[index + 1]
     return ""
 
+def _path_mapping_key(path):
+    """Returns an execroot path identity independent of Bazel's config mapping."""
+    parts = path.replace("\\", "/").split("/")
+    if (
+        len(parts) >= 4 and
+        parts[0] == "bazel-out" and
+        parts[2] in ("bin", "genfiles")
+    ):
+        return "/".join([parts[0]] + parts[2:])
+    return "/".join(parts)
+
 def _source_version_mappings(argv):
     mappings = {}
     canonical_order = []
@@ -81,7 +92,7 @@ def _generated_source_version_test_impl(ctx):
         mappings = _source_version_mappings(action.argv)
         asserts.equals(env, ctx.attr.expected_primary, _argument_after(action.argv, "-primary"))
         asserts.equals(env, sorted(mappings.order), mappings.order)
-        action_inputs = {file.path: True for file in action.inputs.to_list()}
+        action_inputs = {_path_mapping_key(file.path): True for file in action.inputs.to_list()}
         staged_paths = [path_file.path for path_file in info.source_version_records[0].path_files]
         asserts.equals(env, sorted(staged_paths), staged_paths)
         for path in ctx.attr.expected_generated_paths:
@@ -89,7 +100,7 @@ def _generated_source_version_test_impl(ctx):
             if path in mappings.by_path:
                 asserts.true(
                     env,
-                    mappings.by_path[path] in action_inputs,
+                    _path_mapping_key(mappings.by_path[path]) in action_inputs,
                     "generated source-version input %s is not an action input" % path,
                 )
             asserts.true(env, path in staged_paths, "generated source-version input %s is not staged" % path)
@@ -120,7 +131,7 @@ def _consumer_generated_headers_test_impl(ctx):
     asserts.equals(env, 1, len(actions))
     if info.source_version_records and actions:
         mappings = _source_version_mappings(actions[0].argv)
-        action_inputs = {file.path: True for file in actions[0].inputs.to_list()}
+        action_inputs = {_path_mapping_key(file.path): True for file in actions[0].inputs.to_list()}
         staged_paths = [path_file.path for path_file in info.source_version_records[0].path_files]
         asserts.equals(env, sorted(staged_paths), staged_paths)
         for path in expected_paths:
@@ -128,7 +139,7 @@ def _consumer_generated_headers_test_impl(ctx):
             if path in mappings.by_path:
                 asserts.true(
                     env,
-                    mappings.by_path[path] in action_inputs,
+                    _path_mapping_key(mappings.by_path[path]) in action_inputs,
                     "generated header %s is not an action input" % path,
                 )
             asserts.true(env, path in staged_paths, "generated header %s is not staged" % path)

@@ -957,6 +957,17 @@ _powerpc_purgatory_actions_test = analysistest.make(
     _powerpc_purgatory_actions_test_impl,
 )
 
+def _path_mapping_key(path):
+    """Returns an execroot path identity independent of Bazel's config mapping."""
+    parts = path.replace("\\", "/").split("/")
+    if (
+        len(parts) >= 4 and
+        parts[0] == "bazel-out" and
+        parts[2] in ("bin", "genfiles")
+    ):
+        return "/".join([parts[0]] + parts[2:])
+    return "/".join(parts)
+
 def _x86_purgatory_actions_test_impl(ctx):
     env = analysistest.begin(ctx)
     actions = analysistest.target_actions(env)
@@ -1001,8 +1012,11 @@ def _x86_purgatory_actions_test_impl(ctx):
             for positive in ["-mcmodel=small", "-fno-stack-protector", "-fpic", "-fvisibility=hidden"]:
                 positive_indices = [index for index in range(len(action.argv)) if action.argv[index] == positive]
                 asserts.true(env, any([index > response_index for index in positive_indices]))
-            input_paths = [file.path for file in action.inputs.to_list()]
-            asserts.true(env, action.argv[response_index][1:] in input_paths)
+            input_paths = {
+                _path_mapping_key(file.path): True
+                for file in action.inputs.to_list()
+            }
+            asserts.true(env, _path_mapping_key(action.argv[response_index][1:]) in input_paths)
     return analysistest.end(env)
 
 _x86_purgatory_actions_test = analysistest.make(
