@@ -51,14 +51,17 @@ label required for Kbuild-compatible post-processing.
    source trees on x86_64 and arm64. Cover C and assembly exports, generated C
    sources, built-in and external C modules, and verify that extended, DWARF,
    and Rust module-versioning paths fail closed.
-8. Exercise an empty `CONFIG_SYSTEM_TRUSTED_KEYS` configuration with
+8. Exercise x86 and RISC-V purgatory with their per-source preprocessor
+   contexts, ARM64 KVM generated `hyp_constants.h`, compiler-provided ARM NEON
+   headers, and a provably inactive legacy `MODVERSIONS` include.
+9. Exercise an empty `CONFIG_SYSTEM_TRUSTED_KEYS` configuration with
    `CONFIG_SYSTEM_TRUSTED_KEYRING=y`, including dm-verity root-hash signature
    verification. Verify that non-empty certificate, revocation, blacklist,
    and module-signing inputs still fail closed.
-9. Verify that unsupported source layouts, unresolved Make expressions,
+10. Verify that unsupported source layouts, unresolved Make expressions,
    incomplete leaf objects, and unsupported Rust profiles fail with actionable
    errors.
-10. Build the six platform archives twice from clean output trees and compare
+11. Build the six platform archives twice from clean output trees and compare
    their SHA-256 digests.
 
 Each deterministic `.tar.zst` archive must contain exactly two executables at

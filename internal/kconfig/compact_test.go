@@ -1816,6 +1816,57 @@ func TestCompactContentGraphArm64GeneratedIncludeSelectsMonolithicFamily(t *test
 	}
 }
 
+func TestCompactContentGraphArm64PKVMBindsHypConstantsFamily(t *testing.T) {
+	tree := mustParseString(t, "mainmenu \"arm64 pKVM hyp constants\"\n")
+	kb, err := ParseKbuild(strings.NewReader("obj-y += arch/arm64/kvm/pkvm.o\n"), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "arch/arm64/kvm/pkvm.c", "#include \"hyp_constants.h\"\n")
+	mustWriteSource(t, sourceRoot, "arch/arm64/kvm/hyp/hyp-constants.c", "int hyp_constants;\n")
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+
+	metadata, err := compactMetadataBatchWithOptionsForTest(
+		t,
+		tree,
+		kb,
+		[]NamedConfig{{Name: "arm64"}},
+		CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "arm64",
+			CompileEnvironmentABI: "arm64-pkvm-abi-v1",
+		},
+	)
+	if err != nil {
+		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
+	}
+	if len(metadata.GeneratedHeaderFamilies) != 1 ||
+		metadata.GeneratedHeaderFamilies[0].Name != compactGeneratedHeaderFamilyAll {
+		t.Fatalf("arm64 generated-header families = %#v, want monolithic all family", metadata.GeneratedHeaderFamilies)
+	}
+	family := metadata.GeneratedHeaderFamilies[0]
+	familyInputs, err := metadata.expandedSourceInputGroup(family.SourceInputGroup, "arm64 hyp constants")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceInputByPath(familyInputs, "arch/arm64/kvm/hyp/hyp-constants.c").Path == "" {
+		t.Fatalf("hyp-constants producer is absent from generated-header inputs: %v", familyInputs)
+	}
+	config := configByName(metadata, "arm64")
+	variant := variantByTarget(metadata, objectTarget(metadata, config, "arch/arm64/kvm/pkvm.o"))
+	var environment CompactCompileEnvironment
+	for _, candidate := range metadata.CompileEnvironments {
+		if candidate.ID == variant.CompileEnvironment {
+			environment = candidate
+			break
+		}
+	}
+	if want := []string{family.ID}; !reflect.DeepEqual(environment.GeneratedHeaderFamilies, want) {
+		t.Fatalf("pKVM generated-header families = %v, want %v", environment.GeneratedHeaderFamilies, want)
+	}
+}
+
 func TestCompactContentGraphARMGeneratedSyscallIncludeSelectsMonolithicFamily(t *testing.T) {
 	tree := mustParseString(t, `
 config AEABI
@@ -2597,6 +2648,83 @@ obj-y += arch/riscv/kernel/compat_vdso/compat_vdso.o
 	}
 }
 
+func TestCompactContentGraphX86PurgatoryUsesPerSourceActionContext(t *testing.T) {
+	tree := mustParseString(t, `
+mainmenu "x86 purgatory action context"
+
+config CRYPTO_LIB_SHA256_ARCH
+	bool "architecture SHA-256"
+`)
+	kb, err := ParseKbuild(strings.NewReader(`
+KBUILD_CFLAGS += -DCOMMON_PURGATORY_CONTEXT -include include/special-purgatory.h
+obj-y := arch/x86/purgatory/kexec-purgatory.o
+`), "Makefile")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	sourceRoot := t.TempDir()
+	for path, content := range map[string]string{
+		"arch/x86/purgatory/kexec-purgatory.S": ".incbin \"arch/x86/purgatory/purgatory.ro\"\n",
+		"arch/x86/purgatory/purgatory.c":       "int purgatory;\n",
+		"arch/x86/purgatory/stack.S":           "nop\n",
+		"arch/x86/purgatory/setup-x86_64.S":    "nop\n",
+		"arch/x86/purgatory/entry64.S":         "nop\n",
+		"arch/x86/boot/compressed/string.c":    "int string;\n",
+		"include/special-purgatory.h": `
+#ifndef COMMON_PURGATORY_CONTEXT
+#include <missing-common-purgatory-context.h>
+#endif
+`,
+		"lib/crypto/sha256.c": `
+#ifndef DISABLE_BRANCH_PROFILING
+#include <missing-purgatory-common-define.h>
+#endif
+#ifndef __NO_FORTIFY
+#include <missing-purgatory-fortify-header.h>
+#endif
+#if defined(CONFIG_CRYPTO_LIB_SHA256_ARCH) && !defined(__DISABLE_EXPORTS)
+#include "sha256.h"
+#endif
+`,
+	} {
+		mustWriteSource(t, sourceRoot, path, content)
+	}
+	writeCompactContentGraphForcedInputs(t, sourceRoot)
+	metadata, err := compactMetadataBatchWithOptionsForTest(
+		t,
+		tree,
+		kb,
+		[]NamedConfig{{
+			Name: "x86",
+			Flags: map[string]string{
+				"CONFIG_CRYPTO_LIB_SHA256_ARCH": "y",
+			},
+		}},
+		CompactMetadataOptions{
+			SourceRoot:            sourceRoot,
+			Srcarch:               "x86",
+			CompileEnvironmentABI: "x86-purgatory-abi-v1",
+		},
+	)
+	if err != nil {
+		t.Fatalf("CompactMetadataBatchWithOptions() failed: %v", err)
+	}
+	config := configByName(metadata, "x86")
+	variant := variantByTarget(metadata, objectTarget(metadata, config, "arch/x86/purgatory/kexec-purgatory.o"))
+	inputs, err := metadata.expandedSourceInputGroup(variant.SourceInputGroup, "x86 purgatory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"include/special-purgatory.h",
+		"lib/crypto/sha256.c",
+	} {
+		if sourceInputByPath(inputs, want).Path == "" {
+			t.Errorf("x86 purgatory inputs = %v, want %q", sourceInputPaths(inputs), want)
+		}
+	}
+}
+
 func TestCompactContentGraphRISCVPurgatoryBindsGeneratedImageAndProducers(t *testing.T) {
 	tree := mustParseString(t, `
 mainmenu "RISC-V purgatory image identity"
@@ -2618,14 +2746,29 @@ config KASAN_SW_TAGS
 		"arch/riscv/purgatory/kexec-purgatory.S": ".incbin \"arch/riscv/purgatory/purgatory.ro\"\n",
 		"arch/riscv/purgatory/purgatory.c":       "int purgatory;\n",
 		"arch/riscv/purgatory/entry.S":           "nop\n",
-		"lib/crypto/sha256.c":                    "int sha256;\n",
-		"lib/string.c":                           "int string;\n",
-		"lib/ctype.c":                            "int ctype;\n",
-		"arch/riscv/lib/memcpy.S":                "nop\n",
-		"arch/riscv/lib/memset.S":                "nop\n",
-		"arch/riscv/lib/strcmp.S":                "nop\n",
-		"arch/riscv/lib/strlen.S":                "nop\n",
-		"arch/riscv/lib/strncmp.S":               "nop\n",
+		"lib/crypto/sha256.c": `
+#if !defined(DISABLE_BRANCH_PROFILING) || !defined(__DISABLE_EXPORTS) || !defined(__NO_FORTIFY)
+#include <missing-riscv-sha-purgatory-context.h>
+#endif
+int sha256;
+`,
+		"lib/string.c": `
+#if !defined(DISABLE_BRANCH_PROFILING) || !defined(__DISABLE_EXPORTS)
+#include <missing-riscv-string-purgatory-context.h>
+#endif
+int string;
+`,
+		"lib/ctype.c": `
+#if !defined(DISABLE_BRANCH_PROFILING) || !defined(__DISABLE_EXPORTS)
+#include <missing-riscv-ctype-purgatory-context.h>
+#endif
+int ctype;
+`,
+		"arch/riscv/lib/memcpy.S":  "nop\n",
+		"arch/riscv/lib/memset.S":  "nop\n",
+		"arch/riscv/lib/strcmp.S":  "nop\n",
+		"arch/riscv/lib/strlen.S":  "nop\n",
+		"arch/riscv/lib/strncmp.S": "nop\n",
 	} {
 		mustWriteSource(t, sourceRoot, path, content)
 	}
@@ -4028,6 +4171,58 @@ ccflags-y += -UCONFIG_NET -DCONFIG_NET=1
 	variant := variantByTarget(metadata, target)
 	if got, want := strings.Join(variant.Flags, " "), "-UCONFIG_NET -DCONFIG_NET=1"; got != want {
 		t.Fatalf("flags = %q, want %q", got, want)
+	}
+}
+
+func TestCompactMetadataStripsCompilerBuiltinIncludeDirectoryShellFlag(t *testing.T) {
+	tree := mustParseCompactFixture(t)
+	kb, err := ParseKbuild(strings.NewReader(`
+obj-y += crypto/aegis128-neon-inner.o
+CFLAGS_crypto/aegis128-neon-inner.o += -DBEFORE -isystem $(shell $(CC) -print-file-name=include) -DAFTER
+`), "crypto/Makefile")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+	metadata, err := compactMetadataBatchForTest(t, tree, kb, []NamedConfig{{Name: "base", Flags: nil}})
+	if err != nil {
+		t.Fatalf("CompactMetadata() failed: %v", err)
+	}
+	target := objectTarget(metadata, configByName(metadata, "base"), "crypto/aegis128-neon-inner.o")
+	variant := variantByTarget(metadata, target)
+	if got, want := variant.Flags, []string{"-DBEFORE", "-DAFTER"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("flags = %q, want %q", got, want)
+	}
+	if !variant.sourceBuildReady() {
+		t.Fatalf("filtered variant is not source-build ready: %s", variant.sourceBuildError())
+	}
+}
+
+func TestCompilerBuiltinIncludeDirectoryShellFilterPreservesOtherExpressions(t *testing.T) {
+	for name, flags := range map[string][]string{
+		"arbitrary compiler query": {
+			"-isystem", "$(shell", "$(CC)", "-print-file-name=plugin)",
+		},
+		"arbitrary compiler variable": {
+			"-isystem", "$(shell", "$(HOSTCC)", "-print-file-name=include)",
+		},
+		"arbitrary make variable": {
+			"-isystem", "$(UNKNOWN_INCLUDE_DIR)",
+		},
+		"compiler query on non-system path": {
+			"-I", "$(shell", "$(CC)", "-print-file-name=include)",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			groups := []resolvedKbuildFlag{{language: "c", values: flags}}
+			got := filterResolvedKbuildFlags(groups, "crypto/aegis128-neon-inner.c")
+			if !reflect.DeepEqual(got, flags) {
+				t.Fatalf("filtered flags = %q, want unchanged %q", got, flags)
+			}
+			variant := CompactObjectVariant{Source: "crypto/aegis128-neon-inner.c", Flags: got}
+			if variant.sourceBuildReady() {
+				t.Fatalf("sourceBuildReady() accepted unsupported flags %q", got)
+			}
+		})
 	}
 }
 

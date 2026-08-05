@@ -1591,15 +1591,12 @@ func (memo compactVariantMemo) variantForStack(
 	forceAllGeneratedHeaders := false
 	if source != "" {
 		flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(object.flags, source), opts.SourceRoot)
-		includeDirs, err := includeDirsFromFlags(flags, source)
-		if err != nil {
-			return CompactObjectVariant{}, fmt.Errorf(
-				"model source include flags for %s: %w",
-				name,
-				err,
-			)
-		}
-		actionIncludeSearch, err := scanner.actionIncludeSearch(source, flags)
+		actionIncludeSearch, err := compactSourceActionIncludeSearch(
+			scanner,
+			source,
+			flags,
+			compactIntrinsicIncludeRoots(source),
+		)
 		if err != nil {
 			return CompactObjectVariant{}, fmt.Errorf(
 				"model source include search for %s: %w",
@@ -1607,12 +1604,6 @@ func (memo compactVariantMemo) variantForStack(
 				err,
 			)
 		}
-		intrinsicIncludeRoots := compactIntrinsicIncludeRoots(source)
-		includeDirs = appendUniqueStrings(includeDirs, intrinsicIncludeRoots...)
-		actionIncludeSearch.includeRoots = appendUniqueStrings(
-			actionIncludeSearch.includeRoots,
-			intrinsicIncludeRoots...,
-		)
 		forcedSources, err := forcedSourceInputs(flags, source, name)
 		if err != nil {
 			return CompactObjectVariant{}, fmt.Errorf(
@@ -1727,21 +1718,44 @@ func (memo compactVariantMemo) variantForStack(
 			)
 			sourceInputs = appendUniqueSourceInputs(sourceInputs, generatedClosure.sourceInputs...)
 		}
-		specialIncludeDirs := appendUniqueStrings(
-			append([]string(nil), includeDirs...),
-			specialSources.includeRoots...,
-		)
 		for _, input := range specialSources.inputs {
 			if input.path == source {
 				continue
+			}
+			specialFlags := normalizeSourceRootFlags(
+				filterResolvedKbuildFlags(object.flags, input.path),
+				opts.SourceRoot,
+			)
+			specialFlags = append(specialFlags, input.flags...)
+			specialIncludeRoots := appendUniqueStrings(
+				append([]string(nil), specialSources.includeRoots...),
+				input.includeRoots...,
+			)
+			specialIncludeRoots = appendUniqueStrings(
+				specialIncludeRoots,
+				compactIntrinsicIncludeRoots(input.path)...,
+			)
+			specialSearch, err := compactSourceActionIncludeSearch(
+				scanner,
+				input.path,
+				specialFlags,
+				specialIncludeRoots,
+			)
+			if err != nil {
+				return CompactObjectVariant{}, fmt.Errorf(
+					"model special source include search for %s of %s: %w",
+					input.path,
+					name,
+					err,
+				)
 			}
 			specialProfile := profile
 			if input.profile != sourceScanKernel {
 				specialProfile = input.profile
 			}
-			specialClosure, err := scanner.closureForSourceConfigInputsProfile(
+			specialClosure, err := scanner.closureForSourceConfigInputsSearchProfile(
 				input.path,
-				specialIncludeDirs,
+				specialSearch,
 				config,
 				isAssemblySourcePath(input.path),
 				actionFootprint.providedIncludes,
@@ -1764,10 +1778,19 @@ func (memo compactVariantMemo) variantForStack(
 			if !input.compiled {
 				continue
 			}
-			for _, forcedSource := range defaultForcedSourceInputs(input.path) {
-				forcedClosure, err := scanner.closureForSourceConfigInputsProfile(
+			specialForcedSources, err := forcedSourceInputs(specialFlags, input.path, name)
+			if err != nil {
+				return CompactObjectVariant{}, fmt.Errorf(
+					"model forced source inputs for special input %s of %s: %w",
+					input.path,
+					name,
+					err,
+				)
+			}
+			for _, forcedSource := range specialForcedSources {
+				forcedClosure, err := scanner.closureForSourceConfigInputsSearchProfile(
 					forcedSource,
-					specialIncludeDirs,
+					specialSearch,
 					config,
 					isAssemblySourcePath(input.path),
 					actionFootprint.providedIncludes,
@@ -1968,11 +1991,18 @@ func (memo compactVariantMemo) variantForStack(
 	return variant, nil
 }
 
-type compactSpecialSourceInput struct {
-	path     string
-	compiled bool
-	profile  sourceScanProfile
+// compactSourceAction describes the scanner-visible portion of a concrete
+// compile action. Special image objects and generated-header producers share
+// these descriptions so their per-source preprocessor contexts cannot drift.
+type compactSourceAction struct {
+	path         string
+	includeRoots []string
+	flags        []string
+	compiled     bool
+	profile      sourceScanProfile
 }
+
+type compactSpecialSourceInput = compactSourceAction
 
 type compactSpecialSourceInputs struct {
 	primary      string
@@ -2200,35 +2230,15 @@ func compactSpecialSourcesForObject(object string) compactSpecialSourceInputs {
 		}
 	case "arch/x86/purgatory/kexec-purgatory.o":
 		return compactSpecialSourceInputs{
-			inputs: compiled(
-				"arch/x86/purgatory/purgatory.c",
-				"arch/x86/purgatory/stack.S",
-				"arch/x86/purgatory/setup-x86_64.S",
-				"arch/x86/purgatory/entry64.S",
-				"arch/x86/boot/compressed/string.c",
-				"lib/crypto/sha256.c",
-			),
+			inputs: compactPurgatorySourceActions("x86"),
 		}
 	case "arch/riscv/purgatory/kexec-purgatory.o":
 		return compactSpecialSourceInputs{
-			inputs: compiled(
-				"arch/riscv/purgatory/purgatory.c",
-				"arch/riscv/purgatory/entry.S",
-				"lib/crypto/sha256.c",
-				"lib/string.c",
-				"lib/ctype.c",
-				"arch/riscv/lib/memcpy.S",
-				"arch/riscv/lib/memset.S",
-				"arch/riscv/lib/strcmp.S",
-				"arch/riscv/lib/strlen.S",
-				"arch/riscv/lib/strncmp.S",
-			),
+			inputs: compactPurgatorySourceActions("riscv"),
 		}
 	case "arch/powerpc/purgatory/kexec-purgatory.o":
 		return compactSpecialSourceInputs{
-			inputs: compiled(
-				"arch/powerpc/purgatory/trampoline_64.S",
-			),
+			inputs: compactPurgatorySourceActions("powerpc"),
 		}
 	case "arch/arm64/kernel/vdso32-wrap.o":
 		profile := func(path string, compiled bool) compactSpecialSourceInput {
@@ -2253,6 +2263,69 @@ func compactSpecialSourcesForObject(object string) compactSpecialSourceInputs {
 	default:
 		return compactSpecialSourceInputs{}
 	}
+}
+
+func compactPurgatorySourceActions(srcarch string) []compactSourceAction {
+	compiled := func(path string, flags ...string) compactSourceAction {
+		return compactSourceAction{
+			path:     path,
+			flags:    append([]string(nil), flags...),
+			compiled: true,
+		}
+	}
+	commonCFlags := []string{"-DDISABLE_BRANCH_PROFILING"}
+	withCommonCFlags := func(path string, flags ...string) compactSourceAction {
+		return compiled(path, append(append([]string(nil), commonCFlags...), flags...)...)
+	}
+	switch srcarch {
+	case "x86":
+		// The x86 helper adds DISABLE_BRANCH_PROFILING to every source,
+		// including assembly.
+		common := func(path string, flags ...string) compactSourceAction {
+			return withCommonCFlags(path, flags...)
+		}
+		return []compactSourceAction{
+			common("arch/x86/purgatory/purgatory.c"),
+			common("arch/x86/purgatory/stack.S"),
+			common("arch/x86/purgatory/setup-x86_64.S"),
+			common("arch/x86/purgatory/entry64.S"),
+			common("arch/x86/boot/compressed/string.c"),
+			common("lib/crypto/sha256.c", "-D__DISABLE_EXPORTS", "-D__NO_FORTIFY"),
+		}
+	case "riscv":
+		return []compactSourceAction{
+			withCommonCFlags("arch/riscv/purgatory/purgatory.c"),
+			compiled("arch/riscv/purgatory/entry.S"),
+			withCommonCFlags("lib/crypto/sha256.c", "-D__DISABLE_EXPORTS", "-D__NO_FORTIFY"),
+			withCommonCFlags("lib/string.c", "-D__DISABLE_EXPORTS"),
+			withCommonCFlags("lib/ctype.c", "-D__DISABLE_EXPORTS"),
+			compiled("arch/riscv/lib/memcpy.S"),
+			compiled("arch/riscv/lib/memset.S"),
+			compiled("arch/riscv/lib/strcmp.S"),
+			compiled("arch/riscv/lib/strlen.S"),
+			compiled("arch/riscv/lib/strncmp.S"),
+		}
+	case "powerpc":
+		return []compactSourceAction{
+			compiled("arch/powerpc/purgatory/trampoline_64.S"),
+		}
+	default:
+		return nil
+	}
+}
+
+func compactSourceActionIncludeSearch(
+	scanner *configSourceScanner,
+	source string,
+	flags []string,
+	includeRoots []string,
+) (sourceIncludeSearch, error) {
+	search, err := scanner.actionIncludeSearch(source, flags)
+	if err != nil {
+		return sourceIncludeSearch{}, err
+	}
+	search.includeRoots = appendUniqueStrings(search.includeRoots, includeRoots...)
+	return search, nil
 }
 
 func compactIntrinsicIncludeRoots(source string) []string {
@@ -2280,6 +2353,9 @@ func includeDirsFromFlags(flags []string, source string) ([]string, error) {
 		return nil, err
 	}
 	for _, flag := range pathFlags {
+		if flag.compilerProvided {
+			continue
+		}
 		if flag.option == "-include" || flag.option == "-imacros" {
 			continue
 		}
@@ -2313,6 +2389,9 @@ func forcedSourceInputs(flags []string, source, object string) ([]string, error)
 		return nil, err
 	}
 	for _, flag := range pathFlags {
+		if flag.compilerProvided {
+			continue
+		}
 		if flag.option != "-include" && flag.option != "-imacros" {
 			continue
 		}
@@ -2552,7 +2631,7 @@ func filterResolvedKbuildFlags(groups []resolvedKbuildFlag, source string) []str
 		}
 		out = append(out, group.values...)
 	}
-	return out
+	return stripCompilerBuiltinIncludeDirectoryShellFlags(out)
 }
 
 func filterResolvedKbuildFlagsForLanguage(groups []resolvedKbuildFlag, language string) []string {
@@ -2562,6 +2641,20 @@ func filterResolvedKbuildFlagsForLanguage(groups []resolvedKbuildFlag, language 
 			continue
 		}
 		out = append(out, group.values...)
+	}
+	return stripCompilerBuiltinIncludeDirectoryShellFlags(out)
+}
+
+func stripCompilerBuiltinIncludeDirectoryShellFlags(flags []string) []string {
+	out := make([]string, 0, len(flags))
+	for i := 0; i < len(flags); i++ {
+		if flags[i] == "-isystem" && i+1 < len(flags) {
+			if _, last, ok := compilerBuiltinIncludeDirectoryShell(flags, i+1); ok {
+				i = last
+				continue
+			}
+		}
+		out = append(out, flags[i])
 	}
 	return out
 }

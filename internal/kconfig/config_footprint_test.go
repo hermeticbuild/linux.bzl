@@ -703,6 +703,72 @@ func TestConfigSourceScannerUsesCommandLineUndefines(t *testing.T) {
 	}
 }
 
+func TestConfigSourceScannerDefaultsLegacyMODVERSIONSToUndefined(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "drivers/legacy.c", `
+#if defined(MODVERSIONS)
+#include <linux/modversions.h>
+#endif
+`)
+	scanner := newConfigSourceScanner(CompactMetadataOptions{SourceRoot: root})
+
+	if _, err := scanner.closureForSource("drivers/legacy.c", nil); err != nil {
+		t.Fatalf("default kernel scan followed inactive MODVERSIONS include: %v", err)
+	}
+	defined, err := scanner.actionIncludeSearch("drivers/legacy.c", []string{"-DMODVERSIONS"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scanner.closureForSourceConfigInputsSearchProfile(
+		"drivers/legacy.c",
+		defined,
+		nil,
+		false,
+		nil,
+		sourceScanKernel,
+	); err == nil || !strings.Contains(err.Error(), "linux/modversions.h") {
+		t.Fatalf("explicit -DMODVERSIONS error = %v, want active missing include", err)
+	}
+	undefined, err := scanner.actionIncludeSearch("drivers/legacy.c", []string{
+		"-DMODVERSIONS",
+		"-UMODVERSIONS",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scanner.closureForSourceConfigInputsSearchProfile(
+		"drivers/legacy.c",
+		undefined,
+		nil,
+		false,
+		nil,
+		sourceScanKernel,
+	); err != nil {
+		t.Fatalf("trailing -UMODVERSIONS did not override action define: %v", err)
+	}
+}
+
+func TestConfigSourceScannerModelsArmNeonAsCompilerProvided(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "arch/arm64/crypto/neon.c", "#include <arm_neon.h>\n")
+	mustWriteSource(t, root, "arch/arm64/crypto/missing.c", "#include <not-a-compiler-header.h>\n")
+	scanner := newConfigSourceScanner(CompactMetadataOptions{
+		SourceRoot: root,
+		Srcarch:    "arm64",
+	})
+	closure, err := scanner.closureForSource("arch/arm64/crypto/neon.c", nil)
+	if err != nil {
+		t.Fatalf("compiler-provided arm_neon.h was rejected: %v", err)
+	}
+	if got, want := sourceInputPaths(closure.sourceInputs), []string{"arch/arm64/crypto/neon.c"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("NEON closure inputs = %v, want %v", got, want)
+	}
+	if _, err := scanner.closureForSource("arch/arm64/crypto/missing.c", nil); err == nil ||
+		!strings.Contains(err.Error(), "not-a-compiler-header.h") {
+		t.Fatalf("arbitrary missing compiler header error = %v, want unresolved include", err)
+	}
+}
+
 func TestConfigSourceScannerContentGraphModelsTraceTemplateReinclude(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/trace.h", "#include <trace/define_trace.h>\n")
@@ -988,6 +1054,55 @@ func TestConfigSourceScannerContentGraphPreservesActionIncludeClassesAndOrder(t 
 		if slices.Contains(paths, shadowed) {
 			t.Errorf("action include scan selected shadowed path %q: %v", shadowed, paths)
 		}
+	}
+}
+
+func TestConfigSourceScannerModelsCompilerBuiltinIncludeDirectoryShell(t *testing.T) {
+	scanner := newConfigSourceScanner(CompactMetadataOptions{})
+	for name, flags := range map[string][]string{
+		"split kbuild tokens": {
+			"-isystem", "$(shell", "$(CC)", "-print-file-name=include)",
+			"-isystem", "$(srctree)/system",
+		},
+		"single token": {
+			"-isystem", compilerBuiltinIncludeDirectoryShellExpression,
+			"-isystem", "$(srctree)/system",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			search, err := scanner.actionIncludeSearch("crypto/aegis128-neon-inner.c", flags)
+			if err != nil {
+				t.Fatalf("actionIncludeSearch() rejected compiler builtin directory: %v", err)
+			}
+			if got, want := search.systemRoots, []string{"system"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("system include roots = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestConfigSourceScannerRejectsOtherUnresolvedIncludeDirectoryShells(t *testing.T) {
+	scanner := newConfigSourceScanner(CompactMetadataOptions{})
+	for name, flags := range map[string][]string{
+		"arbitrary compiler query": {
+			"-isystem", "$(shell", "$(CC)", "-print-file-name=plugin)",
+		},
+		"arbitrary compiler variable": {
+			"-isystem", "$(shell", "$(HOSTCC)", "-print-file-name=include)",
+		},
+		"arbitrary make variable": {
+			"-isystem", "$(UNKNOWN_INCLUDE_DIR)",
+		},
+		"compiler query on non-system path": {
+			"-I", "$(shell", "$(CC)", "-print-file-name=include)",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := scanner.actionIncludeSearch("crypto/aegis128-neon-inner.c", flags)
+			if err == nil || !strings.Contains(err.Error(), "unresolved make variable") {
+				t.Fatalf("actionIncludeSearch() error = %v, want unresolved make variable", err)
+			}
+		})
 	}
 }
 
@@ -1522,6 +1637,11 @@ func TestGeneratedHeaderFamilyClassifierUsesOwnedSpellings(t *testing.T) {
 		},
 		{
 			path:    "calls-oabi.S",
+			name:    compactGeneratedHeaderFamilyAll,
+			precise: true,
+		},
+		{
+			path:    "hyp_constants.h",
 			name:    compactGeneratedHeaderFamilyAll,
 			precise: true,
 		},
