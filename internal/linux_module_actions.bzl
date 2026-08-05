@@ -494,6 +494,28 @@ def _symversion_cmd_path(object):
     directory, basename = object.rsplit("/", 1)
     return directory + "/." + basename + ".cmd"
 
+def _object_module_leaf_objects(info):
+    leaves = []
+    if hasattr(info, "module_leaf_objects"):
+        leaves = list(info.module_leaf_objects)
+    else:
+        seen_fallback = {}
+        for record in _object_source_version_records(info) + _object_symversion_records(info):
+            if record.object not in seen_fallback:
+                seen_fallback[record.object] = True
+                leaves.append(record.object)
+        if not leaves and info.module_root_kind == "single":
+            leaves = [info.object]
+    if not leaves:
+        fail("configured Linux module %s has no primitive leaf-object manifest" % info.object)
+    seen = {}
+    for leaf in leaves:
+        _symversion_cmd_path(leaf)
+        if leaf in seen:
+            fail("Linux module %s repeats primitive leaf %s" % (info.object, leaf))
+        seen[leaf] = True
+    return leaves
+
 def _object_symversion_records(info):
     if not hasattr(info, "symversion_records") or not info.symversion_records:
         return []
@@ -511,34 +533,54 @@ def _object_symversion_records(info):
         ))
     return records
 
-def _stage_symversion_inputs(ctx, kernel, stage, module_paths):
+def _stage_symversion_inputs(ctx, kernel, stage, module_metadata):
     if kernel.config.config_flags.get("CONFIG_MODVERSIONS") != "y":
         return []
 
     built_in_records = []
     for info in kernel.objects:
         built_in_records.extend(_object_symversion_records(info))
-    module_records = {
-        info.object: _object_symversion_records(info)
-        for info in kernel.module_objects
-    }
-
     staged_by_path = {}
     inputs = []
-    for owner, records in [("vmlinux", built_in_records)] + [
-        (path, module_records[path])
-        for path in module_paths
-    ]:
+    for owner, records in [("vmlinux", built_in_records)]:
         for record in records:
             previous = staged_by_path.get(record.path)
             if previous != None:
                 fail(
                     "Linux symbol-version leaf %s is owned by both %s and %s" %
-                    (record.object, previous, owner),
+                    (record.object, previous.owner, owner),
                 )
             staged = ctx.actions.declare_file(stage + "/" + record.path)
             ctx.actions.symlink(output = staged, target_file = record.cmd)
-            staged_by_path[record.path] = owner
+            staged_by_path[record.path] = struct(cmd = record.cmd.path, owner = owner)
+            inputs.append(staged)
+
+    for module_path in module_metadata.order:
+        metadata = module_metadata.by_module[module_path]
+        for leaf in metadata.leaves:
+            if leaf in metadata.source_by_object:
+                # The source-version command already appends this leaf's
+                # optional #SYMVER records and owns the staged .cmd path.
+                continue
+            path = _symversion_cmd_path(leaf)
+            previous = staged_by_path.get(path)
+            record = metadata.symversion_by_object.get(leaf)
+            command_path = record.cmd.path if record != None else ""
+            if previous != None:
+                if previous.cmd != command_path:
+                    fail(
+                        "Linux symbol-version leaf %s has different commands in %s and %s" %
+                        (leaf, previous.owner, module_path),
+                    )
+                continue
+            staged = ctx.actions.declare_file(stage + "/" + path)
+            if record != None:
+                ctx.actions.symlink(output = staged, target_file = record.cmd)
+            else:
+                # Linux 6.18 reads one .cmd for every leaf in <module>.mod
+                # under MODVERSIONS, even when the leaf exports no CRCs.
+                ctx.actions.write(staged, "")
+            staged_by_path[path] = struct(cmd = command_path, owner = module_path)
             inputs.append(staged)
 
     vmlinux_objects = ctx.actions.declare_file(stage + "/.vmlinux.objs")
@@ -547,13 +589,132 @@ def _stage_symversion_inputs(ctx, kernel, stage, module_paths):
         "".join([record.object + "\n" for record in built_in_records]),
     )
     inputs.append(vmlinux_objects)
-    for path in module_paths:
-        manifest = ctx.actions.declare_file(stage + "/" + path[:-len(".o")] + ".mod")
+    return inputs
+
+def _object_source_version_records(info):
+    if not hasattr(info, "source_version_records") or not info.source_version_records:
+        return []
+    records = []
+    seen = {}
+    for record in info.source_version_records:
+        path = _symversion_cmd_path(record.object)
+        if record.object in seen:
+            fail("Linux object %s repeats source-version leaf %s" % (info.object, record.object))
+        seen[record.object] = True
+        records.append(struct(
+            cmd = record.cmd,
+            object = record.object,
+            path = path,
+            path_files = record.path_files,
+        ))
+    return records
+
+def _module_metadata(kernel, module_paths):
+    infos = {info.object: info for info in kernel.module_objects}
+    by_module = {}
+    shared_leaves = {}
+    for module_path in module_paths:
+        info = infos[module_path]
+        leaves = _object_module_leaf_objects(info)
+        source_by_object = {
+            record.object: record
+            for record in _object_source_version_records(info)
+        }
+        symversion_by_object = {
+            record.object: record
+            for record in _object_symversion_records(info)
+        }
+        for record_kind, records in [
+            ("source-version", source_by_object),
+            ("symbol-version", symversion_by_object),
+        ]:
+            for leaf in records.keys():
+                if leaf not in leaves:
+                    fail(
+                        "Linux module %s has %s record for non-manifest leaf %s" %
+                        (module_path, record_kind, leaf),
+                    )
+        for leaf in leaves:
+            source_record = source_by_object.get(leaf)
+            symversion_record = symversion_by_object.get(leaf)
+            current = struct(
+                module = module_path,
+                source_cmd = source_record.cmd.path if source_record != None else "",
+                source_path_files = [
+                    (path_file.path, path_file.file.path)
+                    for path_file in source_record.path_files
+                ] if source_record != None else [],
+                symversion_cmd = symversion_record.cmd.path if symversion_record != None else "",
+            )
+            previous = shared_leaves.get(leaf)
+            if previous != None and (
+                previous.source_cmd != current.source_cmd or
+                previous.source_path_files != current.source_path_files or
+                previous.symversion_cmd != current.symversion_cmd
+            ):
+                fail(
+                    "Linux module leaf %s has incompatible metadata in %s and %s" %
+                    (leaf, previous.module, module_path),
+                )
+            if previous == None:
+                shared_leaves[leaf] = current
+        by_module[module_path] = struct(
+            leaves = leaves,
+            source_by_object = source_by_object,
+            symversion_by_object = symversion_by_object,
+        )
+    return struct(
+        by_module = by_module,
+        order = module_paths,
+    )
+
+def _stage_module_source_version_inputs(ctx, kernel, stage, module_metadata):
+    staged_commands = {}
+    staged_sources = {}
+    inputs = []
+    for module_path in module_metadata.order:
+        metadata = module_metadata.by_module[module_path]
+        missing = [leaf for leaf in metadata.leaves if leaf not in metadata.source_by_object]
+        if missing and kernel.config.config_flags.get("CONFIG_MODULE_SRCVERSION_ALL") == "y":
+            fail(
+                "Linux module %s has source-version-unsupported leaves %s but CONFIG_MODULE_SRCVERSION_ALL=y" %
+                (module_path, ", ".join(missing)),
+            )
+        manifest = ctx.actions.declare_file(stage + "/" + module_path[:-len(".o")] + ".mod")
         ctx.actions.write(
             manifest,
-            "".join([record.object + "\n" for record in module_records[path]]),
+            "".join([leaf + "\n" for leaf in metadata.leaves]),
         )
         inputs.append(manifest)
+        for leaf in metadata.leaves:
+            record = metadata.source_by_object.get(leaf)
+            if record == None:
+                continue
+            previous = staged_commands.get(record.path)
+            if previous != None:
+                if previous.cmd.path != record.cmd.path:
+                    fail(
+                        "Linux source-version leaf %s has different commands in %s and %s" %
+                        (record.object, previous.module, module_path),
+                    )
+            else:
+                staged_cmd = ctx.actions.declare_file(stage + "/" + record.path)
+                ctx.actions.symlink(output = staged_cmd, target_file = record.cmd)
+                staged_commands[record.path] = struct(cmd = record.cmd, module = module_path)
+                inputs.append(staged_cmd)
+            for path_file in record.path_files:
+                previous_file = staged_sources.get(path_file.path)
+                if previous_file != None:
+                    if previous_file.path != path_file.file.path:
+                        fail(
+                            "Linux source-version path %s names both %s and %s" %
+                            (path_file.path, previous_file.path, path_file.file.path),
+                        )
+                    continue
+                staged_source = ctx.actions.declare_file(stage + "/" + path_file.path)
+                ctx.actions.symlink(output = staged_source, target_file = path_file.file)
+                staged_sources[path_file.path] = path_file.file
+                inputs.append(staged_source)
     return inputs
 
 def _modpost_args(config):
@@ -604,10 +765,12 @@ def _pahole_flags(config, version, external_module = False):
         flags.append("--btf_features=distilled_base")
     return flags
 
-def _check_module_modinfo(ctx, module, output):
+def _check_module_modinfo(ctx, module, output, allow_version = False):
     args = ctx.actions.args()
     args.add("-in", module)
     args.add("-out", output)
+    if allow_version:
+        args.add("-allow-version")
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._modulemodinfo,
@@ -708,12 +871,18 @@ def _run_modpost(ctx, kernel, modpost, module_outputs):
     module_checks = []
     module_sources = {}
     module_paths = [info.object for info in kernel.module_objects]
+    module_metadata = _module_metadata(kernel, module_paths)
     for path in module_paths:
         staged = ctx.actions.declare_file(stage + "/" + path)
         ctx.actions.symlink(output = staged, target_file = module_outputs[path])
         staged_modules.append(staged)
         checked = ctx.actions.declare_file(stage + "/" + path + ".modinfo.checked")
-        _check_module_modinfo(ctx, module_outputs[path], checked)
+        _check_module_modinfo(
+            ctx,
+            module_outputs[path],
+            checked,
+            allow_version = len(module_metadata.by_module[path].source_by_object) == len(module_metadata.by_module[path].leaves),
+        )
         module_checks.append(checked)
         module_sources[path] = ctx.actions.declare_file(stage + "/" + path[:-len(".o")] + ".mod.c")
 
@@ -722,11 +891,17 @@ def _run_modpost(ctx, kernel, modpost, module_outputs):
         modules_order,
         "".join([path + "\n" for path in module_paths]),
     )
+    source_version_inputs = _stage_module_source_version_inputs(
+        ctx,
+        kernel,
+        stage,
+        module_metadata,
+    )
     symversion_inputs = _stage_symversion_inputs(
         ctx,
         kernel,
         stage,
-        module_paths,
+        module_metadata,
     )
     module_symvers = ctx.actions.declare_file(stage + "/Module.symvers")
     vmlinux_export = ctx.actions.declare_file(stage + "/.vmlinux.export.c")
@@ -750,7 +925,7 @@ def _run_modpost(ctx, kernel, modpost, module_outputs):
         ctx.actions,
         executable = ctx.executable._runincwd,
         exec_group = "host_cc",
-        inputs = [staged_vmlinux, modules_order] + staged_modules + module_checks + symversion_inputs,
+        inputs = [staged_vmlinux, modules_order] + staged_modules + module_checks + source_version_inputs + symversion_inputs,
         tools = [modpost],
         outputs = outputs,
         arguments = [args],

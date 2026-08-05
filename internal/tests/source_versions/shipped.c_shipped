@@ -1,0 +1,4 @@
+int shipped_source(void)
+{
+	return 0;
+}

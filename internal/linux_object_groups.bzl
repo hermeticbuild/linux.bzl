@@ -155,10 +155,21 @@ def _rewrite_target_flags(flags, target_triple):
 
 def _drop_toolchain_include(path):
     return (
+        "llvm++glibc+" in path or
         "llvm++musl+musl_libc/" in path or
         "llvm++musl+musl_libc\\" in path or
         "llvm++kernel_headers+linux_kernel_headers_" in path
     )
+
+def _clang_resource_include(path):
+    """Whether path is Clang's compiler-provided resource header directory."""
+    normalized = path.replace("\\", "/")
+    marker = "/lib/clang/"
+    marker_index = normalized.rfind(marker)
+    if marker_index < 0:
+        return False
+    suffix = normalized[marker_index + len(marker):].split("/")
+    return len(suffix) == 2 and bool(suffix[0]) and suffix[1] == "include"
 
 def _compile_flags(ctx, cc_toolchain, feature_configuration):
     variables = cc_common.create_compile_variables(
@@ -185,8 +196,12 @@ def _compile_flags(ctx, cc_toolchain, feature_configuration):
         flag = flags[index]
         if flag == "-Xclang":
             if index + 1 < len(flags) and flags[index + 1] == "-internal-isystem":
-                drop_count = 3
-                continue
+                resource_path = ""
+                if index + 3 < len(flags) and flags[index + 2] == "-Xclang":
+                    resource_path = flags[index + 3]
+                if not _clang_resource_include(resource_path):
+                    drop_count = 3
+                    continue
             if index + 1 < len(flags) and flags[index + 1] == "-fno-cxx-modules":
                 drop_count = 1
                 continue
@@ -260,7 +275,9 @@ def _source_group(index, group_number, file_number, target):
         fail("grouped object %s source group omits primary source %d" % (target, file_number))
     return struct(
         files = group.files,
+        path_files = group.path_files,
         source = index.files[file_number - 1],
+        source_path = index.paths[file_number - 1],
     )
 
 def _object_stem(object):
@@ -366,7 +383,7 @@ def _source_include_dirs(source_root, srcarch, generated_headers):
         generated.other
     )
 
-def _compile_arguments(ctx, base_flags, spec, source, output, config, generated_headers, source_root):
+def _compile_arguments(ctx, base_flags, spec, source, output, config, generated_headers, source_root, depfile = None):
     replacements = dict(config.config_flags)
     replacements.update({
         "src": source.dirname,
@@ -434,11 +451,70 @@ def _compile_arguments(ctx, base_flags, spec, source, output, config, generated_
         files = mapping_files,
         directory_anchors = anchors,
     )
+    if depfile != None:
+        args.add("-MD")
+        args.add("-MF")
+        args.add(depfile)
     args.add("-c")
     args.add(source)
     args.add("-o")
     args.add(output)
     return args
+
+def _cmd_path(object):
+    if "/" not in object:
+        return "." + object + ".cmd"
+    directory, basename = object.rsplit("/", 1)
+    return directory + "/." + basename + ".cmd"
+
+def _source_version_record(ctx, selection, spec, depfile, generated_path_files = [], symversions = None):
+    path_files_by_path = {}
+    for path_file in selection.path_files + generated_path_files:
+        previous = path_files_by_path.get(path_file.path)
+        if previous != None and previous.file.path != path_file.file.path:
+            fail(
+                "grouped source-version path %s names both %s and %s" %
+                (path_file.path, previous.file.path, path_file.file.path),
+            )
+        path_files_by_path[path_file.path] = path_file
+    path_files = [path_files_by_path[path] for path in sorted(path_files_by_path.keys())]
+    object_dir = spec.object.rsplit("/", 1)[0] if "/" in spec.object else ""
+    staged_path_files = []
+    for path_file in path_files:
+        path_dir = path_file.path.rsplit("/", 1)[0] if "/" in path_file.path else ""
+        if path_file.path == selection.source_path or path_dir == object_dir:
+            staged_path_files.append(path_file)
+
+    out = ctx.actions.declare_file(
+        ctx.label.name + ".source_versions/" + spec.content_id + "/" + _cmd_path(spec.object),
+    )
+    args = ctx.actions.args()
+    args.add("-depfile", depfile)
+    args.add("-object", spec.object)
+    args.add("-out", out)
+    args.add("-primary", selection.source_path)
+    inputs = [depfile]
+    if symversions != None:
+        args.add("-symversions", symversions)
+        inputs.append(symversions)
+    for path_file in path_files:
+        args.add("-physical")
+        args.add(path_file.file)
+        args.add("-canonical", path_file.path)
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._sourceversioncmd,
+        inputs = depset(inputs + [path_file.file for path_file in generated_path_files], transitive = [selection.files]),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxSourceVersionCmd",
+        progress_message = "Generating grouped Linux module source-version data %{label}",
+    )
+    return struct(
+        cmd = out,
+        object = spec.object,
+        path_files = staged_path_files,
+    )
 
 def _symversion_config_response(ctx, config, spec, source, source_root):
     if not ctx.attr.symversion_remove_flags:
@@ -562,10 +638,13 @@ def _grouped_objtool(ctx, config, input_file, output):
 
 def _group_providers(ctx, objects, outputs):
     symversion_files = []
+    source_version_files = []
     for target in sorted(objects.keys()):
         info = objects[target]
         if hasattr(info, "symversion_records") and info.symversion_records:
             symversion_files.extend([record.cmd for record in info.symversion_records])
+        if hasattr(info, "source_version_records") and info.source_version_records:
+            source_version_files.extend([record.cmd for record in info.source_version_records])
     return [
         DefaultInfo(files = depset(outputs)),
         LinuxObjectActionGroupInfo(
@@ -578,6 +657,7 @@ def _group_providers(ctx, objects, outputs):
         ),
         OutputGroupInfo(
             object = depset(outputs),
+            source_versions = depset(source_version_files),
             symversions = depset(symversion_files),
         ),
     ]
@@ -647,6 +727,20 @@ def _linux_object_action_group_impl(ctx):
             compile_out = ctx.actions.declare_file(
                 ctx.label.name + ".objects/" + spec.content_id + "/.objtool-input/" + spec.object,
             )
+        source_version_depfile = None
+        if ctx.attr.mode == "m" and (ctx.attr.language == "c" or source.basename.endswith(".S")):
+            source_version_depfile = ctx.actions.declare_file(
+                ctx.label.name + ".source_versions/" + spec.content_id + "/" + spec.object + ".d",
+            )
+        elif (
+            ctx.attr.mode == "m" and
+            source.basename.endswith(".s") and
+            config.config_flags.get("CONFIG_MODULE_SRCVERSION_ALL") == "y"
+        ):
+            fail(
+                "%s builds raw assembler module leaf %s from %s, but CONFIG_MODULE_SRCVERSION_ALL=y requires depfile-capable C or preprocessed assembly (.S)" %
+                (ctx.label, spec.object, source.basename),
+            )
         transitive_inputs = [
             selection.files,
             config.files,
@@ -654,6 +748,9 @@ def _linux_object_action_group_impl(ctx):
         ]
         if generated_headers != None:
             transitive_inputs.append(generated_headers.files)
+        compile_outputs = [compile_out]
+        if source_version_depfile != None:
+            compile_outputs.append(source_version_depfile)
         path_mapped_run(
             ctx.actions,
             executable = compiler,
@@ -661,7 +758,7 @@ def _linux_object_action_group_impl(ctx):
                 [source, source_root_file],
                 transitive = transitive_inputs,
             ),
-            outputs = [compile_out],
+            outputs = compile_outputs,
             arguments = [_compile_arguments(
                 ctx,
                 base_flags,
@@ -671,6 +768,7 @@ def _linux_object_action_group_impl(ctx):
                 config,
                 generated_headers,
                 source_root,
+                depfile = source_version_depfile,
             )],
             mnemonic = "LinuxObjectCompile",
             progress_message = "Compiling grouped Linux object %s" % spec.object,
@@ -678,6 +776,7 @@ def _linux_object_action_group_impl(ctx):
         if use_objtool:
             _grouped_objtool(ctx, config, compile_out, out)
         symversion_records = []
+        symversion_cmd = None
         if ctx.attr.symversions:
             if config.config_flags.get("CONFIG_MODVERSIONS") != "y":
                 fail("%s enables symversions without CONFIG_MODVERSIONS=y" % ctx.label)
@@ -743,17 +842,33 @@ def _linux_object_action_group_impl(ctx):
                 cmd = symversion_cmd,
                 object = spec.object,
             ))
+        source_version_records = []
+        if source_version_depfile != None:
+            generated_path_files = []
+            if generated_headers != None and hasattr(generated_headers, "path_files") and generated_headers.path_files:
+                generated_path_files = generated_headers.path_files
+            source_version_records.append(_source_version_record(
+                ctx,
+                selection,
+                spec,
+                source_version_depfile,
+                generated_path_files = generated_path_files,
+                symversions = symversion_cmd,
+            ))
         info = LinuxObjectInfo(
             content_id = spec.content_id,
             generated_headers = depset([]),
+            generated_header_path_files = [],
             generated_include_dir_anchors = {},
             generated_include_dirs = [],
             mode = ctx.attr.mode,
+            module_leaf_objects = [spec.object] if ctx.attr.mode == "m" else [],
             module_root_kind = "single" if ctx.attr.module_root else "",
             object = spec.object,
             objtool_args = list(ctx.attr.objtool_args) if use_objtool else [],
             objtool_force = ctx.attr.objtool_force if use_objtool else False,
             output = out,
+            source_version_records = source_version_records,
             symversion_records = symversion_records,
         )
         objects[target] = info
@@ -805,6 +920,11 @@ linux_object_action_group = rule(
         "_objtoolrun": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/objtoolrun"),
+            executable = True,
+        ),
+        "_sourceversioncmd": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/sourceversioncmd"),
             executable = True,
         ),
     },
@@ -865,12 +985,45 @@ def _merged_generated_include_dir_anchors(infos):
         anchors.update(info.generated_include_dir_anchors)
     return anchors
 
+def _merged_generated_header_path_files(infos):
+    by_path = {}
+    for info in infos:
+        if not hasattr(info, "generated_header_path_files") or not info.generated_header_path_files:
+            continue
+        for path_file in info.generated_header_path_files:
+            previous = by_path.get(path_file.path)
+            if previous != None and previous.file.path != path_file.file.path:
+                fail(
+                    "generated header path %s names both %s and %s" %
+                    (path_file.path, previous.file.path, path_file.file.path),
+                )
+            by_path[path_file.path] = path_file
+    return [by_path[path] for path in sorted(by_path.keys())]
+
 def _merged_symversion_records(infos):
     records = []
     for info in infos:
         if hasattr(info, "symversion_records") and info.symversion_records:
             records.extend(info.symversion_records)
     return records
+
+def _merged_source_version_records(infos):
+    records = []
+    for info in infos:
+        if hasattr(info, "source_version_records") and info.source_version_records:
+            records.extend(info.source_version_records)
+    return records
+
+def _merged_module_leaf_objects(infos):
+    seen = {}
+    objects = []
+    for info in infos:
+        if hasattr(info, "module_leaf_objects") and info.module_leaf_objects:
+            for object in info.module_leaf_objects:
+                if object not in seen:
+                    seen[object] = True
+                    objects.append(object)
+    return objects
 
 def _unique_generated_include_dirs(infos):
     seen = {}
@@ -938,14 +1091,17 @@ def _linux_composite_object_action_group_impl(ctx):
                 generated_headers = depset(
                     transitive = [member.generated_headers for member in member_infos],
                 ),
+                generated_header_path_files = _merged_generated_header_path_files(member_infos),
                 generated_include_dir_anchors = _merged_generated_include_dir_anchors(member_infos),
                 generated_include_dirs = _unique_generated_include_dirs(member_infos),
                 mode = ctx.attr.mode,
+                module_leaf_objects = _merged_module_leaf_objects(member_infos),
                 module_root_kind = "composite" if ctx.attr.module_root else "",
                 object = spec.object,
                 objtool_args = list(ctx.attr.objtool_args),
                 objtool_force = ctx.attr.objtool_force,
                 output = out,
+                source_version_records = _merged_source_version_records(member_infos),
                 symversion_records = _merged_symversion_records(member_infos),
             )
             available[target] = info

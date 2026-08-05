@@ -246,8 +246,9 @@ crate graph, built-in or generated target specification, and compiler flags
 from its kernel sources. Full DWARF5 debug information, kernel BTF, and module
 BTF are supported together. DWARF4, toolchain-default/reduced/split/compressed
 debug information, symbol versioning, LTO/CFI, and sanitizers remain explicit
-errors. `MODULE_VERSION` and module `version=` or `srcversion=` metadata are
-not supported.
+errors. Rust modules also reject `MODULE_VERSION` and module `version=` or
+`srcversion=` metadata; source-version manifests are currently modeled only
+for C and assembly module objects.
 
 The standalone end-to-end workspace compiles this path, boots the kernel under
 QEMU, inserts the resulting module, and checks its load marker:
@@ -380,6 +381,7 @@ config architecture that disagrees with the platform-selected target profile.
 | In-tree modules | Loadable `.ko` files plus Kbuild module metadata |
 | Out-of-tree modules | C `.ko` files through `linux_cc_module` on all three profiles; Rust-for-Linux `.ko` files through `linux_module` on x86_64 and aarch64 |
 | Module symbol versions | Classic Linux 6.12 and Linux 6.18 basic GENKSYMS for C and assembly objects and C modules |
+| Module source versions | `MODULE_VERSION` for C modules; `CONFIG_MODULE_SRCVERSION_ALL` for in-tree C/assembly modules and out-of-tree C modules |
 | Trusted keyrings | Empty built-in trusted keyring for verification consumers; no embedded certificates or signing keys |
 | Kernel BPF/BTF | BPF syscall configurations, BTF-enabled `vmlinux`, and module BTF with Rust+DWARF5 kernels |
 | VM verification | Hermetic QEMU boots with initramfs and module-load checks |
@@ -398,11 +400,16 @@ archives, while `linux_cc_module` and `linux_module` build out-of-tree C and
 Rust-for-Linux modules respectively.
 BPF-syscall and BTF-enabled kernel configurations are supported; eBPF program
 compilation remains the responsibility of consumers such as Aya.
+C modules may use `MODULE_VERSION`, and configured kernels may enable
+`CONFIG_MODULE_SRCVERSION_ALL` for C and assembly modules; linux.bzl generates
+the Kbuild source and dependency manifests consumed by modpost. Direct
+user-authored `srcversion=` metadata remains rejected because modpost owns that
+value.
 
 Kernel and module signing, embedded trusted or revocation certificates,
-extended or DWARF module versions, `MODULE_VERSION`/module source-version
-metadata, compiled device-tree artifacts, and other unimplemented Kbuild
-products remain outside the supported contract.
+extended or DWARF module versions, Rust module source versions, compiled
+device-tree artifacts, and other unimplemented Kbuild products remain outside
+the supported contract.
 `CONFIG_X86_NATIVE_CPU` is rejected because `-march=native` would make an action
 depend on worker CPU features that are absent from its cache key. Generated
 graphs that require an unsupported artifact rule are rejected with an

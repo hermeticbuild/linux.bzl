@@ -329,6 +329,34 @@ _fake_powerpc_purgatory_source_inputs = rule(
     implementation = _fake_powerpc_purgatory_source_inputs_impl,
 )
 
+def _fake_x86_purgatory_source_inputs_impl(ctx):
+    root = ctx.actions.declare_file(ctx.label.name + ".source/Kconfig")
+    ctx.actions.write(root, "")
+    files = []
+    for path in [
+        "arch/x86/boot/compressed/string.c",
+        "arch/x86/purgatory/entry64.S",
+        "arch/x86/purgatory/kexec-purgatory.S",
+        "arch/x86/purgatory/purgatory.c",
+        "arch/x86/purgatory/setup-x86_64.S",
+        "arch/x86/purgatory/stack.S",
+        "include/linux/compiler-version.h",
+        "include/linux/compiler_types.h",
+        "include/linux/kconfig.h",
+        "lib/crypto/sha256.c",
+    ]:
+        out = ctx.actions.declare_file(ctx.label.name + ".source/" + path)
+        ctx.actions.write(out, "")
+        files.append(out)
+    return [
+        DefaultInfo(files = depset(files)),
+        _fake_source_tree_info(root),
+    ]
+
+_fake_x86_purgatory_source_inputs = rule(
+    implementation = _fake_x86_purgatory_source_inputs_impl,
+)
+
 def _fake_riscv_purgatory_source_inputs_impl(ctx):
     root = ctx.actions.declare_file(ctx.label.name + ".source/Kconfig")
     ctx.actions.write(root, "")
@@ -498,6 +526,35 @@ _indexed_assembly_source_test = analysistest.make(
         "unexpected_generated_cflags": attr.string(mandatory = True),
     },
 )
+
+def _object_remove_flags_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = analysistest.target_actions(env)
+    compile_actions = [action for action in actions if action.mnemonic == "LinuxObjectCompile"]
+    symversion_actions = [action for action in actions if action.mnemonic == "LinuxGenksyms"]
+    filter_actions = [action for action in actions if action.mnemonic == "LinuxFlagFilter"]
+    asserts.equals(env, 1, len(compile_actions))
+    asserts.equals(env, 1, len(symversion_actions))
+    asserts.equals(env, 2, len(filter_actions))
+    if compile_actions:
+        argv = compile_actions[0].argv
+        asserts.false(env, "-mgeneral-regs-only" in argv)
+        asserts.false(env, "-DREMOVE" in argv)
+        asserts.true(env, "-DKEEP_COMPILE" in argv)
+        asserts.true(env, "-DREMOVE_SUFFIX" in argv)
+    if symversion_actions:
+        argv = symversion_actions[0].argv
+        asserts.false(env, "-mgeneral-regs-only" in argv)
+        asserts.false(env, "-DREMOVE" in argv)
+        asserts.true(env, "-DKEEP_SYMVERSION" in argv)
+        asserts.true(env, "-DREMOVE_SUFFIX" in argv)
+    for action in filter_actions:
+        asserts.true(env, "-remove" in action.argv)
+        asserts.true(env, "-mgeneral-regs-only" in action.argv)
+        asserts.true(env, "-DREMOVE" in action.argv)
+    return analysistest.end(env)
+
+_object_remove_flags_test = analysistest.make(_object_remove_flags_test_impl)
 
 def _empty_system_certificates_test_impl(ctx):
     env = analysistest.begin(ctx)
@@ -898,6 +955,72 @@ def _powerpc_purgatory_actions_test_impl(ctx):
 
 _powerpc_purgatory_actions_test = analysistest.make(
     _powerpc_purgatory_actions_test_impl,
+)
+
+def _path_mapping_key(path):
+    """Returns an execroot path identity independent of Bazel's config mapping."""
+    parts = path.replace("\\", "/").split("/")
+    if (
+        len(parts) >= 4 and
+        parts[0] == "bazel-out" and
+        parts[2] in ("bin", "genfiles")
+    ):
+        return "/".join([parts[0]] + parts[2:])
+    return "/".join(parts)
+
+def _x86_purgatory_actions_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    actions = analysistest.target_actions(env)
+    compile_actions = [action for action in actions if action.mnemonic == "LinuxPurgatoryCompile"]
+    filter_actions = [action for action in actions if action.mnemonic == "LinuxFlagFilter"]
+    asserts.equals(env, 6, len(compile_actions))
+    asserts.equals(env, 6, len(filter_actions))
+    filter_outputs = []
+    for action in filter_actions:
+        outputs = action.outputs.to_list()
+        asserts.equals(env, 1, len(outputs))
+        if outputs:
+            filter_outputs.append(outputs[0].path)
+        if any([output.path.endswith("-c.rsp") for output in outputs]):
+            for flag in [
+                "-pg",
+                "-mcmodel=kernel",
+                "-fstack-protector-strong",
+                "-mretpoline",
+                "-mfunction-return=thunk-extern",
+                "-fsanitize-cfi-icall-experimental-normalize-integers",
+                "-fsanitize=kcfi",
+                "-fsanitize-kcfi-arity",
+                "-flto=thin",
+                "-fsplit-lto-unit",
+            ]:
+                asserts.true(env, flag in action.argv)
+            asserts.true(env, "-fprofile-use=" in action.argv)
+        else:
+            asserts.true(env, "-gdwarf-5" in action.argv)
+            asserts.true(env, "-Wa,-gdwarf-5" in action.argv)
+    asserts.equals(env, 6, len({path: True for path in filter_outputs}))
+    for action in compile_actions:
+        response_indices = [
+            index
+            for index in range(len(action.argv))
+            if "x86-purgatory-" in action.argv[index] and action.argv[index].endswith(".rsp")
+        ]
+        asserts.equals(env, 1, len(response_indices))
+        if response_indices:
+            response_index = response_indices[0]
+            for positive in ["-mcmodel=small", "-fno-stack-protector", "-fpic", "-fvisibility=hidden"]:
+                positive_indices = [index for index in range(len(action.argv)) if action.argv[index] == positive]
+                asserts.true(env, any([index > response_index for index in positive_indices]))
+            input_paths = {
+                _path_mapping_key(file.path): True
+                for file in action.inputs.to_list()
+            }
+            asserts.true(env, _path_mapping_key(action.argv[response_index][1:]) in input_paths)
+    return analysistest.end(env)
+
+_x86_purgatory_actions_test = analysistest.make(
+    _x86_purgatory_actions_test_impl,
 )
 
 def _riscv_purgatory_actions_test_impl(ctx):
@@ -1391,6 +1514,66 @@ def linux_objects_fail_closed_test_suite(name):
         unexpected_generated_headers = [duplicate_generated_headers + ".h"],
         unexpected_input = "linux_modules_test_fixture.rs",
     )
+    remove_flags_payload_id = "1818181818181818181818181818181818181818181818181818181818181818"
+    remove_flags_environment_id = "1919191919191919191919191919191919191919191919191919191919191919"
+    remove_flags_environment_index = name + "_remove_flags_environment_index"
+    linux_compile_environment_index(
+        name = remove_flags_environment_index,
+        compile_environments = {
+            remove_flags_environment_id: json.encode({
+                "abi": "x86_64-linux-gnu",
+                "config_payload": remove_flags_payload_id,
+                "generated_header_families": [header_family_id],
+            }),
+        },
+        config_payloads = {
+            remove_flags_payload_id: "CONFIG_GENKSYMS=y\nCONFIG_MODVERSIONS=y\n",
+        },
+        expected_abi = "x86_64-linux-gnu",
+        generated_headers = [":" + generated_headers],
+        tags = fixture_tags,
+    )
+    remove_flags_object = name + "_remove_flags_object"
+    linux_object(
+        name = remove_flags_object,
+        compile_environment_id = remove_flags_environment_id,
+        compile_environment_index = ":" + remove_flags_environment_index,
+        content_id = "2020202020202020202020202020202020202020202020202020202020202020",
+        flags = [
+            "-mgeneral-regs-only",
+            "-DREMOVE",
+            "-DKEEP_COMPILE",
+            "-DREMOVE_SUFFIX",
+        ],
+        genksyms = "//internal/cmd/runandwrite",
+        mode = "m",
+        object = "crypto/aegis128-neon-inner.o",
+        remove_flags = [
+            "-mgeneral-regs-only",
+            "-DREMOVE",
+        ],
+        source_input_file = 4,
+        source_input_group = 1,
+        source_input_index = ":" + source_input_index,
+        symversion_flags = [
+            "-mgeneral-regs-only",
+            "-DREMOVE",
+            "-DKEEP_SYMVERSION",
+            "-DREMOVE_SUFFIX",
+        ],
+        symversion_remove_flags = [
+            "-mgeneral-regs-only",
+            "-DREMOVE",
+        ],
+        symversions = True,
+        tags = fixture_tags,
+        version = "6.18.39",
+    )
+    remove_flags_object_test = remove_flags_object + "_test"
+    _object_remove_flags_test(
+        name = remove_flags_object_test,
+        target_under_test = ":" + remove_flags_object,
+    )
     precise_family_object = name + "_precise_family_object"
     linux_object(
         name = precise_family_object,
@@ -1686,6 +1869,68 @@ def linux_objects_fail_closed_test_suite(name):
     )
     generic_header_tests.append(":" + powerpc_vdso_headers_test)
 
+    x86_purgatory_headers = name + "_x86_purgatory_headers"
+    _fake_generated_headers(
+        name = x86_purgatory_headers,
+        arch = "x86",
+        family_content_id = "1414141414141414141414141414141414141414141414141414141414141414",
+        tags = fixture_tags,
+    )
+    x86_purgatory_sources = name + "_x86_purgatory_sources"
+    _fake_x86_purgatory_source_inputs(
+        name = x86_purgatory_sources,
+        tags = fixture_tags,
+    )
+    x86_purgatory_source_index = name + "_x86_purgatory_source_index"
+    linux_source_input_index(
+        name = x86_purgatory_source_index,
+        groups = [",".join([str(index) for index in range(1, 11)])],
+        srcs = [":" + x86_purgatory_sources],
+        source_tree_info = ":" + x86_purgatory_sources,
+        tags = fixture_tags,
+    )
+    x86_purgatory_environment_id = "1515151515151515151515151515151515151515151515151515151515151515"
+    x86_purgatory_payload_id = "1616161616161616161616161616161616161616161616161616161616161616"
+    x86_purgatory_environment_index = name + "_x86_purgatory_environment_index"
+    linux_compile_environment_index(
+        name = x86_purgatory_environment_index,
+        arch = "x86",
+        compile_environments = {
+            x86_purgatory_environment_id: json.encode({
+                "abi": "x86_64-linux-gnu",
+                "config_payload": x86_purgatory_payload_id,
+                "generated_header_families": ["1414141414141414141414141414141414141414141414141414141414141414"],
+            }),
+        },
+        config_payloads = {
+            x86_purgatory_payload_id: "CONFIG_64BIT=y\nCONFIG_CC_IS_CLANG=y\nCONFIG_X86_64=y\n",
+        },
+        expected_abi = "x86_64-linux-gnu",
+        generated_headers = [":" + x86_purgatory_headers],
+        tags = fixture_tags,
+    )
+    x86_purgatory_object = name + "_x86_purgatory_object"
+    linux_object(
+        name = x86_purgatory_object,
+        arch = "x86",
+        compile_environment_id = x86_purgatory_environment_id,
+        compile_environment_index = ":" + x86_purgatory_environment_index,
+        content_id = "1717171717171717171717171717171717171717171717171717171717171717",
+        mode = "y",
+        object = "arch/x86/purgatory/kexec-purgatory.o",
+        source_input_file = 3,
+        source_input_group = 1,
+        source_input_index = ":" + x86_purgatory_source_index,
+        srcarch = "x86",
+        tags = fixture_tags,
+    )
+    x86_purgatory_object_test = x86_purgatory_object + "_actions_test"
+    _x86_purgatory_actions_test(
+        name = x86_purgatory_object_test,
+        target_under_test = ":" + x86_purgatory_object,
+    )
+    generic_header_tests.append(":" + x86_purgatory_object_test)
+
     powerpc_purgatory_headers = name + "_powerpc_purgatory_headers"
     _fake_generated_headers(
         name = powerpc_purgatory_headers,
@@ -1825,6 +2070,7 @@ def linux_objects_fail_closed_test_suite(name):
         ":" + indexed_assembly_object_test,
         ":" + indexed_object_test,
         ":" + precise_family_object_test,
+        ":" + remove_flags_object_test,
     ] + generic_header_tests
     _empty_system_certificates_test(
         name = certificate_object + "_test",

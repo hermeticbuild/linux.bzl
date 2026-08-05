@@ -18,3 +18,4 @@ module_exit(hello_exit);
 MODULE_AUTHOR("linux.bzl contributors");
 MODULE_DESCRIPTION("Example out-of-tree C module built with linux.bzl");
 MODULE_LICENSE("GPL");
+MODULE_VERSION("1.0");

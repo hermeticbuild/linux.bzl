@@ -107,6 +107,13 @@ linux_images.image(
     source = "@e2e_linux_6_18_39//:Kconfig",
 )
 linux_images.image(
+    name = "e2e_cnic_x86_64",
+    config = "//:cnic.config",
+    config_mode = "allnoconfig",
+    platform = "//:linux_x86_64",
+    source = "@e2e_linux_6_18_39//:Kconfig",
+)
+linux_images.image(
     name = "e2e_verity_x86_64",
     config = "//:verity.config",
     platform = "//:linux_x86_64",
@@ -151,12 +158,18 @@ linux_images.overlay(
     config = "//:modversions.config",
     image = "e2e_aarch64",
 )
+linux_images.overlay(
+    name = "srcversions",
+    config = "//:srcversions.config",
+    image = "e2e_x86_64",
+)
 use_repo(
     linux_images,
     "e2e_6_12_96_aarch64",
     "e2e_6_12_96_x86_64",
     "e2e_aarch64",
     "e2e_armv7",
+    "e2e_cnic_x86_64",
     "e2e_kvm_x86_64",
     "e2e_rust_6_12_96_aarch64",
     "e2e_rust_6_12_96_x86_64",

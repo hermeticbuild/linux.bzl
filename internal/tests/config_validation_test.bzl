@@ -34,6 +34,7 @@ def _config_validation_supported_test_impl(ctx):
     for config in [
         {"CONFIG_KCSAN": "y"},
         {"CONFIG_MODVERSIONS": "y"},
+        {"CONFIG_MODULE_SRCVERSION_ALL": "y"},
         {
             "CONFIG_BASIC_MODVERSIONS": "y",
             "CONFIG_MODVERSIONS": "y",
@@ -78,10 +79,6 @@ def config_validation_test_suite(name):
         "native_cpu": (
             {"CONFIG_X86_NATIVE_CPU": "y"},
             "CONFIG_X86_NATIVE_CPU",
-        ),
-        "srcversion": (
-            {"CONFIG_MODULE_SRCVERSION_ALL": "y"},
-            "module versioning",
         ),
         "trim_unused_ksyms": (
             {"CONFIG_TRIM_UNUSED_KSYMS": "y"},

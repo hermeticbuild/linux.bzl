@@ -276,8 +276,8 @@
   "moduleExtensions": {
     "@@linux.bzl+//:extensions.bzl%linux_images": {
       "os:linux,arch:amd64": {
-        "bzlTransitiveDigest": "VKeWW4FolCR/HuXnKZEUnWijBmYGaoYI4j9Kg+bs6Kc=",
-        "usagesDigest": "tbh+HgXV+3aLkVonNGYZwseHj2p7IBJe2RmuCjsCaCo=",
+        "bzlTransitiveDigest": "i8JU4u+DHOljB6j2Oe7hzT5Ne5gyu9R2+/3nvIJYk5A=",
+        "usagesDigest": "U/85JI7pPNiJN46Hvyr+YQQbTZLaVxv2fqqBAIog+ZY=",
         "recordedInputs": [
           "REPO_MAPPING:,e2e_linux_6_12_96 +linux_source_repository+e2e_linux_6_12_96",
           "REPO_MAPPING:,e2e_linux_6_18_39 +linux_source_repository+e2e_linux_6_18_39",
@@ -528,6 +528,63 @@
                 "armv7": "e2e_armv7__linux_graph__armv7"
               },
               "platform": "@@//:linux_armv7",
+              "variants": []
+            }
+          },
+          "e2e_cnic_x86_64__linux_graph__x86_64": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
+            "attributes": {
+              "config": "@@//:cnic.config",
+              "config_mode": "allnoconfig",
+              "overlays": {},
+              "platform": "@@//:linux_x86_64",
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig",
+              "target_profile": "x86_64",
+              "linux_arch": "x86",
+              "target_triple": "x86_64-linux-gnu"
+            }
+          },
+          "e2e_cnic_x86_64__linux_graph__aarch64": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
+            "attributes": {
+              "config": "@@//:cnic.config",
+              "config_mode": "allnoconfig",
+              "overlays": {},
+              "platform": "@@//:linux_x86_64",
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig",
+              "target_profile": "aarch64",
+              "linux_arch": "arm64",
+              "target_triple": "aarch64-linux-gnu"
+            }
+          },
+          "e2e_cnic_x86_64__linux_graph__armv7": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
+            "attributes": {
+              "config": "@@//:cnic.config",
+              "config_mode": "allnoconfig",
+              "overlays": {},
+              "platform": "@@//:linux_x86_64",
+              "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
+              "probe_ld": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/ld.lld",
+              "source": "@@+linux_source_repository+e2e_linux_6_18_39//:Kconfig",
+              "target_profile": "armv7",
+              "linux_arch": "arm",
+              "target_triple": "arm-linux-gnueabi"
+            }
+          },
+          "e2e_cnic_x86_64": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_extension.bzl%_linux_image_facade_repository",
+            "attributes": {
+              "graph_repos": {
+                "x86_64": "e2e_cnic_x86_64__linux_graph__x86_64",
+                "aarch64": "e2e_cnic_x86_64__linux_graph__aarch64",
+                "armv7": "e2e_cnic_x86_64__linux_graph__armv7"
+              },
+              "platform": "@@//:linux_x86_64",
               "variants": []
             }
           },
@@ -879,7 +936,8 @@
               "config": "@@//:tiny.config",
               "config_mode": "default",
               "overlays": {
-                "modversions": "@@//:modversions.config"
+                "modversions": "@@//:modversions.config",
+                "srcversions": "@@//:srcversions.config"
               },
               "platform": "@@//:linux_x86_64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
@@ -896,7 +954,8 @@
               "config": "@@//:tiny.config",
               "config_mode": "default",
               "overlays": {
-                "modversions": "@@//:modversions.config"
+                "modversions": "@@//:modversions.config",
+                "srcversions": "@@//:srcversions.config"
               },
               "platform": "@@//:linux_x86_64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
@@ -913,7 +972,8 @@
               "config": "@@//:tiny.config",
               "config_mode": "default",
               "overlays": {
-                "modversions": "@@//:modversions.config"
+                "modversions": "@@//:modversions.config",
+                "srcversions": "@@//:srcversions.config"
               },
               "platform": "@@//:linux_x86_64",
               "probe_cc": "@@llvm++llvm_toolchain_minimal+llvm-toolchain-minimal-22.1.8-linux-amd64//:bin/clang",
@@ -934,7 +994,8 @@
               },
               "platform": "@@//:linux_x86_64",
               "variants": [
-                "modversions"
+                "modversions",
+                "srcversions"
               ]
             }
           }
