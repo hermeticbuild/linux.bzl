@@ -9,6 +9,7 @@ load(
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load(":architecture_profiles.bzl", "linux_arch_values", "linux_architecture_profile_for_arch")
+load(":clang_resource_headers.bzl", "clang_resource_headers")
 load(
     ":linux_objects.bzl",
     "LinuxCompileEnvironmentIndexInfo",
@@ -161,16 +162,6 @@ def _drop_toolchain_include(path):
         "llvm++kernel_headers+linux_kernel_headers_" in path
     )
 
-def _clang_resource_include(path):
-    """Whether path is Clang's compiler-provided resource header directory."""
-    normalized = path.replace("\\", "/")
-    marker = "/lib/clang/"
-    marker_index = normalized.rfind(marker)
-    if marker_index < 0:
-        return False
-    suffix = normalized[marker_index + len(marker):].split("/")
-    return len(suffix) == 2 and bool(suffix[0]) and suffix[1] == "include"
-
 def _compile_flags(ctx, cc_toolchain, feature_configuration):
     variables = cc_common.create_compile_variables(
         feature_configuration = feature_configuration,
@@ -199,7 +190,7 @@ def _compile_flags(ctx, cc_toolchain, feature_configuration):
                 resource_path = ""
                 if index + 3 < len(flags) and flags[index + 2] == "-Xclang":
                     resource_path = flags[index + 3]
-                if not _clang_resource_include(resource_path):
+                if not clang_resource_headers.is_include(resource_path):
                     drop_count = 3
                     continue
             if index + 1 < len(flags) and flags[index + 1] == "-fno-cxx-modules":
@@ -236,6 +227,7 @@ def _compile_flags(ctx, cc_toolchain, feature_configuration):
         if flag.startswith("-isystem") and _drop_toolchain_include(flag[len("-isystem"):]):
             continue
         out.append(flag)
+    out = clang_resource_headers.ensure_include(out, cc_toolchain.all_files.to_list())
     if "-nostdinc" not in out:
         out.append("-nostdinc")
     if "-fintegrated-as" not in out:

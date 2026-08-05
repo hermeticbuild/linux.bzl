@@ -5,6 +5,7 @@ load(
     "linux_config",
 )
 load(":architecture_linking_test.bzl", "architecture_linking_test_suite")
+load(":clang_resource_headers_test.bzl", "clang_resource_headers_test")
 load(":compact_generator_test.bzl", "compact_generator_test_suite")
 load(":config_validation_test.bzl", "config_validation_test_suite")
 load(":host_cc_toolchain_test.bzl", "host_cc_toolchain_test")
@@ -24,6 +25,8 @@ package(default_visibility = ["//visibility:private"])
 compact_generator_test_suite(name = "compact_generator_tests")
 
 architecture_linking_test_suite(name = "architecture_linking_tests")
+
+clang_resource_headers_test(name = "clang_resource_headers_test")
 
 action_group_validation_test(name = "action_group_validation_test")
 

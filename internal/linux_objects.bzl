@@ -5,6 +5,7 @@ load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolch
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load(":architecture_linking.bzl", "linux_vmlinux_link_spec")
 load(":architecture_profiles.bzl", "linux_architecture_profile_for_arch")
+load(":clang_resource_headers.bzl", "clang_resource_headers")
 load(":host_cc_toolchain.bzl", "host_cc_toolchain_attr")
 load(":kconfig.bzl", "KconfigInfo")
 load(":linux_module_actions.bzl", "linux_module_actions")
@@ -352,7 +353,7 @@ def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
                 resource_path = ""
                 if index + 3 < len(flags) and flags[index + 2] == "-Xclang":
                     resource_path = flags[index + 3]
-                if not _linux_clang_resource_include(resource_path):
+                if not clang_resource_headers.is_include(resource_path):
                     drop_count = 3
                     continue
             if index + 1 < len(flags) and flags[index + 1] == "-fno-cxx-modules":
@@ -391,6 +392,7 @@ def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
         if flag.startswith("-isystem") and _linux_drop_toolchain_include(flag[len("-isystem"):]):
             continue
         out.append(flag)
+    out = clang_resource_headers.ensure_include(out, cc_toolchain.all_files.to_list())
     if "-nostdinc" not in out:
         out.append("-nostdinc")
     if "-fintegrated-as" not in out:
@@ -434,16 +436,6 @@ def _linux_drop_toolchain_include(path):
         "llvm++musl+musl_libc\\" in path or
         "llvm++kernel_headers+linux_kernel_headers_" in path
     )
-
-def _linux_clang_resource_include(path):
-    """Whether path is Clang's compiler-provided resource header directory."""
-    normalized = path.replace("\\", "/")
-    marker = "/lib/clang/"
-    marker_index = normalized.rfind(marker)
-    if marker_index < 0:
-        return False
-    suffix = normalized[marker_index + len(marker):].split("/")
-    return len(suffix) == 2 and bool(suffix[0]) and suffix[1] == "include"
 
 def _cc_target_flags(ctx, cc_toolchain, feature_configuration):
     flags = _linux_compile_flags(ctx, cc_toolchain, feature_configuration)
@@ -8603,14 +8595,16 @@ def _linux_x86_bzimage(ctx, setup_bin, vmlinux_bin):
 
 def _linux_x86_inat_tables(ctx):
     opcode_map = _source_tree_file(ctx, "arch/x86/lib/x86-opcode-map.txt")
+    inat_h = _source_tree_file(ctx, "arch/x86/include/asm/inat.h")
     out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/lib/inat-tables.c")
     args = ctx.actions.args()
     args.add("-in", opcode_map)
+    args.add("-inat_h", inat_h)
     args.add("-out", out)
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._insnattr,
-        inputs = [opcode_map],
+        inputs = [inat_h, opcode_map],
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxX86InsnAttr",
