@@ -1,0 +1,39 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@rules_go//go:def.bzl", "go_binary")
+load("//internal:map_directory_kconfig.bzl", "linux_map_directory_kconfig_spike")
+
+package(default_visibility = ["//visibility:private"])
+
+go_binary(
+    name = "validator",
+    srcs = ["validator.go"],
+    pure = "on",
+)
+
+linux_map_directory_kconfig_spike(
+    name = "compiler_capabilities",
+    srcs = [
+        "include/linux/compiler-version.h",
+        "include/linux/compiler_types.h",
+        "include/linux/kconfig.h",
+        "supported.c",
+        "unsupported.c",
+    ],
+    config = "base.config",
+    kbuild = "Kbuild",
+    kconfig = "Kconfig",
+    tags = [
+        "manual",
+        "requires-bazel-9",
+    ],
+    validator = ":validator",
+)
+
+build_test(
+    name = "compiler_capabilities_e2e_test",
+    tags = [
+        "manual",
+        "requires-bazel-9",
+    ],
+    targets = [":compiler_capabilities"],
+)

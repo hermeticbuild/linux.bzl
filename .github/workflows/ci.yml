@@ -52,7 +52,10 @@ jobs:
           targets=(//...)
           path_mapping_args=()
           if [[ -n "${BAZEL_PATH_MAPPING}" ]]; then
-            targets+=(//internal/tests:path_mapping_test)
+            targets+=(
+              //internal/tests:path_mapping_test
+              //tests/map_directory:compiler_capabilities_e2e_test
+            )
             path_mapping_args+=("${BAZEL_PATH_MAPPING}")
           fi
           bazel --host_jvm_args=-Xmx6g \

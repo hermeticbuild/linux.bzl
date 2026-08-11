@@ -1,0 +1,20 @@
+mainmenu "map_directory compiler capability fixture"
+
+if-success = $(shell,{ $(1); } >/dev/null 2>&1 && echo "$(2)" || echo "$(3)")
+success = $(if-success,$(1),y,n)
+cc-option = $(success,$(CC) -Werror $(CLANG_FLAGS) $(1) -c -x c /dev/null -o /dev/null)
+
+config 64BIT
+	def_bool y
+
+config X86
+	def_bool 64BIT
+
+config X86_64
+	def_bool X86 && 64BIT
+
+config MAP_DIRECTORY_CC_SUPPORTED
+	def_bool $(cc-option,-fno-omit-frame-pointer)
+
+config MAP_DIRECTORY_CC_UNSUPPORTED
+	def_bool $(cc-option,-fno-linux-bzl-map-directory-spike)

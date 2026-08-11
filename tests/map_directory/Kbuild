@@ -1,0 +1,4 @@
+obj-$(CONFIG_MAP_DIRECTORY_CC_SUPPORTED) += supported.o
+obj-$(CONFIG_MAP_DIRECTORY_CC_UNSUPPORTED) += unsupported.o
+
+CFLAGS_supported.o += -fno-omit-frame-pointer
