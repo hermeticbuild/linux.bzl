@@ -278,14 +278,31 @@ jobs:
         if: ${{ matrix.batch == 'x86-64-variants' }}
         working-directory: examples
         env:
+          BAZEL_AQUERY: ${{ runner.temp }}/examples-${{ matrix.batch }}.aquery.json
           BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.batch }}.bep.json
-        run: >-
-          ../.github/workflows/assert_shared_kernel_graph.sh
-          "${BAZEL_BEP}"
-          bazel-bin/x86_64_shared_graph_metadata.json
-          3533
-          4727
-          117000
+          BAZEL_TARGETS: ${{ matrix.targets }}
+        run: |
+          set -euo pipefail
+          read -r -a targets <<<"${BAZEL_TARGETS}"
+          query="deps(${targets[0]})"
+          for target in "${targets[@]:1}"; do
+            query="${query} + deps(${target})"
+          done
+          bazel \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            aquery \
+            --config=path-mapping \
+            --output=jsonproto \
+            --noinclude_artifacts \
+            --noinclude_commandline \
+            "${query}" >"${BAZEL_AQUERY}"
+          ../.github/workflows/assert_shared_kernel_graph.sh \
+            "${BAZEL_BEP}" \
+            "${BAZEL_AQUERY}" \
+            bazel-bin/x86_64_shared_graph_metadata.json \
+            3533 \
+            4727 \
+            117000
 
       - name: Upload Bazel profile
         if: ${{ !cancelled() }}

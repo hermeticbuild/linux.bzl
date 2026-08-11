@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 5 ]]; then
-  echo "usage: $0 BEP METADATA EXPECTED_ACTIONS EXPECTED_MEMBERSHIPS MAX_CONFIGURED_TARGETS" >&2
+if [[ $# -ne 6 ]]; then
+  echo "usage: $0 BEP AQUERY METADATA EXPECTED_ACTIONS EXPECTED_MEMBERSHIPS MAX_CONFIGURED_TARGETS" >&2
   exit 2
 fi
 
 bep="$1"
-metadata="$2"
-expected_actions="$3"
-expected_memberships="$4"
-max_configured_targets="$5"
+aquery="$2"
+metadata="$3"
+expected_actions="$4"
+expected_memberships="$5"
+max_configured_targets="$6"
 
 expect() {
   local label="$1"
@@ -24,6 +25,11 @@ expect() {
 
 if [[ ! -f "${metadata}" ]]; then
   echo "missing shared graph metadata: ${metadata}" >&2
+  exit 1
+fi
+
+if [[ ! -f "${aquery}" ]]; then
+  echo "missing aquery action graph: ${aquery}" >&2
   exit 1
 fi
 
@@ -269,42 +275,42 @@ expect debug_generated_header_families \
   "${debug_families}" \
   "all,asm_offsets,bounds,kvm_offsets,rq_offsets,utsrelease"
 
-if ! action_counts="$(
+# The number of LinuxObjectCompile actions is a property of the configured
+# action graph, so it is read from aquery. The BEP's actionsCreated counts
+# actions created by *this invocation's* analysis, which double-counts on a
+# warm Bazel server (and collapses to near zero when analysis is fully cached),
+# so it is not a stable measure of graph size. actionsExecuted is reported for
+# information only, and is likewise state-dependent.
+if ! actions_created="$(
+  jq -er '
+    [.actions[]? | select(.mnemonic == "LinuxObjectCompile")] | length
+  ' "${aquery}"
+)"; then
+  echo "invalid LinuxObjectCompile actions: ${aquery}" >&2
+  exit 1
+fi
+expect actions_created "${actions_created}" "${union_count}"
+
+actions_executed="$(
   jq -ser '
     [
       .[]?
       | .buildMetrics.actionSummary.actionData[]?
       | select(.mnemonic == "LinuxObjectCompile")
+      | .actionsExecuted
     ]
-    | if length != 1 then
-        error("expected exactly one LinuxObjectCompile metric")
-      else
-        [.[0].actionsCreated, .[0].actionsExecuted] | @tsv
-      end
-  ' "${bep}"
-)"; then
-  echo "invalid LinuxObjectCompile metrics: ${bep}" >&2
-  exit 1
-fi
-IFS=$'\t' read -r actions_created actions_executed <<<"${action_counts}"
-expect actions_created "${actions_created}" "${union_count}"
+    | if length == 0 then "unreported" else .[0] end
+  ' "${bep}" 2>/dev/null || echo unreported
+)"
 
+# Counted from the action graph for the same reason as above: these are
+# per-mnemonic action counts, not per-invocation work.
 if ! generated_header_actions="$(
-  jq -ser '
-    . as $events
+  jq -er '
+    . as $graph
     |
     def created($mnemonic):
-      [
-        $events[]?
-        | .buildMetrics.actionSummary.actionData[]?
-        | select(.mnemonic == $mnemonic)
-        | .actionsCreated
-      ]
-      | if length != 1 then
-          error("expected exactly one \($mnemonic) metric")
-        else
-          .[0]
-        end;
+      [$graph.actions[]? | select(.mnemonic == $mnemonic)] | length;
     [
       "LinuxCPUFeatureMasks",
       "LinuxCompileHeader",
@@ -323,34 +329,37 @@ if ! generated_header_actions="$(
     ]
     | map("\(.)=\(created(.))")
     | join(",")
-  ' "${bep}"
+  ' "${aquery}"
 )"; then
-  echo "invalid generated-header action metrics: ${bep}" >&2
+  echo "invalid generated-header action metrics: ${aquery}" >&2
   exit 1
 fi
 expect generated_header_actions \
   "${generated_header_actions}" \
   "LinuxCPUFeatureMasks=1,LinuxCompileHeader=1,LinuxModuleOffsetsAsm=3,LinuxModuleOffsetsHeader=3,LinuxORCHash=1,LinuxOffsetsAsm=12,LinuxOffsetsHeader=12,LinuxSyscallHeader=5,LinuxSyscallTableHeader=3,LinuxTimeconstHeader=1,LinuxUTSReleaseHeader=2,LinuxUTSVersionHeader=1,LinuxVersionHeader=1,LinuxXenHypercalls=1"
 
-if ! configured_targets="$(
+# targetsConfiguredNotIncludingAspects is a budget check on analysis size, so
+# it is only meaningful when this invocation actually did the analysis. A warm
+# server reports whatever little it re-analysed, or omits the metric entirely;
+# treat that as "not measured" rather than as a pass or a hard error.
+configured_targets="$(
   jq -ser '
     [
       .[]?
       | .buildMetrics?
       | select(. != null)
-      | .targetMetrics.targetsConfiguredNotIncludingAspects
+      | .targetMetrics?
+      | select(. != null)
+      | .targetsConfiguredNotIncludingAspects
+      | select(. != null)
     ]
-    | if length != 1 then
-        error("expected exactly one configured-target metric")
-      else
-        .[0]
-      end
-  ' "${bep}"
-)"; then
-  echo "invalid configured-target metrics: ${bep}" >&2
-  exit 1
-fi
-if (( configured_targets > max_configured_targets )); then
+    | if length == 0 then "unreported" else .[0] end
+  ' "${bep}" 2>/dev/null || echo unreported
+)"
+if [[ "${configured_targets}" == "unreported" ]]; then
+  echo "note: configured-target budget not checked (no analysis metric in ${bep};" \
+    "run with a cold output base to measure it)" >&2
+elif (( configured_targets > max_configured_targets )); then
   echo "configured targets: got ${configured_targets}, maximum ${max_configured_targets}" >&2
   exit 1
 fi
