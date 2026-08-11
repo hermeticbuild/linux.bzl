@@ -287,6 +287,7 @@ func run() (exitCode int) {
 		kbuildTreeMinCount       = flag.Int("kbuild_tree_min_count", 0, "Minimum number of Kbuild-like files that must be parsed during -kbuild_tree_root validation")
 		compactMetadataOut       = flag.String("compact_metadata_out", "", "Path to write compact fragment-keyed Linux metadata JSON")
 		compactBuildfileOut      = flag.String("compact_buildfile_out", "", "Path to write a combined compact object/image BUILD file")
+		compactActionPlanOut     = flag.String("compact_action_plan_out", "", "Directory to write a map_directory compact compile action plan")
 		compactBaseConfig        = flag.String("compact_base_config", "", "Base config name for delta image BUILD emission")
 		compileEnvironmentABI    = flag.String("compile_environment_abi", "", "Toolchain/action ABI bound into compile environment content IDs")
 		rustProfileOut           = flag.String("rust_profile_out", "", "Path to write the source-derived Rust profile JSON")
@@ -535,7 +536,7 @@ func run() (exitCode int) {
 	}
 
 	resolvedConfigRequested := *resolveConfig != "" || *resolvedConfigOut != "" || *resolvedAutoConfOut != "" || *resolvedCmdOut != "" || *resolvedAutoconfOut != "" || *resolvedRustcCfgOut != "" || *resolvedReleaseOut != ""
-	if tree == nil && (*compactMetadataOut != "" || *compactBuildfileOut != "" || resolvedConfigRequested || *out != "") {
+	if tree == nil && (*compactMetadataOut != "" || *compactBuildfileOut != "" || *compactActionPlanOut != "" || resolvedConfigRequested || *out != "") {
 		fmt.Fprintf(os.Stderr, "-root is required for Kconfig outputs\n")
 		return 2
 	}
@@ -554,7 +555,7 @@ func run() (exitCode int) {
 		}
 	}
 
-	if *compactMetadataOut != "" || *compactBuildfileOut != "" {
+	if *compactMetadataOut != "" || *compactBuildfileOut != "" || *compactActionPlanOut != "" {
 		headerLabels, err := compactGeneratedHeaderLabels(
 			compactConfigInputs,
 			generatedHeadersByConfig,
@@ -590,6 +591,12 @@ func run() (exitCode int) {
 			}
 			if err := os.WriteFile(workspacePath(*compactMetadataOut), data, 0o644); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to write compact metadata: %v\n", err)
+				return 1
+			}
+		}
+		if *compactActionPlanOut != "" {
+			if err := metadata.WriteCompactActionPlan(workspacePath(*compactActionPlanOut)); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to write compact action plan: %v\n", err)
 				return 1
 			}
 		}
@@ -631,7 +638,7 @@ func run() (exitCode int) {
 
 	// Only emit the JSON dump when explicitly requested, or when no output was
 	// requested at all (preserves the prior default of dumping to stdout).
-	if *out == "" && (*kbuildOut != "" || *kbuildTreeOut != "" || *compactMetadataOut != "" || *compactBuildfileOut != "" || *rustProfileOut != "" || resolvedConfigRequested) {
+	if *out == "" && (*kbuildOut != "" || *kbuildTreeOut != "" || *compactMetadataOut != "" || *compactBuildfileOut != "" || *compactActionPlanOut != "" || *rustProfileOut != "" || resolvedConfigRequested) {
 		return 0
 	}
 

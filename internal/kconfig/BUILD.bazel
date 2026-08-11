@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "buildmerge.go",
         "compact.go",
+        "compact_action_plan.go",
         "compact_content.go",
         "config.go",
         "config_footprint.go",
@@ -37,6 +38,7 @@ go_library(
 go_test(
     name = "kconfig_test",
     srcs = [
+        "compact_action_plan_test.go",
         "compact_test.go",
         "config_footprint_test.go",
         "config_test.go",
