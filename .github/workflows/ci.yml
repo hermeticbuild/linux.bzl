@@ -55,6 +55,9 @@ jobs:
             targets+=(
               //internal/tests:path_mapping_test
               //tests/map_directory:compiler_capabilities_e2e_test
+              //tests/map_directory:distinct_compiler_plan_identities_e2e_test
+              //tests/map_directory:gcc_compiler_capabilities_e2e_test
+              //tests/map_directory:upstream_gcc_kconfig_e2e_test
             )
             path_mapping_args+=("${BAZEL_PATH_MAPPING}")
           fi

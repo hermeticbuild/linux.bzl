@@ -145,6 +145,13 @@ func TestWriteCompactActionPlanRejectsUnsupportedMetadata(t *testing.T) {
 			want: "unsupported generated-object dependencies",
 		},
 		{
+			name: "remove flags",
+			mutate: func(_ *CompactMetadata, variant *CompactObjectVariant) {
+				variant.RemoveFlags = []string{"-Werror"}
+			},
+			want: "unsupported Kbuild remove flags",
+		},
+		{
 			name: "assembly source",
 			mutate: func(_ *CompactMetadata, variant *CompactObjectVariant) {
 				variant.Source = strings.TrimSuffix(variant.Source, ".c") + ".S"

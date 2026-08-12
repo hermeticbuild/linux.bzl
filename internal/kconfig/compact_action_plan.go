@@ -243,6 +243,9 @@ func validateCompactActionPlanVariant(variant CompactObjectVariant) error {
 	if len(variant.Deps) != 0 {
 		return fmt.Errorf("object %q has unsupported generated-object dependencies", variant.Object)
 	}
+	if len(variant.RemoveFlags) != 0 {
+		return fmt.Errorf("object %q has unsupported Kbuild remove flags", variant.Object)
+	}
 	if compactGroupedSpecialObjects[variant.Object] ||
 		strings.HasSuffix(variant.Object, ".asn1.o") ||
 		strings.HasSuffix(variant.Object, ".pi.o") ||

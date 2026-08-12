@@ -1,0 +1,22 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "mapdirectoryrecipe_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/mapdirectoryrecipe",
+    visibility = ["//visibility:private"],
+    deps = ["//internal/kconfig"],
+)
+
+go_binary(
+    name = "mapdirectoryrecipe",
+    embed = [":mapdirectoryrecipe_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "mapdirectoryrecipe_test",
+    srcs = ["main_test.go"],
+    embed = [":mapdirectoryrecipe_lib"],
+    deps = ["//internal/kconfig"],
+)

@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,39 +19,67 @@ import (
 )
 
 const (
-	linuxProbeTimeout     = 20 * time.Second
-	linuxProbeOutputLimit = 64 << 10
+	linuxProbeTimeout                = 20 * time.Second
+	linuxProbeOutputLimit            = 64 << 10
+	linuxProbeMinimumLLVMVersion     = 150000
+	linuxProbeMinimumGCCVersion      = 80100
+	linuxProbeMinimumBinutilsVersion = 23000
 )
 
-// LinuxToolProbeOptions describes integrity-pinned host tools used to answer
+// LinuxToolProbeOptions describes integrity-pinned compiler tools used to answer
 // Kconfig and Kbuild capability probes. Tools are executed directly with argv;
 // probe text is never passed to a command shell.
 type LinuxToolProbeOptions struct {
 	Profile      string
 	Architecture string
 	TargetTriple string
-	ClangPath    string
-	LLDPath      string
-	TempDir      string
-	Identity     string
-	Timeout      time.Duration
-	OutputLimit  int
+	CompilerPath string
+	LinkerPath   string
+	ArchiverPath string
+	NMPath       string
+	ObjcopyPath  string
+	CompilerArgs []string
+	// LinkerDriverArgs are the selected CcToolchain's link-action flags that
+	// accompany CompilerArgs only when the compiler driver performs a link.
+	LinkerDriverArgs []string
+	// DisableCCCanLink and DisableGCCPlugins make capabilities whose complete
+	// runtime closure is unavailable fail closed without consulting ambient
+	// executor files. Both default to false for existing callers.
+	DisableCCCanLink  bool
+	DisableGCCPlugins bool
+	TempDir           string
+	Identity          string
+	Timeout           time.Duration
+	OutputLimit       int
 }
 
 // LinuxToolProbe executes and memoizes safe compiler/linker capability probes.
 type LinuxToolProbe struct {
-	profile      LinuxTargetProfile
-	clangPath    string
-	lldPath      string
-	tempDir      string
-	identity     string
-	timeout      time.Duration
-	outputLimit  int
-	mu           sync.Mutex
-	cache        map[string]bool
-	clangVersion string
-	clangCode    int
-	lldCode      int
+	profile           LinuxTargetProfile
+	compilerPath      string
+	linkerPath        string
+	archiverPath      string
+	nmPath            string
+	objcopyPath       string
+	compilerArgs      []string
+	linkerDriverArgs  []string
+	disableCCCanLink  bool
+	disableGCCPlugins bool
+	tempDir           string
+	identity          string
+	timeout           time.Duration
+	outputLimit       int
+	mu                sync.Mutex
+	cache             map[string]bool
+	compilerFamily    string
+	compilerName      string
+	compilerVersion   string
+	compilerCode      int
+	assemblerName     string
+	assemblerCode     int
+	linkerName        string
+	linkerVersion     string
+	linkerCode        int
 }
 
 func NewLinuxToolProbe(opts LinuxToolProbeOptions) (*LinuxToolProbe, error) {
@@ -63,18 +90,42 @@ func NewLinuxToolProbe(opts LinuxToolProbeOptions) (*LinuxToolProbe, error) {
 	if err := profile.ValidateTargetIdentity(opts.Architecture, opts.TargetTriple); err != nil {
 		return nil, err
 	}
-	if opts.ClangPath == "" || opts.LLDPath == "" {
-		return nil, fmt.Errorf("real Linux probes require both clang and ld.lld paths")
+	if opts.CompilerPath == "" || opts.LinkerPath == "" || opts.ArchiverPath == "" || opts.NMPath == "" || opts.ObjcopyPath == "" {
+		return nil, fmt.Errorf("real Linux probes require compiler, linker, archiver, nm, and objcopy paths")
 	}
-	clangPath, err := filepath.Abs(opts.ClangPath)
+	if err := validateCompilerPrefixArgs(opts.CompilerArgs); err != nil {
+		return nil, fmt.Errorf("invalid configured compiler prefix: %w", err)
+	}
+	if err := validateLinkerDriverPrefixArgs(opts.LinkerDriverArgs); err != nil {
+		return nil, fmt.Errorf("invalid configured linker-driver prefix: %w", err)
+	}
+	compilerPath, err := filepath.Abs(opts.CompilerPath)
 	if err != nil {
-		return nil, fmt.Errorf("resolve clang path: %w", err)
+		return nil, fmt.Errorf("resolve compiler path: %w", err)
 	}
-	lldPath, err := filepath.Abs(opts.LLDPath)
+	linkerPath, err := filepath.Abs(opts.LinkerPath)
 	if err != nil {
-		return nil, fmt.Errorf("resolve ld.lld path: %w", err)
+		return nil, fmt.Errorf("resolve linker path: %w", err)
 	}
-	for name, path := range map[string]string{"clang": clangPath, "ld.lld": lldPath} {
+	archiverPath, err := filepath.Abs(opts.ArchiverPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve archiver path: %w", err)
+	}
+	nmPath, err := filepath.Abs(opts.NMPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve nm path: %w", err)
+	}
+	objcopyPath, err := filepath.Abs(opts.ObjcopyPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve objcopy path: %w", err)
+	}
+	for name, path := range map[string]string{
+		"compiler": compilerPath,
+		"linker":   linkerPath,
+		"archiver": archiverPath,
+		"nm":       nmPath,
+		"objcopy":  objcopyPath,
+	} {
 		info, statErr := os.Stat(path)
 		if statErr != nil {
 			return nil, fmt.Errorf("stat probe %s %q: %w", name, path, statErr)
@@ -83,16 +134,14 @@ func NewLinuxToolProbe(opts LinuxToolProbeOptions) (*LinuxToolProbe, error) {
 			return nil, fmt.Errorf("probe %s %q is not an executable file", name, path)
 		}
 	}
-	identity := opts.Identity
-	if identity == "" {
-		identity, err = toolPairIdentity(clangPath, lldPath)
-		if err != nil {
-			return nil, err
-		}
-	}
 	p := &LinuxToolProbe{
-		profile: profile, clangPath: clangPath, lldPath: lldPath,
-		tempDir: opts.TempDir, identity: identity, cache: map[string]bool{},
+		profile: profile, compilerPath: compilerPath, linkerPath: linkerPath,
+		archiverPath: archiverPath, nmPath: nmPath, objcopyPath: objcopyPath,
+		compilerArgs:      append([]string(nil), opts.CompilerArgs...),
+		linkerDriverArgs:  append([]string(nil), opts.LinkerDriverArgs...),
+		disableCCCanLink:  opts.DisableCCCanLink,
+		disableGCCPlugins: opts.DisableGCCPlugins,
+		tempDir:           opts.TempDir, identity: opts.Identity, cache: map[string]bool{},
 		timeout: opts.Timeout, outputLimit: opts.OutputLimit,
 	}
 	if p.timeout <= 0 {
@@ -103,29 +152,172 @@ func NewLinuxToolProbe(opts LinuxToolProbeOptions) (*LinuxToolProbe, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
 	defer cancel()
-	clangText, err := p.run(ctx, clangPath, []string{"--version"}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("identify clang probe tool: %w", err)
+	// Linux's cc-version.sh identifies the compiler from predefined macros,
+	// not from the branding printed by --version.  First use the unadorned
+	// version command only as a compatibility hint for the legacy implicit
+	// Clang target prefix, then make the configured preprocessing invocation
+	// authoritative below.  In particular, this permits compiler wrappers
+	// whose own --version output does not identify the wrapped frontend.
+	compilerText, versionErr := p.run(ctx, compilerPath, []string{"--version"}, nil)
+	if versionErr != nil {
+		if _, ok := versionErr.(*exec.ExitError); !ok {
+			return nil, fmt.Errorf("read compiler version text: %w", versionErr)
+		}
 	}
-	p.clangVersion, p.clangCode, err = parseLLVMVersion(clangText, "clang")
+	if family, name, _, code, parseErr := parseCompilerVersion(compilerText); parseErr == nil {
+		p.compilerFamily = family
+		p.compilerName = name
+		p.compilerCode = code
+	}
+	configuredCompilerArgs := p.configuredCompilerArgs()
+	if len(configuredCompilerArgs) != 0 {
+		versionArgs := append(configuredCompilerArgs, "--version")
+		compilerText, versionErr = p.run(ctx, compilerPath, versionArgs, nil)
+		if versionErr != nil {
+			if _, ok := versionErr.(*exec.ExitError); !ok {
+				return nil, fmt.Errorf("read configured compiler version text: %w", versionErr)
+			}
+		}
+	}
+	p.compilerVersion = strings.TrimSpace(strings.SplitN(compilerText, "\n", 2)[0])
+	compilerInfo, err := p.identifyConfiguredCompiler(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if p.clangCode != linuxProbeCCVersion {
-		return nil, fmt.Errorf("probe clang version is %d, want pinned LLVM %d", p.clangCode, linuxProbeCCVersion)
-	}
-	lldText, err := p.run(ctx, lldPath, []string{"--version"}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("identify ld.lld probe tool: %w", err)
-	}
-	_, p.lldCode, err = parseLLVMVersion(lldText, "LLD")
+	p.compilerFamily, p.compilerName, p.compilerCode, err = parseCompilerMacroIdentity(compilerInfo)
 	if err != nil {
 		return nil, err
 	}
-	if p.lldCode != linuxProbeLDVersion {
-		return nil, fmt.Errorf("probe ld.lld version is %d, want pinned LLVM %d", p.lldCode, linuxProbeLDVersion)
+	if p.compilerFamily == "clang" && p.compilerCode < linuxProbeMinimumLLVMVersion {
+		return nil, fmt.Errorf("probe clang version is %d, want at least Linux 6.18 LLVM minimum %d", p.compilerCode, linuxProbeMinimumLLVMVersion)
 	}
+	if p.compilerFamily == "gcc" && p.compilerCode < linuxProbeMinimumGCCVersion {
+		return nil, fmt.Errorf("probe GCC version is %d, want at least %d", p.compilerCode, linuxProbeMinimumGCCVersion)
+	}
+	linkerText, err := p.run(ctx, linkerPath, []string{"--version"}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("identify linker probe tool: %w", err)
+	}
+	p.linkerName, p.linkerVersion, p.linkerCode, err = parseLinkerVersion(linkerText)
+	if err != nil {
+		return nil, err
+	}
+	switch p.linkerName {
+	case linuxProbeLDName:
+		if p.linkerCode < linuxProbeMinimumLLVMVersion {
+			return nil, fmt.Errorf("probe ld.lld version is %d, want at least Linux 6.18 LLVM minimum %d", p.linkerCode, linuxProbeMinimumLLVMVersion)
+		}
+	case "BFD":
+		if p.linkerCode < linuxProbeMinimumBinutilsVersion {
+			return nil, fmt.Errorf("probe GNU ld version is %d, want at least %d", p.linkerCode, linuxProbeMinimumBinutilsVersion)
+		}
+	default:
+		return nil, fmt.Errorf("probe linker has unsupported family %q", p.linkerName)
+	}
+	assemblerText := compilerText
+	integratedAssembler := false
+	if p.compilerFamily == "clang" {
+		integratedAssembler, err = p.detectClangIntegratedAssembler(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if integratedAssembler {
+		p.assemblerName = linuxProbeASName
+		p.assemblerCode = linuxProbeASVersion
+	} else {
+		assemblerArgs := append(p.configuredCompilerArgs(), "-Wa,--version", "-c", "-x", "assembler-with-cpp", os.DevNull, "-o", os.DevNull)
+		assemblerText, err = p.run(ctx, compilerPath, assemblerArgs, nil)
+		if err != nil {
+			return nil, fmt.Errorf("identify assembler through compiler driver: %w", err)
+		}
+		p.assemblerName, p.assemblerCode, err = parseGNUAssemblerVersion(assemblerText)
+		if err != nil {
+			return nil, err
+		}
+		if p.assemblerCode < linuxProbeMinimumBinutilsVersion {
+			return nil, fmt.Errorf("probe GNU assembler version is %d, want at least %d", p.assemblerCode, linuxProbeMinimumBinutilsVersion)
+		}
+	}
+	archiverText, err := p.run(ctx, archiverPath, []string{"--version"}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("identify archiver probe tool: %w", err)
+	}
+	nmText, err := p.run(ctx, nmPath, []string{"--version"}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("identify nm probe tool: %w", err)
+	}
+	objcopyText, err := p.run(ctx, objcopyPath, []string{"--version"}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("identify objcopy probe tool: %w", err)
+	}
+	if p.identity == "" {
+		p.identity, err = toolIdentityWithVersionLines(
+			[]string{compilerText, compilerInfo, assemblerText, linkerText, archiverText, nmText, objcopyText},
+			compilerPath,
+			linkerPath,
+			archiverPath,
+			nmPath,
+			objcopyPath,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	p.identity = extendToolIdentity(
+		p.identity,
+		p.profile,
+		p.compilerArgs,
+		p.linkerDriverArgs,
+		!p.disableCCCanLink,
+		!p.disableGCCPlugins,
+	)
 	return p, nil
+}
+
+const linuxCompilerIdentitySource = `#if defined(__clang__)
+Clang __clang_major__ __clang_minor__ __clang_patchlevel__
+#elif defined(__GNUC__)
+GCC __GNUC__ __GNUC_MINOR__ __GNUC_PATCHLEVEL__
+#else
+unknown
+#endif
+`
+
+// identifyConfiguredCompiler reproduces the substantive part of Linux's
+// scripts/cc-version.sh: preprocess predefined compiler macros through the
+// complete configured compiler prefix.  stderr is intentionally ignored just
+// as cc-version.sh redirects it, while a non-zero compiler exit remains fatal.
+func (p *LinuxToolProbe) identifyConfiguredCompiler(ctx context.Context) (string, error) {
+	args := append(p.configuredCompilerArgs(), "-E", "-P", "-x", "c", "-")
+	stdout, _, err := p.runSeparate(ctx, p.compilerPath, args, []byte(linuxCompilerIdentitySource))
+	if err != nil {
+		return "", fmt.Errorf("identify configured compiler from predefined macros: %w", err)
+	}
+	return stdout, nil
+}
+
+var clangCC1AssemblerPattern = regexp.MustCompile(`(?:^|[\s"])-cc1as(?:[\s"]|$)`)
+
+func (p *LinuxToolProbe) detectClangIntegratedAssembler(ctx context.Context) (bool, error) {
+	selected := ""
+	for _, arg := range p.configuredCompilerArgs() {
+		if arg == "-fintegrated-as" || arg == "-fno-integrated-as" {
+			selected = arg
+		}
+	}
+	if selected != "" {
+		return selected == "-fintegrated-as", nil
+	}
+	args := append(p.configuredCompilerArgs(), "-###", "-c", "-x", "assembler-with-cpp", os.DevNull, "-o", os.DevNull)
+	trace, err := p.run(ctx, p.compilerPath, args, nil)
+	if err != nil {
+		return false, fmt.Errorf("identify Clang assembler selection: %w", err)
+	}
+	if strings.TrimSpace(trace) == "" {
+		return false, fmt.Errorf("identify Clang assembler selection: empty -### output")
+	}
+	return clangCC1AssemblerPattern.MatchString(trace), nil
 }
 
 func probeToolModeIsExecutable(goos string, mode os.FileMode) bool {
@@ -140,7 +332,85 @@ func probeToolModeIsExecutable(goos string, mode os.FileMode) bool {
 
 func (p *LinuxToolProbe) Identity() string { return p.identity }
 
-func toolPairIdentity(paths ...string) (string, error) {
+func (p *LinuxToolProbe) CompilerFamily() string { return p.compilerFamily }
+
+func (p *LinuxToolProbe) CompilerVersionText() string { return p.compilerVersion }
+
+func (p *LinuxToolProbe) ClangFlags() string {
+	if p.compilerFamily != "clang" {
+		return ""
+	}
+	if p.assemblerName == linuxProbeASName {
+		return "-fintegrated-as"
+	}
+	return "-fno-integrated-as"
+}
+
+func (p *LinuxToolProbe) compilerToolName() string {
+	return linuxProbeToolName(p.compilerPath)
+}
+
+func (p *LinuxToolProbe) linkerToolName() string {
+	return linuxProbeToolName(p.linkerPath)
+}
+
+func (p *LinuxToolProbe) ArchiverPath() string { return p.archiverPath }
+
+func (p *LinuxToolProbe) NMPath() string { return p.nmPath }
+
+func (p *LinuxToolProbe) ObjcopyPath() string { return p.objcopyPath }
+
+func probeToolValueMatches(value, selectedPath string) bool {
+	value = strings.Trim(value, `"'`)
+	if value == "" {
+		return false
+	}
+	if absolute, err := filepath.Abs(value); err == nil && filepath.Clean(absolute) == filepath.Clean(selectedPath) {
+		return true
+	}
+	return !strings.ContainsAny(value, `/\\`) && linuxProbeToolName(value) == linuxProbeToolName(selectedPath)
+}
+
+func (p *LinuxToolProbe) configuredCompilerArgs() []string {
+	if len(p.compilerArgs) != 0 {
+		return append([]string(nil), p.compilerArgs...)
+	}
+	// Before callers could pass the configured CcToolchain command line, the
+	// measured probe always supplied Clang's target explicitly. Preserve that
+	// behavior for a legacy caller probing a non-host Linux target. GCC has no
+	// equivalent driver option; a GCC cross compiler must encode its target in
+	// the selected executable or in the configured compiler prefix.
+	if p.compilerFamily == "clang" && !linuxProbeProfileMatchesHost(p.profile) {
+		return []string{"--target=" + p.profile.TargetTriple}
+	}
+	return nil
+}
+
+func linuxProbeProfileMatchesHost(profile LinuxTargetProfile) bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	switch runtime.GOARCH {
+	case "amd64":
+		return profile.Name == "x86_64"
+	case "arm64":
+		return profile.Name == "aarch64"
+	case "arm":
+		return profile.Name == "armv7"
+	case "riscv64":
+		return profile.Name == "riscv64"
+	case "ppc64le":
+		return profile.Name == "ppc64le"
+	default:
+		return false
+	}
+}
+
+func toolIdentity(paths ...string) (string, error) {
+	return toolIdentityWithVersionLines(nil, paths...)
+}
+
+func toolIdentityWithVersionLines(versionOutputs []string, paths ...string) (string, error) {
 	h := sha256.New()
 	for _, path := range paths {
 		file, err := os.Open(path)
@@ -157,10 +427,106 @@ func toolPairIdentity(paths ...string) (string, error) {
 		}
 		h.Write([]byte{0})
 	}
+	for _, output := range versionOutputs {
+		line := strings.TrimSpace(strings.SplitN(output, "\n", 2)[0])
+		h.Write([]byte(line))
+		h.Write([]byte{0})
+	}
 	return "sha256-" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
+func extendToolIdentity(base string, profile LinuxTargetProfile, compilerArgs, linkerDriverArgs []string, policy ...bool) string {
+	allowCCCanLink := true
+	allowGCCPlugins := true
+	if len(policy) > 0 {
+		allowCCCanLink = policy[0]
+	}
+	if len(policy) > 1 {
+		allowGCCPlugins = policy[1]
+	}
+	h := sha256.New()
+	values := append([]string{
+		"linux.bzl/measured-toolchain/v2",
+		base,
+		profile.Name,
+		profile.TargetTriple,
+		"compiler-args",
+	}, compilerArgs...)
+	values = append(values, "linker-driver-args")
+	values = append(values, linkerDriverArgs...)
+	values = append(values,
+		"allow-cc-can-link", strconv.FormatBool(allowCCCanLink),
+		"allow-gcc-plugins", strconv.FormatBool(allowGCCPlugins),
+	)
+	for _, value := range values {
+		fmt.Fprintf(h, "%d:", len(value))
+		h.Write([]byte(value))
+	}
+	return "sha256-" + hex.EncodeToString(h.Sum(nil))
+}
+
+func validateCompilerPrefixArgs(args []string) error {
+	for i, arg := range args {
+		if err := validateProbeToken(arg); err != nil {
+			return fmt.Errorf("argument %d: %w", i, err)
+		}
+		if strings.HasPrefix(arg, "@") {
+			return fmt.Errorf("response-file argument %q is prohibited", arg)
+		}
+		switch arg {
+		case "-c", "-S", "-E", "-M", "-MM", "-MD", "-MMD", "-o", "--output", "-MF", "-MT", "-MQ", "-MJ", "--serialize-diagnostics", "-save-temps", "--save-temps":
+			return fmt.Errorf("compiler-controlled input, output, or mode argument %q is prohibited", arg)
+		}
+		for _, prefix := range []string{
+			"--output=", "-MF=", "-MJ=", "--serialize-diagnostics=", "-save-temps=", "--save-temps=",
+		} {
+			if strings.HasPrefix(arg, prefix) {
+				return fmt.Errorf("compiler-controlled output argument %q is prohibited", arg)
+			}
+		}
+	}
+	return nil
+}
+
+func validateLinkerDriverPrefixArgs(args []string) error {
+	expectOperand := ""
+	for i, arg := range args {
+		if err := validateProbeToken(arg); err != nil {
+			return fmt.Errorf("argument %d: %w", i, err)
+		}
+		if expectOperand != "" {
+			if strings.HasPrefix(arg, "-") || strings.ContainsAny(arg, `\`) {
+				return fmt.Errorf("unsafe %s operand %q", expectOperand, arg)
+			}
+			expectOperand = ""
+			continue
+		}
+		switch arg {
+		case "-c", "-S", "-E", "-M", "-MM", "-MD", "-MMD", "-o", "--output", "-MF", "-MT", "-MQ", "-MJ", "--serialize-diagnostics", "-save-temps", "--save-temps":
+			return fmt.Errorf("linker-driver-controlled input, output, or mode argument %q is prohibited", arg)
+		}
+		for _, prefix := range []string{
+			"--output=", "-MF=", "-MJ=", "--serialize-diagnostics=", "-save-temps=", "--save-temps=",
+		} {
+			if strings.HasPrefix(arg, prefix) {
+				return fmt.Errorf("linker-driver-controlled output argument %q is prohibited", arg)
+			}
+		}
+		if !strings.HasPrefix(arg, "-") {
+			return fmt.Errorf("linker-driver input or positional argument %q is prohibited", arg)
+		}
+		if arg == "-target" || arg == "-resource-dir" {
+			expectOperand = arg
+		}
+	}
+	if expectOperand != "" {
+		return fmt.Errorf("missing operand for final linker-driver option %s", expectOperand)
+	}
+	return nil
+}
+
 var llvmVersionPattern = regexp.MustCompile(`(?i)(?:clang version|LLD(?: version)?) ([0-9]+)\.([0-9]+)\.([0-9]+)`)
+var semanticVersionPattern = regexp.MustCompile(`([0-9]+)\.([0-9]+)(?:\.([0-9]+))?`)
 
 func parseLLVMVersion(output, tool string) (string, int, error) {
 	line := strings.TrimSpace(strings.SplitN(output, "\n", 2)[0])
@@ -177,6 +543,85 @@ func parseLLVMVersion(output, tool string) (string, int, error) {
 	return line, major*10000 + minor*100 + patch, nil
 }
 
+func parseCompilerVersion(output string) (string, string, string, int, error) {
+	line := strings.TrimSpace(strings.SplitN(output, "\n", 2)[0])
+	lower := strings.ToLower(line)
+	if strings.Contains(lower, "clang version") {
+		text, code, err := parseLLVMVersion(line, "clang")
+		return "clang", linuxProbeCCName, text, code, err
+	}
+	if strings.Contains(lower, "gcc") || strings.Contains(lower, "gnu compiler collection") {
+		code, err := parseLastSemanticVersion(line, "GCC")
+		return "gcc", "GCC", line, code, err
+	}
+	return "", "", "", 0, fmt.Errorf("probe compiler returned an unsupported version line %q", line)
+}
+
+func parseCompilerMacroIdentity(output string) (string, string, int, error) {
+	fields := strings.Fields(output)
+	if len(fields) < 4 || (fields[0] != "Clang" && fields[0] != "GCC") {
+		return "", "", 0, fmt.Errorf("configured compiler returned unsupported predefined macros %q", strings.TrimSpace(output))
+	}
+	parts := [3]int{}
+	for i := range parts {
+		value, err := strconv.Atoi(fields[i+1])
+		if err != nil || value < 0 || (i != 0 && value > 99) {
+			return "", "", 0, fmt.Errorf("configured compiler returned invalid macro identity %q", strings.TrimSpace(output))
+		}
+		parts[i] = value
+	}
+	if parts[0] == 0 {
+		return "", "", 0, fmt.Errorf("configured compiler returned invalid macro identity %q", strings.TrimSpace(output))
+	}
+	if fields[0] == "Clang" {
+		return "clang", linuxProbeCCName, parts[0]*10000 + parts[1]*100 + parts[2], nil
+	}
+	return "gcc", "GCC", parts[0]*10000 + parts[1]*100 + parts[2], nil
+}
+
+func parseLinkerVersion(output string) (string, string, int, error) {
+	line := strings.TrimSpace(strings.SplitN(output, "\n", 2)[0])
+	if strings.Contains(strings.ToLower(line), "lld") {
+		text, code, err := parseLLVMVersion(line, "LLD")
+		return linuxProbeLDName, text, code, err
+	}
+	if strings.Contains(line, "GNU ld") {
+		code, err := parseLastSemanticVersion(line, "GNU ld")
+		return "BFD", line, code, err
+	}
+	return "", "", 0, fmt.Errorf("probe linker returned an unsupported version line %q", line)
+}
+
+func parseGNUAssemblerVersion(output string) (string, int, error) {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "GNU assembler") {
+			continue
+		}
+		code, err := parseLastSemanticVersion(line, "GNU assembler")
+		return "GNU", code, err
+	}
+	return "", 0, fmt.Errorf("probe assembler returned unsupported version output %q", strings.TrimSpace(output))
+}
+
+func parseLastSemanticVersion(line, tool string) (int, error) {
+	matches := semanticVersionPattern.FindAllStringSubmatch(line, -1)
+	if len(matches) == 0 {
+		return 0, fmt.Errorf("probe %s returned an unsupported version line %q", tool, line)
+	}
+	match := matches[len(matches)-1]
+	major, _ := strconv.Atoi(match[1])
+	minor, _ := strconv.Atoi(match[2])
+	patch := 0
+	if match[3] != "" {
+		patch, _ = strconv.Atoi(match[3])
+	}
+	if minor > 99 || patch > 99 {
+		return 0, fmt.Errorf("probe %s version cannot be represented by Linux: %q", tool, line)
+	}
+	return major*10000 + minor*100 + patch, nil
+}
+
 // SupportsOption performs one controlled cc-option/as-option/ld-option probe.
 // A normal non-zero tool exit reports unsupported; malformed argv and tool
 // execution failures are errors.
@@ -190,13 +635,6 @@ func (p *LinuxToolProbe) SupportsOption(ctx context.Context, kind string, candid
 	execContext, err := sanitizeProbeContext(kind, probeContext)
 	if err != nil {
 		return false, fmt.Errorf("invalid %s context: %w", kind, err)
-	}
-	// Native CPU selection depends on the repository worker's processor, which
-	// is not represented in Bazel's repository or action cache keys. Keep the
-	// measured probe aligned with the cache-safe fixed probe policy instead of
-	// allowing the host running module resolution to change generated metadata.
-	if slices.Contains(candidate, "-march=native") {
-		return false, nil
 	}
 	key := strings.Join([]string{
 		p.identity, p.profile.Name, p.profile.TargetTriple, kind,
@@ -215,7 +653,7 @@ func (p *LinuxToolProbe) SupportsOption(ctx context.Context, kind string, candid
 	if kind == "ld_option" {
 		args := append([]string{"-v"}, execContext...)
 		args = append(args, candidate...)
-		_, err = p.run(timedCtx, p.lldPath, args, nil)
+		_, err = p.run(timedCtx, p.linkerPath, args, nil)
 	} else {
 		output, createErr := os.CreateTemp(p.tempDir, "linux-bzl-probe-*.o")
 		if createErr != nil {
@@ -231,11 +669,11 @@ func (p *LinuxToolProbe) SupportsOption(ctx context.Context, kind string, candid
 		if kind == "as_option" {
 			language = "assembler-with-cpp"
 		}
-		args := []string{"--target=" + p.profile.TargetTriple, "-Werror"}
+		args := append(p.configuredCompilerArgs(), "-Werror")
 		args = append(args, execContext...)
 		args = append(args, candidate...)
 		args = append(args, "-x", language, "-c", "-o", outputPath, "-")
-		_, err = p.run(timedCtx, p.clangPath, args, []byte("\n"))
+		_, err = p.run(timedCtx, p.compilerPath, args, []byte("\n"))
 	}
 	if err == nil {
 		supported = true
@@ -248,11 +686,42 @@ func (p *LinuxToolProbe) SupportsOption(ctx context.Context, kind string, candid
 	return supported, nil
 }
 
-// SupportsSource compiles one allowlisted Kconfig feature-test source using
-// controlled language/input/output arguments.
-func (p *LinuxToolProbe) SupportsSource(ctx context.Context, language string, candidate []string, source string) (bool, error) {
+// SupportsPreprocessorOption performs Linux's cc-option-bit check. Unlike a
+// normal cc-option, this intentionally stops after preprocessing so assembler
+// availability cannot change the selected -m32/-m64 driver flag.
+func (p *LinuxToolProbe) SupportsPreprocessorOption(ctx context.Context, candidate []string) (bool, error) {
+	if err := validateProbeCandidate("cc_option_bit", candidate); err != nil {
+		return false, fmt.Errorf("invalid cc_option_bit candidate: %w", err)
+	}
+	key := strings.Join([]string{
+		p.identity, p.profile.Name, p.profile.TargetTriple, "cc-option-bit",
+		strings.Join(candidate, "\x00"),
+	}, "\x01")
+	if supported, ok := p.cachedCapability(key); ok {
+		return supported, nil
+	}
+	timedCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	args := append(p.configuredCompilerArgs(), "-Werror")
+	args = append(args, candidate...)
+	args = append(args, "-E", "-x", "c", os.DevNull, "-o", os.DevNull)
+	_, runErr := p.run(timedCtx, p.compilerPath, args, nil)
+	supported, err := capabilityResult(runErr)
+	if err != nil {
+		return false, err
+	}
+	p.cacheCapability(key, supported)
+	return supported, nil
+}
+
+// SupportsSource runs one allowlisted Kconfig feature-test source using its
+// original compile/assembly mode and controlled input/output arguments.
+func (p *LinuxToolProbe) SupportsSource(ctx context.Context, language, mode string, candidate []string, source string) (bool, error) {
 	if language != "c" && language != "assembler-with-cpp" {
 		return false, fmt.Errorf("unsupported Linux source probe language %q", language)
+	}
+	if mode != "-c" && mode != "-S" {
+		return false, fmt.Errorf("unsupported Linux source probe mode %q", mode)
 	}
 	if len(candidate) != 0 {
 		if err := validateProbeCandidate("source", candidate); err != nil {
@@ -261,7 +730,7 @@ func (p *LinuxToolProbe) SupportsSource(ctx context.Context, language string, ca
 	}
 	digest := sha256.Sum256([]byte(source))
 	key := strings.Join([]string{
-		p.identity, p.profile.Name, p.profile.TargetTriple, "source", language,
+		p.identity, p.profile.Name, p.profile.TargetTriple, "source", language, mode,
 		strings.Join(candidate, "\x00"), hex.EncodeToString(digest[:]),
 	}, "\x01")
 	p.mu.Lock()
@@ -282,10 +751,9 @@ func (p *LinuxToolProbe) SupportsSource(ctx context.Context, language string, ca
 	defer os.Remove(outputPath)
 	timedCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
-	args := []string{"--target=" + p.profile.TargetTriple, "-Werror"}
-	args = append(args, candidate...)
-	args = append(args, "-x", language, "-c", "-o", outputPath, "-")
-	_, runErr := p.run(timedCtx, p.clangPath, args, []byte(source))
+	args := append(p.configuredCompilerArgs(), candidate...)
+	args = append(args, "-x", language, mode, "-o", outputPath, "-")
+	_, runErr := p.run(timedCtx, p.compilerPath, args, []byte(source))
 	supported := runErr == nil
 	if runErr != nil {
 		if _, ok := runErr.(*exec.ExitError); !ok {
@@ -296,6 +764,327 @@ func (p *LinuxToolProbe) SupportsSource(ctx context.Context, language string, ca
 	p.cache[key] = supported
 	p.mu.Unlock()
 	return supported, nil
+}
+
+const linuxCCCanLinkSource = `#include <stdio.h>
+int main(void)
+{
+	printf("\n");
+	return 0;
+}
+`
+
+// CanLink reproduces scripts/cc-can-link.sh with a fixed input and output.
+// Script arguments have already been separated from the recognized command;
+// only compiler options that cannot select an input, output, or plugin are
+// accepted here.
+func (p *LinuxToolProbe) CanLink(ctx context.Context, scriptArgs []string) (bool, error) {
+	if err := validateLinkDriverProbeArgs(scriptArgs); err != nil {
+		return false, fmt.Errorf("invalid cc-can-link arguments: %w", err)
+	}
+	if p.disableCCCanLink {
+		return false, nil
+	}
+	digest := sha256.Sum256([]byte(linuxCCCanLinkSource))
+	key := strings.Join([]string{
+		p.identity, p.profile.Name, p.profile.TargetTriple, "cc-can-link",
+		strings.Join(scriptArgs, "\x00"), hex.EncodeToString(digest[:]),
+	}, "\x01")
+	if supported, ok := p.cachedCapability(key); ok {
+		return supported, nil
+	}
+
+	output, err := os.CreateTemp(p.tempDir, "linux-bzl-can-link-*")
+	if err != nil {
+		return false, fmt.Errorf("create cc-can-link output: %w", err)
+	}
+	outputPath := output.Name()
+	if err := output.Close(); err != nil {
+		os.Remove(outputPath)
+		return false, fmt.Errorf("close cc-can-link output: %w", err)
+	}
+	defer os.Remove(outputPath)
+
+	timedCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	args := append(p.configuredCompilerArgs(), p.linkerDriverArgs...)
+	args = append(args, scriptArgs...)
+	args = append(args, "-Werror", "-Wl,--fatal-warnings", "-x", "c", "-", "-o", outputPath)
+	_, runErr := p.run(timedCtx, p.compilerPath, args, []byte(linuxCCCanLinkSource))
+	supported, err := capabilityResult(runErr)
+	if err != nil {
+		return false, err
+	}
+	if supported {
+		if err := requireProbeRegularFile(outputPath, "cc-can-link executable"); err != nil {
+			return false, err
+		}
+	}
+	p.cacheCapability(key, supported)
+	return supported, nil
+}
+
+const linuxStackProtectorProbeSource = "int foo(void) { char X[200]; return 3; }\n"
+
+// SupportsX86StackProtector reproduces the legacy x86 stack-protector helper
+// scripts. Those scripts check generated assembly for the %gs canary access,
+// so merely checking whether the option parses would not be equivalent.
+func (p *LinuxToolProbe) SupportsX86StackProtector(ctx context.Context, bits int, scriptArgs []string) (bool, error) {
+	if p.profile.Name != "x86_64" {
+		return false, fmt.Errorf("x86 stack-protector probe requires x86_64 profile, got %q", p.profile.Name)
+	}
+	if bits != 32 && bits != 64 {
+		return false, fmt.Errorf("invalid x86 stack-protector width %d", bits)
+	}
+	wantArgs := []string{}
+	if clangFlags := p.ClangFlags(); clangFlags != "" {
+		wantArgs = []string{clangFlags}
+	}
+	if len(scriptArgs) != len(wantArgs) {
+		return false, fmt.Errorf("invalid x86 stack-protector script arguments %q, want %q", scriptArgs, wantArgs)
+	}
+	for i, arg := range scriptArgs {
+		if arg != wantArgs[i] {
+			return false, fmt.Errorf("invalid x86 stack-protector script argument %q, want %q", arg, wantArgs[i])
+		}
+	}
+	key := strings.Join([]string{
+		p.identity, p.profile.Name, p.profile.TargetTriple, "x86-stack-protector",
+		strconv.Itoa(bits), strings.Join(scriptArgs, "\x00"),
+	}, "\x01")
+	if supported, ok := p.cachedCapability(key); ok {
+		return supported, nil
+	}
+
+	timedCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	args := append(p.configuredCompilerArgs(), scriptArgs...)
+	args = append(args, "-S", "-x", "c", "-c", fmt.Sprintf("-m%d", bits), "-O0")
+	if bits == 64 {
+		args = append(args, "-mcmodel=kernel", "-fno-PIE")
+	}
+	args = append(args, "-fstack-protector", "-", "-o", "-")
+	assembly, runErr := p.run(timedCtx, p.compilerPath, args, []byte(linuxStackProtectorProbeSource))
+	compiled, err := capabilityResult(runErr)
+	if err != nil {
+		return false, err
+	}
+	supported := compiled && strings.Contains(assembly, "%gs")
+	p.cacheCapability(key, supported)
+	return supported, nil
+}
+
+// SupportsRELR reproduces scripts/tools-support-relr.sh using the selected
+// compiler and linker plus the NM and OBJCOPY executables named by the
+// recognized Kconfig command. Every input and output path is controlled here.
+func (p *LinuxToolProbe) SupportsRELR(ctx context.Context) (bool, error) {
+	key := strings.Join([]string{
+		p.identity, p.profile.Name, p.profile.TargetTriple, "tools-support-relr",
+	}, "\x01")
+	if supported, ok := p.cachedCapability(key); ok {
+		return supported, nil
+	}
+
+	tempDir, err := os.MkdirTemp(p.tempDir, "linux-bzl-relr-*")
+	if err != nil {
+		return false, fmt.Errorf("create RELR probe directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+	objectPath := filepath.Join(tempDir, "probe.o")
+	sharedPath := filepath.Join(tempDir, "probe.so")
+	binaryPath := filepath.Join(tempDir, "probe.bin")
+	timedCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	compileArgs := append(p.configuredCompilerArgs(), "-c", "-x", "c", "-", "-o", objectPath)
+	_, runErr := p.run(timedCtx, p.compilerPath, compileArgs, []byte("void *p = &p;\n"))
+	if supported, resultErr := capabilityResult(runErr); resultErr != nil || !supported {
+		return supported, resultErr
+	}
+	if err := requireProbeRegularFile(objectPath, "RELR object"); err != nil {
+		return false, err
+	}
+
+	_, runErr = p.run(timedCtx, p.linkerPath, []string{
+		objectPath, "-shared", "-Bsymbolic", "--pack-dyn-relocs=relr", "-o", sharedPath,
+	}, nil)
+	if runErr != nil {
+		if _, ok := runErr.(*exec.ExitError); !ok {
+			return false, runErr
+		}
+		fallbackOutput, fallbackErr := p.run(timedCtx, p.linkerPath, []string{
+			objectPath, "-shared", "-Bsymbolic", "-z", "pack-relative-relocs", "-o", sharedPath,
+		}, nil)
+		fallbackSupported, resultErr := capabilityResult(fallbackErr)
+		if resultErr != nil {
+			return false, resultErr
+		}
+		if !fallbackSupported || strings.Contains(fallbackOutput, "pack-relative-relocs") {
+			p.cacheCapability(key, false)
+			return false, nil
+		}
+	}
+	if err := requireProbeRegularFile(sharedPath, "RELR shared object"); err != nil {
+		return false, err
+	}
+
+	_, nmStderr, nmErr := p.runSeparate(timedCtx, p.nmPath, []string{sharedPath}, nil)
+	nmSupported, resultErr := capabilityResult(nmErr)
+	if resultErr != nil {
+		return false, resultErr
+	}
+	if !nmSupported || strings.TrimSpace(nmStderr) != "" {
+		p.cacheCapability(key, false)
+		return false, nil
+	}
+	_, runErr = p.run(timedCtx, p.objcopyPath, []string{"-O", "binary", sharedPath, binaryPath}, nil)
+	supported, err := capabilityResult(runErr)
+	if err != nil {
+		return false, err
+	}
+	if supported {
+		if err := requireProbeRegularFile(binaryPath, "RELR binary"); err != nil {
+			return false, err
+		}
+	}
+	p.cacheCapability(key, supported)
+	return supported, nil
+}
+
+func requireProbeRegularFile(path, description string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %s %q: %w", description, path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s %q is not a regular file", description, path)
+	}
+	return nil
+}
+
+func (p *LinuxToolProbe) compilerPrintFileName(ctx context.Context, name string) (string, error) {
+	if name != "plugin" {
+		return "", fmt.Errorf("unsupported compiler print-file-name value %q", name)
+	}
+	if p.disableGCCPlugins {
+		return "", nil
+	}
+	timedCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	args := append(p.configuredCompilerArgs(), "-print-file-name="+name)
+	stdout, stderr, runErr := p.runSeparate(timedCtx, p.compilerPath, args, nil)
+	if runErr != nil {
+		if _, ok := runErr.(*exec.ExitError); ok {
+			return "", nil
+		}
+		return "", runErr
+	}
+	if strings.TrimSpace(stderr) != "" {
+		return "", fmt.Errorf("compiler print-file-name wrote to stderr: %q", strings.TrimSpace(stderr))
+	}
+	value := strings.TrimSpace(stdout)
+	if value == "" || strings.ContainsAny(value, "\x00\r\n") {
+		return "", fmt.Errorf("compiler print-file-name returned invalid path %q", value)
+	}
+	return value, nil
+}
+
+func (p *LinuxToolProbe) compilerPluginHeaderExists(ctx context.Context, path string) (bool, error) {
+	if p.disableGCCPlugins {
+		return false, nil
+	}
+	pluginDir, err := p.compilerPrintFileName(ctx, "plugin")
+	if err != nil {
+		return false, err
+	}
+	if pluginDir == "" {
+		return false, nil
+	}
+	want := filepath.Clean(filepath.Join(pluginDir, "include", "plugin-version.h"))
+	if filepath.Clean(path) != want {
+		return false, fmt.Errorf("compiler plugin header probe path %q does not match %q", path, want)
+	}
+	info, err := os.Stat(want)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat compiler plugin header %q: %w", want, err)
+	}
+	return !info.IsDir(), nil
+}
+
+func (p *LinuxToolProbe) auxiliaryToolFirstLineContains(ctx context.Context, tool, option, needle string) (bool, error) {
+	var executable string
+	switch tool {
+	case "ar":
+		executable = p.archiverPath
+	case "nm":
+		executable = p.nmPath
+	case "objcopy":
+		executable = p.objcopyPath
+	default:
+		return false, fmt.Errorf("unsupported auxiliary probe tool %q", tool)
+	}
+	if option != "--help" && option != "--version" {
+		return false, fmt.Errorf("unsupported auxiliary probe option %q", option)
+	}
+	timedCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	stdout, _, runErr := p.runSeparate(timedCtx, executable, []string{option}, nil)
+	supported, err := capabilityResult(runErr)
+	if err != nil || !supported {
+		return supported, err
+	}
+	line := strings.SplitN(stdout, "\n", 2)[0]
+	return strings.Contains(strings.ToLower(line), strings.ToLower(needle)), nil
+}
+
+func (p *LinuxToolProbe) cachedCapability(key string) (bool, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	value, ok := p.cache[key]
+	return value, ok
+}
+
+func (p *LinuxToolProbe) cacheCapability(key string, value bool) {
+	p.mu.Lock()
+	p.cache[key] = value
+	p.mu.Unlock()
+}
+
+func capabilityResult(err error) (bool, error) {
+	if err == nil {
+		return true, nil
+	}
+	if _, ok := err.(*exec.ExitError); ok {
+		return false, nil
+	}
+	return false, err
+}
+
+func validateLinkDriverProbeArgs(args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	if err := validateProbeCandidate("cc_can_link", args); err != nil {
+		return err
+	}
+	for _, arg := range args {
+		lower := strings.ToLower(arg)
+		for _, prefix := range []string{
+			"--config", "--config-system-dir", "--gcc-toolchain", "--ld-path", "--resource-dir",
+			"-fuse-ld", "-resource-dir", "-specs", "-wrapper",
+		} {
+			if lower == prefix || strings.HasPrefix(lower, prefix+"=") {
+				return fmt.Errorf("tool-selection option is prohibited: %q", arg)
+			}
+		}
+		if strings.HasPrefix(arg, "-B") {
+			return fmt.Errorf("tool-selection option is prohibited: %q", arg)
+		}
+	}
+	return nil
 }
 
 // SupportsKbuildSource compiles a bounded source fragment from a recognized
@@ -346,10 +1135,10 @@ func (p *LinuxToolProbe) SupportsKbuildSource(
 	defer os.Remove(outputPath)
 	timedCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
-	args := []string{"--target=" + p.profile.TargetTriple, "-Werror"}
+	args := append(p.configuredCompilerArgs(), "-Werror")
 	args = append(args, execContext...)
 	args = append(args, "-Wa,--fatal-warnings", "-x", language, "-c", "-o", outputPath, "-")
-	_, runErr := p.run(timedCtx, p.clangPath, args, []byte(decoded))
+	_, runErr := p.run(timedCtx, p.compilerPath, args, []byte(decoded))
 	supported := runErr == nil
 	if runErr != nil {
 		if _, ok := runErr.(*exec.ExitError); !ok {
@@ -466,18 +1255,17 @@ func (p *LinuxToolProbe) supportsPowerPCCompilerScript(ctx context.Context, scri
 	timedCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 	compile := func(source string, featureFlags ...string) (string, bool, error) {
-		args := []string{
-			"--target=" + p.profile.TargetTriple,
+		args := append(p.configuredCompilerArgs(),
 			endian,
 			"-m64",
 			"-mabi=elfv2",
 			"-S",
 			"-x", "c",
 			"-O2",
-		}
+		)
 		args = append(args, featureFlags...)
 		args = append(args, "-", "-o", "-")
-		output, err := p.run(timedCtx, p.clangPath, args, []byte(source))
+		output, err := p.run(timedCtx, p.compilerPath, args, []byte(source))
 		if err == nil {
 			return output, true, nil
 		}
@@ -613,7 +1401,7 @@ func safeProbeOperand(option, operand string) bool {
 
 // KBUILD_{CPP,C,A,LD}FLAGS contain include/search paths that are irrelevant to
 // option acceptance. They are deliberately omitted rather than handed to a
-// repository-time probe. Output/plugin options remain hard errors.
+// controlled probe action. Output/plugin options remain hard errors.
 func sanitizeProbeContext(kind string, argv []string) ([]string, error) {
 	out := make([]string, 0, len(argv))
 	skipOperand := false
@@ -666,22 +1454,35 @@ func sanitizeProbeContext(kind string, argv []string) ([]string, error) {
 }
 
 func (p *LinuxToolProbe) run(ctx context.Context, executable string, args []string, input []byte) (string, error) {
+	stdout, stderr, err := p.runSeparate(ctx, executable, args, input)
+	return stdout + stderr, err
+}
+
+func (p *LinuxToolProbe) runSeparate(ctx context.Context, executable string, args []string, input []byte) (string, string, error) {
 	cmd := exec.CommandContext(ctx, executable, args...)
-	cmd.Env = []string{"LANG=C", "LC_ALL=C", "PATH="}
+	cmd.Env = make([]string, 0, len(os.Environ())+2)
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "LANG=") || strings.HasPrefix(entry, "LC_ALL=") {
+			continue
+		}
+		cmd.Env = append(cmd.Env, entry)
+	}
+	cmd.Env = append(cmd.Env, "LANG=C", "LC_ALL=C")
 	if input != nil {
 		cmd.Stdin = bytes.NewReader(input)
 	}
-	output := &limitedProbeBuffer{remaining: p.outputLimit}
-	cmd.Stdout = output
-	cmd.Stderr = output
+	stdout := &limitedProbeBuffer{remaining: p.outputLimit}
+	stderr := &limitedProbeBuffer{remaining: p.outputLimit}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	err := cmd.Run()
 	if ctx.Err() != nil {
-		return output.String(), fmt.Errorf("Linux probe timed out or was cancelled: %w", ctx.Err())
+		return stdout.String(), stderr.String(), fmt.Errorf("Linux probe timed out or was cancelled: %w", ctx.Err())
 	}
-	if output.exceeded {
-		return output.String(), fmt.Errorf("Linux probe output exceeded %d bytes", p.outputLimit)
+	if stdout.exceeded || stderr.exceeded {
+		return stdout.String(), stderr.String(), fmt.Errorf("Linux probe output exceeded %d bytes per stream", p.outputLimit)
 	}
-	return output.String(), err
+	return stdout.String(), stderr.String(), err
 }
 
 type limitedProbeBuffer struct {

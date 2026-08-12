@@ -6,6 +6,7 @@ bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 
 bazel_dep(name = "buildifier_prebuilt", version = "8.2.1.1", dev_dependency = True)
+bazel_dep(name = "gcc_toolchain", version = "0.12.0", dev_dependency = True)
 
 bazel_dep(name = "llvm", version = "0.8.14")
 bazel_dep(name = "elfutils", version = "0.195")
@@ -47,10 +48,35 @@ use_repo(bindgen_toolchains, "rules_rust_bindgen")
 tar_toolchains = use_extension("@tar.bzl//tar:extensions.bzl", "toolchains", dev_dependency = True)
 use_repo(tar_toolchains, "bsd_tar_toolchains")
 
+map_directory_gcc_toolchains = use_extension(
+    "@gcc_toolchain//toolchain:module_extensions.bzl",
+    "gcc_toolchains",
+    dev_dependency = True,
+)
+map_directory_gcc_toolchains.toolchain(
+    name = "map_directory_gcc_x86_64",
+    enable_fortran = False,
+    gcc_version = "15.2.0",
+    target_arch = "x86_64",
+)
+use_repo(map_directory_gcc_toolchains, "map_directory_gcc_x86_64")
+
+map_directory_linux_source_repository = use_repo_rule(
+    "//:linux.bzl",
+    "linux_source_repository",
+)
+
+map_directory_linux_source_repository(
+    name = "map_directory_linux_6_18_39",
+    dev_dependency = True,
+    version = "6.18.39",
+)
+
 register_toolchains(
     "@default_rust_toolchains//:all",
     "@rules_rust_bindgen//:all",
     "@bsd_tar_toolchains//:all",
+    "//tests/map_directory:gcc_cc_toolchain",
     "@llvm//toolchain:all",
     dev_dependency = True,
 )

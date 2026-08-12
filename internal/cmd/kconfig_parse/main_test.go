@@ -61,6 +61,81 @@ func TestFixedLinuxProbeShellRejectsToolEnvironmentOverride(t *testing.T) {
 	}
 }
 
+func TestMeasuredLinuxProbeShellUsesGCCEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	gcc := filepath.Join(dir, "gcc")
+	ld := filepath.Join(dir, "ld")
+	ar := filepath.Join(dir, "ar")
+	nm := filepath.Join(dir, "nm")
+	objcopy := filepath.Join(dir, "objcopy")
+	for path, output := range map[string]string{
+		ld:      "GNU ld (GNU Binutils) 2.44",
+		ar:      "GNU ar (GNU Binutils) 2.44",
+		nm:      "GNU nm (GNU Binutils) 2.44",
+		objcopy: "GNU objcopy (GNU Binutils) 2.44",
+	} {
+		script := "#!/bin/sh\necho '" + output + "'\n"
+		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gccScript := `#!/bin/sh
+case " $* " in
+	*' -E -P -x c - '*) echo 'GCC 15 2 0' ;;
+  *' -Wa,--version '*) echo 'GNU assembler (GNU Binutils) 2.44' ;;
+  *) echo 'gcc (GCC) 15.2.0' ;;
+esac
+`
+	if err := os.WriteFile(gcc, []byte(gccScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := kconfig.NewLinuxToolProbe(kconfig.LinuxToolProbeOptions{
+		Profile:      "x86_64",
+		Architecture: "x86",
+		TargetTriple: "x86_64-linux-gnu",
+		CompilerPath: gcc,
+		LinkerPath:   ld,
+		ArchiverPath: ar,
+		NMPath:       nm,
+		ObjcopyPath:  objcopy,
+		TempDir:      dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := stringMapFlag{}
+	shell, err := measuredLinuxProbeShell(
+		probe,
+		gcc,
+		ld,
+		ar,
+		nm,
+		objcopy,
+		kconfig.LinuxProbeDefaultRustcVersion,
+		kconfig.LinuxProbeDefaultRustcLLVMVersion,
+		env,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shell == nil {
+		t.Fatal("measuredLinuxProbeShell() returned nil shell")
+	}
+	for name, want := range map[string]string{
+		"CC":              gcc,
+		"CC_VERSION_TEXT": "gcc (GCC) 15.2.0",
+		"CLANG_FLAGS":     "",
+		"LD":              ld,
+		"AR":              ar,
+		"NM":              nm,
+		"OBJCOPY":         objcopy,
+	} {
+		if got := env[name]; got != want {
+			t.Fatalf("env[%q] = %q, want %q", name, got, want)
+		}
+	}
+}
+
 func TestStartRuntimeProfilesWritesMemoryProfiles(t *testing.T) {
 	dir := t.TempDir()
 	heapPath := filepath.Join(dir, "heap.pprof")

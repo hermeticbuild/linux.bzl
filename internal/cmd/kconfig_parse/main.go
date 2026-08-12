@@ -82,15 +82,29 @@ func measuredLinuxProbeShell(
 	probe *kconfig.LinuxToolProbe,
 	ccPath string,
 	ldPath string,
+	arPath string,
+	nmPath string,
+	objcopyPath string,
 	rustcVersion int,
 	rustcLLVMVersion int,
 	env stringMapFlag,
 ) (func(context.Context, string) (string, error), error) {
 	for name, value := range fixedLinuxProbeEnvironment {
-		if name == "CC" {
+		switch name {
+		case "CC":
 			value = ccPath
-		} else if name == "LD" {
+		case "CC_VERSION_TEXT":
+			value = probe.CompilerVersionText()
+		case "CLANG_FLAGS":
+			value = probe.ClangFlags()
+		case "LD":
 			value = ldPath
+		case "AR":
+			value = arPath
+		case "NM":
+			value = nmPath
+		case "OBJCOPY":
+			value = objcopyPath
 		}
 		if configured, ok := env[name]; ok && configured != value {
 			return nil, fmt.Errorf("measured Linux probe requires %s=%q, got %q", name, value, configured)
@@ -271,8 +285,15 @@ func run() (exitCode int) {
 		targetProfile            = flag.String("target_profile", "", "Canonical platform-selected Linux target profile")
 		linuxArch                = flag.String("linux_arch", "", "Linux ARCH required by -target_profile")
 		targetTriple             = flag.String("target_triple", "", "Canonical LLVM target triple required by -target_profile")
-		probeCC                  = flag.String("probe_cc", "", "Path to the integrity-pinned clang used for real repository-time probes")
-		probeLD                  = flag.String("probe_ld", "", "Path to the integrity-pinned ld.lld used for real repository-time probes")
+		probeCC                  = flag.String("probe_cc", "", "Path to the selected integrity-pinned C compiler used for real action-time probes")
+		probeLD                  = flag.String("probe_ld", "", "Path to the selected integrity-pinned linker used for real action-time probes")
+		probeAR                  = flag.String("probe_ar", "", "Path to the selected integrity-pinned archiver used for real action-time probes")
+		probeNM                  = flag.String("probe_nm", "", "Path to the selected integrity-pinned nm used for real action-time probes")
+		probeObjcopy             = flag.String("probe_objcopy", "", "Path to the selected integrity-pinned objcopy used for real action-time probes")
+		probeCCArgs              stringSliceFlag
+		probeLinkArgs            stringSliceFlag
+		probeAllowCCCanLink      = flag.Bool("probe_allow_cc_can_link", true, "Allow measured CC_CAN_LINK execution")
+		probeAllowGCCPlugins     = flag.Bool("probe_allow_gcc_plugins", true, "Allow measured GCC plugin-directory probing")
 		linuxProbeRustcVersion   = flag.Int("linux_probe_rustc_version", kconfig.LinuxProbeDefaultRustcVersion, "Linux-encoded Rust compiler version for repository-time Kconfig resolution")
 		linuxProbeRustcLLVM      = flag.Int("linux_probe_rustc_llvm_version", kconfig.LinuxProbeDefaultRustcLLVMVersion, "Linux-encoded Rust LLVM version for repository-time Kconfig resolution")
 		rustToolchainProbe       = flag.String("rust_toolchain_probe", "", "JSON identity produced from the selected rustc -vV output")
@@ -329,6 +350,8 @@ func run() (exitCode int) {
 	flag.Var(&compactConfigInputs, "config", "Named .config input in NAME=PATH form for compact metadata generation. May be repeated")
 	flag.Var(&compactExports, "compact_buildfile_export", "Source filename exported by the generated compact BUILD file. May be repeated")
 	flag.Var(&sourceRootMaps, "source_root_map", "Virtual source prefix to filesystem root in PREFIX=PATH form. May be repeated")
+	flag.Var(&probeCCArgs, "probe_cc_arg", "Configured compiler prefix argument used for measured probes. May be repeated")
+	flag.Var(&probeLinkArgs, "probe_link_arg", "Configured linker-driver argument used by measured compiler link probes. May be repeated")
 	flag.Var(&kconfigExtras, "kconfig_extra", "Extra Kconfig source in PREFIX=PATH form. May be repeated")
 	flag.Var(&generatedHeadersByConfig, "generated_headers_for_config", "Generated headers binding in NAME=LABEL form. May be repeated once per compact config")
 	flag.Parse()
@@ -346,7 +369,29 @@ func run() (exitCode int) {
 		fmt.Fprintln(os.Stderr, "-target_profile, -linux_arch, -target_triple, -probe_cc, and -probe_ld must be supplied together")
 		return 2
 	}
+	if adaptiveCount == 0 && (*probeAR != "" || *probeNM != "" || *probeObjcopy != "" || len(probeCCArgs) != 0 || len(probeLinkArgs) != 0) {
+		fmt.Fprintln(os.Stderr, "-probe_ar, -probe_nm, -probe_objcopy, -probe_cc_arg, and -probe_link_arg require the measured probe arguments")
+		return 2
+	}
+	if adaptiveCount == 0 && (!*probeAllowCCCanLink || !*probeAllowGCCPlugins) {
+		fmt.Fprintln(os.Stderr, "-probe_allow_cc_can_link and -probe_allow_gcc_plugins require the measured probe arguments")
+		return 2
+	}
 	if adaptiveCount != 0 {
+		// The released repository rule predates the auxiliary-tool flags and
+		// selects tools from hermeticbuild/llvm's bin directory. Preserve that
+		// invocation contract while action-time callers pass every selected
+		// tool explicitly as a declared Bazel input.
+		probeDir := filepath.Dir(*probeCC)
+		if *probeAR == "" {
+			*probeAR = filepath.Join(probeDir, "llvm-ar")
+		}
+		if *probeNM == "" {
+			*probeNM = filepath.Join(probeDir, "llvm-nm")
+		}
+		if *probeObjcopy == "" {
+			*probeObjcopy = filepath.Join(probeDir, "llvm-objcopy")
+		}
 		profile, err := kconfig.LinuxTargetProfileByName(*targetProfile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "invalid Linux target profile: %v\n", err)
@@ -365,7 +410,10 @@ func run() (exitCode int) {
 		}
 		probe, err := kconfig.NewLinuxToolProbe(kconfig.LinuxToolProbeOptions{
 			Profile: profile.Name, Architecture: profile.Arch, TargetTriple: profile.TargetTriple,
-			ClangPath: workspacePath(*probeCC), LLDPath: workspacePath(*probeLD),
+			CompilerPath: workspacePath(*probeCC), LinkerPath: workspacePath(*probeLD),
+			ArchiverPath: workspacePath(*probeAR), NMPath: workspacePath(*probeNM), ObjcopyPath: workspacePath(*probeObjcopy),
+			CompilerArgs: probeCCArgs, LinkerDriverArgs: probeLinkArgs,
+			DisableCCCanLink: !*probeAllowCCCanLink, DisableGCCPlugins: !*probeAllowGCCPlugins,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to configure measured Linux tools: %v\n", err)
@@ -421,7 +469,17 @@ func run() (exitCode int) {
 		}
 		var shell func(context.Context, string) (string, error)
 		if toolProbe != nil {
-			shell, err = measuredLinuxProbeShell(toolProbe, workspacePath(*probeCC), workspacePath(*probeLD), *linuxProbeRustcVersion, *linuxProbeRustcLLVM, env)
+			shell, err = measuredLinuxProbeShell(
+				toolProbe,
+				workspacePath(*probeCC),
+				workspacePath(*probeLD),
+				workspacePath(*probeAR),
+				workspacePath(*probeNM),
+				workspacePath(*probeObjcopy),
+				*linuxProbeRustcVersion,
+				*linuxProbeRustcLLVM,
+				env,
+			)
 		} else {
 			shell, err = fixedLinuxProbeShell(*linuxProbeArch, *linuxProbeRustcVersion, *linuxProbeRustcLLVM, env)
 		}
