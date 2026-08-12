@@ -1,1 +1,2 @@
 aya_e2e/patches/*.patch -whitespace
+e2e/patches/*.patch -whitespace

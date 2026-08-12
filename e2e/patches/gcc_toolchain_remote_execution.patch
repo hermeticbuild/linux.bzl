@@ -1,0 +1,124 @@
+diff --git a/toolchain/cc_toolchain_config.bzl b/toolchain/cc_toolchain_config.bzl
+--- a/toolchain/cc_toolchain_config.bzl
++++ b/toolchain/cc_toolchain_config.bzl
+@@ -106,6 +106,13 @@ def _impl(ctx):
+ 
+     action_configs = []
+ 
++    for link_action in base_link_actions:
++        action_configs.append(action_config(
++            action_name = link_action,
++            enabled = True,
++            tools = [tool(path = tool_paths.get("g++"))],
++        ))
++
+     action_configs.append(action_config(
+         action_name = "objcopy_embed_data",
+         enabled = True,
+diff --git a/toolchain/wrapper.sh.tpl b/toolchain/wrapper.sh.tpl
+--- a/toolchain/wrapper.sh.tpl
++++ b/toolchain/wrapper.sh.tpl
+@@ -19,11 +19,8 @@
+ 
+ set -o errexit -o nounset -o pipefail
+ 
+-# Getting the execroot by navigating to a relative directory from the resolved
+-# symlinks of the BASH_SOURCE[0] is more reliable than navigating to the
+-# execroot from $PWD. This is due to the fact that the Bazel C++ toolchain can
+-# be called from different working directories (e.g. rules_foreign_cc rules).
+-EXECROOT="${EXECROOT:-"$(realpath "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/../../..")"}"
++# Resolve the wrapper with Bash builtins; remote actions need no host coreutils.
++EXECROOT="${EXECROOT:-"$(cd -P -- "${BASH_SOURCE[0]%/*}/../../.." && pwd -P)"}"
+ export EXECROOT
+ export PATH="__PATH__"
+ args=("$@")
+diff --git a/toolchain/defs.bzl b/toolchain/defs.bzl
+--- a/toolchain/defs.bzl
++++ b/toolchain/defs.bzl
+@@ -965,6 +965,8 @@
+         ":coverage_files",
+         ":dwp_files",
+         ":linker_files",
++        ":nm_files",
++        ":objdump_files",
+         ":objcopy_files",
+         ":strip_files",
+     ],
+@@ -998,7 +1000,10 @@
+         ":ld",
+         ":ld.bfd",
+         "xbin/ld",
+-    ],
++    ] + glob([
++        "{include_prefix}bin/ld",
++        "{include_prefix}lib/ldscripts/**",
++    ], allow_empty = True),
+     visibility = ["//visibility:public"],
+ )
+ 
+@@ -1050,6 +1055,7 @@
+         "bin/{binary_prefix}cpp",
+         "bin/{binary_prefix}g++",
+         "bin/{binary_prefix}gcc",
++        "bin/{binary_prefix}c++",
+ {fortran_bin_gfortran}
+         "xbin/cpp",
+         "xbin/g++",
+@@ -1078,7 +1084,7 @@
+     srcs = [
+         ":ar",
+         "xbin/ar",
+-    ],
++    ] + glob(["{include_prefix}bin/ar"], allow_empty = True),
+     visibility = ["//visibility:public"],
+ )
+ 
+@@ -1089,7 +1095,7 @@
+         "xbin/as",
+         ":gcc",
+         "xbin/gcc",
+-    ],
++    ] + glob(["{include_prefix}bin/as"], allow_empty = True),
+     visibility = ["//visibility:public"],
+ )
+ 
+@@ -1100,11 +1106,29 @@
+ )
+ 
+ filegroup(
++    name = "nm_files",
++    srcs = [
++        ":nm",
++        "xbin/nm",
++    ] + glob(["{include_prefix}bin/nm"], allow_empty = True),
++    visibility = ["//visibility:public"],
++)
++
++filegroup(
+     name = "objcopy_files",
+     srcs = [
+         ":objcopy",
+         "xbin/objcopy",
+-    ],
++    ] + glob(["{include_prefix}bin/objcopy"], allow_empty = True),
++    visibility = ["//visibility:public"],
++)
++
++filegroup(
++    name = "objdump_files",
++    srcs = [
++        ":objdump",
++        "xbin/objdump",
++    ] + glob(["{include_prefix}bin/objdump"], allow_empty = True),
+     visibility = ["//visibility:public"],
+ )
+ 
+@@ -1113,7 +1137,7 @@
+     srcs = [
+         ":strip",
+         "xbin/strip",
+-    ],
++    ] + glob(["{include_prefix}bin/strip"], allow_empty = True),
+     visibility = ["//visibility:public"],
+ )
+ 

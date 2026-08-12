@@ -1,11 +1,71 @@
 # gazelle:prefix github.com/hermeticbuild/linux.bzl/e2e
 
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
 load("@bazel_skylib//rules:select_file.bzl", "select_file")
 load("@linux.bzl", "initramfs", "linux_cc_module", "linux_module")
 load(":qemu_boot_test.bzl", "qemu_boot_test", "qemu_system_target")
 
 package(default_visibility = ["//visibility:public"])
+
+string_flag(
+    name = "compiler",
+    build_setting_default = "clang",
+    values = [
+        "clang",
+        "gcc",
+    ],
+)
+
+config_setting(
+    name = "gcc_selected",
+    flag_values = {":compiler": "gcc"},
+)
+
+toolchain(
+    name = "gcc_cc_toolchain_aarch64",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+    target_settings = [":gcc_selected"],
+    toolchain = "@e2e_gcc_aarch64//:_cc_toolchain",
+    toolchain_type = "@rules_cc//cc:toolchain_type",
+)
+
+toolchain(
+    name = "gcc_cc_toolchain_armv7",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        "@platforms//cpu:armv7",
+        "@platforms//os:linux",
+    ],
+    target_settings = [":gcc_selected"],
+    toolchain = "@e2e_gcc_armv7//:_cc_toolchain",
+    toolchain_type = "@rules_cc//cc:toolchain_type",
+)
+
+toolchain(
+    name = "gcc_cc_toolchain_x86_64",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_settings = [":gcc_selected"],
+    toolchain = "@e2e_gcc_x86_64//:_cc_toolchain",
+    toolchain_type = "@rules_cc//cc:toolchain_type",
+)
 
 exports_files([
     "cnic.config",

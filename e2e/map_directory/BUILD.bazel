@@ -1,5 +1,4 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
-load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
 load(
     "@linux.bzl//internal:map_directory_kconfig.bzl",
     "linux_map_directory_kconfig_spike",
@@ -8,35 +7,6 @@ load(
 load("@rules_go//go:def.bzl", "go_binary")
 
 package(default_visibility = ["//visibility:public"])
-
-string_flag(
-    name = "compiler",
-    build_setting_default = "clang",
-    values = [
-        "clang",
-        "gcc",
-    ],
-)
-
-config_setting(
-    name = "gcc_selected",
-    flag_values = {":compiler": "gcc"},
-)
-
-toolchain(
-    name = "gcc_cc_toolchain",
-    exec_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:linux",
-    ],
-    target_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:linux",
-    ],
-    target_settings = [":gcc_selected"],
-    toolchain = "@e2e_map_directory_gcc_x86_64//:_cc_toolchain",
-    toolchain_type = "@rules_cc//cc:toolchain_type",
-)
 
 go_binary(
     name = "upstream_validator",
@@ -60,10 +30,6 @@ linux_map_directory_kconfig_spike(
     config = "base.config",
     kbuild = "Kbuild",
     kconfig = "Kconfig",
-    probe_nm = select({
-        ":gcc_selected": "@e2e_map_directory_gcc_x86_64//:nm",
-        "//conditions:default": None,
-    }),
     tags = ["requires-bazel-9"],
     validator = "@linux.bzl//internal/cmd/mapdirectoryvalidator",
 )
@@ -74,16 +40,12 @@ linux_upstream_kconfig(
     kconfig = "@e2e_linux_6_18_39//:Kconfig",
     kconfig_files = "@e2e_linux_6_18_39//:kconfig_files",
     probe_allow_cc_can_link = select({
-        ":gcc_selected": False,
+        "//:gcc_selected": False,
         "//conditions:default": True,
     }),
     probe_allow_gcc_plugins = select({
-        ":gcc_selected": False,
+        "//:gcc_selected": False,
         "//conditions:default": True,
-    }),
-    probe_nm = select({
-        ":gcc_selected": "@e2e_map_directory_gcc_x86_64//:nm",
-        "//conditions:default": None,
     }),
     tags = ["requires-bazel-9"],
     validator = ":upstream_validator",
