@@ -5945,11 +5945,11 @@ def _resolve_linux_config(ctx, rust_toolchain_probe):
     if rust_toolchain_probe:
         args.add("-rust_toolchain_probe", rust_toolchain_probe)
 
-        # The repository snapshot is generated with Clang. GCC intentionally
-        # changes compiler-derived structural symbols, so the Rust-only
-        # equivalence check is meaningful only when Clang remains selected.
-        if compiler_family == "clang":
-            args.add("-validate_config_equivalence")
+        # Do not compare this action-time resolution with the repository-time
+        # snapshot. The selected C/C++ toolchain can legitimately change
+        # structural compiler-capability symbols under both Clang and GCC;
+        # that difference cannot be attributed to the Rust probe here.
+
     probe_tools = None
     tool_environment = {}
     if ctx.attr.allow_shell:

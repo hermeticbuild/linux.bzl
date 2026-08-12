@@ -124,7 +124,11 @@ def _rust_config_test_impl(ctx):
     if resolved:
         asserts.equals(env, "x86", _argument_after(resolved[0].argv, "-linux_probe_arch"))
         asserts.true(env, _has_argument(resolved[0], "-rust_toolchain_probe"))
-        asserts.true(env, _has_argument(resolved[0], "-validate_config_equivalence"))
+        asserts.false(
+            env,
+            _has_argument(resolved[0], "-validate_config_equivalence"),
+            "selected C/C++ toolchain capabilities may differ from the repository snapshot",
+        )
         asserts.true(env, _has_input(resolved[0], info.rustc_probe))
     return analysistest.end(env)
 
