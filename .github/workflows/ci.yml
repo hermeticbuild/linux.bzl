@@ -112,6 +112,8 @@ jobs:
             - e2e/.bazelversion
             - e2e/MODULE.bazel
             - e2e/MODULE.bazel.lock
+            - e2e/patches/BUILD.bazel
+            - e2e/patches/gcc_toolchain_remote_execution.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Test with ${{ matrix.compiler }}
@@ -388,13 +390,16 @@ jobs:
           retention-days: 14
 
   qemu-e2e:
-    name: QEMU e2e (${{ matrix.batch }})
+    name: QEMU e2e (${{ matrix.suite.title }}, ${{ matrix.compiler }})
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        include:
+        compiler:
+          - clang
+          - gcc
+        suite:
           - batch: tooling
             title: E2E tooling
             targets: "//boot:init_test //cmd/qemuboot:qemuboot_test"
@@ -436,21 +441,23 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-qemu-e2e-${{ matrix.batch }}
+          disk-cache: ${{ github.workflow }}-qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}
           module-root: e2e
           repository-cache: |
             - e2e/.bazelversion
             - e2e/MODULE.bazel
             - e2e/MODULE.bazel.lock
+            - e2e/patches/BUILD.bazel
+            - e2e/patches/gcc_toolchain_remote_execution.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
-      - name: Run ${{ matrix.title }}
+      - name: Run ${{ matrix.suite.title }} with ${{ matrix.compiler }}
         working-directory: e2e
         env:
-          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.log
-          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.profile.gz
-          BAZEL_TARGETS: ${{ matrix.targets }}
+          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.profile.gz
+          BAZEL_TARGETS: ${{ matrix.suite.targets }}
         run: |
           set -euo pipefail
           read -r -a targets <<<"${BAZEL_TARGETS}"
@@ -458,6 +465,7 @@ jobs:
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test "${targets[@]}" \
             --config=path-mapping \
+            --config="compiler-${{ matrix.compiler }}" \
             --notrack_incremental_state \
             --nokeep_state_after_build \
             --discard_analysis_cache \
@@ -468,12 +476,12 @@ jobs:
       - name: Report cache efficiency
         if: ${{ !cancelled() }}
         env:
-          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.log
-          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.profile.gz
         run: |
           .github/workflows/bazel_cache_report.sh \
-            "QEMU e2e (${{ matrix.title }})" \
+            "QEMU e2e (${{ matrix.suite.title }}, ${{ matrix.compiler }})" \
             "${BAZEL_PROFILE}" \
             "${BAZEL_BEP}" \
             "${BAZEL_LOG}"
@@ -482,11 +490,11 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: bazel-profile-qemu-e2e-${{ matrix.batch }}
+          name: bazel-profile-qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}
           path: |
-            ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.profile.gz
-            ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.bep.json
-            ${{ runner.temp }}/qemu-e2e-${{ matrix.batch }}.log
+            ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.profile.gz
+            ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.bep.json
+            ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.log
           if-no-files-found: warn
           retention-days: 14
 
