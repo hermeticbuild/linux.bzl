@@ -16,27 +16,62 @@ import (
 )
 
 type configPayloadManifest struct {
-	Arch     string            `json:"arch"`
-	Payloads map[string]string `json:"payloads"`
-	Version  string            `json:"version"`
+	Arch           string              `json:"arch"`
+	CompilerFamily string              `json:"compiler_family,omitempty"`
+	Payloads       map[string]string   `json:"payloads"`
+	PayloadOwners  map[string][]string `json:"payload_owners,omitempty"`
+	Version        string              `json:"version"`
+}
+
+type stringListFlag []string
+
+func (values *stringListFlag) String() string {
+	return strings.Join(*values, ",")
+}
+
+func (values *stringListFlag) Set(value string) error {
+	*values = append(*values, value)
+	return nil
 }
 
 func main() {
 	configPath := flag.String("config", "", "Resolved Linux .config file")
 	arch := flag.String("arch", "x86", "Linux ARCH value")
+	compilerFamily := flag.String("compiler_family", "", "Selected C compiler family (clang or gcc); defaults to CONFIG_CC_IS_CLANG")
 	version := flag.String("version", "", "Linux kernel version")
-	outPath := flag.String("out", "", "Output Clang response file")
+	outPath := flag.String("out", "", "Output compiler response file")
 	asmOutPath := flag.String("asm_out", "", "Output assembler response file")
 	batchManifestPath := flag.String("batch_manifest", "", "JSON manifest of content-addressed config payloads")
 	batchOutDir := flag.String("batch_out_dir", "", "Output root for content-addressed config payloads")
+	var batchConfigNames stringListFlag
+	var batchBaselineConfigPaths stringListFlag
+	var batchResolvedConfigPaths stringListFlag
+	flag.Var(&batchConfigNames, "batch_config_name", "Config name corresponding to the next baseline and resolved config paths; repeat for every graph config")
+	flag.Var(&batchBaselineConfigPaths, "batch_baseline_config", "Repository-resolved baseline .config; repeat in batch_config_name order")
+	flag.Var(&batchResolvedConfigPaths, "batch_resolved_config", "Action-time selected-toolchain .config; repeat in batch_config_name order")
 	flag.Parse()
 
 	if *batchManifestPath != "" || *batchOutDir != "" {
-		if *batchManifestPath == "" || *batchOutDir == "" || *configPath != "" || *outPath != "" || *asmOutPath != "" {
+		if *batchManifestPath == "" || *batchOutDir == "" || *configPath != "" || *outPath != "" || *asmOutPath != "" || *compilerFamily != "" {
 			flag.PrintDefaults()
 			os.Exit(2)
 		}
-		if err := materializeConfigPayloads(*batchManifestPath, *batchOutDir); err != nil {
+		baselineConfigs, resolvedConfigs, err := namedConfigPaths(
+			batchConfigNames,
+			batchBaselineConfigPaths,
+			batchResolvedConfigPaths,
+		)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			flag.PrintDefaults()
+			os.Exit(2)
+		}
+		if err := materializeConfigPayloadsFromGraph(
+			*batchManifestPath,
+			*batchOutDir,
+			baselineConfigs,
+			resolvedConfigs,
+		); err != nil {
 			fmt.Fprintf(os.Stderr, "materialize config payloads: %v\n", err)
 			os.Exit(1)
 		}
@@ -45,6 +80,10 @@ func main() {
 
 	if *configPath == "" || *outPath == "" {
 		flag.PrintDefaults()
+		os.Exit(2)
+	}
+	if err := validateCompilerFamily(*compilerFamily); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 
@@ -61,19 +100,66 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := os.WriteFile(*outPath, []byte(responseFile(linuxCFlags(config, *arch, *version))), 0o644); err != nil {
+	if err := os.WriteFile(*outPath, []byte(responseFile(linuxCFlagsForCompiler(config, *arch, *version, *compilerFamily))), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "write flags: %v\n", err)
 		os.Exit(1)
 	}
 	if *asmOutPath != "" {
-		if err := os.WriteFile(*asmOutPath, []byte(responseFile(linuxAFlags(config, *arch, *version))), 0o644); err != nil {
+		if err := os.WriteFile(*asmOutPath, []byte(responseFile(linuxAFlagsForCompiler(config, *arch, *version, *compilerFamily))), 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "write assembler flags: %v\n", err)
 			os.Exit(1)
 		}
 	}
 }
 
-func materializeConfigPayloads(manifestPath, outDir string) error {
+func materializeConfigPayloads(manifestPath, outDir, baselineConfigPath, resolvedConfigPath string) error {
+	baselineConfigs := map[string]string{}
+	resolvedConfigs := map[string]string{}
+	if baselineConfigPath != "" || resolvedConfigPath != "" {
+		if baselineConfigPath == "" || resolvedConfigPath == "" {
+			return fmt.Errorf("baseline and resolved configs must be provided together")
+		}
+		baselineConfigs["default"] = baselineConfigPath
+		resolvedConfigs["default"] = resolvedConfigPath
+	}
+	return materializeConfigPayloadsFromGraph(
+		manifestPath,
+		outDir,
+		baselineConfigs,
+		resolvedConfigs,
+	)
+}
+
+func namedConfigPaths(names, baselinePaths, resolvedPaths []string) (map[string]string, map[string]string, error) {
+	if len(names) != len(baselinePaths) || len(names) != len(resolvedPaths) {
+		return nil, nil, fmt.Errorf(
+			"batch config names, baseline configs, and resolved configs must have equal lengths (got %d, %d, and %d)",
+			len(names),
+			len(baselinePaths),
+			len(resolvedPaths),
+		)
+	}
+	baselineConfigs := make(map[string]string, len(names))
+	resolvedConfigs := make(map[string]string, len(names))
+	for index, name := range names {
+		if name == "" {
+			return nil, nil, fmt.Errorf("batch config name %d is empty", index+1)
+		}
+		if _, ok := baselineConfigs[name]; ok {
+			return nil, nil, fmt.Errorf("repeated batch config name %q", name)
+		}
+		baselineConfigs[name] = baselinePaths[index]
+		resolvedConfigs[name] = resolvedPaths[index]
+	}
+	return baselineConfigs, resolvedConfigs, nil
+}
+
+func materializeConfigPayloadsFromGraph(
+	manifestPath,
+	outDir string,
+	baselineConfigPaths,
+	resolvedConfigPaths map[string]string,
+) error {
 	file, err := os.Open(manifestPath)
 	if err != nil {
 		return fmt.Errorf("open manifest: %w", err)
@@ -105,6 +191,39 @@ func materializeConfigPayloads(manifestPath, outDir string) error {
 	if manifest.Arch != "" && !supportedArchitectures[manifest.Arch] {
 		return fmt.Errorf("unsupported Linux ARCH %q", manifest.Arch)
 	}
+	if err := validateCompilerFamily(manifest.CompilerFamily); err != nil {
+		return err
+	}
+	baselineConfigs, err := parseNamedConfigs(baselineConfigPaths, "baseline")
+	if err != nil {
+		return err
+	}
+	resolvedConfigs, err := parseNamedConfigs(resolvedConfigPaths, "selected-toolchain")
+	if err != nil {
+		return err
+	}
+	if len(baselineConfigs) != len(resolvedConfigs) {
+		return fmt.Errorf("baseline and selected-toolchain config sets differ")
+	}
+	for name := range baselineConfigs {
+		if _, ok := resolvedConfigs[name]; !ok {
+			return fmt.Errorf("selected-toolchain config %q is missing", name)
+		}
+	}
+	payloadOwners := manifest.PayloadOwners
+	if len(baselineConfigs) == 0 {
+		if len(payloadOwners) != 0 {
+			return fmt.Errorf("payload owners require named baseline and selected-toolchain configs")
+		}
+		payloadOwners = nil
+	} else if len(payloadOwners) == 0 {
+		if len(baselineConfigs) != 1 {
+			return fmt.Errorf("payload owners are required for multiple named configs")
+		}
+		for name := range baselineConfigs {
+			payloadOwners = map[string][]string{"*": {name}}
+		}
+	}
 
 	ids := make([]string, 0, len(manifest.Payloads))
 	for id := range manifest.Payloads {
@@ -119,9 +238,124 @@ func materializeConfigPayloads(manifestPath, outDir string) error {
 		if err != nil {
 			return fmt.Errorf("parse payload %s: %w", id, err)
 		}
-		if err := materializeConfigPayload(outDir, id, config, manifest.Arch, manifest.Version); err != nil {
+		if payloadOwners != nil {
+			owners := payloadOwners[id]
+			if owners == nil {
+				owners = payloadOwners["*"]
+			}
+			config, err = extractSelectedConfigPayload(
+				id,
+				config,
+				owners,
+				baselineConfigs,
+				resolvedConfigs,
+			)
+			if err != nil {
+				return err
+			}
+		} else {
+			config = configForCompiler(config, manifest.CompilerFamily)
+		}
+		if err := materializeConfigPayload(outDir, id, config, manifest.Arch, manifest.Version, manifest.CompilerFamily); err != nil {
 			return fmt.Errorf("materialize payload %s: %w", id, err)
 		}
+	}
+	return nil
+}
+
+func parseNamedConfigs(paths map[string]string, kind string) (map[string]map[string]string, error) {
+	configs := make(map[string]map[string]string, len(paths))
+	for name, path := range paths {
+		config, err := parseConfigFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s config %q: %w", kind, name, err)
+		}
+		configs[name] = config
+	}
+	return configs, nil
+}
+
+func parseConfigFile(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer file.Close()
+	config, err := kconfig.ParseConfig(file)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return config, nil
+}
+
+func extractSelectedConfigPayload(
+	payloadID string,
+	baselinePayload map[string]string,
+	owners []string,
+	baselineConfigs,
+	resolvedConfigs map[string]map[string]string,
+) (map[string]string, error) {
+	if len(owners) == 0 {
+		return nil, fmt.Errorf("config payload %s has no reachable graph config", payloadID)
+	}
+	var selected map[string]string
+	selectedOwner := ""
+	for _, owner := range owners {
+		baseline, ok := baselineConfigs[owner]
+		if !ok {
+			return nil, fmt.Errorf("config payload %s references unavailable baseline config %q", payloadID, owner)
+		}
+		resolved, ok := resolvedConfigs[owner]
+		if !ok {
+			return nil, fmt.Errorf("config payload %s references unavailable selected-toolchain config %q", payloadID, owner)
+		}
+		candidate := make(map[string]string, len(baselinePayload))
+		for key, payloadValue := range baselinePayload {
+			baselineValue := configValue(baseline, key)
+			if baselineValue != payloadValue {
+				return nil, fmt.Errorf(
+					"config payload %s field %s=%s does not match baseline config %s value %s",
+					payloadID,
+					key,
+					payloadValue,
+					owner,
+					baselineValue,
+				)
+			}
+			candidate[key] = configValue(resolved, key)
+		}
+		if selected == nil {
+			selected = candidate
+			selectedOwner = owner
+			continue
+		}
+		for key, value := range candidate {
+			if selected[key] != value {
+				return nil, fmt.Errorf(
+					"config payload %s field %s resolves differently for graph configs %s (%s) and %s (%s)",
+					payloadID,
+					key,
+					selectedOwner,
+					selected[key],
+					owner,
+					value,
+				)
+			}
+		}
+	}
+	return selected, nil
+}
+
+func configValue(config map[string]string, key string) string {
+	if value := config[key]; value != "" {
+		return value
+	}
+	return "n"
+}
+
+func validateCompilerFamily(compilerFamily string) error {
+	if compilerFamily != "" && compilerFamily != "clang" && compilerFamily != "gcc" {
+		return fmt.Errorf("unsupported compiler family %q", compilerFamily)
 	}
 	return nil
 }
@@ -178,7 +412,7 @@ func isContentID(value string) bool {
 	return true
 }
 
-func materializeConfigPayload(outDir, id string, config map[string]string, arch, version string) error {
+func materializeConfigPayload(outDir, id string, config map[string]string, arch, version, compilerFamily string) error {
 	root := filepath.Join(outDir, id)
 	autoConf := filepath.Join(root, "include", "config", "auto.conf")
 	files := map[string]string{
@@ -189,8 +423,8 @@ func materializeConfigPayload(outDir, id string, config map[string]string, arch,
 		filepath.Join(root, "include", "generated", "autoconf.h"):              autoconfText(config),
 		filepath.Join(root, "include", "generated", "integer-wrap.h"):          "",
 		filepath.Join(root, "include", "generated", "rustc_cfg"):               rustcConfigText(config),
-		filepath.Join(root, "include", "generated", "bazel_kbuild_aflags.rsp"): configFlagsResponse(config, arch, version, true),
-		filepath.Join(root, "include", "generated", "bazel_kbuild_cflags.rsp"): configFlagsResponse(config, arch, version, false),
+		filepath.Join(root, "include", "generated", "bazel_kbuild_aflags.rsp"): configFlagsResponse(config, arch, version, compilerFamily, true),
+		filepath.Join(root, "include", "generated", "bazel_kbuild_cflags.rsp"): configFlagsResponse(config, arch, version, compilerFamily, false),
 	}
 	paths := make([]string, 0, len(files))
 	for path := range files {
@@ -206,6 +440,24 @@ func materializeConfigPayload(outDir, id string, config map[string]string, arch,
 		}
 	}
 	return nil
+}
+
+func configForCompiler(config map[string]string, compilerFamily string) map[string]string {
+	if compilerFamily == "" {
+		return config
+	}
+	normalized := make(map[string]string, len(config)+1)
+	for key, value := range config {
+		normalized[key] = value
+	}
+	if compilerFamily == "clang" {
+		normalized["CONFIG_CC_IS_CLANG"] = "y"
+		normalized["CONFIG_CC_IS_GCC"] = "n"
+	} else {
+		normalized["CONFIG_CC_IS_CLANG"] = "n"
+		normalized["CONFIG_CC_IS_GCC"] = "y"
+	}
+	return normalized
 }
 
 func configText(config map[string]string) string {
@@ -265,14 +517,14 @@ func sortedConfigKeys(config map[string]string) []string {
 	return keys
 }
 
-func configFlagsResponse(config map[string]string, arch, version string, assembly bool) string {
+func configFlagsResponse(config map[string]string, arch, version, compilerFamily string, assembly bool) string {
 	if arch == "" {
 		return ""
 	}
 	if assembly {
-		return responseFile(linuxAFlags(config, arch, version))
+		return responseFile(linuxAFlagsForCompiler(config, arch, version, compilerFamily))
 	}
-	return responseFile(linuxCFlags(config, arch, version))
+	return responseFile(linuxCFlagsForCompiler(config, arch, version, compilerFamily))
 }
 
 func unquote(value string) string {
@@ -283,6 +535,11 @@ func unquote(value string) string {
 }
 
 func linuxCFlags(config map[string]string, arch, version string) []string {
+	return linuxCFlagsForCompiler(config, arch, version, "")
+}
+
+func linuxCFlagsForCompiler(config map[string]string, arch, version, compilerFamily string) []string {
+	isClang := compilerIsClang(config, compilerFamily)
 	flags := []string{
 		"-std=gnu11",
 		"-fshort-wchar",
@@ -298,7 +555,7 @@ func linuxCFlags(config map[string]string, arch, version string) []string {
 		"-Wno-pointer-sign",
 		"-Wno-trigraphs",
 	}
-	if enabled(config, "CONFIG_CC_IS_CLANG") {
+	if isClang {
 		flags = append(flags,
 			"-fno-addrsig",
 			"-Wno-default-const-init-unsafe",
@@ -345,7 +602,7 @@ func linuxCFlags(config map[string]string, arch, version string) []string {
 	}
 	if enabled(config, "CONFIG_INIT_STACK_ALL_ZERO") {
 		flags = append(flags, "-ftrivial-auto-var-init=zero")
-		if enabled(config, "CONFIG_CC_HAS_AUTO_VAR_INIT_ZERO_ENABLER") {
+		if isClang && enabled(config, "CONFIG_CC_HAS_AUTO_VAR_INIT_ZERO_ENABLER") {
 			flags = append(flags, "-enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang")
 		}
 	}
@@ -356,17 +613,17 @@ func linuxCFlags(config map[string]string, arch, version string) []string {
 	if enabled(config, "CONFIG_DEBUG_SECTION_MISMATCH") {
 		flags = append(flags, "-fno-inline-functions-called-once")
 	}
-	if enabled(config, "CONFIG_CC_IS_CLANG") {
+	if isClang {
 		flags = append(flags, "-fno-stack-clash-protection")
 	}
 	if alignment := config["CONFIG_FUNCTION_ALIGNMENT"]; alignment != "" {
-		if enabled(config, "CONFIG_CC_HAS_MIN_FUNCTION_ALIGNMENT") && !enabled(config, "CONFIG_CC_IS_CLANG") {
+		if enabled(config, "CONFIG_CC_HAS_MIN_FUNCTION_ALIGNMENT") && !isClang {
 			flags = append(flags, "-fmin-function-alignment="+alignment)
 		} else {
 			flags = append(flags, "-falign-functions="+alignment)
 		}
 	}
-	if enabled(config, "CONFIG_CC_IS_CLANG") {
+	if isClang {
 		flags = append(flags, "-fstrict-flex-arrays=3")
 	}
 	flags = append(flags,
@@ -374,12 +631,12 @@ func linuxCFlags(config map[string]string, arch, version string) []string {
 		"-fno-stack-check",
 		"-fno-builtin-wcslen",
 	)
-	if !enabled(config, "CONFIG_CC_IS_CLANG") {
+	if !isClang {
 		flags = append(flags, "-fconserve-stack")
 	}
 	switch arch {
 	case "arm":
-		flags = append(flags, armCFlags(config)...)
+		flags = append(flags, armCFlags(config, isClang)...)
 	case "arm64":
 		flags = append(flags, arm64CFlags(config)...)
 	case "powerpc":
@@ -387,9 +644,20 @@ func linuxCFlags(config map[string]string, arch, version string) []string {
 	case "riscv":
 		flags = append(flags, riscvCFlags(config, version)...)
 	case "x86":
-		flags = append(flags, x86CFlags(config, version)...)
+		flags = append(flags, x86CFlags(config, version, isClang)...)
 	}
 	return flags
+}
+
+func compilerIsClang(config map[string]string, compilerFamily string) bool {
+	switch compilerFamily {
+	case "clang":
+		return true
+	case "gcc":
+		return false
+	default:
+		return enabled(config, "CONFIG_CC_IS_CLANG")
+	}
 }
 
 func ftraceFlags(config map[string]string, arch string) []string {
@@ -448,7 +716,7 @@ func debugInfoFlags(config map[string]string) []string {
 	return flags
 }
 
-func x86CFlags(config map[string]string, version string) []string {
+func x86CFlags(config map[string]string, version string, isClang bool) []string {
 	flags := []string{
 		"-mno-sse",
 		"-mno-mmx",
@@ -468,11 +736,15 @@ func x86CFlags(config map[string]string, version string) []string {
 			"-falign-loops=1",
 			"-mno-80387",
 			"-mno-fp-ret-in-387",
-			"-mstack-alignment=8",
 			"-mskip-rax-setup",
 			"-mno-red-zone",
 			"-mcmodel=kernel",
 		)
+		if isClang {
+			flags = append(flags, "-mstack-alignment=8")
+		} else {
+			flags = append(flags, "-mpreferred-stack-boundary=3")
+		}
 		if enabled(config, "CONFIG_X86_NATIVE_CPU") {
 			flags = append(flags, "-march=native")
 		} else {
@@ -489,10 +761,10 @@ func x86CFlags(config map[string]string, version string) []string {
 	}
 	flags = append(flags, "-Wno-sign-compare", "-fno-asynchronous-unwind-tables")
 	if enabled(config, "CONFIG_MITIGATION_RETPOLINE") {
-		if enabled(config, "CONFIG_CC_IS_CLANG") {
+		if isClang {
 			flags = append(flags, "-mretpoline-external-thunk")
 		} else {
-			flags = append(flags, "-mindirect-branch=thunk-extern", "-mindirect-branch-register")
+			flags = append(flags, "-mindirect-branch=thunk-extern", "-mindirect-branch-register", "-fno-jump-tables")
 		}
 	}
 	if enabled(config, "CONFIG_MITIGATION_RETHUNK") {
@@ -545,9 +817,14 @@ func kernelVersionAtLeast(version string, wantMajor, wantMinor int) bool {
 }
 
 func linuxAFlags(config map[string]string, arch, version string) []string {
+	return linuxAFlagsForCompiler(config, arch, version, "")
+}
+
+func linuxAFlagsForCompiler(config map[string]string, arch, version, compilerFamily string) []string {
+	isClang := compilerIsClang(config, compilerFamily)
 	switch arch {
 	case "arm":
-		return append(armAFlags(config), debugInfoFlags(config)...)
+		return append(armAFlags(config, isClang), debugInfoFlags(config)...)
 	case "arm64":
 		return append(arm64AFlags(config), debugInfoFlags(config)...)
 	case "powerpc":
@@ -644,7 +921,7 @@ func armTune(config map[string]string) string {
 	return ""
 }
 
-func armABIFlags(config map[string]string) []string {
+func armABIFlags(config map[string]string, isClang bool) []string {
 	flags := []string{}
 	if enabled(config, "CONFIG_AEABI") {
 		flags = append(flags, "-mabi=aapcs-linux", "-mfpu=vfp")
@@ -654,7 +931,7 @@ func armABIFlags(config map[string]string) []string {
 	if enabled(config, "CONFIG_ARM_UNWIND") {
 		flags = append(flags, "-funwind-tables")
 	}
-	if enabled(config, "CONFIG_CC_IS_CLANG") {
+	if isClang {
 		flags = append(flags, "-meabi", "gnu")
 	}
 	return flags
@@ -675,7 +952,7 @@ func armISAFlags(config map[string]string, assembly bool) []string {
 	return flags
 }
 
-func armCFlags(config map[string]string) []string {
+func armCFlags(config map[string]string, isClang bool) []string {
 	flags := []string{
 		"-fno-dwarf2-cfi-asm",
 	}
@@ -687,13 +964,13 @@ func armCFlags(config map[string]string) []string {
 	if !enabled(config, "CONFIG_MMU") {
 		flags = append(flags, "-mno-unaligned-access")
 	}
-	if enabled(config, "CONFIG_FRAME_POINTER") && !enabled(config, "CONFIG_CC_IS_CLANG") {
+	if enabled(config, "CONFIG_FRAME_POINTER") && !isClang {
 		flags = append(flags, "-mapcs", "-mno-sched-prolog")
 	}
 	if enabled(config, "CONFIG_CURRENT_POINTER_IN_TPIDRURO") {
 		flags = append(flags, "-mtp=cp15")
 	}
-	flags = append(flags, armABIFlags(config)...)
+	flags = append(flags, armABIFlags(config, isClang)...)
 	flags = append(flags, armISAFlags(config, false)...)
 	march, version := armArchitecture(config)
 	if march != "" {
@@ -708,14 +985,14 @@ func armCFlags(config map[string]string) []string {
 	return append(flags, "-msoft-float", "-Uarm")
 }
 
-func armAFlags(config map[string]string) []string {
+func armAFlags(config map[string]string, isClang bool) []string {
 	flags := []string{"-D__ASSEMBLY__", "-fno-PIE"}
 	if enabled(config, "CONFIG_CPU_BIG_ENDIAN") {
 		flags = append(flags, "-mbig-endian")
 	} else {
 		flags = append(flags, "-mlittle-endian")
 	}
-	flags = append(flags, armABIFlags(config)...)
+	flags = append(flags, armABIFlags(config, isClang)...)
 	flags = append(flags, armISAFlags(config, true)...)
 	if march, version := armArchitecture(config); march != "" {
 		flags = append(flags, "-Wa,-march="+march)

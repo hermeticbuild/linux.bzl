@@ -180,7 +180,7 @@ func newConfigSourceScannerWithCache(opts CompactMetadataOptions, sourceCache *c
 		sourceRoot:   opts.SourceRoot,
 		sourceRoots:  opts.SourceRoots,
 		includeRoots: roots,
-		predefined:   sourcePredefinedSymbols(opts.Srcarch),
+		predefined:   sourcePredefinedSymbols(opts.Srcarch, opts.CompilerFamily),
 		sourceCache:  sourceCache,
 		files:        map[string]scannedSourceFile{},
 		fileErrors:   map[string]error{},
@@ -1450,14 +1450,14 @@ func sourceIdentifierContinue(value byte) bool {
 	return sourceIdentifierStart(value) || value >= '0' && value <= '9'
 }
 
-func sourcePredefinedSymbols(srcarch string) map[string]bool {
+func sourcePredefinedSymbols(srcarch, compilerFamily string) map[string]bool {
 	// ACPICA's aclinux.h defines its standard-header mode only in the
 	// !__KERNEL__ branch. Record that kernel-action consequence explicitly so
 	// scanning acenv.h does not treat libc includes as potentially active.
 	symbols := map[string]bool{
 		"__KERNEL__":   true,
 		"__GNUC__":     true,
-		"__clang__":    true,
+		"__clang__":    compilerFamily != "gcc",
 		"__GENKSYMS__": false,
 		// Linux kernel C actions never enable AVX2. The x86 architecture
 		// Makefile explicitly adds -mno-avx, and non-x86 target compilers do

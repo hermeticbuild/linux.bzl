@@ -1,7 +1,7 @@
 """Native rules for compact, content-addressed Linux build units."""
 
 load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "CPP_LINK_STATIC_LIBRARY_ACTION_NAME", "C_COMPILE_ACTION_NAME")
-load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
+load("@rules_cc//cc:find_cc_toolchain.bzl", "CC_TOOLCHAIN_TYPE", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load(":architecture_linking.bzl", "linux_vmlinux_link_spec")
 load(":architecture_profiles.bzl", "linux_architecture_profile_for_arch")
@@ -9,6 +9,7 @@ load(":clang_resource_headers.bzl", "clang_resource_headers")
 load(":host_cc_toolchain.bzl", "host_cc_toolchain_attr")
 load(":kconfig.bzl", "KconfigInfo")
 load(":linux_module_actions.bzl", "linux_module_actions")
+load(":map_directory_kconfig.bzl", "linux_kconfig_toolchain_probe_helpers")
 load(
     ":path_mapping.bzl",
     "add_directory_arg",
@@ -105,11 +106,11 @@ LinuxCompileEnvironmentIndexInfo = provider(
 )
 
 LinuxSourceInputIndexInfo = provider(
-    doc = "Canonical exact Linux source inputs shared by content-addressed object actions.",
+    doc = "Canonical indexed Linux source inputs with per-group compiler-compatibility supersets.",
     fields = {
         "file_indices": "Dictionary of source-root-relative paths to one-based file indices.",
-        "files": "Canonical list of source files, each labeled exactly once by the index target.",
-        "groups": "List of structs containing the depset and encoded membership for one exact input group.",
+        "files": "Canonical list of generated source files defining the stable numeric index.",
+        "groups": "List of structs containing each indexed group plus its compiler-compatibility input superset.",
         "paths": "Canonical source-root-relative paths aligned with files.",
         "source_tree_info": "Linux source tree used to root and interpret the indexed files.",
     },
@@ -214,6 +215,22 @@ def _linux_source_input_index_impl(ctx):
         file = files[i]
         file_indices[path] = i + 1
 
+    compiler_compatibility_files_by_path = {}
+    for file in ctx.files.compiler_compatibility_srcs:
+        path = _source_tree_relpath(file, root_dir)
+        if not path or path in compiler_compatibility_files_by_path:
+            fail(
+                "linux_source_input_index %s has duplicate or non-canonical compiler compatibility source path %r" %
+                (ctx.label, path),
+            )
+        indexed_file = files_by_path.get(path)
+        if indexed_file != None and indexed_file.path != file.path:
+            fail(
+                "linux_source_input_index %s compiler compatibility source path %s names both %s and %s" %
+                (ctx.label, path, indexed_file.path, file.path),
+            )
+        compiler_compatibility_files_by_path[path] = file
+
     groups = []
     seen_groups = {}
     previous_group = ""
@@ -252,6 +269,20 @@ def _linux_source_input_index_impl(ctx):
                 path = paths[index - 1],
             ))
             previous_index = index
+        group_files_by_path = {
+            group_paths[i]: group_files[i]
+            for i in range(len(group_paths))
+        }
+        group_files_by_path.update(compiler_compatibility_files_by_path)
+        group_paths = sorted(group_files_by_path.keys())
+        group_files = [group_files_by_path[path] for path in group_paths]
+        group_path_files = [
+            struct(
+                file = group_files_by_path[path],
+                path = path,
+            )
+            for path in group_paths
+        ]
         groups.append(struct(
             encoded_membership = "," + encoded + ",",
             files = depset(group_files),
@@ -273,14 +304,18 @@ def _linux_source_input_index_impl(ctx):
 linux_source_input_index = rule(
     implementation = _linux_source_input_index_impl,
     attrs = {
+        "compiler_compatibility_srcs": attr.label_list(
+            allow_files = True,
+            doc = "Compiler-dependent source headers unioned into every indexed input group without changing generated source indices.",
+        ),
         "groups": attr.string_list(
             mandatory = True,
-            doc = "Canonical comma-separated one-based file indices for each exact input group.",
+            doc = "Canonical comma-separated one-based file indices for each generated input group; compatibility sources do not participate in these indices.",
         ),
         "srcs": attr.label_list(
             allow_files = True,
             mandatory = True,
-            doc = "Exact source files, canonicalized by source-root-relative path during analysis.",
+            doc = "Generated source files defining the stable numeric index, canonicalized by source-root-relative path during analysis.",
         ),
         "source_tree_info": attr.label(
             mandatory = True,
@@ -288,7 +323,7 @@ linux_source_input_index = rule(
             doc = "Linux source tree used to derive canonical paths for srcs.",
         ),
     },
-    doc = "Indexes exact source files into shared depsets selected by content-addressed Linux actions.",
+    doc = "Indexes generated source files and adds compiler-compatibility inputs to each selected action group.",
 )
 
 def _cc_feature_configuration(ctx, cc_toolchain):
@@ -299,28 +334,121 @@ def _cc_feature_configuration(ctx, cc_toolchain):
         unsupported_features = ctx.disabled_features,
     )
 
-def _llvm_tool(cc_toolchain, name):
-    basenames = [name, name + ".exe"]
-    matches = [
-        file
-        for file in cc_toolchain.all_files.to_list()
-        if file.basename in basenames
-    ]
+def _is_clang(cc_toolchain):
+    return "clang" in cc_toolchain.compiler.lower()
+
+def _compiler_family(cc_toolchain):
+    compiler = cc_toolchain.compiler.lower()
+    if "clang" in compiler:
+        return "clang"
+    if "gcc" in compiler:
+        return "gcc"
+    fail("linux rules do not recognize selected C/C++ compiler kind %r" % cc_toolchain.compiler)
+
+def _tool_file(cc_toolchain, executable, description, fallback_basenames = []):
+    executable = executable.replace("\\", "/") if executable else ""
+    matches = []
+    if executable:
+        matches = [
+            file
+            for file in cc_toolchain.all_files.to_list()
+            if (
+                file.path.replace("\\", "/") == executable or
+                file.short_path.replace("\\", "/") == executable or
+                executable.endswith("/" + file.short_path.replace("\\", "/"))
+            )
+        ]
+    if not matches and fallback_basenames:
+        matches = [
+            file
+            for file in cc_toolchain.all_files.to_list()
+            if file.basename in fallback_basenames
+        ]
     if len(matches) != 1:
         fail(
-            "selected C/C++ toolchain must provide exactly one %s (%s), found: %s" % (
-                name,
-                ", ".join(basenames),
+            "selected C/C++ toolchain must provide exactly one %s (declared executable %r; fallback basenames %s), found: %s" % (
+                description,
+                executable,
+                ", ".join(fallback_basenames) or "none",
                 ", ".join(sorted([file.path for file in matches])) or "none",
             ),
         )
     return matches[0]
 
-def _llvm_nm(cc_toolchain):
-    return _llvm_tool(cc_toolchain, "llvm-nm")
+def _nm(cc_toolchain):
+    return _tool_file(
+        cc_toolchain,
+        cc_toolchain.nm_executable,
+        "nm",
+        fallback_basenames = ["llvm-nm", "llvm-nm.exe"] if _is_clang(cc_toolchain) else [],
+    )
 
-def _llvm_objcopy(cc_toolchain):
-    return _llvm_tool(cc_toolchain, "llvm-objcopy")
+def _objcopy(cc_toolchain):
+    return _tool_file(
+        cc_toolchain,
+        cc_toolchain.objcopy_executable,
+        "objcopy",
+        fallback_basenames = ["llvm-objcopy", "llvm-objcopy.exe"] if _is_clang(cc_toolchain) else [],
+    )
+
+def _ld(cc_toolchain):
+    return _tool_file(
+        cc_toolchain,
+        cc_toolchain.ld_executable,
+        "ld",
+        fallback_basenames = ["ld.lld", "ld.lld.exe"] if _is_clang(cc_toolchain) else [],
+    )
+
+def _cc_tool_inputs(cc_toolchain, direct = []):
+    """Includes both a selected tool and any runtime files behind its wrapper."""
+    return depset(direct, transitive = [cc_toolchain.all_files])
+
+def _linker_selection_flags(cc_toolchain):
+    return ["-fuse-ld=lld"] if _is_clang(cc_toolchain) else []
+
+def _compiler_adjusted_kbuild_flags(flags, cc_toolchain):
+    if _is_clang(cc_toolchain):
+        return flags
+
+    # The repository graph predates action-selected compiler probes. Translate
+    # the compiler-family branches emitted by its Clang baseline to the exact
+    # GCC branches in the upstream Kbuild files. The map_directory graph
+    # replaces this compatibility bridge by evaluating those branches with the
+    # selected compiler before it emits actions.
+    adjusted = []
+    skip_next = False
+    for index, flag in enumerate(flags):
+        if skip_next:
+            skip_next = False
+            continue
+        if flag == "-fno-addrsig":
+            continue
+        if flag == "-meabi" and index + 1 < len(flags) and flags[index + 1] == "gnu":
+            skip_next = True
+            continue
+        if flag == "-mstack-alignment=4":
+            adjusted.append("-mpreferred-stack-boundary=2")
+            continue
+        if flag == "-mstack-alignment=8":
+            adjusted.append("-mpreferred-stack-boundary=3")
+            continue
+        if flag == "-mretpoline-external-thunk":
+            adjusted.extend([
+                "-mindirect-branch=thunk-extern",
+                "-mindirect-branch-register",
+                "-fno-jump-tables",
+            ])
+            continue
+        if flag == "-mretpoline":
+            adjusted.extend([
+                "-mindirect-branch=thunk-inline",
+                "-mindirect-branch-register",
+            ])
+            continue
+        if flag in ["-Wno-gnu", "-Wno-unused-command-line-argument"]:
+            continue
+        adjusted.append(flag)
+    return adjusted
 
 def _cc_compile_flags(ctx, cc_toolchain, feature_configuration):
     variables = cc_common.create_compile_variables(
@@ -336,7 +464,8 @@ def _cc_compile_flags(ctx, cc_toolchain, feature_configuration):
 
 def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
     flags = _cc_compile_flags(ctx, cc_toolchain, feature_configuration)
-    flags = _linux_rewrite_target_flags(flags, _linux_kbuild_target_triple(ctx))
+    if _is_clang(cc_toolchain):
+        flags = _linux_rewrite_target_flags(flags, _linux_kbuild_target_triple(ctx))
     out = []
     skip_next = False
     drop_count = 0
@@ -392,10 +521,11 @@ def _linux_compile_flags(ctx, cc_toolchain, feature_configuration):
         if flag.startswith("-isystem") and _linux_drop_toolchain_include(flag[len("-isystem"):]):
             continue
         out.append(flag)
-    out = clang_resource_headers.ensure_include(out, cc_toolchain.all_files.to_list())
+    if _is_clang(cc_toolchain):
+        out = clang_resource_headers.ensure_include(out, cc_toolchain.all_files.to_list())
     if "-nostdinc" not in out:
         out.append("-nostdinc")
-    if "-fintegrated-as" not in out:
+    if _is_clang(cc_toolchain) and "-fintegrated-as" not in out:
         out.append("-fintegrated-as")
     return out
 
@@ -510,6 +640,16 @@ def _config_flags(ctx):
     if ctx.attr.config and KconfigInfo in ctx.attr.config:
         flags.update(ctx.attr.config[KconfigInfo].config_flags)
     return flags
+
+def _config_flags_for_compiler(flags, compiler_family):
+    normalized = dict(flags)
+    if compiler_family == "clang":
+        normalized["CONFIG_CC_IS_CLANG"] = "y"
+        normalized["CONFIG_CC_IS_GCC"] = "n"
+    else:
+        normalized["CONFIG_CC_IS_CLANG"] = "n"
+        normalized["CONFIG_CC_IS_GCC"] = "y"
+    return normalized
 
 def _config_value_to_header_suffix(key, value):
     if value == "y":
@@ -1284,7 +1424,7 @@ def _linux_purgatory_compile(ctx, compiler, cc_toolchain, feature_configuration,
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
-    args.add_all([
+    args.add_all(_compiler_adjusted_kbuild_flags([
         "-ffreestanding",
         "-fno-builtin",
         "-fno-stack-protector",
@@ -1295,7 +1435,7 @@ def _linux_purgatory_compile(ctx, compiler, cc_toolchain, feature_configuration,
         "-mcmodel=small",
         "-Wno-unused-command-line-argument",
         "-DDISABLE_BRANCH_PROFILING",
-    ])
+    ], cc_toolchain))
     args.add_all(_linux_object_name_flags(out_relpath))
     args.add_all(extra_flags)
     args.add_all(filtered.flags, format_each = "@%s")
@@ -1335,7 +1475,7 @@ def _linux_purgatory_compile(ctx, compiler, cc_toolchain, feature_configuration,
 def _linux_purgatory_link(ctx, linker, cc_toolchain, objects, out_relpath, relocatable):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
     args = ctx.actions.args()
-    args.add("-fuse-ld=lld")
+    args.add_all(_linker_selection_flags(cc_toolchain))
     args.add("-no-pie")
     args.add("-nostdlib")
     if relocatable:
@@ -1386,7 +1526,6 @@ def _linux_purgatory_outputs(ctx, compiler, linker, cc_toolchain, feature_config
 def _linux_powerpc_purgatory_outputs(
         ctx,
         compiler,
-        linker,
         cc_toolchain,
         feature_configuration,
         config,
@@ -1419,7 +1558,7 @@ def _linux_powerpc_purgatory_outputs(
     )
 
     out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/powerpc/purgatory/purgatory.ro")
-    ld = _linux_x86_tool_sibling(linker, "ld.lld")
+    ld = _ld(cc_toolchain)
     link_args = ctx.actions.args()
     little_endian = config.config_flags.get("CONFIG_CPU_BIG_ENDIAN") != "y"
     link_args.add("-EL" if little_endian else "-EB")
@@ -1536,9 +1675,9 @@ def _linux_riscv_purgatory_compile(
     )
     return out
 
-def _linux_riscv_purgatory_link(ctx, linker, cc_toolchain, config, objects, out_relpath, relocatable):
+def _linux_riscv_purgatory_link(ctx, cc_toolchain, config, objects, out_relpath, relocatable):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
-    ld = _linux_x86_tool_sibling(linker, "ld.lld")
+    ld = _ld(cc_toolchain)
     args = ctx.actions.args()
     args.add_all([
         "-m",
@@ -1582,7 +1721,6 @@ def _linux_riscv_purgatory_link(ctx, linker, cc_toolchain, config, objects, out_
 def _linux_riscv_purgatory_outputs(
         ctx,
         compiler,
-        linker,
         cc_toolchain,
         feature_configuration,
         config,
@@ -1619,7 +1757,6 @@ def _linux_riscv_purgatory_outputs(
         ))
     ro = _linux_riscv_purgatory_link(
         ctx,
-        linker,
         cc_toolchain,
         config,
         objects,
@@ -1628,7 +1765,6 @@ def _linux_riscv_purgatory_outputs(
     )
     chk = _linux_riscv_purgatory_link(
         ctx,
-        linker,
         cc_toolchain,
         config,
         [ro],
@@ -1642,7 +1778,7 @@ def _linux_realmode_compile(ctx, compiler, cc_toolchain, config, generated_heade
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, _cc_feature_configuration(ctx, cc_toolchain)))
-    args.add_all([
+    args.add_all(_compiler_adjusted_kbuild_flags([
         "-std=gnu11",
         "-m16",
         "-g",
@@ -1667,7 +1803,7 @@ def _linux_realmode_compile(ctx, compiler, cc_toolchain, config, generated_heade
         "-D_SETUP",
         "-D_WAKEUP",
         "-fno-asynchronous-unwind-tables",
-    ])
+    ], cc_toolchain))
     if assembly:
         args.add("-D__ASSEMBLY__")
     args.add_all(_linux_source_preinclude_flags_for_root(source_root, assembly))
@@ -1701,7 +1837,7 @@ def _linux_realmode_compile(ctx, compiler, cc_toolchain, config, generated_heade
 
 def _linux_realmode_pasyms(ctx, cc_toolchain, objects):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/realmode/rm/pasyms.h")
-    llvm_nm = _llvm_nm(cc_toolchain)
+    llvm_nm = _nm(cc_toolchain)
     args = ctx.actions.args()
     args.add("-nm", llvm_nm)
     args.add("-out", out)
@@ -1709,7 +1845,7 @@ def _linux_realmode_pasyms(ctx, cc_toolchain, objects):
     path_mapped_run(
         ctx.actions,
         executable = ctx.attr._pasyms[DefaultInfo].files_to_run,
-        inputs = objects,
+        inputs = _cc_tool_inputs(cc_toolchain, objects),
         tools = [llvm_nm],
         outputs = [out],
         arguments = [args],
@@ -1762,9 +1898,9 @@ def _linux_realmode_linker_script(ctx, compiler, cc_toolchain, config, generated
     )
     return out
 
-def _linux_realmode_link(ctx, linker, cc_toolchain, objects, linker_script):
+def _linux_realmode_link(ctx, cc_toolchain, objects, linker_script):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/realmode/rm/realmode.elf")
-    ld = _linux_x86_tool_sibling(linker, "ld.lld")
+    ld = _ld(cc_toolchain)
     args = ctx.actions.args()
     args.add_all([
         "-m",
@@ -1787,7 +1923,7 @@ def _linux_realmode_link(ctx, linker, cc_toolchain, objects, linker_script):
     )
     return out
 
-def _linux_realmode_outputs(ctx, compiler, linker, cc_toolchain, config, generated_headers, source_root):
+def _linux_realmode_outputs(ctx, compiler, cc_toolchain, config, generated_headers, source_root):
     source_specs = [
         ("arch/x86/realmode/rm/header.S", "arch/x86/realmode/rm/header.o"),
         ("arch/x86/realmode/rm/trampoline_64.S", "arch/x86/realmode/rm/trampoline_64.o"),
@@ -1818,7 +1954,7 @@ def _linux_realmode_outputs(ctx, compiler, linker, cc_toolchain, config, generat
 
     pasyms = _linux_realmode_pasyms(ctx, cc_toolchain, objects)
     linker_script = _linux_realmode_linker_script(ctx, compiler, cc_toolchain, config, generated_headers, source_root, pasyms)
-    elf = _linux_realmode_link(ctx, linker, cc_toolchain, objects, linker_script)
+    elf = _linux_realmode_link(ctx, cc_toolchain, objects, linker_script)
 
     bin = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/realmode/rm/realmode.bin")
     objcopy_args = ctx.actions.args()
@@ -1828,8 +1964,8 @@ def _linux_realmode_outputs(ctx, compiler, linker, cc_toolchain, config, generat
     objcopy_args.add(bin)
     path_mapped_run(
         ctx.actions,
-        executable = _llvm_objcopy(cc_toolchain),
-        inputs = [elf],
+        executable = _objcopy(cc_toolchain),
+        inputs = _cc_tool_inputs(cc_toolchain, [elf]),
         outputs = [bin],
         arguments = [objcopy_args],
         mnemonic = "LinuxRealmodeObjcopy",
@@ -1856,7 +1992,8 @@ def _linux_vdso_compile(ctx, compiler, cc_toolchain, feature_configuration, conf
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
-    args.add_all([
+    args.add_all(_compiler_adjusted_kbuild_flags([
+        "-std=gnu11",
         "-mcmodel=small",
         "-fPIC",
         "-O2",
@@ -1868,7 +2005,7 @@ def _linux_vdso_compile(ctx, compiler, cc_toolchain, feature_configuration, conf
         "-DDISABLE_BRANCH_PROFILING",
         "-DBUILD_VDSO",
         "-Wno-unused-command-line-argument",
-    ])
+    ], cc_toolchain))
     args.add_all(_linux_source_preinclude_flags_for_root(source_root, assembly))
     if config:
         _add_config_include_flag(args, config)
@@ -1945,7 +2082,7 @@ def _linux_vdso_linker_script(ctx, compiler, cc_toolchain, feature_configuration
 def _linux_vdso_link(ctx, linker, cc_toolchain, objects, linker_script):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/entry/vdso/vdso64.so.dbg")
     args = ctx.actions.args()
-    args.add("-fuse-ld=lld")
+    args.add_all(_linker_selection_flags(cc_toolchain))
     args.add("-nostdlib")
     args.add("-shared")
     args.add("-Wl,--hash-style=both")
@@ -2005,8 +2142,8 @@ def _linux_vdso_image_source(ctx, compiler, linker, cc_toolchain, feature_config
     objcopy_args.add(stripped)
     path_mapped_run(
         ctx.actions,
-        executable = _llvm_objcopy(cc_toolchain),
-        inputs = [dbg],
+        executable = _objcopy(cc_toolchain),
+        inputs = _cc_tool_inputs(cc_toolchain, [dbg]),
         outputs = [stripped],
         arguments = [objcopy_args],
         mnemonic = "LinuxVDSOObjcopy",
@@ -2208,7 +2345,6 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         purgatory = _linux_riscv_purgatory_outputs(
             ctx,
             compiler,
-            linker,
             cc_toolchain,
             feature_configuration,
             config,
@@ -2223,7 +2359,6 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         purgatory = _linux_powerpc_purgatory_outputs(
             ctx,
             compiler,
-            linker,
             cc_toolchain,
             feature_configuration,
             config,
@@ -2238,7 +2373,6 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         realmode = _linux_realmode_outputs(
             ctx,
             compiler,
-            linker,
             cc_toolchain,
             config,
             generated_headers,
@@ -2636,11 +2770,7 @@ def _linux_arm64_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, 
         _linux_arm64_vdso_compile(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, include_dir_anchors, generated_inputs, _source_tree_file(ctx, "arch/arm64/kernel/vdso/vgetrandom-chacha.S"), base + "/arch/arm64/kernel/vdso/vgetrandom-chacha.o"),
     ]
     linker_script = _linux_arm64_vdso_linker_script(ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, include_dir_anchors, generated_inputs, base + "/arch/arm64/kernel/vdso/vdso.lds")
-    linker = cc_common.get_tool_for_action(
-        feature_configuration = feature_configuration,
-        action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
-    )
-    ld = _linux_x86_tool_sibling(linker, "ld.lld")
+    ld = _ld(cc_toolchain)
     dbg = ctx.actions.declare_file(base + "/arch/arm64/kernel/vdso/vdso.so.dbg")
     link_args = ctx.actions.args()
     link_args.add_all([
@@ -2674,8 +2804,8 @@ def _linux_arm64_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, 
         progress_message = "Linking Linux arm64 vDSO %{label}",
     )
 
-    llvm_nm = _llvm_nm(cc_toolchain)
-    llvm_objcopy = _llvm_objcopy(cc_toolchain)
+    llvm_nm = _nm(cc_toolchain)
+    llvm_objcopy = _objcopy(cc_toolchain)
     so = ctx.actions.declare_file(base + "/arch/arm64/kernel/vdso/vdso.so")
     objcopy_args = ctx.actions.args()
     objcopy_args.add("-S")
@@ -2684,7 +2814,7 @@ def _linux_arm64_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, 
     path_mapped_run(
         ctx.actions,
         executable = llvm_objcopy,
-        inputs = [dbg],
+        inputs = _cc_tool_inputs(cc_toolchain, [dbg]),
         outputs = [so],
         arguments = [objcopy_args],
         mnemonic = "LinuxARM64VDSOObjcopy",
@@ -2699,7 +2829,7 @@ def _linux_arm64_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, 
     path_mapped_run(
         ctx.actions,
         executable = ctx.attr._runandwrite[DefaultInfo].files_to_run,
-        inputs = [dbg],
+        inputs = _cc_tool_inputs(cc_toolchain, [dbg]),
         tools = [llvm_nm],
         outputs = [nm],
         arguments = [nm_args],
@@ -2727,8 +2857,9 @@ def _linux_arm64_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, 
 
 def _add_linux_arm64_vdso32_common_flags(args, ctx, cc_toolchain, feature_configuration, config, source_root, include_dirs, include_dir_anchors):
     args.add_all(_linux_compile_flags_without_target(ctx, cc_toolchain, feature_configuration))
+    if _is_clang(cc_toolchain):
+        args.add("--target=arm-linux-gnueabi")
     args.add_all([
-        "--target=arm-linux-gnueabi",
         "-nostdinc",
         "-DBUILD_VDSO",
         "-D__KERNEL__",
@@ -2817,8 +2948,9 @@ def _linux_arm64_vdso32_linker_script(ctx, cc_toolchain, feature_configuration, 
     out = ctx.actions.declare_file(out_relpath)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags_without_target(ctx, cc_toolchain, feature_configuration))
+    if _is_clang(cc_toolchain):
+        args.add("--target=arm-linux-gnueabi")
     args.add_all([
-        "--target=arm-linux-gnueabi",
         "-E",
         "-P",
         "-C",
@@ -2866,9 +2998,10 @@ def _linux_arm64_vdso32_outputs(ctx, cc_toolchain, feature_configuration, config
     )
     raw = ctx.actions.declare_file(base + "/arch/arm64/kernel/vdso32/vdso.so.raw")
     link_args = ctx.actions.args()
+    if _is_clang(cc_toolchain):
+        link_args.add("--target=arm-linux-gnueabi")
+    link_args.add_all(_linker_selection_flags(cc_toolchain))
     link_args.add_all([
-        "--target=arm-linux-gnueabi",
-        "-fuse-ld=lld",
         "-nostdlib",
         "-shared",
         "-Wl,-Bsymbolic",
@@ -2914,8 +3047,8 @@ def _linux_arm64_vdso32_outputs(ctx, cc_toolchain, feature_configuration, config
     objcopy_args.add(so)
     path_mapped_run(
         ctx.actions,
-        executable = _llvm_objcopy(cc_toolchain),
-        inputs = [dbg],
+        executable = _objcopy(cc_toolchain),
+        inputs = _cc_tool_inputs(cc_toolchain, [dbg]),
         outputs = [so],
         arguments = [objcopy_args],
         mnemonic = "LinuxARM64VDSO32Objcopy",
@@ -4241,13 +4374,7 @@ def _linux_arm_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, ge
         base + "/arch/arm/vdso/vdso.lds",
     )
     raw = ctx.actions.declare_file(base + "/arch/arm/vdso/vdso.so.raw")
-    linker = _linux_x86_tool_sibling(
-        cc_common.get_tool_for_action(
-            feature_configuration = feature_configuration,
-            action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
-        ),
-        "ld.lld",
-    )
+    linker = _ld(cc_toolchain)
     link_args = ctx.actions.args()
     link_args.add_all([
         "-EB" if config.config_flags.get("CONFIG_CPU_BIG_ENDIAN") == "y" else "-EL",
@@ -4298,8 +4425,8 @@ def _linux_arm_vdso_outputs(ctx, cc_toolchain, feature_configuration, config, ge
     objcopy_args.add(so)
     path_mapped_run(
         ctx.actions,
-        executable = _llvm_objcopy(cc_toolchain),
-        inputs = [dbg],
+        executable = _objcopy(cc_toolchain),
+        inputs = _cc_tool_inputs(cc_toolchain, [dbg]),
         outputs = [so],
         arguments = [objcopy_args],
         mnemonic = "LinuxARMVDSOObjcopy",
@@ -4342,7 +4469,8 @@ def _linux_riscv_vdso_compile(
     args = ctx.actions.args()
     if compat:
         args.add_all(_linux_compile_flags_without_target(ctx, cc_toolchain, feature_configuration))
-        args.add("--target=riscv32-linux-gnu")
+        if _is_clang(cc_toolchain):
+            args.add("--target=riscv32-linux-gnu")
         args.add("-march=rv32g" if config.config_flags.get("CONFIG_TOOLCHAIN_NEEDS_EXPLICIT_ZICSR_ZIFENCEI") == "y" else "-march=rv32imafd")
         args.add("-mabi=ilp32")
     else:
@@ -4410,7 +4538,8 @@ def _linux_riscv_vdso_linker_script(
     args = ctx.actions.args()
     if compat:
         args.add_all(_linux_compile_flags_without_target(ctx, cc_toolchain, feature_configuration))
-        args.add("--target=riscv32-linux-gnu")
+        if _is_clang(cc_toolchain):
+            args.add("--target=riscv32-linux-gnu")
     else:
         args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
     args.add_all([
@@ -4524,13 +4653,7 @@ def _linux_riscv_vdso_link(
         base,
         compat,
     )
-    linker = _linux_x86_tool_sibling(
-        cc_common.get_tool_for_action(
-            feature_configuration = feature_configuration,
-            action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
-        ),
-        "ld.lld",
-    )
+    linker = _ld(cc_toolchain)
     raw = ctx.actions.declare_file(base + "/arch/riscv/kernel/%s/%s.so.raw" % (directory, name))
     link_args = ctx.actions.args()
     link_args.add_all(["-m", "elf32lriscv" if compat else "elf64lriscv", "-shared"])
@@ -4559,8 +4682,8 @@ def _linux_riscv_vdso_link(
     keep_args.add_all([raw, dbg])
     path_mapped_run(
         ctx.actions,
-        executable = _llvm_objcopy(cc_toolchain),
-        inputs = [raw],
+        executable = _objcopy(cc_toolchain),
+        inputs = _cc_tool_inputs(cc_toolchain, [raw]),
         outputs = [dbg],
         arguments = [keep_args],
         mnemonic = "LinuxRISCVCompatVDSOSymbols" if compat else "LinuxRISCVVDSOSymbols",
@@ -4571,8 +4694,8 @@ def _linux_riscv_vdso_link(
     strip_args.add_all(["-S", dbg, so])
     path_mapped_run(
         ctx.actions,
-        executable = _llvm_objcopy(cc_toolchain),
-        inputs = [dbg],
+        executable = _objcopy(cc_toolchain),
+        inputs = _cc_tool_inputs(cc_toolchain, [dbg]),
         outputs = [so],
         arguments = [strip_args],
         mnemonic = "LinuxRISCVCompatVDSOStrip" if compat else "LinuxRISCVVDSOStrip",
@@ -4854,13 +4977,7 @@ def _linux_powerpc_vdso_outputs(
         base,
         bits,
     )
-    linker = _linux_x86_tool_sibling(
-        cc_common.get_tool_for_action(
-            feature_configuration = feature_configuration,
-            action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
-        ),
-        "ld.lld",
-    )
+    linker = _ld(cc_toolchain)
     dbg = ctx.actions.declare_file(base + "/arch/powerpc/kernel/vdso/vdso%d.so.dbg" % bits)
     link_args = ctx.actions.args()
     little_endian = config.config_flags.get("CONFIG_CPU_BIG_ENDIAN") != "y"
@@ -5263,7 +5380,8 @@ def _declare_linux_config(ctx, config_dir, flags, kernel_version):
         outputs = outputs,
     )
 
-def _materialize_linux_config(ctx, config_dir, flags, arch, version):
+def _materialize_linux_config(ctx, config_dir, flags, arch, version, compiler_family):
+    flags = _config_flags_for_compiler(flags, compiler_family)
     declared = _declare_linux_config(ctx, config_dir, flags, version)
     info = declared.info
     config_lines = []
@@ -5305,6 +5423,7 @@ def _materialize_linux_config(ctx, config_dir, flags, arch, version):
         cflags_args = ctx.actions.args()
         cflags_args.add("-config", info.config)
         cflags_args.add("-arch", arch)
+        cflags_args.add("-compiler_family", compiler_family)
         cflags_args.add("-version", version)
         cflags_args.add("-out", info.cflags)
         cflags_args.add("-asm_out", info.aflags)
@@ -5324,12 +5443,14 @@ def _materialize_linux_config(ctx, config_dir, flags, arch, version):
     return info
 
 def _linux_config_impl(ctx):
+    compiler_family = _compiler_family(find_cpp_toolchain(ctx))
     info = _materialize_linux_config(
         ctx,
         ctx.label.name + ".config_tree",
         _config_flags(ctx),
         ctx.attr.arch,
         ctx.attr.version,
+        compiler_family,
     )
     return [
         DefaultInfo(files = info.files),
@@ -5352,6 +5473,8 @@ linux_config = rule(
             executable = True,
         ),
     },
+    fragments = ["cpp"],
+    toolchains = use_cc_toolchain(),
     doc = "Materializes Linux config files used by native compile and link actions.",
 )
 
@@ -5487,6 +5610,16 @@ def _merge_compile_environment_generated_header_families(environment_id, family_
 def _linux_compile_environment_index_impl(ctx):
     if not ctx.attr.expected_abi:
         fail("linux_compile_environment_index %s expected_abi must be a non-empty string" % ctx.label)
+    baseline_config_names = sorted(ctx.attr.baseline_configs.keys())
+    resolved_config_names = sorted(ctx.attr.resolved_configs.keys())
+    if baseline_config_names != resolved_config_names:
+        fail(
+            "linux_compile_environment_index %s baseline configs %s do not match resolved configs %s" %
+            (ctx.label, baseline_config_names, resolved_config_names),
+        )
+    if bool(baseline_config_names) != bool(ctx.attr.config_payload_owners):
+        fail("linux_compile_environment_index %s requires config_payload_owners and named configs together" % ctx.label)
+    compiler_family = _compiler_family(find_cpp_toolchain(ctx))
     raw_environments = {}
     referenced_payloads = {}
     for environment_id, encoded in ctx.attr.compile_environments.items():
@@ -5523,6 +5656,8 @@ def _linux_compile_environment_index_impl(ctx):
         if type(family_ids) != "list":
             fail("compile environment %s generated_header_families must be a list" % environment_id)
         _validate_content_id(payload_id, "compile environment %s config payload" % environment_id)
+        if ctx.attr.config_payload_owners and payload_id not in ctx.attr.config_payload_owners:
+            continue
         for family_id in family_ids:
             if type(family_id) != "string":
                 fail("compile environment %s generated-header family IDs must be strings" % environment_id)
@@ -5532,8 +5667,32 @@ def _linux_compile_environment_index_impl(ctx):
         )
         referenced_payloads[payload_id] = True
 
-    config_payload_contents_by_bucket = {}
-    config_payload_outputs_by_bucket = {}
+    for payload_id, owners in ctx.attr.config_payload_owners.items():
+        _validate_content_id(payload_id, "config payload owner ID")
+        if payload_id not in ctx.attr.config_payloads:
+            fail("config payload owners reference unknown payload %s" % payload_id)
+        if not owners:
+            fail("config payload %s has no owners" % payload_id)
+        if owners != sorted(owners) or len({owner: True for owner in owners}) != len(owners):
+            fail("config payload %s owners must be sorted and unique" % payload_id)
+        for owner in owners:
+            if owner not in ctx.attr.baseline_configs:
+                fail("config payload %s references unknown owner %s" % (payload_id, owner))
+
+    owner_set_indices = {}
+    if baseline_config_names:
+        owner_set_keys = {
+            json.encode(owners): True
+            for owners in ctx.attr.config_payload_owners.values()
+        }
+        owner_set_indices = {
+            owner_set_key: index
+            for index, owner_set_key in enumerate(sorted(owner_set_keys.keys()))
+        }
+
+    config_payload_contents_by_action = {}
+    config_payload_outputs_by_action = {}
+    config_payload_owners_by_action = {}
     config_payloads = {}
     for payload_id in sorted(referenced_payloads.keys()):
         if payload_id not in ctx.attr.config_payloads:
@@ -5543,44 +5702,62 @@ def _linux_compile_environment_index_impl(ctx):
         declared = _declare_linux_config(
             ctx,
             ctx.label.name + ".config_payloads/" + payload_id,
-            _parse_config_payload(payload_id, content),
+            _config_flags_for_compiler(_parse_config_payload(payload_id, content), compiler_family),
             ctx.attr.version,
         )
-        bucket = payload_id[0]
-        if bucket not in config_payload_contents_by_bucket:
-            config_payload_contents_by_bucket[bucket] = {}
-            config_payload_outputs_by_bucket[bucket] = []
-        config_payload_contents_by_bucket[bucket][payload_id] = content
-        config_payload_outputs_by_bucket[bucket].extend(declared.outputs)
+        owners = ctx.attr.config_payload_owners.get(payload_id, [])
+        action_key = payload_id[0]
+        if owners:
+            action_key += "_%d" % owner_set_indices[json.encode(owners)]
+        if action_key not in config_payload_contents_by_action:
+            config_payload_contents_by_action[action_key] = {}
+            config_payload_outputs_by_action[action_key] = []
+            config_payload_owners_by_action[action_key] = owners
+        config_payload_contents_by_action[action_key][payload_id] = content
+        config_payload_outputs_by_action[action_key].extend(declared.outputs)
         config_payloads[payload_id] = declared.info
     for payload_id in ctx.attr.config_payloads.keys():
         _validate_content_id(payload_id, "config payload ID")
 
-    for bucket in sorted(config_payload_contents_by_bucket.keys()):
-        manifest = ctx.actions.declare_file(ctx.label.name + ".config_payloads_%s_manifest.json" % bucket)
+    for action_key in sorted(config_payload_contents_by_action.keys()):
+        manifest = ctx.actions.declare_file(ctx.label.name + ".config_payloads_%s_manifest.json" % action_key)
         ctx.actions.write(
             manifest,
             json.encode({
                 "arch": ctx.attr.arch,
-                "payloads": config_payload_contents_by_bucket[bucket],
+                "compiler_family": compiler_family,
+                "payloads": config_payload_contents_by_action[action_key],
+                "payload_owners": {
+                    payload_id: ctx.attr.config_payload_owners[payload_id]
+                    for payload_id in config_payload_contents_by_action[action_key].keys()
+                } if baseline_config_names else {},
                 "version": ctx.attr.version,
             }) + "\n",
         )
         payload_args = ctx.actions.args()
         payload_args.add("-batch_manifest", manifest)
         payload_args.add("-batch_out_dir")
-        first_payload_id = sorted(config_payload_contents_by_bucket[bucket].keys())[0]
+        first_payload_id = sorted(config_payload_contents_by_action[action_key].keys())[0]
         first_payload = config_payloads[first_payload_id]
         payload_root = first_payload.config.dirname.rsplit("/", 1)[0]
         add_directory_arg(
             payload_args,
             directory_anchor(first_payload.config, payload_root),
         )
+        payload_inputs = [manifest]
+        if baseline_config_names:
+            for config_name in config_payload_owners_by_action[action_key]:
+                baseline_config = ctx.attr.baseline_configs[config_name][KconfigInfo].config
+                resolved_config = ctx.attr.resolved_configs[config_name][LinuxConfigInfo].config
+                payload_args.add("-batch_config_name", config_name)
+                payload_args.add("-batch_baseline_config", baseline_config)
+                payload_args.add("-batch_resolved_config", resolved_config)
+                payload_inputs.extend([baseline_config, resolved_config])
         path_mapped_run(
             ctx.actions,
             executable = ctx.executable._kernelflags,
-            inputs = [manifest],
-            outputs = config_payload_outputs_by_bucket[bucket],
+            inputs = payload_inputs,
+            outputs = config_payload_outputs_by_action[action_key],
             arguments = [payload_args],
             mnemonic = "LinuxConfigPayloads",
             progress_message = "Materializing Linux config payloads %{label}",
@@ -5645,9 +5822,16 @@ linux_compile_environment_index = rule(
         "arch": attr.string(
             doc = "Linux ARCH used to derive compiler and assembler flags for materialized payloads.",
         ),
+        "baseline_configs": attr.string_keyed_label_dict(
+            providers = [KconfigInfo],
+            doc = "Named repository-resolved configs used to validate compact payload symbol recipes.",
+        ),
         "compile_environments": attr.string_dict(
             mandatory = True,
             doc = "Map of full compile-environment SHA-256 IDs to JSON config-payload/generated-header-family references.",
+        ),
+        "config_payload_owners": attr.string_list_dict(
+            doc = "Map of active config-payload IDs to graph config names that reach them.",
         ),
         "config_payloads": attr.string_dict(
             mandatory = True,
@@ -5656,6 +5840,10 @@ linux_compile_environment_index = rule(
         "generated_headers": attr.label_list(
             providers = [LinuxGeneratedHeadersInfo],
             doc = "Generated-header providers whose content-addressed families are indexed.",
+        ),
+        "resolved_configs": attr.string_keyed_label_dict(
+            providers = [LinuxConfigInfo],
+            doc = "Named action-time configs resolved with the selected C/C++ toolchain.",
         ),
         "expected_abi": attr.string(
             mandatory = True,
@@ -5668,21 +5856,10 @@ linux_compile_environment_index = rule(
             executable = True,
         ),
     },
+    fragments = ["cpp"],
+    toolchains = use_cc_toolchain(),
     doc = "Materializes and indexes content-addressed Linux compile environments without per-environment targets.",
 )
-
-def _add_linux_probe_args(args, allow_shell, vars, env):
-    if not allow_shell:
-        return
-    vars_arch = vars.get("ARCH", "")
-    env_arch = env.get("ARCH", "")
-    if vars_arch and env_arch and vars_arch != env_arch:
-        fail("Linux probe ARCH differs between vars (%r) and env (%r)" % (vars_arch, env_arch))
-    architecture = env_arch or vars_arch
-    if not architecture:
-        fail("allow_shell requires ARCH in vars or env for the fixed Linux probe policy")
-    args.add("-allow_shell")
-    args.add("-linux_probe_arch", architecture)
 
 def _linux_compiler_version_string():
     return "clang version 22.1.8None, LLD 22.1.8"
@@ -5722,6 +5899,9 @@ def _materialize_rust_toolchain_probe(ctx):
     return out
 
 def _resolve_linux_config(ctx, rust_toolchain_probe):
+    cc_toolchain = find_cpp_toolchain(ctx)
+    compiler_family = _compiler_family(cc_toolchain)
+    feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
     config_dir = ctx.label.name + ".config_tree"
     config = ctx.actions.declare_file(config_dir + "/.config")
     auto_conf = ctx.actions.declare_file(config_dir + "/include/config/auto.conf")
@@ -5764,8 +5944,65 @@ def _resolve_linux_config(ctx, rust_toolchain_probe):
     args.add("-kernel_version", ctx.attr.version)
     if rust_toolchain_probe:
         args.add("-rust_toolchain_probe", rust_toolchain_probe)
-        args.add("-validate_config_equivalence")
-    _add_linux_probe_args(args, ctx.attr.allow_shell, vars, env)
+
+        # The repository snapshot is generated with Clang. GCC intentionally
+        # changes compiler-derived structural symbols, so the Rust-only
+        # equivalence check is meaningful only when Clang remains selected.
+        if compiler_family == "clang":
+            args.add("-validate_config_equivalence")
+    probe_tools = None
+    tool_environment = {}
+    if ctx.attr.allow_shell:
+        vars_arch = vars.get("ARCH", "")
+        env_arch = env.get("ARCH", "")
+        if vars_arch and env_arch and vars_arch != env_arch:
+            fail("Linux probe ARCH differs between vars (%r) and env (%r)" % (vars_arch, env_arch))
+        profile = linux_architecture_profile_for_arch(env_arch or vars_arch or "x86")
+        compiler_path = cc_common.get_tool_for_action(
+            feature_configuration = feature_configuration,
+            action_name = C_COMPILE_ACTION_NAME,
+        )
+        compiler = linux_kconfig_toolchain_probe_helpers.tool_file_for_path(
+            cc_toolchain,
+            compiler_path,
+            "C compiler",
+        )
+        probe_tools = linux_kconfig_toolchain_probe_helpers.selected_probe_tools(
+            cc_toolchain,
+            feature_configuration,
+            compiler,
+            compiler_family,
+        )
+        compile_action = linux_kconfig_toolchain_probe_helpers.configured_compile_action(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+        )
+        linker_driver = linux_kconfig_toolchain_probe_helpers.configured_linker_driver_prefix(
+            ctx,
+            cc_toolchain,
+            feature_configuration,
+        )
+        tool_environment = dict(compile_action.environment)
+        tool_environment["EXECROOT"] = "."
+        for name, value in linker_driver.environment.items():
+            if name in tool_environment and tool_environment[name] != value:
+                fail("Linux config probe has conflicting compile/link toolchain environment %s" % name)
+            tool_environment[name] = value
+
+        args.add("-target_profile", profile.name)
+        args.add("-linux_arch", profile.linux_arch)
+        args.add("-linux_probe_arch", profile.linux_arch)
+        args.add("-target_triple", profile.target_triple)
+        args.add("-probe_cc", compiler)
+        args.add("-probe_ld", probe_tools.linker)
+        args.add("-probe_ar", probe_tools.archiver)
+        args.add("-probe_nm", probe_tools.nm)
+        args.add("-probe_objcopy", probe_tools.objcopy)
+        for value in compile_action.probe_prefix:
+            args.add("-probe_cc_arg", value)
+        for value in linker_driver.flags:
+            args.add("-probe_link_arg", value)
     for key, value in sorted(vars.items()):
         args.add("-var", "%s=%s" % (key, value))
     for key, value in sorted(env.items()):
@@ -5776,20 +6013,35 @@ def _resolve_linux_config(ctx, rust_toolchain_probe):
         inputs.append(rust_toolchain_probe)
     if ctx.file.source_root:
         inputs.append(ctx.file.source_root)
+    probe_tool_inputs = []
+    if probe_tools != None:
+        probe_tool_inputs = [
+            probe_tools.archiver,
+            probe_tools.linker,
+            probe_tools.nm,
+            probe_tools.objcopy,
+        ]
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._kconfig_parse,
         inputs = depset(inputs),
+        tools = depset(
+            direct = probe_tool_inputs,
+            transitive = [cc_toolchain.all_files] if probe_tools != None else [],
+        ),
         outputs = [config, auto_conf, auto_conf_cmd, autoconf_h, rustc_cfg, kernel_release],
         arguments = [args],
         mnemonic = "LinuxResolvedConfig",
         progress_message = "Resolving Linux config %{label}",
+        env = tool_environment,
+        toolchain = CC_TOOLCHAIN_TYPE,
     )
     ctx.actions.write(integer_wrap_h, "")
 
     cflags_args = ctx.actions.args()
     cflags_args.add("-config", config)
     cflags_args.add("-arch", env.get("ARCH", "x86"))
+    cflags_args.add("-compiler_family", compiler_family)
     cflags_args.add("-version", ctx.attr.version)
     cflags_args.add("-out", cflags)
     cflags_args.add("-asm_out", aflags)
@@ -5815,7 +6067,10 @@ def _resolve_linux_config(ctx, rust_toolchain_probe):
             auto_conf_cmd = auto_conf_cmd,
             autoconf_h = autoconf_h,
             config = config,
-            config_flags = dict(ctx.attr.config[KconfigInfo].config_flags),
+            config_flags = _config_flags_for_compiler(
+                ctx.attr.config[KconfigInfo].config_flags,
+                compiler_family,
+            ),
             cflags = cflags,
             files = files,
             include_dir = include_dir,
@@ -5894,6 +6149,8 @@ _LINUX_RESOLVED_CONFIG_ATTRS = {
 _linux_resolved_config = rule(
     implementation = _linux_resolved_config_impl,
     attrs = _LINUX_RESOLVED_CONFIG_ATTRS,
+    fragments = ["cpp"],
+    toolchains = use_cc_toolchain(),
     doc = "Resolves an imported Linux .config fragment into Kbuild config outputs.",
 )
 
@@ -5914,7 +6171,8 @@ _LINUX_RUST_RESOLVED_CONFIG_ATTRS.update({
 _linux_rust_resolved_config = rule(
     implementation = _linux_rust_resolved_config_impl,
     attrs = _LINUX_RUST_RESOLVED_CONFIG_ATTRS,
-    toolchains = [_RUST_TOOLCHAIN_TYPE],
+    fragments = ["cpp"],
+    toolchains = use_cc_toolchain() + [_RUST_TOOLCHAIN_TYPE],
     doc = "Resolves a Rust-enabled Linux config against the selected rules_rust toolchain.",
 )
 
@@ -5972,11 +6230,6 @@ def _linux_object_impl(ctx):
         )
 
     cc_toolchain = find_cpp_toolchain(ctx)
-    if cc_toolchain.compiler.lower().find("clang") < 0:
-        fail(
-            "linux_object %s requires a Clang toolchain matching the configured Linux target, got compiler %r" %
-            (ctx.label, cc_toolchain.compiler),
-        )
     feature_configuration = _cc_feature_configuration(ctx, cc_toolchain)
     compiler = cc_common.get_tool_for_action(
         feature_configuration = feature_configuration,
@@ -6320,6 +6573,10 @@ def _linux_object_impl(ctx):
             _expand_flag_refs(ctx.attr.symversion_flags, config_values, make_values, ctx.attr.object),
             source_root,
         )
+        expanded_symversion_flags = _compiler_adjusted_kbuild_flags(
+            expanded_symversion_flags,
+            cc_toolchain,
+        )
         expanded_symversion_flags = _remove_exact_flags(
             expanded_symversion_flags,
             expanded_symversion_remove_flags,
@@ -6375,7 +6632,10 @@ def _linux_object_impl(ctx):
             generated_inputs.assembler_include_root_anchors,
             format = "-Wa,-I,%s",
         )
-    expanded_flags = _rewrite_source_root_flags(_expand_flag_refs(ctx.attr.flags, config_values, make_values, ctx.attr.object), source_root)
+    expanded_flags = _compiler_adjusted_kbuild_flags(
+        _rewrite_source_root_flags(_expand_flag_refs(ctx.attr.flags, config_values, make_values, ctx.attr.object), source_root),
+        cc_toolchain,
+    )
     expanded_flags = _remove_exact_flags(expanded_flags, expanded_remove_flags)
     if utsversion_tmp != None:
         expanded_flags = _rewrite_utsversion_tmp_flags(expanded_flags, ctx.attr.object, utsversion_tmp)
@@ -6462,8 +6722,8 @@ def _linux_object_impl(ctx):
         objcopy_args.add(objcopy_out)
         path_mapped_run(
             ctx.actions,
-            executable = _llvm_objcopy(cc_toolchain),
-            inputs = [objtool_out],
+            executable = _objcopy(cc_toolchain),
+            inputs = _cc_tool_inputs(cc_toolchain, [objtool_out]),
             outputs = [objcopy_out],
             arguments = [objcopy_args],
             mnemonic = "LinuxObjectObjcopy",
@@ -6532,7 +6792,7 @@ def _linux_object_impl(ctx):
 
         runner_args = ctx.actions.args()
         runner_args.add("-mode", mode)
-        llvm_nm = _llvm_nm(cc_toolchain)
+        llvm_nm = _nm(cc_toolchain)
         runner_args.add("-nm", llvm_nm)
         runner_args.add("-object", compile_out)
         runner_args.add("-compiler", compiler)
@@ -6801,7 +7061,7 @@ def _linux_composite_object_impl(ctx):
     out = ctx.actions.declare_file(ctx.label.name + ".o")
     args = ctx.actions.args()
     args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
-    args.add("-fuse-ld=lld")
+    args.add_all(_linker_selection_flags(cc_toolchain))
     args.add("-nostdlib")
     args.add("-r")
     args.add("-o")
@@ -6911,7 +7171,7 @@ def _linux_link_relocatable(ctx, linker, cc_toolchain, feature_configuration, ou
     out = output if output else ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
     args = ctx.actions.args()
     args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
-    args.add("-fuse-ld=lld")
+    args.add_all(_linker_selection_flags(cc_toolchain))
     args.add("-nostdlib")
     args.add("-r")
     args.add_all(flags)
@@ -7025,8 +7285,8 @@ def _linux_arm64_nvhe_object_impl(ctx):
     objcopy_args.add(out)
     path_mapped_run(
         ctx.actions,
-        executable = _llvm_objcopy(cc_toolchain),
-        inputs = [rel],
+        executable = _objcopy(cc_toolchain),
+        inputs = _cc_tool_inputs(cc_toolchain, [rel]),
         outputs = [out],
         arguments = [objcopy_args],
         mnemonic = "LinuxArm64NvheObjcopy",
@@ -7584,7 +7844,7 @@ def _linux_vmlinux_export_object(ctx, compiler, cc_toolchain, feature_configurat
 
 def _linux_system_map(ctx, cc_toolchain, input, name):
     nm_out = ctx.actions.declare_file(ctx.label.name + ".obj/" + name + ".nm")
-    llvm_nm = _llvm_nm(cc_toolchain)
+    llvm_nm = _nm(cc_toolchain)
     nm_args = ctx.actions.args()
     nm_args.add("-nm", llvm_nm)
     nm_args.add("-in", input)
@@ -7592,7 +7852,7 @@ def _linux_system_map(ctx, cc_toolchain, input, name):
     path_mapped_run(
         ctx.actions,
         executable = ctx.attr._nmrun[DefaultInfo].files_to_run,
-        inputs = [input],
+        inputs = _cc_tool_inputs(cc_toolchain, [input]),
         tools = [llvm_nm],
         outputs = [nm_out],
         arguments = [nm_args],
@@ -7618,7 +7878,7 @@ def _linux_system_map(ctx, cc_toolchain, input, name):
 def _linux_sorttable(ctx, cc_toolchain, config, input):
     out = ctx.actions.declare_file(ctx.label.name + ".sorted.vmlinux")
     nm_out = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux.nm-sort")
-    llvm_nm = _llvm_nm(cc_toolchain)
+    llvm_nm = _nm(cc_toolchain)
     tools = [llvm_nm]
     if ctx.executable.sorttable_tool:
         tools.append(ctx.attr.sorttable_tool[DefaultInfo].files_to_run)
@@ -7634,7 +7894,7 @@ def _linux_sorttable(ctx, cc_toolchain, config, input):
     path_mapped_run(
         ctx.actions,
         executable = ctx.attr._sorttablerun[DefaultInfo].files_to_run,
-        inputs = [input, config.config],
+        inputs = _cc_tool_inputs(cc_toolchain, [input, config.config]),
         tools = tools,
         outputs = [out, nm_out],
         arguments = [args],
@@ -7665,7 +7925,7 @@ def _linux_strip_vmlinux(ctx, cc_toolchain, config, input, out):
             "--remove-section=.rel.*",
         ])
 
-    llvm_objcopy = _llvm_objcopy(cc_toolchain)
+    llvm_objcopy = _objcopy(cc_toolchain)
     prepared = ctx.actions.declare_file(ctx.label.name + ".obj/vmlinux.strip-prepared")
     prepare_args = ctx.actions.args()
     prepare_args.add_all(set_flags)
@@ -7674,7 +7934,7 @@ def _linux_strip_vmlinux(ctx, cc_toolchain, config, input, out):
     path_mapped_run(
         ctx.actions,
         executable = llvm_objcopy,
-        inputs = [input],
+        inputs = _cc_tool_inputs(cc_toolchain, [input]),
         outputs = [prepared],
         arguments = [prepare_args],
         mnemonic = "LinuxVmlinuxPrepareStrip",
@@ -7687,7 +7947,7 @@ def _linux_strip_vmlinux(ctx, cc_toolchain, config, input, out):
     path_mapped_run(
         ctx.actions,
         executable = llvm_objcopy,
-        inputs = [prepared],
+        inputs = _cc_tool_inputs(cc_toolchain, [prepared]),
         outputs = [out],
         arguments = [strip_args],
         mnemonic = "LinuxVmlinuxStrip",
@@ -7736,7 +7996,7 @@ def _linux_btf_object(ctx, cc_toolchain, config, input):
     if not ctx.executable.pahole:
         fail("linux_vmlinux %s has DEBUG_INFO_BTF enabled and requires pahole" % ctx.label)
 
-    llvm_objcopy = _llvm_objcopy(cc_toolchain)
+    llvm_objcopy = _objcopy(cc_toolchain)
     btf_vmlinux = ctx.actions.declare_file(ctx.label.name + ".obj/" + input.basename + ".btf")
     pahole_args = ctx.actions.args()
     pahole_args.add("-input", input)
@@ -7751,7 +8011,7 @@ def _linux_btf_object(ctx, cc_toolchain, config, input):
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._btfmutate,
-        inputs = [input],
+        inputs = _cc_tool_inputs(cc_toolchain, [input]),
         tools = [
             ctx.attr.pahole[DefaultInfo].files_to_run,
             llvm_objcopy,
@@ -7781,7 +8041,7 @@ def _linux_btf_object(ctx, cc_toolchain, config, input):
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._btfmutate,
-        inputs = [btf_vmlinux],
+        inputs = _cc_tool_inputs(cc_toolchain, [btf_vmlinux]),
         tools = [llvm_objcopy],
         outputs = [out],
         arguments = [extract_args],
@@ -7826,7 +8086,7 @@ def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_
     args = ctx.actions.args()
     spec = linux_vmlinux_link_spec(ctx.attr.arch)
     if spec.direct_lld:
-        executable = _linux_x86_tool_sibling(linker, "ld.lld")
+        executable = _ld(cc_toolchain)
         args.add_all(_linux_vmlinux_ld_flags(ctx.attr.arch, ctx.attr.config[LinuxConfigInfo]))
         args.add(linker_script, format = "--script=%s")
         if strip_debug:
@@ -7835,7 +8095,7 @@ def _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_
         no_whole_archive = "--no-whole-archive"
     else:
         args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
-        args.add_all(_linux_vmlinux_link_flags(ctx, ctx.attr.config[LinuxConfigInfo]))
+        args.add_all(_linux_vmlinux_link_flags(ctx, ctx.attr.config[LinuxConfigInfo], cc_toolchain))
         args.add(linker_script, format = "-Wl,--script=%s")
         if strip_debug:
             args.add("-Wl,--strip-debug")
@@ -7930,10 +8190,9 @@ def _linux_vmlinux_ld_flags(arch, config):
         flags.extend(["-mllvm", "-mattr=+c", "-mllvm", "-mattr=+relax"])
     return flags
 
-def _linux_vmlinux_link_flags(ctx, config):
+def _linux_vmlinux_link_flags(ctx, config, cc_toolchain):
     spec = linux_vmlinux_link_spec(ctx.attr.arch)
-    flags = [
-        "-fuse-ld=lld",
+    flags = _linker_selection_flags(cc_toolchain) + [
         "-nostdlib",
         "-no-pie",
         "-Wl,-m," + spec.emulation,
@@ -7997,7 +8256,7 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
     args = ctx.actions.args()
     spec = linux_vmlinux_link_spec(ctx.attr.arch)
     if spec.direct_lld:
-        executable = _linux_x86_tool_sibling(linker, "ld.lld")
+        executable = _ld(cc_toolchain)
         flags = _linux_link_endian_flags(ctx.attr.arch, config) + [
             "-m",
             spec.emulation,
@@ -8031,8 +8290,7 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
     else:
         executable = linker
         args.add_all(_cc_target_flags(ctx, cc_toolchain, feature_configuration))
-        flags = [
-            "-fuse-ld=lld",
+        flags = _linker_selection_flags(cc_toolchain) + [
             "-nostdlib",
             "-no-pie",
             "-Wl,-r",
@@ -8450,12 +8708,6 @@ def _linux_x86_run_x86boot(ctx, outputs, arguments, inputs = [], tools = []):
         progress_message = "Generating Linux x86 boot data %{label}",
     )
 
-def _linux_x86_tool_sibling(tool, name):
-    parts = tool.rsplit("/", 1)
-    if len(parts) == 1:
-        return name
-    return parts[0] + "/" + name
-
 def _linux_x86_objcopy(ctx, cc_toolchain, input, out_relpath, flags):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
     args = ctx.actions.args()
@@ -8464,8 +8716,8 @@ def _linux_x86_objcopy(ctx, cc_toolchain, input, out_relpath, flags):
     args.add(out)
     path_mapped_run(
         ctx.actions,
-        executable = _llvm_objcopy(cc_toolchain),
-        inputs = [input],
+        executable = _objcopy(cc_toolchain),
+        inputs = _cc_tool_inputs(cc_toolchain, [input]),
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxX86Objcopy",
@@ -8709,7 +8961,7 @@ def _linux_x86_efi_stub_compile(ctx, compiler, cc_toolchain, feature_configurati
     compile_out = ctx.actions.declare_file(ctx.label.name + ".obj/" + object[:-len(".stub.o")] + ".o")
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
-    args.add_all([
+    efi_stub_flags = [
         "-m64",
         "-D__KERNEL__",
         "-std=gnu11",
@@ -8732,7 +8984,8 @@ def _linux_x86_efi_stub_compile(ctx, compiler, cc_toolchain, feature_configurati
         "-fno-stack-protector",
         "-fno-addrsig",
         "-D__DISABLE_EXPORTS",
-    ])
+    ]
+    args.add_all(_compiler_adjusted_kbuild_flags(efi_stub_flags, cc_toolchain))
     args.add_all(_linux_object_name_flags(_linux_compile_object_name(object)))
     args.add_all(_linux_source_preinclude_flags_for_root(source_root, False))
     args.add("-include")
@@ -8764,8 +9017,8 @@ def _linux_x86_efi_stub_compile(ctx, compiler, cc_toolchain, feature_configurati
     objcopy_args.add(out)
     path_mapped_run(
         ctx.actions,
-        executable = _llvm_objcopy(cc_toolchain),
-        inputs = [compile_out],
+        executable = _objcopy(cc_toolchain),
+        inputs = _cc_tool_inputs(cc_toolchain, [compile_out]),
         outputs = [out],
         arguments = [objcopy_args],
         mnemonic = "LinuxX86EFIStubObjcopy",
@@ -8778,7 +9031,11 @@ def _linux_x86_archive(ctx, archiver, cc_toolchain, out_relpath, objects):
         return None
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
     args = ctx.actions.args()
-    args.add("cDPrS")
+
+    # Kbuild uses an unindexed thin archive because its link action also owns
+    # every member object. Keep this Bazel output self-contained for remote
+    # execution and emit the symbol index required by GNU ld.
+    args.add("cDPrs")
     args.add(out)
     args.add_all(objects)
     path_mapped_run(
@@ -8937,7 +9194,7 @@ def _linux_x86_compressed_vmlinux(ctx, compiler, linker, archiver, cc_toolchain,
 
     out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/boot/compressed/vmlinux")
     args = ctx.actions.args()
-    args.add("-fuse-ld=lld")
+    args.add_all(_linker_selection_flags(cc_toolchain))
     args.add("-nostdlib")
     args.add("-pie")
     args.add("-Wl,-m,elf_x86_64")
@@ -8968,7 +9225,7 @@ def _linux_x86_setup_compile(ctx, compiler, cc_toolchain, feature_configuration,
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
-    args.add_all([
+    args.add_all(_compiler_adjusted_kbuild_flags([
         "-std=gnu11",
         "-m16",
         "-g",
@@ -8993,7 +9250,7 @@ def _linux_x86_setup_compile(ctx, compiler, cc_toolchain, feature_configuration,
         "-D_SETUP",
         "-fno-asynchronous-unwind-tables",
         "-Wno-unused-command-line-argument",
-    ])
+    ], cc_toolchain))
     if assembly:
         args.add("-D__ASSEMBLY__")
     args.add_all(_linux_object_name_flags(object))
@@ -9034,7 +9291,7 @@ def _linux_x86_cpustr(ctx, generated_headers):
     )
     return out
 
-def _linux_x86_setup_bin(ctx, compiler, linker, cc_toolchain, feature_configuration, config, generated_headers, source_root, voffset, zoffset):
+def _linux_x86_setup_bin(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, voffset, zoffset):
     cpustr = _linux_x86_cpustr(ctx, generated_headers)
     source_specs = [
         ("arch/x86/boot/a20.c", "arch/x86/boot/a20.o", [], [], []),
@@ -9084,7 +9341,7 @@ def _linux_x86_setup_bin(ctx, compiler, linker, cc_toolchain, feature_configurat
 
     setup_ld = _source_tree_file(ctx, "arch/x86/boot/setup.ld")
     setup_elf = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/boot/setup.elf")
-    ld = _linux_x86_tool_sibling(linker, "ld.lld")
+    ld = _ld(cc_toolchain)
     args = ctx.actions.args()
     args.add_all([
         "-m",
@@ -9151,7 +9408,7 @@ def _linux_x86_bzimage_impl(ctx):
     )
     zoffset = _linux_x86_offsets(ctx, compressed_vmlinux, "zoffset", "arch/x86/boot/zoffset.h")
     vmlinux_bin = _linux_x86_objcopy(ctx, cc_toolchain, compressed_vmlinux, "arch/x86/boot/vmlinux.bin", ["-O", "binary", "-R", ".note", "-R", ".comment", "-S"])
-    setup_bin = _linux_x86_setup_bin(ctx, compiler, linker, cc_toolchain, feature_configuration, config, generated_headers, source_root, voffset, zoffset)
+    setup_bin = _linux_x86_setup_bin(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, voffset, zoffset)
     out = _linux_x86_bzimage(ctx, setup_bin, vmlinux_bin)
     info = LinuxImageInfo(
         archives = image.archives,
@@ -9453,13 +9710,7 @@ def _linux_arm_zimage_impl(ctx):
         feature_configuration = feature_configuration,
         action_name = C_COMPILE_ACTION_NAME,
     )
-    linker = _linux_x86_tool_sibling(
-        cc_common.get_tool_for_action(
-            feature_configuration = feature_configuration,
-            action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
-        ),
-        "ld.lld",
-    )
+    linker = _ld(cc_toolchain)
     source_root = _linux_source_root_path(ctx)
     payload = _linux_arm_compressed_payload(ctx, cc_toolchain, config, image.output)
     output_root = payload.dirname[:-len("/arch/arm/boot/compressed")]
@@ -9546,8 +9797,8 @@ def _linux_arm_zimage_impl(ctx):
     objcopy_args.add_all(["-O", "binary", "-R", ".comment", "-S", compressed_vmlinux, out])
     path_mapped_run(
         ctx.actions,
-        executable = _llvm_objcopy(cc_toolchain),
-        inputs = [compressed_vmlinux],
+        executable = _objcopy(cc_toolchain),
+        inputs = _cc_tool_inputs(cc_toolchain, [compressed_vmlinux]),
         outputs = [out],
         arguments = [objcopy_args],
         mnemonic = "LinuxARMZImage",
@@ -9606,8 +9857,8 @@ def _linux_objcopy_image_impl(ctx, objcopy_flags):
     args.add(out)
     path_mapped_run(
         ctx.actions,
-        executable = _llvm_objcopy(cc_toolchain),
-        inputs = [image.output],
+        executable = _objcopy(cc_toolchain),
+        inputs = _cc_tool_inputs(cc_toolchain, [image.output]),
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxKernelObjcopyImage",
@@ -9739,15 +9990,23 @@ linux_cache_shape_check = rule(
 # Narrow private helper surface shared with sibling internal rules. Keeping these
 # functions behind one struct avoids making them part of the root public API.
 linux_module_cc_helpers = struct(
+    compiler_adjusted_kbuild_flags = _compiler_adjusted_kbuild_flags,
     compile_flags = _linux_compile_flags,
     configure_features = _cc_feature_configuration,
     cpp_undef_flags = _linux_cpp_undef_flags,
-    llvm_nm = _llvm_nm,
-    llvm_objcopy = _llvm_objcopy,
+    is_clang = _is_clang,
+    ld = _ld,
+    linker_selection_flags = _linker_selection_flags,
+    nm = _nm,
+    objcopy = _objcopy,
+    # Compatibility aliases for the existing private helper surface.
+    llvm_nm = _nm,
+    llvm_objcopy = _objcopy,
     module_flags = _linux_module_flags,
     object_name_flags = _linux_object_name_flags,
     source_include_dirs = _linux_ordered_include_dirs,
     source_include_flags = _linux_source_include_flags_for_root,
     source_preinclude_flags = _linux_source_preinclude_flags_for_root,
     target_flags = _cc_target_flags,
+    tool_inputs = _cc_tool_inputs,
 )

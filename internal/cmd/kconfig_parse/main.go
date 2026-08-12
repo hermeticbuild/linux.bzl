@@ -1107,6 +1107,7 @@ func compactMetadata(
 		Srcarch:               vars["SRCARCH"],
 	}
 	if profile != nil {
+		opts.CompilerFamily = toolProbe.CompilerFamily()
 		opts.CompileEnvironmentABI += "/probe-" + toolProbe.Identity()
 		opts.Target = &kconfig.CompactTarget{
 			Profile: profile.Name, LinuxArch: profile.Arch, Srcarch: profile.Srcarch,

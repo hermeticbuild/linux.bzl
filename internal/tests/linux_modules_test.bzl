@@ -31,6 +31,7 @@ def _fake_module_kernel_impl(ctx):
             btf_tools = struct(
                 btfmutate = None,
                 llvm_objcopy = None,
+                objcopy_files = depset(),
                 pahole = None,
                 resolve_btfids = None,
             ),
@@ -48,6 +49,8 @@ def _fake_module_kernel_impl(ctx):
             rust = struct(
                 compile_inputs = depset(),
                 enabled = True,
+                module_config_conditions = [],
+                module_config_flag_index = -1,
                 module_flags = [],
                 module_version_predicates = [{
                     "add": ["--cfg", "new_rustc"],

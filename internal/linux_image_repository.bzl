@@ -827,6 +827,84 @@ def _initialize_generator_outputs(rctx, graph_dir):
     rctx.file(graph_dir + "/BUILD.bazel", "", executable = False)
     rctx.file(graph_dir + "/metadata.json", "{}\n", executable = False)
 
+def _config_payload_owners(metadata):
+    environment_payloads = {
+        environment["id"]: environment["config_payload"]
+        for environment in metadata["compile_environments"]
+    }
+    target_environments = {
+        variant["target"]: variant.get("compile_environment", "")
+        for variant in metadata["object_variants"]
+    }
+    owner_sets = {}
+    for group in metadata["action_groups"]:
+        for target in group["object_targets"]:
+            environment_id = target_environments.get(target, "")
+            if not environment_id:
+                continue
+            payload_id = environment_payloads[environment_id]
+            if payload_id not in owner_sets:
+                owner_sets[payload_id] = {}
+            for config_name in group["reachable_configs"]:
+                owner_sets[payload_id][config_name] = True
+    return {
+        payload_id: sorted(owner_set.keys())
+        for payload_id, owner_set in sorted(owner_sets.items())
+    }
+
+def _graph_rule_adapter(rules_repo, compiler_compatibility_sources, base_config_name, config_names, config_payload_owners):
+    baseline_configs = {
+        name: "//configs:%s" % name
+        for name in config_names
+    }
+    resolved_configs = {
+        name: "//:_base_config" if name == base_config_name else "//:_variant_%s_config" % name
+        for name in config_names
+    }
+    return """load(
+    "{rules_repo}//internal:linux_objects.bzl",
+    _linux_arm64_nvhe_object = "linux_arm64_nvhe_object",
+    _linux_compile_environment_index = "linux_compile_environment_index",
+    _linux_composite_object = "linux_composite_object",
+    _linux_object = "linux_object",
+    _linux_source_input_index = "linux_source_input_index",
+    _linux_source_tree = "linux_source_tree",
+)
+
+def linux_arm64_nvhe_object(**kwargs):
+    _linux_arm64_nvhe_object(**kwargs)
+
+def linux_compile_environment_index(**kwargs):
+    _linux_compile_environment_index(
+        baseline_configs = {baseline_configs},
+        config_payload_owners = {config_payload_owners},
+        resolved_configs = {resolved_configs},
+        **kwargs
+    )
+
+def linux_composite_object(**kwargs):
+    _linux_composite_object(**kwargs)
+
+def linux_object(**kwargs):
+    _linux_object(**kwargs)
+
+def linux_source_input_index(name, **kwargs):
+    _linux_source_input_index(
+        name = name,
+        compiler_compatibility_srcs = {compiler_compatibility_sources},
+        **kwargs
+    )
+
+def linux_source_tree(**kwargs):
+    _linux_source_tree(**kwargs)
+""".format(
+        baseline_configs = repr(baseline_configs),
+        compiler_compatibility_sources = repr(compiler_compatibility_sources),
+        config_payload_owners = repr(config_payload_owners),
+        resolved_configs = repr(resolved_configs),
+        rules_repo = rules_repo,
+    )
+
 def _host_platform(rctx):
     os_name = rctx.os.name.lower()
     if os_name.startswith("linux"):
@@ -929,6 +1007,14 @@ def _generate_content_graph(
         descriptor.srcarch,
     )
     source_package = str(source).rsplit(":", 1)[0]
+    compiler_compatibility_sources = []
+    for path in [
+        "include/linux/compiler-clang.h",
+        "include/linux/compiler-gcc.h",
+    ]:
+        if source_root.get_child(path).exists:
+            compiler_compatibility_sources.append(source_package + ":" + path)
+    graph_rule_adapter = graph_dir + "/linux_graph_rules.bzl"
     args = [
         str(tool),
         "-compact_base_config",
@@ -951,7 +1037,7 @@ def _generate_content_graph(
         "-compact_buildfile_export",
         "metadata.json",
         "-linux_objects_load",
-        rules_repo + "//internal:linux_objects.bzl",
+        "//" + graph_dir + ":linux_graph_rules.bzl",
         "-object_label_package",
         "//" + graph_dir,
         "-source_label_package",
@@ -1007,6 +1093,17 @@ def _generate_content_graph(
             target_triple = descriptor.target_triple,
             uts_machine = descriptor.uts_machine,
         ),
+    )
+    rctx.file(
+        graph_rule_adapter,
+        _graph_rule_adapter(
+            rules_repo,
+            compiler_compatibility_sources,
+            arch,
+            sorted(config_paths.keys()),
+            _config_payload_owners(validated.metadata),
+        ),
+        executable = False,
     )
     _validate_generated_build(
         rctx,
@@ -2064,8 +2161,10 @@ repositories_test_helpers = struct(
     validate_compile_environment_abi = _validate_compile_environment_abi,
     content_graph_metadata_structure_error = _content_graph_metadata_structure_error,
     core_config_aliases = _content_core_config_aliases,
+    config_payload_owners = _config_payload_owners,
     generated_object_block_has_buildable_inputs = _generated_object_block_has_buildable_inputs,
     graph_configs_args = _graph_configs_args,
+    graph_rule_adapter = _graph_rule_adapter,
     graph_arch_tool_args = _graph_arch_tool_args,
     generator_variable_args = _generator_variable_args,
     generated_header_config_index = _content_generated_header_config_index,

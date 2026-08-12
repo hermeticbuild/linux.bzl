@@ -548,6 +548,12 @@ def _object_remove_flags_test_impl(ctx):
         asserts.false(env, "-DREMOVE" in argv)
         asserts.true(env, "-DKEEP_SYMVERSION" in argv)
         asserts.true(env, "-DREMOVE_SUFFIX" in argv)
+
+        # The action test exercises the exact flags that require translation
+        # when the same graph is built with GCC. The focused helper test covers
+        # their GCC spelling; the default Clang toolchain must preserve them.
+        asserts.true(env, "-mstack-alignment=8" in argv)
+        asserts.true(env, "-mretpoline-external-thunk" in argv)
     for action in filter_actions:
         asserts.true(env, "-remove" in action.argv)
         asserts.true(env, "-mgeneral-regs-only" in action.argv)
@@ -1560,6 +1566,8 @@ def linux_objects_fail_closed_test_suite(name):
             "-DREMOVE",
             "-DKEEP_SYMVERSION",
             "-DREMOVE_SUFFIX",
+            "-mstack-alignment=8",
+            "-mretpoline-external-thunk",
         ],
         symversion_remove_flags = [
             "-mgeneral-regs-only",

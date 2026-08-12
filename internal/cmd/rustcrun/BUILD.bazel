@@ -5,7 +5,10 @@ go_library(
     srcs = ["main.go"],
     importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/rustcrun",
     visibility = ["//visibility:private"],
-    deps = ["//internal/rusttoolchain"],
+    deps = [
+        "//internal/kconfig",
+        "//internal/rusttoolchain",
+    ],
 )
 
 go_binary(

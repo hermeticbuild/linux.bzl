@@ -14,6 +14,8 @@ load(":providers.bzl", "LinuxModuleInfo", "LinuxModuleSdkInfo", "LinuxVmlinuxInf
 
 visibility("//...")
 
+_RUST_CONFIG_FLAGS_MARKER = "--linux-bzl-config-flags"
+
 def _link_module(ctx, target, preliminary, mod_object, module_common, module_lds, path, target_link_flags = None):
     out = ctx.actions.declare_file(ctx.label.name + ".modules/" + path[:-len(".o")] + ".ko.unprocessed")
     args = ctx.actions.args()
@@ -24,8 +26,8 @@ def _link_module(ctx, target, preliminary, mod_object, module_common, module_lds
             target.feature_configuration,
         )
     args.add_all(target_link_flags)
+    args.add_all(linux_module_cc_helpers.linker_selection_flags(target.cc_toolchain))
     args.add_all([
-        "-fuse-ld=lld",
         "-nostdlib",
         "-r",
         "-Wl,--build-id=sha1",
@@ -111,11 +113,24 @@ def _compile_external_rust(ctx, sdk, crate_root, crate_name):
     args.add(ctx.executable._rustcrun)
     args.add("-probe")
     args.add(rust.rustc_probe)
+    if rust.module_config_conditions:
+        args.add("-config")
+        args.add(sdk.config.config)
+        for condition in rust.module_config_conditions:
+            args.add("-config-condition", json.encode(condition))
     for predicate in rust.module_version_predicates:
         args.add("-predicate", json.encode(predicate))
     args.add("--")
     args.add(rust.rustc)
-    _add_rust_sdk_flags(args, sdk, rust.module_flags)
+    if rust.module_config_conditions:
+        index = rust.module_config_flag_index
+        if index < 0 or index > len(rust.module_flags):
+            fail("Rust module config condition insertion index is out of range")
+        _add_rust_sdk_flags(args, sdk, rust.module_flags[:index])
+        args.add(_RUST_CONFIG_FLAGS_MARKER)
+        _add_rust_sdk_flags(args, sdk, rust.module_flags[index:])
+    else:
+        _add_rust_sdk_flags(args, sdk, rust.module_flags)
     args.add("--crate-name")
     args.add(crate_name)
     args.add("--out-dir")
@@ -126,7 +141,9 @@ def _compile_external_rust(ctx, sdk, crate_root, crate_name):
         ctx.actions,
         executable = ctx.executable._runincwd,
         inputs = depset(
-            ctx.files.srcs + [rust.rustc_probe],
+            ctx.files.srcs + [rust.rustc_probe] + (
+                [sdk.config.config] if rust.module_config_conditions else []
+            ),
             transitive = [rust.compile_inputs, rust.rustc_files],
         ),
         tools = [ctx.attr._rustcrun[DefaultInfo].files_to_run],
@@ -220,7 +237,7 @@ def _compile_external_c(ctx, sdk, source, module_name):
         )
         runner_args = ctx.actions.args()
         runner_args.add("-mode", "c")
-        llvm_nm = linux_module_cc_helpers.llvm_nm(sdk.target.cc_toolchain)
+        llvm_nm = linux_module_cc_helpers.nm(sdk.target.cc_toolchain)
         runner_args.add("-nm", llvm_nm)
         runner_args.add("-object", raw)
         runner_args.add("-compiler", sdk.target.compiler)
@@ -576,7 +593,10 @@ def _btf_module(ctx, config, vmlinux, linked, out, version, tools, external_modu
     path_mapped_run(
         ctx.actions,
         executable = tools.btfmutate,
-        inputs = [linked, vmlinux],
+        inputs = depset(
+            [linked, vmlinux],
+            transitive = [tools.objcopy_files],
+        ),
         tools = [tools.pahole, tools.llvm_objcopy],
         outputs = [encoded],
         arguments = [pahole_args],
@@ -611,7 +631,7 @@ def _empty_file(ctx, path):
 
 def _builtin_module_metadata(ctx, cc_toolchain, vmlinux):
     raw = ctx.actions.declare_file(ctx.label.name + ".sdk/modules.builtin.modinfo.raw")
-    llvm_objcopy = linux_module_cc_helpers.llvm_objcopy(cc_toolchain)
+    llvm_objcopy = linux_module_cc_helpers.objcopy(cc_toolchain)
     objcopy_args = ctx.actions.args()
     objcopy_args.add_all([
         "-j",
@@ -624,7 +644,7 @@ def _builtin_module_metadata(ctx, cc_toolchain, vmlinux):
     path_mapped_run(
         ctx.actions,
         executable = llvm_objcopy,
-        inputs = [vmlinux.vmlinux_unstripped],
+        inputs = linux_module_cc_helpers.tool_inputs(cc_toolchain, [vmlinux.vmlinux_unstripped]),
         outputs = [raw],
         arguments = [objcopy_args],
         mnemonic = "LinuxBuiltinModinfoExtract",
@@ -681,7 +701,8 @@ def _linux_module_sdk_impl(ctx):
     ko_files = []
     btf_tools = struct(
         btfmutate = ctx.attr._btfmutate[DefaultInfo].files_to_run,
-        llvm_objcopy = linux_module_cc_helpers.llvm_objcopy(target.cc_toolchain),
+        llvm_objcopy = linux_module_cc_helpers.objcopy(target.cc_toolchain),
+        objcopy_files = target.cc_toolchain.all_files,
         pahole = ctx.attr.pahole[DefaultInfo].files_to_run if ctx.attr.pahole else None,
         resolve_btfids = ctx.attr.resolve_btfids_tool[DefaultInfo].files_to_run if ctx.attr.resolve_btfids_tool else None,
     )

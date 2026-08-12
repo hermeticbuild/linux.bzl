@@ -1224,6 +1224,45 @@ func TestConfigSourceScannerContentGraphModelsClangLinuxPredefines(t *testing.T)
 	}
 }
 
+func TestConfigSourceScannerContentGraphModelsCompilerFamilyPredefines(t *testing.T) {
+	root := t.TempDir()
+	mustWriteSource(t, root, "compiler.h", `
+#if defined(__clang__)
+#include "clang.h"
+#elif defined(__GNUC__)
+#include "gcc.h"
+#endif
+`)
+	mustWriteSource(t, root, "clang.h", "#define COMPILER_CLANG 1\n")
+	mustWriteSource(t, root, "gcc.h", "#define COMPILER_GCC 1\n")
+
+	for _, test := range []struct {
+		family string
+		want   []string
+	}{
+		{family: "clang", want: []string{"clang.h", "compiler.h"}},
+		{family: "gcc", want: []string{"compiler.h", "gcc.h"}},
+	} {
+		t.Run(test.family, func(t *testing.T) {
+			scanner := newConfigSourceScanner(CompactMetadataOptions{
+				CompilerFamily: test.family,
+				SourceRoot:     root,
+			})
+			closure, err := scanner.closureForSource("compiler.h", nil)
+			if err != nil {
+				t.Fatalf("closureForSource() failed: %v", err)
+			}
+			var paths []string
+			for _, input := range closure.sourceInputs {
+				paths = append(paths, input.Path)
+			}
+			if !reflect.DeepEqual(paths, test.want) {
+				t.Fatalf("compiler predefined inputs = %v, want %v", paths, test.want)
+			}
+		})
+	}
+}
+
 func TestConfigSourceScannerContentGraphTracksAssemblyPredefine(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "arch/x86/entry.S", `

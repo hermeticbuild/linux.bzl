@@ -116,6 +116,72 @@ def _graph_configs_args_test_impl(ctx):
 
 graph_configs_args_test = unittest.make(_graph_configs_args_test_impl)
 
+def _graph_rule_adapter_test_impl(ctx):
+    env = unittest.begin(ctx)
+    generated = repositories_test_helpers.graph_rule_adapter(
+        "@linux.bzl",
+        [
+            "@linux_source//:include/linux/compiler-clang.h",
+            "@linux_source//:include/linux/compiler-gcc.h",
+        ],
+        "aarch64",
+        ["aarch64", "modversions"],
+        {
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef": ["aarch64"],
+        },
+    )
+    for want in [
+        '"@linux.bzl//internal:linux_objects.bzl"',
+        '_linux_source_input_index = "linux_source_input_index"',
+        'baseline_configs = {"aarch64": "//configs:aarch64", "modversions": "//configs:modversions"}',
+        'config_payload_owners = {"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef": ["aarch64"]}',
+        'resolved_configs = {"aarch64": "//:_base_config", "modversions": "//:_variant_modversions_config"}',
+        "def linux_source_input_index(name, **kwargs):",
+        'compiler_compatibility_srcs = ["@linux_source//:include/linux/compiler-clang.h", "@linux_source//:include/linux/compiler-gcc.h"]',
+        "**kwargs",
+    ]:
+        asserts.true(env, want in generated, "generated rule adapter missing %r:\n%s" % (want, generated))
+    return unittest.end(env)
+
+graph_rule_adapter_test = unittest.make(_graph_rule_adapter_test_impl)
+
+def _config_payload_owners_test_impl(ctx):
+    env = unittest.begin(ctx)
+    metadata = {
+        "action_groups": [{
+            "object_targets": ["active"],
+            "reachable_configs": ["base", "variant"],
+        }],
+        "compile_environments": [
+            {
+                "config_payload": "active-payload",
+                "id": "active-environment",
+            },
+            {
+                "config_payload": "inactive-payload",
+                "id": "inactive-environment",
+            },
+        ],
+        "object_variants": [
+            {
+                "compile_environment": "active-environment",
+                "target": "active",
+            },
+            {
+                "compile_environment": "inactive-environment",
+                "target": "inactive",
+            },
+        ],
+    }
+    asserts.equals(
+        env,
+        {"active-payload": ["base", "variant"]},
+        repositories_test_helpers.config_payload_owners(metadata),
+    )
+    return unittest.end(env)
+
+config_payload_owners_test = unittest.make(_config_payload_owners_test_impl)
+
 def _metadata_with_key(metadata, collection, key, value):
     result = dict(metadata)
     if collection:

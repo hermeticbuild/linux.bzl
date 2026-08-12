@@ -193,18 +193,7 @@ def _tool_file_for_sibling(cc_toolchain, tool, basename, name):
     path = tool.dirname + "/" + basename
     return _tool_file_for_path(cc_toolchain, path, name)
 
-def _single_file(target, name):
-    if target == None:
-        fail("%s is required by the selected C/C++ toolchain" % name)
-    files = target[DefaultInfo].files.to_list()
-    if len(files) != 1:
-        fail("%s must provide exactly one executable File; found: %s" % (
-            name,
-            ", ".join(sorted([file.path for file in files])) or "none",
-        ))
-    return files[0]
-
-def _selected_probe_tools(ctx, cc_toolchain, feature_configuration, compiler, compiler_family):
+def _selected_probe_tools(cc_toolchain, feature_configuration, compiler, compiler_family):
     if compiler_family == "clang":
         link_driver_path = cc_common.get_tool_for_action(
             feature_configuration = feature_configuration,
@@ -220,10 +209,7 @@ def _selected_probe_tools(ctx, cc_toolchain, feature_configuration, compiler, co
     return struct(
         archiver = _tool_file_for_path(cc_toolchain, cc_toolchain.ar_executable, "archiver"),
         linker = _tool_file_for_path(cc_toolchain, cc_toolchain.ld_executable, "linker"),
-        # gcc_toolchain 0.12 publishes nm_executable but omits its File from
-        # CcToolchainInfo.all_files. Accept the single explicit gap until that
-        # upstream provider is complete.
-        nm = _single_file(ctx.attr.probe_nm, "probe nm"),
+        nm = _tool_file_for_path(cc_toolchain, cc_toolchain.nm_executable, "nm"),
         objcopy = _tool_file_for_path(cc_toolchain, cc_toolchain.objcopy_executable, "objcopy"),
     )
 
@@ -381,6 +367,16 @@ def _configured_linker_driver_prefix(ctx, cc_toolchain, feature_configuration):
         flags = flags,
     )
 
+# Shared by the prototype and the production config-materialization action so
+# they measure exactly the same selected Bazel C/C++ toolchain invocation.
+linux_kconfig_toolchain_probe_helpers = struct(
+    configured_compile_action = _configured_compile_action,
+    configured_linker_driver_prefix = _configured_linker_driver_prefix,
+    selected_compiler_family = _selected_compiler_family,
+    selected_probe_tools = _selected_probe_tools,
+    tool_file_for_path = _tool_file_for_path,
+)
+
 def _linux_map_directory_kconfig_spike_impl(ctx):
     cc_toolchain = find_cpp_toolchain(ctx)
     feature_configuration = cc_common.configure_features(
@@ -404,7 +400,7 @@ def _linux_map_directory_kconfig_spike_impl(ctx):
             fail("map_directory spike has conflicting compile/link toolchain environment %s" % name)
         tool_environment[name] = value
     compiler_family = _selected_compiler_family(cc_toolchain, compiler)
-    probe_tools = _selected_probe_tools(ctx, cc_toolchain, feature_configuration, compiler, compiler_family)
+    probe_tools = _selected_probe_tools(cc_toolchain, feature_configuration, compiler, compiler_family)
     sources = _canonical_sources(ctx)
 
     plan = ctx.actions.declare_directory(ctx.label.name + ".plan")
@@ -551,7 +547,6 @@ linux_map_directory_kconfig_spike = rule(
         "kbuild": attr.label(allow_single_file = True, mandatory = True),
         "kconfig": attr.label(allow_single_file = True, mandatory = True),
         "linux_arch": attr.string(default = "x86"),
-        "probe_nm": attr.label(allow_single_file = True, cfg = "exec"),
         "srcs": attr.label_list(allow_files = [".c", ".h"], mandatory = True),
         "target_profile": attr.string(default = "x86_64"),
         "target_triple": attr.string(default = "x86_64-linux-gnu"),
@@ -586,7 +581,7 @@ def _linux_upstream_kconfig_impl(ctx):
     )
     compiler = _tool_file_for_path(cc_toolchain, compiler_path, "C compiler")
     compiler_family = _selected_compiler_family(cc_toolchain, compiler)
-    probe_tools = _selected_probe_tools(ctx, cc_toolchain, feature_configuration, compiler, compiler_family)
+    probe_tools = _selected_probe_tools(cc_toolchain, feature_configuration, compiler, compiler_family)
     compile_action = _configured_compile_action(ctx, cc_toolchain, feature_configuration)
     compiler_prefix = compile_action.probe_prefix
     linker_driver = _configured_linker_driver_prefix(ctx, cc_toolchain, feature_configuration)
@@ -711,7 +706,6 @@ linux_upstream_kconfig = rule(
         "kconfig_files": attr.label(mandatory = True),
         "probe_allow_cc_can_link": attr.bool(default = True),
         "probe_allow_gcc_plugins": attr.bool(default = True),
-        "probe_nm": attr.label(allow_single_file = True, cfg = "exec"),
         "validator": attr.label(cfg = "exec", executable = True, mandatory = True),
         "_kconfig_parse": attr.label(
             cfg = "exec",

@@ -141,7 +141,10 @@ type CompactMetadataOptions struct {
 	// Srcarch selects architecture include roots while scanning source files for
 	// CONFIG_* dependencies.
 	Srcarch string
-	Target  *CompactTarget
+	// CompilerFamily selects compiler-specific predefined branches while
+	// scanning source inputs. Empty preserves the legacy Clang graph.
+	CompilerFamily string
+	Target         *CompactTarget
 }
 
 // CompactConfigGraph binds one resolved configuration to its Kbuild graph and

@@ -2,8 +2,8 @@ package kconfig
 
 import "sort"
 
-// commonKernelFlagsConfigSymbols preserves the existing x86/arm64 compiler
-// payload ABI. New architecture-specific dependencies live below so adding an
+// commonKernelFlagsConfigSymbols is the compiler/config footprint shared by all
+// architectures. Architecture-specific dependencies live below so adding an
 // ARM, PowerPC, or RISC-V flag cannot perturb an unrelated x86 payload ID.
 var commonKernelFlagsConfigSymbols = []string{
 	"CONFIG_ARM64_BTI_KERNEL",
@@ -14,6 +14,7 @@ var commonKernelFlagsConfigSymbols = []string{
 	"CONFIG_CC_HAS_K_CONSTRAINT",
 	"CONFIG_CC_HAS_MIN_FUNCTION_ALIGNMENT",
 	"CONFIG_CC_IS_CLANG",
+	"CONFIG_CC_IS_GCC",
 	"CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE",
 	"CONFIG_CC_OPTIMIZE_FOR_SIZE",
 	"CONFIG_CPU_BIG_ENDIAN",

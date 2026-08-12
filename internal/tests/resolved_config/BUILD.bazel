@@ -5,6 +5,7 @@ load(":linux_resolved_config_test.bzl", "linux_resolved_config_test_suite")
 package(default_visibility = ["//visibility:private"])
 
 exports_files([
+    "arm64.config",
     "Kconfig",
     "c.config",
     "rust.config",
@@ -15,6 +16,16 @@ kconfig_file(
     config = "c.config",
     config_flags = {
         "CONFIG_64BIT": "y",
+        "CONFIG_X86": "y",
+        "CONFIG_X86_64": "y",
+    },
+)
+
+kconfig_file(
+    name = "resolved_arm64_config_input",
+    config = "arm64.config",
+    config_flags = {
+        "CONFIG_ARM64": "y",
     },
 )
 
@@ -24,6 +35,8 @@ kconfig_file(
     config_flags = {
         "CONFIG_64BIT": "y",
         "CONFIG_RUST": "y",
+        "CONFIG_X86": "y",
+        "CONFIG_X86_64": "y",
     },
 )
 
@@ -46,7 +59,7 @@ linux_resolved_config(
 
 linux_resolved_config(
     name = "resolved_arm64_config",
-    config = ":resolved_c_config_input",
+    config = ":resolved_arm64_config_input",
     config_name = "arm64",
     env = {
         "ARCH": "arm64",

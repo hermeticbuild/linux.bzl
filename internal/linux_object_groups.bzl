@@ -173,7 +173,8 @@ def _compile_flags(ctx, cc_toolchain, feature_configuration):
         action_name = C_COMPILE_ACTION_NAME,
         variables = variables,
     )
-    flags = _rewrite_target_flags(flags, _target_triple(ctx.attr.arch))
+    if linux_module_cc_helpers.is_clang(cc_toolchain):
+        flags = _rewrite_target_flags(flags, _target_triple(ctx.attr.arch))
     out = []
     skip_next = False
     drop_count = 0
@@ -227,10 +228,11 @@ def _compile_flags(ctx, cc_toolchain, feature_configuration):
         if flag.startswith("-isystem") and _drop_toolchain_include(flag[len("-isystem"):]):
             continue
         out.append(flag)
-    out = clang_resource_headers.ensure_include(out, cc_toolchain.all_files.to_list())
+    if linux_module_cc_helpers.is_clang(cc_toolchain):
+        out = clang_resource_headers.ensure_include(out, cc_toolchain.all_files.to_list())
     if "-nostdinc" not in out:
         out.append("-nostdinc")
-    if "-fintegrated-as" not in out:
+    if linux_module_cc_helpers.is_clang(cc_toolchain) and "-fintegrated-as" not in out:
         out.append("-fintegrated-as")
     return out
 
@@ -375,7 +377,7 @@ def _source_include_dirs(source_root, srcarch, generated_headers):
         generated.other
     )
 
-def _compile_arguments(ctx, base_flags, spec, source, output, config, generated_headers, source_root, depfile = None):
+def _compile_arguments(ctx, base_flags, spec, source, output, config, generated_headers, source_root, cc_toolchain, depfile = None):
     replacements = dict(config.config_flags)
     replacements.update({
         "src": source.dirname,
@@ -417,13 +419,13 @@ def _compile_arguments(ctx, base_flags, spec, source, output, config, generated_
         "-I" + include_dir
         for include_dir in _source_include_dirs(source_root, ctx.attr.srcarch, generated_headers)
     ])
-    object_args.extend([
+    object_args.extend(linux_module_cc_helpers.compiler_adjusted_kbuild_flags([
         _rewrite_source_root_flag(
             _expand_make_refs(flag, replacements, spec.object),
             source_root,
         )
         for flag in ctx.attr.flags
-    ])
+    ], cc_toolchain))
 
     source_root_file = ctx.attr.source_input_index[LinuxSourceInputIndexInfo].source_tree_info.root
     anchors = {
@@ -540,7 +542,7 @@ def _symversion_config_response(ctx, config, spec, source, source_root):
     )
     return struct(file = out, inputs = [out])
 
-def _symversion_arguments(ctx, base_flags, spec, source, config, generated_headers, source_root, config_response):
+def _symversion_arguments(ctx, base_flags, spec, source, config, generated_headers, source_root, config_response, cc_toolchain):
     replacements = dict(config.config_flags)
     replacements.update({
         "src": source.dirname,
@@ -570,13 +572,13 @@ def _symversion_arguments(ctx, base_flags, spec, source, config, generated_heade
         "-I" + include_dir
         for include_dir in _source_include_dirs(source_root, ctx.attr.srcarch, generated_headers)
     ])
-    object_args.extend([
+    object_args.extend(linux_module_cc_helpers.compiler_adjusted_kbuild_flags([
         _rewrite_source_root_flag(
             _expand_make_refs(flag, replacements, spec.object),
             source_root,
         )
         for flag in ctx.attr.symversion_flags
-    ])
+    ], cc_toolchain))
     object_args.extend(["-E", "-D__GENKSYMS__"])
     if ctx.attr.language == "asm":
         object_args.extend(["-xc", "-"])
@@ -666,8 +668,6 @@ def _linux_object_action_group_impl(ctx):
         fail("%s does not support grouped remove flags" % ctx.label)
 
     cc_toolchain = find_cpp_toolchain(ctx)
-    if cc_toolchain.compiler.lower().find("clang") < 0:
-        fail("%s requires Clang, got compiler %r" % (ctx.label, cc_toolchain.compiler))
     feature_configuration = _feature_configuration(ctx, cc_toolchain)
     compiler = cc_common.get_tool_for_action(
         feature_configuration = feature_configuration,
@@ -760,6 +760,7 @@ def _linux_object_action_group_impl(ctx):
                 config,
                 generated_headers,
                 source_root,
+                cc_toolchain,
                 depfile = source_version_depfile,
             )],
             mnemonic = "LinuxObjectCompile",
@@ -786,7 +787,7 @@ def _linux_object_action_group_impl(ctx):
             )
             runner_args = ctx.actions.args()
             runner_args.add("-mode", ctx.attr.language)
-            llvm_nm = linux_module_cc_helpers.llvm_nm(cc_toolchain)
+            llvm_nm = linux_module_cc_helpers.nm(cc_toolchain)
             runner_args.add("-nm", llvm_nm)
             runner_args.add("-object", compile_out)
             runner_args.add("-compiler", compiler)
@@ -825,6 +826,7 @@ def _linux_object_action_group_impl(ctx):
                         generated_headers,
                         source_root,
                         config_response.file,
+                        cc_toolchain,
                     ),
                 ],
                 mnemonic = "LinuxGenksyms",
@@ -1034,8 +1036,6 @@ def _linux_composite_object_action_group_impl(ctx):
     if ctx.attr.module_root and ctx.attr.mode != "m":
         fail("%s marks built-in composites as module roots" % ctx.label)
     cc_toolchain = find_cpp_toolchain(ctx)
-    if cc_toolchain.compiler.lower().find("clang") < 0:
-        fail("%s requires Clang, got compiler %r" % (ctx.label, cc_toolchain.compiler))
     feature_configuration = _feature_configuration(ctx, cc_toolchain)
     linker = cc_common.get_tool_for_action(
         feature_configuration = feature_configuration,
@@ -1063,7 +1063,8 @@ def _linux_composite_object_action_group_impl(ctx):
             )
             args = ctx.actions.args()
             args.add_all(_target_flags(ctx, cc_toolchain, feature_configuration))
-            args.add_all(["-fuse-ld=lld", "-nostdlib", "-r", "-o"])
+            args.add_all(linux_module_cc_helpers.linker_selection_flags(cc_toolchain))
+            args.add_all(["-nostdlib", "-r", "-o"])
             args.add(out)
             args.add_all([info.output for info in member_infos])
             path_mapped_run(

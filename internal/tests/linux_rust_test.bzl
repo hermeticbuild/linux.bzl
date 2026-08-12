@@ -195,6 +195,8 @@ def _disabled_sdk_test_impl(ctx):
 
     asserts.false(env, sdk.enabled)
     asserts.equals(env, [], sdk.compile_inputs.to_list())
+    asserts.equals(env, [], sdk.module_config_conditions)
+    asserts.equals(env, -1, sdk.module_config_flag_index)
     asserts.equals(env, [], sdk.module_flags)
     asserts.equals(env, [], sdk.module_version_predicates)
     asserts.equals(env, None, sdk.rustc)
@@ -539,8 +541,17 @@ def _enabled_sdk_test_impl(ctx):
         ]),
         "Rust metadata and compiler runtime inputs must be disjoint",
     )
-    asserts.true(env, "-Zdwarf-version=5" in sdk.module_flags)
-    asserts.true(env, "-Cdebuginfo=2" in sdk.module_flags)
+    asserts.false(env, "-Zdwarf-version=5" in sdk.module_flags)
+    asserts.false(env, "-Cdebuginfo=2" in sdk.module_flags)
+    asserts.true(env, sdk.module_config_flag_index >= 0)
+    asserts.equals(
+        env,
+        ["CONFIG_DEBUG_INFO", "CONFIG_DEBUG_INFO_DWARF5"],
+        [
+            condition["config"]
+            for condition in sdk.module_config_conditions
+        ],
+    )
     asserts.equals(
         env,
         ["1.91.0", "1.98.0", "1.99.0"],
@@ -615,8 +626,23 @@ def _enabled_sdk_test_impl(ctx):
             _action_has_argument_ending_with(core_actions[0], "/" + sdk.rustc.basename),
             "kernel crates must invoke rustc",
         )
-        asserts.true(env, "-Zdwarf-version=5" in core_actions[0].argv)
-        asserts.true(env, "-Cdebuginfo=2" in core_actions[0].argv)
+        asserts.true(env, "-config" in core_actions[0].argv)
+        asserts.true(env, "--linux-bzl-config-flags" in core_actions[0].argv)
+        asserts.true(
+            env,
+            _action_has_argument_containing(core_actions[0], '"config":"CONFIG_DEBUG_INFO"'),
+            "core rustc action is missing its deferred debug-info condition",
+        )
+        asserts.true(
+            env,
+            _action_has_argument_containing(core_actions[0], '"flags":["-Zdwarf-version=5"]'),
+            "core rustc action is missing its deferred DWARF-version flag",
+        )
+        asserts.true(
+            env,
+            _action_has_input_suffix(core_actions[0], ".config"),
+            "core rustc action is missing the action-resolved kernel config",
+        )
         asserts.true(
             env,
             _action_has_argument_containing(core_actions[0], '"at_least":"1.91.0"'),
@@ -687,8 +713,9 @@ def _builtin_target_sdk_test_impl(ctx):
     asserts.equals(env, None, sdk.target_spec)
     asserts.true(env, sdk.objtree_anchor != None)
     asserts.true(env, "--target=aarch64-unknown-none" in sdk.module_flags)
-    asserts.true(env, "-Zdwarf-version=5" in sdk.module_flags)
-    asserts.true(env, "-Cdebuginfo=2" in sdk.module_flags)
+    asserts.false(env, "-Zdwarf-version=5" in sdk.module_flags)
+    asserts.false(env, "-Cdebuginfo=2" in sdk.module_flags)
+    asserts.equals(env, 2, len(sdk.module_config_conditions))
     target_generator_actions = [
         action
         for action in analysistest.target_actions(env)
@@ -810,6 +837,13 @@ def _conditional_unless_config_test_impl(ctx):
         ),
         "x86",
     )
+    profile["target_flags"]["conditional"][0]["version_predicates"] = [{
+        "add": ["--conditional-version-flag"],
+        "at_least": "1.99.0",
+        "else_add": [],
+        "else_remove": [],
+        "remove": [],
+    }]
     replacements = {
         "rustc_cfg": "cfg",
         "target_spec": "target.json",
@@ -829,10 +863,36 @@ def _conditional_unless_config_test_impl(ctx):
         }),
         replacements,
     )
+    deferred = linux_rust_test_helpers.profile_target_flags(
+        profile,
+        struct(config_flags = {
+            "CONFIG_CC_OPTIMIZE_FOR_SIZE": "y",
+            "CONFIG_FORCE_SPEED": "y",
+        }),
+        replacements,
+        defer_conditions = True,
+    )
     asserts.true(env, "-Copt-level=s" in optimized.flags)
     asserts.false(env, "-Copt-level=2" in optimized.flags)
     asserts.false(env, "-Copt-level=s" in forced_speed.flags)
     asserts.true(env, "-Copt-level=2" in forced_speed.flags)
+    asserts.false(env, "-Copt-level=s" in deferred.flags)
+    asserts.false(env, "-Copt-level=2" in deferred.flags)
+    asserts.equals(env, [{
+        "config": "CONFIG_CC_OPTIMIZE_FOR_SIZE",
+        "else_flags": ["-Copt-level=2"],
+        "equals": "y",
+        "flags": ["-Copt-level=s"],
+        "unless_config": "CONFIG_FORCE_SPEED",
+    }], deferred.conditions)
+    asserts.equals(env, {
+        "config": "CONFIG_CC_OPTIMIZE_FOR_SIZE",
+        "equals": "y",
+        "unless_config": "CONFIG_FORCE_SPEED",
+    }, {
+        key: deferred.predicates[1][key]
+        for key in ["config", "equals", "unless_config"]
+    })
     return unittest.end(env)
 
 _conditional_unless_config_test = unittest.make(_conditional_unless_config_test_impl)
@@ -873,6 +933,26 @@ def _extend_kernel_c_flags_test_impl(ctx):
     return unittest.end(env)
 
 _extend_kernel_c_flags_test = unittest.make(_extend_kernel_c_flags_test_impl)
+
+def _gcc_bindgen_compatible_values_test_impl(ctx):
+    env = unittest.begin(ctx)
+    values = linux_rust_test_helpers.gcc_bindgen_compatible_values([
+        "-fno-canonical-system-headers",
+        "-fconserve-stack",
+        "-mpreferred-stack-boundary=3",
+        "-mstack-protector-guard-reg=gs",
+        "--param",
+        "asan-stack=1",
+        "-DKEPT=1",
+    ], "x86")
+    asserts.equals(env, [
+        "-DKEPT=1",
+        "-w",
+        "--target=x86_64-linux-gnu",
+    ], values)
+    return unittest.end(env)
+
+_gcc_bindgen_compatible_values_test = unittest.make(_gcc_bindgen_compatible_values_test_impl)
 
 def _unsupported_dead_code_elimination_test_impl(ctx):
     env = unittest.begin(ctx)
@@ -1031,6 +1111,8 @@ def linux_rust_test_suite(name):
     _rustc_source_prefixes_test(name = source_prefixes_test)
     extend_flags_test = name + "_extend_kernel_c_flags_test"
     _extend_kernel_c_flags_test(name = extend_flags_test)
+    gcc_bindgen_flags_test = name + "_gcc_bindgen_compatible_values_test"
+    _gcc_bindgen_compatible_values_test(name = gcc_bindgen_flags_test)
 
     native.test_suite(
         name = name,
@@ -1042,6 +1124,7 @@ def linux_rust_test_suite(name):
             ":" + dead_code_test,
             ":" + conditional_unless_config_test,
             ":" + extend_flags_test,
+            ":" + gcc_bindgen_flags_test,
             ":" + hardening_test,
             ":" + legacy_profile_test,
             ":" + source_prefixes_test,

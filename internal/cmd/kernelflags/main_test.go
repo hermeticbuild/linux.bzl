@@ -74,7 +74,7 @@ func TestMaterializeConfigPayloads(t *testing.T) {
 		t.Fatal(err)
 	}
 	outDir := filepath.Join(tempDir, "payloads")
-	if err := materializeConfigPayloads(manifestPath, outDir); err != nil {
+	if err := materializeConfigPayloads(manifestPath, outDir, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -141,9 +141,216 @@ func TestMaterializeConfigPayloadsRejectsInvalidID(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	err := materializeConfigPayloads(manifestPath, filepath.Join(tempDir, "payloads"))
+	err := materializeConfigPayloads(manifestPath, filepath.Join(tempDir, "payloads"), "", "")
 	if err == nil || !strings.Contains(err.Error(), "invalid payload ID") {
 		t.Fatalf("materializeConfigPayloads() error = %v, want invalid payload ID", err)
+	}
+}
+
+func TestMaterializeConfigPayloadsUsesExplicitCompilerFamily(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	tempDir := t.TempDir()
+	manifestPath := filepath.Join(tempDir, "manifest.json")
+	manifest := `{"arch":"x86","compiler_family":"gcc","payloads":{"` + id + `":"CONFIG_CC_IS_CLANG=y\nCONFIG_X86_64=y\n"},"version":"6.18.39"}` + "\n"
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outDir := filepath.Join(tempDir, "payloads")
+	if err := materializeConfigPayloads(manifestPath, outDir, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	cflagsPath := filepath.Join(outDir, id, "include", "generated", "bazel_kbuild_cflags.rsp")
+	cflags, err := os.ReadFile(cflagsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cflags), "-fno-addrsig") {
+		t.Fatalf("GCC response file contains Clang-only -fno-addrsig:\n%s", cflags)
+	}
+	if !strings.Contains(string(cflags), "-fconserve-stack") {
+		t.Fatalf("GCC response file is missing -fconserve-stack:\n%s", cflags)
+	}
+	autoconfPath := filepath.Join(outDir, id, "include", "generated", "autoconf.h")
+	autoconf, err := os.ReadFile(autoconfPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(autoconf), "#define CONFIG_CC_IS_GCC 1") {
+		t.Fatalf("GCC autoconf is missing CONFIG_CC_IS_GCC:\n%s", autoconf)
+	}
+	if strings.Contains(string(autoconf), "#define CONFIG_CC_IS_CLANG") {
+		t.Fatalf("GCC autoconf still defines CONFIG_CC_IS_CLANG:\n%s", autoconf)
+	}
+}
+
+func TestMaterializeConfigPayloadsOverlaysSelectedToolchainDifferences(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	tempDir := t.TempDir()
+	manifestPath := filepath.Join(tempDir, "manifest.json")
+	manifest := `{"arch":"arm64","compiler_family":"gcc","payloads":{"` + id + `":"CONFIG_ARM64_BTI_KERNEL=y\nCONFIG_CC_IS_CLANG=y\nCONFIG_CC_IS_GCC=n\nCONFIG_VARIANT=y\n"},"version":"6.18.39"}` + "\n"
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baselinePath := filepath.Join(tempDir, "baseline.config")
+	if err := os.WriteFile(baselinePath, []byte("CONFIG_ARM64_BTI_KERNEL=y\nCONFIG_CC_IS_CLANG=y\n# CONFIG_CC_IS_GCC is not set\nCONFIG_VARIANT=y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolvedPath := filepath.Join(tempDir, "resolved.config")
+	if err := os.WriteFile(resolvedPath, []byte("# CONFIG_ARM64_BTI_KERNEL is not set\n# CONFIG_CC_IS_CLANG is not set\nCONFIG_CC_IS_GCC=y\nCONFIG_VARIANT=y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outDir := filepath.Join(tempDir, "payloads")
+	if err := materializeConfigPayloads(manifestPath, outDir, baselinePath, resolvedPath); err != nil {
+		t.Fatal(err)
+	}
+
+	autoconf, err := os.ReadFile(filepath.Join(outDir, id, "include", "generated", "autoconf.h"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unwanted := range []string{"#define CONFIG_ARM64_BTI_KERNEL", "#define CONFIG_CC_IS_CLANG"} {
+		if strings.Contains(string(autoconf), unwanted) {
+			t.Errorf("selected-toolchain payload contains %s:\n%s", unwanted, autoconf)
+		}
+	}
+	for _, want := range []string{"#define CONFIG_CC_IS_GCC 1", "#define CONFIG_VARIANT 1"} {
+		if !strings.Contains(string(autoconf), want) {
+			t.Errorf("selected-toolchain payload is missing %s:\n%s", want, autoconf)
+		}
+	}
+	cflags, err := os.ReadFile(filepath.Join(outDir, id, "include", "generated", "bazel_kbuild_cflags.rsp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cflags), "-mbranch-protection=pac-ret+bti") {
+		t.Fatalf("GCC payload retained the baseline arm64 BTI flag:\n%s", cflags)
+	}
+}
+
+func TestExtractSelectedConfigPayloadUsesVariantOwner(t *testing.T) {
+	const payloadID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	got, err := extractSelectedConfigPayload(
+		payloadID,
+		map[string]string{"CONFIG_COMPILER_FEATURE": "y"},
+		[]string{"variant"},
+		map[string]map[string]string{
+			"base":    {"CONFIG_COMPILER_FEATURE": "y"},
+			"variant": {"CONFIG_COMPILER_FEATURE": "y"},
+		},
+		map[string]map[string]string{
+			"base":    {"CONFIG_COMPILER_FEATURE": "y"},
+			"variant": {"CONFIG_COMPILER_FEATURE": "n"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["CONFIG_COMPILER_FEATURE"] != "n" {
+		t.Fatalf("variant-owned compiler feature = %q, want n", got["CONFIG_COMPILER_FEATURE"])
+	}
+}
+
+func TestExtractSelectedConfigPayloadSharedOwnersAgree(t *testing.T) {
+	const payloadID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	got, err := extractSelectedConfigPayload(
+		payloadID,
+		map[string]string{"CONFIG_COMPILER_FEATURE": "y"},
+		[]string{"base", "variant"},
+		map[string]map[string]string{
+			"base":    {"CONFIG_COMPILER_FEATURE": "y"},
+			"variant": {"CONFIG_COMPILER_FEATURE": "y"},
+		},
+		map[string]map[string]string{
+			"base":    {},
+			"variant": {"CONFIG_COMPILER_FEATURE": "n"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["CONFIG_COMPILER_FEATURE"] != "n" {
+		t.Fatalf("shared compiler feature = %q, want n", got["CONFIG_COMPILER_FEATURE"])
+	}
+}
+
+func TestExtractSelectedConfigPayloadRejectsSharedOwnerDivergence(t *testing.T) {
+	const payloadID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	_, err := extractSelectedConfigPayload(
+		payloadID,
+		map[string]string{"CONFIG_COMPILER_FEATURE": "y"},
+		[]string{"base", "variant"},
+		map[string]map[string]string{
+			"base":    {"CONFIG_COMPILER_FEATURE": "y"},
+			"variant": {"CONFIG_COMPILER_FEATURE": "y"},
+		},
+		map[string]map[string]string{
+			"base":    {"CONFIG_COMPILER_FEATURE": "y"},
+			"variant": {},
+		},
+	)
+	for _, want := range []string{payloadID, "CONFIG_COMPILER_FEATURE", "base", "variant", "resolves differently"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("extractSelectedConfigPayload() error = %v, want %q", err, want)
+		}
+	}
+}
+
+func TestExtractSelectedConfigPayloadRejectsBaselineMismatch(t *testing.T) {
+	const payloadID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	_, err := extractSelectedConfigPayload(
+		payloadID,
+		map[string]string{"CONFIG_COMPILER_FEATURE": "y"},
+		[]string{"variant"},
+		map[string]map[string]string{"variant": {}},
+		map[string]map[string]string{"variant": {}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "does not match baseline config variant") {
+		t.Fatalf("extractSelectedConfigPayload() error = %v, want baseline mismatch", err)
+	}
+}
+
+func TestMaterializeConfigPayloadsRejectsUnknownCompilerFamily(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	tempDir := t.TempDir()
+	manifestPath := filepath.Join(tempDir, "manifest.json")
+	manifest := `{"arch":"x86","compiler_family":"other","payloads":{"` + id + `":"CONFIG_X86_64=y\n"},"version":"6.18.39"}` + "\n"
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := materializeConfigPayloads(manifestPath, filepath.Join(tempDir, "payloads"), "", "")
+	if err == nil || !strings.Contains(err.Error(), "unsupported compiler family") {
+		t.Fatalf("materializeConfigPayloads() error = %v, want unsupported compiler family", err)
+	}
+}
+
+func TestLinuxCFlagsExplicitCompilerFamilyOverridesStaticConfigIdentity(t *testing.T) {
+	config := map[string]string{
+		"CONFIG_CC_IS_CLANG":          "y",
+		"CONFIG_MITIGATION_RETPOLINE": "y",
+		"CONFIG_X86_64":               "y",
+	}
+	gccFlags := linuxCFlagsForCompiler(config, "x86", testKernelVersion, "gcc")
+	for _, unwanted := range []string{"-fno-addrsig", "-mretpoline-external-thunk", "-mstack-alignment=8"} {
+		if contains(gccFlags, unwanted) {
+			t.Errorf("GCC flags unexpectedly contain %s: %v", unwanted, gccFlags)
+		}
+	}
+	for _, want := range []string{"-fconserve-stack", "-mindirect-branch=thunk-extern", "-mindirect-branch-register", "-fno-jump-tables", "-mpreferred-stack-boundary=3"} {
+		if !contains(gccFlags, want) {
+			t.Errorf("GCC flags are missing %s: %v", want, gccFlags)
+		}
+	}
+
+	clangFlags := linuxCFlagsForCompiler(map[string]string{"CONFIG_X86_64": "y"}, "x86", testKernelVersion, "clang")
+	if !contains(clangFlags, "-fno-addrsig") {
+		t.Errorf("Clang flags are missing -fno-addrsig: %v", clangFlags)
+	}
+	if contains(clangFlags, "-fconserve-stack") {
+		t.Errorf("Clang flags unexpectedly contain -fconserve-stack: %v", clangFlags)
+	}
+	if !contains(clangFlags, "-mstack-alignment=8") {
+		t.Errorf("Clang flags are missing -mstack-alignment=8: %v", clangFlags)
 	}
 }
 

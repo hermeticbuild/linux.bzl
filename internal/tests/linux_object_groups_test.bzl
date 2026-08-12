@@ -112,6 +112,13 @@ def _argument_after(argv, flag):
             return argv[index + 1]
     return ""
 
+def _arguments_after(argv, flag):
+    return [
+        argv[index + 1]
+        for index in range(len(argv) - 1)
+        if argv[index] == flag
+    ]
+
 def _compile_group_test_impl(ctx):
     env = analysistest.begin(ctx)
     target = analysistest.target_under_test(env)
@@ -122,6 +129,16 @@ def _compile_group_test_impl(ctx):
     asserts.equals(env, 2, len(_actions_with_mnemonic(actions, "LinuxObjectCompile")))
     asserts.equals(env, 0, len(_actions_with_mnemonic(actions, "LinuxFlagFilter")))
     for action in _actions_with_mnemonic(actions, "LinuxObjectCompile"):
+        asserts.true(
+            env,
+            "compiler_compatibility.inc" in [file.basename for file in action.inputs.to_list()],
+            "compiler compatibility sources should be present in every compile action",
+        )
+        asserts.true(
+            env,
+            _argument_after(action.argv, "-c").replace("\\", "/").endswith("tests/compile/source/cross_tree/leaf.c"),
+            "compiler compatibility sources that sort before indexed files must not shift the primary source index",
+        )
         generated_cflags = [arg for arg in action.argv if arg.endswith(".cflags.rsp")]
         asserts.equals(env, 1, len(generated_cflags))
         resource_includes = [
@@ -187,11 +204,21 @@ def _symversion_group_test_impl(ctx):
     asserts.equals(env, "kernel/versioned.o", info.source_version_records[0].object)
     source_version_actions = _actions_with_mnemonic(analysistest.target_actions(env), "LinuxSourceVersionCmd")
     asserts.equals(env, 1, len(source_version_actions))
+    if source_version_actions:
+        source_version_action = source_version_actions[0]
+        asserts.equals(env, "cross_tree/leaf.c", _argument_after(source_version_action.argv, "-primary"))
+        asserts.true(
+            env,
+            "compiler_compatibility.inc" in _arguments_after(source_version_action.argv, "-canonical"),
+            "compiler compatibility sources should retain canonical source-version mappings",
+        )
     if actions:
         asserts.true(env, "-mode" in actions[0].argv)
         asserts.true(env, "c" in actions[0].argv)
         asserts.true(env, "-D__GENKSYMS__" in actions[0].argv)
         asserts.true(env, "6.18.39" in actions[0].argv)
+        asserts.true(env, "-mstack-alignment=8" in actions[0].argv)
+        asserts.true(env, "-mretpoline-external-thunk" in actions[0].argv)
         compile_actions = _actions_with_mnemonic(analysistest.target_actions(env), "LinuxObjectCompile")
         objtool_actions = _actions_with_mnemonic(analysistest.target_actions(env), "LinuxObjectObjtool")
         asserts.equals(env, 1, len(compile_actions))
@@ -271,6 +298,7 @@ def linux_object_groups_test_suite(name):
     )
     linux_source_input_index(
         name = name + "_source_inputs",
+        compiler_compatibility_srcs = ["//tests/compile:source/compiler_compatibility.inc"],
         groups = ["1,2,3,4,5,6,7"],
         source_tree_info = ":" + name + "_source_tree",
         srcs = [
@@ -355,7 +383,11 @@ def linux_object_groups_test_suite(name):
         recipe_id = _MODVERSION_RECIPE_ID,
         source_input_index = ":" + name + "_source_inputs",
         srcarch = "x86",
-        symversion_flags = ["-Werror"],
+        symversion_flags = [
+            "-Werror",
+            "-mstack-alignment=8",
+            "-mretpoline-external-thunk",
+        ],
         symversions = True,
         version = "6.18.39",
     )

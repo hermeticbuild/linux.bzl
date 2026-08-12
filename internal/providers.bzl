@@ -20,6 +20,8 @@ LinuxRustSdkInfo = provider(
     fields = {
         "compile_inputs": "Depset of Rust crate metadata and generated sources.",
         "enabled": "Whether CONFIG_RUST is enabled for this kernel.",
+        "module_config_conditions": "Ordered action-time Kconfig conditions for external module flags.",
+        "module_config_flag_index": "Insertion point for action-time Kconfig flags in module_flags, or -1.",
         "module_flags": "Rust compiler flags shared by external modules.",
         "module_version_predicates": "Ordered rustc-version predicates for external module flags.",
         "objtool": "Configured objtool executable File, or None when objtool is disabled.",

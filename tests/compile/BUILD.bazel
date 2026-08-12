@@ -11,7 +11,10 @@ load(":source_include_closure_test.bzl", "source_include_closure_test")
 
 package(default_visibility = ["//:__subpackages__"])
 
-exports_files(["source/cross_tree/leaf.S"])
+exports_files([
+    "source/compiler_compatibility.inc",
+    "source/cross_tree/leaf.S",
+])
 
 _COMPILE_ENVIRONMENT_ID = "1111111111111111111111111111111111111111111111111111111111111111"
 

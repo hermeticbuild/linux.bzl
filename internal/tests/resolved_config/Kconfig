@@ -1,5 +1,14 @@
 mainmenu "linux.bzl resolved config test"
 
+config X86
+	bool "x86"
+
+config X86_64
+	bool "x86-64"
+
+config ARM64
+	bool "arm64"
+
 config 64BIT
 	bool
 	default y

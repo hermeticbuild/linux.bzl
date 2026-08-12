@@ -19,6 +19,66 @@ visibility("//...")
 _RUST_TOOLCHAIN_TYPE = Label("@rules_rust//rust:toolchain_type")
 _BINDGEN_TOOLCHAIN_TYPE = Label("@rules_rs//rs:bindgen_toolchain_type")
 _RUST_PROFILE_SCHEMA = "linux-rust-profile-v2"
+_RUST_CONFIG_FLAGS_MARKER = "--linux-bzl-config-flags"
+_BINDGEN_GCC_TARGETS = {
+    "arm": "arm-linux-gnueabi",
+    "arm64": "aarch64-linux-gnu",
+    "loongarch": "loongarch64-linux-gnusf",
+    "x86": "x86_64-linux-gnu",
+}
+
+# bindgen parses C with libclang even when Kbuild selects GCC. Keep this in
+# sync with bindgen_skip_c_flags in Linux's rust/Makefile. The extra
+# -fno-canonical-system-headers entry is injected by the Bazel GCC toolchain,
+# rather than Kbuild, and is likewise rejected by libclang.
+_BINDGEN_GCC_SKIP_FLAGS = [
+    "--param",
+    "-fconserve-stack",
+    "-femit-struct-debug-baseonly",
+    "-fno-allow-store-data-races",
+    "-fno-canonical-system-headers",
+    "-fno-inline-functions-called-once",
+    "-fno-ipa-cp-clone",
+    "-fno-ipa-sra",
+    "-fno-isolate-erroneous-paths-dereference",
+    "-fno-partial-inlining",
+    "-fno-reorder-blocks",
+    "-fno-stack-clash-protection",
+    "-fsanitize=bounds-strict",
+    "-mabi=lp64",
+    "-mdirect-extern-access",
+    "-mexplicit-relocs",
+    "-mgeneral-regs-only",
+    "-mindirect-branch-cs-prefix",
+    "-mindirect-branch-register",
+    "-mindirect-branch=thunk-extern",
+    "-mfunction-return=thunk-extern",
+    "-mno-check-zero-division",
+    "-mno-fdpic",
+    "-mno-fp-ret-in-387",
+    "-mno-pointers-to-nested-functions",
+    "-mno-strict-align",
+    "-mno-string",
+    "-mrecord-mcount",
+    "-mskip-rax-setup",
+    "-mstrict-align",
+    "-mtraceback=no",
+]
+_BINDGEN_GCC_SKIP_PREFIXES = [
+    "--param=",
+    "asan-",
+    "-falign-jumps=",
+    "-falign-loops=",
+    "-fasan-shadow-offset=",
+    "-fmin-function-alignment=",
+    "-fplugin-arg-arm_ssp_per_task_plugin-",
+    "-fstrict-flex-arrays=",
+    "-fzero-call-used-regs=",
+    "-fzero-init-padding-bits=",
+    "-mpreferred-stack-boundary=",
+    "-msign-return-address=",
+    "-mstack-protector-guard",
+]
 _RUSTC_SOURCE_PREFIX_CLOSURE = {
     # core imports these sibling trees with #[path] across supported releases.
     "rustc://library/core/": [
@@ -183,20 +243,66 @@ def _profile_versioned_flags(value, name, config, replacements):
         predicates = _profile_version_predicates(value, name, config, replacements),
     )
 
-def _condition_matches(config, condition):
+def _profile_condition_selector(condition):
     symbol = _required_profile_field(condition, "config", "string")
     expected = condition.get("equals", "y")
     if type(expected) != "string":
         fail("Rust profile conditional equals field must be a string")
-    if config.config_flags.get(symbol, "n") != expected:
-        return False
     unless_symbol = condition.get("unless_config")
     if unless_symbol != None:
         if type(unless_symbol) != "string" or not unless_symbol:
             fail("Rust profile conditional unless_config field must be a non-empty string")
-        if config.config_flags.get(unless_symbol, "n") == "y":
+    return struct(
+        config = symbol,
+        equals = expected,
+        unless_config = unless_symbol,
+    )
+
+def _condition_matches(config, condition):
+    selector = _profile_condition_selector(condition)
+    if config.config_flags.get(selector.config, "n") != selector.equals:
+        return False
+    if selector.unless_config != None:
+        if config.config_flags.get(selector.unless_config, "n") == "y":
             return False
     return True
+
+def _deferred_profile_condition(condition, config, replacements):
+    selector = _profile_condition_selector(condition)
+    out = {
+        "config": selector.config,
+        "equals": selector.equals,
+        "flags": _expand_profile_values(
+            _required_profile_field(condition, "flags", "list"),
+            config,
+            replacements,
+        ),
+        "else_flags": _expand_profile_values(
+            _required_profile_field(condition, "else_flags", "list"),
+            config,
+            replacements,
+        ),
+    }
+    if selector.unless_config != None:
+        out["unless_config"] = selector.unless_config
+    return out
+
+def _deferred_condition_predicates(condition, config, replacements):
+    selector = _profile_condition_selector(condition)
+    out = []
+    for raw in _profile_version_predicates(
+        condition,
+        "target_flags.conditional",
+        config,
+        replacements,
+    ):
+        predicate = dict(raw)
+        predicate["config"] = selector.config
+        predicate["equals"] = selector.equals
+        if selector.unless_config != None:
+            predicate["unless_config"] = selector.unless_config
+        out.append(predicate)
+    return out
 
 def _expand_profile_value(value, config, replacements):
     if type(value) != "string":
@@ -219,7 +325,7 @@ def _expand_profile_values(values, config, replacements):
         for value in values
     ]
 
-def _profile_target_flags(profile, config, replacements):
+def _profile_target_flags(profile, config, replacements, defer_conditions = False):
     target_flags = profile["target_flags"]
     common = _profile_versioned_flags(
         profile["common_flags"],
@@ -240,9 +346,22 @@ def _profile_target_flags(profile, config, replacements):
         config,
         replacements,
     ))
+    conditions = []
     for condition in target_flags.get("conditional", []):
         if type(condition) != "dict":
             fail("Rust profile target_flags.conditional entries must be objects")
+        if defer_conditions:
+            conditions.append(_deferred_profile_condition(
+                condition,
+                config,
+                replacements,
+            ))
+            predicates.extend(_deferred_condition_predicates(
+                condition,
+                config,
+                replacements,
+            ))
+            continue
         if _condition_matches(config, condition):
             flags.extend(_expand_profile_values(
                 _required_profile_field(condition, "flags", "list"),
@@ -261,7 +380,11 @@ def _profile_target_flags(profile, config, replacements):
                 config,
                 replacements,
             ))
-    return struct(flags = flags, predicates = predicates)
+    return struct(
+        conditions = conditions,
+        flags = flags,
+        predicates = predicates,
+    )
 
 def _profile_inputs(source_files, prefixes, paths):
     inputs = {}
@@ -353,7 +476,10 @@ def _run_rustc(
         objtree_anchor = None,
         transitive_tool_inputs = [],
         include_rust_std = False,
-        version_predicates = []):
+        version_predicates = [],
+        config_file = None,
+        config_conditions = [],
+        config_flag_index = -1):
     runner_args = ctx.actions.args()
     runner_args.add("-cwd", ".")
     env = _rust_env(compiler)
@@ -370,21 +496,47 @@ def _run_rustc(
     runner_args.add(ctx.executable._rustcrun)
     runner_args.add("-probe")
     runner_args.add(rustc_probe)
+    action_inputs = inputs + [rustc_probe]
+    if config_conditions:
+        if config_file == None:
+            fail("deferred Rust config conditions require a resolved .config")
+        if config_flag_index < 0 or config_flag_index > len(args):
+            fail("deferred Rust config condition insertion index is out of range")
+        runner_args.add("-config")
+        runner_args.add(config_file)
+        for condition in config_conditions:
+            runner_args.add("-config-condition", json.encode(condition))
+        action_inputs.append(config_file)
     for predicate in version_predicates:
         runner_args.add("-predicate", json.encode(predicate))
     runner_args.add("--")
     runner_args.add(compiler.rustc)
-    add_mapped_values(
-        runner_args,
-        args,
-        files = mapped_files,
-        directory_anchors = mapped_directories,
-    )
+    if config_conditions:
+        add_mapped_values(
+            runner_args,
+            args[:config_flag_index],
+            files = mapped_files,
+            directory_anchors = mapped_directories,
+        )
+        runner_args.add(_RUST_CONFIG_FLAGS_MARKER)
+        add_mapped_values(
+            runner_args,
+            args[config_flag_index:],
+            files = mapped_files,
+            directory_anchors = mapped_directories,
+        )
+    else:
+        add_mapped_values(
+            runner_args,
+            args,
+            files = mapped_files,
+            directory_anchors = mapped_directories,
+        )
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._runincwd,
         inputs = depset(
-            inputs + [rustc_probe],
+            action_inputs,
             transitive = [
                 _rustc_tool_inputs(compiler, include_std = include_rust_std),
             ] + transitive_tool_inputs,
@@ -580,6 +732,56 @@ def _kernel_c_flags(ctx, config, generated_headers, cc_toolchain, feature_config
         values = values,
     )
 
+def _gcc_bindgen_compatible_values(values, srcarch):
+    out = []
+    for value in values:
+        if value in _BINDGEN_GCC_SKIP_FLAGS:
+            continue
+        if any([value.startswith(prefix) for prefix in _BINDGEN_GCC_SKIP_PREFIXES]):
+            continue
+        out.append(value)
+    target = _BINDGEN_GCC_TARGETS.get(srcarch)
+    if target == None:
+        fail("GCC-backed bindgen does not know a libclang target for Linux SRCARCH %r" % srcarch)
+    out.extend(["-w", "--target=" + target])
+    return out
+
+def _gcc_bindgen_response_file(ctx, input, index):
+    output = ctx.actions.declare_file(
+        ctx.label.name + ".rust_sdk/bindgen_cflags/%d_%s" % (index, input.basename),
+    )
+    args = ctx.actions.args()
+    args.add("-in", input)
+    args.add("-out", output)
+    args.add_all(_BINDGEN_GCC_SKIP_FLAGS, before_each = "-remove")
+    args.add_all(_BINDGEN_GCC_SKIP_PREFIXES, before_each = "-remove_prefix")
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._flagfilter,
+        inputs = [input],
+        outputs = [output],
+        arguments = [args],
+        mnemonic = "LinuxRustBindgenFlagFilter",
+        progress_message = "Filtering GCC-only bindgen flags %{label}",
+    )
+    return output
+
+def _gcc_bindgen_c_flags(ctx, flags, srcarch):
+    replacements = {}
+    mapped_files = []
+    for index, file in enumerate(flags.mapped_files):
+        filtered = _gcc_bindgen_response_file(ctx, file, index)
+        replacements["@" + file.path] = "@" + filtered.path
+        mapped_files.append(filtered)
+    return struct(
+        directory_anchors = flags.directory_anchors,
+        mapped_files = mapped_files,
+        values = _gcc_bindgen_compatible_values([
+            replacements.get(value, value)
+            for value in flags.values
+        ], srcarch),
+    )
+
 def _add_kernel_c_flags(args, flags):
     add_mapped_values(
         args,
@@ -710,7 +912,7 @@ def _run_bindgen_with_parameters(
         ctx.actions,
         executable = ctx.executable._lineargsrun,
         inputs = depset(
-            [header, parameters],
+            [header, parameters] + c_flags.mapped_files,
             transitive = [
                 config.files,
                 generated_headers.files,
@@ -755,7 +957,7 @@ def _run_helpers_bindgen(
         ctx.actions,
         executable = bindgen,
         inputs = depset(
-            [source],
+            [source] + c_flags.mapped_files,
             transitive = [
                 config.files,
                 generated_headers.files,
@@ -817,7 +1019,7 @@ def _compile_kernel_c(
 
 def _objcopy(ctx, cc_toolchain, input, path, flags):
     out = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/" + path)
-    llvm_objcopy = linux_module_cc_helpers.llvm_objcopy(cc_toolchain)
+    llvm_objcopy = linux_module_cc_helpers.objcopy(cc_toolchain)
     args = ctx.actions.args()
     args.add_all(flags)
     args.add(input)
@@ -825,7 +1027,7 @@ def _objcopy(ctx, cc_toolchain, input, path, flags):
     path_mapped_run(
         ctx.actions,
         executable = llvm_objcopy,
-        inputs = [input],
+        inputs = linux_module_cc_helpers.tool_inputs(cc_toolchain, [input]),
         outputs = [out],
         arguments = [args],
         mnemonic = "LinuxRustObjcopy",
@@ -844,6 +1046,7 @@ def _rust_crate(
         rust_dir_anchor,
         target_flags,
         version_predicates,
+        config_conditions,
         crate,
         source,
         source_inputs,
@@ -858,6 +1061,21 @@ def _rust_crate(
         for flag in target_flags
         if flag not in skip_flags
     ]
+    config_flag_index = len(flags)
+    filtered_config_conditions = []
+    for raw_condition in config_conditions:
+        condition = dict(raw_condition)
+        condition["flags"] = [
+            flag
+            for flag in condition["flags"]
+            if flag not in skip_flags
+        ]
+        condition["else_flags"] = [
+            flag
+            for flag in condition["else_flags"]
+            if flag not in skip_flags
+        ]
+        filtered_config_conditions.append(condition)
     flags.extend(crate_flags)
     flags.extend([
         "--emit=obj=" + raw_object.path,
@@ -891,6 +1109,9 @@ def _rust_crate(
         },
         objtree_anchor = objtree_anchor,
         version_predicates = version_predicates,
+        config_file = config.config,
+        config_conditions = filtered_config_conditions,
+        config_flag_index = config_flag_index,
     )
     processed = raw_object
     if objcopy_flags:
@@ -902,7 +1123,7 @@ def _rust_crate(
 
 def _export_header(ctx, cc_toolchain, object, name):
     symbols = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/rust/." + name + ".nm")
-    llvm_nm = linux_module_cc_helpers.llvm_nm(cc_toolchain)
+    llvm_nm = linux_module_cc_helpers.nm(cc_toolchain)
     nm_args = ctx.actions.args()
     nm_args.add("-nm", llvm_nm)
     nm_args.add("-in", object)
@@ -910,7 +1131,7 @@ def _export_header(ctx, cc_toolchain, object, name):
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._nmrun,
-        inputs = [object],
+        inputs = linux_module_cc_helpers.tool_inputs(cc_toolchain, [object]),
         tools = [llvm_nm],
         outputs = [symbols],
         arguments = [nm_args],
@@ -984,6 +1205,8 @@ def _disabled_sdk():
     return LinuxRustSdkInfo(
         compile_inputs = depset(),
         enabled = False,
+        module_config_conditions = [],
+        module_config_flag_index = -1,
         module_flags = [],
         module_version_predicates = [],
         objtool = None,
@@ -1091,7 +1314,12 @@ def _linux_rust_kernel_sdk_impl(ctx):
         config,
         replacements,
     )
-    target_flags = _profile_target_flags(profile, config, replacements)
+    target_flags = _profile_target_flags(
+        profile,
+        config,
+        replacements,
+        defer_conditions = True,
+    )
     c_flags = _kernel_c_flags(
         ctx,
         config,
@@ -1100,7 +1328,10 @@ def _linux_rust_kernel_sdk_impl(ctx):
         feature_configuration,
         source_root,
     )
-    bindgen_c_flags = _extend_kernel_c_flags(c_flags, [
+    bindgen_base_c_flags = c_flags
+    if not linux_module_cc_helpers.is_clang(cc_toolchain):
+        bindgen_base_c_flags = _gcc_bindgen_c_flags(ctx, c_flags, ctx.attr.srcarch)
+    bindgen_c_flags = _extend_kernel_c_flags(bindgen_base_c_flags, [
         "-fno-builtin",
         "-D__BINDGEN__",
         "-DMODULE",
@@ -1347,6 +1578,7 @@ def _linux_rust_kernel_sdk_impl(ctx):
                 config,
                 replacements,
             ),
+            target_flags.conditions,
             name,
             source,
             source_inputs,
@@ -1457,6 +1689,8 @@ def _linux_rust_kernel_sdk_impl(ctx):
     sdk = LinuxRustSdkInfo(
         compile_inputs = compile_inputs,
         enabled = True,
+        module_config_conditions = target_flags.conditions,
+        module_config_flag_index = len(target_flags.flags) if target_flags.conditions else -1,
         module_flags = module_flags,
         module_version_predicates = module_version_predicates,
         objtool = ctx.executable.objtool,
@@ -1519,6 +1753,11 @@ linux_rust_kernel_sdk = rule(
             executable = True,
         ),
         "_host_cc_toolchain": host_cc_toolchain_attr(),
+        "_flagfilter": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/flagfilter"),
+            executable = True,
+        ),
         "_nmrun": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/nmrun"),
@@ -1562,6 +1801,7 @@ linux_rust_test_helpers = struct(
     decode_profile = _decode_rust_profile,
     extend_kernel_c_flags = _extend_kernel_c_flags,
     expand_profile_value = _expand_profile_value,
+    gcc_bindgen_compatible_values = _gcc_bindgen_compatible_values,
     profile_target_flags = _profile_target_flags,
     rustc_source_prefixes = _rustc_source_prefixes,
     unsupported_config_symbols = _unsupported_rust_config_symbols,
