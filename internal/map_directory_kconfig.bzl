@@ -1,4 +1,4 @@
-"""Bazel 9 feasibility spike for execution-time Kconfig graph expansion."""
+"""Bazel 9 feasibility rules for execution-time Kconfig graph expansion."""
 
 load(
     "@rules_cc//cc:action_names.bzl",
@@ -13,12 +13,11 @@ load(
 )
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 
-visibility("//tests/map_directory")
+visibility("public")
 
 _HEX_DIGITS = "0123456789abcdef"
 _PLAN_VERSION = "v1"
 _SOURCE_INPUT_PREFIX = "source:"
-_GCC_TOOLCHAIN_SETTING = "//tests/map_directory:use_gcc_toolchain"
 _COMPILE_OUTPUT_SENTINEL = "__linux_bzl_map_output__.o"
 _COMPILE_RECIPE_FLAGS_SENTINEL = "-D__LINUX_BZL_MAP_RECIPE_FLAGS__"
 _COMPILE_SOURCE_SENTINEL = "__linux_bzl_map_source__.c"
@@ -168,6 +167,18 @@ def _tool_file_for_path(cc_toolchain, tool_path, name):
         for file in cc_toolchain.all_files.to_list()
         if file.path == tool_path
     ]
+    if not matches:
+        # Some toolchains return a canonical exec path from CcToolchainInfo
+        # while their File artifacts retain a repository-relative path. Match
+        # the final directory and basename in that case; requiring exactly one
+        # result keeps ambiguous toolchain layouts fail-closed.
+        parts = tool_path.split("/")
+        suffix = "/" + "/".join(parts[-2:])
+        matches = [
+            file
+            for file in cc_toolchain.all_files.to_list()
+            if file.path.endswith(suffix)
+        ]
     if len(matches) != 1:
         fail(
             "selected C/C++ toolchain must provide exactly one File for %s path %r; found: %s" % (
@@ -183,6 +194,8 @@ def _tool_file_for_sibling(cc_toolchain, tool, basename, name):
     return _tool_file_for_path(cc_toolchain, path, name)
 
 def _single_file(target, name):
+    if target == None:
+        fail("%s is required by the selected C/C++ toolchain" % name)
     files = target[DefaultInfo].files.to_list()
     if len(files) != 1:
         fail("%s must provide exactly one executable File; found: %s" % (
@@ -205,11 +218,22 @@ def _selected_probe_tools(ctx, cc_toolchain, feature_configuration, compiler, co
             objcopy = _tool_file_for_sibling(cc_toolchain, compiler, "llvm-objcopy", "objcopy"),
         )
     return struct(
-        archiver = _single_file(ctx.attr._gcc_ar, "GCC test archiver"),
-        linker = _single_file(ctx.attr._gcc_ld, "GCC test linker"),
-        nm = _single_file(ctx.attr._gcc_nm, "GCC test nm"),
-        objcopy = _single_file(ctx.attr._gcc_objcopy, "GCC test objcopy"),
+        archiver = _tool_file_for_path(cc_toolchain, cc_toolchain.ar_executable, "archiver"),
+        linker = _tool_file_for_path(cc_toolchain, cc_toolchain.ld_executable, "linker"),
+        # gcc_toolchain 0.12 publishes nm_executable but omits its File from
+        # CcToolchainInfo.all_files. Accept the single explicit gap until that
+        # upstream provider is complete.
+        nm = _single_file(ctx.attr.probe_nm, "probe nm"),
+        objcopy = _tool_file_for_path(cc_toolchain, cc_toolchain.objcopy_executable, "objcopy"),
     )
+
+def _selected_compiler_family(cc_toolchain, compiler):
+    compiler_id = cc_toolchain.compiler.lower()
+    if "clang" in compiler_id:
+        return "clang"
+    if "gcc" in compiler_id:
+        return "gcc"
+    fail("map_directory rules do not recognize selected compiler kind %r for %s" % (cc_toolchain.compiler, compiler.path))
 
 def _canonical_sources(ctx):
     prefix = ctx.label.package + "/" if ctx.label.package else ""
@@ -379,14 +403,7 @@ def _linux_map_directory_kconfig_spike_impl(ctx):
         if name in tool_environment and tool_environment[name] != value:
             fail("map_directory spike has conflicting compile/link toolchain environment %s" % name)
         tool_environment[name] = value
-    compiler_id = cc_toolchain.compiler.lower()
-    compiler_family = ""
-    if "clang" in compiler_id:
-        compiler_family = "clang"
-    elif "gcc" in compiler_id:
-        compiler_family = "gcc"
-    else:
-        fail("map_directory spike does not recognize selected compiler kind %r for %s" % (cc_toolchain.compiler, compiler.path))
+    compiler_family = _selected_compiler_family(cc_toolchain, compiler)
     probe_tools = _selected_probe_tools(ctx, cc_toolchain, feature_configuration, compiler, compiler_family)
     sources = _canonical_sources(ctx)
 
@@ -402,7 +419,7 @@ def _linux_map_directory_kconfig_spike_impl(ctx):
     plan_args.add("-config")
     plan_args.add(ctx.file.config, format = ctx.attr.config_name + "=%s")
     plan_args.add("-generated_headers_for_config")
-    plan_args.add(ctx.attr.config_name + "=//tests/map_directory:unused_generated_headers")
+    plan_args.add(ctx.attr.config_name + "=" + str(ctx.label) + "_unused_generated_headers")
     plan_args.add("-compile_environment_abi")
     plan_args.add("map-directory-spike/" + ctx.attr.target_profile)
     plan_args.add("-target_profile")
@@ -534,14 +551,11 @@ linux_map_directory_kconfig_spike = rule(
         "kbuild": attr.label(allow_single_file = True, mandatory = True),
         "kconfig": attr.label(allow_single_file = True, mandatory = True),
         "linux_arch": attr.string(default = "x86"),
+        "probe_nm": attr.label(allow_single_file = True, cfg = "exec"),
         "srcs": attr.label_list(allow_files = [".c", ".h"], mandatory = True),
         "target_profile": attr.string(default = "x86_64"),
         "target_triple": attr.string(default = "x86_64-linux-gnu"),
         "validator": attr.label(cfg = "exec", executable = True, mandatory = True),
-        "_gcc_ar": attr.label(default = Label("@map_directory_gcc_x86_64//:ar")),
-        "_gcc_ld": attr.label(default = Label("@map_directory_gcc_x86_64//:ld")),
-        "_gcc_nm": attr.label(default = Label("@map_directory_gcc_x86_64//:nm")),
-        "_gcc_objcopy": attr.label(default = Label("@map_directory_gcc_x86_64//:objcopy")),
         "_kconfig_parse": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/kconfig_parse:kconfig_parse"),
@@ -557,8 +571,8 @@ linux_map_directory_kconfig_spike = rule(
     toolchains = use_cc_toolchain(),
 )
 
-def _linux_upstream_gcc_kconfig_impl(ctx):
-    """Resolves the complete upstream Kconfig tree with the selected GCC."""
+def _linux_upstream_kconfig_impl(ctx):
+    """Resolves the complete upstream Kconfig tree with the selected compiler."""
     cc_toolchain = find_cpp_toolchain(ctx)
     feature_configuration = cc_common.configure_features(
         ctx = ctx,
@@ -571,9 +585,8 @@ def _linux_upstream_gcc_kconfig_impl(ctx):
         action_name = C_COMPILE_ACTION_NAME,
     )
     compiler = _tool_file_for_path(cc_toolchain, compiler_path, "C compiler")
-    if "gcc" not in cc_toolchain.compiler.lower():
-        fail("upstream GCC Kconfig test selected compiler kind %r, want gcc" % cc_toolchain.compiler)
-    probe_tools = _selected_probe_tools(ctx, cc_toolchain, feature_configuration, compiler, "gcc")
+    compiler_family = _selected_compiler_family(cc_toolchain, compiler)
+    probe_tools = _selected_probe_tools(ctx, cc_toolchain, feature_configuration, compiler, compiler_family)
     compile_action = _configured_compile_action(ctx, cc_toolchain, feature_configuration)
     compiler_prefix = compile_action.probe_prefix
     linker_driver = _configured_linker_driver_prefix(ctx, cc_toolchain, feature_configuration)
@@ -581,7 +594,7 @@ def _linux_upstream_gcc_kconfig_impl(ctx):
     tool_environment["EXECROOT"] = "."
     for name, value in linker_driver.environment.items():
         if name in tool_environment and tool_environment[name] != value:
-            fail("upstream GCC Kconfig test has conflicting compile/link toolchain environment %s" % name)
+            fail("upstream Kconfig test has conflicting compile/link toolchain environment %s" % name)
         tool_environment[name] = value
 
     resolved = ctx.actions.declare_file(ctx.label.name + ".config")
@@ -630,12 +643,10 @@ def _linux_upstream_gcc_kconfig_impl(ctx):
     args.add("-probe_objcopy")
     args.add(probe_tools.objcopy)
 
-    # gcc_toolchain's sysroot is materialized through absolute symlinks and its
-    # plugin headers are not exposed as declared targets. Fail these two
-    # capabilities closed explicitly, so local sandbox, standalone, and remote
-    # execution cannot select different Kconfig graphs from ambient files.
-    args.add("-probe_allow_cc_can_link=false")
-    args.add("-probe_allow_gcc_plugins=false")
+    if not ctx.attr.probe_allow_cc_can_link:
+        args.add("-probe_allow_cc_can_link=false")
+    if not ctx.attr.probe_allow_gcc_plugins:
+        args.add("-probe_allow_gcc_plugins=false")
     for flag in compiler_prefix:
         args.add("-probe_cc_arg")
         args.add(flag)
@@ -663,8 +674,8 @@ def _linux_upstream_gcc_kconfig_impl(ctx):
         ),
         outputs = resolved_outputs,
         arguments = [args],
-        mnemonic = "UpstreamGCCKconfigResolve",
-        progress_message = "Resolving upstream Linux 6.18.39 Kconfig with selected GCC for %{label}",
+        mnemonic = "UpstreamKconfigResolve",
+        progress_message = "Resolving upstream Linux 6.18.39 Kconfig with the selected compiler for %{label}",
         execution_requirements = {"supports-path-mapping": "1"},
         env = tool_environment,
         toolchain = CC_TOOLCHAIN_TYPE,
@@ -673,6 +684,8 @@ def _linux_upstream_gcc_kconfig_impl(ctx):
     validation_args = ctx.actions.args()
     validation_args.add("-config")
     validation_args.add(resolved)
+    validation_args.add("-compiler_family")
+    validation_args.add(compiler_family)
     validation_args.add("-out")
     validation_args.add(validated)
     ctx.actions.run(
@@ -680,8 +693,8 @@ def _linux_upstream_gcc_kconfig_impl(ctx):
         inputs = [resolved],
         outputs = [validated],
         arguments = [validation_args],
-        mnemonic = "UpstreamGCCKconfigValidate",
-        progress_message = "Validating upstream GCC Kconfig fields for %{label}",
+        mnemonic = "UpstreamKconfigValidate",
+        progress_message = "Validating upstream compiler-derived Kconfig fields for %{label}",
         execution_requirements = {"supports-path-mapping": "1"},
     )
     return [
@@ -689,18 +702,17 @@ def _linux_upstream_gcc_kconfig_impl(ctx):
         OutputGroupInfo(resolved_config = depset(resolved_outputs)),
     ]
 
-_linux_upstream_gcc_kconfig = rule(
-    implementation = _linux_upstream_gcc_kconfig_impl,
+linux_upstream_kconfig = rule(
+    implementation = _linux_upstream_kconfig_impl,
     attrs = {
         "config": attr.label(allow_single_file = True, mandatory = True),
-        "config_name": attr.string(default = "upstream_gcc"),
+        "config_name": attr.string(default = "upstream"),
         "kconfig": attr.label(allow_single_file = True, mandatory = True),
         "kconfig_files": attr.label(mandatory = True),
+        "probe_allow_cc_can_link": attr.bool(default = True),
+        "probe_allow_gcc_plugins": attr.bool(default = True),
+        "probe_nm": attr.label(allow_single_file = True, cfg = "exec"),
         "validator": attr.label(cfg = "exec", executable = True, mandatory = True),
-        "_gcc_ar": attr.label(default = Label("@map_directory_gcc_x86_64//:ar")),
-        "_gcc_ld": attr.label(default = Label("@map_directory_gcc_x86_64//:ld")),
-        "_gcc_nm": attr.label(default = Label("@map_directory_gcc_x86_64//:nm")),
-        "_gcc_objcopy": attr.label(default = Label("@map_directory_gcc_x86_64//:objcopy")),
         "_kconfig_parse": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/kconfig_parse:kconfig_parse"),
@@ -739,69 +751,3 @@ map_directory_probe_identity_comparison = rule(
         "validator": attr.label(cfg = "exec", executable = True, mandatory = True),
     },
 )
-
-def _select_gcc_toolchain_impl(settings, _attr):
-    return {
-        _GCC_TOOLCHAIN_SETTING: True,
-        "//command_line_option:copt": settings["//command_line_option:copt"] + [
-            "-DMAP_DIRECTORY_TOOLCHAIN_PREFIX_REPLAYED=1",
-        ],
-    }
-
-_select_gcc_toolchain = transition(
-    implementation = _select_gcc_toolchain_impl,
-    inputs = ["//command_line_option:copt"],
-    outputs = [
-        _GCC_TOOLCHAIN_SETTING,
-        "//command_line_option:copt",
-    ],
-)
-
-def _gcc_spike_transition_impl(ctx):
-    actual = ctx.attr.actual[0]
-    providers = [actual[DefaultInfo]]
-    if OutputGroupInfo in actual:
-        providers.append(actual[OutputGroupInfo])
-    return providers
-
-_gcc_spike_transition = rule(
-    implementation = _gcc_spike_transition_impl,
-    attrs = {
-        "actual": attr.label(cfg = _select_gcc_toolchain, mandatory = True),
-        "_allowlist_function_transition": attr.label(
-            default = "@bazel_tools//tools/allowlists/function_transition_allowlist",
-        ),
-    },
-)
-
-def linux_map_directory_gcc_kconfig_spike(name, tags = [], visibility = None, **kwargs):
-    """Creates a private GCC-selected variant of the map_directory spike."""
-    actual_name = name + "_gcc_impl"
-    linux_map_directory_kconfig_spike(
-        name = actual_name,
-        tags = tags,
-        visibility = ["//visibility:private"],
-        **kwargs
-    )
-    _gcc_spike_transition(
-        name = name,
-        actual = ":" + actual_name,
-        tags = tags,
-        visibility = visibility,
-    )
-
-def linux_upstream_gcc_kconfig_test(name, tags = [], visibility = None, **kwargs):
-    """Resolves upstream Linux Kconfig under the registered hermetic GCC."""
-    actual_name = name + "_gcc_impl"
-    _linux_upstream_gcc_kconfig(
-        name = actual_name,
-        tags = tags,
-        visibility = ["//visibility:private"],
-        **kwargs
-    )
-    _gcc_spike_transition(
-        name = name,
-        actual = ":" + actual_name,
-        tags = tags,
-        visibility = visibility,
-    )

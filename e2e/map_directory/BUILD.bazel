@@ -1,0 +1,110 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+load(
+    "@linux.bzl//internal:map_directory_kconfig.bzl",
+    "linux_map_directory_kconfig_spike",
+    "linux_upstream_kconfig",
+)
+load("@rules_go//go:def.bzl", "go_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+string_flag(
+    name = "compiler",
+    build_setting_default = "clang",
+    values = [
+        "clang",
+        "gcc",
+    ],
+)
+
+config_setting(
+    name = "gcc_selected",
+    flag_values = {":compiler": "gcc"},
+)
+
+toolchain(
+    name = "gcc_cc_toolchain",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_settings = [":gcc_selected"],
+    toolchain = "@e2e_map_directory_gcc_x86_64//:_cc_toolchain",
+    toolchain_type = "@rules_cc//cc:toolchain_type",
+)
+
+go_binary(
+    name = "upstream_validator",
+    srcs = ["upstream_validator.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/e2e/map_directory/upstream_validator",
+    pure = "on",
+)
+
+linux_map_directory_kconfig_spike(
+    name = "compiler_capabilities",
+    srcs = [
+        "clang_selected.c",
+        "gcc_selected.c",
+        "include/linux/compiler-version.h",
+        "include/linux/compiler_types.h",
+        "include/linux/kconfig.h",
+        "required_local_header.h",
+        "supported.c",
+        "unsupported.c",
+    ],
+    config = "base.config",
+    kbuild = "Kbuild",
+    kconfig = "Kconfig",
+    probe_nm = select({
+        ":gcc_selected": "@e2e_map_directory_gcc_x86_64//:nm",
+        "//conditions:default": None,
+    }),
+    tags = ["requires-bazel-9"],
+    validator = "@linux.bzl//internal/cmd/mapdirectoryvalidator",
+)
+
+linux_upstream_kconfig(
+    name = "upstream_kconfig",
+    config = "@e2e_linux_6_18_39//:arch/x86/configs/x86_64_defconfig",
+    kconfig = "@e2e_linux_6_18_39//:Kconfig",
+    kconfig_files = "@e2e_linux_6_18_39//:kconfig_files",
+    probe_allow_cc_can_link = select({
+        ":gcc_selected": False,
+        "//conditions:default": True,
+    }),
+    probe_allow_gcc_plugins = select({
+        ":gcc_selected": False,
+        "//conditions:default": True,
+    }),
+    probe_nm = select({
+        ":gcc_selected": "@e2e_map_directory_gcc_x86_64//:nm",
+        "//conditions:default": None,
+    }),
+    tags = ["requires-bazel-9"],
+    validator = ":upstream_validator",
+)
+
+build_test(
+    name = "compiler_capabilities_e2e_test",
+    tags = ["requires-bazel-9"],
+    targets = [":compiler_capabilities"],
+)
+
+build_test(
+    name = "upstream_kconfig_e2e_test",
+    tags = ["requires-bazel-9"],
+    targets = [":upstream_kconfig"],
+)
+
+test_suite(
+    name = "compiler_kconfig_e2e_tests",
+    tests = [
+        ":compiler_capabilities_e2e_test",
+        ":upstream_kconfig_e2e_test",
+    ],
+)

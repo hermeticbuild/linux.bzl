@@ -2,4 +2,9 @@ import ../.bazelrc.shared
 
 common:remote --extra_execution_platforms=@hermetic_llvm//:rbe_platform
 
+build:map-directory-clang --//map_directory:compiler=clang
+build:map-directory-gcc --//map_directory:compiler=gcc
+build:map-directory-gcc --copt=-DMAP_DIRECTORY_TOOLCHAIN_PREFIX_REPLAYED=1
+build:map-directory-gcc --extra_toolchains=//map_directory:gcc_cc_toolchain
+
 try-import %workspace%/.bazelrc.user

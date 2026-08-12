@@ -30,7 +30,6 @@ go_library(
     importpath = "github.com/hermeticbuild/linux.bzl/internal/kconfig",
     visibility = [
         "//internal:__subpackages__",
-        "//tests/map_directory:__pkg__",
     ],
     deps = [
         "//internal/kconfig/buildgen",

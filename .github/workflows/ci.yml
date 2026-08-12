@@ -52,13 +52,7 @@ jobs:
           targets=(//...)
           path_mapping_args=()
           if [[ -n "${BAZEL_PATH_MAPPING}" ]]; then
-            targets+=(
-              //internal/tests:path_mapping_test
-              //tests/map_directory:compiler_capabilities_e2e_test
-              //tests/map_directory:distinct_compiler_plan_identities_e2e_test
-              //tests/map_directory:gcc_compiler_capabilities_e2e_test
-              //tests/map_directory:upstream_gcc_kconfig_e2e_test
-            )
+            targets+=(//internal/tests:path_mapping_test)
             path_mapping_args+=("${BAZEL_PATH_MAPPING}")
           fi
           bazel --host_jvm_args=-Xmx6g \
@@ -91,6 +85,77 @@ jobs:
             ${{ runner.temp }}/root-${{ matrix.bazel }}.profile.gz
             ${{ runner.temp }}/root-${{ matrix.bazel }}.bep.json
             ${{ runner.temp }}/root-${{ matrix.bazel }}.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  map-directory-e2e:
+    name: map_directory Kconfig (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - clang
+          - gcc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-map-directory-${{ matrix.compiler }}
+          module-root: e2e
+          repository-cache: |
+            - e2e/.bazelversion
+            - e2e/MODULE.bazel
+            - e2e/MODULE.bazel.lock
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Test with ${{ matrix.compiler }}
+        working-directory: e2e
+        env:
+          BAZEL_BEP: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.profile.gz
+        run: |
+          set -euo pipefail
+          bazel --host_jvm_args=-Xmx6g \
+            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+            test //map_directory:compiler_kconfig_e2e_tests \
+            --config=path-mapping \
+            --config="map-directory-${{ matrix.compiler }}" \
+            --notrack_incremental_state \
+            --nokeep_state_after_build \
+            --discard_analysis_cache \
+            --build_event_json_file="${BAZEL_BEP}" \
+            --profile="${BAZEL_PROFILE}" \
+            2>&1 | tee "${BAZEL_LOG}"
+
+      - name: Report cache efficiency
+        if: ${{ !cancelled() }}
+        env:
+          BAZEL_BEP: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.profile.gz
+        run: |
+          .github/workflows/bazel_cache_report.sh \
+            "map_directory Kconfig (${{ matrix.compiler }})" \
+            "${BAZEL_PROFILE}" \
+            "${BAZEL_BEP}" \
+            "${BAZEL_LOG}"
+
+      - name: Upload Bazel profile
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bazel-profile-map-directory-${{ matrix.compiler }}
+          path: |
+            ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.profile.gz
+            ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.bep.json
+            ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.log
           if-no-files-found: warn
           retention-days: 14
 
