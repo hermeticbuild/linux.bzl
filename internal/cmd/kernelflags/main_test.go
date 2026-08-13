@@ -514,7 +514,7 @@ func TestLinuxCFlagsX86RetpolineUsesIndirectBranchCSPrefix(t *testing.T) {
 			"CONFIG_MITIGATION_RETPOLINE": "y",
 			compiler:                      "y",
 		}
-		flags := linuxCFlags(config, "x86")
+		flags := linuxCFlags(config, "x86", testKernelVersion)
 		if !contains(flags, "-mindirect-branch-cs-prefix") {
 			t.Fatalf("linuxCFlags() with %s missing -mindirect-branch-cs-prefix: %v", compiler, flags)
 		}
@@ -522,7 +522,7 @@ func TestLinuxCFlagsX86RetpolineUsesIndirectBranchCSPrefix(t *testing.T) {
 	flags := linuxCFlags(map[string]string{
 		"CONFIG_X86_64":      "y",
 		"CONFIG_CC_IS_CLANG": "y",
-	}, "x86")
+	}, "x86", testKernelVersion)
 	if contains(flags, "-mindirect-branch-cs-prefix") {
 		t.Fatalf("linuxCFlags() without CONFIG_MITIGATION_RETPOLINE contains -mindirect-branch-cs-prefix: %v", flags)
 	}
