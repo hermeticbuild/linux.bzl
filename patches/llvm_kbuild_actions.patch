@@ -1,0 +1,130 @@
+diff --git a/toolchain/BUILD.bazel b/toolchain/BUILD.bazel
+--- a/toolchain/BUILD.bazel
++++ b/toolchain/BUILD.bazel
+@@ -1,6 +1,7 @@
+ load("@bazel_lib//:bzl_library.bzl", "bzl_library")
+ load("@bazel_skylib//rules:common_settings.bzl", "string_flag", "string_setting")
+-load("@rules_cc//cc/toolchains:actions.bzl", "cc_action_type_set")
++load("@rules_cc//cc/toolchains:actions.bzl", "cc_action_type", "cc_action_type_set")
++load("@rules_cc//cc/toolchains:args.bzl", "cc_args")
+ load("@rules_cc//cc/toolchains:artifacts.bzl", "cc_artifact_name_pattern")
+ load("@rules_cc//cc/toolchains/impl:documented_api.bzl", "cc_args_list")
+ load("//toolchain/bootstrap:declare_toolchains.bzl", declare_bootstrap_toolchains = "declare_toolchains")
+@@ -427,6 +428,27 @@
+     visibility = ["//visibility:public"],
+ )
+ 
++[
++    cc_action_type(
++        name = "linux_kbuild_" + role,
++        action_name = "linux-kbuild-" + role,
++        visibility = ["//visibility:public"],
++    )
++    for role in [
++        "ar", "as", "cc", "cpp", "cxx", "ld", "nm", "objcopy",
++        "objdump", "ranlib", "readelf", "strip",
++    ]
++]
++
++cc_args(
++    name = "linux_kbuild_args",
++    actions = [":linux_kbuild_" + role for role in [
++        "ar", "as", "cc", "cpp", "cxx", "ld", "nm", "objcopy",
++        "objdump", "ranlib", "readelf", "strip",
++    ]],
++    args = ["__LINUX_BZL_KBUILD_ARGS_V1__"],
++)
++
+ declare_toolchains()
+ 
+ declare_bootstrap_toolchains()
+diff --git a/toolchain/cc_toolchain.bzl b/toolchain/cc_toolchain.bzl
+--- a/toolchain/cc_toolchain.bzl
++++ b/toolchain/cc_toolchain.bzl
+@@ -103,6 +103,7 @@
+             "@llvm//toolchain:runtimes_stage1_hosted": ["@llvm//toolchain/runtimes:toolchain_args"],
+             "//conditions:default": ["@llvm//toolchain:toolchain_args"],
+         }) + [
++            "@llvm//toolchain:linux_kbuild_args",
+             # TODO: rules_cc passes extra args to these actions, ideally these would be fixed in rules_cc.
+             "@llvm//toolchain/args:ignore_unused_command_line_argument",
+         ] + extra_args,
+diff --git a/toolchain/llvm/llvm.bzl b/toolchain/llvm/llvm.bzl
+--- a/toolchain/llvm/llvm.bzl
++++ b/toolchain/llvm/llvm.bzl
+@@ -55,6 +55,10 @@
+         name = "compile_resource_dir",
+         actions = [
+             "@rules_cc//cc/toolchains/actions:compile_actions",
++            "@llvm//toolchain:linux_kbuild_as",
++            "@llvm//toolchain:linux_kbuild_cc",
++            "@llvm//toolchain:linux_kbuild_cpp",
++            "@llvm//toolchain:linux_kbuild_cxx",
+         ],
+         allowlist_include_directories = [
+             ":builtin_resource_dir",
+@@ -105,6 +109,19 @@
+         "@rules_cc//cc/toolchains/actions:objcopy_embed_data": ":llvm-objcopy",
+         "@rules_cc//cc/toolchains/actions:dwp": ":llvm-dwp",
+         "@rules_cc//cc/toolchains/actions:strip": ":llvm-strip",
++    } | {
++        "@llvm//toolchain:linux_kbuild_ar": ":llvm-ar",
++        "@llvm//toolchain:linux_kbuild_as": ":clang",
++        "@llvm//toolchain:linux_kbuild_cc": ":clang",
++        "@llvm//toolchain:linux_kbuild_cpp": ":clang",
++        "@llvm//toolchain:linux_kbuild_cxx": ":clang++",
++        "@llvm//toolchain:linux_kbuild_ld": ":ld.lld",
++        "@llvm//toolchain:linux_kbuild_nm": ":llvm-nm",
++        "@llvm//toolchain:linux_kbuild_objcopy": ":llvm-objcopy",
++        "@llvm//toolchain:linux_kbuild_objdump": ":llvm-objdump",
++        "@llvm//toolchain:linux_kbuild_ranlib": ":llvm-ranlib",
++        "@llvm//toolchain:linux_kbuild_readelf": ":llvm-readelf",
++        "@llvm//toolchain:linux_kbuild_strip": ":llvm-strip",
+     }
+     BASE_TOOLS = TOOLS_WITHOUT_LINKER | {
+         "@rules_cc//cc/toolchains/actions:link_actions": ":lld",
+@@ -275,6 +292,18 @@
+         src = "bin/llvm-objcopy" + suffix,
+     )
+ 
++    for name in [
++        "ld.lld",
++        "llvm-nm",
++        "llvm-objdump",
++        "llvm-ranlib",
++        "llvm-readelf",
++    ]:
++        cc_tool(
++            name = name,
++            src = "bin/" + name + suffix,
++        )
++
+     cc_tool(
+         name = "llvm-dwp",
+         src = "bin/llvm-dwp" + suffix,
+@@ -310,7 +339,11 @@
+             "//conditions:default": [],
+         }) + [
+             "bin/c++filt" + suffix,
++            "bin/ld.lld" + suffix,
+             "bin/llvm-nm" + suffix,
++            "bin/llvm-objdump" + suffix,
++            "bin/llvm-ranlib" + suffix,
++            "bin/llvm-readelf" + suffix,
+             "bin/gcov" + suffix,
+             "bin/llvm-cov" + suffix,
+             "bin/llvm-profdata" + suffix,
+diff --git a/toolchain/args/BUILD.bazel b/toolchain/args/BUILD.bazel
+--- a/toolchain/args/BUILD.bazel
++++ b/toolchain/args/BUILD.bazel
+@@ -37,6 +37,10 @@
+     actions = [
+         "@rules_cc//cc/toolchains/actions:compile_actions",
+         "@rules_cc//cc/toolchains/actions:link_actions",
++        "@llvm//toolchain:linux_kbuild_as",
++        "@llvm//toolchain:linux_kbuild_cc",
++        "@llvm//toolchain:linux_kbuild_cpp",
++        "@llvm//toolchain:linux_kbuild_cxx",
+     ],
+     args = [
+         "-target",

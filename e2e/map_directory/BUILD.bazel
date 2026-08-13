@@ -19,6 +19,8 @@ linux_map_directory_kconfig_spike(
     name = "compiler_capabilities",
     srcs = [
         "clang_selected.c",
+        "composite_first.c",
+        "composite_second.c",
         "gcc_selected.c",
         "include/linux/compiler-version.h",
         "include/linux/compiler_types.h",
@@ -39,14 +41,6 @@ linux_upstream_kconfig(
     config = "@e2e_linux_6_18_39//:arch/x86/configs/x86_64_defconfig",
     kconfig = "@e2e_linux_6_18_39//:Kconfig",
     kconfig_files = "@e2e_linux_6_18_39//:kconfig_files",
-    probe_allow_cc_can_link = select({
-        "//:gcc_selected": False,
-        "//conditions:default": True,
-    }),
-    probe_allow_gcc_plugins = select({
-        "//:gcc_selected": False,
-        "//conditions:default": True,
-    }),
     tags = ["requires-bazel-9"],
     validator = ":upstream_validator",
 )

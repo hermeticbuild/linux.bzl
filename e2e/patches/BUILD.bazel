@@ -1,3 +1,6 @@
+package(default_visibility = ["//visibility:public"])
+
 exports_files([
     "gcc_toolchain_remote_execution.patch",
+    "llvm_kbuild_actions.patch",
 ])

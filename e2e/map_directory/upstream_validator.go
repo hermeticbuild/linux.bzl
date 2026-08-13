@@ -5,154 +5,93 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"sort"
+	"strconv"
 	"strings"
 )
 
 func main() {
 	configPath := flag.String("config", "", "resolved upstream Linux .config")
-	compilerFamily := flag.String("compiler_family", "", "selected compiler family (clang or gcc)")
 	outPath := flag.String("out", "", "validation stamp")
 	flag.Parse()
-	if *configPath == "" || (*compilerFamily != "clang" && *compilerFamily != "gcc") || *outPath == "" || flag.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "usage: upstream_validator -config FILE -compiler_family clang|gcc -out FILE")
+	if *configPath == "" || *outPath == "" || flag.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "usage: upstream_validator -config FILE -out FILE")
 		os.Exit(2)
 	}
 
 	values, err := readConfig(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "read resolved upstream config: %v\n", err)
-		os.Exit(1)
+		fatalf("read resolved upstream config: %v", err)
 	}
-	want := map[string]string{
-		"CONFIG_64BIT":                             "y",
-		"CONFIG_AS_HAS_NON_CONST_ULEB128":          "y",
-		"CONFIG_AS_WRUSS":                          "y",
-		"CONFIG_CC_HAS_AUTO_VAR_INIT_ZERO_ENABLER": "n",
-		"CONFIG_CC_HAS_ASM_GOTO_OUTPUT":            "y",
-		"CONFIG_CC_HAS_ASM_GOTO_TIED_OUTPUT":       "y",
-		"CONFIG_CC_HAS_ASM_INLINE":                 "y",
-		"CONFIG_CC_HAS_ASSUME":                     "y",
-		"CONFIG_CC_HAS_AUTO_VAR_INIT_PATTERN":      "y",
-		"CONFIG_CC_HAS_AUTO_VAR_INIT_ZERO":         "y",
-		"CONFIG_CC_HAS_AUTO_VAR_INIT_ZERO_BARE":    "y",
-		"CONFIG_CC_HAS_COUNTED_BY":                 "y",
-		"CONFIG_CC_HAS_ENTRY_PADDING":              "y",
-		"CONFIG_CC_HAS_IBT":                        "y",
-		"CONFIG_CC_HAS_INT128":                     "y",
-		"CONFIG_CC_HAS_KASAN_GENERIC":              "y",
-		"CONFIG_CC_HAS_KASAN_SW_TAGS":              "y",
-		"CONFIG_CC_HAS_MARCH_NATIVE":               "y",
-		"CONFIG_CC_HAS_MULTIDIMENSIONAL_NONSTRING": "y",
-		"CONFIG_CC_HAS_NAMED_AS_FIXED_SANITIZERS":  "y",
-		"CONFIG_CC_HAS_NO_PROFILE_FN_ATTR":         "y",
-		"CONFIG_CC_HAS_RETURN_THUNK":               "y",
-		"CONFIG_CC_HAS_SANE_FUNCTION_ALIGNMENT":    "y",
-		"CONFIG_CC_HAS_SLS":                        "y",
-		"CONFIG_CC_HAS_WORKING_NOSANITIZE_ADDRESS": "y",
-		"CONFIG_CC_HAS_ZERO_CALL_USED_REGS":        "y",
-		"CONFIG_GCC_NO_STRINGOP_OVERFLOW":          "y",
-		"CONFIG_GCC_PLUGINS":                       "n",
-		"CONFIG_HAVE_KCSAN_COMPILER":               "y",
-		"CONFIG_LD_CAN_USE_KEEP_IN_OVERLAY":        "y",
-		"CONFIG_STACKPROTECTOR":                    "y",
-		"CONFIG_STACKPROTECTOR_STRONG":             "y",
-		"CONFIG_TOOLS_SUPPORT_RELR":                "y",
-		"CONFIG_X86":                               "y",
-		"CONFIG_X86_64":                            "y",
+	if values["CONFIG_X86_64"] != "y" || values["CONFIG_64BIT"] != "y" {
+		fatalf("resolved config is not the requested x86_64 configuration")
 	}
-	if *compilerFamily == "clang" {
-		addExpected(valuesForClang(), want)
+
+	compiler := exactlyOne(values, "CONFIG_CC_IS_CLANG", "CONFIG_CC_IS_GCC")
+	assembler := exactlyOne(values, "CONFIG_AS_IS_LLVM", "CONFIG_AS_IS_GNU")
+	linker := exactlyOne(values, "CONFIG_LD_IS_LLD", "CONFIG_LD_IS_BFD")
+	versionText := values["CONFIG_CC_VERSION_TEXT"]
+	if versionText == "" {
+		fatalf("CONFIG_CC_VERSION_TEXT was not measured")
+	}
+
+	if compiler == "CONFIG_CC_IS_CLANG" {
+		requirePositive(values, "CONFIG_CLANG_VERSION")
+		requireZero(values, "CONFIG_GCC_VERSION")
 	} else {
-		addExpected(valuesForGCC(), want)
+		requirePositive(values, "CONFIG_GCC_VERSION")
+		requireZero(values, "CONFIG_CLANG_VERSION")
+	}
+	if assembler == "CONFIG_AS_IS_LLVM" {
+		requirePositive(values, "CONFIG_AS_VERSION")
+	} else {
+		requirePositive(values, "CONFIG_AS_VERSION")
+	}
+	if linker == "CONFIG_LD_IS_LLD" {
+		requirePositive(values, "CONFIG_LLD_VERSION")
+		requireZero(values, "CONFIG_LD_VERSION")
+	} else {
+		requirePositive(values, "CONFIG_LD_VERSION")
+		requireZero(values, "CONFIG_LLD_VERSION")
 	}
 
-	var mismatches []string
-	for key, expected := range want {
-		actual := values[key]
-		// The resolver omits disabled hidden symbols from .config. Kconfig's
-		// effective value for those absent bools is still n.
-		if actual == "" && expected == "n" {
-			actual = "n"
+	stamp := fmt.Sprintf("compiler=%s\nassembler=%s\nlinker=%s\nversion=%s\n", compiler, assembler, linker, versionText)
+	if err := os.WriteFile(*outPath, []byte(stamp), 0o644); err != nil {
+		fatalf("write validation stamp: %v", err)
+	}
+}
+
+func exactlyOne(values map[string]string, names ...string) string {
+	selected := ""
+	for _, name := range names {
+		if values[name] == "y" {
+			if selected != "" {
+				fatalf("both %s and %s were selected", selected, name)
+			}
+			selected = name
 		}
-		if actual != expected {
-			mismatches = append(mismatches, fmt.Sprintf("%s=%q, want %q", key, actual, expected))
-		}
 	}
-	if len(mismatches) != 0 {
-		sort.Strings(mismatches)
-		fmt.Fprintln(os.Stderr, strings.Join(mismatches, "\n"))
-		os.Exit(1)
+	if selected == "" {
+		fatalf("none of %s was selected", strings.Join(names, ", "))
 	}
-	if err := os.WriteFile(*outPath, []byte(fmt.Sprintf("upstream Linux 6.18.39 Kconfig resolved with %s\n", want["CONFIG_CC_VERSION_TEXT"])), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "write validation stamp: %v\n", err)
-		os.Exit(1)
+	return selected
+}
+
+func requirePositive(values map[string]string, name string) {
+	value, err := strconv.ParseUint(values[name], 10, 64)
+	if err != nil || value == 0 {
+		fatalf("%s=%q, want a positive measured version", name, values[name])
 	}
 }
 
-func addExpected(from, to map[string]string) {
-	for key, value := range from {
-		to[key] = value
+func requireZero(values map[string]string, name string) {
+	if values[name] != "0" {
+		fatalf("%s=%q, want 0 for the unselected tool family", name, values[name])
 	}
 }
 
-func valuesForClang() map[string]string {
-	return map[string]string{
-		"CONFIG_AS_IS_GNU":  "n",
-		"CONFIG_AS_IS_LLVM": "y",
-		"CONFIG_AS_VERSION": "220108",
-		// The hermetic LLVM toolchain does not expose a hosted libc link closure
-		// to this freestanding Linux probe action, so this capability resolves n.
-		"CONFIG_CC_CAN_LINK":                        "n",
-		"CONFIG_CC_HAS_KCFI_ARITY":                  "y",
-		"CONFIG_CC_HAS_MIN_FUNCTION_ALIGNMENT":      "n",
-		"CONFIG_CC_HAS_NAMED_AS":                    "n",
-		"CONFIG_CC_HAS_RANDSTRUCT":                  "y",
-		"CONFIG_CC_HAS_SANCOV_STACK_DEPTH_CALLBACK": "y",
-		"CONFIG_CC_IMPLICIT_FALLTHROUGH":            "-Wimplicit-fallthrough",
-		"CONFIG_CC_IS_CLANG":                        "y",
-		"CONFIG_CC_IS_GCC":                          "n",
-		"CONFIG_CC_NO_ARRAY_BOUNDS":                 "n",
-		"CONFIG_CC_NO_STRINGOP_OVERFLOW":            "n",
-		"CONFIG_CC_VERSION_TEXT":                    "clang version 22.1.8None",
-		"CONFIG_CLANG_VERSION":                      "220108",
-		"CONFIG_GCC_VERSION":                        "0",
-		"CONFIG_HAVE_KMSAN_COMPILER":                "y",
-		"CONFIG_LD_IS_BFD":                          "n",
-		"CONFIG_LD_IS_LLD":                          "y",
-		"CONFIG_LD_VERSION":                         "0",
-		"CONFIG_LLD_VERSION":                        "220108",
-	}
-}
-
-func valuesForGCC() map[string]string {
-	return map[string]string{
-		"CONFIG_AS_IS_GNU":  "y",
-		"CONFIG_AS_IS_LLVM": "n",
-		"CONFIG_AS_VERSION": "24600",
-		// gcc_toolchain's libc linker scripts contain absolute symlinks and
-		// are not a relocatable action input closure. The fixture deliberately
-		// fails this capability closed on every executor.
-		"CONFIG_CC_CAN_LINK":                        "n",
-		"CONFIG_CC_HAS_KCFI_ARITY":                  "n",
-		"CONFIG_CC_HAS_MIN_FUNCTION_ALIGNMENT":      "y",
-		"CONFIG_CC_HAS_NAMED_AS":                    "y",
-		"CONFIG_CC_HAS_RANDSTRUCT":                  "n",
-		"CONFIG_CC_HAS_SANCOV_STACK_DEPTH_CALLBACK": "n",
-		"CONFIG_CC_IMPLICIT_FALLTHROUGH":            "-Wimplicit-fallthrough=5",
-		"CONFIG_CC_IS_CLANG":                        "n",
-		"CONFIG_CC_IS_GCC":                          "y",
-		"CONFIG_CC_NO_ARRAY_BOUNDS":                 "y",
-		"CONFIG_CC_NO_STRINGOP_OVERFLOW":            "y",
-		"CONFIG_CC_VERSION_TEXT":                    "x86_64-linux-gcc (GCC) 15.2.0",
-		"CONFIG_CLANG_VERSION":                      "0",
-		"CONFIG_GCC_VERSION":                        "150200",
-		"CONFIG_HAVE_KMSAN_COMPILER":                "n",
-		"CONFIG_LD_IS_BFD":                          "y",
-		"CONFIG_LD_IS_LLD":                          "n",
-		"CONFIG_LD_VERSION":                         "24600",
-		"CONFIG_LLD_VERSION":                        "0",
-	}
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
 }
 
 func readConfig(path string) (map[string]string, error) {

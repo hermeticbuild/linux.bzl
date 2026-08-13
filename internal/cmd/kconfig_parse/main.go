@@ -291,9 +291,9 @@ func run() (exitCode int) {
 		probeNM                  = flag.String("probe_nm", "", "Path to the selected integrity-pinned nm used for real action-time probes")
 		probeObjcopy             = flag.String("probe_objcopy", "", "Path to the selected integrity-pinned objcopy used for real action-time probes")
 		probeCCArgs              stringSliceFlag
-		probeLinkArgs            stringSliceFlag
-		probeAllowCCCanLink      = flag.Bool("probe_allow_cc_can_link", true, "Allow measured CC_CAN_LINK execution")
-		probeAllowGCCPlugins     = flag.Bool("probe_allow_gcc_plugins", true, "Allow measured GCC plugin-directory probing")
+		probeCCSuffixArgs        stringSliceFlag
+		probeLDArgs              stringSliceFlag
+		probeLDSuffixArgs        stringSliceFlag
 		linuxProbeRustcVersion   = flag.Int("linux_probe_rustc_version", kconfig.LinuxProbeDefaultRustcVersion, "Linux-encoded Rust compiler version for repository-time Kconfig resolution")
 		linuxProbeRustcLLVM      = flag.Int("linux_probe_rustc_llvm_version", kconfig.LinuxProbeDefaultRustcLLVMVersion, "Linux-encoded Rust LLVM version for repository-time Kconfig resolution")
 		rustToolchainProbe       = flag.String("rust_toolchain_probe", "", "JSON identity produced from the selected rustc -vV output")
@@ -351,14 +351,16 @@ func run() (exitCode int) {
 	flag.Var(&compactExports, "compact_buildfile_export", "Source filename exported by the generated compact BUILD file. May be repeated")
 	flag.Var(&sourceRootMaps, "source_root_map", "Virtual source prefix to filesystem root in PREFIX=PATH form. May be repeated")
 	flag.Var(&probeCCArgs, "probe_cc_arg", "Configured compiler prefix argument used for measured probes. May be repeated")
-	flag.Var(&probeLinkArgs, "probe_link_arg", "Configured linker-driver argument used by measured compiler link probes. May be repeated")
+	flag.Var(&probeCCSuffixArgs, "probe_cc_suffix_arg", "Configured compiler suffix argument used for measured probes. May be repeated")
+	flag.Var(&probeLDArgs, "probe_ld_arg", "Configured linker prefix argument used for measured probes. May be repeated")
+	flag.Var(&probeLDSuffixArgs, "probe_ld_suffix_arg", "Configured linker suffix argument used for measured probes. May be repeated")
 	flag.Var(&kconfigExtras, "kconfig_extra", "Extra Kconfig source in PREFIX=PATH form. May be repeated")
 	flag.Var(&generatedHeadersByConfig, "generated_headers_for_config", "Generated headers binding in NAME=LABEL form. May be repeated once per compact config")
 	flag.Parse()
 
 	var selectedProfile *kconfig.LinuxTargetProfile
 	var toolProbe *kconfig.LinuxToolProbe
-	adaptiveValues := []string{*targetProfile, *linuxArch, *targetTriple, *probeCC, *probeLD}
+	adaptiveValues := []string{*targetProfile, *linuxArch, *targetTriple, *probeCC, *probeLD, *probeAR, *probeNM, *probeObjcopy}
 	adaptiveCount := 0
 	for _, value := range adaptiveValues {
 		if value != "" {
@@ -366,32 +368,14 @@ func run() (exitCode int) {
 		}
 	}
 	if adaptiveCount != 0 && adaptiveCount != len(adaptiveValues) {
-		fmt.Fprintln(os.Stderr, "-target_profile, -linux_arch, -target_triple, -probe_cc, and -probe_ld must be supplied together")
+		fmt.Fprintln(os.Stderr, "-target_profile, -linux_arch, -target_triple, -probe_cc, -probe_ld, -probe_ar, -probe_nm, and -probe_objcopy must be supplied together")
 		return 2
 	}
-	if adaptiveCount == 0 && (*probeAR != "" || *probeNM != "" || *probeObjcopy != "" || len(probeCCArgs) != 0 || len(probeLinkArgs) != 0) {
-		fmt.Fprintln(os.Stderr, "-probe_ar, -probe_nm, -probe_objcopy, -probe_cc_arg, and -probe_link_arg require the measured probe arguments")
-		return 2
-	}
-	if adaptiveCount == 0 && (!*probeAllowCCCanLink || !*probeAllowGCCPlugins) {
-		fmt.Fprintln(os.Stderr, "-probe_allow_cc_can_link and -probe_allow_gcc_plugins require the measured probe arguments")
+	if adaptiveCount == 0 && (len(probeCCArgs) != 0 || len(probeCCSuffixArgs) != 0 || len(probeLDArgs) != 0 || len(probeLDSuffixArgs) != 0) {
+		fmt.Fprintln(os.Stderr, "probe tool arguments require the measured probe tools")
 		return 2
 	}
 	if adaptiveCount != 0 {
-		// The released repository rule predates the auxiliary-tool flags and
-		// selects tools from hermeticbuild/llvm's bin directory. Preserve that
-		// invocation contract while action-time callers pass every selected
-		// tool explicitly as a declared Bazel input.
-		probeDir := filepath.Dir(*probeCC)
-		if *probeAR == "" {
-			*probeAR = filepath.Join(probeDir, "llvm-ar")
-		}
-		if *probeNM == "" {
-			*probeNM = filepath.Join(probeDir, "llvm-nm")
-		}
-		if *probeObjcopy == "" {
-			*probeObjcopy = filepath.Join(probeDir, "llvm-objcopy")
-		}
 		profile, err := kconfig.LinuxTargetProfileByName(*targetProfile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "invalid Linux target profile: %v\n", err)
@@ -412,8 +396,8 @@ func run() (exitCode int) {
 			Profile: profile.Name, Architecture: profile.Arch, TargetTriple: profile.TargetTriple,
 			CompilerPath: workspacePath(*probeCC), LinkerPath: workspacePath(*probeLD),
 			ArchiverPath: workspacePath(*probeAR), NMPath: workspacePath(*probeNM), ObjcopyPath: workspacePath(*probeObjcopy),
-			CompilerArgs: probeCCArgs, LinkerDriverArgs: probeLinkArgs,
-			DisableCCCanLink: !*probeAllowCCCanLink, DisableGCCPlugins: !*probeAllowGCCPlugins,
+			CompilerArgs: probeCCArgs, CompilerSuffixArgs: probeCCSuffixArgs,
+			LinkerArgs: probeLDArgs, LinkerSuffixArgs: probeLDSuffixArgs,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to configure measured Linux tools: %v\n", err)

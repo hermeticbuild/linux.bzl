@@ -1,10 +1,39 @@
 diff --git a/toolchain/cc_toolchain_config.bzl b/toolchain/cc_toolchain_config.bzl
 --- a/toolchain/cc_toolchain_config.bzl
 +++ b/toolchain/cc_toolchain_config.bzl
-@@ -106,6 +106,13 @@ def _impl(ctx):
+@@ -106,6 +106,42 @@ def _impl(ctx):
  
      action_configs = []
  
++    kbuild_tools = {
++        "linux-kbuild-ar": "ar",
++        "linux-kbuild-as": "as",
++        "linux-kbuild-cc": "gcc",
++        "linux-kbuild-cpp": "cpp",
++        "linux-kbuild-cxx": "g++",
++        "linux-kbuild-ld": "ld",
++        "linux-kbuild-nm": "nm",
++        "linux-kbuild-objcopy": "objcopy",
++        "linux-kbuild-objdump": "objdump",
++        "linux-kbuild-ranlib": "ranlib",
++        "linux-kbuild-readelf": "readelf",
++        "linux-kbuild-strip": "strip",
++    }
++    for kbuild_action, kbuild_tool in kbuild_tools.items():
++        action_configs.append(action_config(
++            action_name = kbuild_action,
++            enabled = True,
++            tools = [tool(path = tool_paths.get(kbuild_tool))],
++        ))
++    kbuild_args_feature = feature(
++        name = "linux_kbuild_args",
++        enabled = True,
++        flag_sets = [flag_set(
++            actions = kbuild_tools.keys(),
++            flag_groups = [flag_group(flags = ["__LINUX_BZL_KBUILD_ARGS_V1__"])],
++        )],
++    )
++
 +    for link_action in base_link_actions:
 +        action_configs.append(action_config(
 +            action_name = link_action,
@@ -15,6 +44,14 @@ diff --git a/toolchain/cc_toolchain_config.bzl b/toolchain/cc_toolchain_config.b
      action_configs.append(action_config(
          action_name = "objcopy_embed_data",
          enabled = True,
+@@ -552,6 +582,7 @@ def _impl(ctx):
+ 
+     features = fortran_extend(
+         [
++            kbuild_args_feature,
+             default_compile_flags_feature,
+             include_paths_feature,
+             library_search_directories_feature,
 diff --git a/toolchain/wrapper.sh.tpl b/toolchain/wrapper.sh.tpl
 --- a/toolchain/wrapper.sh.tpl
 +++ b/toolchain/wrapper.sh.tpl
@@ -35,13 +72,17 @@ diff --git a/toolchain/wrapper.sh.tpl b/toolchain/wrapper.sh.tpl
 diff --git a/toolchain/defs.bzl b/toolchain/defs.bzl
 --- a/toolchain/defs.bzl
 +++ b/toolchain/defs.bzl
-@@ -965,6 +965,8 @@
+@@ -965,6 +965,12 @@
          ":coverage_files",
          ":dwp_files",
          ":linker_files",
 +        ":nm_files",
 +        ":objdump_files",
          ":objcopy_files",
++        ":ranlib",
++        ":readelf",
++        "xbin/ranlib",
++        "xbin/readelf",
          ":strip_files",
      ],
 @@ -998,7 +1000,10 @@
@@ -55,7 +96,26 @@ diff --git a/toolchain/defs.bzl b/toolchain/defs.bzl
 +    ], allow_empty = True),
      visibility = ["//visibility:public"],
  )
- 
+
+diff --git a/toolchain/defs.bzl b/toolchain/defs.bzl
+--- a/toolchain/defs.bzl
++++ b/toolchain/defs.bzl
+@@ -684,7 +684,15 @@ def _render_tool_paths(rctx, path_prefix, binary_prefix):
+         "objdump": "{path_prefix}/bin/{binary_prefix}objdump".format(
+             path_prefix = path_prefix,
+             binary_prefix = binary_prefix,
+         ),
++        "ranlib": "{path_prefix}/bin/{binary_prefix}ranlib".format(
++            path_prefix = path_prefix,
++            binary_prefix = binary_prefix,
++        ),
++        "readelf": "{path_prefix}/bin/{binary_prefix}readelf".format(
++            path_prefix = path_prefix,
++            binary_prefix = binary_prefix,
++        ),
+         "strip": "{path_prefix}/bin/{binary_prefix}strip".format(
+             path_prefix = path_prefix,
+             binary_prefix = binary_prefix,
 @@ -1050,6 +1055,7 @@
          "bin/{binary_prefix}cpp",
          "bin/{binary_prefix}g++",

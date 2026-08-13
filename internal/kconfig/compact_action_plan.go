@@ -130,7 +130,8 @@ func (m *CompactMetadata) compactActionPlanEntries() ([]compactActionPlanEntry, 
 
 	selected := make([]CompactObjectVariant, 0, len(selectedTargets))
 	seenTargets := make(map[string]bool, len(selectedTargets))
-	for _, target := range selectedTargets {
+	for cursor := 0; cursor < len(selectedTargets); cursor++ {
+		target := selectedTargets[cursor]
 		if seenTargets[target] {
 			continue
 		}
@@ -143,6 +144,8 @@ func (m *CompactMetadata) compactActionPlanEntries() ([]compactActionPlanEntry, 
 			return nil, err
 		}
 		selected = append(selected, variant)
+		selectedTargets = append(selectedTargets, variant.Members...)
+		selectedTargets = append(selectedTargets, variant.Deps...)
 	}
 	sort.Slice(selected, func(i, j int) bool {
 		if selected[i].Object != selected[j].Object {
@@ -154,6 +157,9 @@ func (m *CompactMetadata) compactActionPlanEntries() ([]compactActionPlanEntry, 
 	usedSourceIndices := map[int]bool{}
 	primarySourceIndices := make(map[string]int, len(selected))
 	for _, variant := range selected {
+		if len(variant.Members) != 0 {
+			continue
+		}
 		if variant.SourceInputGroup <= 0 || variant.SourceInputGroup > len(m.SourceInputGroups) {
 			return nil, fmt.Errorf(
 				"object %q references source input group %d, out of range 1..%d",
@@ -194,7 +200,9 @@ func (m *CompactMetadata) compactActionPlanEntries() ([]compactActionPlanEntry, 
 	}
 
 	entries := []compactActionPlanEntry{{
-		path: path.Join("v1", "probe", m.Target.ProbeIdentity),
+		path: path.Join("schema", "linux-kernel-plan-v2"),
+	}, {
+		path: path.Join("toolsets", "target", m.Target.ProbeIdentity),
 	}}
 	indices := make([]int, 0, len(usedSourceIndices))
 	for index := range usedSourceIndices {
@@ -206,8 +214,13 @@ func (m *CompactMetadata) compactActionPlanEntries() ([]compactActionPlanEntry, 
 			return nil, fmt.Errorf("compact action plan source index %d exceeds eight digits", index)
 		}
 		entries = append(entries, compactActionPlanEntry{
-			path: path.Join("v1", "source", fmt.Sprintf("%08d", index), m.SourceFiles[index-1].Path),
+			path: path.Join("sources", fmt.Sprintf("src-%08d", index), "kernel", m.SourceFiles[index-1].Path),
 		})
+	}
+	seenRecipes := map[string][]byte{}
+	selectedByTarget := make(map[string]CompactObjectVariant, len(selected))
+	for _, variant := range selected {
+		selectedByTarget[variant.Target] = variant
 	}
 	for _, variant := range selected {
 		data, err := json.MarshalIndent(variant, "", "  ")
@@ -215,16 +228,42 @@ func (m *CompactMetadata) compactActionPlanEntries() ([]compactActionPlanEntry, 
 			return nil, fmt.Errorf("encode compact action plan recipe for %q: %w", variant.Object, err)
 		}
 		data = append(data, '\n')
-		entries = append(entries, compactActionPlanEntry{
-			path: path.Join(
-				"v1",
-				"compile",
-				variant.ContentID,
-				fmt.Sprintf("%08d", primarySourceIndices[variant.Target]),
-				variant.Object+".json",
-			),
-			data: data,
-		})
+		if previous, ok := seenRecipes[variant.ContentID]; ok && string(previous) != string(data) {
+			return nil, fmt.Errorf("content ID %q identifies different compile recipes", variant.ContentID)
+		}
+		if _, ok := seenRecipes[variant.ContentID]; !ok {
+			seenRecipes[variant.ContentID] = data
+			entries = append(entries, compactActionPlanEntry{
+				path: path.Join("recipes", variant.ContentID+".json"),
+				data: data,
+			})
+		}
+		nodeRoot := path.Join("nodes", "target", variant.ContentID)
+		kind := "compile"
+		if len(variant.Members) != 0 {
+			kind = "composite"
+		}
+		entries = append(entries,
+			compactActionPlanEntry{path: path.Join(nodeRoot, "kind", kind)},
+			compactActionPlanEntry{path: path.Join(nodeRoot, "recipe", variant.ContentID)},
+			compactActionPlanEntry{path: path.Join(nodeRoot, "tool", "target")},
+			compactActionPlanEntry{path: path.Join(nodeRoot, "out", "objects", "00000000", variant.Object)},
+		)
+		if kind == "compile" {
+			entries = append(entries, compactActionPlanEntry{
+				path: path.Join(nodeRoot, "in", "source", "src", "00000000", fmt.Sprintf("src-%08d", primarySourceIndices[variant.Target])),
+			})
+		} else {
+			for index, memberTarget := range variant.Members {
+				member, ok := selectedByTarget[memberTarget]
+				if !ok {
+					return nil, fmt.Errorf("composite object %q references unselected member %q", variant.Object, memberTarget)
+				}
+				entries = append(entries, compactActionPlanEntry{
+					path: path.Join(nodeRoot, "in", "node", "member", fmt.Sprintf("%08d", index), member.ContentID, "00000000"),
+				})
+			}
+		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
 	return entries, nil
@@ -237,38 +276,42 @@ func validateCompactActionPlanVariant(variant CompactObjectVariant) error {
 	if err := validateCompactActionPlanRelativePath("object", variant.Object); err != nil {
 		return err
 	}
-	if len(variant.Members) != 0 {
-		return fmt.Errorf("object %q has an unsupported composite recipe", variant.Object)
-	}
 	if len(variant.Deps) != 0 {
 		return fmt.Errorf("object %q has unsupported generated-object dependencies", variant.Object)
 	}
 	if len(variant.RemoveFlags) != 0 {
 		return fmt.Errorf("object %q has unsupported Kbuild remove flags", variant.Object)
 	}
-	if compactGroupedSpecialObjects[variant.Object] ||
+	if len(variant.Members) == 0 && (compactGroupedSpecialObjects[variant.Object] ||
 		strings.HasSuffix(variant.Object, ".asn1.o") ||
 		strings.HasSuffix(variant.Object, ".pi.o") ||
-		strings.HasSuffix(variant.Object, ".stub.o") {
+		strings.HasSuffix(variant.Object, ".stub.o")) {
 		return fmt.Errorf("object %q has an unsupported generated recipe", variant.Object)
 	}
 	if !strings.HasSuffix(variant.Object, ".o") {
 		return fmt.Errorf("object %q is not a leaf object", variant.Object)
 	}
-	if variant.Mode != "y" || variant.ModuleRoot {
-		return fmt.Errorf("object %q has unsupported non-built-in mode %q", variant.Object, variant.Mode)
+	if variant.Mode != "y" && variant.Mode != "m" {
+		return fmt.Errorf("object %q has unsupported mode %q", variant.Object, variant.Mode)
 	}
-	if err := validateCompactActionPlanRelativePath("source", variant.Source); err != nil {
-		return err
+	if variant.ModuleRoot && variant.Mode != "m" {
+		return fmt.Errorf("object %q is a module root in non-module mode %q", variant.Object, variant.Mode)
 	}
-	if compactSourceLanguage(variant.Source) != "c" {
-		return fmt.Errorf("object %q has unsupported non-C source %q", variant.Object, variant.Source)
+	if len(variant.Members) == 0 {
+		if err := validateCompactActionPlanRelativePath("source", variant.Source); err != nil {
+			return err
+		}
+		if compactSourceLanguage(variant.Source) != "c" {
+			return fmt.Errorf("object %q has unsupported non-C source %q", variant.Object, variant.Source)
+		}
 	}
 	if variant.Symversions || variant.ObjtoolForce || len(variant.ObjtoolArgs) != 0 {
 		return fmt.Errorf("object %q has unsupported generated or post-compile processing", variant.Object)
 	}
-	if reason := variant.sourceBuildError(); reason != "" {
-		return fmt.Errorf("object %q cannot be compiled from source: %s", variant.Object, reason)
+	if len(variant.Members) == 0 {
+		if reason := variant.sourceBuildError(); reason != "" {
+			return fmt.Errorf("object %q cannot be compiled from source: %s", variant.Object, reason)
+		}
 	}
 	return nil
 }

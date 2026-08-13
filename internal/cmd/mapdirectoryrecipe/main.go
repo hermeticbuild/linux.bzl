@@ -19,8 +19,10 @@ import (
 
 type recipeOptions struct {
 	recipe         string
-	compiler       string
+	kind           string
+	tool           string
 	source         string
+	inputs         []string
 	output         string
 	expectedSource string
 	expectedObject string
@@ -29,9 +31,7 @@ type recipeOptions struct {
 }
 
 const (
-	compileOutputSentinel = "__linux_bzl_map_output__.o"
-	compileRecipeSentinel = "-D__LINUX_BZL_MAP_RECIPE_FLAGS__"
-	compileSourceSentinel = "__linux_bzl_map_source__.c"
+	kbuildArgsSentinel = "__LINUX_BZL_KBUILD_ARGS_V1__"
 )
 
 type repeatedFlag []string
@@ -56,8 +56,8 @@ func parseRecipe(path string) (kconfig.CompactObjectVariant, error) {
 
 func runRecipe(opts recipeOptions) error {
 	for name, value := range map[string]string{
-		"recipe": opts.recipe, "compiler": opts.compiler, "source": opts.source,
-		"output": opts.output, "expected source": opts.expectedSource,
+		"recipe": opts.recipe, "kind": opts.kind, "tool": opts.tool,
+		"output":          opts.output,
 		"expected object": opts.expectedObject, "expected content ID": opts.expectedID,
 	} {
 		if value == "" {
@@ -68,49 +68,55 @@ func runRecipe(opts recipeOptions) error {
 	if err != nil {
 		return err
 	}
-	if recipe.Source != opts.expectedSource {
-		return fmt.Errorf("recipe source = %q, want %q", recipe.Source, opts.expectedSource)
-	}
 	if recipe.Object != opts.expectedObject {
 		return fmt.Errorf("recipe object = %q, want %q", recipe.Object, opts.expectedObject)
 	}
 	if recipe.ContentID != opts.expectedID {
 		return fmt.Errorf("recipe content ID = %q, want %q", recipe.ContentID, opts.expectedID)
 	}
-	if recipe.Mode != "y" || recipe.ModuleRoot || len(recipe.Members) != 0 || len(recipe.Deps) != 0 || len(recipe.RemoveFlags) != 0 {
-		return errors.New("recipe is not a supported built-in leaf compile")
+	if (recipe.Mode != "y" && recipe.Mode != "m") ||
+		(recipe.ModuleRoot && recipe.Mode != "m") ||
+		len(recipe.Deps) != 0 || len(recipe.RemoveFlags) != 0 || filepath.Ext(recipe.Object) != ".o" {
+		return errors.New("recipe is not a supported object action")
 	}
-	if filepath.Ext(recipe.Source) != ".c" || filepath.Ext(recipe.Object) != ".o" {
-		return fmt.Errorf("recipe is not a C-to-object compile: %q -> %q", recipe.Source, recipe.Object)
+	if opts.kind == "compile" {
+		if recipe.Source != opts.expectedSource {
+			return fmt.Errorf("recipe source = %q, want %q", recipe.Source, opts.expectedSource)
+		}
+		if len(recipe.Members) != 0 || len(opts.inputs) != 0 || opts.source == "" || filepath.Ext(recipe.Source) != ".c" {
+			return fmt.Errorf("recipe is not a C-to-object compile: %q -> %q", recipe.Source, recipe.Object)
+		}
+	} else if opts.kind == "composite" {
+		if len(recipe.Members) == 0 || len(opts.inputs) != len(recipe.Members) || opts.source != "" || opts.expectedSource != "" {
+			return fmt.Errorf("recipe is not a composite with %d declared members", len(opts.inputs))
+		}
+	} else {
+		return fmt.Errorf("unsupported action kind %q", opts.kind)
 	}
 
 	var args []string
-	foundSource := false
-	foundOutput := false
-	foundRecipe := false
+	foundSentinel := false
 	for _, argument := range opts.actionArgs {
-		if argument == compileRecipeSentinel {
-			if foundRecipe {
-				return errors.New("compile action repeats its recipe-flags marker")
+		if argument == kbuildArgsSentinel {
+			if foundSentinel {
+				return errors.New("compile action repeats its Kbuild-arguments marker")
 			}
-			foundRecipe = true
-			args = append(args, recipe.Flags...)
+			foundSentinel = true
+			if opts.kind == "compile" {
+				args = append(args, recipe.Flags...)
+				args = append(args, "-c", opts.source, "-o", opts.output)
+			} else {
+				args = append(args, "-r", "-o", opts.output)
+				args = append(args, opts.inputs...)
+			}
 			continue
-		}
-		if strings.Contains(argument, compileSourceSentinel) {
-			foundSource = true
-			argument = strings.ReplaceAll(argument, compileSourceSentinel, opts.source)
-		}
-		if strings.Contains(argument, compileOutputSentinel) {
-			foundOutput = true
-			argument = strings.ReplaceAll(argument, compileOutputSentinel, opts.output)
 		}
 		args = append(args, argument)
 	}
-	if !foundSource || !foundOutput || !foundRecipe {
-		return fmt.Errorf("compile action markers: source=%t output=%t recipe=%t; want all true", foundSource, foundOutput, foundRecipe)
+	if !foundSentinel {
+		return errors.New("compile action is missing its Kbuild-arguments marker")
 	}
-	command := exec.Command(opts.compiler, args...)
+	command := exec.Command(opts.tool, args...)
 	command.Env = os.Environ()
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
@@ -122,17 +128,21 @@ func runRecipe(opts recipeOptions) error {
 
 func main() {
 	var actionArgs repeatedFlag
+	var inputs repeatedFlag
 	opts := recipeOptions{}
+	flag.StringVar(&opts.kind, "kind", "", "action kind")
 	flag.StringVar(&opts.recipe, "recipe", "", "compact action-plan recipe JSON")
-	flag.StringVar(&opts.compiler, "compiler", "", "selected C compiler")
+	flag.StringVar(&opts.tool, "tool", "", "selected Kbuild tool")
 	flag.StringVar(&opts.source, "source", "", "declared primary source input")
 	flag.StringVar(&opts.output, "output", "", "declared object output")
 	flag.StringVar(&opts.expectedSource, "expected_source", "", "canonical source path encoded by the plan")
 	flag.StringVar(&opts.expectedObject, "expected_object", "", "object path encoded by the plan")
 	flag.StringVar(&opts.expectedID, "expected_content_id", "", "content ID encoded by the plan")
 	flag.Var(&actionArgs, "action_arg", "selected CcToolchain compile action argument (repeatable)")
+	flag.Var(&inputs, "input", "declared node input (repeatable)")
 	flag.Parse()
 	opts.actionArgs = actionArgs
+	opts.inputs = inputs
 	if flag.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "mapdirectoryrecipe: positional arguments are not supported")
 		os.Exit(2)

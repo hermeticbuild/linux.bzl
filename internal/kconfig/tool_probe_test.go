@@ -256,16 +256,16 @@ func TestConfiguredToolIdentityIncludesCompilerPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := extendToolIdentity("sha256-base", profile, []string{"-DTOOLCHAIN=one"}, nil)
-	second := extendToolIdentity("sha256-base", profile, []string{"-DTOOLCHAIN=two"}, nil)
+	first := extendToolIdentity("sha256-base", profile, []string{"-DTOOLCHAIN=one"}, nil, nil, nil)
+	second := extendToolIdentity("sha256-base", profile, []string{"-DTOOLCHAIN=two"}, nil, nil, nil)
 	if first == second {
 		t.Fatalf("configured tool identities are equal: %q", first)
 	}
-	linked := extendToolIdentity("sha256-base", profile, []string{"-DTOOLCHAIN=one"}, []string{"-fuse-ld=lld"})
+	linked := extendToolIdentity("sha256-base", profile, []string{"-DTOOLCHAIN=one"}, nil, []string{"-fuse-ld=lld"}, nil)
 	if first == linked {
 		t.Fatalf("linker-driver prefix did not change tool identity: %q", first)
 	}
-	policyDisabled := extendToolIdentity("sha256-base", profile, []string{"-DTOOLCHAIN=one"}, nil, false, false)
+	policyDisabled := extendToolIdentity("sha256-base", profile, []string{"-DTOOLCHAIN=one"}, nil, nil, nil, false, false)
 	if first == policyDisabled {
 		t.Fatalf("measured probe policy did not change tool identity: %q", first)
 	}

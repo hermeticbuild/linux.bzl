@@ -1,0 +1,4 @@
+exports_files(
+    ["llvm_kbuild_actions.patch"],
+    visibility = ["//visibility:public"],
+)

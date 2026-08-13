@@ -7,14 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
-
-var probeMarkerPattern = regexp.MustCompile(`^v1/probe/sha256-[0-9a-f]{64}$`)
 
 func treeFiles(root string) ([]string, error) {
 	var files []string
@@ -40,15 +37,18 @@ func treeFiles(root string) ([]string, error) {
 }
 
 type compileRecipe struct {
-	ContentID string   `json:"content_id"`
-	Object    string   `json:"object"`
-	Source    string   `json:"source"`
-	Flags     []string `json:"flags"`
+	ContentID  string   `json:"content_id"`
+	Object     string   `json:"object"`
+	Source     string   `json:"source"`
+	Mode       string   `json:"mode"`
+	ModuleRoot bool     `json:"module_root"`
+	Flags      []string `json:"flags"`
+	Members    []string `json:"members"`
 }
 
 type planValidation struct {
 	identity string
-	family   string
+	objects  []string
 }
 
 func validatePlan(root string) (planValidation, error) {
@@ -56,50 +56,68 @@ func validatePlan(root string) (planValidation, error) {
 	if err != nil {
 		return planValidation{}, fmt.Errorf("walk action plan: %w", err)
 	}
-	var probes, sources, compiles []string
-	for _, path := range files {
+	identity := ""
+	schema := false
+	var sources []string
+	recipes := map[string]string{}
+	nodes := map[string]map[string]string{}
+	for _, marker := range files {
+		parts := strings.Split(marker, "/")
 		switch {
-		case strings.HasPrefix(path, "v1/probe/"):
-			probes = append(probes, path)
-		case strings.HasPrefix(path, "v1/source/"):
-			sources = append(sources, path)
-		case strings.HasPrefix(path, "v1/compile/"):
-			compiles = append(compiles, path)
+		case marker == "schema/linux-kernel-plan-v2":
+			schema = true
+		case len(parts) == 3 && parts[0] == "toolsets" && parts[1] == "target":
+			if identity != "" || !strings.HasPrefix(parts[2], "sha256-") || len(parts[2]) != len("sha256-")+64 {
+				return planValidation{}, fmt.Errorf("invalid or repeated target toolset marker %q", marker)
+			}
+			identity = parts[2]
+		case len(parts) >= 4 && parts[0] == "sources" && parts[2] == "kernel":
+			sources = append(sources, marker)
+		case len(parts) == 2 && parts[0] == "recipes" && strings.HasSuffix(parts[1], ".json"):
+			id := strings.TrimSuffix(parts[1], ".json")
+			if _, exists := recipes[id]; exists {
+				return planValidation{}, fmt.Errorf("repeated recipe %q", id)
+			}
+			recipes[id] = marker
+		case len(parts) >= 5 && parts[0] == "nodes" && parts[1] == "target":
+			id := parts[2]
+			if nodes[id] == nil {
+				nodes[id] = map[string]string{}
+			}
+			node := nodes[id]
+			var key, value string
+			switch {
+			case len(parts) == 5 && (parts[3] == "kind" || parts[3] == "recipe" || parts[3] == "tool"):
+				key, value = parts[3], parts[4]
+			case len(parts) == 8 && parts[3] == "in" && parts[4] == "source" && parts[5] == "src" && parts[6] == "00000000":
+				key, value = "source", parts[7]
+			case len(parts) == 9 && parts[3] == "in" && parts[4] == "node" && parts[5] == "member" && parts[8] == "00000000":
+				key, value = "member:"+parts[6], parts[7]
+			case len(parts) >= 7 && parts[3] == "out" && parts[4] == "objects" && parts[5] == "00000000":
+				key, value = "output", strings.Join(parts[6:], "/")
+			default:
+				return planValidation{}, fmt.Errorf("invalid target node marker %q", marker)
+			}
+			if _, exists := node[key]; exists {
+				return planValidation{}, fmt.Errorf("node %q repeats %s", id, key)
+			}
+			node[key] = value
 		default:
-			return planValidation{}, fmt.Errorf("unexpected action-plan marker %q", path)
+			return planValidation{}, fmt.Errorf("unexpected action-plan marker %q", marker)
 		}
 	}
-	if len(probes) != 1 || !probeMarkerPattern.MatchString(probes[0]) {
-		return planValidation{}, fmt.Errorf("measured compiler probe markers = %q, want one sha256 marker", probes)
-	}
-	family := ""
-	for _, path := range compiles {
-		switch {
-		case strings.HasSuffix(path, "/clang_selected.o.json"):
-			if family != "" {
-				return planValidation{}, fmt.Errorf("compile markers select more than one compiler family: %q", compiles)
-			}
-			family = "clang"
-		case strings.HasSuffix(path, "/gcc_selected.o.json"):
-			if family != "" {
-				return planValidation{}, fmt.Errorf("compile markers select more than one compiler family: %q", compiles)
-			}
-			family = "gcc"
-		}
-	}
-	if family == "" {
-		return planValidation{}, fmt.Errorf("compile markers select no compiler family: %q", compiles)
+	if !schema || identity == "" {
+		return planValidation{}, fmt.Errorf("action plan is missing its v2 schema or target toolset marker")
 	}
 	wantSources := []string{
-		family + "_selected.c",
 		"include/linux/compiler-version.h",
 		"include/linux/compiler_types.h",
 		"include/linux/kconfig.h",
 		"required_local_header.h",
 		"supported.c",
 	}
-	if len(sources) != len(wantSources) {
-		return planValidation{}, fmt.Errorf("selected source markers = %q, want %q", sources, wantSources)
+	if len(sources) != len(wantSources)+3 {
+		return planValidation{}, fmt.Errorf("selected source markers = %q, want common closure, one Kconfig-selected source, and two composite members", sources)
 	}
 	for _, want := range wantSources {
 		found := false
@@ -118,16 +136,21 @@ func validatePlan(root string) (planValidation, error) {
 			"-fno-omit-frame-pointer",
 			"-DMAP_DIRECTORY_RECIPE_REPLAYED=1",
 		},
-		family + "_selected.o": {
-			"-DMAP_DIRECTORY_" + strings.ToUpper(family) + "_RECIPE_REPLAYED=1",
-		},
 	}
-	if len(compiles) != len(wantObjects) {
-		return planValidation{}, fmt.Errorf("compile markers = %q, want objects %v", compiles, sortedKeys(wantObjects))
+	if len(nodes) != 5 {
+		return planValidation{}, fmt.Errorf("target nodes = %v, want four compiles and one module composite", sortedKeys(nodes))
 	}
 	seenObjects := map[string]bool{}
-	for _, compile := range compiles {
-		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(compile)))
+	selectedObject := ""
+	for id, node := range nodes {
+		if node["tool"] != "target" || node["recipe"] == "" || node["output"] == "" {
+			return planValidation{}, fmt.Errorf("target node %q is incomplete: %v", id, node)
+		}
+		recipePath, exists := recipes[node["recipe"]]
+		if !exists {
+			return planValidation{}, fmt.Errorf("target node %q references unknown recipe %q", id, node["recipe"])
+		}
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(recipePath)))
 		if err != nil {
 			return planValidation{}, fmt.Errorf("read compile recipe: %w", err)
 		}
@@ -135,15 +158,42 @@ func validatePlan(root string) (planValidation, error) {
 		if err := json.Unmarshal(data, &recipe); err != nil {
 			return planValidation{}, fmt.Errorf("decode compile recipe: %w", err)
 		}
-		parts := strings.Split(compile, "/")
-		wantFlags, wanted := wantObjects[recipe.Object]
-		if len(parts) < 5 || recipe.ContentID != parts[2] || !strings.HasSuffix(compile, "/"+recipe.Object+".json") || recipe.Source != strings.TrimSuffix(recipe.Object, ".o")+".c" || !wanted {
-			return planValidation{}, fmt.Errorf("compile recipe does not match its marker path or selected family: path=%q recipe=%#v", compile, recipe)
+		wantFlags := wantObjects[recipe.Object]
+		if recipe.ContentID != id || node["recipe"] != id || node["output"] != recipe.Object {
+			return planValidation{}, fmt.Errorf("compile recipe does not match node %q: node=%v recipe=%#v", id, node, recipe)
+		}
+		if node["kind"] == "composite" {
+			if recipe.Object != "composite.o" || recipe.Mode != "m" || !recipe.ModuleRoot || len(recipe.Members) != 2 || node["member:00000000"] == "" || node["member:00000001"] == "" || node["source"] != "" {
+				return planValidation{}, fmt.Errorf("module composite recipe does not match node %q: node=%v recipe=%#v", id, node, recipe)
+			}
+			seenObjects[recipe.Object] = true
+			continue
+		}
+		if node["kind"] != "compile" || node["source"] == "" || len(recipe.Members) != 0 || recipe.Source != strings.TrimSuffix(recipe.Object, ".o")+".c" {
+			return planValidation{}, fmt.Errorf("compile recipe does not match node %q: node=%v recipe=%#v", id, node, recipe)
+		}
+		sourceFound := false
+		for _, source := range sources {
+			parts := strings.Split(source, "/")
+			if parts[1] == node["source"] && strings.HasSuffix(source, "/"+recipe.Source) {
+				sourceFound = true
+				break
+			}
+		}
+		if !sourceFound {
+			return planValidation{}, fmt.Errorf("node %q does not reference the recipe source %q", id, recipe.Source)
 		}
 		if seenObjects[recipe.Object] {
 			return planValidation{}, fmt.Errorf("compile plan repeats recipe for %q", recipe.Object)
 		}
 		seenObjects[recipe.Object] = true
+		if recipe.Object != "supported.o" && !strings.HasPrefix(recipe.Object, "composite_") {
+			if !strings.HasSuffix(recipe.Object, "_selected.o") {
+				return planValidation{}, fmt.Errorf("Kconfig-selected object %q does not use the fixture's selected-object contract", recipe.Object)
+			}
+			selectedObject = recipe.Object
+			wantFlags = []string{"-DMAP_DIRECTORY_" + strings.ToUpper(strings.TrimSuffix(recipe.Object, "_selected.o")) + "_RECIPE_REPLAYED=1"}
+		}
 		for _, want := range wantFlags {
 			found := false
 			for _, flag := range recipe.Flags {
@@ -157,14 +207,17 @@ func validatePlan(root string) (planValidation, error) {
 			}
 		}
 	}
+	if !seenObjects["supported.o"] || !seenObjects["composite.o"] || !seenObjects["composite_first.o"] || !seenObjects["composite_second.o"] || selectedObject == "" {
+		return planValidation{}, fmt.Errorf("compile plan did not contain its common and selected objects: %v", sortedKeys(seenObjects))
+	}
 	for _, path := range files {
-		if strings.Contains(path, "unsupported") || strings.Contains(path, map[string]string{"clang": "gcc_selected", "gcc": "clang_selected"}[family]) {
-			return planValidation{}, fmt.Errorf("unselected compiler branch appeared in action plan as %q", path)
+		if strings.Contains(path, "unsupported") {
+			return planValidation{}, fmt.Errorf("Kconfig-disabled branch appeared in action plan as %q", path)
 		}
 	}
 	return planValidation{
-		identity: strings.TrimPrefix(probes[0], "v1/probe/"),
-		family:   family,
+		identity: identity,
+		objects:  []string{"supported.o", selectedObject, "composite_first.o", "composite_second.o", "composite.o"},
 	}, nil
 }
 
@@ -185,14 +238,23 @@ func (f *repeatedFlag) Set(value string) error {
 	return nil
 }
 
-func validateObjects(root, family string) error {
+func validateObjects(root string, objects []string) error {
 	files, err := treeFiles(root)
 	if err != nil {
 		return fmt.Errorf("walk mapped objects: %w", err)
 	}
-	wantSymbols := map[string]string{
-		"supported.o":          "map_directory_selected",
-		family + "_selected.o": "map_directory_" + family + "_selected",
+	wantSymbols := map[string]string{}
+	for _, object := range objects {
+		stem := strings.TrimSuffix(object, ".o")
+		if object == "supported.o" {
+			wantSymbols[object] = "map_directory_selected"
+		} else if object == "composite.o" {
+			wantSymbols[object] = ""
+		} else if strings.HasPrefix(stem, "composite_") {
+			wantSymbols[object] = "map_directory_" + stem
+		} else {
+			wantSymbols[object] = "map_directory_" + strings.TrimSuffix(stem, "_selected") + "_selected"
+		}
 	}
 	if len(files) != len(wantSymbols) {
 		return fmt.Errorf("mapped objects = %q, want %v", files, sortedKeys(wantSymbols))
@@ -218,7 +280,7 @@ func validateObjects(root, family string) error {
 		if err != nil {
 			return fmt.Errorf("read mapped object %q symbols: %w", path, err)
 		}
-		found := false
+		found := wantSymbol == ""
 		for _, symbol := range symbols {
 			if symbol.Name == wantSymbol {
 				found = true
@@ -234,7 +296,9 @@ func validateObjects(root, family string) error {
 
 func run() error {
 	var compilerArgs repeatedFlag
-	var linkerDriverArgs repeatedFlag
+	var compilerSuffixArgs repeatedFlag
+	var linkerArgs repeatedFlag
+	var linkerSuffixArgs repeatedFlag
 	plan := flag.String("plan", "", "action-plan tree")
 	objects := flag.String("objects", "", "mapped object tree")
 	otherPlan := flag.String("other_plan", "", "second action-plan tree whose probe identity must differ")
@@ -248,7 +312,9 @@ func run() error {
 	linuxArch := flag.String("linux_arch", "", "selected Linux ARCH")
 	targetTriple := flag.String("target_triple", "", "selected compiler target triple")
 	flag.Var(&compilerArgs, "compiler_arg", "configured compiler prefix argument")
-	flag.Var(&linkerDriverArgs, "linker_driver_arg", "configured linker-driver prefix argument")
+	flag.Var(&compilerSuffixArgs, "compiler_suffix_arg", "configured compiler suffix argument")
+	flag.Var(&linkerArgs, "linker_arg", "configured linker prefix argument")
+	flag.Var(&linkerSuffixArgs, "linker_suffix_arg", "configured linker suffix argument")
 	flag.Parse()
 	if *otherPlan != "" {
 		if *plan == "" || *out == "" {
@@ -265,10 +331,10 @@ func run() error {
 		if first.identity == second.identity {
 			return fmt.Errorf("compiler-selected plans share probe identity %q", first.identity)
 		}
-		if first.family == second.family {
-			return fmt.Errorf("compiler-selected plans both selected %s recipes", first.family)
+		if strings.Join(first.objects, "\x00") == strings.Join(second.objects, "\x00") {
+			return fmt.Errorf("different compiler probes selected the same object recipes %q", first.objects)
 		}
-		contents := fmt.Sprintf("map_directory compiler plans differ: %s/%s != %s/%s\n", first.family, first.identity, second.family, second.identity)
+		contents := fmt.Sprintf("map_directory compiler plans differ: %s/%q != %s/%q\n", first.identity, first.objects, second.identity, second.objects)
 		if err := os.WriteFile(*out, []byte(contents), 0o644); err != nil {
 			return fmt.Errorf("write identity comparison stamp: %w", err)
 		}
@@ -282,16 +348,18 @@ func run() error {
 		return err
 	}
 	probe, err := kconfig.NewLinuxToolProbe(kconfig.LinuxToolProbeOptions{
-		Profile:          *targetProfile,
-		Architecture:     *linuxArch,
-		TargetTriple:     *targetTriple,
-		CompilerPath:     *compiler,
-		LinkerPath:       *linker,
-		ArchiverPath:     *archiver,
-		NMPath:           *nm,
-		ObjcopyPath:      *objcopy,
-		CompilerArgs:     compilerArgs,
-		LinkerDriverArgs: linkerDriverArgs,
+		Profile:            *targetProfile,
+		Architecture:       *linuxArch,
+		TargetTriple:       *targetTriple,
+		CompilerPath:       *compiler,
+		LinkerPath:         *linker,
+		ArchiverPath:       *archiver,
+		NMPath:             *nm,
+		ObjcopyPath:        *objcopy,
+		CompilerArgs:       compilerArgs,
+		CompilerSuffixArgs: compilerSuffixArgs,
+		LinkerArgs:         linkerArgs,
+		LinkerSuffixArgs:   linkerSuffixArgs,
 	})
 	if err != nil {
 		return err
@@ -300,14 +368,10 @@ func run() error {
 	if planResult.identity != selectedIdentity {
 		return fmt.Errorf("plan probe identity = %q, selected tool identity = %q", planResult.identity, selectedIdentity)
 	}
-	selectedFamily := probe.CompilerFamily()
-	if planResult.family != selectedFamily {
-		return fmt.Errorf("plan selected %s recipes for the measured %s compiler", planResult.family, selectedFamily)
-	}
-	if err := validateObjects(*objects, selectedFamily); err != nil {
+	if err := validateObjects(*objects, planResult.objects); err != nil {
 		return err
 	}
-	if err := os.WriteFile(*out, []byte(fmt.Sprintf("map_directory %s compiler capability spike passed: %s\n", selectedFamily, planResult.identity)), 0o644); err != nil {
+	if err := os.WriteFile(*out, []byte(fmt.Sprintf("map_directory compiler capability spike passed: %s, objects=%q\n", planResult.identity, planResult.objects)), 0o644); err != nil {
 		return fmt.Errorf("write validation stamp: %w", err)
 	}
 	return nil

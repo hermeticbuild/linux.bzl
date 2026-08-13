@@ -33,27 +33,27 @@ func TestWriteCompactActionPlanEmitsDeterministicSelectedRecipes(t *testing.T) {
 	if !reflect.DeepEqual(firstFiles, secondFiles) {
 		t.Fatalf("compact action plan is not deterministic:\nfirst: %#v\nsecond: %#v", firstFiles, secondFiles)
 	}
-	probePath := "v1/probe/" + compactActionPlanTestProbeIdentity
+	probePath := "toolsets/target/" + compactActionPlanTestProbeIdentity
 	if data, ok := firstFiles[probePath]; !ok || len(data) != 0 {
 		t.Fatalf("probe marker %q = %q, present=%v; want empty marker", probePath, data, ok)
 	}
 
 	selected := compactActionPlanSelectedVariantsForTest(t, metadata)
-	compileFiles := map[string][]byte{}
+	recipeFiles := map[string][]byte{}
 	sourceMarkers := 0
 	for name, data := range firstFiles {
 		switch {
-		case strings.HasPrefix(name, "v1/compile/"):
-			compileFiles[name] = data
-		case strings.HasPrefix(name, "v1/source/"):
+		case strings.HasPrefix(name, "recipes/"):
+			recipeFiles[name] = data
+		case strings.HasPrefix(name, "sources/"):
 			sourceMarkers++
 			if len(data) != 0 {
 				t.Fatalf("source marker %q is not empty: %q", name, data)
 			}
 		}
 	}
-	if len(compileFiles) != len(selected) {
-		t.Fatalf("compile marker count = %d, want %d", len(compileFiles), len(selected))
+	if len(recipeFiles) != len(selected) {
+		t.Fatalf("recipe count = %d, want %d", len(recipeFiles), len(selected))
 	}
 	if sourceMarkers == 0 {
 		t.Fatal("compact action plan emitted no source markers")
@@ -63,15 +63,10 @@ func TestWriteCompactActionPlanEmitsDeterministicSelectedRecipes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		name := fmt.Sprintf(
-			"v1/compile/%s/%08d/%s.json",
-			variant.ContentID,
-			primary,
-			variant.Object,
-		)
-		got, ok := compileFiles[name]
+		name := fmt.Sprintf("recipes/%s.json", variant.ContentID)
+		got, ok := recipeFiles[name]
 		if !ok {
-			t.Fatalf("missing compile marker %q; got %v", name, sortedCompactActionPlanFileNames(compileFiles))
+			t.Fatalf("missing recipe %q; got %v", name, sortedCompactActionPlanFileNames(recipeFiles))
 		}
 		want, err := json.MarshalIndent(variant, "", "  ")
 		if err != nil {
@@ -79,7 +74,20 @@ func TestWriteCompactActionPlanEmitsDeterministicSelectedRecipes(t *testing.T) {
 		}
 		want = append(want, '\n')
 		if string(got) != string(want) {
-			t.Fatalf("compile marker %q =\n%s\nwant:\n%s", name, got, want)
+			t.Fatalf("recipe %q =\n%s\nwant:\n%s", name, got, want)
+		}
+		node := fmt.Sprintf("nodes/target/%s", variant.ContentID)
+		wantMarkers := []string{
+			node + "/kind/compile",
+			node + "/recipe/" + variant.ContentID,
+			node + "/tool/target",
+			fmt.Sprintf("%s/in/source/src/00000000/src-%08d", node, primary),
+			node + "/out/objects/00000000/" + variant.Object,
+		}
+		for _, marker := range wantMarkers {
+			if data, ok := firstFiles[marker]; !ok || len(data) != 0 {
+				t.Fatalf("node marker %q = %q, present=%v; want empty marker", marker, data, ok)
+			}
 		}
 	}
 }
@@ -131,13 +139,6 @@ func TestWriteCompactActionPlanRejectsUnsupportedMetadata(t *testing.T) {
 			want: "exactly one config",
 		},
 		{
-			name: "composite recipe",
-			mutate: func(_ *CompactMetadata, variant *CompactObjectVariant) {
-				variant.Members = []string{"member"}
-			},
-			want: "unsupported composite recipe",
-		},
-		{
 			name: "generated dependency",
 			mutate: func(_ *CompactMetadata, variant *CompactObjectVariant) {
 				variant.Deps = []string{"generated"}
@@ -159,12 +160,11 @@ func TestWriteCompactActionPlanRejectsUnsupportedMetadata(t *testing.T) {
 			want: "unsupported non-C source",
 		},
 		{
-			name: "module recipe",
+			name: "invalid mode",
 			mutate: func(_ *CompactMetadata, variant *CompactObjectVariant) {
-				variant.Mode = "m"
-				variant.ModuleRoot = true
+				variant.Mode = "mystery"
 			},
-			want: "unsupported non-built-in mode",
+			want: "unsupported mode",
 		},
 		{
 			name: "object path traversal",

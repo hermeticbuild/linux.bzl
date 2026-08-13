@@ -22,6 +22,13 @@ bazel_dep(name = "rules_perl", version = "0.5.0")
 bazel_dep(name = "rules_rs", version = "0.0.102")
 bazel_dep(name = "zstd", version = "1.5.7.bcr.1")
 
+single_version_override(
+    module_name = "llvm",
+    patch_strip = 1,
+    patches = ["//patches:llvm_kbuild_actions.patch"],
+    version = "0.8.14",
+)
+
 bazel_dep(name = "tar.bzl", version = "0.9.0", dev_dependency = True)
 
 rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
