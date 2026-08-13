@@ -5958,18 +5958,27 @@ def _resolve_linux_config(ctx, rust_toolchain_probe):
         if vars_arch and env_arch and vars_arch != env_arch:
             fail("Linux probe ARCH differs between vars (%r) and env (%r)" % (vars_arch, env_arch))
         profile = linux_architecture_profile_for_arch(env_arch or vars_arch or "x86")
-        kbuild = linux_kconfig_toolchain_probe_helpers.configured_kbuild_tools(
+        compiler_path = cc_common.get_tool_for_action(
+            feature_configuration = feature_configuration,
+            action_name = C_COMPILE_ACTION_NAME,
+        )
+        compiler = linux_kconfig_toolchain_probe_helpers.tool_file_for_path(
+            cc_toolchain,
+            compiler_path,
+            "C compiler",
+        )
+        probe_tools = linux_kconfig_toolchain_probe_helpers.standard_probe_tools(
             cc_toolchain,
             feature_configuration,
+            compiler,
+            compiler_family,
         )
-        compiler = kbuild.tools["cc"]
-        probe_tools = linux_kconfig_toolchain_probe_helpers.selected_probe_tools(kbuild)
-        compile_action = linux_kconfig_toolchain_probe_helpers.configured_compile_action(
+        compile_action = linux_kconfig_toolchain_probe_helpers.standard_compile_action(
             ctx,
             cc_toolchain,
             feature_configuration,
         )
-        linker_driver = linux_kconfig_toolchain_probe_helpers.configured_linker_driver_prefix(
+        linker_driver = linux_kconfig_toolchain_probe_helpers.standard_linker_driver_prefix(
             ctx,
             cc_toolchain,
             feature_configuration,

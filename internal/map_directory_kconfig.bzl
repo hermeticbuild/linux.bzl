@@ -1,6 +1,11 @@
 """Bazel 9 feasibility rules for execution-time Kconfig graph expansion."""
 
 load(
+    "@rules_cc//cc:action_names.bzl",
+    "CPP_LINK_EXECUTABLE_ACTION_NAME",
+    "C_COMPILE_ACTION_NAME",
+)
+load(
     "@rules_cc//cc:find_cc_toolchain.bzl",
     "CC_TOOLCHAIN_TYPE",
     "find_cpp_toolchain",
@@ -14,6 +19,9 @@ _HEX_DIGITS = "0123456789abcdef"
 _PLAN_SCHEMA = "linux-kernel-plan-v2"
 _SOURCE_INPUT_PREFIX = "source:"
 _KBUILD_ARGS_SENTINEL = "__LINUX_BZL_KBUILD_ARGS_V1__"
+_STANDARD_COMPILE_OUTPUT_SENTINEL = "__linux_bzl_probe_output__.o"
+_STANDARD_COMPILE_RECIPE_SENTINEL = "-D__LINUX_BZL_PROBE_FLAGS__"
+_STANDARD_COMPILE_SOURCE_SENTINEL = "__linux_bzl_probe_source__.c"
 _KBUILD_ACTIONS = {
     "ar": "linux-kbuild-ar",
     "as": "linux-kbuild-as",
@@ -315,6 +323,97 @@ def _selected_probe_tools(kbuild):
         objcopy = kbuild.tools["objcopy"],
     )
 
+def _tool_file_for_sibling(cc_toolchain, tool, basename, name):
+    return _tool_file_for_path(cc_toolchain, tool.dirname + "/" + basename, name)
+
+def _standard_probe_tools(cc_toolchain, feature_configuration, compiler, compiler_family):
+    """Returns probe tools exposed by every ordinary CcToolchainInfo."""
+    if compiler_family == "clang":
+        link_driver_path = cc_common.get_tool_for_action(
+            feature_configuration = feature_configuration,
+            action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
+        )
+        link_driver = _tool_file_for_path(cc_toolchain, link_driver_path, "C++ link driver")
+        return struct(
+            archiver = _tool_file_for_sibling(cc_toolchain, compiler, "llvm-ar", "archiver"),
+            linker = _tool_file_for_sibling(cc_toolchain, link_driver, "ld.lld", "linker"),
+            nm = _tool_file_for_sibling(cc_toolchain, compiler, "llvm-nm", "nm"),
+            objcopy = _tool_file_for_sibling(cc_toolchain, compiler, "llvm-objcopy", "objcopy"),
+        )
+    return struct(
+        archiver = _tool_file_for_path(cc_toolchain, cc_toolchain.ar_executable, "archiver"),
+        linker = _tool_file_for_path(cc_toolchain, cc_toolchain.ld_executable, "linker"),
+        nm = _tool_file_for_path(cc_toolchain, cc_toolchain.nm_executable, "nm"),
+        objcopy = _tool_file_for_path(cc_toolchain, cc_toolchain.objcopy_executable, "objcopy"),
+    )
+
+def _standard_compile_action(ctx, cc_toolchain, feature_configuration):
+    """Measures the configured standard C compile action around a marker."""
+    variables = cc_common.create_compile_variables(
+        feature_configuration = feature_configuration,
+        cc_toolchain = cc_toolchain,
+        output_file = _STANDARD_COMPILE_OUTPUT_SENTINEL,
+        source_file = _STANDARD_COMPILE_SOURCE_SENTINEL,
+        user_compile_flags = ctx.fragments.cpp.copts + ctx.fragments.cpp.conlyopts + [_STANDARD_COMPILE_RECIPE_SENTINEL],
+    )
+    action_args = cc_common.get_memory_inefficient_command_line(
+        feature_configuration = feature_configuration,
+        action_name = C_COMPILE_ACTION_NAME,
+        variables = variables,
+    )
+    if len([argument for argument in action_args if argument == _STANDARD_COMPILE_RECIPE_SENTINEL]) != 1:
+        fail("selected C/C++ toolchain must preserve exactly one probe flags marker")
+    if not any([_STANDARD_COMPILE_SOURCE_SENTINEL in argument for argument in action_args]):
+        fail("selected C/C++ toolchain compile command does not contain its source operand")
+    if not any([_STANDARD_COMPILE_OUTPUT_SENTINEL in argument for argument in action_args]):
+        fail("selected C/C++ toolchain compile command does not contain its output operand")
+
+    controlled = {}
+    for index, argument in enumerate(action_args):
+        if argument == _STANDARD_COMPILE_RECIPE_SENTINEL or argument == "-c" or _STANDARD_COMPILE_SOURCE_SENTINEL in argument or _STANDARD_COMPILE_OUTPUT_SENTINEL in argument:
+            controlled[index] = True
+            if index > 0 and action_args[index - 1] in ["-o", "--output"]:
+                controlled[index - 1] = True
+    flags = [
+        argument
+        for index, argument in enumerate(action_args)
+        if index not in controlled
+    ]
+    for flag in flags:
+        if flag.startswith("@") or flag in ["--output", "-E", "-M", "-MD", "-MF", "-MJ", "-MM", "-MMD", "-MQ", "-MT", "-S", "-c", "-o"]:
+            fail("selected C/C++ toolchain produced unsafe compiler probe argument %r" % flag)
+        if flag.startswith("--output=") or flag.startswith("-MF=") or flag.startswith("-MJ="):
+            fail("selected C/C++ toolchain produced unsafe compiler probe argument %r" % flag)
+    return struct(
+        environment = dict(cc_common.get_environment_variables(
+            feature_configuration = feature_configuration,
+            action_name = C_COMPILE_ACTION_NAME,
+            variables = variables,
+        )),
+        probe_prefix = flags,
+        probe_suffix = [],
+    )
+
+def _standard_linker_driver_prefix(ctx, cc_toolchain, feature_configuration):
+    """Returns the standard link environment for a directly invoked linker."""
+    variables = cc_common.create_link_variables(
+        cc_toolchain = cc_toolchain,
+        feature_configuration = feature_configuration,
+        is_linking_dynamic_library = False,
+        is_using_linker = True,
+        output_file = "__linux_bzl_probe_link_output__",
+        user_link_flags = ctx.fragments.cpp.linkopts,
+    )
+    return struct(
+        environment = dict(cc_common.get_environment_variables(
+            feature_configuration = feature_configuration,
+            action_name = CPP_LINK_EXECUTABLE_ACTION_NAME,
+            variables = variables,
+        )),
+        flags = [],
+        suffix_flags = [],
+    )
+
 def _canonical_sources(ctx):
     prefix = ctx.label.package + "/" if ctx.label.package else ""
     sources = {}
@@ -349,6 +448,9 @@ linux_kconfig_toolchain_probe_helpers = struct(
     configured_compile_action = _configured_compile_action,
     configured_linker_driver_prefix = _configured_linker_driver_prefix,
     selected_probe_tools = _selected_probe_tools,
+    standard_compile_action = _standard_compile_action,
+    standard_linker_driver_prefix = _standard_linker_driver_prefix,
+    standard_probe_tools = _standard_probe_tools,
     tool_file_for_path = _tool_file_for_path,
 )
 
