@@ -18,6 +18,7 @@ go_binary(
 linux_map_directory_kconfig_spike(
     name = "compiler_capabilities",
     srcs = [
+        "assembly_selected.S",
         "clang_selected.c",
         "composite_first.c",
         "composite_second.c",

@@ -2,6 +2,7 @@ obj-$(CONFIG_MAP_DIRECTORY_CC_SUPPORTED) += supported.o
 obj-$(CONFIG_MAP_DIRECTORY_CC_UNSUPPORTED) += unsupported.o
 obj-$(CONFIG_MAP_DIRECTORY_CLANG_SELECTED) += clang_selected.o
 obj-$(CONFIG_MAP_DIRECTORY_GCC_SELECTED) += gcc_selected.o
+obj-y += assembly_selected.o
 obj-m += composite.o
 composite-y += composite_first.o composite_second.o
 

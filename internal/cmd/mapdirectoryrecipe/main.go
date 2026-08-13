@@ -83,8 +83,10 @@ func runRecipe(opts recipeOptions) error {
 		if recipe.Source != opts.expectedSource {
 			return fmt.Errorf("recipe source = %q, want %q", recipe.Source, opts.expectedSource)
 		}
-		if len(recipe.Members) != 0 || len(opts.inputs) != 0 || opts.source == "" || filepath.Ext(recipe.Source) != ".c" {
-			return fmt.Errorf("recipe is not a C-to-object compile: %q -> %q", recipe.Source, recipe.Object)
+		sourceExtension := filepath.Ext(recipe.Source)
+		if len(recipe.Members) != 0 || len(opts.inputs) != 0 || opts.source == "" ||
+			(sourceExtension != ".c" && sourceExtension != ".S" && sourceExtension != ".s") {
+			return fmt.Errorf("recipe is not a supported source-to-object compile: %q -> %q", recipe.Source, recipe.Object)
 		}
 	} else if opts.kind == "composite" {
 		if len(recipe.Members) == 0 || len(opts.inputs) != len(recipe.Members) || opts.source != "" || opts.expectedSource != "" {

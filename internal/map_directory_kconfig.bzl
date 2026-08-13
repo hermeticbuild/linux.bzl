@@ -534,7 +534,7 @@ linux_map_directory_kconfig_spike = rule(
         "kbuild": attr.label(allow_single_file = True, mandatory = True),
         "kconfig": attr.label(allow_single_file = True, mandatory = True),
         "linux_arch": attr.string(default = "x86"),
-        "srcs": attr.label_list(allow_files = [".c", ".h"], mandatory = True),
+        "srcs": attr.label_list(allow_files = [".c", ".h", ".S", ".s"], mandatory = True),
         "target_profile": attr.string(default = "x86_64"),
         "target_triple": attr.string(default = "x86_64-linux-gnu"),
         "validator": attr.label(cfg = "exec", executable = True, mandatory = True),

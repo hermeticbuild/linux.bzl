@@ -301,8 +301,8 @@ func validateCompactActionPlanVariant(variant CompactObjectVariant) error {
 		if err := validateCompactActionPlanRelativePath("source", variant.Source); err != nil {
 			return err
 		}
-		if compactSourceLanguage(variant.Source) != "c" {
-			return fmt.Errorf("object %q has unsupported non-C source %q", variant.Object, variant.Source)
+		if compactSourceLanguage(variant.Source) == "" {
+			return fmt.Errorf("object %q has unsupported source %q", variant.Object, variant.Source)
 		}
 	}
 	if variant.Symversions || variant.ObjtoolForce || len(variant.ObjtoolArgs) != 0 {

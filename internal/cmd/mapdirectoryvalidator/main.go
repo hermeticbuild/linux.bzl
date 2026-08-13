@@ -110,6 +110,7 @@ func validatePlan(root string) (planValidation, error) {
 		return planValidation{}, fmt.Errorf("action plan is missing its v2 schema or target toolset marker")
 	}
 	wantSources := []string{
+		"assembly_selected.S",
 		"include/linux/compiler-version.h",
 		"include/linux/compiler_types.h",
 		"include/linux/kconfig.h",
@@ -137,8 +138,8 @@ func validatePlan(root string) (planValidation, error) {
 			"-DMAP_DIRECTORY_RECIPE_REPLAYED=1",
 		},
 	}
-	if len(nodes) != 5 {
-		return planValidation{}, fmt.Errorf("target nodes = %v, want four compiles and one module composite", sortedKeys(nodes))
+	if len(nodes) != 6 {
+		return planValidation{}, fmt.Errorf("target nodes = %v, want five compiles and one module composite", sortedKeys(nodes))
 	}
 	seenObjects := map[string]bool{}
 	selectedObject := ""
@@ -169,7 +170,10 @@ func validatePlan(root string) (planValidation, error) {
 			seenObjects[recipe.Object] = true
 			continue
 		}
-		if node["kind"] != "compile" || node["source"] == "" || len(recipe.Members) != 0 || recipe.Source != strings.TrimSuffix(recipe.Object, ".o")+".c" {
+		sourceExtension := filepath.Ext(recipe.Source)
+		if node["kind"] != "compile" || node["source"] == "" || len(recipe.Members) != 0 ||
+			(sourceExtension != ".c" && sourceExtension != ".S" && sourceExtension != ".s") ||
+			recipe.Source != strings.TrimSuffix(recipe.Object, ".o")+sourceExtension {
 			return planValidation{}, fmt.Errorf("compile recipe does not match node %q: node=%v recipe=%#v", id, node, recipe)
 		}
 		sourceFound := false
@@ -187,7 +191,7 @@ func validatePlan(root string) (planValidation, error) {
 			return planValidation{}, fmt.Errorf("compile plan repeats recipe for %q", recipe.Object)
 		}
 		seenObjects[recipe.Object] = true
-		if recipe.Object != "supported.o" && !strings.HasPrefix(recipe.Object, "composite_") {
+		if recipe.Object != "supported.o" && recipe.Object != "assembly_selected.o" && !strings.HasPrefix(recipe.Object, "composite_") {
 			if !strings.HasSuffix(recipe.Object, "_selected.o") {
 				return planValidation{}, fmt.Errorf("Kconfig-selected object %q does not use the fixture's selected-object contract", recipe.Object)
 			}
@@ -207,7 +211,7 @@ func validatePlan(root string) (planValidation, error) {
 			}
 		}
 	}
-	if !seenObjects["supported.o"] || !seenObjects["composite.o"] || !seenObjects["composite_first.o"] || !seenObjects["composite_second.o"] || selectedObject == "" {
+	if !seenObjects["supported.o"] || !seenObjects["assembly_selected.o"] || !seenObjects["composite.o"] || !seenObjects["composite_first.o"] || !seenObjects["composite_second.o"] || selectedObject == "" {
 		return planValidation{}, fmt.Errorf("compile plan did not contain its common and selected objects: %v", sortedKeys(seenObjects))
 	}
 	for _, path := range files {
@@ -217,7 +221,7 @@ func validatePlan(root string) (planValidation, error) {
 	}
 	return planValidation{
 		identity: identity,
-		objects:  []string{"supported.o", selectedObject, "composite_first.o", "composite_second.o", "composite.o"},
+		objects:  []string{"supported.o", "assembly_selected.o", selectedObject, "composite_first.o", "composite_second.o", "composite.o"},
 	}, nil
 }
 
