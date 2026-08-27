@@ -1,0 +1,9 @@
+mainmenu "mapped kernel smoke"
+
+config X86
+    bool
+    default y
+
+config X86_64
+    bool
+    default y

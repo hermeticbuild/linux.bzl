@@ -3,8 +3,33 @@ module(
     version = "0.0.0",
 )
 
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "gcc_toolchain", version = "0.12.0")
 bazel_dep(name = "linux.bzl", version = "0.0.1")
 bazel_dep(name = "llvm", version = "0.8.14")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
+
+single_version_override(
+    module_name = "gcc_toolchain",
+    patch_strip = 1,
+    patches = ["//:gcc_toolchain_remote_execution.patch"],
+    version = "0.12.0",
+)
+
+single_version_override(
+    module_name = "llvm",
+    patch_strip = 1,
+    patches = ["//:llvm_kbuild_actions.patch"],
+    version = "0.8.14",
+)
+
+single_version_override(
+    module_name = "libbpf",
+    patch_strip = 1,
+    patches = ["//:libbpf_old_uapi_compat.patch"],
+    version = "1.7.0",
+)
 
 # This override makes the example exercise the adjacent checkout. Remove it
 # when consuming a published linux.bzl release.
@@ -14,7 +39,31 @@ local_path_override(
 )
 
 register_toolchains(
+    "//:gcc_cc_toolchain_aarch64",
+    "//:gcc_cc_toolchain_x86_64",
     "@llvm//toolchain:all",
+)
+
+example_gcc_toolchains = use_extension(
+    "@gcc_toolchain//toolchain:module_extensions.bzl",
+    "gcc_toolchains",
+)
+example_gcc_toolchains.toolchain(
+    name = "example_gcc_aarch64",
+    enable_fortran = False,
+    gcc_version = "15.2.0",
+    target_arch = "aarch64",
+)
+example_gcc_toolchains.toolchain(
+    name = "example_gcc_x86_64",
+    enable_fortran = False,
+    gcc_version = "15.2.0",
+    target_arch = "x86_64",
+)
+use_repo(
+    example_gcc_toolchains,
+    "example_gcc_aarch64",
+    "example_gcc_x86_64",
 )
 
 linux_source_repository = use_repo_rule(

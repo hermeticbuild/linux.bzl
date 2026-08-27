@@ -2,5 +2,7 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "gcc_toolchain_remote_execution.patch",
+    "libbpf_old_uapi_compat.patch",
     "llvm_kbuild_actions.patch",
+    "rules_rs_linux_rust_lld_runtime.patch",
 ])

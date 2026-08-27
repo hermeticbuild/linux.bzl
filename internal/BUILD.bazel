@@ -1,6 +1,28 @@
+load(":execution_platform.bzl", "linux_execution_platform")
+load(":script_runtime_toolchain.bzl", "linux_x86_64_script_runtime_toolchain")
+
 package(default_visibility = ["//:__subpackages__"])
 
 exports_files(
-    ["linux_object_groups.bzl"],
+    ["mapped_kernel.bzl"],
+    visibility = ["//visibility:public"],
+)
+
+toolchain_type(
+    name = "script_runtime_toolchain_type",
+    visibility = ["//visibility:public"],
+)
+
+linux_execution_platform(
+    name = "execution_platform",
+)
+
+linux_x86_64_script_runtime_toolchain(
+    name = "busybox_script_runtime_toolchain",
+    applets = {
+        "find": "@linux_bzl_toybox//file:toybox",
+    },
+    implementation_name = "script_runtime",
+    runtime = "@linux_bzl_busybox//file:busybox",
     visibility = ["//visibility:public"],
 )

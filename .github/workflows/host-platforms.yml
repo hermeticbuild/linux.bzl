@@ -44,8 +44,12 @@ jobs:
           module-root: examples
           repository-cache: |
             - examples/.bazelversion
+            - examples/.bazelrc
             - examples/MODULE.bazel
             - examples/MODULE.bazel.lock
+            - examples/gcc_toolchain_remote_execution.patch
+            - examples/libbpf_old_uapi_compat.patch
+            - examples/llvm_kbuild_actions.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Build Linux kernels
@@ -60,6 +64,7 @@ jobs:
           bazel --host_jvm_args=-Xmx${{ matrix.heap }} \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             build \
+            --noannounce_rc \
             //:x86_64_kernel \
             //:x86_64_debug_kernel \
             //:x86_64_lz4_kernel \

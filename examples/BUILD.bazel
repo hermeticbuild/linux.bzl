@@ -1,6 +1,57 @@
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
 load("@linux.bzl", "initramfs")
 
 package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "gcc_toolchain_remote_execution.patch",
+    "libbpf_old_uapi_compat.patch",
+    "llvm_kbuild_actions.patch",
+])
+
+string_flag(
+    name = "compiler",
+    build_setting_default = "clang",
+    values = [
+        "clang",
+        "gcc",
+    ],
+)
+
+config_setting(
+    name = "gcc_selected",
+    flag_values = {":compiler": "gcc"},
+)
+
+toolchain(
+    name = "gcc_cc_toolchain_aarch64",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+    target_settings = [":gcc_selected"],
+    toolchain = "@example_gcc_aarch64//:_cc_toolchain",
+    toolchain_type = "@rules_cc//cc:toolchain_type",
+)
+
+toolchain(
+    name = "gcc_cc_toolchain_x86_64",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_settings = [":gcc_selected"],
+    toolchain = "@example_gcc_x86_64//:_cc_toolchain",
+    toolchain_type = "@rules_cc//cc:toolchain_type",
+)
 
 initramfs(
     name = "example_initramfs",
@@ -32,17 +83,6 @@ alias(
 alias(
     name = "x86_64_lz4_kernel",
     actual = "@example_x86_64//variants/lz4:kernel",
-)
-
-genrule(
-    name = "x86_64_shared_graph_metadata",
-    srcs = ["@example_x86_64//graph:metadata.json"],
-    outs = ["x86_64_shared_graph_metadata.json"],
-    cmd = "cp $(location @example_x86_64//graph:metadata.json) $@",
-    tags = [
-        "local",
-        "manual",
-    ],
 )
 
 alias(

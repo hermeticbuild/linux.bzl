@@ -8,6 +8,13 @@ bazel_dep(name = "linux.bzl", version = "0.0.1")
 bazel_dep(name = "llvm", version = "0.8.14")
 bazel_dep(name = "rules_rs", version = "0.0.102")
 
+single_version_override(
+    module_name = "llvm",
+    patch_strip = 1,
+    patches = ["//patches:llvm_kbuild_actions.patch"],
+    version = "0.8.14",
+)
+
 archive_override(
     module_name = "aya",
     integrity = "sha256-3+2/du1fBvpAB+65NtdWBeGE3By0d2/HfR3BstE7w7o=",

@@ -172,24 +172,6 @@ func exprIsYes(e Expr) bool {
 	return e == nil || isConst(e, "y")
 }
 
-func exprContainsSymbol(e Expr, sym *Symbol) bool {
-	if e == nil || sym == nil {
-		return false
-	}
-	switch x := e.(type) {
-	case *SymbolExpr:
-		return x.Symbol == sym
-	case *UnaryExpr:
-		return exprContainsSymbol(x.X, sym)
-	case *BinaryExpr:
-		return exprContainsSymbol(x.Left, sym) || exprContainsSymbol(x.Right, sym)
-	case *CompareExpr:
-		return exprContainsSymbol(x.Left, sym) || exprContainsSymbol(x.Right, sym)
-	default:
-		return false
-	}
-}
-
 func exprImpliesSymbol(e Expr, sym *Symbol) bool {
 	if e == nil || sym == nil {
 		return false

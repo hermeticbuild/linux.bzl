@@ -2,12 +2,18 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
     name = "kconfig_parse_lib",
-    srcs = ["main.go"],
+    srcs = [
+        "frontier_join.go",
+        "frontier_state.go",
+        "frontier_virtual_file_view.go",
+        "main.go",
+        "path_set.go",
+    ],
     importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/kconfig_parse",
     visibility = ["//visibility:private"],
     deps = [
         "//internal/kconfig",
-        "//internal/rusttoolchain",
+        "//internal/toolaction",
     ],
 )
 
@@ -20,10 +26,18 @@ go_binary(
 
 go_test(
     name = "kconfig_parse_test",
-    srcs = ["main_test.go"],
+    srcs = [
+        "deferred_content_selection_test.go",
+        "frontier_join_test.go",
+        "frontier_state_test.go",
+        "frontier_virtual_file_view_test.go",
+        "main_test.go",
+        "path_set_test.go",
+        "virtual_file_alias_test.go",
+    ],
     embed = [":kconfig_parse_lib"],
     deps = [
         "//internal/kconfig",
-        "//internal/rusttoolchain",
+        "//internal/toolaction",
     ],
 )

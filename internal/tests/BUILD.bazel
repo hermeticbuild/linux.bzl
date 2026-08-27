@@ -1,112 +1,34 @@
-load("@bazel_skylib//rules:build_test.bzl", "build_test")
-load(
-    "//internal:linux_objects.bzl",
-    "linux_cc_context",
-    "linux_config",
-)
-load(":architecture_linking_test.bzl", "architecture_linking_test_suite")
-load(":clang_resource_headers_test.bzl", "clang_resource_headers_test")
-load(":compact_generator_test.bzl", "compact_generator_test_suite")
-load(":config_validation_test.bzl", "config_validation_test_suite")
 load(":host_cc_toolchain_test.bzl", "host_cc_toolchain_test")
-load(":kconfig_repositories_test.bzl", "action_group_validation_test", "compile_environment_abi_test", "config_payload_owners_test", "core_config_aliases_test", "fragment_arch_preflight_test", "generated_header_config_index_test", "generated_object_inputs_test", "generator_variable_args_test", "graph_arch_tool_args_test", "graph_configs_args_test", "graph_rule_adapter_test", "kconfig_tool_filename_test", "metadata_key_validation_test", "target_profiles_test", "without_rust_toolchain_config_test")
-load(":linux_compile_flags_test.bzl", "compiler_adjusted_flags_test", "linux_compile_flags_test")
-load(":linux_modules_test.bzl", "linux_module_test_suite")
-load(":linux_object_groups_test.bzl", "linux_object_groups_test_suite")
-load(":linux_object_objtool_test.bzl", "linux_object_objtool_test_suite")
-load(":linux_objects_failure_test.bzl", "linux_objects_fail_closed_test_suite")
-load(":linux_rust_test.bzl", "linux_rust_test_suite")
-load(":linux_source_versions_test.bzl", "linux_source_versions_test_suite")
-load(":path_mapping_test.bzl", "path_mapping_test")
-load(":sanitizer_actions_test.bzl", "sanitizer_actions_test")
+load(":linux_external_module_test.bzl", "linux_external_module_test")
+load(":linux_image_name_test.bzl", "linux_image_name_test")
+load(":mapped_kernel_toolset_test.bzl", "mapped_kernel_backend_test", "mapped_kernel_exec_python_test", "mapped_kernel_host_dependency_validation_test", "mapped_kernel_path_validation_test", "mapped_kernel_requirement_validation_test", "mapped_kernel_toolset_test")
+load(":probe_map_directory_test.bzl", "probe_map_directory_path_rendering_test", "probe_map_directory_test", "probe_map_directory_validation_test")
+load(":script_runtime_toolchain_test.bzl", "script_runtime_toolchain_test")
 
 package(default_visibility = ["//visibility:private"])
 
-compact_generator_test_suite(name = "compact_generator_tests")
-
-architecture_linking_test_suite(name = "architecture_linking_tests")
-
-clang_resource_headers_test(name = "clang_resource_headers_test")
-
-action_group_validation_test(name = "action_group_validation_test")
-
-config_validation_test_suite(name = "config_validation_tests")
-
-compile_environment_abi_test(name = "compile_environment_abi_test")
-
-core_config_aliases_test(name = "core_config_aliases_test")
-
-fragment_arch_preflight_test(name = "fragment_arch_preflight_test")
-
-generated_object_inputs_test(name = "generated_object_inputs_test")
-
-graph_configs_args_test(name = "graph_configs_args_test")
-
-graph_rule_adapter_test(name = "graph_rule_adapter_test")
-
-config_payload_owners_test(name = "config_payload_owners_test")
-
-generator_variable_args_test(name = "generator_variable_args_test")
-
-generated_header_config_index_test(name = "generated_header_config_index_test")
-
-graph_arch_tool_args_test(name = "graph_arch_tool_args_test")
-
 host_cc_toolchain_test(name = "host_cc_toolchain_test")
 
-kconfig_tool_filename_test(name = "kconfig_tool_filename_test")
+linux_image_name_test(name = "linux_image_name_test")
 
-metadata_key_validation_test(name = "metadata_key_validation_test")
+linux_external_module_test(name = "linux_external_module_test")
 
-target_profiles_test(name = "target_profiles_test")
+mapped_kernel_backend_test(name = "mapped_kernel_backend_test")
 
-without_rust_toolchain_config_test(name = "without_rust_toolchain_config_test")
+mapped_kernel_exec_python_test(name = "mapped_kernel_exec_python_test")
 
-linux_cc_context(
-    name = "cc_context_smoke",
-)
+mapped_kernel_host_dependency_validation_test(name = "mapped_kernel_host_dependency_validation_test")
 
-linux_compile_flags_test(
-    name = "linux_compile_flags_test",
-    target_under_test = ":cc_context_smoke",
-)
+mapped_kernel_path_validation_test(name = "mapped_kernel_path_validation_test")
 
-compiler_adjusted_flags_test(name = "compiler_adjusted_flags_test")
+mapped_kernel_requirement_validation_test(name = "mapped_kernel_requirement_validation_test")
 
-linux_config(
-    name = "config_smoke",
-    config_flags = {
-        "CONFIG_TEST": "y",
-        "CONFIG_TEST_MODULE": "m",
-        "CONFIG_TEST_VALUE": "7",
-    },
-)
+mapped_kernel_toolset_test(name = "mapped_kernel_toolset_test")
 
-build_test(
-    name = "internal_rule_build_test",
-    targets = [
-        ":cc_context_smoke",
-        ":config_smoke",
-    ],
-)
+probe_map_directory_test(name = "probe_map_directory_test")
 
-linux_objects_fail_closed_test_suite(name = "linux_objects_fail_closed_test")
+probe_map_directory_path_rendering_test(name = "probe_map_directory_path_rendering_test")
 
-linux_object_objtool_test_suite(name = "linux_object_objtool_test")
+probe_map_directory_validation_test(name = "probe_map_directory_validation_test")
 
-linux_object_groups_test_suite(name = "linux_object_groups_test")
-
-linux_module_test_suite(name = "linux_module_test")
-
-linux_rust_test_suite(name = "linux_rust_test")
-
-linux_source_versions_test_suite(name = "linux_source_versions_test")
-
-build_test(
-    name = "linux_rust_enabled_sdk_build_test",
-    targets = [":linux_rust_test_host_link_outputs"],
-)
-
-path_mapping_test(name = "path_mapping_test")
-
-sanitizer_actions_test(name = "sanitizer_actions_test")
+script_runtime_toolchain_test(name = "script_runtime_toolchain_test")

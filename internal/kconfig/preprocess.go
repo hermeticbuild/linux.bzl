@@ -3,12 +3,7 @@ package kconfig
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"maps"
-	"os"
-	"os/exec"
-	"slices"
 	"strconv"
 	"strings"
 )
@@ -187,7 +182,11 @@ func (p *preprocessor) expandBuiltin(name string, args []string) (string, bool, 
 		if err := checkArgs(2, 2); err != nil {
 			return "", true, err
 		}
-		if args[0] == "y" {
+		condition, err := p.resolveSymbolic(args[0])
+		if err != nil {
+			return "", true, err
+		}
+		if condition == "y" {
 			return "", true, p.errorf("%s", args[1])
 		}
 		return "", true, nil
@@ -217,7 +216,11 @@ func (p *preprocessor) expandBuiltin(name string, args []string) (string, bool, 
 		if err := checkArgs(2, 2); err != nil {
 			return "", true, err
 		}
-		if args[0] == "y" {
+		condition, err := p.resolveSymbolic(args[0])
+		if err != nil {
+			return "", true, err
+		}
+		if condition == "y" {
 			*p.diagnostics = append(*p.diagnostics, Diagnostic{Position: p.current, Message: args[1]})
 		}
 		return "", true, nil
@@ -233,56 +236,35 @@ func (p *preprocessor) expandEnv(name string) (string, bool) {
 			return value, true
 		}
 	}
-	if p.opts.UseHostEnv {
-		value, ok := os.LookupEnv(name)
-		return value, ok
-	}
 	return "", false
 }
 
 func (p *preprocessor) runShell(command string) (string, error) {
-	if !p.opts.AllowShell {
-		return "", p.errorf("$(shell,...) is disabled for hermetic parsing")
+	if p.opts.Shell == nil {
+		return "", p.errorf("$(shell,...) requires an explicit hermetic evaluator")
 	}
-	var (
-		out []byte
-		err error
-	)
-	if p.opts.Shell != nil {
-		outString, err := p.opts.Shell(p.ctx, command)
-		return normalizeShellOutput([]byte(outString)), err
-	}
-	cmd := exec.CommandContext(p.ctx, "sh", "-c", command)
-	cmd.Env = sortedEnv(p.opts.Env)
-	if p.opts.UseHostEnv {
-		cmd.Env = append(os.Environ(), cmd.Env...)
-	}
-	out, err = cmd.Output()
+	out, err := p.opts.Shell(p.ctx, command)
 	if err != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) {
-			return "", p.errorf("shell command failed: %v", err)
-		}
+		return "", err
 	}
-	if err := p.ctx.Err(); err != nil {
-		return "", p.errorf("shell command failed: %v", err)
+	return normalizeShellOutput([]byte(out)), nil
+}
+
+func (p *preprocessor) resolveSymbolic(value string) (string, error) {
+	if p.opts.ResolveSymbolic == nil {
+		return value, nil
 	}
-	return normalizeShellOutput(out), nil
+	resolved, err := p.opts.ResolveSymbolic(value)
+	if err != nil {
+		return "", p.errorf("resolve symbolic value: %v", err)
+	}
+	return resolved, nil
 }
 
 func normalizeShellOutput(out []byte) string {
 	out = bytes.TrimRight(out, "\n")
 	out = bytes.ReplaceAll(out, []byte("\n"), []byte(" "))
 	return string(out)
-}
-
-func sortedEnv(env map[string]string) []string {
-	keys := slices.Sorted(maps.Keys(env))
-	out := make([]string, 0, len(keys))
-	for _, key := range keys {
-		out = append(out, key+"="+env[key])
-	}
-	return out
 }
 
 func (p *preprocessor) errorf(format string, args ...any) error {

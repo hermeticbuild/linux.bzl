@@ -2,25 +2,52 @@ module(
     name = "linux.bzl",
 )
 
-bazel_dep(name = "bazel_lib", version = "3.2.2")
-bazel_dep(name = "bazel_skylib", version = "1.9.0")
-
+bazel_dep(name = "bazel_skylib", version = "1.9.0", dev_dependency = True)
 bazel_dep(name = "buildifier_prebuilt", version = "8.2.1.1", dev_dependency = True)
 
-bazel_dep(name = "llvm", version = "0.8.14")
 bazel_dep(name = "elfutils", version = "0.195")
-bazel_dep(name = "gazelle", version = "0.51.3")
-bazel_dep(name = "libbpf", version = "1.7.0")
+
+bazel_dep(name = "gazelle", version = "0.51.3", dev_dependency = True)
+bazel_dep(name = "llvm", version = "0.8.14", dev_dependency = True)
+
+bazel_dep(name = "gawk", version = "5.3.2.bcr.3")
 bazel_dep(name = "lz4", version = "1.10.0.bcr.1")
+bazel_dep(name = "openssl", version = "3.3.1.bcr.1")
 bazel_dep(name = "pahole", version = "1.31")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "rules_cc", version = "0.2.17")
 bazel_dep(name = "rules_bison", version = "0.4.bcr.1")
 bazel_dep(name = "rules_flex", version = "0.4.1")
-bazel_dep(name = "rules_go", version = "0.62.0")
+bazel_dep(name = "rules_m4", version = "0.3.bcr.1")
+
+# Keep non-shell source generators (for example Linux's Perl helpers) bound
+# to a declared execution toolchain instead of an ambient remote-worker PATH.
 bazel_dep(name = "rules_perl", version = "0.5.0")
+bazel_dep(name = "rules_go", version = "0.62.0")
+bazel_dep(name = "rules_python", version = "1.7.0")
 bazel_dep(name = "rules_rs", version = "0.0.102")
-bazel_dep(name = "zstd", version = "1.5.7.bcr.1")
+
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+http_file(
+    name = "linux_bzl_busybox",
+    downloaded_file_path = "busybox",
+    executable = True,
+    sha256 = "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348",
+    urls = ["https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox"],
+)
+
+# Linux source scripts require find's -printf action, which BusyBox omits. Keep
+# the shell and broad POSIX applet set in the pinned BusyBox runtime, then let
+# the script-runtime toolchain override individual applets with independently
+# pinned multicall implementations when their command contracts differ.
+http_file(
+    name = "linux_bzl_toybox",
+    downloaded_file_path = "toybox",
+    executable = True,
+    sha256 = "836ba9d6821fb3bcd85f4e2c511115d677930796ef76418799e0df95526d4e65",
+    urls = ["https://landley.net/toybox/downloads/binaries/0.8.14/toybox-x86_64"],
+)
 
 single_version_override(
     module_name = "llvm",
@@ -28,8 +55,6 @@ single_version_override(
     patches = ["//patches:llvm_kbuild_actions.patch"],
     version = "0.8.14",
 )
-
-bazel_dep(name = "tar.bzl", version = "0.9.0", dev_dependency = True)
 
 rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
 use_repo(rules_rust, "rules_rust")
@@ -51,20 +76,14 @@ use_repo(
 bindgen_toolchains = use_extension("@rules_rs//rs:rules_rust_bindgen.bzl", "rules_rust_bindgen", dev_dependency = True)
 use_repo(bindgen_toolchains, "rules_rust_bindgen")
 
-tar_toolchains = use_extension("@tar.bzl//tar:extensions.bzl", "toolchains", dev_dependency = True)
-use_repo(tar_toolchains, "bsd_tar_toolchains")
-
 register_toolchains(
     "@default_rust_toolchains//:all",
     "@rules_rust_bindgen//:all",
-    "@bsd_tar_toolchains//:all",
     "@llvm//toolchain:all",
     dev_dependency = True,
 )
 
+register_toolchains("//internal:busybox_script_runtime_toolchain")
+
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
 go_sdk.nogo(nogo = "@rules_go//:tools_nogo")
-
-go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
-go_deps.from_file(go_mod = "//:go.mod")
-use_repo(go_deps, "com_github_bazelbuild_buildtools")

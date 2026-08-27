@@ -1,0 +1,47 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "proberun_lib",
+    srcs = [
+        "candidate.go",
+        "main.go",
+        "toolset.go",
+    ],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/proberun",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//internal/kconfig",
+        "//internal/toolaction",
+    ],
+)
+
+go_binary(
+    name = "proberun",
+    embed = [":proberun_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "proberun_test",
+    srcs = [
+        "argument_fragments_test.go",
+        "candidate_test.go",
+        "main_test.go",
+        "test_toolset_fixture_test.go",
+        "toolset_test.go",
+    ],
+    data = [
+        "//internal/cmd/scriptrun",
+        "@linux_bzl_busybox//file:busybox",
+    ],
+    embed = [":proberun_lib"],
+    env = {
+        "LINUX_BZL_TEST_SCRIPTRUN": "$(rlocationpath //internal/cmd/scriptrun:scriptrun)",
+        "LINUX_BZL_TEST_SCRIPT_RUNTIME": "$(rlocationpath @linux_bzl_busybox//file:busybox)",
+    },
+    deps = [
+        "//internal/kconfig",
+        "//internal/toolaction",
+        "@rules_go//go/runfiles",
+    ],
+)

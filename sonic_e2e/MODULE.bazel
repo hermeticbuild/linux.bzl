@@ -4,8 +4,33 @@ module(
 )
 
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "gcc_toolchain", version = "0.12.0")
 bazel_dep(name = "linux.bzl", version = "0.0.1")
 bazel_dep(name = "llvm", version = "0.8.14")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "rules_go", version = "0.62.0")
+
+single_version_override(
+    module_name = "gcc_toolchain",
+    patch_strip = 1,
+    patches = ["//:gcc_toolchain_remote_execution.patch"],
+    version = "0.12.0",
+)
+
+single_version_override(
+    module_name = "llvm",
+    patch_strip = 1,
+    patches = ["//:llvm_kbuild_actions.patch"],
+    version = "0.8.14",
+)
+
+single_version_override(
+    module_name = "libbpf",
+    patch_strip = 1,
+    patches = ["//:libbpf_old_uapi_compat.patch"],
+    version = "1.7.0",
+)
 
 local_path_override(
     module_name = "linux.bzl",
@@ -21,6 +46,8 @@ http_archive(
     name = "sai_bcm_modules",
     build_file_content = 'exports_files(glob(["**"]))',
     integrity = "sha256-W907LnUlUHP0wluU7aIaD2pm6LTn2o74T310/ePHeIQ=",
+    patch_args = ["-p1"],
+    patches = ["//:sai_bcm_kconfig.patch"],
     strip_prefix = "sonic-buildimage-0058681761a86abd324514d817faf0720aa27405",
     urls = ["https://github.com/sonic-net/sonic-buildimage/archive/0058681761a86abd324514d817faf0720aa27405.tar.gz"],
 )
@@ -33,11 +60,17 @@ linux_source_repository = use_repo_rule(
 linux_source_repository(
     name = "sonic_linux_6_18_39",
     module_kbuild_roots = {
-        "drivers/net/ethernet/broadcom/sdklt/linux/bde": "X86",
+        "drivers/net/ethernet/broadcom/sdklt/linux/bde": "LINUX_NGBDE",
     },
+    module_kconfig_roots = [
+        "drivers/net/ethernet/broadcom/sdklt/linux/bde/Kconfig",
+    ],
     module_make_vars = {
         "BDE_CPPFLAGS": "-UBCMDRD_INCLUDE_CUSTOM_CONFIG",
         "SDK": "$(srctree)/drivers/net/ethernet/broadcom/sdklt",
+    },
+    module_targets = {
+        "linux_ngbde": "drivers/net/ethernet/broadcom/sdklt/linux/bde/linux_ngbde.ko",
     },
     source_overlays = {
         "drivers/net/ethernet/broadcom/sdklt": "@sai_bcm_modules//:platform/broadcom/saibcm-modules/sdklt/Makefile",
@@ -46,8 +79,35 @@ linux_source_repository(
 )
 
 register_toolchains(
+    "//:gcc_cc_toolchain_aarch64",
+    "//:gcc_cc_toolchain_x86_64",
     "@llvm//toolchain:all",
 )
+
+sonic_gcc_toolchains = use_extension(
+    "@gcc_toolchain//toolchain:module_extensions.bzl",
+    "gcc_toolchains",
+)
+sonic_gcc_toolchains.toolchain(
+    name = "sonic_gcc_aarch64",
+    enable_fortran = False,
+    gcc_version = "15.2.0",
+    target_arch = "aarch64",
+)
+sonic_gcc_toolchains.toolchain(
+    name = "sonic_gcc_x86_64",
+    enable_fortran = False,
+    gcc_version = "15.2.0",
+    target_arch = "x86_64",
+)
+use_repo(
+    sonic_gcc_toolchains,
+    "sonic_gcc_aarch64",
+    "sonic_gcc_x86_64",
+)
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.nogo(nogo = "@rules_go//:tools_nogo")
 
 linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
 linux_images.image(

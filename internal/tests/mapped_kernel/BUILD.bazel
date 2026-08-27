@@ -1,0 +1,16 @@
+load("//internal:mapped_kernel.bzl", "linux_mapped_kernel")
+
+package(default_visibility = ["//visibility:private"])
+
+linux_mapped_kernel(
+    name = "analysis_smoke",
+    config = "config",
+    kbuild = "Kbuild",
+    source_files = glob(
+        ["**"],
+        exclude = ["BUILD.bazel"],
+    ),
+    source_root = "Kconfig",
+    version = "6.18.0",
+    visibility = ["//internal/tests:__pkg__"],
+)

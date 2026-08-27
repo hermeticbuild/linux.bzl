@@ -1,0 +1,22 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "actionfile_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/actionfile",
+    visibility = ["//visibility:private"],
+    deps = ["//internal/toolaction"],
+)
+
+go_binary(
+    name = "actionfile",
+    embed = [":actionfile_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "actionfile_test",
+    srcs = ["main_test.go"],
+    embed = [":actionfile_lib"],
+    deps = ["//internal/toolaction"],
+)

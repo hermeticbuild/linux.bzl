@@ -5,7 +5,10 @@ go_library(
     srcs = ["main.go"],
     importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/mapdirectoryrecipe",
     visibility = ["//visibility:private"],
-    deps = ["//internal/kconfig"],
+    deps = [
+        "//internal/kconfig",
+        "//internal/toolaction",
+    ],
 )
 
 go_binary(
@@ -18,5 +21,8 @@ go_test(
     name = "mapdirectoryrecipe_test",
     srcs = ["main_test.go"],
     embed = [":mapdirectoryrecipe_lib"],
-    deps = ["//internal/kconfig"],
+    deps = [
+        "//internal/kconfig",
+        "//internal/toolaction",
+    ],
 )

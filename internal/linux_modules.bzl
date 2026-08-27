@@ -1,86 +1,68 @@
-"""Private configured-kernel module finalization rule."""
+"""Out-of-tree modules planned by the same source-derived Kbuild backend as Linux."""
 
-load("@rules_cc//cc:find_cc_toolchain.bzl", "use_cc_toolchain")
-load(":architecture_profiles.bzl", "linux_arch_values", "linux_architecture_profile_for_arch")
-load(":linux_module_actions.bzl", "linux_module_actions")
-load(":linux_objects.bzl", "linux_module_cc_helpers")
+load("@rules_bison//bison:toolchain_type.bzl", "BISON_TOOLCHAIN_TYPE")
+load("@rules_cc//cc:find_cc_toolchain.bzl", "CC_TOOLCHAIN_TYPE", "use_cc_toolchain")
+load("@rules_flex//flex:toolchain_type.bzl", "FLEX_TOOLCHAIN_TYPE")
+load("@rules_m4//m4:toolchain_type.bzl", "M4_TOOLCHAIN_TYPE")
+load(":execution_platform.bzl", "linux_execution_platform_attr", "linux_execution_platform_label")
 load(
-    ":path_mapping.bzl",
-    "add_directory_arg",
-    "directory_anchor",
-    "path_mapped_run",
+    ":mapped_kernel.bzl",
+    "expand_linux_plan_stage",
+    "linux_map_directory_params",
+    "linux_map_directory_tools",
+    "linux_merge_toolset_execution_requirements",
+    "linux_toolset_execution_requirements",
 )
-load(":providers.bzl", "LinuxModuleInfo", "LinuxModuleSdkInfo", "LinuxVmlinuxInfo")
+load(":module_make_vars.bzl", "validate_linux_module_make_vars")
+load(
+    ":probe_map_directory.bzl",
+    "expand_linux_probe_plan",
+    "linux_probe_map_directory_params",
+    "linux_probe_map_directory_tools",
+)
+load(":providers.bzl", "LinuxModuleInfo", "LinuxModuleSdkInfo")
+load(
+    ":rust_toolchain.bzl",
+    "optional_bindgen_toolchain_type",
+    "optional_rust_analyzer_toolchain_type",
+    "optional_rust_toolchain_type",
+)
+load(":script_runtime_toolchain.bzl", "SCRIPT_RUNTIME_TOOLCHAIN_TYPE")
 
 visibility("//...")
 
-_RUST_CONFIG_FLAGS_MARKER = "--linux-bzl-config-flags"
+_EXTERNAL_TARGET_TREES = ["metadata", "modules", "objects"]
+_HOST_DEPS_TREE = "host_deps"
+_HOST_DEPS_SENTINEL = "__LINUX_BZL_HOST_DEPS__"
+_PLAN_STAGES = ["prehost", "bootstrap", "host", "prep", "target"]
+_SOURCE_TREE_SENTINEL = "__LINUX_BZL_SOURCE_TREE__"
+_PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE = str(Label("@rules_python//python:exec_tools_toolchain_type"))
 
-def _link_module(ctx, target, preliminary, mod_object, module_common, module_lds, path, target_link_flags = None):
-    out = ctx.actions.declare_file(ctx.label.name + ".modules/" + path[:-len(".o")] + ".ko.unprocessed")
+def _add_artifact_path(args, flag, artifact, format = None):
+    """Adds one File/TreeArtifact without expanding it or losing path mapping."""
+    args.add(flag)
+    if format == None:
+        args.add_all([artifact], expand_directories = False)
+    else:
+        args.add_all([artifact], expand_directories = False, format_each = format)
+
+def _copy_linux_tree_file(ctx, runner, tree, path, output):
     args = ctx.actions.args()
-    if target_link_flags == None:
-        target_link_flags = linux_module_cc_helpers.target_flags(
-            ctx,
-            target.cc_toolchain,
-            target.feature_configuration,
-        )
-    args.add_all(target_link_flags)
-    args.add_all(linux_module_cc_helpers.linker_selection_flags(target.cc_toolchain))
-    args.add_all([
-        "-nostdlib",
-        "-r",
-        "-Wl,--build-id=sha1",
-        "-Wl,-z,noexecstack",
-    ])
-    args.add(module_lds, format = "-Wl,-T,%s")
-    args.add("-o")
-    args.add(out)
-    args.add(preliminary)
-    args.add(mod_object)
-    args.add(module_common)
-    path_mapped_run(
-        ctx.actions,
-        executable = target.linker,
-        inputs = depset(
-            [preliminary, mod_object, module_common, module_lds],
-            transitive = [target.cc_toolchain.all_files],
-        ),
-        outputs = [out],
+    args.add("-copy_tree_file")
+    _add_artifact_path(args, "-tree", tree)
+    args.add("-path", path)
+    _add_artifact_path(args, "-output", output)
+    ctx.actions.run(
+        executable = runner,
+        inputs = [tree],
+        outputs = [output],
         arguments = [args],
-        mnemonic = "LinuxModuleLink",
-        progress_message = "Linking Linux module %{label}",
-    )
-    return out
-
-def _sdk_target_inputs(sdk, direct = []):
-    return depset(
-        direct,
-        transitive = [
-            sdk.target.cc_toolchain.all_files,
-            sdk.config.files,
-            sdk.generated_headers.files,
-            sdk.source_tree,
-        ],
+        mnemonic = "LinuxExternalModuleFile",
+        progress_message = "Projecting external Linux module file %s" % path,
     )
 
-def _crate_root(ctx):
-    sources = ctx.files.srcs
-    if not sources:
-        fail("%s requires at least one Rust source" % ctx.label)
-    for source in sources:
-        if not source.basename.endswith(".rs"):
-            fail("%s accepts only Rust .rs sources, got %s" % (ctx.label, source.short_path))
-    if ctx.file.crate_root:
-        if ctx.file.crate_root not in sources:
-            fail("%s crate_root must also appear in srcs" % ctx.label)
-        return ctx.file.crate_root
-    if len(sources) != 1:
-        fail("%s has multiple Rust sources; set crate_root explicitly" % ctx.label)
-    return sources[0]
-
-def _crate_name(ctx):
-    name = ctx.label.name.replace("-", "_")
+def _module_name(ctx):
+    name = ctx.attr.module_name.replace("-", "_")
     if name[0] >= "0" and name[0] <= "9":
         name = "_" + name
     for character in name.elems():
@@ -90,859 +72,575 @@ def _crate_name(ctx):
             (character >= "0" and character <= "9") or
             character == "_"
         ):
-            fail("%s cannot be normalized to a Rust crate name" % ctx.label)
+            fail("%s cannot be normalized to a Linux module name" % ctx.label)
     return name
 
-def _compile_external_rust(ctx, sdk, crate_root, crate_name):
-    rust = sdk.rust
-    raw = ctx.actions.declare_file(ctx.label.name + ".external/" + crate_name + ".o.raw")
-    args = ctx.actions.args()
-    args.add("-cwd", ".")
-    env = dict(rust.rustc_env)
-    modfile = ctx.label.package + "/" + crate_name if ctx.label.package else crate_name
-    env["RUST_MODFILE"] = modfile
-    for name in sorted(env.keys()):
-        args.add("-env", name + "=" + env[name])
-    args.add("-env")
-    add_directory_arg(
-        args,
-        rust.objtree_anchor,
-        format = "OBJTREE={cwd}/%s",
-    )
-    args.add("--")
-    args.add(ctx.executable._rustcrun)
-    args.add("-probe")
-    args.add(rust.rustc_probe)
-    if rust.module_config_conditions:
-        args.add("-config")
-        args.add(sdk.config.config)
-        for condition in rust.module_config_conditions:
-            args.add("-config-condition", json.encode(condition))
-    for predicate in rust.module_version_predicates:
-        args.add("-predicate", json.encode(predicate))
-    args.add("--")
-    args.add(rust.rustc)
-    if rust.module_config_conditions:
-        index = rust.module_config_flag_index
-        if index < 0 or index > len(rust.module_flags):
-            fail("Rust module config condition insertion index is out of range")
-        _add_rust_sdk_flags(args, sdk, rust.module_flags[:index])
-        args.add(_RUST_CONFIG_FLAGS_MARKER)
-        _add_rust_sdk_flags(args, sdk, rust.module_flags[index:])
-    else:
-        _add_rust_sdk_flags(args, sdk, rust.module_flags)
-    args.add("--crate-name")
-    args.add(crate_name)
-    args.add("--out-dir")
-    add_directory_arg(args, directory_anchor(raw))
-    args.add(raw, format = "--emit=obj=%s")
-    args.add(crate_root)
-    path_mapped_run(
-        ctx.actions,
-        executable = ctx.executable._runincwd,
-        inputs = depset(
-            ctx.files.srcs + [rust.rustc_probe] + (
-                [sdk.config.config] if rust.module_config_conditions else []
-            ),
-            transitive = [rust.compile_inputs, rust.rustc_files],
-        ),
-        tools = [ctx.attr._rustcrun[DefaultInfo].files_to_run],
-        outputs = [raw],
-        arguments = [args],
-        mnemonic = "LinuxRustModuleCompile",
-        progress_message = "Compiling Rust-for-Linux module %{label}",
-    )
+def _validate_sdk_execution_context(ctx, sdk):
+    # External actions execute the SDK's exact probe runners, tool Files, argv,
+    # environments, and requirements directly. The module rule's matching
+    # toolchain types exist only to anchor map_directory to an execution
+    # platform, so exact platform identity is the compatibility contract;
+    # selecting a second runner or compiler here would make aliases and select-
+    # valued kernel dependencies configuration-dependent again.
+    target_execution_platform = linux_execution_platform_label(ctx.attr._target_execution_platform)
+    if sdk.target_execution_platform != target_execution_platform:
+        fail("%s target actions resolved execution platform %s, but the configured kernel SDK requires %s" % (
+            ctx.label,
+            target_execution_platform,
+            sdk.target_execution_platform,
+        ))
+    host_execution_platform = linux_execution_platform_label(ctx.attr._host_execution_platform)
+    if sdk.host_execution_platform != host_execution_platform:
+        fail("%s host actions resolved execution platform %s, but the configured kernel SDK requires %s" % (
+            ctx.label,
+            host_execution_platform,
+            sdk.host_execution_platform,
+        ))
+    if target_execution_platform != host_execution_platform:
+        fail("%s requires target and host tools on one execution platform for source-selected mixed-tool actions; got target %s and host %s" % (
+            ctx.label,
+            target_execution_platform,
+            host_execution_platform,
+        ))
 
-    out = ctx.actions.declare_file(ctx.label.name + ".external/" + crate_name + ".o")
-    return linux_module_actions.process_objtool(
-        ctx,
-        sdk.config,
-        rust.objtool,
-        raw,
-        out,
-        "module",
-        "LinuxRustModuleObjtool",
-        "Processing Rust-for-Linux module with objtool %{label}",
-    )
+def _canonical_source_path(ctx, file):
+    path = file.short_path
+    package_prefix = ctx.label.package + "/" if ctx.label.package else ""
+    if package_prefix and path.startswith(package_prefix):
+        path = path[len(package_prefix):]
+    elif path.startswith("../"):
+        path = "external/" + path[3:]
+    components = path.split("/")
+    if (
+        not path or
+        path.startswith("/") or
+        "\\" in path or
+        any([component in ["", ".", ".."] for component in components])
+    ):
+        fail("%s source %s has no canonical staged path" % (ctx.label, file))
+    return path
 
-def _external_c_arguments(ctx, sdk, source, module_name, output = None, preprocess = False, depfile = None):
-    args = ctx.actions.args()
-    linux_module_actions.add_target_c_flags(args, sdk.target_c_flags)
-    args.add_all(linux_module_cc_helpers.module_flags("m"))
-    args.add_all(linux_module_cc_helpers.object_name_flags(
-        module_name + ".o",
-        module_name + ".o",
-    ))
-    args.add_all(linux_module_actions.module_metadata_sanitizer_flags(
-        sdk.config,
-        sdk.target_c_flags.source_root,
-        sdk.version,
-    ))
-    add_directory_arg(args, directory_anchor(source), format = "-I%s")
-    args.add_all(ctx.attr.copts)
-    if preprocess:
-        args.add_all(["-E", "-D__GENKSYMS__"])
-    else:
-        if depfile != None:
-            args.add("-MD")
-            args.add("-MF")
-            args.add(depfile)
-        args.add("-c")
-    args.add(source)
-    if output != None:
-        args.add("-o")
-        args.add(output)
-    return args
+def _source_bindings(ctx):
+    bindings = []
+    owners = {}
+    for kind, files in [("source", ctx.files.srcs), ("header", ctx.files.hdrs)]:
+        for file in files:
+            path = _canonical_source_path(ctx, file)
+            if path in owners:
+                fail("%s stages both %s and %s as %s" % (ctx.label, owners[path], file, path))
+            owners[path] = file
+            bindings.append(struct(file = file, kind = kind, path = path))
+    return bindings
 
-def _compile_external_c(ctx, sdk, source, module_name):
-    raw = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o.raw")
-    depfile = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o.d")
-    path_mapped_run(
-        ctx.actions,
-        executable = sdk.target.compiler,
-        inputs = _sdk_target_inputs(sdk, ctx.files.srcs),
-        outputs = [raw, depfile],
-        arguments = [_external_c_arguments(
-            ctx,
-            sdk,
-            source,
-            module_name,
-            output = raw,
-            depfile = depfile,
-        )],
-        mnemonic = "LinuxCModuleCompile",
-        progress_message = "Compiling out-of-tree C Linux module %{label}",
-    )
-
-    out = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o")
-    out = linux_module_actions.process_objtool(
-        ctx,
-        sdk.config,
-        sdk.objtool,
-        raw,
-        out,
-        "module",
-        "LinuxCModuleObjtool",
-        "Processing out-of-tree C Linux module with objtool %{label}",
-    )
-    symversion_record = None
-    symversion_cmd = None
-    if sdk.config.config_flags.get("CONFIG_MODVERSIONS") == "y":
-        if linux_module_actions.version_at_least(sdk.version, 6, 18) and sdk.config.config_flags.get("CONFIG_GENKSYMS") != "y":
-            fail("%s requires CONFIG_GENKSYMS=y for symbol versions" % ctx.label)
-        if not sdk.genksyms:
-            fail("%s requires a configured genksyms tool for CONFIG_MODVERSIONS=y" % ctx.label)
-        cmd = ctx.actions.declare_file(
-            ctx.label.name + ".external/symversions/" + module_name + ".o.cmd",
-        )
-        runner_args = ctx.actions.args()
-        runner_args.add("-mode", "c")
-        llvm_nm = linux_module_cc_helpers.nm(sdk.target.cc_toolchain)
-        runner_args.add("-nm", llvm_nm)
-        runner_args.add("-object", raw)
-        runner_args.add("-compiler", sdk.target.compiler)
-        runner_args.add("-genksyms", sdk.genksyms)
-        runner_args.add("-out", cmd)
-        runner_args.add("-linux-version", sdk.version)
-        extra_inputs = []
-        if not linux_module_actions.version_at_least(sdk.version, 6, 18):
-            reference = ctx.actions.declare_file(
-                ctx.label.name + ".external/symversions/" + module_name + ".symref",
-            )
-            ctx.actions.write(reference, "")
-            runner_args.add("-reference", reference)
-            extra_inputs.append(reference)
-        runner_args.add("--")
-        path_mapped_run(
-            ctx.actions,
-            executable = ctx.executable._genksymsrun,
-            inputs = _sdk_target_inputs(sdk, ctx.files.srcs + [raw] + extra_inputs),
-            tools = [llvm_nm, sdk.genksyms],
-            outputs = [cmd],
-            arguments = [
-                runner_args,
-                _external_c_arguments(
-                    ctx,
-                    sdk,
-                    source,
-                    module_name,
-                    preprocess = True,
-                ),
-            ],
-            mnemonic = "LinuxGenksyms",
-            progress_message = "Generating external Linux module symbol versions %{label}",
-        )
-        symversion_record = struct(
-            cmd = cmd,
-            object = module_name + ".o",
-        )
-        symversion_cmd = cmd
-    source_cmd = ctx.actions.declare_file(
-        ctx.label.name + ".external/source_versions/." + module_name + ".o.cmd",
-    )
-    source_path = module_name + ".c"
-    source_args = ctx.actions.args()
-    source_args.add("-depfile", depfile)
-    source_args.add("-object", module_name + ".o")
-    source_args.add("-out", source_cmd)
-    source_args.add("-primary", source_path)
-    source_inputs = [depfile, source]
-    if symversion_cmd != None:
-        source_args.add("-symversions", symversion_cmd)
-        source_inputs.append(symversion_cmd)
-    source_args.add("-physical")
-    source_args.add(source)
-    source_args.add("-canonical", source_path)
-    path_mapped_run(
-        ctx.actions,
-        executable = ctx.executable._sourceversioncmd,
-        inputs = source_inputs,
-        outputs = [source_cmd],
-        arguments = [source_args],
-        mnemonic = "LinuxSourceVersionCmd",
-        progress_message = "Generating external Linux module source-version data %{label}",
-    )
-    return struct(
-        object = out,
-        source_version_record = struct(
-            cmd = source_cmd,
-            object = module_name + ".o",
-            path_files = [struct(file = source, path = source_path)],
-        ),
-        symversion_record = symversion_record,
-    )
-
-def _add_rust_sdk_flags(args, sdk, flags):
-    rust = sdk.rust
-    for flag in flags:
-        if rust.target_spec != None and rust.target_spec.path in flag:
-            args.add(
-                rust.target_spec,
-                format = flag.replace("%", "%%").replace(rust.target_spec.path, "%s"),
-            )
-        elif sdk.config.rustc_cfg.path in flag:
-            args.add(
-                sdk.config.rustc_cfg,
-                format = flag.replace("%", "%%").replace(sdk.config.rustc_cfg.path, "%s"),
-            )
-        elif rust.rust_dir in flag:
-            add_directory_arg(
-                args,
-                rust.rust_dir_anchor,
-                format = flag.replace("%", "%%").replace(rust.rust_dir, "%s"),
-            )
-        else:
-            args.add(flag)
-
-def _check_external_modinfo(ctx, preliminary, crate_name, allow_version = False):
-    checked = ctx.actions.declare_file(
-        ctx.label.name + ".external/" + crate_name + ".modinfo.checked",
-    )
-    check_args = ctx.actions.args()
-    check_args.add("-in", preliminary)
-    check_args.add("-out", checked)
-    if allow_version:
-        check_args.add("-allow-version")
-    path_mapped_run(
-        ctx.actions,
-        executable = ctx.executable._modulemodinfo,
-        inputs = [preliminary],
-        outputs = [checked],
-        arguments = [check_args],
-        mnemonic = "LinuxExternalModuleModinfoCheck",
-        progress_message = "Checking external Linux module metadata %{label}",
-    )
-    return checked
-
-def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check, source_version_record = None, symversion_record = None):
-    stage = ctx.label.name + ".external/modpost"
-    staged_object = ctx.actions.declare_file(stage + "/" + crate_name + ".o")
-    ctx.actions.symlink(output = staged_object, target_file = preliminary)
-    manifest = ctx.actions.declare_file(stage + "/" + crate_name + ".mod")
-    ctx.actions.write(manifest, crate_name + ".o\n")
-    source_version_inputs = []
-    if source_version_record != None:
-        staged_source_cmd = ctx.actions.declare_file(
-            stage + "/" + linux_module_actions.symversion_cmd_path(source_version_record.object),
-        )
-        ctx.actions.symlink(output = staged_source_cmd, target_file = source_version_record.cmd)
-        source_version_inputs.append(staged_source_cmd)
-        for path_file in source_version_record.path_files:
-            staged_source = ctx.actions.declare_file(stage + "/" + path_file.path)
-            ctx.actions.symlink(output = staged_source, target_file = path_file.file)
-            source_version_inputs.append(staged_source)
-    symversion_inputs = []
-    if sdk.config.config_flags.get("CONFIG_MODVERSIONS") == "y":
-        if symversion_record == None:
-            fail("%s requires C symbol-version records for CONFIG_MODVERSIONS=y" % ctx.label)
-        if source_version_record == None:
-            fail("%s requires combined source and symbol-version records for CONFIG_MODVERSIONS=y" % ctx.label)
-    modules_order = ctx.actions.declare_file(stage + "/modules.order")
-    ctx.actions.write(modules_order, crate_name + ".o\n")
-    kernel_symvers = ctx.actions.declare_file(stage + "/Kernel.symvers")
-    ctx.actions.symlink(output = kernel_symvers, target_file = sdk.module_symvers)
-
-    dep_symvers = []
-    for index, dep in enumerate(ctx.attr.deps):
-        info = dep[LinuxModuleInfo]
-        if info.kernel_key != sdk.kernel_key:
-            fail(
-                "%s dependency %s was built against a different configured kernel" %
-                (ctx.label, dep.label),
-            )
-        staged = ctx.actions.declare_file(stage + "/dependency_%d.symvers" % index)
-        ctx.actions.symlink(output = staged, target_file = info.module_symvers)
-        dep_symvers.append(staged)
-
-    mod_source = ctx.actions.declare_file(stage + "/" + crate_name + ".mod.c")
-    module_symvers = ctx.actions.declare_file(stage + "/Module.symvers")
-    args = ctx.actions.args()
-    args.add("-cwd")
-    add_directory_arg(args, directory_anchor(modules_order))
-    args.add("--")
-    args.add(sdk.modpost)
-    args.add_all(linux_module_actions.modpost_args(sdk.config))
-    args.add("-e")
-    args.add("-i")
-    args.add("Kernel.symvers")
-    for dep in dep_symvers:
-        args.add("-i")
-        args.add(dep.basename)
-    args.add("-o")
-    args.add("Module.symvers")
-    args.add("-T")
-    args.add("modules.order")
-    path_mapped_run(
-        ctx.actions,
-        executable = ctx.executable._runincwd,
-        inputs = [
-            staged_object,
-            manifest,
-            modules_order,
-            kernel_symvers,
-            modinfo_check,
-        ] + dep_symvers + source_version_inputs + symversion_inputs,
-        tools = [sdk.modpost],
-        outputs = [mod_source, module_symvers],
-        arguments = [args],
-        mnemonic = "LinuxExternalModpost",
-        progress_message = "Running Linux modpost for %{label}",
-    )
-    return mod_source, module_symvers
-
-def _compile_external_mod_source(ctx, sdk, source, crate_name):
-    out = ctx.actions.declare_file(ctx.label.name + ".external/" + crate_name + ".mod.o")
-    args = ctx.actions.args()
-    linux_module_actions.add_target_c_flags(args, sdk.target_c_flags)
-    args.add_all(linux_module_cc_helpers.module_flags("m"))
-    args.add_all(linux_module_cc_helpers.object_name_flags(
-        crate_name + ".mod.o",
-        crate_name + ".o",
-    ))
-    args.add_all(linux_module_actions.module_metadata_sanitizer_flags(
-        sdk.config,
-        sdk.target_c_flags.source_root,
-        sdk.version,
-    ))
-    args.add("-c")
-    args.add(source)
-    args.add("-o")
-    args.add(out)
-    path_mapped_run(
-        ctx.actions,
-        executable = sdk.target.compiler,
-        inputs = _sdk_target_inputs(sdk, [source]),
-        outputs = [out],
-        arguments = [args],
-        mnemonic = "LinuxExternalModuleMetadataCompile",
-        progress_message = "Compiling external Linux module metadata %{label}",
-    )
-    return out
-
-def _linux_module_impl(ctx):
-    sdk = ctx.attr.kernel[LinuxModuleSdkInfo]
-    if sdk.config.config_flags.get("CONFIG_MODULES") != "y":
-        fail("%s requires a kernel with CONFIG_MODULES=y" % ctx.label)
-    if sdk.config.config_flags.get("CONFIG_MODVERSIONS") == "y":
-        fail("%s does not support Rust modules with CONFIG_MODVERSIONS=y" % ctx.label)
-    if sdk.config.config_flags.get("CONFIG_MODULE_SRCVERSION_ALL") == "y":
-        fail("%s does not support Rust module source versions; use a C module or disable CONFIG_MODULE_SRCVERSION_ALL" % ctx.label)
-    if sdk.rust == None or not sdk.rust.enabled:
-        fail("%s requires a kernel with CONFIG_RUST=y" % ctx.label)
-    crate_root = _crate_root(ctx)
-    crate_name = _crate_name(ctx)
-    preliminary = _compile_external_rust(ctx, sdk, crate_root, crate_name)
-    modinfo_check = _check_external_modinfo(ctx, preliminary, crate_name)
-    mod_source, module_symvers = _external_modpost(
-        ctx,
-        sdk,
-        preliminary,
-        crate_name,
-        modinfo_check,
-    )
-    mod_object = _compile_external_mod_source(ctx, sdk, mod_source, crate_name)
-    linked = _link_module(
-        ctx,
-        sdk.target,
-        preliminary,
-        mod_object,
-        sdk.module_common,
-        sdk.module_lds,
-        crate_name + ".o",
-        target_link_flags = sdk.target_link_flags,
-    )
-    out = ctx.actions.declare_file(ctx.label.name + ".ko")
-    _btf_module(
-        ctx,
-        sdk.config,
-        sdk.vmlinux,
-        linked,
-        out,
-        sdk.version,
-        sdk.btf_tools,
-        external_module = True,
-    )
-    return [
-        DefaultInfo(files = depset([out])),
-        LinuxModuleInfo(
-            kernel_key = sdk.kernel_key,
-            ko = out,
-            module_symvers = module_symvers,
-        ),
-        OutputGroupInfo(module_symvers = depset([module_symvers])),
-    ]
-
-def _linux_cc_module_impl(ctx):
-    sdk = ctx.attr.kernel[LinuxModuleSdkInfo]
-    if sdk.config.config_flags.get("CONFIG_MODULES") != "y":
-        fail("%s requires a kernel with CONFIG_MODULES=y" % ctx.label)
+def _crate_root(ctx):
+    if ctx.attr.kind != "rust":
+        if ctx.file.crate_root != None:
+            fail("%s crate_root is valid only for a Rust module" % ctx.label)
+        return None
+    if not ctx.files.srcs:
+        fail("%s requires at least one Rust source" % ctx.label)
+    for source in ctx.files.srcs:
+        if not source.basename.endswith(".rs"):
+            fail("%s accepts only Rust .rs sources, got %s" % (ctx.label, source.short_path))
+    if ctx.file.crate_root != None:
+        if ctx.file.crate_root not in ctx.files.srcs:
+            fail("%s crate_root must also appear in srcs" % ctx.label)
+        return ctx.file.crate_root
     if len(ctx.files.srcs) != 1:
-        fail("%s requires exactly one C source" % ctx.label)
-    source = ctx.files.srcs[0]
-    module_name = _crate_name(ctx)
-    compiled = _compile_external_c(ctx, sdk, source, module_name)
-    preliminary = compiled.object
-    modinfo_check = _check_external_modinfo(ctx, preliminary, module_name, allow_version = True)
-    mod_source, module_symvers = _external_modpost(
-        ctx,
-        sdk,
-        preliminary,
-        module_name,
-        modinfo_check,
-        source_version_record = compiled.source_version_record,
-        symversion_record = compiled.symversion_record,
+        fail("%s has multiple Rust sources; set crate_root explicitly" % ctx.label)
+    return ctx.files.srcs[0]
+
+def _dirname(path):
+    return path.rsplit("/", 1)[0] if "/" in path else ""
+
+def _external_kbuild(ctx, module_name, bindings, crate_root, dependencies):
+    lines = ["obj-m += %s.o" % module_name]
+    planner_vars = {}
+    aliases = []
+    if ctx.attr.kind == "rust":
+        alias_path = module_name + ".rs"
+        aliases.append(struct(file = crate_root, path = alias_path))
+    else:
+        members = []
+        for binding in bindings:
+            if binding.kind != "source":
+                continue
+            member = binding.path[:-len(".c")] + ".o"
+            if member == module_name + ".o":
+                if len(ctx.files.srcs) != 1:
+                    fail("%s composite module source %s collides with its final object; rename the source" % (ctx.label, binding.file))
+                members = []
+                break
+            members.append(member)
+        if members:
+            lines.append("%s-y := %s" % (module_name, " ".join(members)))
+
+        include_dirs = {"": True}
+        for binding in bindings:
+            include_dirs[_dirname(binding.path)] = True
+        for directory in sorted(include_dirs):
+            suffix = "/" + directory if directory else ""
+            lines.append("ccflags-y += -I$(src)%s" % suffix)
+        flags = []
+        for value in ctx.attr.defines + ctx.attr.local_defines:
+            flags.append("-D" + value)
+        flags.extend(ctx.attr.copts)
+        for index, value in enumerate(flags):
+            variable = "LINUX_BZL_EXTERNAL_CFLAG_" + ("00000000" + str(index))[-8:]
+            lines.append("ccflags-y += $(%s)" % variable)
+            planner_vars[variable] = value
+
+    for index, _dependency in enumerate(dependencies):
+        lines.append("KBUILD_EXTRA_SYMBOLS += $(src)/.linux-bzl-dependencies/%08d.symvers" % index)
+    return "\n".join(lines) + "\n", planner_vars, aliases
+
+def _stage_external_source(ctx, module_name, bindings, crate_root, dependencies):
+    prefix = ".linux-bzl/external/" + module_name
+    kbuild, planner_vars, aliases = _external_kbuild(ctx, module_name, bindings, crate_root, dependencies)
+    kbuild_file = ctx.actions.declare_file(ctx.label.name + ".external.Kbuild")
+    ctx.actions.write(kbuild_file, kbuild)
+    staged = ctx.actions.declare_directory(ctx.label.name + ".external-source")
+    copies = {prefix + "/Kbuild": kbuild_file}
+    for binding in bindings:
+        copies[prefix + "/" + binding.path] = binding.file
+    for alias in aliases:
+        destination = prefix + "/" + alias.path
+        existing = copies.get(destination)
+        if existing != None and existing != alias.file:
+            fail("%s Rust crate-root alias %s collides with %s" % (ctx.label, alias.path, existing))
+        copies[destination] = alias.file
+    for index, dependency in enumerate(dependencies):
+        copies[prefix + "/.linux-bzl-dependencies/%08d.symvers" % index] = dependency.module_symvers
+
+    args = ctx.actions.args()
+    _add_artifact_path(args, "-tree_out", staged)
+    for destination in sorted(copies):
+        _add_artifact_path(args, "-copy", copies[destination], format = destination + "=%s")
+    ctx.actions.run(
+        executable = ctx.executable._actionfile,
+        inputs = depset(copies.values()),
+        outputs = [staged],
+        arguments = [args],
+        execution_requirements = {"supports-path-mapping": "1"},
+        mnemonic = "LinuxExternalModuleSources",
+        progress_message = "Staging declarative Kbuild module %{label}",
     )
-    mod_object = _compile_external_mod_source(ctx, sdk, mod_source, module_name)
-    linked = _link_module(
-        ctx,
-        sdk.target,
-        preliminary,
-        mod_object,
-        sdk.module_common,
-        sdk.module_lds,
-        module_name + ".o",
-        target_link_flags = sdk.target_link_flags,
-    )
-    out = ctx.actions.declare_file(ctx.label.name + ".ko")
-    _btf_module(
-        ctx,
+    return struct(prefix = prefix, tree = staged, planner_vars = planner_vars)
+
+def _source_prefix(sdk):
+    return sdk.source_root.short_path.rsplit("/", 1)[0] if "/" in sdk.source_root.short_path else ""
+
+def _planner_inputs(sdk, staged, extra = []):
+    direct = [
         sdk.config,
-        sdk.vmlinux,
-        linked,
-        out,
-        sdk.version,
-        sdk.btf_tools,
-        external_module = True,
+        sdk.host_deps,
+        sdk.host_kconfig_probe_results,
+        sdk.host_probe_results,
+        sdk.host_toolset_identity,
+        sdk.host_toolset_manifest,
+        sdk.kbuild,
+        sdk.sdk,
+        sdk.source_root,
+        sdk.target_probe_results,
+        sdk.target_kconfig_probe_results,
+        sdk.target_toolset_identity,
+        sdk.target_toolset_manifest,
+        staged.tree,
+    ] + extra
+    return depset(direct = direct, transitive = [sdk.source, sdk.rust_source_files])
+
+def _add_planner_contract_args(args, sdk, staged):
+    args.add("-root", sdk.source_root)
+    args.add("-srctree", sdk.source_root)
+    args.add("-kbuild", sdk.kbuild)
+    _add_artifact_path(args, "-resolve_config", sdk.config)
+    args.add("-kernel_version", sdk.version)
+    _add_artifact_path(args, "-target_toolset_identity", sdk.target_toolset_identity)
+    _add_artifact_path(args, "-host_toolset_identity", sdk.host_toolset_identity)
+    _add_artifact_path(args, "-target_toolset_manifest", sdk.target_toolset_manifest)
+    _add_artifact_path(args, "-host_toolset_manifest", sdk.host_toolset_manifest)
+    _add_artifact_path(args, "-target_probe_results", sdk.target_probe_results)
+    _add_artifact_path(args, "-host_probe_results", sdk.host_probe_results)
+    _add_artifact_path(args, "-host_kconfig_probe_results", sdk.host_kconfig_probe_results)
+    _add_artifact_path(args, "-target_kconfig_probe_results", sdk.target_kconfig_probe_results)
+    _add_artifact_path(args, "-object_root", sdk.sdk)
+    args.add("-object_namespace", "prep")
+    args.add("-selected_products_only")
+    args.add("-kbuild_target", "modules")
+    virtual_root = _SOURCE_TREE_SENTINEL + "/" + staged.prefix
+    _add_artifact_path(
+        args,
+        "-source_root_map",
+        staged.tree,
+        format = virtual_root + "=%s/" + staged.prefix,
     )
+    args.add("-source_namespace", virtual_root + "=external")
+    args.add("-kbuild_var", "M=" + virtual_root)
+    _add_artifact_path(args, "-source_root_map", sdk.host_deps, format = _HOST_DEPS_SENTINEL + "=%s")
+    args.add("-var", "LIBELF_FLAGS=" + " ".join(sdk.libelf_compile_flags))
+    args.add("-var", "LIBELF_LIBS=" + " ".join(sdk.libelf_link_flags))
+    for name, value in sdk.make_vars.items():
+        args.add("-var", name + "=" + value)
+    for name in sorted(staged.planner_vars):
+        args.add("-kbuild_var", name + "=" + staged.planner_vars[name])
+    if sdk.rust_source_root:
+        args.add("-var", "RUST_LIB_SRC=" + sdk.rust_source_root)
+        args.add("-source_root_map", sdk.rust_source_root + "=" + sdk.rust_source_root)
+
+def _probe_source_inputs(sdk):
+    inputs = {
+        "source_files": sdk.source,
+        "source_root": sdk.source_root,
+    }
+    if sdk.rust_source_root:
+        inputs["rust_source_files"] = sdk.rust_source_files
+    return inputs
+
+def _probe_input_directories(sdk, staged, plan, host_results = None, target = False):
+    inputs = {
+        _HOST_DEPS_TREE: sdk.host_deps,
+        "external": staged.tree,
+        "host_toolset_identity": sdk.host_toolset_identity,
+        "plan": plan,
+        "prep": sdk.sdk,
+    }
+    if host_results != None:
+        inputs["host_results"] = host_results
+    if target:
+        inputs["target_toolset_identity"] = sdk.target_toolset_identity
+    return inputs
+
+def _kbuild_probe_actions(ctx, sdk, staged):
+    plan = ctx.actions.declare_directory(ctx.label.name + ".external-kbuild-probe-plan")
+    host_results = ctx.actions.declare_directory(ctx.label.name + ".external-kbuild-probes-host")
+    target_results = ctx.actions.declare_directory(ctx.label.name + ".external-kbuild-probes-target")
+    args = ctx.actions.args()
+    _add_planner_contract_args(args, sdk, staged)
+    _add_artifact_path(args, "-kbuild_probe_plan_out", plan)
+    ctx.actions.run(
+        executable = ctx.executable._planner,
+        inputs = _planner_inputs(sdk, staged),
+        outputs = [plan],
+        arguments = [args],
+        execution_requirements = {"supports-path-mapping": "1"},
+        mnemonic = "LinuxExternalKbuildProbePlan",
+        progress_message = "Planning external module Kbuild capability discovery %{label}",
+    )
+
+    host_requirements = linux_toolset_execution_requirements(sdk.host_action_requirements, "external host probe")
+    target_requirements = linux_toolset_execution_requirements(sdk.target_action_requirements, "external target probe")
+    ctx.actions.map_directory(
+        implementation = expand_linux_probe_plan,
+        input_directories = _probe_input_directories(sdk, staged, plan),
+        additional_inputs = _probe_source_inputs(sdk),
+        output_directories = {"results": host_results},
+        tools = linux_probe_map_directory_tools(
+            sdk.host_probe_runner,
+            sdk.host_tool_files,
+            sdk.host_toolchain_files,
+            sdk.host_toolset_manifest,
+            sdk.host_companion_tools,
+        ),
+        additional_params = linux_probe_map_directory_params(
+            "host",
+            sdk.host_action_args,
+            sdk.host_action_environments,
+            source_prefix = _source_prefix(sdk),
+            rust_source_root = sdk.rust_source_root,
+        ),
+        env = {},
+        execution_requirements = dict(host_requirements, **{"supports-path-mapping": "1"}),
+        exec_group = "host_cc",
+        mnemonic = "LinuxExternalMappedHostKbuildProbe",
+    )
+    ctx.actions.map_directory(
+        implementation = expand_linux_probe_plan,
+        input_directories = _probe_input_directories(sdk, staged, plan, host_results = host_results, target = True),
+        additional_inputs = _probe_source_inputs(sdk),
+        output_directories = {"results": target_results},
+        tools = linux_probe_map_directory_tools(
+            sdk.target_probe_runner,
+            sdk.target_tool_files,
+            sdk.target_toolchain_files,
+            sdk.target_toolset_manifest,
+            sdk.target_companion_tools,
+        ),
+        additional_params = linux_probe_map_directory_params(
+            "target",
+            sdk.target_action_args,
+            sdk.target_action_environments,
+            source_prefix = _source_prefix(sdk),
+            rust_source_root = sdk.rust_source_root,
+        ),
+        env = {},
+        execution_requirements = dict(target_requirements, **{"supports-path-mapping": "1"}),
+        mnemonic = "LinuxExternalMappedTargetKbuildProbe",
+        toolchain = CC_TOOLCHAIN_TYPE,
+    )
+    return struct(plan = plan, host = host_results, target = target_results)
+
+def _external_action_plan(ctx, sdk, staged, probes):
+    plans = {
+        stage: ctx.actions.declare_directory(ctx.label.name + ".external-plan-v4-" + stage)
+        for stage in _PLAN_STAGES
+    }
+    args = ctx.actions.args()
+    _add_planner_contract_args(args, sdk, staged)
+    _add_artifact_path(args, "-host_kbuild_probe_results", probes.host)
+    _add_artifact_path(args, "-target_kbuild_probe_results", probes.target)
+    for stage in _PLAN_STAGES:
+        _add_artifact_path(
+            args,
+            "-action_plan_stage_out",
+            plans[stage],
+            format = stage + "=%s",
+        )
+    ctx.actions.run(
+        executable = ctx.executable._planner,
+        inputs = _planner_inputs(sdk, staged, extra = [probes.host, probes.target]),
+        outputs = [plans[stage] for stage in _PLAN_STAGES],
+        arguments = [args],
+        execution_requirements = {"supports-path-mapping": "1"},
+        mnemonic = "LinuxExternalModulePlan",
+        progress_message = "Planning external module through native Kbuild %{label}",
+    )
+    return plans
+
+def _map_external_plan(ctx, sdk, plans, staged):
+    trees = {
+        "prehost": ctx.actions.declare_directory(ctx.label.name + ".tree-prehost"),
+        "bootstrap": ctx.actions.declare_directory(ctx.label.name + ".tree-bootstrap"),
+        "host": ctx.actions.declare_directory(ctx.label.name + ".tree-host"),
+        "metadata": ctx.actions.declare_directory(ctx.label.name + ".tree-metadata"),
+        "modules": ctx.actions.declare_directory(ctx.label.name + ".tree-modules"),
+        "objects": ctx.actions.declare_directory(ctx.label.name + ".tree-objects"),
+        "prep": ctx.actions.declare_directory(ctx.label.name + ".tree-prep"),
+        "work_prehost": ctx.actions.declare_directory(ctx.label.name + ".tree-work-prehost"),
+        "work_bootstrap": ctx.actions.declare_directory(ctx.label.name + ".tree-work-bootstrap"),
+        "work_host": ctx.actions.declare_directory(ctx.label.name + ".tree-work-host"),
+        "work_prep": ctx.actions.declare_directory(ctx.label.name + ".tree-work-prep"),
+        "work_target": ctx.actions.declare_directory(ctx.label.name + ".tree-work-target"),
+    }
+    common_inputs = {
+        _HOST_DEPS_TREE: sdk.host_deps,
+        "external": staged.tree,
+        "host_toolset_identity": sdk.host_toolset_identity,
+        "prep_base": sdk.sdk,
+        "target_toolset_identity": sdk.target_toolset_identity,
+    }
+    additional_inputs = {
+        "auto_conf": sdk.auto_conf,
+        "auto_conf_cmd": sdk.auto_conf_cmd,
+        "autoconf": sdk.autoconf,
+        "kernel_release": sdk.kernel_release,
+        "resolved_config": sdk.config,
+        "rust_source_files": sdk.rust_source_files,
+        "rustc_cfg": sdk.rustc_cfg,
+        "source_files": sdk.source,
+        "source_root": sdk.source_root,
+    }
+    mapped_requirements = linux_merge_toolset_execution_requirements(
+        sdk.target_action_requirements,
+        sdk.host_action_requirements,
+        "external module",
+    )
+    mapped_requirements["supports-path-mapping"] = "1"
+
+    def mapped_tools(runner, scope):
+        return linux_map_directory_tools(
+            runner,
+            scope,
+            sdk.target_tool_files,
+            sdk.target_toolchain_files,
+            sdk.host_tool_files,
+            sdk.host_toolchain_files,
+            sdk.target_companion_tools,
+            sdk.host_companion_tools,
+        )
+
+    def mapped_params(stage, input_tree_aliases = {}, output_tree_bases = {}):
+        return linux_map_directory_params(
+            stage,
+            _source_prefix(sdk),
+            sdk.target_action_args,
+            sdk.target_action_environments,
+            sdk.host_action_args,
+            sdk.host_action_environments,
+            input_tree_aliases = input_tree_aliases,
+            output_tree_bases = output_tree_bases,
+        )
+
+    ctx.actions.map_directory(
+        implementation = expand_linux_plan_stage,
+        input_directories = dict(common_inputs, plan = plans["prehost"]),
+        additional_inputs = additional_inputs,
+        output_directories = {"prehost": trees["prehost"], "work": trees["work_prehost"]},
+        tools = mapped_tools(sdk.host_recipe_runner, "host"),
+        additional_params = mapped_params(
+            "prehost",
+            input_tree_aliases = {"prep": "prep_base"},
+        ),
+        env = {},
+        execution_requirements = mapped_requirements,
+        exec_group = "host_cc",
+        mnemonic = "LinuxExternalMappedPrehost",
+    )
+    ctx.actions.map_directory(
+        implementation = expand_linux_plan_stage,
+        input_directories = dict(common_inputs, plan = plans["bootstrap"], prehost = trees["prehost"]),
+        additional_inputs = additional_inputs,
+        output_directories = {"bootstrap": trees["bootstrap"], "work": trees["work_bootstrap"]},
+        tools = mapped_tools(sdk.target_recipe_runner, "target"),
+        additional_params = mapped_params(
+            "bootstrap",
+            input_tree_aliases = {"prep": "prep_base"},
+        ),
+        env = {},
+        execution_requirements = mapped_requirements,
+        mnemonic = "LinuxExternalMappedBootstrap",
+        toolchain = CC_TOOLCHAIN_TYPE,
+    )
+    ctx.actions.map_directory(
+        implementation = expand_linux_plan_stage,
+        input_directories = dict(common_inputs, plan = plans["host"], prehost = trees["prehost"], bootstrap = trees["bootstrap"]),
+        additional_inputs = additional_inputs,
+        output_directories = {"host": trees["host"], "work": trees["work_host"]},
+        tools = mapped_tools(sdk.host_recipe_runner, "host"),
+        additional_params = mapped_params(
+            "host",
+            input_tree_aliases = {"prep": "prep_base"},
+        ),
+        env = {},
+        execution_requirements = mapped_requirements,
+        exec_group = "host_cc",
+        mnemonic = "LinuxExternalMappedHost",
+    )
+    ctx.actions.map_directory(
+        implementation = expand_linux_plan_stage,
+        input_directories = dict(common_inputs, plan = plans["prep"], prehost = trees["prehost"], bootstrap = trees["bootstrap"], host = trees["host"]),
+        additional_inputs = additional_inputs,
+        output_directories = {"prep": trees["prep"], "work": trees["work_prep"]},
+        tools = mapped_tools(sdk.target_recipe_runner, "target"),
+        additional_params = mapped_params(
+            "prep",
+            input_tree_aliases = {"prep": "prep_base"},
+            output_tree_bases = {"prep": "prep_base"},
+        ),
+        env = {},
+        execution_requirements = mapped_requirements,
+        mnemonic = "LinuxExternalMappedPrep",
+        toolchain = CC_TOOLCHAIN_TYPE,
+    )
+    target_inputs = {
+        key: value
+        for key, value in common_inputs.items()
+        if key != "prep_base"
+    }
+    target_inputs.update({
+        "plan": plans["target"],
+        "prehost": trees["prehost"],
+        "bootstrap": trees["bootstrap"],
+        "host": trees["host"],
+        "prep": trees["prep"],
+    })
+    ctx.actions.map_directory(
+        implementation = expand_linux_plan_stage,
+        input_directories = target_inputs,
+        additional_inputs = additional_inputs,
+        output_directories = dict({name: trees[name] for name in _EXTERNAL_TARGET_TREES}, work = trees["work_target"]),
+        tools = mapped_tools(sdk.target_recipe_runner, "target"),
+        additional_params = mapped_params("target"),
+        env = {},
+        execution_requirements = mapped_requirements,
+        mnemonic = "LinuxExternalMappedTarget",
+        toolchain = CC_TOOLCHAIN_TYPE,
+    )
+    return trees
+
+def _linux_external_module_impl(ctx):
+    sdk = ctx.attr.kernel[LinuxModuleSdkInfo]
+    validate_linux_module_make_vars(sdk.make_vars, "configured kernel %s" % ctx.attr.kernel.label)
+    _validate_sdk_execution_context(ctx, sdk)
+    module_name = _module_name(ctx)
+    if not ctx.files.srcs:
+        fail("%s requires at least one source" % ctx.label)
+    if ctx.attr.kind == "c":
+        for source in ctx.files.srcs:
+            if not source.basename.endswith(".c"):
+                fail("%s accepts only C .c sources, got %s" % (ctx.label, source.short_path))
+    crate_root = _crate_root(ctx)
+    dependencies = []
+    for dependency in ctx.attr.deps:
+        info = dependency[LinuxModuleInfo]
+        if info.kernel_key != sdk.kernel_key:
+            fail("%s dependency %s was built against a different configured kernel" % (ctx.label, dependency.label))
+        dependencies.append(info)
+
+    bindings = _source_bindings(ctx)
+    staged = _stage_external_source(ctx, module_name, bindings, crate_root, dependencies)
+    probes = _kbuild_probe_actions(ctx, sdk, staged)
+    plans = _external_action_plan(ctx, sdk, staged, probes)
+    trees = _map_external_plan(ctx, sdk, plans, staged)
+    ko = ctx.actions.declare_file(ctx.attr.output_basename + ".ko")
+    module_symvers = ctx.actions.declare_file(ctx.attr.output_basename + ".Module.symvers")
+    _copy_linux_tree_file(ctx, sdk.target_recipe_runner, trees["modules"], staged.prefix + "/" + module_name + ".ko", ko)
+    _copy_linux_tree_file(ctx, sdk.target_recipe_runner, trees["metadata"], staged.prefix + "/Module.symvers", module_symvers)
     return [
-        DefaultInfo(files = depset([out])),
+        DefaultInfo(files = depset([ko])),
         LinuxModuleInfo(
             kernel_key = sdk.kernel_key,
-            ko = out,
             module_symvers = module_symvers,
-        ),
-        OutputGroupInfo(module_symvers = depset([module_symvers])),
-    ]
-
-def _btf_module(ctx, config, vmlinux, linked, out, version, tools, external_module = False):
-    if config.config_flags.get("CONFIG_DEBUG_INFO_BTF_MODULES") != "y":
-        ctx.actions.symlink(output = out, target_file = linked)
-        return out
-    if not tools.pahole:
-        fail("%s enables CONFIG_DEBUG_INFO_BTF_MODULES and requires pahole" % ctx.label)
-    if not tools.resolve_btfids:
-        fail("%s enables CONFIG_DEBUG_INFO_BTF_MODULES and requires resolve_btfids_tool" % ctx.label)
-
-    encoded = ctx.actions.declare_file(out.basename + ".btf", sibling = out)
-    pahole_args = ctx.actions.args()
-    pahole_args.add("-input", linked)
-    pahole_args.add("-output", encoded)
-    pahole_args.add("-env")
-    pahole_args.add(tools.llvm_objcopy, format = "LLVM_OBJCOPY=%s")
-    pahole_args.add("--")
-    pahole_args.add(tools.pahole.executable)
-    pahole_args.add("-J")
-    pahole_args.add_all(linux_module_actions.pahole_flags(
-        config,
-        version,
-        external_module = external_module,
-    ))
-    pahole_args.add("--btf_base")
-    pahole_args.add(vmlinux)
-    pahole_args.add("{output}")
-    path_mapped_run(
-        ctx.actions,
-        executable = tools.btfmutate,
-        inputs = depset(
-            [linked, vmlinux],
-            transitive = [tools.objcopy_files],
-        ),
-        tools = [tools.pahole, tools.llvm_objcopy],
-        outputs = [encoded],
-        arguments = [pahole_args],
-        mnemonic = "LinuxModuleBTF",
-        progress_message = "Encoding Linux module BTF %{label}",
-    )
-
-    resolve_args = ctx.actions.args()
-    resolve_args.add("-input", encoded)
-    resolve_args.add("-output", out)
-    resolve_args.add("--")
-    resolve_args.add(tools.resolve_btfids.executable)
-    resolve_args.add("-b")
-    resolve_args.add(vmlinux)
-    resolve_args.add("{output}")
-    path_mapped_run(
-        ctx.actions,
-        executable = tools.btfmutate,
-        inputs = [encoded, vmlinux],
-        tools = [tools.resolve_btfids],
-        outputs = [out],
-        arguments = [resolve_args],
-        mnemonic = "LinuxModuleResolveBTFIDs",
-        progress_message = "Resolving Linux module BTF IDs %{label}",
-    )
-    return out
-
-def _empty_file(ctx, path):
-    out = ctx.actions.declare_file(ctx.label.name + ".sdk/" + path)
-    ctx.actions.write(out, "")
-    return out
-
-def _builtin_module_metadata(ctx, cc_toolchain, vmlinux):
-    raw = ctx.actions.declare_file(ctx.label.name + ".sdk/modules.builtin.modinfo.raw")
-    llvm_objcopy = linux_module_cc_helpers.objcopy(cc_toolchain)
-    objcopy_args = ctx.actions.args()
-    objcopy_args.add_all([
-        "-j",
-        ".modinfo",
-        "-O",
-        "binary",
-        vmlinux.vmlinux_unstripped,
-        raw,
-    ])
-    path_mapped_run(
-        ctx.actions,
-        executable = llvm_objcopy,
-        inputs = linux_module_cc_helpers.tool_inputs(cc_toolchain, [vmlinux.vmlinux_unstripped]),
-        outputs = [raw],
-        arguments = [objcopy_args],
-        mnemonic = "LinuxBuiltinModinfoExtract",
-        progress_message = "Extracting built-in Linux module metadata %{label}",
-    )
-
-    modules_builtin = ctx.actions.declare_file(ctx.label.name + ".sdk/modules.builtin")
-    modules_builtin_modinfo = ctx.actions.declare_file(ctx.label.name + ".sdk/modules.builtin.modinfo")
-    metadata_args = ctx.actions.args()
-    metadata_args.add("-input", raw)
-    metadata_args.add("-modinfo_out", modules_builtin_modinfo)
-    metadata_args.add("-modules_out", modules_builtin)
-    path_mapped_run(
-        ctx.actions,
-        executable = ctx.executable._builtinmodinfo,
-        inputs = [raw],
-        outputs = [modules_builtin, modules_builtin_modinfo],
-        arguments = [metadata_args],
-        mnemonic = "LinuxBuiltinModinfo",
-        progress_message = "Generating built-in Linux module metadata %{label}",
-    )
-    return modules_builtin, modules_builtin_modinfo
-
-def _linux_module_sdk_impl(ctx):
-    vmlinux = ctx.attr.vmlinux[LinuxVmlinuxInfo]
-    profile = linux_architecture_profile_for_arch(ctx.attr.arch)
-    if vmlinux.arch != profile.name or vmlinux.srcarch != profile.srcarch:
-        fail(
-            "%s declares Linux ARCH %s (profile %s, SRCARCH %s), but %s provides profile %s and SRCARCH %s" % (
-                ctx.label,
-                ctx.attr.arch,
-                profile.name,
-                profile.srcarch,
-                ctx.attr.vmlinux.label,
-                vmlinux.arch,
-                vmlinux.srcarch,
-            ),
-        )
-    modules = linux_module_actions.module_map(vmlinux.module_objects)
-    target = linux_module_actions.target_context(ctx, linux_module_cc_helpers)
-    target_c_flags = linux_module_actions.target_c_flags(
-        ctx,
-        linux_module_cc_helpers,
-        vmlinux,
-        target,
-    )
-    target_link_flags = linux_module_actions.target_link_flags(
-        ctx,
-        linux_module_cc_helpers,
-        target,
-    )
-
-    modules_builtin, modules_builtin_modinfo = _builtin_module_metadata(ctx, target.cc_toolchain, vmlinux)
-    ko_files = []
-    btf_tools = struct(
-        btfmutate = ctx.attr._btfmutate[DefaultInfo].files_to_run,
-        llvm_objcopy = linux_module_cc_helpers.objcopy(target.cc_toolchain),
-        objcopy_files = target.cc_toolchain.all_files,
-        pahole = ctx.attr.pahole[DefaultInfo].files_to_run if ctx.attr.pahole else None,
-        resolve_btfids = ctx.attr.resolve_btfids_tool[DefaultInfo].files_to_run if ctx.attr.resolve_btfids_tool else None,
-    )
-
-    modules_enabled = vmlinux.config.config_flags.get("CONFIG_MODULES") == "y"
-    if modules and not modules_enabled:
-        fail("%s has configured module objects but CONFIG_MODULES is disabled" % ctx.label)
-    if modules_enabled:
-        for field in [
-            "module_common",
-            "module_lds",
-            "module_symvers",
-            "modules_order",
-            "modpost",
-        ]:
-            if getattr(vmlinux, field) == None:
-                fail("%s is missing prepared module field %s" % (ctx.label, field))
-
-        module_common = vmlinux.module_common
-        module_lds = vmlinux.module_lds
-        module_symvers = vmlinux.module_symvers
-        modules_order = vmlinux.modules_order
-        modpost = vmlinux.modpost
-
-        for info in vmlinux.module_objects:
-            path = info.object
-            mod_source = vmlinux.module_sources.get(path)
-            if mod_source == None:
-                fail("%s is missing modpost source for module %s" % (ctx.label, path))
-            mod_object = ctx.actions.declare_file(
-                ctx.label.name + ".modules/" + path[:-len(".o")] + ".mod.o",
-            )
-            linux_module_actions.compile_module_c(
-                ctx,
-                linux_module_cc_helpers,
-                vmlinux,
-                target,
-                mod_source,
-                mod_object,
-                path[:-len(".o")] + ".mod.o",
-                path,
-                ctx.attr.version,
-            )
-            linked = _link_module(
-                ctx,
-                target,
-                vmlinux.module_outputs[path],
-                mod_object,
-                module_common,
-                module_lds,
-                path,
-            )
-            out = ctx.actions.declare_file(ctx.label.name + ".modules/" + path[:-len(".o")] + ".ko")
-            ko_files.append(_btf_module(
-                ctx,
-                vmlinux.config,
-                vmlinux.vmlinux,
-                linked,
-                out,
-                ctx.attr.version,
-                btf_tools,
-            ))
-    else:
-        modules_order = _empty_file(ctx, "modules.order")
-        module_symvers = _empty_file(ctx, "Module.symvers")
-        module_common = _empty_file(ctx, ".module-common.o")
-        module_lds = _empty_file(ctx, "scripts/module.lds")
-        modpost = _empty_file(ctx, "scripts/mod/modpost")
-
-    all_outputs = depset(
-        ko_files + [
-            module_symvers,
-            modules_order,
-            modules_builtin,
-            modules_builtin_modinfo,
-        ],
-    )
-    return [
-        DefaultInfo(files = all_outputs),
-        LinuxModuleSdkInfo(
-            arch = vmlinux.arch,
-            btf_tools = btf_tools,
-            config = vmlinux.config,
-            generated_headers = vmlinux.generated_headers,
-            genksyms = vmlinux.genksyms,
-            kernel_key = str(ctx.label),
-            kernel_release = vmlinux.config.kernel_release,
-            module_common = module_common,
-            module_lds = module_lds,
-            module_symvers = module_symvers,
-            modules = depset(ko_files),
-            modules_builtin = modules_builtin,
-            modules_builtin_modinfo = modules_builtin_modinfo,
-            modules_order = modules_order,
-            modpost = modpost,
-            objtool = ctx.executable.objtool,
-            source_root = vmlinux.source_root,
-            source_tree = vmlinux.source_tree,
-            srcarch = vmlinux.srcarch,
-            rust = vmlinux.rust,
-            target = target,
-            target_c_flags = target_c_flags,
-            target_link_flags = target_link_flags,
-            version = ctx.attr.version,
-            vmlinux = vmlinux.vmlinux,
-            vmlinux_object = vmlinux.vmlinux_object,
         ),
         OutputGroupInfo(
+            kbuild_probes = depset([probes.plan, probes.host, probes.target]),
             module_symvers = depset([module_symvers]),
-            modules = depset(ko_files),
-            modules_builtin = depset([modules_builtin]),
-            modules_builtin_modinfo = depset([modules_builtin_modinfo]),
-            modules_order = depset([modules_order]),
+            modules = depset([trees["modules"]]),
+            objects = depset([trees["objects"]]),
+            plan = depset([plans[stage] for stage in _PLAN_STAGES]),
         ),
     ]
 
-linux_module_sdk = rule(
-    implementation = _linux_module_sdk_impl,
-    attrs = {
-        "arch": attr.string(
-            mandatory = True,
-            values = linux_arch_values(),
-        ),
-        "objtool": attr.label(
-            cfg = "exec",
-            executable = True,
-        ),
-        "pahole": attr.label(
-            cfg = "exec",
-            executable = True,
-        ),
-        "resolve_btfids_tool": attr.label(
-            cfg = "exec",
-            executable = True,
-        ),
-        "version": attr.string(mandatory = True),
-        "vmlinux": attr.label(
-            mandatory = True,
-            providers = [LinuxVmlinuxInfo],
-        ),
-        "_btfmutate": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/btfmutate"),
-            executable = True,
-        ),
-        "_builtinmodinfo": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/builtinmodinfo"),
-            executable = True,
-        ),
-    },
-    fragments = ["cpp"],
-    toolchains = use_cc_toolchain(),
-    doc = "Finalizes configured in-tree modules and exposes the private module SDK.",
-)
-
-_linux_module = rule(
-    implementation = _linux_module_impl,
-    attrs = {
-        "crate_root": attr.label(
-            allow_single_file = [".rs"],
-        ),
-        "deps": attr.label_list(
-            providers = [LinuxModuleInfo],
-        ),
-        "kernel": attr.label(
-            mandatory = True,
-            providers = [LinuxModuleSdkInfo],
-        ),
-        "srcs": attr.label_list(
-            allow_files = [".rs"],
-            mandatory = True,
-        ),
-        "_objtoolrun": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/objtoolrun"),
-            executable = True,
-        ),
-        "_modulemodinfo": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/modulemodinfo"),
-            executable = True,
-        ),
-        "_runincwd": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/runincwd"),
-            executable = True,
-        ),
-        "_rustcrun": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/rustcrun"),
-            executable = True,
-        ),
-    },
-    doc = "Builds one out-of-tree Rust-for-Linux loadable module.",
-)
-
-_linux_cc_module = rule(
-    implementation = _linux_cc_module_impl,
+_linux_external_module = rule(
+    implementation = _linux_external_module_impl,
     attrs = {
         "copts": attr.string_list(),
-        "deps": attr.label_list(
-            providers = [LinuxModuleInfo],
-        ),
-        "kernel": attr.label(
-            mandatory = True,
-            providers = [LinuxModuleSdkInfo],
-        ),
-        "srcs": attr.label_list(
-            allow_files = [".c"],
-            mandatory = True,
-        ),
-        "_modulemodinfo": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/modulemodinfo"),
-            executable = True,
-        ),
-        "_genksymsrun": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/genksymsrun"),
-            executable = True,
-        ),
-        "_objtoolrun": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/objtoolrun"),
-            executable = True,
-        ),
-        "_runincwd": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/runincwd"),
-            executable = True,
-        ),
-        "_sourceversioncmd": attr.label(
-            cfg = "exec",
-            default = Label("//internal/cmd/sourceversioncmd"),
-            executable = True,
-        ),
+        "crate_root": attr.label(allow_single_file = [".rs"]),
+        "defines": attr.string_list(),
+        "deps": attr.label_list(providers = [LinuxModuleInfo]),
+        "hdrs": attr.label_list(allow_files = True),
+        "kernel": attr.label(mandatory = True, providers = [LinuxModuleSdkInfo]),
+        "kind": attr.string(mandatory = True, values = ["c", "rust"]),
+        "local_defines": attr.string_list(),
+        "module_name": attr.string(mandatory = True),
+        "output_basename": attr.string(mandatory = True),
+        "srcs": attr.label_list(allow_files = True, mandatory = True),
+        "_actionfile": attr.label(cfg = "exec", default = Label("//internal/cmd/actionfile"), executable = True),
+        "_host_execution_platform": linux_execution_platform_attr(exec_group = "host_cc"),
+        "_planner": attr.label(cfg = "exec", default = Label("//internal/cmd/kconfig_parse:kconfig_parse"), executable = True),
+        "_target_execution_platform": linux_execution_platform_attr(),
     },
-    doc = "Builds one out-of-tree C Linux loadable module.",
+    exec_groups = {"host_cc": exec_group(toolchains = use_cc_toolchain() + [
+        BISON_TOOLCHAIN_TYPE,
+        optional_bindgen_toolchain_type(),
+        FLEX_TOOLCHAIN_TYPE,
+        M4_TOOLCHAIN_TYPE,
+        optional_rust_analyzer_toolchain_type(),
+        optional_rust_toolchain_type(),
+        _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE,
+        SCRIPT_RUNTIME_TOOLCHAIN_TYPE,
+    ])},
+    toolchains = use_cc_toolchain() + [optional_rust_toolchain_type(), _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE, SCRIPT_RUNTIME_TOOLCHAIN_TYPE],
+    doc = "Builds one external module through the configured kernel's generic Kbuild planner.",
 )
+
+def _linux_external_module_targets(name, kernel, **kwargs):
+    _linux_external_module(
+        name = name,
+        kernel = kernel,
+        module_name = name,
+        output_basename = name,
+        **kwargs
+    )
 
 def linux_module(
         name,
@@ -951,16 +649,13 @@ def linux_module(
         crate_root = None,
         deps = [],
         **kwargs):
-    """Builds a Rust-for-Linux module on the supported Linux executor."""
-    _linux_module(
+    """Builds one Rust-for-Linux module through native Kbuild."""
+    _linux_external_module_targets(
         name = name,
         crate_root = crate_root,
         deps = deps,
-        exec_compatible_with = [
-            Label("@platforms//cpu:x86_64"),
-            Label("@platforms//os:linux"),
-        ],
         kernel = kernel,
+        kind = "rust",
         srcs = srcs,
         **kwargs
     )
@@ -971,17 +666,20 @@ def linux_cc_module(
         srcs,
         copts = [],
         deps = [],
+        hdrs = [],
+        defines = [],
+        local_defines = [],
         **kwargs):
-    """Builds one out-of-tree C Linux module on the supported Linux executor."""
-    _linux_cc_module(
+    """Builds one C Linux module through native Kbuild."""
+    _linux_external_module_targets(
         name = name,
         copts = copts,
+        defines = defines,
         deps = deps,
-        exec_compatible_with = [
-            Label("@platforms//cpu:x86_64"),
-            Label("@platforms//os:linux"),
-        ],
+        hdrs = hdrs,
         kernel = kernel,
+        kind = "c",
+        local_defines = local_defines,
         srcs = srcs,
         **kwargs
     )

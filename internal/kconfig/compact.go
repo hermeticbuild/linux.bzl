@@ -3,3857 +3,1321 @@ package kconfig
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"sort"
-	"strconv"
 	"strings"
-
-	"github.com/hermeticbuild/linux.bzl/internal/kconfig/buildgen"
 )
 
-type NamedConfig struct {
-	Name        string
-	Flags       map[string]string
-	AllNoConfig bool
-}
-
 type CompactMetadata struct {
-	Schema                  string                         `json:"schema,omitempty"`
-	Target                  *CompactTarget                 `json:"target,omitempty"`
-	Configs                 []CompactConfig                `json:"configs"`
-	ConfigPayloads          []CompactConfigPayload         `json:"config_payloads"`
-	CompileEnvironments     []CompactCompileEnvironment    `json:"compile_environments"`
-	GeneratedHeaderFamilies []CompactGeneratedHeaderFamily `json:"generated_header_families"`
-	SourceFiles             []CompactSourceInput           `json:"source_files"`
-	SourceInputGroups       []string                       `json:"source_input_groups"`
-	ActionGroups            []CompactActionGroup           `json:"action_groups"`
-	ObjectVariants          []CompactObjectVariant         `json:"object_variants"`
-}
-
-// CompactTarget binds a generated graph to the platform-selected architecture
-// and to the exact compiler identity used for capability probes.
-type CompactTarget struct {
-	Profile       string `json:"profile"`
-	LinuxArch     string `json:"linux_arch"`
-	Srcarch       string `json:"srcarch"`
-	UTSMachine    string `json:"uts_machine"`
-	TargetTriple  string `json:"target_triple"`
-	ProbeIdentity string `json:"probe_identity"`
+	Config                  CompactConfig
+	configFragment          map[string]string
+	sourceNamespaces        map[string]string
+	sourceNamespacePrefixes map[string]string
+	exactSourceNamespaces   map[string]string
+	exactSourcePaths        map[string]string
+	sourceNamespaceIndexErr error
+	sourceNamespaceIndexed  bool
+	actionRoles             []KbuildActionRoleRef
+	preconfiguredObjectTree bool
+	selectedProductsOnly    bool
 }
 
 type CompactConfig struct {
-	Name                string   `json:"name"`
-	ConfigPayload       string   `json:"config_payload,omitempty"`
-	ObjectTargets       []string `json:"object_targets"`
-	ModuleObjectTargets []string `json:"module_object_targets,omitempty"`
-	imageTarget         string
+	KbuildProfiles                  []CompactKbuildProfile
+	KbuildSelections                []CompactKbuildSelection
+	KbuildDeferredContentSelections []KbuildDeferredContentSelection
+	imageTarget                     string
 }
 
-type CompactSourceInput struct {
-	Path   string `json:"path"`
-	Digest string `json:"digest"`
+// CompactKbuildSelection records one materialized target in the exact Make
+// invocation that selected it. Profile names are diagnostic identities; rule
+// lowering uses this provenance instead of manufacturing cloned target views.
+type CompactKbuildSelection struct {
+	Profile string
+	Target  string
+	// MakeTarget preserves the concrete lexical filename GNU Make used while
+	// matching declarations for Target. It may contain parent traversals which
+	// disappear from the canonical graph identity in Target. It is mandatory;
+	// callers without a distinct lexical spelling must provide Target explicitly.
+	MakeTarget string
+	// GroupedTrigger names the first-reached logical output which caused one
+	// GNU Make grouped recipe to execute. It is empty for ordinary actions and
+	// identical across every selected peer of one physical grouped producer.
+	// Lowering retains this target as the automatic-variable context even when a
+	// different peer sorts first lexically.
+	GroupedTrigger string
+	// UsesInitialObjectTree is derived from the exact evaluated recipe. It
+	// preserves whether this action consumes its invocation's initial visible
+	// artifact frontier through materialization ordering and final lowering.
+	UsesInitialObjectTree bool
+	// InitialObjectTreeArtifacts is the canonical comparable encoding of the
+	// invocation's exact visible-artifact frontier subset reachable through
+	// source-derived object-tree references in this action. Every record retains
+	// its source-proven producer profile and target; a pathname alone is never
+	// used to rediscover ownership later.
+	InitialObjectTreeArtifacts string
+	// GeneratedObjectTreeArtifacts encodes exact selected producers referenced
+	// by immutable source text but not exported through the invocation's initial
+	// frontier. Each record is bound by profile+target provenance before
+	// lowering; it is never resolved through a global path-only guess.
+	GeneratedObjectTreeArtifacts string
+	// Lifecycle records when the source Make graph demands this target. It is
+	// independent from Stage: a prepare prerequisite can itself be a host
+	// action, in which case Lifecycle is "prep" while Stage is "host".
+	Lifecycle string
+	// Scope is the compiler/tool contract selected from source-time action-role
+	// provenance. It is always target or host and is deliberately independent
+	// from the prep/target lifecycle.
+	Scope string
+	// Stage is the physical action-plan stage selected from compiler-action
+	// provenance. Initial host actions required by a bootstrap closure use
+	// prehost; target actions required by a host closure use bootstrap; later
+	// host-scoped actions use host; remaining target-scoped actions use prep or
+	// target according to Lifecycle.
+	Stage string
+	// DeferredContentQueries is the canonical encoding of first-class query
+	// effects consumed by this action. The query owns its scope, stage, and
+	// object-tree frontier; the consumer retains only this explicit value edge.
+	DeferredContentQueries string
 }
 
-type CompactConfigPayload struct {
-	ID       string `json:"id"`
-	Content  string `json:"content"`
-	fragment map[string]string
+func normalizeCompactKbuildSelectionMakeTargets(
+	profiles []CompactKbuildProfile,
+	selections []CompactKbuildSelection,
+) ([]CompactKbuildSelection, error) {
+	profilesByName := make(map[string]CompactKbuildProfile, len(profiles))
+	for _, profile := range profiles {
+		profilesByName[profile.Name] = profile
+	}
+	out := append([]CompactKbuildSelection(nil), selections...)
+	for index := range out {
+		profile, ok := profilesByName[out[index].Profile]
+		if !ok {
+			return nil, fmt.Errorf("Kbuild selection references missing profile %q", out[index].Profile)
+		}
+		normalized, err := normalizeCompactKbuildSelectionMakeTarget(profile, out[index])
+		if err != nil {
+			return nil, err
+		}
+		out[index] = normalized
+	}
+	return out, nil
 }
 
-type CompactCompileEnvironment struct {
-	ID                      string   `json:"id"`
-	ABI                     string   `json:"abi"`
-	ConfigPayload           string   `json:"config_payload"`
-	GeneratedHeaderFamilies []string `json:"generated_header_families,omitempty"`
+// normalizeCompactKbuildSelectionMakeTarget validates one lexical target
+// against its already-resolved profile. Keeping this operation separate from
+// the slice-level profile lookup lets graph construction validate each
+// selection without rebuilding an all-profile index for every target.
+func normalizeCompactKbuildSelectionMakeTarget(
+	profile CompactKbuildProfile,
+	selection CompactKbuildSelection,
+) (CompactKbuildSelection, error) {
+	if selection.Profile != profile.Name {
+		return CompactKbuildSelection{}, fmt.Errorf(
+			"Kbuild selection references profile %q through resolved profile %q",
+			selection.Profile, profile.Name,
+		)
+	}
+	if selection.MakeTarget == "" {
+		return CompactKbuildSelection{}, fmt.Errorf(
+			"Kbuild selection %s target %q has empty lexical Make target",
+			selection.Profile, selection.Target,
+		)
+	}
+	if strings.TrimSpace(selection.MakeTarget) != selection.MakeTarget ||
+		filepath.IsAbs(filepath.FromSlash(selection.MakeTarget)) ||
+		strings.ContainsAny(selection.MakeTarget, "%$\x00\r\n") {
+		return CompactKbuildSelection{}, fmt.Errorf(
+			"Kbuild selection %s target %q has invalid lexical Make target %q",
+			selection.Profile, selection.Target, selection.MakeTarget,
+		)
+	}
+	if _, aliasesTarget := ResolveCompactKbuildMakeTarget(
+		profile, selection.Target, selection.MakeTarget,
+	); !aliasesTarget {
+		graphCanonical := CanonicalKbuildGraphTarget(selection.MakeTarget)
+		profileCanonical := CanonicalKbuildProfileTarget(profile, selection.MakeTarget)
+		return CompactKbuildSelection{}, fmt.Errorf(
+			"Kbuild selection %s lexical Make target %q resolves to root target %q and invocation target %q, want canonical target %q",
+			selection.Profile, selection.MakeTarget, graphCanonical, profileCanonical, selection.Target,
+		)
+	}
+	return selection, nil
 }
 
-type CompactGeneratedHeaderFamily struct {
-	ID               string   `json:"id"`
-	Name             string   `json:"name"`
-	ConfigPayload    string   `json:"config_payload"`
-	Labels           []string `json:"labels,omitempty"`
-	Srcarch          string   `json:"srcarch"`
-	Dependencies     []string `json:"dependencies,omitempty"`
-	SourceInputGroup int      `json:"source_input_group,omitempty"`
-	sourceInputs     []CompactSourceInput
+// EncodeCompactKbuildDeferredContentQueries returns a deterministic comparable
+// representation for the query-use edges of one materialized action.
+func EncodeCompactKbuildDeferredContentQueries(tokens []string) string {
+	if len(tokens) == 0 {
+		return ""
+	}
+	tokens = append([]string(nil), tokens...)
+	sort.Strings(tokens)
+	tokens = slices.Compact(tokens)
+	encoded, err := json.Marshal(tokens)
+	if err != nil {
+		panic(fmt.Sprintf("encode deferred Kbuild content queries: %v", err))
+	}
+	return string(encoded)
 }
 
-type CompactObjectVariant struct {
-	Target                   string `json:"target"`
-	ContentID                string `json:"content_id,omitempty"`
-	CompileEnvironment       string `json:"compile_environment,omitempty"`
-	Object                   string `json:"object"`
-	Source                   string `json:"source,omitempty"`
-	SourceInputGroup         int    `json:"source_input_group,omitempty"`
-	sourceInputs             []CompactSourceInput
-	Mode                     string   `json:"mode"`
-	ModuleRoot               bool     `json:"module_root,omitempty"`
-	ModName                  string   `json:"modname,omitempty"`
-	Flags                    []string `json:"flags,omitempty"`
-	RemoveFlags              []string `json:"remove_flags,omitempty"`
-	ObjtoolArgs              []string `json:"objtool_args,omitempty"`
-	ObjtoolDisabled          bool     `json:"objtool_disabled,omitempty"`
-	ObjtoolForce             bool     `json:"objtool_force,omitempty"`
-	Symversions              bool     `json:"symversions,omitempty"`
-	SymversionFlags          []string `json:"symversion_flags,omitempty"`
-	SymversionRemoveFlags    []string `json:"symversion_remove_flags,omitempty"`
-	configFragment           map[string]string
-	Deps                     []string `json:"deps,omitempty"`
-	Members                  []string `json:"members,omitempty"`
-	generatedHeaderFamilyIDs []string
+func compactKbuildSelectionDeferredContentQueries(selection CompactKbuildSelection) ([]string, error) {
+	if selection.DeferredContentQueries == "" {
+		return nil, nil
+	}
+	var tokens []string
+	if err := json.Unmarshal([]byte(selection.DeferredContentQueries), &tokens); err != nil {
+		return nil, fmt.Errorf("decode deferred Kbuild content queries: %w", err)
+	}
+	if len(tokens) == 0 || EncodeCompactKbuildDeferredContentQueries(tokens) != selection.DeferredContentQueries {
+		return nil, fmt.Errorf("deferred Kbuild content query encoding is not canonical")
+	}
+	return tokens, nil
 }
 
-// CompactActionGroup is the lazy grouping layer over concrete compact objects.
-// Objects share one configured rule when their concrete action recipe and the
-// set of configs that can reach them are identical.
-type CompactActionGroup struct {
-	ID               string   `json:"id"`
-	RecipeID         string   `json:"recipe_id"`
-	ReachableConfigs []string `json:"reachable_configs"`
-	ObjectTargets    []string `json:"object_targets"`
+// CompactKbuildVisibleArtifact identifies the source-proven target boundary
+// which made one object-root-relative path visible to a recursive Make
+// invocation. A boundary implemented only by recursive $(MAKE) may forward
+// ownership to a selected descendant; both stage solving and final lowering
+// resolve that forwarding through TargetInvocationDependencies.
+type CompactKbuildVisibleArtifact struct {
+	Path    string
+	Profile string
+	Target  string
 }
 
-type CompactBuildFileOptions struct {
-	Arch               string
-	Version            string
-	Visibility         []string
-	RuleLoadLabel      string
-	BaseConfig         string
-	ObjectLabelPackage string
-	Exports            []string
-	SourceLabelPackage string
-	SourceASN1Compiler string
-	SourceGenksyms     string
-	SourceObjtool      string
-	SourceRelacheck    string
-	SourceRootLabel    string
-	Srcarch            string
+// EncodeCompactKbuildInitialObjectTreeArtifacts returns the deterministic,
+// comparable selection encoding of exact visible-artifact records. Empty input
+// uses the selection zero value. Callers do not need to pre-sort the subset.
+func EncodeCompactKbuildInitialObjectTreeArtifacts(artifacts []CompactKbuildVisibleArtifact) string {
+	if len(artifacts) == 0 {
+		return ""
+	}
+	canonical := append([]CompactKbuildVisibleArtifact(nil), artifacts...)
+	sort.Slice(canonical, func(i, j int) bool {
+		if canonical[i].Path != canonical[j].Path {
+			return canonical[i].Path < canonical[j].Path
+		}
+		if canonical[i].Profile != canonical[j].Profile {
+			return canonical[i].Profile < canonical[j].Profile
+		}
+		return canonical[i].Target < canonical[j].Target
+	})
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		// CompactKbuildVisibleArtifact contains only strings, so encoding cannot
+		// fail. Keep this API total because it is used while constructing a
+		// comparable selection identity.
+		panic(fmt.Sprintf("encode initial Kbuild object-tree artifacts: %v", err))
+	}
+	return string(encoded)
+}
+
+func compactKbuildSelectionInitialObjectTreeArtifacts(selection CompactKbuildSelection) ([]CompactKbuildVisibleArtifact, error) {
+	if selection.InitialObjectTreeArtifacts == "" {
+		return nil, nil
+	}
+	var artifacts []CompactKbuildVisibleArtifact
+	if err := json.Unmarshal([]byte(selection.InitialObjectTreeArtifacts), &artifacts); err != nil {
+		return nil, fmt.Errorf("decode initial object-tree artifacts: %w", err)
+	}
+	if len(artifacts) == 0 || EncodeCompactKbuildInitialObjectTreeArtifacts(artifacts) != selection.InitialObjectTreeArtifacts {
+		return nil, fmt.Errorf("initial object-tree artifact encoding is not canonical")
+	}
+	return artifacts, nil
+}
+
+func compactKbuildSelectionGeneratedObjectTreeArtifacts(selection CompactKbuildSelection) ([]CompactKbuildVisibleArtifact, error) {
+	if selection.GeneratedObjectTreeArtifacts == "" {
+		return nil, nil
+	}
+	var artifacts []CompactKbuildVisibleArtifact
+	if err := json.Unmarshal([]byte(selection.GeneratedObjectTreeArtifacts), &artifacts); err != nil {
+		return nil, fmt.Errorf("decode generated object-tree artifacts: %w", err)
+	}
+	if len(artifacts) == 0 || EncodeCompactKbuildInitialObjectTreeArtifacts(artifacts) != selection.GeneratedObjectTreeArtifacts {
+		return nil, fmt.Errorf("generated object-tree artifact encoding is not canonical")
+	}
+	return artifacts, nil
+}
+
+// CompactKbuildProfile binds one terminal, preparation, or host Kbuild
+// invocation to its source-derived evaluator. Consumers request only the
+// targets they need instead of serializing the invocation's variable state.
+type CompactKbuildProfile struct {
+	Name      string
+	Path      string
+	Directory string
+	// invocationLocation is the typed working directory of the concrete Make
+	// process which produced this profile. Directory above remains Kbuild's
+	// logical obj= scope; the two intentionally differ for drivers such as
+	// scripts/Makefile.build and for recursive make -C invocations.
+	invocationLocation    CompactKbuildInvocationLocation
+	invocationLocationSet bool
+	// initialVisibleArtifactView is immutable, process-local provenance. The
+	// selected action graph serializes only queried artifact subsets, never this
+	// backing representation.
+	initialVisibleArtifactView CompactKbuildInitialVisibleArtifactView
+	// InvocationPredecessors are the recursive Make invocations which must
+	// complete before this invocation starts. They are derived from the
+	// prerequisite and recipe order of the selected parent rule. The edge is
+	// execution provenance, not a guessed relationship between output names;
+	// lowering uses it to attribute demanded files written as side effects by
+	// an earlier source-owned recipe.
+	InvocationPredecessors []string
+	// TargetInvocationDependencies record recursive Make invocations selected
+	// while expanding one concrete target recipe, including invocations found
+	// inside an immutable source script executed by that recipe.  The child
+	// profile and goals come from the evaluated Make argv; action ordering never
+	// infers this edge from an output or script filename.
+	TargetInvocationDependencies []CompactKbuildInvocationDependency
+	// EntryTargets are the concrete goals requested from this Make invocation.
+	// They are derived from the selected parent rule/recipe, never from every
+	// target that happens to be declared in the parsed file.
+	EntryTargets    []string
+	Generated       []KbuildTarget
+	Rules           []KbuildRule
+	TargetVariables []KbuildTargetVariable
+	evaluator       *kbuildTargetEvaluator
+	// targetEvaluators retain the exact cumulative Make state in effect when a
+	// selected target's executable recipe was expanded. Linux mutates exported
+	// variables from prerequisite recipes with $(eval ...); using only the
+	// invocation's final evaluator would leak a later mutation backward into an
+	// earlier action in the same Make process. This map is process-local for the
+	// same reason as evaluator and deferredContentQueries.
+	targetEvaluators map[string]*kbuildTargetEvaluator
+	// probeEnvironmentActivation restores the exact exported process
+	// environment attached to this profile snapshot before one of its lazy Make
+	// evaluators performs a compiler or immutable-source probe. Control-effect
+	// snapshots and deferred-content query profiles use this fallback directly.
+	// The closure is process-local and is never serialized as graph policy.
+	probeEnvironmentActivation func() error
+	// targetProbeEnvironmentActivations retain the source-ordered, target-
+	// specific exported environments of executable recipe lines. Keep these
+	// separate from targetEvaluators: many targets can share one immutable Make
+	// evaluator generation while target-specific export assignments still give
+	// their subprocesses different environments.
+	targetProbeEnvironmentActivations map[string]func() error
+	// controlGeneration is the deterministic source-order control state of this
+	// profile snapshot. The targetRecipe* maps retain the corresponding state
+	// for executable target recipes so deferred recipe-side shell queries cannot
+	// be rebound to the invocation's final Make state. These fields are
+	// process-local execution provenance.
+	controlGeneration        uint64
+	targetControlGenerations map[string]uint64
+	targetRecipeEnvironments map[string]*compactKbuildEnvironmentSnapshot
+	targetRecipeShells       map[string]string
+	// groupedActions is the process-local, source-order authority for GNU Make
+	// grouped targets. Every logical output points at the same immutable record;
+	// the trigger is selected once by the DFS control walk and reused by recursive
+	// discovery, completion-frontier evaluation, selection, and lowering.
+	groupedActions map[string]*compactKbuildGroupedAction
+	// targetVariableScopes retains GNU Make's first-reached target-specific
+	// variable context for every selected target. Immutable linked frames keep
+	// long prerequisite chains linear in memory; later parents cannot replace a
+	// target's scope after it has started updating.
+	targetVariableScopes map[string]*compactKbuildTargetVariableScope
+	// deferredContentQueries is process-local execution provenance for opaque
+	// values introduced by selected recipe-side $(eval ... $(shell ...)). It is
+	// never serialized as policy; the query command and its exact producer edge
+	// are lowered into the content-addressed action plan in the same process.
+	deferredContentQueries map[string]KbuildDeferredContentQuery
+}
+
+type compactKbuildGroupedAction struct {
+	ruleIndex int
+	stem      string
+	trigger   string
+	outputs   []string
+}
+
+type compactKbuildTargetVariableScope struct {
+	parent    *compactKbuildTargetVariableScope
+	variables []KbuildTargetVariable
+}
+
+// BindCompactKbuildGroupedAction records one grouped recipe at the first target
+// reached by the source-order walk. internal/cmd/kconfig_parse is a separate Go
+// package, so these accessors form the narrow internal bridge while the stored
+// representation remains private and process-local.
+func BindCompactKbuildGroupedAction(
+	profile *CompactKbuildProfile,
+	ruleIndex int,
+	stem, trigger string,
+	outputs []string,
+) error {
+	if profile == nil || ruleIndex < 0 {
+		return fmt.Errorf("cannot bind grouped Kbuild action with invalid profile or rule index %d", ruleIndex)
+	}
+	trigger = compactKbuildGraphTargetPath(trigger)
+	if trigger == "" {
+		return fmt.Errorf("grouped Kbuild action has an empty trigger")
+	}
+	canonical := make([]string, 0, len(outputs))
+	seen := make(map[string]bool, len(outputs))
+	triggerFound := false
+	for _, output := range outputs {
+		output = compactKbuildGraphTargetPath(output)
+		if output == "" || seen[output] {
+			return fmt.Errorf("grouped Kbuild action has invalid or duplicate output %q", output)
+		}
+		seen[output] = true
+		triggerFound = triggerFound || output == trigger
+		canonical = append(canonical, output)
+	}
+	if len(canonical) < 2 || !triggerFound {
+		return fmt.Errorf("grouped Kbuild action trigger %q is not one of at least two outputs %q", trigger, canonical)
+	}
+	if profile.groupedActions == nil {
+		profile.groupedActions = map[string]*compactKbuildGroupedAction{}
+	}
+	var existing *compactKbuildGroupedAction
+	for _, output := range canonical {
+		previous := profile.groupedActions[output]
+		if previous == nil {
+			continue
+		}
+		if previous.ruleIndex != ruleIndex || previous.stem != stem || previous.trigger != trigger ||
+			!slices.Equal(previous.outputs, canonical) {
+			return fmt.Errorf("grouped Kbuild output %q has conflicting source-order identities", output)
+		}
+		if existing != nil && previous != existing {
+			return fmt.Errorf("grouped Kbuild outputs %q do not share one canonical action", canonical)
+		}
+		existing = previous
+	}
+	if existing != nil {
+		for _, output := range canonical {
+			if profile.groupedActions[output] != existing {
+				return fmt.Errorf("grouped Kbuild outputs %q are only partially bound", canonical)
+			}
+		}
+		return nil
+	}
+	action := &compactKbuildGroupedAction{
+		ruleIndex: ruleIndex,
+		stem:      stem,
+		trigger:   trigger,
+		outputs:   append([]string(nil), canonical...),
+	}
+	for _, output := range canonical {
+		profile.groupedActions[output] = action
+	}
+	return nil
+}
+
+// CompactKbuildGroupedActionForTarget returns the one DFS-selected physical
+// action for target. Returned outputs are cloned so callers cannot mutate the
+// canonical shared record.
+func CompactKbuildGroupedActionForTarget(
+	profile CompactKbuildProfile,
+	target string,
+) (ruleIndex int, stem, trigger string, outputs []string, ok bool) {
+	target = compactKbuildGraphTargetPath(target)
+	action := profile.groupedActions[target]
+	if action == nil {
+		return 0, "", "", nil, false
+	}
+	return action.ruleIndex, action.stem, action.trigger, append([]string(nil), action.outputs...), true
+}
+
+// EffectiveCompactKbuildRecipeRuleIndexes returns the recipe declarations GNU
+// Make executes for one already-selected target context. Ordinary colon and
+// grouped-colon declarations have one effective recipe (the last declaration
+// wins); double-colon declarations are independent and all execute.
+func EffectiveCompactKbuildRecipeRuleIndexes(
+	profile CompactKbuildProfile,
+	ruleIndexes []int,
+) ([]int, error) {
+	recipeIndexes := make([]int, 0, len(ruleIndexes))
+	separator := ""
+	seen := map[int]bool{}
+	for _, ruleIndex := range ruleIndexes {
+		if ruleIndex < 0 || ruleIndex >= len(profile.Rules) {
+			return nil, fmt.Errorf("selected Kbuild recipe has invalid rule index %d", ruleIndex)
+		}
+		if seen[ruleIndex] {
+			continue
+		}
+		seen[ruleIndex] = true
+		rule := profile.Rules[ruleIndex]
+		candidateSeparator := rule.Separator
+		if candidateSeparator == "" {
+			candidateSeparator = ":"
+		}
+		if separator == "" {
+			separator = candidateSeparator
+		} else if (separator == "::") != (candidateSeparator == "::") {
+			return nil, fmt.Errorf("selected Kbuild target mixes ordinary and double-colon declarations")
+		}
+		if len(rule.Recipe) != 0 {
+			recipeIndexes = append(recipeIndexes, ruleIndex)
+		}
+	}
+	if separator == "::" && len(ruleIndexes) > 1 {
+		for _, ruleIndex := range ruleIndexes {
+			rule := profile.Rules[ruleIndex]
+			if len(rule.Prerequisites) != 0 || len(rule.OrderOnly) != 0 {
+				return nil, fmt.Errorf(
+					"independent double-colon recipes with prerequisites require an interleaved prerequisite/recipe timeline",
+				)
+			}
+		}
+	}
+	if len(recipeIndexes) <= 1 || separator == "::" {
+		return recipeIndexes, nil
+	}
+	return recipeIndexes[len(recipeIndexes)-1:], nil
+}
+
+// ResolveCompactKbuildGroupedRule returns the concrete peer outputs of the
+// effective recipe selected for target. GNU &: rules are grouped, as are the
+// historical multi-target implicit colon rules used by Linux's yacc/lex rules.
+func ResolveCompactKbuildGroupedRule(
+	profile CompactKbuildProfile,
+	ruleIndexes []int,
+	target, stem string,
+) (ruleIndex int, outputs []string, grouped bool, err error) {
+	effective, err := EffectiveCompactKbuildRecipeRuleIndexes(profile, ruleIndexes)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	if len(effective) != 1 {
+		return 0, nil, false, nil
+	}
+	selectedRuleIndex := effective[0]
+	rule := profile.Rules[selectedRuleIndex]
+	if rule.Separator == "::" {
+		return 0, nil, false, nil
+	}
+	if !compactKbuildRuleHasGroupedOutputs(rule) {
+		return 0, nil, false, nil
+	}
+	target = compactKbuildGraphTargetPath(target)
+	seen := make(map[string]bool, len(rule.Targets))
+	for _, pattern := range rule.Targets {
+		peer := compactKbuildProfileTargetPath(profile, instantiateKbuildRulePattern(pattern, stem))
+		if peer == "" || strings.ContainsAny(peer, "%$") {
+			return 0, nil, false, fmt.Errorf("rule %d has non-concrete grouped output %q", selectedRuleIndex, peer)
+		}
+		if !seen[peer] {
+			seen[peer] = true
+			outputs = append(outputs, peer)
+		}
+	}
+	if !seen[target] {
+		return 0, nil, false, fmt.Errorf(
+			"rule %d grouped outputs %q do not contain selected target %q",
+			selectedRuleIndex, outputs, target,
+		)
+	}
+	if len(outputs) < 2 {
+		return 0, nil, false, nil
+	}
+	return selectedRuleIndex, outputs, true, nil
+}
+
+// CompactKbuildInvocationTree identifies which declared tree owns a Make
+// process's working directory. Relative compiler paths inherit this identity;
+// reducing it to a bare graph path would make source- and object-rooted -C
+// invocations indistinguishable.
+type CompactKbuildInvocationTree string
+
+const (
+	CompactKbuildInvocationSourceTree CompactKbuildInvocationTree = "source"
+	CompactKbuildInvocationObjectTree CompactKbuildInvocationTree = "object"
+)
+
+// CompactKbuildInvocationLocation is a canonical directory beneath one
+// declared invocation tree. The empty directory denotes that tree's root.
+type CompactKbuildInvocationLocation struct {
+	Tree      CompactKbuildInvocationTree
+	Directory string
+}
+
+type CompactKbuildInvocationDependency struct {
+	Target          string
+	Profile         string
+	Goals           []string
+	ReplayArguments []string
 }
 
 type CompactMetadataOptions struct {
-	ObjectDir             string
-	SourceRoot            string
-	SourceRoots           map[string]string
-	LibraryDirs           []string
-	CompileEnvironmentABI string
-	KernelVersion         string
-	// Srcarch selects architecture include roots while scanning source files for
-	// CONFIG_* dependencies.
-	Srcarch string
-	// CompilerFamily selects compiler-specific predefined branches while
-	// scanning source inputs. Empty preserves the legacy Clang graph.
-	CompilerFamily string
-	Target         *CompactTarget
+	// SourceNamespaces maps canonical source-path prefixes to ActionPlan source
+	// namespaces.  This keeps non-kernel inputs (for example a selected Rust
+	// source toolchain) distinct from files in the Linux source repository.
+	SourceNamespaces map[string]string
+	// ExactSourceNamespaces maps individual immutable source paths to their
+	// ActionPlan namespaces. Unlike SourceNamespaces, these entries never own
+	// descendants. Preconfigured object-tree indexing uses this form so an SDK
+	// file cannot accidentally become a source-tree prefix.
+	ExactSourceNamespaces map[string]string
+	// ActionRoles is the exact scoped role registry from the identity-bound
+	// target and host toolset manifests. Make values carry these refs from
+	// source parse time; this registry only rejects forged/reserved tokens.
+	ActionRoles []KbuildActionRoleRef
+	// PreconfiguredObjectTree treats resolved config and preparation artifacts
+	// as inputs from an existing object tree instead of producing them again.
+	PreconfiguredObjectTree bool
+	// SelectedProductsOnly retains the selected native graph and module
+	// products without requiring the kernel image/vmlinux facade.
+	SelectedProductsOnly bool
 }
 
-// CompactConfigGraph binds one resolved configuration to its Kbuild graph and
-// the Bazel target that produces that configuration's generated headers.
+// CompactConfigGraph binds one resolved configuration to its exact evaluated
+// Kbuild invocations and selected materialized targets.
 type CompactConfigGraph struct {
-	Kbuild                *KbuildFile
-	GeneratedHeadersLabel string
+	KbuildProfiles                  []CompactKbuildProfile
+	KbuildSelections                []CompactKbuildSelection
+	KbuildDeferredContentSelections []KbuildDeferredContentSelection
+	ImageTarget                     string
 }
 
-// CompactMetadataBatchWithOptions resolves and emits multiple config-specific
-// Kbuild graphs while sharing immutable source scanning work for the invocation.
-func (t *Tree) CompactMetadataBatchWithOptions(
-	configs []NamedConfig,
+func normalizeActionRoles(roles []KbuildActionRoleRef) ([]KbuildActionRoleRef, error) {
+	seen := map[KbuildActionRoleRef]bool{}
+	out := append([]KbuildActionRoleRef(nil), roles...)
+	for _, ref := range out {
+		if ref.Scope != "target" && ref.Scope != "host" {
+			return nil, fmt.Errorf("action role %q has invalid scope %q", ref.Role, ref.Scope)
+		}
+		if err := validatePlanName(ref.Scope+" action role", ref.Role); err != nil {
+			return nil, err
+		}
+		if seen[ref] {
+			return nil, fmt.Errorf("%s action role %q is repeated", ref.Scope, ref.Role)
+		}
+		seen[ref] = true
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Scope != out[j].Scope {
+			return out[i].Scope < out[j].Scope
+		}
+		return out[i].Role < out[j].Role
+	})
+	return out, nil
+}
+
+// CompactMetadataWithOptions resolves one configuration and the exact
+// source-derived Kbuild selections consumed by action lowering.
+func (t *Tree) CompactMetadataWithOptions(
+	flags map[string]string,
+	resolveOpts ResolveConfigOptions,
 	opts CompactMetadataOptions,
 	graphForConfig func(*ResolvedConfig) (CompactConfigGraph, error),
 ) (*CompactMetadata, error) {
 	if graphForConfig == nil {
-		return nil, fmt.Errorf("compact metadata config graph resolver must not be nil")
+		return nil, fmt.Errorf("action-plan config graph resolver must not be nil")
 	}
-	if strings.TrimSpace(opts.CompileEnvironmentABI) == "" {
-		return nil, fmt.Errorf("compact metadata requires a non-empty compile environment ABI")
-	}
-	if opts.SourceRoot == "" && len(opts.SourceRoots) == 0 {
-		return nil, fmt.Errorf("compact metadata requires a source root for exact input scanning")
-	}
-	variants := map[string]CompactObjectVariant{}
-	out := &CompactMetadata{}
-	if opts.Target != nil {
-		profile, err := LinuxTargetProfileByName(opts.Target.Profile)
-		if err != nil {
-			return nil, err
-		}
-		if err := profile.ValidateTargetIdentity(opts.Target.LinuxArch, opts.Target.TargetTriple); err != nil {
-			return nil, err
-		}
-		if opts.Target.Srcarch != profile.Srcarch || opts.Target.UTSMachine != profile.UTSMachine || opts.Target.ProbeIdentity == "" {
-			return nil, fmt.Errorf("compact metadata has incomplete or inconsistent target identity %#v", opts.Target)
-		}
-		copy := *opts.Target
-		out.Schema = "compact-v8-adaptive-content-graph"
-		out.Target = &copy
-	}
-	configPayloads := map[string]CompactConfigPayload{}
-	compileEnvironments := map[string]CompactCompileEnvironment{}
-	generatedHeaderFamilies := map[string]CompactGeneratedHeaderFamily{}
-	sourceInputInterner := newCompactSourceInputInterner()
-	seenConfigs := map[string]bool{}
-	seenImageTargets := map[string]string{}
-	sourceCache := newCompactSourceCache()
-	for _, named := range configs {
-		if named.Name == "" {
-			return nil, fmt.Errorf("compact config name must not be empty")
-		}
-		if seenConfigs[named.Name] {
-			return nil, fmt.Errorf("duplicate compact config name %q", named.Name)
-		}
-		seenConfigs[named.Name] = true
-
-		resolved, err := t.ResolveConfigWithOptions(named.Name, named.Flags, ResolveConfigOptions{
-			AllNoConfig: named.AllNoConfig,
-		})
-		if err != nil {
-			return nil, err
-		}
-		if opts.Target != nil {
-			profile, _ := LinuxTargetProfileByName(opts.Target.Profile)
-			if err := profile.ValidateResolvedArchitecture(resolved); err != nil {
-				return nil, fmt.Errorf("resolve config %q: %w", named.Name, err)
-			}
-		}
-		graph, err := graphForConfig(resolved)
-		if err != nil {
-			return nil, fmt.Errorf("resolve Kbuild for config %q: %w", named.Name, err)
-		}
-		if graph.Kbuild == nil {
-			return nil, fmt.Errorf("resolve Kbuild for config %q: nil Kbuild", named.Name)
-		}
-		if strings.TrimSpace(graph.GeneratedHeadersLabel) == "" {
-			return nil, fmt.Errorf("resolve Kbuild for config %q: generated headers label must not be empty", named.Name)
-		}
-		kb := graph.Kbuild
-		generatedHeadersLabel := graph.GeneratedHeadersLabel
-		scanner := newConfigSourceScannerWithCache(opts, sourceCache)
-		fullConfigPayload := newCompactConfigPayload(compactFullConfigFragment(resolved))
-		configPayloads[fullConfigPayload.ID] = fullConfigPayload
-		configHeaderFamilies := compactGeneratedHeaderFamilySet{}
-		footprints, err := generatedHeaderFamilyFootprints(resolved, opts, scanner)
-		if err != nil {
-			return nil, fmt.Errorf("derive generated headers for config %q: %w", named.Name, err)
-		}
-		for _, footprint := range footprints {
-			if _, ok := configHeaderFamilies[footprint.name]; ok {
-				return nil, fmt.Errorf(
-					"derive generated headers for config %q: duplicate family %q",
-					named.Name,
-					footprint.name,
-				)
-			}
-			dependencyIDs := make([]string, 0, len(footprint.dependencies))
-			for _, dependencyName := range footprint.dependencies {
-				dependency, ok := configHeaderFamilies[dependencyName]
-				if !ok {
-					return nil, fmt.Errorf(
-						"derive generated headers for config %q: family %q depends on unknown or later family %q",
-						named.Name,
-						footprint.name,
-						dependencyName,
-					)
-				}
-				dependencyIDs = append(dependencyIDs, dependency.ID)
-			}
-			payload := newCompactConfigPayload(footprint.fragment)
-			configPayloads[payload.ID] = payload
-			family := newCompactGeneratedHeaderFamily(
-				footprint.name,
-				payload.ID,
-				generatedHeadersLabel,
-				opts.Srcarch,
-				dependencyIDs,
-				footprint.sourceInputs,
-			)
-			family.SourceInputGroup, err = sourceInputInterner.intern(
-				family.sourceInputs,
-				fmt.Sprintf("generated header family %q", family.ID),
-			)
-			if err != nil {
-				return nil, err
-			}
-			family.sourceInputs = nil
-			if existing, ok := generatedHeaderFamilies[family.ID]; ok {
-				existing.Labels = appendUniqueStrings(existing.Labels, family.Labels...)
-				generatedHeaderFamilies[family.ID] = existing
-			} else {
-				generatedHeaderFamilies[family.ID] = family
-			}
-			configHeaderFamilies[family.Name] = family
-		}
-		imageTarget := sanitizeTargetName(named.Name) + "_image"
-		if existing := seenImageTargets[imageTarget]; existing != "" {
-			return nil, fmt.Errorf("compact config names %q and %q produce duplicate image target %q", existing, named.Name, imageTarget)
-		}
-		seenImageTargets[imageTarget] = named.Name
-
-		objects := kb.resolvedObjects(resolved)
-		resolvedVariants := compactVariantMemo{}
-		for _, object := range objects.all() {
-			if rustSDKOwnsObject(object.object) {
-				continue
-			}
-			variant, err := resolvedVariants.variantFor(
-				object.object,
-				resolved,
-				opts,
-				objects,
-				scanner,
-				configHeaderFamilies,
-			)
-			if err != nil {
-				return nil, err
-			}
-			variant.SourceInputGroup, err = sourceInputInterner.intern(
-				variant.sourceInputs,
-				fmt.Sprintf("object target %q", variant.Target),
-			)
-			if err != nil {
-				return nil, err
-			}
-			variant.sourceInputs = nil
-			resolvedVariants[object.object] = variant
-			if existing, ok := variants[variant.Target]; ok && !existing.equal(variant) {
-				return nil, fmt.Errorf("object variants %q and %q produce duplicate target %q", existing.Object, variant.Object, variant.Target)
-			}
-			variants[variant.Target] = variant
-			if variant.CompileEnvironment != "" {
-				payload := newCompactConfigPayload(variant.configFragment)
-				configPayloads[payload.ID] = payload
-				environment := newCompactCompileEnvironment(
-					opts.CompileEnvironmentABI,
-					payload.ID,
-					variant.generatedHeaderFamilyIDs,
-				)
-				if environment.ID != variant.CompileEnvironment {
-					return nil, fmt.Errorf(
-						"internal error: object %q compile environment is %q, want %q",
-						variant.Object,
-						variant.CompileEnvironment,
-						environment.ID,
-					)
-				}
-				compileEnvironments[environment.ID] = environment
-			}
-		}
-
-		variantsByTarget := map[string]CompactObjectVariant{}
-		for _, variant := range resolvedVariants {
-			variantsByTarget[variant.Target] = variant
-		}
-
-		targets := make([]string, 0, len(objects.roots))
-		moduleTargets := make([]string, 0, len(objects.roots))
-		appendRootTargets := func(roots []resolvedKbuildObject) error {
-			for _, object := range roots {
-				if rustSDKOwnsObject(object.object) {
-					continue
-				}
-				variant, ok := resolvedVariants[object.object]
-				if !ok {
-					return fmt.Errorf("internal error: missing resolved variant for %q", object.object)
-				}
-				switch variant.Mode {
-				case "y":
-					expanded, err := imageObjectTargetsForVariant(variant, variantsByTarget)
-					if err != nil {
-						return err
-					}
-					targets = append(targets, expanded...)
-				case "m":
-					moduleTargets = append(moduleTargets, variant.Target)
-				}
-			}
-			return nil
-		}
-		if err := appendRootTargets(objects.roots); err != nil {
-			return nil, err
-		}
-		if err := appendRootTargets(objects.orderedLibRoots(opts.LibraryDirs)); err != nil {
-			return nil, err
-		}
-		out.Configs = append(out.Configs, CompactConfig{
-			Name:                named.Name,
-			ConfigPayload:       fullConfigPayload.ID,
-			ObjectTargets:       targets,
-			ModuleObjectTargets: moduleTargets,
-			imageTarget:         imageTarget,
-		})
-	}
-
-	targets := make([]string, 0, len(variants))
-	for target := range variants {
-		targets = append(targets, target)
-	}
-	sort.Strings(targets)
-	for _, target := range targets {
-		out.ObjectVariants = append(out.ObjectVariants, variants[target])
-	}
-	out.ConfigPayloads = sortedCompactConfigPayloads(configPayloads)
-	out.CompileEnvironments = sortedCompactCompileEnvironments(compileEnvironments)
-	out.GeneratedHeaderFamilies = sortedCompactGeneratedHeaderFamilies(generatedHeaderFamilies)
-	sourceInputInterner.apply(out)
-	if err := out.canonicalizeSourceInputIndex(); err != nil {
-		return nil, err
-	}
-	if err := out.validateContentIDs(); err != nil {
-		return nil, err
-	}
-	if err := out.ensureActionGroups(); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// The Rust-for-Linux support crates have a configuration-specific build graph
-// that does not follow the ordinary one-source-to-one-object Kbuild model.
-// Bazel builds them as a dedicated SDK and injects their objects into vmlinux.
-func rustSDKOwnsObject(object string) bool {
-	object = strings.TrimPrefix(filepath.ToSlash(filepath.Clean(object)), "./")
-	return strings.HasPrefix(object, "rust/")
-}
-
-func imageObjectTargetsForVariant(variant CompactObjectVariant, variantsByTarget map[string]CompactObjectVariant) ([]string, error) {
-	return imageObjectTargetsForVariantStack(variant, variantsByTarget, map[string]bool{})
-}
-
-func imageObjectTargetsForVariantStack(variant CompactObjectVariant, variantsByTarget map[string]CompactObjectVariant, stack map[string]bool) ([]string, error) {
-	if len(variant.Members) == 0 || keepLinkedBuiltinComposite(variant.Object) {
-		return []string{variant.Target}, nil
-	}
-	if stack[variant.Target] {
-		return nil, fmt.Errorf("cycle in compact image object graph at %q", variant.Object)
-	}
-	stack[variant.Target] = true
-	out := []string{}
-	for _, memberTarget := range variant.Members {
-		member, ok := variantsByTarget[memberTarget]
-		if !ok {
-			return nil, fmt.Errorf("compact image member target %q for %q is missing", memberTarget, variant.Object)
-		}
-		expanded, err := imageObjectTargetsForVariantStack(member, variantsByTarget, stack)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, expanded...)
-	}
-	delete(stack, variant.Target)
-	return out, nil
-}
-
-func keepLinkedBuiltinComposite(object string) bool {
-	return object == "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o"
-}
-
-const (
-	compactActionRecipeDomain = "linux-compact-concrete-action-recipe-v1"
-	compactReachabilityDomain = "linux-compact-reachability-v1"
-	compactActionGroupDomain  = "linux-compact-action-group-v1"
-)
-
-func compactActionKind(variant CompactObjectVariant) string {
-	if len(variant.Members) == 0 {
-		return "compile"
-	}
-	if variant.Object == "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o" {
-		return "arm64_nvhe"
-	}
-	return "composite"
-}
-
-func compactSourceLanguage(source string) string {
-	switch filepath.Ext(source) {
-	case ".S", ".s":
-		return "asm"
-	case ".c":
-		return "c"
-	default:
-		return ""
-	}
-}
-
-func compactConcreteRecipeID(variant CompactObjectVariant) string {
-	hasher := newCompactContentHasher(compactActionRecipeDomain)
-	hasher.writeValue("kind=", compactActionKind(variant))
-	hasher.writeValue("language=", compactSourceLanguage(variant.Source))
-	hasher.writeValue("mode=", variant.Mode)
-	hasher.writeValue("modname=", variant.ModName)
-	if variant.ModuleRoot {
-		hasher.writeValue("module_root=true")
-	}
-	if variant.ObjtoolDisabled {
-		hasher.writeValue("objtool_disabled=true")
-	}
-	if variant.ObjtoolForce {
-		hasher.writeValue("objtool_force=true")
-	}
-	for _, flag := range variant.Flags {
-		hasher.writeValue("flag=", flag)
-	}
-	for _, flag := range variant.RemoveFlags {
-		hasher.writeValue("remove_flag=", flag)
-	}
-	for _, arg := range variant.ObjtoolArgs {
-		hasher.writeValue("objtool_arg=", arg)
-	}
-	if variant.Symversions {
-		hasher.writeValue("symversions=true")
-	}
-	for _, flag := range variant.SymversionFlags {
-		hasher.writeValue("symversion_flag=", flag)
-	}
-	for _, flag := range variant.SymversionRemoveFlags {
-		hasher.writeValue("symversion_remove_flag=", flag)
-	}
-	return hasher.id()
-}
-
-func compactReachabilityID(configs []string) string {
-	hasher := newCompactContentHasher(compactReachabilityDomain)
-	for _, config := range configs {
-		hasher.writeValue("config=", config)
-	}
-	return hasher.id()
-}
-
-func compactActionGroupID(recipeID, reachabilityID string, variants map[string]CompactObjectVariant, targets []string) string {
-	hasher := newCompactContentHasher(compactActionGroupDomain)
-	hasher.writeValue("recipe=", recipeID)
-	hasher.writeValue("reachability=", reachabilityID)
-	for _, target := range targets {
-		hasher.writeValue("object=", variants[target].ContentID)
-	}
-	return hasher.id()
-}
-
-func compactActionGroupRuleName(group CompactActionGroup) string {
-	return "_action_group_" +
-		compactShortID(group.RecipeID) + "_" +
-		compactShortID(compactReachabilityID(group.ReachableConfigs))
-}
-
-func (m *CompactMetadata) deriveActionGroups() ([]CompactActionGroup, error) {
-	variants := make(map[string]CompactObjectVariant, len(m.ObjectVariants))
-	for _, variant := range m.ObjectVariants {
-		if _, ok := variants[variant.Target]; ok {
-			return nil, fmt.Errorf("derive compact action groups: duplicate object target %q", variant.Target)
-		}
-		variants[variant.Target] = variant
-	}
-
-	reachable := make(map[string]map[string]bool, len(variants))
-	for _, config := range m.Configs {
-		seen := map[string]bool{}
-		var visit func(string) error
-		visit = func(target string) error {
-			if seen[target] {
-				return nil
-			}
-			variant, ok := variants[target]
-			if !ok {
-				return fmt.Errorf("compact config %q reaches unknown object target %q", config.Name, target)
-			}
-			seen[target] = true
-			if reachable[target] == nil {
-				reachable[target] = map[string]bool{}
-			}
-			reachable[target][config.Name] = true
-			for _, dependency := range variant.Deps {
-				if err := visit(dependency); err != nil {
-					return err
-				}
-			}
-			for _, member := range variant.Members {
-				if err := visit(member); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-		for _, target := range config.ObjectTargets {
-			if err := visit(target); err != nil {
-				return nil, err
-			}
-		}
-		for _, target := range config.ModuleObjectTargets {
-			if err := visit(target); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	type actionGroupKey struct {
-		recipe       string
-		reachability string
-	}
-	targetsByKey := map[actionGroupKey][]string{}
-	configsByReachability := map[string][]string{}
-	for _, variant := range m.ObjectVariants {
-		namesSet := reachable[variant.Target]
-		if len(namesSet) == 0 {
-			continue
-		}
-		names := make([]string, 0, len(namesSet))
-		for name := range namesSet {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		reachabilityID := compactReachabilityID(names)
-		configsByReachability[reachabilityID] = names
-		key := actionGroupKey{
-			recipe:       compactConcreteRecipeID(variant),
-			reachability: reachabilityID,
-		}
-		targetsByKey[key] = append(targetsByKey[key], variant.Target)
-	}
-
-	groups := make([]CompactActionGroup, 0, len(targetsByKey))
-	for key, targets := range targetsByKey {
-		sort.Strings(targets)
-		groups = append(groups, CompactActionGroup{
-			ID:               compactActionGroupID(key.recipe, key.reachability, variants, targets),
-			RecipeID:         key.recipe,
-			ReachableConfigs: append([]string(nil), configsByReachability[key.reachability]...),
-			ObjectTargets:    targets,
-		})
-	}
-	sort.Slice(groups, func(i, j int) bool {
-		return groups[i].ID < groups[j].ID
-	})
-	return groups, nil
-}
-
-func compactActionGroupsEqual(left, right []CompactActionGroup) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i].ID != right[i].ID ||
-			left[i].RecipeID != right[i].RecipeID ||
-			!stringSlicesEqual(left[i].ReachableConfigs, right[i].ReachableConfigs) ||
-			!stringSlicesEqual(left[i].ObjectTargets, right[i].ObjectTargets) {
-			return false
-		}
-	}
-	return true
-}
-
-func (m *CompactMetadata) ensureActionGroups() error {
-	groups, err := m.deriveActionGroups()
-	if err != nil {
-		return err
-	}
-	if len(m.ActionGroups) == 0 {
-		m.ActionGroups = groups
-		return nil
-	}
-	if !compactActionGroupsEqual(m.ActionGroups, groups) {
-		return fmt.Errorf("compact action groups do not match the concrete object/config graph")
-	}
-	return nil
-}
-
-func (objects resolvedKbuildObjects) orderedLibRoots(libraryDirs []string) []resolvedKbuildObject {
-	if len(objects.libRoots) == 0 {
-		return nil
-	}
-	if len(libraryDirs) == 0 {
-		out := append([]resolvedKbuildObject(nil), objects.libRoots...)
-		sort.SliceStable(out, func(i, j int) bool {
-			return out[i].object < out[j].object
-		})
-		return out
-	}
-
-	byDir := map[string][]resolvedKbuildObject{}
-	var remainingDirs []string
-	seenRemainingDir := map[string]bool{}
-	for _, root := range objects.libRoots {
-		dir := cleanKbuildDir(root.directory)
-		byDir[dir] = append(byDir[dir], root)
-		if !seenRemainingDir[dir] {
-			seenRemainingDir[dir] = true
-			remainingDirs = append(remainingDirs, dir)
-		}
-	}
-	appendDir := func(out []resolvedKbuildObject, dir string) []resolvedKbuildObject {
-		roots := byDir[dir]
-		if len(roots) == 0 {
-			return out
-		}
-		sort.SliceStable(roots, func(i, j int) bool {
-			return roots[i].object < roots[j].object
-		})
-		out = append(out, roots...)
-		delete(byDir, dir)
-		return out
-	}
-
-	out := []resolvedKbuildObject{}
-	for _, dir := range libraryDirs {
-		out = appendDir(out, cleanKbuildDir(dir))
-	}
-	for _, dir := range remainingDirs {
-		out = appendDir(out, dir)
-	}
-	return out
-}
-
-func cleanKbuildDir(dir string) string {
-	dir = strings.Trim(filepath.ToSlash(dir), "/")
-	if dir == "." {
-		return ""
-	}
-	return dir
-}
-
-func (v CompactObjectVariant) equal(other CompactObjectVariant) bool {
-	if v.Target != other.Target || v.ContentID != other.ContentID || v.CompileEnvironment != other.CompileEnvironment || v.Object != other.Object || v.Source != other.Source || v.SourceInputGroup != other.SourceInputGroup || v.Mode != other.Mode || v.ModuleRoot != other.ModuleRoot || v.ModName != other.ModName || v.ObjtoolDisabled != other.ObjtoolDisabled || v.ObjtoolForce != other.ObjtoolForce || v.Symversions != other.Symversions || len(v.sourceInputs) != len(other.sourceInputs) || len(v.Flags) != len(other.Flags) || len(v.RemoveFlags) != len(other.RemoveFlags) || len(v.ObjtoolArgs) != len(other.ObjtoolArgs) || len(v.SymversionFlags) != len(other.SymversionFlags) || len(v.SymversionRemoveFlags) != len(other.SymversionRemoveFlags) || len(v.configFragment) != len(other.configFragment) || len(v.Deps) != len(other.Deps) || len(v.Members) != len(other.Members) {
-		return false
-	}
-	for i := range v.sourceInputs {
-		if v.sourceInputs[i] != other.sourceInputs[i] {
-			return false
-		}
-	}
-	for i := range v.Flags {
-		if v.Flags[i] != other.Flags[i] {
-			return false
-		}
-	}
-	for i := range v.RemoveFlags {
-		if v.RemoveFlags[i] != other.RemoveFlags[i] {
-			return false
-		}
-	}
-	for i := range v.ObjtoolArgs {
-		if v.ObjtoolArgs[i] != other.ObjtoolArgs[i] {
-			return false
-		}
-	}
-	for i := range v.SymversionFlags {
-		if v.SymversionFlags[i] != other.SymversionFlags[i] {
-			return false
-		}
-	}
-	for i := range v.SymversionRemoveFlags {
-		if v.SymversionRemoveFlags[i] != other.SymversionRemoveFlags[i] {
-			return false
-		}
-	}
-	for i := range v.Deps {
-		if v.Deps[i] != other.Deps[i] {
-			return false
-		}
-	}
-	for i := range v.Members {
-		if v.Members[i] != other.Members[i] {
-			return false
-		}
-	}
-	for key, value := range v.configFragment {
-		if other.configFragment[key] != value {
-			return false
-		}
-	}
-	return true
-}
-
-func (m *CompactMetadata) JSON() ([]byte, error) {
-	if err := m.canonicalizeSourceInputIndex(); err != nil {
-		return nil, err
-	}
-	if err := m.validateContentIDs(); err != nil {
-		return nil, err
-	}
-	if err := m.ensureActionGroups(); err != nil {
-		return nil, err
-	}
-	serializable := *m
-	if serializable.Configs == nil {
-		serializable.Configs = []CompactConfig{}
-	}
-	if serializable.ConfigPayloads == nil {
-		serializable.ConfigPayloads = []CompactConfigPayload{}
-	}
-	if serializable.CompileEnvironments == nil {
-		serializable.CompileEnvironments = []CompactCompileEnvironment{}
-	}
-	if serializable.GeneratedHeaderFamilies == nil {
-		serializable.GeneratedHeaderFamilies = []CompactGeneratedHeaderFamily{}
-	}
-	if serializable.SourceFiles == nil {
-		serializable.SourceFiles = []CompactSourceInput{}
-	}
-	if serializable.SourceInputGroups == nil {
-		serializable.SourceInputGroups = []string{}
-	}
-	if serializable.ActionGroups == nil {
-		serializable.ActionGroups = []CompactActionGroup{}
-	}
-	if serializable.ObjectVariants == nil {
-		serializable.ObjectVariants = []CompactObjectVariant{}
-	}
-	data, err := json.MarshalIndent(&serializable, "", "  ")
+	actionRoles, err := normalizeActionRoles(opts.ActionRoles)
 	if err != nil {
 		return nil, err
 	}
-	return compactShortStringArrays(append(data, '\n'), 80), nil
+	out := &CompactMetadata{
+		sourceNamespaces:        maps.Clone(opts.SourceNamespaces),
+		exactSourceNamespaces:   maps.Clone(opts.ExactSourceNamespaces),
+		actionRoles:             actionRoles,
+		preconfiguredObjectTree: opts.PreconfiguredObjectTree,
+		selectedProductsOnly:    opts.SelectedProductsOnly,
+	}
+	if err := out.ensureActionPlanSourceNamespaceIndex(); err != nil {
+		return nil, err
+	}
+	resolved, err := t.ResolveConfigWithOptions(flags, resolveOpts)
+	if err != nil {
+		return nil, err
+	}
+	graph, err := graphForConfig(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Kbuild: %w", err)
+	}
+	if err := validateCompactKbuildProfiles(graph.KbuildProfiles); err != nil {
+		return nil, fmt.Errorf("resolve Kbuild profiles: %w", err)
+	}
+	selections, err := normalizeCompactKbuildSelectionMakeTargets(graph.KbuildProfiles, graph.KbuildSelections)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Kbuild selections: %w", err)
+	}
+	out.Config = CompactConfig{
+		KbuildProfiles:                  graph.KbuildProfiles,
+		KbuildSelections:                selections,
+		KbuildDeferredContentSelections: graph.KbuildDeferredContentSelections,
+		imageTarget:                     graph.ImageTarget,
+	}
+	if _, err := newCompactKbuildSelectionGraph(out.Config); err != nil {
+		return nil, fmt.Errorf("resolve Kbuild selections: %w", err)
+	}
+	out.configFragment = resolvedConfigFragment(resolved)
+	return out, nil
 }
 
-func compactShortStringArrays(data []byte, printWidth int) []byte {
-	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
-	out := make([]string, 0, len(lines))
-	for i := 0; i < len(lines); i++ {
-		line := lines[i]
-		if !strings.HasSuffix(strings.TrimSpace(line), "[") {
-			out = append(out, line)
-			continue
-		}
-
-		prefixEnd := strings.LastIndex(line, "[")
-		if prefixEnd < 0 {
-			out = append(out, line)
-			continue
-		}
-
-		var values []string
-		j := i + 1
-		ok := true
-		for ; j < len(lines); j++ {
-			trimmed := strings.TrimSpace(lines[j])
-			if trimmed == "]" || trimmed == "]," {
-				break
-			}
-			value := strings.TrimSuffix(trimmed, ",")
-			var decoded string
-			if err := json.Unmarshal([]byte(value), &decoded); err != nil {
-				ok = false
-				break
-			}
-			values = append(values, value)
-		}
-		if !ok || j == len(lines) {
-			out = append(out, line)
-			continue
-		}
-
-		suffix := "]"
-		if strings.TrimSpace(lines[j]) == "]," {
-			suffix = "],"
-		}
-		candidate := line[:prefixEnd+1] + strings.Join(values, ", ") + suffix
-		if len(candidate) > printWidth {
-			out = append(out, line)
-			continue
-		}
-		out = append(out, candidate)
-		i = j
+func resolvedConfigFragment(config *ResolvedConfig) map[string]string {
+	fragment := map[string]string{}
+	if config == nil {
+		return fragment
 	}
-	return []byte(strings.Join(out, "\n") + "\n")
+	for key := range config.Effective {
+		if config.ShouldWrite(key) {
+			fragment[key] = config.Value(key)
+		}
+	}
+	return fragment
 }
 
-type resolvedKbuildObject struct {
-	object          string
-	directory       string
-	mode            string
-	modname         string
-	flags           []resolvedKbuildFlag
-	remove          []resolvedKbuildFlag
-	objtoolArgs     []string
-	objtoolDisabled bool
-	objtoolForce    bool
-	footprint       map[string]bool
-	members         []string
-	root            bool
-	traversals      []kbuildTraversal
+// NewCompactKbuildProfile binds an evaluated KbuildFile to its source-tree
+// invocation path. Target commands remain lazy in the process-local evaluator.
+func NewCompactKbuildProfile(name, makefile, sourceRoot string, kb *KbuildFile) (CompactKbuildProfile, error) {
+	if kb == nil {
+		return CompactKbuildProfile{}, fmt.Errorf("Kbuild profile %q has nil file", name)
+	}
+	makefile = filepath.Clean(makefile)
+	root := filepath.Clean(sourceRoot)
+	if root != "" && filepath.IsAbs(makefile) {
+		rel, err := filepath.Rel(root, makefile)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return CompactKbuildProfile{}, fmt.Errorf("Kbuild profile path %q is outside source root %q", makefile, sourceRoot)
+		}
+		makefile = rel
+	}
+	makefile = filepath.ToSlash(makefile)
+	if makefile == "." || makefile == "" || strings.HasPrefix(makefile, "../") || filepath.IsAbs(makefile) {
+		return CompactKbuildProfile{}, fmt.Errorf("Kbuild profile %q has invalid source-tree path %q", name, makefile)
+	}
+	if name == "" {
+		name = makefile
+	}
+	profile := CompactKbuildProfile{
+		Name:            name,
+		Path:            makefile,
+		Directory:       filepath.ToSlash(filepath.Dir(makefile)),
+		Generated:       append([]KbuildTarget(nil), kb.Generated...),
+		Rules:           cloneKbuildRules(kb.Rules),
+		TargetVariables: cloneKbuildTargetVariables(kb.TargetVariables),
+		evaluator:       kb.evaluator,
+		// Profiles are intentionally copied by value while walking recursive
+		// Make invocations. Keep one process-local registry behind those copies so
+		// a target-context evaluator can record execution-time shell provenance
+		// without mutating the serialized Kbuild graph.
+		deferredContentQueries: map[string]KbuildDeferredContentQuery{},
+	}
+	// The profile owns immutable copies of the parsed declarations.  Target
+	// evaluation needs only the parser's variable state; retaining parser.kb
+	// would keep a second complete Rules/Generated/TargetVariables graph alive
+	// through evaluator -> template -> kb for every recursive invocation.
+	if profile.evaluator != nil && profile.evaluator.template != nil {
+		profile.evaluator.template.kb = &KbuildFile{}
+	}
+	if profile.Directory == "." {
+		profile.Directory = ""
+	}
+	return profile, nil
 }
 
-type resolvedKbuildFlag struct {
-	language string
-	values   []string
-}
-
-type resolvedKbuildObjects struct {
-	byName   map[string]*resolvedKbuildObject
-	roots    []resolvedKbuildObject
-	libRoots []resolvedKbuildObject
-}
-
-func (kb *KbuildFile) resolvedObjects(config *ResolvedConfig) resolvedKbuildObjects {
-	byObject := map[string]*resolvedKbuildObject{}
-	var rootOrder []string
-	var libRootOrder []string
-	seenRoot := map[string]bool{}
-	seenLibRoot := map[string]bool{}
-	for _, entry := range kb.resolvedObjectEntries(config) {
-		mode := entry.Condition.Mode(config)
-		if mode == "n" {
-			continue
-		}
-		object := byObject[entry.Object]
-		if object == nil {
-			object = &resolvedKbuildObject{
-				object:    entry.Object,
-				directory: entry.Directory,
-				mode:      mode,
-				footprint: map[string]bool{},
-			}
-			byObject[entry.Object] = object
-		}
-		if object.directory == "" {
-			object.directory = entry.Directory
-		}
-		object.addTraversal(entry.traversal)
-		if entry.Root {
-			object.root = true
-			if entry.Kind == "lib" {
-				if !seenLibRoot[entry.Object] {
-					seenLibRoot[entry.Object] = true
-					libRootOrder = append(libRootOrder, entry.Object)
-				}
-			} else if !seenRoot[entry.Object] {
-				seenRoot[entry.Object] = true
-				rootOrder = append(rootOrder, entry.Object)
-			}
-		}
-		if modePrecedence(mode) > modePrecedence(object.mode) {
-			object.mode = mode
-		}
-		for _, ref := range entry.Condition.Refs() {
-			object.footprint[ref] = true
-		}
-	}
-
-	for _, member := range kb.resolvedCompositeMembers(config, byObject) {
-		parent := byObject[member.Composite]
-		if parent == nil {
-			continue
-		}
-		if member.traversal.scope != 0 && !parent.hasActiveTraversal(member.traversal) {
-			continue
-		}
-		mode := compositeMemberMode(parent.mode, member.Mode)
-		if mode == "n" {
-			continue
-		}
-		parent.members = appendUnique(parent.members, member.Object)
-		object := byObject[member.Object]
-		if object == nil {
-			object = &resolvedKbuildObject{
-				object:    member.Object,
-				directory: member.Directory,
-				mode:      mode,
-				footprint: map[string]bool{},
-			}
-			byObject[member.Object] = object
-		}
-		object.modname = appendModName(object.modname, strings.TrimSuffix(member.Composite, ".o"))
-		if object.directory == "" {
-			object.directory = member.Directory
-		}
-		object.addTraversal(member.traversal)
-		if modePrecedence(mode) > modePrecedence(object.mode) {
-			object.mode = mode
-		}
-		for ref := range parent.footprint {
-			object.footprint[ref] = true
-		}
-		for _, ref := range member.Condition.Refs() {
-			object.footprint[ref] = true
-		}
-	}
-
-	for _, object := range byObject {
-		for _, flag := range kb.Flags {
-			if flag.Scope == "object" && !kbuildObjectFlagMatches(flag.Object, object.object) {
-				continue
-			}
-			if flag.Scope == "global" && !globalFlagAppliesToObject(flag, object) {
-				continue
-			}
-			for _, ref := range flag.Condition.Refs() {
-				object.footprint[ref] = true
-			}
-			if !flag.Condition.Enabled(config) {
-				continue
-			}
-			object.flags = append(object.flags, resolvedKbuildFlag{
-				language: flag.Language,
-				values:   append([]string(nil), flag.Flags...),
-			})
-			for _, value := range flag.Flags {
-				for _, ref := range configRefs(value) {
-					object.footprint[ref] = true
-				}
-			}
-		}
-		for _, flag := range kb.RemoveFlags {
-			if flag.Scope == "object" && !kbuildObjectFlagMatches(flag.Object, object.object) {
-				continue
-			}
-			if flag.Scope == "global" && !globalFlagAppliesToObject(flag, object) {
-				continue
-			}
-			for _, ref := range flag.Condition.Refs() {
-				object.footprint[ref] = true
-			}
-			if !flag.Condition.Enabled(config) {
-				continue
-			}
-			object.remove = append(object.remove, resolvedKbuildFlag{
-				language: flag.Language,
-				values:   append([]string(nil), flag.Flags...),
-			})
-			for _, value := range flag.Flags {
-				for _, ref := range configRefs(value) {
-					object.footprint[ref] = true
-				}
-			}
-		}
-		object.flags = append(object.flags, sanitizerKbuildFlags(config, kb.objectSettings, object)...)
-		object.objtoolDisabled, object.objtoolForce, object.objtoolArgs = kbuildObjtoolSettings(kb, object)
-	}
-
-	out := resolvedKbuildObjects{
-		byName: byObject,
-	}
-	for _, name := range rootOrder {
-		if object := byObject[name]; object != nil && object.root {
-			out.roots = append(out.roots, *object)
-		}
-	}
-	for _, name := range libRootOrder {
-		if object := byObject[name]; object != nil && object.root {
-			out.libRoots = append(out.libRoots, *object)
-		}
-	}
-	return out
-}
-
-func kbuildObjectFlagMatches(flagObject, object string) bool {
-	return flagObject == object || flagObject == kbuildCompileObjectName(object)
-}
-
-func kbuildObjtoolSettings(kb *KbuildFile, object *resolvedKbuildObject) (disabled, force bool, args []string) {
-	compileObject := kbuildCompileObjectName(object.object)
-	settingsObject := object
-	if compileObject != object.object {
-		settingsObject = &resolvedKbuildObject{
-			object:    compileObject,
-			directory: object.directory,
-		}
-	}
-	objectValue, directoryValue := kbuildObjectSettingValues(
-		kb.objectSettings,
-		settingsObject,
-		"OBJECT_FILES_NON_STANDARD",
-	)
-	nonStandardValue, hasNonStandardValue := kbuildTargetVariableValue(
-		kb.TargetVariables,
-		compileObject,
-		"OBJECT_FILES_NON_STANDARD",
-	)
-	nonStandard := firstKbuildSettingEnabled(
-		false,
-		conditionalSettingValue(nonStandardValue, hasNonStandardValue),
-		objectValue,
-		directoryValue,
-	)
-	enabledValue, hasEnabledValue := kbuildTargetVariableValue(
-		kb.TargetVariables,
-		compileObject,
-		"objtool-enabled",
-	)
-	enabled := !nonStandard && compileObject == object.object
-	if hasEnabledValue {
-		enabled = strings.TrimSpace(enabledValue) != ""
-		force = enabled
-	}
-	argsValue, hasArgsValue := kbuildTargetVariableValue(
-		kb.TargetVariables,
-		compileObject,
-		"objtool-args",
-	)
-	if hasArgsValue {
-		args = concreteKbuildFlags(kbuildFields(argsValue))
-	}
-	return !enabled, force, args
-}
-
-func conditionalSettingValue(value string, present bool) string {
-	if !present {
-		return ""
-	}
-	if strings.TrimSpace(value) == "" {
-		return "n"
-	}
-	return value
-}
-
-func kbuildCompileObjectName(object string) string {
-	for _, suffix := range []string{".pi.o", ".stub.o"} {
-		if strings.HasSuffix(object, suffix) {
-			return strings.TrimSuffix(object, suffix) + ".o"
-		}
-	}
-	return object
-}
-
-func kbuildTargetVariableValue(variables []KbuildTargetVariable, object, name string) (string, bool) {
-	value := ""
-	assigned := false
-	for _, variable := range variables {
-		if variable.Variable != name || !kbuildTargetVariableMatches(variable.Targets, object) {
-			continue
-		}
-		switch variable.Operator {
-		case "+=":
-			value = appendMakeValue(value, variable.Value)
-			assigned = true
-		case "?=":
-			if !assigned {
-				value = variable.Value
-				assigned = true
-			}
-		default:
-			value = variable.Value
-			assigned = true
-		}
-	}
-	return strings.TrimSpace(value), assigned
-}
-
-func kbuildTargetVariableMatches(targets []string, object string) bool {
-	object = filepath.ToSlash(strings.TrimPrefix(object, "./"))
-	for _, target := range targets {
-		target = filepath.ToSlash(strings.TrimPrefix(target, "./"))
-		prefix, suffix, pattern := strings.Cut(target, "%")
-		if !pattern && target == object {
-			return true
-		}
-		if pattern &&
-			len(object) >= len(prefix)+len(suffix) &&
-			strings.HasPrefix(object, prefix) &&
-			strings.HasSuffix(object, suffix) {
-			return true
-		}
-	}
-	return false
-}
-
-func (kb *KbuildFile) resolvedObjectEntries(config *ResolvedConfig) []KbuildObject {
-	if len(kb.objectAssigns) == 0 {
-		return kb.Objects
-	}
-
-	type bucketKey struct {
-		directory string
-		kind      string
-		mode      string
-		traversal int
-	}
-	type assignmentRecord struct {
-		key    bucketKey
-		values []KbuildObject
-		active bool
-	}
-
-	var records []*assignmentRecord
-	recordsByKey := map[bucketKey][]*assignmentRecord{}
-	assigned := map[bucketKey]bool{}
-	for _, assignment := range kb.objectAssigns {
-		mode := assignment.Condition.Mode(config)
-		if mode == "n" {
-			continue
-		}
-		key := bucketKey{
-			directory: assignment.Directory,
-			kind:      assignment.Kind,
-			mode:      mode,
-			traversal: assignment.traversal.scope,
-		}
-		values := make([]KbuildObject, 0, len(assignment.Objects))
-		for _, object := range assignment.Objects {
-			values = append(values, KbuildObject{
-				Object:    object,
-				Kind:      assignment.Kind,
-				Directory: assignment.Directory,
-				Condition: assignment.Condition,
-				Root:      assignment.Root,
-				Position:  assignment.Position,
-				traversal: assignment.traversal,
-			})
-		}
-		addRecord := func() {
-			record := &assignmentRecord{
-				key:    key,
-				values: values,
-				active: true,
-			}
-			records = append(records, record)
-			recordsByKey[key] = append(recordsByKey[key], record)
-		}
-		switch assignment.Operator {
-		case "+=":
-			addRecord()
-			assigned[key] = true
-		case "?=":
-			if !assigned[key] {
-				addRecord()
-				assigned[key] = true
-			}
-		default:
-			for _, record := range recordsByKey[key] {
-				record.active = false
-			}
-			addRecord()
-			assigned[key] = true
-		}
-	}
-
-	var out []KbuildObject
-	for _, record := range records {
-		if record.active {
-			out = append(out, record.values...)
-		}
-	}
-	return out
-}
-
-type resolvedCompositeMember struct {
-	Composite string
-	Object    string
-	Directory string
-	Mode      string
-	Condition KbuildCondition
-	traversal kbuildTraversal
-}
-
-type compositeMemberValue struct {
-	object    string
-	directory string
-	condition KbuildCondition
-	traversal kbuildTraversal
-}
-
-func (kb *KbuildFile) resolvedCompositeMembers(config *ResolvedConfig, parents map[string]*resolvedKbuildObject) []resolvedCompositeMember {
-	if len(kb.compositeAssigns) == 0 {
-		out := make([]resolvedCompositeMember, 0, len(kb.compositeMembers))
-		for _, member := range kb.compositeMembers {
-			out = append(out, resolvedCompositeMember{
-				Composite: member.Composite,
-				Object:    member.Object,
-				Directory: member.Directory,
-				Mode:      member.Condition.Mode(config),
-				Condition: member.Condition,
-				traversal: member.traversal,
-			})
-		}
-		return out
-	}
-
-	type bucketKey struct {
-		composite string
-		mode      string
-		traversal int
-	}
-	buckets := map[bucketKey][]compositeMemberValue{}
-	var bucketOrder []bucketKey
-	assigned := map[bucketKey]bool{}
-	for _, assignment := range kb.compositeAssigns {
-		parent := parents[assignment.Composite]
-		if parent == nil || (assignment.traversal.scope != 0 && !parent.hasActiveTraversal(assignment.traversal)) {
-			continue
-		}
-		mode := assignment.Condition.Mode(config)
-		if mode == "n" {
-			continue
-		}
-		key := bucketKey{
-			composite: assignment.Composite,
-			mode:      mode,
-			traversal: assignment.traversal.scope,
-		}
-		if _, ok := buckets[key]; !ok {
-			bucketOrder = append(bucketOrder, key)
-		}
-		values := make([]compositeMemberValue, 0, len(assignment.Objects))
-		for _, object := range assignment.Objects {
-			values = append(values, compositeMemberValue{
-				object:    object,
-				directory: assignment.Directory,
-				condition: assignment.Condition,
-				traversal: assignment.traversal,
-			})
-		}
-		switch assignment.Operator {
-		case "+=":
-			buckets[key] = append(buckets[key], values...)
-		case "?=":
-			if !assigned[key] {
-				buckets[key] = values
-				assigned[key] = true
-			}
-		default:
-			buckets[key] = values
-			assigned[key] = true
-		}
-	}
-
-	out := []resolvedCompositeMember{}
-	for _, key := range bucketOrder {
-		for _, value := range buckets[key] {
-			out = append(out, resolvedCompositeMember{
-				Composite: key.composite,
-				Object:    value.object,
-				Directory: value.directory,
-				Mode:      key.mode,
-				Condition: value.condition,
-				traversal: value.traversal,
-			})
-		}
-	}
-	return out
-}
-
-func appendUnique(values []string, value string) []string {
-	for _, existing := range values {
-		if existing == value {
-			return values
-		}
-	}
-	return append(values, value)
-}
-
-func (object *resolvedKbuildObject) addTraversal(traversal kbuildTraversal) {
-	if traversal.scope == 0 {
+// SetCompactKbuildProfileDirectory records the working-directory portion of a
+// concrete Make invocation. The parsed Makefile path and invocation directory
+// intentionally differ for drivers such as scripts/Makefile.build.
+func SetCompactKbuildProfileDirectory(profile *CompactKbuildProfile, directory string) {
+	if profile == nil {
 		return
 	}
-	for _, existing := range object.traversals {
-		if existing.scope == traversal.scope {
-			return
-		}
+	directory = filepath.ToSlash(filepath.Clean(directory))
+	if directory == "." {
+		directory = ""
 	}
-	object.traversals = append(object.traversals, traversal)
+	profile.Directory = directory
 }
 
-func (object *resolvedKbuildObject) hasActiveTraversal(want kbuildTraversal) bool {
-	hasLinked := false
-	for _, traversal := range object.traversals {
-		if traversal.linked {
-			hasLinked = true
-			break
+// SetCompactKbuildProfileInvocationLocation records the typed working
+// directory selected by recursive Make. This is separate from Directory,
+// which is the logical obj= directory used to scope Kbuild targets.
+func SetCompactKbuildProfileInvocationLocation(
+	profile *CompactKbuildProfile,
+	location CompactKbuildInvocationLocation,
+) error {
+	if profile == nil {
+		return fmt.Errorf("cannot set invocation location on a nil Kbuild profile")
+	}
+	if location.Tree != CompactKbuildInvocationSourceTree && location.Tree != CompactKbuildInvocationObjectTree {
+		return fmt.Errorf("Kbuild invocation location has invalid tree %q", location.Tree)
+	}
+	directory := filepath.ToSlash(filepath.Clean(location.Directory))
+	if directory == "." {
+		directory = ""
+	}
+	if directory != "" {
+		if err := validatePlanRelativePath("Kbuild invocation directory", directory); err != nil {
+			return err
 		}
 	}
-	for _, traversal := range object.traversals {
-		if hasLinked && !traversal.linked {
-			continue
-		}
-		if traversal.scope == want.scope {
-			return true
-		}
-	}
-	return false
+	profile.invocationLocation = CompactKbuildInvocationLocation{Tree: location.Tree, Directory: directory}
+	profile.invocationLocationSet = true
+	return nil
 }
 
-func appendModName(existing, value string) string {
-	if existing == "" {
-		return value
-	}
-	for _, part := range strings.Split(existing, ":") {
-		if part == value {
-			return existing
-		}
-	}
-	parts := append(strings.Split(existing, ":"), value)
-	sort.Strings(parts)
-	return strings.Join(parts, ":")
-}
-
-func globalFlagAppliesToObject(flag KbuildFlag, object *resolvedKbuildObject) bool {
-	if flag.traversalStart != 0 {
-		hasLinked := false
-		for _, traversal := range object.traversals {
-			if traversal.linked {
-				hasLinked = true
-				break
-			}
-		}
-		for _, traversal := range object.traversals {
-			if hasLinked && !traversal.linked {
-				continue
-			}
-			if traversal.scope == flag.traversalStart ||
-				(flag.Recursive && traversal.scope > flag.traversalStart && traversal.scope <= flag.traversalEnd) {
-				return true
-			}
-		}
-		return false
-	}
-	flagDir := strings.TrimSuffix(flag.Directory, "/")
-	objectDir := strings.TrimSuffix(object.directory, "/")
-	if objectDir == flagDir {
-		return true
-	}
-	if !flag.Recursive {
-		return false
-	}
-	if flagDir == "" {
-		return true
-	}
-	return strings.HasPrefix(objectDir+"/", flagDir+"/")
-}
-
-func (objects resolvedKbuildObjects) all() []resolvedKbuildObject {
-	names := make([]string, 0, len(objects.byName))
-	for name := range objects.byName {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	out := make([]resolvedKbuildObject, 0, len(names))
-	for _, name := range names {
-		out = append(out, *objects.byName[name])
-	}
-	return out
-}
-
-type compactVariantMemo map[string]CompactObjectVariant
-
-type compactGeneratedHeaderFamilySet map[string]CompactGeneratedHeaderFamily
-
-func (families compactGeneratedHeaderFamilySet) selectForAction(
-	generatedIncludes []string,
-	forceAll bool,
-) ([]string, error) {
-	if len(families) == 0 {
-		return nil, nil
-	}
-	all, hasAll := families[compactGeneratedHeaderFamilyAll]
-	monolithic := hasAll && len(families) == 1
-	if forceAll {
-		if !hasAll {
-			return nil, fmt.Errorf("generated-header action requires the all family, but it is unavailable")
-		}
-		return []string{all.ID}, nil
-	}
-
+func validateCompactKbuildProfiles(profiles []CompactKbuildProfile) error {
 	names := map[string]bool{}
-	for _, include := range generatedIncludes {
-		name, precise := generatedHeaderFamilyNameForInclude(include)
-		if name == "" {
-			continue
+	for _, profile := range profiles {
+		if profile.Name == "" || profile.Path == "" {
+			return fmt.Errorf("Kbuild profile name and path must not be empty")
 		}
-		if monolithic {
-			return []string{all.ID}, nil
+		if names[profile.Name] {
+			return fmt.Errorf("duplicate Kbuild profile name %q", profile.Name)
 		}
-		if !precise {
-			return nil, fmt.Errorf("generated include %q is unclassified", include)
-		}
-		if _, ok := families[name]; !ok {
-			return nil, fmt.Errorf(
-				"generated include %q requires unavailable family %q",
-				include,
-				name,
-			)
-		}
-		names[name] = true
-	}
-	ids := make([]string, 0, len(names))
-	for name := range names {
-		ids = append(ids, families[name].ID)
-	}
-	sort.Strings(ids)
-	return ids, nil
-}
-
-func (memo compactVariantMemo) variantFor(
-	name string,
-	config *ResolvedConfig,
-	opts CompactMetadataOptions,
-	objects resolvedKbuildObjects,
-	scanner *configSourceScanner,
-	generatedHeaderFamilies compactGeneratedHeaderFamilySet,
-) (CompactObjectVariant, error) {
-	return memo.variantForStack(
-		name,
-		config,
-		opts,
-		objects,
-		scanner,
-		generatedHeaderFamilies,
-		map[string]bool{},
-	)
-}
-
-func (memo compactVariantMemo) variantForStack(
-	name string,
-	config *ResolvedConfig,
-	opts CompactMetadataOptions,
-	objects resolvedKbuildObjects,
-	scanner *configSourceScanner,
-	generatedHeaderFamilies compactGeneratedHeaderFamilySet,
-	stack map[string]bool,
-) (CompactObjectVariant, error) {
-	if variant, ok := memo[name]; ok {
-		return variant, nil
-	}
-	object, ok := objects.byName[name]
-	if !ok {
-		return CompactObjectVariant{}, fmt.Errorf("composite member %q is not present in resolved object graph", name)
-	}
-	if stack[name] {
-		return CompactObjectVariant{}, fmt.Errorf("cycle in composite Kbuild object graph at %q", name)
-	}
-	stack[name] = true
-	members := make([]string, 0, len(object.members))
-	memberContentIDs := make([]string, 0, len(object.members))
-	for _, member := range object.members {
-		variant, err := memo.variantForStack(
-			member,
-			config,
-			opts,
-			objects,
-			scanner,
-			generatedHeaderFamilies,
-			stack,
-		)
-		if err != nil {
-			return CompactObjectVariant{}, err
-		}
-		members = append(members, variant.Target)
-		memberContentIDs = append(memberContentIDs, variant.ContentID)
-	}
-	delete(stack, name)
-
-	source := sourceForObject(opts.SourceRoot, opts.ObjectDir, object.object, opts.SourceRoots)
-	specialSources := compactSpecialSourcesForObject(name)
-	if specialSources.primary != "" {
-		source = specialSources.primary
-	}
-	if len(members) != 0 {
-		source = ""
-	}
-	if len(members) == 0 && source == "" {
-		return CompactObjectVariant{}, fmt.Errorf("exact input scan cannot resolve a source for leaf object %q", name)
-	}
-	symversions := compactSymversionsEnabled(config, source)
-	var symversionFlags, symversionRemoveFlags []string
-	if symversions {
-		symversionFlags = normalizeSourceRootFlags(
-			filterResolvedKbuildFlagsForLanguage(object.flags, "c"),
-			opts.SourceRoot,
-		)
-		symversionRemoveFlags = normalizeSourceRootFlags(
-			filterResolvedKbuildFlagsForLanguage(object.remove, "c"),
-			opts.SourceRoot,
-		)
-	}
-	deps := []string{}
-	depContentIDs := []string{}
-	asn1ProvidedIncludes := []string{}
-	asn1HeaderClosureInputs := []string{}
-	if source != "" {
-		for _, dep := range asn1HeaderDepsForSource(opts.SourceRoot, source) {
-			if dep.object == name {
-				continue
-			}
-			if _, ok := objects.byName[dep.object]; !ok {
-				continue
-			}
-			variant, err := memo.variantForStack(
-				dep.object,
-				config,
-				opts,
-				objects,
-				scanner,
-				generatedHeaderFamilies,
-				stack,
-			)
-			if err != nil {
-				return CompactObjectVariant{}, err
-			}
-			depCount := len(deps)
-			deps = appendUnique(deps, variant.Target)
-			if len(deps) != depCount {
-				depContentIDs = append(depContentIDs, variant.ContentID)
-			}
-			asn1ProvidedIncludes = appendUniqueStrings(asn1ProvidedIncludes, dep.include)
-			asn1HeaderClosureInputs = appendUniqueStrings(
-				asn1HeaderClosureInputs,
-				dep.headerClosureInputs...,
-			)
-		}
-		sort.Strings(deps)
-		sort.Strings(depContentIDs)
-	}
-
-	var sourceRefs, generatedIncludes []string
-	var sourceInputs []CompactSourceInput
-	forceAllGeneratedHeaders := false
-	if source != "" {
-		flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(object.flags, source), opts.SourceRoot)
-		actionIncludeSearch, err := compactSourceActionIncludeSearch(
-			scanner,
-			source,
-			flags,
-			compactIntrinsicIncludeRoots(source),
-		)
-		if err != nil {
-			return CompactObjectVariant{}, fmt.Errorf(
-				"model source include search for %s: %w",
-				name,
-				err,
-			)
-		}
-		forcedSources, err := forcedSourceInputs(flags, source, name)
-		if err != nil {
-			return CompactObjectVariant{}, fmt.Errorf(
-				"model forced source inputs for %s: %w",
-				name,
-				err,
-			)
-		}
-		actionFootprint := compactObjectActionFootprintForObject(name, flags)
-		actionFootprint.closureInputs = appendUniqueStrings(
-			actionFootprint.closureInputs,
-			asn1HeaderClosureInputs...,
-		)
-		actionFootprint.configSymbols = appendUniqueStrings(
-			actionFootprint.configSymbols,
-			compactSymversionConfigSymbols...,
-		)
-		if opts.Srcarch == "x86" && !object.objtoolDisabled {
-			actionFootprint.configSymbols = appendUniqueStrings(
-				actionFootprint.configSymbols,
-				ObjtoolConfigSymbols()...,
-			)
-		}
-		if object.root && object.mode == "m" {
-			actionFootprint.configSymbols = appendUniqueStrings(
-				actionFootprint.configSymbols,
-				"CONFIG_LTO_CLANG",
-			)
-		}
-		actionFootprint.providedIncludes = appendUniqueStrings(
-			actionFootprint.providedIncludes,
-			asn1ProvidedIncludes...,
-		)
-		profile := sourceScanKernel
-		if object.mode == "m" {
-			profile = sourceScanKernelModule
-		}
-		closure, err := scanner.closureForSourceConfigInputsSearchProfile(
-			source,
-			actionIncludeSearch,
-			config,
-			isAssemblySourcePath(source),
-			actionFootprint.providedIncludes,
-			profile,
-		)
-		if err != nil {
-			return CompactObjectVariant{}, fmt.Errorf("scan source inputs for %s: %w", name, err)
-		}
-		sourceRefs = append(sourceRefs, closure.refs...)
-		generatedIncludes = append(generatedIncludes, closure.generatedIncludes...)
-		forceAllGeneratedHeaders = actionFootprint.fullGeneratedHeaders ||
-			len(specialSources.inputs) != 0
-		sourceRefs = appendUniqueStrings(sourceRefs, actionFootprint.configSymbols...)
-		sourceInputs = append(sourceInputs, closure.sourceInputs...)
-		for _, path := range actionFootprint.sourceInputs {
-			input, err := scanner.inputForTreePath(path)
-			if err != nil {
-				return CompactObjectVariant{}, fmt.Errorf(
-					"record generated-input producer %s for %s: %w",
-					path,
-					name,
-					err,
-				)
-			}
-			sourceInputs = appendUniqueSourceInputs(sourceInputs, input)
-		}
-		for _, forcedSource := range forcedSources {
-			forcedClosure, err := scanner.closureForSourceConfigInputsSearchProfile(
-				forcedSource,
-				actionIncludeSearch,
-				config,
-				isAssemblySourcePath(source),
-				actionFootprint.providedIncludes,
-				profile,
-			)
-			if err != nil {
-				return CompactObjectVariant{}, fmt.Errorf(
-					"scan forced source input %s for %s: %w",
-					forcedSource,
-					name,
-					err,
-				)
-			}
-			sourceRefs = appendUniqueStrings(sourceRefs, forcedClosure.refs...)
-			generatedIncludes = appendUniqueStrings(
-				generatedIncludes,
-				forcedClosure.generatedIncludes...,
-			)
-			sourceInputs = appendUniqueSourceInputs(sourceInputs, forcedClosure.sourceInputs...)
-		}
-		for _, generatedSource := range actionFootprint.closureInputs {
-			generatedClosure, err := scanner.closureForSourceConfigInputsSearchProfile(
-				generatedSource,
-				actionIncludeSearch,
-				config,
-				isAssemblySourcePath(source),
-				actionFootprint.providedIncludes,
-				profile,
-			)
-			if err != nil {
-				return CompactObjectVariant{}, fmt.Errorf(
-					"scan generated source input %s for %s: %w",
-					generatedSource,
-					name,
-					err,
-				)
-			}
-			sourceRefs = appendUniqueStrings(sourceRefs, generatedClosure.refs...)
-			generatedIncludes = appendUniqueStrings(
-				generatedIncludes,
-				generatedClosure.generatedIncludes...,
-			)
-			sourceInputs = appendUniqueSourceInputs(sourceInputs, generatedClosure.sourceInputs...)
-		}
-		for _, input := range specialSources.inputs {
-			if input.path == source {
-				continue
-			}
-			specialFlags := normalizeSourceRootFlags(
-				filterResolvedKbuildFlags(object.flags, input.path),
-				opts.SourceRoot,
-			)
-			specialFlags = append(specialFlags, input.flags...)
-			specialIncludeRoots := appendUniqueStrings(
-				append([]string(nil), specialSources.includeRoots...),
-				input.includeRoots...,
-			)
-			specialIncludeRoots = appendUniqueStrings(
-				specialIncludeRoots,
-				compactIntrinsicIncludeRoots(input.path)...,
-			)
-			specialSearch, err := compactSourceActionIncludeSearch(
-				scanner,
-				input.path,
-				specialFlags,
-				specialIncludeRoots,
-			)
-			if err != nil {
-				return CompactObjectVariant{}, fmt.Errorf(
-					"model special source include search for %s of %s: %w",
-					input.path,
-					name,
-					err,
-				)
-			}
-			specialProfile := profile
-			if input.profile != sourceScanKernel {
-				specialProfile = input.profile
-			}
-			specialClosure, err := scanner.closureForSourceConfigInputsSearchProfile(
-				input.path,
-				specialSearch,
-				config,
-				isAssemblySourcePath(input.path),
-				actionFootprint.providedIncludes,
-				specialProfile,
-			)
-			if err != nil {
-				return CompactObjectVariant{}, fmt.Errorf(
-					"scan special source input %s for %s: %w",
-					input.path,
-					name,
-					err,
-				)
-			}
-			sourceRefs = appendUniqueStrings(sourceRefs, specialClosure.refs...)
-			generatedIncludes = appendUniqueStrings(
-				generatedIncludes,
-				specialClosure.generatedIncludes...,
-			)
-			sourceInputs = appendUniqueSourceInputs(sourceInputs, specialClosure.sourceInputs...)
-			if !input.compiled {
-				continue
-			}
-			specialForcedSources, err := forcedSourceInputs(specialFlags, input.path, name)
-			if err != nil {
-				return CompactObjectVariant{}, fmt.Errorf(
-					"model forced source inputs for special input %s of %s: %w",
-					input.path,
-					name,
-					err,
-				)
-			}
-			for _, forcedSource := range specialForcedSources {
-				forcedClosure, err := scanner.closureForSourceConfigInputsSearchProfile(
-					forcedSource,
-					specialSearch,
-					config,
-					isAssemblySourcePath(input.path),
-					actionFootprint.providedIncludes,
-					specialProfile,
-				)
-				if err != nil {
-					return CompactObjectVariant{}, fmt.Errorf(
-						"scan forced source input %s for special input %s of %s: %w",
-						forcedSource,
-						input.path,
-						name,
-						err,
-					)
-				}
-				sourceRefs = appendUniqueStrings(sourceRefs, forcedClosure.refs...)
-				generatedIncludes = appendUniqueStrings(
-					generatedIncludes,
-					forcedClosure.generatedIncludes...,
-				)
-				sourceInputs = appendUniqueSourceInputs(sourceInputs, forcedClosure.sourceInputs...)
-			}
-		}
-		if symversions {
-			symversionSearch, err := scanner.actionIncludeSearch(source, symversionFlags)
-			if err != nil {
-				return CompactObjectVariant{}, fmt.Errorf(
-					"model genksyms include search for %s: %w",
-					name,
-					err,
-				)
-			}
-			symversionProfile := compactGenksymsProfile(object.mode == "m")
-			appendSymversionClosure := func(closure sourceClosure) {
-				sourceRefs = appendUniqueStrings(sourceRefs, closure.refs...)
-				generatedIncludes = appendUniqueStrings(
-					generatedIncludes,
-					closure.generatedIncludes...,
-				)
-				sourceInputs = appendUniqueSourceInputs(sourceInputs, closure.sourceInputs...)
-			}
-			effectiveLanguage := compactEffectiveSourceLanguage(source)
-			if effectiveLanguage == "c" &&
-				(strings.HasSuffix(source, ".c") || strings.HasSuffix(source, ".c_shipped")) {
-				closure, err := scanner.closureForSourceConfigInputsSearchProfile(
-					source,
-					symversionSearch,
-					config,
-					false,
-					actionFootprint.providedIncludes,
-					symversionProfile,
-				)
-				if err != nil {
-					return CompactObjectVariant{}, fmt.Errorf(
-						"scan genksyms source inputs for %s: %w",
-						name,
-						err,
-					)
-				}
-				appendSymversionClosure(closure)
-			}
-			if effectiveLanguage == "c" {
-				for _, generatedSource := range actionFootprint.closureInputs {
-					closure, err := scanner.closureForSourceConfigInputsSearchProfile(
-						generatedSource,
-						symversionSearch,
-						config,
-						false,
-						actionFootprint.providedIncludes,
-						symversionProfile,
-					)
-					if err != nil {
-						return CompactObjectVariant{}, fmt.Errorf(
-							"scan genksyms generated input %s for %s: %w",
-							generatedSource,
-							name,
-							err,
-						)
-					}
-					appendSymversionClosure(closure)
-				}
-			}
-			if effectiveLanguage == "asm" {
-				headers, err := compactGenksymsAssemblyHeaders(opts.KernelVersion)
-				if err != nil {
-					return CompactObjectVariant{}, fmt.Errorf("model genksyms assembly inputs for %s: %w", name, err)
-				}
-				for _, include := range headers {
-					resolved := scanner.resolveInclude(source, include, sourceIncludeAngled, symversionSearch)
-					if len(resolved) == 0 {
-						return CompactObjectVariant{}, fmt.Errorf(
-							"model genksyms assembly inputs for %s: include <%s> does not resolve",
-							name,
-							include,
-						)
-					}
-					closure, err := scanner.closureForSourceConfigInputsSearchProfile(
-						resolved[0],
-						symversionSearch,
-						config,
-						false,
-						actionFootprint.providedIncludes,
-						symversionProfile,
-					)
-					if err != nil {
-						return CompactObjectVariant{}, fmt.Errorf(
-							"scan genksyms assembly include <%s> for %s: %w",
-							include,
-							name,
-							err,
-						)
-					}
-					appendSymversionClosure(closure)
-				}
-			}
-			genksymsForcedSources, err := forcedSourceInputs(symversionFlags, source, name)
-			if err != nil {
-				return CompactObjectVariant{}, fmt.Errorf("model genksyms forced inputs for %s: %w", name, err)
-			}
-			genksymsForcedSources = appendUnique(
-				genksymsForcedSources,
-				"include/linux/compiler_types.h",
-			)
-			sort.Strings(genksymsForcedSources)
-			for _, forcedSource := range genksymsForcedSources {
-				closure, err := scanner.closureForSourceConfigInputsSearchProfile(
-					forcedSource,
-					symversionSearch,
-					config,
-					false,
-					actionFootprint.providedIncludes,
-					symversionProfile,
-				)
-				if err != nil {
-					return CompactObjectVariant{}, fmt.Errorf(
-						"scan genksyms forced input %s for %s: %w",
-						forcedSource,
-						name,
-						err,
-					)
-				}
-				appendSymversionClosure(closure)
-			}
-		}
-	}
-	if isArm64NvheObject(name) {
-		forceAllGeneratedHeaders = true
-		for _, actionSource := range []string{
-			"arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
-			"include/linux/compiler-version.h",
-			"include/linux/kconfig.h",
-		} {
-			closure, err := scanner.closureForSourceConfigMode(actionSource, nil, config, true)
-			if err != nil {
-				return CompactObjectVariant{}, fmt.Errorf(
-					"scan arm64 nVHE action input %s for %s: %w",
-					actionSource,
-					name,
-					err,
-				)
-			}
-			sourceRefs = appendUniqueStrings(sourceRefs, closure.refs...)
-			generatedIncludes = appendUniqueStrings(
-				generatedIncludes,
-				closure.generatedIncludes...,
-			)
-			sourceInputs = appendUniqueSourceInputs(sourceInputs, closure.sourceInputs...)
-		}
-	}
-	generatedHeaderFamilyIDs, err := generatedHeaderFamilies.selectForAction(
-		generatedIncludes,
-		forceAllGeneratedHeaders,
-	)
-	if err != nil {
-		return CompactObjectVariant{}, fmt.Errorf(
-			"select generated-header families for %s: %w",
-			name,
-			err,
-		)
-	}
-	variant := object.variant(
-		config,
-		source,
-		sourceInputs,
-		members,
-		deps,
-		memberContentIDs,
-		depContentIDs,
-		opts.SourceRoot,
-		sourceRefs,
-		opts.CompileEnvironmentABI,
-		generatedHeaderFamilyIDs,
-		opts.Srcarch,
-		symversions,
-		symversionFlags,
-		symversionRemoveFlags,
-	)
-	memo[name] = variant
-	return variant, nil
-}
-
-// compactSourceAction describes the scanner-visible portion of a concrete
-// compile action. Special image objects and generated-header producers share
-// these descriptions so their per-source preprocessor contexts cannot drift.
-type compactSourceAction struct {
-	path         string
-	includeRoots []string
-	flags        []string
-	compiled     bool
-	profile      sourceScanProfile
-}
-
-type compactSpecialSourceInput = compactSourceAction
-
-type compactSpecialSourceInputs struct {
-	primary      string
-	includeRoots []string
-	inputs       []compactSpecialSourceInput
-}
-
-type compactObjectActionFootprint struct {
-	sourceInputs         []string
-	closureInputs        []string
-	providedIncludes     []string
-	configSymbols        []string
-	fullGeneratedHeaders bool
-}
-
-func compactObjectActionFootprintForObject(object string, flags []string) compactObjectActionFootprint {
-	footprint := compactObjectActionFootprint{}
-	switch object {
-	case "drivers/tty/vt/ucs.o":
-		footprint.sourceInputs = []string{
-			"drivers/tty/vt/ucs_width_table.h_shipped",
-			"drivers/tty/vt/ucs_recompose_table.h_shipped",
-			"drivers/tty/vt/ucs_fallback_table.h_shipped",
-		}
-		footprint.providedIncludes = []string{
-			"ucs_width_table.h",
-			"ucs_recompose_table.h",
-			"ucs_fallback_table.h",
-		}
-	case "drivers/scsi/scsi_sysfs.o":
-		footprint.sourceInputs = []string{"include/scsi/scsi_devinfo.h"}
-		footprint.providedIncludes = []string{"scsi_devinfo_tbl.c"}
-	case "drivers/tty/vt/consolemap_deftbl.o":
-		footprint.closureInputs = []string{"include/linux/types.h"}
-	case "drivers/of/empty_root.dtb.o":
-		footprint.closureInputs = []string{"include/asm-generic/vmlinux.lds.h"}
-	case "lib/crc/crc32-main.o":
-		footprint.providedIncludes = []string{"crc32table.h"}
-	case "lib/crc32.o":
-		footprint.providedIncludes = []string{"crc32table.h"}
-		footprint.configSymbols = []string{
-			"CONFIG_CRC32_BIT",
-			"CONFIG_CRC32_SARWATE",
-			"CONFIG_CRC32_SLICEBY4",
-		}
-	case "lib/crc/crc64-main.o", "lib/crc64.o":
-		footprint.providedIncludes = []string{"crc64table.h"}
-	case "lib/oid_registry.o":
-		footprint.sourceInputs = []string{"include/linux/oid_registry.h"}
-		footprint.providedIncludes = []string{"oid_registry_data.c"}
-	case "arch/x86/lib/inat.o":
-		footprint.sourceInputs = []string{
-			"arch/x86/lib/x86-opcode-map.txt",
-			"arch/x86/include/asm/inat.h",
-		}
-		footprint.providedIncludes = []string{"inat-tables.c"}
-	case "usr/initramfs_data.o":
-		footprint.sourceInputs = []string{"usr/default_cpio_list"}
-		footprint.providedIncludes = []string{"usr/initramfs_inc_data"}
-	case "certs/system_certificates.o":
-		footprint.providedIncludes = []string{
-			"certs/signing_key.x509",
-			"certs/x509_certificate_list",
-		}
-	case "arch/x86/kernel/cpu/capflags.o":
-		footprint.closureInputs = []string{
-			"arch/x86/include/asm/cpufeatures.h",
-			"arch/x86/include/asm/vmxfeatures.h",
-		}
-	case "arch/x86/purgatory/kexec-purgatory.o":
-		footprint.providedIncludes = []string{
-			"arch/x86/purgatory/purgatory.ro",
-		}
-	case "arch/riscv/purgatory/kexec-purgatory.o":
-		footprint.providedIncludes = []string{
-			"arch/riscv/purgatory/purgatory.ro",
-		}
-	case "arch/powerpc/purgatory/kexec-purgatory.o":
-		footprint.providedIncludes = []string{
-			"arch/powerpc/purgatory/purgatory.ro",
-		}
-	case "arch/x86/realmode/rmpiggy.o":
-		footprint.providedIncludes = []string{
-			"arch/x86/realmode/rm/realmode.bin",
-			"arch/x86/realmode/rm/realmode.relocs",
-			"pasyms.h",
-		}
-	case "arch/arm64/kernel/vdso-wrap.o":
-		footprint.providedIncludes = []string{
-			"arch/arm64/kernel/vdso/vdso.so",
-		}
-	case "arch/arm/vdso/vdso.o":
-		footprint.providedIncludes = []string{
-			"arch/arm/vdso/vdso.so",
-		}
-	case "arch/arm64/kernel/vdso32-wrap.o":
-		footprint.providedIncludes = []string{
-			"arch/arm64/kernel/vdso32/vdso.so",
-		}
-	case "arch/riscv/kernel/vdso/vdso.o":
-		footprint.providedIncludes = []string{
-			"arch/riscv/kernel/vdso/vdso.so",
-		}
-	case "arch/riscv/kernel/compat_vdso/compat_vdso.o":
-		footprint.providedIncludes = []string{
-			"arch/riscv/kernel/compat_vdso/compat_vdso.so",
-		}
-	case "arch/powerpc/kernel/vdso64_wrapper.o":
-		footprint.providedIncludes = []string{
-			"arch/powerpc/kernel/vdso/vdso64.so.dbg",
-		}
-	case "arch/powerpc/kernel/vdso32_wrapper.o":
-		footprint.providedIncludes = []string{
-			"arch/powerpc/kernel/vdso/vdso32.so.dbg",
-		}
-	case "init/version.o":
-		footprint.sourceInputs = []string{"init/version-timestamp.c"}
-	}
-	if strings.HasPrefix(object, "lib/fdt") && strings.HasSuffix(object, ".o") {
-		source := strings.TrimSuffix(filepath.Base(object), ".o") + ".c"
-		footprint.sourceInputs = appendUniqueStrings(
-			footprint.sourceInputs,
-			"scripts/dtc/libfdt/"+source,
-		)
-	}
-	if strings.HasSuffix(object, ".asn1.o") {
-		footprint.sourceInputs = appendUniqueStrings(
-			footprint.sourceInputs,
-			"scripts/asn1_compiler.c",
-		)
-		footprint.closureInputs = appendUniqueStrings(
-			footprint.closureInputs,
-			"include/linux/asn1_ber_bytecode.h",
-			"include/linux/asn1_decoder.h",
-		)
-	}
-	if flagsNeedUTSVersionTmp(flags) {
-		footprint.configSymbols = appendUniqueStrings(footprint.configSymbols,
-			"CONFIG_LOCALVERSION",
-			"CONFIG_PREEMPT_BUILD",
-			"CONFIG_PREEMPT_DYNAMIC",
-			"CONFIG_PREEMPT_RT",
-			"CONFIG_SMP",
-		)
-	}
-	if isMultiSourceImageObject(object) ||
-		object == "arch/arm/vdso/vdso.o" ||
-		object == "arch/arm64/kernel/vdso-wrap.o" ||
-		object == "arch/arm64/kernel/vdso32-wrap.o" ||
-		object == "arch/riscv/kernel/vdso/vdso.o" ||
-		object == "arch/riscv/kernel/compat_vdso/compat_vdso.o" ||
-		object == "arch/powerpc/kernel/vdso64_wrapper.o" ||
-		object == "arch/powerpc/kernel/vdso32_wrapper.o" ||
-		isArm64NvheObject(object) {
-		footprint.fullGeneratedHeaders = true
-	}
-	return footprint
-}
-
-func isMultiSourceImageObject(object string) bool {
-	return strings.HasPrefix(object, "arch/x86/entry/vdso/vdso-image-") ||
-		object == "arch/x86/realmode/rmpiggy.o" ||
-		object == "arch/x86/purgatory/kexec-purgatory.o" ||
-		object == "arch/riscv/purgatory/kexec-purgatory.o" ||
-		object == "arch/powerpc/purgatory/kexec-purgatory.o"
-}
-
-func flagsNeedUTSVersionTmp(flags []string) bool {
-	for _, flag := range flags {
-		if strings.Contains(flag, "utsversion-tmp.h") {
-			return true
-		}
-	}
-	return false
-}
-
-func compactSpecialSourcesForObject(object string) compactSpecialSourceInputs {
-	compiled := func(paths ...string) []compactSpecialSourceInput {
-		out := make([]compactSpecialSourceInput, 0, len(paths))
-		for _, path := range paths {
-			out = append(out, compactSpecialSourceInput{path: path, compiled: true})
-		}
-		return out
-	}
-	switch object {
-	case "arch/x86/entry/vdso/vdso-image-64.o":
-		inputs := compiled(
-			"arch/x86/entry/vdso/vdso-note.S",
-			"arch/x86/entry/vdso/vclock_gettime.c",
-			"arch/x86/entry/vdso/vgetcpu.c",
-			"arch/x86/entry/vdso/vgetrandom.c",
-			"arch/x86/entry/vdso/vgetrandom-chacha.S",
-			"arch/x86/entry/vdso/vdso.lds.S",
-		)
-		inputs = append(inputs, compactSpecialSourceInput{
-			path: "arch/x86/include/asm/vdso.h",
-		})
-		return compactSpecialSourceInputs{
-			primary:      "arch/x86/entry/vdso/vdso-note.S",
-			includeRoots: []string{"arch/x86/entry/vdso"},
-			inputs:       inputs,
-		}
-	case "arch/x86/realmode/rmpiggy.o":
-		return compactSpecialSourceInputs{
-			includeRoots: []string{
-				"arch/x86/boot",
-				"arch/x86/realmode/rm",
-			},
-			inputs: compiled(
-				"arch/x86/realmode/rm/header.S",
-				"arch/x86/realmode/rm/trampoline_64.S",
-				"arch/x86/realmode/rm/stack.S",
-				"arch/x86/realmode/rm/reboot.S",
-				"arch/x86/realmode/rm/wakeup_asm.S",
-				"arch/x86/realmode/rm/wakemain.c",
-				"arch/x86/realmode/rm/video-mode.c",
-				"arch/x86/realmode/rm/copy.S",
-				"arch/x86/realmode/rm/bioscall.S",
-				"arch/x86/realmode/rm/regs.c",
-				"arch/x86/realmode/rm/video-vga.c",
-				"arch/x86/realmode/rm/video-vesa.c",
-				"arch/x86/realmode/rm/video-bios.c",
-				"arch/x86/realmode/rm/realmode.lds.S",
-			),
-		}
-	case "arch/x86/purgatory/kexec-purgatory.o":
-		return compactSpecialSourceInputs{
-			inputs: compactPurgatorySourceActions("x86"),
-		}
-	case "arch/riscv/purgatory/kexec-purgatory.o":
-		return compactSpecialSourceInputs{
-			inputs: compactPurgatorySourceActions("riscv"),
-		}
-	case "arch/powerpc/purgatory/kexec-purgatory.o":
-		return compactSpecialSourceInputs{
-			inputs: compactPurgatorySourceActions("powerpc"),
-		}
-	case "arch/arm64/kernel/vdso32-wrap.o":
-		profile := func(path string, compiled bool) compactSpecialSourceInput {
-			return compactSpecialSourceInput{
-				path:     path,
-				compiled: compiled,
-				profile:  sourceScanArm32CompatVDSO,
-			}
-		}
-		return compactSpecialSourceInputs{
-			includeRoots: []string{
-				"arch/arm64/kernel/vdso32",
-				"lib/vdso",
-			},
-			inputs: []compactSpecialSourceInput{
-				profile("arch/arm64/kernel/vdso32/note.c", true),
-				profile("arch/arm64/kernel/vdso32/vgettimeofday.c", true),
-				profile("arch/arm64/kernel/vdso32/vdso.lds.S", true),
-				profile("lib/vdso/gettimeofday.c", false),
-			},
-		}
-	default:
-		return compactSpecialSourceInputs{}
-	}
-}
-
-func compactPurgatorySourceActions(srcarch string) []compactSourceAction {
-	compiled := func(path string, flags ...string) compactSourceAction {
-		return compactSourceAction{
-			path:     path,
-			flags:    append([]string(nil), flags...),
-			compiled: true,
-		}
-	}
-	commonCFlags := []string{"-DDISABLE_BRANCH_PROFILING"}
-	withCommonCFlags := func(path string, flags ...string) compactSourceAction {
-		return compiled(path, append(append([]string(nil), commonCFlags...), flags...)...)
-	}
-	switch srcarch {
-	case "x86":
-		// The x86 helper adds DISABLE_BRANCH_PROFILING to every source,
-		// including assembly.
-		common := func(path string, flags ...string) compactSourceAction {
-			return withCommonCFlags(path, flags...)
-		}
-		return []compactSourceAction{
-			common("arch/x86/purgatory/purgatory.c"),
-			common("arch/x86/purgatory/stack.S"),
-			common("arch/x86/purgatory/setup-x86_64.S"),
-			common("arch/x86/purgatory/entry64.S"),
-			common("arch/x86/boot/compressed/string.c"),
-			common("lib/crypto/sha256.c", "-D__DISABLE_EXPORTS", "-D__NO_FORTIFY"),
-		}
-	case "riscv":
-		return []compactSourceAction{
-			withCommonCFlags("arch/riscv/purgatory/purgatory.c"),
-			compiled("arch/riscv/purgatory/entry.S"),
-			withCommonCFlags("lib/crypto/sha256.c", "-D__DISABLE_EXPORTS", "-D__NO_FORTIFY"),
-			withCommonCFlags("lib/string.c", "-D__DISABLE_EXPORTS"),
-			withCommonCFlags("lib/ctype.c", "-D__DISABLE_EXPORTS"),
-			compiled("arch/riscv/lib/memcpy.S"),
-			compiled("arch/riscv/lib/memset.S"),
-			compiled("arch/riscv/lib/strcmp.S"),
-			compiled("arch/riscv/lib/strlen.S"),
-			compiled("arch/riscv/lib/strncmp.S"),
-		}
-	case "powerpc":
-		return []compactSourceAction{
-			compiled("arch/powerpc/purgatory/trampoline_64.S"),
-		}
-	default:
-		return nil
-	}
-}
-
-func compactSourceActionIncludeSearch(
-	scanner *configSourceScanner,
-	source string,
-	flags []string,
-	includeRoots []string,
-) (sourceIncludeSearch, error) {
-	search, err := scanner.actionIncludeSearch(source, flags)
-	if err != nil {
-		return sourceIncludeSearch{}, err
-	}
-	search.includeRoots = appendUniqueStrings(search.includeRoots, includeRoots...)
-	return search, nil
-}
-
-func compactIntrinsicIncludeRoots(source string) []string {
-	source = filepath.ToSlash(filepath.Clean(source))
-	if strings.HasPrefix(source, "lib/fdt") && strings.HasSuffix(source, ".c") {
-		return []string{"scripts/dtc/libfdt"}
+		names[profile.Name] = true
 	}
 	return nil
 }
 
-func isArm64NvheObject(object string) bool {
-	return object == "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o"
-}
-
-func objectNeedsFullConfig(object string) bool {
-	return object == "arch/x86/purgatory/kexec-purgatory.o" ||
-		object == "arch/riscv/purgatory/kexec-purgatory.o" ||
-		object == "arch/powerpc/purgatory/kexec-purgatory.o"
-}
-
-func includeDirsFromFlags(flags []string, source string) ([]string, error) {
-	var dirs []string
-	pathFlags, err := sourcePathFlags(flags)
-	if err != nil {
-		return nil, err
-	}
-	for _, flag := range pathFlags {
-		if flag.compilerProvided {
-			continue
-		}
-		if flag.option == "-include" || flag.option == "-imacros" {
-			continue
-		}
-		class, path, err := resolveSourceFlagPath(flag.path, source)
-		if err != nil {
-			return nil, fmt.Errorf("%s path %q: %w", flag.option, flag.path, err)
-		}
-		if class == sourceFlagPathTree {
-			dirs = appendUnique(dirs, path)
-		}
-	}
-	return dirs, nil
-}
-
-func defaultForcedSourceInputs(source string) []string {
-	out := []string{
-		"include/linux/compiler-version.h",
-		"include/linux/kconfig.h",
-	}
-	if !strings.HasSuffix(source, ".S") && !strings.HasSuffix(source, ".s") {
-		out = append(out, "include/linux/compiler_types.h")
-	}
-	sort.Strings(out)
-	return out
-}
-
-func forcedSourceInputs(flags []string, source, object string) ([]string, error) {
-	out := defaultForcedSourceInputs(source)
-	pathFlags, err := sourcePathFlags(flags)
-	if err != nil {
-		return nil, err
-	}
-	for _, flag := range pathFlags {
-		if flag.compilerProvided {
-			continue
-		}
-		if flag.option != "-include" && flag.option != "-imacros" {
-			continue
-		}
-		class, path, err := resolveSourceFlagPath(flag.path, source)
-		if err != nil {
-			return nil, fmt.Errorf("%s path %q: %w", flag.option, flag.path, err)
-		}
-		if isGeneratedUTSVersionForcedInput(path, object) {
-			continue
-		}
-		switch class {
-		case sourceFlagPathTree:
-			if path == "" {
-				return nil, fmt.Errorf("%s path %q does not name a source-tree file", flag.option, flag.path)
-			}
-			out = appendUnique(out, path)
-		case sourceFlagPathObject:
-			if filepath.Base(path) != "utsversion-tmp.h" {
-				return nil, fmt.Errorf(
-					"%s path %q names an unmodeled generated forced include",
-					flag.option,
-					flag.path,
-				)
-			}
-		case sourceFlagPathExternal:
-			return nil, fmt.Errorf(
-				"%s path %q is outside the source tree",
-				flag.option,
-				flag.path,
-			)
-		}
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
-func isGeneratedUTSVersionForcedInput(path, object string) bool {
-	path = filepath.ToSlash(filepath.Clean(path))
-	if path == "utsversion-tmp.h" {
-		return true
-	}
-	objectDir := filepath.ToSlash(filepath.Dir(object))
-	return objectDir != "." && path == objectDir+"/utsversion-tmp.h"
-}
-
-func (o resolvedKbuildObject) variant(
-	config *ResolvedConfig,
-	source string,
-	sourceInputs []CompactSourceInput,
-	members []string,
-	deps []string,
-	memberContentIDs []string,
-	depContentIDs []string,
-	sourceRoot string,
-	sourceRefs []string,
-	compileEnvironmentABI string,
-	generatedHeaderFamilyIDs []string,
-	srcarch string,
-	symversions bool,
-	symversionFlags []string,
-	symversionRemoveFlags []string,
-) CompactObjectVariant {
-	fragment := map[string]string{}
-	refset := make(map[string]bool, len(o.footprint)+len(sourceRefs))
-	if len(members) == 0 {
-		for ref := range o.footprint {
-			refset[ref] = true
-		}
-	}
-	for _, ref := range sourceRefs {
-		refset[ref] = true
-	}
-	if source != "" || isArm64NvheObject(o.object) {
-		for _, ref := range KernelFlagsConfigSymbols(srcarch) {
-			refset[ref] = true
-		}
-	}
-	if objectNeedsFullConfig(o.object) {
-		for key, written := range config.Written {
-			if written {
-				refset[key] = true
-			}
-		}
-	}
-	refs := make([]string, 0, len(refset))
-	for ref := range refset {
-		refs = append(refs, ref)
-	}
-	sort.Strings(refs)
-	for _, ref := range refs {
-		if config.ShouldWrite(ref) {
-			fragment[ref] = config.Value(ref)
-		} else {
-			fragment[ref] = "n"
-		}
-	}
-	flags := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.flags, source), sourceRoot)
-	remove := normalizeSourceRootFlags(filterResolvedKbuildFlags(o.remove, source), sourceRoot)
-	modname := o.modname
-	moduleRoot := o.root && o.mode == "m"
-	compileComposite := isArm64NvheObject(o.object)
-	if len(members) != 0 {
-		modname = ""
-		flags = nil
-		remove = nil
-		deps = nil
-		depContentIDs = nil
-		if !compileComposite {
-			sourceInputs = nil
-		}
-	}
-	contentID := ""
-	compileEnvironmentID := ""
-	usesCompileEnvironment := len(members) == 0 || compileComposite
-	if usesCompileEnvironment {
-		payload := newCompactConfigPayload(fragment)
-		environment := newCompactCompileEnvironment(
-			compileEnvironmentABI,
-			payload.ID,
-			generatedHeaderFamilyIDs,
-		)
-		compileEnvironmentID = environment.ID
-	} else {
-		fragment = map[string]string{}
-	}
-	contentID = objectVariantContentID(
-		o.object,
-		o.mode,
-		modname,
-		flags,
-		remove,
-		compileEnvironmentID,
-		source,
-		sourceInputs,
-		depContentIDs,
-		memberContentIDs,
-		compileEnvironmentABI,
-		moduleRoot,
-		o.objtoolDisabled,
-		o.objtoolForce,
-		o.objtoolArgs,
-		symversions,
-		symversionFlags,
-		symversionRemoveFlags,
-	)
-	return CompactObjectVariant{
-		Target:             sanitizeTargetName(strings.TrimSuffix(o.object, ".o")) + "__" + compactShortID(contentID),
-		ContentID:          contentID,
-		CompileEnvironment: compileEnvironmentID,
-		Object:             o.object,
-		Source:             source,
-		sourceInputs:       append([]CompactSourceInput(nil), sourceInputs...),
-		Mode:               o.mode,
-		ModuleRoot:         moduleRoot,
-		ModName:            modname,
-		Flags:              flags,
-		RemoveFlags:        remove,
-		ObjtoolArgs:        append([]string(nil), o.objtoolArgs...),
-		ObjtoolDisabled:    o.objtoolDisabled,
-		ObjtoolForce:       o.objtoolForce,
-		Symversions:        symversions,
-		SymversionFlags:    append([]string(nil), symversionFlags...),
-		SymversionRemoveFlags: append(
-			[]string(nil),
-			symversionRemoveFlags...,
-		),
-		configFragment: fragment,
-		Deps:           append([]string(nil), deps...),
-		Members:        append([]string(nil), members...),
-		generatedHeaderFamilyIDs: append(
-			[]string(nil),
-			generatedHeaderFamilyIDs...,
-		),
-	}
-}
-
-func normalizeSourceRootFlags(flags []string, sourceRoot string) []string {
-	if sourceRoot == "" {
-		return flags
-	}
-	sourceRoot = normalizeCompactPath(sourceRoot)
-	if sourceRoot == "." || sourceRoot == "/" {
-		return flags
-	}
-	out := make([]string, len(flags))
-	changed := false
-	for i, flag := range flags {
-		normalized := normalizeSourceRootFlag(flag, sourceRoot)
-		if normalized != flag {
-			changed = true
-		}
-		out[i] = normalized
-	}
-	if !changed {
-		return flags
+func cloneKbuildRules(rules []KbuildRule) []KbuildRule {
+	out := append([]KbuildRule(nil), rules...)
+	for i := range out {
+		out[i].Targets = append([]string(nil), out[i].Targets...)
+		out[i].Prerequisites = append([]string(nil), out[i].Prerequisites...)
+		out[i].OrderOnly = append([]string(nil), out[i].OrderOnly...)
+		out[i].Recipe = append([]string(nil), out[i].Recipe...)
+		out[i].Condition = cloneKbuildCondition(out[i].Condition)
 	}
 	return out
 }
 
-func normalizeSourceRootFlag(flag, sourceRoot string) string {
-	for _, prefix := range []string{"-I", "-iquote", "-isystem", "-include"} {
-		path := strings.TrimPrefix(flag, prefix)
-		if path == flag {
+func cloneKbuildTargetVariables(variables []KbuildTargetVariable) []KbuildTargetVariable {
+	out := append([]KbuildTargetVariable(nil), variables...)
+	for i := range out {
+		out[i].Targets = append([]string(nil), out[i].Targets...)
+		out[i].Modifiers = append([]string(nil), out[i].Modifiers...)
+	}
+	return out
+}
+
+func cloneKbuildCondition(condition KbuildCondition) KbuildCondition {
+	condition.Conditions = append([]KbuildCondition(nil), condition.Conditions...)
+	for i := range condition.Conditions {
+		condition.Conditions[i] = cloneKbuildCondition(condition.Conditions[i])
+	}
+	return condition
+}
+
+func evaluatedKbuildTargetRuleContext(profile CompactKbuildProfile, target string) ([]string, []string, string, error) {
+	// The root directory goal is source-defined control flow, not an artifact.
+	// Its evaluator match may come from a normalized duplicate declaration whose
+	// rule index is intentionally absent from the compact artifact-rule index;
+	// resolve the merged declaration context directly instead.
+	if compactKbuildGraphTargetPath(target) == "." {
+		return evaluatedKbuildSelectedTargetRuleContext(profile, target, nil)
+	}
+	if profile.evaluator != nil {
+		selected, found, err := (&CompactMetadata{}).compactKbuildRuleForProfile(profile, target)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		if found {
+			return evaluatedKbuildSelectedTargetRuleContext(profile, target, &selected)
+		}
+	}
+	return evaluatedKbuildSelectedTargetRuleContext(profile, target, nil)
+}
+
+// EvaluateCompactKbuildTargetRuleContext returns the canonical prerequisites
+// and pattern stem of the exact GNU Make rule context selected for target.
+// Unlike the exported declaration snapshot, this includes prerequisites merged
+// from explicit declarations into the selected implicit or explicit recipe.
+func EvaluateCompactKbuildTargetRuleContext(profile CompactKbuildProfile, target string) ([]string, []string, string, error) {
+	return evaluatedKbuildTargetRuleContext(profile, target)
+}
+
+type compactKbuildEvaluatedPath struct {
+	graphPath string
+	makeWord  string
+}
+
+type compactKbuildEvaluatedRuleContext struct {
+	target    compactKbuildEvaluatedPath
+	normal    []compactKbuildEvaluatedPath
+	orderOnly []compactKbuildEvaluatedPath
+	stem      string
+}
+
+var compactKbuildStableMakeWordReplacer = strings.NewReplacer(
+	"${tree:kernel}", "__LINUX_BZL_SOURCE_TREE__",
+	"${tree:prep}", "__LINUX_BZL_OBJECT_TREE__",
+	"${tree:host}", "__LINUX_BZL_OBJECT_TREE__",
+	"${tree:bootstrap}", "__LINUX_BZL_OBJECT_TREE__",
+	"${tree:prehost}", "__LINUX_BZL_OBJECT_TREE__",
+)
+
+func compactKbuildStableMakeWord(profile CompactKbuildProfile, value string) (string, error) {
+	value = compactKbuildStableMakeWordReplacer.Replace(strings.TrimSpace(filepathToSlash(value)))
+	// GNU Make interns relative file names without a leading ./ before binding
+	// automatic variables. The parser sees the expanded declaration text, so
+	// mirror that one normalization without path-cleaning the remaining word.
+	for strings.HasPrefix(value, "./") {
+		value = strings.TrimPrefix(value, "./")
+	}
+	if !filepath.IsAbs(filepath.FromSlash(value)) || profile.evaluator == nil || profile.evaluator.template == nil {
+		return value, nil
+	}
+	type rootMatch struct {
+		marker   string
+		root     string
+		relative string
+	}
+	matches := []rootMatch{}
+	for marker, rawRoot := range profile.evaluator.template.sourceRoots {
+		root, err := filepath.Abs(rawRoot)
+		if err != nil {
 			continue
 		}
-		if path == "" {
-			return flag
+		candidates := []string{filepath.Clean(root)}
+		if resolved, err := filepath.EvalSymlinks(root); err == nil && resolved != candidates[0] {
+			candidates = append(candidates, filepath.Clean(resolved))
 		}
-		path = normalizeCompactPath(path)
-		if path == sourceRoot {
-			return prefix + "$(srctree)"
-		}
-		if strings.HasPrefix(path, sourceRoot+"/") {
-			return prefix + "$(srctree)/" + strings.TrimPrefix(path, sourceRoot+"/")
-		}
-		return prefix + path
-	}
-	flag = normalizeCompactPath(flag)
-	if flag == sourceRoot {
-		return "$(srctree)"
-	}
-	if strings.HasPrefix(flag, sourceRoot+"/") {
-		return "$(srctree)/" + strings.TrimPrefix(flag, sourceRoot+"/")
-	}
-	return flag
-}
-
-func normalizeCompactPath(path string) string {
-	return filepath.ToSlash(filepath.Clean(strings.ReplaceAll(path, `\`, "/")))
-}
-
-func filterResolvedKbuildFlags(groups []resolvedKbuildFlag, source string) []string {
-	out := []string{}
-	for _, group := range groups {
-		if !kbuildFlagLanguageMatchesSource(group.language, source) {
-			continue
-		}
-		out = append(out, group.values...)
-	}
-	return stripCompilerBuiltinIncludeDirectoryShellFlags(out)
-}
-
-func filterResolvedKbuildFlagsForLanguage(groups []resolvedKbuildFlag, language string) []string {
-	out := []string{}
-	for _, group := range groups {
-		if group.language != "" && group.language != "any" && group.language != language {
-			continue
-		}
-		out = append(out, group.values...)
-	}
-	return stripCompilerBuiltinIncludeDirectoryShellFlags(out)
-}
-
-func stripCompilerBuiltinIncludeDirectoryShellFlags(flags []string) []string {
-	out := make([]string, 0, len(flags))
-	for i := 0; i < len(flags); i++ {
-		if flags[i] == "-isystem" && i+1 < len(flags) {
-			if _, last, ok := compilerBuiltinIncludeDirectoryShell(flags, i+1); ok {
-				i = last
+		for _, candidate := range candidates {
+			relative, ok := compactKbuildPathRelativeToRoot(candidate, filepath.FromSlash(value))
+			if !ok {
 				continue
 			}
-		}
-		out = append(out, flags[i])
-	}
-	return out
-}
-
-var compactSymversionConfigSymbols = []string{
-	"CONFIG_ASM_MODVERSIONS",
-	"CONFIG_BASIC_MODVERSIONS",
-	"CONFIG_GENKSYMS",
-	"CONFIG_MODVERSIONS",
-}
-
-func compactSymversionsEnabled(config *ResolvedConfig, source string) bool {
-	if config == nil || !config.ShouldWrite("CONFIG_MODVERSIONS") || config.Value("CONFIG_MODVERSIONS") != "y" {
-		return false
-	}
-	switch compactEffectiveSourceLanguage(source) {
-	case "c":
-		return true
-	case "asm":
-		return config.ShouldWrite("CONFIG_ASM_MODVERSIONS") && config.Value("CONFIG_ASM_MODVERSIONS") == "y"
-	default:
-		return false
-	}
-}
-
-func compactEffectiveSourceLanguage(source string) string {
-	switch filepath.Ext(source) {
-	case ".S", ".s", ".dts", ".dtso", ".pl":
-		return "asm"
-	case ".c", ".asn1", ".c_shipped", ".sh", ".uni":
-		return "c"
-	default:
-		return ""
-	}
-}
-
-func compactGenksymsProfile(module bool) sourceScanProfile {
-	if module {
-		return sourceScanModuleGenksyms
-	}
-	return sourceScanKernelGenksyms
-}
-
-func compactGenksymsAssemblyHeaders(version string) ([]string, error) {
-	parts := strings.Split(version, ".")
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("kernel version %q does not contain a major and minor version", version)
-	}
-	major, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return nil, fmt.Errorf("kernel version %q has an invalid major version", version)
-	}
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return nil, fmt.Errorf("kernel version %q has an invalid minor version", version)
-	}
-	headers := []string{"linux/kernel.h"}
-	if major > 6 || (major == 6 && minor >= 18) {
-		headers = append(headers, "linux/string.h")
-	}
-	return append(headers, "asm/asm-prototypes.h"), nil
-}
-
-func kbuildFlagLanguageMatchesSource(language string, source string) bool {
-	if language == "" || language == "any" || source == "" {
-		return true
-	}
-	switch filepath.Ext(source) {
-	case ".c":
-		return language == "c"
-	case ".asn1", ".c_shipped", ".sh", ".uni":
-		// These source paths are explicit generator mappings whose outputs
-		// are compiled as C.
-		return language == "c"
-	case ".S", ".s":
-		return language == "asm"
-	case ".dts", ".dtso", ".pl":
-		// Kbuild turns DTB inputs into generated assembly wrappers, while
-		// the explicit perlasm source mappings emit assembly sources.
-		return language == "asm"
-	default:
-		return true
-	}
-}
-
-func sourceForObject(sourceRoot, objectDir, object string, sourceRoots map[string]string) string {
-	if !strings.HasSuffix(object, ".o") {
-		return ""
-	}
-	for _, mapped := range sourceCandidatesForObject(object) {
-		candidate := filepath.ToSlash(filepath.Join(objectDir, mapped))
-		if sourceRoot != "" && fileExists(filepath.Join(sourceRoot, filepath.FromSlash(candidate))) {
-			return candidate
-		}
-		if mappedPath, ok := mappedSourceRootPath(candidate, sourceRoots); ok && fileExists(mappedPath) {
-			return candidate
+			matches = append(matches, rootMatch{marker: marker, root: candidate, relative: relative})
 		}
 	}
-	stem := strings.TrimSuffix(object, ".o")
-	for _, ext := range []string{".c", ".S", ".s"} {
-		candidate := filepath.ToSlash(filepath.Join(objectDir, stem+ext))
-		if sourceRoot != "" && fileExists(filepath.Join(sourceRoot, filepath.FromSlash(candidate))) {
-			return candidate
+	if len(matches) == 0 {
+		return value, nil
+	}
+	priority := func(marker string) int {
+		switch marker {
+		case "__LINUX_BZL_SOURCE_TREE__":
+			return 0
+		case "__LINUX_BZL_OBJECT_TREE__":
+			return 1
+		default:
+			return 2
 		}
-		if mappedPath, ok := mappedSourceRootPath(candidate, sourceRoots); ok && fileExists(mappedPath) {
-			return candidate
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if len(matches[i].root) != len(matches[j].root) {
+			return len(matches[i].root) > len(matches[j].root)
+		}
+		if priority(matches[i].marker) != priority(matches[j].marker) {
+			return priority(matches[i].marker) < priority(matches[j].marker)
+		}
+		return matches[i].marker < matches[j].marker
+	})
+	selected := matches[0]
+	if selected.relative == "" {
+		return selected.marker, nil
+	}
+	return selected.marker + "/" + filepathToSlash(selected.relative), nil
+}
+
+func compactKbuildEvaluatedPathNamespace(value string) string {
+	value = strings.TrimSpace(filepathToSlash(value))
+	for _, candidate := range []struct {
+		marker    string
+		namespace string
+	}{
+		{"__LINUX_BZL_SOURCE_TREE__", "source"},
+		{"__LINUX_BZL_OBJECT_TREE__", "object"},
+	} {
+		if value == candidate.marker || strings.HasPrefix(value, candidate.marker+"/") {
+			return candidate.namespace
 		}
 	}
 	return ""
 }
 
-func sourceCandidatesForObject(object string) []string {
-	stem := strings.TrimSuffix(object, ".o")
-	var out []string
-	if base, ok := strings.CutSuffix(stem, ".pi"); ok {
-		for _, ext := range []string{".c", ".S", ".s"} {
-			out = append(out, base+ext)
+// evaluatedKbuildSelectedTargetRuleContext expands the prerequisites of the
+// exact rule selected by compactKbuildRuleForProfile. Its public shape remains
+// canonical graph paths for dependency traversal; the paired Make spellings
+// are retained by evaluatedKbuildSelectedTargetMakeContext for automatic
+// variables and exact textual functions such as filter/filter-out.
+func evaluatedKbuildSelectedTargetRuleContext(
+	profile CompactKbuildProfile,
+	target string,
+	selectedMatch *compactKbuildRuleMatch,
+) ([]string, []string, string, error) {
+	context, err := evaluatedKbuildSelectedTargetMakeContext(profile, target, selectedMatch)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	normal := make([]string, len(context.normal))
+	for index, prerequisite := range context.normal {
+		normal[index] = prerequisite.graphPath
+	}
+	orderOnly := make([]string, len(context.orderOnly))
+	for index, prerequisite := range context.orderOnly {
+		orderOnly[index] = prerequisite.graphPath
+	}
+	return normal, orderOnly, context.stem, nil
+}
+
+// evaluatedKbuildSelectedTargetMakeContext retains both identities of every
+// selected rule word: graphPath is the canonical producer key, while makeWord
+// is the already-expanded spelling GNU Make placed in $@/$</$^/$+/$|. The two
+// must not be reconstructed from the eventual Bazel input edge: a source edge
+// may transport an object-tree config projection, and a relative prerequisite
+// deliberately remains relative during Make functions.
+func evaluatedKbuildSelectedTargetMakeContext(
+	profile CompactKbuildProfile,
+	target string,
+	selectedMatch *compactKbuildRuleMatch,
+) (compactKbuildEvaluatedRuleContext, error) {
+	return evaluatedKbuildTargetMakeContext(profile, target, selectedMatch, true)
+}
+
+// evaluatedKbuildSelectedRuleDeclarationContext expands only the
+// prerequisites declared by the candidate which owns the selected recipe.
+// GNU Make uses that declaration-local context while deciding whether an
+// implicit rule can be applied. Prerequisites from recipe-less explicit
+// declarations are merged only after the implicit recipe has been selected.
+func evaluatedKbuildSelectedRuleDeclarationContext(
+	profile CompactKbuildProfile,
+	target string,
+	selectedMatch compactKbuildRuleMatch,
+) ([]string, []string, string, error) {
+	context, err := evaluatedKbuildTargetMakeContext(profile, target, &selectedMatch, false)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	normal := make([]string, len(context.normal))
+	for index, prerequisite := range context.normal {
+		normal[index] = prerequisite.graphPath
+	}
+	orderOnly := make([]string, len(context.orderOnly))
+	for index, prerequisite := range context.orderOnly {
+		orderOnly[index] = prerequisite.graphPath
+	}
+	return normal, orderOnly, context.stem, nil
+}
+
+func evaluatedKbuildTargetMakeContext(
+	profile CompactKbuildProfile,
+	target string,
+	selectedMatch *compactKbuildRuleMatch,
+	mergeExplicitPrerequisites bool,
+) (compactKbuildEvaluatedRuleContext, error) {
+	target = compactKbuildGraphTargetPath(target)
+	lookupTarget := target
+	if selectedMatch != nil {
+		lookupTarget = selectedMatch.lookupTarget
+	}
+	type match struct {
+		rule        KbuildRule
+		target      string
+		targetOrder int
+		makeTarget  string
+		stem        string
+		specificity int
+		ruleOrder   int
+	}
+	matches := []match{}
+	for _, candidate := range compactKbuildRuleCandidatesForMakeTarget(profile, target, lookupTarget) {
+		rawTarget := target
+		if candidate.targetOrder >= 0 && candidate.targetOrder < len(candidate.rule.Targets) {
+			rawTarget = instantiateKbuildRulePattern(candidate.rule.Targets[candidate.targetOrder], candidate.stem)
 		}
-		if dir, file := filepath.Split(base); strings.HasPrefix(file, "lib-") {
-			for _, ext := range []string{".c", ".S", ".s"} {
-				out = append(out, filepath.ToSlash(filepath.Join("lib", strings.TrimPrefix(file, "lib-")+ext)))
-				out = append(out, filepath.ToSlash(filepath.Join(dir, strings.TrimPrefix(file, "lib-")+ext)))
+		makeTarget, err := compactKbuildStableMakeWord(profile, rawTarget)
+		if err != nil {
+			return compactKbuildEvaluatedRuleContext{}, err
+		}
+		matches = append(matches, match{
+			rule: candidate.rule, target: candidate.target, targetOrder: candidate.targetOrder,
+			makeTarget: makeTarget, stem: candidate.stem,
+			specificity: len(strings.ReplaceAll(candidate.target, "%", "")), ruleOrder: candidate.ruleOrder,
+		})
+	}
+	if len(matches) == 0 {
+		return compactKbuildEvaluatedRuleContext{}, fmt.Errorf("target %q profile %q has no evaluated rule", target, profile.Name)
+	}
+	selected := matches[0]
+	if selectedMatch != nil {
+		found := false
+		for _, candidate := range matches {
+			if candidate.ruleOrder == selectedMatch.ruleOrder && candidate.targetOrder == selectedMatch.targetOrder && candidate.stem == selectedMatch.stem {
+				selected = candidate
+				found = true
+				break
+			}
+		}
+		if !found {
+			return compactKbuildEvaluatedRuleContext{}, fmt.Errorf(
+				"target %q profile %q selected rule %d with stem %q is absent from evaluated candidates",
+				target, profile.Name, selectedMatch.ruleOrder, selectedMatch.stem,
+			)
+		}
+	} else {
+		for _, candidate := range matches[1:] {
+			if candidate.specificity > selected.specificity {
+				selected = candidate
 			}
 		}
 	}
-	if base, ok := strings.CutSuffix(stem, ".nvhe"); ok {
-		for _, ext := range []string{".c", ".S", ".s"} {
-			out = append(out, base+ext)
+	selectedRules := []match{selected}
+	// GNU Make combines every ordinary explicit declaration with the selected
+	// recipe even when that recipe comes from an implicit pattern. Kbuild's
+	// multi_depend macro relies on the explicit/explicit form, while ordinary
+	// suffix fallback uses the explicit-prerequisite/implicit-recipe form. This
+	// merge happens after implicit-rule viability has selected the recipe.
+	if mergeExplicitPrerequisites && selected.rule.Separator != "::" {
+		doubleColon := selected.rule.Separator == "::"
+		for _, candidate := range matches {
+			if candidate.ruleOrder == selected.ruleOrder && candidate.stem == selected.stem {
+				continue
+			}
+			if strings.Contains(candidate.target, "%") {
+				continue
+			}
+			if doubleColon || candidate.rule.Separator == "::" {
+				return compactKbuildEvaluatedRuleContext{}, fmt.Errorf(
+					"target %q profile %q mixes independent double-colon and merged rule contexts",
+					target, profile.Name,
+				)
+			}
+			selectedRules = append(selectedRules, candidate)
 		}
 	}
-	if base, ok := strings.CutSuffix(stem, ".stub"); ok {
-		for _, ext := range []string{".c", ".S", ".s"} {
-			out = append(out, base+ext)
-		}
-		if dir, file := filepath.Split(base); strings.HasPrefix(file, "lib-") {
-			for _, ext := range []string{".c", ".S", ".s"} {
-				out = append(out, filepath.ToSlash(filepath.Join("lib", strings.TrimPrefix(file, "lib-")+ext)))
-				out = append(out, filepath.ToSlash(filepath.Join(dir, strings.TrimPrefix(file, "lib-")+ext)))
+	expand := func(orderOnly bool) ([]compactKbuildEvaluatedPath, error) {
+		out := []compactKbuildEvaluatedPath{}
+		for _, candidate := range selectedRules {
+			values := candidate.rule.Prerequisites
+			if orderOnly {
+				values = candidate.rule.OrderOnly
+			}
+			for _, value := range values {
+				makeWord, err := compactKbuildStableMakeWord(
+					profile, instantiateKbuildRulePattern(value, candidate.stem),
+				)
+				if err != nil {
+					return nil, err
+				}
+				graphPath := instantiateKbuildRulePattern(compactKbuildProfileTargetPath(profile, value), candidate.stem)
+				graphPath = compactKbuildGraphTargetPath(graphPath)
+				if graphPath != "" {
+					out = append(out, compactKbuildEvaluatedPath{graphPath: graphPath, makeWord: makeWord})
+				}
 			}
 		}
+		return out, nil
 	}
-	if base, ok := strings.CutSuffix(stem, ".asn1"); ok {
-		out = append(out, base+".asn1")
+	normal, err := expand(false)
+	if err != nil {
+		return compactKbuildEvaluatedRuleContext{}, err
 	}
-	if base, ok := strings.CutSuffix(stem, ".dtb"); ok {
-		out = append(out, base+".dts")
+	orderOnly, err := expand(true)
+	if err != nil {
+		return compactKbuildEvaluatedRuleContext{}, err
 	}
-	if base, ok := strings.CutSuffix(stem, ".dtbo"); ok {
-		out = append(out, base+".dtso")
+	if len(orderOnly) != 0 {
+		normalSet := make(map[string]bool, len(normal))
+		for _, prerequisite := range normal {
+			normalSet[prerequisite.graphPath] = true
+		}
+		filtered := orderOnly[:0]
+		for _, prerequisite := range orderOnly {
+			if !normalSet[prerequisite.graphPath] {
+				filtered = append(filtered, prerequisite)
+			}
+		}
+		orderOnly = filtered
 	}
-	switch object {
-	case "arch/riscv/kernel/pi/ctype.pi.o":
-		out = append(out, "lib/ctype.c")
-	case "arch/riscv/kernel/pi/string.pi.o":
-		out = append(out, "lib/string.c")
-	case "arch/x86/entry/vdso/vdso-image-64.o":
-		out = append(out, "arch/x86/entry/vdso/vdso2c.c")
-	case "arch/x86/kernel/cpu/capflags.o":
-		// linux_object still carries this nominal src as a direct action input;
-		// the exact producer headers are added by compactObjectActionFootprint.
-		out = append(out, "arch/x86/kernel/cpu/mkcapflags.sh")
-	case "drivers/tty/vt/consolemap_deftbl.o":
-		out = append(out, "drivers/tty/vt/cp437.uni")
-	case "drivers/tty/vt/defkeymap.o":
-		out = append(out, "drivers/tty/vt/defkeymap.c_shipped")
-	case "fs/unicode/utf8data.o":
-		out = append(out, "fs/unicode/utf8data.c_shipped")
-	case "lib/crypto/arm64/poly1305-core.o":
-		out = append(out, "lib/crypto/arm64/poly1305-armv8.pl")
-	case "lib/crypto/arm64/sha256-core.o", "lib/crypto/arm64/sha512-core.o":
-		out = append(out, "lib/crypto/arm64/sha2-armv8.pl")
-	case "lib/crypto/arm/poly1305-core.o":
-		out = append(out, "lib/crypto/arm/poly1305-armv4.pl")
-	case "lib/crypto/arm/sha256-core.o":
-		out = append(out, "lib/crypto/arm/sha256-armv4.pl")
-	case "lib/crypto/arm/sha512-core.o":
-		out = append(out, "lib/crypto/arm/sha512-armv4.pl")
-	case "lib/crypto/riscv/poly1305-core.o":
-		out = append(out, "lib/crypto/riscv/poly1305-riscv.pl")
-	case "lib/crypto/x86/poly1305-x86_64-cryptogams.o":
-		out = append(out, "lib/crypto/x86/poly1305-x86_64-cryptogams.pl")
+	return compactKbuildEvaluatedRuleContext{
+		target: compactKbuildEvaluatedPath{graphPath: target, makeWord: selected.makeTarget},
+		normal: normal, orderOnly: orderOnly, stem: selected.stem,
+	}, nil
+}
+
+func compactKbuildRuleTargetStem(
+	profile CompactKbuildProfile,
+	rule KbuildRule,
+	declaredTarget string,
+	target string,
+) (string, bool) {
+	stem, ok := matchKbuildRulePattern(declaredTarget, target)
+	if !ok {
+		return "", false
 	}
-	if dir, file := filepath.Split(stem); strings.HasPrefix(file, "lib-") {
-		for _, ext := range []string{".c", ".S", ".s"} {
-			out = append(out, filepath.ToSlash(filepath.Join("lib", strings.TrimPrefix(file, "lib-")+ext)))
-			out = append(out, filepath.ToSlash(filepath.Join(dir, strings.TrimPrefix(file, "lib-")+ext)))
+	if rule.TargetPattern == "" {
+		return stem, true
+	}
+	return matchKbuildRulePattern(compactKbuildProfileTargetPath(profile, rule.TargetPattern), target)
+}
+
+// CompactKbuildProfileInvocationLocation returns the evaluated Make process's
+// typed working directory. A profile's Directory is the logical obj= directory
+// and is not necessarily the process cwd (scripts/Makefile.build is normally
+// evaluated from the object root). Profiles assembled by recursive discovery
+// must carry an explicit location so physical parser paths cannot leak into
+// invocation-tree semantics.
+func CompactKbuildProfileInvocationLocation(profile CompactKbuildProfile) (CompactKbuildInvocationLocation, bool) {
+	if !profile.invocationLocationSet {
+		return CompactKbuildInvocationLocation{}, false
+	}
+	return profile.invocationLocation, true
+}
+
+func compactKbuildPathRelativeToRoot(root, candidate string) (string, bool) {
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	if relative == "." {
+		return "", true
+	}
+	return filepath.ToSlash(relative), true
+}
+
+func compactKbuildProfileInvocationRelativePath(profile CompactKbuildProfile, value string) (string, bool) {
+	location, ok := CompactKbuildProfileInvocationLocation(profile)
+	workingDirectory := location.Directory
+	if !ok || workingDirectory == "" || value == workingDirectory || strings.HasPrefix(value, workingDirectory+"/") {
+		return value, ok
+	}
+	return path.Join(workingDirectory, value), true
+}
+
+func compactKbuildProfileTargetPath(profile CompactKbuildProfile, value string) string {
+	// Make expands $(srctree), $(objtree), $(src), and $(obj) before captured
+	// rules reach the action planner.  Strip the physical executor root here as
+	// well as the symbolic spellings below so prerequisites and targets cannot
+	// retain a local or remote execroot path.  The generated/source distinction
+	// is resolved later from the evaluated producer graph; at this boundary we
+	// only need the stable logical path within the invocation tree.
+	trimmed := strings.TrimSpace(value)
+	// The root Makefile uses `.` as an invocation-local phony directory goal.
+	// Preserve it as control-flow identity; it is never emitted as an artifact
+	// path, but recursive invocation dependencies may legitimately be owned by
+	// that selected source target.
+	if trimmed == "." || trimmed == "./" {
+		return "."
+	}
+	rootRelative := false
+	if filepath.IsAbs(trimmed) && profile.evaluator != nil && profile.evaluator.template != nil {
+		roots := map[string]bool{}
+		for _, configured := range profile.evaluator.template.sourceRoots {
+			if configured == "" {
+				continue
+			}
+			root, err := filepath.Abs(configured)
+			if err != nil {
+				continue
+			}
+			root = filepath.Clean(root)
+			roots[root] = true
+			if resolved, err := filepath.EvalSymlinks(root); err == nil {
+				roots[filepath.Clean(resolved)] = true
+			}
+		}
+		ordered := make([]string, 0, len(roots))
+		for root := range roots {
+			ordered = append(ordered, root)
+		}
+		sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+		for _, root := range ordered {
+			relative, err := filepath.Rel(root, filepath.Clean(trimmed))
+			if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				continue
+			}
+			value = filepath.ToSlash(relative)
+			rootRelative = true
+			break
 		}
 	}
-	return out
+	value = canonicalKbuildRulePath(value)
+	if value == "" || value == "FORCE" {
+		return value
+	}
+	for _, prefix := range []string{
+		"$(srctree)/", "${srctree}/", "$(objtree)/", "${objtree}/",
+		"${tree:kernel}/", "${tree:prep}/", "${tree:host}/", "${tree:bootstrap}/", "${tree:prehost}/",
+		"__LINUX_BZL_SOURCE_TREE__/", "__LINUX_BZL_OBJECT_TREE__/",
+	} {
+		if strings.HasPrefix(value, prefix) {
+			return strings.TrimPrefix(value, prefix)
+		}
+	}
+	invocationLocal := false
+	for _, prefix := range []string{"$(obj)/", "${obj}/", "$(src)/", "${src}/"} {
+		if strings.HasPrefix(value, prefix) {
+			value = strings.TrimPrefix(value, prefix)
+			invocationLocal = true
+			break
+		}
+	}
+	if strings.HasPrefix(value, "$(") || strings.HasPrefix(value, "${") {
+		return value
+	}
+	if rootRelative {
+		return value
+	}
+	directory := strings.Trim(canonicalKbuildRulePath(profile.Directory), "/")
+	if !invocationLocal {
+		if scoped, ok := compactKbuildProfileInvocationRelativePath(profile, value); ok {
+			return scoped
+		}
+	}
+	if directory == "" || value == directory || strings.HasPrefix(value, directory+"/") {
+		return value
+	}
+	joined := path.Join(directory, value)
+	joinedEvidence := compactKbuildProfileSourceAncestryDepth(profile, joined) - len(strings.Split(directory, "/"))
+	if joinedEvidence < 0 {
+		joinedEvidence = 0
+	}
+	rootEvidence := compactKbuildProfileSourceAncestryDepth(profile, value)
+	if rootEvidence > joinedEvidence {
+		return value
+	}
+	return joined
+}
+
+// compactKbuildGraphTargetPath normalizes a target which has already crossed
+// the Make-invocation boundary. CompactKbuildProfile entry targets, recursive
+// dependency goals, and selections are source/object-tree-relative graph
+// identities; interpreting them relative to the profile cwd a second time can
+// silently turn an OUTPUT-rooted goal such as tools/objtool/fixdep into
+// tools/build/tools/objtool/fixdep.
+func compactKbuildGraphTargetPath(value string) string {
+	trimmed := strings.TrimSpace(filepathToSlash(value))
+	if trimmed == "." || trimmed == "./" {
+		return "."
+	}
+	return canonicalKbuildRulePath(trimmed)
+}
+
+// CanonicalKbuildGraphTarget returns the stable target identity after a raw
+// Make declaration or argv goal has already been resolved by its profile.
+// Unlike CanonicalKbuildProfileTarget it never applies invocation-cwd scope.
+func CanonicalKbuildGraphTarget(value string) string {
+	return compactKbuildGraphTargetPath(value)
+}
+
+// compactKbuildProfileGeneratedTargetPath canonicalizes values captured from
+// Kbuild's obj-y, hostprogs, always-y, and related generated-target
+// collections. Those collections are object-directory-relative even though
+// their source assignment commonly contains a bare filename; rule targets and
+// prerequisites, by contrast, are relative to Make's process cwd.
+func compactKbuildProfileGeneratedTargetPath(profile CompactKbuildProfile, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return compactKbuildProfileTargetPath(profile, "$(obj)/"+value)
+}
+
+// CanonicalKbuildProfileGeneratedTarget returns the stable object-tree path
+// of a target captured from a Kbuild generated-target collection.
+func CanonicalKbuildProfileGeneratedTarget(profile CompactKbuildProfile, value string) string {
+	return compactKbuildProfileGeneratedTargetPath(profile, value)
+}
+
+// CanonicalKbuildProfileTarget returns the stable source/object-tree-relative
+// identity of a target in one evaluated Make invocation.
+func CanonicalKbuildProfileTarget(profile CompactKbuildProfile, value string) string {
+	return compactKbuildProfileTargetPath(profile, value)
 }
 
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
-}
-
-type asn1HeaderDep struct {
-	include             string
-	object              string
-	headerClosureInputs []string
-}
-
-func asn1HeaderDepsForSource(sourceRoot, source string) []asn1HeaderDep {
-	if sourceRoot == "" || source == "" {
-		return nil
-	}
-	data, err := os.ReadFile(filepath.Join(sourceRoot, filepath.FromSlash(source)))
-	if err != nil {
-		return nil
-	}
-	sourceDir := filepath.ToSlash(filepath.Dir(source))
-	if sourceDir == "." {
-		sourceDir = ""
-	}
-	seen := map[string]bool{}
-	var out []asn1HeaderDep
-	for _, line := range strings.Split(string(data), "\n") {
-		include, ok := quotedInclude(line)
-		if !ok || !strings.HasSuffix(include, ".asn1.h") {
-			continue
-		}
-		object := strings.TrimSuffix(include, ".h") + ".o"
-		object = filepath.ToSlash(filepath.Join(sourceDir, object))
-		if seen[object] {
-			continue
-		}
-		seen[object] = true
-		out = append(out, asn1HeaderDep{
-			include: filepath.ToSlash(include),
-			object:  object,
-			// scripts/asn1_compiler.c emits this include in every public .asn1.h.
-			headerClosureInputs: []string{"include/linux/asn1_decoder.h"},
-		})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].object == out[j].object {
-			return out[i].include < out[j].include
-		}
-		return out[i].object < out[j].object
-	})
-	return out
-}
-
-func quotedInclude(line string) (string, bool) {
-	line = strings.TrimSpace(line)
-	if !strings.HasPrefix(line, "#") {
-		return "", false
-	}
-	line = strings.TrimSpace(strings.TrimPrefix(line, "#"))
-	if !strings.HasPrefix(line, "include") {
-		return "", false
-	}
-	line = strings.TrimSpace(strings.TrimPrefix(line, "include"))
-	if !strings.HasPrefix(line, "\"") {
-		return "", false
-	}
-	line = strings.TrimPrefix(line, "\"")
-	end := strings.IndexByte(line, '"')
-	if end < 0 {
-		return "", false
-	}
-	return line[:end], true
-}
-
-var compactGroupedSpecialObjects = map[string]bool{
-	"arch/arm/vdso/vdso.o":                        true,
-	"arch/arm64/kernel/vdso-wrap.o":               true,
-	"arch/arm64/kernel/vdso32-wrap.o":             true,
-	"arch/riscv/kernel/vdso/vdso.o":               true,
-	"arch/riscv/kernel/compat_vdso/compat_vdso.o": true,
-	"arch/riscv/purgatory/kexec-purgatory.o":      true,
-	"arch/powerpc/purgatory/kexec-purgatory.o":    true,
-	"arch/powerpc/kernel/vdso64_wrapper.o":        true,
-	"arch/powerpc/kernel/vdso32_wrapper.o":        true,
-	"arch/x86/entry/vdso/vdso-image-64.o":         true,
-	"arch/x86/kernel/cpu/capflags.o":              true,
-	"arch/x86/lib/inat.o":                         true,
-	"arch/x86/purgatory/kexec-purgatory.o":        true,
-	"arch/x86/realmode/rmpiggy.o":                 true,
-	"certs/blacklist_hashes.o":                    true,
-	"certs/revocation_certificates.o":             true,
-	"certs/system_certificates.o":                 true,
-	"drivers/of/empty_root.dtb.o":                 true,
-	"drivers/scsi/scsi_sysfs.o":                   true,
-	"drivers/tty/vt/consolemap_deftbl.o":          true,
-	"drivers/tty/vt/ucs.o":                        true,
-	"lib/crc/crc32-main.o":                        true,
-	"lib/crc/crc64-main.o":                        true,
-	"lib/crc32.o":                                 true,
-	"lib/crc64.o":                                 true,
-	"lib/crypto/arm/poly1305-core.o":              true,
-	"lib/crypto/arm/sha256-core.o":                true,
-	"lib/crypto/arm/sha512-core.o":                true,
-	"lib/crypto/arm64/poly1305-core.o":            true,
-	"lib/crypto/arm64/sha256-core.o":              true,
-	"lib/crypto/arm64/sha512-core.o":              true,
-	"lib/crypto/riscv/poly1305-core.o":            true,
-	"lib/crypto/x86/poly1305-x86_64-cryptogams.o": true,
-	"lib/oid_registry.o":                          true,
-	"usr/initramfs_data.o":                        true,
-}
-
-type compactActionGroupEmission struct {
-	Group          CompactActionGroup
-	GroupedName    string
-	GroupedTargets []string
-	LegacyName     string
-	LegacyTargets  []string
-}
-
-type compactActionGraphPlan struct {
-	Emissions         []compactActionGroupEmission
-	GroupNameByTarget map[string]string
-	LegacyTargets     map[string]bool
-	Variants          map[string]CompactObjectVariant
-}
-
-func (m *CompactMetadata) groupedCompileFallbackReason(variant CompactObjectVariant) string {
-	if len(variant.Deps) != 0 {
-		return "has generated-header object dependencies"
-	}
-	if reason := variant.sourceBuildError(); reason != "" {
-		return reason
-	}
-	if len(variant.RemoveFlags) != 0 {
-		return "has Kbuild remove flags"
-	}
-	if compactGroupedSpecialObjects[variant.Object] {
-		return "requires generated-object actions"
-	}
-	if strings.HasSuffix(variant.Object, ".asn1.o") ||
-		strings.HasSuffix(variant.Object, ".pi.o") ||
-		strings.HasSuffix(variant.Object, ".stub.o") {
-		return "requires generated-source or post-compile processing"
-	}
-	if strings.HasSuffix(variant.Source, ".c_shipped") {
-		return "requires source materialization"
-	}
-	language := compactSourceLanguage(variant.Source)
-	if language == "" {
-		return "has unsupported primary source"
-	}
-	for _, flag := range variant.Flags {
-		if strings.Contains(flag, "$(obj)") ||
-			strings.Contains(flag, "${obj}") ||
-			strings.Contains(flag, "utsversion-tmp.h") {
-			return "requires an object-local generated directory"
-		}
-	}
-	if variant.Mode == "m" && language == "c" &&
-		(variant.ModuleRoot || variant.ObjtoolForce) &&
-		(variant.configFragment["CONFIG_LTO_CLANG"] == "y" ||
-			variant.configFragment["CONFIG_LTO_CLANG_FULL"] == "y" ||
-			variant.configFragment["CONFIG_LTO_CLANG_THIN"] == "y") {
-		return "requires the module LTO relocatable-link stage"
-	}
-
-	inputs, err := m.expandedSourceInputGroup(
-		variant.SourceInputGroup,
-		fmt.Sprintf("object target %q", variant.Target),
-	)
-	if err != nil {
-		return err.Error()
-	}
-	paths := map[string]bool{}
-	for _, input := range inputs {
-		paths[input.Path] = true
-	}
-	required := []string{
-		"include/linux/compiler-version.h",
-		"include/linux/kconfig.h",
-	}
-	if language == "c" {
-		required = append(required, "include/linux/compiler_types.h")
-	}
-	for _, path := range required {
-		if !paths[path] {
-			return "exact source set omits required preinclude " + path
-		}
-	}
-	return ""
-}
-
-func (m *CompactMetadata) actionGraphPlan() (*compactActionGraphPlan, error) {
-	if err := m.ensureActionGroups(); err != nil {
-		return nil, err
-	}
-	variants := make(map[string]CompactObjectVariant, len(m.ObjectVariants))
-	for _, variant := range m.ObjectVariants {
-		variants[variant.Target] = variant
-	}
-
-	legacy := map[string]bool{}
-	active := map[string]bool{}
-	for _, group := range m.ActionGroups {
-		for _, target := range group.ObjectTargets {
-			active[target] = true
-		}
-	}
-	for _, variant := range m.ObjectVariants {
-		if !active[variant.Target] {
-			continue
-		}
-		switch compactActionKind(variant) {
-		case "compile":
-			if m.groupedCompileFallbackReason(variant) != "" {
-				legacy[variant.Target] = true
-			}
-		case "arm64_nvhe":
-			legacy[variant.Target] = true
-		}
-	}
-
-	// Legacy rules consume ordinary labels. Keep each legacy island closed over
-	// dependencies and members so no action is duplicated to bridge providers.
-	for changed := true; changed; {
-		changed = false
-		for target := range legacy {
-			variant := variants[target]
-			children := append(append([]string(nil), variant.Deps...), variant.Members...)
-			for _, child := range children {
-				if !legacy[child] {
-					legacy[child] = true
-					changed = true
-				}
-			}
-		}
-	}
-
-	plan := &compactActionGraphPlan{
-		GroupNameByTarget: map[string]string{},
-		LegacyTargets:     legacy,
-		Variants:          variants,
-	}
-	groupIdentitiesByName := map[string]string{}
-	for _, group := range m.ActionGroups {
-		emission := compactActionGroupEmission{Group: group}
-		for _, target := range group.ObjectTargets {
-			if legacy[target] {
-				emission.LegacyTargets = append(emission.LegacyTargets, target)
-			} else {
-				emission.GroupedTargets = append(emission.GroupedTargets, target)
-			}
-		}
-		reachabilityID := compactReachabilityID(group.ReachableConfigs)
-		baseName := compactActionGroupRuleName(group)
-		identity := group.RecipeID + "\x00" + reachabilityID
-		if existing := groupIdentitiesByName[baseName]; existing != "" && existing != identity {
-			return nil, fmt.Errorf("compact action-group identities produce duplicate rule name %q", baseName)
-		}
-		groupIdentitiesByName[baseName] = identity
-		if len(emission.GroupedTargets) != 0 {
-			emission.GroupedName = baseName
-			for _, target := range emission.GroupedTargets {
-				plan.GroupNameByTarget[target] = emission.GroupedName
-			}
-		}
-		if len(emission.LegacyTargets) != 0 {
-			emission.LegacyName = baseName + "_legacy"
-			for _, target := range emission.LegacyTargets {
-				plan.GroupNameByTarget[target] = emission.LegacyName
-			}
-		}
-		plan.Emissions = append(plan.Emissions, emission)
-	}
-	return plan, nil
-}
-
-func (m *CompactMetadata) BuildFile(opts CompactBuildFileOptions) ([]byte, error) {
-	objectBuild, err := m.objectBuildFile(opts)
-	if err != nil {
-		return nil, err
-	}
-	imageBuild, err := m.imageBuildFile(opts)
-	if err != nil {
-		return nil, err
-	}
-	return mergeBuildFiles("compact.BUILD.bazel", opts.Exports, objectBuild, imageBuild)
-}
-
-func (m *CompactMetadata) objectBuildFile(opts CompactBuildFileOptions) ([]byte, error) {
-	if err := m.validateContentIDs(); err != nil {
-		return nil, err
-	}
-	plan, err := m.actionGraphPlan()
-	if err != nil {
-		return nil, err
-	}
-	if opts.SourceLabelPackage == "" {
-		return nil, fmt.Errorf("compact object BUILD emission requires a source label package")
-	}
-	if opts.SourceRootLabel == "" {
-		return nil, fmt.Errorf("compact object BUILD emission requires a source root label")
-	}
-	visibility := opts.Visibility
-	if len(visibility) == 0 {
-		visibility = []string{"//visibility:public"}
-	}
-	file := buildgen.NewBuildFile("compact_objects.BUILD.bazel", "# Generated by kconfig_parse compact backend. Do not edit.")
-	loadsByName := map[string]bool{
-		"linux_compile_environment_index": true,
-		"linux_source_input_index":        true,
-		"linux_source_tree":               true,
-	}
-	groupLoadsByName := map[string]bool{}
-	for _, variant := range m.ObjectVariants {
-		if !plan.LegacyTargets[variant.Target] {
-			continue
-		}
-		switch compactActionKind(variant) {
-		case "compile":
-			loadsByName["linux_object"] = true
-		case "arm64_nvhe":
-			loadsByName["linux_arm64_nvhe_object"] = true
-		case "composite":
-			loadsByName["linux_composite_object"] = true
-		}
-	}
-	for _, emission := range plan.Emissions {
-		if emission.GroupedName != "" {
-			first := plan.Variants[emission.GroupedTargets[0]]
-			switch compactActionKind(first) {
-			case "compile":
-				groupLoadsByName["linux_object_action_group"] = true
-			case "composite":
-				groupLoadsByName["linux_composite_object_action_group"] = true
-			}
-		}
-		if emission.LegacyName != "" {
-			groupLoadsByName["linux_object_action_group_import"] = true
-		}
-	}
-	loads := make([]string, 0, len(loadsByName))
-	for name := range loadsByName {
-		loads = append(loads, name)
-	}
-	sort.Strings(loads)
-	groupLoads := make([]string, 0, len(groupLoadsByName))
-	for name := range groupLoadsByName {
-		groupLoads = append(groupLoads, name)
-	}
-	sort.Strings(groupLoads)
-	compileEnvironmentIndexTarget := "_compile_environment_index"
-	sourceInputIndexTarget := "_source_input_index"
-	sourceTreeTarget := "_source_tree"
-	file.AddLoad(compactRuleLoadLabel(opts.RuleLoadLabel), loads...)
-	if len(groupLoads) != 0 {
-		file.AddLoad(compactObjectGroupRuleLoadLabel(opts.RuleLoadLabel), groupLoads...)
-	}
-	file.AddPackage(visibility)
-	referencedPayloads := make(map[string]bool, len(m.CompileEnvironments))
-	expectedABI := ""
-	for _, environment := range m.CompileEnvironments {
-		referencedPayloads[environment.ConfigPayload] = true
-		if expectedABI == "" {
-			expectedABI = environment.ABI
-		} else if expectedABI != environment.ABI {
-			return nil, fmt.Errorf(
-				"compile environments use ABIs %q and %q",
-				expectedABI,
-				environment.ABI,
-			)
-		}
-	}
-	if expectedABI == "" {
-		return nil, fmt.Errorf("compact compile environment index has no ABI")
-	}
-	configPayloads := make(map[string]string, len(referencedPayloads))
-	for _, payload := range m.ConfigPayloads {
-		if referencedPayloads[payload.ID] {
-			configPayloads[payload.ID] = payload.Content
-		}
-	}
-	compileEnvironments := make(map[string]string, len(m.CompileEnvironments))
-	for _, environment := range m.CompileEnvironments {
-		compileEnvironments[environment.ID] = compactCompileEnvironmentValue(environment)
-	}
-	generatedHeaders := []string{}
-	seenGeneratedHeaders := map[string]bool{}
-	for _, family := range m.GeneratedHeaderFamilies {
-		labels := append([]string(nil), family.Labels...)
-		sort.Strings(labels)
-		if len(labels) == 0 {
-			continue
-		}
-		label := labels[0]
-		if seenGeneratedHeaders[label] {
-			continue
-		}
-		seenGeneratedHeaders[label] = true
-		generatedHeaders = append(generatedHeaders, label)
-	}
-	sort.Strings(generatedHeaders)
-	r := file.AddRule("linux_compile_environment_index", compileEnvironmentIndexTarget)
-	r.SetAttr("config_payloads", configPayloads)
-	r.SetAttr("compile_environments", compileEnvironments)
-	r.SetAttr("expected_abi", expectedABI)
-	if len(generatedHeaders) != 0 {
-		r.SetAttr("generated_headers", generatedHeaders)
-	}
-	if opts.Arch != "" {
-		r.SetAttr("arch", opts.Arch)
-	}
-	if opts.Version != "" {
-		r.SetAttr("version", opts.Version)
-	}
-	r.SetAttr("tags", []string{"manual"})
-
-	sourceLabels := make([]string, 0, len(m.SourceFiles))
-	for _, input := range m.SourceFiles {
-		sourceLabels = append(sourceLabels, labelFor(opts.SourceLabelPackage, input.Path))
-	}
-	r = file.AddRule("linux_source_input_index", sourceInputIndexTarget)
-	r.SetAttr("groups", m.SourceInputGroups)
-	r.SetAttr("srcs", sourceLabels)
-	r.SetAttr("source_tree_info", ":"+sourceTreeTarget)
-	r.SetAttr("tags", []string{"manual"})
-
-	r = file.AddRule("linux_source_tree", sourceTreeTarget)
-	r.SetAttr("root", opts.SourceRootLabel)
-	r.SetAttr("tags", []string{"manual"})
-
-	for _, variant := range m.ObjectVariants {
-		if !plan.LegacyTargets[variant.Target] {
-			continue
-		}
-		if len(variant.Members) != 0 {
-			if variant.Object == "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o" {
-				r := file.AddRule("linux_arm64_nvhe_object", variant.Target)
-				r.SetAttr("object", variant.Object)
-				r.SetAttr("mode", variant.Mode)
-				r.SetAttr("tags", []string{"manual"})
-				r.SetAttr("objects", localLabels(variant.Members))
-				r.SetAttr("content_id", variant.ContentID)
-				if variant.CompileEnvironment == "" {
-					return nil, fmt.Errorf("arm64 nVHE object %q has no compile environment", variant.Object)
-				}
-				r.SetAttr("compile_environment_index", ":"+compileEnvironmentIndexTarget)
-				r.SetAttr("compile_environment_id", variant.CompileEnvironment)
-				r.SetAttr("source_input_index", ":"+sourceInputIndexTarget)
-				r.SetAttr("source_input_group", variant.SourceInputGroup)
-				if opts.Arch != "" {
-					r.SetAttr("arch", opts.Arch)
-				}
-				if opts.Srcarch != "" {
-					r.SetAttr("srcarch", opts.Srcarch)
-				}
-				continue
-			}
-			r := file.AddRule("linux_composite_object", variant.Target)
-			r.SetAttr("object", variant.Object)
-			r.SetAttr("mode", variant.Mode)
-			r.SetAttr("tags", []string{"manual"})
-			r.SetAttr("objects", localLabels(variant.Members))
-			r.SetAttr("content_id", variant.ContentID)
-			if variant.ModuleRoot {
-				r.SetAttr("module_root", true)
-			}
-			if variant.ObjtoolForce {
-				r.SetAttr("objtool_force", true)
-			}
-			if len(variant.ObjtoolArgs) != 0 {
-				r.SetAttr("objtool_args", variant.ObjtoolArgs)
-			}
-			if opts.Arch != "" {
-				r.SetAttr("arch", opts.Arch)
-			}
-			continue
-		}
-		if reason := variant.sourceBuildError(); reason != "" {
-			return nil, fmt.Errorf(
-				"cannot emit source-backed linux_object %q for %q: %s",
-				variant.Target,
-				variant.Object,
-				reason,
-			)
-		}
-		r := file.AddRule("linux_object", variant.Target)
-		r.SetAttr("object", variant.Object)
-		r.SetAttr("mode", variant.Mode)
-		r.SetAttr("tags", []string{"manual"})
-		r.SetAttr("content_id", variant.ContentID)
-		if opts.Arch != "" {
-			r.SetAttr("arch", opts.Arch)
-		}
-		sourceFile, err := m.sourceFileIndex(variant.Source)
-		if err != nil {
-			return nil, fmt.Errorf("source-backed object %q: %w", variant.Object, err)
-		}
-		r.SetAttr("source_input_file", sourceFile)
-		r.SetAttr("source_input_group", variant.SourceInputGroup)
-		r.SetAttr("source_input_index", ":"+sourceInputIndexTarget)
-		if variant.CompileEnvironment == "" {
-			return nil, fmt.Errorf("source-backed object %q has no compile environment", variant.Object)
-		}
-		r.SetAttr("compile_environment_index", ":"+compileEnvironmentIndexTarget)
-		r.SetAttr("compile_environment_id", variant.CompileEnvironment)
-		if opts.Srcarch != "" {
-			r.SetAttr("srcarch", opts.Srcarch)
-		}
-		if opts.SourceASN1Compiler != "" && strings.HasSuffix(variant.Object, ".asn1.o") {
-			r.SetAttr("asn1_compiler", opts.SourceASN1Compiler)
-		}
-		if opts.Version != "" {
-			r.SetAttr("version", opts.Version)
-		}
-		if variant.Symversions {
-			if opts.SourceGenksyms == "" {
-				return nil, fmt.Errorf("source-backed object %q enables symbol versions without a genksyms label", variant.Object)
-			}
-			r.SetAttr("genksyms", opts.SourceGenksyms)
-			r.SetAttr("symversions", true)
-			if len(variant.SymversionFlags) != 0 {
-				r.SetAttr("symversion_flags", variant.SymversionFlags)
-			}
-			if len(variant.SymversionRemoveFlags) != 0 {
-				r.SetAttr("symversion_remove_flags", variant.SymversionRemoveFlags)
-			}
-		}
-		if opts.SourceRelacheck != "" && strings.HasSuffix(variant.Object, ".pi.o") {
-			r.SetAttr("relacheck", opts.SourceRelacheck)
-		}
-		if opts.Arch == "x86" && opts.SourceObjtool != "" && !variant.ObjtoolDisabled {
-			r.SetAttr("objtool", opts.SourceObjtool)
-			if variant.ObjtoolForce {
-				r.SetAttr("objtool_force", true)
-			}
-			if len(variant.ObjtoolArgs) != 0 {
-				r.SetAttr("objtool_args", variant.ObjtoolArgs)
-			}
-		}
-		if variant.ModuleRoot {
-			r.SetAttr("module_root", true)
-		}
-		if len(variant.Flags) != 0 {
-			r.SetAttr("flags", variant.Flags)
-		}
-		if len(variant.RemoveFlags) != 0 {
-			r.SetAttr("remove_flags", variant.RemoveFlags)
-		}
-		if variant.ModName != "" {
-			r.SetAttr("modname", variant.ModName)
-		}
-		if len(variant.Deps) != 0 {
-			r.SetAttr("deps", localLabels(variant.Deps))
-		}
-	}
-
-	for _, emission := range plan.Emissions {
-		if emission.GroupedName != "" {
-			first := plan.Variants[emission.GroupedTargets[0]]
-			reachabilityID := compactReachabilityID(emission.Group.ReachableConfigs)
-			switch compactActionKind(first) {
-			case "compile":
-				objects := map[string]string{}
-				for _, target := range emission.GroupedTargets {
-					variant := plan.Variants[target]
-					sourceFile, err := m.sourceFileIndex(variant.Source)
-					if err != nil {
-						return nil, fmt.Errorf("grouped source-backed object %q: %w", variant.Object, err)
-					}
-					encoded, err := json.Marshal(map[string]any{
-						"compile_environment": variant.CompileEnvironment,
-						"content_id":          variant.ContentID,
-						"object":              variant.Object,
-						"source_input_file":   sourceFile,
-						"source_input_group":  variant.SourceInputGroup,
-					})
-					if err != nil {
-						return nil, fmt.Errorf("encode grouped object %q: %w", variant.Object, err)
-					}
-					objects[target] = string(encoded)
-				}
-				r := file.AddRule("linux_object_action_group", emission.GroupedName)
-				r.SetAttr("objects", objects)
-				r.SetAttr("mode", first.Mode)
-				r.SetAttr("language", compactSourceLanguage(first.Source))
-				r.SetAttr("flags", first.Flags)
-				r.SetAttr("recipe_id", emission.Group.RecipeID)
-				r.SetAttr("reachability_id", reachabilityID)
-				r.SetAttr("reachable_configs", emission.Group.ReachableConfigs)
-				r.SetAttr("compile_environment_index", ":"+compileEnvironmentIndexTarget)
-				r.SetAttr("source_input_index", ":"+sourceInputIndexTarget)
-				r.SetAttr("tags", []string{"manual"})
-				if opts.Version != "" {
-					r.SetAttr("version", opts.Version)
-				}
-				if opts.Arch != "" {
-					r.SetAttr("arch", opts.Arch)
-				}
-				if opts.Srcarch != "" {
-					r.SetAttr("srcarch", opts.Srcarch)
-				}
-				if first.ModuleRoot {
-					r.SetAttr("module_root", true)
-				}
-				if first.ModName != "" {
-					r.SetAttr("modname", first.ModName)
-				}
-				if first.Symversions {
-					if opts.SourceGenksyms == "" {
-						return nil, fmt.Errorf("grouped source-backed objects enable symbol versions without a genksyms label")
-					}
-					r.SetAttr("genksyms", opts.SourceGenksyms)
-					r.SetAttr("symversions", true)
-					if len(first.SymversionFlags) != 0 {
-						r.SetAttr("symversion_flags", first.SymversionFlags)
-					}
-					if len(first.SymversionRemoveFlags) != 0 {
-						r.SetAttr("symversion_remove_flags", first.SymversionRemoveFlags)
-					}
-				}
-				if first.ObjtoolDisabled {
-					r.SetAttr("objtool_disabled", true)
-				}
-				if first.ObjtoolForce {
-					r.SetAttr("objtool_force", true)
-				}
-				if len(first.ObjtoolArgs) != 0 {
-					r.SetAttr("objtool_args", first.ObjtoolArgs)
-				}
-				if opts.Arch == "x86" && opts.SourceObjtool != "" && !first.ObjtoolDisabled {
-					r.SetAttr("objtool", opts.SourceObjtool)
-				}
-			case "composite":
-				objects := map[string]string{}
-				memberGroups := map[string]bool{}
-				for _, target := range emission.GroupedTargets {
-					variant := plan.Variants[target]
-					encoded, err := json.Marshal(map[string]any{
-						"content_id": variant.ContentID,
-						"members":    variant.Members,
-						"object":     variant.Object,
-					})
-					if err != nil {
-						return nil, fmt.Errorf("encode grouped composite %q: %w", variant.Object, err)
-					}
-					objects[target] = string(encoded)
-					for _, member := range variant.Members {
-						groupName := plan.GroupNameByTarget[member]
-						if groupName == "" {
-							return nil, fmt.Errorf("grouped composite %q references unowned member %q", variant.Object, member)
-						}
-						if groupName != emission.GroupedName {
-							memberGroups[groupName] = true
-						}
-					}
-				}
-				memberLabels := make([]string, 0, len(memberGroups))
-				for name := range memberGroups {
-					memberLabels = append(memberLabels, ":"+name)
-				}
-				sort.Strings(memberLabels)
-				r := file.AddRule("linux_composite_object_action_group", emission.GroupedName)
-				r.SetAttr("objects", objects)
-				r.SetAttr("member_groups", memberLabels)
-				r.SetAttr("mode", first.Mode)
-				r.SetAttr("recipe_id", emission.Group.RecipeID)
-				r.SetAttr("reachability_id", reachabilityID)
-				r.SetAttr("reachable_configs", emission.Group.ReachableConfigs)
-				r.SetAttr("tags", []string{"manual"})
-				if opts.Arch != "" {
-					r.SetAttr("arch", opts.Arch)
-				}
-				if first.ModuleRoot {
-					r.SetAttr("module_root", true)
-				}
-				if first.ObjtoolForce {
-					r.SetAttr("objtool_force", true)
-				}
-				if len(first.ObjtoolArgs) != 0 {
-					r.SetAttr("objtool_args", first.ObjtoolArgs)
-				}
-			default:
-				return nil, fmt.Errorf("unsupported grouped action kind %q", compactActionKind(first))
-			}
-		}
-		if emission.LegacyName != "" {
-			first := plan.Variants[emission.LegacyTargets[0]]
-			r := file.AddRule("linux_object_action_group_import", emission.LegacyName)
-			r.SetAttr("object_targets", emission.LegacyTargets)
-			r.SetAttr("objects", localLabels(emission.LegacyTargets))
-			r.SetAttr("mode", first.Mode)
-			r.SetAttr("recipe_id", emission.Group.RecipeID)
-			r.SetAttr("reachability_id", compactReachabilityID(emission.Group.ReachableConfigs))
-			r.SetAttr("reachable_configs", emission.Group.ReachableConfigs)
-			r.SetAttr("tags", []string{"manual"})
-		}
-	}
-	return file.Format(), nil
-}
-
-func localLabels(targets []string) []string {
-	labels := make([]string, 0, len(targets))
-	for _, target := range targets {
-		labels = append(labels, ":"+target)
-	}
-	return labels
-}
-
-func (v CompactObjectVariant) sourceBuildReady() bool {
-	return v.sourceBuildError() == ""
-}
-
-func (v CompactObjectVariant) sourceBuildError() string {
-	if v.Source == "" {
-		return "no concrete source was resolved"
-	}
-	for _, flag := range v.Flags {
-		for _, ref := range makeVariableRefs(flag) {
-			if ref == "obj" || ref == "src" || ref == "srctree" {
-				continue
-			}
-			if knownEmptyKbuildMakeRef(ref) {
-				continue
-			}
-			if _, ok := v.configFragment[ref]; !ok {
-				return fmt.Sprintf("flag %q contains unsupported Kbuild make variable %q", flag, ref)
-			}
-		}
-	}
-	for _, flag := range v.RemoveFlags {
-		for _, ref := range makeVariableRefs(flag) {
-			if ref == "obj" || ref == "src" || ref == "srctree" {
-				continue
-			}
-			if knownEmptyKbuildMakeRef(ref) {
-				continue
-			}
-			if _, ok := v.configFragment[ref]; !ok {
-				return fmt.Sprintf("remove flag %q contains unsupported Kbuild make variable %q", flag, ref)
-			}
-		}
-	}
-	return ""
-}
-
-func knownEmptyKbuildMakeRef(ref string) bool {
-	if strings.HasPrefix(ref, "cflags-nogcse-") {
-		return true
-	}
-	switch ref {
-	case "CC_FLAGS_CFI", "CC_FLAGS_FTRACE", "CC_FLAGS_LTO", "CC_FLAGS_SCS", "CLANG_FLAGS", "DISABLE_KSTACK_ERASE", "DISABLE_LATENT_ENTROPY_PLUGIN", "DISABLE_STACKLEAK_PLUGIN", "RANDSTRUCT_CFLAGS":
-		return true
-	default:
-		return false
-	}
-}
-
-func makeVariableRefs(value string) []string {
-	var out []string
-	for i := 0; i < len(value); i++ {
-		if value[i] != '$' || i+1 >= len(value) {
-			continue
-		}
-		closer := byte(0)
-		switch value[i+1] {
-		case '(':
-			closer = ')'
-		case '{':
-			closer = '}'
-		default:
-			continue
-		}
-		start := i + 2
-		end := strings.IndexByte(value[start:], closer)
-		if end < 0 {
-			out = append(out, "")
-			continue
-		}
-		end += start
-		out = append(out, value[start:end])
-		i = end
-	}
-	return out
-}
-
-func (m *CompactMetadata) imageBuildFile(opts CompactBuildFileOptions) ([]byte, error) {
-	if opts.BaseConfig == "" {
-		return nil, fmt.Errorf("compact image BUILD emission requires a base config")
-	}
-	plan, err := m.actionGraphPlan()
-	if err != nil {
-		return nil, err
-	}
-	visibility := opts.Visibility
-	if len(visibility) == 0 {
-		visibility = []string{"//visibility:public"}
-	}
-	configs := make(map[string]CompactConfig, len(m.Configs))
-	for _, config := range m.Configs {
-		configs[config.Name] = config
-	}
-	base, ok := configs[opts.BaseConfig]
-	if !ok {
-		return nil, fmt.Errorf("compact base config %q is absent from metadata", opts.BaseConfig)
-	}
-
-	file := buildgen.NewBuildFile("compact_images.BUILD.bazel", "# Generated by kconfig_parse compact backend. Do not edit.")
-	file.AddLoad(
-		compactObjectGroupRuleLoadLabel(opts.RuleLoadLabel),
-		"linux_grouped_compact_image",
-	)
-	file.AddPackage(visibility)
-
-	names := make([]string, 0, len(m.Configs))
-	names = append(names, base.Name)
-	for _, config := range m.Configs {
-		if config.Name != base.Name {
-			names = append(names, config.Name)
-		}
-	}
-	sort.Strings(names[1:])
-	shapeTargets := map[string]string{}
-	for _, name := range names {
-		config := configs[name]
-		shape := strings.Join(config.ObjectTargets, "\x00") + "\x01" +
-			strings.Join(config.ModuleObjectTargets, "\x00")
-		if actual := shapeTargets[shape]; actual != "" {
-			r := file.AddRule("alias", config.imageTarget)
-			r.SetAttr("actual", ":"+actual)
-			r.SetAttr("tags", []string{"manual"})
-			continue
-		}
-		shapeTargets[shape] = config.imageTarget
-
-		groupNames := map[string]bool{}
-		for _, emission := range plan.Emissions {
-			if !compactStringContains(emission.Group.ReachableConfigs, config.Name) {
-				continue
-			}
-			if emission.GroupedName != "" {
-				groupNames[emission.GroupedName] = true
-			}
-			if emission.LegacyName != "" {
-				groupNames[emission.LegacyName] = true
-			}
-		}
-		groupLabels := make([]string, 0, len(groupNames))
-		for groupName := range groupNames {
-			groupLabels = append(groupLabels, labelFor(opts.ObjectLabelPackage, groupName))
-		}
-		sort.Strings(groupLabels)
-		r := file.AddRule("linux_grouped_compact_image", config.imageTarget)
-		r.SetAttr("config", config.Name)
-		r.SetAttr("groups", groupLabels)
-		r.SetAttr("object_targets", config.ObjectTargets)
-		if len(config.ModuleObjectTargets) != 0 {
-			r.SetAttr("module_object_targets", config.ModuleObjectTargets)
-		}
-		if opts.Arch != "" {
-			r.SetAttr("arch", opts.Arch)
-		}
-		r.SetAttr("tags", []string{"manual"})
-	}
-	return file.Format(), nil
-}
-
-func compactStringContains(values []string, value string) bool {
-	for _, candidate := range values {
-		if candidate == value {
-			return true
-		}
-	}
-	return false
-}
-
-func compactTargetSet(targets []string) map[string]bool {
-	out := make(map[string]bool, len(targets))
-	for _, target := range targets {
-		out[target] = true
-	}
-	return out
-}
-
-func compactTargetLabels(targets []string, variants map[string]CompactObjectVariant, objectLabelPackage string) ([]string, error) {
-	labels := make([]string, 0, len(targets))
-	for _, target := range targets {
-		if _, ok := variants[target]; !ok {
-			return nil, fmt.Errorf("compact image target %q is absent from object metadata", target)
-		}
-		labels = append(labels, labelFor(objectLabelPackage, target))
-	}
-	return labels, nil
-}
-
-func compactContentIDs(targets []string, variants map[string]CompactObjectVariant) ([]string, error) {
-	ids := make([]string, 0, len(targets))
-	for _, target := range targets {
-		variant, ok := variants[target]
-		if !ok {
-			return nil, fmt.Errorf("compact image target %q is absent from object metadata", target)
-		}
-		if variant.ContentID == "" {
-			return nil, fmt.Errorf("compact image target %q has no content ID", target)
-		}
-		ids = append(ids, variant.ContentID)
-	}
-	return ids, nil
-}
-
-func stringSlicesEqual(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func configRefs(value string) []string {
-	refs := map[string]bool{}
-	for start := 0; start < len(value); {
-		idx := strings.Index(value[start:], "CONFIG_")
-		if idx < 0 {
-			break
-		}
-		idx += start
-		end := idx + len("CONFIG_")
-		for end < len(value) {
-			c := value[end]
-			if c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
-				end++
-				continue
-			}
-			break
-		}
-		if end > idx+len("CONFIG_") {
-			refs[value[idx:end]] = true
-		}
-		start = end
-	}
-	out := make([]string, 0, len(refs))
-	for ref := range refs {
-		out = append(out, ref)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func compactRuleLoadLabel(label string) string {
-	if label == "" {
-		return "@linux.bzl//internal:linux_objects.bzl"
-	}
-	return label
-}
-
-func compactObjectGroupRuleLoadLabel(linuxObjectsLabel string) string {
-	label := compactRuleLoadLabel(linuxObjectsLabel)
-	if strings.HasSuffix(label, "linux_objects.bzl") {
-		return strings.TrimSuffix(label, "linux_objects.bzl") + "linux_object_groups.bzl"
-	}
-	return "@linux.bzl//internal:linux_object_groups.bzl"
-}
-
-func sanitizeTargetName(value string) string {
-	value = filepath.ToSlash(value)
-	var out strings.Builder
-	for _, r := range value {
-		switch {
-		case r >= 'A' && r <= 'Z':
-			out.WriteRune(r)
-		case r >= 'a' && r <= 'z':
-			out.WriteRune(r)
-		case r >= '0' && r <= '9':
-			out.WriteRune(r)
-		default:
-			out.WriteByte('_')
-		}
-	}
-	if out.Len() == 0 {
-		return "unnamed"
-	}
-	return out.String()
-}
-
-func modePrecedence(mode string) int {
-	switch mode {
-	case "y":
-		return 2
-	case "m":
-		return 1
-	default:
-		return 0
-	}
-}
-
-func compositeMemberMode(parentMode, memberMode string) string {
-	if memberMode == "n" {
-		return "n"
-	}
-	if memberMode == "m" && parentMode != "m" {
-		return "n"
-	}
-	return parentMode
 }

@@ -4,6 +4,8 @@ load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
 load("@bazel_skylib//rules:select_file.bzl", "select_file")
 load("@linux.bzl", "initramfs", "linux_cc_module", "linux_module")
+load("@rules_go//go:def.bzl", "go_test")
+load(":compiler_identity_test.bzl", "compiler_probe_artifacts")
 load(":qemu_boot_test.bzl", "qemu_boot_test", "qemu_system_target")
 
 package(default_visibility = ["//visibility:public"])
@@ -20,6 +22,41 @@ string_flag(
 config_setting(
     name = "gcc_selected",
     flag_values = {":compiler": "gcc"},
+)
+
+compiler_probe_artifacts(
+    name = "compiler_identity_probe_artifacts",
+    kernel = "@e2e_x86_64//:kernel",
+)
+
+go_test(
+    name = "compiler_identity_test",
+    srcs = ["compiler_identity_test.go"],
+    data = [
+        ":compiler_identity_probe_artifacts",
+        "@e2e_linux_6_18_39//:init/Kconfig",
+        "@e2e_linux_6_18_39//:scripts/Kconfig.include",
+        "@e2e_x86_64//:config",
+    ],
+    env = select({
+        ":gcc_selected": {
+            "EXPECTED_COMPILER": "gcc",
+            "KERNEL_CONFIG": "$(rlocationpath @e2e_x86_64//:config)",
+            "KERNEL_INIT_KCONFIG": "$(rlocationpath @e2e_linux_6_18_39//:init/Kconfig)",
+            "KERNEL_KCONFIG_INCLUDE": "$(rlocationpath @e2e_linux_6_18_39//:scripts/Kconfig.include)",
+            "KERNEL_PROBE_ARTIFACTS": "$(rlocationpaths :compiler_identity_probe_artifacts)",
+        },
+        "//conditions:default": {
+            "EXPECTED_COMPILER": "clang",
+            "KERNEL_CONFIG": "$(rlocationpath @e2e_x86_64//:config)",
+            "KERNEL_INIT_KCONFIG": "$(rlocationpath @e2e_linux_6_18_39//:init/Kconfig)",
+            "KERNEL_KCONFIG_INCLUDE": "$(rlocationpath @e2e_linux_6_18_39//:scripts/Kconfig.include)",
+            "KERNEL_PROBE_ARTIFACTS": "$(rlocationpaths :compiler_identity_probe_artifacts)",
+        },
+    }),
+    pure = "on",
+    rundir = ".",
+    deps = ["@rules_go//go/runfiles"],
 )
 
 toolchain(
@@ -108,6 +145,20 @@ platform(
 linux_cc_module(
     name = "hello_c_module",
     srcs = ["hello_module.c"],
+    hdrs = [
+        "external_module_headers/linux_bzl_external_closure.h",
+        "external_module_headers/linux_bzl_from_kbuild_extmod.h",
+        "external_module_headers/linux_bzl_from_m.h",
+    ],
+    # Recursive Kbuild keeps M in MAKEOVERRIDES while the root Makefile exports
+    # its derived KBUILD_EXTMOD value to the compiler child.
+    copts = [
+        "-DLINUX_BZL_EXTERNAL_E2E",
+        "$(if $(filter command line,$(origin M)),-DLINUX_BZL_M_ORIGIN_OK,-DLINUX_BZL_M_ORIGIN_BAD)",
+        "$(if $(filter environment,$(origin KBUILD_EXTMOD)),-DLINUX_BZL_KBUILD_EXTMOD_ORIGIN_OK,-DLINUX_BZL_KBUILD_EXTMOD_ORIGIN_BAD)",
+        "-include$(M)/external_module_headers/linux_bzl_from_m.h",
+        "-include$(KBUILD_EXTMOD)/external_module_headers/linux_bzl_from_kbuild_extmod.h",
+    ],
     kernel = "@e2e_x86_64//:kernel",
 )
 
@@ -127,15 +178,9 @@ build_test(
     ],
 )
 
-select_file(
-    name = "cnic_module",
-    srcs = "@e2e_cnic_x86_64//:modules",
-    subpath = "cnic.ko",
-)
-
 build_test(
     name = "cnic_module_version_build_test",
-    targets = [":cnic_module"],
+    targets = ["@e2e_cnic_x86_64//:cnic_module"],
 )
 
 linux_cc_module(
@@ -212,7 +257,11 @@ build_test(
 
 linux_module(
     name = "rust_test_module",
-    srcs = ["rust_test_module.rs"],
+    srcs = [
+        "rust_test_module.rs",
+        "rust_test_module_sibling.rs",
+    ],
+    crate_root = "rust_test_module.rs",
     kernel = "@e2e_rust_x86_64//:kernel",
 )
 
@@ -230,7 +279,11 @@ linux_module(
 
 linux_module(
     name = "rust_test_module_6_18_39_aarch64",
-    srcs = ["rust_test_module.rs"],
+    srcs = [
+        "rust_test_module.rs",
+        "rust_test_module_sibling.rs",
+    ],
+    crate_root = "rust_test_module.rs",
     kernel = "@e2e_rust_aarch64//:kernel",
 )
 
@@ -276,68 +329,44 @@ initramfs(
 )
 
 select_file(
-    name = "test_module_6_12_96_x86_64",
-    srcs = "@e2e_6_12_96_x86_64//:modules",
-    subpath = "test_module.ko",
-)
-
-select_file(
-    name = "test_module_6_12_96_aarch64",
-    srcs = "@e2e_6_12_96_aarch64//:modules",
-    subpath = "test_module.ko",
-)
-
-select_file(
-    name = "test_module_6_18_39_x86_64",
-    srcs = "@e2e_x86_64//:modules",
-    subpath = "test_module.ko",
-)
-
-select_file(
-    name = "test_module_6_18_39_aarch64",
-    srcs = "@e2e_aarch64//:modules",
-    subpath = "test_module.ko",
-)
-
-select_file(
     name = "x86_decompress_mm_lookup",
-    srcs = "@e2e_linux_6_18_39//:source_tree_lookup_files",
+    srcs = "@e2e_linux_6_18_39//:all_files",
     subpath = "include/linux/decompress/mm.h",
 )
 
 select_file(
     name = "x86_decompress_lz4_header_lookup",
-    srcs = "@e2e_linux_6_18_39//:source_tree_lookup_files",
+    srcs = "@e2e_linux_6_18_39//:all_files",
     subpath = "include/linux/lz4.h",
 )
 
 select_file(
     name = "x86_decompress_lz4defs_lookup",
-    srcs = "@e2e_linux_6_18_39//:source_tree_lookup_files",
+    srcs = "@e2e_linux_6_18_39//:all_files",
     subpath = "lib/lz4/lz4defs.h",
 )
 
 select_file(
     name = "x86_decompress_inffixed_lookup",
-    srcs = "@e2e_linux_6_18_39//:source_tree_lookup_files",
+    srcs = "@e2e_linux_6_18_39//:all_files",
     subpath = "lib/zlib_inflate/inffixed.h",
 )
 
 select_file(
     name = "x86_decompress_zutil_lookup",
-    srcs = "@e2e_linux_6_18_39//:source_tree_lookup_files",
+    srcs = "@e2e_linux_6_18_39//:all_files",
     subpath = "include/linux/zutil.h",
 )
 
 select_file(
     name = "x86_decompress_zlib_lookup",
-    srcs = "@e2e_linux_6_18_39//:source_tree_lookup_files",
+    srcs = "@e2e_linux_6_18_39//:all_files",
     subpath = "include/linux/zlib.h",
 )
 
 select_file(
     name = "x86_decompress_zconf_lookup",
-    srcs = "@e2e_linux_6_18_39//:source_tree_lookup_files",
+    srcs = "@e2e_linux_6_18_39//:all_files",
     subpath = "include/linux/zconf.h",
 )
 
@@ -379,7 +408,7 @@ initramfs(
         "/init": "//boot:init_x86_64",
     },
     files = {
-        "/test_module.ko": ":test_module_6_12_96_x86_64",
+        "/test_module.ko": "@e2e_6_12_96_x86_64//:test_module",
     },
 )
 
@@ -393,7 +422,7 @@ initramfs(
         "/init": "//boot:init_aarch64",
     },
     files = {
-        "/test_module.ko": ":test_module_6_12_96_aarch64",
+        "/test_module.ko": "@e2e_6_12_96_aarch64//:test_module",
     },
 )
 
@@ -407,7 +436,7 @@ initramfs(
         "/init": "//boot:init_x86_64",
     },
     files = {
-        "/test_module.ko": ":test_module_6_18_39_x86_64",
+        "/test_module.ko": "@e2e_x86_64//:test_module",
     },
 )
 
@@ -449,7 +478,7 @@ initramfs(
         "/init": "//boot:init_aarch64",
     },
     files = {
-        "/test_module.ko": ":test_module_6_18_39_aarch64",
+        "/test_module.ko": "@e2e_aarch64//:test_module",
     },
 )
 

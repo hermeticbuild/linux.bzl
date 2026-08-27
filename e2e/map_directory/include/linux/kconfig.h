@@ -1,1 +1,0 @@
-/* Forced kernel Kconfig preinclude for the compact source scanner. */

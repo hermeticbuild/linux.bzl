@@ -2,4 +2,9 @@ import ../.bazelrc.shared
 
 common:remote --extra_execution_platforms=@llvm//:rbe_platform
 
+build:compiler-clang --//:compiler=clang
+build:compiler-gcc --//:compiler=gcc
+build:compiler-gcc --extra_toolchains=//:gcc_cc_toolchain_aarch64
+build:compiler-gcc --extra_toolchains=//:gcc_cc_toolchain_x86_64
+
 try-import %workspace%/.bazelrc.user

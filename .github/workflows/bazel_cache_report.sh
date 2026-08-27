@@ -126,27 +126,18 @@ if [[ -s "${profile}" ]]; then
             | add // 0),
           ([.traceEvents[]?
             | select(.name == "Memory usage (Bazel)")
-            | (.args.memory // 0)] | max // 0 | floor),
-          ([.traceEvents[]?
-            | select(.name == "_linux_object_impl")] | length),
-          ([.traceEvents[]?
-            | select(.name == "_linux_object_impl")
-            | (.dur // 0)] | add // 0)
+            | (.args.memory // 0)] | max // 0 | floor)
         ]
         | @tsv
       ' 2>/dev/null || true
   )"
 fi
-linux_image_fetch_us=0
+linux_image_facade_fetch_us=0
 profile_peak_memory_mib=0
-linux_object_analyses=0
-linux_object_analysis_us=0
 if [[ -n "${profile_values}" ]]; then
   IFS=$'\t' read -r \
-    linux_image_fetch_us \
-    profile_peak_memory_mib \
-    linux_object_analyses \
-    linux_object_analysis_us <<<"${profile_values}"
+    linux_image_facade_fetch_us \
+    profile_peak_memory_mib <<<"${profile_values}"
 fi
 disk_cache_size="$(
   du -sh "${HOME}/.cache/bazel-disk" 2>/dev/null | awk '{ print $1 }' || true
@@ -185,15 +176,9 @@ disk_available="$(
   if ((profile_peak_memory_mib > 0)); then
     printf '| Peak Bazel memory (profile) | %s MiB |\n' "${profile_peak_memory_mib}"
   fi
-  if ((linux_object_analyses > 0)); then
-    printf '| Linux object analysis events (profile) | %s |\n' "${linux_object_analyses}"
-    printf '| Linux object aggregate analysis duration (profile) | %d.%03d s |\n' \
-      "$((linux_object_analysis_us / 1000000))" \
-      "$((linux_object_analysis_us % 1000000 / 1000))"
-  fi
-  if ((linux_image_fetch_us > 0)); then
-    printf '| Linux image repository generation | %d.%03d s |\n' \
-      "$((linux_image_fetch_us / 1000000))" "$((linux_image_fetch_us % 1000000 / 1000))"
+  if ((linux_image_facade_fetch_us > 0)); then
+    printf '| Linux image facade repository setup | %d.%03d s |\n' \
+      "$((linux_image_facade_fetch_us / 1000000))" "$((linux_image_facade_fetch_us % 1000000 / 1000))"
   fi
   if [[ -n "${disk_cache_size}" ]]; then
     printf '| Disk cache on runner | %s |\n' "${disk_cache_size}"

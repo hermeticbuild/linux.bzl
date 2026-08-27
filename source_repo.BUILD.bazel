@@ -1,7 +1,8 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
-
 package(default_visibility = ["//visibility:public"])
 
+# linux_source_repository replaces this marker with the exact files staged by
+# source_overlays. Keep them explicit so directory symlinks and ordinary source
+# globs have one deterministic ownership model.
 _SOURCE_OVERLAY_FILES = [
     # __LINUX_BZL_SOURCE_OVERLAY_FILES__
 ]
@@ -15,265 +16,21 @@ exports_files(
     visibility = ["//visibility:public"],
 )
 
-filegroup(
-    name = "source_tree_lookup_files",
-    srcs = glob([
-        "Documentation/Kconfig",
-        "arch/arm/boot/compressed/**",
-        "arch/arm/kernel/hyp-stub.S",
-        "arch/arm/lib/*.S",
-        "arch/arm/vdso/**",
-        "arch/arm64/kernel/vdso/**",
-        "arch/arm64/kernel/vdso32/**",
-        "arch/arm64/kvm/hyp/nvhe/hyp.lds.S",
-        "arch/powerpc/kernel/vdso/**",
-        "arch/powerpc/lib/crtsavres.S",
-        "arch/powerpc/purgatory/**",
-        "arch/riscv/kernel/compat_vdso/**",
-        "arch/riscv/kernel/vdso/**",
-        "arch/riscv/lib/*.S",
-        "arch/riscv/purgatory/**",
-        "arch/x86/boot/**",
-        "arch/x86/entry/vdso/**",
-        "arch/x86/coco/sev/vc-shared.c",
-        "arch/x86/coco/tdx/tdcall.S",
-        "arch/x86/coco/tdx/tdx-shared.c",
-        "arch/x86/include/asm/cpufeatures.h",
-        "arch/x86/include/asm/inat.h",
-        "arch/x86/include/asm/vdso.h",
-        "arch/x86/include/asm/vmxfeatures.h",
-        "arch/x86/kernel/asm-offsets_*.c",
-        "arch/x86/kernel/sev_verify_cbit.S",
-        "arch/x86/kernel/verify_cpu.S",
-        "arch/x86/lib/inat.c",
-        "arch/x86/lib/insn.c",
-        "arch/x86/lib/kaslr.c",
-        "arch/x86/lib/x86-opcode-map.txt",
-        "arch/x86/mm/ident_map.c",
-        "arch/x86/purgatory/**",
-        "arch/x86/realmode/rm/**",
-        "arch/x86/xen/xen-head.S",
-        "drivers/firmware/efi/libstub/**/*.c",
-        "drivers/tty/vt/*_shipped",
-        "include/linux/decompress/mm.h",
-        "include/linux/export-internal.h",
-        "include/linux/hidden.h",
-        "include/linux/license.h",
-        "include/linux/lz4.h",
-        "include/linux/mod_devicetable.h",
-        "include/linux/module_symbol.h",
-        "include/linux/oid_registry.h",
-        "include/linux/pe.h",
-        "include/linux/zconf.h",
-        "include/linux/zlib.h",
-        "include/linux/zutil.h",
-        "include/scsi/scsi_devinfo.h",
-        "init/version-timestamp.c",
-        "lib/cmdline.c",
-        "lib/crypto/sha256.c",
-        "lib/ctype.c",
-        "lib/string.c",
-        "lib/decompress_*.c",
-        "lib/fdt*.c",
-        "lib/lz4/lz4_decompress.c",
-        "lib/lz4/lz4defs.h",
-        "lib/lzo/lzo1x_decompress_safe.c",
-        "lib/xxhash.c",
-        "lib/xz/xz_crc32.c",
-        "lib/xz/xz_dec_bcj.c",
-        "lib/xz/xz_dec_lzma2.c",
-        "lib/xz/xz_dec_stream.c",
-        "lib/zlib_dfltcc/dfltcc.c",
-        "lib/zlib_dfltcc/dfltcc_inflate.c",
-        "lib/zlib_inflate/inffast.c",
-        "lib/zlib_inflate/inffast.h",
-        "lib/zlib_inflate/inffixed.h",
-        "lib/zlib_inflate/inflate.c",
-        "lib/zlib_inflate/inflate.h",
-        "lib/zlib_inflate/inftrees.c",
-        "lib/zlib_inflate/inftrees.h",
-        "lib/zlib_inflate/infutil.h",
-        "lib/zstd/common/*.c",
-        "lib/zstd/decompress/*.c",
-        "lib/zstd/zstd_decompress_module.c",
-        "lib/vdso/**",
-        "rust/**",
-        "samples/Kconfig",
-        "scripts/generate_rust_target.rs",
-        "scripts/include/**",
-        "scripts/integer-wrap-ignore.scl",
-        "scripts/mod/**",
-        "scripts/module-common.c",
-        "scripts/module.lds.S",
-        "scripts/dtc/libfdt/**",
-        "usr/default_cpio_list",
-    ], allow_empty = True),
-)
-
-filegroup(
-    name = "local_include_files",
-    srcs = glob([
-        "**/*.S",
-        "**/*.c",
-        "**/*.inc",
-    ], allow_empty = True),
-)
-
-filegroup(
-    name = "tools_files",
-    srcs = glob([
-        "tools/**",
-    ], exclude = [
-        "tools/docker/**",
-    ], allow_empty = True),
-)
-
+# The Bazel 9 map_directory backend receives the complete immutable source
+# tree and derives the selected Kconfig/Kbuild graph itself. No architecture-
+# specific source inventory is mirrored in this repository template.
 filegroup(
     name = "all_files",
     srcs = glob(["**"]),
 )
 
-filegroup(
-    name = "kconfig_files",
-    srcs = glob([
-        "Kconfig*",
-        "**/Kconfig*",
-    ], allow_empty = True),
-)
-
-filegroup(
-    name = "headers",
-    srcs = glob(["**/*.h"]),
-)
-
-filegroup(
-    name = "global_headers",
-    srcs = glob(["include/**/*.h"]),
-)
-
-filegroup(
-    name = "arch_headers",
-    srcs = glob([
-        "arch/*/include/**/*.h",
-    ]),
-)
-
-filegroup(
-    name = "uapi_headers",
-    srcs = glob([
-        "include/uapi/**/*.h",
-        "arch/*/include/uapi/**/*.h",
-    ], allow_empty = True),
-)
-
-filegroup(
-    name = "scripts_headers",
-    srcs = glob(["scripts/**/*.h"], allow_empty = True),
-)
-
-filegroup(
-    name = "kbuild_files",
-    srcs = glob([
-        "Kbuild",
-        "Makefile",
-        "**/Kbuild",
-        "**/Makefile",
-    ], allow_empty = True),
-)
-
+# Public source-only aggregate used by rules_devicetree consumers. It does not
+# duplicate any Kbuild selection policy.
 filegroup(
     name = "dtb_sources",
     srcs = glob([
         "arch/*/boot/dts/**/*.dts",
         "arch/*/boot/dts/**/*.dtsi",
         "include/dt-bindings/**/*.h",
-    ], allow_empty = True),
-)
-
-cc_library(
-    name = "linux_headers_cc",
-    hdrs = [
-        ":global_headers",
-        ":arch_headers",
-    ],
-    includes = [
-        "include",
-        "arch/arm/include",
-        "arch/arm64/include",
-        "arch/mips/include",
-        "arch/riscv/include",
-        "arch/x86/include",
-    ],
-)
-
-cc_library(
-    name = "scripts_headers_cc",
-    hdrs = glob(["scripts/include/**/*.h"]),
-    includes = ["scripts/include"],
-)
-
-cc_library(
-    name = "genksyms_headers_cc",
-    hdrs = ["scripts/genksyms/genksyms.h"],
-    textual_hdrs = ["scripts/genksyms/keywords.c"],
-    includes = ["scripts/genksyms"],
-    deps = [":scripts_headers_cc"],
-)
-
-cc_library(
-    name = "tools_headers_cc",
-    hdrs = glob([
-        "arch/x86/tools/**/*.h",
-        "tools/arch/*/include/**/*.h",
-        "tools/include/**/*.h",
-        "tools/lib/**/*.h",
-        "tools/objtool/**/*.h",
-    ], allow_empty = True),
-    includes = [
-        "arch/x86/tools",
-        "tools/include",
-        "tools/include/uapi",
-        "tools/lib",
-    ] + select({
-        "@platforms//cpu:aarch64": ["tools/arch/arm64/include/uapi"],
-        "@platforms//cpu:arm64": ["tools/arch/arm64/include/uapi"],
-        "@platforms//cpu:x86_32": ["tools/arch/x86/include/uapi"],
-        "@platforms//cpu:x86_64": ["tools/arch/x86/include/uapi"],
-        "//conditions:default": ["tools/arch/x86/include/uapi"],
-    }) + [
-        "tools/arch/x86/include",
-        "tools/objtool/arch/x86/include",
-        "tools/objtool/include",
-    ],
-)
-
-filegroup(
-    name = "x86_syscall_32_tbl",
-    srcs = ["arch/x86/entry/syscalls/syscall_32.tbl"],
-)
-
-filegroup(
-    name = "x86_syscall_64_tbl",
-    srcs = ["arch/x86/entry/syscalls/syscall_64.tbl"],
-)
-
-filegroup(
-    name = "rq_offsets_c",
-    srcs = glob([
-        "kernel/sched/rq-offsets.c",
-    ], allow_empty = True),
-)
-
-filegroup(
-    name = "arm64_cfi_h",
-    srcs = glob([
-        "arch/arm64/include/asm/cfi.h",
-    ], allow_empty = True),
-)
-
-filegroup(
-    name = "x86_required_features_h",
-    srcs = glob([
-        "arch/x86/include/asm/required-features.h",
     ], allow_empty = True),
 )

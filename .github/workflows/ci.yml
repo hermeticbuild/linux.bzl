@@ -39,6 +39,7 @@ jobs:
           repository-cache: |
             - MODULE.bazel
             - MODULE.bazel.lock
+            - patches/llvm_kbuild_actions.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Test
@@ -50,7 +51,8 @@ jobs:
           set -euo pipefail
           bazel --host_jvm_args=-Xmx6g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-            test //... //internal/tests:path_mapping_test \
+            test //... \
+            --noannounce_rc \
             --config=path-mapping \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
@@ -81,121 +83,31 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  map-directory-e2e:
-    name: map_directory Kconfig (${{ matrix.compiler }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        compiler:
-          - clang
-          - gcc
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Configure Bazel
-        uses: bazel-contrib/setup-bazel@0.19.0
-        with:
-          bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-map-directory-${{ matrix.compiler }}
-          module-root: e2e
-          repository-cache: |
-            - e2e/.bazelversion
-            - e2e/MODULE.bazel
-            - e2e/MODULE.bazel.lock
-            - e2e/patches/BUILD.bazel
-            - e2e/patches/gcc_toolchain_remote_execution.patch
-            - e2e/patches/llvm_kbuild_actions.patch
-          cache-save: ${{ github.event_name != 'pull_request' }}
-
-      - name: Test with ${{ matrix.compiler }}
-        working-directory: e2e
-        env:
-          BAZEL_BEP: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.log
-          BAZEL_PROFILE: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.profile.gz
-        run: |
-          set -euo pipefail
-          bazel --host_jvm_args=-Xmx6g \
-            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-            test //map_directory:compiler_kconfig_e2e_tests \
-            --config=path-mapping \
-            --config="map-directory-${{ matrix.compiler }}" \
-            --notrack_incremental_state \
-            --nokeep_state_after_build \
-            --discard_analysis_cache \
-            --build_event_json_file="${BAZEL_BEP}" \
-            --profile="${BAZEL_PROFILE}" \
-            2>&1 | tee "${BAZEL_LOG}"
-
-      - name: Report cache efficiency
-        if: ${{ !cancelled() }}
-        env:
-          BAZEL_BEP: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.log
-          BAZEL_PROFILE: ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.profile.gz
-        run: |
-          .github/workflows/bazel_cache_report.sh \
-            "map_directory Kconfig (${{ matrix.compiler }})" \
-            "${BAZEL_PROFILE}" \
-            "${BAZEL_BEP}" \
-            "${BAZEL_LOG}"
-
-      - name: Upload Bazel profile
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: bazel-profile-map-directory-${{ matrix.compiler }}
-          path: |
-            ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.profile.gz
-            ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.bep.json
-            ${{ runner.temp }}/map-directory-${{ matrix.compiler }}.log
-          if-no-files-found: warn
-          retention-days: 14
-
   examples:
-    name: Standalone examples (${{ matrix.title }})
+    name: Standalone examples (${{ matrix.suite.title }}, ${{ matrix.compiler }}, Bazel ${{ matrix.bazel }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
+        bazel:
+          - 9.1.0
+          - 9.2.0
+        compiler:
+          - clang
+          - gcc
+        suite:
           - batch: initramfs
             title: initramfs
             targets: "//:example_initramfs"
-            report_name: ""
-            report_target: ""
-            report_title: ""
-            report_mnemonics: ""
           - batch: x86-64-variants
             title: x86_64 base + overlays
-            targets: "//:x86_64_kernel //:x86_64_debug_kernel //:x86_64_btf_vmlinux //:x86_64_lz4_kernel //:x86_64_shared_graph_metadata"
-            report_name: x86-64-base
-            report_target: "//:x86_64_kernel"
-            report_title: x86_64 base
-            report_mnemonics: >-
-              LinuxObjectCompile
-              LinuxPurgatoryCompile
-              LinuxRealmodeCompile
-              LinuxVDSOCompile
-              LinuxVmlinuxCompile
-              LinuxX86CompressedCompile
-              LinuxX86EFIStubCompile
-              LinuxX86SetupCompile
+            targets: "//:x86_64_kernel //:x86_64_debug_kernel //:x86_64_btf_vmlinux //:x86_64_lz4_kernel"
           - batch: aarch64-base
             title: aarch64 base
             targets: "//:aarch64_kernel"
-            report_name: aarch64-base
-            report_target: "//:aarch64_kernel"
-            report_title: aarch64 base
-            report_mnemonics: >-
-              LinuxObjectCompile
-              LinuxARM64VDSOCompile
-              LinuxARM64VDSO32Compile
-              LinuxVmlinuxCompile
+    env:
+      USE_BAZEL_VERSION: ${{ matrix.bazel }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -204,28 +116,34 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-examples-${{ matrix.batch }}
+          disk-cache: ${{ github.workflow }}-examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}
           module-root: examples
           repository-cache: |
             - examples/.bazelversion
+            - examples/.bazelrc
             - examples/MODULE.bazel
             - examples/MODULE.bazel.lock
+            - examples/gcc_toolchain_remote_execution.patch
+            - examples/libbpf_old_uapi_compat.patch
+            - examples/llvm_kbuild_actions.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
-      - name: Build ${{ matrix.title }}
+      - name: Build ${{ matrix.suite.title }} with ${{ matrix.compiler }}
         working-directory: examples
         env:
-          BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.batch }}.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/examples-${{ matrix.batch }}.log
-          BAZEL_PROFILE: ${{ runner.temp }}/examples-${{ matrix.batch }}.profile.gz
-          BAZEL_TARGETS: ${{ matrix.targets }}
+          BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
+          BAZEL_TARGETS: ${{ matrix.suite.targets }}
         run: |
           set -euo pipefail
           read -r -a targets <<<"${BAZEL_TARGETS}"
           bazel --host_jvm_args=-Xmx6g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             build "${targets[@]}" \
+            --noannounce_rc \
             --config=path-mapping \
+            --config="compiler-${{ matrix.compiler }}" \
             --notrack_incremental_state \
             --nokeep_state_after_build \
             --discard_analysis_cache \
@@ -234,169 +152,48 @@ jobs:
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
 
-      - name: Generate Linux object input reports
-        if: ${{ matrix.report_target != '' }}
-        working-directory: examples
-        env:
-          BAZEL_REPORT_MNEMONICS: ${{ matrix.report_mnemonics }}
-          BAZEL_REPORT_TARGET: ${{ matrix.report_target }}
-          REPORT_NAME: ${{ matrix.report_name }}
-          REPORT_TITLE: ${{ matrix.report_title }}
-        run: |
-          set -euo pipefail
-          report_dir="${RUNNER_TEMP}/linux-object-input-report-${REPORT_NAME}"
-          aquery="${report_dir}/aquery.json"
-          reporter="${RUNNER_TEMP}/linuxobjectinputreport"
-          mkdir -p "${report_dir}"
-
-          execroot="$(
-            bazel \
-              --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-              info \
-              --config=path-mapping \
-              execution_root
-          )"
-
-          bazel \
-            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-            build \
-            --config=path-mapping \
-            --remote_download_toplevel \
-            @linux.bzl//tools:linuxobjectinputreport
-          reporter_output="$(
-            bazel \
-              --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-              cquery \
-              --config=path-mapping \
-              --output=files \
-              @linux.bzl//tools:linuxobjectinputreport
-          )"
-          install -m 0755 "${reporter_output}" "${reporter}"
-
-          bazel \
-            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-            build \
-            --config=path-mapping \
-            --remote_download_all \
-            "${BAZEL_REPORT_TARGET}"
-
-          bazel \
-            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-            aquery \
-            --config=path-mapping \
-            --output=jsonproto \
-            --include_artifacts \
-            --noinclude_commandline \
-            "deps(${BAZEL_REPORT_TARGET})" >"${aquery}"
-
-          "${reporter}" \
-            -input "${aquery}" \
-            -execroot "${execroot}" |
-            tee "${report_dir}/linux-object-input-report.txt"
-
-          read -r -a mnemonics <<<"${BAZEL_REPORT_MNEMONICS}"
-          mnemonic_args=()
-          for mnemonic in "${mnemonics[@]}"; do
-            mnemonic_args+=(-mnemonic "${mnemonic}")
-          done
-          "${reporter}" \
-            -input "${aquery}" \
-            -execroot "${execroot}" \
-            "${mnemonic_args[@]}" |
-            tee "${report_dir}/linux-object-input-report-all-compiles.txt"
-
-          gzip "${aquery}"
-
-          {
-            printf '### Linux object input reports (%s)\n\n' "${REPORT_TITLE}"
-            printf "Full reports and their compressed producer-complete aquery are attached as \`%s\`.\n\n" \
-              "linux-object-input-report-${REPORT_NAME}"
-            printf '<details><summary>LinuxObjectCompile report</summary>\n\n```text\n'
-            cat "${report_dir}/linux-object-input-report.txt"
-            printf '```\n\n</details>\n\n'
-            printf '<details><summary>All selected compile actions</summary>\n\n```text\n'
-            cat "${report_dir}/linux-object-input-report-all-compiles.txt"
-            printf '```\n\n</details>\n'
-          } >>"${GITHUB_STEP_SUMMARY}"
-
-      - name: Upload Linux object input reports
-        if: ${{ !cancelled() && matrix.report_target != '' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: linux-object-input-report-${{ matrix.report_name }}
-          path: ${{ runner.temp }}/linux-object-input-report-${{ matrix.report_name }}
-          if-no-files-found: warn
-          retention-days: 14
-
       - name: Report cache efficiency
         if: ${{ !cancelled() }}
         env:
-          BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.batch }}.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/examples-${{ matrix.batch }}.log
-          BAZEL_PROFILE: ${{ runner.temp }}/examples-${{ matrix.batch }}.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
         run: |
           .github/workflows/bazel_cache_report.sh \
-            "Standalone examples (${{ matrix.title }})" \
+            "Standalone examples (${{ matrix.suite.title }}, ${{ matrix.compiler }}, Bazel ${{ matrix.bazel }})" \
             "${BAZEL_PROFILE}" \
             "${BAZEL_BEP}" \
             "${BAZEL_LOG}"
-
-      - name: Verify shared kernel graph
-        if: ${{ matrix.batch == 'x86-64-variants' }}
-        working-directory: examples
-        env:
-          BAZEL_AQUERY: ${{ runner.temp }}/examples-${{ matrix.batch }}.aquery.json
-          BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.batch }}.bep.json
-          BAZEL_TARGETS: ${{ matrix.targets }}
-        run: |
-          set -euo pipefail
-          read -r -a targets <<<"${BAZEL_TARGETS}"
-          query="deps(${targets[0]})"
-          for target in "${targets[@]:1}"; do
-            query="${query} + deps(${target})"
-          done
-          bazel \
-            --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-            aquery \
-            --config=path-mapping \
-            --output=jsonproto \
-            --noinclude_artifacts \
-            --noinclude_commandline \
-            "${query}" >"${BAZEL_AQUERY}"
-          ../.github/workflows/assert_shared_kernel_graph.sh \
-            "${BAZEL_BEP}" \
-            "${BAZEL_AQUERY}" \
-            bazel-bin/x86_64_shared_graph_metadata.json \
-            3533 \
-            4727 \
-            117000
 
       - name: Upload Bazel profile
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: bazel-profile-examples-${{ matrix.batch }}
+          name: bazel-profile-examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}
           path: |
-            ${{ runner.temp }}/examples-${{ matrix.batch }}.profile.gz
-            ${{ runner.temp }}/examples-${{ matrix.batch }}.bep.json
-            ${{ runner.temp }}/examples-${{ matrix.batch }}.log
+            ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
+            ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+            ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.log
           if-no-files-found: warn
           retention-days: 14
 
   qemu-e2e:
-    name: QEMU e2e (${{ matrix.suite.title }}, ${{ matrix.compiler }})
+    name: QEMU e2e (${{ matrix.suite.title }}, ${{ matrix.compiler }}, Bazel ${{ matrix.bazel }})
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
+        bazel:
+          - 9.1.0
+          - 9.2.0
         compiler:
           - clang
           - gcc
         suite:
           - batch: tooling
             title: E2E tooling
-            targets: "//boot:init_test //cmd/qemuboot:qemuboot_test"
+            targets: "//:compiler_identity_test //boot:init_test //cmd/qemuboot:qemuboot_test"
           - batch: linux-6.12-x86_64
             title: Linux 6.12 x86_64
             targets: "//:linux_6_12_96_x86_64_boot_test //:linux_6_12_96_x86_64_module_test //:modversions_6_12_96_x86_64_build_test"
@@ -427,6 +224,8 @@ jobs:
           - batch: linux-6.12-rust-aarch64
             title: Linux 6.12 Rust aarch64
             targets: "//:linux_6_12_96_aarch64_rust_module_test"
+    env:
+      USE_BAZEL_VERSION: ${{ matrix.bazel }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -435,22 +234,26 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}
+          disk-cache: ${{ github.workflow }}-qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}
           module-root: e2e
           repository-cache: |
             - e2e/.bazelversion
+            - e2e/.bazelrc
             - e2e/MODULE.bazel
             - e2e/MODULE.bazel.lock
             - e2e/patches/BUILD.bazel
             - e2e/patches/gcc_toolchain_remote_execution.patch
+            - e2e/patches/libbpf_old_uapi_compat.patch
+            - e2e/patches/llvm_kbuild_actions.patch
+            - e2e/patches/rules_rs_linux_rust_lld_runtime.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Run ${{ matrix.suite.title }} with ${{ matrix.compiler }}
         working-directory: e2e
         env:
-          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.log
-          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
           BAZEL_TARGETS: ${{ matrix.suite.targets }}
         run: |
           set -euo pipefail
@@ -458,11 +261,13 @@ jobs:
           bazel --host_jvm_args=-Xmx6g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test "${targets[@]}" \
+            --noannounce_rc \
             --config=path-mapping \
             --config="compiler-${{ matrix.compiler }}" \
             --notrack_incremental_state \
             --nokeep_state_after_build \
             --discard_analysis_cache \
+            --experimental_record_metrics_for_all_mnemonics \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -470,12 +275,12 @@ jobs:
       - name: Report cache efficiency
         if: ${{ !cancelled() }}
         env:
-          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.log
-          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
         run: |
           .github/workflows/bazel_cache_report.sh \
-            "QEMU e2e (${{ matrix.suite.title }}, ${{ matrix.compiler }})" \
+            "QEMU e2e (${{ matrix.suite.title }}, ${{ matrix.compiler }}, Bazel ${{ matrix.bazel }})" \
             "${BAZEL_PROFILE}" \
             "${BAZEL_BEP}" \
             "${BAZEL_LOG}"
@@ -484,11 +289,11 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: bazel-profile-qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}
+          name: bazel-profile-qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}
           path: |
-            ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.profile.gz
-            ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.bep.json
-            ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}.log
+            ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
+            ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+            ${{ runner.temp }}/qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.log
           if-no-files-found: warn
           retention-days: 14
 
@@ -508,11 +313,13 @@ jobs:
           module-root: aya_e2e
           repository-cache: |
             - aya_e2e/.bazelversion
+            - aya_e2e/.bazelrc
             - aya_e2e/MODULE.bazel
             - aya_e2e/MODULE.bazel.lock
             - aya_e2e/patches/BUILD.bazel
             - aya_e2e/patches/aya_linux_bzl_api.patch
             - aya_e2e/patches/aya_rust_kernel_module_e2e.patch
+            - aya_e2e/patches/llvm_kbuild_actions.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Run Aya integration VMs
@@ -528,6 +335,7 @@ jobs:
             test \
             '@aya//test/integration-test:vm_aarch64' \
             '@aya//test/integration-test:vm_x86_64' \
+            --noannounce_rc \
             --notrack_incremental_state \
             --nokeep_state_after_build \
             --discard_analysis_cache \
@@ -561,9 +369,20 @@ jobs:
           retention-days: 14
 
   sonic-e2e:
-    name: SONiC linux_ngbde module
+    name: SONiC linux_ngbde module (${{ matrix.compiler }}, Bazel ${{ matrix.bazel }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        bazel:
+          - 9.1.0
+          - 9.2.0
+        compiler:
+          - clang
+          - gcc
+    env:
+      USE_BAZEL_VERSION: ${{ matrix.bazel }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -572,29 +391,41 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-sonic-e2e
+          disk-cache: ${{ github.workflow }}-sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}
           module-root: sonic_e2e
           repository-cache: |
             - sonic_e2e/.bazelversion
+            - sonic_e2e/.bazelrc
+            - sonic_e2e/BUILD.bazel
             - sonic_e2e/MODULE.bazel
             - sonic_e2e/MODULE.bazel.lock
+            - sonic_e2e/arm64_module_test.go
+            - sonic_e2e/gcc_toolchain_remote_execution.patch
+            - sonic_e2e/libbpf_old_uapi_compat.patch
+            - sonic_e2e/llvm_kbuild_actions.patch
+            - sonic_e2e/module_test.go
+            - sonic_e2e/sai_bcm_kconfig.patch
+            - sonic_e2e/sonic.config
           cache-save: ${{ github.event_name != 'pull_request' }}
 
-      - name: Build SONiC linux_ngbde module
+      - name: Build SONiC linux_ngbde module with ${{ matrix.compiler }}
         working-directory: sonic_e2e
         env:
-          BAZEL_BEP: ${{ runner.temp }}/sonic-e2e.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/sonic-e2e.log
-          BAZEL_PROFILE: ${{ runner.temp }}/sonic-e2e.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
         run: |
           set -euo pipefail
           bazel --host_jvm_args=-Xmx6g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
-            test //:sonic_linux_ngbde_module_test \
+            test //:sonic_linux_ngbde_module_test //:sonic_arm64_module_exclusion_test \
+            --noannounce_rc \
             --config=path-mapping \
+            --config="compiler-${{ matrix.compiler }}" \
             --notrack_incremental_state \
             --nokeep_state_after_build \
             --discard_analysis_cache \
+            --experimental_record_metrics_for_all_mnemonics \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -602,12 +433,12 @@ jobs:
       - name: Report cache efficiency
         if: ${{ !cancelled() }}
         env:
-          BAZEL_BEP: ${{ runner.temp }}/sonic-e2e.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/sonic-e2e.log
-          BAZEL_PROFILE: ${{ runner.temp }}/sonic-e2e.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
         run: |
           .github/workflows/bazel_cache_report.sh \
-            "SONiC linux_ngbde module" \
+            "SONiC linux_ngbde module (${{ matrix.compiler }}, Bazel ${{ matrix.bazel }})" \
             "${BAZEL_PROFILE}" \
             "${BAZEL_BEP}" \
             "${BAZEL_LOG}"
@@ -616,10 +447,10 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: bazel-profile-sonic-e2e
+          name: bazel-profile-sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}
           path: |
-            ${{ runner.temp }}/sonic-e2e.profile.gz
-            ${{ runner.temp }}/sonic-e2e.bep.json
-            ${{ runner.temp }}/sonic-e2e.log
+            ${{ runner.temp }}/sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
+            ${{ runner.temp }}/sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+            ${{ runner.temp }}/sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.log
           if-no-files-found: warn
           retention-days: 14

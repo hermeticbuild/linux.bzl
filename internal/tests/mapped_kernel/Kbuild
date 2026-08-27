@@ -1,0 +1,9 @@
+cmd_cc_o_c = $(CC) $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS) -c -o $@ $<
+
+obj-y += smoke.o
+
+.PHONY: modules_prepare
+modules_prepare:
+
+smoke.o: smoke.c
+	$(cmd_cc_o_c)

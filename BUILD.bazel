@@ -4,6 +4,7 @@
 # gazelle:exclude examples
 # gazelle:exclude sonic_e2e
 # gazelle:resolve go github.com/bazelbuild/bazel-gazelle/rule @gazelle//rule
+# gazelle:resolve go github.com/bazelbuild/rules_go/go/runfiles @rules_go//go/runfiles
 
 load("@buildifier_prebuilt//:rules.bzl", "buildifier", "buildifier_test")
 load("@gazelle//:def.bzl", "gazelle", "gazelle_test")

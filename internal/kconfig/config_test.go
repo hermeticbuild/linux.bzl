@@ -2,6 +2,7 @@ package kconfig
 
 import (
 	"context"
+	"maps"
 	"strings"
 	"testing"
 )
@@ -31,68 +32,94 @@ config TARGET
 	})
 }
 
-func TestResolveConfigIgnoresImportedRustToolchainValues(t *testing.T) {
-	resolved := mustResolveConfig(t, `
-config RUSTC_VERSION
+func TestResolveConfigUsesMeasuredDefaultsForHiddenSymbols(t *testing.T) {
+	tree, err := Parse(context.Background(), strings.NewReader(`
+config MEASURED_VERSION
 	int
-	default 109800
+	default $(MEASURED_VERSION)
 
-config RUSTC_HAS_FOO
+config MEASURED_CAPABILITY
 	bool
-	default y
-`, map[string]string{
-		"CONFIG_RUSTC_VERSION": "107800",
-		"CONFIG_RUSTC_HAS_FOO": "n",
+	default $(MEASURED_CAPABILITY)
+
+config USER_CHOICE
+	bool "User choice"
+	default n
+`), "Kconfig", Options{Variables: map[string]string{
+		"MEASURED_VERSION":    "109800",
+		"MEASURED_CAPABILITY": "y",
+	}})
+	if err != nil {
+		t.Fatalf("Parse() failed: %v", err)
+	}
+	resolved, err := tree.ResolveConfig(map[string]string{
+		"CONFIG_MEASURED_VERSION":    "107800",
+		"CONFIG_MEASURED_CAPABILITY": "n",
+		"CONFIG_USER_CHOICE":         "y",
 	})
-	if got := resolved.Value("CONFIG_RUSTC_VERSION"); got != "109800" {
-		t.Fatalf("CONFIG_RUSTC_VERSION = %q, want probe-derived default", got)
+	if err != nil {
+		t.Fatalf("ResolveConfig() failed: %v", err)
 	}
-	if got := resolved.Value("CONFIG_RUSTC_HAS_FOO"); got != "y" {
-		t.Fatalf("CONFIG_RUSTC_HAS_FOO = %q, want probe-derived default", got)
+	if got := resolved.Value("CONFIG_MEASURED_VERSION"); got != "109800" {
+		t.Fatalf("CONFIG_MEASURED_VERSION = %q, want measured default", got)
 	}
-	if len(resolved.Raw) != 0 {
-		t.Fatalf("raw toolchain values were retained: %#v", resolved.Raw)
+	if got := resolved.Value("CONFIG_MEASURED_CAPABILITY"); got != "y" {
+		t.Fatalf("CONFIG_MEASURED_CAPABILITY = %q, want measured default", got)
 	}
-}
-
-func TestValidateRustToolchainEquivalence(t *testing.T) {
-	actual := &ResolvedConfig{
-		Effective: map[string]string{
-			"CONFIG_RUST":          "y",
-			"CONFIG_RUSTC_VERSION": "109800",
-			"CONFIG_RUSTC_HAS_FOO": "y",
-			"CONFIG_HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC": "y",
-			"CONFIG_EMPTY_STRING_DEFAULT":                    `""`,
-			"CONFIG_STRUCTURAL_NEW":                          "n",
-		},
-		Written: map[string]bool{
-			"CONFIG_RUST":          true,
-			"CONFIG_RUSTC_VERSION": true,
-			"CONFIG_RUSTC_HAS_FOO": true,
-			"CONFIG_HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC": true,
-			"CONFIG_EMPTY_STRING_DEFAULT":                    true,
-		},
-	}
-	if err := ValidateRustToolchainEquivalence(map[string]string{
-		"CONFIG_RUST":          "y",
-		"CONFIG_RUSTC_VERSION": "107800",
-	}, actual); err != nil {
-		t.Fatalf("ValidateRustToolchainEquivalence() rejected dynamic-only changes: %v", err)
-	}
-	actual.Effective["CONFIG_STRUCTURAL_NEW"] = "y"
-	actual.Written["CONFIG_STRUCTURAL_NEW"] = true
-	if err := ValidateRustToolchainEquivalence(map[string]string{"CONFIG_RUST": "y"}, actual); err == nil {
-		t.Fatal("ValidateRustToolchainEquivalence() accepted structural change")
+	if got := resolved.Value("CONFIG_USER_CHOICE"); got != "y" {
+		t.Fatalf("CONFIG_USER_CHOICE = %q, want imported visible value", got)
 	}
 }
 
-func TestParseConfigSkipsUnsetComments(t *testing.T) {
-	raw, err := ParseConfig(strings.NewReader("# CONFIG_DEFAULT_ON is not set\n"))
+func TestCompactMetadataWithOptionsStoresOneResolvedFragment(t *testing.T) {
+	tree, err := Parse(context.Background(), strings.NewReader(`
+config ENABLED
+	bool "Enabled"
+
+config HIDDEN
+	def_bool y
+`), "Kconfig", Options{})
+	if err != nil {
+		t.Fatalf("Parse() failed: %v", err)
+	}
+	metadata, err := tree.CompactMetadataWithOptions(
+		map[string]string{"CONFIG_ENABLED": "y"},
+		ResolveConfigOptions{},
+		CompactMetadataOptions{SelectedProductsOnly: true},
+		func(resolved *ResolvedConfig) (CompactConfigGraph, error) {
+			if resolved.Value("CONFIG_ENABLED") != "y" || resolved.Value("CONFIG_HIDDEN") != "y" {
+				t.Fatalf("graph resolver received unresolved config: %#v", resolved.Effective)
+			}
+			return CompactConfigGraph{ImageTarget: "image"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("CompactMetadataWithOptions() failed: %v", err)
+	}
+	if got, want := metadata.configFragment, map[string]string{
+		"CONFIG_ENABLED": "y",
+		"CONFIG_HIDDEN":  "y",
+	}; !maps.Equal(got, want) {
+		t.Fatalf("resolved fragment = %#v, want %#v", got, want)
+	}
+	if metadata.Config.imageTarget != "image" {
+		t.Fatalf("image target = %q, want image", metadata.Config.imageTarget)
+	}
+}
+
+func TestParseConfigPreservesCanonicalUnsetComments(t *testing.T) {
+	raw, err := ParseConfig(strings.NewReader(`# Generated configuration
+# CONFIG_DEFAULT_ON is not set
+# CONFIG_ is not set
+# CONFIG_SPACED  is not set
+# CONFIG_TRAILING is not set trailing text
+# CONFIG_DIFFERENT_COMMENT has another meaning
+`))
 	if err != nil {
 		t.Fatalf("ParseConfig() failed: %v", err)
 	}
-	if len(raw) != 0 {
-		t.Fatalf("ParseConfig() = %#v, want no explicit flags", raw)
+	if got, want := raw, map[string]string{"CONFIG_DEFAULT_ON": "n"}; !maps.Equal(got, want) {
+		t.Fatalf("ParseConfig() = %#v, want %#v", got, want)
 	}
 	resolved := mustResolveConfig(t, `
 mainmenu "Test"
@@ -100,11 +127,18 @@ mainmenu "Test"
 config DEFAULT_ON
 	bool "Default on"
 	default y
-`, raw)
+	`, raw)
 
 	wantConfigValues(t, resolved, map[string]string{
-		"CONFIG_DEFAULT_ON": "y",
+		"CONFIG_DEFAULT_ON": "n",
 	})
+}
+
+func TestParseConfigRejectsDuplicateAssignmentAndUnset(t *testing.T) {
+	_, err := ParseConfig(strings.NewReader("CONFIG_DUPLICATE=y\n# CONFIG_DUPLICATE is not set\n"))
+	if err == nil || !strings.Contains(err.Error(), `duplicate config key "CONFIG_DUPLICATE"`) {
+		t.Fatalf("ParseConfig() error = %v, want duplicate key", err)
+	}
 }
 
 func TestResolveConfigAllNoConfigStartsFromN(t *testing.T) {
@@ -1190,7 +1224,7 @@ func mustResolveConfigWithOptions(t *testing.T, fixture string, raw map[string]s
 	if err != nil {
 		t.Fatalf("Parse() failed: %v", err)
 	}
-	resolved, err := tree.ResolveConfigWithOptions("test", raw, opts)
+	resolved, err := tree.ResolveConfigWithOptions(raw, opts)
 	if err != nil {
 		t.Fatalf("ResolveConfig() failed: %v", err)
 	}

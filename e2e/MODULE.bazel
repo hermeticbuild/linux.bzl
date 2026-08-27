@@ -28,6 +28,25 @@ single_version_override(
     version = "0.8.14",
 )
 
+# Rust 1.97's native Linux target spec carries a self-contained linker
+# component.  Keep that distribution-provided runtime in the generated
+# rules_rust sysroot while the configured C/C++ toolchain remains the selected
+# link driver.  This patch can be dropped once rules_rs publishes the same
+# complete toolchain closure.
+single_version_override(
+    module_name = "rules_rs",
+    patch_strip = 1,
+    patches = ["//patches:rules_rs_linux_rust_lld_runtime.patch"],
+    version = "0.0.102",
+)
+
+single_version_override(
+    module_name = "libbpf",
+    patch_strip = 1,
+    patches = ["//patches:libbpf_old_uapi_compat.patch"],
+    version = "1.7.0",
+)
+
 register_toolchains(
     "//:gcc_cc_toolchain_aarch64",
     "//:gcc_cc_toolchain_armv7",
@@ -109,11 +128,18 @@ linux_source_repository = use_repo_rule(
 
 linux_source_repository(
     name = "e2e_linux_6_12_96",
+    module_targets = {
+        "test_module": "lib/test_module.ko",
+    },
     version = "6.12.96",
 )
 
 linux_source_repository(
     name = "e2e_linux_6_18_39",
+    module_targets = {
+        "cnic_module": "drivers/net/ethernet/broadcom/cnic.ko",
+        "test_module": "lib/test_module.ko",
+    },
     version = "6.18.39",
 )
 

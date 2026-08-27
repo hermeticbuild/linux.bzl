@@ -1,9 +1,11 @@
 # Releasing linux.bzl
 
-Each rules release pins both its supported Linux source catalog and the
-platform-specific Kconfig graph generator archives. The generator has its own
-version and release assets; changing it is an explicit compatibility update to
-the rules module.
+Each rules release pins its supported Linux source catalog. Kconfig/Kbuild
+planning ships with the module and runs as a normal Bazel exec tool; it has no
+independent prebuilt or release stream.
+
+The release line is Bazel 9-only. Do not add a compatibility fallback for
+Bazel 8; validate both maintained Bazel 9 minors instead.
 
 ## Prepare
 
@@ -22,31 +24,20 @@ the rules module.
 6. On a Linux x86_64 executor with the registered stable Rust 1.97.0
    toolchain, run
    `bazel test //:linux_6_12_96_rust_module_test
-   //:linux_6_18_39_rust_module_test --test_output=streamed` from `e2e`.
+   //:linux_6_12_96_aarch64_rust_module_test
+   //:linux_6_18_39_rust_module_test
+   //:linux_6_18_39_aarch64_rust_module_test --test_output=streamed` from
+   `e2e`.
    This builds and loads version-native Rust-for-Linux modules for the
-   cataloged x86_64 kernels. Also verify that cross-kernel dependencies and
-   Rust `MODULE_VERSION`/module source-version metadata are rejected. Build the
-   C source-version fixture to verify `MODULE_VERSION` and
+   cataloged x86_64 and aarch64 kernels. Also verify that cross-kernel
+   dependencies are rejected. Build the C source-version fixture to verify
+   that native Kbuild carries `MODULE_VERSION` and
    `CONFIG_MODULE_SRCVERSION_ALL` through modpost.
 7. From `aya_e2e`, run the pinned Aya x86_64 and aarch64 VM targets in one
-   Bazel invocation. This exercises the shared action graph and records
-   cross-target action deduplication in one profile and BEP.
+   Bazel invocation.
 8. Audit the pinned source URLs and integrities in the catalog.
-9. Audit `KCONFIG_TOOL_VERSION` and all six entries in
-   `internal/kconfig_tool_releases.bzl`.
-
-When updating the generator, first publish deterministic
-`kconfig-<version>` archives for Linux, macOS, and Windows on amd64 and arm64.
-Each archive must contain `kconfig_parse` at its root. Compute the Subresource
-Integrity values from the published assets, update the checked-in table, and
-run repository-generation smoke tests for every host archive. Rebuild the
-archives once from a clean checkout and compare digests.
-
-After verifying the generator commit, create and push its release tag with:
-
-```sh
-VERSION=vX.Y.Z ./release_kconfig.sh
-```
+9. Run the full GCC and Clang RBE matrix and verify the selected toolchain is
+   recorded in resolved Kconfig values and action plans.
 
 ## Publish
 
@@ -54,42 +45,37 @@ VERSION=vX.Y.Z ./release_kconfig.sh
    workflow creates the module source archive and starts the BCR publishing
    workflow using the configuration under `.bcr/`.
 2. Verify the release archive and the generated BCR pull request.
-3. Test a clean consumer module using the tag, without `local_path_override` or
-   a locally built generator.
+3. Test a clean consumer module using the tag, without `local_path_override`.
 
 ## Support checks
 
 A release is ready only when:
 
-- Bazel 8.x and 9.x pass the root test suite.
-- Linux 6.12 and 6.18 build for x86_64 and aarch64 with the registered Bazel C++
-  toolchains.
+- Bazel 9.1.0 and 9.2.0 pass the root test suite.
+- Linux 6.12 and 6.18 build for x86_64 and aarch64 with both registered GCC and
+  Clang toolchains.
 - All four maintained kernel/architecture pairs boot under the registered QEMU
   system toolchains, reach the initramfs userspace marker, and exercise
   configured module loading.
 - The fixed `:modules`, `:module_symvers`, `:modules_order`,
   `:modules_builtin`, and `:modules_builtin_modinfo` labels produce the
   corresponding Kbuild artifacts.
-- Rust-for-Linux modules build for the cataloged x86_64 Linux targets
-  on a Linux x86_64 executor with stable Rust 1.97.0 through the public
-  `linux_module` API. Cross-kernel module dependencies and
-  Rust `MODULE_VERSION`/module source-version metadata fail explicitly.
-- C modules support `MODULE_VERSION`; in-tree C/assembly modules and
-  out-of-tree C modules support `CONFIG_MODULE_SRCVERSION_ALL`, while direct
-  authored `srcversion=` metadata fails explicitly.
+- Rust-for-Linux modules build for the cataloged x86_64 and aarch64 Linux
+  targets on a Linux x86_64 executor with stable Rust 1.97.0 through the public
+  `linux_module` API. Cross-kernel module dependencies fail explicitly.
+- External C and Rust modules use the same source-derived Kbuild planner as the
+  configured kernel. C module coverage includes `MODULE_VERSION` and
+  `CONFIG_MODULE_SRCVERSION_ALL` through native modpost stages.
 - The pinned Aya x86_64 and aarch64 VM tests pass from the standalone
   `aya_e2e` module root.
 - BPF-syscall and BTF-enabled configurations are covered by a compatibility
   build.
-- Repository generation is smoke-tested with all six host generator archives.
 - The base and named-overlay repositories produce the documented fixed outputs.
 - Unsupported Kbuild constructs and toolchain/config mismatches fail with
   actionable diagnostics.
 
-Named variants must share content-identical object actions in one configured
-graph. Release CI verifies the maintained x86_64 base/BTF/debug/LZ4 invocation
-against the generated graph statistics and Bazel action metrics.
+Release CI verifies plan determinism and real kernel/module outputs through the
+expanded `map_directory` actions rather than generated BUILD targets.
 
-Signing kernel images or modules, Rust module source versions, direct authored
-`srcversion=` metadata, and device-tree artifacts are outside the current
-release contract.
+Signing kernel images or modules and compiling device-tree artifacts are
+outside the current release contract.
