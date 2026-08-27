@@ -87,6 +87,7 @@ stem_cflags = $(CFLAGS_$(target-stem).o)
 CFLAGS_../../../virt/kvm/kvm_main.o = -DLEXICAL_TARGET_STEM
 cmd_cc_o_c = $(CC) $(object_cflags) $(stem_cflags) -DRELATIVE_OBJECT=$(patsubst $(obj)/%,%,$@) -c -o $@ $<
 $(obj)/%.o: private object_cflags = -DLEXICAL_KVM_TARGET
+virt/kvm/kvm_main.o: FORCE
 $(obj)/%.o: $(obj)/%.c FORCE
 	$(call if_changed_dep,cc_o_c)
 `, map[string]string{
@@ -114,8 +115,20 @@ $(obj)/%.o: $(obj)/%.c FORCE
 		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
 		Recipes:  map[string]ActionRecipe{},
 	}
-	if _, err := metadata.appendGeneratedActionPlan(plan); err != nil {
+	if orderingOnly, err := metadata.compactKbuildTargetIsOrderingOnlyInProfile(profile, target); err != nil {
 		t.Fatal(err)
+	} else if !orderingOnly {
+		t.Fatalf("canonical target %q did not reproduce the prerequisite-only classification", target)
+	}
+	graph, err := metadata.appendGeneratedActionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(graph.selectedRootRuleResolutions) != 0 || len(graph.ruleResolutions) != 0 {
+		t.Fatalf(
+			"completed parent-traversal plan retained selected/general rule resolutions %d/%d",
+			len(graph.selectedRootRuleResolutions), len(graph.ruleResolutions),
+		)
 	}
 	producer, _, ok := planProducerByOutput(plan, "objects", target)
 	if !ok {

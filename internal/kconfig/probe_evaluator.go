@@ -1854,9 +1854,9 @@ func (e *LinuxProbeEvaluator) rustcPrintFileNames(command string) (string, bool,
 	if len(fields) == 0 {
 		return "", false, nil
 	}
-	environment := map[string]string(nil)
+	inlineEnvironment := map[string]string(nil)
 	if fields[0] == "MAKEFLAGS=" {
-		environment = map[string]string{"MAKEFLAGS": ""}
+		inlineEnvironment = map[string]string{"MAKEFLAGS": ""}
 		fields = fields[1:]
 	}
 	if len(fields) == 0 || !e.isToolToken(fields[0], "rustc") {
@@ -1875,13 +1875,20 @@ func (e *LinuxProbeEvaluator) rustcPrintFileNames(command string) (string, bool,
 		fields[5] != "--crate-type" || !safeLinuxProbePathComponent(fields[6]) || fields[7] != "-" {
 		return "", true, e.unsupportedCommand(command)
 	}
+	environment, auxiliaryTools, sourceRoots, err := e.probeStepEnvironment("rustc", inlineEnvironment)
+	if err != nil {
+		return "", true, fmt.Errorf("invalid rustc file-name environment: %w", err)
+	}
 	request := ProbeRequest{
-		Schema: LinuxProbeRequestSchema,
+		Schema:      LinuxProbeRequestSchema,
+		SourceRoots: sourceRoots,
 		Steps: []ProbeStep{{
-			Name: "print-file-names", Tool: "rustc", Arguments: slices.Clone(fields[1:]), Environment: environment,
+			Name: "print-file-names", Tool: "rustc", Arguments: slices.Clone(fields[1:]),
+			AuxiliaryTools: auxiliaryTools, Environment: environment,
 		}},
 		Outcome: ProbeOutcome{
-			Kind: "text", Step: "print-file-names", Stream: "stdout", TrimSpace: true, PathComponent: true,
+			Kind: "text", Step: "print-file-names", Stream: "stdout", TrimSpace: true,
+			PathComponent: true, RequireSuccess: true,
 		},
 	}
 	value, err := e.requestText(request)

@@ -1048,6 +1048,7 @@ func compactKbuildTargetParserWithExportsForLookup(
 		}
 		if root, ok := parser.sourceRoots["__LINUX_BZL_OBJECT_TREE__"]; ok {
 			parser.sourceRoots[compactKbuildActionObjectTreeMarker] = root
+			parser.sourceRoots[compactKbuildActionAbsoluteObjectTreeMarker] = root
 		}
 	}
 	if !allowShell {

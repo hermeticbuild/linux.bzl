@@ -7575,6 +7575,113 @@ tools/objtool/fixdep: tools/build/fixdep.c FORCE
 	}
 }
 
+func TestHermeticKbuildCompoundBindsNamespacedCompilerSourceExactly(t *testing.T) {
+	const (
+		rustRoot = "external/rules_rs++toolchains+rust_src_1_97_0/lib/rustlib/src/library"
+		source   = rustRoot + "/core/src/lib.rs"
+		target   = "rust/core.o"
+	)
+	profile := mustCompactKbuildProfileForTest(t, "build:rust-core", "scripts/Makefile.build", "", `
+objtree := .
+cmd_rustc_library = { RELATIVE_OBJTREE=$(objtree) OBJTREE=$(abspath $(objtree)) $(RUSTC) --crate-name core --emit=obj=$@ $<; $(OBJCOPY) --strip-debug $@; }
+rust/core.o: $(RUST_LIB_SRC)/core/src/lib.rs FORCE
+	$(call if_changed,rustc_library)
+FORCE:
+`, map[string]string{
+		"OBJCOPY":      KbuildActionRoleToken("target", "objcopy"),
+		"RUSTC":        KbuildActionRoleToken("target", "rustc"),
+		"RUST_LIB_SRC": rustRoot,
+	})
+	kernelRoot := t.TempDir()
+	objectRoot := t.TempDir()
+	physicalRustRoot := t.TempDir()
+	mustWriteSource(t, kernelRoot, source, "wrong kernel shadow\n")
+	mustWriteSource(t, physicalRustRoot, "core/src/lib.rs", "#![no_std]\n")
+	profile.evaluator.template.sourceRoots = map[string]string{
+		"__LINUX_BZL_SOURCE_TREE__": kernelRoot,
+		"__LINUX_BZL_OBJECT_TREE__": objectRoot,
+		rustRoot:                    physicalRustRoot,
+	}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		actionRoles:      testTargetActionRoles(append(testConfiguredActionRoles, "rustc")...),
+		sourceNamespaces: map[string]string{rustRoot: "rust"},
+		Config:           CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{},
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		forProfile(profile).
+		forOutput("target", "objects", "sdk")
+	producer, err := builder.build(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("namespaced compiler producer %q not found", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if node.Tool != compactKbuildScriptRunnerRole || recipe.Tool != compactKbuildScriptRunnerRole {
+		t.Fatalf("namespaced compiler producer = %#v recipe = %#v, want scriptrun", node, recipe)
+	}
+	sourceID := ""
+	for _, candidate := range plan.Sources {
+		if candidate.Namespace == "rust" && candidate.Path == source {
+			sourceID = candidate.ID
+			break
+		}
+	}
+	if sourceID == "" {
+		t.Fatalf("namespaced compiler sources = %#v, want exact rust source %q", plan.Sources, source)
+	}
+	script := compactKbuildRecipeScriptContentForTest(t, recipe)
+	if !strings.Contains(script, "OBJTREE=${tree:prep}") || strings.Contains(script, " OBJTREE=.") {
+		t.Fatalf("namespaced compiler script lost absolute object-root provenance: %q", script)
+	}
+	if !strings.Contains(script, "RELATIVE_OBJTREE=.") || strings.Contains(script, "RELATIVE_OBJTREE=${tree:prep}") {
+		t.Fatalf("namespaced compiler script made an ordinary object-root value absolute: %q", script)
+	}
+	if !slices.Contains(recipe.Arguments, "prep=${work:root}") {
+		t.Fatalf("namespaced compiler absolute object root is not bound to private writable state: arguments=%#v", recipe.Arguments)
+	}
+	if slices.Contains(node.Trees, "prep") || slices.Contains(recipe.Trees, "prep") {
+		t.Fatalf("namespaced compiler absolute object root retained an immutable prep tree: node=%#v recipe=%#v", node.Trees, recipe.Trees)
+	}
+	environmentName := compactKbuildActionSourceInputEnvironment(sourceID)
+	if !strings.Contains(script, `"$`+environmentName+`"`) {
+		t.Fatalf("namespaced compiler script omits exact source environment %q: %q", environmentName, script)
+	}
+	for _, rejected := range []string{source, "${tree:kernel}", compactKbuildActionSourceInputPrefix} {
+		if strings.Contains(script, rejected) {
+			t.Fatalf("namespaced compiler script retained %q: %q", rejected, script)
+		}
+	}
+	binding := recipe.Environment[environmentName]
+	if !strings.HasPrefix(binding, "${source:") || !strings.HasSuffix(binding, "}") {
+		t.Fatalf("namespaced compiler environment %s=%q, want exact source binding", environmentName, binding)
+	}
+	sourceKey := strings.TrimSuffix(strings.TrimPrefix(binding, "${source:"), "}")
+	if !slices.Contains(recipe.Sources, sourceKey) {
+		t.Fatalf("namespaced compiler source binding %q is absent from recipe sources %#v", sourceKey, recipe.Sources)
+	}
+	if got := recipe.WorkingInputs["source:"+sourceKey]; got != source {
+		t.Fatalf("namespaced compiler source working path = %q, want %q", got, source)
+	}
+	if slices.Contains(node.Trees, "kernel") || slices.Contains(recipe.Trees, "kernel") {
+		t.Fatalf("namespaced compiler gained a kernel tree input: node=%#v recipe=%#v", node.Trees, recipe.Trees)
+	}
+	if _, err := plan.entries(); err != nil {
+		t.Fatalf("namespaced compiler action plan is invalid: %v", err)
+	}
+}
+
 func TestCompactKbuildRecipeSideEffectProjectionPartitionsCompositeGroup(t *testing.T) {
 	const target = "generated/result"
 	context := compactKbuildAutomaticContext{target: target}
@@ -7603,6 +7710,16 @@ func TestCompactKbuildRecipeSideEffectProjectionPartitionsCompositeGroup(t *test
 			programs: []string{"printf", "printf"},
 			outputs:  []string{"generated/literal.txt", "generated/state.cmd"},
 		},
+		"and chain before ordinary command": {
+			template: `printf conditional > generated/conditional.cmd && test -s generated/conditional.cmd; printf saved > generated/state.cmd`,
+			programs: []string{"printf"},
+			outputs:  []string{"generated/state.cmd"},
+		},
+		"or chain before ordinary command": {
+			template: `false || printf conditional > generated/conditional.cmd; printf saved > generated/state.cmd`,
+			programs: []string{"printf"},
+			outputs:  []string{"generated/state.cmd"},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			commands := compactKbuildRecipeSideEffectProjection([]string{test.template}, context)
@@ -7614,6 +7731,97 @@ func TestCompactKbuildRecipeSideEffectProjectionPartitionsCompositeGroup(t *test
 			}
 			if !slices.Equal(programs, test.programs) || !slices.Equal(outputs, test.outputs) {
 				t.Fatalf("projection programs=%q outputs=%q, want programs=%q outputs=%q", programs, outputs, test.programs, test.outputs)
+			}
+		})
+	}
+}
+
+func TestCompactKbuildRecipeSideEffectProjectionPreservesStubcopySavecmdAfterIf(t *testing.T) {
+	const (
+		target      = "drivers/firmware/efi/libstub/alignedmem.stub.o"
+		input       = "drivers/firmware/efi/libstub/alignedmem.o"
+		commandFile = "drivers/firmware/efi/libstub/.alignedmem.stub.o.cmd"
+	)
+	context := compactKbuildAutomaticContext{target: target, normal: []string{input}}
+	template := `strip --strip-debug -o ` + target + ` ` + input + `; ` +
+		`if objdump -r ` + target + ` | grep R_AARCH64_ABS; then ` +
+		`echo "` + target + `: absolute symbol references not allowed in the EFI stub" >&2; /bin/false; fi; ` +
+		`objcopy --remove-section=.note.gnu.property --prefix-alloc-sections=.init ` +
+		`--prefix-symbols=__efistub_ ` + input + ` ` + target + `; ` +
+		`printf '%s\n' 'savedcmd_alignedmem.stub.o := stubcopy' > ` + commandFile
+	units, ok := compactKbuildTopLevelSemicolonUnits(template)
+	if !ok {
+		t.Fatal("stubcopy recipe did not partition into bounded top-level units")
+	}
+	if len(units) != 4 || units[0].conditional || !units[1].conditional || units[2].conditional || units[3].conditional {
+		t.Fatalf("stubcopy top-level units=%#v, want only if/fi unit conditional", units)
+	}
+	for index, unit := range units {
+		if unit.conditional {
+			continue
+		}
+		if _, err := parseCompactKbuildRecipe(unit.value, context); err != nil {
+			t.Fatalf("stubcopy unconditional unit %d %q: %v", index, unit.value, err)
+		}
+	}
+
+	commands := compactKbuildRecipeSideEffectProjection([]string{template}, context)
+	programs := make([]string, 0, len(commands))
+	for _, command := range commands {
+		programs = append(programs, command.program)
+	}
+	if want := []string{"strip", "objcopy", "printf"}; !slices.Equal(programs, want) {
+		t.Fatalf("stubcopy projection programs=%q, want %q", programs, want)
+	}
+	outputs, err := compactKbuildCompoundSurvivingExplicitOutputs(
+		CompactKbuildProfile{}, commands, target,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{commandFile}; !slices.Equal(outputs, want) {
+		t.Fatalf("stubcopy surviving outputs=%q, want %q", outputs, want)
+	}
+}
+
+func TestCompactKbuildRecipeSideEffectProjectionIfControlFlowFailsClosed(t *testing.T) {
+	const state = "generated/state.cmd"
+	context := compactKbuildAutomaticContext{target: "generated/result"}
+	for name, test := range map[string]struct {
+		template string
+		outputs  []string
+	}{
+		"branch output is conditional": {
+			template: `if true; then printf branch > generated/branch.cmd; fi`,
+		},
+		"unconditional sibling survives": {
+			template: `if true; then printf branch > generated/branch.cmd; fi; printf saved > ` + state,
+			outputs:  []string{state},
+		},
+		"nested branch output is conditional": {
+			template: `if true; then if false; then printf branch > generated/branch.cmd; fi; fi; printf saved > ` + state,
+			outputs:  []string{state},
+		},
+		"unclosed if": {
+			template: `if true; then printf branch > generated/branch.cmd; printf saved > ` + state,
+		},
+		"unmatched fi": {
+			template: `fi; printf saved > ` + state,
+		},
+		"extra fi": {
+			template: `if true; then printf branch > generated/branch.cmd; fi; fi; printf saved > ` + state,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			commands := compactKbuildRecipeSideEffectProjection([]string{test.template}, context)
+			outputs := make([]string, 0, len(commands))
+			for _, command := range commands {
+				if command.stdout != "" {
+					outputs = append(outputs, command.stdout)
+				}
+			}
+			if !slices.Equal(outputs, test.outputs) {
+				t.Fatalf("if projection outputs=%q, want %q", outputs, test.outputs)
 			}
 		})
 	}
@@ -8729,7 +8937,7 @@ make-cmd = $(cmd_$(1))
 dot-target = $(dir $@).$(notdir $@)
 cmd_and_savecmd = $(cmd); printf '%s\n' 'savedcmd_$@ := $(make-cmd)' > $(dot-target).cmd
 if_changed = $(cmd_and_savecmd)
-cmd_ld_multi = $(LD) -r -o $@ $(filter $(obj-y),$^)
+cmd_ld_multi = $(LD) -r -o $@ $(filter $(obj-y),$^) && test -f $@
 $(OUTPUT)libsubcmd-in.o: $(obj-y) FORCE
 	$(call if_changed,ld_multi)
 	`), "tools/build/Makefile.build", KbuildOptions{
@@ -8808,6 +9016,116 @@ $(OUTPUT)libsubcmd-in.o: $(obj-y) FORCE
 	}
 	if !foundCommandFile {
 		t.Fatalf("split-root savecmd outputs = %#v, want %q", recipe.WorkingOutputs, commandFile)
+	}
+}
+
+func TestGenericKbuildSplitRootStubcopySavecmdSideOutputStaysObjectRooted(t *testing.T) {
+	const (
+		directory   = "drivers/firmware/efi/libstub"
+		target      = directory + "/alignedmem.stub.o"
+		input       = directory + "/alignedmem.o"
+		commandFile = directory + "/.alignedmem.stub.o.cmd"
+	)
+	sourceRoot := filepath.ToSlash(t.TempDir())
+	objectRoot := filepath.ToSlash(t.TempDir())
+	variables := map[string]string{
+		"STRIP":   KbuildActionRoleToken("target", "strip"),
+		"OBJDUMP": KbuildActionRoleToken("target", "objdump"),
+		"OBJCOPY": KbuildActionRoleToken("target", "objcopy"),
+		"OUTPUT":  objectRoot + "/" + directory + "/",
+	}
+	kb, err := parseKbuildWithOptions(strings.NewReader(`
+cmd = $(cmd_$(1))
+make-cmd = $(cmd_$(1))
+dot-target = $(dir $@).$(notdir $@)
+cmd_and_savecmd = $(cmd); printf '%s\n' 'savedcmd_$@ := $(make-cmd)' > $(dot-target).cmd
+if_changed = $(cmd_and_savecmd)
+cmd_stubcopy = $(STRIP) --strip-debug -o $@ $<; if $(OBJDUMP) -r $@ | grep R_AARCH64_ABS; then echo "$@: absolute symbol references not allowed in the EFI stub" >&2; /bin/false; fi; $(OBJCOPY) --remove-section=.note.gnu.property --prefix-alloc-sections=.init --prefix-symbols=__efistub_ $< $@
+$(OUTPUT)alignedmem.stub.o: $(OUTPUT)alignedmem.o FORCE
+	$(call if_changed,stubcopy)
+	`), "drivers/firmware/efi/libstub/Makefile", KbuildOptions{
+		SourceRoots: map[string]string{
+			"__LINUX_BZL_SOURCE_TREE__": sourceRoot,
+			"__LINUX_BZL_OBJECT_TREE__": objectRoot,
+		},
+		Variables: variables,
+		CommandLineVariables: map[string]string{
+			"STRIP": variables["STRIP"], "OBJDUMP": variables["OBJDUMP"], "OBJCOPY": variables["OBJCOPY"],
+		},
+		ConfigVariablesComplete: true,
+		MakeVariablesComplete:   true,
+		CaptureTargetEvaluator:  true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := NewCompactKbuildProfile("build:libstub", "drivers/firmware/efi/libstub/Makefile", "", kb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.Directory = "libstub"
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationSourceTree, Directory: directory,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	match, found, err := metadata.compactKbuildRuleForProfile(profile, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatalf("split-root stubcopy target %q did not match", target)
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{},
+		Products: []ActionPlanProduct{{Name: "vmlinux", Tree: "objects", Path: target}},
+	}
+	inputNode := ActionPlanNode{
+		Stage: "target", Kind: "compile", Tool: "cc", Product: "vmlinux",
+		Outputs: []ActionPlanOutput{{Tree: "objects", Path: input}},
+	}
+	inputRecipe := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "compile", Tool: "cc",
+		Arguments: []string{"-o", "${output:00000000}"}, Outputs: []string{"00000000"},
+	}
+	inputProducer, err := appendActionPlanNode(plan, inputNode, inputRecipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		forOutput("target", "objects", "vmlinux").
+		forProfile(profile)
+	producer, err := builder.buildCommandTemplate(
+		target, match, []compactKbuildRuleInput{{path: input, producer: inputProducer}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("split-root stubcopy producer %q not found", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if node.Tool != compactKbuildScriptRunnerRole || recipe.Tool != compactKbuildScriptRunnerRole {
+		t.Fatalf("split-root stubcopy node = %#v recipe = %#v, want scriptrun", node, recipe)
+	}
+	foundCommandFile := false
+	for _, output := range recipe.WorkingOutputs {
+		foundCommandFile = foundCommandFile || output == commandFile
+		if strings.Contains(output, directory+"/"+directory) {
+			t.Fatalf("split-root stubcopy side output was scoped below source cwd: %#v", recipe.WorkingOutputs)
+		}
+	}
+	if !foundCommandFile {
+		t.Fatalf("split-root stubcopy outputs = %#v, want %q", recipe.WorkingOutputs, commandFile)
+	}
+	if _, err := plan.entries(); err != nil {
+		t.Fatalf("split-root stubcopy action plan is invalid: %v", err)
 	}
 }
 

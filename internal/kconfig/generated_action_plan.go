@@ -168,9 +168,16 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 		if selectionGraph.compactKbuildProfileTargetIsPhony(profile, target) {
 			continue
 		}
-		setupOnly, err := m.compactKbuildTargetIsOrderingOnlyInProfile(profile, target)
-		if err != nil {
-			return nil, fmt.Errorf("classify evaluated %s target %q: %w", selection.Stage, target, err)
+		setupOnly := false
+		if !selectionGraph.hasSelectedRootRuleResolution(
+			m, selectionKey, profile, target, selection.MakeTarget,
+		) {
+			setupOnly, err = m.compactKbuildTargetIsOrderingOnlyInProfileForMakeTarget(
+				profile, target, selection.MakeTarget,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("classify evaluated %s target %q: %w", selection.Stage, target, err)
+			}
 		}
 		if setupOnly {
 			// Preserve the selected Make ordering edge without inventing a file

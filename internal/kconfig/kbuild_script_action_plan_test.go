@@ -234,6 +234,51 @@ generated/result.h: scripts/generate FORCE
 	}
 }
 
+func TestKbuildSourceScriptExplicitShellConsumesValuedOptions(t *testing.T) {
+	const script = "scripts/bash-generator"
+	role := compactKbuildScriptAppletRolePrefix + "bash"
+	profile := mustCompactKbuildProfileForTest(t, "bash-generator", "Makefile", "", `
+generated/result.h: scripts/bash-generator FORCE
+	@true
+`, nil)
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, script)
+	root := profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"]
+	mustWriteSource(t, root, script, "#!/usr/bin/env -S bash -eo pipefail +O extglob\nprintf '%s\\n' bounded\n")
+
+	arguments := []string{
+		"-o", "errexit", "${tree:kernel}/" + script,
+		"-c", "input.c",
+	}
+	match, matched, err := compactKbuildProfileSourceInterpreterCommand(profile, "bash", arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matched || match.scriptPath != script || match.scriptIndex != 2 {
+		t.Fatalf("explicit bash match=(%#v,%t), want script index 2", match, matched)
+	}
+	invocation, matched, err := compactKbuildSourceScriptCommand(
+		profile,
+		compactKbuildRecipeCommand{program: "bash", arguments: arguments},
+		map[string]string{"CONFIG_SHELL": "sh"},
+		"target",
+		testTargetActionRoles(role),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matched || invocation.interpreterRole != role || invocation.scriptPath != script {
+		t.Fatalf("explicit bash invocation=(%#v,%t), want shebang-selected script", invocation, matched)
+	}
+	if got, want := invocation.interpreterArguments, []string{
+		"-eo", "pipefail", "+O", "extglob", "-o", "errexit",
+	}; !slices.Equal(got, want) {
+		t.Fatalf("explicit bash interpreter arguments=%q, want %q", got, want)
+	}
+	if got, want := invocation.scriptArguments, []string{"-c", "input.c"}; !slices.Equal(got, want) {
+		t.Fatalf("explicit bash script arguments=%q, want %q", got, want)
+	}
+}
+
 func TestKbuildSourceScriptActionExportsCanonicalRootAliases(t *testing.T) {
 	aliases := []string{"abs_output", "abs_srctree", "objtree", "srcroot", "srctree", "sub_make_done"}
 	profile := compactKbuildScriptProfileWithExportsForTest(
@@ -1028,6 +1073,132 @@ func TestKbuildWorkingTreeClosureUsesSourceOrderedVersionAcrossStageTrees(t *tes
 			}
 			if got := byPath[pathname]; got.producer != targetWriter.ID || got.workingOnly {
 				t.Fatalf("source-ordered Rust input = %#v, want native target writer %q", got, targetWriter.ID)
+			}
+		})
+	}
+}
+
+func TestKbuildWorkingTreeClosureUsesSourceOrderedMaterializedSideOutput(t *testing.T) {
+	const (
+		firstTarget    = "rust/libpin_init_internal-prep.so"
+		targetTarget   = "rust/libpin_init_internal.so"
+		sideOutputPath = "rust/.libpin_init_internal.so.cmd"
+		dependencyPath = "rust/pin_init.o"
+		consumerPath   = "vmlinux.a"
+	)
+	for _, test := range []struct {
+		name    string
+		ordered bool
+	}{
+		{name: "prep lifecycle side output precedes target rewrite", ordered: true},
+		{name: "unrelated target lifecycle side outputs remain ambiguous", ordered: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			firstProfile := CompactKbuildProfile{
+				Name: "build:rust-procmacro-first", Path: "rust/Makefile",
+				EntryTargets: []string{firstTarget},
+			}
+			targetProfile := CompactKbuildProfile{
+				Name: "build:rust-procmacro-target", Path: "rust/Makefile",
+				EntryTargets: []string{targetTarget},
+			}
+			consumerProfile := CompactKbuildProfile{
+				Name: "driver:Makefile", Path: "Makefile",
+				EntryTargets: []string{consumerPath},
+			}
+			firstSelection := CompactKbuildSelection{
+				Profile: firstProfile.Name, Target: firstTarget, MakeTarget: firstTarget,
+				Lifecycle: "prep", Scope: "target", Stage: "prep",
+			}
+			firstNodeStage, firstNodeTree := "prep", "prep"
+			if !test.ordered {
+				firstSelection.Lifecycle = "target"
+				firstSelection.Scope = "host"
+				firstSelection.Stage = "host"
+				firstNodeStage, firstNodeTree = "host", "host"
+			}
+			config := CompactConfig{
+				KbuildProfiles: []CompactKbuildProfile{firstProfile, targetProfile, consumerProfile},
+				KbuildSelections: []CompactKbuildSelection{
+					firstSelection,
+					{Profile: targetProfile.Name, Target: targetTarget, MakeTarget: targetTarget, Lifecycle: "target", Scope: "target", Stage: "target"},
+					{Profile: consumerProfile.Name, Target: consumerPath, MakeTarget: consumerPath, Lifecycle: "target", Scope: "target", Stage: "target"},
+				},
+			}
+			graph, err := newCompactKbuildSelectionGraph(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstWriter := ActionPlanNode{
+				ID: strings.Repeat("a", 64), Stage: firstNodeStage, Kind: "generate",
+				Outputs: []ActionPlanOutput{
+					{Tree: firstNodeTree, Path: firstTarget},
+					{Tree: firstNodeTree, Path: sideOutputPath, ArtifactPath: ".linux-bzl-versions/rust-procmacro-first/" + sideOutputPath},
+				},
+			}
+			dependency := ActionPlanNode{
+				ID: strings.Repeat("b", 64), Stage: "target", Kind: "compile",
+				Inputs: []ActionPlanNodeEdge{{
+					Role: compactKbuildWorkingClosureInputRole, ProducerID: firstWriter.ID, Slot: 1,
+				}},
+				Outputs: []ActionPlanOutput{{Tree: "objects", Path: dependencyPath}},
+			}
+			targetWriter := ActionPlanNode{
+				ID: strings.Repeat("c", 64), Stage: "target", Kind: "generate",
+				Outputs: []ActionPlanOutput{
+					{Tree: "objects", Path: targetTarget},
+					{Tree: "objects", Path: sideOutputPath, ArtifactPath: ".linux-bzl-versions/rust-procmacro-target/" + sideOutputPath},
+				},
+			}
+			firstKey := compactKbuildSelectionKey{
+				profile: firstProfile.Name, target: firstTarget, stage: firstSelection.Stage,
+			}
+			targetKey := compactKbuildSelectionKey{
+				profile: targetProfile.Name, target: targetTarget, stage: "target",
+			}
+			consumerKey := compactKbuildSelectionKey{
+				profile: consumerProfile.Name, target: consumerPath, stage: "target",
+			}
+			if err := graph.recordMaterializedProducer(firstKey, firstWriter.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := graph.recordMaterializedProducer(targetKey, targetWriter.ID); err != nil {
+				t.Fatal(err)
+			}
+			if got := len(graph.outputOwnersByPath[sideOutputPath]); got != 0 {
+				t.Fatalf("materialized side-output pathname has %d statically registered owners, want none", got)
+			}
+			plan := &ActionPlan{Nodes: []ActionPlanNode{firstWriter, dependency, targetWriter}}
+			builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{}, plan).
+				withSelectionGraph(graph).
+				forSelection(consumerKey, consumerProfile).
+				forOutput("target", "objects", "vmlinux")
+			inputs, closureErr := builder.compactKbuildWorkingTreeClosureInputs(
+				consumerPath,
+				consumerProfile,
+				[]compactKbuildRuleInput{
+					{path: dependencyPath, producer: dependency.ID},
+					{path: sideOutputPath, producer: targetWriter.ID, slot: 1},
+				},
+			)
+			if got := len(graph.outputOwnersByPath[sideOutputPath]); got != 0 {
+				t.Fatalf("source comparison published %d side-output owners, want none", got)
+			}
+			if !test.ordered {
+				if closureErr == nil || !strings.Contains(closureErr.Error(), "working object-tree path \""+sideOutputPath+"\" has ambiguous maximal producers") {
+					t.Fatalf("unordered materialized side-output error = %v, want path-specific fail-closed ambiguity", closureErr)
+				}
+				return
+			}
+			if closureErr != nil {
+				t.Fatal(closureErr)
+			}
+			byPath := map[string]compactKbuildRuleInput{}
+			for _, input := range inputs {
+				byPath[input.path] = input
+			}
+			if got := byPath[sideOutputPath]; got.producer != targetWriter.ID || got.slot != 1 || got.workingOnly {
+				t.Fatalf("source-ordered materialized side output = %#v, want native target producer %q slot 1", got, targetWriter.ID)
 			}
 		})
 	}
@@ -1901,6 +2072,9 @@ func TestKbuildSourceScriptRejectsCommandTextAndGeneratedPayload(t *testing.T) {
 	}{
 		{name: "command text", command: `$(CONFIG_SHELL) -c scripts/transform.sh > $@`, want: "non-file mode"},
 		{name: "object payload", command: `$(CONFIG_SHELL) $(objtree)/scripts/transform.sh > $@`, want: "not a declared source file"},
+		{name: "split startup file", command: `$(CONFIG_SHELL) --rcfile scripts/bashrc $(srctree)/scripts/transform.sh > $@`, want: "non-file mode"},
+		{name: "equals startup file", command: `$(CONFIG_SHELL) --init-file=scripts/bashrc $(srctree)/scripts/transform.sh > $@`, want: "non-file mode"},
+		{name: "unknown long option", command: `$(CONFIG_SHELL) --startup-file scripts/bashrc $(srctree)/scripts/transform.sh > $@`, want: "non-file mode"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			profile := compactKbuildScriptProfileForTest(t, test.command)
@@ -1912,6 +2086,52 @@ func TestKbuildSourceScriptRejectsCommandTextAndGeneratedPayload(t *testing.T) {
 			_, err := builder.build("generated/result.h")
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("build error=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestKbuildSourceScriptRejectsShebangShellStartupInput(t *testing.T) {
+	const (
+		script = "scripts/bash-generator"
+		target = "generated/result.h"
+	)
+	role := compactKbuildScriptAppletRolePrefix + "bash"
+	for name, shebang := range map[string]string{
+		"split startup file":  "#!/usr/bin/env -S bash --rcfile scripts/bashrc\n",
+		"equals startup file": "#!/usr/bin/env -S bash --init-file=scripts/bashrc\n",
+		"unknown long option": "#!/usr/bin/env -S bash --startup-file scripts/bashrc\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			profile := mustCompactKbuildProfileForTest(t, "bash-generator", "Makefile", "", `
+cmd_generate = bash $(srctree)/scripts/bash-generator > $@
+generated/result.h: scripts/bash-generator FORCE
+	$(call cmd,generate)
+`, nil)
+			profile = compactKbuildProfileWithSourcesForTest(t, profile, script)
+			root := profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"]
+			mustWriteSource(t, root, script, shebang+"printf '%s\\n' bounded\n")
+
+			_, matched, err := compactKbuildProfileSourceInterpreterCommand(
+				profile,
+				"bash",
+				[]string{"${tree:kernel}/" + script},
+			)
+			if !matched || err == nil || !strings.Contains(err.Error(), "shebang interpreter arguments") {
+				t.Fatalf("source-interpreter match=(%t, %v), want shebang argument rejection", matched, err)
+			}
+
+			metadata := &CompactMetadata{
+				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+				actionRoles: testTargetActionRoles(role),
+			}
+			builder := newCompactKbuildRulePlanBuilder(
+				metadata,
+				&ActionPlan{Recipes: map[string]ActionRecipe{}},
+			).forProfile(profile)
+			if _, buildErr := builder.build(target); buildErr == nil ||
+				!strings.Contains(buildErr.Error(), "shebang interpreter arguments") {
+				t.Fatalf("unsafe shebang build error = %v, want argument rejection", buildErr)
 			}
 		})
 	}
@@ -1941,6 +2161,43 @@ func TestKbuildSourceScriptPreservesConfiguredInterpreterArgumentsOnce(t *testin
 	}
 	if got := countString(arguments, "-eu"); got != 1 {
 		t.Fatalf("recipe arguments contain configured interpreter option %d times, want once: %q", got, arguments)
+	}
+}
+
+func TestKbuildSourceScriptPreservesValuedInterpreterArgumentsOnce(t *testing.T) {
+	profile := compactKbuildScriptProfileForTest(t, `$(CONFIG_SHELL) $(srctree)/scripts/transform.sh > $@`)
+	interpreterArguments := []string{
+		"-eo", "pipefail",
+		"+O", "extglob",
+	}
+	commandArguments := append(slices.Clone(interpreterArguments),
+		"${tree:kernel}/scripts/transform.sh", "-c", "input.c",
+	)
+	configuration := "sh " + strings.Join(interpreterArguments, " ")
+	invocation, matched, err := compactKbuildSourceScriptCommand(profile, compactKbuildRecipeCommand{
+		program:   "sh",
+		arguments: commandArguments,
+	}, map[string]string{"CONFIG_SHELL": configuration}, "target", testTargetActionRoles("awk", "cc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matched {
+		t.Fatal("configured source-script invocation did not match")
+	}
+	if !slices.Equal(invocation.interpreterArguments, interpreterArguments) {
+		t.Fatalf("interpreter arguments=%q, want %q", invocation.interpreterArguments, interpreterArguments)
+	}
+	if got, want := invocation.scriptArguments, []string{"-c", "input.c"}; !slices.Equal(got, want) {
+		t.Fatalf("script arguments=%q, want %q", got, want)
+	}
+	recipeArguments, err := invocation.recipeArguments("script:00000000", map[string]string{"CONFIG_SHELL": configuration}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, argument := range interpreterArguments {
+		if got := countString(recipeArguments, argument); got != 1 {
+			t.Fatalf("recipe arguments contain interpreter argument %q %d times, want once: %q", argument, got, recipeArguments)
+		}
 	}
 }
 

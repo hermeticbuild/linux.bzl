@@ -1274,6 +1274,10 @@ func inspectCompactKbuildSourceScriptCommandDepth(
 	}
 	base := path.Base(strings.ReplaceAll(program, compactKbuildLiteralDollarToken, "$"))
 	dynamicProgram := strings.Contains(program, "$")
+	dynamicShellProgram := false
+	if name, exact := compactKbuildExactShellParameter(positionalProgram); exact {
+		dynamicShellProgram = name == "CONFIG_SHELL" || name == "SHELL"
+	}
 	if !dynamicProgram {
 		scan.usage.addProgram(strings.ReplaceAll(program, compactKbuildLiteralDollarToken, "$"))
 	}
@@ -1282,9 +1286,17 @@ func inspectCompactKbuildSourceScriptCommandDepth(
 	} else if compactKbuildDynamicSourceScriptPath(program) && !compactKbuildObjectTreeProgramPath(program) {
 		scan.usage.ObservesAll = true
 	}
-	if compactKbuildShellProgram(base) {
-		if compactKbuildShellCommandMode(arguments) {
+	if compactKbuildShellProgram(base) || dynamicShellProgram {
+		invocation := compactKbuildShellArguments(arguments)
+		if invocation.mode != compactKbuildShellModeFile {
 			scan.usage.ObservesAll = true
+		} else {
+			argument := strings.ReplaceAll(arguments[invocation.scriptIndex], compactKbuildLiteralDollarToken, "$")
+			if child, exact := compactKbuildSourceScriptChildPath(argument); exact {
+				scan.sources = append(scan.sources, child)
+			} else if compactKbuildDynamicSourceScriptPath(argument) {
+				scan.usage.ObservesAll = true
+			}
 		}
 	}
 	// Shells are also commonly reached through env or a multicall binary. Scan
@@ -1296,11 +1308,11 @@ func inspectCompactKbuildSourceScriptCommandDepth(
 		if !compactKbuildShellProgram(path.Base(argument)) {
 			continue
 		}
-		if compactKbuildShellCommandMode(arguments[index+1:]) {
+		if compactKbuildShellArguments(arguments[index+1:]).mode != compactKbuildShellModeFile {
 			scan.usage.ObservesAll = true
 		}
 	}
-	if base == "sh" || base == "bash" || base == "dash" || base == "ash" || base == "ksh" || dynamicProgram {
+	if dynamicProgram && !compactKbuildShellProgram(base) && !dynamicShellProgram {
 		for _, argument := range arguments {
 			if strings.HasPrefix(argument, "-") {
 				continue
@@ -1429,21 +1441,121 @@ func compactKbuildShellProgram(base string) bool {
 	}
 }
 
-// compactKbuildShellCommandMode recognizes both a standalone -c and combined
-// short-option words such as -ec. It intentionally keeps scanning later option
-// words: shells accept `sh -e -c command`, while a false positive after a
-// source-file operand merely retains more role-bearing exports.
-func compactKbuildShellCommandMode(arguments []string) bool {
-	for _, argument := range arguments {
-		argument = strings.ReplaceAll(argument, compactKbuildLiteralDollarToken, "$")
-		if argument == "--command" || strings.HasPrefix(argument, "--command=") {
-			return true
+type compactKbuildShellMode string
+
+const (
+	compactKbuildShellModeFile    compactKbuildShellMode = "file"
+	compactKbuildShellModeCommand compactKbuildShellMode = "command"
+	compactKbuildShellModeStdin   compactKbuildShellMode = "stdin"
+)
+
+type compactKbuildShellArgumentClassification struct {
+	mode        compactKbuildShellMode
+	scriptIndex int
+}
+
+// compactKbuildShellArguments classifies the interpreter-owned prefix of one
+// shell argv. It stops permanently at the script operand, so options passed to
+// that script cannot change the interpreter mode. Options whose value is a
+// separate word consume that word even when it resembles -c, -s, or a source
+// path. The returned script index refers to the original argv and therefore
+// also slices a path-rewritten argv without reconstructing interpreter flags.
+func compactKbuildShellArguments(arguments []string) compactKbuildShellArgumentClassification {
+	result := compactKbuildShellArgumentClassification{
+		mode: compactKbuildShellModeStdin, scriptIndex: -1,
+	}
+	stdin := false
+	for index := 0; index < len(arguments); index++ {
+		argument := strings.ReplaceAll(arguments[index], compactKbuildLiteralDollarToken, "$")
+		if argument == "--" {
+			if stdin || index+1 == len(arguments) {
+				return result
+			}
+			return compactKbuildShellArgumentClassification{
+				mode: compactKbuildShellModeFile, scriptIndex: index + 1,
+			}
 		}
-		if len(argument) > 1 && argument[0] == '-' && argument[1] != '-' && strings.ContainsRune(argument[1:], 'c') {
-			return true
+		if argument == "-" {
+			return result
+		}
+		if argument == "--command" || strings.HasPrefix(argument, "--command=") {
+			result.mode = compactKbuildShellModeCommand
+			return result
+		}
+		if argument == "--stdin" || strings.HasPrefix(argument, "--stdin=") {
+			stdin = true
+			continue
+		}
+		if argument == "--init-file" || argument == "--rcfile" ||
+			strings.HasPrefix(argument, "--init-file=") || strings.HasPrefix(argument, "--rcfile=") {
+			// Startup files are interpreter inputs, not ordinary option values.
+			// Source-script lowering has no binding for them, so accepting either
+			// spelling would replay an undeclared path inside the sandbox.
+			return result
+		}
+		if len(argument) > 1 && (argument[0] == '-' || argument[0] == '+') && argument[1] != '-' {
+			options := argument[1:]
+			consumeValue := false
+			for optionIndex, option := range options {
+				switch option {
+				case 'o', 'O':
+					// A value attached with = belongs to this option word. The
+					// common combined form (`-eo VALUE`) consumes the next word
+					// when o/O terminates the short-option cluster.
+					consumeValue = optionIndex+1 == len(options)
+				case 'c':
+					if argument[0] == '-' {
+						result.mode = compactKbuildShellModeCommand
+						return result
+					}
+				case 's':
+					if argument[0] == '-' {
+						stdin = true
+					}
+				}
+				if option == 'o' || option == 'O' {
+					break
+				}
+			}
+			if consumeValue {
+				if index+1 == len(arguments) {
+					return result
+				}
+				index++
+			}
+			continue
+		}
+		if strings.HasPrefix(argument, "--") {
+			// Unknown long-option arity is not bounded. It may consume the next
+			// word as a file or another interpreter-owned value, so that word can
+			// never be selected safely as the source-script operand.
+			return result
+		}
+		if stdin {
+			return result
+		}
+		return compactKbuildShellArgumentClassification{
+			mode: compactKbuildShellModeFile, scriptIndex: index,
 		}
 	}
-	return false
+	return result
+}
+
+// CompactKbuildShellFileScriptIndex returns the original argv index of a shell
+// script operand only when the bounded shell grammar selects file mode.
+// Callers which cannot preserve interpreter arguments must additionally require
+// index zero instead of silently dropping options before the script.
+func CompactKbuildShellFileScriptIndex(arguments []string) (int, bool) {
+	invocation := compactKbuildShellArguments(arguments)
+	return invocation.scriptIndex,
+		invocation.mode == compactKbuildShellModeFile && invocation.scriptIndex >= 0
+}
+
+// compactKbuildShellCommandMode is the fail-closed environment scanner's
+// command-text predicate. File and stdin modes remain distinct in the shared
+// classifier so source discovery cannot reinterpret positional argv as a file.
+func compactKbuildShellCommandMode(arguments []string) bool {
+	return compactKbuildShellArguments(arguments).mode == compactKbuildShellModeCommand
 }
 
 // compactKbuildEnvProgram returns the first command operand after env options
@@ -1606,7 +1718,8 @@ func compactKbuildObjectTreeProgramPath(word string) bool {
 	word = strings.ReplaceAll(word, compactKbuildLiteralDollarToken, "$")
 	for _, prefix := range []string{
 		"$objtree/", "${objtree}/", "$abs_output/", "${abs_output}/",
-		"__LINUX_BZL_OBJECT_TREE__/", "${tree:prep}/", "${tree:host}/",
+		"__LINUX_BZL_OBJECT_TREE__/", compactKbuildActionAbsoluteObjectTreeMarker + "/",
+		"${tree:prep}/", "${tree:host}/",
 		"${tree:bootstrap}/", "${tree:prehost}/", "${work:root}/",
 	} {
 		suffix, ok := strings.CutPrefix(word, prefix)

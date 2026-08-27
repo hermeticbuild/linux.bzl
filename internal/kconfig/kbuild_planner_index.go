@@ -291,6 +291,7 @@ func ResolveCompactKbuildMakeTarget(
 		"__LINUX_BZL_OBJECT_TREE__",
 		compactKbuildActionSourceTreeMarker,
 		compactKbuildActionObjectTreeMarker,
+		compactKbuildActionAbsoluteObjectTreeMarker,
 	} {
 		if makeTarget == marker {
 			makeTarget = ""

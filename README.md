@@ -600,9 +600,12 @@ Linux OS constraint and select a conforming C/C++ toolchain. The extension
 applies that platform transition once at the public facade and analyzes one
 kernel graph after the transition. Toolchains expose the exact
 `linux-kbuild-{host,target}-{ar,as,cc,cxx,ld,nm,objcopy,objdump,ranlib,readelf,strip}`
-actions with one `__LINUX_BZL_KBUILD_ARGS_V1__` argument sentinel and every
-runtime/tool file in `CcToolchainInfo.all_files`. There is no fallback to
-standard C++ actions, executable basename discovery, or host tools.
+actions with one `__LINUX_BZL_KBUILD_ARGS_V1__` argument sentinel. Every tool
+and its support files must be present in `CcToolchainInfo.all_files`;
+feature-selected static linker runtimes are obtained from
+`CcToolchainInfo.static_runtime_lib()` and added to the corresponding action
+closure automatically. There is no fallback to standard C++ actions,
+executable basename discovery, or host tools.
 
 The build does not read ambient host tools or environment variables. All tools
 are Bazel inputs, temporary paths are action-local, timestamps and release

@@ -382,22 +382,20 @@ func compactKbuildSourceScriptProgram(
 	if path, source, pathLike := compactKbuildProfileCommandPath(profile, fields[0]); pathLike && source && compactKbuildProfileSourceUsesShell(profile, path) && compactKbuildProfileSourcePathExists(profile, path) {
 		return path, true, nil
 	}
-	if len(configuredShell) != 0 && fields[0] == configuredShell[0] && len(fields) > len(configuredShell) &&
-		slices.Equal(fields[1:len(configuredShell)], configuredShell[1:]) {
-		for _, candidate := range fields[len(configuredShell):] {
-			if candidate == "-c" || candidate == "--command" || candidate == "-s" || candidate == "--stdin" {
-				return "", false, nil
-			}
-			if strings.HasPrefix(candidate, "-") {
-				continue
-			}
-			path, source, pathLike := compactKbuildProfileCommandPath(profile, candidate)
-			if !pathLike || !source || !compactKbuildProfileSourcePathExists(profile, path) {
-				return "", false, nil
-			}
-			return path, true, nil
+	selectedShell := len(configuredShell) != 0 && fields[0] == configuredShell[0] &&
+		len(fields) >= len(configuredShell) && slices.Equal(fields[1:len(configuredShell)], configuredShell[1:])
+	defaultShell := len(configuredShell) == 0 && fields[0] == "sh"
+	if selectedShell || defaultShell {
+		invocation := compactKbuildShellArguments(fields[1:])
+		if invocation.mode != compactKbuildShellModeFile || invocation.scriptIndex < 0 {
+			return "", false, nil
 		}
-		return "", false, nil
+		candidate := fields[invocation.scriptIndex+1]
+		path, source, pathLike := compactKbuildProfileCommandPath(profile, candidate)
+		if !pathLike || !source || !compactKbuildProfileSourcePathExists(profile, path) {
+			return "", false, nil
+		}
+		return path, true, nil
 	}
 	match, matched, err := compactKbuildProfileSourceInterpreterCommand(profile, fields[0], fields[1:])
 	if err != nil || !matched {

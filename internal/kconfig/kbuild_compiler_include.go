@@ -104,9 +104,12 @@ func ResolveCompactKbuildCompilerIncludePath(
 	for _, root := range []rootMarker{
 		{marker: "__LINUX_BZL_SOURCE_TREE__", tree: CompactKbuildInvocationSourceTree},
 		{marker: "${tree:kernel}", tree: CompactKbuildInvocationSourceTree},
+		{marker: compactKbuildActionSourceTreeMarker, tree: CompactKbuildInvocationSourceTree},
 		{marker: "__LINUX_BZL_OBJECT_TREE__", tree: CompactKbuildInvocationObjectTree},
 		{marker: "${tree:prep}", tree: CompactKbuildInvocationObjectTree},
 		{marker: "${work:root}", tree: CompactKbuildInvocationObjectTree},
+		{marker: compactKbuildActionObjectTreeMarker, tree: CompactKbuildInvocationObjectTree},
+		{marker: compactKbuildActionAbsoluteObjectTreeMarker, tree: CompactKbuildInvocationObjectTree},
 	} {
 		if value == root.marker {
 			return CompactKbuildInvocationLocation{Tree: root.tree}, false, true, nil
@@ -152,6 +155,9 @@ func compactKbuildCollapseCompilerTreeRootJoins(value string) string {
 		"${tree:kernel}",
 		"${tree:prep}",
 		"${work:root}",
+		compactKbuildActionSourceTreeMarker,
+		compactKbuildActionObjectTreeMarker,
+		compactKbuildActionAbsoluteObjectTreeMarker,
 	}
 	outer := ""
 	for _, marker := range markers {
@@ -663,6 +669,8 @@ func resolveCompactKbuildCompilerOutputPath(
 		"${tree:kernel}", "__LINUX_BZL_SOURCE_TREE__",
 		"${tree:prep}", "${tree:host}", "${tree:bootstrap}", "${tree:prehost}",
 		"${work:root}", "__LINUX_BZL_OBJECT_TREE__",
+		compactKbuildActionSourceTreeMarker, compactKbuildActionObjectTreeMarker,
+		compactKbuildActionAbsoluteObjectTreeMarker,
 	} {
 		if value == marker {
 			return compactKbuildCompilerOutputPath{argument: "${work:root}"}, true, nil

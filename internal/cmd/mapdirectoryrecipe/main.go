@@ -378,6 +378,25 @@ func runRecipe(opts recipeOptions) error {
 		}
 		cleanups = append(cleanups, cleanup)
 	}
+	toolBindings := opts.tools
+	// scriptrun consumes the forwarded contracts and installs its own private
+	// proxies for source-script commands. Every other recipe receives proxies
+	// here so a direct primary tool (notably rustc) cannot bypass the configured
+	// action envelope when it invokes an explicit ${tool:...} binding.
+	if recipe.Tool != "scriptrun" && len(recipe.AuxiliaryTools) != 0 {
+		var cleanup func()
+		toolBindings, cleanup, err = prepareDirectAuxiliaryToolBindings(
+			opts.workingDirectory,
+			opts.runtimeTools["script-runtime"],
+			recipe.AuxiliaryTools,
+			opts.tools,
+			opts.auxiliaryActionContracts,
+		)
+		if err != nil {
+			return err
+		}
+		cleanups = append(cleanups, cleanup)
+	}
 	for _, name := range recipe.ExecutableInputs {
 		var cleanup func()
 		inputBindings[name], cleanup, err = actionLocalExecutable(inputBindings[name], opts.workingDirectory)
@@ -429,7 +448,7 @@ func runRecipe(opts recipeOptions) error {
 	}
 	bindings := map[string]map[string]string{
 		"source": opts.sources, "input": inputBindings, "output": outputBindings,
-		"tool": opts.tools, "tree": opts.trees, "work": {},
+		"tool": toolBindings, "tree": opts.trees, "work": {},
 	}
 	contentBindings, err := materializeRecipeContentSubstitutions(recipe.ContentSubstitutions, bindings)
 	if err != nil {
@@ -1299,6 +1318,67 @@ func absolutizeWorkingRecipeOptions(opts *recipeOptions) error {
 // auxiliary tool's Kbuild argv contract.
 func prepareRuntimeToolDirectory(privateRoot string, tools map[string]string) (string, func(), error) {
 	return toolaction.PrepareRuntimeToolDirectory(privateRoot, tools)
+}
+
+func prepareDirectAuxiliaryToolBindings(
+	privateRoot, multicall string,
+	roles []string,
+	tools map[string]string,
+	contracts map[string]toolaction.Contract,
+) (map[string]string, func(), error) {
+	bindings := make(map[string]string, len(tools))
+	for role, executable := range tools {
+		bindings[role] = executable
+	}
+	noop := func() {}
+	if len(roles) == 0 {
+		return bindings, noop, nil
+	}
+	if privateRoot == "" || !filepath.IsAbs(privateRoot) {
+		return nil, noop, fmt.Errorf("direct auxiliary tools require an absolute private working-directory root")
+	}
+	if multicall == "" {
+		return nil, noop, fmt.Errorf("direct auxiliary tools require the configured script-runtime multicall")
+	}
+	proxyDirectory := filepath.Join(privateRoot, ".linux-bzl-action-tools")
+	if err := os.Mkdir(proxyDirectory, 0o700); err != nil {
+		return nil, noop, fmt.Errorf("create private action-tool directory: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(proxyDirectory) }
+	orderedRoles := append([]string(nil), roles...)
+	sort.Strings(orderedRoles)
+	for _, role := range orderedRoles {
+		executable := tools[role]
+		if executable == "" {
+			cleanup()
+			return nil, noop, fmt.Errorf("direct auxiliary tool %q has no executable binding", role)
+		}
+		contract, exists := contracts[role]
+		if !exists {
+			cleanup()
+			return nil, noop, fmt.Errorf("direct auxiliary tool %q has no configured action contract", role)
+		}
+		var linkContract *toolaction.Contract
+		if linkRole, compilerDriver := toolaction.LinkContractRole(role); compilerDriver {
+			if companion, exists := contracts[linkRole]; exists {
+				linkContract = &companion
+			}
+		}
+		proxy, err := toolaction.InstallToolActionProxy(
+			proxyDirectory,
+			multicall,
+			role,
+			executable,
+			contract,
+			linkContract,
+		)
+		if err != nil {
+			cleanup()
+			return nil, noop, fmt.Errorf("install direct auxiliary tool %s: %w", role, err)
+		}
+		bindings[role] = proxy
+	}
+	return bindings, cleanup, nil
 }
 
 func validateWorkingDirectory(root, marker string) error {

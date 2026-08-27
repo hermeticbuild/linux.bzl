@@ -63,6 +63,22 @@ func writeRecipe(t *testing.T, recipe kconfig.ActionRecipe) (string, string) {
 	return path, id
 }
 
+func writeTestShellMulticall(t *testing.T, directory string) string {
+	t.Helper()
+	filename := filepath.Join(directory, "script-runtime")
+	contents := `#!/bin/sh
+if [ "$1" = sh ]; then
+  shift
+  exec /bin/sh "$@"
+fi
+exit 64
+`
+	if err := os.WriteFile(filename, []byte(contents), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return filename
+}
+
 func writeInputBindings(t *testing.T, bindings kconfig.ActionPlanInputBindings) (string, string) {
 	t.Helper()
 	data, err := bindings.CanonicalJSON()
@@ -614,9 +630,10 @@ printf '%s' hostcc-omitted > "$1"
 func TestRunRecipeForwardsAuxiliaryActionContracts(t *testing.T) {
 	directory := t.TempDir()
 	output := filepath.Join(directory, "contract")
+	workRoot := filepath.Join(directory, "work")
 	recipe := kconfig.ActionRecipe{
 		Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "helper",
-		Arguments: []string{"${tool:frobnicator}", "${output:00000000}"}, Outputs: []string{"00000000"},
+		Arguments: []string{"${tool:frobnicator}", "${output:00000000}"}, Outputs: []string{"00000000"}, WorkingDirectory: "nested",
 		AuxiliaryTools: []string{"frobnicator"},
 	}
 	recipePath, recipeID := writeRecipe(t, recipe)
@@ -638,6 +655,8 @@ func TestRunRecipeForwardsAuxiliaryActionContracts(t *testing.T) {
 		recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
 		toolRole: "helper", sources: map[string]string{}, inputs: map[string]string{},
 		outputs: map[string]string{"00000000": output}, tools: map[string]string{"helper": helper, "frobnicator": frobnicator}, trees: map[string]string{},
+		workingDirectory: workRoot, workingDirectoryMarker: filepath.Join(workRoot, ".linux-bzl-work-root"),
+		runtimeTools:      map[string]string{"script-runtime": writeTestShellMulticall(t, directory)},
 		actionEnvironment: map[string]string{}, auxiliaryActionContracts: want,
 	}); err != nil {
 		t.Fatal(err)
@@ -652,6 +671,141 @@ func TestRunRecipeForwardsAuxiliaryActionContracts(t *testing.T) {
 	}
 	if got["frobnicator"].Environment["SELECTED_ENV"] != "exact=value" || !slices.Equal(got["frobnicator"].Arguments, want["frobnicator"].Arguments) {
 		t.Fatalf("forwarded contract=%#v, want %#v", got, want)
+	}
+}
+
+func TestRunRecipeAppliesDirectAuxiliaryCompilerActionContract(t *testing.T) {
+	for _, test := range []struct {
+		name, mode, wantContract, wantArguments string
+	}{
+		{
+			name:          "compile",
+			mode:          "compile",
+			wantContract:  "compile",
+			wantArguments: "compile-prefix -c source.c -o %s compile-suffix",
+		},
+		{
+			name:          "link",
+			mode:          "link",
+			wantContract:  "link",
+			wantArguments: "link-prefix source.o -o %s link-suffix",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			output := filepath.Join(directory, "result")
+			workRoot := filepath.Join(directory, "work")
+			recipe := kconfig.ActionRecipe{
+				Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "rustc",
+				Arguments:        []string{"-Clinker=${tool:cc}", test.mode, "${output:00000000}"},
+				Outputs:          []string{"00000000"},
+				AuxiliaryTools:   []string{"cc"},
+				WorkingDirectory: "nested",
+			}
+			recipePath, recipeID := writeRecipe(t, recipe)
+			rustc := filepath.Join(directory, "rustc")
+			rustcScript := `#!/bin/sh
+linker=${1#-Clinker=}
+case "$2" in
+  compile) "$linker" -c source.c -o "$3" ;;
+  link) "$linker" source.o -o "$3" ;;
+  *) exit 65 ;;
+esac
+`
+			if err := os.WriteFile(rustc, []byte(rustcScript), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			compiler := filepath.Join(directory, "selected-cc")
+			compilerScript := `#!/bin/sh
+out=
+expect_output=
+for argument do
+  if [ -n "$expect_output" ]; then
+    out=$argument
+    expect_output=
+    continue
+  fi
+  case "$argument" in
+    -o) expect_output=1 ;;
+    -o?*) out=${argument#-o} ;;
+  esac
+done
+[ -n "$out" ] || exit 66
+printf '%s\n%s\n' "$SELECTED_CONTRACT" "$*" > "$out"
+`
+			if err := os.WriteFile(compiler, []byte(compilerScript), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := runRecipe(recipeOptions{
+				recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
+				toolRole: "rustc", sources: map[string]string{}, inputs: map[string]string{},
+				outputs: map[string]string{"00000000": output},
+				tools:   map[string]string{"rustc": rustc, "cc": compiler}, trees: map[string]string{},
+				workingDirectory: workRoot, workingDirectoryMarker: filepath.Join(workRoot, ".linux-bzl-work-root"),
+				runtimeTools: map[string]string{"script-runtime": writeTestShellMulticall(t, directory)},
+				actionArgs:   []string{toolaction.KbuildArgumentsSentinel}, actionEnvironment: map[string]string{},
+				auxiliaryActionContracts: map[string]toolaction.Contract{
+					"cc": {
+						Arguments:   []string{"compile-prefix", toolaction.KbuildArgumentsSentinel, "compile-suffix"},
+						Environment: map[string]string{"SELECTED_CONTRACT": "compile"},
+					},
+					"cc-link": {
+						Arguments:   []string{"link-prefix", toolaction.KbuildArgumentsSentinel, "link-suffix"},
+						Environment: map[string]string{"SELECTED_CONTRACT": "link"},
+					},
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := test.wantContract + "\n" + fmt.Sprintf(test.wantArguments, output) + "\n"
+			if string(got) != want {
+				t.Fatalf("nested compiler invocation = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRunRecipeLeavesScriptRunnerAuxiliaryToolUnwrapped(t *testing.T) {
+	directory := t.TempDir()
+	output := filepath.Join(directory, "binding")
+	compiler := filepath.Join(directory, "selected-cc")
+	if err := os.WriteFile(compiler, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recipe := kconfig.ActionRecipe{
+		Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "scriptrun",
+		Arguments:      []string{"${tool:cc}", "${output:00000000}"},
+		Environment:    map[string]string{"EXPECTED_CC": compiler},
+		Outputs:        []string{"00000000"},
+		AuxiliaryTools: []string{"cc"},
+	}
+	recipePath, recipeID := writeRecipe(t, recipe)
+	scriptRunner := filepath.Join(directory, "scriptrun")
+	if err := os.WriteFile(scriptRunner, []byte("#!/bin/sh\n[ \"$1\" = \"$EXPECTED_CC\" ] || exit 67\nprintf '%s' raw-binding > \"$2\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := runRecipe(recipeOptions{
+		recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
+		toolRole: "scriptrun", sources: map[string]string{}, inputs: map[string]string{},
+		outputs: map[string]string{"00000000": output},
+		tools:   map[string]string{"scriptrun": scriptRunner, "cc": compiler}, trees: map[string]string{},
+		actionEnvironment: map[string]string{},
+		auxiliaryActionContracts: map[string]toolaction.Contract{
+			"cc": {Arguments: []string{"prefix", toolaction.KbuildArgumentsSentinel}, Environment: map[string]string{}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "raw-binding" {
+		t.Fatalf("script runner binding output = %q, want raw binding", got)
 	}
 }
 
@@ -2103,6 +2257,7 @@ func TestRunRecipeExpandsToolchainContractPathsBeforeWorkingDirectory(t *testing
 		outputs: map[string]string{"00000000": output},
 		tools:   map[string]string{"helper": helper, "auxiliary": helper}, trees: map[string]string{},
 		workingDirectory: workRoot, workingDirectoryMarker: filepath.Join(workRoot, ".linux-bzl-work-root"),
+		runtimeTools:      map[string]string{"script-runtime": writeTestShellMulticall(t, executionRoot)},
 		actionArgs:        []string{toolaction.KbuildArgumentsSentinel, markerPath},
 		actionEnvironment: map[string]string{"PRIMARY_SYSROOT": markerPath},
 		auxiliaryActionContracts: map[string]toolaction.Contract{

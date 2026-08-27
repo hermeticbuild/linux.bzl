@@ -2,6 +2,7 @@ package toolaction
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -151,5 +152,83 @@ func TestPrepareRuntimeToolDirectoryUsesOnlyDeclaredRoles(t *testing.T) {
 	}
 	if resolved != executable {
 		t.Fatalf("runtime ld = %q, want %q", resolved, executable)
+	}
+}
+
+func TestInstallToolActionProxyRejectsInvalidShebangRuntime(t *testing.T) {
+	contract := Contract{
+		Arguments:   []string{KbuildArgumentsSentinel},
+		Environment: map[string]string{},
+	}
+	for name, runtime := range map[string]string{
+		"relative":      "script-runtime",
+		"space in path": filepath.Join(string(filepath.Separator), "runtime path", "script-runtime"),
+		"tab in path":   filepath.Join(string(filepath.Separator), "runtime\tpath", "script-runtime"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := InstallToolActionProxy(t.TempDir(), runtime, "cc", "/toolchain/cc", contract, nil); err == nil {
+				t.Fatalf("InstallToolActionProxy with runtime %q succeeded", runtime)
+			}
+		})
+	}
+}
+
+func TestInstallToolActionProxyMatchesInvocationContractRole(t *testing.T) {
+	root := t.TempDir()
+	multicall := filepath.Join(root, "multicall")
+	if err := os.WriteFile(multicall, []byte(`#!/bin/sh
+if [ "$1" != sh ]; then exit 90; fi
+shift
+exec /bin/sh "$@"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tool := filepath.Join(root, "tool")
+	if err := os.WriteFile(tool, []byte(`#!/bin/sh
+printf '%s' "$SELECTED_MODE" > "$RESULT"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	proxyDirectory := filepath.Join(root, "proxies")
+	if err := os.Mkdir(proxyDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	compile := Contract{
+		Arguments:   []string{KbuildArgumentsSentinel},
+		Environment: map[string]string{"SELECTED_MODE": "cc"},
+	}
+	link := Contract{
+		Arguments:   []string{KbuildArgumentsSentinel},
+		Environment: map[string]string{"SELECTED_MODE": "cc-link"},
+	}
+	proxy, err := InstallToolActionProxy(proxyDirectory, multicall, "cc", tool, compile, &link)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name      string
+		arguments []string
+	}{
+		{name: "link", arguments: []string{"first.o", "-o", "tool"}},
+		{name: "empty output", arguments: []string{"first.o", "-o", ""}},
+		{name: "missing output", arguments: []string{"first.o", "-o"}},
+		{name: "compile", arguments: []string{"-c", "source.c", "-o", "source.o"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := filepath.Join(root, "result-"+test.name)
+			command := exec.Command(proxy, test.arguments...)
+			command.Env = append(os.Environ(), "RESULT="+result)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("run proxy: %v\n%s", err, output)
+			}
+			got, err := os.ReadFile(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := InvocationContractRole("cc", test.arguments); string(got) != want {
+				t.Fatalf("proxy selected %q, want canonical contract role %q", got, want)
+			}
+		})
 	}
 }

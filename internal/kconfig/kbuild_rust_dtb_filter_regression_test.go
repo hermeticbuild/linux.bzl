@@ -84,6 +84,11 @@ endif
 	fixture := linuxCompilerBootstrapFixtures(t)[1]
 	target := testKbuildProbeScopeOptions(t, fixture)
 	target.Tools["rustc"] = "/configured/target/rustc"
+	target.ScriptEnvironment = map[string]string{
+		"CC":              target.Tools["cc"],
+		"RUSTC":           target.Tools["rustc"],
+		"RUSTC_BOOTSTRAP": "1",
+	}
 	opts := KbuildProbeWorkloadOptions{Target: target}
 	workload := func(scopes *KbuildProbeScopes) (string, error) {
 		options, err := scopes.Options("target", KbuildOptions{
@@ -134,9 +139,14 @@ endif
 		if request.InputCount != 0 || len(request.Steps) != 1 ||
 			request.Steps[0].Name != "print-file-names" || request.Steps[0].Tool != "rustc" ||
 			!slices.Equal(request.Steps[0].Arguments, wantArguments) ||
-			!reflect.DeepEqual(request.Steps[0].Environment, map[string]string{"MAKEFLAGS": ""}) ||
+			!slices.Equal(request.Steps[0].AuxiliaryTools, []string{"cc"}) ||
+			!reflect.DeepEqual(request.Steps[0].Environment, map[string]string{
+				"ARCH": "x86", "CC": "${tool:cc}", "MAKEFLAGS": "", "RUSTC": "${tool:rustc}",
+				"RUSTC_BOOTSTRAP": "1", "SRCARCH": "x86",
+			}) || len(request.SourceRoots) != 0 ||
 			request.Outcome.Kind != "text" || request.Outcome.Step != "print-file-names" ||
-			request.Outcome.Stream != "stdout" || !request.Outcome.TrimSpace || !request.Outcome.PathComponent {
+			request.Outcome.Stream != "stdout" || !request.Outcome.TrimSpace || !request.Outcome.PathComponent ||
+			!request.Outcome.RequireSuccess {
 			t.Fatalf("rustc text leaf %d = %#v", index, request)
 		}
 	}

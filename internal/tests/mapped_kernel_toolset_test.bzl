@@ -32,6 +32,7 @@ load(
     "linux_test_tree_input_directory_name",
     "linux_test_validate_host_dependency_artifact",
     "linux_test_with_compile_action_arguments",
+    "linux_test_with_link_runtime_arguments",
     "linux_test_with_rust_toolchain",
 )
 load("//internal:probe_map_directory.bzl", "linux_probe_map_directory_tools")
@@ -293,9 +294,9 @@ def _mapped_kernel_toolset_test_impl(ctx):
                     runner.executable.path in {file.path: True for file in closure.to_list()},
                     "%s %s runner must remain in the identity-bound toolset closure" % (scope, kind),
                 )
-        for scope, action_args in [
-            ("host", sdk.host_action_args),
-            ("target", sdk.target_action_args),
+        for scope, action_args, closure in [
+            ("host", sdk.host_action_args, sdk.host_toolchain_files),
+            ("target", sdk.target_action_args, sdk.target_toolchain_files),
         ]:
             for role in ["ar", "as", "cc", "cc-link", "cxx", "cxx-link", "ld", "nm", "objcopy", "objdump", "ranlib", "readelf", "strip"]:
                 asserts.equals(
@@ -316,6 +317,33 @@ def _mapped_kernel_toolset_test_impl(ctx):
                     env,
                     len(action_args[link_role]) > len(action_args[role]),
                     "%s %s must add the configured standard link envelope" % (scope, link_role),
+                )
+            closure_paths = {file.path: True for file in closure.to_list()}
+            runtime_paths = {}
+            for role in ["cc-link", "cxx-link"]:
+                argv = action_args[role]
+                markers = [index for index, arg in enumerate(argv) if arg == "__LINUX_BZL_KBUILD_ARGS_V1__"]
+                runtime_paths[role] = sorted([
+                    arg
+                    for arg in argv[markers[0] + 1:]
+                    if arg in closure_paths and arg.endswith(".a")
+                ])
+                asserts.true(
+                    env,
+                    len(runtime_paths[role]) > 0,
+                    "%s %s must append configured runtime archives after source-selected inputs" % (scope, role),
+                )
+            asserts.equals(
+                env,
+                runtime_paths["cc-link"],
+                runtime_paths["cxx-link"],
+                "%s compiler-driver link roles must share configured runtime archives" % scope,
+            )
+            for path in runtime_paths["cc-link"]:
+                asserts.false(
+                    env,
+                    path in action_args["cc"] or path in action_args["cxx"],
+                    "%s runtime archive must remain link-only" % scope,
                 )
         host_dependency_path = sdk.host_deps.path
         for role in ["cc", "cc-link", "cxx", "cxx-link"]:
@@ -589,6 +617,21 @@ def _mapped_kernel_toolset_test_impl(ctx):
             asserts.true(env, name in sdk.host_action_environments["bison"])
         asserts.false(env, "RUSTC_BOOTSTRAP" in sdk.target_action_environments["rustc"])
         asserts.false(env, "RUSTC_BOOTSTRAP" in sdk.host_action_environments["rustc"])
+        for scope, rustc_args in [
+            ("host", sdk.host_action_args["rustc"]),
+            ("target", sdk.target_action_args["rustc"]),
+        ]:
+            asserts.equals(env, [
+                "__LINUX_BZL_KBUILD_ARGS_V1__",
+                "-Zunstable-options",
+                "-Clink-self-contained=-linker",
+            ], rustc_args, "%s rustc action must preserve only the source-selected invocation boundary" % scope)
+        asserts.equals(
+            env,
+            sdk.target_action_args["rustc"],
+            sdk.target_action_args["clippy"],
+            "clippy must preserve the same external-linker contract as rustc",
+        )
         asserts.true(env, "clippy" in sdk.target_tool_files)
         asserts.true(env, "rustdoc" in sdk.target_tool_files)
         asserts.equals(env, sdk.target_action_environments["rustc"], sdk.target_action_environments["clippy"])
@@ -732,6 +775,14 @@ def _mapped_kernel_backend_test_impl(ctx):
     asserts.equals(env, {}, rust_tools.environments["rustdoc"])
     asserts.equals(env, {}, rust_tools.environments["rustfmt"])
     asserts.equals(env, {}, rust_tools.environments["bindgen"])
+    asserts.equals(env, [
+        "__LINUX_BZL_KBUILD_ARGS_V1__",
+        "-Zunstable-options",
+        "-Clink-self-contained=-linker",
+    ], rust_tools.arguments["rustc"])
+    asserts.equals(env, rust_tools.arguments["rustc"], rust_tools.arguments["clippy"])
+    for role in ["bindgen", "rustdoc", "rustfmt"]:
+        asserts.equals(env, [], rust_tools.arguments[role])
     bindgen_only = linux_test_with_rust_toolchain(
         "target",
         empty_toolset,
@@ -1276,6 +1327,27 @@ def _mapped_kernel_backend_test_impl(ctx):
                 "--configured-after",
             ],
             ["-Ityped/host-dependency/include"],
+        ),
+    )
+    asserts.equals(
+        env,
+        [
+            "--configured-before",
+            "__LINUX_BZL_KBUILD_ARGS_V1__",
+            "toolchain/lib/libc++.a",
+            "toolchain/lib/libunwind.a",
+            "--configured-after",
+        ],
+        linux_test_with_link_runtime_arguments(
+            [
+                "--configured-before",
+                "__LINUX_BZL_KBUILD_ARGS_V1__",
+                "--configured-after",
+            ],
+            [
+                struct(path = "toolchain/lib/libc++.a"),
+                struct(path = "toolchain/lib/libunwind.a"),
+            ],
         ),
     )
 

@@ -175,6 +175,11 @@ func TestSourceScriptObjectTreeObservationScopesEnvironmentAndArguments(t *testi
 			references: []string{"tools/objtool/objtool"},
 		},
 		{
+			name:       "valued interpreter options",
+			command:    `sh -eo pipefail +O extglob ${tree:kernel}/scripts/argument.sh ${tree:prep}/tools/objtool/objtool -c input.c`,
+			references: []string{"tools/objtool/objtool"},
+		},
+		{
 			name:       "inline environment path",
 			command:    `INLINE_ROOT=${tree:prep}/include/generated sh ${tree:kernel}/scripts/inline.sh`,
 			references: []string{"include/generated/autoconf.h"},
@@ -186,6 +191,73 @@ func TestSourceScriptObjectTreeObservationScopesEnvironmentAndArguments(t *testi
 				t.Fatalf("observation = %#v, want scoped references %q", got, test.references)
 			}
 		})
+	}
+}
+
+func TestSourceScriptObjectTreeObservationKeepsScriptInsideControlFlow(t *testing.T) {
+	profile := compactKbuildObjectTreeScriptProfileForTest(t, map[string]string{
+		"scripts/inline.sh": "#!/bin/sh\nprintf '%s\\n' \"${INLINE_ROOT}/vdso.so\"\n",
+	})
+	got := compactKbuildObjectTreeObservationForTest(
+		t,
+		profile,
+		`INLINE_ROOT=${tree:prep}/arch/x86 sh ${tree:kernel}/scripts/inline.sh; if readelf -rW output | grep -q relocation; then rm -f output; fi`,
+	)
+	want := []string{"arch/x86/vdso.so"}
+	if !got.ObservesObjectTree || got.ObservesAll || !reflect.DeepEqual(got.References, want) {
+		t.Fatalf("control-flow observation = %#v, want %q", got, want)
+	}
+}
+
+func TestSourceScriptObjectTreeObservationConsumesEvaluatedAutomaticInsideControlFlow(t *testing.T) {
+	profile := compactKbuildObjectTreeScriptProfileForTest(t, map[string]string{
+		"scripts/argument.sh": "#!/bin/sh\nprintf '%s\\n' \"$1\" \"$2\"\n",
+	})
+	const target = "generated/result.h"
+	injected := map[string]string{
+		"objtree": "__LINUX_BZL_OBJECT_TREE__",
+		"srctree": "__LINUX_BZL_SOURCE_TREE__",
+	}
+	evaluated, _, err := EvaluateCompactKbuildTextActionRolesForMakeTarget(
+		profile,
+		target,
+		target,
+		"__LINUX_BZL_OBJECT_TREE__/"+target,
+		"",
+		[]string{"__LINUX_BZL_OBJECT_TREE__/generated/input.h"},
+		nil,
+		injected,
+		`sh $(srctree)/scripts/argument.sh '$<' "$$@"; if readelf -rW output | grep -q relocation; then rm -f output; fi`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluated, err = ResolveCompactKbuildTargetSymbolicText(profile, target, evaluated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(evaluated, "$<") ||
+		!strings.Contains(evaluated, "${tree:prep}/generated/input.h") ||
+		!strings.Contains(evaluated, `"$@"`) {
+		t.Fatalf("target-evaluated command = %q, want expanded Make input and retained shell $@", evaluated)
+	}
+	observation, err := EvaluateCompactKbuildSourceScriptObjectTreeObservationSymbolicForMakeTarget(
+		profile,
+		target,
+		target,
+		"__LINUX_BZL_OBJECT_TREE__/"+target,
+		"",
+		[]string{"__LINUX_BZL_OBJECT_TREE__/generated/input.h"},
+		nil,
+		injected,
+		evaluated,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"generated/input.h"}
+	if !observation.ObservesObjectTree || observation.ObservesAll || !reflect.DeepEqual(observation.References, want) {
+		t.Fatalf("automatic control-flow observation = %#v, want %q", observation, want)
 	}
 }
 

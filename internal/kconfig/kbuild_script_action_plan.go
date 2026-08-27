@@ -382,32 +382,30 @@ func compactKbuildSourceScriptCommandWithSourceArguments(
 	if direct {
 		scriptPath = directScriptPath
 	} else {
-		for index, argument := range sourceArguments {
-			if argument == "-c" || argument == "--command" || argument == "-s" || argument == "--stdin" {
-				return compactKbuildSourceScriptInvocation{}, true, fmt.Errorf("selected CONFIG_SHELL command uses non-file mode %q", argument)
-			}
-			candidate, source, pathLike := compactKbuildProfileCommandPath(profile, argument)
-			if pathLike {
-				if !source || !compactKbuildProfileSourcePathExists(profile, candidate) {
-					return compactKbuildSourceScriptInvocation{}, true, fmt.Errorf("selected CONFIG_SHELL payload %q is not a declared source file", argument)
-				}
-				scriptIndex, scriptPath = index, candidate
-				break
-			}
-			if !strings.HasPrefix(argument, "-") {
-				return compactKbuildSourceScriptInvocation{}, true, fmt.Errorf("selected CONFIG_SHELL argument before source script is not an option: %q", argument)
-			}
-			if index >= len(command.arguments) {
-				return compactKbuildSourceScriptInvocation{}, true, fmt.Errorf(
-					"selected CONFIG_SHELL argument index %d exceeds rewritten argument count %d",
-					index, len(command.arguments),
-				)
-			}
-			interpreterArguments = append(interpreterArguments, command.arguments[index])
+		invocation := compactKbuildShellArguments(sourceArguments)
+		if invocation.mode != compactKbuildShellModeFile {
+			return compactKbuildSourceScriptInvocation{}, true, fmt.Errorf(
+				"selected CONFIG_SHELL command uses non-file mode %q", invocation.mode,
+			)
 		}
-		if scriptIndex < 0 {
+		scriptIndex = invocation.scriptIndex
+		if scriptIndex < 0 || scriptIndex >= len(sourceArguments) {
 			return compactKbuildSourceScriptInvocation{}, true, fmt.Errorf("selected CONFIG_SHELL command has no declared source script")
 		}
+		candidate, source, pathLike := compactKbuildProfileCommandPath(profile, sourceArguments[scriptIndex])
+		if !pathLike || !source || !compactKbuildProfileSourcePathExists(profile, candidate) {
+			return compactKbuildSourceScriptInvocation{}, true, fmt.Errorf(
+				"selected CONFIG_SHELL payload %q is not a declared source file", sourceArguments[scriptIndex],
+			)
+		}
+		if scriptIndex >= len(command.arguments) {
+			return compactKbuildSourceScriptInvocation{}, true, fmt.Errorf(
+				"selected CONFIG_SHELL script index %d exceeds rewritten argument count %d",
+				scriptIndex, len(command.arguments),
+			)
+		}
+		scriptPath = candidate
+		interpreterArguments = slices.Clone(command.arguments[:scriptIndex])
 	}
 	roles := map[string]bool{}
 	argumentStart := scriptIndex + 1
@@ -494,10 +492,23 @@ func compactKbuildProfileSourceInterpreterCommand(
 	if !safeLinuxSourceScriptCommandName(programName) {
 		return compactKbuildSourceInterpreterCommandMatch{}, false, nil
 	}
-	for index, argument := range arguments {
-		if strings.HasPrefix(argument, "-") {
-			continue
+	candidates := make([]int, 0, 1)
+	if compactKbuildShellProgram(programName) {
+		invocation := compactKbuildShellArguments(arguments)
+		if invocation.mode != compactKbuildShellModeFile || invocation.scriptIndex < 0 {
+			return compactKbuildSourceInterpreterCommandMatch{}, false, nil
 		}
+		candidates = append(candidates, invocation.scriptIndex)
+	} else {
+		for index, argument := range arguments {
+			if !strings.HasPrefix(argument, "-") {
+				candidates = append(candidates, index)
+				break
+			}
+		}
+	}
+	for _, index := range candidates {
+		argument := arguments[index]
 		scriptPath, source, pathLike := compactKbuildProfileCommandPath(profile, argument)
 		if !pathLike || !source || !compactKbuildProfileSourcePathExists(profile, scriptPath) {
 			return compactKbuildSourceInterpreterCommandMatch{}, false, nil
@@ -508,6 +519,23 @@ func compactKbuildProfileSourceInterpreterCommand(
 		}
 		if !found || interpreter.program != programName {
 			return compactKbuildSourceInterpreterCommandMatch{}, false, nil
+		}
+		if compactKbuildShellProgram(interpreter.program) {
+			// The immutable shebang and explicit command line jointly form the
+			// interpreter-owned prefix which scriptrun replays. Validate that
+			// complete prefix against the same bounded shell grammar as an
+			// ordinary CONFIG_SHELL invocation. In particular, a shebang-provided
+			// startup file must not become an undeclared sandbox input.
+			prefix := append(slices.Clone(interpreter.arguments), arguments[:index]...)
+			classified := compactKbuildShellArguments(append(
+				slices.Clone(prefix),
+				"linux-bzl-declared-source-script",
+			))
+			if classified.mode != compactKbuildShellModeFile || classified.scriptIndex != len(prefix) {
+				return compactKbuildSourceInterpreterCommandMatch{}, true, fmt.Errorf(
+					"source-script shebang interpreter arguments do not select the declared script safely",
+				)
+			}
 		}
 		return compactKbuildSourceInterpreterCommandMatch{
 			interpreter: interpreter,

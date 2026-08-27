@@ -4248,8 +4248,23 @@ func (p *kbuildParser) makeAbsPath(word string) string {
 	// absolute paths according to the host filesystem.  Do not accidentally
 	// anchor them below the directory containing the Makefile: that would bake
 	// the analysis execroot into every $(abspath ...) result.
-	if _, _, ok := p.mappedFilesystemPath(word); ok {
-		return filepath.ToSlash(filepath.Clean(word))
+	if _, prefix, ok := p.mappedFilesystemPath(word); ok {
+		cleaned := filepath.ToSlash(filepath.Clean(word))
+		// Action lowering normally projects an object-root path relative to the
+		// typed Make cwd. GNU Make's abspath is observably different: its result
+		// must stay absolute even when it is carried in a command-local environment
+		// assignment (Linux's Rust OBJTREE contract relies on that distinction).
+		// Preserve that provenance without changing public parse-time sentinels or
+		// assigning meaning to the receiving environment-variable name.
+		if prefix == compactKbuildActionObjectTreeMarker {
+			if cleaned == prefix {
+				return compactKbuildActionAbsoluteObjectTreeMarker
+			}
+			if suffix, rooted := strings.CutPrefix(cleaned, prefix+"/"); rooted {
+				return compactKbuildActionAbsoluteObjectTreeMarker + "/" + suffix
+			}
+		}
+		return cleaned
 	}
 	if filepath.IsAbs(word) {
 		return filepath.ToSlash(filepath.Clean(word))

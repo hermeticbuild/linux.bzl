@@ -245,7 +245,6 @@ jobs:
             - e2e/patches/gcc_toolchain_remote_execution.patch
             - e2e/patches/libbpf_old_uapi_compat.patch
             - e2e/patches/llvm_kbuild_actions.patch
-            - e2e/patches/rules_rs_linux_rust_lld_runtime.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Run ${{ matrix.suite.title }} with ${{ matrix.compiler }}

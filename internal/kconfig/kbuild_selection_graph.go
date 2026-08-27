@@ -1060,6 +1060,56 @@ func (g *compactKbuildSelectionGraph) releasePlanningCaches() {
 	g.unruledPrerequisites = make(map[compactKbuildSelectionMetadataKey]compactKbuildPrerequisitePaths)
 }
 
+func (g *compactKbuildSelectionGraph) selectedRootRuleResolutionKey(
+	metadata *CompactMetadata,
+	selectionKey compactKbuildSelectionKey,
+	profile CompactKbuildProfile,
+	target, makeTarget string,
+) (compactKbuildSelectedRuleResolutionKey, bool) {
+	if g == nil || metadata == nil {
+		return compactKbuildSelectedRuleResolutionKey{}, false
+	}
+	target = canonicalKbuildRulePath(target)
+	if selectionKey.profile != profile.Name || selectionKey.target != target {
+		return compactKbuildSelectedRuleResolutionKey{}, false
+	}
+	selection, selected := g.selections[selectionKey]
+	graphProfile, profiled := g.profile(selectionKey.profile)
+	if !selected || !profiled {
+		return compactKbuildSelectedRuleResolutionKey{}, false
+	}
+	expectedMakeTarget := compactKbuildRuleLookupTarget(
+		graphProfile,
+		target,
+		selection.MakeTarget,
+	)
+	makeTarget = compactKbuildRuleLookupTarget(graphProfile, target, makeTarget)
+	if makeTarget != expectedMakeTarget {
+		return compactKbuildSelectedRuleResolutionKey{}, false
+	}
+	return compactKbuildSelectedRuleResolutionKey{
+		metadata:   metadata,
+		selection:  selectionKey,
+		makeTarget: makeTarget,
+	}, true
+}
+
+// hasSelectedRootRuleResolution checks the exact successful root match retained
+// across releasePlanningCaches without consuming the one-shot lowering entry.
+func (g *compactKbuildSelectionGraph) hasSelectedRootRuleResolution(
+	metadata *CompactMetadata,
+	selectionKey compactKbuildSelectionKey,
+	profile CompactKbuildProfile,
+	target, makeTarget string,
+) bool {
+	key, valid := g.selectedRootRuleResolutionKey(metadata, selectionKey, profile, target, makeTarget)
+	if !valid {
+		return false
+	}
+	_, cached := g.selectedRootRuleResolutions[key]
+	return cached
+}
+
 // takeSelectedRootRuleResolution returns the successful root match retained
 // across releasePlanningCaches. The cache is exact to one metadata instance,
 // graph selection (including stage), and lexical Make target. A hit is deleted
@@ -1071,31 +1121,9 @@ func (g *compactKbuildSelectionGraph) takeSelectedRootRuleResolution(
 	profile CompactKbuildProfile,
 	target, makeTarget string,
 ) (compactKbuildRuleResolution, bool) {
-	if g == nil || metadata == nil {
+	key, valid := g.selectedRootRuleResolutionKey(metadata, selectionKey, profile, target, makeTarget)
+	if !valid {
 		return compactKbuildRuleResolution{}, false
-	}
-	target = canonicalKbuildRulePath(target)
-	if selectionKey.profile != profile.Name || selectionKey.target != target {
-		return compactKbuildRuleResolution{}, false
-	}
-	selection, selected := g.selections[selectionKey]
-	graphProfile, profiled := g.profile(selectionKey.profile)
-	if !selected || !profiled {
-		return compactKbuildRuleResolution{}, false
-	}
-	expectedMakeTarget := compactKbuildRuleLookupTarget(
-		graphProfile,
-		target,
-		selection.MakeTarget,
-	)
-	makeTarget = compactKbuildRuleLookupTarget(graphProfile, target, makeTarget)
-	if makeTarget != expectedMakeTarget {
-		return compactKbuildRuleResolution{}, false
-	}
-	key := compactKbuildSelectedRuleResolutionKey{
-		metadata:   metadata,
-		selection:  selectionKey,
-		makeTarget: makeTarget,
 	}
 	resolution, cached := g.selectedRootRuleResolutions[key]
 	if !cached {

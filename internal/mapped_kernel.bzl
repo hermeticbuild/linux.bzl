@@ -1203,6 +1203,17 @@ def _with_compile_action_arguments(arguments, additional, owner):
 def linux_test_with_compile_action_arguments(arguments, additional):
     return _with_compile_action_arguments(arguments, additional, "test")
 
+def _with_link_runtime_arguments(arguments, runtime_files, owner):
+    """Places configured runtime archives after source-selected link inputs."""
+    return _with_compile_action_arguments(
+        arguments,
+        [file.path for file in runtime_files],
+        owner,
+    )
+
+def linux_test_with_link_runtime_arguments(arguments, runtime_files):
+    return _with_link_runtime_arguments(arguments, runtime_files, "test")
+
 def _kbuild_toolset(ctx, cc_toolchain, scope, additional_compile_flags = []):
     features = cc_common.configure_features(
         ctx = ctx,
@@ -1255,12 +1266,26 @@ def _kbuild_toolset(ctx, cc_toolchain, scope, additional_compile_flags = []):
         link_variables,
         ACTION_NAMES.cpp_link_executable,
     )
+    link_runtime_files = cc_toolchain.static_runtime_lib(
+        feature_configuration = features,
+    )
+    if link_runtime_files == None:
+        # Bazel's provider permits toolchains without an embedded C++ runtime.
+        # Feature-aware implementations normally return an empty depset when
+        # static_link_cpp_runtimes is disabled; normalize older/custom
+        # providers that expose None to the same contract.
+        link_runtime_files = depset()
+    link_arguments = _with_link_runtime_arguments(
+        link_contract.arguments,
+        link_runtime_files.to_list(),
+        "%s C/C++ link runtime" % scope,
+    )
     for role in ["cc", "cxx"]:
         contract_role = _driver_link_contract_role(role)
         compile_owner = _kbuild_action_name(scope, role)
         tools[contract_role] = tools[role]
         arguments[contract_role] = _merge_action_arguments(
-            link_contract.arguments,
+            link_arguments,
             arguments[role],
             "%s %s" % (scope, contract_role),
         )
@@ -1279,6 +1304,7 @@ def _kbuild_toolset(ctx, cc_toolchain, scope, additional_compile_flags = []):
         arguments = arguments,
         companion_tools = {},
         environments = environments,
+        link_runtime_files = link_runtime_files,
         requirements_by_role = requirements_by_role,
         make_variables = make_variables,
         tools = tools,
@@ -1831,10 +1857,22 @@ def _with_rust_toolchain(scope, toolset, rust, bindgen = None):
             fail("%s toolset already defines %s" % (scope, role))
         if variable in make_variables:
             fail("%s toolset already binds Make variable %s" % (scope, variable))
-        arguments[role] = []
+        if role in ["rustc", "clippy"]:
+            # This is the generic rustc driver envelope, not a compiler-
+            # capability answer: Linux still owns every Kconfig/Kbuild flag and
+            # supplies the selected C linker through its source recipe. Disable
+            # only rustc's bundled linker component so that explicit linker is
+            # authoritative for any configured C/C++ toolchain.
+            arguments[role] = [
+                _KBUILD_ARGS_SENTINEL,
+                "-Zunstable-options",
+                "-Clink-self-contained=-linker",
+            ]
+        else:
+            arguments[role] = []
+        requirements_by_role[role] = {}
         tools[role] = executable
         environments[role] = environment
-        requirements_by_role[role] = {}
         make_variables[variable] = role
     return struct(
         arguments = arguments,
@@ -2100,10 +2138,12 @@ def _linux_mapped_kernel_impl(ctx):
     target_perl = ctx.toolchains[_PERL_TOOLCHAIN_TYPE].perl_runtime
     host_perl = ctx.exec_groups["host_cc"].toolchains[_PERL_TOOLCHAIN_TYPE].perl_runtime
     rust_source = _rust_source_selection(rust_source_toolchain) if rust_source_toolchain != None else None
+    target = _kbuild_toolset(ctx, target_cc, "target")
+    target_link_runtime_files = target.link_runtime_files
     target = _with_rust_toolchain(
         "target",
         _with_auxiliary_tools(
-            _kbuild_toolset(ctx, target_cc, "target"),
+            target,
             "target",
             {
                 "awk": ctx.executable._target_awk,
@@ -2126,17 +2166,19 @@ def _linux_mapped_kernel_impl(ctx):
     flex = flex_toolchain(host_exec_group)
     m4 = m4_toolchain(host_exec_group)
 
+    host = _kbuild_toolset(
+        ctx,
+        host_cc,
+        "host",
+        additional_compile_flags = libelf.action_compile_flags,
+    )
+    host_link_runtime_files = host.link_runtime_files
     host = _with_pkg_config(
         _with_rust_toolchain(
             "host",
             _with_auxiliary_tools(
                 _with_host_generators(
-                    _kbuild_toolset(
-                        ctx,
-                        host_cc,
-                        "host",
-                        additional_compile_flags = libelf.action_compile_flags,
-                    ),
+                    host,
                     bison,
                     flex,
                     m4,
@@ -2182,6 +2224,7 @@ def _linux_mapped_kernel_impl(ctx):
     )
     target_base_closures = [
         target_cc.all_files,
+        target_link_runtime_files,
         depset([libelf.tree]),
         _executable_label_closure(ctx.attr._target_awk),
         _executable_label_closure(ctx.attr._lz4),
@@ -2197,6 +2240,7 @@ def _linux_mapped_kernel_impl(ctx):
     ]
     host_base_closures = [
         host_cc.all_files,
+        host_link_runtime_files,
         depset([libelf.tree, pkg_config_manifest]),
         bison.all_files,
         flex.all_files,

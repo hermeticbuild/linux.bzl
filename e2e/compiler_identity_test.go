@@ -20,12 +20,13 @@ import (
 const targetProbeScope = "target"
 
 var (
-	kconfigBlockPattern = regexp.MustCompile(`^(?:menu)?config[[:space:]]+([A-Z0-9_]+)$`)
-	identityPattern     = regexp.MustCompile(`^def_bool[[:space:]]+\$\(success,test[[:space:]]+"\$\(([a-z][a-z0-9_-]*)-name\)"[[:space:]]*=[[:space:]]*([^[:space:])]+)\)$`)
-	versionPattern      = regexp.MustCompile(`^default[[:space:]]+\$\(([a-z][a-z0-9_-]*)-version\)(?:[[:space:]]+if[[:space:]]+([A-Z0-9_]+))?$`)
-	literalPattern      = regexp.MustCompile(`^default[[:space:]]+([0-9]+)$`)
-	versionTextPattern  = regexp.MustCompile(`^default[[:space:]]+"\$\(([A-Z][A-Z0-9_]*)\)"$`)
-	infoScriptPattern   = regexp.MustCompile(`^([a-z][a-z0-9_-]*)-info[[:space:]]*:=[[:space:]]*\$\(shell,\$\(srctree\)/([^[:space:])]+)`)
+	kconfigBlockPattern  = regexp.MustCompile(`^(?:menu)?config[[:space:]]+([A-Z0-9_]+)$`)
+	identityPattern      = regexp.MustCompile(`^def_bool[[:space:]]+\$\(success,test[[:space:]]+"\$\(([a-z][a-z0-9_-]*)-name\)"[[:space:]]*=[[:space:]]*([^[:space:])]+)\)$`)
+	versionPattern       = regexp.MustCompile(`^default[[:space:]]+\$\(([a-z][a-z0-9_-]*)-version\)(?:[[:space:]]+if[[:space:]]+([A-Z0-9_]+))?$`)
+	symbolDefaultPattern = regexp.MustCompile(`^default[[:space:]]+([A-Z0-9_]+)[[:space:]]+if[[:space:]]+([A-Z0-9_]+)$`)
+	literalPattern       = regexp.MustCompile(`^default[[:space:]]+([0-9]+)$`)
+	versionTextPattern   = regexp.MustCompile(`^default[[:space:]]+"\$\(([A-Z][A-Z0-9_]*)\)"$`)
+	infoScriptPattern    = regexp.MustCompile(`^([a-z][a-z0-9_-]*)-info[[:space:]]*:=[[:space:]]*\$\(shell,\$\(srctree\)/([^[:space:])]+)`)
 )
 
 type toolClassOracle struct {
@@ -36,10 +37,16 @@ type toolClassOracle struct {
 }
 
 type compilerKconfigOracle struct {
-	classes           map[string]*toolClassOracle
-	fallbacks         map[string]string
-	compilerClass     string
-	versionTextSymbol string
+	classes                   map[string]*toolClassOracle
+	fallbacks                 map[string]string
+	conditionalSymbolDefaults map[string][]conditionalSymbolDefault
+	compilerClass             string
+	versionTextSymbol         string
+}
+
+type conditionalSymbolDefault struct {
+	value     string
+	condition string
 }
 
 type probeRequest struct {
@@ -153,8 +160,23 @@ func validateToolClass(
 	}
 
 	if class.directVersion != "" {
-		if got := config[class.directVersion]; got != measurement.version {
-			t.Errorf("%s = %q, want %s probe version %q", class.directVersion, got, className, measurement.version)
+		want := measurement.version
+		source := className + " probe"
+		for _, candidate := range oracle.conditionalSymbolDefaults[class.directVersion] {
+			if config[candidate.condition] != "y" {
+				continue
+			}
+			var ok bool
+			want, ok = config[candidate.value]
+			if !ok {
+				t.Errorf("%s selects missing Kconfig value %s", candidate.condition, candidate.value)
+				return
+			}
+			source = candidate.value
+			break
+		}
+		if got := config[class.directVersion]; got != want {
+			t.Errorf("%s = %q, want %q from source-declared %s default", class.directVersion, got, want, source)
 		}
 	}
 	for identity, versionSymbol := range class.conditionalVersions {
@@ -207,8 +229,9 @@ func readCompilerKconfigOracle(initKconfigPath, kconfigIncludePath string) (*com
 
 func parseCompilerKconfig(r io.Reader) (*compilerKconfigOracle, error) {
 	oracle := &compilerKconfigOracle{
-		classes:   map[string]*toolClassOracle{},
-		fallbacks: map[string]string{},
+		classes:                   map[string]*toolClassOracle{},
+		fallbacks:                 map[string]string{},
+		conditionalSymbolDefaults: map[string][]conditionalSymbolDefault{},
 	}
 	versionTextSymbols := map[string]string{}
 	currentSymbol := ""
@@ -245,6 +268,16 @@ func parseCompilerKconfig(r io.Reader) (*compilerKconfigOracle, error) {
 				}
 				class.conditionalVersions[identity] = currentSymbol
 			}
+			continue
+		}
+		if match := symbolDefaultPattern.FindStringSubmatch(line); match != nil {
+			oracle.conditionalSymbolDefaults[currentSymbol] = append(
+				oracle.conditionalSymbolDefaults[currentSymbol],
+				conditionalSymbolDefault{
+					value:     "CONFIG_" + match[1],
+					condition: "CONFIG_" + match[2],
+				},
+			)
 			continue
 		}
 		if match := literalPattern.FindStringSubmatch(line); match != nil {
@@ -455,9 +488,8 @@ func (e *probeEvidence) measurement(script string) (toolMeasurement, error) {
 		if len(fields) != 2 {
 			return toolMeasurement{}, fmt.Errorf("probe result %s is %q, want identity and numeric version", result.RequestID, result.Text)
 		}
-		version, err := strconv.ParseUint(fields[1], 10, 64)
-		if err != nil || version == 0 {
-			return toolMeasurement{}, fmt.Errorf("probe result %s has non-positive version %q", result.RequestID, fields[1])
+		if _, err := strconv.ParseUint(fields[1], 10, 64); err != nil {
+			return toolMeasurement{}, fmt.Errorf("probe result %s has non-numeric version %q", result.RequestID, fields[1])
 		}
 		measurements[toolMeasurement{name: fields[0], version: fields[1]}] = true
 	}

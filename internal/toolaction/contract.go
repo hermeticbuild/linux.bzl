@@ -221,6 +221,113 @@ func CompilerInvocationProducesBinaryOutput(role string, arguments []string) boo
 	return properties.compileOnly || properties.hasOutput
 }
 
+// InstallToolActionProxy materializes one private executable which applies the
+// configured action contract for role before invoking executable. C/C++ driver
+// roles may supply their semantic link companion; the proxy selects it from
+// the caller's stable driver-mode argv without identifying a compiler family.
+// multicall must provide a POSIX sh applet and is written into the proxy's
+// shebang so execution never searches an ambient shell.
+func InstallToolActionProxy(
+	directory, multicall, role, executable string,
+	contract Contract,
+	linkContract *Contract,
+) (string, error) {
+	if !ValidBinding(role) {
+		return "", fmt.Errorf("invalid tool action proxy role %q", role)
+	}
+	if _, companion := BaseContractRole(role); companion {
+		return "", fmt.Errorf("tool action proxy role %q is a semantic contract, not an executable role", role)
+	}
+	if directory == "" || multicall == "" || executable == "" {
+		return "", fmt.Errorf("tool action proxy %q requires a directory, multicall runtime, and executable", role)
+	}
+	if !filepath.IsAbs(multicall) || strings.ContainsAny(multicall, "\x00\r\n\t ") || strings.ContainsRune(executable, 0) {
+		return "", fmt.Errorf("tool action proxy %q has an invalid runtime or executable path", role)
+	}
+	contracts := map[string]Contract{role: contract}
+	linkRole := ""
+	if linkContract != nil {
+		var ok bool
+		linkRole, ok = LinkContractRole(role)
+		if !ok {
+			return "", fmt.Errorf("tool action proxy role %q cannot have a driver-link companion contract", role)
+		}
+		contracts[linkRole] = *linkContract
+	}
+	if err := Validate(contracts); err != nil {
+		return "", err
+	}
+
+	destination := filepath.Join(directory, role)
+	if err := os.Remove(destination); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	var script strings.Builder
+	script.WriteString("#!")
+	script.WriteString(multicall)
+	script.WriteString(" sh\n")
+	if linkContract != nil {
+		script.WriteString("linux_bzl_link=\nlinux_bzl_expect_output=\n")
+		script.WriteString("for linux_bzl_arg do\n")
+		script.WriteString("  if [ -n \"$linux_bzl_expect_output\" ]; then\n")
+		script.WriteString("    if [ -n \"$linux_bzl_arg\" ]; then linux_bzl_link=1; fi\n")
+		script.WriteString("    linux_bzl_expect_output=\n    continue\n  fi\n")
+		script.WriteString("  case \"$linux_bzl_arg\" in\n")
+		script.WriteString("    -c|-S|-E|-M|-MM|-fsyntax-only) linux_bzl_link=; break ;;\n")
+		script.WriteString("    -o) linux_bzl_expect_output=1 ;;\n")
+		script.WriteString("    -o?*) linux_bzl_link=1 ;;\n")
+		script.WriteString("  esac\ndone\n")
+		script.WriteString("if [ \"$linux_bzl_link\" = 1 ]; then\n")
+		writeToolActionContractInvocation(&script, executable, *linkContract, "  ")
+		script.WriteString("fi\n")
+	}
+	writeToolActionContractInvocation(&script, executable, contract, "")
+	if err := os.WriteFile(destination, []byte(script.String()), 0o700); err != nil {
+		return "", err
+	}
+	return destination, nil
+}
+
+func writeToolActionContractInvocation(script *strings.Builder, executable string, contract Contract, indent string) {
+	for _, environmentName := range sortedEnvironmentNames(contract.Environment) {
+		script.WriteString(indent)
+		script.WriteString("export ")
+		script.WriteString(environmentName)
+		script.WriteString("=")
+		script.WriteString(shellQuote(contract.Environment[environmentName]))
+		script.WriteByte('\n')
+	}
+	script.WriteString(indent)
+	script.WriteString("exec ")
+	script.WriteString(shellQuote(executable))
+	if len(contract.Arguments) == 0 {
+		script.WriteString(" \"$@\"")
+	} else {
+		for _, argument := range contract.Arguments {
+			if argument == KbuildArgumentsSentinel {
+				script.WriteString(" \"$@\"")
+			} else {
+				script.WriteByte(' ')
+				script.WriteString(shellQuote(argument))
+			}
+		}
+	}
+	script.WriteByte('\n')
+}
+
+func sortedEnvironmentNames(environment map[string]string) []string {
+	names := make([]string, 0, len(environment))
+	for name := range environment {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
 // PrepareRuntimeToolDirectory creates a private PATH component containing one
 // symlink per configured tool role.  Callers own privateRoot and must invoke
 // the returned cleanup function.  No ambient PATH entries are inspected.

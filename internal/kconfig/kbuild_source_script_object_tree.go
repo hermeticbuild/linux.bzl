@@ -156,9 +156,17 @@ func evaluateCompactKbuildSourceScriptObjectTreeObservationForMakeTarget(
 		return CompactKbuildObjectTreeObservation{}, err
 	}
 
-	commands, err := parseCompactKbuildRecipe(
-		compactKbuildProfileCanonicalRecipeText(profile, command),
-		compactKbuildAutomaticContext{target: automaticTarget, stem: stem, normal: normal, order: orderOnly},
+	canonicalCommand := compactKbuildProfileCanonicalRecipeText(profile, command)
+	// command is already one target-evaluated Make value. Active automatic
+	// variables were expanded quote-independently by the captured evaluator,
+	// while escaped Make dollars have become shell-owned dollars. Do not pass it
+	// through the final argv lowerer's automatic-variable phase again: doing so
+	// could reinterpret a shell $@ from source $$@ as this Make target.
+	// Project typed tree placeholders onto inert observation sentinels before
+	// command-head classification. They retain source/object provenance without
+	// looking like shell parameters to the compound scanner.
+	commands, err := compactKbuildCompoundProgramCommands(
+		compactKbuildCommandObservationText(profile, canonicalCommand),
 	)
 	if err != nil {
 		return CompactKbuildObjectTreeObservation{}, fmt.Errorf("inspect source-script object-tree command for target %q: %w", target, err)
@@ -286,6 +294,7 @@ func (b *compactKbuildObjectTreeObservationBuilder) addValue(value string) {
 	for _, marker := range []string{
 		"__LINUX_BZL_OBJECT_TREE__",
 		compactKbuildActionObjectTreeMarker,
+		compactKbuildActionAbsoluteObjectTreeMarker,
 		"${tree:prep}",
 		"${work:root}",
 	} {

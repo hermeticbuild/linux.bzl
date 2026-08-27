@@ -370,9 +370,14 @@ func sourceDerivedLinuxKconfigEnvironment(
 		return nil, fmt.Errorf("canonicalize Linux compiler-policy source root %q: %w", sourceRoot, err)
 	}
 	root = filepath.Clean(root)
-	values := linuxRootMakeInvocationVariables(root)
+	values := linuxRootKconfigInvocationVariables(root)
 	configured := make(map[string]string, len(variables)+2)
 	for name, value := range variables {
+		// MAKECMDGOALS is invocation-local state synthesized by the planner,
+		// never a caller-configured Make command-line assignment.
+		if name == "MAKECMDGOALS" {
+			continue
+		}
 		values[name] = value
 		configured[name] = value
 	}
@@ -3586,6 +3591,15 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 					)
 					if err != nil {
 						return nil, fmt.Errorf("evaluate selected target %s action-role provenance: %w", item.target, err)
+					}
+					// Command-template selection intentionally projects an
+					// if_changed[_rule] wrapper onto its cmd_<name> payload for
+					// compiler semantics.  Generated command heads in the wrapper
+					// remain real executable inputs, however: cmd_and_fixdep is the
+					// canonical example.  Observe those heads from the exact expanded
+					// recipe before replacing it with the inner command template.
+					if programs, programErr := kconfig.CompactKbuildObjectTreeCommandPrograms(profile, expanded); programErr == nil {
+						evaluation.objectTreePrograms = append(evaluation.objectTreePrograms, programs...)
 					}
 					lineRule := rule
 					lineRule.Recipe = []string{recipe}
@@ -8118,6 +8132,15 @@ func kbuildGeneratedSourceScriptInvocationForRecipe(
 	if scope != "target" && scope != "host" {
 		return kbuildGeneratedSourceScriptInvocation{}, false, nil
 	}
+	scriptArgument, fileMode := kconfig.CompactKbuildShellFileScriptIndex(fields[1:])
+	if !fileMode || scriptArgument != 0 {
+		// SourceScriptOutputText models only the immutable script and its argv;
+		// it has no field for interpreter options. Keep the historical direct
+		// `sh SCRIPT ...` shape, but decline every option-bearing invocation
+		// instead of mistaking an option operand for the script.
+		return kbuildGeneratedSourceScriptInvocation{}, false, nil
+	}
+	scriptField := scriptArgument + 1
 	resolveTreePath := func(value string) (kconfig.CompactKbuildInvocationLocation, bool, error) {
 		location, _, ok, pathErr := kconfig.ResolveCompactKbuildCompilerIncludePath(profile, value)
 		return location, ok, pathErr
@@ -8130,7 +8153,7 @@ func kbuildGeneratedSourceScriptInvocationForRecipe(
 	for _, generated := range generatedPrerequisites {
 		generatedSet[generated] = true
 	}
-	scriptLocation, ok, err := resolveTreePath(fields[1])
+	scriptLocation, ok, err := resolveTreePath(fields[scriptField])
 	if err != nil {
 		return kbuildGeneratedSourceScriptInvocation{}, false, err
 	}
@@ -8142,7 +8165,7 @@ func kbuildGeneratedSourceScriptInvocationForRecipe(
 	if !ok || scriptLocation.Tree != kconfig.CompactKbuildInvocationSourceTree {
 		return kbuildGeneratedSourceScriptInvocation{}, false, nil
 	}
-	argumentFields := fields[2:]
+	argumentFields := fields[scriptField+1:]
 	stdoutOutput := false
 	if len(command.redirections) != 0 {
 		if len(command.redirections) != 1 || command.redirections[0].operator != ">" ||
@@ -9903,6 +9926,15 @@ func linuxRootMakeInvocationVariables(rootDir string) map[string]string {
 		"srcroot":       rootDir,
 		"srctree":       rootDir,
 	}
+}
+
+func linuxRootKconfigInvocationVariables(rootDir string) map[string]string {
+	variables := linuxRootMakeInvocationVariables(rootDir)
+	// Linux exports the source-derived compiler version fields to Kconfig only
+	// for a %config goal. No recipe is executed here, so use one canonical goal
+	// to select that source-owned environment independently of config mode.
+	variables["MAKECMDGOALS"] = "olddefconfig"
+	return variables
 }
 
 func readToolsetIdentity(root string) (string, error) {

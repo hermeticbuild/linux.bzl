@@ -266,7 +266,41 @@ func (g *compactKbuildSelectionGraph) compactKbuildSourceOrderedPathProducer(
 		return "", false, nil
 	}
 	target = canonicalKbuildRulePath(target)
-	owners := append([]compactKbuildSelectionKey(nil), g.outputOwnersByPath[target]...)
+	// Primary and statically known outputs are indexed by logical pathname.
+	// Ordinary materialized side outputs are not: their physical observations
+	// only exist after the selected recipe has been lowered. The caller has
+	// already established that both producer nodes emit target, so augment this
+	// comparison's owner set from the exact selection-to-producer mapping when
+	// the pathname index cannot identify both versions. This is deliberately a
+	// local view; publishing these owners would make an observed side output
+	// alter global ownership and overwrite dependencies.
+	owners := make([]compactKbuildSelectionKey, 0, len(g.outputOwnersByPath[target]))
+	seen := make(map[compactKbuildSelectionKey]bool, len(g.outputOwnersByPath[target]))
+	mapped := map[string]bool{}
+	appendOwner := func(owner compactKbuildSelectionKey) {
+		if seen[owner] {
+			return
+		}
+		seen[owner] = true
+		owners = append(owners, owner)
+		producer := g.materializedProducers[owner]
+		if producer == leftProducer || producer == rightProducer {
+			mapped[producer] = true
+		}
+	}
+	for _, owner := range g.outputOwnersByPath[target] {
+		appendOwner(owner)
+	}
+	if !mapped[leftProducer] || !mapped[rightProducer] {
+		for owner, producer := range g.materializedProducers {
+			if producer == leftProducer || producer == rightProducer {
+				appendOwner(owner)
+			}
+		}
+	}
+	sort.Slice(owners, func(i, j int) bool {
+		return compactKbuildSelectionKeyLess(owners[i], owners[j])
+	})
 	reachable, err := g.compactKbuildOverwriteReachability(target, owners)
 	if err != nil {
 		return "", false, err

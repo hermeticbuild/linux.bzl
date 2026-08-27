@@ -28,18 +28,6 @@ single_version_override(
     version = "0.8.14",
 )
 
-# Rust 1.97's native Linux target spec carries a self-contained linker
-# component.  Keep that distribution-provided runtime in the generated
-# rules_rust sysroot while the configured C/C++ toolchain remains the selected
-# link driver.  This patch can be dropped once rules_rs publishes the same
-# complete toolchain closure.
-single_version_override(
-    module_name = "rules_rs",
-    patch_strip = 1,
-    patches = ["//patches:rules_rs_linux_rust_lld_runtime.patch"],
-    version = "0.0.102",
-)
-
 single_version_override(
     module_name = "libbpf",
     patch_strip = 1,

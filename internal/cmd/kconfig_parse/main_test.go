@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -304,6 +305,10 @@ export CLANG_FLAGS
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(`
+config-build :=
+ifneq ($(filter %config,$(MAKECMDGOALS)),)
+config-build := 1
+endif
 COMPILER_MACHINE := $(shell $(CC) -dumpmachine)
 SUBARCH := $(word 1,$(subst -, ,$(COMPILER_MACHINE)))
 ifeq ($(SUBARCH),aarch64)
@@ -320,7 +325,10 @@ CLANG_FLAGS :=
 ifneq ($(findstring clang,$(CC_VERSION_TEXT)),)
 include $(srctree)/scripts/Makefile.clang
 endif
-export AR BINDGEN CC CC_VERSION_TEXT LD NM OBJCOPY PAHOLE PYTHON3 RUSTC
+export AR BINDGEN CC LD NM OBJCOPY PAHOLE PYTHON3 RUSTC
+ifdef config-build
+export CC_VERSION_TEXT
+endif
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -988,6 +996,10 @@ success = $(if-success,$(1),y,n)
 cc-option = $(success,$(CC) -Werror $(CLANG_FLAGS) $(1) -c -x c /dev/null -o .tmp_probe/tmp.o)
 capability := $(cc-option,-fbrand-new)
 
+config CC_VERSION_TEXT
+	string
+	default "$(CC_VERSION_TEXT)"
+
 config MEASURED_CAPABILITY
 	bool
 	default $(capability)
@@ -1001,7 +1013,7 @@ config MEASURED_CAPABILITY
 	targetContract, hostContract := testKbuildContracts(actions, facts)
 	discovery, err := evaluateLinuxKconfigProbes(
 		t.Context(), kconfigPath, root, nil,
-		map[string]string{"ARCH": "arm64", "SRCARCH": "arm64", "UTS_MACHINE": "arm64"},
+		map[string]string{"ARCH": "arm64", "MAKECMDGOALS": "all", "SRCARCH": "arm64", "UTS_MACHINE": "arm64"},
 		targetIdentity, hostIdentity, facts,
 		targetContract, hostContract, "", nil,
 	)
@@ -1037,7 +1049,7 @@ config MEASURED_CAPABILITY
 	}
 	replay, err := evaluateLinuxKconfigProbes(
 		t.Context(), kconfigPath, root, nil,
-		map[string]string{"ARCH": "arm64", "SRCARCH": "arm64", "UTS_MACHINE": "arm64"},
+		map[string]string{"ARCH": "arm64", "MAKECMDGOALS": "all", "SRCARCH": "arm64", "UTS_MACHINE": "arm64"},
 		targetIdentity, hostIdentity, facts,
 		targetContract, hostContract, "", oracle,
 	)
@@ -1053,6 +1065,9 @@ config MEASURED_CAPABILITY
 	}
 	if got := resolved.Value("CONFIG_MEASURED_CAPABILITY"); got != "y" {
 		t.Fatalf("resolved capability = %q, want y", got)
+	}
+	if got, want := resolved.Value("CONFIG_CC_VERSION_TEXT"), strconv.Quote(facts.VersionText()); got != want {
+		t.Fatalf("resolved compiler version text = %q, want source-exported %q", got, want)
 	}
 }
 
@@ -1488,6 +1503,17 @@ func TestLinuxRootMakeInvocationVariablesSelectFinalBuild(t *testing.T) {
 	}
 	if _, ok := vars["sub_make_done"]; ok {
 		t.Fatalf("sub_make_done must remain source-derived: %#v", vars)
+	}
+}
+
+func TestLinuxRootKconfigInvocationVariablesSelectConfigBuild(t *testing.T) {
+	root := filepath.ToSlash(t.TempDir())
+	vars := linuxRootKconfigInvocationVariables(root)
+	if got, want := vars["MAKECMDGOALS"], "olddefconfig"; got != want {
+		t.Fatalf("MAKECMDGOALS=%q, want canonical Kconfig goal %q", got, want)
+	}
+	if got := vars["srctree"]; got != root {
+		t.Fatalf("srctree=%q, want %q", got, root)
 	}
 }
 
@@ -2459,6 +2485,24 @@ func TestKbuildGeneratedSourceScriptInvocationUsesTypedImmutableArguments(t *tes
 		[]string{"scripts/generate.sh"}, []string{"include/features.h"},
 	); err != nil || recognized {
 		t.Fatalf("generated-input script probe = recognized %t, error %v; want conservative rejection", recognized, err)
+	}
+
+	for name, optionBearingRecipe := range map[string]string{
+		"valued option": strings.Join([]string{
+			"sh", "-o", "errexit", "${tree:kernel}/scripts/generate.sh", target,
+		}, " "),
+		"option terminator": strings.Join([]string{
+			"sh", "--", "${tree:kernel}/scripts/generate.sh", target,
+		}, " "),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, recognized, err := kbuildGeneratedSourceScriptInvocationForRecipe(
+				profile, target, optionBearingRecipe,
+				[]string{"scripts/generate.sh"}, nil,
+			); err != nil || recognized {
+				t.Fatalf("option-bearing script probe = recognized %t, error %v; want conservative rejection", recognized, err)
+			}
+		})
 	}
 }
 
@@ -5965,6 +6009,10 @@ target-bootstrap.o: target-bootstrap.c
 	generated := selectionByTarget(t, selections, "generated/header.h")
 	if generated.Scope != "target" || generated.Stage != "bootstrap" {
 		t.Fatalf("visible object-tree owner selection = %#v, want target/bootstrap", generated)
+	}
+	fixdepSelection := selectionByTarget(t, selections, "scripts/basic/fixdep")
+	if fixdepSelection.Scope != "host" || fixdepSelection.Stage != "prehost" {
+		t.Fatalf("bootstrap executable owner selection = %#v, want host/prehost", fixdepSelection)
 	}
 	bootstrap := selectionByTarget(t, selections, "target-bootstrap.o")
 	wantInitialArtifacts := kconfig.EncodeCompactKbuildInitialObjectTreeArtifacts([]kconfig.CompactKbuildVisibleArtifact{{

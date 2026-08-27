@@ -947,6 +947,49 @@ result: FORCE
 	}
 }
 
+func TestKbuildCommandSourceScriptsConsumeValuedShellOptions(t *testing.T) {
+	profile := compactKbuildScriptProfileForTest(
+		t,
+		`$(CONFIG_SHELL) $(srctree)/scripts/transform.sh > $@`,
+	)
+	for name, command := range map[string]string{
+		"split short option":    `sh -o pipefail ${tree:kernel}/scripts/transform.sh -c input.c`,
+		"combined short option": `sh -eo pipefail ${tree:kernel}/scripts/transform.sh -c input.c`,
+		"plus option":           `sh +O extglob ${tree:kernel}/scripts/transform.sh`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			scripts, err := ReadCompactKbuildCommandSourceScripts(
+				profile, "generated/result.h", "", nil, nil, nil, command,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(scripts) != 1 || scripts[0].Path != "scripts/transform.sh" {
+				t.Fatalf("source scripts = %#v, want only scripts/transform.sh", scripts)
+			}
+		})
+	}
+	for name, command := range map[string]string{
+		"command":                   `sh -o pipefail -c ${tree:kernel}/scripts/transform.sh`,
+		"stdin":                     `sh -o pipefail -s ${tree:kernel}/scripts/transform.sh`,
+		"split startup file":        `sh --rcfile scripts/bashrc ${tree:kernel}/scripts/transform.sh`,
+		"equals startup file":       `sh --init-file=scripts/bashrc ${tree:kernel}/scripts/transform.sh`,
+		"unknown long option arity": `sh --startup-file scripts/bashrc ${tree:kernel}/scripts/transform.sh`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			scripts, err := ReadCompactKbuildCommandSourceScripts(
+				profile, "generated/result.h", "", nil, nil, nil, command,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(scripts) != 0 {
+				t.Fatalf("non-file shell mode discovered source scripts: %#v", scripts)
+			}
+		})
+	}
+}
+
 func TestReadCompactKbuildProfileSourceSupportsDeclaredSymlinkForest(t *testing.T) {
 	physical := t.TempDir()
 	if err := os.WriteFile(filepath.Join(physical, "selected.sh"), []byte("#!/bin/sh\necho selected\n"), 0o755); err != nil {

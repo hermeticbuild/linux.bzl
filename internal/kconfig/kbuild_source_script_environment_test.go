@@ -101,6 +101,88 @@ func TestCompactKbuildSourceScriptEnvironmentUsageKeepsNestedExpansionQuotesLoca
 	}
 }
 
+func TestCompactKbuildShellArgumentsClassifiesValuedOptionsAndPayloadBoundary(t *testing.T) {
+	for name, test := range map[string]struct {
+		arguments   []string
+		mode        compactKbuildShellMode
+		scriptIndex int
+	}{
+		"split valued option": {
+			arguments: []string{"-o", "pipefail", "scripts/child.sh", "-c", "input.c"},
+			mode:      compactKbuildShellModeFile, scriptIndex: 2,
+		},
+		"combined valued option": {
+			arguments: []string{"-eo", "pipefail", "scripts/child.sh", "-c", "input.c"},
+			mode:      compactKbuildShellModeFile, scriptIndex: 2,
+		},
+		"plus valued option": {
+			arguments: []string{"+eO", "extglob", "scripts/child.sh"},
+			mode:      compactKbuildShellModeFile, scriptIndex: 2,
+		},
+		"short equals value": {
+			arguments: []string{"-o=pipefail", "scripts/child.sh"},
+			mode:      compactKbuildShellModeFile, scriptIndex: 1,
+		},
+		"long split startup file fails closed": {
+			arguments: []string{"--rcfile", "scripts/bashrc", "scripts/child.sh"},
+			mode:      compactKbuildShellModeStdin, scriptIndex: -1,
+		},
+		"long equals startup file fails closed": {
+			arguments: []string{"--init-file=scripts/bashrc", "scripts/child.sh"},
+			mode:      compactKbuildShellModeStdin, scriptIndex: -1,
+		},
+		"unknown long option fails closed": {
+			arguments: []string{"--startup-file", "scripts/bashrc", "scripts/child.sh"},
+			mode:      compactKbuildShellModeStdin, scriptIndex: -1,
+		},
+		"option terminator": {
+			arguments: []string{"--", "-c"},
+			mode:      compactKbuildShellModeFile, scriptIndex: 1,
+		},
+		"consumed command spelling": {
+			arguments: []string{"-o", "-c", "scripts/child.sh"},
+			mode:      compactKbuildShellModeFile, scriptIndex: 2,
+		},
+		"split command": {
+			arguments: []string{"-o", "pipefail", "-c", "$program"},
+			mode:      compactKbuildShellModeCommand, scriptIndex: -1,
+		},
+		"combined command": {
+			arguments: []string{"-eo", "pipefail", "-ec", "$program"},
+			mode:      compactKbuildShellModeCommand, scriptIndex: -1,
+		},
+		"long command": {
+			arguments: []string{"--command=printf bounded"},
+			mode:      compactKbuildShellModeCommand, scriptIndex: -1,
+		},
+		"combined stdin": {
+			arguments: []string{"-es", "arg0"},
+			mode:      compactKbuildShellModeStdin, scriptIndex: -1,
+		},
+		"long stdin": {
+			arguments: []string{"--stdin", "arg0"},
+			mode:      compactKbuildShellModeStdin, scriptIndex: -1,
+		},
+		"missing valued operand": {
+			arguments: []string{"-o"},
+			mode:      compactKbuildShellModeStdin, scriptIndex: -1,
+		},
+		"stdin default": {
+			mode: compactKbuildShellModeStdin, scriptIndex: -1,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := compactKbuildShellArguments(test.arguments)
+			if got.mode != test.mode || got.scriptIndex != test.scriptIndex {
+				t.Fatalf("classification = %#v, want mode=%q scriptIndex=%d", got, test.mode, test.scriptIndex)
+			}
+			if command := compactKbuildShellCommandMode(test.arguments); command != (test.mode == compactKbuildShellModeCommand) {
+				t.Fatalf("command mode = %t, want %t", command, test.mode == compactKbuildShellModeCommand)
+			}
+		})
+	}
+}
+
 func TestCompactKbuildSourceScriptEnvironmentUsageScansMultilineCommandSubstitution(t *testing.T) {
 	scan, err := scanCompactKbuildSourceScript(`guard=_UAPI_ASM_$(basename "$outfile" |
 	sed -e 'y/abcdefghijklmnopqrstuvwxyz/ABCDEFGHIJKLMNOPQRSTUVWXYZ/' \
@@ -134,6 +216,7 @@ func TestCompactKbuildSourceScriptEnvironmentUsageFailsClosedForDynamicObservati
 		"dynamic shell":       `sh -c "$program"`,
 		"combined shell":      `sh -ec "$program"`,
 		"split shell options": `busybox sh -e -c "$program"`,
+		"valued shell option": `sh -o errexit -c "$program"`,
 		"env nested shell":    `env -u CC sh -ec "$program"`,
 		"dynamic source":      `. "$fragment"`,
 		"env unset listing":   `env -u CC`,
@@ -161,6 +244,7 @@ func TestCompactKbuildSourceScriptEnvironmentUsageEnvOptionOperandsWithProgramSt
 		`env --unset=CC printf bounded`,
 		`env --unset CC printf bounded`,
 		`$* -Wno-error -Wno-unused-macros -E -x c -`,
+		`sh scripts/test_fortify.sh input.c output.log nm cc -Werror -c input.c`,
 	} {
 		scan, err := scanCompactKbuildSourceScript(script + "\n")
 		if err != nil {
@@ -320,7 +404,7 @@ func TestCompactKbuildSourceScriptEnvironmentUsageRecursesIntoImmutableChildren(
 	root := t.TempDir()
 	for name, content := range map[string]string{
 		"Makefile":             "all:\n\t@true\n",
-		"scripts/parent.sh":    `"$srctree/scripts/child.sh"` + "\n" + `. scripts/fragment.sh` + "\n" + `"${CONFIG_SHELL}" "$srctree/scripts/file-size.sh"` + "\n",
+		"scripts/parent.sh":    `"$srctree/scripts/child.sh"` + "\n" + `. scripts/fragment.sh` + "\n" + `"${CONFIG_SHELL}" -eo pipefail "$srctree/scripts/file-size.sh"` + "\n",
 		"scripts/child.sh":     `printf '%s\n' "$CC"` + "\n",
 		"scripts/file-size.sh": `printf '%s\n' "$OBJCOPY"` + "\n",
 		"scripts/fragment.sh":  `printf '%s\n' "$HOSTCC"` + "\n",

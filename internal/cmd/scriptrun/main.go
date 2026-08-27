@@ -230,7 +230,7 @@ func runScript(opts scriptRunOptions) error {
 				linkContract = &contract
 			}
 		}
-		if err := installScriptToolProxy(toolDirectory, multicall, name, tool, opts.toolContracts[name], linkContract); err != nil {
+		if _, err := toolaction.InstallToolActionProxy(toolDirectory, multicall, name, tool, opts.toolContracts[name], linkContract); err != nil {
 			return fmt.Errorf("install external tool %s: %w", name, err)
 		}
 	}
@@ -413,81 +413,6 @@ func validateToolContracts(tools, applets map[string]string, contracts map[strin
 	return nil
 }
 
-func installScriptToolProxy(
-	directory, multicall, name, executable string,
-	contract toolaction.Contract,
-	linkContract *toolaction.Contract,
-) error {
-	if err := validateScriptToolName(name); err != nil {
-		return err
-	}
-	contracts := map[string]toolaction.Contract{name: contract}
-	if linkContract != nil {
-		linkRole, ok := toolaction.LinkContractRole(name)
-		if !ok {
-			return fmt.Errorf("tool %q cannot have a driver-link companion contract", name)
-		}
-		contracts[linkRole] = *linkContract
-	}
-	if err := toolaction.Validate(contracts); err != nil {
-		return err
-	}
-	destination := filepath.Join(directory, name)
-	if err := os.Remove(destination); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	var script strings.Builder
-	script.WriteString("#!")
-	script.WriteString(multicall)
-	script.WriteString(" sh\n")
-	if linkContract != nil {
-		script.WriteString("linux_bzl_link=\nlinux_bzl_expect_output=\n")
-		script.WriteString("for linux_bzl_arg do\n")
-		script.WriteString("  if [ -n \"$linux_bzl_expect_output\" ]; then\n")
-		script.WriteString("    linux_bzl_link=1\n    linux_bzl_expect_output=\n    continue\n  fi\n")
-		script.WriteString("  case \"$linux_bzl_arg\" in\n")
-		script.WriteString("    -c|-S|-E|-M|-MM|-fsyntax-only) linux_bzl_link=; break ;;\n")
-		script.WriteString("    -o) linux_bzl_expect_output=1 ;;\n")
-		script.WriteString("    -o?*) linux_bzl_link=1 ;;\n")
-		script.WriteString("  esac\ndone\n")
-		script.WriteString("if [ \"$linux_bzl_link\" = 1 ]; then\n")
-		writeScriptToolContractInvocation(&script, executable, *linkContract, "  ")
-		script.WriteString("fi\n")
-	}
-	writeScriptToolContractInvocation(&script, executable, contract, "")
-	if err := os.WriteFile(destination, []byte(script.String()), 0o700); err != nil {
-		return err
-	}
-	return nil
-}
-
-func writeScriptToolContractInvocation(script *strings.Builder, executable string, contract toolaction.Contract, indent string) {
-	for _, environmentName := range sortedEnvironmentNames(contract.Environment) {
-		script.WriteString(indent)
-		script.WriteString("export ")
-		script.WriteString(environmentName)
-		script.WriteString("=")
-		script.WriteString(shellQuote(contract.Environment[environmentName]))
-		script.WriteByte('\n')
-	}
-	script.WriteString(indent)
-	script.WriteString("exec ")
-	script.WriteString(shellQuote(executable))
-	if len(contract.Arguments) == 0 {
-		script.WriteString(" \"$@\"")
-	} else {
-		for _, argument := range contract.Arguments {
-			if argument == toolaction.KbuildArgumentsSentinel {
-				script.WriteString(" \"$@\"")
-			} else {
-				script.WriteByte(' ')
-				script.WriteString(shellQuote(argument))
-			}
-		}
-	}
-	script.WriteByte('\n')
-}
-
 func decodeReplayManifests(values []string) ([]scriptReplayManifest, error) {
 	if len(values) > maxReplayManifests {
 		return nil, fmt.Errorf("more than %d command replay manifests", maxReplayManifests)
@@ -654,15 +579,6 @@ func installScriptReplayProxy(directory, multicall string, manifest scriptReplay
 		return err
 	}
 	return nil
-}
-
-func sortedEnvironmentNames(environment map[string]string) []string {
-	names := make([]string, 0, len(environment))
-	for name := range environment {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
 }
 
 func shellQuote(value string) string {
