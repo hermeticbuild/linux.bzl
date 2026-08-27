@@ -1,6 +1,7 @@
 import ../.bazelrc.shared
 
-common:remote --extra_execution_platforms=@llvm//:rbe_platform
+# Remote builds execute Linux/x86_64 tools regardless of the client host.
+common:remote --extra_execution_platforms=@llvm//:rbe_linux_x86_64
 
 build:compiler-clang --//:compiler=clang
 build:compiler-gcc --//:compiler=gcc

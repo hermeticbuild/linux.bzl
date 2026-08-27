@@ -25,7 +25,7 @@ jobs:
         include:
           - host: macOS
             runner: macos-latest
-            heap: 4g
+            heap: 6g
           - host: Windows
             runner: windows-latest
             heap: 6g

@@ -12,7 +12,7 @@ bazel_dep(name = "llvm", version = "0.8.14", dev_dependency = True)
 
 bazel_dep(name = "gawk", version = "5.3.2.bcr.3")
 bazel_dep(name = "lz4", version = "1.10.0.bcr.1")
-bazel_dep(name = "openssl", version = "3.3.1.bcr.1")
+bazel_dep(name = "openssl", version = "3.3.1.bcr.9")
 bazel_dep(name = "pahole", version = "1.31")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "rules_cc", version = "0.2.17")
