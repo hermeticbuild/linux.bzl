@@ -51,6 +51,39 @@ func addKbuildOnlyVariables(variables, kbuildVariables map[string]string) map[st
 	return identityVariables
 }
 
+func validateConfiguredKbuildInputs(
+	variables, kbuildVariables map[string]string,
+	targets, preparationTargets []string,
+) error {
+	for _, input := range []struct {
+		name   string
+		values map[string]string
+	}{
+		{name: "-var", values: variables},
+		{name: "-kbuild_var", values: kbuildVariables},
+	} {
+		if err := kconfig.ValidateKbuildOrdinaryVariables(input.name, input.values); err != nil {
+			return err
+		}
+	}
+	for _, input := range []struct {
+		name   string
+		values []string
+	}{
+		{name: "-kbuild_target", values: targets},
+		{name: "-kbuild_prepare_target", values: preparationTargets},
+	} {
+		for index, value := range input.values {
+			if err := kconfig.ValidateKbuildOrdinaryValue(
+				fmt.Sprintf("%s value %d", input.name, index+1), value,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 type linuxCompilerBootstrapPlan struct {
 	plan   *kconfig.ProbePlan
 	target kconfig.ProbeReference
@@ -1275,6 +1308,12 @@ func run() (exitCode int) {
 	flag.Var(&kbuildTargets, "kbuild_target", "Top-level Kbuild goal. May be repeated")
 	flag.Var(&kbuildPreparationTargets, "kbuild_prepare_target", "Top-level Kbuild goal whose source-derived closure is exported through the module SDK. May be repeated")
 	flag.Parse()
+	if err := validateConfiguredKbuildInputs(
+		vars, kbuildVars, []string(kbuildTargets), []string(kbuildPreparationTargets),
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid configured Kbuild input: %v\n", err)
+		return 2
+	}
 
 	selectedPlannerOutput := ""
 	for _, output := range []struct {
@@ -1924,7 +1963,10 @@ func compactMetadata(
 		return nil, err
 	}
 	return tree.CompactMetadataWithOptions(flags, resolveOpts, opts, func(resolved *kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
-		kbuildVars := kbuildVariablesForConfig(vars, tree, resolved)
+		kbuildVars, err := kbuildVariablesForConfig(vars, tree, resolved)
+		if err != nil {
+			return kconfig.CompactConfigGraph{}, err
+		}
 		for name, value := range linuxRootMakeInvocationVariables(rootDir) {
 			if _, configured := kbuildVars[name]; !configured {
 				kbuildVars[name] = value
@@ -2024,8 +2066,9 @@ func evaluatedKbuildProfilesWithGeneratedContent(
 }
 
 const (
-	kbuildEvalSourceTree = "__LINUX_BZL_SOURCE_TREE__"
-	kbuildEvalObjectTree = "__LINUX_BZL_OBJECT_TREE__"
+	kbuildEvalSourceTree    = "__LINUX_BZL_SOURCE_TREE__"
+	kbuildEvalObjectTree    = "__LINUX_BZL_OBJECT_TREE__"
+	kbuildEvalRecursiveMake = kconfig.CompactKbuildRecursiveMakeProvenanceToken
 )
 
 // evaluatedKbuildInvocationProfiles parses the actual Make drivers used for
@@ -2042,10 +2085,25 @@ func evaluatedKbuildInvocationProfiles(
 	bindProbeEnvironment func(map[string]string) (func() error, error),
 	generatedContent kbuildGeneratedContentResolver,
 ) ([]kconfig.CompactKbuildProfile, []kconfig.CompactKbuildSelection, string, error) {
+	if err := validateConfiguredKbuildInputs(variables, nil, entryTargets, preparationTargets); err != nil {
+		return nil, nil, "", fmt.Errorf("configure Kbuild root invocation: %w", err)
+	}
+	for _, input := range []struct {
+		name   string
+		values map[string]string
+	}{
+		{name: "Kbuild root environment", values: baseOptions.EnvironmentVariables},
+		{name: "Kbuild root command line", values: baseOptions.CommandLineVariables},
+	} {
+		if err := kconfig.ValidateKbuildOrdinaryVariables(input.name, input.values); err != nil {
+			return nil, nil, "", fmt.Errorf("configure Kbuild root invocation: %w", err)
+		}
+	}
 	sourceIndex, err := newKbuildInvocationInputIndex(rootDir, objectRoot, baseOptions.SourceRoots)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("index Kbuild source inputs: %w", err)
 	}
+	sourceOverlayDirectories := kbuildFrontierSourceOverlayDirectories(baseOptions.SourceRoots)
 	satisfied := kbuildSatisfiedTargets(sourceIndex)
 	dispatchCommandLine := cloneKbuildVariables(baseOptions.CommandLineVariables)
 	dispatchAutoExport := map[string]bool{}
@@ -2086,9 +2144,12 @@ func evaluatedKbuildInvocationProfiles(
 	// Normalize their potentially physical source-tree spellings once and retain
 	// the resulting immutable environment in kconfig. Each recursive profile then
 	// supplies only its sparse directory, environment, and argv overrides.
-	invocationVariableBase := kconfig.NewKbuildVariableBase(
+	invocationVariableBase, err := kconfig.NewKbuildVariableBaseWithRecursiveMakeDefault(
 		sentinelNormalization.normalizedVariableBase(invocationVariables),
 	)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("configure Kbuild invocation variables: %w", err)
+	}
 	profiles := []kconfig.CompactKbuildProfile{}
 	// GNU Make carries command-line assignments into recursive invocations via
 	// MAKEOVERRIDES, even when a nested $(MAKE) argv does not repeat them. Keep
@@ -2164,6 +2225,7 @@ func evaluatedKbuildInvocationProfiles(
 		options.EnvironmentVariables = profileEnvironment
 		options.VirtualFileView = kbuildFrontierVirtualFileView{
 			state: initialFrontier, directory: processLocation.Directory,
+			sourceOverlayDirectories: sourceOverlayDirectories,
 		}
 		options.CommandLineVariables = make(map[string]string, len(request.variables))
 		for name := range request.variables {
@@ -2194,6 +2256,20 @@ func evaluatedKbuildInvocationProfiles(
 		options.CommandLineVariables["abs_srctree"] = kbuildEvalSourceTree
 		options.CommandLineVariables["objtree"] = kbuildEvalObjectTree
 		options.CommandLineVariables["srctree"] = kbuildEvalSourceTree
+		virtualSourceDirectory := kbuildEvalSourceTree
+		if request.directory != "" {
+			virtualSourceDirectory += "/" + strings.Trim(request.directory, "/")
+		}
+		if kbuildInvocationSourceOverlayPath(virtualSourceDirectory, baseOptions.SourceRoots) {
+			// Linux 6.12 derives src=$(obj) in scripts/Makefile.build. That is
+			// normally correct because M= is both the source and output directory,
+			// but this planner deliberately overlays immutable external sources on
+			// a distinct writable object directory. Keep src on the declared
+			// source mapping while obj and CURDIR retain their object-tree
+			// locations. This is an evaluator-only precedence pin: omitting it
+			// from effectiveCommandLineVariables keeps it out of MAKEOVERRIDES.
+			options.CommandLineVariables["src"] = virtualSourceDirectory
+		}
 		options.SourceRoots = make(map[string]string, len(baseOptions.SourceRoots)+2)
 		for prefix, path := range baseOptions.SourceRoots {
 			options.SourceRoots[prefix] = path
@@ -3152,10 +3228,6 @@ func kbuildInvocationSentinelVariables(rootDir string, base map[string]string, d
 	return values
 }
 
-func kbuildInvocationSentinelValue(rootDir, srcarch, value string) string {
-	return newKbuildInvocationSentinelNormalization(rootDir, srcarch).value(value)
-}
-
 func kbuildInvocationSentinelValueForArch(root, srcarch, value string) string {
 	if root == "" || root == "." {
 		return value
@@ -3580,10 +3652,7 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 				if injectionErr != nil {
 					return nil, fmt.Errorf("evaluate selected target %s target-context paths: %w", item.target, injectionErr)
 				}
-				recursiveInjections := kbuildRecursiveMakeInjections()
-				for _, name := range []string{"MAKE", "Q"} {
-					injections[name] = recursiveInjections[name]
-				}
+				injections["Q"] = ""
 				for _, recipe := range rule.Recipe {
 					expanded, recipeRoles, err := kconfig.EvaluateCompactKbuildTextActionRolesForMakeTarget(
 						profile, item.target, item.makeTarget, automaticTarget, stem,
@@ -3744,6 +3813,19 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 					if invocationErr == nil && len(invocations) != 0 {
 						if stats != nil {
 							stats.RecipeEvaluations++
+						}
+						effects, effectsErr := kbuildSelectedRecipeExecutionEffects(
+							profile, rule, item.target, item.makeTarget, automaticTarget, stem,
+							evaluation.normalMakeTargets, evaluation.orderOnlyMakeTargets, recipe,
+						)
+						if effectsErr != nil {
+							return nil, fmt.Errorf(
+								"interpret selected recursive recipe for %s target %q: %w",
+								profile.Name, item.target, effectsErr,
+							)
+						}
+						for _, effect := range effects {
+							evaluation.materialized = evaluation.materialized || effect.materializesTarget
 						}
 						for _, invocation := range invocations {
 							child := kbuildInvocationProfileName(invocation.request)
@@ -3992,6 +4074,15 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 				continue
 			}
 			if materialized[candidate] && candidateIdentity != consumer {
+				if candidateIdentity.target == consumer.target &&
+					indexes[candidate.profile].initialVisibleArtifactOwnedBy(
+						consumer.target, profiles[consumer.profile].Name, consumer.target,
+					) {
+					// This recursive invocation started after the current action
+					// materialized the same pathname. Its terminal is a successor
+					// overwrite, not a prerequisite of the earlier writer.
+					continue
+				}
 				if nativeActionDependencies[consumer] == nil {
 					nativeActionDependencies[consumer] = map[actionIdentity]bool{}
 				}
@@ -4205,9 +4296,7 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 		if err != nil {
 			return "", false, fmt.Errorf("derive selected producer environment paths: %w", err)
 		}
-		for name, value := range kbuildRecursiveMakeInjections() {
-			environmentInjections[name] = value
-		}
+		environmentInjections["Q"] = ""
 		exportedEnvironment, err := kconfig.EvaluateCompactKbuildTargetEnvironmentForMakeTarget(
 			profile, identity.target, evaluation.lookupTarget, evaluation.automaticTarget, evaluation.stem,
 			evaluation.normalMakeTargets, evaluation.orderOnlyMakeTargets, environmentInjections,
@@ -4408,6 +4497,30 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 				profiles[consumer.profile].Name, artifact.Path, canonical,
 			)
 		}
+		exact := actionIdentity{profile: originProfile, target: producerTarget}
+		if _, selected := selectedLifecycle[exact]; selected {
+			hasDescendant := false
+			materializesBeforeDescendant := false
+			for _, candidate := range ownerActionsByTarget[producerTarget] {
+				if candidate == exact || !invocationDescendsTo(originProfile, producerTarget, candidate.profile) {
+					continue
+				}
+				hasDescendant = true
+				if indexes[candidate.profile].initialVisibleArtifactOwnedBy(
+					artifact.Path, artifact.Profile, artifact.Target,
+				) {
+					materializesBeforeDescendant = true
+					break
+				}
+			}
+			if !hasDescendant || materializesBeforeDescendant {
+				// A visible-artifact record names one exact source-ordered
+				// version. Forward through a same-target recursive descendant only
+				// when no descendant started from this materialized version.
+				visibleArtifactOwnerCache[artifact] = exact
+				return exact, nil
+			}
+		}
 		candidates := []actionIdentity{}
 		ownerCandidates := ownerActionsByTarget[producerTarget]
 		if stats != nil {
@@ -4454,6 +4567,7 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 	generatedObjectTreeArtifactsByAction := map[actionIdentity][]kconfig.CompactKbuildVisibleArtifact{}
 	initialObjectTreeArtifactSetByAction := map[actionIdentity]map[kconfig.CompactKbuildVisibleArtifact]bool{}
 	generatedObjectTreeArtifactSetByAction := map[actionIdentity]map[kconfig.CompactKbuildVisibleArtifact]bool{}
+	generatedObjectTreeReplacementPathsByAction := map[actionIdentity]map[string]bool{}
 	// An opaque compiler include root can observe any already-available header,
 	// but it is not a Make dependency on every selected header that happens to
 	// precede the command. Keep those candidate inputs for same/earlier-stage
@@ -4539,7 +4653,10 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 		}
 		selectedActionsByTarget[identity.target] = append(selectedActionsByTarget[identity.target], identity)
 	}
-	producerCanFeed := func(consumer, producer actionIdentity) bool {
+	producerCanFeedUsing := func(
+		nativeDependencies map[actionIdentity]map[actionIdentity]bool,
+		consumer, producer actionIdentity,
+	) bool {
 		if producer == consumer {
 			return false
 		}
@@ -4563,7 +4680,7 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 				continue
 			}
 			seen[candidate] = true
-			for dependency := range nativeActionDependencies[candidate] {
+			for dependency := range nativeDependencies[candidate] {
 				pending = append(pending, dependency)
 			}
 			for dependency := range invocationActionDependencies[candidate] {
@@ -4571,6 +4688,9 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 			}
 		}
 		return true
+	}
+	producerCanFeed := func(consumer, producer actionIdentity) bool {
+		return producerCanFeedUsing(nativeActionDependencies, consumer, producer)
 	}
 	sortSelectedActionCandidates := func(candidates []actionIdentity) {
 		sort.Slice(candidates, func(i, j int) bool {
@@ -4593,10 +4713,13 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 		sortSelectedActionCandidates(candidates)
 		return candidates
 	}
-	selectedPredecessors := func(consumer actionIdentity) map[actionIdentity]bool {
+	selectedPredecessorsUsing := func(
+		nativeDependencies map[actionIdentity]map[actionIdentity]bool,
+		consumer actionIdentity,
+	) map[actionIdentity]bool {
 		predecessors := map[actionIdentity]bool{}
 		pending := []actionIdentity{}
-		for dependency := range nativeActionDependencies[consumer] {
+		for dependency := range nativeDependencies[consumer] {
 			pending = append(pending, dependency)
 		}
 		for dependency := range invocationActionDependencies[consumer] {
@@ -4609,7 +4732,7 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 				continue
 			}
 			predecessors[candidate] = true
-			for dependency := range nativeActionDependencies[candidate] {
+			for dependency := range nativeDependencies[candidate] {
 				pending = append(pending, dependency)
 			}
 			for dependency := range invocationActionDependencies[candidate] {
@@ -4618,7 +4741,10 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 		}
 		return predecessors
 	}
-	latestSelectedProducerVersions := func(candidates []actionIdentity) []actionIdentity {
+	latestSelectedProducerVersionsUsing := func(
+		candidates []actionIdentity,
+		predecessors func(actionIdentity) map[actionIdentity]bool,
+	) []actionIdentity {
 		if len(candidates) < 2 {
 			return candidates
 		}
@@ -4630,7 +4756,7 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 			if selectedLifecycle[earlier] == "prep" && selectedLifecycle[later] != "prep" {
 				return true
 			}
-			if selectedPredecessors(later)[earlier] {
+			if predecessors(later)[earlier] {
 				return true
 			}
 			// A recursive invocation's initial frontier is the exact completed
@@ -4655,6 +4781,18 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 			}
 		}
 		return latest
+	}
+	latestSelectedProducerVersions := func(candidates []actionIdentity) []actionIdentity {
+		predecessorCache := map[actionIdentity]map[actionIdentity]bool{}
+		predecessors := func(consumer actionIdentity) map[actionIdentity]bool {
+			if cached, ok := predecessorCache[consumer]; ok {
+				return cached
+			}
+			resolved := selectedPredecessorsUsing(nativeActionDependencies, consumer)
+			predecessorCache[consumer] = resolved
+			return resolved
+		}
+		return latestSelectedProducerVersionsUsing(candidates, predecessors)
 	}
 	// Command-head provenance identifies executable producer identities, while
 	// configured compiler mode proves primary object/link outputs cannot be
@@ -4735,6 +4873,217 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 		return bindGeneratedArtifactCandidates(
 			consumer, reference, origin, selectedFeedCandidates(consumer, reference), false,
 		)
+	}
+	// A statically resolved object-tree command head is an exact executable
+	// input, independently of compiler include/search-root observations. Decide
+	// every program owner against a prospective graph first, then apply the
+	// converged edges as one batch. Mutating nativeActionDependencies while
+	// ranging evaluationForAction made ownership depend on Go map order; a
+	// downstream consumer can also learn that a replacement precedes it only
+	// after an upstream consumer's inferred program edge is present.
+	type objectTreeProgramObservation struct {
+		consumer actionIdentity
+		program  string
+	}
+	type objectTreeProgramDecision struct {
+		producer        actionIdentity
+		artifact        kconfig.CompactKbuildVisibleArtifact
+		bound           bool
+		initial         bool
+		replacesInitial bool
+	}
+	programObservations := []objectTreeProgramObservation{}
+	for consumer, evaluation := range evaluationForAction {
+		for _, program := range sortedUniquePaths(evaluation.objectTreePrograms) {
+			programObservations = append(programObservations, objectTreeProgramObservation{
+				consumer: consumer,
+				program:  program,
+			})
+		}
+	}
+	sort.Slice(programObservations, func(i, j int) bool {
+		left := programObservations[i]
+		right := programObservations[j]
+		leftName := profiles[left.consumer.profile].Name
+		rightName := profiles[right.consumer.profile].Name
+		if leftName != rightName {
+			return leftName < rightName
+		}
+		if left.consumer.target != right.consumer.target {
+			return left.consumer.target < right.consumer.target
+		}
+		return left.program < right.program
+	})
+	cloneNativeDependencies := func(source map[actionIdentity]map[actionIdentity]bool) map[actionIdentity]map[actionIdentity]bool {
+		result := make(map[actionIdentity]map[actionIdentity]bool, len(source))
+		for consumer, dependencies := range source {
+			result[consumer] = maps.Clone(dependencies)
+		}
+		return result
+	}
+	ambiguousProgramOwner := func(observation objectTreeProgramObservation, candidates []actionIdentity) error {
+		labels := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			labels = append(labels, profiles[candidate.profile].Name+":"+candidate.target)
+		}
+		sort.Strings(labels)
+		return fmt.Errorf(
+			"Kbuild invocation %q action %q object-tree command program %q resolves to %d selected producers %q",
+			profiles[observation.consumer.profile].Name, observation.consumer.target,
+			observation.program, len(candidates), labels,
+		)
+	}
+	resolveObjectTreeProgramOwners := func() error {
+		baseNativeDependencies := cloneNativeDependencies(nativeActionDependencies)
+		programDecisions := map[objectTreeProgramObservation]objectTreeProgramDecision{}
+		converged := false
+		for round := 0; round <= len(programObservations)+1; round++ {
+			prospectiveNativeDependencies := cloneNativeDependencies(baseNativeDependencies)
+			for observation, decision := range programDecisions {
+				if !decision.bound {
+					continue
+				}
+				if prospectiveNativeDependencies[observation.consumer] == nil {
+					prospectiveNativeDependencies[observation.consumer] = map[actionIdentity]bool{}
+				}
+				prospectiveNativeDependencies[observation.consumer][decision.producer] = true
+			}
+			predecessorCache := map[actionIdentity]map[actionIdentity]bool{}
+			prospectivePredecessors := func(consumer actionIdentity) map[actionIdentity]bool {
+				if cached, ok := predecessorCache[consumer]; ok {
+					return cached
+				}
+				predecessors := selectedPredecessorsUsing(prospectiveNativeDependencies, consumer)
+				predecessorCache[consumer] = predecessors
+				return predecessors
+			}
+			prospectiveProducerCanFeed := func(consumer, producer actionIdentity) bool {
+				if producer == consumer ||
+					selectedLifecycle[consumer] == "prep" && selectedLifecycle[producer] != "prep" {
+					return false
+				}
+				return !prospectivePredecessors(producer)[consumer]
+			}
+			nextDecisions := make(map[objectTreeProgramObservation]objectTreeProgramDecision, len(programObservations))
+			ambiguousDecisions := make(map[objectTreeProgramObservation][]actionIdentity)
+			for _, observation := range programObservations {
+				consumer := observation.consumer
+				program := observation.program
+				visibleIndex := indexes[consumer.profile]
+				if initialArtifact, visible := visibleIndex.initialVisibleArtifact(program); visible {
+					initialOwner, err := resolveVisibleArtifactOwner(consumer, initialArtifact)
+					if err != nil {
+						return err
+					}
+					decision := objectTreeProgramDecision{
+						producer: initialOwner, artifact: initialArtifact, bound: true, initial: true,
+					}
+					hasAlternative := slices.ContainsFunc(selectedActionsByTarget[program], func(candidate actionIdentity) bool {
+						return candidate != initialOwner
+					})
+					if !hasAlternative {
+						nextDecisions[observation] = decision
+						continue
+					}
+					predecessors := prospectivePredecessors(consumer)
+					candidates := []actionIdentity{initialOwner}
+					for _, candidate := range selectedActionsByTarget[program] {
+						// A concrete invocation-start version remains authoritative
+						// over unordered same-path selections. Only a writer which the
+						// prospective selected graph proves runs first can overwrite it.
+						if candidate == initialOwner || !predecessors[candidate] ||
+							selectedLifecycle[consumer] == "prep" && selectedLifecycle[candidate] != "prep" {
+							continue
+						}
+						candidates = append(candidates, candidate)
+					}
+					sortSelectedActionCandidates(candidates)
+					latest := latestSelectedProducerVersionsUsing(candidates, prospectivePredecessors)
+					if len(latest) != 1 {
+						nextDecisions[observation] = objectTreeProgramDecision{}
+						ambiguousDecisions[observation] = latest
+						continue
+					}
+					if latest[0] != initialOwner {
+						decision = objectTreeProgramDecision{
+							producer: latest[0], bound: true, replacesInitial: true,
+							artifact: kconfig.CompactKbuildVisibleArtifact{
+								Path: program, Profile: profiles[latest[0].profile].Name, Target: latest[0].target,
+							},
+						}
+					}
+					nextDecisions[observation] = decision
+					continue
+				}
+				candidates := append([]actionIdentity(nil), selectedActionsByTarget[program]...)
+				candidates = slices.DeleteFunc(candidates, func(candidate actionIdentity) bool {
+					return !prospectiveProducerCanFeed(consumer, candidate)
+				})
+				sortSelectedActionCandidates(candidates)
+				candidates = latestSelectedProducerVersionsUsing(candidates, prospectivePredecessors)
+				if len(candidates) == 0 {
+					nextDecisions[observation] = objectTreeProgramDecision{}
+					continue
+				}
+				if len(candidates) != 1 {
+					nextDecisions[observation] = objectTreeProgramDecision{}
+					ambiguousDecisions[observation] = candidates
+					continue
+				}
+				producer := candidates[0]
+				nextDecisions[observation] = objectTreeProgramDecision{
+					producer: producer, bound: true,
+					artifact: kconfig.CompactKbuildVisibleArtifact{
+						Path: program, Profile: profiles[producer.profile].Name, Target: producer.target,
+					},
+				}
+			}
+			if maps.Equal(programDecisions, nextDecisions) {
+				// An observation can be ambiguous in an early round and become exact
+				// after another observation contributes an inferred predecessor edge.
+				// Fail closed only when the comparable decision state is stable and no
+				// further edge can refine the ambiguity.
+				for _, observation := range programObservations {
+					if candidates := ambiguousDecisions[observation]; len(candidates) != 0 {
+						return ambiguousProgramOwner(observation, candidates)
+					}
+				}
+				programDecisions = nextDecisions
+				converged = true
+				break
+			}
+			programDecisions = nextDecisions
+		}
+		if !converged {
+			return fmt.Errorf("object-tree program ownership did not converge after %d decisions", len(programObservations))
+		}
+		for _, observation := range programObservations {
+			decision := programDecisions[observation]
+			if !decision.bound {
+				continue
+			}
+			selectedNonIncludeActions[decision.producer] = true
+			if err := bindObjectTreeArtifact(observation.consumer, decision.producer, decision.artifact, false); err != nil {
+				return err
+			}
+			byAction := generatedObjectTreeArtifactsByAction
+			seenByAction := generatedObjectTreeArtifactSetByAction
+			if decision.initial {
+				byAction = initialObjectTreeArtifactsByAction
+				seenByAction = initialObjectTreeArtifactSetByAction
+			}
+			appendObjectTreeArtifact(byAction, seenByAction, observation.consumer, decision.artifact)
+			if decision.replacesInitial {
+				if generatedObjectTreeReplacementPathsByAction[observation.consumer] == nil {
+					generatedObjectTreeReplacementPathsByAction[observation.consumer] = map[string]bool{}
+				}
+				generatedObjectTreeReplacementPathsByAction[observation.consumer][observation.program] = true
+			}
+			evaluation := evaluationForAction[observation.consumer]
+			evaluation.objectTreeSnapshot = true
+			evaluationForAction[observation.consumer] = evaluation
+		}
+		return nil
 	}
 	// Kconfig replay supplies these projections independently of selected
 	// Kbuild actions and of a recursive invocation's initial generated-file
@@ -4896,6 +5245,13 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 		}
 		evaluationForAction[consumer] = evaluation
 	}
+	// Exact object-tree and compiler-include edges above are part of program
+	// provenance. Resolve command-head owners only after those strong edges are
+	// present, so a selected same-path overwrite can supersede an invocation-
+	// start executable deterministically.
+	if err := resolveObjectTreeProgramOwners(); err != nil {
+		return nil, err
+	}
 
 	// Exact include edges above are independent of opaque-root availability and
 	// must be established for every consumer before predecessor closure is
@@ -4909,7 +5265,7 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 			continue
 		}
 		visibleIndex := indexes[consumer.profile]
-		predecessors := selectedPredecessors(consumer)
+		predecessors := selectedPredecessorsUsing(nativeActionDependencies, consumer)
 		predecessorCandidatesByTarget := map[string][]actionIdentity{}
 		for candidate := range predecessors {
 			if stats != nil {
@@ -5117,6 +5473,13 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 		for _, artifact := range indexes[consumer.profile].matchingInitialVisibleArtifacts(
 			references, evaluation.objectTreeAllVisible,
 		) {
+			if generatedObjectTreeReplacementPathsByAction[consumer][artifact.Path] {
+				// Exact command-head arbitration proved that a selected writer
+				// replaces this invocation-start version before the consumer runs.
+				// A later opaque/all-visible snapshot must not reintroduce the stale
+				// same-path executable alongside its replacement.
+				continue
+			}
 			producer, err := resolveVisibleArtifactOwner(consumer, artifact)
 			if err != nil {
 				return nil, err
@@ -6215,15 +6578,6 @@ func (resolver *kbuildProfileTargetSatisfaction) targetIsSatisfied(target string
 	return current
 }
 
-func kbuildProfileTargetIsSatisfiedIndexed(
-	profile kconfig.CompactKbuildProfile,
-	index *kbuildProfileTargetIndex,
-	target string,
-	satisfied map[string]bool,
-) bool {
-	return newKbuildProfileTargetSatisfaction(profile, index, satisfied).targetIsSatisfied(target)
-}
-
 func (index *kbuildProfileTargetIndex) generatedKind(target string) string {
 	return index.generated[target]
 }
@@ -7113,10 +7467,7 @@ func kbuildSelectedRecipeExecutionEffects(
 	// the external source root derived from M=.
 	delete(injections, "abs_output")
 	delete(injections, "srcroot")
-	recursiveInjections := kbuildRecursiveMakeInjections()
-	for _, name := range []string{"MAKE", "Q"} {
-		injections[name] = recursiveInjections[name]
-	}
+	injections["Q"] = ""
 	lineRule := rule
 	lineRule.Recipe = []string{recipe}
 	templates, err := kconfig.EvaluateCompactKbuildCommandTemplatesSymbolicForMakeTarget(
@@ -7359,10 +7710,27 @@ func kbuildEvaluatedRecipeExecutionEffects(
 			}
 			scriptEnvironment = cloneKbuildVariables(scriptEnvironment)
 			replayScriptEnvironment = cloneKbuildVariables(replayScriptEnvironment)
-			scriptEnvironment["MAKE"] = "__LINUX_BZL_MAKE__"
+			effectiveMake, makeErr := kconfig.EvaluateCompactKbuildTextSymbolicForMakeTarget(
+				profile, target, lookupTarget, automaticTarget, stem,
+				rule.Prerequisites, rule.OrderOnly, injections, "$(MAKE)",
+			)
+			if makeErr != nil {
+				return nil, fmt.Errorf("evaluate source-script MAKE: %w", makeErr)
+			}
+			resolvedMake, makeErr := kconfig.ResolveCompactKbuildTargetSymbolicText(
+				profile, target, effectiveMake,
+			)
+			if makeErr != nil {
+				return nil, fmt.Errorf("resolve source-script MAKE: %w", makeErr)
+			}
+			// A script may reference MAKE even when the Make frontend did not add
+			// its default to the exported environment. Project the profile's actual
+			// effective value: private provenance is carried only when it survived
+			// normal Make precedence into this target context.
+			scriptEnvironment["MAKE"] = effectiveMake
 			scriptEnvironment["srctree"] = kbuildEvalSourceTree
 			scriptEnvironment["objtree"] = kbuildEvalObjectTree
-			replayScriptEnvironment["MAKE"] = "__LINUX_BZL_MAKE__"
+			replayScriptEnvironment["MAKE"] = resolvedMake
 			replayScriptEnvironment["srctree"] = kbuildEvalSourceTree
 			replayScriptEnvironment["objtree"] = kbuildEvalObjectTree
 		}
@@ -7391,7 +7759,23 @@ func kbuildEvaluatedRecipeExecutionEffects(
 			}
 			recursive = recursive || len(nested) != 0
 		}
-		if !recursive && !kbuildRecipeOnlyCreatesDirectories(segment) && kconfig.CompactKbuildRecipeWritesTarget(segment, recipeTarget) {
+		declaredSourceScriptWriter := slices.ContainsFunc(scripts, func(script kconfig.CompactKbuildSourceScript) bool {
+			declared := slices.Contains(rule.Prerequisites, script.Path) || slices.Contains(rule.OrderOnly, script.Path)
+			if !declared {
+				return false
+			}
+			if kconfig.CompactKbuildRecipeWritesTarget(script.Content, recipeTarget) {
+				return true
+			}
+			// Linux's terminal link driver owns vmlinux internally rather than
+			// receiving $@ or a shell redirection from its Make recipe. Keep that
+			// explicit source ABI narrow: merely declaring any other validation
+			// script is not evidence that it writes the rule target.
+			return kconfig.CanonicalKbuildGraphTarget(recipeTarget) == "vmlinux" &&
+				pathpkg.Clean(script.Path) == "scripts/link-vmlinux.sh"
+		})
+		if !kbuildRecipeOnlyCreatesDirectories(segment) &&
+			(declaredSourceScriptWriter || !recursive && kconfig.CompactKbuildRecipeWritesTarget(segment, recipeTarget)) {
 			effects = append(effects, kbuildRecipeExecutionEffect{
 				materializesTarget: true,
 				command:            segment,
@@ -7477,14 +7861,14 @@ func kbuildRecursiveMakeInvocationsAt(
 ) ([]kbuildRecursiveMakeInvocation, error) {
 	commands, _, err := kbuildShellSimpleCommands(command)
 	if err != nil {
-		if strings.Contains(command, "__LINUX_BZL_MAKE__") {
+		if strings.Contains(command, kbuildEvalRecursiveMake) {
 			return nil, err
 		}
 		return nil, nil
 	}
 	invocations := []kbuildRecursiveMakeInvocation{}
 	for _, simple := range commands {
-		if len(simple.argv) == 0 || strings.TrimLeft(simple.argv[0], "+@-") != "__LINUX_BZL_MAKE__" {
+		if len(simple.argv) == 0 || strings.TrimLeft(simple.argv[0], "+@-") != kbuildEvalRecursiveMake {
 			continue
 		}
 		replay := append([]string(nil), simple.argv[1:]...)
@@ -7502,31 +7886,22 @@ func kbuildRecursiveMakeInvocationsAt(
 		if err != nil {
 			return nil, err
 		}
+		// The child profile must retain the private MAKE capability, but runtime
+		// replay argv is serialized into an ActionRecipe and must match the
+		// lowered script, where every proven private occurrence names the replay
+		// proxy. Printable lookalikes are ordinary bytes and remain unchanged.
+		for replayIndex, argument := range replay {
+			replay[replayIndex] = strings.ReplaceAll(
+				argument,
+				kbuildEvalRecursiveMake,
+				kconfig.CompactKbuildRecursiveMakeReplayName,
+			)
+		}
 		invocations = append(invocations, kbuildRecursiveMakeInvocation{
 			request: request, replayArguments: replay,
 		})
 	}
 	return invocations, nil
-}
-
-// kbuildRecursiveMakeInvocationsForReplayAt keeps the request which is fed
-// back into Kbuild evaluation symbolic while binding the argv that an eventual
-// recursive Make action executes to its exact replay value. Probe-backed
-// compiler flags must remain symbolic in the child request so a downstream
-// probe reconstructs the same dependency DAG during discovery and replay.
-func kbuildRecursiveMakeInvocationsForReplayAt(
-	command, replayCommand string,
-	parentLocation kconfig.CompactKbuildInvocationLocation,
-) ([]kbuildRecursiveMakeInvocation, error) {
-	invocations, err := kbuildRecursiveMakeInvocationsAt(command, parentLocation)
-	if err != nil {
-		return nil, err
-	}
-	replayInvocations, err := kbuildRecursiveMakeInvocationsAt(replayCommand, parentLocation)
-	if err != nil {
-		return nil, err
-	}
-	return kbuildBindRecursiveMakeReplayArguments(invocations, replayInvocations)
 }
 
 func kbuildBindRecursiveMakeReplayArguments(
@@ -7692,7 +8067,7 @@ func expandKbuildSourceScriptEnvironment(line string, environment map[string]str
 		}
 		value, known := environment[name]
 		if name == "MAKE" {
-			value, known, selectedMake = "__LINUX_BZL_MAKE__", true, true
+			selectedMake = selectedMake || known && strings.Contains(value, kbuildEvalRecursiveMake)
 		}
 		if !known || form == '(' && name != "MAKE" {
 			expanded.WriteString(line[index:end])
@@ -7821,27 +8196,6 @@ func validateKbuildTraversalTarget(profile, origin, target string) error {
 		"Kbuild profile %q produced an implausibly long %s (%d bytes; prefix %q; suffix %q)",
 		profile, origin, len(target), prefix, suffix,
 	)
-}
-
-func kbuildRecursiveMakeInjections() map[string]string {
-	// Q is Kbuild's optional echo-suppression prefix (usually empty or @).
-	// It has no bearing on the child Make argv, and retaining an unresolved
-	// $(Q) prefix would hide the otherwise exact MAKE sentinel from discovery.
-	return map[string]string{
-		"MAKE":    "__LINUX_BZL_MAKE__",
-		"Q":       "",
-		"objtree": kbuildEvalObjectTree,
-		"srctree": kbuildEvalSourceTree,
-	}
-}
-
-// kbuildSelectedRecipeUsesObjectTree recognizes the stable object-root
-// spelling carried by the evaluated Make recipe. This is execution evidence,
-// not a compiler- or target-name heuristic: only actions whose source-selected
-// argv or environment can observe the invocation's object tree consume its
-// initial visible-artifact frontier as a strong dependency.
-func kbuildSelectedRecipeUsesObjectTree(value string) bool {
-	return kconfig.ObserveCompactKbuildObjectTree(value).ObservesObjectTree
 }
 
 // kbuildSelectedRecipeObjectTreeReferences extracts canonical paths rooted in
@@ -8958,16 +9312,19 @@ func kbuildInvocationSourceOverlayRequest(
 }
 
 func kbuildInvocationSourceOverlayPath(virtual string, sourceRoots map[string]string) bool {
-	virtual = filepath.ToSlash(strings.Trim(virtual, "/"))
-	for rawPrefix := range sourceRoots {
-		prefix := filepath.ToSlash(strings.Trim(rawPrefix, "/"))
-		if !strings.HasPrefix(prefix, kbuildEvalSourceTree+"/") {
-			continue
+	virtual = filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(virtual))))
+	prefix := kbuildEvalSourceTree + "/"
+	if !strings.HasPrefix(virtual, prefix) {
+		return false
+	}
+	directory := kconfig.CanonicalKbuildGraphTarget(strings.TrimPrefix(virtual, prefix))
+	if directory == "" || directory == "." {
+		return false
+	}
+	for _, overlay := range kbuildFrontierSourceOverlayDirectories(sourceRoots) {
+		if directory == overlay || strings.HasPrefix(directory, overlay+"/") {
+			return true
 		}
-		if virtual != prefix && !strings.HasPrefix(virtual, prefix+"/") {
-			continue
-		}
-		return true
 	}
 	return false
 }
@@ -9203,13 +9560,13 @@ func kbuildRecursiveMakeRequestAt(
 ) (kbuildInvocationRequest, bool, error) {
 	commands, _, err := kbuildShellSimpleCommands(command)
 	if err != nil {
-		if strings.Contains(command, "__LINUX_BZL_MAKE__") {
+		if strings.Contains(command, kbuildEvalRecursiveMake) {
 			return kbuildInvocationRequest{}, false, err
 		}
 		return kbuildInvocationRequest{}, false, nil
 	}
 	for _, simple := range commands {
-		if len(simple.argv) == 0 || strings.TrimLeft(simple.argv[0], "+@-") != "__LINUX_BZL_MAKE__" {
+		if len(simple.argv) == 0 || strings.TrimLeft(simple.argv[0], "+@-") != kbuildEvalRecursiveMake {
 			continue
 		}
 		request, err := kbuildRecursiveMakeRequestArgvAt(simple.argv[1:], simple.assignments, parentLocation)
@@ -9967,7 +10324,7 @@ func readToolsetIdentity(root string) (string, error) {
 	return name, nil
 }
 
-func kbuildVariablesForConfig(base map[string]string, tree *kconfig.Tree, config *kconfig.ResolvedConfig) map[string]string {
+func kbuildVariablesForConfig(base map[string]string, tree *kconfig.Tree, config *kconfig.ResolvedConfig) (map[string]string, error) {
 	// scripts/Kbuild.include defines this before the architecture Makefile is
 	// evaluated by Kbuild. Kbuild action planning starts at that Makefile.
 	vars := map[string]string{"comma": ","}
@@ -9981,7 +10338,10 @@ func kbuildVariablesForConfig(base map[string]string, tree *kconfig.Tree, config
 		}
 		vars[key] = kbuildConfigValue(tree, key, value)
 	}
-	return vars
+	if err := kconfig.ValidateKbuildOrdinaryVariables("resolved Kbuild configuration", vars); err != nil {
+		return nil, err
+	}
+	return vars, nil
 }
 
 func workspacePath(path string) string {

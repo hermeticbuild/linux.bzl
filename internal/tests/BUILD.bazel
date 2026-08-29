@@ -3,9 +3,230 @@ load(":linux_external_module_test.bzl", "linux_external_module_test")
 load(":linux_image_name_test.bzl", "linux_image_name_test")
 load(":mapped_kernel_toolset_test.bzl", "mapped_kernel_backend_test", "mapped_kernel_exec_python_test", "mapped_kernel_host_dependency_validation_test", "mapped_kernel_path_validation_test", "mapped_kernel_requirement_validation_test", "mapped_kernel_toolset_test")
 load(":probe_map_directory_test.bzl", "probe_map_directory_path_rendering_test", "probe_map_directory_test", "probe_map_directory_validation_test")
+load(":rust_toolchain_test.bzl", "fake_rust_guard_toolchain", "rust_toolchain_execution_platform_guard_test")
 load(":script_runtime_toolchain_test.bzl", "script_runtime_toolchain_test")
 
 package(default_visibility = ["//visibility:private"])
+
+toolchain_type(
+    name = "rust_guard_pin_toolchain_type",
+    visibility = ["//visibility:public"],
+)
+
+toolchain_type(
+    name = "rust_guard_second_pin_toolchain_type",
+    visibility = ["//visibility:public"],
+)
+
+constraint_setting(name = "rust_guard_execution_slot")
+
+constraint_value(
+    name = "rust_guard_first_slot",
+    constraint_setting = ":rust_guard_execution_slot",
+)
+
+constraint_value(
+    name = "rust_guard_second_slot",
+    constraint_setting = ":rust_guard_execution_slot",
+)
+
+constraint_value(
+    name = "rust_guard_fallback_slot",
+    constraint_setting = ":rust_guard_execution_slot",
+)
+
+platform(
+    name = "rust_guard_first_platform",
+    allowed_toolchain_types = [
+        ":rust_guard_pin_toolchain_type",
+        "@rules_rs//rs:bindgen_toolchain_type",
+        "@rules_rust//rust:toolchain_type",
+        "@rules_rust//rust/rust_analyzer:toolchain_type",
+    ],
+    check_toolchain_types = True,
+    constraint_values = [
+        ":rust_guard_first_slot",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+platform(
+    name = "rust_guard_second_platform",
+    allowed_toolchain_types = [
+        ":rust_guard_second_pin_toolchain_type",
+        "@rules_rs//rs:bindgen_toolchain_type",
+        "@rules_rust//rust:toolchain_type",
+        "@rules_rust//rust/rust_analyzer:toolchain_type",
+    ],
+    check_toolchain_types = True,
+    constraint_values = [
+        ":rust_guard_second_slot",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+platform(
+    name = "rust_guard_fallback_platform",
+    constraint_values = [
+        ":rust_guard_fallback_slot",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+fake_rust_guard_toolchain(
+    name = "rust_guard_pin_toolchain_impl",
+    marker = "first",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "rust_guard_pin_toolchain",
+    exec_compatible_with = [":rust_guard_first_slot"],
+    toolchain = ":rust_guard_pin_toolchain_impl",
+    toolchain_type = ":rust_guard_pin_toolchain_type",
+)
+
+fake_rust_guard_toolchain(
+    name = "rust_guard_second_pin_toolchain_impl",
+    marker = "second-pin",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "rust_guard_second_pin_toolchain",
+    exec_compatible_with = [":rust_guard_second_slot"],
+    toolchain = ":rust_guard_second_pin_toolchain_impl",
+    toolchain_type = ":rust_guard_second_pin_toolchain_type",
+)
+
+fake_rust_guard_toolchain(
+    name = "rust_guard_first_rust_toolchain_impl",
+    marker = "first",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "rust_guard_first_rust_toolchain",
+    exec_compatible_with = [":rust_guard_first_slot"],
+    target_compatible_with = [":rust_guard_first_slot"],
+    toolchain = ":rust_guard_first_rust_toolchain_impl",
+    toolchain_type = "@rules_rust//rust:toolchain_type",
+)
+
+fake_rust_guard_toolchain(
+    name = "rust_guard_rust_toolchain_impl",
+    marker = "second",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "rust_guard_rust_toolchain",
+    exec_compatible_with = [":rust_guard_second_slot"],
+    target_compatible_with = [":rust_guard_second_slot"],
+    toolchain = ":rust_guard_rust_toolchain_impl",
+    toolchain_type = "@rules_rust//rust:toolchain_type",
+)
+
+fake_rust_guard_toolchain(
+    name = "rust_guard_cross_rust_toolchain_impl",
+    marker = "cross-platform",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "rust_guard_cross_rust_toolchain",
+    exec_compatible_with = [":rust_guard_fallback_slot"],
+    target_compatible_with = [":rust_guard_second_slot"],
+    toolchain = ":rust_guard_cross_rust_toolchain_impl",
+    toolchain_type = "@rules_rust//rust:toolchain_type",
+)
+
+fake_rust_guard_toolchain(
+    name = "rust_guard_first_rust_source_toolchain_impl",
+    marker = "first-source",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "rust_guard_first_rust_source_toolchain",
+    exec_compatible_with = [":rust_guard_first_slot"],
+    target_compatible_with = [":rust_guard_first_slot"],
+    toolchain = ":rust_guard_first_rust_source_toolchain_impl",
+    toolchain_type = "@rules_rust//rust/rust_analyzer:toolchain_type",
+)
+
+fake_rust_guard_toolchain(
+    name = "rust_guard_rust_source_toolchain_impl",
+    marker = "second-source",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "rust_guard_rust_source_toolchain",
+    exec_compatible_with = [":rust_guard_second_slot"],
+    target_compatible_with = [":rust_guard_second_slot"],
+    toolchain = ":rust_guard_rust_source_toolchain_impl",
+    toolchain_type = "@rules_rust//rust/rust_analyzer:toolchain_type",
+)
+
+fake_rust_guard_toolchain(
+    name = "rust_guard_cross_rust_source_toolchain_impl",
+    marker = "cross-source",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "rust_guard_cross_rust_source_toolchain",
+    exec_compatible_with = [":rust_guard_fallback_slot"],
+    target_compatible_with = [":rust_guard_second_slot"],
+    toolchain = ":rust_guard_cross_rust_source_toolchain_impl",
+    toolchain_type = "@rules_rust//rust/rust_analyzer:toolchain_type",
+)
+
+fake_rust_guard_toolchain(
+    name = "rust_guard_first_bindgen_toolchain_impl",
+    marker = "first-bindgen",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "rust_guard_first_bindgen_toolchain",
+    exec_compatible_with = [":rust_guard_first_slot"],
+    target_compatible_with = [":rust_guard_first_slot"],
+    toolchain = ":rust_guard_first_bindgen_toolchain_impl",
+    toolchain_type = "@rules_rs//rs:bindgen_toolchain_type",
+)
+
+fake_rust_guard_toolchain(
+    name = "rust_guard_bindgen_toolchain_impl",
+    marker = "second-bindgen",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "rust_guard_bindgen_toolchain",
+    exec_compatible_with = [":rust_guard_second_slot"],
+    target_compatible_with = [":rust_guard_second_slot"],
+    toolchain = ":rust_guard_bindgen_toolchain_impl",
+    toolchain_type = "@rules_rs//rs:bindgen_toolchain_type",
+)
+
+fake_rust_guard_toolchain(
+    name = "rust_guard_cross_bindgen_toolchain_impl",
+    marker = "cross-bindgen",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "rust_guard_cross_bindgen_toolchain",
+    exec_compatible_with = [":rust_guard_fallback_slot"],
+    target_compatible_with = [":rust_guard_second_slot"],
+    toolchain = ":rust_guard_cross_bindgen_toolchain_impl",
+    toolchain_type = "@rules_rs//rs:bindgen_toolchain_type",
+)
 
 host_cc_toolchain_test(name = "host_cc_toolchain_test")
 
@@ -30,5 +251,7 @@ probe_map_directory_test(name = "probe_map_directory_test")
 probe_map_directory_path_rendering_test(name = "probe_map_directory_path_rendering_test")
 
 probe_map_directory_validation_test(name = "probe_map_directory_validation_test")
+
+rust_toolchain_execution_platform_guard_test(name = "rust_toolchain_execution_platform_guard_test")
 
 script_runtime_toolchain_test(name = "script_runtime_toolchain_test")

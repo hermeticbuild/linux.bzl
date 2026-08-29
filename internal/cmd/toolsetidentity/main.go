@@ -17,10 +17,6 @@ func readManifest(path string) (toolsetManifest, error) {
 	return toolaction.ReadKbuildToolsetManifest(path)
 }
 
-func validateManifest(manifest toolsetManifest) error {
-	return manifest.Validate()
-}
-
 func manifestIdentity(manifest toolsetManifest) (string, error) {
 	return manifest.Identity()
 }

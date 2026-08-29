@@ -7,12 +7,12 @@ bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "gcc_toolchain", version = "0.12.0")
 bazel_dep(name = "linux.bzl", version = "0.0.1")
-bazel_dep(name = "llvm", version = "0.8.14", repo_name = "hermetic_llvm")
+bazel_dep(name = "llvm", version = "0.8.18", repo_name = "hermetic_llvm")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "rules_cc", version = "0.2.17")
 bazel_dep(name = "rules_go", version = "0.62.0")
 bazel_dep(name = "rules_qemu", version = "0.3.0")
-bazel_dep(name = "rules_rs", version = "0.0.102")
+bazel_dep(name = "rules_rs", version = "0.0.107")
 
 single_version_override(
     module_name = "gcc_toolchain",
@@ -25,7 +25,7 @@ single_version_override(
     module_name = "llvm",
     patch_strip = 1,
     patches = ["//patches:llvm_kbuild_actions.patch"],
-    version = "0.8.14",
+    version = "0.8.18",
 )
 
 single_version_override(
@@ -80,7 +80,7 @@ rust_toolchains.toolchain(
 )
 use_repo(rust_toolchains, "default_rust_toolchains")
 
-register_toolchains("@default_rust_toolchains//:all")
+register_toolchains("@default_rust_toolchains//...")
 
 bindgen_toolchains = use_extension("@rules_rs//rs:rules_rust_bindgen.bzl", "rules_rust_bindgen")
 use_repo(bindgen_toolchains, "rules_rust_bindgen")

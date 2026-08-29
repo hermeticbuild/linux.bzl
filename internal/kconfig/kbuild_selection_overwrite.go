@@ -20,6 +20,25 @@ type compactKbuildOverwriteEdge struct {
 	path   string
 }
 
+// compactKbuildSelectionOwnsPath reports whether selection is one of the
+// source-selected writers registered for path. Grouped output peers share one
+// physical recipe, so any member owns every path published by that recipe.
+func (g *compactKbuildSelectionGraph) compactKbuildSelectionOwnsPath(
+	selection compactKbuildSelectionKey,
+	target string,
+) bool {
+	if g == nil {
+		return false
+	}
+	target = canonicalKbuildRulePath(target)
+	for _, owner := range g.outputOwnersByPath[target] {
+		if g.compactKbuildSelectionsShareProducer(selection, owner) {
+			return true
+		}
+	}
+	return false
+}
+
 // compactKbuildRegisterOutputOwners records every exact selected writer of a
 // logical output, including opaque side outputs whose Path is not the selected
 // target. Registration happens before materialization order is computed.

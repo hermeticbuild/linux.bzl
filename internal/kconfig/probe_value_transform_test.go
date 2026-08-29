@@ -169,6 +169,8 @@ func TestPureKbuildMakeFunctionMatchesGNUEmptyAndPercentEdges(t *testing.T) {
 		{"patsubst", []string{"%", "x%y%", "a"}, "xay%"},
 		{"patsubst", []string{"%.c", "", "a.c b.c z"}, "z"},
 		{"suffix", []string{"a.c b"}, ".c"},
+		{"addprefix", []string{"-i ", "one.symvers two.symvers"}, "-i one.symvers -i two.symvers"},
+		{"addsuffix", []string{" .stamp", "one two"}, "one .stamp two .stamp"},
 	}
 	for _, test := range tests {
 		got, recognized, err := evalPureKbuildMakeFunction(test.function, test.arguments, "original")

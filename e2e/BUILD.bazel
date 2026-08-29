@@ -198,7 +198,31 @@ linux_cc_module(
 linux_cc_module(
     name = "hello_c_module_6_12_96_modversions",
     srcs = ["hello_module.c"],
+    hdrs = ["hello_module_local.h"],
+    copts = ["-DLINUX_BZL_SRCVERSION_LOCAL_HEADER_E2E"],
     kernel = "@e2e_6_12_96_x86_64//variants/modversions:kernel",
+)
+
+linux_cc_module(
+    name = "exported_symbol_provider_6_12_96",
+    srcs = ["exported_symbol_provider.c"],
+    kernel = "@e2e_6_12_96_x86_64//variants/modversions:kernel",
+)
+
+linux_cc_module(
+    name = "exported_symbol_second_provider_6_12_96",
+    srcs = ["exported_symbol_second_provider.c"],
+    kernel = "@e2e_6_12_96_x86_64//variants/modversions:kernel",
+)
+
+linux_cc_module(
+    name = "exported_symbol_consumer_6_12_96",
+    srcs = ["exported_symbol_consumer.c"],
+    kernel = "@e2e_6_12_96_x86_64//variants/modversions:kernel",
+    deps = [
+        ":exported_symbol_provider_6_12_96",
+        ":exported_symbol_second_provider_6_12_96",
+    ],
 )
 
 linux_cc_module(
@@ -233,6 +257,7 @@ build_test(
     targets = [
         "@e2e_6_12_96_x86_64//variants/modversions:kernel",
         "@e2e_6_12_96_x86_64//variants/modversions:modules",
+        ":exported_symbol_consumer_6_12_96",
         ":hello_c_module_6_12_96_modversions",
     ],
 )

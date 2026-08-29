@@ -24,6 +24,33 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
+const (
+	// compactKbuildRecursiveMakeMarker is the printable spelling which may occur
+	// as ordinary source-owned data. Source parsing protects it exactly like the
+	// public tree sentinels so it can survive action-template serialization.
+	compactKbuildRecursiveMakeMarker = "__LINUX_BZL_MAKE__"
+
+	// CompactKbuildRecursiveMakeProvenanceToken is evaluator-owned provenance for
+	// GNU Make's injected MAKE variable. It must never be accepted from source
+	// text or reach an action recipe. Keeping it distinct from the printable
+	// marker prevents Make expansion from manufacturing a recursive-build
+	// capability by concatenating ordinary source strings.
+	CompactKbuildRecursiveMakeProvenanceToken = "\x05linux-bzl-recursive-make\x06"
+
+	// CompactKbuildRecursiveMakeReplayName is the runtime proxy spelling which
+	// replaces trusted recursive-Make provenance when an action recipe is
+	// serialized. Analysis keeps the private token in invocation variables;
+	// stored replay argv uses this exact public spelling so it matches the
+	// lowered script without leaking authority bytes.
+	CompactKbuildRecursiveMakeReplayName = "make"
+
+	compactKbuildPrivateProvenanceBytes = "\x05\x06"
+)
+
+func compactKbuildContainsPrivateProvenanceByte(value string) bool {
+	return strings.ContainsAny(value, compactKbuildPrivateProvenanceBytes)
+}
+
 type compactKbuildRulePlanBuilder struct {
 	metadata                     *CompactMetadata
 	plan                         *ActionPlan
@@ -552,7 +579,23 @@ var compactKbuildFinalizeRootedActionRecipeReplacer = strings.NewReplacer(
 
 func compactKbuildFinalizeRootedActionRecipeText(value string) string {
 	value = compactKbuildCollapseActionRootJoins(value)
+	value = compactKbuildCollapseEmbeddedActionObjectRoots(value)
 	return compactKbuildFinalizeRootedActionRecipeReplacer.Replace(value)
+}
+
+// compactKbuildCollapseEmbeddedActionObjectRoots interprets an object-rooted
+// automatic variable used as a path component. GNU Make commonly constructs
+// side outputs as $(literal_directory)/$@.suffix; the literal directory owns
+// that resulting graph path, so the private root carried by $@ is redundant.
+// A leading marker remains intact and continues to select the object tree.
+func compactKbuildCollapseEmbeddedActionObjectRoots(value string) string {
+	for _, marker := range []string{
+		compactKbuildActionObjectTreeMarker,
+		compactKbuildActionAbsoluteObjectTreeMarker,
+	} {
+		value = strings.ReplaceAll(value, "/"+marker+"/", "/")
+	}
+	return value
 }
 
 // compactKbuildCollapseActionRootJoins applies path algebra to roots injected
@@ -591,7 +634,8 @@ func compactKbuildCollapseActionRootJoins(value string) string {
 // offsets have been assembled.
 func protectCompactKbuildSourceLiteralActionMarkers(value string) (string, error) {
 	if strings.Contains(value, compactKbuildLiteralTreeEscapeByte) ||
-		strings.Contains(value, compactKbuildLiteralSentinelEscapeByte) {
+		strings.Contains(value, compactKbuildLiteralSentinelEscapeByte) ||
+		compactKbuildContainsPrivateProvenanceByte(value) {
 		return "", fmt.Errorf("source action text contains a reserved literal-marker byte")
 	}
 	var protected strings.Builder
@@ -625,6 +669,7 @@ func protectCompactKbuildSourceLiteralActionMarkers(value string) (string, error
 			"__LINUX_BZL_SOURCE_TREE__",
 			"__LINUX_BZL_OBJECT_TREE__",
 			linuxProbeHostDepsSentinel,
+			compactKbuildRecursiveMakeMarker,
 		} {
 			if !strings.HasPrefix(value[index:], sentinel) {
 				continue
@@ -647,27 +692,6 @@ func protectCompactKbuildSourceLiteralActionMarkers(value string) (string, error
 func compactKbuildContainsProtectedLiteralActionMarker(value string) bool {
 	return strings.Contains(value, compactKbuildLiteralTreeEscapeByte) ||
 		strings.Contains(value, compactKbuildLiteralSentinelEscapeByte)
-}
-
-func evaluateCompactKbuildRuleVariables(
-	target string,
-	match compactKbuildRuleMatch,
-	inputs []compactKbuildRuleInput,
-	injected map[string]string,
-	names ...string,
-) (map[string]string, error) {
-	automatic, err := compactKbuildRuleAutomaticEvaluationContext(target, match, inputs)
-	if err != nil {
-		return nil, err
-	}
-	values, err := evaluateCompactKbuildRecipeVariablesForMakeTarget(
-		match.profile, target, match.lookupTarget, automatic.target, automatic.stem, automatic.normal, automatic.order,
-		injected, names...,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return values, nil
 }
 
 func evaluateCompactKbuildRuleVariablesRooted(
@@ -1051,12 +1075,16 @@ type compactKbuildRuleInput struct {
 	// objectTree distinguishes an immutable configured-object-tree projection
 	// from an ordinary immutable source. Both use Bazel source edges, while
 	// $(obj) and $(src) remain distinct namespaces during Make evaluation.
-	objectTree bool
-	orderOnly  bool
+	objectTree       bool
+	orderOnly        bool
+	overwriteLineage bool
 	// workingOnly marks an ancestor materialized solely so a source-owned
 	// script sees the complete writable object-tree closure. It remains a real
 	// action input, but it is not a native Make prerequisite of this rule and
-	// therefore must not participate in producer-lineage queries.
+	// therefore must not participate in producer-lineage queries. An exact
+	// source-ordered overwrite predecessor is also staged through the writable
+	// tree, but overwriteLineage keeps that byte-state edge distinguishable from
+	// the incidental closure.
 	workingOnly bool
 }
 
@@ -1425,7 +1453,7 @@ func (b *compactKbuildRulePlanBuilder) buildResolved(
 				return "", fmt.Errorf("Kbuild overwrite predecessor %s does not publish logical path %q", compactKbuildSelectionKeyString(overwrite.producer), overwrite.path)
 			}
 			alreadyBound := false
-			for _, input := range inputs {
+			for index, input := range inputs {
 				if input.path != overwrite.path {
 					continue
 				}
@@ -1435,12 +1463,14 @@ func (b *compactKbuildRulePlanBuilder) buildResolved(
 						overwrite.path, compactKbuildSelectionKeyString(b.selection),
 					)
 				}
+				inputs[index].overwriteLineage = true
 				alreadyBound = true
 				break
 			}
 			if !alreadyBound {
 				inputs = append(inputs, compactKbuildRuleInput{
-					path: overwrite.path, producer: producer, slot: slot, workingOnly: true,
+					path: overwrite.path, producer: producer, slot: slot,
+					workingOnly: true, overwriteLineage: true,
 				})
 			}
 		}
@@ -2211,7 +2241,7 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 	if err != nil {
 		return "", err
 	}
-	needsCompound := compactKbuildRecipeHasPipeline(commands) || archiveCompound ||
+	needsCompound := compactKbuildRecipeHasPipeline(commands) || compactKbuildRecipeHasRecursiveMake(commands) || archiveCompound ||
 		compactKbuildContainsProtectedLiteralActionMarker(rootedTemplate)
 	if !needsCompound {
 		atomicRecipe, atomicErr := compactKbuildRecipeRequiresAtomicExecution(target, match, commands)
@@ -2243,6 +2273,12 @@ func compactKbuildRecipeHasPipeline(commands []compactKbuildRecipeCommand) bool 
 		}
 	}
 	return false
+}
+
+func compactKbuildRecipeHasRecursiveMake(commands []compactKbuildRecipeCommand) bool {
+	return slices.ContainsFunc(commands, func(command compactKbuildRecipeCommand) bool {
+		return command.program == CompactKbuildRecursiveMakeProvenanceToken
+	})
 }
 
 // compactKbuildRecipeTextHasShellGroup recognizes an unquoted, standalone
@@ -3986,7 +4022,22 @@ func compactKbuildCompoundCompilerOutputs(
 				"compound compiler command %d source inputs: %w", commandIndex, err,
 			)
 		}
-		analysis, err := analyzeCompactKbuildCompilerOutputs(profile, role, projected.arguments, knownGraphOutputs...)
+		includeArguments := slices.Clone(projected.arguments)
+		includeObjectRoot := typedObjectRoot
+		if includeObjectRoot == "" {
+			includeObjectRoot = "."
+		}
+		projected.arguments, err = rewriteCompactKbuildCompilerRelativeIncludes(
+			profile, role, includeObjectRoot, projected.arguments,
+		)
+		if err != nil {
+			return compactKbuildCompoundCompilerOutputAnalysis{}, fmt.Errorf(
+				"compound compiler command %d include paths: %w", commandIndex, err,
+			)
+		}
+		analysis, err := analyzeCompactKbuildCompilerOutputsWithIncludeProvenance(
+			profile, role, projected.arguments, includeArguments, knownGraphOutputs...,
+		)
 		if err != nil {
 			return compactKbuildCompoundCompilerOutputAnalysis{}, fmt.Errorf("compound compiler command %d outputs: %w", commandIndex, err)
 		}
@@ -4226,6 +4277,7 @@ func restoreCompactKbuildLiteralActionMarkers(value string) (string, []int, erro
 				"__LINUX_BZL_SOURCE_TREE__",
 				"__LINUX_BZL_OBJECT_TREE__",
 				linuxProbeHostDepsSentinel,
+				compactKbuildRecursiveMakeMarker,
 			} {
 				if strings.HasPrefix(restored, sentinel) {
 					valid = true
@@ -4241,6 +4293,16 @@ func restoreCompactKbuildLiteralActionMarkers(value string) (string, []int, erro
 		}
 	}
 	return out.String(), offsets, nil
+}
+
+// RestoreCompactKbuildLiteralActionMarkers decodes source-authored marker
+// spellings after recipe placeholder expansion. Action environments retain
+// the protected form through serialization so literal ${tree:...} data cannot
+// be mistaken for a tree capability and literal planner sentinels cannot be
+// mistaken for evaluator provenance.
+func RestoreCompactKbuildLiteralActionMarkers(value string) (string, error) {
+	restored, _, err := restoreCompactKbuildLiteralActionMarkers(value)
+	return restored, err
 }
 
 func replaceCompactKbuildTreePathPrefix(value, marker, replacement string) string {
@@ -4319,6 +4381,62 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildCompoundWithSideEffect
 	return b.buildHermeticKbuildScriptContext(
 		target, match, inputs, template, commands, sideEffectCommands,
 	)
+}
+
+// compactKbuildHermeticExactSourceOperandInputs stages immutable files named
+// directly by a statically discovered hermetic command's argv or stdin. The
+// source tree remains available to the planner for discovery, but scriptrun
+// executes below a private writable root; a relative operand therefore needs
+// its own exact WorkingInput instead of relying on a typed TreeArtifact binding
+// which is not copied into that root.
+func (b *compactKbuildRulePlanBuilder) compactKbuildHermeticExactSourceOperandInputs(
+	profile CompactKbuildProfile,
+	inputs []compactKbuildRuleInput,
+	commands []compactKbuildRecipeCommand,
+	ruleOutputs ...string,
+) ([]compactKbuildRuleInput, error) {
+	outputSet := make(map[string]bool, len(ruleOutputs))
+	for _, output := range ruleOutputs {
+		if output = canonicalKbuildRulePath(output); output != "" {
+			outputSet[output] = true
+		}
+	}
+	inputSet := make(map[string]bool, len(inputs))
+	for _, input := range inputs {
+		if inputPath := canonicalKbuildRulePath(input.path); inputPath != "" {
+			inputSet[inputPath] = true
+		}
+	}
+	for commandIndex, command := range commands {
+		fields := append([]string(nil), command.arguments...)
+		if command.stdin != "" {
+			fields = append(fields, command.stdin)
+		}
+		for _, field := range fields {
+			candidate, ok := compactKbuildProfileCommandOperandPath(profile, field)
+			candidate = canonicalKbuildRulePath(candidate)
+			if !ok || candidate == "" || outputSet[candidate] || inputSet[candidate] {
+				continue
+			}
+			evidence, err := b.sourcePathEvidence(candidate)
+			if err != nil {
+				return nil, fmt.Errorf("hermetic command %d source operand %q: %w", commandIndex, candidate, err)
+			}
+			if !evidence.exists {
+				continue
+			}
+			var inputIndex int
+			inputs, inputIndex, err = b.ensureCommandInput(inputs, candidate, true)
+			if err != nil {
+				return nil, fmt.Errorf("hermetic command %d source operand %q: %w", commandIndex, candidate, err)
+			}
+			if inputIndex < 0 || inputIndex >= len(inputs) {
+				return nil, fmt.Errorf("hermetic command %d source operand %q has no exact input binding", commandIndex, candidate)
+			}
+			inputSet[candidate] = true
+		}
+	}
+	return inputs, nil
 }
 
 func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
@@ -4400,11 +4518,18 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 			}
 		}
 	}
+	directMakeReplay := compactKbuildRecipeHasRecursiveMake(compilerCommands)
 	if compoundCommands != nil {
 		executionDirectory, objectRoot, err = compactKbuildTypedPrivateExecution(match.profile)
 		if err != nil {
 			return "", fmt.Errorf("atomic compound typed invocation execution: %w", err)
 		}
+	}
+	inputs, err = b.compactKbuildHermeticExactSourceOperandInputs(
+		match.profile, inputs, compilerCommands, compactKbuildRecipeRuleOutputs(target, match)...,
+	)
+	if err != nil {
+		return "", fmt.Errorf("hermetic script exact source inputs: %w", err)
 	}
 	compilerOutputs, err := compactKbuildCompoundCompilerOutputs(
 		match.profile, b.plan, b.metadata, target, match, inputs, objectRoot, template, compilerCommands,
@@ -4566,25 +4691,38 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 		return "", fmt.Errorf("hermetic script exported environment: %w", err)
 	}
 	replayTargets := append([]string{target, match.lookupTarget}, compactKbuildRecipeRuleOutputs(target, match)...)
-	commandReplays, err := compactKbuildSourceScriptCommandReplays(match.profile, replayTargets...)
+	commandReplays, err := b.compactKbuildSourceScriptCommandReplays(match.profile, target, replayTargets...)
 	if err != nil {
 		return "", fmt.Errorf("hermetic script recursive replay: %w", err)
 	}
-	if environmentUsage.uses("MAKE") {
+	if environmentUsage.uses("MAKE") || directMakeReplay {
 		makeValue := environment["MAKE"]
 		switch {
 		case len(commandReplays) != 0 &&
-			(makeValue == "__LINUX_BZL_MAKE__" || makeValue == commandReplays[0].Name):
-			environment["MAKE"] = commandReplays[0].Name
-		case makeValue == "__LINUX_BZL_MAKE__":
+			(makeValue == "" || makeValue == CompactKbuildRecursiveMakeProvenanceToken || makeValue == commandReplays[0].Name):
+			if makeValue != "" || environmentUsage.uses("MAKE") {
+				environment["MAKE"] = commandReplays[0].Name
+			}
+		case makeValue == CompactKbuildRecursiveMakeProvenanceToken:
 			return "", fmt.Errorf("hermetic script reads recursive MAKE but has no discovered replay")
 		case len(commandReplays) != 0:
 			return "", fmt.Errorf(
 				"hermetic script recursive replay has unexpected MAKE value %q", makeValue,
 			)
+		default:
+			return "", fmt.Errorf("hermetic script invokes recursive Make but has no discovered replay")
+		}
+		if directMakeReplay {
+			// The marker is evaluator provenance, including inside Kbuild's saved
+			// command text. Source-authored identical bytes were protected before
+			// Make expansion and therefore cannot collide with this replacement.
+			template = strings.ReplaceAll(template, CompactKbuildRecursiveMakeProvenanceToken, commandReplays[0].Name)
 		}
 	} else {
 		commandReplays = nil
+		if environment["MAKE"] == CompactKbuildRecursiveMakeProvenanceToken {
+			delete(environment, "MAKE")
+		}
 	}
 	// Stage solving derives object-tree visibility from this exact evaluated
 	// recipe. Preserve the same frontier when argv lowering falls back to a
@@ -4645,6 +4783,7 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 		return "", err
 	}
 	if strings.Contains(script, "${work:root}") ||
+		compactKbuildContainsPrivateProvenanceByte(script) ||
 		strings.Contains(script, compactKbuildActionSourceTreeMarker) ||
 		strings.Contains(script, compactKbuildActionObjectTreeMarker) ||
 		strings.Contains(script, compactKbuildActionAbsoluteObjectTreeMarker) ||
@@ -5293,7 +5432,7 @@ func (b *compactKbuildRulePlanBuilder) buildDirectFilechkRecipe(
 		compound := "{\n" + rootedTemplate + "\n} > " + compactKbuildActionObjectTreeMarker + "/" + target
 		return b.buildHermeticKbuildScriptContext(target, match, inputs, compound, programs, programs)
 	}
-	if compactKbuildRecipeHasPipeline(commands) || compactKbuildContainsProtectedLiteralActionMarker(rootedTemplate) {
+	if compactKbuildRecipeHasPipeline(commands) || compactKbuildRecipeHasRecursiveMake(commands) || compactKbuildContainsProtectedLiteralActionMarker(rootedTemplate) {
 		// filechk owns the combined stdout of its source-defined command body.
 		// Preserve a live pipeline and capture that stream inside the same staged
 		// object tree instead of serializing it through intermediate actions.
@@ -5370,17 +5509,25 @@ func compactKbuildProfileSourceOverlayProjections(profile CompactKbuildProfile) 
 		if err != nil || canonical != prefix {
 			continue
 		}
-		root, err := filepath.Abs(rawRoot)
-		if err != nil {
-			continue
-		}
-		physical := []string{filepath.ToSlash(filepath.Clean(root))}
-		if resolved, resolveErr := filepath.EvalSymlinks(root); resolveErr == nil {
-			resolved = filepath.ToSlash(filepath.Clean(resolved))
-			if resolved != physical[0] {
-				physical = append(physical, resolved)
+		physicalSet := map[string]bool{}
+		addPhysical := func(root string) {
+			root = filepath.ToSlash(filepath.Clean(root))
+			if root != "" && root != "." && root != "/" {
+				physicalSet[root] = true
 			}
 		}
+		// Bazel passes TreeArtifact paths to an action using their execroot-
+		// relative spelling. Filesystem functions may retain that spelling or
+		// resolve it to an absolute/symlink-resolved path, so all three are the
+		// same declared root provenance.
+		addPhysical(rawRoot)
+		if root, absErr := filepath.Abs(rawRoot); absErr == nil {
+			addPhysical(root)
+			if resolved, resolveErr := filepath.EvalSymlinks(root); resolveErr == nil {
+				addPhysical(resolved)
+			}
+		}
+		physical := slices.Sorted(maps.Keys(physicalSet))
 		projections = append(projections, compactKbuildSourceOverlayProjection{
 			virtual: sourceRoot + "/" + canonical, prefix: canonical, physical: physical,
 		})
@@ -5394,10 +5541,11 @@ func compactKbuildProfileSourceOverlayProjections(profile CompactKbuildProfile) 
 	return projections
 }
 
-// replaceCompactKbuildCanonicalRoot replaces a complete root or one followed
-// by a slash. This also covers assignment words such as M=<root> while leaving
-// a longer pathname component which merely shares the root's byte prefix
-// untouched.
+// replaceCompactKbuildCanonicalRoot replaces a complete path root. The match
+// must begin at a token/path boundary and end at the root or a slash. This also
+// covers assignments and joined compiler path options such as M=<root> and
+// -I<root>, while leaving a pathname component which merely contains the
+// execroot-relative spelling untouched.
 func replaceCompactKbuildCanonicalRoot(value, root, replacement string) string {
 	if root == "" || !strings.Contains(value, root) {
 		return value
@@ -5412,7 +5560,8 @@ func replaceCompactKbuildCanonicalRoot(value, root, replacement string) string {
 		start := cursor + relative
 		end := start + len(root)
 		out.WriteString(value[cursor:start])
-		if end == len(value) || value[end] == '/' {
+		if compactKbuildCanonicalRootLeadingBoundary(value, start) &&
+			compactKbuildCanonicalRootTrailingBoundary(value, end) {
 			out.WriteString(replacement)
 		} else {
 			out.WriteString(root)
@@ -5420,6 +5569,32 @@ func replaceCompactKbuildCanonicalRoot(value, root, replacement string) string {
 		cursor = end
 	}
 	return out.String()
+}
+
+func compactKbuildCanonicalRootTrailingBoundary(value string, end int) bool {
+	if end == len(value) || value[end] == '/' {
+		return true
+	}
+	// This function operates on evaluated Make/recipe text, before shell words
+	// are split. Closing quotes, shell connectors, list delimiters, and closing
+	// grouping characters terminate an exact pathname just as whitespace does.
+	return strings.ContainsRune(" \t\r\n\"'=,:;|&)]}>", rune(value[end]))
+}
+
+func compactKbuildCanonicalRootLeadingBoundary(value string, start int) bool {
+	if start == 0 {
+		return true
+	}
+	if strings.ContainsRune(" \t\r\n\"'=,:;|&(<>{[", rune(value[start-1])) {
+		return true
+	}
+	// Compiler and linker drivers commonly join a directory to an option
+	// (-I<dir>, -L<dir>, -B<dir>). Find the current shell/assignment field and
+	// accept only a flag-shaped prefix; an ordinary component such as
+	// notexternal/linux-source must not grant root provenance.
+	prefixStart := strings.LastIndexAny(value[:start], " \t\r\n\"'=,:;|&(<>{[") + 1
+	prefix := value[prefixStart:start]
+	return strings.HasPrefix(prefix, "-") && !strings.ContainsAny(prefix, "/\\")
 }
 
 // compactKbuildProfileCanonicalSourceOverlayRoots preserves the graph prefix
@@ -5563,19 +5738,27 @@ type compactKbuildCanonicalRecipeRoot struct {
 
 func compactKbuildCanonicalRecipeRoots(sourceRoots map[string]string) []compactKbuildCanonicalRecipeRoot {
 	lexical := map[string]compactKbuildCanonicalRecipeRootKind{}
+	add := func(root string, kind compactKbuildCanonicalRecipeRootKind) {
+		root = filepath.ToSlash(filepath.Clean(strings.TrimSpace(root)))
+		if root == "" || root == "." || root == "/" {
+			return
+		}
+		if previous, ok := lexical[root]; !ok || kind > previous {
+			lexical[root] = kind
+		}
+	}
 	for name, rawRoot := range sourceRoots {
 		kind := compactKbuildCanonicalRecipeRootSource
 		if name == "__LINUX_BZL_OBJECT_TREE__" {
 			kind = compactKbuildCanonicalRecipeRootObject
 		} else if name == linuxProbeHostDepsSentinel {
 			kind = compactKbuildCanonicalRecipeRootHostDeps
-		}
-		root := rawRoot
-		if absolute, err := filepath.Abs(root); err == nil {
-			root = absolute
-		}
-		root = filepath.ToSlash(filepath.Clean(root))
-		if root == "" || root == "." || root == "/" {
+		} else if name != "__LINUX_BZL_SOURCE_TREE__" {
+			// Nested external source overlays are projected by
+			// compactKbuildProfileCanonicalSourceOverlayRoots, which retains
+			// their graph prefix. Other independently declared roots (notably
+			// RUST_LIB_SRC) have their own action input identity and must never
+			// be collapsed onto the kernel tree.
 			continue
 		}
 		// A planning checkout commonly represents both trees with the same
@@ -5583,8 +5766,12 @@ func compactKbuildCanonicalRecipeRoots(sourceRoots map[string]string) []compactK
 		// rendered through the injected ${tree:prep} variables. The explicit
 		// kind ordering also makes the otherwise-degenerate host/object overlap
 		// deterministic.
-		if previous, ok := lexical[root]; !ok || kind > previous {
-			lexical[root] = kind
+		// Keep the declared spelling as well as its absolute form. Bazel action
+		// arguments are normally execroot-relative, while realpath and symlink
+		// traversal can produce an absolute spelling of the same root.
+		add(rawRoot, kind)
+		if absolute, err := filepath.Abs(rawRoot); err == nil {
+			add(absolute, kind)
 		}
 	}
 
@@ -6669,11 +6856,6 @@ func compactKbuildSourceProjectionOperands(program string, arguments []string) (
 	return operands, true
 }
 
-func compactKbuildRecipeExplicitOutput(command compactKbuildRecipeCommand) (string, bool) {
-	output, ok, err := compactKbuildRecipeExplicitOutputForProfile(CompactKbuildProfile{}, command)
-	return output, ok && err == nil
-}
-
 func compactKbuildCommandCompilerRole(command compactKbuildRecipeCommand) (string, bool) {
 	role := command.programToolRole
 	if role == "" {
@@ -7029,6 +7211,9 @@ func appendCompactKbuildRecipeInput(
 }
 
 func compactKbuildRuleInputEdgeRole(input compactKbuildRuleInput, fallback string) string {
+	if input.overwriteLineage {
+		return compactKbuildOverwriteInputRole
+	}
 	if input.workingOnly {
 		return compactKbuildWorkingClosureInputRole
 	}
@@ -7286,19 +7471,29 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 		if err := b.annotateSourceActionRoles(&command); err != nil {
 			return "", fmt.Errorf("command %d configured action-role provenance: %w", commandIndex, err)
 		}
+		exactResponseFile := compactKbuildCommandUsesExactResponseFile(match.profile, command, available)
 		compilerOutputs := compactKbuildCompilerOutputAnalysis{}
 		compilerOutputsAnalyzed := false
+		compilerIncludeArguments := []string(nil)
 		if command.programToolRole == "cc" || command.programToolRole == "cxx" || command.programToolRole == "bindgen" {
+			compilerObjectRoot := "."
+			if exactResponseFile {
+				_, compilerObjectRoot, err = compactKbuildTypedPrivateExecution(match.profile)
+				if err != nil {
+					return "", fmt.Errorf("command %d compiler response-file execution: %w", commandIndex, err)
+				}
+			}
+			compilerIncludeArguments = slices.Clone(command.arguments)
 			command.arguments, err = rewriteCompactKbuildCompilerRelativeIncludes(
-				match.profile, command.programToolRole, command.arguments,
+				match.profile, command.programToolRole, compilerObjectRoot, command.arguments,
 			)
 			if err != nil {
 				return "", fmt.Errorf("command %d compiler include paths: %w", commandIndex, err)
 			}
 		}
 		if command.programToolRole == "cc" || command.programToolRole == "cxx" {
-			compilerOutputs, err = analyzeCompactKbuildCompilerOutputs(
-				match.profile, command.programToolRole, command.arguments, ruleOutputs...,
+			compilerOutputs, err = analyzeCompactKbuildCompilerOutputsWithIncludeProvenance(
+				match.profile, command.programToolRole, command.arguments, compilerIncludeArguments, ruleOutputs...,
 			)
 			if err != nil {
 				return "", fmt.Errorf("command %d compiler outputs: %w", commandIndex, err)
@@ -7438,7 +7633,7 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 			tool = "generated"
 		}
 		typedOpaqueProgram := tool == "generated"
-		typedResponseFile := !sourceScript && compactKbuildCommandUsesExactResponseFile(match.profile, command, available)
+		typedResponseFile := !sourceScript && exactResponseFile
 		if typedOpaqueProgram || typedResponseFile {
 			typedExecutionDirectory, typedObjectRoot, err = compactKbuildTypedPrivateExecution(match.profile)
 			if err != nil {
@@ -7734,7 +7929,7 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 			scriptInvocation.toolRoles = append(scriptInvocation.toolRoles, environmentRoles...)
 			sort.Strings(scriptInvocation.toolRoles)
 			scriptInvocation.toolRoles = slices.Compact(scriptInvocation.toolRoles)
-			recipe.CommandReplays, err = compactKbuildSourceScriptCommandReplays(match.profile, target)
+			recipe.CommandReplays, err = b.compactKbuildSourceScriptCommandReplays(match.profile, target, target)
 			if err != nil {
 				return "", fmt.Errorf("command %d source-script recursive replay: %w", commandIndex, err)
 			}
@@ -7750,6 +7945,8 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 			}
 			if len(recipe.CommandReplays) != 0 {
 				recipe.Environment["MAKE"] = recipe.CommandReplays[0].Name
+			} else if recipe.Environment["MAKE"] == CompactKbuildRecursiveMakeProvenanceToken {
+				delete(recipe.Environment, "MAKE")
 			}
 			recipe.AuxiliaryTools = scriptInvocation.auxiliaryToolRoles(runtimeApplets)
 			node.AuxiliaryTools = slices.Clone(recipe.AuxiliaryTools)
@@ -8309,6 +8506,28 @@ func (b *compactKbuildRulePlanBuilder) ensureCommandProgramInput(
 	return b.ensureCommandInput(inputs, programPath, true)
 }
 
+// immutableSourceExecutableProjectionRecipe is the one generic action contract
+// which turns an immutable source file into a Bazel-executable private copy.
+// Terminal provenance checks share this exact contract with its producer so a
+// source-tagged compiler output or compound action cannot masquerade as the
+// source program which owns a side output.
+func immutableSourceExecutableProjectionRecipe() ActionRecipe {
+	return ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "copy", Tool: "actionfile",
+		Arguments: []string{"-input", "${source:program:00000000}", "-out", "${output:00000000}"},
+		Sources:   []string{"program:00000000"}, Outputs: []string{"00000000"},
+	}
+}
+
+func isImmutableSourceExecutableProjectionRecipe(recipe ActionRecipe) bool {
+	actual, err := recipe.CanonicalJSON()
+	if err != nil {
+		return false
+	}
+	expected, err := immutableSourceExecutableProjectionRecipe().CanonicalJSON()
+	return err == nil && bytes.Equal(actual, expected)
+}
+
 func (b *compactKbuildRulePlanBuilder) materializeSourceExecutable(sourcePath string) (string, error) {
 	// Source files are not executable inputs by themselves under Bazel. Stage a
 	// private executable copy no later than its consumer: ordinary prep/target
@@ -8330,12 +8549,7 @@ func (b *compactKbuildRulePlanBuilder) materializeSourceExecutable(sourcePath st
 		Sources: []ActionPlanSourceEdge{{Role: "program", SourceID: sourceID}},
 		Outputs: []ActionPlanOutput{{Tree: stage, Path: sourcePath}},
 	}
-	recipe := ActionRecipe{
-		Schema: LinuxKernelPlanSchema, Kind: "copy", Tool: "actionfile",
-		Arguments: []string{"-input", "${source:program:00000000}", "-out", "${output:00000000}"},
-		Sources:   []string{"program:00000000"}, Outputs: []string{"00000000"},
-	}
-	return appendActionPlanNode(b.plan, node, recipe)
+	return appendActionPlanNode(b.plan, node, immutableSourceExecutableProjectionRecipe())
 }
 
 func (b *compactKbuildRulePlanBuilder) ensureOptionalCommandInput(
@@ -8379,6 +8593,11 @@ func compactKbuildProfileCommandOperandPath(profile CompactKbuildProfile, value 
 func compactKbuildCommandPath(value string) (string, bool) {
 	// Target-context evaluation uses private control-byte tree roots so Make
 	// path algebra cannot confuse injected roots with source-authored literals.
+	// An automatic variable can appear beneath a literal output directory, for
+	// example $(OUT_RELOCS)/$@.relocs. In that form the private object root is a
+	// path component, not the owner of the whole path; remove only that embedded
+	// component before projecting leading roots into the public namespace.
+	value = compactKbuildCollapseEmbeddedActionObjectRoots(value)
 	// Command lookup is the graph boundary: project those private roots back to
 	// the public sentinel namespace before classifying source versus generated
 	// executables and canonicalizing their graph paths.
@@ -9774,43 +9993,6 @@ func evaluatedKbuildRuleCommands(
 		return nil, false, nil
 	}
 	return selections, true, nil
-}
-
-func evaluatedKbuildRuleCommandTemplate(
-	target string,
-	match compactKbuildRuleMatch,
-	automatic compactKbuildAutomaticContext,
-	command string,
-) (string, bool, error) {
-	parser, cleanup, err := compactKbuildTargetParserWithExportsForLookup(
-		match.profile, target, match.lookupTarget, automatic.target, automatic.stem,
-		automatic.normal, automatic.order, nil, true, false,
-	)
-	if err != nil {
-		return "", false, err
-	}
-	defer cleanup()
-	preserveUnsupportedKbuildRecipeShell(parser, match.profile, target)
-	name := "cmd_" + command
-	if _, defined := parser.lookupVariable(name); !defined {
-		// Resolution tests and incomplete discovery fixtures may intentionally
-		// omit the command definition. Preserve the selected source call so the
-		// eventual lowering site reports that missing template; only a defined,
-		// empty variable is a Kbuild-selected no-op.
-		return "", false, nil
-	}
-	value, ok, err := parser.expandVariable(name, "$("+name+")", 0)
-	if err != nil {
-		return "", true, fmt.Errorf("target %q profile %q variable %s: %w", target, match.profile.Name, name, err)
-	}
-	if !ok {
-		return "", true, nil
-	}
-	value, err = parser.resolveKbuildSymbolic(value)
-	if err != nil {
-		return "", true, fmt.Errorf("target %q profile %q variable %s symbolic result: %w", target, match.profile.Name, name, err)
-	}
-	return value, true, nil
 }
 
 // kbuildRecipeCommandExpressions extracts the ordered command arguments from

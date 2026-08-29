@@ -3,6 +3,13 @@
 visibility("//internal/...")
 
 EXECUTION_ROOT_MARKER = "__LINUX_BZL_EXECROOT__"
+DEFAULT_DIRECTORY_ARGUMENT_MARKER = "__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__"
+
+def default_directory_action_argument(option, anchor):
+    """Encodes a configured option whose default value is an artifact dirname."""
+    if len(option) == 2 or not option.startswith("--") or "=" in option or any([character in option for character in " /\\\t\r\n".elems()]):
+        fail("configured default directory option is invalid: %r" % option)
+    return DEFAULT_DIRECTORY_ARGUMENT_MARKER + option + "=" + anchor.path
 
 def _validate_path(value, what):
     if not value or value.startswith("/") or value.endswith("/") or "\\" in value:

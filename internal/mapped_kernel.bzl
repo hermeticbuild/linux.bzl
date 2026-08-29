@@ -21,12 +21,11 @@ load(":providers.bzl", "LinuxKernelInfo", "LinuxModuleSdkInfo", "LinuxModuleTree
 load(
     ":rust_toolchain.bzl",
     "execution_bindgen_toolchain",
+    "execution_bindgen_toolchain_attr",
     "execution_rust_source_toolchain",
+    "execution_rust_source_toolchain_attr",
     "execution_rust_toolchain",
-    "optional_bindgen_toolchain_type",
-    "optional_rust_analyzer_toolchain_type",
-    "optional_rust_toolchain_type",
-    "target_rust_toolchain",
+    "execution_rust_toolchain_attr",
 )
 load(":script_runtime_toolchain.bzl", "SCRIPT_RUNTIME_TOOLCHAIN_TYPE", "script_runtime_toolchain")
 load(
@@ -34,6 +33,7 @@ load(
     _EXECUTION_ROOT_MARKER = "EXECUTION_ROOT_MARKER",
     _add_rendered_toolchain_action_value = "add_rendered_toolchain_action_value",
     _canonicalize_toolchain_action_value = "canonicalize_toolchain_action_value",
+    _default_directory_action_argument = "default_directory_action_argument",
     _render_toolchain_action_value = "render_toolchain_action_value",
     _toolchain_action_path_index = "toolchain_action_path_index",
     _toolchain_action_path_index_from_list = "toolchain_action_path_index_from_list",
@@ -193,7 +193,7 @@ def _canonical_file_path(file, what):
 def _record_canonical_file(files, file, what):
     canonical = _canonical_file_path(file, what)
     existing = files.get(canonical)
-    if existing != None and existing != file and existing.path != file.path:
+    if existing != None and (existing != file or existing.path != file.path):
         fail("%s %s (%s) collides with distinct artifact %s (%s) at canonical path %r" % (
             what,
             file,
@@ -208,6 +208,9 @@ def _record_canonical_file(files, file, what):
 # Test seam for Bazel's sibling-repository path spelling.
 def linux_test_canonical_file_path(path, short_path):
     return _canonical_file_path_values(path, short_path, "test artifact")
+
+def linux_test_filtered_toolchain_closure_files(base, additional, scope = "test"):
+    return _filtered_toolchain_closure_files(base, additional, scope)
 
 def _source_input_namespace_names(directory_name, additional_params):
     namespaces = {directory_name: True}
@@ -797,6 +800,13 @@ def _companion_tool_bindings(tools, binding, current_scope = "target"):
 def linux_test_companion_tool_bindings(tools, role, current_scope = "target"):
     return _companion_tool_bindings(tools, role, current_scope)
 
+def _node_uses_runtime_toolset(kind, role, auxiliary_tools):
+    """Whether a mapped recipe can execute source-selected toolchain tools."""
+    return not (kind == "copy" and role == "actionfile" and not auxiliary_tools)
+
+def linux_test_node_uses_runtime_toolset(kind, role, auxiliary_tools = None):
+    return _node_uses_runtime_toolset(kind, role, auxiliary_tools or {})
+
 def _render_toolchain_action_contracts(additional_params, tools):
     roles = {}
     prefix = "action_arg_count_"
@@ -973,10 +983,11 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
             inputs.append(source.file)
         for key in sorted(bindings):
             inputs.append(bindings[key])
-        selected_scopes = {scope: True}
+        uses_runtime_toolset = _node_uses_runtime_toolset(kind, role, node["tools"])
+        selected_scopes = {scope: True} if uses_runtime_toolset else {}
         for descriptor in node["tools"].values():
             selected_scopes[descriptor.scope] = True
-        runtime_tools = _runtime_tool_bindings(tools, scope, selected_scopes)
+        runtime_tools = _runtime_tool_bindings(tools, scope, selected_scopes) if uses_runtime_toolset else {}
         for runtime_role, runtime_tool in sorted(runtime_tools.items()):
             _add_artifact_path(args, "-runtime_tool", runtime_tool, format = runtime_role + "=%s")
         for slot in sorted(node["outputs"]):
@@ -1475,18 +1486,43 @@ def _execution_python_runtime(toolchain, scope):
         fail("Linux %s toolset requires an execution-platform Python interpreter" % scope)
     return _hermetic_python_runtime(interpreter[platform_common.ToolchainInfo], scope)
 
-def _filtered_toolchain_closure(base_closures, additional, scope):
-    """Uses the base toolset artifact for canonical duplicates in a closure."""
-    files = {}
-    for closure in base_closures:
-        for file in closure.to_list():
-            _record_canonical_file(files, file, "%s base toolchain closure" % scope)
+def _filtered_toolchain_closure_files(base, additional, scope):
+    merged_files = {}
+    for file in base:
+        _record_canonical_file(merged_files, file, "%s merged toolchain closure" % scope)
     additional_files = {}
-    for file in additional.to_list():
+    for file in additional:
         canonical = _canonical_file_path(file, "%s additional toolchain closure" % scope)
-        if canonical not in files:
+        already_present = canonical in merged_files
+        _record_canonical_file(merged_files, file, "%s merged toolchain closure" % scope)
+        if not already_present:
             additional_files[canonical] = file
-    return depset(direct = [additional_files[path] for path in sorted(additional_files)])
+
+    # Exact duplicate Files can appear through more than one provider edge and
+    # are already retained by the base depsets. A distinct configured artifact
+    # at the same canonical path is not interchangeable: allowing the base File
+    # to win would make toolset identity cover different bytes from the selected
+    # executable passed separately to map_directory.
+    return [additional_files[path] for path in sorted(additional_files)]
+
+def _filtered_toolchain_closure(base_closures, additional, scope):
+    """Adds only exact/disjoint artifacts and rejects ambiguous path overlap."""
+    base = []
+    for closure in base_closures:
+        base.extend(closure.to_list())
+    return depset(direct = _filtered_toolchain_closure_files(base, additional.to_list(), scope))
+
+def _rust_sysroot_files(rust, scope):
+    files = getattr(rust, "sysroot_files", None)
+    if files != None:
+        return files
+
+    # Custom providers predating the split may already expose a Rust-only
+    # all_files closure. Ambiguous overlap still fails in the strict merge.
+    files = getattr(rust, "all_files", None)
+    if files == None:
+        fail("Linux %s Rust toolchain exposes neither sysroot_files nor all_files" % scope)
+    return files
 
 def _sequence(value):
     return value.to_list() if type(value) == "depset" else list(value)
@@ -1863,11 +1899,17 @@ def _with_rust_toolchain(scope, toolset, rust, bindgen = None):
             # supplies the selected C linker through its source recipe. Disable
             # only rustc's bundled linker component so that explicit linker is
             # authoritative for any configured C/C++ toolchain.
-            arguments[role] = [
+            arguments[role] = []
+            sysroot_anchor = getattr(rust, "sysroot_anchor", None)
+            if getattr(rust, "_toolchain_generated_sysroot", sysroot_anchor != None):
+                if sysroot_anchor == None:
+                    fail("%s Rust toolchain enables its generated sysroot but exposes no sysroot_anchor" % scope)
+                arguments[role].append(_default_directory_action_argument("--sysroot", sysroot_anchor))
+            arguments[role].extend([
                 _KBUILD_ARGS_SENTINEL,
                 "-Zunstable-options",
                 "-Clink-self-contained=-linker",
-            ]
+            ])
         else:
             arguments[role] = []
         requirements_by_role[role] = {}
@@ -2113,10 +2155,10 @@ def _linux_mapped_kernel_impl(ctx):
         ))
     target_cc = find_cpp_toolchain(ctx)
     host_cc = host_cc_toolchain(ctx)
-    target_rust = target_rust_toolchain(ctx)
-    host_rust = execution_rust_toolchain(ctx, "host_cc")
-    rust_source_toolchain = execution_rust_source_toolchain(ctx, "host_cc")
-    bindgen = execution_bindgen_toolchain(ctx, "host_cc")
+    target_rust = execution_rust_toolchain(ctx, "_target_rust_toolchain", target_execution_platform)
+    host_rust = execution_rust_toolchain(ctx, "_host_rust_toolchain", host_execution_platform)
+    rust_source_toolchain = execution_rust_source_toolchain(ctx, "_target_rust_source_toolchain", target_execution_platform)
+    bindgen = execution_bindgen_toolchain(ctx, "_target_bindgen_toolchain", target_execution_platform)
     host_dependencies = _stage_host_cc_dependencies(ctx, {
         "libcrypto": ctx.attr._libcrypto,
         "libelf": ctx.attr._libelf,
@@ -2260,22 +2302,31 @@ def _linux_mapped_kernel_impl(ctx):
         for attribute in _SHARED_PLANNER_HELPER_ATTRS.values()
     ]
     target_rust_closures = []
-    if target_rust != None and getattr(target_rust, "all_files", None) != None:
-        target_rust_closures.append(target_rust.all_files)
+    target_rust_direct_files = []
+    if target_rust != None:
+        target_rust_closures.append(_rust_sysroot_files(target_rust, "target"))
+        if getattr(target_rust, "sysroot_anchor", None) != None:
+            target_rust_direct_files.append(target_rust.sysroot_anchor)
     target_bindgen = getattr(bindgen, "bindgen", None) if bindgen != None else None
     target_rust_files = _filtered_toolchain_closure(
         target_base_closures,
         depset(
-            direct = [target_bindgen] if target_bindgen != None else [],
+            direct = target_rust_direct_files + ([target_bindgen] if target_bindgen != None else []),
             transitive = target_rust_closures,
         ),
         "target Rust",
-    ) if target_rust_closures or target_bindgen != None else depset()
+    ) if target_rust_closures or target_rust_direct_files or target_bindgen != None else depset()
+    host_rust_closures = []
+    host_rust_direct_files = []
+    if host_rust != None:
+        host_rust_closures.append(_rust_sysroot_files(host_rust, "host"))
+        if getattr(host_rust, "sysroot_anchor", None) != None:
+            host_rust_direct_files.append(host_rust.sysroot_anchor)
     host_rust_files = _filtered_toolchain_closure(
         host_base_closures,
-        host_rust.all_files,
+        depset(direct = host_rust_direct_files, transitive = host_rust_closures),
         "host Rust",
-    ) if host_rust != None and getattr(host_rust, "all_files", None) != None else depset()
+    ) if host_rust_closures or host_rust_direct_files else depset()
     host_toolchain_files = depset(transitive = host_base_closures + [host_rust_files])
     target_toolchain_files = depset(transitive = target_base_closures + [target_rust_files])
     target_toolset_contract = _toolset_identity(ctx, "target", target, target_toolchain_files)
@@ -2954,6 +3005,10 @@ linux_mapped_kernel = rule(
         "version": attr.string(mandatory = True),
         "_host_cc_toolchain": host_cc_toolchain_attr(exec_group = "host_cc"),
         "_host_execution_platform": linux_execution_platform_attr(exec_group = "host_cc"),
+        "_host_rust_toolchain": execution_rust_toolchain_attr(exec_group = "host_cc"),
+        "_target_bindgen_toolchain": execution_bindgen_toolchain_attr(),
+        "_target_rust_source_toolchain": execution_rust_source_toolchain_attr(),
+        "_target_rust_toolchain": execution_rust_toolchain_attr(),
         "_libcrypto": attr.label(
             cfg = config.exec(exec_group = "host_cc"),
             default = Label("@openssl//:crypto"),
@@ -3005,17 +3060,14 @@ linux_mapped_kernel = rule(
     },
     exec_groups = {"host_cc": exec_group(toolchains = use_cc_toolchain() + [
         BISON_TOOLCHAIN_TYPE,
-        optional_bindgen_toolchain_type(),
         FLEX_TOOLCHAIN_TYPE,
         M4_TOOLCHAIN_TYPE,
-        optional_rust_analyzer_toolchain_type(),
-        optional_rust_toolchain_type(),
         _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE,
         _PERL_TOOLCHAIN_TYPE,
         SCRIPT_RUNTIME_TOOLCHAIN_TYPE,
     ])},
     fragments = ["cpp"],
-    toolchains = use_cc_toolchain() + [optional_rust_toolchain_type(), _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE, _PERL_TOOLCHAIN_TYPE, SCRIPT_RUNTIME_TOOLCHAIN_TYPE],
+    toolchains = use_cc_toolchain() + [_PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE, _PERL_TOOLCHAIN_TYPE, SCRIPT_RUNTIME_TOOLCHAIN_TYPE],
 )
 
 def _kernel_projection_impl(ctx):

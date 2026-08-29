@@ -5,14 +5,14 @@ module(
 
 bazel_dep(name = "aya", version = "0.0.0")
 bazel_dep(name = "linux.bzl", version = "0.0.1")
-bazel_dep(name = "llvm", version = "0.8.14")
-bazel_dep(name = "rules_rs", version = "0.0.102")
+bazel_dep(name = "llvm", version = "0.8.18")
+bazel_dep(name = "rules_rs", version = "0.0.107")
 
 single_version_override(
     module_name = "llvm",
     patch_strip = 1,
     patches = ["//patches:llvm_kbuild_actions.patch"],
-    version = "0.8.14",
+    version = "0.8.18",
 )
 
 archive_override(
@@ -82,7 +82,7 @@ toolchains = use_extension(
 )
 use_repo(toolchains, "default_rust_toolchains")
 
-register_toolchains("@default_rust_toolchains//:all")
+register_toolchains("@default_rust_toolchains//...")
 
 bindgen_toolchains = use_extension("@rules_rs//rs:rules_rust_bindgen.bzl", "rules_rust_bindgen")
 use_repo(bindgen_toolchains, "rules_rust_bindgen")

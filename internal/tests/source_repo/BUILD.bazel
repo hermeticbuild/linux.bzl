@@ -1,7 +1,26 @@
 load("@rules_go//go:def.bzl", "go_test")
+load(":source_repo_test.bzl", "source_overlay_package_marker_test")
+
+source_overlay_package_marker_test(name = "source_overlay_package_marker_test")
 
 go_test(
     name = "source_repo_test",
-    srcs = ["source_repo_test.go"],
-    data = ["//:source_repo.BUILD.bazel"],
+    size = "medium",
+    srcs = [
+        "source_overlay_repository_test.go",
+        "source_repo_test.go",
+    ],
+    data = [
+        "//:source_repo.BUILD.bazel",
+        "//:source_repository_test_bazel_version",
+        "//internal:linux_source_repository_test_support",
+    ],
+    env_inherit = [
+        "PATH",
+        "USE_BAZEL_VERSION",
+    ],
+    tags = [
+        "no-remote",
+        "requires-network",
+    ],
 )

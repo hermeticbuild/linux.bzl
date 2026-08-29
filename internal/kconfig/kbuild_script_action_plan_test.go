@@ -458,9 +458,13 @@ func TestKbuildSourceScriptWithoutOutputArgumentOwnsRuleTarget(t *testing.T) {
 
 func TestKbuildSourceScriptReplaysDiscoveredRecursiveMakeDependency(t *testing.T) {
 	profile := compactKbuildScriptProfileForTest(t, `$(srctree)/scripts/transform.sh > $@`)
+	literalArgument, err := protectCompactKbuildSourceLiteralActionMarkers("FLAG=" + compactKbuildRecursiveMakeMarker)
+	if err != nil {
+		t.Fatal(err)
+	}
 	profile.TargetInvocationDependencies = []CompactKbuildInvocationDependency{{
 		Target: "generated/result.h", Profile: "build:init", Goals: []string{"init/version-timestamp.o"},
-		ReplayArguments: []string{"-f", "__LINUX_BZL_SOURCE_TREE__/scripts/Makefile.build", "obj=init", "init/version-timestamp.o"},
+		ReplayArguments: []string{"-f", "__LINUX_BZL_SOURCE_TREE__/scripts/Makefile.build", "obj=init", literalArgument, "init/version-timestamp.o"},
 	}}
 	metadata := &CompactMetadata{
 		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
@@ -495,9 +499,9 @@ func TestKbuildSourceScriptReplaysDiscoveredRecursiveMakeDependency(t *testing.T
 	if replay.Name != "make" || len(replay.Invocations) != 1 {
 		t.Fatalf("command replay=%#v", replay)
 	}
-	wantArguments := []string{"-f", "${tree:kernel}/scripts/Makefile.build", "obj=init", "init/version-timestamp.o"}
+	wantArguments := []string{"-f", "${tree:kernel}/scripts/Makefile.build", "obj=init", literalArgument, "init/version-timestamp.o"}
 	if !slices.Equal(replay.Invocations[0].Arguments, wantArguments) ||
-		!slices.Equal(replay.Invocations[0].Outputs, []string{"init/version-timestamp.o"}) {
+		!slices.Equal(replay.Invocations[0].Outputs, []string{"${work:root}/init/version-timestamp.o"}) {
 		t.Fatalf("command replay invocation=%#v", replay.Invocations[0])
 	}
 	foundStagedGoal := false
@@ -523,6 +527,7 @@ func TestKbuildSourceScriptStagesTerminalOfPhonyRecursiveGoal(t *testing.T) {
 	child := mustCompactKbuildProfileForTest(t, "build:init", "scripts/Makefile.build", "init", `
 .PHONY: init/__build
 init/__build: init/version-timestamp.o
+init/setup: init/version-timestamp.o
 cmd_emit = touch $@
 init/version-timestamp.o: FORCE
 	$(call if_changed,emit)
@@ -533,9 +538,17 @@ init/version-timestamp.o: FORCE
 	}}
 	config := CompactConfig{
 		KbuildProfiles: []CompactKbuildProfile{profile, child},
-		KbuildSelections: []CompactKbuildSelection{{
-			Profile: child.Name, Target: "init/version-timestamp.o", MakeTarget: "init/version-timestamp.o", Lifecycle: "target", Scope: "target", Stage: "target",
-		}},
+		KbuildSelections: []CompactKbuildSelection{
+			{
+				Profile: child.Name, Target: "init/__build", MakeTarget: "init/__build", Lifecycle: "target", Scope: "target", Stage: "target",
+			},
+			{
+				Profile: child.Name, Target: "init/setup", MakeTarget: "init/setup", Lifecycle: "target", Scope: "target", Stage: "target",
+			},
+			{
+				Profile: child.Name, Target: "init/version-timestamp.o", MakeTarget: "init/version-timestamp.o", Lifecycle: "target", Scope: "target", Stage: "target",
+			},
+		},
 	}
 	metadata := &CompactMetadata{
 		Config: config, actionRoles: testTargetActionRoles("cc"),
@@ -543,6 +556,24 @@ init/version-timestamp.o: FORCE
 	graph, err := newCompactKbuildSelectionGraph(config)
 	if err != nil {
 		t.Fatal(err)
+	}
+	phonyKey, selected := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{
+		profile: child.Name, target: "init/__build",
+	}]
+	if !selected || !graph.compactKbuildProfileTargetIsPhony(child, phonyKey.target) {
+		t.Fatalf("phony recursive goal selection=%s selected=%t, want an exact phony graph node", compactKbuildSelectionKeyString(phonyKey), selected)
+	}
+	if _, materialized := graph.materializedProducers[phonyKey]; materialized {
+		t.Fatalf("phony recursive goal %s unexpectedly has a regular-file producer", compactKbuildSelectionKeyString(phonyKey))
+	}
+	setupKey, selected := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{
+		profile: child.Name, target: "init/setup",
+	}]
+	if !selected || graph.compactKbuildProfileTargetIsPhony(child, setupKey.target) {
+		t.Fatalf("ordering-only recursive goal selection=%s selected=%t, want an exact non-phony graph node", compactKbuildSelectionKeyString(setupKey), selected)
+	}
+	if _, materialized := graph.materializedProducers[setupKey]; materialized {
+		t.Fatalf("ordering-only recursive goal %s unexpectedly has a regular-file producer", compactKbuildSelectionKeyString(setupKey))
 	}
 	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
 	childRecipe := ActionRecipe{
@@ -553,12 +584,47 @@ init/version-timestamp.o: FORCE
 		Stage: "target", Kind: "generate", Tool: "actionfile", Product: "vmlinux",
 		Outputs: []ActionPlanOutput{{Tree: "objects", Path: "init/version-timestamp.o"}},
 	}
-	if _, err := appendActionPlanNode(plan, childNode, childRecipe); err != nil {
+	childProducer, err := appendActionPlanNode(plan, childNode, childRecipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childKey := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{
+		profile: child.Name, target: "init/version-timestamp.o",
+	}]
+	if err := graph.recordMaterializedProducer(childKey, childProducer); err != nil {
 		t.Fatal(err)
 	}
 	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
 		withSelectionGraph(graph).
 		forProfile(profile)
+	directoryDependency := profile.TargetInvocationDependencies[0]
+	directoryDependency.Goals = []string{"init/"}
+	directoryMaterialization, err := builder.compactKbuildInvocationDependencyMaterialization(
+		"generated/result.h", profile, directoryDependency,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(directoryMaterialization.outputs, []string{"${work:root}/init/version-timestamp.o"}) {
+		t.Fatalf(
+			"directory-goal materialization=%#v, want its selected regular terminal",
+			directoryMaterialization,
+		)
+	}
+	orderingDependency := profile.TargetInvocationDependencies[0]
+	orderingDependency.Goals = []string{"init/setup"}
+	orderingMaterialization, err := builder.compactKbuildInvocationDependencyMaterialization(
+		"generated/result.h", profile, orderingDependency,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(orderingMaterialization.outputs, []string{"${work:root}/init/version-timestamp.o"}) {
+		t.Fatalf(
+			"ordering-only goal materialization=%#v, want its selected regular terminal",
+			orderingMaterialization,
+		)
+	}
 	producer, err := builder.build("generated/result.h")
 	if err != nil {
 		t.Fatal(err)
@@ -568,6 +634,18 @@ init/version-timestamp.o: FORCE
 		t.Fatalf("producer %q is missing", producer)
 	}
 	recipe := plan.Recipes[node.Recipe]
+	if len(recipe.CommandReplays) != 1 || len(recipe.CommandReplays[0].Invocations) != 1 {
+		t.Fatalf("command replays=%#v, want one recursive Make invocation", recipe.CommandReplays)
+	}
+	replay := recipe.CommandReplays[0].Invocations[0]
+	wantArguments := []string{
+		"-f", "${tree:kernel}/scripts/Makefile.build", "obj=init", "init/__build",
+	}
+	if !slices.Equal(replay.Arguments, wantArguments) ||
+		!slices.Equal(replay.Outputs, []string{"${work:root}/init/version-timestamp.o"}) ||
+		slices.Contains(replay.Outputs, "init/__build") {
+		t.Fatalf("command replay invocation=%#v, want phony argv with only its regular terminal output", replay)
+	}
 	if !slices.Contains(sortedStringMapValues(recipe.WorkingInputs), "init/version-timestamp.o") {
 		t.Fatalf("working inputs=%#v, want materialized terminal behind phony recursive goal", recipe.WorkingInputs)
 	}
@@ -1966,12 +2044,14 @@ demo/%.out: demo/%.in
 	}
 }
 
-func TestKbuildSourceScriptEnvironmentRejectsLiteralTreeMarker(t *testing.T) {
+func TestKbuildSourceScriptEnvironmentPreservesLiteralActionMarkers(t *testing.T) {
 	profile := mustCompactKbuildProfileForTest(t, "build:demo", "scripts/Makefile.build", "demo", `
 export LITERAL_TREE = '$${tree:prep}'
+export LITERAL_MAKE = '__LINUX_BZL_MAKE__'
+export __LINUX_BZL_MAKE__ = restored-name
 demo/result.out: FORCE
 `, nil)
-	_, _, err := compactKbuildSourceScriptExportedEnvironment(
+	environment, _, err := compactKbuildSourceScriptExportedEnvironment(
 		profile,
 		"demo/result.out",
 		"",
@@ -1983,8 +2063,51 @@ demo/result.out: FORCE
 		"target",
 		nil,
 	)
-	if err == nil || !strings.Contains(err.Error(), "literal ${tree:...} marker") {
-		t.Fatalf("literal tree environment error=%v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{
+		"LITERAL_TREE": "'${tree:prep}'",
+		"LITERAL_MAKE": "'__LINUX_BZL_MAKE__'",
+	} {
+		encoded := environment[name]
+		if strings.Contains(encoded, want[1:len(want)-1]) {
+			t.Fatalf("%s lost source-literal provenance in action environment %q", name, encoded)
+		}
+		restored, restoreErr := RestoreCompactKbuildLiteralActionMarkers(encoded)
+		if restoreErr != nil {
+			t.Fatal(restoreErr)
+		}
+		if restored != want {
+			t.Fatalf("restored %s=%q, want %q", name, restored, want)
+		}
+	}
+	encodedName := ""
+	for name, value := range environment {
+		restored, restoreErr := RestoreCompactKbuildLiteralActionMarkers(name)
+		if restoreErr != nil {
+			t.Fatal(restoreErr)
+		}
+		if restored == compactKbuildRecursiveMakeMarker {
+			encodedName = name
+			if value != "restored-name" {
+				t.Fatalf("restored marker-name value = %q, want restored-name", value)
+			}
+		}
+	}
+	if encodedName == "" || encodedName == compactKbuildRecursiveMakeMarker {
+		t.Fatalf("literal marker environment name lost provenance: %#v", environment)
+	}
+	recipe := ActionRecipe{
+		Schema:      LinuxKernelPlanSchema,
+		Kind:        "generate",
+		Tool:        "script-runtime",
+		Arguments:   []string{"${output:00000000}"},
+		Environment: environment,
+		Outputs:     []string{"00000000"},
+	}
+	if err := recipe.Validate(); err != nil {
+		t.Fatalf("recipe rejected protected source-literal environment: %v", err)
 	}
 }
 

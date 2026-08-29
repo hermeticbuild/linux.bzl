@@ -218,6 +218,7 @@ func compactKbuildCompilerIncludeLocationValue(location CompactKbuildInvocationL
 func rewriteCompactKbuildCompilerRelativeIncludes(
 	profile CompactKbuildProfile,
 	role string,
+	objectRoot string,
 	arguments []string,
 ) ([]string, error) {
 	rewritten := append([]string(nil), arguments...)
@@ -230,10 +231,32 @@ func rewriteCompactKbuildCompilerRelativeIncludes(
 		if err != nil {
 			return nil, err
 		}
-		if !ok || !relative {
+		if !ok {
 			continue
 		}
-		value := compactKbuildCompilerIncludeLocationValue(location)
+		value := ""
+		if location.Tree == CompactKbuildInvocationObjectTree {
+			usesOverlay, overlayErr := compactKbuildGraphPathUsesSourceOverlay(profile, location.Directory)
+			if overlayErr != nil {
+				return nil, overlayErr
+			}
+			if usesOverlay {
+				// External sources are copied to the same logical path in every
+				// action's private root. Keep their include operands relative to
+				// the action's actual execution cwd so fixdep's generated .cmd
+				// metadata remains replayable by later actions instead of retaining
+				// one sandbox's absolute ${work:root} expansion. Most compiler
+				// actions execute at the private root (objectRoot == "."); typed
+				// compound and response-file actions execute below it.
+				value = path.Join(objectRoot, location.Directory)
+			}
+		}
+		if value == "" {
+			if !relative {
+				continue
+			}
+			value = compactKbuildCompilerIncludeLocationValue(location)
+		}
 		if operand.Joined {
 			value = operand.Flag + value
 		}
@@ -263,6 +286,7 @@ type compactKbuildCompilerOutputAnalysis struct {
 
 type compactKbuildCompilerOutputAnalyzer struct {
 	profile              CompactKbuildProfile
+	includeArguments     []string
 	analysis             compactKbuildCompilerOutputAnalysis
 	workingDirectories   map[string]bool
 	preparedInputs       map[string]bool
@@ -291,13 +315,32 @@ func analyzeCompactKbuildCompilerOutputs(
 	arguments []string,
 	knownGraphOutputs ...string,
 ) (compactKbuildCompilerOutputAnalysis, error) {
+	return analyzeCompactKbuildCompilerOutputsWithIncludeProvenance(
+		profile, role, arguments, arguments, knownGraphOutputs...,
+	)
+}
+
+// analyzeCompactKbuildCompilerOutputsWithIncludeProvenance separates the
+// compiler argv which will execute from the include argv whose tree provenance
+// was captured from Make. Source-overlay includes are projected relative to an
+// action's eventual cwd, which can differ from the Make process cwd; resolving
+// those projected spellings against the capture cwd a second time would stage
+// the wrong prepared-object directory.
+func analyzeCompactKbuildCompilerOutputsWithIncludeProvenance(
+	profile CompactKbuildProfile,
+	role string,
+	arguments []string,
+	includeArguments []string,
+	knownGraphOutputs ...string,
+) (compactKbuildCompilerOutputAnalysis, error) {
 	switch role {
 	case "cc", "cxx", "rustc", "clippy":
 	default:
 		return compactKbuildCompilerOutputAnalysis{}, fmt.Errorf("unsupported compiler action role %q", role)
 	}
 	analyzer := compactKbuildCompilerOutputAnalyzer{
-		profile: profile,
+		profile:          profile,
+		includeArguments: append([]string(nil), includeArguments...),
 		analysis: compactKbuildCompilerOutputAnalysis{
 			Arguments: append([]string(nil), arguments...),
 		},
@@ -448,11 +491,11 @@ func analyzeCompactKbuildCompilerOutputs(
 // is an exact, architecture- and toolchain-independent boundary. Forced
 // includes and macro files remain exact single-file inputs.
 func (a *compactKbuildCompilerOutputAnalyzer) recordCPreprocessorInputs() error {
-	start, end, ok := KbuildCPreprocessorArgumentRange("cc", a.analysis.Arguments)
+	start, end, ok := KbuildCPreprocessorArgumentRange("cc", a.includeArguments)
 	if !ok {
 		return nil
 	}
-	for _, operand := range KbuildCompilerIncludeOperands(a.analysis.Arguments[start:end]) {
+	for _, operand := range KbuildCompilerIncludeOperands(a.includeArguments[start:end]) {
 		location, _, resolved, err := ResolveCompactKbuildCompilerIncludePath(a.profile, operand.Operand)
 		if err != nil {
 			return fmt.Errorf("compiler %s path %q: %w", operand.Flag, operand.Operand, err)

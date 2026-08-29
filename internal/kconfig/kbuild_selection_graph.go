@@ -549,14 +549,24 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 		})
 		terminal := make([]compactKbuildSelectionKey, 0, len(candidates))
 		for _, candidate := range candidates {
-			forwarding := false
+			hasDescendant := false
+			materializesBeforeDescendant := false
 			for _, other := range candidates {
 				if candidate != other && graph.compactKbuildInvocationDescendsTo(candidate.profile, target, other.profile) {
-					forwarding = true
-					break
+					hasDescendant = true
+					artifact, ok := graph.compactKbuildInitialVisibleArtifact(other.profile, target)
+					if ok && artifact == (CompactKbuildVisibleArtifact{
+						Path: target, Profile: candidate.profile, Target: candidate.target,
+					}) {
+						// The descendant started from this exact same-path version, so
+						// the parent is a real writer followed by an overwrite, not a
+						// recursive-Make forwarding target.
+						materializesBeforeDescendant = true
+						break
+					}
 				}
 			}
-			if forwarding {
+			if hasDescendant && !materializesBeforeDescendant {
 				graph.forwardingSelections[candidate] = true
 				continue
 			}
@@ -741,6 +751,13 @@ func (g *compactKbuildSelectionGraph) compactKbuildVisibleArtifactOwner(
 			"visible artifact %q has invalid provenance target %q in profile %q",
 			artifact.Path, artifact.Target, artifact.Profile,
 		)
+	}
+	if exact, ok := g.selectionsByProfileTarget[compactKbuildProfileTargetKey{
+		profile: artifact.Profile, target: target,
+	}]; ok && !g.forwardingSelections[exact] {
+		// The frontier names one exact materialized version. Only a pure
+		// recursive forwarding origin is resolved through its descendants.
+		return exact, nil
 	}
 	candidates := []compactKbuildSelectionKey{}
 	for _, candidate := range g.selectionsByTarget[target] {
@@ -1416,6 +1433,15 @@ func (g *compactKbuildSelectionGraph) selectionDependenciesSingle(
 	}
 	invocationKey := compactKbuildProfileTargetKey{profile: profile.Name, target: key.target}
 	for _, dependencyProfile := range g.targetInvocations[invocationKey] {
+		if artifact, ok := g.compactKbuildInitialVisibleArtifact(dependencyProfile, key.target); ok &&
+			artifact == (CompactKbuildVisibleArtifact{
+				Path: key.target, Profile: key.profile, Target: key.target,
+			}) {
+			// The child invocation starts from this action's same-path output.
+			// It is a source-ordered successor overwrite, not a dependency of
+			// the action which produced that initial version.
+			continue
+		}
 		terminals, err := g.compactKbuildTerminalRecipeSelections(metadata, dependencyProfile, key.stage)
 		if err != nil {
 			return nil, fmt.Errorf("resolve recursive invocation dependency %q for %s: %w", dependencyProfile, compactKbuildSelectionKeyString(key), err)

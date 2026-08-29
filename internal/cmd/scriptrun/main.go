@@ -5,18 +5,25 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
@@ -33,7 +40,16 @@ const (
 	maxReplayOutputs        = 4096
 	maxReplayValueBytes     = 1 << 20
 	maxReplayValueTotalSize = 4 << 20
+	maxReplayProtocolBytes  = maxReplayValueTotalSize + (maxReplayArguments * 4) + 64
+	maxReplayDiagnosticSize = maxReplayValueBytes + 4096
+	scriptReplayIOTimeout   = 30 * time.Second
 	scriptAppletRolePrefix  = "script-applet-"
+	scriptReplayProxyMode   = "__linux_bzl_internal_script_replay_proxy__"
+	scriptReplayProtocol    = "LBZLRP01"
+	scriptReplayResponse    = "LBZLRS01"
+	// O_PATH is Linux-specific and intentionally not exposed by package syscall.
+	// scriptrun itself is selected only by the Linux script-runtime toolchain.
+	linuxOpenPath = 0x200000
 )
 
 type repeatedFlag []string
@@ -50,6 +66,57 @@ type scriptReplayInvocation struct {
 	Arguments []string `json:"arguments"`
 	Outputs   []string `json:"outputs"`
 }
+
+// The replay runtime representation is deliberately private to the original
+// scriptrun process. It is never serialized into the source script's writable
+// filesystem. The action plan keeps carrying only command arguments and output
+// paths; concrete file identities are captured immediately before the source
+// script runs and first-seen receipts remain in parent memory.
+type scriptReplayRuntimeManifest struct {
+	Name        string
+	Invocations []scriptReplayRuntimeInvocation
+}
+
+type scriptReplayRuntimeInvocation struct {
+	Arguments []string
+	Outputs   []*scriptReplayRuntimeOutput
+}
+
+type scriptReplayRuntimeOutput struct {
+	DisplayPath string
+	Path        string
+	Initial     *scriptReplayOutputSnapshot
+
+	mu      sync.Mutex
+	receipt *scriptReplayOutputSnapshot
+}
+
+type scriptReplayOutputSnapshot struct {
+	Digest         string
+	ExecutableBits uint32
+}
+
+type scriptReplayBroker struct {
+	listener   *net.UnixListener
+	endpoint   string
+	replays    []*scriptReplayRuntimeManifest
+	acceptDone chan error
+	closeDone  chan struct{}
+	closeOnce  sync.Once
+	closeErr   error
+
+	mu          sync.Mutex
+	closing     bool
+	connections map[*net.UnixConn]bool
+	handlers    sync.WaitGroup
+}
+
+type scriptReplayProxyFailure struct {
+	exitCode int
+	message  string
+}
+
+func (failure *scriptReplayProxyFailure) Error() string { return failure.message }
 
 type scriptRunOptions struct {
 	interpreter        string
@@ -236,9 +303,42 @@ func runScript(opts scriptRunOptions) error {
 	}
 	replays := append([]scriptReplayManifest(nil), opts.replays...)
 	sort.Slice(replays, func(left, right int) bool { return replays[left].Name < replays[right].Name })
+	preparedReplays := make([]*scriptReplayRuntimeManifest, 0, len(replays))
+	replayVerifier := ""
+	if len(replays) != 0 {
+		replayVerifier, err = os.Executable()
+		if err != nil {
+			return fmt.Errorf("resolve command replay verifier: %w", err)
+		}
+		replayVerifier, err = requireScriptExecutable(replayVerifier, "command replay verifier")
+		if err != nil {
+			return err
+		}
+	}
 	for _, replay := range replays {
-		if err := installScriptReplayProxy(toolDirectory, multicall, replay); err != nil {
-			return fmt.Errorf("install command replay %s: %w", replay.Name, err)
+		prepared, err := prepareScriptReplayRuntime(replay)
+		if err != nil {
+			return fmt.Errorf("prepare command replay %s: %w", replay.Name, err)
+		}
+		preparedReplays = append(preparedReplays, prepared)
+	}
+	var replayBroker *scriptReplayBroker
+	brokerOpen := false
+	if len(preparedReplays) != 0 {
+		replayBroker, err = startScriptReplayBroker(preparedReplays)
+		if err != nil {
+			return fmt.Errorf("start command replay broker: %w", err)
+		}
+		brokerOpen = true
+		defer func() {
+			if brokerOpen {
+				_ = replayBroker.Close()
+			}
+		}()
+		for replayIndex, replay := range replays {
+			if err := installScriptReplayProxy(toolDirectory, multicall, replayVerifier, replayBroker.endpoint, uint32(replayIndex), replay); err != nil {
+				return fmt.Errorf("install command replay %s: %w", replay.Name, err)
+			}
 		}
 	}
 	arguments := append([]string(nil), opts.interpreterArgs...)
@@ -260,8 +360,26 @@ func runScript(opts scriptRunOptions) error {
 	command.Stdin = opts.stdin
 	command.Stdout = opts.stdout
 	command.Stderr = opts.stderr
-	if err := command.Run(); err != nil {
-		return fmt.Errorf("execute source script: %w", err)
+	commandErr := command.Run()
+	var brokerErr error
+	if replayBroker != nil {
+		brokerErr = replayBroker.Close()
+		brokerOpen = false
+	}
+	if err := verifyScriptReplayReceipts(preparedReplays); err != nil {
+		if commandErr != nil {
+			return fmt.Errorf("execute source script: %v; verify command replay outputs: %w", commandErr, err)
+		}
+		return fmt.Errorf("verify command replay outputs: %w", err)
+	}
+	if brokerErr != nil {
+		if commandErr != nil {
+			return fmt.Errorf("execute source script: %v; stop command replay broker: %w", commandErr, brokerErr)
+		}
+		return fmt.Errorf("stop command replay broker: %w", brokerErr)
+	}
+	if commandErr != nil {
+		return fmt.Errorf("execute source script: %w", commandErr)
 	}
 	return nil
 }
@@ -505,13 +623,9 @@ func validateReplayManifests(manifests []scriptReplayManifest, tools map[string]
 			if totalOutputs > maxReplayOutputs {
 				return fmt.Errorf("command replay manifests contain more than %d outputs", maxReplayOutputs)
 			}
-			encodedArguments, err := json.Marshal(append([]string{}, invocation.Arguments...))
-			if err != nil {
-				return fmt.Errorf("encode command replay %q invocation %d arguments: %w", manifest.Name, invocationIndex, err)
-			}
-			argumentsKey := string(encodedArguments)
+			argumentsKey := scriptReplayArgumentsKey(invocation.Arguments)
 			if seenInvocations[argumentsKey] {
-				return fmt.Errorf("command replay %q repeats invocation arguments %s", manifest.Name, argumentsKey)
+				return fmt.Errorf("command replay %q repeats invocation arguments at index %d", manifest.Name, invocationIndex)
 			}
 			seenInvocations[argumentsKey] = true
 			for argumentIndex, argument := range invocation.Arguments {
@@ -534,9 +648,580 @@ func validateReplayManifests(manifests []scriptReplayManifest, tools map[string]
 	return nil
 }
 
-func installScriptReplayProxy(directory, multicall string, manifest scriptReplayManifest) error {
+func scriptReplayArgumentsKey(arguments []string) string {
+	var key strings.Builder
+	for _, argument := range arguments {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(argument)))
+		key.Write(size[:])
+		key.WriteString(argument)
+	}
+	return key.String()
+}
+
+func prepareScriptReplayRuntime(manifest scriptReplayManifest) (*scriptReplayRuntimeManifest, error) {
+	if err := validateReplayManifests([]scriptReplayManifest{manifest}, nil); err != nil {
+		return nil, err
+	}
+	runtimeManifest := &scriptReplayRuntimeManifest{
+		Name:        manifest.Name,
+		Invocations: make([]scriptReplayRuntimeInvocation, len(manifest.Invocations)),
+	}
+	for invocationIndex, invocation := range manifest.Invocations {
+		runtimeInvocation := scriptReplayRuntimeInvocation{
+			Arguments: append([]string(nil), invocation.Arguments...),
+			Outputs:   make([]*scriptReplayRuntimeOutput, len(invocation.Outputs)),
+		}
+		for outputIndex, output := range invocation.Outputs {
+			// Generated replay paths are absolute after work-tree expansion. Keep
+			// relative test/debug manifests useful by anchoring them to the same
+			// pre-script directory in which their initial identity is captured.
+			absolute, err := filepath.Abs(output)
+			if err != nil {
+				return nil, fmt.Errorf("resolve output %q: %w", output, err)
+			}
+			runtimeOutput := &scriptReplayRuntimeOutput{
+				DisplayPath: output,
+				Path:        absolute,
+			}
+			snapshot, available, err := snapshotScriptReplayOutput(absolute)
+			if err != nil {
+				return nil, fmt.Errorf("snapshot output %q: %w", output, err)
+			}
+			if available {
+				runtimeOutput.Initial = &snapshot
+			}
+			runtimeInvocation.Outputs[outputIndex] = runtimeOutput
+		}
+		runtimeManifest.Invocations[invocationIndex] = runtimeInvocation
+	}
+	return runtimeManifest, nil
+}
+
+func snapshotScriptReplayOutput(path string) (scriptReplayOutputSnapshot, bool, error) {
+	pinnedFD, pinned, available, err := pinScriptReplayOutput(path)
+	if err != nil || !available {
+		return scriptReplayOutputSnapshot{}, available, err
+	}
+	defer syscall.Close(pinnedFD)
+
+	// Reopen the descriptor rather than the pathname. A source script can rename
+	// or replace its output concurrently, but /proc/self/fd continues to name the
+	// exact O_PATH-pinned inode and O_NOFOLLOW has already rejected a final
+	// symlink. This also gives us a stable object on which to restore permissions.
+	descriptorPath := "/proc/self/fd/" + strconv.Itoa(pinnedFD)
+	file, err := os.Open(descriptorPath)
+	originalMode := pinned.Mode & 0o7777
+	if err != nil && originalMode&0o400 == 0 {
+		if err := syscall.Chmod(descriptorPath, originalMode|0o400); err != nil {
+			return scriptReplayOutputSnapshot{}, false, fmt.Errorf("temporarily make output readable: %w", err)
+		}
+		file, err = os.Open(descriptorPath)
+		if file != nil {
+			if restoreErr := syscall.Fchmod(int(file.Fd()), originalMode); restoreErr != nil {
+				fallbackErr := syscall.Chmod(descriptorPath, originalMode)
+				_ = file.Close()
+				if fallbackErr != nil {
+					return scriptReplayOutputSnapshot{}, false, fmt.Errorf("restore output mode through descriptor: %v; fallback restore: %w", restoreErr, fallbackErr)
+				}
+				return scriptReplayOutputSnapshot{}, false, fmt.Errorf("restore output mode: %w", restoreErr)
+			}
+		} else if restoreErr := syscall.Chmod(descriptorPath, originalMode); restoreErr != nil {
+			return scriptReplayOutputSnapshot{}, false, fmt.Errorf("open output: %v; restore output mode: %w", err, restoreErr)
+		}
+	}
+	if err != nil {
+		return scriptReplayOutputSnapshot{}, false, err
+	}
+	defer file.Close()
+
+	var opened syscall.Stat_t
+	if err := syscall.Fstat(int(file.Fd()), &opened); err != nil {
+		return scriptReplayOutputSnapshot{}, false, err
+	}
+	if !sameScriptReplayFile(pinned, opened) || opened.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		return scriptReplayOutputSnapshot{}, false, fmt.Errorf("output changed identity while opening")
+	}
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return scriptReplayOutputSnapshot{}, false, err
+	}
+	var afterRead syscall.Stat_t
+	if err := syscall.Fstat(int(file.Fd()), &afterRead); err != nil {
+		return scriptReplayOutputSnapshot{}, false, err
+	}
+	if !stableScriptReplayFile(opened, afterRead) {
+		return scriptReplayOutputSnapshot{}, false, fmt.Errorf("output changed identity, metadata, or size while reading")
+	}
+	currentFD, current, currentAvailable, err := pinScriptReplayOutput(path)
+	if err != nil {
+		return scriptReplayOutputSnapshot{}, false, err
+	}
+	if currentFD >= 0 {
+		defer syscall.Close(currentFD)
+	}
+	if !currentAvailable || !stableScriptReplayFile(afterRead, current) {
+		return scriptReplayOutputSnapshot{}, false, fmt.Errorf("output path changed identity, metadata, or size while reading")
+	}
+	return scriptReplayOutputSnapshot{
+		Digest:         base64.RawStdEncoding.EncodeToString(digest.Sum(nil)),
+		ExecutableBits: afterRead.Mode & 0o111,
+	}, true, nil
+}
+
+func pinScriptReplayOutput(path string) (int, syscall.Stat_t, bool, error) {
+	fd, err := syscall.Open(path, linuxOpenPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			return -1, syscall.Stat_t{}, false, nil
+		}
+		return -1, syscall.Stat_t{}, false, err
+	}
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil {
+		_ = syscall.Close(fd)
+		return -1, syscall.Stat_t{}, false, err
+	}
+	if stat.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		_ = syscall.Close(fd)
+		return -1, syscall.Stat_t{}, false, nil
+	}
+	return fd, stat, true, nil
+}
+
+func sameScriptReplayFile(left, right syscall.Stat_t) bool {
+	return left.Dev == right.Dev && left.Ino == right.Ino
+}
+
+func stableScriptReplayFile(left, right syscall.Stat_t) bool {
+	return sameScriptReplayFile(left, right) &&
+		left.Mode&syscall.S_IFMT == syscall.S_IFREG &&
+		right.Mode&syscall.S_IFMT == syscall.S_IFREG &&
+		left.Mode&0o111 == right.Mode&0o111 &&
+		left.Size == right.Size &&
+		left.Mtim.Sec == right.Mtim.Sec && left.Mtim.Nsec == right.Mtim.Nsec &&
+		left.Ctim.Sec == right.Ctim.Sec && left.Ctim.Nsec == right.Ctim.Nsec
+}
+
+func scriptReplayOutputFailure(name string, output *scriptReplayRuntimeOutput, err error) error {
+	if err == nil {
+		return &scriptReplayProxyFailure{
+			exitCode: 66,
+			message:  "command replay " + name + " is missing regular output " + output.DisplayPath,
+		}
+	}
+	return &scriptReplayProxyFailure{
+		exitCode: 66,
+		message:  fmt.Sprintf("command replay %s could not read regular output %s: %v", name, output.DisplayPath, err),
+	}
+}
+
+func compareScriptReplayOutput(name string, output *scriptReplayRuntimeOutput, want, got scriptReplayOutputSnapshot, phase string) error {
+	if want.Digest != got.Digest {
+		return &scriptReplayProxyFailure{
+			exitCode: 66,
+			message:  fmt.Sprintf("command replay %s output %s changed content %s", name, output.DisplayPath, phase),
+		}
+	}
+	if want.ExecutableBits != got.ExecutableBits {
+		return &scriptReplayProxyFailure{
+			exitCode: 66,
+			message:  fmt.Sprintf("command replay %s output %s changed executable bits %s", name, output.DisplayPath, phase),
+		}
+	}
+	return nil
+}
+
+func snapshotRequiredScriptReplayOutput(name string, output *scriptReplayRuntimeOutput) (scriptReplayOutputSnapshot, error) {
+	snapshot, available, err := snapshotScriptReplayOutput(output.Path)
+	if err != nil {
+		return scriptReplayOutputSnapshot{}, scriptReplayOutputFailure(name, output, err)
+	}
+	if !available {
+		return scriptReplayOutputSnapshot{}, scriptReplayOutputFailure(name, output, nil)
+	}
+	return snapshot, nil
+}
+
+func equalScriptReplayArguments(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func startScriptReplayBroker(replays []*scriptReplayRuntimeManifest) (*scriptReplayBroker, error) {
+	if len(replays) == 0 || len(replays) > maxReplayManifests {
+		return nil, fmt.Errorf("command replay broker requires between 1 and %d manifests", maxReplayManifests)
+	}
+	for index, replay := range replays {
+		if replay == nil {
+			return nil, fmt.Errorf("command replay broker manifest %d is nil", index)
+		}
+	}
+	var nonce [18]byte
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+		return nil, fmt.Errorf("create command replay endpoint identity: %w", err)
+	}
+	// Linux abstract sockets have no source-visible directory entry to unlink or
+	// replace. The random name also prevents collisions between concurrent local
+	// or remote actions sharing one network namespace.
+	endpoint := "@linux-bzl-replay-" + base64.RawURLEncoding.EncodeToString(nonce[:])
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Net: "unix", Name: endpoint})
+	if err != nil {
+		return nil, err
+	}
+	broker := &scriptReplayBroker{
+		listener:    listener,
+		endpoint:    endpoint,
+		replays:     append([]*scriptReplayRuntimeManifest(nil), replays...),
+		acceptDone:  make(chan error, 1),
+		closeDone:   make(chan struct{}),
+		connections: map[*net.UnixConn]bool{},
+	}
+	go func() { broker.acceptDone <- broker.serve() }()
+	return broker, nil
+}
+
+func (broker *scriptReplayBroker) serve() error {
+	for {
+		connection, err := broker.listener.AcceptUnix()
+		if err != nil {
+			return err
+		}
+		broker.mu.Lock()
+		if broker.closing {
+			broker.mu.Unlock()
+			_ = connection.Close()
+			continue
+		}
+		broker.connections[connection] = true
+		broker.handlers.Add(1)
+		broker.mu.Unlock()
+		go broker.handle(connection)
+	}
+}
+
+func (broker *scriptReplayBroker) handle(connection *net.UnixConn) {
+	defer func() {
+		_ = connection.Close()
+		broker.mu.Lock()
+		delete(broker.connections, connection)
+		broker.mu.Unlock()
+		broker.handlers.Done()
+	}()
+	_ = connection.SetReadDeadline(time.Now().Add(scriptReplayIOTimeout))
+	replayID, arguments, err := readScriptReplayRequest(connection)
+	_ = connection.SetReadDeadline(time.Time{})
+	if err != nil {
+		err = fmt.Errorf("decode command replay request: %w", err)
+	} else {
+		err = broker.evaluate(replayID, arguments)
+	}
+	exitCode, message := scriptReplayResult(err)
+	_ = connection.SetWriteDeadline(time.Now().Add(scriptReplayIOTimeout))
+	_ = writeScriptReplayResponse(connection, exitCode, message)
+}
+
+func (broker *scriptReplayBroker) Close() error {
+	broker.closeOnce.Do(func() {
+		broker.mu.Lock()
+		broker.closing = true
+		listenerErr := broker.listener.Close()
+		broker.mu.Unlock()
+		acceptErr := <-broker.acceptDone
+		broker.handlers.Wait()
+		if listenerErr != nil && !errors.Is(listenerErr, net.ErrClosed) {
+			broker.closeErr = listenerErr
+		} else if acceptErr != nil && !errors.Is(acceptErr, net.ErrClosed) {
+			broker.closeErr = acceptErr
+		}
+		close(broker.closeDone)
+	})
+	<-broker.closeDone
+	return broker.closeErr
+}
+
+func (broker *scriptReplayBroker) evaluate(replayID uint32, arguments []string) error {
+	if uint64(replayID) >= uint64(len(broker.replays)) {
+		return fmt.Errorf("unknown command replay identity %d", replayID)
+	}
+	manifest := broker.replays[replayID]
+	for _, invocation := range manifest.Invocations {
+		if !equalScriptReplayArguments(arguments, invocation.Arguments) {
+			continue
+		}
+		for _, output := range invocation.Outputs {
+			if err := checkScriptReplayOutput(manifest.Name, output); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return &scriptReplayProxyFailure{
+		exitCode: 64,
+		message:  "command replay " + manifest.Name + " rejected undeclared arguments",
+	}
+}
+
+func checkScriptReplayOutput(name string, output *scriptReplayRuntimeOutput) error {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	current, err := snapshotRequiredScriptReplayOutput(name, output)
+	if err != nil {
+		return err
+	}
+	if output.Initial != nil {
+		return compareScriptReplayOutput(name, output, *output.Initial, current, "before replay")
+	}
+	if output.receipt != nil {
+		return compareScriptReplayOutput(name, output, *output.receipt, current, "after replay")
+	}
+	receipt := current
+	output.receipt = &receipt
+	return nil
+}
+
+func verifyScriptReplayReceipts(manifests []*scriptReplayRuntimeManifest) error {
+	for _, manifest := range manifests {
+		for _, invocation := range manifest.Invocations {
+			for _, output := range invocation.Outputs {
+				// A preexisting output is staged from the separately planned child
+				// action, so its identity matters only at the replay boundary. An
+				// initially absent output is owned by this source-script action; its
+				// receipt must still match when that action finishes and collects it.
+				output.mu.Lock()
+				if output.Initial != nil || output.receipt == nil {
+					output.mu.Unlock()
+					continue
+				}
+				receipt := *output.receipt
+				current, err := snapshotRequiredScriptReplayOutput(manifest.Name, output)
+				if err != nil {
+					output.mu.Unlock()
+					return err
+				}
+				if err := compareScriptReplayOutput(manifest.Name, output, receipt, current, "after replay"); err != nil {
+					output.mu.Unlock()
+					return err
+				}
+				output.mu.Unlock()
+			}
+		}
+	}
+	return nil
+}
+
+func writeScriptReplayBytes(writer io.Writer, value []byte) error {
+	for len(value) != 0 {
+		written, err := writer.Write(value)
+		if err != nil {
+			return err
+		}
+		if written <= 0 || written > len(value) {
+			return io.ErrShortWrite
+		}
+		value = value[written:]
+	}
+	return nil
+}
+
+func writeScriptReplayRequest(writer io.Writer, replayID uint32, arguments []string) error {
+	if len(arguments) > maxReplayArguments {
+		return fmt.Errorf("command replay request contains more than %d arguments", maxReplayArguments)
+	}
+	total := len(scriptReplayProtocol) + 8
+	for index, argument := range arguments {
+		if len(argument) > maxReplayValueBytes {
+			return fmt.Errorf("command replay argument %d exceeds %d bytes", index, maxReplayValueBytes)
+		}
+		total += 4 + len(argument)
+		if total > maxReplayProtocolBytes {
+			return fmt.Errorf("command replay request exceeds %d bytes", maxReplayProtocolBytes)
+		}
+	}
+	var header [16]byte
+	copy(header[:8], scriptReplayProtocol)
+	binary.BigEndian.PutUint32(header[8:12], replayID)
+	binary.BigEndian.PutUint32(header[12:16], uint32(len(arguments)))
+	if err := writeScriptReplayBytes(writer, header[:]); err != nil {
+		return err
+	}
+	for _, argument := range arguments {
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], uint32(len(argument)))
+		if err := writeScriptReplayBytes(writer, size[:]); err != nil {
+			return err
+		}
+		if err := writeScriptReplayBytes(writer, []byte(argument)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readScriptReplayRequest(reader io.Reader) (uint32, []string, error) {
+	var header [16]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
+		return 0, nil, err
+	}
+	if string(header[:8]) != scriptReplayProtocol {
+		return 0, nil, fmt.Errorf("invalid protocol identity")
+	}
+	replayID := binary.BigEndian.Uint32(header[8:12])
+	argumentCount := binary.BigEndian.Uint32(header[12:16])
+	if argumentCount > maxReplayArguments {
+		return 0, nil, fmt.Errorf("argument count %d exceeds %d", argumentCount, maxReplayArguments)
+	}
+	arguments := make([]string, int(argumentCount))
+	total := len(header)
+	for index := range arguments {
+		var encodedSize [4]byte
+		if _, err := io.ReadFull(reader, encodedSize[:]); err != nil {
+			return 0, nil, err
+		}
+		size := binary.BigEndian.Uint32(encodedSize[:])
+		if size > maxReplayValueBytes {
+			return 0, nil, fmt.Errorf("argument %d exceeds %d bytes", index, maxReplayValueBytes)
+		}
+		total += len(encodedSize) + int(size)
+		if total > maxReplayProtocolBytes {
+			return 0, nil, fmt.Errorf("request exceeds %d bytes", maxReplayProtocolBytes)
+		}
+		value := make([]byte, int(size))
+		if _, err := io.ReadFull(reader, value); err != nil {
+			return 0, nil, err
+		}
+		arguments[index] = string(value)
+	}
+	var trailing [1]byte
+	read, err := reader.Read(trailing[:])
+	if read != 0 {
+		return 0, nil, fmt.Errorf("request contains trailing bytes")
+	}
+	if err != io.EOF {
+		if err == nil {
+			err = io.ErrNoProgress
+		}
+		return 0, nil, fmt.Errorf("finish request: %w", err)
+	}
+	return replayID, arguments, nil
+}
+
+func writeScriptReplayResponse(writer io.Writer, exitCode int, message string) error {
+	if exitCode != 0 && exitCode != 64 && exitCode != 66 && exitCode != 70 {
+		return fmt.Errorf("invalid command replay exit code %d", exitCode)
+	}
+	if len(message) > maxReplayDiagnosticSize {
+		message = message[:maxReplayDiagnosticSize]
+	}
+	var header [16]byte
+	copy(header[:8], scriptReplayResponse)
+	binary.BigEndian.PutUint32(header[8:12], uint32(exitCode))
+	binary.BigEndian.PutUint32(header[12:16], uint32(len(message)))
+	if err := writeScriptReplayBytes(writer, header[:]); err != nil {
+		return err
+	}
+	return writeScriptReplayBytes(writer, []byte(message))
+}
+
+func readScriptReplayResponse(reader io.Reader) (int, string, error) {
+	var header [16]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
+		return 0, "", err
+	}
+	if string(header[:8]) != scriptReplayResponse {
+		return 0, "", fmt.Errorf("invalid response protocol identity")
+	}
+	exitCode := int(binary.BigEndian.Uint32(header[8:12]))
+	if exitCode != 0 && exitCode != 64 && exitCode != 66 && exitCode != 70 {
+		return 0, "", fmt.Errorf("invalid response exit code %d", exitCode)
+	}
+	size := binary.BigEndian.Uint32(header[12:16])
+	if size > maxReplayDiagnosticSize {
+		return 0, "", fmt.Errorf("response diagnostic exceeds %d bytes", maxReplayDiagnosticSize)
+	}
+	message := make([]byte, int(size))
+	if _, err := io.ReadFull(reader, message); err != nil {
+		return 0, "", err
+	}
+	if exitCode != 0 && len(message) == 0 {
+		return 0, "", fmt.Errorf("error response has no diagnostic")
+	}
+	return exitCode, string(message), nil
+}
+
+func scriptReplayResult(err error) (int, string) {
+	if err == nil {
+		return 0, ""
+	}
+	exitCode := 70
+	var failure *scriptReplayProxyFailure
+	if errors.As(err, &failure) {
+		exitCode = failure.exitCode
+	}
+	return exitCode, err.Error()
+}
+
+func runScriptReplayProxy(endpoint string, replayID uint32, arguments []string) error {
+	connection, err := net.DialUnix("unix", nil, &net.UnixAddr{Net: "unix", Name: endpoint})
+	if err != nil {
+		return &scriptReplayProxyFailure{exitCode: 70, message: "connect command replay broker: " + err.Error()}
+	}
+	defer connection.Close()
+	if err := writeScriptReplayRequest(connection, replayID, arguments); err != nil {
+		return &scriptReplayProxyFailure{exitCode: 70, message: "write command replay request: " + err.Error()}
+	}
+	if err := connection.CloseWrite(); err != nil {
+		return &scriptReplayProxyFailure{exitCode: 70, message: "finish command replay request: " + err.Error()}
+	}
+	exitCode, message, err := readScriptReplayResponse(connection)
+	if err != nil {
+		return &scriptReplayProxyFailure{exitCode: 70, message: "read command replay response: " + err.Error()}
+	}
+	if exitCode == 0 {
+		return nil
+	}
+	return &scriptReplayProxyFailure{exitCode: exitCode, message: message}
+}
+
+func executeScriptReplayProxyMode(arguments []string, stderr io.Writer) (bool, int) {
+	if len(arguments) == 0 || arguments[0] != scriptReplayProxyMode {
+		return false, 0
+	}
+	if len(arguments) < 3 {
+		fmt.Fprintln(stderr, "command replay proxy is missing its broker endpoint or identity")
+		return true, 70
+	}
+	replayID, parseErr := strconv.ParseUint(arguments[2], 10, 32)
+	if parseErr != nil {
+		fmt.Fprintln(stderr, "command replay proxy has an invalid replay identity")
+		return true, 70
+	}
+	err := runScriptReplayProxy(arguments[1], uint32(replayID), arguments[3:])
+	if err == nil {
+		return true, 0
+	}
+	exitCode := 70
+	var failure *scriptReplayProxyFailure
+	if errors.As(err, &failure) {
+		exitCode = failure.exitCode
+	}
+	fmt.Fprintln(stderr, err)
+	return true, exitCode
+}
+
+func installScriptReplayProxy(directory, multicall, verifier, endpoint string, replayID uint32, manifest scriptReplayManifest) error {
 	if err := validateReplayManifests([]scriptReplayManifest{manifest}, nil); err != nil {
 		return err
+	}
+	if !strings.HasPrefix(endpoint, "@") || strings.ContainsRune(endpoint, 0) {
+		return fmt.Errorf("command replay endpoint is not an abstract Unix socket address")
 	}
 	destination := filepath.Join(directory, manifest.Name)
 	if err := os.Remove(destination); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -546,35 +1231,15 @@ func installScriptReplayProxy(directory, multicall string, manifest scriptReplay
 	script.WriteString("#!")
 	script.WriteString(multicall)
 	script.WriteString(" sh\n")
-	for _, invocation := range manifest.Invocations {
-		script.WriteString("if [ \"$#\" -eq ")
-		script.WriteString(strconv.Itoa(len(invocation.Arguments)))
-		script.WriteString(" ]")
-		for index, argument := range invocation.Arguments {
-			script.WriteString(" && [ \"${")
-			script.WriteString(strconv.Itoa(index + 1))
-			script.WriteString("}\" = ")
-			script.WriteString(shellQuote(argument))
-			script.WriteString(" ]")
-		}
-		script.WriteString("; then\n")
-		for _, output := range invocation.Outputs {
-			script.WriteString("  if [ ! -f ")
-			script.WriteString(shellQuote(output))
-			script.WriteString(" ]; then\n")
-			script.WriteString("    printf '%s\\n' ")
-			script.WriteString(shellQuote("command replay " + manifest.Name + " is missing regular output " + output))
-			script.WriteString(" >&2\n")
-			script.WriteString("    exit 66\n")
-			script.WriteString("  fi\n")
-		}
-		script.WriteString("  exit 0\n")
-		script.WriteString("fi\n")
-	}
-	script.WriteString("printf '%s\\n' ")
-	script.WriteString(shellQuote("command replay " + manifest.Name + " rejected undeclared arguments"))
-	script.WriteString(" >&2\n")
-	script.WriteString("exit 64\n")
+	script.WriteString("exec ")
+	script.WriteString(shellQuote(verifier))
+	script.WriteByte(' ')
+	script.WriteString(shellQuote(scriptReplayProxyMode))
+	script.WriteByte(' ')
+	script.WriteString(shellQuote(endpoint))
+	script.WriteByte(' ')
+	script.WriteString(strconv.FormatUint(uint64(replayID), 10))
+	script.WriteString(" \"$@\"\n")
 	if err := os.WriteFile(destination, []byte(script.String()), 0o700); err != nil {
 		return err
 	}
@@ -737,6 +1402,12 @@ func resolveScriptContent(sourceScript, rawContent, base64Content string) (strin
 }
 
 func main() {
+	if handled, exitCode := executeScriptReplayProxyMode(os.Args[1:], os.Stderr); handled {
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+		return
+	}
 	var appletFlags, interpreterArgs, literalTreeOffsetFlags, replayFlags, requiredAppletFlags, toolFlags, treeFlags repeatedFlag
 	interpreter := flag.String("interpreter", "", "declared interpreter executable")
 	multicall := flag.String("multicall", "", "optional declared multicall executable used to populate PATH")

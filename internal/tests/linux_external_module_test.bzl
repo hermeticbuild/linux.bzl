@@ -1,27 +1,26 @@
 """Analysis test proving external modules consume only their kernel SDK tools."""
 
-load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
+load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts", "unittest")
 load("@rules_bison//bison:toolchain_type.bzl", "BISON_TOOLCHAIN_TYPE")
-load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
+load("@rules_cc//cc:find_cc_toolchain.bzl", "CC_TOOLCHAIN_TYPE", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_flex//flex:toolchain_type.bzl", "FLEX_TOOLCHAIN_TYPE")
 load("@rules_m4//m4:toolchain_type.bzl", "M4_TOOLCHAIN_TYPE")
 load("//internal:execution_platform.bzl", "linux_execution_platform_attr", "linux_execution_platform_label")
 load("//internal:host_cc_toolchain.bzl", "host_cc_toolchain", "host_cc_toolchain_attr")
-load("//internal:linux_modules.bzl", "linux_cc_module")
+load("//internal:linux_modules.bzl", "linux_cc_module", "linux_test_dependency_symvers_kbuild_lines")
 load("//internal:mapped_kernel.bzl", "linux_kbuild_toolset")
 load("//internal:platform_transition_gateway.bzl", "linux_platform_transition")
 load("//internal:providers.bzl", "LinuxModuleInfo", "LinuxModuleSdkInfo")
 load(
     "//internal:rust_toolchain.bzl",
-    "optional_bindgen_toolchain_type",
-    "optional_rust_analyzer_toolchain_type",
-    "optional_rust_toolchain_type",
+    "RUST_TOOLCHAIN_TYPE",
 )
 load("//internal:script_runtime_toolchain.bzl", "SCRIPT_RUNTIME_TOOLCHAIN_TYPE")
 
 visibility("private")
 
 _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE = str(Label("@rules_python//python:exec_tools_toolchain_type"))
+_PERL_TOOLCHAIN_TYPE = str(Label("@rules_perl//perl:toolchain_type"))
 _PLAN_STAGES = ["prehost", "bootstrap", "host", "prep", "target"]
 _TEST_LIBELF_COMPILE_FLAGS = ["-I__LINUX_BZL_HOST_DEPS__/external/libelf/include"]
 _TEST_LIBELF_LINK_FLAGS = ["-L__LINUX_BZL_HOST_DEPS__/external/libelf/lib", "-lelf"]
@@ -31,6 +30,34 @@ _TEST_SHARED_VARS = [
     "LIBELF_FLAGS=" + " ".join(_TEST_LIBELF_COMPILE_FLAGS),
     "LIBELF_LIBS=" + " ".join(_TEST_LIBELF_LINK_FLAGS),
 ]
+_DIVERGENT_PRIMARY_EXECUTION_PLATFORM = Label("//internal/tests:linux_external_module_test_primary_execution_platform")
+_DIVERGENT_RUST_EXECUTION_PLATFORM = Label("//internal/tests:linux_external_module_test_rust_execution_platform")
+_DIVERGENT_RUST_TOOLCHAIN = Label("//internal/tests:linux_external_module_test_rust_only_toolchain")
+_PERL_MISSING_EXECUTION_PLATFORM = Label("//internal/tests:linux_external_module_test_perl_missing_execution_platform")
+_PERL_PRESENT_EXECUTION_PLATFORM = Label("//internal/tests:linux_external_module_test_perl_present_execution_platform")
+_EXTERNAL_MODULE_PLATFORM_TOOLCHAIN_TYPES = [
+    BISON_TOOLCHAIN_TYPE,
+    CC_TOOLCHAIN_TYPE,
+    FLEX_TOOLCHAIN_TYPE,
+    M4_TOOLCHAIN_TYPE,
+    _PERL_TOOLCHAIN_TYPE,
+    _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE,
+    SCRIPT_RUNTIME_TOOLCHAIN_TYPE,
+]
+
+def _dependency_symvers_kbuild_test_impl(ctx):
+    env = unittest.begin(ctx)
+    asserts.equals(
+        env,
+        [
+            "override KBUILD_EXTRA_SYMBOLS := $(KBUILD_EXTRA_SYMBOLS) $(src)/.linux-bzl-dependencies/00000000.symvers",
+            "override KBUILD_EXTRA_SYMBOLS := $(KBUILD_EXTRA_SYMBOLS) $(src)/.linux-bzl-dependencies/00000001.symvers",
+        ],
+        linux_test_dependency_symvers_kbuild_lines(2),
+    )
+    return unittest.end(env)
+
+_dependency_symvers_kbuild_test = unittest.make(_dependency_symvers_kbuild_test_impl)
 
 def _flag_values(argv, flag):
     return [argv[index + 1] for index in range(len(argv) - 1) if argv[index] == flag]
@@ -54,6 +81,97 @@ _probe_runner_fixture = rule(
     implementation = _probe_runner_fixture_impl,
     executable = True,
 )
+
+def _fake_optional_rust_toolchain_impl(_ctx):
+    return [platform_common.ToolchainInfo()]
+
+_fake_optional_rust_toolchain = rule(
+    implementation = _fake_optional_rust_toolchain_impl,
+)
+
+def _divergent_execution_platform_fixtures(name):
+    # The first pair differs only by direct Rust-toolchain availability; the
+    # second differs only by Perl availability. Candidate order makes the SDK's
+    # mapped-kernel-shaped anchors the oracle for the external rule.
+    setting = name + "_execution_platform_slot"
+    primary_slot = name + "_primary_execution_slot"
+    rust_slot = name + "_rust_execution_slot"
+    perl_missing_slot = name + "_perl_missing_execution_slot"
+    perl_present_slot = name + "_perl_present_execution_slot"
+    primary_platform = name + "_primary_execution_platform"
+    rust_platform = name + "_rust_execution_platform"
+    perl_missing_platform = name + "_perl_missing_execution_platform"
+    perl_present_platform = name + "_perl_present_execution_platform"
+    rust_toolchain_impl = name + "_rust_only_toolchain_impl"
+    rust_toolchain = name + "_rust_only_toolchain"
+    native.constraint_setting(name = setting)
+    native.constraint_value(
+        name = primary_slot,
+        constraint_setting = ":" + setting,
+    )
+    native.constraint_value(
+        name = rust_slot,
+        constraint_setting = ":" + setting,
+    )
+    native.constraint_value(
+        name = perl_missing_slot,
+        constraint_setting = ":" + setting,
+    )
+    native.constraint_value(
+        name = perl_present_slot,
+        constraint_setting = ":" + setting,
+    )
+    native.platform(
+        name = primary_platform,
+        allowed_toolchain_types = _EXTERNAL_MODULE_PLATFORM_TOOLCHAIN_TYPES,
+        check_toolchain_types = True,
+        constraint_values = [
+            ":" + primary_slot,
+            "@platforms//cpu:x86_64",
+            "@platforms//os:linux",
+        ],
+    )
+    native.platform(
+        name = rust_platform,
+        allowed_toolchain_types = _EXTERNAL_MODULE_PLATFORM_TOOLCHAIN_TYPES + [RUST_TOOLCHAIN_TYPE],
+        check_toolchain_types = True,
+        constraint_values = [
+            ":" + rust_slot,
+            "@platforms//cpu:x86_64",
+            "@platforms//os:linux",
+        ],
+    )
+    native.platform(
+        name = perl_missing_platform,
+        allowed_toolchain_types = [
+            toolchain_type
+            for toolchain_type in _EXTERNAL_MODULE_PLATFORM_TOOLCHAIN_TYPES + [RUST_TOOLCHAIN_TYPE]
+            if toolchain_type != _PERL_TOOLCHAIN_TYPE
+        ],
+        check_toolchain_types = True,
+        constraint_values = [
+            ":" + perl_missing_slot,
+            "@platforms//cpu:x86_64",
+            "@platforms//os:linux",
+        ],
+    )
+    native.platform(
+        name = perl_present_platform,
+        allowed_toolchain_types = _EXTERNAL_MODULE_PLATFORM_TOOLCHAIN_TYPES + [RUST_TOOLCHAIN_TYPE],
+        check_toolchain_types = True,
+        constraint_values = [
+            ":" + perl_present_slot,
+            "@platforms//cpu:x86_64",
+            "@platforms//os:linux",
+        ],
+    )
+    _fake_optional_rust_toolchain(name = rust_toolchain_impl)
+    native.toolchain(
+        name = rust_toolchain,
+        exec_compatible_with = [":" + rust_slot],
+        toolchain = ":" + rust_toolchain_impl,
+        toolchain_type = RUST_TOOLCHAIN_TYPE,
+    )
 
 def _fake_sdk_impl(ctx):
     target_cc = find_cpp_toolchain(ctx)
@@ -204,16 +322,14 @@ _fake_sdk = rule(
     },
     exec_groups = {"host_cc": exec_group(toolchains = use_cc_toolchain() + [
         BISON_TOOLCHAIN_TYPE,
-        optional_bindgen_toolchain_type(),
         FLEX_TOOLCHAIN_TYPE,
         M4_TOOLCHAIN_TYPE,
-        optional_rust_analyzer_toolchain_type(),
-        optional_rust_toolchain_type(),
         _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE,
+        _PERL_TOOLCHAIN_TYPE,
         SCRIPT_RUNTIME_TOOLCHAIN_TYPE,
     ])},
     fragments = ["cpp"],
-    toolchains = use_cc_toolchain() + [optional_rust_toolchain_type(), _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE, SCRIPT_RUNTIME_TOOLCHAIN_TYPE],
+    toolchains = use_cc_toolchain() + [_PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE, _PERL_TOOLCHAIN_TYPE, SCRIPT_RUNTIME_TOOLCHAIN_TYPE],
 )
 
 def _fake_kernel(name, **kwargs):
@@ -299,17 +415,46 @@ def _external_module_test_impl(ctx):
         asserts.equals(env, 1, len([arg for arg in source_actions[0].argv if arg.startswith(expected_kbuild)]))
     return analysistest.end(env)
 
+_EXTERNAL_MODULE_TEST_ATTRS = {
+    "expected_kbuild_vars": attr.string_list(),
+    "expected_module_name": attr.string(mandatory = True),
+    "expected_output": attr.string(mandatory = True),
+    "expected_shared_vars": attr.string_list(),
+}
+
 _external_module_test = analysistest.make(
     _external_module_test_impl,
-    attrs = {
-        "expected_kbuild_vars": attr.string_list(),
-        "expected_module_name": attr.string(mandatory = True),
-        "expected_output": attr.string(mandatory = True),
-        "expected_shared_vars": attr.string_list(),
-    },
+    attrs = _EXTERNAL_MODULE_TEST_ATTRS,
     config_settings = {
         # External map actions intentionally resolve an execution platform
         # through the same target/host C++ toolchain types as their SDK.
+        "//command_line_option:platforms": str(Label("@platforms//host")),
+    },
+)
+
+_external_module_rust_skew_execution_platform_test = analysistest.make(
+    _external_module_test_impl,
+    attrs = _EXTERNAL_MODULE_TEST_ATTRS,
+    config_settings = {
+        "//command_line_option:extra_execution_platforms": [
+            str(_DIVERGENT_PRIMARY_EXECUTION_PLATFORM),
+            str(_DIVERGENT_RUST_EXECUTION_PLATFORM),
+        ],
+        "//command_line_option:extra_toolchains": [str(_DIVERGENT_RUST_TOOLCHAIN)],
+        "//command_line_option:host_platform": str(Label("@platforms//host")),
+        "//command_line_option:platforms": str(Label("@platforms//host")),
+    },
+)
+
+_external_module_perl_execution_platform_test = analysistest.make(
+    _external_module_test_impl,
+    attrs = _EXTERNAL_MODULE_TEST_ATTRS,
+    config_settings = {
+        "//command_line_option:extra_execution_platforms": [
+            str(_PERL_MISSING_EXECUTION_PLATFORM),
+            str(_PERL_PRESENT_EXECUTION_PLATFORM),
+        ],
+        "//command_line_option:host_platform": str(Label("@platforms//host")),
         "//command_line_option:platforms": str(Label("@platforms//host")),
     },
 )
@@ -341,6 +486,8 @@ _execution_platform_mismatch_test = analysistest.make(
 )
 
 def linux_external_module_test(name):
+    _dependency_symvers_kbuild_test(name = name + "_dependency_symvers_kbuild")
+    _divergent_execution_platform_fixtures(name)
     host_probe_runner = name + "_sdk_host_probe_runner"
     host_recipe_runner = name + "_sdk_host_recipe_runner"
     target_probe_runner = name + "_sdk_target_probe_runner"
@@ -384,6 +531,22 @@ def linux_external_module_test(name):
     )
     _external_module_test(
         name = name,
+        expected_kbuild_vars = ["LINUX_BZL_EXTERNAL_CFLAG_00000000=-DEXTERNAL_PHASE_TEST=1"],
+        expected_module_name = module,
+        expected_output = module + ".ko",
+        expected_shared_vars = _TEST_SHARED_VARS,
+        target_under_test = ":" + module,
+    )
+    _external_module_rust_skew_execution_platform_test(
+        name = name + "_rust_skew_execution_platform",
+        expected_kbuild_vars = ["LINUX_BZL_EXTERNAL_CFLAG_00000000=-DEXTERNAL_PHASE_TEST=1"],
+        expected_module_name = module,
+        expected_output = module + ".ko",
+        expected_shared_vars = _TEST_SHARED_VARS,
+        target_under_test = ":" + module,
+    )
+    _external_module_perl_execution_platform_test(
+        name = name + "_perl_execution_platform",
         expected_kbuild_vars = ["LINUX_BZL_EXTERNAL_CFLAG_00000000=-DEXTERNAL_PHASE_TEST=1"],
         expected_module_name = module,
         expected_output = module + ".ko",

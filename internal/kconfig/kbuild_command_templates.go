@@ -83,21 +83,6 @@ func EvaluateCompactKbuildCommandTemplatesSymbolic(
 	return evaluateCompactKbuildCommandTemplates(profile, rule, target, target, stem, injected, false)
 }
 
-// EvaluateCompactKbuildCommandTemplatesSymbolicForAutomaticTarget is the
-// declaration-local counterpart of EvaluateCompactKbuildCommandTemplatesSymbolic.
-// target remains the canonical graph identity while automaticTarget preserves
-// the selected rule's Make spelling for $@.
-func EvaluateCompactKbuildCommandTemplatesSymbolicForAutomaticTarget(
-	profile CompactKbuildProfile,
-	rule KbuildRule,
-	target, automaticTarget, stem string,
-	injected map[string]string,
-) ([]CompactKbuildCommandTemplate, error) {
-	return evaluateCompactKbuildCommandTemplates(
-		profile, rule, target, automaticTarget, stem, injected, false,
-	)
-}
-
 // EvaluateCompactKbuildCommandTemplatesSymbolicForMakeTarget also preserves
 // the lexical implicit-rule/target-variable lookup identity. The rule's
 // prerequisite slices must contain the exact expanded Make words.
@@ -230,35 +215,6 @@ func ReadCompactKbuildCommandSourceScripts(
 	command string,
 ) ([]CompactKbuildSourceScript, error) {
 	return readCompactKbuildCommandSourceScripts(profile, target, stem, normal, orderOnly, injected, command, true)
-}
-
-// ReadCompactKbuildCommandSourceScriptsForMakeTarget preserves lexical target
-// lookup and automatic-variable identities while discovering immutable source
-// programs in a concrete command.
-func ReadCompactKbuildCommandSourceScriptsForMakeTarget(
-	profile CompactKbuildProfile,
-	target, lookupTarget, automaticTarget, stem string,
-	normal, orderOnly []string,
-	injected map[string]string,
-	command string,
-) ([]CompactKbuildSourceScript, error) {
-	return readCompactKbuildCommandSourceScriptsForMakeTarget(
-		profile, target, lookupTarget, automaticTarget, stem, normal, orderOnly,
-		injected, command, true,
-	)
-}
-
-// ReadCompactKbuildCommandSourceScriptsSymbolic performs source-script
-// discovery without reducing compiler probe atoms in the surrounding target
-// environment.
-func ReadCompactKbuildCommandSourceScriptsSymbolic(
-	profile CompactKbuildProfile,
-	target, stem string,
-	normal, orderOnly []string,
-	injected map[string]string,
-	command string,
-) ([]CompactKbuildSourceScript, error) {
-	return readCompactKbuildCommandSourceScripts(profile, target, stem, normal, orderOnly, injected, command, false)
 }
 
 // ReadCompactKbuildCommandSourceScriptsSymbolicForMakeTarget is the

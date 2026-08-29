@@ -1,6 +1,142 @@
 package kconfig
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestActionRecipeRejectsPrivateRecursiveMakeProvenanceBytes(t *testing.T) {
+	base := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+		Arguments: []string{"-out", "${output:00000000}"}, Outputs: []string{"00000000"},
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*ActionRecipe, string)
+	}{
+		{name: "tool", mutate: func(recipe *ActionRecipe, boundary string) { recipe.Tool = "actionfile" + boundary }},
+		{name: "argument", mutate: func(recipe *ActionRecipe, boundary string) {
+			recipe.Arguments = append(recipe.Arguments, "value"+boundary)
+		}},
+		{name: "environment-name", mutate: func(recipe *ActionRecipe, boundary string) {
+			recipe.Environment = map[string]string{"NAME" + boundary: "value"}
+		}},
+		{name: "environment-value", mutate: func(recipe *ActionRecipe, boundary string) {
+			recipe.Environment = map[string]string{"MAKE": "value" + boundary}
+		}},
+		{name: "working-directory", mutate: func(recipe *ActionRecipe, boundary string) {
+			recipe.WorkingDirectory = "work" + boundary
+		}},
+		{name: "execution-directory", mutate: func(recipe *ActionRecipe, boundary string) {
+			recipe.WorkingDirectory = "work"
+			recipe.ExecutionDirectory = "directory" + boundary
+		}},
+		{name: "declared-working-directory", mutate: func(recipe *ActionRecipe, boundary string) {
+			recipe.WorkingDirectory = "work"
+			recipe.WorkingDirectories = []string{"directory" + boundary}
+		}},
+		{name: "working-input-path", mutate: func(recipe *ActionRecipe, boundary string) {
+			recipe.WorkingDirectory = "work"
+			recipe.Inputs = []string{"data"}
+			recipe.WorkingInputs = map[string]string{"input:data": "data" + boundary}
+		}},
+		{name: "working-output-path", mutate: func(recipe *ActionRecipe, boundary string) {
+			recipe.WorkingDirectory = "work"
+			recipe.WorkingOutputs = map[string]string{"00000000": "output" + boundary}
+		}},
+		{name: "observed-output-path", mutate: func(recipe *ActionRecipe, boundary string) {
+			recipe.WorkingDirectory = "work"
+			recipe.ObservedOutputs = map[string]string{"00000000": "output" + boundary}
+		}},
+		{name: "command-replay-argument", mutate: func(recipe *ActionRecipe, boundary string) {
+			recipe.CommandReplays = []ActionRecipeCommandReplay{{
+				Name: "make", Invocations: []ActionRecipeCommandReplayInvocation{{Arguments: []string{"value" + boundary}}},
+			}}
+		}},
+		{name: "command-replay-output", mutate: func(recipe *ActionRecipe, boundary string) {
+			recipe.CommandReplays = []ActionRecipeCommandReplay{{
+				Name: "make", Invocations: []ActionRecipeCommandReplayInvocation{{Outputs: []string{"output" + boundary}}},
+			}}
+		}},
+	} {
+		for _, boundary := range []struct {
+			name  string
+			value string
+		}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
+			t.Run(test.name+"/"+boundary.name, func(t *testing.T) {
+				recipe := cloneActionRecipe(base)
+				test.mutate(&recipe, boundary.value)
+				if err := recipe.Validate(); err == nil || !strings.Contains(err.Error(), "reserved recursive Make provenance byte") {
+					t.Fatalf("Validate() error = %v, want private provenance-byte rejection", err)
+				}
+			})
+		}
+	}
+}
+
+func TestPrivateRecursiveMakeProvenanceBytesRejectedAtMakeIngress(t *testing.T) {
+	for _, boundary := range []struct {
+		name  string
+		value string
+	}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
+		t.Run(boundary.name+"/source", func(t *testing.T) {
+			if _, err := protectCompactKbuildSourceLiteralActionMarkers("value=" + boundary.value); err == nil ||
+				!strings.Contains(err.Error(), "reserved literal-marker byte") {
+				t.Fatalf("source protection error = %v, want reserved-byte rejection", err)
+			}
+		})
+		t.Run(boundary.name+"/shell-output", func(t *testing.T) {
+			if _, err := normalizeKbuildShellOutput("value=" + boundary.value); err == nil ||
+				!strings.Contains(err.Error(), "reserved provenance byte") {
+				t.Fatalf("shell normalization error = %v, want reserved-byte rejection", err)
+			}
+		})
+	}
+}
+
+func TestActionRecipeMakeShellTransformsRejectPrivateProvenanceBytes(t *testing.T) {
+	transforms := []struct {
+		name string
+		run  func(string) (string, error)
+	}{
+		{name: "value", run: NormalizeActionRecipeMakeShellValue},
+		{name: "single-word", run: QuoteActionRecipeMakeShellSingleWord},
+		{name: "single-quoted-segment", run: FormatActionRecipeMakeShellSingleQuotedSegment},
+	}
+	for _, transform := range transforms {
+		for _, boundary := range []struct {
+			name  string
+			value string
+		}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
+			t.Run(transform.name+"/"+boundary.name, func(t *testing.T) {
+				if _, err := transform.run("value" + boundary.value); err == nil ||
+					!strings.Contains(err.Error(), "reserved provenance byte") {
+					t.Fatalf("transform error = %v, want reserved-byte rejection", err)
+				}
+			})
+		}
+	}
+}
+
+func TestActionRecipeAcceptsPrintableAndProtectedRecursiveMakeLiterals(t *testing.T) {
+	recipe := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+		Arguments: []string{"-out", "${output:00000000}", compactKbuildRecursiveMakeMarker},
+		Environment: map[string]string{
+			"\x04_LINUX_BZL_MAKE__": "named literal",
+		},
+		CommandReplays: []ActionRecipeCommandReplay{{
+			Name: "make",
+			Invocations: []ActionRecipeCommandReplayInvocation{{
+				Arguments: []string{"FLAG=\x04_LINUX_BZL_MAKE__"},
+			}},
+		}},
+		Outputs: []string{"00000000"},
+	}
+	if err := recipe.Validate(); err != nil {
+		t.Fatalf("literal recursive Make spellings rejected: %v", err)
+	}
+}
 
 func TestContentAddressActionPlanNodesRewritesSelectedDependencyEdges(t *testing.T) {
 	profile := CompactKbuildProfile{Name: "root", Path: "Makefile"}

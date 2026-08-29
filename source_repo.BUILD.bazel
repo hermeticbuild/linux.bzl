@@ -2,7 +2,8 @@ package(default_visibility = ["//visibility:public"])
 
 # linux_source_repository replaces this marker with the exact files staged by
 # source_overlays. Keep them explicit so directory symlinks and ordinary source
-# globs have one deterministic ownership model.
+# globs have one deterministic ownership model. Exact BUILD and BUILD.bazel
+# metadata files from overlays are intentionally absent.
 _SOURCE_OVERLAY_FILES = [
     # __LINUX_BZL_SOURCE_OVERLAY_FILES__
 ]

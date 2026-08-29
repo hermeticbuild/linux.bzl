@@ -567,6 +567,113 @@ func TestAppendReferencedPlanTreesClosesWorkingTreesWithoutPlaceholders(t *testi
 	}
 }
 
+func TestAppendReferencedPlanTreesClosesOnlyCommandMetadataSourceNamespaces(t *testing.T) {
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{
+		"compile-recipe": {WorkingTrees: []string{"external"}},
+	}}
+	sourceID, err := ensureActionPlanSource(plan, "external", ".linux-bzl/external/demo/demo.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vendorSourceID, err := ensureActionPlanSource(plan, "vendor", "drivers/vendor/immutable.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Nodes = []ActionPlanNode{
+		{
+			ID:      "compile",
+			Recipe:  "compile-recipe",
+			Sources: []ActionPlanSourceEdge{{Role: "object", SourceID: sourceID}},
+			Trees:   []string{"external", "prep"},
+			Outputs: []ActionPlanOutput{{
+				Tree: "metadata", Path: ".captures/demo.state",
+				ObservedPath: ".linux-bzl/external/demo/.demo.o.cmd",
+			}},
+		},
+		{
+			ID: "resolver",
+			Inputs: []ActionPlanNodeEdge{{
+				Role: "state", ProducerID: "compile", Slot: 0,
+			}},
+			Outputs: []ActionPlanOutput{{
+				Tree: "objects", Path: ".linux-bzl/external/demo/.demo.o.cmd",
+			}},
+		},
+		{
+			ID:      "immutable-command-metadata",
+			Sources: []ActionPlanSourceEdge{{Role: "object", SourceID: sourceID}},
+			Trees:   []string{"external"},
+			Outputs: []ActionPlanOutput{{
+				Tree: "objects", Path: ".linux-bzl/external/demo/.immutable.o.cmd",
+			}},
+		},
+		{
+			ID:      "vendor-command-metadata",
+			Sources: []ActionPlanSourceEdge{{Role: "object", SourceID: vendorSourceID}},
+			Trees:   []string{"vendor"},
+			Outputs: []ActionPlanOutput{{
+				Tree: "objects", Path: "drivers/vendor/.immutable.o.cmd",
+			}},
+		},
+		{
+			ID: "ordinary",
+			Inputs: []ActionPlanNodeEdge{{
+				Role: "state", ProducerID: "compile", Slot: 0,
+			}},
+			Outputs: []ActionPlanOutput{{
+				Tree: "objects", Path: ".linux-bzl/external/demo/demo.o",
+			}},
+		},
+	}
+	for _, test := range []struct {
+		name     string
+		producer string
+		want     []string
+		working  []string
+	}{
+		{name: "relative generated command metadata", producer: "resolver", want: []string{"external"}, working: []string{"external"}},
+		{name: "immutable command metadata", producer: "immutable-command-metadata", want: []string{"external"}},
+		{name: "ordinary generated output", producer: "ordinary"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			node := ActionPlanNode{Inputs: []ActionPlanNodeEdge{{
+				Role: "prerequisite", ProducerID: test.producer, Slot: 0,
+			}}}
+			recipe := ActionRecipe{}
+			if err := appendReferencedPlanTrees(plan, &node, &recipe); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(node.Trees, test.want) || !slices.Equal(recipe.Trees, test.want) {
+				t.Fatalf("source metadata closure = node %q recipe %q, want %q", node.Trees, recipe.Trees, test.want)
+			}
+			if !slices.Equal(recipe.WorkingTrees, test.working) {
+				t.Fatalf("source metadata working trees = %q, want %q", recipe.WorkingTrees, test.working)
+			}
+		})
+	}
+
+	t.Run("multiple command metadata roots union namespaces", func(t *testing.T) {
+		node := ActionPlanNode{Inputs: []ActionPlanNodeEdge{
+			{Role: "prerequisite", ProducerID: "resolver", Slot: 0},
+			{Role: "prerequisite", ProducerID: "vendor-command-metadata", Slot: 0},
+			{Role: "duplicate", ProducerID: "resolver", Slot: 0},
+		}}
+		recipe := ActionRecipe{}
+		if err := appendReferencedPlanTrees(plan, &node, &recipe); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := node.Trees, []string{"external", "vendor"}; !slices.Equal(got, want) {
+			t.Fatalf("multiple metadata roots node trees = %q, want %q", got, want)
+		}
+		if !slices.Equal(recipe.Trees, node.Trees) {
+			t.Fatalf("multiple metadata roots recipe trees = %q, want node trees %q", recipe.Trees, node.Trees)
+		}
+		if got, want := recipe.WorkingTrees, []string{"external"}; !slices.Equal(got, want) {
+			t.Fatalf("multiple metadata roots working trees = %q, want %q", got, want)
+		}
+	})
+}
+
 func TestAppendReferencedPlanTreesClosesKernelSourceRelativeIncludes(t *testing.T) {
 	plan := &ActionPlan{}
 	kernelID, err := ensureActionPlanSource(plan, "kernel", "arch/x86/boot/mkcpustr.c")

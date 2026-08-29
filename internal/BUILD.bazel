@@ -1,4 +1,11 @@
 load(":execution_platform.bzl", "linux_execution_platform")
+load(
+    ":rust_toolchain.bzl",
+    "execution_bindgen_toolchain_resolver",
+    "execution_optional_toolchain_bridge",
+    "execution_rust_source_toolchain_resolver",
+    "execution_rust_toolchain_resolver",
+)
 load(":script_runtime_toolchain.bzl", "linux_x86_64_script_runtime_toolchain")
 
 package(default_visibility = ["//:__subpackages__"])
@@ -8,6 +15,16 @@ exports_files(
     visibility = ["//visibility:public"],
 )
 
+filegroup(
+    name = "linux_source_repository_test_support",
+    srcs = [
+        "linux_source_repository.bzl",
+        "module_make_vars.bzl",
+        "repository_utils.bzl",
+    ],
+    visibility = ["//internal/tests/source_repo:__pkg__"],
+)
+
 toolchain_type(
     name = "script_runtime_toolchain_type",
     visibility = ["//visibility:public"],
@@ -15,6 +32,33 @@ toolchain_type(
 
 linux_execution_platform(
     name = "execution_platform",
+)
+
+execution_optional_toolchain_bridge(
+    name = "execution_rust_toolchain",
+    resolver = ":execution_rust_toolchain_resolver",
+)
+
+execution_rust_toolchain_resolver(
+    name = "execution_rust_toolchain_resolver",
+)
+
+execution_optional_toolchain_bridge(
+    name = "execution_rust_source_toolchain",
+    resolver = ":execution_rust_source_toolchain_resolver",
+)
+
+execution_rust_source_toolchain_resolver(
+    name = "execution_rust_source_toolchain_resolver",
+)
+
+execution_optional_toolchain_bridge(
+    name = "execution_bindgen_toolchain",
+    resolver = ":execution_bindgen_toolchain_resolver",
+)
+
+execution_bindgen_toolchain_resolver(
+    name = "execution_bindgen_toolchain_resolver",
 )
 
 linux_x86_64_script_runtime_toolchain(

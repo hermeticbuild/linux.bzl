@@ -58,6 +58,21 @@ def _in_tree_path(path, what):
             fail("%s must not escape or alias the Linux source root, got %r" % (what, path))
     return normalized
 
+def _source_overlay_package_marker_action(path, is_directory):
+    if is_directory:
+        return None
+    basename = path.rsplit("/", 1)[-1]
+    if basename in ["BUILD", "BUILD.bazel"]:
+        return "ignore"
+    if basename.lower() in ["build", "build.bazel"]:
+        return "reject"
+    return None
+
+# Test seam for the cross-filesystem package-boundary check performed while a
+# source overlay is still represented by ordinary repository paths.
+def linux_test_source_overlay_package_marker_action(path, is_directory = False):
+    return _source_overlay_package_marker_action(path, is_directory)
+
 def _stage_source_overlays(rctx):
     staged_files = []
     for destination in sorted(rctx.attr.source_overlays.keys()):
@@ -84,11 +99,19 @@ def _stage_source_overlays(rctx):
                     if child.is_dir:
                         pending.append((child, child_relative))
                     else:
+                        package_marker_action = _source_overlay_package_marker_action(child_relative, False)
+                        if package_marker_action == "ignore":
+                            continue
+                        if package_marker_action == "reject":
+                            fail(
+                                "source_overlays[%r] contains %r, whose file name case-folds to BUILD or BUILD.bazel but is not an exact Bazel package marker; rename it for deterministic behavior across case-sensitive and case-insensitive filesystems" %
+                                (destination, child_relative),
+                            )
                         files[child_relative] = child
         if pending:
             fail("source_overlays[%r] exceeds maximum directory depth %d" % (destination, _TOOLS_MAX_DEPTH))
         if not files:
-            fail("source_overlays[%r] identifies an empty source tree" % destination)
+            fail("source_overlays[%r] identifies an empty source tree after exact BUILD and BUILD.bazel metadata files are omitted" % destination)
         for relative in sorted(files.keys()):
             staged = normalized + "/" + relative
             rctx.symlink(files[relative], staged)
@@ -355,7 +378,7 @@ linux_source_repository = repository_rule(
         ),
         "source_overlays": attr.string_keyed_label_dict(
             allow_files = True,
-            doc = "Map from in-tree destination directories to marker files identifying source overlay roots.",
+            doc = "Map from in-tree destination directories to marker files identifying source overlay roots. Regular files named exactly BUILD or BUILD.bazel are Bazel metadata and are omitted; case-only variants are rejected for cross-filesystem determinism.",
         ),
         "strip_prefix": attr.string(
             doc = "Archive directory prefix to remove. Catalog entries provide a default.",

@@ -1,6 +1,7 @@
 package kconfig
 
 import (
+	"path"
 	"slices"
 	"strings"
 	"testing"
@@ -190,6 +191,184 @@ FORCE:
 	}
 	if _, err := plan.entries(); err != nil {
 		t.Fatalf("validate external generated compiler action plan: %v", err)
+	}
+}
+
+func TestExternalCompoundCompilerKeepsSourceOverlayIncludeReplayable(t *testing.T) {
+	const (
+		directory       = ".linux-bzl/external/demo"
+		nestedDirectory = directory + "/nested"
+		target          = directory + "/demo.o"
+	)
+	profile := mustCompactKbuildProfileForTest(
+		t,
+		"external-compound-include",
+		"scripts/Makefile.build",
+		directory,
+		"",
+		nil,
+	)
+	profile.evaluator.template.sourceRoots = map[string]string{
+		"__LINUX_BZL_SOURCE_TREE__":              t.TempDir(),
+		"__LINUX_BZL_SOURCE_TREE__/" + directory: t.TempDir(),
+	}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: nestedDirectory,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, objectRoot, err := compactKbuildTypedPrivateExecution(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := "if true; then " + KbuildActionRoleToken("target", "cc") +
+		" -I__LINUX_BZL_OBJECT_TREE__/" + directory + " -c -o " + target + " " + directory + "/demo.c; fi"
+	commands, err := compactKbuildCompoundProgramCommands(template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	analysis, err := compactKbuildCompoundCompilerOutputs(
+		profile,
+		nil,
+		nil,
+		target,
+		compactKbuildRuleMatch{profile: profile},
+		nil,
+		objectRoot,
+		template,
+		commands,
+		target,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewritten, err := applyCompactKbuildScriptSourceReplacements(template, analysis.Replacements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "'-I" + path.Join(objectRoot, directory) + "'"; !strings.Contains(rewritten, want) {
+		t.Fatalf("external compound compiler script = %q, want replayable include %q", rewritten, want)
+	}
+	if bare := "'-I" + directory + "'"; strings.Contains(rewritten, bare) {
+		t.Fatalf("external compound compiler script retains cwd-relative include %q: %q", bare, rewritten)
+	}
+	for _, rejected := range []string{"${work:root}", compactKbuildActionObjectTreeMarker, "__LINUX_BZL_OBJECT_TREE__"} {
+		if strings.Contains(rewritten, rejected+"/"+directory) {
+			t.Fatalf("external compound compiler script retains private include root %q: %q", rejected, rewritten)
+		}
+	}
+}
+
+func TestExternalLinearCompilerKeepsPreparedOverlayIncludeFromNestedMakeDirectory(t *testing.T) {
+	const (
+		directory       = ".linux-bzl/external/demo"
+		nestedDirectory = directory + "/nested"
+		preparedHeader  = directory + "/generated_config.h"
+		source          = directory + "/demo.c"
+		target          = directory + "/demo.o"
+	)
+
+	profile := mustCompactKbuildProfileForTest(
+		t,
+		"external-linear-nested-include",
+		"scripts/Makefile.build",
+		directory,
+		"",
+		nil,
+	)
+	objectRoot := t.TempDir()
+	mustWriteSource(t, objectRoot, preparedHeader, "#define GENERATED_CONFIG 1\n")
+	externalRoot := t.TempDir()
+	mustWriteSource(t, externalRoot, "demo.c", "int demo;\n")
+	profile.evaluator.template.sourceRoots = map[string]string{
+		"__LINUX_BZL_SOURCE_TREE__":              t.TempDir(),
+		"__LINUX_BZL_OBJECT_TREE__":              objectRoot,
+		"__LINUX_BZL_SOURCE_TREE__/" + directory: externalRoot,
+	}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: nestedDirectory,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata := &CompactMetadata{
+		actionRoles:             testTargetActionRoles(append(testConfiguredActionRoles, "cc")...),
+		preconfiguredObjectTree: true,
+		exactSourceNamespaces: map[string]string{
+			preparedHeader: "prep",
+		},
+		sourceNamespaces: map[string]string{
+			"__LINUX_BZL_SOURCE_TREE__/" + directory: "external",
+		},
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{},
+	}
+	sourceID, err := metadata.ensureActionPlanSource(plan, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		withInitialObjectTree(true).
+		forProfile(profile)
+	producer, err := builder.appendCompactKbuildRecipe(
+		target,
+		compactKbuildRuleMatch{profile: profile},
+		[]compactKbuildRuleInput{{path: source, sourceID: sourceID}},
+		nil,
+		[]compactKbuildRecipeCommand{{
+			program: KbuildActionRoleToken("target", "cc"),
+			arguments: []string{
+				"-I__LINUX_BZL_OBJECT_TREE__/" + directory,
+				"-c", "-o", "../demo.o", "../demo.c",
+			},
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("external linear compiler producer %q not found", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if node.Tool != "cc" || recipe.Tool != "cc" || recipe.ExecutionDirectory != "" {
+		t.Fatalf(
+			"external linear compiler execution = tool %q/%q directory %q, want cc at the private root",
+			node.Tool, recipe.Tool, recipe.ExecutionDirectory,
+		)
+	}
+	if wantInclude := "-I" + directory; !slices.Contains(recipe.Arguments, wantInclude) {
+		t.Fatalf("external linear compiler arguments = %#v, want replayable include %q", recipe.Arguments, wantInclude)
+	}
+	if wrongInclude := "-I" + nestedDirectory + "/" + directory; slices.Contains(recipe.Arguments, wrongInclude) {
+		t.Fatalf("external linear compiler arguments retain doubly scoped include %q: %#v", wrongInclude, recipe.Arguments)
+	}
+	if !slices.Contains(sortedStringMapValues(recipe.WorkingInputs), preparedHeader) {
+		t.Fatalf(
+			"external linear compiler working inputs = %#v, want prepared header %q from the overlay include root",
+			recipe.WorkingInputs, preparedHeader,
+		)
+	}
+	preparedSourceID := ""
+	for _, planSource := range plan.Sources {
+		if planSource.Namespace == "prep" && planSource.Path == preparedHeader {
+			preparedSourceID = planSource.ID
+			break
+		}
+	}
+	if preparedSourceID == "" || !slices.ContainsFunc(node.Sources, func(edge ActionPlanSourceEdge) bool {
+		return edge.SourceID == preparedSourceID
+	}) {
+		t.Fatalf(
+			"external linear compiler sources = %#v from %#v, want prepared header %q",
+			node.Sources, plan.Sources, preparedHeader,
+		)
+	}
+	if _, err := plan.entries(); err != nil {
+		t.Fatalf("validate external linear compiler action plan: %v", err)
 	}
 }
 
@@ -426,5 +605,114 @@ $(multi-obj-m): $(obj)/leaf.o
 	}
 	if _, err := plan.entries(); err != nil {
 		t.Fatalf("validate external response-file action plan: %v", err)
+	}
+}
+
+func TestExternalCompilerResponseFileKeepsSourceOverlayIncludeReplayableFromTypedDirectory(t *testing.T) {
+	const (
+		directory       = ".linux-bzl/external/demo"
+		nestedDirectory = directory + "/nested"
+		responseFile    = nestedDirectory + "/options.rsp"
+		source          = directory + "/demo.c"
+		target          = directory + "/demo.o"
+	)
+
+	profile := mustCompactKbuildProfileForTest(
+		t,
+		"external-compiler-response-file",
+		"scripts/Makefile.build",
+		directory,
+		"",
+		nil,
+	)
+	profile.evaluator.template.sourceRoots = map[string]string{
+		"__LINUX_BZL_SOURCE_TREE__":              t.TempDir(),
+		"__LINUX_BZL_SOURCE_TREE__/" + directory: t.TempDir(),
+	}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: nestedDirectory,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata := &CompactMetadata{
+		actionRoles: testTargetActionRoles(append(testConfiguredActionRoles, "cc")...),
+		sourceNamespaces: map[string]string{
+			"__LINUX_BZL_SOURCE_TREE__/" + directory: "external",
+		},
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{},
+	}
+	responseProducer, err := appendActionPlanNode(plan, ActionPlanNode{
+		Stage: "target", Kind: "generate", Tool: "actionfile", Product: "modules",
+		Outputs: []ActionPlanOutput{{Tree: "objects", Path: responseFile}},
+	}, ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+		Arguments: []string{"-out", "${output:00000000}", "-content_base64", ""},
+		Outputs:   []string{"00000000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID, err := metadata.ensureActionPlanSource(plan, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).forProfile(profile)
+	producer, err := builder.appendCompactKbuildRecipe(
+		target,
+		compactKbuildRuleMatch{profile: profile},
+		[]compactKbuildRuleInput{
+			{path: responseFile, producer: responseProducer},
+			{path: source, sourceID: sourceID},
+		},
+		nil,
+		[]compactKbuildRecipeCommand{{
+			program: KbuildActionRoleToken("target", "cc"),
+			arguments: []string{
+				"-I__LINUX_BZL_OBJECT_TREE__/" + directory,
+				"@options.rsp",
+				"-c", "-o", "../demo.o", "../demo.c",
+			},
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("external compiler response-file producer %q not found", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if node.Tool != "cc" || recipe.Tool != "cc" || recipe.ExecutionDirectory != nestedDirectory {
+		t.Fatalf(
+			"external compiler response-file execution = tool %q/%q directory %q, want cc in %q",
+			node.Tool, recipe.Tool, recipe.ExecutionDirectory, nestedDirectory,
+		)
+	}
+	_, objectRoot, err := compactKbuildTypedPrivateExecution(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantInclude := "-I" + path.Join(objectRoot, directory)
+	if !slices.Contains(recipe.Arguments, wantInclude) || !slices.Contains(recipe.Arguments, "@options.rsp") {
+		t.Fatalf(
+			"external compiler response-file arguments = %#v, want include %q and @options.rsp",
+			recipe.Arguments, wantInclude,
+		)
+	}
+	if bare := "-I" + directory; slices.Contains(recipe.Arguments, bare) {
+		t.Fatalf("external compiler response-file arguments retain cwd-relative include %q: %#v", bare, recipe.Arguments)
+	}
+	for _, argument := range recipe.Arguments {
+		if strings.Contains(argument, "${work:root}") || strings.Contains(argument, compactKbuildActionObjectTreeMarker) {
+			t.Fatalf("external compiler response-file arguments retain a private root marker: %#v", recipe.Arguments)
+		}
+	}
+	if _, err := plan.entries(); err != nil {
+		t.Fatalf("validate external compiler response-file action plan: %v", err)
 	}
 }

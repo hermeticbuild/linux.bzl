@@ -39,11 +39,16 @@ func compactKbuildSourceScriptInjections(directory, targetStem string) map[strin
 }
 
 // compactKbuildSourceOverlayRoot identifies an out-of-tree source mapping
-// whose Make process executes in the corresponding writable object overlay.
-// A plain object-tree invocation is not enough: ordinary in-tree Kbuild also
-// executes from the object tree.  The nested source-root mapping is the
-// explicit provenance that the logical directory belongs to a separately
+// whose Make process executes against a writable object overlay. A plain
+// object-tree invocation is not enough: ordinary in-tree Kbuild also executes
+// from the object tree. The nested source-root mapping is the explicit
+// provenance that the profile's logical directory belongs to a separately
 // supplied source tree (for example M= for an external module).
+//
+// The process cwd is deliberately not used for containment. Linux may invoke
+// scripts/Makefile.build from the object-tree root with obj=$M and no -C; that
+// leaves InvocationLocation.Directory empty while profile.Directory carries
+// the selected external directory.
 func compactKbuildSourceOverlayRoot(profile CompactKbuildProfile) (string, bool, error) {
 	location, locationSet := CompactKbuildProfileInvocationLocation(profile)
 	if !locationSet || location.Tree != CompactKbuildInvocationObjectTree ||
@@ -52,9 +57,9 @@ func compactKbuildSourceOverlayRoot(profile CompactKbuildProfile) (string, bool,
 	}
 
 	const sourceRoot = "__LINUX_BZL_SOURCE_TREE__"
-	invocationPath := sourceRoot
-	if location.Directory != "" {
-		invocationPath += "/" + location.Directory
+	directory := strings.Trim(strings.TrimSpace(profile.Directory), "/")
+	if directory == "." {
+		directory = ""
 	}
 	best := ""
 	for marker := range profile.evaluator.template.sourceRoots {
@@ -69,8 +74,7 @@ func compactKbuildSourceOverlayRoot(profile CompactKbuildProfile) (string, bool,
 			}
 			return "", false, fmt.Errorf("nested Kbuild source root %q: %w", marker, err)
 		}
-		candidate := sourceRoot + "/" + canonical
-		if invocationPath != candidate && !strings.HasPrefix(invocationPath, candidate+"/") {
+		if directory != canonical && !strings.HasPrefix(directory, canonical+"/") {
 			continue
 		}
 		if len(canonical) > len(best) {
@@ -79,17 +83,6 @@ func compactKbuildSourceOverlayRoot(profile CompactKbuildProfile) (string, bool,
 	}
 	if best == "" {
 		return "", false, nil
-	}
-
-	directory := strings.Trim(strings.TrimSpace(profile.Directory), "/")
-	if directory == "." {
-		directory = ""
-	}
-	if directory != best && !strings.HasPrefix(directory, best+"/") {
-		return "", false, fmt.Errorf(
-			"Kbuild source overlay %q does not contain logical invocation directory %q",
-			best, profile.Directory,
-		)
 	}
 	return best, true, nil
 }
@@ -243,8 +236,271 @@ func compactKbuildSourceScriptReplayValue(profile CompactKbuildProfile, value st
 	)
 }
 
-func compactKbuildSourceScriptCommandReplays(
+type compactKbuildInvocationMaterialization struct {
+	outputs []string
+	roots   []compactKbuildRuleInput
+}
+
+// compactKbuildInvocationDependencyMaterialization resolves the regular files
+// which make one recursive invocation complete. A recursive goal can itself be
+// phony; in that case the selected terminal recipes, rather than the goal
+// spelling passed to Make, are the files staged into the private object tree
+// and verified by the exact-argv replay proxy.
+func (b *compactKbuildRulePlanBuilder) compactKbuildInvocationDependencyMaterialization(
+	target string,
 	profile CompactKbuildProfile,
+	dependency CompactKbuildInvocationDependency,
+) (compactKbuildInvocationMaterialization, error) {
+	if b == nil || b.plan == nil {
+		return compactKbuildInvocationMaterialization{}, fmt.Errorf(
+			"recursive Make materialization for target %q requires an action-plan builder",
+			target,
+		)
+	}
+	materialization := compactKbuildInvocationMaterialization{}
+	seenOutputs := map[string]bool{}
+	seenRoots := map[string]bool{}
+	appendOutput := func(pathname string) error {
+		pathname = canonicalKbuildRulePath(pathname)
+		if err := validatePlanRelativePath("recursive Make materialized output", pathname); err != nil {
+			return err
+		}
+		if !seenOutputs[pathname] {
+			seenOutputs[pathname] = true
+			// Replays execute from the source command's typed cwd, which can be a
+			// nested invocation directory. Verify the staged artifact through the
+			// private object-tree root instead of interpreting its graph path
+			// relative to that cwd.
+			materialization.outputs = append(materialization.outputs, "${work:root}/"+pathname)
+		}
+		return nil
+	}
+	appendRoot := func(input compactKbuildRuleInput) {
+		identity := fmt.Sprintf("%s\x00%d", input.producer, input.slot)
+		if !seenRoots[identity] {
+			seenRoots[identity] = true
+			input.objectTree = true
+			materialization.roots = append(materialization.roots, input)
+		}
+	}
+
+	target = canonicalKbuildRulePath(target)
+	appendSelectedRoot := func(selection compactKbuildSelectionKey) error {
+		artifact := CompactKbuildVisibleArtifact{
+			Path: selection.target, Profile: selection.profile, Target: selection.target,
+		}
+		input, err := b.exactObjectTreeArtifactInput(artifact)
+		if err != nil {
+			return fmt.Errorf(
+				"working object-tree target %q recursive invocation %q terminal %s: %w",
+				target, dependency.Profile, compactKbuildSelectionKeyString(selection), err,
+			)
+		}
+		appendRoot(input)
+		return appendOutput(selection.target)
+	}
+	selectedRootIsMaterialized := func(selection compactKbuildSelectionKey) (bool, error) {
+		artifact := CompactKbuildVisibleArtifact{
+			Path: selection.target, Profile: selection.profile, Target: selection.target,
+		}
+		owner, err := b.selectionGraph.compactKbuildVisibleArtifactOwner(artifact)
+		if err != nil {
+			return false, err
+		}
+		_, materialized := b.selectionGraph.materializedProducers[owner]
+		return materialized, nil
+	}
+	appendTerminals := func(skipTargets map[string]bool) error {
+		if b == nil || b.selectionGraph == nil {
+			return fmt.Errorf(
+				"working object-tree target %q recursive invocation %q has no exact selection graph",
+				target, dependency.Profile,
+			)
+		}
+		terminals, err := b.selectionGraph.compactKbuildTerminalRecipeSelections(
+			b.metadata, dependency.Profile, b.planContext().Stage,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"working object-tree target %q recursive invocation %q terminals: %w",
+				target, dependency.Profile, err,
+			)
+		}
+		for _, terminal := range terminals {
+			skippedProducer := false
+			peerOutputs := map[string]bool{}
+			members := b.selectionGraph.compactKbuildGroupedSelectionMembers(terminal)
+			for _, member := range members {
+				pathname := canonicalKbuildRulePath(member.target)
+				if skipTargets[pathname] {
+					skippedProducer = true
+				} else if pathname != "" {
+					peerOutputs[pathname] = true
+				}
+				producer := b.selectionGraph.materializedProducers[member]
+				node, materialized := compactKbuildPlanNode(b.plan, producer)
+				if !materialized {
+					continue
+				}
+				if slices.ContainsFunc(node.Outputs, func(output ActionPlanOutput) bool {
+					return skipTargets[canonicalKbuildRulePath(output.Path)]
+				}) {
+					skippedProducer = true
+				}
+				for _, output := range node.Outputs {
+					pathname := canonicalKbuildRulePath(output.Path)
+					if pathname != "" && !skipTargets[pathname] {
+						peerOutputs[pathname] = true
+					}
+				}
+			}
+			if skippedProducer {
+				if len(peerOutputs) != 0 {
+					return fmt.Errorf(
+						"working object-tree target %q recursive invocation %q terminal %s overwrites parent paths %q but shares its producer with non-overwritten outputs %q",
+						target, dependency.Profile, compactKbuildSelectionKeyString(terminal),
+						slices.Sorted(maps.Keys(skipTargets)), slices.Sorted(maps.Keys(peerOutputs)),
+					)
+				}
+				continue
+			}
+			if err := appendSelectedRoot(terminal); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if b != nil && b.selectionGraph != nil {
+		parentPaths := map[string]bool{}
+		if target != "" {
+			parentPaths[target] = true
+		}
+		appendParentSelection := func(selection compactKbuildSelectionKey) {
+			if selection.profile != profile.Name {
+				return
+			}
+			for _, member := range b.selectionGraph.compactKbuildGroupedSelectionMembers(selection) {
+				if pathname := canonicalKbuildRulePath(member.target); pathname != "" {
+					parentPaths[pathname] = true
+				}
+			}
+		}
+		if b.selectionBound {
+			appendParentSelection(b.selection)
+		}
+		for _, parentTarget := range []string{target, canonicalKbuildRulePath(dependency.Target)} {
+			if selection, selected := b.selectionGraph.selectionsByProfileTarget[compactKbuildProfileTargetKey{
+				profile: profile.Name, target: parentTarget,
+			}]; selected {
+				appendParentSelection(selection)
+			}
+		}
+		overwrittenParentPaths := map[string]bool{}
+		for _, parentPath := range slices.Sorted(maps.Keys(parentPaths)) {
+			artifact, ok := b.selectionGraph.compactKbuildInitialVisibleArtifact(dependency.Profile, parentPath)
+			if ok && artifact == (CompactKbuildVisibleArtifact{
+				Path: parentPath, Profile: profile.Name, Target: parentPath,
+			}) {
+				overwrittenParentPaths[parentPath] = true
+				if err := appendOutput(parentPath); err != nil {
+					return compactKbuildInvocationMaterialization{}, err
+				}
+			}
+		}
+		if len(overwrittenParentPaths) != 0 {
+			// The parent script materializes the version visible when the child
+			// starts. The recursive invocation overwrites those same regular files,
+			// so the proxy verifies the parent outputs but the parent action does
+			// not acquire a self-input edge. This comparison covers every exact
+			// grouped peer produced by the parent, not only the representative used
+			// to lower the shared action.
+			if err := appendTerminals(overwrittenParentPaths); err != nil {
+				return compactKbuildInvocationMaterialization{}, err
+			}
+			return materialization, nil
+		}
+	}
+
+	unresolvedGoals := []string{}
+	for _, rawGoal := range dependency.Goals {
+		goal := compactKbuildGraphTargetPath(rawGoal)
+		directoryGoal := goal == "." || strings.HasSuffix(goal, "/")
+		validatedGoal := strings.TrimSuffix(goal, "/")
+		if goal != "." {
+			if err := validatePlanRelativePath("recursive Make goal", validatedGoal); err != nil {
+				return compactKbuildInvocationMaterialization{}, err
+			}
+		}
+		if directoryGoal {
+			// A trailing slash (or the invocation root itself) is a Make dispatch
+			// goal, not a regular file the replay proxy can verify.
+			unresolvedGoals = append(unresolvedGoals, goal)
+			continue
+		}
+		if goal == "" {
+			return compactKbuildInvocationMaterialization{}, fmt.Errorf(
+				"working object-tree target %q recursive invocation %q has an empty goal",
+				target, dependency.Profile,
+			)
+		}
+		if b != nil && b.selectionGraph != nil {
+			selection, selected := b.selectionGraph.selectionsByProfileTarget[compactKbuildProfileTargetKey{
+				profile: dependency.Profile, target: goal,
+			}]
+			if selected {
+				materialized, err := selectedRootIsMaterialized(selection)
+				if err != nil {
+					return compactKbuildInvocationMaterialization{}, err
+				}
+				if materialized {
+					if err := appendSelectedRoot(selection); err != nil {
+						return compactKbuildInvocationMaterialization{}, err
+					}
+					continue
+				}
+				// Phony, directory-setup, and other ordering-only selections are
+				// retained in the exact graph but intentionally publish no regular
+				// file. Complete their invocation through its materialized terminal
+				// recipes instead of treating the selected target spelling as output.
+				unresolvedGoals = append(unresolvedGoals, goal)
+				continue
+			}
+			if len(b.selectionGraph.outputOwnersByPath[goal]) > 1 {
+				unresolvedGoals = append(unresolvedGoals, goal)
+				continue
+			}
+		}
+		producer, slot, ok := b.existingProducer(goal)
+		if !ok {
+			unresolvedGoals = append(unresolvedGoals, goal)
+			continue
+		}
+		appendRoot(compactKbuildRuleInput{
+			path: goal, producer: producer, slot: slot, objectTree: true,
+		})
+		if err := appendOutput(goal); err != nil {
+			return compactKbuildInvocationMaterialization{}, err
+		}
+	}
+	if len(unresolvedGoals) == 0 {
+		return materialization, nil
+	}
+	if b == nil || b.selectionGraph == nil {
+		return compactKbuildInvocationMaterialization{}, fmt.Errorf(
+			"working object-tree target %q recursive invocation %q goals %q have no materialized producer",
+			target, dependency.Profile, unresolvedGoals,
+		)
+	}
+	if err := appendTerminals(nil); err != nil {
+		return compactKbuildInvocationMaterialization{}, err
+	}
+	return materialization, nil
+}
+
+func (b *compactKbuildRulePlanBuilder) compactKbuildSourceScriptCommandReplays(
+	profile CompactKbuildProfile,
+	consumerTarget string,
 	targets ...string,
 ) ([]ActionRecipeCommandReplay, error) {
 	targetSet := map[string]bool{}
@@ -254,7 +510,7 @@ func compactKbuildSourceScriptCommandReplays(
 		}
 	}
 	invocations := []ActionRecipeCommandReplayInvocation{}
-	seen := map[string]bool{}
+	invocationByArguments := map[string]int{}
 	for _, dependency := range profile.TargetInvocationDependencies {
 		if !targetSet[canonicalKbuildRulePath(dependency.Target)] {
 			continue
@@ -269,20 +525,29 @@ func compactKbuildSourceScriptCommandReplays(
 		for index, argument := range dependency.ReplayArguments {
 			arguments[index] = compactKbuildSourceScriptReplayValue(profile, argument)
 		}
+		materialization, err := b.compactKbuildInvocationDependencyMaterialization(
+			consumerTarget, profile, dependency,
+		)
+		if err != nil {
+			return nil, err
+		}
 		key := strings.Join(arguments, "\x00")
-		if seen[key] {
+		if invocationIndex, seen := invocationByArguments[key]; seen {
+			outputs := append(invocations[invocationIndex].Outputs, materialization.outputs...)
+			sort.Strings(outputs)
+			invocations[invocationIndex].Outputs = slices.Compact(outputs)
 			continue
 		}
-		seen[key] = true
+		invocationByArguments[key] = len(invocations)
 		invocations = append(invocations, ActionRecipeCommandReplayInvocation{
 			Arguments: arguments,
-			Outputs:   append([]string(nil), dependency.Goals...),
+			Outputs:   materialization.outputs,
 		})
 	}
 	if len(invocations) == 0 {
 		return nil, nil
 	}
-	return []ActionRecipeCommandReplay{{Name: "make", Invocations: invocations}}, nil
+	return []ActionRecipeCommandReplay{{Name: CompactKbuildRecursiveMakeReplayName, Invocations: invocations}}, nil
 }
 
 // compactKbuildSourceScriptEnvironment returns GNU Make's exact exported
@@ -408,6 +673,10 @@ func compactKbuildActionEnvironment(
 		)
 		if err != nil {
 			return nil, nil, fmt.Errorf("Kbuild action effective variable %s: %w", name, err)
+		}
+		if name == "MAKE" && rewritten == CompactKbuildRecursiveMakeProvenanceToken {
+			delete(environment, name)
+			continue
 		}
 		environment[name] = compactKbuildFinalizeRootedActionRecipeText(rewritten)
 		for _, role := range roles {
@@ -573,6 +842,18 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 				)
 			}
 			input.workingOnly = true
+			// A selected invocation may consume the exact version of its own
+			// output path left by a predecessor and then replace it in a different
+			// immutable Bazel stage. That byte-state dependency is an overwrite,
+			// even though the writers cannot collide in one physical output tree.
+			// Require both source-recorded initial visibility and registered output
+			// ownership so an incidental same-named working-tree file cannot become
+			// terminal producer lineage.
+			if b.selectionBound &&
+				pathname == canonicalKbuildRulePath(target) &&
+				b.selectionGraph.compactKbuildSelectionOwnsPath(b.selection, pathname) {
+				input.overwriteLineage = true
+			}
 			baseline = append(baseline, input)
 		}
 	}
@@ -647,51 +928,20 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 		if canonicalKbuildRulePath(dependency.Target) != canonicalKbuildRulePath(target) {
 			continue
 		}
-		unresolvedGoals := []string{}
-		for _, goal := range dependency.Goals {
-			producer, slot, ok := b.existingProducer(goal)
-			if ok {
-				addRoot(producer)
-				nativeRoots[producerOutput{producer: producer, slot: slot}] = true
-			} else {
-				unresolvedGoals = append(unresolvedGoals, goal)
-			}
-		}
-		if len(unresolvedGoals) == 0 {
-			continue
-		}
-		// Recursive Make goals are often phony dispatch nodes such as __build.
-		// They have no file producer of their own; the exact selected invocation
-		// completes at its terminal materialized recipes. Reuse the validated
-		// selection graph which established materialization order instead of
-		// guessing a target name from the phony boundary.
-		if b.selectionGraph == nil {
-			return nil, fmt.Errorf("working object-tree target %q recursive invocation %q goals %q have no materialized producer", target, dependency.Profile, unresolvedGoals)
-		}
-		terminals, err := b.selectionGraph.compactKbuildTerminalRecipeSelections(
-			b.metadata, dependency.Profile, b.planContext().Stage,
+		materialization, err := b.compactKbuildInvocationDependencyMaterialization(
+			target, profile, dependency,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("working object-tree target %q recursive invocation %q terminals: %w", target, dependency.Profile, err)
+			return nil, err
 		}
-		for _, terminal := range terminals {
-			if b.selectionGraph.forwardingSelections[terminal] {
-				owner, ok := b.selectionGraph.owner(terminal.target)
-				if !ok {
-					return nil, fmt.Errorf("working object-tree target %q recursive invocation %q forwarding terminal %s has no selected owner", target, dependency.Profile, compactKbuildSelectionKeyString(terminal))
-				}
-				terminal = owner
-			}
-			producer, slot, ok := b.existingProducer(terminal.target)
-			if !ok {
-				return nil, fmt.Errorf("working object-tree target %q recursive invocation %q terminal %s has no producer visible from %s stage", target, dependency.Profile, compactKbuildSelectionKeyString(terminal), b.planContext().Stage)
-			}
-			addRoot(producer)
-			nativeRoots[producerOutput{producer: producer, slot: slot}] = true
+		for _, root := range materialization.roots {
+			addRoot(root.producer)
+			nativeRoots[producerOutput{producer: root.producer, slot: root.slot}] = true
 		}
 	}
 
 	preferInput := func(preferred, other compactKbuildRuleInput) compactKbuildRuleInput {
+		preferred.overwriteLineage = preferred.overwriteLineage || other.overwriteLineage
 		// The selected producer is still a native prerequisite when either
 		// equivalent graph position was a native root. Preserve the native
 		// root's order-only classification in that case.

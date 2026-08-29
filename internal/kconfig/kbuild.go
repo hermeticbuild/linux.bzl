@@ -112,6 +112,24 @@ func NewKbuildVariableBase(variables map[string]string) *KbuildVariableBase {
 	return &KbuildVariableBase{variables: newKbuildInitialVariables(variables)}
 }
 
+// NewKbuildVariableBaseWithRecursiveMakeDefault validates an ordinary
+// invocation environment and installs the evaluator-owned recursive Make
+// capability only when the caller did not configure MAKE. Keeping capability
+// creation in this constructor lets source-derived child overlays propagate a
+// genuine $(MAKE) value without treating arbitrary configured bytes as trusted.
+func NewKbuildVariableBaseWithRecursiveMakeDefault(variables map[string]string) (*KbuildVariableBase, error) {
+	if err := ValidateKbuildOrdinaryVariables("Kbuild invocation", variables); err != nil {
+		return nil, err
+	}
+	base := NewKbuildVariableBase(variables)
+	if _, configured := base.variables.lookup("MAKE"); !configured {
+		base.variables = base.variables.withOverrides(map[string]string{
+			"MAKE": CompactKbuildRecursiveMakeProvenanceToken,
+		})
+	}
+	return base, nil
+}
+
 type KbuildOptions struct {
 	RootDir string
 	// WorkingDir is the directory in which GNU Make is invoked. It differs
@@ -210,6 +228,48 @@ type KbuildOptions struct {
 	SkipExportedVariables bool
 }
 
+func normalizeKbuildSourceRoots(sourceRoots map[string]string) (map[string]string, error) {
+	if sourceRoots == nil {
+		return nil, nil
+	}
+	const sourceRoot = "__LINUX_BZL_SOURCE_TREE__"
+	markers := make([]string, 0, len(sourceRoots))
+	for marker := range sourceRoots {
+		markers = append(markers, marker)
+	}
+	sort.Strings(markers)
+	result := make(map[string]string, len(sourceRoots))
+	original := make(map[string]string, len(sourceRoots))
+	for _, marker := range markers {
+		canonicalMarker := marker
+		trimmed := filepath.ToSlash(strings.TrimSpace(marker))
+		if strings.HasPrefix(trimmed, sourceRoot+"/") {
+			cleaned := filepath.ToSlash(filepath.Clean(filepath.FromSlash(trimmed)))
+			if !strings.HasPrefix(cleaned, sourceRoot+"/") {
+				return nil, fmt.Errorf("nested Kbuild source root %q escapes %s", marker, sourceRoot)
+			}
+			relative := strings.TrimPrefix(cleaned, sourceRoot+"/")
+			canonical, err := canonicalCompactKbuildInvocationPath(relative)
+			if err != nil || canonical == "" || canonical == "." {
+				if err == nil {
+					err = fmt.Errorf("path is empty")
+				}
+				return nil, fmt.Errorf("nested Kbuild source root %q: %w", marker, err)
+			}
+			canonicalMarker = sourceRoot + "/" + canonical
+		}
+		if previous, exists := original[canonicalMarker]; exists {
+			return nil, fmt.Errorf(
+				"Kbuild source roots %q and %q have duplicate canonical marker %q",
+				previous, marker, canonicalMarker,
+			)
+		}
+		original[canonicalMarker] = marker
+		result[canonicalMarker] = sourceRoots[marker]
+	}
+	return result, nil
+}
+
 func (opts KbuildOptions) hasVariable(name string) bool {
 	if _, ok := opts.Variables[name]; ok {
 		return true
@@ -235,12 +295,20 @@ func ParseKbuildFileTree(path string, opts KbuildOptions) (*KbuildFile, error) {
 }
 
 func parseKbuildFileTree(path string, opts KbuildOptions, variableOverrides map[string]string) (*KbuildFile, error) {
+	var err error
+	opts.SourceRoots, err = normalizeKbuildSourceRoots(opts.SourceRoots)
+	if err != nil {
+		return nil, err
+	}
 	if opts.MaxIncludeDepth == 0 {
 		opts.MaxIncludeDepth = 64
 	}
 	if opts.RootDir != "" {
 		if _, overridden := variableOverrides["srctree"]; !overridden {
 			if !opts.hasVariable("srctree") {
+				if err := ValidateKbuildOrdinaryValue("Kbuild srctree root", opts.RootDir); err != nil {
+					return nil, err
+				}
 				if variableOverrides == nil {
 					variableOverrides = map[string]string{}
 				}
@@ -301,6 +369,11 @@ func parseKbuild(r io.Reader, filename string, vars map[string]string, baseDir s
 }
 
 func parseKbuildWithOptions(r io.Reader, filename string, opts KbuildOptions, baseDir string) (*KbuildFile, error) {
+	var err error
+	opts.SourceRoots, err = normalizeKbuildSourceRoots(opts.SourceRoots)
+	if err != nil {
+		return nil, err
+	}
 	parser := newKbuildParserWithVariableBase(opts.VariableBase, opts.Variables, nil, baseDir)
 	parser.applyEnvironmentVariables(opts.EnvironmentVariables)
 	parser.applyCommandLineVariables(opts.CommandLineVariables, opts.AutoExportCommandLineVariables)
@@ -383,7 +456,9 @@ func (p *kbuildParser) finalizeExportedVariables() error {
 }
 
 func (p *kbuildParser) parseReader(r io.Reader, filename string) error {
-	p.appendMakefileList(filename)
+	if err := p.appendMakefileList(filename); err != nil {
+		return err
+	}
 	scanner := bufio.NewScanner(r)
 	lineNo := 0
 	var logical strings.Builder
@@ -430,13 +505,17 @@ func (p *kbuildParser) parseReader(r io.Reader, filename string) error {
 	return nil
 }
 
-func (p *kbuildParser) appendMakefileList(filename string) {
+func (p *kbuildParser) appendMakefileList(filename string) error {
 	filename = filepath.ToSlash(filename)
+	if err := ValidateKbuildOrdinaryValue("Kbuild MAKEFILE_LIST filename", filename); err != nil {
+		return err
+	}
 	current := ""
 	if variable, ok := p.lookupVariable("MAKEFILE_LIST"); ok {
 		current = variable.value
 	}
 	p.setVariable("MAKEFILE_LIST", kbuildVariable{value: appendMakeValue(current, filename)})
+	return nil
 }
 
 type kbuildParser struct {
@@ -723,10 +802,6 @@ type kbuildConditionalFrame struct {
 
 func newKbuildParser(vars map[string]string, baseDir string) *kbuildParser {
 	return newKbuildParserWithVariableBase(nil, vars, nil, baseDir)
-}
-
-func newKbuildParserWithOverrides(vars, overrides map[string]string, baseDir string) *kbuildParser {
-	return newKbuildParserWithVariableBase(nil, vars, overrides, baseDir)
 }
 
 func newKbuildInitialVariables(vars map[string]string) *kbuildInitialVariables {
@@ -2224,7 +2299,10 @@ func (p *kbuildParser) evalReference(original, clause string, depth int) (string
 					}
 					args[0] = resolved
 					if !makeArgsContainProbeSymbol(args) {
-						return p.evalMakeFunction(name, args, original), nil
+						if makeArgsContainReference(args) && !p.expandedReferencesAreLiteral {
+							return original, nil
+						}
+						return p.expandWildcard(args[0])
 					}
 				}
 				if p.transformSymbolic == nil {
@@ -2244,6 +2322,33 @@ func (p *kbuildParser) evalReference(original, clause string, depth int) (string
 					return original, nil
 				}
 				return p.makeFile(args[0], original)
+			}
+			if name == "wildcard" {
+				if len(args) != 1 {
+					return original, nil
+				}
+				if makeArgsContainReference(args) && !p.expandedReferencesAreLiteral {
+					return original, nil
+				}
+				return p.expandWildcard(args[0])
+			}
+			if name == "realpath" {
+				if len(args) != 1 {
+					return original, nil
+				}
+				if makeArgsContainReference(args) && !p.expandedReferencesAreLiteral {
+					return original, nil
+				}
+				return p.expandRealPaths(args[0])
+			}
+			if name == "abspath" {
+				if len(args) != 1 {
+					return original, nil
+				}
+				if makeArgsContainReference(args) && !p.expandedReferencesAreLiteral {
+					return original, nil
+				}
+				return p.expandAbsPaths(args[0])
 			}
 			return p.evalMakeFunction(name, args, original), nil
 		}
@@ -2856,7 +2961,7 @@ func (p *kbuildParser) evalShell(args []string, original string, depth int) (str
 		if p.sourceShell != nil {
 			value, sourceErr := p.sourceShell(command, p.workingDir)
 			if sourceErr == nil {
-				return NormalizeGNUMakeShellOutput(value), nil
+				return normalizeKbuildShellOutput(value)
 			}
 			if !IsLinuxProbeUnsupportedCommand(sourceErr) {
 				return "", fmt.Errorf("%s: evaluate Kbuild source shell command %q: %w", p.currentPos, command, sourceErr)
@@ -2874,6 +2979,13 @@ func (p *kbuildParser) evalShell(args []string, original string, depth int) (str
 	}
 	if err != nil {
 		return "", fmt.Errorf("%s: evaluate Kbuild shell command %q: %w", p.currentPos, command, err)
+	}
+	return normalizeKbuildShellOutput(value)
+}
+
+func normalizeKbuildShellOutput(value string) (string, error) {
+	if compactKbuildContainsPrivateProvenanceByte(value) {
+		return "", fmt.Errorf("Kbuild shell output contains a reserved provenance byte")
 	}
 	return NormalizeGNUMakeShellOutput(value), nil
 }
@@ -4062,25 +4174,7 @@ func (p *kbuildParser) evalMakeFunction(name string, args []string, original str
 		}
 		return value
 	}
-	switch name {
-	case "abspath":
-		if len(args) != 1 {
-			return original
-		}
-		return mapMakeWords(args[0], p.makeAbsPath)
-	case "realpath":
-		if len(args) != 1 {
-			return original
-		}
-		return mapMakeWordsDropEmpty(args[0], p.makeRealPath)
-	case "wildcard":
-		if len(args) != 1 {
-			return original
-		}
-		return p.expandWildcard(args[0])
-	default:
-		return original
-	}
+	return original
 }
 
 // evalPureKbuildMakeFunction is the context-free subset that can be replayed
@@ -4106,12 +4200,12 @@ func evalPureKbuildMakeFunction(name string, args []string, original string) (st
 		if len(args) != 2 {
 			return badArity()
 		}
-		return mapMakeWords(args[1], func(word string) string { return strings.TrimSpace(args[0]) + word }), true, nil
+		return mapMakeWords(args[1], func(word string) string { return args[0] + word }), true, nil
 	case "addsuffix":
 		if len(args) != 2 {
 			return badArity()
 		}
-		return mapMakeWords(args[1], func(word string) string { return word + strings.TrimSpace(args[0]) }), true, nil
+		return mapMakeWords(args[1], func(word string) string { return word + args[0] }), true, nil
 	case "basename":
 		if len(args) != 1 {
 			return badArity()
@@ -4216,7 +4310,38 @@ func evalPureKbuildMakeFunction(name string, args []string, original string) (st
 	}
 }
 
-func (p *kbuildParser) expandWildcard(patterns string) string {
+// ValidateKbuildOrdinaryValue closes an ordinary-text-to-Make boundary over
+// the private recursive-Make delimiters. Reject each delimiter independently,
+// rather than only the complete token: Make string functions can copy, delete,
+// reorder, and concatenate inputs, but cannot synthesize either reserved byte
+// from delimiter-free ordinary data.
+func ValidateKbuildOrdinaryValue(operation, value string) error {
+	if compactKbuildContainsPrivateProvenanceByte(value) {
+		return fmt.Errorf("%s contains a reserved recursive Make provenance byte", operation)
+	}
+	return nil
+}
+
+// ValidateKbuildOrdinaryVariables validates both names and values before a
+// configured variable map crosses into the Kbuild evaluator.
+func ValidateKbuildOrdinaryVariables(operation string, variables map[string]string) error {
+	names := make([]string, 0, len(variables))
+	for name := range variables {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := ValidateKbuildOrdinaryValue(operation+" variable name", name); err != nil {
+			return err
+		}
+		if err := ValidateKbuildOrdinaryValue(fmt.Sprintf("%s variable %q", operation, name), variables[name]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *kbuildParser) expandWildcard(patterns string) (string, error) {
 	var out []string
 	for _, pattern := range strings.Fields(patterns) {
 		matches, relBase := p.glob(pattern)
@@ -4237,10 +4362,15 @@ func (p *kbuildParser) expandWildcard(patterns string) string {
 		for _, candidate := range lazyMatches {
 			visible = append(visible, filepath.ToSlash(candidate))
 		}
+		for _, match := range visible {
+			if err := ValidateKbuildOrdinaryValue("Kbuild wildcard result", match); err != nil {
+				return "", err
+			}
+		}
 		sort.Strings(visible)
 		out = append(out, slices.Compact(visible)...)
 	}
-	return strings.Join(out, " ")
+	return strings.Join(out, " "), nil
 }
 
 func (p *kbuildParser) makeAbsPath(word string) string {
@@ -4282,6 +4412,18 @@ func (p *kbuildParser) makeAbsPath(word string) string {
 	return filepath.ToSlash(abs)
 }
 
+func (p *kbuildParser) expandAbsPaths(words string) (string, error) {
+	resolved := make([]string, 0, len(strings.Fields(words)))
+	for _, word := range strings.Fields(words) {
+		value := p.makeAbsPath(word)
+		if err := ValidateKbuildOrdinaryValue("Kbuild abspath result", value); err != nil {
+			return "", err
+		}
+		resolved = append(resolved, value)
+	}
+	return strings.Join(resolved, " "), nil
+}
+
 func (p *kbuildParser) makeRealPath(word string) string {
 	abs := p.makeAbsPath(word)
 	filesystemPath, prefix, mapped := p.mappedFilesystemPath(abs)
@@ -4315,6 +4457,21 @@ func (p *kbuildParser) makeRealPath(word string) string {
 	return filepath.ToSlash(resolved)
 }
 
+func (p *kbuildParser) expandRealPaths(words string) (string, error) {
+	resolved := make([]string, 0, len(strings.Fields(words)))
+	for _, word := range strings.Fields(words) {
+		value := p.makeRealPath(word)
+		if value == "" {
+			continue
+		}
+		if err := ValidateKbuildOrdinaryValue("Kbuild realpath result", value); err != nil {
+			return "", err
+		}
+		resolved = append(resolved, value)
+	}
+	return strings.Join(resolved, " "), nil
+}
+
 func (p *kbuildParser) makeFile(arg, original string) (string, error) {
 	path, ok := strings.CutPrefix(strings.TrimSpace(arg), "<")
 	if !ok {
@@ -4334,7 +4491,11 @@ func (p *kbuildParser) makeFile(arg, original string) (string, error) {
 			if !exact {
 				return "", fmt.Errorf("Kbuild file read of visible virtual file %q requires exact contents", virtualPath)
 			}
-			return strings.TrimSuffix(contents, "\n"), nil
+			contents = strings.TrimSuffix(contents, "\n")
+			if err := ValidateKbuildOrdinaryValue("Kbuild virtual file contents", contents); err != nil {
+				return "", err
+			}
+			return contents, nil
 		}
 	}
 	if mapped, _, ok := p.mappedFilesystemPath(path); ok {
@@ -4348,7 +4509,11 @@ func (p *kbuildParser) makeFile(arg, original string) (string, error) {
 	if err != nil {
 		return "", nil
 	}
-	return strings.TrimSuffix(string(data), "\n"), nil
+	contents := strings.TrimSuffix(string(data), "\n")
+	if err := ValidateKbuildOrdinaryValue("Kbuild file contents", contents); err != nil {
+		return "", err
+	}
+	return contents, nil
 }
 
 // mappedFilesystemPath resolves a stable Make-visible source-root path solely

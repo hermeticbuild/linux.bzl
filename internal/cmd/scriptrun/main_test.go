@@ -3,14 +3,27 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
+
+func TestMain(testMain *testing.M) {
+	if handled, exitCode := executeScriptReplayProxyMode(os.Args[1:], os.Stderr); handled {
+		os.Exit(exitCode)
+	}
+	os.Exit(testMain.Run())
+}
 
 func writeExecutable(t *testing.T, directory, name, contents string) string {
 	t.Helper()
@@ -19,6 +32,21 @@ func writeExecutable(t *testing.T, directory, name, contents string) string {
 		t.Fatal(err)
 	}
 	return filename
+}
+
+func writeReplayRuntime(t *testing.T, directory string) string {
+	t.Helper()
+	return writeExecutable(t, directory, "runtime", `#!/bin/sh
+if [ "$1" = --list ]; then
+	printf '%s\n' '[' sh
+	exit 0
+fi
+if [ "$1" != sh ]; then
+	exit 64
+fi
+shift
+exec /bin/sh "$@"
+`)
 }
 
 func TestRunScriptUsesDeclaredSourceStreamsAndExternalTool(t *testing.T) {
@@ -436,20 +464,12 @@ func TestValidateScriptToolNameAcceptsBusyBoxTestApplets(t *testing.T) {
 }
 
 func TestRunScriptReplayProxyAcceptsOnlyDeclaredArgumentsWithRegularOutputs(t *testing.T) {
+	t.Setenv("MAKE", "make")
 	directory := t.TempDir()
-	interpreter := writeExecutable(t, directory, "runtime", `#!/bin/sh
-if [ "$1" = --list ]; then
-	printf '%s\n' '[' sh
-	exit 0
-fi
-if [ "$1" = sh ]; then
-	shift
-	exec /bin/sh "$@"
-fi
-exit 64
-`)
+	interpreter := writeReplayRuntime(t, directory)
 	relativeOutput := "child/generated 'file'.o"
 	absoluteOutput := filepath.Join(directory, "absolute output")
+	unreadableOutput := filepath.Join(directory, "unreadable output")
 	if err := os.Mkdir(filepath.Join(directory, "child"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -458,11 +478,17 @@ exit 64
 			t.Fatal(err)
 		}
 	}
+	if err := os.WriteFile(unreadableOutput, []byte("executable"), 0o101); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unreadableOutput, 0o101); err != nil {
+		t.Fatal(err)
+	}
 	manifestJSON, err := json.Marshal(scriptReplayManifest{
 		Name: "make",
 		Invocations: []scriptReplayInvocation{{
 			Arguments: []string{"-f", "Makefile", "obj=init dir", "quoted'value"},
-			Outputs:   []string{relativeOutput, absoluteOutput},
+			Outputs:   []string{relativeOutput, absoluteOutput, unreadableOutput},
 		}},
 	})
 	if err != nil {
@@ -486,7 +512,7 @@ exit 64
 		interpreter:     interpreter,
 		interpreterArgs: []string{"sh"},
 		multicall:       interpreter,
-		scriptContent:   "#!/bin/sh\nmake -f Makefile 'obj=init dir' \"quoted'value\"\nprintf replay-ok\n",
+		scriptContent:   "#!/bin/sh\n\"$MAKE\" -f Makefile 'obj=init dir' \"quoted'value\"\nprintf replay-ok\n",
 		tools:           map[string]string{},
 		toolContracts:   map[string]toolaction.Contract{},
 		replays:         replays,
@@ -499,18 +525,442 @@ exit 64
 	if got, want := stdout.String(), "replay-ok"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
+	if info, err := os.Stat(unreadableOutput); err != nil {
+		t.Fatal(err)
+	} else if got, want := info.Mode().Perm(), os.FileMode(0o101); got != want {
+		t.Fatalf("unreadable output mode = %#o, want %#o", got, want)
+	}
+}
+
+func TestRunScriptReplayKeepsAuthoritativeStateOutOfRuntimeFilesystem(t *testing.T) {
+	directory := t.TempDir()
+	interpreter := writeReplayRuntime(t, directory)
+	output := filepath.Join(directory, "generated.o")
+	if err := os.WriteFile(output, []byte("materialized"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The source can read and write its same-uid runtime directory. It must find
+	// neither the old authoritative state/receipt files nor expected argv/output
+	// identity embedded in the executable replay wrapper.
+	script := `#!/bin/sh
+runtime=${PATH%/bin}
+for candidate in "$runtime"/replay-state-* "$runtime"/replay-receipts; do
+  [ ! -e "$candidate" ] || exit 81
+done
+proxy=$(command -v make)
+while IFS= read -r line; do
+  case "$line" in
+    *expected*|*generated.o*) exit 82 ;;
+  esac
+done < "$proxy"
+make expected
+`
+	var stderr bytes.Buffer
+	err := runScript(scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		scriptContent: script, replays: []scriptReplayManifest{{
+			Name: "make", Invocations: []scriptReplayInvocation{{Arguments: []string{"expected"}, Outputs: []string{output}}},
+		}},
+		tools: map[string]string{}, toolContracts: map[string]toolaction.Contract{},
+		stdout: ioDiscard{}, stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runScript() exposed writable replay authority: %v\nstderr: %s", err, stderr.String())
+	}
+}
+
+func TestScriptReplayArgumentIdentityPreservesInvalidUTF8Bytes(t *testing.T) {
+	raw := string([]byte{0xff, 0xfe})
+	replacement := "\ufffd\ufffd"
+	if err := validateReplayManifests([]scriptReplayManifest{{
+		Name: "make",
+		Invocations: []scriptReplayInvocation{
+			{Arguments: []string{raw}},
+			{Arguments: []string{replacement}},
+		},
+	}}, nil); err != nil {
+		t.Fatalf("byte-distinct argv were treated as duplicates: %v", err)
+	}
+
+	directory := t.TempDir()
+	output := filepath.Join(directory, "generated.o")
+	if err := os.WriteFile(output, []byte("materialized"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := prepareScriptReplayRuntime(scriptReplayManifest{
+		Name: "make", Invocations: []scriptReplayInvocation{{Arguments: []string{raw}, Outputs: []string{output}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := startScriptReplayBroker([]*scriptReplayRuntimeManifest{prepared})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = broker.Close() }()
+	if err := runScriptReplayProxy(broker.endpoint, 0, []string{raw}); err != nil {
+		t.Fatalf("byte-exact invalid UTF-8 argv was rejected: %v", err)
+	}
+	err = runScriptReplayProxy(broker.endpoint, 0, []string{replacement})
+	var failure *scriptReplayProxyFailure
+	if !errors.As(err, &failure) || failure.exitCode != 64 {
+		t.Fatalf("replacement-rune argv error = %v, want exact status 64", err)
+	}
+}
+
+func TestScriptReplayBrokerRejectsMalformedProtocolWithStatus70(t *testing.T) {
+	directory := t.TempDir()
+	output := filepath.Join(directory, "generated.o")
+	if err := os.WriteFile(output, []byte("materialized"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := prepareScriptReplayRuntime(scriptReplayManifest{
+		Name: "make", Invocations: []scriptReplayInvocation{{Arguments: []string{"expected"}, Outputs: []string{output}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := startScriptReplayBroker([]*scriptReplayRuntimeManifest{prepared})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = broker.Close() }()
+
+	var valid bytes.Buffer
+	if err := writeScriptReplayRequest(&valid, 0, []string{"expected"}); err != nil {
+		t.Fatal(err)
+	}
+	withTrailing := append(append([]byte(nil), valid.Bytes()...), 0x7f)
+	tooManyArguments := make([]byte, 16)
+	copy(tooManyArguments[:8], scriptReplayProtocol)
+	binary.BigEndian.PutUint32(tooManyArguments[12:16], maxReplayArguments+1)
+	for _, test := range []struct {
+		name    string
+		request []byte
+	}{
+		{name: "truncated", request: []byte(scriptReplayProtocol)},
+		{name: "wrong identity", request: make([]byte, 16)},
+		{name: "too many arguments", request: tooManyArguments},
+		{name: "trailing bytes", request: withTrailing},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			connection, err := net.DialUnix("unix", nil, &net.UnixAddr{Net: "unix", Name: broker.endpoint})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			if err := writeScriptReplayBytes(connection, test.request); err != nil {
+				t.Fatal(err)
+			}
+			if err := connection.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			exitCode, diagnostic, err := readScriptReplayResponse(connection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if exitCode != 70 || diagnostic == "" {
+				t.Fatalf("malformed protocol response = (%d, %q), want status 70 with diagnostic", exitCode, diagnostic)
+			}
+		})
+	}
+	unknownErr := runScriptReplayProxy(broker.endpoint, 99, nil)
+	var unknownFailure *scriptReplayProxyFailure
+	if !errors.As(unknownErr, &unknownFailure) || unknownFailure.exitCode != 70 {
+		t.Fatalf("unknown replay identity error = %v, want status 70", unknownErr)
+	}
+}
+
+func TestRunScriptReplayProxyRejectsPreexistingOutputMutationBeforeReplay(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		mutation   func(string) string
+		diagnostic string
+	}{
+		{
+			name:       "content",
+			mutation:   func(output string) string { return "printf modified >" + shellQuote(output) },
+			diagnostic: "changed content before replay",
+		},
+		{
+			name:       "executable bits",
+			mutation:   func(output string) string { return "/bin/chmod 700 " + shellQuote(output) },
+			diagnostic: "changed executable bits before replay",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			interpreter := writeReplayRuntime(t, directory)
+			output := filepath.Join(directory, "generated.o")
+			if err := os.WriteFile(output, []byte("original"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			err := runScript(scriptRunOptions{
+				interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+				scriptContent: "#!/bin/sh\n" + test.mutation(output) + "\nmake expected\n", replays: []scriptReplayManifest{{
+					Name: "make", Invocations: []scriptReplayInvocation{{Arguments: []string{"expected"}, Outputs: []string{output}}},
+				}},
+				tools: map[string]string{}, toolContracts: map[string]toolaction.Contract{},
+				stdout: ioDiscard{}, stderr: &stderr,
+			})
+			if err == nil {
+				t.Fatal("runScript() accepted a mutated preexisting replay output")
+			}
+			if !strings.Contains(stderr.String(), test.diagnostic) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), test.diagnostic)
+			}
+		})
+	}
+}
+
+func TestRunScriptReplayProxyAcceptsNewOutputCreatedAtReplay(t *testing.T) {
+	directory := t.TempDir()
+	interpreter := writeReplayRuntime(t, directory)
+	output := filepath.Join(directory, "generated.o")
+	var stderr bytes.Buffer
+	err := runScript(scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		scriptContent: "#!/bin/sh\nprintf original >" + shellQuote(output) + "\nmake expected\n", replays: []scriptReplayManifest{{
+			Name: "make", Invocations: []scriptReplayInvocation{{Arguments: []string{"expected"}, Outputs: []string{output}}},
+		}},
+		tools: map[string]string{}, toolContracts: map[string]toolaction.Contract{},
+		stdout: ioDiscard{}, stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runScript() rejected an output created at the replay boundary: %v\nstderr: %s", err, stderr.String())
+	}
+}
+
+func TestRunScriptReplayBrokerEstablishesNewOutputReceiptAtomically(t *testing.T) {
+	runtimeRoot := t.TempDir()
+	output := filepath.Join(runtimeRoot, "generated.o")
+	manifest := scriptReplayManifest{
+		Name: "make", Invocations: []scriptReplayInvocation{{Arguments: []string{"expected"}, Outputs: []string{output}}},
+	}
+	prepared, err := prepareScriptReplayRuntime(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := startScriptReplayBroker([]*scriptReplayRuntimeManifest{prepared})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = broker.Close() }()
+	if err := os.WriteFile(output, []byte("materialized"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const invocations = 16
+	start := make(chan struct{})
+	errors := make(chan error, invocations)
+	var wait sync.WaitGroup
+	for range invocations {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			errors <- runScriptReplayProxy(broker.endpoint, 0, []string{"expected"})
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Errorf("runScriptReplayProxy() failed: %v", err)
+		}
+	}
+	if err := verifyScriptReplayReceipts([]*scriptReplayRuntimeManifest{prepared}); err != nil {
+		t.Fatalf("verifyScriptReplayReceipts() failed: %v", err)
+	}
+	if err := os.WriteFile(output, []byte("modified----"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runScriptReplayProxy(broker.endpoint, 0, []string{"expected"}); err == nil || !strings.Contains(err.Error(), "changed content after replay") {
+		t.Fatalf("repeated runScriptReplayProxy() error = %v, want changed-content error", err)
+	}
+}
+
+func TestScriptReplayBrokerCloseDrainsAcceptedRequest(t *testing.T) {
+	directory := t.TempDir()
+	output := filepath.Join(directory, "generated.o")
+	if err := os.WriteFile(output, []byte("materialized"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := prepareScriptReplayRuntime(scriptReplayManifest{
+		Name: "make", Invocations: []scriptReplayInvocation{{Arguments: []string{"expected"}, Outputs: []string{output}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := startScriptReplayBroker([]*scriptReplayRuntimeManifest{prepared})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := net.DialUnix("unix", nil, &net.UnixAddr{Net: "unix", Name: broker.endpoint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		broker.mu.Lock()
+		accepted := len(broker.connections) == 1
+		broker.mu.Unlock()
+		if accepted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("broker did not accept test connection")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- broker.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("broker close did not drain accepted request: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := writeScriptReplayRequest(connection, 0, []string{"expected"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	exitCode, diagnostic, err := readScriptReplayResponse(connection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exitCode != 0 || diagnostic != "" {
+		t.Fatalf("drained replay response = (%d, %q), want success", exitCode, diagnostic)
+	}
+	if err := <-closed; err != nil {
+		t.Fatalf("broker close failed after draining request: %v", err)
+	}
+}
+
+func TestSnapshotScriptReplayOutputPinsRegularFileAndRejectsSymlink(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "output")
+	original := filepath.Join(directory, "original")
+	replacement := filepath.Join(directory, "replacement")
+	if err := os.WriteFile(path, []byte("original"), 0o101); err != nil {
+		t.Fatal(err)
+	}
+	fd, pinned, available, err := pinScriptReplayOutput(path)
+	if err != nil || !available {
+		t.Fatalf("pinScriptReplayOutput() = (%d, %#v, %t, %v), want regular file", fd, pinned, available, err)
+	}
+	defer syscall.Close(fd)
+	if err := os.Rename(path, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	currentFD, current, available, err := pinScriptReplayOutput(path)
+	if err != nil || !available {
+		t.Fatalf("pin replacement = (%d, %#v, %t, %v)", currentFD, current, available, err)
+	}
+	_ = syscall.Close(currentFD)
+	if sameScriptReplayFile(pinned, current) {
+		t.Fatal("O_PATH descriptor followed a pathname replacement")
+	}
+	if err := os.Rename(path, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(original, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, available, err := snapshotScriptReplayOutput(path); err != nil || available {
+		t.Fatalf("snapshot symlink = (available %t, error %v), want rejected non-regular output", available, err)
+	}
+	if info, err := os.Stat(original); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o101 {
+		t.Fatalf("pinned unreadable output mode = %#o, want restored 0101", info.Mode().Perm())
+	}
+}
+
+func TestStableScriptReplayFileRejectsConcurrentWriteMetadata(t *testing.T) {
+	stable := syscall.Stat_t{
+		Dev: 3, Ino: 7, Mode: syscall.S_IFREG | 0o600, Size: 11,
+		Mtim: syscall.Timespec{Sec: 13, Nsec: 17},
+		Ctim: syscall.Timespec{Sec: 19, Nsec: 23},
+	}
+	if !stableScriptReplayFile(stable, stable) {
+		t.Fatal("identical regular-file metadata was unstable")
+	}
+	for _, mutate := range []func(*syscall.Stat_t){
+		func(stat *syscall.Stat_t) { stat.Size++ },
+		func(stat *syscall.Stat_t) { stat.Mtim.Nsec++ },
+		func(stat *syscall.Stat_t) { stat.Ctim.Nsec++ },
+		func(stat *syscall.Stat_t) { stat.Mode |= 0o100 },
+		func(stat *syscall.Stat_t) { stat.Ino++ },
+	} {
+		changed := stable
+		mutate(&changed)
+		if stableScriptReplayFile(stable, changed) {
+			t.Fatalf("changed metadata %#v was accepted as stable against %#v", changed, stable)
+		}
+	}
+}
+
+func TestRunScriptReplayProxyRejectsNewOutputMutationAfterReplay(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		mutation   func(string) string
+		diagnostic string
+	}{
+		{
+			name:       "content",
+			mutation:   func(output string) string { return "printf modified >" + shellQuote(output) },
+			diagnostic: "changed content after replay",
+		},
+		{
+			name:       "executable bits",
+			mutation:   func(output string) string { return "/bin/chmod 700 " + shellQuote(output) },
+			diagnostic: "changed executable bits after replay",
+		},
+		{
+			name:       "missing",
+			mutation:   func(output string) string { return "/bin/rm " + shellQuote(output) },
+			diagnostic: "missing regular output",
+		},
+		{
+			name: "nonregular",
+			mutation: func(output string) string {
+				return "/bin/rm " + shellQuote(output) + " && /bin/mkdir " + shellQuote(output)
+			},
+			diagnostic: "missing regular output",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			interpreter := writeReplayRuntime(t, directory)
+			output := filepath.Join(directory, "generated.o")
+			err := runScript(scriptRunOptions{
+				interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+				scriptContent: "#!/bin/sh\nprintf original >" + shellQuote(output) + "\nmake expected\n" + test.mutation(output) + "\n", replays: []scriptReplayManifest{{
+					Name: "make", Invocations: []scriptReplayInvocation{{Arguments: []string{"expected"}, Outputs: []string{output}}},
+				}},
+				tools: map[string]string{}, toolContracts: map[string]toolaction.Contract{},
+				stdout: ioDiscard{}, stderr: ioDiscard{},
+			})
+			if err == nil {
+				t.Fatal("runScript() accepted a newly created replay output mutated after the boundary")
+			}
+			if !strings.Contains(err.Error(), test.diagnostic) {
+				t.Fatalf("runScript() error = %q, want %q", err, test.diagnostic)
+			}
+		})
+	}
 }
 
 func TestRunScriptReplayProxyRejectsUndeclaredArguments(t *testing.T) {
 	directory := t.TempDir()
-	interpreter := writeExecutable(t, directory, "runtime", `#!/bin/sh
-if [ "$1" = --list ]; then
-	printf '%s\n' '[' sh
-	exit 0
-fi
-shift
-exec /bin/sh "$@"
-`)
+	interpreter := writeReplayRuntime(t, directory)
 	output := filepath.Join(directory, "generated.o")
 	if err := os.WriteFile(output, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -527,6 +977,9 @@ exec /bin/sh "$@"
 	if err == nil {
 		t.Fatal("runScript() accepted undeclared replay arguments")
 	}
+	if !strings.Contains(err.Error(), "exit status 64") {
+		t.Fatalf("runScript() error = %q, want replay exit status 64", err)
+	}
 	if !strings.Contains(stderr.String(), "rejected undeclared arguments") {
 		t.Fatalf("stderr = %q, want undeclared-arguments diagnostic", stderr.String())
 	}
@@ -534,14 +987,7 @@ exec /bin/sh "$@"
 
 func TestRunScriptReplayProxyRejectsMissingOrNonRegularOutput(t *testing.T) {
 	directory := t.TempDir()
-	interpreter := writeExecutable(t, directory, "runtime", `#!/bin/sh
-if [ "$1" = --list ]; then
-	printf '%s\n' '[' sh
-	exit 0
-fi
-shift
-exec /bin/sh "$@"
-`)
+	interpreter := writeReplayRuntime(t, directory)
 	for _, test := range []struct {
 		name            string
 		createDirectory bool
@@ -567,6 +1013,9 @@ exec /bin/sh "$@"
 			})
 			if err == nil {
 				t.Fatal("runScript() accepted a missing or non-regular replay output")
+			}
+			if !strings.Contains(err.Error(), "exit status 66") {
+				t.Fatalf("runScript() error = %q, want replay exit status 66", err)
 			}
 			if !strings.Contains(stderr.String(), "missing regular output") {
 				t.Fatalf("stderr = %q, want regular-output diagnostic", stderr.String())

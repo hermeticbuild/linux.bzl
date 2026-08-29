@@ -1,6 +1,7 @@
 package kconfig
 
 import (
+	"path"
 	"slices"
 	"strings"
 	"testing"
@@ -26,7 +27,7 @@ func TestRewriteCompactKbuildCompilerRelativeIncludesUsesInvocationTree(t *testi
 				"-I.", "-iquote", "../include", "-isystem=toolchain/include",
 				"-include", "generated/autoconf.h", "-I-",
 			}
-			got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", arguments)
+			got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", ".", arguments)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -51,15 +52,59 @@ func TestRewriteCompactKbuildCompilerRelativeIncludesAllowsRootAndRejectsEscape(
 	}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", []string{"-I.", "-I=toolchain/include"})
+	got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", ".", []string{"-I.", "-I=toolchain/include"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := []string{"-I${work:root}", "-I=toolchain/include"}; !slices.Equal(got, want) {
 		t.Fatalf("root include argv = %#v, want %#v", got, want)
 	}
-	if _, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", []string{"-I../escape"}); err == nil {
+	if _, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", ".", []string{"-I../escape"}); err == nil {
 		t.Fatal("include directory escaping its declared object tree was accepted")
+	}
+}
+
+func TestRewriteCompactKbuildCompilerIncludesKeepsSourceOverlayPathsReplayable(t *testing.T) {
+	const directory = ".linux-bzl/external/demo"
+	profile := CompactKbuildProfile{Directory: directory}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profile.evaluator = &kbuildTargetEvaluator{template: &kbuildParser{
+		sourceRoots: map[string]string{
+			"__LINUX_BZL_SOURCE_TREE__":              t.TempDir(),
+			"__LINUX_BZL_SOURCE_TREE__/" + directory: t.TempDir(),
+		},
+	}}
+	arguments := []string{
+		"-I__LINUX_BZL_OBJECT_TREE__/" + directory,
+		"-include", "__LINUX_BZL_OBJECT_TREE__/" + directory + "/local.h",
+		"-I__LINUX_BZL_OBJECT_TREE__/include/generated",
+	}
+	for _, test := range []struct {
+		name       string
+		objectRoot string
+	}{
+		{name: "private root", objectRoot: "."},
+		{name: "typed nested cwd", objectRoot: "../../../.."},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", test.objectRoot, arguments)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rootedDirectory := path.Join(test.objectRoot, directory)
+			want := []string{
+				"-I" + rootedDirectory,
+				"-include", path.Join(rootedDirectory, "local.h"),
+				"-I__LINUX_BZL_OBJECT_TREE__/include/generated",
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("source-overlay include argv = %#v, want replayable %#v", got, want)
+			}
+		})
 	}
 }
 
@@ -71,7 +116,7 @@ func TestRewriteCompactKbuildCompilerRelativeIncludesStopsAtDoubleDash(t *testin
 		t.Fatal(err)
 	}
 	arguments := []string{"-Ibefore", "--", "-Iafter", "-include", "ignored.h"}
-	got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", arguments)
+	got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", ".", arguments)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +137,7 @@ func TestRewriteCompactKbuildBindgenRelativeIncludesUsesPostDelimiterCompilerArg
 		"bindings_helper.h", "-o", "bindings_generated.rs",
 		"--", "-I.", "-include", "generated/autoconf.h", "-I=toolchain/include",
 	}
-	got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "bindgen", arguments)
+	got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "bindgen", ".", arguments)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +154,7 @@ func TestRewriteCompactKbuildBindgenRelativeIncludesUsesPostDelimiterCompilerArg
 		{"bindings_helper.h", "-Ibefore"},
 		{"bindings_helper.h", "--", "-Ione", "--", "-Itwo"},
 	} {
-		got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "bindgen", malformed)
+		got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "bindgen", ".", malformed)
 		if err != nil {
 			t.Fatal(err)
 		}

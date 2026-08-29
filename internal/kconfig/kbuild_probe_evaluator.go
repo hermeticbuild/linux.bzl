@@ -2935,8 +2935,10 @@ func (e *LinuxProbeEvaluator) KbuildShell(ctx context.Context, command string) (
 	// Make has removed one escaping layer, while the real shell would replace
 	// the remaining pair with its PID. The symbolic evaluator never executes
 	// the wrapper, so retain and validate that exact token.
-	validTempDir := kbuildTryRunTemp.MatchString(tempDir) || tempDir == ".tmp_$$"
-	if !validTempDir || trapDir != tempDir || mkdirDir != tempDir {
+	if !validKbuildTryRunTempDir(tempDir) {
+		return "", fmt.Errorf("Linux Kbuild try-run has invalid temporary directory %q", tempDir)
+	}
+	if trapDir != tempDir || mkdirDir != tempDir {
 		return "", fmt.Errorf("Linux Kbuild try-run has inconsistent temporary directory")
 	}
 	probeCommand := strings.TrimSpace(match[4])
@@ -2961,4 +2963,25 @@ func (e *LinuxProbeEvaluator) KbuildShell(ctx context.Context, command string) (
 	}
 	e.kbuildShellResults.store(command, value)
 	return value, nil
+}
+
+func validKbuildTryRunTempDir(value string) bool {
+	validBase := func(base string) bool {
+		return kbuildTryRunTemp.MatchString(base) || base == ".tmp_$$"
+	}
+	if validBase(value) {
+		return true
+	}
+	const sourcePrefix = "__LINUX_BZL_SOURCE_TREE__/"
+	if !strings.HasPrefix(value, sourcePrefix) {
+		return false
+	}
+	relative := strings.TrimPrefix(value, sourcePrefix)
+	separator := strings.LastIndexByte(relative, '/')
+	if separator <= 0 || !validBase(relative[separator+1:]) {
+		return false
+	}
+	directory := relative[:separator]
+	return !strings.ContainsAny(directory, "$%") &&
+		validatePlanRelativePath("Kbuild try-run temporary directory", directory) == nil
 }

@@ -1718,6 +1718,9 @@ func (e *LinuxProbeEvaluator) readText(reference ProbeReference, request ProbeRe
 	if result.Text != want {
 		return "", fmt.Errorf("Linux text probe result %s disagrees with its exact reduction", reference.NodeID)
 	}
+	if err := ValidateKbuildOrdinaryValue("Linux text probe result "+reference.NodeID, result.Text); err != nil {
+		return "", err
+	}
 	if strings.ContainsRune(result.Text, 0) {
 		return "", fmt.Errorf("Linux text probe result %s contains NUL", reference.NodeID)
 	}

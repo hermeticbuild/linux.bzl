@@ -1275,7 +1275,7 @@ func TestGenericKbuildCompoundProjectsAbsoluteRuntimeCommandHeadOnly(t *testing.
 
 func TestGenericKbuildCompoundPreservesLiteralTreeMarkerPayloads(t *testing.T) {
 	metadata, target := compactGenericRecipeMetadataForTest(
-		t, `printf '%s\n' '__LINUX_BZL_OBJECT_TREE__' '$${tree:prep}' | tools/filter > $@`, ":", "generated/result.h",
+		t, `printf '%s\n' '__LINUX_BZL_OBJECT_TREE__' '__LINUX_BZL_MAKE__' '$${tree:prep}' | tools/filter > $@`, ":", "generated/result.h",
 	)
 	plan := compactGenericRecipePlanForTest()
 	if err := buildCompactKbuildTargetForTest(metadata, plan, target); err != nil {
@@ -1283,7 +1283,7 @@ func TestGenericKbuildCompoundPreservesLiteralTreeMarkerPayloads(t *testing.T) {
 	}
 	recipe := plan.Recipes[plan.Nodes[len(plan.Nodes)-1].Recipe]
 	script := compactKbuildRecipeScriptContentForTest(t, recipe)
-	for _, literal := range []string{`'__LINUX_BZL_OBJECT_TREE__'`, `'${tree:prep}'`} {
+	for _, literal := range []string{`'__LINUX_BZL_OBJECT_TREE__'`, `'__LINUX_BZL_MAKE__'`, `'${tree:prep}'`} {
 		if !strings.Contains(script, literal) {
 			t.Fatalf("compound script mutated literal marker %q: %q", literal, script)
 		}
@@ -1292,6 +1292,89 @@ func TestGenericKbuildCompoundPreservesLiteralTreeMarkerPayloads(t *testing.T) {
 		return strings.HasPrefix(argument, "prep=")
 	}) {
 		t.Fatalf("literal marker provenance bindings=%#v", recipe.Arguments)
+	}
+	if len(recipe.CommandReplays) != 0 {
+		t.Fatalf("source-authored recursive Make lookalike created replay capability: %#v", recipe.CommandReplays)
+	}
+}
+
+func TestGenericKbuildCompoundSeparatesConstructedMakeLiteralFromRecursiveMake(t *testing.T) {
+	const target = "generated/result.h"
+	profile := mustCompactKbuildProfileForTest(t, "build:root", "scripts/Makefile.build", "", `
+make_marker_prefix := __LINUX_BZL_
+cmd_transform = printf '%s\n' '$(make_marker_prefix)MAKE__' > $@; $(MAKE) child.o
+`+target+`: FORCE
+	$(call if_changed,transform)
+`, map[string]string{"MAKE": CompactKbuildRecursiveMakeProvenanceToken})
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profile.TargetInvocationDependencies = []CompactKbuildInvocationDependency{{
+		Target: target, Profile: "build:child", Goals: []string{"child.o"},
+		ReplayArguments: []string{"child.o"},
+	}}
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	childRecipe := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+		Arguments: []string{"-out", "${output:00000000}"}, Outputs: []string{"00000000"},
+	}
+	childNode := ActionPlanNode{
+		Stage: "target", Kind: "generate", Tool: "actionfile", Product: "vmlinux",
+		Outputs: []ActionPlanOutput{{Tree: "objects", Path: "child.o"}},
+	}
+	if _, err := appendActionPlanNode(plan, childNode, childRecipe); err != nil {
+		t.Fatal(err)
+	}
+	if err := buildCompactKbuildTargetForTest(metadata, plan, target); err != nil {
+		t.Fatal(err)
+	}
+	recipe := plan.Recipes[plan.Nodes[len(plan.Nodes)-1].Recipe]
+	script := compactKbuildRecipeScriptContentForTest(t, recipe)
+	if strings.Count(script, compactKbuildRecursiveMakeMarker) != 1 ||
+		!strings.Contains(script, "'"+compactKbuildRecursiveMakeMarker+"'") ||
+		!strings.Contains(script, "make child.o") ||
+		strings.Contains(script, CompactKbuildRecursiveMakeProvenanceToken) {
+		t.Fatalf("constructed literal and recursive Make lost provenance: %q", script)
+	}
+	if len(recipe.CommandReplays) != 1 ||
+		!slices.Equal(recipe.CommandReplays[0].Invocations[0].Arguments, []string{"child.o"}) {
+		t.Fatalf("recursive Make replay = %#v, want exact child.o invocation", recipe.CommandReplays)
+	}
+}
+
+func TestGenericKbuildCompoundRejectsPrivateProvenanceByteBeforeScriptEncoding(t *testing.T) {
+	const target = "generated/result.h"
+	for _, boundary := range []struct {
+		name  string
+		value string
+	}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
+		t.Run(boundary.name, func(t *testing.T) {
+			profile := mustCompactKbuildProfileForTest(t, "build:root", "scripts/Makefile.build", "", `
+cmd_transform = printf '%s\n' '$(PRIVATE)' | tools/filter > $@
+`+target+`: input.txt tools/filter FORCE
+	$(call if_changed,transform)
+`, map[string]string{"PRIVATE": boundary.value})
+			profile = compactKbuildProfileWithSourcesForTest(t, profile, "input.txt", "tools/filter")
+			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+				Tree: CompactKbuildInvocationObjectTree,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			metadata := &CompactMetadata{
+				actionRoles: testConfiguredScopedActionRoles,
+				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+			}
+			err := buildCompactKbuildTargetForTest(metadata, compactGenericRecipePlanForTest(), target)
+			if err == nil || !strings.Contains(err.Error(), "unlowered private action placeholder") {
+				t.Fatalf("compound build error = %v, want private-placeholder rejection before script encoding", err)
+			}
+		})
 	}
 }
 
@@ -4476,8 +4559,11 @@ cmd_cc_o_c = $(CC) $(ccflags-y) -c -o $@ $<
 		"__LINUX_BZL_SOURCE_TREE__":              kernelRoot,
 		"__LINUX_BZL_SOURCE_TREE__/" + directory: externalRoot,
 	}
+	// Linux 6.12 runs `make -f scripts/Makefile.build obj=$M` without
+	// changing directory. The process therefore remains at the object-tree
+	// root even though the evaluated profile and its targets live below M.
 	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
-		Tree: CompactKbuildInvocationObjectTree, Directory: directory,
+		Tree: CompactKbuildInvocationObjectTree,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -4504,11 +4590,12 @@ cmd_cc_o_c = $(CC) $(ccflags-y) -c -o $@ $<
 		t.Fatalf("external compile producer %q not found", producer)
 	}
 	recipe := plan.Recipes[node.Recipe]
-	if !slices.Contains(recipe.Arguments, "-I${work:root}/"+directory) {
-		t.Fatalf("external compiler arguments do not use staged source overlay: %#v", recipe.Arguments)
+	if !slices.Contains(recipe.Arguments, "-I"+directory) {
+		t.Fatalf("external compiler arguments do not use the replayable staged source overlay: %#v", recipe.Arguments)
 	}
 	joined := strings.Join(append(slices.Clone(recipe.Arguments), sortedStringMapValues(recipe.Environment)...), " ")
 	for _, rejected := range []string{
+		"-I${work:root}/" + directory,
 		"-I${tree:kernel}/" + directory,
 		"$(src)", "$(srcroot)", "$(abs_output)", "__LINUX_BZL_",
 	} {
@@ -4690,7 +4777,9 @@ FORCE:
 		if sourceDescriptor.Namespace != "prep" || sourceDescriptor.Path != targetSpec {
 			continue
 		}
-		if edge.Role != compactKbuildWorkingClosureInputRole || index >= len(recipe.Sources) ||
+		// The statically discovered --target operand is a direct hermetic
+		// prerequisite, not merely a file inherited from writable-tree closure.
+		if edge.Role != "prerequisite" || index >= len(recipe.Sources) ||
 			recipe.WorkingInputs["source:"+recipe.Sources[index]] != targetSpec {
 			t.Fatalf("prepared target-spec edge = %#v recipe = %#v", edge, recipe)
 		}
@@ -4934,6 +5023,140 @@ cmd_copy = cp $< $@
 		want := variable + "=${work:root}/" + directory + "/src"
 		if got := compactKbuildSourceScriptReplayValue(profile, input); got != want {
 			t.Errorf("replay %s = %q, want %q", variable, got, want)
+		}
+	}
+}
+
+func TestCompactKbuildCanonicalRootsAcceptExecrootRelativeTreeArtifacts(t *testing.T) {
+	const directory = ".linux-bzl/external/demo"
+	profile := mustCompactKbuildProfileForTest(t, "canonical-relative-overlay", "scripts/Makefile.build", directory, `
+cmd_copy = cp $< $@
+`, nil)
+	const (
+		kernelRoot  = "external/linux-source"
+		objectRoot  = "bazel-out/cfg/bin/external/linux/kernel.tree-sdk"
+		overlayRoot = "bazel-out/cfg/bin/demo.external-source/" + directory
+		rustRoot    = "external/rust-src/library"
+	)
+	virtualOverlay := "__LINUX_BZL_SOURCE_TREE__/" + directory
+	profile.evaluator.template.sourceRoots = map[string]string{
+		"__LINUX_BZL_SOURCE_TREE__": kernelRoot,
+		"__LINUX_BZL_OBJECT_TREE__": objectRoot,
+		virtualOverlay:              overlayRoot,
+		rustRoot:                    rustRoot,
+	}
+
+	for _, test := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "relative object recipe",
+			input: "obj=" + objectRoot + "/" + directory,
+			want:  "obj=${tree:prep}/" + directory,
+		},
+		{
+			name:  "relative overlay recipe",
+			input: "src=" + overlayRoot,
+			want:  "src=${tree:prep}/" + directory,
+		},
+		{
+			name:  "joined relative include option",
+			input: "-I" + kernelRoot + "/include",
+			want:  "-I${tree:kernel}/include",
+		},
+		{
+			name:  "quoted exact relative root",
+			input: `cd "` + kernelRoot + `"`,
+			want:  `cd "${tree:kernel}"`,
+		},
+		{
+			name:  "relative root before shell connector",
+			input: kernelRoot + "; next",
+			want:  "${tree:kernel}; next",
+		},
+		{
+			name:  "relative root in path list",
+			input: "PATH=" + kernelRoot + ":$PATH",
+			want:  "PATH=${tree:kernel}:$PATH",
+		},
+		{
+			name:  "relative root in comma list",
+			input: "roots=" + kernelRoot + ",other",
+			want:  "roots=${tree:kernel},other",
+		},
+		{
+			name:  "embedded relative root is not provenance",
+			input: "path=not" + kernelRoot + "/Makefile",
+			want:  "path=not" + kernelRoot + "/Makefile",
+		},
+		{
+			name:  "relative root suffix collision",
+			input: "path=" + kernelRoot + "-other/Makefile",
+			want:  "path=" + kernelRoot + "-other/Makefile",
+		},
+		{
+			name:  "independent Rust source root",
+			input: "crate=" + rustRoot + "/core/src/lib.rs",
+			want:  "crate=" + rustRoot + "/core/src/lib.rs",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := compactKbuildProfileCanonicalRecipeText(profile, test.input); got != test.want {
+				t.Fatalf("canonical recipe text = %q, want %q", got, test.want)
+			}
+		})
+	}
+
+	if got, want := compactKbuildProfileCanonicalMakeValue(profile, "M="+overlayRoot), "M="+virtualOverlay; got != want {
+		t.Fatalf("canonical recursive Make value = %q, want %q", got, want)
+	}
+}
+
+func TestParsedKbuildCanonicalizesNestedSourceOverlayMarker(t *testing.T) {
+	const directory = "external/module"
+	physical := filepath.ToSlash(t.TempDir())
+	kb, err := parseKbuildWithOptions(strings.NewReader("all:\n\ttouch $@\n"), "Makefile", KbuildOptions{
+		SourceRoots: map[string]string{
+			"__LINUX_BZL_SOURCE_TREE__/" + directory + "/.": physical,
+		},
+		ConfigVariablesComplete: true,
+		MakeVariablesComplete:   true,
+		CaptureTargetEvaluator:  true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := NewCompactKbuildProfile("canonical-overlay-key", "Makefile", "", kb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.Directory = directory
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: directory,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	root, overlay, err := compactKbuildSourceOverlayRoot(profile)
+	if err != nil || !overlay || root != directory {
+		t.Fatalf("canonical source overlay root = (%q, %t, %v), want (%q, true, nil)", root, overlay, err, directory)
+	}
+	projections := compactKbuildProfileSourceOverlayProjections(profile)
+	if len(projections) != 1 || projections[0].virtual != "__LINUX_BZL_SOURCE_TREE__/"+directory ||
+		projections[0].prefix != directory || !slices.Contains(projections[0].physical, physical) {
+		t.Fatalf("canonical source overlay projections = %#v", projections)
+	}
+
+	for _, sourceRoots := range []map[string]string{
+		{
+			"__LINUX_BZL_SOURCE_TREE__/" + directory:        physical,
+			"__LINUX_BZL_SOURCE_TREE__/" + directory + "/.": physical,
+		},
+		{"__LINUX_BZL_SOURCE_TREE__/../escape": physical},
+	} {
+		if _, err := normalizeKbuildSourceRoots(sourceRoots); err == nil {
+			t.Fatalf("invalid nested source roots accepted: %#v", sourceRoots)
 		}
 	}
 }
@@ -7145,6 +7368,29 @@ func TestGenericKbuildRecipeCanonicalizesSourceRootExecutablePath(t *testing.T) 
 	if got, ok := compactKbuildCommandPath(rooted); !ok || got != "scripts/mkcompile_h" {
 		t.Fatalf("compactKbuildCommandPath(%q)=(%q,%t), want source-relative generated tool", rooted, got, ok)
 	}
+	for _, marker := range []string{
+		compactKbuildActionObjectTreeMarker,
+		compactKbuildActionAbsoluteObjectTreeMarker,
+	} {
+		rootedOutput := "arch/x86/boot/compressed/" + marker + "/vmlinux.relocs"
+		if got, ok := compactKbuildCommandPath(rootedOutput); !ok || got != "arch/x86/boot/compressed/vmlinux.relocs" {
+			t.Fatalf("compactKbuildCommandPath(%q)=(%q,%t), want literal prefix around private object root", rootedOutput, got, ok)
+		}
+		if got := compactKbuildFinalizeRootedActionRecipeText(rootedOutput); got != "arch/x86/boot/compressed/vmlinux.relocs" {
+			t.Fatalf("compactKbuildFinalizeRootedActionRecipeText(%q)=%q, want literal prefix around private object root", rootedOutput, got)
+		}
+	}
+	embeddedSource := "generated/" + compactKbuildActionSourceTreeMarker + "/source.h"
+	if got := compactKbuildCollapseEmbeddedActionObjectRoots(embeddedSource); got != embeddedSource {
+		t.Fatalf("compactKbuildCollapseEmbeddedActionObjectRoots(%q)=%q, want source root unchanged", embeddedSource, got)
+	}
+	if got, want := compactKbuildFinalizeRootedActionRecipeText(embeddedSource), "generated/${tree:kernel}/source.h"; got != want {
+		t.Fatalf("compactKbuildFinalizeRootedActionRecipeText(%q)=%q, want uncollapsed source root %q", embeddedSource, got, want)
+	}
+	publicObjectRoot := "/rbe/execroot/external/kernel/__LINUX_BZL_OBJECT_TREE__/vmlinux.relocs"
+	if got, ok := compactKbuildCommandPath(publicObjectRoot); !ok || got != "vmlinux.relocs" {
+		t.Fatalf("compactKbuildCommandPath(%q)=(%q,%t), want physical prefix before public object root discarded", publicObjectRoot, got, ok)
+	}
 	for command, want := range map[string]struct {
 		path   string
 		source bool
@@ -8201,10 +8447,15 @@ cmd_ld_vmlinux.o = $(LD) $(KBUILD_LDFLAGS) -r -o $@ $(vmlinux-o-ld-args-y) $(add
 		t.Fatalf("vmlinux.o link=%#v", link)
 	}
 	joined := strings.Join(linkRecipe.Arguments, " ")
-	for _, exact := range []string{"--exact-kbuild", "--exact-vmlinux-o", "-Tscripts/initcalls.lds", "--whole-archive", "--start-group"} {
+	for _, exact := range []string{"--exact-kbuild", "--exact-vmlinux-o", "--whole-archive", "--start-group"} {
 		if !strings.Contains(joined, exact) {
 			t.Fatalf("link arguments omit %q: %q", exact, linkRecipe.Arguments)
 		}
+	}
+	linkerScriptFlag := slices.Index(linkRecipe.Arguments, "-T")
+	if linkerScriptFlag < 0 || linkerScriptFlag+1 >= len(linkRecipe.Arguments) ||
+		!strings.HasPrefix(linkRecipe.Arguments[linkerScriptFlag+1], "${input:") {
+		t.Fatalf("link arguments do not preserve GNU addprefix's split -T operand: %q", linkRecipe.Arguments)
 	}
 	for _, input := range []string{"vmlinux.a", "scripts/initcalls.lds", "lib/built-in.a"} {
 		if !slices.Contains(sortedStringMapValues(linkRecipe.WorkingInputs), input) {
@@ -8395,6 +8646,7 @@ func TestPreconfiguredObjectTreeUsesOnlyExactExistingSourceLeaves(t *testing.T) 
 func TestExternalModpostKeepsKernelSymversInputDistinctFromModuleOutput(t *testing.T) {
 	const (
 		directory     = ".linux-bzl/external/demo"
+		virtualRoot   = "__LINUX_BZL_SOURCE_TREE__/" + directory
 		target        = directory + "/Module.symvers"
 		kernelSymvers = "Module.symvers"
 		modpost       = "scripts/mod/modpost"
@@ -8472,6 +8724,121 @@ FORCE:
 	}
 	if prepSource.Path != kernelSymvers || node.Outputs[0].Path != target || prepSource.Namespace == node.Outputs[0].Tree {
 		t.Fatalf("modpost input %#v and output %#v do not retain distinct prep/metadata provenance", prepSource, node.Outputs[0])
+	}
+}
+
+func TestExternalRootModpostStagesExactOverlaySymversForHermeticScript(t *testing.T) {
+	const (
+		directory     = ".linux-bzl/external/demo"
+		virtualRoot   = "__LINUX_BZL_SOURCE_TREE__/" + directory
+		target        = directory + "/Module.symvers"
+		commandState  = directory + "/.hello_module.o.cmd"
+		extraSymvers0 = directory + "/.linux-bzl-dependencies/00000000.symvers"
+		extraSymvers1 = directory + "/.linux-bzl-dependencies/00000001.symvers"
+		modpost       = "scripts/mod/modpost"
+	)
+	objectRoot := t.TempDir()
+	mustWriteSource(t, objectRoot, modpost, "prepared modpost\n")
+	externalRoot := t.TempDir()
+	mustWriteSource(t, externalRoot, "hello_module.c", "int hello_module;\n")
+	mustWriteSource(t, externalRoot, ".linux-bzl-dependencies/00000000.symvers", "0x1\tprovider\tprovider\tEXPORT_SYMBOL\n")
+	mustWriteSource(t, externalRoot, ".linux-bzl-dependencies/00000001.symvers", "0x2\tsecond\tsecond\tEXPORT_SYMBOL\n")
+	profile := mustCompactKbuildProfileForTest(t, "external-root-modpost", "scripts/Makefile.modpost", "", `
+MODPOST = $(objtree)/scripts/mod/modpost
+KBUILD_EXTRA_SYMBOLS := $(src)/.linux-bzl-dependencies/00000000.symvers $(src)/.linux-bzl-dependencies/00000001.symvers
+modpost-args = -o $@ -e $(addprefix -i ,$(KBUILD_EXTRA_SYMBOLS)) `+commandState+`
+cmd_modpost = if true; then $(MODPOST) $(modpost-args); fi
+`+target+`: `+commandState+` $(MODPOST) FORCE
+	$(call if_changed,modpost)
+FORCE:
+`, map[string]string{
+		"objtree": "__LINUX_BZL_OBJECT_TREE__",
+		"src":     virtualRoot,
+	})
+	profile.evaluator.template.sourceRoots = map[string]string{
+		"__LINUX_BZL_SOURCE_TREE__":              t.TempDir(),
+		"__LINUX_BZL_OBJECT_TREE__":              objectRoot,
+		"__LINUX_BZL_SOURCE_TREE__/" + directory: externalRoot,
+	}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		preconfiguredObjectTree: true,
+		exactSourceNamespaces:   map[string]string{modpost: "prep"},
+		sourceNamespaces: map[string]string{
+			"__LINUX_BZL_SOURCE_TREE__/" + directory: "external",
+		},
+		Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	externalSourceID, err := metadata.ensureActionPlanSource(plan, directory+"/hello_module.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandStateProducer, err := appendActionPlanNode(plan, ActionPlanNode{
+		Stage: "target", Kind: "generate", Tool: "actionfile", Product: "module",
+		Sources: []ActionPlanSourceEdge{{Role: "source", SourceID: externalSourceID}},
+		Trees:   []string{"external"},
+		Outputs: []ActionPlanOutput{{Tree: "objects", Path: commandState}},
+	}, ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+		Arguments:        []string{"-input", "${source:source:00000000}", "-out", "${output:00000000}"},
+		Sources:          []string{"source:00000000"},
+		Trees:            []string{"external"},
+		WorkingTrees:     []string{"external"},
+		WorkingDirectory: "external-compile",
+		Outputs:          []string{"00000000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		forOutput("target", "metadata", "module_symvers").
+		withInitialObjectTree(true).
+		forProfile(profile)
+	producer, err := builder.build(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("root-level modpost producer %q is absent", producer)
+	}
+	if !slices.ContainsFunc(node.Inputs, func(edge ActionPlanNodeEdge) bool {
+		return edge.ProducerID == commandStateProducer
+	}) {
+		t.Fatalf("root-level modpost inputs = %#v, want generated command metadata producer %q", node.Inputs, commandStateProducer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if recipe.Tool != compactKbuildScriptRunnerRole {
+		t.Fatalf("root-level modpost tool = %q, want compound %q action", recipe.Tool, compactKbuildScriptRunnerRole)
+	}
+	script := compactKbuildRecipeScriptContentForTest(t, recipe)
+	workingInputs := sortedStringMapValues(recipe.WorkingInputs)
+	for _, extraSymvers := range []string{extraSymvers0, extraSymvers1} {
+		extraSource := ActionPlanSource{}
+		for _, edge := range node.Sources {
+			for _, source := range plan.Sources {
+				if source.ID == edge.SourceID && source.Namespace == "external" && source.Path == extraSymvers {
+					extraSource = source
+				}
+			}
+		}
+		if extraSource.ID == "" {
+			t.Fatalf("root-level modpost sources = %#v from %#v, want external/%s in script %q", node.Sources, plan.Sources, extraSymvers, script)
+		}
+		if !slices.Contains(workingInputs, extraSymvers) {
+			t.Fatalf("root-level modpost working inputs = %#v, want exact %s", recipe.WorkingInputs, extraSymvers)
+		}
+	}
+	if !slices.Contains(node.Trees, "external") || !slices.Contains(recipe.Trees, "external") {
+		t.Fatalf("root-level modpost trees = node %#v recipe %#v, want external namespace retained by %s", node.Trees, recipe.Trees, commandState)
+	}
+	if !slices.Contains(recipe.WorkingTrees, "external") {
+		t.Fatalf("root-level modpost did not replay command-metadata working source namespace: %#v", recipe.WorkingTrees)
 	}
 }
 

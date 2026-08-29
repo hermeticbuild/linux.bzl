@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -35,10 +36,72 @@ func TestContractRejectsMalformedData(t *testing.T) {
 		`{"cc":{"arguments":["missing-marker"],"environment":{}}}`,
 		`{"cc":{"arguments":null,"environment":{}}}`,
 		`{"cc":{"arguments":[],"environment":{"BAD-NAME":"value"}}}`,
+		`{"cc":{"arguments":[],"environment":{"linux_bzl_default_directory_argument_0":"overwrite"}}}`,
+		`{"cc":{"arguments":["__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__--sysroot=/anchor","__LINUX_BZL_KBUILD_ARGS_V1__","__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__--resource=/anchor"],"environment":{}}}`,
+		`{"cc":{"arguments":["__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__sysroot=/anchor","__LINUX_BZL_KBUILD_ARGS_V1__"],"environment":{}}}`,
+		`{"cc":{"arguments":["__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__--=/anchor","__LINUX_BZL_KBUILD_ARGS_V1__"],"environment":{}}}`,
+		`{"cc":{"arguments":["__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__--sysroot","__LINUX_BZL_KBUILD_ARGS_V1__"],"environment":{}}}`,
+		`{"cc":{"arguments":["__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__--sysroot=","__LINUX_BZL_KBUILD_ARGS_V1__"],"environment":{}}}`,
+		`{"cc":{"arguments":["__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__--sysroot=/one","__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__--sysroot=/two","__LINUX_BZL_KBUILD_ARGS_V1__"],"environment":{}}}`,
+		`{"cc":{"arguments":["__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__--sysroot=/anchor","__LINUX_BZL_KBUILD_ARGS_V1__","--sysroot=/configured"],"environment":{}}}`,
 		`{"cc":{"arguments":[],"environment":{}}} {}`,
 	} {
 		if _, err := Decode(value); err == nil {
 			t.Errorf("Decode(%q) succeeded", value)
+		}
+	}
+}
+
+func TestSpliceArgumentsAppliesConditionalDirectoryDefault(t *testing.T) {
+	anchor := filepath.Join(t.TempDir(), "rust.sysroot")
+	action := []string{
+		DefaultDirectoryArgumentMarker + "--sysroot=" + anchor,
+		KbuildArgumentsSentinel,
+		"-Zunstable-options",
+	}
+	defaultSysroot := "--sysroot=" + filepath.Dir(anchor)
+	for _, test := range []struct {
+		name       string
+		invocation []string
+		want       []string
+	}{
+		{
+			name:       "default",
+			invocation: []string{"--crate-name", "macros"},
+			want:       []string{defaultSysroot, "--crate-name", "macros", "-Zunstable-options"},
+		},
+		{
+			name:       "source attached override",
+			invocation: []string{"--sysroot=/dev/null", "--crate-name", "kernel"},
+			want:       []string{"--sysroot=/dev/null", "--crate-name", "kernel", "-Zunstable-options"},
+		},
+		{
+			name:       "source separate override",
+			invocation: []string{"--sysroot", "/dev/null", "--crate-name", "kernel"},
+			want:       []string{"--sysroot", "/dev/null", "--crate-name", "kernel", "-Zunstable-options"},
+		},
+		{
+			name:       "near match does not override",
+			invocation: []string{"--sysroot-extra=/different", "--crate-name", "macros"},
+			want:       []string{defaultSysroot, "--sysroot-extra=/different", "--crate-name", "macros", "-Zunstable-options"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := SpliceArguments(action, test.invocation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, test.want) {
+				t.Fatalf("SpliceArguments() = %q, want %q", got, test.want)
+			}
+		})
+	}
+
+	invalid := append([]string(nil), action...)
+	invalid[0] = DefaultDirectoryArgumentMarker + "--sysroot=relative/anchor"
+	for _, invocation := range [][]string{nil, {"--sysroot=/dev/null"}} {
+		if _, err := SpliceArguments(invalid, invocation); err == nil {
+			t.Fatalf("relative default directory anchor accepted with invocation %q", invocation)
 		}
 	}
 }
@@ -228,6 +291,80 @@ printf '%s' "$SELECTED_MODE" > "$RESULT"
 			}
 			if want := InvocationContractRole("cc", test.arguments); string(got) != want {
 				t.Fatalf("proxy selected %q, want canonical contract role %q", got, want)
+			}
+		})
+	}
+}
+
+func TestInstallToolActionProxyAppliesConditionalDirectoryDefault(t *testing.T) {
+	root := t.TempDir()
+	multicall := filepath.Join(root, "multicall")
+	if err := os.WriteFile(multicall, []byte(`#!/bin/sh
+if [ "$1" != sh ]; then exit 90; fi
+shift
+exec /bin/sh "$@"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tool := filepath.Join(root, "tool")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$RESULT\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	anchor := filepath.Join(root, "generated sysroot's", "rust.sysroot")
+	if err := os.MkdirAll(filepath.Dir(anchor), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	contract := Contract{
+		Arguments: []string{
+			DefaultDirectoryArgumentMarker + "--sysroot=" + anchor,
+			KbuildArgumentsSentinel,
+		},
+		Environment: map[string]string{},
+	}
+	proxy, err := InstallToolActionProxy(root, multicall, "rustc", tool, contract, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		arguments []string
+		want      []string
+	}{
+		{
+			name:      "default",
+			arguments: []string{"--crate-name", "macros"},
+			want:      []string{"--sysroot=" + filepath.Dir(anchor), "--crate-name", "macros"},
+		},
+		{
+			name:      "override",
+			arguments: []string{"--sysroot=/dev/null", "--crate-name", "kernel"},
+			want:      []string{"--sysroot=/dev/null", "--crate-name", "kernel"},
+		},
+		{
+			name:      "split override",
+			arguments: []string{"--sysroot", "/dev/null", "--crate-name", "kernel"},
+			want:      []string{"--sysroot", "/dev/null", "--crate-name", "kernel"},
+		},
+		{
+			name:      "near match",
+			arguments: []string{"--sysroot-extra=/different", "--crate-name", "macros"},
+			want:      []string{"--sysroot=" + filepath.Dir(anchor), "--sysroot-extra=/different", "--crate-name", "macros"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := filepath.Join(root, "result-"+test.name)
+			command := exec.Command(proxy, test.arguments...)
+			command.Env = append(os.Environ(), "RESULT="+result)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("run proxy: %v\n%s", err, output)
+			}
+			data, err := os.ReadFile(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+			if !slices.Equal(got, test.want) {
+				t.Fatalf("proxy arguments = %q, want %q", got, test.want)
 			}
 		})
 	}

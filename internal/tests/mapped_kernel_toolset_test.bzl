@@ -12,6 +12,7 @@ load(
     "linux_test_declare_working_output",
     "linux_test_decode_packed_node_inputs",
     "linux_test_execution_root_marker",
+    "linux_test_filtered_toolchain_closure_files",
     "linux_test_host_dependency_compile_flags",
     "linux_test_host_dependency_library_search_flags",
     "linux_test_host_library_artifact",
@@ -20,6 +21,7 @@ load(
     "linux_test_node_action_contract_role",
     "linux_test_node_input_artifact_tree_roots",
     "linux_test_node_source_closure_keys",
+    "linux_test_node_uses_runtime_toolset",
     "linux_test_parse_plan_marker_paths",
     "linux_test_render_toolchain_action_value",
     "linux_test_resolve_node_input_bindings",
@@ -621,11 +623,10 @@ def _mapped_kernel_toolset_test_impl(ctx):
             ("host", sdk.host_action_args["rustc"]),
             ("target", sdk.target_action_args["rustc"]),
         ]:
-            asserts.equals(env, [
-                "__LINUX_BZL_KBUILD_ARGS_V1__",
-                "-Zunstable-options",
-                "-Clink-self-contained=-linker",
-            ], rustc_args, "%s rustc action must preserve only the source-selected invocation boundary" % scope)
+            asserts.equals(env, 4, len(rustc_args), "%s rustc action must preserve one configured default and the source-selected invocation boundary" % scope)
+            asserts.true(env, rustc_args[0].startswith("__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__--sysroot="))
+            asserts.equals(env, "__LINUX_BZL_KBUILD_ARGS_V1__", rustc_args[1])
+            asserts.equals(env, ["-Zunstable-options", "-Clink-self-contained=-linker"], rustc_args[2:])
         asserts.equals(
             env,
             sdk.target_action_args["rustc"],
@@ -656,6 +657,48 @@ def _mapped_kernel_exec_python_test_impl(ctx):
     env = analysistest.begin(ctx)
     target = analysistest.target_under_test(env)
     sdk = target[LinuxModuleSdkInfo]
+    rustc = sdk.target_tool_files.get("rustc")
+    host_rustc = sdk.host_tool_files.get("rustc")
+    asserts.true(env, rustc != None and host_rustc != None)
+    for scope, selected_rustc, closure in [
+        ("target", rustc, sdk.target_toolchain_files),
+        ("host", host_rustc, sdk.host_toolchain_files),
+    ]:
+        files = closure.to_list()
+        if selected_rustc != None:
+            asserts.true(
+                env,
+                selected_rustc in files,
+                "%s Rust closure must retain the exact compiler artifact selected for that execution group" % scope,
+            )
+        anchors = [file for file in files if file.basename == "rust.sysroot"]
+        asserts.equals(env, 1, len(anchors), "%s Rust closure must retain its typed sysroot anchor" % scope)
+        if anchors:
+            default_argument = sdk.target_action_args["rustc"][0] if scope == "target" else sdk.host_action_args["rustc"][0]
+            asserts.equals(
+                env,
+                "__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__--sysroot=" + anchors[0].path,
+                default_argument,
+                "%s rustc contract must bind the execution sysroot through its exact anchor" % scope,
+            )
+            rendered = linux_test_render_toolchain_action_value(default_argument, [anchors[0]])
+            asserts.true(env, rendered.substituted and anchors[0] in rendered.fragments)
+        rustlib_paths = [file.path for file in files if "/lib/rustlib/" in file.path]
+        asserts.true(
+            env,
+            any(["/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-" in path for path in rustlib_paths]),
+            "%s Rust closure must contain execution-platform libstd" % scope,
+        )
+        asserts.true(
+            env,
+            any(["/lib/rustlib/x86_64-unknown-linux-gnu/lib/libproc_macro-" in path for path in rustlib_paths]),
+            "%s Rust closure must contain execution-platform proc_macro" % scope,
+        )
+        asserts.false(
+            env,
+            any(["/lib/rustlib/aarch64-unknown-linux-gnu/lib/libstd-" in path for path in rustlib_paths]),
+            "%s Rust closure must not select target-platform prebuilt std" % scope,
+        )
     for scope, tools, closure in [
         ("target", sdk.target_tool_files, sdk.target_toolchain_files),
         ("host", sdk.host_tool_files, sdk.host_toolchain_files),
@@ -759,6 +802,7 @@ def _mapped_kernel_backend_test_impl(ctx):
             rust_doc = "selected-rustdoc",
             rustc = "selected-rustc",
             rustfmt = "selected-rustfmt",
+            sysroot_anchor = struct(path = "bazel-out/exec/bin/rust-toolchain/rust.sysroot"),
         ),
         struct(bindgen = "selected-bindgen"),
     )
@@ -776,6 +820,7 @@ def _mapped_kernel_backend_test_impl(ctx):
     asserts.equals(env, {}, rust_tools.environments["rustfmt"])
     asserts.equals(env, {}, rust_tools.environments["bindgen"])
     asserts.equals(env, [
+        "__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__--sysroot=bazel-out/exec/bin/rust-toolchain/rust.sysroot",
         "__LINUX_BZL_KBUILD_ARGS_V1__",
         "-Zunstable-options",
         "-Clink-self-contained=-linker",
@@ -783,6 +828,21 @@ def _mapped_kernel_backend_test_impl(ctx):
     asserts.equals(env, rust_tools.arguments["rustc"], rust_tools.arguments["clippy"])
     for role in ["bindgen", "rustdoc", "rustfmt"]:
         asserts.equals(env, [], rust_tools.arguments[role])
+    ambient_sysroot_tools = linux_test_with_rust_toolchain(
+        "host",
+        empty_toolset,
+        struct(
+            _toolchain_generated_sysroot = False,
+            env = {},
+            rustc = "selected-rustc",
+            sysroot_anchor = struct(path = "bazel-out/exec/bin/rust-toolchain/rust.sysroot"),
+        ),
+    )
+    asserts.equals(env, [
+        "__LINUX_BZL_KBUILD_ARGS_V1__",
+        "-Zunstable-options",
+        "-Clink-self-contained=-linker",
+    ], ambient_sysroot_tools.arguments["rustc"])
     bindgen_only = linux_test_with_rust_toolchain(
         "target",
         empty_toolset,
@@ -960,6 +1020,34 @@ def _mapped_kernel_backend_test_impl(ctx):
             "bazel-out/k8-opt-exec/bin/external/elfutils+/libcpu/i386.mnemonics",
             "../elfutils+/libcpu/i386.mnemonics",
         ),
+    )
+    closure_file = struct(
+        identity = "same-artifact",
+        path = "bazel-out/k8-opt-exec/bin/toolchain/runtime",
+        short_path = "toolchain/runtime",
+    )
+    asserts.equals(
+        env,
+        [closure_file],
+        linux_test_filtered_toolchain_closure_files([], [closure_file, closure_file]),
+        "the same additional artifact may be deduplicated",
+    )
+    asserts.equals(
+        env,
+        [],
+        linux_test_filtered_toolchain_closure_files([closure_file], [closure_file]),
+        "the same base artifact must win over its identical additional entry",
+    )
+    disjoint_file = struct(
+        identity = "disjoint-artifact",
+        path = "bazel-out/rbe_linux_x86_64-opt-exec/bin/toolchain/other-runtime",
+        short_path = "toolchain/other-runtime",
+    )
+    asserts.equals(
+        env,
+        [disjoint_file],
+        linux_test_filtered_toolchain_closure_files([closure_file], [closure_file, disjoint_file]),
+        "a disjoint additional artifact must remain in the selected closure",
     )
     producer = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     other_producer = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -1268,6 +1356,9 @@ def _mapped_kernel_backend_test_impl(ctx):
         "lz4": "exact-lz4-tool",
         "pahole": "exact-pahole-tool",
     }, linux_test_runtime_tool_bindings(tools, "target", {"host": True, "target": True}))
+    asserts.false(env, linux_test_node_uses_runtime_toolset("copy", "actionfile"))
+    asserts.true(env, linux_test_node_uses_runtime_toolset("copy", "objcopy"))
+    asserts.true(env, linux_test_node_uses_runtime_toolset("copy", "actionfile", {"host@cc": True}))
 
     probe_tools = linux_probe_map_directory_tools(
         "exact-probe-runner",
@@ -1454,6 +1545,40 @@ _canonical_path_probe = rule(
         "path": attr.string(mandatory = True),
         "short_path": attr.string(mandatory = True),
     },
+)
+
+def _toolchain_closure_collision_probe_impl(_ctx):
+    first = struct(
+        identity = "first",
+        path = "bazel-out/first-exec/bin/toolchain/runtime",
+        short_path = "toolchain/runtime",
+    )
+    second = struct(
+        identity = "second",
+        path = first.path,
+        short_path = "toolchain/runtime",
+    )
+    linux_test_filtered_toolchain_closure_files([], [first, second])
+    return []
+
+_toolchain_closure_collision_probe = rule(implementation = _toolchain_closure_collision_probe_impl)
+
+def _toolchain_closure_cross_configuration_collision_probe_impl(_ctx):
+    base = struct(
+        identity = "target-config-artifact",
+        path = "bazel-out/k8-opt-exec/bin/toolchain/runtime",
+        short_path = "toolchain/runtime",
+    )
+    additional = struct(
+        identity = "exec-config-artifact",
+        path = "bazel-out/rbe_linux_x86_64-opt-exec/bin/toolchain/runtime",
+        short_path = "toolchain/runtime",
+    )
+    linux_test_filtered_toolchain_closure_files([base], [additional])
+    return []
+
+_toolchain_closure_cross_configuration_collision_probe = rule(
+    implementation = _toolchain_closure_cross_configuration_collision_probe_impl,
 )
 
 def _canonical_path_failure_test_impl(ctx):
@@ -1728,6 +1853,24 @@ def mapped_kernel_path_validation_test(name):
             target_under_test = ":" + subject,
         )
         tests.append(":" + test)
+    subject = name + "_toolchain_closure_additional_collision_subject"
+    test = name + "_toolchain_closure_additional_collision"
+    _toolchain_closure_collision_probe(name = subject, tags = ["manual"])
+    _canonical_path_failure_test(
+        name = test,
+        expected_error = "collides with distinct artifact",
+        target_under_test = ":" + subject,
+    )
+    tests.append(":" + test)
+    subject = name + "_toolchain_closure_cross_configuration_collision_subject"
+    test = name + "_toolchain_closure_cross_configuration_collision"
+    _toolchain_closure_cross_configuration_collision_probe(name = subject, tags = ["manual"])
+    _canonical_path_failure_test(
+        name = test,
+        expected_error = "test merged toolchain closure",
+        target_under_test = ":" + subject,
+    )
+    tests.append(":" + test)
     native.test_suite(name = name, tests = tests)
 
 def _host_dependency_tree_artifact_probe_impl(ctx):

@@ -24,11 +24,15 @@ export NOSTDINC_FLAGS LINUXINCLUDE KBUILD_CPPFLAGS KBUILD_CFLAGS KBUILD_AFLAGS K
 
 include Kbuild
 
+CONFIG_SHELL := sh
+if_changed_dep = $(cmd_$(1))
+cmd_link_vmlinux = $< smoke.o $@
+
 .PHONY: all
 all: vmlinux modules.builtin modules.builtin.modinfo kernel
 
-.vmlinux.unstripped: smoke.o
-	cp $< $@; touch System.map
+.vmlinux.unstripped: scripts/link-vmlinux.sh smoke.o
+	+$(call if_changed_dep,link_vmlinux)
 
 vmlinux: .vmlinux.unstripped
 	cp $< $@

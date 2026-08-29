@@ -15,6 +15,7 @@ const (
 	compactKbuildScriptRunnerRole        = "scriptrun"
 	compactKbuildScriptRuntimeRole       = "script-runtime"
 	compactKbuildScriptAppletRolePrefix  = "script-applet-"
+	compactKbuildOverwriteInputRole      = "overwrite"
 	compactKbuildWorkingClosureInputRole = "working-closure"
 )
 
@@ -79,20 +80,6 @@ type compactKbuildSourceScriptInvocation struct {
 	environmentUsage     compactKbuildSourceScriptEnvironmentUsage
 	argumentUsage        compactKbuildSourceScriptEnvironmentUsage
 	toolRoles            []string
-}
-
-func compactKbuildProjectedSourceScriptEnvironmentForAutomaticTarget(
-	profile CompactKbuildProfile,
-	target, automaticTarget, stem string,
-	normal, orderOnly []string,
-	injected map[string]string,
-	inline map[string]string,
-	usage compactKbuildSourceScriptEnvironmentUsage,
-) (map[string]string, []KbuildActionRoleRef, error) {
-	return compactKbuildProjectedSourceScriptEnvironmentForMakeTarget(
-		profile, target, target, automaticTarget, stem, normal, orderOnly,
-		injected, inline, usage,
-	)
 }
 
 func compactKbuildProjectedSourceScriptEnvironmentForMakeTarget(
@@ -168,15 +155,8 @@ func compactKbuildProjectedSourceScriptEnvironmentValues(
 	for _, name := range sortedStringMapKeys(values) {
 		value := values[name]
 		value = compactKbuildProfileCanonicalRecipeText(profile, value)
-		value, literalTreeOffsets, err := restoreCompactKbuildLiteralActionMarkers(value)
-		if err != nil {
+		if _, _, err := restoreCompactKbuildLiteralActionMarkers(value); err != nil {
 			return nil, nil, fmt.Errorf("source-script effective variable %s literal marker: %w", name, err)
-		}
-		if len(literalTreeOffsets) != 0 {
-			return nil, nil, fmt.Errorf(
-				"source-script effective variable %s contains a literal ${tree:...} marker which cannot be represented in an action environment",
-				name,
-			)
 		}
 		valueRefs, err := KbuildActionRoleRefs(value)
 		if err != nil {

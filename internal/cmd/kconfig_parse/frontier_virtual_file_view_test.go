@@ -51,6 +51,44 @@ func TestKbuildFrontierVirtualFileViewReadsExactAndOpaqueFiles(t *testing.T) {
 	}
 }
 
+func TestKbuildFrontierVirtualFileViewReadsAndMatchesNestedSourceOverlay(t *testing.T) {
+	const overlay = ".linux-bzl/external/demo"
+	embeddedSourceMarker := overlay + "/" + kbuildEvalSourceTree + "/drivers/net/generated"
+	state := newKbuildFrontierStateFromSorted([]kbuildFrontierEntry{
+		{path: overlay + "/modules.order", value: testKbuildFrontierValue(overlay+"/modules.order", overlay+"/demo.o\n", true)},
+		{path: embeddedSourceMarker, value: testKbuildFrontierValue(embeddedSourceMarker, "generated\n", true)},
+		{path: "drivers/net/modules.order", value: testKbuildFrontierValue("drivers/net/modules.order", "drivers/net/demo.o\n", true)},
+	})
+	view := kbuildFrontierVirtualFileView{
+		state: state, directory: overlay,
+		sourceOverlayDirectories: []string{overlay},
+	}
+
+	sourcePath := kbuildEvalSourceTree + "/" + overlay + "/modules.order"
+	content, exists, exact, err := view.Read(sourcePath)
+	if err != nil || !exists || !exact || content != overlay+"/demo.o\n" {
+		t.Fatalf("nested source-overlay read = (%q, %t, %t, %v)", content, exists, exact, err)
+	}
+	if got, want := view.Match(kbuildEvalSourceTree+"/"+overlay+"/*.order"), []string{sourcePath}; !slices.Equal(got, want) {
+		t.Fatalf("nested source-overlay Match() = %q, want %q", got, want)
+	}
+
+	ordinarySourcePath := kbuildEvalSourceTree + "/drivers/net/modules.order"
+	if _, exists, _, err := view.Read(ordinarySourcePath); err != nil || exists {
+		t.Fatalf("ordinary source-tree read unexpectedly resolved through object frontier: exists=%t err=%v", exists, err)
+	}
+	if got := view.Match(kbuildEvalSourceTree + "/drivers/net/*.order"); len(got) != 0 {
+		t.Fatalf("ordinary source-tree Match() unexpectedly resolved through object frontier: %q", got)
+	}
+	ordinaryGeneratedSourcePath := kbuildEvalSourceTree + "/drivers/net/generated"
+	if _, exists, _, err := view.Read(ordinaryGeneratedSourcePath); err != nil || exists {
+		t.Fatalf("source-tree read fell through to embedded marker path: exists=%t err=%v", exists, err)
+	}
+	if got := view.Match(ordinaryGeneratedSourcePath); len(got) != 0 {
+		t.Fatalf("source-tree Match() fell through to embedded marker path: %q", got)
+	}
+}
+
 func TestKbuildFrontierVirtualFileViewMatchesBothAliasCoordinateSystems(t *testing.T) {
 	state := newKbuildFrontierStateFromSorted([]kbuildFrontierEntry{
 		{path: "foo.o", value: testKbuildFrontierValue("foo.o", "", false)},
@@ -82,15 +120,15 @@ func TestKbuildFrontierVirtualFileViewReadsLiteralMetacharacters(t *testing.T) {
 	}
 }
 
-func TestKbuildFrontierVirtualFileViewRejectsConflictingAliasContents(t *testing.T) {
+func TestKbuildFrontierVirtualFileViewTreatsObjectMarkerAsRooted(t *testing.T) {
 	nested := "drivers/" + kbuildEvalObjectTree + "/foo.order"
 	state := newKbuildFrontierStateFromSorted([]kbuildFrontierEntry{
 		{path: "foo.order", value: testKbuildFrontierValue("foo.order", "root\n", true)},
 		{path: nested, value: testKbuildFrontierValue(nested, "relative\n", true)},
 	})
 	view := kbuildFrontierVirtualFileView{state: state, directory: "drivers"}
-	if _, _, _, err := view.Read(kbuildEvalObjectTree + "/foo.order"); err == nil {
-		t.Fatal("conflicting direct/relative aliases unexpectedly succeeded")
+	if content, exists, exact, err := view.Read(kbuildEvalObjectTree + "/foo.order"); err != nil || !exists || !exact || content != "root\n" {
+		t.Fatalf("rooted object-tree read = (%q, %t, %t, %v)", content, exists, exact, err)
 	}
 }
 

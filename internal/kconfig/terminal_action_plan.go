@@ -86,8 +86,9 @@ func (m *CompactMetadata) appendTerminalActionPlanNodes(
 
 // appendNearestSourceScriptSideOutput turns a stable facade demand into a
 // declared output of the nearest source-owned script in that terminal's native
-// dependency chain. The Make graph chooses the producer; no script name,
-// intermediate target, architecture, or command catalogue participates.
+// dependency chain. The selected terminal itself is the first layer: some
+// Linux versions link vmlinux there, while others add a native post-link action
+// and retain the source script as an upstream producer.
 func appendNearestSourceScriptSideOutput(plan *ActionPlan, terminalProducer string, output ActionPlanOutput) error {
 	if plan == nil || terminalProducer == "" {
 		return fmt.Errorf("terminal producer is missing")
@@ -99,11 +100,10 @@ func appendNearestSourceScriptSideOutput(plan *ActionPlan, terminalProducer stri
 	for index, node := range plan.Nodes {
 		indexByID[node.ID] = index
 	}
-	terminalIndex, ok := indexByID[terminalProducer]
-	if !ok {
+	if _, ok := indexByID[terminalProducer]; !ok {
 		return fmt.Errorf("terminal producer %q is absent from the plan", terminalProducer)
 	}
-	queue := terminalNativeInputProducers(plan.Nodes[terminalIndex])
+	queue := []string{terminalProducer}
 	visited := map[string]bool{}
 	for len(queue) != 0 {
 		pending := make([]string, 0, len(queue))
@@ -127,7 +127,9 @@ func appendNearestSourceScriptSideOutput(plan *ActionPlan, terminalProducer stri
 			}
 			node := plan.Nodes[index]
 			recipe, exists := plan.Recipes[node.Recipe]
-			if exists && recipe.Tool == compactKbuildScriptRunnerRole && recipe.WorkingDirectory != "" {
+			if exists && actionPlanNodeExecutesImmutableSourceScriptPath(
+				plan, indexByID, node, recipe, "kernel", "scripts/link-vmlinux.sh",
+			) {
 				candidates = append(candidates, index)
 			}
 			next = append(next, terminalNativeInputProducers(node)...)
@@ -173,6 +175,118 @@ func appendNearestSourceScriptSideOutput(plan *ActionPlan, terminalProducer stri
 		queue = next
 	}
 	return fmt.Errorf("terminal dependency chain has no source-owned script action")
+}
+
+// actionPlanNodeExecutesImmutableSourceScript distinguishes source programs
+// from generic compound shell actions, which also use scriptrun. A linear
+// source-script action carries its immutable script directly. An atomic source
+// command carries an executable input whose producer is the standard private
+// executable copy of an immutable source program.
+func actionPlanNodeExecutesImmutableSourceScript(
+	plan *ActionPlan,
+	indexByID map[string]int,
+	node ActionPlanNode,
+	recipe ActionRecipe,
+) bool {
+	return actionPlanNodeExecutesImmutableSourceScriptPath(plan, indexByID, node, recipe, "", "")
+}
+
+func actionPlanNodeExecutesImmutableSourceScriptPath(
+	plan *ActionPlan,
+	indexByID map[string]int,
+	node ActionPlanNode,
+	recipe ActionRecipe,
+	wantNamespace, wantPath string,
+) bool {
+	if plan == nil || recipe.Tool != compactKbuildScriptRunnerRole || recipe.WorkingDirectory == "" {
+		return false
+	}
+	if err := plan.ensureSourceLookupIndex(); err != nil {
+		return false
+	}
+	matches := func(source ActionPlanSource, exists bool) bool {
+		if !exists || source.ID == "" || validatePlanName("source namespace", source.Namespace) != nil ||
+			validatePlanRelativePath("source", source.Path) != nil {
+			return false
+		}
+		return (wantNamespace == "" || source.Namespace == wantNamespace) &&
+			(wantPath == "" || source.Path == wantPath)
+	}
+	sourceBindings := make(map[string]bool, len(recipe.Sources))
+	for _, binding := range recipe.Sources {
+		sourceBindings[binding] = true
+	}
+	for ordinal, source := range node.Sources {
+		candidate, exists := plan.sourcesByID[source.SourceID]
+		if source.Role == "script" && source.SourceID != "" &&
+			sourceBindings[source.Role+":"+planOrdinal(ordinal)] &&
+			matches(candidate, exists) {
+			return true
+		}
+	}
+	executableBindings := make(map[string]bool, len(recipe.ExecutableInputs))
+	for _, binding := range recipe.ExecutableInputs {
+		executableBindings[binding] = true
+	}
+	for ordinal, input := range node.Inputs {
+		if !executableBindings[input.Role+":"+planOrdinal(ordinal)] {
+			continue
+		}
+		source, exists := actionPlanInputImmutableSourceExecutable(plan, indexByID, input)
+		if matches(source, exists) {
+			return true
+		}
+	}
+	return false
+}
+
+// actionPlanInputImmutableSourceExecutable recognizes only the exact private
+// source-program projection emitted by materializeSourceExecutable. A source
+// edge is provenance, not a capability by itself: the producer must copy that
+// one immutable path with the canonical actionfile recipe and expose its sole
+// canonical output to the executable input binding.
+func actionPlanInputImmutableSourceExecutable(
+	plan *ActionPlan,
+	indexByID map[string]int,
+	input ActionPlanNodeEdge,
+) (ActionPlanSource, bool) {
+	if plan == nil || input.Slot != 0 {
+		return ActionPlanSource{}, false
+	}
+	producerIndex, exists := indexByID[input.ProducerID]
+	if !exists {
+		return ActionPlanSource{}, false
+	}
+	producer := plan.Nodes[producerIndex]
+	if (producer.Stage != "prehost" && producer.Stage != "bootstrap" && producer.Stage != "host") ||
+		producer.Kind != "copy" || producer.Tool != "actionfile" || producer.Product != "sdk" ||
+		len(producer.Sources) != 1 || producer.Sources[0].Role != "program" || producer.Sources[0].SourceID == "" ||
+		len(producer.Inputs) != 0 || len(producer.Trees) != 0 || len(producer.AuxiliaryTools) != 0 ||
+		len(producer.Outputs) != 1 {
+		return ActionPlanSource{}, false
+	}
+	output := producer.Outputs[0]
+	if output.Tree != producer.Stage || output.Path == "" || output.ArtifactPath != "" ||
+		output.ObservedPath != "" || output.persistent {
+		return ActionPlanSource{}, false
+	}
+	if err := plan.ensureSourceLookupIndex(); err != nil {
+		return ActionPlanSource{}, false
+	}
+	source, exists := plan.sourcesByID[producer.Sources[0].SourceID]
+	if !exists || source.Path != output.Path || validatePlanName("source namespace", source.Namespace) != nil ||
+		validatePlanRelativePath("source", source.Path) != nil {
+		return ActionPlanSource{}, false
+	}
+	producerRecipe, exists := plan.Recipes[producer.Recipe]
+	if !exists || !isImmutableSourceExecutableProjectionRecipe(producerRecipe) {
+		return ActionPlanSource{}, false
+	}
+	recipeID, err := producerRecipe.ID()
+	if err != nil || recipeID != producer.Recipe {
+		return ActionPlanSource{}, false
+	}
+	return source, true
 }
 
 // nativeProducerFrontier removes producers which are transitively upstream of

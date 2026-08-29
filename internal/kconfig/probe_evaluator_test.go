@@ -37,6 +37,114 @@ type countingProbeResultLookup struct {
 	results  int
 }
 
+func TestLinuxProbeEvaluatorRejectsPrivateRecursiveMakeBytesFromTextResults(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := ProbeRequest{
+		Schema:  LinuxProbeRequestSchema,
+		Steps:   []ProbeStep{{Name: "text", Tool: "cc"}},
+		Outcome: ProbeOutcome{Kind: "text", Step: "text", Stream: "stdout"},
+	}
+	reference, err := builder.Request("target", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		value     string
+		wantError bool
+	}{
+		{name: "opening", value: "prefix\x05suffix", wantError: true},
+		{name: "closing", value: "prefix\x06suffix", wantError: true},
+		{name: "printable marker", value: compactKbuildRecursiveMakeMarker},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			oracle := &ProbeResultOracle{
+				toolsets: map[string]string{"target": bootstrapTestIdentity},
+				results: map[string]ProbeResult{
+					reference.NodeID: {
+						Schema: LinuxProbeResultSchema, NodeID: reference.NodeID, RequestID: reference.RequestID,
+						Scope: "target", ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: test.value,
+						Steps: []ProbeStepResult{{Name: "text", Status: "success", ExitCode: 0, Stdout: test.value}},
+					},
+				},
+			}
+			evaluator := &LinuxProbeEvaluator{oracle: oracle, symbolRegistry: newLinuxProbeSymbolRegistry()}
+			got, err := evaluator.readText(reference, request)
+			if test.wantError {
+				if err == nil || !strings.Contains(err.Error(), "reserved recursive Make provenance byte") {
+					t.Fatalf("readText() error = %v, want reserved-provenance rejection", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.value {
+				t.Fatalf("readText() = %q, want printable value %q", got, test.value)
+			}
+		})
+	}
+}
+
+func TestLinuxProbeEvaluatorRejectsRecursiveMakeTokenReconstructedByDerivedText(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafRequest := func(name string) ProbeRequest {
+		return ProbeRequest{
+			Schema:  LinuxProbeRequestSchema,
+			Steps:   []ProbeStep{{Name: name, Tool: "cc"}},
+			Outcome: ProbeOutcome{Kind: "text", Step: name, Stream: "stdout"},
+		}
+	}
+	openingRequest := leafRequest("opening")
+	opening, err := builder.Request("target", openingRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closingRequest := leafRequest("closing")
+	closing, err := builder.Request("target", closingRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	derivedRequest := ProbeRequest{
+		Schema:     LinuxProbeRequestSchema,
+		InputCount: 2,
+		Outcome: ProbeOutcome{Kind: "text", Fragments: []ProbeValueFragment{
+			{Value: "${result:00000000.text}"},
+			{Value: "linux-bzl-recursive-make"},
+			{Value: "${result:00000001.text}"},
+		}},
+	}
+	derived, err := builder.Request("target", derivedRequest, opening, closing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := func(reference ProbeReference, request ProbeRequest, value string) ProbeResult {
+		return ProbeResult{
+			Schema: LinuxProbeResultSchema, NodeID: reference.NodeID, RequestID: reference.RequestID,
+			Scope: "target", ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: value,
+			Steps: []ProbeStepResult{{Name: request.Steps[0].Name, Status: "success", ExitCode: 0, Stdout: value}},
+		}
+	}
+	oracle := &ProbeResultOracle{
+		toolsets: map[string]string{"target": bootstrapTestIdentity},
+		results: map[string]ProbeResult{
+			opening.NodeID: result(opening, openingRequest, "\x05"),
+			closing.NodeID: result(closing, closingRequest, "\x06"),
+		},
+	}
+	evaluator := &LinuxProbeEvaluator{oracle: oracle, symbolRegistry: newLinuxProbeSymbolRegistry()}
+	_, err = evaluator.readText(derived, derivedRequest, opening, closing)
+	if err == nil || !strings.Contains(err.Error(), "reserved recursive Make provenance byte") {
+		t.Fatalf("derived readText() error = %v, want reconstructed-token rejection", err)
+	}
+}
+
 func TestReplayPureDependencyWordUsesDeclaredResultOrdinal(t *testing.T) {
 	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
 	if err != nil {
@@ -1276,6 +1384,36 @@ config MEASURED_CAPABILITY
 	}
 	if len(replayPlan.Nodes) != 1 || replayPlan.Nodes[0].ID != plan.Nodes[0].ID {
 		t.Fatalf("replay Kconfig plan differs from discovery: %#v vs %#v", replayPlan.Nodes, plan.Nodes)
+	}
+}
+
+func TestKbuildShellAcceptsExternalModuleTryRunDirectory(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := testSymbolicProbeEvaluator(t, builder, nil)
+	tempDir := "__LINUX_BZL_SOURCE_TREE__/.linux-bzl/external/module/.tmp_$$"
+	command := `set -e; TMP=` + tempDir + `/tmp; trap "rm -rf ` + tempDir + `" EXIT; mkdir -p ` + tempDir + `; if (` +
+		KbuildActionRoleToken("target", "ld") +
+		` --no-apply-dynamic-relocs -v) >/dev/null 2>&1; then echo " --no-apply-dynamic-relocs"; else echo ""; fi`
+	value, err := evaluator.KbuildShell(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !linuxProbeSymbolPattern.MatchString(strings.TrimSpace(value)) {
+		t.Fatalf("external-module Kbuild try-run = %q, want symbolic linker result", value)
+	}
+
+	for _, invalid := range []string{
+		"__LINUX_BZL_SOURCE_TREE__/.tmp_$$",
+		"__LINUX_BZL_SOURCE_TREE__/../outside/.tmp_$$",
+		"__LINUX_BZL_SOURCE_TREE__/external/$module/.tmp_$$",
+		"__LINUX_BZL_OBJECT_TREE__/external/module/.tmp_$$",
+	} {
+		if validKbuildTryRunTempDir(invalid) {
+			t.Errorf("validKbuildTryRunTempDir(%q) = true", invalid)
+		}
 	}
 }
 

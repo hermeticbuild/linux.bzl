@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	KbuildArgumentsSentinel = "__LINUX_BZL_KBUILD_ARGS_V1__"
-	ExecutionRootMarker     = "__LINUX_BZL_EXECROOT__"
-	EnvironmentName         = "LINUX_BZL_TOOL_ACTION_CONTRACTS_V1"
+	KbuildArgumentsSentinel        = "__LINUX_BZL_KBUILD_ARGS_V1__"
+	ExecutionRootMarker            = "__LINUX_BZL_EXECROOT__"
+	DefaultDirectoryArgumentMarker = "__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__"
+	EnvironmentName                = "LINUX_BZL_TOOL_ACTION_CONTRACTS_V1"
 	// RuntimeToolPathEnvironmentName is a runner-owned handoff to nested
 	// source-script executors.  It names the private directory containing only
 	// identity-bound tool-role aliases; source and configured action
@@ -29,6 +30,12 @@ const (
 const driverLinkContractSuffix = "-link"
 
 const toolBindingScopeSeparator = "@"
+
+// generatedProxyEnvironmentPrefix is reserved for shell state owned by
+// InstallToolActionProxy. Contract environments are untrusted toolchain data;
+// allowing them to reuse these names would let an export overwrite a derived
+// conditional argument before the proxy invokes the selected tool.
+const generatedProxyEnvironmentPrefix = "linux_bzl_"
 
 type Contract struct {
 	Arguments   []string          `json:"arguments"`
@@ -76,24 +83,147 @@ func Validate(contracts map[string]Contract) error {
 			return fmt.Errorf("tool action role %q must declare arguments and environment", role)
 		}
 		sentinels := 0
+		seenSentinel := false
+		defaultOptions := map[string]bool{}
 		for _, argument := range contract.Arguments {
 			if strings.ContainsRune(argument, 0) {
 				return fmt.Errorf("tool action role %q has a NUL argument", role)
 			}
 			if argument == KbuildArgumentsSentinel {
 				sentinels++
+				seenSentinel = true
+				continue
+			}
+			defaultArgument, encoded, err := parseDefaultDirectoryArgument(argument)
+			if err != nil {
+				return fmt.Errorf("tool action role %q: %w", role, err)
+			}
+			if encoded {
+				if seenSentinel {
+					return fmt.Errorf("tool action role %q has a default directory argument after its Kbuild argument marker", role)
+				}
+				if defaultOptions[defaultArgument.option] {
+					return fmt.Errorf("tool action role %q repeats default option %q", role, defaultArgument.option)
+				}
+				defaultOptions[defaultArgument.option] = true
 			}
 		}
 		if len(contract.Arguments) != 0 && sentinels != 1 {
 			return fmt.Errorf("tool action role %q has %d Kbuild argument markers, want one", role, sentinels)
 		}
+		for option := range defaultOptions {
+			if invocationHasOption(contract.Arguments, option) {
+				return fmt.Errorf("tool action role %q configures both a default and an explicit %q option", role, option)
+			}
+		}
 		for name, value := range contract.Environment {
-			if !validEnvironmentName(name) || strings.ContainsRune(value, 0) {
+			if !validEnvironmentName(name) ||
+				strings.HasPrefix(name, generatedProxyEnvironmentPrefix) ||
+				strings.ContainsRune(value, 0) {
 				return fmt.Errorf("tool action role %q has invalid environment entry %q", role, name)
 			}
 		}
 	}
 	return nil
+}
+
+type defaultDirectoryArgument struct {
+	option string
+	anchor string
+}
+
+func parseDefaultDirectoryArgument(argument string) (defaultDirectoryArgument, bool, error) {
+	encoded, found := strings.CutPrefix(argument, DefaultDirectoryArgumentMarker)
+	if !found {
+		return defaultDirectoryArgument{}, false, nil
+	}
+	option, anchor, ok := strings.Cut(encoded, "=")
+	if !ok || !strings.HasPrefix(option, "--") || len(option) == 2 ||
+		strings.ContainsAny(option, "=/\\\x00\r\n\t ") || anchor == "" || strings.ContainsRune(anchor, 0) {
+		return defaultDirectoryArgument{}, true, fmt.Errorf("invalid default directory argument %q", argument)
+	}
+	return defaultDirectoryArgument{option: option, anchor: anchor}, true, nil
+}
+
+func invocationHasOption(arguments []string, option string) bool {
+	for _, argument := range arguments {
+		if argument == option || strings.HasPrefix(argument, option+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveDefaultDirectoryArgument(value defaultDirectoryArgument) (string, error) {
+	if !filepath.IsAbs(value.anchor) {
+		return "", fmt.Errorf("default option %q has non-absolute artifact anchor %q", value.option, value.anchor)
+	}
+	return value.option + "=" + filepath.Dir(filepath.Clean(value.anchor)), nil
+}
+
+// SpliceArguments applies a configured action envelope to source-selected
+// arguments. Default-directory arguments remain typed through their anchor
+// File and are materialized only when the source invocation omitted the same
+// option. This models compiler-driver defaults without overriding source-owned
+// policy such as Linux's explicit --sysroot=/dev/null.
+func SpliceArguments(action, invocation []string) ([]string, error) {
+	if len(action) == 0 {
+		return append([]string(nil), invocation...), nil
+	}
+	foundSentinel := false
+	out := make([]string, 0, len(action)+len(invocation))
+	seenOptions := map[string]bool{}
+	configuredArguments := make([]string, 0, len(action))
+	for _, argument := range action {
+		if argument == KbuildArgumentsSentinel {
+			continue
+		}
+		if _, encoded, err := parseDefaultDirectoryArgument(argument); err != nil {
+			return nil, err
+		} else if !encoded {
+			configuredArguments = append(configuredArguments, argument)
+		}
+	}
+	for _, argument := range action {
+		if argument == KbuildArgumentsSentinel {
+			if foundSentinel {
+				return nil, errors.New("configured action repeats Kbuild argument sentinel")
+			}
+			foundSentinel = true
+			out = append(out, invocation...)
+			continue
+		}
+		defaultArgument, encoded, err := parseDefaultDirectoryArgument(argument)
+		if err != nil {
+			return nil, err
+		}
+		if !encoded {
+			out = append(out, argument)
+			continue
+		}
+		if foundSentinel {
+			return nil, errors.New("configured default directory argument follows Kbuild argument sentinel")
+		}
+		if seenOptions[defaultArgument.option] {
+			return nil, fmt.Errorf("configured action repeats default option %q", defaultArgument.option)
+		}
+		seenOptions[defaultArgument.option] = true
+		if invocationHasOption(configuredArguments, defaultArgument.option) {
+			return nil, fmt.Errorf("configured action provides both a default and an explicit %q option", defaultArgument.option)
+		}
+		resolved, err := resolveDefaultDirectoryArgument(defaultArgument)
+		if err != nil {
+			return nil, err
+		}
+		if invocationHasOption(invocation, defaultArgument.option) {
+			continue
+		}
+		out = append(out, resolved)
+	}
+	if !foundSentinel {
+		return nil, errors.New("configured action omits Kbuild argument sentinel")
+	}
+	return out, nil
 }
 
 // ExpandExecutionRootValue resolves the reserved action-contract marker
@@ -278,17 +408,58 @@ func InstallToolActionProxy(
 		script.WriteString("    -o?*) linux_bzl_link=1 ;;\n")
 		script.WriteString("  esac\ndone\n")
 		script.WriteString("if [ \"$linux_bzl_link\" = 1 ]; then\n")
-		writeToolActionContractInvocation(&script, executable, *linkContract, "  ")
+		if err := writeToolActionContractInvocation(&script, executable, *linkContract, "  "); err != nil {
+			return "", err
+		}
 		script.WriteString("fi\n")
 	}
-	writeToolActionContractInvocation(&script, executable, contract, "")
+	if err := writeToolActionContractInvocation(&script, executable, contract, ""); err != nil {
+		return "", err
+	}
 	if err := os.WriteFile(destination, []byte(script.String()), 0o700); err != nil {
 		return "", err
 	}
 	return destination, nil
 }
 
-func writeToolActionContractInvocation(script *strings.Builder, executable string, contract Contract, indent string) {
+func writeToolActionContractInvocation(script *strings.Builder, executable string, contract Contract, indent string) error {
+	defaultVariables := map[string]string{}
+	for index, argument := range contract.Arguments {
+		value, encoded, err := parseDefaultDirectoryArgument(argument)
+		if err != nil {
+			return err
+		}
+		if !encoded {
+			continue
+		}
+		resolved, err := resolveDefaultDirectoryArgument(value)
+		if err != nil {
+			return err
+		}
+		variable := fmt.Sprintf("linux_bzl_default_directory_argument_%d", index)
+		defaultVariables[argument] = variable
+		script.WriteString(indent)
+		script.WriteString(variable)
+		script.WriteString("=")
+		script.WriteString(shellQuote(resolved))
+		script.WriteByte('\n')
+		script.WriteString(indent)
+		script.WriteString("for linux_bzl_arg do\n")
+		script.WriteString(indent)
+		script.WriteString("  case \"$linux_bzl_arg\" in\n")
+		script.WriteString(indent)
+		script.WriteString("    ")
+		script.WriteString(shellQuote(value.option))
+		script.WriteString("|")
+		script.WriteString(shellQuote(value.option + "="))
+		script.WriteString("*) ")
+		script.WriteString(variable)
+		script.WriteString("= ;;\n")
+		script.WriteString(indent)
+		script.WriteString("  esac\n")
+		script.WriteString(indent)
+		script.WriteString("done\n")
+	}
 	for _, environmentName := range sortedEnvironmentNames(contract.Environment) {
 		script.WriteString(indent)
 		script.WriteString("export ")
@@ -306,6 +477,12 @@ func writeToolActionContractInvocation(script *strings.Builder, executable strin
 		for _, argument := range contract.Arguments {
 			if argument == KbuildArgumentsSentinel {
 				script.WriteString(" \"$@\"")
+			} else if variable := defaultVariables[argument]; variable != "" {
+				script.WriteString(" ${")
+				script.WriteString(variable)
+				script.WriteString(":+\"$")
+				script.WriteString(variable)
+				script.WriteString("\"}")
 			} else {
 				script.WriteByte(' ')
 				script.WriteString(shellQuote(argument))
@@ -313,6 +490,7 @@ func writeToolActionContractInvocation(script *strings.Builder, executable strin
 		}
 	}
 	script.WriteByte('\n')
+	return nil
 }
 
 func sortedEnvironmentNames(environment map[string]string) []string {

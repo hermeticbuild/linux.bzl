@@ -192,6 +192,139 @@ func TestKbuildVariableBaseOverlaysAreNormalizedAndIsolated(t *testing.T) {
 	}
 }
 
+func TestKbuildVariableInputsDoNotPromotePrintableRecursiveMakeMarker(t *testing.T) {
+	const marker = "__LINUX_BZL_MAKE__"
+	tests := []struct {
+		name   string
+		parser func() *kbuildParser
+	}{
+		{
+			name: "initial variables",
+			parser: func() *kbuildParser {
+				return newKbuildParser(map[string]string{"MAKE": marker}, "")
+			},
+		},
+		{
+			name: "shared variable base",
+			parser: func() *kbuildParser {
+				return newKbuildParserWithVariableBase(
+					NewKbuildVariableBase(map[string]string{"MAKE": marker}), nil, nil, "",
+				)
+			},
+		},
+		{
+			name: "variable-base overlay",
+			parser: func() *kbuildParser {
+				return newKbuildParserWithVariableBase(
+					NewKbuildVariableBase(nil), map[string]string{"MAKE": marker}, nil, "",
+				)
+			},
+		},
+		{
+			name: "parser override",
+			parser: func() *kbuildParser {
+				return newKbuildParserWithVariableBase(nil, nil, map[string]string{"MAKE": marker}, "")
+			},
+		},
+		{
+			name: "environment",
+			parser: func() *kbuildParser {
+				parser := newKbuildParser(nil, "")
+				parser.applyEnvironmentVariables(map[string]string{"MAKE": marker})
+				return parser
+			},
+		},
+		{
+			name: "command line",
+			parser: func() *kbuildParser {
+				parser := newKbuildParser(nil, "")
+				parser.applyCommandLineVariables(map[string]string{"MAKE": marker}, nil)
+				return parser
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			variable, defined := test.parser().lookupVariable("MAKE")
+			if !defined || variable.value != marker {
+				t.Fatalf("MAKE = (%q, %t), want ordinary printable value %q", variable.value, defined, marker)
+			}
+			if strings.Contains(variable.value, CompactKbuildRecursiveMakeProvenanceToken) {
+				t.Fatalf("printable MAKE input acquired private provenance: %q", variable.value)
+			}
+		})
+	}
+}
+
+func TestKbuildRecursiveMakeDefaultIsTrustedAndRetainsMakePrecedence(t *testing.T) {
+	input := map[string]string{"PROFILE": "ordinary"}
+	base, err := NewKbuildVariableBaseWithRecursiveMakeDefault(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, mutated := input["MAKE"]; mutated {
+		t.Fatalf("recursive Make constructor mutated caller input: %#v", input)
+	}
+	if got, ok := base.variables.lookup("MAKE"); !ok || got != CompactKbuildRecursiveMakeProvenanceToken {
+		t.Fatalf("trusted MAKE default = (%q, %t), want private capability", got, ok)
+	}
+
+	parsed, err := parseKbuildWithOptions(strings.NewReader("command := $(MAKE) child\n"), "Kbuild", KbuildOptions{
+		VariableBase:     base,
+		CaptureVariables: []string{"command"},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := parsed.Variables["command"], CompactKbuildRecursiveMakeProvenanceToken+" child"; got != want {
+		t.Fatalf("trusted recursive command = %q, want %q", got, want)
+	}
+
+	parsed, err = parseKbuildWithOptions(strings.NewReader("command := $(MAKE) child\n"), "Kbuild", KbuildOptions{
+		VariableBase:         base,
+		EnvironmentVariables: map[string]string{"MAKE": "configured-make"},
+		CaptureVariables:     []string{"command"},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := parsed.Variables["command"], "configured-make child"; got != want {
+		t.Fatalf("environment MAKE override = %q, want %q", got, want)
+	}
+
+	printable, err := NewKbuildVariableBaseWithRecursiveMakeDefault(map[string]string{
+		"MAKE": compactKbuildRecursiveMakeMarker,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := printable.variables.lookup("MAKE"); !ok || got != compactKbuildRecursiveMakeMarker {
+		t.Fatalf("printable MAKE override = (%q, %t), want ordinary marker", got, ok)
+	}
+}
+
+func TestKbuildRecursiveMakeDefaultRejectsPrivateBytesInOrdinaryVariables(t *testing.T) {
+	for _, boundary := range []struct {
+		name  string
+		value string
+	}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
+		for _, input := range []struct {
+			name      string
+			variables map[string]string
+		}{
+			{name: "variable name", variables: map[string]string{"PRIVATE" + boundary.value: "value"}},
+			{name: "variable value", variables: map[string]string{"PRIVATE": "value" + boundary.value}},
+		} {
+			t.Run(boundary.name+"/"+input.name, func(t *testing.T) {
+				_, err := NewKbuildVariableBaseWithRecursiveMakeDefault(input.variables)
+				if err == nil || !strings.Contains(err.Error(), "reserved recursive Make provenance byte") {
+					t.Fatalf("NewKbuildVariableBaseWithRecursiveMakeDefault() error = %v, want reserved-provenance rejection", err)
+				}
+			})
+		}
+	}
+}
+
 func TestParseKbuildFileTreeReusesVariableBaseAcrossInvocationOverlays(t *testing.T) {
 	root := t.TempDir()
 	makefile := filepath.Join(root, "Makefile")
@@ -350,6 +483,206 @@ visible := $(sort $(wildcard modules.order empty.order))
 	}
 }
 
+func TestParseKbuildRejectsRecursiveMakeProvenanceFromFilesystemFunctions(t *testing.T) {
+	boundaries := []struct {
+		name  string
+		value string
+	}{
+		{name: "opening delimiter", value: "\x05"},
+		{name: "closing delimiter", value: "\x06"},
+	}
+	ingresses := []string{
+		"filesystem file contents",
+		"virtual file contents",
+		"filesystem wildcard filename",
+		"virtual wildcard filename",
+		"resolved symlink filename",
+	}
+	for _, ingress := range ingresses {
+		for _, boundary := range boundaries {
+			t.Run(ingress+"/"+boundary.name, func(t *testing.T) {
+				root := t.TempDir()
+				opts := KbuildOptions{
+					WorkingDir:       root,
+					CaptureVariables: []string{"value"},
+				}
+				source := ""
+				value := "prefix" + boundary.value + "suffix"
+				switch ingress {
+				case "filesystem file contents":
+					if err := os.WriteFile(filepath.Join(root, "payload"), []byte(value+"\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					source = "value := $(file < payload)\n"
+				case "virtual file contents":
+					opts.VirtualFileView = &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{
+						"payload": {content: value + "\n", exact: true},
+					}}
+					source = "value := $(file < payload)\n"
+				case "filesystem wildcard filename":
+					if err := os.MkdirAll(filepath.Join(root, "matches"), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(root, "matches", value), nil, 0o644); err != nil {
+						t.Fatal(err)
+					}
+					source = "value := $(wildcard matches/*)\n"
+				case "virtual wildcard filename":
+					opts.VirtualFileView = &testKbuildVirtualFileView{matches: map[string][]string{
+						"matches/*": {"matches/" + value},
+					}}
+					source = "value := $(wildcard matches/*)\n"
+				case "resolved symlink filename":
+					if err := os.WriteFile(filepath.Join(root, value), nil, 0o644); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(value, filepath.Join(root, "selected")); err != nil {
+						t.Fatal(err)
+					}
+					source = "value := $(notdir $(realpath selected))\n"
+				default:
+					t.Fatalf("unknown test ingress %q", ingress)
+				}
+
+				_, err := parseKbuildWithOptions(strings.NewReader(source), "Kbuild", opts, root)
+				if err == nil || !strings.Contains(err.Error(), "reserved recursive Make provenance byte") {
+					t.Fatalf("parseKbuildWithOptions() error = %v, want reserved-provenance rejection", err)
+				}
+			})
+		}
+	}
+}
+
+func TestParseKbuildFilesystemFunctionProvenanceGuardPreservesOrdinaryValues(t *testing.T) {
+	root := t.TempDir()
+	ordinaryContents := "ordinary " + compactKbuildRecursiveMakeMarker + " bytes"
+	if err := os.WriteFile(filepath.Join(root, "physical.payload"), []byte(ordinaryContents+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "matches"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "matches", "physical.o"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("matches/physical.o", filepath.Join(root, "ordinary-link")); err != nil {
+		t.Fatal(err)
+	}
+	view := &testKbuildVirtualFileView{
+		matches: map[string][]string{"virtual/*": {"virtual/generated.o"}},
+		files: map[string]testKbuildVirtualFile{
+			"virtual.payload": {content: ordinaryContents + "\n", exact: true},
+		},
+	}
+	kb, err := parseKbuildWithOptions(strings.NewReader(`physical := $(file < physical.payload)
+virtual := $(file < virtual.payload)
+matches := $(sort $(wildcard matches/* virtual/*))
+resolved := $(notdir $(realpath ordinary-link))
+`), "Kbuild", KbuildOptions{
+		WorkingDir:       root,
+		VirtualFileView:  view,
+		CaptureVariables: []string{"physical", "virtual", "matches", "resolved"},
+	}, root)
+	if err != nil {
+		t.Fatalf("parseKbuildWithOptions() failed: %v", err)
+	}
+	for _, name := range []string{"physical", "virtual"} {
+		if got := kb.Variables[name]; got != ordinaryContents {
+			t.Errorf("%s = %q, want %q", name, got, ordinaryContents)
+		}
+	}
+	if got, want := kb.Variables["matches"], "matches/physical.o virtual/generated.o"; got != want {
+		t.Errorf("matches = %q, want %q", got, want)
+	}
+	if got, want := kb.Variables["resolved"], "physical.o"; got != want {
+		t.Errorf("resolved = %q, want %q", got, want)
+	}
+}
+
+func TestParseKbuildRejectsRecursiveMakeProvenanceFromMakefileListFilename(t *testing.T) {
+	for _, boundary := range []struct {
+		name  string
+		value string
+	}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
+		t.Run(boundary.name, func(t *testing.T) {
+			_, err := parseKbuildWithOptions(
+				strings.NewReader("value := $(lastword $(MAKEFILE_LIST))\n"),
+				"prefix"+boundary.value+"suffix/Makefile",
+				KbuildOptions{CaptureVariables: []string{"value"}},
+				"",
+			)
+			if err == nil || !strings.Contains(err.Error(), "reserved recursive Make provenance byte") {
+				t.Fatalf("parseKbuildWithOptions() error = %v, want MAKEFILE_LIST provenance rejection", err)
+			}
+		})
+	}
+
+	filename := "ordinary/" + compactKbuildRecursiveMakeMarker + "/Makefile"
+	parsed, err := parseKbuildWithOptions(
+		strings.NewReader("value := $(lastword $(MAKEFILE_LIST))\n"),
+		filename,
+		KbuildOptions{CaptureVariables: []string{"value"}},
+		"",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed.Variables["value"]; got != filename {
+		t.Fatalf("printable MAKEFILE_LIST filename = %q, want %q", got, filename)
+	}
+}
+
+func TestParseKbuildRejectsRecursiveMakeProvenanceFromParserPaths(t *testing.T) {
+	for _, boundary := range []struct {
+		name  string
+		value string
+	}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
+		for _, ingress := range []string{"working directory abspath", "base directory abspath", "root srctree"} {
+			t.Run(ingress+"/"+boundary.name, func(t *testing.T) {
+				path := filepath.Join("configured", "prefix"+boundary.value+"suffix")
+				var err error
+				switch ingress {
+				case "working directory abspath":
+					_, err = parseKbuildWithOptions(
+						strings.NewReader("value := $(abspath .)\n"), "Kbuild",
+						KbuildOptions{WorkingDir: path, CaptureVariables: []string{"value"}}, "",
+					)
+				case "base directory abspath":
+					_, err = parseKbuildWithOptions(
+						strings.NewReader("value := $(abspath .)\n"), "Kbuild",
+						KbuildOptions{CaptureVariables: []string{"value"}}, path,
+					)
+				case "root srctree":
+					makefile := filepath.Join(t.TempDir(), "Makefile")
+					if writeErr := os.WriteFile(makefile, []byte("value := $(srctree)\n"), 0o644); writeErr != nil {
+						t.Fatal(writeErr)
+					}
+					_, err = ParseKbuildFileTree(makefile, KbuildOptions{
+						RootDir: path, CaptureVariables: []string{"value"},
+					})
+				default:
+					t.Fatalf("unknown parser path ingress %q", ingress)
+				}
+				if err == nil || !strings.Contains(err.Error(), "reserved recursive Make provenance byte") {
+					t.Fatalf("Kbuild parse error = %v, want parser-path provenance rejection", err)
+				}
+			})
+		}
+	}
+
+	ordinary := filepath.Join("configured", compactKbuildRecursiveMakeMarker)
+	parsed, err := parseKbuildWithOptions(
+		strings.NewReader("value := $(abspath .)\n"), "Kbuild",
+		KbuildOptions{WorkingDir: ordinary, CaptureVariables: []string{"value"}}, "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := parsed.Variables["value"], filepath.ToSlash(filepath.Clean(ordinary)); got != want {
+		t.Fatalf("printable abspath = %q, want %q", got, want)
+	}
+}
+
 func TestParseKbuildMergesVirtualFileViewWithPhysicalFiles(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "physical.o"), nil, 0o644); err != nil {
@@ -443,7 +776,11 @@ func TestKbuildLazyVirtualFileViewIsRetainedByCapturedEvaluator(t *testing.T) {
 	if parser.virtualFileView != view {
 		t.Fatal("target-evaluation clone did not retain the lazy virtual-file view")
 	}
-	if got, want := parser.expandWildcard("late/*.o"), "late/generated.o"; got != want {
+	gotWildcard, err := parser.expandWildcard("late/*.o")
+	if err != nil {
+		t.Fatalf("late wildcard failed: %v", err)
+	}
+	if got, want := gotWildcard, "late/generated.o"; got != want {
 		t.Fatalf("late wildcard = %q, want %q", got, want)
 	}
 	got, err := parser.makeFile("< ./late/../late.order", "$(file < ./late/../late.order)")

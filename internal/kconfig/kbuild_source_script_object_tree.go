@@ -95,20 +95,6 @@ func EvaluateCompactKbuildSourceScriptObjectTreeObservationSymbolicForMakeTarget
 	)
 }
 
-func evaluateCompactKbuildSourceScriptObjectTreeObservation(
-	profile CompactKbuildProfile,
-	target, stem string,
-	normal, orderOnly []string,
-	injected map[string]string,
-	command string,
-	resolveSymbolic bool,
-) (CompactKbuildObjectTreeObservation, error) {
-	return evaluateCompactKbuildSourceScriptObjectTreeObservationForMakeTarget(
-		profile, target, target, target, stem, normal, orderOnly,
-		injected, command, resolveSymbolic,
-	)
-}
-
 func evaluateCompactKbuildSourceScriptObjectTreeObservationForMakeTarget(
 	profile CompactKbuildProfile,
 	target, lookupTarget, automaticTarget, stem string,

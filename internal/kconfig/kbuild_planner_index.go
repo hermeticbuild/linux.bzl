@@ -9,7 +9,6 @@ package kconfig
 import (
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -457,27 +456,4 @@ func compactKbuildTargetVariablesForMakeTarget(
 		out = append(out, profile.TargetVariables[order])
 	}
 	return out
-}
-
-// compactKbuildInheritableTargetVariables returns the target-local assignment
-// program which GNU Make exposes to prerequisites. Privacy belongs to the final
-// local binding, rather than to one statement: a later private assignment hides
-// every local operation for that variable, while a later non-private assignment
-// makes the complete local value visible again.
-func compactKbuildInheritableTargetVariables(profile CompactKbuildProfile, target string) []KbuildTargetVariable {
-	variables := compactKbuildTargetVariables(profile, target)
-	if len(variables) == 0 {
-		return nil
-	}
-	private := make(map[string]bool, len(variables))
-	for _, variable := range variables {
-		private[variable.Variable] = slices.Contains(variable.Modifiers, "private")
-	}
-	inherited := make([]KbuildTargetVariable, 0, len(variables))
-	for _, variable := range variables {
-		if !private[variable.Variable] {
-			inherited = append(inherited, variable)
-		}
-	}
-	return inherited
 }

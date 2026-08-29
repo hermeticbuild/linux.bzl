@@ -227,7 +227,7 @@ func nativeModuleProductOutputFrontier(
 	}
 	includeEdge := func(edge ActionPlanNodeEdge) bool {
 		return edge.ProducerID != "" && edge.Role != compactKbuildWorkingClosureInputRole &&
-			edge.Role != "sequence" && edge.Role != "order-only"
+			edge.Role != compactKbuildOverwriteInputRole && edge.Role != "sequence" && edge.Role != "order-only"
 	}
 	pending := []ActionPlanNodeEdge{}
 	for _, producer := range orderedCandidateProducers {

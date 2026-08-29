@@ -966,31 +966,6 @@ func evaluatedKbuildSelectedTargetMakeContext(
 	return evaluatedKbuildTargetMakeContext(profile, target, selectedMatch, true)
 }
 
-// evaluatedKbuildSelectedRuleDeclarationContext expands only the
-// prerequisites declared by the candidate which owns the selected recipe.
-// GNU Make uses that declaration-local context while deciding whether an
-// implicit rule can be applied. Prerequisites from recipe-less explicit
-// declarations are merged only after the implicit recipe has been selected.
-func evaluatedKbuildSelectedRuleDeclarationContext(
-	profile CompactKbuildProfile,
-	target string,
-	selectedMatch compactKbuildRuleMatch,
-) ([]string, []string, string, error) {
-	context, err := evaluatedKbuildTargetMakeContext(profile, target, &selectedMatch, false)
-	if err != nil {
-		return nil, nil, "", err
-	}
-	normal := make([]string, len(context.normal))
-	for index, prerequisite := range context.normal {
-		normal[index] = prerequisite.graphPath
-	}
-	orderOnly := make([]string, len(context.orderOnly))
-	for index, prerequisite := range context.orderOnly {
-		orderOnly[index] = prerequisite.graphPath
-	}
-	return normal, orderOnly, context.stem, nil
-}
-
 func evaluatedKbuildTargetMakeContext(
 	profile CompactKbuildProfile,
 	target string,

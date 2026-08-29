@@ -546,18 +546,6 @@ func compactKbuildGeneratedTextApplet(program string) (string, bool) {
 	}
 }
 
-func compactKbuildGeneratedTextLiterals(tokens []compactKbuildRecipeToken) ([]string, bool) {
-	values := make([]string, 0, len(tokens))
-	for _, token := range tokens {
-		value, ok := compactKbuildGeneratedTextLiteral(token)
-		if !ok {
-			return nil, false
-		}
-		values = append(values, value)
-	}
-	return values, true
-}
-
 func compactKbuildGeneratedTextOutputLiterals(tokens []compactKbuildRecipeToken) ([]string, bool) {
 	values := make([]string, 0, len(tokens))
 	for _, token := range tokens {

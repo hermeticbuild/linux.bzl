@@ -1184,24 +1184,7 @@ func expandProbeValue(value string, scratch, sources, sourceRoots map[string]str
 }
 
 func spliceActionArguments(action, probe []string) ([]string, error) {
-	if len(action) == 0 {
-		return append([]string(nil), probe...), nil
-	}
-	index := -1
-	for i, value := range action {
-		if value == kconfig.LinuxKbuildArgsSentinel {
-			if index >= 0 {
-				return nil, errors.New("configured action repeats Kbuild argument sentinel")
-			}
-			index = i
-		}
-	}
-	if index < 0 {
-		return nil, errors.New("configured action omits Kbuild argument sentinel")
-	}
-	out := append([]string(nil), action[:index]...)
-	out = append(out, probe...)
-	return append(out, action[index+1:]...), nil
+	return toolaction.SpliceArguments(action, probe)
 }
 
 func exactRoles(want []string, got map[string]actionContract) error {

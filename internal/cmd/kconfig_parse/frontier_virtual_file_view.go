@@ -41,13 +41,14 @@ func (view kbuildFrontierArtifactView) Range(
 // only for queried prefixes instead of materializing two aliases and an exact
 // content map for every inherited artifact at every child invocation.
 type kbuildFrontierVirtualFileView struct {
-	state     kbuildFrontierState
-	directory string
+	state                    kbuildFrontierState
+	directory                string
+	sourceOverlayDirectories []string
 }
 
 func (view kbuildFrontierVirtualFileView) Match(pattern string) []string {
 	pattern = filepath.ToSlash(pattern)
-	prefixes := kbuildFrontierPatternPrefixes(pattern, view.directory)
+	prefixes := kbuildFrontierPatternPrefixes(pattern, view.directory, view.sourceOverlayDirectories)
 	if len(prefixes) == 0 {
 		return nil
 	}
@@ -60,7 +61,11 @@ func (view kbuildFrontierVirtualFileView) Match(pattern string) []string {
 			}
 			visited[path] = true
 			first, second := kbuildInvocationVirtualPathAliasPair(path, view.directory)
-			for _, alias := range [...]string{first, second} {
+			aliases := []string{first, second}
+			if kbuildFrontierPathWithinSourceOverlay(path, view.sourceOverlayDirectories) {
+				aliases = append(aliases, kbuildEvalSourceTree+"/"+path)
+			}
+			for _, alias := range aliases {
 				if alias == "" {
 					continue
 				}
@@ -80,7 +85,7 @@ func (view kbuildFrontierVirtualFileView) Match(pattern string) []string {
 }
 
 func (view kbuildFrontierVirtualFileView) Read(path string) (string, bool, bool, error) {
-	paths := kbuildFrontierGlobalPathCandidates(path, view.directory)
+	paths := kbuildFrontierGlobalPathCandidates(path, view.directory, view.sourceOverlayDirectories)
 	exists := false
 	exact := false
 	content := ""
@@ -111,7 +116,7 @@ func (view kbuildFrontierVirtualFileView) Read(path string) (string, bool, bool,
 // kbuildInvocationVirtualPathAliasPair. A first-component wildcard can match
 // either ".." in a cwd-relative alias or the object-tree marker, so that case
 // deliberately falls back to a full frontier range before final matching.
-func kbuildFrontierPatternPrefixes(pattern, directory string) []string {
+func kbuildFrontierPatternPrefixes(pattern, directory string, sourceOverlayDirectories []string) []string {
 	prefixes := []string{}
 	add := func(globalPattern string, ok bool) {
 		if !ok {
@@ -125,7 +130,20 @@ func kbuildFrontierPatternPrefixes(pattern, directory string) []string {
 
 	if slash := strings.IndexByte(pattern, '/'); slash >= 0 {
 		first := pattern[:slash]
+		if first == kbuildEvalObjectTree {
+			add(kbuildCanonicalFrontierPattern(pattern[slash+1:]))
+			return prefixes
+		}
+		if first == kbuildEvalSourceTree {
+			if len(sourceOverlayDirectories) != 0 {
+				add(kbuildCanonicalFrontierPattern(pattern[slash+1:]))
+			}
+			return prefixes
+		}
 		if matched, err := filepath.Match(first, kbuildEvalObjectTree); err == nil && matched {
+			add(kbuildCanonicalFrontierPattern(pattern[slash+1:]))
+		}
+		if matched, err := filepath.Match(first, kbuildEvalSourceTree); err == nil && matched && len(sourceOverlayDirectories) != 0 {
 			add(kbuildCanonicalFrontierPattern(pattern[slash+1:]))
 		}
 	}
@@ -156,7 +174,7 @@ func kbuildCanonicalFrontierPattern(pattern string) (string, bool) {
 	return pattern, true
 }
 
-func kbuildFrontierGlobalPathCandidates(path, directory string) []string {
+func kbuildFrontierGlobalPathCandidates(path, directory string, sourceOverlayDirectories []string) []string {
 	path = filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
 	candidates := []string{}
 	add := func(global string) {
@@ -168,13 +186,59 @@ func kbuildFrontierGlobalPathCandidates(path, directory string) []string {
 		}
 		candidates = append(candidates, global)
 	}
+	if path == kbuildEvalObjectTree || path == kbuildEvalSourceTree {
+		return candidates
+	}
 	if strings.HasPrefix(path, kbuildEvalObjectTree+"/") {
 		add(strings.TrimPrefix(path, kbuildEvalObjectTree+"/"))
+		return candidates
+	}
+	if strings.HasPrefix(path, kbuildEvalSourceTree+"/") {
+		candidate := strings.TrimPrefix(path, kbuildEvalSourceTree+"/")
+		if kbuildFrontierPathWithinSourceOverlay(candidate, sourceOverlayDirectories) {
+			add(candidate)
+		}
+		return candidates
 	}
 	if !filepath.IsAbs(path) {
 		add(filepath.ToSlash(filepath.Join(filepath.FromSlash(directory), filepath.FromSlash(path))))
 	}
 	return candidates
+}
+
+func kbuildFrontierPathWithinSourceOverlay(path string, sourceOverlayDirectories []string) bool {
+	path = kconfig.CanonicalKbuildGraphTarget(path)
+	for _, directory := range sourceOverlayDirectories {
+		if path == directory || strings.HasPrefix(path, directory+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// kbuildFrontierSourceOverlayDirectories returns only nested declared source
+// roots. Those roots are merged with their same-path writable object subtree
+// for external-module execution. The broad kernel source root is deliberately
+// excluded so an ordinary $(srctree) read can never observe generated files.
+func kbuildFrontierSourceOverlayDirectories(sourceRoots map[string]string) []string {
+	directories := map[string]bool{}
+	prefix := kbuildEvalSourceTree + "/"
+	for root := range sourceRoots {
+		root = filepath.ToSlash(filepath.Clean(filepath.FromSlash(root)))
+		if !strings.HasPrefix(root, prefix) {
+			continue
+		}
+		directory := kconfig.CanonicalKbuildGraphTarget(strings.TrimPrefix(root, prefix))
+		if directory != "" && directory != "." {
+			directories[directory] = true
+		}
+	}
+	result := make([]string, 0, len(directories))
+	for directory := range directories {
+		result = append(result, directory)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func slicesContainsString(values []string, value string) bool {

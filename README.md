@@ -17,7 +17,7 @@ Add `linux.bzl` and a hermetic C/C++ toolchain to `MODULE.bazel`:
 
 ```starlark
 bazel_dep(name = "linux.bzl", version = "0.0.1")
-bazel_dep(name = "llvm", version = "0.8.14")
+bazel_dep(name = "llvm", version = "0.8.18")
 
 # Copy `patches/llvm_kbuild_actions.patch` from the linux.bzl release into
 # `//third_party` and export it from that package's BUILD.bazel.
@@ -25,7 +25,7 @@ single_version_override(
     module_name = "llvm",
     patch_strip = 1,
     patches = ["//third_party:llvm_kbuild_actions.patch"],
-    version = "0.8.14",
+    version = "0.8.18",
 )
 
 register_toolchains(
@@ -126,7 +126,7 @@ for configured images, as shown above.
 | `strip_prefix` | Archive prefix; overrides the catalog default when set |
 | `patches` | Deterministic patch files |
 | `patch_strip` | Strip count for `patches` |
-| `source_overlays` | In-tree destination directories mapped to marker files in external source roots |
+| `source_overlays` | In-tree destination directories mapped to marker files in external source roots; exact `BUILD`/`BUILD.bazel` metadata files are omitted and case-only variants are rejected |
 | `module_kbuild_roots` | Overlaid Kbuild directories mapped to Kconfig expressions controlling graph inclusion; use `"y"` for an unconditional root |
 | `module_kconfig_roots` | Overlaid Kconfig files sourced by the root Kconfig |
 | `module_make_vars` | Deterministic variables needed while parsing overlaid Kconfig/Kbuild files |
@@ -160,7 +160,7 @@ supplies the versioned `linux-kbuild-*` actions and their complete input
 closure. No repository-generated configuration, architecture profile, or
 object graph is involved. Repository and platform labels may be renamed.
 The LLVM patch shown in the quick start adds that action contract to LLVM
-0.8.14; Bazel requires override patches to be labels in the consuming root
+0.8.18; Bazel requires override patches to be labels in the consuming root
 module, so consumers must vendor the patch locally.
 There are no public explicit Kbuild linker, compiler-path, host-probe,
 image-format, or signing-key attributes.
@@ -210,7 +210,7 @@ C-only kernels do not require one:
 
 ```starlark
 # MODULE.bazel
-bazel_dep(name = "rules_rs", version = "0.0.102")
+bazel_dep(name = "rules_rs", version = "0.0.107")
 
 rust_toolchains = use_extension(
     "@rules_rs//rs/toolchains:module_extension.bzl",
@@ -221,7 +221,7 @@ rust_toolchains.toolchain(
 )
 use_repo(rust_toolchains, "default_rust_toolchains")
 
-register_toolchains("@default_rust_toolchains//:all")
+register_toolchains("@default_rust_toolchains//...")
 ```
 
 The execution-time planner derives Rust configuration and arguments from the
@@ -367,6 +367,14 @@ If a vendor tree has Kconfig entry points, list their in-tree paths in
 `module_kconfig_roots`. Selecting the vendor symbol as `m` makes its module a
 normal output of `@configured_kernel//:modules`, including the usual objtool,
 modpost, module-link, and optional BTF stages.
+
+Overlay repositories may contain Bazel metadata. Regular files named exactly
+`BUILD` or `BUILD.bazel` are not copied into the Linux source repository, so
+they cannot split its single Bazel package. Case-only variants such as `Build`
+or `BUILD.BAZEL` are rejected because they behave differently on
+case-insensitive filesystems. Patch or rename a meaningful vendor `Build` file
+before overlaying it. Directories with those names remain ordinary source
+directories and are traversed normally.
 
 `module_targets` is the immutable public-product contract for an overlaid
 source tree. Every configured image generated from that source automatically

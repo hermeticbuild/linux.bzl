@@ -8,7 +8,7 @@ bazel_dep(name = "buildifier_prebuilt", version = "8.2.1.1", dev_dependency = Tr
 bazel_dep(name = "elfutils", version = "0.195")
 
 bazel_dep(name = "gazelle", version = "0.51.3", dev_dependency = True)
-bazel_dep(name = "llvm", version = "0.8.14", dev_dependency = True)
+bazel_dep(name = "llvm", version = "0.8.18", dev_dependency = True)
 
 bazel_dep(name = "gawk", version = "5.3.2.bcr.3")
 bazel_dep(name = "lz4", version = "1.10.0.bcr.1")
@@ -25,7 +25,7 @@ bazel_dep(name = "rules_m4", version = "0.3.bcr.1")
 bazel_dep(name = "rules_perl", version = "0.5.0")
 bazel_dep(name = "rules_go", version = "0.62.0")
 bazel_dep(name = "rules_python", version = "1.7.0")
-bazel_dep(name = "rules_rs", version = "0.0.102")
+bazel_dep(name = "rules_rs", version = "0.0.107")
 
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
 
@@ -53,7 +53,7 @@ single_version_override(
     module_name = "llvm",
     patch_strip = 1,
     patches = ["//patches:llvm_kbuild_actions.patch"],
-    version = "0.8.14",
+    version = "0.8.18",
 )
 
 rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
@@ -77,7 +77,7 @@ bindgen_toolchains = use_extension("@rules_rs//rs:rules_rust_bindgen.bzl", "rule
 use_repo(bindgen_toolchains, "rules_rust_bindgen")
 
 register_toolchains(
-    "@default_rust_toolchains//:all",
+    "@default_rust_toolchains//...",
     "@rules_rust_bindgen//:all",
     "@llvm//toolchain:all",
     dev_dependency = True,

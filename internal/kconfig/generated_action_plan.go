@@ -493,7 +493,6 @@ func actionPlanSourceNamespacePrefix(rawPrefix string) (string, error) {
 	}
 	return prefix, nil
 }
-
 func actionPlanExactSourceNamespacePath(rawPath string) (string, error) {
 	if rawPath != strings.TrimSpace(rawPath) {
 		return "", fmt.Errorf("invalid path %q", rawPath)
@@ -640,17 +639,40 @@ func appendReferencedPlanTrees(plan *ActionPlan, node *ActionPlanNode, recipe *A
 	for _, tree := range node.Trees {
 		seen[tree] = true
 	}
+	bindTree := func(tree string) {
+		if !seen[tree] {
+			seen[tree] = true
+			node.Trees = append(node.Trees, tree)
+		}
+		if !slices.Contains(recipe.Trees, tree) {
+			recipe.Trees = append(recipe.Trees, tree)
+		}
+	}
+	commandMetadataTrees, commandMetadataWorkingTrees, err := actionPlanCommandMetadataSourceTreeClosure(plan, node.Inputs)
+	if err != nil {
+		return err
+	}
+	// fixdep writes physical compiler source/dependency paths into Kbuild .cmd
+	// files, and modpost's srcversion calculation opens those paths later. Keep
+	// only the source namespaces behind a consumed .cmd producer. An ancestor
+	// WorkingTree means that compiler paths may be relative to its private object
+	// overlay, so replay that same namespace into the consumer's private root.
+	for _, tree := range commandMetadataWorkingTrees {
+		if !slices.Contains(recipe.WorkingTrees, tree) {
+			recipe.WorkingTrees = append(recipe.WorkingTrees, tree)
+		}
+	}
+	sort.Strings(recipe.WorkingTrees)
+	recipe.WorkingTrees = slices.Compact(recipe.WorkingTrees)
+	for _, tree := range commandMetadataTrees {
+		bindTree(tree)
+	}
 	// WorkingTrees are input-only tree bindings whose complete contents are
 	// staged below the recipe's private writable root. They need not appear in
 	// argv or environment placeholders, but they are still part of the exact
 	// sandbox/RBE closure of both the node and its interned recipe.
 	for _, tree := range recipe.WorkingTrees {
-		if seen[tree] {
-			continue
-		}
-		seen[tree] = true
-		node.Trees = append(node.Trees, tree)
-		recipe.Trees = append(recipe.Trees, tree)
+		bindTree(tree)
 	}
 	// A translation unit can include a sibling by a relative quoted path even
 	// when no -I flag spells the source root (for example mkcpustr.c includes a
@@ -667,24 +689,107 @@ func appendReferencedPlanTrees(plan *ActionPlan, node *ActionPlanNode, recipe *A
 			if !ok {
 				return fmt.Errorf("node source edge references unknown source %q", edge.SourceID)
 			}
-			if source.Namespace == "kernel" && !seen["kernel"] {
-				seen["kernel"] = true
-				node.Trees = append(node.Trees, "kernel")
-				recipe.Trees = append(recipe.Trees, "kernel")
+			if source.Namespace == "kernel" {
+				bindTree("kernel")
 			}
 		}
 	}
 	for _, value := range values {
 		for _, match := range actionRecipePlaceholder.FindAllStringSubmatch(value, -1) {
-			if match[1] != "tree" || seen[match[2]] {
+			if match[1] != "tree" {
 				continue
 			}
-			seen[match[2]] = true
-			node.Trees = append(node.Trees, match[2])
-			recipe.Trees = append(recipe.Trees, match[2])
+			bindTree(match[2])
 		}
 	}
 	return nil
+}
+
+// actionPlanCommandMetadataSourceTreeClosure returns source namespaces whose
+// physical paths may be retained by a consumed generated Kbuild .cmd file.
+// Only that output's producer ancestry participates. The source-edge and tree
+// intersection identifies a selected source namespace without forwarding
+// unrelated object/preparation trees. A namespace is also returned as writable
+// only when the producing ancestry staged it as a WorkingTree; this preserves
+// relative compiler paths without treating immutable source roots the same way.
+func actionPlanCommandMetadataSourceTreeClosure(
+	plan *ActionPlan,
+	inputs []ActionPlanNodeEdge,
+) ([]string, []string, error) {
+	if plan == nil {
+		return nil, nil, fmt.Errorf("Kbuild command metadata source-tree closure requires an action plan")
+	}
+	plan.ensureNodeLookupIndexes()
+	roots := []string{}
+	seenRoots := map[string]bool{}
+	for _, input := range inputs {
+		producer, ok := plan.nodesByID[input.ProducerID]
+		if !ok {
+			return nil, nil, fmt.Errorf("Kbuild command metadata input references absent producer %q", input.ProducerID)
+		}
+		if input.Slot < 0 || input.Slot >= len(producer.Outputs) {
+			return nil, nil, fmt.Errorf("Kbuild command metadata input references absent producer %q slot %d", input.ProducerID, input.Slot)
+		}
+		output := producer.Outputs[input.Slot]
+		logicalPath := output.Path
+		if output.ObservedPath != "" {
+			logicalPath = output.ObservedPath
+		}
+		if !strings.HasSuffix(canonicalKbuildRulePath(logicalPath), ".cmd") || seenRoots[input.ProducerID] {
+			continue
+		}
+		seenRoots[input.ProducerID] = true
+		roots = append(roots, input.ProducerID)
+	}
+	if len(roots) == 0 {
+		return nil, nil, nil
+	}
+	if err := plan.ensureSourceLookupIndex(); err != nil {
+		return nil, nil, err
+	}
+	retained := map[string]bool{}
+	staged := map[string]bool{}
+	visited := make([]bool, len(plan.Nodes))
+	for _, root := range roots {
+		err := plan.walkCompactKbuildWorkingTreeTopology(root, visited, func(nodeIndex uint32) error {
+			producer := plan.Nodes[nodeIndex]
+			declaredTrees := make(map[string]bool, len(producer.Trees))
+			for _, tree := range producer.Trees {
+				declaredTrees[tree] = true
+			}
+			if producer.Recipe != "" {
+				recipe, ok := plan.Recipes[producer.Recipe]
+				if !ok {
+					return fmt.Errorf("Kbuild command metadata producer %q references unknown recipe %q", producer.ID, producer.Recipe)
+				}
+				for _, tree := range recipe.WorkingTrees {
+					if declaredTrees[tree] {
+						staged[tree] = true
+					}
+				}
+			}
+			for _, edge := range producer.Sources {
+				source, ok := plan.sourcesByID[edge.SourceID]
+				if !ok {
+					return fmt.Errorf("Kbuild command metadata producer %q references unknown source %q", producer.ID, edge.SourceID)
+				}
+				if declaredTrees[source.Namespace] {
+					retained[source.Namespace] = true
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	working := map[string]bool{}
+	for tree := range retained {
+		if staged[tree] {
+			working[tree] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(retained)), slices.Sorted(maps.Keys(working)), nil
 }
 
 func (b *generatedPlanBuilder) internConfigProjectionSources() error {

@@ -21,12 +21,6 @@ load(
     "linux_probe_map_directory_tools",
 )
 load(":providers.bzl", "LinuxModuleInfo", "LinuxModuleSdkInfo")
-load(
-    ":rust_toolchain.bzl",
-    "optional_bindgen_toolchain_type",
-    "optional_rust_analyzer_toolchain_type",
-    "optional_rust_toolchain_type",
-)
 load(":script_runtime_toolchain.bzl", "SCRIPT_RUNTIME_TOOLCHAIN_TYPE")
 
 visibility("//...")
@@ -36,6 +30,7 @@ _HOST_DEPS_TREE = "host_deps"
 _HOST_DEPS_SENTINEL = "__LINUX_BZL_HOST_DEPS__"
 _PLAN_STAGES = ["prehost", "bootstrap", "host", "prep", "target"]
 _SOURCE_TREE_SENTINEL = "__LINUX_BZL_SOURCE_TREE__"
+_PERL_TOOLCHAIN_TYPE = str(Label("@rules_perl//perl:toolchain_type"))
 _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE = str(Label("@rules_python//python:exec_tools_toolchain_type"))
 
 def _add_artifact_path(args, flag, artifact, format = None):
@@ -153,6 +148,36 @@ def _crate_root(ctx):
 def _dirname(path):
     return path.rsplit("/", 1)[0] if "/" in path else ""
 
+def _dependency_symvers_name(index):
+    decimal = str(index)
+    if len(decimal) > 8:
+        fail("external module dependency index %s exceeds eight digits" % decimal)
+    return "00000000"[:8 - len(decimal)] + decimal + ".symvers"
+
+def _dependency_symvers_kbuild_lines(count):
+    return [
+        "override KBUILD_EXTRA_SYMBOLS := $(KBUILD_EXTRA_SYMBOLS) $(src)/.linux-bzl-dependencies/" + _dependency_symvers_name(index)
+        for index in range(count)
+    ]
+
+def linux_test_dependency_symvers_kbuild_lines(count):
+    return _dependency_symvers_kbuild_lines(count)
+
+def _record_external_source_copy(ctx, copies, destination, file, owner, allow_same = False):
+    existing = copies.get(destination)
+    if existing != None:
+        if allow_same and existing == file:
+            return
+        fail("%s stages both %s and %s as %s" % (ctx.label, existing, owner, destination))
+    copies[destination] = file
+
+def _validate_external_source_binding(ctx, binding):
+    if binding.path == "Kbuild":
+        fail("%s source %s uses backend-owned staged path Kbuild" % (ctx.label, binding.file))
+    dependency_namespace = ".linux-bzl-dependencies"
+    if binding.path == dependency_namespace or binding.path.startswith(dependency_namespace + "/"):
+        fail("%s source %s uses backend-owned staged path %s" % (ctx.label, binding.file, binding.path))
+
 def _external_kbuild(ctx, module_name, bindings, crate_root, dependencies):
     lines = ["obj-m += %s.o" % module_name]
     planner_vars = {}
@@ -190,8 +215,12 @@ def _external_kbuild(ctx, module_name, bindings, crate_root, dependencies):
             lines.append("ccflags-y += $(%s)" % variable)
             planner_vars[variable] = value
 
-    for index, _dependency in enumerate(dependencies):
-        lines.append("KBUILD_EXTRA_SYMBOLS += $(src)/.linux-bzl-dependencies/%08d.symvers" % index)
+    # KBUILD_EXTRA_SYMBOLS is consumed later by the root modpost recipe, after
+    # Kbuild has changed `src` back to the kernel source directory. Capture this
+    # external module's `src` while its Kbuild is being read. `override` retains
+    # declared dependencies when the SDK already supplies extra symvers through
+    # a Make command-line variable.
+    lines.extend(_dependency_symvers_kbuild_lines(len(dependencies)))
     return "\n".join(lines) + "\n", planner_vars, aliases
 
 def _stage_external_source(ctx, module_name, bindings, crate_root, dependencies):
@@ -200,17 +229,17 @@ def _stage_external_source(ctx, module_name, bindings, crate_root, dependencies)
     kbuild_file = ctx.actions.declare_file(ctx.label.name + ".external.Kbuild")
     ctx.actions.write(kbuild_file, kbuild)
     staged = ctx.actions.declare_directory(ctx.label.name + ".external-source")
-    copies = {prefix + "/Kbuild": kbuild_file}
+    copies = {}
+    _record_external_source_copy(ctx, copies, prefix + "/Kbuild", kbuild_file, "generated Kbuild")
     for binding in bindings:
-        copies[prefix + "/" + binding.path] = binding.file
+        _validate_external_source_binding(ctx, binding)
+        _record_external_source_copy(ctx, copies, prefix + "/" + binding.path, binding.file, binding.file)
     for alias in aliases:
         destination = prefix + "/" + alias.path
-        existing = copies.get(destination)
-        if existing != None and existing != alias.file:
-            fail("%s Rust crate-root alias %s collides with %s" % (ctx.label, alias.path, existing))
-        copies[destination] = alias.file
+        _record_external_source_copy(ctx, copies, destination, alias.file, "Rust crate-root alias %s" % alias.path, allow_same = True)
     for index, dependency in enumerate(dependencies):
-        copies[prefix + "/.linux-bzl-dependencies/%08d.symvers" % index] = dependency.module_symvers
+        destination = prefix + "/.linux-bzl-dependencies/" + _dependency_symvers_name(index)
+        _record_external_source_copy(ctx, copies, destination, dependency.module_symvers, "dependency %s Module.symvers" % index)
 
     args = ctx.actions.args()
     _add_artifact_path(args, "-tree_out", staged)
@@ -600,6 +629,10 @@ def _linux_external_module_impl(ctx):
         ),
     ]
 
+# Match linux_mapped_kernel's execution-platform anchors exactly. Rust compiler
+# executables already arrive through the SDK's identity-bound action contract;
+# resolving another target-aware Rust toolchain here can move the module onto a
+# different execution platform than the SDK which supplied those executables.
 _linux_external_module = rule(
     implementation = _linux_external_module_impl,
     attrs = {
@@ -621,15 +654,13 @@ _linux_external_module = rule(
     },
     exec_groups = {"host_cc": exec_group(toolchains = use_cc_toolchain() + [
         BISON_TOOLCHAIN_TYPE,
-        optional_bindgen_toolchain_type(),
         FLEX_TOOLCHAIN_TYPE,
         M4_TOOLCHAIN_TYPE,
-        optional_rust_analyzer_toolchain_type(),
-        optional_rust_toolchain_type(),
         _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE,
+        _PERL_TOOLCHAIN_TYPE,
         SCRIPT_RUNTIME_TOOLCHAIN_TYPE,
     ])},
-    toolchains = use_cc_toolchain() + [optional_rust_toolchain_type(), _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE, SCRIPT_RUNTIME_TOOLCHAIN_TYPE],
+    toolchains = use_cc_toolchain() + [_PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE, _PERL_TOOLCHAIN_TYPE, SCRIPT_RUNTIME_TOOLCHAIN_TYPE],
     doc = "Builds one external module through the configured kernel's generic Kbuild planner.",
 )
 

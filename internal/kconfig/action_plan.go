@@ -143,6 +143,9 @@ func NormalizeActionRecipeMakeShellValue(raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if compactKbuildContainsPrivateProvenanceByte(value) {
+		return "", fmt.Errorf("GNU Make shell output contains a reserved provenance byte")
+	}
 	if strings.ContainsRune(value, 0) {
 		return "", fmt.Errorf("GNU Make shell output contains NUL")
 	}
@@ -188,6 +191,9 @@ func normalizeActionRecipeMakeShellSingleWord(raw string) (string, string, error
 	value, err := normalizeActionRecipeMakeShellNewlines(raw)
 	if err != nil {
 		return "", "", err
+	}
+	if compactKbuildContainsPrivateProvenanceByte(value) {
+		return "", "", fmt.Errorf("GNU Make shell output contains a reserved provenance byte")
 	}
 	if strings.ContainsRune(value, 0) {
 		return "", "", fmt.Errorf("GNU Make shell output contains NUL")
@@ -1038,6 +1044,9 @@ func (r ActionRecipe) Validate() error {
 	if r.Schema != LinuxKernelPlanSchema {
 		return fmt.Errorf("recipe schema %q, want %q", r.Schema, LinuxKernelPlanSchema)
 	}
+	if compactKbuildContainsPrivateProvenanceByte(r.Tool) {
+		return fmt.Errorf("recipe retains a reserved recursive Make provenance byte")
+	}
 	if !LinuxKernelPlanNodeKinds[r.Kind] {
 		return fmt.Errorf("recipe has unsupported kind %q", r.Kind)
 	}
@@ -1083,10 +1092,22 @@ func (r ActionRecipe) Validate() error {
 			seen[name] = true
 		}
 	}
-	for key := range r.Environment {
-		if key == "" || strings.ContainsAny(key, "=\x00") {
-			return fmt.Errorf("recipe has invalid environment name %q", key)
+	restoredEnvironmentNames := map[string]string{}
+	for _, key := range sortedStringMapKeys(r.Environment) {
+		restored, err := RestoreCompactKbuildLiteralActionMarkers(key)
+		if err != nil {
+			return fmt.Errorf("recipe environment name %q protected source literal: %w", key, err)
 		}
+		if restored == "" || strings.ContainsAny(restored, "=\x00") {
+			return fmt.Errorf("recipe has invalid environment name %q", restored)
+		}
+		if compactKbuildContainsPrivateProvenanceByte(restored) {
+			return fmt.Errorf("recipe retains a reserved recursive Make provenance byte")
+		}
+		if previous, exists := restoredEnvironmentNames[restored]; exists {
+			return fmt.Errorf("recipe environment names %q and %q restore to the same name %q", previous, key, restored)
+		}
+		restoredEnvironmentNames[restored] = key
 	}
 	if r.WorkingDirectory != "" && strings.ContainsRune(r.WorkingDirectory, 0) {
 		return fmt.Errorf("recipe working directory contains NUL")
@@ -1311,8 +1332,34 @@ func (r ActionRecipe) Validate() error {
 		declared["tool"][r.Tool] = true
 		used["tool"][r.Tool] = true
 	}
-	values := append([]string(nil), r.Arguments...)
-	values = append(values, r.WorkingDirectory)
+	nonLiteralValues := append([]string{r.Tool}, r.Arguments...)
+	nonLiteralValues = append(nonLiteralValues, r.WorkingDirectory)
+	for _, replay := range r.CommandReplays {
+		for _, invocation := range replay.Invocations {
+			nonLiteralValues = append(nonLiteralValues, invocation.Outputs...)
+		}
+	}
+	for _, value := range nonLiteralValues {
+		if compactKbuildContainsProtectedLiteralActionMarker(value) {
+			return fmt.Errorf("recipe retains a protected source literal outside its environment")
+		}
+	}
+	values := append([]string(nil), nonLiteralValues...)
+	for replayIndex, replay := range r.CommandReplays {
+		for invocationIndex, invocation := range replay.Invocations {
+			for argumentIndex, value := range invocation.Arguments {
+				if compactKbuildContainsProtectedLiteralActionMarker(value) {
+					if _, err := RestoreCompactKbuildLiteralActionMarkers(value); err != nil {
+						return fmt.Errorf(
+							"recipe command replay %d invocation %d argument %d protected source literal: %w",
+							replayIndex, invocationIndex, argumentIndex, err,
+						)
+					}
+				}
+				values = append(values, value)
+			}
+		}
+	}
 	if r.Stdin != "" {
 		kind, name, ok := strings.Cut(r.Stdin, ":")
 		if !ok || (kind != "source" && kind != "input") || !declared[kind][name] {
@@ -1330,15 +1377,18 @@ func (r ActionRecipe) Validate() error {
 		used["output"][r.Stdout] = true
 	}
 	for _, key := range sortedStringMapKeys(r.Environment) {
-		values = append(values, r.Environment[key])
-	}
-	for _, replay := range r.CommandReplays {
-		for _, invocation := range replay.Invocations {
-			values = append(values, invocation.Arguments...)
-			values = append(values, invocation.Outputs...)
+		value := r.Environment[key]
+		if compactKbuildContainsProtectedLiteralActionMarker(value) {
+			if _, err := RestoreCompactKbuildLiteralActionMarkers(value); err != nil {
+				return fmt.Errorf("recipe environment %q protected source literal: %w", key, err)
+			}
 		}
+		values = append(values, value)
 	}
 	for _, value := range values {
+		if compactKbuildContainsPrivateProvenanceByte(value) {
+			return fmt.Errorf("recipe retains a reserved recursive Make provenance byte")
+		}
 		for _, match := range actionRecipePlaceholder.FindAllStringSubmatch(value, -1) {
 			if match[1] == "output" && observedOutputBindings[match[2]] {
 				return fmt.Errorf("recipe observed output binding %q cannot be referenced as a path placeholder", match[2])
@@ -2166,6 +2216,9 @@ func validateBindingName(kind, value string) error {
 }
 
 func validatePlanRelativePath(kind, value string) error {
+	if compactKbuildContainsPrivateProvenanceByte(value) {
+		return fmt.Errorf("kernel action plan %s path contains a reserved recursive Make provenance byte", kind)
+	}
 	if value == "" || strings.Contains(value, `\`) || strings.ContainsRune(value, 0) || strings.HasPrefix(value, "/") || path.Clean(value) != value {
 		return fmt.Errorf("kernel action plan %s path %q is not a canonical relative path", kind, value)
 	}

@@ -18,12 +18,16 @@ func TestEncodeRecipeCommandReplaysExpandsTypedPaths(t *testing.T) {
 	replays := []kconfig.ActionRecipeCommandReplay{{
 		Name: "make",
 		Invocations: []kconfig.ActionRecipeCommandReplayInvocation{{
-			Arguments: []string{"-f", "${tree:kernel}/scripts/Makefile.build", "obj=init"},
+			Arguments: []string{"-f", "${tree:kernel}/scripts/Makefile.build", "obj=init", "FLAG=\x04_LINUX_BZL_MAKE__"},
 			Outputs:   []string{"${work:root}/init/version-timestamp.o"},
 		}},
 	}}
+	bindings := map[string]map[string]string{
+		"tree": {"kernel": "/source"},
+		"work": {"root": "/work"},
+	}
 	arguments, err := encodeRecipeCommandReplays(replays, func(value string) (string, error) {
-		return strings.NewReplacer("${tree:kernel}", "/source", "${work:root}", "/work").Replace(value), nil
+		return expandValueWithLiteralActionMarkers(value, bindings)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -39,10 +43,25 @@ func TestEncodeRecipeCommandReplaysExpandsTypedPaths(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	wantArguments := []string{"-f", "/source/scripts/Makefile.build", "obj=init"}
+	wantArguments := []string{"-f", "/source/scripts/Makefile.build", "obj=init", "FLAG=__LINUX_BZL_MAKE__"}
 	if !slices.Equal(got.Invocations[0].Arguments, wantArguments) ||
 		!slices.Equal(got.Invocations[0].Outputs, []string{"/work/init/version-timestamp.o"}) {
 		t.Fatalf("expanded replay=%#v", got)
+	}
+}
+
+func TestExpandValueWithLiteralActionMarkersDoesNotDecodeBindingBytes(t *testing.T) {
+	const generated = "\x04_LINUX_BZL_MAKE__|\x03{tree:prep}"
+	got, err := expandValueWithLiteralActionMarkers(
+		"${content:value}|\x04_LINUX_BZL_MAKE__|\x03{tree:prep}",
+		map[string]map[string]string{"content": {"value": generated}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := generated + "|__LINUX_BZL_MAKE__|${tree:prep}"
+	if got != want {
+		t.Fatalf("literal-aware expansion = %q, want %q", got, want)
 	}
 }
 
@@ -421,6 +440,42 @@ func TestRunRecipeUsesOnlySelectedRoleEnvironment(t *testing.T) {
 	want := "exact-role-environment\nunset\n" + output + "\n"
 	if string(got) != want {
 		t.Fatalf("environment output = %q, want %q", got, want)
+	}
+}
+
+func TestRunRecipeRestoresProtectedSourceLiteralEnvironment(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "environment")
+	recipe := kconfig.ActionRecipe{
+		Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "helper",
+		Arguments: []string{"${output:00000000}"},
+		Environment: map[string]string{
+			"LITERAL_TREE":          "\x03{tree:prep}",
+			"LITERAL_MAKE":          "\x04_LINUX_BZL_MAKE__",
+			"\x04_LINUX_BZL_MAKE__": "restored-name",
+		},
+		Outputs: []string{"00000000"},
+	}
+	recipePath, recipeID := writeRecipe(t, recipe)
+	helper := filepath.Join(t.TempDir(), "helper")
+	script := "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$LITERAL_TREE\" \"$LITERAL_MAKE\" \"${__LINUX_BZL_MAKE__-unset}\" > \"$1\"\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := runRecipe(recipeOptions{
+		recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
+		toolRole: "helper", sources: map[string]string{}, inputs: map[string]string{},
+		outputs: map[string]string{"00000000": output}, tools: map[string]string{"helper": helper}, trees: map[string]string{},
+		actionEnvironment: map[string]string{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "${tree:prep}\n__LINUX_BZL_MAKE__\nrestored-name\n"
+	if string(got) != want {
+		t.Fatalf("restored literal environment=%q, want %q", got, want)
 	}
 }
 
@@ -1076,6 +1131,37 @@ func TestRecipeContentSubstitutionFailsClosed(t *testing.T) {
 				t.Fatal("materializeRecipeContentSubstitutions succeeded")
 			}
 		})
+	}
+}
+
+func TestRecipeContentSubstitutionRejectsPrivateProvenanceBytes(t *testing.T) {
+	directory := t.TempDir()
+	for _, boundary := range []struct {
+		name  string
+		value string
+	}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
+		filename := filepath.Join(directory, boundary.name)
+		if err := os.WriteFile(filename, []byte("value"+boundary.value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, transform := range []string{
+			kconfig.ActionRecipeContentTransformMakeShellWord,
+			kconfig.ActionRecipeContentTransformMakeShellSingleWord,
+			kconfig.ActionRecipeContentTransformMakeShellSingleQuotedSegment,
+			kconfig.ActionRecipeContentTransformMakeShellValue,
+		} {
+			t.Run(boundary.name+"/"+transform, func(t *testing.T) {
+				_, err := materializeRecipeContentSubstitutions(
+					map[string]kconfig.ActionRecipeContentSubstitution{
+						"value": {Input: "input:query", Transform: transform},
+					},
+					map[string]map[string]string{"source": {}, "input": {"query": filename}},
+				)
+				if err == nil || !strings.Contains(err.Error(), "reserved provenance byte") {
+					t.Fatalf("materializeRecipeContentSubstitutions() error = %v, want reserved-byte rejection", err)
+				}
+			})
+		}
 	}
 }
 

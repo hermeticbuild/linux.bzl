@@ -1,6 +1,14 @@
 #include <linux/init.h>
 #include <linux/module.h>
 
+#ifdef LINUX_BZL_SRCVERSION_LOCAL_HEADER_E2E
+#include <hello_module_local.h>
+
+#ifndef LINUX_BZL_SRCVERSION_LOCAL_HEADER_OK
+#error "srcversion did not retain the external module's local header closure"
+#endif
+#endif
+
 #ifdef LINUX_BZL_EXTERNAL_E2E
 #include <linux_bzl_external_closure.h>
 

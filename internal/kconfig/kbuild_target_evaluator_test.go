@@ -394,7 +394,7 @@ run: FORCE
 		t.Fatal(err)
 	}
 	kb, err := ParseKbuildFileTree(path, KbuildOptions{
-		Variables: map[string]string{"MAKE": "__LINUX_BZL_MAKE__"},
+		Variables: map[string]string{"MAKE": CompactKbuildRecursiveMakeProvenanceToken},
 		CommandLineVariables: map[string]string{
 			"CC":     KbuildActionRoleToken("target", "cc"),
 			"HOSTCC": KbuildActionRoleToken("host", "cc"),
@@ -1055,7 +1055,7 @@ build = -f $(srctree)/scripts/Makefile.build obj
 $(obj)/compressed/vmlinux: FORCE
 	$(MAKE) $(build)=$(obj)/compressed $@
 `, map[string]string{
-		"MAKE": "__LINUX_BZL_MAKE__",
+		"MAKE": CompactKbuildRecursiveMakeProvenanceToken,
 	})
 	injected, err := compactKbuildSourceScriptInjectionsForTarget(
 		profile, target, "", []string{"FORCE"}, nil,
@@ -1076,7 +1076,7 @@ $(obj)/compressed/vmlinux: FORCE
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "__LINUX_BZL_MAKE__ -f __LINUX_BZL_SOURCE_TREE__/scripts/Makefile.build obj=__LINUX_BZL_OBJECT_TREE__/arch/x86/boot/compressed " + target
+	want := CompactKbuildRecursiveMakeProvenanceToken + " -f __LINUX_BZL_SOURCE_TREE__/scripts/Makefile.build obj=__LINUX_BZL_OBJECT_TREE__/arch/x86/boot/compressed " + target
 	if command != want {
 		t.Fatalf("recursive command = %q, want %q", command, want)
 	}

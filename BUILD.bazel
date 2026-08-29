@@ -17,6 +17,12 @@ exports_files([
     "source_repo.BUILD.bazel",
 ])
 
+filegroup(
+    name = "source_repository_test_bazel_version",
+    srcs = [".bazelversion"],
+    visibility = ["//internal/tests/source_repo:__pkg__"],
+)
+
 gazelle(
     name = "gazelle",
     extra_args = ["internal"],

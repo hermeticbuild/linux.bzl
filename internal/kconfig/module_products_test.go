@@ -149,32 +149,41 @@ func TestSelectedModuleProductTargetRejectsIndependentAggregates(t *testing.T) {
 	}
 }
 
-func TestSelectedModuleProductTargetIgnoresWorkingClosureEdges(t *testing.T) {
-	profile := CompactKbuildProfile{Name: "selected:modules"}
-	config := CompactConfig{
-		KbuildProfiles: []CompactKbuildProfile{profile},
-		KbuildSelections: []CompactKbuildSelection{
-			{Profile: profile.Name, Target: "drivers/a/modules.order", MakeTarget: "drivers/a/modules.order", Lifecycle: "target", Scope: "target", Stage: "target"},
-			{Profile: profile.Name, Target: "net/b/modules.order", MakeTarget: "net/b/modules.order", Lifecycle: "target", Scope: "target", Stage: "target"},
-		},
-	}
-	selections, err := newCompactKbuildSelectionGraph(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan := &ActionPlan{Nodes: []ActionPlanNode{
-		{ID: "drivers-order", Outputs: []ActionPlanOutput{{Tree: "modules", Path: "drivers/a/modules.order"}}},
-		{
-			ID: "net-order",
-			Inputs: []ActionPlanNodeEdge{{
-				Role: compactKbuildWorkingClosureInputRole, ProducerID: "drivers-order",
-			}},
-			Outputs: []ActionPlanOutput{{Tree: "modules", Path: "net/b/modules.order"}},
-		},
-	}}
-	_, _, err = selectedModuleProductTarget(plan, config, selections, "modules.order")
-	if err == nil || !strings.Contains(err.Error(), "independent downstream modules.order products") {
-		t.Fatalf("working-closure-only module aggregates error = %v", err)
+func TestSelectedModuleProductTargetIgnoresOrderingAndStateEdges(t *testing.T) {
+	for _, role := range []string{
+		compactKbuildWorkingClosureInputRole,
+		compactKbuildOverwriteInputRole,
+		"sequence",
+		"order-only",
+	} {
+		t.Run(role, func(t *testing.T) {
+			profile := CompactKbuildProfile{Name: "selected:modules"}
+			config := CompactConfig{
+				KbuildProfiles: []CompactKbuildProfile{profile},
+				KbuildSelections: []CompactKbuildSelection{
+					{Profile: profile.Name, Target: "drivers/a/modules.order", MakeTarget: "drivers/a/modules.order", Lifecycle: "target", Scope: "target", Stage: "target"},
+					{Profile: profile.Name, Target: "net/b/modules.order", MakeTarget: "net/b/modules.order", Lifecycle: "target", Scope: "target", Stage: "target"},
+				},
+			}
+			selections, err := newCompactKbuildSelectionGraph(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan := &ActionPlan{Nodes: []ActionPlanNode{
+				{ID: "drivers-order", Outputs: []ActionPlanOutput{{Tree: "modules", Path: "drivers/a/modules.order"}}},
+				{
+					ID: "net-order",
+					Inputs: []ActionPlanNodeEdge{{
+						Role: role, ProducerID: "drivers-order",
+					}},
+					Outputs: []ActionPlanOutput{{Tree: "modules", Path: "net/b/modules.order"}},
+				},
+			}}
+			_, _, err = selectedModuleProductTarget(plan, config, selections, "modules.order")
+			if err == nil || !strings.Contains(err.Error(), "independent downstream modules.order products") {
+				t.Fatalf("%s-only module aggregates error = %v", role, err)
+			}
+		})
 	}
 }
 

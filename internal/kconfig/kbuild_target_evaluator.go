@@ -296,26 +296,6 @@ func evaluateCompactKbuildTargetForMakeTarget(
 	return values, nil
 }
 
-// evaluateCompactKbuildRecipeVariablesForAutomaticTarget expands variables at
-// the point where GNU Make expands a selected recipe. Compiler/Kconfig shell
-// probes which the source evaluator understands retain their measured result.
-// A shell expression outside that analysis-time grammar is recipe work: retain
-// it as an opaque content token so action lowering can give the query its exact
-// predecessor edges and safely substitute GNU Make's normalized result.
-func evaluateCompactKbuildRecipeVariablesForAutomaticTarget(
-	profile CompactKbuildProfile,
-	target, automaticTarget string,
-	stem string,
-	normal []string,
-	orderOnly []string,
-	injected map[string]string,
-	names ...string,
-) (map[string]string, error) {
-	return evaluateCompactKbuildRecipeVariablesForAutomaticTargetMode(
-		profile, target, target, automaticTarget, stem, normal, orderOnly, injected, true, names...,
-	)
-}
-
 func evaluateCompactKbuildRecipeVariablesForMakeTarget(
 	profile CompactKbuildProfile,
 	target, lookupTarget, automaticTarget string,
@@ -327,25 +307,6 @@ func evaluateCompactKbuildRecipeVariablesForMakeTarget(
 ) (map[string]string, error) {
 	return evaluateCompactKbuildRecipeVariablesForAutomaticTargetMode(
 		profile, target, lookupTarget, automaticTarget, stem, normal, orderOnly, injected, true, names...,
-	)
-}
-
-// evaluateCompactKbuildRecipeVariablesSymbolicForAutomaticTarget is the graph-
-// discovery counterpart of evaluateCompactKbuildRecipeVariablesForAutomaticTarget.
-// Unsupported recipe-side shell remains execution-time provenance in both
-// modes; only compiler probe atoms outside those shell expressions differ
-// between discovery and replay.
-func evaluateCompactKbuildRecipeVariablesSymbolicForAutomaticTarget(
-	profile CompactKbuildProfile,
-	target, automaticTarget string,
-	stem string,
-	normal []string,
-	orderOnly []string,
-	injected map[string]string,
-	names ...string,
-) (map[string]string, error) {
-	return evaluateCompactKbuildRecipeVariablesForAutomaticTargetMode(
-		profile, target, target, automaticTarget, stem, normal, orderOnly, injected, false, names...,
 	)
 }
 

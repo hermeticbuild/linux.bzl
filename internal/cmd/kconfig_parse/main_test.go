@@ -18,6 +18,51 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
+func trustedRecursiveMakeForTest(value string) string {
+	return strings.ReplaceAll(value, "__LINUX_BZL_MAKE__", kbuildEvalRecursiveMake)
+}
+
+func TestValidateConfiguredKbuildInputsRejectsPrivateRecursiveMakeBytes(t *testing.T) {
+	for _, boundary := range []struct {
+		name  string
+		value string
+	}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
+		for _, input := range []struct {
+			name               string
+			variables          map[string]string
+			kbuildVariables    map[string]string
+			targets            []string
+			preparationTargets []string
+		}{
+			{name: "shared variable name", variables: map[string]string{"PRIVATE" + boundary.value: "value"}},
+			{name: "shared variable value", variables: map[string]string{"PRIVATE": "value" + boundary.value}},
+			{name: "Kbuild variable name", kbuildVariables: map[string]string{"PRIVATE" + boundary.value: "value"}},
+			{name: "Kbuild variable value", kbuildVariables: map[string]string{"PRIVATE": "value" + boundary.value}},
+			{name: "target", targets: []string{"target" + boundary.value}},
+			{name: "preparation target", preparationTargets: []string{"target" + boundary.value}},
+		} {
+			t.Run(boundary.name+"/"+input.name, func(t *testing.T) {
+				err := validateConfiguredKbuildInputs(
+					input.variables, input.kbuildVariables, input.targets, input.preparationTargets,
+				)
+				if err == nil || !strings.Contains(err.Error(), "reserved recursive Make provenance byte") {
+					t.Fatalf("validateConfiguredKbuildInputs() error = %v, want reserved-provenance rejection", err)
+				}
+			})
+		}
+	}
+
+	marker := "__LINUX_BZL_MAKE__"
+	if err := validateConfiguredKbuildInputs(
+		map[string]string{"MAKE": marker},
+		map[string]string{"FORWARDED": marker},
+		[]string{"target-" + marker},
+		[]string{"prepare-" + marker},
+	); err != nil {
+		t.Fatalf("printable configured Kbuild inputs rejected: %v", err)
+	}
+}
+
 var testConfiguredKbuildActionRoles = []string{
 	"ar", "as", "cc", "cxx", "ld", "nm", "objcopy", "objdump", "ranlib", "readelf", "strip",
 }
@@ -1540,7 +1585,7 @@ config EMPTY
 	if err != nil {
 		t.Fatal(err)
 	}
-	vars := kbuildVariablesForConfig(
+	vars, err := kbuildVariablesForConfig(
 		map[string]string{
 			"ARCH":        "arm64",
 			"CONFIG_BASE": "base",
@@ -1563,6 +1608,9 @@ config EMPTY
 			},
 		},
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for key, want := range map[string]string{
 		"ARCH":            "arm64",
@@ -1578,6 +1626,64 @@ config EMPTY
 		if got := vars[key]; got != want {
 			t.Fatalf("vars[%q] = %q, want %q", key, got, want)
 		}
+	}
+}
+
+func TestKbuildVariablesForConfigRejectsPrivateRecursiveMakeBytes(t *testing.T) {
+	tree, err := kconfig.Parse(
+		t.Context(),
+		strings.NewReader("config PRIVATE\n\tstring\n"),
+		"Kconfig",
+		kconfig.Options{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, boundary := range []struct {
+		name  string
+		value string
+	}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
+		for _, input := range []struct {
+			name     string
+			base     map[string]string
+			resolved *kconfig.ResolvedConfig
+		}{
+			{
+				name: "configured base",
+				base: map[string]string{"PRIVATE": "prefix" + boundary.value + "suffix"},
+				resolved: &kconfig.ResolvedConfig{
+					Effective: map[string]string{}, Written: map[string]bool{},
+				},
+			},
+			{
+				name: "resolved string",
+				resolved: &kconfig.ResolvedConfig{
+					Effective: map[string]string{
+						"CONFIG_PRIVATE": `"prefix` + boundary.value + `suffix"`,
+					},
+					Written: map[string]bool{"CONFIG_PRIVATE": true},
+				},
+			},
+		} {
+			t.Run(boundary.name+"/"+input.name, func(t *testing.T) {
+				_, err := kbuildVariablesForConfig(input.base, tree, input.resolved)
+				if err == nil || !strings.Contains(err.Error(), "reserved recursive Make provenance byte") {
+					t.Fatalf("kbuildVariablesForConfig() error = %v, want reserved-provenance rejection", err)
+				}
+			})
+		}
+	}
+
+	marker := "__LINUX_BZL_MAKE__"
+	variables, err := kbuildVariablesForConfig(nil, tree, &kconfig.ResolvedConfig{
+		Effective: map[string]string{"CONFIG_PRIVATE": `"` + marker + `"`},
+		Written:   map[string]bool{"CONFIG_PRIVATE": true},
+	})
+	if err != nil {
+		t.Fatalf("printable resolved Kconfig value rejected: %v", err)
+	}
+	if got := variables["CONFIG_PRIVATE"]; got != marker {
+		t.Fatalf("printable resolved Kconfig value = %q, want %q", got, marker)
 	}
 }
 
@@ -1605,8 +1711,12 @@ obj-y += $(firmware)
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	variables, err := kbuildVariablesForConfig(nil, tree, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
 	kb, err := kconfig.ParseKbuildFileWithOptions(path, kconfig.KbuildOptions{
-		Variables:        kbuildVariablesForConfig(nil, tree, resolved),
+		Variables:        variables,
 		CaptureVariables: []string{"firmware"},
 	})
 	if err != nil {
@@ -4399,6 +4509,7 @@ func selectionRoleProfile(t *testing.T, makefile string, entryTargets ...string)
 	}
 	parsed, err := kconfig.ParseKbuildFileTree(filename, kconfig.KbuildOptions{
 		Variables: map[string]string{
+			"MAKE":    kbuildEvalRecursiveMake,
 			"objtree": kbuildEvalObjectTree,
 			"srctree": kbuildEvalSourceTree,
 		},
@@ -4451,6 +4562,7 @@ func selectionRoleProfileWithSources(
 	}
 	parsed, err := kconfig.ParseKbuildFileTree(filename, kconfig.KbuildOptions{
 		Variables: map[string]string{
+			"MAKE":    kbuildEvalRecursiveMake,
 			"objtree": kbuildEvalObjectTree,
 			"srctree": kbuildEvalSourceTree,
 		},
@@ -4826,6 +4938,231 @@ FORCE:
 	}
 	if !selectedExternal {
 		t.Fatalf("selections omit external module object: selections=%#v profiles=%#v", selections, profiles)
+	}
+}
+
+func TestEvaluatedKbuildProfilesMapLinux612ExternalModuleSourceDirectory(t *testing.T) {
+	root := t.TempDir()
+	objectRoot := t.TempDir()
+	externalRoot := t.TempDir()
+	write := func(base, relative, content string) {
+		t.Helper()
+		filename := filepath.Join(base, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(filename), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filename, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(root, "Makefile", `
+ifeq ("$(origin M)", "command line")
+KBUILD_EXTMOD := $(M)
+endif
+export KBUILD_EXTMOD
+build := -f $(srctree)/scripts/Makefile.build obj
+build-dir := $(KBUILD_EXTMOD)
+.PHONY: modules $(build-dir)
+modules: $(build-dir)
+$(build-dir):
+	$(MAKE) $(build)=$@ need-builtin=1 need-modorder=1 all
+`)
+	write(root, "scripts/Makefile.build", `
+src := $(if $(VPATH),$(VPATH)/)$(obj)
+kbuild-file = $(or $(wildcard $(src)/Kbuild),$(src)/Makefile)
+include $(kbuild-file)
+.PHONY: all
+all: $(obj)/module.o
+$(obj)/module.o: $(src)/$(MODULE_SOURCE)
+	cp $< $@
+`)
+	write(externalRoot, "Kbuild", "MODULE_SOURCE := module.c\n")
+	write(externalRoot, "module.c", "external module input\n")
+
+	const externalDirectory = ".linux-bzl/external/module"
+	externalSourceRoot := kbuildEvalSourceTree + "/" + externalDirectory
+	variables := map[string]string{
+		"M":       externalSourceRoot,
+		"SRCARCH": "x86",
+	}
+	profiles, selections, _, err := evaluatedKbuildProfilesWithOptions(
+		root,
+		objectRoot,
+		[]string{"modules"},
+		variables,
+		kconfig.KbuildOptions{
+			RootDir: root,
+			CommandLineVariables: map[string]string{
+				"M": variables["M"],
+			},
+			AutoExportCommandLineVariables: map[string]bool{"M": true},
+			SourceRoots: map[string]string{
+				externalSourceRoot: externalRoot,
+			},
+			ConfigVariablesComplete: true,
+			MakeVariablesComplete:   true,
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	selectedModule := false
+	for _, selection := range selections {
+		if selection.Target == externalDirectory+"/module.o" {
+			selectedModule = true
+		}
+	}
+	if !selectedModule {
+		t.Fatalf("Linux 6.12 external-module selections omit module object: selections=%#v profiles=%#v", selections, profiles)
+	}
+	for _, profile := range profiles {
+		if profile.Path != "scripts/Makefile.build" || profile.Directory != externalDirectory {
+			continue
+		}
+		location, located := kconfig.CompactKbuildProfileInvocationLocation(profile)
+		if !located || location.Tree != kconfig.CompactKbuildInvocationObjectTree || location.Directory != "" {
+			t.Fatalf("Linux 6.12 external-module process location = %#v,%t, want object-tree root", location, located)
+		}
+		got, evalErr := kconfig.EvaluateCompactKbuildTextSymbolic(
+			profile, externalDirectory+"/module.o", "", nil, nil, nil, "$(src)",
+		)
+		if evalErr != nil {
+			t.Fatal(evalErr)
+		}
+		if got != externalSourceRoot {
+			t.Fatalf("Linux 6.12 external-module src = %q, want immutable source root %q", got, externalSourceRoot)
+		}
+		return
+	}
+	t.Fatalf("profiles omit Linux 6.12 external-module Makefile.build invocation: %#v", profiles)
+}
+
+func TestEvaluatedKbuildProfilesReadLinux612SourceRootedExternalModuleOrder(t *testing.T) {
+	root := t.TempDir()
+	objectRoot := t.TempDir()
+	externalRoot := t.TempDir()
+	write := func(base, relative, content string) {
+		t.Helper()
+		filename := filepath.Join(base, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(filename), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filename, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(root, "Makefile", `
+ifeq ("$(origin M)", "command line")
+KBUILD_EXTMOD := $(M)
+endif
+export KBUILD_EXTMOD
+export extmod_prefix = $(if $(KBUILD_EXTMOD),$(KBUILD_EXTMOD)/)
+export MODORDER := $(extmod_prefix)modules.order
+build := -f $(srctree)/scripts/Makefile.build obj
+build-dir := $(KBUILD_EXTMOD)
+.PHONY: modules modpost modules_check $(build-dir)
+$(MODORDER): $(build-dir)
+	@:
+modules: modpost
+	$(MAKE) -f $(srctree)/scripts/Makefile.modfinal
+modpost: modules_check
+	$(MAKE) -f $(srctree)/scripts/Makefile.modpost
+modules_check: $(MODORDER)
+	@:
+$(build-dir):
+	$(MAKE) $(build)=$@ need-builtin=1 need-modorder=1
+`)
+	write(root, "scripts/Kbuild.include", `
+empty :=
+space := $(empty) $(empty)
+define newline
+
+
+endef
+read-file = $(subst $(newline),$(space),$(file < $1))
+`)
+	write(root, "scripts/Makefile.build", `
+include $(srctree)/scripts/Kbuild.include
+src := $(obj)
+include $(src)/Kbuild
+.PHONY: __build FORCE
+__build: $(obj)/modules.order
+cmd_gen_order = { echo $(obj)/demo.o; :; } > $@
+$(obj)/modules.order: $(obj)/demo.o FORCE
+	$(cmd_gen_order)
+$(obj)/demo.o: $(src)/demo.rs
+	touch $@
+FORCE:
+`)
+	write(root, "scripts/Makefile.modpost", `
+.PHONY: __modpost
+__modpost: $(extmod_prefix)Module.symvers
+$(extmod_prefix)Module.symvers: $(MODORDER)
+	cp $< $@
+`)
+	write(root, "scripts/Makefile.modfinal", `
+include $(srctree)/scripts/Kbuild.include
+modules := $(call read-file, $(MODORDER))
+.PHONY: __modfinal FORCE
+__modfinal: $(modules:%.o=%.ko)
+%.ko: %.o %.mod.o $(extmod_prefix).module-common.o FORCE
+	cp $< $@
+%.mod.o: %.mod.c
+	cp $< $@
+$(extmod_prefix).module-common.o:
+	touch $@
+targets += $(modules:%.o=%.ko) $(modules:%.o=%.mod.o) $(extmod_prefix).module-common.o
+FORCE:
+`)
+	write(externalRoot, "Kbuild", "obj-m += demo.o\n")
+	write(externalRoot, "demo.rs", "external module input\n")
+
+	const externalDirectory = ".linux-bzl/external/demo"
+	externalSourceRoot := kbuildEvalSourceTree + "/" + externalDirectory
+	variables := map[string]string{
+		"M":       externalSourceRoot,
+		"SRCARCH": "x86",
+	}
+	profiles, selections, _, err := evaluatedKbuildProfilesWithOptions(
+		root,
+		objectRoot,
+		[]string{"modules"},
+		variables,
+		kconfig.KbuildOptions{
+			RootDir: root,
+			CommandLineVariables: map[string]string{
+				"M": variables["M"],
+			},
+			AutoExportCommandLineVariables: map[string]bool{"M": true},
+			SourceRoots: map[string]string{
+				externalSourceRoot: externalRoot,
+			},
+			ConfigVariablesComplete: true,
+			MakeVariablesComplete:   true,
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("evaluatedKbuildProfilesWithOptions() failed: %v", err)
+	}
+
+	selected := map[string]bool{}
+	for _, selection := range selections {
+		selected[selection.Target] = true
+	}
+	for _, target := range []string{
+		externalDirectory + "/demo.mod.o",
+		externalDirectory + "/.module-common.o",
+		externalDirectory + "/demo.ko",
+	} {
+		if !selected[target] {
+			t.Fatalf("Linux 6.12 source-rooted modules.order selections omit %q: profiles=%#v selections=%#v", target, profiles, selections)
+		}
+	}
+	if selected[externalDirectory+"/demo.mod.c"] {
+		t.Fatalf("modpost side output became a materialized selection: %#v", selections)
 	}
 }
 
@@ -5361,6 +5698,220 @@ output:
 	}
 }
 
+func TestEvaluatedKbuildProfilesPreserveNestedRecursiveMakeProvenance(t *testing.T) {
+	const printableMake = "__LINUX_BZL_MAKE__"
+	for _, test := range []struct {
+		name           string
+		rootArguments  string
+		wantChildMake  string
+		wantRootReplay []string
+		wantGrandchild bool
+	}{
+		{
+			name:           "trusted default remains recursive",
+			wantChildMake:  kbuildEvalRecursiveMake,
+			wantRootReplay: []string{"-f", kbuildEvalSourceTree + "/scripts/child.mk", "child"},
+			wantGrandchild: true,
+		},
+		{
+			name:          "trusted explicit forwarding remains recursive",
+			rootArguments: "MAKE=$(MAKE) ",
+			wantChildMake: kbuildEvalRecursiveMake,
+			wantRootReplay: []string{
+				"MAKE=" + kconfig.CompactKbuildRecursiveMakeReplayName,
+				"-f", kbuildEvalSourceTree + "/scripts/child.mk", "child",
+			},
+			wantGrandchild: true,
+		},
+		{
+			name:          "source-constructed printable override is ordinary",
+			rootArguments: "MAKE=$(make_marker_prefix)MAKE__ ",
+			wantChildMake: printableMake,
+			wantRootReplay: []string{
+				"MAKE=" + printableMake,
+				"-f", kbuildEvalSourceTree + "/scripts/child.mk", "child",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			write := func(relative, content string) {
+				t.Helper()
+				filename := filepath.Join(root, filepath.FromSlash(relative))
+				if err := os.MkdirAll(filepath.Dir(filename), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filename, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write("Makefile", `
+make_marker_prefix := __LINUX_BZL_
+.PHONY: all
+all:
+	$(MAKE) `+test.rootArguments+`-f $(srctree)/scripts/child.mk child
+`)
+			write("scripts/child.mk", `
+.PHONY: child
+child:
+	$(MAKE) -f $(srctree)/scripts/grandchild.mk grandchild
+`)
+			write("scripts/grandchild.mk", `
+grandchild: grandchild.in
+	cp $< $@
+`)
+			write("grandchild.in", "nested input\n")
+
+			variables := map[string]string{"SRCARCH": "x86"}
+			profiles, selections, _, err := evaluatedKbuildProfilesWithOptions(
+				root, root, []string{"all"}, variables, kconfig.KbuildOptions{
+					RootDir:                 root,
+					Variables:               variables,
+					ConfigVariablesComplete: true,
+					MakeVariablesComplete:   true,
+				}, nil,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			profilesByPath := make(map[string]*kconfig.CompactKbuildProfile, len(profiles))
+			for index := range profiles {
+				profilesByPath[profiles[index].Path] = &profiles[index]
+			}
+			rootProfile := profilesByPath["Makefile"]
+			child := profilesByPath["scripts/child.mk"]
+			if rootProfile == nil || child == nil {
+				t.Fatalf("profiles omit trusted root-to-child invocation: %#v", profiles)
+			}
+
+			childValues, err := kconfig.EvaluateCompactKbuildTargetSymbolic(
+				*child, "child", "", nil, nil, nil, "MAKE",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := childValues["MAKE"]; got != test.wantChildMake {
+				t.Fatalf("child MAKE = %q, want %q", got, test.wantChildMake)
+			}
+
+			var rootDependency *kconfig.CompactKbuildInvocationDependency
+			for index := range rootProfile.TargetInvocationDependencies {
+				candidate := &rootProfile.TargetInvocationDependencies[index]
+				if candidate.Target == "all" && candidate.Profile == child.Name {
+					rootDependency = candidate
+					break
+				}
+			}
+			if rootDependency == nil {
+				t.Fatalf("root dependencies omit child profile %q: %#v", child.Name, rootProfile.TargetInvocationDependencies)
+			}
+			if !slices.Equal(rootDependency.Goals, []string{"child"}) ||
+				!slices.Equal(rootDependency.ReplayArguments, test.wantRootReplay) {
+				t.Fatalf(
+					"root-to-child dependency = %#v, want goals child and replay argv %q",
+					rootDependency, test.wantRootReplay,
+				)
+			}
+
+			grandchild := profilesByPath["scripts/grandchild.mk"]
+			if (grandchild != nil) != test.wantGrandchild {
+				t.Fatalf("grandchild profile present = %t, want %t; profiles=%#v", grandchild != nil, test.wantGrandchild, profiles)
+			}
+			if !test.wantGrandchild {
+				if len(child.TargetInvocationDependencies) != 0 {
+					t.Fatalf("ordinary printable child MAKE created recursive dependencies: %#v", child.TargetInvocationDependencies)
+				}
+				if slices.ContainsFunc(selections, func(selection kconfig.CompactKbuildSelection) bool {
+					return selection.Target == "grandchild"
+				}) {
+					t.Fatalf("ordinary printable child MAKE selected grandchild: %#v", selections)
+				}
+			} else {
+				var nestedDependency *kconfig.CompactKbuildInvocationDependency
+				for index := range child.TargetInvocationDependencies {
+					candidate := &child.TargetInvocationDependencies[index]
+					if candidate.Target == "child" && candidate.Profile == grandchild.Name {
+						nestedDependency = candidate
+						break
+					}
+				}
+				if nestedDependency == nil ||
+					!slices.Equal(nestedDependency.Goals, []string{"grandchild"}) ||
+					!slices.Equal(nestedDependency.ReplayArguments, []string{
+						"-f", kbuildEvalSourceTree + "/scripts/grandchild.mk", "grandchild",
+					}) {
+					t.Fatalf("trusted child-to-grandchild dependency = %#v", nestedDependency)
+				}
+				if !slices.ContainsFunc(selections, func(selection kconfig.CompactKbuildSelection) bool {
+					return selection.Profile == grandchild.Name && selection.Target == "grandchild"
+				}) {
+					t.Fatalf("trusted recursive MAKE omitted grandchild selection: %#v", selections)
+				}
+			}
+
+			for _, profile := range profiles {
+				for _, dependency := range profile.TargetInvocationDependencies {
+					for _, argument := range dependency.ReplayArguments {
+						if strings.Contains(argument, kbuildEvalRecursiveMake) {
+							t.Fatalf("replay argv leaked private recursive-Make provenance: %q", dependency.ReplayArguments)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestEvaluatedKbuildProfilesRejectPrivateRecursiveMakeBytesInRootOverlays(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(`
+.PHONY: all
+all:
+	$(MAKE) -f $(srctree)/scripts/child.mk child
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "scripts", "child.mk"), []byte(`
+.PHONY: child
+child:
+	@:
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, boundary := range []struct {
+		name  string
+		value string
+	}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
+		for _, ingress := range []string{"environment", "command line"} {
+			t.Run(boundary.name+"/"+ingress, func(t *testing.T) {
+				variables := map[string]string{"SRCARCH": "x86"}
+				options := kconfig.KbuildOptions{
+					RootDir:                 root,
+					Variables:               variables,
+					ConfigVariablesComplete: true,
+					MakeVariablesComplete:   true,
+				}
+				forged := "prefix" + boundary.value + "suffix"
+				if ingress == "environment" {
+					options.EnvironmentVariables = map[string]string{"MAKE": forged}
+				} else {
+					options.CommandLineVariables = map[string]string{"MAKE": forged}
+				}
+				_, _, _, err := evaluatedKbuildProfilesWithOptions(
+					root, root, []string{"all"}, variables, options, nil,
+				)
+				if err == nil || !strings.Contains(err.Error(), "reserved recursive Make provenance byte") {
+					t.Fatalf("evaluatedKbuildProfilesWithOptions() error = %v, want root-overlay provenance rejection", err)
+				}
+			})
+		}
+	}
+}
+
 func TestKbuildInvocationRequestKeySeparatesEnvironmentFromCommandLine(t *testing.T) {
 	request := kbuildInvocationRequest{
 		name: "child", makefile: "scripts/child.mk",
@@ -5394,6 +5945,37 @@ func TestKbuildInvocationRequestKeyIncludesProcessTreeProvenance(t *testing.T) {
 	}
 }
 
+func TestKbuildInvocationSourceOverlayRecognizesCanonicalNestedRootKey(t *testing.T) {
+	const directory = "external/module"
+	sourceRoots := map[string]string{
+		kbuildEvalSourceTree + "/" + directory + "/.": t.TempDir(),
+	}
+	if got, want := kbuildFrontierSourceOverlayDirectories(sourceRoots), []string{directory}; !slices.Equal(got, want) {
+		t.Fatalf("discovered source overlay directories = %q, want %q", got, want)
+	}
+	for _, virtual := range []string{
+		kbuildEvalSourceTree + "/" + directory,
+		kbuildEvalSourceTree + "/" + directory + "/subdir",
+		kbuildEvalSourceTree + "/external/other/../module",
+	} {
+		if !kbuildInvocationSourceOverlayPath(virtual, sourceRoots) {
+			t.Fatalf("canonical nested source root did not recognize %q", virtual)
+		}
+	}
+	request := kbuildInvocationRequest{processLocation: kconfig.CompactKbuildInvocationLocation{
+		Tree: kconfig.CompactKbuildInvocationSourceTree, Directory: directory,
+	}}
+	request = kbuildInvocationSourceOverlayRequest(request, sourceRoots)
+	if got, want := request.processLocation.Tree, kconfig.CompactKbuildInvocationObjectTree; got != want {
+		t.Fatalf("canonical nested source-root request tree = %q, want %q", got, want)
+	}
+	if _, handled, err := evaluateKbuildSourceOverlayDirectoryQuery(
+		"mkdir -p "+kbuildEvalSourceTree+"/"+directory, sourceRoots,
+	); err != nil || !handled {
+		t.Fatalf("canonical nested source-root mkdir query = handled %t, error %v", handled, err)
+	}
+}
+
 func TestKbuildInvocationRequestKeyIncludesInvocationPredecessors(t *testing.T) {
 	request := kbuildInvocationRequest{
 		name: "child", makefile: "scripts/child.mk",
@@ -5408,7 +5990,7 @@ func TestKbuildInvocationRequestKeyIncludesInvocationPredecessors(t *testing.T) 
 
 func TestKbuildRecursiveMakeRequestCapturesInlineEnvironment(t *testing.T) {
 	invocations, err := kbuildRecursiveMakeInvocations(
-		`V=1 confdir=/configured __LINUX_BZL_MAKE__ -f `+kbuildEvalSourceTree+`/scripts/child.mk all`,
+		trustedRecursiveMakeForTest(`V=1 confdir=/configured __LINUX_BZL_MAKE__ -f `+kbuildEvalSourceTree+`/scripts/child.mk all`),
 		"",
 	)
 	if err != nil {
@@ -6027,6 +6609,362 @@ target-bootstrap.o: target-bootstrap.c
 	host := selectionByTarget(t, selections, "final-host")
 	if host.Scope != "host" || host.Stage != "host" {
 		t.Fatalf("host consumer selection = %#v, want host/host", host)
+	}
+}
+
+func TestSelectedKbuildSelectionsTreatIfChangedDepProgramAsDirectObjectTreeInput(t *testing.T) {
+	const (
+		program = "scripts/basic/fixdep"
+		target  = "scripts/mod/devicetable-offsets.s"
+	)
+	root := selectionRoleProfile(t, "all:\n", "all")
+	root.Name = "root:if-changed-dep-program"
+	fixdep := selectionRoleProfile(t, `
+scripts/basic/fixdep: scripts/basic/fixdep.c
+	$(HOSTCC) -o $@ $<
+`, program)
+	fixdep.Name = "child:if-changed-dep-fixdep"
+	consumer := selectionRoleProfile(t, `
+cmd_and_fixdep = __LINUX_BZL_OBJECT_TREE__/scripts/basic/fixdep $(depfile) $@; $(cmd_$(1))
+if_changed_dep = $(cmd_and_fixdep)
+cmd_cc_s_c = $(CC) -S -o $@ $<
+final-host: scripts/mod/devicetable-offsets.s final-host.c
+	$(HOSTCC) -o $@ final-host.c
+scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
+	$(call if_changed_dep,cc_s_c)
+`, "final-host")
+	consumer.Name = "child:if-changed-dep-consumer"
+	consumer.InvocationPredecessors = []string{fixdep.Name}
+	programArtifact := kconfig.CompactKbuildVisibleArtifact{
+		Path: program, Profile: fixdep.Name, Target: program,
+	}
+	setTestCompactKbuildInitialVisibleArtifacts(t, &consumer, []kconfig.CompactKbuildVisibleArtifact{programArtifact})
+	root.TargetInvocationDependencies = []kconfig.CompactKbuildInvocationDependency{
+		{Target: "all", Profile: fixdep.Name, Goals: fixdep.EntryTargets},
+		{Target: "all", Profile: consumer.Name, Goals: consumer.EntryTargets},
+	}
+
+	selections := mustSelectedKbuildSelections(t, []kconfig.CompactKbuildProfile{root, fixdep, consumer}, map[string]bool{
+		"scripts/basic/fixdep.c":            true,
+		"scripts/mod/devicetable-offsets.c": true,
+		"final-host.c":                      true,
+	})
+	programSelection := selectionByTarget(t, selections, program)
+	if programSelection.Scope != "host" || programSelection.Stage != "prehost" {
+		t.Fatalf("generated program selection = %#v, want host/prehost", programSelection)
+	}
+	consumerSelection := selectionByTarget(t, selections, target)
+	wantArtifacts := kconfig.EncodeCompactKbuildInitialObjectTreeArtifacts(
+		[]kconfig.CompactKbuildVisibleArtifact{programArtifact},
+	)
+	if consumerSelection.Scope != "target" || consumerSelection.Stage != "bootstrap" ||
+		!consumerSelection.UsesInitialObjectTree || consumerSelection.InitialObjectTreeArtifacts != wantArtifacts {
+		t.Fatalf("if_changed_dep consumer selection = %#v, want target/bootstrap with exact program artifact %q", consumerSelection, wantArtifacts)
+	}
+}
+
+func TestSelectedKbuildSelectionsUseSelectedOverwriteOfInitialObjectTreeProgram(t *testing.T) {
+	const (
+		program = "scripts/basic/fixdep"
+		target  = "scripts/mod/devicetable-offsets.s"
+	)
+	root := selectionRoleProfile(t, "all:\n", "all")
+	root.Name = "root:overwritten-if-changed-dep-program"
+	stale := selectionRoleProfile(t, `
+scripts/basic/fixdep: scripts/basic/fixdep-stale.c
+	$(HOSTCC) -o $@ $<
+`, program)
+	stale.Name = "child:stale-if-changed-dep-fixdep"
+	staleArtifact := kconfig.CompactKbuildVisibleArtifact{
+		Path: program, Profile: stale.Name, Target: program,
+	}
+	overwrite := selectionRoleProfile(t, `
+scripts/basic/fixdep: scripts/basic/fixdep-current.c
+	$(HOSTCC) -o $@ $<
+`, program)
+	overwrite.Name = "child:current-if-changed-dep-fixdep"
+	overwrite.InvocationPredecessors = []string{stale.Name}
+	setTestCompactKbuildInitialVisibleArtifacts(t, &overwrite, []kconfig.CompactKbuildVisibleArtifact{staleArtifact})
+	consumer := selectionRoleProfile(t, `
+cmd_and_fixdep = __LINUX_BZL_OBJECT_TREE__/scripts/basic/fixdep $(depfile) $@; $(cmd_$(1))
+if_changed_dep = $(cmd_and_fixdep)
+cmd_cc_s_c = $(CC) -S -o $@ $<
+final-host: scripts/mod/devicetable-offsets.s final-host.c
+	$(HOSTCC) -o $@ final-host.c
+scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
+	$(call if_changed_dep,cc_s_c)
+`, "final-host")
+	consumer.Name = "child:overwritten-if-changed-dep-consumer"
+	consumer.InvocationPredecessors = []string{overwrite.Name}
+	// This is the invocation-start frontier. The selected overwrite above is a
+	// later version of the same path and must win before the command executes.
+	setTestCompactKbuildInitialVisibleArtifacts(t, &consumer, []kconfig.CompactKbuildVisibleArtifact{staleArtifact})
+	root.TargetInvocationDependencies = []kconfig.CompactKbuildInvocationDependency{
+		{Target: "all", Profile: stale.Name, Goals: stale.EntryTargets},
+		{Target: "all", Profile: overwrite.Name, Goals: overwrite.EntryTargets},
+		{Target: "all", Profile: consumer.Name, Goals: consumer.EntryTargets},
+	}
+
+	selections := mustSelectedKbuildSelections(t, []kconfig.CompactKbuildProfile{root, stale, overwrite, consumer}, map[string]bool{
+		"scripts/basic/fixdep-stale.c":      true,
+		"scripts/basic/fixdep-current.c":    true,
+		"scripts/mod/devicetable-offsets.c": true,
+		"final-host.c":                      true,
+	})
+	consumerSelection := selectionByTarget(t, selections, target)
+	want := kconfig.EncodeCompactKbuildInitialObjectTreeArtifacts([]kconfig.CompactKbuildVisibleArtifact{{
+		Path: program, Profile: overwrite.Name, Target: program,
+	}})
+	if !consumerSelection.UsesInitialObjectTree || consumerSelection.InitialObjectTreeArtifacts != "" ||
+		consumerSelection.GeneratedObjectTreeArtifacts != want {
+		t.Fatalf("if_changed_dep consumer selection = %#v, want selected overwrite artifact %q", consumerSelection, want)
+	}
+}
+
+func TestSelectedKbuildSelectionsDoNotRebindReplacedProgramThroughOpaqueRoot(t *testing.T) {
+	const (
+		program = "scripts/basic/fixdep"
+		target  = "scripts/mod/devicetable-offsets.s"
+	)
+	root := selectionRoleProfile(t, "all:\n", "all")
+	root.Name = "root:opaque-overwritten-if-changed-dep-program"
+	stale := selectionRoleProfile(t, `
+scripts/basic/fixdep: scripts/basic/fixdep-stale.c
+	$(HOSTCC) -o $@ $<
+`, program)
+	stale.Name = "child:opaque-stale-if-changed-dep-fixdep"
+	staleArtifact := kconfig.CompactKbuildVisibleArtifact{
+		Path: program, Profile: stale.Name, Target: program,
+	}
+	overwrite := selectionRoleProfile(t, `
+scripts/basic/fixdep: scripts/basic/fixdep-current.c
+	$(HOSTCC) -o $@ $<
+`, program)
+	overwrite.Name = "child:opaque-current-if-changed-dep-fixdep"
+	overwrite.InvocationPredecessors = []string{stale.Name}
+	setTestCompactKbuildInitialVisibleArtifacts(t, &overwrite, []kconfig.CompactKbuildVisibleArtifact{staleArtifact})
+	consumer := selectionRoleProfile(t, `
+cmd_and_fixdep = __LINUX_BZL_OBJECT_TREE__/scripts/basic/fixdep $(depfile) $@; $(cmd_$(1))
+if_changed_dep = $(cmd_and_fixdep)
+cmd_cc_s_c = $(CC) -I__LINUX_BZL_OBJECT_TREE__ -S -o $@ $<
+final-host: scripts/mod/devicetable-offsets.s final-host.c
+	$(HOSTCC) -o $@ final-host.c
+scripts/mod/devicetable-offsets.s: generated/devicetable-offsets.c FORCE
+	$(call if_changed_dep,cc_s_c)
+generated/devicetable-offsets.c: scripts/mod/devicetable-offsets.in
+	sed 's/^//' $< > $@
+`, "final-host")
+	consumer.Name = "child:opaque-overwritten-if-changed-dep-consumer"
+	consumer.InvocationPredecessors = []string{overwrite.Name}
+	setTestCompactKbuildInitialVisibleArtifacts(t, &consumer, []kconfig.CompactKbuildVisibleArtifact{staleArtifact})
+	root.TargetInvocationDependencies = []kconfig.CompactKbuildInvocationDependency{
+		{Target: "all", Profile: stale.Name, Goals: stale.EntryTargets},
+		{Target: "all", Profile: overwrite.Name, Goals: overwrite.EntryTargets},
+		{Target: "all", Profile: consumer.Name, Goals: consumer.EntryTargets},
+	}
+
+	selections := mustSelectedKbuildSelections(t, []kconfig.CompactKbuildProfile{root, stale, overwrite, consumer}, map[string]bool{
+		"scripts/basic/fixdep-stale.c":       true,
+		"scripts/basic/fixdep-current.c":     true,
+		"scripts/mod/devicetable-offsets.in": true,
+		"final-host.c":                       true,
+	})
+	consumerSelection := selectionByTarget(t, selections, target)
+	wantGenerated := kconfig.EncodeCompactKbuildInitialObjectTreeArtifacts([]kconfig.CompactKbuildVisibleArtifact{
+		{Path: "generated/devicetable-offsets.c", Profile: consumer.Name, Target: "generated/devicetable-offsets.c"},
+		{Path: program, Profile: overwrite.Name, Target: program},
+	})
+	if !consumerSelection.UsesInitialObjectTree ||
+		consumerSelection.InitialObjectTreeArtifacts != "" ||
+		consumerSelection.GeneratedObjectTreeArtifacts != wantGenerated {
+		t.Fatalf(
+			"opaque object-root consumer selection = %#v, want no stale initial program and generated inputs %q",
+			consumerSelection, wantGenerated,
+		)
+	}
+}
+
+func TestSelectedKbuildSelectionsPropagateInferredProgramOwnerToDownstreamConsumer(t *testing.T) {
+	const program = "scripts/basic/fixdep"
+	root := selectionRoleProfile(t, "all:\n", "all")
+	root.Name = "root:transitive-if-changed-dep-program"
+	stale := selectionRoleProfile(t, `
+scripts/basic/fixdep: scripts/basic/fixdep-stale.c
+	$(HOSTCC) -o $@ $<
+`, program)
+	stale.Name = "child:transitive-stale-fixdep"
+	staleArtifact := kconfig.CompactKbuildVisibleArtifact{
+		Path: program, Profile: stale.Name, Target: program,
+	}
+	current := selectionRoleProfile(t, `
+scripts/basic/fixdep: scripts/basic/fixdep-current.c
+	$(HOSTCC) -o $@ $<
+`, program)
+	current.Name = "child:transitive-current-fixdep"
+	current.InvocationPredecessors = []string{stale.Name}
+	setTestCompactKbuildInitialVisibleArtifacts(t, &current, []kconfig.CompactKbuildVisibleArtifact{staleArtifact})
+	upstream := selectionRoleProfile(t, `
+cmd_and_fixdep = __LINUX_BZL_OBJECT_TREE__/scripts/basic/fixdep $(depfile) $@; $(cmd_$(1))
+if_changed_dep = $(cmd_and_fixdep)
+cmd_cc_s_c = $(CC) -S -o $@ $<
+upstream.s: upstream.c FORCE
+	$(call if_changed_dep,cc_s_c)
+`, "upstream.s")
+	// The downstream profile sorts before this one. Ownership must follow the
+	// inferred program dependency, never profile-name or Go-map iteration order.
+	upstream.Name = "child:z-upstream-program-consumer"
+	downstream := selectionRoleProfile(t, `
+cmd_and_fixdep = __LINUX_BZL_OBJECT_TREE__/scripts/basic/fixdep $(depfile) $@; $(cmd_$(1))
+if_changed_dep = $(cmd_and_fixdep)
+cmd_cc_s_c = $(CC) -S -o $@ $<
+downstream.s: downstream.c FORCE
+	$(call if_changed_dep,cc_s_c)
+`, "downstream.s")
+	downstream.Name = "child:a-downstream-program-consumer"
+	downstream.InvocationPredecessors = []string{upstream.Name}
+	setTestCompactKbuildInitialVisibleArtifacts(t, &downstream, []kconfig.CompactKbuildVisibleArtifact{staleArtifact})
+	root.TargetInvocationDependencies = []kconfig.CompactKbuildInvocationDependency{
+		{Target: "all", Profile: downstream.Name, Goals: downstream.EntryTargets},
+		{Target: "all", Profile: upstream.Name, Goals: upstream.EntryTargets},
+		{Target: "all", Profile: current.Name, Goals: current.EntryTargets},
+		{Target: "all", Profile: stale.Name, Goals: stale.EntryTargets},
+	}
+	profiles := []kconfig.CompactKbuildProfile{root, stale, current, downstream, upstream}
+	satisfied := map[string]bool{
+		"scripts/basic/fixdep-stale.c":   true,
+		"scripts/basic/fixdep-current.c": true,
+		"upstream.c":                     true,
+		"downstream.c":                   true,
+	}
+	want := kconfig.EncodeCompactKbuildInitialObjectTreeArtifacts([]kconfig.CompactKbuildVisibleArtifact{{
+		Path: program, Profile: current.Name, Target: program,
+	}})
+	for iteration := 0; iteration < 16; iteration++ {
+		selections := mustSelectedKbuildSelections(t, profiles, satisfied)
+		for _, target := range []string{"upstream.s", "downstream.s"} {
+			consumer := selectionByTarget(t, selections, target)
+			if !consumer.UsesInitialObjectTree || consumer.InitialObjectTreeArtifacts != "" ||
+				consumer.GeneratedObjectTreeArtifacts != want {
+				t.Fatalf(
+					"iteration %d %s selection = %#v, want inferred current program owner %q",
+					iteration, target, consumer, want,
+				)
+			}
+		}
+	}
+}
+
+func TestSelectedKbuildSelectionsConvergeAfterProgramEdgeOrdersSamePathWriters(t *testing.T) {
+	const (
+		program = "generated/tool"
+		helper  = "generated/rewrite"
+	)
+	root := selectionRoleProfile(t, "all:\n", "all")
+	root.Name = "root:program-owner-fixed-point"
+	early := selectionRoleProfile(t, `
+all: generated/tool generated/rewrite
+generated/tool: generated/tool-old.c
+	$(HOSTCC) -o $@ $<
+generated/rewrite: generated/tool generated/rewrite.c
+	$(HOSTCC) -o $@ generated/rewrite.c
+`, "all")
+	early.Name = "child:m-program-owner-early"
+	current := selectionRoleProfile(t, `
+generated/tool: generated/tool-current.in
+	__LINUX_BZL_OBJECT_TREE__/generated/rewrite < $< > $@
+`, program)
+	current.Name = "child:z-program-owner-current"
+	consumer := selectionRoleProfile(t, `
+generated/result: generated/result.in
+	__LINUX_BZL_OBJECT_TREE__/generated/tool < $< > $@
+`, "generated/result")
+	// Deliberately sort the ambiguous observation before the observation which
+	// contributes current -> rewrite -> early. Ownership must be evaluated as a
+	// fixed point rather than failing or depending on observation order.
+	consumer.Name = "child:a-program-owner-consumer"
+	root.TargetInvocationDependencies = []kconfig.CompactKbuildInvocationDependency{
+		{Target: "all", Profile: consumer.Name, Goals: consumer.EntryTargets},
+		{Target: "all", Profile: current.Name, Goals: current.EntryTargets},
+		{Target: "all", Profile: early.Name, Goals: early.EntryTargets},
+	}
+
+	selections := mustSelectedKbuildSelections(t, []kconfig.CompactKbuildProfile{root, early, current, consumer}, map[string]bool{
+		"generated/tool-old.c":      true,
+		"generated/rewrite.c":       true,
+		"generated/tool-current.in": true,
+		"generated/result.in":       true,
+	})
+	wantCurrent := kconfig.EncodeCompactKbuildInitialObjectTreeArtifacts([]kconfig.CompactKbuildVisibleArtifact{{
+		Path: program, Profile: current.Name, Target: program,
+	}})
+	result := selectionByTarget(t, selections, "generated/result")
+	if !result.UsesInitialObjectTree || result.InitialObjectTreeArtifacts != "" ||
+		result.GeneratedObjectTreeArtifacts != wantCurrent {
+		t.Fatalf("program consumer selection = %#v, want current owner %q", result, wantCurrent)
+	}
+	currentIndex := slices.IndexFunc(selections, func(selection kconfig.CompactKbuildSelection) bool {
+		return selection.Profile == current.Name && selection.Target == program
+	})
+	if currentIndex < 0 {
+		t.Fatalf("selections omit same-path writer %s:%s: %#v", current.Name, program, selections)
+	}
+	rewrite := selections[currentIndex]
+	wantHelper := kconfig.EncodeCompactKbuildInitialObjectTreeArtifacts([]kconfig.CompactKbuildVisibleArtifact{{
+		Path: helper, Profile: early.Name, Target: helper,
+	}})
+	if !rewrite.UsesInitialObjectTree || rewrite.GeneratedObjectTreeArtifacts != wantHelper {
+		t.Fatalf("same-path writer selection = %#v, want inferred helper edge %q", rewrite, wantHelper)
+	}
+}
+
+func TestSelectedKbuildSelectionsUseExactIncludeEdgeToChooseCurrentProgramOwner(t *testing.T) {
+	const program = "scripts/basic/fixdep"
+	root := selectionRoleProfile(t, "all:\n", "all")
+	root.Name = "root:exact-include-orders-program-owner"
+	stale := selectionRoleProfile(t, `
+scripts/basic/fixdep: scripts/basic/fixdep-stale.c
+	$(HOSTCC) -o $@ $<
+`, program)
+	stale.Name = "child:exact-include-stale-fixdep"
+	staleArtifact := kconfig.CompactKbuildVisibleArtifact{
+		Path: program, Profile: stale.Name, Target: program,
+	}
+	currentAndConsumer := selectionRoleProfile(t, `
+cmd_and_fixdep = __LINUX_BZL_OBJECT_TREE__/scripts/basic/fixdep $(depfile) $@; $(cmd_$(1))
+if_changed_dep = $(cmd_and_fixdep)
+cmd_cc_o_c = $(CC) -include __LINUX_BZL_OBJECT_TREE__/generated/current.h -c -o $@ $<
+all: generated/current.h generated/result.o
+scripts/basic/fixdep: scripts/basic/fixdep-current.c
+	$(HOSTCC) -o $@ $<
+generated/current.h: scripts/basic/fixdep generated/current.in
+	sed 's/^//' generated/current.in > $@
+generated/result.o: generated/result.c FORCE
+	$(call if_changed_dep,cc_o_c)
+`, "all")
+	currentAndConsumer.Name = "child:exact-include-current-fixdep"
+	setTestCompactKbuildInitialVisibleArtifacts(t, &currentAndConsumer, []kconfig.CompactKbuildVisibleArtifact{staleArtifact})
+	root.TargetInvocationDependencies = []kconfig.CompactKbuildInvocationDependency{
+		{Target: "all", Profile: stale.Name, Goals: stale.EntryTargets},
+		{Target: "all", Profile: currentAndConsumer.Name, Goals: currentAndConsumer.EntryTargets},
+	}
+
+	selections := mustSelectedKbuildSelections(t, []kconfig.CompactKbuildProfile{root, stale, currentAndConsumer}, map[string]bool{
+		"scripts/basic/fixdep-stale.c":   true,
+		"scripts/basic/fixdep-current.c": true,
+		"generated/current.in":           true,
+		"generated/result.c":             true,
+	})
+	consumer := selectionByTarget(t, selections, "generated/result.o")
+	wantGenerated := kconfig.EncodeCompactKbuildInitialObjectTreeArtifacts([]kconfig.CompactKbuildVisibleArtifact{
+		{Path: "generated/current.h", Profile: currentAndConsumer.Name, Target: "generated/current.h"},
+		{Path: program, Profile: currentAndConsumer.Name, Target: program},
+	})
+	if !consumer.UsesInitialObjectTree || consumer.InitialObjectTreeArtifacts != "" ||
+		consumer.GeneratedObjectTreeArtifacts != wantGenerated {
+		t.Fatalf(
+			"exact-include program consumer = %#v, want current program and include owners %q",
+			consumer, wantGenerated,
+		)
 	}
 }
 
@@ -7451,11 +8389,11 @@ func TestGeneratedImplicitFallbackUsesGNUShortestStemForControlAndPlanning(t *te
 			{Targets: []string{"vmlinux.unstripped"}, Prerequisites: []string{".vmlinux.export.o"}},
 			{
 				Targets: []string{"%"}, Prerequisites: []string{"%_shipped"},
-				Recipe: []string{"__LINUX_BZL_MAKE__ -f __LINUX_BZL_SOURCE_TREE__/scripts/wrong.mk all"},
+				Recipe: []string{trustedRecursiveMakeForTest("__LINUX_BZL_MAKE__ -f __LINUX_BZL_SOURCE_TREE__/scripts/wrong.mk all")},
 			},
 			{
 				Targets: []string{"%.o"}, Prerequisites: []string{"%.c", "FORCE"},
-				Recipe: []string{"__LINUX_BZL_MAKE__ -f __LINUX_BZL_SOURCE_TREE__/scripts/right.mk all"},
+				Recipe: []string{trustedRecursiveMakeForTest("__LINUX_BZL_MAKE__ -f __LINUX_BZL_SOURCE_TREE__/scripts/right.mk all")},
 			},
 		},
 	}
@@ -7682,7 +8620,10 @@ func mixedRecipeEffectProfile(t *testing.T, command string, commandTemplate bool
 		t.Fatal(err)
 	}
 	parsed, err := kconfig.ParseKbuildFileTree(makefile, kconfig.KbuildOptions{
-		Variables:               map[string]string{"SRCARCH": "x86"},
+		Variables: map[string]string{
+			"MAKE":    kbuildEvalRecursiveMake,
+			"SRCARCH": "x86",
+		},
 		ConfigVariablesComplete: true,
 		MakeVariablesComplete:   true,
 		CaptureTargetEvaluator:  true,
@@ -7722,6 +8663,7 @@ result.o:
 		}
 	}
 	parsed, err := kconfig.ParseKbuildFileTree(makefile, kconfig.KbuildOptions{
+		Variables:                map[string]string{"MAKE": kbuildEvalRecursiveMake},
 		ConfigVariablesComplete:  true,
 		MakeVariablesComplete:    true,
 		CaptureTargetEvaluator:   true,
@@ -7765,7 +8707,7 @@ func TestKbuildSelectedRecipeEffectsUseProbeSelectedCommandStructure(t *testing.
 		},
 		{
 			name:      "recursive command binds structural argv to replay",
-			source:    "__LINUX_BZL_MAKE__ FLAGS=__SELECTED_COMMAND_STRUCTURE__ child",
+			source:    "$(MAKE) FLAGS=__SELECTED_COMMAND_STRUCTURE__ child",
 			structure: "-O2", replay: "-O2",
 			wantEffects: 1, wantRecursiveReplayFlag: "FLAGS=-O2", wantRecursiveSymbolicFlag: "-O2",
 		},
@@ -7818,7 +8760,12 @@ func TestKbuildSelectedRecipeEffectsUseProbeSelectedCommandStructure(t *testing.
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			profile := selectedCommandStructureProfile(t, test.source, test.structure, test.replay)
+			profile := selectedCommandStructureProfile(
+				t,
+				test.source,
+				trustedRecursiveMakeForTest(test.structure),
+				trustedRecursiveMakeForTest(test.replay),
+			)
 			var rule kconfig.KbuildRule
 			for _, candidate := range profile.Rules {
 				if slices.Contains(candidate.Targets, "result.o") {
@@ -7922,7 +8869,7 @@ func TestKbuildRecursiveMakeRedirectionsRemainShellSyntax(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			invocations, err := kbuildRecursiveMakeInvocationsAt(
-				test.command,
+				trustedRecursiveMakeForTest(test.command),
 				kconfig.CompactKbuildInvocationLocation{Tree: kconfig.CompactKbuildInvocationObjectTree},
 			)
 			if err != nil {
@@ -7946,7 +8893,7 @@ func TestKbuildRecursiveMakeRequiresSimpleCommandExecutable(t *testing.T) {
 		"echo __LINUX_BZL_MAKE__ child",
 		"echo -__LINUX_BZL_MAKE__ child",
 	} {
-		invocations, err := kbuildRecursiveMakeInvocations(command, "")
+		invocations, err := kbuildRecursiveMakeInvocations(trustedRecursiveMakeForTest(command), "")
 		if err != nil {
 			t.Fatalf("recursive Make discovery for %q: %v", command, err)
 		}
@@ -7955,7 +8902,9 @@ func TestKbuildRecursiveMakeRequiresSimpleCommandExecutable(t *testing.T) {
 		}
 	}
 
-	invocations, err := kbuildRecursiveMakeInvocations("KEEP=ok __LINUX_BZL_MAKE__ child EXTRA=value", "")
+	invocations, err := kbuildRecursiveMakeInvocations(
+		trustedRecursiveMakeForTest("KEEP=ok __LINUX_BZL_MAKE__ child EXTRA=value"), "",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7977,7 +8926,7 @@ func TestKbuildRecursiveMakeShellAssignmentProvenance(t *testing.T) {
 		`FOO-BAR=x __LINUX_BZL_MAKE__ child`,
 		`FOO.BAR=x __LINUX_BZL_MAKE__ child`,
 	} {
-		invocations, err := kbuildRecursiveMakeInvocationsAt(command, location)
+		invocations, err := kbuildRecursiveMakeInvocationsAt(trustedRecursiveMakeForTest(command), location)
 		if err != nil {
 			t.Fatalf("recursive Make discovery for %q: %v", command, err)
 		}
@@ -7987,7 +8936,7 @@ func TestKbuildRecursiveMakeShellAssignmentProvenance(t *testing.T) {
 	}
 
 	invocations, err := kbuildRecursiveMakeInvocationsAt(
-		`FOO="bar baz" __LINUX_BZL_MAKE__ child FOO-BAR=value`, location,
+		trustedRecursiveMakeForTest(`FOO="bar baz" __LINUX_BZL_MAKE__ child FOO-BAR=value`), location,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -8005,7 +8954,7 @@ func TestKbuildRecursiveMakeShellAssignmentProvenance(t *testing.T) {
 
 func TestKbuildShellShapeRetainsAssignmentProvenance(t *testing.T) {
 	segments, connectors, err := kbuildEvaluatedShellCommandShape(
-		`FOO="bar baz" __LINUX_BZL_MAKE__ child`,
+		trustedRecursiveMakeForTest(`FOO="bar baz" __LINUX_BZL_MAKE__ child`),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -8031,7 +8980,7 @@ func TestKbuildRecursiveMakeBehindShellReservedWord(t *testing.T) {
 		`{ __LINUX_BZL_MAKE__ child; }`,
 	} {
 		invocations, err := kbuildRecursiveMakeInvocationsAt(
-			command,
+			trustedRecursiveMakeForTest(command),
 			kconfig.CompactKbuildInvocationLocation{Tree: kconfig.CompactKbuildInvocationObjectTree},
 		)
 		if err != nil {
@@ -8048,7 +8997,7 @@ func TestKbuildRecursiveMakeBehindShellReservedWord(t *testing.T) {
 
 func TestKbuildRecursiveMakeContinuesAfterMultilineComment(t *testing.T) {
 	invocations, err := kbuildRecursiveMakeInvocations(
-		"echo setup # __LINUX_BZL_MAKE__ is data\n__LINUX_BZL_MAKE__ child", "",
+		trustedRecursiveMakeForTest("echo setup # __LINUX_BZL_MAKE__ is data\n__LINUX_BZL_MAKE__ child"), "",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -8091,7 +9040,7 @@ func TestKbuildShellLexemesPreservePOSIXBackslashesAndEmptyQuotedWords(t *testin
 
 func TestKbuildRecursiveMakeInlineEnvironmentDoesNotCrossCommandBoundary(t *testing.T) {
 	invocations, err := kbuildRecursiveMakeInvocationsAt(
-		"LEAK=bad echo setup; KEEP=ok __LINUX_BZL_MAKE__ child",
+		trustedRecursiveMakeForTest("LEAK=bad echo setup; KEEP=ok __LINUX_BZL_MAKE__ child"),
 		kconfig.CompactKbuildInvocationLocation{Tree: kconfig.CompactKbuildInvocationObjectTree},
 	)
 	if err != nil {
@@ -8200,6 +9149,133 @@ func TestSelectedKbuildRecursiveMakePlanExposesEarlierSameLineWrite(t *testing.T
 				t.Fatalf("recursive invocation frontier = %#v, want earlier same-line write %#v", events, want)
 			}
 		})
+	}
+}
+
+func sourceScriptThenRecursivePostlinkProfile(t *testing.T) kconfig.CompactKbuildProfile {
+	t.Helper()
+	profile := selectionRoleProfileWithSources(t, `
+CONFIG_SHELL = sh
+cmd_link_vmlinux = $(CONFIG_SHELL) __LINUX_BZL_SOURCE_TREE__/scripts/link-vmlinux.sh "$(LD)"; $(MAKE) -f $(srctree)/arch/x86/Makefile.postlink $@
+if_changed_dep = $(cmd_$(1))
+vmlinux: scripts/link-vmlinux.sh FORCE
+	$(call if_changed_dep,link_vmlinux)
+`, map[string]string{
+		// The output name is deliberately internal to the script, as it is in
+		// Linux. The selected immutable executable, not an authored `$@` argv or
+		// redirect, is the source provenance for this rule action.
+		"scripts/link-vmlinux.sh": "#!/bin/sh\n$MAKE -f \"$srctree/scripts/link-inner.mk\" inner\nprintf linked >/dev/null\n",
+	}, "vmlinux")
+	profile.Name = "link-vmlinux:mixed-source-script"
+	return profile
+}
+
+func TestSelectedKbuildRecursiveMakePlanExposesSourceScriptWriterBeforePostlink(t *testing.T) {
+	profile := sourceScriptThenRecursivePostlinkProfile(t)
+	plan, err := selectedKbuildRecursiveMakePlan(profile, map[string]bool{
+		"scripts/link-vmlinux.sh": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(plan), 2; got != want {
+		t.Fatalf("source-script postlink plan = %#v, want %d invocation", plan, want)
+	}
+	want := kconfig.CompactKbuildVisibleArtifact{
+		Path: "vmlinux", Profile: profile.Name, Target: "vmlinux",
+	}
+	events := linearKbuildRecursiveMakeFrontierEvents(t, plan[1].frontier)
+	if len(events) != 2 || events[0].invocation != plan[0].key || events[1].artifact != want {
+		t.Fatalf("postlink initial frontier = %#v, want source-script writer %#v", events, want)
+	}
+}
+
+func TestSelectedKbuildRecursiveMakePlanDoesNotPromoteUndeclaredValidationScript(t *testing.T) {
+	profile := selectionRoleProfileWithSources(t, `
+CONFIG_SHELL = sh
+generated.stamp: FORCE
+	$(CONFIG_SHELL) __LINUX_BZL_SOURCE_TREE__/scripts/sync-check.sh
+	$(MAKE) -f $(srctree)/scripts/child.mk $@
+`, map[string]string{
+		"scripts/sync-check.sh": "#!/bin/sh\nprintf checked >/dev/null\n",
+	}, "generated.stamp")
+	profile.Name = "validation-script-before-forwarder"
+	plan, err := selectedKbuildRecursiveMakePlan(profile, map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(plan), 1; got != want {
+		t.Fatalf("validation-script recursive plan = %#v, want %d invocation", plan, want)
+	}
+	if got := kbuildFrontierLen(plan[0].request.visibleState); got != 0 {
+		t.Fatalf("validation script invented %d initial target versions", got)
+	}
+}
+
+func TestSelectedKbuildRecursiveMakePlanDoesNotPromoteDeclaredValidationScript(t *testing.T) {
+	profile := selectionRoleProfileWithSources(t, `
+CONFIG_SHELL = sh
+generated.stamp: scripts/sync-check.sh FORCE
+	$(CONFIG_SHELL) __LINUX_BZL_SOURCE_TREE__/scripts/sync-check.sh
+	$(MAKE) -f $(srctree)/scripts/child.mk $@
+`, map[string]string{
+		"scripts/sync-check.sh": "#!/bin/sh\nprintf checked >/dev/null\n",
+	}, "generated.stamp")
+	profile.Name = "declared-validation-script-before-forwarder"
+	plan, err := selectedKbuildRecursiveMakePlan(profile, map[string]bool{
+		"scripts/sync-check.sh": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(plan), 1; got != want {
+		t.Fatalf("declared validation-script recursive plan = %#v, want %d invocation", plan, want)
+	}
+	if got := kbuildFrontierLen(plan[0].request.visibleState); got != 0 {
+		t.Fatalf("declared validation script invented %d initial target versions", got)
+	}
+}
+
+func TestSelectedKbuildSelectionsRetainSourceScriptWriterBeforeSameTargetPostlink(t *testing.T) {
+	link := sourceScriptThenRecursivePostlinkProfile(t)
+	postlink := selectionRoleProfile(t, `
+vmlinux: FORCE
+	cat __LINUX_BZL_OBJECT_TREE__/vmlinux > vmlinux.next; mv vmlinux.next $@
+`, "vmlinux")
+	postlink.Name = "postlink:mixed-source-script"
+	linkArtifact := kconfig.CompactKbuildVisibleArtifact{
+		Path: "vmlinux", Profile: link.Name, Target: "vmlinux",
+	}
+	setTestCompactKbuildInitialVisibleArtifacts(t, &postlink, []kconfig.CompactKbuildVisibleArtifact{linkArtifact})
+	link.TargetInvocationDependencies = []kconfig.CompactKbuildInvocationDependency{{
+		Target: "vmlinux", Profile: postlink.Name, Goals: postlink.EntryTargets,
+	}}
+
+	selections, err := selectedKbuildSelections(
+		[]kconfig.CompactKbuildProfile{link, postlink},
+		map[string]bool{"scripts/link-vmlinux.sh": true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := map[string]kconfig.CompactKbuildSelection{}
+	for _, selection := range selections {
+		if selection.Target == "vmlinux" {
+			selected[selection.Profile] = selection
+		}
+	}
+	for _, profile := range []kconfig.CompactKbuildProfile{link, postlink} {
+		selection, ok := selected[profile.Name]
+		if !ok {
+			t.Fatalf("same-target selections omit %s:vmlinux: %#v", profile.Name, selections)
+		}
+		if selection.Lifecycle != "target" || selection.Scope != "target" || selection.Stage != "target" {
+			t.Errorf("%s:vmlinux selection = %#v, want target/target/target", profile.Name, selection)
+		}
+	}
+	if got, want := selected[postlink.Name].InitialObjectTreeArtifacts,
+		kconfig.EncodeCompactKbuildInitialObjectTreeArtifacts([]kconfig.CompactKbuildVisibleArtifact{linkArtifact}); got != want {
+		t.Fatalf("postlink initial artifacts = %q, want exact link writer %q", got, want)
 	}
 }
 
@@ -8879,9 +9955,12 @@ local:
 		t.Fatal(err)
 	}
 	parsed, err := kconfig.ParseKbuildFileTree(makefile, kconfig.KbuildOptions{
-		RootDir:                 root,
-		WorkingDir:              filepath.Join(root, "parent"),
-		Variables:               map[string]string{"srctree": kbuildEvalSourceTree},
+		RootDir:    root,
+		WorkingDir: filepath.Join(root, "parent"),
+		Variables: map[string]string{
+			"MAKE":    kbuildEvalRecursiveMake,
+			"srctree": kbuildEvalSourceTree,
+		},
 		ConfigVariablesComplete: true,
 		MakeVariablesComplete:   true,
 		CaptureTargetEvaluator:  true,
@@ -9651,7 +10730,7 @@ early/early.o: early/early.c
 
 func TestKbuildRecursiveMakeRequestDerivesDriverWorkingDirectoryAndGoals(t *testing.T) {
 	request, ok, err := kbuildRecursiveMakeRequest(
-		`__LINUX_BZL_MAKE__ -C __LINUX_BZL_SOURCE_TREE__/tools/objtool -f __LINUX_BZL_SOURCE_TREE__/tools/build/Makefile.build OUTPUT=out CFLAGS="-O2 -DSELECTED" all install ; echo ignored`,
+		trustedRecursiveMakeForTest(`__LINUX_BZL_MAKE__ -C __LINUX_BZL_SOURCE_TREE__/tools/objtool -f __LINUX_BZL_SOURCE_TREE__/tools/build/Makefile.build OUTPUT=out CFLAGS="-O2 -DSELECTED" all install ; echo ignored`),
 		"",
 	)
 	if err != nil {
@@ -9685,7 +10764,7 @@ func TestKbuildRecursiveMakeRequestDerivesDriverWorkingDirectoryAndGoals(t *test
 
 func TestKbuildRecursiveMakeRequestSeparatesCustomDriverObjectAndProcessDirectories(t *testing.T) {
 	request, ok, err := kbuildRecursiveMakeRequest(
-		`__LINUX_BZL_MAKE__ -C __LINUX_BZL_SOURCE_TREE__/tools/runner -f __LINUX_BZL_SOURCE_TREE__/scripts/custom-driver.mk obj=drivers/demo drivers/demo/leaf.o`,
+		trustedRecursiveMakeForTest(`__LINUX_BZL_MAKE__ -C __LINUX_BZL_SOURCE_TREE__/tools/runner -f __LINUX_BZL_SOURCE_TREE__/scripts/custom-driver.mk obj=drivers/demo drivers/demo/leaf.o`),
 		"",
 	)
 	if err != nil {
@@ -9716,7 +10795,7 @@ func TestKbuildRecursiveMakeRequestSeparatesCustomDriverObjectAndProcessDirector
 
 func TestKbuildRecursiveMakeRequestDoesNotScopePhonyGoalToObjectDirectory(t *testing.T) {
 	request, ok, err := kbuildRecursiveMakeRequest(
-		`__LINUX_BZL_MAKE__ -f __LINUX_BZL_SOURCE_TREE__/scripts/Makefile.build obj=arch/x86/entry/syscalls all`,
+		trustedRecursiveMakeForTest(`__LINUX_BZL_MAKE__ -f __LINUX_BZL_SOURCE_TREE__/scripts/Makefile.build obj=arch/x86/entry/syscalls all`),
 		"",
 	)
 	if err != nil {
@@ -9738,7 +10817,7 @@ func TestKbuildRecursiveMakeRequestPreservesAndSwitchesInvocationTreeAcrossC(t *
 		Tree: kconfig.CompactKbuildInvocationSourceTree, Directory: "tools/build",
 	}
 	preserved, ok, err := kbuildRecursiveMakeRequestAt(
-		`__LINUX_BZL_MAKE__ -C ../objtool -f ../build/Makefile all`, parent,
+		trustedRecursiveMakeForTest(`__LINUX_BZL_MAKE__ -C ../objtool -f ../build/Makefile all`), parent,
 	)
 	if err != nil || !ok {
 		t.Fatalf("relative source-tree request = (%#v, %t, %v)", preserved, ok, err)
@@ -9750,7 +10829,7 @@ func TestKbuildRecursiveMakeRequestPreservesAndSwitchesInvocationTreeAcrossC(t *
 	}
 
 	switched, ok, err := kbuildRecursiveMakeRequestAt(
-		`__LINUX_BZL_MAKE__ -C __LINUX_BZL_OBJECT_TREE__/arch/x86 -f __LINUX_BZL_SOURCE_TREE__/scripts/Makefile.build all`, parent,
+		trustedRecursiveMakeForTest(`__LINUX_BZL_MAKE__ -C __LINUX_BZL_OBJECT_TREE__/arch/x86 -f __LINUX_BZL_SOURCE_TREE__/scripts/Makefile.build all`), parent,
 	)
 	if err != nil || !ok {
 		t.Fatalf("object-tree request = (%#v, %t, %v)", switched, ok, err)
@@ -9761,7 +10840,9 @@ func TestKbuildRecursiveMakeRequestPreservesAndSwitchesInvocationTreeAcrossC(t *
 		t.Fatalf("explicit object -C location = %#v, want %#v", got, want)
 	}
 
-	if _, _, err := kbuildRecursiveMakeRequestAt(`__LINUX_BZL_MAKE__ -C ../../../escape all`, parent); err == nil {
+	if _, _, err := kbuildRecursiveMakeRequestAt(
+		trustedRecursiveMakeForTest(`__LINUX_BZL_MAKE__ -C ../../../escape all`), parent,
+	); err == nil {
 		t.Fatal("recursive -C escaping its declared source tree was accepted")
 	}
 }
@@ -9834,7 +10915,7 @@ $(obj)/leaf.o: $(srctree)/drivers/demo/leaf.c FORCE
 
 func TestKbuildRecursiveMakeRequestPreservesObjectRootedGoalProvenance(t *testing.T) {
 	request, ok, err := kbuildRecursiveMakeRequest(
-		`__LINUX_BZL_MAKE__ -C __LINUX_BZL_SOURCE_TREE__/tools/build __LINUX_BZL_OBJECT_TREE__/tools/objtool/fixdep`,
+		trustedRecursiveMakeForTest(`__LINUX_BZL_MAKE__ -C __LINUX_BZL_SOURCE_TREE__/tools/build __LINUX_BZL_OBJECT_TREE__/tools/objtool/fixdep`),
 		"",
 	)
 	if err != nil {
@@ -9921,6 +11002,7 @@ $(objtree)/tools/objtool/fixdep:
 		RootDir:    root,
 		WorkingDir: filepath.Join(root, "tools", "build"),
 		Variables: map[string]string{
+			"MAKE":    kbuildEvalRecursiveMake,
 			"objtree": kbuildEvalObjectTree,
 			"srctree": kbuildEvalSourceTree,
 		},
@@ -9953,7 +11035,7 @@ $(objtree)/tools/objtool/fixdep:
 
 func TestKbuildRecursiveMakeReplayArgumentsPreserveExactValues(t *testing.T) {
 	invocations, err := kbuildRecursiveMakeInvocations(
-		`__LINUX_BZL_MAKE__ -f ${tree:kernel}/scripts/child.mk FLAGS="-O2 -DSELECTED" '' child`,
+		trustedRecursiveMakeForTest(`__LINUX_BZL_MAKE__ -f ${tree:kernel}/scripts/child.mk FLAGS="-O2 -DSELECTED" '' child`),
 		"",
 	)
 	if err != nil {
@@ -9966,6 +11048,42 @@ func TestKbuildRecursiveMakeReplayArgumentsPreserveExactValues(t *testing.T) {
 		"-f", kbuildEvalSourceTree + "/scripts/child.mk", "FLAGS=-O2 -DSELECTED", "", "child",
 	}; !slices.Equal(got, want) {
 		t.Fatalf("recursive Make replay argv = %q, want %q", got, want)
+	}
+}
+
+func TestKbuildRecursiveMakeReplayArgumentsCanonicalizeOnlyPrivateMakeProvenance(t *testing.T) {
+	command := kbuildEvalRecursiveMake +
+		" MAKE=" + kbuildEvalRecursiveMake +
+		" FORWARDED=before" + kbuildEvalRecursiveMake + "after" +
+		" LITERAL=__LINUX_BZL_MAKE__ child"
+	invocations, err := kbuildRecursiveMakeInvocations(command, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(invocations), 1; got != want {
+		t.Fatalf("recursive Make invocations = %#v, want %d", invocations, want)
+	}
+	invocation := invocations[0]
+	for name, want := range map[string]string{
+		"MAKE":      kbuildEvalRecursiveMake,
+		"FORWARDED": "before" + kbuildEvalRecursiveMake + "after",
+		"LITERAL":   "__LINUX_BZL_MAKE__",
+	} {
+		if got := invocation.request.variables[name]; got != want {
+			t.Errorf("analysis request %s = %q, want %q", name, got, want)
+		}
+	}
+	wantReplay := []string{
+		"MAKE=" + kconfig.CompactKbuildRecursiveMakeReplayName,
+		"FORWARDED=before" + kconfig.CompactKbuildRecursiveMakeReplayName + "after",
+		"LITERAL=__LINUX_BZL_MAKE__",
+		"child",
+	}
+	if !slices.Equal(invocation.replayArguments, wantReplay) {
+		t.Fatalf("runtime replay argv = %q, want lowered script argv %q", invocation.replayArguments, wantReplay)
+	}
+	if strings.Contains(strings.Join(invocation.replayArguments, "\n"), kbuildEvalRecursiveMake) {
+		t.Fatalf("runtime replay argv leaked private MAKE provenance: %q", invocation.replayArguments)
 	}
 }
 
@@ -10043,6 +11161,7 @@ FORCE:
 			Variables: map[string]string{
 				"HOSTCC":    probeOptions.Host.Tools["cc"],
 				"HOST_DEPS": hostDeps,
+				"MAKE":      kbuildEvalRecursiveMake,
 				"SRCARCH":   "x86",
 				"objtree":   kbuildEvalObjectTree,
 				"srctree":   kbuildEvalSourceTree,
@@ -10259,7 +11378,7 @@ child: input.c
 					RootDir: root,
 					Variables: map[string]string{
 						"HOSTCC":  probeOptions.Host.Tools["cc"],
-						"MAKE":    "__LINUX_BZL_MAKE__",
+						"MAKE":    kbuildEvalRecursiveMake,
 						"SRCARCH": "x86",
 						"objtree": kbuildEvalObjectTree,
 						"srctree": kbuildEvalSourceTree,
@@ -10560,6 +11679,7 @@ func TestSourceScriptRecursiveMakeResolvesExportedTargetEnvironment(t *testing.T
 	invocations, err := kbuildSourceScriptRecursiveMakeInvocationsAt(`
 $MAKE -f "$objtree/$DRIVER" obj=$OBJECT_DIR $GOAL
 `, map[string]string{
+		"MAKE":       kbuildEvalRecursiveMake,
 		"DRIVER":     "scripts/Makefile.build",
 		"GOAL":       "drivers/example/module.o",
 		"OBJECT_DIR": "drivers/example",
@@ -10584,7 +11704,7 @@ func TestSourceScriptRecursiveMakeIgnoresDataUseAndFindsConditionalExecutable(t 
 echo "$MAKE"
 if test -f marker; then "$MAKE" child; fi
 `, map[string]string{
-		"MAKE": "__LINUX_BZL_MAKE__",
+		"MAKE": kbuildEvalRecursiveMake,
 	}, kconfig.CompactKbuildInvocationLocation{Tree: kconfig.CompactKbuildInvocationObjectTree})
 	if err != nil {
 		t.Fatal(err)
@@ -10594,6 +11714,30 @@ if test -f marker; then "$MAKE" child; fi
 	}
 	if got := invocations[0].request.variables["MAKECMDGOALS"]; got != "child" {
 		t.Fatalf("source-script recursive Make goals = %q, want child", got)
+	}
+}
+
+func TestSourceScriptRecursiveMakeRequiresPrivateMakeProvenance(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		environment map[string]string
+	}{
+		{name: "missing MAKE", environment: map[string]string{}},
+		{name: "printable lookalike", environment: map[string]string{"MAKE": "__LINUX_BZL_MAKE__"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invocations, err := kbuildSourceScriptRecursiveMakeInvocationsAt(
+				`$MAKE -f "$srctree/scripts/child.mk" child`,
+				test.environment,
+				kconfig.CompactKbuildInvocationLocation{Tree: kconfig.CompactKbuildInvocationObjectTree},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(invocations) != 0 {
+				t.Fatalf("ordinary source-script MAKE created recursive invocations: %#v", invocations)
+			}
+		})
 	}
 }
 
@@ -10626,7 +11770,7 @@ second:
 
 func TestKbuildRecursiveMakeRequestLeavesGoalToEvaluatedBuildDefault(t *testing.T) {
 	request, ok, err := kbuildRecursiveMakeRequest(
-		`__LINUX_BZL_MAKE__ -f __LINUX_BZL_SOURCE_TREE__/scripts/Makefile.build obj=drivers/demo need-builtin=1`,
+		trustedRecursiveMakeForTest(`__LINUX_BZL_MAKE__ -f __LINUX_BZL_SOURCE_TREE__/scripts/Makefile.build obj=drivers/demo need-builtin=1`),
 		"",
 	)
 	if err != nil {

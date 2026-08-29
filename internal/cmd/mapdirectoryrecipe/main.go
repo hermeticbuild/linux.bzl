@@ -456,6 +456,9 @@ func runRecipe(opts recipeOptions) error {
 	}
 	bindings["content"] = contentBindings
 	expand := func(value string) (string, error) { return expandValue(value, bindings) }
+	expandLiteral := func(value string) (string, error) {
+		return expandValueWithLiteralActionMarkers(value, bindings)
+	}
 	workingRoot := ""
 	executionDirectory := ""
 	workingOutputPaths := map[string]string{}
@@ -575,7 +578,7 @@ func runRecipe(opts recipeOptions) error {
 			return fmt.Errorf("argument %d: %w", i, err)
 		}
 	}
-	replayArgs, err := encodeRecipeCommandReplays(recipe.CommandReplays, expand)
+	replayArgs, err := encodeRecipeCommandReplays(recipe.CommandReplays, expandLiteral)
 	if err != nil {
 		return err
 	}
@@ -592,7 +595,7 @@ func runRecipe(opts recipeOptions) error {
 	}
 	args := linuxArgs
 	if len(opts.actionArgs) != 0 {
-		args, err = spliceActionArgs(opts.actionArgs, linuxArgs)
+		args, err = toolaction.SpliceArguments(opts.actionArgs, linuxArgs)
 		if err != nil {
 			return err
 		}
@@ -619,18 +622,22 @@ func runRecipe(opts recipeOptions) error {
 		defer stdin.Close()
 		command.Stdin = stdin
 	}
+	recipeEnvironment, err := restoreRecipeEnvironmentNames(recipe.Environment)
+	if err != nil {
+		return err
+	}
 	for _, name := range []string{toolaction.EnvironmentName, toolaction.RuntimeToolPathEnvironmentName} {
 		if _, exists := opts.actionEnvironment[name]; exists {
 			return fmt.Errorf("configured action environment uses reserved variable %s", name)
 		}
-		if _, exists := recipe.Environment[name]; exists {
+		if _, exists := recipeEnvironment[name]; exists {
 			return fmt.Errorf("recipe environment uses reserved variable %s", name)
 		}
 	}
-	if len(recipe.Environment) != 0 || len(opts.auxiliaryActionContracts) != 0 || runtimeToolDirectory != "" {
+	if len(recipeEnvironment) != 0 || len(opts.auxiliaryActionContracts) != 0 || runtimeToolDirectory != "" {
 		environment := environmentMap(command.Env)
-		for _, key := range sortedKeys(recipe.Environment) {
-			value, err := expand(recipe.Environment[key])
+		for _, key := range sortedKeys(recipeEnvironment) {
+			value, err := expandLiteral(recipeEnvironment[key])
 			if err != nil {
 				return fmt.Errorf("environment %s: %w", key, err)
 			}
@@ -1477,28 +1484,69 @@ func actionLocalExecutable(source, privateRoot string) (string, func(), error) {
 	return destination, cleanup, nil
 }
 
-func spliceActionArgs(actionArgs, linuxArgs []string) ([]string, error) {
-	found := false
-	out := []string{}
-	for _, argument := range actionArgs {
-		if argument == kconfig.LinuxKbuildArgsSentinel {
-			if found {
-				return nil, fmt.Errorf("configured tool action repeats its Kbuild-arguments marker")
-			}
-			found = true
-			out = append(out, linuxArgs...)
-		} else {
-			out = append(out, argument)
-		}
-	}
-	if !found {
-		return nil, fmt.Errorf("configured tool action is missing its Kbuild-arguments marker")
-	}
-	return out, nil
-}
-
 func expandValue(value string, bindings map[string]map[string]string) (string, error) {
 	return expandValueKinds(value, bindings, nil)
+}
+
+// expandValueWithLiteralActionMarkers expands typed placeholders and decodes
+// protected source literals in one pass. Template literals are decoded as they
+// are copied, after the scanner has passed them, so a restored ${tree:...}
+// spelling cannot become a capability. Placeholder replacements are copied as
+// opaque data and are never inspected for private escape bytes.
+func expandValueWithLiteralActionMarkers(value string, bindings map[string]map[string]string) (string, error) {
+	var out strings.Builder
+	writeLiteral := func(literal string) error {
+		restored, err := kconfig.RestoreCompactKbuildLiteralActionMarkers(literal)
+		if err != nil {
+			return err
+		}
+		out.WriteString(restored)
+		return nil
+	}
+	for cursor := 0; ; {
+		relativeStart := strings.Index(value[cursor:], "${")
+		if relativeStart < 0 {
+			if err := writeLiteral(value[cursor:]); err != nil {
+				return "", err
+			}
+			return out.String(), nil
+		}
+		start := cursor + relativeStart
+		if err := writeLiteral(value[cursor:start]); err != nil {
+			return "", err
+		}
+		relativeEnd := strings.IndexByte(value[start+2:], '}')
+		if relativeEnd < 0 {
+			return "", fmt.Errorf("unterminated placeholder in %q", value)
+		}
+		end := start + 2 + relativeEnd
+		body := value[start+2 : end]
+		kind, name, ok := strings.Cut(body, ":")
+		if !ok || bindings[kind] == nil {
+			return "", fmt.Errorf("unsupported placeholder %q", body)
+		}
+		replacement, ok := bindings[kind][name]
+		if !ok {
+			return "", fmt.Errorf("unbound placeholder %q", body)
+		}
+		out.WriteString(replacement)
+		cursor = end + 1
+	}
+}
+
+func restoreRecipeEnvironmentNames(environment map[string]string) (map[string]string, error) {
+	restored := make(map[string]string, len(environment))
+	for _, key := range sortedKeys(environment) {
+		name, err := kconfig.RestoreCompactKbuildLiteralActionMarkers(key)
+		if err != nil {
+			return nil, fmt.Errorf("environment name %q literal marker: %w", key, err)
+		}
+		if _, exists := restored[name]; exists {
+			return nil, fmt.Errorf("environment name %q restores to duplicate %q", key, name)
+		}
+		restored[name] = environment[key]
+	}
+	return restored, nil
 }
 
 // expandContentTemplate substitutes generated content while retaining typed
