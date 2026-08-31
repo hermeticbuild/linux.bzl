@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 func parseCapturedKbuild(t *testing.T, source string, opts KbuildOptions, names ...string) *KbuildFile {
@@ -549,6 +551,56 @@ func TestParseKbuildRejectsRecursiveMakeProvenanceFromFilesystemFunctions(t *tes
 					t.Fatalf("parseKbuildWithOptions() error = %v, want reserved-provenance rejection", err)
 				}
 			})
+		}
+	}
+}
+
+func TestParseKbuildRejectsSplitToolsetPathProvenanceAtOrdinaryIngress(t *testing.T) {
+	token, err := toolaction.EncodeExecutionRootProvenancePath("target", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminator := strings.LastIndex(token, toolaction.ExecutionRootProvenanceTerminator)
+	if terminator <= 0 {
+		t.Fatalf("toolset token %q has no terminator", token)
+	}
+	pieces := []string{token[:terminator], token[terminator:]}
+	for index, piece := range pieces {
+		t.Run(fmt.Sprintf("filesystem piece %d", index), func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "piece"), []byte(piece+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := parseKbuildWithOptions(strings.NewReader("value := $(file < piece)\n"), "Kbuild", KbuildOptions{
+				WorkingDir: root, CaptureVariables: []string{"value"},
+			}, root)
+			if err == nil || !strings.Contains(err.Error(), "reserved toolset-path provenance byte") {
+				t.Fatalf("filesystem token piece error = %v, want toolset-path provenance rejection", err)
+			}
+		})
+		t.Run(fmt.Sprintf("virtual piece %d", index), func(t *testing.T) {
+			_, err := parseKbuildWithOptions(strings.NewReader("value := $(file < piece)\n"), "Kbuild", KbuildOptions{
+				CaptureVariables: []string{"value"},
+				VirtualFileView: &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{
+					"piece": {content: piece + "\n", exact: true},
+				}},
+			}, "")
+			if err == nil || !strings.Contains(err.Error(), "reserved toolset-path provenance byte") {
+				t.Fatalf("virtual token piece error = %v, want toolset-path provenance rejection", err)
+			}
+		})
+	}
+
+	for _, boundary := range []string{"\x07", "\x08"} {
+		_, err := parseKbuildWithOptions(strings.NewReader("part := "+boundary+"\nvalue := $(part)\n"), "Kbuild", KbuildOptions{
+			CaptureVariables: []string{"value"},
+		}, "")
+		if err == nil || !strings.Contains(err.Error(), "reserved literal-marker byte") {
+			t.Fatalf("source token boundary %q error = %v, want source-ingress rejection", boundary, err)
+		}
+		if _, err := NewKbuildVariableBaseWithRecursiveMakeDefault(map[string]string{"PART": boundary}); err == nil ||
+			!strings.Contains(err.Error(), "reserved toolset-path provenance byte") {
+			t.Fatalf("configured token boundary %q error = %v, want variable-ingress rejection", boundary, err)
 		}
 	}
 }

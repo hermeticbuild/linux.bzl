@@ -24,6 +24,10 @@ type CompactMetadata struct {
 	actionRoles             []KbuildActionRoleRef
 	preconfiguredObjectTree bool
 	selectedProductsOnly    bool
+	// toolsetPathCapabilityNormalizer verifies workload-local capabilities
+	// after source-owned Make transformations and removes their ephemeral tags
+	// before recipes cross a stable content-addressing boundary.
+	toolsetPathCapabilityNormalizer func(string) (string, error)
 }
 
 type CompactConfig struct {

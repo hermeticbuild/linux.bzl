@@ -47,7 +47,7 @@ func TestProbeOutcomeFragmentsAcceptsDependencyOnlyRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoded := string(data)
-	if !strings.Contains(encoded, `"schema":"linux-probe-request-v10"`) ||
+	if !strings.Contains(encoded, `"schema":"linux-probe-request-v11"`) ||
 		!strings.Contains(encoded, `"fragments"`) || strings.Contains(encoded, `"steps":[`) {
 		t.Fatalf("derived text outcome canonical JSON has the wrong envelope: %s", encoded)
 	}

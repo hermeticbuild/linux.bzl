@@ -18,4 +18,5 @@ go_test(
     name = "toolsetidentity_test",
     srcs = ["main_test.go"],
     embed = [":toolsetidentity_lib"],
+    deps = ["//internal/toolaction"],
 )

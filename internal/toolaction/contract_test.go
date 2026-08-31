@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -196,6 +197,436 @@ func TestExpandExecutionRootValue(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExecutionRootProvenancePathIsScopedSelfDelimitedAndCanonical(t *testing.T) {
+	token, err := EncodeExecutionRootProvenancePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := "before=-I" + token + " after"
+	got, err := RewriteExecutionRootProvenanceValue(value, func(scope, canonical string) (string, error) {
+		if scope != "host" || canonical != "external/gcc/include" {
+			t.Fatalf("resolver input = (%q, %q)", scope, canonical)
+		}
+		return "/physical/gcc/include", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "before=-I/physical/gcc/include after"; got != want {
+		t.Fatalf("rewritten value = %q, want %q", got, want)
+	}
+
+	for _, test := range []struct {
+		name, value string
+	}{
+		{name: "unknown scope", value: ExecutionRootProvenanceMarker + "build:external/gcc/include" + ExecutionRootProvenanceTerminator},
+		{name: "parent traversal", value: ExecutionRootProvenanceMarker + "target:external/gcc/../../etc" + ExecutionRootProvenanceTerminator},
+		{name: "dot component", value: ExecutionRootProvenanceMarker + "target:external/./gcc" + ExecutionRootProvenanceTerminator},
+		{name: "unterminated", value: ExecutionRootProvenanceMarker + "target:external/gcc/include"},
+		{name: "stray opener", value: "prefix\x07suffix"},
+		{name: "stray terminator", value: "prefix\x08suffix"},
+		{name: "slash suffix", value: token + "/../../etc"},
+		{name: "backslash suffix", value: token + `\..\..\etc`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := RewriteExecutionRootProvenanceValue(test.value, func(_, _ string) (string, error) {
+				return "/unused", nil
+			}); err == nil {
+				t.Fatalf("RewriteExecutionRootProvenanceValue(%q) succeeded", test.value)
+			}
+		})
+	}
+}
+
+func TestExecutionRootProvenanceAuthorityRejectsAdjacentSuffixes(t *testing.T) {
+	codec := fixedExecutionRootProvenanceCapabilityCodec(t, 0x42)
+	core, err := EncodeExecutionRootProvenancePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := codec.EncodePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name, suffix string
+	}{
+		{name: "dot extension", suffix: ".a"},
+		{name: "star glob", suffix: "*"},
+		{name: "question glob", suffix: "?"},
+		{name: "lowercase", suffix: "a"},
+		{name: "uppercase", suffix: "Z"},
+		{name: "digit", suffix: "0"},
+		{name: "underscore", suffix: "_suffix"},
+		{name: "hyphen", suffix: "-suffix"},
+		{name: "percent pattern", suffix: "%"},
+		{name: "slash path", suffix: "/subdir"},
+		{name: "backslash path", suffix: `\subdir`},
+		{name: "quoted path continuation", suffix: `"/../sibling"`},
+		{name: "single quoted path continuation", suffix: `'/../sibling'`},
+		{name: "brace expansion", suffix: "{,.a}"},
+		{name: "backtick", suffix: "`tail"},
+		{name: "comma", suffix: ",tail"},
+		{name: "semicolon", suffix: ";tail"},
+		{name: "colon", suffix: ":tail"},
+		{name: "pipe", suffix: "|tail"},
+		{name: "ampersand", suffix: "&tail"},
+		{name: "open parenthesis", suffix: "(tail"},
+		{name: "close parenthesis", suffix: ")tail"},
+		{name: "open bracket", suffix: "[tail"},
+		{name: "close bracket", suffix: "]tail"},
+		{name: "open angle", suffix: "<tail"},
+		{name: "close angle", suffix: ">tail"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, err := RewriteExecutionRootProvenanceValue(core+test.suffix, func(_, _ string) (string, error) {
+				return "/resolved/include", nil
+			}); err == nil {
+				t.Fatalf("RewriteExecutionRootProvenanceValue() = %q, want error", got)
+			}
+			if got, err := codec.NormalizeValue(capability + test.suffix); err == nil {
+				t.Fatalf("NormalizeValue() = %q, want error", got)
+			}
+			got, err := CanonicalizeExecutionRootProvenanceCapabilityIdentity(capability + test.suffix)
+			if err != nil {
+				t.Fatalf("CanonicalizeExecutionRootProvenanceCapabilityIdentity() error = %v", err)
+			}
+			if want := core + test.suffix; got != want {
+				t.Fatalf("CanonicalizeExecutionRootProvenanceCapabilityIdentity() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRewriteExecutionRootProvenancePreservesCapabilitySuffix(t *testing.T) {
+	codec := fixedExecutionRootProvenanceCapabilityCodec(t, 0x42)
+	core, err := EncodeExecutionRootProvenancePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := codec.EncodePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := DecodeExecutionRootProvenancePath(capability); err == nil {
+		t.Fatal("DecodeExecutionRootProvenancePath() accepted an authenticated planning capability as an exact runtime core")
+	}
+	got, err := RewriteExecutionRootProvenanceValue(capability+" ", func(_, _ string) (string, error) {
+		return "/resolved/include", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "/resolved/include" + strings.TrimPrefix(capability, core) + " "; got != want {
+		t.Fatalf("rewritten planning capability = %q, want preserved suffix in %q", got, want)
+	}
+}
+
+func TestExecutionRootProvenanceAllowsWhitespaceAndPrefixes(t *testing.T) {
+	codec := fixedExecutionRootProvenanceCapabilityCodec(t, 0x42)
+	core, err := EncodeExecutionRootProvenancePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := codec.EncodePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name, suffix string
+	}{
+		{name: "end"},
+		{name: "space", suffix: " tail"},
+		{name: "tab", suffix: "\ttail"},
+		{name: "newline", suffix: "\ntail"},
+		{name: "carriage return", suffix: "\rtail"},
+		{name: "vertical tab", suffix: "\vtail"},
+		{name: "form feed", suffix: "\ftail"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := RewriteExecutionRootProvenanceValue(core+test.suffix, func(_, _ string) (string, error) {
+				return "/resolved/include", nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := "/resolved/include" + test.suffix; got != want {
+				t.Fatalf("RewriteExecutionRootProvenanceValue() = %q, want %q", got, want)
+			}
+			if err := ValidateExecutionRootProvenanceValue(capability + test.suffix); err != nil {
+				t.Fatalf("ValidateExecutionRootProvenanceValue() error = %v", err)
+			}
+			got, err = codec.NormalizeValue(capability + test.suffix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := core + test.suffix; got != want {
+				t.Fatalf("NormalizeValue() = %q, want %q", got, want)
+			}
+		})
+	}
+
+	for _, prefix := range []string{"-I", `prefix.a*?Az0_-%/\=`} {
+		got, err := RewriteExecutionRootProvenanceValue(prefix+core, func(_, _ string) (string, error) {
+			return "/resolved/include", nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := prefix + "/resolved/include"; got != want {
+			t.Fatalf("prefixed runtime token = %q, want %q", got, want)
+		}
+		got, err = codec.NormalizeValue(prefix + capability)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := prefix + core; got != want {
+			t.Fatalf("prefixed capability = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestExecutionRootProvenanceCapabilityRoundTrip(t *testing.T) {
+	codec := fixedExecutionRootProvenanceCapabilityCodec(t, 0x42)
+	hostCapability, err := codec.EncodePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetCapability, err := codec.EncodePath("target", "bazel-out/toolchain/compiler")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, capability := range []string{hostCapability, targetCapability} {
+		if err := ValidateExecutionRootProvenanceValue(capability); err != nil {
+			t.Fatalf("capability is not a syntactically valid provenance token: %v", err)
+		}
+	}
+	hostRuntime, err := EncodeExecutionRootProvenancePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetRuntime, err := EncodeExecutionRootProvenancePath("target", "bazel-out/toolchain/compiler")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	value := "prefix=-I" + hostCapability + " between " + targetCapability + " suffix"
+	got, err := codec.NormalizeValue(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "prefix=-I" + hostRuntime + " between " + targetRuntime + " suffix"
+	if got != want {
+		t.Fatalf("NormalizeValue() = %q, want %q", got, want)
+	}
+	if strings.Contains(got, executionRootProvenanceCapabilitySuffix) {
+		t.Fatalf("normalized value retained capability data: %q", got)
+	}
+
+	otherCodec := fixedExecutionRootProvenanceCapabilityCodec(t, 0x99)
+	otherCapability, err := otherCodec.EncodePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherCapability == hostCapability {
+		t.Fatal("different workload keys produced the same capability")
+	}
+	otherNormalized, err := otherCodec.NormalizeValue(otherCapability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherNormalized != hostRuntime {
+		t.Fatalf("normalization depends on ephemeral key: got %q, want %q", otherNormalized, hostRuntime)
+	}
+
+	hostIdentity, err := CanonicalizeExecutionRootProvenanceCapabilityIdentity(hostCapability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherIdentity, err := CanonicalizeExecutionRootProvenanceCapabilityIdentity(otherCapability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hostIdentity != hostRuntime || otherIdentity != hostRuntime || hostIdentity != otherIdentity {
+		t.Fatalf("identity canonicalization retained ephemeral key data: first=%q second=%q want=%q", hostIdentity, otherIdentity, hostRuntime)
+	}
+	mixed := "cap=" + hostCapability + " raw=" + targetRuntime
+	mixedIdentity, err := CanonicalizeExecutionRootProvenanceCapabilityIdentity(mixed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "cap=" + hostRuntime + " raw=" + targetRuntime; mixedIdentity != want {
+		t.Fatalf("mixed identity canonicalization = %q, want %q", mixedIdentity, want)
+	}
+}
+
+func TestExecutionRootProvenanceCapabilityPreservesLexicalPathOrder(t *testing.T) {
+	firstCodec := fixedExecutionRootProvenanceCapabilityCodec(t, 0x42)
+	secondCodec := fixedExecutionRootProvenanceCapabilityCodec(t, 0x99)
+	paths := []string{
+		"external/gcc",
+		"external/gcc/include",
+		"external/llvm",
+		"bazel-out/toolchain/compiler",
+	}
+	cores := make([]string, 0, len(paths))
+	capabilities := make([]string, 0, len(paths))
+	for i, path := range paths {
+		core, err := EncodeExecutionRootProvenancePath("target", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		codec := firstCodec
+		if i%2 != 0 {
+			codec = secondCodec
+		}
+		capability, err := codec.EncodePath("target", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cores = append(cores, core)
+		capabilities = append(capabilities, capability)
+	}
+	for i := range cores {
+		for j := range cores {
+			if i == j {
+				continue
+			}
+			coreOrder := strings.Compare(cores[i], cores[j])
+			capabilityOrder := strings.Compare(capabilities[i], capabilities[j])
+			if coreOrder != capabilityOrder {
+				t.Fatalf("capability order for %q and %q = %d, deterministic core order = %d", paths[i], paths[j], capabilityOrder, coreOrder)
+			}
+		}
+	}
+
+	sortedCores := append([]string(nil), cores...)
+	sortedCapabilities := append([]string(nil), capabilities...)
+	sort.Strings(sortedCores)
+	sort.Strings(sortedCapabilities)
+	identitySorted := make([]string, 0, len(sortedCapabilities))
+	for _, capability := range sortedCapabilities {
+		canonical, err := CanonicalizeExecutionRootProvenanceCapabilityIdentity(capability)
+		if err != nil {
+			t.Fatal(err)
+		}
+		identitySorted = append(identitySorted, canonical)
+	}
+	if !slices.Equal(identitySorted, sortedCores) {
+		t.Fatalf("sort-like capability order canonicalized to %q, want %q", identitySorted, sortedCores)
+	}
+
+	prefixCore, prefixCapability := cores[0], capabilities[0]
+	descendantCore, descendantCapability := cores[1], capabilities[1]
+	if strings.Compare(prefixCore, descendantCore) != strings.Compare(prefixCapability, descendantCapability) {
+		t.Fatalf("prefix-related paths changed lexical order: core=(%q,%q) capability=(%q,%q)", prefixCore, descendantCore, prefixCapability, descendantCapability)
+	}
+}
+
+func TestExecutionRootProvenanceCapabilityRejectsForgery(t *testing.T) {
+	codec := fixedExecutionRootProvenanceCapabilityCodec(t, 0x42)
+	capability, err := codec.EncodePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeToken, err := EncodeExecutionRootProvenancePath("host", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tagOffset := len(runtimeToken) + len(executionRootProvenanceCapabilitySuffix)
+	mutatedTag := capability[:tagOffset] + differentHexByte(capability[tagOffset]) + capability[tagOffset+1:]
+	suffixOnly := strings.TrimPrefix(capability, runtimeToken)
+	for _, test := range []struct {
+		name  string
+		codec *ExecutionRootProvenanceCapabilityCodec
+		value string
+	}{
+		{name: "wrong workload key", codec: fixedExecutionRootProvenanceCapabilityCodec(t, 0x99), value: capability},
+		{name: "mutated scope", codec: codec, value: strings.Replace(capability, ExecutionRootProvenanceMarker+"host:", ExecutionRootProvenanceMarker+"target:", 1)},
+		{name: "mutated path", codec: codec, value: strings.Replace(capability, "external/gcc/include", "external/gcc/lib", 1)},
+		{name: "mutated tag", codec: codec, value: mutatedTag},
+		{name: "raw deterministic token", codec: codec, value: runtimeToken},
+		{name: "core stripped", codec: codec, value: suffixOnly},
+		{name: "suffix detached before core", codec: codec, value: suffixOnly + runtimeToken},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, err := test.codec.NormalizeValue("before" + test.value + " after"); err == nil {
+				t.Fatalf("NormalizeValue() = %q, want error", got)
+			}
+		})
+	}
+
+	for _, malformedCapability := range []string{
+		runtimeToken + executionRootProvenanceCapabilitySuffix,
+		runtimeToken + executionRootProvenanceCapabilitySuffix + strings.Repeat("a", executionRootProvenanceCapabilityTagSize-1),
+		runtimeToken + executionRootProvenanceCapabilitySuffix + strings.Repeat("A", executionRootProvenanceCapabilityTagSize),
+		runtimeToken + executionRootProvenanceCapabilitySuffix + strings.Repeat("g", executionRootProvenanceCapabilityTagSize),
+		executionRootProvenanceCapabilitySuffix + strings.Repeat("a", executionRootProvenanceCapabilityTagSize),
+		"before" + executionRootProvenanceCapabilitySuffix + strings.Repeat("a", executionRootProvenanceCapabilityTagSize) + "after",
+		capability + executionRootProvenanceCapabilitySuffix + strings.Repeat("a", executionRootProvenanceCapabilityTagSize),
+	} {
+		if got, err := codec.NormalizeValue(malformedCapability); err == nil {
+			t.Fatalf("NormalizeValue() = %q, want error", got)
+		}
+		if got, err := CanonicalizeExecutionRootProvenanceCapabilityIdentity(malformedCapability); err == nil {
+			t.Fatalf("CanonicalizeExecutionRootProvenanceCapabilityIdentity() = %q, want error", got)
+		}
+	}
+}
+
+func TestExecutionRootProvenanceCapabilityValidatesInputs(t *testing.T) {
+	if _, err := newExecutionRootProvenanceCapabilityCodec(make([]byte, executionRootProvenanceCapabilityKeySize-1)); err == nil {
+		t.Fatal("short capability key was accepted")
+	}
+	codec := fixedExecutionRootProvenanceCapabilityCodec(t, 0x42)
+	for _, test := range []struct {
+		name, scope, canonical string
+	}{
+		{name: "unknown scope", scope: "build", canonical: "external/gcc/include"},
+		{name: "empty path", scope: "host", canonical: ""},
+		{name: "parent path", scope: "target", canonical: "external/gcc/../include"},
+		{name: "reserved delimiter", scope: "target", canonical: "external/gcc/\x07include"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, err := codec.EncodePath(test.scope, test.canonical); err == nil {
+				t.Fatalf("EncodePath() = %q, want error", got)
+			}
+		})
+	}
+	var nilCodec *ExecutionRootProvenanceCapabilityCodec
+	if _, err := nilCodec.EncodePath("host", "external/gcc/include"); err == nil {
+		t.Fatal("nil codec encoded a capability")
+	}
+	if _, err := nilCodec.NormalizeValue("ordinary text"); err == nil {
+		t.Fatal("nil codec normalized a value")
+	}
+	if got, err := codec.NormalizeValue("ordinary text without provenance tokens"); err != nil || got != "ordinary text without provenance tokens" {
+		t.Fatalf("NormalizeValue(ordinary text) = %q, %v", got, err)
+	}
+}
+
+func fixedExecutionRootProvenanceCapabilityCodec(t *testing.T, fill byte) *ExecutionRootProvenanceCapabilityCodec {
+	t.Helper()
+	key := make([]byte, executionRootProvenanceCapabilityKeySize)
+	for i := range key {
+		key[i] = fill
+	}
+	codec, err := newExecutionRootProvenanceCapabilityCodec(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return codec
+}
+
+func differentHexByte(value byte) string {
+	if value == '0' {
+		return "1"
+	}
+	return "0"
 }
 
 func TestPrepareRuntimeToolDirectoryUsesOnlyDeclaredRoles(t *testing.T) {

@@ -42,12 +42,14 @@ load(
 visibility("public")
 
 _SCHEMA = "linux-kernel-plan-v4"
-_TOOLSET_SCHEMA = "linux-kbuild-toolset-v5"
+_TOOLSET_SCHEMA = "linux-kbuild-toolset-v6"
 _KBUILD_ARGS_SENTINEL = "__LINUX_BZL_KBUILD_ARGS_V1__"
 _SCRIPT_RUNTIME_APPLET_ROLE_PREFIX = "script-applet-"
 _COMPANION_TOOL_PREFIX = "companion_tool_"
 _TOOL_BINDING_SEPARATOR = "@"
 _TOOLCHAIN_FILES_PREFIX = "toolchain_files@"
+_TOOLSET_ANCHOR_PREFIX = "toolset_anchor@"
+_TOOLSET_MANIFEST_PREFIX = "toolset_manifest@"
 _HOST_DEPS_SENTINEL = "__LINUX_BZL_HOST_DEPS__"
 _HOST_DEPS_TREE = "host_deps"
 _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE = str(Label("@rules_python//python:exec_tools_toolchain_type"))
@@ -189,6 +191,25 @@ def _canonical_file_path_values(path, short_path, what):
 
 def _canonical_file_path(file, what):
     return _canonical_file_path_values(file.path, file.short_path, what)
+
+def _artifact_root_relative(file, canonical, what):
+    """Returns the analysis root and exact path below it for one typed File."""
+    root = file.root.path
+    if root in ["", "."]:
+        relative = file.path
+    elif file.path.startswith(root + "/"):
+        relative = file.path[len(root) + 1:]
+    else:
+        fail("%s path %r is not below its artifact root %r" % (what, file.path, root))
+    _validate_path(relative, what + " root-relative path")
+    if _canonical_artifact_path(file.path, what + " path") != canonical:
+        fail("%s canonical path changed while deriving its artifact root" % what)
+    return struct(path = relative, root = root)
+
+def linux_test_artifact_root_relative(path, short_path, root):
+    file = struct(path = path, root = struct(path = root), short_path = short_path)
+    canonical = _canonical_file_path(file, "test artifact")
+    return _artifact_root_relative(file, canonical, "test artifact")
 
 def _record_canonical_file(files, file, what):
     canonical = _canonical_file_path(file, what)
@@ -418,6 +439,7 @@ def _parse_plan(plan, input_directories, additional_inputs, source_prefix, stage
             "outputs": {},
             "sources": {},
             "tools": {},
+            "toolsets": {},
             "trees": {},
         })
         if field in ["kind", "product", "recipe", "tool"] and len(parts) == 5:
@@ -459,6 +481,11 @@ def _parse_plan(plan, input_directories, additional_inputs, source_prefix, stage
             if binding in node["tools"]:
                 fail("mapped Linux node %s repeats auxiliary tool %r" % (node_id, binding))
             node["tools"][binding] = struct(binding = binding, role = role, scope = scope)
+        elif field == "in" and len(parts) == 6 and parts[4] == "toolset":
+            scope = parts[5]
+            if scope not in ["host", "target"] or scope in node["toolsets"]:
+                fail("mapped Linux node %s has invalid or repeated toolset scope %r" % (node_id, path))
+            node["toolsets"][scope] = True
         elif field == "out" and len(parts) >= 7:
             slot = parts[5]
             if slot in node["outputs"]:
@@ -603,7 +630,11 @@ def _validate_plan_toolsets(parsed, input_directories):
                 planned.identity,
                 expected.identity,
             ))
-        validated[scope] = struct(plan_file = planned.file, expected_file = expected.file)
+        validated[scope] = struct(
+            identity = planned.identity,
+            plan_file = planned.file,
+            expected_file = expected.file,
+        )
     return validated
 
 def _resolve_node_input_bindings(node_id, dependencies, outputs, prior, declared_outputs):
@@ -775,7 +806,7 @@ def _runtime_tool_bindings(tools, current_scope = "target", selected_scopes = No
         selected_scopes = {current_scope: True}
     bindings = {}
     for binding, tool in tools.items():
-        if binding in ["runner", "toolchain_files"] or binding.startswith(_TOOLCHAIN_FILES_PREFIX) or binding.startswith(_COMPANION_TOOL_PREFIX):
+        if binding in ["runner", "toolchain_files"] or binding.startswith(_TOOLCHAIN_FILES_PREFIX) or binding.startswith(_TOOLSET_ANCHOR_PREFIX) or binding.startswith(_TOOLSET_MANIFEST_PREFIX) or binding.startswith(_COMPANION_TOOL_PREFIX):
             continue
         parsed = _split_tool_binding(binding, current_scope)
         if parsed.scoped:
@@ -840,6 +871,41 @@ def _render_toolchain_action_contracts(additional_params, tools):
         ]
         contracts[role] = struct(arguments = arguments, environment = environment)
     return contracts
+
+def _toolset_artifact_binding_args(template_ctx, tools, toolsets, scopes):
+    """Forwards identity, manifest, and consumer-mapped root anchors by scope."""
+    args = template_ctx.args()
+    for scope in sorted(scopes):
+        closure = tools.get(_TOOLCHAIN_FILES_PREFIX + scope)
+        if closure == None:
+            fail("mapped Linux toolset artifact bindings have no %s closure" % scope)
+        manifest = tools.get(_TOOLSET_MANIFEST_PREFIX + scope)
+        if manifest == None:
+            fail("mapped Linux toolset artifact bindings have no %s manifest" % scope)
+        identity = toolsets.get(scope)
+        if identity == None:
+            fail("mapped Linux toolset artifact bindings have no %s identity" % scope)
+        args.add("-toolset_identity=" + scope + "=" + identity.identity)
+        args.add_all(
+            [manifest],
+            expand_directories = False,
+            format_each = "-toolset_manifest=" + scope + "=%s",
+        )
+        anchor_prefix = _TOOLSET_ANCHOR_PREFIX + scope + "@"
+        anchors = [
+            (binding[len(anchor_prefix):], tools[binding])
+            for binding in sorted(tools)
+            if binding.startswith(anchor_prefix)
+        ]
+        if not anchors:
+            fail("mapped Linux toolset artifact bindings have no %s root anchors" % scope)
+        for root, anchor in anchors:
+            args.add_all(
+                [anchor],
+                expand_directories = False,
+                format_each = "-toolset_anchor=" + scope + "=" + root + "=%s",
+            )
+    return args
 
 def linux_test_render_toolchain_action_value(value, artifacts):
     return _render_toolchain_action_value(value, _toolchain_action_path_index_from_list(artifacts))
@@ -984,9 +1050,21 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
         for key in sorted(bindings):
             inputs.append(bindings[key])
         uses_runtime_toolset = _node_uses_runtime_toolset(kind, role, node["tools"])
-        selected_scopes = {scope: True} if uses_runtime_toolset else {}
+
+        # Recipe markers carry the exact scopes of compiler-probe paths embedded
+        # in arguments, environments, command replays, or evaluated scripts.
+        # Add the current execution scope only when the recipe can invoke its
+        # runtime toolset; pure actionfile projections remain closure-free unless
+        # their content-addressed recipe explicitly carries path provenance.
+        selected_scopes = dict(node["toolsets"])
+        if uses_runtime_toolset:
+            selected_scopes[scope] = True
         for descriptor in node["tools"].values():
             selected_scopes[descriptor.scope] = True
+        for selected_scope in sorted(selected_scopes):
+            if selected_scope != scope:
+                selected_toolset = toolsets[selected_scope]
+                inputs.extend([selected_toolset.plan_file, selected_toolset.expected_file])
         runtime_tools = _runtime_tool_bindings(tools, scope, selected_scopes) if uses_runtime_toolset else {}
         for runtime_role, runtime_tool in sorted(runtime_tools.items()):
             _add_artifact_path(args, "-runtime_tool", runtime_tool, format = runtime_role + "=%s")
@@ -1090,12 +1168,25 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
         _add_artifact_path(args, working_output.argument, working_output.artifact)
         action_outputs.append(working_output.artifact)
 
+        # A recipe may replay a canonical path returned by any compiler whose
+        # role is bound to this node.  The closure scopes are therefore exactly
+        # the same scopes already authorized for runtime tool execution.  The
+        # runner rejects a provenance token for every other scope.
+        action_arguments = [args]
+        if selected_scopes:
+            action_arguments.append(_toolset_artifact_binding_args(
+                template_ctx,
+                tools,
+                toolsets,
+                selected_scopes,
+            ))
+
         template_ctx.run(
             executable = tools["runner"],
             inputs = depset(inputs, transitive = transitive_inputs),
-            tools = [tools[_TOOLCHAIN_FILES_PREFIX + selected_scope] for selected_scope in sorted(selected_scopes)] + ([selected_tool] if role != "generated" else []) + selected_auxiliary_tools + selected_companion_tools,
+            tools = [tools[_TOOLCHAIN_FILES_PREFIX + selected_scope] for selected_scope in sorted(selected_scopes)] + [tools[_TOOLSET_MANIFEST_PREFIX + selected_scope] for selected_scope in sorted(selected_scopes)] + ([selected_tool] if role != "generated" else []) + selected_auxiliary_tools + selected_companion_tools,
             outputs = action_outputs,
-            arguments = [args],
+            arguments = action_arguments,
             progress_message = "Building Linux %s node %s" % (kind, node_id[:12]),
         )
 
@@ -1981,12 +2072,34 @@ def _toolset_identity(ctx, scope, toolset, closure):
             for name in sorted(toolset.environments[role])
         }
     artifact_kinds = {}
+    analysis_root_members = {}
+    root_relative_paths = {}
     for path, file in closure_by_path.items():
         # File.is_directory only identifies declared TreeArtifacts/Filesets.
         # Bazel's legacy opaque source directories are ordinary SourceArtifacts
         # here, so their identity-bound kind must preserve that ambiguity for
         # execution-time inspection of the exact typed input.
         artifact_kinds[path] = "source-artifact" if file.is_source else ("generated-directory" if file.is_directory else "generated-file")
+        location = _artifact_root_relative(file, path, "%s toolset artifact %s" % (scope, path))
+        analysis_root_members.setdefault(location.root, []).append(path)
+        root_relative_paths[path] = location.path
+    roots_by_first_member = {}
+    for analysis_root, members in analysis_root_members.items():
+        members = sorted(members)
+        roots_by_first_member[members[0]] = struct(analysis_root = analysis_root, members = members)
+    artifact_roots = {}
+    roots = {}
+    anchors = {}
+    for index, first_member in enumerate(sorted(roots_by_first_member)):
+        root = roots_by_first_member[first_member]
+        root_id = "root-" + _ordinal(index)
+        roots[root_id] = first_member
+        anchors[root_id] = closure_by_path[first_member]
+        for canonical in root.members:
+            artifact_roots[canonical] = {
+                "path": root_relative_paths[canonical],
+                "root": root_id,
+            }
     tool_paths = {}
     for role, tool in toolset.tools.items():
         tool_path = _canonical_file_path(_tool_executable(tool), "%s %s tool" % (scope, role))
@@ -2008,10 +2121,12 @@ def _toolset_identity(ctx, scope, toolset, closure):
         content = json.encode({
             "actions": canonical_actions,
             "artifact_kinds": artifact_kinds,
+            "artifact_roots": artifact_roots,
             "closure": sorted(closure_by_path),
             "environments": canonical_environments,
             "make_variables": toolset.make_variables,
             "requirements": toolset.requirements_by_role,
+            "roots": roots,
             "schema": _TOOLSET_SCHEMA,
             "scope": scope,
             "tools": tool_paths,
@@ -2029,7 +2144,7 @@ def _toolset_identity(ctx, scope, toolset, closure):
         mnemonic = "LinuxToolsetIdentity",
         progress_message = "Identifying %s Linux toolset %%{label}" % scope,
     )
-    return struct(identity = identity, manifest = manifest)
+    return struct(anchors = anchors, identity = identity, manifest = manifest)
 
 def linux_map_directory_params(
         stage,
@@ -2069,8 +2184,12 @@ def linux_map_directory_tools(
         current_scope,
         target_tool_files,
         target_toolchain_files,
+        target_toolset_manifest,
+        target_toolset_anchors,
         host_tool_files,
         host_toolchain_files,
+        host_toolset_manifest,
+        host_toolset_anchors,
         target_companion_tools = {},
         host_companion_tools = {}):
     if current_scope not in ["host", "target"]:
@@ -2079,7 +2198,14 @@ def linux_map_directory_tools(
         "runner": runner,
         _TOOLCHAIN_FILES_PREFIX + "target": target_toolchain_files,
         _TOOLCHAIN_FILES_PREFIX + "host": host_toolchain_files,
+        _TOOLSET_MANIFEST_PREFIX + "target": target_toolset_manifest,
+        _TOOLSET_MANIFEST_PREFIX + "host": host_toolset_manifest,
     }
+    for scope, anchors in [("target", target_toolset_anchors), ("host", host_toolset_anchors)]:
+        for root, anchor in anchors.items():
+            if not _valid_name(root):
+                fail("mapped Linux %s toolset has invalid root anchor %r" % (scope, root))
+            values[_TOOLSET_ANCHOR_PREFIX + scope + "@" + root] = anchor
     for scope, tool_files, companion_tools in [
         ("target", target_tool_files, target_companion_tools),
         ("host", host_tool_files, host_companion_tools),
@@ -2333,6 +2459,8 @@ def _linux_mapped_kernel_impl(ctx):
     host_toolset_contract = _toolset_identity(ctx, "host", host, host_toolchain_files)
     target_toolset_identity = target_toolset_contract.identity
     host_toolset_identity = host_toolset_contract.identity
+    target_toolset_anchors = target_toolset_contract.anchors
+    host_toolset_anchors = host_toolset_contract.anchors
     target_toolset_manifest = target_toolset_contract.manifest
     host_toolset_manifest = host_toolset_contract.manifest
     target_tools = dict(target.tools)
@@ -2383,6 +2511,7 @@ def _linux_mapped_kernel_impl(ctx):
             host.tools,
             host_toolchain_files,
             host_toolset_manifest,
+            host_toolset_anchors,
             host.companion_tools,
         ),
         additional_params = linux_probe_map_directory_params("host", host.arguments, host.environments),
@@ -2405,6 +2534,7 @@ def _linux_mapped_kernel_impl(ctx):
             target.tools,
             target_toolchain_files,
             target_toolset_manifest,
+            target_toolset_anchors,
             target.companion_tools,
         ),
         additional_params = linux_probe_map_directory_params("target", target.arguments, target.environments),
@@ -2475,6 +2605,7 @@ def _linux_mapped_kernel_impl(ctx):
             host.tools,
             host_toolchain_files,
             host_toolset_manifest,
+            host_toolset_anchors,
             host.companion_tools,
         ),
         additional_params = linux_probe_map_directory_params(
@@ -2505,6 +2636,7 @@ def _linux_mapped_kernel_impl(ctx):
             target.tools,
             target_toolchain_files,
             target_toolset_manifest,
+            target_toolset_anchors,
             target.companion_tools,
         ),
         additional_params = linux_probe_map_directory_params(
@@ -2596,6 +2728,7 @@ def _linux_mapped_kernel_impl(ctx):
             host.tools,
             host_toolchain_files,
             host_toolset_manifest,
+            host_toolset_anchors,
             host.companion_tools,
         ),
         additional_params = linux_probe_map_directory_params(
@@ -2626,6 +2759,7 @@ def _linux_mapped_kernel_impl(ctx):
             target.tools,
             target_toolchain_files,
             target_toolset_manifest,
+            target_toolset_anchors,
             target.companion_tools,
         ),
         additional_params = linux_probe_map_directory_params(
@@ -2768,8 +2902,12 @@ def _linux_mapped_kernel_impl(ctx):
             scope,
             target_tools,
             target_toolchain_files,
+            target_toolset_manifest,
+            target_toolset_anchors,
             host_tools,
             host_toolchain_files,
+            host_toolset_manifest,
+            host_toolset_anchors,
             target.companion_tools,
             host.companion_tools,
         )
@@ -2928,6 +3066,7 @@ def _linux_mapped_kernel_impl(ctx):
         host_tool_files = host_tools,
         host_toolchain_files = host_toolchain_files,
         host_toolset_identity = host_toolset_identity,
+        host_toolset_anchors = host_toolset_anchors,
         host_toolset_manifest = host_toolset_manifest,
         kbuild = ctx.file.kbuild,
         host_kconfig_probe_results = host_kconfig_probe_results,
@@ -2954,6 +3093,7 @@ def _linux_mapped_kernel_impl(ctx):
         target_tool_files = target_tools,
         target_toolchain_files = target_toolchain_files,
         target_toolset_identity = target_toolset_identity,
+        target_toolset_anchors = target_toolset_anchors,
         target_toolset_manifest = target_toolset_manifest,
         version = ctx.attr.version,
     )

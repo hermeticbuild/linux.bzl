@@ -4,6 +4,7 @@ load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts", "unittest")
 load(
     "//internal:mapped_kernel.bzl",
     "linux_map_directory_tools",
+    "linux_test_artifact_root_relative",
     "linux_test_canonical_file_path",
     "linux_test_canonical_rust_source_root",
     "linux_test_canonicalize_toolchain_action_value",
@@ -491,6 +492,12 @@ def _mapped_kernel_toolset_test_impl(ctx):
 
         host_closure = {file.path: True for file in sdk.host_toolchain_files.to_list()}
         target_closure = {file.path: True for file in sdk.target_toolchain_files.to_list()}
+        asserts.true(env, len(sdk.host_toolset_anchors) > 0)
+        asserts.true(env, len(sdk.target_toolset_anchors) > 0)
+        for anchor in sdk.host_toolset_anchors.values():
+            asserts.true(env, anchor.path in host_closure, "host root anchor must belong to its exact toolset closure")
+        for anchor in sdk.target_toolset_anchors.values():
+            asserts.true(env, anchor.path in target_closure, "target root anchor must belong to its exact toolset closure")
         m4 = sdk.host_tool_files.get("m4")
         m4_executable = getattr(m4, "executable", None)
         bison_companions = sdk.host_companion_tools.get("bison", [])
@@ -523,8 +530,12 @@ def _mapped_kernel_toolset_test_impl(ctx):
                 "host",
                 sdk.target_tool_files,
                 sdk.target_toolchain_files,
+                sdk.target_toolset_manifest,
+                sdk.target_toolset_anchors,
                 sdk.host_tool_files,
                 sdk.host_toolchain_files,
+                sdk.host_toolset_manifest,
+                sdk.host_toolset_anchors,
                 sdk.target_companion_tools,
                 sdk.host_companion_tools,
             )
@@ -1021,6 +1032,24 @@ def _mapped_kernel_backend_test_impl(ctx):
             "../elfutils+/libcpu/i386.mnemonics",
         ),
     )
+    asserts.equals(
+        env,
+        struct(path = "external/toolchain/bin/cc", root = "bazel-out/k8-opt-exec/bin"),
+        linux_test_artifact_root_relative(
+            "bazel-out/k8-opt-exec/bin/external/toolchain/bin/cc",
+            "external/toolchain/bin/cc",
+            "bazel-out/k8-opt-exec/bin",
+        ),
+    )
+    asserts.equals(
+        env,
+        struct(path = "include/stddef.h", root = "../toolchain"),
+        linux_test_artifact_root_relative(
+            "../toolchain/include/stddef.h",
+            "../toolchain/include/stddef.h",
+            "../toolchain",
+        ),
+    )
     closure_file = struct(
         identity = "same-artifact",
         path = "bazel-out/k8-opt-exec/bin/toolchain/runtime",
@@ -1186,6 +1215,7 @@ def _mapped_kernel_backend_test_impl(ctx):
         "schema/linux-kernel-plan-v4",
         "index/00000000/" + producer,
         "index/00000001/" + other_producer,
+        "toolsets/host/sha256-" + ("6" * 64),
         "toolsets/target/sha256-" + ("0" * 64),
         "recipes/" + recipe + ".json",
         "nodes/target/" + producer + "/kind/generate",
@@ -1195,6 +1225,7 @@ def _mapped_kernel_backend_test_impl(ctx):
         "nodes/target/" + producer + "/in/bindings/" + bindings_digest + ".json",
         "nodes/target/" + producer + "/in/tool/target/objcopy/unscoped",
         "nodes/target/" + producer + "/in/tool/host/cc/scoped",
+        "nodes/target/" + producer + "/in/toolset/host",
         "nodes/target/" + producer + "/out/objects/00000000/.linux-bzl-versions/first/generated/preserved",
         "nodes/target/" + other_producer + "/kind/generate",
         "nodes/target/" + other_producer + "/product/vmlinux",
@@ -1215,6 +1246,13 @@ def _mapped_kernel_backend_test_impl(ctx):
         sorted(parsed_outputs.nodes[producer]["tools"].keys()),
         "plan tool markers must retain scoped and source-owned binding spellings",
     )
+    asserts.equals(
+        env,
+        ["host"],
+        sorted(parsed_outputs.nodes[producer]["toolsets"].keys()),
+        "plan toolset markers must retain exact recipe provenance scopes",
+    )
+    asserts.equals(env, {}, parsed_outputs.nodes[other_producer]["toolsets"])
     asserts.equals(env, bindings_digest, parsed_outputs.nodes[producer]["input_bindings"].id)
     asserts.equals(
         env,
@@ -1336,8 +1374,12 @@ def _mapped_kernel_backend_test_impl(ctx):
             "pahole": "exact-pahole-tool",
         },
         "exact-target-toolchain-closure",
+        "exact-target-toolset-manifest",
+        {"root-00000000": "exact-target-toolset-anchor"},
         {"cc": "exact-host-cc-tool"},
         "exact-host-toolchain-closure",
+        "exact-host-toolset-manifest",
+        {"root-00000000": "exact-host-toolset-anchor"},
         {"lz4": ["exact-lz4-helper", "exact-lz4-runtime"]},
     )
     asserts.equals(env, "exact-lz4-tool", tools.get("lz4"))
@@ -1345,6 +1387,10 @@ def _mapped_kernel_backend_test_impl(ctx):
     asserts.equals(env, "exact-runner", tools.get("runner"))
     asserts.equals(env, "exact-target-toolchain-closure", tools.get("toolchain_files@target"))
     asserts.equals(env, "exact-host-toolchain-closure", tools.get("toolchain_files@host"))
+    asserts.equals(env, "exact-target-toolset-manifest", tools.get("toolset_manifest@target"))
+    asserts.equals(env, "exact-host-toolset-manifest", tools.get("toolset_manifest@host"))
+    asserts.equals(env, "exact-target-toolset-anchor", tools.get("toolset_anchor@target@root-00000000"))
+    asserts.equals(env, "exact-host-toolset-anchor", tools.get("toolset_anchor@host@root-00000000"))
     asserts.equals(env, "exact-host-cc-tool", tools.get("host@cc"))
     asserts.equals(env, ["exact-lz4-helper", "exact-lz4-runtime"], linux_test_companion_tool_bindings(tools, "lz4"))
     asserts.equals(env, {
@@ -1369,6 +1415,7 @@ def _mapped_kernel_backend_test_impl(ctx):
         },
         "exact-rust-toolchain-closure",
         "exact-rust-toolset-manifest",
+        {"root-00000000": "exact-rust-toolset-anchor"},
         {"bindgen": ["exact-bindgen-helper"]},
     )
     asserts.equals(env, "exact-bindgen-tool", probe_tools.get("probe_role_bindgen"))
@@ -1377,6 +1424,7 @@ def _mapped_kernel_backend_test_impl(ctx):
     asserts.equals(env, "exact-probe-runner", probe_tools.get("probe_runner"))
     asserts.equals(env, "exact-rust-toolchain-closure", probe_tools.get("toolchain_files"))
     asserts.equals(env, "exact-rust-toolset-manifest", probe_tools.get("toolset_manifest"))
+    asserts.equals(env, "exact-rust-toolset-anchor", probe_tools.get("toolset_anchor_root-00000000"))
     asserts.equals(env, "exact-bindgen-helper", probe_tools.get("companion_tool_bindgen_00000000"))
 
     host_compile_flags = linux_test_host_dependency_compile_flags(
@@ -1592,7 +1640,7 @@ _canonical_path_failure_test = analysistest.make(
     expect_failure = True,
 )
 
-def _packed_plan_paths(index_markers, input_markers = [], binding_markers = None):
+def _packed_plan_paths(index_markers, input_markers = [], binding_markers = None, toolset_markers = []):
     node = "b" * 64
     recipe = "c" * 64
     root = "nodes/target/" + node
@@ -1613,6 +1661,9 @@ def _packed_plan_paths(index_markers, input_markers = [], binding_markers = None
     ] + [
         root + "/in/node-pack/" + marker
         for marker in input_markers
+    ] + [
+        root + "/in/toolset/" + marker
+        for marker in toolset_markers
     ]
 
 def _packed_plan_probe_impl(ctx):
@@ -1778,6 +1829,20 @@ def mapped_kernel_path_validation_test(name):
             inputs = [],
             name = "duplicate_input_bindings",
         ),
+        struct(
+            expected_error = "has invalid or repeated toolset scope",
+            indexes = ["index/00000000/" + consumer],
+            inputs = [],
+            name = "invalid_toolset_scope",
+            toolsets = ["exec"],
+        ),
+        struct(
+            expected_error = "has invalid or repeated toolset scope",
+            indexes = ["index/00000000/" + consumer],
+            inputs = [],
+            name = "duplicate_toolset_scope",
+            toolsets = ["host", "host"],
+        ),
     ]:
         subject = name + "_" + case.name + "_subject"
         test = name + "_" + case.name
@@ -1788,6 +1853,7 @@ def mapped_kernel_path_validation_test(name):
                 case.indexes,
                 input_markers = case.inputs,
                 binding_markers = getattr(case, "bindings", None),
+                toolset_markers = getattr(case, "toolsets", []),
             ),
             tags = ["manual"],
         )

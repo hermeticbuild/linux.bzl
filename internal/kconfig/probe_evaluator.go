@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 const (
@@ -187,6 +189,12 @@ type linuxProbeSymbol struct {
 	// evidence whose mode says whether it is byte-exact, only argv-word-
 	// equivalent, or deliberately unusable outside exact Make replay.
 	makeText *linuxProbeMakeText
+	// toolsetPathLiteral is a deterministic runtime-provenance value imported
+	// from an already authenticated upstream Kconfig workload. Kbuild keeps it
+	// behind the opaque symbol until replay, then seals it with this workload's
+	// key before any source-owned transform observes the value.
+	toolsetPathLiteral string
+	toolsetPathScopes  []string
 }
 
 type linuxProbeSelectionInput struct {
@@ -499,6 +507,56 @@ func (e *LinuxProbeEvaluator) ResolveSymbolic(value string) (string, error) {
 	return e.resolveSymbolicWithState(value, &linuxProbeResolveState{visiting: map[string]bool{}})
 }
 
+// NormalizeToolsetPathCapabilities verifies compiler-path capabilities issued
+// by this evaluator's workload and removes their ephemeral authenticator. The
+// result retains deterministic scope/path provenance and is suitable only for
+// a typed handoff or a stable generated output; it must not be fed back into a
+// source-owned Make evaluation as ordinary configured text.
+func (e *LinuxProbeEvaluator) NormalizeToolsetPathCapabilities(value string) (string, error) {
+	if e == nil || e.symbolRegistry == nil {
+		return "", fmt.Errorf("Linux probe evaluator has no toolset-path authority")
+	}
+	codec, err := e.symbolRegistry.executionRootProvenanceCapabilityCodec()
+	if err != nil {
+		return "", err
+	}
+	return codec.NormalizeValue(value)
+}
+
+// NormalizeOrAuthorizeToolsetPathCapabilities additionally accepts the stable
+// deterministic provenance emitted by an earlier resolved-config action, but
+// only when this replay workload independently measured the exact same
+// scope/path through its validated Kconfig probe graph. This is the typed SDK
+// reuse boundary: raw configured provenance which has no matching oracle result
+// remains unauthorized.
+func (e *LinuxProbeEvaluator) NormalizeOrAuthorizeToolsetPathCapabilities(value string) (string, error) {
+	if e == nil || e.symbolRegistry == nil {
+		return "", fmt.Errorf("Linux probe evaluator has no toolset-path authority")
+	}
+	codec, err := e.symbolRegistry.executionRootProvenanceCapabilityCodec()
+	if err != nil {
+		return "", err
+	}
+	normalized, normalizeErr := codec.NormalizeValue(value)
+	if normalizeErr == nil {
+		return normalized, nil
+	}
+	canonical, canonicalErr := toolaction.CanonicalizeExecutionRootProvenanceCapabilityIdentity(value)
+	if canonicalErr != nil || canonical != value {
+		return "", normalizeErr
+	}
+	tokens, err := executionRootProvenanceTokens(value)
+	if err != nil {
+		return "", err
+	}
+	for _, token := range tokens {
+		if !e.symbolRegistry.authorizesToolsetPath(token.scope, token.canonical) {
+			return "", fmt.Errorf("%s toolset path %q was not measured by this Kconfig probe workload", token.scope, token.canonical)
+		}
+	}
+	return value, nil
+}
+
 // ResolveSymbolicStructure selects one source-visible layer of finite
 // boolean/selection branches from replay results. Every atom nested inside a
 // selected branch remains symbolic, allowing callers to observe its shell
@@ -763,7 +821,7 @@ func (e *LinuxProbeEvaluator) resolveSymbolWithState(token string, state *linuxP
 		}
 		arguments := slices.Clone(symbol.textTransform.arguments)
 		arguments[symbol.textTransform.inputArgument] = input
-		transformed, transformErr := applyBoundedPureKbuildTextTransform(symbol.textTransform.function, arguments)
+		transformed, transformErr := e.applyAuthenticatedKbuildTextTransform(symbol.textTransform.function, arguments)
 		if transformErr != nil {
 			return "", transformErr
 		}
@@ -780,11 +838,21 @@ func (e *LinuxProbeEvaluator) resolveSymbolWithState(token string, state *linuxP
 			}
 			arguments[index] = resolved
 		}
-		transformed, transformErr := applyBoundedPureKbuildTextTransform(symbol.makeText.function, arguments)
+		transformed, transformErr := e.applyAuthenticatedKbuildTextTransform(symbol.makeText.function, arguments)
 		if transformErr != nil {
 			return "", fmt.Errorf("evaluate Linux whole Make text %q: %w", token, transformErr)
 		}
 		value = transformed
+	case "toolset-path-literal":
+		codec, codecErr := e.symbolRegistry.executionRootProvenanceCapabilityCodec()
+		if codecErr != nil {
+			return "", fmt.Errorf("resolve imported toolset path %q: %w", token, codecErr)
+		}
+		sealed, sealErr := sealExecutionRootProvenanceCapabilities(codec, symbol.toolsetPathLiteral)
+		if sealErr != nil {
+			return "", fmt.Errorf("resolve imported toolset path %q: %w", token, sealErr)
+		}
+		value = sealed
 	default:
 		return "", fmt.Errorf("Linux probe symbolic value %q has unsupported kind %q", token, symbol.kind)
 	}
@@ -793,6 +861,156 @@ func (e *LinuxProbeEvaluator) resolveSymbolWithState(token string, state *linuxP
 	}
 	e.resolvedSymbols.store(token, value)
 	return value, nil
+}
+
+// applyAuthenticatedKbuildTextTransform keeps workload-local authentication
+// bytes outside source-owned Make semantics. Compiler path probes reach replay
+// as authenticated capabilities, but lexical Make functions must observe only
+// their deterministic runtime cores: otherwise functions such as subst and
+// word can extract the random MAC into a stable recipe.
+//
+// Every input capability is verified before evaluation. Exact provenance cores
+// which survive the transform are sealed again for the next Make operation or
+// the action-plan boundary. A transform may wrap, reorder, duplicate, or drop
+// an authenticated core, but it may not manufacture or mutate one: only exact
+// scope/path pairs present in authenticated inputs are granted authority.
+func (e *LinuxProbeEvaluator) applyAuthenticatedKbuildTextTransform(function string, arguments []string) (string, error) {
+	if e == nil || e.symbolRegistry == nil {
+		return "", fmt.Errorf("pure Make function %q has no toolset-path authority", function)
+	}
+	codec, err := e.symbolRegistry.executionRootProvenanceCapabilityCodec()
+	if err != nil {
+		return "", fmt.Errorf("pure Make function %q toolset-path authority: %w", function, err)
+	}
+
+	authorized := map[string]bool{}
+	normalized := slices.Clone(arguments)
+	for index, argument := range normalized {
+		argument, err = codec.NormalizeValue(argument)
+		if err != nil {
+			return "", fmt.Errorf("pure Make function %q argument %d toolset-path capability: %w", function, index, err)
+		}
+		tokens, err := executionRootProvenanceTokens(argument)
+		if err != nil {
+			return "", fmt.Errorf("pure Make function %q argument %d toolset-path provenance: %w", function, index, err)
+		}
+		for _, token := range tokens {
+			authorized[token.core] = true
+		}
+		normalized[index] = argument
+	}
+
+	transformed, err := applyBoundedPureKbuildTextTransform(function, normalized)
+	if err != nil {
+		return "", err
+	}
+	tokens, err := executionRootProvenanceTokens(transformed)
+	if err != nil {
+		return "", fmt.Errorf("pure Make function %q result toolset-path provenance: %w", function, err)
+	}
+	var sealed strings.Builder
+	sealed.Grow(len(transformed) + len(tokens)*96)
+	cursor := 0
+	for _, token := range tokens {
+		if !authorized[token.core] {
+			return "", fmt.Errorf(
+				"pure Make function %q result toolset-path provenance: scope/path was not present in an authenticated planning capability input",
+				function,
+			)
+		}
+		capability, encodeErr := codec.EncodePath(token.scope, token.canonical)
+		if encodeErr != nil {
+			return "", fmt.Errorf("pure Make function %q result toolset-path provenance: %w", function, encodeErr)
+		}
+		sealed.WriteString(transformed[cursor:token.start])
+		sealed.WriteString(capability)
+		cursor = token.end
+	}
+	sealed.WriteString(transformed[cursor:])
+	sealedValue := sealed.String()
+	// Re-verify the complete result. Besides checking every re-sealed token,
+	// this rejects a source expression which manufactures an unpaired printable
+	// capability suffix even when no provenance core survived the transform.
+	verified, err := codec.NormalizeValue(sealedValue)
+	if err != nil {
+		return "", fmt.Errorf("pure Make function %q result toolset-path capability: %w", function, err)
+	}
+	if verified != transformed {
+		return "", fmt.Errorf("pure Make function %q changed toolset-path provenance while sealing its result", function)
+	}
+	return sealedValue, nil
+}
+
+type executionRootProvenanceToken struct {
+	start, end       int
+	scope, canonical string
+	core             string
+}
+
+// executionRootProvenanceTokens validates one complete value with the shared
+// runtime parser before exposing token byte ranges to the planning-only
+// capability wrapper. This keeps the wire grammar owned by toolaction while
+// allowing a token to be re-sealed without asking the runtime rewriter to emit
+// another reserved token as a replacement.
+func executionRootProvenanceTokens(value string) ([]executionRootProvenanceToken, error) {
+	if err := toolaction.ValidateExecutionRootProvenanceValue(value); err != nil {
+		return nil, err
+	}
+	var tokens []executionRootProvenanceToken
+	for cursor := 0; ; {
+		relativeStart := strings.Index(value[cursor:], toolaction.ExecutionRootProvenanceMarker)
+		if relativeStart < 0 {
+			return tokens, nil
+		}
+		start := cursor + relativeStart
+		payloadStart := start + len(toolaction.ExecutionRootProvenanceMarker)
+		relativeEnd := strings.Index(value[payloadStart:], toolaction.ExecutionRootProvenanceTerminator)
+		if relativeEnd < 0 {
+			// ValidateExecutionRootProvenanceValue already diagnosed this shape;
+			// retain a defensive error if its contract ever changes.
+			return nil, fmt.Errorf("probed toolset path token at byte %d is unterminated", start)
+		}
+		end := payloadStart + relativeEnd + len(toolaction.ExecutionRootProvenanceTerminator)
+		core := value[start:end]
+		scope, canonical, err := toolaction.DecodeExecutionRootProvenancePath(core)
+		if err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, executionRootProvenanceToken{
+			start: start, end: end, scope: scope, canonical: canonical, core: core,
+		})
+		cursor = end
+	}
+}
+
+func sealExecutionRootProvenanceCapabilities(
+	codec *toolaction.ExecutionRootProvenanceCapabilityCodec,
+	value string,
+) (string, error) {
+	if codec == nil {
+		return "", fmt.Errorf("toolset-path capability codec is nil")
+	}
+	tokens, err := executionRootProvenanceTokens(value)
+	if err != nil {
+		return "", err
+	}
+	if len(tokens) == 0 {
+		return value, nil
+	}
+	var sealed strings.Builder
+	sealed.Grow(len(value) + len(tokens)*96)
+	cursor := 0
+	for _, token := range tokens {
+		capability, err := codec.EncodePath(token.scope, token.canonical)
+		if err != nil {
+			return "", err
+		}
+		sealed.WriteString(value[cursor:token.start])
+		sealed.WriteString(capability)
+		cursor = token.end
+	}
+	sealed.WriteString(value[cursor:])
+	return sealed.String(), nil
 }
 
 func (e *LinuxProbeEvaluator) output(command string) (string, error) {
@@ -1173,7 +1391,7 @@ func (e *LinuxProbeEvaluator) renderTextTransform(sourceToken, function string, 
 	if !ok {
 		return "", fmt.Errorf("unknown Linux probe symbolic value %q", sourceToken)
 	}
-	if source.kind != "text" && source.kind != "transformed-text" {
+	if source.kind != "text" && source.kind != "transformed-text" && source.kind != "toolset-path-literal" {
 		return "", fmt.Errorf("Make function %q cannot transform Linux %s probe value", function, source.kind)
 	}
 	probeArguments := slices.Clone(arguments)
@@ -1687,7 +1905,8 @@ func (e *LinuxProbeEvaluator) readText(reference ProbeReference, request ProbeRe
 				reference.NodeID, request.Outcome.Step, step.ExitCode,
 			)
 		}
-		if request.Steps[0].StdoutExecrootRelative && (step.Status != "success" || step.ExitCode != 0 || strings.TrimSpace(step.Stderr) != "") {
+		requestStep, pathOutcome := probeRequestStep(request.Steps, request.Outcome.Step)
+		if pathOutcome && requestStep.StdoutExecrootRelative && (step.Status != "success" || step.ExitCode != 0 || strings.TrimSpace(step.Stderr) != "") {
 			return "", fmt.Errorf("Linux path probe result %s process did not succeed cleanly", reference.NodeID)
 		}
 		want = step.Stdout
@@ -1724,9 +1943,40 @@ func (e *LinuxProbeEvaluator) readText(reference ProbeReference, request ProbeRe
 	if strings.ContainsRune(result.Text, 0) {
 		return "", fmt.Errorf("Linux text probe result %s contains NUL", reference.NodeID)
 	}
-	if len(request.Steps) != 0 && request.Steps[0].StdoutExecrootRelative {
+	if requestStep, ok := probeRequestStep(request.Steps, request.Outcome.Step); ok && requestStep.StdoutExecrootRelative {
+		step, exists := probeResultStep(result.Steps, request.Outcome.Step)
+		if !exists {
+			return "", fmt.Errorf("Linux path probe result %s omits outcome step %q", reference.NodeID, request.Outcome.Step)
+		}
 		if err := ValidateProbeExecrootRelativePath(result.Text); err != nil {
 			return "", fmt.Errorf("Linux text probe result %s: %w", reference.NodeID, err)
+		}
+		// ProbeResults retain a canonical execroot-relative spelling so their
+		// identity is independent of the worker which measured them. Replay must
+		// retain the missing root provenance, though: Kbuild runs final commands
+		// below a private writable directory and would otherwise reinterpret an
+		// external/... compiler include directory relative to that directory.
+		// Fallback provenance is explicit. A real declared artifact may have the
+		// same spelling as the compiler's unresolved -print-file-name sentinel.
+		switch step.StdoutPathKind {
+		case ProbeStdoutPathFallback:
+			if requestStep.StdoutFallbackPath == "" || result.Text != requestStep.StdoutFallbackPath {
+				return "", fmt.Errorf("Linux path probe result %s has inconsistent fallback provenance", reference.NodeID)
+			}
+			return result.Text, nil
+		case ProbeStdoutPathToolset:
+			codec, err := e.symbolRegistry.executionRootProvenanceCapabilityCodec()
+			if err != nil {
+				return "", fmt.Errorf("Linux path probe result %s: %w", reference.NodeID, err)
+			}
+			e.symbolRegistry.authorizeToolsetPath(result.Scope, result.Text)
+			marked, err := codec.EncodePath(result.Scope, result.Text)
+			if err != nil {
+				return "", fmt.Errorf("Linux path probe result %s: %w", reference.NodeID, err)
+			}
+			return marked, nil
+		default:
+			return "", fmt.Errorf("Linux path probe result %s omits stdout path provenance", reference.NodeID)
 		}
 	}
 	return result.Text, nil
@@ -1739,6 +1989,15 @@ func probeResultStep(steps []ProbeStepResult, name string) (ProbeStepResult, boo
 		}
 	}
 	return ProbeStepResult{}, false
+}
+
+func probeRequestStep(steps []ProbeStep, name string) (ProbeStep, bool) {
+	for _, step := range steps {
+		if step.Name == name {
+			return step, true
+		}
+	}
+	return ProbeStep{}, false
 }
 
 func (e *LinuxProbeEvaluator) requestText(request ProbeRequest, dependencies ...ProbeReference) (string, error) {
@@ -2989,7 +3248,7 @@ func (e *LinuxProbeEvaluator) symbolicExistingPath(path string) (linuxProbeTruth
 	if len(symbol.request.Steps) == 1 && symbol.request.Steps[0].StdoutFallbackPath != "" {
 		predicate = ProbePredicate{Operator: "all", Operands: []ProbePredicate{
 			{Operator: "not", Operands: []ProbePredicate{{
-				Operator: "result-text-equals", Result: "00000000", Value: symbol.request.Steps[0].StdoutFallbackPath,
+				Operator: "result-path-fallback", Result: "00000000",
 			}}},
 			exists,
 		}}

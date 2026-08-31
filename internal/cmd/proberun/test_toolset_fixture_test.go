@@ -19,6 +19,11 @@ import (
 // their protocol behavior without manufacturing the same manifest repeatedly.
 func runTestProbe(t *testing.T, opts probeOptions) error {
 	t.Helper()
+	return runTestProbeWithToolset(t, opts)
+}
+
+func runTestProbeWithToolset(t *testing.T, opts probeOptions, additionalToolsetFiles ...string) error {
+	t.Helper()
 	workingDirectory, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +41,7 @@ func runTestProbe(t *testing.T, opts probeOptions) error {
 	for _, role := range sortedStringKeys(opts.runtimeTools) {
 		descriptor = append(descriptor, "runtime="+role+"="+absolute(opts.runtimeTools[role]))
 	}
-	for _, filename := range opts.toolsetFiles {
+	for _, filename := range additionalToolsetFiles {
 		descriptor = append(descriptor, "closure="+absolute(filename))
 	}
 	digest := sha256.Sum256([]byte(strings.Join(descriptor, "\n")))
@@ -109,9 +114,9 @@ func runTestProbe(t *testing.T, opts probeOptions) error {
 		opts.runtimeTools[role] = filename
 	}
 
-	closureFiles := make([]string, 0, len(boundByPath)+len(opts.toolsetFiles))
+	closureFiles := make([]string, 0, len(boundByPath)+len(additionalToolsetFiles))
 	closureFiles = append(closureFiles, sortedStringValues(boundByPath)...)
-	for index, filename := range opts.toolsetFiles {
+	for index, filename := range additionalToolsetFiles {
 		bound := bind(fmt.Sprintf("closure-%d", index), filename)
 		found := false
 		for _, existing := range closureFiles {
@@ -141,6 +146,7 @@ func runTestProbe(t *testing.T, opts probeOptions) error {
 		artifactKinds[canonical] = testToolsetArtifactKind(true, info.IsDir())
 	}
 	sort.Strings(closure)
+	artifactRoots, roots, anchors := testToolsetRootBindings(t, workingDirectory, closure, closureFiles)
 	actionValueResolver := &toolsetPathResolver{}
 	for _, filename := range closureFiles {
 		info, err := os.Stat(filename)
@@ -162,6 +168,8 @@ func runTestProbe(t *testing.T, opts probeOptions) error {
 		Tools:         map[string]string{},
 		Closure:       closure,
 		ArtifactKinds: artifactKinds,
+		ArtifactRoots: artifactRoots,
+		Roots:         roots,
 		Environments:  map[string]map[string]string{},
 		MakeVariables: map[string]string{},
 		Requirements:  map[string]map[string]string{},
@@ -201,7 +209,7 @@ func runTestProbe(t *testing.T, opts probeOptions) error {
 		t.Fatal(err)
 	}
 	opts.toolsetManifest = manifestPath
-	opts.toolsetFiles = closureFiles
+	opts.toolsetAnchors = anchors
 	if opts.toolsetMarkers == nil {
 		opts.toolsetMarkers = map[string]string{}
 	}
@@ -250,6 +258,71 @@ func testManifestActionValue(t *testing.T, resolver *toolsetPathResolver, value 
 		t.Fatalf("canonicalize test manifest action value: %v", err)
 	}
 	return canonical
+}
+
+func testToolsetRootBindings(t *testing.T, execroot string, closure, files []string) (map[string]toolaction.KbuildToolsetArtifactRoot, map[string]string, map[string]string) {
+	t.Helper()
+	physicalByCanonical := make(map[string]string, len(files))
+	rootByCanonical := make(map[string]string, len(files))
+	relativeByCanonical := make(map[string]string, len(files))
+	membersByRoot := map[string][]string{}
+	for _, filename := range files {
+		canonical, err := canonicalActionArtifactPath(execroot, filename)
+		if err != nil {
+			t.Fatalf("canonicalize test toolset root anchor %q: %v", filename, err)
+		}
+		if prior := physicalByCanonical[canonical]; prior != "" {
+			t.Fatalf("test toolset root anchor %q repeats canonical artifact %q already bound by %q", filename, canonical, prior)
+		}
+		physical := filepath.Clean(filename)
+		if !filepath.IsAbs(physical) {
+			physical = filepath.Join(execroot, physical)
+		}
+		root := physical
+		for range strings.Split(canonical, "/") {
+			root = filepath.Dir(root)
+		}
+		relative := canonical
+		if filepath.Clean(filepath.Join(root, filepath.FromSlash(relative))) != physical {
+			root = filepath.Dir(physical)
+			relative = filepath.Base(physical)
+		}
+		physicalByCanonical[canonical] = physical
+		rootByCanonical[canonical] = root
+		relativeByCanonical[canonical] = filepath.ToSlash(relative)
+		membersByRoot[root] = append(membersByRoot[root], canonical)
+	}
+	groupsByFirstMember := map[string]string{}
+	for physicalRoot, members := range membersByRoot {
+		sort.Strings(members)
+		groupsByFirstMember[members[0]] = physicalRoot
+	}
+	firstMembers := make([]string, 0, len(groupsByFirstMember))
+	for first := range groupsByFirstMember {
+		firstMembers = append(firstMembers, first)
+	}
+	sort.Strings(firstMembers)
+	artifactRoots := make(map[string]toolaction.KbuildToolsetArtifactRoot, len(closure))
+	roots := make(map[string]string, len(firstMembers))
+	anchors := make(map[string]string, len(firstMembers))
+	for index, first := range firstMembers {
+		physicalRoot := groupsByFirstMember[first]
+		root := fmt.Sprintf("root-%08d", index)
+		roots[root] = first
+		anchors[root] = physicalByCanonical[first]
+		for _, canonical := range membersByRoot[physicalRoot] {
+			artifactRoots[canonical] = toolaction.KbuildToolsetArtifactRoot{
+				Root: root,
+				Path: relativeByCanonical[canonical],
+			}
+		}
+	}
+	for _, canonical := range closure {
+		if rootByCanonical[canonical] == "" {
+			t.Fatalf("test toolset closure artifact %q has no physical binding", canonical)
+		}
+	}
+	return artifactRoots, roots, anchors
 }
 
 func sortedActionContractRoles(values map[string]actionContract) []string {

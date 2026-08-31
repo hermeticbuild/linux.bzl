@@ -15,6 +15,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 const kbuildDeferredContentTokenPrefix = "LINUX_BZL_KBUILD_CONTENT_"
@@ -115,6 +117,14 @@ func registerKbuildDeferredContentQuery(
 	if err != nil {
 		return "", err
 	}
+	canonicalCommandShell, err := toolaction.CanonicalizeExecutionRootProvenanceCapabilityIdentity(commandShell)
+	if err != nil {
+		return "", fmt.Errorf("deferred Kbuild content query command shell: %w", err)
+	}
+	canonicalCommand, err := toolaction.CanonicalizeExecutionRootProvenanceCapabilityIdentity(command)
+	if err != nil {
+		return "", fmt.Errorf("deferred Kbuild content query command: %w", err)
+	}
 	digest := sha256.Sum256([]byte(strings.Join([]string{
 		profile.Name,
 		profile.Path,
@@ -122,8 +132,8 @@ func registerKbuildDeferredContentQuery(
 		transform,
 		fmt.Sprintf("%d", generation),
 		canonicalEnvironment,
-		commandShell,
-		command,
+		canonicalCommandShell,
+		canonicalCommand,
 	}, "\x00")))
 	token := kbuildDeferredContentTokenPrefix + hex.EncodeToString(digest[:])
 	queryProfile := profile
@@ -185,6 +195,10 @@ func canonicalKbuildDeferredContentEnvironment(environment map[string]string) (s
 		value := environment[name]
 		if !validKbuildCommandEnvironmentName(name) || strings.ContainsRune(value, 0) {
 			return "", fmt.Errorf("deferred Kbuild content query has invalid environment variable %q", name)
+		}
+		value, err := toolaction.CanonicalizeExecutionRootProvenanceCapabilityIdentity(value)
+		if err != nil {
+			return "", fmt.Errorf("deferred Kbuild content query environment %q: %w", name, err)
 		}
 		canonical.WriteByte(0)
 		canonical.WriteString(name)

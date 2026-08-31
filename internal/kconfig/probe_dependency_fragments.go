@@ -39,7 +39,7 @@ func IsProbeResultPredicate(predicate ProbePredicate) bool {
 		return true
 	case "not":
 		return len(predicate.Operands) == 1 && IsProbeResultPredicate(predicate.Operands[0])
-	case "result-true", "result-false", "result-text-empty", "result-text-equals", "result-text-contains":
+	case "result-true", "result-false", "result-text-empty", "result-text-equals", "result-text-contains", "result-path-fallback":
 		return true
 	default:
 		return false
@@ -98,9 +98,36 @@ func evaluateProbeResultPredicate(predicate ProbePredicate, inputs map[string]Pr
 		default:
 			return strings.Contains(result.Text, predicate.Value), nil
 		}
+	case "result-path-fallback":
+		result, ok := inputs[predicate.Result]
+		if !ok || result.Kind != "text" {
+			return false, fmt.Errorf("result input %s is not text", predicate.Result)
+		}
+		kind, err := probeResultStdoutPathKind(result)
+		if err != nil {
+			return false, fmt.Errorf("result input %s: %w", predicate.Result, err)
+		}
+		if kind == "" {
+			return false, fmt.Errorf("result input %s has no stdout path provenance", predicate.Result)
+		}
+		return kind == ProbeStdoutPathFallback, nil
 	default:
 		return false, fmt.Errorf("predicate %q is not a pure dependency reduction", predicate.Operator)
 	}
+}
+
+func probeResultStdoutPathKind(result ProbeResult) (string, error) {
+	kind := ""
+	for _, step := range result.Steps {
+		if step.StdoutPathKind == "" {
+			continue
+		}
+		if kind != "" {
+			return "", fmt.Errorf("contains more than one stdout path provenance")
+		}
+		kind = step.StdoutPathKind
+	}
+	return kind, nil
 }
 
 // validate traverses the entire declared projection before selecting any

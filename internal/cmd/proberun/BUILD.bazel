@@ -12,6 +12,7 @@ go_library(
     deps = [
         "//internal/kconfig",
         "//internal/toolaction",
+        "//internal/toolsetpath",
     ],
 )
 
@@ -42,6 +43,7 @@ go_test(
     deps = [
         "//internal/kconfig",
         "//internal/toolaction",
+        "//internal/toolsetpath",
         "@rules_go//go/runfiles",
     ],
 )

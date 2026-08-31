@@ -24,8 +24,8 @@ import (
 
 const (
 	LinuxProbePlanSchema    = "linux-probe-plan-v2"
-	LinuxProbeRequestSchema = "linux-probe-request-v10"
-	LinuxProbeResultSchema  = "linux-probe-result-v1"
+	LinuxProbeRequestSchema = "linux-probe-request-v11"
+	LinuxProbeResultSchema  = "linux-probe-result-v2"
 
 	// Probe candidate policies select the security grammar used for arguments
 	// originating in Kconfig or Kbuild. They describe the invoked interface,
@@ -258,12 +258,18 @@ type ProbeOutcome struct {
 }
 
 type ProbeStepResult struct {
-	Name     string `json:"name"`
-	Status   string `json:"status"` // success, failure, or skipped
-	ExitCode int    `json:"exit_code"`
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
+	Name           string `json:"name"`
+	Status         string `json:"status"` // success, failure, or skipped
+	ExitCode       int    `json:"exit_code"`
+	Stdout         string `json:"stdout"`
+	StdoutPathKind string `json:"stdout_path_kind,omitempty"` // toolset or fallback
+	Stderr         string `json:"stderr"`
 }
+
+const (
+	ProbeStdoutPathToolset  = "toolset"
+	ProbeStdoutPathFallback = "fallback"
+)
 
 type ProbeResult struct {
 	Schema          string            `json:"schema"`
@@ -422,6 +428,7 @@ func (r ProbeRequest) Validate() error {
 		scratch[item.Name], previous = true, item.Name
 	}
 	steps := map[string]int{}
+	stdoutPathStep := ""
 	for index, step := range r.Steps {
 		if err := validatePlanName("probe step", step.Name); err != nil {
 			return err
@@ -439,6 +446,12 @@ func (r ProbeRequest) Validate() error {
 		}
 		if step.DiscardStdout && step.StdoutExecrootRelative {
 			return fmt.Errorf("probe step %q cannot discard and normalize stdout", step.Name)
+		}
+		if step.StdoutExecrootRelative {
+			if stdoutPathStep != "" {
+				return fmt.Errorf("probe steps %q and %q both declare stdout path provenance", stdoutPathStep, step.Name)
+			}
+			stdoutPathStep = step.Name
 		}
 		if step.StdoutFallbackPath != "" {
 			if !step.StdoutExecrootRelative {
@@ -599,6 +612,9 @@ func (r ProbeRequest) Validate() error {
 	}
 	if err := r.Outcome.validate(steps, scratch, sources, sourceRoots, r.InputCount); err != nil {
 		return err
+	}
+	if stdoutPathStep != "" && (r.Outcome.Kind != "text" || r.Outcome.Step != stdoutPathStep || r.Outcome.Stream != "stdout") {
+		return fmt.Errorf("probe step %q stdout path provenance must be the direct text stdout outcome", stdoutPathStep)
 	}
 	return nil
 }
@@ -848,7 +864,7 @@ func validateProbeValueFragments(
 
 func (p ProbePredicate) validate(steps map[string]int, scratch, sources, sourceRoots map[string]bool, inputCount int) error {
 	leaf := p.Operator == "exit-zero" || p.Operator == "stream-contains" || p.Operator == "stream-matches" || p.Operator == "stream-empty" || p.Operator == "stream-trimmed-empty" || p.Operator == "regular-file" || p.Operator == "execroot-exists" || p.Operator == "execroot-regular-file"
-	resultLeaf := p.Operator == "result-true" || p.Operator == "result-false" || p.Operator == "result-text-empty" || p.Operator == "result-text-equals" || p.Operator == "result-text-contains"
+	resultLeaf := p.Operator == "result-true" || p.Operator == "result-false" || p.Operator == "result-text-empty" || p.Operator == "result-text-equals" || p.Operator == "result-text-contains" || p.Operator == "result-path-fallback"
 	if !leaf && !resultLeaf && p.Operator != "all" && p.Operator != "any" && p.Operator != "not" {
 		return fmt.Errorf("unsupported predicate operator %q", p.Operator)
 	}
@@ -876,7 +892,7 @@ func (p ProbePredicate) validate(steps map[string]int, scratch, sources, sourceR
 		if (p.Operator == "result-true" || p.Operator == "result-false") && p.Value != "" {
 			return fmt.Errorf("boolean result predicate has text value")
 		}
-		if p.Operator == "result-text-empty" && p.Value != "" {
+		if (p.Operator == "result-text-empty" || p.Operator == "result-path-fallback") && p.Value != "" {
 			return fmt.Errorf("empty-text result predicate has a value")
 		}
 		if (p.Operator == "result-text-equals" || p.Operator == "result-text-contains") && p.Value == "" {
@@ -1234,6 +1250,7 @@ func (r ProbeResult) Validate() error {
 		return fmt.Errorf("probe result has unsupported kind %q", r.Kind)
 	}
 	seen := map[string]bool{}
+	pathResults := 0
 	for _, step := range r.Steps {
 		if err := validatePlanName("probe result step", step.Name); err != nil {
 			return err
@@ -1248,6 +1265,33 @@ func (r ProbeResult) Validate() error {
 		if step.Status == "success" && step.ExitCode != 0 || step.Status == "failure" && step.ExitCode == 0 || step.Status == "skipped" && (step.ExitCode != -1 || step.Stdout != "" || step.Stderr != "") {
 			return fmt.Errorf("probe result step %q status and process fields disagree", step.Name)
 		}
+		switch step.StdoutPathKind {
+		case "":
+		case ProbeStdoutPathToolset:
+			if step.Status != "success" {
+				return fmt.Errorf("probe result step %q toolset path did not succeed", step.Name)
+			}
+			if err := ValidateProbeExecrootRelativePath(step.Stdout); err != nil {
+				return fmt.Errorf("probe result step %q toolset path: %w", step.Name, err)
+			}
+			pathResults++
+		case ProbeStdoutPathFallback:
+			if step.Status != "success" {
+				return fmt.Errorf("probe result step %q fallback path did not succeed", step.Name)
+			}
+			if err := ValidateProbePathComponent(step.Stdout); err != nil {
+				return fmt.Errorf("probe result step %q fallback path: %w", step.Name, err)
+			}
+			pathResults++
+		default:
+			return fmt.Errorf("probe result step %q has invalid stdout path kind %q", step.Name, step.StdoutPathKind)
+		}
+	}
+	if pathResults > 1 {
+		return errors.New("probe result contains more than one stdout path provenance")
+	}
+	if pathResults != 0 && r.Kind != "text" {
+		return errors.New("non-text probe result contains stdout path provenance")
 	}
 	return nil
 }

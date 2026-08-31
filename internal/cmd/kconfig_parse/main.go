@@ -96,9 +96,10 @@ type linuxCompilerBootstrapResults struct {
 }
 
 type linuxKconfigProbeEvaluation struct {
-	tree   *kconfig.Tree
-	plan   *kconfig.ProbePlan
-	target sourceDerivedLinuxTarget
+	tree                             *kconfig.Tree
+	plan                             *kconfig.ProbePlan
+	target                           sourceDerivedLinuxTarget
+	normalizeToolsetPathCapabilities func(string) (string, error)
 }
 
 type linuxKbuildProbeValue struct {
@@ -129,6 +130,7 @@ type linuxKbuildProbeOptions struct {
 	targetContract       *hostKbuildContract
 	hostContract         *hostKbuildContract
 	rustSourceRoot       string
+	normalizeConfigValue func(string) (string, error)
 }
 
 func newLinuxCompilerBootstrapPlan(targetIdentity, hostIdentity string) (*linuxCompilerBootstrapPlan, error) {
@@ -337,7 +339,12 @@ func evaluateLinuxKconfigProbes(
 			return nil, err
 		}
 	}
-	return &linuxKconfigProbeEvaluation{tree: tree, plan: plan, target: target}, nil
+	return &linuxKconfigProbeEvaluation{
+		tree:                             tree,
+		plan:                             plan,
+		target:                           target,
+		normalizeToolsetPathCapabilities: finalEvaluator.NormalizeOrAuthorizeToolsetPathCapabilities,
+	}, nil
 }
 
 func linuxProbeScriptEnvironment(
@@ -564,6 +571,7 @@ func evaluateLinuxKbuildProbes(
 				opts.targetContract,
 				opts.hostContract,
 				scopes,
+				opts.normalizeConfigValue,
 			)
 			if err != nil {
 				return linuxKbuildProbeValue{}, err
@@ -1577,7 +1585,8 @@ func run() (exitCode int) {
 			kernelVersion:        *kernelVersion, target: selectedTarget,
 			targetFacts: targetCompilerFacts, hostFacts: hostCompilerFacts,
 			targetContract: targetContract, hostContract: hostContract,
-			rustSourceRoot: rustSourceRoot,
+			rustSourceRoot:       rustSourceRoot,
+			normalizeConfigValue: kconfigEvaluation.normalizeToolsetPathCapabilities,
 		}, oracle)
 		if evaluateErr != nil {
 			fmt.Fprintf(os.Stderr, "failed to evaluate Kbuild probes: %v\n", evaluateErr)
@@ -1609,7 +1618,7 @@ func run() (exitCode int) {
 			autoconf:      *resolvedAutoconfOut,
 			rustcCfg:      *resolvedRustcCfgOut,
 			kernelRelease: *resolvedReleaseOut,
-		}, *kernelVersion); err != nil {
+		}, *kernelVersion, kconfigEvaluation.normalizeToolsetPathCapabilities); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to write resolved config: %v\n", err)
 			return 1
 		}
@@ -1641,7 +1650,15 @@ func writeResolvedArchitecture(path, arch string) error {
 	return os.WriteFile(workspacePath(path), []byte(arch+"\n"), 0o644)
 }
 
-func writeResolvedConfig(tree *kconfig.Tree, input string, overlays []string, configMode string, outputs resolvedConfigOutputs, kernelVersion string) error {
+func writeResolvedConfig(
+	tree *kconfig.Tree,
+	input string,
+	overlays []string,
+	configMode string,
+	outputs resolvedConfigOutputs,
+	kernelVersion string,
+	normalizeConfigValue func(string) (string, error),
+) error {
 	if input == "" {
 		return fmt.Errorf("-resolve_config is required when resolved config outputs are requested")
 	}
@@ -1690,7 +1707,80 @@ func writeResolvedConfig(tree *kconfig.Tree, input string, overlays []string, co
 	if err != nil {
 		return err
 	}
+	if err := normalizeResolvedConfigValues(resolved, normalizeConfigValue); err != nil {
+		return err
+	}
 	return writeResolvedConfigOutputs(tree, resolved, outputs, kernelVersion)
+}
+
+// normalizeResolvedConfigValues verifies workload-local compiler-path
+// capabilities and replaces them with the deterministic runtime provenance
+// representation before Kconfig values cross into generated files, Kbuild,
+// or stable compact metadata. The resolver result is private to this call, so
+// replacing its maps cannot mutate the parsed source tree or caller input.
+// Generated config artifacts retain that deterministic provenance token, not
+// a worker-local physical pathname. The typed Kconfig-to-Kbuild import below
+// reauthorizes it for planning and recipe lowering; embedding or executing a
+// path-valued CONFIG string as a physical runtime path is intentionally not
+// supported until those generated contents have their own runtime projection.
+func normalizeResolvedConfigValues(
+	resolved *kconfig.ResolvedConfig,
+	normalize func(string) (string, error),
+) error {
+	if resolved == nil || normalize == nil {
+		return nil
+	}
+	normalizeMap := func(kind string, values map[string]string) (map[string]string, error) {
+		if values == nil {
+			return nil, nil
+		}
+		out := maps.Clone(values)
+		keys := make([]string, 0, len(values))
+		for key := range values {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			value := values[key]
+			quoteNormalized := false
+			if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+				body := value[1 : len(value)-1]
+				if strings.ContainsAny(body, "\x07\x08") {
+					// Reserved provenance bytes are never ordinary Kconfig string
+					// data. Strip only the outer quotes so the capability parser
+					// can validate them without treating the closing quote as a
+					// path suffix.
+					value = body
+					quoteNormalized = true
+				} else if unquoted, decodeErr := strconv.Unquote(value); decodeErr == nil && strings.Contains(unquoted, toolaction.ExecutionRootProvenanceMarker) {
+					// configScalarValue uses strconv.Quote, which renders the two
+					// reserved delimiters as \a and \b. Decode that generated
+					// representation only when it actually contains provenance.
+					// All ordinary quoted values—including Linux-accepted escape
+					// spellings which are not Go literals—remain byte-for-byte
+					// untouched below.
+					value = unquoted
+					quoteNormalized = true
+				}
+			}
+			value, err := normalize(value)
+			if err != nil {
+				return nil, fmt.Errorf("normalize %s Kconfig value %s: %w", kind, key, err)
+			}
+			if quoteNormalized {
+				value = strconv.Quote(value)
+			}
+			out[key] = value
+		}
+		return out, nil
+	}
+	var err error
+	resolved.Raw, err = normalizeMap("raw", resolved.Raw)
+	if err != nil {
+		return err
+	}
+	resolved.Effective, err = normalizeMap("effective", resolved.Effective)
+	return err
 }
 
 func validateKernelVersion(value string, required bool) error {
@@ -1774,7 +1864,11 @@ func kbuildConfigValue(tree *kconfig.Tree, key, value string) string {
 	return value
 }
 
-func writeResolvedConfigOutputs(tree *kconfig.Tree, resolved *kconfig.ResolvedConfig, outputs resolvedConfigOutputs, kernelVersion string) error {
+func resolvedConfigObjectTreeContents(
+	tree *kconfig.Tree,
+	resolved *kconfig.ResolvedConfig,
+	kernelVersion string,
+) map[string]string {
 	keys := make([]string, 0, len(resolved.Effective))
 	for key := range resolved.Effective {
 		keys = append(keys, key)
@@ -1811,13 +1905,25 @@ func writeResolvedConfigOutputs(tree *kconfig.Tree, resolved *kconfig.ResolvedCo
 	headerLines = append(headerLines, "#endif")
 
 	localVersion := strings.Trim(resolved.Effective["CONFIG_LOCALVERSION"], `"`)
+	return map[string]string{
+		".config":                       strings.Join(configLines, "\n") + "\n",
+		"include/config/auto.conf":      strings.Join(autoConfLines, "\n") + "\n",
+		"include/config/auto.conf.cmd":  "cmd_include/config/auto.conf := bazel kconfig_parse -resolve_config\n",
+		"include/config/kernel.release": kernelVersion + localVersion + "\n",
+		"include/generated/autoconf.h":  strings.Join(headerLines, "\n") + "\n",
+		"include/generated/rustc_cfg":   strings.Join(rustcCfgLines(tree, resolved), "\n") + "\n",
+	}
+}
+
+func writeResolvedConfigOutputs(tree *kconfig.Tree, resolved *kconfig.ResolvedConfig, outputs resolvedConfigOutputs, kernelVersion string) error {
+	contents := resolvedConfigObjectTreeContents(tree, resolved, kernelVersion)
 	files := map[string]string{
-		outputs.config:        strings.Join(configLines, "\n") + "\n",
-		outputs.autoConf:      strings.Join(autoConfLines, "\n") + "\n",
-		outputs.autoConfCmd:   "cmd_" + filepath.ToSlash(outputs.autoConf) + " := bazel kconfig_parse -resolve_config\n",
-		outputs.autoconf:      strings.Join(headerLines, "\n") + "\n",
-		outputs.rustcCfg:      strings.Join(rustcCfgLines(tree, resolved), "\n") + "\n",
-		outputs.kernelRelease: kernelVersion + localVersion + "\n",
+		outputs.config:        contents[".config"],
+		outputs.autoConf:      contents["include/config/auto.conf"],
+		outputs.autoConfCmd:   contents["include/config/auto.conf.cmd"],
+		outputs.autoconf:      contents["include/generated/autoconf.h"],
+		outputs.rustcCfg:      contents["include/generated/rustc_cfg"],
+		outputs.kernelRelease: contents["include/config/kernel.release"],
 	}
 	for path, content := range files {
 		if err := os.WriteFile(workspacePath(path), []byte(content), 0o644); err != nil {
@@ -1859,6 +1965,7 @@ func compactMetadata(
 	targetContract *hostKbuildContract,
 	hostContract *hostKbuildContract,
 	probeScopes *kconfig.KbuildProbeScopes,
+	normalizeConfigValue func(string) (string, error),
 ) (*kconfig.CompactMetadata, error) {
 	if probeScopes == nil {
 		return nil, fmt.Errorf("action-plan generation requires symbolic Kbuild probes")
@@ -1962,7 +2069,12 @@ func compactMetadata(
 	if err != nil {
 		return nil, err
 	}
-	return tree.CompactMetadataWithOptions(flags, resolveOpts, opts, func(resolved *kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
+	metadata, err := tree.CompactMetadataWithOptions(flags, resolveOpts, opts, func(resolved *kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
+		if err := normalizeResolvedConfigValues(resolved, func(value string) (string, error) {
+			return probeScopes.ImportToolsetPathCapabilities(value, normalizeConfigValue)
+		}); err != nil {
+			return kconfig.CompactConfigGraph{}, err
+		}
 		kbuildVars, err := kbuildVariablesForConfig(vars, tree, resolved)
 		if err != nil {
 			return kconfig.CompactConfigGraph{}, err
@@ -2005,6 +2117,7 @@ func compactMetadata(
 		profiles, selections, imageTarget, parseErr := evaluatedKbuildProfilesWithGeneratedContent(
 			rootDir, objectRoot, entryTargets, preparationTargets, kbuildVars, kbuildOpts, bindProbeEnvironment,
 			linuxKbuildGeneratedContentResolver(probeScopes),
+			resolvedConfigObjectTreeContents(tree, resolved, kernelVersion),
 		)
 		if parseErr != nil {
 			return kconfig.CompactConfigGraph{}, parseErr
@@ -2020,6 +2133,13 @@ func compactMetadata(
 			ImageTarget:                     imageTarget,
 		}, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	if err := probeScopes.BindActionPlanToolsetPathCapabilities(metadata); err != nil {
+		return nil, fmt.Errorf("bind Kbuild toolset-path capabilities: %w", err)
+	}
+	return metadata, nil
 }
 
 // evaluatedKbuildProfilesWithOptions snapshots terminal Make invocations from roots
@@ -2037,7 +2157,7 @@ func evaluatedKbuildProfilesWithOptions(
 	bindProbeEnvironment func(map[string]string) (func() error, error),
 ) ([]kconfig.CompactKbuildProfile, []kconfig.CompactKbuildSelection, string, error) {
 	return evaluatedKbuildProfilesWithGeneratedContent(
-		rootDir, objectRoot, entryTargets, nil, variables, baseOptions, bindProbeEnvironment, nil,
+		rootDir, objectRoot, entryTargets, nil, variables, baseOptions, bindProbeEnvironment, nil, nil,
 	)
 }
 
@@ -2050,6 +2170,7 @@ func evaluatedKbuildProfilesWithGeneratedContent(
 	baseOptions kconfig.KbuildOptions,
 	bindProbeEnvironment func(map[string]string) (func() error, error),
 	generatedContent kbuildGeneratedContentResolver,
+	immutableContents map[string]string,
 ) ([]kconfig.CompactKbuildProfile, []kconfig.CompactKbuildSelection, string, error) {
 	if rootDir == "" {
 		return nil, nil, "", nil
@@ -2057,6 +2178,7 @@ func evaluatedKbuildProfilesWithGeneratedContent(
 	rootDir = filepath.Clean(rootDir)
 	profiles, selections, imageTarget, err := evaluatedKbuildInvocationProfiles(
 		rootDir, objectRoot, entryTargets, preparationTargets, variables, baseOptions, bindProbeEnvironment, generatedContent,
+		immutableContents,
 	)
 	if err != nil {
 		return nil, nil, "", err
@@ -2084,6 +2206,7 @@ func evaluatedKbuildInvocationProfiles(
 	baseOptions kconfig.KbuildOptions,
 	bindProbeEnvironment func(map[string]string) (func() error, error),
 	generatedContent kbuildGeneratedContentResolver,
+	immutableContents map[string]string,
 ) ([]kconfig.CompactKbuildProfile, []kconfig.CompactKbuildSelection, string, error) {
 	if err := validateConfiguredKbuildInputs(variables, nil, entryTargets, preparationTargets); err != nil {
 		return nil, nil, "", fmt.Errorf("configure Kbuild root invocation: %w", err)
@@ -2104,6 +2227,7 @@ func evaluatedKbuildInvocationProfiles(
 		return nil, nil, "", fmt.Errorf("index Kbuild source inputs: %w", err)
 	}
 	sourceOverlayDirectories := kbuildFrontierSourceOverlayDirectories(baseOptions.SourceRoots)
+	immutableContents = maps.Clone(immutableContents)
 	satisfied := kbuildSatisfiedTargets(sourceIndex)
 	dispatchCommandLine := cloneKbuildVariables(baseOptions.CommandLineVariables)
 	dispatchAutoExport := map[string]bool{}
@@ -2226,6 +2350,7 @@ func evaluatedKbuildInvocationProfiles(
 		options.VirtualFileView = kbuildFrontierVirtualFileView{
 			state: initialFrontier, directory: processLocation.Directory,
 			sourceOverlayDirectories: sourceOverlayDirectories,
+			immutableContents:        immutableContents,
 		}
 		options.CommandLineVariables = make(map[string]string, len(request.variables))
 		for name := range request.variables {
@@ -4380,7 +4505,11 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 			GeneratedContentKnown:     evaluation.generatedContentRecognized,
 			EvaluatedCommandTextCount: evaluation.evaluatedCommandTexts,
 		}
-		data, err := json.Marshal(payload)
+		// The selected action contract still carries authenticated toolset-path
+		// capabilities so its eventual recipe can verify them.  Its structural
+		// identity must not carry the workload-local MAC, including capabilities
+		// nested in command text, exported variables, or generated content.
+		data, err := marshalCanonicalKbuildToolsetPathCapabilityIdentity(payload)
 		if err != nil {
 			return "", false, fmt.Errorf("encode selected producer plan identity: %w", err)
 		}
@@ -5163,7 +5292,7 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 				return kbuildGeneratedIncludeProjection{}, false, nil
 			}
 			if !producerEvaluation.literalProjectionAmbiguous && producerEvaluation.literalProjectionSet {
-				digest := sha256.Sum256([]byte(producerEvaluation.literalProjection))
+				digest := kbuildGeneratedIncludeContentIdentityDigest(producerEvaluation.literalProjection)
 				return kbuildGeneratedIncludeProjection{
 					cacheKey: fmt.Sprintf("%d:%s:%x", producer.profile, producer.target, digest),
 					contents: producerEvaluation.literalProjection,
@@ -5172,7 +5301,7 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 			}
 			if producerEvaluation.generatedContentRecognized && producerEvaluation.evaluatedCommandTexts == 1 {
 				if producerEvaluation.generatedContentSet {
-					digest := sha256.Sum256([]byte(producerEvaluation.generatedContent))
+					digest := kbuildGeneratedIncludeContentIdentityDigest(producerEvaluation.generatedContent)
 					return kbuildGeneratedIncludeProjection{
 						cacheKey: fmt.Sprintf("generated-content:%d:%s:%x", producer.profile, producer.target, digest),
 						contents: producerEvaluation.generatedContent,
@@ -6906,11 +7035,15 @@ func kbuildRecursiveMakeFrontierID(frontier *kbuildRecursiveMakeFrontier) string
 
 func kbuildRecursiveMakeFrontierEventIdentity(event kbuildRecursiveMakeFrontierEvent) string {
 	if event.invocation != "" {
-		return "invocation\x1f" + event.invocation
+		return "invocation\x1f" + canonicalKbuildToolsetPathCapabilityIdentity(event.invocation)
 	}
 	return strings.Join([]string{
-		"artifact", event.artifact.Path, event.artifact.Profile, event.artifact.Target,
-		event.commandTarget, event.command,
+		"artifact",
+		canonicalKbuildToolsetPathCapabilityIdentity(event.artifact.Path),
+		canonicalKbuildToolsetPathCapabilityIdentity(event.artifact.Profile),
+		canonicalKbuildToolsetPathCapabilityIdentity(event.artifact.Target),
+		canonicalKbuildToolsetPathCapabilityIdentity(event.commandTarget),
+		canonicalKbuildToolsetPathCapabilityIdentity(event.command),
 	}, "\x1f")
 }
 
@@ -8963,6 +9096,14 @@ type kbuildGeneratedIncludeProjection struct {
 	literal  bool
 }
 
+// kbuildGeneratedIncludeContentIdentityDigest keys the parsed include cache by
+// stable source-derived bytes.  The cached contents themselves retain their
+// authenticated capabilities; only the key drops the workload-local MAC so an
+// otherwise identical replay graph has the same identity under a fresh codec.
+func kbuildGeneratedIncludeContentIdentityDigest(contents string) [sha256.Size]byte {
+	return sha256.Sum256([]byte(canonicalKbuildToolsetPathCapabilityIdentity(contents)))
+}
+
 type kbuildGeneratedIncludeSource func(string) (kbuildGeneratedIncludeProjection, bool, error)
 
 type kbuildIncludeResolution struct {
@@ -9408,7 +9549,7 @@ func forEachCanonicalKbuildInvocationRequestKeyPart(
 	}
 	sort.Strings(environmentNames)
 	for _, name := range environmentNames {
-		visit("environment:" + name + "=" + request.environment[name])
+		visit("environment:" + name + "=" + canonicalKbuildToolsetPathCapabilityIdentity(request.environment[name]))
 	}
 	names := make([]string, 0, len(request.variables))
 	for name := range request.variables {
@@ -9416,11 +9557,59 @@ func forEachCanonicalKbuildInvocationRequestKeyPart(
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		visit("command-line:" + name + "=" + request.variables[name])
+		visit("command-line:" + name + "=" + canonicalKbuildToolsetPathCapabilityIdentity(request.variables[name]))
 		if request.commandLineAutoExport[name] {
 			visit("command-line-export:" + name)
 		}
 	}
+}
+
+// canonicalKbuildToolsetPathCapabilityIdentity removes only the ephemeral MAC
+// from well-formed planning capabilities before an intermediate stable hash is
+// computed. Keyed verification remains mandatory when the value enters an
+// action recipe; malformed values are left unchanged so they cannot be made
+// valid by an identity-only projection.
+func canonicalKbuildToolsetPathCapabilityIdentity(value string) string {
+	canonical, err := toolaction.CanonicalizeExecutionRootProvenanceCapabilityIdentity(value)
+	if err != nil {
+		return value
+	}
+	return canonical
+}
+
+// marshalCanonicalKbuildToolsetPathCapabilityIdentity recursively projects
+// every JSON string value onto its stable capability identity.  Marshaling
+// through an independent value keeps the authenticated planning data owned by
+// the caller byte-for-byte intact for the later keyed recipe boundary.  UseNumber
+// also preserves integer identities which exceed the exact float64 range.
+func marshalCanonicalKbuildToolsetPathCapabilityIdentity(value any) ([]byte, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var identity any
+	if err := decoder.Decode(&identity); err != nil {
+		return nil, err
+	}
+	var canonicalize func(any) any
+	canonicalize = func(value any) any {
+		switch value := value.(type) {
+		case string:
+			return canonicalKbuildToolsetPathCapabilityIdentity(value)
+		case []any:
+			for index := range value {
+				value[index] = canonicalize(value[index])
+			}
+		case map[string]any:
+			for name, field := range value {
+				value[name] = canonicalize(field)
+			}
+		}
+		return value
+	}
+	return json.Marshal(canonicalize(identity))
 }
 
 func canonicalKbuildInvocationRequestsEqual(left, right kbuildInvocationRequest) bool {
@@ -9436,6 +9625,9 @@ func canonicalKbuildInvocationRequestsEqual(left, right kbuildInvocationRequest)
 		return false
 	}
 	if kbuildFrontierDigest(left.visibleState) != kbuildFrontierDigest(right.visibleState) {
+		return false
+	}
+	if kbuildFrontierRawDigest(left.visibleState) != kbuildFrontierRawDigest(right.visibleState) {
 		return false
 	}
 	for name := range left.variables {

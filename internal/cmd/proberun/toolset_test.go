@@ -4,74 +4,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
-
-func TestExpandProbeParameterFiles(t *testing.T) {
-	dir := t.TempDir()
-	first := filepath.Join(dir, "first.params")
-	writeToolsetTestFile(t, first, "--scope\ntarget value\n", 0o600)
-	second := filepath.Join(dir, "second.params")
-	writeToolsetTestFile(t, second, " --preserved exactly \n--last=value\n", 0o600)
-	empty := filepath.Join(dir, "empty.params")
-	writeToolsetTestFile(t, empty, "", 0o600)
-
-	got, err := expandProbeParameterFiles([]string{
-		"literal",
-		"@" + first,
-		"middle",
-		"@" + empty,
-		"@" + second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{
-		"literal",
-		"--scope",
-		"target value",
-		"middle",
-		" --preserved exactly ",
-		"--last=value",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("expandProbeParameterFiles() = %#v, want %#v", got, want)
-	}
-}
-
-func TestExpandProbeParameterFilesRejectsUnsafeInput(t *testing.T) {
-	dir := t.TempDir()
-	blank := filepath.Join(dir, "blank.params")
-	writeToolsetTestFile(t, blank, "first\n\nlast\n", 0o600)
-	nested := filepath.Join(dir, "nested.params")
-	writeToolsetTestFile(t, nested, "@other.params\n", 0o600)
-	carriageReturn := filepath.Join(dir, "cr.params")
-	writeToolsetTestFile(t, carriageReturn, "first\r\n", 0o600)
-
-	tests := []struct {
-		name      string
-		arguments []string
-		wantError string
-	}{
-		{name: "empty filename", arguments: []string{"@"}, wantError: "empty probe parameter-file path"},
-		{name: "missing file", arguments: []string{"@" + filepath.Join(dir, "missing.params")}, wantError: "open probe parameter file"},
-		{name: "empty argument", arguments: []string{"@" + blank}, wantError: "empty, nested, or CR-bearing"},
-		{name: "nested parameter file", arguments: []string{"@" + nested}, wantError: "empty, nested, or CR-bearing"},
-		{name: "carriage return", arguments: []string{"@" + carriageReturn}, wantError: "empty, nested, or CR-bearing"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got, err := expandProbeParameterFiles(test.arguments)
-			if err == nil || !strings.Contains(err.Error(), test.wantError) {
-				t.Fatalf("expandProbeParameterFiles(%q) = %#v, %v; want error containing %q", test.arguments, got, err, test.wantError)
-			}
-		})
-	}
-}
 
 func TestCanonicalActionArtifactPathMapsBazelSpellings(t *testing.T) {
 	root := t.TempDir()
@@ -142,7 +79,7 @@ func TestLoadToolsetPathResolverBindsExactManifestMarkerAndClosure(t *testing.T)
 		fixture.manifest.Scope,
 		fixture.identity,
 		fixture.manifestFilename,
-		fixture.files,
+		fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -166,7 +103,7 @@ func TestToolsetPathResolverResolvesTypedTreesAndAncestorDirectories(t *testing.
 		"target",
 		fixture.identity,
 		fixture.manifestFilename,
-		fixture.files,
+		fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -220,7 +157,7 @@ func TestToolsetPathResolverResolvesTypedTreesAndAncestorDirectories(t *testing.
 func TestLoadToolsetPathResolverRejectsUnboundInputs(t *testing.T) {
 	t.Run("missing manifest argument", func(t *testing.T) {
 		fixture := newToolsetResolverFixture(t)
-		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, "", fixture.files)
+		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, "", fixture.anchors)
 		if err == nil || !strings.Contains(err.Error(), "has no target toolset manifest") {
 			t.Fatalf("loadToolsetPathResolver() error = %v", err)
 		}
@@ -228,7 +165,7 @@ func TestLoadToolsetPathResolverRejectsUnboundInputs(t *testing.T) {
 
 	t.Run("missing manifest file", func(t *testing.T) {
 		fixture := newToolsetResolverFixture(t)
-		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, filepath.Join(fixture.root, "missing.json"), fixture.files)
+		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, filepath.Join(fixture.root, "missing.json"), fixture.anchors)
 		if err == nil || !strings.Contains(err.Error(), "read toolset manifest") {
 			t.Fatalf("loadToolsetPathResolver() error = %v", err)
 		}
@@ -237,7 +174,7 @@ func TestLoadToolsetPathResolverRejectsUnboundInputs(t *testing.T) {
 	t.Run("wrong marker", func(t *testing.T) {
 		fixture := newToolsetResolverFixture(t)
 		wrongIdentity := "sha256-" + strings.Repeat("0", 64)
-		_, err := loadToolsetPathResolver(fixture.execroot, "target", wrongIdentity, fixture.manifestFilename, fixture.files)
+		_, err := loadToolsetPathResolver(fixture.execroot, "target", wrongIdentity, fixture.manifestFilename, fixture.anchors)
 		if err == nil || !strings.Contains(err.Error(), "want marker") {
 			t.Fatalf("loadToolsetPathResolver() error = %v", err)
 		}
@@ -248,7 +185,7 @@ func TestLoadToolsetPathResolverRejectsUnboundInputs(t *testing.T) {
 		originalIdentity := fixture.identity
 		fixture.manifest.Actions["cc"] = []string{"tampered", toolaction.KbuildArgumentsSentinel}
 		writeToolsetTestManifest(t, fixture.manifestFilename, fixture.manifest)
-		_, err := loadToolsetPathResolver(fixture.execroot, "target", originalIdentity, fixture.manifestFilename, fixture.files)
+		_, err := loadToolsetPathResolver(fixture.execroot, "target", originalIdentity, fixture.manifestFilename, fixture.anchors)
 		if err == nil || !strings.Contains(err.Error(), "want marker") {
 			t.Fatalf("loadToolsetPathResolver() error = %v", err)
 		}
@@ -258,16 +195,21 @@ func TestLoadToolsetPathResolverRejectsUnboundInputs(t *testing.T) {
 		fixture := newToolsetResolverFixture(t)
 		fixture.manifest.Scope = "host"
 		identity := writeToolsetTestManifest(t, fixture.manifestFilename, fixture.manifest)
-		_, err := loadToolsetPathResolver(fixture.execroot, "target", identity, fixture.manifestFilename, fixture.files)
+		_, err := loadToolsetPathResolver(fixture.execroot, "target", identity, fixture.manifestFilename, fixture.anchors)
 		if err == nil || !strings.Contains(err.Error(), `has scope "host"`) {
 			t.Fatalf("loadToolsetPathResolver() error = %v", err)
 		}
 	})
 
-	t.Run("closure cardinality mismatch", func(t *testing.T) {
+	t.Run("missing root anchor", func(t *testing.T) {
 		fixture := newToolsetResolverFixture(t)
-		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files[:len(fixture.files)-1])
-		if err == nil || !strings.Contains(err.Error(), "typed artifacts") {
+		anchors := cloneMap(fixture.anchors)
+		for root := range anchors {
+			delete(anchors, root)
+			break
+		}
+		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, fixture.manifestFilename, anchors)
+		if err == nil || !strings.Contains(err.Error(), "root anchors omit manifest root") {
 			t.Fatalf("loadToolsetPathResolver() error = %v", err)
 		}
 	})
@@ -277,25 +219,23 @@ func TestLoadToolsetPathResolverRejectsUnboundInputs(t *testing.T) {
 		if err := os.Remove(fixture.header); err != nil {
 			t.Fatal(err)
 		}
-		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files)
+		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors)
 		if err == nil || !strings.Contains(err.Error(), "inspect target toolset artifact") {
 			t.Fatalf("loadToolsetPathResolver() error = %v", err)
 		}
 	})
 
-	t.Run("closure path mismatch", func(t *testing.T) {
+	t.Run("root anchor path mismatch", func(t *testing.T) {
 		fixture := newToolsetResolverFixture(t)
 		unexpected := filepath.Join(filepath.Dir(filepath.Dir(fixture.tool)), "other", "unexpected")
 		writeToolsetTestFile(t, unexpected, "unexpected", 0o600)
-		files := append([]string(nil), fixture.files...)
-		for index, filename := range files {
-			if filename == fixture.header {
-				files[index] = unexpected
-				break
-			}
+		anchors := cloneMap(fixture.anchors)
+		for root := range anchors {
+			anchors[root] = unexpected
+			break
 		}
-		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, fixture.manifestFilename, files)
-		if err == nil || !strings.Contains(err.Error(), "omits manifest artifact") {
+		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, fixture.manifestFilename, anchors)
+		if err == nil || !strings.Contains(err.Error(), "anchor maps to canonical artifact") {
 			t.Fatalf("loadToolsetPathResolver() error = %v", err)
 		}
 	})
@@ -304,34 +244,18 @@ func TestLoadToolsetPathResolverRejectsUnboundInputs(t *testing.T) {
 		fixture := newToolsetResolverFixture(t)
 		fixture.manifest.ArtifactKinds["external/toolchain/include/a.h"] = toolaction.KbuildToolsetArtifactGeneratedDirectory
 		identity := writeToolsetTestManifest(t, fixture.manifestFilename, fixture.manifest)
-		_, err := loadToolsetPathResolver(fixture.execroot, "target", identity, fixture.manifestFilename, fixture.files)
+		_, err := loadToolsetPathResolver(fixture.execroot, "target", identity, fixture.manifestFilename, fixture.anchors)
 		if err == nil || !strings.Contains(err.Error(), "manifest binds kind") {
 			t.Fatalf("loadToolsetPathResolver(artifact kind mismatch) error = %v", err)
 		}
 	})
 
-	t.Run("repeated canonical artifact", func(t *testing.T) {
+	t.Run("unknown root anchor", func(t *testing.T) {
 		fixture := newToolsetResolverFixture(t)
-		alternateTool := filepath.Join(
-			fixture.execroot,
-			"bazel-out",
-			"alternate-opt",
-			"bin",
-			"external",
-			"toolchain",
-			"bin",
-			"cc",
-		)
-		writeToolsetTestFile(t, alternateTool, "alternate", 0o700)
-		files := append([]string(nil), fixture.files...)
-		for index, filename := range files {
-			if filename == fixture.header {
-				files[index] = alternateTool
-				break
-			}
-		}
-		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, fixture.manifestFilename, files)
-		if err == nil || !strings.Contains(err.Error(), "repeats canonical artifact") {
+		anchors := cloneMap(fixture.anchors)
+		anchors["root-unknown"] = fixture.tool
+		_, err := loadToolsetPathResolver(fixture.execroot, "target", fixture.identity, fixture.manifestFilename, anchors)
+		if err == nil || !strings.Contains(err.Error(), "root anchors contain unknown root") {
 			t.Fatalf("loadToolsetPathResolver() error = %v", err)
 		}
 	})
@@ -344,7 +268,7 @@ func TestToolsetPathResolverRejectsToolBindingMismatch(t *testing.T) {
 		"target",
 		fixture.identity,
 		fixture.manifestFilename,
-		fixture.files,
+		fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -383,7 +307,7 @@ func TestToolsetPathResolverVerifiesIdentityBoundActionContract(t *testing.T) {
 	}
 	fixture.identity = writeToolsetTestManifest(t, fixture.manifestFilename, fixture.manifest)
 	resolver, err := loadToolsetPathResolver(
-		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files,
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -417,7 +341,7 @@ func TestToolsetPathResolverVerifiesIdentityBoundActionContract(t *testing.T) {
 func TestToolsetPathResolverCanonicalizesOnlyRenderedPathOccurrences(t *testing.T) {
 	fixture := newToolsetResolverFixture(t)
 	resolver, err := loadToolsetPathResolver(
-		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files,
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -461,9 +385,12 @@ func TestToolsetPathResolverProjectsInconsistentPhysicalAncestors(t *testing.T) 
 		"external/toolchain/bin/cc",
 		"external/toolchain/include/header.h",
 	})
+	artifactRoots, roots, anchors := testToolsetRootBindings(t, execroot, manifest.Closure, []string{tool, header})
+	manifest.ArtifactRoots = artifactRoots
+	manifest.Roots = roots
 	manifestFilename := filepath.Join(root, "manifest.json")
 	identity := writeToolsetTestManifest(t, manifestFilename, manifest)
-	resolver, err := loadToolsetPathResolver(execroot, "target", identity, manifestFilename, []string{tool, header})
+	resolver, err := loadToolsetPathResolver(execroot, "target", identity, manifestFilename, anchors)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +426,7 @@ func TestToolsetPathResolverProjectsInconsistentPhysicalAncestors(t *testing.T) 
 		t.Fatalf("nested projection header = %q, %v; want %q", got, err, header)
 	}
 
-	reverse, err := loadToolsetPathResolver(execroot, "target", identity, manifestFilename, []string{tool, header})
+	reverse, err := loadToolsetPathResolver(execroot, "target", identity, manifestFilename, anchors)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +455,7 @@ func TestToolsetPathResolverRejectsTypedDirectorySymlinkEscape(t *testing.T) {
 		"target",
 		fixture.identity,
 		fixture.manifestFilename,
-		fixture.files,
+		fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -545,6 +472,7 @@ type toolsetResolverFixture struct {
 	manifest         toolaction.KbuildToolsetManifest
 	identity         string
 	files            []string
+	anchors          map[string]string
 	tool             string
 	header           string
 	nestedHeader     string
@@ -580,9 +508,13 @@ func newToolsetResolverFixture(t *testing.T) toolsetResolverFixture {
 		"external/toolchain/include/nested/b.h",
 		"external/toolchain/sysroot",
 	})
-	fixture.identity = writeToolsetTestManifest(t, fixture.manifestFilename, fixture.manifest)
 	// Deliberately use a different order from the canonical manifest closure.
 	fixture.files = []string{fixture.tree, fixture.nestedHeader, fixture.tool, fixture.include, fixture.header}
+	artifactRoots, roots, anchors := testToolsetRootBindings(t, fixture.execroot, fixture.manifest.Closure, fixture.files)
+	fixture.manifest.ArtifactRoots = artifactRoots
+	fixture.manifest.Roots = roots
+	fixture.anchors = anchors
+	fixture.identity = writeToolsetTestManifest(t, fixture.manifestFilename, fixture.manifest)
 	return fixture
 }
 

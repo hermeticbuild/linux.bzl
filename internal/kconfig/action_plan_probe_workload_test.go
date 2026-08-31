@@ -2,11 +2,14 @@ package kconfig
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 func TestKbuildProbeWorkloadIncludesActionPlanOnlyProbe(t *testing.T) {
@@ -154,6 +157,197 @@ generated.txt: FORCE
 	}
 	if !actionPlanRecipeEnvironmentContains(replay.Value.plan, "ACTION_ONLY", "-faction-only") {
 		t.Fatal("replay action plan omits the resolved ACTION_ONLY=-faction-only export")
+	}
+}
+
+func TestKbuildProbeWorkloadAuthenticatesCompilerPathsAfterMakeTransforms(t *testing.T) {
+	const (
+		target        = "generated.txt"
+		scriptPath    = "scripts/generate.sh"
+		canonicalPath = "external/compiler/vendor-sdk"
+	)
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	probeOptions := KbuildProbeWorkloadOptions{Target: testKbuildProbeScopeOptions(t, fixture)}
+
+	type workloadValue struct{ plan *ActionPlan }
+	evaluate := func(expression string, oracle *ProbeResultOracle) (*KbuildProbeEvaluation[workloadValue], error) {
+		root := t.TempDir()
+		makefile := filepath.Join(root, "Makefile")
+		mustWriteSource(t, root, scriptPath, "#!/bin/sh\n: \"$ACTION_ONLY\"\n: > \"$1\"\n")
+		if err := os.WriteFile(makefile, []byte(fmt.Sprintf(`
+SDK := $(shell $(CC) -print-file-name=vendor-sdk)
+export ACTION_ONLY := %s
+cmd_generate = $(srctree)/scripts/generate.sh $@
+
+generated.txt: FORCE
+	$(cmd_generate)
+`, expression)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return EvaluateKbuildProbeWorkload(probeOptions, oracle, func(scopes *KbuildProbeScopes) (workloadValue, error) {
+			options, err := scopes.Options("target", KbuildOptions{
+				RootDir: root,
+				Variables: map[string]string{
+					"CC":      KbuildActionRoleToken("target", "cc"),
+					"SRCARCH": "x86",
+					"srctree": "__LINUX_BZL_SOURCE_TREE__",
+				},
+				SourceRoots: map[string]string{
+					"__LINUX_BZL_SOURCE_TREE__": root,
+					"__LINUX_BZL_OBJECT_TREE__": root,
+				},
+				ConfigVariablesComplete: true,
+				MakeVariablesComplete:   true,
+				CaptureTargetEvaluator:  true,
+				SkipExportedVariables:   true,
+			})
+			if err != nil {
+				return workloadValue{}, err
+			}
+			parsed, err := ParseKbuildFileTree(makefile, options)
+			if err != nil {
+				return workloadValue{}, err
+			}
+			profile, err := NewCompactKbuildProfile("build:root", makefile, root, parsed)
+			if err != nil {
+				return workloadValue{}, err
+			}
+			profile.EntryTargets = []string{target}
+			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+				Tree: CompactKbuildInvocationObjectTree,
+			}); err != nil {
+				return workloadValue{}, err
+			}
+			actionRoles := append([]KbuildActionRoleRef(nil), testConfiguredScopedActionRoles...)
+			actionRoles = append(actionRoles,
+				KbuildActionRoleRef{Scope: "target", Role: compactKbuildScriptRunnerRole},
+				KbuildActionRoleRef{Scope: "target", Role: compactKbuildScriptRuntimeRole},
+			)
+			metadata := &CompactMetadata{
+				Config: CompactConfig{
+					KbuildProfiles: []CompactKbuildProfile{profile},
+					KbuildSelections: []CompactKbuildSelection{{
+						Profile: profile.Name, Target: target, MakeTarget: target,
+						Lifecycle: "target", Scope: "target", Stage: "target",
+					}},
+				},
+				configFragment:          map[string]string{"CONFIG_MODULES": "n"},
+				actionRoles:             actionRoles,
+				preconfiguredObjectTree: true,
+				selectedProductsOnly:    true,
+			}
+			if err := scopes.BindActionPlanToolsetPathCapabilities(metadata); err != nil {
+				return workloadValue{}, err
+			}
+			if oracle == nil {
+				return workloadValue{}, metadata.DiscoverActionPlanProbes(bootstrapTestIdentity, bootstrapTestIdentity)
+			}
+			plan, err := metadata.ActionPlan(bootstrapTestIdentity, bootstrapTestIdentity)
+			return workloadValue{plan: plan}, err
+		})
+	}
+
+	discovery, err := evaluate("$(addprefix -I,$(SDK))", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovery.Plan.Nodes) != 1 {
+		t.Fatalf("compiler-path discovery has %d nodes, want 1", len(discovery.Plan.Nodes))
+	}
+	results := map[string]ProbeResult{}
+	for _, node := range discovery.Plan.Nodes {
+		request := discovery.Plan.Requests[node.RequestID]
+		if len(request.Steps) != 1 || !reflect.DeepEqual(request.Steps[0].Arguments, []string{"-print-file-name=vendor-sdk"}) {
+			t.Fatalf("compiler-path request = %#v", request)
+		}
+		results[node.ID] = ProbeResult{
+			Schema: LinuxProbeResultSchema, NodeID: node.ID, RequestID: node.RequestID,
+			Scope: node.Scope, ToolsetIdentity: discovery.Plan.Toolsets[node.Scope], Kind: "text", Text: canonicalPath,
+			Steps: []ProbeStepResult{{
+				Name: request.Steps[0].Name, Status: "success", ExitCode: 0,
+				Stdout: canonicalPath, StdoutPathKind: ProbeStdoutPathToolset,
+			}},
+		}
+	}
+	oracle := &ProbeResultOracle{results: results, toolsets: maps.Clone(discovery.Plan.Toolsets)}
+
+	var first *ActionPlan
+	var firstEntries []actionPlanEntry
+	for replayIndex := 0; replayIndex < 2; replayIndex++ {
+		replay, err := evaluate("$(addprefix -I,$(SDK))", oracle)
+		if err != nil {
+			t.Fatalf("benign replay %d: %v", replayIndex, err)
+		}
+		if replay.Value.plan == nil || len(replay.Value.plan.Recipes) == 0 {
+			t.Fatalf("benign replay %d returned no action recipe", replayIndex)
+		}
+		entries, err := replay.Value.plan.entries()
+		if err != nil {
+			t.Fatalf("benign replay %d entries: %v", replayIndex, err)
+		}
+		if first == nil {
+			first = replay.Value.plan
+			firstEntries = entries
+		} else if !reflect.DeepEqual(firstEntries, entries) {
+			t.Fatalf("serialized action plan depends on ephemeral compiler-path capability key\nfirst: %#v\nsecond: %#v", firstEntries, entries)
+		}
+	}
+	wantPath, err := toolaction.EncodeExecutionRootProvenancePath("target", canonicalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !actionPlanRecipeEnvironmentContains(first, "ACTION_ONLY", "-I"+wantPath) {
+		t.Fatal("benign Make prefix did not normalize to the deterministic runtime compiler path")
+	}
+
+	// A capability suffix used to be visible to source-owned Make here. The
+	// inner subst could split its double-underscore framing from the random HMAC
+	// and lastword
+	// would then copy that secret into ACTION_ONLY (and the recipe ID). Each
+	// evaluate call owns an independent random codec; both serialized plans must
+	// nevertheless retain only the same deterministic path core.
+	const capabilitySuffix = "__LINUX_BZL_TOOLSET_PATH_CAPABILITY_V1__"
+	tagExtraction := "$(lastword $(subst __, ,$(SDK)))"
+	var extractedEntries []actionPlanEntry
+	for replayIndex := 0; replayIndex < 2; replayIndex++ {
+		replay, err := evaluate(tagExtraction, oracle)
+		if err != nil {
+			t.Fatalf("capability-tag extraction replay %d: %v", replayIndex, err)
+		}
+		entries, err := replay.Value.plan.entries()
+		if err != nil {
+			t.Fatalf("capability-tag extraction replay %d entries: %v", replayIndex, err)
+		}
+		if replayIndex == 0 {
+			extractedEntries = entries
+		} else if !reflect.DeepEqual(extractedEntries, entries) {
+			t.Fatalf("capability-tag extraction leaked the workload key into the serialized plan\nfirst: %#v\nsecond: %#v", extractedEntries, entries)
+		}
+		if !actionPlanRecipeEnvironmentContains(replay.Value.plan, "ACTION_ONLY", wantPath) {
+			t.Fatalf("capability-tag extraction replay %d did not retain the deterministic compiler path", replayIndex)
+		}
+		for _, recipe := range replay.Value.plan.Recipes {
+			if strings.Contains(recipe.Environment["ACTION_ONLY"], capabilitySuffix) {
+				t.Fatalf("capability-tag extraction replay %d retained a transient capability suffix", replayIndex)
+			}
+		}
+	}
+
+	if _, err := evaluate("$(subst target,host,$(SDK))", oracle); err == nil || !strings.Contains(err.Error(), "authenticated planning capability") {
+		t.Fatalf("scope-mutating Make subst error = %v, want authenticated capability rejection", err)
+	}
+	for _, test := range []struct {
+		name, expression string
+	}{
+		{name: "archive suffix", expression: "$(addsuffix .a,$(SDK))"},
+		{name: "quoted path continuation", expression: `$(SDK)"/../sibling"`},
+		{name: "brace expansion", expression: "$(SDK){,.a}"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := evaluate(test.expression, oracle); err == nil || !strings.Contains(err.Error(), "suffix outside its provenance envelope") {
+				t.Fatalf("suffix-mutating Make expression error = %v, want provenance-boundary rejection", err)
+			}
+		})
 	}
 }
 

@@ -135,10 +135,12 @@ def _probe_map_directory_test_impl(ctx):
         {"cc": "exact-cc", "ld": "exact-ld"},
         "exact-toolchain-closure",
         "exact-toolset-manifest",
+        {"root-00000000": "exact-toolset-anchor"},
     )
     asserts.equals(env, "exact-runner", tools["probe_runner"])
     asserts.equals(env, "exact-toolchain-closure", tools["toolchain_files"])
     asserts.equals(env, "exact-toolset-manifest", tools["toolset_manifest"])
+    asserts.equals(env, "exact-toolset-anchor", tools["toolset_anchor_root-00000000"])
     asserts.equals(env, "exact-cc", tools["probe_role_cc"])
     asserts.equals(env, "exact-ld", tools["probe_role_ld"])
 

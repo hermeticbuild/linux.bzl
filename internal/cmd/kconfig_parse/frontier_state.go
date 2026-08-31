@@ -47,6 +47,13 @@ type kbuildFrontierNode struct {
 	priority    [sha256.Size]byte
 	valueDigest [sha256.Size]byte
 	digest      [sha256.Size]byte
+	// rawValueDigest/rawDigest retain an O(1) collision witness for the
+	// workload-local authenticated bytes. The canonical digest above is stable
+	// across independently keyed replays, but deliberately aliases capability
+	// tags; request reuse must additionally prove that the exact authenticated
+	// frontier is unchanged inside one workload.
+	rawValueDigest [sha256.Size]byte
+	rawDigest      [sha256.Size]byte
 }
 
 // newKbuildFrontierStateFromSorted constructs a canonical state.
@@ -142,6 +149,16 @@ func kbuildFrontierDigest(state kbuildFrontierState) [sha256.Size]byte {
 	return state.root.digest
 }
 
+// kbuildFrontierRawDigest is the O(1) authenticated-content witness paired
+// with kbuildFrontierDigest. It is intentionally workload-local and must not
+// be serialized into a stable profile or action identity.
+func kbuildFrontierRawDigest(state kbuildFrontierState) [sha256.Size]byte {
+	if state.root == nil {
+		return sha256.Sum256([]byte("linux-bzl-kbuild-frontier-raw-empty-v1"))
+	}
+	return state.root.rawDigest
+}
+
 func kbuildFrontierSetNode(node *kbuildFrontierNode, path string, value kbuildFrontierValue) *kbuildFrontierNode {
 	if node == nil {
 		return newKbuildFrontierNode(path, value, nil, nil)
@@ -203,12 +220,13 @@ func newKbuildFrontierNode(
 	left, right *kbuildFrontierNode,
 ) *kbuildFrontierNode {
 	node := &kbuildFrontierNode{
-		path:        path,
-		value:       value,
-		left:        left,
-		right:       right,
-		priority:    sha256.Sum256([]byte("linux-bzl-kbuild-frontier-priority-v1\x00" + path)),
-		valueDigest: kbuildFrontierValueDigest(path, value),
+		path:           path,
+		value:          value,
+		left:           left,
+		right:          right,
+		priority:       sha256.Sum256([]byte("linux-bzl-kbuild-frontier-priority-v1\x00" + path)),
+		valueDigest:    kbuildFrontierValueDigest(path, value),
+		rawValueDigest: kbuildFrontierRawValueDigest(path, value),
 	}
 	kbuildFrontierFinishNode(node)
 	return node
@@ -222,20 +240,44 @@ func rebuildKbuildFrontierNode(
 	left, right *kbuildFrontierNode,
 ) *kbuildFrontierNode {
 	node := &kbuildFrontierNode{
-		path:        source.path,
-		value:       source.value,
-		left:        left,
-		right:       right,
-		priority:    source.priority,
-		valueDigest: source.valueDigest,
+		path:           source.path,
+		value:          source.value,
+		left:           left,
+		right:          right,
+		priority:       source.priority,
+		valueDigest:    source.valueDigest,
+		rawValueDigest: source.rawValueDigest,
 	}
 	kbuildFrontierFinishNode(node)
 	return node
 }
 
 func kbuildFrontierValueDigest(path string, value kbuildFrontierValue) [sha256.Size]byte {
+	return kbuildFrontierValueDigestWithContent(
+		"linux-bzl-kbuild-frontier-value-v1",
+		path,
+		value,
+		canonicalKbuildToolsetPathCapabilityIdentity,
+	)
+}
+
+func kbuildFrontierRawValueDigest(path string, value kbuildFrontierValue) [sha256.Size]byte {
+	return kbuildFrontierValueDigestWithContent(
+		"linux-bzl-kbuild-frontier-raw-value-v1",
+		path,
+		value,
+		func(content string) string { return content },
+	)
+}
+
+func kbuildFrontierValueDigestWithContent(
+	domain string,
+	path string,
+	value kbuildFrontierValue,
+	contentIdentity func(string) string,
+) [sha256.Size]byte {
 	hash := sha256.New()
-	_, _ = hash.Write([]byte("linux-bzl-kbuild-frontier-value-v1"))
+	_, _ = hash.Write([]byte(domain))
 	writeDigestString := func(value string) {
 		var size [8]byte
 		binary.LittleEndian.PutUint64(size[:], uint64(len(value)))
@@ -248,7 +290,7 @@ func kbuildFrontierValueDigest(path string, value kbuildFrontierValue) [sha256.S
 	writeDigestString(value.artifact.Target)
 	if value.exact {
 		_, _ = hash.Write([]byte{1})
-		writeDigestString(value.content)
+		writeDigestString(contentIdentity(value.content))
 	} else {
 		_, _ = hash.Write([]byte{0})
 	}
@@ -271,6 +313,17 @@ func kbuildFrontierFinishNode(node *kbuildFrontierNode) {
 		}
 	}
 	copy(node.digest[:], hash.Sum(nil))
+	rawHash := sha256.New()
+	_, _ = rawHash.Write([]byte("linux-bzl-kbuild-frontier-raw-node-v1"))
+	_, _ = rawHash.Write(node.rawValueDigest[:])
+	for _, child := range []*kbuildFrontierNode{node.left, node.right} {
+		if child == nil {
+			_, _ = rawHash.Write(make([]byte, sha256.Size))
+		} else {
+			_, _ = rawHash.Write(child.rawDigest[:])
+		}
+	}
+	copy(node.rawDigest[:], rawHash.Sum(nil))
 }
 
 func kbuildFrontierNodeHeight(node *kbuildFrontierNode) int {

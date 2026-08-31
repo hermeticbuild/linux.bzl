@@ -112,6 +112,21 @@ func (m *CompactMetadata) appendModuleSDKActionPlanNodes(plan *ActionPlan) error
 		path:     symvers.path,
 	}
 
+	vmlinux, err := selectedModuleSDKProduct(plan, "vmlinux")
+	if err != nil {
+		return err
+	}
+	// External Kbuild clears KBUILD_BUILTIN, so Makefile.modfinal does not
+	// retain vmlinux as a native prerequisite even when module BTF is enabled.
+	// Linux instead expects the read-only basis object tree to contain it. Keep
+	// the public terminal image in the SDK at that exact conventional path;
+	// target-lifecycle intermediates such as vmlinux.o remain private.
+	projections["vmlinux"] = moduleSDKProjection{
+		artifact: vmlinux,
+		role:     "kernel BTF base",
+		path:     "vmlinux",
+	}
+
 	destinations := make([]string, 0, len(projections))
 	for destination := range projections {
 		destinations = append(destinations, destination)

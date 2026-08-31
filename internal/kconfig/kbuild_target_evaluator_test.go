@@ -62,6 +62,107 @@ $(obj)/%.o: private objtool-args = --dynamic
 	}
 }
 
+func TestEvaluateCompactKbuildTargetNormalizesPrivateRootsForVirtualFiles(t *testing.T) {
+	const releasePath = "include/config/kernel.release"
+	publicRelease := "__LINUX_BZL_OBJECT_TREE__/" + releasePath
+	publicLiteralRelease := "__LINUX_BZL_OBJECT_TREE__/include/config/__LINUX_BZL_OBJECT_TREE__.release"
+	view := &testKbuildVirtualFileView{
+		matches: map[string][]string{
+			"__LINUX_BZL_OBJECT_TREE__/include/config/*.release": {publicRelease, publicLiteralRelease},
+		},
+		files: map[string]testKbuildVirtualFile{
+			publicRelease: {content: "6.18.39-test\n", exact: true},
+		},
+	}
+	path := filepath.Join(t.TempDir(), "Makefile")
+	if err := os.WriteFile(path, []byte(`
+KERNELRELEASE = $(file < $(objtree)/include/config/kernel.release)
+release-files = $(wildcard $(objtree)/include/config/*.release)
+output: FORCE
+	@:
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseKbuildFileTree(path, KbuildOptions{
+		Variables:              map[string]string{"objtree": "__LINUX_BZL_OBJECT_TREE__"},
+		VirtualFileView:        view,
+		MakeVariablesComplete:  true,
+		CaptureTargetEvaluator: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := NewCompactKbuildProfile("root:virtual-action-roots", path, filepath.Dir(path), parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := compactKbuildActionTreeInjections(map[string]string{
+		"objtree": "__LINUX_BZL_OBJECT_TREE__",
+	})
+	values, err := EvaluateCompactKbuildTarget(
+		profile, "output", "", []string{"FORCE"}, nil, injected,
+		"KERNELRELEASE", "release-files",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := values["KERNELRELEASE"], "6.18.39-test"; got != want {
+		t.Fatalf("KERNELRELEASE = %q, want %q", got, want)
+	}
+	if got, want := values["release-files"], strings.Join([]string{
+		compactKbuildActionObjectTreeMarker + "/include/config/__LINUX_BZL_OBJECT_TREE__.release",
+		compactKbuildActionObjectTreeMarker + "/" + releasePath,
+	}, " "); got != want {
+		t.Fatalf("release-files = %q, want private-rooted %q", got, want)
+	}
+	if got, want := view.readCalls, []string{publicRelease}; !slices.Equal(got, want) {
+		t.Fatalf("virtual Read calls = %q, want public query %q", got, want)
+	}
+	if got, want := view.matchCalls, []string{"__LINUX_BZL_OBJECT_TREE__/include/config/*.release"}; !slices.Equal(got, want) {
+		t.Fatalf("virtual Match calls = %q, want public query %q", got, want)
+	}
+}
+
+func TestEvaluateCompactKbuildTargetRejectsPrivateVirtualWildcardResult(t *testing.T) {
+	const publicPattern = "__LINUX_BZL_OBJECT_TREE__/include/config/*.release"
+	view := &testKbuildVirtualFileView{
+		matches: map[string][]string{
+			publicPattern: {compactKbuildActionObjectTreeMarker + "/include/config/injected.release"},
+		},
+	}
+	path := filepath.Join(t.TempDir(), "Makefile")
+	if err := os.WriteFile(path, []byte(`
+release-files = $(wildcard $(objtree)/include/config/*.release)
+output: FORCE
+	@:
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseKbuildFileTree(path, KbuildOptions{
+		Variables:              map[string]string{"objtree": "__LINUX_BZL_OBJECT_TREE__"},
+		VirtualFileView:        view,
+		MakeVariablesComplete:  true,
+		CaptureTargetEvaluator: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := NewCompactKbuildProfile("root:private-virtual-wildcard", path, filepath.Dir(path), parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = EvaluateCompactKbuildTarget(
+		profile, "output", "", []string{"FORCE"}, nil,
+		compactKbuildActionTreeInjections(map[string]string{
+			"objtree": "__LINUX_BZL_OBJECT_TREE__",
+		}),
+		"release-files",
+	)
+	if err == nil || !strings.Contains(err.Error(), "reserved private action marker") {
+		t.Fatalf("EvaluateCompactKbuildTarget() error = %v, Match calls = %q, want reserved provenance rejection", err, view.matchCalls)
+	}
+}
+
 func TestEvaluateCompactKbuildTargetExpandsComputedNamesWithAutomaticAndEscapedDollars(t *testing.T) {
 	profile := mustCompactKbuildProfileForTest(t, "root", "Makefile", "", `
 ordinary_active = $(value_$*)

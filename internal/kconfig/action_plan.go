@@ -8,6 +8,7 @@ package kconfig
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -143,7 +144,7 @@ func NormalizeActionRecipeMakeShellValue(raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if compactKbuildContainsPrivateProvenanceByte(value) {
+	if compactKbuildContainsPrivateProvenanceByte(value) || compactKbuildContainsPrivateToolsetPathByte(value) {
 		return "", fmt.Errorf("GNU Make shell output contains a reserved provenance byte")
 	}
 	if strings.ContainsRune(value, 0) {
@@ -192,7 +193,7 @@ func normalizeActionRecipeMakeShellSingleWord(raw string) (string, string, error
 	if err != nil {
 		return "", "", err
 	}
-	if compactKbuildContainsPrivateProvenanceByte(value) {
+	if compactKbuildContainsPrivateProvenanceByte(value) || compactKbuildContainsPrivateToolsetPathByte(value) {
 		return "", "", fmt.Errorf("GNU Make shell output contains a reserved provenance byte")
 	}
 	if strings.ContainsRune(value, 0) {
@@ -465,6 +466,399 @@ func cloneActionRecipe(recipe ActionRecipe) ActionRecipe {
 	return recipe
 }
 
+// actionRecipeToolsetScopes derives the exact compiler-toolset authorities
+// carried by a recipe. The marker tree records this deterministic projection
+// of the content-addressed recipe so Bazel can bind only the required typed
+// closures without reading recipe contents in the map_directory callback.
+func actionRecipeToolsetScopes(recipe ActionRecipe) ([]string, error) {
+	scopes := map[string]bool{}
+	visit := func(value string) error {
+		_, err := toolaction.RewriteExecutionRootProvenanceValue(value, func(scope, canonical string) (string, error) {
+			scopes[scope] = true
+			return canonical, nil
+		})
+		return err
+	}
+
+	for _, value := range recipe.Arguments {
+		if err := visit(value); err != nil {
+			return nil, fmt.Errorf("recipe toolset scope argument: %w", err)
+		}
+	}
+	for name, value := range recipe.Environment {
+		if err := visit(value); err != nil {
+			return nil, fmt.Errorf("recipe toolset scope environment %q: %w", name, err)
+		}
+	}
+	if err := visit(recipe.WorkingDirectory); err != nil {
+		return nil, fmt.Errorf("recipe toolset scope working directory: %w", err)
+	}
+	for replayIndex, replay := range recipe.CommandReplays {
+		for invocationIndex, invocation := range replay.Invocations {
+			for argumentIndex, value := range invocation.Arguments {
+				if err := visit(value); err != nil {
+					return nil, fmt.Errorf(
+						"recipe toolset scope replay %d invocation %d argument %d: %w",
+						replayIndex, invocationIndex, argumentIndex, err,
+					)
+				}
+			}
+			for outputIndex, value := range invocation.Outputs {
+				if err := visit(value); err != nil {
+					return nil, fmt.Errorf(
+						"recipe toolset scope replay %d invocation %d output %d: %w",
+						replayIndex, invocationIndex, outputIndex, err,
+					)
+				}
+			}
+		}
+	}
+
+	// Ordinary evaluated scripts are stored as base64 so arbitrary shell bytes
+	// remain one canonical JSON string. Decode only the semantic scriptrun flag;
+	// content-template transforms remain plaintext until the action executes and
+	// were already visited above.
+	if recipe.Tool == compactKbuildScriptRunnerRole {
+		transformed := map[int]bool{}
+		for _, transform := range recipe.ArgumentTransforms {
+			transformed[transform.Index] = true
+		}
+		visitEncodedScript := func(index int, encoded string) error {
+			if transformed[index] {
+				return nil
+			}
+			decoded, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil {
+				// The selected runner owns malformed base64 diagnostics. An
+				// undecodable value cannot hide raw provenance delimiter bytes from
+				// the scans above.
+				return nil
+			}
+			if err := visit(string(decoded)); err != nil {
+				return fmt.Errorf("recipe toolset scope evaluated script: %w", err)
+			}
+			return nil
+		}
+		for index, argument := range recipe.Arguments {
+			if index > 0 && (recipe.Arguments[index-1] == "-script_content_base64" || recipe.Arguments[index-1] == "--script_content_base64") {
+				if err := visitEncodedScript(index, argument); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			for _, prefix := range []string{"-script_content_base64=", "--script_content_base64="} {
+				if encoded, ok := strings.CutPrefix(argument, prefix); ok {
+					if err := visitEncodedScript(index, encoded); err != nil {
+						return nil, err
+					}
+					break
+				}
+			}
+		}
+	}
+
+	return slices.Sorted(maps.Keys(scopes)), nil
+}
+
+// normalizeActionRecipeToolsetPathCapabilities verifies every Make-visible
+// compiler path with the workload-local authority that issued it, then removes
+// the ephemeral authentication tag. The resulting deterministic tokens are
+// the only form permitted in content-addressed recipes and runtime runners.
+func normalizeActionRecipeToolsetPathCapabilities(
+	recipe *ActionRecipe,
+	normalize func(string) (string, error),
+) error {
+	if recipe == nil || normalize == nil {
+		return nil
+	}
+	normalized := cloneActionRecipe(*recipe)
+	if err := normalizeActionRecipeToolsetPathCapabilitiesInPlace(&normalized, normalize); err != nil {
+		return err
+	}
+	*recipe = normalized
+	return nil
+}
+
+func normalizeActionRecipeToolsetPathCapabilitiesInPlace(
+	recipe *ActionRecipe,
+	normalize func(string) (string, error),
+) error {
+	apply := func(label string, value *string) error {
+		normalized, err := normalize(*value)
+		if err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		*value = normalized
+		return nil
+	}
+	for index := range recipe.Arguments {
+		if err := apply(fmt.Sprintf("recipe argument %d toolset-path capability", index), &recipe.Arguments[index]); err != nil {
+			return err
+		}
+	}
+	for name, value := range recipe.Environment {
+		if err := apply("recipe environment "+strconv.Quote(name)+" toolset-path capability", &value); err != nil {
+			return err
+		}
+		recipe.Environment[name] = value
+	}
+	if err := apply("recipe working directory toolset-path capability", &recipe.WorkingDirectory); err != nil {
+		return err
+	}
+	for replayIndex := range recipe.CommandReplays {
+		replay := &recipe.CommandReplays[replayIndex]
+		for invocationIndex := range replay.Invocations {
+			invocation := &replay.Invocations[invocationIndex]
+			for argumentIndex := range invocation.Arguments {
+				if err := apply(fmt.Sprintf(
+					"recipe replay %d invocation %d argument %d toolset-path capability",
+					replayIndex, invocationIndex, argumentIndex,
+				), &invocation.Arguments[argumentIndex]); err != nil {
+					return err
+				}
+			}
+			for outputIndex := range invocation.Outputs {
+				if err := apply(fmt.Sprintf(
+					"recipe replay %d invocation %d output %d toolset-path capability",
+					replayIndex, invocationIndex, outputIndex,
+				), &invocation.Outputs[outputIndex]); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// scriptrun transports ordinary evaluated shell text as base64. Authenticate
+	// and normalize tokens inside that decoded runtime surface as well. A
+	// content-template transform keeps plaintext in the argument until execution
+	// and was therefore handled by the direct argument pass above.
+	if recipe.Tool != compactKbuildScriptRunnerRole {
+		return nil
+	}
+	transformed := map[int]bool{}
+	for _, transform := range recipe.ArgumentTransforms {
+		transformed[transform.Index] = true
+	}
+	type encodedScriptArgument struct {
+		index          int
+		prefix         string
+		decoded        string
+		normalized     string
+		transformed    bool
+		decodeError    error
+		normalizeError error
+	}
+	encodedScripts := []encodedScriptArgument{}
+	appendEncodedScript := func(index int, prefix, encoded string) {
+		script := encodedScriptArgument{
+			index: index, prefix: prefix, transformed: transformed[index],
+		}
+		if !script.transformed {
+			decoded, err := base64.StdEncoding.DecodeString(encoded)
+			script.decodeError = err
+			if err == nil {
+				script.decoded = string(decoded)
+				script.normalized, err = normalize(script.decoded)
+				if err != nil {
+					script.normalizeError = fmt.Errorf("recipe evaluated script toolset-path capability: %w", err)
+				}
+			}
+		}
+		encodedScripts = append(encodedScripts, script)
+	}
+	for index := range recipe.Arguments {
+		if index > 0 && (recipe.Arguments[index-1] == "-script_content_base64" || recipe.Arguments[index-1] == "--script_content_base64") {
+			appendEncodedScript(index, "", recipe.Arguments[index])
+			continue
+		}
+		for _, prefix := range []string{"-script_content_base64=", "--script_content_base64="} {
+			encoded, ok := strings.CutPrefix(recipe.Arguments[index], prefix)
+			if !ok {
+				continue
+			}
+			appendEncodedScript(index, prefix, encoded)
+			break
+		}
+	}
+	scriptContentArgumentCount := len(encodedScripts)
+	for _, argument := range recipe.Arguments {
+		switch argument {
+		case "-script", "--script", "-script_content", "--script_content", "-script_stdin", "--script_stdin":
+			scriptContentArgumentCount++
+			continue
+		}
+		for _, prefix := range []string{
+			"-script=", "--script=", "-script_content=", "--script_content=", "-script_stdin=", "--script_stdin=",
+		} {
+			if strings.HasPrefix(argument, prefix) {
+				scriptContentArgumentCount++
+				break
+			}
+		}
+	}
+	for _, script := range encodedScripts {
+		if script.normalizeError != nil {
+			return script.normalizeError
+		}
+	}
+	literalOffsets, err := actionRecipeLiteralTreeOffsetArguments(recipe.Arguments)
+	if err != nil {
+		return err
+	}
+	if len(literalOffsets) != 0 {
+		if scriptContentArgumentCount != 1 || len(encodedScripts) != 1 {
+			return fmt.Errorf(
+				"recipe literal evaluated-script tree offsets require exactly one untransformed base64 script argument, got %d script arguments (%d base64)",
+				scriptContentArgumentCount, len(encodedScripts),
+			)
+		}
+		script := &encodedScripts[0]
+		if script.transformed {
+			return fmt.Errorf("recipe literal evaluated-script tree offsets cannot address a transformed script argument")
+		}
+		if script.decodeError != nil {
+			return fmt.Errorf("recipe literal evaluated-script tree offsets cannot address an invalid base64 script: %w", script.decodeError)
+		}
+		rebased, err := rebaseActionRecipeLiteralTreeOffsets(
+			recipe.Arguments, literalOffsets, script.decoded, script.normalized,
+		)
+		if err != nil {
+			return err
+		}
+		recipe.Arguments = rebased
+	}
+	for _, script := range encodedScripts {
+		if script.transformed || script.decodeError != nil {
+			// Without byte-addressed literal markers, the selected runner owns
+			// malformed base64 diagnostics. Base64 cannot contain the private
+			// provenance delimiters, so it cannot conceal an unnormalized token.
+			continue
+		}
+		recipe.Arguments[script.index] = script.prefix + base64.StdEncoding.EncodeToString([]byte(script.normalized))
+	}
+	return nil
+}
+
+type actionRecipeLiteralTreeOffsetArgument struct {
+	valueIndex int
+	prefix     string
+	offset     int
+}
+
+func actionRecipeLiteralTreeOffsetArguments(arguments []string) ([]actionRecipeLiteralTreeOffsetArgument, error) {
+	var offsets []actionRecipeLiteralTreeOffsetArgument
+	seen := map[int]bool{}
+	appendOffset := func(valueIndex int, prefix, value string) error {
+		offset, err := strconv.Atoi(value)
+		if err != nil || offset < 0 {
+			return fmt.Errorf("recipe has invalid literal evaluated-script tree offset %q", value)
+		}
+		if seen[offset] {
+			return fmt.Errorf("recipe repeats literal evaluated-script tree offset %d", offset)
+		}
+		seen[offset] = true
+		offsets = append(offsets, actionRecipeLiteralTreeOffsetArgument{
+			valueIndex: valueIndex, prefix: prefix, offset: offset,
+		})
+		return nil
+	}
+	for index := 0; index < len(arguments); index++ {
+		switch arguments[index] {
+		case "-literal_tree_offset", "--literal_tree_offset":
+			if index+1 == len(arguments) {
+				return nil, fmt.Errorf("recipe literal evaluated-script tree offset flag is missing its value")
+			}
+			index++
+			if err := appendOffset(index, "", arguments[index]); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		for _, prefix := range []string{"-literal_tree_offset=", "--literal_tree_offset="} {
+			if value, ok := strings.CutPrefix(arguments[index], prefix); ok {
+				if err := appendOffset(index, prefix, value); err != nil {
+					return nil, err
+				}
+				break
+			}
+		}
+	}
+	return offsets, nil
+}
+
+type actionRecipeScriptTreeMarker struct {
+	offset int
+	text   string
+}
+
+func actionRecipeScriptTreeMarkers(script string) ([]actionRecipeScriptTreeMarker, error) {
+	const prefix = "${tree:"
+	var markers []actionRecipeScriptTreeMarker
+	for cursor := 0; ; {
+		relative := strings.Index(script[cursor:], prefix)
+		if relative < 0 {
+			return markers, nil
+		}
+		start := cursor + relative
+		relativeEnd := strings.IndexByte(script[start+len(prefix):], '}')
+		if relativeEnd < 0 {
+			return nil, fmt.Errorf("recipe evaluated script contains an unterminated tree marker at byte offset %d", start)
+		}
+		end := start + len(prefix) + relativeEnd
+		marker := script[start : end+1]
+		if strings.Contains(marker[len(prefix):len(marker)-1], prefix) {
+			return nil, fmt.Errorf("recipe evaluated script contains a nested tree marker at byte offset %d", start)
+		}
+		markers = append(markers, actionRecipeScriptTreeMarker{offset: start, text: marker})
+		cursor = end + 1
+	}
+}
+
+func rebaseActionRecipeLiteralTreeOffsets(
+	arguments []string,
+	offsets []actionRecipeLiteralTreeOffsetArgument,
+	before, after string,
+) ([]string, error) {
+	beforeMarkers, err := actionRecipeScriptTreeMarkers(before)
+	if err != nil {
+		return nil, err
+	}
+	afterMarkers, err := actionRecipeScriptTreeMarkers(after)
+	if err != nil {
+		return nil, err
+	}
+	if len(beforeMarkers) != len(afterMarkers) {
+		return nil, fmt.Errorf("recipe toolset-path normalization changed evaluated-script tree marker count from %d to %d", len(beforeMarkers), len(afterMarkers))
+	}
+	for ordinal := range beforeMarkers {
+		if beforeMarkers[ordinal].text != afterMarkers[ordinal].text {
+			return nil, fmt.Errorf(
+				"recipe toolset-path normalization changed evaluated-script tree marker %d from %q to %q",
+				ordinal, beforeMarkers[ordinal].text, afterMarkers[ordinal].text,
+			)
+		}
+	}
+
+	rebased := slices.Clone(arguments)
+	for _, literal := range offsets {
+		ordinal := -1
+		for candidate, marker := range beforeMarkers {
+			if marker.offset == literal.offset {
+				ordinal = candidate
+				break
+			}
+		}
+		if ordinal < 0 {
+			return nil, fmt.Errorf(
+				"recipe literal evaluated-script tree offset %d does not identify a complete tree marker",
+				literal.offset,
+			)
+		}
+		rebased[literal.valueIndex] = literal.prefix + strconv.Itoa(afterMarkers[ordinal].offset)
+	}
+	return rebased, nil
+}
+
 // ActionPlan is the typed form used by planners and unit tests. WriteStages
 // writes the sharded marker layout consumed by map_directory:
 //
@@ -479,6 +873,7 @@ func cloneActionRecipe(recipe ActionRecipe) ActionRecipe {
 //	nodes/<stage>/<sha256>/in/node-pack/<role>/<role chunk>.<payload>
 //	nodes/<stage>/<sha256>/in/tree/<name>
 //	nodes/<stage>/<sha256>/in/tool/<scope>/<role>/<scoped|unscoped>
+//	nodes/<stage>/<sha256>/in/toolset/<scope>
 //	nodes/<stage>/<sha256>/out/<tree>/<slot>/<physical artifact path>
 //
 // A packed node-input payload contains comma-separated
@@ -1104,6 +1499,9 @@ func (r ActionRecipe) Validate() error {
 		if compactKbuildContainsPrivateProvenanceByte(restored) {
 			return fmt.Errorf("recipe retains a reserved recursive Make provenance byte")
 		}
+		if compactKbuildContainsPrivateToolsetPathByte(restored) {
+			return fmt.Errorf("recipe environment name contains a reserved toolset-path provenance byte")
+		}
 		if previous, exists := restoredEnvironmentNames[restored]; exists {
 			return fmt.Errorf("recipe environment names %q and %q restore to the same name %q", previous, key, restored)
 		}
@@ -1388,6 +1786,9 @@ func (r ActionRecipe) Validate() error {
 	for _, value := range values {
 		if compactKbuildContainsPrivateProvenanceByte(value) {
 			return fmt.Errorf("recipe retains a reserved recursive Make provenance byte")
+		}
+		if err := toolaction.ValidateExecutionRootProvenanceValue(value); err != nil {
+			return fmt.Errorf("recipe contains invalid toolset-path provenance: %w", err)
 		}
 		for _, match := range actionRecipePlaceholder.FindAllStringSubmatch(value, -1) {
 			if match[1] == "output" && observedOutputBindings[match[2]] {
@@ -1907,6 +2308,19 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 			}
 			entries = append(entries, actionPlanEntry{path: path.Join(root, "in", "tool", scope, role, bindingForm)})
 		}
+		recipeToolsetScopes, err := actionRecipeToolsetScopes(recipe)
+		if err != nil {
+			return nil, fmt.Errorf("node %s: %w", node.ID, err)
+		}
+		for _, scope := range recipeToolsetScopes {
+			if p.Toolsets[scope] == "" {
+				return nil, fmt.Errorf("node %s recipe requires unavailable %s toolset", node.ID, scope)
+			}
+			if scope == "host" {
+				hasHostScopeNode = true
+			}
+			entries = append(entries, actionPlanEntry{path: path.Join(root, "in", "toolset", scope)})
+		}
 		for i, output := range node.Outputs {
 			if !LinuxKernelPlanTrees[output.Tree] {
 				return nil, fmt.Errorf("node %s has unknown output tree %q", node.ID, output.Tree)
@@ -2216,7 +2630,7 @@ func validateBindingName(kind, value string) error {
 }
 
 func validatePlanRelativePath(kind, value string) error {
-	if compactKbuildContainsPrivateProvenanceByte(value) {
+	if compactKbuildContainsPrivateProvenanceByte(value) || compactKbuildContainsPrivateToolsetPathByte(value) {
 		return fmt.Errorf("kernel action plan %s path contains a reserved recursive Make provenance byte", kind)
 	}
 	if value == "" || strings.Contains(value, `\`) || strings.ContainsRune(value, 0) || strings.HasPrefix(value, "/") || path.Clean(value) != value {

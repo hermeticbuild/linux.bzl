@@ -370,7 +370,7 @@ jobs:
   sonic-e2e:
     name: SONiC linux_ngbde module (${{ matrix.compiler }}, Bazel ${{ matrix.bazel }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

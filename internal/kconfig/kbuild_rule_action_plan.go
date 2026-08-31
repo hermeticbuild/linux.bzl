@@ -44,11 +44,25 @@ const (
 	// lowered script without leaking authority bytes.
 	CompactKbuildRecursiveMakeReplayName = "make"
 
-	compactKbuildPrivateProvenanceBytes = "\x05\x06"
+	compactKbuildPrivateProvenanceBytes  = "\x05\x06"
+	compactKbuildPrivateToolsetPathBytes = "\x07\x08"
 )
 
 func compactKbuildContainsPrivateProvenanceByte(value string) bool {
 	return strings.ContainsAny(value, compactKbuildPrivateProvenanceBytes)
+}
+
+func compactKbuildContainsPrivateToolsetPathByte(value string) bool {
+	return strings.ContainsAny(value, compactKbuildPrivateToolsetPathBytes)
+}
+
+func compactKbuildContainsPrivateActionMarker(value string) bool {
+	return strings.Contains(value, compactKbuildActionSourceTreeMarker) ||
+		strings.Contains(value, compactKbuildActionObjectTreeMarker) ||
+		strings.Contains(value, compactKbuildActionAbsoluteObjectTreeMarker) ||
+		strings.Contains(value, compactKbuildActionHostDepsTreeMarker) ||
+		strings.Contains(value, compactKbuildActionSourceInputPrefix) ||
+		strings.Contains(value, toolaction.ExecutionRootProvenanceMarker)
 }
 
 type compactKbuildRulePlanBuilder struct {
@@ -551,6 +565,58 @@ func compactKbuildMaterializeActionTreeMarkers(value string) string {
 	return compactKbuildMaterializeActionTreeMarkerReplacer.Replace(value)
 }
 
+func compactKbuildActionTreeRoot(value string) (privateRoot, publicRoot string, ok bool) {
+	hasRoot := func(root string) bool {
+		return value == root || strings.HasPrefix(value, root+"/")
+	}
+	switch {
+	case hasRoot(compactKbuildActionSourceTreeMarker):
+		return compactKbuildActionSourceTreeMarker, "__LINUX_BZL_SOURCE_TREE__", true
+	case hasRoot(compactKbuildActionAbsoluteObjectTreeMarker):
+		return compactKbuildActionAbsoluteObjectTreeMarker, "__LINUX_BZL_OBJECT_TREE__", true
+	case hasRoot(compactKbuildActionObjectTreeMarker):
+		return compactKbuildActionObjectTreeMarker, "__LINUX_BZL_OBJECT_TREE__", true
+	case hasRoot(compactKbuildActionHostDepsTreeMarker):
+		return compactKbuildActionHostDepsTreeMarker, linuxProbeHostDepsSentinel, true
+	default:
+		return "", "", false
+	}
+}
+
+func compactKbuildReplaceActionTreeRoot(value, oldRoot, newRoot string) string {
+	switch {
+	case value == oldRoot:
+		return newRoot
+	case strings.HasPrefix(value, oldRoot+"/"):
+		return newRoot + strings.TrimPrefix(value, oldRoot)
+	default:
+		return value
+	}
+}
+
+// compactKbuildRestoreActionTreeMarkers returns a virtual-filesystem result to
+// the private namespace used by the query which produced it. Object-root
+// abspath provenance stays distinct from an ordinary object-root path; other
+// result text remains untouched.
+func compactKbuildRestoreActionTreeMarkers(value, query string) string {
+	privateRoot, publicRoot, ok := compactKbuildActionTreeRoot(query)
+	if !ok {
+		return value
+	}
+	return compactKbuildReplaceActionTreeRoot(value, publicRoot, privateRoot)
+}
+
+// compactKbuildMaterializeActionTreeRoot exposes only the private leading root
+// owned by query. Any private bytes elsewhere remain visible to the ordinary
+// value validator instead of being laundered through a public sentinel.
+func compactKbuildMaterializeActionTreeRoot(value, query string) string {
+	privateRoot, publicRoot, ok := compactKbuildActionTreeRoot(query)
+	if !ok {
+		return value
+	}
+	return compactKbuildReplaceActionTreeRoot(value, privateRoot, publicRoot)
+}
+
 // compactKbuildActionTreeInjections changes only planner-owned invocation
 // roots into unforgeable action markers. Keeping this conversion at the
 // action-lowering boundary lets path algebra distinguish injected roots from
@@ -635,7 +701,9 @@ func compactKbuildCollapseActionRootJoins(value string) string {
 func protectCompactKbuildSourceLiteralActionMarkers(value string) (string, error) {
 	if strings.Contains(value, compactKbuildLiteralTreeEscapeByte) ||
 		strings.Contains(value, compactKbuildLiteralSentinelEscapeByte) ||
-		compactKbuildContainsPrivateProvenanceByte(value) {
+		compactKbuildContainsPrivateProvenanceByte(value) ||
+		compactKbuildContainsPrivateToolsetPathByte(value) ||
+		compactKbuildContainsPrivateActionMarker(value) {
 		return "", fmt.Errorf("source action text contains a reserved literal-marker byte")
 	}
 	var protected strings.Builder
@@ -8960,6 +9028,14 @@ func appendActionPlanNode(plan *ActionPlan, node ActionPlanNode, recipe ActionRe
 	}
 	if err := bindActionRecipeDeferredKbuildContent(plan, &node, &recipe); err != nil {
 		return "", err
+	}
+	if plan.metadata != nil {
+		if err := normalizeActionRecipeToolsetPathCapabilities(
+			&recipe,
+			plan.metadata.toolsetPathCapabilityNormalizer,
+		); err != nil {
+			return "", err
+		}
 	}
 	recipeData, err := recipe.CanonicalJSON()
 	if err != nil {

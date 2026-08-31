@@ -7,7 +7,39 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
+
+func TestCanonicalKbuildDeferredContentEnvironmentExcludesCapabilityTags(t *testing.T) {
+	firstCodec, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCodec, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := firstCodec.EncodePath("host", "external/compiler/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := secondCodec.EncodePath("host", "external/compiler/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCanonical, err := canonicalKbuildDeferredContentEnvironment(map[string]string{"FLAGS": "-I" + first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCanonical, err := canonicalKbuildDeferredContentEnvironment(map[string]string{"FLAGS": "-I" + second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstCanonical != secondCanonical {
+		t.Fatalf("deferred-content environment retains ephemeral capability tag\nfirst: %q\nsecond: %q", firstCanonical, secondCanonical)
+	}
+}
 
 func TestCompactKbuildEnvironmentInternerCopiesOnceAndKeepsDistinctValues(t *testing.T) {
 	interner := compactKbuildEnvironmentInterner{}

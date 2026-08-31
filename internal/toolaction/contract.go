@@ -5,6 +5,10 @@
 package toolaction
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,10 +20,23 @@ import (
 )
 
 const (
-	KbuildArgumentsSentinel        = "__LINUX_BZL_KBUILD_ARGS_V1__"
-	ExecutionRootMarker            = "__LINUX_BZL_EXECROOT__"
-	DefaultDirectoryArgumentMarker = "__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__"
-	EnvironmentName                = "LINUX_BZL_TOOL_ACTION_CONTRACTS_V1"
+	executionRootProvenanceCapabilitySuffix  = "__LINUX_BZL_TOOLSET_PATH_CAPABILITY_V1__"
+	executionRootProvenanceCapabilityKeySize = 32
+	executionRootProvenanceCapabilityTagSize = sha256.Size * 2
+)
+
+const (
+	KbuildArgumentsSentinel = "__LINUX_BZL_KBUILD_ARGS_V1__"
+	ExecutionRootMarker     = "__LINUX_BZL_EXECROOT__"
+	// ExecutionRootProvenanceMarker and ExecutionRootProvenanceTerminator frame
+	// one evaluator-owned, scope-qualified canonical toolset path. Keeping the
+	// complete path inside a self-delimiting token lets action runners replace
+	// it without guessing where a flag or shell word ends. Both delimiter bytes
+	// are reserved at every ordinary Kbuild ingress.
+	ExecutionRootProvenanceMarker     = "\x07linux-bzl-toolset-path-v1:"
+	ExecutionRootProvenanceTerminator = "\x08"
+	DefaultDirectoryArgumentMarker    = "__LINUX_BZL_DEFAULT_DIRECTORY_ARGUMENT_V1__"
+	EnvironmentName                   = "LINUX_BZL_TOOL_ACTION_CONTRACTS_V1"
 	// RuntimeToolPathEnvironmentName is a runner-owned handoff to nested
 	// source-script executors.  It names the private directory containing only
 	// identity-bound tool-role aliases; source and configured action
@@ -231,7 +248,347 @@ func SpliceArguments(action, invocation []string) ([]string, error) {
 // retain absolute access to selected toolchain inputs after a runner changes
 // its working directory.
 func ExpandExecutionRootValue(value, executionRoot string) (string, error) {
-	marker := ExecutionRootMarker
+	return expandExecutionRootMarker(value, executionRoot, ExecutionRootMarker, "configured toolchain action")
+}
+
+// EncodeExecutionRootProvenancePath returns the private runtime wire
+// representation of one canonical artifact in the selected host or target
+// toolset closure. Planning code which exposes a token to source-owned Kbuild
+// must use ExecutionRootProvenanceCapabilityCodec instead: this deterministic
+// representation is intentionally not an authentication mechanism.
+func EncodeExecutionRootProvenancePath(scope, canonical string) (string, error) {
+	if scope != "host" && scope != "target" {
+		return "", fmt.Errorf("probed toolset path has invalid scope %q", scope)
+	}
+	if err := ValidateCanonicalArtifactPath(canonical); err != nil {
+		return "", fmt.Errorf("probed toolset path %q: %w", canonical, err)
+	}
+	if strings.ContainsAny(canonical, "\x00\x07\x08\r\n") {
+		return "", fmt.Errorf("probed toolset path %q contains a reserved byte", canonical)
+	}
+	return ExecutionRootProvenanceMarker + scope + ":" + canonical + ExecutionRootProvenanceTerminator, nil
+}
+
+// ExecutionRootProvenanceCapabilityCodec authenticates transient toolset-path
+// tokens while source-owned Kbuild text transformations are evaluated. Each
+// workload must use its own randomly keyed codec. Authenticated tokens remain
+// syntactically valid provenance tokens, but must be normalized before they
+// enter a stable action recipe or a runtime runner.
+type ExecutionRootProvenanceCapabilityCodec struct {
+	key [executionRootProvenanceCapabilityKeySize]byte
+}
+
+// NewExecutionRootProvenanceCapabilityCodec creates a codec with a fresh
+// workload-local key.
+func NewExecutionRootProvenanceCapabilityCodec() (*ExecutionRootProvenanceCapabilityCodec, error) {
+	key := make([]byte, executionRootProvenanceCapabilityKeySize)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("create toolset-path capability key: %w", err)
+	}
+	return newExecutionRootProvenanceCapabilityCodec(key)
+}
+
+// newExecutionRootProvenanceCapabilityCodec constructs a codec from a fixed
+// key for focused deterministic tests. Production callers must use the random
+// constructor above.
+func newExecutionRootProvenanceCapabilityCodec(key []byte) (*ExecutionRootProvenanceCapabilityCodec, error) {
+	if len(key) != executionRootProvenanceCapabilityKeySize {
+		return nil, fmt.Errorf("toolset-path capability key has size %d, want %d", len(key), executionRootProvenanceCapabilityKeySize)
+	}
+	codec := &ExecutionRootProvenanceCapabilityCodec{}
+	copy(codec.key[:], key)
+	return codec, nil
+}
+
+// EncodePath returns an authenticated, transient planning representation of
+// one canonical toolset path. The deterministic core comes first so Make's
+// lexical operations order distinct capabilities exactly like their runtime
+// paths; a fixed printable suffix carries the tag binding scope and path.
+func (c *ExecutionRootProvenanceCapabilityCodec) EncodePath(scope, canonical string) (string, error) {
+	if c == nil {
+		return "", errors.New("toolset-path capability codec is nil")
+	}
+	core, err := EncodeExecutionRootProvenancePath(scope, canonical)
+	if err != nil {
+		return "", err
+	}
+	tag := c.capabilityTag(scope, canonical)
+	return core + executionRootProvenanceCapabilitySuffix + hex.EncodeToString(tag), nil
+}
+
+// NormalizeValue verifies every provenance token in value was issued by this
+// codec, then replaces it with the deterministic runtime representation. Raw
+// deterministic tokens and tokens altered by Kbuild fail closed. Ordinary
+// surrounding bytes and multiple intact tokens are preserved.
+func (c *ExecutionRootProvenanceCapabilityCodec) NormalizeValue(value string) (string, error) {
+	if c == nil {
+		return "", errors.New("toolset-path capability codec is nil")
+	}
+	return rewriteExecutionRootProvenanceCapabilityValue(value, true, true, func(scope, canonical string, tag []byte) error {
+		want := c.capabilityTag(scope, canonical)
+		if !hmac.Equal(tag, want) {
+			return errors.New("authenticated planning capability tag does not match its scope and path")
+		}
+		return nil
+	})
+}
+
+// CanonicalizeExecutionRootProvenanceCapabilityIdentity removes ephemeral
+// capability tags from stable hash and equality projections. It verifies only
+// the capability's structure, not its authenticity; callers must still apply
+// the workload's keyed NormalizeValue before granting path authority. Ordinary
+// deterministic runtime tokens are preserved unchanged. Identity text is not
+// granted path authority, so this projection deliberately does not require a
+// runtime token boundary: it strips only a complete structural capability tag
+// and preserves every trailing byte. For example, capability+".a" projects to
+// core+".a", which remains distinct from core.
+func CanonicalizeExecutionRootProvenanceCapabilityIdentity(value string) (string, error) {
+	return rewriteExecutionRootProvenanceCapabilityValue(value, false, false, nil)
+}
+
+func rewriteExecutionRootProvenanceCapabilityValue(
+	value string,
+	requireCapability bool,
+	requireRuntimeBoundary bool,
+	verify func(scope, canonical string, tag []byte) error,
+) (string, error) {
+	if !strings.ContainsAny(value, "\x07\x08") && !strings.Contains(value, executionRootProvenanceCapabilitySuffix) {
+		return value, nil
+	}
+	var out strings.Builder
+	for cursor := 0; cursor < len(value); {
+		relativeDelimiter := strings.IndexAny(value[cursor:], "\x07\x08")
+		relativeSuffix := strings.Index(value[cursor:], executionRootProvenanceCapabilitySuffix)
+		if relativeSuffix >= 0 && (relativeDelimiter < 0 || relativeSuffix < relativeDelimiter) {
+			return "", fmt.Errorf("stray toolset-path capability suffix at byte %d", cursor+relativeSuffix)
+		}
+		if relativeDelimiter < 0 {
+			out.WriteString(value[cursor:])
+			break
+		}
+		start := cursor + relativeDelimiter
+		out.WriteString(value[cursor:start])
+		scope, canonical, next, err := parseExecutionRootProvenanceToken(value, start)
+		if err != nil {
+			return "", err
+		}
+		core := value[start:next]
+		capability, err := parseExecutionRootProvenanceCapability(value, start, next, requireRuntimeBoundary)
+		if err != nil {
+			return "", err
+		}
+		if !capability.present {
+			if requireCapability {
+				return "", fmt.Errorf("probed toolset path token at byte %d omits its authenticated capability suffix", start)
+			}
+			out.WriteString(core)
+			cursor = next
+			continue
+		}
+		if verify != nil {
+			if err := verify(scope, canonical, capability.tag); err != nil {
+				return "", fmt.Errorf("verify %s toolset path %q: %w", scope, canonical, err)
+			}
+		}
+		out.WriteString(core)
+		cursor = capability.end
+	}
+	return out.String(), nil
+}
+
+func (c *ExecutionRootProvenanceCapabilityCodec) capabilityTag(scope, canonical string) []byte {
+	mac := hmac.New(sha256.New, c.key[:])
+	_, _ = mac.Write([]byte("linux-bzl-toolset-path-capability-v1\x00"))
+	_, _ = mac.Write([]byte(scope))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(canonical))
+	return mac.Sum(nil)
+}
+
+func isLowerHex(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if !isLowerHexByte(value[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isLowerHexByte(value byte) bool {
+	return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f')
+}
+
+type executionRootProvenanceCapability struct {
+	present bool
+	tag     []byte
+	end     int
+}
+
+// parseExecutionRootProvenanceCapability classifies the bytes immediately
+// after one deterministic token core. For authority-bearing values, the
+// printable authenticated suffix is the only non-boundary continuation of a
+// core and every complete token variant must then end or be followed by ASCII
+// whitespace. Punctuation is not a universal runtime boundary: quotes
+// concatenate shell words, braces expand, and most punctuation can extend a
+// single argv element. Stable identity projection disables that boundary check
+// because it preserves, rather than grants authority to, all trailing bytes.
+func parseExecutionRootProvenanceCapability(
+	value string,
+	start, coreEnd int,
+	requireRuntimeBoundary bool,
+) (executionRootProvenanceCapability, error) {
+	if !strings.HasPrefix(value[coreEnd:], executionRootProvenanceCapabilitySuffix) {
+		if requireRuntimeBoundary && !isExecutionRootProvenanceBoundary(value, coreEnd) {
+			return executionRootProvenanceCapability{}, fmt.Errorf("probed toolset path token at byte %d has a suffix outside its provenance envelope", start)
+		}
+		return executionRootProvenanceCapability{end: coreEnd}, nil
+	}
+
+	tagStart := coreEnd + len(executionRootProvenanceCapabilitySuffix)
+	tagEnd := tagStart + executionRootProvenanceCapabilityTagSize
+	if tagEnd > len(value) {
+		return executionRootProvenanceCapability{}, fmt.Errorf("toolset-path capability suffix at byte %d has a truncated tag", coreEnd)
+	}
+	tagHex := value[tagStart:tagEnd]
+	if !isLowerHex(tagHex) {
+		return executionRootProvenanceCapability{}, fmt.Errorf("toolset-path capability suffix at byte %d has a malformed tag", coreEnd)
+	}
+	tag, err := hex.DecodeString(tagHex)
+	if err != nil {
+		return executionRootProvenanceCapability{}, fmt.Errorf("toolset-path capability suffix at byte %d has a malformed tag", coreEnd)
+	}
+	if requireRuntimeBoundary && !isExecutionRootProvenanceBoundary(value, tagEnd) {
+		return executionRootProvenanceCapability{}, fmt.Errorf("probed toolset path capability at byte %d has a suffix outside its provenance envelope", start)
+	}
+	return executionRootProvenanceCapability{present: true, tag: tag, end: tagEnd}, nil
+}
+
+func isExecutionRootProvenanceBoundary(value string, end int) bool {
+	if end == len(value) {
+		return true
+	}
+	if end < 0 || end > len(value) {
+		return false
+	}
+	switch value[end] {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	default:
+		return false
+	}
+}
+
+// DecodeExecutionRootProvenancePath parses one value consisting exclusively
+// of a single private toolset-path token.
+func DecodeExecutionRootProvenancePath(value string) (scope, canonical string, err error) {
+	const decoded = "__LINUX_BZL_DECODED_TOOLSET_PATH_V1__"
+	seen := false
+	rewritten, err := RewriteExecutionRootProvenanceValue(value, func(gotScope, gotCanonical string) (string, error) {
+		if seen {
+			return "", errors.New("contains more than one toolset-path token")
+		}
+		seen = true
+		scope, canonical = gotScope, gotCanonical
+		return decoded, nil
+	})
+	if err != nil {
+		return "", "", err
+	}
+	if !seen || rewritten != decoded {
+		return "", "", errors.New("value is not exactly one toolset-path token")
+	}
+	return scope, canonical, nil
+}
+
+// RewriteExecutionRootProvenanceValue validates and replaces every complete
+// private toolset-path token in value. Ordinary bytes are copied verbatim;
+// stray, truncated, nested, or suffixed tokens fail closed. A structurally
+// valid capability spelling is accepted at this syntax layer, but its printable
+// suffix is preserved verbatim so this unkeyed operation cannot silently turn
+// it into runtime authority. Callers must use keyed NormalizeValue verification
+// before granting the underlying deterministic token that authority. This is
+// the shared parser hook used by runners which resolve canonical paths through
+// their declared toolset closure.
+func RewriteExecutionRootProvenanceValue(
+	value string,
+	resolve func(scope, canonical string) (string, error),
+) (string, error) {
+	if !strings.ContainsAny(value, "\x07\x08") {
+		return value, nil
+	}
+	if resolve == nil {
+		return "", errors.New("probed toolset path resolver is nil")
+	}
+	var out strings.Builder
+	for cursor := 0; cursor < len(value); {
+		relative := strings.IndexAny(value[cursor:], "\x07\x08")
+		if relative < 0 {
+			out.WriteString(value[cursor:])
+			break
+		}
+		start := cursor + relative
+		out.WriteString(value[cursor:start])
+		scope, canonical, next, err := parseExecutionRootProvenanceToken(value, start)
+		if err != nil {
+			return "", err
+		}
+		capability, err := parseExecutionRootProvenanceCapability(value, start, next, true)
+		if err != nil {
+			return "", err
+		}
+		replacement, err := resolve(scope, canonical)
+		if err != nil {
+			return "", fmt.Errorf("resolve %s toolset path %q: %w", scope, canonical, err)
+		}
+		if replacement == "" || strings.ContainsAny(replacement, "\x00\x07\x08") {
+			return "", fmt.Errorf("resolved %s toolset path %q is empty or contains a reserved byte", scope, canonical)
+		}
+		out.WriteString(replacement)
+		out.WriteString(value[next:capability.end])
+		cursor = capability.end
+	}
+	return out.String(), nil
+}
+
+func parseExecutionRootProvenanceToken(value string, start int) (scope, canonical string, next int, err error) {
+	if start < 0 || start >= len(value) || !strings.HasPrefix(value[start:], ExecutionRootProvenanceMarker) {
+		return "", "", 0, fmt.Errorf("probed toolset path value contains a stray provenance delimiter at byte %d", start)
+	}
+	payloadStart := start + len(ExecutionRootProvenanceMarker)
+	relativeEnd := strings.Index(value[payloadStart:], ExecutionRootProvenanceTerminator)
+	if relativeEnd < 0 {
+		return "", "", 0, fmt.Errorf("probed toolset path token at byte %d is unterminated", start)
+	}
+	end := payloadStart + relativeEnd
+	payload := value[payloadStart:end]
+	if strings.ContainsRune(payload, '\x07') {
+		return "", "", 0, fmt.Errorf("probed toolset path token at byte %d contains a nested provenance delimiter", start)
+	}
+	scope, canonical, ok := strings.Cut(payload, ":")
+	if !ok {
+		return "", "", 0, fmt.Errorf("probed toolset path token at byte %d omits its scope", start)
+	}
+	encoded, err := EncodeExecutionRootProvenancePath(scope, canonical)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("probed toolset path token at byte %d: %w", start, err)
+	}
+	next = end + len(ExecutionRootProvenanceTerminator)
+	if encoded != value[start:next] {
+		return "", "", 0, fmt.Errorf("probed toolset path token at byte %d is not canonical", start)
+	}
+	return scope, canonical, next, nil
+}
+
+// ValidateExecutionRootProvenanceValue verifies the private tokens in value
+// without resolving them or changing their bytes.
+func ValidateExecutionRootProvenanceValue(value string) error {
+	_, err := RewriteExecutionRootProvenanceValue(value, func(_, _ string) (string, error) {
+		return "validated-toolset-path", nil
+	})
+	return err
+}
+
+func expandExecutionRootMarker(value, executionRoot, marker, description string) (string, error) {
 	prefix := marker + "/"
 	if !strings.Contains(value, marker) {
 		return value, nil
@@ -245,7 +602,7 @@ func ExpandExecutionRootValue(value, executionRoot string) (string, error) {
 	}
 	expanded := strings.ReplaceAll(value, prefix, root)
 	if strings.Contains(expanded, marker) {
-		return "", fmt.Errorf("configured toolchain action value contains malformed execution-root marker")
+		return "", fmt.Errorf("%s value contains malformed execution-root marker", description)
 	}
 	return expanded, nil
 }

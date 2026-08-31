@@ -26,8 +26,8 @@ func testProbeRequest() ProbeRequest {
 }
 
 func TestProbeRequestCanonicalIdentity(t *testing.T) {
-	if LinuxProbeRequestSchema != "linux-probe-request-v10" {
-		t.Fatalf("probe request schema = %q, want v10", LinuxProbeRequestSchema)
+	if LinuxProbeRequestSchema != "linux-probe-request-v11" {
+		t.Fatalf("probe request schema = %q, want v11", LinuxProbeRequestSchema)
 	}
 	request := testProbeRequest()
 	id, err := request.ID()
@@ -84,6 +84,11 @@ func TestProbeStepStdoutFallbackPathValidation(t *testing.T) {
 	unsafe.Steps[0].StdoutFallbackPath = "../plugin"
 	if err := unsafe.Validate(); err == nil || !strings.Contains(err.Error(), "safe path component") {
 		t.Fatalf("unsafe stdout fallback error = %v", err)
+	}
+	indirect := request
+	indirect.Outcome = ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{Operator: "exit-zero", Step: "query"}}
+	if err := indirect.Validate(); err == nil || !strings.Contains(err.Error(), "direct text stdout outcome") {
+		t.Fatalf("indirect stdout path outcome error = %v", err)
 	}
 }
 
@@ -655,5 +660,30 @@ func TestProbeResultCanonicalValidation(t *testing.T) {
 	}
 	if _, err := result.CanonicalJSON(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProbeResultStdoutPathKindValidation(t *testing.T) {
+	base := ProbeResult{
+		Schema: LinuxProbeResultSchema, NodeID: strings.Repeat("b", 64), RequestID: strings.Repeat("c", 64),
+		Scope: "target", ToolsetIdentity: "sha256-" + strings.Repeat("d", 64), Kind: "text", Text: "include",
+		Steps: []ProbeStepResult{{
+			Name: "query", Status: "success", ExitCode: 0, Stdout: "include", StdoutPathKind: ProbeStdoutPathToolset,
+		}},
+	}
+	if _, err := base.CanonicalJSON(); err != nil {
+		t.Fatalf("canonical toolset path result: %v", err)
+	}
+	fallback := base
+	fallback.Steps = slices.Clone(base.Steps)
+	fallback.Steps[0].StdoutPathKind = ProbeStdoutPathFallback
+	if _, err := fallback.CanonicalJSON(); err != nil {
+		t.Fatalf("canonical fallback result: %v", err)
+	}
+	invalid := base
+	invalid.Steps = slices.Clone(base.Steps)
+	invalid.Steps[0].StdoutPathKind = "guessed"
+	if err := invalid.Validate(); err == nil || !strings.Contains(err.Error(), "invalid stdout path kind") {
+		t.Fatalf("invalid stdout path kind error = %v", err)
 	}
 }

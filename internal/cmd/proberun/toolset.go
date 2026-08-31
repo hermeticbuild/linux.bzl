@@ -12,8 +12,6 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
-const maxProbeParameterFileBytes = 8 << 20
-
 var errToolsetPathOutsideClosure = errors.New("toolset path is not identity-bound")
 
 type toolsetArtifactBinding struct {
@@ -43,7 +41,7 @@ type toolsetActionPathMapping struct {
 	allowRunfiles   bool
 }
 
-func loadToolsetPathResolver(execroot, scope, markerIdentity, manifestFilename string, files []string) (*toolsetPathResolver, error) {
+func loadToolsetPathResolver(execroot, scope, markerIdentity, manifestFilename string, anchors map[string]string) (*toolsetPathResolver, error) {
 	if manifestFilename == "" {
 		return nil, fmt.Errorf("probe has no %s toolset manifest", scope)
 	}
@@ -61,26 +59,56 @@ func loadToolsetPathResolver(execroot, scope, markerIdentity, manifestFilename s
 	if identity != markerIdentity {
 		return nil, fmt.Errorf("probe %s toolset manifest identity is %q, want marker %q", scope, identity, markerIdentity)
 	}
-	if len(files) != len(manifest.Closure) {
-		return nil, fmt.Errorf("probe %s toolset closure has %d typed artifacts, manifest has %d", scope, len(files), len(manifest.Closure))
+	for root := range anchors {
+		if _, exists := manifest.Roots[root]; !exists {
+			return nil, fmt.Errorf("probe %s toolset root anchors contain unknown root %q", scope, root)
+		}
+	}
+	for root := range manifest.Roots {
+		if _, exists := anchors[root]; !exists {
+			return nil, fmt.Errorf("probe %s toolset root anchors omit manifest root %q", scope, root)
+		}
 	}
 	resolver := &toolsetPathResolver{
 		manifest:    manifest,
 		execroot:    filepath.Clean(execroot),
-		exact:       make(map[string]toolsetArtifactBinding, len(files)),
+		exact:       make(map[string]toolsetArtifactBinding, len(manifest.Closure)),
 		projections: make(map[string]string),
 	}
-	for _, filename := range files {
+	physicalRoots := make(map[string]string, len(manifest.Roots))
+	for root, anchorCanonical := range manifest.Roots {
+		filename := anchors[root]
 		canonical, err := canonicalActionArtifactPath(execroot, filename)
 		if err != nil {
-			return nil, fmt.Errorf("canonicalize %s toolset artifact %q: %w", scope, filename, err)
+			return nil, fmt.Errorf("canonicalize %s toolset root %q anchor %q: %w", scope, root, filename, err)
 		}
-		if _, exists := resolver.exact[canonical]; exists {
-			return nil, fmt.Errorf("probe %s toolset closure repeats canonical artifact %q", scope, canonical)
+		if canonical != anchorCanonical {
+			return nil, fmt.Errorf("probe %s toolset root %q anchor maps to canonical artifact %q, manifest binds %q", scope, root, canonical, anchorCanonical)
+		}
+		physicalAnchor := filepath.Clean(filename)
+		if !filepath.IsAbs(physicalAnchor) {
+			physicalAnchor = filepath.Join(resolver.execroot, physicalAnchor)
+		}
+		location := manifest.ArtifactRoots[anchorCanonical]
+		physicalRoot, err := deriveToolsetPhysicalRoot(physicalAnchor, location.Path)
+		if err != nil {
+			return nil, fmt.Errorf("derive %s toolset root %q from anchor %q: %w", scope, root, filename, err)
+		}
+		physicalRoots[root] = physicalRoot
+	}
+	for _, canonical := range manifest.Closure {
+		location := manifest.ArtifactRoots[canonical]
+		filename := filepath.Join(physicalRoots[location.Root], filepath.FromSlash(location.Path))
+		gotCanonical, err := canonicalActionArtifactPath(execroot, filename)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalize reconstructed %s toolset artifact %q: %w", scope, filename, err)
+		}
+		if gotCanonical != canonical {
+			return nil, fmt.Errorf("reconstructed %s toolset artifact %q maps to canonical artifact %q, manifest binds %q", scope, filename, gotCanonical, canonical)
 		}
 		info, err := os.Stat(filename)
 		if err != nil {
-			return nil, fmt.Errorf("inspect %s toolset artifact %q: %w", scope, filename, err)
+			return nil, fmt.Errorf("inspect %s toolset artifact %q: %w", scope, canonical, err)
 		}
 		kind := manifest.ArtifactKinds[canonical]
 		source := kind == toolaction.KbuildToolsetArtifactSource
@@ -103,11 +131,6 @@ func loadToolsetPathResolver(execroot, scope, markerIdentity, manifestFilename s
 		resolver.exact[canonical] = binding
 		resolver.ordered = append(resolver.ordered, binding)
 	}
-	for _, canonical := range manifest.Closure {
-		if _, exists := resolver.exact[canonical]; !exists {
-			return nil, fmt.Errorf("probe %s toolset closure omits manifest artifact %q", scope, canonical)
-		}
-	}
 	sort.Slice(resolver.ordered, func(i, j int) bool {
 		left, right := resolver.ordered[i].canonical, resolver.ordered[j].canonical
 		if len(left) != len(right) {
@@ -116,6 +139,21 @@ func loadToolsetPathResolver(execroot, scope, markerIdentity, manifestFilename s
 		return left < right
 	})
 	return resolver, nil
+}
+
+func deriveToolsetPhysicalRoot(anchor, relative string) (string, error) {
+	root := filepath.Clean(anchor)
+	for range strings.Split(relative, "/") {
+		parent := filepath.Dir(root)
+		if parent == root {
+			return "", fmt.Errorf("root-relative path %q has more components than its physical anchor", relative)
+		}
+		root = parent
+	}
+	if reconstructed := filepath.Join(root, filepath.FromSlash(relative)); filepath.Clean(reconstructed) != filepath.Clean(anchor) {
+		return "", fmt.Errorf("root-relative path %q does not identify its physical anchor", relative)
+	}
+	return root, nil
 }
 
 func (r *toolsetPathResolver) setProjectionRoot(root string) error {
@@ -464,39 +502,4 @@ func ensurePathInsideDirectory(root, candidate string) error {
 		return fmt.Errorf("toolset path %q escapes typed directory %q", candidate, root)
 	}
 	return nil
-}
-
-// expandProbeParameterFiles expands Bazel multiline parameter files. Only
-// top-level @file arguments are accepted, and expansion is deliberately one
-// level so request-controlled values cannot acquire response-file semantics.
-func expandProbeParameterFiles(arguments []string) ([]string, error) {
-	out := make([]string, 0, len(arguments))
-	for _, argument := range arguments {
-		filename, parameterFile := strings.CutPrefix(argument, "@")
-		if !parameterFile {
-			out = append(out, argument)
-			continue
-		}
-		if filename == "" {
-			return nil, fmt.Errorf("empty probe parameter-file path")
-		}
-		data, err := os.ReadFile(filename)
-		if err != nil {
-			return nil, fmt.Errorf("open probe parameter file: %w", err)
-		}
-		if len(data) > maxProbeParameterFileBytes {
-			return nil, fmt.Errorf("read probe parameter file: file exceeds %d bytes", maxProbeParameterFileBytes)
-		}
-		lines := strings.Split(string(data), "\n")
-		if len(lines) != 0 && lines[len(lines)-1] == "" {
-			lines = lines[:len(lines)-1]
-		}
-		for _, line := range lines {
-			if line == "" || strings.ContainsRune(line, '\r') || strings.HasPrefix(line, "@") {
-				return nil, fmt.Errorf("probe parameter file contains an empty, nested, or CR-bearing argument")
-			}
-			out = append(out, line)
-		}
-	}
-	return out, nil
 }

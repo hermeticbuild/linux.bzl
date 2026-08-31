@@ -1201,6 +1201,76 @@ func TestExpandContentTemplateRejectsGeneratedTreeMarkers(t *testing.T) {
 	}
 }
 
+func TestExpandContentTemplateRejectsGeneratedToolsetPathProvenance(t *testing.T) {
+	marker := toolaction.ExecutionRootProvenanceMarker
+	terminator := toolaction.ExecutionRootProvenanceTerminator
+	targetToken, err := toolaction.EncodeExecutionRootProvenancePath("target", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostToken, err := toolaction.EncodeExecutionRootProvenancePath("host", "external/clang/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name, template string
+		contents       map[string]string
+	}{
+		{name: "complete marker", template: "${content:value}", contents: map[string]string{"value": marker}},
+		{name: "complete token", template: "${content:value}", contents: map[string]string{"value": hostToken}},
+		{name: "template-boundary split", template: "${content:value}" + marker[len(marker)/2:], contents: map[string]string{"value": marker[:len(marker)/2]}},
+		{name: "two-binding split", template: "${content:left}${content:right}", contents: map[string]string{
+			"left": marker[:len(marker)/2], "right": marker[len(marker)/2:],
+		}},
+		{
+			name:     "scope mutation inside token",
+			template: marker + "tar${content:scope}:external/gcc/include" + terminator,
+			contents: map[string]string{"scope": "get"},
+		},
+		{
+			name:     "path mutation inside token",
+			template: marker + "target:external/${content:compiler}/include" + terminator,
+			contents: map[string]string{"compiler": "clang"},
+		},
+		{
+			name:     "terminator supplied by content",
+			template: strings.TrimSuffix(targetToken, terminator) + "${content:terminator}",
+			contents: map[string]string{"terminator": terminator},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := expandContentTemplate(test.template, map[string]map[string]string{"content": test.contents})
+			if err == nil || !strings.Contains(err.Error(), "toolset-path provenance") {
+				t.Fatalf("expandContentTemplate error = %v, want toolset-path provenance rejection", err)
+			}
+		})
+	}
+
+	got, err := expandContentTemplate(
+		"${content:prefix}"+targetToken+"${content:separator}"+hostToken,
+		map[string]map[string]string{"content": {
+			"prefix":    "include=",
+			"separator": " host-include=",
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "include=" + targetToken + " host-include=" + hostToken; got != want {
+		t.Fatalf("planner-owned provenance = %q, want %q", got, want)
+	}
+}
+
+func TestRecipeWithoutToolsetScopeRejectsProvenanceToken(t *testing.T) {
+	token, err := toolaction.EncodeExecutionRootProvenancePath("target", "external/gcc/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := expandValueWithLiteralActionMarkers(token, map[string]map[string]string{}); err == nil || !strings.Contains(err.Error(), "no bound toolset scopes") {
+		t.Fatalf("scope-free recipe provenance error = %v", err)
+	}
+}
+
 func TestRunRecipeRejectsEnvironmentOnlyContentTransformBeforeExecution(t *testing.T) {
 	directory := t.TempDir()
 	queryResult := filepath.Join(directory, "query-result")
@@ -2375,6 +2445,87 @@ func TestRunRecipeExpandsToolchainContractPathsBeforeWorkingDirectory(t *testing
 	}
 	if strings.Contains(string(data), toolaction.ExecutionRootMarker) {
 		t.Fatalf("reserved execution-root marker survived expansion: %q", data)
+	}
+}
+
+func TestRunRecipeExpandsProbedCompilerPathBeforeWorkingDirectory(t *testing.T) {
+	executionRoot := t.TempDir()
+	t.Chdir(executionRoot)
+	canonicalInclude := "external/gcc/lib/gcc/aarch64-linux/15.2.0/include"
+	include := filepath.Join(executionRoot, "bazel-out", "arm64-fastbuild", "genfiles", filepath.FromSlash(canonicalInclude))
+	if err := os.MkdirAll(include, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(include, "arm_neon.h"), []byte("declared intrinsic\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(executionRoot, "out", "compiler-include")
+	workRoot := filepath.Join(executionRoot, "work")
+	probed, err := toolaction.EncodeExecutionRootProvenancePath("target", canonicalInclude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipe := kconfig.ActionRecipe{
+		Schema: kconfig.LinuxKernelPlanSchema, Kind: "compile", Tool: "cc",
+		Arguments: []string{"-isystem", probed, "${output:00000000}"},
+		Outputs:   []string{"00000000"}, WorkingDirectory: "nested",
+	}
+	recipePath, recipeID := writeRecipe(t, recipe)
+	compiler := filepath.Join(executionRoot, "selected-gcc")
+	if err := os.WriteFile(compiler, []byte("#!/bin/sh\ntest -f \"$2/arm_neon.h\" || exit 41\nprintf '%s' \"$2\" > \"$3\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := toolaction.KbuildToolsetManifest{
+		Schema:  toolaction.KbuildToolsetManifestSchema,
+		Scope:   "target",
+		Actions: map[string][]string{"cc": {toolaction.KbuildArgumentsSentinel}},
+		Tools:   map[string]string{"cc": "selected-gcc"},
+		Closure: []string{canonicalInclude, "selected-gcc"},
+		ArtifactKinds: map[string]string{
+			canonicalInclude: toolaction.KbuildToolsetArtifactGeneratedDirectory,
+			"selected-gcc":   toolaction.KbuildToolsetArtifactSource,
+		},
+		ArtifactRoots: map[string]toolaction.KbuildToolsetArtifactRoot{
+			canonicalInclude: {Root: "generated", Path: canonicalInclude},
+			"selected-gcc":   {Root: "source", Path: "selected-gcc"},
+		},
+		Roots: map[string]string{
+			"generated": canonicalInclude,
+			"source":    "selected-gcc",
+		},
+		Environments:  map[string]map[string]string{"cc": {}},
+		MakeVariables: map[string]string{},
+		Requirements:  map[string]map[string]string{"cc": {}},
+	}
+	identity, err := manifest.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(executionRoot, "target-toolset.json")
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, manifestData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runRecipe(recipeOptions{
+		recipe: recipePath, kind: "compile", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
+		toolRole: "cc", sources: map[string]string{}, inputs: map[string]string{},
+		outputs: map[string]string{"00000000": output}, tools: map[string]string{"cc": compiler}, trees: map[string]string{},
+		workingDirectory: workRoot, workingDirectoryMarker: filepath.Join(workRoot, ".linux-bzl-work-root"),
+		toolsetIdentities: []string{"target=" + identity},
+		toolsetManifests:  []string{"target=" + manifestPath},
+		toolsetAnchors:    []string{"target=generated=" + include, "target=source=" + compiler},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); got != include {
+		t.Fatalf("compiler include = %q, want absolute execroot path %q", got, include)
 	}
 }
 

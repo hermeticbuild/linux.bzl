@@ -34,6 +34,7 @@ func TestModuleSDKProjectsOnlyPreparationClosure(t *testing.T) {
 	plan.Products = append(plan.Products, ActionPlanProduct{
 		Name: "module_symvers", Tree: "metadata", Path: "Module.symvers",
 	})
+	vmlinux := seedModuleSDKVmlinuxForTest(t, plan)
 
 	if err := metadata.appendModuleSDKActionPlanNodes(plan); err != nil {
 		t.Fatalf("appendModuleSDKActionPlanNodes() failed: %v", err)
@@ -45,6 +46,7 @@ func TestModuleSDKProjectsOnlyPreparationClosure(t *testing.T) {
 		"scripts/module.lds":           moduleLinkerScript,
 		"rust/libkernel.rmeta":         persistentMetadata,
 		"Module.symvers":               symvers,
+		"vmlinux":                      vmlinux,
 	} {
 		projection := moduleSDKProjectionNodeForTest(t, plan, destination)
 		if len(projection.Inputs) != 1 || projection.Inputs[0].ProducerID != source.producer {
@@ -82,6 +84,21 @@ func TestModuleSDKRequiresNativeModuleSymversProduct(t *testing.T) {
 	}
 }
 
+func TestModuleSDKRequiresNativeVmlinuxProduct(t *testing.T) {
+	metadata := &CompactMetadata{Config: CompactConfig{}}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	seedModuleSDKPlanOutputForTest(t, plan, "prep", "prep", ".config", "sdk")
+	seedModuleSDKSymversForTest(t, plan)
+	before := len(plan.Nodes)
+	err := metadata.appendModuleSDKActionPlanNodes(plan)
+	if err == nil || !strings.Contains(err.Error(), `requires selected product "vmlinux"`) {
+		t.Fatalf("error = %v, want missing vmlinux product", err)
+	}
+	if got := len(plan.Nodes); got != before {
+		t.Fatalf("failed SDK projection added %d nodes", got-before)
+	}
+}
+
 func TestModuleSDKUsesDependencyOrderForCanonicalAndPrivatePersistentVersions(t *testing.T) {
 	const destination = "rust/libkernel.rmeta"
 	for _, test := range []struct {
@@ -113,6 +130,7 @@ func TestModuleSDKUsesDependencyOrderForCanonicalAndPrivatePersistentVersions(t 
 				)
 			}
 			seedModuleSDKSymversForTest(t, plan)
+			seedModuleSDKVmlinuxForTest(t, plan)
 
 			if err := metadata.appendModuleSDKActionPlanNodes(plan); err != nil {
 				t.Fatalf("appendModuleSDKActionPlanNodes() failed: %v", err)
@@ -180,6 +198,7 @@ func TestModuleSDKUsesKbuildOverwriteOrderWithoutActionDependency(t *testing.T) 
 				}
 			}
 			seedModuleSDKSymversForTest(t, plan)
+			seedModuleSDKVmlinuxForTest(t, plan)
 
 			if err := metadata.appendModuleSDKActionPlanNodes(plan); err != nil {
 				t.Fatalf("appendModuleSDKActionPlanNodes() failed: %v", err)
@@ -208,6 +227,7 @@ func TestModuleSDKRejectsUnorderedCanonicalAndPrivatePersistentVersions(t *testi
 	}, "sdk")
 	seedModuleSDKPlanOutputForTest(t, plan, "prep", "prep", destination, "sdk")
 	seedModuleSDKSymversForTest(t, plan)
+	seedModuleSDKVmlinuxForTest(t, plan)
 
 	err := metadata.appendModuleSDKActionPlanNodes(plan)
 	if err == nil || !strings.Contains(err.Error(), "is claimed by") {
@@ -223,6 +243,7 @@ func TestModuleSDKSelectedModuleSymversOverridesGenericObjectTreePath(t *testing
 	}
 	seedModuleSDKPlanOutputForTest(t, plan, "prep", "prep", "Module.symvers", "sdk")
 	symvers := seedModuleSDKSymversForTest(t, plan)
+	seedModuleSDKVmlinuxForTest(t, plan)
 
 	if err := metadata.appendModuleSDKActionPlanNodes(plan); err != nil {
 		t.Fatalf("appendModuleSDKActionPlanNodes() failed: %v", err)
@@ -282,6 +303,7 @@ rust/helper-wrapper.o: rust/helper.rs FORCE
 		t.Fatalf("linear compiler lowering omits persistent output %q", persistent)
 	}
 	seedModuleSDKSymversForTest(t, plan)
+	seedModuleSDKVmlinuxForTest(t, plan)
 	if err := metadata.appendModuleSDKActionPlanNodes(plan); err != nil {
 		t.Fatalf("appendModuleSDKActionPlanNodes() failed: %v", err)
 	}
@@ -407,6 +429,15 @@ func seedModuleSDKSymversForTest(t *testing.T, plan *ActionPlan) moduleSDKSelect
 		Name: "module_symvers", Tree: "metadata", Path: "Module.symvers",
 	})
 	return symvers
+}
+
+func seedModuleSDKVmlinuxForTest(t *testing.T, plan *ActionPlan) moduleSDKSelectedArtifact {
+	t.Helper()
+	vmlinux := seedModuleSDKPlanOutputForTest(t, plan, "target", "vmlinux", "vmlinux", "vmlinux")
+	plan.Products = append(plan.Products, ActionPlanProduct{
+		Name: "vmlinux", Tree: "vmlinux", Path: "vmlinux",
+	})
+	return vmlinux
 }
 
 func moduleSDKProjectionNodeForTest(t *testing.T, plan *ActionPlan, outputPath string) ActionPlanNode {

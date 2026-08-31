@@ -22,6 +22,7 @@ import (
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
+	"github.com/hermeticbuild/linux.bzl/internal/toolsetpath"
 )
 
 type repeatedFlag []string
@@ -30,16 +31,17 @@ func (f *repeatedFlag) String() string         { return strings.Join(*f, " ") }
 func (f *repeatedFlag) Set(value string) error { *f = append(*f, value); return nil }
 
 type recipeOptions struct {
-	recipe, kind, expectedNodeID, expectedRecipeID     string
-	toolRole, workingDirectory, workingDirectoryMarker string
-	inputBindings, expectedInputBindingsID             string
-	sources, inputs, outputs, tools, trees             map[string]string
-	artifactTrees                                      map[string]string
-	privateInputTrees                                  map[string]bool
-	runtimeTools                                       map[string]string
-	actionArgs                                         []string
-	actionEnvironment                                  map[string]string
-	auxiliaryActionContracts                           map[string]toolaction.Contract
+	recipe, kind, expectedNodeID, expectedRecipeID      string
+	toolRole, workingDirectory, workingDirectoryMarker  string
+	inputBindings, expectedInputBindingsID              string
+	sources, inputs, outputs, tools, trees              map[string]string
+	artifactTrees                                       map[string]string
+	privateInputTrees                                   map[string]bool
+	runtimeTools                                        map[string]string
+	actionArgs                                          []string
+	actionEnvironment                                   map[string]string
+	auxiliaryActionContracts                            map[string]toolaction.Contract
+	toolsetIdentities, toolsetManifests, toolsetAnchors []string
 }
 
 func decodeRecipe(filename string) (kconfig.ActionRecipe, []byte, error) {
@@ -288,6 +290,24 @@ func runRecipe(opts recipeOptions) error {
 	if !isDigest(opts.expectedNodeID) || !isDigest(opts.expectedRecipeID) {
 		return fmt.Errorf("expected node and recipe IDs must be canonical SHA-256 digests")
 	}
+	var toolsetPaths *toolsetpath.Resolver
+	if len(opts.toolsetIdentities) != 0 || len(opts.toolsetManifests) != 0 || len(opts.toolsetAnchors) != 0 {
+		projectionRoot, err := os.MkdirTemp("", "linux-bzl-recipe-toolsets-")
+		if err != nil {
+			return fmt.Errorf("create recipe toolset projection root: %w", err)
+		}
+		defer os.RemoveAll(projectionRoot)
+		toolsetPaths, err = toolsetpath.LoadFlags(
+			executionRoot,
+			projectionRoot,
+			opts.toolsetIdentities,
+			opts.toolsetManifests,
+			opts.toolsetAnchors,
+		)
+		if err != nil {
+			return fmt.Errorf("load recipe toolset bindings: %w", err)
+		}
+	}
 	recipe, canonical, err := decodeRecipe(opts.recipe)
 	if err != nil {
 		return err
@@ -455,9 +475,15 @@ func runRecipe(opts recipeOptions) error {
 		return err
 	}
 	bindings["content"] = contentBindings
-	expand := func(value string) (string, error) { return expandValue(value, bindings) }
+	expand := func(value string) (string, error) {
+		value, err := toolsetpath.Rewrite(value, toolsetPaths)
+		if err != nil {
+			return "", err
+		}
+		return expandValue(value, bindings)
+	}
 	expandLiteral := func(value string) (string, error) {
-		return expandValueWithLiteralActionMarkers(value, bindings)
+		return expandValueWithLiteralActionMarkersAndToolsets(value, bindings, toolsetPaths)
 	}
 	workingRoot := ""
 	executionDirectory := ""
@@ -626,7 +652,11 @@ func runRecipe(opts recipeOptions) error {
 	if err != nil {
 		return err
 	}
-	for _, name := range []string{toolaction.EnvironmentName, toolaction.RuntimeToolPathEnvironmentName} {
+	for _, name := range []string{
+		toolaction.EnvironmentName,
+		toolaction.RuntimeToolPathEnvironmentName,
+		toolsetpath.HandoffEnvironmentName,
+	} {
 		if _, exists := opts.actionEnvironment[name]; exists {
 			return fmt.Errorf("configured action environment uses reserved variable %s", name)
 		}
@@ -634,7 +664,7 @@ func runRecipe(opts recipeOptions) error {
 			return fmt.Errorf("recipe environment uses reserved variable %s", name)
 		}
 	}
-	if len(recipeEnvironment) != 0 || len(opts.auxiliaryActionContracts) != 0 || runtimeToolDirectory != "" {
+	if len(recipeEnvironment) != 0 || len(opts.auxiliaryActionContracts) != 0 || runtimeToolDirectory != "" || recipe.Tool == "scriptrun" {
 		environment := environmentMap(command.Env)
 		for _, key := range sortedKeys(recipeEnvironment) {
 			value, err := expandLiteral(recipeEnvironment[key])
@@ -657,6 +687,14 @@ func runRecipe(opts recipeOptions) error {
 				environment["PATH"] = runtimeToolDirectory
 			}
 			environment[toolaction.RuntimeToolPathEnvironmentName] = runtimeToolDirectory
+		}
+		if recipe.Tool == "scriptrun" && toolsetPaths != nil {
+			handoff, err := toolsetPaths.CreateHandoff("")
+			if err != nil {
+				return fmt.Errorf("create scriptrun toolset handoff: %w", err)
+			}
+			cleanups = append(cleanups, func() { _ = os.Remove(handoff) })
+			environment[toolsetpath.HandoffEnvironmentName] = handoff
 		}
 		command.Env = environmentList(environment)
 	}
@@ -1494,8 +1532,21 @@ func expandValue(value string, bindings map[string]map[string]string) (string, e
 // spelling cannot become a capability. Placeholder replacements are copied as
 // opaque data and are never inspected for private escape bytes.
 func expandValueWithLiteralActionMarkers(value string, bindings map[string]map[string]string) (string, error) {
+	return expandValueWithLiteralActionMarkersAndToolsets(value, bindings, nil)
+}
+
+func expandValueWithLiteralActionMarkersAndToolsets(
+	value string,
+	bindings map[string]map[string]string,
+	toolsetPaths *toolsetpath.Resolver,
+) (string, error) {
 	var out strings.Builder
 	writeLiteral := func(literal string) error {
+		var err error
+		literal, err = toolsetpath.Rewrite(literal, toolsetPaths)
+		if err != nil {
+			return err
+		}
 		restored, err := kconfig.RestoreCompactKbuildLiteralActionMarkers(literal)
 		if err != nil {
 			return err
@@ -1557,14 +1608,31 @@ func restoreRecipeEnvironmentNames(environment map[string]string) (map[string]st
 func expandContentTemplate(value string, bindings map[string]map[string]string) (string, error) {
 	var out strings.Builder
 	allowedTrees := map[int]string{}
+	allowedToolsetPaths := map[int]string{}
+	writeLiteral := func(literal string) error {
+		tokens, err := indexedToolsetPathTokens(literal)
+		if err != nil {
+			return fmt.Errorf("template literal contains split or invalid toolset-path provenance: %w", err)
+		}
+		base := out.Len()
+		for offset, token := range tokens {
+			allowedToolsetPaths[base+offset] = token
+		}
+		out.WriteString(literal)
+		return nil
+	}
 	for cursor := 0; ; {
 		relativeStart := strings.Index(value[cursor:], "${")
 		if relativeStart < 0 {
-			out.WriteString(value[cursor:])
+			if err := writeLiteral(value[cursor:]); err != nil {
+				return "", err
+			}
 			break
 		}
 		start := cursor + relativeStart
-		out.WriteString(value[cursor:start])
+		if err := writeLiteral(value[cursor:start]); err != nil {
+			return "", err
+		}
 		relativeEnd := strings.IndexByte(value[start+2:], '}')
 		if relativeEnd < 0 {
 			return "", fmt.Errorf("unterminated placeholder in %q", value)
@@ -1604,7 +1672,48 @@ func expandContentTemplate(value string, bindings map[string]map[string]string) 
 		}
 		cursor = start + len("${tree:")
 	}
+	expandedToolsetPaths, err := indexedToolsetPathTokens(expanded)
+	if err != nil {
+		return "", fmt.Errorf("generated content altered reserved toolset-path provenance: %w", err)
+	}
+	for offset, token := range expandedToolsetPaths {
+		if allowedToolsetPaths[offset] != token {
+			return "", fmt.Errorf("generated content created or modified reserved toolset-path provenance at byte %d", offset)
+		}
+	}
+	for offset, token := range allowedToolsetPaths {
+		if expandedToolsetPaths[offset] != token {
+			return "", fmt.Errorf("generated content removed or modified reserved toolset-path provenance at byte %d", offset)
+		}
+	}
 	return expanded, nil
+}
+
+// indexedToolsetPathTokens validates every private provenance delimiter and
+// returns each complete canonical token by its byte offset. Content templates
+// treat those tokens as indivisible literals: generated substitutions may move
+// later tokens only by changing the length of preceding content, never split or
+// rewrite a token which the planner supplied.
+func indexedToolsetPathTokens(value string) (map[int]string, error) {
+	if err := toolaction.ValidateExecutionRootProvenanceValue(value); err != nil {
+		return nil, err
+	}
+	tokens := map[int]string{}
+	for cursor := 0; ; {
+		relativeStart := strings.Index(value[cursor:], toolaction.ExecutionRootProvenanceMarker)
+		if relativeStart < 0 {
+			return tokens, nil
+		}
+		start := cursor + relativeStart
+		payloadStart := start + len(toolaction.ExecutionRootProvenanceMarker)
+		relativeEnd := strings.Index(value[payloadStart:], toolaction.ExecutionRootProvenanceTerminator)
+		if relativeEnd < 0 {
+			return nil, fmt.Errorf("toolset-path token at byte %d is unterminated", start)
+		}
+		end := payloadStart + relativeEnd + len(toolaction.ExecutionRootProvenanceTerminator)
+		tokens[start] = value[start:end]
+		cursor = end
+	}
 }
 
 // expandValueKinds expands only the selected typed placeholder kinds. Every
@@ -1908,6 +2017,7 @@ func isDigest(value string) bool {
 func main() {
 	var sourceFlags, inputFlags, outputFlags, toolFlags, runtimeToolFlags, treeFlags, artifactTreeFlags, privateInputTreeFlags, actionArgs, actionEnvironment repeatedFlag
 	var auxiliaryActionRoles, auxiliaryActionArguments, auxiliaryActionEnvironment repeatedFlag
+	var toolsetIdentities, toolsetManifests, toolsetAnchors repeatedFlag
 	recipe := flag.String("recipe", "", "v4 action recipe JSON")
 	kind := flag.String("kind", "", "node kind encoded by the plan")
 	expectedNodeID := flag.String("expected_node_id", "", "content-addressed node ID")
@@ -1934,6 +2044,9 @@ func main() {
 	flag.Var(&auxiliaryActionRoles, "auxiliary_action_role", "auxiliary configured action role (repeatable)")
 	flag.Var(&auxiliaryActionArguments, "auxiliary_action_arg", "auxiliary configured action argument ROLE=VALUE (repeatable)")
 	flag.Var(&auxiliaryActionEnvironment, "auxiliary_action_env", "auxiliary configured action environment ROLE=NAME=VALUE (repeatable)")
+	flag.Var(&toolsetIdentities, "toolset_identity", "identity-bound toolset scope SCOPE=SHA256 (repeatable)")
+	flag.Var(&toolsetManifests, "toolset_manifest", "identity-bound toolset manifest SCOPE=PATH (repeatable)")
+	flag.Var(&toolsetAnchors, "toolset_anchor", "typed toolset root anchor SCOPE=ROOT=PATH (repeatable)")
 	flag.Parse()
 	workingDirectory := ""
 	if *workingDirectoryMarker != "" {
@@ -2003,7 +2116,8 @@ func main() {
 		os.Exit(2)
 	}
 	opts := recipeOptions{recipe: *recipe, kind: *kind, expectedNodeID: *expectedNodeID, expectedRecipeID: *expectedRecipeID, inputBindings: *inputBindings, expectedInputBindingsID: *expectedInputBindingsID, toolRole: *toolRole, workingDirectory: workingDirectory, workingDirectoryMarker: *workingDirectoryMarker, actionArgs: actionArgs,
-		actionEnvironment: actionEnv, auxiliaryActionContracts: auxiliaryContracts, sources: *bindings[0].out, inputs: *bindings[1].out, outputs: *bindings[2].out, tools: *bindings[3].out, runtimeTools: runtimeTools, trees: *bindings[4].out, artifactTrees: artifactTrees, privateInputTrees: privateInputTrees}
+		actionEnvironment: actionEnv, auxiliaryActionContracts: auxiliaryContracts, sources: *bindings[0].out, inputs: *bindings[1].out, outputs: *bindings[2].out, tools: *bindings[3].out, runtimeTools: runtimeTools, trees: *bindings[4].out, artifactTrees: artifactTrees, privateInputTrees: privateInputTrees,
+		toolsetIdentities: toolsetIdentities, toolsetManifests: toolsetManifests, toolsetAnchors: toolsetAnchors}
 	if err := runRecipe(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: %v\n", err)
 		os.Exit(1)

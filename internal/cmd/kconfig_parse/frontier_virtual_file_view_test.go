@@ -51,6 +51,32 @@ func TestKbuildFrontierVirtualFileViewReadsExactAndOpaqueFiles(t *testing.T) {
 	}
 }
 
+func TestKbuildFrontierVirtualFileViewReadsImmutableBaselineUntilFrontierReplacesIt(t *testing.T) {
+	const releasePath = "include/config/kernel.release"
+	baseline := map[string]string{releasePath: "6.18.39-baseline\n"}
+	view := kbuildFrontierVirtualFileView{
+		directory:         "scripts",
+		immutableContents: baseline,
+	}
+
+	rooted := kbuildEvalObjectTree + "/" + releasePath
+	for _, pathname := range []string{rooted, "../" + releasePath} {
+		content, exists, exact, err := view.Read(pathname)
+		if err != nil || !exists || !exact || content != baseline[releasePath] {
+			t.Fatalf("immutable Read(%q) = (%q, %t, %t, %v)", pathname, content, exists, exact, err)
+		}
+	}
+	if got, want := view.Match(kbuildEvalObjectTree+"/include/config/kernel.*"), []string{rooted}; !slices.Equal(got, want) {
+		t.Fatalf("immutable Match() = %q, want %q", got, want)
+	}
+
+	view.state = kbuildFrontierSet(view.state, releasePath, testKbuildFrontierValue(releasePath, "6.18.39-generated\n", true))
+	content, exists, exact, err := view.Read(rooted)
+	if err != nil || !exists || !exact || content != "6.18.39-generated\n" {
+		t.Fatalf("frontier replacement read = (%q, %t, %t, %v)", content, exists, exact, err)
+	}
+}
+
 func TestKbuildFrontierVirtualFileViewReadsAndMatchesNestedSourceOverlay(t *testing.T) {
 	const overlay = ".linux-bzl/external/demo"
 	embeddedSourceMarker := overlay + "/" + kbuildEvalSourceTree + "/drivers/net/generated"

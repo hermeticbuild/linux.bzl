@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 type KbuildFile struct {
@@ -2970,9 +2972,11 @@ func (p *kbuildParser) evalShell(args []string, original string, depth int) (str
 		return "", fmt.Errorf("%s: Kbuild shell command %q requires a hermetic evaluator", p.currentPos, command)
 	}
 	value, err := p.shell(command)
+	evaluatorOwned := err == nil
 	if err != nil && p.sourceShell != nil && IsLinuxProbeUnsupportedCommand(err) {
 		if sourceValue, sourceErr := p.sourceShell(command, p.workingDir); sourceErr == nil {
 			value, err = sourceValue, nil
+			evaluatorOwned = false
 		} else if !IsLinuxProbeUnsupportedCommand(sourceErr) {
 			return "", fmt.Errorf("%s: evaluate Kbuild source shell command %q: %w", p.currentPos, command, sourceErr)
 		}
@@ -2980,12 +2984,25 @@ func (p *kbuildParser) evalShell(args []string, original string, depth int) (str
 	if err != nil {
 		return "", fmt.Errorf("%s: evaluate Kbuild shell command %q: %w", p.currentPos, command, err)
 	}
+	if evaluatorOwned {
+		return normalizeKbuildEvaluatorShellOutput(value)
+	}
 	return normalizeKbuildShellOutput(value)
 }
 
 func normalizeKbuildShellOutput(value string) (string, error) {
+	if compactKbuildContainsPrivateProvenanceByte(value) || compactKbuildContainsPrivateToolsetPathByte(value) {
+		return "", fmt.Errorf("Kbuild shell output contains a reserved provenance byte")
+	}
+	return NormalizeGNUMakeShellOutput(value), nil
+}
+
+func normalizeKbuildEvaluatorShellOutput(value string) (string, error) {
 	if compactKbuildContainsPrivateProvenanceByte(value) {
 		return "", fmt.Errorf("Kbuild shell output contains a reserved provenance byte")
+	}
+	if err := toolaction.ValidateExecutionRootProvenanceValue(value); err != nil {
+		return "", fmt.Errorf("Kbuild evaluator shell output: %w", err)
 	}
 	return NormalizeGNUMakeShellOutput(value), nil
 }
@@ -4319,6 +4336,9 @@ func ValidateKbuildOrdinaryValue(operation, value string) error {
 	if compactKbuildContainsPrivateProvenanceByte(value) {
 		return fmt.Errorf("%s contains a reserved recursive Make provenance byte", operation)
 	}
+	if compactKbuildContainsPrivateToolsetPathByte(value) {
+		return fmt.Errorf("%s contains a reserved toolset-path provenance byte", operation)
+	}
 	return nil
 }
 
@@ -4346,9 +4366,24 @@ func (p *kbuildParser) expandWildcard(patterns string) (string, error) {
 	for _, pattern := range strings.Fields(patterns) {
 		matches, relBase := p.glob(pattern)
 		pattern = filepath.ToSlash(pattern)
+		query := compactKbuildMaterializeActionTreeMarkers(pattern)
+		_, _, actionRooted := compactKbuildActionTreeRoot(pattern)
 		var lazyMatches []string
 		if p.virtualFileView != nil {
-			lazyMatches = p.virtualFileView.Match(pattern)
+			lazyMatches = p.virtualFileView.Match(query)
+			for _, match := range lazyMatches {
+				if err := ValidateKbuildOrdinaryValue("Kbuild virtual wildcard result", match); err != nil {
+					return "", err
+				}
+				if compactKbuildContainsPrivateActionMarker(match) {
+					return "", fmt.Errorf("Kbuild virtual wildcard result contains a reserved private action marker")
+				}
+			}
+			if actionRooted {
+				for index := range lazyMatches {
+					lazyMatches[index] = compactKbuildRestoreActionTreeMarkers(lazyMatches[index], pattern)
+				}
+			}
 		}
 		visible := make([]string, 0, len(matches)+len(lazyMatches))
 		for _, match := range matches {
@@ -4363,7 +4398,12 @@ func (p *kbuildParser) expandWildcard(patterns string) (string, error) {
 			visible = append(visible, filepath.ToSlash(candidate))
 		}
 		for _, match := range visible {
-			if err := ValidateKbuildOrdinaryValue("Kbuild wildcard result", match); err != nil {
+			// Private action roots in a result can only come from this parser's
+			// planner-owned query or mapped physical lookup. Validate their public
+			// spelling so arbitrary virtual-file contents still cannot introduce a
+			// reserved provenance byte.
+			ordinary := compactKbuildMaterializeActionTreeRoot(match, pattern)
+			if err := ValidateKbuildOrdinaryValue("Kbuild wildcard result", ordinary); err != nil {
 				return "", err
 			}
 		}
@@ -4483,7 +4523,13 @@ func (p *kbuildParser) makeFile(arg, original string) (string, error) {
 	}
 	virtualPath := filepath.ToSlash(filepath.Clean(path))
 	if p.virtualFileView != nil {
-		contents, exists, exact, err := p.virtualFileView.Read(virtualPath)
+		// Action lowering replaces evaluator-owned roots with private control-byte
+		// markers. The virtual view models the Make-visible filesystem and speaks
+		// the public sentinel namespace, so normalize only its query. Keep path
+		// unchanged for the physical fallback below, whose source-root map owns the
+		// private aliases.
+		query := compactKbuildMaterializeActionTreeMarkers(virtualPath)
+		contents, exists, exact, err := p.virtualFileView.Read(query)
 		if err != nil {
 			return "", err
 		}

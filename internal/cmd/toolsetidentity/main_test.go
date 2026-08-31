@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 func testManifest() toolsetManifest {
@@ -23,6 +25,12 @@ func testManifest() toolsetManifest {
 			"external/toolchain/bin/ld":        "generated-file",
 			"external/toolchain/lib/runtime.a": "source-artifact",
 		},
+		ArtifactRoots: map[string]toolaction.KbuildToolsetArtifactRoot{
+			"external/toolchain/bin/cc":        {Root: "root-00000000", Path: "external/toolchain/bin/cc"},
+			"external/toolchain/bin/ld":        {Root: "root-00000000", Path: "external/toolchain/bin/ld"},
+			"external/toolchain/lib/runtime.a": {Root: "root-00000000", Path: "external/toolchain/lib/runtime.a"},
+		},
+		Roots: map[string]string{"root-00000000": "external/toolchain/bin/cc"},
 		Environments: map[string]map[string]string{
 			"cc": {"PATH": "/toolchain/cc", "ZERO_AR_DATE": "1"},
 			"ld": {"PATH": "/toolchain/ld"},
@@ -72,17 +80,30 @@ func TestManifestIdentityIsStableAndSensitiveToEveryField(t *testing.T) {
 		"scope":       func(m *toolsetManifest) { m.Scope = "host" },
 		"action argv": func(m *toolsetManifest) { m.Actions["cc"][1] = "--different" },
 		"tool path": func(m *toolsetManifest) {
-			delete(m.ArtifactKinds, m.Closure[0])
+			old := m.Closure[0]
+			delete(m.ArtifactKinds, old)
+			delete(m.ArtifactRoots, old)
 			m.Closure[0] = "external/toolchain/bin/alternate-cc"
 			m.Tools["cc"] = m.Closure[0]
 			m.ArtifactKinds[m.Closure[0]] = "generated-file"
+			m.ArtifactRoots[m.Closure[0]] = toolaction.KbuildToolsetArtifactRoot{Root: "root-00000000", Path: m.Closure[0]}
+			m.Roots["root-00000000"] = m.Closure[0]
 		},
 		"closure": func(m *toolsetManifest) {
-			delete(m.ArtifactKinds, m.Closure[2])
+			old := m.Closure[2]
+			delete(m.ArtifactKinds, old)
+			delete(m.ArtifactRoots, old)
 			m.Closure[2] = "external/toolchain/lib/runtime.so"
 			m.ArtifactKinds[m.Closure[2]] = "source-artifact"
+			m.ArtifactRoots[m.Closure[2]] = toolaction.KbuildToolsetArtifactRoot{Root: "root-00000000", Path: m.Closure[2]}
 		},
-		"artifact kind":   func(m *toolsetManifest) { m.ArtifactKinds["external/toolchain/bin/cc"] = "source-artifact" },
+		"artifact kind": func(m *toolsetManifest) { m.ArtifactKinds["external/toolchain/bin/cc"] = "source-artifact" },
+		"artifact root path": func(m *toolsetManifest) {
+			location := m.ArtifactRoots["external/toolchain/bin/ld"]
+			location.Path = "alternate/root/bin/ld"
+			m.ArtifactRoots["external/toolchain/bin/ld"] = location
+		},
+		"root anchor":     func(m *toolsetManifest) { m.Roots["root-00000000"] = "external/toolchain/bin/ld" },
 		"cc environment":  func(m *toolsetManifest) { m.Environments["cc"]["ZERO_AR_DATE"] = "0" },
 		"ld environment":  func(m *toolsetManifest) { m.Environments["ld"]["PATH"] = "/other/ld" },
 		"cc requirements": func(m *toolsetManifest) { m.Requirements["cc"]["supports-path-mapping"] = "0" },

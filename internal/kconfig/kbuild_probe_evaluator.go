@@ -14,6 +14,8 @@ import (
 	"maps"
 	"slices"
 	"strings"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 // KbuildProbeWorkloadOptions binds both configured compiler scopes to one
@@ -560,7 +562,7 @@ func (s *KbuildProbeScopes) isSingleCompleteSymbolicTextArgument(args []string) 
 		return false
 	}
 	_, symbol, ok := s.symbolOwner(completeToken)
-	return ok && (symbol.kind == "text" || symbol.kind == "transformed-text")
+	return ok && (symbol.kind == "text" || symbol.kind == "transformed-text" || symbol.kind == "toolset-path-literal")
 }
 
 func (s *KbuildProbeScopes) renderMakeText(function string, arguments []string, protocolValue string, protocolMode linuxProbeMakeTextProtocolMode) (string, error) {
@@ -860,7 +862,7 @@ func (s *KbuildProbeScopes) transformCompositionalSubstText(
 		var tokenValue string
 		tokenMode := linuxProbeMakeTextProtocolExact
 		switch symbol.kind {
-		case "text", "transformed-text":
+		case "text", "transformed-text", "toolset-path-literal":
 			var err error
 			tokenValue, err = evaluator.renderTextTransform(token, "subst", []string{old, replacement, token}, 2)
 			if err != nil {
@@ -1055,7 +1057,7 @@ func (s *KbuildProbeScopes) makeTextInputProtocolMode(values ...string) (linuxPr
 					return fmt.Errorf("Linux whole Make text symbolic value %q has no expression", token)
 				}
 				mode = combineLinuxProbeMakeTextProtocolMode(mode, symbol.makeText.protocolMode)
-			case "text":
+			case "text", "toolset-path-literal":
 			default:
 				return fmt.Errorf("Linux probe symbolic value %q has unsupported kind %q in protocol proof", token, symbol.kind)
 			}
@@ -1247,7 +1249,7 @@ func (s *KbuildProbeScopes) transformWordwiseFiniteSymbolicFilter(function strin
 					return "", true, collectErr
 				}
 			}
-		case "text", "transformed-text":
+		case "text", "transformed-text", "toolset-path-literal":
 			transformed, err := evaluator.renderTextTransform(word, function, []string{patterns, word}, 1)
 			if err != nil {
 				return "", true, err
@@ -1445,7 +1447,7 @@ func (s *KbuildProbeScopes) transformCompositionalSymbolicStrip(args []string) (
 			return "", true, fmt.Errorf("unknown Linux probe symbolic value %q", word)
 		}
 		switch symbol.kind {
-		case "text", "transformed-text":
+		case "text", "transformed-text", "toolset-path-literal":
 			transformed, err := evaluator.renderTextTransform(word, "strip", []string{word}, 0)
 			if err != nil {
 				return "", true, err
@@ -1941,7 +1943,7 @@ func (s *KbuildProbeScopes) collectSymbolicComparison(values ...string) (
 						return err
 					}
 				}
-			case "text", "transformed-text":
+			case "text", "transformed-text", "toolset-path-literal":
 				if symbol.reference.Kind != "text" {
 					if symbol.kind == "text" {
 						return fmt.Errorf("Linux text probe symbolic value %q has %q reference", token, symbol.reference.Kind)
@@ -2122,7 +2124,7 @@ func (s *KbuildProbeScopes) symbolEmptiness(
 			states[index] = state
 		}
 		return uniformKbuildSymbolicEmptiness(states), nil
-	case "text", "transformed-text":
+	case "text", "transformed-text", "toolset-path-literal":
 		return kbuildSymbolicEmptinessUnknown, nil
 	case "make-text":
 		if symbol.makeText == nil {
@@ -2556,6 +2558,109 @@ func (s *KbuildProbeScopes) References() []ProbeReference {
 		}
 	}
 	return references
+}
+
+// ImportToolsetPathCapabilities performs the typed phase handoff from an
+// upstream Kconfig probe workload into this Kbuild workload. The upstream
+// callback first authenticates and removes its transient tags. Kbuild then
+// hides the deterministic provenance behind one stable symbolic atom so
+// source-owned Make never observes either workload's authenticator. Replay
+// seals the value with this workload's key immediately before symbolic use.
+func (s *KbuildProbeScopes) ImportToolsetPathCapabilities(
+	value string,
+	normalizeUpstream func(string) (string, error),
+) (string, error) {
+	if s == nil {
+		return "", fmt.Errorf("Kbuild probe workload is nil")
+	}
+	if normalizeUpstream == nil {
+		return "", fmt.Errorf("Kconfig toolset-path normalizer is nil")
+	}
+	normalized, err := normalizeUpstream(value)
+	if err != nil {
+		return "", fmt.Errorf("authenticate Kconfig toolset path: %w", err)
+	}
+	if linuxProbeSymbolPattern.MatchString(normalized) {
+		return "", fmt.Errorf("Kconfig toolset-path handoff contains an unresolved upstream probe symbol")
+	}
+	scopes := map[string]bool{}
+	found := false
+	if _, err := toolaction.RewriteExecutionRootProvenanceValue(normalized, func(scope, _ string) (string, error) {
+		found = true
+		scopes[scope] = true
+		return "authenticated-toolset-path", nil
+	}); err != nil {
+		return "", fmt.Errorf("validate normalized Kconfig toolset path: %w", err)
+	}
+	if !found {
+		return normalized, nil
+	}
+
+	var registry *linuxProbeSymbolRegistry
+	for _, scope := range []string{"target", "host"} {
+		evaluator := s.evaluators[scope]
+		if evaluator == nil {
+			continue
+		}
+		if evaluator.symbolRegistry == nil {
+			return "", fmt.Errorf("Kbuild probe workload %s evaluator has no shared symbol registry", scope)
+		}
+		if registry != nil && registry != evaluator.symbolRegistry {
+			return "", fmt.Errorf("Kbuild probe workload evaluators do not share toolset-path authority")
+		}
+		registry = evaluator.symbolRegistry
+	}
+	if registry == nil {
+		return "", fmt.Errorf("Kbuild probe workload has no evaluator symbol registry")
+	}
+	digest := sha256.Sum256([]byte("linux-bzl-kconfig-toolset-path-handoff-v1\x00" + normalized))
+	token := fmt.Sprintf("%s%x", linuxProbeSymbolPrefix, digest)
+	symbol := linuxProbeSymbol{
+		kind:               "toolset-path-literal",
+		toolsetPathLiteral: normalized,
+		toolsetPathScopes:  slices.Sorted(maps.Keys(scopes)),
+	}
+	if err := registry.publish(token, symbol); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// BindActionPlanToolsetPathCapabilities attaches this workload's authenticated
+// compiler-path normalizer to metadata produced inside the same callback.
+// Source-owned Make transformations remain visible until action lowering, but
+// no ephemeral capability tag or unauthenticated runtime token may cross the
+// recipe content-addressing boundary.
+func (s *KbuildProbeScopes) BindActionPlanToolsetPathCapabilities(metadata *CompactMetadata) error {
+	if s == nil {
+		return fmt.Errorf("Kbuild probe workload is nil")
+	}
+	if metadata == nil {
+		return fmt.Errorf("Kbuild probe workload cannot bind nil metadata")
+	}
+	var registry *linuxProbeSymbolRegistry
+	for _, scope := range []string{"target", "host"} {
+		evaluator := s.evaluators[scope]
+		if evaluator == nil {
+			continue
+		}
+		if evaluator.symbolRegistry == nil {
+			return fmt.Errorf("Kbuild probe workload %s evaluator has no shared symbol registry", scope)
+		}
+		if registry != nil && registry != evaluator.symbolRegistry {
+			return fmt.Errorf("Kbuild probe workload evaluators do not share toolset-path authority")
+		}
+		registry = evaluator.symbolRegistry
+	}
+	if registry == nil {
+		return fmt.Errorf("Kbuild probe workload has no evaluator symbol registry")
+	}
+	codec, err := registry.executionRootProvenanceCapabilityCodec()
+	if err != nil {
+		return err
+	}
+	metadata.toolsetPathCapabilityNormalizer = codec.NormalizeValue
+	return nil
 }
 
 // BindExactScriptEnvironments interns one complete source-owned environment

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
+	"github.com/hermeticbuild/linux.bzl/internal/toolsetpath"
 )
 
 const (
@@ -133,6 +134,7 @@ type scriptRunOptions struct {
 	literalTreeOffsets map[int]bool
 	toolContracts      map[string]toolaction.Contract
 	runtimeToolPath    string
+	toolsetHandoff     string
 	replays            []scriptReplayManifest
 	stdin              io.Reader
 	stdout             io.Writer
@@ -182,6 +184,17 @@ func runScript(opts scriptRunOptions) error {
 	if err != nil {
 		return fmt.Errorf("resolve private script runtime: %w", err)
 	}
+	var toolsetPaths *toolsetpath.Resolver
+	if opts.toolsetHandoff != "" {
+		projectionRoot := filepath.Join(runtimeRoot, "toolsets")
+		if err := os.Mkdir(projectionRoot, 0o700); err != nil {
+			return fmt.Errorf("create script toolset projection root: %w", err)
+		}
+		toolsetPaths, err = toolsetpath.LoadHandoff(opts.toolsetHandoff, projectionRoot)
+		if err != nil {
+			return fmt.Errorf("load script toolset bindings: %w", err)
+		}
+	}
 	runtimeToolPath, err := validateRuntimeToolPath(opts.runtimeToolPath)
 	if err != nil {
 		return err
@@ -200,10 +213,22 @@ func runScript(opts scriptRunOptions) error {
 		if err != nil {
 			return err
 		}
+		opts.scriptContent, err = toolsetpath.RewriteShell(opts.scriptContent, toolsetPaths)
+		if err != nil {
+			return fmt.Errorf("expand evaluated-script compiler path: %w", err)
+		}
 		script = filepath.Join(runtimeRoot, "evaluated-kbuild-recipe.sh")
 		if err := os.WriteFile(script, []byte(opts.scriptContent), 0o600); err != nil {
 			return fmt.Errorf("materialize evaluated Kbuild recipe: %w", err)
 		}
+	}
+	var toolsetAliasRoot *os.File
+	if toolsetPaths != nil {
+		toolsetAliasRoot, err = toolsetPaths.OpenShellAliasRoot()
+		if err != nil {
+			return fmt.Errorf("open evaluated-script toolset aliases: %w", err)
+		}
+		defer toolsetAliasRoot.Close()
 	}
 	toolDirectory := filepath.Join(runtimeRoot, "bin")
 	tempDirectory := filepath.Join(runtimeRoot, "tmp")
@@ -345,8 +370,19 @@ func runScript(opts scriptRunOptions) error {
 	arguments = append(arguments, script)
 	arguments = append(arguments, opts.scriptArgs...)
 	command := exec.Command(interpreter, arguments...)
+	if toolsetAliasRoot != nil {
+		// ExtraFiles[0] is fd 3 in the child, matching toolsetpath's stable
+		// /proc/self/fd/3 shell alias contract. Descendant shells and tool
+		// proxies inherit the descriptor across their exec chains.
+		command.ExtraFiles = []*os.File{toolsetAliasRoot}
+	}
 	environment := environmentMap(os.Environ())
-	for _, name := range []string{"BASH_ENV", "CDPATH", "ENV", "GLOBIGNORE", "PATH", "SHELLOPTS", "TMPDIR", toolaction.EnvironmentName, toolaction.RuntimeToolPathEnvironmentName} {
+	for _, name := range []string{
+		"BASH_ENV", "CDPATH", "ENV", "GLOBIGNORE", "PATH", "SHELLOPTS", "TMPDIR",
+		toolaction.EnvironmentName,
+		toolaction.RuntimeToolPathEnvironmentName,
+		toolsetpath.HandoffEnvironmentName,
+	} {
 		delete(environment, name)
 	}
 	environment["LC_ALL"] = "C"
@@ -1454,8 +1490,10 @@ func main() {
 			err = runScript(scriptRunOptions{
 				interpreter: *interpreter, interpreterArgs: interpreterArgs, multicall: *multicall,
 				script: *script, scriptContent: scriptContent, scriptStdin: *scriptStdin, scriptArgs: flag.Args(), applets: applets, requiredApplets: requiredAppletFlags, tools: tools, trees: trees, literalTreeOffsets: literalTreeOffsets, toolContracts: contracts,
-				runtimeToolPath: os.Getenv(toolaction.RuntimeToolPathEnvironmentName), replays: replays,
-				stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr,
+				runtimeToolPath: os.Getenv(toolaction.RuntimeToolPathEnvironmentName),
+				toolsetHandoff:  os.Getenv(toolsetpath.HandoffEnvironmentName),
+				replays:         replays,
+				stdin:           os.Stdin, stdout: os.Stdout, stderr: os.Stderr,
 			})
 		}
 	}

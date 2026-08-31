@@ -12,19 +12,73 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 type linuxProbeSymbolRegistry struct {
 	mu          sync.RWMutex
 	symbols     map[string]linuxProbeSymbol
 	definitions map[string]linuxProbeRequestDefinition
+	// toolsetPaths is the exact set of scope/path results authenticated by this
+	// workload's replay oracle. It permits a stable deterministic provenance
+	// token emitted in a prior resolved config to re-enter through the same
+	// source-owned Kconfig probe graph without trusting arbitrary raw tokens.
+	toolsetPaths map[string]bool
+
+	toolsetPathCapabilityOnce  sync.Once
+	toolsetPathCapabilityCodec *toolaction.ExecutionRootProvenanceCapabilityCodec
+	toolsetPathCapabilityErr   error
+}
+
+func (r *linuxProbeSymbolRegistry) executionRootProvenanceCapabilityCodec() (*toolaction.ExecutionRootProvenanceCapabilityCodec, error) {
+	if r == nil {
+		return nil, fmt.Errorf("Linux probe symbol registry is nil")
+	}
+	r.toolsetPathCapabilityOnce.Do(func() {
+		r.toolsetPathCapabilityCodec, r.toolsetPathCapabilityErr = toolaction.NewExecutionRootProvenanceCapabilityCodec()
+	})
+	if r.toolsetPathCapabilityErr != nil {
+		return nil, r.toolsetPathCapabilityErr
+	}
+	if r.toolsetPathCapabilityCodec == nil {
+		return nil, fmt.Errorf("Linux probe symbol registry has no toolset-path capability codec")
+	}
+	return r.toolsetPathCapabilityCodec, nil
 }
 
 func newLinuxProbeSymbolRegistry() *linuxProbeSymbolRegistry {
 	return &linuxProbeSymbolRegistry{
-		symbols:     map[string]linuxProbeSymbol{},
-		definitions: map[string]linuxProbeRequestDefinition{},
+		symbols:      map[string]linuxProbeSymbol{},
+		definitions:  map[string]linuxProbeRequestDefinition{},
+		toolsetPaths: map[string]bool{},
 	}
+}
+
+func linuxProbeToolsetPathKey(scope, canonical string) string {
+	return scope + "\x00" + canonical
+}
+
+func (r *linuxProbeSymbolRegistry) authorizeToolsetPath(scope, canonical string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.toolsetPaths == nil {
+		r.toolsetPaths = map[string]bool{}
+	}
+	r.toolsetPaths[linuxProbeToolsetPathKey(scope, canonical)] = true
+	r.mu.Unlock()
+}
+
+func (r *linuxProbeSymbolRegistry) authorizesToolsetPath(scope, canonical string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	authorized := r.toolsetPaths[linuxProbeToolsetPathKey(scope, canonical)]
+	r.mu.RUnlock()
+	return authorized
 }
 
 type linuxProbeRequestDefinition struct {
@@ -164,6 +218,14 @@ func (e *LinuxProbeEvaluator) adoptSymbolRecursive(token string, state *linuxPro
 			if err := compatibleReference(dependency); err != nil {
 				return linuxProbeSymbol{}, false, err
 			}
+		}
+	}
+	for _, scope := range symbol.toolsetPathScopes {
+		if scope != "target" && scope != "host" {
+			return linuxProbeSymbol{}, false, fmt.Errorf("Linux probe symbolic value %q has invalid toolset-path scope %q", token, scope)
+		}
+		if e.scope == "host" && scope != "host" {
+			return linuxProbeSymbol{}, false, fmt.Errorf("host Linux probe evaluator cannot adopt target-scoped toolset path %q", token)
 		}
 	}
 

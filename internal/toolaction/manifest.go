@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-const KbuildToolsetManifestSchema = "linux-kbuild-toolset-v5"
+const KbuildToolsetManifestSchema = "linux-kbuild-toolset-v6"
 
 const (
 	// Bazel's File.is_directory reports only declared TreeArtifacts and Filesets.
@@ -30,18 +30,29 @@ const (
 // configured Kbuild toolset. Closure entries use the stable logical artifact
 // namespace shared by analysis and mapped execution actions.
 type KbuildToolsetManifest struct {
-	Schema        string                       `json:"schema"`
-	Scope         string                       `json:"scope"`
-	Actions       map[string][]string          `json:"actions"`
-	Tools         map[string]string            `json:"tools"`
-	Closure       []string                     `json:"closure"`
-	ArtifactKinds map[string]string            `json:"artifact_kinds"`
-	Environments  map[string]map[string]string `json:"environments"`
-	MakeVariables map[string]string            `json:"make_variables"`
-	Requirements  map[string]map[string]string `json:"requirements"`
+	Schema        string                               `json:"schema"`
+	Scope         string                               `json:"scope"`
+	Actions       map[string][]string                  `json:"actions"`
+	Tools         map[string]string                    `json:"tools"`
+	Closure       []string                             `json:"closure"`
+	ArtifactKinds map[string]string                    `json:"artifact_kinds"`
+	ArtifactRoots map[string]KbuildToolsetArtifactRoot `json:"artifact_roots"`
+	Roots         map[string]string                    `json:"roots"`
+	Environments  map[string]map[string]string         `json:"environments"`
+	MakeVariables map[string]string                    `json:"make_variables"`
+	Requirements  map[string]map[string]string         `json:"requirements"`
 }
 
-// ReadKbuildToolsetManifest decodes exactly one canonical v5 manifest.
+// KbuildToolsetArtifactRoot binds one canonical artifact to its stable root
+// authority and root-relative path. A mapped action passes one typed anchor
+// File for every root, allowing the consumer's own path mapper to select the
+// physical root without forwarding every closure File on argv.
+type KbuildToolsetArtifactRoot struct {
+	Root string `json:"root"`
+	Path string `json:"path"`
+}
+
+// ReadKbuildToolsetManifest decodes exactly one canonical v6 manifest.
 func ReadKbuildToolsetManifest(filename string) (KbuildToolsetManifest, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -134,6 +145,41 @@ func (m KbuildToolsetManifest) Validate() error {
 	if len(m.ArtifactKinds) != len(m.Closure) {
 		return errors.New("toolset manifest artifact kinds must exactly cover the closure")
 	}
+	if len(m.ArtifactRoots) != len(m.Closure) {
+		return errors.New("toolset manifest artifact roots must exactly cover the closure")
+	}
+	usedRoots := map[string]bool{}
+	for _, canonical := range m.Closure {
+		location, exists := m.ArtifactRoots[canonical]
+		if !exists {
+			return fmt.Errorf("toolset manifest closure path %q has no artifact root", canonical)
+		}
+		if !validKbuildToolsetRootID(location.Root) {
+			return fmt.Errorf("toolset manifest closure path %q has invalid artifact root %q", canonical, location.Root)
+		}
+		if err := ValidateCanonicalArtifactPath(location.Path); err != nil {
+			return fmt.Errorf("toolset manifest closure path %q has invalid root-relative path %q: %w", canonical, location.Path, err)
+		}
+		if m.Roots[location.Root] == "" {
+			return fmt.Errorf("toolset manifest closure path %q references unknown artifact root %q", canonical, location.Root)
+		}
+		usedRoots[location.Root] = true
+	}
+	if len(usedRoots) != len(m.Roots) {
+		return errors.New("toolset manifest roots must exactly cover referenced artifact roots")
+	}
+	for root, anchor := range m.Roots {
+		if !validKbuildToolsetRootID(root) {
+			return fmt.Errorf("toolset manifest has invalid artifact root %q", root)
+		}
+		index := sort.SearchStrings(m.Closure, anchor)
+		if index == len(m.Closure) || m.Closure[index] != anchor {
+			return fmt.Errorf("toolset manifest artifact root %q anchor %q is absent from its closure", root, anchor)
+		}
+		if m.ArtifactRoots[anchor].Root != root {
+			return fmt.Errorf("toolset manifest artifact root %q anchor %q belongs to root %q", root, anchor, m.ArtifactRoots[anchor].Root)
+		}
+	}
 	for path := range m.ArtifactKinds {
 		if err := ValidateCanonicalArtifactPath(path); err != nil {
 			return fmt.Errorf("toolset manifest artifact kind path %q: %w", path, err)
@@ -141,6 +187,12 @@ func (m KbuildToolsetManifest) Validate() error {
 		index := sort.SearchStrings(m.Closure, path)
 		if index == len(m.Closure) || m.Closure[index] != path {
 			return fmt.Errorf("toolset manifest artifact kind path %q is absent from its closure", path)
+		}
+	}
+	for path := range m.ArtifactRoots {
+		index := sort.SearchStrings(m.Closure, path)
+		if index == len(m.Closure) || m.Closure[index] != path {
+			return fmt.Errorf("toolset manifest artifact root path %q is absent from its closure", path)
 		}
 	}
 	for role, path := range m.Tools {
@@ -153,6 +205,10 @@ func (m KbuildToolsetManifest) Validate() error {
 		}
 	}
 	return nil
+}
+
+func validKbuildToolsetRootID(value string) bool {
+	return value != "" && !strings.ContainsAny(value, "/\\=\x00 \t\r\n")
 }
 
 func ValidKbuildToolsetArtifactKind(kind string) bool {

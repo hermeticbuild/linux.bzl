@@ -14,6 +14,7 @@ import (
 	"github.com/bazelbuild/rules_go/go/runfiles"
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
+	"github.com/hermeticbuild/linux.bzl/internal/toolsetpath"
 )
 
 func TestProbeHelperProcess(t *testing.T) {
@@ -247,6 +248,8 @@ func TestValidateProbeRequestEnvironmentNameProtectsExecutionEnvelope(t *testing
 		"GCC_EXEC_PREFIX",
 		"LANG",
 		toolaction.EnvironmentName,
+		toolaction.RuntimeToolPathEnvironmentName,
+		toolsetpath.HandoffEnvironmentName,
 	} {
 		t.Run("reject "+name, func(t *testing.T) {
 			if err := validateProbeRequestEnvironmentName(name, contract); err == nil {
@@ -500,9 +503,8 @@ func TestRunProbeExpandsToolchainPathsBeforeScratchWorkingDirectory(t *testing.T
 	node.ID = node.ContentID()
 	markerPath := toolaction.ExecutionRootMarker + "/external/toolchain/lib/clang/22/include/stddef.h"
 	resultPath := filepath.Join(execroot, "result.json")
-	if err := runTestProbe(t, probeOptions{
+	if err := runTestProbeWithToolset(t, probeOptions{
 		request: requestPath, result: resultPath, nodeID: node.ID, requestID: requestID, scope: "target",
-		toolsetFiles:   []string{resource},
 		toolsetMarkers: map[string]string{"target": identityPath},
 		tools: map[string]actionContract{"cc": {
 			path: executable,
@@ -518,7 +520,7 @@ func TestRunProbeExpandsToolchainPathsBeforeScratchWorkingDirectory(t *testing.T
 				"RESOURCE_HEADER":        markerPath,
 			},
 		}},
-	}); err != nil {
+	}, resource); err != nil {
 		t.Fatal(err)
 	}
 	result, err := kconfig.ReadProbeResult(resultPath)
@@ -775,37 +777,49 @@ func TestRunProbeNormalizesReportedExecrootPath(t *testing.T) {
 	node := kconfig.ProbePlanNode{Scope: "target", RequestID: requestID}
 	node.ID = node.ContentID()
 	executable, _ := os.Executable()
-	run := func(reported, result string) error {
-		return runTestProbe(t, probeOptions{
+	run := func(reported, result string, closureArtifacts ...string) error {
+		if len(closureArtifacts) == 0 {
+			closureArtifacts = []string{filepath.Join(execroot, "external", "toolchain", "include")}
+		}
+		return runTestProbeWithToolset(t, probeOptions{
 			request: "request.json", result: result, nodeID: node.ID, requestID: requestID, scope: "target",
-			toolsetFiles:   []string{filepath.Join(execroot, "external", "toolchain", "include")},
 			toolsetMarkers: map[string]string{"target": identity},
 			tools: map[string]actionContract{"cc": {
 				path:      executable,
 				arguments: []string{"-test.run=TestProbeHelperProcess", "--", "emit-path", reported, kconfig.LinuxKbuildArgsSentinel},
 			}},
-		})
+		}, closureArtifacts...)
 	}
 	if err := run(filepath.Join(execroot, "external", "toolchain", "include")+"\n", "result.json"); err != nil {
 		t.Fatal(err)
 	}
 	result, err := kconfig.ReadProbeResult("result.json")
-	if err != nil || result.Text != "external/toolchain/include" || result.Steps[0].Stdout != result.Text {
+	if err != nil || result.Text != "external/toolchain/include" || result.Steps[0].Stdout != result.Text || result.Steps[0].StdoutPathKind != kconfig.ProbeStdoutPathToolset {
 		t.Fatalf("normalized path result = %#v, %v", result, err)
 	}
 	if err := run("plugin\n", "fallback.json"); err != nil {
 		t.Fatalf("literal fallback path: %v", err)
 	}
 	fallback, err := kconfig.ReadProbeResult("fallback.json")
-	if err != nil || fallback.Text != "plugin" || fallback.Steps[0].Stdout != fallback.Text {
+	if err != nil || fallback.Text != "plugin" || fallback.Steps[0].Stdout != fallback.Text || fallback.Steps[0].StdoutPathKind != kconfig.ProbeStdoutPathFallback {
 		t.Fatalf("fallback path result = %#v, %v", fallback, err)
 	}
 	if err := run(filepath.Join(execroot, "plugin"), "absolute-fallback.json"); err != nil {
 		t.Fatalf("unbound absolute fallback path: %v", err)
 	}
 	absoluteFallback, err := kconfig.ReadProbeResult("absolute-fallback.json")
-	if err != nil || absoluteFallback.Text != "plugin" || absoluteFallback.Steps[0].Stdout != absoluteFallback.Text {
+	if err != nil || absoluteFallback.Text != "plugin" || absoluteFallback.Steps[0].Stdout != absoluteFallback.Text || absoluteFallback.Steps[0].StdoutPathKind != kconfig.ProbeStdoutPathFallback {
 		t.Fatalf("absolute fallback path result = %#v, %v", absoluteFallback, err)
+	}
+	if err := os.MkdirAll(filepath.Join(execroot, "plugin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := run("plugin\n", "exact-sentinel-artifact.json", filepath.Join(execroot, "plugin")); err != nil {
+		t.Fatalf("real artifact with fallback spelling: %v", err)
+	}
+	exact, err := kconfig.ReadProbeResult("exact-sentinel-artifact.json")
+	if err != nil || exact.Text != "plugin" || exact.Steps[0].StdoutPathKind != kconfig.ProbeStdoutPathToolset {
+		t.Fatalf("exact-sentinel artifact result = %#v, %v", exact, err)
 	}
 	outside := filepath.Join(filepath.Dir(execroot), "outside")
 	if err := os.MkdirAll(outside, 0o755); err != nil {
@@ -864,31 +878,26 @@ func TestRunProbeRebasesRepositoryCachePathThroughConfiguredTool(t *testing.T) {
 	node := kconfig.ProbePlanNode{Scope: "target", RequestID: requestID}
 	node.ID = node.ContentID()
 	run := func(reported, output string) error {
-		return runTestProbe(t, probeOptions{
+		return runTestProbeWithToolset(t, probeOptions{
 			request: "request.json", result: output, nodeID: node.ID, requestID: requestID, scope: "target",
-			toolsetFiles:   []string{"external/cc-toolchain/lib/gcc/include"},
 			toolsetMarkers: map[string]string{"target": identity},
 			tools: map[string]actionContract{"cc": {
 				path:      "external/cc-toolchain/bin/proberun-test",
 				arguments: []string{"-test.run=TestProbeHelperProcess", "--", "emit-path", reported, kconfig.LinuxKbuildArgsSentinel},
 			}},
-		})
+		}, "external/cc-toolchain/lib/gcc/include")
 	}
 	reported := filepath.Join(repository, "lib", "gcc", "include")
 	if err := run(reported, "result.json"); err != nil {
 		t.Fatal(err)
 	}
 	result, err := kconfig.ReadProbeResult("result.json")
-	if err != nil || result.Text != "external/cc-toolchain/lib/gcc/include" || result.Steps[0].Stdout != result.Text {
+	if err != nil || result.Text != "external/cc-toolchain/lib/gcc/include" || result.Steps[0].Stdout != result.Text || result.Steps[0].StdoutPathKind != kconfig.ProbeStdoutPathToolset {
 		t.Fatalf("rebased repository result = %#v, %v", result, err)
 	}
 	reportedPlugin := filepath.Join(repository, "lib", "gcc", "plugin")
-	if err := run(reportedPlugin, "unbound-plugin.json"); err != nil {
-		t.Fatalf("unbound repository plugin path: %v", err)
-	}
-	unboundPlugin, err := kconfig.ReadProbeResult("unbound-plugin.json")
-	if err != nil || unboundPlugin.Text != "plugin" || unboundPlugin.Steps[0].Stdout != unboundPlugin.Text {
-		t.Fatalf("unbound repository plugin result = %#v, %v", unboundPlugin, err)
+	if err := run(reportedPlugin, "unbound-plugin.json"); err == nil || !strings.Contains(err.Error(), "outside the identity-bound") {
+		t.Fatalf("unbound repository plugin path error = %v", err)
 	}
 	unrelated := filepath.Join(root, "unrelated", "include")
 	if err := os.MkdirAll(unrelated, 0o755); err != nil {
@@ -940,11 +949,10 @@ func TestRunProbeEvaluatesExecrootFileDependencyWithoutTool(t *testing.T) {
 	}
 	node := kconfig.ProbePlanNode{Scope: "target", RequestID: requestID, Inputs: []string{predecessorNodeID}}
 	node.ID = node.ContentID()
-	if err := runTestProbe(t, probeOptions{
+	if err := runTestProbeWithToolset(t, probeOptions{
 		request: "request.json", result: "result.json", nodeID: node.ID, requestID: requestID, scope: "target",
-		toolsetFiles:   []string{"external/plugin/include/plugin-version.h"},
 		toolsetMarkers: map[string]string{"target": identity}, inputs: map[string]string{"00000000": "predecessor.json"},
-	}); err != nil {
+	}, "external/plugin/include/plugin-version.h"); err != nil {
 		t.Fatal(err)
 	}
 	result, err := kconfig.ReadProbeResult("result.json")
@@ -982,11 +990,10 @@ func TestRunProbeEvaluatesExecrootFileDependencyWithoutTool(t *testing.T) {
 	fallbackNode := kconfig.ProbePlanNode{Scope: "target", RequestID: fallbackRequestID, Inputs: []string{predecessorNodeID}}
 	fallbackNode.ID = fallbackNode.ContentID()
 	runFallback := func(output string) error {
-		return runTestProbe(t, probeOptions{
+		return runTestProbeWithToolset(t, probeOptions{
 			request: "fallback-request.json", result: output, nodeID: fallbackNode.ID, requestID: fallbackRequestID, scope: "target",
-			toolsetFiles:   []string{"external/plugin/include/plugin-version.h"},
 			toolsetMarkers: map[string]string{"target": identity}, inputs: map[string]string{"00000000": "predecessor.json"},
-		})
+		}, "external/plugin/include/plugin-version.h")
 	}
 	if err := runFallback("fallback-result.json"); err != nil {
 		t.Fatal(err)

@@ -77,6 +77,10 @@ func TestReadConfiguredKbuildToolsetManifestRejectsInvalidActionRole(t *testing.
 		Tools:         map[string]string{"CC": "tool"},
 		Closure:       []string{"tool"},
 		ArtifactKinds: map[string]string{"tool": toolaction.KbuildToolsetArtifactSource},
+		ArtifactRoots: map[string]toolaction.KbuildToolsetArtifactRoot{
+			"tool": {Root: "root-00000000", Path: "tool"},
+		},
+		Roots:         map[string]string{"root-00000000": "tool"},
 		Environments:  map[string]map[string]string{"CC": {}},
 		MakeVariables: map[string]string{"CC": "CC"},
 		Requirements:  map[string]map[string]string{"CC": {}},
@@ -1116,6 +1120,194 @@ config MEASURED_CAPABILITY
 	}
 }
 
+func TestEvaluateLinuxKconfigCompilerPathStringSurvivesResolvedSDKReuse(t *testing.T) {
+	const (
+		targetIdentity = "sha256-5656565656565656565656565656565656565656565656565656565656565656"
+		hostIdentity   = "sha256-5757575757575757575757575757575757575757575757575757575757575757"
+		canonicalPath  = "external/compiler/vendor-sdk"
+	)
+	bootstrap, err := newLinuxCompilerBootstrapPlan(targetIdentity, hostIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := kconfig.ParseLinuxCompilerBootstrapResult(
+		testLinuxCompilerBootstrapResult(t, bootstrap.target, targetIdentity, true),
+		"target",
+		targetIdentity,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	writeTestLinuxCompilerMakefiles(t, root)
+	kconfigPath := filepath.Join(root, "Kconfig")
+	if err := os.WriteFile(kconfigPath, []byte(`
+vendor-sdk := $(shell,$(CC) -print-file-name=vendor-sdk)
+
+config VENDOR_SDK
+	string
+	default "$(vendor-sdk)"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	actions := map[string]configuredKbuildAction{}
+	for _, role := range testConfiguredKbuildActionRoles {
+		actions[role] = configuredKbuildAction{Path: filepath.Join(root, "missing-"+role)}
+	}
+	targetContract, hostContract := testKbuildContracts(actions, facts)
+	variables := map[string]string{"ARCH": "arm64", "SRCARCH": "arm64", "UTS_MACHINE": "arm64"}
+	discovery, err := evaluateLinuxKconfigProbes(
+		t.Context(), kconfigPath, root, nil, variables,
+		targetIdentity, hostIdentity, facts,
+		targetContract, hostContract, "", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(discovery.plan.Nodes); got != 1 {
+		t.Fatalf("compiler-path Kconfig discovery nodes = %d, want 1: %#v", got, discovery.plan.Nodes)
+	}
+	node := discovery.plan.Nodes[0]
+	request := discovery.plan.Requests[node.RequestID]
+	if len(request.Steps) != 1 || !slices.Equal(request.Steps[0].Arguments, []string{"-print-file-name=vendor-sdk"}) {
+		t.Fatalf("compiler-path Kconfig request = %#v", request)
+	}
+	results := t.TempDir()
+	writeTestProbeResult(t, results, kconfig.ProbeResult{
+		Schema: kconfig.LinuxProbeResultSchema, NodeID: node.ID, RequestID: node.RequestID,
+		Scope: node.Scope, ToolsetIdentity: targetIdentity, Kind: "text", Text: canonicalPath,
+		Steps: []kconfig.ProbeStepResult{{
+			Name: request.Steps[0].Name, Status: "success", ExitCode: 0,
+			Stdout: canonicalPath, StdoutPathKind: kconfig.ProbeStdoutPathToolset,
+		}},
+	})
+	oracle, err := kconfig.NewProbeResultOracleFromTrees(
+		map[string]string{"target": results},
+		map[string]string{"target": targetIdentity, "host": hostIdentity},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := evaluateLinuxKconfigProbes(
+		t.Context(), kconfigPath, root, nil, variables,
+		targetIdentity, hostIdentity, facts,
+		targetContract, hostContract, "", oracle,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := replay.tree.ResolveConfig(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transient := resolved.Value("CONFIG_VENDOR_SDK")
+	if !strings.Contains(transient, "__LINUX_BZL_TOOLSET_PATH_CAPABILITY_V1__") {
+		t.Fatalf("replayed Kconfig compiler path lacks authenticated planning capability: %q", transient)
+	}
+	if err := normalizeResolvedConfigValues(resolved, replay.normalizeToolsetPathCapabilities); err != nil {
+		t.Fatalf("normalize replayed compiler path %q: %v", transient, err)
+	}
+	wantCore, err := toolaction.EncodeExecutionRootProvenancePath("target", canonicalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := resolved.Value("CONFIG_VENDOR_SDK"), strconv.Quote(wantCore); got != want {
+		t.Fatalf("normalized Kconfig compiler path = %q, want %q", got, want)
+	}
+
+	// LinuxModuleSdkInfo exposes the resolved .config to a later external-module
+	// planner. That fresh Kconfig workload has another random key, but it replays
+	// the same identity-bound compiler result and may therefore reauthorize only
+	// this exact deterministic scope/path.
+	sdkReplay, err := evaluateLinuxKconfigProbes(
+		t.Context(), kconfigPath, root, nil, variables,
+		targetIdentity, hostIdentity, facts,
+		targetContract, hostContract, "", oracle,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sdkResolved, err := sdkReplay.tree.ResolveConfig(map[string]string{
+		"CONFIG_VENDOR_SDK": resolved.Value("CONFIG_VENDOR_SDK"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := normalizeResolvedConfigValues(sdkResolved, sdkReplay.normalizeToolsetPathCapabilities); err != nil {
+		t.Fatalf("resolved SDK config path was not reauthorized by exact Kconfig replay: %v", err)
+	}
+	if got, want := sdkResolved.Value("CONFIG_VENDOR_SDK"), resolved.Value("CONFIG_VENDOR_SDK"); got != want {
+		t.Fatalf("SDK-reused compiler path = %q, want stable %q", got, want)
+	}
+
+	// The external-module planner imports the stable SDK config into a fresh
+	// Kbuild workload. Exercise that second phase twice so neither the Kconfig
+	// nor Kbuild workload key can influence the final recipe identity.
+	var stableRecipe string
+	for generation := 0; generation < 2; generation++ {
+		kbuildEvaluation, err := kconfig.EvaluateKbuildProbeWorkload(
+			kconfig.KbuildProbeWorkloadOptions{Target: kconfig.KbuildProbeScopeOptions{
+				Architecture: "arm64", SourceArchitecture: "arm64", SourceRoot: root,
+				Facts: facts, Tools: map[string]string{"cc": actions["cc"].Path},
+			}},
+			oracle,
+			func(scopes *kconfig.KbuildProbeScopes) (string, error) {
+				importedConfig := &kconfig.ResolvedConfig{
+					Raw:       maps.Clone(sdkResolved.Raw),
+					Effective: maps.Clone(sdkResolved.Effective),
+					Written:   maps.Clone(sdkResolved.Written),
+				}
+				if err := normalizeResolvedConfigValues(importedConfig, func(value string) (string, error) {
+					return scopes.ImportToolsetPathCapabilities(value, sdkReplay.normalizeToolsetPathCapabilities)
+				}); err != nil {
+					return "", err
+				}
+				imported, err := strconv.Unquote(importedConfig.Value("CONFIG_VENDOR_SDK"))
+				if err != nil {
+					return "", err
+				}
+				options, err := scopes.Options("target", kconfig.KbuildOptions{})
+				if err != nil {
+					return "", err
+				}
+				recipe, recognized, err := options.TransformSymbolic("addprefix", []string{"-I", imported})
+				if err != nil {
+					return "", err
+				}
+				if !recognized {
+					return "", fmt.Errorf("imported SDK path was not retained as symbolic Kbuild text")
+				}
+				return options.ResolveSymbolic(recipe)
+			},
+		)
+		if err != nil {
+			t.Fatalf("Kbuild generation %d: %v", generation, err)
+		}
+		canonicalRecipe, err := toolaction.CanonicalizeExecutionRootProvenanceCapabilityIdentity(kbuildEvaluation.Value)
+		if err != nil {
+			t.Fatalf("canonicalize Kbuild generation %d recipe: %v", generation, err)
+		}
+		if got, want := canonicalRecipe, "-I"+wantCore; got != want {
+			t.Fatalf("Kbuild generation %d recipe = %q, want %q", generation, got, want)
+		}
+		scope, path, err := toolaction.DecodeExecutionRootProvenancePath(strings.TrimPrefix(canonicalRecipe, "-I"))
+		if err != nil {
+			t.Fatalf("decode Kbuild generation %d toolset path: %v", generation, err)
+		}
+		if scope != "target" || path != canonicalPath {
+			t.Fatalf("Kbuild generation %d toolset path = (%q, %q), want (%q, %q)", generation, scope, path, "target", canonicalPath)
+		}
+		if got := kbuildEvaluation.Plan.Toolsets["target"]; got != targetIdentity {
+			t.Fatalf("Kbuild generation %d target toolset = %q, want %q", generation, got, targetIdentity)
+		}
+		if generation == 0 {
+			stableRecipe = canonicalRecipe
+		} else if canonicalRecipe != stableRecipe {
+			t.Fatalf("Kbuild recipe depends on workload keys: first=%q second=%q", stableRecipe, canonicalRecipe)
+		}
+	}
+}
+
 func TestKbuildOnlyVariablesStayOutOfReusableKconfigAndReachKbuild(t *testing.T) {
 	const (
 		targetIdentity = "sha256-6767676767676767676767676767676767676767676767676767676767676767"
@@ -1785,6 +1977,97 @@ config FIRMWARE_LIST
 	}
 }
 
+func TestResolvedConfigNormalizesAuthenticatedCompilerPathStrings(t *testing.T) {
+	tree, err := kconfig.Parse(
+		t.Context(),
+		strings.NewReader("config VENDOR_SDK\n\tstring\n"),
+		"Kconfig",
+		kconfig.Options{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCore, err := toolaction.EncodeExecutionRootProvenancePath("target", "external/compiler/vendor-sdk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stable map[string]string
+	for replay := 0; replay < 2; replay++ {
+		codec, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+		if err != nil {
+			t.Fatal(err)
+		}
+		capability, err := codec.EncodePath("target", "external/compiler/vendor-sdk")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved := &kconfig.ResolvedConfig{
+			Raw:       map[string]string{"CONFIG_VENDOR_SDK": `"` + capability + `"`},
+			Effective: map[string]string{"CONFIG_VENDOR_SDK": `"` + capability + `"`},
+			Written:   map[string]bool{"CONFIG_VENDOR_SDK": true},
+		}
+		if err := normalizeResolvedConfigValues(resolved, codec.NormalizeValue); err != nil {
+			t.Fatalf("replay %d: %v", replay, err)
+		}
+		if got, want := resolved.Value("CONFIG_VENDOR_SDK"), strconv.Quote(wantCore); got != want {
+			t.Fatalf("replay %d resolved compiler path = %q, want %q", replay, got, want)
+		}
+		contents := resolvedConfigObjectTreeContents(tree, resolved, "6.18.39")
+		for path, content := range contents {
+			if strings.Contains(content, "__LINUX_BZL_TOOLSET_PATH_CAPABILITY_V1__") {
+				t.Fatalf("replay %d %s retains transient capability bytes: %q", replay, path, content)
+			}
+		}
+		if replay == 0 {
+			stable = contents
+		} else if !maps.Equal(stable, contents) {
+			t.Fatalf("resolved config output depends on workload key\nfirst: %#v\nsecond: %#v", stable, contents)
+		}
+	}
+
+	codec, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := codec.EncodePath("target", "external/compiler/vendor-sdk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := capability[:len(capability)-1] + map[bool]string{true: "0", false: "1"}[capability[len(capability)-1] != '0']
+	resolved := &kconfig.ResolvedConfig{Effective: map[string]string{"CONFIG_VENDOR_SDK": `"` + mutated + `"`}}
+	if err := normalizeResolvedConfigValues(resolved, codec.NormalizeValue); err == nil || !strings.Contains(err.Error(), "authenticated planning capability") {
+		t.Fatalf("mutated Kconfig path error = %v, want capability rejection", err)
+	}
+}
+
+func TestResolvedConfigPreservesOrdinaryQuotedKconfigEscapes(t *testing.T) {
+	values := map[string]string{
+		"CONFIG_INVALID_GO_ESCAPE":  `"vendor\qpath"`,
+		"CONFIG_HEX_LOOKING_ESCAPE": `"vendor\x41path"`,
+		"CONFIG_OCTAL_LOOKING":      `"vendor\101path"`,
+		"CONFIG_ESCAPED_QUOTE":      `"vendor\"path"`,
+		"CONFIG_ALERT_ESCAPE":       `"\a"`,
+		"CONFIG_BACKSPACE_ESCAPE":   `"\b"`,
+	}
+	resolved := &kconfig.ResolvedConfig{
+		Raw:       maps.Clone(values),
+		Effective: maps.Clone(values),
+	}
+	codec, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := normalizeResolvedConfigValues(resolved, codec.NormalizeValue); err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(resolved.Raw, values) {
+		t.Fatalf("ordinary raw Kconfig strings changed: got %#v, want %#v", resolved.Raw, values)
+	}
+	if !maps.Equal(resolved.Effective, values) {
+		t.Fatalf("ordinary effective Kconfig strings changed: got %#v, want %#v", resolved.Effective, values)
+	}
+}
+
 func TestWriteResolvedArchitecturePreservesSourceDerivedValue(t *testing.T) {
 	output := filepath.Join(t.TempDir(), "linux.arch")
 	if err := writeResolvedArchitecture(output, "vendor-riscv"); err != nil {
@@ -1877,7 +2160,7 @@ func TestWriteResolvedConfigAcceptsPlainPath(t *testing.T) {
 		rustcCfg:      filepath.Join(dir, "rustc_cfg"),
 		kernelRelease: filepath.Join(dir, "kernel.release"),
 	}
-	if err := writeResolvedConfig(tree, input, nil, "default", outputs, "6.18.39"); err != nil {
+	if err := writeResolvedConfig(tree, input, nil, "default", outputs, "6.18.39", nil); err != nil {
 		t.Fatalf("writeResolvedConfig(%q) failed: %v", input, err)
 	}
 	content, err := os.ReadFile(outputs.config)
@@ -1886,6 +2169,168 @@ func TestWriteResolvedConfigAcceptsPlainPath(t *testing.T) {
 	}
 	if got, want := string(content), "CONFIG_ENABLED=y\n"; got != want {
 		t.Fatalf("resolved config = %q, want %q", got, want)
+	}
+}
+
+func TestEvaluatedKbuildProfilesReadResolvedKernelReleaseForUtsrelease(t *testing.T) {
+	tree, err := kconfig.Parse(
+		t.Context(),
+		strings.NewReader("config LOCALVERSION\n\tstring\n"),
+		"Kconfig",
+		kconfig.Options{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved := &kconfig.ResolvedConfig{
+		Effective: map[string]string{"CONFIG_LOCALVERSION": `"-test"`},
+		Written:   map[string]bool{"CONFIG_LOCALVERSION": true},
+	}
+	immutableContents := resolvedConfigObjectTreeContents(tree, resolved, "6.18.39")
+
+	root := t.TempDir()
+	makefile := strings.ReplaceAll(`
+empty :=
+space := $(empty) $(empty)
+define newline
+
+
+endef
+read-file = $(subst $(newline),$(space),$(file < $1))
+KERNELRELEASE = $(call read-file, $(objtree)/include/config/kernel.release)
+uts_len := 64
+define filechk_utsrelease.h
+	if [ __BACKTICK__echo -n "$(KERNELRELEASE)" | wc -c __BACKTICK__ -gt $(uts_len) ]; then \
+	  echo '"$(KERNELRELEASE)" exceeds $(uts_len) characters' >&2;    \
+	  exit 1;                                                         \
+	fi;                                                               \
+	echo \#define UTS_RELEASE \"$(KERNELRELEASE)\"
+endef
+define filechk
+	{ $(filechk_$(1)); } > $@
+endef
+.PHONY: all FORCE
+all: include/generated/utsrelease.h
+include/generated/utsrelease.h: include/config/kernel.release FORCE
+	$(call filechk,utsrelease.h)
+`, "__BACKTICK__", "`")
+	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(makefile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	variables := linuxRootMakeInvocationVariables(root)
+	variables["SRCARCH"] = "x86"
+	profiles, selections, _, err := evaluatedKbuildProfilesWithGeneratedContent(
+		root,
+		root,
+		[]string{"include/generated/utsrelease.h"},
+		[]string{"include/generated/utsrelease.h"},
+		variables,
+		kconfig.KbuildOptions{
+			RootDir:                 root,
+			Variables:               variables,
+			ConfigVariablesComplete: true,
+			MakeVariablesComplete:   true,
+		},
+		nil,
+		nil,
+		immutableContents,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const target = "include/generated/utsrelease.h"
+	selection := selectionByTarget(t, selections, target)
+	var profile kconfig.CompactKbuildProfile
+	found := false
+	for _, candidate := range profiles {
+		if candidate.Name == selection.Profile {
+			profile = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("selection profile %q is absent: %#v", selection.Profile, profiles)
+	}
+	normal, orderOnly, stem, err := kconfig.EvaluateCompactKbuildTargetRuleContext(profile, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, err := kconfig.EvaluateCompactKbuildTarget(
+		profile, target, stem, normal, orderOnly, nil,
+		"KERNELRELEASE", "filechk_utsrelease.h",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := values["KERNELRELEASE"], "6.18.39-test"; got != want {
+		t.Fatalf("KERNELRELEASE = %q, want resolved projection %q", got, want)
+	}
+	if got, want := values["filechk_utsrelease.h"], `echo \#define UTS_RELEASE \"6.18.39-test\"`; !strings.Contains(got, want) {
+		t.Fatalf("filechk_utsrelease.h = %q, want fragment %q", got, want)
+	}
+
+	metadata, err := tree.CompactMetadataWithOptions(
+		nil,
+		kconfig.ResolveConfigOptions{},
+		kconfig.CompactMetadataOptions{SelectedProductsOnly: true},
+		func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
+			return kconfig.CompactConfigGraph{
+				KbuildProfiles:   profiles,
+				KbuildSelections: selections,
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := "sha256-" + strings.Repeat("7a", 32)
+	plan, err := metadata.ActionPlan(identity, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var node *kconfig.ActionPlanNode
+	for index := range plan.Nodes {
+		if slices.ContainsFunc(plan.Nodes[index].Outputs, func(output kconfig.ActionPlanOutput) bool {
+			return output.Path == target
+		}) {
+			node = &plan.Nodes[index]
+			break
+		}
+	}
+	if node == nil {
+		t.Fatalf("action plan omits %q: %#v", target, plan.Nodes)
+	}
+	recipe, ok := plan.Recipes[node.Recipe]
+	if !ok {
+		t.Fatalf("UTS release node references missing recipe %q", node.Recipe)
+	}
+	line := `#define UTS_RELEASE "6.18.39-test"`
+	lineFound := false
+	for index, argument := range recipe.Arguments {
+		if index != 0 && recipe.Arguments[index-1] == "-line" && argument == line {
+			lineFound = true
+		}
+	}
+	if !lineFound {
+		t.Fatalf("UTS release action arguments = %q, want -line %q", recipe.Arguments, line)
+	}
+	configSource := ""
+	for _, source := range plan.Sources {
+		if source.Namespace == "config" && source.Path == "kernel.release" {
+			configSource = source.ID
+			break
+		}
+	}
+	if configSource == "" {
+		t.Fatalf("action plan sources omit config/kernel.release: %#v", plan.Sources)
+	}
+	if !slices.ContainsFunc(node.Sources, func(edge kconfig.ActionPlanSourceEdge) bool {
+		return edge.SourceID == configSource
+	}) {
+		t.Fatalf("UTS release node sources = %#v, want config source %q", node.Sources, configSource)
 	}
 }
 
@@ -3871,6 +4316,7 @@ func TestSelectedKbuildSelectionsDeduplicateOnlyPlanEquivalentOpaqueIncludeProdu
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			firstRecipe, secondRecipe := "\tcp shared.in $@\n", test.secondRecipe
 			sourceRoot := t.TempDir()
 			for name, contents := range map[string]string{
 				"shared.in":   "#define SHARED 1\n",
@@ -3930,8 +4376,6 @@ func TestSelectedKbuildSelectionsDeduplicateOnlyPlanEquivalentOpaqueIncludeProdu
 				secondName = "build:rust#61b2e3543bcb"
 			}
 			root := makeProfile("root:duplicate-opaque-producers", "root.mk", rootMakefile, "all")
-			firstRecipe := "\tcp shared.in $@\n"
-			secondRecipe := test.secondRecipe
 			if test.splitInitialFrontier {
 				// The proc-macro recipe observes one exact generated response file.
 				// Repeated recursive invocations can inherit different unrelated
@@ -6089,6 +6533,216 @@ func TestCanonicalKbuildInvocationRequestDigestMatchesStableKey(t *testing.T) {
 	if canonicalKbuildInvocationRequestsEqual(request, clone) {
 		t.Fatal("canonical request equality ignored exact-content change")
 	}
+}
+
+func TestKbuildIntermediateIdentitiesExcludeEphemeralToolsetPathCapabilityTags(t *testing.T) {
+	firstCodec, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCodec, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCapability, err := firstCodec.EncodePath("target", "external/compiler/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCapability, err := secondCodec.EncodePath("target", "external/compiler/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstCapability == secondCapability {
+		t.Fatal("independent workload codecs produced the same transient capability")
+	}
+
+	request := func(capability string) kbuildInvocationRequest {
+		return kbuildInvocationRequest{
+			name: "child", makefile: "scripts/child.mk", directory: "drivers",
+			processLocation: kconfig.CompactKbuildInvocationLocation{
+				Tree: kconfig.CompactKbuildInvocationObjectTree, Directory: "drivers",
+			},
+			entryTargets: []string{"all"},
+			environment:  map[string]string{"COMPILER_INCLUDE": "-I" + capability},
+			variables:    map[string]string{"SDK": capability},
+		}
+	}
+	firstRequest := request(firstCapability)
+	secondRequest := request(secondCapability)
+	if got, want := canonicalKbuildInvocationRequestKey(firstRequest), canonicalKbuildInvocationRequestKey(secondRequest); got != want {
+		t.Fatalf("request key retains ephemeral capability tag\nfirst: %q\nsecond: %q", got, want)
+	}
+	if got, want := canonicalKbuildInvocationRequestDigest(firstRequest), canonicalKbuildInvocationRequestDigest(secondRequest); got != want {
+		t.Fatalf("request digest retains ephemeral capability tag: first=%x second=%x", got, want)
+	}
+
+	frontier := func(capability string) kbuildFrontierState {
+		return kbuildFrontierSet(kbuildFrontierState{}, "generated/flags", kbuildFrontierValue{
+			artifact: kconfig.CompactKbuildVisibleArtifact{
+				Path: "generated/flags", Profile: "producer", Target: "generated/flags",
+			},
+			content: "include=" + capability + "\n",
+			exact:   true,
+		})
+	}
+	if got, want := kbuildFrontierDigest(frontier(firstCapability)), kbuildFrontierDigest(frontier(secondCapability)); got != want {
+		t.Fatalf("frontier digest retains ephemeral capability tag: first=%x second=%x", got, want)
+	}
+	if got, want := kbuildFrontierRawDigest(frontier(firstCapability)), kbuildFrontierRawDigest(frontier(secondCapability)); got == want {
+		t.Fatalf("frontier raw witness aliases independent authenticated bytes: first=%x second=%x", got, want)
+	}
+
+	firstFrontierRequest := firstRequest
+	firstFrontierRequest.environment = nil
+	firstFrontierRequest.variables = nil
+	firstFrontierRequest.visibleState = frontier(firstCapability)
+	secondFrontierRequest := firstFrontierRequest
+	secondFrontierRequest.visibleState = frontier(secondCapability)
+	if canonicalKbuildInvocationRequestDigest(firstFrontierRequest) != canonicalKbuildInvocationRequestDigest(secondFrontierRequest) {
+		t.Fatal("stable request identity includes the workload-local frontier witness")
+	}
+	if canonicalKbuildInvocationRequestsEqual(firstFrontierRequest, secondFrontierRequest) {
+		t.Fatal("request reuse ignored distinct authenticated frontier bytes")
+	}
+
+	runtimeCore, err := firstCodec.NormalizeValue(firstCapability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutatedCapability := firstCapability[:len(firstCapability)-1] + map[bool]string{true: "0", false: "1"}[firstCapability[len(firstCapability)-1] != '0']
+	for name, content := range map[string]string{
+		"raw deterministic token": runtimeCore,
+		"mutated capability tag":  mutatedCapability,
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := firstFrontierRequest
+			candidate.visibleState = frontier(content)
+			if canonicalKbuildInvocationRequestDigest(candidate) != canonicalKbuildInvocationRequestDigest(firstFrontierRequest) {
+				t.Fatal("canonical profile identity did not preserve the same-path projection")
+			}
+			if canonicalKbuildInvocationRequestsEqual(candidate, firstFrontierRequest) {
+				t.Fatal("request reuse aliased unauthenticated or source-mutated frontier content")
+			}
+		})
+	}
+}
+
+func TestSelectedProducerPlanIdentityExcludesNestedEphemeralCapabilityTags(t *testing.T) {
+	firstCapability, secondCapability := independentToolsetPathCapabilitiesForTest(
+		t, "target", "external/compiler/include",
+	)
+	type deferredIdentity struct {
+		Command     string
+		Environment map[string]string
+		Contents    []string
+		Generation  uint64
+	}
+	type producerIdentity struct {
+		CommandTexts        []string
+		ExportedEnvironment map[string]string
+		DeferredQueries     []deferredIdentity
+		GeneratedContent    string
+	}
+	payload := func(capability string) producerIdentity {
+		return producerIdentity{
+			CommandTexts:        []string{"cc -I" + capability + " -c input.c"},
+			ExportedEnvironment: map[string]string{"SDK": capability},
+			DeferredQueries: []deferredIdentity{{
+				Command: "printf %s " + capability,
+				Environment: map[string]string{
+					"FLAGS": "--sysroot=" + capability,
+				},
+				Contents:   []string{"include=" + capability + "\n"},
+				Generation: ^uint64(0),
+			}},
+			GeneratedContent: "#define SDK \"" + capability + "\"\n",
+		}
+	}
+	firstPayload, secondPayload := payload(firstCapability), payload(secondCapability)
+	firstIdentity, err := marshalCanonicalKbuildToolsetPathCapabilityIdentity(firstPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondIdentity, err := marshalCanonicalKbuildToolsetPathCapabilityIdentity(secondPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(firstIdentity) != string(secondIdentity) {
+		t.Fatalf("selected producer identity retains ephemeral capability tags\nfirst: %s\nsecond: %s", firstIdentity, secondIdentity)
+	}
+	if !strings.Contains(string(firstIdentity), `"Generation":18446744073709551615`) {
+		t.Fatalf("selected producer identity changed its uint64 generation: %s", firstIdentity)
+	}
+	if firstPayload.ExportedEnvironment["SDK"] != firstCapability ||
+		secondPayload.ExportedEnvironment["SDK"] != secondCapability {
+		t.Fatal("stable identity projection mutated authenticated producer data")
+	}
+}
+
+func TestKbuildGeneratedIncludeCacheIdentityExcludesEphemeralCapabilityTags(t *testing.T) {
+	firstCapability, secondCapability := independentToolsetPathCapabilitiesForTest(
+		t, "target", "external/compiler/include",
+	)
+	firstContents := "#define TOOLSET_INCLUDE \"" + firstCapability + "\"\n"
+	secondContents := "#define TOOLSET_INCLUDE \"" + secondCapability + "\"\n"
+	if firstContents == secondContents {
+		t.Fatal("generated include fixtures unexpectedly have identical authenticated bytes")
+	}
+	if got, want := kbuildGeneratedIncludeContentIdentityDigest(firstContents), kbuildGeneratedIncludeContentIdentityDigest(secondContents); got != want {
+		t.Fatalf("generated include cache identity retains ephemeral capability tag: first=%x second=%x", got, want)
+	}
+}
+
+func TestKbuildRecursiveMakeFrontierIdentityExcludesEphemeralCapabilityTags(t *testing.T) {
+	firstCapability, secondCapability := independentToolsetPathCapabilitiesForTest(
+		t, "target", "external/compiler/include",
+	)
+	event := func(capability string) kbuildRecursiveMakeFrontierEvent {
+		return kbuildRecursiveMakeFrontierEvent{
+			artifact: kconfig.CompactKbuildVisibleArtifact{
+				Path: "generated/sdk.h", Profile: "producer", Target: "generated/sdk.h",
+			},
+			commandTarget: "generated/sdk.h",
+			command:       "printf '%s\\n' " + capability + " > generated/sdk.h",
+		}
+	}
+	firstEvent, secondEvent := event(firstCapability), event(secondCapability)
+	if got, want := kbuildRecursiveMakeFrontierEventIdentity(firstEvent), kbuildRecursiveMakeFrontierEventIdentity(secondEvent); got != want {
+		t.Fatalf("recursive Make frontier event identity retains ephemeral capability tag\nfirst: %q\nsecond: %q", got, want)
+	}
+	firstNode := newKbuildRecursiveMakeFrontierBuilder().sequence(nil, firstEvent)
+	secondNode := newKbuildRecursiveMakeFrontierBuilder().sequence(nil, secondEvent)
+	if firstNode.id != secondNode.id {
+		t.Fatalf("recursive Make frontier node retains ephemeral capability tag: first=%s second=%s", firstNode.id, secondNode.id)
+	}
+	if firstNode.event.command != firstEvent.command || secondNode.event.command != secondEvent.command ||
+		firstNode.event.command == secondNode.event.command {
+		t.Fatal("frontier identity projection did not retain each authenticated command for replay")
+	}
+}
+
+func independentToolsetPathCapabilitiesForTest(t *testing.T, scope, path string) (string, string) {
+	t.Helper()
+	firstCodec, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCodec, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCapability, err := firstCodec.EncodePath(scope, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCapability, err := secondCodec.EncodePath(scope, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstCapability == secondCapability {
+		t.Fatal("independent workload codecs produced the same transient capability")
+	}
+	return firstCapability, secondCapability
 }
 
 func TestSelectedKbuildSelectionsUsePrimaryRoleForMixedExplicitScopes(t *testing.T) {

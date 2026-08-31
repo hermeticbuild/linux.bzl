@@ -20,6 +20,7 @@ import (
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
+	"github.com/hermeticbuild/linux.bzl/internal/toolsetpath"
 )
 
 const (
@@ -96,7 +97,7 @@ type actionContract struct {
 type probeOptions struct {
 	request, result, nodeID, requestID, scope string
 	toolsetManifest                           string
-	toolsetFiles                              []string
+	toolsetAnchors                            map[string]string
 	toolsetMarkers                            map[string]string
 	tools                                     map[string]actionContract
 	runtimeTools                              map[string]string
@@ -128,11 +129,11 @@ func resolveProbeArtifactPaths(opts probeOptions) (probeOptions, error) {
 	opts.request = absolute(opts.request)
 	opts.result = absolute(opts.result)
 	opts.toolsetManifest = absolute(opts.toolsetManifest)
-	toolsetFiles := make([]string, len(opts.toolsetFiles))
-	for index, file := range opts.toolsetFiles {
-		toolsetFiles[index] = absolute(file)
+	toolsetAnchors := make(map[string]string, len(opts.toolsetAnchors))
+	for root, anchor := range opts.toolsetAnchors {
+		toolsetAnchors[root] = absolute(anchor)
 	}
-	opts.toolsetFiles = toolsetFiles
+	opts.toolsetAnchors = toolsetAnchors
 	if opts.tempDir != "" {
 		opts.tempDir = absolute(opts.tempDir)
 	}
@@ -311,13 +312,19 @@ func validateProbeRequestEnvironmentName(name string, contractEnvironment map[st
 	if _, owned := contractEnvironment[name]; owned {
 		return fmt.Errorf("environment variable %s would override the identity-bound action contract", name)
 	}
-	if name == "LANG" || name == "LC_ALL" || name == toolaction.EnvironmentName || name == toolaction.RuntimeToolPathEnvironmentName {
+	if name == "LANG" || name == "LC_ALL" || probeRunnerOwnsEnvironmentName(name) {
 		return fmt.Errorf("environment variable %s is runner-owned", name)
 	}
 	if prohibitedProbeEnvironmentNames[name] || strings.HasPrefix(name, "LD_") || strings.HasPrefix(name, "DYLD_") {
 		return fmt.Errorf("environment variable %s controls process loading or tool/helper search", name)
 	}
 	return nil
+}
+
+func probeRunnerOwnsEnvironmentName(name string) bool {
+	return name == toolaction.EnvironmentName ||
+		name == toolaction.RuntimeToolPathEnvironmentName ||
+		name == toolsetpath.HandoffEnvironmentName
 }
 
 func applyProbeRequestEnvironmentValue(environment, contractEnvironment map[string]string, name, value string) error {
@@ -503,7 +510,7 @@ func runProbe(opts probeOptions) error {
 		opts.scope,
 		toolsetIdentity,
 		opts.toolsetManifest,
-		opts.toolsetFiles,
+		opts.toolsetAnchors,
 	)
 	if err != nil {
 		return err
@@ -754,7 +761,11 @@ func runProbe(opts probeOptions) error {
 			}
 		}
 		environment := cloneMap(contract.environment)
-		for _, name := range []string{toolaction.EnvironmentName, toolaction.RuntimeToolPathEnvironmentName} {
+		for _, name := range []string{
+			toolaction.EnvironmentName,
+			toolaction.RuntimeToolPathEnvironmentName,
+			toolsetpath.HandoffEnvironmentName,
+		} {
 			if _, exists := environment[name]; exists {
 				return fmt.Errorf("step %s primary configured action environment uses reserved variable %s", step.Name, name)
 			}
@@ -844,13 +855,12 @@ func runProbe(opts probeOptions) error {
 			status, exitCode = "failure", exitError.ExitCode()
 		}
 		stdoutValue := stdout.String()
+		stdoutPathKind := ""
 		if step.StdoutExecrootRelative {
 			if status != "success" {
 				// A failed path query has no consumable value. Do not persist an
 				// arbitrary absolute path it happened to print before failing.
 				stdoutValue = ""
-			} else if step.StdoutFallbackPath != "" && strings.TrimSpace(stdoutValue) == step.StdoutFallbackPath {
-				stdoutValue = step.StdoutFallbackPath
 			} else {
 				stdoutValue, err = kconfig.NormalizeProbeExecrootRelativePath(execroot, executableContract.path, stdoutValue)
 				if err != nil {
@@ -861,15 +871,21 @@ func runProbe(opts probeOptions) error {
 					return fmt.Errorf("canonicalize step %s stdout: %w", step.Name, err)
 				}
 				if _, err := toolsetPaths.resolve(stdoutValue); err != nil {
-					if step.StdoutFallbackPath != "" && errors.Is(err, errToolsetPathOutsideClosure) {
+					if step.StdoutFallbackPath != "" && stdoutValue == step.StdoutFallbackPath && errors.Is(err, errToolsetPathOutsideClosure) {
 						stdoutValue = step.StdoutFallbackPath
+						stdoutPathKind = kconfig.ProbeStdoutPathFallback
 					} else {
 						return fmt.Errorf("authorize step %s stdout: %w", step.Name, err)
 					}
+				} else {
+					stdoutPathKind = kconfig.ProbeStdoutPathToolset
 				}
 			}
 		}
-		results = append(results, kconfig.ProbeStepResult{Name: step.Name, Status: status, ExitCode: exitCode, Stdout: stdoutValue, Stderr: stderr.String()})
+		results = append(results, kconfig.ProbeStepResult{
+			Name: step.Name, Status: status, ExitCode: exitCode,
+			Stdout: stdoutValue, StdoutPathKind: stdoutPathKind, Stderr: stderr.String(),
+		})
 	}
 	result := kconfig.ProbeResult{
 		Schema: kconfig.LinuxProbeResultSchema, NodeID: opts.nodeID, RequestID: opts.requestID,
@@ -1278,19 +1294,14 @@ func parseNamed(raw []string) (map[string]string, error) {
 }
 
 func main() {
-	expandedArguments, err := expandProbeParameterFiles(os.Args[1:])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "proberun: %v\n", err)
-		os.Exit(2)
-	}
-	var toolFlags, runtimeToolFlags, toolsetFileFlags, inputFlags, sourceFlags, sourceRootFlags, sourceRootTreeFlags, sourceRootAnchorFlags, sourceRootWitnessFlags, toolsetMarkerFlags, actionArgFlags, actionEnvFlags repeatedFlag
+	var toolFlags, runtimeToolFlags, toolsetAnchorFlags, inputFlags, sourceFlags, sourceRootFlags, sourceRootTreeFlags, sourceRootAnchorFlags, sourceRootWitnessFlags, toolsetMarkerFlags, actionArgFlags, actionEnvFlags repeatedFlag
 	request := flag.String("request", "", "canonical probe request JSON")
 	result := flag.String("result", "", "canonical probe result JSON")
 	nodeID := flag.String("node_id", "", "content-addressed probe node ID")
 	requestID := flag.String("request_id", "", "content-addressed request ID")
 	scope := flag.String("scope", "", "target or host toolset scope")
 	toolsetManifest := flag.String("toolset_manifest", "", "current-scope identity-bound toolset manifest")
-	flag.Var(&toolsetFileFlags, "toolset_file", "current-action typed toolset closure artifact (repeatable)")
+	flag.Var(&toolsetAnchorFlags, "toolset_anchor", "ROOT=PATH current-action typed toolset root anchor (repeatable)")
 	flag.Var(&toolFlags, "tool", "ROLE=PATH configured tool (repeatable)")
 	flag.Var(&runtimeToolFlags, "runtime_tool", "ROLE=PATH identity-bound runtime tool alias (repeatable)")
 	flag.Var(&inputFlags, "input", "ORDINAL=RESULT configured dependency result (repeatable)")
@@ -1302,7 +1313,7 @@ func main() {
 	flag.Var(&toolsetMarkerFlags, "toolset_marker", "SCOPE=MARKER typed identity marker (repeatable)")
 	flag.Var(&actionArgFlags, "action_arg", "ROLE=ARG configured action argv (repeatable)")
 	flag.Var(&actionEnvFlags, "action_env", "ROLE=NAME=VALUE configured action environment (repeatable)")
-	if err := flag.CommandLine.Parse(expandedArguments); err != nil {
+	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "proberun: %v\n", err)
 		os.Exit(2)
 	}
@@ -1318,6 +1329,11 @@ func main() {
 	runtimeTools, err := parseNamed(runtimeToolFlags)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "proberun: runtime tools: %v\n", err)
+		os.Exit(2)
+	}
+	toolsetAnchors, err := parseNamed(toolsetAnchorFlags)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "proberun: toolset anchors: %v\n", err)
 		os.Exit(2)
 	}
 	inputs, err := parseNamed(inputFlags)
@@ -1382,7 +1398,7 @@ func main() {
 	}
 	if err := runProbe(probeOptions{
 		request: *request, result: *result, nodeID: *nodeID, requestID: *requestID, scope: *scope,
-		toolsetManifest: *toolsetManifest, toolsetFiles: toolsetFileFlags,
+		toolsetManifest: *toolsetManifest, toolsetAnchors: toolsetAnchors,
 		toolsetMarkers: toolsetMarkers, tools: contracts, runtimeTools: runtimeTools, inputs: inputs, sources: sources,
 		sourceRoots: sourceRoots, sourceRootTrees: sourceRootTrees, sourceRootAnchors: sourceRootAnchors, sourceRootWitnesses: sourceRootWitnesses,
 	}); err != nil {

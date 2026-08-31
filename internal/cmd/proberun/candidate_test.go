@@ -12,7 +12,7 @@ import (
 func TestValidateAndRewriteProbeCandidateArgumentsUsesTypedPaths(t *testing.T) {
 	fixture := newToolsetResolverFixture(t)
 	resolver, err := loadToolsetPathResolver(
-		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files,
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +60,7 @@ func TestValidateAndRewriteProbeCandidateArgumentsUsesTypedPaths(t *testing.T) {
 func TestValidateAndRewriteProbeCandidateArgumentsRejectsRenderedAuthority(t *testing.T) {
 	fixture := newToolsetResolverFixture(t)
 	resolver, err := loadToolsetPathResolver(
-		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files,
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +89,7 @@ func TestValidateAndRewriteProbeCandidateArgumentsRejectsRenderedAuthority(t *te
 func TestValidateAndRewriteProbeCandidateArgumentsConfinesSplitDwarf(t *testing.T) {
 	fixture := newToolsetResolverFixture(t)
 	resolver, err := loadToolsetPathResolver(
-		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files,
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +117,7 @@ func TestValidateAndRewriteProbeCandidateArgumentsConfinesSplitDwarf(t *testing.
 func TestValidateAndRewriteProbeCandidateArgumentsBindsSanitizerIgnorelist(t *testing.T) {
 	fixture := newToolsetResolverFixture(t)
 	resolver, err := loadToolsetPathResolver(
-		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files,
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -175,7 +175,7 @@ func TestValidateAndRewriteProbeCandidateArgumentsBindsSanitizerIgnorelist(t *te
 func TestResolveProbeCandidatePathUsesDeclaredSourceRootAndRejectsEscape(t *testing.T) {
 	fixture := newToolsetResolverFixture(t)
 	resolver, err := loadToolsetPathResolver(
-		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files,
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -219,7 +219,7 @@ func TestResolveProbeCandidatePathUsesDeclaredSourceRootAndRejectsEscape(t *test
 func TestResolveProbeCandidatePathAllowsMissingIncludeInsidePrivateScratch(t *testing.T) {
 	fixture := newToolsetResolverFixture(t)
 	resolver, err := loadToolsetPathResolver(
-		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files,
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -246,7 +246,7 @@ func TestResolveProbeCandidatePathAllowsMissingIncludeInsidePrivateScratch(t *te
 func TestResolveProbeCandidatePathRejectsMissingIncludeThroughEscapingSymlink(t *testing.T) {
 	fixture := newToolsetResolverFixture(t)
 	resolver, err := loadToolsetPathResolver(
-		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files,
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +268,7 @@ func TestResolveProbeCandidatePathRejectsMissingIncludeThroughEscapingSymlink(t 
 func TestResolveProbeCandidatePathStillRejectsMissingForcedInclude(t *testing.T) {
 	fixture := newToolsetResolverFixture(t)
 	resolver, err := loadToolsetPathResolver(
-		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files,
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +286,7 @@ func TestResolveProbeCandidatePathStillRejectsMissingForcedInclude(t *testing.T)
 func TestValidateAndRewriteProbeCandidateArgumentsRejectsCommaBearingForwardedPath(t *testing.T) {
 	fixture := newToolsetResolverFixture(t)
 	resolver, err := loadToolsetPathResolver(
-		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.files,
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
 	)
 	if err != nil {
 		t.Fatal(err)

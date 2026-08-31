@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 // KbuildCompilerIncludeOperand describes one compiler include option without
@@ -94,6 +96,23 @@ func ResolveCompactKbuildCompilerIncludePath(
 ) (location CompactKbuildInvocationLocation, relative, ok bool, err error) {
 	value = strings.TrimSpace(value)
 	if value == "" || strings.HasPrefix(value, "=") {
+		return CompactKbuildInvocationLocation{}, false, false, nil
+	}
+	if compactKbuildContainsPrivateToolsetPathByte(value) {
+		// Capability tags are transient planning data. Strip only their
+		// structural identity here so the exact-token check accepts both a
+		// planning capability and its normalized runtime core; authenticity is
+		// still verified by the workload codec before action replay.
+		core, err := toolaction.CanonicalizeExecutionRootProvenanceCapabilityIdentity(value)
+		if err != nil {
+			return CompactKbuildInvocationLocation{}, false, false, fmt.Errorf("compiler include has invalid toolset-path provenance: %w", err)
+		}
+		if _, _, err := toolaction.DecodeExecutionRootProvenancePath(core); err != nil {
+			return CompactKbuildInvocationLocation{}, false, false, fmt.Errorf("compiler include has invalid toolset-path provenance: %w", err)
+		}
+		// The identity-bound probe owns this root. It is neither source-tree nor
+		// object-tree relative and is resolved only by the action runner through
+		// the exact selected toolset closure.
 		return CompactKbuildInvocationLocation{}, false, false, nil
 	}
 	value = compactKbuildCollapseCompilerTreeRootJoins(value)

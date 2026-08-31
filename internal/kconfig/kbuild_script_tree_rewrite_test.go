@@ -182,3 +182,67 @@ drivers/demo.ko: vmlinux FORCE
 		t.Fatalf("staged script = %q arguments=%q, want authorized writable target binding", decoded, recipe.Arguments)
 	}
 }
+
+func TestHermeticKbuildScriptStagesPreconfiguredVmlinuxWithoutNativePrerequisite(t *testing.T) {
+	objectRoot := t.TempDir()
+	mustWriteSource(t, objectRoot, "vmlinux", "kernel BTF base\n")
+	profile := mustCompactKbuildProfileForTest(t, "modfinal", "scripts/Makefile.modfinal", "", `
+OBJCOPY = /selected/objcopy
+cmd_btf_ko = if [ ! -f $(objtree)/vmlinux ]; then printf 'skip BTF\n' >&2; else $(OBJCOPY) --strip-debug $(objtree)/vmlinux $@; fi
+drivers/demo.ko: FORCE
+	$(call if_changed,btf_ko)
+`, map[string]string{"OBJCOPY": KbuildActionRoleToken("target", "objcopy")})
+	profile.evaluator.template.sourceRoots = map[string]string{
+		"__LINUX_BZL_OBJECT_TREE__": objectRoot,
+	}
+	metadata := &CompactMetadata{
+		actionRoles:             testConfiguredScopedActionRoles,
+		preconfiguredObjectTree: true,
+		exactSourceNamespaces:   map[string]string{"vmlinux": "prep"},
+		Config:                  CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		forProfile(profile).
+		forOutput("target", "modules", "modules")
+	producer, err := builder.build("drivers/demo.ko")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("missing module producer %s", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	vmlinuxSource := false
+	for _, edge := range node.Sources {
+		for _, source := range plan.Sources {
+			if source.ID == edge.SourceID && source.Namespace == "prep" && source.Path == "vmlinux" {
+				vmlinuxSource = true
+				break
+			}
+		}
+	}
+	if !vmlinuxSource {
+		t.Fatalf("module sources = %#v, want exact prep/vmlinux source", node.Sources)
+	}
+	stagedVmlinux := false
+	for binding, destination := range recipe.WorkingInputs {
+		if strings.HasPrefix(binding, "source:") && destination == "vmlinux" {
+			stagedVmlinux = true
+			break
+		}
+	}
+	if !stagedVmlinux {
+		t.Fatalf("working inputs = %#v, want exact source staged as vmlinux", recipe.WorkingInputs)
+	}
+	script := compactKbuildRecipeScriptContentForTest(t, recipe)
+	for _, want := range []string{"[ ! -f vmlinux ]", "--strip-debug vmlinux"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("module script omits %q: %q", want, script)
+		}
+	}
+	if strings.Contains(script, "${tree:prep}/vmlinux") {
+		t.Fatalf("module script retained unstaged prep-tree vmlinux: %q", script)
+	}
+}

@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 func readActionPlanFilesForTest(root string) (map[string][]byte, error) {
@@ -74,9 +76,14 @@ func TestSelectedProductsOnlyPlanOmitsKernelAndSDKFacades(t *testing.T) {
 }
 
 func TestActionPlanWritesDeterministicV4StageMarkers(t *testing.T) {
+	hostInclude, err := toolaction.EncodeExecutionRootProvenancePath("host", "external/clang/include")
+	if err != nil {
+		t.Fatal(err)
+	}
 	recipe := ActionRecipe{
 		Schema: LinuxKernelPlanSchema, Kind: "compile", Tool: "cc",
 		Arguments:        []string{"-I${tree:kernel}/include", "-c", "${source:src:00000000}", "-o", "${output:00000000}"},
+		Environment:      map[string]string{"HOST_INCLUDE": hostInclude},
 		WorkingDirectory: "compile",
 		Sources:          []string{"src:00000000"}, Outputs: []string{"00000000"}, Trees: []string{"kernel"},
 	}
@@ -92,7 +99,7 @@ func TestActionPlanWritesDeterministicV4StageMarkers(t *testing.T) {
 	}
 	node.ID = node.ContentID()
 	plan := &ActionPlan{
-		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
+		Toolsets: map[string]string{"host": actionPlanTestProbeIdentity, "target": actionPlanTestProbeIdentity},
 		Sources:  []ActionPlanSource{{ID: "src-00000001", Namespace: "kernel", Path: "init/main.c"}},
 		Recipes:  map[string]ActionRecipe{recipeID: recipe}, Nodes: []ActionPlanNode{node},
 	}
@@ -139,6 +146,7 @@ func TestActionPlanWritesDeterministicV4StageMarkers(t *testing.T) {
 	}
 	for _, marker := range []string{
 		"schema/" + LinuxKernelPlanSchema,
+		"toolsets/host/" + actionPlanTestProbeIdentity,
 		"toolsets/target/" + actionPlanTestProbeIdentity,
 		"index/00000000/" + node.ID,
 		"sources/src-00000001/kernel/init/main.c",
@@ -146,6 +154,7 @@ func TestActionPlanWritesDeterministicV4StageMarkers(t *testing.T) {
 		"nodes/target/" + node.ID + "/kind/compile",
 		"nodes/target/" + node.ID + "/in/source/src/00000000/src-00000001",
 		"nodes/target/" + node.ID + "/in/tree/kernel",
+		"nodes/target/" + node.ID + "/in/toolset/host",
 		"nodes/target/" + node.ID + "/in/bindings/" + emptyBindingsID + ".json",
 		"nodes/target/" + node.ID + "/out/objects/00000000/init/main.o",
 	} {
@@ -1122,6 +1131,10 @@ func TestActionRecipeValidatesArgumentsFileProtocol(t *testing.T) {
 }
 
 func TestActionPlanRejectsInvalidGraphs(t *testing.T) {
+	hostInclude, err := toolaction.EncodeExecutionRootProvenancePath("host", "external/clang/include")
+	if err != nil {
+		t.Fatal(err)
+	}
 	valid := func() *ActionPlan {
 		recipe := ActionRecipe{Schema: LinuxKernelPlanSchema, Kind: "copy", Tool: "objcopy", Arguments: []string{"${input:src:00000000}", "${output:00000000}"}, Inputs: []string{"src:00000000"}, Outputs: []string{"00000000"}}
 		rid, _ := recipe.ID()
@@ -1150,6 +1163,19 @@ func TestActionPlanRejectsInvalidGraphs(t *testing.T) {
 			p.Nodes[0].Stage = "host"
 			p.Nodes[0].Outputs[0].Tree = "host"
 			p.Nodes[0].ID = p.Nodes[0].ContentID()
+		}},
+		{"recipe host provenance without toolset", "recipe requires unavailable host toolset", func(p *ActionPlan) {
+			oldID := p.Nodes[1].Recipe
+			recipe := p.Recipes[oldID]
+			recipe.Environment = map[string]string{"HOST_INCLUDE": hostInclude}
+			newID, err := recipe.ID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			delete(p.Recipes, oldID)
+			p.Recipes[newID] = recipe
+			p.Nodes[1].Recipe = newID
+			p.Nodes[1].ID = p.Nodes[1].ContentID()
 		}},
 		{"stage output tree mismatch", "target stage cannot write prep tree", func(p *ActionPlan) {
 			p.Nodes[0].Outputs[0].Tree = "prep"

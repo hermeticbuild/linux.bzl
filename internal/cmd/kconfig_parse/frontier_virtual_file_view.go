@@ -44,6 +44,11 @@ type kbuildFrontierVirtualFileView struct {
 	state                    kbuildFrontierState
 	directory                string
 	sourceOverlayDirectories []string
+	// immutableContents are object-tree files supplied independently of the
+	// selected Kbuild frontier. Resolved Kconfig projections live here: Make
+	// observes them as existing files from the start of every invocation, while
+	// a source-selected writer in state still supersedes their baseline bytes.
+	immutableContents map[string]string
 }
 
 func (view kbuildFrontierVirtualFileView) Match(pattern string) []string {
@@ -54,27 +59,35 @@ func (view kbuildFrontierVirtualFileView) Match(pattern string) []string {
 	}
 	visited := map[string]bool{}
 	matches := map[string]bool{}
+	visit := func(path string) {
+		if visited[path] {
+			return
+		}
+		visited[path] = true
+		first, second := kbuildInvocationVirtualPathAliasPair(path, view.directory)
+		aliases := []string{first, second}
+		if kbuildFrontierPathWithinSourceOverlay(path, view.sourceOverlayDirectories) {
+			aliases = append(aliases, kbuildEvalSourceTree+"/"+path)
+		}
+		for _, alias := range aliases {
+			if alias == "" {
+				continue
+			}
+			if matched, err := filepath.Match(pattern, alias); err == nil && matched {
+				matches[alias] = true
+			}
+		}
+	}
 	for _, prefix := range prefixes {
 		kbuildFrontierRangePrefix(view.state, prefix, func(path string, _ kbuildFrontierValue) bool {
-			if visited[path] {
-				return true
-			}
-			visited[path] = true
-			first, second := kbuildInvocationVirtualPathAliasPair(path, view.directory)
-			aliases := []string{first, second}
-			if kbuildFrontierPathWithinSourceOverlay(path, view.sourceOverlayDirectories) {
-				aliases = append(aliases, kbuildEvalSourceTree+"/"+path)
-			}
-			for _, alias := range aliases {
-				if alias == "" {
-					continue
-				}
-				if matched, err := filepath.Match(pattern, alias); err == nil && matched {
-					matches[alias] = true
-				}
-			}
+			visit(path)
 			return true
 		})
+		for path := range view.immutableContents {
+			if strings.HasPrefix(path, prefix) {
+				visit(path)
+			}
+		}
 	}
 	result := make([]string, 0, len(matches))
 	for match := range matches {
@@ -107,6 +120,25 @@ func (view kbuildFrontierVirtualFileView) Read(path string) (string, bool, bool,
 		}
 		exact = true
 		content = value.content
+		exactPath = global
+	}
+	if exists {
+		return content, true, exact, nil
+	}
+	for _, global := range paths {
+		baseline, found := view.immutableContents[global]
+		if !found {
+			continue
+		}
+		exists = true
+		if exact && content != baseline {
+			return "", false, false, fmt.Errorf(
+				"virtual path alias %q has conflicting immutable contents from %q and %q",
+				path, exactPath, global,
+			)
+		}
+		exact = true
+		content = baseline
 		exactPath = global
 	}
 	return content, exists, exact, nil

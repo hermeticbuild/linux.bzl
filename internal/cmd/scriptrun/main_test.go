@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
+	"github.com/hermeticbuild/linux.bzl/internal/toolsetpath"
 )
 
 func TestMain(testMain *testing.M) {
@@ -396,6 +397,123 @@ func TestExpandScriptTreeBindingsPreservesProvenanceMarkedLiteral(t *testing.T) 
 	}
 	if want := `printf '%s %s' '${tree:prep}' /declared/kernel`; got != want {
 		t.Fatalf("expanded script=%q, want %q", got, want)
+	}
+}
+
+func TestRunScriptResolvesTypedToolsetPathsAfterLiteralOffsets(t *testing.T) {
+	executionRoot := filepath.Join(t.TempDir(), "mapped $(printf unsafe) `printf unsafe` root's files")
+	canonicalHeader := "external/gcc/include/arm_neon.h"
+	include := filepath.Join(executionRoot, "bazel-out", "arm64-fastbuild", "genfiles", "external", "gcc", "include")
+	if err := os.MkdirAll(include, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(include, "arm_neon.h"), []byte("intrinsic"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	interpreter := writeExecutable(t, executionRoot, "runtime", `#!/bin/sh
+if [ "$1" = --list ]; then
+	printf '%s\n' sh
+	exit 0
+fi
+if [ "${0##*/}" = sh ]; then
+	exec /bin/sh "$@"
+fi
+if [ "$1" = sh ]; then
+	shift
+	exec /bin/sh "$@"
+fi
+exit 64
+`)
+	privatePath, err := toolaction.EncodeExecutionRootProvenancePath("target", canonicalHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := toolaction.KbuildToolsetManifest{
+		Schema:        toolaction.KbuildToolsetManifestSchema,
+		Scope:         "target",
+		Actions:       map[string][]string{"cc": {toolaction.KbuildArgumentsSentinel}},
+		Tools:         map[string]string{"cc": canonicalHeader},
+		Closure:       []string{canonicalHeader},
+		ArtifactKinds: map[string]string{canonicalHeader: toolaction.KbuildToolsetArtifactGeneratedFile},
+		ArtifactRoots: map[string]toolaction.KbuildToolsetArtifactRoot{
+			canonicalHeader: {Root: "root-00000000", Path: canonicalHeader},
+		},
+		Roots:         map[string]string{"root-00000000": canonicalHeader},
+		Environments:  map[string]map[string]string{"cc": {}},
+		MakeVariables: map[string]string{},
+		Requirements:  map[string]map[string]string{"cc": {}},
+	}
+	identity, err := manifest.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(executionRoot, "target-toolset.json")
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, manifestData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := toolsetpath.LoadFlags(
+		executionRoot,
+		filepath.Join(executionRoot, "parent-projection"),
+		[]string{"target=" + identity},
+		[]string{"target=" + manifestPath},
+		[]string{"target=root-00000000=" + filepath.Join(include, "arm_neon.h")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handoff, err := resolver.CreateHandoff(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	scriptContent := "#!/bin/sh\nvalue=\nIFS= read -r value < " + privatePath + " || :\nprintf '%s|%s|%s' \"$value\" '" + toolaction.ExecutionRootMarker + "' '${tree:literal}'\nprintf '|single:%s|double:%s' 'prefix " + privatePath + " suffix' \"prefix " + privatePath + " suffix\"\ncd /\nafter_cd=\nIFS= read -r after_cd < " + privatePath + " || :\nprintf '|cwd:%s' \"$after_cd\"\nsh -c 'nested=; IFS= read -r nested < " + privatePath + " || :; printf \"|nested:%s\" \"$nested\"'\neval 'evaluated=; IFS= read -r evaluated < " + privatePath + " || :'\nprintf '|eval:%s' \"$evaluated\"\n"
+	literalOffset := strings.Index(scriptContent, "${tree:literal}")
+	if literalOffset < 0 {
+		t.Fatal("test script omits literal tree marker")
+	}
+	var stdout, stderr bytes.Buffer
+	err = runScript(scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		toolsetHandoff: handoff,
+		scriptContent:  scriptContent, literalTreeOffsets: map[int]bool{literalOffset: true},
+		tools: map[string]string{}, toolContracts: map[string]toolaction.Contract{},
+		stdout: &stdout, stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runScript() failed: %v\nstderr: %s", err, stderr.String())
+	}
+	visibleHeader := toolsetpath.ShellAliasRootPath + "/aliases/target/" + identity + "/" + canonicalHeader
+	if got, want := stdout.String(), "intrinsic|"+toolaction.ExecutionRootMarker+"|${tree:literal}|single:prefix "+visibleHeader+" suffix|double:prefix "+visibleHeader+" suffix|cwd:intrinsic|nested:intrinsic|eval:intrinsic"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+
+	err = runScript(scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		toolsetHandoff: handoff,
+		scriptContent:  "#!/bin/sh\ncat <\\\n<EOF\n" + privatePath + "\nEOF\n",
+		tools:          map[string]string{}, toolContracts: map[string]toolaction.Contract{},
+		stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "heredoc") {
+		t.Fatalf("runScript(continued heredoc) error = %v, want heredoc rejection", err)
+	}
+
+	hostPath, err := toolaction.EncodeExecutionRootProvenancePath("host", canonicalHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = runScript(scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		toolsetHandoff: handoff,
+		scriptContent:  "#!/bin/sh\nprintf '%s' " + hostPath + "\n",
+		tools:          map[string]string{}, toolContracts: map[string]toolaction.Contract{},
+		stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "no typed host toolset scope") {
+		t.Fatalf("runScript(unknown scope) error = %v", err)
 	}
 }
 

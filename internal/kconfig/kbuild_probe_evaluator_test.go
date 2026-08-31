@@ -8,7 +8,84 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
+
+func TestKbuildProbeScopesImportAuthenticatedKconfigToolsetPath(t *testing.T) {
+	const canonicalPath = "external/compiler/vendor-sdk"
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	options := KbuildProbeWorkloadOptions{Target: testKbuildProbeScopeOptions(t, fixture)}
+	oracle := &ProbeResultOracle{
+		results:  map[string]ProbeResult{},
+		toolsets: map[string]string{"target": bootstrapTestIdentity},
+	}
+	wantCore, err := toolaction.EncodeExecutionRootProvenancePath("target", canonicalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stable string
+	for replay := 0; replay < 2; replay++ {
+		upstream, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+		if err != nil {
+			t.Fatal(err)
+		}
+		capability, err := upstream.EncodePath("target", canonicalPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evaluation, err := EvaluateKbuildProbeWorkload(options, oracle, func(scopes *KbuildProbeScopes) (string, error) {
+			imported, err := scopes.ImportToolsetPathCapabilities(capability, upstream.NormalizeValue)
+			if err != nil {
+				return "", err
+			}
+			parserOptions, err := scopes.Options("target", KbuildOptions{})
+			if err != nil {
+				return "", err
+			}
+			transformed, recognized, err := parserOptions.TransformSymbolic("addprefix", []string{"-I", imported})
+			if err != nil {
+				return "", err
+			}
+			if !recognized {
+				return "", fmt.Errorf("imported Kconfig path was not retained as symbolic Make text")
+			}
+			resolved, err := parserOptions.ResolveSymbolic(transformed)
+			if err != nil {
+				return "", err
+			}
+			return scopes.evaluators["target"].NormalizeToolsetPathCapabilities(resolved)
+		})
+		if err != nil {
+			t.Fatalf("replay %d: %v", replay, err)
+		}
+		if got, want := evaluation.Value, "-I"+wantCore; got != want {
+			t.Fatalf("replay %d imported path = %q, want %q", replay, got, want)
+		}
+		if replay == 0 {
+			stable = evaluation.Value
+		} else if evaluation.Value != stable {
+			t.Fatalf("typed Kconfig handoff depends on either workload key: first=%q second=%q", stable, evaluation.Value)
+		}
+	}
+
+	upstream, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := upstream.EncodePath("target", canonicalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := capability[:len(capability)-1] + map[bool]string{true: "0", false: "1"}[capability[len(capability)-1] != '0']
+	if _, err := EvaluateKbuildProbeWorkload(options, oracle, func(scopes *KbuildProbeScopes) (struct{}, error) {
+		_, err := scopes.ImportToolsetPathCapabilities(mutated, upstream.NormalizeValue)
+		return struct{}{}, err
+	}); err == nil || !strings.Contains(err.Error(), "authenticate Kconfig toolset path") {
+		t.Fatalf("mutated upstream capability error = %v, want authenticated handoff rejection", err)
+	}
+}
 
 type kbuildProbeWorkloadFixture struct {
 	TargetFlags string

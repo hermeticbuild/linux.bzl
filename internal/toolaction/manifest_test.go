@@ -24,6 +24,11 @@ func testKbuildToolsetManifest() KbuildToolsetManifest {
 			"external/toolchain/bin/cc":  KbuildToolsetArtifactGeneratedFile,
 			"external/toolchain/include": KbuildToolsetArtifactSource,
 		},
+		ArtifactRoots: map[string]KbuildToolsetArtifactRoot{
+			"external/toolchain/bin/cc":  {Root: "root-00000000", Path: "external/toolchain/bin/cc"},
+			"external/toolchain/include": {Root: "root-00000000", Path: "external/toolchain/include"},
+		},
+		Roots:         map[string]string{"root-00000000": "external/toolchain/bin/cc"},
 		Environments:  map[string]map[string]string{"cc": {}},
 		MakeVariables: map[string]string{"CC": "cc"},
 		Requirements:  map[string]map[string]string{"cc": {}},
@@ -83,6 +88,15 @@ func TestKbuildToolsetManifestRejectsPathsOutsideCanonicalClosure(t *testing.T) 
 		"invalid artifact kind": func(m *KbuildToolsetManifest) {
 			m.ArtifactKinds["external/toolchain/include"] = "directory-ish"
 		},
+		"missing artifact root": func(m *KbuildToolsetManifest) {
+			delete(m.ArtifactRoots, "external/toolchain/include")
+		},
+		"unknown artifact root": func(m *KbuildToolsetManifest) {
+			m.ArtifactRoots["external/toolchain/include"] = KbuildToolsetArtifactRoot{Root: "missing", Path: "external/toolchain/include"}
+		},
+		"wrong root anchor": func(m *KbuildToolsetManifest) {
+			m.Roots["root-00000000"] = "external/missing"
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			manifest := testKbuildToolsetManifest()
@@ -90,6 +104,14 @@ func TestKbuildToolsetManifestRejectsPathsOutsideCanonicalClosure(t *testing.T) 
 			manifest.ArtifactKinds = map[string]string{}
 			for path, kind := range testKbuildToolsetManifest().ArtifactKinds {
 				manifest.ArtifactKinds[path] = kind
+			}
+			manifest.ArtifactRoots = map[string]KbuildToolsetArtifactRoot{}
+			for path, root := range testKbuildToolsetManifest().ArtifactRoots {
+				manifest.ArtifactRoots[path] = root
+			}
+			manifest.Roots = map[string]string{}
+			for root, anchor := range testKbuildToolsetManifest().Roots {
+				manifest.Roots[root] = anchor
 			}
 			edit(&manifest)
 			if err := manifest.Validate(); err == nil {

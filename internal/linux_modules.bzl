@@ -368,6 +368,7 @@ def _kbuild_probe_actions(ctx, sdk, staged):
             sdk.host_tool_files,
             sdk.host_toolchain_files,
             sdk.host_toolset_manifest,
+            sdk.host_toolset_anchors,
             sdk.host_companion_tools,
         ),
         additional_params = linux_probe_map_directory_params(
@@ -392,6 +393,7 @@ def _kbuild_probe_actions(ctx, sdk, staged):
             sdk.target_tool_files,
             sdk.target_toolchain_files,
             sdk.target_toolset_manifest,
+            sdk.target_toolset_anchors,
             sdk.target_companion_tools,
         ),
         additional_params = linux_probe_map_directory_params(
@@ -481,8 +483,12 @@ def _map_external_plan(ctx, sdk, plans, staged):
             scope,
             sdk.target_tool_files,
             sdk.target_toolchain_files,
+            sdk.target_toolset_manifest,
+            sdk.target_toolset_anchors,
             sdk.host_tool_files,
             sdk.host_toolchain_files,
+            sdk.host_toolset_manifest,
+            sdk.host_toolset_anchors,
             sdk.target_companion_tools,
             sdk.host_companion_tools,
         )

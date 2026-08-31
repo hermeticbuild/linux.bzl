@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 type probeResultMap map[string]ProbeResult
@@ -86,6 +88,120 @@ func TestLinuxProbeEvaluatorRejectsPrivateRecursiveMakeBytesFromTextResults(t *t
 				t.Fatalf("readText() = %q, want printable value %q", got, test.value)
 			}
 		})
+	}
+}
+
+func TestLinuxProbeEvaluatorReplaysCompilerPathsWithExecutionRootProvenance(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := ProbeRequest{
+		Schema: LinuxProbeRequestSchema,
+		Steps: []ProbeStep{{
+			Name: "print-file", Tool: "cc", Arguments: []string{"-print-file-name=include"},
+			StdoutExecrootRelative: true, StdoutFallbackPath: "include",
+		}},
+		Outcome: ProbeOutcome{Kind: "text", Step: "print-file", Stream: "stdout", TrimSpace: true},
+	}
+	reference, err := builder.Request("target", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolchainPath, err := toolaction.EncodeExecutionRootProvenancePath("target", "external/gcc/lib/gcc/aarch64-linux/15.2.0/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exactSentinelArtifact, err := toolaction.EncodeExecutionRootProvenancePath("target", "include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name, result, pathKind, want string
+	}{
+		{
+			name: "identity-bound toolchain directory", result: "external/gcc/lib/gcc/aarch64-linux/15.2.0/include",
+			pathKind: ProbeStdoutPathToolset, want: toolchainPath,
+		},
+		{name: "real artifact with fallback spelling", result: "include", pathKind: ProbeStdoutPathToolset, want: exactSentinelArtifact},
+		{name: "unresolved compiler fallback", result: "include", pathKind: ProbeStdoutPathFallback, want: "include"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			oracle := &ProbeResultOracle{
+				toolsets: map[string]string{"target": bootstrapTestIdentity},
+				results: map[string]ProbeResult{
+					reference.NodeID: {
+						Schema: LinuxProbeResultSchema, NodeID: reference.NodeID, RequestID: reference.RequestID,
+						Scope: "target", ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: test.result,
+						Steps: []ProbeStepResult{{
+							Name: "print-file", Status: "success", ExitCode: 0, Stdout: test.result, StdoutPathKind: test.pathKind,
+						}},
+					},
+				},
+			}
+			registry := newLinuxProbeSymbolRegistry()
+			evaluator := &LinuxProbeEvaluator{oracle: oracle, symbolRegistry: registry}
+			got, err := evaluator.readText(reference, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			codec, err := registry.executionRootProvenanceCapabilityCodec()
+			if err != nil {
+				t.Fatal(err)
+			}
+			normalized, err := codec.NormalizeValue(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if normalized != test.want {
+				t.Fatalf("normalized readText() = %q, want %q (transient %q)", normalized, test.want, got)
+			}
+			if test.pathKind == ProbeStdoutPathToolset && got == normalized {
+				t.Fatalf("toolset path replay exposed unauthenticated deterministic token %q", got)
+			}
+			if stored, err := oracle.Result(reference); err != nil || stored.Text != test.result {
+				t.Fatalf("durable result = %#v, %v; want canonical relative text %q", stored, err, test.result)
+			}
+		})
+	}
+}
+
+func TestLinuxProbeEvaluatorReauthorizesStableConfigPathOnlyAfterExactReplay(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := testSymbolicProbeEvaluator(t, builder, nil)
+	stable, err := toolaction.EncodeExecutionRootProvenancePath("target", "external/compiler/vendor-sdk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := evaluator.NormalizeOrAuthorizeToolsetPathCapabilities(stable); err == nil || !strings.Contains(err.Error(), "was not measured") {
+		t.Fatalf("unmeasured stable config path error = %v, want authorization rejection", err)
+	}
+	evaluator.symbolRegistry.authorizeToolsetPath("target", "external/compiler/vendor-sdk")
+	if got, err := evaluator.NormalizeOrAuthorizeToolsetPathCapabilities(stable); err != nil || got != stable {
+		t.Fatalf("measured stable config path = %q, error %v, want %q", got, err, stable)
+	}
+	other, err := toolaction.EncodeExecutionRootProvenancePath("target", "external/compiler/other-sdk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := evaluator.NormalizeOrAuthorizeToolsetPathCapabilities(other); err == nil || !strings.Contains(err.Error(), "was not measured") {
+		t.Fatalf("different stable config path error = %v, want exact authorization rejection", err)
+	}
+
+	codec, err := evaluator.symbolRegistry.executionRootProvenanceCapabilityCodec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := codec.EncodePath("target", "external/compiler/vendor-sdk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := capability[:len(capability)-1] + map[bool]string{true: "0", false: "1"}[capability[len(capability)-1] != '0']
+	if _, err := evaluator.NormalizeOrAuthorizeToolsetPathCapabilities(mutated); err == nil || !strings.Contains(err.Error(), "authenticated planning capability") {
+		t.Fatalf("mutated capability error = %v, want keyed rejection without raw fallback", err)
 	}
 }
 
@@ -1200,7 +1316,7 @@ func TestLinuxProbeEvaluatorDiscoversCanonicalCapabilityDAG(t *testing.T) {
 			t.Errorf("request roles = %v", roles)
 		}
 	}
-	if got, want := plan.Nodes[0].RequestID, "64e567bf1cb2073accac8ad39a5cc6d565a3f86dca4255ae51ddabd474f6db51"; got != want {
+	if got, want := plan.Nodes[0].RequestID, "a6e3104fecd997c970d141cca0ac8876fca534fa35d3f1c957c1d4d200f477d2"; got != want {
 		t.Fatalf("cc-option canonical request ID = %s, want %s", got, want)
 	}
 }
@@ -2053,7 +2169,7 @@ func TestLinuxProbeEvaluatorDiscoversExactSpecialProbeRecipes(t *testing.T) {
 			if got, want := operands[1].Value, "${result:00000000.text}/headers/vendor-capability.h"; operands[1].Operator != "execroot-exists" || got != want {
 				t.Fatalf("source-selected compiler file predicate = %#v, want execroot-exists %q", operands[1], want)
 			}
-			if got := operands[0]; got.Operator != "not" || len(got.Operands) != 1 || got.Operands[0].Operator != "result-text-equals" || got.Operands[0].Result != "00000000" || got.Operands[0].Value != "vendor-sdk" {
+			if got := operands[0]; got.Operator != "not" || len(got.Operands) != 1 || got.Operands[0].Operator != "result-path-fallback" || got.Operands[0].Result != "00000000" || got.Operands[0].Value != "" {
 				t.Fatalf("source-selected compiler fallback predicate = %#v", got)
 			}
 			found["compiler-path-predicate"]++

@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 func TestRewriteCompactKbuildCompilerRelativeIncludesUsesInvocationTree(t *testing.T) {
@@ -61,6 +63,99 @@ func TestRewriteCompactKbuildCompilerRelativeIncludesAllowsRootAndRejectsEscape(
 	}
 	if _, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", ".", []string{"-I../escape"}); err == nil {
 		t.Fatal("include directory escaping its declared object tree was accepted")
+	}
+}
+
+func TestRewriteCompactKbuildCompilerIncludesPreservesProbedExecutionRoot(t *testing.T) {
+	profile := CompactKbuildProfile{}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: "crypto",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const canonicalInclude = "external/gcc/lib/gcc/aarch64-linux/15.2.0/include"
+	include, err := toolaction.EncodeExecutionRootProvenancePath("target", canonicalInclude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codec, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := codec.EncodePath("target", canonicalInclude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range []string{include, capability} {
+		arguments := []string{"-nostdinc", "-isystem", candidate, "-c", "aegis128-neon-inner.c"}
+		got, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", ".", arguments)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, arguments) {
+			t.Fatalf("probed compiler include argv = %#v, want preserved %#v", got, arguments)
+		}
+	}
+	malformed := toolaction.ExecutionRootProvenanceMarker + "target:external/gcc/../../etc" + toolaction.ExecutionRootProvenanceTerminator
+	if _, err := rewriteCompactKbuildCompilerRelativeIncludes(profile, "cc", ".", []string{"-isystem", malformed}); err == nil {
+		t.Fatal("compiler include accepted a traversing toolset-path token")
+	}
+}
+
+func TestKbuildSourceCannotAuthorProbedExecutionRoot(t *testing.T) {
+	marker, err := toolaction.EncodeExecutionRootProvenancePath("target", "external/forged/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protectCompactKbuildSourceLiteralActionMarkers(
+		"-isystem" + marker,
+	); err == nil || !strings.Contains(err.Error(), "reserved literal-marker byte") {
+		t.Fatalf("source execution-root marker error = %v, want reserved-marker rejection", err)
+	}
+}
+
+func TestGenericKbuildCompilerCarriesProbedExecutionRootIntoRecipe(t *testing.T) {
+	const (
+		directory = "crypto"
+		target    = directory + "/aegis128-neon-inner.o"
+		source    = directory + "/aegis128-neon-inner.c"
+	)
+	include, err := toolaction.EncodeExecutionRootProvenancePath("target", "external/gcc/lib/gcc/aarch64-linux/15.2.0/include")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := mustCompactKbuildProfileForTest(t, "build:"+directory, "scripts/Makefile.build", directory, `
+cmd_cc_o_c = $(CC) -nostdinc -isystem $(compiler-include) -c -o $@ $<
+`, map[string]string{
+		"CC":               KbuildActionRoleToken("target", "cc"),
+		"compiler-include": include,
+	})
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: directory,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{actionRoles: testConfiguredScopedActionRoles}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	sourceID, err := metadata.ensureActionPlanSource(plan, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).forProfile(profile)
+	producer, err := builder.buildCommandTemplate(target, compactKbuildRuleMatch{
+		profile: profile, stem: "aegis128-neon-inner", command: "cc_o_c",
+	}, []compactKbuildRuleInput{{path: source, sourceID: sourceID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("compiler producer %q not found", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if !slices.Contains(recipe.Arguments, include) {
+		t.Fatalf("compiler arguments = %#v, want probed include %q", recipe.Arguments, include)
 	}
 }
 

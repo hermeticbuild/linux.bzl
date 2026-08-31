@@ -59,7 +59,7 @@ include/generated/bounds.h: kernel/bounds.c FORCE
 		},
 		ConfigVariablesComplete: true,
 		MakeVariablesComplete:   true,
-	}, nil, nil)
+	}, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

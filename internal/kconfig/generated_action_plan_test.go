@@ -309,6 +309,7 @@ include/generated/release-consumer: include/config/kernel.release FORCE
 	plan.Products = append(plan.Products, ActionPlanProduct{
 		Name: "module_symvers", Tree: "metadata", Path: "Module.symvers",
 	})
+	seedModuleSDKVmlinuxForTest(t, plan)
 	if err := metadata.appendModuleSDKActionPlanNodes(plan); err != nil {
 		t.Fatal(err)
 	}

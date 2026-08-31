@@ -5,6 +5,32 @@ import (
 	"testing"
 )
 
+func TestProbeResultPathFallbackPredicateUsesExplicitProvenance(t *testing.T) {
+	predicate := ProbePredicate{Operator: "result-path-fallback", Result: "00000000"}
+	for _, test := range []struct {
+		name, kind string
+		want       bool
+	}{
+		{name: "real artifact named like sentinel", kind: ProbeStdoutPathToolset, want: false},
+		{name: "compiler fallback", kind: ProbeStdoutPathFallback, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := EvaluateProbeResultPredicate(predicate, map[string]ProbeResult{
+				"00000000": {
+					Kind: "text", Text: "include",
+					Steps: []ProbeStepResult{{Name: "query", Status: "success", Stdout: "include", StdoutPathKind: test.kind}},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("fallback predicate = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func dependencyTextResult(value string) ProbeResult {
 	return ProbeResult{Kind: "text", Text: value}
 }

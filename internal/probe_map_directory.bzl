@@ -32,6 +32,7 @@ _IDENTITY_DIRECTORIES = {
 _RUNNER_TOOL = "probe_runner"
 _TOOLCHAIN_FILES = "toolchain_files"
 _TOOLSET_MANIFEST = "toolset_manifest"
+_TOOLSET_ANCHOR_PREFIX = "toolset_anchor_"
 _ROLE_TOOL_PREFIX = "probe_role_"
 _COMPANION_TOOL_PREFIX = "companion_tool_"
 _EMPTY_RESULT_MARKER = ".empty"
@@ -650,20 +651,26 @@ def expand_linux_probe_plan(template_ctx, input_directories, output_directories,
             if source_context.rust_root:
                 transitive_inputs.append(source_context.rust_files)
 
-        closure_args = template_ctx.args()
-        closure_args.add_all(
-            tools[_TOOLCHAIN_FILES],
-            expand_directories = False,
-            format_each = "-toolset_file=%s",
-        )
-        closure_args.use_param_file("@%s", use_always = True)
-        closure_args.set_param_file_format("multiline")
+        anchor_args = template_ctx.args()
+        anchors = [
+            (name[len(_TOOLSET_ANCHOR_PREFIX):], tools[name])
+            for name in sorted(tools)
+            if name.startswith(_TOOLSET_ANCHOR_PREFIX)
+        ]
+        if not anchors:
+            fail("Linux probe expansion has no toolset root anchors")
+        for root, anchor in anchors:
+            anchor_args.add_all(
+                [anchor],
+                expand_directories = False,
+                format_each = "-toolset_anchor=" + root + "=%s",
+            )
         template_ctx.run(
             executable = tools[_RUNNER_TOOL],
             inputs = depset(direct = inputs, transitive = transitive_inputs),
             tools = [tools[_TOOLCHAIN_FILES]] + selected_tools,
             outputs = [output],
-            arguments = [args, closure_args],
+            arguments = [args, anchor_args],
             progress_message = "Probing Linux %s compiler capability %s" % (scope, node_id[:12]),
         )
         registered[node_id] = True
@@ -710,13 +717,19 @@ def linux_probe_map_directory_params(
         fail("Linux probe environments have no action argv for roles %r" % unexpected)
     return params
 
-def linux_probe_map_directory_tools(runner, tool_files, toolchain_files, toolset_manifest, companion_tools = {}):
+def linux_probe_map_directory_tools(runner, tool_files, toolchain_files, toolset_manifest, toolset_anchors, companion_tools = {}):
     """Namespaces configured probe tools away from callback implementation tools."""
     values = {
         _RUNNER_TOOL: runner,
         _TOOLCHAIN_FILES: toolchain_files,
         _TOOLSET_MANIFEST: toolset_manifest,
     }
+    if not toolset_anchors:
+        fail("Linux probe map_directory has no toolset root anchors")
+    for root, anchor in toolset_anchors.items():
+        if not _valid_name(root):
+            fail("Linux probe map_directory has invalid toolset root anchor %r" % root)
+        values[_TOOLSET_ANCHOR_PREFIX + root] = anchor
     for role, tool in tool_files.items():
         if not _valid_name(role):
             fail("Linux probe tool has invalid role %r" % role)
