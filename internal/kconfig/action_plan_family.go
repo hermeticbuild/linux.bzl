@@ -485,9 +485,59 @@ func marshalCanonicalActionPlanSnapshot(s ActionPlanSnapshot) ([]byte, error) {
 	}
 	data = append(data, '\n')
 	if len(data) > MaxActionPlanSnapshotBytes {
-		return nil, fmt.Errorf("action plan snapshot contains %d bytes, want at most %d", len(data), MaxActionPlanSnapshotBytes)
+		return nil, actionPlanSnapshotSizeError(s, len(data), MaxActionPlanSnapshotBytes)
 	}
 	return data, nil
+}
+
+// Compute section sizes only on the rejected transport path. Count canonical
+// bytes without retaining a second encoded copy of a potentially huge field;
+// report sizes, never command, environment, or source contents.
+func actionPlanSnapshotSizeError(snapshot ActionPlanSnapshot, actual, limit int) error {
+	sections, err := actionPlanSnapshotSectionSizes(snapshot)
+	if err != nil {
+		return fmt.Errorf("action plan snapshot contains %d bytes, want at most %d (section sizes unavailable: %w)", actual, limit, err)
+	}
+	names := slices.Sorted(maps.Keys(sections))
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%s=%d", name, sections[name]))
+	}
+	return fmt.Errorf("action plan snapshot contains %d bytes, want at most %d (section bytes: %s)", actual, limit, strings.Join(parts, ", "))
+}
+
+type actionPlanSnapshotByteCounter int64
+
+func (count *actionPlanSnapshotByteCounter) Write(data []byte) (int, error) {
+	*count += actionPlanSnapshotByteCounter(len(data))
+	return len(data), nil
+}
+
+func actionPlanSnapshotSectionSizes(snapshot ActionPlanSnapshot) (map[string]int64, error) {
+	value := reflect.ValueOf(snapshot)
+	valueType := value.Type()
+	sizes := make(map[string]int64, value.NumField())
+	for index := 0; index < value.NumField(); index++ {
+		fieldType := valueType.Field(index)
+		tag := strings.Split(fieldType.Tag.Get("json"), ",")
+		if fieldType.PkgPath != "" || tag[0] == "-" {
+			continue
+		}
+		field := value.Field(index)
+		if slices.Contains(tag[1:], "omitempty") && actionPlanSnapshotJSONEmpty(field) {
+			continue
+		}
+		name := tag[0]
+		if name == "" {
+			name = fieldType.Name
+		}
+		var count actionPlanSnapshotByteCounter
+		if err := writeActionPlanSnapshotCanonicalValue(&count, field); err != nil {
+			return nil, err
+		}
+		sizes[name] = int64(count)
+	}
+	return sizes, nil
 }
 
 func (s ActionPlanSnapshot) canonicalJSON() ([]byte, error) {
