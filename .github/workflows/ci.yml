@@ -35,7 +35,7 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-root-${{ matrix.bazel }}
+          disk-cache: false
           repository-cache: |
             - MODULE.bazel
             - MODULE.bazel.lock
@@ -53,6 +53,7 @@ jobs:
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test //... \
             --noannounce_rc \
+            --disk_cache= \
             --config=path-mapping \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
@@ -116,7 +117,7 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}
+          disk-cache: false
           module-root: examples
           repository-cache: |
             - examples/.bazelversion
@@ -153,6 +154,7 @@ jobs:
           fi
           configuration_flags=(
             --config=path-mapping
+            --disk_cache=
             --config="compiler-${BAZEL_COMPILER}"
           )
           bazel --host_jvm_args=-Xmx6g \
@@ -285,7 +287,7 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-qemu-e2e-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}
+          disk-cache: false
           module-root: e2e
           repository-cache: |
             - e2e/.bazelversion
@@ -312,6 +314,7 @@ jobs:
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test "${targets[@]}" \
             --noannounce_rc \
+            --disk_cache= \
             --config=path-mapping \
             --config="compiler-${{ matrix.compiler }}" \
             --notrack_incremental_state \
@@ -370,7 +373,7 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}
+          disk-cache: false
           module-root: aya_e2e
           repository-cache: |
             - aya_e2e/.bazelversion
@@ -403,6 +406,7 @@ jobs:
             '//:compiler_toolchain_tests' \
             '@rules_rust//test/unit/linker_path_mapping:all' \
             --noannounce_rc \
+            --disk_cache= \
             --config=path-mapping \
             --config="compiler-${{ matrix.compiler }}" \
             --notrack_incremental_state \
@@ -461,7 +465,7 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-sonic-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}
+          disk-cache: false
           module-root: sonic_e2e
           repository-cache: |
             - sonic_e2e/.bazelversion
@@ -490,6 +494,7 @@ jobs:
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             test //:sonic_linux_ngbde_module_test //:sonic_arm64_module_exclusion_test \
             --noannounce_rc \
+            --disk_cache= \
             --config=path-mapping \
             --config="compiler-${{ matrix.compiler }}" \
             --notrack_incremental_state \
