@@ -386,6 +386,81 @@ result.o: result.c FORCE
 	}
 }
 
+func TestKbuildCommandSelectionUsesExactResolvedEmptiness(t *testing.T) {
+	emptyToken := linuxProbeSymbolPrefix + strings.Repeat("a", 64)
+	firstToken := linuxProbeSymbolPrefix + strings.Repeat("b", 64)
+	lastToken := linuxProbeSymbolPrefix + strings.Repeat("c", 64)
+	recipe := []string{
+		"$(call cmd,emit,first)",
+		"$(call cmd,emit,optional)",
+		"$(call cmd,emit,last)",
+		"$(call cmd,emit,first)",
+	}
+	for _, test := range []struct {
+		name, optional string
+		resolved, fail bool
+	}{
+		{name: "discovery retains unresolved occurrences"},
+		{name: "empty middle occurrence", resolved: true},
+		{name: "whitespace middle occurrence", optional: " \t\n ", resolved: true},
+		{name: "nonempty middle occurrence", optional: "echo optional", resolved: true},
+		{name: "failed answer is not emptiness", resolved: true, fail: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile := mustCompactKbuildProfileForTest(t, "build:selection", "Makefile", "", `
+cmd = $(if $(cmd_$(1)),set -e; $(cmd_$(1)),:)
+cmd_emit = $(payload_$(2))
+payload_first = `+firstToken+`
+payload_optional = `+emptyToken+`
+payload_last = `+lastToken+`
+result:
+	$(call cmd,emit,first)
+`, nil)
+			answers := map[string]string{firstToken: "echo first", emptyToken: test.optional, lastToken: "echo last"}
+			profile.evaluator.template.resolveSymbolic = func(value string) (string, error) {
+				if !test.resolved {
+					return value, nil
+				}
+				if test.fail && strings.Contains(value, emptyToken) {
+					return "", fmt.Errorf("missing exact occurrence answer")
+				}
+				for token, answer := range answers {
+					value = strings.ReplaceAll(value, token, answer)
+				}
+				return value, nil
+			}
+			for _, concrete := range []bool{true, false} {
+				selections, err := evaluatedKbuildRuleCommandSelections(profile, "result", "result", "", nil, nil, nil, recipe, concrete)
+				if test.fail {
+					if err == nil || !strings.Contains(err.Error(), "missing exact occurrence answer") {
+						t.Fatalf("concrete=%t swallowed failed oracle answer: %v", concrete, err)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := []string{firstToken, emptyToken, lastToken, firstToken}
+				if test.resolved && strings.TrimSpace(test.optional) == "" {
+					want = []string{firstToken, lastToken, firstToken}
+				}
+				if len(selections) != len(want) {
+					t.Fatalf("concrete=%t selected %d occurrences, want %d: %#v", concrete, len(selections), len(want), selections)
+				}
+				for index, token := range want {
+					text := token
+					if concrete && test.resolved {
+						text = answers[token]
+					}
+					if selections[index].Name != "emit" || selections[index].Text != text {
+						t.Fatalf("concrete=%t occurrence %d = %#v, want emit/%q", concrete, index, selections[index], text)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestKbuildCommandSelectionRecoversExactWrapperFromUnlowerableRebuildGuard(t *testing.T) {
 	token := linuxProbeSymbolPrefix + strings.Repeat("e", 64)
 	profile := mustCompactKbuildProfileForTest(t, "build:symbolic-guard", "scripts/Makefile.build", "", `

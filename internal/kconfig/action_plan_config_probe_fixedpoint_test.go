@@ -969,13 +969,17 @@ func TestActionPlanConfigProbeReplayPreservesConditionalMetadataSuffix(t *testin
 	testActionPlanConfigProbeReplaySplitSuffix(t, "conditional metadata")
 }
 
+func TestActionPlanConfigProbeReplayDropsEmptyConditionalMetadataSelection(t *testing.T) {
+	testActionPlanConfigProbeReplaySplitSuffix(t, "empty conditional metadata")
+}
+
 func TestActionPlanConfigProbeReplayRejectsChangedConditionalCompilerSuffix(t *testing.T) {
 	testActionPlanConfigProbeReplaySplitSuffix(t, "conditional compiler")
 }
 
 func testActionPlanConfigProbeReplaySplitSuffix(t *testing.T, suffixMode string) {
 	conditionalSuffix := suffixMode != "compiler"
-	conditionalMetadata := suffixMode == "conditional metadata"
+	conditionalMetadata := suffixMode == "conditional metadata" || suffixMode == "empty conditional metadata"
 	const (
 		target  = "scripts/mod/devicetable-offsets.s"
 		source  = "scripts/mod/devicetable-offsets.c"
@@ -1016,6 +1020,11 @@ scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 		makeText = strings.ReplaceAll(makeText,
 			"cmd_gensymtypes = if true; then $(CC) -D__GENKSYMS__ $(c_flags) -E $< >> $(dot-target).cmd; fi",
 			"cmd_gensymtypes = $(if $(call cc-option,-ffixedpoint-selected),"+suffixCommand+")")
+		if suffixMode == "empty conditional metadata" {
+			makeText = strings.ReplaceAll(makeText,
+				"cmd_gensymtypes = $(if $(call cc-option,-ffixedpoint-selected),",
+				"cmd_gensymtypes = $(if $(findstring -pg,$(call cc-option,-ffixedpoint-selected)),")
+		}
 	}
 	if err := os.WriteFile(makefile, []byte(makeText), 0o644); err != nil {
 		t.Fatal(err)
@@ -1190,7 +1199,8 @@ scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 			}
 		}
 	}
-	if !typedPrefix || !opaqueSuffix {
+	wantOpaqueSuffix := suffixMode != "empty conditional metadata"
+	if !typedPrefix || opaqueSuffix != wantOpaqueSuffix {
 		t.Fatalf("changed split classification: prefix=%t suffix=%t", typedPrefix, opaqueSuffix)
 	}
 }

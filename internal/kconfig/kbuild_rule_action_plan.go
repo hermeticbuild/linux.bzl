@@ -11362,12 +11362,13 @@ func evaluatedKbuildRuleCommandSelectionsForMakeTarget(
 	commandStackIndex := map[string]int{}
 	var lineCommandAccesses *[]CompactKbuildCommandTemplate
 	newSelectionMarker := func(selection CompactKbuildCommandTemplate, preserveEmpty bool) (string, error) {
-		// The marker deliberately hides selected command text from the outer
-		// recipe expansion. Resolve replay-time probe atoms before hiding that
-		// text, or the outer resolver can see only the inert marker and a planner
-		// token can escape into an executed argv. Discovery keeps the same text
-		// symbolic so it can still collect the complete probe workload.
-		if resolveSymbolic && linuxProbeSymbolPattern.MatchString(selection.Text) {
+		// Both selection passes must agree whether this exact occurrence exists.
+		// An inert marker would otherwise hide a helper which resolves to empty
+		// from its source-defined wrapper. Use the same target-context oracle for
+		// that decision, but retain symbolic command bytes in the probe pass so
+		// compiler requests keep their discovery-time identity and dependencies.
+		activeText := selection.Text
+		if linuxProbeSymbolPattern.MatchString(activeText) {
 			resolved, err := parser.resolveKbuildSymbolic(selection.Text)
 			if err != nil {
 				owner := selection.Name
@@ -11381,9 +11382,12 @@ func evaluatedKbuildRuleCommandSelectionsForMakeTarget(
 					target, profile.Name, owner, err,
 				)
 			}
-			selection.Text = resolved
+			activeText = resolved
+			if resolveSymbolic {
+				selection.Text = resolved
+			}
 		}
-		if !preserveEmpty && strings.TrimSpace(selection.Text) == "" {
+		if !preserveEmpty && strings.TrimSpace(activeText) == "" {
 			return "", nil
 		}
 		marker := fmt.Sprintf("%s%08d__", compactKbuildCommandSelectionMarker, len(selectionByMarker))
