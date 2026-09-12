@@ -127,17 +127,26 @@ func TestActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t *testing.T)
 			"-imacros $(srctree)/forced.S)",
 	} {
 		t.Run(name, func(t *testing.T) {
-			testActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t, expression, false)
+			testActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t, expression, "")
 		})
 	}
 }
 
 func TestActionPlanConfigProbeForcedCPrerequisiteDoesNotGainPositionalAuthority(t *testing.T) {
 	testActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t,
-		"$(strip $(call cc-option,-ffixedpoint-selected) -include $(srctree)/forced.c)", true)
+		"$(strip $(call cc-option,-ffixedpoint-selected) -include $(srctree)/forced.c)", "forced.c")
 }
 
-func testActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t *testing.T, flagExpression string, forcedPrerequisite bool) {
+func TestActionPlanConfigProbeExtraSourcePrerequisiteDoesNotBecomeTranslationUnit(t *testing.T) {
+	for _, prerequisite := range []string{"forced.c", "forced.C", "forced.S", "forced.s"} {
+		t.Run(prerequisite, func(t *testing.T) {
+			testActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t,
+				"$(strip $(call cc-option,-ffixedpoint-selected))", prerequisite)
+		})
+	}
+}
+
+func testActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t *testing.T, flagExpression string, extraPrerequisite string) {
 	const target = "driver.o"
 	root := t.TempDir()
 	makefile := filepath.Join(root, "Makefile")
@@ -145,9 +154,10 @@ func testActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t *testing.T,
 	mustWriteSource(t, root, "forced.c", "#define FORCED_SOURCE_INPUT 1\n")
 	mustWriteSource(t, root, "forced.C", "#define FORCED_SOURCE_INPUT 1\n")
 	mustWriteSource(t, root, "forced.S", "#define FORCED_SOURCE_INPUT 1\n")
+	mustWriteSource(t, root, "forced.s", "#define FORCED_SOURCE_INPUT 1\n")
 	prerequisites := "driver.c"
-	if forcedPrerequisite {
-		prerequisites += " forced.c"
+	if extraPrerequisite != "" {
+		prerequisites += " " + extraPrerequisite
 	}
 	if err := os.WriteFile(makefile, []byte(fmt.Sprintf(`
 TMPOUT = .tmp_$$$$
@@ -267,32 +277,19 @@ driver.o: %s FORCE
 	if !foundDependentPredefines {
 		t.Fatalf("discovery plan has no compiler-predefines request dependent on cc-option: %#v", discovery.Plan.Nodes)
 	}
-	if forcedPrerequisite {
-		// A source-like Make prerequisite hidden behind unresolved option
-		// ownership is not proven to be a positional TU. This deliberately
-		// remains outside the supported projection; no successful result oracle
-		// is fabricated for it. The runner's original exact occurrence check
-		// must reject the false positional claim after the fragment resolves.
-		found := false
+	if extraPrerequisite != "" {
 		for _, request := range discovery.Plan.Requests {
 			if len(request.Steps) != 1 || request.Steps[0].Name != "compiler-predefines" {
 				continue
 			}
 			candidate := request.Steps[0].Candidate
-			if candidate == nil || !slices.Contains(candidate.TranslationUnits, "forced.c") {
-				continue
+			if candidate == nil || len(candidate.TranslationUnits) != 0 {
+				t.Fatalf("extra prerequisite acquired positional authority: %#v", candidate)
 			}
-			found = true
-			if _, _, err := ProjectProbeCandidateArguments(candidate.Projection,
-				[]string{"-ffixedpoint-selected", "-include", "__LINUX_BZL_SOURCE_TREE__/forced.c"},
-				candidate.TranslationUnits); err == nil {
-				t.Fatal("forced prerequisite acquired unowned positional TU authority")
+			if !slices.Contains(request.Steps[0].Arguments, "c") {
+				t.Fatal("extra prerequisite changed the C compiler language")
 			}
 		}
-		if !found {
-			t.Fatal("fixture did not stage the unresolved forced C prerequisite")
-		}
-		return
 	}
 
 	oracle := successfulProbeOracleForFixedPointTest(t, discovery.Plan)
@@ -1145,7 +1142,7 @@ func TestActionPlanConfigProbeReplayPreservesDynamicFirstCompilerProjection(t *t
 	for _, distinctSources := range []bool{false, true} {
 		name := "same explicit source"
 		if distinctSources {
-			name = "different sources stay opaque on split replay"
+			name = "different sources keep independent projection proofs"
 		}
 		t.Run(name, func(t *testing.T) {
 			testActionPlanDynamicFirstCompilerProjection(t, distinctSources)
@@ -1313,6 +1310,9 @@ scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 			continue
 		}
 		step := request.Steps[0]
+		if step.Candidate == nil || len(step.Candidate.TranslationUnits) != 0 {
+			t.Fatalf("compound compiler claimed a hidden source from another command: %#v", step.Candidate)
+		}
 		suffix := strings.Contains(strings.Join(step.Arguments, " "), "GENKSYMS")
 		if suffix {
 			count++
@@ -1331,14 +1331,11 @@ scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 			}
 		}
 	}
-	if !distinctSources && count == 0 {
+	if count == 0 {
 		t.Fatal("dynamic first compiler suppressed discovery of the suffix compiler query")
 	}
-	if distinctSources && count != 0 {
-		t.Fatal("compound discovery claimed another command's source as a mandatory TU")
-	}
-	if !distinctSources && (!firstSourceShell || !suffixSourceShell) {
-		t.Fatal("unsplit discovery discarded the first or suffix compiler's source-shell twin")
+	if !suffixSourceShell || (!distinctSources && !firstSourceShell) {
+		t.Fatalf("unsplit discovery lost a supported source-shell twin: first=%t suffix=%t", firstSourceShell, suffixSourceShell)
 	}
 	for _, node := range discovery.Value.Nodes {
 		if node.Kind == "compile" || discovery.Value.Recipes[node.Recipe].CompilerInvocation != nil {
@@ -1359,8 +1356,11 @@ scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 			typed = true
 			if distinctSources {
 				set, err := AnalyzeActionPlanNodeConfigDependencies(replay.Value, node)
+				// Unlike the suffix, the first command has dynamic filter-out
+				// operands outside the bounded finite proof. Its old fail-closed
+				// precision boundary must survive the new suffix query.
 				if err != nil || !set.Opaque || !strings.Contains(set.Reason, "unresolved translation-unit ownership") {
-					t.Fatalf("split replay changed unsupported ownership into a required query: set=%#v err=%v", set, err)
+					t.Fatalf("split replay bypassed unresolved first-command ownership: set=%#v err=%v", set, err)
 				}
 			}
 		}

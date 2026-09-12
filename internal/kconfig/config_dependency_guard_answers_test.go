@@ -45,14 +45,7 @@ func configDependencyGuardAnswerProbeForTest(
 	if err != nil {
 		t.Fatal(err)
 	}
-	sources = configDependencyCompilerPredefineSourcePaths(invocation, sources)
-	if invocation.hasPredefineProjection {
-		invocation.arguments = invocation.predefineArguments
-		invocation.kbuildStart = invocation.predefineKbuildStart
-		invocation.kbuildEnd = invocation.predefineKbuildEnd
-		invocation.probeEnvironment = invocation.predefineProbeEnvironment
-	}
-	probe, reason := configDependencyCompilerPredefineProbeForInvocation(invocation, sources)
+	probe, reason := configDependencyCompilerPredefineProbeForActionInvocation(invocation, sources)
 	if reason != "" {
 		t.Fatal(reason)
 	}

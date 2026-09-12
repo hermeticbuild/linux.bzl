@@ -3172,6 +3172,7 @@ func (s *KbuildProbeScopes) BindActionPlanToolsetPathCapabilities(metadata *Comp
 		return evaluator.renderSourceShellWords(value)
 	}
 	metadata.compilerPredefines = s.CompilerPredefines
+	metadata.compilerSourceCandidates = s.compilerSourceCandidates
 	metadata.compilerDefinedness = s.CompilerDefinedness
 	metadata.compilerDollarPunctuation = s.CompilerDollarPunctuation
 	if s.sourceGuardInventory == nil {

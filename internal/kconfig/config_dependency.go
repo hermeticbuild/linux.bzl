@@ -6206,6 +6206,7 @@ type configDependencyCompilerInvocation struct {
 	predefineProbeEnvironment map[string]string
 	hasPredefineProjection    bool
 	predefineExplicitSources  bool
+	sourceCandidates          func(arguments, candidates []string) []string
 	sourceBindings            map[string]ActionPlanSource
 	inputBindings             map[string]configDependencyInputBinding
 }
@@ -6349,6 +6350,12 @@ func actionPlanConfigDependencyCompilerInvocationWithProjection(
 	if plan == nil || plan.metadata == nil {
 		bindConfigDependencyCompilerInvocationInputs(plan, node, recipe, &invocation)
 		return invocation, ""
+	}
+	if filter := plan.metadata.compilerSourceCandidates; filter != nil {
+		scope, role := actionPlanConfigDependencyScope(node), invocation.tool
+		invocation.sourceCandidates = func(arguments, candidates []string) []string {
+			return filter(scope, role, arguments, candidates)
+		}
 	}
 	if plan.metadata.actionContracts == nil {
 		if len(plan.metadata.actionRoles) != 0 {
@@ -7261,6 +7268,7 @@ func configDependencyCompilerPredefineProbeForInvocation(
 		}
 	}
 	language := "c"
+	plainAssembler := false
 	if invocation.tool == "cxx" {
 		language = "c++"
 	}
@@ -7271,7 +7279,7 @@ func configDependencyCompilerPredefineProbeForInvocation(
 		case ".S", ".sx":
 			language = "assembler-with-cpp"
 		case ".s":
-			return configDependencyCompilerPredefineProbe{}, "compiler predefine probe cannot preprocess a plain assembler source"
+			plainAssembler = true
 		}
 	}
 	probeEnvironment, reason := configDependencyCompilerPredefineEnvironmentProjection(invocation.probeEnvironment)
@@ -7361,6 +7369,9 @@ func configDependencyCompilerPredefineProbeForInvocation(
 	}
 	if invocation.predefineExplicitSources && len(probe.translationUnits) != 0 {
 		return configDependencyCompilerPredefineProbe{}, "multi-compiler probe cannot assign unresolved translation-unit ownership"
+	}
+	if plainAssembler {
+		return probe, "compiler predefine probe cannot preprocess a plain assembler source"
 	}
 	switch probe.language {
 	case "c", "c++", "assembler-with-cpp":
@@ -9942,6 +9953,30 @@ func configDependencyCompilerPredefineProbeForActionInvocation(
 		invocation.kbuildEnd = invocation.predefineKbuildEnd
 		invocation.probeEnvironment = maps.Clone(invocation.predefineProbeEnvironment)
 	}
+	if invocation.sourceCandidates != nil {
+		// First isolate the potential hidden operands using the same option
+		// ownership parser as the final query. Only then inspect the authenticated
+		// fragment grammar; a Make prerequisite alone is not a positional input.
+		candidateInvocation := invocation
+		candidateInvocation.predefineExplicitSources = false
+		probe, reason := configDependencyCompilerPredefineProbeForInvocation(candidateInvocation, sourcePaths)
+		if reason == "" || reason == "compiler predefine probe cannot preprocess a plain assembler source" {
+			possible := invocation.sourceCandidates(probe.arguments, probe.translationUnits)
+			if len(possible) != len(probe.translationUnits) {
+				kept := make([]string, 0, len(sourcePaths))
+				for _, source := range sourcePaths {
+					if !slices.Contains(probe.translationUnits, source) || slices.Contains(possible, source) {
+						kept = append(kept, source)
+					}
+				}
+				sourcePaths = kept
+			} else if !invocation.predefineExplicitSources {
+				return probe, reason
+			}
+		}
+	}
+	// Recompute language as well as exact hidden-input ownership after removing
+	// impossible prerequisites. The source/header dependency closure is untouched.
 	return configDependencyCompilerPredefineProbeForInvocation(invocation, sourcePaths)
 }
 

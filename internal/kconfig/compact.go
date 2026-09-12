@@ -51,6 +51,10 @@ type CompactMetadata struct {
 	// argument as source shell text rather than as already cooked compiler argv.
 	// Only the source recipe occurrence boundary may create this annotation.
 	compilerProbeSourceShellWords func(string) (string, error)
+	// compilerSourceCandidates removes staged prerequisites which cannot occur
+	// in any finite rendering of the preserved compiler argument fragments.
+	// This is not authority to omit an input which may actually occur.
+	compilerSourceCandidates func(scope, role string, arguments, candidates []string) []string
 	// compilerPredefines is a process-local bridge back into the Kbuild probe
 	// workload which produced this metadata. Discovery registers one normalized
 	// preprocessor defined-name request; replay returns its measured text. The
