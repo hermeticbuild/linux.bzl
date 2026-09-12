@@ -11368,7 +11368,11 @@ func evaluatedKbuildRuleCommandSelectionsForMakeTarget(
 		// that decision, but retain symbolic command bytes in the probe pass so
 		// compiler requests keep their discovery-time identity and dependencies.
 		activeText := selection.Text
-		if linuxProbeSymbolPattern.MatchString(activeText) {
+		// Literal command text usually proves nonemptiness without replaying
+		// its complete argument dependency graph a second time. Resolve all
+		// arguments in the concrete pass, and only possible emptiness here.
+		needResolution := resolveSymbolic || !preserveEmpty && !linuxProbeSymbolPattern.HasGuaranteedNonWhitespace(activeText)
+		if needResolution && linuxProbeSymbolPattern.MatchString(activeText) {
 			resolved, err := parser.resolveKbuildSymbolic(selection.Text)
 			if err != nil {
 				owner := selection.Name

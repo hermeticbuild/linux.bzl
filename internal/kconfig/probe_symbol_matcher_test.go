@@ -68,6 +68,49 @@ func TestLinuxProbeSymbolMatcherMatchesRegexp(t *testing.T) {
 
 var linuxProbeSymbolMatcherAllocationSink int
 
+func TestLinuxProbeSymbolMatcherGuaranteedNonWhitespace(t *testing.T) {
+	token := linuxProbeSymbolPrefix + strings.Repeat("a", linuxProbeSymbolDigestLength)
+	for _, test := range []struct {
+		value string
+		want  bool
+	}{
+		{"", false},
+		{" \t\n\u00a0", false},
+		{token, false},
+		{token + token, false},
+		{linuxProbeSymbolPrefix + token, false},
+		{token + strings.Repeat("a", linuxProbeSymbolDigestLength), false},
+		{"echo " + token, true},
+		{"${tool:cc} " + token, true},
+		{token + " -c source.c", true},
+		{"'" + token + "'", true},
+		{token + "\u03bb", true},
+	} {
+		if got := linuxProbeSymbolPattern.HasGuaranteedNonWhitespace(test.value); got != test.want {
+			t.Errorf("HasGuaranteedNonWhitespace(%q) = %t, want %t", test.value, got, test.want)
+		}
+	}
+	// The literal prefix is not itself a whitespace witness: resolving the
+	// existing token to a digest manufactures a second token, which can then
+	// disappear. The actual resolver also performs repeated whole-string passes.
+	value := linuxProbeSymbolPrefix + token
+	value = linuxProbeSymbolPattern.ReplaceAllStringFunc(value, func(string) string {
+		return strings.Repeat("b", linuxProbeSymbolDigestLength)
+	})
+	value = linuxProbeSymbolPattern.ReplaceAllStringFunc(value, func(string) string { return "" })
+	if value != "" {
+		t.Fatalf("cross-boundary substitution fixture did not become empty: %q", value)
+	}
+	nonempty := token + " -c"
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if linuxProbeSymbolPattern.HasGuaranteedNonWhitespace(nonempty) {
+			linuxProbeSymbolMatcherAllocationSink++
+		}
+	}); allocations != 0 {
+		t.Fatalf("nonempty witness allocated %v objects", allocations)
+	}
+}
+
 func TestLinuxProbeSymbolMatcherRangesDoNotAllocate(t *testing.T) {
 	validA := linuxProbeSymbolPrefix + strings.Repeat("a", linuxProbeSymbolDigestLength)
 	validB := linuxProbeSymbolPrefix + strings.Repeat("0123456789abcdef", 4)

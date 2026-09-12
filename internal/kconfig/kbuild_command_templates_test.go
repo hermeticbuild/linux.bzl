@@ -461,6 +461,35 @@ result:
 	}
 }
 
+func TestKbuildSymbolicCommandSelectionSkipsProvenNonemptyResolution(t *testing.T) {
+	token := linuxProbeSymbolPrefix + strings.Repeat("d", 64)
+	profile := mustCompactKbuildProfileForTest(t, "build:nonempty", "Makefile", "", `
+cmd = $(if $(cmd_$(1)),set -e; $(cmd_$(1)),:)
+cmd_emit = configured-cc `+token+` -c source.c -o result.o
+result.o:
+	$(call cmd,emit)
+`, nil)
+	calls := 0
+	profile.evaluator.template.resolveSymbolic = func(value string) (string, error) {
+		calls++
+		return strings.ReplaceAll(value, token, "-fselected"), nil
+	}
+	for _, concrete := range []bool{false, true} {
+		calls = 0
+		selections, err := evaluatedKbuildRuleCommandSelections(profile, "result.o", "result.o", "", nil, nil, nil, []string{"$(call cmd,emit)"}, concrete)
+		if err != nil || len(selections) != 1 {
+			t.Fatalf("concrete=%t selections=%#v error=%v", concrete, selections, err)
+		}
+		if !concrete {
+			if calls != 0 || !strings.Contains(selections[0].Text, token) {
+				t.Fatalf("symbolic nonempty occurrence resolved %d times: %q", calls, selections[0].Text)
+			}
+		} else if calls == 0 || strings.Contains(selections[0].Text, token) || !strings.Contains(selections[0].Text, "-fselected") {
+			t.Fatalf("concrete occurrence did not resolve arguments: calls=%d text=%q", calls, selections[0].Text)
+		}
+	}
+}
+
 func TestKbuildCommandSelectionRecoversExactWrapperFromUnlowerableRebuildGuard(t *testing.T) {
 	token := linuxProbeSymbolPrefix + strings.Repeat("e", 64)
 	profile := mustCompactKbuildProfileForTest(t, "build:symbolic-guard", "scripts/Makefile.build", "", `

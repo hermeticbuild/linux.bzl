@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"iter"
 	"strings"
+	"unicode"
 )
 
 const linuxProbeSymbolDigestLength = 64
@@ -15,6 +16,22 @@ const linuxProbeSymbolDigestLength = 64
 // package; replacement keeps using regexp so Go's replacement-string semantics
 // remain exact on the uncommon rewrite paths.
 type linuxProbeSymbolMatcher struct{}
+
+// HasGuaranteedNonWhitespace recognizes a literal rune that cannot be consumed
+// by any symbolic substitution. Checking only gaps between today's tokens is
+// insufficient: replacements may form another token across a fragment boundary.
+// A non-space rune outside the token alphabet survives even that recursive
+// case. False is deliberately inconclusive, not evidence of an empty result.
+func (linuxProbeSymbolMatcher) HasGuaranteedNonWhitespace(value string) bool {
+	for _, character := range value {
+		if !unicode.IsSpace(character) &&
+			!strings.ContainsRune(linuxProbeSymbolPrefix, character) &&
+			!(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return true
+		}
+	}
+	return false
+}
 
 func linuxProbeSymbolDigestByte(value byte) bool {
 	return value >= '0' && value <= '9' || value >= 'a' && value <= 'f'
