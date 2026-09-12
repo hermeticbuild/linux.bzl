@@ -1,5 +1,8 @@
 exports_files([
     "aya_linux_bzl_api.patch",
     "aya_rust_kernel_module_e2e.patch",
+    "gcc_toolchain_remote_execution.patch",
+    "libbpf_old_uapi_compat.patch",
     "llvm_kbuild_actions.patch",
+    "rules_rust_linker_path_mapping.patch",
 ])

@@ -110,15 +110,18 @@ func TestDeferredKbuildQueryBindsExactPreconfiguredObjectOperand(t *testing.T) {
 			break
 		}
 	}
-	if preparedSourceID == "" || !slices.ContainsFunc(node.Sources, func(edge ActionPlanSourceEdge) bool {
-		return edge.SourceID == preparedSourceID
-	}) {
-		t.Fatalf("deferred query sources = %#v from %#v, want exact prep/%s source", node.Sources, plan.Sources, operand)
+	if preparedSourceID == "" {
+		t.Fatalf("plan sources omit exact prep/%s source: %#v", operand, plan.Sources)
+	}
+	operandEntry, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, node, operand)
+	wantOperandEntry := ActionPlanInputSetEntry{
+		Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: operand},
+		SourceID: preparedSourceID,
+	}
+	if !found || operandEntry != wantOperandEntry {
+		t.Fatalf("deferred query persistent operand = %#v, %t; want %#v", operandEntry, found, wantOperandEntry)
 	}
 	recipe := plan.Recipes[node.Recipe]
-	if !slices.Contains(sortedStringMapValues(recipe.WorkingInputs), operand) {
-		t.Fatalf("deferred query working inputs = %#v, want canonical path %q", recipe.WorkingInputs, operand)
-	}
 	if got := recipe.ExecutionDirectory; got != invocationDir {
 		t.Fatalf("deferred query execution directory = %q, want %q", got, invocationDir)
 	}
@@ -260,22 +263,15 @@ usr/gen_crc32table: usr/gen_crc32table.c FORCE
 	if !ok || queryNode.Stage != "bootstrap" || queryNode.Tool != compactKbuildScriptRunnerRole {
 		t.Fatalf("deferred query node = %#v, want bootstrap scriptrun fallback", queryNode)
 	}
-	if !slices.ContainsFunc(queryNode.Inputs, func(edge ActionPlanNodeEdge) bool {
-		return edge.ProducerID == bootstrapID
-	}) {
-		t.Fatalf("deferred query inputs = %#v, want exact bootstrap operand producer %s", queryNode.Inputs, bootstrapID)
+	operandEntry, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, queryNode, operand)
+	wantOperandEntry := ActionPlanInputSetEntry{
+		Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: operand},
+		ProducerID: bootstrapID,
+	}
+	if !found || operandEntry != wantOperandEntry {
+		t.Fatalf("deferred query persistent operand = %#v, %t; want %#v", operandEntry, found, wantOperandEntry)
 	}
 	queryRecipe := plan.Recipes[queryNode.Recipe]
-	workingInput := false
-	for _, workingPath := range queryRecipe.WorkingInputs {
-		if workingPath == operand {
-			workingInput = true
-			break
-		}
-	}
-	if !workingInput {
-		t.Fatalf("deferred query working inputs = %#v, want canonical path %q", queryRecipe.WorkingInputs, operand)
-	}
 	if got := queryRecipe.ExecutionDirectory; got != invocationDir {
 		t.Fatalf("deferred query execution directory = %q, want %q", got, invocationDir)
 	}

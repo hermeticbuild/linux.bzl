@@ -9,6 +9,8 @@ load("@rules_flex//flex:toolchain_type.bzl", "FLEX_TOOLCHAIN_TYPE", "flex_toolch
 load("@rules_m4//m4:toolchain_type.bzl", "M4_TOOLCHAIN_TYPE", "m4_toolchain")
 load(":execution_platform.bzl", "linux_execution_platform_attr", "linux_execution_platform_label")
 load(":host_cc_toolchain.bzl", "host_cc_toolchain", "host_cc_toolchain_attr")
+load(":image_name_validation.bzl", "validate_linux_overlay_name")
+load(":linux_source_runfiles.bzl", "validate_linux_source_runfiles")
 load(":module_make_vars.bzl", "validate_linux_module_make_vars")
 load(":platform_transition_gateway.bzl", "linux_platform_transition")
 load(
@@ -17,7 +19,7 @@ load(
     "linux_probe_map_directory_params",
     "linux_probe_map_directory_tools",
 )
-load(":providers.bzl", "LinuxKernelInfo", "LinuxModuleSdkInfo", "LinuxModuleTreeInfo")
+load(":providers.bzl", "LinuxKernelInfo", "LinuxMappedKernelFamilyInfo", "LinuxModuleSdkInfo", "LinuxModuleTreeInfo")
 load(
     ":rust_toolchain.bzl",
     "execution_bindgen_toolchain",
@@ -28,6 +30,7 @@ load(
     "execution_rust_toolchain_attr",
 )
 load(":script_runtime_toolchain.bzl", "SCRIPT_RUNTIME_TOOLCHAIN_TYPE", "script_runtime_toolchain")
+load(":template_arguments.bzl", "template_arguments")
 load(
     ":toolchain_action_paths.bzl",
     _EXECUTION_ROOT_MARKER = "EXECUTION_ROOT_MARKER",
@@ -41,7 +44,11 @@ load(
 
 visibility("public")
 
-_SCHEMA = "linux-kernel-plan-v4"
+_SCHEMA = "linux-kernel-plan-v5"
+_FAMILY_SCHEMA = "linux-kernel-family-plan-v7"
+_FAMILY_EXECUTION_SCHEMA = "linux-kernel-family-execution-v1"
+_MAX_FAMILY_EXECUTION_NODES = 4096
+_MAX_FAMILY_EXECUTION_SLOTS = 16384
 _TOOLSET_SCHEMA = "linux-kbuild-toolset-v6"
 _KBUILD_ARGS_SENTINEL = "__LINUX_BZL_KBUILD_ARGS_V1__"
 _SCRIPT_RUNTIME_APPLET_ROLE_PREFIX = "script-applet-"
@@ -61,9 +68,12 @@ _NAME = "abcdefghijklmnopqrstuvwxyz0123456789_.+-"
 _MAX_MARKER_COMPONENT = 240
 _MAX_PACKED_INPUT_FILENAME = 240
 _MAX_PACKED_INPUT_TUPLES = 64
+_MAX_INPUT_SET_DEPTH = 64
+_MAX_INPUT_SET_LEAF_ENTRIES = 16
 _MAX_PLAN_ORDINAL = 99999999
 _STAGES = ["prehost", "bootstrap", "host", "prep", "target"]
 _TREES = ["prehost", "bootstrap", "prep", "host", "objects", "sdk", "vmlinux", "image", "modules", "metadata"]
+_FAMILY_VIEW_TREES = ["objects", "sdk", "vmlinux", "image", "modules", "metadata"]
 _STAGE_OUTPUT_TREES = {
     "prehost": {"prehost": True},
     "bootstrap": {"bootstrap": True},
@@ -359,9 +369,535 @@ def _decode_packed_node_inputs(node_id, node, node_index):
         inputs[edge.key] = struct(producer = edge.producer, slot = edge.slot)
     return inputs
 
+def _valid_plan_source_id(source_id, family):
+    if not source_id.startswith("src-"):
+        return False
+    value = source_id[len("src-"):]
+    return _is_sha256(value) if family else _is_decimal(value, 8)
+
+def _parse_input_set_marker(child, input_sets, family):
+    """Parses one path-only persistent input-set marker."""
+    marker_path = child.tree_relative_path
+    parts = marker_path.split("/")
+    what = "mapped Linux family plan" if family else "mapped Linux plan"
+    if len(parts) < 3 or parts[0] != "input-sets" or not _is_sha256(parts[1]):
+        fail("%s has invalid input-set marker %r" % (what, marker_path))
+    set_id = parts[1]
+    node = input_sets.setdefault(set_id, {
+        "children": {},
+        "entries": {},
+        "manifest": None,
+    })
+    if len(parts) == 4 and parts[2] == "manifest":
+        expected = set_id + ".json"
+        if parts[3] != expected or node["manifest"] != None:
+            fail("%s input set %s has invalid or repeated manifest %r" % (what, set_id, marker_path))
+        node["manifest"] = child
+        return
+    if len(parts) == 5 and parts[2] == "child":
+        nibble, child_id = parts[3], parts[4]
+        if len(nibble) != 1 or nibble not in _HEX or not _is_sha256(child_id) or nibble in node["children"]:
+            fail("%s input set %s has invalid or repeated child marker %r" % (what, set_id, marker_path))
+        if child_id in node["children"].values():
+            fail("%s input set %s repeats child ID %s" % (what, set_id, child_id))
+        node["children"][nibble] = child_id
+        return
+    if len(parts) == 6 and parts[2:4] == ["in", "source"]:
+        ordinal_text, source_id = parts[4], parts[5]
+        if not _is_decimal(ordinal_text, 8) or not _valid_plan_source_id(source_id, family):
+            fail("%s input set %s has invalid source marker %r" % (what, set_id, marker_path))
+        ordinal = int(ordinal_text)
+        if ordinal in node["entries"]:
+            fail("%s input set %s repeats entry ordinal %s" % (what, set_id, ordinal_text))
+        node["entries"][ordinal] = struct(kind = "source", source = source_id)
+        return
+    if len(parts) == 7 and parts[2:4] == ["in", "node"]:
+        ordinal_text, producer, slot = parts[4], parts[5], parts[6]
+        if not _is_decimal(ordinal_text, 8) or not _is_sha256(producer) or not _is_decimal(slot, 8):
+            fail("%s input set %s has invalid producer marker %r" % (what, set_id, marker_path))
+        ordinal = int(ordinal_text)
+        if ordinal in node["entries"]:
+            fail("%s input set %s repeats entry ordinal %s" % (what, set_id, ordinal_text))
+        node["entries"][ordinal] = struct(kind = "node", producer = producer, slot = slot)
+        return
+    fail("%s input set %s has invalid marker %r" % (what, set_id, marker_path))
+
+def _input_set_closure_ids(input_sets, root):
+    """Returns a deterministic closure without recursively walking Starlark."""
+    if root == None:
+        return []
+    seen = {root: True}
+    pending = [root]
+    for index in range(len(input_sets.nodes)):
+        if index >= len(pending):
+            break
+        set_id = pending[index]
+        for child_id in sorted(input_sets.nodes[set_id]["children"].values()):
+            if child_id not in seen:
+                seen[child_id] = True
+                pending.append(child_id)
+    return sorted(seen)
+
+def _input_set_dependencies(input_sets, root):
+    """Collects exact provenance keys named by a persistent set closure."""
+    sources = {}
+    inputs = {}
+    for set_id in _input_set_closure_ids(input_sets, root):
+        for entry in input_sets.nodes[set_id]["entries"].values():
+            if entry.kind == "source":
+                sources[entry.source] = True
+            else:
+                inputs[entry.producer + ":" + entry.slot] = struct(
+                    producer = entry.producer,
+                    slot = entry.slot,
+                )
+    return struct(inputs = inputs, sources = sources)
+
+def linux_test_input_set_dependencies(input_sets, root):
+    return _input_set_dependencies(input_sets, root)
+
+def _selected_input_sets(input_sets, nodes):
+    """Projects the persistent store to roots consumed by one action segment."""
+    selected = {}
+    for node in nodes.values():
+        root = node.get("input_set")
+        if root == None:
+            continue
+        for set_id in _input_set_closure_ids(input_sets, root):
+            selected[set_id] = input_sets.nodes[set_id]
+    return struct(
+        nodes = selected,
+        postorder = [set_id for set_id in input_sets.postorder if set_id in selected],
+    )
+
+def linux_test_selected_input_sets(input_sets, nodes):
+    return _selected_input_sets(input_sets, nodes)
+
+def _input_set_postorder(nodes, what):
+    """Validates the child DAG and returns children before their parents."""
+    parents = {set_id: [] for set_id in nodes}
+    remaining_children = {}
+    ready = []
+    for set_id, node in nodes.items():
+        remaining_children[set_id] = len(node["children"])
+        if not node["children"]:
+            ready.append(set_id)
+        for child_id in node["children"].values():
+            parents[child_id].append(set_id)
+    ready = sorted(ready)
+    postorder = []
+    for index in range(len(nodes)):
+        if index >= len(ready):
+            break
+        set_id = ready[index]
+        postorder.append(set_id)
+        for parent in sorted(parents[set_id]):
+            remaining_children[parent] -= 1
+            if remaining_children[parent] == 0:
+                ready.append(parent)
+    if len(postorder) != len(nodes):
+        cycle = sorted([set_id for set_id in nodes if remaining_children[set_id] != 0])[0]
+        fail("%s input-set graph contains a cycle at %s" % (what, cycle))
+    return postorder
+
+def _validate_input_set_depths(nodes, roots, what):
+    """Checks the SHA-256 radix-depth bound and shared-node depth identity."""
+    depths = {}
+    pending = []
+    for root in sorted(roots):
+        depths[root] = 0
+        pending.append(root)
+    for index in range(len(nodes)):
+        if index >= len(pending):
+            break
+        set_id = pending[index]
+        depth = depths[set_id]
+        children = nodes[set_id]["children"].values()
+        if children and depth >= _MAX_INPUT_SET_DEPTH:
+            fail("%s input set %s has children at maximum radix depth %d" % (what, set_id, depth))
+        for child_id in children:
+            child_depth = depth + 1
+            existing = depths.get(child_id)
+            if existing != None and existing != child_depth:
+                fail("%s input set %s is reachable at inconsistent depths %d and %d" % (
+                    what,
+                    child_id,
+                    existing,
+                    child_depth,
+                ))
+            if existing == None:
+                depths[child_id] = child_depth
+                pending.append(child_id)
+    return depths
+
+def _validate_input_sets(input_set_nodes, nodes, node_index, declared_outputs, source_markers, family):
+    """Validates marker shape, referential integrity, roots, and reachability."""
+    what = "mapped Linux family plan" if family else "mapped Linux plan"
+    for set_id, input_set in input_set_nodes.items():
+        if input_set["manifest"] == None:
+            fail("%s input set %s has no manifest" % (what, set_id))
+        has_children = bool(input_set["children"])
+        has_entries = bool(input_set["entries"])
+        if has_children == has_entries:
+            fail("%s input set %s must contain exactly one of children or entries" % (what, set_id))
+        if len(input_set["entries"]) > _MAX_INPUT_SET_LEAF_ENTRIES:
+            fail("%s input set %s has %d entries, maximum is %d" % (
+                what,
+                set_id,
+                len(input_set["entries"]),
+                _MAX_INPUT_SET_LEAF_ENTRIES,
+            ))
+        for ordinal in range(len(input_set["entries"])):
+            if ordinal not in input_set["entries"]:
+                fail("%s input set %s entry ordinals are not contiguous at %s" % (what, set_id, _ordinal(ordinal)))
+        for child_id in input_set["children"].values():
+            if child_id not in input_set_nodes:
+                fail("%s input set %s references unknown child %s" % (what, set_id, child_id))
+        for entry in input_set["entries"].values():
+            if entry.kind == "source":
+                if entry.source not in source_markers:
+                    fail("%s input set %s references unknown source %s" % (what, set_id, entry.source))
+                continue
+            if entry.producer not in node_index.ordinals:
+                fail("%s input set %s references unknown producer %s" % (what, set_id, entry.producer))
+            output_key = entry.producer + ":" + entry.slot
+            if output_key not in declared_outputs:
+                fail("%s input set %s references unavailable output slot %s of producer %s" % (
+                    what,
+                    set_id,
+                    entry.slot,
+                    entry.producer,
+                ))
+
+    roots = {}
+    for node_id, node in nodes.items():
+        root = node.get("input_set")
+        if root == None:
+            continue
+        if root not in input_set_nodes:
+            fail("%s node %s references unknown input-set root %s" % (what, node_id, root))
+        roots[root] = True
+    postorder = _input_set_postorder(input_set_nodes, what)
+    reachable = _validate_input_set_depths(input_set_nodes, roots, what)
+    if len(reachable) != len(input_set_nodes):
+        unreachable = [set_id for set_id in sorted(input_set_nodes) if set_id not in reachable]
+        fail("%s contains unreachable input sets %s" % (what, unreachable))
+    return struct(nodes = input_set_nodes, postorder = postorder)
+
+def _validate_node_dependency_cycles(nodes, node_index, input_sets, what):
+    """Rejects cycles introduced by either direct or persistent-set edges."""
+    dependencies = {}
+    for node_id, node in nodes.items():
+        producers = {}
+        for dependency in _decode_packed_node_inputs(node_id, node, node_index).values():
+            if dependency.producer in nodes:
+                producers[dependency.producer] = True
+        set_dependencies = _input_set_dependencies(input_sets, node.get("input_set"))
+        for dependency in set_dependencies.inputs.values():
+            if dependency.producer in nodes:
+                producers[dependency.producer] = True
+        dependencies[node_id] = sorted(producers)
+
+    consumers = {node_id: [] for node_id in nodes}
+    remaining_producers = {}
+    ready = []
+    for node_id, producers in dependencies.items():
+        remaining_producers[node_id] = len(producers)
+        if not producers:
+            ready.append(node_id)
+        for producer in producers:
+            consumers[producer].append(node_id)
+    ready = sorted(ready)
+    visited = 0
+    for index in range(len(nodes)):
+        if index >= len(ready):
+            break
+        producer = ready[index]
+        visited += 1
+        for consumer in sorted(consumers[producer]):
+            remaining_producers[consumer] -= 1
+            if remaining_producers[consumer] == 0:
+                ready.append(consumer)
+    if visited != len(nodes):
+        cycle = sorted([node_id for node_id in nodes if remaining_producers[node_id] != 0])[0]
+        fail("%s action graph contains a cycle at node %s" % (what, cycle))
+
+def _input_set_output_artifacts(input_sets, outputs, prior, declared_outputs, family, what):
+    """Binds every producer provenance key to its exact declared TreeFile."""
+    artifacts = {}
+    for input_set in input_sets.nodes.values():
+        for entry in input_set["entries"].values():
+            if entry.kind != "node":
+                continue
+            output_key = entry.producer + ":" + entry.slot
+            if output_key in artifacts:
+                continue
+            artifact = outputs.get(output_key)
+            descriptor = declared_outputs.get(output_key)
+            if descriptor == None:
+                fail("%s input set references unknown producer output %s" % (what, output_key))
+            if artifact == None:
+                physical_path = "nodes/%s/%s" % (entry.producer, entry.slot) if family else descriptor.artifact_path
+                artifact = prior.get(descriptor.tree + ":" + physical_path)
+            if artifact == None:
+                fail("%s input set requires unavailable producer output %s" % (what, output_key))
+            artifacts[output_key] = artifact
+    return artifacts
+
+def _bind_input_sets(input_sets, sources, output_artifacts, what):
+    """Builds each immutable input-set depset once, retaining shared subtries."""
+    bound = {}
+    for set_id in input_sets.postorder:
+        node = input_sets.nodes[set_id]
+        direct = [node["manifest"]]
+        source_artifacts = {}
+        producer_artifacts = {}
+        for ordinal in sorted(node["entries"]):
+            entry = node["entries"][ordinal]
+            if entry.kind == "source":
+                source = sources.get(entry.source)
+                if source == None:
+                    fail("%s input set %s has no artifact for source %s" % (what, set_id, entry.source))
+                source_artifacts[entry.source] = source.file
+                direct.append(source.file)
+            else:
+                output_key = entry.producer + ":" + entry.slot
+                artifact = output_artifacts.get(output_key)
+                if artifact == None:
+                    fail("%s input set %s has no artifact for producer output %s" % (what, set_id, output_key))
+                producer_artifacts[output_key] = artifact
+                direct.append(artifact)
+        child_inputs = [bound[child_id].inputs for child_id in sorted(node["children"].values())]
+        bound[set_id] = struct(
+            inputs = depset(direct = direct, transitive = child_inputs),
+            producer_artifacts = producer_artifacts,
+            source_artifacts = source_artifacts,
+        )
+    return bound
+
+def linux_test_bind_input_sets(input_sets, sources, output_artifacts):
+    return _bind_input_sets(input_sets, sources, output_artifacts, "test plan")
+
+def _input_set_manifest_path(set_id):
+    return "input-sets/%s/manifest/%s.json" % (set_id, set_id)
+
+def _input_set_anchor_root(artifact, relative, what):
+    """Checks an exact TreeFile suffix; never assumes Bazel's mapping policy."""
+    if artifact.tree_relative_path != relative:
+        fail("%s TreeFile %r does not have its declared relative path %r" % (what, artifact.path, relative))
+    if artifact.path == relative:
+        return ""
+    suffix = "/" + relative
+    if not artifact.path.endswith(suffix):
+        fail("%s TreeFile %r is not below its exact store root" % (what, artifact.path))
+    return artifact.path[:-len(suffix)]
+
+def _add_family_input_set_bindings(args, producer_artifacts, what):
+    """Binds existing leaf Files using the family's provenance-addressed layout.
+
+    Roots are partitioned by the actual physical store, not by canonical names
+    or staging destinations. Only one already-declared leaf per root travels as
+    a typed File. The runner checks the ordinal packs against the authenticated
+    input-set closure before deriving paths below those anchors.
+    """
+    stores = {}
+    indices = []
+    for output_key in sorted(producer_artifacts):
+        producer, slot = output_key.split(":")
+        artifact = producer_artifacts[output_key]
+        relative = _family_store_path(producer, slot)
+        root = _input_set_anchor_root(artifact, relative, what + " producer " + output_key)
+        if root not in stores:
+            index = len(stores)
+            stores[root] = index
+            _add_artifact_path(args, "-input_set_store_anchor", artifact, format = "%d:%s=%%s" % (index, output_key))
+        indices.append(str(stores[root]))
+    for start in range(0, len(indices), 256):
+        args.add("-input_set_store_pack", _ordinal(start) + ":" + ".".join(indices[start:start + 256]))
+
+def linux_test_add_family_input_set_bindings(args, producer_artifacts):
+    _add_family_input_set_bindings(args, producer_artifacts, "test family input set")
+
+def _add_family_source_binding(args, flag, key, source, source_runfiles = None):
+    """Keeps opaque source operands and their complete aggregate in one tree."""
+    if source_runfiles != None and source.namespace == "kernel":
+        _validate_path(source.path, "opaque kernel source")
+        args.add_joined(
+            flag,
+            [key + "=", _tool_executable(source_runfiles), ".runfiles/kernel/", source.path],
+            expand_directories = False,
+            join_with = "",
+        )
+    else:
+        _add_artifact_path(args, flag, source.file, format = key + "=%s")
+
+def linux_test_add_family_source_binding(args, flag, key, source, source_runfiles = None):
+    _add_family_source_binding(args, flag, key, source, source_runfiles)
+
+def _add_input_set_args(args, root, input_sets, bound, what, family = False, sources = None, source_runfiles = None):
+    """Wires one set closure through the runner's bounded argument transport."""
+    if root == None:
+        return None
+    args.add("-input_set_root", root)
+    source_artifacts = {}
+    producer_artifacts = {}
+    manifest_root = None
+    for set_id in _input_set_closure_ids(input_sets, root):
+        node = input_sets.nodes[set_id]
+        if family:
+            physical_root = _input_set_anchor_root(node["manifest"], _input_set_manifest_path(set_id), what + " manifest " + set_id)
+            if manifest_root != None and manifest_root != physical_root:
+                fail("%s input-set manifests resolve to distinct physical plan roots" % what)
+            manifest_root = physical_root
+        else:
+            _add_artifact_path(args, "-input_set_manifest", node["manifest"], format = set_id + "=%s")
+        binding = bound[set_id]
+        for source_id, artifact in binding.source_artifacts.items():
+            existing = source_artifacts.get(source_id)
+            if existing != None and existing != artifact:
+                fail("%s input set resolves source %s to distinct artifacts" % (what, source_id))
+            source_artifacts[source_id] = artifact
+        for output_key, artifact in binding.producer_artifacts.items():
+            existing = producer_artifacts.get(output_key)
+            if existing != None and existing != artifact:
+                fail("%s input set resolves producer output %s to distinct artifacts" % (what, output_key))
+            producer_artifacts[output_key] = artifact
+    if family:
+        _add_artifact_path(args, "-input_set_manifest_root", input_sets.nodes[root]["manifest"])
+        _add_family_input_set_bindings(args, producer_artifacts, what)
+    for source_id in sorted(source_artifacts):
+        if source_runfiles != None:
+            source = sources.get(source_id) if sources != None else None
+            if source == None or source.file != source_artifacts[source_id]:
+                fail("%s has inconsistent source provenance for aggregate binding %s" % (what, source_id))
+            _add_family_source_binding(args, "-input_set_source", source_id, source, source_runfiles)
+        else:
+            _add_artifact_path(args, "-input_set_source", source_artifacts[source_id], format = source_id + "=%s")
+    if not family:
+        for output_key in sorted(producer_artifacts):
+            _add_artifact_path(args, "-input_set_input", producer_artifacts[output_key], format = output_key + "=%s")
+    return bound[root].inputs
+
+def linux_test_add_input_set_args(args, root, input_sets, bound, family = False, sources = None, source_runfiles = None):
+    return _add_input_set_args(args, root, input_sets, bound, "test plan", family = family, sources = sources, source_runfiles = source_runfiles)
+
+def _decode_packed_source_projections(node_id, node):
+    """Decodes the exact immutable-source ordinals for each private tree."""
+    projection_manifest = node.get("source_projections")
+    packs = node["source_projection_packs"]
+    if not packs:
+        if projection_manifest != None:
+            fail("mapped Linux family node %s has a source-projection manifest without marker packs" % node_id)
+        return {}
+    if projection_manifest == None:
+        fail("mapped Linux family node %s has source-projection marker packs without a manifest" % node_id)
+
+    source_keys_by_ordinal = {}
+    for key in node["sources"]:
+        fields = key.split(":")
+        if len(fields) != 2 or not _is_decimal(fields[1], 8):
+            fail("mapped Linux family node %s has invalid source binding %r" % (node_id, key))
+        ordinal = int(fields[1])
+        if ordinal in source_keys_by_ordinal:
+            fail("mapped Linux family node %s repeats source ordinal %s" % (node_id, fields[1]))
+        source_keys_by_ordinal[ordinal] = key
+
+    projected_ordinals = {}
+    projected_keys_by_tree = {}
+    for tree, filenames in packs.items():
+        if tree != "kernel" or tree not in node["trees"]:
+            fail("mapped Linux family node %s projects sources into unavailable tree %r" % (node_id, tree))
+        chunks = {}
+        for filename in filenames:
+            if len(filename) > _MAX_PACKED_INPUT_FILENAME or len(filename) < 10 or filename[8] != "." or not _is_decimal(filename[:8], 8):
+                fail("mapped Linux family node %s has invalid packed source-projection filename %r" % (node_id, filename))
+            chunk = int(filename[:8])
+            if chunk in chunks:
+                fail("mapped Linux family node %s repeats packed source-projection chunk %s/%s" % (node_id, tree, _ordinal(chunk)))
+            payload = filename[9:]
+            ordinals = payload.split(",")
+            if not payload or len(ordinals) > _MAX_PACKED_INPUT_TUPLES:
+                fail("mapped Linux family node %s has invalid packed source-projection count in %r" % (node_id, filename))
+            chunks[chunk] = ordinals
+        previous_ordinal = None
+        projected_keys = {}
+        for chunk in range(len(chunks)):
+            ordinals = chunks.get(chunk)
+            if ordinals == None:
+                fail("mapped Linux family node %s has non-contiguous packed source-projection chunks for tree %s" % (node_id, tree))
+            for value in ordinals:
+                ordinal = _parse_base36_ordinal(value, "mapped Linux family node %s source projection" % node_id)
+                if previous_ordinal != None and ordinal <= previous_ordinal:
+                    fail("mapped Linux family node %s has non-canonical source-projection order for tree %s" % (node_id, tree))
+                previous_ordinal = ordinal
+                if ordinal in projected_ordinals:
+                    fail("mapped Linux family node %s repeats source-projection ordinal %s" % (node_id, _ordinal(ordinal)))
+                key = source_keys_by_ordinal.get(ordinal)
+                if key == None:
+                    fail("mapped Linux family node %s projects unknown source ordinal %s" % (node_id, _ordinal(ordinal)))
+                projected_ordinals[ordinal] = True
+                projected_keys[key] = True
+        projected_keys_by_tree[tree] = projected_keys
+    return projected_keys_by_tree
+
+def linux_test_decode_packed_source_projections(node_id, node):
+    return _decode_packed_source_projections(node_id, node)
+
+def _family_private_source_tree_anchor(node_id, tree, projected_keys_by_tree, source_artifacts):
+    """Returns one exact immutable source as a path-mappable private-tree anchor.
+
+    The runner replaces a private tree binding with its freshly materialized
+    projection before expanding any recipe placeholder. The original binding
+    therefore identifies the tree name, but is never interpreted as a root.
+    Binding it to a source which is already in that exact projection avoids a
+    dependency on an unrelated repository-wide root marker.
+    """
+    projected_keys = projected_keys_by_tree.get(tree)
+    if projected_keys == None:
+        return None
+    bindings = sorted(projected_keys)
+    if not bindings:
+        fail("mapped Linux family node %s has an empty %s source projection" % (node_id, tree))
+    for binding in bindings:
+        if source_artifacts.get(binding) == None:
+            fail("mapped Linux family node %s has no artifact for projected %s source %s" % (
+                node_id,
+                tree,
+                binding,
+            ))
+    return source_artifacts[bindings[0]]
+
+def _family_kernel_tree_binding(node_id, projected_keys_by_tree, source_artifacts, source_runfiles):
+    """Selects the exact private anchor or the sound opaque source root."""
+    anchor = _family_private_source_tree_anchor(
+        node_id,
+        "kernel",
+        projected_keys_by_tree,
+        source_artifacts,
+    )
+    if anchor != None:
+        return struct(
+            path = anchor,
+            path_suffix = "",
+            private = True,
+            source_runfiles = None,
+        )
+    if source_runfiles == None:
+        fail("mapped Linux family node %s has no opaque kernel source aggregate" % node_id)
+    return struct(
+        path = _tool_executable(source_runfiles),
+        path_suffix = ".runfiles/kernel",
+        private = False,
+        source_runfiles = source_runfiles,
+    )
+
+def linux_test_family_kernel_tree_binding(node_id, projected_keys_by_tree, source_artifacts, source_runfiles):
+    return _family_kernel_tree_binding(node_id, projected_keys_by_tree, source_artifacts, source_runfiles)
+
 def _parse_plan(plan, input_directories, additional_inputs, source_prefix, stage, additional_params = {}):
     node_index = _parse_plan_node_index(plan)
     has_schema = False
+    input_set_nodes = {}
     toolsets = {}
     recipe_markers = {}
     source_markers = {}
@@ -376,6 +912,9 @@ def _parse_plan(plan, input_directories, additional_inputs, source_prefix, stage
         if parts and parts[0] == "index":
             # The complete index was validated independently before any node
             # packs can refer to its compact ordinals.
+            continue
+        if parts and parts[0] == "input-sets":
+            _parse_input_set_marker(child, input_set_nodes, False)
             continue
         if len(parts) == 3 and parts[0] == "toolsets" and parts[1] in ["host", "target"]:
             if not parts[2].startswith("sha256-") or not _is_sha256(parts[2][len("sha256-"):]):
@@ -465,6 +1004,11 @@ def _parse_plan(plan, input_directories, additional_inputs, source_prefix, stage
             if "input_bindings" in node:
                 fail("mapped Linux node %s repeats input binding manifest" % node_id)
             node["input_bindings"] = struct(file = child, id = digest)
+        elif field == "in" and len(parts) == 6 and parts[4] == "input-set":
+            root = parts[5]
+            if not _is_sha256(root) or "input_set" in node:
+                fail("mapped Linux node %s has invalid or repeated input-set root %r" % (node_id, path))
+            node["input_set"] = root
         elif field == "in" and len(parts) == 6 and parts[4] == "tree":
             tree = parts[5]
             if not _valid_name(tree) or tree in node["trees"]:
@@ -499,6 +1043,16 @@ def _parse_plan(plan, input_directories, additional_inputs, source_prefix, stage
         if "input_bindings" not in node:
             fail("mapped Linux node %s has no input binding manifest" % node_id)
 
+    input_sets = _validate_input_sets(
+        input_set_nodes,
+        nodes,
+        node_index,
+        declared_outputs,
+        source_markers,
+        False,
+    )
+    _validate_node_dependency_cycles(nodes, node_index, input_sets, "mapped Linux plan")
+
     referenced_recipes = {}
     referenced_sources = {}
     for node in nodes.values():
@@ -506,6 +1060,8 @@ def _parse_plan(plan, input_directories, additional_inputs, source_prefix, stage
         if recipe != None:
             referenced_recipes[recipe] = True
         for source_id in node["sources"].values():
+            referenced_sources[source_id] = True
+        for source_id in _input_set_dependencies(input_sets, node.get("input_set")).sources:
             referenced_sources[source_id] = True
     recipes = {
         recipe: file
@@ -597,12 +1153,348 @@ def _parse_plan(plan, input_directories, additional_inputs, source_prefix, stage
             fail("mapped Linux plan has duplicate or unstaged source %s/%s" % (source_id, marker.path))
         sources[source_id] = struct(file = file, namespace = marker.namespace, path = marker.path)
     return struct(
+        input_sets = input_sets,
         nodes = nodes,
         recipes = recipes,
         sources = sources,
         toolsets = toolsets,
         declared_outputs = declared_outputs,
         node_index = node_index,
+    )
+
+def _record_family_source_child(source_children, key, file):
+    existing = source_children.get(key)
+    if existing != None and existing != file:
+        fail("mapped Linux family source path %s is provided by distinct artifacts %s and %s" % (
+            key,
+            existing,
+            file,
+        ))
+    source_children[key] = file
+
+def linux_test_record_family_source_child(source_children, key, file):
+    _record_family_source_child(source_children, key, file)
+
+def _parse_family_plan(plan, input_directories, additional_inputs, source_prefix):
+    """Parses one lossless, symmetric plan for every image-family variant."""
+    node_index = _parse_plan_node_index(plan)
+    has_schema = False
+    input_set_nodes = {}
+    toolsets = {}
+    recipe_markers = {}
+    source_markers = {}
+    capsule_files = {}
+    nodes = {}
+    declared_outputs = {}
+    prior_outputs = {}
+    views = {}
+    validations = {}
+    for child in plan.children:
+        marker_path = child.tree_relative_path
+        parts = marker_path.split("/")
+        if parts == ["schema", _FAMILY_SCHEMA]:
+            has_schema = True
+            continue
+        if parts and parts[0] == "index":
+            continue
+        if parts and parts[0] == "input-sets":
+            _parse_input_set_marker(child, input_set_nodes, True)
+            continue
+        if len(parts) == 3 and parts[0] == "toolsets" and parts[1] in ["host", "target"]:
+            if not parts[2].startswith("sha256-") or not _is_sha256(parts[2][len("sha256-"):]):
+                fail("mapped Linux family plan has invalid toolset marker %r" % marker_path)
+            if parts[1] in toolsets:
+                fail("mapped Linux family plan repeats %s toolset" % parts[1])
+            toolsets[parts[1]] = struct(file = child, identity = parts[2])
+            continue
+        if len(parts) == 2 and parts[0] == "recipes" and parts[1].endswith(".json"):
+            recipe = parts[1][:-len(".json")]
+            if not _is_sha256(recipe) or recipe in recipe_markers:
+                fail("mapped Linux family plan has invalid recipe marker %r" % marker_path)
+            recipe_markers[recipe] = child
+            continue
+        if len(parts) >= 3 and parts[0] == "capsules":
+            digest = parts[1]
+            relative = "/".join(parts[2:])
+            if not _is_sha256(digest):
+                fail("mapped Linux family plan has invalid capsule digest %r" % digest)
+            _validate_path(relative, "mapped Linux config capsule path")
+            canonical = digest + "/" + relative
+            if canonical in capsule_files:
+                fail("mapped Linux family plan repeats config capsule file %r" % canonical)
+            capsule_files[canonical] = child
+            continue
+        if len(parts) >= 4 and parts[0] == "sources":
+            source_id = parts[1]
+            namespace = parts[2]
+            canonical = "/".join(parts[3:])
+            if not source_id.startswith("src-") or not _is_sha256(source_id[len("src-"):]):
+                fail("mapped Linux family plan has invalid source ID %r" % source_id)
+            if not _valid_name(namespace):
+                fail("mapped Linux family plan references invalid source namespace %r" % namespace)
+            _validate_path(canonical, "mapped Linux family source")
+            if source_id in source_markers:
+                fail("mapped Linux family plan repeats source %s" % source_id)
+            source_markers[source_id] = struct(namespace = namespace, path = canonical)
+            continue
+        if len(parts) >= 6 and parts[0] == "prior":
+            producer_ordinal, slot, tree = parts[1], parts[2], parts[3]
+            artifact_path = "/".join(parts[5:])
+            if not _is_decimal(producer_ordinal, 8) or int(producer_ordinal) >= len(node_index.node_ids):
+                fail("mapped Linux family plan has invalid prior producer in %r" % marker_path)
+            if not _is_decimal(slot, 8) or tree not in _TREES or parts[4] != "at":
+                fail("mapped Linux family plan has invalid prior output marker %r" % marker_path)
+            _validate_path(artifact_path, "mapped Linux family prior output")
+            producer = node_index.node_ids[int(producer_ordinal)]
+            output_key = producer + ":" + slot
+            if output_key in declared_outputs:
+                fail("mapped Linux family plan repeats output descriptor %s" % output_key)
+            descriptor = struct(artifact_path = artifact_path, tree = tree)
+            declared_outputs[output_key] = descriptor
+            prior_outputs[output_key] = True
+            continue
+        if len(parts) >= 9 and parts[0] == "variants" and parts[2] == "view":
+            variant, tree = parts[1], parts[3]
+            node_id, slot = parts[5], parts[6]
+            artifact_path = "/".join(parts[8:])
+            if not _valid_name(variant) or tree not in _FAMILY_VIEW_TREES or parts[4] != "from" or parts[7] != "at":
+                fail("mapped Linux family plan has invalid variant view marker %r" % marker_path)
+            if not _is_sha256(node_id) or not _is_decimal(slot, 8):
+                fail("mapped Linux family plan has invalid variant view producer in %r" % marker_path)
+            _validate_path(artifact_path, "mapped Linux family variant view")
+            key = tree + ":" + artifact_path
+            variant_views = views.setdefault(variant, {})
+            if key in variant_views:
+                fail("mapped Linux family variant %s repeats view path %s" % (variant, key))
+            variant_views[key] = struct(
+                artifact_path = artifact_path,
+                marker = child,
+                node_id = node_id,
+                slot = slot,
+                tree = tree,
+            )
+            continue
+        if len(parts) == 6 and parts[0] == "variants" and parts[2] == "validation" and parts[3] == "from":
+            variant, node_id, slot = parts[1], parts[4], parts[5]
+            if not _valid_name(variant) or not _is_sha256(node_id) or not _is_decimal(slot, 8):
+                fail("mapped Linux family plan has invalid variant validation marker %r" % marker_path)
+            validation_key = node_id + ":" + slot
+            variant_validations = validations.setdefault(variant, {})
+            if validation_key in variant_validations:
+                fail("mapped Linux family variant %s repeats validation %s" % (variant, validation_key))
+            variant_validations[validation_key] = struct(marker = child, node_id = node_id, slot = slot)
+            continue
+        if len(parts) >= 3 and parts[0] == "variants" and parts[2] == "products":
+            # Product markers are planner validation/reporting metadata. Exact
+            # public trees are described by the view markers above.
+            continue
+        if len(parts) >= 4 and parts[0] == "products":
+            continue
+        if len(parts) >= 2 and parts[0] == "reports":
+            continue
+        if len(parts) < 5 or parts[0] != "nodes":
+            fail("mapped Linux family plan contains unknown marker %r" % marker_path)
+        node_stage = parts[1]
+        node_id = parts[2]
+        if node_stage not in _STAGES or not _is_sha256(node_id):
+            fail("mapped Linux family plan has invalid node marker %r" % marker_path)
+        if node_id not in node_index.ordinals:
+            fail("mapped Linux family plan node %s is absent from its global index" % node_id)
+        node = nodes.setdefault(node_id, {
+            "input_packs": {},
+            "outputs": {},
+            "source_projection_packs": {},
+            "sources": {},
+            "stage": node_stage,
+            "tools": {},
+            "toolsets": {},
+            "trees": {},
+        })
+        if node["stage"] != node_stage:
+            fail("mapped Linux family plan repeats node %s in stages %s and %s" % (node_id, node["stage"], node_stage))
+        field = parts[3]
+        if field in ["kind", "product", "recipe", "tool"] and len(parts) == 5:
+            if field in node or not _valid_name(parts[4]):
+                fail("mapped Linux family node %s has invalid or repeated %s" % (node_id, field))
+            node[field] = parts[4]
+        elif field == "in" and len(parts) == 8 and parts[4] == "source":
+            role, ordinal, source_id = parts[5], parts[6], parts[7]
+            key = role + ":" + ordinal
+            if not _valid_name(role) or not _is_decimal(ordinal, 8) or key in node["sources"]:
+                fail("mapped Linux family node %s has invalid source marker %r" % (node_id, marker_path))
+            node["sources"][key] = source_id
+        elif field == "in" and len(parts) == 7 and parts[4] == "node-pack":
+            role, filename = parts[5], parts[6]
+            if not _valid_name(role):
+                fail("mapped Linux family node %s has invalid packed input role %r" % (node_id, role))
+            node["input_packs"].setdefault(role, []).append(filename)
+        elif field == "in" and len(parts) == 7 and parts[4] == "source-tree-pack":
+            tree, filename = parts[5], parts[6]
+            if not _valid_name(tree):
+                fail("mapped Linux family node %s has invalid source-projection tree %r" % (node_id, tree))
+            node["source_projection_packs"].setdefault(tree, []).append(filename)
+        elif field == "in" and len(parts) == 6 and parts[4] == "bindings":
+            filename = parts[5]
+            digest = filename[:-len(".json")] if filename.endswith(".json") else ""
+            if not _is_sha256(digest) or "input_bindings" in node:
+                fail("mapped Linux family node %s has invalid input binding manifest %r" % (node_id, marker_path))
+            node["input_bindings"] = struct(file = child, id = digest)
+        elif field == "in" and len(parts) == 6 and parts[4] == "input-set":
+            root = parts[5]
+            if not _is_sha256(root) or "input_set" in node:
+                fail("mapped Linux family node %s has invalid or repeated input-set root %r" % (node_id, marker_path))
+            node["input_set"] = root
+        elif field == "in" and len(parts) == 6 and parts[4] == "source-tree-bindings":
+            filename = parts[5]
+            digest = filename[:-len(".json")] if filename.endswith(".json") else ""
+            if not _is_sha256(digest) or "source_projections" in node:
+                fail("mapped Linux family node %s has invalid source-projection manifest %r" % (node_id, marker_path))
+            node["source_projections"] = struct(file = child, id = digest)
+        elif field == "in" and len(parts) == 6 and parts[4] == "tree":
+            tree = parts[5]
+            if not _valid_name(tree) or tree in node["trees"]:
+                fail("mapped Linux family node %s has invalid or repeated tree input %r" % (node_id, marker_path))
+            node["trees"][tree] = True
+        elif field == "in" and len(parts) == 8 and parts[4] == "tool":
+            scope, role, binding_form = parts[5], parts[6], parts[7]
+            if not _valid_scoped_tool_binding(scope, role) or binding_form not in ["scoped", "unscoped"]:
+                fail("mapped Linux family node %s has invalid auxiliary tool %r" % (node_id, marker_path))
+            default_scope = "host" if node_stage in ["prehost", "host"] else "target"
+            if binding_form == "unscoped" and scope != default_scope:
+                fail("mapped Linux family node %s has cross-scope unscoped auxiliary tool %r" % (node_id, marker_path))
+            binding = role if binding_form == "unscoped" else _scoped_tool_binding(scope, role)
+            if binding in node["tools"]:
+                fail("mapped Linux family node %s repeats auxiliary tool %r" % (node_id, binding))
+            node["tools"][binding] = struct(binding = binding, role = role, scope = scope)
+        elif field == "in" and len(parts) == 6 and parts[4] == "toolset":
+            scope = parts[5]
+            if scope not in ["host", "target"] or scope in node["toolsets"]:
+                fail("mapped Linux family node %s has invalid toolset scope %r" % (node_id, marker_path))
+            node["toolsets"][scope] = True
+        elif field == "out" and len(parts) >= 8 and parts[6] == "at":
+            tree, slot = parts[4], parts[5]
+            artifact_path = "/".join(parts[7:])
+            if tree not in _TREES or not _is_decimal(slot, 8) or slot in node["outputs"]:
+                fail("mapped Linux family node %s has invalid output marker %r" % (node_id, marker_path))
+            if tree not in _STAGE_OUTPUT_TREES[node_stage]:
+                fail("mapped Linux family %s node %s cannot write %s tree" % (node_stage, node_id, tree))
+            _validate_path(artifact_path, "mapped Linux family physical output")
+            descriptor = struct(artifact_path = artifact_path, tree = tree)
+            output_key = node_id + ":" + slot
+            if output_key in declared_outputs:
+                fail("mapped Linux family plan repeats output descriptor %s" % output_key)
+            node["outputs"][slot] = descriptor
+            declared_outputs[output_key] = descriptor
+        else:
+            fail("mapped Linux family node %s has invalid marker %r" % (node_id, marker_path))
+
+    if not has_schema:
+        fail("mapped Linux family plan does not use schema %s" % _FAMILY_SCHEMA)
+    for node_id, node in nodes.items():
+        if "input_bindings" not in node:
+            fail("mapped Linux family node %s has no input binding manifest" % node_id)
+        _decode_packed_source_projections(node_id, node)
+    input_sets = _validate_input_sets(
+        input_set_nodes,
+        nodes,
+        node_index,
+        declared_outputs,
+        source_markers,
+        True,
+    )
+    _validate_node_dependency_cycles(nodes, node_index, input_sets, "mapped Linux family plan")
+    required_prior_outputs = {}
+    for node_id, node in nodes.items():
+        for dependency in _decode_packed_node_inputs(node_id, node, node_index).values():
+            if dependency.producer not in nodes:
+                required_prior_outputs[dependency.producer + ":" + dependency.slot] = True
+        for dependency in _input_set_dependencies(input_sets, node.get("input_set")).inputs.values():
+            if dependency.producer not in nodes:
+                required_prior_outputs[dependency.producer + ":" + dependency.slot] = True
+    for variant_validations in validations.values():
+        for validation in variant_validations.values():
+            if validation.node_id not in nodes:
+                required_prior_outputs[validation.node_id + ":" + validation.slot] = True
+    if sorted(required_prior_outputs) != sorted(prior_outputs):
+        missing = [key for key in sorted(required_prior_outputs) if key not in prior_outputs]
+        extra = [key for key in sorted(prior_outputs) if key not in required_prior_outputs]
+        fail("mapped Linux family plan prior output descriptors differ from cross-segment inputs (missing %s, extra %s)" % (missing, extra))
+    for variant, variant_views in views.items():
+        for key, view in variant_views.items():
+            descriptor = declared_outputs.get(view.node_id + ":" + view.slot)
+            if descriptor == None:
+                fail("mapped Linux family variant %s view %s references unknown output" % (variant, key))
+
+            # Storage spelling is deliberately excluded from semantic node
+            # identity. The node marker records one deterministic diagnostic
+            # spelling; each variant view owns its exact facade path.
+            if descriptor.tree != view.tree:
+                fail("mapped Linux family variant %s view %s disagrees with producer output" % (variant, key))
+    for variant, variant_validations in validations.items():
+        for key, validation in variant_validations.items():
+            if declared_outputs.get(validation.node_id + ":" + validation.slot) == None:
+                fail("mapped Linux family variant %s validation %s references unknown output" % (variant, key))
+
+    referenced_recipes = {}
+    referenced_sources = {}
+    for node in nodes.values():
+        referenced_recipes[node.get("recipe")] = True
+        for source_id in node["sources"].values():
+            referenced_sources[source_id] = True
+        for source_id in _input_set_dependencies(input_sets, node.get("input_set")).sources:
+            referenced_sources[source_id] = True
+    recipes = {recipe: file for recipe, file in recipe_markers.items() if recipe in referenced_recipes}
+    selected_source_keys = {
+        marker.namespace + "/" + marker.path: True
+        for source_id, marker in source_markers.items()
+        if source_id in referenced_sources
+    }
+    source_children = {}
+    for file in additional_inputs["source_files"].to_list():
+        canonical = file.short_path
+        if source_prefix:
+            prefix = source_prefix + "/"
+            if not canonical.startswith(prefix):
+                fail("mapped Linux family source input %s is outside %s" % (file, source_prefix))
+            canonical = canonical[len(prefix):]
+        key = "kernel/" + canonical
+        if key in selected_source_keys:
+            _record_family_source_child(source_children, key, file)
+    for file in additional_inputs.get("rust_source_files", depset()).to_list():
+        canonical = _canonical_file_path(file, "selected Rust source")
+        key = "rust/" + canonical
+        if key in selected_source_keys:
+            _record_family_source_child(source_children, key, file)
+    for canonical, file in capsule_files.items():
+        key = "capsule/" + canonical
+        if key in selected_source_keys:
+            _record_family_source_child(source_children, key, file)
+    for directory_name, directory in input_directories.items():
+        if directory_name == "plan" or directory_name in _TOOLSET_DIRECTORIES.values() or _family_execution_directory(directory_name):
+            continue
+        for file in directory.children:
+            key = directory_name + "/" + file.tree_relative_path
+            if key in selected_source_keys:
+                _record_family_source_child(source_children, key, file)
+    sources = {}
+    for source_id, marker in source_markers.items():
+        if source_id not in referenced_sources:
+            continue
+        source_key = marker.namespace + "/" + marker.path
+        file = source_children.get(source_key)
+        if file == None:
+            fail("mapped Linux family plan has unstaged source %s/%s" % (source_id, source_key))
+        sources[source_id] = struct(file = file, namespace = marker.namespace, path = marker.path)
+    return struct(
+        declared_outputs = declared_outputs,
+        input_sets = input_sets,
+        node_index = node_index,
+        nodes = nodes,
+        recipes = recipes,
+        sources = sources,
+        toolsets = toolsets,
+        validations = validations,
+        views = views,
     )
 
 def _expected_toolset_identity(directory, scope):
@@ -745,19 +1637,20 @@ def _composed_tree_base_paths(base_paths, planned_paths, tree):
     """Selects base leaves not replaced by plan outputs and validates shape."""
     planned = {path: True for path in planned_paths}
     selected_base = [path for path in base_paths if path not in planned]
-    owners = [(path, "base") for path in selected_base] + [(path, "plan") for path in planned]
-    owners = sorted(owners)
-    for index in range(len(owners) - 1):
-        parent = owners[index]
-        child = owners[index + 1]
-        if child[0].startswith(parent[0] + "/"):
-            fail("mapped Linux composed %s tree has file/subtree collision between %s %r and %s %r" % (
-                tree,
-                parent[1],
-                parent[0],
-                child[1],
-                child[0],
-            ))
+    owners = dict([(path, "base") for path in selected_base] + [(path, "plan") for path in planned])
+    for child_path, child_owner in sorted(owners.items()):
+        components = child_path.split("/")
+        for component_count in range(1, len(components)):
+            parent_path = "/".join(components[:component_count])
+            parent_owner = owners.get(parent_path)
+            if parent_owner != None:
+                fail("mapped Linux composed %s tree has file/subtree collision between %s %r and %s %r" % (
+                    tree,
+                    parent_owner,
+                    parent_path,
+                    child_owner,
+                    child_path,
+                ))
     return sorted(selected_base)
 
 def linux_test_composed_tree_base_paths(base_paths, planned_paths, tree = "prep"):
@@ -815,6 +1708,26 @@ def _runtime_tool_bindings(tools, current_scope = "target", selected_scopes = No
         bindings[binding] = _tool_executable(tool)
     return bindings
 
+def _family_runtime_tool_bindings(tools, current_scope, selected_scopes):
+    """Returns scoped tools plus unscoped aliases for one node in a family."""
+    bindings = {}
+    for binding, tool in tools.items():
+        if (
+            _TOOL_BINDING_SEPARATOR not in binding or
+            binding.startswith(_TOOLCHAIN_FILES_PREFIX) or
+            binding.startswith(_TOOLSET_ANCHOR_PREFIX) or
+            binding.startswith(_TOOLSET_MANIFEST_PREFIX) or
+            binding.startswith(_COMPANION_TOOL_PREFIX)
+        ):
+            continue
+        parsed = _split_tool_binding(binding)
+        if parsed.scope not in selected_scopes:
+            continue
+        bindings[binding] = _tool_executable(tool)
+        if parsed.scope == current_scope:
+            bindings[parsed.role] = _tool_executable(tool)
+    return bindings
+
 def linux_test_runtime_tool_bindings(tools, current_scope = "target", selected_scopes = None):
     return _runtime_tool_bindings(tools, current_scope, selected_scopes)
 
@@ -831,12 +1744,19 @@ def _companion_tool_bindings(tools, binding, current_scope = "target"):
 def linux_test_companion_tool_bindings(tools, role, current_scope = "target"):
     return _companion_tool_bindings(tools, role, current_scope)
 
-def _node_uses_runtime_toolset(kind, role, auxiliary_tools):
+def _node_uses_runtime_toolset(_kind, role, auxiliary_tools):
     """Whether a mapped recipe can execute source-selected toolchain tools."""
-    return not (kind == "copy" and role == "actionfile" and not auxiliary_tools)
+    return not (role == "actionfile" and not auxiliary_tools)
 
 def linux_test_node_uses_runtime_toolset(kind, role, auxiliary_tools = None):
     return _node_uses_runtime_toolset(kind, role, auxiliary_tools or {})
+
+def _render_toolchain_action_value_cached(value, path_index, values):
+    rendered = values.get(value)
+    if rendered == None:
+        rendered = _render_toolchain_action_value(value, path_index)
+        values[value] = rendered
+    return rendered
 
 def _render_toolchain_action_contracts(additional_params, tools):
     roles = {}
@@ -846,6 +1766,7 @@ def _render_toolchain_action_contracts(additional_params, tools):
             roles[name[len(prefix):]] = True
     contracts = {}
     path_indexes = {}
+    rendered_values = {}
     for role in sorted(roles):
         parsed = _split_tool_binding(role)
         path_index = path_indexes.get(parsed.scope)
@@ -855,26 +1776,36 @@ def _render_toolchain_action_contracts(additional_params, tools):
                 fail("mapped Linux action contract %s has no %s toolchain closure" % (role, parsed.scope))
             path_index = _toolchain_action_path_index(toolchain_files)
             path_indexes[parsed.scope] = path_index
+
+            # Successful renders are reusable only within this callback and
+            # exact scope: equal text can refer to different host/target Files.
+            # Validate the complete closure before consulting its value cache.
+            rendered_values[parsed.scope] = {}
+        values = rendered_values[parsed.scope]
         arguments = [
-            _render_toolchain_action_value(
+            _render_toolchain_action_value_cached(
                 additional_params["action_arg_%s_%d" % (role, index)],
                 path_index,
+                values,
             )
             for index in range(int(additional_params["action_arg_count_" + role]))
         ]
         environment = [
-            _render_toolchain_action_value(
+            _render_toolchain_action_value_cached(
                 additional_params["action_env_%s_%d" % (role, index)],
                 path_index,
+                values,
             )
             for index in range(int(additional_params.get("action_env_count_" + role, "0")))
         ]
         contracts[role] = struct(arguments = arguments, environment = environment)
     return contracts
 
-def _toolset_artifact_binding_args(template_ctx, tools, toolsets, scopes):
+def linux_test_render_toolchain_action_contracts(additional_params, tools):
+    return _render_toolchain_action_contracts(additional_params, tools)
+
+def _add_toolset_artifact_binding_args(args, tools, toolsets, scopes):
     """Forwards identity, manifest, and consumer-mapped root anchors by scope."""
-    args = template_ctx.args()
     for scope in sorted(scopes):
         closure = tools.get(_TOOLCHAIN_FILES_PREFIX + scope)
         if closure == None:
@@ -905,7 +1836,9 @@ def _toolset_artifact_binding_args(template_ctx, tools, toolsets, scopes):
                 expand_directories = False,
                 format_each = "-toolset_anchor=" + scope + "=" + root + "=%s",
             )
-    return args
+
+def _recipe_runner_args(template_ctx):
+    return template_arguments(template_ctx)
 
 def linux_test_render_toolchain_action_value(value, artifacts):
     return _render_toolchain_action_value(value, _toolchain_action_path_index_from_list(artifacts))
@@ -1009,6 +1942,21 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
                 directory = output_directories[descriptor.tree],
             )
 
+    input_set_output_artifacts = _input_set_output_artifacts(
+        parsed.input_sets,
+        outputs,
+        prior,
+        parsed.declared_outputs,
+        False,
+        "mapped Linux plan",
+    )
+    bound_input_sets = _bind_input_sets(
+        parsed.input_sets,
+        parsed.sources,
+        input_set_output_artifacts,
+        "mapped Linux plan",
+    )
+
     for node_id in sorted(parsed.nodes):
         node = parsed.nodes[node_id]
         recipe_id = node.get("recipe")
@@ -1029,7 +1977,7 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
             parsed.declared_outputs,
         )
 
-        args = template_ctx.args()
+        args = _recipe_runner_args(template_ctx)
         args.add("-recipe", parsed.recipes[recipe_id])
         args.add("-kind", kind)
         args.add("-expected_node_id", node_id)
@@ -1038,6 +1986,13 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
         input_bindings = node["input_bindings"]
         _add_artifact_path(args, "-input_bindings", input_bindings.file)
         args.add("-expected_input_bindings_id", input_bindings.id)
+        input_set_inputs = _add_input_set_args(
+            args,
+            node.get("input_set"),
+            parsed.input_sets,
+            bound_input_sets,
+            "mapped Linux node %s" % node_id,
+        )
         for tree, root in sorted(artifact_tree_roots.items()):
             _add_artifact_path(args, "-artifact_tree", root, format = tree + "=%s")
         inputs = [parsed.recipes[recipe_id], input_bindings.file, toolset.plan_file, toolset.expected_file]
@@ -1076,6 +2031,8 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
             additional_inputs[key]
             for key in _node_source_closure_keys(node, parsed.sources)
         ]
+        if input_set_inputs != None:
+            transitive_inputs.append(input_set_inputs)
         for tree in sorted(node["trees"]):
             if tree == "kernel" and root_marker != None:
                 # source_root is a File because Args can path-map Files,
@@ -1172,23 +2129,699 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
         # role is bound to this node.  The closure scopes are therefore exactly
         # the same scopes already authorized for runtime tool execution.  The
         # runner rejects a provenance token for every other scope.
-        action_arguments = [args]
         if selected_scopes:
-            action_arguments.append(_toolset_artifact_binding_args(
-                template_ctx,
+            _add_toolset_artifact_binding_args(
+                args,
                 tools,
                 toolsets,
                 selected_scopes,
-            ))
+            )
 
+        action_tools = [tools[_TOOLCHAIN_FILES_PREFIX + selected_scope] for selected_scope in sorted(selected_scopes)] + [tools[_TOOLSET_MANIFEST_PREFIX + selected_scope] for selected_scope in sorted(selected_scopes)] + ([selected_tool] if role != "generated" else []) + selected_auxiliary_tools + selected_companion_tools
+        transport = args.finish(tools["runner"], work_directory, node_id, depset(inputs, transitive = transitive_inputs), action_tools)
+        inputs.extend(transport.inputs)
         template_ctx.run(
             executable = tools["runner"],
             inputs = depset(inputs, transitive = transitive_inputs),
-            tools = [tools[_TOOLCHAIN_FILES_PREFIX + selected_scope] for selected_scope in sorted(selected_scopes)] + [tools[_TOOLSET_MANIFEST_PREFIX + selected_scope] for selected_scope in sorted(selected_scopes)] + ([selected_tool] if role != "generated" else []) + selected_auxiliary_tools + selected_companion_tools,
+            tools = action_tools,
             outputs = action_outputs,
-            arguments = action_arguments,
+            arguments = transport.arguments,
             progress_message = "Building Linux %s node %s" % (kind, node_id[:12]),
         )
+
+def _family_view_directory_key(variant, tree):
+    return "view@%s@%s" % (variant, tree)
+
+def _family_stage_scope(stage):
+    if stage in ["prehost", "host"]:
+        return "host"
+    if stage in ["bootstrap", "prep", "target"]:
+        return "target"
+    fail("mapped Linux family has unknown stage %r" % stage)
+
+def _family_execution_segments():
+    """Returns the minimum stage-ordered map_directory platform segments."""
+    return [
+        struct(
+            emit_views = False,
+            input_trees = [],
+            mnemonic = "LinuxMappedFamilyPrehost",
+            name = "prehost",
+            output_trees = ["prehost"],
+            scope = "host",
+            stages = ["prehost"],
+        ),
+        struct(
+            emit_views = False,
+            input_trees = ["prehost"],
+            mnemonic = "LinuxMappedFamilyBootstrap",
+            name = "bootstrap",
+            output_trees = ["bootstrap"],
+            scope = "target",
+            stages = ["bootstrap"],
+        ),
+        struct(
+            emit_views = False,
+            input_trees = ["prehost", "bootstrap"],
+            mnemonic = "LinuxMappedFamilyHost",
+            name = "host",
+            output_trees = ["host"],
+            scope = "host",
+            stages = ["host"],
+        ),
+        struct(
+            emit_views = True,
+            input_trees = ["prehost", "bootstrap", "host"],
+            mnemonic = "LinuxMappedFamilyTarget",
+            name = "target",
+            output_trees = ["prep"] + _FAMILY_VIEW_TREES,
+            scope = "target",
+            stages = ["prep", "target"],
+        ),
+    ]
+
+def linux_test_family_execution_segments():
+    return _family_execution_segments()
+
+def _family_store_path(node_id, slot):
+    return "nodes/%s/%s" % (node_id, slot)
+
+def linux_test_family_store_path(node_id, slot):
+    return _family_store_path(node_id, slot)
+
+def _family_segment_prior_outputs(input_directories):
+    outputs = {}
+    for tree in _TREES:
+        directory = input_directories.get(tree)
+        if directory == None:
+            continue
+        for child in directory.children:
+            key = tree + ":" + child.tree_relative_path
+            if key in outputs:
+                fail("mapped Linux family prior store repeats %s" % key)
+            outputs[key] = child
+    return outputs
+
+def _selected_family_prior_outputs(input_directories, nodes, node_index, declared_outputs, validations = None, input_sets = None, current_nodes = None):
+    """Indexes only cross-segment producer leaves referenced by these nodes."""
+    if current_nodes == None:
+        current_nodes = nodes
+    required = {}
+    for node_id, node in nodes.items():
+        for dependency in _decode_packed_node_inputs(node_id, node, node_index).values():
+            if dependency.producer in current_nodes:
+                continue
+            output_key = dependency.producer + ":" + dependency.slot
+            descriptor = declared_outputs.get(output_key)
+            if descriptor == None:
+                fail("mapped Linux family node %s references unknown prior output %s" % (node_id, output_key))
+            required.setdefault(descriptor.tree, {})[_family_store_path(dependency.producer, dependency.slot)] = True
+
+    # The caller has already selected the union of executing InputSet roots.
+    # Visit each shared subtree once instead of flattening cumulative closures
+    # separately for every consumer.
+    if input_sets != None:
+        for input_set in input_sets.nodes.values():
+            for dependency in input_set["entries"].values():
+                if dependency.kind != "node" or dependency.producer in current_nodes:
+                    continue
+                output_key = dependency.producer + ":" + dependency.slot
+                descriptor = declared_outputs.get(output_key)
+                if descriptor == None:
+                    fail("mapped Linux family input set references unknown prior output %s" % output_key)
+                required.setdefault(descriptor.tree, {})[_family_store_path(dependency.producer, dependency.slot)] = True
+    for variant_validations in (validations or {}).values():
+        for validation in variant_validations.values():
+            if validation.node_id in current_nodes:
+                continue
+            output_key = validation.node_id + ":" + validation.slot
+            descriptor = declared_outputs.get(output_key)
+            if descriptor == None:
+                fail("mapped Linux family validation references unknown prior output %s" % output_key)
+            required.setdefault(descriptor.tree, {})[_family_store_path(validation.node_id, validation.slot)] = True
+
+    outputs = {}
+    for tree, paths in required.items():
+        directory = input_directories.get(tree)
+        if directory == None:
+            continue
+        for child in directory.children:
+            if child.tree_relative_path in paths:
+                outputs[tree + ":" + child.tree_relative_path] = child
+    return outputs
+
+def linux_test_family_segment_prior_outputs(input_directories):
+    return _family_segment_prior_outputs(input_directories)
+
+def linux_test_selected_family_prior_outputs(input_directories, nodes, node_index, declared_outputs):
+    return _selected_family_prior_outputs(input_directories, nodes, node_index, declared_outputs)
+
+def _family_tree_input(tree, input_directories, output_directories):
+    """Selects one physical family store for an action-private logical view.
+
+    Family stores deliberately use nodes/<content-id>/<slot> paths. They are
+    storage namespaces, not the logical Kbuild trees named by WorkingTrees.
+    This is true for a current segment's output store and for an immutable
+    prior-segment input store alike. The runner must therefore reconstruct the
+    tree from this node's exact input bindings (whose ProjectionPath values are
+    logical paths) instead of exposing either complete physical store.
+    """
+    current = output_directories.get(tree)
+    if current != None:
+        path = current
+    else:
+        prior = input_directories.get(tree)
+        path = getattr(prior, "directory", None) if prior != None else None
+        if path == None:
+            fail("mapped Linux family action requires unavailable %s store" % tree)
+    return struct(
+        path = path,
+        projection_argument = "-private_input_tree",
+    )
+
+def linux_test_family_tree_input(tree, input_directories, output_directories):
+    return _family_tree_input(tree, input_directories, output_directories)
+
+def _family_execution_directory(name):
+    return name == "execution" or name.startswith("cut-")
+
+def _parse_family_execution(directory, node_index):
+    """Reads only the bounded selection emitted by the Go cut/pin verifier.
+
+    The seal authenticates complete contracts in Go; filenames do not replace
+    that proof. Bazel waits for the complete verifier-owned input TreeArtifacts
+    before invoking this callback. Keep the whole-cut seal at that boundary:
+    adding its changing filename to each spawn would invalidate unrelated
+    compiler artifacts. Fixed schema/mode and exact node markers remain inputs.
+    An explicit mode distinguishes an empty cut/pin set from ordinary execution.
+    """
+    if directory == None:
+        return None
+    if len(directory.children) > _MAX_FAMILY_EXECUTION_NODES + 3:
+        fail("mapped Linux family execution exceeds node marker bound")
+    schema = None
+    mode = None
+    seal = None
+    mode_marker = None
+    nodes = {}
+    node_modes = {}
+    for child in directory.children:
+        parts = child.tree_relative_path.split("/")
+        if parts == ["schema", _FAMILY_EXECUTION_SCHEMA] and schema == None:
+            schema = child
+        elif len(parts) == 2 and parts[0] == "mode" and parts[1] in ["cut", "pinned"] and mode == None:
+            mode = parts[1]
+            mode_marker = child
+        elif len(parts) == 2 and parts[0] == "seal" and _is_sha256(parts[1]) and seal == None:
+            seal = child
+        elif len(parts) == 2 and parts[0] in ["cut", "pinned"] and _is_sha256(parts[1]):
+            node_id = parts[1]
+            if node_id not in node_index.ordinals or node_id in nodes:
+                fail("mapped Linux family execution has unknown or repeated node %s" % node_id)
+            nodes[node_id] = child
+            node_modes[node_id] = parts[0]
+        else:
+            fail("mapped Linux family execution has invalid or repeated marker %r" % child.tree_relative_path)
+    if schema == None or mode == None or seal == None:
+        fail("mapped Linux family execution requires schema, mode, and seal markers")
+    for node_id, node_mode in node_modes.items():
+        if node_mode != mode:
+            fail("mapped Linux family execution mixes %s mode with %s node %s" % (mode, node_mode, node_id))
+    return struct(mode = mode, nodes = nodes, proof = [schema, mode_marker])
+
+def _family_execution_input_sets(input_sets, nodes):
+    """Selects a union of roots without flattening each cumulative input set."""
+    selected = {}
+    pending = []
+    for node in nodes.values():
+        root = node.get("input_set")
+        if root != None and root not in selected:
+            selected[root] = input_sets.nodes[root]
+            pending.append(root)
+    for index in range(len(input_sets.nodes)):
+        if index >= len(pending):
+            break
+        for child_id in input_sets.nodes[pending[index]]["children"].values():
+            if child_id not in selected:
+                selected[child_id] = input_sets.nodes[child_id]
+                pending.append(child_id)
+    return struct(
+        nodes = selected,
+        postorder = [set_id for set_id in input_sets.postorder if set_id in selected],
+    )
+
+def _validate_family_cut_dependencies(execution, decoded_inputs, input_sets):
+    if execution == None or execution.mode != "cut":
+        return
+    for node_id, dependencies in decoded_inputs.items():
+        for dependency in dependencies.values():
+            if dependency.producer not in execution.nodes:
+                fail("mapped Linux family cut node %s depends on unselected producer %s" % (node_id, dependency.producer))
+    for set_id, node in input_sets.nodes.items():
+        for entry in node["entries"].values():
+            if entry.kind == "node" and entry.producer not in execution.nodes:
+                fail("mapped Linux family cut input set %s depends on unselected producer %s" % (set_id, entry.producer))
+
+def _family_pinned_outputs(execution, selected_nodes, input_directories):
+    """Authenticates the complete physical slot vector for current pinned nodes."""
+    if execution == None or execution.mode != "pinned":
+        return {}
+    expected = {}
+    for node_id, node in selected_nodes.items():
+        if node_id not in execution.nodes:
+            continue
+        for slot, descriptor in node["outputs"].items():
+            expected[node_id + ":" + slot] = descriptor.tree
+            if len(expected) > _MAX_FAMILY_EXECUTION_SLOTS:
+                fail("mapped Linux family execution exceeds copied slot bound")
+    found = {}
+    count = 0
+    seen = {}
+    for tree in _TREES:
+        directory = input_directories.get("cut-" + tree)
+        if directory == None:
+            continue
+        for child in directory.children:
+            count += 1
+            if count > _MAX_FAMILY_EXECUTION_SLOTS:
+                fail("mapped Linux family execution exceeds copied slot bound")
+            parts = child.tree_relative_path.split("/")
+            if len(parts) != 3 or parts[0] != "nodes" or not _is_sha256(parts[1]) or not _is_decimal(parts[2], 8):
+                fail("mapped Linux family cut store has invalid output %r" % child.tree_relative_path)
+            node_id, slot = parts[1], parts[2]
+            key = node_id + ":" + slot
+            if node_id not in execution.nodes or key in seen:
+                fail("mapped Linux family cut store has unknown or repeated pinned output %s" % key)
+            seen[key] = True
+            if node_id not in selected_nodes:
+                continue
+            if expected.get(key) != tree:
+                fail("mapped Linux family pinned node has extra or misplaced output %s in %s" % (key, tree))
+            found[key] = child
+    missing = [key for key in sorted(expected) if key not in found]
+    if missing:
+        fail("mapped Linux family pinned node has missing outputs %s" % missing)
+    return found
+
+def linux_test_parse_family_execution(directory, node_index):
+    return _parse_family_execution(directory, node_index)
+
+def linux_test_family_cut_dependencies(execution, decoded_inputs, input_sets):
+    _validate_family_cut_dependencies(execution, decoded_inputs, input_sets)
+
+def linux_test_family_execution_input_sets(input_sets, nodes):
+    return _family_execution_input_sets(input_sets, nodes)
+
+def linux_test_family_pinned_outputs(execution, selected_nodes, input_directories):
+    return _family_pinned_outputs(execution, selected_nodes, input_directories)
+
+def expand_linux_family_plan(template_ctx, input_directories, output_directories, additional_inputs, tools, additional_params):
+    """Expands one execution-platform segment of the symmetric family DAG."""
+    parsed = _parse_family_plan(
+        input_directories["plan"],
+        input_directories,
+        additional_inputs,
+        additional_params["source_prefix"],
+    )
+    toolsets = _validate_plan_toolsets(parsed, input_directories)
+    action_contracts = _render_toolchain_action_contracts(additional_params, tools)
+    scope = additional_params.get("family_scope")
+    stages = additional_params.get("family_stages", "").split(",")
+    emit_views = additional_params.get("family_emit_views", False)
+    if scope not in ["host", "target"] or not stages or any([_family_stage_scope(stage) != scope for stage in stages]):
+        fail("mapped Linux family expansion has invalid %s stages for %s scope" % (stages, scope))
+    selected_stages = {stage: True for stage in stages}
+    execution = _parse_family_execution(input_directories.get("execution"), parsed.node_index)
+    if execution != None and execution.mode == "cut" and emit_views:
+        fail("mapped Linux family cut execution must not emit final views")
+    work = output_directories.get("work")
+    if work == None:
+        fail("mapped Linux family expansion requires a work output directory")
+
+    selected_nodes = {
+        node_id: node
+        for node_id, node in parsed.nodes.items()
+        if node["stage"] in selected_stages and
+           (execution == None or execution.mode != "cut" or node_id in execution.nodes)
+    }
+    pinned_outputs = _family_pinned_outputs(execution, selected_nodes, input_directories)
+    executing_nodes = {
+        node_id: node
+        for node_id, node in selected_nodes.items()
+        if execution == None or execution.mode != "pinned" or node_id not in execution.nodes
+    }
+    outputs = {}
+    for node_id in sorted(selected_nodes):
+        node = selected_nodes[node_id]
+        role = node.get("tool")
+        if node_id in executing_nodes and role != "generated" and (not _valid_name(role or "") or tools.get(_scoped_tool_binding(scope, role)) == None):
+            fail("mapped Linux family node %s requires unavailable %s %s tool" % (node_id, scope, role))
+        for descriptor in node["tools"].values():
+            if node_id in executing_nodes and tools.get(_scoped_tool_binding(descriptor.scope, descriptor.role)) == None:
+                fail("mapped Linux family node %s requires unavailable %s/%s auxiliary tool" % (
+                    node_id,
+                    descriptor.scope,
+                    descriptor.role,
+                ))
+        for slot in sorted(node["outputs"]):
+            tree = node["outputs"][slot].tree
+            directory = output_directories.get(tree)
+            if directory == None:
+                fail("mapped Linux family %s stage has no %s output store" % (node["stage"], tree))
+            outputs[node_id + ":" + slot] = template_ctx.declare_file(
+                _family_store_path(node_id, slot),
+                directory = directory,
+            )
+
+    selected_input_sets = _family_execution_input_sets(parsed.input_sets, executing_nodes)
+    decoded_inputs_by_node = {
+        node_id: _decode_packed_node_inputs(node_id, node, parsed.node_index)
+        for node_id, node in executing_nodes.items()
+    }
+    _validate_family_cut_dependencies(execution, decoded_inputs_by_node, selected_input_sets)
+    selected_validations = parsed.validations
+    if execution != None and execution.mode == "cut":
+        selected_validations = {
+            variant: {key: validation for key, validation in validations.items() if validation.node_id in execution.nodes}
+            for variant, validations in parsed.validations.items()
+        }
+    prior_outputs = _selected_family_prior_outputs(
+        input_directories,
+        executing_nodes,
+        parsed.node_index,
+        parsed.declared_outputs,
+        selected_validations,
+        selected_input_sets,
+        selected_nodes,
+    )
+    input_set_output_artifacts = _input_set_output_artifacts(
+        selected_input_sets,
+        outputs,
+        prior_outputs,
+        parsed.declared_outputs,
+        True,
+        "mapped Linux family plan",
+    )
+    bound_input_sets = _bind_input_sets(
+        selected_input_sets,
+        parsed.sources,
+        input_set_output_artifacts,
+        "mapped Linux family plan",
+    )
+    if pinned_outputs:
+        copy_tool = tools.get(_scoped_tool_binding(scope, "actionfile"))
+        if copy_tool == None:
+            fail("mapped Linux family pinned execution requires the %s actionfile tool" % scope)
+        for key in sorted(pinned_outputs):
+            node_id = key.split(":")[0]
+            source = pinned_outputs[key]
+            output = outputs[key]
+            args = template_ctx.args()
+            _add_artifact_path(args, "-input", source)
+            _add_artifact_path(args, "-out", output)
+            args.add("-preserve_mode")
+            template_ctx.run(
+                executable = _tool_executable(copy_tool),
+                inputs = [source] + execution.proof + [execution.nodes[node_id]],
+                tools = [copy_tool],
+                outputs = [output],
+                arguments = [args],
+                progress_message = "Importing pinned Linux %s output %s" % (scope, key),
+            )
+    for node_id in sorted(executing_nodes):
+        node = executing_nodes[node_id]
+        stage = node["stage"]
+        toolset = toolsets[scope]
+        recipe_id = node.get("recipe")
+        role = node.get("tool")
+        kind = node.get("kind")
+        if recipe_id not in parsed.recipes or not _valid_name(role or "") or not _valid_name(kind or "") or "product" not in node:
+            fail("mapped Linux family node %s has incomplete metadata" % node_id)
+        decoded_inputs = decoded_inputs_by_node[node_id]
+        bindings = {}
+        artifact_tree_roots = {}
+        for key, dependency in decoded_inputs.items():
+            output_key = dependency.producer + ":" + dependency.slot
+            artifact = outputs.get(output_key)
+            descriptor = parsed.declared_outputs.get(output_key)
+            if descriptor == None:
+                fail("mapped Linux family node %s references unknown producer output %s" % (node_id, output_key))
+            root = output_directories.get(descriptor.tree) if artifact != None else None
+            if artifact == None:
+                artifact = prior_outputs.get(descriptor.tree + ":" + _family_store_path(dependency.producer, dependency.slot))
+                directory = input_directories.get(descriptor.tree)
+                root = getattr(directory, "directory", None) if directory != None else None
+            if artifact == None or root == None:
+                fail("mapped Linux family node %s requires unavailable producer output %s" % (node_id, output_key))
+            existing = artifact_tree_roots.get(descriptor.tree)
+            if existing != None and existing != root:
+                fail("mapped Linux family node %s resolves conflicting %s store roots" % (node_id, descriptor.tree))
+            artifact_tree_roots[descriptor.tree] = root
+            bindings[key] = artifact
+
+        args = _recipe_runner_args(template_ctx)
+        args.add("-recipe", parsed.recipes[recipe_id])
+        args.add("-kind", kind)
+        args.add("-expected_node_id", node_id)
+        args.add("-expected_recipe_id", recipe_id)
+        args.add("-tool_role", role)
+        input_bindings = node["input_bindings"]
+        _add_artifact_path(args, "-input_bindings", input_bindings.file)
+        args.add("-expected_input_bindings_id", input_bindings.id)
+        source_projection_trees = _decode_packed_source_projections(node_id, node)
+        opaque_source_runfiles = None
+        if "kernel" in node["trees"] and "kernel" not in source_projection_trees:
+            opaque_source_runfiles = tools.get("source_runfiles")
+        input_set_inputs = _add_input_set_args(
+            args,
+            node.get("input_set"),
+            selected_input_sets,
+            bound_input_sets,
+            "mapped Linux family node %s" % node_id,
+            family = True,
+            sources = parsed.sources,
+            source_runfiles = opaque_source_runfiles,
+        )
+        source_projections = node.get("source_projections")
+        if source_projections != None:
+            _add_artifact_path(args, "-source_projections", source_projections.file)
+            args.add("-expected_source_projections_id", source_projections.id)
+        for tree, root in sorted(artifact_tree_roots.items()):
+            _add_artifact_path(args, "-artifact_tree", root, format = tree + "=%s")
+        inputs = [parsed.recipes[recipe_id], input_bindings.file, toolset.plan_file, toolset.expected_file]
+        if execution != None:
+            inputs.extend(execution.proof)
+            if node_id in execution.nodes:
+                inputs.append(execution.nodes[node_id])
+        if source_projections != None:
+            inputs.append(source_projections.file)
+        source_artifacts = {}
+        for key, source_id in sorted(node["sources"].items()):
+            source = parsed.sources.get(source_id)
+            if source == None:
+                fail("mapped Linux family node %s references unknown source %s" % (node_id, source_id))
+            _add_family_source_binding(args, "-source", key, source, opaque_source_runfiles)
+            inputs.append(source.file)
+            source_artifacts[key] = source.file
+        inputs.extend([bindings[key] for key in sorted(bindings)])
+
+        uses_runtime_toolset = _node_uses_runtime_toolset(kind, role, node["tools"])
+        selected_scopes = dict(node["toolsets"])
+        if uses_runtime_toolset:
+            selected_scopes[scope] = True
+        for descriptor in node["tools"].values():
+            selected_scopes[descriptor.scope] = True
+        for selected_scope in sorted(selected_scopes):
+            if selected_scope != scope:
+                selected_toolset = toolsets[selected_scope]
+                inputs.extend([selected_toolset.plan_file, selected_toolset.expected_file])
+        runtime_tools = _family_runtime_tool_bindings(tools, scope, selected_scopes) if uses_runtime_toolset else {}
+        for runtime_role, runtime_tool in sorted(runtime_tools.items()):
+            _add_artifact_path(args, "-runtime_tool", runtime_tool, format = runtime_role + "=%s")
+        for slot in sorted(node["outputs"]):
+            _add_artifact_path(args, "-recipe_output", outputs[node_id + ":" + slot], format = slot + "=%s")
+
+        transitive_inputs = [
+            additional_inputs[key]
+            for key in _node_source_closure_keys(node, parsed.sources)
+        ]
+        if input_set_inputs != None:
+            transitive_inputs.append(input_set_inputs)
+        for tree in sorted(node["trees"]):
+            tree_path_suffix = ""
+            if tree == "kernel":
+                kernel_tree = _family_kernel_tree_binding(
+                    node_id,
+                    source_projection_trees,
+                    source_artifacts,
+                    opaque_source_runfiles,
+                )
+                tree_path = kernel_tree.path
+                tree_path_suffix = kernel_tree.path_suffix
+                if kernel_tree.private:
+                    # This File is already an exact projected input. It exists
+                    # only to keep the tree argument path-mappable; the runner
+                    # replaces it with its private projection before use.
+                    args.add("-private_input_tree", tree)
+
+                # Opaque readers retain exactly the old complete source union
+                # through one runfiles aggregate below, not a flat source depset.
+
+            elif tree in _TREES:
+                tree_input = _family_tree_input(tree, input_directories, output_directories)
+                tree_path = tree_input.path
+
+                # A family store is always physically content-addressed,
+                # including immutable prior-stage stores. Reconstruct the
+                # recipe's exact logical view from producer bindings so a
+                # WorkingTrees copy cannot observe nodes/<id>/<slot> paths or
+                # artifacts belonging only to another variant.
+                args.add(tree_input.projection_argument, tree)
+            elif tree in input_directories and tree not in ["plan"] + _TOOLSET_DIRECTORIES.values() and not _family_execution_directory(tree):
+                directory = input_directories[tree]
+                tree_path = directory.directory
+                inputs.append(directory.directory)
+            else:
+                fail("mapped Linux family node %s requires unavailable %s tree" % (node_id, tree))
+            args.add_joined("-input_tree", [tree + "=", tree_path, tree_path_suffix], expand_directories = False, join_with = "")
+
+        selected_tool = None
+        selected_companion_tools = []
+        if role != "generated":
+            selected_binding = _scoped_tool_binding(scope, role)
+            selected_tool = tools.get(selected_binding)
+            selected_executable = _tool_executable(selected_tool)
+            _add_artifact_path(args, "-tool", selected_executable, format = role + "=%s")
+            inputs.append(selected_executable)
+            selected_companion_tools.extend(_companion_tool_bindings(tools, selected_binding, scope))
+        selected_auxiliary_tools = []
+        for auxiliary_binding in sorted(node["tools"]):
+            descriptor = node["tools"][auxiliary_binding]
+            configured_binding = _scoped_tool_binding(descriptor.scope, descriptor.role)
+            auxiliary_tool = tools.get(configured_binding)
+            auxiliary_executable = _tool_executable(auxiliary_tool)
+            _add_artifact_path(args, "-tool", auxiliary_executable, format = auxiliary_binding + "=%s")
+            inputs.append(auxiliary_executable)
+            selected_auxiliary_tools.append(auxiliary_tool)
+            selected_companion_tools.extend(_companion_tool_bindings(tools, configured_binding, scope))
+            auxiliary_contract_roles = [(auxiliary_binding, configured_binding)]
+            recipe_companion_role = _driver_link_contract_role(auxiliary_binding)
+            configured_companion_role = _driver_link_contract_role(configured_binding)
+            if configured_companion_role != None and action_contracts.get(configured_companion_role) != None:
+                auxiliary_contract_roles.append((recipe_companion_role, configured_companion_role))
+            for recipe_contract_role, contract_role in auxiliary_contract_roles:
+                contract = action_contracts.get(contract_role)
+                if contract == None:
+                    continue
+                args.add("-auxiliary_action_role", recipe_contract_role)
+                for argument in contract.arguments:
+                    _add_rendered_toolchain_action_value(
+                        args,
+                        "-auxiliary_action_arg",
+                        argument,
+                        prefix = recipe_contract_role + "=",
+                    )
+                for environment in contract.environment:
+                    _add_rendered_toolchain_action_value(
+                        args,
+                        "-auxiliary_action_env",
+                        environment,
+                        prefix = recipe_contract_role + "=",
+                    )
+        selected_contract = action_contracts.get(_scoped_tool_binding(scope, _node_action_contract_role(kind, role)))
+        if selected_contract != None:
+            for argument in selected_contract.arguments:
+                _add_rendered_toolchain_action_value(args, "-action_arg", argument)
+            for environment in selected_contract.environment:
+                _add_rendered_toolchain_action_value(args, "-action_env", environment)
+
+        action_outputs = [outputs[node_id + ":" + slot] for slot in sorted(node["outputs"])]
+        working_output = _declare_working_output(template_ctx, work, node_id)
+        _add_artifact_path(args, working_output.argument, working_output.artifact)
+        action_outputs.append(working_output.artifact)
+        if selected_scopes:
+            _add_toolset_artifact_binding_args(
+                args,
+                tools,
+                toolsets,
+                selected_scopes,
+            )
+        action_tools = [tools[_TOOLCHAIN_FILES_PREFIX + selected_scope] for selected_scope in sorted(selected_scopes)] + [tools[_TOOLSET_MANIFEST_PREFIX + selected_scope] for selected_scope in sorted(selected_scopes)] + ([selected_tool] if selected_tool != None else []) + selected_auxiliary_tools + selected_companion_tools
+        if opaque_source_runfiles != None:
+            action_tools.append(opaque_source_runfiles)
+        transport = args.finish(tools["runner"], work, node_id, depset(inputs, transitive = transitive_inputs), action_tools)
+        inputs.extend(transport.inputs)
+        template_ctx.run(
+            executable = tools["runner"],
+            inputs = depset(inputs, transitive = transitive_inputs),
+            tools = action_tools,
+            outputs = action_outputs,
+            arguments = transport.arguments,
+            progress_message = "Building Linux %s/%s node %s" % (stage, kind, node_id[:12]),
+        )
+
+    if not emit_views:
+        return
+    copy_tool = tools.get(_scoped_tool_binding("target", "actionfile"))
+    if copy_tool == None:
+        fail("mapped Linux family expansion requires the target actionfile tool")
+    for variant in sorted(parsed.views):
+        variant_validations = parsed.validations.get(variant, {})
+        views_by_tree = {tree: {} for tree in _FAMILY_VIEW_TREES}
+        for view in parsed.views[variant].values():
+            views_by_tree[view.tree][view.artifact_path] = view
+        for tree in _FAMILY_VIEW_TREES:
+            selected_views = [views_by_tree[tree][path] for path in sorted(views_by_tree[tree])]
+            _composed_tree_base_paths(
+                [],
+                [view.artifact_path for view in selected_views],
+                "%s %s view" % (variant, tree),
+            )
+            if not selected_views:
+                continue
+            directory_key = _family_view_directory_key(variant, tree)
+            directory = output_directories.get(directory_key)
+            if directory == None:
+                fail("mapped Linux family plan declares unavailable view %s" % directory_key)
+            store_root = output_directories.get(tree)
+            if store_root == None:
+                fail("mapped Linux family view %s/%s has no current content-addressed store" % (variant, tree))
+            args = template_ctx.args()
+            _add_artifact_path(args, "-family_view_plan_root", input_directories["plan"].directory)
+            args.add("-family_view_variant", variant)
+            args.add("-family_view_tree", tree)
+            _add_artifact_path(args, "-family_view_store_root", store_root)
+            _add_artifact_path(args, "-family_view_output_root", directory)
+            args.add("-family_view_expected_count", len(selected_views))
+            args.add("-preserve_mode")
+            inputs = list(execution.proof) if execution != None else []
+            view_outputs = []
+            for validation_key in sorted(variant_validations):
+                validation = variant_validations[validation_key]
+                output_key = validation.node_id + ":" + validation.slot
+                validation_input = outputs.get(output_key)
+                if validation_input == None:
+                    descriptor = parsed.declared_outputs.get(output_key)
+                    if descriptor != None:
+                        validation_input = prior_outputs.get(descriptor.tree + ":" + _family_store_path(validation.node_id, validation.slot))
+                if validation_input == None:
+                    fail("mapped Linux family view %s/%s cannot resolve validation %s" % (variant, tree, validation_key))
+                inputs.extend([validation.marker, validation_input])
+            for view in selected_views:
+                source = outputs.get(view.node_id + ":" + view.slot)
+                if source == None:
+                    fail("mapped Linux family view references noncurrent producer %s:%s" % (view.node_id, view.slot))
+                output = template_ctx.declare_file(view.artifact_path, directory = directory)
+                inputs.extend([view.marker, source])
+                view_outputs.append(output)
+            template_ctx.run(
+                executable = _tool_executable(copy_tool),
+                inputs = inputs,
+                tools = [copy_tool],
+                outputs = view_outputs,
+                arguments = [args],
+                progress_message = "Projecting Linux %s %s view %%{label}" % (variant, tree),
+            )
 
 def _tool_file_path_index_from_list(files):
     path_to_file = {}
@@ -2243,42 +3876,113 @@ def _project(ctx, tree, path, output, manifest = None):
         mnemonic = "LinuxMappedProjection",
     )
 
-def _stage_resolved_object_tree(ctx, resolved, auto_conf, auto_conf_cmd, autoconf, rustc_cfg, kernel_release):
-    """Creates the immutable config/object view available before host actions."""
-    tree = ctx.actions.declare_directory(ctx.label.name + ".tree-prep-base")
-    copies = {
-        ".config": resolved,
-        "include/config/auto.conf": auto_conf,
-        "include/config/auto.conf.cmd": auto_conf_cmd,
-        "include/config/kernel.release": kernel_release,
-        "include/generated/autoconf.h": autoconf,
-        "include/generated/rustc_cfg": rustc_cfg,
-    }
-    args = ctx.actions.args()
-    _add_artifact_path(args, "-tree_out", tree)
-    for destination in sorted(copies):
-        _add_artifact_path(args, "-copy", copies[destination], format = destination + "=%s")
-    ctx.actions.run(
-        executable = ctx.executable._actionfile,
-        inputs = depset(copies.values()),
-        outputs = [tree],
-        arguments = [args],
-        execution_requirements = {"supports-path-mapping": "1"},
-        mnemonic = "LinuxMappedPrepBase",
-        progress_message = "Staging resolved Linux pre-host object tree %{label}",
-    )
-    return tree
-
-def _linux_mapped_kernel_impl(ctx):
-    validate_linux_module_make_vars(ctx.attr.module_make_vars, str(ctx.label))
-    target_execution_platform = linux_execution_platform_label(ctx.attr._target_execution_platform)
-    host_execution_platform = linux_execution_platform_label(ctx.attr._host_execution_platform)
+def _validate_family_execution_platforms(owner, target_execution_platform, host_execution_platform):
+    # Kbuild chooses recipes from source and configuration data at execution
+    # time, and one recipe can combine both scopes (for example, target rustc
+    # invoking a host linker). Splitting the stages across execution platforms
+    # would therefore place part of a mixed-tool action on the wrong worker.
     if target_execution_platform != host_execution_platform:
         fail("%s requires target and host tools on one execution platform for source-selected mixed-tool actions; got target %s and host %s" % (
-            ctx.label,
+            owner,
             target_execution_platform,
             host_execution_platform,
         ))
+
+def linux_test_validate_family_execution_platforms(owner, target_execution_platform, host_execution_platform):
+    _validate_family_execution_platforms(owner, target_execution_platform, host_execution_platform)
+
+def _register_family_execution_segment(ctx, segment, initial, plans, stores, cut_stores, base_inputs, map_inputs, selection, observed_headers, observed_artifacts, view_trees, tools, params, requirements):
+    """Registers the actual cut/final template with exact typed store bindings."""
+    store_prefix = ctx.label.name + (".cut" if initial else "")
+    inputs = dict(base_inputs)
+    inputs["plan"] = plans[segment.name]
+    inputs["execution"] = selection
+    if not initial:
+        inputs["observed-headers"] = observed_headers
+        inputs["observed-artifacts"] = observed_artifacts
+        for tree in segment.output_trees:
+            inputs["cut-" + tree] = cut_stores[tree]
+    for tree in segment.input_trees:
+        inputs[tree] = stores[tree]
+    outputs = {
+        "work": ctx.actions.declare_directory(store_prefix + ".tree-work-" + segment.name),
+    }
+    for tree in segment.output_trees:
+        store = ctx.actions.declare_directory(store_prefix + ".tree-store-" + tree)
+        stores[tree] = store
+        outputs[tree] = store
+    if segment.emit_views and not initial:
+        for variant in sorted(view_trees):
+            for tree in _FAMILY_VIEW_TREES:
+                output = ctx.actions.declare_directory(ctx.label.name + "." + variant + ".tree-" + tree)
+                view_trees[variant][tree] = output
+                outputs[_family_view_directory_key(variant, tree)] = output
+    params = dict(params)
+    params["family_emit_views"] = segment.emit_views and not initial
+    params["family_scope"] = segment.scope
+    params["family_stages"] = ",".join(segment.stages)
+    arguments = {
+        "implementation": expand_linux_family_plan,
+        "input_directories": inputs,
+        "additional_inputs": map_inputs,
+        "output_directories": outputs,
+        "tools": tools,
+        "additional_params": params,
+        "env": {},
+        "execution_requirements": requirements,
+        "mnemonic": segment.mnemonic + ("Cut" if initial else ""),
+    }
+    if segment.scope == "host":
+        arguments["exec_group"] = "host_cc"
+    else:
+        arguments["toolchain"] = CC_TOOLCHAIN_TYPE
+    ctx.actions.map_directory(**arguments)
+
+def linux_test_register_family_execution_segment(ctx, **kwargs):
+    _register_family_execution_segment(ctx, **kwargs)
+
+def _family_variant_plan_outputs(ctx, variant_names, initial):
+    records = {}
+    outputs = []
+    args = ctx.actions.args()
+    for variant in sorted(variant_names):
+        prefix = ctx.label.name + "." + variant
+        config_prefix = prefix + ".initial" if initial else prefix
+        record = struct(
+            arch = ctx.actions.declare_file(config_prefix + ".arch"),
+            auto_conf = ctx.actions.declare_file(config_prefix + ".auto.conf"),
+            auto_conf_cmd = ctx.actions.declare_file(config_prefix + ".auto.conf.cmd"),
+            autoconf = ctx.actions.declare_file(config_prefix + ".autoconf.h"),
+            kernel_release = ctx.actions.declare_file(config_prefix + ".kernel.release"),
+            resolved = ctx.actions.declare_file(config_prefix + ".config"),
+            rustc_cfg = ctx.actions.declare_file(config_prefix + ".rustc_cfg"),
+            snapshot = ctx.actions.declare_file(prefix + (".action-plan.json.gz" if initial else ".observed-action-plan.json.gz")),
+        )
+        records[variant] = record
+        for flag, output in [
+            ("-family_plan_resolved_arch_out", record.arch),
+            ("-family_plan_resolved_config_out", record.resolved),
+            ("-family_plan_resolved_auto_conf_out", record.auto_conf),
+            ("-family_plan_resolved_auto_conf_cmd_out", record.auto_conf_cmd),
+            ("-family_plan_resolved_autoconf_out", record.autoconf),
+            ("-family_plan_resolved_rustc_cfg_out", record.rustc_cfg),
+            ("-family_plan_resolved_kernel_release_out", record.kernel_release),
+            ("-family_plan_snapshot_out", record.snapshot),
+        ]:
+            _add_artifact_path(args, flag, output, format = variant + "=%s")
+            outputs.append(output)
+    return records, outputs, args
+
+def _linux_mapped_kernel_family_impl(ctx):
+    validate_linux_module_make_vars(ctx.attr.module_make_vars, str(ctx.label))
+    source_runfiles = validate_linux_source_runfiles(
+        ctx.attr.source_runfiles[DefaultInfo],
+        ctx.files.source_files,
+        ctx.file.source_root,
+    )
+    target_execution_platform = linux_execution_platform_label(ctx.attr._target_execution_platform)
+    host_execution_platform = linux_execution_platform_label(ctx.attr._host_execution_platform)
+    _validate_family_execution_platforms(ctx.label, target_execution_platform, host_execution_platform)
     target_cc = find_cpp_toolchain(ctx)
     host_cc = host_cc_toolchain(ctx)
     target_rust = execution_rust_toolchain(ctx, "_target_rust_toolchain", target_execution_platform)
@@ -2652,68 +4356,156 @@ def _linux_mapped_kernel_impl(ctx):
         toolchain = CC_TOOLCHAIN_TYPE,
     )
 
-    # Kconfig replay fixes the exact selected configuration.  Kbuild is then
-    # evaluated symbolically in a third planner invocation so every cc-option,
-    # as-option, ld-option, source try-run, and compiler-derived shell query is
-    # an execution action under the selected target or host toolchain.  Like
-    # Kconfig discovery, this planner receives action paths only as inert
-    # strings and has neither compiler binaries nor toolchain closures.
+    variant_overlays = {"base": None}
+    for variant, target_overlay in ctx.attr.overlays.items():
+        validate_linux_overlay_name(variant)
+        files = target_overlay[DefaultInfo].files.to_list()
+        if len(files) != 1:
+            fail("%s overlay %s must provide exactly one file, got %d" % (ctx.label, variant, len(files)))
+        variant_overlays[variant] = files[0]
+
+    # Kconfig replay fixes each exact selected configuration. Discovery remains
+    # variant-specific because overlays can change Kbuild's requested probes,
+    # but request/node IDs are already content-addressed. Generate the fragments
+    # independently, then union them before registering any probe action so an
+    # identical request executes once for the complete image family.
+    kbuild_probe_plan_fragments = {}
+    public_configs = {}
+    for variant in sorted(variant_overlays):
+        overlay = variant_overlays[variant]
+        prefix = ctx.label.name + "." + variant
+        kbuild_probe_plan = ctx.actions.declare_directory(prefix + ".kbuild-probe-plan-fragment")
+        kbuild_probe_args = ctx.actions.args()
+        kbuild_probe_args.add("-root", ctx.file.source_root)
+        kbuild_probe_args.add("-srctree", ctx.file.source_root)
+        kbuild_probe_args.add("-kbuild", ctx.file.kbuild)
+        _add_artifact_path(kbuild_probe_args, "-resolve_config", ctx.file.config)
+        if overlay != None:
+            _add_artifact_path(kbuild_probe_args, "-resolve_config_overlay", overlay)
+        kbuild_probe_args.add("-config_mode", ctx.attr.config_mode)
+        kbuild_probe_args.add("-kernel_version", ctx.attr.version)
+        _add_kernel_kbuild_goals(kbuild_probe_args)
+        _add_artifact_path(kbuild_probe_args, "-target_toolset_identity", target_toolset_identity)
+        _add_artifact_path(kbuild_probe_args, "-host_toolset_identity", host_toolset_identity)
+        _add_artifact_path(kbuild_probe_args, "-target_toolset_manifest", target_toolset_manifest)
+        _add_artifact_path(kbuild_probe_args, "-host_toolset_manifest", host_toolset_manifest)
+        _add_artifact_path(kbuild_probe_args, "-target_probe_results", target_probe_results)
+        _add_artifact_path(kbuild_probe_args, "-host_probe_results", host_probe_results)
+        _add_artifact_path(kbuild_probe_args, "-host_kconfig_probe_results", host_kconfig_probe_results)
+        _add_artifact_path(kbuild_probe_args, "-target_kconfig_probe_results", target_kconfig_probe_results)
+        _add_artifact_path(kbuild_probe_args, "-kbuild_probe_plan_out", kbuild_probe_plan)
+        _add_host_dependency_variables(kbuild_probe_args, libelf)
+        if rust_source != None:
+            kbuild_probe_args.add("-var", "RUST_LIB_SRC=" + rust_source.root)
+            kbuild_probe_args.add("-source_root_map", rust_source.root + "=" + rust_source.root)
+        for name, value in ctx.attr.module_make_vars.items():
+            kbuild_probe_args.add("-var", name + "=" + value)
+        kbuild_probe_inputs = ctx.files.source_files + [
+            ctx.file.config,
+            ctx.file.kbuild,
+            ctx.file.source_root,
+            target_toolset_identity,
+            host_toolset_identity,
+            target_toolset_manifest,
+            host_toolset_manifest,
+            target_probe_results,
+            host_probe_results,
+            host_kconfig_probe_results,
+            target_kconfig_probe_results,
+        ]
+        if overlay != None:
+            kbuild_probe_inputs.append(overlay)
+
+        # A configuration-only consumer must not wait for Kbuild planning,
+        # generator execution, or cross-config sharing proofs. Resolve it from
+        # the same measured Kconfig inputs used by the execution planner. The
+        # SDK keeps the independently resolved execution configuration below.
+        config_args = ctx.actions.args()
+        config_args.add("-root", ctx.file.source_root)
+        config_args.add("-srctree", ctx.file.source_root)
+        config_args.add("-config_mode", ctx.attr.config_mode)
+        config_args.add("-kernel_version", ctx.attr.version)
+        for flag, artifact in [
+            ("-resolve_config", ctx.file.config),
+            ("-target_toolset_identity", target_toolset_identity),
+            ("-host_toolset_identity", host_toolset_identity),
+            ("-target_toolset_manifest", target_toolset_manifest),
+            ("-host_toolset_manifest", host_toolset_manifest),
+            ("-target_probe_results", target_probe_results),
+            ("-host_probe_results", host_probe_results),
+            ("-host_kconfig_probe_results", host_kconfig_probe_results),
+            ("-target_kconfig_probe_results", target_kconfig_probe_results),
+        ]:
+            _add_artifact_path(config_args, flag, artifact)
+        if overlay != None:
+            _add_artifact_path(config_args, "-resolve_config_overlay", overlay)
+        _add_host_dependency_variables(config_args, libelf)
+        if rust_source != None:
+            config_args.add("-var", "RUST_LIB_SRC=" + rust_source.root)
+            config_args.add("-source_root_map", rust_source.root + "=" + rust_source.root)
+        for name, value in ctx.attr.module_make_vars.items():
+            config_args.add("-var", name + "=" + value)
+        config_outputs = {}
+        for flag, suffix in [
+            ("-resolved_config_out", ".config"),
+            ("-resolved_auto_conf_out", ".auto.conf"),
+            ("-resolved_auto_conf_cmd_out", ".auto.conf.cmd"),
+            ("-resolved_autoconf_out", ".autoconf.h"),
+            ("-resolved_rustc_cfg_out", ".rustc_cfg"),
+            ("-resolved_kernel_release_out", ".kernel.release"),
+        ]:
+            artifact = ctx.actions.declare_file(prefix + ".kconfig" + suffix)
+            config_outputs[flag] = artifact
+            _add_artifact_path(config_args, flag, artifact)
+        public_configs[variant] = config_outputs["-resolved_config_out"]
+        ctx.actions.run(
+            executable = ctx.executable._planner,
+            inputs = depset(
+                direct = kbuild_probe_inputs,
+                transitive = [rust_source.files] if rust_source != None else [],
+            ),
+            outputs = config_outputs.values(),
+            arguments = [config_args],
+            execution_requirements = {"supports-path-mapping": "1"},
+            mnemonic = "LinuxKconfigResolve",
+            progress_message = "Resolving Linux %s Kconfig %%{label}" % variant,
+        )
+        ctx.actions.run(
+            executable = ctx.executable._planner,
+            inputs = depset(
+                direct = kbuild_probe_inputs,
+                transitive = [rust_source.files] if rust_source != None else [],
+            ),
+            outputs = [kbuild_probe_plan],
+            arguments = [kbuild_probe_args],
+            execution_requirements = {"supports-path-mapping": "1"},
+            mnemonic = "LinuxKbuildProbePlan",
+            progress_message = "Planning Linux %s Kbuild capability discovery %%{label}" % variant,
+        )
+        kbuild_probe_plan_fragments[variant] = kbuild_probe_plan
+
     kbuild_probe_plan = ctx.actions.declare_directory(ctx.label.name + ".kbuild-probe-plan")
-    host_kbuild_probe_results = ctx.actions.declare_directory(ctx.label.name + ".kbuild-probe-results-host")
-    target_kbuild_probe_results = ctx.actions.declare_directory(ctx.label.name + ".kbuild-probe-results-target")
-    kbuild_probe_args = ctx.actions.args()
-    kbuild_probe_args.add("-root", ctx.file.source_root)
-    kbuild_probe_args.add("-srctree", ctx.file.source_root)
-    kbuild_probe_args.add("-kbuild", ctx.file.kbuild)
-    _add_artifact_path(kbuild_probe_args, "-resolve_config", ctx.file.config)
-    if ctx.file.overlay:
-        kbuild_probe_args.add("-resolve_config_overlay", ctx.file.overlay)
-    kbuild_probe_args.add("-config_mode", ctx.attr.config_mode)
-    kbuild_probe_args.add("-kernel_version", ctx.attr.version)
-    _add_kernel_kbuild_goals(kbuild_probe_args)
-    _add_artifact_path(kbuild_probe_args, "-target_toolset_identity", target_toolset_identity)
-    _add_artifact_path(kbuild_probe_args, "-host_toolset_identity", host_toolset_identity)
-    _add_artifact_path(kbuild_probe_args, "-target_toolset_manifest", target_toolset_manifest)
-    _add_artifact_path(kbuild_probe_args, "-host_toolset_manifest", host_toolset_manifest)
-    _add_artifact_path(kbuild_probe_args, "-target_probe_results", target_probe_results)
-    _add_artifact_path(kbuild_probe_args, "-host_probe_results", host_probe_results)
-    _add_artifact_path(kbuild_probe_args, "-host_kconfig_probe_results", host_kconfig_probe_results)
-    _add_artifact_path(kbuild_probe_args, "-target_kconfig_probe_results", target_kconfig_probe_results)
-    _add_artifact_path(kbuild_probe_args, "-kbuild_probe_plan_out", kbuild_probe_plan)
-    _add_host_dependency_variables(kbuild_probe_args, libelf)
-    if rust_source != None:
-        kbuild_probe_args.add("-var", "RUST_LIB_SRC=" + rust_source.root)
-        kbuild_probe_args.add("-source_root_map", rust_source.root + "=" + rust_source.root)
-    for name, value in ctx.attr.module_make_vars.items():
-        kbuild_probe_args.add("-var", name + "=" + value)
-    kbuild_probe_inputs = ctx.files.source_files + [
-        ctx.file.config,
-        ctx.file.kbuild,
-        ctx.file.source_root,
-        target_toolset_identity,
-        host_toolset_identity,
-        target_toolset_manifest,
-        host_toolset_manifest,
-        target_probe_results,
-        host_probe_results,
-        host_kconfig_probe_results,
-        target_kconfig_probe_results,
-    ]
-    if ctx.file.overlay:
-        kbuild_probe_inputs.append(ctx.file.overlay)
-    kbuild_probe_inputs = depset(
-        direct = kbuild_probe_inputs,
-        transitive = [rust_source.files] if rust_source != None else [],
-    )
+    kbuild_probe_union_args = ctx.actions.args()
+    for variant in sorted(kbuild_probe_plan_fragments):
+        _add_artifact_path(
+            kbuild_probe_union_args,
+            "-probe_plan_union_input",
+            kbuild_probe_plan_fragments[variant],
+            format = variant + "=%s",
+        )
+    _add_artifact_path(kbuild_probe_union_args, "-probe_plan_union_out", kbuild_probe_plan)
     ctx.actions.run(
         executable = ctx.executable._planner,
-        inputs = kbuild_probe_inputs,
+        inputs = [kbuild_probe_plan_fragments[variant] for variant in sorted(kbuild_probe_plan_fragments)],
         outputs = [kbuild_probe_plan],
-        arguments = [kbuild_probe_args],
+        arguments = [kbuild_probe_union_args],
         execution_requirements = {"supports-path-mapping": "1"},
-        mnemonic = "LinuxKbuildProbePlan",
-        progress_message = "Planning Linux Kbuild capability discovery %{label}",
+        mnemonic = "LinuxKbuildProbeUnion",
+        progress_message = "Joining Linux image-family Kbuild probes %{label}",
     )
+
+    host_kbuild_probe_results = ctx.actions.declare_directory(ctx.label.name + ".kbuild-probe-results-host")
+    target_kbuild_probe_results = ctx.actions.declare_directory(ctx.label.name + ".kbuild-probe-results-target")
     ctx.actions.map_directory(
         implementation = expand_linux_probe_plan,
         input_directories = {
@@ -2775,68 +4567,43 @@ def _linux_mapped_kernel_impl(ctx):
         toolchain = CC_TOOLCHAIN_TYPE,
     )
 
-    plans = {
-        stage: ctx.actions.declare_directory(ctx.label.name + ".plan-v4-" + stage)
-        for stage in _STAGES
-    }
-    arch = ctx.actions.declare_file(ctx.label.name + ".arch")
-    resolved = ctx.actions.declare_file(ctx.label.name + ".config")
-    auto_conf = ctx.actions.declare_file(ctx.label.name + ".auto.conf")
-    auto_conf_cmd = ctx.actions.declare_file(ctx.label.name + ".auto.conf.cmd")
-    autoconf = ctx.actions.declare_file(ctx.label.name + ".autoconf.h")
-    rustc_cfg = ctx.actions.declare_file(ctx.label.name + ".rustc_cfg")
-    kernel_release = ctx.actions.declare_file(ctx.label.name + ".kernel.release")
-    output_trees = {key: ctx.actions.declare_directory(ctx.label.name + ".tree-" + key) for key in _TREES}
-    work_trees = {stage: ctx.actions.declare_directory(ctx.label.name + ".tree-work-" + stage) for stage in _STAGES}
+    # Both evaluations retain the same immutable source/tool/probe inputs.
+    # The first selects a conservative generator cut; replay uses its actual
+    # outputs without reparsing a different prepared object tree.
+    initial_variants, initial_outputs, initial_args = _family_variant_plan_outputs(ctx, variant_overlays, True)
+    variants, family_planner_outputs, replay_args = _family_variant_plan_outputs(ctx, variant_overlays, False)
 
-    args = ctx.actions.args()
-    args.add("-root", ctx.file.source_root)
-
-    # Pass the root File itself so output-path mapping remains active. The
-    # planner normalizes a regular-file srctree argument to its parent.
-    args.add("-srctree", ctx.file.source_root)
-    args.add("-kbuild", ctx.file.kbuild)
-    _add_artifact_path(args, "-resolve_config", ctx.file.config)
-    if ctx.file.overlay:
-        args.add("-resolve_config_overlay", ctx.file.overlay)
-    args.add("-config_mode", ctx.attr.config_mode)
-    args.add("-resolved_arch_out", arch)
-    args.add("-resolved_config_out", resolved)
-    args.add("-resolved_auto_conf_out", auto_conf)
-    args.add("-resolved_auto_conf_cmd_out", auto_conf_cmd)
-    args.add("-resolved_autoconf_out", autoconf)
-    args.add("-resolved_rustc_cfg_out", rustc_cfg)
-    args.add("-resolved_kernel_release_out", kernel_release)
-    args.add("-kernel_version", ctx.attr.version)
-    _add_kernel_kbuild_goals(args)
-    _add_artifact_path(args, "-target_toolset_identity", target_toolset_identity)
-    _add_artifact_path(args, "-host_toolset_identity", host_toolset_identity)
-    _add_artifact_path(args, "-target_toolset_manifest", target_toolset_manifest)
-    _add_artifact_path(args, "-host_toolset_manifest", host_toolset_manifest)
-    _add_artifact_path(args, "-target_probe_results", target_probe_results)
-    _add_artifact_path(args, "-host_probe_results", host_probe_results)
-    _add_artifact_path(args, "-host_kconfig_probe_results", host_kconfig_probe_results)
-    _add_artifact_path(args, "-target_kconfig_probe_results", target_kconfig_probe_results)
-    _add_artifact_path(args, "-host_kbuild_probe_results", host_kbuild_probe_results)
-    _add_artifact_path(args, "-target_kbuild_probe_results", target_kbuild_probe_results)
-    _add_host_dependency_variables(args, libelf)
+    family_planner_args = ctx.actions.args()
+    family_planner_args.add("-root", ctx.file.source_root)
+    family_planner_args.add("-srctree", ctx.file.source_root)
+    family_planner_args.add("-kbuild", ctx.file.kbuild)
+    _add_artifact_path(family_planner_args, "-resolve_config", ctx.file.config)
+    family_planner_args.add("-config_mode", ctx.attr.config_mode)
+    family_planner_args.add("-kernel_version", ctx.attr.version)
+    _add_kernel_kbuild_goals(family_planner_args)
+    _add_artifact_path(family_planner_args, "-target_toolset_identity", target_toolset_identity)
+    _add_artifact_path(family_planner_args, "-host_toolset_identity", host_toolset_identity)
+    _add_artifact_path(family_planner_args, "-target_toolset_manifest", target_toolset_manifest)
+    _add_artifact_path(family_planner_args, "-host_toolset_manifest", host_toolset_manifest)
+    _add_artifact_path(family_planner_args, "-target_probe_results", target_probe_results)
+    _add_artifact_path(family_planner_args, "-host_probe_results", host_probe_results)
+    _add_artifact_path(family_planner_args, "-host_kconfig_probe_results", host_kconfig_probe_results)
+    _add_artifact_path(family_planner_args, "-target_kconfig_probe_results", target_kconfig_probe_results)
+    _add_artifact_path(family_planner_args, "-host_kbuild_probe_results", host_kbuild_probe_results)
+    _add_artifact_path(family_planner_args, "-target_kbuild_probe_results", target_kbuild_probe_results)
+    _add_host_dependency_variables(family_planner_args, libelf)
     if rust_source != None:
-        # Kbuild consumes the source root as a normal make variable.  This
-        # canonical path comes from the selected source toolchain's provider
-        # contract, not from rustc's ambient sysroot.
-        args.add("-var", "RUST_LIB_SRC=" + rust_source.root)
-        args.add("-source_root_map", rust_source.root + "=" + rust_source.root)
-    for stage in _STAGES:
-        _add_artifact_path(
-            args,
-            "-action_plan_stage_out",
-            plans[stage],
-            format = stage + "=%s",
-        )
+        family_planner_args.add("-var", "RUST_LIB_SRC=" + rust_source.root)
+        family_planner_args.add("-source_root_map", rust_source.root + "=" + rust_source.root)
     for name, value in ctx.attr.module_make_vars.items():
-        args.add("-var", name + "=" + value)
+        family_planner_args.add("-var", name + "=" + value)
+    for variant in sorted(variants):
+        family_planner_args.add("-family_plan_variant", variant)
+        overlay = variant_overlays[variant]
+        if overlay != None:
+            _add_artifact_path(family_planner_args, "-family_plan_overlay", overlay, format = variant + "=%s")
 
-    planner_inputs = ctx.files.source_files + [
+    family_planner_inputs = ctx.files.source_files + [
         ctx.file.config,
         ctx.file.kbuild,
         ctx.file.source_root,
@@ -2850,270 +4617,404 @@ def _linux_mapped_kernel_impl(ctx):
         target_kconfig_probe_results,
         host_kbuild_probe_results,
         target_kbuild_probe_results,
+    ] + [
+        variant_overlays[variant]
+        for variant in sorted(variant_overlays)
+        if variant_overlays[variant] != None
     ]
-    if ctx.file.overlay:
-        planner_inputs.append(ctx.file.overlay)
-    planner_inputs = depset(
-        direct = planner_inputs,
-        transitive = [rust_source.files] if rust_source != None else [],
-    )
-    planner_outputs = [plans[stage] for stage in _STAGES] + [arch, resolved, auto_conf, auto_conf_cmd, autoconf, rustc_cfg, kernel_release]
+    family_segments = _family_execution_segments()
+    family_plans = {}
+    cut_plans = {}
+    for segment in family_segments:
+        family_plans[segment.name] = ctx.actions.declare_directory(
+            ctx.label.name + ".family-plan-" + segment.name + "-v7",
+        )
+        cut_plans[segment.name] = ctx.actions.declare_directory(
+            ctx.label.name + ".cut-plan-" + segment.name + "-v7",
+        )
+        _add_artifact_path(initial_args, "-family_execution_segment_out", cut_plans[segment.name], format = segment.name + "=%s")
+        _add_artifact_path(replay_args, "-family_execution_segment_out", family_plans[segment.name], format = segment.name + "=%s")
+    execution_cut = ctx.actions.declare_file(ctx.label.name + ".execution-cut.json")
+    cut_selection = ctx.actions.declare_directory(ctx.label.name + ".cut-selection")
+    pinned_selection = ctx.actions.declare_directory(ctx.label.name + ".pinned-selection")
+    observed_headers = ctx.actions.declare_directory(ctx.label.name + ".observed-headers")
+    observed_artifacts = ctx.actions.declare_directory(ctx.label.name + ".observed-artifacts")
+    reuse_report = ctx.actions.declare_file(ctx.label.name + ".reuse-report.json")
+    guard_cpu_profile = ctx.actions.declare_file(ctx.label.name + ".compiler-guards-1.cpu.pprof")
+    guard_heap_profile = ctx.actions.declare_file(ctx.label.name + ".compiler-guards-1.heap.pprof")
+    initial_args.add("-family_execution_mode", "initial")
+    _add_artifact_path(initial_args, "-family_execution_cut_out", execution_cut)
+    _add_artifact_path(initial_args, "-family_execution_selection_out", cut_selection)
+    replay_args.add("-family_execution_mode", "replay")
+    _add_artifact_path(replay_args, "-family_execution_cut_in", execution_cut)
+    _add_artifact_path(replay_args, "-family_execution_pinned_out", pinned_selection)
+    _add_artifact_path(replay_args, "-family_execution_headers_out", observed_headers)
+    _add_artifact_path(replay_args, "-family_execution_artifacts_out", observed_artifacts)
+    _add_artifact_path(replay_args, "-family_execution_reuse_report_out", reuse_report)
+    for variant in sorted(initial_variants):
+        _add_artifact_path(replay_args, "-family_execution_initial_snapshot", initial_variants[variant].snapshot, format = variant + "=%s")
     ctx.actions.run(
         executable = ctx.executable._planner,
-        inputs = planner_inputs,
-        outputs = planner_outputs,
-        arguments = [args],
+        inputs = depset(
+            direct = family_planner_inputs,
+            transitive = [rust_source.files] if rust_source != None else [],
+        ),
+        outputs = initial_outputs + [execution_cut, cut_selection] + [cut_plans[segment.name] for segment in family_segments],
+        arguments = [family_planner_args, initial_args],
         execution_requirements = {"supports-path-mapping": "1"},
-        mnemonic = "LinuxMappedPlan",
-        progress_message = "Resolving Kconfig and planning Kbuild %{label}",
+        mnemonic = "LinuxMappedFamilySnapshotPlan",
+        progress_message = "Planning conservative Linux image-family generator cut %{label}",
     )
 
-    prep_base = _stage_resolved_object_tree(
-        ctx,
-        resolved,
-        auto_conf,
-        auto_conf_cmd,
-        autoconf,
-        rustc_cfg,
-        kernel_release,
-    )
-
-    common_inputs = {
-        _HOST_DEPS_TREE: libelf.tree,
-        "host_toolset_identity": host_toolset_identity,
-        "prep_base": prep_base,
-        "target_toolset_identity": target_toolset_identity,
-    }
+    view_trees = {}
+    for variant in sorted(variants):
+        view_trees[variant] = {}
     map_inputs = {
-        "auto_conf": auto_conf,
-        "auto_conf_cmd": auto_conf_cmd,
-        "autoconf": autoconf,
-        "kernel_release": kernel_release,
-        "resolved_config": resolved,
-        "rustc_cfg": rustc_cfg,
         "rust_source_files": rust_source.files if rust_source != None else depset(),
         "source_files": depset(ctx.files.source_files),
         "source_root": ctx.file.source_root,
     }
+    family_stores = {}
 
-    def mapped_tools(runner, scope):
-        return linux_map_directory_tools(
-            runner,
-            scope,
-            target_tools,
-            target_toolchain_files,
-            target_toolset_manifest,
-            target_toolset_anchors,
-            host_tools,
-            host_toolchain_files,
-            host_toolset_manifest,
-            host_toolset_anchors,
-            target.companion_tools,
-            host.companion_tools,
-        )
-
-    def mapped_params(stage, input_tree_aliases = {}, output_tree_bases = {}):
-        return linux_map_directory_params(
-            stage,
-            source_prefix,
-            target.arguments,
-            target.environments,
-            host.arguments,
-            host.environments,
-            input_tree_aliases = input_tree_aliases,
-            output_tree_bases = output_tree_bases,
-        )
-
-    mapped_requirements = _merge_execution_requirements(
+    # Some prehost/bootstrap recipes mention the logical prep root even though
+    # their exact config inputs are projected from content-addressed capsule
+    # producers. A map_directory callback still needs a typed directory
+    # artifact to path-map that root. Create a genuinely empty seed: the runner
+    # builds each private prep view exclusively from exact input bindings.
+    prep_seed = ctx.actions.declare_directory(ctx.label.name + ".tree-prep-seed")
+    prep_seed_args = ctx.actions.args()
+    _add_artifact_path(prep_seed_args, "-tree_out", prep_seed)
+    ctx.actions.run(
+        executable = ctx.executable._actionfile,
+        inputs = [],
+        outputs = [prep_seed],
+        arguments = [prep_seed_args],
+        execution_requirements = {"supports-path-mapping": "1"},
+        mnemonic = "LinuxMappedFamilyPrepSeed",
+        progress_message = "Creating empty Linux family prep root %{label}",
+    )
+    base_family_inputs = {
+        _HOST_DEPS_TREE: libelf.tree,
+        "host_toolset_identity": host_toolset_identity,
+        "prep": prep_seed,
+        "target_toolset_identity": target_toolset_identity,
+    }
+    family_requirements = _merge_execution_requirements(
         "target toolset",
         target_requirements,
         [("host toolset", host_requirements)],
     )
-    mapped_requirements["supports-path-mapping"] = "1"
-    ctx.actions.map_directory(
-        implementation = expand_linux_plan_stage,
-        input_directories = dict(common_inputs, plan = plans["prehost"]),
-        additional_inputs = map_inputs,
-        output_directories = {"prehost": output_trees["prehost"], "work": work_trees["prehost"]},
-        tools = mapped_tools(ctx.attr._host_recipe_runner[DefaultInfo].files_to_run, "host"),
-        additional_params = mapped_params(
-            "prehost",
-            input_tree_aliases = {"prep": "prep_base"},
-        ),
-        env = {},
-        execution_requirements = mapped_requirements,
-        exec_group = "host_cc",
-        mnemonic = "LinuxMappedPrehost",
-    )
-    ctx.actions.map_directory(
-        implementation = expand_linux_plan_stage,
-        input_directories = dict(common_inputs, plan = plans["bootstrap"], prehost = output_trees["prehost"]),
-        additional_inputs = map_inputs,
-        output_directories = {"bootstrap": output_trees["bootstrap"], "work": work_trees["bootstrap"]},
-        tools = mapped_tools(ctx.attr._recipe_runner[DefaultInfo].files_to_run, "target"),
-        additional_params = mapped_params(
-            "bootstrap",
-            input_tree_aliases = {"prep": "prep_base"},
-        ),
-        env = {},
-        execution_requirements = mapped_requirements,
-        mnemonic = "LinuxMappedBootstrap",
-        toolchain = CC_TOOLCHAIN_TYPE,
-    )
-    ctx.actions.map_directory(
-        implementation = expand_linux_plan_stage,
-        input_directories = dict(common_inputs, plan = plans["host"], prehost = output_trees["prehost"], bootstrap = output_trees["bootstrap"]),
-        additional_inputs = map_inputs,
-        output_directories = {"host": output_trees["host"], "work": work_trees["host"]},
-        tools = mapped_tools(ctx.attr._host_recipe_runner[DefaultInfo].files_to_run, "host"),
-        additional_params = mapped_params(
-            "host",
-            input_tree_aliases = {"prep": "prep_base"},
-        ),
-        env = {},
-        execution_requirements = mapped_requirements,
-        exec_group = "host_cc",
-        mnemonic = "LinuxMappedHost",
-    )
-    ctx.actions.map_directory(
-        implementation = expand_linux_plan_stage,
-        input_directories = dict(common_inputs, plan = plans["prep"], prehost = output_trees["prehost"], bootstrap = output_trees["bootstrap"], host = output_trees["host"]),
-        additional_inputs = map_inputs,
-        output_directories = {"prep": output_trees["prep"], "work": work_trees["prep"]},
-        tools = mapped_tools(ctx.attr._recipe_runner[DefaultInfo].files_to_run, "target"),
-        additional_params = mapped_params(
-            "prep",
-            input_tree_aliases = {"prep": "prep_base"},
-            output_tree_bases = {"prep": "prep_base"},
-        ),
-        env = {},
-        execution_requirements = mapped_requirements,
-        mnemonic = "LinuxMappedPrep",
-        toolchain = CC_TOOLCHAIN_TYPE,
-    )
-    target_input_directories = {
-        key: value
-        for key, value in common_inputs.items()
-        if key != "prep_base"
-    }
-    target_input_directories.update({
-        "plan": plans["target"],
-        "prehost": output_trees["prehost"],
-        "bootstrap": output_trees["bootstrap"],
-        "host": output_trees["host"],
-        "prep": output_trees["prep"],
-    })
-    target_outputs = {key: output_trees[key] for key in _TREES if key not in ["prehost", "bootstrap", "prep", "host"]}
-    target_outputs["work"] = work_trees["target"]
-    ctx.actions.map_directory(
-        implementation = expand_linux_plan_stage,
-        input_directories = target_input_directories,
-        additional_inputs = map_inputs,
-        output_directories = target_outputs,
-        tools = mapped_tools(ctx.attr._recipe_runner[DefaultInfo].files_to_run, "target"),
-        additional_params = mapped_params("target"),
-        env = {},
-        execution_requirements = mapped_requirements,
-        mnemonic = "LinuxMappedTarget",
-        toolchain = CC_TOOLCHAIN_TYPE,
-    )
+    family_requirements["supports-path-mapping"] = "1"
 
-    image = ctx.actions.declare_file(ctx.label.name + ".image")
-    vmlinux = ctx.actions.declare_file(ctx.label.name + ".vmlinux")
-    system_map = ctx.actions.declare_file(ctx.label.name + ".System.map")
-    module_symvers = ctx.actions.declare_file(ctx.label.name + ".Module.symvers")
-    modules_order = ctx.actions.declare_file(ctx.label.name + ".modules.order")
-    modules_builtin = ctx.actions.declare_file(ctx.label.name + ".modules.builtin")
-    modules_builtin_modinfo = ctx.actions.declare_file(ctx.label.name + ".modules.builtin.modinfo")
-    modules_manifest = ctx.actions.declare_file(ctx.label.name + ".modules.manifest")
-    _project(ctx, output_trees["image"], "kernel", image)
-    _project(ctx, output_trees["vmlinux"], "vmlinux", vmlinux)
-    _project(ctx, output_trees["vmlinux"], "System.map", system_map)
-    _project(ctx, output_trees["metadata"], "Module.symvers", module_symvers)
-    _project(ctx, output_trees["modules"], "modules.order", modules_order)
-    _project(ctx, output_trees["metadata"], "modules.builtin", modules_builtin)
-    _project(ctx, output_trees["metadata"], "modules.builtin.modinfo", modules_builtin_modinfo)
-    _project(ctx, output_trees["metadata"], "modules.manifest", modules_manifest)
+    # Bazel 9 selects one ActionOwner/exec group for an entire map_directory
+    # template; template_ctx.run has no per-expanded-action exec_group. Keep
+    # the union plan whole, but hand its content-addressed trees through the
+    # minimum host/target segments imposed by the kernel's stage order.
+    cut_stores = {}
+    guard_rounds = []
+    for initial in [True, False]:
+        selected_plans = cut_plans if initial else family_plans
+        selected_stores = cut_stores if initial else family_stores
+        if not initial:
+            for tree in sorted(cut_stores):
+                _add_artifact_path(replay_args, "-family_execution_store", cut_stores[tree], format = tree + "=%s")
 
-    kernel = LinuxKernelInfo(
-        arch = arch,
-        version = ctx.attr.version,
-        kernel_release = kernel_release,
-        image = image,
-        vmlinux = vmlinux,
-        config = resolved,
-        system_map = system_map,
-    )
-    module_tree = LinuxModuleTreeInfo(tree = output_trees["modules"], manifest = modules_manifest)
+            # Supplemental queries are discovered only from files reached by
+            # the original-source scanner after the generator cut completed.
+            # They use independent frozen plans: missing ordinary Kbuild
+            # results never become a late discovery request.
+            guard_inputs = []
+            for round_index in range(3):
+                prefix = ctx.label.name + ".compiler-guards-" + str(round_index)
+                guard_manifest = ctx.actions.declare_file(prefix + ".json")
+                guard_plan = ctx.actions.declare_directory(prefix + ".plan")
+                guard_args = ctx.actions.args()
+                guard_args.add("-family_execution_mode", "guards")
+                _add_artifact_path(guard_args, "-family_execution_cut_in", execution_cut)
+                _add_artifact_path(guard_args, "-family_compiler_guard_manifest_out", guard_manifest)
+                _add_artifact_path(guard_args, "-family_compiler_guard_plan_out", guard_plan)
+                for variant in sorted(initial_variants):
+                    _add_artifact_path(guard_args, "-family_execution_initial_snapshot", initial_variants[variant].snapshot, format = variant + "=%s")
+                for tree in sorted(cut_stores):
+                    _add_artifact_path(guard_args, "-family_execution_store", cut_stores[tree], format = tree + "=%s")
+                for previous_index, previous in enumerate(guard_rounds):
+                    for flag, artifact in previous.items():
+                        _add_artifact_path(guard_args, flag, artifact, format = str(previous_index) + "=%s")
+                guard_action_inputs = depset(
+                    direct = family_planner_inputs + [execution_cut] +
+                             [initial_variants[name].snapshot for name in sorted(initial_variants)] +
+                             [cut_stores[tree] for tree in sorted(cut_stores)] + guard_inputs,
+                    transitive = [rust_source.files] if rust_source != None else [],
+                )
+                ctx.actions.run(
+                    executable = ctx.executable._planner,
+                    inputs = guard_action_inputs,
+                    outputs = [guard_manifest, guard_plan],
+                    arguments = [family_planner_args, guard_args],
+                    execution_requirements = {"supports-path-mapping": "1"},
+                    mnemonic = "LinuxMappedCompilerGuardPlan",
+                    progress_message = "Discovering reached-header compiler guards %{label}",
+                )
+                if round_index == 1:
+                    # An opt-in diagnostic samples the exact second-round
+                    # workload without demanding later guards or final replay.
+                    # The runner redirects only disposable output operands;
+                    # its profile is never an input or receipt for the build.
+                    profile_args = ctx.actions.args()
+                    profile_args.add("-planner", ctx.executable._planner)
+                    _add_artifact_path(profile_args, "-out", guard_cpu_profile)
+                    profile_args.add("-duration", "180s")
+                    profile_args.add("--")
+                    ctx.actions.run(
+                        executable = ctx.executable._profile_capture,
+                        inputs = guard_action_inputs,
+                        tools = [ctx.attr._planner[DefaultInfo].files_to_run],
+                        outputs = [guard_cpu_profile],
+                        arguments = [profile_args, family_planner_args, guard_args],
+                        execution_requirements = {"supports-path-mapping": "1", "no-cache": "1"},
+                        mnemonic = "LinuxMappedCompilerGuardCPUProfile",
+                        progress_message = "Sampling Linux compiler-guard planner CPU %{label}",
+                    )
 
-    # The SDK provider is intentionally tree-based: external modules must run
-    # their own execution-time planner and may not inspect resolved CONFIG_*
-    # values during analysis.
-    module_sdk = LinuxModuleSdkInfo(
-        auto_conf = auto_conf,
-        auto_conf_cmd = auto_conf_cmd,
-        autoconf = autoconf,
-        config = resolved,
-        host_action_args = host.arguments,
-        host_action_environments = host.environments,
-        host_action_requirements = host.requirements_by_role,
-        host_companion_tools = host.companion_tools,
-        host_deps = libelf.tree,
-        host_execution_platform = host_execution_platform,
-        host_probe_results = host_probe_results,
-        host_probe_runner = ctx.attr._host_probe_runner[DefaultInfo].files_to_run,
-        host_recipe_runner = ctx.attr._host_recipe_runner[DefaultInfo].files_to_run,
-        host_tool_files = host_tools,
-        host_toolchain_files = host_toolchain_files,
-        host_toolset_identity = host_toolset_identity,
-        host_toolset_anchors = host_toolset_anchors,
-        host_toolset_manifest = host_toolset_manifest,
-        kbuild = ctx.file.kbuild,
-        host_kconfig_probe_results = host_kconfig_probe_results,
-        kernel_key = str(ctx.label),
-        kernel_release = kernel_release,
-        libelf_compile_flags = libelf.compile_flags,
-        libelf_link_flags = libelf.link_flags,
-        make_vars = ctx.attr.module_make_vars,
-        rust_source_files = rust_source.files if rust_source != None else depset(),
-        rust_source_root = rust_source_root,
-        rustc_cfg = rustc_cfg,
-        sdk = output_trees["sdk"],
-        source = depset(ctx.files.source_files),
-        source_root = ctx.file.source_root,
-        target_action_args = target.arguments,
-        target_action_environments = target.environments,
-        target_action_requirements = target.requirements_by_role,
-        target_companion_tools = target.companion_tools,
-        target_execution_platform = target_execution_platform,
-        target_probe_results = target_probe_results,
-        target_probe_runner = ctx.attr._probe_runner[DefaultInfo].files_to_run,
-        target_recipe_runner = ctx.attr._recipe_runner[DefaultInfo].files_to_run,
-        target_kconfig_probe_results = target_kconfig_probe_results,
-        target_tool_files = target_tools,
-        target_toolchain_files = target_toolchain_files,
-        target_toolset_identity = target_toolset_identity,
-        target_toolset_anchors = target_toolset_anchors,
-        target_toolset_manifest = target_toolset_manifest,
-        version = ctx.attr.version,
-    )
-    return [
-        DefaultInfo(files = depset([image])),
-        kernel,
-        module_sdk,
-        module_tree,
-        OutputGroupInfo(
-            arch = depset([arch]),
-            config = depset([resolved]),
+                    # Heap sampling is linked only into this diagnostic binary.
+                    # Do not add its outputs or tool closure to ordinary actions.
+                    heap_args = ctx.actions.args()
+                    heap_args.add("-planner", ctx.executable._heap_planner)
+                    _add_artifact_path(heap_args, "-out", guard_heap_profile)
+                    heap_args.add("-duration", "180s")
+                    heap_args.add("-kind", "heap")
+                    heap_args.add("--")
+                    ctx.actions.run(
+                        executable = ctx.executable._profile_capture,
+                        inputs = guard_action_inputs,
+                        tools = [ctx.attr._heap_planner[DefaultInfo].files_to_run],
+                        outputs = [guard_heap_profile],
+                        arguments = [heap_args, family_planner_args, guard_args],
+                        execution_requirements = {"supports-path-mapping": "1", "no-cache": "1"},
+                        mnemonic = "LinuxMappedCompilerGuardHeapProfile",
+                        progress_message = "Sampling Linux compiler-guard planner heap %{label}",
+                    )
+                guard_results = {}
+                for scope in ["host", "target"]:
+                    host_scope = scope == "host"
+                    selected = host if host_scope else target
+                    guard_results[scope] = ctx.actions.declare_directory(prefix + ".results-" + scope)
+                    guard_directories = {
+                        _HOST_DEPS_TREE: libelf.tree,
+                        "host_toolset_identity": host_toolset_identity,
+                        "plan": guard_plan,
+                    }
+                    if not host_scope:
+                        guard_directories["host_results"] = guard_results["host"]
+                        guard_directories["target_toolset_identity"] = target_toolset_identity
+                    ctx.actions.map_directory(
+                        implementation = expand_linux_probe_plan,
+                        input_directories = guard_directories,
+                        additional_inputs = probe_source_inputs,
+                        output_directories = {"results": guard_results[scope]},
+                        tools = linux_probe_map_directory_tools(
+                            ctx.attr._host_probe_runner[DefaultInfo].files_to_run if host_scope else ctx.attr._probe_runner[DefaultInfo].files_to_run,
+                            selected.tools,
+                            host_toolchain_files if host_scope else target_toolchain_files,
+                            host_toolset_manifest if host_scope else target_toolset_manifest,
+                            host_toolset_anchors if host_scope else target_toolset_anchors,
+                            selected.companion_tools,
+                        ),
+                        additional_params = linux_probe_map_directory_params(
+                            scope,
+                            selected.arguments,
+                            selected.environments,
+                            source_prefix = source_prefix,
+                            rust_source_root = rust_source_root,
+                        ),
+                        env = {},
+                        execution_requirements = dict(host_requirements if host_scope else target_requirements, **{"supports-path-mapping": "1"}),
+                        mnemonic = "LinuxMappedCompilerGuardProbe",
+                        **({"exec_group": "host_cc"} if host_scope else {"toolchain": CC_TOOLCHAIN_TYPE})
+                    )
+                round_inputs = {
+                    "-family_compiler_guard_manifest": guard_manifest,
+                    "-family_compiler_guard_plan": guard_plan,
+                    "-family_compiler_guard_host_results": guard_results["host"],
+                    "-family_compiler_guard_target_results": guard_results["target"],
+                }
+                guard_rounds.append(round_inputs)
+                guard_inputs.extend(round_inputs.values())
+                for flag, artifact in round_inputs.items():
+                    _add_artifact_path(replay_args, flag, artifact, format = str(round_index) + "=%s")
+
+            # A completed TreeArtifact, not a plan marker or partial file,
+            # makes generator bytes available to the second planner action.
+            ctx.actions.run(
+                executable = ctx.executable._planner,
+                inputs = depset(
+                    direct = family_planner_inputs + [execution_cut] +
+                             [initial_variants[name].snapshot for name in sorted(initial_variants)] +
+                             [cut_stores[tree] for tree in sorted(cut_stores)] + guard_inputs,
+                    transitive = [rust_source.files] if rust_source != None else [],
+                ),
+                outputs = family_planner_outputs +
+                          [family_plans[segment.name] for segment in family_segments] +
+                          [pinned_selection, observed_headers, observed_artifacts, reuse_report],
+                arguments = [family_planner_args, replay_args],
+                execution_requirements = {"supports-path-mapping": "1"},
+                mnemonic = "LinuxMappedFamilyPlan",
+                progress_message = "Replaying and verifying observed Linux image-family inputs %{label}",
+            )
+        for segment in family_segments:
+            segment_tools = linux_map_directory_tools(
+                ctx.attr._host_recipe_runner[DefaultInfo].files_to_run if segment.scope == "host" else ctx.attr._recipe_runner[DefaultInfo].files_to_run,
+                segment.scope,
+                target_tools,
+                target_toolchain_files,
+                target_toolset_manifest,
+                target_toolset_anchors,
+                host_tools,
+                host_toolchain_files,
+                host_toolset_manifest,
+                host_toolset_anchors,
+                target.companion_tools,
+                host.companion_tools,
+            )
+            segment_tools["source_runfiles"] = source_runfiles
+            segment_params = linux_map_directory_params(
+                segment.name,
+                source_prefix,
+                target.arguments,
+                target.environments,
+                host.arguments,
+                host.environments,
+            )
+            _register_family_execution_segment(
+                ctx,
+                segment = segment,
+                initial = initial,
+                plans = selected_plans,
+                stores = selected_stores,
+                cut_stores = cut_stores,
+                base_inputs = base_family_inputs,
+                map_inputs = map_inputs,
+                selection = cut_selection if initial else pinned_selection,
+                observed_headers = observed_headers,
+                observed_artifacts = observed_artifacts,
+                view_trees = view_trees,
+                tools = segment_tools,
+                params = segment_params,
+                requirements = family_requirements,
+            )
+
+    payloads = {}
+    for variant in sorted(variants):
+        record = variants[variant]
+        trees = view_trees[variant]
+        prefix = ctx.label.name + "." + variant
+        image = ctx.actions.declare_file(prefix + ".image")
+        vmlinux = ctx.actions.declare_file(prefix + ".vmlinux")
+        system_map = ctx.actions.declare_file(prefix + ".System.map")
+        module_symvers = ctx.actions.declare_file(prefix + ".Module.symvers")
+        modules_order = ctx.actions.declare_file(prefix + ".modules.order")
+        modules_builtin = ctx.actions.declare_file(prefix + ".modules.builtin")
+        modules_builtin_modinfo = ctx.actions.declare_file(prefix + ".modules.builtin.modinfo")
+        modules_manifest = ctx.actions.declare_file(prefix + ".modules.manifest")
+        _project(ctx, trees["image"], "kernel", image)
+        _project(ctx, trees["vmlinux"], "vmlinux", vmlinux)
+        _project(ctx, trees["vmlinux"], "System.map", system_map)
+        _project(ctx, trees["metadata"], "Module.symvers", module_symvers)
+        _project(ctx, trees["modules"], "modules.order", modules_order)
+        _project(ctx, trees["metadata"], "modules.builtin", modules_builtin)
+        _project(ctx, trees["metadata"], "modules.builtin.modinfo", modules_builtin_modinfo)
+        _project(ctx, trees["metadata"], "modules.manifest", modules_manifest)
+        kernel = LinuxKernelInfo(
+            arch = record.arch,
+            version = ctx.attr.version,
+            kernel_release = record.kernel_release,
+            image = image,
+            vmlinux = vmlinux,
+            config = record.resolved,
+            system_map = system_map,
+        )
+        module_tree = LinuxModuleTreeInfo(tree = trees["modules"], manifest = modules_manifest)
+        module_sdk = LinuxModuleSdkInfo(
+            auto_conf = record.auto_conf,
+            auto_conf_cmd = record.auto_conf_cmd,
+            autoconf = record.autoconf,
+            config = record.resolved,
+            host_action_args = host.arguments,
+            host_action_environments = host.environments,
+            host_action_requirements = host.requirements_by_role,
+            host_companion_tools = host.companion_tools,
+            host_deps = libelf.tree,
+            host_execution_platform = host_execution_platform,
+            host_probe_results = host_probe_results,
+            host_probe_runner = ctx.attr._host_probe_runner[DefaultInfo].files_to_run,
+            host_recipe_runner = ctx.attr._host_recipe_runner[DefaultInfo].files_to_run,
+            host_tool_files = host_tools,
+            host_toolchain_files = host_toolchain_files,
+            host_toolset_identity = host_toolset_identity,
+            host_toolset_anchors = host_toolset_anchors,
+            host_toolset_manifest = host_toolset_manifest,
+            kbuild = ctx.file.kbuild,
+            host_kconfig_probe_results = host_kconfig_probe_results,
+            # The public label and variant alone do not identify a configured
+            # target: transitions can select a different compiler/toolchain for
+            # the same apparent kernel. Include configured output identities so
+            # external modules cannot accidentally combine SDK/vmlinux state
+            # from distinct configured kernels.
+            kernel_key = "#".join([
+                str(ctx.label),
+                variant,
+                record.resolved.path,
+                target_toolset_identity.path,
+                host_toolset_identity.path,
+            ]),
+            kernel_release = record.kernel_release,
+            libelf_compile_flags = libelf.compile_flags,
+            libelf_link_flags = libelf.link_flags,
+            make_vars = ctx.attr.module_make_vars,
+            rust_source_files = rust_source.files if rust_source != None else depset(),
+            rust_source_root = rust_source_root,
+            rustc_cfg = record.rustc_cfg,
+            sdk = trees["sdk"],
+            source = depset(ctx.files.source_files),
+            source_root = ctx.file.source_root,
+            target_action_args = target.arguments,
+            target_action_environments = target.environments,
+            target_action_requirements = target.requirements_by_role,
+            target_companion_tools = target.companion_tools,
+            target_execution_platform = target_execution_platform,
+            target_probe_results = target_probe_results,
+            target_probe_runner = ctx.attr._probe_runner[DefaultInfo].files_to_run,
+            target_recipe_runner = ctx.attr._recipe_runner[DefaultInfo].files_to_run,
+            target_kconfig_probe_results = target_kconfig_probe_results,
+            target_tool_files = target_tools,
+            target_toolchain_files = target_toolchain_files,
+            target_toolset_identity = target_toolset_identity,
+            target_toolset_anchors = target_toolset_anchors,
+            target_toolset_manifest = target_toolset_manifest,
+            version = ctx.attr.version,
+        )
+        output_groups = OutputGroupInfo(
+            arch = depset([record.arch]),
+            # Diagnose the first frontier without demanding later rounds.
+            compiler_guard0_manifest = depset([guard_rounds[0]["-family_compiler_guard_manifest"]]),
+            compiler_guard1_cpu_profile = depset([guard_cpu_profile]),
+            compiler_guard1_heap_profile = depset([guard_heap_profile]),
+            # Canonical manifests expose requested query cardinality without
+            # downloading result trees or substituting for the actual build.
+            compiler_guards = depset([round["-family_compiler_guard_manifest"] for round in guard_rounds]),
+            config = depset([public_configs[variant]]),
             image = depset([image]),
-            kernel_release = depset([kernel_release]),
+            kernel_release = depset([record.kernel_release]),
             module_symvers = depset([module_symvers]),
-            modules = depset([output_trees["modules"]]),
+            modules = depset([trees["modules"]]),
             modules_builtin = depset([modules_builtin]),
             modules_builtin_modinfo = depset([modules_builtin_modinfo]),
             modules_order = depset([modules_order]),
-            objects = depset([output_trees["objects"]]),
-            plan = depset([plans[stage] for stage in _STAGES]),
+            objects = depset([trees["objects"]]),
+            plan = depset([family_plans[segment.name] for segment in family_segments]),
+            # Keep the pre-reduction graph available for dependency and reuse
+            # diagnostics without requesting every final execution-plan shard.
+            plan_snapshots = depset([initial_variants[name].snapshot for name in sorted(initial_variants)]),
             probes = depset([
                 probe_plan,
                 host_probe_results,
@@ -3125,23 +5026,41 @@ def _linux_mapped_kernel_impl(ctx):
                 host_kbuild_probe_results,
                 target_kbuild_probe_results,
             ]),
-            sdk = depset([output_trees["sdk"]]),
+            reuse_report = depset([reuse_report]),
+            sdk = depset([trees["sdk"]]),
             system_map = depset([system_map]),
             toolsets = depset([target_toolset_identity, host_toolset_identity]),
             vmlinux = depset([vmlinux]),
-        ),
+        )
+        default = DefaultInfo(files = depset([image]))
+        payloads[variant] = struct(
+            default = default,
+            kernel = kernel,
+            module_sdk = module_sdk,
+            module_tree = module_tree,
+            output_groups = output_groups,
+        )
+    base_payload = payloads["base"]
+    return [
+        base_payload.default,
+        base_payload.kernel,
+        base_payload.module_sdk,
+        base_payload.module_tree,
+        base_payload.output_groups,
+        LinuxMappedKernelFamilyInfo(variants = payloads),
     ]
 
-linux_mapped_kernel = rule(
-    implementation = _linux_mapped_kernel_impl,
+linux_mapped_kernel_family = rule(
+    implementation = _linux_mapped_kernel_family_impl,
     attrs = {
         "config": attr.label(allow_single_file = True, mandatory = True),
         "config_mode": attr.string(default = "default", values = ["allnoconfig", "default"]),
         "kbuild": attr.label(allow_single_file = True, mandatory = True),
         "module_make_vars": attr.string_dict(),
-        "overlay": attr.label(allow_single_file = True),
+        "overlays": attr.string_keyed_label_dict(allow_files = True),
         "source_files": attr.label_list(allow_files = True, mandatory = True),
         "source_root": attr.label(allow_single_file = True, mandatory = True),
+        "source_runfiles": attr.label(cfg = "exec", executable = True, mandatory = True),
         "version": attr.string(mandatory = True),
         "_host_cc_toolchain": host_cc_toolchain_attr(exec_group = "host_cc"),
         "_host_execution_platform": linux_execution_platform_attr(exec_group = "host_cc"),
@@ -3171,6 +5090,8 @@ linux_mapped_kernel = rule(
         for role, attribute in _SHARED_PLANNER_HELPER_ATTRS.items()
     } | {
         "_planner": attr.label(cfg = "exec", default = Label("//internal/cmd/kconfig_parse:kconfig_parse"), executable = True),
+        "_heap_planner": attr.label(cfg = "exec", default = Label("//internal/cmd/kconfig_parse:kconfig_parse_heap"), executable = True),
+        "_profile_capture": attr.label(cfg = "exec", default = Label("//internal/cmd/profilecapture"), executable = True),
         "_probe_runner": attr.label(cfg = "exec", default = Label("//internal/cmd/proberun"), executable = True),
         "_recipe_runner": attr.label(cfg = "exec", default = Label("//internal/cmd/mapdirectoryrecipe"), executable = True),
         "_host_probe_runner": attr.label(cfg = config.exec(exec_group = "host_cc"), default = Label("//internal/cmd/proberun"), executable = True),
@@ -3211,6 +5132,10 @@ linux_mapped_kernel = rule(
 )
 
 def _kernel_projection_impl(ctx):
+    if ctx.attr.field == "config":
+        # Public config-only targets select the early measured resolution;
+        # kernel and SDK providers retain the execution-planning artifact.
+        return [DefaultInfo(files = ctx.attr.kernel[OutputGroupInfo].config)]
     info = ctx.attr.kernel[LinuxKernelInfo]
     return [DefaultInfo(files = depset([getattr(info, ctx.attr.field)]))]
 
@@ -3221,6 +5146,16 @@ _kernel_projection = rule(
         "kernel": attr.label(mandatory = True, providers = [LinuxKernelInfo]),
     },
 )
+
+def linux_test_kernel_projection(name, kernel, field, visibility = None):
+    """Exercises the same projection rule used by generated public targets."""
+    _kernel_projection(
+        name = name,
+        testonly = True,
+        kernel = kernel,
+        field = field,
+        visibility = visibility,
+    )
 
 def _module_projection_impl(ctx):
     return [DefaultInfo(files = getattr(ctx.attr.kernel[OutputGroupInfo], ctx.attr.field))]
@@ -3268,35 +5203,41 @@ _in_tree_module_projection = rule(
     doc = "Projects one repository-declared in-tree .ko from a kernel module tree.",
 )
 
-def linux_mapped_image_targets(
+def _linux_mapped_kernel_variant_impl(ctx):
+    family = ctx.attr.family[LinuxMappedKernelFamilyInfo]
+    payload = family.variants.get(ctx.attr.variant)
+    if payload == None:
+        fail("%s selects unknown Linux image-family variant %r; available variants are %r" % (
+            ctx.label,
+            ctx.attr.variant,
+            sorted(family.variants),
+        ))
+    return [
+        payload.default,
+        payload.kernel,
+        payload.module_sdk,
+        payload.module_tree,
+        payload.output_groups,
+    ]
+
+linux_mapped_kernel_variant = rule(
+    implementation = _linux_mapped_kernel_variant_impl,
+    attrs = {
+        "family": attr.label(mandatory = True, providers = [LinuxMappedKernelFamilyInfo]),
+        "variant": attr.string(mandatory = True),
+    },
+)
+
+def _linux_mapped_image_public_targets(
         name,
-        config,
-        config_mode,
-        module_make_vars,
+        family,
         module_targets,
-        overlay,
-        platform,
-        source_repo,
-        version,
-        visibility = ["//visibility:public"]):
-    """Defines one execution-time mapped graph behind stable image labels."""
-    graph = name + "__mapped"
-    linux_mapped_kernel(
-        name = graph,
-        config = config,
-        config_mode = config_mode,
-        kbuild = source_repo + "//:Kbuild",
-        module_make_vars = module_make_vars,
-        overlay = overlay,
-        source_files = [source_repo + "//:all_files"],
-        source_root = source_repo + "//:Kconfig",
-        version = version,
-        visibility = ["//visibility:private"],
-    )
-    linux_platform_transition(
+        variant,
+        visibility):
+    linux_mapped_kernel_variant(
         name = name,
-        graph = ":" + graph,
-        platform = platform,
+        family = family,
+        variant = variant,
         visibility = visibility,
     )
     for field in _KERNEL_FIELDS:
@@ -3320,3 +5261,59 @@ def linux_mapped_image_targets(
             path = module_targets[module_name],
             visibility = visibility,
         )
+
+def linux_mapped_image_family_targets(
+        name,
+        config,
+        config_mode,
+        module_make_vars,
+        module_targets,
+        overlays,
+        platform,
+        source_repo,
+        version,
+        visibility = ["//visibility:public"]):
+    """Defines one shared execution graph for a base image and all overlays."""
+    graph = name + "__family_graph"
+    family = name + "__family"
+    linux_mapped_kernel_family(
+        name = graph,
+        config = config,
+        config_mode = config_mode,
+        kbuild = source_repo + "//:Kbuild",
+        module_make_vars = module_make_vars,
+        overlays = overlays,
+        source_files = [source_repo + "//:all_files"],
+        source_root = source_repo + "//:Kconfig",
+        source_runfiles = source_repo + "//:linux_bzl_source_runfiles",
+        version = version,
+        visibility = ["//visibility:private"],
+    )
+    linux_platform_transition(
+        name = family,
+        graph = ":" + graph,
+        platform = platform,
+        visibility = ["//:__subpackages__"],
+    )
+    _linux_mapped_image_public_targets(
+        name = name,
+        family = ":" + family,
+        module_targets = module_targets,
+        variant = "base",
+        visibility = visibility,
+    )
+
+def linux_mapped_image_variant_targets(
+        name,
+        family,
+        module_targets,
+        variant,
+        visibility = ["//visibility:public"]):
+    """Defines stable public labels selecting one member of an image family."""
+    _linux_mapped_image_public_targets(
+        name = name,
+        family = family,
+        module_targets = module_targets,
+        variant = variant,
+        visibility = visibility,
+    )

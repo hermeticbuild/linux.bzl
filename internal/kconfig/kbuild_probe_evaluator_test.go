@@ -150,6 +150,306 @@ func writeKbuildProbeResults(t *testing.T, plan *ProbePlan, success map[string]b
 	return roots
 }
 
+func TestCanonicalCompilerPredefineArgumentsOnlyRewritesObjectMacroBodies(t *testing.T) {
+	arguments := []string{
+		"-target", "-DTHIS_IS_THE_TARGET_OPERAND",
+		"-DNO_VALUE",
+		"-DVALUE=old=tail",
+		"-D", "SEPARATED=drivers/example/module",
+		"-DFUNCTION(argument)=argument",
+		"-D${DYNAMIC_NAME}=value",
+		"-DSYMBOLIC_VALUE=${DYNAMIC_VALUE}",
+		"-D=malformed",
+		"-UJOINED", "-U", "SEPARATED_UNDEF",
+		"-Xclang", "-DXCLANG_PAYLOAD=value",
+		"-mllvm", "-DMLLVM_PAYLOAD=value",
+		"-Xpreprocessor", "-DPREPROCESSOR_PAYLOAD=value",
+		"--", "-DAFTER_DELIMITER=value",
+	}
+	original := slices.Clone(arguments)
+	want := []string{
+		"-target", "-DTHIS_IS_THE_TARGET_OPERAND",
+		"-DNO_VALUE=1",
+		"-DVALUE=1",
+		"-D", "SEPARATED=1",
+		"-DFUNCTION(argument)=argument",
+		"-D${DYNAMIC_NAME}=value",
+		"-DSYMBOLIC_VALUE=1",
+		"-D=malformed",
+		"-UJOINED", "-U", "SEPARATED_UNDEF",
+		"-Xclang", "-DXCLANG_PAYLOAD=value",
+		"-mllvm", "-DMLLVM_PAYLOAD=value",
+		"-Xpreprocessor", "-DPREPROCESSOR_PAYLOAD=value",
+		"--", "-DAFTER_DELIMITER=value",
+	}
+	got := canonicalCompilerPredefineArguments("cc", arguments)
+	if !slices.Equal(got, want) {
+		t.Fatalf("canonical compiler-predefine arguments = %#v, want %#v", got, want)
+	}
+	if !slices.Equal(arguments, original) {
+		t.Fatalf("canonical compiler-predefine arguments mutated caller argv: got %#v, want %#v", arguments, original)
+	}
+}
+
+func TestKbuildProbeScopesCompilerPredefinesDiscoversAndReplaysExactText(t *testing.T) {
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	options := KbuildProbeWorkloadOptions{Target: testKbuildProbeScopeOptions(t, fixture)}
+	type value struct {
+		contents string
+		ready    bool
+	}
+	arguments := []string{
+		"--target=x86_64-linux-gnu", "-std=gnu11",
+		"-DKBUILD_MODFILE=drivers/example/module",
+		"source.c",
+	}
+	originalArguments := slices.Clone(arguments)
+	workload := func(scopes *KbuildProbeScopes) (value, error) {
+		contents, ready, err := scopes.CompilerPredefines(
+			"target", "cc", "c", arguments, []string{"source.c"},
+			map[string]string{"COMPILER_MODE": "exact"},
+		)
+		return value{contents: contents, ready: ready}, err
+	}
+	discovery, err := EvaluateKbuildProbeWorkload(options, nil, workload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if discovery.Value.ready || discovery.Value.contents != "" {
+		t.Fatalf("compiler-predefine discovery value = %#v, want unresolved", discovery.Value)
+	}
+	if len(discovery.Plan.Nodes) != 1 {
+		t.Fatalf("compiler-predefine discovery nodes = %d, want 1", len(discovery.Plan.Nodes))
+	}
+	node := discovery.Plan.Nodes[0]
+	request := discovery.Plan.Requests[node.RequestID]
+	if request.Outcome.Kind != "text" || request.Outcome.Stream != "stdout" ||
+		!request.Outcome.RequireSuccess || request.Outcome.TrimSpace {
+		t.Fatalf("compiler-predefine outcome = %#v, want exact successful stdout", request.Outcome)
+	}
+	if len(request.Steps) != 1 || request.Steps[0].Tool != "cc" ||
+		!slices.Equal(request.Steps[0].Arguments, []string{
+			"--target=x86_64-linux-gnu", "-std=gnu11", "-DKBUILD_MODFILE=1",
+			"source.c",
+			"-dM", "-E", "-x", "c", "/dev/null",
+		}) {
+		t.Fatalf("compiler-predefine request steps = %#v", request.Steps)
+	}
+	if request.Steps[0].Candidate == nil ||
+		request.Steps[0].Candidate.Projection != ProbeCandidateProjectionCompilerPredefines ||
+		!slices.Equal(request.Steps[0].Candidate.TranslationUnits, []string{"source.c"}) {
+		t.Fatalf("compiler-predefine candidate = %#v, want runtime compiler-predefine projection", request.Steps[0].Candidate)
+	}
+	if !slices.Equal(arguments, originalArguments) {
+		t.Fatalf("compiler-predefine request mutated executable argv: got %#v, want %#v", arguments, originalArguments)
+	}
+	candidateArguments := []string{}
+	for _, index := range request.Steps[0].Candidate.Base {
+		candidateArguments = append(candidateArguments, request.Steps[0].Arguments[index])
+	}
+	projected, _, err := ProjectProbeCandidateArguments(
+		request.Steps[0].Candidate.Projection,
+		candidateArguments,
+		request.Steps[0].Candidate.TranslationUnits,
+	)
+	if err != nil {
+		t.Fatalf("project canonical compiler-predefine candidate arguments: %v", err)
+	}
+	if _, err := ValidateProbeCandidateArguments(request.Steps[0].Candidate.Policy, projected); err != nil {
+		t.Fatalf("canonical KBUILD_MODFILE candidate arguments are unsafe: %v", err)
+	}
+	if got := request.Steps[0].Environment; !maps.Equal(got, map[string]string{"COMPILER_MODE": "exact"}) {
+		t.Fatalf("compiler-predefine request environment = %#v", got)
+	}
+
+	const predefines = "#define DYNAMIC_COMPILER_MARKER 1\n"
+	root := filepath.Join(t.TempDir(), "target")
+	if err := os.MkdirAll(filepath.Join(root, "results"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := ProbeResult{
+		Schema: LinuxProbeResultSchema, NodeID: node.ID, RequestID: node.RequestID,
+		Scope: node.Scope, ToolsetIdentity: discovery.Plan.Toolsets[node.Scope], Kind: "text", Text: predefines,
+		Steps: []ProbeStepResult{{
+			Name: "compiler-predefines", Status: "success", ExitCode: 0, Stdout: predefines,
+		}},
+	}
+	data, err := result.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "results", node.ID+".json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots := map[string]string{"target": root}
+	oracle, err := NewProbeResultOracleFromTrees(roots, discovery.Plan.Toolsets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := EvaluateKbuildProbeWorkload(options, oracle, workload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replay.Value.ready || replay.Value.contents != predefines {
+		t.Fatalf("compiler-predefine replay value = %#v, want exact text %q", replay.Value, predefines)
+	}
+	if len(replay.Plan.Nodes) != 1 || replay.Plan.Nodes[0].ID != node.ID {
+		t.Fatalf("compiler-predefine replay plan = %#v, want discovery node %s", replay.Plan.Nodes, node.ID)
+	}
+}
+
+func TestKbuildProbeScopesCompilerPredefineIdentityCanonicalizesObjectMacroValues(t *testing.T) {
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	options := KbuildProbeWorkloadOptions{Target: testKbuildProbeScopeOptions(t, fixture)}
+	discover := func(arguments []string, environment map[string]string) string {
+		t.Helper()
+		evaluation, err := EvaluateKbuildProbeWorkload(options, nil, func(scopes *KbuildProbeScopes) (struct{}, error) {
+			_, ready, err := scopes.CompilerPredefines("target", "cc", "c", arguments, nil, environment)
+			if ready {
+				return struct{}{}, fmt.Errorf("compiler predefines unexpectedly ready during discovery")
+			}
+			return struct{}{}, err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(evaluation.Plan.Nodes) != 1 {
+			t.Fatalf("compiler-predefine identity nodes = %d, want 1", len(evaluation.Plan.Nodes))
+		}
+		return evaluation.Plan.Nodes[0].ID
+	}
+	environment := map[string]string{"OBJECT_MODE": "32"}
+	defined := discover([]string{"--target=x86_64-linux-gnu", "-DSELECTED=drivers/one"}, environment)
+	otherValue := discover([]string{"--target=x86_64-linux-gnu", "-DSELECTED=drivers/two"}, environment)
+	separated := discover([]string{"--target=x86_64-linux-gnu", "-D", "SELECTED=drivers/one"}, environment)
+	separatedOtherValue := discover([]string{"--target=x86_64-linux-gnu", "-D", "SELECTED=drivers/two"}, environment)
+	undefined := discover([]string{"--target=x86_64-linux-gnu", "-USELECTED"}, environment)
+	otherName := discover([]string{"--target=x86_64-linux-gnu", "-DOTHER=drivers/one"}, environment)
+	otherEnvironment := discover(
+		[]string{"--target=x86_64-linux-gnu", "-DSELECTED=drivers/one"},
+		map[string]string{"OBJECT_MODE": "64"},
+	)
+	otherNonMacro := discover([]string{"--target=aarch64-linux-gnu", "-DSELECTED=drivers/one"}, environment)
+	functionOne := discover([]string{"--target=x86_64-linux-gnu", "-DFUNCTION(x)=one"}, environment)
+	functionTwo := discover([]string{"--target=x86_64-linux-gnu", "-DFUNCTION(x)=two"}, environment)
+	defineThenUndef := discover(
+		[]string{"--target=x86_64-linux-gnu", "-DSELECTED=drivers/one", "-UOTHER"}, environment,
+	)
+	undefThenDefine := discover(
+		[]string{"--target=x86_64-linux-gnu", "-UOTHER", "-DSELECTED=drivers/one"}, environment,
+	)
+
+	if defined != otherValue {
+		t.Fatalf("object-like -D replacement changed identity: one=%s two=%s", defined, otherValue)
+	}
+	if separated != separatedOtherValue {
+		t.Fatalf("separated object-like -D replacement changed identity: one=%s two=%s", separated, separatedOtherValue)
+	}
+	for label, identity := range map[string]string{
+		"joined/separated shape":            separated,
+		"D/U operation":                     undefined,
+		"macro name":                        otherName,
+		"defined-name-relevant environment": otherEnvironment,
+		"nonmacro option":                   otherNonMacro,
+	} {
+		if defined == identity {
+			t.Fatalf("compiler-predefine identity omitted %s: both are %s", label, defined)
+		}
+	}
+	if functionOne == functionTwo {
+		t.Fatalf("function-like -D bodies were unexpectedly canonicalized: both are %s", functionOne)
+	}
+	if defineThenUndef == undefThenDefine {
+		t.Fatalf("D/U operation order was omitted from identity: both are %s", defineThenUndef)
+	}
+}
+
+func TestKbuildProbeScopesCompilerPredefinesLowersSymbolicEnvironmentForReplay(t *testing.T) {
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	options := KbuildProbeWorkloadOptions{Target: testKbuildProbeScopeOptions(t, fixture)}
+	type value struct {
+		contents string
+		ready    bool
+	}
+	workload := func(scopes *KbuildProbeScopes) (value, error) {
+		evaluator := scopes.evaluators["target"]
+		mode, err := evaluator.requestText(ProbeRequest{
+			Schema: LinuxProbeRequestSchema,
+			Steps:  []ProbeStep{{Name: "environment-source", Tool: "cc", Arguments: []string{"--version"}}},
+			Outcome: ProbeOutcome{
+				Kind: "text", Step: "environment-source", Stream: "stdout", RequireSuccess: true,
+			},
+		})
+		if err != nil {
+			return value{}, err
+		}
+		contents, ready, err := scopes.CompilerPredefines(
+			"target", "cc", "c", []string{"-DSELECTED=1"}, nil, map[string]string{"MODE": mode},
+		)
+		return value{contents: contents, ready: ready}, err
+	}
+	discovery, err := EvaluateKbuildProbeWorkload(options, nil, workload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if discovery.Value.ready || len(discovery.Plan.Nodes) != 2 {
+		t.Fatalf("symbolic-environment discovery = value %#v nodes %d", discovery.Value, len(discovery.Plan.Nodes))
+	}
+	compilerNode := ProbePlanNode{}
+	for _, node := range discovery.Plan.Nodes {
+		request := discovery.Plan.Requests[node.RequestID]
+		if len(request.Steps) != 0 && request.Steps[0].Name == "compiler-predefines" {
+			compilerNode = node
+			step := request.Steps[0]
+			if request.InputCount != 1 || len(step.Environment) != 0 ||
+				len(step.EnvironmentFragments) != 1 || step.EnvironmentFragments[0].Name != "MODE" {
+				t.Fatalf("symbolic compiler environment request = %#v", request)
+			}
+		}
+	}
+	if compilerNode.ID == "" {
+		t.Fatal("compiler-predefine request missing from symbolic-environment plan")
+	}
+
+	root := filepath.Join(t.TempDir(), "target")
+	if err := os.MkdirAll(filepath.Join(root, "results"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range discovery.Plan.Nodes {
+		request := discovery.Plan.Requests[node.RequestID]
+		textValue := "dynamic-mode\n"
+		if node.ID == compilerNode.ID {
+			textValue = "#define SELECTED 1\n"
+		}
+		result := ProbeResult{
+			Schema: LinuxProbeResultSchema, NodeID: node.ID, RequestID: node.RequestID,
+			Scope: node.Scope, ToolsetIdentity: discovery.Plan.Toolsets[node.Scope], Kind: "text", Text: textValue,
+			Steps: []ProbeStepResult{{
+				Name: request.Steps[0].Name, Status: "success", ExitCode: 0, Stdout: textValue,
+			}},
+		}
+		data, err := result.CanonicalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "results", node.ID+".json"), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oracle, err := NewProbeResultOracleFromTrees(map[string]string{"target": root}, discovery.Plan.Toolsets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := EvaluateKbuildProbeWorkload(options, oracle, workload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replay.Value.ready || replay.Value.contents != "#define SELECTED 1\n" ||
+		len(replay.Plan.Nodes) != len(discovery.Plan.Nodes) {
+		t.Fatalf("symbolic-environment replay = %#v plan nodes %d", replay.Value, len(replay.Plan.Nodes))
+	}
+}
+
 func TestKbuildProbeRequestsCanonicalizeLexicalAndPhysicalSourceRoots(t *testing.T) {
 	physicalRoot := filepath.Join(t.TempDir(), "repository-cache", "linux")
 	if err := os.MkdirAll(physicalRoot, 0o755); err != nil {

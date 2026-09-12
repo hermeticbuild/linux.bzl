@@ -189,6 +189,11 @@ type linuxProbeSymbol struct {
 	// evidence whose mode says whether it is byte-exact, only argv-word-
 	// equivalent, or deliberately unusable outside exact Make replay.
 	makeText *linuxProbeMakeText
+	// sourceShellWords is an exact recipe expression captured after Make
+	// evaluation, but before its deferred result has undergone shell quote
+	// removal. It is only usable as one complete argv fragment, never as Make
+	// data, an environment value, stdin, or an embedded substring.
+	sourceShellWords string
 	// toolsetPathLiteral is a deterministic runtime-provenance value imported
 	// from an already authenticated upstream Kconfig workload. Kbuild keeps it
 	// behind the opaque symbol until replay, then seals it with this workload's
@@ -382,7 +387,10 @@ func (e *LinuxProbeEvaluator) Shell(ctx context.Context, command string) (string
 }
 
 func (e *LinuxProbeEvaluator) canonicalSourceCommand(command string) string {
-	if e == nil || e.sourceRoot == "" {
+	// Canonicalization replaces rooted prefixes ending in '/'. Most compiler
+	// argv and definedness-probe operands contain no slash at all; resolving
+	// source symlinks for each such token cannot change their bytes.
+	if e == nil || e.sourceRoot == "" || !strings.ContainsRune(command, '/') {
 		return command
 	}
 	roots := []string{e.sourceRoot}
@@ -416,7 +424,9 @@ func (e *LinuxProbeEvaluator) canonicalSourceCommand(command string) string {
 func (e *LinuxProbeEvaluator) canonicalSourceRequest(request ProbeRequest) ProbeRequest {
 	request.Scratch = slices.Clone(request.Scratch)
 	for index := range request.Scratch {
-		request.Scratch[index].Content = e.canonicalSourceCommand(request.Scratch[index].Content)
+		if !request.Scratch[index].ContentIsOpaque {
+			request.Scratch[index].Content = e.canonicalSourceCommand(request.Scratch[index].Content)
+		}
 	}
 	request.Steps = slices.Clone(request.Steps)
 	for index := range request.Steps {
@@ -496,6 +506,78 @@ func (e *LinuxProbeEvaluator) canonicalSourcePredicate(predicate *ProbePredicate
 		clone.Operands[index] = *operand
 	}
 	return &clone
+}
+
+func cloneLinuxProbeRequest(request ProbeRequest) ProbeRequest {
+	request.Sources = slices.Clone(request.Sources)
+	request.SourceRoots = slices.Clone(request.SourceRoots)
+	request.Scratch = slices.Clone(request.Scratch)
+	request.Steps = slices.Clone(request.Steps)
+	for index := range request.Steps {
+		step := request.Steps[index]
+		step.AuxiliaryTools = slices.Clone(step.AuxiliaryTools)
+		step.Arguments = slices.Clone(step.Arguments)
+		step.ConditionalArguments = slices.Clone(step.ConditionalArguments)
+		for conditional := range step.ConditionalArguments {
+			step.ConditionalArguments[conditional].When = *cloneLinuxProbePredicate(&step.ConditionalArguments[conditional].When)
+			step.ConditionalArguments[conditional].Arguments = slices.Clone(step.ConditionalArguments[conditional].Arguments)
+		}
+		step.ArgumentFragments = slices.Clone(step.ArgumentFragments)
+		for group := range step.ArgumentFragments {
+			step.ArgumentFragments[group].Fragments = cloneLinuxProbeValueFragments(step.ArgumentFragments[group].Fragments)
+		}
+		if step.Candidate != nil {
+			candidate := *step.Candidate
+			candidate.Base = slices.Clone(candidate.Base)
+			candidate.Conditional = slices.Clone(candidate.Conditional)
+			candidate.TranslationUnits = slices.Clone(candidate.TranslationUnits)
+			step.Candidate = &candidate
+		}
+		step.Environment = maps.Clone(step.Environment)
+		step.EnvironmentFragments = slices.Clone(step.EnvironmentFragments)
+		for entry := range step.EnvironmentFragments {
+			step.EnvironmentFragments[entry].Fragments = cloneLinuxProbeValueFragments(step.EnvironmentFragments[entry].Fragments)
+		}
+		step.StdinFragments = cloneLinuxProbeValueFragments(step.StdinFragments)
+		step.When = cloneLinuxProbePredicate(step.When)
+		request.Steps[index] = step
+	}
+	request.Outcome.Predicate = cloneLinuxProbePredicate(request.Outcome.Predicate)
+	request.Outcome.Fragments = cloneLinuxProbeValueFragments(request.Outcome.Fragments)
+	return request
+}
+
+func cloneLinuxProbePredicate(predicate *ProbePredicate) *ProbePredicate {
+	if predicate == nil {
+		return nil
+	}
+	clone := *predicate
+	clone.Operands = slices.Clone(clone.Operands)
+	for index := range clone.Operands {
+		clone.Operands[index] = *cloneLinuxProbePredicate(&clone.Operands[index])
+	}
+	return &clone
+}
+
+func cloneLinuxProbeValueFragments(fragments []ProbeValueFragment) []ProbeValueFragment {
+	fragments = slices.Clone(fragments)
+	for index := range fragments {
+		fragment := fragments[index]
+		fragment.When = cloneLinuxProbePredicate(fragment.When)
+		fragment.Fragments = cloneLinuxProbeValueFragments(fragment.Fragments)
+		fragment.Transforms = slices.Clone(fragment.Transforms)
+		for transformIndex := range fragment.Transforms {
+			transform := fragment.Transforms[transformIndex]
+			transform.Arguments = slices.Clone(transform.Arguments)
+			transform.ArgumentFragments = slices.Clone(transform.ArgumentFragments)
+			for group := range transform.ArgumentFragments {
+				transform.ArgumentFragments[group].Fragments = cloneLinuxProbeValueFragments(transform.ArgumentFragments[group].Fragments)
+			}
+			fragment.Transforms[transformIndex] = transform
+		}
+		fragments[index] = fragment
+	}
+	return fragments
 }
 
 // ResolveSymbolic substitutes every known probe atom from exact replay
@@ -1345,16 +1427,20 @@ func (e *LinuxProbeEvaluator) renderSelection(inputs []linuxProbeSelectionInput,
 		fmt.Fprintf(hash, "%d:%s", len(value), value)
 	}
 	token := linuxProbeSymbolPrefix + hex.EncodeToString(hash.Sum(nil))
+	if existing, ok := e.symbols[token]; ok {
+		if existing.kind != "selection" ||
+			!equalLinuxProbeSelectionInputs(existing.selectionInputs, inputs) ||
+			!slices.Equal(existing.selectionValues, values) {
+			return "", fmt.Errorf("Linux probe symbolic value collision %q", token)
+		}
+		return token, nil
+	}
 	symbol := linuxProbeSymbol{
 		kind: "selection", selectionInputs: slices.Clone(inputs), selectionValues: slices.Clone(values),
 	}
 	for index := range symbol.selectionInputs {
+		symbol.selectionInputs[index].request = cloneLinuxProbeRequest(symbol.selectionInputs[index].request)
 		symbol.selectionInputs[index].dependencies = slices.Clone(symbol.selectionInputs[index].dependencies)
-	}
-	if existing, ok := e.symbols[token]; ok {
-		if existing.kind != symbol.kind || !slices.Equal(existing.selectionValues, symbol.selectionValues) || !equalLinuxProbeSelectionInputs(existing.selectionInputs, symbol.selectionInputs) {
-			return "", fmt.Errorf("Linux probe symbolic value collision %q", token)
-		}
 	}
 	if err := e.publishSymbol(token, symbol); err != nil {
 		return "", err
@@ -1367,14 +1453,143 @@ func equalLinuxProbeSelectionInputs(left, right []linuxProbeSelectionInput) bool
 		return false
 	}
 	for index := range left {
-		if left[index].reference != right[index].reference || left[index].request.Schema != right[index].request.Schema ||
-			!slices.Equal(left[index].dependencies, right[index].dependencies) {
+		if left[index].reference != right[index].reference ||
+			!slices.Equal(left[index].dependencies, right[index].dependencies) ||
+			!equalLinuxProbeRequest(left[index].request, right[index].request) {
 			return false
 		}
-		leftID, leftErr := left[index].request.ID()
-		rightID, rightErr := right[index].request.ID()
-		if leftErr != nil || rightErr != nil || leftID != rightID {
+	}
+	return true
+}
+
+func equalLinuxProbeRequest(left, right ProbeRequest) bool {
+	if left.Schema != right.Schema || left.InputCount != right.InputCount ||
+		!slices.Equal(left.Sources, right.Sources) ||
+		!slices.Equal(left.SourceRoots, right.SourceRoots) ||
+		!slices.Equal(left.Scratch, right.Scratch) ||
+		len(left.Steps) != len(right.Steps) ||
+		!equalLinuxProbeOutcome(left.Outcome, right.Outcome) {
+		return false
+	}
+	for index := range left.Steps {
+		if !equalLinuxProbeStep(left.Steps[index], right.Steps[index]) {
 			return false
+		}
+	}
+	return true
+}
+
+func equalLinuxProbeStep(left, right ProbeStep) bool {
+	if left.Name != right.Name || left.Tool != right.Tool ||
+		left.WorkingDirectory != right.WorkingDirectory || left.Stdin != right.Stdin ||
+		left.DiscardStdout != right.DiscardStdout || left.DiscardStderr != right.DiscardStderr ||
+		left.StdoutExecrootRelative != right.StdoutExecrootRelative ||
+		left.StdoutFallbackPath != right.StdoutFallbackPath ||
+		!slices.Equal(left.AuxiliaryTools, right.AuxiliaryTools) ||
+		!slices.Equal(left.Arguments, right.Arguments) ||
+		!maps.Equal(left.Environment, right.Environment) ||
+		!equalLinuxProbePredicate(left.When, right.When) ||
+		!equalLinuxProbeCandidate(left.Candidate, right.Candidate) ||
+		len(left.ConditionalArguments) != len(right.ConditionalArguments) ||
+		len(left.ArgumentFragments) != len(right.ArgumentFragments) ||
+		len(left.EnvironmentFragments) != len(right.EnvironmentFragments) ||
+		!equalLinuxProbeValueFragments(left.StdinFragments, right.StdinFragments) {
+		return false
+	}
+	for index := range left.ConditionalArguments {
+		leftConditional := left.ConditionalArguments[index]
+		rightConditional := right.ConditionalArguments[index]
+		if leftConditional.Before != rightConditional.Before ||
+			!equalLinuxProbePredicate(&leftConditional.When, &rightConditional.When) ||
+			!slices.Equal(leftConditional.Arguments, rightConditional.Arguments) {
+			return false
+		}
+	}
+	for index := range left.ArgumentFragments {
+		if left.ArgumentFragments[index].Index != right.ArgumentFragments[index].Index ||
+			left.ArgumentFragments[index].Mode != right.ArgumentFragments[index].Mode ||
+			!equalLinuxProbeValueFragments(left.ArgumentFragments[index].Fragments, right.ArgumentFragments[index].Fragments) {
+			return false
+		}
+	}
+	for index := range left.EnvironmentFragments {
+		if left.EnvironmentFragments[index].Name != right.EnvironmentFragments[index].Name ||
+			!equalLinuxProbeValueFragments(left.EnvironmentFragments[index].Fragments, right.EnvironmentFragments[index].Fragments) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalLinuxProbeCandidate(left, right *ProbeCandidateArguments) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Policy == right.Policy && left.Projection == right.Projection &&
+		slices.Equal(left.Base, right.Base) &&
+		slices.Equal(left.Conditional, right.Conditional) &&
+		slices.Equal(left.TranslationUnits, right.TranslationUnits)
+}
+
+func equalLinuxProbeOutcome(left, right ProbeOutcome) bool {
+	return left.Kind == right.Kind && left.Step == right.Step && left.Stream == right.Stream &&
+		left.Result == right.Result && left.Word == right.Word &&
+		left.TrimSpace == right.TrimSpace && left.FirstLine == right.FirstLine &&
+		left.LastLine == right.LastLine && left.GNUMakeShell == right.GNUMakeShell &&
+		left.RequireSuccess == right.RequireSuccess && left.SingleMakeWord == right.SingleMakeWord &&
+		left.PathComponent == right.PathComponent &&
+		equalLinuxProbePredicate(left.Predicate, right.Predicate) &&
+		equalLinuxProbeValueFragments(left.Fragments, right.Fragments)
+}
+
+func equalLinuxProbePredicate(left, right *ProbePredicate) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if left.Operator != right.Operator || left.Step != right.Step || left.Stream != right.Stream ||
+		left.Value != right.Value || left.Scratch != right.Scratch || left.Result != right.Result ||
+		len(left.Operands) != len(right.Operands) {
+		return false
+	}
+	for index := range left.Operands {
+		if !equalLinuxProbePredicate(&left.Operands[index], &right.Operands[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalLinuxProbeValueFragments(left, right []ProbeValueFragment) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		leftFragment := left[index]
+		rightFragment := right[index]
+		if leftFragment.Value != rightFragment.Value ||
+			!equalLinuxProbePredicate(leftFragment.When, rightFragment.When) ||
+			!equalLinuxProbeValueFragments(leftFragment.Fragments, rightFragment.Fragments) ||
+			len(leftFragment.Transforms) != len(rightFragment.Transforms) {
+			return false
+		}
+		for transformIndex := range leftFragment.Transforms {
+			leftTransform := leftFragment.Transforms[transformIndex]
+			rightTransform := rightFragment.Transforms[transformIndex]
+			if leftTransform.Function != rightTransform.Function ||
+				leftTransform.InputArgument != rightTransform.InputArgument ||
+				!slices.Equal(leftTransform.Arguments, rightTransform.Arguments) ||
+				len(leftTransform.ArgumentFragments) != len(rightTransform.ArgumentFragments) {
+				return false
+			}
+			for group := range leftTransform.ArgumentFragments {
+				if leftTransform.ArgumentFragments[group].Index != rightTransform.ArgumentFragments[group].Index ||
+					!equalLinuxProbeValueFragments(
+						leftTransform.ArgumentFragments[group].Fragments,
+						rightTransform.ArgumentFragments[group].Fragments,
+					) {
+					return false
+				}
+			}
 		}
 	}
 	return true
@@ -1418,6 +1633,25 @@ func (e *LinuxProbeEvaluator) renderTextTransform(sourceToken, function string, 
 		}
 	}
 	if err := e.publishSymbol(token, symbol); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (e *LinuxProbeEvaluator) renderSourceShellWords(value string) (string, error) {
+	if len(value) != len(linuxProbeSymbolPrefix)+linuxProbeSymbolDigestLength || !linuxProbeSymbolPattern.MatchString(value) {
+		return "", fmt.Errorf("source shell words require one complete registered symbolic value")
+	}
+	symbol, exists, err := e.adoptSymbol(value)
+	if err != nil {
+		return "", err
+	}
+	if !exists || symbol.kind == "source-shell-words" {
+		return "", fmt.Errorf("source shell words require one original registered symbolic value")
+	}
+	digest := sha256.Sum256([]byte("linux-bzl-source-shell-words-v1\x00" + value))
+	token := linuxProbeSymbolPrefix + hex.EncodeToString(digest[:])
+	if err := e.publishSymbol(token, linuxProbeSymbol{kind: "source-shell-words", sourceShellWords: value}); err != nil {
 		return "", err
 	}
 	return token, nil

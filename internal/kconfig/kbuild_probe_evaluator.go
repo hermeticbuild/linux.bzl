@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
@@ -36,6 +38,25 @@ type KbuildProbeScopeOptions struct {
 	RustSourceRoot     string
 }
 
+// compilerPredefineProjectionUnsupportedError is returned before an initial
+// compiler-state request is registered when its name vector, symbolic argv,
+// or environment state cannot be represented by the probe protocol. The
+// executable compiler action is still valid; config-dependency analysis must
+// conservatively make it opaque instead of constructing a partial request.
+type compilerPredefineProjectionUnsupportedError struct {
+	cause error
+}
+
+func (e *compilerPredefineProjectionUnsupportedError) Error() string { return e.cause.Error() }
+func (e *compilerPredefineProjectionUnsupportedError) Unwrap() error { return e.cause }
+
+func unsupportedCompilerPredefineProjection(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &compilerPredefineProjectionUnsupportedError{cause: err}
+}
+
 // KbuildProbeScopes supplies parser options whose callbacks are pinned to the
 // requested toolchain scope. Callers may parse an arbitrary collection of
 // source-derived Makefiles/profiles in one workload; every request enters the
@@ -45,12 +66,14 @@ type KbuildProbeScopes struct {
 	baseScriptEnvironments map[string]map[string]string
 	resolved               successfulStringMemo
 	resolvedStructure      successfulStringMemo
+	sourceGuardInventory   *configDependencyGuardInventory
 	// exactScriptEnvironmentBindings intern complete source-owned process
 	// environments. Profiles retain only the corresponding activation closure;
 	// the binding and active evaluator set remain local to this workload.
 	exactScriptEnvironmentBindings    map[string]map[string]map[string]string
 	exactScriptEnvironmentActivations map[string]func() error
 	activeExactScriptEnvironment      string
+	activeScriptEnvironmentIdentity   string
 }
 
 const (
@@ -142,6 +165,9 @@ func (s *KbuildProbeScopes) Options(scope string, base KbuildOptions) (KbuildOpt
 	if base.shellResultAvailable != nil {
 		return KbuildOptions{}, fmt.Errorf("Kbuild probe workload %s options already contain a shell-result observer", scope)
 	}
+	if base.probeEnvironmentIdentity != nil {
+		return KbuildOptions{}, fmt.Errorf("Kbuild probe workload %s options already contain a probe-environment identity", scope)
+	}
 	fallbackShell := base.Shell
 	base.ResolveSymbolic = func(value string) (string, error) {
 		return s.resolveSymbolicForScope(scope, value)
@@ -169,6 +195,9 @@ func (s *KbuildProbeScopes) Options(scope string, base KbuildOptions) (KbuildOpt
 	}
 	base.shellResultAvailable = func(command string) bool {
 		return s.kbuildShellResultAvailable(scope, command)
+	}
+	base.probeEnvironmentIdentity = func() string {
+		return s.activeScriptEnvironmentIdentity
 	}
 	base.SourceShell = func(command, workingDirectory string) (string, error) {
 		return s.kbuildSourceShell(context.Background(), command, workingDirectory)
@@ -2560,6 +2589,411 @@ func (s *KbuildProbeScopes) References() []ProbeReference {
 	return references
 }
 
+// canonicalCompilerPredefineArguments clones arguments and canonicalizes only
+// the replacement body of a direct, object-like -D whose name is one literal
+// ASCII C identifier. The config-dependency consumer observes defined macro
+// names, not replacement tokens, so GCC/Clang-compatible preprocessors give the
+// same observable state for every such body. Keeping the -D/-U name, position,
+// and joined/separated shape preserves option ordering and candidate ownership.
+//
+// An opaque compiler wrapper which assigns meaning to the raw replacement bytes
+// beyond ordinary GCC/Clang -D semantics is intentionally outside this bounded
+// projection. Function-like, malformed, and dynamically named definitions stay
+// byte-exact so the probe continues to fail closed for unmodeled grammar.
+func canonicalCompilerPredefineArguments(role string, arguments []string) []string {
+	canonical := slices.Clone(arguments)
+	separatedPayloads := compactKbuildCompilerSeparatedOptionPayloads(role, canonical)
+	for index := 0; index < len(canonical); index++ {
+		if separatedPayloads[index] {
+			continue
+		}
+		argument := canonical[index]
+		if argument == "--" {
+			break
+		}
+		if argument == "-D" {
+			if index+1 >= len(canonical) || !separatedPayloads[index+1] {
+				continue
+			}
+			if operand, ok := canonicalCompilerPredefineObjectMacro(canonical[index+1]); ok {
+				canonical[index+1] = operand
+			}
+			index++
+			continue
+		}
+		// Preserve any -D-looking operand owned by the candidate grammar even if
+		// the Kbuild command parser does not model that option (for example
+		// -mllvm). Such invocations normally fail closed before reaching this API.
+		if argument == "-mllvm" || argument == "-Xpreprocessor" ||
+			probeCandidateOptionRequiresScalar(argument, ProbeCandidatePolicyCC) {
+			index++
+			continue
+		}
+		operand, joined := strings.CutPrefix(argument, "-D")
+		if !joined || operand == "" {
+			continue
+		}
+		if operand, ok := canonicalCompilerPredefineObjectMacro(operand); ok {
+			canonical[index] = "-D" + operand
+		}
+	}
+	return canonical
+}
+
+func canonicalCompilerPredefineObjectMacro(operand string) (string, bool) {
+	name, _, _ := strings.Cut(operand, "=")
+	identifier, ok := configDependencyMacroIdentifier(name)
+	if !ok || identifier != name {
+		return "", false
+	}
+	return name + "=1", true
+}
+
+// CompilerPredefines registers (during discovery) or replays (during final
+// planning) one compiler predefine dump for the config-dependency defined-name
+// projection. arguments contains only the source-selected portion of the
+// configured compiler invocation: proberun's identity-bound tool proxy adds the
+// selected role's configured prefix, suffix, and environment around these
+// arguments at execution time. translationUnits names exact argv words which
+// can remain inside a dependency-backed fragment and must be removed before
+// the managed /dev/null query. Direct object-like -D replacement bodies are
+// canonicalized on a private copy before request identity. Arguments hidden in
+// symbolic Make-text fragments receive the same projection in proberun after
+// they render and before candidate validation; executable ActionRecipe
+// arguments remain untouched.
+//
+// The bool result is false only during discovery, when the returned probe text
+// is intentionally still symbolic. Callers must fail closed for that pass and
+// repeat the same request during replay before interpreting the text.
+func (s *KbuildProbeScopes) CompilerPredefines(
+	scope, role, language string,
+	arguments, translationUnits []string,
+	environment map[string]string,
+) (string, bool, error) {
+	return s.compilerProjectedText(scope, role, language, arguments, translationUnits, environment,
+		"compiler-predefines", []string{"-dM", "-E", "-x", language, "/dev/null"}, "")
+}
+
+// CompilerDefinedness measures every requested name, including explicit false
+// results. Names are validated, sorted and deduplicated on a private copy before
+// request identity; their source must remain stable across discovery and replay.
+// Like CompilerPredefines, this queries the configured initial compiler state,
+// before source-selected includes. It does not mutate a predefine dump or infer
+// absence from a compiler family. A nil error with ready=false means discovery;
+// unsupported projections and unavailable/malformed results remain errors.
+func (s *KbuildProbeScopes) CompilerDefinedness(
+	scope, role, language string,
+	arguments, translationUnits, names []string,
+	environment map[string]string,
+) (map[string]bool, bool, error) {
+	ordered, stdin, err := compilerDefinednessSource(names)
+	if err != nil {
+		return nil, false, unsupportedCompilerPredefineProjection(err)
+	}
+	contents, ready, err := s.compilerProjectedText(scope, role, language, arguments, translationUnits, environment,
+		"compiler-definedness", []string{"-E", "-P", "-x", language, "-"}, stdin)
+	if err != nil || !ready {
+		return nil, false, err
+	}
+	result, err := parseCompilerDefinednessResult(ordered, contents)
+	return result, err == nil, err
+}
+
+func parseCompilerDefinednessResult(ordered []string, contents string) (map[string]bool, error) {
+	if len(contents) > MaxProbeInterpolatedBytes {
+		return nil, fmt.Errorf("compiler definedness result exceeds %d bytes", MaxProbeInterpolatedBytes)
+	}
+	// Only preprocessing whitespace may separate the exact 0/1 tokens. Extra
+	// diagnostics, missing values, and non-Boolean values cannot prove absence.
+	values := strings.FieldsFunc(contents, func(character rune) bool {
+		return character == ' ' || character == '\t' || character == '\n' ||
+			character == '\r' || character == '\v' || character == '\f'
+	})
+	if len(values) != len(ordered) {
+		return nil, fmt.Errorf("compiler definedness returned %d values, want %d", len(values), len(ordered))
+	}
+	for _, value := range values {
+		if value != "0" && value != "1" {
+			return nil, fmt.Errorf("compiler definedness returned a non-Boolean value")
+		}
+	}
+	result := make(map[string]bool, len(ordered))
+	for index, name := range ordered {
+		result[name] = values[index] == "1"
+	}
+	return result, nil
+}
+
+const compilerDollarPunctuationSource = "#undef linux_bzl_dollar_punctuation_v1\n" +
+	"#define linux_bzl_dollar_punctuation_v1(a) #a$\n" +
+	"linux_bzl_dollar_punctuation_v1(731)\n"
+
+const compilerDollarPunctuationPattern = `^[ \t\r\n\v\f]*"731"[ \t\r\n\v\f]*\$[ \t\r\n\v\f]*$`
+
+var compilerDollarPunctuationOutput = regexp.MustCompile(compilerDollarPunctuationPattern)
+
+// CompilerDollarPunctuation measures a positive lexical capability in the
+// configured invocation, without changing its dollar options. Stringification
+// of a formal followed by a separate '$' avoids depending on the absence of a
+// predefined $NAME macro. Some assembler preprocessors accept #a$ unchanged,
+// so success alone is insufficient: stdout must also match the exact proof.
+// A negative measurement is ready, but grants no identifier-mode authority.
+func (s *KbuildProbeScopes) CompilerDollarPunctuation(
+	scope, role, language string,
+	arguments, translationUnits []string,
+	environment map[string]string,
+) (bool, bool, error) {
+	const stepName = "compiler-dollar-punctuation"
+	probe, err := s.compilerProjectedRequest(scope, role, language, arguments, translationUnits, environment,
+		stepName, []string{"-E", "-P", "-x", language, "-"}, compilerDollarPunctuationSource,
+		ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{Operator: "all", Operands: []ProbePredicate{
+			{Operator: "exit-zero", Step: stepName},
+			{Operator: "stream-matches", Step: stepName, Stream: "stdout", Value: compilerDollarPunctuationPattern},
+		}}})
+	if err != nil {
+		return false, false, err
+	}
+	truth, err := probe.evaluator.requestTruth(probe.request, probe.dependencies...)
+	if err != nil {
+		return false, false, err
+	}
+	token, err := probe.evaluator.renderTruth(truth, "1", "0")
+	if err != nil {
+		return false, false, err
+	}
+	resolved, err := probe.evaluator.ResolveSymbolic(token)
+	if err != nil {
+		return false, false, fmt.Errorf("resolve %s %s compiler dollar punctuation: %w", scope, role, err)
+	}
+	if resolved == token {
+		return false, false, nil
+	}
+	if resolved != "0" && resolved != "1" {
+		return false, false, fmt.Errorf("compiler dollar punctuation returned a non-Boolean result")
+	}
+	// Validate the exact reduction as well as readBoolean's request, toolset and
+	// step-shape checks. A malformed oracle summary must not grant permission.
+	result, err := probe.evaluator.readProbeResult(truth.reference, truth.request, truth.dependencies...)
+	if err != nil {
+		return false, false, err
+	}
+	step, present := probeResultStep(result.Steps, stepName)
+	if !present || step.Status == "skipped" {
+		return false, false, fmt.Errorf("compiler dollar punctuation result has no executed proof step")
+	}
+	positive := step.Status == "success" && step.ExitCode == 0 && compilerDollarPunctuationOutput.MatchString(step.Stdout)
+	if positive != (resolved == "1") {
+		return false, false, fmt.Errorf("compiler dollar punctuation result disagrees with its exact reduction")
+	}
+	return positive, true, nil
+}
+
+func compilerDefinednessSource(names []string) ([]string, string, error) {
+	// Bound caller-owned input before copying/sorting it, as well as the final
+	// canonical program. Duplicates cannot create unbounded preprocessing work.
+	if len(names) > MaxProbeDynamicArgumentWords {
+		return nil, "", fmt.Errorf("compiler definedness has too many names")
+	}
+	nameBytes := 0
+	for _, name := range names {
+		if len(name) > MaxProbeInterpolatedBytes-nameBytes {
+			return nil, "", fmt.Errorf("compiler definedness names exceed %d bytes", MaxProbeInterpolatedBytes)
+		}
+		nameBytes += len(name)
+		if identifier, valid := configDependencyMacroIdentifier(name); !valid || identifier != name {
+			return nil, "", fmt.Errorf("compiler definedness has an invalid macro name")
+		}
+	}
+	ordered := slices.Clone(names)
+	slices.Sort(ordered)
+	ordered = slices.Compact(ordered)
+	const prefix, suffix = "#if defined(", ")\n1\n#else\n0\n#endif\n"
+	var source strings.Builder
+	for _, name := range ordered {
+		if len(name) > MaxProbeInterpolatedBytes-source.Len()-len(prefix)-len(suffix) {
+			return nil, "", fmt.Errorf("compiler definedness stdin exceeds %d bytes", MaxProbeInterpolatedBytes)
+		}
+		source.WriteString(prefix)
+		source.WriteString(name)
+		source.WriteString(suffix)
+	}
+	return ordered, source.String(), nil
+}
+
+// compilerProjectedText shares the source-argument projection, symbolic
+// lowering, environment security and identity-bound tool proxy contract of
+// both initial-state queries. Keep the legacy predefine request bytes unchanged.
+func (s *KbuildProbeScopes) compilerProjectedText(
+	scope, role, language string,
+	arguments, translationUnits []string,
+	environment map[string]string,
+	stepName string,
+	managedArguments []string,
+	stdin string,
+) (string, bool, error) {
+	probe, err := s.compilerProjectedRequest(scope, role, language, arguments, translationUnits, environment,
+		stepName, managedArguments, stdin,
+		ProbeOutcome{Kind: "text", Step: stepName, Stream: "stdout", RequireSuccess: true})
+	if err != nil {
+		return "", false, err
+	}
+	token, err := probe.evaluator.requestText(probe.request, probe.dependencies...)
+	if err != nil {
+		return "", false, err
+	}
+	resolved, err := probe.evaluator.ResolveSymbolic(token)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve %s %s compiler predefines: %w", scope, role, err)
+	}
+	if resolved == token {
+		return "", false, nil
+	}
+	return resolved, true, nil
+}
+
+type compilerProjectedProbe struct {
+	evaluator    *LinuxProbeEvaluator
+	request      ProbeRequest
+	dependencies []ProbeReference
+}
+
+// Construction is shared by text and Boolean initial-state probes. Outcome
+// selection does not change candidate ownership, projection or tool authority.
+func (s *KbuildProbeScopes) compilerProjectedRequest(
+	scope, role, language string,
+	arguments, translationUnits []string,
+	environment map[string]string,
+	stepName string,
+	managedArguments []string,
+	stdin string,
+	outcome ProbeOutcome,
+) (*compilerProjectedProbe, error) {
+	return s.compilerProjectedRequestWithProjection(scope, role, language, arguments, translationUnits, environment,
+		stepName, managedArguments, stdin, outcome, ProbeCandidateProjectionCompilerPredefines)
+}
+
+// Existing initial-state queries keep their canonicalizing projection and exact
+// request bytes. Value-sensitive intrinsic queries select a distinct projection,
+// including after dependency-backed argv fragments have rendered in proberun.
+func (s *KbuildProbeScopes) compilerProjectedRequestWithProjection(
+	scope, role, language string,
+	arguments, translationUnits []string,
+	environment map[string]string,
+	stepName string,
+	managedArguments []string,
+	stdin string,
+	outcome ProbeOutcome,
+	projection string,
+) (*compilerProjectedProbe, error) {
+	if s == nil || s.evaluators[scope] == nil {
+		return nil, fmt.Errorf("Kbuild probe workload has no %s scope", scope)
+	}
+	if role != "cc" && role != "cxx" {
+		return nil, fmt.Errorf("Kbuild compiler predefines require cc or cxx role, got %q", role)
+	}
+	switch language {
+	case "c", "c++", "assembler-with-cpp":
+	default:
+		return nil, fmt.Errorf("Kbuild compiler predefines have unsupported language %q", language)
+	}
+	evaluator := s.evaluators[scope]
+	if evaluator.tools[role] == "" {
+		return nil, fmt.Errorf("Kbuild probe workload %s scope has no %s role", scope, role)
+	}
+	switch projection {
+	case ProbeCandidateProjectionCompilerPredefines:
+		arguments = canonicalCompilerPredefineArguments(role, arguments)
+	case ProbeCandidateProjectionCompilerIntrinsic:
+		arguments = slices.Clone(arguments)
+	default:
+		return nil, fmt.Errorf("unsupported compiler query projection %q", projection)
+	}
+	lowerer := newProbeSymbolicValueLowerer(evaluator)
+	base, conditional, fragments, candidate, err := lowerProbeCandidateArguments(
+		lowerer, arguments, probeCandidateArgumentMask(len(arguments)), ProbeCandidatePolicyCC,
+	)
+	if err != nil {
+		return nil, unsupportedCompilerPredefineProjection(fmt.Errorf(
+			"lower %s %s compiler predefine arguments: %w", scope, role, err,
+		))
+	}
+	if candidate != nil {
+		candidate.Projection = projection
+		canonicalTranslationUnits := slices.Clone(translationUnits)
+		slices.Sort(canonicalTranslationUnits)
+		candidate.TranslationUnits = slices.Compact(canonicalTranslationUnits)
+	} else if len(translationUnits) != 0 {
+		return nil, unsupportedCompilerPredefineProjection(fmt.Errorf(
+			"Kbuild compiler predefines have translation units but no source-owned arguments",
+		))
+	}
+	literalEnvironment := maps.Clone(environment)
+	environmentFragments := []ProbeEnvironmentFragments{}
+	environmentNames := slices.Sorted(maps.Keys(literalEnvironment))
+	for _, name := range environmentNames {
+		valueFragments, symbolic, err := lowerer.value(literalEnvironment[name])
+		if err != nil {
+			return nil, unsupportedCompilerPredefineProjection(fmt.Errorf(
+				"lower %s %s compiler predefine environment %s: %w", scope, role, name, err,
+			))
+		}
+		if !symbolic {
+			continue
+		}
+		environmentFragments = append(environmentFragments, ProbeEnvironmentFragments{
+			Name: name, Fragments: valueFragments,
+		})
+		delete(literalEnvironment, name)
+	}
+	dependencies := slices.Clone(lowerer.dependencies)
+	base = append(base, managedArguments...)
+	step := ProbeStep{
+		Name:                 stepName,
+		Tool:                 role,
+		Arguments:            base,
+		Stdin:                stdin,
+		ConditionalArguments: conditional,
+		ArgumentFragments:    fragments,
+		Candidate:            candidate,
+		Environment:          literalEnvironment,
+		EnvironmentFragments: environmentFragments,
+	}
+	auxiliary := []string{}
+	for referenced := range probeStepTemplateToolRoles(step) {
+		if referenced == role {
+			continue
+		}
+		if evaluator.tools[referenced] == "" {
+			return nil, unsupportedCompilerPredefineProjection(fmt.Errorf(
+				"Kbuild compiler predefine environment references unavailable %s tool role %q",
+				scope, referenced,
+			))
+		}
+		auxiliary = append(auxiliary, referenced)
+	}
+	sort.Strings(auxiliary)
+	step.AuxiliaryTools = auxiliary
+	request := ProbeRequest{
+		Schema:     LinuxProbeRequestSchema,
+		InputCount: len(dependencies),
+		Steps:      []ProbeStep{step},
+		Outcome:    outcome,
+	}
+	// Symbol lowering can leave literal ActionRecipe capabilities (for example
+	// ${work:root} in an exported Make value) which this standalone compiler
+	// query cannot bind. Validate exactly the source-normalized request that
+	// requestText/requestTruth will register, before it enters the discovery DAG.
+	// Keep the executable environment intact and classify this optional projection as
+	// unsupported; registration and oracle failures below remain real errors.
+	request = evaluator.canonicalSourceRequest(request)
+	if err := request.Validate(); err != nil {
+		return nil, unsupportedCompilerPredefineProjection(fmt.Errorf(
+			"validate %s %s compiler predefine projection: %w", scope, role, err,
+		))
+	}
+	return &compilerProjectedProbe{evaluator: evaluator, request: request, dependencies: dependencies}, nil
+}
+
 // ImportToolsetPathCapabilities performs the typed phase handoff from an
 // upstream Kconfig probe workload into this Kbuild workload. The upstream
 // callback first authenticates and removes its transient tags. Kbuild then
@@ -2660,6 +3094,20 @@ func (s *KbuildProbeScopes) BindActionPlanToolsetPathCapabilities(metadata *Comp
 		return err
 	}
 	metadata.toolsetPathCapabilityNormalizer = codec.NormalizeValue
+	metadata.compilerProbeSourceShellWords = func(value string) (string, error) {
+		evaluator, err := s.compatibleSymbolicEvaluator(value)
+		if err != nil {
+			return "", err
+		}
+		return evaluator.renderSourceShellWords(value)
+	}
+	metadata.compilerPredefines = s.CompilerPredefines
+	metadata.compilerDefinedness = s.CompilerDefinedness
+	metadata.compilerDollarPunctuation = s.CompilerDollarPunctuation
+	if s.sourceGuardInventory == nil {
+		s.sourceGuardInventory = &configDependencyGuardInventory{}
+	}
+	metadata.sourceGuardInventory = s.sourceGuardInventory
 	return nil
 }
 
@@ -2716,6 +3164,7 @@ func (s *KbuildProbeScopes) BindExactScriptEnvironments(
 
 func (s *KbuildProbeScopes) activateExactScriptEnvironments(key string) error {
 	if s.activeExactScriptEnvironment == key {
+		s.activeScriptEnvironmentIdentity = key
 		return nil
 	}
 	exact := s.exactScriptEnvironmentBindings[key]
@@ -2731,6 +3180,7 @@ func (s *KbuildProbeScopes) activateExactScriptEnvironments(key string) error {
 	}
 	if unchanged {
 		s.activeExactScriptEnvironment = key
+		s.activeScriptEnvironmentIdentity = key
 		return nil
 	}
 	refreshed := make(map[string]*LinuxProbeEvaluator, len(exact))
@@ -2749,6 +3199,7 @@ func (s *KbuildProbeScopes) activateExactScriptEnvironments(key string) error {
 		s.evaluators[scope] = evaluator
 	}
 	s.activeExactScriptEnvironment = key
+	s.activeScriptEnvironmentIdentity = key
 	s.resolved.clear()
 	s.resolvedStructure.clear()
 	return nil
@@ -2910,13 +3361,32 @@ func (s *KbuildProbeScopes) RefreshScriptEnvironments(exported map[string]map[st
 	if !changed {
 		return nil
 	}
+	nextEnvironments := s.currentScriptEnvironments()
+	for scope, evaluator := range refreshed {
+		nextEnvironments[scope] = evaluator.scriptEnvironment
+	}
+	identity, err := s.exactScriptEnvironmentsKey(nextEnvironments)
+	if err != nil {
+		return fmt.Errorf("identify refreshed Kbuild probe environments: %w", err)
+	}
 	for scope, evaluator := range refreshed {
 		s.evaluators[scope] = evaluator
 	}
 	s.activeExactScriptEnvironment = ""
+	s.activeScriptEnvironmentIdentity = identity
 	s.resolved.clear()
 	s.resolvedStructure.clear()
 	return nil
+}
+
+func (s *KbuildProbeScopes) currentScriptEnvironments() map[string]map[string]string {
+	current := make(map[string]map[string]string, len(s.evaluators))
+	for scope, evaluator := range s.evaluators {
+		if evaluator != nil {
+			current[scope] = evaluator.scriptEnvironment
+		}
+	}
+	return current
 }
 
 // KbuildProbeEvaluation is the result of either discovery or replay. During
@@ -2991,6 +3461,11 @@ func EvaluateKbuildProbeWorkload[T any](
 			return nil, fmt.Errorf("create host Kbuild probe evaluator: %w", err)
 		}
 	}
+	identity, err := scopes.exactScriptEnvironmentsKey(scopes.currentScriptEnvironments())
+	if err != nil {
+		return nil, fmt.Errorf("identify initial Kbuild probe environments: %w", err)
+	}
+	scopes.activeScriptEnvironmentIdentity = identity
 	value, err := workload(scopes)
 	if err != nil {
 		return nil, err

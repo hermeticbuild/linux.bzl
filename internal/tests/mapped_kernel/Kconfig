@@ -7,3 +7,11 @@ config X86
 config X86_64
     bool
     default y
+
+config UNUSED_FAMILY_OPTION
+    bool "Unused family option"
+    default n
+
+config USED_FAMILY_OPTION
+    bool "Used family option"
+    default n

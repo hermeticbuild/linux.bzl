@@ -253,6 +253,179 @@ exit 64
 	}
 }
 
+func TestRunScriptFallbackPassesThroughSuccessfulOutput(t *testing.T) {
+	directory := t.TempDir()
+	runtime := writeExecutable(t, directory, "runtime", `#!/bin/sh
+if [ "$1" = --list ]; then printf '%s\n' sh; exit 0; fi
+if [ "$1" = sh ]; then shift; exec /bin/sh "$@"; fi
+exit 64
+`)
+	var stdout bytes.Buffer
+	err := runScriptWithFallback(scriptRunOptions{
+		interpreter: runtime, interpreterArgs: []string{"sh"}, multicall: runtime,
+		scriptContent: "printf '%s\\n' measured-output\n",
+		stdout:        &stdout, stderr: ioDiscard{},
+	}, scriptRunFallback{enabled: true, timeout: time.Second, stdout: []byte("unsafe\n")})
+	if err != nil {
+		t.Fatalf("runScriptWithFallback() failed: %v", err)
+	}
+	if got, want := stdout.String(), "measured-output\n"; got != want {
+		t.Fatalf("stdout = %q, want successful output %q", got, want)
+	}
+}
+
+func TestRunScriptFallbackReplacesPartialOutputAfterTimeout(t *testing.T) {
+	directory := t.TempDir()
+	runtime := writeExecutable(t, directory, "runtime", `#!/bin/sh
+if [ "$1" = --list ]; then printf '%s\n' sh; exit 0; fi
+if [ "$1" = sh ]; then shift; exec /bin/sh "$@"; fi
+exit 64
+`)
+	var stdout bytes.Buffer
+	started := time.Now()
+	err := runScriptWithFallback(scriptRunOptions{
+		interpreter: runtime, interpreterArgs: []string{"sh"}, multicall: runtime,
+		scriptContent: "printf partial-output; while :; do :; done\n",
+		stdout:        &stdout, stderr: ioDiscard{},
+	}, scriptRunFallback{enabled: true, timeout: 100 * time.Millisecond, stdout: []byte("unsafe\n")})
+	if err != nil {
+		t.Fatalf("runScriptWithFallback() failed: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("timed-out script returned after %v, want a prompt fallback", elapsed)
+	}
+	if got, want := stdout.String(), "unsafe\n"; got != want {
+		t.Fatalf("stdout = %q, want only fallback %q", got, want)
+	}
+}
+
+func TestRunScriptFallbackHandlesSetupFailure(t *testing.T) {
+	directory := t.TempDir()
+	runtime := writeExecutable(t, directory, "runtime", `#!/bin/sh
+if [ "$1" = --list ]; then printf '%s\n' sh; exit 0; fi
+if [ "$1" = sh ]; then shift; exec /bin/sh "$@"; fi
+exit 64
+`)
+	var stdout bytes.Buffer
+	err := runScriptWithFallback(scriptRunOptions{
+		interpreter: runtime, interpreterArgs: []string{"sh"}, multicall: runtime,
+		scriptContent:   ":\n",
+		requiredApplets: []string{"missing"},
+		stdout:          &stdout, stderr: ioDiscard{},
+	}, scriptRunFallback{enabled: true, timeout: time.Second, stdout: []byte("unsafe\n")})
+	if err != nil {
+		t.Fatalf("runScriptWithFallback() failed: %v", err)
+	}
+	if got, want := stdout.String(), "unsafe\n"; got != want {
+		t.Fatalf("stdout = %q, want setup fallback %q", got, want)
+	}
+}
+
+func TestRunScriptFallbackHandlesFileSizeLimit(t *testing.T) {
+	directory := t.TempDir()
+	runtime := writeExecutable(t, directory, "runtime", `#!/bin/sh
+if [ "$1" = --list ]; then printf '%s\n' sh; exit 0; fi
+if [ "$1" = sh ]; then shift; exec /bin/sh "$@"; fi
+exit 64
+`)
+	const fileSizeLimit = 32 << 10
+	output := filepath.Join(directory, "oversized-output")
+	var inherited syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &inherited); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &inherited); err != nil {
+			t.Errorf("restore test file-size limit: %v", err)
+		}
+	}()
+
+	var stdout bytes.Buffer
+	err := runScriptWithFallback(scriptRunOptions{
+		interpreter: runtime, interpreterArgs: []string{"sh"}, multicall: runtime,
+		scriptContent:    "printf '%262144s' x > \"$1\"\n",
+		scriptArgs:       []string{output},
+		maxFileSizeBytes: fileSizeLimit,
+		stdout:           &stdout, stderr: ioDiscard{},
+	}, scriptRunFallback{enabled: true, timeout: 2 * time.Second, stdout: []byte("unsafe\n")})
+	if err != nil {
+		t.Fatalf("runScriptWithFallback() failed: %v", err)
+	}
+	if got, want := stdout.String(), "unsafe\n"; got != want {
+		t.Fatalf("stdout = %q, want file-size fallback %q", got, want)
+	}
+	info, err := os.Stat(output)
+	if err != nil {
+		t.Fatalf("stat bounded output: %v", err)
+	}
+	if info.Size() > fileSizeLimit {
+		t.Fatalf("bounded output size = %d, want at most %d", info.Size(), fileSizeLimit)
+	}
+	var restored syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored != inherited {
+		t.Fatalf("parent file-size limit = %#v, want inherited %#v", restored, inherited)
+	}
+}
+
+func TestMaxFileSizeFlag(t *testing.T) {
+	var value maxFileSizeFlag
+	if err := value.Set("32768"); err != nil {
+		t.Fatalf("Set() failed: %v", err)
+	}
+	if got, want := value.bytes, uint64(32768); got != want {
+		t.Fatalf("parsed bytes = %d, want %d", got, want)
+	}
+	if got, want := value.String(), "32768"; got != want {
+		t.Fatalf("String() = %q, want %q", got, want)
+	}
+
+	for _, invalid := range []string{"", "0", "-1", "1.5", "1073741825"} {
+		t.Run(invalid, func(t *testing.T) {
+			var value maxFileSizeFlag
+			if err := value.Set(invalid); err == nil {
+				t.Fatalf("Set(%q) accepted invalid max_file_size_bytes", invalid)
+			}
+		})
+	}
+}
+
+func TestParseScriptRunFallback(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("unsafe\n"))
+	fallback, err := parseScriptRunFallback(10, encoded)
+	if err != nil {
+		t.Fatalf("parseScriptRunFallback() failed: %v", err)
+	}
+	if !fallback.enabled || fallback.timeout != 10*time.Second || string(fallback.stdout) != "unsafe\n" {
+		t.Fatalf("fallback = %#v", fallback)
+	}
+	disabled, err := parseScriptRunFallback(0, "")
+	if err != nil || disabled.enabled {
+		t.Fatalf("disabled fallback = %#v, %v", disabled, err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		timeout int
+		stdout  string
+	}{
+		{name: "timeout without fallback", timeout: 1},
+		{name: "fallback without timeout", stdout: encoded},
+		{name: "negative timeout", timeout: -1, stdout: encoded},
+		{name: "unbounded timeout", timeout: maxScriptTimeoutSeconds + 1, stdout: encoded},
+		{name: "malformed fallback", timeout: 1, stdout: "not-base64"},
+		{name: "oversized fallback", timeout: 1, stdout: strings.Repeat("A", base64.StdEncoding.EncodedLen(maxFallbackStdoutBytes)+1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parseScriptRunFallback(test.timeout, test.stdout); err == nil {
+				t.Fatal("parseScriptRunFallback() accepted invalid flags")
+			}
+		})
+	}
+}
+
 func TestValidateToolContractsRejectsRuntimeAppletWrapperPolicy(t *testing.T) {
 	err := validateToolContracts(
 		map[string]string{},
@@ -1173,5 +1346,111 @@ func TestValidateReplayManifestsRejectsExternalToolCollision(t *testing.T) {
 	}}, map[string]string{"make": "/declared/make"})
 	if err == nil || !strings.Contains(err.Error(), "collides") {
 		t.Fatalf("validateReplayManifests() error = %v, want collision", err)
+	}
+}
+
+// A configured runtime role must beat a same-named multicall fallback without
+// bypassing explicit action contracts or importing ambient PATH entries.
+func TestRunScriptConfiguredRuntimePrecedesMulticallFallback(t *testing.T) {
+	for _, test := range []struct {
+		name                         string
+		configured, applet, explicit bool
+		want                         string
+	}{
+		{name: "fallback", want: "multicall:argument\n"},
+		{name: "configured", configured: true, want: "configured:argument\n"},
+		{name: "applet", configured: true, applet: true, want: "applet:argument\n"},
+		{name: "explicit", configured: true, explicit: true, want: "explicit:prefix:argument:from-contract\n"},
+		{name: "explicit_over_applet", configured: true, applet: true, explicit: true, want: "explicit:prefix:argument:from-contract\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			runtime := writeExecutable(t, directory, "runtime", `#!/bin/sh
+if [ "$1" = --list ]; then printf '%s\n' selected sh; exit 0; fi
+if [ "${0##*/}" = selected ]; then printf 'multicall:%s\n' "$1"; exit 0; fi
+if [ "$1" = sh ]; then shift; exec /bin/sh "$@"; fi
+exit 64
+`)
+			// Use the actual runner's validated directory constructor. Its
+			// noncolliding configured command must remain available too.
+			runtimeTools := map[string]string{
+				"runtime-only": writeExecutable(t, directory, "runtime-only", "#!/bin/sh\nprintf 'runtime-only\\n'\n"),
+			}
+			if test.configured {
+				runtimeTools["selected"] = writeExecutable(t, directory, "configured", "#!/bin/sh\nprintf 'configured:%s\\n' \"$1\"\n")
+			}
+			runtimePath, cleanup, err := toolaction.PrepareRuntimeToolDirectory(directory, runtimeTools)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+			options := scriptRunOptions{
+				interpreter: runtime, interpreterArgs: []string{"sh"}, multicall: runtime,
+				scriptContent:   "selected argument\nruntime-only\n",
+				runtimeToolPath: runtimePath,
+				tools:           map[string]string{}, applets: map[string]string{},
+				toolContracts:   map[string]toolaction.Contract{},
+				requiredApplets: []string{"selected"},
+			}
+			if test.applet {
+				options.applets["selected"] = writeExecutable(t, directory, "applet", "#!/bin/sh\nprintf 'applet:%s\\n' \"$1\"\n")
+				options.toolContracts[scriptAppletRolePrefix+"selected"] = toolaction.Contract{
+					Arguments: []string{}, Environment: map[string]string{},
+				}
+			}
+			if test.explicit {
+				options.tools["selected"] = writeExecutable(t, directory, "explicit", "#!/bin/sh\nprintf 'explicit:%s:%s:%s\\n' \"$1\" \"$2\" \"$SELECTED_MODE\"\n")
+				options.toolContracts["selected"] = toolaction.Contract{
+					Arguments:   []string{"prefix", toolaction.KbuildArgumentsSentinel},
+					Environment: map[string]string{"SELECTED_MODE": "from-contract"},
+				}
+			}
+			var stdout, stderr bytes.Buffer
+			options.stdout, options.stderr = &stdout, &stderr
+			if err := runScript(options); err != nil {
+				t.Fatalf("runScript(): %v\nstderr: %s", err, stderr.String())
+			}
+			if got, want := stdout.String(), test.want+"runtime-only\n"; got != want {
+				t.Fatalf("stdout = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRunScriptRejectsInvalidConfiguredMulticallCollision(t *testing.T) {
+	for _, kind := range []string{"directory", "nonexecutable", "dangling"} {
+		t.Run(kind, func(t *testing.T) {
+			directory := t.TempDir()
+			runtime := writeExecutable(t, directory, "runtime", `#!/bin/sh
+if [ "$1" = --list ]; then printf '%s\n' selected sh; exit 0; fi
+if [ "$1" = sh ]; then shift; exec /bin/sh "$@"; fi
+exit 64
+`)
+			runtimePath := filepath.Join(directory, "runtime-tools")
+			if err := os.Mkdir(runtimePath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			collision := filepath.Join(runtimePath, "selected")
+			var err error
+			switch kind {
+			case "directory":
+				err = os.Mkdir(collision, 0o700)
+			case "nonexecutable":
+				err = os.WriteFile(collision, []byte("not executable"), 0o600)
+			case "dangling":
+				err = os.Symlink(filepath.Join(directory, "missing"), collision)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = runScript(scriptRunOptions{
+				interpreter: runtime, interpreterArgs: []string{"sh"}, multicall: runtime,
+				scriptContent: "printf 'must not run\\n'\n", runtimeToolPath: runtimePath,
+				stdout: ioDiscard{}, stderr: ioDiscard{},
+			})
+			if err == nil || !strings.Contains(err.Error(), "configured runtime tool selected") {
+				t.Fatalf("runScript() = %v, want invalid configured collision error", err)
+			}
+		})
 	}
 }

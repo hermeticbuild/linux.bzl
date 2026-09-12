@@ -132,25 +132,70 @@ jobs:
         working-directory: examples
         env:
           BAZEL_BEP: ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+          BAZEL_COMPILER: ${{ matrix.compiler }}
           BAZEL_LOG: ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.log
           BAZEL_PROFILE: ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
+          BAZEL_REUSE_REPORT: ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.reuse-report.json
+          BAZEL_SUITE: ${{ matrix.suite.batch }}
           BAZEL_TARGETS: ${{ matrix.suite.targets }}
+          BAZEL_VERSION: ${{ matrix.bazel }}
         run: |
           set -euo pipefail
           read -r -a targets <<<"${BAZEL_TARGETS}"
+          output_groups=()
+          if [[ "${BAZEL_SUITE}" == "x86-64-variants" ]]; then
+            output_groups+=(--output_groups=+reuse_report)
+          fi
+          configuration_flags=(
+            --config=path-mapping
+            --config="compiler-${BAZEL_COMPILER}"
+          )
           bazel --host_jvm_args=-Xmx6g \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             build "${targets[@]}" \
-            --noannounce_rc \
-            --config=path-mapping \
-            --config="compiler-${{ matrix.compiler }}" \
+            "${output_groups[@]}" \
+            "${configuration_flags[@]}" \
             --notrack_incremental_state \
             --nokeep_state_after_build \
             --discard_analysis_cache \
             --experimental_record_metrics_for_all_mnemonics \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
+            --noannounce_rc \
             2>&1 | tee "${BAZEL_LOG}"
+
+          if [[ "${BAZEL_SUITE}" == "x86-64-variants" ]]; then
+            bash "${GITHUB_WORKSPACE}/.github/workflows/check_family_reuse_test.sh"
+            # Ask the same configured target for its report; bazel-out may
+            # retain artifacts from another compiler or earlier invocation.
+            # Assignment preserves cquery's status even if it emits partial output.
+            # Query needs analysis state during this command; these lifecycle
+            # overrides do not change the target's build configuration.
+            reuse_report_paths=$(
+              bazel --host_jvm_args=-Xmx6g \
+                --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
+                cquery //:x86_64_kernel \
+                "${configuration_flags[@]}" \
+                --track_incremental_state \
+                --nodiscard_analysis_cache \
+                --nokeep_state_after_build \
+                --output=files \
+                --output_groups=reuse_report \
+                --noannounce_rc
+            )
+            mapfile -t reuse_reports <<<"${reuse_report_paths}"
+            if [[ ${#reuse_reports[@]} -ne 1 || ! -f "${reuse_reports[0]}" ]]; then
+              echo "expected one existing configured x86_64 reuse report" >&2
+              exit 1
+            fi
+            cp -- "${reuse_reports[0]}" "${BAZEL_REUSE_REPORT}"
+            jq -e \
+              --arg compiler "${BAZEL_COMPILER}" \
+              --arg bazel_version "${BAZEL_VERSION}" \
+              --slurpfile baseline "${GITHUB_WORKSPACE}/.github/workflows/family_reuse_baseline.json" \
+              -f "${GITHUB_WORKSPACE}/.github/workflows/check_family_reuse.jq" \
+              "${BAZEL_REUSE_REPORT}" >/dev/null
+          fi
 
       - name: Report cache efficiency
         if: ${{ !cancelled() }}
@@ -174,6 +219,7 @@ jobs:
             ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
             ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
             ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.log
+            ${{ runner.temp }}/examples-${{ matrix.suite.batch }}-${{ matrix.compiler }}-${{ matrix.bazel }}.reuse-report.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -193,7 +239,7 @@ jobs:
         suite:
           - batch: tooling
             title: E2E tooling
-            targets: "//:compiler_identity_test //boot:init_test //cmd/qemuboot:qemuboot_test"
+            targets: "//:compiler_identity_test //boot:init_test //internal/modversions:modversions_test //cmd/qemuboot:qemuboot_test @linux.bzl//internal/tests/mapped_kernel:mapped_kernel_test"
           - batch: linux-6.12-x86_64
             title: Linux 6.12 x86_64
             targets: "//:linux_6_12_96_x86_64_boot_test //:linux_6_12_96_x86_64_module_test //:modversions_6_12_96_x86_64_build_test"
@@ -297,9 +343,20 @@ jobs:
           retention-days: 14
 
   aya-e2e:
-    name: Aya eBPF VMs
+    name: Aya eBPF VMs (${{ matrix.compiler }} kernel, Bazel ${{ matrix.bazel }})
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        bazel:
+          - 9.1.0
+          - 9.2.0
+        compiler:
+          - clang
+          - gcc
+    env:
+      USE_BAZEL_VERSION: ${{ matrix.bazel }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -308,25 +365,29 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-aya-e2e
+          disk-cache: ${{ github.workflow }}-aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}
           module-root: aya_e2e
           repository-cache: |
             - aya_e2e/.bazelversion
             - aya_e2e/.bazelrc
+            - aya_e2e/BUILD.bazel
             - aya_e2e/MODULE.bazel
             - aya_e2e/MODULE.bazel.lock
             - aya_e2e/patches/BUILD.bazel
             - aya_e2e/patches/aya_linux_bzl_api.patch
             - aya_e2e/patches/aya_rust_kernel_module_e2e.patch
+            - aya_e2e/patches/gcc_toolchain_remote_execution.patch
+            - aya_e2e/patches/libbpf_old_uapi_compat.patch
             - aya_e2e/patches/llvm_kbuild_actions.patch
+            - aya_e2e/patches/rules_rust_linker_path_mapping.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
-      - name: Run Aya integration VMs
+      - name: Run Aya integration VMs with ${{ matrix.compiler }} kernel
         working-directory: aya_e2e
         env:
-          BAZEL_BEP: ${{ runner.temp }}/aya-e2e.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/aya-e2e.log
-          BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
         run: |
           set -euo pipefail
           bazel --host_jvm_args=-Xmx6g \
@@ -334,10 +395,15 @@ jobs:
             test \
             '@aya//test/integration-test:vm_aarch64' \
             '@aya//test/integration-test:vm_x86_64' \
+            '//:compiler_toolchain_tests' \
+            '@rules_rust//test/unit/linker_path_mapping:all' \
             --noannounce_rc \
+            --config=path-mapping \
+            --config="compiler-${{ matrix.compiler }}" \
             --notrack_incremental_state \
             --nokeep_state_after_build \
             --discard_analysis_cache \
+            --experimental_record_metrics_for_all_mnemonics \
             --build_event_json_file="${BAZEL_BEP}" \
             --profile="${BAZEL_PROFILE}" \
             2>&1 | tee "${BAZEL_LOG}"
@@ -345,12 +411,12 @@ jobs:
       - name: Report cache efficiency
         if: ${{ !cancelled() }}
         env:
-          BAZEL_BEP: ${{ runner.temp }}/aya-e2e.bep.json
-          BAZEL_LOG: ${{ runner.temp }}/aya-e2e.log
-          BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e.profile.gz
+          BAZEL_BEP: ${{ runner.temp }}/aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+          BAZEL_LOG: ${{ runner.temp }}/aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.log
+          BAZEL_PROFILE: ${{ runner.temp }}/aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
         run: |
           .github/workflows/bazel_cache_report.sh \
-            "Aya eBPF VMs" \
+            "Aya eBPF VMs (${{ matrix.compiler }} kernel, Bazel ${{ matrix.bazel }})" \
             "${BAZEL_PROFILE}" \
             "${BAZEL_BEP}" \
             "${BAZEL_LOG}"
@@ -359,11 +425,11 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: bazel-profile-aya-e2e
+          name: bazel-profile-aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}
           path: |
-            ${{ runner.temp }}/aya-e2e.profile.gz
-            ${{ runner.temp }}/aya-e2e.bep.json
-            ${{ runner.temp }}/aya-e2e.log
+            ${{ runner.temp }}/aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.profile.gz
+            ${{ runner.temp }}/aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.bep.json
+            ${{ runner.temp }}/aya-e2e-${{ matrix.compiler }}-${{ matrix.bazel }}.log
           if-no-files-found: warn
           retention-days: 14
 

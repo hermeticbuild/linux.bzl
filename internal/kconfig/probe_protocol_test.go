@@ -4,6 +4,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -26,8 +27,8 @@ func testProbeRequest() ProbeRequest {
 }
 
 func TestProbeRequestCanonicalIdentity(t *testing.T) {
-	if LinuxProbeRequestSchema != "linux-probe-request-v11" {
-		t.Fatalf("probe request schema = %q, want v11", LinuxProbeRequestSchema)
+	if LinuxProbeRequestSchema != "linux-probe-request-v13" {
+		t.Fatalf("probe request schema = %q, want v13", LinuxProbeRequestSchema)
 	}
 	request := testProbeRequest()
 	id, err := request.ID()
@@ -128,6 +129,198 @@ func TestProbePlanWritesPathEncodedDAG(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(relative))); err != nil {
 			t.Errorf("missing %s: %v", relative, err)
 		}
+	}
+}
+
+func testProbePlanUnionVariants(t *testing.T, identity string) (*ProbePlan, *ProbePlan) {
+	t.Helper()
+	build := func(uniqueSource string) *ProbePlan {
+		builder, err := NewProbePlanBuilder(identity, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		common, err := builder.Request("target", testProbeRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		uniqueRequest := testProbeRequest()
+		uniqueRequest.InputCount = 1
+		uniqueRequest.Steps[0].Stdin = uniqueSource
+		unique, err := builder.Request("target", uniqueRequest, common)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := builder.Plan(unique)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plan
+	}
+	return build("int left;\n"), build("int right;\n")
+}
+
+func TestReadProbePlanRoundTripsAndRejectsNoncanonicalTrees(t *testing.T) {
+	identity := "sha256-" + strings.Repeat("4", 64)
+	plan, _ := testProbePlanUnionVariants(t, identity)
+	write := func(t *testing.T) string {
+		t.Helper()
+		root := filepath.Join(t.TempDir(), "plan")
+		if err := plan.Write(root); err != nil {
+			t.Fatal(err)
+		}
+		return root
+	}
+
+	root := write(t)
+	roundTrip, err := ReadProbePlan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.Toolsets["target"] != identity || len(roundTrip.Requests) != 2 || len(roundTrip.Nodes) != 2 || len(roundTrip.Terminal) != 1 {
+		t.Fatalf("round-trip probe plan = %#v", roundTrip)
+	}
+	if !slices.IsSortedFunc(roundTrip.Nodes, func(left, right ProbePlanNode) int {
+		return strings.Compare(left.ID, right.ID)
+	}) || !slices.IsSorted(roundTrip.Terminal) {
+		t.Fatalf("round-trip probe plan is not deterministic: nodes=%#v terminals=%q", roundTrip.Nodes, roundTrip.Terminal)
+	}
+	originalEntries, err := plan.entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTripEntries, err := roundTrip.entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(originalEntries) != len(roundTripEntries) {
+		t.Fatalf("round-trip marker count = %d, want %d", len(roundTripEntries), len(originalEntries))
+	}
+	for index := range originalEntries {
+		if originalEntries[index].path != roundTripEntries[index].path || !slices.Equal(originalEntries[index].data, roundTripEntries[index].data) {
+			t.Fatalf("round-trip marker %d = %#v, want %#v", index, roundTripEntries[index], originalEntries[index])
+		}
+	}
+
+	requestID := plan.Nodes[0].RequestID
+	nodeID := plan.Nodes[0].ID
+	for name, mutate := range map[string]func(*testing.T, string){
+		"unknown file": func(t *testing.T, root string) {
+			if err := os.WriteFile(filepath.Join(root, "unexpected"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"empty directory": func(t *testing.T, root string) {
+			if err := os.Mkdir(filepath.Join(root, "unexpected"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"missing derived marker": func(t *testing.T, root string) {
+			if err := os.Remove(filepath.Join(root, "nodes", nodeID, "tool", "cc")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"noncanonical request": func(t *testing.T, root string) {
+			filename := filepath.Join(root, "requests", requestID+".json")
+			data, err := os.ReadFile(filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filename, append([]byte(" "), data...), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"nonempty marker": func(t *testing.T, root string) {
+			if err := os.WriteFile(filepath.Join(root, "terminal", plan.Terminal[0]), []byte("unexpected"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"symlink": func(t *testing.T, root string) {
+			if err := os.Symlink(filepath.Join("schema", LinuxProbePlanSchema), filepath.Join(root, "unexpected-link")); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := write(t)
+			mutate(t, root)
+			if _, err := ReadProbePlan(root); err == nil {
+				t.Fatal("noncanonical probe plan was accepted")
+			}
+		})
+	}
+}
+
+func TestMergeProbePlansIsDeterministicAndSupportsPerVariantReplay(t *testing.T) {
+	identity := "sha256-" + strings.Repeat("5", 64)
+	left, right := testProbePlanUnionVariants(t, identity)
+	forward, err := MergeProbePlans([]ProbePlanVariant{{Name: "left", Plan: left}, {Name: "right", Plan: right}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reverse, err := MergeProbePlans([]ProbePlanVariant{{Name: "right", Plan: right}, {Name: "left", Plan: left}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwardEntries, _ := forward.entries()
+	reverseEntries, _ := reverse.entries()
+	if len(forwardEntries) != len(reverseEntries) {
+		t.Fatalf("reverse union has %d markers, want %d", len(reverseEntries), len(forwardEntries))
+	}
+	for index := range forwardEntries {
+		if forwardEntries[index].path != reverseEntries[index].path || !slices.Equal(forwardEntries[index].data, reverseEntries[index].data) {
+			t.Fatalf("reverse union marker %d differs: %#v != %#v", index, reverseEntries[index], forwardEntries[index])
+		}
+	}
+	if len(forward.Nodes) != 3 || len(forward.Requests) != 3 || len(forward.Terminal) != 2 {
+		t.Fatalf("merged plan = %d nodes, %d requests, %d terminals; want 3, 3, 2", len(forward.Nodes), len(forward.Requests), len(forward.Terminal))
+	}
+	if !slices.IsSortedFunc(forward.Nodes, func(left, right ProbePlanNode) int {
+		return strings.Compare(left.ID, right.ID)
+	}) || !slices.IsSorted(forward.Terminal) {
+		t.Fatalf("merged plan is not canonically ordered: nodes=%#v terminals=%q", forward.Nodes, forward.Terminal)
+	}
+
+	value := true
+	oracle := &ProbeResultOracle{results: map[string]ProbeResult{}, toolsets: maps.Clone(forward.Toolsets)}
+	for _, node := range forward.Nodes {
+		oracle.results[node.ID] = ProbeResult{
+			Schema: LinuxProbeResultSchema, NodeID: node.ID, RequestID: node.RequestID,
+			Scope: node.Scope, ToolsetIdentity: identity, Kind: "boolean", Boolean: &value,
+		}
+	}
+	for name, variant := range map[string]*ProbePlan{"left": left, "right": right} {
+		if err := oracle.ValidatePlan(variant); err != nil {
+			t.Errorf("%s replay rejected merged result superset: %v", name, err)
+		}
+	}
+	delete(oracle.results, left.Terminal[0])
+	if err := oracle.ValidatePlan(left); err == nil || !strings.Contains(err.Error(), "missing result") {
+		t.Fatalf("replay with missing demanded result error = %v", err)
+	}
+}
+
+func TestMergeProbePlansRejectsInvalidMembersAndToolsetMismatch(t *testing.T) {
+	identity := "sha256-" + strings.Repeat("6", 64)
+	left, right := testProbePlanUnionVariants(t, identity)
+	if _, err := MergeProbePlans(nil); err == nil || !strings.Contains(err.Error(), "no variants") {
+		t.Fatalf("empty union error = %v", err)
+	}
+	if _, err := MergeProbePlans([]ProbePlanVariant{{Name: "same", Plan: left}, {Name: "same", Plan: right}}); err == nil || !strings.Contains(err.Error(), "repeats variant") {
+		t.Fatalf("duplicate variant error = %v", err)
+	}
+
+	mismatched := *right
+	mismatched.Toolsets = maps.Clone(right.Toolsets)
+	mismatched.Toolsets["target"] = "sha256-" + strings.Repeat("7", 64)
+	if _, err := MergeProbePlans([]ProbePlanVariant{{Name: "left", Plan: left}, {Name: "right", Plan: &mismatched}}); err == nil || !strings.Contains(err.Error(), "right") || !strings.Contains(err.Error(), "target toolset") {
+		t.Fatalf("toolset mismatch error = %v", err)
+	}
+
+	invalid := *left
+	invalid.Nodes = slices.Clone(left.Nodes)
+	invalid.Nodes[0].ID = strings.Repeat("8", 64)
+	if _, err := MergeProbePlans([]ProbePlanVariant{{Name: "broken", Plan: &invalid}}); err == nil || !strings.Contains(err.Error(), "broken") || !strings.Contains(err.Error(), "does not match canonical content") {
+		t.Fatalf("invalid member error = %v", err)
 	}
 }
 
@@ -505,6 +698,45 @@ func TestProbeRequestValidatesDeclaredSourcesRootsAndAuxiliaryTools(t *testing.T
 	}
 }
 
+func TestProbeRequestValidatesScratchWorkingDirectory(t *testing.T) {
+	request := ProbeRequest{
+		Schema: LinuxProbeRequestSchema,
+		Scratch: []ProbeScratch{
+			{Name: "file", Kind: "file"},
+			{Name: "work", Kind: "directory"},
+		},
+		Steps: []ProbeStep{{
+			Name: "inspect", Tool: "runner", WorkingDirectory: "${scratch:work}",
+		}},
+		Outcome: ProbeOutcome{
+			Kind:      "boolean",
+			Predicate: &ProbePredicate{Operator: "exit-zero", Step: "inspect"},
+		},
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("valid scratch working directory: %v", err)
+	}
+
+	for _, test := range []struct {
+		name, workingDirectory, want string
+	}{
+		{name: "file scratch", workingDirectory: "${scratch:file}", want: "is not a directory"},
+		{name: "undeclared scratch", workingDirectory: "${scratch:other}", want: "undeclared scratch"},
+		{name: "suffix", workingDirectory: "${scratch:work}/nested", want: "exactly one"},
+		{name: "mixed placeholders", workingDirectory: "${scratch:work}${source_root:linux}", want: "exactly one"},
+		{name: "embedded scratch", workingDirectory: "prefix/${scratch:work}", want: "must start"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := request
+			candidate.Steps = append([]ProbeStep(nil), request.Steps...)
+			candidate.Steps[0].WorkingDirectory = test.workingDirectory
+			if err := candidate.Validate(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("working directory %q error = %v; want substring %q", test.workingDirectory, err, test.want)
+			}
+		})
+	}
+}
+
 func TestProbeRequestRejectsUnsafeOrUnboundedSourcePaths(t *testing.T) {
 	for _, source := range []string{
 		"",
@@ -685,5 +917,160 @@ func TestProbeResultStdoutPathKindValidation(t *testing.T) {
 	invalid.Steps[0].StdoutPathKind = "guessed"
 	if err := invalid.Validate(); err == nil || !strings.Contains(err.Error(), "invalid stdout path kind") {
 		t.Fatalf("invalid stdout path kind error = %v", err)
+	}
+}
+
+func probeTerminalSelectionFixture(t *testing.T) (*ProbePlan, ProbeReference, ProbeReference, []string) {
+	t.Helper()
+	builder, err := NewProbePlanBuilder("sha256-"+strings.Repeat("a", 64), "sha256-"+strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := builder.Request("host", testProbeRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := builder.Request("target", testProbeRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testProbeRequest()
+	request.InputCount = 3
+	request.Sources = []string{"source.c"}
+	request.SourceRoots = []string{"linux"}
+	request.Steps[0].Stdin = "int selected;\n"
+	request.Steps[0].Environment = map[string]string{"MODE": "unchanged"}
+	root, err := builder.Request("target", request, target, host, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRequest := testProbeRequest()
+	otherRequest.Steps[0].Stdin = "int excluded;\n"
+	other, err := builder.Request("target", otherRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := builder.Plan(root, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan, root, other, []string{target.NodeID, host.NodeID, target.NodeID}
+}
+
+func TestSelectProbePlanTerminalsExactClosureAndDefensiveCopies(t *testing.T) {
+	plan, root, other, inputs := probeTerminalSelectionFixture(t)
+	before, err := plan.entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := []string{root.NodeID, root.NodeID}
+	selected, err := SelectProbePlanTerminals(plan, selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected.Nodes) != 3 || len(selected.Requests) != 2 || !slices.Equal(selected.Terminal, []string{root.NodeID}) ||
+		!maps.Equal(selected.Toolsets, plan.Toolsets) || !slices.Equal(selection, []string{root.NodeID, root.NodeID}) {
+		t.Fatalf("selected closure changed exact roots, toolsets or caller selection: %#v", selected)
+	}
+	if _, found := selected.Requests[other.RequestID]; found {
+		t.Fatal("discarded request survived terminal selection")
+	}
+	for index, node := range selected.Nodes {
+		if index != 0 && selected.Nodes[index-1].ID >= node.ID {
+			t.Fatal("selected nodes are not canonical")
+		}
+		if node.ID == other.NodeID {
+			t.Fatal("unselected terminal survived")
+		}
+		if node.ID == root.NodeID {
+			if !slices.Equal(node.Inputs, inputs) {
+				t.Fatal("ordered/repeated dependency inputs changed")
+			}
+			selected.Nodes[index].Inputs[0] = "changed"
+		}
+	}
+	request := selected.Requests[root.RequestID]
+	request.Sources[0], request.SourceRoots[0] = "changed", "changed"
+	request.Steps[0].Arguments[0] = "changed"
+	request.Steps[0].Environment["MODE"] = "changed"
+	request.Outcome.Predicate.Operands[0].Operator = "changed"
+	selected.Toolsets["target"] = "changed"
+	selected.Terminal[0] = "changed"
+	after, err := plan.entries()
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("selection mutation changed its original plan: %v", err)
+	}
+}
+
+func TestSelectProbePlanTerminalsCanonicalFullAndEmptySelection(t *testing.T) {
+	plan, root, other, _ := probeTerminalSelectionFixture(t)
+	forward, err := SelectProbePlanTerminals(plan, []string{root.NodeID, other.NodeID, root.NodeID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reverse, err := SelectProbePlanTerminals(plan, []string{other.NodeID, root.NodeID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(forward, reverse) || !slices.IsSorted(forward.Terminal) {
+		t.Fatal("terminal selection depends on order/duplication")
+	}
+	before, err := plan.entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := forward.entries()
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("all-terminal selection changed the original request/node bytes: %v", err)
+	}
+	empty, err := SelectProbePlanTerminals(plan, nil)
+	if err != nil || len(empty.Nodes) != 0 || len(empty.Requests) != 0 || len(empty.Terminal) != 0 || !maps.Equal(empty.Toolsets, plan.Toolsets) {
+		t.Fatalf("empty selection lost full configured toolsets: %#v %v", empty, err)
+	}
+	empty.Toolsets["host"] = "changed"
+	if plan.Toolsets["host"] == "changed" {
+		t.Fatal("empty selection aliases original toolset map")
+	}
+}
+
+func TestSelectProbePlanTerminalsRejectsInvalidWholePlansAndRoots(t *testing.T) {
+	if selected, err := SelectProbePlanTerminals(nil, nil); err == nil || selected != nil {
+		t.Fatalf("nil plan accepted: %#v %v", selected, err)
+	}
+	for _, name := range []string{"unknown root", "nonterminal dependency", "invalid discarded request", "invalid discarded node", "repeated terminal", "unknown toolset", "extra malformed request"} {
+		t.Run(name, func(t *testing.T) {
+			plan, root, other, inputs := probeTerminalSelectionFixture(t)
+			selection := []string{root.NodeID}
+			switch name {
+			case "unknown root":
+				selection = []string{strings.Repeat("0", 64)}
+			case "nonterminal dependency":
+				selection = []string{inputs[0]}
+			case "invalid discarded request":
+				request := plan.Requests[other.RequestID]
+				request.Steps[0].Tool = ""
+				plan.Requests[other.RequestID] = request
+				selection = nil
+			case "invalid discarded node":
+				for index := range plan.Nodes {
+					if plan.Nodes[index].ID == other.NodeID {
+						plan.Nodes[index].ID = strings.Repeat("0", 64)
+					}
+				}
+				selection = nil
+			case "repeated terminal":
+				plan.Terminal = append(plan.Terminal, other.NodeID)
+				selection = nil
+			case "unknown toolset":
+				plan.Toolsets["untrusted"] = plan.Toolsets["host"]
+				selection = nil
+			case "extra malformed request":
+				plan.Requests[strings.Repeat("f", 64)] = testProbeRequest()
+				selection = nil
+			}
+			if selected, err := SelectProbePlanTerminals(plan, selection); err == nil || selected != nil {
+				t.Fatalf("invalid whole plan or root accepted: %#v %v", selected, err)
+			}
+		})
 	}
 }

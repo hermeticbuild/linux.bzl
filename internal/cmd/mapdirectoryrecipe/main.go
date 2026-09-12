@@ -30,18 +30,175 @@ type repeatedFlag []string
 func (f *repeatedFlag) String() string         { return strings.Join(*f, " ") }
 func (f *repeatedFlag) Set(value string) error { *f = append(*f, value); return nil }
 
+type singleFlag struct {
+	value string
+	set   bool
+}
+
+func (f *singleFlag) String() string { return f.value }
+func (f *singleFlag) Set(value string) error {
+	if f.set {
+		return fmt.Errorf("flag may be supplied only once")
+	}
+	if value == "" {
+		return fmt.Errorf("flag value may not be empty")
+	}
+	f.value = value
+	f.set = true
+	return nil
+}
+
+const (
+	maxParameterFileBytes     = 64 << 20
+	maxParameterFileLineBytes = 1 << 20
+	maxParameterFileArguments = 65536
+
+	// An input-set node contains at most sixteen entries or sixteen child
+	// references, but entry paths are deliberately not coupled to host PATH_MAX.
+	// Bound both each witness and the complete imported closure before decoding
+	// so a malformed callback invocation cannot turn a compact radix graph into
+	// unbounded runner memory.
+	maxActionPlanInputSetManifestBytes      = 64 << 20
+	maxActionPlanInputSetManifestTotalBytes = 64 << 20
+	maxActionPlanInputSetManifests          = maxParameterFileArguments
+	maxActionPlanInputSetEntries            = 1 << 20
+)
+
+// expandParameterFileArguments implements the Bazel multiline parameter-file
+// protocol used by this runner. A response file is recognized only when it is
+// the sole argument, so direct invocations retain their literal argv (including
+// values beginning with '@'). Each LF-terminated line is one exact argument;
+// recursive response files are deliberately unsupported.
+func expandParameterFileArguments(arguments []string) ([]string, error) {
+	if len(arguments) != 1 || !strings.HasPrefix(arguments[0], "@") {
+		return arguments, nil
+	}
+	filename := strings.TrimPrefix(arguments[0], "@")
+	if filename == "" {
+		return nil, fmt.Errorf("parameter file path is empty")
+	}
+	if strings.ContainsRune(filename, 0) {
+		return nil, fmt.Errorf("parameter file path contains NUL")
+	}
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("open parameter file %q: %w", filename, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat parameter file %q: %w", filename, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("parameter file %q is not a regular file", filename)
+	}
+	if info.Size() < 0 || info.Size() > maxParameterFileBytes {
+		return nil, fmt.Errorf("parameter file %q exceeds %d bytes", filename, maxParameterFileBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxParameterFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read parameter file %q: %w", filename, err)
+	}
+	if len(data) > maxParameterFileBytes {
+		return nil, fmt.Errorf("parameter file %q exceeds %d bytes", filename, maxParameterFileBytes)
+	}
+	if bytes.IndexByte(data, 0) >= 0 {
+		return nil, fmt.Errorf("parameter file %q contains NUL", filename)
+	}
+	if bytes.IndexByte(data, '\r') >= 0 {
+		return nil, fmt.Errorf("parameter file %q contains carriage return; multiline parameter files require LF line endings", filename)
+	}
+	if len(data) != 0 && data[len(data)-1] != '\n' {
+		return nil, fmt.Errorf("parameter file %q does not end with LF", filename)
+	}
+	argumentCount := bytes.Count(data, []byte{'\n'})
+	if argumentCount > maxParameterFileArguments {
+		return nil, fmt.Errorf("parameter file %q contains %d arguments, maximum is %d", filename, argumentCount, maxParameterFileArguments)
+	}
+
+	expanded := make([]string, 0, argumentCount)
+	for start, ordinal := 0, 0; start < len(data); ordinal++ {
+		lineEnd := start + bytes.IndexByte(data[start:], '\n')
+		line := data[start:lineEnd]
+		if len(line) > maxParameterFileLineBytes {
+			return nil, fmt.Errorf("parameter file %q argument %d exceeds %d bytes", filename, ordinal, maxParameterFileLineBytes)
+		}
+		if len(line) != 0 && line[0] == '@' {
+			return nil, fmt.Errorf("parameter file %q argument %d nests the parameter-file protocol", filename, ordinal)
+		}
+		expanded = append(expanded, string(line))
+		start = lineEnd + 1
+	}
+	return expanded, nil
+}
+
 type recipeOptions struct {
 	recipe, kind, expectedNodeID, expectedRecipeID      string
 	toolRole, workingDirectory, workingDirectoryMarker  string
 	inputBindings, expectedInputBindingsID              string
+	sourceProjections, expectedSourceProjectionsID      string
+	inputSetRoot                                        string
+	inputSetManifestRoot                                string
+	inputSetStoreAnchors                                map[string]string
+	inputSetStorePacks                                  []string
 	sources, inputs, outputs, tools, trees              map[string]string
 	artifactTrees                                       map[string]string
 	privateInputTrees                                   map[string]bool
+	inputSetManifests, inputSetSources, inputSetInputs  map[string]string
 	runtimeTools                                        map[string]string
 	actionArgs                                          []string
 	actionEnvironment                                   map[string]string
 	auxiliaryActionContracts                            map[string]toolaction.Contract
 	toolsetIdentities, toolsetManifests, toolsetAnchors []string
+}
+
+func decodeSourceProjections(filename, expectedID string) (kconfig.ActionPlanSourceProjections, error) {
+	if filename == "" {
+		return kconfig.ActionPlanSourceProjections{}, fmt.Errorf("source projections manifest is required")
+	}
+	if !isDigest(expectedID) {
+		return kconfig.ActionPlanSourceProjections{}, fmt.Errorf("expected source projections ID must be a canonical SHA-256 digest")
+	}
+	file, err := os.Open(filename)
+	if err != nil {
+		return kconfig.ActionPlanSourceProjections{}, fmt.Errorf("open source projections manifest %q: %w", filename, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return kconfig.ActionPlanSourceProjections{}, fmt.Errorf("stat source projections manifest %q: %w", filename, err)
+	}
+	if !info.Mode().IsRegular() {
+		return kconfig.ActionPlanSourceProjections{}, fmt.Errorf("source projections manifest %q is not a regular file", filename)
+	}
+	if info.Size() > kconfig.MaxActionPlanSourceProjectionsBytes {
+		return kconfig.ActionPlanSourceProjections{}, fmt.Errorf(
+			"source projections manifest %q exceeds %d bytes", filename, kconfig.MaxActionPlanSourceProjectionsBytes,
+		)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, kconfig.MaxActionPlanSourceProjectionsBytes+1))
+	if err != nil {
+		return kconfig.ActionPlanSourceProjections{}, fmt.Errorf("read source projections manifest %q: %w", filename, err)
+	}
+	if len(data) > kconfig.MaxActionPlanSourceProjectionsBytes {
+		return kconfig.ActionPlanSourceProjections{}, fmt.Errorf(
+			"source projections manifest %q exceeds %d bytes", filename, kconfig.MaxActionPlanSourceProjectionsBytes,
+		)
+	}
+	projections, err := kconfig.DecodeActionPlanSourceProjections(data)
+	if err != nil {
+		return kconfig.ActionPlanSourceProjections{}, fmt.Errorf("decode source projections manifest %q: %w", filename, err)
+	}
+	actualID, err := projections.ID()
+	if err != nil {
+		return kconfig.ActionPlanSourceProjections{}, fmt.Errorf("identify source projections manifest %q: %w", filename, err)
+	}
+	if actualID != expectedID {
+		return kconfig.ActionPlanSourceProjections{}, fmt.Errorf(
+			"source projections manifest content ID = %q, want %q", actualID, expectedID,
+		)
+	}
+	return projections, nil
 }
 
 func decodeRecipe(filename string) (kconfig.ActionRecipe, []byte, error) {
@@ -118,6 +275,387 @@ func decodeInputBindings(filename, expectedID string) (kconfig.ActionPlanInputBi
 		)
 	}
 	return bindings, nil
+}
+
+type resolvedActionPlanInputSetEntry struct {
+	entry      kconfig.ActionPlanInputSetEntry
+	input      string
+	provenance string
+}
+
+type resolvedActionPlanInputSet struct {
+	root    string
+	entries []resolvedActionPlanInputSetEntry
+}
+
+func decodeActionPlanInputSetManifest(filename, expectedID string) (kconfig.ActionPlanInputSetNode, int, error) {
+	if !isDigest(expectedID) {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf("input-set manifest ID %q is not a canonical SHA-256 digest", expectedID)
+	}
+	file, err := os.Open(filename)
+	if err != nil {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf("open input-set manifest %q: %w", filename, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf("stat input-set manifest %q: %w", filename, err)
+	}
+	if !info.Mode().IsRegular() {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf("input-set manifest %q is not a regular file", filename)
+	}
+	if info.Size() < 0 || info.Size() > maxActionPlanInputSetManifestBytes {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf(
+			"input-set manifest %q exceeds %d bytes", filename, maxActionPlanInputSetManifestBytes,
+		)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxActionPlanInputSetManifestBytes+1))
+	if err != nil {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf("read input-set manifest %q: %w", filename, err)
+	}
+	if len(data) == 0 {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf("input-set manifest %q is empty", filename)
+	}
+	if len(data) > maxActionPlanInputSetManifestBytes {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf(
+			"input-set manifest %q exceeds %d bytes", filename, maxActionPlanInputSetManifestBytes,
+		)
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var node kconfig.ActionPlanInputSetNode
+	if err := decoder.Decode(&node); err != nil {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf("decode input-set manifest %q: %w", filename, err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf("decode input-set manifest %q: trailing JSON value", filename)
+		}
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf("decode input-set manifest %q: %w", filename, err)
+	}
+	canonical, err := json.Marshal(node)
+	if err != nil {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf("encode input-set manifest %q: %w", filename, err)
+	}
+	if !bytes.Equal(data, canonical) {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf("input-set manifest %q is not canonically encoded", filename)
+	}
+	digest := sha256.Sum256(canonical)
+	if actualID := hex.EncodeToString(digest[:]); actualID != expectedID {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf(
+			"input-set manifest content ID = %q, want %q", actualID, expectedID,
+		)
+	}
+	if node.Count < 0 || node.Count > maxActionPlanInputSetEntries {
+		return kconfig.ActionPlanInputSetNode{}, 0, fmt.Errorf(
+			"input-set manifest %q count %d is outside [0,%d]", expectedID, node.Count, maxActionPlanInputSetEntries,
+		)
+	}
+	return node, len(data), nil
+}
+
+func actionPlanInputSetProducerBinding(producerID string, slot int) string {
+	return fmt.Sprintf("%s:%08d", producerID, slot)
+}
+
+func exactActionPlanInputSetBindings(kind string, expected map[string]bool, bindings map[string]string) error {
+	for _, name := range sortedKeys(bindings) {
+		if !expected[name] {
+			return fmt.Errorf("unexpected input-set %s binding %q", kind, name)
+		}
+		if bindings[name] == "" {
+			return fmt.Errorf("input-set %s binding %q is empty", kind, name)
+		}
+	}
+	expectedNames := make([]string, 0, len(expected))
+	for name := range expected {
+		expectedNames = append(expectedNames, name)
+	}
+	sort.Strings(expectedNames)
+	for _, name := range expectedNames {
+		if bindings[name] == "" {
+			return fmt.Errorf("missing input-set %s binding %q", kind, name)
+		}
+	}
+	return nil
+}
+
+func validateActionPlanInputSetArtifact(kind, name, filename string) error {
+	info, err := os.Stat(filename)
+	if err != nil {
+		return fmt.Errorf("inspect input-set %s binding %q: %w", kind, name, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("input-set %s binding %q is not a regular file", kind, name)
+	}
+	return nil
+}
+
+func validateActionPlanInputSetTargetShapes(entries []resolvedActionPlanInputSetEntry) error {
+	paths := map[string]map[string]bool{}
+	for _, resolved := range entries {
+		target := resolved.entry.Target
+		namespace := string(target.Kind) + "\x00" + target.Tree
+		if paths[namespace] == nil {
+			paths[namespace] = map[string]bool{}
+		}
+		paths[namespace][target.Path] = true
+	}
+	namespaces := make([]string, 0, len(paths))
+	for namespace := range paths {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+	for _, namespace := range namespaces {
+		namespacePaths := paths[namespace]
+		orderedPaths := make([]string, 0, len(namespacePaths))
+		for pathname := range namespacePaths {
+			orderedPaths = append(orderedPaths, pathname)
+		}
+		sort.Strings(orderedPaths)
+		for _, pathname := range orderedPaths {
+			for parent := pathParent(pathname); parent != ""; parent = pathParent(parent) {
+				if !namespacePaths[parent] {
+					continue
+				}
+				kind, tree, _ := strings.Cut(namespace, "\x00")
+				if tree != "" {
+					kind += ":" + tree
+				}
+				return fmt.Errorf(
+					"input-set %s target %q is below file target %q",
+					kind, pathname, parent,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func pathParent(value string) string {
+	index := strings.LastIndexByte(value, '/')
+	if index < 0 {
+		return ""
+	}
+	return value[:index]
+}
+
+func validateActionPlanInputSetManifestGraph(root string, nodes map[string]kconfig.ActionPlanInputSetNode) error {
+	if _, exists := nodes[root]; !exists {
+		return fmt.Errorf("input-set root %q is missing", root)
+	}
+	state := make(map[string]uint8, len(nodes))
+	var visit func(string, int) error
+	visit = func(id string, depth int) error {
+		switch state[id] {
+		case 1:
+			return fmt.Errorf("input-set manifest graph contains a cycle at %q", id)
+		case 2:
+			return nil
+		}
+		if depth > sha256.Size*2 {
+			return fmt.Errorf("input-set manifest graph exceeds %d radix levels at %q", sha256.Size*2, id)
+		}
+		node, exists := nodes[id]
+		if !exists {
+			return fmt.Errorf("input-set manifest graph references missing child %q", id)
+		}
+		state[id] = 1
+		for _, child := range node.Children {
+			if err := visit(child.ID, depth+1); err != nil {
+				return err
+			}
+		}
+		state[id] = 2
+		return nil
+	}
+	if err := visit(root, 0); err != nil {
+		return err
+	}
+	reachable := make(map[string]bool, len(state))
+	for id := range state {
+		reachable[id] = true
+	}
+	ids := make([]string, 0, len(nodes))
+	for id := range nodes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		if state[id] == 0 {
+			if err := visit(id, 0); err != nil {
+				return err
+			}
+		}
+	}
+	if len(reachable) != len(nodes) {
+		for _, id := range ids {
+			if !reachable[id] {
+				return fmt.Errorf("input-set manifest %q is not reachable from root %q", id, root)
+			}
+		}
+	}
+	return nil
+}
+
+// loadActionPlanInputSet imports exactly one persistent radix closure. The
+// callback binds canonical manifest witnesses and the immutable artifacts
+// named by leaf provenance; target paths and usage classifications remain
+// authenticated inside those witnesses and never become caller-controlled
+// flags of their own.
+func loadActionPlanInputSet(opts recipeOptions) (resolvedActionPlanInputSet, error) {
+	configured := opts.inputSetRoot != "" || len(opts.inputSetManifests) != 0 ||
+		len(opts.inputSetSources) != 0 || len(opts.inputSetInputs) != 0 ||
+		opts.inputSetManifestRoot != "" || len(opts.inputSetStoreAnchors) != 0 || len(opts.inputSetStorePacks) != 0
+	if !configured {
+		return resolvedActionPlanInputSet{}, nil
+	}
+	if !isDigest(opts.inputSetRoot) {
+		return resolvedActionPlanInputSet{}, fmt.Errorf("input-set root must be a canonical SHA-256 digest")
+	}
+	compact := opts.inputSetManifestRoot != ""
+	if compact && (len(opts.inputSetManifests) != 0 || len(opts.inputSetInputs) != 0) {
+		return resolvedActionPlanInputSet{}, fmt.Errorf("compact input-set transport cannot include explicit manifests or producer bindings")
+	}
+	if !compact && (len(opts.inputSetStoreAnchors) != 0 || len(opts.inputSetStorePacks) != 0) {
+		return resolvedActionPlanInputSet{}, fmt.Errorf("input-set store anchors and packs require compact manifest root")
+	}
+	if !compact && len(opts.inputSetManifests) == 0 {
+		return resolvedActionPlanInputSet{}, fmt.Errorf("input-set root %q has no manifests", opts.inputSetRoot)
+	}
+	if len(opts.inputSetManifests) > maxActionPlanInputSetManifests {
+		return resolvedActionPlanInputSet{}, fmt.Errorf(
+			"input set contains %d manifests, want at most %d", len(opts.inputSetManifests), maxActionPlanInputSetManifests,
+		)
+	}
+	if len(opts.inputSetSources) > maxActionPlanInputSetEntries {
+		return resolvedActionPlanInputSet{}, fmt.Errorf(
+			"input set contains %d source bindings, want at most %d", len(opts.inputSetSources), maxActionPlanInputSetEntries,
+		)
+	}
+	if len(opts.inputSetInputs) > maxActionPlanInputSetEntries {
+		return resolvedActionPlanInputSet{}, fmt.Errorf(
+			"input set contains %d producer bindings, want at most %d", len(opts.inputSetInputs), maxActionPlanInputSetEntries,
+		)
+	}
+	if len(opts.inputSetSources)+len(opts.inputSetInputs) > maxActionPlanInputSetEntries {
+		return resolvedActionPlanInputSet{}, fmt.Errorf(
+			"input set contains %d artifact bindings, want at most %d",
+			len(opts.inputSetSources)+len(opts.inputSetInputs), maxActionPlanInputSetEntries,
+		)
+	}
+
+	nodes := make(map[string]kconfig.ActionPlanInputSetNode, len(opts.inputSetManifests))
+	if compact {
+		var err error
+		nodes, err = loadCompactActionPlanInputSetManifests(opts.inputSetRoot, opts.inputSetManifestRoot)
+		if err != nil {
+			return resolvedActionPlanInputSet{}, err
+		}
+	}
+	totalBytes := 0
+	for _, id := range sortedKeys(opts.inputSetManifests) {
+		node, size, err := decodeActionPlanInputSetManifest(opts.inputSetManifests[id], id)
+		if err != nil {
+			return resolvedActionPlanInputSet{}, err
+		}
+		if size > maxActionPlanInputSetManifestTotalBytes-totalBytes {
+			return resolvedActionPlanInputSet{}, fmt.Errorf(
+				"input-set manifests exceed %d total bytes", maxActionPlanInputSetManifestTotalBytes,
+			)
+		}
+		totalBytes += size
+		nodes[id] = node
+	}
+	if err := validateActionPlanInputSetManifestGraph(opts.inputSetRoot, nodes); err != nil {
+		return resolvedActionPlanInputSet{}, err
+	}
+	store, err := kconfig.NewActionPlanInputSetStoreFromNodes(nodes)
+	if err != nil {
+		return resolvedActionPlanInputSet{}, fmt.Errorf("validate input-set manifests: %w", err)
+	}
+	closure, err := store.ReachableNodes(opts.inputSetRoot)
+	if err != nil {
+		return resolvedActionPlanInputSet{}, fmt.Errorf("validate input-set root %q: %w", opts.inputSetRoot, err)
+	}
+	if len(closure) != len(nodes) {
+		for _, id := range sortedKeys(opts.inputSetManifests) {
+			if _, reachable := closure[id]; !reachable {
+				return resolvedActionPlanInputSet{}, fmt.Errorf("input-set manifest %q is not reachable from root %q", id, opts.inputSetRoot)
+			}
+		}
+		return resolvedActionPlanInputSet{}, fmt.Errorf(
+			"input-set root %q reaches %d of %d manifests", opts.inputSetRoot, len(closure), len(nodes),
+		)
+	}
+
+	entries := make([]resolvedActionPlanInputSetEntry, 0, nodes[opts.inputSetRoot].Count)
+	expectedSources := map[string]bool{}
+	expectedInputs := map[string]bool{}
+	err = store.Walk(opts.inputSetRoot, func(entry kconfig.ActionPlanInputSetEntry) error {
+		if len(entries) == maxActionPlanInputSetEntries {
+			return fmt.Errorf("input set contains more than %d entries", maxActionPlanInputSetEntries)
+		}
+		if entry.AuxiliaryUse && !entry.CompilerUse {
+			return fmt.Errorf("input-set target %s/%s marks auxiliary use without compiler use", entry.Target.Kind, entry.Target.Path)
+		}
+		resolved := resolvedActionPlanInputSetEntry{entry: entry}
+		if entry.SourceID != "" {
+			expectedSources[entry.SourceID] = true
+			resolved.input = opts.inputSetSources[entry.SourceID]
+			resolved.provenance = entry.SourceID
+		} else {
+			binding := actionPlanInputSetProducerBinding(entry.ProducerID, entry.Slot)
+			expectedInputs[binding] = true
+			resolved.input = opts.inputSetInputs[binding]
+			resolved.provenance = binding
+		}
+		entries = append(entries, resolved)
+		return nil
+	})
+	if err != nil {
+		return resolvedActionPlanInputSet{}, fmt.Errorf("walk input-set root %q: %w", opts.inputSetRoot, err)
+	}
+	if len(entries) != nodes[opts.inputSetRoot].Count {
+		return resolvedActionPlanInputSet{}, fmt.Errorf(
+			"input-set root %q yielded %d entries, want %d", opts.inputSetRoot, len(entries), nodes[opts.inputSetRoot].Count,
+		)
+	}
+	if compact {
+		opts.inputSetInputs, err = resolveCompactActionPlanInputSetProducers(expectedInputs, opts.inputSetStoreAnchors, opts.inputSetStorePacks)
+		if err != nil {
+			return resolvedActionPlanInputSet{}, err
+		}
+		if len(expectedSources)+len(opts.inputSetInputs) > maxActionPlanInputSetEntries {
+			return resolvedActionPlanInputSet{}, fmt.Errorf("compact input set contains too many artifact bindings")
+		}
+		for index := range entries {
+			if entries[index].entry.ProducerID != "" {
+				entries[index].input = opts.inputSetInputs[entries[index].provenance]
+			}
+		}
+	}
+	if err := exactActionPlanInputSetBindings("source", expectedSources, opts.inputSetSources); err != nil {
+		return resolvedActionPlanInputSet{}, err
+	}
+	if err := exactActionPlanInputSetBindings("input", expectedInputs, opts.inputSetInputs); err != nil {
+		return resolvedActionPlanInputSet{}, err
+	}
+	for _, name := range sortedKeys(opts.inputSetSources) {
+		if err := validateActionPlanInputSetArtifact("source", name, opts.inputSetSources[name]); err != nil {
+			return resolvedActionPlanInputSet{}, err
+		}
+	}
+	for _, name := range sortedKeys(opts.inputSetInputs) {
+		if err := validateActionPlanInputSetArtifact("input", name, opts.inputSetInputs[name]); err != nil {
+			return resolvedActionPlanInputSet{}, err
+		}
+	}
+	if err := validateActionPlanInputSetTargetShapes(entries); err != nil {
+		return resolvedActionPlanInputSet{}, err
+	}
+	return resolvedActionPlanInputSet{root: opts.inputSetRoot, entries: entries}, nil
 }
 
 // resolveRecipeInputBindings expands the compact, content-addressed per-node
@@ -201,17 +739,94 @@ func resolveRecipeInputBindings(recipeInputs []string, opts recipeOptions) (map[
 	return resolved, nil
 }
 
-func preparePrivateInputTreeProjections(recipeInputs []string, opts *recipeOptions) (func(), error) {
+func preparePrivateInputTreeProjections(recipeInputs, recipeSources []string, opts *recipeOptions) (func(), error) {
+	return preparePrivateInputTreeProjectionsWithInputSet(recipeInputs, recipeSources, resolvedActionPlanInputSet{}, opts)
+}
+
+func sameRecipeInput(left, right string) bool {
+	leftAbsolute, leftErr := filepath.Abs(left)
+	rightAbsolute, rightErr := filepath.Abs(right)
+	return leftErr == nil && rightErr == nil && filepath.Clean(leftAbsolute) == filepath.Clean(rightAbsolute)
+}
+
+func validateActionPlanInputSetTargets(recipe kconfig.ActionRecipe, inputSet resolvedActionPlanInputSet, opts recipeOptions) error {
+	for _, resolved := range inputSet.entries {
+		target := resolved.entry.Target
+		switch target.Kind {
+		case kconfig.ActionPlanInputSetWorkTarget:
+			if recipe.WorkingDirectory == "" || opts.workingDirectory == "" {
+				return fmt.Errorf("input-set work target %q requires a private recipe working directory", target.Path)
+			}
+		case kconfig.ActionPlanInputSetTreeTarget:
+			if opts.trees[target.Tree] == "" {
+				return fmt.Errorf("input-set tree target %s/%s has no declared tree binding", target.Tree, target.Path)
+			}
+			if !opts.privateInputTrees[target.Tree] {
+				return fmt.Errorf("input-set tree target %s/%s requires private input tree %q", target.Tree, target.Path, target.Tree)
+			}
+		case kconfig.ActionPlanInputSetAmbientTarget:
+			// Ambient entries are already materialized by Bazel at their bound
+			// artifact paths. They grant dependency authority without asking the
+			// runner to mutate an execroot-relative path.
+		default:
+			return fmt.Errorf("input-set target %q has unsupported kind %q", target.Path, target.Kind)
+		}
+	}
+	return nil
+}
+
+func preparePrivateInputTreeProjectionsWithInputSet(
+	recipeInputs, recipeSources []string,
+	inputSet resolvedActionPlanInputSet,
+	opts *recipeOptions,
+) (func(), error) {
 	cleanup := func() {}
+	inputManifestMode := opts.inputBindings != "" || opts.expectedInputBindingsID != ""
+	sourceManifestMode := opts.sourceProjections != "" || opts.expectedSourceProjectionsID != ""
+	inputSetTreeMode := false
+	for _, resolved := range inputSet.entries {
+		if resolved.entry.Target.Kind == kconfig.ActionPlanInputSetTreeTarget {
+			inputSetTreeMode = true
+			break
+		}
+	}
 	if len(opts.privateInputTrees) == 0 {
+		if sourceManifestMode {
+			return cleanup, fmt.Errorf("source projections require a private input tree")
+		}
+		if inputSetTreeMode {
+			return cleanup, fmt.Errorf("input-set tree targets require a private input tree")
+		}
 		return cleanup, nil
 	}
-	if opts.inputBindings == "" || opts.expectedInputBindingsID == "" {
-		return cleanup, fmt.Errorf("private input trees require an input bindings manifest")
+	if !inputManifestMode && !sourceManifestMode && !inputSetTreeMode {
+		return cleanup, fmt.Errorf("private input trees require an input bindings, source projections, or input-set manifest")
 	}
-	manifest, err := decodeInputBindings(opts.inputBindings, opts.expectedInputBindingsID)
-	if err != nil {
-		return cleanup, err
+	inputManifest := kconfig.ActionPlanInputBindings{
+		Schema: kconfig.LinuxKernelInputBindingsSchema, Bindings: map[string]kconfig.ActionPlanInputBinding{},
+	}
+	if inputManifestMode {
+		if opts.inputBindings == "" || opts.expectedInputBindingsID == "" {
+			return cleanup, fmt.Errorf("private input-tree input bindings require both manifest and expected ID")
+		}
+		var err error
+		inputManifest, err = decodeInputBindings(opts.inputBindings, opts.expectedInputBindingsID)
+		if err != nil {
+			return cleanup, err
+		}
+	}
+	sourceManifest := kconfig.ActionPlanSourceProjections{
+		Schema: kconfig.LinuxKernelSourceProjectionsSchema, Bindings: map[string]kconfig.ActionPlanSourceProjectionBinding{},
+	}
+	if sourceManifestMode {
+		if opts.sourceProjections == "" || opts.expectedSourceProjectionsID == "" {
+			return cleanup, fmt.Errorf("private input-tree source projections require both manifest and expected ID")
+		}
+		var err error
+		sourceManifest, err = decodeSourceProjections(opts.sourceProjections, opts.expectedSourceProjectionsID)
+		if err != nil {
+			return cleanup, err
+		}
 	}
 	declaredTrees := make(map[string]bool, len(opts.trees))
 	for name := range opts.trees {
@@ -220,6 +835,29 @@ func preparePrivateInputTreeProjections(recipeInputs []string, opts *recipeOptio
 	for name := range opts.privateInputTrees {
 		if !declaredTrees[name] {
 			return cleanup, fmt.Errorf("private input tree %q has no declared tree binding", name)
+		}
+	}
+	for bindingName, binding := range sourceManifest.Bindings {
+		if !opts.privateInputTrees[binding.Tree] {
+			return cleanup, fmt.Errorf("source projection %q targets non-private tree %q", bindingName, binding.Tree)
+		}
+	}
+	for _, resolved := range inputSet.entries {
+		target := resolved.entry.Target
+		if target.Kind == kconfig.ActionPlanInputSetTreeTarget && !opts.privateInputTrees[target.Tree] {
+			return cleanup, fmt.Errorf("input-set tree target %s/%s targets non-private tree", target.Tree, target.Path)
+		}
+	}
+	recipeSourceBindings := make(map[string]bool, len(recipeSources))
+	for _, binding := range recipeSources {
+		recipeSourceBindings[binding] = true
+	}
+	for bindingName := range sourceManifest.Bindings {
+		if !recipeSourceBindings[bindingName] {
+			return cleanup, fmt.Errorf("source projection %q is not a declared recipe source", bindingName)
+		}
+		if opts.sources[bindingName] == "" {
+			return cleanup, fmt.Errorf("source projection %q has no resolved source", bindingName)
 		}
 	}
 
@@ -240,9 +878,41 @@ func preparePrivateInputTreeProjections(recipeInputs []string, opts *recipeOptio
 			return func() {}, fmt.Errorf("create private input tree %q: %w", name, err)
 		}
 		materialized := map[string]string{}
+		project := func(projectionPath, source, description string) error {
+			destination := filepath.Join(projection, filepath.FromSlash(projectionPath))
+			contained, err := recipeTreeContains(projection, destination)
+			if err != nil || !contained {
+				return fmt.Errorf("private input tree %q path %q escapes its projection", name, projectionPath)
+			}
+			if prior := materialized[projectionPath]; prior != "" {
+				if !sameRecipeInput(prior, source) {
+					return fmt.Errorf("private input tree %q path %q has conflicting inputs", name, projectionPath)
+				}
+				return nil
+			}
+			for parent := pathParent(projectionPath); parent != ""; parent = pathParent(parent) {
+				if materialized[parent] != "" {
+					return fmt.Errorf("private input tree %q path %q is below projected file %q", name, projectionPath, parent)
+				}
+			}
+			paths := sortedKeys(materialized)
+			prefix := projectionPath + "/"
+			if index := sort.SearchStrings(paths, prefix); index < len(paths) && strings.HasPrefix(paths[index], prefix) {
+				return fmt.Errorf("private input tree %q projected file %q is below path %q", name, paths[index], projectionPath)
+			}
+			if err := copyRecipeFile(source, destination); err != nil {
+				return fmt.Errorf("project private input tree %q %s at %q: %w", name, description, projectionPath, err)
+			}
+			materialized[projectionPath] = source
+			return nil
+		}
 		for _, bindingName := range recipeInputs {
-			binding, exists := manifest.Bindings[bindingName]
-			if !exists || binding.Tree != name {
+			binding, exists := inputManifest.Bindings[bindingName]
+			projectionTree, projectionPath := binding.Tree, binding.Path
+			if binding.ProjectionTree != "" {
+				projectionTree, projectionPath = binding.ProjectionTree, binding.ProjectionPath
+			}
+			if !exists || projectionTree != name {
 				continue
 			}
 			source := opts.inputs[bindingName]
@@ -250,28 +920,146 @@ func preparePrivateInputTreeProjections(recipeInputs []string, opts *recipeOptio
 				cleanup()
 				return func() {}, fmt.Errorf("private input tree %q has no resolved input %q", name, bindingName)
 			}
-			destination := filepath.Join(projection, filepath.FromSlash(binding.Path))
-			contained, err := recipeTreeContains(projection, destination)
-			if err != nil || !contained {
+			if err := project(projectionPath, source, "generated input "+bindingName); err != nil {
 				cleanup()
-				return func() {}, fmt.Errorf("private input tree %q path %q escapes its projection", name, binding.Path)
+				return func() {}, err
 			}
-			if prior := materialized[binding.Path]; prior != "" {
-				if filepath.Clean(prior) != filepath.Clean(source) {
-					cleanup()
-					return func() {}, fmt.Errorf("private input tree %q path %q has conflicting inputs", name, binding.Path)
-				}
+		}
+		for _, bindingName := range sortedKeys(opts.sources) {
+			binding, exists := sourceManifest.Bindings[bindingName]
+			if !exists || binding.Tree != name {
 				continue
 			}
-			if err := copyRecipeFile(source, destination); err != nil {
+			if err := project(binding.Path, opts.sources[bindingName], "immutable source "+bindingName); err != nil {
 				cleanup()
-				return func() {}, fmt.Errorf("project private input tree %q path %q: %w", name, binding.Path, err)
+				return func() {}, err
 			}
-			materialized[binding.Path] = source
+		}
+		for _, resolved := range inputSet.entries {
+			target := resolved.entry.Target
+			if target.Kind != kconfig.ActionPlanInputSetTreeTarget || target.Tree != name {
+				continue
+			}
+			if err := project(target.Path, resolved.input, "input-set provenance "+resolved.provenance); err != nil {
+				cleanup()
+				return func() {}, err
+			}
 		}
 		opts.trees[name] = projection
 	}
 	return cleanup, nil
+}
+
+func inputSetWorkEntries(inputSet resolvedActionPlanInputSet) []resolvedActionPlanInputSetEntry {
+	entries := []resolvedActionPlanInputSetEntry{}
+	for _, resolved := range inputSet.entries {
+		if resolved.entry.Target.Kind == kconfig.ActionPlanInputSetWorkTarget {
+			entries = append(entries, resolved)
+		}
+	}
+	return entries
+}
+
+func validateInputSetWorkCollisions(
+	entries []resolvedActionPlanInputSetEntry,
+	workingInputs map[string]string,
+	bindings map[string]map[string]string,
+) (map[string]bool, error) {
+	setByPath := make(map[string]resolvedActionPlanInputSetEntry, len(entries))
+	setPaths := make([]string, 0, len(entries))
+	for _, resolved := range entries {
+		pathname := resolved.entry.Target.Path
+		setByPath[pathname] = resolved
+		setPaths = append(setPaths, pathname)
+	}
+	sort.Strings(setPaths)
+	duplicates := map[string]bool{}
+	for _, reference := range sortedKeys(workingInputs) {
+		kind, name, ok := strings.Cut(reference, ":")
+		if !ok || bindings[kind] == nil {
+			return nil, fmt.Errorf("working input %q has no typed binding", reference)
+		}
+		source := bindings[kind][name]
+		pathname := workingInputs[reference]
+		if existing, found := setByPath[pathname]; found {
+			if !sameRecipeInput(existing.input, source) {
+				return nil, fmt.Errorf(
+					"input-set work target %q from %s conflicts with working input %s",
+					pathname, existing.provenance, reference,
+				)
+			}
+			duplicates[pathname] = true
+		}
+		for parent := pathParent(pathname); parent != ""; parent = pathParent(parent) {
+			if existing, found := setByPath[parent]; found {
+				return nil, fmt.Errorf(
+					"working input %s at %q is below input-set file target %q from %s",
+					reference, pathname, parent, existing.provenance,
+				)
+			}
+		}
+		prefix := pathname + "/"
+		index := sort.SearchStrings(setPaths, prefix)
+		if index < len(setPaths) && strings.HasPrefix(setPaths[index], prefix) {
+			existing := setByPath[setPaths[index]]
+			return nil, fmt.Errorf(
+				"input-set work target %q from %s is below working input %s at %q",
+				setPaths[index], existing.provenance, reference, pathname,
+			)
+		}
+	}
+	return duplicates, nil
+}
+
+func materializeActionPlanInputSetWork(
+	inputSet resolvedActionPlanInputSet,
+	workingRoot string,
+	workingInputs map[string]string,
+	bindings map[string]map[string]string,
+) error {
+	entries := inputSetWorkEntries(inputSet)
+	if len(entries) == 0 {
+		return nil
+	}
+	if workingRoot == "" {
+		return fmt.Errorf("input-set work targets require an expanded private working root")
+	}
+	duplicates, err := validateInputSetWorkCollisions(entries, workingInputs, bindings)
+	if err != nil {
+		return err
+	}
+	for _, resolved := range entries {
+		pathname := resolved.entry.Target.Path
+		if duplicates[pathname] {
+			// The later direct WorkingInputs pass owns the identical projection.
+			continue
+		}
+		destination := filepath.Join(workingRoot, filepath.FromSlash(pathname))
+		contained, err := recipeTreeContains(workingRoot, destination)
+		if err != nil {
+			return fmt.Errorf("resolve input-set work target %q: %w", pathname, err)
+		}
+		if !contained {
+			return fmt.Errorf("input-set work target %q escapes its private working root", pathname)
+		}
+		if err := validateRecipeOutputAncestors(workingRoot, destination); err != nil {
+			return fmt.Errorf("materialize input-set work target %q: %w", pathname, err)
+		}
+		if info, err := os.Lstat(destination); err == nil {
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("input-set work target %q collides with a non-regular working path", pathname)
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect input-set work target %q: %w", pathname, err)
+		}
+		if sameRecipeInput(resolved.input, destination) {
+			continue
+		}
+		if err := copyRecipeFile(resolved.input, destination); err != nil {
+			return fmt.Errorf("materialize input-set work target %q from %s: %w", pathname, resolved.provenance, err)
+		}
+	}
+	return nil
 }
 
 func runRecipe(opts recipeOptions) error {
@@ -367,6 +1155,13 @@ func runRecipe(opts recipeOptions) error {
 			return err
 		}
 	}
+	inputSet, err := loadActionPlanInputSet(opts)
+	if err != nil {
+		return err
+	}
+	if err := validateActionPlanInputSetTargets(recipe, inputSet, opts); err != nil {
+		return err
+	}
 	if err := prepareWorkingDirectory(opts.workingDirectory, opts.workingDirectoryMarker); err != nil {
 		return err
 	}
@@ -382,13 +1177,11 @@ func runRecipe(opts recipeOptions) error {
 			cleanup()
 		}
 	}()
-	if len(opts.privateInputTrees) != 0 {
-		cleanup, err := preparePrivateInputTreeProjections(recipe.Inputs, &opts)
-		if err != nil {
-			return err
-		}
-		cleanups = append(cleanups, cleanup)
+	privateTreeCleanup, err := preparePrivateInputTreeProjectionsWithInputSet(recipe.Inputs, recipe.Sources, inputSet, &opts)
+	if err != nil {
+		return err
 	}
+	cleanups = append(cleanups, privateTreeCleanup)
 	runtimeToolDirectory := ""
 	if len(opts.runtimeTools) != 0 {
 		var cleanup func()
@@ -529,6 +1322,16 @@ func runRecipe(opts recipeOptions) error {
 			if err := copyRecipeTree(opts.trees[binding], workingRoot); err != nil {
 				return fmt.Errorf("stage working tree %s: %w", binding, err)
 			}
+		}
+		// Compare set/direct collisions against the declared artifact paths, not
+		// inputBindings: executable inputs may already have been copied to a
+		// private chmod-capable location by this point.
+		declaredInputBindings := map[string]map[string]string{
+			"source": opts.sources,
+			"input":  opts.inputs,
+		}
+		if err := materializeActionPlanInputSetWork(inputSet, workingRoot, recipe.WorkingInputs, declaredInputBindings); err != nil {
+			return err
 		}
 		for _, binding := range sortedKeys(recipe.WorkingInputs) {
 			kind, name, _ := strings.Cut(binding, ":")
@@ -1334,6 +2137,9 @@ func absolutizeWorkingRecipeOptions(opts *recipeOptions) error {
 	if opts.workingDirectoryMarker != "" {
 		paths["working-directory marker"] = &opts.workingDirectoryMarker
 	}
+	if opts.inputSetManifestRoot != "" {
+		paths["input-set manifest root"] = &opts.inputSetManifestRoot
+	}
 	for name, value := range paths {
 		absolute, err := filepath.Abs(*value)
 		if err != nil {
@@ -1344,6 +2150,9 @@ func absolutizeWorkingRecipeOptions(opts *recipeOptions) error {
 	for kind, values := range map[string]map[string]string{
 		"source": opts.sources, "input": opts.inputs, "output": opts.outputs,
 		"tool": opts.tools, "runtime tool": opts.runtimeTools, "tree": opts.trees,
+		"input-set manifest": opts.inputSetManifests, "input-set source": opts.inputSetSources,
+		"input-set input":        opts.inputSetInputs,
+		"input-set store anchor": opts.inputSetStoreAnchors,
 	} {
 		for name, value := range values {
 			absolute, err := filepath.Abs(value)
@@ -2015,7 +2824,24 @@ func isDigest(value string) bool {
 }
 
 func main() {
+	arguments, err := expandArgumentChunks(os.Args[1:])
+	if err == nil && len(arguments) > 0 && arguments[0] == "-write_argument_chunk" {
+		if len(arguments) < 3 || arguments[2] != "--" {
+			err = fmt.Errorf("-write_argument_chunk requires OUTPUT -- ARGUMENTS...")
+		} else {
+			err = writeArgumentChunk(arguments[1], arguments[3:])
+		}
+		if err == nil {
+			return
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: %v\n", err)
+		os.Exit(2)
+	}
 	var sourceFlags, inputFlags, outputFlags, toolFlags, runtimeToolFlags, treeFlags, artifactTreeFlags, privateInputTreeFlags, actionArgs, actionEnvironment repeatedFlag
+	var inputSetManifestFlags, inputSetSourceFlags, inputSetInputFlags repeatedFlag
+	var inputSetStoreAnchorFlags, inputSetStorePackFlags compactInputSetFlags
 	var auxiliaryActionRoles, auxiliaryActionArguments, auxiliaryActionEnvironment repeatedFlag
 	var toolsetIdentities, toolsetManifests, toolsetAnchors repeatedFlag
 	recipe := flag.String("recipe", "", "v4 action recipe JSON")
@@ -2024,6 +2850,12 @@ func main() {
 	expectedRecipeID := flag.String("expected_recipe_id", "", "content-addressed recipe ID")
 	inputBindings := flag.String("input_bindings", "", "canonical per-node input bindings manifest")
 	expectedInputBindingsID := flag.String("expected_input_bindings_id", "", "content ID of the input bindings manifest")
+	sourceProjections := flag.String("source_projections", "", "canonical per-node immutable source projections manifest")
+	expectedSourceProjectionsID := flag.String("expected_source_projections_id", "", "content ID of the source projections manifest")
+	var inputSetRoot singleFlag
+	flag.Var(&inputSetRoot, "input_set_root", "content ID of the node's persistent input-set root")
+	var inputSetManifestRoot singleFlag
+	flag.Var(&inputSetManifestRoot, "input_set_manifest_root", "typed root manifest for compact family input-set transport")
 	toolRole := flag.String("tool_role", "", "tool role encoded by the node")
 	workingDirectoryMarker := flag.String("working_directory_marker", "", "declared output proving the private working root was cleaned")
 	copyMode := flag.Bool("copy_tree_file", false, "project one TreeArtifact child to a fixed output")
@@ -2039,6 +2871,11 @@ func main() {
 	flag.Var(&treeFlags, "input_tree", "recipe input-tree binding NAME=ROOT (repeatable)")
 	flag.Var(&artifactTreeFlags, "artifact_tree", "input-binding artifact tree TREE=ROOT (repeatable)")
 	flag.Var(&privateInputTreeFlags, "private_input_tree", "current-stage tree projected from exact inputs (repeatable)")
+	flag.Var(&inputSetManifestFlags, "input_set_manifest", "persistent input-set node binding ID=PATH (repeatable)")
+	flag.Var(&inputSetSourceFlags, "input_set_source", "persistent input-set source binding SOURCE_ID=PATH (repeatable)")
+	flag.Var(&inputSetInputFlags, "input_set_input", "persistent input-set producer binding PRODUCER_ID:SLOT=PATH (repeatable)")
+	flag.Var(&inputSetStoreAnchorFlags, "input_set_store_anchor", "compact producer store anchor INDEX:PRODUCER_ID:SLOT=PATH (repeatable)")
+	flag.Var(&inputSetStorePackFlags, "input_set_store_pack", "compact producer store indices START:INDEX.INDEX... (repeatable)")
 	flag.Var(&actionArgs, "action_arg", "configured tool action argument (repeatable)")
 	flag.Var(&actionEnvironment, "action_env", "configured tool action environment NAME=VALUE (repeatable)")
 	flag.Var(&auxiliaryActionRoles, "auxiliary_action_role", "auxiliary configured action role (repeatable)")
@@ -2047,7 +2884,7 @@ func main() {
 	flag.Var(&toolsetIdentities, "toolset_identity", "identity-bound toolset scope SCOPE=SHA256 (repeatable)")
 	flag.Var(&toolsetManifests, "toolset_manifest", "identity-bound toolset manifest SCOPE=PATH (repeatable)")
 	flag.Var(&toolsetAnchors, "toolset_anchor", "typed toolset root anchor SCOPE=ROOT=PATH (repeatable)")
-	flag.Parse()
+	_ = flag.CommandLine.Parse(arguments)
 	workingDirectory := ""
 	if *workingDirectoryMarker != "" {
 		// The callback supplies the declared marker as a typed Artifact so Bazel
@@ -2098,6 +2935,26 @@ func main() {
 		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: artifact tree bindings: %v\n", err)
 		os.Exit(2)
 	}
+	inputSetManifests, err := namedBindings(inputSetManifestFlags)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: input-set manifest bindings: %v\n", err)
+		os.Exit(2)
+	}
+	inputSetSources, err := namedBindings(inputSetSourceFlags)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: input-set source bindings: %v\n", err)
+		os.Exit(2)
+	}
+	inputSetInputs, err := namedBindings(inputSetInputFlags)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: input-set input bindings: %v\n", err)
+		os.Exit(2)
+	}
+	inputSetStoreAnchors, err := namedBindings(inputSetStoreAnchorFlags.values)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: input-set store anchors: %v\n", err)
+		os.Exit(2)
+	}
 	privateInputTrees := map[string]bool{}
 	for _, name := range privateInputTreeFlags {
 		if name == "" || strings.ContainsAny(name, "=/\\\x00\r\n\t ") {
@@ -2115,8 +2972,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: auxiliary action contracts: %v\n", err)
 		os.Exit(2)
 	}
-	opts := recipeOptions{recipe: *recipe, kind: *kind, expectedNodeID: *expectedNodeID, expectedRecipeID: *expectedRecipeID, inputBindings: *inputBindings, expectedInputBindingsID: *expectedInputBindingsID, toolRole: *toolRole, workingDirectory: workingDirectory, workingDirectoryMarker: *workingDirectoryMarker, actionArgs: actionArgs,
+	opts := recipeOptions{recipe: *recipe, kind: *kind, expectedNodeID: *expectedNodeID, expectedRecipeID: *expectedRecipeID, inputBindings: *inputBindings, expectedInputBindingsID: *expectedInputBindingsID, sourceProjections: *sourceProjections, expectedSourceProjectionsID: *expectedSourceProjectionsID, inputSetRoot: inputSetRoot.value, toolRole: *toolRole, workingDirectory: workingDirectory, workingDirectoryMarker: *workingDirectoryMarker, actionArgs: actionArgs,
 		actionEnvironment: actionEnv, auxiliaryActionContracts: auxiliaryContracts, sources: *bindings[0].out, inputs: *bindings[1].out, outputs: *bindings[2].out, tools: *bindings[3].out, runtimeTools: runtimeTools, trees: *bindings[4].out, artifactTrees: artifactTrees, privateInputTrees: privateInputTrees,
+		inputSetManifests: inputSetManifests, inputSetSources: inputSetSources, inputSetInputs: inputSetInputs,
+		inputSetManifestRoot: inputSetManifestRoot.value, inputSetStoreAnchors: inputSetStoreAnchors, inputSetStorePacks: inputSetStorePackFlags.values,
 		toolsetIdentities: toolsetIdentities, toolsetManifests: toolsetManifests, toolsetAnchors: toolsetAnchors}
 	if err := runRecipe(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: %v\n", err)

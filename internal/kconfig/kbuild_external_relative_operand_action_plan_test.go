@@ -346,12 +346,6 @@ func TestExternalLinearCompilerKeepsPreparedOverlayIncludeFromNestedMakeDirector
 	if wrongInclude := "-I" + nestedDirectory + "/" + directory; slices.Contains(recipe.Arguments, wrongInclude) {
 		t.Fatalf("external linear compiler arguments retain doubly scoped include %q: %#v", wrongInclude, recipe.Arguments)
 	}
-	if !slices.Contains(sortedStringMapValues(recipe.WorkingInputs), preparedHeader) {
-		t.Fatalf(
-			"external linear compiler working inputs = %#v, want prepared header %q from the overlay include root",
-			recipe.WorkingInputs, preparedHeader,
-		)
-	}
 	preparedSourceID := ""
 	for _, planSource := range plan.Sources {
 		if planSource.Namespace == "prep" && planSource.Path == preparedHeader {
@@ -359,13 +353,28 @@ func TestExternalLinearCompilerKeepsPreparedOverlayIncludeFromNestedMakeDirector
 			break
 		}
 	}
-	if preparedSourceID == "" || !slices.ContainsFunc(node.Sources, func(edge ActionPlanSourceEdge) bool {
-		return edge.SourceID == preparedSourceID
-	}) {
+	if preparedSourceID == "" {
 		t.Fatalf(
-			"external linear compiler sources = %#v from %#v, want prepared header %q",
-			node.Sources, plan.Sources, preparedHeader,
+			"external linear compiler sources = %#v, want prepared header %q",
+			plan.Sources, preparedHeader,
 		)
+	}
+	preparedInput, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, node, preparedHeader)
+	wantPreparedInput := ActionPlanInputSetEntry{
+		Target: ActionPlanInputSetTarget{
+			Kind: ActionPlanInputSetWorkTarget,
+			Path: preparedHeader,
+		},
+		SourceID: preparedSourceID,
+	}
+	if !found || preparedInput != wantPreparedInput {
+		t.Fatalf(
+			"external linear compiler prepared input = %#v, found %t, want exact persistent provenance %#v",
+			preparedInput, found, wantPreparedInput,
+		)
+	}
+	if err := contentAddressActionPlanNodes(plan); err != nil {
+		t.Fatalf("content-address external linear compiler action plan: %v", err)
 	}
 	if _, err := plan.entries(); err != nil {
 		t.Fatalf("validate external linear compiler action plan: %v", err)

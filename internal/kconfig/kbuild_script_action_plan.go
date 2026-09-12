@@ -90,8 +90,37 @@ func compactKbuildProjectedSourceScriptEnvironmentForMakeTarget(
 	inline map[string]string,
 	usage compactKbuildSourceScriptEnvironmentUsage,
 ) (map[string]string, []KbuildActionRoleRef, error) {
+	return compactKbuildProjectedSourceScriptEnvironmentForMakeTargetWithResolution(
+		profile, target, lookupTarget, automaticTarget, stem, normal, orderOnly,
+		injected, inline, usage, true,
+	)
+}
+
+func compactKbuildProjectedSourceScriptEnvironmentSymbolicForMakeTarget(
+	profile CompactKbuildProfile,
+	target, lookupTarget, automaticTarget, stem string,
+	normal, orderOnly []string,
+	injected map[string]string,
+	inline map[string]string,
+	usage compactKbuildSourceScriptEnvironmentUsage,
+) (map[string]string, []KbuildActionRoleRef, error) {
+	return compactKbuildProjectedSourceScriptEnvironmentForMakeTargetWithResolution(
+		profile, target, lookupTarget, automaticTarget, stem, normal, orderOnly,
+		injected, inline, usage, false,
+	)
+}
+
+func compactKbuildProjectedSourceScriptEnvironmentForMakeTargetWithResolution(
+	profile CompactKbuildProfile,
+	target, lookupTarget, automaticTarget, stem string,
+	normal, orderOnly []string,
+	injected map[string]string,
+	inline map[string]string,
+	usage compactKbuildSourceScriptEnvironmentUsage,
+	resolveSymbolic bool,
+) (map[string]string, []KbuildActionRoleRef, error) {
 	values, err := evaluateCompactKbuildTargetEnvironmentForMakeTarget(
-		profile, target, lookupTarget, automaticTarget, stem, normal, orderOnly, injected, true,
+		profile, target, lookupTarget, automaticTarget, stem, normal, orderOnly, injected, resolveSymbolic,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -215,9 +244,42 @@ func compactKbuildSourceScriptExportedEnvironmentForMakeTarget(
 	expectedScope string,
 	configured []KbuildActionRoleRef,
 ) (map[string]string, []string, error) {
-	environment, _, err := compactKbuildProjectedSourceScriptEnvironmentForMakeTarget(
+	return compactKbuildSourceScriptExportedEnvironmentForMakeTargetWithResolution(
 		profile, target, lookupTarget, automaticTarget, stem, normal, orderOnly,
-		injected, inline, usage,
+		injected, inline, usage, expectedScope, configured, true,
+	)
+}
+
+func compactKbuildSourceScriptExportedEnvironmentSymbolicForMakeTarget(
+	profile CompactKbuildProfile,
+	target, lookupTarget, automaticTarget, stem string,
+	normal, orderOnly []string,
+	injected map[string]string,
+	inline map[string]string,
+	usage compactKbuildSourceScriptEnvironmentUsage,
+	expectedScope string,
+	configured []KbuildActionRoleRef,
+) (map[string]string, []string, error) {
+	return compactKbuildSourceScriptExportedEnvironmentForMakeTargetWithResolution(
+		profile, target, lookupTarget, automaticTarget, stem, normal, orderOnly,
+		injected, inline, usage, expectedScope, configured, false,
+	)
+}
+
+func compactKbuildSourceScriptExportedEnvironmentForMakeTargetWithResolution(
+	profile CompactKbuildProfile,
+	target, lookupTarget, automaticTarget, stem string,
+	normal, orderOnly []string,
+	injected map[string]string,
+	inline map[string]string,
+	usage compactKbuildSourceScriptEnvironmentUsage,
+	expectedScope string,
+	configured []KbuildActionRoleRef,
+	resolveSymbolic bool,
+) (map[string]string, []string, error) {
+	environment, _, err := compactKbuildProjectedSourceScriptEnvironmentForMakeTargetWithResolution(
+		profile, target, lookupTarget, automaticTarget, stem, normal, orderOnly,
+		injected, inline, usage, resolveSymbolic,
 	)
 	if err != nil {
 		return nil, nil, err

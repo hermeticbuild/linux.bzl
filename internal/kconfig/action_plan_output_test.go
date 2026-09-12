@@ -39,6 +39,43 @@ func readActionPlanFilesForTest(root string) (map[string][]byte, error) {
 	return out, err
 }
 
+func actionPlanNodeInputSetEntriesForTest(t *testing.T, plan *ActionPlan, node ActionPlanNode) []ActionPlanInputSetEntry {
+	t.Helper()
+	store, err := plan.planningActionPlanInputSetStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []ActionPlanInputSetEntry{}
+	if err := store.Walk(node.InputSet, func(entry ActionPlanInputSetEntry) error {
+		entries = append(entries, entry)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return entries
+}
+
+func actionPlanNodeInputSetEntryForPathForTest(
+	t *testing.T,
+	plan *ActionPlan,
+	node ActionPlanNode,
+	pathname string,
+) (ActionPlanInputSetEntry, bool) {
+	t.Helper()
+	store, err := plan.planningActionPlanInputSetStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, found, err := store.Lookup(node.InputSet, ActionPlanInputSetTarget{
+		Kind: ActionPlanInputSetWorkTarget,
+		Path: pathname,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return entry, found
+}
+
 func actionPlanStageOutputsForTest(root string) map[string]string {
 	outputs := make(map[string]string, len(linuxKernelPlanStageOrder))
 	for _, stage := range linuxKernelPlanStageOrder {
@@ -161,6 +198,47 @@ func TestActionPlanWritesDeterministicV4StageMarkers(t *testing.T) {
 		if _, ok := a[marker]; !ok {
 			t.Errorf("missing marker %s", marker)
 		}
+	}
+}
+
+func TestWriteActionPlanTreeRollsBackPartiallyPublishedPrecreatedRoot(t *testing.T) {
+	root := t.TempDir()
+	output := filepath.Join(root, "plan")
+	if err := os.Mkdir(output, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entries := []actionPlanEntry{
+		{path: "first/marker", data: []byte("first\n")},
+		{path: "second/marker", data: []byte("second\n")},
+		{path: "third/marker", data: []byte("third\n")},
+	}
+	renameCalls := 0
+	err := writeActionPlanTreeUsingRename(output, entries, func(oldPath, newPath string) error {
+		renameCalls++
+		if renameCalls == 2 {
+			return fs.ErrPermission
+		}
+		return os.Rename(oldPath, newPath)
+	})
+	if err == nil || !strings.Contains(err.Error(), "publish action-plan child") {
+		t.Fatalf("partial publication error = %v, want injected child rename failure", err)
+	}
+	if renameCalls != 3 {
+		t.Fatalf("rename calls = %d, want first publication, failed second publication, and rollback", renameCalls)
+	}
+	children, err := os.ReadDir(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 0 {
+		t.Fatalf("precreated output retains children after rollback: %v", children)
+	}
+	temporary, err := filepath.Glob(filepath.Join(root, ".plan.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temporary) != 0 {
+		t.Fatalf("action-plan staging directories remain after rollback: %v", temporary)
 	}
 }
 
@@ -646,6 +724,179 @@ func TestActionPlanWritesSelfContainedStageShards(t *testing.T) {
 			if strings.HasPrefix(marker, "nodes/") || strings.HasPrefix(marker, "recipes/") || strings.HasPrefix(marker, "sources/") {
 				t.Errorf("empty %s shard retains action marker %s", stage, marker)
 			}
+		}
+	}
+}
+
+func TestActionPlanWritesStageShardsWithSharedInputSets(t *testing.T) {
+	producerRecipe := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "cc",
+		Arguments: []string{"${output:00000000}", "${output:00000001}", "${output:00000002}"},
+		Outputs:   []string{"00000000", "00000001", "00000002"},
+	}
+	producerRecipeID, err := producerRecipe.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumerRecipe := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "cc",
+		Arguments: []string{"${output:00000000}"}, Outputs: []string{"00000000"},
+	}
+	consumerRecipeID, err := consumerRecipe.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer := ActionPlanNode{
+		Stage: "prehost", Kind: "generate", Recipe: producerRecipeID, Tool: "cc", Product: "sdk",
+		Outputs: []ActionPlanOutput{
+			{Tree: "prehost", Path: "shared"},
+			{Tree: "prehost", Path: "target-only"},
+			{Tree: "prehost", Path: "unused"},
+		},
+	}
+	producer.ID = producer.ContentID()
+	store := NewActionPlanInputSetStore()
+	insert := func(root string, entry ActionPlanInputSetEntry) string {
+		t.Helper()
+		next, err := store.Insert(root, entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return next
+	}
+	const sharedSourceCount = 40
+	sources := make([]ActionPlanSource, sharedSourceCount+3)
+	sharedRoot := ""
+	for index := range sources {
+		sources[index] = ActionPlanSource{
+			ID: "src-" + planOrdinal(index+1), Namespace: "kernel", Path: fmt.Sprintf("include/%d.h", index),
+		}
+		if index < sharedSourceCount {
+			sharedRoot = insert(sharedRoot, ActionPlanInputSetEntry{
+				Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: sources[index].Path},
+				SourceID: sources[index].ID,
+			})
+		}
+	}
+	sharedRoot = insert(sharedRoot, ActionPlanInputSetEntry{
+		Target: ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "shared"}, ProducerID: producer.ID,
+	})
+	newConsumer := func(stage, root, output string) ActionPlanNode {
+		tree := "objects"
+		if stage == "prep" {
+			tree = "prep"
+		}
+		node := ActionPlanNode{
+			Stage: stage, Kind: "generate", Recipe: consumerRecipeID, Tool: "cc", Product: "sdk", InputSet: root,
+			Outputs: []ActionPlanOutput{{Tree: tree, Path: output}},
+		}
+		node.ID = node.ContentID()
+		return node
+	}
+	prep := newConsumer("prep", sharedRoot, "prep.o")
+	targetShared := newConsumer("target", sharedRoot, "shared.o")
+	targetRoots := []string{sharedRoot}
+	for index := range 2 {
+		source := sources[sharedSourceCount+index]
+		root := insert(sharedRoot, ActionPlanInputSetEntry{
+			Target: ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: source.Path}, SourceID: source.ID,
+		})
+		if index == 0 {
+			root = insert(root, ActionPlanInputSetEntry{
+				Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "target-only"},
+				ProducerID: producer.ID, Slot: 1,
+			})
+		} else {
+			for _, dependency := range []ActionPlanNode{prep, targetShared} {
+				root = insert(root, ActionPlanInputSetEntry{
+					Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: dependency.Outputs[0].Path},
+					ProducerID: dependency.ID,
+				})
+			}
+		}
+		targetRoots = append(targetRoots, root)
+	}
+	sharedClosure, err := store.ReachableNodes(sharedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetClosure, err := store.ReachableNodesForRoots(targetRoots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sharedClosure) < 2 || len(targetClosure) <= len(sharedClosure) {
+		t.Fatalf("fixture must share a branched root and add target-only nodes: shared=%d target=%d", len(sharedClosure), len(targetClosure))
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity},
+		Sources:  sources, InputSets: targetClosure,
+		Recipes: map[string]ActionRecipe{producerRecipeID: producerRecipe, consumerRecipeID: consumerRecipe},
+		// Producers deliberately follow consumers, including the same-stage edge.
+		Nodes: []ActionPlanNode{
+			newConsumer("target", targetRoots[2], "right.o"), newConsumer("target", targetRoots[1], "left.o"),
+			targetShared, prep, producer,
+		},
+	}
+	allEntries, err := plan.entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputs := actionPlanStageOutputsForTest(t.TempDir())
+	if err := plan.WriteStages(outputs); err != nil {
+		t.Fatal(err)
+	}
+	producerOutput := func(node ActionPlanNode, slot int) string {
+		output := node.Outputs[slot]
+		return "nodes/" + node.Stage + "/" + node.ID + "/out/" + output.Tree + "/" + planOrdinal(slot) + "/" + output.Path
+	}
+	for _, stage := range linuxKernelPlanStageOrder {
+		files, err := readActionPlanFilesForTest(outputs[stage])
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantedInputSets := map[string]ActionPlanInputSetNode{}
+		if stage == "prep" {
+			wantedInputSets = sharedClosure
+		} else if stage == "target" {
+			wantedInputSets = targetClosure
+		}
+		wantedSources := map[string]bool{}
+		for index, source := range sources {
+			wantedSources[source.ID] = stage == "prep" && index < sharedSourceCount || stage == "target" && index < sharedSourceCount+2
+		}
+		wantedCrossStageOutputs := map[string]bool{
+			producerOutput(producer, 0): stage == "prep" || stage == "target",
+			producerOutput(producer, 1): stage == "target",
+			producerOutput(prep, 0):     stage == "target",
+		}
+		for _, entry := range allEntries {
+			parts := strings.Split(entry.path, "/")
+			want := false
+			switch parts[0] {
+			case "schema", "toolsets", "index":
+				want = true
+			case "recipes":
+				want = stage == "prehost" && parts[1] == producerRecipeID+".json" ||
+					(stage == "prep" || stage == "target") && parts[1] == consumerRecipeID+".json"
+			case "sources":
+				want = wantedSources[parts[1]]
+			case "input-sets":
+				_, want = wantedInputSets[parts[1]]
+			case "nodes":
+				want = parts[1] == stage || wantedCrossStageOutputs[entry.path]
+			default:
+				t.Fatalf("unexpected fixture marker %s", entry.path)
+			}
+			data, exists := files[entry.path]
+			if exists != want {
+				t.Errorf("%s shard contains %s = %v, want %v", stage, entry.path, exists, want)
+			} else if exists && !slices.Equal(data, entry.data) {
+				t.Errorf("%s shard changed marker contents for %s", stage, entry.path)
+			}
+			delete(files, entry.path)
+		}
+		for marker := range files {
+			t.Errorf("%s shard added unknown marker %s", stage, marker)
 		}
 	}
 }
@@ -1276,6 +1527,67 @@ func TestActionRecipeAcceptsDependencyOnlyTree(t *testing.T) {
 	}
 	if err := recipe.Validate(); err != nil {
 		t.Fatalf("dependency-only tree rejected: %v", err)
+	}
+}
+
+func TestActionRecipeValidatesCompleteCompoundCompilerWorkingInputUses(t *testing.T) {
+	base := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "compile", Tool: compactKbuildScriptRunnerRole,
+		Arguments:        []string{"${output:out}"},
+		WorkingDirectory: "compound",
+		WorkingInputs: map[string]string{
+			"source:source": "scripts/basic/fixdep.c",
+			"input:helper":  "scripts/basic/fixdep",
+		},
+		CompilerInvocation: &ActionRecipeCompilerInvocation{
+			Tool:                      "cc",
+			Arguments:                 []string{"scripts/basic/fixdep.c", "-o", "scripts/basic/fixdep"},
+			WorkingInputUses:          []string{"input:helper", "source:source"},
+			WorkingInputUsesComplete:  true,
+			AuxiliaryWorkingInputUses: []string{"input:helper"},
+		},
+		Sources: []string{"source"}, Inputs: []string{"helper"}, Outputs: []string{"out"},
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("Validate rejected binary driver-link projection: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		edit func(*ActionRecipe)
+		want string
+	}{
+		{name: "uses without completeness", edit: func(recipe *ActionRecipe) {
+			recipe.CompilerInvocation.WorkingInputUsesComplete = false
+		}, want: "without a complete projection"},
+		{name: "unstaged use", edit: func(recipe *ActionRecipe) {
+			delete(recipe.WorkingInputs, "input:helper")
+		}, want: "is not staged"},
+		{name: "noncanonical uses", edit: func(recipe *ActionRecipe) {
+			recipe.CompilerInvocation.WorkingInputUses = []string{"source:source", "input:helper"}
+		}, want: "canonical lexical order"},
+		{name: "auxiliary use outside complete set", edit: func(recipe *ActionRecipe) {
+			recipe.CompilerInvocation.AuxiliaryWorkingInputUses = []string{"input:missing"}
+		}, want: "absent from the complete working input projection"},
+		{name: "noncanonical auxiliary uses", edit: func(recipe *ActionRecipe) {
+			recipe.CompilerInvocation.AuxiliaryWorkingInputUses = []string{"source:source", "input:helper"}
+		}, want: "canonical lexical order"},
+		{name: "text output", edit: func(recipe *ActionRecipe) {
+			recipe.CompilerInvocation.Arguments = []string{"-E", "scripts/basic/fixdep.c", "-o", "scripts/basic/fixdep.i"}
+		}, want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := cloneActionRecipe(base)
+			test.edit(&invalid)
+			err := invalid.Validate()
+			if test.want == "" {
+				if err != nil {
+					t.Fatalf("Validate rejected existing cc text-output compile: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 

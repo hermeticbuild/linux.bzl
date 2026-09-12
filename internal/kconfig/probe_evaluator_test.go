@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -1316,7 +1317,7 @@ func TestLinuxProbeEvaluatorDiscoversCanonicalCapabilityDAG(t *testing.T) {
 			t.Errorf("request roles = %v", roles)
 		}
 	}
-	if got, want := plan.Nodes[0].RequestID, "a6e3104fecd997c970d141cca0ac8876fca534fa35d3f1c957c1d4d200f477d2"; got != want {
+	if got, want := plan.Nodes[0].RequestID, "2a3c2724f14a5f1b12f74a06ca682bb635dcd4e95f69c5401fbbff28ef09a692"; got != want {
 		t.Fatalf("cc-option canonical request ID = %s, want %s", got, want)
 	}
 }
@@ -1383,6 +1384,276 @@ func TestLinuxProbeEvaluatorReplaysExactResultsAndSameDAG(t *testing.T) {
 	badValues := exerciseSymbolicProbeEvaluator(t, badReplay)
 	if _, resolveErr := badReplay.ResolveSymbolic(badValues.ccOption); resolveErr == nil || !strings.Contains(resolveErr.Error(), "exact step plan") {
 		t.Fatalf("malformed result error = %v, want exact step plan", resolveErr)
+	}
+}
+
+func testLargeLinuxProbeSelectionInput(t testing.TB, index int, variant string) linuxProbeSelectionInput {
+	t.Helper()
+	dependencies := []ProbeReference{
+		{
+			NodeID: fmt.Sprintf("%064x", 4*index+1), RequestID: fmt.Sprintf("%064x", 4*index+2),
+			Scope: "target", Kind: "boolean",
+		},
+		{
+			NodeID: fmt.Sprintf("%064x", 4*index+3), RequestID: fmt.Sprintf("%064x", 4*index+4),
+			Scope: "target", Kind: "text",
+		},
+	}
+	arguments := []string{
+		"-Werror", "-c", "-x", "c", "${source:scripts/probe.c}", "-o", "${scratch:out}",
+	}
+	candidateBase := make([]int, 0, 128)
+	for flag := 0; flag < 128; flag++ {
+		candidateBase = append(candidateBase, len(arguments))
+		arguments = append(arguments, fmt.Sprintf("-DSELECTION_%02d_%03d=%d", index, flag, flag))
+	}
+	environment := make(map[string]string, 64)
+	for variable := 0; variable < 64; variable++ {
+		environment[fmt.Sprintf("PROBE_ENV_%03d", variable)] = fmt.Sprintf("selection-%02d-value-%03d", index, variable)
+	}
+	warnings := make([]ProbePredicate, 32)
+	for warning := range warnings {
+		warnings[warning] = ProbePredicate{
+			Operator: "stream-contains", Step: "compile", Stream: "stderr",
+			Value: fmt.Sprintf("warning-%03d-%s", warning, variant),
+		}
+	}
+	request := ProbeRequest{
+		Schema: LinuxProbeRequestSchema, InputCount: len(dependencies),
+		Sources: []string{"scripts/probe.c"},
+		Scratch: []ProbeScratch{{Name: "out", Kind: "file"}},
+		Steps: []ProbeStep{{
+			Name: "compile", Tool: "cc", Arguments: arguments, Environment: environment,
+			ConditionalArguments: []ProbeConditionalArguments{{
+				Before:    0,
+				When:      ProbePredicate{Operator: "result-true", Result: "00000000"},
+				Arguments: []string{"-DDEPENDENCY_ENABLED=1"},
+			}},
+			Candidate: &ProbeCandidateArguments{Policy: ProbeCandidatePolicyCC, Base: candidateBase},
+		}},
+		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{
+			Operator: "all",
+			Operands: []ProbePredicate{
+				{Operator: "exit-zero", Step: "compile"},
+				{Operator: "not", Operands: []ProbePredicate{{Operator: "any", Operands: warnings}}},
+			},
+		}},
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("large selection request is invalid: %v", err)
+	}
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := builder.Request("target", request, dependencies...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return linuxProbeSelectionInput{reference: reference, request: request, dependencies: dependencies}
+}
+
+func testLinuxProbeSelectionValues(inputCount int) []string {
+	values := make([]string, 1<<inputCount)
+	for state := range values {
+		values[state] = fmt.Sprintf("selection-state-%03d", state)
+	}
+	return values
+}
+
+func testLinuxProbeSelectionEvaluator() *LinuxProbeEvaluator {
+	return &LinuxProbeEvaluator{
+		scope: "target", symbols: map[string]linuxProbeSymbol{}, symbolRegistry: newLinuxProbeSymbolRegistry(),
+	}
+}
+
+func linuxProbeSelectionRegistrySize(evaluator *LinuxProbeEvaluator) int {
+	evaluator.symbolRegistry.mu.RLock()
+	defer evaluator.symbolRegistry.mu.RUnlock()
+	return len(evaluator.symbolRegistry.symbols)
+}
+
+func TestLinuxProbeEvaluatorRenderSelectionExistingTokenFastPath(t *testing.T) {
+	t.Run("exact repeat keeps maps stable", func(t *testing.T) {
+		evaluator := testLinuxProbeSelectionEvaluator()
+		inputs := make([]linuxProbeSelectionInput, 4)
+		for index := range inputs {
+			inputs[index] = testLargeLinuxProbeSelectionInput(t, index, "same")
+		}
+		values := testLinuxProbeSelectionValues(len(inputs))
+		first, err := evaluator.renderSelection(inputs, values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		localSize, registrySize := len(evaluator.symbols), linuxProbeSelectionRegistrySize(evaluator)
+		second, err := evaluator.renderSelection(inputs, values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if second != first {
+			t.Fatalf("repeated selection token = %q, want %q", second, first)
+		}
+		if got := len(evaluator.symbols); got != localSize {
+			t.Fatalf("repeated selection grew evaluator symbols to %d, want %d", got, localSize)
+		}
+		if got := linuxProbeSelectionRegistrySize(evaluator); got != registrySize {
+			t.Fatalf("repeated selection grew registry symbols to %d, want %d", got, registrySize)
+		}
+	})
+
+	t.Run("canonical empty collections reuse across evaluators", func(t *testing.T) {
+		firstEvaluator := testLinuxProbeSelectionEvaluator()
+		original := testLargeLinuxProbeSelectionInput(t, 0, "same")
+		values := testLinuxProbeSelectionValues(1)
+		token, err := firstEvaluator.renderSelection([]linuxProbeSelectionInput{original}, values)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		equivalent := original
+		equivalent.request = cloneLinuxProbeRequest(original.request)
+		equivalent.dependencies = slices.Clone(original.dependencies)
+		equivalent.request.SourceRoots = []string{}
+		equivalent.request.Steps[0].AuxiliaryTools = []string{}
+		equivalent.request.Steps[0].ArgumentFragments = []ProbeArgumentFragments{}
+		equivalent.request.Steps[0].EnvironmentFragments = []ProbeEnvironmentFragments{}
+		equivalent.request.Steps[0].StdinFragments = []ProbeValueFragment{}
+		equivalent.request.Steps[0].Candidate.Conditional = []int{}
+		equivalent.request.Steps[0].Candidate.TranslationUnits = []string{}
+		equivalent.request.Outcome.Fragments = []ProbeValueFragment{}
+		originalID, err := original.request.ID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		equivalentID, err := equivalent.request.ID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if equivalentID != originalID {
+			t.Fatalf("canonically equivalent request ID = %s, want %s", equivalentID, originalID)
+		}
+
+		secondEvaluator := testLinuxProbeSelectionEvaluator()
+		secondEvaluator.symbolRegistry = firstEvaluator.symbolRegistry
+		reused, err := secondEvaluator.renderSelection([]linuxProbeSelectionInput{equivalent}, slices.Clone(values))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reused != token {
+			t.Fatalf("canonically equivalent selection token = %q, want %q", reused, token)
+		}
+	})
+
+	t.Run("different nested request collides", func(t *testing.T) {
+		evaluator := testLinuxProbeSelectionEvaluator()
+		original := testLargeLinuxProbeSelectionInput(t, 0, "original")
+		if _, err := evaluator.renderSelection([]linuxProbeSelectionInput{original}, testLinuxProbeSelectionValues(1)); err != nil {
+			t.Fatal(err)
+		}
+		changed := testLargeLinuxProbeSelectionInput(t, 0, "changed")
+		changed.reference = original.reference
+		if _, err := evaluator.renderSelection([]linuxProbeSelectionInput{changed}, testLinuxProbeSelectionValues(1)); err == nil || !strings.Contains(err.Error(), "collision") {
+			t.Fatalf("structurally different request error = %v, want collision", err)
+		}
+	})
+
+	t.Run("different nested request collides through shared registry", func(t *testing.T) {
+		firstEvaluator := testLinuxProbeSelectionEvaluator()
+		original := testLargeLinuxProbeSelectionInput(t, 0, "original")
+		values := testLinuxProbeSelectionValues(1)
+		if _, err := firstEvaluator.renderSelection([]linuxProbeSelectionInput{original}, values); err != nil {
+			t.Fatal(err)
+		}
+		changed := testLargeLinuxProbeSelectionInput(t, 0, "changed")
+		changed.reference = original.reference
+		secondEvaluator := testLinuxProbeSelectionEvaluator()
+		secondEvaluator.symbolRegistry = firstEvaluator.symbolRegistry
+		if _, err := secondEvaluator.renderSelection([]linuxProbeSelectionInput{changed}, values); err == nil || !strings.Contains(err.Error(), "collision") {
+			t.Fatalf("shared-registry request error = %v, want collision", err)
+		}
+	})
+
+	t.Run("different dependencies collide", func(t *testing.T) {
+		evaluator := testLinuxProbeSelectionEvaluator()
+		original := testLargeLinuxProbeSelectionInput(t, 0, "same")
+		if _, err := evaluator.renderSelection([]linuxProbeSelectionInput{original}, testLinuxProbeSelectionValues(1)); err != nil {
+			t.Fatal(err)
+		}
+		changed := testLargeLinuxProbeSelectionInput(t, 0, "same")
+		changed.dependencies[1].NodeID = strings.Repeat("f", 64)
+		if _, err := evaluator.renderSelection([]linuxProbeSelectionInput{changed}, testLinuxProbeSelectionValues(1)); err == nil || !strings.Contains(err.Error(), "collision") {
+			t.Fatalf("different dependencies error = %v, want collision", err)
+		}
+	})
+
+	t.Run("stored selection owns caller data", func(t *testing.T) {
+		evaluator := testLinuxProbeSelectionEvaluator()
+		inputs := []linuxProbeSelectionInput{testLargeLinuxProbeSelectionInput(t, 0, "same")}
+		values := testLinuxProbeSelectionValues(len(inputs))
+		token, err := evaluator.renderSelection(inputs, values)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		exactInputs := []linuxProbeSelectionInput{testLargeLinuxProbeSelectionInput(t, 0, "same")}
+		exactValues := testLinuxProbeSelectionValues(len(exactInputs))
+		inputs[0].reference.NodeID = strings.Repeat("e", 64)
+		inputs[0].dependencies[0].NodeID = strings.Repeat("d", 64)
+		inputs[0].request.Steps[0].Arguments[0] = "-Wmutated"
+		inputs[0].request.Steps[0].Environment["PROBE_ENV_000"] = "mutated"
+		inputs[0].request.Outcome.Predicate.Operands[1].Operands[0].Operands[0].Value = "mutated"
+		values[0] = "mutated"
+
+		stored := evaluator.symbols[token]
+		if !reflect.DeepEqual(stored.selectionInputs, exactInputs) || !slices.Equal(stored.selectionValues, exactValues) {
+			t.Fatalf("stored selection changed through caller-owned slices: %#v", stored)
+		}
+		registered, ok := evaluator.symbolRegistry.lookup(token)
+		if !ok || !reflect.DeepEqual(registered.selectionInputs, exactInputs) || !slices.Equal(registered.selectionValues, exactValues) {
+			t.Fatalf("registered selection changed through caller-owned slices: %#v, found %v", registered, ok)
+		}
+		repeated, err := evaluator.renderSelection(exactInputs, exactValues)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if repeated != token {
+			t.Fatalf("reconstructed selection token = %q, want %q", repeated, token)
+		}
+	})
+}
+
+func BenchmarkLinuxProbeEvaluatorRenderSelectionExistingToken(b *testing.B) {
+	for _, inputCount := range []int{1, 4, 8} {
+		b.Run(fmt.Sprintf("inputs-%d", inputCount), func(b *testing.B) {
+			evaluator := testLinuxProbeSelectionEvaluator()
+			inputs := make([]linuxProbeSelectionInput, inputCount)
+			for index := range inputs {
+				inputs[index] = testLargeLinuxProbeSelectionInput(b, index, "benchmark")
+			}
+			values := testLinuxProbeSelectionValues(inputCount)
+			want, err := evaluator.renderSelection(inputs, values)
+			if err != nil {
+				b.Fatal(err)
+			}
+			localSize, registrySize := len(evaluator.symbols), linuxProbeSelectionRegistrySize(evaluator)
+			var got string
+			b.ReportAllocs()
+			b.ReportMetric(float64(inputCount), "inputs/op")
+			b.ResetTimer()
+			for range b.N {
+				got, err = evaluator.renderSelection(inputs, values)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			if got != want {
+				b.Fatalf("last selection token = %q, want %q", got, want)
+			}
+			if len(evaluator.symbols) != localSize || linuxProbeSelectionRegistrySize(evaluator) != registrySize {
+				b.Fatal("existing-token fast path grew symbol maps")
+			}
+		})
 	}
 }
 

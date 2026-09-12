@@ -1,8 +1,43 @@
-load("//internal:mapped_kernel.bzl", "linux_mapped_kernel")
+load("@rules_go//go:def.bzl", "go_test")
+load("//internal:linux_modules.bzl", "linux_cc_module")
+load("//internal:linux_source_runfiles.bzl", "linux_source_runfiles")
+load("//internal:mapped_kernel.bzl", "linux_mapped_kernel_family", "linux_mapped_kernel_variant", "linux_test_kernel_projection")
+load("//internal/tests/optional_definedness:fixture.bzl", "compiler_optional_definedness_fixture")
+load(":compiler_intrinsic_measurement.bzl", "compiler_intrinsic_measurement")
+load(":configuration_witness.bzl", "execution_config")
 
 package(default_visibility = ["//visibility:private"])
 
-linux_mapped_kernel(
+compiler_optional_definedness_fixture(
+    name = "compiler_optional_definedness",
+    testonly = True,
+    kernel = ":family_smoke",
+)
+
+compiler_intrinsic_measurement(
+    name = "compiler_intrinsic_measurement",
+    src = "compiler_intrinsic_measurement.c",
+    # Match the fixture's source-owned C language and compilation policy, while
+    # measuring outside the Kbuild scanner and supplemental probe machinery.
+    copts = [
+        "-nostdinc",
+        "-std=gnu11",
+        "-fno-common",
+        "-fno-PIE",
+    ],
+    kernel = ":family_smoke",
+)
+
+linux_source_runfiles(
+    name = "source_runfiles",
+    source_files = glob(
+        ["**"],
+        exclude = ["BUILD.bazel"],
+    ),
+    source_root = "Kconfig",
+)
+
+linux_mapped_kernel_family(
     name = "analysis_smoke",
     config = "config",
     kbuild = "Kbuild",
@@ -11,6 +46,202 @@ linux_mapped_kernel(
         exclude = ["BUILD.bazel"],
     ),
     source_root = "Kconfig",
+    source_runfiles = ":source_runfiles",
     version = "6.18.0",
     visibility = ["//internal/tests:__pkg__"],
+)
+
+linux_mapped_kernel_family(
+    name = "family_smoke",
+    config = "config",
+    kbuild = "Kbuild",
+    overlays = {
+        "irrelevant": "irrelevant.config",
+        "relevant": "relevant.config",
+    },
+    source_files = glob(
+        ["**"],
+        exclude = ["BUILD.bazel"],
+    ),
+    source_root = "Kconfig",
+    source_runfiles = ":source_runfiles",
+    version = "6.18.0",
+    visibility = ["//internal/tests:__pkg__"],
+)
+
+linux_mapped_kernel_variant(
+    name = "family_smoke_irrelevant",
+    family = ":family_smoke",
+    variant = "irrelevant",
+)
+
+linux_mapped_kernel_variant(
+    name = "family_smoke_relevant",
+    family = ":family_smoke",
+    variant = "relevant",
+    visibility = ["//internal/tests:__pkg__"],
+)
+
+linux_cc_module(
+    name = "family_smoke_overlay_module",
+    srcs = ["module_smoke.c"],
+    kernel = ":family_smoke_relevant",
+    visibility = ["//internal/tests:__pkg__"],
+)
+
+filegroup(
+    name = "family_smoke_overlay_module_output",
+    srcs = [":family_smoke_overlay_module"],
+)
+
+filegroup(
+    name = "family_smoke_base_image",
+    srcs = [":family_smoke"],
+    output_group = "image",
+)
+
+filegroup(
+    name = "family_smoke_irrelevant_image",
+    srcs = [":family_smoke_irrelevant"],
+    output_group = "image",
+)
+
+filegroup(
+    name = "family_smoke_relevant_image",
+    srcs = [":family_smoke_relevant"],
+    output_group = "image",
+)
+
+filegroup(
+    name = "family_smoke_reuse_report",
+    srcs = [":family_smoke"],
+    output_group = "reuse_report",
+)
+
+filegroup(
+    name = "family_smoke_compiler_guards",
+    srcs = [":family_smoke"],
+    output_group = "compiler_guards",
+)
+
+filegroup(
+    name = "family_smoke_initial_snapshots",
+    srcs = [":family_smoke"],
+    output_group = "plan_snapshots",
+)
+
+filegroup(
+    name = "family_smoke_plan",
+    srcs = [":family_smoke"],
+    output_group = "plan",
+)
+
+execution_config(
+    name = "family_smoke_base_execution_config",
+    testonly = True,
+    kernel = ":family_smoke",
+)
+
+execution_config(
+    name = "family_smoke_irrelevant_execution_config",
+    testonly = True,
+    kernel = ":family_smoke_irrelevant",
+)
+
+execution_config(
+    name = "family_smoke_relevant_execution_config",
+    testonly = True,
+    kernel = ":family_smoke_relevant",
+)
+
+linux_test_kernel_projection(
+    name = "family_smoke_base_config",
+    field = "config",
+    kernel = ":family_smoke",
+)
+
+filegroup(
+    name = "family_smoke_base_objects",
+    srcs = [":family_smoke"],
+    output_group = "objects",
+)
+
+filegroup(
+    name = "family_smoke_irrelevant_objects",
+    srcs = [":family_smoke_irrelevant"],
+    output_group = "objects",
+)
+
+filegroup(
+    name = "family_smoke_relevant_objects",
+    srcs = [":family_smoke_relevant"],
+    output_group = "objects",
+)
+
+linux_test_kernel_projection(
+    name = "family_smoke_irrelevant_config",
+    field = "config",
+    kernel = ":family_smoke_irrelevant",
+)
+
+linux_test_kernel_projection(
+    name = "family_smoke_relevant_config",
+    field = "config",
+    kernel = ":family_smoke_relevant",
+    visibility = ["//internal/tests:__pkg__"],
+)
+
+go_test(
+    name = "mapped_kernel_test",
+    srcs = [
+        "executed_helper_test.go",
+        "family_intrinsic_test.go",
+        "family_numeric_header_test.go",
+        "family_optional_definedness_test.go",
+        "family_reuse_test.go",
+        "source_paths_test.go",
+    ],
+    data = [
+        ":compiler_intrinsic_measurement",
+        ":compiler_optional_definedness",
+        ":family_smoke_base_config",
+        ":family_smoke_base_execution_config",
+        ":family_smoke_base_image",
+        ":family_smoke_base_objects",
+        ":family_smoke_compiler_guards",
+        ":family_smoke_initial_snapshots",
+        ":family_smoke_irrelevant_config",
+        ":family_smoke_irrelevant_execution_config",
+        ":family_smoke_irrelevant_image",
+        ":family_smoke_irrelevant_objects",
+        ":family_smoke_overlay_module_output",
+        ":family_smoke_plan",
+        ":family_smoke_relevant_config",
+        ":family_smoke_relevant_execution_config",
+        ":family_smoke_relevant_image",
+        ":family_smoke_relevant_objects",
+        ":family_smoke_reuse_report",
+    ],
+    env = {
+        "FAMILY_SMOKE_OPTIONAL_DEFINEDNESS": "$(rlocationpath :compiler_optional_definedness)",
+        "FAMILY_SMOKE_INTRINSIC_MEASUREMENT": "$(rlocationpath :compiler_intrinsic_measurement)",
+        "FAMILY_SMOKE_BASE_CONFIG": "$(rlocationpath :family_smoke_base_config)",
+        "FAMILY_SMOKE_BASE_EXECUTION_CONFIG": "$(rlocationpath :family_smoke_base_execution_config)",
+        "FAMILY_SMOKE_BASE_IMAGE": "$(rlocationpath :family_smoke_base_image)",
+        "FAMILY_SMOKE_BASE_OBJECTS": "$(rlocationpath :family_smoke_base_objects)",
+        "FAMILY_SMOKE_COMPILER_GUARDS": "$(rlocationpaths :family_smoke_compiler_guards)",
+        "FAMILY_SMOKE_INITIAL_SNAPSHOTS": "$(rlocationpaths :family_smoke_initial_snapshots)",
+        "FAMILY_SMOKE_IRRELEVANT_CONFIG": "$(rlocationpath :family_smoke_irrelevant_config)",
+        "FAMILY_SMOKE_IRRELEVANT_EXECUTION_CONFIG": "$(rlocationpath :family_smoke_irrelevant_execution_config)",
+        "FAMILY_SMOKE_IRRELEVANT_IMAGE": "$(rlocationpath :family_smoke_irrelevant_image)",
+        "FAMILY_SMOKE_IRRELEVANT_OBJECTS": "$(rlocationpath :family_smoke_irrelevant_objects)",
+        "FAMILY_SMOKE_OVERLAY_MODULE": "$(rlocationpath :family_smoke_overlay_module_output)",
+        "FAMILY_SMOKE_PLAN": "$(rlocationpaths :family_smoke_plan)",
+        "FAMILY_SMOKE_RELEVANT_CONFIG": "$(rlocationpath :family_smoke_relevant_config)",
+        "FAMILY_SMOKE_RELEVANT_EXECUTION_CONFIG": "$(rlocationpath :family_smoke_relevant_execution_config)",
+        "FAMILY_SMOKE_RELEVANT_IMAGE": "$(rlocationpath :family_smoke_relevant_image)",
+        "FAMILY_SMOKE_RELEVANT_OBJECTS": "$(rlocationpath :family_smoke_relevant_objects)",
+        "FAMILY_SMOKE_REUSE_REPORT": "$(rlocationpath :family_smoke_reuse_report)",
+    },
+    deps = ["@rules_go//go/runfiles"],
 )

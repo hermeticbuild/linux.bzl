@@ -256,6 +256,7 @@ func selectProbeStepContractRole(step kconfig.ProbeStep, arguments []string) (st
 
 func resolveProbeWorkingDirectory(
 	value, scratchRoot string,
+	scratch map[string]string,
 	sourceRoots map[string]string,
 	expand func(string) (string, error),
 ) (string, error) {
@@ -265,6 +266,44 @@ func resolveProbeWorkingDirectory(
 			return "", fmt.Errorf("resolve private scratch working directory: %w", err)
 		}
 		return filepath.Clean(resolved), nil
+	}
+
+	const scratchPrefix = "${scratch:"
+	if strings.HasPrefix(value, scratchPrefix) {
+		end := strings.IndexByte(value[len(scratchPrefix):], '}')
+		if end < 0 {
+			return "", fmt.Errorf("working directory has an unterminated scratch placeholder")
+		}
+		end += len(scratchPrefix)
+		name := value[len(scratchPrefix):end]
+		if value[end+1:] != "" {
+			return "", fmt.Errorf("scratch working directory must be exactly one placeholder")
+		}
+		working := scratch[name]
+		if working == "" {
+			return "", fmt.Errorf("working directory references unavailable scratch %q", name)
+		}
+		rootResolved, err := filepath.EvalSymlinks(scratchRoot)
+		if err != nil {
+			return "", fmt.Errorf("resolve private scratch root: %w", err)
+		}
+		workingResolved, err := filepath.EvalSymlinks(working)
+		if err != nil {
+			return "", fmt.Errorf("resolve scratch working directory %q: %w", name, err)
+		}
+		rootResolved = filepath.Clean(rootResolved)
+		workingResolved = filepath.Clean(workingResolved)
+		if !probePhysicalPathWithin(rootResolved, workingResolved) {
+			return "", fmt.Errorf("scratch working directory %q resolves outside private scratch root", name)
+		}
+		info, err := os.Stat(workingResolved)
+		if err != nil {
+			return "", fmt.Errorf("inspect scratch working directory %q: %w", name, err)
+		}
+		if !info.IsDir() {
+			return "", fmt.Errorf("scratch working directory %q is not a directory", name)
+		}
+		return workingResolved, nil
 	}
 
 	const prefix = "${source_root:"
@@ -597,7 +636,7 @@ func runProbe(opts probeOptions) error {
 			if err := os.Mkdir(filename, 0o700); err != nil {
 				return fmt.Errorf("create scratch directory %s: %w", item.Name, err)
 			}
-		} else if item.Content != "" {
+		} else if item.Present || item.Content != "" {
 			if err := os.WriteFile(filename, []byte(item.Content), 0o600); err != nil {
 				return fmt.Errorf("write scratch file %s: %w", item.Name, err)
 			}
@@ -677,7 +716,14 @@ func runProbe(opts probeOptions) error {
 			if index < len(step.Arguments) {
 				if argumentFragmentIndex < len(step.ArgumentFragments) && step.ArgumentFragments[argumentFragmentIndex].Index == index {
 					group := step.ArgumentFragments[argumentFragmentIndex]
-					rendered, err := renderFragments(fmt.Sprintf("argument fragments %d", argumentFragmentIndex), group.Fragments, 0)
+					var resultGuard func(string) error
+					if group.Mode == kconfig.ProbeArgumentFragmentsModeSourceShellWords {
+						resultGuard = validateProbeSourceShellResult
+					}
+					rendered, err := renderProbeValueFragmentsWithResultGuard(
+						fmt.Sprintf("step %s argument fragments %d", step.Name, argumentFragmentIndex), group.Fragments, 0,
+						results, scratch, opts.sources, resolvedSourceRoots, opts.tools, inputResults, execroot, toolsetPaths, resultGuard,
+					)
 					if err != nil {
 						return err
 					}
@@ -694,6 +740,11 @@ func runProbe(opts probeOptions) error {
 							return fmt.Errorf("step %s argument fragment group %d: %w", step.Name, argumentFragmentIndex, err)
 						}
 						words = append(words, rendered)
+					case kconfig.ProbeArgumentFragmentsModeSourceShellWords:
+						words, err = kconfig.ParseProbeSourceShellWords(rendered)
+						if err != nil {
+							return fmt.Errorf("step %s argument fragment group %d: %w", step.Name, argumentFragmentIndex, err)
+						}
 					default:
 						return fmt.Errorf("step %s argument fragment group %d has unsupported mode %q", step.Name, argumentFragmentIndex, group.Mode)
 					}
@@ -717,14 +768,31 @@ func runProbe(opts probeOptions) error {
 		if argumentFragmentIndex != len(step.ArgumentFragments) {
 			return fmt.Errorf("step %s did not consume every argument fragment group", step.Name)
 		}
-		workingDirectory, err := resolveProbeWorkingDirectory(step.WorkingDirectory, root, resolvedSourceRoots, expand)
+		workingDirectory, err := resolveProbeWorkingDirectory(step.WorkingDirectory, root, scratch, resolvedSourceRoots, expand)
 		if err != nil {
 			return fmt.Errorf("resolve step %s working directory: %w", step.Name, err)
 		}
 		if step.Candidate != nil {
-			arguments, err = validateAndRewriteProbeCandidateArguments(
+			translationUnits := make([]string, len(step.Candidate.TranslationUnits))
+			for index, translationUnit := range step.Candidate.TranslationUnits {
+				translationUnits[index], err = expand(translationUnit)
+				if err != nil {
+					return fmt.Errorf("expand step %s translation unit %d: %w", step.Name, index, err)
+				}
+			}
+			arguments, candidateArguments, candidateArgumentIndexes, err = projectRenderedProbeCandidateArguments(
 				step.Name,
-				step.Candidate.Policy,
+				step.Candidate.Projection,
+				arguments,
+				candidateArguments,
+				candidateArgumentIndexes,
+				translationUnits,
+			)
+			if err != nil {
+				return err
+			}
+			arguments, err = validateAndRewriteProbeStepCandidateArguments(
+				step,
 				arguments,
 				candidateArguments,
 				candidateArgumentIndexes,
@@ -986,11 +1054,40 @@ func renderProbeValueFragments(
 	execroot string,
 	toolsetPaths *toolsetPathResolver,
 ) (string, error) {
+	return renderProbeValueFragmentsWithResultGuard(owner, fragments, depth,
+		results, scratch, sources, sourceRoots, tools, inputs, execroot, toolsetPaths, nil)
+}
+
+// A source-shell fragment may contain planner-owned marker literals. Guard
+// each measured substitution before concatenation or Make transformations so
+// result bytes cannot forge those markers, including by supplying only part.
+func validateProbeSourceShellResult(value string) error {
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if (character < 0x20 && character != '\t' && character != '\n') || character == 0x7f {
+			return fmt.Errorf("source-shell measured result contains a prohibited control byte")
+		}
+	}
+	return nil
+}
+
+func renderProbeValueFragmentsWithResultGuard(
+	owner string,
+	fragments []kconfig.ProbeValueFragment,
+	depth int,
+	results []kconfig.ProbeStepResult,
+	scratch, sources, sourceRoots map[string]string,
+	tools map[string]actionContract,
+	inputs map[string]kconfig.ProbeResult,
+	execroot string,
+	toolsetPaths *toolsetPathResolver,
+	resultGuard func(string) error,
+) (string, error) {
 	if depth > kconfig.MaxProbeValueFragmentDepth {
 		return "", fmt.Errorf("%s exceeds aggregate depth %d", owner, kconfig.MaxProbeValueFragmentDepth)
 	}
 	expand := func(value string) (string, error) {
-		return expandProbeValue(value, scratch, sources, sourceRoots, tools, inputs)
+		return expandProbeValueWithResultGuard(value, scratch, sources, sourceRoots, tools, inputs, resultGuard)
 	}
 	var rendered strings.Builder
 	for fragmentIndex, fragment := range fragments {
@@ -1006,10 +1103,10 @@ func renderProbeValueFragments(
 		var expanded string
 		var err error
 		if len(fragment.Fragments) != 0 {
-			expanded, err = renderProbeValueFragments(
+			expanded, err = renderProbeValueFragmentsWithResultGuard(
 				fmt.Sprintf("%s fragment %d aggregate", owner, fragmentIndex),
 				fragment.Fragments, depth+1,
-				results, scratch, sources, sourceRoots, tools, inputs, execroot, toolsetPaths,
+				results, scratch, sources, sourceRoots, tools, inputs, execroot, toolsetPaths, resultGuard,
 			)
 		} else {
 			expanded, err = expand(fragment.Value)
@@ -1026,10 +1123,10 @@ func renderProbeValueFragments(
 				}
 				if dynamicGroupIndex < len(transform.ArgumentFragments) && transform.ArgumentFragments[dynamicGroupIndex].Index == argumentIndex {
 					group := transform.ArgumentFragments[dynamicGroupIndex]
-					transform.Arguments[argumentIndex], err = renderProbeValueFragments(
+					transform.Arguments[argumentIndex], err = renderProbeValueFragmentsWithResultGuard(
 						fmt.Sprintf("%s fragment %d transform %d argument group %d", owner, fragmentIndex, transformIndex, dynamicGroupIndex),
 						group.Fragments, depth+1,
-						results, scratch, sources, sourceRoots, tools, inputs, execroot, toolsetPaths,
+						results, scratch, sources, sourceRoots, tools, inputs, execroot, toolsetPaths, resultGuard,
 					)
 					if err != nil {
 						return "", err
@@ -1156,6 +1253,10 @@ func stepStream(step kconfig.ProbeStepResult, stream string) (string, error) {
 }
 
 func expandProbeValue(value string, scratch, sources, sourceRoots map[string]string, tools map[string]actionContract, inputs map[string]kconfig.ProbeResult) (string, error) {
+	return expandProbeValueWithResultGuard(value, scratch, sources, sourceRoots, tools, inputs, nil)
+}
+
+func expandProbeValueWithResultGuard(value string, scratch, sources, sourceRoots map[string]string, tools map[string]actionContract, inputs map[string]kconfig.ProbeResult, resultGuard func(string) error) (string, error) {
 	var expansionErr error
 	out := placeholderPattern.ReplaceAllStringFunc(value, func(match string) string {
 		parts := placeholderPattern.FindStringSubmatch(match)
@@ -1180,10 +1281,23 @@ func expandProbeValue(value string, scratch, sources, sourceRoots map[string]str
 			result, exists := inputs[ordinal]
 			if ok && exists {
 				if field == "text" && result.Kind == "text" {
+					if resultGuard != nil {
+						if err := resultGuard(result.Text); err != nil {
+							expansionErr = fmt.Errorf("result %s text: %w", ordinal, err)
+							return match
+						}
+					}
 					return result.Text
 				}
 				if field == "boolean" && result.Kind == "boolean" && result.Boolean != nil {
-					return fmt.Sprint(*result.Boolean)
+					value := fmt.Sprint(*result.Boolean)
+					if resultGuard != nil {
+						if err := resultGuard(value); err != nil {
+							expansionErr = fmt.Errorf("result %s boolean: %w", ordinal, err)
+							return match
+						}
+					}
+					return value
 				}
 			}
 		}

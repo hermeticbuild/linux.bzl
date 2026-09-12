@@ -25,6 +25,14 @@ filegroup(
     srcs = glob(["**"]),
 )
 
+# The repository rule prepends the canonical linux_source_runfiles load. One
+# source-repository aggregate is shared by every image profile and family.
+linux_source_runfiles(
+    name = "linux_bzl_source_runfiles",
+    source_files = [":all_files"],
+    source_root = "Kconfig",
+)
+
 # Public source-only aggregate used by rules_devicetree consumers. It does not
 # duplicate any Kbuild selection policy.
 filegroup(

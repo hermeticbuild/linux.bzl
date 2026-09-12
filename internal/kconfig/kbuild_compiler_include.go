@@ -2,8 +2,10 @@ package kconfig
 
 import (
 	"fmt"
+	"maps"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -435,7 +437,7 @@ func analyzeCompactKbuildCompilerOutputsWithIncludeProvenance(
 			if err := analyzer.rewriteCCompilerOutput(index); err != nil {
 				return compactKbuildCompilerOutputAnalysis{}, err
 			}
-			if argument == "-MF" && index+1 < len(analyzer.analysis.Arguments) {
+			if (argument == "-MF" || argument == "-MJ") && index+1 < len(analyzer.analysis.Arguments) {
 				index++
 			}
 			continue
@@ -474,6 +476,11 @@ func analyzeCompactKbuildCompilerOutputsWithIncludeProvenance(
 				return compactKbuildCompilerOutputAnalysis{}, err
 			}
 			analyzer.analysis.Arguments[index] = "--emit=" + value
+		}
+	}
+	if role == "cc" || role == "cxx" {
+		if err := analyzer.recordCImplicitPersistentOutputs(); err != nil {
+			return compactKbuildCompilerOutputAnalysis{}, err
 		}
 	}
 	for directory := range analyzer.workingDirectories {
@@ -619,17 +626,32 @@ func (a *compactKbuildCompilerOutputAnalyzer) rewriteRustLibrarySearch(index int
 func (a *compactKbuildCompilerOutputAnalyzer) rewriteCCompilerOutput(index int) error {
 	argument := a.analysis.Arguments[index]
 	switch {
+	case argument == "-MJ":
+		if index+1 >= len(a.analysis.Arguments) {
+			return nil
+		}
+		value, err := a.rewriteCPersistentOutput(a.analysis.Arguments[index+1], "compiler JSON output")
+		if err != nil {
+			return err
+		}
+		a.analysis.Arguments[index+1] = value
+	case strings.HasPrefix(argument, "-MJ") && len(argument) > len("-MJ"):
+		value, err := a.rewriteCPersistentOutput(strings.TrimPrefix(argument, "-MJ"), "compiler JSON output")
+		if err != nil {
+			return err
+		}
+		a.analysis.Arguments[index] = "-MJ" + value
 	case argument == "-MF":
 		if index+1 >= len(a.analysis.Arguments) {
 			return nil
 		}
-		value, err := a.rewriteFileOutput(a.analysis.Arguments[index+1], "compiler dependency output", compactKbuildCompilerSideOutputRank)
+		value, err := a.rewriteCDependencyOutput(a.analysis.Arguments[index+1])
 		if err != nil {
 			return err
 		}
 		a.analysis.Arguments[index+1] = value
 	case strings.HasPrefix(argument, "-MF") && len(argument) > len("-MF"):
-		value, err := a.rewriteFileOutput(strings.TrimPrefix(argument, "-MF"), "compiler dependency output", compactKbuildCompilerSideOutputRank)
+		value, err := a.rewriteCDependencyOutput(strings.TrimPrefix(argument, "-MF"))
 		if err != nil {
 			return err
 		}
@@ -642,7 +664,7 @@ func (a *compactKbuildCompilerOutputAnalyzer) rewriteCCompilerOutput(index int) 
 			default:
 				continue
 			}
-			value, err := a.rewriteFileOutput(forwarded[forwardedIndex+1], "compiler dependency output", compactKbuildCompilerSideOutputRank)
+			value, err := a.rewriteCDependencyOutput(forwarded[forwardedIndex+1])
 			if err != nil {
 				return err
 			}
@@ -652,6 +674,117 @@ func (a *compactKbuildCompilerOutputAnalyzer) rewriteCCompilerOutput(index int) 
 		a.analysis.Arguments[index] = strings.Join(forwarded, ",")
 	}
 	return nil
+}
+
+func (a *compactKbuildCompilerOutputAnalyzer) rewriteCPersistentOutput(value, description string) (string, error) {
+	output, ok, err := resolveCompactKbuildCompilerOutputPath(a.profile, value, description)
+	if err != nil {
+		return "", err
+	}
+	if ok && output.logical != "" {
+		a.persistentOutputs[canonicalKbuildRulePath(output.logical)] = true
+	}
+	return a.rewriteFileOutput(value, description, compactKbuildCompilerSideOutputRank)
+}
+
+func (a *compactKbuildCompilerOutputAnalyzer) recordCImplicitPersistentOutputs() error {
+	primary := canonicalKbuildRulePath(a.analysis.PrimaryOutput)
+	if primary == "" {
+		return nil
+	}
+	stackUsage, coverage, splitDwarf := false, false, false
+	for _, argument := range a.analysis.Arguments {
+		if argument == "--" {
+			break
+		}
+		switch {
+		case argument == "-fstack-usage":
+			stackUsage = true
+		case argument == "-fno-stack-usage":
+			stackUsage = false
+		case argument == "--coverage" || argument == "-ftest-coverage":
+			coverage = true
+		case argument == "-fno-test-coverage":
+			coverage = false
+		case argument == "-gsplit-dwarf" || strings.HasPrefix(argument, "-gsplit-dwarf="):
+			splitDwarf = true
+		case argument == "-gno-split-dwarf":
+			splitDwarf = false
+		}
+	}
+	stem := strings.TrimSuffix(primary, path.Ext(primary))
+	outputs := []string{}
+	if stackUsage {
+		outputs = append(outputs, stem+".su")
+	}
+	if coverage {
+		outputs = append(outputs, stem+".gcno")
+	}
+	if splitDwarf {
+		outputs = append(outputs, stem+".dwo")
+	}
+	for _, output := range outputs {
+		if err := validatePlanRelativePath("implicit compiler persistent output", output); err != nil {
+			return err
+		}
+		a.persistentOutputs[output] = true
+		if directory := path.Dir(output); directory != "." && directory != "" {
+			a.workingDirectories[directory] = true
+		}
+	}
+	return nil
+}
+
+func (a *compactKbuildCompilerOutputAnalyzer) rewriteCDependencyOutput(value string) (string, error) {
+	return a.rewriteFileOutput(value, "compiler dependency output", compactKbuildCompilerSideOutputRank)
+}
+
+// compactKbuildExactCDependencyOutputs returns only explicitly named C-family
+// depfiles.  They remain compiler-private scratch; the cmd_and_fixdep seam uses
+// this parser solely to prove that its final rm removes the same one depfile.
+func compactKbuildExactCDependencyOutputs(profile CompactKbuildProfile, arguments []string) ([]string, error) {
+	outputs := map[string]bool{}
+	record := func(value string) error {
+		output, ok, err := resolveCompactKbuildCompilerOutputPath(profile, value, "compiler dependency output")
+		if err != nil {
+			return err
+		}
+		if ok && output.logical != "" {
+			outputs[canonicalKbuildRulePath(output.logical)] = true
+		}
+		return nil
+	}
+	for index := 0; index < len(arguments); index++ {
+		argument := arguments[index]
+		if argument == "--" {
+			break
+		}
+		switch {
+		case argument == "-MF" && index+1 < len(arguments):
+			if err := record(arguments[index+1]); err != nil {
+				return nil, err
+			}
+			index++
+		case strings.HasPrefix(argument, "-MF") && len(argument) > len("-MF"):
+			if err := record(strings.TrimPrefix(argument, "-MF")); err != nil {
+				return nil, err
+			}
+		case strings.HasPrefix(argument, "-Wp,"):
+			forwarded := strings.Split(argument, ",")
+			for forwardedIndex := 1; forwardedIndex+1 < len(forwarded); forwardedIndex++ {
+				switch forwarded[forwardedIndex] {
+				case "-MD", "-MMD", "-MF":
+				default:
+					continue
+				}
+				if err := record(forwarded[forwardedIndex+1]); err != nil {
+					return nil, err
+				}
+				forwardedIndex++
+			}
+		}
+	}
+	return slices.Sorted(maps.Keys(outputs)), nil
 }
 
 func (a *compactKbuildCompilerOutputAnalyzer) rewriteRustEmit(value string) (string, error) {

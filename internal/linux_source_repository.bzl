@@ -333,6 +333,10 @@ def _linux_source_repository_impl(rctx):
         _SOURCE_OVERLAY_FILES_MARKER,
         "\n".join(["    %r," % path for path in overlay_files]),
     )
+    source_build = "load(%r, \"linux_source_runfiles\")\n\n%s" % (
+        str(rctx.attr._source_runfiles_bzl),
+        source_build,
+    )
     rctx.file("BUILD.bazel", source_build, executable = False)
 
     # Image repositories are deliberately thin: expose only immutable source
@@ -393,6 +397,10 @@ linux_source_repository = repository_rule(
         "_source_build_file": attr.label(
             allow_single_file = True,
             default = Label("//:source_repo.BUILD.bazel"),
+        ),
+        "_source_runfiles_bzl": attr.label(
+            allow_single_file = True,
+            default = Label("//internal:linux_source_runfiles.bzl"),
         ),
     },
     doc = "Downloads an integrity-pinned, complete upstream Linux source tree.",

@@ -5,19 +5,23 @@ load(":repository_utils.bzl", _repository_prefix = "repository_prefix")
 
 visibility("//...")
 
-def _build_file(rules_repo, source_repo, config, config_mode, platform, overlay):
+def _root_build_file(rules_repo, source_repo, config, config_mode, platform, overlays):
+    overlay_entries = []
+    for name in sorted(overlays):
+        overlay_entries.append("        %s: %s," % (repr(name), repr(str(overlays[name]))))
+    overlays_literal = "{\n%s\n    }" % "\n".join(overlay_entries) if overlay_entries else "{}"
     return """load({source_info}, "LINUX_MODULE_MAKE_VARS", "LINUX_MODULE_TARGETS", "LINUX_SOURCE_VERSION")
-load({mapped_kernel}, "linux_mapped_image_targets")
+load({mapped_kernel}, "linux_mapped_image_family_targets")
 
 package(default_visibility = ["//visibility:public"])
 
-linux_mapped_image_targets(
+linux_mapped_image_family_targets(
     name = "kernel",
     config = {config},
     config_mode = {config_mode},
     module_make_vars = LINUX_MODULE_MAKE_VARS,
     module_targets = LINUX_MODULE_TARGETS,
-    overlay = {overlay},
+    overlays = {overlays},
     platform = {platform},
     source_repo = {source_repo},
     version = LINUX_SOURCE_VERSION,
@@ -26,10 +30,45 @@ linux_mapped_image_targets(
         config = repr(str(config)),
         config_mode = repr(config_mode),
         mapped_kernel = repr(rules_repo + "//internal:mapped_kernel.bzl"),
-        overlay = repr(str(overlay)) if overlay else "None",
+        overlays = overlays_literal,
         platform = repr(str(platform)),
         source_info = repr(source_repo + "//:source_info.bzl"),
         source_repo = repr(source_repo),
+    )
+
+def _variant_build_file(rules_repo, source_repo, name):
+    return """load({source_info}, "LINUX_MODULE_TARGETS")
+load({mapped_kernel}, "linux_mapped_image_variant_targets")
+
+package(default_visibility = ["//visibility:public"])
+
+linux_mapped_image_variant_targets(
+    name = "kernel",
+    family = "//:kernel__family",
+    module_targets = LINUX_MODULE_TARGETS,
+    variant = {variant},
+)
+""".format(
+        mapped_kernel = repr(rules_repo + "//internal:mapped_kernel.bzl"),
+        source_info = repr(source_repo + "//:source_info.bzl"),
+        variant = repr(name),
+    )
+
+def linux_image_repository_build_files_for_test(rules_repo, source_repo, config, config_mode, platform, overlays):
+    """Returns rendered facade files for unit tests without running a repository rule."""
+    return struct(
+        root = _root_build_file(
+            rules_repo = rules_repo,
+            source_repo = source_repo,
+            config = config,
+            config_mode = config_mode,
+            platform = platform,
+            overlays = overlays,
+        ),
+        variants = {
+            name: _variant_build_file(rules_repo, source_repo, name)
+            for name in sorted(overlays)
+        },
     )
 
 def _linux_image_impl(rctx):
@@ -40,13 +79,13 @@ def _linux_image_impl(rctx):
     rules_repo = _repository_prefix(rctx.attr._self_linux_bzl)
     rctx.file(
         "BUILD.bazel",
-        _build_file(
+        _root_build_file(
             rules_repo = rules_repo,
             source_repo = source_repo,
             config = rctx.attr.config,
             config_mode = rctx.attr.config_mode,
             platform = rctx.attr.platform,
-            overlay = None,
+            overlays = rctx.attr.overlays,
         ),
         executable = False,
     )
@@ -54,13 +93,10 @@ def _linux_image_impl(rctx):
         validate_linux_overlay_name(name)
         rctx.file(
             "variants/%s/BUILD.bazel" % name,
-            _build_file(
+            _variant_build_file(
                 rules_repo = rules_repo,
                 source_repo = source_repo,
-                config = rctx.attr.config,
-                config_mode = rctx.attr.config_mode,
-                platform = rctx.attr.platform,
-                overlay = rctx.attr.overlays[name],
+                name = name,
             ),
             executable = False,
         )
@@ -76,5 +112,5 @@ linux_image = repository_rule(
         "source": attr.label(allow_single_file = True, mandatory = True),
         "_self_linux_bzl": attr.label(default = Label("//:linux.bzl")),
     },
-    doc = "Creates stable labels for an execution-time mapped Linux build.",
+    doc = "Creates stable labels for one execution-time mapped Linux image family.",
 )

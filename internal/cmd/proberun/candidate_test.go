@@ -32,7 +32,7 @@ func TestValidateAndRewriteProbeCandidateArgumentsUsesTypedPaths(t *testing.T) {
 	candidates := arguments[2:8]
 	indexes := []int{2, 3, 4, 5, 6, 7}
 	got, err := validateAndRewriteProbeCandidateArguments(
-		"compile", kconfig.ProbeCandidatePolicyCC,
+		"compile", kconfig.ProbeCandidatePolicyCC, "",
 		arguments, candidates, indexes,
 		workingDirectory, workingDirectory, fixture.execroot,
 		nil, nil, resolver,
@@ -76,7 +76,7 @@ func TestValidateAndRewriteProbeCandidateArgumentsRejectsRenderedAuthority(t *te
 			indexes[index] = index
 		}
 		if _, err := validateAndRewriteProbeCandidateArguments(
-			"compile", kconfig.ProbeCandidatePolicyCCLink,
+			"compile", kconfig.ProbeCandidatePolicyCCLink, "",
 			candidate, candidate, indexes,
 			fixture.root, fixture.root, fixture.execroot,
 			nil, nil, resolver,
@@ -97,7 +97,7 @@ func TestValidateAndRewriteProbeCandidateArgumentsConfinesSplitDwarf(t *testing.
 	scratch := t.TempDir()
 	arguments := []string{"-gsplit-dwarf"}
 	if _, err := validateAndRewriteProbeCandidateArguments(
-		"compile", kconfig.ProbeCandidatePolicyCC,
+		"compile", kconfig.ProbeCandidatePolicyCC, "",
 		arguments, arguments, []int{0},
 		scratch, scratch, fixture.execroot,
 		nil, nil, resolver,
@@ -105,7 +105,7 @@ func TestValidateAndRewriteProbeCandidateArgumentsConfinesSplitDwarf(t *testing.
 		t.Fatalf("private split-DWARF candidate: %v", err)
 	}
 	if _, err := validateAndRewriteProbeCandidateArguments(
-		"compile", kconfig.ProbeCandidatePolicyCC,
+		"compile", kconfig.ProbeCandidatePolicyCC, "",
 		arguments, arguments, []int{0},
 		scratch, t.TempDir(), fixture.execroot,
 		nil, nil, resolver,
@@ -125,7 +125,7 @@ func TestValidateAndRewriteProbeCandidateArgumentsBindsSanitizerIgnorelist(t *te
 	scratch := t.TempDir()
 	argument := "-fsanitize-ignorelist=/dev/null"
 	got, err := validateAndRewriteProbeCandidateArguments(
-		"compile", kconfig.ProbeCandidatePolicyCC,
+		"compile", kconfig.ProbeCandidatePolicyCC, "",
 		[]string{argument}, []string{argument}, []int{0},
 		scratch, scratch, fixture.execroot,
 		nil, nil, resolver,
@@ -157,7 +157,7 @@ func TestValidateAndRewriteProbeCandidateArgumentsBindsSanitizerIgnorelist(t *te
 		"-fsanitize-blacklist=" + ignorelists[1],
 	}
 	got, err = validateAndRewriteProbeCandidateArguments(
-		"compile", kconfig.ProbeCandidatePolicyCC,
+		"compile", kconfig.ProbeCandidatePolicyCC, "",
 		arguments, arguments, []int{0, 1},
 		scratch, scratch, fixture.execroot,
 		nil, map[string]string{"linux": sourceRoot}, resolver,
@@ -297,7 +297,7 @@ func TestValidateAndRewriteProbeCandidateArgumentsRejectsCommaBearingForwardedPa
 	}
 	argument := "-Wa,-I,include"
 	if _, err := validateAndRewriteProbeCandidateArguments(
-		"compile", kconfig.ProbeCandidatePolicyCC,
+		"compile", kconfig.ProbeCandidatePolicyCC, "",
 		[]string{argument}, []string{argument}, []int{0},
 		t.TempDir(), sourceRoot, fixture.execroot,
 		nil, map[string]string{"linux": sourceRoot}, resolver,

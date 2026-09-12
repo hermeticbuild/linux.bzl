@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -512,6 +513,374 @@ func TestRunProbePlanDoesNotInspectConfiguredToolsOrSourceTree(t *testing.T) {
 	}
 }
 
+func writeTestProbePlan(t *testing.T, identity, source string) string {
+	t.Helper()
+	builder, err := kconfig.NewProbePlanBuilder(identity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := kconfig.ProbeRequest{
+		Schema:  kconfig.LinuxProbeRequestSchema,
+		Scratch: []kconfig.ProbeScratch{{Name: "object", Kind: "file"}},
+		Steps: []kconfig.ProbeStep{{
+			Name: "compile", Tool: "cc",
+			Arguments: []string{"-c", "-x", "c", "-", "-o", "${scratch:object}"},
+			Stdin:     source,
+		}},
+		Outcome: kconfig.ProbeOutcome{Kind: "boolean", Predicate: &kconfig.ProbePredicate{
+			Operator: "exit-zero", Step: "compile",
+		}},
+	}
+	reference, err := builder.Request("target", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := builder.Plan(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "probe-plan")
+	if err := plan.Write(root); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func runKconfigParseForTest(t *testing.T, arguments ...string) (int, string) {
+	t.Helper()
+	stderrFile, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCommandLine, oldArgs, oldStderr := flag.CommandLine, os.Args, os.Stderr
+	code := func() int {
+		defer func() {
+			flag.CommandLine = oldCommandLine
+			os.Args = oldArgs
+			os.Stderr = oldStderr
+		}()
+		flag.CommandLine = flag.NewFlagSet("kconfig_parse", flag.PanicOnError)
+		flag.CommandLine.SetOutput(io.Discard)
+		os.Args = append([]string{"kconfig_parse"}, arguments...)
+		os.Stderr = stderrFile
+		return run()
+	}()
+	if err := stderrFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := os.ReadFile(stderrFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return code, string(stderr)
+}
+
+func writeTestActionPlanFamilySnapshot(t *testing.T) string {
+	t.Helper()
+	recipe := kconfig.ActionRecipe{
+		Schema: kconfig.LinuxKernelPlanSchema, Kind: "copy", Tool: "actionfile",
+		Arguments: []string{"-input", "${source:source:00000000}", "-out", "${output:00000000}"},
+		Sources:   []string{"source:00000000"}, Outputs: []string{"00000000"},
+	}
+	recipeID, err := recipe.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := kconfig.ActionPlanNode{
+		Stage: "target", Kind: "copy", Recipe: recipeID, Tool: "actionfile", Product: "image",
+		Sources: []kconfig.ActionPlanSourceEdge{{Role: "source", SourceID: "src-00000001"}},
+		Outputs: []kconfig.ActionPlanOutput{{Tree: "objects", Path: "drivers/example.o"}},
+	}
+	node.ID = node.ContentID()
+	plan := &kconfig.ActionPlan{
+		Toolsets: map[string]string{
+			"host": "sha256-" + strings.Repeat("2", 64), "target": "sha256-" + strings.Repeat("1", 64),
+		},
+		Sources:  []kconfig.ActionPlanSource{{ID: "src-00000001", Namespace: "kernel", Path: "drivers/example.c"}},
+		Recipes:  map[string]kconfig.ActionRecipe{recipeID: recipe},
+		Nodes:    []kconfig.ActionPlanNode{node},
+		Products: []kconfig.ActionPlanProduct{{Name: "image", Tree: "objects", Path: "drivers/example.o"}},
+	}
+	configFiles := map[string]string{
+		".config":                       "CONFIG_EXAMPLE=y\n",
+		"include/config/auto.conf":      "CONFIG_EXAMPLE=y\n",
+		"include/config/auto.conf.cmd":  "cmd_auto_conf := true\n",
+		"include/generated/autoconf.h":  "#define CONFIG_EXAMPLE 1\n",
+		"include/generated/rustc_cfg":   "--cfg=CONFIG_EXAMPLE\n",
+		"include/config/kernel.release": "6.18.0-test\n",
+	}
+	output := filepath.Join(t.TempDir(), "base.snapshot.json.gz")
+	if err := kconfig.WriteActionPlanSnapshot(
+		output, plan, map[string]kconfig.ConfigDependencySet{node.ID: {}}, configFiles,
+	); err != nil {
+		t.Fatal(err)
+	}
+	return output
+}
+
+func TestRunActionPlanFamilyWritesFourSegmentsAndReuseReport(t *testing.T) {
+	snapshot := writeTestActionPlanFamilySnapshot(t)
+	root := t.TempDir()
+	report := filepath.Join(root, "reuse.json")
+	arguments := []string{
+		"-action_plan_family_variant=base=" + snapshot,
+		"-action_plan_reuse_report_out=" + report,
+	}
+	for _, segment := range []string{"target", "host", "bootstrap", "prehost"} {
+		arguments = append(arguments, "-action_plan_family_segment_out="+segment+"="+filepath.Join(root, segment))
+	}
+	code, stderr := runKconfigParseForTest(t, arguments...)
+	if code != 0 {
+		t.Fatalf("family reduction run() = %d, stderr = %q", code, stderr)
+	}
+	for _, segment := range []string{"prehost", "bootstrap", "host", "target"} {
+		if _, err := os.Stat(filepath.Join(root, segment, "schema", kconfig.LinuxKernelFamilyPlanSchema)); err != nil {
+			t.Errorf("%s family segment schema: %v", segment, err)
+		}
+	}
+	reportData, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded kconfig.ActionPlanFamilyReuseReport
+	if err := json.Unmarshal(reportData, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Schema != kconfig.LinuxKernelFamilyReuseReportSchema || decoded.UniqueNodes != 1 {
+		t.Fatalf("reuse report = %#v", decoded)
+	}
+}
+
+func TestRunActionPlanFamilyRequiresExactlyFourNamedSegments(t *testing.T) {
+	snapshot := writeTestActionPlanFamilySnapshot(t)
+	root := t.TempDir()
+	base := []string{
+		"-action_plan_family_variant=base=" + snapshot,
+		"-action_plan_reuse_report_out=" + filepath.Join(root, "reuse.json"),
+		"-action_plan_family_segment_out=prehost=" + filepath.Join(root, "prehost"),
+		"-action_plan_family_segment_out=bootstrap=" + filepath.Join(root, "bootstrap"),
+		"-action_plan_family_segment_out=host=" + filepath.Join(root, "host"),
+	}
+	for name, extra := range map[string][]string{
+		"missing":    nil,
+		"duplicate":  {"-action_plan_family_segment_out=host=" + filepath.Join(root, "host-again")},
+		"unknown":    {"-action_plan_family_segment_out=later=" + filepath.Join(root, "later")},
+		"deprecated": {"-action_plan_family_out=" + filepath.Join(root, "full")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			arguments := append(slices.Clone(base), extra...)
+			code, stderr := runKconfigParseForTest(t, arguments...)
+			if code != 2 {
+				t.Fatalf("run() = %d, stderr = %q", code, stderr)
+			}
+			if name == "deprecated" && !strings.Contains(stderr, "no longer supported") {
+				t.Fatalf("deprecated output stderr = %q", stderr)
+			}
+		})
+	}
+}
+
+func completeFamilyPlanFlags(root string, names ...string) familyPlanFlags {
+	flags := familyPlanFlags{variants: append(stringSliceFlag(nil), names...)}
+	for _, name := range names {
+		output := func(suffix string) namedPath {
+			return namedPath{Name: name, Path: filepath.Join(root, name+suffix)}
+		}
+		flags.resolvedArch = append(flags.resolvedArch, output(".arch"))
+		flags.resolvedConfig = append(flags.resolvedConfig, output(".config"))
+		flags.resolvedAutoConf = append(flags.resolvedAutoConf, output(".auto.conf"))
+		flags.resolvedCmd = append(flags.resolvedCmd, output(".auto.conf.cmd"))
+		flags.resolvedAutoconf = append(flags.resolvedAutoconf, output(".autoconf.h"))
+		flags.resolvedRustcCfg = append(flags.resolvedRustcCfg, output(".rustc_cfg"))
+		flags.resolvedRelease = append(flags.resolvedRelease, output(".kernel.release"))
+		flags.snapshots = append(flags.snapshots, output(".snapshot.json.gz"))
+	}
+	return flags
+}
+
+func TestFamilyPlanRequestsAreNamedStrictAndDeterministic(t *testing.T) {
+	root := t.TempDir()
+	flags := completeFamilyPlanFlags(root, "debug", "base")
+	flags.overlays = append(flags.overlays, namedPath{Name: "debug", Path: filepath.Join(root, "debug.overlay")})
+	requests, err := flags.requests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{requests[0].name, requests[1].name}; !slices.Equal(got, []string{"base", "debug"}) {
+		t.Fatalf("family request order = %q, want [base debug]", got)
+	}
+	if requests[0].overlay != "" || requests[1].overlay != filepath.Join(root, "debug.overlay") {
+		t.Fatalf("family overlays = %q, %q", requests[0].overlay, requests[1].overlay)
+	}
+	if requests[0].resolved.config != filepath.Join(root, "base.config") ||
+		requests[1].snapshot != filepath.Join(root, "debug.snapshot.json.gz") {
+		t.Fatalf("family outputs = %#v", requests)
+	}
+
+	for name, mutate := range map[string]func(*familyPlanFlags){
+		"duplicate variant": func(flags *familyPlanFlags) {
+			flags.variants = append(flags.variants, "base")
+		},
+		"unknown overlay": func(flags *familyPlanFlags) {
+			flags.overlays = append(flags.overlays, namedPath{Name: "other", Path: filepath.Join(root, "other.overlay")})
+		},
+		"missing output": func(flags *familyPlanFlags) {
+			flags.snapshots = flags.snapshots[:len(flags.snapshots)-1]
+		},
+		"duplicate output": func(flags *familyPlanFlags) {
+			flags.resolvedConfig = append(flags.resolvedConfig, flags.resolvedConfig[0])
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := completeFamilyPlanFlags(root, "base", "debug")
+			mutate(&invalid)
+			if _, err := invalid.requests(); err == nil {
+				t.Fatal("invalid family request succeeded")
+			}
+		})
+	}
+}
+
+func TestFamilyVariantConfigFlagsCloneSharedBase(t *testing.T) {
+	root := t.TempDir()
+	basePath := filepath.Join(root, "base.config")
+	overlayPath := filepath.Join(root, "debug.config")
+	if err := os.WriteFile(basePath, []byte("CONFIG_COMMON=y\nCONFIG_CHANGED=n\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(overlayPath, []byte("CONFIG_CHANGED=y\nCONFIG_DEBUG=y\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base, err := readConfigFlags(basePath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := familyVariantConfigFlags(base, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	debug, err := familyVariantConfigFlags(base, overlayPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base["CONFIG_CHANGED"] != "n" || plain["CONFIG_CHANGED"] != "n" ||
+		debug["CONFIG_CHANGED"] != "y" || debug["CONFIG_DEBUG"] != "y" {
+		t.Fatalf("base=%#v plain=%#v debug=%#v", base, plain, debug)
+	}
+	plain["CONFIG_COMMON"] = "n"
+	if base["CONFIG_COMMON"] != "y" {
+		t.Fatal("family variant mutated shared base config")
+	}
+}
+
+func readTestMarkerTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	markers := map[string]string{}
+	if err := filepath.WalkDir(root, func(filename string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(root, filename)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+		markers[filepath.ToSlash(relative)] = string(data)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return markers
+}
+
+func TestRunProbePlanUnionIsNamedStrictAndDeterministic(t *testing.T) {
+	identity := "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	left := writeTestProbePlan(t, identity, "int left;\n")
+	right := writeTestProbePlan(t, identity, "int right;\n")
+	forwardOut := filepath.Join(t.TempDir(), "forward")
+	code, stderr := runKconfigParseForTest(t,
+		"-probe_plan_union_input=right="+right,
+		"-probe_plan_union_input=left="+left,
+		"-probe_plan_union_out="+forwardOut,
+	)
+	if code != 0 {
+		t.Fatalf("forward union run() = %d, stderr = %q", code, stderr)
+	}
+	forward, err := kconfig.ReadProbePlan(forwardOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(forward.Nodes) != 2 || len(forward.Requests) != 2 || len(forward.Terminal) != 2 {
+		t.Fatalf("union = %d nodes, %d requests, %d terminals; want 2, 2, 2", len(forward.Nodes), len(forward.Requests), len(forward.Terminal))
+	}
+
+	reverseOut := filepath.Join(t.TempDir(), "reverse")
+	code, stderr = runKconfigParseForTest(t,
+		"-probe_plan_union_input=left="+left,
+		"-probe_plan_union_input=right="+right,
+		"-probe_plan_union_out="+reverseOut,
+	)
+	if code != 0 {
+		t.Fatalf("reverse union run() = %d, stderr = %q", code, stderr)
+	}
+	if forwardMarkers, reverseMarkers := readTestMarkerTree(t, forwardOut), readTestMarkerTree(t, reverseOut); !maps.Equal(forwardMarkers, reverseMarkers) {
+		t.Fatalf("union marker trees depend on input flag order\nforward: %#v\nreverse: %#v", forwardMarkers, reverseMarkers)
+	}
+
+	duplicateOut := filepath.Join(t.TempDir(), "duplicate")
+	code, stderr = runKconfigParseForTest(t,
+		"-probe_plan_union_input=same="+left,
+		"-probe_plan_union_input=same="+right,
+		"-probe_plan_union_out="+duplicateOut,
+	)
+	if code != 2 || !strings.Contains(stderr, `duplicate probe-plan union input "same"`) {
+		t.Fatalf("duplicate union run() = %d, stderr = %q", code, stderr)
+	}
+
+	mismatch := writeTestProbePlan(t, "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "int mismatch;\n")
+	code, stderr = runKconfigParseForTest(t,
+		"-probe_plan_union_input=left="+left,
+		"-probe_plan_union_input=mismatch="+mismatch,
+		"-probe_plan_union_out="+filepath.Join(t.TempDir(), "mismatch"),
+	)
+	if code != 2 || !strings.Contains(stderr, `variant "mismatch"`) || !strings.Contains(stderr, "target toolset") {
+		t.Fatalf("mismatched union run() = %d, stderr = %q", code, stderr)
+	}
+
+	if err := os.WriteFile(filepath.Join(right, "unknown"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stderr = runKconfigParseForTest(t,
+		"-probe_plan_union_input=broken="+right,
+		"-probe_plan_union_out="+filepath.Join(t.TempDir(), "broken"),
+	)
+	if code != 2 || !strings.Contains(stderr, `input "broken"`) || !strings.Contains(stderr, "unknown file") {
+		t.Fatalf("invalid union run() = %d, stderr = %q", code, stderr)
+	}
+}
+
+func TestRunProbePlanUnionRequiresInputsAndOutput(t *testing.T) {
+	identity := "sha256-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	input := writeTestProbePlan(t, identity, "int value;\n")
+	for name, arguments := range map[string][]string{
+		"input only":  {"-probe_plan_union_input=base=" + input},
+		"output only": {"-probe_plan_union_out=" + filepath.Join(t.TempDir(), "out")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			code, stderr := runKconfigParseForTest(t, arguments...)
+			if code != 2 || !strings.Contains(stderr, "probe-plan union requires") {
+				t.Fatalf("run() = %d, stderr = %q", code, stderr)
+			}
+		})
+	}
+}
+
 func TestRunRejectsMutuallyExclusivePlannerOutputs(t *testing.T) {
 	outputs := []string{
 		"-probe_plan_out",
@@ -816,6 +1185,59 @@ HOST_LFS_CFLAGS := $(shell false)
 	identity := testSourceDerivedLinuxKconfigIdentity(t, root, "x86_64-linux-gnu")
 	if want := (sourceDerivedLinuxTarget{Machine: "x86_64-linux-gnu", Arch: "x86", Srcarch: "x86", UTSMachine: "x86"}); identity != want {
 		t.Fatalf("identity = %#v, want %#v", identity, want)
+	}
+}
+
+func TestKbuildBuildOwnerIsExplicitAndExported(t *testing.T) {
+	t.Setenv("USER", "ambient-user-must-not-be-used")
+	t.Setenv("HOSTNAME", "ambient-host-must-not-be-used")
+	for _, configured := range []map[string]string{
+		{},
+		{"KBUILD_BUILD_USER": "release", "KBUILD_BUILD_HOST": "reproducible-builder"},
+	} {
+		before := maps.Clone(configured)
+		contract := &hostKbuildContract{}
+		commandLine, err := kbuildCommandLineVariables(contract, contract, configured)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root := t.TempDir()
+		makefile := filepath.Join(root, "Makefile")
+		if err := os.WriteFile(makefile, []byte("KBUILD_BUILD_USER := $(shell whoami)\nKBUILD_BUILD_HOST := $(shell uname -n)\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := kconfig.ParseKbuildFileTree(makefile, kconfig.KbuildOptions{
+			RootDir: root, CommandLineVariables: commandLine,
+			AutoExportCommandLineVariables: kbuildConfiguredCommandLineAutoExports(configured, contract, contract),
+			ConfigVariablesComplete:        true, MakeVariablesComplete: true,
+			Shell: func(command string) (string, error) {
+				return "", fmt.Errorf("must not discover ambient build metadata: %s", command)
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, fallback := range map[string]string{
+			"KBUILD_BUILD_USER": hermeticKbuildBuildUser,
+			"KBUILD_BUILD_HOST": hermeticKbuildBuildHost,
+		} {
+			want := fallback
+			if value, ok := configured[name]; ok {
+				want = value
+			}
+			if got := parsed.ExportedEnvironment()[name]; got != want {
+				t.Errorf("exported %s=%q, want %q", name, got, want)
+			}
+		}
+		if !maps.Equal(before, configured) {
+			t.Fatal("metadata defaults mutated caller variables")
+		}
+	}
+	for _, name := range []string{"KBUILD_BUILD_USER", "KBUILD_BUILD_HOST"} {
+		contract := &hostKbuildContract{}
+		if _, err := kbuildCommandLineVariables(contract, contract, map[string]string{name: ""}); err == nil || !strings.Contains(err.Error(), "must be nonempty") {
+			t.Fatalf("empty %s must not re-enable ambient metadata: %v", name, err)
+		}
 	}
 }
 
@@ -1368,11 +1790,12 @@ config BASE
 	}
 	targetContract, hostContract := testKbuildContracts(actions, targetFacts)
 	sharedVariables := map[string]string{"ARCH": "x86", "SRCARCH": "x86"}
+	kbuildInputCache := &kbuildInvocationInputCache{}
 
 	discovery, err := evaluateLinuxKconfigProbes(
 		t.Context(), kconfigPath, root, nil, sharedVariables,
 		targetIdentity, hostIdentity, targetFacts,
-		targetContract, hostContract, "", nil,
+		targetContract, hostContract, "", nil, kbuildInputCache,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1390,9 +1813,16 @@ config BASE
 	if _, err := evaluateLinuxKconfigProbes(
 		t.Context(), kconfigPath, root, nil, sharedVariables,
 		targetIdentity, hostIdentity, targetFacts,
-		targetContract, hostContract, "", oracle,
+		targetContract, hostContract, "", oracle, kbuildInputCache,
 	); err != nil {
 		t.Fatalf("reusable kernel Kconfig replay failed without consumer-only M: %v", err)
+	}
+	cacheHits := 0
+	for _, sourceCache := range kbuildInputCache.sourcePrograms {
+		cacheHits += sourceCache.Stats().CacheHits
+	}
+	if cacheHits == 0 {
+		t.Fatal("full Kconfig discovery/replay did not reuse source-derived Make programs")
 	}
 
 	leakedKconfigVariables := maps.Clone(sharedVariables)
@@ -2235,6 +2665,8 @@ include/generated/utsrelease.h: include/config/kernel.release FORCE
 		nil,
 		nil,
 		immutableContents,
+		nil,
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -3163,6 +3595,375 @@ FORCE:
 		if !strings.Contains(got, want) {
 			t.Errorf("evaluated source-script recipe %q omits %q", got, want)
 		}
+	}
+}
+
+const selectedKbuildActualFilechkWrapperForTest = `
+tmp-target = $(dir $@).tmp_$(notdir $@)
+kecho = echo
+define filechk
+	$(check-FORCE)
+	$(Q)set -e; \
+	mkdir -p $(dir $@); \
+	trap "rm -f $(tmp-target)" EXIT; \
+	{ $(filechk_$(1)); } > $(tmp-target); \
+	if [ ! -r $@ ] || ! cmp -s $@ $(tmp-target); then \
+		$(kecho) '  UPD     $@'; \
+		mv -f $(tmp-target) $@; \
+	fi
+endef
+`
+
+func TestSelectedKbuildGeneratedContentUsesActualFilechkWrapper(t *testing.T) {
+	const target = "include/generated/measured-arithmetic.h"
+	profile := selectionRoleProfileWithSources(t, selectedKbuildActualFilechkWrapperForTest+`
+all: `+target+`
+RATE = 999
+`+target+`: RATE := 250
+filechk_arbitrary = echo $(RATE) | bc -q $<
+`+target+`: arithmetic/program.dat FORCE
+	$(call filechk,arbitrary)
+.PHONY: FORCE
+FORCE:
+`, map[string]string{"arithmetic/program.dat": "immutable arithmetic program\n"}, "all")
+	profile.Name = "root:actual-filechk-wrapper"
+	const exact = "#include <linux/measured-dependency.h>\n#define MEASURED 250\n"
+	root := filepath.Dir(profile.Path)
+	seen := 0
+	selections, err := selectedKbuildSelectionsWithStatsSourceRootAndGeneratedContent(
+		[]kconfig.CompactKbuildProfile{profile}, map[string]bool{"arithmetic/program.dat": true}, nil, root,
+		func(current kconfig.CompactKbuildProfile, output, recipe string, sources, generated []string) (string, bool, bool, error) {
+			if output != target {
+				return "", false, false, nil
+			}
+			seen++
+			want := "{\necho 250 | bc -q ${tree:kernel}/arithmetic/program.dat\n} > '" + target + "'"
+			if recipe != want || !slices.Equal(sources, []string{"arithmetic/program.dat"}) || len(generated) != 0 {
+				t.Fatalf("filechk resolver received %q sources=%q generated=%q", recipe, sources, generated)
+			}
+			if !kbuildGeneratedContentHasClosedWorkingFrontier(current, output, recipe, root, root, false) {
+				t.Fatal("Make's incremental wrapper still contaminates the exact content frontier")
+			}
+			return exact, true, true, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := selectionByTarget(t, selections, target)
+	if seen != 1 || !selection.ExactGeneratedContentSet || selection.ExactGeneratedContent != exact || selection.UsesInitialObjectTree {
+		t.Fatalf("actual filechk selection = %#v, calls=%d", selection, seen)
+	}
+}
+
+func TestSelectedKbuildGeneratedContentCarriesReplayBytesToLowering(t *testing.T) {
+	profile := selectionRoleProfileWithSources(t, `
+all: include/generated/measured.h
+include/generated/measured.h: kernel/time/timeconst.bc FORCE
+	{ echo 250 | bc -q $(srctree)/kernel/time/timeconst.bc; } > $@
+.PHONY: FORCE
+FORCE:
+`, map[string]string{
+		"kernel/time/timeconst.bc": "fixture\n",
+	}, "all")
+	profile.Name = "root:measured-generated-content"
+	const exact = "#if defined(CONFIG_HZ_250)\n#define HZ_TO_MSEC 4\n#endif\n"
+	selections, err := selectedKbuildSelectionsWithStatsSourceRootAndGeneratedContent(
+		[]kconfig.CompactKbuildProfile{profile},
+		map[string]bool{"kernel/time/timeconst.bc": true},
+		nil, filepath.Dir(profile.Path),
+		func(_ kconfig.CompactKbuildProfile, target, _ string, _, _ []string) (string, bool, bool, error) {
+			if target != "include/generated/measured.h" {
+				return "", false, false, nil
+			}
+			return exact, true, true, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := selectionByTarget(t, selections, "include/generated/measured.h")
+	if !selection.ExactGeneratedContentSet || selection.ExactGeneratedContent != exact {
+		t.Fatalf("measured generated selection = %#v, want exact replay bytes", selection)
+	}
+}
+
+func TestSelectedKbuildFilechkContentRejectsGeneratedSourceShadow(t *testing.T) {
+	const target = "include/generated/measured-arithmetic.h"
+	profile := selectionRoleProfileWithSources(t, selectedKbuildActualFilechkWrapperForTest+`
+all: `+target+`
+filechk_arbitrary = echo 250 | bc -q $<
+arithmetic/program.dat: arithmetic/seed.dat FORCE
+	cp $< $@
+`+target+`: arithmetic/program.dat FORCE
+	$(call filechk,arbitrary)
+.PHONY: FORCE
+FORCE:
+`, map[string]string{
+		"arithmetic/program.dat": "checked-in bytes shadowed by selected writer\n",
+		"arithmetic/seed.dat":    "different generated bytes\n",
+	}, "all")
+	profile.Name = "root:filechk-generated-source-shadow"
+	seen := false
+	selections, err := selectedKbuildSelectionsWithStatsSourceRootAndGeneratedContent(
+		[]kconfig.CompactKbuildProfile{profile}, map[string]bool{"arithmetic/seed.dat": true}, nil, filepath.Dir(profile.Path),
+		func(_ kconfig.CompactKbuildProfile, output, _ string, _, generated []string) (string, bool, bool, error) {
+			if output != target {
+				return "", false, false, nil
+			}
+			seen = true
+			if !slices.Contains(generated, "arithmetic/program.dat") {
+				t.Fatalf("selected writer lost its generated provenance: %q", generated)
+			}
+			// Even a successful candidate probe cannot authorize bytes from the
+			// immutable source when final lowering binds a generated replacement.
+			return "#define UNAUTHORIZED 250\n", true, true, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := selectionByTarget(t, selections, target)
+	if !seen || selection.ExactGeneratedContentSet {
+		t.Fatalf("generated/source same-path candidate = %#v, seen=%t", selection, seen)
+	}
+}
+
+func TestSelectedKbuildGeneratedContentRejectsTargetSpecificBCEnvArgs(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "kernel", "time"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{
+		"Kconfig":                  "# probe root anchor\n",
+		"kernel/time/timeconst.bc": "fixture\n",
+		"Makefile": selectedKbuildActualFilechkWrapperForTest + `
+all: include/generated/measured.h
+include/generated/measured.h: export BC_ENV_ARGS := extra.bc
+filechk_arbitrary = echo 250 | bc -q $<
+include/generated/measured.h: kernel/time/timeconst.bc FORCE
+	$(call filechk,arbitrary)
+.PHONY: FORCE
+FORCE:
+`,
+	} {
+		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(name)), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const (
+		targetIdentity = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		hostIdentity   = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	bootstrap, err := newLinuxCompilerBootstrapPlan(targetIdentity, hostIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := kconfig.ParseLinuxCompilerBootstrapResult(
+		testLinuxCompilerBootstrapResultWithVersion(
+			t, bootstrap.target, targetIdentity, "x86_64-linux-gnu", "Acme C compiler 1.0",
+		),
+		"target", targetIdentity,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeOptions := kconfig.KbuildProbeWorkloadOptions{Target: kconfig.KbuildProbeScopeOptions{
+		Architecture: "x86", SourceArchitecture: "x86", SourceRoot: root, Facts: facts,
+		Tools: map[string]string{
+			"cc":             filepath.Join(root, "configured-cc"),
+			"script-runtime": filepath.Join(root, "configured-script-runtime"),
+			"scriptrun":      filepath.Join(root, "configured-scriptrun"),
+		},
+	}}
+	workingTreeContents := map[string]string{}
+	for _, path := range kconfig.ResolvedConfigProjectionOutputs() {
+		workingTreeContents[path] = ""
+	}
+
+	evaluation, err := kconfig.EvaluateKbuildProbeWorkload(
+		probeOptions,
+		nil,
+		func(scopes *kconfig.KbuildProbeScopes) ([]kconfig.CompactKbuildSelection, error) {
+			bindProbeEnvironment := func(exported map[string]string) (func() error, error) {
+				return scopes.BindExactScriptEnvironments(map[string]map[string]string{"target": exported})
+			}
+			variables := linuxRootMakeInvocationVariables(root)
+			variables["SRCARCH"] = "x86"
+			_, selections, _, parseErr := evaluatedKbuildProfilesWithGeneratedContent(
+				root,
+				root,
+				[]string{"all"},
+				nil,
+				variables,
+				kconfig.KbuildOptions{
+					RootDir:                 root,
+					Variables:               variables,
+					ConfigVariablesComplete: true,
+					MakeVariablesComplete:   true,
+				},
+				bindProbeEnvironment,
+				linuxKbuildGeneratedContentResolver(
+					scopes, workingTreeContents, root, root, false,
+				),
+				workingTreeContents,
+				nil,
+				false,
+			)
+			return selections, parseErr
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(evaluation.Plan.Nodes); got != 0 {
+		t.Fatalf("target-specific BC_ENV_ARGS registered %d exact-output probes: %#v", got, evaluation.Plan.Nodes)
+	}
+	selection := selectionByTarget(t, evaluation.Value, "include/generated/measured.h")
+	if selection.ExactGeneratedContentSet {
+		t.Fatalf("target-specific BC_ENV_ARGS admitted exact generated content: %#v", selection)
+	}
+}
+
+func TestSelectedKbuildGeneratedContentRejectsSelectedConfigWriterBeforeIncludeDiscovery(t *testing.T) {
+	profile := selectionRoleProfileWithSources(t, selectedKbuildActualFilechkWrapperForTest+`
+all: include/generated/measured.h include/config/kernel.release
+filechk_arbitrary = echo 250 | bc -q $<
+include/generated/measured.h: kernel/time/timeconst.bc FORCE
+	$(call filechk,arbitrary)
+include/config/kernel.release: kernel.release FORCE
+	cp $< $@
+.PHONY: FORCE
+FORCE:
+`, map[string]string{
+		"kernel/time/timeconst.bc": "fixture\n",
+		"kernel.release":           "6.12.0\n",
+	}, "all")
+	profile.Name = "root:measured-generated-content-with-config-writer"
+	const exact = "#define MEASURED 1\n"
+	selections, err := selectedKbuildSelectionsWithStatsSourceRootAndGeneratedContent(
+		[]kconfig.CompactKbuildProfile{profile},
+		map[string]bool{
+			"kernel/time/timeconst.bc": true,
+			"kernel.release":           true,
+		},
+		nil, filepath.Dir(profile.Path),
+		func(_ kconfig.CompactKbuildProfile, target, _ string, _, _ []string) (string, bool, bool, error) {
+			if target == "include/generated/measured.h" {
+				return exact, true, true, nil
+			}
+			return "", false, false, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := selectionByTarget(t, selections, "include/generated/measured.h")
+	if selection.ExactGeneratedContentSet {
+		t.Fatalf("candidate bytes survived a selected config writer: %#v", selection)
+	}
+}
+
+func TestSelectedKbuildGeneratedContentRejectsExplicitSameRootObjectTree(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "kernel", "time"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "kernel", "time", "timeconst.bc"), []byte("fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(`
+all: include/generated/measured.h
+include/generated/measured.h: kernel/time/timeconst.bc FORCE
+	{ echo 250 | bc -q $(srctree)/kernel/time/timeconst.bc; } > $@
+.PHONY: FORCE
+FORCE:
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	variables := linuxRootMakeInvocationVariables(root)
+	variables["SRCARCH"] = "x86"
+	probes := 0
+	_, selections, _, err := evaluatedKbuildProfilesWithGeneratedContent(
+		root,
+		root,
+		[]string{"all"},
+		nil,
+		variables,
+		kconfig.KbuildOptions{
+			RootDir:                 root,
+			Variables:               variables,
+			ConfigVariablesComplete: true,
+			MakeVariablesComplete:   true,
+		},
+		nil,
+		func(_ kconfig.CompactKbuildProfile, _, _ string, _, _ []string) (string, bool, bool, error) {
+			probes++
+			return "measured\n", true, true, nil
+		},
+		nil,
+		nil,
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probes != 0 {
+		t.Fatalf("generated-content probes = %d, want none for an explicit preconfigured object tree", probes)
+	}
+	selection := selectionByTarget(t, selections, "include/generated/measured.h")
+	if selection.ExactGeneratedContentSet {
+		t.Fatalf("preconfigured same-root selection retained exact generated content: %#v", selection)
+	}
+}
+
+func TestKbuildGeneratedContentRequiresClosedWorkingFrontier(t *testing.T) {
+	root := t.TempDir()
+	base := kconfig.CompactKbuildProfile{Name: "root:generated-content-frontier"}
+	if err := kconfig.SetCompactKbuildProfileInvocationLocation(&base, kconfig.CompactKbuildInvocationLocation{
+		Tree: kconfig.CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const target = "include/generated/measured.h"
+	const recipe = `{ printf measured; } > include/generated/measured.h`
+	if !kbuildGeneratedContentHasClosedWorkingFrontier(base, target, recipe, root, root, false) {
+		t.Fatal("source/config-only generated action was not eligible")
+	}
+	if kbuildGeneratedContentHasClosedWorkingFrontier(base, target, recipe, root, root, true) {
+		t.Fatal("explicit same-root preconfigured object tree was treated as an exact probe frontier")
+	}
+	if kbuildGeneratedContentHasClosedWorkingFrontier(
+		base, target, recipe, root, filepath.Join(root, "object"), false,
+	) {
+		t.Fatal("preconfigured object tree was treated as an exact probe frontier")
+	}
+	nested := base
+	if err := kconfig.SetCompactKbuildProfileInvocationLocation(&nested, kconfig.CompactKbuildInvocationLocation{
+		Tree: kconfig.CompactKbuildInvocationObjectTree, Directory: "kernel/time",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if kbuildGeneratedContentHasClosedWorkingFrontier(nested, target, recipe, root, root, false) {
+		t.Fatal("non-root invocation cwd was treated as an exact probe frontier")
+	}
+	withInvocation := base
+	withInvocation.TargetInvocationDependencies = []kconfig.CompactKbuildInvocationDependency{{
+		Target: target, Profile: "child", Goals: []string{"all"},
+	}}
+	if kbuildGeneratedContentHasClosedWorkingFrontier(withInvocation, target, recipe, root, root, false) {
+		t.Fatal("recursive-invocation materialization was omitted from the probe frontier")
+	}
+	if kbuildGeneratedContentHasClosedWorkingFrontier(
+		base, target, `{ cat ${tree:prep}/generated-input; } > include/generated/measured.h`, root, root, false,
+	) {
+		t.Fatal("object-tree reference was treated as an exact probe frontier")
+	}
+	if kbuildGeneratedContentHasClosedWorkingFrontier(
+		base, target, `${tree:prep}/generated-tool > include/generated/measured.h`, root, root, false,
+	) {
+		t.Fatal("object-tree program was treated as an exact probe frontier")
 	}
 }
 
@@ -8148,6 +8949,198 @@ func TestKbuildInvocationInputIndexFollowsSymlinkedSourceRoots(t *testing.T) {
 	}
 }
 
+func TestKbuildInvocationInputCacheKeyIsDeterministicAndExact(t *testing.T) {
+	sourceRoots := map[string]string{
+		kbuildEvalSourceTree + "/drivers/vendor": "inputs/./vendor",
+		kbuildEvalSourceTree + "/generated":      "inputs/tmp/../generated",
+	}
+	reorderedSourceRoots := map[string]string{}
+	reorderedSourceRoots[kbuildEvalSourceTree+"/generated"] = "inputs/generated"
+	reorderedSourceRoots[kbuildEvalSourceTree+"/drivers/vendor"] = "inputs/vendor"
+
+	base := kbuildInvocationInputCacheKey(
+		"kernel/./source",
+		"output/tmp/../tree",
+		sourceRoots,
+	)
+	if got := kbuildInvocationInputCacheKey(
+		"kernel/source",
+		"output/tree",
+		reorderedSourceRoots,
+	); got != base {
+		t.Fatalf("equivalent input tuple produced distinct keys:\nbase: %q\n got: %q", base, got)
+	}
+
+	for _, test := range []struct {
+		name        string
+		rootDir     string
+		objectRoot  string
+		sourceRoots map[string]string
+	}{
+		{
+			name:        "kernel root",
+			rootDir:     "kernel/other",
+			objectRoot:  "output/tree",
+			sourceRoots: reorderedSourceRoots,
+		},
+		{
+			name:        "object root",
+			rootDir:     "kernel/source",
+			objectRoot:  "output/other",
+			sourceRoots: reorderedSourceRoots,
+		},
+		{
+			name:       "source root marker",
+			rootDir:    "kernel/source",
+			objectRoot: "output/tree",
+			sourceRoots: map[string]string{
+				kbuildEvalSourceTree + "/generated":     "inputs/generated",
+				kbuildEvalSourceTree + "/drivers/other": "inputs/vendor",
+			},
+		},
+		{
+			name:       "source root path",
+			rootDir:    "kernel/source",
+			objectRoot: "output/tree",
+			sourceRoots: map[string]string{
+				kbuildEvalSourceTree + "/generated":      "inputs/generated",
+				kbuildEvalSourceTree + "/drivers/vendor": "inputs/other",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := kbuildInvocationInputCacheKey(test.rootDir, test.objectRoot, test.sourceRoots); got == base {
+				t.Fatalf("distinct %s tuple reused key %q", test.name, got)
+			}
+		})
+	}
+}
+
+func TestKbuildInvocationInputsCachesImmutableSnapshotDefensively(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "subdirectory"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{
+		"Makefile":              "all:\n",
+		"subdirectory/source.c": "int source;\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(name)), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cache := &kbuildInvocationInputCache{}
+	index, satisfied, err := kbuildInvocationInputs(cache, root, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(cache.entries), 1; got != want {
+		t.Fatalf("cache entries after first lookup = %d, want %d", got, want)
+	}
+	wantFiles := slices.Clone(index.files)
+	wantDirectories := slices.Clone(index.directories)
+	wantSatisfied := maps.Clone(satisfied)
+	if !slices.Contains(wantFiles, "Makefile") || !slices.Contains(wantFiles, "subdirectory/source.c") {
+		t.Fatalf("indexed files = %#v, want fixture sources", wantFiles)
+	}
+	if !slices.Contains(wantDirectories, "subdirectory") {
+		t.Fatalf("indexed directories = %#v, want fixture directory", wantDirectories)
+	}
+	if !wantSatisfied["Makefile"] {
+		t.Fatalf("satisfied targets = %#v, want Makefile", wantSatisfied)
+	}
+
+	index.files[0] = "caller-mutation"
+	index.directories[0] = "caller-mutation"
+	delete(satisfied, "Makefile")
+	satisfied["caller-mutation"] = true
+
+	index, satisfied, err = kbuildInvocationInputs(cache, root, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(index.files, wantFiles) || !slices.Equal(index.directories, wantDirectories) {
+		t.Fatalf("cached index leaked caller mutation: files=%#v directories=%#v", index.files, index.directories)
+	}
+	if !maps.Equal(satisfied, wantSatisfied) {
+		t.Fatalf("cached satisfied targets leaked caller mutation: got %#v, want %#v", satisfied, wantSatisfied)
+	}
+
+	// A hit also returns fresh state rather than exposing the cache's private
+	// slices and map through the previous hit.
+	index.files[0] = "second-caller-mutation"
+	satisfied["second-caller-mutation"] = true
+	thirdIndex, thirdSatisfied, err := kbuildInvocationInputs(cache, root, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(thirdIndex.files, wantFiles) || !maps.Equal(thirdSatisfied, wantSatisfied) {
+		t.Fatalf("cache hit leaked caller mutation: index=%#v satisfied=%#v", thirdIndex, thirdSatisfied)
+	}
+
+	objectRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(objectRoot, "generated.h"), []byte("#define GENERATED 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	separateIndex, separateSatisfied, err := kbuildInvocationInputs(cache, root, objectRoot, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(cache.entries), 2; got != want {
+		t.Fatalf("cache entries after distinct object-root lookup = %d, want %d", got, want)
+	}
+	if !slices.Contains(separateIndex.files, "generated.h") || !separateSatisfied["generated.h"] {
+		t.Fatalf("distinct object-root input missing from index=%#v satisfied=%#v", separateIndex, separateSatisfied)
+	}
+}
+
+func TestEvaluatedKbuildProfilesShareSourceProgramsAcrossFamilyVariants(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte("all:\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cache := &kbuildInvocationInputCache{}
+	for _, config := range []string{"y", "n"} {
+		variables := linuxRootMakeInvocationVariables(root)
+		variables["SRCARCH"] = "x86"
+		variables["CONFIG_CACHE_VARIANT"] = config
+		_, _, _, err := evaluatedKbuildProfilesWithGeneratedContent(
+			root,
+			root,
+			[]string{"all"},
+			nil,
+			variables,
+			kconfig.KbuildOptions{
+				RootDir:                 root,
+				Variables:               variables,
+				ConfigVariablesComplete: true,
+				MakeVariablesComplete:   true,
+			},
+			nil,
+			nil,
+			nil,
+			cache,
+			false,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := len(cache.sourcePrograms), 1; got != want {
+		t.Fatalf("family source caches = %d, want %d", got, want)
+	}
+	for _, sourceCache := range cache.sourcePrograms {
+		if got, want := sourceCache.Stats(), (kconfig.KbuildSourceCacheStats{
+			SourceReads: 1,
+			CacheHits:   1,
+			Entries:     1,
+		}); got != want {
+			t.Fatalf("family source cache stats = %#v, want %#v", got, want)
+		}
+	}
+}
+
 func TestKbuildProfileImplicitRuleIdentityStopsRecursiveTargetGrowth(t *testing.T) {
 	profile := kconfig.CompactKbuildProfile{
 		Name: "driver:scripts/Makefile.vmlinux@.#fixture",
@@ -8557,6 +9550,66 @@ func TestSelectedKbuildSelectionsWalkGrowsWithSelectedClosure(t *testing.T) {
 	}
 }
 
+func TestGraphReachabilityMemoCachesRepeatedQueriesWithinRound(t *testing.T) {
+	const queryCount = 4096
+	dependencies := map[string]map[string]bool{
+		"consumer": {"middle": true},
+		"middle":   {"producer": true},
+	}
+	walks := 0
+	hits := 0
+	memo := newGraphReachabilityMemo(
+		dependencies,
+		map[string]map[string]bool{},
+		func() { walks++ },
+		func() { hits++ },
+	)
+	for range queryCount {
+		if !memo.reaches("consumer", "producer") {
+			t.Fatal("producer is not reachable from consumer")
+		}
+	}
+	if !memo.allPredecessors("consumer")["middle"] {
+		t.Fatal("middle predecessor is absent")
+	}
+	if !memo.allPredecessors("consumer")["producer"] {
+		t.Fatal("producer predecessor is absent from repeated closure query")
+	}
+	if got, want := hits, queryCount; got != want {
+		t.Fatalf("cache hits = %d, want %d", got, want)
+	}
+	if got, want := walks, 2; got != want {
+		t.Fatalf("graph walks = %d, want one for each of %d distinct pair/closure queries", got, want)
+	}
+}
+
+func TestGraphReachabilityMemoIsRecreatedAfterGraphMutation(t *testing.T) {
+	dependencies := map[string]map[string]bool{
+		"consumer": {"producer": true},
+	}
+	walks := 0
+	newRound := func() *graphReachabilityMemo[string] {
+		return newGraphReachabilityMemo(
+			dependencies,
+			map[string]map[string]bool{},
+			func() { walks++ },
+			nil,
+		)
+	}
+	memo := newRound()
+	if memo.reaches("consumer", "late") {
+		t.Fatal("late predecessor is reachable before its edge is added")
+	}
+	dependencies["producer"] = map[string]bool{"late": true}
+	memo = newRound()
+	if !memo.reaches("consumer", "late") {
+		t.Fatal("new graph round did not observe the added edge")
+	}
+	if got, want := walks, 2; got != want {
+		t.Fatalf("graph walks = %d, want one per immutable graph round (%d)", got, want)
+	}
+}
+
 func TestSelectedKbuildSelectionsOpaqueRootWalksOnlyPredecessorTargets(t *testing.T) {
 	const unrelatedCount = 1024
 	var makefile strings.Builder
@@ -8608,6 +9661,12 @@ generated/header.h: header.in
 			"opaque-root predecessor checks = %d, want %d independent of %d unrelated selected targets",
 			got, want, unrelatedCount,
 		)
+	}
+	if got, want := stats.ReachabilityWalks, 2; got != want {
+		t.Fatalf("reachability walks = %d, want %d for the immutable selection rounds", got, want)
+	}
+	if got, want := stats.ReachabilityCacheHits, 1; got != want {
+		t.Fatalf("reachability cache hits = %d, want %d repeated query without another graph walk", got, want)
 	}
 }
 
@@ -12477,4 +13536,131 @@ func setTestCompactKbuildInitialVisibleArtifacts(
 	kconfig.SetCompactKbuildProfileInitialVisibleArtifactView(
 		profile, kbuildFrontierArtifactView{state: state},
 	)
+}
+
+func TestKbuildResolvedTargetCacheReusesDiscoveryResolutionDuringSelection(t *testing.T) {
+	profile := selectionRoleProfileWithSources(t, `
+if_changed = $(cmd_$(1))
+cmd_cc = $(CC) -c -o $@ $<
+result.o: input.c FORCE
+	$(call if_changed,cc)
+`, map[string]string{"input.c": "int input;\n"}, "result.o")
+	satisfied := map[string]bool{"input.c": true}
+	resolvedTargets := newKbuildResolvedTargetCache()
+
+	if _, err := selectedKbuildRecursiveMakePlanWithResolvedTargets(
+		profile, satisfied, nil, nil, resolvedTargets,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(resolvedTargets.values), 1; got != want {
+		t.Fatalf("resolved targets after discovery = %d, want %d", got, want)
+	}
+	discoveryResolution := resolvedTargets.values[kbuildResolvedTargetKey{
+		profile: profile.Name, target: "result.o", makeTarget: "result.o",
+	}].resolved
+	if discoveryResolution == nil {
+		t.Fatal("discovery did not retain the selected target resolution")
+	}
+
+	selections, err := selectedKbuildSelectionsWithResolvedTargets(
+		[]kconfig.CompactKbuildProfile{profile}, satisfied, nil, "", nil, nil, resolvedTargets, false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selections) != 1 || selections[0].Target != "result.o" {
+		t.Fatalf("selections = %#v, want result.o", selections)
+	}
+	if got, want := len(resolvedTargets.values), 1; got != want {
+		t.Fatalf("resolved targets after selection = %d, want unchanged %d", got, want)
+	}
+	selectionResolution := resolvedTargets.values[kbuildResolvedTargetKey{
+		profile: profile.Name, target: "result.o", makeTarget: "result.o",
+	}].resolved
+	if selectionResolution != discoveryResolution {
+		t.Fatal("selection replaced the target resolution retained by discovery")
+	}
+}
+
+func TestEvaluateSelectedKbuildRuleContextReturnsSharedResolvedTarget(t *testing.T) {
+	profile := selectionRoleProfileWithSources(t, `
+result.o: input.c FORCE
+	touch $@
+`, map[string]string{"input.c": "int input;\n"}, "result.o")
+	satisfied := map[string]bool{"input.c": true}
+	resolvedTargets := newKbuildResolvedTargetCache()
+	firstIndex := newKbuildProfileTargetIndexWithResolvedTargets(profile, nil, resolvedTargets)
+	ruleIndexes := kbuildProfileRuleIndexesForMakeTargetIndexed(
+		profile, firstIndex, "result.o", "result.o", satisfied,
+	)
+	effectiveRecipeIndexes, err := kconfig.EffectiveCompactKbuildRecipeRuleIndexes(profile, ruleIndexes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstNormal, firstOrderOnly, firstStem, first, err := evaluateSelectedKbuildRuleContextForMakeTarget(
+		profile, firstIndex, "result.o", "result.o", ruleIndexes, effectiveRecipeIndexes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondIndex := newKbuildProfileTargetIndexWithResolvedTargets(profile, nil, resolvedTargets)
+	secondNormal, secondOrderOnly, secondStem, second, err := evaluateSelectedKbuildRuleContextForMakeTarget(
+		profile, secondIndex, "result.o", "result.o", ruleIndexes, effectiveRecipeIndexes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == nil || second != first {
+		t.Fatalf("resolved handles = (%p, %p), want one shared non-nil handle", first, second)
+	}
+	if !slices.Equal(firstNormal, secondNormal) || !slices.Equal(firstOrderOnly, secondOrderOnly) || firstStem != secondStem {
+		t.Fatalf(
+			"cached context changed: first=(%#v, %#v, %q), second=(%#v, %#v, %q)",
+			firstNormal, firstOrderOnly, firstStem, secondNormal, secondOrderOnly, secondStem,
+		)
+	}
+}
+
+func TestKbuildResolvedTargetCacheInvalidatesAttachedDeferredQueries(t *testing.T) {
+	const token = "LINUX_BZL_KBUILD_CONTENT_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	profile := selectionRoleProfileWithSources(t, `
+value := `+token+`
+if_changed = $(cmd_$(1))
+cmd_emit = printf '%s' $(value) > $@
+result: input FORCE
+	$(call if_changed,emit)
+`, map[string]string{"input": "input\n"}, "result")
+	cache := newKbuildResolvedTargetCache()
+	before, err := cache.resolve(profile, "result", "result")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == nil || !before.HasSelectedRule() {
+		t.Fatal("initial profile did not resolve result")
+	}
+
+	updated, err := kconfig.AttachKbuildDeferredContentQueries(profile, kconfig.KbuildControlEvaluation{
+		Queries: []kconfig.KbuildDeferredContentQuery{{
+			Token: token, Command: "printf query", Target: "producer", Profile: profile,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.invalidateProfile(profile.Name)
+	after, err := cache.resolve(updated, "result", "result")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after == before {
+		t.Fatal("profile invalidation retained a handle with the previous deferred-query registry")
+	}
+	effects, selected, err := after.SelectedTargetEffects()
+	if err != nil || !selected {
+		t.Fatalf("updated target effects = (%#v, %t, %v), want selected", effects, selected, err)
+	}
+	if len(effects.DeferredContentQueries) != 1 || effects.DeferredContentQueries[0].Token != token {
+		t.Fatalf("updated target queries = %#v, want %q", effects.DeferredContentQueries, token)
+	}
 }

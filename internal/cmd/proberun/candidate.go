@@ -17,6 +17,78 @@ type probeCandidatePathRewrite struct {
 	value string
 }
 
+// projectRenderedProbeCandidateArguments applies a protocol projection only to
+// candidate-owned words and rebuilds the complete argv around the surviving
+// words. Managed arguments are neither inspected nor rewritten; in particular,
+// a compiler-predefine step's -dM -E -x LANG /dev/null tail remains exact.
+func projectRenderedProbeCandidateArguments(
+	stepName, projection string,
+	arguments, candidates []string,
+	candidateIndexes []int,
+	translationUnits []string,
+) ([]string, []string, []int, error) {
+	if len(candidates) != len(candidateIndexes) {
+		return nil, nil, nil, fmt.Errorf(
+			"step %s candidate provenance has %d words and %d argument indexes",
+			stepName, len(candidates), len(candidateIndexes),
+		)
+	}
+	projected, origins, err := kconfig.ProjectProbeCandidateArguments(projection, candidates, translationUnits)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("step %s candidate projection: %w", stepName, err)
+	}
+	if len(projected) != len(origins) {
+		return nil, nil, nil, fmt.Errorf(
+			"step %s candidate projection returned %d words and %d origins",
+			stepName, len(projected), len(origins),
+		)
+	}
+
+	projectedByOrigin := make(map[int]string, len(projected))
+	previousOrigin := -1
+	for index, origin := range origins {
+		if origin < 0 || origin >= len(candidates) || origin <= previousOrigin {
+			return nil, nil, nil, fmt.Errorf(
+				"step %s candidate projection returned invalid or unsorted origin %d",
+				stepName, origin,
+			)
+		}
+		projectedByOrigin[origin] = projected[index]
+		previousOrigin = origin
+	}
+	candidateByArgument := make(map[int]int, len(candidateIndexes))
+	previousArgument := -1
+	for candidateIndex, argumentIndex := range candidateIndexes {
+		if argumentIndex < 0 || argumentIndex >= len(arguments) || argumentIndex <= previousArgument {
+			return nil, nil, nil, fmt.Errorf(
+				"step %s candidate provenance has invalid or unsorted argument index %d",
+				stepName, argumentIndex,
+			)
+		}
+		candidateByArgument[argumentIndex] = candidateIndex
+		previousArgument = argumentIndex
+	}
+
+	complete := make([]string, 0, len(arguments))
+	projectedCandidates := make([]string, 0, len(projected))
+	projectedIndexes := make([]int, 0, len(projected))
+	for argumentIndex, argument := range arguments {
+		candidateIndex, owned := candidateByArgument[argumentIndex]
+		if !owned {
+			complete = append(complete, argument)
+			continue
+		}
+		value, keep := projectedByOrigin[candidateIndex]
+		if !keep {
+			continue
+		}
+		projectedIndexes = append(projectedIndexes, len(complete))
+		projectedCandidates = append(projectedCandidates, value)
+		complete = append(complete, value)
+	}
+	return complete, projectedCandidates, projectedIndexes, nil
+}
+
 // validateAndRewriteProbeCandidateArguments applies the security grammar to
 // the fully rendered source-owned argv and then binds every filesystem operand
 // to an input of this action. candidateIndexes maps each source-owned argv word
@@ -24,19 +96,56 @@ type probeCandidatePathRewrite struct {
 // validator and therefore cannot be mistaken for source-controlled compiler
 // mode or output selection.
 func validateAndRewriteProbeCandidateArguments(
-	stepName, policy string,
+	stepName, policy, projection string,
 	arguments, candidates []string,
 	candidateIndexes []int,
 	scratchRoot, workingDirectory, execroot string,
 	sources, sourceRoots map[string]string,
 	toolsetPaths *toolsetPathResolver,
 ) ([]string, error) {
+	operands, err := kconfig.ValidateProjectedProbeCandidateArguments(policy, projection, candidates)
+	return rewriteValidatedProbeCandidateArguments(stepName, arguments, candidates, candidateIndexes,
+		scratchRoot, workingDirectory, execroot, sources, sourceRoots, toolsetPaths, operands, err)
+}
+
+// Intrinsic authority comes from the same immutable step whose fragments were
+// rendered into arguments. Never substitute a caller-asserted operator list or
+// the attribute-only legacy projection contract for that actual managed input.
+func validateAndRewriteProbeStepCandidateArguments(
+	step kconfig.ProbeStep,
+	arguments, candidates []string,
+	candidateIndexes []int,
+	scratchRoot, workingDirectory, execroot string,
+	sources, sourceRoots map[string]string,
+	toolsetPaths *toolsetPathResolver,
+) ([]string, error) {
+	if step.Candidate == nil {
+		return nil, fmt.Errorf("step %s has no candidate argument ownership", step.Name)
+	}
+	if step.Candidate.Projection != kconfig.ProbeCandidateProjectionCompilerIntrinsic {
+		return validateAndRewriteProbeCandidateArguments(step.Name, step.Candidate.Policy, step.Candidate.Projection,
+			arguments, candidates, candidateIndexes, scratchRoot, workingDirectory, execroot, sources, sourceRoots, toolsetPaths)
+	}
+	operands, err := kconfig.ValidateCompilerIntrinsicProbeCandidateArguments(step, candidates)
+	return rewriteValidatedProbeCandidateArguments(step.Name, arguments, candidates, candidateIndexes,
+		scratchRoot, workingDirectory, execroot, sources, sourceRoots, toolsetPaths, operands, err)
+}
+
+func rewriteValidatedProbeCandidateArguments(
+	stepName string,
+	arguments, candidates []string,
+	candidateIndexes []int,
+	scratchRoot, workingDirectory, execroot string,
+	sources, sourceRoots map[string]string,
+	toolsetPaths *toolsetPathResolver,
+	operands []kconfig.ProbeCandidatePathOperand,
+	validationErr error,
+) ([]string, error) {
 	if len(candidates) != len(candidateIndexes) {
 		return nil, fmt.Errorf("step %s candidate provenance has %d words and %d argument indexes", stepName, len(candidates), len(candidateIndexes))
 	}
-	operands, err := kconfig.ValidateProbeCandidateArguments(policy, candidates)
-	if err != nil {
-		return nil, fmt.Errorf("step %s candidate arguments: %w", stepName, err)
+	if validationErr != nil {
+		return nil, fmt.Errorf("step %s candidate arguments: %w", stepName, validationErr)
 	}
 	for _, candidate := range candidates {
 		if candidate == "-gsplit-dwarf" && filepath.Clean(workingDirectory) != filepath.Clean(scratchRoot) {

@@ -1,6 +1,7 @@
 package kconfig
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,6 +53,78 @@ func TestProbePlanBuilderCanonicalizesRepeatedTerminals(t *testing.T) {
 	}
 	if len(plan.Terminal) != 1 || plan.Terminal[0] != reference.NodeID {
 		t.Fatalf("terminal roots = %q, want [%s]", plan.Terminal, reference.NodeID)
+	}
+}
+
+func TestProbePlanBuilderDeduplicatesAtScaleInFirstSeenOrder(t *testing.T) {
+	const requestCount = 2048
+	identity := "sha256-" + strings.Repeat("a", 64)
+	builder, err := NewProbePlanBuilder(identity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := make([]ProbeRequest, requestCount)
+	references := make([]ProbeReference, requestCount)
+	for index := range requests {
+		request := testProbeRequest()
+		request.Steps[0].Stdin = fmt.Sprintf("int value_%08d;\n", index)
+		requests[index] = request
+		references[index], err = builder.Request("target", request)
+		if err != nil {
+			t.Fatalf("request %d: %v", index, err)
+		}
+	}
+	for index := requestCount - 1; index >= 0; index-- {
+		duplicate, err := builder.Request("target", requests[index])
+		if err != nil {
+			t.Fatalf("duplicate request %d: %v", index, err)
+		}
+		if duplicate != references[index] {
+			t.Fatalf("duplicate request %d = %#v, want %#v", index, duplicate, references[index])
+		}
+	}
+	if len(builder.plan.Nodes) != requestCount {
+		t.Fatalf("deduplicated plan has %d nodes, want %d", len(builder.plan.Nodes), requestCount)
+	}
+	for index, node := range builder.plan.Nodes {
+		if node.ID != references[index].NodeID {
+			t.Fatalf("plan node %d = %s, want first-seen %s", index, node.ID, references[index].NodeID)
+		}
+	}
+}
+
+func BenchmarkProbePlanBuilderRequestDedupScale(b *testing.B) {
+	identity := "sha256-" + strings.Repeat("a", 64)
+	for _, requestCount := range []int{128, 1024, 4096} {
+		requests := make([]ProbeRequest, requestCount)
+		for index := range requests {
+			request := testProbeRequest()
+			request.Steps[0].Stdin = fmt.Sprintf("int value_%08d;\n", index)
+			requests[index] = request
+		}
+		b.Run(fmt.Sprintf("requests-%d", requestCount), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ReportMetric(float64(requestCount), "unique-requests/op")
+			for range b.N {
+				builder, err := NewProbePlanBuilder(identity, "")
+				if err != nil {
+					b.Fatal(err)
+				}
+				for _, request := range requests {
+					if _, err := builder.Request("target", request); err != nil {
+						b.Fatal(err)
+					}
+				}
+				for index := len(requests) - 1; index >= 0; index-- {
+					if _, err := builder.Request("target", requests[index]); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if len(builder.plan.Nodes) != requestCount {
+					b.Fatalf("deduplicated plan has %d nodes, want %d", len(builder.plan.Nodes), requestCount)
+				}
+			}
+		})
 	}
 }
 

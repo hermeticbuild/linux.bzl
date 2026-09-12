@@ -13,8 +13,21 @@ import (
 )
 
 type CompactMetadata struct {
-	Config                  CompactConfig
-	configFragment          map[string]string
+	Config         CompactConfig
+	configFragment map[string]string
+	// validatedSelectionGraph is the one-shot handoff from metadata validation
+	// to action lowering. Graph construction is deliberately eager so callers
+	// still receive structural Kbuild errors from CompactMetadata construction,
+	// but the first lowering must not rebuild the same index. Lowering mutates
+	// planning caches and materialization state, so it consumes this pointer;
+	// any later traversal constructs a fresh graph.
+	validatedSelectionGraph *compactKbuildSelectionGraph
+	// configSymbolUniverse is the stable sorted set of all CONFIG_* names
+	// defined by this Kconfig tree, including currently disabled/unwritten
+	// symbols. Differential generator recipes expand their stable selector
+	// prefixes over this universe so adding an enabled variant cannot widen the
+	// dependency contract of existing family members.
+	configSymbolUniverse    []string
 	sourceNamespaces        map[string]string
 	sourceNamespacePrefixes map[string]string
 	exactSourceNamespaces   map[string]string
@@ -22,12 +35,70 @@ type CompactMetadata struct {
 	sourceNamespaceIndexErr error
 	sourceNamespaceIndexed  bool
 	actionRoles             []KbuildActionRoleRef
+	// actionContracts retains the configured argv envelope and process
+	// environment applied by the identity-bound tool proxy.  It is planner-only:
+	// executable recipes continue to refer to the toolset by content identity,
+	// while config-dependency analysis uses this exact projection to model the
+	// compiler invocation which will actually execute.
+	actionContracts         map[KbuildActionRoleRef]CompactKbuildActionContract
 	preconfiguredObjectTree bool
 	selectedProductsOnly    bool
 	// toolsetPathCapabilityNormalizer verifies workload-local capabilities
 	// after source-owned Make transformations and removes their ephemeral tags
 	// before recipes cross a stable content-addressing boundary.
 	toolsetPathCapabilityNormalizer func(string) (string, error)
+	// compilerProbeSourceShellWords retains an unquoted, whole deferred recipe
+	// argument as source shell text rather than as already cooked compiler argv.
+	// Only the source recipe occurrence boundary may create this annotation.
+	compilerProbeSourceShellWords func(string) (string, error)
+	// compilerPredefines is a process-local bridge back into the Kbuild probe
+	// workload which produced this metadata. Discovery registers one normalized
+	// preprocessor defined-name request; replay returns its measured text. The
+	// probe workload canonicalizes direct object-like -D replacement bodies under
+	// GCC/Clang-compatible command-line macro semantics, without changing the
+	// executable recipe. Neither the callback nor the raw compiler output crosses
+	// an ActionPlan serialization boundary.
+	compilerPredefines func(
+		scope, role, language string,
+		arguments, translationUnits []string,
+		environment map[string]string,
+	) (string, bool, error)
+	// compilerDefinedness measures a stable source-derived name inventory in
+	// the same configured compiler context, retaining explicit negative answers.
+	compilerDefinedness func(
+		scope, role, language string,
+		arguments, translationUnits, names []string,
+		environment map[string]string,
+	) (map[string]bool, bool, error)
+	// compilerDollarPunctuation proves this lexical capability using the exact
+	// configured compiler context. False is not evidence of identifier mode;
+	// unready results cannot authorize the complete-call scanner.
+	compilerDollarPunctuation func(
+		scope, role, language string,
+		arguments, translationUnits []string,
+		environment map[string]string,
+	) (bool, bool, error)
+	compilerGuardObserver func(ConfigDependencyCompilerGuardObservation) error
+	compilerGuardAnswers  *KbuildCompilerGuardAnswers
+	// Inventory ownership follows the probe workload across metadata rebuilds;
+	// neither this process-local cache nor its callback is serialized.
+	sourceGuardInventory *configDependencyGuardInventory
+	// Source mappings are immutable during lowering. Cache the merged hint list
+	// once per metadata object rather than per compiler node or query chunk.
+	sourceGuardNames      []string
+	sourceGuardNamesReady bool
+}
+
+// CompactKbuildActionContract is the configured action envelope surrounding
+// source-selected Kbuild argv. PrefixArguments execute before the Kbuild argv,
+// SuffixArguments after it, and Environment is exported by the tool proxy just
+// before exec. Paths remain in the canonical toolset namespace owned by the
+// manifest; dependency analysis distinguishes intrinsic toolset-owned roots
+// from explicit configured/environment roots whose contents remain opaque.
+type CompactKbuildActionContract struct {
+	PrefixArguments []string
+	SuffixArguments []string
+	Environment     map[string]string
 }
 
 type CompactConfig struct {
@@ -87,6 +158,13 @@ type CompactKbuildSelection struct {
 	// effects consumed by this action. The query owns its scope, stage, and
 	// object-tree frontier; the consumer retains only this explicit value edge.
 	DeferredContentQueries string
+	// ExactGeneratedContent is the byte result of executing this selection's
+	// complete source-selected generator in the content-addressed probe
+	// workload. It is planner-only evidence: final lowering may replace the
+	// generator with an input-free literal action when Set is true, making
+	// equal generated bytes reusable across otherwise different configs.
+	ExactGeneratedContent    string
+	ExactGeneratedContentSet bool
 }
 
 func normalizeCompactKbuildSelectionMakeTargets(
@@ -564,12 +642,59 @@ type CompactMetadataOptions struct {
 	// target and host toolset manifests. Make values carry these refs from
 	// source parse time; this registry only rejects forged/reserved tokens.
 	ActionRoles []KbuildActionRoleRef
+	// ActionContracts carries the exact configured argv/environment envelope for
+	// every ActionRoles member. It is not serialized into ActionRecipe: the
+	// toolset identity already owns execution, while the planner needs the
+	// envelope only to conservatively discover compiler include/config inputs.
+	ActionContracts map[KbuildActionRoleRef]CompactKbuildActionContract
 	// PreconfiguredObjectTree treats resolved config and preparation artifacts
 	// as inputs from an existing object tree instead of producing them again.
 	PreconfiguredObjectTree bool
 	// SelectedProductsOnly retains the selected native graph and module
 	// products without requiring the kernel image/vmlinux facade.
 	SelectedProductsOnly bool
+}
+
+func normalizeCompactKbuildActionContracts(
+	roles []KbuildActionRoleRef,
+	contracts map[KbuildActionRoleRef]CompactKbuildActionContract,
+) (map[KbuildActionRoleRef]CompactKbuildActionContract, error) {
+	if contracts == nil {
+		return nil, nil
+	}
+	roleSet := make(map[KbuildActionRoleRef]bool, len(roles))
+	for _, role := range roles {
+		roleSet[role] = true
+	}
+	if len(contracts) != len(roleSet) {
+		return nil, fmt.Errorf("configured Kbuild action contracts contain %d roles, want %d", len(contracts), len(roleSet))
+	}
+	out := make(map[KbuildActionRoleRef]CompactKbuildActionContract, len(contracts))
+	for ref, contract := range contracts {
+		if !roleSet[ref] {
+			return nil, fmt.Errorf("configured Kbuild action contract references unknown %s role %q", ref.Scope, ref.Role)
+		}
+		clone := CompactKbuildActionContract{
+			PrefixArguments: slices.Clone(contract.PrefixArguments),
+			SuffixArguments: slices.Clone(contract.SuffixArguments),
+			Environment:     maps.Clone(contract.Environment),
+		}
+		if clone.Environment == nil {
+			clone.Environment = map[string]string{}
+		}
+		for _, argument := range append(slices.Clone(clone.PrefixArguments), clone.SuffixArguments...) {
+			if strings.ContainsRune(argument, 0) {
+				return nil, fmt.Errorf("configured Kbuild %s action role %q has a NUL argument", ref.Scope, ref.Role)
+			}
+		}
+		for name, value := range clone.Environment {
+			if name == "" || strings.ContainsAny(name, "=\x00") || strings.ContainsRune(value, 0) {
+				return nil, fmt.Errorf("configured Kbuild %s action role %q has invalid environment entry %q", ref.Scope, ref.Role, name)
+			}
+		}
+		out[ref] = clone
+	}
+	return out, nil
 }
 
 // CompactConfigGraph binds one resolved configuration to its exact evaluated
@@ -616,7 +741,34 @@ func (t *Tree) CompactMetadataWithOptions(
 	if graphForConfig == nil {
 		return nil, fmt.Errorf("action-plan config graph resolver must not be nil")
 	}
+	resolved, err := t.ResolveConfigWithOptions(flags, resolveOpts)
+	if err != nil {
+		return nil, err
+	}
+	return t.CompactMetadataForResolvedConfigWithOptions(resolved, opts, graphForConfig)
+}
+
+// CompactMetadataForResolvedConfigWithOptions builds the exact source-derived
+// Kbuild selections for an already-resolved configuration. Family planners use
+// this phase boundary to resolve and normalize each configuration once, then
+// feed the same immutable value to both metadata construction and generated
+// config output. The method does not mutate resolved.
+func (t *Tree) CompactMetadataForResolvedConfigWithOptions(
+	resolved *ResolvedConfig,
+	opts CompactMetadataOptions,
+	graphForConfig func(*ResolvedConfig) (CompactConfigGraph, error),
+) (*CompactMetadata, error) {
+	if graphForConfig == nil {
+		return nil, fmt.Errorf("action-plan config graph resolver must not be nil")
+	}
+	if resolved == nil {
+		return nil, fmt.Errorf("action-plan resolved config must not be nil")
+	}
 	actionRoles, err := normalizeActionRoles(opts.ActionRoles)
+	if err != nil {
+		return nil, err
+	}
+	actionContracts, err := normalizeCompactKbuildActionContracts(actionRoles, opts.ActionContracts)
 	if err != nil {
 		return nil, err
 	}
@@ -624,14 +776,11 @@ func (t *Tree) CompactMetadataWithOptions(
 		sourceNamespaces:        maps.Clone(opts.SourceNamespaces),
 		exactSourceNamespaces:   maps.Clone(opts.ExactSourceNamespaces),
 		actionRoles:             actionRoles,
+		actionContracts:         actionContracts,
 		preconfiguredObjectTree: opts.PreconfiguredObjectTree,
 		selectedProductsOnly:    opts.SelectedProductsOnly,
 	}
 	if err := out.ensureActionPlanSourceNamespaceIndex(); err != nil {
-		return nil, err
-	}
-	resolved, err := t.ResolveConfigWithOptions(flags, resolveOpts)
-	if err != nil {
 		return nil, err
 	}
 	graph, err := graphForConfig(resolved)
@@ -651,10 +800,18 @@ func (t *Tree) CompactMetadataWithOptions(
 		KbuildDeferredContentSelections: graph.KbuildDeferredContentSelections,
 		imageTarget:                     graph.ImageTarget,
 	}
-	if _, err := newCompactKbuildSelectionGraph(out.Config); err != nil {
+	selectionGraph, err := newCompactKbuildSelectionGraph(out.Config)
+	if err != nil {
 		return nil, fmt.Errorf("resolve Kbuild selections: %w", err)
 	}
+	out.validatedSelectionGraph = selectionGraph
 	out.configFragment = resolvedConfigFragment(resolved)
+	for key := range resolved.Effective {
+		if isConfigKey(key) {
+			out.configSymbolUniverse = append(out.configSymbolUniverse, key)
+		}
+	}
+	sort.Strings(out.configSymbolUniverse)
 	return out, nil
 }
 

@@ -344,3 +344,104 @@ func TestRunProbeValidatesSignedDecimalArgumentFragments(t *testing.T) {
 		})
 	}
 }
+
+func TestRunProbeProjectsDynamicCompilerPredefineArgumentsBeforePathResolution(t *testing.T) {
+	dir := t.TempDir()
+	identity := "sha256-" + strings.Repeat("6", 64)
+	marker := filepath.Join(dir, identity)
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the production shape which motivated the execution-time
+	// projection: one Make-text fragment owns an entire compiler flag vector.
+	// Its forced header is a logical Kbuild spelling, not a proberun-declared
+	// path, and -Wa belongs only to the real assembler phase.
+	const dynamic = "-C -CC -nostdinc -I__LINUX_BZL_SOURCE_TREE__/include " +
+		"-include __LINUX_BZL_SOURCE_TREE__/include/linux/hidden.h " +
+		"-DSELECTED=drivers/example --wrapper-mode mode.c " +
+		"-fmacro-prefix-map=/mapped/drivers/example.c=drivers/example.c " +
+		"-Wa,-gdwarf-5 -c -o drivers/example.o " +
+		"drivers/example.c -MMD -MF drivers/example.d"
+	dependency := kconfig.ProbeResult{
+		Schema: kconfig.LinuxProbeResultSchema,
+		NodeID: strings.Repeat("7", 64), RequestID: strings.Repeat("8", 64),
+		Scope: "target", ToolsetIdentity: identity, Kind: "text", Text: dynamic,
+	}
+	dependencyData, err := dependency.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencyPath := filepath.Join(dir, "input.json")
+	if err := os.WriteFile(dependencyPath, dependencyData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mappedSource := filepath.Join(dir, "mapped.c")
+	if err := os.WriteFile(mappedSource, []byte("int mapped;\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	request := kconfig.ProbeRequest{
+		Schema: kconfig.LinuxProbeRequestSchema, InputCount: 1, Sources: []string{"mapped.c"},
+		Steps: []kconfig.ProbeStep{{
+			Name: "compiler-predefines", Tool: "cc",
+			Arguments: []string{"", "${source:mapped.c}", "-dM", "-E", "-x", "c", "/dev/null"},
+			ArgumentFragments: []kconfig.ProbeArgumentFragments{{
+				Index:     0,
+				Fragments: []kconfig.ProbeValueFragment{{Value: "${result:00000000.text}"}},
+			}},
+			Candidate: &kconfig.ProbeCandidateArguments{
+				Policy:           kconfig.ProbeCandidatePolicyCC,
+				Projection:       kconfig.ProbeCandidateProjectionCompilerPredefines,
+				Base:             []int{0, 1},
+				TranslationUnits: []string{"${source:mapped.c}", "drivers/example.c"},
+			},
+		}},
+		Outcome: kconfig.ProbeOutcome{Kind: "text", Step: "compiler-predefines", Stream: "stdout"},
+	}
+	requestID, err := request.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestData, err := request.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestPath := filepath.Join(dir, "request.json")
+	if err := os.WriteFile(requestPath, requestData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	node := kconfig.ProbePlanNode{
+		Scope: "target", RequestID: requestID, Inputs: []string{dependency.NodeID},
+	}
+	node.ID = node.ContentID()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultPath := filepath.Join(dir, "result.json")
+	err = runTestProbe(t, probeOptions{
+		request: requestPath, result: resultPath, nodeID: node.ID, requestID: requestID, scope: "target",
+		toolsetMarkers: map[string]string{"target": marker}, inputs: map[string]string{"00000000": dependencyPath},
+		sources: map[string]string{"mapped.c": mappedSource},
+		tools: map[string]actionContract{"cc": {
+			path: executable,
+			arguments: []string{
+				"-test.run=TestProbeHelperProcess", "--", "transformed-arguments", kconfig.LinuxKbuildArgsSentinel,
+			},
+			environment: map[string]string{
+				"LINUX_BZL_PROBE_HELPER": "1",
+				"EXPECTED_ARGUMENTS": "-nostdinc -DSELECTED=1 --wrapper-mode mode.c " +
+					"-fmacro-prefix-map=/mapped/drivers/example.c=drivers/example.c " +
+					"-dM -E -x c /dev/null",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := kconfig.ReadProbeResult(resultPath)
+	if err != nil || result.Text != "accepted" {
+		t.Fatalf("result = %#v, error = %v; want projected compiler invocation", result, err)
+	}
+}

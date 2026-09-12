@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -85,6 +86,14 @@ func compactKbuildSourceOverlayRoot(profile CompactKbuildProfile) (string, bool,
 		return "", false, nil
 	}
 	return best, true, nil
+}
+
+// CompactKbuildProfileSourceOverlayRoot exposes the source-derived overlay
+// identity to invocation discovery. Exact generated-content probes run before
+// ActionPlan lowering, so they must reject this writable namespace at the same
+// boundary as the final working-tree proof.
+func CompactKbuildProfileSourceOverlayRoot(profile CompactKbuildProfile) (string, bool, error) {
+	return compactKbuildSourceOverlayRoot(profile)
 }
 
 // compactKbuildGraphPathUsesSourceOverlay reports whether graphPath belongs to
@@ -564,12 +573,49 @@ func compactKbuildSourceScriptEnvironment(
 	expectedScope string,
 	configured []KbuildActionRoleRef,
 ) (map[string]string, []string, error) {
+	return compactKbuildSourceScriptEnvironmentWithResolution(
+		target, match, inputs, inline, usage, expectedScope, configured, true,
+	)
+}
+
+func compactKbuildSourceScriptEnvironmentSymbolic(
+	target string,
+	match compactKbuildRuleMatch,
+	inputs []compactKbuildRuleInput,
+	inline map[string]string,
+	usage compactKbuildSourceScriptEnvironmentUsage,
+	expectedScope string,
+	configured []KbuildActionRoleRef,
+) (map[string]string, []string, error) {
+	return compactKbuildSourceScriptEnvironmentWithResolution(
+		target, match, inputs, inline, usage, expectedScope, configured, false,
+	)
+}
+
+func compactKbuildSourceScriptEnvironmentWithResolution(
+	target string,
+	match compactKbuildRuleMatch,
+	inputs []compactKbuildRuleInput,
+	inline map[string]string,
+	usage compactKbuildSourceScriptEnvironmentUsage,
+	expectedScope string,
+	configured []KbuildActionRoleRef,
+	resolveSymbolic bool,
+) (map[string]string, []string, error) {
 	if match.capturedEnvironment != nil {
 		effectiveUsage := compactKbuildSourceScriptEnvironmentUsage{Names: map[string]bool{}}
 		effectiveUsage.merge(usage)
 		effectiveUsage.merge(match.capturedEnvironmentUsage)
-		environment, _, err := compactKbuildProjectedCapturedEnvironment(
-			match.profile, match.capturedEnvironment, inline, effectiveUsage,
+		captured := maps.Clone(match.capturedEnvironment)
+		var err error
+		if resolveSymbolic {
+			captured, err = compactKbuildResolvedCapturedEnvironment(match.profile, captured)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		environment, _, err := compactKbuildProjectedSourceScriptEnvironmentValues(
+			match.profile, captured, inline, effectiveUsage,
 		)
 		if err != nil {
 			return nil, nil, err
@@ -595,19 +641,10 @@ func compactKbuildSourceScriptEnvironment(
 	if err != nil {
 		return nil, nil, err
 	}
-	environment, roles, err := compactKbuildSourceScriptExportedEnvironmentForMakeTarget(
-		match.profile,
-		target,
-		match.lookupTarget,
-		automatic.target,
-		automatic.stem,
-		automatic.normal,
-		automatic.order,
-		injected,
-		inline,
-		usage,
-		expectedScope,
-		configured,
+	environment, roles, err := compactKbuildSourceScriptExportedEnvironmentForMakeTargetWithResolution(
+		match.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+		automatic.normal, automatic.order, injected, inline, usage, expectedScope,
+		configured, resolveSymbolic,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -631,15 +668,45 @@ func compactKbuildActionEnvironment(
 	expectedScope string,
 	configured []KbuildActionRoleRef,
 ) (map[string]string, []string, error) {
+	return compactKbuildActionEnvironmentWithResolution(
+		target, match, inputs, inline, expectedScope, configured, true,
+	)
+}
+
+func compactKbuildActionEnvironmentSymbolic(
+	target string,
+	match compactKbuildRuleMatch,
+	inputs []compactKbuildRuleInput,
+	inline map[string]string,
+	expectedScope string,
+	configured []KbuildActionRoleRef,
+) (map[string]string, []string, error) {
+	return compactKbuildActionEnvironmentWithResolution(
+		target, match, inputs, inline, expectedScope, configured, false,
+	)
+}
+
+func compactKbuildActionEnvironmentWithResolution(
+	target string,
+	match compactKbuildRuleMatch,
+	inputs []compactKbuildRuleInput,
+	inline map[string]string,
+	expectedScope string,
+	configured []KbuildActionRoleRef,
+	resolveSymbolic bool,
+) (map[string]string, []string, error) {
 	var environment map[string]string
 	var err error
 	if match.capturedEnvironment != nil {
-		environment, _, err = compactKbuildProjectedCapturedEnvironment(
-			match.profile,
-			match.capturedEnvironment,
-			inline,
-			match.capturedEnvironmentUsage,
-		)
+		captured := maps.Clone(match.capturedEnvironment)
+		if resolveSymbolic {
+			captured, err = compactKbuildResolvedCapturedEnvironment(match.profile, captured)
+		}
+		if err == nil {
+			environment, _, err = compactKbuildProjectedSourceScriptEnvironmentValues(
+				match.profile, captured, inline, match.capturedEnvironmentUsage,
+			)
+		}
 	} else {
 		var injected map[string]string
 		injected, err = compactKbuildSourceScriptInjectionsForRuleTarget(target, match, inputs)
@@ -648,17 +715,10 @@ func compactKbuildActionEnvironment(
 			var automatic compactKbuildAutomaticContext
 			automatic, err = compactKbuildRuleRootedAutomaticEvaluationContext(target, match, inputs, injected)
 			if err == nil {
-				environment, _, err = compactKbuildProjectedSourceScriptEnvironmentForMakeTarget(
-					match.profile,
-					target,
-					match.lookupTarget,
-					automatic.target,
-					automatic.stem,
-					automatic.normal,
-					automatic.order,
-					injected,
-					inline,
-					compactKbuildSourceScriptEnvironmentUsage{Names: map[string]bool{}},
+				environment, _, err = compactKbuildProjectedSourceScriptEnvironmentForMakeTargetWithResolution(
+					match.profile, target, match.lookupTarget, automatic.target,
+					automatic.stem, automatic.normal, automatic.order, injected, inline,
+					compactKbuildSourceScriptEnvironmentUsage{Names: map[string]bool{}}, resolveSymbolic,
 				)
 			}
 		}
@@ -776,6 +836,464 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputs(
 	return b.compactKbuildWorkingTreeClosureInputsFromRoots(target, profile, direct, roots)
 }
 
+func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeInputFrontier(
+	target string,
+	profile CompactKbuildProfile,
+	direct []compactKbuildRuleInput,
+) (compactKbuildInputFrontier, error) {
+	roots := make([]compactKbuildRuleInput, 0, len(direct))
+	for _, input := range direct {
+		if input.producer != "" && !input.workingOnly {
+			roots = append(roots, input)
+		}
+	}
+	return b.compactKbuildWorkingTreeInputFrontierFromRoots(target, profile, direct, roots)
+}
+
+// compactKbuildWorkingTreeMaterializedCore is the consumer-independent
+// projection of one producer-root set. inputSet holds every single-writer
+// ordinary output in the same persistent radix store used by serialized action
+// plans. Only duplicate-writer paths remain as flat conflict witnesses. A core
+// which reaches any path-sensitive archive has neither projection: replayNodes
+// instead names the complete DFS-ordered reached-node sequence so live
+// archive/source handling remains interleaved with ordinary producer outputs
+// exactly as it was during the authoritative traversal. Native-root
+// classification, direct inputs, exact frontier ownership, and overwrite
+// selection remain outside this cache.
+type compactKbuildWorkingTreeMaterializedCore struct {
+	inputSet        string
+	conflicts       []compactKbuildWorkingTreeMaterializedCorePath
+	replayNodes     []compactKbuildWorkingTreeReplayNode
+	replayRootOrder string
+}
+
+type compactKbuildWorkingTreeMaterializedCorePath struct {
+	path     string
+	versions []compactKbuildWorkingTreeMaterializedOutput
+}
+
+// compactKbuildWorkingTreeMaterializedOutput is intentionally narrower than
+// compactKbuildRuleInput. A materialized core may retain only immutable graph
+// facts; native, recipe-local, object-tree, order-only, and overwrite flags are
+// reconstructed from the concrete consumer query.
+type compactKbuildWorkingTreeMaterializedOutput struct {
+	path     string
+	producer string
+	slot     int
+}
+
+// compactKbuildWorkingTreeReplayNode retains only local topology and the
+// path-sensitive output shape. For an archive-bearing core there is one record
+// for every reached node; ordinary records have an empty slot vector. The node
+// and its recipe are always reread from the current ActionPlan before
+// processNode is invoked.
+type compactKbuildWorkingTreeReplayNode struct {
+	index uint32
+	slots []int
+}
+
+func appendCompactKbuildClosureSignatureString(builder *strings.Builder, value string) {
+	builder.WriteString(strconv.Itoa(len(value)))
+	builder.WriteByte(':')
+	builder.WriteString(value)
+}
+
+func compactKbuildClosureRootSetSignature(roots []string) string {
+	canonical := append([]string(nil), roots...)
+	sort.Strings(canonical)
+	return compactKbuildClosureSequenceSignature(canonical)
+}
+
+func compactKbuildClosureSequenceSignature(values []string) string {
+	var builder strings.Builder
+	builder.WriteString(strconv.Itoa(len(values)))
+	builder.WriteByte(';')
+	for _, value := range values {
+		appendCompactKbuildClosureSignatureString(&builder, value)
+	}
+	return builder.String()
+}
+
+func cloneCompactKbuildRuleInputs(inputs []compactKbuildRuleInput) []compactKbuildRuleInput {
+	if inputs == nil {
+		return nil
+	}
+	cloned := make([]compactKbuildRuleInput, len(inputs))
+	copy(cloned, inputs)
+	return cloned
+}
+
+func (p *ActionPlan) compactKbuildWorkingTreeMaterializedNodeInputSet(
+	index uint32,
+) (string, []compactKbuildWorkingTreeMaterializedCorePath, error) {
+	if p == nil || int(index) >= len(p.Nodes) {
+		return "", nil, nil
+	}
+	if root, ok := p.workingTreeMaterializedNodeInputSets[index]; ok {
+		return root, p.workingTreeMaterializedNodeConflicts[index], nil
+	}
+	store, err := p.planningActionPlanInputSetStore()
+	if err != nil {
+		return "", nil, err
+	}
+	p.workingTreeMaterializedNodeProjections++
+	node := p.Nodes[index]
+	root := ""
+	conflictsByPath := map[string][]compactKbuildWorkingTreeMaterializedOutput{}
+	for slot, output := range node.Outputs {
+		if output.ObservedPath != "" {
+			continue
+		}
+		entry := ActionPlanInputSetEntry{
+			Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: output.Path},
+			ProducerID: node.ID,
+			Slot:       slot,
+		}
+		if previous, found, lookupErr := store.Lookup(root, entry.Target); lookupErr != nil {
+			return "", nil, lookupErr
+		} else if found && previous != entry {
+			versions := conflictsByPath[output.Path]
+			if len(versions) == 0 {
+				versions = append(versions, compactKbuildWorkingTreeMaterializedOutput{
+					path: output.Path, producer: previous.ProducerID, slot: previous.Slot,
+				})
+			}
+			conflictsByPath[output.Path] = append(versions, compactKbuildWorkingTreeMaterializedOutput{
+				path: output.Path, producer: entry.ProducerID, slot: entry.Slot,
+			})
+			continue
+		}
+		root, err = store.Insert(root, entry)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	conflicts := make([]compactKbuildWorkingTreeMaterializedCorePath, 0, len(conflictsByPath))
+	for _, pathname := range slices.Sorted(maps.Keys(conflictsByPath)) {
+		versions := conflictsByPath[pathname]
+		sort.Slice(versions, func(i, j int) bool {
+			if versions[i].producer != versions[j].producer {
+				return versions[i].producer < versions[j].producer
+			}
+			return versions[i].slot < versions[j].slot
+		})
+		conflicts = append(conflicts, compactKbuildWorkingTreeMaterializedCorePath{
+			path: pathname, versions: versions,
+		})
+		var deleted bool
+		root, deleted, err = store.Delete(root, ActionPlanInputSetTarget{
+			Kind: ActionPlanInputSetWorkTarget, Path: pathname,
+		})
+		if err != nil {
+			return "", nil, err
+		}
+		if !deleted {
+			return "", nil, fmt.Errorf("node %s duplicate output path %q has no persistent representative", node.ID, pathname)
+		}
+	}
+	if len(p.workingTreeMaterializedNodeInputSets) < maximumWorkingTreeMaterializedNodeEntries {
+		if p.workingTreeMaterializedNodeInputSets == nil {
+			p.workingTreeMaterializedNodeInputSets = map[uint32]string{}
+		}
+		p.workingTreeMaterializedNodeInputSets[index] = root
+		if len(conflicts) != 0 {
+			if p.workingTreeMaterializedNodeConflicts == nil {
+				p.workingTreeMaterializedNodeConflicts = map[uint32][]compactKbuildWorkingTreeMaterializedCorePath{}
+			}
+			p.workingTreeMaterializedNodeConflicts[index] = conflicts
+		}
+	}
+	return root, conflicts, nil
+}
+
+func (p *ActionPlan) retainCompactKbuildWorkingTreeMaterializedCore(
+	key string,
+	core *compactKbuildWorkingTreeMaterializedCore,
+) {
+	if p == nil || core == nil {
+		return
+	}
+	if _, exists := p.workingTreeMaterializedCoreCache[key]; exists {
+		return
+	}
+	inputCount := 0
+	for _, entry := range core.conflicts {
+		inputCount += len(entry.versions)
+	}
+	for _, replay := range core.replayNodes {
+		inputCount += 1 + len(replay.slots)
+	}
+	retainedKeyBytes := len(key) + len(core.inputSet) + len(core.replayRootOrder)
+	if len(p.workingTreeMaterializedCoreCache) >= maximumWorkingTreeMaterializedCoreEntries ||
+		inputCount > maximumWorkingTreeMaterializedCoreInputs-p.workingTreeMaterializedCoreInputs ||
+		retainedKeyBytes > maximumWorkingTreeMaterializedCoreKeyBytes-p.workingTreeMaterializedCoreKeyBytes {
+		return
+	}
+	if p.workingTreeMaterializedCoreCache == nil {
+		p.workingTreeMaterializedCoreCache = map[string]*compactKbuildWorkingTreeMaterializedCore{}
+	}
+	p.workingTreeMaterializedCoreCache[key] = core
+	p.workingTreeMaterializedCoreInputs += inputCount
+	p.workingTreeMaterializedCoreKeyBytes += retainedKeyBytes
+}
+
+// replayCompactKbuildWorkingTreeMaterializedCore validates the complete live
+// path-sensitive shape before invoking any callbacks. Ordinary cores are
+// consumer-independent only while their materialized targets do not intersect
+// consumer-local state. On an intersection we deliberately replay the live
+// topology so duplicate-path error ordering remains GNU-Make compatible
+// without retaining a flattened DFS output list in the cache.
+func (p *ActionPlan) replayCompactKbuildWorkingTreeMaterializedCore(
+	core *compactKbuildWorkingTreeMaterializedCore,
+	roots []string,
+	consumerPaths map[string]compactKbuildRuleInput,
+	processNode func(uint32) error,
+) (bool, error) {
+	if p == nil || core == nil {
+		return false, nil
+	}
+	if len(core.replayNodes) == 0 {
+		if core.replayRootOrder != "" {
+			return false, nil
+		}
+		store, err := p.planningActionPlanInputSetStore()
+		if err != nil {
+			return false, err
+		}
+		if err := store.ValidateRoot(core.inputSet); err != nil {
+			return false, nil
+		}
+		previousPath := ""
+		conflictPaths := make(map[string]bool, len(core.conflicts))
+		for _, conflict := range core.conflicts {
+			if conflict.path == "" || len(conflict.versions) < 2 ||
+				(previousPath != "" && conflict.path <= previousPath) {
+				return false, nil
+			}
+			previousPath = conflict.path
+			conflictPaths[conflict.path] = true
+			target := ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: conflict.path}
+			if _, found, lookupErr := store.Lookup(core.inputSet, target); lookupErr != nil || found {
+				return false, lookupErr
+			}
+			for _, version := range conflict.versions {
+				if version.path != conflict.path || version.producer == "" || version.slot < 0 {
+					return false, nil
+				}
+			}
+		}
+		for pathname := range consumerPaths {
+			if conflictPaths[pathname] {
+				return false, nil
+			}
+			target := ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: pathname}
+			if _, found, lookupErr := store.Lookup(core.inputSet, target); lookupErr != nil {
+				return false, lookupErr
+			} else if found {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+	if core.inputSet != "" || len(core.conflicts) != 0 ||
+		core.replayRootOrder != compactKbuildClosureSequenceSignature(roots) {
+		return false, nil
+	}
+	seen := make(map[uint32]bool, len(core.replayNodes))
+	hasPathSensitiveArchive := false
+	for _, replay := range core.replayNodes {
+		if int(replay.index) >= len(p.Nodes) || seen[replay.index] {
+			return false, nil
+		}
+		seen[replay.index] = true
+		liveSlots := p.pathSensitiveArchiveSlots(p.Nodes[replay.index])
+		if !slices.Equal(replay.slots, liveSlots) {
+			return false, nil
+		}
+		hasPathSensitiveArchive = hasPathSensitiveArchive || len(liveSlots) != 0
+	}
+	if !hasPathSensitiveArchive {
+		return false, nil
+	}
+	if processNode != nil {
+		for _, replay := range core.replayNodes {
+			if err := processNode(replay.index); err != nil {
+				return true, err
+			}
+		}
+	}
+	return true, nil
+}
+
+// compactKbuildWorkingTreeMaterializedCoreWhileProcessing preserves the old
+// first-computation error order by invoking processNode in the original DFS
+// position while it assembles a cache candidate. An archive-free cache hit
+// needs no callbacks. An archive-bearing hit invokes callbacks for the complete
+// DFS-ordered reached-node sequence because archive source insertion and
+// ordinary output insertion do not commute.
+func (p *ActionPlan) compactKbuildWorkingTreeMaterializedCoreWhileProcessing(
+	roots []string,
+	processNode func(uint32) error,
+) (*compactKbuildWorkingTreeMaterializedCore, bool, error) {
+	return p.compactKbuildWorkingTreeMaterializedCoreForConsumer(roots, nil, processNode)
+}
+
+func (p *ActionPlan) compactKbuildWorkingTreeMaterializedCoreForConsumer(
+	roots []string,
+	consumerPaths map[string]compactKbuildRuleInput,
+	processNode func(uint32) error,
+) (*compactKbuildWorkingTreeMaterializedCore, bool, error) {
+	if p == nil {
+		return nil, false, fmt.Errorf("working object-tree closure requires an action plan")
+	}
+	key := compactKbuildClosureRootSetSignature(roots)
+	if core, ok := p.workingTreeMaterializedCoreCache[key]; ok {
+		valid, replayErr := p.replayCompactKbuildWorkingTreeMaterializedCore(core, roots, consumerPaths, processNode)
+		if replayErr != nil {
+			return nil, false, replayErr
+		}
+		if valid {
+			return core, false, nil
+		}
+	}
+	if p.familyPlanningCache != nil {
+		core, hit, lookupErr := p.familyPlanningCache.lookupMaterializedCore(p, key)
+		if lookupErr == nil && hit {
+			valid, replayErr := p.replayCompactKbuildWorkingTreeMaterializedCore(core, roots, consumerPaths, processNode)
+			if replayErr != nil {
+				return nil, false, replayErr
+			}
+			if valid {
+				p.retainCompactKbuildWorkingTreeMaterializedCore(key, core)
+				return core, false, nil
+			}
+		}
+	}
+	p.workingTreeMaterializedCoreComputations++
+	store, err := p.planningActionPlanInputSetStore()
+	if err != nil {
+		return nil, false, err
+	}
+	materializedRoot := ""
+	conflictsByPath := map[string][]compactKbuildWorkingTreeMaterializedOutput{}
+	rememberConflict := func(entry ActionPlanInputSetEntry) {
+		versions := conflictsByPath[entry.Target.Path]
+		for _, existing := range versions {
+			if existing.producer == entry.ProducerID && existing.slot == entry.Slot {
+				return
+			}
+		}
+		conflictsByPath[entry.Target.Path] = append(versions, compactKbuildWorkingTreeMaterializedOutput{
+			path: entry.Target.Path, producer: entry.ProducerID, slot: entry.Slot,
+		})
+	}
+	mergeNodeInputSet := func(nodeRoot string) error {
+		var unionErr error
+		materializedRoot, unionErr = store.Union(materializedRoot, nodeRoot, func(
+			target ActionPlanInputSetTarget,
+			left, right ActionPlanInputSetEntry,
+		) (ActionPlanInputSetEntry, error) {
+			if left == right {
+				return left, nil
+			}
+			rememberConflict(left)
+			rememberConflict(right)
+			return left, nil
+		})
+		return unionErr
+	}
+	visited := actionPlanNodeVisitSet{}
+	replayOrder := []compactKbuildWorkingTreeReplayNode{}
+	hasPathSensitiveArchive := false
+	for _, producer := range roots {
+		err := p.walkCompactKbuildWorkingTreeTopology(producer, visited, func(index uint32) error {
+			if p.workingTreeMaterializedReachedNodes == nil {
+				p.workingTreeMaterializedReachedNodes = actionPlanNodeVisitSet{}
+			}
+			p.workingTreeMaterializedReachedNodes.add(index)
+			node := p.Nodes[index]
+			slots := p.pathSensitiveArchiveSlots(node)
+			replayOrder = append(replayOrder, compactKbuildWorkingTreeReplayNode{
+				index: index,
+				slots: append([]int(nil), slots...),
+			})
+			if len(slots) != 0 {
+				hasPathSensitiveArchive = true
+			} else {
+				nodeRoot, nodeConflicts, rootErr := p.compactKbuildWorkingTreeMaterializedNodeInputSet(index)
+				if rootErr != nil {
+					return rootErr
+				}
+				if rootErr := mergeNodeInputSet(nodeRoot); rootErr != nil {
+					return rootErr
+				}
+				for _, conflict := range nodeConflicts {
+					target := ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: conflict.path}
+					if existing, found, lookupErr := store.Lookup(materializedRoot, target); lookupErr != nil {
+						return lookupErr
+					} else if found {
+						rememberConflict(existing)
+					}
+					for _, version := range conflict.versions {
+						rememberConflict(ActionPlanInputSetEntry{
+							Target: target, ProducerID: version.producer, Slot: version.slot,
+						})
+					}
+				}
+			}
+			if processNode != nil {
+				return processNode(index)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, true, err
+		}
+	}
+	var replayNodes []compactKbuildWorkingTreeReplayNode
+	if hasPathSensitiveArchive {
+		replayNodes = replayOrder
+		// The callbacks above already preserved exact interleaving on this live
+		// computation. Future hits must rebuild that same state from the complete
+		// replay order rather than merging an independently canonicalized path set.
+		materializedRoot = ""
+		conflictsByPath = nil
+	}
+	core := &compactKbuildWorkingTreeMaterializedCore{
+		inputSet:    materializedRoot,
+		conflicts:   make([]compactKbuildWorkingTreeMaterializedCorePath, 0, len(conflictsByPath)),
+		replayNodes: replayNodes,
+	}
+	if len(replayNodes) != 0 {
+		core.replayRootOrder = compactKbuildClosureSequenceSignature(roots)
+	}
+	for _, pathname := range slices.Sorted(maps.Keys(conflictsByPath)) {
+		core.inputSet, _, err = store.Delete(
+			core.inputSet,
+			ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: pathname},
+		)
+		if err != nil {
+			return nil, true, err
+		}
+		versions := conflictsByPath[pathname]
+		sort.Slice(versions, func(i, j int) bool {
+			if versions[i].producer != versions[j].producer {
+				return versions[i].producer < versions[j].producer
+			}
+			return versions[i].slot < versions[j].slot
+		})
+		core.conflicts = append(core.conflicts, compactKbuildWorkingTreeMaterializedCorePath{
+			path:     pathname,
+			versions: versions,
+		})
+	}
+	p.retainCompactKbuildWorkingTreeMaterializedCore(key, core)
+	if p.familyPlanningCache != nil {
+		p.familyPlanningCache.storeMaterializedCore(key, core)
+	}
+	return core, true, nil
+}
+
 // compactKbuildWorkingTreeClosureInputsFromRoots keeps every native direct
 // input native while preserving workingOnly on an already-expanded closure.
 // It traverses only the producers whose filesystem representation requires
@@ -787,6 +1305,60 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 	profile CompactKbuildProfile,
 	direct []compactKbuildRuleInput,
 	traversalRoots []compactKbuildRuleInput,
+) ([]compactKbuildRuleInput, error) {
+	return b.compactKbuildWorkingTreeClosureInputsFromRootsImpl(
+		target, profile, direct, traversalRoots, nil,
+	)
+}
+
+func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeInputFrontierFromRoots(
+	target string,
+	profile CompactKbuildProfile,
+	direct []compactKbuildRuleInput,
+	traversalRoots []compactKbuildRuleInput,
+) (compactKbuildInputFrontier, error) {
+	sharedRoot := ""
+	inputs, err := b.compactKbuildWorkingTreeClosureInputsFromRootsImpl(
+		target, profile, direct, traversalRoots, &sharedRoot,
+	)
+	if err != nil {
+		return compactKbuildInputFrontier{}, err
+	}
+	frontier, err := compactKbuildInputFrontierFromResolved(b.plan, inputs)
+	if err != nil {
+		return compactKbuildInputFrontier{}, err
+	}
+	if sharedRoot == "" {
+		return frontier, nil
+	}
+	store, err := b.plan.planningActionPlanInputSetStore()
+	if err != nil {
+		return compactKbuildInputFrontier{}, err
+	}
+	frontier.inputSet, err = store.Union(sharedRoot, frontier.inputSet, func(
+		target ActionPlanInputSetTarget,
+		left, right ActionPlanInputSetEntry,
+	) (ActionPlanInputSetEntry, error) {
+		if left != right {
+			return ActionPlanInputSetEntry{}, fmt.Errorf(
+				"persistent working frontier target %s has conflicting provenance",
+				actionPlanInputSetTargetDescription(target),
+			)
+		}
+		return left, nil
+	})
+	if err != nil {
+		return compactKbuildInputFrontier{}, err
+	}
+	return frontier, nil
+}
+
+func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFromRootsImpl(
+	target string,
+	profile CompactKbuildProfile,
+	direct []compactKbuildRuleInput,
+	traversalRoots []compactKbuildRuleInput,
+	sharedInputSet *string,
 ) ([]compactKbuildRuleInput, error) {
 	if b == nil || b.plan == nil {
 		return nil, fmt.Errorf("working object-tree closure requires an action plan")
@@ -939,7 +1511,6 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 			nativeRoots[producerOutput{producer: root.producer, slot: root.slot}] = true
 		}
 	}
-
 	preferInput := func(preferred, other compactKbuildRuleInput) compactKbuildRuleInput {
 		preferred.overwriteLineage = preferred.overwriteLineage || other.overwriteLineage
 		// The selected producer is still a native prerequisite when either
@@ -1010,6 +1581,7 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 		ancestor   string
 	}
 	lineage := map[producerLineage]bool{}
+	var lineageInputErr error
 	producerDescendsFrom := func(descendant, ancestor string) bool {
 		key := producerLineage{descendant: descendant, ancestor: ancestor}
 		if result, ok := lineage[key]; ok {
@@ -1033,9 +1605,12 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 			if !ok {
 				continue
 			}
-			for _, edge := range node.Inputs {
-				pending = append(pending, edge.ProducerID)
+			producers, err := b.plan.actionPlanNodeProducerIDs(node)
+			if err != nil {
+				lineageInputErr = err
+				return false
 			}
+			pending = append(pending, producers...)
 		}
 		lineage[key] = false
 		return false
@@ -1178,6 +1753,9 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 				if !leftBeforeRight && !rightBeforeLeft {
 					leftBeforeRight = producerDescendsFrom(right.producer, left.producer)
 					rightBeforeLeft = producerDescendsFrom(left.producer, right.producer)
+					if lineageInputErr != nil {
+						return compactKbuildRuleInput{}, fmt.Errorf("resolve working object-tree producer lineage: %w", lineageInputErr)
+					}
 				}
 				if !leftBeforeRight && !rightBeforeLeft && sourceOrdered {
 					leftBeforeRight = sourceWinner == right.producer
@@ -1258,7 +1836,45 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 		}
 		return winner, nil
 	}
-	visited := make([]bool, len(b.plan.Nodes))
+	processOutputCandidate := func(candidate compactKbuildRuleInput) error {
+		candidate.workingOnly = !nativeRoots[producerOutput{
+			producer: candidate.producer,
+			slot:     candidate.slot,
+		}]
+		rememberProducerVersion(candidate)
+		if existing, exists := byPath[candidate.path]; exists {
+			if existing.producer == candidate.producer && existing.slot == candidate.slot {
+				return nil
+			}
+			if existing.producer == "" {
+				if directImmutablePaths[candidate.path] {
+					baselineOnly := baselineProducers[candidate.path][candidate.producer] &&
+						!directProducers[candidate.path][candidate.producer]
+					if baselineOnly {
+						// A native immutable prerequisite is the consumer's current
+						// version of this pathname. A generated version seeded by the
+						// initial object-tree baseline remains older even when another
+						// root also traverses that producer.
+						return nil
+					}
+				}
+				if existing.sourceID == "" || !existing.objectTree || !existing.workingOnly {
+					return fmt.Errorf(
+						"working object-tree path %q producer %q conflicts with immutable source %q",
+						candidate.path, candidate.producer, existing.sourceID,
+					)
+				}
+				// Pretarget actions begin with immutable Kconfig source
+				// projections. A generated version in the traversed lineage
+				// replaces that initial baseline; multiple generated versions
+				// are resolved together after the complete closure is known.
+				byPath[candidate.path] = preferInput(candidate, existing)
+			}
+			return nil
+		}
+		byPath[candidate.path] = candidate
+		return nil
+	}
 	processNode := func(nodeIndex uint32) error {
 		node := b.plan.Nodes[nodeIndex]
 		producer := node.ID
@@ -1269,6 +1885,11 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 		// their source text in a private cwd, but that text is not an archive
 		// member required by the downstream link.
 		if b.plan.hasPathSensitiveArchiveOutput(producer) {
+			// Archive source bindings are deliberately live planner state: a
+			// path-sensitive marker may be attached after append, and probe-only
+			// compaction can release or retain its recipe payload independently.
+			// The topology remains reusable, but a complete result containing that
+			// policy must be rebuilt from the current recipe on every query.
 			recipe, ok := b.plan.Recipes[node.Recipe]
 			if !ok {
 				return fmt.Errorf("path-sensitive archive producer %q references absent recipe %q", producer, node.Recipe)
@@ -1321,48 +1942,100 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 				// Kbuild's writable object-tree namespace.
 				continue
 			}
-			candidate := compactKbuildRuleInput{
+			if err := processOutputCandidate(compactKbuildRuleInput{
 				path: output.Path, producer: node.ID, slot: slot,
-				workingOnly: !nativeRoots[producerOutput{producer: producer, slot: slot}],
+			}); err != nil {
+				return err
 			}
-			rememberProducerVersion(candidate)
-			if existing, exists := byPath[candidate.path]; exists {
-				if existing.producer == candidate.producer && existing.slot == candidate.slot {
-					continue
-				}
-				if existing.producer == "" {
-					if directImmutablePaths[candidate.path] {
-						baselineOnly := baselineProducers[candidate.path][candidate.producer] &&
-							!directProducers[candidate.path][candidate.producer]
-						if baselineOnly {
-							// A native immutable prerequisite is the consumer's current
-							// version of this pathname. A generated version seeded by the
-							// initial object-tree baseline remains older even when another
-							// root also traverses that producer.
-							continue
-						}
-					}
-					if existing.sourceID == "" || !existing.objectTree || !existing.workingOnly {
-						return fmt.Errorf(
-							"working object-tree path %q producer %q conflicts with immutable source %q",
-							candidate.path, candidate.producer, existing.sourceID,
-						)
-					}
-					// Pretarget actions begin with immutable Kconfig source
-					// projections. A generated version in the traversed lineage
-					// replaces that initial baseline; multiple generated versions
-					// are resolved together after the complete closure is known.
-					byPath[candidate.path] = preferInput(candidate, existing)
-				}
-				continue
-			}
-			byPath[candidate.path] = candidate
 		}
 		return nil
 	}
-	for _, producer := range roots {
-		if err := b.plan.walkCompactKbuildWorkingTreeTopology(producer, visited, processNode); err != nil {
+	fastMaterializedResults := []compactKbuildRuleInput{}
+	persistentMaterializedRoot := ""
+	if len(roots) != 0 {
+		core, processedLive, err := b.plan.compactKbuildWorkingTreeMaterializedCoreForConsumer(
+			roots, byPath, processNode,
+		)
+		if err != nil {
 			return nil, err
+		}
+		if !processedLive {
+			store, storeErr := b.plan.planningActionPlanInputSetStore()
+			if storeErr != nil {
+				return nil, storeErr
+			}
+			if sharedInputSet == nil {
+				if walkErr := store.Walk(core.inputSet, func(entry ActionPlanInputSetEntry) error {
+					input, inputErr := compactKbuildRuleInputFromSetEntry(entry)
+					if inputErr != nil {
+						return inputErr
+					}
+					input.workingOnly = !nativeRoots[producerOutput{producer: input.producer, slot: input.slot}]
+					fastMaterializedResults = append(fastMaterializedResults, input)
+					return nil
+				}); walkErr != nil {
+					return nil, walkErr
+				}
+			} else {
+				persistentMaterializedRoot = core.inputSet
+				// Native-root policy is consumer-local. Pull only those exact slots
+				// out of the shared root; every other entry keeps the persistent
+				// ancestry identity reused by sibling configurations.
+				nativeOutputs := make([]compactKbuildWorkingTreeMaterializedOutput, 0, len(nativeRoots))
+				for root := range nativeRoots {
+					node, exists := b.plan.nodesByID[root.producer]
+					if !exists || root.slot < 0 || root.slot >= len(node.Outputs) {
+						continue
+					}
+					output := node.Outputs[root.slot]
+					if output.ObservedPath == "" {
+						nativeOutputs = append(nativeOutputs, compactKbuildWorkingTreeMaterializedOutput{
+							path: output.Path, producer: root.producer, slot: root.slot,
+						})
+					}
+				}
+				sort.Slice(nativeOutputs, func(i, j int) bool {
+					if nativeOutputs[i].path != nativeOutputs[j].path {
+						return nativeOutputs[i].path < nativeOutputs[j].path
+					}
+					if nativeOutputs[i].producer != nativeOutputs[j].producer {
+						return nativeOutputs[i].producer < nativeOutputs[j].producer
+					}
+					return nativeOutputs[i].slot < nativeOutputs[j].slot
+				})
+				for _, output := range nativeOutputs {
+					target := ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: output.path}
+					entry, found, lookupErr := store.Lookup(persistentMaterializedRoot, target)
+					if lookupErr != nil {
+						return nil, lookupErr
+					}
+					if !found || entry.ProducerID != output.producer || entry.Slot != output.slot {
+						continue
+					}
+					var deleted bool
+					persistentMaterializedRoot, deleted, lookupErr = store.Delete(persistentMaterializedRoot, target)
+					if lookupErr != nil {
+						return nil, lookupErr
+					}
+					if !deleted {
+						return nil, fmt.Errorf("native materialized target %q disappeared from persistent frontier", output.path)
+					}
+					if candidateErr := processOutputCandidate(compactKbuildRuleInput{
+						path: output.path, producer: output.producer, slot: output.slot,
+					}); candidateErr != nil {
+						return nil, candidateErr
+					}
+				}
+			}
+			for _, conflict := range core.conflicts {
+				for _, output := range conflict.versions {
+					if err := processOutputCandidate(compactKbuildRuleInput{
+						path: output.path, producer: output.producer, slot: output.slot,
+					}); err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 	}
 	for pathname, versions := range producerVersions {
@@ -1391,9 +2064,31 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 		paths = append(paths, pathname)
 	}
 	sort.Strings(paths)
-	result := make([]compactKbuildRuleInput, 0, len(paths))
-	for _, pathname := range paths {
-		result = append(result, byPath[pathname])
+	result := make([]compactKbuildRuleInput, 0, len(paths)+len(fastMaterializedResults))
+	fastIndex, localIndex := 0, 0
+	for fastIndex < len(fastMaterializedResults) || localIndex < len(paths) {
+		if fastIndex == len(fastMaterializedResults) {
+			result = append(result, byPath[paths[localIndex]])
+			localIndex++
+			continue
+		}
+		if localIndex == len(paths) || fastMaterializedResults[fastIndex].path < paths[localIndex] {
+			result = append(result, fastMaterializedResults[fastIndex])
+			fastIndex++
+			continue
+		}
+		if paths[localIndex] < fastMaterializedResults[fastIndex].path {
+			result = append(result, byPath[paths[localIndex]])
+			localIndex++
+			continue
+		}
+		return nil, fmt.Errorf(
+			"working object-tree materialized core path %q also entered consumer-local closure state",
+			paths[localIndex],
+		)
+	}
+	if sharedInputSet != nil {
+		*sharedInputSet = persistentMaterializedRoot
 	}
 	return result, nil
 }

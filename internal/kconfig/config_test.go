@@ -107,6 +107,122 @@ config HIDDEN
 	}
 }
 
+func TestCompactMetadataForResolvedConfigWithOptionsReusesResolvedValue(t *testing.T) {
+	tree, err := Parse(context.Background(), strings.NewReader(`
+config ENABLED
+	bool "Enabled"
+`), "Kconfig", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := tree.ResolveConfig(map[string]string{"CONFIG_ENABLED": "y"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := 0
+	metadata, err := tree.CompactMetadataForResolvedConfigWithOptions(
+		resolved,
+		CompactMetadataOptions{SelectedProductsOnly: true},
+		func(got *ResolvedConfig) (CompactConfigGraph, error) {
+			called++
+			if got != resolved {
+				t.Fatal("resolved-config phase boundary cloned or re-resolved its input")
+			}
+			return CompactConfigGraph{ImageTarget: "image"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called != 1 || metadata.configFragment["CONFIG_ENABLED"] != "y" {
+		t.Fatalf("resolved metadata callback calls=%d fragment=%#v", called, metadata.configFragment)
+	}
+	if resolved.Effective["CONFIG_ENABLED"] != "y" {
+		t.Fatal("resolved config was mutated")
+	}
+	if _, err := tree.CompactMetadataForResolvedConfigWithOptions(
+		nil, CompactMetadataOptions{}, func(*ResolvedConfig) (CompactConfigGraph, error) {
+			return CompactConfigGraph{}, nil
+		},
+	); err == nil || !strings.Contains(err.Error(), "must not be nil") {
+		t.Fatalf("nil resolved config error = %v", err)
+	}
+}
+
+func TestCompactMetadataFirstLoweringConsumesValidatedSelectionGraph(t *testing.T) {
+	tree, err := Parse(context.Background(), strings.NewReader(`
+config ENABLED
+	bool "Enabled"
+`), "Kconfig", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := tree.CompactMetadataWithOptions(
+		map[string]string{"CONFIG_ENABLED": "y"},
+		ResolveConfigOptions{},
+		CompactMetadataOptions{PreconfiguredObjectTree: true, SelectedProductsOnly: true},
+		func(*ResolvedConfig) (CompactConfigGraph, error) {
+			return CompactConfigGraph{ImageTarget: "image"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validated := metadata.validatedSelectionGraph
+	if validated == nil {
+		t.Fatal("metadata construction did not retain its validated selection graph")
+	}
+
+	_, first, err := metadata.lowerSelectedActionPlan(
+		actionPlanTestProbeIdentity, actionPlanTestProbeIdentity, false, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != validated {
+		t.Fatal("first lowering rebuilt the selection graph validated by metadata construction")
+	}
+	if metadata.validatedSelectionGraph != nil {
+		t.Fatal("first lowering retained a mutable selection graph for reuse")
+	}
+
+	_, second, err := metadata.lowerSelectedActionPlan(
+		actionPlanTestProbeIdentity, actionPlanTestProbeIdentity, false, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first {
+		t.Fatal("later lowering reused materialization state from the first traversal")
+	}
+}
+
+func TestCompactMetadataRetainedSelectionGraphStillValidatesEagerly(t *testing.T) {
+	tree, err := Parse(context.Background(), strings.NewReader(`
+config ENABLED
+	bool "Enabled"
+`), "Kconfig", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = tree.CompactMetadataWithOptions(
+		map[string]string{"CONFIG_ENABLED": "y"},
+		ResolveConfigOptions{},
+		CompactMetadataOptions{SelectedProductsOnly: true},
+		func(*ResolvedConfig) (CompactConfigGraph, error) {
+			return CompactConfigGraph{
+				KbuildSelections: []CompactKbuildSelection{{
+					Profile: "missing", Target: "target", MakeTarget: "target",
+					Lifecycle: "target", Scope: "target", Stage: "target",
+				}},
+			}, nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), `resolve Kbuild selections: Kbuild selection references missing profile "missing"`) {
+		t.Fatalf("metadata construction error = %v, want eager selection-graph validation", err)
+	}
+}
+
 func TestParseConfigPreservesCanonicalUnsetComments(t *testing.T) {
 	raw, err := ParseConfig(strings.NewReader(`# Generated configuration
 # CONFIG_DEFAULT_ON is not set

@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -18,34 +19,46 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 const (
-	LinuxKernelPlanSchema          = "linux-kernel-plan-v4"
-	LinuxKernelInputBindingsSchema = "linux-kernel-input-bindings-v1"
-	LinuxKbuildArgsSentinel        = "__LINUX_BZL_KBUILD_ARGS_V1__"
-	LinuxKernelTreeRootMarker      = ".linux-bzl-tree-root"
+	LinuxKernelPlanSchema              = "linux-kernel-plan-v5"
+	LinuxKernelInputBindingsSchema     = "linux-kernel-input-bindings-v1"
+	LinuxKernelSourceProjectionsSchema = "linux-kernel-source-projections-v1"
+	LinuxKbuildArgsSentinel            = "__LINUX_BZL_KBUILD_ARGS_V1__"
+	LinuxKernelTreeRootMarker          = ".linux-bzl-tree-root"
 
 	// MaxActionPlanInputBindingsBytes bounds the canonical per-node binding
 	// manifest before it is decoded or consumed by an action runner.
-	MaxActionPlanInputBindingsBytes = 64 << 20
+	MaxActionPlanInputBindingsBytes     = 64 << 20
+	MaxActionPlanSourceProjectionsBytes = 64 << 20
 
-	maximumActionPlanOrdinal              = 99999999
-	maximumActionPlanNameComponent        = 240
-	maximumActionPlanInputTuplesPerMarker = 64
-	maximumActionPlanInputMarkerFilename  = 240
-	maximumActionPlanInputBindingCount    = 1 << 20
+	maximumActionPlanOrdinal               = 99999999
+	maximumActionPlanNameComponent         = 240
+	maximumActionPlanInputTuplesPerMarker  = 64
+	maximumActionPlanInputMarkerFilename   = 240
+	maximumActionPlanInputBindingCount     = 1 << 20
+	maximumActionPlanSourceProjectionCount = 1 << 20
 
 	// Keep the process-local working-tree topology cache bounded independently
 	// of the size of the serialized plan. Each entry is a uint32 node index, so
 	// this permits at most roughly 32 MiB of cached flattened topology.
 	maximumWorkingTreeTopologyCacheIndexes = 8 << 20
+	// Materialized cores outlive append-only plan growth. Node projections and
+	// root-set cores retain only persistent input-set roots; flat records remain
+	// only for exceptional duplicate-writer and archive replay witnesses.
+	maximumWorkingTreeMaterializedNodeEntries  = 1 << 20
+	maximumWorkingTreeMaterializedCoreInputs   = 1 << 20
+	maximumWorkingTreeMaterializedCoreEntries  = 1 << 15
+	maximumWorkingTreeMaterializedCoreKeyBytes = 64 << 20
 )
 
 var LinuxKernelPlanStages = map[string]bool{
@@ -344,6 +357,75 @@ type ActionRecipeCommandReplayInvocation struct {
 	Outputs   []string `json:"outputs"`
 }
 
+// ActionRecipeCompilerInvocation retains the exact configured compiler argv
+// embedded in a typed compound action.  It is analysis metadata, not a second
+// executable command: ActionRecipe.Tool remains the program which executes the
+// recipe.  Keeping this projection separate lets config-dependency analysis
+// inspect a compiler which must remain atomic with fixdep and other bounded
+// Kbuild bookkeeping in one private working directory.
+type ActionRecipeCompilerInvocation struct {
+	Tool      string   `json:"tool"`
+	Arguments []string `json:"arguments"`
+	// WorkingInputUses is the complete set of staged source/input bindings read
+	// by the bounded compound program, including commands which execute before or
+	// after the compiler itself.  The projection is meaningful only when
+	// WorkingInputUsesComplete is true: old plans and synthetic recipes omit the
+	// bit and therefore retain their complete staged frontier fail closed.
+	WorkingInputUses         []string `json:"working_input_uses,omitempty"`
+	WorkingInputUsesComplete bool     `json:"working_input_uses_complete,omitempty"`
+	// AuxiliaryWorkingInputUses is the exact subset read by commands in the
+	// compound envelope other than this compiler invocation.  Compiler argv is
+	// modeled by config-dependency analysis; auxiliary reads are opaque unless
+	// they are proved not to consume resolved config data.
+	AuxiliaryWorkingInputUses []string `json:"auxiliary_working_input_uses,omitempty"`
+}
+
+// actionRecipeCompilerProbeInvocation is the discovery-form compiler process
+// projection retained only while an ActionPlan is being analyzed. Executable
+// recipes always contain replay-resolved argv/environment, but compiler
+// predefine requests must keep the symbolic probe atoms which produced those
+// values so discovery and replay rebuild the same dependency-backed request.
+// This value is never serialized or included in a recipe/node content ID.
+type actionRecipeCompilerProbeInvocation struct {
+	Tool         string
+	Arguments    []string
+	Environment  map[string]string
+	OpaqueReason string
+	// A multi-compiler envelope cannot assign unresolved staged TU candidates
+	// to one command. Retain this policy when replay splits the envelope.
+	RequireExplicitSources bool
+}
+
+// actionRecipeCompoundCompilerProbe retains one command's concrete ownership
+// and symbolic probe twin. These records register optional compiler queries;
+// they never classify a multi-compiler compound as a typed compiler action.
+type actionRecipeCompoundCompilerProbe struct {
+	Invocation ActionRecipeCompilerInvocation
+	Projection actionRecipeCompilerProbeInvocation
+}
+
+func cloneActionRecipeCompoundCompilerProbes(probes []actionRecipeCompoundCompilerProbe) []actionRecipeCompoundCompilerProbe {
+	cloned := slices.Clone(probes)
+	for index := range cloned {
+		invocation := &cloned[index].Invocation
+		invocation.Arguments = slices.Clone(invocation.Arguments)
+		invocation.WorkingInputUses = slices.Clone(invocation.WorkingInputUses)
+		invocation.AuxiliaryWorkingInputUses = slices.Clone(invocation.AuxiliaryWorkingInputUses)
+		cloned[index].Projection = *cloneActionRecipeCompilerProbeInvocation(&cloned[index].Projection)
+	}
+	return cloned
+}
+
+func cloneActionRecipeCompilerProbeInvocation(invocation *actionRecipeCompilerProbeInvocation) *actionRecipeCompilerProbeInvocation {
+	if invocation == nil {
+		return nil
+	}
+	cloned := *invocation
+	cloned.Arguments = slices.Clone(invocation.Arguments)
+	cloned.Environment = maps.Clone(invocation.Environment)
+	return &cloned
+}
+
 // ActionRecipe is deliberately an argv description, not a compiler model.
 // Every string may contain the exact tokens ${source:KEY}, ${input:KEY},
 // ${output:KEY}, ${tool:KEY}, ${tree:KEY}, or ${content:KEY}. The runner rejects
@@ -407,6 +489,15 @@ type ActionRecipe struct {
 	// that every dynamic value is backed by an exact graph input.
 	ContentSubstitutions map[string]ActionRecipeContentSubstitution `json:"content_substitutions,omitempty"`
 	CommandReplays       []ActionRecipeCommandReplay                `json:"command_replays,omitempty"`
+	CompilerInvocation   *ActionRecipeCompilerInvocation            `json:"compiler_invocation,omitempty"`
+	// ConfigProjectionPrefixes is present only on a generator whose exact
+	// full-config behavior is checked by a separate differential replay. The
+	// family reducer expands these stable CONFIG_* prefixes against each
+	// snapshot, unions the resulting symbols symmetrically, and supplies that
+	// exact capsule instead of the complete resolved configuration.
+	ConfigProjectionPrefixes []string `json:"config_projection_prefixes,omitempty"`
+	compilerProbeInvocation  *actionRecipeCompilerProbeInvocation
+	compoundCompilerProbes   []actionRecipeCompoundCompilerProbe
 	// ExecutableInputs names declared input bindings that are programs invoked
 	// by the primary recipe tool. Bazel output Files are not intrinsically
 	// executable, so the runner materializes private executable copies without
@@ -457,7 +548,19 @@ func cloneActionRecipe(recipe ActionRecipe) ActionRecipe {
 			invocation.Outputs = slices.Clone(invocation.Outputs)
 		}
 	}
+	if recipe.CompilerInvocation != nil {
+		invocation := *recipe.CompilerInvocation
+		invocation.Arguments = slices.Clone(invocation.Arguments)
+		invocation.WorkingInputUses = slices.Clone(invocation.WorkingInputUses)
+		invocation.AuxiliaryWorkingInputUses = slices.Clone(invocation.AuxiliaryWorkingInputUses)
+		recipe.CompilerInvocation = &invocation
+	}
+	if recipe.compilerProbeInvocation != nil {
+		recipe.compilerProbeInvocation = cloneActionRecipeCompilerProbeInvocation(recipe.compilerProbeInvocation)
+	}
+	recipe.compoundCompilerProbes = cloneActionRecipeCompoundCompilerProbes(recipe.compoundCompilerProbes)
 	recipe.ExecutableInputs = slices.Clone(recipe.ExecutableInputs)
+	recipe.ConfigProjectionPrefixes = slices.Clone(recipe.ConfigProjectionPrefixes)
 	recipe.Sources = slices.Clone(recipe.Sources)
 	recipe.Inputs = slices.Clone(recipe.Inputs)
 	recipe.Outputs = slices.Clone(recipe.Outputs)
@@ -601,6 +704,16 @@ func normalizeActionRecipeToolsetPathCapabilitiesInPlace(
 			return err
 		}
 		recipe.Environment[name] = value
+	}
+	if recipe.CompilerInvocation != nil {
+		for index := range recipe.CompilerInvocation.Arguments {
+			if err := apply(
+				fmt.Sprintf("recipe compiler invocation argument %d toolset-path capability", index),
+				&recipe.CompilerInvocation.Arguments[index],
+			); err != nil {
+				return err
+			}
+		}
 	}
 	if err := apply("recipe working directory toolset-path capability", &recipe.WorkingDirectory); err != nil {
 		return err
@@ -862,7 +975,7 @@ func rebaseActionRecipeLiteralTreeOffsets(
 // ActionPlan is the typed form used by planners and unit tests. WriteStages
 // writes the sharded marker layout consumed by map_directory:
 //
-//	schema/linux-kernel-plan-v4
+//	schema/linux-kernel-plan-v5
 //	toolsets/{target,host}/sha256-<digest>
 //	products/<product>/root/<tree>/<canonical path>
 //	sources/src-########/<namespace>/<canonical path>
@@ -871,6 +984,8 @@ func rebaseActionRecipeLiteralTreeOffsets(
 //	nodes/<stage>/<sha256>/{kind,recipe,tool,product}/<value>
 //	nodes/<stage>/<sha256>/in/source/<role>/<ordinal>/src-########
 //	nodes/<stage>/<sha256>/in/node-pack/<role>/<role chunk>.<payload>
+//	input-sets/<sha256>/{manifest,child,in}/...
+//	nodes/<stage>/<sha256>/in/input-set/<sha256>
 //	nodes/<stage>/<sha256>/in/tree/<name>
 //	nodes/<stage>/<sha256>/in/tool/<scope>/<role>/<scoped|unscoped>
 //	nodes/<stage>/<sha256>/in/toolset/<scope>
@@ -887,9 +1002,13 @@ type ActionPlan struct {
 	Toolsets map[string]string
 	Sources  []ActionPlanSource
 	Recipes  map[string]ActionRecipe
-	Nodes    []ActionPlanNode
-	Products []ActionPlanProduct
-	metadata *CompactMetadata
+	// InputSets is the canonical, reachable persistent input-set node store
+	// serialized with the plan. During lowering inputSetStore may additionally
+	// retain historical roots; only the closure reachable from Nodes is exported.
+	InputSets map[string]ActionPlanInputSetNode
+	Nodes     []ActionPlanNode
+	Products  []ActionPlanProduct
+	metadata  *CompactMetadata
 	// selectionGraph is process-local provenance used while first-class deferred
 	// query nodes resolve their exact artifact owners. Serialized node edges own
 	// the final execution contract.
@@ -909,6 +1028,34 @@ type ActionPlan struct {
 	// refs into ordinary node input edges plus the recipe runtime contract before
 	// either content ID is computed.
 	observedOutputBases map[string][]ActionPlanNodeEdge
+	// compilerProbeInvocations retains the exact discovery-form compiler argv
+	// and environment for a concrete provisional node. It is node-keyed rather
+	// than recipe-keyed because two source occurrences can share executable
+	// recipe bytes while depending on distinct probe atoms which happen to
+	// resolve to the same text.
+	compilerProbeInvocations map[string]actionRecipeCompilerProbeInvocation
+	// compoundCompilerProbes is registration-only provenance for an untyped
+	// multi-compiler envelope. It is not consulted by precision classification.
+	compoundCompilerProbes map[string][]actionRecipeCompoundCompilerProbe
+	// projectedGeneratorValidations are full-versus-projected equivalence
+	// witnesses. Terminal product producers acquire ordinary input edges to
+	// these stamps before content addressing; compiler nodes never do.
+	projectedGeneratorValidations []string
+	// projectedGeneratorInternalNodes identifies snapshot-only raw/replay/check
+	// actions retained by differential validation. Some replay side-output slots
+	// remain public; projectedGeneratorInternalOutputs is the exact per-slot set
+	// excluded from family views and prior-tree projection.
+	projectedGeneratorInternalNodes   map[string]bool
+	projectedGeneratorInternalOutputs map[actionPlanOutputRef]bool
+	// projectedGeneratorOriginalOutputs commits the exact pre-lowering output
+	// vector and target slot for each raw projected generator. Snapshot validation
+	// never infers this authority from the lowered graph it is meant to verify.
+	projectedGeneratorOriginalOutputs map[string]projectedGeneratorOriginalOutputCommitment
+	// projectedGeneratorCandidates is a source-language proof keyed by the
+	// ordinary provisional producer and exact generated target slot. It is
+	// deliberately absent from serialized recipes so standalone ActionPlan/cache
+	// identities remain unchanged.
+	projectedGeneratorCandidates map[string]projectedGeneratorCandidate
 
 	// Planning routinely asks whether an already-materialized action owns a
 	// prerequisite. Keep that operation linear over the whole plan instead of
@@ -930,6 +1077,42 @@ type ActionPlan struct {
 	// cache before a possibly-mutated public Nodes slice is used again.
 	workingTreeTopologyCache        map[string][]uint32
 	workingTreeTopologyCacheIndexes int
+	// workingTreeMaterializedNodeInputSets and workingTreeMaterializedCoreCache
+	// retain append-stable producer ancestry separately from consumer-local
+	// frontier/native policy. Full index rebuilds and live archive-policy changes
+	// clear them; ordinary appends cannot change an existing root's ancestors.
+	workingTreeMaterializedNodeInputSets map[uint32]string
+	workingTreeMaterializedNodeConflicts map[uint32][]compactKbuildWorkingTreeMaterializedCorePath
+	workingTreeMaterializedCoreCache     map[string]*compactKbuildWorkingTreeMaterializedCore
+	workingTreeMaterializedCoreInputs    int
+	workingTreeMaterializedCoreKeyBytes  int
+	// workingTreeMaterializedReachedNodes is the exact set of nodes observed by
+	// retained or attempted materialized-core computations. Archive provenance
+	// attached to a node outside this set cannot change any existing core. This
+	// matters for the normal append-then-mark archive sequence: clearing every
+	// older core for each newly appended thin archive turns repeated closure
+	// queries into quadratic traversals and family-cache rebindings.
+	workingTreeMaterializedReachedNodes     actionPlanNodeVisitSet
+	workingTreeMaterializedCoreComputations int
+	workingTreeMaterializedNodeProjections  int
+	// familyPlanningCache is shared only by the sequential variants emitted by
+	// one family snapshot planner. Its persistent input-set store reuses
+	// canonical closure subtries directly; no parallel structural graph exists.
+	familyPlanningCache *ActionPlanFamilyPlanningCache
+	// inputSetStore is shared by the sequential members of one family planning
+	// invocation. Content-addressed radix nodes are immutable, so unchanged
+	// closure subtrees are allocated once even while each variant keeps its own
+	// root and producer bindings.
+	inputSetStore *ActionPlanInputSetStore
+	// inputUseProjection clears inherited consumer flags once per immutable
+	// subtree before applying sparse use updates. Its memo resets whenever the
+	// backing input-set store changes and is never shared across plan copies.
+	inputUseProjection *compactKbuildInputUseProjection
+
+	// recipeInterning contains private append-path instrumentation. Collision
+	// checks deliberately canonicalize the live public Recipes value: retaining
+	// a stale witness would let a caller mutation escape fail-fast validation.
+	recipeInterning actionPlanRecipeInterningState
 
 	// Probe discovery executes the complete selected lowering so every lazy
 	// expansion and validation runs, but never serializes its provisional plan.
@@ -963,7 +1146,17 @@ func (p *ActionPlan) markPathSensitiveArchiveOutput(producerID string, slot int)
 	if p.pathSensitiveArchiveOutputs == nil {
 		p.pathSensitiveArchiveOutputs = map[actionPlanOutputRef]bool{}
 	}
-	p.pathSensitiveArchiveOutputs[actionPlanOutputRef{producerID: producerID, slot: slot}] = true
+	ref := actionPlanOutputRef{producerID: producerID, slot: slot}
+	if !p.pathSensitiveArchiveOutputs[ref] {
+		p.pathSensitiveArchiveOutputs[ref] = true
+		// A marker changes closure semantics only when a cached computation has
+		// actually reached this producer. In production archives are marked
+		// synchronously after append, before any consumer can reach the new node,
+		// so all cores rooted in the older append-only prefix remain valid.
+		if p.workingTreeMaterializedReachedNodes.contains(nodeIndex) {
+			p.clearWorkingTreeMaterializedCoreCache()
+		}
+	}
 	return nil
 }
 
@@ -989,6 +1182,23 @@ func (p *ActionPlan) hasPathSensitiveArchiveOutput(producerID string) bool {
 	return false
 }
 
+// pathSensitiveArchiveSlots returns the exact output-shape policy attached to
+// node. Slots are naturally sorted by output order. Family working-tree cache
+// entries retain this narrow shape (never output contents) so a structural hit
+// can fail closed when a sibling plan classifies the same node differently.
+func (p *ActionPlan) pathSensitiveArchiveSlots(node ActionPlanNode) []int {
+	if p == nil {
+		return nil
+	}
+	slots := []int{}
+	for slot := range node.Outputs {
+		if p.pathSensitiveArchiveOutputs[actionPlanOutputRef{producerID: node.ID, slot: slot}] {
+			slots = append(slots, slot)
+		}
+	}
+	return slots
+}
+
 type ActionPlanSource struct {
 	ID        string
 	Namespace string
@@ -1006,7 +1216,29 @@ type ActionPlanNode struct {
 	Inputs         []ActionPlanNodeEdge
 	Trees          []string
 	AuxiliaryTools []string
-	Outputs        []ActionPlanOutput
+	// InputSet names the canonical persistent set of implicit materialized
+	// inputs. Recipe-addressable operands remain in Sources and Inputs; the set
+	// owns closure-only work/tree projections without flattening them into every
+	// consumer node.
+	InputSet string
+	Outputs  []ActionPlanOutput
+
+	// familySourceProjections is deliberately family-only planner metadata.
+	// Ordinary v4 plans and ActionPlanSnapshot JSON neither serialize nor
+	// interpret it. The family reducer attaches the symmetric immutable-source
+	// closure only after matching config-independent nodes, then includes this
+	// field in the final family identity and v6 marker tree.
+	familySourceProjections []ActionPlanFamilySourceProjection
+}
+
+// ActionPlanFamilySourceProjection binds one node source edge into an exact
+// private logical source-tree view. SourceOrdinal indexes ActionPlanNode.Sources;
+// the edge itself owns the immutable Bazel File and this record owns only its
+// logical placement.
+type ActionPlanFamilySourceProjection struct {
+	SourceOrdinal int
+	Tree          string
+	Path          string
 }
 
 type ActionPlanSourceEdge struct {
@@ -1022,9 +1254,15 @@ type ActionPlanNodeEdge struct {
 
 // ActionPlanInputBinding identifies the exact physical producer output bound
 // to one recipe input. Path is relative to the TreeArtifact named by Tree.
+// ProjectionTree and ProjectionPath retain the producer's logical tree
+// placement when a family plan stores the physical artifact in a shared,
+// content-addressed store. They are either both empty (the v4 layout) or both
+// present (the family layout).
 type ActionPlanInputBinding struct {
-	Tree string `json:"tree"`
-	Path string `json:"path"`
+	Tree           string `json:"tree"`
+	Path           string `json:"path"`
+	ProjectionTree string `json:"projection_tree,omitempty"`
+	ProjectionPath string `json:"projection_path,omitempty"`
 }
 
 // ActionPlanInputBindings is the compact execution contract for one node's
@@ -1035,6 +1273,127 @@ type ActionPlanInputBinding struct {
 type ActionPlanInputBindings struct {
 	Schema   string                            `json:"schema"`
 	Bindings map[string]ActionPlanInputBinding `json:"bindings"`
+}
+
+// ActionPlanSourceProjectionBinding is the runner-side representation of one
+// exact immutable source in a private logical tree. Bindings use the same
+// role:%08d names as -source arguments, so the manifest cannot redirect an
+// undeclared File.
+type ActionPlanSourceProjectionBinding struct {
+	Tree string `json:"tree"`
+	Path string `json:"path"`
+}
+
+// ActionPlanSourceProjections is a compact, content-addressed runner contract.
+// The family marker tree separately packs source-edge ordinals into filenames
+// so map_directory can select the exact Bazel Files without reading contents.
+type ActionPlanSourceProjections struct {
+	Schema   string                                       `json:"schema"`
+	Bindings map[string]ActionPlanSourceProjectionBinding `json:"bindings"`
+}
+
+// Validate verifies the complete source-projection contract. Unlike generated
+// input bindings, source projections may be a subset of a node's source edges,
+// so their ordinals need not be contiguous.
+func (p ActionPlanSourceProjections) Validate() error {
+	if p.Schema != LinuxKernelSourceProjectionsSchema {
+		return fmt.Errorf("source projections schema %q, want %q", p.Schema, LinuxKernelSourceProjectionsSchema)
+	}
+	if p.Bindings == nil {
+		return fmt.Errorf("source projections must contain a bindings object")
+	}
+	if len(p.Bindings) > maximumActionPlanSourceProjectionCount {
+		return fmt.Errorf("source projections contain %d entries, want at most %d", len(p.Bindings), maximumActionPlanSourceProjectionCount)
+	}
+	seenOrdinals := map[int]string{}
+	seenDestinations := map[string]string{}
+	for _, key := range slices.Sorted(maps.Keys(p.Bindings)) {
+		role, ordinalText, ok := strings.Cut(key, ":")
+		if !ok || strings.Contains(ordinalText, ":") {
+			return fmt.Errorf("source projection key %q is not role:%%08d", key)
+		}
+		if err := validatePlanName("source projection role", role); err != nil {
+			return err
+		}
+		if len(ordinalText) != 8 || strings.Trim(ordinalText, "0123456789") != "" {
+			return fmt.Errorf("source projection key %q does not have an eight-digit ordinal", key)
+		}
+		ordinal, err := strconv.Atoi(ordinalText)
+		if err != nil || ordinal < 0 || ordinal > maximumActionPlanOrdinal {
+			return fmt.Errorf("source projection key %q has out-of-range ordinal %q", key, ordinalText)
+		}
+		if previous := seenOrdinals[ordinal]; previous != "" {
+			return fmt.Errorf("source projections repeat ordinal %s in %q and %q", ordinalText, previous, key)
+		}
+		seenOrdinals[ordinal] = key
+
+		binding := p.Bindings[key]
+		if err := validatePlanName("source projection tree", binding.Tree); err != nil {
+			return fmt.Errorf("source projection %q: %w", key, err)
+		}
+		if err := validatePlanRelativePath("source projection path", binding.Path); err != nil {
+			return fmt.Errorf("source projection %q: %w", key, err)
+		}
+		destination := binding.Tree + "\x00" + binding.Path
+		if previous := seenDestinations[destination]; previous != "" {
+			return fmt.Errorf("source projections %q and %q collide at %s/%s", previous, key, binding.Tree, binding.Path)
+		}
+		seenDestinations[destination] = key
+	}
+	return nil
+}
+
+func (p ActionPlanSourceProjections) CanonicalJSON() ([]byte, error) {
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, fmt.Errorf("encode source projections: %w", err)
+	}
+	data = append(data, '\n')
+	if len(data) > MaxActionPlanSourceProjectionsBytes {
+		return nil, fmt.Errorf("canonical source projections contain %d bytes, want at most %d", len(data), MaxActionPlanSourceProjectionsBytes)
+	}
+	return data, nil
+}
+
+func (p ActionPlanSourceProjections) ID() (string, error) {
+	data, err := p.CanonicalJSON()
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func DecodeActionPlanSourceProjections(data []byte) (ActionPlanSourceProjections, error) {
+	if len(data) == 0 {
+		return ActionPlanSourceProjections{}, fmt.Errorf("source projections are empty")
+	}
+	if len(data) > MaxActionPlanSourceProjectionsBytes {
+		return ActionPlanSourceProjections{}, fmt.Errorf("source projections contain %d bytes, want at most %d", len(data), MaxActionPlanSourceProjectionsBytes)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var projections ActionPlanSourceProjections
+	if err := decoder.Decode(&projections); err != nil {
+		return ActionPlanSourceProjections{}, fmt.Errorf("decode source projections: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return ActionPlanSourceProjections{}, fmt.Errorf("decode source projections: trailing JSON value")
+		}
+		return ActionPlanSourceProjections{}, fmt.Errorf("decode source projections: %w", err)
+	}
+	canonical, err := projections.CanonicalJSON()
+	if err != nil {
+		return ActionPlanSourceProjections{}, err
+	}
+	if !bytes.Equal(data, canonical) {
+		return ActionPlanSourceProjections{}, fmt.Errorf("source projections are not canonically encoded")
+	}
+	return projections, nil
 }
 
 // Validate verifies the complete standalone input-binding contract.
@@ -1075,6 +1434,17 @@ func (b ActionPlanInputBindings) Validate() error {
 		}
 		if err := validatePlanRelativePath("input binding physical artifact", binding.Path); err != nil {
 			return fmt.Errorf("input binding %q: %w", key, err)
+		}
+		if (binding.ProjectionTree == "") != (binding.ProjectionPath == "") {
+			return fmt.Errorf("input binding %q must set both projection tree and path", key)
+		}
+		if binding.ProjectionTree != "" {
+			if err := validatePlanName("input binding projection tree", binding.ProjectionTree); err != nil {
+				return fmt.Errorf("input binding %q: %w", key, err)
+			}
+			if err := validatePlanRelativePath("input binding projection artifact", binding.ProjectionPath); err != nil {
+				return fmt.Errorf("input binding %q: %w", key, err)
+			}
 		}
 	}
 	return nil
@@ -1238,6 +1608,35 @@ func (p *ActionPlan) clearWorkingTreeTopologyCache() {
 	}
 	p.workingTreeTopologyCache = nil
 	p.workingTreeTopologyCacheIndexes = 0
+	p.clearWorkingTreeMaterializedCoreCache()
+}
+
+func (p *ActionPlan) clearWorkingTreeMaterializedCoreCache() {
+	if p == nil {
+		return
+	}
+	p.workingTreeMaterializedNodeInputSets = nil
+	p.workingTreeMaterializedNodeConflicts = nil
+	p.workingTreeMaterializedCoreCache = nil
+	p.workingTreeMaterializedCoreInputs = 0
+	p.workingTreeMaterializedCoreKeyBytes = 0
+	p.workingTreeMaterializedReachedNodes = nil
+}
+
+// actionPlanNodeVisitSet is a sparse, call-local traversal set. Working-tree
+// closures are assembled while the action plan grows, and most compiler roots
+// reach only a tiny fraction of the nodes already present. A dense len(Nodes)
+// bitmap per closure therefore turns otherwise sparse walks into quadratic
+// allocation and zeroing across a complete kernel plan.
+type actionPlanNodeVisitSet map[uint32]struct{}
+
+func (s actionPlanNodeVisitSet) contains(index uint32) bool {
+	_, ok := s[index]
+	return ok
+}
+
+func (s actionPlanNodeVisitSet) add(index uint32) {
+	s[index] = struct{}{}
 }
 
 // walkCompactKbuildWorkingTreeTopology visits root's ActionPlan ancestry in
@@ -1247,28 +1646,28 @@ func (p *ActionPlan) clearWorkingTreeTopologyCache() {
 // and native-root policy are always read from the current planning state.
 //
 // visited is shared by every root in one closure computation and implements
-// the original visited-on-entry behavior. A separate per-root bitset records a
-// complete reusable topology. If that root encounters an already-visited
+// the original visited-on-entry behavior. A separate per-root sparse set records
+// a complete reusable topology. If that root encounters an already-visited
 // uncached subtree, traversal still preserves the original behavior but the
 // necessarily-partial topology is not cached.
 func (p *ActionPlan) walkCompactKbuildWorkingTreeTopology(
 	root string,
-	visited []bool,
+	visited actionPlanNodeVisitSet,
 	processNode func(uint32) error,
 ) error {
 	if p == nil {
 		return fmt.Errorf("working object-tree closure requires an action plan")
 	}
 	p.ensureNodeLookupIndexes()
-	if len(visited) != len(p.Nodes) {
-		return fmt.Errorf("working object-tree traversal has %d visited entries for %d action plan nodes", len(visited), len(p.Nodes))
+	if visited == nil {
+		return fmt.Errorf("working object-tree traversal requires a visitation set")
 	}
 	if cached, ok := p.workingTreeTopologyCache[root]; ok {
 		for _, index := range cached {
-			if visited[index] {
+			if visited.contains(index) {
 				continue
 			}
-			visited[index] = true
+			visited.add(index)
 			if err := processNode(index); err != nil {
 				return err
 			}
@@ -1279,11 +1678,11 @@ func (p *ActionPlan) walkCompactKbuildWorkingTreeTopology(
 	if !ok {
 		return fmt.Errorf("working object-tree ancestor %q is absent from the action plan", root)
 	}
-	if visited[rootIndex] {
+	if visited.contains(rootIndex) {
 		return nil
 	}
 
-	localSeen := make([]bool, len(p.Nodes))
+	localSeen := actionPlanNodeVisitSet{}
 	topology := []uint32{}
 	cacheable := p.workingTreeTopologyCacheIndexes < maximumWorkingTreeTopologyCacheIndexes
 	record := func(index uint32) {
@@ -1304,7 +1703,7 @@ func (p *ActionPlan) walkCompactKbuildWorkingTreeTopology(
 		if !ok {
 			return fmt.Errorf("working object-tree ancestor %q is absent from the action plan", producer)
 		}
-		if localSeen[index] {
+		if localSeen.contains(index) {
 			return nil
 		}
 		if cached, ok := p.workingTreeTopologyCache[producer]; ok {
@@ -1313,12 +1712,12 @@ func (p *ActionPlan) walkCompactKbuildWorkingTreeTopology(
 			// ancestor locally, and that ancestor must still be emitted by the
 			// stack frame which first entered it.
 			for _, cachedIndex := range cached {
-				if localSeen[cachedIndex] {
+				if localSeen.contains(cachedIndex) {
 					continue
 				}
-				localSeen[cachedIndex] = true
-				if !visited[cachedIndex] {
-					visited[cachedIndex] = true
+				localSeen.add(cachedIndex)
+				if !visited.contains(cachedIndex) {
+					visited.add(cachedIndex)
 					if err := processNode(cachedIndex); err != nil {
 						return err
 					}
@@ -1327,7 +1726,7 @@ func (p *ActionPlan) walkCompactKbuildWorkingTreeTopology(
 			}
 			return nil
 		}
-		if visited[index] {
+		if visited.contains(index) {
 			// The original traversal stops here. Without a cached closure for
 			// this producer, doing the same leaves this root's local topology
 			// incomplete, so do not publish it as reusable.
@@ -1336,11 +1735,15 @@ func (p *ActionPlan) walkCompactKbuildWorkingTreeTopology(
 			return nil
 		}
 
-		visited[index] = true
-		localSeen[index] = true
+		visited.add(index)
+		localSeen.add(index)
 		node := p.Nodes[index]
-		for _, edge := range node.Inputs {
-			if err := visit(edge.ProducerID); err != nil {
+		producers, err := p.actionPlanNodeProducerIDs(node)
+		if err != nil {
+			return fmt.Errorf("working object-tree node %s inputs: %w", node.ID, err)
+		}
+		for _, producer := range producers {
+			if err := visit(producer); err != nil {
 				return err
 			}
 		}
@@ -1415,6 +1818,13 @@ type actionPlanEntry struct {
 	data []byte
 }
 
+// actionPlanValidationStats is deliberately private test instrumentation. A
+// structural-only validation must leave markerEntries at zero; every marker
+// append in the emitting path is counted through the shared helper below.
+type actionPlanValidationStats struct {
+	markerEntries int
+}
+
 func (r ActionRecipe) CanonicalJSON() ([]byte, error) {
 	if err := r.Validate(); err != nil {
 		return nil, err
@@ -1452,6 +1862,48 @@ func (r ActionRecipe) Validate() error {
 	}
 	if r.ArgumentsFile && r.Tool != "actionfile" {
 		return fmt.Errorf("recipe arguments_file requires actionfile tool, got %q", r.Tool)
+	}
+	for ordinal, prefix := range r.ConfigProjectionPrefixes {
+		if !isConfigKey(prefix) {
+			return fmt.Errorf("recipe config projection prefix %q is invalid", prefix)
+		}
+		if ordinal != 0 && prefix <= r.ConfigProjectionPrefixes[ordinal-1] {
+			return fmt.Errorf("recipe config projection prefixes are not in canonical unique order")
+		}
+	}
+	if len(r.ConfigProjectionPrefixes) != 0 && r.Kind != "generate" {
+		return fmt.Errorf("recipe config projection requires a generate recipe")
+	}
+	if r.CompilerInvocation != nil {
+		invocation := r.CompilerInvocation
+		if r.Kind != "compile" || r.Tool != compactKbuildScriptRunnerRole {
+			return fmt.Errorf("recipe compiler_invocation requires a compile scriptrun recipe")
+		}
+		if invocation.Tool != "cc" && invocation.Tool != "cxx" {
+			return fmt.Errorf("recipe compiler_invocation has unsupported tool %q", invocation.Tool)
+		}
+		contractRole := toolaction.InvocationContractRole(invocation.Tool, invocation.Arguments)
+		linkRole, hasLinkRole := toolaction.LinkContractRole(invocation.Tool)
+		if contractRole != invocation.Tool &&
+			(!hasLinkRole || contractRole != linkRole ||
+				!toolaction.CompilerInvocationProducesBinaryOutput(invocation.Tool, invocation.Arguments)) {
+			return fmt.Errorf("recipe compiler_invocation argv is not one %s compile or binary-output driver link", invocation.Tool)
+		}
+		if !invocation.WorkingInputUsesComplete &&
+			(len(invocation.WorkingInputUses) != 0 || len(invocation.AuxiliaryWorkingInputUses) != 0) {
+			return fmt.Errorf("recipe compiler_invocation has working input uses without a complete projection")
+		}
+		for index, argument := range invocation.Arguments {
+			if strings.ContainsRune(argument, 0) {
+				return fmt.Errorf("recipe compiler_invocation argument %d contains NUL", index)
+			}
+			if compactKbuildContainsPrivateProvenanceByte(argument) {
+				return fmt.Errorf("recipe compiler_invocation argument %d retains private provenance", index)
+			}
+			if err := toolaction.ValidateExecutionRootProvenanceValue(argument); err != nil {
+				return fmt.Errorf("recipe compiler_invocation argument %d has invalid toolset-path provenance: %w", index, err)
+			}
+		}
 	}
 	for ordinal, transform := range r.ArgumentTransforms {
 		if transform.Index < 0 || transform.Index >= len(r.Arguments) {
@@ -1654,6 +2106,38 @@ func (r ActionRecipe) Validate() error {
 			return fmt.Errorf("recipe working path %q is used by %s and %s", relative, previous, binding)
 		}
 		workingPaths[relative] = binding
+	}
+	if r.CompilerInvocation != nil && r.CompilerInvocation.WorkingInputUsesComplete {
+		seen := map[string]bool{}
+		for ordinal, reference := range r.CompilerInvocation.WorkingInputUses {
+			if ordinal != 0 && reference < r.CompilerInvocation.WorkingInputUses[ordinal-1] {
+				return fmt.Errorf("recipe compiler_invocation working input use ordinal %d is not in canonical lexical order", ordinal)
+			}
+			if seen[reference] {
+				return fmt.Errorf("recipe compiler_invocation repeats working input use %q", reference)
+			}
+			seen[reference] = true
+			kind, binding, ok := strings.Cut(reference, ":")
+			if !ok || (kind != "source" && kind != "input") || !declared[kind][binding] {
+				return fmt.Errorf("recipe compiler_invocation working input use %q is not a declared source/input binding", reference)
+			}
+			if _, staged := r.WorkingInputs[reference]; !staged {
+				return fmt.Errorf("recipe compiler_invocation working input use %q is not staged", reference)
+			}
+		}
+		seenAuxiliary := map[string]bool{}
+		for ordinal, reference := range r.CompilerInvocation.AuxiliaryWorkingInputUses {
+			if ordinal != 0 && reference < r.CompilerInvocation.AuxiliaryWorkingInputUses[ordinal-1] {
+				return fmt.Errorf("recipe compiler_invocation auxiliary working input use ordinal %d is not in canonical lexical order", ordinal)
+			}
+			if seenAuxiliary[reference] {
+				return fmt.Errorf("recipe compiler_invocation repeats auxiliary working input use %q", reference)
+			}
+			seenAuxiliary[reference] = true
+			if !seen[reference] {
+				return fmt.Errorf("recipe compiler_invocation auxiliary working input use %q is absent from the complete working input projection", reference)
+			}
+		}
 	}
 	for binding, relative := range r.WorkingOutputs {
 		if !declared["output"][binding] {
@@ -1928,17 +2412,8 @@ func actionPlanPackedInputEntries(
 ) ([]actionPlanEntry, error) {
 	byRole := map[string][]actionPlanPackedInputTuple{}
 	for inputOrdinal, input := range node.Inputs {
-		if err := validateActionPlanInputOrdinal(node.ID, inputOrdinal); err != nil {
+		if err := validateActionPlanNodeInput(node.ID, inputOrdinal, input); err != nil {
 			return nil, err
-		}
-		if err := validatePlanName("input role", input.Role); err != nil {
-			return nil, err
-		}
-		if err := validatePlanDigest("producer node ID", input.ProducerID); err != nil {
-			return nil, err
-		}
-		if input.Slot < 0 || input.Slot > 99999999 {
-			return nil, fmt.Errorf("node %s input slot %d is out of range", node.ID, input.Slot)
 		}
 		producerOrdinal, ok := nodeOrdinals[input.ProducerID]
 		if !ok {
@@ -1971,6 +2446,22 @@ func actionPlanPackedInputEntries(
 		}
 	}
 	return entries, nil
+}
+
+func validateActionPlanNodeInput(nodeID string, inputOrdinal int, input ActionPlanNodeEdge) error {
+	if err := validateActionPlanInputOrdinal(nodeID, inputOrdinal); err != nil {
+		return err
+	}
+	if err := validatePlanName("input role", input.Role); err != nil {
+		return err
+	}
+	if err := validatePlanDigest("producer node ID", input.ProducerID); err != nil {
+		return err
+	}
+	if input.Slot < 0 || input.Slot > maximumActionPlanOrdinal {
+		return fmt.Errorf("node %s input slot %d is out of range", nodeID, input.Slot)
+	}
+	return nil
 }
 
 func actionPlanNodeInputBindings(node ActionPlanNode, nodes map[string]ActionPlanNode) (ActionPlanInputBindings, error) {
@@ -2009,8 +2500,11 @@ func (n ActionPlanNode) ContentID() string {
 		}
 		_, _ = h.Write([]byte{0})
 	}
-	write("linux-kernel-action-node-v3")
+	write("linux-kernel-action-node-v4")
 	write(n.Stage, n.Kind, n.Recipe, n.Tool, n.Product)
+	if n.InputSet != "" {
+		write("input-set", n.InputSet)
+	}
 	for i, source := range n.Sources {
 		write("source", planOrdinal(i), source.Role, source.SourceID)
 	}
@@ -2060,9 +2554,15 @@ func (p *ActionPlan) WriteStages(outputDirs map[string]string) error {
 	if err != nil {
 		return err
 	}
+	inputSets, err := p.serializedActionPlanInputSetStore()
+	if err != nil {
+		return err
+	}
 	nodes := make(map[string]ActionPlanNode, len(p.Nodes))
 	recipeStages := map[string]map[string]bool{}
 	sourceStages := map[string]map[string]bool{}
+	inputSetStages := map[string]map[string]bool{}
+	stageInputSetRoots := map[string][]string{}
 	crossStageOutputs := map[string]map[string]bool{}
 	for _, stage := range linuxKernelPlanStageOrder {
 		crossStageOutputs[stage] = map[string]bool{}
@@ -2075,6 +2575,9 @@ func (p *ActionPlan) WriteStages(outputDirs map[string]string) error {
 			recipeStages[node.Recipe] = stages
 		}
 		stages[node.Stage] = true
+		if node.InputSet != "" {
+			stageInputSetRoots[node.Stage] = append(stageInputSetRoots[node.Stage], node.InputSet)
+		}
 		for _, source := range node.Sources {
 			stages := sourceStages[source.SourceID]
 			if stages == nil {
@@ -2089,6 +2592,35 @@ func (p *ActionPlan) WriteStages(outputDirs map[string]string) error {
 			producer := nodes[input.ProducerID]
 			if producer.Stage != node.Stage {
 				crossStageOutputs[node.Stage][input.ProducerID+":"+planOrdinal(input.Slot)] = true
+			}
+		}
+	}
+	// A stage needs the union of its consumers' immutable input-set closures.
+	// Traverse shared subtries once per stage, rather than flattening the same
+	// persistent frontier separately for every consumer.
+	for _, stage := range linuxKernelPlanStageOrder {
+		closure, err := inputSets.ReachableNodesForRoots(stageInputSetRoots[stage])
+		if err != nil {
+			return fmt.Errorf("%s stage input sets: %w", stage, err)
+		}
+		for id, inputSet := range closure {
+			stages := inputSetStages[id]
+			if stages == nil {
+				stages = map[string]bool{}
+				inputSetStages[id] = stages
+			}
+			stages[stage] = true
+			for _, entry := range inputSet.Entries {
+				if entry.SourceID != "" {
+					stages := sourceStages[entry.SourceID]
+					if stages == nil {
+						stages = map[string]bool{}
+						sourceStages[entry.SourceID] = stages
+					}
+					stages[stage] = true
+				} else if producer := nodes[entry.ProducerID]; producer.Stage != stage {
+					crossStageOutputs[stage][entry.ProducerID+":"+planOrdinal(entry.Slot)] = true
+				}
 			}
 		}
 	}
@@ -2114,6 +2646,10 @@ func (p *ActionPlan) WriteStages(outputDirs map[string]string) error {
 			}
 		case "sources":
 			for stage := range sourceStages[parts[1]] {
+				appendEntry(stage, entry)
+			}
+		case "input-sets":
+			for stage := range inputSetStages[parts[1]] {
 				appendEntry(stage, entry)
 			}
 		case "products":
@@ -2144,16 +2680,45 @@ func (p *ActionPlan) WriteStages(outputDirs map[string]string) error {
 }
 
 func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
+	return p.actionPlanEntries(true, nil)
+}
+
+// validateStructure checks the action graph contract without materializing
+// its repository marker tree. Marker-only encodings (packed filenames,
+// binding JSON, marker ordering, and duplicate marker paths) remain validated
+// by entries when an actual plan tree is emitted.
+func (p *ActionPlan) validateStructure(stats *actionPlanValidationStats) error {
+	_, err := p.actionPlanEntries(false, stats)
+	return err
+}
+
+func (p *ActionPlan) actionPlanEntries(emitMarkers bool, stats *actionPlanValidationStats) ([]actionPlanEntry, error) {
 	if p == nil {
 		return nil, fmt.Errorf("kernel action plan is nil")
 	}
-	nodeOrdinals, indexedNodeIDs, err := actionPlanNodeOrdinalIndex(p.Nodes)
-	if err != nil {
-		return nil, err
+	appendEntries := func(entries *[]actionPlanEntry, values ...actionPlanEntry) {
+		if stats != nil {
+			stats.markerEntries += len(values)
+		}
+		*entries = append(*entries, values...)
 	}
-	entries := []actionPlanEntry{{path: path.Join("schema", LinuxKernelPlanSchema)}}
-	for ordinal, nodeID := range indexedNodeIDs {
-		entries = append(entries, actionPlanEntry{path: path.Join("index", planOrdinal(ordinal), nodeID)})
+	var nodeOrdinals map[string]int
+	var indexedNodeIDs []string
+	if emitMarkers {
+		var err error
+		nodeOrdinals, indexedNodeIDs, err = actionPlanNodeOrdinalIndex(p.Nodes)
+		if err != nil {
+			return nil, err
+		}
+	} else if len(p.Nodes) > maximumActionPlanOrdinal+1 {
+		return nil, fmt.Errorf("kernel action plan node index space is exhausted")
+	}
+	entries := []actionPlanEntry(nil)
+	if emitMarkers {
+		appendEntries(&entries, actionPlanEntry{path: path.Join("schema", LinuxKernelPlanSchema)})
+		for ordinal, nodeID := range indexedNodeIDs {
+			appendEntries(&entries, actionPlanEntry{path: path.Join("index", planOrdinal(ordinal), nodeID)})
+		}
 	}
 	for scope, identity := range p.Toolsets {
 		if scope != "target" && scope != "host" {
@@ -2162,7 +2727,9 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 		if err := validateProbeIdentity(identity); err != nil {
 			return nil, fmt.Errorf("%s toolset: %w", scope, err)
 		}
-		entries = append(entries, actionPlanEntry{path: path.Join("toolsets", scope, identity)})
+		if emitMarkers {
+			appendEntries(&entries, actionPlanEntry{path: path.Join("toolsets", scope, identity)})
+		}
 	}
 	if p.Toolsets["target"] == "" {
 		return nil, fmt.Errorf("kernel action plan has no target toolset")
@@ -2183,10 +2750,12 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 			return nil, fmt.Errorf("repeated source ID %q", source.ID)
 		}
 		sources[source.ID] = source
-		entries = append(entries, actionPlanEntry{path: path.Join("sources", source.ID, source.Namespace, source.Path)})
+		if emitMarkers {
+			appendEntries(&entries, actionPlanEntry{path: path.Join("sources", source.ID, source.Namespace, source.Path)})
+		}
 	}
 
-	recipeData := map[string][]byte{}
+	validatedRecipes := make(map[string]bool, len(p.Recipes))
 	for id, recipe := range p.Recipes {
 		if err := validatePlanDigest("recipe ID", id); err != nil {
 			return nil, err
@@ -2199,8 +2768,10 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 		if got := hex.EncodeToString(actual[:]); got != id {
 			return nil, fmt.Errorf("recipe ID %s does not match canonical content %s", id, got)
 		}
-		recipeData[id] = data
-		entries = append(entries, actionPlanEntry{path: path.Join("recipes", id+".json"), data: data})
+		validatedRecipes[id] = true
+		if emitMarkers {
+			appendEntries(&entries, actionPlanEntry{path: path.Join("recipes", id+".json"), data: data})
+		}
 	}
 
 	nodes := map[string]ActionPlanNode{}
@@ -2223,7 +2794,7 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 		if got := node.ContentID(); got != node.ID {
 			return nil, fmt.Errorf("node ID %s does not match canonical content %s", node.ID, got)
 		}
-		if _, ok := recipeData[node.Recipe]; !ok {
+		if !validatedRecipes[node.Recipe] {
 			return nil, fmt.Errorf("node %s references unknown recipe %q", node.ID, node.Recipe)
 		}
 		if p.Recipes[node.Recipe].Kind != node.Kind {
@@ -2247,13 +2818,24 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 			return nil, fmt.Errorf("node %s has no outputs", node.ID)
 		}
 		nodes[node.ID] = node
-		root := path.Join("nodes", node.Stage, node.ID)
-		entries = append(entries,
-			actionPlanEntry{path: path.Join(root, "kind", node.Kind)},
-			actionPlanEntry{path: path.Join(root, "recipe", node.Recipe)},
-			actionPlanEntry{path: path.Join(root, "tool", node.Tool)},
-			actionPlanEntry{path: path.Join(root, "product", node.Product)},
-		)
+		root := ""
+		if emitMarkers {
+			root = path.Join("nodes", node.Stage, node.ID)
+			appendEntries(&entries,
+				actionPlanEntry{path: path.Join(root, "kind", node.Kind)},
+				actionPlanEntry{path: path.Join(root, "recipe", node.Recipe)},
+				actionPlanEntry{path: path.Join(root, "tool", node.Tool)},
+				actionPlanEntry{path: path.Join(root, "product", node.Product)},
+			)
+		}
+		if node.InputSet != "" {
+			if err := validatePlanDigest("node input-set root", node.InputSet); err != nil {
+				return nil, fmt.Errorf("node %s: %w", node.ID, err)
+			}
+			if emitMarkers {
+				appendEntries(&entries, actionPlanEntry{path: path.Join(root, "in", "input-set", node.InputSet)})
+			}
+		}
 		for i, source := range node.Sources {
 			if _, ok := sources[source.SourceID]; !ok {
 				return nil, fmt.Errorf("node %s references unknown source %q", node.ID, source.SourceID)
@@ -2261,13 +2843,23 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 			if err := validatePlanName("source role", source.Role); err != nil {
 				return nil, err
 			}
-			entries = append(entries, actionPlanEntry{path: path.Join(root, "in", "source", source.Role, planOrdinal(i), source.SourceID)})
+			if emitMarkers {
+				appendEntries(&entries, actionPlanEntry{path: path.Join(root, "in", "source", source.Role, planOrdinal(i), source.SourceID)})
+			}
 		}
-		inputEntries, err := actionPlanPackedInputEntries(node, root, nodeOrdinals)
-		if err != nil {
-			return nil, err
+		if emitMarkers {
+			inputEntries, err := actionPlanPackedInputEntries(node, root, nodeOrdinals)
+			if err != nil {
+				return nil, err
+			}
+			appendEntries(&entries, inputEntries...)
+		} else {
+			for inputOrdinal, input := range node.Inputs {
+				if err := validateActionPlanNodeInput(node.ID, inputOrdinal, input); err != nil {
+					return nil, err
+				}
+			}
 		}
-		entries = append(entries, inputEntries...)
 		seenTrees := map[string]bool{}
 		for _, tree := range node.Trees {
 			if err := validatePlanName("input tree", tree); err != nil {
@@ -2277,7 +2869,9 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 				return nil, fmt.Errorf("node %s repeats input tree %q", node.ID, tree)
 			}
 			seenTrees[tree] = true
-			entries = append(entries, actionPlanEntry{path: path.Join(root, "in", "tree", tree)})
+			if emitMarkers {
+				appendEntries(&entries, actionPlanEntry{path: path.Join(root, "in", "tree", tree)})
+			}
 		}
 		seenTools := map[string]bool{}
 		primaryScope := "target"
@@ -2306,7 +2900,9 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 			if !scoped {
 				bindingForm = "unscoped"
 			}
-			entries = append(entries, actionPlanEntry{path: path.Join(root, "in", "tool", scope, role, bindingForm)})
+			if emitMarkers {
+				appendEntries(&entries, actionPlanEntry{path: path.Join(root, "in", "tool", scope, role, bindingForm)})
+			}
 		}
 		recipeToolsetScopes, err := actionRecipeToolsetScopes(recipe)
 		if err != nil {
@@ -2319,7 +2915,9 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 			if scope == "host" {
 				hasHostScopeNode = true
 			}
-			entries = append(entries, actionPlanEntry{path: path.Join(root, "in", "toolset", scope)})
+			if emitMarkers {
+				appendEntries(&entries, actionPlanEntry{path: path.Join(root, "in", "toolset", scope)})
+			}
 		}
 		for i, output := range node.Outputs {
 			if !LinuxKernelPlanTrees[output.Tree] {
@@ -2347,7 +2945,9 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 				}
 				canonicalOutputs[logicalKey] = node.ID
 			}
-			entries = append(entries, actionPlanEntry{path: path.Join(root, "out", output.Tree, planOrdinal(i), artifactPath)})
+			if emitMarkers {
+				appendEntries(&entries, actionPlanEntry{path: path.Join(root, "out", output.Tree, planOrdinal(i), artifactPath)})
+			}
 		}
 		wantSources := make([]string, len(node.Sources))
 		for i, edge := range node.Sources {
@@ -2368,10 +2968,21 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 	if hasHostScopeNode && p.Toolsets["host"] == "" {
 		return nil, fmt.Errorf("kernel action plan has host-scope stage nodes but no host toolset")
 	}
+	inputSetStore, inputSetEntries, err := validateAndEncodeActionPlanInputSets(p, nodes, sources, emitMarkers)
+	if err != nil {
+		return nil, err
+	}
+	appendEntries(&entries, inputSetEntries...)
 	for _, node := range p.Nodes {
-		bindings, err := actionPlanNodeInputBindings(node, nodes)
-		if err != nil {
-			return nil, err
+		var bindings ActionPlanInputBindings
+		if emitMarkers {
+			var err error
+			bindings, err = actionPlanNodeInputBindings(node, nodes)
+			if err != nil {
+				return nil, err
+			}
+		} else if len(node.Inputs) > maximumActionPlanInputBindingCount {
+			return nil, fmt.Errorf("input bindings contain %d entries, want at most %d", len(node.Inputs), maximumActionPlanInputBindingCount)
 		}
 		for _, input := range node.Inputs {
 			producer, ok := nodes[input.ProducerID]
@@ -2391,18 +3002,20 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 				)
 			}
 		}
-		bindingData, err := bindings.CanonicalJSON()
-		if err != nil {
-			return nil, fmt.Errorf("node %s input bindings: %w", node.ID, err)
+		if emitMarkers {
+			bindingData, err := bindings.CanonicalJSON()
+			if err != nil {
+				return nil, fmt.Errorf("node %s input bindings: %w", node.ID, err)
+			}
+			bindingDigest := sha256.Sum256(bindingData)
+			bindingID := hex.EncodeToString(bindingDigest[:])
+			appendEntries(&entries, actionPlanEntry{
+				path: path.Join("nodes", node.Stage, node.ID, "in", "bindings", bindingID+".json"),
+				data: bindingData,
+			})
 		}
-		bindingDigest := sha256.Sum256(bindingData)
-		bindingID := hex.EncodeToString(bindingDigest[:])
-		entries = append(entries, actionPlanEntry{
-			path: path.Join("nodes", node.Stage, node.ID, "in", "bindings", bindingID+".json"),
-			data: bindingData,
-		})
 	}
-	if err := validateActionPlanAcyclic(nodes); err != nil {
+	if err := validateActionPlanAcyclic(nodes, inputSetStore); err != nil {
 		return nil, err
 	}
 
@@ -2421,13 +3034,17 @@ func (p *ActionPlan) entries() ([]actionPlanEntry, error) {
 		if product.Path != LinuxKernelTreeRootMarker && canonicalOutputs[product.Tree+"/"+product.Path] == "" {
 			return nil, fmt.Errorf("product %q refers to unowned output %s/%s", product.Name, product.Tree, product.Path)
 		}
-		entries = append(entries, actionPlanEntry{path: path.Join("products", product.Name, "root", product.Tree, product.Path)})
+		if emitMarkers {
+			appendEntries(&entries, actionPlanEntry{path: path.Join("products", product.Name, "root", product.Tree, product.Path)})
+		}
 	}
 
-	sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
-	for i := 1; i < len(entries); i++ {
-		if entries[i-1].path == entries[i].path {
-			return nil, fmt.Errorf("plan repeats marker %q", entries[i].path)
+	if emitMarkers {
+		sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
+		for i := 1; i < len(entries); i++ {
+			if entries[i-1].path == entries[i].path {
+				return nil, fmt.Errorf("plan repeats marker %q", entries[i].path)
+			}
 		}
 	}
 	return entries, nil
@@ -2448,24 +3065,54 @@ func equalStringSets(left, right []string) bool {
 	return true
 }
 
-func validateActionPlanAcyclic(nodes map[string]ActionPlanNode) error {
-	state := map[string]byte{}
-	var visit func(string) error
-	visit = func(id string) error {
-		switch state[id] {
-		case 1:
-			return fmt.Errorf("kernel action plan contains a cycle at node %s", id)
-		case 2:
-			return nil
-		}
-		state[id] = 1
-		for _, input := range nodes[id].Inputs {
-			if err := visit(input.ProducerID); err != nil {
-				return err
+func validateActionPlanAcyclic(nodes map[string]ActionPlanNode, inputSets *ActionPlanInputSetStore) error {
+	const (
+		actionPlanGraphActionVertex byte = iota
+		actionPlanGraphInputSetVertex
+	)
+	type graphVertex struct {
+		kind byte
+		id   string
+	}
+	type graphFrame struct {
+		vertex    graphVertex
+		neighbors []graphVertex
+		next      int
+	}
+	state := map[graphVertex]byte{}
+	neighbors := func(vertex graphVertex) ([]graphVertex, error) {
+		switch vertex.kind {
+		case actionPlanGraphActionVertex:
+			node, ok := nodes[vertex.id]
+			if !ok {
+				return nil, fmt.Errorf("kernel action plan references unknown node %s", vertex.id)
 			}
+			result := make([]graphVertex, 0, len(node.Inputs)+1)
+			for _, input := range node.Inputs {
+				result = append(result, graphVertex{kind: actionPlanGraphActionVertex, id: input.ProducerID})
+			}
+			if node.InputSet != "" {
+				result = append(result, graphVertex{kind: actionPlanGraphInputSetVertex, id: node.InputSet})
+			}
+			return result, nil
+		case actionPlanGraphInputSetVertex:
+			inputSetNode, ok := inputSets.Node(vertex.id)
+			if !ok {
+				return nil, fmt.Errorf("kernel action plan references unknown input-set node %s", vertex.id)
+			}
+			result := make([]graphVertex, 0, len(inputSetNode.Children)+len(inputSetNode.Entries))
+			for _, child := range inputSetNode.Children {
+				result = append(result, graphVertex{kind: actionPlanGraphInputSetVertex, id: child.ID})
+			}
+			for _, entry := range inputSetNode.Entries {
+				if entry.ProducerID != "" {
+					result = append(result, graphVertex{kind: actionPlanGraphActionVertex, id: entry.ProducerID})
+				}
+			}
+			return result, nil
+		default:
+			return nil, fmt.Errorf("kernel action plan has unknown graph vertex kind %d", vertex.kind)
 		}
-		state[id] = 2
-		return nil
 	}
 	ids := make([]string, 0, len(nodes))
 	for id := range nodes {
@@ -2473,16 +3120,59 @@ func validateActionPlanAcyclic(nodes map[string]ActionPlanNode) error {
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
-		if err := visit(id); err != nil {
+		root := graphVertex{kind: actionPlanGraphActionVertex, id: id}
+		if state[root] == 2 {
+			continue
+		}
+		rootNeighbors, err := neighbors(root)
+		if err != nil {
 			return err
+		}
+		state[root] = 1
+		stack := []graphFrame{{vertex: root, neighbors: rootNeighbors}}
+		for len(stack) != 0 {
+			frame := &stack[len(stack)-1]
+			if frame.next == len(frame.neighbors) {
+				state[frame.vertex] = 2
+				stack = stack[:len(stack)-1]
+				continue
+			}
+			next := frame.neighbors[frame.next]
+			frame.next++
+			switch state[next] {
+			case 1:
+				if next.kind == actionPlanGraphActionVertex {
+					return fmt.Errorf("kernel action plan contains a cycle at node %s", next.id)
+				}
+				return fmt.Errorf("kernel action plan contains a cycle through input-set node %s", next.id)
+			case 2:
+				continue
+			}
+			nextNeighbors, err := neighbors(next)
+			if err != nil {
+				return err
+			}
+			state[next] = 1
+			stack = append(stack, graphFrame{vertex: next, neighbors: nextNeighbors})
 		}
 	}
 	return nil
 }
 
 func writeActionPlanTree(outputDir string, entries []actionPlanEntry) error {
+	return writeActionPlanTreeUsingRename(outputDir, entries, os.Rename)
+}
+
+func writeActionPlanTreeUsingRename(
+	outputDir string,
+	entries []actionPlanEntry,
+	rename func(string, string) error,
+) error {
 	if strings.TrimSpace(outputDir) == "" {
 		return fmt.Errorf("kernel action plan output directory must not be empty")
+	}
+	if rename == nil {
+		return fmt.Errorf("kernel action plan rename function must not be nil")
 	}
 	outputDir = filepath.Clean(outputDir)
 	precreated := false
@@ -2514,55 +3204,126 @@ func writeActionPlanTree(outputDir string, entries []actionPlanEntry) error {
 			_ = os.RemoveAll(tmp)
 		}
 	}()
-	// The marker tree has many files below a comparatively small directory
-	// prefix graph. Calling MkdirAll for every marker repeatedly stats the same
-	// ancestors and dominates large kernel plans on remote filesystems. Since
-	// tmp is private and initially empty, create each directory exactly once.
-	createdDirectories := map[string]bool{tmp: true}
-	var ensureDirectory func(string) error
-	ensureDirectory = func(directory string) error {
-		if createdDirectories[directory] {
-			return nil
-		}
-		parent := filepath.Dir(directory)
-		if parent != directory {
-			if err := ensureDirectory(parent); err != nil {
-				return err
+	// The marker tree has many tiny files below a comparatively small directory
+	// prefix graph. Create each directory once, one depth at a time, then write
+	// independent leaves concurrently. This preserves deterministic bytes and
+	// parent-before-child ordering while avoiding serialized remote-filesystem
+	// latency for tens of thousands of markers.
+	filenames := make([]string, len(entries))
+	directoriesByDepth := map[int]map[string]bool{}
+	maximumDepth := 0
+	for index, entry := range entries {
+		filename := filepath.Join(tmp, filepath.FromSlash(entry.path))
+		filenames[index] = filename
+		for directory := filepath.Dir(filename); directory != tmp; directory = filepath.Dir(directory) {
+			relative, err := filepath.Rel(tmp, directory)
+			if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("kernel action plan marker %q escapes its output tree", entry.path)
+			}
+			depth := strings.Count(relative, string(filepath.Separator)) + 1
+			if directoriesByDepth[depth] == nil {
+				directoriesByDepth[depth] = map[string]bool{}
+			}
+			directoriesByDepth[depth][directory] = true
+			if depth > maximumDepth {
+				maximumDepth = depth
 			}
 		}
-		if err := os.Mkdir(directory, 0o755); err != nil {
-			return err
-		}
-		createdDirectories[directory] = true
-		return nil
 	}
-	for _, entry := range entries {
-		filename := filepath.Join(tmp, filepath.FromSlash(entry.path))
-		if err := ensureDirectory(filepath.Dir(filename)); err != nil {
+	workers := runtime.GOMAXPROCS(0) * 2
+	if workers < 8 {
+		workers = 8
+	}
+	if workers > 32 {
+		workers = 32
+	}
+	for depth := 1; depth <= maximumDepth; depth++ {
+		directories := slices.Sorted(maps.Keys(directoriesByDepth[depth]))
+		if err := runParallelActionPlanTasks(len(directories), workers, func(index int) error {
+			return os.Mkdir(directories[index], 0o755)
+		}); err != nil {
 			return err
 		}
-		if err := os.WriteFile(filename, entry.data, 0o644); err != nil {
-			return err
-		}
+	}
+	if err := runParallelActionPlanTasks(len(entries), workers, func(index int) error {
+		return os.WriteFile(filenames[index], entries[index].data, 0o644)
+	}); err != nil {
+		return err
 	}
 	if precreated {
 		children, err := os.ReadDir(tmp)
 		if err != nil {
 			return err
 		}
-		for _, child := range children {
-			if err := os.Rename(filepath.Join(tmp, child.Name()), filepath.Join(outputDir, child.Name())); err != nil {
-				return err
+		moved := make([]string, 0, len(children))
+		rollback := func(cause error) error {
+			result := cause
+			for index := len(moved) - 1; index >= 0; index-- {
+				name := moved[index]
+				if err := rename(filepath.Join(outputDir, name), filepath.Join(tmp, name)); err != nil {
+					result = errors.Join(result, fmt.Errorf("roll back published action-plan child %q: %w", name, err))
+				}
 			}
+			return result
+		}
+		for _, child := range children {
+			name := child.Name()
+			if err := rename(filepath.Join(tmp, name), filepath.Join(outputDir, name)); err != nil {
+				return rollback(fmt.Errorf("publish action-plan child %q: %w", name, err))
+			}
+			moved = append(moved, name)
 		}
 		if err := os.Remove(tmp); err != nil {
-			return err
+			return rollback(fmt.Errorf("remove published action-plan staging directory: %w", err))
 		}
-	} else if err := os.Rename(tmp, outputDir); err != nil {
+	} else if err := rename(tmp, outputDir); err != nil {
 		return err
 	}
 	published = true
 	return nil
+}
+
+func runParallelActionPlanTasks(count, workers int, task func(int) error) error {
+	if count == 0 {
+		return nil
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > count {
+		workers = count
+	}
+	jobs := make(chan int)
+	var wait sync.WaitGroup
+	var mutex sync.Mutex
+	var firstErr error
+	wait.Add(workers)
+	for range workers {
+		go func() {
+			defer wait.Done()
+			for index := range jobs {
+				mutex.Lock()
+				failed := firstErr != nil
+				mutex.Unlock()
+				if failed {
+					continue
+				}
+				if err := task(index); err != nil {
+					mutex.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mutex.Unlock()
+				}
+			}
+		}()
+	}
+	for index := range count {
+		jobs <- index
+	}
+	close(jobs)
+	wait.Wait()
+	return firstErr
 }
 
 func planOrdinal(value int) string { return fmt.Sprintf("%08d", value) }

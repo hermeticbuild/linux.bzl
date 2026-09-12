@@ -562,6 +562,12 @@ Every base and variant package exposes the same projection labels:
 | `:modules_builtin` | Deterministic built-in module inventory |
 | `:modules_builtin_modinfo` | Deterministic built-in module metadata |
 
+The `:config` label and the `config` output group resolve Kconfig directly from
+the measured compiler environment and configured source/overlay inputs. They do
+not require family guard discovery, kernel objects, or final image linking.
+`LinuxKernelInfo` and module SDKs retain the final execution configuration; the
+early public projection does not replace their configured object-tree inputs.
+
 The `:kernel` target's `DefaultInfo` contains one native image: x86_64
 uses `bzImage`, aarch64 uses `Image`, and armv7 uses `zImage`. This output can
 be used directly by packaging and VM rules without selecting an output group. When no
@@ -620,14 +626,450 @@ are Bazel inputs, temporary paths are action-local, timestamps and release
 metadata are normalized, and source downloads require integrity. Remote cache
 and executor settings belong to the consuming workspace or CI environment;
 this repository does not prescribe a service.
+Source-owned metadata scripts receive stable `KBUILD_BUILD_USER` and
+`KBUILD_BUILD_HOST` defaults of `bazel`; explicit nonempty values remain declared
+Make inputs instead of being discovered from the remote worker.
 
-## Cache behavior
+## Cache and in-invocation reuse behavior
 
-Source and object actions are separate, so changing one source file does not
-invalidate a monolithic kernel-build action. The content-addressed plan records
-the exact TreeFile dependencies expanded by `map_directory`; Bazel schedules
-and caches those actions individually. Public base and variant labels remain
-unchanged even though their action graph is discovered at execution time.
+For supported precise kernel compiler actions--C, C++, and compiler-preprocessed
+assembly--the content-addressed plan records the exact immutable translation
+unit and header TreeFiles expanded by `map_directory`. Bazel schedules and
+caches the source projection and object actions individually, so an edit
+invalidates only objects whose projected closure contains that source. This
+exact source-edit reuse does not currently extend to Rust or source namespaces
+outside the kernel tree; unsupported action shapes remain opaque.
+
+The base image and all named overlays are reduced symmetrically into one family
+graph. Structurally equivalent variant instances first union their exact source
+and config dependencies, then receive semantic node identities independent of
+variant order and variant-specific storage paths. Identical semantic inputs
+therefore select one node and action across configurations. Within one Bazel
+invocation, that shared action is part of the graph once; this is graph
+deduplication, not an action-cache lookup or hit. Variant-specific Kbuild probe
+fragments are likewise merged into one deterministic, content-addressed union
+plan, expanded once with the host execution owner and once with the target
+execution owner.
+
+Generated-input reuse starts with an initial family plan and ends with a
+verified replay. The initial plan records the
+ordinary generated headers that stop dependency analysis and declared auxiliary
+executables used by complete compiler recipes, reduces the complete family with
+full configuration inputs, and selects a bounded dependency-closed set of
+generators. Executable candidates must serve an already-precise compiler or a
+compiler with a recorded generated-header demand; completeness alone does not
+make an otherwise opaque compiler a prospective sharing benefit.
+An optional numeric-header tier also considers exact declared bindings of
+opaque compilers, independently of where their source scan stopped. It checks
+the original configured generator contract; a bound path is neither a read
+receipt nor proof that the header is configuration-independent.
+After those actions complete, replay reads their actual output bytes
+while checking the original lowering and tool/config contracts. Precise consumers
+can then stage equal byte/mode-addressed headers at their original include paths,
+independently of the generating variant. Header receipts alone never authorize
+changes to executable, sequence, auxiliary-command, or observed-state dependencies.
+
+A separate executed-artifact observation authenticates every selected action's
+complete output vector, including executable permissions and sidecar writer
+identities. For a precisely analyzed, complete compiler envelope, an executable
+at its unchanged declared staging path can be replaced by an exact content-backed
+copy. Exclusively internal sidecar-base inputs can use the same mechanism, but
+their original envelope bytes and writers are preserved: equal payloads from
+different writers are not equal states. Sequence edges, public views, ambiguous
+aliases, mutable staging paths, and unsupported consumers retain their original
+dependencies. The content tree is only a lookup catalog for `map_directory`;
+each copy/compiler action receives its exact child files, not the whole catalog.
+
+Planner-owned sidecars in the public metadata tree can also feed exclusively
+internal compiler state. Their original producers and public views remain
+unchanged; authenticated consumer copies use the private prehost tree. This is
+disabled when a whole-prehost-tree consumer could acquire those new copies as
+additional inputs. Present/deleted states retain their exact writer records,
+and neither equal payloads nor metadata filenames alone establish equivalence.
+The initial cut considers these sidecar generators for already-precise compilers
+and consumers of prospective header/executable groups. It selects ordinary
+producer outputs and observes their complete output vectors; a sidecar is never
+treated as a generated header. A validation-private ordinary root retains both
+generator versions and their exact byte-comparison obligation in the cut, without
+becoming public. Exhausting this optional discovery budget leaves
+the original header/executable candidates intact.
+
+Selection groups corresponding logical prerequisites across variants and
+prioritizes the number of compiler instances they could unblock. A group's
+complete dependency closure must fit the execution budget and either increase
+the number of prospective consumers outside that closure, or complement an
+already selected consumer without newly pinning any previously useful compiler.
+This admits a header and executable needed by the same compiler without trading
+away an existing sharing opportunity for an equal-count late dependency.
+After this baseline selection, numeric-header groups may additionally pin
+prerequisite compilers when their unique remaining consumer opportunities
+number at least the newly pinned compiler nodes. The complete closure still
+has to fit the same budgets. This scheduling heuristic does not guarantee a
+net reuse improvement: pinning preserves conservative identities, and the
+production reuse regression gate remains the acceptance check.
+Selection is deterministic and bounded to 128 group attempts, without filename
+or toolchain allowlists. Rejected groups remain conservative; exceeding
+an optimization budget does not fail an otherwise valid build. Malformed
+contracts still fail validation.
+
+Before publishing the final graph, replay verifies that every pre-executed
+action still has exactly the same semantic identity and complete output vector.
+The final expansion copies all its slots, including sidecars, without rerunning
+its recipe or rewriting provenance. Verification gates template expansion; its
+whole-family seal is not an input to every compiler action. An unrelated change
+to that seal therefore does not by itself invalidate unchanged compiler inputs.
+Authenticated execution roots retain generators even when replacing a header
+removes their last compiler edge; this adds no compiler inputs or public views.
+This is a first-frontier observation pass, not an assumption that all generated
+headers have become known: unresolved or unsupported consumers remain opaque,
+and an execution-cut mismatch fails before final graph publication.
+
+The family plan is split into four execution shards: `prehost={prehost}`,
+`bootstrap={bootstrap}`, `host={host}`, and `target={prep,target}`. Each shard
+retains the shared lexical node index and toolsets, but carries only its local
+nodes, referenced recipes, sources, and Kconfig capsule bytes; compact
+descriptors hand prior-shard outputs forward.
+
+Materialized input sets are persistent, content-addressed radix trees rather
+than duplicated lists of every ancestor's files. Consumers and variants share
+unchanged subtrees, while each entry preserves its exact source or producer
+output and target namespace. Consumer-specific usage flags are projected through
+a shared immutable-subtree cache and sparse path updates. A bounded store-local
+cache also reuses conflict-free unions; conflicting inputs still go through the
+caller's resolver on every merge. This bounds retained frontier state by unique
+subtrees; some path-sensitive analysis still creates temporary flattened views,
+so it does not make every planning pass linear.
+
+Family recipe actions retain the same exact manifest, source, and producer
+leaf inputs while transporting their bindings compactly. One typed root
+manifest locates its content-addressed child witnesses; one already-declared
+producer leaf per physical store anchors its provenance-addressed layout.
+Bounded ordinal packs assign the verified producer keys to those stores.
+Staging destinations never locate artifacts, whole stores are not added as
+inputs, and Bazel still maps the typed anchors using the complete action input
+set. Distinct configured stores may remain distinct or legally converge under
+path mapping. This reduces argument transport, not dependency requirements or
+the proof needed for cross-config compiler reuse.
+
+Large recipe argument vectors use explicit, bounded JSON chunks because Bazel
+9.1/9.2 action templates drop `Args.use_param_file` settings. Small actions keep
+their direct arguments. Chunk writers retain the consumer's complete input and
+tool closures so both actions make the same path-mapping decision, including
+when cross-configuration input paths collide. This adds transport actions for
+large nodes; it does not change recipe identity or increase compiler reuse.
+
+For precise compiler nodes, the planner scans the translation unit and literal
+include closure for `CONFIG_*` references and stages a filtered six-file
+Kconfig capsule: the resolved `.config`, `auto.conf`, `auto.conf.cmd`,
+`autoconf.h`, `rustc_cfg`, and `kernel.release`. Each translation unit starts
+from the selected configured compiler's probed predefines and configured and
+source-selected `-D`/`-U` operations. Because a predefine dump does not enumerate
+every compiler builtin, the planner also collects a bounded set of reserved
+macro names from immutable source conditional directives and asks the selected
+compiler whether each is defined. Source discovery supplies query hints, not
+absence proofs; unsupported or unqueried names stay unknown. Family variants
+share this source-name inventory for one sequential planning action, keyed by
+their immutable source-root bindings. Each variant retains its own name union
+and compiler queries and answers; the inventory does not persist across actions.
+
+After the selected generator cut completes, three bounded supplemental rounds
+can discover additional names from the complete bytes of source and generated
+headers actually entered by the scanner, including an opaque stop or a header
+cache hit. Literal `defined(...)` expressions are included. This does not walk
+the source tree again. Names already covered by measured initial facts are not
+queried again. Each round executes a separate frozen host/target probe plan;
+it does not relax missing-result errors in the original Kbuild workload.
+Replay checks exact query membership, toolsets, ordered compiler context, and
+the current measured values of symbolic argument dependencies before applying
+answers to a fresh initial namespace. Source `#define`/`#undef` operations still
+take effect in their original order. These answers authorize no source reads
+or generated-header substitutions by themselves: the original lowering,
+executed cut, and current source closure are still verified independently.
+Unavailable generated inputs outside the selected cut and exhausted query
+budgets retain the conservative fallback; the rounds do not expand that cut.
+If a completed round has no queries and its validated probe plan is empty,
+later discovery rounds carry that empty work forward without repeating
+per-variant lowering and scanning. This relies on the rule-owned chain's
+identical immutable inputs, not a source-convergence claim in the manifest.
+Existing input loaders and cut validation still run; final replay performs
+all per-variant config, lowering, current-source, and frozen-query checks.
+Truncated rounds do not take this shortcut.
+
+When complete macro-call analysis stops at an actually requested reserved name
+whose initial compiler binding is still unknown, it can also register an
+optional definedness attempt. This observes the first unknown expansion; it
+does not continue past that stop, inspect unused macro bodies, or grant facts
+from a source spelling. The configured compiler must successfully answer the
+complete vector before any of its names become known. A normal nonzero compiler
+exit makes only that exact attempt unqueryable and supplies no answers, even
+if it wrote partial output. Other vectors and singleton queries remain
+independent. Missing, malformed, signaled, skipped, or stale results remain
+errors; prior accepted and rejected attempts are replay-validated alike.
+
+The same rounds can measure C/C++ `__has_attribute(identifier)` and
+`__has_builtin(identifier)` calls from entered files. Value-sensitive queries
+preserve exact `-D` bodies and return the compiler's integer tokens, not merely
+their truth values. Each round batches reached `(operator, operand)` pairs for
+one exact compiler context into a single action. Its sorted result vector is
+validated in full before
+any answer is admitted; overlapping batches must agree and retain their
+contributing request identities. The round's v4 manifest stores each exact
+compiler context once; query kinds and sibling configs reference that shared
+argument/environment descriptor. Only storage is shared: every variant still
+replays each query against its own current dependencies and toolsets.
+Budgets separately bound 8,192 unique complete query descriptors, 32,768
+per-variant memberships, values, compact discovery data (32 MiB), serialized
+data (64 MiB), and expanded replay descriptors (128 MiB). The latter two
+membership/work allowances are fixed, not multiplied by family size; these
+are not total process-memory limits. Overflow in the existing directive and
+intrinsic frontier discards that whole new frontier. Optional expansion demands
+are staged separately: every variant's existing frontier finishes before
+deterministic whole-query admission spends the remaining capacity. An optional
+staging or admission limit omits that optional work without truncating the
+existing frontier or relaxing prior-result validation. Retained optional plans
+have separate structural and encoded-size bounds, not a total heap bound.
+Ordinary logs distinguish whole-frontier truncation from optional omission;
+published query counters include admitted optional queries, while omission
+events are not a count of omitted names or distinct queries.
+The optional `compiler_guards` output group exposes the canonical round
+manifests for query-count and truncation diagnostics, without downloading
+compiler result trees. It does not substitute for building kernel outputs.
+For a first-round limit investigation, `compiler_guard0_manifest` requests only
+that round's manifest; it does not demand later rounds or final kernel outputs.
+The source interpreter admits an answer only when measured initial definedness
+and the absence of a textual predefinition establish the original intrinsic
+binding. Each operator's availability is established independently; textual
+fallbacks remain ordinary macros. For each operator, any subsequent definition,
+undefinition, or unknown header effect revokes that binding. Operands must be
+proven currently undefined single identifiers, and the query freezes that
+operand against initial macro re-expansion. Missing
+answers grant no precision. Assembly, file-sensitive operators such as
+`__has_include`, and other unmodeled calls remain conservative. The optional
+completed-analysis cache is bypassed when intrinsic answers are attached;
+ordinary final artifact sharing still uses the verified dependency result.
+
+Measured answers participate in macro-state and cache identities. The
+interpreter processes forced headers
+in preprocessing order (`-imacros` before `-include`), then carries the resulting
+macro state through the translation unit and its ordinary include closure.
+Boolean combinations of `defined(...)` tests are evaluated from that state.
+The fast scanner inspects replacement bodies for literal `CONFIG_*` aliases.
+When a reachable token paste prevents precision, a bounded second pass can
+prove the complete ordered macro-call stream. It retains exact definition
+text and origin, restores final compiler `-D`/`-U` values after the shared
+definedness probe, and expands every active ordinary-text span and conditional
+expression. Conditional arithmetic uses a checked, portable signed-integer
+subset; unsigned conversions, overflow, language-dependent keywords, and
+unproved identifiers remain unsupported. This pass
+bypasses definedness-only header caches and requires a single translation
+unit with `-nostdinc`; unknown compiler bindings, unresolved conditions,
+unsupported expansion forms, or incomplete include coverage reject the entire
+proof. Self-references use token-local suppression across argument prescan and
+replacement rescans; pasting a suppressed token and calls spanning source or
+replacement boundaries remain unsupported. No successful prefix grants reuse.
+An independent, lower-priority observer inventories leading-underscore names
+in already-opened source and authenticated generated headers. Its cached,
+bounded inventory includes ordinary tokens and supported literal replacement
+bodies, including later and inactive spans, but excludes bound macro formals,
+strings, comments, and include operands in the entered-file inventory.
+Each compilation unit selects complete file inventories within the existing
+limits, ordered by original token work and then exact file identity. Oversized
+or incomplete files supply no hints; aggregate overflow stops selection without
+discarding earlier complete files. Cached inventories retain their original
+work charge. Baseline queries and actual demands retain their separate admission
+rules. Family-stage omission counters do not count these local omissions.
+After entered files, remaining optional budget may inspect literal-include
+candidates, including later or inactive includes, with the original lookup
+order and input ownership. Candidate lookup has separate mutable state and
+does not add entered files, CONFIG dependencies, source paths, or read receipts.
+These candidates can also supply reserved names in conditional operands, but
+never intrinsic answers or computed include paths. Traversal, cycles, reads,
+directive visits and lookups are bounded; cached reads retain their work charge.
+Missing, oversized, unsupported or uninspectable candidates supply no facts and
+cannot discard already-emitted hints. Generated origins still require the
+existing authenticated observed-cut bytes before any query is admitted.
+These are hints for future compiler measurements,
+not expansion reads or assumed negative answers. Their optional query vectors
+are separate from actual first-unknown demands and exclude higher-priority
+names. All configs' existing queries and expansion demands are admitted before
+entered-file token hints, followed by speculative literal-include hints, use
+the remaining fixed frontier capacity. These last two tiers have separate query
+vectors and staging ledgers; their retained plans share the original size and
+node limits. A later config's stronger work may evict speculative hints, never
+the reverse. Each tier retains one shared immutable probe graph across configs,
+so identical dependency closures consume its staging budget only once. Each
+config keeps its original allowed terminals; selecting its admitted work cannot
+pull in another config's private probes. A rejected hint vector
+supplies no facts and cannot poison a separate demanded-name attempt. Fresh
+complete source replay is still required after successful measurements.
+Within each variant and optional tier, equivalent definedness contexts schedule
+each pending name once, retaining original raw descriptors and finite residual
+vectors. Priority also applies across these equivalent contexts. A previously
+rejected vector disables this scheduling optimization for its context class;
+it neither rejects a separate singleton nor grants any per-name facts. Bounded
+scheduling indexes reset per variant and never initialize the source namespace.
+Measured definedness answers use the same object-like `-D` value projection
+as their compiler queries, allowing equivalent queries to share answers across
+compilation units. Original macro replacements are restored for each unit's
+source analysis; value-sensitive intrinsic queries keep their exact context.
+Macro-debug options which can record unused definitions retain the full config
+capsule, including when they occur in configured compiler arguments.
+Dollar punctuation requires an
+executed compiler probe with the projected invocation's language, ordered
+options, and environment. Neither an option spelling nor a compiler-family
+name grants this capability; a negative or unavailable result retains the
+conservative fallback. This initial
+bounded coverage does not yet prove general Linux C/assembly translation units.
+Source-bearing compiler-driver links also retain the full-config fallback when
+their configured prefix, suffix, or environment differs from the compile-only
+contract used by initial-state probes.
+Unproved dynamically constructed config names, dynamic includes, preprocessor
+behavior outside the supported model,
+unsafe compiler controls, source scripts, `CONFIG_MODVERSIONS`, and other
+inputs that cannot be proved safe fail closed to the full resolved config and
+ordinary per-config execution.
+
+Bounded analysis-local caches memoize supported forced-header prefixes and
+eligible source-header includes directly reached from a translation unit,
+including their nested closures. Hits validate the applicable compiler context,
+consumed macro state, and live include-resolution and binding witnesses before
+replaying recorded macro effects. Cache misses and admission-limit failures use
+normal interpretation; they do not themselves make an action opaque. This is
+planner memoization, separate from graph deduplication and Bazel artifact
+caching. It neither relaxes precision requirements nor supplies runtime
+cache-hit statistics to the reuse report.
+
+Generated text needed by that include analysis is handled without a
+generator-name table. A statically bounded Kbuild recipe may be measured with
+the selected script runtime, configured tool proxies, declared immutable source
+inputs, and the exact source-exported environment. The planner substitutes its
+bytes only when target and host scopes agree and the probe proves the recipe has
+one ordinary output, no other filesystem effect, no transient execution path,
+and bounded runtime and size. Any unsupported or inconclusive recipe remains a
+normal mapped Kbuild action and keeps conservative per-configuration inputs.
+
+Config projection for an AWK file-check generator additionally requires a
+bounded source-language proof: literal affirmative config selectors, an exact
+file-counter initialization and increment, and immutable nonempty inputs before
+the final config operand. Unsupported syntax or unproven input bindings retain
+the full config. Eligible generators still compare their projected output with
+the full-config output at execution time; projection never bypasses that check.
+
+Unknown recipe environment variables remain byte-exact in the probe identity,
+while Linux Make/script variables whose effects are already present in compiler
+argv are omitted. Locale and `SOURCE_DATE_EPOCH` may change diagnostics or
+ordinary macro replacement text, but cannot change the defined-name set or
+introduce a literal `CONFIG_*` alias in the supported model, so they are also
+omitted. The selected tool action's configured environment is installed by the
+same identity-bound proxy for the real compile and the probe. Known
+argument-injection, config-file, dynamic-loader, and interpreter controls fail
+closed; wrappers with hidden flag semantics must expose those flags in their
+configured action argv. A host compiler action whose retained source-exported
+environment depends on target-only probe state likewise falls back to opaque,
+per-configuration execution instead of crossing execution scopes.
+
+Each precise compiler action receives an action-private kernel tree containing
+only its exact source closure. Its root Kconfig is excluded from the spawn
+inputs through the exact-source anchor, while opaque actions keep the complete
+source and resolved-config closures. Opaque kernel readers receive the complete
+source closure through one shared, source-repository runfiles aggregate. Its
+root mappings are checked against the caller's exact original Bazel Files,
+including the root marker; an exec-configured wrapper resolving a generated
+input to a different File is rejected. No source bytes are copied, and precise
+actions do not acquire the aggregate. This lets Bazel retain aggregate upload
+state instead of treating the complete source tree as a flat input list for
+every opaque action. It does not narrow dependencies, prove additional compiler
+reuse, or change the runner's restrictions on copied working trees.
+Opaque readers now see the aggregate's physical source path. Source-owned
+filename/debug prefix-map flags are expanded against that same root; without
+such flags, compiler-emitted filenames and debug paths can reflect the new
+location. This transport change does not promise byte-identical objects to the
+previous physical layout.
+
+The target shard also emits exact
+variant-view markers. One batched projection action per non-empty
+`(variant, tree)` consumes those markers and the corresponding
+content-addressed TreeFiles, then copies the public facade outputs while
+preserving executable mode. Public base and variant labels remain unchanged.
+
+Each configured kernel exposes a machine-readable reuse report through the
+`reuse_report` output group. It reports planned in-invocation graph
+deduplication: variant instances, unique and shared nodes, reused instances,
+pairwise compile/archive-node and recognized compiler-node reuse rates, and the
+subset of compiler actions whose source/object/config closure was analyzed
+precisely. The precise-compiler coverage rate measures analyzer coverage;
+effective precise reuse measures precisely analyzed shared nodes against the
+complete recognized compiler-node population. The report also includes node
+membership groups and grouped opaque fallback reasons. Schema v2 records the
+canonical host and target toolset identities plus one typed, precision-marked
+membership record per semantic node, so consumers can reconstruct every
+aggregate instead of trusting summary counters alone.
+
+Observed replay also reports an `observed_header_frontier`: exact generated
+producer/slot bindings that still stop analysis, including whether their bytes
+were already observed or their producers already executed. These diagnostics
+describe the per-variant replay plans before pruning, not the final live-node
+totals. Explicit truncation flags distinguish incomplete collection from an
+empty frontier; none of these diagnostic fields authorize reuse.
+
+These are static planner counts and ratios for the emitted image-family graph.
+They are not local, disk, or remote action-cache hit rates, and they do not
+measure actions executed, wall time, probe generation, planning, facade
+projection, or other Bazel actions outside that graph. Runtime cache behavior
+must be measured separately from Bazel execution metrics. The fallback reasons
+make a lost planned-reuse opportunity attributable to a specific unsupported
+include or action shape instead of reporting only a zero rate:
+
+```sh
+bazel build @example_kernel//:kernel --output_groups=+reuse_report
+```
+
+For dependency diagnostics, `--output_groups=plan_snapshots` builds only the
+resolved per-variant planner snapshots, not kernel objects or images. These
+compressed internal snapshots retain exact producer/slot edges, persistent input
+sets, and config-dependency classifications before family reduction. The `plan`
+output group instead exposes the reduced execution-plan shards and therefore
+requires the selected generator cut to execute before observed replay. Neither
+group is a substitute for building the real targets when measuring performance.
+
+Ordinary compiler-probe discovery registers requests without retaining discarded
+dependency annotations. An exact, already registered but unavailable compiler
+state lets discovery skip the source scan that would stop at that same request;
+unmatched compiler invocations still use the full admission checks. Supplemental
+guard-only rounds freshly lower and verify the original graph and scan the
+authenticated generated headers, but do not finalize a graph or publish reuse
+evidence. Final family replay still performs the full analysis, content
+addressing, and evidence sealing before any cross-config substitution.
+
+For planner CPU diagnostics, `--output_groups=compiler_guard1_cpu_profile`
+samples the second supplemental guard round for up to 180 seconds using its
+original inputs, arguments, environment and execution platform. It requires the
+initial generator cut and first guard round, but not later rounds or final
+replay. Only the CPU profile is published; disposable planner outputs are never
+accepted as build results. This opt-in action bypasses its own cache without
+changing normal planner actions or default outputs. Inspect the resulting
+`.compiler-guards-1.cpu.pprof` with `go tool pprof -top` before using it: capture
+checks the complete gzip stream, while pprof validates the profile itself.
+A bounded CPU sample is not a completed-kernel timing or a cache-hit measurement.
+
+For allocation-stack attribution at the same bounded round-1 workload, use
+`--output_groups=compiler_guard1_heap_profile`. This separate diagnostic action
+uses a heap-enabled planner binary with the same planning sources and original
+inputs, arguments, environment and platform. It publishes only
+`.compiler-guards-1.heap.pprof`; the CPU profile that drives its 180-second
+lifecycle and disposable planner outputs remain private. Both profiles must
+finish within the supervisor's existing 15-second flush margin.
+
+Heap capture does not force a GC or change the sampling rate. The profile
+reflects Go's sampled, most recently published GC accounting, which can lag
+current allocations; it is not an exact `HeapAlloc` measurement or a retaining
+reference graph. Existing CPU phase labels do not label heap samples.
+Validate and inspect it with `go tool pprof -sample_index=inuse_space -top`
+and `go tool pprof -sample_index=alloc_space -top` before drawing conclusions.
+Allocation totals cover the process lifetime, not just the CPU sample window.
+The ordinary planner has no heap-writer binding; only the diagnostic binary
+retains heap profiling code. Adding the inert shared hook changes ordinary tool
+digests once, but does not add heap sampling, flags or outputs to normal actions.
 
 For x86 boot images, the resolved config must select a supported payload
 compression mode. Unsupported modes fail during execution-time planning rather
@@ -658,21 +1100,25 @@ The standalone compatibility suites exercise the runtime contracts:
 
 ```sh
 cd e2e
-bazel test //boot:init_test //cmd/qemuboot:qemuboot_test
+bazel test //boot:init_test //internal/modversions:modversions_test \
+  //cmd/qemuboot:qemuboot_test
 bazel shutdown
 bazel test //:linux_6_12_96_x86_64_boot_test \
-  //:linux_6_12_96_x86_64_module_test
+  //:linux_6_12_96_x86_64_module_test \
+  //:modversions_6_12_96_x86_64_build_test
 bazel shutdown
 bazel test //:linux_6_12_96_aarch64_boot_test \
   //:linux_6_12_96_aarch64_module_test
 bazel shutdown
 bazel test //:kernel_outputs_x86_64_build_test \
   //:linux_6_18_39_x86_64_boot_test \
-  //:linux_6_18_39_x86_64_module_test
+  //:linux_6_18_39_x86_64_module_test \
+  //:modversions_6_18_39_x86_64_build_test
 bazel shutdown
 bazel test //:kernel_outputs_aarch64_build_test \
   //:linux_6_18_39_aarch64_boot_test \
-  //:linux_6_18_39_aarch64_module_test
+  //:linux_6_18_39_aarch64_module_test \
+  //:modversions_6_18_39_aarch64_build_test
 bazel shutdown
 bazel test //:linux_6_12_96_rust_module_test \
   //:linux_6_12_96_aarch64_rust_module_test \
@@ -691,6 +1137,12 @@ kernel in a fresh Bazel server to bound peak analysis memory. Aya's x86_64 and
 aarch64 VMs intentionally run in one Bazel invocation. These
 are separate Bzlmod roots because each consumer owns its Rust toolchain: the
 e2e workspace registers stable Rust 1.97.0, while Aya keeps its pinned nightly.
+
+The MODVERSIONS suites retain their build checks and also compare the built
+modules' version records against their producers' `Module.symvers`. Each boots
+the matching MODVERSIONS kernel, requires it to reject a copy of the external
+module with an altered `module_layout` CRC, and then loads the original module.
+CRC values come from the selected compiler's actual build, not fixed fixtures.
 
 ## Development
 

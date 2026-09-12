@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "modversions",
+    srcs = ["modversions.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/e2e/internal/modversions",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "modversions_test",
+    srcs = ["modversions_test.go"],
+    embed = [":modversions"],
+    pure = "on",
+)

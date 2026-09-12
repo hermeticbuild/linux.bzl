@@ -1,10 +1,51 @@
 package kconfig
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestCanonicalSourceCommandSourceAndUnrelatedOperands(t *testing.T) {
+	directory := t.TempDir()
+	root := filepath.Join(directory, "linux")
+	alias := filepath.Join(directory, "alias")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(root, alias); err != nil {
+		t.Fatal(err)
+	}
+	evaluator := &LinuxProbeEvaluator{sourceRoot: alias}
+	for _, test := range []struct{ input, want string }{
+		{"", ""},
+		{"__KERNEL__", "__KERNEL__"},
+		{"-DNAME=value", "-DNAME=value"},
+		{"${result:00000000.text}", "${result:00000000.text}"},
+		{alias, alias},
+		{alias + "/include", "__LINUX_BZL_SOURCE_TREE__/include"},
+		{root + "/include", "__LINUX_BZL_SOURCE_TREE__/include"},
+		{"-I" + root + "/include", "-I__LINUX_BZL_SOURCE_TREE__/include"},
+		{alias + "-sibling/include", alias + "-sibling/include"},
+		{"/unrelated/include", "/unrelated/include"},
+	} {
+		if got := evaluator.canonicalSourceCommand(test.input); got != test.want {
+			t.Errorf("canonicalSourceCommand(%q) = %q, want %q", test.input, got, test.want)
+		}
+	}
+}
+
+func BenchmarkCanonicalSourceCommandUnrelatedOperand(b *testing.B) {
+	evaluator := &LinuxProbeEvaluator{sourceRoot: b.TempDir()}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if got := evaluator.canonicalSourceCommand("__KERNEL__"); got != "__KERNEL__" {
+			b.Fatal(got)
+		}
+	}
+}
 
 func TestApplyProbeValueTransformSupportsPureMakeFunctionChains(t *testing.T) {
 	tests := []struct {
@@ -108,6 +149,33 @@ func TestCanonicalSourceRequestDeepCopiesValueTransformArguments(t *testing.T) {
 	originalDynamic := request.Steps[0].ArgumentFragments[0].Fragments[0].Transforms[1].ArgumentFragments[0].Fragments[0].Value
 	if !strings.Contains(originalDynamic, filepath.ToSlash(root)) {
 		t.Fatalf("canonicalization retained dynamic transform argument alias: %q", originalDynamic)
+	}
+}
+
+func TestCanonicalSourceRequestPreservesOpaqueScratchContent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "linux")
+	evaluator := &LinuxProbeEvaluator{sourceRoot: root}
+	physical := filepath.ToSlash(filepath.Join(root, "literal-config-value"))
+	request := ProbeRequest{
+		Schema: LinuxProbeRequestSchema,
+		Scratch: []ProbeScratch{
+			{Name: "command", Kind: "file", Content: physical},
+			{Name: "config", Kind: "file", Content: physical, ContentIsOpaque: true},
+		},
+		Steps: []ProbeStep{{Name: "consume", Tool: "cc"}},
+		Outcome: ProbeOutcome{
+			Kind: "boolean", Predicate: &ProbePredicate{Operator: "exit-zero", Step: "consume"},
+		},
+	}
+	canonical := evaluator.canonicalSourceRequest(request)
+	if got, want := canonical.Scratch[0].Content, "__LINUX_BZL_SOURCE_TREE__/literal-config-value"; got != want {
+		t.Fatalf("canonical command scratch = %q, want %q", got, want)
+	}
+	if got := canonical.Scratch[1].Content; got != physical {
+		t.Fatalf("opaque config scratch = %q, want exact bytes %q", got, physical)
+	}
+	if got := request.Scratch[0].Content; got != physical {
+		t.Fatalf("canonicalization mutated original scratch content: %q", got)
 	}
 }
 

@@ -479,6 +479,13 @@ def _node_source_bindings(node_id, node, source_context, input_directories):
         sources = sources,
     )
 
+def _render_probe_action_value_cached(value, path_index, rendered_values):
+    rendered = rendered_values.get(value)
+    if rendered == None:
+        rendered = _render_toolchain_action_value(value, path_index)
+        rendered_values[value] = rendered
+    return rendered
+
 def expand_linux_probe_plan(template_ctx, input_directories, output_directories, additional_inputs, tools, additional_params):
     """Expands one host or target scope of a path-encoded ProbePlan."""
     scope = additional_params.get("scope")
@@ -510,6 +517,12 @@ def expand_linux_probe_plan(template_ctx, input_directories, output_directories,
     if _RUNNER_TOOL not in tools or _TOOLCHAIN_FILES not in tools or _TOOLSET_MANIFEST not in tools:
         fail("Linux probe expansion has no runner, toolset manifest, or toolchain closure")
     action_path_index = _toolchain_action_path_index(tools[_TOOLCHAIN_FILES])
+
+    # Every probe in this callback uses the same validated toolchain closure.
+    # Retain successful exact-value renders only here: the same path text can
+    # bind different Files in another scope or callback. Keep rendering lazy so
+    # unused action roles retain their existing validation behavior.
+    rendered_action_values = {}
     for node_id, node in parsed.nodes.items():
         if node["scope"] != scope:
             continue
@@ -631,14 +644,14 @@ def expand_linux_probe_plan(template_ctx, input_directories, output_directories,
                     _add_rendered_toolchain_action_value(
                         args,
                         "-action_arg",
-                        _render_toolchain_action_value(argument, action_path_index),
+                        _render_probe_action_value_cached(argument, action_path_index, rendered_action_values),
                         prefix = contract_role + "=",
                     )
                 for environment in _action_environment(additional_params, contract_role):
                     _add_rendered_toolchain_action_value(
                         args,
                         "-action_env",
-                        _render_toolchain_action_value(environment, action_path_index),
+                        _render_probe_action_value_cached(environment, action_path_index, rendered_action_values),
                         prefix = contract_role + "=",
                     )
 
@@ -745,6 +758,15 @@ def linux_probe_map_directory_tools(runner, tool_files, toolchain_files, toolset
 
 def linux_test_render_probe_action_value(value, artifacts):
     return _render_toolchain_action_value(value, _toolchain_action_path_index_from_list(artifacts))
+
+def linux_test_render_probe_action_values(values, artifacts, cached = True):
+    """Exercises callback-local rendering without reconstructing path semantics."""
+    path_index = _toolchain_action_path_index_from_list(artifacts)
+    rendered_values = {}
+    return [
+        _render_probe_action_value_cached(value, path_index, rendered_values) if cached else _render_toolchain_action_value(value, path_index)
+        for value in values
+    ]
 
 def linux_test_probe_execution_root_marker():
     return _EXECUTION_ROOT_MARKER

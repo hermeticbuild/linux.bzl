@@ -41,7 +41,7 @@ func candidateProtocolRequest() ProbeRequest {
 }
 
 func TestProbeCandidateProtocolSchemaAndNilCompatibility(t *testing.T) {
-	if got, want := LinuxProbeRequestSchema, "linux-probe-request-v11"; got != want {
+	if got, want := LinuxProbeRequestSchema, "linux-probe-request-v13"; got != want {
 		t.Fatalf("probe request schema = %q, want %q", got, want)
 	}
 
@@ -104,6 +104,26 @@ func TestProbeCandidateProtocolPoliciesAndOwnedFragments(t *testing.T) {
 	}
 }
 
+func TestProbeCandidateProtocolCompilerPredefineProjection(t *testing.T) {
+	request := candidateProtocolRequest()
+	request.Steps[0].Candidate.Projection = ProbeCandidateProjectionCompilerPredefines
+	request.Steps[0].Candidate.TranslationUnits = []string{"source.c"}
+	if err := request.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := request.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"candidate":{"policy":"cc","projection":"compiler-predefines","base":[0,1],"conditional":[0,1],"translation_units":["source.c"]}`) {
+		t.Fatalf("canonical request does not contain compiler-predefine projection: %s", data)
+	}
+	request.Steps[0].Tool = "nm"
+	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "cc or cxx tool role") {
+		t.Fatalf("non-compiler projection validation error = %v", err)
+	}
+}
+
 func TestProbeCandidateProtocolRejectsInvalidOwnership(t *testing.T) {
 	tests := []struct {
 		name string
@@ -119,6 +139,40 @@ func TestProbeCandidateProtocolRejectsInvalidOwnership(t *testing.T) {
 			name: "unknown policy",
 			edit: func(candidate *ProbeCandidateArguments) { candidate.Policy = "gcc" },
 			want: "unsupported policy",
+		},
+		{
+			name: "unknown projection",
+			edit: func(candidate *ProbeCandidateArguments) { candidate.Projection = "strip-inputs" },
+			want: "unsupported projection",
+		},
+		{
+			name: "translation units without projection",
+			edit: func(candidate *ProbeCandidateArguments) { candidate.TranslationUnits = []string{"source.c"} },
+			want: "translation units require",
+		},
+		{
+			name: "duplicate translation units",
+			edit: func(candidate *ProbeCandidateArguments) {
+				candidate.Projection = ProbeCandidateProjectionCompilerPredefines
+				candidate.TranslationUnits = []string{"source.c", "source.c"}
+			},
+			want: "strictly sorted",
+		},
+		{
+			name: "unsorted translation units",
+			edit: func(candidate *ProbeCandidateArguments) {
+				candidate.Projection = ProbeCandidateProjectionCompilerPredefines
+				candidate.TranslationUnits = []string{"two.c", "one.c"}
+			},
+			want: "strictly sorted",
+		},
+		{
+			name: "compiler projection requires cc policy",
+			edit: func(candidate *ProbeCandidateArguments) {
+				candidate.Policy = ProbeCandidatePolicyLD
+				candidate.Projection = ProbeCandidateProjectionCompilerPredefines
+			},
+			want: "requires policy",
 		},
 		{
 			name: "empty ownership",
@@ -230,5 +284,15 @@ func TestProbeCandidateProtocolCanonicalIdentity(t *testing.T) {
 	}
 	if differentOwnershipID == wantID {
 		t.Fatal("candidate ownership did not participate in request identity")
+	}
+
+	differentProjection := candidateProtocolRequest()
+	differentProjection.Steps[0].Candidate.Projection = ProbeCandidateProjectionCompilerPredefines
+	differentProjectionID, err := differentProjection.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if differentProjectionID == wantID {
+		t.Fatal("candidate projection did not participate in request identity")
 	}
 }

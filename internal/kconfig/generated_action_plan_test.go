@@ -433,10 +433,13 @@ a-peer: peer-only.generated peer-only.source
 	if !ok {
 		t.Fatalf("missing grouped trigger node %q", groupID)
 	}
-	if !slices.ContainsFunc(groupNode.Inputs, func(edge ActionPlanNodeEdge) bool {
-		return edge.ProducerID == dependencyID
-	}) {
-		t.Fatalf("grouped trigger inputs = %#v, want peer-only producer %s", groupNode.Inputs, dependencyID)
+	dependencyEntry, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, groupNode, "peer-only.generated")
+	wantDependencyEntry := ActionPlanInputSetEntry{
+		Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "peer-only.generated"},
+		ProducerID: dependencyID,
+	}
+	if !found || dependencyEntry != wantDependencyEntry {
+		t.Fatalf("grouped trigger persistent dependency = %#v, %t; want %#v", dependencyEntry, found, wantDependencyEntry)
 	}
 	groupRecipe := plan.Recipes[groupNode.Recipe]
 	arguments := strings.Join(groupRecipe.Arguments, " ")
@@ -449,11 +452,26 @@ a-peer: peer-only.generated peer-only.source
 	if strings.Contains(arguments, "peer-only.source") {
 		t.Fatalf("grouped trigger automatic prerequisite arguments include peer-only source: %q", arguments)
 	}
-	if !slices.Contains(sortedStringMapValues(groupRecipe.WorkingInputs), "peer-only.generated") {
-		t.Fatalf("grouped trigger working inputs = %#v, want peer-only.generated staged", groupRecipe.WorkingInputs)
+	peerSourceID := ""
+	for _, source := range plan.Sources {
+		if source.Namespace == "kernel" && source.Path == "peer-only.source" {
+			peerSourceID = source.ID
+			break
+		}
 	}
-	if !slices.Contains(sortedStringMapValues(groupRecipe.WorkingInputs), "peer-only.source") || len(groupNode.Sources) == 0 {
-		t.Fatalf("grouped trigger source inputs = %#v/%#v, want peer-only.source staged as a real source edge", groupRecipe.WorkingInputs, groupNode.Sources)
+	if peerSourceID == "" {
+		t.Fatalf("plan sources omit kernel/peer-only.source: %#v", plan.Sources)
+	}
+	peerSourceEntry, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, groupNode, "peer-only.source")
+	wantPeerSourceEntry := ActionPlanInputSetEntry{
+		Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "peer-only.source"},
+		SourceID: peerSourceID,
+	}
+	if !found || peerSourceEntry != wantPeerSourceEntry {
+		t.Fatalf("grouped trigger persistent source = %#v, %t; want %#v", peerSourceEntry, found, wantPeerSourceEntry)
+	}
+	if err := contentAddressActionPlanNodes(plan); err != nil {
+		t.Fatalf("finalize grouped-trigger action plan: %v", err)
 	}
 	if err := plan.WriteStages(actionPlanStageOutputsForTest(filepath.Join(t.TempDir(), "plan"))); err != nil {
 		t.Fatalf("grouped-trigger action plan is invalid: %v", err)
@@ -993,19 +1011,22 @@ generated/shared.h: exact.c FORCE
 	if !ok {
 		t.Fatalf("consumer producer %q is missing", consumerID)
 	}
-	if !slices.ContainsFunc(consumerNode.Inputs, func(edge ActionPlanNodeEdge) bool {
-		return edge.Role == compactKbuildWorkingClosureInputRole && edge.ProducerID == exactID
-	}) {
-		t.Fatalf("consumer inputs = %#v, want exact generated-artifact producer %q", consumerNode.Inputs, exactID)
+	artifactEntry, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, consumerNode, artifact.Path)
+	wantArtifactEntry := ActionPlanInputSetEntry{
+		Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: artifact.Path},
+		ProducerID: exactID,
 	}
-	if slices.ContainsFunc(consumerNode.Inputs, func(edge ActionPlanNodeEdge) bool {
-		return edge.ProducerID == firstID
-	}) {
-		t.Fatalf("consumer inputs = %#v, unrelated same-path producer %q leaked into exact closure", consumerNode.Inputs, firstID)
+	if !found || artifactEntry != wantArtifactEntry {
+		t.Fatalf("consumer persistent generated artifact = %#v, %t; want %#v", artifactEntry, found, wantArtifactEntry)
 	}
-	consumerRecipe := plan.Recipes[consumerNode.Recipe]
-	if !slices.Contains(sortedStringMapValues(consumerRecipe.WorkingInputs), artifact.Path) {
-		t.Fatalf("consumer working inputs = %#v, want exact generated path %q", consumerRecipe.WorkingInputs, artifact.Path)
+	consumerEntries := actionPlanNodeInputSetEntriesForTest(t, plan, consumerNode)
+	for _, entry := range consumerEntries {
+		if entry.ProducerID == firstID {
+			t.Fatalf("consumer persistent inputs = %#v, unrelated same-path producer %q leaked into exact closure", consumerEntries, firstID)
+		}
+	}
+	if err := contentAddressActionPlanNodes(plan); err != nil {
+		t.Fatalf("finalize exact generated-artifact action plan: %v", err)
 	}
 	if err := plan.WriteStages(actionPlanStageOutputsForTest(filepath.Join(t.TempDir(), "plan"))); err != nil {
 		t.Fatalf("exact generated-artifact action plan is invalid: %v", err)

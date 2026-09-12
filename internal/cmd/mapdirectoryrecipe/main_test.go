@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -13,6 +18,131 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
+
+func writeParameterFile(t *testing.T, data []byte) string {
+	t.Helper()
+	filename := filepath.Join(t.TempDir(), "arguments.params")
+	if err := os.WriteFile(filename, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return filename
+}
+
+func TestExpandParameterFileArgumentsPreservesDirectArgv(t *testing.T) {
+	direct := []string{"-action_arg", "@literal", "-action_env", "VALUE=with spaces", "positional"}
+	got, err := expandParameterFileArguments(direct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, direct) {
+		t.Fatalf("expanded direct argv = %q, want %q", got, direct)
+	}
+	if &got[0] != &direct[0] {
+		t.Fatal("direct argv was copied or rewritten")
+	}
+}
+
+func TestExpandParameterFileArgumentsReadsExactMultilineArguments(t *testing.T) {
+	filename := writeParameterFile(t, []byte("-recipe\nrecipe with spaces.json\n-action_arg\n\n-action_env\nNAME=value=with=equals\n"))
+	got, err := expandParameterFileArguments([]string{"@" + filename})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"-recipe", "recipe with spaces.json", "-action_arg", "", "-action_env", "NAME=value=with=equals"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("expanded argv = %q, want %q", got, want)
+	}
+
+	empty := writeParameterFile(t, nil)
+	got, err = expandParameterFileArguments([]string{"@" + empty})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("empty parameter-file argv = %q, want no arguments", got)
+	}
+}
+
+func TestExpandParameterFileArgumentsAcceptsExactLineAndCountBounds(t *testing.T) {
+	line := strings.Repeat("x", maxParameterFileLineBytes)
+	filename := writeParameterFile(t, append([]byte(line), '\n'))
+	got, err := expandParameterFileArguments([]string{"@" + filename})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != line {
+		t.Fatalf("maximum-line expansion returned %d arguments", len(got))
+	}
+
+	filename = writeParameterFile(t, bytes.Repeat([]byte{'\n'}, maxParameterFileArguments))
+	got, err = expandParameterFileArguments([]string{"@" + filename})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != maxParameterFileArguments {
+		t.Fatalf("maximum-count expansion returned %d arguments, want %d", len(got), maxParameterFileArguments)
+	}
+}
+
+func TestExpandParameterFileArgumentsRejectsMalformedOrUnboundedFiles(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{name: "missing-final-lf", data: []byte("-recipe\nvalue"), want: "does not end with LF"},
+		{name: "crlf", data: []byte("-recipe\r\n"), want: "contains carriage return"},
+		{name: "bare-carriage-return", data: []byte("-recipe\nvalue\r\n"), want: "contains carriage return"},
+		{name: "nul", data: []byte("-recipe\nbad\x00value\n"), want: "contains NUL"},
+		{name: "oversized-line", data: append(bytes.Repeat([]byte{'x'}, maxParameterFileLineBytes+1), '\n'), want: "argument 0 exceeds"},
+		{name: "too-many-arguments", data: bytes.Repeat([]byte{'\n'}, maxParameterFileArguments+1), want: "maximum is"},
+		{name: "nested", data: []byte("-recipe\n@nested.params\n"), want: "argument 1 nests"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			filename := writeParameterFile(t, test.data)
+			if _, err := expandParameterFileArguments([]string{"@" + filename}); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("expandParameterFileArguments error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestExpandParameterFileArgumentsRejectsInvalidPathsAndFiles(t *testing.T) {
+	for _, argument := range []string{"@", "@bad\x00path"} {
+		if _, err := expandParameterFileArguments([]string{argument}); err == nil {
+			t.Fatalf("expandParameterFileArguments(%q) succeeded", argument)
+		}
+	}
+	missing := filepath.Join(t.TempDir(), "missing.params")
+	if _, err := expandParameterFileArguments([]string{"@" + missing}); err == nil || !strings.Contains(err.Error(), "open parameter file") {
+		t.Fatalf("missing-file error = %v", err)
+	}
+	directory := t.TempDir()
+	if _, err := expandParameterFileArguments([]string{"@" + directory}); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("directory error = %v", err)
+	}
+	oversized := writeParameterFile(t, nil)
+	if err := os.Truncate(oversized, maxParameterFileBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := expandParameterFileArguments([]string{"@" + oversized}); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized-file error = %v", err)
+	}
+}
+
+func TestSingleFlagRejectsRepeatedInputSetRoot(t *testing.T) {
+	var empty singleFlag
+	if err := empty.Set(""); err == nil {
+		t.Fatal("empty root was accepted")
+	}
+	var value singleFlag
+	if err := value.Set(strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if err := value.Set(strings.Repeat("b", 64)); err == nil {
+		t.Fatal("second root was accepted")
+	}
+}
 
 func TestEncodeRecipeCommandReplaysExpandsTypedPaths(t *testing.T) {
 	replays := []kconfig.ActionRecipeCommandReplay{{
@@ -113,6 +243,423 @@ func writeInputBindings(t *testing.T, bindings kconfig.ActionPlanInputBindings) 
 		t.Fatal(err)
 	}
 	return filename, id
+}
+
+func writeSourceProjections(t *testing.T, projections kconfig.ActionPlanSourceProjections) (string, string) {
+	t.Helper()
+	data, err := projections.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := projections.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	filename := filepath.Join(t.TempDir(), id+".json")
+	if err := os.WriteFile(filename, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return filename, id
+}
+
+func writeActionPlanInputSet(
+	t *testing.T,
+	entries []kconfig.ActionPlanInputSetEntry,
+) (string, map[string]string) {
+	t.Helper()
+	store := kconfig.NewActionPlanInputSetStore()
+	root := ""
+	var err error
+	for _, entry := range entries {
+		root, err = store.Insert(root, entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	closure, err := store.ReachableNodes(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	manifests := make(map[string]string, len(closure))
+	for id := range closure {
+		data, ok := store.CanonicalWitness(id)
+		if !ok {
+			t.Fatalf("input-set node %s has no canonical witness", id)
+		}
+		filename := filepath.Join(directory, id+".json")
+		if err := os.WriteFile(filename, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		manifests[id] = filename
+	}
+	return root, manifests
+}
+
+func writeRawActionPlanInputSetNode(t *testing.T, node kconfig.ActionPlanInputSetNode) (string, string) {
+	t.Helper()
+	data, err := json.Marshal(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	id := hex.EncodeToString(digest[:])
+	filename := filepath.Join(t.TempDir(), id+".json")
+	if err := os.WriteFile(filename, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return id, filename
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func TestLoadActionPlanInputSetAuthenticatesClosureAndBindings(t *testing.T) {
+	directory := t.TempDir()
+	workSource := filepath.Join(directory, "work-source")
+	treeInput := filepath.Join(directory, "tree-input")
+	ambientSource := filepath.Join(directory, "ambient-source")
+	for filename, content := range map[string]string{
+		workSource: "work\n", treeInput: "tree\n", ambientSource: "ambient\n",
+	} {
+		if err := os.WriteFile(filename, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	producer := strings.Repeat("a", 64)
+	entries := []kconfig.ActionPlanInputSetEntry{
+		{
+			Target:   kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "include/generated/work.h"},
+			SourceID: "src-00000001",
+		},
+		{
+			Target:      kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetTreeTarget, Tree: "kernel", Path: "include/generated/tree.h"},
+			ProducerID:  producer,
+			Slot:        7,
+			CompilerUse: true,
+		},
+		{
+			Target:       kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetAmbientTarget, Path: "config/kernel.release"},
+			SourceID:     "src-00000002",
+			CompilerUse:  true,
+			AuxiliaryUse: true,
+		},
+	}
+	root, manifests := writeActionPlanInputSet(t, entries)
+	opts := recipeOptions{
+		inputSetRoot: root, inputSetManifests: manifests,
+		inputSetSources: map[string]string{
+			"src-00000001": workSource,
+			"src-00000002": ambientSource,
+		},
+		inputSetInputs: map[string]string{actionPlanInputSetProducerBinding(producer, 7): treeInput},
+	}
+	loaded, err := loadActionPlanInputSet(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.root != root || len(loaded.entries) != len(entries) {
+		t.Fatalf("loaded input set = root %q, %d entries; want %q, %d", loaded.root, len(loaded.entries), root, len(entries))
+	}
+	uses := map[string][2]bool{}
+	for _, resolved := range loaded.entries {
+		uses[resolved.entry.Target.Path] = [2]bool{resolved.entry.CompilerUse, resolved.entry.AuxiliaryUse}
+	}
+	if got := uses["include/generated/tree.h"]; got != [2]bool{true, false} {
+		t.Fatalf("compiler-use flags = %v", got)
+	}
+	if got := uses["config/kernel.release"]; got != [2]bool{true, true} {
+		t.Fatalf("auxiliary-use flags = %v", got)
+	}
+
+	t.Run("missing source", func(t *testing.T) {
+		invalid := opts
+		invalid.inputSetSources = cloneStringMap(opts.inputSetSources)
+		delete(invalid.inputSetSources, "src-00000002")
+		if _, err := loadActionPlanInputSet(invalid); err == nil || !strings.Contains(err.Error(), "missing input-set source binding") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("unexpected input", func(t *testing.T) {
+		invalid := opts
+		invalid.inputSetInputs = cloneStringMap(opts.inputSetInputs)
+		invalid.inputSetInputs[strings.Repeat("b", 64)+":00000000"] = treeInput
+		if _, err := loadActionPlanInputSet(invalid); err == nil || !strings.Contains(err.Error(), "unexpected input-set input binding") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("tampered witness", func(t *testing.T) {
+		invalid := opts
+		invalid.inputSetManifests = cloneStringMap(opts.inputSetManifests)
+		filename := invalid.inputSetManifests[root]
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tampered := filepath.Join(t.TempDir(), "tampered.json")
+		if err := os.WriteFile(tampered, append(data, '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		invalid.inputSetManifests[root] = tampered
+		if _, err := loadActionPlanInputSet(invalid); err == nil || !strings.Contains(err.Error(), "not canonically encoded") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("content ID", func(t *testing.T) {
+		invalid := opts
+		wrongID := strings.Repeat("e", 64)
+		invalid.inputSetRoot = wrongID
+		invalid.inputSetManifests = map[string]string{wrongID: opts.inputSetManifests[root]}
+		if _, err := loadActionPlanInputSet(invalid); err == nil || !strings.Contains(err.Error(), "content ID") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+}
+
+func TestLoadActionPlanInputSetRejectsInvalidGraphAndTargetShape(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.WriteFile(source, []byte("value"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("auxiliary without compiler", func(t *testing.T) {
+		root, manifest := writeRawActionPlanInputSetNode(t, kconfig.ActionPlanInputSetNode{
+			Schema: kconfig.ActionPlanInputSetSchemaVersion, Kind: kconfig.ActionPlanInputSetLeafNode,
+			Depth: 0, Count: 1,
+			Entries: []kconfig.ActionPlanInputSetEntry{{
+				Target:       kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetAmbientTarget, Path: "ambient/file"},
+				SourceID:     "src-00000001",
+				AuxiliaryUse: true,
+			}},
+		})
+		_, err := loadActionPlanInputSet(recipeOptions{
+			inputSetRoot: root, inputSetManifests: map[string]string{root: manifest},
+			inputSetSources: map[string]string{"src-00000001": source}, inputSetInputs: map[string]string{},
+		})
+		if err == nil || !strings.Contains(err.Error(), "auxiliary") || !strings.Contains(err.Error(), "compiler") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("file ancestor", func(t *testing.T) {
+		root, manifests := writeActionPlanInputSet(t, []kconfig.ActionPlanInputSetEntry{
+			{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "generated"}, SourceID: "src-00000001"},
+			{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "generated/child"}, SourceID: "src-00000001"},
+		})
+		_, err := loadActionPlanInputSet(recipeOptions{
+			inputSetRoot: root, inputSetManifests: manifests,
+			inputSetSources: map[string]string{"src-00000001": source}, inputSetInputs: map[string]string{},
+		})
+		if err == nil || !strings.Contains(err.Error(), "below file target") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("missing radix child", func(t *testing.T) {
+		entries := make([]kconfig.ActionPlanInputSetEntry, 17)
+		for index := range entries {
+			entries[index] = kconfig.ActionPlanInputSetEntry{
+				Target:   kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: fmt.Sprintf("path/%02d", index)},
+				SourceID: "src-00000001",
+			}
+		}
+		root, manifests := writeActionPlanInputSet(t, entries)
+		for id := range manifests {
+			if id != root {
+				delete(manifests, id)
+				break
+			}
+		}
+		_, err := loadActionPlanInputSet(recipeOptions{
+			inputSetRoot: root, inputSetManifests: manifests,
+			inputSetSources: map[string]string{"src-00000001": source}, inputSetInputs: map[string]string{},
+		})
+		if err == nil || !strings.Contains(err.Error(), "missing child") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("unreachable manifest", func(t *testing.T) {
+		root, manifests := writeActionPlanInputSet(t, []kconfig.ActionPlanInputSetEntry{{
+			Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "one"}, SourceID: "src-00000001",
+		}})
+		otherRoot, other := writeActionPlanInputSet(t, []kconfig.ActionPlanInputSetEntry{{
+			Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "two"}, SourceID: "src-00000001",
+		}})
+		manifests[otherRoot] = other[otherRoot]
+		_, err := loadActionPlanInputSet(recipeOptions{
+			inputSetRoot: root, inputSetManifests: manifests,
+			inputSetSources: map[string]string{"src-00000001": source}, inputSetInputs: map[string]string{},
+		})
+		if err == nil || !strings.Contains(err.Error(), "not reachable") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("oversized witness", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "manifest")
+		if err := os.WriteFile(filename, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(filename, maxActionPlanInputSetManifestBytes+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := decodeActionPlanInputSetManifest(filename, strings.Repeat("a", 64)); err == nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("invalid leaf shape", func(t *testing.T) {
+		id, filename := writeRawActionPlanInputSetNode(t, kconfig.ActionPlanInputSetNode{
+			Schema: kconfig.ActionPlanInputSetSchemaVersion, Kind: kconfig.ActionPlanInputSetLeafNode,
+			Depth: 0, Count: 2,
+			Entries: []kconfig.ActionPlanInputSetEntry{{
+				Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "one"}, SourceID: "src-00000001",
+			}},
+		})
+		_, err := loadActionPlanInputSet(recipeOptions{
+			inputSetRoot: id, inputSetManifests: map[string]string{id: filename},
+			inputSetSources: map[string]string{"src-00000001": source}, inputSetInputs: map[string]string{},
+		})
+		if err == nil || !strings.Contains(err.Error(), "count is 2, want 1") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("entry-count bound", func(t *testing.T) {
+		id, filename := writeRawActionPlanInputSetNode(t, kconfig.ActionPlanInputSetNode{
+			Schema: kconfig.ActionPlanInputSetSchemaVersion, Kind: kconfig.ActionPlanInputSetBranchNode,
+			Depth: 0, Count: maxActionPlanInputSetEntries + 1,
+			Children: []kconfig.ActionPlanInputSetChild{{Nibble: "0", ID: strings.Repeat("a", 64)}},
+		})
+		_, err := loadActionPlanInputSet(recipeOptions{
+			inputSetRoot: id, inputSetManifests: map[string]string{id: filename},
+			inputSetSources: map[string]string{}, inputSetInputs: map[string]string{},
+		})
+		if err == nil || !strings.Contains(err.Error(), "outside") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("cycle", func(t *testing.T) {
+		first := strings.Repeat("a", 64)
+		second := strings.Repeat("b", 64)
+		nodes := map[string]kconfig.ActionPlanInputSetNode{
+			first:  {Children: []kconfig.ActionPlanInputSetChild{{Nibble: "0", ID: second}}},
+			second: {Children: []kconfig.ActionPlanInputSetChild{{Nibble: "1", ID: first}}},
+		}
+		if err := validateActionPlanInputSetManifestGraph(first, nodes); err == nil || !strings.Contains(err.Error(), "cycle") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+}
+
+func TestRunRecipeMaterializesPersistentInputSetNamespaces(t *testing.T) {
+	directory := t.TempDir()
+	workSource := filepath.Join(directory, "work-source")
+	treeInput := filepath.Join(directory, "tree-input")
+	ambientSource := filepath.Join(directory, "ambient-source")
+	for filename, content := range map[string]string{
+		workSource: "work\n", treeInput: "tree\n", ambientSource: "ambient\n",
+	} {
+		if err := os.WriteFile(filename, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	producer := strings.Repeat("c", 64)
+	root, manifests := writeActionPlanInputSet(t, []kconfig.ActionPlanInputSetEntry{
+		{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "implicit/work.txt"}, SourceID: "src-00000001"},
+		{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetTreeTarget, Tree: "kernel", Path: "implicit/tree.txt"}, ProducerID: producer, Slot: 2},
+		{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetAmbientTarget, Path: "ambient/authority.txt"}, SourceID: "src-00000002", CompilerUse: true},
+	})
+	output := filepath.Join(directory, "out", "result")
+	workDirectory := filepath.Join(directory, "work")
+	workMarker := filepath.Join(workDirectory, ".linux-bzl-work-root")
+	recipe := kconfig.ActionRecipe{
+		Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "helper",
+		Arguments:        []string{"implicit/work.txt", "${tree:kernel}/implicit/tree.txt", "${output:00000000}"},
+		WorkingDirectory: "object",
+		Outputs:          []string{"00000000"},
+		Trees:            []string{"kernel"},
+	}
+	recipePath, recipeID := writeRecipe(t, recipe)
+	helper := filepath.Join(directory, "helper")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nset -eu\ncat \"$1\" \"$2\" > \"$3\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(directory)
+	err := runRecipe(recipeOptions{
+		recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("d", 64), expectedRecipeID: recipeID,
+		toolRole: "helper", workingDirectory: workDirectory, workingDirectoryMarker: workMarker,
+		sources: map[string]string{}, inputs: map[string]string{}, outputs: map[string]string{"00000000": output},
+		tools: map[string]string{"helper": helper}, trees: map[string]string{"kernel": directory},
+		privateInputTrees: map[string]bool{"kernel": true}, inputSetRoot: root, inputSetManifests: manifests,
+		inputSetSources: map[string]string{"src-00000001": workSource, "src-00000002": ambientSource},
+		inputSetInputs:  map[string]string{actionPlanInputSetProducerBinding(producer, 2): treeInput},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "work\ntree\n" {
+		t.Fatalf("output = %q", data)
+	}
+	if _, err := os.Stat(filepath.Join(directory, "ambient", "authority.txt")); !os.IsNotExist(err) {
+		t.Fatalf("ambient target was copied into the execution root: %v", err)
+	}
+}
+
+func TestActionPlanInputSetRequiresPrivateNamespaceTargets(t *testing.T) {
+	inputSet := resolvedActionPlanInputSet{entries: []resolvedActionPlanInputSetEntry{{
+		entry: kconfig.ActionPlanInputSetEntry{
+			Target:   kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetTreeTarget, Tree: "kernel", Path: "generated/value"},
+			SourceID: "src-00000001",
+		},
+	}}}
+	if err := validateActionPlanInputSetTargets(
+		kconfig.ActionRecipe{WorkingDirectory: "object"}, inputSet,
+		recipeOptions{workingDirectory: t.TempDir(), trees: map[string]string{"kernel": t.TempDir()}, privateInputTrees: map[string]bool{}},
+	); err == nil || !strings.Contains(err.Error(), "requires private input tree") {
+		t.Fatalf("ordinary-tree error = %v", err)
+	}
+
+	inputSet.entries[0].entry.Target = kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "generated/value"}
+	if err := validateActionPlanInputSetTargets(kconfig.ActionRecipe{}, inputSet, recipeOptions{}); err == nil || !strings.Contains(err.Error(), "working directory") {
+		t.Fatalf("work-root error = %v", err)
+	}
+
+	inputSet.entries[0].entry.Target = kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetAmbientTarget, Path: "generated/value"}
+	if err := validateActionPlanInputSetTargets(kconfig.ActionRecipe{}, inputSet, recipeOptions{}); err != nil {
+		t.Fatalf("ambient dependency target: %v", err)
+	}
+}
+
+func TestMaterializeActionPlanInputSetWorkRejectsDifferingDirectCollision(t *testing.T) {
+	directory := t.TempDir()
+	setSource := filepath.Join(directory, "set-source")
+	directSource := filepath.Join(directory, "direct-source")
+	for filename, data := range map[string]string{setSource: "set", directSource: "direct"} {
+		if err := os.WriteFile(filename, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inputSet := resolvedActionPlanInputSet{entries: []resolvedActionPlanInputSetEntry{{
+		entry: kconfig.ActionPlanInputSetEntry{
+			Target:   kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "generated/value"},
+			SourceID: "src-00000001",
+		},
+		input: setSource, provenance: "src-00000001",
+	}}}
+	workingInputs := map[string]string{"input:direct": "generated/value"}
+	bindings := map[string]map[string]string{"input": {"direct": directSource}}
+	if err := materializeActionPlanInputSetWork(inputSet, filepath.Join(directory, "work"), workingInputs, bindings); err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("collision error = %v", err)
+	}
+
+	bindings["input"]["direct"] = setSource
+	if err := materializeActionPlanInputSetWork(inputSet, filepath.Join(directory, "work"), workingInputs, bindings); err != nil {
+		t.Fatalf("identical collision: %v", err)
+	}
 }
 
 func TestResolveRecipeInputBindingsExpandsLargeContentAddressedManifest(t *testing.T) {
@@ -296,7 +843,7 @@ func TestPreparePrivateInputTreeProjectionsExposesOnlyExactNodeInputs(t *testing
 		t.Fatal(err)
 	}
 	opts.inputs = resolved
-	cleanup, err := preparePrivateInputTreeProjections([]string{"input:00000000"}, &opts)
+	cleanup, err := preparePrivateInputTreeProjections([]string{"input:00000000"}, nil, &opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,6 +857,258 @@ func TestPreparePrivateInputTreeProjectionsExposesOnlyExactNodeInputs(t *testing
 	}
 	if _, err := os.Stat(filepath.Join(opts.trees["prep"], "include", "unrelated.h")); !os.IsNotExist(err) {
 		t.Fatalf("private tree exposed unrelated sibling: %v", err)
+	}
+}
+
+func TestPreparePrivateInputTreeProjectionsCombinesGeneratedAndImmutableSources(t *testing.T) {
+	shared := t.TempDir()
+	generated := filepath.Join(shared, "generated.h")
+	if err := os.WriteFile(generated, []byte("generated\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	immutable := filepath.Join(t.TempDir(), "source.h")
+	if err := os.WriteFile(immutable, []byte("immutable\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	inputManifest, inputID := writeInputBindings(t, kconfig.ActionPlanInputBindings{
+		Schema: kconfig.LinuxKernelInputBindingsSchema,
+		Bindings: map[string]kconfig.ActionPlanInputBinding{
+			"generated:00000000": {
+				Tree: "objects", Path: "generated.h",
+				ProjectionTree: "kernel", ProjectionPath: "include/generated.h",
+			},
+		},
+	})
+	sourceManifest, sourceID := writeSourceProjections(t, kconfig.ActionPlanSourceProjections{
+		Schema: kconfig.LinuxKernelSourceProjectionsSchema,
+		Bindings: map[string]kconfig.ActionPlanSourceProjectionBinding{
+			"kernel-source:00000000": {Tree: "kernel", Path: "include/source.h"},
+		},
+	})
+	opts := recipeOptions{
+		inputBindings: inputManifest, expectedInputBindingsID: inputID,
+		sourceProjections: sourceManifest, expectedSourceProjectionsID: sourceID,
+		artifactTrees: map[string]string{"objects": shared},
+		sources:       map[string]string{"kernel-source:00000000": immutable},
+		// A private tree uses one of its exact projected files as a typed,
+		// path-mappable anchor. It is not a source-root directory and must be
+		// replaced before recipe expansion.
+		trees:             map[string]string{"kernel": immutable},
+		privateInputTrees: map[string]bool{"kernel": true},
+	}
+	resolved, err := resolveRecipeInputBindings([]string{"generated:00000000"}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.inputs = resolved
+	cleanup, err := preparePrivateInputTreeProjections(
+		[]string{"generated:00000000"}, []string{"kernel-source:00000000"}, &opts,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if opts.trees["kernel"] == immutable {
+		t.Fatal("private kernel tree retained its exact-file anchor")
+	}
+	for relative, want := range map[string]string{
+		"include/generated.h": "generated\n",
+		"include/source.h":    "immutable\n",
+	} {
+		data, err := os.ReadFile(filepath.Join(opts.trees["kernel"], filepath.FromSlash(relative)))
+		if err != nil || string(data) != want {
+			t.Fatalf("private kernel projection %s = %q, %v; want %q", relative, data, err, want)
+		}
+	}
+}
+
+func TestPreparePrivateInputTreeProjectionsRejectsSourceCollisionsAndUndeclaredBindings(t *testing.T) {
+	first := filepath.Join(t.TempDir(), "first.h")
+	second := filepath.Join(t.TempDir(), "second.h")
+	for filename, contents := range map[string]string{first: "first\n", second: "second\n"} {
+		if err := os.WriteFile(filename, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest, id := writeSourceProjections(t, kconfig.ActionPlanSourceProjections{
+		Schema: kconfig.LinuxKernelSourceProjectionsSchema,
+		Bindings: map[string]kconfig.ActionPlanSourceProjectionBinding{
+			"source:00000000": {Tree: "kernel", Path: "include/collision.h"},
+		},
+	})
+	base := recipeOptions{
+		sourceProjections: manifest, expectedSourceProjectionsID: id,
+		sources: map[string]string{"source:00000000": first},
+		trees:   map[string]string{"kernel": t.TempDir()}, privateInputTrees: map[string]bool{"kernel": true},
+	}
+	if _, err := preparePrivateInputTreeProjections(nil, nil, &base); err == nil || !strings.Contains(err.Error(), "not a declared recipe source") {
+		t.Fatalf("undeclared source projection error = %v", err)
+	}
+
+	generatedManifest, generatedID := writeInputBindings(t, kconfig.ActionPlanInputBindings{
+		Schema: kconfig.LinuxKernelInputBindingsSchema,
+		Bindings: map[string]kconfig.ActionPlanInputBinding{
+			"generated:00000000": {
+				Tree: "objects", Path: "second.h",
+				ProjectionTree: "kernel", ProjectionPath: "include/collision.h",
+			},
+		},
+	})
+	base.inputBindings, base.expectedInputBindingsID = generatedManifest, generatedID
+	base.artifactTrees = map[string]string{"objects": filepath.Dir(second)}
+	base.inputs = map[string]string{"generated:00000000": second}
+	if _, err := preparePrivateInputTreeProjections(
+		[]string{"generated:00000000"}, []string{"source:00000000"}, &base,
+	); err == nil || !strings.Contains(err.Error(), "conflicting inputs") {
+		t.Fatalf("source/generated collision error = %v", err)
+	}
+}
+
+func TestDecodeSourceProjectionsRejectsTampering(t *testing.T) {
+	manifest, id := writeSourceProjections(t, kconfig.ActionPlanSourceProjections{
+		Schema: kconfig.LinuxKernelSourceProjectionsSchema,
+		Bindings: map[string]kconfig.ActionPlanSourceProjectionBinding{
+			"source:00000000": {Tree: "kernel", Path: "first.h"},
+		},
+	})
+	tampered, err := (kconfig.ActionPlanSourceProjections{
+		Schema: kconfig.LinuxKernelSourceProjectionsSchema,
+		Bindings: map[string]kconfig.ActionPlanSourceProjectionBinding{
+			"source:00000000": {Tree: "kernel", Path: "second.h"},
+		},
+	}).CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, tampered, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeSourceProjections(manifest, id); err == nil || !strings.Contains(err.Error(), "content ID") {
+		t.Fatalf("tampered source projections error = %v", err)
+	}
+}
+
+func TestPreparePrivateInputTreeProjectionsSeparatesPhysicalStorePathFromLogicalPath(t *testing.T) {
+	store := t.TempDir()
+	physicalPath := "nodes/" + strings.Repeat("a", 64) + "/00000000"
+	physical := filepath.Join(store, filepath.FromSlash(physicalPath))
+	if err := os.MkdirAll(filepath.Dir(physical), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(physical, []byte("shared producer\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	otherVariantPath := "nodes/" + strings.Repeat("b", 64) + "/00000000"
+	otherVariant := filepath.Join(store, filepath.FromSlash(otherVariantPath))
+	if err := os.MkdirAll(filepath.Dir(otherVariant), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(otherVariant, []byte("other variant\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest, id := writeInputBindings(t, kconfig.ActionPlanInputBindings{
+		Schema: kconfig.LinuxKernelInputBindingsSchema,
+		Bindings: map[string]kconfig.ActionPlanInputBinding{
+			"input:00000000": {
+				Tree: "prep", Path: physicalPath,
+				ProjectionTree: "prep", ProjectionPath: "include/generated/value.h",
+			},
+		},
+	})
+	opts := recipeOptions{
+		inputBindings: manifest, expectedInputBindingsID: id,
+		artifactTrees: map[string]string{"prep": store},
+		trees:         map[string]string{"prep": store}, privateInputTrees: map[string]bool{"prep": true},
+	}
+	resolved, err := resolveRecipeInputBindings([]string{"input:00000000"}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.inputs = resolved
+	cleanup, err := preparePrivateInputTreeProjections([]string{"input:00000000"}, nil, &opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	want := filepath.Join(opts.trees["prep"], "include", "generated", "value.h")
+	data, err := os.ReadFile(want)
+	if err != nil || string(data) != "shared producer\n" {
+		t.Fatalf("logical family projection = %q, %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(opts.trees["prep"], filepath.FromSlash(physicalPath))); !os.IsNotExist(err) {
+		t.Fatalf("private tree leaked the physical shared-store path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(opts.trees["prep"], filepath.FromSlash(otherVariantPath))); !os.IsNotExist(err) {
+		t.Fatalf("private tree exposed an unlisted variant leaf: %v", err)
+	}
+}
+
+func TestRunRecipeStagesSyntheticPriorTreeInputAtLogicalPath(t *testing.T) {
+	store := t.TempDir()
+	physicalPath := "nodes/" + strings.Repeat("a", 64) + "/00000000"
+	physical := filepath.Join(store, filepath.FromSlash(physicalPath))
+	if err := os.MkdirAll(filepath.Dir(physical), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(physical, []byte("shared producer\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	otherVariantPath := "nodes/" + strings.Repeat("b", 64) + "/00000000"
+	otherVariant := filepath.Join(store, filepath.FromSlash(otherVariantPath))
+	if err := os.MkdirAll(filepath.Dir(otherVariant), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(otherVariant, []byte("other variant\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest, manifestID := writeInputBindings(t, kconfig.ActionPlanInputBindings{
+		Schema: kconfig.LinuxKernelInputBindingsSchema,
+		Bindings: map[string]kconfig.ActionPlanInputBinding{
+			"tree-prep:00000000": {
+				Tree: "prep", Path: physicalPath,
+				ProjectionTree: "prep", ProjectionPath: "include/generated/value.h",
+			},
+		},
+	})
+	output := filepath.Join(t.TempDir(), "output.txt")
+	recipe := kconfig.ActionRecipe{
+		Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "helper",
+		Arguments:        []string{"${output:00000000}"},
+		WorkingDirectory: "object-tree",
+		Inputs:           []string{"tree-prep:00000000"},
+		Outputs:          []string{"00000000"},
+		Trees:            []string{"prep"}, WorkingTrees: []string{"prep"},
+	}
+	recipePath, recipeID := writeRecipe(t, recipe)
+	helper := filepath.Join(t.TempDir(), "helper")
+	script := `#!/bin/sh
+set -eu
+test -f include/generated/value.h
+test ! -e nodes
+IFS= read -r value < include/generated/value.h
+printf '%s\n' "$value" > "$1"
+`
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workingDirectory := filepath.Join(t.TempDir(), "work")
+	if err := runRecipe(recipeOptions{
+		recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
+		inputBindings: manifest, expectedInputBindingsID: manifestID,
+		artifactTrees: map[string]string{"prep": store},
+		toolRole:      "helper", tools: map[string]string{"helper": helper},
+		sources: map[string]string{}, outputs: map[string]string{"00000000": output},
+		trees: map[string]string{"prep": store}, privateInputTrees: map[string]bool{"prep": true},
+		workingDirectory: workingDirectory, workingDirectoryMarker: filepath.Join(workingDirectory, ".linux-bzl-work-root"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "shared producer\n" {
+		t.Fatalf("synthetic prior-tree recipe output = %q", data)
 	}
 }
 
@@ -1503,6 +2302,42 @@ func TestRunRecipeStaticAndGeneratedToolsUseExactRecipeArguments(t *testing.T) {
 	}
 }
 
+func TestRunRecipeGeneratedHeaderFailureDoesNotPublishSuccess(t *testing.T) {
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "generated-header-tool")
+	script := "#!/bin/sh\nprintf '#define GENERATED_VALUE 1\\n' > \"$1\" || exit 24\nexit 23\n"
+	if err := os.WriteFile(helper, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recipe := kconfig.ActionRecipe{
+		Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "input:helper",
+		Arguments: []string{"${output:header}"},
+		Inputs:    []string{"helper"}, Outputs: []string{"header", "state"},
+		WorkingDirectory: "generated-header-failure",
+		WorkingOutputs:   map[string]string{"header": "include/generated/value.h"},
+		ObservedOutputs:  map[string]string{"state": "include/generated/side.h"},
+	}
+	recipePath, recipeID := writeRecipe(t, recipe)
+	header, state := filepath.Join(dir, "header"), filepath.Join(dir, "state")
+	workRoot := filepath.Join(dir, "work")
+	err := runRecipe(recipeOptions{
+		recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
+		toolRole: "generated", inputs: map[string]string{"helper": helper},
+		outputs: map[string]string{"header": header, "state": state},
+		sources: map[string]string{}, tools: map[string]string{}, trees: map[string]string{},
+		workingDirectory: workRoot, workingDirectoryMarker: filepath.Join(workRoot, ".linux-bzl-work-root"),
+	})
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 23 {
+		t.Fatalf("partial generated header did not retain the real tool failure: %v", err)
+	}
+	for _, filename := range []string{header, state} {
+		if _, err := os.Stat(filename); !os.IsNotExist(err) {
+			t.Fatalf("failed generator published successful output %s: %v", filename, err)
+		}
+	}
+}
+
 func TestRunRecipeMaterializesExecutableInputPrivately(t *testing.T) {
 	dir := t.TempDir()
 	output := filepath.Join(dir, "result")
@@ -1737,6 +2572,81 @@ func TestRunRecipeRejectsSymlinkAncestorOfObservedOutput(t *testing.T) {
 	}
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
 		t.Fatalf("symlink-ancestor observed state was collected: %v", err)
+	}
+}
+
+func TestRunRecipeRequiredCarriedSideOutputPublishesFinalBytesOrFails(t *testing.T) {
+	const initial = "saved command\n"
+	for name, test := range map[string]struct {
+		body    string
+		want    string
+		deleted bool
+	}{
+		"conditional append": {
+			body: "if true; then printf '%s\\n' '#SYMVER example 0x12345678' >> state/value; fi\n",
+			want: initial + "#SYMVER example 0x12345678\n",
+		},
+		"inactive append": {
+			body: "if false; then printf '%s\\n' '#SYMVER example 0x12345678' >> state/value; fi\n",
+			want: initial,
+		},
+		"conditional overwrite": {
+			body: "if true; then printf '%s\\n' replacement > state/value; fi\n",
+			want: "replacement\n",
+		},
+		"conditional deletion": {
+			body:    "if true; then rm -f state/value; fi\n",
+			deleted: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			directory := t.TempDir()
+			previous := filepath.Join(directory, "previous-artifact")
+			if err := os.WriteFile(previous, []byte(initial), 0o444); err != nil {
+				t.Fatal(err)
+			}
+			output := filepath.Join(directory, "final-artifact")
+			workRoot := filepath.Join(directory, "work", "node")
+			recipe := kconfig.ActionRecipe{
+				Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "helper",
+				WorkingDirectory: "object-tree",
+				WorkingInputs:    map[string]string{"input:previous": "state/value"},
+				WorkingOutputs:   map[string]string{"00000000": "state/value"},
+				Inputs:           []string{"previous"}, Outputs: []string{"00000000"},
+			}
+			recipePath, recipeID := writeRecipe(t, recipe)
+			helper := filepath.Join(directory, "helper")
+			if err := os.WriteFile(helper, []byte("#!/bin/sh\nset -e\ntest -f state/value\n"+test.body), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			err := runRecipe(recipeOptions{
+				recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("b", 64), expectedRecipeID: recipeID,
+				toolRole: "helper", workingDirectory: workRoot,
+				workingDirectoryMarker: filepath.Join(workRoot, ".linux-bzl-work-root"),
+				sources:                map[string]string{}, inputs: map[string]string{"previous": previous},
+				outputs: map[string]string{"00000000": output},
+				tools:   map[string]string{"helper": helper}, trees: map[string]string{},
+			})
+			if test.deleted {
+				if err == nil || !strings.Contains(err.Error(), "collect working output 00000000") {
+					t.Fatalf("deleted required output should fail collection, got %v", err)
+				}
+				if _, statErr := os.Stat(output); !os.IsNotExist(statErr) {
+					t.Fatalf("deleted output published stale predecessor bytes: %v", statErr)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, readErr := os.ReadFile(output)
+				if readErr != nil || string(got) != test.want {
+					t.Fatalf("final bytes = %q, %v; want %q", got, readErr, test.want)
+				}
+			}
+			if got, readErr := os.ReadFile(previous); readErr != nil || string(got) != initial {
+				t.Fatalf("immutable predecessor changed: %q, %v", got, readErr)
+			}
+		})
 	}
 }
 

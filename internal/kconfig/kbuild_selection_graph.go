@@ -57,6 +57,11 @@ type compactKbuildSelectionGraph struct {
 	selectionsByProfileTarget       map[compactKbuildProfileTargetKey]compactKbuildSelectionKey
 	forwardingSelections            map[compactKbuildSelectionKey]bool
 	materializedProducers           map[compactKbuildSelectionKey]string
+	// materializedProducerGeneration invalidates process-local planner memos
+	// whose result depends on exact selected producer ownership. Structural
+	// selection policy is immutable before lowering; materialization is the one
+	// ownership relation which advances while the ActionPlan is assembled.
+	materializedProducerGeneration  uint64
 	groupedSelectionIDs             map[compactKbuildSelectionKey]compactKbuildGroupedSelectionID
 	groupedSelectionMembers         map[compactKbuildGroupedSelectionID][]compactKbuildSelectionKey
 	groupedSelectionRepresentatives map[compactKbuildGroupedSelectionID]compactKbuildSelectionKey
@@ -1000,8 +1005,15 @@ func (g *compactKbuildSelectionGraph) recordMaterializedProducer(
 			return fmt.Errorf("Kbuild selection %s has conflicting materialized producers %q and %q", compactKbuildSelectionKeyString(member), existing, producer)
 		}
 	}
+	changed := false
 	for _, member := range members {
+		if existing, ok := g.materializedProducers[member]; !ok || existing != producer {
+			changed = true
+		}
 		g.materializedProducers[member] = producer
+	}
+	if changed {
+		g.materializedProducerGeneration++
 	}
 	return nil
 }

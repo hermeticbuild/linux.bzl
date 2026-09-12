@@ -1,6 +1,98 @@
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+load(":compiler_toolchain_test.bzl", "compiler_toolchain_tests")
+
 package(default_visibility = ["//visibility:public"])
 
 exports_files(["linux_bzl_rust_btf.rs"])
+
+string_flag(
+    name = "compiler",
+    build_setting_default = "clang",
+    values = [
+        "clang",
+        "gcc",
+    ],
+)
+
+config_setting(
+    name = "gcc_selected",
+    flag_values = {":compiler": "gcc"},
+)
+
+# Kernel target C compilation uses an explicit scope marker. The separate GNU
+# host wrapper below must not capture musl userspace or LLVM C BPF configurations.
+# No default marker: execution-platform transitions do not inherit this value.
+constraint_setting(name = "compiler_scope")
+
+constraint_value(
+    name = "kernel_compiler_scope",
+    constraint_setting = ":compiler_scope",
+)
+
+platform(
+    name = "kernel_aarch64",
+    constraint_values = [":kernel_compiler_scope"],
+    parents = ["@llvm//platforms:linux_arm64"],
+)
+
+platform(
+    name = "kernel_x86_64",
+    constraint_values = [":kernel_compiler_scope"],
+    parents = ["@llvm//platforms:linux_x86_64"],
+)
+
+toolchain(
+    name = "gcc_cc_toolchain_aarch64",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        ":kernel_compiler_scope",
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+    target_settings = [":gcc_selected"],
+    toolchain = "@aya_gcc_aarch64//:_cc_toolchain",
+    toolchain_type = "@rules_cc//cc:toolchain_type",
+)
+
+toolchain(
+    name = "gcc_cc_toolchain_x86_64",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        ":kernel_compiler_scope",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_settings = [":gcc_selected"],
+    toolchain = "@aya_gcc_x86_64//:_cc_toolchain",
+    toolchain_type = "@rules_cc//cc:toolchain_type",
+)
+
+# Kbuild's objtool Makefile derives warning flags from CC before recursing with
+# HOSTCC. Keep the GNU host compiler in the same matrix cell as the kernel CC.
+# The remote execution platform has this libc constraint; musl and BPF do not.
+toolchain(
+    name = "gcc_cc_toolchain_gnu_host_x86_64",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        "@llvm//constraints/libc:gnu.2.28",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_settings = [":gcc_selected"],
+    toolchain = "@aya_gcc_x86_64//:_cc_toolchain",
+    toolchain_type = "@rules_cc//cc:toolchain_type",
+)
+
+compiler_toolchain_tests(name = "compiler_toolchain_tests")
 
 test_suite(
     name = "aya_vm_tests",

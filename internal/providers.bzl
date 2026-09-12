@@ -38,7 +38,7 @@ LinuxModuleSdkInfo = provider(
         "host_toolset_anchors": "Stable root IDs mapped to typed host toolset anchor Files.",
         "host_toolset_manifest": "Identity-bound host Kbuild toolset manifest File.",
         "kbuild": "Root Linux Kbuild/Makefile File.",
-        "kernel_key": "Stable identity used to reject cross-kernel module dependencies.",
+        "kernel_key": "Configured kernel/toolset identity used to reject cross-kernel module dependencies.",
         "kernel_release": "File containing the configured kernel release.",
         "libelf_compile_flags": "Kbuild LIBELF_FLAGS using the configured host dependency tree.",
         "libelf_link_flags": "Kbuild LIBELF_LIBS using the configured host dependency tree.",
@@ -80,5 +80,15 @@ LinuxModuleTreeInfo = provider(
     fields = {
         "manifest": "Newline-delimited canonical paths for the .ko files in tree.",
         "tree": "TreeArtifact containing configured in-tree .ko files.",
+    },
+)
+
+# Private carrier used by the repository facade.  Keeping the complete family
+# behind one configured target is what gives equivalent nodes one Bazel action
+# owner; the public root and variant labels only select an existing payload.
+LinuxMappedKernelFamilyInfo = provider(
+    doc = "Private map from image-family variant names to public kernel provider payloads.",
+    fields = {
+        "variants": "Dictionary from variant name to a struct containing DefaultInfo, LinuxKernelInfo, LinuxModuleSdkInfo, LinuxModuleTreeInfo, and OutputGroupInfo.",
     },
 )

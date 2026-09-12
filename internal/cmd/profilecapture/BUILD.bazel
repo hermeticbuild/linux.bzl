@@ -1,0 +1,21 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "profilecapture_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/profilecapture",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "profilecapture",
+    embed = [":profilecapture_lib"],
+    pure = "on",
+    visibility = ["//internal:__pkg__"],
+)
+
+go_test(
+    name = "profilecapture_test",
+    srcs = ["main_test.go"],
+    embed = [":profilecapture_lib"],
+)

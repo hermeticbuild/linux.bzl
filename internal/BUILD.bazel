@@ -11,7 +11,10 @@ load(":script_runtime_toolchain.bzl", "linux_x86_64_script_runtime_toolchain")
 package(default_visibility = ["//:__subpackages__"])
 
 exports_files(
-    ["mapped_kernel.bzl"],
+    [
+        "linux_source_runfiles.bzl",
+        "mapped_kernel.bzl",
+    ],
     visibility = ["//visibility:public"],
 )
 
@@ -19,6 +22,7 @@ filegroup(
     name = "linux_source_repository_test_support",
     srcs = [
         "linux_source_repository.bzl",
+        "linux_source_runfiles.bzl",
         "module_make_vars.bzl",
         "repository_utils.bzl",
     ],

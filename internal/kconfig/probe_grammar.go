@@ -215,19 +215,401 @@ const probeCandidatePolicyAssembler = "assembler-forwarded"
 // or read/write undeclared files. An empty candidate is valid because all of
 // its conditional groups may be unselected at execution time.
 func ValidateProbeCandidateArguments(policy string, argv []string) ([]ProbeCandidatePathOperand, error) {
+	return ValidateProjectedProbeCandidateArguments(policy, "", argv)
+}
+
+// ValidateProjectedProbeCandidateArguments validates an already projected
+// candidate. Only the managed intrinsic input permits path-like quoted object
+// macro values: its operator cannot be replaced and its operands are undefined
+// before use. Ordinary compilation must not gain the same exception, since it
+// could expand those values through #include or _Pragma.
+func ValidateProjectedProbeCandidateArguments(policy, projection string, argv []string) ([]ProbeCandidatePathOperand, error) {
 	switch policy {
 	case ProbeCandidatePolicyCC, ProbeCandidatePolicyLD, ProbeCandidatePolicyCCLink:
 	default:
 		return nil, fmt.Errorf("unsupported probe candidate policy %q", policy)
 	}
+	switch projection {
+	case "", ProbeCandidateProjectionCompilerPredefines, ProbeCandidateProjectionCompilerIntrinsic:
+	default:
+		return nil, fmt.Errorf("unsupported probe candidate projection %q", projection)
+	}
+	if projection != "" && policy != ProbeCandidatePolicyCC {
+		return nil, fmt.Errorf("compiler projection requires compiler candidate policy")
+	}
 	tokens := make([]probeCandidateToken, len(argv))
 	for index, argument := range argv {
 		tokens[index] = probeCandidateToken{value: argument, argument: index, end: len(argument)}
 	}
-	return validateProbeCandidateTokens(policy, tokens)
+	return validateProjectedProbeCandidateTokens(policy, tokens, projection == ProbeCandidateProjectionCompilerIntrinsic)
+}
+
+// ValidateCompilerIntrinsicProbeCandidateArguments validates fully rendered,
+// projected source-owned argv against the actual managed input. Only operators
+// invoked by that canonical input are protected from candidate -D/-U effects;
+// unrelated textual operator definitions retain their original behavior. The
+// legacy projected validator keeps its original attribute-only contract.
+func ValidateCompilerIntrinsicProbeCandidateArguments(step ProbeStep, argv []string) ([]ProbeCandidatePathOperand, error) {
+	calls, err := compilerIntrinsicProbeCalls(step)
+	if err != nil {
+		return nil, err
+	}
+	operators := make(map[string]bool, 2)
+	for _, call := range calls {
+		operators[call.Operator] = true
+	}
+	tokens := make([]probeCandidateToken, len(argv))
+	for index, argument := range argv {
+		// The intrinsic projection rejects preprocessor forwarding and removes
+		// assembler/linker forwarding before this source-aware boundary. Do not
+		// let a direct caller reach the legacy forwarded-token grammar, which
+		// has no binding to this step's managed operators.
+		if strings.HasPrefix(argument, "-Wp,") || strings.HasPrefix(argument, "-Wa,") || strings.HasPrefix(argument, "-Wl,") {
+			return nil, fmt.Errorf("compiler intrinsic projected candidate retains forwarding %q", argument)
+		}
+		tokens[index] = probeCandidateToken{value: argument, argument: index, end: len(argument)}
+	}
+	return validateProbeCandidateTokensWithIntrinsics(ProbeCandidatePolicyCC, tokens, true, operators)
+}
+
+// ProjectProbeCandidateArguments applies one protocol-declared semantic
+// projection after dependency-backed argument fragments have become concrete
+// argv words. The returned origins map every projected word back to its index
+// in argv. A runner uses that mapping to remove or replace only candidate-owned
+// words while leaving managed arguments byte-exact and in their original order.
+//
+// Projection is deliberately separate from ValidateProbeCandidateArguments:
+// the projection removes compiler inputs and output modes which are irrelevant
+// to a managed predefine-only invocation, then the ordinary candidate grammar
+// validates every word which can still reach the configured driver.
+// translationUnits is explicit provenance, not a filename heuristic: each
+// declared word must occur exactly once in argv and is the only positional
+// compiler input this projection is authorized to remove.
+func ProjectProbeCandidateArguments(projection string, argv, translationUnits []string) ([]string, []int, error) {
+	switch projection {
+	case "":
+		if len(translationUnits) != 0 {
+			return nil, nil, fmt.Errorf("probe candidate translation units require a projection")
+		}
+		projected := append([]string(nil), argv...)
+		origins := make([]int, len(argv))
+		for index := range origins {
+			origins[index] = index
+		}
+		return projected, origins, nil
+	case ProbeCandidateProjectionCompilerPredefines:
+		return projectCompilerPredefineCandidateArguments(argv, translationUnits, true)
+	case ProbeCandidateProjectionCompilerIntrinsic:
+		return projectCompilerPredefineCandidateArguments(argv, translationUnits, false)
+	default:
+		return nil, nil, fmt.Errorf("unsupported probe candidate projection %q", projection)
+	}
+}
+
+type compilerPredefineRemovedOperandOption struct {
+	name   string
+	joined bool
+}
+
+// Ordered longest-first where one GCC/Clang spelling prefixes another. These
+// options only select preprocessing inputs. The config-dependency scanner owns
+// those source/header bytes; the compiler-predefine process must observe only
+// compiler defaults and direct command-line macro operations.
+var compilerPredefineRemovedIncludeOptions = []compilerPredefineRemovedOperandOption{
+	{name: "--include-directory"},
+	{name: "--include"},
+	{name: "-iframeworkwithsysroot", joined: true},
+	{name: "-iwithprefixbefore", joined: true},
+	{name: "-isystem-after", joined: true},
+	{name: "-iwithprefix", joined: true},
+	{name: "-iwithsysroot", joined: true},
+	{name: "-iframework", joined: true},
+	{name: "-idirafter", joined: true},
+	{name: "-imultilib", joined: true},
+	{name: "-isystem", joined: true},
+	{name: "-include", joined: true},
+	{name: "-imacros", joined: true},
+	{name: "-iquote", joined: true},
+	{name: "-iprefix", joined: true},
+	{name: "-I", joined: true},
+	{name: "-F", joined: true},
+}
+
+var compilerPredefineRemovedOutputOptions = []compilerPredefineRemovedOperandOption{
+	{name: "--dependency-file"},
+	{name: "--serialize-diagnostics"},
+	{name: "--output"},
+	{name: "-serialize-diagnostics"},
+	{name: "-foptimization-record-file"},
+	{name: "-MF", joined: true},
+	{name: "-MT", joined: true},
+	{name: "-MQ", joined: true},
+	{name: "-MJ", joined: true},
+	{name: "-o", joined: true},
+}
+
+// compilerPredefineRemovedOperand matches both the separated spelling and an
+// explicit =operand. joined additionally admits GCC's traditional -Ifoo-style
+// spelling. Exact empty operands fail closed rather than changing a malformed
+// source invocation into a successful capability query.
+func compilerPredefineRemovedOperand(
+	argument string,
+	options []compilerPredefineRemovedOperandOption,
+) (separated bool, matched bool, err error) {
+	for _, option := range options {
+		if argument == option.name {
+			return true, true, nil
+		}
+		if operand, ok := strings.CutPrefix(argument, option.name+"="); ok {
+			if operand == "" {
+				return false, true, fmt.Errorf("compiler predefine projection has an empty operand for %s", option.name)
+			}
+			return false, true, nil
+		}
+		if option.joined && strings.HasPrefix(argument, option.name) && len(argument) > len(option.name) {
+			return false, true, nil
+		}
+	}
+	return false, false, nil
+}
+
+func projectCompilerPredefineCandidateArguments(argv, translationUnits []string, canonicalizeMacros bool) ([]string, []int, error) {
+	projected := make([]string, 0, len(argv))
+	origins := make([]int, 0, len(argv))
+	remainingTranslationUnits := make(map[string]bool, len(translationUnits))
+	translationUnitOccurrences := make(map[string]int, len(translationUnits))
+	for _, source := range translationUnits {
+		if err := validateProbeToken(source); err != nil {
+			return nil, nil, fmt.Errorf("compiler predefine projection translation unit: %w", err)
+		}
+		if strings.HasPrefix(source, "-") {
+			return nil, nil, fmt.Errorf("compiler predefine projection translation unit looks like an option: %q", source)
+		}
+		if remainingTranslationUnits[source] {
+			return nil, nil, fmt.Errorf("compiler predefine projection repeats translation unit %q", source)
+		}
+		remainingTranslationUnits[source] = true
+	}
+	for _, argument := range argv {
+		if remainingTranslationUnits[argument] {
+			translationUnitOccurrences[argument]++
+		}
+	}
+	for _, source := range translationUnits {
+		if translationUnitOccurrences[source] != 1 {
+			return nil, nil, fmt.Errorf(
+				"compiler predefine projection translation unit %q occurs %d times, want exactly once",
+				source,
+				translationUnitOccurrences[source],
+			)
+		}
+	}
+	appendArgument := func(value string, origin int) {
+		projected = append(projected, value)
+		origins = append(origins, origin)
+	}
+	consumeRemovedOperand := func(index int, option string) (int, error) {
+		if index+1 >= len(argv) {
+			return index, fmt.Errorf("compiler predefine projection has no operand for %s", option)
+		}
+		if err := validateProbeToken(argv[index+1]); err != nil {
+			return index, fmt.Errorf("compiler predefine projection %s operand: %w", option, err)
+		}
+		return index + 1, nil
+	}
+
+	for index := 0; index < len(argv); index++ {
+		argument := argv[index]
+		if err := validateProbeToken(argument); err != nil {
+			return nil, nil, fmt.Errorf("compiler predefine projection argument %d: %w", index, err)
+		}
+		if !canonicalizeMacros && probeCandidateIntrinsicMacroAlias(argument) {
+			return nil, nil, fmt.Errorf("compiler intrinsic projection cannot model macro alias %q", argument)
+		}
+		if argument == "--" {
+			return nil, nil, fmt.Errorf("compiler predefine projection cannot model an option terminator")
+		}
+
+		// Precompiled headers and virtual/module overlays are not equivalent to
+		// text headers owned by the config-dependency scanner. Do not let the
+		// ordinary -include prefix below erase their distinct semantics.
+		if strings.HasPrefix(argument, "-include-pch") ||
+			strings.HasPrefix(argument, "-include-pth") ||
+			strings.HasPrefix(argument, "-ivfsoverlay") {
+			return nil, nil, fmt.Errorf("compiler predefine projection cannot model precompiled or virtual include option %q", argument)
+		}
+
+		if separated, matched, err := compilerPredefineRemovedOperand(argument, compilerPredefineRemovedIncludeOptions); matched {
+			if err != nil {
+				return nil, nil, err
+			}
+			if separated {
+				var consumeErr error
+				index, consumeErr = consumeRemovedOperand(index, argument)
+				if consumeErr != nil {
+					return nil, nil, consumeErr
+				}
+			}
+			continue
+		}
+		switch argument {
+		case "-I-":
+			continue
+		case "-nostdinc", "-nostdinc++", "-nobuiltininc", "-nostdlibinc":
+			// Suppressing default include roots can also suppress an implicit
+			// compiler-owned preinclude, such as GCC's stdc-predef.h. Dropping
+			// these flags would query a different initial macro namespace, not
+			// merely remove source-selected header lookup paths.
+			appendArgument(argument, index)
+			continue
+		}
+
+		if separated, matched, err := compilerPredefineRemovedOperand(argument, compilerPredefineRemovedOutputOptions); matched {
+			if err != nil {
+				return nil, nil, err
+			}
+			if separated {
+				var consumeErr error
+				index, consumeErr = consumeRemovedOperand(index, argument)
+				if consumeErr != nil {
+					return nil, nil, consumeErr
+				}
+			}
+			continue
+		}
+
+		// These switches preserve comments in preprocessor stdout, including
+		// comments from implicit toolchain headers. The initial-state query owns
+		// its output format; comment retention must not corrupt its exact Boolean
+		// vector. Executable compiler invocations retain their original switches.
+		if argument == "-C" || argument == "-CC" {
+			continue
+		}
+
+		// The runner owns preprocessing mode and stdout. Dependency, compile,
+		// and auxiliary-output switches from the original object action are
+		// intentionally absent from the managed predefine invocation.
+		switch argument {
+		case "-c", "-S", "-E", "-M", "-MM", "-MD", "-MMD", "-MP", "-MG",
+			"--compile", "--assemble", "--preprocess", "-fsyntax-only",
+			"-gsplit-dwarf", "-fstack-usage", "-fsave-optimization-record":
+			continue
+		}
+		if strings.HasPrefix(argument, "-save-temps") ||
+			strings.HasPrefix(argument, "--save-temps") ||
+			strings.HasPrefix(argument, "-ftime-trace") ||
+			strings.HasPrefix(argument, "-fdump-") ||
+			strings.HasPrefix(argument, "-fopt-info") {
+			continue
+		}
+		if strings.HasPrefix(argument, "-Wp,") {
+			if !configDependencySafeWpDependencyArgument(argument) {
+				return nil, nil, fmt.Errorf("compiler predefine projection cannot model preprocessor forwarding %q", argument)
+			}
+			continue
+		}
+
+		// Assembler and linker forwarding has no effect while the managed driver
+		// stops after preprocessing. Removing it also prevents forwarded output
+		// paths from acquiring authority in this action.
+		if strings.HasPrefix(argument, "-Wa,") || strings.HasPrefix(argument, "-Wl,") {
+			if len(argument) == 4 {
+				return nil, nil, fmt.Errorf("compiler predefine projection has an empty forwarding option %q", argument)
+			}
+			continue
+		}
+		if argument == "-Xassembler" || argument == "-Xlinker" {
+			var consumeErr error
+			index, consumeErr = consumeRemovedOperand(index, argument)
+			if consumeErr != nil {
+				return nil, nil, consumeErr
+			}
+			continue
+		}
+		if strings.HasPrefix(argument, "-Xassembler=") || strings.HasPrefix(argument, "-Xlinker=") {
+			if strings.HasSuffix(argument, "=") {
+				return nil, nil, fmt.Errorf("compiler predefine projection has an empty forwarding option %q", argument)
+			}
+			continue
+		}
+
+		if argument == "-x" || strings.HasPrefix(argument, "-x") {
+			return nil, nil, fmt.Errorf("compiler predefine projection cannot model candidate language override %q", argument)
+		}
+		if argument == "--language" || strings.HasPrefix(argument, "--language=") ||
+			strings.HasPrefix(argument, "-internal-isystem") ||
+			strings.HasPrefix(argument, "-internal-externc-isystem") ||
+			argument == "-Xpreprocessor" || strings.HasPrefix(argument, "-Xpreprocessor=") ||
+			argument == "-Xclang" || strings.HasPrefix(argument, "-Xclang=") ||
+			argument == "-mllvm" || strings.HasPrefix(argument, "-mllvm=") ||
+			argument == "-cc1" || strings.HasPrefix(argument, "-cc1=") ||
+			strings.HasPrefix(argument, "-X") {
+			return nil, nil, fmt.Errorf("compiler predefine projection cannot model frontend forwarding or language option %q", argument)
+		}
+
+		if argument == "-D" {
+			if index+1 >= len(argv) {
+				return nil, nil, fmt.Errorf("compiler predefine projection has no operand for -D")
+			}
+			operandIndex := index + 1
+			operand := argv[operandIndex]
+			if err := validateProbeToken(operand); err != nil {
+				return nil, nil, fmt.Errorf("compiler predefine projection -D operand: %w", err)
+			}
+			if canonical, ok := canonicalCompilerPredefineObjectMacro(operand); canonicalizeMacros && ok {
+				operand = canonical
+			}
+			appendArgument(argument, index)
+			appendArgument(operand, operandIndex)
+			index++
+			continue
+		}
+		if operand, joined := strings.CutPrefix(argument, "-D"); joined && operand != "" {
+			if canonical, ok := canonicalCompilerPredefineObjectMacro(operand); canonicalizeMacros && ok {
+				argument = "-D" + canonical
+			}
+			appendArgument(argument, index)
+			continue
+		}
+
+		// Do not mistake a known scalar option payload for an output switch.
+		// -D is handled separately above to preserve object-macro normalization.
+		if probeCandidateOptionRequiresScalar(argument, ProbeCandidatePolicyCC) {
+			operandIndex, err := consumeRemovedOperand(index, argument)
+			if err != nil {
+				return nil, nil, err
+			}
+			appendArgument(argument, index)
+			appendArgument(argv[operandIndex], operandIndex)
+			index = operandIndex
+			continue
+		}
+
+		if remainingTranslationUnits[argument] {
+			delete(remainingTranslationUnits, argument)
+			continue
+		}
+		appendArgument(argument, index)
+	}
+	if len(remainingTranslationUnits) != 0 {
+		return nil, nil, fmt.Errorf("compiler predefine projection did not consume every translation unit")
+	}
+	return projected, origins, nil
 }
 
 func validateProbeCandidateTokens(policy string, tokens []probeCandidateToken) ([]ProbeCandidatePathOperand, error) {
+	return validateProjectedProbeCandidateTokens(policy, tokens, false)
+}
+
+func validateProjectedProbeCandidateTokens(policy string, tokens []probeCandidateToken, intrinsic bool) ([]ProbeCandidatePathOperand, error) {
+	var operators map[string]bool
+	if intrinsic {
+		operators = map[string]bool{"__has_attribute": true}
+	}
+	return validateProbeCandidateTokensWithIntrinsics(policy, tokens, intrinsic, operators)
+}
+
+func validateProbeCandidateTokensWithIntrinsics(policy string, tokens []probeCandidateToken, intrinsic bool, operators map[string]bool) ([]ProbeCandidatePathOperand, error) {
 	paths := []ProbeCandidatePathOperand{}
 	mayHaveScalarOperand := false
 	for index := 0; index < len(tokens); index++ {
@@ -235,6 +617,9 @@ func validateProbeCandidateTokens(policy string, tokens []probeCandidateToken) (
 		argument := token.value
 		if err := validateProbeToken(argument); err != nil {
 			return nil, err
+		}
+		if intrinsic && probeCandidateIntrinsicMacroAlias(argument) {
+			return nil, fmt.Errorf("compiler intrinsic candidate cannot use macro alias %q", argument)
 		}
 
 		if !strings.HasPrefix(argument, "-") {
@@ -245,6 +630,32 @@ func validateProbeCandidateTokens(policy string, tokens []probeCandidateToken) (
 			continue
 		}
 		mayHaveScalarOperand = false
+
+		if intrinsic && (strings.HasPrefix(argument, "-D") || strings.HasPrefix(argument, "-U")) {
+			operand := argument[2:]
+			operandIndex := index
+			if operand == "" {
+				operandIndex++
+				if operandIndex >= len(tokens) {
+					return nil, fmt.Errorf("missing macro operand for %s", argument)
+				}
+				operand = tokens[operandIndex].value
+				if err := validateProbeToken(operand); err != nil {
+					return nil, fmt.Errorf("%s macro operand: %w", argument, err)
+				}
+			}
+			name, valid := probeCandidateIntrinsicMacroName(operand, argument[1] == 'D')
+			if !valid {
+				return nil, fmt.Errorf("invalid compiler intrinsic macro operand %q", operand)
+			}
+			if operators[name] {
+				return nil, fmt.Errorf("candidate cannot replace or undefine the managed compiler intrinsic operator")
+			}
+			if argument[1] == 'D' && probeCandidateLiteralMacroDefinition(operand) {
+				index = operandIndex
+				continue
+			}
+		}
 
 		if argument == "-" || argument == "--" {
 			return nil, fmt.Errorf("probe-controlled input or option terminator is prohibited: %q", argument)
@@ -347,6 +758,103 @@ func validateProbeCandidateTokens(policy string, tokens []probeCandidateToken) (
 		mayHaveScalarOperand = probeCandidateOptionMayHaveScalar(argument)
 	}
 	return paths, nil
+}
+
+// Parse the complete command-line signature, not just its leading identifier.
+// Replacement tokens remain opaque unless the literal-only exception below
+// applies. This prevents alternate spellings from bypassing operator protection.
+func probeCandidateIntrinsicMacroName(operand string, define bool) (string, bool) {
+	signature := operand
+	if define {
+		signature, _, _ = strings.Cut(operand, "=")
+	}
+	name, ok := configDependencyMacroIdentifier(signature)
+	if !ok {
+		return "", false
+	}
+	rest := signature[len(name):]
+	if rest == "" {
+		return name, true
+	}
+	if !define || !strings.HasPrefix(rest, "(") || !strings.HasSuffix(rest, ")") {
+		return "", false
+	}
+	formals := strings.TrimSpace(rest[1 : len(rest)-1])
+	if formals == "" {
+		return name, true
+	}
+	seen := map[string]bool{}
+	parts := strings.Split(formals, ",")
+	for index, part := range parts {
+		parameter := strings.TrimSpace(part)
+		if strings.HasSuffix(parameter, "...") {
+			if index != len(parts)-1 {
+				return "", false
+			}
+			parameter = strings.TrimSpace(strings.TrimSuffix(parameter, "..."))
+			if parameter == "" {
+				continue
+			}
+		}
+		identifier, valid := configDependencyMacroIdentifier(parameter)
+		if !valid || identifier != parameter || seen[identifier] {
+			return "", false
+		}
+		seen[identifier] = true
+	}
+	return name, true
+}
+
+func probeCandidateIntrinsicMacroAlias(argument string) bool {
+	option, _, _ := strings.Cut(argument, "=")
+	// Drivers may accept unambiguous long-option abbreviations. None of these
+	// spellings may bypass the explicit -D/-U operator protection above.
+	return len(option) > 2 && strings.HasPrefix(option, "--") &&
+		(strings.HasPrefix("--define-macro", option) || strings.HasPrefix("--undefine-macro", option))
+}
+
+// Recognize exactly one ordinary C string token without decoding or rewriting
+// any bytes. In particular, source/object-tree marker text here is not a path
+// operand. Do not admit function macros, concatenation, comments or trigraphs.
+func probeCandidateLiteralMacroDefinition(operand string) bool {
+	name, value, ok := strings.Cut(operand, "=")
+	identifier, valid := configDependencyMacroIdentifier(name)
+	if !ok || !valid || identifier != name || len(value) < 2 || value[0] != '"' || strings.Contains(value, "??") {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		character := value[index]
+		if character < ' ' || character == 127 {
+			return false
+		}
+		switch character {
+		case '"':
+			return index == len(value)-1
+		case '\\':
+			index++
+			if index >= len(value) {
+				return false
+			}
+			switch value[index] {
+			case '\\', '"', '\'', '?', 'a', 'b', 'f', 'n', 'r', 't', 'v':
+			case '0', '1', '2', '3', '4', '5', '6', '7':
+				for count := 1; count < 3 && index+1 < len(value) && value[index+1] >= '0' && value[index+1] <= '7'; count++ {
+					index++
+				}
+			case 'x':
+				start := index
+				for index+1 < len(value) && strings.ContainsRune("0123456789abcdefABCDEF", rune(value[index+1])) {
+					index++
+				}
+				if index == start {
+					return false
+				}
+			default:
+				return false
+			}
+		}
+	}
+	return false
 }
 
 func probeCandidateOptionRequiresScalar(argument, policy string) bool {
@@ -457,7 +965,7 @@ func probeCandidateToolSelectionOption(argument string) bool {
 		{name: "--ld-path"}, {name: "-fuse-ld"},
 		{name: "--resource-dir"}, {name: "-resource-dir"},
 		{name: "-specs"}, {name: "--specs"}, {name: "-wrapper"},
-		{name: "--sysroot"}, {name: "-isysroot"},
+		{name: "--sysroot"}, {name: "-isysroot", attached: true},
 		{name: "-ccc-install-dir"}, {name: "-gcc-install-dir"},
 		{name: "-working-directory"}, {name: "-ivfsoverlay"},
 	} {

@@ -29,7 +29,8 @@ type ProbeDiscovery interface {
 // ProbePlanBuilder content-addresses requests and their dependency DAG. It is
 // deliberately unaware of compiler families and Kconfig symbols.
 type ProbePlanBuilder struct {
-	plan ProbePlan
+	plan    ProbePlan
+	nodeIDs map[string]bool
 }
 
 func NewProbePlanBuilder(targetIdentity, hostIdentity string) (*ProbePlanBuilder, error) {
@@ -42,7 +43,10 @@ func NewProbePlanBuilder(targetIdentity, hostIdentity string) (*ProbePlanBuilder
 			return nil, fmt.Errorf("%s probe toolset: %w", scope, err)
 		}
 	}
-	return &ProbePlanBuilder{plan: ProbePlan{Toolsets: toolsets, Requests: map[string]ProbeRequest{}}}, nil
+	return &ProbePlanBuilder{
+		plan:    ProbePlan{Toolsets: toolsets, Requests: map[string]ProbeRequest{}},
+		nodeIDs: map[string]bool{},
+	}, nil
 }
 
 func (b *ProbePlanBuilder) Request(scope string, request ProbeRequest, dependencies ...ProbeReference) (ProbeReference, error) {
@@ -69,12 +73,17 @@ func (b *ProbePlanBuilder) Request(scope string, request ProbeRequest, dependenc
 	node := ProbePlanNode{Scope: scope, RequestID: requestID, Inputs: inputs}
 	node.ID = node.ContentID()
 	b.plan.Requests[requestID] = request
-	for _, existing := range b.plan.Nodes {
-		if existing.ID == node.ID {
-			return ProbeReference{NodeID: node.ID, RequestID: requestID, Scope: scope, Kind: request.Outcome.Kind}, nil
+	if b.nodeIDs == nil {
+		b.nodeIDs = make(map[string]bool, len(b.plan.Nodes)+1)
+		for _, existing := range b.plan.Nodes {
+			b.nodeIDs[existing.ID] = true
 		}
 	}
+	if b.nodeIDs[node.ID] {
+		return ProbeReference{NodeID: node.ID, RequestID: requestID, Scope: scope, Kind: request.Outcome.Kind}, nil
+	}
 	b.plan.Nodes = append(b.plan.Nodes, node)
+	b.nodeIDs[node.ID] = true
 	return ProbeReference{NodeID: node.ID, RequestID: requestID, Scope: scope, Kind: request.Outcome.Kind}, nil
 }
 

@@ -1,13 +1,22 @@
 load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
+# The heap binding is an explicit diagnostic-only source. Gazelle must not
+# silently add it to the ordinary library and enable normal allocation sampling.
+# gazelle:exclude heap_profile_diagnostic.go
+
 go_library(
     name = "kconfig_parse_lib",
     srcs = [
+        "family_compiler_guard_transport.go",
+        "family_compiler_guards.go",
+        "family_compiler_intrinsics.go",
+        "family_execution.go",
         "frontier_join.go",
         "frontier_state.go",
         "frontier_virtual_file_view.go",
         "main.go",
         "path_set.go",
+        "profiling.go",
     ],
     importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/kconfig_parse",
     visibility = ["//visibility:private"],
@@ -24,20 +33,55 @@ go_binary(
     visibility = ["//visibility:public"],
 )
 
+# keep
+go_library(
+    name = "kconfig_parse_heap_lib",
+    srcs = ["heap_profile_diagnostic.go"],
+    embed = [":kconfig_parse_lib"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/kconfig_parse",
+    visibility = ["//visibility:private"],
+)
+
+# keep
+go_binary(
+    name = "kconfig_parse_heap",
+    embed = [":kconfig_parse_heap_lib"],
+    pure = "on",
+    visibility = ["//internal:__pkg__"],
+)
+
 go_test(
     name = "kconfig_parse_test",
     srcs = [
         "deferred_content_selection_test.go",
+        "family_compiler_guard_carry_test.go",
+        "family_compiler_guard_transport_test.go",
+        "family_compiler_guards_test.go",
+        "family_compiler_intrinsic_cardinality_test.go",
+        "family_compiler_intrinsics_test.go",
+        "family_execution_test.go",
+        "family_guard_discovery_test.go",
         "frontier_join_test.go",
         "frontier_state_test.go",
         "frontier_virtual_file_view_test.go",
         "main_test.go",
         "path_set_test.go",
+        "profile_binary_test.go",
+        "profile_test.go",
         "virtual_file_alias_test.go",
     ],
+    data = [
+        ":kconfig_parse",
+        ":kconfig_parse_heap",
+    ],
     embed = [":kconfig_parse_lib"],
+    env = {
+        "LINUX_BZL_TEST_NORMAL_PLANNER": "$(rlocationpath :kconfig_parse)",
+        "LINUX_BZL_TEST_HEAP_PLANNER": "$(rlocationpath :kconfig_parse_heap)",
+    },
     deps = [
         "//internal/kconfig",
         "//internal/toolaction",
+        "@rules_go//go/runfiles",
     ],
 )

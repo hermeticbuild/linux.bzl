@@ -716,6 +716,42 @@ func testSourceScriptOutputScopes(
 	return &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{fixture.scope: evaluator}}
 }
 
+func testSourceScriptOutputDualScopes(
+	t *testing.T,
+	root string,
+	discovery ProbeDiscovery,
+	oracle ProbeResultLookup,
+) *KbuildProbeScopes {
+	t.Helper()
+	scopes := &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{}}
+	registry := newLinuxProbeSymbolRegistry()
+	fixtures := linuxCompilerBootstrapFixtures(t)
+	for _, fixture := range []bootstrapFixture{fixtures[1], fixtures[0]} {
+		facts, err := ParseLinuxCompilerBootstrapResult(fixture.result, fixture.scope, bootstrapTestIdentity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tools := map[string]string{
+			"cc":                    "/configured/" + fixture.scope + "/cc",
+			linuxProbeScriptRunner:  "/configured/" + fixture.scope + "/scriptrun",
+			linuxProbeScriptRuntime: "/configured/" + fixture.scope + "/script-runtime",
+			compactKbuildScriptAppletRolePrefix + "cat": "/configured/" + fixture.scope + "/cat",
+		}
+		evaluator, err := NewLinuxProbeEvaluator(LinuxProbeEvaluatorOptions{
+			Scope: fixture.scope, Architecture: "x86", SourceArchitecture: "x86", SourceRoot: root,
+			Facts: facts, Tools: tools,
+			ScriptEnvironment: map[string]string{"CC": tools["cc"], "SCRIPT_MODE": fixture.scope},
+			Discovery:         discovery, Oracle: oracle,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		evaluator.symbolRegistry = registry
+		scopes.evaluators[fixture.scope] = evaluator
+	}
+	return scopes
+}
+
 func sourceScriptOutputFixture(t *testing.T) (string, []KbuildSourceScriptArgument) {
 	t.Helper()
 	root := t.TempDir()
@@ -954,6 +990,411 @@ func TestKbuildSourceScriptOutputTextReplayReturnsExactStdoutBytes(t *testing.T)
 	}
 	if len(replayPlan.Nodes) != 1 || replayPlan.Nodes[0].ID != node.ID {
 		t.Fatalf("stdout replay nodes = %#v, want %s", replayPlan.Nodes, node.ID)
+	}
+}
+
+func evaluatedScriptOutputRecipeForTest() (string, string) {
+	target := "include/generated/timeconst.h"
+	return target, "{ echo 250 | bc -q ${tree:kernel}/kernel/time/timeconst.bc; } > " + target
+}
+
+func TestKbuildEvaluatedScriptOutputTextDiscoveryUsesExactRecipeAndEnvironment(t *testing.T) {
+	root, _ := sourceScriptOutputFixture(t)
+	mustWriteSource(t, root, "kernel/time/timeconst.bc", "scale=6\nprint HZ\n")
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes := testSourceScriptOutputScopes(t, root, builder, nil)
+	target, recipe := evaluatedScriptOutputRecipeForTest()
+	text, concrete, recognized, err := scopes.EvaluatedScriptOutputText(
+		"target", target, recipe, []string{"kernel/time/timeconst.bc"}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "" || concrete || !recognized {
+		t.Fatalf("discovery result = (%q,%t,%t), want empty, pending, recognized", text, concrete, recognized)
+	}
+	plan, err := builder.Plan(scopes.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 1 {
+		t.Fatalf("evaluated-script probe nodes = %#v", plan.Nodes)
+	}
+	request := plan.Requests[plan.Nodes[0].RequestID]
+	if got, want := request.Sources, []string{"Kconfig", "kernel/time/timeconst.bc"}; !slices.Equal(got, want) {
+		t.Fatalf("sources = %q, want %q", got, want)
+	}
+	if got, want := request.SourceRoots, []string{"linux"}; !slices.Equal(got, want) {
+		t.Fatalf("source roots = %q, want %q", got, want)
+	}
+	if got, want := len(request.Steps), 3; got != want ||
+		request.Steps[0].Name != "prepare-evaluated-script-output" ||
+		request.Steps[1].Name != "evaluated-script-output" ||
+		request.Steps[2].Name != "validate-evaluated-script-output" {
+		t.Fatalf("steps = %#v", request.Steps)
+	}
+	prepare, step, validate := request.Steps[0], request.Steps[1], request.Steps[2]
+	if step.WorkingDirectory != "${scratch:working-tree}" ||
+		prepare.WorkingDirectory != step.WorkingDirectory || validate.WorkingDirectory != step.WorkingDirectory ||
+		step.Environment["SCRIPT_MODE"] != "exact" || step.Environment["CC"] != "cc" {
+		t.Fatalf("evaluated-script execution contract = %#v", step)
+	}
+	encodedIndex := slices.Index(step.Arguments, "-script_content_base64")
+	if encodedIndex < 0 || encodedIndex+1 >= len(step.Arguments) {
+		t.Fatalf("evaluated-script argv has no encoded body: %q", step.Arguments)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(step.Arguments[encodedIndex+1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMeasuredRecipe := "#!/bin/sh\nset -e\n" + strings.ReplaceAll(
+		recipe, "${tree:kernel}/kernel/time/timeconst.bc", "kernel/time/timeconst.bc",
+	) + "\n"
+	if got := string(decoded); got != wantMeasuredRecipe {
+		t.Fatalf("measured recipe = %q, want exact final shell %q", got, wantMeasuredRecipe)
+	}
+	if strings.Contains(string(decoded), "unsafe()") || strings.Contains(string(decoded), "probe_root") ||
+		strings.Contains(string(decoded), "source_root") {
+		t.Fatalf("measured recipe contains probe-only shell state: %q", decoded)
+	}
+	validationIndex := slices.Index(validate.Arguments, "-script_content_base64")
+	if validationIndex < 0 || validationIndex+1 >= len(validate.Arguments) {
+		t.Fatalf("validation argv has no encoded body: %q", validate.Arguments)
+	}
+	validationBody, err := base64.StdEncoding.DecodeString(validate.Arguments[validationIndex+1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"find . -mindepth 1 ! -path './include/generated/timeconst.h' ! -path './include/generated' ! -path './include'",
+		"if [ ! -f 'include/generated/timeconst.h' ] || [ -L 'include/generated/timeconst.h' ]; then unsafe; fi",
+		"! -perm 0644",
+		"if [ \"$size\" -gt 46080 ]; then unsafe; fi",
+		"contains_transient()",
+		linuxProbeEvaluatedScriptSafePrefix[:len(linuxProbeEvaluatedScriptSafePrefix)-1],
+	} {
+		if !strings.Contains(string(validationBody), want) {
+			t.Errorf("validation script %q omits %q", validationBody, want)
+		}
+	}
+	for _, want := range []string{"-timeout_seconds", "10", "-fallback_stdout_base64", "-max_file_size_bytes", "50176"} {
+		if !slices.Contains(step.Arguments, want) {
+			t.Errorf("measured recipe argv %q omits %q", step.Arguments, want)
+		}
+	}
+	for _, want := range []string{"base64", "find", "grep", "sh", "wc", "kernel=${source_root:linux}", "cc=${tool:cc}"} {
+		if !slices.Contains(validate.Arguments, want) {
+			t.Errorf("validation argv %q omits %q", validate.Arguments, want)
+		}
+	}
+	for _, want := range []string{"chmod", "cp", "mkdir", "sh", "kernel=${source_root:linux}"} {
+		if !slices.Contains(prepare.Arguments, want) {
+			t.Errorf("setup argv %q omits %q", prepare.Arguments, want)
+		}
+	}
+	if slices.Contains(step.Arguments, "timeout") {
+		t.Errorf("probe argv unexpectedly requires an inner-shell timeout applet: %q", step.Arguments)
+	}
+	if !slices.Contains(step.AuxiliaryTools, "cc") {
+		t.Errorf("evaluated-script auxiliary tools %q omit inherited CC role", step.AuxiliaryTools)
+	}
+}
+
+func TestKbuildEvaluatedScriptOutputTextCarriesExactWorkingTreeContents(t *testing.T) {
+	root, _ := sourceScriptOutputFixture(t)
+	mustWriteSource(t, root, "kernel/time/timeconst.bc", "fixture\n")
+	target, recipe := evaluatedScriptOutputRecipeForTest()
+	requestFor := func(content string) (ProbeRequest, ProbePlanNode) {
+		t.Helper()
+		builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		scopes := testSourceScriptOutputScopes(t, root, builder, nil)
+		if _, concrete, recognized, err := scopes.EvaluatedScriptOutputText(
+			"target", target, recipe, []string{"kernel/time/timeconst.bc"},
+			map[string]string{".config": content},
+		); err != nil || concrete || !recognized {
+			t.Fatalf("working-tree discovery = concrete %t, recognized %t, error %v", concrete, recognized, err)
+		}
+		plan, err := builder.Plan(scopes.References()...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(plan.Nodes) != 1 {
+			t.Fatalf("working-tree probe nodes = %#v", plan.Nodes)
+		}
+		node := plan.Nodes[0]
+		return plan.Requests[node.RequestID], node
+	}
+
+	empty, emptyNode := requestFor("")
+	if len(empty.Scratch) != 2 || empty.Scratch[0].Name != "working-input-0000" ||
+		empty.Scratch[0].Kind != "file" || !empty.Scratch[0].Present ||
+		!empty.Scratch[0].ContentIsOpaque || empty.Scratch[0].Content != "" ||
+		empty.Scratch[1] != (ProbeScratch{Name: "working-tree", Kind: "directory"}) {
+		t.Fatalf("empty exact working input = %#v", empty.Scratch)
+	}
+	step := empty.Steps[0]
+	separator := slices.Index(step.Arguments, "--")
+	if separator < 0 || separator+1 >= len(step.Arguments) || step.Arguments[separator+1] != "${scratch:working-input-0000}" {
+		t.Fatalf("working input transport argv = %q", step.Arguments)
+	}
+	encoded := slices.Index(step.Arguments, "-script_content_base64")
+	if encoded < 0 || encoded >= separator || encoded+1 >= len(step.Arguments) {
+		t.Fatalf("evaluated script must precede positional transports: %q", step.Arguments)
+	}
+	body, err := base64.StdEncoding.DecodeString(step.Arguments[encoded+1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `cp -- "${1}" '.config'`; !strings.Contains(string(body), want) {
+		t.Errorf("working-tree setup body %q omits %q", body, want)
+	}
+	validate := empty.Steps[2]
+	validateEncoded := slices.Index(validate.Arguments, "-script_content_base64")
+	validationBody, err := base64.StdEncoding.DecodeString(validate.Arguments[validateEncoded+1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`cmp -s '.config' "${1}"`, `! -path './.config'`} {
+		if !strings.Contains(string(validationBody), want) {
+			t.Errorf("working-tree validation body %q omits %q", validationBody, want)
+		}
+	}
+
+	nonempty, nonemptyNode := requestFor("CONFIG_CHANGED=y\n")
+	if len(nonempty.Scratch) != 2 || nonempty.Scratch[0].Content != "CONFIG_CHANGED=y\n" ||
+		!nonempty.Scratch[0].Present || !nonempty.Scratch[0].ContentIsOpaque {
+		t.Fatalf("nonempty exact working input = %#v", nonempty.Scratch)
+	}
+	if emptyNode.ID == nonemptyNode.ID || emptyNode.RequestID == nonemptyNode.RequestID {
+		t.Fatalf("working-tree content did not affect request identity: empty=%#v nonempty=%#v", emptyNode, nonemptyNode)
+	}
+}
+
+func evaluatedScriptOutputResultSteps(request ProbeRequest, envelope string) []ProbeStepResult {
+	steps := make([]ProbeStepResult, 0, len(request.Steps))
+	for _, step := range request.Steps {
+		result := ProbeStepResult{Name: step.Name, Status: "success", ExitCode: 0}
+		if step.Name == "validate-evaluated-script-output" {
+			result.Stdout = envelope
+		}
+		steps = append(steps, result)
+	}
+	return steps
+}
+
+func TestKbuildEvaluatedScriptOutputTextAcrossScopesRequiresConsensus(t *testing.T) {
+	root, _ := sourceScriptOutputFixture(t)
+	mustWriteSource(t, root, "kernel/time/timeconst.bc", "fixture\n")
+	target, recipe := evaluatedScriptOutputRecipeForTest()
+	discovery, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discoveryScopes := testSourceScriptOutputDualScopes(t, root, discovery, nil)
+	if text, concrete, recognized, err := discoveryScopes.EvaluatedScriptOutputTextAcrossScopes(
+		target, recipe, []string{"kernel/time/timeconst.bc"}, nil,
+	); err != nil || text != "" || concrete || !recognized {
+		t.Fatalf("cross-scope discovery = (%q,%t,%t,%v), want pending recognized result", text, concrete, recognized, err)
+	}
+	plan, err := discovery.Plan(discoveryScopes.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 2 || plan.Nodes[0].Scope == plan.Nodes[1].Scope {
+		t.Fatalf("cross-scope discovery nodes = %#v, want target and host", plan.Nodes)
+	}
+
+	const exact = "#define GENERATED_VALUE 250\n"
+	for _, test := range []struct {
+		name       string
+		host       string
+		recognized bool
+	}{
+		{name: "identical", host: exact, recognized: true},
+		{name: "scope sensitive", host: "#define GENERATED_VALUE 1000\n", recognized: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			results := probeResultMap{}
+			for _, node := range plan.Nodes {
+				request := plan.Requests[node.RequestID]
+				contents := exact
+				if node.Scope == "host" {
+					contents = test.host
+				}
+				envelope := linuxProbeEvaluatedScriptSafePrefix + base64.StdEncoding.EncodeToString([]byte(contents)) + "\n"
+				results[node.ID] = ProbeResult{
+					Schema: LinuxProbeResultSchema, NodeID: node.ID, RequestID: node.RequestID,
+					Scope: node.Scope, ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: envelope,
+					Steps: evaluatedScriptOutputResultSteps(request, envelope),
+				}
+			}
+			replay, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replayScopes := testSourceScriptOutputDualScopes(t, root, replay, results)
+			got, concrete, recognized, err := replayScopes.EvaluatedScriptOutputTextAcrossScopes(
+				target, recipe, []string{"kernel/time/timeconst.bc"}, nil,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !concrete || recognized != test.recognized {
+				t.Fatalf("cross-scope replay = (%q,%t,%t), want concrete recognized=%t", got, concrete, recognized, test.recognized)
+			}
+			if test.recognized && got != exact || !test.recognized && got != "" {
+				t.Fatalf("cross-scope replay text = %q, recognized=%t", got, recognized)
+			}
+		})
+	}
+}
+
+func TestKbuildEvaluatedScriptOutputTextReplayReturnsMeasuredBytes(t *testing.T) {
+	root, _ := sourceScriptOutputFixture(t)
+	mustWriteSource(t, root, "kernel/time/timeconst.bc", "fixture\n")
+	target, recipe := evaluatedScriptOutputRecipeForTest()
+	discovery, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	discoveryScopes := testSourceScriptOutputScopes(t, root, discovery, nil)
+	if _, concrete, recognized, err := discoveryScopes.EvaluatedScriptOutputText(
+		"target", target, recipe, []string{"kernel/time/timeconst.bc"}, nil,
+	); err != nil || concrete || !recognized {
+		t.Fatalf("discovery = concrete %t, recognized %t, %v", concrete, recognized, err)
+	}
+	plan, err := discovery.Plan(discoveryScopes.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := plan.Nodes[0]
+	request := plan.Requests[node.RequestID]
+	const exact = "#include <linux/param.h>\n#if HZ == 250\n#define HZ_TO_MSEC 4\n#endif\n"
+	envelope := linuxProbeEvaluatedScriptSafePrefix + base64.StdEncoding.EncodeToString([]byte(exact)) + "\n"
+	result := ProbeResult{
+		Schema: LinuxProbeResultSchema, NodeID: node.ID, RequestID: node.RequestID,
+		Scope: "target", ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: envelope,
+		Steps: evaluatedScriptOutputResultSteps(request, envelope),
+	}
+	replay, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayScopes := testSourceScriptOutputScopes(t, root, replay, probeResultMap{node.ID: result})
+	got, concrete, recognized, err := replayScopes.EvaluatedScriptOutputText(
+		"target", target, recipe, []string{"kernel/time/timeconst.bc"}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !concrete || !recognized || got != exact {
+		t.Fatalf("replay result = (%q,%t,%t), want exact measured bytes", got, concrete, recognized)
+	}
+}
+
+func TestKbuildEvaluatedScriptOutputTextFailsClosed(t *testing.T) {
+	root, _ := sourceScriptOutputFixture(t)
+	mustWriteSource(t, root, "kernel/time/timeconst.bc", "fixture\n")
+	newScopes := func() (*KbuildProbeScopes, *ProbePlanBuilder) {
+		builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return testSourceScriptOutputScopes(t, root, builder, nil), builder
+	}
+	target, recipe := evaluatedScriptOutputRecipeForTest()
+	for name, candidate := range map[string]string{
+		"dynamic shell parameter":   strings.Replace(recipe, "echo 250", "echo $CONFIG_HZ", 1),
+		"shell state introspection": "{ set | grep probe_root | wc -l; } > " + target,
+		"process introspection":     "{ ps; } > " + target,
+		"file metadata":             "{ stat .config; } > " + target,
+		"source awk program":        "{ awk -f ${tree:kernel}/kernel/time/timeconst.bc; } > " + target,
+		"source sed program":        "{ sed -f ${tree:kernel}/kernel/time/timeconst.bc; } > " + target,
+		"metadata predicate":        "{ test .config -nt ${tree:kernel}/kernel/time/timeconst.bc; } > " + target,
+		"object tree input":         strings.Replace(recipe, "${tree:kernel}", "${tree:prep}", 1),
+		"second output":             strings.Replace(recipe, "; }", "> leaked.txt; }", 1),
+		"path command":              strings.Replace(recipe, "bc", "tools/bc", 1),
+		"output command argument":   recipe + "; chmod +x " + target,
+		"output ancestor argument":  recipe + "; chmod 777 include/generated",
+		"working root argument":     recipe + "; chmod 777 .",
+		"relative source operand":   strings.Replace(recipe, "${tree:kernel}/kernel/time/timeconst.bc", "kernel/time/timeconst.bc", 1),
+		"implicit absolute operand": strings.Replace(recipe, "bc -q", "bc if=/proc/cpuinfo", 1),
+		"nested command language":   strings.Replace(recipe, "bc -q ${tree:kernel}/kernel/time/timeconst.bc", "sh -c 'printf leak > /tmp/leak'", 1),
+		"tree marker sibling":       strings.Replace(recipe, "${tree:kernel}/kernel/time/timeconst.bc", "${tree:kernel}.sibling", 1),
+		"observed deletion":         strings.Replace(recipe, "echo 250", "rm -f sibling; echo 250", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			scopes, builder := newScopes()
+			if _, concrete, recognized, err := scopes.EvaluatedScriptOutputText(
+				"target", target, candidate, []string{"kernel/time/timeconst.bc"}, nil,
+			); err != nil || concrete || recognized {
+				t.Fatalf("unsupported recipe = concrete %t, recognized %t, error %v", concrete, recognized, err)
+			}
+			plan, err := builder.Plan(scopes.References()...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plan.Nodes) != 0 {
+				t.Fatalf("unsupported recipe registered probes: %#v", plan.Nodes)
+			}
+		})
+	}
+
+	if err := os.Symlink("timeconst.bc", filepath.Join(root, "kernel/time/link.bc")); err != nil {
+		t.Fatal(err)
+	}
+	symlinkRecipe := strings.Replace(recipe, "kernel/time/timeconst.bc", "kernel/time/link.bc", 1)
+	scopes, builder := newScopes()
+	if _, concrete, recognized, err := scopes.EvaluatedScriptOutputText(
+		"target", target, symlinkRecipe, []string{"kernel/time/link.bc"}, nil,
+	); err != nil || concrete || recognized {
+		t.Fatalf("symlink prerequisite = concrete %t, recognized %t, error %v; want conservative fallback", concrete, recognized, err)
+	}
+	plan, err := builder.Plan(scopes.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 0 {
+		t.Fatalf("symlink prerequisite registered probes: %#v", plan.Nodes)
+	}
+
+	scopes, builder = newScopes()
+	scopes.evaluators["target"].scriptEnvironment["BC_ENV_ARGS"] = "/undeclared/program.bc"
+	if _, concrete, recognized, err := scopes.EvaluatedScriptOutputText(
+		"target", target, recipe, []string{"kernel/time/timeconst.bc"}, nil,
+	); err != nil || concrete || recognized {
+		t.Fatalf("BC_ENV_ARGS recipe = concrete %t, recognized %t, error %v; want conservative fallback", concrete, recognized, err)
+	}
+	plan, err = builder.Plan(scopes.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 0 {
+		t.Fatalf("BC_ENV_ARGS recipe registered probes: %#v", plan.Nodes)
+	}
+
+	tooMany := make([]string, maxProbeSources)
+	for index := range tooMany {
+		tooMany[index] = "kernel/time/timeconst.bc"
+	}
+	scopes, builder = newScopes()
+	if _, concrete, recognized, err := scopes.EvaluatedScriptOutputText(
+		"target", target, recipe, tooMany, nil,
+	); err != nil || concrete || recognized {
+		t.Fatalf("oversized source frontier = concrete %t, recognized %t, error %v; want conservative fallback", concrete, recognized, err)
+	}
+	plan, err = builder.Plan(scopes.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 0 {
+		t.Fatalf("oversized source frontier registered probes: %#v", plan.Nodes)
 	}
 }
 

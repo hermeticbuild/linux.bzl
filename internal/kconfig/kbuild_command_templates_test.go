@@ -1,6 +1,7 @@
 package kconfig
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,191 @@ import (
 	"strings"
 	"testing"
 )
+
+// Keep the real filechk control shape: a temporary output, existing-target
+// comparison, EXIT cleanup, and conditional rename. A pre-normalized pipeline
+// would miss the discovery/final-helper boundary exercised here.
+const selectedFilechkWrapperForTest = `
+tmp-target = $(dir $@).tmp_$(notdir $@)
+kecho = echo
+define filechk
+	$(check-FORCE)
+	$(Q)set -e; \
+	mkdir -p $(dir $@); \
+	trap "rm -f $(tmp-target)" EXIT; \
+	{ $(filechk_$(1)); } > $(tmp-target); \
+	if [ ! -r $@ ] || ! cmp -s $@ $(tmp-target); then \
+		$(kecho) '  UPD     $@'; \
+		mv -f $(tmp-target) $@; \
+	fi
+endef
+`
+
+func selectedFilechkResolvedForTest(t *testing.T, source, target string) *CompactKbuildResolvedTarget {
+	t.Helper()
+	root := t.TempDir()
+	mustWriteSource(t, root, "Kconfig", "# immutable root anchor\n")
+	mustWriteSource(t, root, "arithmetic/program.dat", "immutable arithmetic program\n")
+	profile := mustCompactKbuildProfileForTest(t, "selected-filechk", "Makefile", "", selectedFilechkWrapperForTest+source, nil)
+	profile.evaluator.template.sourceRoots = map[string]string{"__LINUX_BZL_SOURCE_TREE__": root}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{Tree: CompactKbuildInvocationObjectTree}); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := ResolveCompactKbuildTargetForMakeTarget(profile, target, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
+func TestSelectedDirectFilechkOutputRecipeUsesExactCallContext(t *testing.T) {
+	const target = "include/generated/ticks_250.h"
+	resolved := selectedFilechkResolvedForTest(t, `
+RATE = 999
+include/generated/ticks_250.h: RATE := 250
+filechk_arbitrary = echo $(3) | bc -q $<
+include/generated/ticks_%.h: arithmetic/program.dat FORCE
+	$(call filechk,arbitrary,$(RATE),$(2))
+.PHONY: FORCE
+FORCE:
+`, target)
+	got, selected, err := resolved.SelectedDirectFilechkOutputRecipe()
+	if err != nil || !selected {
+		t.Fatalf("selected payload = %q/%t/%v", got, selected, err)
+	}
+	want := "{\necho 250 | bc -q ${tree:kernel}/arithmetic/program.dat\n} > '" + target + "'"
+	if got != want {
+		t.Fatalf("selected payload = %q, want %q", got, want)
+	}
+	if _, recognized := compactKbuildEvaluatedScriptOutputRecipe(got, target, []string{"arithmetic/program.dat"}); !recognized {
+		t.Fatal("normalized direct helper does not reach the existing exact-output proof")
+	}
+	// General command-template text is still the real wrapper. Only the
+	// optional output candidate adopts the final direct-helper semantics.
+	automatic, err := compactKbuildRuleAutomaticEvaluationContext(target, resolved.match, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	templates, err := EvaluateCompactKbuildCommandTemplates(resolved.profile, resolved.match.rule, target, automatic.stem, nil)
+	if err != nil || len(templates) != 1 || !strings.Contains(templates[0].Text, "cmp -s") || !strings.Contains(templates[0].Text, "trap") {
+		t.Fatalf("general command-template wrapper changed: %#v/%v", templates, err)
+	}
+}
+
+func TestSelectedDirectFilechkOutputRecipeKeepsUnsafeShapesConservative(t *testing.T) {
+	const target = "include/generated/arith.h"
+	for _, test := range []struct {
+		name, body, call, rule string
+		selected               bool
+	}{
+		{"shell_tail", "echo 250 | bc -q $<", "$(call filechk,arbitrary); echo changed > $@", "", false},
+		{"conditional_call", "echo 250 | bc -q $<", "$(if y,$(call filechk,arbitrary))", "", false},
+		{"multiple_calls", "echo 250 | bc -q $<", "$(call filechk,arbitrary) $(call filechk,arbitrary)", "", false},
+		{"ignored_failure", "echo 250 | bc -q $<", "-$(call filechk,arbitrary)", "", false},
+		{"multiple_recipe_lines", "echo 250 | bc -q $<", "$(call filechk,arbitrary)\n\techo changed > $@", "", false},
+		{"grouped_outputs", "echo 250 | bc -q $<", "$(call filechk,arbitrary)", target + " include/generated/other.h &:", false},
+		{"arbitrary_body_control", "echo 250 | bc -q $<; touch extra", "$(call filechk,arbitrary)", "", true},
+		{"wrong_body_target", "echo 250 | bc -q $< > wrong.h", "$(call filechk,arbitrary)", "", true},
+		{"multiple_body_targets", "echo 250 > first.h; echo 251 > second.h", "$(call filechk,arbitrary)", "", true},
+		{"object_input", "echo 250 | bc -q generated/program.dat", "$(call filechk,arbitrary)", "", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rule := test.rule
+			if rule == "" {
+				rule = target + ":"
+			}
+			resolved := selectedFilechkResolvedForTest(t,
+				"filechk_arbitrary = "+test.body+"\n"+rule+" arithmetic/program.dat FORCE\n\t"+test.call+"\n.PHONY: FORCE\nFORCE:\n", target)
+			got, selected, err := resolved.SelectedDirectFilechkOutputRecipe()
+			if err != nil || selected != test.selected {
+				t.Fatalf("selected payload = %q/%t/%v, want selected %t", got, selected, err, test.selected)
+			}
+			if selected {
+				if _, recognized := compactKbuildEvaluatedScriptOutputRecipe(got, target, []string{"arithmetic/program.dat"}); recognized {
+					t.Fatal("unsafe selected payload acquired exact-output authority")
+				}
+				root := resolved.profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"]
+				builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				scopes := testSourceScriptOutputScopes(t, root, builder, nil)
+				if _, _, recognized, err := scopes.EvaluatedScriptOutputText("target", target, got, []string{"arithmetic/program.dat"}, nil); err != nil || recognized {
+					t.Fatalf("unsafe selected payload registered a real probe: recognized=%t error=%v", recognized, err)
+				}
+				plan, err := builder.Plan(scopes.References()...)
+				if err != nil || len(plan.Nodes) != 0 {
+					t.Fatalf("unsafe payload probe plan = %#v/%v", plan, err)
+				}
+			}
+		})
+	}
+	var absent *CompactKbuildResolvedTarget
+	if _, selected, err := absent.SelectedDirectFilechkOutputRecipe(); selected || err != nil {
+		t.Fatal("absent target supplied a selected filechk")
+	}
+}
+
+func TestSelectedDirectFilechkOutputRecipePreservesProbeReplay(t *testing.T) {
+	const target = "include/generated/arith.h"
+	resolved := selectedFilechkResolvedForTest(t, `
+filechk_arbitrary = echo 250 | bc -q $<
+include/generated/arith.h: arithmetic/program.dat FORCE
+	$(call filechk,arbitrary)
+.PHONY: FORCE
+FORCE:
+`, target)
+	root := resolved.profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"]
+	recipe, selected, err := resolved.SelectedDirectFilechkOutputRecipe()
+	if err != nil || !selected {
+		t.Fatalf("selected payload = %q/%t/%v", recipe, selected, err)
+	}
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes := testSourceScriptOutputScopes(t, root, builder, nil)
+	if _, concrete, recognized, err := scopes.EvaluatedScriptOutputText("target", target, recipe, []string{"arithmetic/program.dat"}, nil); err != nil || concrete || !recognized {
+		t.Fatalf("filechk discovery = concrete %t recognized %t error %v", concrete, recognized, err)
+	}
+	plan, err := builder.Plan(scopes.References()...)
+	if err != nil || len(plan.Nodes) != 1 {
+		t.Fatalf("filechk discovery plan = %#v/%v", plan, err)
+	}
+	node := plan.Nodes[0]
+	request := plan.Requests[node.RequestID]
+	const contents = "#include <linux/needed.h>\n#define MEASURED 250\n"
+	envelope := linuxProbeEvaluatedScriptSafePrefix + base64.StdEncoding.EncodeToString([]byte(contents)) + "\n"
+	results := probeResultMap{node.ID: {
+		Schema: LinuxProbeResultSchema, NodeID: node.ID, RequestID: node.RequestID,
+		Scope: node.Scope, ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: envelope,
+		Steps: evaluatedScriptOutputResultSteps(request, envelope),
+	}}
+	replayBuilder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayScopes := testSourceScriptOutputScopes(t, root, replayBuilder, results)
+	replayRecipe, selected, err := resolved.SelectedDirectFilechkOutputRecipe()
+	if err != nil || !selected || replayRecipe != recipe {
+		t.Fatalf("filechk replay changed its normalized request: %q/%t/%v", replayRecipe, selected, err)
+	}
+	got, concrete, recognized, err := replayScopes.EvaluatedScriptOutputText("target", target, replayRecipe, []string{"arithmetic/program.dat"}, nil)
+	if err != nil || !concrete || !recognized || got != contents {
+		t.Fatalf("filechk replay = %q/%t/%t/%v", got, concrete, recognized, err)
+	}
+	// Environment rejection remains in the real probe boundary after direct
+	// helper normalization; it must not infer that bc sees only its argv file.
+	blockedBuilder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := testSourceScriptOutputScopes(t, root, blockedBuilder, nil)
+	blocked.evaluators["target"].scriptEnvironment["BC_ENV_ARGS"] = "additional-program.bc"
+	if _, _, recognized, err := blocked.EvaluatedScriptOutputText("target", target, recipe, []string{"arithmetic/program.dat"}, nil); err != nil || recognized {
+		t.Fatalf("filechk normalization bypassed compiler environment proof: %t/%v", recognized, err)
+	}
+}
 
 func TestCompactKbuildRecipeIsExactCommandTemplateCall(t *testing.T) {
 	for _, test := range []struct {

@@ -1,6 +1,6 @@
 """Private platform transition boundary for execution-time Linux graphs."""
 
-load(":providers.bzl", "LinuxKernelInfo", "LinuxModuleSdkInfo", "LinuxModuleTreeInfo")
+load(":providers.bzl", "LinuxKernelInfo", "LinuxMappedKernelFamilyInfo", "LinuxModuleSdkInfo", "LinuxModuleTreeInfo")
 
 visibility("//...")
 
@@ -23,6 +23,8 @@ def _forwarded_providers(target):
         providers.append(target[LinuxModuleSdkInfo])
     if LinuxModuleTreeInfo in target:
         providers.append(target[LinuxModuleTreeInfo])
+    if LinuxMappedKernelFamilyInfo in target:
+        providers.append(target[LinuxMappedKernelFamilyInfo])
     if OutputGroupInfo in target:
         providers.append(target[OutputGroupInfo])
     return providers

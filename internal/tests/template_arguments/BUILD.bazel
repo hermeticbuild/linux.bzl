@@ -1,0 +1,31 @@
+load("@rules_go//go:def.bzl", "go_test")
+load(":fixture.bzl", "argument_transport_fixture", "transport_payload")
+
+package(default_visibility = ["//visibility:private"])
+
+transport_payload(name = "payload")
+
+argument_transport_fixture(
+    name = "mapped",
+    payload = ":payload",
+)
+
+argument_transport_fixture(
+    name = "collision",
+    collision = True,
+    payload = ":payload",
+)
+
+go_test(
+    name = "template_arguments_test",
+    srcs = ["transport_test.go"],
+    data = [
+        ":collision",
+        ":mapped",
+    ],
+    env = {
+        "MAPPED_TRANSPORT_OUTPUT": "$(rlocationpath :mapped)",
+        "COLLIDING_TRANSPORT_OUTPUT": "$(rlocationpath :collision)",
+    },
+    deps = ["@rules_go//go/runfiles"],
+)

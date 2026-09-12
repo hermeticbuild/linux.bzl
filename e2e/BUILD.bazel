@@ -6,6 +6,7 @@ load("@bazel_skylib//rules:select_file.bzl", "select_file")
 load("@linux.bzl", "initramfs", "linux_cc_module", "linux_module")
 load("@rules_go//go:def.bzl", "go_test")
 load(":compiler_identity_test.bzl", "compiler_probe_artifacts")
+load(":modversions_metadata_test.bzl", "modversions_metadata_test")
 load(":qemu_boot_test.bzl", "qemu_boot_test", "qemu_system_target")
 
 package(default_visibility = ["//visibility:public"])
@@ -253,7 +254,7 @@ build_test(
 )
 
 build_test(
-    name = "modversions_6_12_96_x86_64_build_test",
+    name = "modversions_6_12_96_x86_64_outputs_build_test",
     targets = [
         "@e2e_6_12_96_x86_64//variants/modversions:kernel",
         "@e2e_6_12_96_x86_64//variants/modversions:modules",
@@ -263,7 +264,7 @@ build_test(
 )
 
 build_test(
-    name = "modversions_6_18_39_x86_64_build_test",
+    name = "modversions_6_18_39_x86_64_outputs_build_test",
     targets = [
         "@e2e_x86_64//variants/modversions:kernel",
         "@e2e_x86_64//variants/modversions:modules",
@@ -272,11 +273,81 @@ build_test(
 )
 
 build_test(
-    name = "modversions_6_18_39_aarch64_build_test",
+    name = "modversions_6_18_39_aarch64_outputs_build_test",
     targets = [
         "@e2e_aarch64//variants/modversions:kernel",
         "@e2e_aarch64//variants/modversions:modules",
         ":hello_c_module_aarch64_modversions",
+    ],
+)
+
+modversions_metadata_test(
+    name = "modversions_6_12_96_x86_64_metadata_test",
+    dependency_consumer = ":exported_symbol_consumer_6_12_96",
+    kernel = "@e2e_6_12_96_x86_64//variants/modversions:kernel",
+    modules = [
+        "@e2e_6_12_96_x86_64//variants/modversions:test_module",
+        ":hello_c_module_6_12_96_modversions",
+        ":exported_symbol_provider_6_12_96",
+        ":exported_symbol_second_provider_6_12_96",
+        ":exported_symbol_consumer_6_12_96",
+    ],
+    required_imports = [
+        "linux_bzl_e2e_dependency_value",
+        "linux_bzl_e2e_second_dependency_value",
+    ],
+    symvers_providers = [
+        ":hello_c_module_6_12_96_modversions",
+        ":exported_symbol_provider_6_12_96",
+        ":exported_symbol_second_provider_6_12_96",
+        ":exported_symbol_consumer_6_12_96",
+    ],
+)
+
+modversions_metadata_test(
+    name = "modversions_6_18_39_x86_64_metadata_test",
+    kernel = "@e2e_x86_64//variants/modversions:kernel",
+    modules = [
+        "@e2e_x86_64//variants/modversions:test_module",
+        ":hello_c_module_x86_64_modversions",
+    ],
+    symvers_providers = [":hello_c_module_x86_64_modversions"],
+)
+
+modversions_metadata_test(
+    name = "modversions_6_18_39_aarch64_metadata_test",
+    kernel = "@e2e_aarch64//variants/modversions:kernel",
+    modules = [
+        "@e2e_aarch64//variants/modversions:test_module",
+        ":hello_c_module_aarch64_modversions",
+    ],
+    symvers_providers = [":hello_c_module_aarch64_modversions"],
+)
+
+test_suite(
+    name = "modversions_6_12_96_x86_64_build_test",
+    tests = [
+        ":linux_6_12_96_x86_64_modversions_module_test",
+        ":modversions_6_12_96_x86_64_metadata_test",
+        ":modversions_6_12_96_x86_64_outputs_build_test",
+    ],
+)
+
+test_suite(
+    name = "modversions_6_18_39_x86_64_build_test",
+    tests = [
+        ":linux_6_18_39_x86_64_modversions_module_test",
+        ":modversions_6_18_39_x86_64_metadata_test",
+        ":modversions_6_18_39_x86_64_outputs_build_test",
+    ],
+)
+
+test_suite(
+    name = "modversions_6_18_39_aarch64_build_test",
+    tests = [
+        ":linux_6_18_39_aarch64_modversions_module_test",
+        ":modversions_6_18_39_aarch64_metadata_test",
+        ":modversions_6_18_39_aarch64_outputs_build_test",
     ],
 )
 
@@ -505,6 +576,89 @@ initramfs(
     files = {
         "/test_module.ko": "@e2e_aarch64//:test_module",
     },
+)
+
+initramfs(
+    name = "initramfs_6_12_96_x86_64_modversions_module",
+    character_devices = {
+        "/dev/console": "5:1",
+        "/dev/null": "1:3",
+    },
+    executables = {"/init": "//boot:init_x86_64"},
+    files = {"/test_module.ko": ":hello_c_module_6_12_96_modversions"},
+)
+
+initramfs(
+    name = "initramfs_6_18_39_x86_64_modversions_module",
+    character_devices = {
+        "/dev/console": "5:1",
+        "/dev/null": "1:3",
+    },
+    executables = {"/init": "//boot:init_x86_64"},
+    files = {"/test_module.ko": ":hello_c_module_x86_64_modversions"},
+)
+
+initramfs(
+    name = "initramfs_6_18_39_aarch64_modversions_module",
+    character_devices = {
+        "/dev/console": "5:1",
+        "/dev/null": "1:3",
+    },
+    executables = {"/init": "//boot:init_aarch64"},
+    files = {"/test_module.ko": ":hello_c_module_aarch64_modversions"},
+)
+
+# These load against the matching MODVERSIONS kernel, and must reject a copy
+# with exactly one changed module_layout CRC before accepting the original.
+qemu_boot_test(
+    name = "linux_6_12_96_x86_64_modversions_module_test",
+    size = "large",
+    timeout = "long",
+    arch = "x86_64",
+    expect = "LINUX_BZL_MODVERSIONS_OK",
+    initramfs = ":initramfs_6_12_96_x86_64_modversions_module",
+    kernel = "@e2e_6_12_96_x86_64//variants/modversions:kernel",
+    kernel_args = [
+        "console=ttyS0,115200",
+        "rdinit=/init",
+        "panic=-1",
+        "--",
+        "--check-modversions",
+    ],
+)
+
+qemu_boot_test(
+    name = "linux_6_18_39_x86_64_modversions_module_test",
+    size = "large",
+    timeout = "long",
+    arch = "x86_64",
+    expect = "LINUX_BZL_MODVERSIONS_OK",
+    initramfs = ":initramfs_6_18_39_x86_64_modversions_module",
+    kernel = "@e2e_x86_64//variants/modversions:kernel",
+    kernel_args = [
+        "console=ttyS0,115200",
+        "rdinit=/init",
+        "panic=-1",
+        "--",
+        "--check-modversions",
+    ],
+)
+
+qemu_boot_test(
+    name = "linux_6_18_39_aarch64_modversions_module_test",
+    size = "large",
+    timeout = "long",
+    arch = "aarch64",
+    expect = "LINUX_BZL_MODVERSIONS_OK",
+    initramfs = ":initramfs_6_18_39_aarch64_modversions_module",
+    kernel = "@e2e_aarch64//variants/modversions:kernel",
+    kernel_args = [
+        "console=ttyAMA0,115200",
+        "rdinit=/init",
+        "panic=-1",
+        "--",
+        "--check-modversions",
+    ],
 )
 
 qemu_boot_test(

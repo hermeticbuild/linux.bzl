@@ -1,7 +1,8 @@
 load(":host_cc_toolchain_test.bzl", "host_cc_toolchain_test")
 load(":linux_external_module_test.bzl", "linux_external_module_test")
 load(":linux_image_name_test.bzl", "linux_image_name_test")
-load(":mapped_kernel_toolset_test.bzl", "mapped_kernel_backend_test", "mapped_kernel_exec_python_test", "mapped_kernel_host_dependency_validation_test", "mapped_kernel_path_validation_test", "mapped_kernel_requirement_validation_test", "mapped_kernel_toolset_test")
+load(":linux_image_repository_test.bzl", "linux_image_repository_test")
+load(":mapped_kernel_toolset_test.bzl", "mapped_kernel_backend_test", "mapped_kernel_exec_python_test", "mapped_kernel_execution_platform_validation_test", "mapped_kernel_family_wiring_test", "mapped_kernel_host_dependency_validation_test", "mapped_kernel_path_validation_test", "mapped_kernel_public_config_projection_test", "mapped_kernel_requirement_validation_test", "mapped_kernel_toolset_test", "mapped_kernel_variant_module_test", "mapped_kernel_variant_provider_test")
 load(":probe_map_directory_test.bzl", "probe_map_directory_path_rendering_test", "probe_map_directory_test", "probe_map_directory_validation_test")
 load(":rust_toolchain_test.bzl", "fake_rust_guard_toolchain", "rust_toolchain_execution_platform_guard_test")
 load(":script_runtime_toolchain_test.bzl", "script_runtime_toolchain_test")
@@ -232,11 +233,19 @@ host_cc_toolchain_test(name = "host_cc_toolchain_test")
 
 linux_image_name_test(name = "linux_image_name_test")
 
+linux_image_repository_test(name = "linux_image_repository_test")
+
 linux_external_module_test(name = "linux_external_module_test")
 
 mapped_kernel_backend_test(name = "mapped_kernel_backend_test")
 
 mapped_kernel_exec_python_test(name = "mapped_kernel_exec_python_test")
+
+mapped_kernel_execution_platform_validation_test(name = "mapped_kernel_execution_platform_validation_test")
+
+mapped_kernel_family_wiring_test(name = "mapped_kernel_family_wiring_test")
+
+mapped_kernel_public_config_projection_test(name = "mapped_kernel_public_config_projection_test")
 
 mapped_kernel_host_dependency_validation_test(name = "mapped_kernel_host_dependency_validation_test")
 
@@ -245,6 +254,10 @@ mapped_kernel_path_validation_test(name = "mapped_kernel_path_validation_test")
 mapped_kernel_requirement_validation_test(name = "mapped_kernel_requirement_validation_test")
 
 mapped_kernel_toolset_test(name = "mapped_kernel_toolset_test")
+
+mapped_kernel_variant_provider_test(name = "mapped_kernel_variant_provider_test")
+
+mapped_kernel_variant_module_test(name = "mapped_kernel_variant_module_test")
 
 probe_map_directory_test(name = "probe_map_directory_test")
 

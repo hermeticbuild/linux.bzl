@@ -46,15 +46,25 @@ type compactKbuildDeclarationBucket struct {
 	variables []compactKbuildIndexedTargetVariable
 }
 
+// compactKbuildSourceRootBinding is one canonical logical source-root prefix.
+// Multiple configured markers can name the same prefix (for example a direct
+// configured root and a source-tree overlay). Such aliases are usable only
+// when they retain one physical identity.
+type compactKbuildSourceRootBinding struct {
+	physical  string
+	ambiguous bool
+}
+
 type compactKbuildPlannerRuntime struct {
 	exactIndex   map[string]int
 	exact        []compactKbuildDeclarationBucket
 	patternIndex map[string]int
 	patterns     []compactKbuildDeclarationBucket
 
-	sourceRoot string
-	sourceMu   sync.Mutex
-	sources    map[string]bool
+	sourceRoot      string
+	sourcePathRoots map[string]compactKbuildSourceRootBinding
+	sourceMu        sync.Mutex
+	sources         map[string]bool
 	// sourceShellScripts memoizes whether an immutable source path carries a
 	// shell shebang. Kbuild routinely executes extensionless helpers (for
 	// example scripts/mkcompile_h) directly; their source content, not a
@@ -95,6 +105,7 @@ func newCompactKbuildPlannerRuntime(profile CompactKbuildProfile) *compactKbuild
 	runtime := &compactKbuildPlannerRuntime{
 		exactIndex:         map[string]int{},
 		patternIndex:       map[string]int{},
+		sourcePathRoots:    map[string]compactKbuildSourceRootBinding{},
 		sources:            map[string]bool{},
 		sourceShellScripts: map[string]bool{},
 	}
@@ -139,6 +150,17 @@ func newCompactKbuildPlannerRuntime(profile CompactKbuildProfile) *compactKbuild
 		seenPattern := map[string]bool{}
 		for _, rawTarget := range variable.Targets {
 			target := normalizeCompactKbuildTargetVariableTarget(rawTarget)
+			if !strings.Contains(target, "%") {
+				// Like rule targets, exact assignments belong to this Make
+				// invocation. Keep the lexical spelling after scoping: cleaning
+				// parent traversal would merge distinct Make variable owners.
+				graphTarget := compactKbuildProfileTargetPath(profile, target)
+				var valid bool
+				target, valid = ResolveCompactKbuildMakeTarget(profile, graphTarget, target)
+				if !valid {
+					continue
+				}
+			}
 			if strings.Contains(target, "%") {
 				if seenPattern[target] {
 					continue
@@ -160,6 +182,7 @@ func newCompactKbuildPlannerRuntime(profile CompactKbuildProfile) *compactKbuild
 		}
 	}
 	if profile.evaluator != nil && profile.evaluator.template != nil {
+		runtime.sourcePathRoots = compactKbuildProfileSourceRootBindings(profile.evaluator.template.sourceRoots)
 		if root := strings.TrimSpace(profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"]); root != "" {
 			if absolute, err := filepath.Abs(root); err == nil {
 				runtime.sourceRoot = absolute
@@ -167,6 +190,75 @@ func newCompactKbuildPlannerRuntime(profile CompactKbuildProfile) *compactKbuild
 		}
 	}
 	return runtime
+}
+
+// compactKbuildProfileSourceRootBindings compiles the immutable source-root
+// configuration into canonical logical prefixes once per planner runtime.
+// Reserved object-tree and host-dependency markers cannot provide source
+// evidence. Invalid logical roots are ignored exactly as they are by source
+// resolution.
+func compactKbuildProfileSourceRootBindings(sourceRoots map[string]string) map[string]compactKbuildSourceRootBinding {
+	bindings := make(map[string]compactKbuildSourceRootBinding, len(sourceRoots))
+	for rawPrefix, physical := range sourceRoots {
+		prefix := filepath.ToSlash(rawPrefix)
+		graphPrefix := ""
+		switch {
+		case prefix == "__LINUX_BZL_SOURCE_TREE__":
+		case strings.HasPrefix(prefix, "__LINUX_BZL_SOURCE_TREE__/"):
+			graphPrefix = strings.TrimPrefix(prefix, "__LINUX_BZL_SOURCE_TREE__/")
+			if validatePlanRelativePath("Kbuild source-tree overlay", graphPrefix) != nil {
+				continue
+			}
+		case strings.HasPrefix(prefix, "__LINUX_BZL_"):
+			continue
+		default:
+			graphPrefix = prefix
+			if validatePlanRelativePath("Kbuild configured source root", graphPrefix) != nil {
+				continue
+			}
+		}
+
+		binding, exists := bindings[graphPrefix]
+		if !exists {
+			bindings[graphPrefix] = compactKbuildSourceRootBinding{physical: physical}
+			continue
+		}
+		if filepath.Clean(binding.physical) != filepath.Clean(physical) ||
+			strings.TrimSpace(binding.physical) == "" || strings.TrimSpace(physical) == "" {
+			binding.ambiguous = true
+		}
+		bindings[graphPrefix] = binding
+	}
+	return bindings
+}
+
+// resolveSourcePath probes only the ancestors of a canonical graph path. This
+// is equivalent to selecting the longest matching source-root prefix, but its
+// cost depends on path depth rather than on the number of configured roots.
+func (r *compactKbuildPlannerRuntime) resolveSourcePath(sourcePath string) (string, bool) {
+	prefix := sourcePath
+	for {
+		if binding, exists := r.sourcePathRoots[prefix]; exists {
+			if binding.ambiguous || strings.TrimSpace(binding.physical) == "" {
+				return "", false
+			}
+			relative := strings.TrimPrefix(sourcePath, prefix)
+			relative = strings.TrimPrefix(relative, "/")
+			return filepath.Join(binding.physical, filepath.FromSlash(relative)), true
+		}
+		separator := strings.LastIndexByte(prefix, '/')
+		if separator < 0 {
+			break
+		}
+		prefix = prefix[:separator]
+	}
+	if binding, exists := r.sourcePathRoots[""]; exists {
+		if binding.ambiguous || strings.TrimSpace(binding.physical) == "" {
+			return "", false
+		}
+		return filepath.Join(binding.physical, filepath.FromSlash(sourcePath)), true
+	}
+	return "", false
 }
 
 // compactKbuildProfileSourceAncestryDepth reports how much of a logical path

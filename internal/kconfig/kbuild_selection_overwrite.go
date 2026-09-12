@@ -407,6 +407,21 @@ func (g *compactKbuildSelectionGraph) compactKbuildSelectionRecordedPathOwner(
 	return g.compactKbuildSelectionPathOwnerWithFallback(consumer, target, false)
 }
 
+// compactKbuildSelectionRecordedPathOwnerWithPredecessorClosure is the
+// analysis-context variant of compactKbuildSelectionRecordedPathOwner. The
+// selection graph remains immutable while config dependency analysis runs, so
+// that analysis may memoize its repeatedly requested invocation closures
+// without adding mutable cache state to the graph itself.
+func (g *compactKbuildSelectionGraph) compactKbuildSelectionRecordedPathOwnerWithPredecessorClosure(
+	consumer compactKbuildSelectionKey,
+	target string,
+	predecessorClosure func(string) []string,
+) (compactKbuildSelectionKey, bool, error) {
+	return g.compactKbuildSelectionPathOwnerWithFallbackAndPredecessorClosure(
+		consumer, target, false, predecessorClosure,
+	)
+}
+
 type compactKbuildUnrecordedPathOwnerError struct {
 	message string
 }
@@ -424,6 +439,17 @@ func (g *compactKbuildSelectionGraph) compactKbuildSelectionPathOwnerWithFallbac
 	consumer compactKbuildSelectionKey,
 	target string,
 	allowUniqueWriterFallback bool,
+) (compactKbuildSelectionKey, bool, error) {
+	return g.compactKbuildSelectionPathOwnerWithFallbackAndPredecessorClosure(
+		consumer, target, allowUniqueWriterFallback, nil,
+	)
+}
+
+func (g *compactKbuildSelectionGraph) compactKbuildSelectionPathOwnerWithFallbackAndPredecessorClosure(
+	consumer compactKbuildSelectionKey,
+	target string,
+	allowUniqueWriterFallback bool,
+	predecessorClosure func(string) []string,
 ) (compactKbuildSelectionKey, bool, error) {
 	if g == nil {
 		return compactKbuildSelectionKey{}, false, nil
@@ -556,7 +582,13 @@ func (g *compactKbuildSelectionGraph) compactKbuildSelectionPathOwnerWithFallbac
 	}
 
 	predecessorProfiles := map[string]bool{}
-	for _, profileName := range g.compactKbuildInvocationPredecessorClosure(consumer.profile) {
+	var closure []string
+	if predecessorClosure != nil {
+		closure = predecessorClosure(consumer.profile)
+	} else {
+		closure = g.compactKbuildInvocationPredecessorClosure(consumer.profile)
+	}
+	for _, profileName := range closure {
 		predecessorProfiles[profileName] = true
 	}
 	predecessors := []compactKbuildSelectionKey{}

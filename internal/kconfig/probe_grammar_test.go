@@ -1,6 +1,217 @@
 package kconfig
 
-import "testing"
+import (
+	"slices"
+	"strings"
+	"testing"
+)
+
+func TestProjectProbeCandidateArgumentsCompilerPredefines(t *testing.T) {
+	arguments := []string{
+		"--target=x86_64-linux-gnu",
+		"-nostdinc",
+		"-I__LINUX_BZL_SOURCE_TREE__/include",
+		"-include", "__LINUX_BZL_SOURCE_TREE__/include/linux/hidden.h",
+		"-DSELECTED=drivers/one",
+		"-D", "OTHER=drivers/two",
+		"-DFUNCTION(x)=three",
+		"-Wa,-gdwarf-5",
+		"-Xassembler", "--fatal-warnings",
+		"-Wl,--build-id",
+		"-Xlinker", "--gc-sections",
+		"-c",
+		"-o", "drivers/example.o",
+		"drivers/example.c",
+		"-MMD",
+		"-MFdrivers/example.d",
+		"-Wp,-MMD,drivers/wp.d",
+		"-O2",
+	}
+	original := slices.Clone(arguments)
+	got, origins, err := ProjectProbeCandidateArguments(
+		ProbeCandidateProjectionCompilerPredefines,
+		arguments,
+		[]string{"drivers/example.c"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"--target=x86_64-linux-gnu",
+		"-nostdinc",
+		"-DSELECTED=1",
+		"-D", "OTHER=1",
+		"-DFUNCTION(x)=three",
+		"-O2",
+	}
+	wantOrigins := []int{0, 1, 5, 6, 7, 8, 22}
+	if !slices.Equal(got, want) || !slices.Equal(origins, wantOrigins) {
+		t.Fatalf("compiler-predefine projection = %#v origins %#v, want %#v origins %#v", got, origins, want, wantOrigins)
+	}
+	if !slices.Equal(arguments, original) {
+		t.Fatalf("compiler-predefine projection mutated caller argv: got %#v, want %#v", arguments, original)
+	}
+	if _, err := ValidateProbeCandidateArguments(ProbeCandidatePolicyCC, got); err != nil {
+		t.Fatalf("projected compiler-predefine candidate is invalid: %v", err)
+	}
+}
+
+func TestProjectProbeCandidateArgumentsCompilerPredefinesPreservesDefaultIncludeSuppression(t *testing.T) {
+	arguments := []string{
+		"-Ibefore", "-nostdinc", "-I-", "-nostdinc++",
+		"-isystem", "source/include", "-nobuiltininc", "-nostdlibinc",
+		"source.c", "-DKEEP=7",
+	}
+	original := slices.Clone(arguments)
+	got, origins, err := ProjectProbeCandidateArguments(
+		ProbeCandidateProjectionCompilerPredefines, arguments, []string{"source.c"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"-nostdinc", "-nostdinc++", "-nobuiltininc", "-nostdlibinc", "-DKEEP=1"}
+	wantOrigins := []int{1, 3, 6, 7, 9}
+	if !slices.Equal(got, want) || !slices.Equal(origins, wantOrigins) {
+		t.Fatalf("default include suppression projection = %#v origins %#v, want %#v origins %#v", got, origins, want, wantOrigins)
+	}
+	if !slices.Equal(arguments, original) {
+		t.Fatal("default include suppression projection mutated caller argv")
+	}
+	if _, err := ValidateProbeCandidateArguments(ProbeCandidatePolicyCC, got); err != nil {
+		t.Fatalf("projected default include suppression is invalid: %v", err)
+	}
+}
+
+func TestProjectProbeCandidateArgumentsCompilerPredefinesRejectsUnmodeledFrontend(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{name: "separated language", argv: []string{"-x", "c++"}, want: "language override"},
+		{name: "joined language", argv: []string{"-xassembler-with-cpp"}, want: "language override"},
+		{name: "preprocessor forwarding", argv: []string{"-Xpreprocessor", "-DOVERRIDE"}, want: "frontend forwarding"},
+		{name: "Wp macro forwarding", argv: []string{"-Wp,-DOVERRIDE=1"}, want: "preprocessor forwarding"},
+		{name: "Clang frontend", argv: []string{"-Xclang", "-fmodules"}, want: "frontend forwarding"},
+		{name: "LLVM backend", argv: []string{"-mllvm", "-opaque-pass"}, want: "frontend forwarding"},
+		{name: "precompiled header", argv: []string{"-include-pch", "kernel.pch"}, want: "precompiled or virtual include"},
+		{name: "virtual overlay", argv: []string{"-ivfsoverlay", "overlay.yaml"}, want: "precompiled or virtual include"},
+		{name: "missing include", argv: []string{"-include"}, want: "no operand"},
+		{name: "option delimiter", argv: []string{"--", "source.c"}, want: "option terminator"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, err := ProjectProbeCandidateArguments(
+				ProbeCandidateProjectionCompilerPredefines,
+				test.argv,
+				nil,
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ProjectProbeCandidateArguments(%q) error = %v, want substring %q", test.argv, err, test.want)
+			}
+		})
+	}
+}
+
+func TestProjectProbeCandidateArgumentsCompilerInitialStateOwnsCommentOutput(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		arguments, want []string
+		origins         []int
+	}{
+		{
+			name:      "literal output modes",
+			arguments: []string{"-C", "-P", "-CC", "-DKEEP=2", "source.lds.S"},
+			want:      []string{"-P", "-DKEEP=1"},
+			origins:   []int{1, 3},
+		},
+		{
+			name:      "scalar payloads and macro bodies are not switches",
+			arguments: []string{"-G", "-C", "-target", "-CC", "-meabi", "-C", "-U", "-CC", "-D", "F(x)=-C", "-DF(x)=-CC", "source.lds.S"},
+			want:      []string{"-G", "-C", "-target", "-CC", "-meabi", "-C", "-U", "-CC", "-D", "F(x)=-C", "-DF(x)=-CC"},
+			origins:   []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+		},
+		{
+			name:      "forwarded nonpreprocessor switches",
+			arguments: []string{"-Xassembler", "-C", "-Wl,-CC", "-Wa,-C", "source.lds.S"},
+			want:      []string{},
+			origins:   []int{},
+		},
+		{
+			name:      "similar spellings are not output switches",
+			arguments: []string{"-CFUTURE", "-CCfuture", "-DF(x)=-CC", "source.lds.S"},
+			want:      []string{"-CFUTURE", "-CCfuture", "-DF(x)=-CC"},
+			origins:   []int{0, 1, 2},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			original := slices.Clone(test.arguments)
+			got, origins, err := ProjectProbeCandidateArguments(
+				ProbeCandidateProjectionCompilerPredefines, test.arguments, []string{"source.lds.S"},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, test.want) || !slices.Equal(origins, test.origins) {
+				t.Fatalf("projected = %q at %v, want %q at %v", got, origins, test.want, test.origins)
+			}
+			if !slices.Equal(test.arguments, original) {
+				t.Fatal("query projection mutated executable source arguments")
+			}
+			if _, err := ValidateProbeCandidateArguments(ProbeCandidatePolicyCC, got); err != nil {
+				t.Fatalf("projected candidate failed validation: %v", err)
+			}
+		})
+	}
+}
+
+func TestProjectProbeCandidateArgumentsCompilerPredefinesUsesExactTranslationUnitProvenance(t *testing.T) {
+	arguments := []string{
+		"--wrapper-mode", "mode.c",
+		"-fmacro-prefix-map=/mapped/drivers/example.c=drivers/example.c",
+		"/mapped/drivers/example.c",
+		"-O2",
+	}
+	got, origins, err := ProjectProbeCandidateArguments(
+		ProbeCandidateProjectionCompilerPredefines,
+		arguments,
+		[]string{"/mapped/drivers/example.c"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"--wrapper-mode", "mode.c",
+		"-fmacro-prefix-map=/mapped/drivers/example.c=drivers/example.c",
+		"-O2",
+	}
+	wantOrigins := []int{0, 1, 2, 4}
+	if !slices.Equal(got, want) || !slices.Equal(origins, wantOrigins) {
+		t.Fatalf("compiler-predefine projection = %#v origins %#v, want %#v origins %#v", got, origins, want, wantOrigins)
+	}
+}
+
+func TestProjectProbeCandidateArgumentsCompilerPredefinesRequiresExactTranslationUnitOnce(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		argv    []string
+		sources []string
+	}{
+		{name: "missing", argv: []string{"-O2"}, sources: []string{"source.c"}},
+		{name: "duplicate argv", argv: []string{"source.c", "source.c"}, sources: []string{"source.c"}},
+		{name: "duplicate declaration", argv: []string{"source.c"}, sources: []string{"source.c", "source.c"}},
+		{name: "option spelling", argv: []string{"-source.c"}, sources: []string{"-source.c"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := ProjectProbeCandidateArguments(
+				ProbeCandidateProjectionCompilerPredefines,
+				test.argv,
+				test.sources,
+			); err == nil {
+				t.Fatalf("ProjectProbeCandidateArguments(%q, %q) unexpectedly succeeded", test.argv, test.sources)
+			}
+		})
+	}
+}
 
 func TestValidateProbeCandidateArgumentsAcceptsSemanticOptionsWithoutACompilerWhitelist(t *testing.T) {
 	t.Parallel()

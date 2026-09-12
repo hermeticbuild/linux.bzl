@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +51,13 @@ func TestProbeHelperProcess(t *testing.T) {
 			os.Exit(19)
 		}
 		fmt.Print("accepted")
+	case "exact-json-arguments":
+		var want []string
+		if err := json.Unmarshal([]byte(os.Getenv("EXPECTED_ARGUMENTS_JSON")), &want); err != nil || !slices.Equal(args[1:], want) {
+			fmt.Fprintf(os.Stderr, "argument vector differs: got %d words, expected %d\n", len(args)-1, len(want))
+			os.Exit(19)
+		}
+		fmt.Print("accepted")
 	case "flood":
 		fmt.Print(strings.Repeat("x", 1024))
 	case "multiline":
@@ -85,6 +95,13 @@ func TestProbeHelperProcess(t *testing.T) {
 			os.Exit(13)
 		}
 		fmt.Print(string(content))
+	case "inspect-scratch-cwd":
+		workingDirectory, err := os.Getwd()
+		if err != nil || !filepath.IsAbs(args[1]) || filepath.Clean(workingDirectory) != filepath.Clean(args[1]) {
+			fmt.Fprintf(os.Stderr, "cwd=%q error=%v scratch=%q", workingDirectory, err, args[1])
+			os.Exit(22)
+		}
+		fmt.Print("scratch-cwd")
 	case "inspect-execution-root":
 		content, err := os.ReadFile(args[1])
 		if err != nil || string(content) != "selected resource\n" || !filepath.IsAbs(args[1]) || os.Getenv("RESOURCE_HEADER") != args[1] {
@@ -303,15 +320,71 @@ func TestResolveProbeWorkingDirectoryCanonicalizesAndRejectsSymlinkEscape(t *tes
 		return strings.Replace(value, "${source_root:linux}", sourceRoot, 1), nil
 	}
 	got, err := resolveProbeWorkingDirectory(
-		"${source_root:linux}/inside-link", t.TempDir(), map[string]string{"linux": sourceRoot}, expand,
+		"${source_root:linux}/inside-link", t.TempDir(), nil, map[string]string{"linux": sourceRoot}, expand,
 	)
 	if err != nil || got != inside {
 		t.Fatalf("resolved in-tree cwd = %q, %v; want %q", got, err, inside)
 	}
 	if _, err := resolveProbeWorkingDirectory(
-		"${source_root:linux}/escape-link", t.TempDir(), map[string]string{"linux": sourceRoot}, expand,
+		"${source_root:linux}/escape-link", t.TempDir(), nil, map[string]string{"linux": sourceRoot}, expand,
 	); err == nil || !strings.Contains(err.Error(), "outside declared source root") {
 		t.Fatalf("cwd symlink escape error = %v", err)
+	}
+}
+
+func TestResolveProbeWorkingDirectoryAcceptsOnlyContainedScratchDirectory(t *testing.T) {
+	parent := t.TempDir()
+	scratchRoot := filepath.Join(parent, "scratch")
+	inside := filepath.Join(scratchRoot, "inside")
+	outside := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(inside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(scratchRoot, "work")
+	if err := os.Symlink("inside", work); err != nil {
+		t.Fatal(err)
+	}
+	expand := func(value string) (string, error) {
+		return strings.Replace(value, "${scratch:work}", work, 1), nil
+	}
+	got, err := resolveProbeWorkingDirectory(
+		"${scratch:work}", scratchRoot, map[string]string{"work": work}, nil, expand,
+	)
+	if err != nil || got != inside {
+		t.Fatalf("resolved contained scratch cwd = %q, %v; want %q", got, err, inside)
+	}
+	if err := os.Remove(work); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, work); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveProbeWorkingDirectory(
+		"${scratch:work}", scratchRoot, map[string]string{"work": work}, nil, expand,
+	); err == nil || !strings.Contains(err.Error(), "outside private scratch root") {
+		t.Fatalf("scratch cwd symlink escape error = %v", err)
+	}
+	for _, value := range []string{
+		"${scratch:work}/suffix",
+		"${scratch:work}${source_root:linux}",
+	} {
+		if _, err := resolveProbeWorkingDirectory(
+			value, scratchRoot, map[string]string{"work": work}, map[string]string{"linux": inside}, expand,
+		); err == nil || !strings.Contains(err.Error(), "exactly one placeholder") {
+			t.Fatalf("scratch cwd %q error = %v", value, err)
+		}
+	}
+	file := filepath.Join(scratchRoot, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveProbeWorkingDirectory(
+		"${scratch:file}", scratchRoot, map[string]string{"file": file}, nil, expand,
+	); err == nil || !strings.Contains(err.Error(), "is not a directory") {
+		t.Fatalf("file scratch cwd error = %v", err)
 	}
 }
 
@@ -1069,6 +1142,56 @@ func TestRunProbeExecutesGenericRecipeAndWritesCanonicalResult(t *testing.T) {
 	}
 }
 
+func TestRunProbeExecutesStepInDeclaredScratchDirectory(t *testing.T) {
+	dir := t.TempDir()
+	request := kconfig.ProbeRequest{
+		Schema:  kconfig.LinuxProbeRequestSchema,
+		Scratch: []kconfig.ProbeScratch{{Name: "work", Kind: "directory"}},
+		Steps: []kconfig.ProbeStep{{
+			Name:             "inspect",
+			Tool:             "runner",
+			WorkingDirectory: "${scratch:work}",
+			Arguments:        []string{"inspect-scratch-cwd", "${scratch:work}"},
+			Environment:      map[string]string{"LINUX_BZL_PROBE_HELPER": "1"},
+		}},
+		Outcome: kconfig.ProbeOutcome{Kind: "text", Step: "inspect", Stream: "stdout"},
+	}
+	requestID, err := request.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestPath := filepath.Join(dir, "request.json")
+	data, _ := request.CanonicalJSON()
+	if err := os.WriteFile(requestPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity := "sha256-" + strings.Repeat("9", 64)
+	marker := filepath.Join(dir, identity)
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := kconfig.ProbePlanNode{Scope: "target", RequestID: requestID}
+	node.ID = node.ContentID()
+	resultPath := filepath.Join(dir, "result.json")
+	if err := runTestProbe(t, probeOptions{
+		request: requestPath, result: resultPath, nodeID: node.ID, requestID: requestID, scope: "target",
+		toolsetMarkers: map[string]string{"target": marker},
+		tools: map[string]actionContract{"runner": {
+			path: executable, arguments: []string{"-test.run=TestProbeHelperProcess", "--", kconfig.LinuxKbuildArgsSentinel},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := kconfig.ReadProbeResult(resultPath)
+	if err != nil || result.Text != "scratch-cwd" {
+		t.Fatalf("scratch cwd result = %#v, %v", result, err)
+	}
+}
+
 func TestRunProbeAnchorsRelativeArtifactsBeforeScratchWorkingDirectory(t *testing.T) {
 	execroot := filepath.Join(t.TempDir(), "execroot", "nested")
 	for _, relative := range []string{"plan", "identities", "inputs", "tools", "scratch/parent"} {
@@ -1205,6 +1328,200 @@ func TestRunProbeExecutesCompoundTryRunThroughScriptRunner(t *testing.T) {
 			second := executeCompoundTryRunProbe(t, scriptRunner, scriptRuntime, test.scenario, test.value, test.status)
 			if !bytes.Equal(first, second) {
 				t.Fatalf("probe results differ across private scratch roots:\nfirst:  %s\nsecond: %s", first, second)
+			}
+		})
+	}
+}
+
+func evaluatedOutputProbeFacts(t *testing.T, identity string) *kconfig.LinuxCompilerFacts {
+	t.Helper()
+	request := kconfig.LinuxCompilerBootstrapRequest()
+	requestID, err := request.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := kconfig.ProbePlanNode{Scope: "target", RequestID: requestID}
+	node.ID = node.ContentID()
+	value := true
+	result := kconfig.ProbeResult{
+		Schema: kconfig.LinuxProbeResultSchema, NodeID: node.ID, RequestID: requestID,
+		Scope: "target", ToolsetIdentity: identity, Kind: "boolean", Boolean: &value,
+		Steps: []kconfig.ProbeStepResult{
+			{Name: "compiler-machine", Status: "success", Stdout: "x86_64-linux-gnu\n"},
+			{Name: "compiler-version", Status: "success", Stdout: "fixture compiler 1\n"},
+			{Name: "compiler-predefines", Status: "success", Stdout: "#define FIXTURE 1\n"},
+		},
+	}
+	facts, err := kconfig.ParseLinuxCompilerBootstrapResult(result, "target", identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return facts
+}
+
+func executeEvaluatedOutputProbe(
+	t *testing.T,
+	scriptRunner, scriptRuntime, replacementRecipe string,
+	workingTreeContents map[string]string,
+) kconfig.ProbeResult {
+	t.Helper()
+	directory := t.TempDir()
+	sourceRoot := filepath.Join(directory, "linux")
+	if err := os.Mkdir(sourceRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const program = "program.bc"
+	allSources := map[string]string{
+		"Kconfig": "mainmenu \"fixture\"\n",
+		program:   "hz=read()\nprint hz, \"\\n\"\n",
+	}
+	sourcePaths := map[string]string{}
+	for name, content := range allSources {
+		filename := filepath.Join(sourceRoot, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(filename), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filename, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sourcePaths[name] = filename
+	}
+	identity := "sha256-" + strings.Repeat("7", 64)
+	facts := evaluatedOutputProbeFacts(t, identity)
+	sourceNames := []string{program}
+	validRecipe := `{ echo 250 | bc -q ${tree:kernel}/` + program + `; } > generated.h`
+	evaluation, err := kconfig.EvaluateKbuildProbeWorkload(
+		kconfig.KbuildProbeWorkloadOptions{Target: kconfig.KbuildProbeScopeOptions{
+			Architecture: "x86", SourceArchitecture: "x86", SourceRoot: sourceRoot,
+			Facts: facts,
+			Tools: map[string]string{"cc": scriptRuntime, "scriptrun": scriptRunner, "script-runtime": scriptRuntime},
+		}},
+		nil,
+		func(scopes *kconfig.KbuildProbeScopes) (struct{}, error) {
+			_, concrete, recognized, err := scopes.EvaluatedScriptOutputTextAcrossScopes(
+				"generated.h", validRecipe, sourceNames, workingTreeContents,
+			)
+			if err == nil && (concrete || !recognized) {
+				return struct{}{}, fmt.Errorf("evaluated output discovery = concrete %t, recognized %t", concrete, recognized)
+			}
+			return struct{}{}, err
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evaluation.Plan.Nodes) != 1 {
+		t.Fatalf("evaluated output plan nodes = %#v", evaluation.Plan.Nodes)
+	}
+	discoveredNode := evaluation.Plan.Nodes[0]
+	request := evaluation.Plan.Requests[discoveredNode.RequestID]
+	if replacementRecipe != "" {
+		replaceEvaluatedOutputRecipe(t, &request, replacementRecipe)
+	}
+	requestID, err := request.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := kconfig.ProbePlanNode{Scope: "target", RequestID: requestID}
+	node.ID = node.ContentID()
+	requestData, err := request.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestPath := filepath.Join(directory, "request.json")
+	if err := os.WriteFile(requestPath, requestData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resultPath := filepath.Join(directory, "result.json")
+	tempDirectory := filepath.Join(directory, "probe-temporary-parent")
+	if err := os.Mkdir(tempDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTestProbe(t, probeOptions{
+		request: requestPath, result: resultPath, nodeID: node.ID, requestID: node.RequestID, scope: "target",
+		sources: sourcePaths, sourceRootAnchors: map[string]string{"linux": sourcePaths["Kconfig"]},
+		tempDir: tempDirectory,
+		tools: map[string]actionContract{
+			"script-runtime": {path: scriptRuntime, environment: map[string]string{}},
+			"scriptrun": {
+				path: scriptRunner, arguments: []string{kconfig.LinuxKbuildArgsSentinel}, environment: map[string]string{},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := kconfig.ReadProbeResult(resultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return *result
+}
+
+func replaceEvaluatedOutputRecipe(t *testing.T, request *kconfig.ProbeRequest, recipe string) {
+	t.Helper()
+	if request == nil || len(request.Steps) != 3 || request.Steps[1].Name != "evaluated-script-output" {
+		t.Fatalf("unexpected evaluated-output request: %#v", request)
+	}
+	step := &request.Steps[1]
+	encoded := slices.Index(step.Arguments, "-script_content_base64")
+	if encoded < 0 || encoded+1 >= len(step.Arguments) {
+		t.Fatalf("evaluated-output recipe argv = %q", step.Arguments)
+	}
+	body := "#!/bin/sh\nset -e\n" + recipe + "\n"
+	step.Arguments[encoded+1] = base64.StdEncoding.EncodeToString([]byte(body))
+	if strings.Contains(recipe, "${tree:kernel}") && !slices.Contains(step.Arguments, "kernel=${source_root:linux}") {
+		step.Arguments = slices.Insert(step.Arguments, encoded, "-tree", "kernel=${source_root:linux}")
+	}
+}
+
+func TestRunProbeEvaluatedOutputUsesIsolatedValidatedWorkingDirectory(t *testing.T) {
+	scriptRunner := resolveProbeTestRunfile(t, "LINUX_BZL_TEST_SCRIPTRUN")
+	scriptRuntime := resolveProbeTestRunfile(t, "LINUX_BZL_TEST_SCRIPT_RUNTIME")
+	const (
+		safePrefix = "linux-bzl-evaluated-script-output-v1\n"
+		unsafe     = "linux-bzl-evaluated-script-side-effects-v1\n"
+	)
+	for _, test := range []struct {
+		name                string
+		replacementRecipe   string
+		workingTreeContents map[string]string
+		want                string
+	}{
+		{name: "declared bc program is staged in the private working directory", want: safePrefix + base64.StdEncoding.EncodeToString([]byte("250\n")) + "\n"},
+		{name: "runner infrastructure stays outside scan", replacementRecipe: `{ printf ok; } > generated.h`, want: safePrefix + "b2s=\n"},
+		{
+			name: "resolved config content is staged in the private working directory", replacementRecipe: `{ cat .config; } > generated.h`,
+			workingTreeContents: map[string]string{".config": "CONFIG_DYNAMIC=y\n"},
+			want:                safePrefix + base64.StdEncoding.EncodeToString([]byte("CONFIG_DYNAMIC=y\n")) + "\n",
+		},
+		{
+			name: "empty working input is present", replacementRecipe: `{ cat empty; } > generated.h`,
+			workingTreeContents: map[string]string{"empty": ""},
+			want:                safePrefix,
+		},
+		{
+			name: "resolved config topology is visible", replacementRecipe: `{ ls -A; } > generated.h`,
+			workingTreeContents: map[string]string{".config": "CONFIG_DYNAMIC=y\n"},
+			want:                safePrefix + base64.StdEncoding.EncodeToString([]byte(".config\ngenerated.h\nprogram.bc\n")) + "\n",
+		},
+		{name: "recipe uses one runtime shell", replacementRecipe: `{ printenv SHLVL; } > generated.h`, want: safePrefix + base64.StdEncoding.EncodeToString([]byte("1\n")) + "\n"},
+		{name: "working input mutation is unsafe", replacementRecipe: `{ cat .config; chmod 0600 .config; } > generated.h`, workingTreeContents: map[string]string{".config": "CONFIG_DYNAMIC=y\n"}, want: unsafe},
+		{name: "surviving directory is unsafe", replacementRecipe: `{ mkdir leaked; printf ok; } > generated.h`, want: unsafe},
+		{name: "physical working directory is unsafe", replacementRecipe: `{ pwd; } > generated.h`, want: unsafe},
+		{name: "physical source root is unsafe", replacementRecipe: `{ printf ${tree:kernel}/program.bc; } > generated.h`, want: unsafe},
+		// The final Kbuild wrapper uses set -e without pipefail. Preserve its
+		// last-command pipeline status now that the probe stages the same inputs.
+		{name: "pipeline follows final shell status", replacementRecipe: `{ unavailable-evaluated-probe-command | printf ok; } > generated.h`, want: safePrefix + "b2s=\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := executeEvaluatedOutputProbe(
+				t, scriptRunner, scriptRuntime, test.replacementRecipe, test.workingTreeContents,
+			)
+			if result.Text != test.want || len(result.Steps) != 3 ||
+				slices.ContainsFunc(result.Steps, func(step kconfig.ProbeStepResult) bool {
+					return step.Status != "success"
+				}) {
+				t.Fatalf("evaluated output result = %#v, want text %q and three successful steps", result, test.want)
 			}
 		})
 	}

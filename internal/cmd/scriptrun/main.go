@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -43,7 +44,11 @@ const (
 	maxReplayValueTotalSize = 4 << 20
 	maxReplayProtocolBytes  = maxReplayValueTotalSize + (maxReplayArguments * 4) + 64
 	maxReplayDiagnosticSize = maxReplayValueBytes + 4096
+	maxFallbackStdoutBytes  = 1 << 20
+	maxScriptFileSizeBytes  = 1 << 30
+	maxScriptTimeoutSeconds = 60 * 60
 	scriptReplayIOTimeout   = 30 * time.Second
+	scriptCommandWaitDelay  = time.Second
 	scriptAppletRolePrefix  = "script-applet-"
 	scriptReplayProxyMode   = "__linux_bzl_internal_script_replay_proxy__"
 	scriptReplayProtocol    = "LBZLRP01"
@@ -57,6 +62,32 @@ type repeatedFlag []string
 
 func (f *repeatedFlag) String() string         { return strings.Join(*f, " ") }
 func (f *repeatedFlag) Set(value string) error { *f = append(*f, value); return nil }
+
+type maxFileSizeFlag struct {
+	bytes uint64
+}
+
+func (f *maxFileSizeFlag) String() string {
+	if f == nil || f.bytes == 0 {
+		return ""
+	}
+	return strconv.FormatUint(f.bytes, 10)
+}
+
+func (f *maxFileSizeFlag) Set(value string) error {
+	bytes, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return fmt.Errorf("max_file_size_bytes must be a positive decimal byte count: %w", err)
+	}
+	if bytes == 0 {
+		return fmt.Errorf("max_file_size_bytes must be positive")
+	}
+	if err := validateMaxFileSizeBytes(bytes); err != nil {
+		return err
+	}
+	f.bytes = bytes
+	return nil
+}
 
 type scriptReplayManifest struct {
 	Name        string                   `json:"name"`
@@ -136,12 +167,63 @@ type scriptRunOptions struct {
 	runtimeToolPath    string
 	toolsetHandoff     string
 	replays            []scriptReplayManifest
+	maxFileSizeBytes   uint64
 	stdin              io.Reader
 	stdout             io.Writer
 	stderr             io.Writer
 }
 
+type scriptRunFallback struct {
+	enabled bool
+	timeout time.Duration
+	stdout  []byte
+}
+
 func runScript(opts scriptRunOptions) error {
+	return runScriptContext(context.Background(), opts)
+}
+
+func runScriptWithFallback(opts scriptRunOptions, fallback scriptRunFallback) error {
+	if err := validateMaxFileSizeBytes(opts.maxFileSizeBytes); err != nil {
+		return err
+	}
+	if err := validateScriptRunFallback(fallback); err != nil {
+		return err
+	}
+	if !fallback.enabled {
+		return runScript(opts)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), fallback.timeout)
+	defer cancel()
+	originalStdout := opts.stdout
+	if originalStdout == nil {
+		originalStdout = io.Discard
+	}
+	var captured bytes.Buffer
+	opts.stdout = &boundedFallbackWriter{writer: &captured, remaining: maxFallbackStdoutBytes}
+	if err := runScriptContext(ctx, opts); err != nil {
+		if _, writeErr := io.Copy(originalStdout, bytes.NewReader(fallback.stdout)); writeErr != nil {
+			return fmt.Errorf("write script fallback stdout: %w", writeErr)
+		}
+		return nil
+	}
+	if _, err := io.Copy(originalStdout, &captured); err != nil {
+		return fmt.Errorf("write script stdout: %w", err)
+	}
+	return nil
+}
+
+func runScriptContext(ctx context.Context, opts scriptRunOptions) error {
+	if ctx == nil {
+		return fmt.Errorf("script execution context is nil")
+	}
+	if err := validateMaxFileSizeBytes(opts.maxFileSizeBytes); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("execute source script: %w", err)
+	}
 	if opts.scriptStdin {
 		if opts.script != "" || opts.scriptContent != "" {
 			return fmt.Errorf("stdin script content is mutually exclusive with a source script or evaluated script content")
@@ -244,13 +326,32 @@ func runScript(opts scriptRunOptions) error {
 		if err != nil {
 			return err
 		}
-		listedApplets, err := multicallApplets(multicall)
+		listedApplets, err := multicallApplets(ctx, multicall)
 		if err != nil {
 			return err
 		}
 		for _, applet := range listedApplets {
-			if err := installScriptTool(toolDirectory, applet, multicall); err != nil {
-				return fmt.Errorf("install multicall applet %s: %w", applet, err)
+			executable := multicall
+			if runtimeToolPath != "" {
+				// The runner already exposes this exact configured role in the
+				// trailing runtime-tool PATH. A multicall entry is only a
+				// fallback: it must not hide that selected implementation.
+				// Inspect only the same validated basename; do not import any
+				// additional role or search the ambient environment. Explicit
+				// applet overrides and action proxies are installed below and
+				// retain their existing priority and configured contracts.
+				configured := filepath.Join(runtimeToolPath, applet)
+				if _, err := os.Lstat(configured); err == nil {
+					executable, err = requireScriptExecutable(configured, "configured runtime tool "+applet)
+					if err != nil {
+						return err
+					}
+				} else if !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("inspect configured runtime tool %s: %w", applet, err)
+				}
+			}
+			if err := installScriptTool(toolDirectory, applet, executable); err != nil {
+				return fmt.Errorf("install multicall fallback %s: %w", applet, err)
 			}
 			applets[applet] = true
 		}
@@ -369,7 +470,7 @@ func runScript(opts scriptRunOptions) error {
 	arguments := append([]string(nil), opts.interpreterArgs...)
 	arguments = append(arguments, script)
 	arguments = append(arguments, opts.scriptArgs...)
-	command := exec.Command(interpreter, arguments...)
+	command := scriptCommandContext(ctx, interpreter, arguments...)
 	if toolsetAliasRoot != nil {
 		// ExtraFiles[0] is fd 3 in the child, matching toolsetpath's stable
 		// /proc/self/fd/3 shell alias contract. Descendant shells and tool
@@ -396,7 +497,7 @@ func runScript(opts scriptRunOptions) error {
 	command.Stdin = opts.stdin
 	command.Stdout = opts.stdout
 	command.Stderr = opts.stderr
-	commandErr := command.Run()
+	commandErr := runScriptCommand(command, opts.maxFileSizeBytes)
 	var brokerErr error
 	if replayBroker != nil {
 		brokerErr = replayBroker.Close()
@@ -417,7 +518,152 @@ func runScript(opts scriptRunOptions) error {
 	if commandErr != nil {
 		return fmt.Errorf("execute source script: %w", commandErr)
 	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("execute source script: %w", err)
+	}
 	return nil
+}
+
+func validateScriptRunFallback(fallback scriptRunFallback) error {
+	if !fallback.enabled {
+		if fallback.timeout != 0 || len(fallback.stdout) != 0 {
+			return fmt.Errorf("disabled script fallback has timeout or stdout")
+		}
+		return nil
+	}
+	if fallback.timeout <= 0 || fallback.timeout > maxScriptTimeoutSeconds*time.Second {
+		return fmt.Errorf("script fallback timeout must be between 1ns and %d seconds", maxScriptTimeoutSeconds)
+	}
+	if len(fallback.stdout) == 0 || len(fallback.stdout) > maxFallbackStdoutBytes {
+		return fmt.Errorf("script fallback stdout is empty or exceeds %d bytes", maxFallbackStdoutBytes)
+	}
+	return nil
+}
+
+func parseScriptRunFallback(timeoutSeconds int, encodedStdout string) (scriptRunFallback, error) {
+	if timeoutSeconds == 0 && encodedStdout == "" {
+		return scriptRunFallback{}, nil
+	}
+	if timeoutSeconds <= 0 || encodedStdout == "" {
+		return scriptRunFallback{}, fmt.Errorf("timeout_seconds and fallback_stdout_base64 must be set together")
+	}
+	if timeoutSeconds > maxScriptTimeoutSeconds {
+		return scriptRunFallback{}, fmt.Errorf("timeout_seconds must not exceed %d", maxScriptTimeoutSeconds)
+	}
+	if len(encodedStdout) > base64.StdEncoding.EncodedLen(maxFallbackStdoutBytes) {
+		return scriptRunFallback{}, fmt.Errorf("fallback stdout exceeds %d decoded bytes", maxFallbackStdoutBytes)
+	}
+	decoded, err := base64.StdEncoding.Strict().DecodeString(encodedStdout)
+	if err != nil {
+		return scriptRunFallback{}, fmt.Errorf("decode fallback stdout: %w", err)
+	}
+	fallback := scriptRunFallback{
+		enabled: true,
+		timeout: time.Duration(timeoutSeconds) * time.Second,
+		stdout:  decoded,
+	}
+	if err := validateScriptRunFallback(fallback); err != nil {
+		return scriptRunFallback{}, err
+	}
+	return fallback, nil
+}
+
+func validateMaxFileSizeBytes(bytes uint64) error {
+	if bytes > maxScriptFileSizeBytes {
+		return fmt.Errorf("max_file_size_bytes must not exceed %d", maxScriptFileSizeBytes)
+	}
+	return nil
+}
+
+func scriptCommandContext(ctx context.Context, executable string, arguments ...string) *exec.Cmd {
+	command := exec.CommandContext(ctx, executable, arguments...)
+	if _, bounded := ctx.Deadline(); !bounded {
+		return command
+	}
+	// CommandContext kills the direct child. Put the interpreter and all of its
+	// descendants in one private process group as well so a timed-out helper
+	// cannot retain stdout or continue mutating its scratch tree.
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.Cancel = func() error {
+		if command.Process == nil {
+			return os.ErrProcessDone
+		}
+		err := syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	command.WaitDelay = scriptCommandWaitDelay
+	return command
+}
+
+var scriptCommandStartMutex sync.Mutex
+
+// runScriptCommand temporarily lowers this process's soft RLIMIT_FSIZE while
+// starting a bounded child. Linux copies that limit during fork, so restoring
+// the exact inherited limit immediately after Start leaves only the child and
+// its descendants bounded. Every command start in this process uses the same
+// gate, including unbounded setup commands, so none can accidentally inherit a
+// concurrent invocation's temporary limit.
+func runScriptCommand(command *exec.Cmd, maxFileSizeBytes uint64) error {
+	if command == nil {
+		return fmt.Errorf("script command is nil")
+	}
+	if err := validateMaxFileSizeBytes(maxFileSizeBytes); err != nil {
+		return err
+	}
+
+	scriptCommandStartMutex.Lock()
+	startErr, restoreErr := startScriptCommand(command, maxFileSizeBytes)
+	scriptCommandStartMutex.Unlock()
+	if restoreErr != nil {
+		// A successfully started child must not continue after the parent failed
+		// to recover its process-wide limit. Reap it before reporting the more
+		// important restoration failure.
+		if startErr == nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+		if startErr != nil {
+			return fmt.Errorf("start script command: %v; %w", startErr, restoreErr)
+		}
+		return restoreErr
+	}
+	if startErr != nil {
+		return startErr
+	}
+	return command.Wait()
+}
+
+func startScriptCommand(command *exec.Cmd, maxFileSizeBytes uint64) (startErr, restoreErr error) {
+	if maxFileSizeBytes == 0 {
+		return command.Start(), nil
+	}
+
+	var inherited syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &inherited); err != nil {
+		return fmt.Errorf("read inherited file-size limit: %w", err), nil
+	}
+	childLimit := inherited
+	childLimit.Cur = maxFileSizeBytes
+	if inherited.Cur < childLimit.Cur {
+		childLimit.Cur = inherited.Cur
+	}
+	if inherited.Max < childLimit.Cur {
+		childLimit.Cur = inherited.Max
+	}
+	if childLimit.Cur == inherited.Cur {
+		return command.Start(), nil
+	}
+	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &childLimit); err != nil {
+		return fmt.Errorf("set child file-size limit: %w", err), nil
+	}
+	startErr = command.Start()
+	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &inherited); err != nil {
+		restoreErr = fmt.Errorf("restore inherited file-size limit: %w", err)
+	}
+	return startErr, restoreErr
 }
 
 func requireScriptExecutable(filename, description string) (string, error) {
@@ -473,13 +719,13 @@ func validateRuntimeToolPath(value string) (string, error) {
 	return value, nil
 }
 
-func multicallApplets(multicall string) ([]string, error) {
-	command := exec.Command(multicall, "--list")
+func multicallApplets(ctx context.Context, multicall string) ([]string, error) {
+	command := scriptCommandContext(ctx, multicall, "--list")
 	command.Env = []string{"LC_ALL=C", "PATH="}
 	var output strings.Builder
 	command.Stdout = &boundedWriter{writer: &output, remaining: maxMulticallListSize}
 	command.Stderr = io.Discard
-	if err := command.Run(); err != nil {
+	if err := runScriptCommand(command, 0); err != nil {
 		return nil, fmt.Errorf("list multicall applets: %w", err)
 	}
 	seen := map[string]bool{}
@@ -507,6 +753,19 @@ func multicallApplets(multicall string) ([]string, error) {
 	}
 	sort.Strings(applets)
 	return applets, nil
+}
+
+type boundedFallbackWriter struct {
+	writer    io.Writer
+	remaining int
+}
+
+func (w *boundedFallbackWriter) Write(value []byte) (int, error) {
+	if len(value) > w.remaining {
+		return 0, fmt.Errorf("script stdout exceeds %d-byte fallback buffer", maxFallbackStdoutBytes)
+	}
+	w.remaining -= len(value)
+	return w.writer.Write(value)
 }
 
 type boundedWriter struct {
@@ -1445,12 +1704,16 @@ func main() {
 		return
 	}
 	var appletFlags, interpreterArgs, literalTreeOffsetFlags, replayFlags, requiredAppletFlags, toolFlags, treeFlags repeatedFlag
+	var maxFileSize maxFileSizeFlag
 	interpreter := flag.String("interpreter", "", "declared interpreter executable")
 	multicall := flag.String("multicall", "", "optional declared multicall executable used to populate PATH")
 	script := flag.String("script", "", "declared source script")
 	scriptContentRaw := flag.String("script_content", "", "raw evaluated Kbuild recipe")
 	scriptContentBase64 := flag.String("script_content_base64", "", "base64-encoded evaluated Kbuild recipe")
 	scriptStdin := flag.Bool("script_stdin", false, "read evaluated Kbuild recipe from stdin")
+	timeoutSeconds := flag.Int("timeout_seconds", 0, "bounded script timeout in seconds (requires fallback_stdout_base64)")
+	fallbackStdoutBase64 := flag.String("fallback_stdout_base64", "", "base64 stdout emitted on script setup, execution, or timeout failure (requires timeout_seconds)")
+	flag.Var(&maxFileSize, "max_file_size_bytes", fmt.Sprintf("maximum regular-file size written by the child in bytes (1-%d)", maxScriptFileSizeBytes))
 	flag.Var(&interpreterArgs, "interpreter_arg", "interpreter argument before the source script (repeatable)")
 	flag.Var(&appletFlags, "applet", "runtime applet override NAME=EXECUTABLE (repeatable)")
 	flag.Var(&requiredAppletFlags, "require_applet", "runtime applet required by evaluated script (repeatable)")
@@ -1480,6 +1743,10 @@ func main() {
 	if err == nil {
 		scriptContent, err = resolveScriptContent(*script, *scriptContentRaw, *scriptContentBase64)
 	}
+	var fallback scriptRunFallback
+	if err == nil {
+		fallback, err = parseScriptRunFallback(*timeoutSeconds, *fallbackStdoutBase64)
+	}
 	if err == nil {
 		var contracts map[string]toolaction.Contract
 		contracts, err = toolaction.Decode(os.Getenv(toolaction.EnvironmentName))
@@ -1487,14 +1754,15 @@ func main() {
 			err = fmt.Errorf("decode configured tool action contracts: %w", err)
 		}
 		if err == nil {
-			err = runScript(scriptRunOptions{
+			err = runScriptWithFallback(scriptRunOptions{
 				interpreter: *interpreter, interpreterArgs: interpreterArgs, multicall: *multicall,
 				script: *script, scriptContent: scriptContent, scriptStdin: *scriptStdin, scriptArgs: flag.Args(), applets: applets, requiredApplets: requiredAppletFlags, tools: tools, trees: trees, literalTreeOffsets: literalTreeOffsets, toolContracts: contracts,
-				runtimeToolPath: os.Getenv(toolaction.RuntimeToolPathEnvironmentName),
-				toolsetHandoff:  os.Getenv(toolsetpath.HandoffEnvironmentName),
-				replays:         replays,
-				stdin:           os.Stdin, stdout: os.Stdout, stderr: os.Stderr,
-			})
+				runtimeToolPath:  os.Getenv(toolaction.RuntimeToolPathEnvironmentName),
+				toolsetHandoff:   os.Getenv(toolsetpath.HandoffEnvironmentName),
+				replays:          replays,
+				maxFileSizeBytes: maxFileSize.bytes,
+				stdin:            os.Stdin, stdout: os.Stdout, stderr: os.Stderr,
+			}, fallback)
 		}
 	}
 	if err != nil {

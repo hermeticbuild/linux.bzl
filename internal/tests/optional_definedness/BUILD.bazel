@@ -1,0 +1,23 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_binary(
+    name = "fixture",
+    testonly = True,
+    embed = [":optional_definedness_lib"],
+    pure = "on",
+    visibility = ["//internal/tests:__subpackages__"],
+)
+
+go_library(
+    name = "optional_definedness_lib",
+    srcs = [
+        "macro_writes.go",
+        "main.go",
+    ],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/tests/optional_definedness",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//internal/kconfig",
+        "//internal/toolaction",
+    ],
+)

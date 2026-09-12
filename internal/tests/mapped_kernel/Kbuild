@@ -1,9 +1,131 @@
-cmd_cc_o_c = $(CC) $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS) -c -o $@ $<
+KBUILD_CPPFLAGS := -I$(objtree)/include -include $(objtree)/include/generated/autoconf.h
+# Keep a quoted, path-like macro in the real intrinsic probe context. It is
+# replacement text, not an include path or an object-tree input to stage.
+KBUILD_CFLAGS += -DMAPPED_OBJECT_FILE='"$(objtree)/smoke"'
 
-obj-y += smoke.o
+cmd_cc_o_c = $(CC) $(NOSTDINC_FLAGS) $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS) -MMD -MF $(depfile) -c -o $@ $<
+quiet_cmd_cc_o_c = CC      $@
+
+cmd_as_o_S = $(CC) $(NOSTDINC_FLAGS) $(KBUILD_CPPFLAGS) $(KBUILD_AFLAGS) -c -o $@ $<
+quiet_cmd_as_o_S = AS      $@
+
+# Keep a generated-C compiler context behind a real compiler-dependent Make
+# filter. The quoted object-root macro is shell source inside the symbolic
+# result, not an already-tokenized compiler argument.
+TMPOUT = .tmp_$$$$
+try-run = $(shell set -e; TMP=$(TMPOUT)/tmp; trap "rm -rf $(TMPOUT)" EXIT; mkdir -p $(TMPOUT); if ($(1)) >/dev/null 2>&1; then echo "$(2)"; else echo "$(3)"; fi)
+__cc-option = $(call try-run,$(1) -Werror $(2) -c -x c /dev/null -o "$$TMP",$(2),$(3))
+cc-option = $(call __cc-option,$(CC),$(1),$(2))
+CC_FLAGS_LTO := $(call cc-option,-flto)
+DEBUG_CFLAGS := -g
+c_flags = $(NOSTDINC_FLAGS) $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS) $(DEBUG_CFLAGS) -DKBUILD_MODFILE='"$(objtree)/asm-offsets"' $(CC_FLAGS_LTO)
+# This visible fixture marker identifies the generated compiler context in
+# query manifests; the path-like macro deliberately stays inside the filter.
+cmd_cc_s_c = $(CC) $(filter-out $(DEBUG_CFLAGS) $(CC_FLAGS_LTO),$(c_flags)) -DMAPPED_DEFERRED_ASSEMBLY_CONTEXT=1 -fverbose-asm -S -o $@ $<
+quiet_cmd_cc_s_c = CC      $@
+
+# Use the source-owned Linux offsets protocol, including the output-validation
+# contract recognized by the planner. Neither compiler answers nor header
+# contents are supplied by the test.
+define sed-offsets
+'s:^[[:space:]]*\.ascii[[:space:]]*"\(.*\)".*:\1:; \
+/^->/{s:->#\(.*\):/* \1 */:; \
+s:^->\([^ ]*\) [\$$#]*\([^ ]*\) \(.*\):#define \1 \2 /* \3 */:; \
+s:->::; p;}'
+endef
+define filechk_offsets
+	echo "#ifndef $2"; \
+	echo "#define $2"; \
+	echo "/* generated */"; \
+	sed -ne $(sed-offsets) < $<; \
+	echo "#endif"
+endef
+tmp-target = $(dir $@).tmp_$(notdir $@)
+define filechk
+	set -e; \
+	mkdir -p $(dir $@); \
+	trap "rm -f $(tmp-target)" EXIT; \
+	{ $(filechk_$(1)); } > $(tmp-target); \
+	if [ ! -r $@ ] || ! cmp -s $@ $(tmp-target); then \
+		mv -f $(tmp-target) $@; \
+	fi
+endef
+
+# Match Makefile.host's out-of-tree -I$(obj): quoted includes first search
+# beside the immutable source, then relative to the output's object directory.
+# No forced include may hide the generated CONFIG header dependency.
+# These fixture-owned maps test the source-root placeholder in both compiler
+# macro strings and DWARF; the backend must not inject such compiler policy.
+# Go 1.25's DWARF5 line reader incorrectly joins absolute filenames to their
+# directory entry. DWARF4 preserves strict path assertions with that reader.
+cmd_host-csingle = $(HOSTCC) -g -gdwarf-4 -ffile-prefix-map=$(srctree)=/mapped-kernel-source -fdebug-prefix-map=$(srctree)=/mapped-kernel-source -I$(dir $@) -o $@ $<
+quiet_cmd_host-csingle = HOSTCC  $@
+
+# This executable deliberately has no CONFIG input. Its opaque host link still
+# gets a full-config execution identity; only executed bytes may decouple it
+# from the precise smoke.o consumer across configurations.
+cmd_host-helper = $(HOSTCC) -o $@ $<
+quiet_cmd_host-helper = HOSTCC $@
+hostprogs := lib/subdir/program scripts/basic/fixdep
+
+obj-y += smoke.o dollar_smoke.o numeric_smoke.o pending_left.o pending_right.o literal_hint.o
+
+literal_hint.o: literal_hint.c include/linux/mapped_literal_first.h include/linux/mapped_literal_later.h
+	$(call if_changed,cc_o_c)
+
+# Two original compile contexts share definedness queries, but their original
+# replacement values must still reach the real compiler and emitted bytes.
+cmd_pending_left = $(CC) $(NOSTDINC_FLAGS) $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS) -DMAPPED_PENDING_CONTEXT=7 -c -o $@ $<
+cmd_pending_right = $(CC) $(NOSTDINC_FLAGS) $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS) -DMAPPED_PENDING_CONTEXT=11 -c -o $@ $<
+
+pending_left.o: pending_left.c include/linux/mapped_pending_hints.h
+	$(call if_changed,pending_left)
+
+pending_right.o: pending_right.c include/linux/mapped_pending_hints.h
+	$(call if_changed,pending_right)
 
 .PHONY: modules_prepare
 modules_prepare:
 
-smoke.o: smoke.c
-	$(cmd_cc_o_c)
+smoke.o: smoke.c include/generated/mapped_family_value.h scripts/basic/fixdep
+	$(call if_changed_dep,cc_o_c)
+
+dollar_smoke.o: dollar_smoke.S
+	$(call if_changed,as_o_S)
+
+# This plain typed compile adds real source-owned absence after common flags.
+# It has no helper or early intrinsic guard that could hide the numeric include.
+cmd_numeric_cc_o_c = $(CC) $(NOSTDINC_FLAGS) $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS) -U__MAPPED_NUMERIC_ABSENT -c -o $@ $<
+quiet_cmd_numeric_cc_o_c = CC      $@
+
+numeric_smoke.o: numeric_smoke.c include/generated/mapped_numeric_offsets.h
+	$(call if_changed,numeric_cc_o_c)
+
+numeric-offsets.s: numeric-offsets.c
+	$(call if_changed,cc_s_c)
+
+include/generated/mapped_numeric_offsets.h: numeric-offsets.s
+	$(call filechk,offsets,MAPPED_GENERATED_NUMERIC_OFFSETS_H)
+
+asm-offsets.s: asm-offsets.c
+	$(call if_changed,cc_s_c)
+
+include/generated/mapped_offsets.h: asm-offsets.s
+	$(call filechk,offsets,__MAPPED_GENERATED_OFFSETS_H__)
+
+scripts/basic/fixdep: scripts/basic/fixdep.c
+	$(call if_changed,host-helper)
+
+lib/subdir/program: lib/subdir/program.c lib/subdir/path_probe.h
+	$(call if_changed,host-csingle)
+
+include/generated/mapped_family_value.h: lib/subdir/program
+	$< --header > $@
+
+host-result: lib/subdir/program
+	$< > $@
+
+# Expose the compiled path fixture as ordinary selected output so the test can
+# inspect its DWARF without reaching into an undeclared family execution store.
+host-path-probe: lib/subdir/program
+	cp $< $@

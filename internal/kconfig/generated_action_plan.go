@@ -36,14 +36,22 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 	if m == nil {
 		return nil, fmt.Errorf("selected Kbuild action plan requires one resolved config")
 	}
-	selectionGraph, err := newCompactKbuildSelectionGraph(m.Config)
-	if err != nil {
-		return nil, err
+	selectionGraph := m.validatedSelectionGraph
+	if selectionGraph == nil {
+		var err error
+		selectionGraph, err = newCompactKbuildSelectionGraph(m.Config)
+		if err != nil {
+			return nil, err
+		}
 	}
-	plan.selectionGraph = selectionGraph
 	if m.configFragment == nil {
 		return nil, fmt.Errorf("selected Kbuild action plan requires a resolved config fragment")
 	}
+	// Every operation below may populate caches or materialization state. Consume
+	// the eagerly validated graph before the first mutation so a failed or later
+	// traversal cannot observe a partially lowered graph.
+	m.validatedSelectionGraph = nil
+	plan.selectionGraph = selectionGraph
 	if err := selectionGraph.prepareGroupedSelections(m, m.Config); err != nil {
 		return nil, err
 	}
@@ -347,6 +355,35 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 				return nil, fmt.Errorf("observed Kbuild state %s/%s has multiple producers", output.Tree, output.Path)
 			}
 			observedStates[key] = state
+		}
+		// A command with a fully proven, target-only filesystem effect keeps its
+		// opaque side-output lineage in a separate no-op state node. Resolve those
+		// candidate-specific captures by their canonical output identity without
+		// making the selected target's byte producer depend on unrelated state.
+		for _, observation := range observations {
+			key := actionPlanLookupKey(observation.output.Tree, observation.output.Path)
+			if _, exists := observedStates[key]; exists {
+				continue
+			}
+			stateProducer, slot, exists := planProducerByOutput(
+				plan, observation.output.Tree, observation.output.Path,
+			)
+			if !exists {
+				return nil, fmt.Errorf(
+					"materialized Kbuild selection %s has no observed state %s/%s",
+					compactKbuildSelectionKeyString(selectionKey), observation.output.Tree, observation.output.Path,
+				)
+			}
+			stateNode, exists := compactKbuildPlanNode(plan, stateProducer)
+			if !exists || slot < 0 || slot >= len(stateNode.Outputs) || stateNode.Outputs[slot].ObservedPath != observation.path {
+				return nil, fmt.Errorf(
+					"materialized Kbuild selection %s observed state %s/%s does not capture %q",
+					compactKbuildSelectionKeyString(selectionKey), observation.output.Tree, observation.output.Path, observation.path,
+				)
+			}
+			observedStates[key] = compactKbuildRuleInput{
+				path: observation.output.Path, producer: stateProducer, slot: slot,
+			}
 		}
 		if err := appendCompactKbuildBootstrapProjections(plan, m.Config, selection, producer); err != nil {
 			return nil, err
@@ -749,7 +786,7 @@ func actionPlanCommandMetadataSourceTreeClosure(
 	}
 	retained := map[string]bool{}
 	staged := map[string]bool{}
-	visited := make([]bool, len(plan.Nodes))
+	visited := actionPlanNodeVisitSet{}
 	for _, root := range roots {
 		err := plan.walkCompactKbuildWorkingTreeTopology(root, visited, func(nodeIndex uint32) error {
 			producer := plan.Nodes[nodeIndex]

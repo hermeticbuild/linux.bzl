@@ -511,6 +511,30 @@ func (l *probeSymbolicValueLowerer) arguments(arguments []string) ([]string, []P
 			base = append(base, argument)
 			continue
 		}
+		if len(argument) == len(linuxProbeSymbolPrefix)+linuxProbeSymbolDigestLength {
+			symbol, exists, err := l.evaluator.adoptSymbol(argument)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if exists && symbol.kind == "source-shell-words" {
+				// Complete Make evaluation precedes shell word formation. Neither
+				// finite-branch strings.Fields nor argv-only Make equivalence is
+				// sufficient when the retained text contains shell quoting.
+				fragments, symbolic, err := l.valueForMode(symbol.sourceShellWords, probeSymbolicValueExact)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				if !symbolic || len(fragments) == 0 {
+					return nil, nil, nil, fmt.Errorf("source shell words have no exact symbolic expression")
+				}
+				index := len(base)
+				base = append(base, "")
+				argumentFragments = append(argumentFragments, ProbeArgumentFragments{
+					Index: index, Mode: ProbeArgumentFragmentsModeSourceShellWords, Fragments: fragments,
+				})
+				continue
+			}
+		}
 		expansion, err := expandProbeSymbolicArgument(l.evaluator, argument)
 		if err != nil {
 			return nil, nil, nil, err

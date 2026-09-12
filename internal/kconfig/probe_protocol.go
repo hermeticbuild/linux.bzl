@@ -14,17 +14,19 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
 
 const (
 	LinuxProbePlanSchema    = "linux-probe-plan-v2"
-	LinuxProbeRequestSchema = "linux-probe-request-v11"
+	LinuxProbeRequestSchema = "linux-probe-request-v13"
 	LinuxProbeResultSchema  = "linux-probe-result-v2"
 
 	// Probe candidate policies select the security grammar used for arguments
@@ -33,6 +35,16 @@ const (
 	ProbeCandidatePolicyCC     = "cc"
 	ProbeCandidatePolicyLD     = "ld"
 	ProbeCandidatePolicyCCLink = "cc-link"
+
+	// ProbeCandidateProjectionCompilerPredefines removes source/action-only
+	// compiler arguments after dependency-backed fragments have rendered. The
+	// remaining candidate argv still passes through the ordinary CC security
+	// grammar before the configured compiler action contract is invoked.
+	ProbeCandidateProjectionCompilerPredefines = "compiler-predefines"
+
+	// Intrinsic queries remove the same source/action-only arguments but retain
+	// every command-line macro replacement byte: their result is value-sensitive.
+	ProbeCandidateProjectionCompilerIntrinsic = "compiler-intrinsic"
 
 	maxProbeSources         = 4096
 	maxProbeSourceRoots     = 256
@@ -67,6 +79,14 @@ type ProbeScratch struct {
 	Name    string `json:"name"`
 	Kind    string `json:"kind"` // file or directory
 	Content string `json:"content,omitempty"`
+	// Present distinguishes an initialized empty input file from an absent
+	// file-shaped scratch output. Nonempty Content continues to imply presence.
+	Present bool `json:"present,omitempty"`
+	// ContentIsOpaque keeps an input file's bytes outside source-command path
+	// canonicalization. Configuration projections are data, not scripts: a
+	// physical checkout spelling inside CONFIG_CMDLINE must reach the probe
+	// unchanged even though the same spelling in a program or argv is rebased.
+	ContentIsOpaque bool `json:"content_is_opaque,omitempty"`
 }
 
 // ProbeCandidateArguments identifies the argument structure supplied by
@@ -74,12 +94,17 @@ type ProbeScratch struct {
 // contains indexes into ProbeStep.Arguments. Owning a base slot also owns all
 // argv words rendered by a ProbeArgumentFragments group at that slot.
 // Conditional contains indexes into ProbeStep.ConditionalArguments and owns
-// every argument rendered by each selected group. Both lists are strictly
-// sorted so semantically identical ownership has one canonical encoding.
+// every argument rendered by each selected group. TranslationUnits contains
+// the exact argv words which the compiler-predefines projection must remove
+// after templates and dependency-backed fragments have rendered. It is never
+// inferred from filename syntax. All three lists are strictly sorted so
+// semantically identical ownership has one canonical encoding.
 type ProbeCandidateArguments struct {
-	Policy      string `json:"policy"`
-	Base        []int  `json:"base,omitempty"`
-	Conditional []int  `json:"conditional,omitempty"`
+	Policy           string   `json:"policy"`
+	Projection       string   `json:"projection,omitempty"`
+	Base             []int    `json:"base,omitempty"`
+	Conditional      []int    `json:"conditional,omitempty"`
+	TranslationUnits []string `json:"translation_units,omitempty"`
 }
 
 type ProbeStep struct {
@@ -89,8 +114,9 @@ type ProbeStep struct {
 	// primary tool through toolaction.EnvironmentName. Each role remains an
 	// explicit ${tool:ROLE} path argument/environment reference as well.
 	AuxiliaryTools []string `json:"auxiliary_tools,omitempty"`
-	// WorkingDirectory is either empty (the private scratch directory) or
-	// exactly one declared ${source_root:NAME} placeholder.
+	// WorkingDirectory is either empty (the private scratch directory), exactly
+	// one declared directory-shaped ${scratch:NAME} placeholder, or one declared
+	// ${source_root:NAME} placeholder with an optional canonical subdirectory.
 	WorkingDirectory     string                      `json:"working_directory,omitempty"`
 	Arguments            []string                    `json:"arguments,omitempty"`
 	ConditionalArguments []ProbeConditionalArguments `json:"conditional_arguments,omitempty"`
@@ -163,6 +189,10 @@ const (
 	// followed by one to nineteen digits. The runner validates the complete
 	// value and appends it without field splitting.
 	ProbeArgumentFragmentsModeSignedDecimal = "signed-decimal"
+	// Source-shell-words retains exact deferred recipe text until all Make
+	// transforms have completed, then performs bounded static shell lexing.
+	// Only source-owned compiler projection arguments may opt into this mode.
+	ProbeArgumentFragmentsModeSourceShellWords = "source-shell-words"
 )
 
 // ValidateProbeSignedDecimalArgument validates the complete runtime value for
@@ -189,7 +219,9 @@ func ValidateProbeSignedDecimalArgument(value string) error {
 // ProbeArgumentFragments replaces one empty base argument with argv derived
 // from concatenating Fragments. The default mode produces whitespace-delimited
 // words using strings.Fields-style splitting. Signed-decimal mode validates and
-// appends exactly one bounded scalar word. Keeping an explicit base slot makes
+// appends exactly one bounded scalar word. Source-shell-words lexes deferred
+// recipe text after its transforms and authenticates measured text boundaries.
+// Keeping an explicit base slot makes
 // its order unambiguous relative to both literal and conditional arguments;
 // neither mode invokes a shell.
 type ProbeArgumentFragments struct {
@@ -408,6 +440,7 @@ func (r ProbeRequest) Validate() error {
 		sourceRoots[root], previous = true, root
 	}
 	scratch := map[string]bool{}
+	scratchKinds := map[string]string{}
 	previous = ""
 	for _, item := range r.Scratch {
 		if err := validatePlanName("probe scratch", item.Name); err != nil {
@@ -425,7 +458,13 @@ func (r ProbeRequest) Validate() error {
 		if item.Kind != "file" && item.Content != "" {
 			return fmt.Errorf("probe scratch directory %q has content", item.Name)
 		}
-		scratch[item.Name], previous = true, item.Name
+		if item.Kind != "file" && item.Present {
+			return fmt.Errorf("probe scratch directory %q has a file-presence marker", item.Name)
+		}
+		if item.Kind != "file" && item.ContentIsOpaque {
+			return fmt.Errorf("probe scratch directory %q has an opaque-content marker", item.Name)
+		}
+		scratch[item.Name], scratchKinds[item.Name], previous = true, item.Kind, item.Name
 	}
 	steps := map[string]int{}
 	stdoutPathStep := ""
@@ -440,7 +479,7 @@ func (r ProbeRequest) Validate() error {
 			return err
 		}
 		if step.WorkingDirectory != "" {
-			if err := validateProbeWorkingDirectory(step.WorkingDirectory, sourceRoots); err != nil {
+			if err := validateProbeWorkingDirectory(step.WorkingDirectory, sourceRoots, scratchKinds); err != nil {
 				return fmt.Errorf("probe step %q working directory: %w", step.Name, err)
 			}
 		}
@@ -523,8 +562,16 @@ func (r ProbeRequest) Validate() error {
 			if group.Index < 0 || group.Index >= len(step.Arguments) || group.Index <= previousArgumentFragmentIndex {
 				return fmt.Errorf("probe step %q argument fragment group %d has an invalid or unsorted index", step.Name, groupIndex)
 			}
-			if group.Mode != "" && group.Mode != ProbeArgumentFragmentsModeSignedDecimal {
+			if group.Mode != "" && group.Mode != ProbeArgumentFragmentsModeSignedDecimal && group.Mode != ProbeArgumentFragmentsModeSourceShellWords {
 				return fmt.Errorf("probe step %q argument fragment group %d has unsupported mode %q", step.Name, groupIndex, group.Mode)
+			}
+			if group.Mode == ProbeArgumentFragmentsModeSourceShellWords {
+				candidate := step.Candidate
+				if candidate == nil || candidate.Policy != ProbeCandidatePolicyCC ||
+					(candidate.Projection != ProbeCandidateProjectionCompilerPredefines && candidate.Projection != ProbeCandidateProjectionCompilerIntrinsic) ||
+					!slices.Contains(candidate.Base, group.Index) {
+					return fmt.Errorf("probe step %q source-shell-words requires a candidate-owned CC compiler projection argument", step.Name)
+				}
 			}
 			if step.Arguments[group.Index] != "" || len(group.Fragments) == 0 {
 				return fmt.Errorf("probe step %q argument fragment group %d must replace one empty base argument", step.Name, groupIndex)
@@ -535,6 +582,11 @@ func (r ProbeRequest) Validate() error {
 				&argumentFragmentCount, &argumentFragmentBytes, &valueTransformCount,
 			); err != nil {
 				return err
+			}
+			if group.Mode == ProbeArgumentFragmentsModeSourceShellWords {
+				if err := validateProbeSourceShellFragmentLiterals(group.Fragments); err != nil {
+					return fmt.Errorf("probe step %q source-shell argument group %d: %w", step.Name, groupIndex, err)
+				}
 			}
 			previousArgumentFragmentIndex = group.Index
 		}
@@ -583,7 +635,7 @@ func (r ProbeRequest) Validate() error {
 			}
 			previousBefore = group.Before
 		}
-		if err := validateProbeCandidateArguments(step); err != nil {
+		if err := validateProbeCandidateArguments(step, scratch, sources, sourceRoots, r.InputCount); err != nil {
 			return fmt.Errorf("probe step %q candidate arguments: %w", step.Name, err)
 		}
 		if err := validateProbeTemplate(step.Stdin, scratch, sources, sourceRoots, r.InputCount); err != nil {
@@ -619,7 +671,38 @@ func (r ProbeRequest) Validate() error {
 	return nil
 }
 
-func validateProbeCandidateArguments(step ProbeStep) error {
+// Called only after the ordinary recursive fragment validation has bounded
+// depth, work and bytes. Literal marker framing is separate from the runtime
+// check on measured substitutions; neither boundary can stand in for the other.
+func validateProbeSourceShellFragmentLiterals(fragments []ProbeValueFragment) error {
+	for _, fragment := range fragments {
+		if err := ValidateProbeSourceShellLiteral(fragment.Value); err != nil {
+			return err
+		}
+		if err := validateProbeSourceShellFragmentLiterals(fragment.Fragments); err != nil {
+			return err
+		}
+		for _, transform := range fragment.Transforms {
+			for _, argument := range transform.Arguments {
+				if err := ValidateProbeSourceShellLiteral(argument); err != nil {
+					return err
+				}
+			}
+			for _, group := range transform.ArgumentFragments {
+				if err := validateProbeSourceShellFragmentLiterals(group.Fragments); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateProbeCandidateArguments(
+	step ProbeStep,
+	scratch, sources, sourceRoots map[string]bool,
+	inputCount int,
+) error {
 	candidate := step.Candidate
 	if candidate == nil {
 		return nil
@@ -628,6 +711,46 @@ func validateProbeCandidateArguments(step ProbeStep) error {
 	case ProbeCandidatePolicyCC, ProbeCandidatePolicyLD, ProbeCandidatePolicyCCLink:
 	default:
 		return fmt.Errorf("unsupported policy %q", candidate.Policy)
+	}
+	switch candidate.Projection {
+	case "":
+		if len(candidate.TranslationUnits) != 0 {
+			return errors.New("translation units require the compiler-predefines projection")
+		}
+	case ProbeCandidateProjectionCompilerPredefines, ProbeCandidateProjectionCompilerIntrinsic:
+		if candidate.Policy != ProbeCandidatePolicyCC {
+			return fmt.Errorf(
+				"projection %q requires policy %q, got %q",
+				candidate.Projection, ProbeCandidatePolicyCC, candidate.Policy,
+			)
+		}
+		if step.Tool != "cc" && step.Tool != "cxx" {
+			return fmt.Errorf(
+				"projection %q requires cc or cxx tool role, got %q",
+				candidate.Projection, step.Tool,
+			)
+		}
+	default:
+		return fmt.Errorf("unsupported projection %q", candidate.Projection)
+	}
+	if len(candidate.TranslationUnits) > maxProbeSources {
+		return fmt.Errorf("declares %d translation units, maximum is %d", len(candidate.TranslationUnits), maxProbeSources)
+	}
+	previousTranslationUnit := ""
+	for index, translationUnit := range candidate.TranslationUnits {
+		if err := validateProbeToken(translationUnit); err != nil {
+			return fmt.Errorf("translation unit %d: %w", index, err)
+		}
+		if strings.HasPrefix(translationUnit, "-") {
+			return fmt.Errorf("translation unit %d looks like an option: %q", index, translationUnit)
+		}
+		if translationUnit <= previousTranslationUnit {
+			return errors.New("translation units must be strictly sorted")
+		}
+		if err := validateProbeTemplate(translationUnit, scratch, sources, sourceRoots, inputCount); err != nil {
+			return fmt.Errorf("translation unit %d: %w", index, err)
+		}
+		previousTranslationUnit = translationUnit
 	}
 	if len(candidate.Base) == 0 && len(candidate.Conditional) == 0 {
 		return errors.New("must own at least one base or conditional argument")
@@ -646,18 +769,121 @@ func validateProbeCandidateArguments(step ProbeStep) error {
 		}
 		previous = groupIndex
 	}
+	if candidate.Projection == ProbeCandidateProjectionCompilerIntrinsic {
+		return validateCompilerIntrinsicProbeShape(step)
+	}
 	return nil
 }
 
-// validateProbeWorkingDirectory admits one declared source root plus an
-// optional canonical subdirectory. Source-only Kbuild shell queries run from
-// the exact recursive-Make cwd, while the root binding and bounded suffix keep
-// the process inside an input tree. No scratch, tool, result, or second source
-// placeholder can influence cwd selection.
-func validateProbeWorkingDirectory(value string, sourceRoots map[string]bool) error {
+// The intrinsic projection grants a narrowly scoped macro-literal exception.
+// Bind that authority to the generated input and its managed argv, rather than
+// allowing a caller to pair the projection with arbitrary preprocessor code or
+// an unvalidated, supposedly managed macro definition.
+func validateCompilerIntrinsicProbeShape(step ProbeStep) error {
+	_, err := compilerIntrinsicProbeCalls(step)
+	return err
+}
+
+// Return the operators only through the exact validated source/argv contract.
+// Runtime candidate validation must not accept an asserted operator list which
+// could omit an invocation from the input actually sent to the compiler.
+func compilerIntrinsicProbeCalls(step ProbeStep) ([]CompilerIntrinsicCall, error) {
+	if step.Candidate == nil || step.Candidate.Policy != ProbeCandidatePolicyCC ||
+		step.Candidate.Projection != ProbeCandidateProjectionCompilerIntrinsic ||
+		(step.Tool != "cc" && step.Tool != "cxx") {
+		return nil, errors.New("compiler intrinsic requires its compiler candidate policy and role")
+	}
+	if len(step.StdinFragments) != 0 || step.Stdin == "" || len(step.Stdin) > MaxProbeInterpolatedBytes {
+		return nil, errors.New("compiler intrinsic requires bounded static canonical stdin")
+	}
+	var calls []CompilerIntrinsicCall
+	for remaining := step.Stdin; remaining != ""; {
+		if len(calls) == maxCompilerIntrinsicCalls {
+			return nil, errors.New("compiler intrinsic stdin exceeds the call limit")
+		}
+		undef, tail, terminated := strings.Cut(remaining, "\n")
+		operand, hasUndef := strings.CutPrefix(undef, "#undef ")
+		if !terminated || !hasUndef {
+			return nil, errors.New("compiler intrinsic stdin requires an exact operand undefinition")
+		}
+		invocation, tail, terminated := strings.Cut(tail, "\n")
+		operator, _, _ := strings.Cut(invocation, "(")
+		call := CompilerIntrinsicCall{Operator: operator, Operand: operand}
+		if !terminated || ValidateCompilerIntrinsicCall(call) != nil || invocation != call.Operator+"("+call.Operand+")" {
+			return nil, errors.New("compiler intrinsic stdin requires the matching exact invocation")
+		}
+		calls = append(calls, call)
+		remaining = tail
+	}
+	_, canonical, err := compilerIntrinsicIntegersSource(calls)
+	if err != nil || canonical != step.Stdin {
+		return nil, errors.New("compiler intrinsic stdin must be canonical sorted unique calls")
+	}
+
+	const managedCount = 5
+	prefix := len(step.Arguments) - managedCount
+	if prefix < 0 {
+		return nil, errors.New("compiler intrinsic is missing its managed argv suffix")
+	}
+	managed := step.Arguments[prefix:]
+	if managed[0] != "-E" || managed[1] != "-P" || managed[2] != "-x" ||
+		(managed[3] != "c" && managed[3] != "c++") || managed[4] != "-" {
+		return nil, errors.New("compiler intrinsic requires the exact C or C++ managed argv suffix")
+	}
+	if len(step.Candidate.Base) != prefix {
+		return nil, errors.New("compiler intrinsic must own every argument before the managed suffix")
+	}
+	for index, owned := range step.Candidate.Base {
+		if owned != index {
+			return nil, errors.New("compiler intrinsic candidate ownership overlaps its managed suffix")
+		}
+	}
+	if len(step.Candidate.Conditional) != len(step.ConditionalArguments) {
+		return nil, errors.New("compiler intrinsic must own every conditional argument group")
+	}
+	for index, owned := range step.Candidate.Conditional {
+		if owned != index || step.ConditionalArguments[index].Before < 0 || step.ConditionalArguments[index].Before > prefix {
+			return nil, errors.New("compiler intrinsic conditional arguments overlap its managed suffix")
+		}
+	}
+	for _, group := range step.ArgumentFragments {
+		if group.Index < 0 || group.Index >= prefix {
+			return nil, errors.New("compiler intrinsic cannot fragment its managed argv suffix")
+		}
+	}
+	return calls, nil
+}
+
+// validateProbeWorkingDirectory admits either exactly one directory-shaped
+// scratch placeholder or one declared source root plus an optional canonical
+// subdirectory. Source-only Kbuild shell queries run from the exact
+// recursive-Make cwd, while exact scratch bindings let a sequence of probe
+// steps share a private output tree without granting authority over a suffix.
+func validateProbeWorkingDirectory(value string, sourceRoots map[string]bool, scratchKinds map[string]string) error {
+	const scratchPrefix = "${scratch:"
+	if strings.HasPrefix(value, scratchPrefix) {
+		end := strings.IndexByte(value[len(scratchPrefix):], '}')
+		if end < 0 {
+			return fmt.Errorf("has an unterminated scratch placeholder")
+		}
+		end += len(scratchPrefix)
+		name := value[len(scratchPrefix):end]
+		kind, exists := scratchKinds[name]
+		if !exists {
+			return fmt.Errorf("references undeclared scratch %q", name)
+		}
+		if kind != "directory" {
+			return fmt.Errorf("scratch %q is not a directory", name)
+		}
+		if value[end+1:] != "" {
+			return fmt.Errorf("scratch working directory must be exactly one ${scratch:NAME} placeholder")
+		}
+		return nil
+	}
+
 	const prefix = "${source_root:"
 	if !strings.HasPrefix(value, prefix) {
-		return fmt.Errorf("must start with one declared ${source_root:NAME}")
+		return fmt.Errorf("must start with one declared ${source_root:NAME} or be exactly one declared directory ${scratch:NAME}")
 	}
 	end := strings.IndexByte(value[len(prefix):], '}')
 	if end < 0 {
@@ -1342,6 +1568,14 @@ type ProbePlanNode struct {
 	Inputs    []string
 }
 
+// ProbePlanVariant names one independently discovered probe DAG. The name is
+// diagnostic-only: content-addressed request and node IDs determine all
+// sharing in the merged plan.
+type ProbePlanVariant struct {
+	Name string
+	Plan *ProbePlan
+}
+
 func (n ProbePlanNode) ContentID() string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s\x00%s\x00%s\x00", LinuxProbePlanSchema, n.Scope, n.RequestID)
@@ -1357,6 +1591,399 @@ func (p *ProbePlan) Write(outputDir string) error {
 		return err
 	}
 	return writeActionPlanTree(outputDir, entries)
+}
+
+// ReadProbePlan strictly reconstructs a path-encoded v2 probe DAG. The reader
+// regenerates the complete canonical marker tree after parsing it, so omitted
+// derived markers, unknown files, empty directories, symlinks, and
+// noncanonical request JSON are all rejected instead of becoming ambient
+// planner state.
+func ReadProbePlan(root string) (*ProbePlan, error) {
+	root = filepath.Clean(root)
+	info, err := os.Lstat(root)
+	if err != nil {
+		return nil, fmt.Errorf("read probe plan: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("read probe plan: root %q is not a directory", root)
+	}
+
+	files := map[string][]byte{}
+	directories := map[string]bool{".": true}
+	err = filepath.WalkDir(root, func(filename string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(root, filename)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("probe plan contains symlink %q", relative)
+		}
+		if entry.IsDir() {
+			directories[relative] = true
+			return nil
+		}
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !entryInfo.Mode().IsRegular() {
+			return fmt.Errorf("probe plan contains non-regular file %q", relative)
+		}
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+		files[relative] = data
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read probe plan: %w", err)
+	}
+
+	type nodeMarkers struct {
+		scope     string
+		requestID string
+		inputs    map[int]string
+	}
+	plan := &ProbePlan{
+		Toolsets: map[string]string{},
+		Requests: map[string]ProbeRequest{},
+	}
+	nodes := map[string]*nodeMarkers{}
+	filePaths := make([]string, 0, len(files))
+	for filename := range files {
+		filePaths = append(filePaths, filename)
+	}
+	sort.Strings(filePaths)
+	for _, filename := range filePaths {
+		parts := strings.Split(filename, "/")
+		switch {
+		case len(parts) == 2 && parts[0] == "schema":
+			// The exact v2 marker is checked against regenerated entries below.
+		case len(parts) == 3 && parts[0] == "toolsets" && (parts[1] == "target" || parts[1] == "host"):
+			if err := validateProbeIdentity(parts[2]); err != nil {
+				return nil, fmt.Errorf("read probe plan: %w", err)
+			}
+			if plan.Toolsets[parts[1]] != "" {
+				return nil, fmt.Errorf("read probe plan: repeated %s toolset marker", parts[1])
+			}
+			plan.Toolsets[parts[1]] = parts[2]
+		case len(parts) == 2 && parts[0] == "requests" && strings.HasSuffix(parts[1], ".json"):
+			requestID := strings.TrimSuffix(parts[1], ".json")
+			if err := validatePlanDigest("probe request ID", requestID); err != nil {
+				return nil, fmt.Errorf("read probe plan: %w", err)
+			}
+			request, err := ReadProbeRequest(filepath.Join(root, filepath.FromSlash(filename)))
+			if err != nil {
+				return nil, fmt.Errorf("read probe plan request %s: %w", requestID, err)
+			}
+			actualID, err := request.ID()
+			if err != nil {
+				return nil, fmt.Errorf("read probe plan request %s: %w", requestID, err)
+			}
+			if actualID != requestID {
+				return nil, fmt.Errorf("read probe plan request ID %s does not match canonical content %s", requestID, actualID)
+			}
+			plan.Requests[requestID] = *request
+		case len(parts) == 2 && parts[0] == "terminal":
+			if err := validatePlanDigest("probe terminal", parts[1]); err != nil {
+				return nil, fmt.Errorf("read probe plan: %w", err)
+			}
+			plan.Terminal = append(plan.Terminal, parts[1])
+		case len(parts) >= 4 && parts[0] == "nodes":
+			nodeID := parts[1]
+			if err := validatePlanDigest("probe node ID", nodeID); err != nil {
+				return nil, fmt.Errorf("read probe plan: %w", err)
+			}
+			markers := nodes[nodeID]
+			if markers == nil {
+				markers = &nodeMarkers{inputs: map[int]string{}}
+				nodes[nodeID] = markers
+			}
+			switch {
+			case len(parts) == 4 && parts[2] == "scope":
+				if (parts[3] != "target" && parts[3] != "host") || markers.scope != "" {
+					return nil, fmt.Errorf("read probe plan node %s has invalid or repeated scope marker", nodeID)
+				}
+				markers.scope = parts[3]
+			case len(parts) == 4 && parts[2] == "request":
+				if err := validatePlanDigest("probe request ID", parts[3]); err != nil {
+					return nil, fmt.Errorf("read probe plan node %s: %w", nodeID, err)
+				}
+				if markers.requestID != "" {
+					return nil, fmt.Errorf("read probe plan node %s repeats its request marker", nodeID)
+				}
+				markers.requestID = parts[3]
+			case len(parts) == 5 && parts[2] == "in":
+				ordinal, ok := parseProbePlanOrdinal(parts[3])
+				if !ok {
+					return nil, fmt.Errorf("read probe plan node %s has invalid dependency ordinal %q", nodeID, parts[3])
+				}
+				if err := validatePlanDigest("probe dependency", parts[4]); err != nil {
+					return nil, fmt.Errorf("read probe plan node %s: %w", nodeID, err)
+				}
+				if _, exists := markers.inputs[ordinal]; exists {
+					return nil, fmt.Errorf("read probe plan node %s repeats dependency ordinal %s", nodeID, parts[3])
+				}
+				markers.inputs[ordinal] = parts[4]
+			}
+		}
+	}
+
+	nodeIDs := make([]string, 0, len(nodes))
+	for nodeID := range nodes {
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	sort.Strings(nodeIDs)
+	for _, nodeID := range nodeIDs {
+		markers := nodes[nodeID]
+		if markers.scope == "" || markers.requestID == "" {
+			return nil, fmt.Errorf("read probe plan node %s has incomplete metadata", nodeID)
+		}
+		inputs := make([]string, len(markers.inputs))
+		for ordinal, input := range markers.inputs {
+			if ordinal >= len(inputs) {
+				return nil, fmt.Errorf("read probe plan node %s has non-contiguous dependency ordinals", nodeID)
+			}
+			inputs[ordinal] = input
+		}
+		for ordinal, input := range inputs {
+			if input == "" {
+				return nil, fmt.Errorf("read probe plan node %s omits dependency ordinal %s", nodeID, planOrdinal(ordinal))
+			}
+		}
+		plan.Nodes = append(plan.Nodes, ProbePlanNode{
+			ID: nodeID, Scope: markers.scope, RequestID: markers.requestID, Inputs: inputs,
+		})
+	}
+	sort.Strings(plan.Terminal)
+
+	expectedEntries, err := plan.entries()
+	if err != nil {
+		return nil, fmt.Errorf("read probe plan: %w", err)
+	}
+	expectedFiles := make(map[string][]byte, len(expectedEntries))
+	expectedDirectories := map[string]bool{".": true}
+	for _, entry := range expectedEntries {
+		expectedFiles[entry.path] = entry.data
+		for directory := path.Dir(entry.path); directory != "."; directory = path.Dir(directory) {
+			expectedDirectories[directory] = true
+		}
+	}
+	if err := compareProbePlanTree(files, expectedFiles, "file"); err != nil {
+		return nil, fmt.Errorf("read probe plan: %w", err)
+	}
+	actualDirectoryMarkers := make(map[string][]byte, len(directories))
+	expectedDirectoryMarkers := make(map[string][]byte, len(expectedDirectories))
+	for directory := range directories {
+		actualDirectoryMarkers[directory] = nil
+	}
+	for directory := range expectedDirectories {
+		expectedDirectoryMarkers[directory] = nil
+	}
+	if err := compareProbePlanTree(actualDirectoryMarkers, expectedDirectoryMarkers, "directory"); err != nil {
+		return nil, fmt.Errorf("read probe plan: %w", err)
+	}
+	return plan, nil
+}
+
+func parseProbePlanOrdinal(value string) (int, bool) {
+	if len(value) != 8 {
+		return 0, false
+	}
+	ordinal := 0
+	for _, character := range []byte(value) {
+		if character < '0' || character > '9' {
+			return 0, false
+		}
+		ordinal = ordinal*10 + int(character-'0')
+	}
+	return ordinal, true
+}
+
+func compareProbePlanTree(actual, expected map[string][]byte, kind string) error {
+	actualPaths := make([]string, 0, len(actual))
+	for pathname := range actual {
+		actualPaths = append(actualPaths, pathname)
+	}
+	sort.Strings(actualPaths)
+	for _, pathname := range actualPaths {
+		want, ok := expected[pathname]
+		if !ok {
+			return fmt.Errorf("probe plan contains unknown %s %q", kind, pathname)
+		}
+		if !bytes.Equal(actual[pathname], want) {
+			return fmt.Errorf("probe plan %s %q has noncanonical content", kind, pathname)
+		}
+	}
+	expectedPaths := make([]string, 0, len(expected))
+	for pathname := range expected {
+		if _, ok := actual[pathname]; !ok {
+			expectedPaths = append(expectedPaths, pathname)
+		}
+	}
+	sort.Strings(expectedPaths)
+	if len(expectedPaths) != 0 {
+		return fmt.Errorf("probe plan omits %s %q", kind, expectedPaths[0])
+	}
+	return nil
+}
+
+// MergeProbePlans returns the deterministic content-addressed union of
+// independently discovered probe DAGs. All variants must select identical
+// target and host toolset identities. Requests, nodes, and terminal roots are
+// deduplicated by their v2 IDs; executing the union therefore produces the
+// intentional result superset accepted by per-variant replay validation.
+func MergeProbePlans(variants []ProbePlanVariant) (*ProbePlan, error) {
+	if len(variants) == 0 {
+		return nil, errors.New("probe plan union has no variants")
+	}
+	variants = slices.Clone(variants)
+	sort.Slice(variants, func(i, j int) bool { return variants[i].Name < variants[j].Name })
+	for index, variant := range variants {
+		if variant.Name == "" {
+			return nil, errors.New("probe plan union has an unnamed variant")
+		}
+		if index != 0 && variants[index-1].Name == variant.Name {
+			return nil, fmt.Errorf("probe plan union repeats variant %q", variant.Name)
+		}
+	}
+
+	merged := &ProbePlan{Toolsets: map[string]string{}, Requests: map[string]ProbeRequest{}}
+	nodes := map[string]ProbePlanNode{}
+	terminals := map[string]bool{}
+	for index, variant := range variants {
+		if variant.Plan == nil {
+			return nil, fmt.Errorf("probe plan union variant %q is nil", variant.Name)
+		}
+		if _, err := variant.Plan.entries(); err != nil {
+			return nil, fmt.Errorf("probe plan union variant %q: %w", variant.Name, err)
+		}
+		if index == 0 {
+			for _, scope := range []string{"target", "host"} {
+				if identity := variant.Plan.Toolsets[scope]; identity != "" {
+					merged.Toolsets[scope] = identity
+				}
+			}
+		} else {
+			for _, scope := range []string{"target", "host"} {
+				if got, want := variant.Plan.Toolsets[scope], merged.Toolsets[scope]; got != want {
+					return nil, fmt.Errorf(
+						"probe plan union variant %q selects %s toolset %q, variant %q selects %q",
+						variant.Name, scope, got, variants[0].Name, want,
+					)
+				}
+			}
+		}
+
+		requestIDs := make([]string, 0, len(variant.Plan.Requests))
+		for requestID := range variant.Plan.Requests {
+			requestIDs = append(requestIDs, requestID)
+		}
+		sort.Strings(requestIDs)
+		for _, requestID := range requestIDs {
+			request := variant.Plan.Requests[requestID]
+			if existing, ok := merged.Requests[requestID]; ok {
+				existingData, _ := existing.CanonicalJSON()
+				requestData, _ := request.CanonicalJSON()
+				if !bytes.Equal(existingData, requestData) {
+					return nil, fmt.Errorf("probe plan union request ID %s has conflicting content in variant %q", requestID, variant.Name)
+				}
+				continue
+			}
+			merged.Requests[requestID] = request
+		}
+
+		variantNodes := slices.Clone(variant.Plan.Nodes)
+		sort.Slice(variantNodes, func(i, j int) bool { return variantNodes[i].ID < variantNodes[j].ID })
+		for _, node := range variantNodes {
+			if existing, ok := nodes[node.ID]; ok {
+				if existing.Scope != node.Scope || existing.RequestID != node.RequestID || !slices.Equal(existing.Inputs, node.Inputs) {
+					return nil, fmt.Errorf("probe plan union node ID %s has conflicting content in variant %q", node.ID, variant.Name)
+				}
+				continue
+			}
+			node.Inputs = slices.Clone(node.Inputs)
+			nodes[node.ID] = node
+		}
+		for _, terminal := range variant.Plan.Terminal {
+			terminals[terminal] = true
+		}
+	}
+
+	merged.Nodes = make([]ProbePlanNode, 0, len(nodes))
+	for _, node := range nodes {
+		merged.Nodes = append(merged.Nodes, node)
+	}
+	sort.Slice(merged.Nodes, func(i, j int) bool { return merged.Nodes[i].ID < merged.Nodes[j].ID })
+	merged.Terminal = make([]string, 0, len(terminals))
+	for terminal := range terminals {
+		merged.Terminal = append(merged.Terminal, terminal)
+	}
+	sort.Strings(merged.Terminal)
+	if _, err := merged.entries(); err != nil {
+		return nil, fmt.Errorf("merged probe plan: %w", err)
+	}
+	merged.Toolsets = maps.Clone(merged.Toolsets)
+	return merged, nil
+}
+
+// SelectProbePlanTerminals returns the exact dependency closure of selected
+// original terminal roots. Selection never turns an arbitrary dependency into a
+// terminal, repairs a malformed discarded branch, or changes configured toolset
+// identities. The entire input plan is validated before any selection; the
+// returned plan owns defensive copies of all retained nested request data.
+func SelectProbePlanTerminals(plan *ProbePlan, terminals []string) (*ProbePlan, error) {
+	if _, err := plan.entries(); err != nil {
+		return nil, fmt.Errorf("select probe plan terminals: %w", err)
+	}
+	allowed := make(map[string]bool, len(plan.Terminal))
+	for _, terminal := range plan.Terminal {
+		allowed[terminal] = true
+	}
+	selected := make(map[string]bool)
+	for _, terminal := range terminals {
+		if !allowed[terminal] {
+			return nil, fmt.Errorf("selected probe root %q is not an original terminal", terminal)
+		}
+		selected[terminal] = true
+	}
+	nodes := make(map[string]ProbePlanNode, len(plan.Nodes))
+	for _, node := range plan.Nodes {
+		nodes[node.ID] = node
+	}
+	kept := make(map[string]bool)
+	stack := slices.Sorted(maps.Keys(selected))
+	for len(stack) != 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if kept[id] {
+			continue
+		}
+		kept[id] = true
+		stack = append(stack, nodes[id].Inputs...)
+	}
+	result := &ProbePlan{
+		Toolsets: maps.Clone(plan.Toolsets),
+		Requests: make(map[string]ProbeRequest),
+		Terminal: slices.Sorted(maps.Keys(selected)),
+	}
+	for _, id := range slices.Sorted(maps.Keys(kept)) {
+		node := nodes[id]
+		node.Inputs = slices.Clone(node.Inputs)
+		result.Nodes = append(result.Nodes, node)
+		if _, present := result.Requests[node.RequestID]; !present {
+			result.Requests[node.RequestID] = cloneLinuxProbeRequest(plan.Requests[node.RequestID])
+		}
+	}
+	if _, err := result.entries(); err != nil {
+		return nil, fmt.Errorf("selected probe plan: %w", err)
+	}
+	return result, nil
 }
 
 func (p *ProbePlan) entries() ([]actionPlanEntry, error) {

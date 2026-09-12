@@ -370,6 +370,207 @@ func TestParseKbuildFileTreeReusesVariableBaseAcrossInvocationOverlays(t *testin
 	}
 }
 
+func TestKbuildSourceCacheReevaluatesConfigAndEnvironment(t *testing.T) {
+	root := t.TempDir()
+	for name, contents := range map[string]string{
+		"Makefile": `include shared.mk
+captured := $(CONFIG_MODE)|$(PROFILE)|$(from-shared)
+`,
+		"shared.mk": `from-shared = $(CONFIG_MODE)-$(PROFILE)
+`,
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache := NewKbuildSourceCache([]string{root}, nil)
+	for _, test := range []struct {
+		config  string
+		profile string
+		want    string
+	}{
+		{config: "y", profile: "first", want: "y|first|y-first"},
+		{config: "n", profile: "second", want: "n|second|n-second"},
+	} {
+		parsed, err := ParseKbuildFileTree(filepath.Join(root, "Makefile"), KbuildOptions{
+			RootDir:                 root,
+			Variables:               map[string]string{"CONFIG_MODE": test.config},
+			EnvironmentVariables:    map[string]string{"PROFILE": test.profile},
+			ConfigVariablesComplete: true,
+			MakeVariablesComplete:   true,
+			CaptureVariables:        []string{"captured"},
+			SourceCache:             cache,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parsed.Variables["captured"]; got != test.want {
+			t.Fatalf("config %q environment %q captured %q, want %q", test.config, test.profile, got, test.want)
+		}
+	}
+	if got, want := cache.Stats(), (KbuildSourceCacheStats{SourceReads: 2, CacheHits: 2, Entries: 2}); got != want {
+		t.Fatalf("source cache stats = %#v, want %#v", got, want)
+	}
+}
+
+func TestKbuildSourceCacheSharesLexingAcrossVariantScale(t *testing.T) {
+	root := t.TempDir()
+	for name, contents := range map[string]string{
+		"Makefile":  "include common.mk\ncaptured := $(COMMON)-$(VARIANT)\n",
+		"common.mk": "COMMON := source\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache := NewKbuildSourceCache([]string{root}, nil)
+	const variants = 128
+	for variant := 0; variant < variants; variant++ {
+		value := fmt.Sprintf("variant-%03d", variant)
+		parsed, err := ParseKbuildFileTree(filepath.Join(root, "Makefile"), KbuildOptions{
+			RootDir:          root,
+			Variables:        map[string]string{"VARIANT": value},
+			CaptureVariables: []string{"captured"},
+			SourceCache:      cache,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := parsed.Variables["captured"], "source-"+value; got != want {
+			t.Fatalf("variant %d captured %q, want %q", variant, got, want)
+		}
+	}
+	if got, want := cache.Stats(), (KbuildSourceCacheStats{
+		SourceReads: 2,
+		CacheHits:   (variants - 1) * 2,
+		Entries:     2,
+	}); got != want {
+		t.Fatalf("source cache stats = %#v, want %#v", got, want)
+	}
+}
+
+func TestKbuildSourceCacheExcludesMutableObjectTree(t *testing.T) {
+	root := t.TempDir()
+	objectRoot := filepath.Join(root, "object")
+	if err := os.MkdirAll(objectRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(`include $(objtree)/variant.mk
+captured := $(OBJECT_VALUE)
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	variantMakefile := filepath.Join(objectRoot, "variant.mk")
+	cache := NewKbuildSourceCache([]string{root}, []string{objectRoot})
+	for _, value := range []string{"first", "second"} {
+		if err := os.WriteFile(variantMakefile, []byte("OBJECT_VALUE := "+value+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParseKbuildFileTree(filepath.Join(root, "Makefile"), KbuildOptions{
+			RootDir:          root,
+			Variables:        map[string]string{"objtree": "__OBJECT_TREE__"},
+			SourceRoots:      map[string]string{"__OBJECT_TREE__": objectRoot},
+			CaptureVariables: []string{"captured"},
+			SourceCache:      cache,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parsed.Variables["captured"]; got != value {
+			t.Fatalf("captured object value = %q, want %q", got, value)
+		}
+	}
+	if got, want := cache.Stats(), (KbuildSourceCacheStats{SourceReads: 1, CacheHits: 1, Entries: 1}); got != want {
+		t.Fatalf("source cache stats = %#v, want source-only reuse %#v", got, want)
+	}
+}
+
+func TestKbuildSourceCacheExcludesSourceSymlinkIntoMutableObjectTree(t *testing.T) {
+	root := t.TempDir()
+	objectRoot := filepath.Join(root, "object")
+	if err := os.MkdirAll(objectRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte("include shared.mk\ncaptured := $(OBJECT_VALUE)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	variantMakefile := filepath.Join(objectRoot, "variant.mk")
+	if err := os.WriteFile(variantMakefile, []byte("OBJECT_VALUE := first\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(variantMakefile, filepath.Join(root, "shared.mk")); err != nil {
+		t.Fatal(err)
+	}
+	cache := NewKbuildSourceCache([]string{root}, []string{objectRoot})
+	for _, value := range []string{"first", "second"} {
+		if err := os.WriteFile(variantMakefile, []byte("OBJECT_VALUE := "+value+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParseKbuildFileTree(filepath.Join(root, "Makefile"), KbuildOptions{
+			RootDir:          root,
+			CaptureVariables: []string{"captured"},
+			SourceCache:      cache,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parsed.Variables["captured"]; got != value {
+			t.Fatalf("captured symlinked object value = %q, want %q", got, value)
+		}
+	}
+	if got, want := cache.Stats(), (KbuildSourceCacheStats{SourceReads: 1, CacheHits: 1, Entries: 1}); got != want {
+		t.Fatalf("source cache stats = %#v, want only the root Makefile cached %#v", got, want)
+	}
+}
+
+func TestKbuildSourceCacheAdmitsBazelStyleImmutableFileSymlink(t *testing.T) {
+	root := t.TempDir()
+	contentStore := t.TempDir()
+	physical := filepath.Join(contentStore, "shared.mk")
+	if err := os.WriteFile(physical, []byte("SHARED := immutable\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(physical, filepath.Join(root, "shared.mk")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte("include shared.mk\ncaptured := $(SHARED)-$(VARIANT)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cache := NewKbuildSourceCache([]string{root}, nil)
+	for _, variant := range []string{"first", "second"} {
+		parsed, err := ParseKbuildFileTree(filepath.Join(root, "Makefile"), KbuildOptions{
+			RootDir:          root,
+			Variables:        map[string]string{"VARIANT": variant},
+			CaptureVariables: []string{"captured"},
+			SourceCache:      cache,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := parsed.Variables["captured"], "immutable-"+variant; got != want {
+			t.Fatalf("captured = %q, want %q", got, want)
+		}
+	}
+	if got, want := cache.Stats(), (KbuildSourceCacheStats{SourceReads: 2, CacheHits: 2, Entries: 2}); got != want {
+		t.Fatalf("source cache stats = %#v, want Bazel-style symlink reuse %#v", got, want)
+	}
+}
+
+func TestKbuildSourceCachePreservesMissingIncludeDiagnostic(t *testing.T) {
+	root := t.TempDir()
+	makefile := filepath.Join(root, "Makefile")
+	if err := os.WriteFile(makefile, []byte("include missing.mk\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, ordinaryErr := ParseKbuildFileTree(makefile, KbuildOptions{RootDir: root})
+	_, cachedErr := ParseKbuildFileTree(makefile, KbuildOptions{
+		RootDir: root, SourceCache: NewKbuildSourceCache([]string{root}, nil),
+	})
+	if ordinaryErr == nil || cachedErr == nil || ordinaryErr.Error() != cachedErr.Error() {
+		t.Fatalf("missing include errors differ without/with cache:\nordinary: %v\n  cached: %v", ordinaryErr, cachedErr)
+	}
+}
+
 func TestParseKbuildFileTreeResolvesSentinelIncludeRoots(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o755); err != nil {

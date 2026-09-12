@@ -102,6 +102,7 @@ linux_source_repository = _linux_source_repository
 	writeFile(t, filepath.Join(root, "internal", "BUILD.bazel"), `exports_files(
     [
         "linux_source_repository.bzl",
+        "linux_source_runfiles.bzl",
         "module_make_vars.bzl",
         "repository_utils.bzl",
     ],
@@ -111,6 +112,7 @@ linux_source_repository = _linux_source_repository
 	for _, relative := range []string{
 		"source_repo.BUILD.bazel",
 		"internal/linux_source_repository.bzl",
+		"internal/linux_source_runfiles.bzl",
 		"internal/module_make_vars.bzl",
 		"internal/repository_utils.bzl",
 	} {

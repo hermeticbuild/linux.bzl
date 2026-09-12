@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
@@ -144,6 +145,13 @@ type KbuildOptions struct {
 	// files. Reads consult it first, so an opaque generated file cannot fall
 	// through to a stale physical object tree.
 	VirtualFileView KbuildVirtualFileView
+	// SourceCache optionally shares immutable Kbuild source reads and lexical
+	// preprocessing across independent Make evaluations. The cache contains no
+	// variables, environment, conditional state, include decisions, shell/probe
+	// results, or target evaluators: every ParseKbuildFileTree call replays the
+	// cached source program into a fresh parser. Only paths below the immutable
+	// roots declared when the cache was constructed are eligible.
+	SourceCache *KbuildSourceCache
 	// VariableBase is an optional immutable shared variable snapshot. When it is
 	// set, Variables is a sparse invocation-local overlay on that base. When it
 	// is nil, Variables retains its traditional standalone behavior.
@@ -187,6 +195,11 @@ type KbuildOptions struct {
 	// revisiting a recursive variable while classifying a dynamic Make branch
 	// cannot introduce a new branch-sensitive shell effect.
 	shellResultAvailable func(command string) bool
+	// probeEnvironmentIdentity returns the stable identity of the currently
+	// activated compiler/source-probe process environment. Target-command
+	// resolution uses it only as process-local memo provenance; it is never
+	// serialized into the action graph.
+	probeEnvironmentIdentity func() string
 	// SourceShell lowers a non-tool shell query against the immutable Linux
 	// source tree. It is consulted after Shell returns a narrowly typed
 	// unhandled-command error, or directly when target replay deliberately
@@ -228,6 +241,150 @@ type KbuildOptions struct {
 	// SkipExportedVariables avoids eagerly expanding every export while a
 	// caller evaluates a bounded source-derived Make identity.
 	SkipExportedVariables bool
+}
+
+// KbuildSourceCache is a process-local cache of immutable Kbuild source
+// programs. Programs contain only continuation-folded, literal-protected
+// source lines and their comment-stripped spelling. They are safe to replay
+// against unrelated configs, environments, compiler probes, and object-tree
+// views because none of those inputs participate in source tokenization.
+//
+// The cache is safe for concurrent callers. Its roots are snapshotted by the
+// constructor; callers must keep files below those roots immutable for the
+// cache's lifetime. Paths below an excluded root always bypass the cache.
+type KbuildSourceCache struct {
+	mu               sync.Mutex
+	roots            []string
+	excluded         []string
+	resolvedExcluded []string
+	paths            map[string]kbuildSourceCachePath
+	programs         map[string]kbuildSourceProgram
+	reads            int
+	hits             int
+}
+
+type kbuildSourceCachePath struct {
+	resolved string
+	eligible bool
+}
+
+// KbuildSourceCacheStats reports source-program cache activity. SourceReads is
+// the number of eligible files lexed from disk, CacheHits is the number of
+// evaluations replayed from an existing program, and Entries is the number of
+// retained immutable source programs.
+type KbuildSourceCacheStats struct {
+	SourceReads int
+	CacheHits   int
+	Entries     int
+}
+
+// NewKbuildSourceCache creates a source cache for immutableRoots. excludedRoots
+// are useful when a writable or config-specific object tree is nested below an
+// otherwise immutable source root.
+func NewKbuildSourceCache(immutableRoots, excludedRoots []string) *KbuildSourceCache {
+	return &KbuildSourceCache{
+		roots:            canonicalKbuildSourceCacheRoots(immutableRoots),
+		excluded:         canonicalKbuildSourceCacheRoots(excludedRoots),
+		resolvedExcluded: resolvedKbuildSourceCacheRoots(excludedRoots),
+		paths:            map[string]kbuildSourceCachePath{},
+		programs:         map[string]kbuildSourceProgram{},
+	}
+}
+
+// Stats returns a consistent snapshot of this cache's counters.
+func (c *KbuildSourceCache) Stats() KbuildSourceCacheStats {
+	if c == nil {
+		return KbuildSourceCacheStats{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return KbuildSourceCacheStats{
+		SourceReads: c.reads,
+		CacheHits:   c.hits,
+		Entries:     len(c.programs),
+	}
+}
+
+func canonicalKbuildSourceCacheRoots(roots []string) []string {
+	canonical := make([]string, 0, len(roots))
+	seen := map[string]bool{}
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		absolute, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		absolute = filepath.Clean(absolute)
+		if !seen[absolute] {
+			seen[absolute] = true
+			canonical = append(canonical, absolute)
+		}
+	}
+	sort.Strings(canonical)
+	return canonical
+}
+
+func resolvedKbuildSourceCacheRoots(roots []string) []string {
+	resolved := make([]string, 0, len(roots))
+	seen := map[string]bool{}
+	for _, root := range roots {
+		physical, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			continue
+		}
+		absolute, err := filepath.Abs(physical)
+		if err != nil {
+			continue
+		}
+		absolute = filepath.Clean(absolute)
+		if !seen[absolute] {
+			seen[absolute] = true
+			resolved = append(resolved, absolute)
+		}
+	}
+	sort.Strings(resolved)
+	return resolved
+}
+
+func kbuildPathBelowRoot(path, root string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func (c *KbuildSourceCache) eligible(path string) bool {
+	if c == nil {
+		return false
+	}
+	for _, root := range c.excluded {
+		if kbuildPathBelowRoot(path, root) {
+			return false
+		}
+	}
+	for _, root := range c.roots {
+		if kbuildPathBelowRoot(path, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *KbuildSourceCache) resolvedPathExcluded(path string) bool {
+	if c == nil {
+		return false
+	}
+	for _, root := range c.excluded {
+		if kbuildPathBelowRoot(path, root) {
+			return true
+		}
+	}
+	for _, root := range c.resolvedExcluded {
+		if kbuildPathBelowRoot(path, root) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeKbuildSourceRoots(sourceRoots map[string]string) (map[string]string, error) {
@@ -331,6 +488,7 @@ func parseKbuildFileTree(path string, opts KbuildOptions, variableOverrides map[
 	parser.makeVariablesComplete = opts.MakeVariablesComplete
 	parser.shell = opts.Shell
 	parser.shellResultAvailable = opts.shellResultAvailable
+	parser.probeEnvironmentIdentity = opts.probeEnvironmentIdentity
 	parser.sourceShell = opts.SourceShell
 	parser.resolveSymbolic = opts.ResolveSymbolic
 	parser.resolveSymbolicWords = opts.ResolveSymbolicWords
@@ -383,6 +541,7 @@ func parseKbuildWithOptions(r io.Reader, filename string, opts KbuildOptions, ba
 	parser.makeVariablesComplete = opts.MakeVariablesComplete
 	parser.shell = opts.Shell
 	parser.shellResultAvailable = opts.shellResultAvailable
+	parser.probeEnvironmentIdentity = opts.probeEnvironmentIdentity
 	parser.sourceShell = opts.SourceShell
 	parser.resolveSymbolic = opts.ResolveSymbolic
 	parser.resolveSymbolicWords = opts.ResolveSymbolicWords
@@ -457,14 +616,46 @@ func (p *kbuildParser) finalizeExportedVariables() error {
 	return nil
 }
 
-func (p *kbuildParser) parseReader(r io.Reader, filename string) error {
+type kbuildSourceLine struct {
+	text         string
+	uncommented  string
+	physicalLine int
+}
+
+type kbuildSourceProgram struct {
+	lines []kbuildSourceLine
+}
+
+func kbuildSourceLineForLogical(text, filename string, physicalLine int) (kbuildSourceLine, error) {
+	protected, err := protectCompactKbuildSourceLiteralActionMarkers(text)
+	if err != nil {
+		return kbuildSourceLine{}, fmt.Errorf("%s:%d: %w", filename, physicalLine, err)
+	}
+	uncommented := stripKbuildComment(protected)
+	if uncommented == protected {
+		// Keep one backing string for the overwhelmingly common no-comment case.
+		uncommented = protected
+	}
+	return kbuildSourceLine{
+		text:         protected,
+		uncommented:  uncommented,
+		physicalLine: physicalLine,
+	}, nil
+}
+
+// parseReaderAndCapture preserves the parser's source-order error and callback
+// semantics on a cache miss: each logical line is evaluated as soon as it is
+// read. The immutable lexical program is retained only after that independent
+// evaluation succeeds.
+func (p *kbuildParser) parseReaderAndCapture(r io.Reader, filename string) (kbuildSourceProgram, error) {
 	if err := p.appendMakefileList(filename); err != nil {
-		return err
+		return kbuildSourceProgram{}, err
 	}
 	scanner := bufio.NewScanner(r)
 	lineNo := 0
 	var logical strings.Builder
 	logicalStart := 1
+	program := kbuildSourceProgram{}
 	for scanner.Scan() {
 		lineNo++
 		line := strings.TrimRight(scanner.Text(), " \t")
@@ -480,24 +671,124 @@ func (p *kbuildParser) parseReader(r io.Reader, filename string) error {
 			logical.WriteByte(' ')
 			continue
 		}
-		protected, err := protectCompactKbuildSourceLiteralActionMarkers(logical.String())
+		source, err := kbuildSourceLineForLogical(logical.String(), filename, logicalStart)
 		if err != nil {
-			return fmt.Errorf("%s:%d: %w", filename, logicalStart, err)
+			return kbuildSourceProgram{}, err
 		}
-		if err := p.parseLine(protected, Position{Filename: filename, Line: logicalStart}); err != nil {
-			return err
+		program.lines = append(program.lines, source)
+		if err := p.parseSourceLine(source, Position{Filename: filename, Line: logicalStart}); err != nil {
+			return kbuildSourceProgram{}, err
 		}
 		logical.Reset()
 	}
 	if err := scanner.Err(); err != nil {
-		return err
+		return kbuildSourceProgram{}, err
 	}
 	if logical.Len() != 0 {
-		protected, err := protectCompactKbuildSourceLiteralActionMarkers(logical.String())
+		source, err := kbuildSourceLineForLogical(logical.String(), filename, logicalStart)
 		if err != nil {
-			return fmt.Errorf("%s:%d: %w", filename, logicalStart, err)
+			return kbuildSourceProgram{}, err
 		}
-		if err := p.parseLine(protected, Position{Filename: filename, Line: logicalStart}); err != nil {
+		program.lines = append(program.lines, source)
+		if err := p.parseSourceLine(source, Position{Filename: filename, Line: logicalStart}); err != nil {
+			return kbuildSourceProgram{}, err
+		}
+	}
+	if p.defineName != "" {
+		return kbuildSourceProgram{}, fmt.Errorf("%s: unterminated define %q", p.definePos, p.defineName)
+	}
+	return program, nil
+}
+
+func (c *KbuildSourceCache) sourceProgram(path string) (kbuildSourceProgram, string, bool, bool, error) {
+	if c == nil {
+		return kbuildSourceProgram{}, path, false, false, nil
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return kbuildSourceProgram{}, "", false, false, err
+	}
+	absolute = filepath.Clean(absolute)
+	if !c.eligible(absolute) {
+		return kbuildSourceProgram{}, absolute, false, false, nil
+	}
+	c.mu.Lock()
+	if cachedPath, ok := c.paths[absolute]; ok {
+		if !cachedPath.eligible {
+			c.mu.Unlock()
+			return kbuildSourceProgram{}, cachedPath.resolved, false, false, nil
+		}
+		if program, ok := c.programs[cachedPath.resolved]; ok {
+			c.hits++
+			c.mu.Unlock()
+			return program, cachedPath.resolved, true, true, nil
+		}
+		c.mu.Unlock()
+		return kbuildSourceProgram{}, cachedPath.resolved, true, false, nil
+	}
+	c.mu.Unlock()
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		// Cache eligibility must not replace the parser's ordinary open-path
+		// diagnostic for missing, dangling, or looping inputs. Fail closed to the
+		// uncached path and let os.Open below report the logical filename.
+		return kbuildSourceProgram{}, absolute, false, false, nil
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		return kbuildSourceProgram{}, absolute, false, false, nil
+	}
+	resolved = filepath.Clean(resolved)
+	// Bazel commonly presents immutable inputs as a symlink forest whose final
+	// files live in a content store outside the declared root. The caller's
+	// immutable-root contract covers those targets. Excluded writable roots are
+	// different: reject both their declared and resolved spellings so a source
+	// symlink cannot smuggle a mutable object-tree file into this cache.
+	eligible := !c.resolvedPathExcluded(resolved)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cachedPath, ok := c.paths[absolute]; ok {
+		resolved = cachedPath.resolved
+		eligible = cachedPath.eligible
+	} else {
+		c.paths[absolute] = kbuildSourceCachePath{resolved: resolved, eligible: eligible}
+	}
+	if !eligible {
+		return kbuildSourceProgram{}, resolved, false, false, nil
+	}
+	if program, ok := c.programs[resolved]; ok {
+		c.hits++
+		return program, resolved, true, true, nil
+	}
+	return kbuildSourceProgram{}, resolved, true, false, nil
+}
+
+func (c *KbuildSourceCache) recordSourceRead() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.reads++
+	c.mu.Unlock()
+}
+
+func (c *KbuildSourceCache) storeSourceProgram(path string, program kbuildSourceProgram) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if _, exists := c.programs[path]; !exists {
+		c.programs[path] = program
+	}
+	c.mu.Unlock()
+}
+
+func (p *kbuildParser) parseSourceProgram(program kbuildSourceProgram, filename string) error {
+	if err := p.appendMakefileList(filename); err != nil {
+		return err
+	}
+	for _, line := range program.lines {
+		if err := p.parseSourceLine(line, Position{Filename: filename, Line: line.physicalLine}); err != nil {
 			return err
 		}
 	}
@@ -505,6 +796,11 @@ func (p *kbuildParser) parseReader(r io.Reader, filename string) error {
 		return fmt.Errorf("%s: unterminated define %q", p.definePos, p.defineName)
 	}
 	return nil
+}
+
+func (p *kbuildParser) parseReader(r io.Reader, filename string) error {
+	_, err := p.parseReaderAndCapture(r, filename)
+	return err
 }
 
 func (p *kbuildParser) appendMakefileList(filename string) error {
@@ -556,6 +852,7 @@ type kbuildParser struct {
 	includeDepth             int
 	shell                    func(command string) (string, error)
 	shellResultAvailable     func(command string) bool
+	probeEnvironmentIdentity func() string
 	sourceShell              func(command, workingDirectory string) (string, error)
 	resolveSymbolic          func(string) (string, error)
 	resolveSymbolicWords     func(string) (string, error)
@@ -880,6 +1177,13 @@ func (p *kbuildParser) undefineVariable(name string) {
 }
 
 func (p *kbuildParser) parseLine(line string, pos Position) error {
+	return p.parseSourceLine(kbuildSourceLine{
+		text:        line,
+		uncommented: stripKbuildComment(line),
+	}, pos)
+}
+
+func (p *kbuildParser) parseSourceLine(source kbuildSourceLine, pos Position) error {
 	previousPos := p.currentPos
 	p.currentPos = pos
 	defer func() {
@@ -887,13 +1191,15 @@ func (p *kbuildParser) parseLine(line string, pos Position) error {
 	}()
 
 	if p.defineName != "" {
-		if strings.TrimSpace(stripKbuildComment(line)) == "endef" {
+		if strings.TrimSpace(source.uncommented) == "endef" {
 			return p.finishDefine()
 		}
-		p.defineBody = append(p.defineBody, line)
+		p.defineBody = append(p.defineBody, source.text)
 		return nil
 	}
 
+	line := source.text
+	uncommented := source.uncommented
 	if strings.HasPrefix(line, "\t") {
 		if p.currentRule >= 0 {
 			// GNU Make conditionals are evaluated before rule parsing. A recipe
@@ -911,10 +1217,11 @@ func (p *kbuildParser) parseLine(line string, pos Position) error {
 			return nil
 		}
 		line = strings.TrimLeft(line, " \t")
+		uncommented = strings.TrimLeft(uncommented, " \t")
 	}
 
 	rawLine := line
-	line = stripKbuildComment(line)
+	line = uncommented
 	if strings.TrimSpace(line) == "" {
 		return nil
 	}
@@ -2196,6 +2503,9 @@ func (p *kbuildParser) expandDepth(value string, depth int) (string, error) {
 	if depth > 100 {
 		return "", fmt.Errorf("too deep Kbuild variable expansion")
 	}
+	if !strings.ContainsRune(value, '$') {
+		return value, nil
+	}
 	var out strings.Builder
 	for i := 0; i < len(value); {
 		if value[i] != '$' || i+1 >= len(value) {
@@ -3443,11 +3753,18 @@ func (p *kbuildTreeParser) parseInto(parser *kbuildParser, path string, depth in
 	if p.seen[abs] {
 		return nil
 	}
-	file, err := os.Open(abs)
+	program, sourcePath, eligible, cached, err := p.opts.SourceCache.sourceProgram(abs)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	var file *os.File
+	if !cached {
+		file, err = os.Open(sourcePath)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+	}
 
 	baseDir := filepath.Dir(abs)
 	previousBaseDir := parser.baseDir
@@ -3455,7 +3772,17 @@ func (p *kbuildTreeParser) parseInto(parser *kbuildParser, path string, depth in
 	parser.baseDir = baseDir
 	parser.includeDepth = depth
 	p.parsing[abs] = true
-	err = parser.parseReader(file, abs)
+	if cached {
+		err = parser.parseSourceProgram(program, abs)
+	} else {
+		if eligible {
+			p.opts.SourceCache.recordSourceRead()
+		}
+		program, err = parser.parseReaderAndCapture(file, abs)
+		if err == nil && eligible {
+			p.opts.SourceCache.storeSourceProgram(sourcePath, program)
+		}
+	}
 	delete(p.parsing, abs)
 	parser.baseDir = previousBaseDir
 	parser.includeDepth = previousDepth

@@ -10,6 +10,7 @@ load(
     "linux_test_probe_execution_root_marker",
     "linux_test_probe_topological_order",
     "linux_test_render_probe_action_value",
+    "linux_test_render_probe_action_values",
     "linux_test_resolve_probe_source_paths",
     "linux_test_select_prior_host_result_paths",
     "linux_test_validate_probe_additional_input_names",
@@ -28,10 +29,12 @@ _FINAL_REQUEST = "f" * 64
 _ProbeActionPathInfo = provider(
     doc = "Configured and source path values captured by the probe expansion fixture.",
     fields = {
+        "cached_values": "Callback-local renders retaining exact configured Files.",
         "configured_output": "Configured output artifact.",
         "configured_output_value": "Rendered configured output path.",
         "source_directory": "Declared probe source directory.",
         "source_directory_value": "Rendered probe source directory path.",
+        "uncached_values": "Independent uncached renders of the same values.",
     },
 )
 
@@ -219,6 +222,59 @@ def _probe_map_directory_test_impl(ctx):
     asserts.equals(env, chain_size, len(chain_order))
     asserts.equals(env, chain_ids[-1], chain_order[0])
     asserts.equals(env, chain_ids[0], chain_order[-1])
+
+    # Both argv and environment entries use the same exact-string renderer.
+    # Empty/scalar results are successful renders too, not cache-miss sentinels.
+    resource = struct(
+        is_directory = True,
+        is_source = False,
+        path = "bazel-out/target-opt/bin/external/probe_sdk/resource",
+        short_path = "../probe_sdk/resource",
+    )
+    host_resource = struct(
+        is_directory = True,
+        is_source = False,
+        path = "bazel-out/host-opt-exec/bin/external/probe_sdk/resource",
+        short_path = resource.short_path,
+    )
+    header = struct(
+        is_directory = False,
+        is_source = True,
+        path = "external/probe_headers/include/stddef.h",
+        short_path = "../probe_headers/include/stddef.h",
+    )
+    executable = struct(
+        is_directory = False,
+        is_source = False,
+        path = "bazel-out/target-opt/bin/external/probe_tools/tool",
+        short_path = "../probe_tools/tool",
+    )
+    values = [
+        "",
+        "-DUNRELATED=1",
+        "-Iexternal/probe_sdk/resource/include",
+        "SDK=external/probe_sdk/resource",
+        "-Iexternal/probe_headers/include",
+        "RESOURCE=external/probe_tools/tool.runfiles/data/input",
+        "--roots=external/probe_sdk/resource/include,external/probe_sdk/resource/lib",
+    ] * 3
+    marker = linux_test_probe_execution_root_marker() + "/"
+    for selected_resource in [resource, host_resource, resource]:
+        artifacts = [selected_resource, header, executable]
+        uncached = linux_test_render_probe_action_values(values, artifacts, cached = False)
+        cached = linux_test_render_probe_action_values(values, artifacts)
+        asserts.equals(env, uncached, cached)
+        asserts.equals(env, [""], cached[0].fragments)
+        asserts.false(env, cached[0].substituted)
+        asserts.equals(env, ["-DUNRELATED=1"], cached[1].fragments)
+        asserts.false(env, cached[1].substituted)
+        asserts.equals(env, ["-I", marker, selected_resource, "/include"], cached[2].fragments)
+        asserts.equals(env, ["SDK=", marker, selected_resource], cached[3].fragments)
+        asserts.equals(env, ["-I", marker, "external/probe_headers/include"], cached[4].fragments)
+        asserts.equals(env, ["RESOURCE=", marker, executable, ".runfiles/data/input"], cached[5].fragments)
+        for index, value in enumerate(values):
+            asserts.equals(env, linux_test_render_probe_action_value(value, artifacts), cached[index])
+    asserts.equals(env, [], linux_test_render_probe_action_values([], [resource]))
     return unittest.end(env)
 
 _probe_map_directory_test = unittest.make(_probe_map_directory_test_impl)
@@ -231,9 +287,16 @@ def _probe_action_path_subject_impl(ctx):
     ctx.actions.write(configured_output, "configured output\n")
     source_directory = ctx.file.source.path.rsplit("/", 1)[0]
     artifacts = [configured_output, ctx.file.source]
+    values = [
+        "--configured-tool=" + configured_output.path,
+        "TOOL=" + configured_output.path,
+        "-I" + source_directory,
+        "",
+    ] * 3
     return [
         DefaultInfo(files = depset([configured_output])),
         _ProbeActionPathInfo(
+            cached_values = linux_test_render_probe_action_values(values, artifacts),
             configured_output = configured_output,
             configured_output_value = linux_test_render_probe_action_value(
                 "--configured-tool=" + configured_output.path,
@@ -244,6 +307,7 @@ def _probe_action_path_subject_impl(ctx):
                 "-I" + source_directory,
                 artifacts,
             ),
+            uncached_values = linux_test_render_probe_action_values(values, artifacts, cached = False),
         ),
     ]
 
@@ -274,6 +338,12 @@ def _probe_action_path_rendering_test_impl(ctx):
         marker,
         info.source_directory,
     ], info.source_directory_value.fragments)
+    asserts.equals(env, info.uncached_values, info.cached_values)
+    for offset in [0, 4, 8]:
+        asserts.equals(env, info.configured_output_value, info.cached_values[offset])
+        asserts.equals(env, ["TOOL=", marker, info.configured_output], info.cached_values[offset + 1].fragments)
+        asserts.equals(env, info.source_directory_value, info.cached_values[offset + 2])
+        asserts.equals(env, [""], info.cached_values[offset + 3].fragments)
     return analysistest.end(env)
 
 _probe_action_path_rendering_test = analysistest.make(_probe_action_path_rendering_test_impl)
@@ -292,7 +362,42 @@ def probe_map_directory_path_rendering_test(name):
 
 def _invalid_probe_plan_impl(ctx):
     paths = _valid_paths()
-    if ctx.attr.case == "unknown_marker":
+    if ctx.attr.case.startswith("render_cached_") or ctx.attr.case.startswith("render_uncached_"):
+        cached = ctx.attr.case.startswith("render_cached_")
+        source = struct(
+            is_directory = False,
+            is_source = True,
+            path = "external/probe_sdk/include/stddef.h",
+            short_path = "../probe_sdk/include/stddef.h",
+        )
+        generated = struct(
+            is_directory = False,
+            is_source = False,
+            path = "bazel-out/target-opt/bin/external/probe_sdk/include/stddef.h",
+            short_path = source.short_path,
+        )
+        value = "-Iexternal/probe_sdk/include"
+
+        # Warm an earlier successful callback. Its value/empty results must
+        # not hide a new callback's invalid closure or different File kinds.
+        linux_test_render_probe_action_values([value, value, ""], [source], cached = cached)
+        if ctx.attr.case.endswith("generated_directory"):
+            linux_test_render_probe_action_values(["", "", value], [generated], cached = cached)
+        elif ctx.attr.case.endswith("invalid_index"):
+            linux_test_render_probe_action_values([], [struct(
+                is_directory = False,
+                is_source = True,
+                path = source.path,
+                short_path = "../different/header.h",
+            )], cached = cached)
+        elif ctx.attr.case.endswith("reserved_late"):
+            linux_test_render_probe_action_values(
+                [value, value, "", "SDK=" + linux_test_probe_execution_root_marker()],
+                [source],
+                cached = cached,
+            )
+        return []
+    elif ctx.attr.case == "unknown_marker":
         paths.append("metadata/not-allowed")
     elif ctx.attr.case == "sparse_ordinal":
         paths.remove("nodes/%s/in/00000000/%s" % (_FINAL, _TARGET))
@@ -366,6 +471,13 @@ def probe_map_directory_validation_test(name):
         "unknown_request": "references unknown request",
         "unexpected_empty_plan_host_result": "received host results for a plan with no host nodes",
     }
+    for mode in ["cached", "uncached"]:
+        for case, expected in {
+            "generated_directory": "references generated directory",
+            "invalid_index": "map to different canonical paths",
+            "reserved_late": "contains reserved execution-root marker",
+        }.items():
+            cases["render_" + mode + "_" + case] = expected
     tests = []
     for case, expected in cases.items():
         subject = name + "_" + case + "_subject"

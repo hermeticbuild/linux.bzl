@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 func compactKbuildProfileWithSourcesForTest(t *testing.T, profile CompactKbuildProfile, sources ...string) CompactKbuildProfile {
@@ -158,6 +160,25 @@ func TestCompactKbuildRecipeLiteralOutput(t *testing.T) {
 			got, ok := CompactKbuildRecipeLiteralOutput(test.recipe, test.target)
 			if got != test.want || ok != test.ok {
 				t.Fatalf("CompactKbuildRecipeLiteralOutput(%q, %q) = (%q, %t), want (%q, %t)", test.recipe, test.target, got, ok, test.want, test.ok)
+			}
+		})
+	}
+}
+
+func TestCompactKbuildRecipeCommandLiteralOutputRejectsDynamicBindings(t *testing.T) {
+	for _, value := range []string{
+		"${tree:kernel}",
+		"${work:root}",
+		KbuildActionRoleToken("target", "cc"),
+		compactKbuildActionSourceTreeMarker,
+		compactKbuildLiteralTreeEscapeByte + "{tree:kernel}",
+	} {
+		t.Run(base64.RawURLEncoding.EncodeToString([]byte(value)), func(t *testing.T) {
+			command := compactKbuildRecipeCommand{
+				program: "echo", arguments: []string{value}, stdout: "generated.h",
+			}
+			if got, ok := compactKbuildRecipeCommandLiteralOutput(command, "generated.h"); ok || got != "" {
+				t.Fatalf("dynamic echo payload %q lowered as literal %q", value, got)
 			}
 		})
 	}
@@ -369,6 +390,67 @@ func TestCompoundProgramDiscoveryRetainsStaticRedirections(t *testing.T) {
 	if len(commands) != 2 || commands[0].stdin != "input.txt" || commands[0].stdout != "output.txt" ||
 		commands[1].stdout != "state.cmd" {
 		t.Fatalf("compound command redirections = %#v", commands)
+	}
+}
+
+func TestCompoundWorkingInputCompletenessUsesShellQuoteProvenanceAndClosedSearchGrammar(t *testing.T) {
+	profile := CompactKbuildProfile{Name: "compound-input-use-proof"}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cc := KbuildActionRoleToken("host", "cc")
+	ld := KbuildActionRoleToken("host", "ld")
+	objectRoot := "__LINUX_BZL_OBJECT_TREE__/"
+	for _, test := range []struct {
+		name     string
+		command  string
+		complete bool
+	}{
+		{name: "direct source", command: cc + " -c source.c -o " + objectRoot + "out", complete: true},
+		{name: "unquoted glob", command: cc + " source.c libs/*.a -o " + objectRoot + "out"},
+		{name: "single quoted glob", command: cc + " source.c 'libs/*.a' -o " + objectRoot + "out", complete: true},
+		{name: "double quoted glob", command: cc + ` source.c "libs/*.a" -o ` + objectRoot + "out", complete: true},
+		{name: "escaped glob", command: cc + ` source.c libs/\*.a -o ` + objectRoot + "out", complete: true},
+		{name: "unquoted tilde", command: cc + " source.c ~/lib.a -o " + objectRoot + "out"},
+		{name: "quoted tilde", command: cc + " source.c '~/lib.a' -o " + objectRoot + "out", complete: true},
+		{name: "environment tilde", command: "LIB=~/lib " + cc + " -c source.c -o " + objectRoot + "out"},
+		{name: "environment search path", command: "CPATH=libs " + cc + " -c source.c -o " + objectRoot + "out"},
+		{name: "parameter expansion", command: cc + " source.c $LIB -o " + objectRoot + "out"},
+		{name: "braced parameter expansion", command: cc + ` source.c "${LIB}" -o ` + objectRoot + "out"},
+		{name: "command substitution", command: cc + " source.c $(printf libs/lib.a) -o " + objectRoot + "out"},
+		{name: "arithmetic expansion", command: cc + " source.c $((1)) -o " + objectRoot + "out"},
+		{name: "single quoted parameter bytes", command: cc + " source.c '$LIB' -o " + objectRoot + "out", complete: true},
+		{name: "escaped parameter bytes", command: cc + ` source.c \$LIB -o ` + objectRoot + "out", complete: true},
+		{name: "stdin glob", command: cc + " -c source.c -o " + objectRoot + "out < inputs/*"},
+		{name: "stdout glob", command: cc + " -c source.c -o " + objectRoot + "out > outputs/*"},
+		{name: "stdout parameter expansion", command: cc + " -c source.c -o " + objectRoot + "out > $OUTPUT"},
+		{name: "driver library search", command: cc + " source.c -L libs -lhidden -o " + objectRoot + "out"},
+		{name: "driver linker script", command: cc + " source.c -Wl,-T,layout.lds -o " + objectRoot + "out"},
+		{name: "driver sysroot", command: cc + " source.c --sysroot libs -o " + objectRoot + "out"},
+		{name: "driver joined isysroot", command: cc + " source.c -isysrootlibs -o " + objectRoot + "out"},
+		{name: "driver gcc toolchain", command: cc + " source.c --gcc-toolchain libs -o " + objectRoot + "out"},
+		{name: "driver joined gcc toolchain", command: cc + " source.c --gcc-toolchain=libs -o " + objectRoot + "out"},
+		{name: "relocatable exact target", command: ld + " -r -o " + objectRoot + ".tmp_out " + objectRoot + "out", complete: true},
+		{name: "relocatable library search", command: ld + " -r -o " + objectRoot + ".tmp_out " + objectRoot + "out -L libs -lhidden"},
+		{name: "relocatable script", command: ld + " -r -o " + objectRoot + ".tmp_out " + objectRoot + "out -T layout.lds"},
+		{name: "objtool target only", command: objectRoot + "tools/objtool/objtool --noinstr " + objectRoot + "out", complete: true},
+		{name: "objtool mcount", command: objectRoot + "tools/objtool/objtool --mcount " + objectRoot + "out", complete: true},
+		{name: "objtool version booleans", command: objectRoot + "tools/objtool/objtool --ibt --unret --no-fp --cfi --noabs --backtrace --sec-address --verbose --Werror " + objectRoot + "out", complete: true},
+		{name: "objtool backup side effect", command: objectRoot + "tools/objtool/objtool --backup " + objectRoot + "out"},
+		{name: "objtool response", command: objectRoot + "tools/objtool/objtool @options " + objectRoot + "out"},
+		{name: "objtool unknown option", command: objectRoot + "tools/objtool/objtool --search=libs " + objectRoot + "out"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			commands, err := compactKbuildCompoundProgramCommands(test.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := compactKbuildCompoundWorkingInputUsesComplete(profile, "out", commands); got != test.complete {
+				t.Fatalf("working-input completeness = %t, want %t for commands %#v", got, test.complete, commands)
+			}
+		})
 	}
 }
 
@@ -1135,6 +1217,278 @@ func TestLiteralFilechkKeepsWorkingClosureRoleAheadOfOrderOnly(t *testing.T) {
 	}
 }
 
+func TestExactGeneratedContentReachesFinalLoweringAndConfigAnalysis(t *testing.T) {
+	const target = "include/generated/measured.h"
+	const exact = "#if defined(CONFIG_MEASURED_FEATURE)\n#define MEASURED 1\n#endif\n"
+	root := t.TempDir()
+	mustWriteSource(t, root, "kernel/time/timeconst.bc", "scale=250\n")
+	profile := mustCompactKbuildProfileForTest(t, "build:measured-generator", "Makefile", "", `
+all: `+target+`
+`+target+`: kernel/time/timeconst.bc FORCE
+	{ echo 250 | bc -q ${tree:kernel}/kernel/time/timeconst.bc; } > $@
+.PHONY: FORCE
+FORCE:
+`, nil)
+	profile.evaluator.template.sourceRoots = map[string]string{
+		"__LINUX_BZL_SOURCE_TREE__": root,
+	}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{profile},
+			KbuildSelections: []CompactKbuildSelection{{
+				Profile: profile.Name, Target: target, MakeTarget: target,
+				Lifecycle: "target", Scope: "target", Stage: "target",
+				ExactGeneratedContent: exact, ExactGeneratedContentSet: true,
+			}},
+		},
+		configFragment:       map[string]string{"CONFIG_MEASURED_FEATURE": "y"},
+		actionRoles:          testConfiguredScopedActionRoles,
+		selectedProductsOnly: true,
+	}
+	plan, dependencies, err := metadata.ActionPlanWithConfigDependencies(
+		bootstrapTestIdentity, bootstrapTestIdentity,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, _, ok := planProducerByOutput(plan, "objects", target)
+	if !ok {
+		t.Fatalf("measured header has no final producer: %#v", plan.Nodes)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("measured header producer %q is absent", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	wantArguments := []string{
+		"-content_base64", base64.StdEncoding.EncodeToString([]byte(exact)),
+		"-out", "${output:00000000}",
+	}
+	if node.Tool != "actionfile" || recipe.Tool != "actionfile" ||
+		!slices.Equal(recipe.Arguments, wantArguments) {
+		t.Fatalf("measured header node=%#v recipe=%#v, want exact actionfile", node, recipe)
+	}
+	if len(node.Sources) != 0 || len(node.Inputs) != 0 || len(node.Trees) != 0 ||
+		len(recipe.Sources) != 0 || len(recipe.Inputs) != 0 || len(recipe.Trees) != 0 ||
+		len(recipe.Environment) != 0 {
+		t.Fatalf("measured literal retained originating config/source state: node=%#v recipe=%#v", node, recipe)
+	}
+	dependency, ok := dependencies[node.ID]
+	if !ok {
+		t.Fatalf("measured header has no config dependency annotation: %#v", dependencies)
+	}
+	if dependency.Opaque || len(dependency.Symbols) != 0 || len(dependency.ObjectPaths) != 0 {
+		t.Fatalf("measured header producer config dependency = %#v, want config-free literal", dependency)
+	}
+
+	compilePlan, compileNode := configDependencyCompilePlanForTest(t, map[string]string{
+		"drivers/example/driver.c": "#include <measured.h>\nCONFIG_DRIVER\n",
+	}, []string{
+		"-I${tree:prep}/include/generated", "-c", "drivers/example/driver.c",
+	}, nil)
+	configDependencyStageGeneratedHeaderForTest(
+		t, compilePlan, &compileNode, "measured-header", target, recipe,
+	)
+	consumerDependency, err := AnalyzeActionPlanNodeConfigDependencies(compilePlan, compileNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumerDependency.Opaque ||
+		!slices.Contains(consumerDependency.Symbols, "CONFIG_DRIVER") ||
+		!slices.Contains(consumerDependency.Symbols, "CONFIG_MEASURED_FEATURE") {
+		t.Fatalf("consumer of measured header config dependency = %#v, want exact generated text", consumerDependency)
+	}
+}
+
+func TestExactGeneratedContentWithGeneratedPrerequisiteKeepsConservativeFinalAction(t *testing.T) {
+	const target = "include/generated/measured.h"
+	profile := mustCompactKbuildProfileForTest(t, "build:measured-generator", "Makefile", "", `
+all: `+target+`
+generated/value: FORCE
+	printf '%s\n' dynamic > $@
+`+target+`: generated/value FORCE
+	cp $< $@
+.PHONY: FORCE
+FORCE:
+`, nil)
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{profile},
+			KbuildSelections: []CompactKbuildSelection{{
+				Profile: profile.Name, Target: target, MakeTarget: target,
+				Lifecycle: "target", Scope: "target", Stage: "target",
+				ExactGeneratedContent: "dynamic\n", ExactGeneratedContentSet: true,
+			}},
+		},
+		configFragment:       map[string]string{},
+		actionRoles:          testConfiguredScopedActionRoles,
+		selectedProductsOnly: true,
+	}
+	plan, err := metadata.ActionPlan(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, _, ok := planProducerByOutput(plan, "objects", target)
+	if !ok {
+		t.Fatalf("measured header has no final producer: %#v", plan.Nodes)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("measured header producer %q is absent", producer)
+	}
+	if node.Tool == "actionfile" || plan.Recipes[node.Recipe].Tool == "actionfile" {
+		t.Fatalf("producer-backed exact candidate was replaced by a literal: node=%#v recipe=%#v", node, plan.Recipes[node.Recipe])
+	}
+}
+
+func TestExactGeneratedContentWithClosureOnlyConfigWriterKeepsConservativeFinalAction(t *testing.T) {
+	const (
+		target       = "include/generated/measured.h"
+		source       = "kernel/time/timeconst.bc"
+		configInput  = "kernel.release"
+		configOutput = "include/config/kernel.release"
+	)
+	prepProfile := CompactKbuildProfile{
+		Name: "prep-config", Path: "Makefile", EntryTargets: []string{configOutput},
+	}
+	profile := CompactKbuildProfile{
+		Name: "build:measured-generator", Path: "Makefile", EntryTargets: []string{target},
+	}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	consumerKey := compactKbuildSelectionKey{
+		profile: profile.Name, target: target, stage: "target",
+	}
+	prepKey := compactKbuildSelectionKey{
+		profile: prepProfile.Name, target: configOutput, stage: "prep",
+	}
+	graph, err := newCompactKbuildSelectionGraph(CompactConfig{
+		KbuildProfiles: []CompactKbuildProfile{prepProfile, profile},
+		KbuildSelections: []CompactKbuildSelection{
+			{Profile: prepProfile.Name, Target: configOutput, MakeTarget: configOutput, Lifecycle: "prep", Scope: "target", Stage: "prep"},
+			{Profile: profile.Name, Target: target, MakeTarget: target, Lifecycle: "target", Scope: "target", Stage: "target"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &ActionPlan{}
+	configSourceIDs := map[string]string{}
+	for _, projection := range resolvedConfigProjections() {
+		sourceID, sourceErr := ensureActionPlanSource(plan, "config", projection.input)
+		if sourceErr != nil {
+			t.Fatal(sourceErr)
+		}
+		configSourceIDs[projection.input] = sourceID
+	}
+	projection := ActionPlanNode{
+		ID: strings.Repeat("a", 64), Stage: "prep", Kind: "copy", Tool: "actionfile", Product: "sdk",
+		Sources: []ActionPlanSourceEdge{{Role: "input", SourceID: configSourceIDs[configInput]}},
+		Outputs: []ActionPlanOutput{{Tree: "prep", Path: configOutput}},
+	}
+	plan.Nodes = []ActionPlanNode{projection}
+	sourceID, err := ensureActionPlanSource(plan, "kernel", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct := []compactKbuildRuleInput{{path: source, sourceID: sourceID}}
+	builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{}, plan).
+		withSelectionGraph(graph).
+		forSelection(consumerKey, profile).
+		forOutput("target", "objects", "sdk")
+
+	closed, err := builder.compactKbuildExactGeneratedContentFrontier(target, profile, direct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !closed {
+		t.Fatal("immutable direct source and config projections did not form a closed exact-content frontier")
+	}
+	if err := graph.recordMaterializedProducer(prepKey, projection.ID); err != nil {
+		t.Fatal(err)
+	}
+	closure, err := builder.compactKbuildWorkingTreeClosureInputs(target, profile, direct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(closure, func(input compactKbuildRuleInput) bool {
+		return input.path == configOutput && input.producer == projection.ID && input.sourceID == "" && input.workingOnly
+	}) {
+		t.Fatalf("working-tree closure = %#v, want materialized config writer %q", closure, projection.ID)
+	}
+	closed, err = builder.compactKbuildExactGeneratedContentFrontier(target, profile, direct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closed {
+		t.Fatal("closure-only materialized config writer was accepted as an immutable exact-content frontier")
+	}
+}
+
+func TestDynamicGeneratedContentKeepsConservativeFinalAction(t *testing.T) {
+	const target = "include/generated/dynamic.h"
+	profile := mustCompactKbuildProfileForTest(t, "build:dynamic-generator", "Makefile", "", `
+DYNAMIC = config-sensitive
+export DYNAMIC
+all: `+target+`
+`+target+`: FORCE
+	{ printf '%s\n' "$$DYNAMIC"; } > $@
+.PHONY: FORCE
+FORCE:
+`, nil)
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{profile},
+			KbuildSelections: []CompactKbuildSelection{{
+				Profile: profile.Name, Target: target, MakeTarget: target,
+				Lifecycle: "target", Scope: "target", Stage: "target",
+			}},
+		},
+		configFragment:       map[string]string{"CONFIG_DYNAMIC_FEATURE": "y"},
+		actionRoles:          testConfiguredScopedActionRoles,
+		selectedProductsOnly: true,
+	}
+	plan, dependencies, err := metadata.ActionPlanWithConfigDependencies(
+		bootstrapTestIdentity, bootstrapTestIdentity,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, _, ok := planProducerByOutput(plan, "objects", target)
+	if !ok {
+		t.Fatalf("dynamic header has no final producer: %#v", plan.Nodes)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("dynamic header producer %q is absent", producer)
+	}
+	if node.Tool == "actionfile" || plan.Recipes[node.Recipe].Tool == "actionfile" {
+		t.Fatalf("dynamic generator was replaced by an unproven literal: node=%#v recipe=%#v", node, plan.Recipes[node.Recipe])
+	}
+	dependency := dependencies[node.ID]
+	if !dependency.Opaque {
+		t.Fatalf("dynamic generator config dependency = %#v, want conservative opaque fallback", dependency)
+	}
+}
+
 func TestGenericKbuildRecipeLowersGeneratedToolPipelineAndRedirect(t *testing.T) {
 	metadata, target := compactGenericRecipeMetadataForTest(
 		t, `tools/filter $< | $(NM) --format=posix > $@`, ":", "generated/result.h",
@@ -1775,16 +2129,17 @@ cmd_lz4_with_size = { : $(srctree)/scripts/file-size.sh; cat $(real-prereqs) | $
 	if queryNode.ID == "" || queryNode.Tool != compactKbuildScriptRunnerRole {
 		t.Fatalf("missing hermetic deferred query node: %#v", plan.Nodes)
 	}
-	if got, want := len(queryNode.Inputs), len(prerequisiteIDs); got != want {
-		t.Fatalf("deferred query inputs=%#v, want %d exact generated prerequisites", queryNode.Inputs, want)
+	if got, want := len(actionPlanNodeInputSetEntriesForTest(t, plan, queryNode)), len(prerequisiteIDs); got != want {
+		t.Fatalf("deferred query persistent inputs=%#v, want %d exact generated prerequisites", actionPlanNodeInputSetEntriesForTest(t, plan, queryNode), want)
 	}
-	for _, edge := range queryNode.Inputs {
-		found := false
-		for _, prerequisiteID := range prerequisiteIDs {
-			found = found || edge.ProducerID == prerequisiteID
+	for _, prerequisite := range prerequisites {
+		got, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, queryNode, prerequisite)
+		want := ActionPlanInputSetEntry{
+			Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: prerequisite},
+			ProducerID: prerequisiteIDs[prerequisite],
 		}
-		if !found {
-			t.Fatalf("deferred query has non-prerequisite edge %#v", edge)
+		if !found || got != want {
+			t.Fatalf("deferred query persistent input for %q = (%#v, %t), want %#v", prerequisite, got, found, want)
 		}
 	}
 	queryRecipe := plan.Recipes[queryNode.Recipe]
@@ -1875,6 +2230,9 @@ cmd_lz4_with_size = { : $(srctree)/scripts/file-size.sh; cat $(real-prereqs) | $
 	}
 	if !slices.Contains(node.AuxiliaryTools, "lz4") || !slices.Contains(consumerRecipe.AuxiliaryTools, "lz4") {
 		t.Fatalf("compound script does not bind selected lz4 role: node=%#v recipe=%#v", node, consumerRecipe)
+	}
+	if err := plan.exportReachableActionPlanInputSets(); err != nil {
+		t.Fatal(err)
 	}
 	if err := plan.WriteStages(actionPlanStageOutputsForTest(filepath.Join(t.TempDir(), "plan"))); err != nil {
 		t.Fatalf("typed generated-query graph failed plan validation: %v", err)
@@ -3086,23 +3444,31 @@ rust/compiler_builtins.o: rust/compiler_builtins.rs rust/core.o FORCE
 			}
 		}
 	}
-	metadataInput := false
+	directCoreObject := false
 	for _, input := range consumer.Inputs {
-		if input.ProducerID == core.ID && input.Slot == metadataSlot {
-			metadataInput = true
+		producer, ok := compactKbuildPlanNode(plan, input.ProducerID)
+		if ok && input.Role == "prerequisite" && input.Slot >= 0 && input.Slot < len(producer.Outputs) &&
+			producer.Outputs[input.Slot].Path == coreTarget {
+			directCoreObject = true
 		}
 	}
-	if !metadataInput {
-		t.Fatalf("Rust consumer inputs = %#v, want metadata slot %d from %s", consumer.Inputs, metadataSlot, core.ID)
+	if !directCoreObject {
+		t.Fatalf("Rust consumer inputs = %#v, want direct %q prerequisite", consumer.Inputs, coreTarget)
 	}
-	stagesMetadata := false
-	for _, value := range consumerRecipe.WorkingInputs {
-		if value == metadataTarget {
-			stagesMetadata = true
-		}
+	if got, want := len(actionPlanNodeInputSetEntriesForTest(t, plan, consumer)), 1; got != want {
+		t.Fatalf("Rust consumer persistent inputs = %#v, want metadata only", actionPlanNodeInputSetEntriesForTest(t, plan, consumer))
 	}
-	if !stagesMetadata {
-		t.Fatalf("Rust consumer working inputs = %#v, want %q", consumerRecipe.WorkingInputs, metadataTarget)
+	metadataInput, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, consumer, metadataTarget)
+	wantMetadataInput := ActionPlanInputSetEntry{
+		Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: metadataTarget},
+		ProducerID: core.ID,
+		Slot:       metadataSlot,
+	}
+	if !found || metadataInput != wantMetadataInput {
+		t.Fatalf("Rust consumer persistent metadata input = (%#v, %t), want %#v", metadataInput, found, wantMetadataInput)
+	}
+	if err := plan.exportReachableActionPlanInputSets(); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := plan.entries(); err != nil {
 		t.Fatalf("Rust metadata action plan: %v", err)
@@ -4675,25 +5041,31 @@ cmd_cc_o_c = $(CC) -I$(objtree)/arch/x86/include/generated -c -o $@ $<
 	if !slices.Contains(recipe.Arguments, "-I${work:root}/arch/x86/include/generated") {
 		t.Fatalf("external compiler arguments omit prepared include root: %#v", recipe.Arguments)
 	}
-	workingInputs := sortedStringMapValues(recipe.WorkingInputs)
-	if !slices.Contains(workingInputs, header) {
-		t.Fatalf("external compiler working inputs = %#v, want %q", recipe.WorkingInputs, header)
-	}
-	if slices.Contains(workingInputs, outside) {
-		t.Fatalf("external compiler staged unrelated prepared root %q: %#v", outside, recipe.WorkingInputs)
+	if got := recipe.WorkingInputs["source:object:00000000"]; got != source {
+		t.Fatalf("external compiler direct working source = %q, want %q", got, source)
 	}
 	preparedSource := ActionPlanSource{}
-	preparedRole := ""
-	for _, edge := range node.Sources {
-		for _, candidate := range plan.Sources {
-			if candidate.ID == edge.SourceID && candidate.Namespace == "prep" && candidate.Path == header {
-				preparedSource = candidate
-				preparedRole = edge.Role
-			}
+	for _, candidate := range plan.Sources {
+		if candidate.Namespace == "prep" && candidate.Path == header {
+			preparedSource = candidate
 		}
 	}
-	if preparedSource.ID == "" || preparedRole != compactKbuildWorkingClosureInputRole {
-		t.Fatalf("external compiler source edges = %#v from %#v, want working prep/%s", node.Sources, plan.Sources, header)
+	if preparedSource.ID == "" {
+		t.Fatalf("external compiler sources = %#v, want prep/%s", plan.Sources, header)
+	}
+	if got, want := len(actionPlanNodeInputSetEntriesForTest(t, plan, node)), 1; got != want {
+		t.Fatalf("external compiler persistent inputs = %#v, want prepared header only", actionPlanNodeInputSetEntriesForTest(t, plan, node))
+	}
+	preparedInput, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, node, header)
+	wantPreparedInput := ActionPlanInputSetEntry{
+		Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: header},
+		SourceID: preparedSource.ID,
+	}
+	if !found || preparedInput != wantPreparedInput {
+		t.Fatalf("external compiler persistent prepared header = (%#v, %t), want %#v", preparedInput, found, wantPreparedInput)
+	}
+	if unrelatedInput, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, node, outside); found {
+		t.Fatalf("external compiler staged unrelated prepared root %q as %#v", outside, unrelatedInput)
 	}
 }
 
@@ -4869,71 +5241,71 @@ FORCE:
 	if node.Tool != "rustc" || recipe.Tool != "rustc" {
 		t.Fatalf("external linear Rust producer = %#v recipe = %#v, want rustc", node, recipe)
 	}
-	preparedSource := false
-	targetArgumentBound := false
+	directSource := false
 	for index, edge := range node.Sources {
 		for _, sourceDescriptor := range plan.Sources {
-			if sourceDescriptor.ID != edge.SourceID || sourceDescriptor.Namespace != "prep" || sourceDescriptor.Path != targetSpec {
+			if sourceDescriptor.ID != edge.SourceID || sourceDescriptor.Namespace != "external" || sourceDescriptor.Path != source {
 				continue
 			}
-			if edge.Role != compactKbuildWorkingClosureInputRole || index >= len(recipe.Sources) {
-				t.Fatalf("linear prepared target-spec edge = %#v recipe = %#v", edge, recipe)
+			if edge.Role != "object" || index >= len(recipe.Sources) {
+				t.Fatalf("external linear Rust direct source edge = %#v recipe = %#v", edge, recipe)
 			}
 			binding := recipe.Sources[index]
-			if recipe.WorkingInputs["source:"+binding] != targetSpec {
-				t.Fatalf("linear prepared target-spec edge = %#v recipe = %#v", edge, recipe)
+			if recipe.WorkingInputs["source:"+binding] != source {
+				t.Fatalf("external linear Rust direct source binding %q = %q, want %q", binding, recipe.WorkingInputs["source:"+binding], source)
 			}
-			for argument := 0; argument+1 < len(recipe.Arguments); argument++ {
-				if recipe.Arguments[argument] == "--target" && recipe.Arguments[argument+1] == "${source:"+binding+"}" {
-					targetArgumentBound = true
-				}
-			}
-			preparedSource = true
+			directSource = true
 		}
 	}
-	if !preparedSource {
-		t.Fatalf("external linear Rust sources = %#v from %#v, want exact prep/%s input", node.Sources, plan.Sources, targetSpec)
+	if !directSource {
+		t.Fatalf("external linear Rust sources = %#v from %#v, want direct external/%s input", node.Sources, plan.Sources, source)
+	}
+	preparedSources := map[string]string{}
+	for _, sourceDescriptor := range plan.Sources {
+		if sourceDescriptor.Namespace == "prep" {
+			preparedSources[sourceDescriptor.Path] = sourceDescriptor.ID
+		}
+	}
+	if got, want := len(actionPlanNodeInputSetEntriesForTest(t, plan, node)), 2; got != want {
+		t.Fatalf("external linear Rust persistent inputs = %#v, want target spec and selected SDK library", actionPlanNodeInputSetEntriesForTest(t, plan, node))
+	}
+	for _, pathname := range []string{targetSpec, selectedSDKLibrary} {
+		got, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, node, pathname)
+		want := ActionPlanInputSetEntry{
+			Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: pathname},
+			SourceID: preparedSources[pathname],
+		}
+		if want.SourceID == "" || !found || got != want {
+			t.Fatalf("external linear Rust persistent input for %q = (%#v, %t), want %#v from sources %#v", pathname, got, found, want, plan.Sources)
+		}
+	}
+	targetArgumentBound := false
+	for argument := 0; argument+1 < len(recipe.Arguments); argument++ {
+		if recipe.Arguments[argument] == "--target" && recipe.Arguments[argument+1] == "${work:root}/"+targetSpec {
+			targetArgumentBound = true
+		}
 	}
 	if !targetArgumentBound {
-		t.Fatalf("external linear Rust arguments = %#v, want --target bound to exact prep/%s source", recipe.Arguments, targetSpec)
+		t.Fatalf("external linear Rust arguments = %#v, want --target bound to persistent prep/%s work path", recipe.Arguments, targetSpec)
 	}
-	selectedLibraryStaged := false
 	unexpectedLibraries := map[string]bool{
 		nestedSDKLibrary:  true,
 		siblingSDKLibrary: true,
 		missingSDKLibrary: true,
 	}
-	for index, edge := range node.Sources {
-		var sourceDescriptor ActionPlanSource
-		for _, candidate := range plan.Sources {
-			if candidate.ID == edge.SourceID {
-				sourceDescriptor = candidate
-				break
-			}
+	for pathname := range unexpectedLibraries {
+		if entry, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, node, pathname); found {
+			t.Fatalf("external linear Rust unexpectedly stages %q from -L %s as %#v", pathname, libraryDir, entry)
 		}
-		if unexpectedLibraries[sourceDescriptor.Path] {
-			t.Fatalf("external linear Rust unexpectedly stages %q from -L %s: node=%#v recipe=%#v", sourceDescriptor.Path, libraryDir, node, recipe)
-		}
-		if sourceDescriptor.Namespace != "prep" || sourceDescriptor.Path != selectedSDKLibrary {
-			continue
-		}
-		if edge.Role != compactKbuildWorkingClosureInputRole || index >= len(recipe.Sources) {
-			t.Fatalf("selected SDK library edge = %#v recipe = %#v", edge, recipe)
-		}
-		binding := recipe.Sources[index]
-		if recipe.WorkingInputs["source:"+binding] != selectedSDKLibrary {
-			t.Fatalf("selected SDK library binding %q is not staged at %q: %#v", binding, selectedSDKLibrary, recipe.WorkingInputs)
-		}
-		selectedLibraryStaged = true
-	}
-	if !selectedLibraryStaged {
-		t.Fatalf("external linear Rust sources = %#v from %#v, want exact prep/%s selected dynamically by -L %s", node.Sources, plan.Sources, selectedSDKLibrary, libraryDir)
 	}
 	if got, want := recipe.WorkingTrees, []string{"external"}; !slices.Equal(got, want) {
 		t.Fatalf("external linear Rust working trees = %#v, want %#v", got, want)
 	}
 	if !slices.Contains(node.Trees, "external") || !slices.Contains(recipe.Trees, "external") {
 		t.Fatalf("external linear Rust tree closure = node %#v recipe %#v, want external", node.Trees, recipe.Trees)
+	}
+	if err := plan.exportReachableActionPlanInputSets(); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := plan.entries(); err != nil {
 		t.Fatalf("external linear Rust -L closure plan is invalid: %v", err)
@@ -5222,13 +5594,28 @@ lib/crc/gen_crc32table: lib/crc/gen_crc32table.c FORCE
 		strings.Contains(strings.Join(recipe.Arguments, " "), "${tree:prep}") {
 		t.Fatalf("host link-driver arguments do not use writable include overlay: %#v", recipe.Arguments)
 	}
-	if !slices.ContainsFunc(node.Sources, func(input ActionPlanSourceEdge) bool {
-		return input.SourceID == configSource
-	}) {
-		t.Fatalf("host link-driver sources omit rebased resolved config %q: %#v", configSource, node.Sources)
+	directSource := ActionPlanSource{}
+	for _, candidate := range plan.Sources {
+		if candidate.Path == source {
+			directSource = candidate
+			break
+		}
 	}
-	if !slices.Contains(sortedStringMapValues(recipe.WorkingInputs), configPath) {
-		t.Fatalf("host link-driver working inputs omit %q: %#v", configPath, recipe.WorkingInputs)
+	if directSource.ID == "" || !slices.ContainsFunc(node.Sources, func(input ActionPlanSourceEdge) bool {
+		return input.Role == "object" && input.SourceID == directSource.ID
+	}) {
+		t.Fatalf("host link-driver sources omit direct %q prerequisite: node=%#v sources=%#v", source, node.Sources, plan.Sources)
+	}
+	if got, want := len(actionPlanNodeInputSetEntriesForTest(t, plan, node)), 1; got != want {
+		t.Fatalf("host link-driver persistent inputs = %#v, want resolved config baseline only", actionPlanNodeInputSetEntriesForTest(t, plan, node))
+	}
+	configInput, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, node, configPath)
+	wantConfigInput := ActionPlanInputSetEntry{
+		Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: configPath},
+		SourceID: configSource,
+	}
+	if !found || configInput != wantConfigInput {
+		t.Fatalf("host link-driver resolved config input = (%#v, %t), want %#v", configInput, found, wantConfigInput)
 	}
 }
 
@@ -5372,27 +5759,31 @@ cmd_cc_s_c = $(CC) $(filter-out $(DEBUG_CFLAGS) $(CC_FLAGS_LTO), $(c_flags)) -fv
 	if strings.Contains(strings.Join(append(recipe.Arguments, sortedStringMapValues(recipe.Environment)...), " "), "${tree:prep}") {
 		t.Fatalf("bootstrap compile retained immutable prep marker: %#v", recipe)
 	}
-	workingPaths := map[string]bool{}
-	for _, pathname := range recipe.WorkingInputs {
-		workingPaths[pathname] = true
+	if got, want := len(actionPlanNodeInputSetEntriesForTest(t, plan, node)), 2; got != want {
+		t.Fatalf("bootstrap persistent inputs=%#v, want visible header and config baseline", actionPlanNodeInputSetEntriesForTest(t, plan, node))
 	}
-	for _, want := range []string{visibleHeader, configWorkingPath} {
-		if !workingPaths[want] {
-			t.Fatalf("bootstrap working inputs=%#v, want %q", recipe.WorkingInputs, want)
+	for pathname, want := range map[string]ActionPlanInputSetEntry{
+		visibleHeader: {
+			Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: visibleHeader},
+			ProducerID: headerProducer.ID,
+		},
+		configWorkingPath: {
+			Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: configWorkingPath},
+			SourceID: configSourceID,
+		},
+	} {
+		got, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, node, pathname)
+		if !found || got != want {
+			t.Fatalf("bootstrap persistent input for %q = (%#v, %t), want %#v", pathname, got, found, want)
 		}
 	}
-	if workingPaths[unrelated] {
-		t.Fatalf("bootstrap working inputs=%#v include unrelated prep output", recipe.WorkingInputs)
-	}
-	if !slices.ContainsFunc(node.Inputs, func(edge ActionPlanNodeEdge) bool {
-		return edge.ProducerID == headerProducer.ID
-	}) {
-		t.Fatalf("bootstrap compile inputs=%#v, want exact visible header producer", node.Inputs)
+	if unrelatedInput, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, node, unrelated); found {
+		t.Fatalf("bootstrap persistent inputs include unrelated prep output %#v", unrelatedInput)
 	}
 	if !slices.ContainsFunc(node.Sources, func(edge ActionPlanSourceEdge) bool {
-		return edge.SourceID == configSourceID
+		return edge.Role == "object" && edge.SourceID == sourceID
 	}) {
-		t.Fatalf("bootstrap compile sources=%#v, want rebased config projection", node.Sources)
+		t.Fatalf("bootstrap compile sources=%#v, want direct source prerequisite %s", node.Sources, sourceID)
 	}
 }
 
@@ -5871,9 +6262,16 @@ $(obj)/.checked-%: include/linux/atomic/% FORCE
 	if got := recipe.WorkingInputs["source:prerequisite:00000000"]; got != source {
 		t.Fatalf("working source path=%q, want %q", got, source)
 	}
-	if !slices.Contains(sortedStringMapValues(recipe.WorkingInputs), visibleHeader) ||
-		!slices.ContainsFunc(node.Inputs, func(edge ActionPlanNodeEdge) bool { return edge.ProducerID == headerProducer.ID }) {
-		t.Fatalf("hermetic fallback omitted exact initial object-tree frontier: node=%#v recipe=%#v", node, recipe)
+	if got, want := len(actionPlanNodeInputSetEntriesForTest(t, plan, node)), 1; got != want {
+		t.Fatalf("hermetic fallback persistent inputs=%#v, want exact initial object-tree frontier", actionPlanNodeInputSetEntriesForTest(t, plan, node))
+	}
+	visibleInput, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, node, visibleHeader)
+	wantVisibleInput := ActionPlanInputSetEntry{
+		Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: visibleHeader},
+		ProducerID: headerProducer.ID,
+	}
+	if !found || visibleInput != wantVisibleInput {
+		t.Fatalf("hermetic fallback visible frontier input = (%#v, %t), want %#v", visibleInput, found, wantVisibleInput)
 	}
 	if got := recipe.WorkingOutputs["00000000"]; got != target {
 		t.Fatalf("working output=%q, want %q", got, target)
@@ -5953,6 +6351,7 @@ arch/arm64/boot/dts/actions/dtbs-list: $(real-prereqs) FORCE
 
 func TestGenericKbuildCmdCallSelectsSourceDefinedCommand(t *testing.T) {
 	const target = "arch/x86/include/generated/asm/early_ioremap.h"
+	const source = "include/asm-generic/early_ioremap.h"
 	profile := mustCompactKbuildProfileForTest(t, "driver:scripts/Makefile.asm-headers", "scripts/Makefile.asm-headers", "", `
 cmd_wrap = echo "\#include <asm-generic/$*.h>" > $@
 $(obj)/%.h: $(generic)/%.h
@@ -5961,6 +6360,7 @@ $(obj)/%.h: $(generic)/%.h
 		"obj":     "arch/x86/include/generated/asm",
 		"generic": "include/asm-generic",
 	})
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
 	metadata := &CompactMetadata{Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}}}
 	match, ok, err := metadata.compactKbuildRuleForProfile(profile, target)
 	if err != nil {
@@ -5968,6 +6368,108 @@ $(obj)/%.h: $(generic)/%.h
 	}
 	if !ok || match.command != "wrap" {
 		t.Fatalf("match=%#v found=%t, want source-defined cmd_wrap", match, ok)
+	}
+	root := profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"]
+	if !filepath.IsAbs(root) {
+		t.Fatalf("source fixture requires an absolute temporary root, got %q", root)
+	}
+	packageSource, err := filepath.Abs(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureSource := filepath.Join(root, source)
+	if fixtureSource == packageSource {
+		t.Fatal("source fixture would write into the package directory")
+	}
+	mustWriteSource(t, root, source, "#define EARLY_IOREMAP 1\n")
+	if contents, err := os.ReadFile(fixtureSource); err != nil || string(contents) != "#define EARLY_IOREMAP 1\n" {
+		t.Fatalf("temporary source fixture contents=%q, error=%v", contents, err)
+	}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	baseProducer, err := appendActionPlanNode(plan, ActionPlanNode{
+		Stage: "target", Kind: "generate", Tool: "actionfile", Product: "vmlinux",
+		Outputs: []ActionPlanOutput{{Tree: "metadata", Path: ".captures/asm-wrapper-base"}},
+	}, ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+		Arguments: []string{"-line", "base", "-out", "${output:00000000}"}, Outputs: []string{"00000000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID, err := metadata.ensureActionPlanSource(plan, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).forProfile(profile)
+	builder, err = builder.forObservedOutputs(target, []compactKbuildObservedOutput{{
+		output: ActionPlanOutput{Tree: "metadata", Path: ".captures/asm-wrapper"},
+		path:   ".vmlinux.export.c",
+		baseInputs: []compactKbuildRuleInput{{
+			path: ".captures/asm-wrapper-base", producer: baseProducer, slot: 0,
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, err := builder.buildCommandTemplate(target, match, []compactKbuildRuleInput{{
+		path: source, sourceID: sourceID,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("missing asm wrapper producer %q", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	wantContents := base64.StdEncoding.EncodeToString([]byte("#include <asm-generic/early_ioremap.h>\n"))
+	wantArguments := []string{
+		"-content_base64", wantContents,
+		"-out", "${output:00000000}",
+	}
+	if node.Tool != "actionfile" || recipe.Tool != "actionfile" ||
+		!slices.Equal(recipe.Arguments, wantArguments) {
+		t.Fatalf("asm wrapper node=%#v recipe=%#v, want literal actionfile lowering", node, recipe)
+	}
+	if len(recipe.Environment) != 0 || len(recipe.Trees) != 0 || len(node.Trees) != 0 ||
+		len(recipe.ObservedOutputs) != 0 || len(recipe.ObservedOutputBases) != 0 || len(node.Outputs) != 1 {
+		t.Fatalf("literal asm wrapper retained process/tree/observation state: node=%#v recipe=%#v", node, recipe)
+	}
+	for _, input := range node.Inputs {
+		if input.ProducerID == baseProducer {
+			t.Fatalf("literal asm wrapper retained unrelated observed-state input: %#v", node.Inputs)
+		}
+	}
+	var stateNode ActionPlanNode
+	for _, candidate := range plan.Nodes {
+		for _, output := range candidate.Outputs {
+			if output.ObservedPath == ".vmlinux.export.c" {
+				stateNode = candidate
+			}
+		}
+	}
+	if stateNode.ID == "" || stateNode.ID == producer || len(stateNode.Outputs) != 2 ||
+		!strings.HasPrefix(stateNode.Outputs[0].Path, compactKbuildSideOutputStateDirectory+"/transparent/") {
+		t.Fatalf("literal asm wrapper transparent state node=%#v, plan=%#v", stateNode, plan.Nodes)
+	}
+	stateRecipe := plan.Recipes[stateNode.Recipe]
+	stateBinding := planOrdinal(1)
+	if !slices.Equal(stateRecipe.Arguments, []string{"-content_base64", "", "-out", "${output:00000000}"}) ||
+		stateRecipe.ObservedOutputs[stateBinding] != ".vmlinux.export.c" ||
+		len(stateRecipe.ObservedOutputBases[stateBinding]) != 1 {
+		t.Fatalf("literal asm wrapper transparent state recipe=%#v", stateRecipe)
+	}
+	baseBinding := stateRecipe.ObservedOutputBases[stateBinding][0]
+	baseIndex := slices.Index(stateRecipe.Inputs, baseBinding)
+	if baseIndex < 0 || baseIndex >= len(stateNode.Inputs) ||
+		stateNode.Inputs[baseIndex].ProducerID != baseProducer || stateNode.Inputs[baseIndex].Slot != 0 {
+		t.Fatalf("literal asm wrapper transparent state base=%q node=%#v recipe=%#v", baseBinding, stateNode, stateRecipe)
+	}
+	if err := stateRecipe.Validate(); err != nil {
+		t.Fatalf("literal asm wrapper transparent state recipe is invalid: %v", err)
+	}
+	if err := recipe.Validate(); err != nil {
+		t.Fatalf("literal asm wrapper recipe is invalid: %v", err)
 	}
 }
 
@@ -6894,18 +7396,16 @@ vmlinux.a: built-in.a FORCE
 	if got := rolesByProducer[archiveProducer]; got != "prerequisite" {
 		t.Fatalf("direct thin archive role=%q, want prerequisite; inputs=%#v", got, final.Inputs)
 	}
-	if got := rolesByProducer[leafProducer]; got != "working-closure" {
-		t.Fatalf("thin archive member role=%q, want working-closure; inputs=%#v", got, final.Inputs)
+	if got, want := len(actionPlanNodeInputSetEntriesForTest(t, plan, final)), 1; got != want {
+		t.Fatalf("atomic archive persistent inputs=%#v, want thin member only", actionPlanNodeInputSetEntriesForTest(t, plan, final))
 	}
-	recipe := plan.Recipes[final.Recipe]
-	foundLeaf := false
-	for key, pathname := range recipe.WorkingInputs {
-		if pathname == leafPath {
-			foundLeaf = strings.HasPrefix(key, "input:working-closure:")
-		}
+	memberInput, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, final, leafPath)
+	wantMemberInput := ActionPlanInputSetEntry{
+		Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: leafPath},
+		ProducerID: leafProducer,
 	}
-	if !foundLeaf {
-		t.Fatalf("atomic archive does not stage thin member %q as closure: %#v", leafPath, recipe.WorkingInputs)
+	if !found || memberInput != wantMemberInput {
+		t.Fatalf("atomic archive thin-member input = (%#v, %t), want %#v", memberInput, found, wantMemberInput)
 	}
 }
 
@@ -7021,37 +7521,46 @@ cmd_ld = $(LD) -r -o $@ --whole-archive $< --no-whole-archive
 	if got := rolesByProducer[indexProducer]; got != "object" {
 		t.Fatalf("direct archive role=%q, want object; inputs=%#v", got, link.Inputs)
 	}
-	if got := rolesByProducer[memberProducer]; got != compactKbuildWorkingClosureInputRole {
-		t.Fatalf("thin archive member role=%q, want %q; inputs=%#v", got, compactKbuildWorkingClosureInputRole, link.Inputs)
-	}
 	if got := rolesByProducer[unrelatedProducer]; got != "" {
 		t.Fatalf("unrelated object unexpectedly staged with role %q; inputs=%#v", got, link.Inputs)
 	}
-	rolesBySource := map[string]string{}
-	for _, source := range link.Sources {
-		rolesBySource[source.SourceID] = source.Role
+	if got, want := len(actionPlanNodeInputSetEntriesForTest(t, plan, link)), 3; got != want {
+		t.Fatalf("thin archive link persistent inputs=%#v, want archive lineage plus generated and source members", actionPlanNodeInputSetEntriesForTest(t, plan, link))
 	}
-	if got := rolesBySource[sourceMemberID]; got != compactKbuildWorkingClosureInputRole {
-		t.Fatalf("thin archive source member role=%q, want %q; sources=%#v", got, compactKbuildWorkingClosureInputRole, link.Sources)
+	for pathname, want := range map[string]ActionPlanInputSetEntry{
+		archivePath: {
+			Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: archivePath},
+			ProducerID: archiveProducer,
+		},
+		memberPath: {
+			Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: memberPath},
+			ProducerID: memberProducer,
+		},
+		sourceMemberPath: {
+			Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: sourceMemberPath},
+			SourceID: sourceMemberID,
+		},
+	} {
+		got, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, link, pathname)
+		if !found || got != want {
+			t.Fatalf("thin archive link persistent input for %q = (%#v, %t), want %#v", pathname, got, found, want)
+		}
+	}
+	if unrelatedInput, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, link, unrelatedPath); found {
+		t.Fatalf("unrelated object unexpectedly staged as persistent input %#v", unrelatedInput)
 	}
 	linkRecipe := plan.Recipes[link.Recipe]
-	foundMember, foundSourceMember := false, false
+	foundDirectArchive := false
 	for binding, pathname := range linkRecipe.WorkingInputs {
 		if pathname == unrelatedPath {
 			t.Fatalf("unrelated object appears in link working inputs: %#v", linkRecipe.WorkingInputs)
 		}
-		if pathname == memberPath {
-			foundMember = strings.HasPrefix(binding, "input:"+compactKbuildWorkingClosureInputRole+":")
-		}
-		if pathname == sourceMemberPath {
-			foundSourceMember = strings.HasPrefix(binding, "source:"+compactKbuildWorkingClosureInputRole+":")
+		if pathname == copiedArchive {
+			foundDirectArchive = strings.HasPrefix(binding, "input:object:")
 		}
 	}
-	if !foundMember {
-		t.Fatalf("thin archive member %q is absent from link working inputs: %#v", memberPath, linkRecipe.WorkingInputs)
-	}
-	if !foundSourceMember {
-		t.Fatalf("thin archive source member %q is absent from link working inputs: %#v", sourceMemberPath, linkRecipe.WorkingInputs)
+	if !foundDirectArchive {
+		t.Fatalf("direct thin archive %q is absent from link working inputs: %#v", copiedArchive, linkRecipe.WorkingInputs)
 	}
 }
 
@@ -7672,6 +8181,724 @@ drivers/of/%.dtb: drivers/of/%.dts $(DTC) FORCE
 	}
 }
 
+func TestGenericKbuildCmdAndFixdepKeepsAtomicCompilerMetadataBeforeOpaqueSuffix(t *testing.T) {
+	const (
+		target  = "drivers/example/foo.o"
+		source  = "drivers/example/foo.c"
+		fixdep  = "scripts/basic/fixdep"
+		objtool = "tools/objtool/objtool"
+		depfile = "drivers/example/.foo.o.d"
+		cmdfile = "drivers/example/.foo.o.cmd"
+		stack   = "drivers/example/foo.su"
+	)
+	profile := mustCompactKbuildProfileForTest(t, "build:drivers/example", "scripts/Makefile.build", "drivers/example", `
+dummy := y
+`, nil)
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
+	sourceRoot := profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"]
+	if err := os.WriteFile(filepath.Join(sourceRoot, source), []byte("#if defined(CONFIG_USED)\n#endif\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: "drivers/example",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{}, metadata: metadata,
+	}
+	metadata.actionContracts = map[KbuildActionRoleRef]CompactKbuildActionContract{
+		{Scope: "target", Role: "cc"}: {},
+	}
+	fixdepNode := ActionPlanNode{
+		Stage: "host", Kind: "generate", Tool: "actionfile", Product: "sdk",
+		Outputs: []ActionPlanOutput{{Tree: "host", Path: fixdep}},
+	}
+	fixdepRecipe := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+		Arguments: []string{"-out", "${output:00000000}", "-content_base64", ""}, Outputs: []string{"00000000"},
+	}
+	fixdepProducer, err := appendActionPlanNode(plan, fixdepNode, fixdepRecipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objtoolNode := ActionPlanNode{
+		Stage: "host", Kind: "generate", Tool: "actionfile", Product: "sdk",
+		Outputs: []ActionPlanOutput{{Tree: "host", Path: objtool}},
+	}
+	objtoolProducer, err := appendActionPlanNode(plan, objtoolNode, fixdepRecipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID, err := metadata.ensureActionPlanSource(plan, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configSourceID, err := ensureActionPlanSource(plan, "config", "autoconf.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ambientConfigSourceID, err := ensureActionPlanSource(plan, "config", "kernel.release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectRoot := "__LINUX_BZL_OBJECT_TREE__/"
+	temporary := "drivers/example/.tmp_foo.o"
+	prefix := "set -e; echo 'CC foo.o'; "
+	for _, signal := range []string{"HUP", "INT", "QUIT", "TERM", "PIPE"} {
+		prefix += "trap 'rm -f " + objectRoot + target + "; trap - " + signal + "; kill -s " + signal + " $$' " + signal + "; "
+	}
+	compileAndFixdep := prefix + KbuildActionRoleToken("target", "cc") +
+		" -Wp,-MMD," + objectRoot + depfile + " -include " + objectRoot + "include/generated/autoconf.h" +
+		" -fstack-usage -c -o " + objectRoot + target + " __LINUX_BZL_SOURCE_TREE__/" + source +
+		"; " + KbuildActionRoleToken("target", "ld") + " -r -o " + objectRoot + temporary + " " + objectRoot + target +
+		"; mv " + objectRoot + temporary + " " + objectRoot + target +
+		"; " + objectRoot + objtool + " --noinstr " + objectRoot + target +
+		"; " + objectRoot + fixdep + " " + objectRoot + depfile + " " + objectRoot + target +
+		" 'saved command' > " + objectRoot + cmdfile + "; rm -f " + objectRoot + depfile
+	genObjtooldep := "{ echo; echo '" + target + ": $$(wildcard " + fixdep + ")'; } >> " + objectRoot + cmdfile
+	match := compactKbuildRuleMatch{
+		profile: profile,
+		stem:    "foo",
+		commandTemplates: []CompactKbuildCommandTemplate{
+			{Name: "cc_o_c", Text: compileAndFixdep},
+			{Name: "gen_objtooldep", Text: genObjtooldep},
+		},
+	}
+	unsafeTemplate := "touch unsafe-prefix; " + strings.TrimPrefix(compileAndFixdep, prefix)
+	unsafeRooted, err := compactKbuildRootedActionDirectRecipeText(profile, unsafeTemplate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target,
+		match,
+		compactKbuildFinalizeRootedActionRecipeText(unsafeRooted),
+		unsafeRooted,
+		compactKbuildAutomaticContext{target: target, stem: "foo"},
+	); split {
+		t.Fatal("cmd_and_fixdep split accepted an opaque filesystem-producing prefix")
+	}
+	trapTemplate := "trap 'rm -f " + objectRoot + depfile + "' EXIT; " + strings.TrimPrefix(compileAndFixdep, prefix)
+	trapRooted, err := compactKbuildRootedActionDirectRecipeText(profile, trapTemplate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target,
+		match,
+		compactKbuildFinalizeRootedActionRecipeText(trapRooted),
+		trapRooted,
+		compactKbuildAutomaticContext{target: target, stem: "foo"},
+	); split {
+		t.Fatal("cmd_and_fixdep split accepted a trap-prefixed template")
+	}
+	arbitraryTrap := "trap 'echo unsafe' HUP; " + strings.TrimPrefix(compileAndFixdep, prefix)
+	arbitraryRooted, err := compactKbuildRootedActionDirectRecipeText(profile, arbitraryTrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target, match, compactKbuildFinalizeRootedActionRecipeText(arbitraryRooted), arbitraryRooted,
+		compactKbuildAutomaticContext{target: target, stem: "foo"},
+	); split {
+		t.Fatal("cmd_and_fixdep split accepted an arbitrary signal trap")
+	}
+	foreignFixdep := strings.Replace(compileAndFixdep, objectRoot+fixdep+" ", objectRoot+"vendor/fixdep ", 1)
+	foreignRooted, err := compactKbuildRootedActionDirectRecipeText(profile, foreignFixdep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target, match, compactKbuildFinalizeRootedActionRecipeText(foreignRooted), foreignRooted,
+		compactKbuildAutomaticContext{target: target, stem: "foo"},
+	); split {
+		t.Fatal("cmd_and_fixdep split accepted a noncanonical generated fixdep")
+	}
+	sourceFixdep := strings.Replace(compileAndFixdep, objectRoot+fixdep+" ", "__LINUX_BZL_SOURCE_TREE__/"+fixdep+" ", 1)
+	sourceFixdepRooted, err := compactKbuildRootedActionDirectRecipeText(profile, sourceFixdep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target, match, compactKbuildFinalizeRootedActionRecipeText(sourceFixdepRooted), sourceFixdepRooted,
+		compactKbuildAutomaticContext{target: target, stem: "foo"},
+	); split {
+		t.Fatal("cmd_and_fixdep split accepted an immutable-source fixdep")
+	}
+	ldWithConfig := strings.Replace(
+		compileAndFixdep,
+		KbuildActionRoleToken("target", "ld")+" -r",
+		KbuildActionRoleToken("target", "ld")+" -T "+objectRoot+"include/config/auto.conf -r",
+		1,
+	)
+	ldWithConfigRooted, err := compactKbuildRootedActionDirectRecipeText(profile, ldWithConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target, match, compactKbuildFinalizeRootedActionRecipeText(ldWithConfigRooted), ldWithConfigRooted,
+		compactKbuildAutomaticContext{target: target, stem: "foo"},
+	); split {
+		t.Fatal("cmd_and_fixdep split accepted a linker config-projection operand")
+	}
+	firstRooted, err := compactKbuildRootedActionDirectRecipeText(profile, compileAndFixdep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target, match, compactKbuildFinalizeRootedActionRecipeText(firstRooted), firstRooted,
+		compactKbuildAutomaticContext{target: target, stem: "foo"},
+	); !split {
+		t.Fatal("exact compiler/ld/objtool/fixdep template was not recognized")
+	}
+	groupedMatch := match
+	groupedMatch.rule = KbuildRule{
+		Targets:   []string{target, "drivers/example/foo.peer"},
+		Separator: "&:",
+	}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target, groupedMatch, compactKbuildFinalizeRootedActionRecipeText(firstRooted), firstRooted,
+		compactKbuildAutomaticContext{target: target, stem: "foo"},
+	); split {
+		t.Fatal("cmd_and_fixdep split accepted a grouped-output rule")
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		forOutput("target", "objects", "vmlinux").
+		forProfile(profile)
+	builder, err = builder.forObservedOutputs(target, []compactKbuildObservedOutput{{
+		output: ActionPlanOutput{Tree: "metadata", Path: ".captures/foo.state"},
+		path:   "drivers/example/opaque.side-effect",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, err := builder.buildCommandTemplate(target, match, []compactKbuildRuleInput{
+		{path: source, sourceID: sourceID},
+		{path: fixdep, producer: fixdepProducer},
+		{path: objtool, producer: objtoolProducer},
+		{path: "include/generated/autoconf.h", sourceID: configSourceID, objectTree: true, workingOnly: true},
+		{path: "include/config/kernel.release", sourceID: ambientConfigSourceID, objectTree: true, workingOnly: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(plan.Nodes), 4; got != want {
+		t.Fatalf("node count = %d, want tool seeds + atomic compiler template + opaque suffix: %#v", got, plan.Nodes)
+	}
+	compile := plan.Nodes[2]
+	compileRecipe := plan.Recipes[compile.Recipe]
+	if compile.Kind != "compile" || compile.Tool != compactKbuildScriptRunnerRole ||
+		compileRecipe.Tool != compactKbuildScriptRunnerRole || compileRecipe.CompilerInvocation == nil {
+		t.Fatalf("compiler node = %#v recipe = %#v, want typed atomic scriptrun metadata", compile, compileRecipe)
+	}
+	if compileRecipe.CompilerInvocation.Tool != "cc" ||
+		!slices.Contains(compileRecipe.CompilerInvocation.Arguments, "-include") ||
+		!slices.ContainsFunc(compileRecipe.CompilerInvocation.Arguments, func(argument string) bool {
+			return strings.Contains(argument, depfile)
+		}) {
+		t.Fatalf("compiler dependency metadata = %#v, want exact cc argv", compileRecipe.CompilerInvocation)
+	}
+	if !compileRecipe.CompilerInvocation.WorkingInputUsesComplete {
+		t.Fatalf("compiler dependency working-input projection is incomplete: %#v", compileRecipe.CompilerInvocation)
+	}
+	usedWorkingPaths := map[string]bool{}
+	for _, reference := range compileRecipe.CompilerInvocation.WorkingInputUses {
+		usedWorkingPaths[compileRecipe.WorkingInputs[reference]] = true
+	}
+	for _, pathname := range []string{source, fixdep, objtool} {
+		if !usedWorkingPaths[pathname] {
+			t.Errorf("compiler dependency working-input projection omits %q: uses=%#v working=%#v", pathname, compileRecipe.CompilerInvocation.WorkingInputUses, compileRecipe.WorkingInputs)
+		}
+	}
+	if got, want := len(actionPlanNodeInputSetEntriesForTest(t, plan, compile)), 2; got != want {
+		t.Fatalf("compiler persistent inputs = %#v, want compiler config and ambient config", actionPlanNodeInputSetEntriesForTest(t, plan, compile))
+	}
+	for pathname, want := range map[string]ActionPlanInputSetEntry{
+		"include/generated/autoconf.h": {
+			Target:      ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "include/generated/autoconf.h"},
+			SourceID:    configSourceID,
+			CompilerUse: true,
+		},
+		"include/config/kernel.release": {
+			Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "include/config/kernel.release"},
+			SourceID: ambientConfigSourceID,
+		},
+	} {
+		got, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, compile, pathname)
+		if !found || got != want {
+			t.Errorf("compiler persistent input for %q = (%#v, %t), want %#v", pathname, got, found, want)
+		}
+	}
+	if usedWorkingPaths["include/config/kernel.release"] {
+		t.Errorf("compiler dependency working-input projection retained ambient kernel release: %#v", usedWorkingPaths)
+	}
+	auxiliaryWorkingPaths := map[string]bool{}
+	for _, reference := range compileRecipe.CompilerInvocation.AuxiliaryWorkingInputUses {
+		auxiliaryWorkingPaths[compileRecipe.WorkingInputs[reference]] = true
+	}
+	for _, pathname := range []string{fixdep, objtool} {
+		if !auxiliaryWorkingPaths[pathname] {
+			t.Errorf("auxiliary working-input projection omits %q: uses=%#v working=%#v", pathname, compileRecipe.CompilerInvocation.AuxiliaryWorkingInputUses, compileRecipe.WorkingInputs)
+		}
+	}
+	for _, pathname := range []string{source, "include/generated/autoconf.h"} {
+		if auxiliaryWorkingPaths[pathname] {
+			t.Errorf("auxiliary projection incorrectly attributes compiler-only %q to a surrounding command", pathname)
+		}
+	}
+	for _, pathname := range []string{target, cmdfile, stack} {
+		outputIndex := slices.IndexFunc(compile.Outputs, func(output ActionPlanOutput) bool {
+			return output.Path == pathname && output.ObservedPath == ""
+		})
+		if outputIndex < 0 || actionPlanOutputIsCanonical(compile.Outputs[outputIndex]) {
+			t.Errorf("compiler outputs = %#v, want private atomic output %q", compile.Outputs, pathname)
+		}
+	}
+	if slices.ContainsFunc(compile.Outputs, func(output ActionPlanOutput) bool { return output.Path == depfile }) ||
+		!slices.ContainsFunc(compile.Outputs, func(output ActionPlanOutput) bool {
+			return output.ObservedPath == "drivers/example/opaque.side-effect" && output.Path != ".captures/foo.state"
+		}) {
+		t.Fatalf("atomic compiler lost private observation or leaked depfile: %#v", compile.Outputs)
+	}
+	compileScript := compactKbuildRecipeScriptContentForTest(t, compileRecipe)
+	for _, want := range []string{"set -e", "echo 'CC foo.o'", "trap ", " -c -o ", " -r -o ", "mv ", objtool, fixdep, "rm -f"} {
+		if !strings.Contains(compileScript, want) {
+			t.Errorf("atomic compiler script omits %q: %q", want, compileScript)
+		}
+	}
+	if strings.Contains(compileScript, "wildcard") {
+		t.Fatalf("atomic compiler script contains later selected template: %q", compileScript)
+	}
+	suffix, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("missing suffix producer %q", producer)
+	}
+	suffixRecipe := plan.Recipes[suffix.Recipe]
+	if suffix.Kind != "generate" || suffix.Tool != compactKbuildScriptRunnerRole ||
+		suffixRecipe.Tool != compactKbuildScriptRunnerRole || len(suffix.Inputs) < 2 {
+		t.Fatalf("suffix = %#v recipe = %#v, want opaque scriptrun", suffix, suffixRecipe)
+	}
+	if !slices.ContainsFunc(suffix.Inputs, func(input ActionPlanNodeEdge) bool {
+		return input.ProducerID == compile.ID && input.Role == "observed-state"
+	}) {
+		t.Errorf("suffix inputs = %#v, missing first-template observed-state frontier", suffix.Inputs)
+	}
+	for _, pathname := range []string{target, cmdfile, stack} {
+		found := false
+		for _, value := range suffixRecipe.WorkingInputs {
+			found = found || value == pathname
+		}
+		if !found {
+			t.Errorf("suffix working inputs = %#v, missing compiler output %q", suffixRecipe.WorkingInputs, pathname)
+		}
+	}
+	for _, pathname := range []string{target, cmdfile} {
+		if !slices.ContainsFunc(suffix.Outputs, func(output ActionPlanOutput) bool { return output.Path == pathname }) {
+			t.Errorf("suffix outputs = %#v, missing %q", suffix.Outputs, pathname)
+		}
+	}
+	if !slices.ContainsFunc(suffix.Outputs, func(output ActionPlanOutput) bool {
+		return output.ObservedPath == "drivers/example/opaque.side-effect"
+	}) {
+		t.Errorf("opaque suffix did not retain final observed-state ownership: %#v", suffix.Outputs)
+	}
+	firstStack := slices.IndexFunc(compile.Outputs, func(output ActionPlanOutput) bool { return output.Path == stack })
+	if firstStack < 0 {
+		t.Fatalf("atomic compiler omitted persistent output %q: %#v", stack, compile.Outputs)
+	}
+	if !slices.ContainsFunc(suffix.Outputs, func(output ActionPlanOutput) bool {
+		return output.Path == stack && output.persistent && output.ArtifactPath != compile.Outputs[firstStack].ArtifactPath
+	}) {
+		t.Errorf("opaque suffix did not republish persistent compiler output %q at a fresh artifact: first=%#v suffix=%#v", stack, compile.Outputs, suffix.Outputs)
+	}
+	script := compactKbuildRecipeScriptContentForTest(t, suffixRecipe)
+	if strings.Contains(script, KbuildActionRoleToken("target", "cc")) || strings.Contains(script, " -c -o ") ||
+		strings.Contains(script, "rm -f") {
+		t.Fatalf("opaque suffix still contains the atomic first template: %q", script)
+	}
+	for _, want := range []string{"wildcard", cmdfile} {
+		if !strings.Contains(script, want) {
+			t.Errorf("opaque suffix omits %q: %q", want, script)
+		}
+	}
+	selection := compactKbuildSelectionKey{profile: profile.Name, target: target, stage: "target"}
+	plan.selectionGraph = &compactKbuildSelectionGraph{
+		profiles:                    map[string]CompactKbuildProfile{profile.Name: profile},
+		selections:                  map[compactKbuildSelectionKey]CompactKbuildSelection{selection: {Profile: profile.Name}},
+		materializedProducers:       map[compactKbuildSelectionKey]string{selection: compile.ID},
+		selectionInitialArtifacts:   map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact{},
+		selectionGeneratedArtifacts: map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact{},
+	}
+	compileDependencies, err := AnalyzeActionPlanNodeConfigDependencies(plan, compile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compileDependencies.Opaque || !slices.Equal(compileDependencies.Symbols, []string{"CONFIG_USED"}) {
+		t.Fatalf("compiler dependencies = %#v, want dynamically scanned CONFIG_USED", compileDependencies)
+	}
+	plan.metadata.configFragment = map[string]string{"CONFIG_MODVERSIONS": "y"}
+	modversionsDependencies, err := AnalyzeActionPlanNodeConfigDependencies(plan, compile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !modversionsDependencies.Opaque || !strings.Contains(modversionsDependencies.Reason, "MODVERSIONS") {
+		t.Fatalf("MODVERSIONS compiler dependencies = %#v, want opaque", modversionsDependencies)
+	}
+	plan.metadata.configFragment = nil
+	dependencies, err := AnalyzeActionPlanNodeConfigDependencies(plan, suffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dependencies.Opaque {
+		t.Fatalf("suffix dependencies = %#v, want full-config opaque classification", dependencies)
+	}
+
+	singleMetadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	singlePlan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{}, metadata: singleMetadata,
+	}
+	singleFixdep, err := appendActionPlanNode(singlePlan, fixdepNode, fixdepRecipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	singleObjtool, err := appendActionPlanNode(singlePlan, objtoolNode, fixdepRecipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	singleSource, err := singleMetadata.ensureActionPlanSource(singlePlan, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	singleConfig, err := ensureActionPlanSource(singlePlan, "config", "autoconf.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	singleMatch := match
+	singleMatch.commandTemplates = slices.Clone(match.commandTemplates[:1])
+	singleBuilder := newCompactKbuildRulePlanBuilder(singleMetadata, singlePlan).
+		forOutput("target", "objects", "vmlinux").
+		forProfile(profile)
+	singleProducer, err := singleBuilder.buildCommandTemplate(target, singleMatch, []compactKbuildRuleInput{
+		{path: source, sourceID: singleSource},
+		{path: fixdep, producer: singleFixdep},
+		{path: objtool, producer: singleObjtool},
+		{path: "include/generated/autoconf.h", sourceID: singleConfig, objectTree: true, workingOnly: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	singleNode, ok := compactKbuildPlanNode(singlePlan, singleProducer)
+	if !ok || singleNode.Kind != "compile" || singleNode.Tool != compactKbuildScriptRunnerRole ||
+		singlePlan.Recipes[singleNode.Recipe].CompilerInvocation == nil {
+		t.Fatalf("single-template cmd_and_fixdep = node %#v recipe %#v, want final typed compound compile", singleNode, singlePlan.Recipes[singleNode.Recipe])
+	}
+	for _, pathname := range []string{target, cmdfile, stack} {
+		if !slices.ContainsFunc(singleNode.Outputs, func(output ActionPlanOutput) bool {
+			return output.Path == pathname && (pathname == stack || actionPlanOutputIsCanonical(output))
+		}) {
+			t.Errorf("single-template outputs = %#v, missing final %q", singleNode.Outputs, pathname)
+		}
+	}
+
+	plan.Products = []ActionPlanProduct{{Name: "vmlinux", Tree: "objects", Path: target}}
+	configDependencies := make(map[string]ConfigDependencySet, len(plan.Nodes))
+	for _, node := range plan.Nodes {
+		switch {
+		case node.Kind == "compile":
+			configDependencies[node.ID] = compileDependencies
+		case node.Tool == compactKbuildScriptRunnerRole:
+			configDependencies[node.ID] = dependencies
+		default:
+			configDependencies[node.ID] = ConfigDependencySet{}
+		}
+	}
+	baseSnapshot, err := canonicalActionPlanSnapshot(plan, configDependencies, familyTestConfig("y", "n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlaySnapshot, err := canonicalActionPlanSnapshot(plan, configDependencies, familyTestConfig("y", "m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	family, err := BuildActionPlanFamily([]ActionPlanFamilyVariant{
+		{Name: "base", Snapshot: baseSnapshot},
+		{Name: "irrelevant", Snapshot: overlaySnapshot},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedCompiles, localSuffixes := 0, 0
+	for _, node := range family.Nodes {
+		members := family.Memberships[node.ID]
+		switch {
+		case node.Kind == "compile":
+			if slices.Equal(members, []string{"base", "irrelevant"}) {
+				sharedCompiles++
+			}
+		case node.Tool == compactKbuildScriptRunnerRole && len(members) == 1:
+			localSuffixes++
+		}
+	}
+	if sharedCompiles != 1 || localSuffixes != 2 {
+		t.Fatalf(
+			"family split reuse = %d shared compiles, %d variant-local suffixes; want 1 and 2: memberships=%#v nodes=%#v",
+			sharedCompiles, localSuffixes, family.Memberships, family.Nodes,
+		)
+	}
+}
+
+func TestGenericKbuildCmdAndFixdepRepublishesRequiredSideOutputFinalState(t *testing.T) {
+	const (
+		target  = "drivers/example/foo.o"
+		source  = "drivers/example/foo.c"
+		fixdep  = "scripts/basic/fixdep"
+		depfile = "drivers/example/.foo.o.d"
+		state   = "drivers/example/.foo.o.cmd"
+		stack   = "drivers/example/foo.su"
+	)
+	for name, suffix := range map[string]string{
+		"conditional append":                    "if true; then printf '%s\\n' '#SYMVER example 0x12345678' >> __LINUX_BZL_OBJECT_TREE__/" + state + "; fi",
+		"inactive append":                       "if false; then printf '%s\\n' '#SYMVER example 0x12345678' >> __LINUX_BZL_OBJECT_TREE__/" + state + "; fi",
+		"conditional overwrite":                 "if true; then printf '%s\\n' replacement > __LINUX_BZL_OBJECT_TREE__/" + state + "; fi",
+		"conditional deletion requires failure": "if true; then rm -f __LINUX_BZL_OBJECT_TREE__/" + state + "; fi",
+		"no suffix":                             "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			profile := mustCompactKbuildProfileForTest(t, "build:side-state", "scripts/Makefile.build", "drivers/example", "dummy := y\n", nil)
+			profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
+			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+				Tree: CompactKbuildInvocationObjectTree, Directory: "drivers/example",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			metadata := &CompactMetadata{
+				actionRoles: testConfiguredScopedActionRoles,
+				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+				actionContracts: map[KbuildActionRoleRef]CompactKbuildActionContract{
+					{Scope: "target", Role: "cc"}: {},
+				},
+			}
+			plan := &ActionPlan{
+				Toolsets: map[string]string{"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity},
+				Recipes:  map[string]ActionRecipe{}, metadata: metadata,
+			}
+			fixdepProducer, err := appendActionPlanNode(plan, ActionPlanNode{
+				Stage: "host", Kind: "generate", Tool: "actionfile", Product: "sdk",
+				Outputs: []ActionPlanOutput{{Tree: "host", Path: fixdep}},
+			}, ActionRecipe{
+				Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+				Arguments: []string{"-out", "${output:00000000}", "-content_base64", ""},
+				Outputs:   []string{"00000000"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sourceID, err := metadata.ensureActionPlanSource(plan, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			objectRoot := "__LINUX_BZL_OBJECT_TREE__/"
+			first := KbuildActionRoleToken("target", "cc") +
+				" -Wp,-MMD," + objectRoot + depfile + " -fstack-usage -c -o " + objectRoot + target +
+				" __LINUX_BZL_SOURCE_TREE__/" + source + "; " + objectRoot + fixdep + " " +
+				objectRoot + depfile + " " + objectRoot + target + " 'saved command' > " +
+				objectRoot + state + "; rm -f " + objectRoot + depfile
+			match := compactKbuildRuleMatch{
+				profile: profile, stem: "foo",
+				commandTemplates: []CompactKbuildCommandTemplate{{Name: "first", Text: first}},
+			}
+			if suffix != "" {
+				match.commandTemplates = append(match.commandTemplates, CompactKbuildCommandTemplate{Name: "suffix", Text: suffix})
+			}
+			builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+				forOutput("target", "objects", "vmlinux").forProfile(profile)
+			producer, err := builder.buildCommandTemplate(target, match, []compactKbuildRuleInput{
+				{path: source, sourceID: sourceID}, {path: fixdep, producer: fixdepProducer},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantNodes := 3
+			if suffix == "" {
+				wantNodes = 2
+			}
+			if len(plan.Nodes) != wantNodes {
+				t.Fatalf("nodes = %d, want %d", len(plan.Nodes), wantNodes)
+			}
+			firstNode := plan.Nodes[1]
+			firstSlot := slices.IndexFunc(firstNode.Outputs, func(output ActionPlanOutput) bool {
+				return output.Path == state && output.ObservedPath == ""
+			})
+			if firstNode.Kind != "compile" || firstSlot < 0 || firstNode.Outputs[firstSlot].persistent {
+				t.Fatalf("first output lost typed compile or ordinary side-output identity: %#v", firstNode)
+			}
+			finalNode, found := compactKbuildPlanNode(plan, producer)
+			if !found {
+				t.Fatalf("missing final producer %s", producer)
+			}
+			finalSlot := slices.IndexFunc(finalNode.Outputs, func(output ActionPlanOutput) bool {
+				return output.Path == state && output.ObservedPath == ""
+			})
+			if finalSlot < 0 {
+				t.Fatalf("final producer does not publish required final state: %#v", finalNode.Outputs)
+			}
+			if finalNode.Outputs[finalSlot].persistent {
+				t.Fatal("ordinary shell side output acquired persistent compiler/SDK provenance")
+			}
+			recipe := plan.Recipes[finalNode.Recipe]
+			if recipe.WorkingOutputs[planOrdinal(finalSlot)] != state {
+				t.Fatalf("final working outputs = %#v, want ordinary required %s", recipe.WorkingOutputs, state)
+			}
+			if suffix != "" {
+				if finalNode.ID == firstNode.ID ||
+					actionPlanOutputArtifactPath(finalNode.Outputs[finalSlot]) == actionPlanOutputArtifactPath(firstNode.Outputs[firstSlot]) {
+					t.Fatal("suffix reused the pre-mutation producer or physical output identity")
+				}
+				if !slices.ContainsFunc(finalNode.Inputs, func(edge ActionPlanNodeEdge) bool {
+					return edge.ProducerID == firstNode.ID && edge.Slot == firstSlot
+				}) || !slices.Contains(sortedStringMapValues(recipe.WorkingInputs), state) {
+					t.Fatal("suffix lost exact predecessor side-output bytes")
+				}
+				if finalNode.Kind != "generate" || strings.Contains(compactKbuildRecipeScriptContentForTest(t, recipe), " -c -o ") {
+					t.Fatal("opaque suffix absorbed or repeated the first compiler command")
+				}
+				// Ordinary state is republished separately from compiler-produced
+				// stack metadata; that metadata retains its existing SDK contract.
+				if !slices.ContainsFunc(finalNode.Outputs, func(output ActionPlanOutput) bool {
+					return output.Path == stack && output.persistent
+				}) {
+					t.Fatal("persistent compiler product was demoted while carrying ordinary state")
+				}
+			}
+			if _, err := plan.entries(); err != nil {
+				t.Fatalf("invalid final producer/slot ownership: %v", err)
+			}
+		})
+	}
+}
+
+func TestGenericKbuildGroupedCmdAndFixdepFallsBackToOneOpaqueProducer(t *testing.T) {
+	const (
+		target  = "drivers/example/foo.o"
+		peer    = "drivers/example/foo.peer"
+		source  = "drivers/example/foo.c"
+		fixdep  = "scripts/basic/fixdep"
+		depfile = "drivers/example/.foo.o.d"
+		cmdfile = "drivers/example/.foo.o.cmd"
+	)
+	profile := mustCompactKbuildProfileForTest(t, "build:grouped-cmd-and-fixdep", "scripts/Makefile.build", "drivers/example", `
+dummy := y
+`, nil)
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: "drivers/example",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	metadata.actionContracts = map[KbuildActionRoleRef]CompactKbuildActionContract{
+		{Scope: "target", Role: "cc"}: {},
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{}, metadata: metadata,
+	}
+	fixdepNode := ActionPlanNode{
+		Stage: "host", Kind: "generate", Tool: "actionfile", Product: "sdk",
+		Outputs: []ActionPlanOutput{{Tree: "host", Path: fixdep}},
+	}
+	fixdepRecipe := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+		Arguments: []string{"-out", "${output:00000000}", "-content_base64", ""}, Outputs: []string{"00000000"},
+	}
+	fixdepProducer, err := appendActionPlanNode(plan, fixdepNode, fixdepRecipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID, err := metadata.ensureActionPlanSource(plan, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectRoot := "__LINUX_BZL_OBJECT_TREE__/"
+	compileAndFixdep := KbuildActionRoleToken("target", "cc") +
+		" -Wp,-MMD," + objectRoot + depfile + " -c -o " + objectRoot + target + " __LINUX_BZL_SOURCE_TREE__/" + source +
+		"; " + objectRoot + fixdep + " " + objectRoot + depfile + " " + objectRoot + target +
+		" 'saved command' > " + objectRoot + cmdfile + "; rm -f " + objectRoot + depfile
+	publishPeer := "cp " + objectRoot + target + " " + objectRoot + peer
+	match := compactKbuildRuleMatch{
+		profile: profile,
+		rule: KbuildRule{
+			Targets:   []string{"drivers/example/%.o", "drivers/example/%.peer"},
+			Separator: ":",
+		},
+		stem: "foo",
+		commandTemplates: []CompactKbuildCommandTemplate{
+			{Name: "cc_o_c", Text: compileAndFixdep},
+			{Name: "publish_peer", Text: publishPeer},
+		},
+	}
+	rootedFirst, err := compactKbuildRootedActionDirectRecipeText(profile, compileAndFixdep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinaryMatch := match
+	ordinaryMatch.rule = KbuildRule{Targets: []string{target}, Separator: ":"}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target, ordinaryMatch, compactKbuildFinalizeRootedActionRecipeText(rootedFirst), rootedFirst,
+		compactKbuildAutomaticContext{target: target, stem: "foo"},
+	); !split {
+		t.Fatal("fixture first template is not independently eligible for cmd_and_fixdep splitting")
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		forOutput("target", "objects", "vmlinux").
+		forProfile(profile)
+	producer, err := builder.buildCommandTemplate(target, match, []compactKbuildRuleInput{
+		{path: source, sourceID: sourceID},
+		{path: fixdep, producer: fixdepProducer},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(plan.Nodes), 2; got != want {
+		t.Fatalf("node count = %d, want fixdep seed + one unsplit grouped producer: %#v", got, plan.Nodes)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("missing grouped producer %q", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if node.Kind == "compile" || node.Tool != compactKbuildScriptRunnerRole ||
+		recipe.Tool != compactKbuildScriptRunnerRole || recipe.CompilerInvocation != nil {
+		t.Fatalf("grouped producer = %#v recipe = %#v, want one opaque unsplit scriptrun", node, recipe)
+	}
+	for _, pathname := range []string{target, peer} {
+		if !slices.ContainsFunc(node.Outputs, func(output ActionPlanOutput) bool {
+			return output.Tree == "objects" && output.Path == pathname
+		}) {
+			t.Errorf("grouped outputs = %#v, missing %q", node.Outputs, pathname)
+		}
+	}
+	script := compactKbuildRecipeScriptContentForTest(t, recipe)
+	for _, want := range []string{" -c -o ", fixdep, "rm -f", "cp ", peer} {
+		if !strings.Contains(script, want) {
+			t.Errorf("unsplit grouped script omits %q: %q", want, script)
+		}
+	}
+}
+
 func TestHermeticKbuildCompoundExecutesEarlierExplicitOutput(t *testing.T) {
 	const (
 		target  = "scripts/basic/fixdep"
@@ -7764,6 +8991,226 @@ scripts/basic/fixdep: scripts/basic/fixdep.c FORCE
 	}
 }
 
+func TestCompactKbuildCmdAndFixdepRecognizesCanonicalSelfBootstrap(t *testing.T) {
+	const (
+		target          = "scripts/basic/fixdep"
+		source          = "scripts/basic/fixdep.c"
+		depfile         = "scripts/basic/.fixdep.d"
+		cmdfile         = "scripts/basic/.fixdep.cmd"
+		xallocHeader    = "scripts/include/xalloc.h"
+		nestedHeader    = "scripts/include/linux/nested.h"
+		unrelatedSource = "scripts/not-included.c"
+	)
+	profile := mustCompactKbuildProfileForTest(t, "build:scripts/basic", "scripts/Makefile.build", "scripts/basic", `
+scripts/basic/fixdep: scripts/basic/fixdep.c FORCE
+	@true
+`, nil)
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
+	mustWriteSource(t, profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"], source, `
+#include <xalloc.h>
+static const char config_prefix[] = "CONFIG_";
+int main(void) { return config_prefix[0] == 'C' ? 0 : 1; }
+`)
+	mustWriteSource(t, profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"], xallocHeader, "#include \"linux/nested.h\"\n#define xmalloc(size) malloc(size)\n")
+	mustWriteSource(t, profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"], nestedHeader, "#define NESTED_HEADER 1\n")
+	mustWriteSource(t, profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"], unrelatedSource, "int unrelated;\n")
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: "scripts/basic",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	objectRoot := "__LINUX_BZL_OBJECT_TREE__/"
+	template := KbuildActionRoleToken("host", "cc") +
+		" -Wp,-MMD," + objectRoot + depfile + " -I__LINUX_BZL_SOURCE_TREE__/scripts/include -o " + objectRoot + target +
+		" __LINUX_BZL_SOURCE_TREE__/" + source +
+		"; " + objectRoot + target + " " + objectRoot + depfile + " " + objectRoot + target +
+		" 'saved command' > " + objectRoot + cmdfile + "; rm -f " + objectRoot + depfile
+	rooted, err := compactKbuildRootedActionDirectRecipeText(profile, template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	match := compactKbuildRuleMatch{profile: profile}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target, match, compactKbuildFinalizeRootedActionRecipeText(rooted), rooted,
+		compactKbuildAutomaticContext{target: target},
+	); !split {
+		t.Fatal("canonical driver-link-then-execute fixdep bootstrap was not recognized")
+	}
+	searchedTemplate := strings.Replace(template, " -o ", " -L vendor/lib -lhelper -o ", 1)
+	searchedRooted, err := compactKbuildRootedActionDirectRecipeText(profile, searchedTemplate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target, match, compactKbuildFinalizeRootedActionRecipeText(searchedRooted), searchedRooted,
+		compactKbuildAutomaticContext{target: target},
+	); split {
+		t.Fatal("driver-link fixdep bootstrap accepted an indirect library search")
+	}
+
+	// Exercise the selected-rule lowering path as well as the recognizer. The
+	// family dependency analyzer can prune and share this bootstrap only when
+	// the emitted atomic scriptrun retains its bounded compiler invocation.
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	linkRole, ok := toolaction.LinkContractRole("cc")
+	if !ok {
+		t.Fatal("cc has no semantic link contract")
+	}
+	baseRef := KbuildActionRoleRef{Scope: "host", Role: "cc"}
+	linkRef := KbuildActionRoleRef{Scope: "host", Role: linkRole}
+	metadata.actionRoles = append(slices.Clone(metadata.actionRoles), linkRef)
+	metadata.actionContracts = map[KbuildActionRoleRef]CompactKbuildActionContract{
+		baseRef: {},
+		linkRef: {},
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{},
+		metadata: metadata,
+	}
+	sourceID, err := metadata.ensureActionPlanSource(plan, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	match.rule = profile.Rules[0]
+	match.commandTemplates = []CompactKbuildCommandTemplate{{Name: "hostcc", Text: template}}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		forOutput("prehost", "prehost", "sdk").
+		forProfile(profile)
+	producer, err := builder.buildCommandTemplate(target, match, []compactKbuildRuleInput{{
+		path: source, sourceID: sourceID,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(plan.Nodes), 1; got != want {
+		t.Fatalf("node count = %d, want one atomic fixdep bootstrap: %#v", got, plan.Nodes)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("missing fixdep bootstrap producer %q", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if node.Kind != "compile" || node.Tool != compactKbuildScriptRunnerRole ||
+		recipe.Tool != compactKbuildScriptRunnerRole || recipe.CompilerInvocation == nil ||
+		recipe.CompilerInvocation.Tool != "cc" {
+		t.Fatalf("fixdep bootstrap = %#v recipe = %#v, want typed atomic compiler scriptrun", node, recipe)
+	}
+	compilerArguments := strings.Join(recipe.CompilerInvocation.Arguments, "\x00")
+	if !strings.Contains(compilerArguments, depfile) || !strings.Contains(compilerArguments, source) {
+		t.Fatalf("fixdep compiler invocation omits depfile or source: %#v", recipe.CompilerInvocation)
+	}
+	if slices.Contains(recipe.CompilerInvocation.Arguments, "-c") ||
+		toolaction.InvocationContractRole("cc", recipe.CompilerInvocation.Arguments) != linkRole ||
+		!toolaction.CompilerInvocationProducesBinaryOutput("cc", recipe.CompilerInvocation.Arguments) {
+		t.Fatalf("fixdep compiler invocation = %#v, want binary %s without -c", recipe.CompilerInvocation, linkRole)
+	}
+	if !recipe.CompilerInvocation.WorkingInputUsesComplete {
+		t.Fatalf("fixdep driver-link working-input projection is incomplete: %#v", recipe.CompilerInvocation)
+	}
+	if len(recipe.ExecutableInputs) != 0 {
+		t.Fatalf("self-bootstrap unexpectedly declares its output executable as an input: %#v", recipe.ExecutableInputs)
+	}
+	for _, pathname := range recipe.WorkingInputs {
+		if pathname == target {
+			t.Fatalf("self-bootstrap stages its output as an input: %#v", recipe.WorkingInputs)
+		}
+	}
+	hasTarget, hasCommand, hasDepfile := false, false, false
+	for _, pathname := range recipe.WorkingOutputs {
+		hasTarget = hasTarget || pathname == target
+		hasCommand = hasCommand || pathname == cmdfile
+		hasDepfile = hasDepfile || pathname == depfile
+	}
+	if !hasTarget || !hasCommand || hasDepfile {
+		t.Fatalf("fixdep bootstrap outputs = %#v, want target and command record but no removed depfile", recipe.WorkingOutputs)
+	}
+
+	selection := compactKbuildSelectionKey{profile: profile.Name, target: target, stage: "prehost"}
+	plan.selectionGraph = &compactKbuildSelectionGraph{
+		profiles:                    map[string]CompactKbuildProfile{profile.Name: profile},
+		selections:                  map[compactKbuildSelectionKey]CompactKbuildSelection{selection: {Profile: profile.Name}},
+		materializedProducers:       map[compactKbuildSelectionKey]string{selection: node.ID},
+		selectionInitialArtifacts:   map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact{},
+		selectionGeneratedArtifacts: map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact{},
+	}
+	dependencies, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSourcePaths := []string{source, nestedHeader, xallocHeader}
+	slices.Sort(wantSourcePaths)
+	if dependencies.Opaque || len(dependencies.Symbols) != 0 ||
+		!slices.Equal(dependencies.SourcePaths, wantSourcePaths) ||
+		slices.Contains(dependencies.SourcePaths, unrelatedSource) {
+		t.Fatalf("fixdep driver-link dependencies = %#v, want config-independent source closure", dependencies)
+	}
+	plan.Products = []ActionPlanProduct{{Name: "sdk", Tree: "prehost", Path: target}}
+	baseSnapshot, err := canonicalActionPlanSnapshot(
+		plan, map[string]ConfigDependencySet{node.ID: dependencies}, familyTestConfig("y", "n"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlaySnapshot, err := canonicalActionPlanSnapshot(
+		plan, map[string]ConfigDependencySet{node.ID: dependencies}, familyTestConfig("y", "m"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	family, err := BuildActionPlanFamily([]ActionPlanFamilyVariant{
+		{Name: "base", Snapshot: baseSnapshot},
+		{Name: "irrelevant", Snapshot: overlaySnapshot},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared := 0
+	for _, familyNode := range family.Nodes {
+		familyRecipe := family.Recipes[familyNode.Recipe]
+		if familyNode.Kind == "compile" && familyRecipe.CompilerInvocation != nil &&
+			slices.Equal(family.Memberships[familyNode.ID], []string{"base", "irrelevant"}) {
+			shared++
+			manifest, err := familyNodeSourceProjections(familyNode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			projected := map[string]bool{}
+			for _, binding := range manifest.Bindings {
+				if binding.Tree == "kernel" {
+					projected[binding.Path] = true
+				}
+			}
+			for _, pathname := range wantSourcePaths {
+				if !projected[pathname] {
+					t.Fatalf("fixdep family source projection omits %q: %#v", pathname, manifest)
+				}
+			}
+			if projected[unrelatedSource] {
+				t.Fatalf("fixdep family source projection includes unrelated source %q: %#v", unrelatedSource, manifest)
+			}
+		}
+	}
+	if shared != 1 {
+		t.Fatalf("fixdep driver-link family has %d shared compiles, want one: memberships=%#v nodes=%#v", shared, family.Memberships, family.Nodes)
+	}
+
+	sourceWriter := strings.Replace(template, objectRoot+target+" "+objectRoot+depfile, "__LINUX_BZL_SOURCE_TREE__/"+target+" "+objectRoot+depfile, 1)
+	sourceRooted, err := compactKbuildRootedActionDirectRecipeText(profile, sourceWriter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, split := compactKbuildCmdAndFixdepRecipeSplit(
+		target, match, compactKbuildFinalizeRootedActionRecipeText(sourceRooted), sourceRooted,
+		compactKbuildAutomaticContext{target: target},
+	); split {
+		t.Fatal("canonical fixdep bootstrap accepted a source-tree executable")
+	}
+}
+
 func TestHermeticKbuildCompilerFallbackFinalizesImmutableSourceProvenance(t *testing.T) {
 	const (
 		target = "tools/objtool/fixdep"
@@ -7800,6 +9247,7 @@ tools/objtool/fixdep: tools/build/fixdep.c FORCE
 		template,
 		nil,
 		nil,
+		compactKbuildHermeticScriptOptions{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -7818,6 +9266,179 @@ tools/objtool/fixdep: tools/build/fixdep.c FORCE
 	}
 	if !slices.Contains(node.Trees, "kernel") || !slices.Contains(recipe.Trees, "kernel") {
 		t.Fatalf("compiler fallback omits kernel tree binding: node=%#v recipe=%#v", node.Trees, recipe.Trees)
+	}
+}
+
+func TestHermeticKbuildSingleDriverLinkIsTypedCompile(t *testing.T) {
+	const (
+		target  = "scripts/basic/fixdep"
+		source  = "scripts/basic/fixdep.c"
+		ambient = "include/config/kernel.release"
+	)
+	profile := mustCompactKbuildProfileForTest(t, "host:fixdep-link", "scripts/Makefile.host", "", `
+scripts/basic/fixdep: scripts/basic/fixdep.c FORCE
+	@true
+`, nil)
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"host": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{}, metadata: metadata,
+	}
+	sourceID, err := metadata.ensureActionPlanSource(plan, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ambientID, err := ensureActionPlanSource(plan, "config", "kernel.release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := compactKbuildRecipeLineShells([]string{
+		KbuildActionRoleToken("host", "cc") + " -O2 -o " +
+			compactKbuildActionObjectTreeMarker + "/" + target + " " +
+			compactKbuildActionSourceTreeMarker + "/" + source,
+	})
+	commands, err := compactKbuildCompoundProgramCommands(template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		forProfile(profile).
+		forOutput("host", "host", "sdk")
+	producer, err := builder.buildHermeticKbuildCompound(
+		target,
+		compactKbuildRuleMatch{profile: profile, rule: profile.Rules[0]},
+		[]compactKbuildRuleInput{
+			{path: source, sourceID: sourceID},
+			{path: ambient, sourceID: ambientID, objectTree: true, workingOnly: true},
+		},
+		template,
+		commands,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("fixdep driver-link producer %q not found", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if node.Kind != "compile" || recipe.CompilerInvocation == nil ||
+		recipe.CompilerInvocation.Tool != "cc" ||
+		toolaction.InvocationContractRole("cc", recipe.CompilerInvocation.Arguments) != "cc-link" {
+		t.Fatalf("fixdep driver-link = node %#v recipe %#v, want typed cc-link compile", node, recipe)
+	}
+	if !recipe.CompilerInvocation.WorkingInputUsesComplete {
+		t.Fatalf("fixdep driver-link has incomplete working-input uses: %#v", recipe.CompilerInvocation)
+	}
+	used := map[string]bool{}
+	for _, reference := range recipe.CompilerInvocation.WorkingInputUses {
+		used[recipe.WorkingInputs[reference]] = true
+	}
+	if !used[source] || used[ambient] {
+		t.Fatalf("fixdep driver-link working-input uses = %#v, want source only (working=%#v)", used, recipe.WorkingInputs)
+	}
+}
+
+func TestHermeticKbuildSingleDriverLinkIndirectInputsKeepIncompleteProjection(t *testing.T) {
+	const (
+		target = "tools/hidden-link-input"
+		source = "tools/hidden-link-input.c"
+		hidden = "libs/libhidden.a"
+	)
+	for _, test := range []struct {
+		name     string
+		operands string
+	}{
+		{name: "unquoted glob", operands: " libs/*.a"},
+		{name: "library search", operands: " -L libs -lhidden"},
+		{name: "source-selected sysroot", operands: " --sysroot libs"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile := mustCompactKbuildProfileForTest(t, "host:hidden-link-input", "scripts/Makefile.host", "", `
+tools/hidden-link-input: tools/hidden-link-input.c FORCE
+	@true
+`, nil)
+			profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
+			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+				Tree: CompactKbuildInvocationObjectTree,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			metadata := &CompactMetadata{
+				actionRoles: testConfiguredScopedActionRoles,
+				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+			}
+			plan := &ActionPlan{
+				Toolsets: map[string]string{"host": actionPlanTestProbeIdentity},
+				Recipes:  map[string]ActionRecipe{}, metadata: metadata,
+			}
+			hiddenNode := ActionPlanNode{
+				Stage: "prehost", Kind: "generate", Tool: "actionfile", Product: "sdk",
+				Outputs: []ActionPlanOutput{{Tree: "prehost", Path: hidden}},
+			}
+			hiddenRecipe := ActionRecipe{
+				Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+				Arguments: []string{"-out", "${output:00000000}", "-content_base64", ""}, Outputs: []string{"00000000"},
+			}
+			hiddenProducer, err := appendActionPlanNode(plan, hiddenNode, hiddenRecipe)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sourceID, err := metadata.ensureActionPlanSource(plan, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			template := compactKbuildRecipeLineShells([]string{
+				KbuildActionRoleToken("host", "cc") + " " +
+					compactKbuildActionSourceTreeMarker + "/" + source + test.operands + " -o " +
+					compactKbuildActionObjectTreeMarker + "/" + target,
+			})
+			commands, err := compactKbuildCompoundProgramCommands(template)
+			if err != nil {
+				t.Fatal(err)
+			}
+			builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+				forProfile(profile).
+				forOutput("host", "host", "sdk")
+			producer, err := builder.buildHermeticKbuildCompound(
+				target,
+				compactKbuildRuleMatch{profile: profile, rule: profile.Rules[0]},
+				[]compactKbuildRuleInput{
+					{path: source, sourceID: sourceID},
+					{path: hidden, producer: hiddenProducer},
+				},
+				template,
+				commands,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			node, ok := compactKbuildPlanNode(plan, producer)
+			if !ok {
+				t.Fatalf("hidden-input driver-link producer %q not found", producer)
+			}
+			recipe := plan.Recipes[node.Recipe]
+			if node.Kind != "compile" || recipe.CompilerInvocation == nil ||
+				recipe.CompilerInvocation.WorkingInputUsesComplete {
+				t.Fatalf("hidden-input driver-link = node %#v recipe %#v, want typed incomplete projection", node, recipe)
+			}
+			stagedHidden := false
+			for _, pathname := range recipe.WorkingInputs {
+				stagedHidden = stagedHidden || pathname == hidden
+			}
+			if !stagedHidden {
+				t.Fatalf("hidden input %q was not staged for incomplete fallback: %#v", hidden, recipe.WorkingInputs)
+			}
+		})
 	}
 }
 
@@ -9053,6 +10674,13 @@ arch/x86/include/generated/asm/cpufeaturemasks.h: arch/x86/tools/cpufeaturemasks
 		"arch/x86/tools/cpufeaturemasks.awk",
 		"arch/x86/include/asm/cpufeatures.h",
 	)
+	script, ok := ResolveCompactKbuildProfileSourcePath(profile, "arch/x86/tools/cpufeaturemasks.awk")
+	if !ok {
+		t.Fatal("cannot resolve cpufeaturemasks AWK source")
+	}
+	if err := os.WriteFile(script, []byte(projectedGeneratorTestAWK), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	metadata := &CompactMetadata{
 		actionRoles: testConfiguredScopedActionRoles,
 		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
@@ -9074,6 +10702,12 @@ arch/x86/include/generated/asm/cpufeaturemasks.h: arch/x86/tools/cpufeaturemasks
 	}
 	if len(recipe.ExecutableInputs) != 0 || strings.HasPrefix(recipe.Tool, "input:") {
 		t.Fatalf("filechk AWK is not identity-bound: %#v", recipe)
+	}
+	if got, want := plan.projectedGeneratorCandidates[result.ID], []string{
+		"CONFIG_X86_DISABLED_FEATURE_",
+		"CONFIG_X86_REQUIRED_FEATURE_",
+	}; got.TargetPath != target || got.TargetSlot != 0 || !slices.Equal(got.ConfigProjectionPrefixes, want) {
+		t.Fatalf("filechk projected Kconfig candidate=%#v, want %#v", got, want)
 	}
 }
 
@@ -9673,6 +11307,68 @@ generated.h: FORCE
 	}
 }
 
+func TestGenericKbuildOffsetsFilechkCarriesValidatedMacroHeaderContract(t *testing.T) {
+	makefile := `
+define sed-offsets
+'s:^[[:space:]]*\.ascii[[:space:]]*"\(.*\)".*:\1:; \
+/^->/{s:->#\(.*\):/* \1 */:; \
+s:^->\([^ ]*\) [\$$#]*\([^ ]*\) \(.*\):#define \1 \2 /* \3 */:; \
+s:->::; p;}'
+endef
+define filechk_offsets
+	echo "#ifndef $2"; \
+	echo "#define $2"; \
+	echo "/* generated */"; \
+	sed -ne $(sed-offsets) < $<; \
+	echo "#endif"
+endef
+generated.h: offsets.s FORCE
+	$(call filechk,offsets,__GENERATED_OFFSETS_H__)
+`
+	profile := mustCompactKbuildProfileForTest(t, "prep:validated-offsets", "Makefile", "", makefile, nil)
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, "offsets.s")
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	if err := buildCompactKbuildTargetForTest(metadata, plan, "generated.h"); err != nil {
+		t.Fatal(err)
+	}
+	producer, _, ok := planProducerByOutput(plan, "objects", "generated.h")
+	if !ok {
+		t.Fatalf("validated offsets plan has no generated.h producer: %#v", plan.Nodes)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("validated offsets producer %q is absent", producer)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if recipe.Tool != "actionfile" || !slices.Contains(recipe.Arguments, "-validate_config_independent_macro_header_v1") {
+		t.Fatalf("validated offsets final recipe = %#v, want actionfile validation contract", recipe)
+	}
+	if len(recipe.Environment) != 0 {
+		t.Fatalf("validated offsets final actionfile retained source-exported environment: %#v", recipe.Environment)
+	}
+
+	makefile = strings.Replace(makefile, "s:->::; p;", "s:->::; s:SAFE:UNSAFE:; p;", 1)
+	profile = mustCompactKbuildProfileForTest(t, "prep:unrecognized-offsets", "Makefile", "", makefile, nil)
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, "offsets.s")
+	metadata.Config.KbuildProfiles = []CompactKbuildProfile{profile}
+	plan = &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	if err := buildCompactKbuildTargetForTest(metadata, plan, "generated.h"); err != nil {
+		t.Fatal(err)
+	}
+	producer, _, ok = planProducerByOutput(plan, "objects", "generated.h")
+	if !ok {
+		t.Fatalf("unrecognized offsets plan has no generated.h producer: %#v", plan.Nodes)
+	}
+	node, _ = compactKbuildPlanNode(plan, producer)
+	if recipe = plan.Recipes[node.Recipe]; slices.Contains(recipe.Arguments, "-validate_config_independent_macro_header_v1") {
+		t.Fatalf("modified offsets helper incorrectly received validation contract: %#v", recipe)
+	}
+}
+
 func TestGenericKbuildRecipeConcatenatesMultiCommandFilechk(t *testing.T) {
 	makefile := `
 filechk_transform = echo begin; sed -ne 's:^value$:VALUE:p' < $<; echo end
@@ -9848,4 +11544,265 @@ include/generated/utsrelease.h: FORCE
 	if got := slices.Index(recipe.Arguments, "-line"); got < 0 || got+1 == len(recipe.Arguments) || recipe.Arguments[got+1] != want {
 		t.Fatalf("literal filechk arguments=%q, want line %q", recipe.Arguments, want)
 	}
+}
+
+func BenchmarkCompoundWorkingInputPathsCumulativeFrontier(b *testing.B) {
+	for _, count := range []int{128, 256, 512} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			parsed, err := parseKbuildWithOptions(strings.NewReader(""), "Makefile", KbuildOptions{
+				CaptureTargetEvaluator: true,
+			}, "")
+			if err != nil {
+				b.Fatal(err)
+			}
+			profile, err := NewCompactKbuildProfile("working-input-benchmark", "Makefile", "", parsed)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+				Tree: CompactKbuildInvocationObjectTree,
+			}); err != nil {
+				b.Fatal(err)
+			}
+			const (
+				objectRoot = "__LINUX_BZL_OBJECT_TREE__/"
+				source     = "drivers/performance/working-input/input.c"
+				config     = "include/generated/autoconf.h"
+				fixdep     = "scripts/basic/fixdep"
+			)
+			inputs := []compactKbuildRuleInput{
+				{path: source, sourceID: "src-00000001"},
+				{path: config, producer: "config-producer"},
+				{path: fixdep, producer: "fixdep-producer"},
+			}
+			commands := make([][]compactKbuildRecipeCommand, count)
+			for index := range commands {
+				target := fmt.Sprintf("drivers/performance/working-input/unit-%04d.o", index)
+				depfile := objectRoot + target + ".d"
+				compile := KbuildActionRoleToken("target", "cc") +
+					" -nostdinc -O2 -Wall -Werror -fno-common -fno-pie -fno-strict-aliasing" +
+					" -D__KERNEL__ -DKBUILD_MODNAME=benchmark -DKBUILD_BASENAME=unit" +
+					" -include " + objectRoot + config + " -Wp,-MMD," + depfile +
+					" -c __LINUX_BZL_SOURCE_TREE__/" + source + " -o " + objectRoot + target
+				template := compile + "; " + objectRoot + fixdep + " " + depfile + " " +
+					objectRoot + target + " " + compactKbuildShellLiteralWord(compile)
+				commands[index], err = compactKbuildCompoundProgramCommands(template)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if !compactKbuildCompoundWorkingInputUsesComplete(profile, target, commands[index]) {
+					b.Fatal("benchmark command does not satisfy the closed working-input grammar")
+				}
+				inputs = append(inputs, compactKbuildRuleInput{path: target, producer: fmt.Sprintf("producer-%04d", index)})
+			}
+			// Each operation is a batch of ordinary compile+fixdep actions. The
+			// staged frontier retains outputs from earlier actions, but argv size
+			// stays fixed. Construction, parsing, grammar checks, and warming the
+			// profile's source-path cache are excluded from measurement.
+			for index, command := range commands {
+				used := compactKbuildCompoundWorkingInputPathsNaiveForTest(profile, command, inputs[:3+index])
+				if len(used) != 3 || !used[source] || !used[config] || !used[fixdep] {
+					b.Fatalf("command %d selected unexpected inputs: %#v", index, used)
+				}
+				indexed := compactKbuildCompoundWorkingInputPaths(profile, command, inputs[:3+index])
+				if !maps.Equal(indexed, used) {
+					b.Fatalf("command %d indexed inputs %#v differ from naive %#v", index, indexed, used)
+				}
+			}
+			for _, implementation := range []struct {
+				name  string
+				query func(CompactKbuildProfile, []compactKbuildRecipeCommand, []compactKbuildRuleInput) map[string]bool
+			}{
+				{name: "naive", query: compactKbuildCompoundWorkingInputPathsNaiveForTest},
+				{name: "indexed", query: compactKbuildCompoundWorkingInputPaths},
+			} {
+				b.Run(implementation.name, func(b *testing.B) {
+					b.ReportAllocs()
+					b.ResetTimer()
+					for iteration := 0; iteration < b.N; iteration++ {
+						for index, command := range commands {
+							used := implementation.query(profile, command, inputs[:3+index])
+							if len(used) != 3 {
+								b.Fatalf("command %d selected %d inputs, want 3", index, len(used))
+							}
+						}
+					}
+					b.ReportMetric(float64(count), "actions/op")
+				})
+			}
+		})
+	}
+}
+
+func TestCompoundWorkingInputPathsIndexedMatchesNaive(t *testing.T) {
+	const (
+		objectRoot = "__LINUX_BZL_OBJECT_TREE__/"
+		sourceRoot = "__LINUX_BZL_SOURCE_TREE__/"
+	)
+	cc := KbuildActionRoleToken("target", "cc")
+	for _, test := range []struct {
+		name, command string
+		inputs, want  []string
+		complete      bool
+	}{
+		{
+			name:    "raw non-component and multiple suffixes",
+			command: cc + " -c " + sourceRoot + "drivers/foobar.c -o " + objectRoot + "out",
+			inputs:  []string{"drivers/foobar.c", "foobar.c", "bar.c", "ar.c", "other.c"},
+			want:    []string{"drivers/foobar.c", "foobar.c", "bar.c", "ar.c"}, complete: true,
+		},
+		{
+			name:    "UTF-8 suffix byte lengths",
+			command: cc + " -c " + sourceRoot + "drivers/模块.c -o " + objectRoot + "out",
+			inputs:  []string{"drivers/模块.c", "模块.c", "块.c", ".c", "é.c"},
+			want:    []string{"drivers/模块.c", "模块.c", "块.c", ".c"}, complete: true,
+		},
+		{
+			name:    "canonicalized duplicate and empty input paths",
+			command: cc + " -include " + sourceRoot + "include/forced.h -c " + sourceRoot + "drivers/input.c -o " + objectRoot + "out",
+			inputs:  []string{"./drivers/./input.c", " drivers/cache/../input.c ", "include/generated/../forced.h", "", "."},
+			want:    []string{"drivers/input.c", "include/forced.h"}, complete: true,
+		},
+		{
+			name:    "response operand remains conservative",
+			command: cc + " @" + objectRoot + "options.rsp -c " + sourceRoot + "source.c -o " + objectRoot + "out",
+			inputs:  []string{"options.rsp", "ions.rsp", "source.c"},
+			want:    []string{"options.rsp", "ions.rsp", "source.c"},
+		},
+		{
+			name:    "comma and equal operand splits",
+			command: cc + " -Wp,-include," + sourceRoot + "forced.h -DHEADER=" + sourceRoot + "config.h -c " + sourceRoot + "source.c -o " + objectRoot + "out",
+			inputs:  []string{"forced.h", "config.h", "source.c", "unused.h"},
+			want:    []string{"forced.h", "config.h", "source.c"}, complete: true,
+		},
+		{
+			name:    "script and forced-header prefixes",
+			command: "echo -T" + sourceRoot + "first.lds --script=" + sourceRoot + "second.lds -include" + sourceRoot + "forced.h -imacros" + sourceRoot + "macros.h",
+			inputs:  []string{"first.lds", "second.lds", "forced.h", "macros.h"},
+			want:    []string{"first.lds", "second.lds", "forced.h", "macros.h"}, complete: true,
+		},
+		{
+			name:    "environment stdin and exact program binding",
+			command: "DATA=" + sourceRoot + "env.h " + objectRoot + "scripts/basic/fixdep " + objectRoot + "file.d " + objectRoot + "out saved < " + sourceRoot + "stdin.h",
+			inputs:  []string{"env.h", "stdin.h", "file.d", "scripts/basic/fixdep", "fixdep"},
+			want:    []string{"env.h", "stdin.h", "file.d", "scripts/basic/fixdep"},
+		},
+		{
+			name:    "static compiler stdin",
+			command: cc + " -c " + sourceRoot + "source.c -o " + objectRoot + "out < " + sourceRoot + "stdin.h",
+			inputs:  []string{"source.c", "stdin.h"}, want: []string{"source.c", "stdin.h"}, complete: true,
+		},
+		{
+			name:    "private source and object tree markers",
+			command: cc + " -include " + compactKbuildActionObjectTreeMarker + "/forced.h -c " + compactKbuildActionSourceTreeMarker + "/source.c -o " + compactKbuildActionObjectTreeMarker + "/out",
+			inputs:  []string{"source.c", "forced.h"}, want: []string{"source.c", "forced.h"}, complete: true,
+		},
+		{
+			name:    "trailing slash suffixes",
+			command: "echo /prefix/directory/",
+			inputs:  []string{"directory/", "tory/", "ory/", "directory"},
+			want:    []string{"directory/", "tory/", "ory/"}, complete: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile := CompactKbuildProfile{Name: "indexed-working-input-equivalence"}
+			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+				Tree: CompactKbuildInvocationObjectTree,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			commands, err := compactKbuildCompoundProgramCommands(test.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if complete := compactKbuildCompoundWorkingInputUsesComplete(profile, "out", commands); complete != test.complete {
+				t.Fatalf("closed working-input grammar = %v, want %v", complete, test.complete)
+			}
+			inputs := make([]compactKbuildRuleInput, len(test.inputs))
+			for index, pathname := range test.inputs {
+				inputs[index].path = pathname
+			}
+			want := make(map[string]bool, len(test.want))
+			for _, pathname := range test.want {
+				want[pathname] = true
+			}
+			naive := compactKbuildCompoundWorkingInputPathsNaiveForTest(profile, commands, inputs)
+			if !maps.Equal(naive, want) {
+				t.Fatalf("naive matcher = %#v, want %#v", naive, want)
+			}
+			indexed := compactKbuildCompoundWorkingInputPaths(profile, commands, inputs)
+			if !maps.Equal(indexed, naive) {
+				t.Fatalf("indexed matcher = %#v, naive = %#v", indexed, naive)
+			}
+		})
+	}
+}
+
+// Retain the original full-frontier scan as an independent equivalence and
+// benchmark oracle. In particular, its raw suffix match is not restricted to
+// directory-component boundaries and may select several overlapping paths.
+func compactKbuildCompoundWorkingInputPathsNaiveForTest(
+	profile CompactKbuildProfile,
+	commands []compactKbuildRecipeCommand,
+	inputs []compactKbuildRuleInput,
+) map[string]bool {
+	inputPaths := make(map[string]bool, len(inputs))
+	for _, input := range inputs {
+		if pathname := canonicalKbuildRulePath(input.path); pathname != "" {
+			inputPaths[pathname] = true
+		}
+	}
+	used := map[string]bool{}
+	add := func(pathname string) {
+		pathname = canonicalKbuildRulePath(pathname)
+		if inputPaths[pathname] {
+			used[pathname] = true
+		}
+	}
+	resolveOperand := func(value string) {
+		values := []string{value}
+		values = append(values, strings.FieldsFunc(value, func(character rune) bool {
+			return character == ',' || character == '='
+		})...)
+		baseValues := slices.Clone(values)
+		for _, candidate := range baseValues {
+			candidate = strings.TrimPrefix(candidate, "@")
+			for _, prefix := range []string{"-T", "--script=", "-include", "-imacros"} {
+				if strings.HasPrefix(candidate, prefix) && len(candidate) > len(prefix) {
+					values = append(values, candidate[len(prefix):])
+				}
+			}
+		}
+		for _, candidate := range values {
+			candidate = strings.TrimPrefix(candidate, "@")
+			if pathname, ok := compactKbuildProfileCommandOperandPath(profile, candidate); ok {
+				add(pathname)
+			}
+			if pathname, _, ok := compactKbuildProfileCommandPath(profile, candidate); ok {
+				add(pathname)
+			}
+			add(compactKbuildCompilerSourceOperandGraphPath(candidate))
+			materialized := compactKbuildMaterializeActionTreeMarkers(candidate)
+			for pathname := range inputPaths {
+				if materialized == pathname || strings.HasSuffix(materialized, "/"+pathname) || strings.HasSuffix(materialized, pathname) {
+					used[pathname] = true
+				}
+			}
+		}
+	}
+	for _, command := range commands {
+		if pathname, _, ok := compactKbuildProfileCommandPath(profile, command.program); ok {
+			add(pathname)
+		}
+		for _, argument := range command.arguments {
+			resolveOperand(argument)
+		}
+		if command.stdin != "" {
+			resolveOperand(command.stdin)
+		}
+		for _, name := range sortedStringMapKeys(command.environment) {
+			resolveOperand(command.environment[name])
+		}
+	}
+	return used
 }

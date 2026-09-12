@@ -171,6 +171,15 @@ type kbuildTargetEvaluator struct {
 	plannerMu       sync.Mutex
 	plannerRuntimes map[compactKbuildPlannerRuntimeKey]*compactKbuildPlannerRuntime
 
+	// commandMemo owns successful source-rule command resolutions for this
+	// immutable evaluator. The key also carries the activated probe environment
+	// and profile-local control provenance, so source-order environment changes
+	// cannot reuse a result from another compiler setup.
+	commandMemoMu     sync.Mutex
+	commandMemo       map[kbuildRuleCommandMemoKey]kbuildRuleCommandMemoValue
+	commandMemoHits   uint64
+	commandMemoMisses uint64
+
 	pathScopeMu    sync.Mutex
 	sourceAncestry map[string]int
 }
@@ -613,13 +622,37 @@ func EvaluateCompactKbuildSelectedTargetEffectsForMakeTarget(
 	profile CompactKbuildProfile,
 	target, makeTarget string,
 ) (CompactKbuildSelectedTargetEffects, bool, error) {
-	match, matched, err := (&CompactMetadata{}).compactKbuildRuleForProfileMakeTarget(profile, target, makeTarget)
+	resolved, err := ResolveCompactKbuildTargetForMakeTarget(profile, target, makeTarget)
 	if err != nil {
 		return CompactKbuildSelectedTargetEffects{}, false, err
 	}
-	if !matched {
+	return resolved.SelectedTargetEffects()
+}
+
+// SelectedTargetEffects classifies the selected action retained by r without
+// repeating target resolution. Returned slices are owned by the caller.
+func (r *CompactKbuildResolvedTarget) SelectedTargetEffects() (CompactKbuildSelectedTargetEffects, bool, error) {
+	if r == nil {
+		return CompactKbuildSelectedTargetEffects{}, false, fmt.Errorf("nil resolved Kbuild target")
+	}
+	if r.effects == nil {
+		effects, selected, err := r.selectedTargetEffectsUncached()
+		return cloneCompactKbuildSelectedTargetEffects(effects), selected, err
+	}
+	r.effects.once.Do(func() {
+		r.effects.effects, r.effects.selected, r.effects.err = r.selectedTargetEffectsUncached()
+	})
+	return cloneCompactKbuildSelectedTargetEffects(r.effects.effects), r.effects.selected, r.effects.err
+}
+
+func (r *CompactKbuildResolvedTarget) selectedTargetEffectsUncached() (CompactKbuildSelectedTargetEffects, bool, error) {
+	if !r.matched {
 		return CompactKbuildSelectedTargetEffects{}, false, nil
 	}
+	profile := r.profile
+	target := r.target
+	match := r.match
+	var err error
 	match, err = activeCompactKbuildRuleCommands(target, match, nil)
 	if err != nil {
 		return CompactKbuildSelectedTargetEffects{}, false, err
@@ -709,13 +742,7 @@ func EvaluateCompactKbuildSelectedTargetEffectsForMakeTarget(
 	if automaticErr != nil {
 		return CompactKbuildSelectedTargetEffects{}, false, automaticErr
 	}
-	selections, selectionErr := evaluatedKbuildRuleCommandSelectionsForMakeTarget(
-		profile, target, match.lookupTarget, automatic.target, automatic.stem,
-		automatic.normal, automatic.order, injected, match.rule.Recipe, true,
-	)
-	if selectionErr != nil {
-		return CompactKbuildSelectedTargetEffects{}, false, selectionErr
-	}
+	selections := match.commandTemplates
 	if len(selections) == 0 {
 		return CompactKbuildSelectedTargetEffects{}, false, fmt.Errorf(
 			"Kbuild target %q has no active source-selected command templates", target,
@@ -1155,14 +1182,16 @@ func compactKbuildTargetVariablePrograms(
 	return programs
 }
 
-// compactKbuildProfileTargetEvaluator is the single activation boundary for
-// lazy target evaluation. Make parser callbacks close over the workload's
-// mutable probe scopes, so selecting a captured evaluator must also restore
-// the exact source-ordered process environment attached to that capture.
-func compactKbuildProfileTargetEvaluator(
+// ActivateCompactKbuildProfileTargetProbeEnvironment restores the exact
+// source-ordered process environment captured for one target. Probe evaluators
+// are shared across lazily evaluated profiles, so callers which execute a
+// target-owned probe after evaluating its Make text must re-establish this
+// target boundary explicitly rather than falling back to the invocation's
+// incoming environment.
+func ActivateCompactKbuildProfileTargetProbeEnvironment(
 	profile CompactKbuildProfile,
 	target string,
-) (*kbuildTargetEvaluator, error) {
+) error {
 	graphTarget := compactKbuildGraphTargetPath(target)
 	activate := profile.probeEnvironmentActivation
 	if graphTarget != "" {
@@ -1172,12 +1201,27 @@ func compactKbuildProfileTargetEvaluator(
 	}
 	if activate != nil {
 		if err := activate(); err != nil {
-			return nil, fmt.Errorf(
+			return fmt.Errorf(
 				"activate Kbuild profile %q target %q probe environment: %w",
 				profile.Name, target, err,
 			)
 		}
 	}
+	return nil
+}
+
+// compactKbuildProfileTargetEvaluator is the single activation boundary for
+// lazy target evaluation. Make parser callbacks close over the workload's
+// mutable probe scopes, so selecting a captured evaluator must also restore
+// the exact source-ordered process environment attached to that capture.
+func compactKbuildProfileTargetEvaluator(
+	profile CompactKbuildProfile,
+	target string,
+) (*kbuildTargetEvaluator, error) {
+	if err := ActivateCompactKbuildProfileTargetProbeEnvironment(profile, target); err != nil {
+		return nil, err
+	}
+	graphTarget := compactKbuildGraphTargetPath(target)
 	evaluator := profile.evaluator
 	if graphTarget != "" {
 		if selected := profile.targetEvaluators[graphTarget]; selected != nil {

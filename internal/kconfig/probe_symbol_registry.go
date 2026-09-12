@@ -11,10 +11,24 @@ package kconfig
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
+
+// linuxProbeScopeAdoptionError identifies a dependency graph which cannot be
+// consumed in the selected execution scope. Callers may conservatively abandon
+// an optional projection on this error, while every other probe construction
+// failure remains fatal.
+type linuxProbeScopeAdoptionError struct {
+	token string
+	kind  string
+}
+
+func (e *linuxProbeScopeAdoptionError) Error() string {
+	return fmt.Sprintf("host Linux probe evaluator cannot adopt target-scoped %s %q", e.kind, e.token)
+}
 
 type linuxProbeSymbolRegistry struct {
 	mu          sync.RWMutex
@@ -126,11 +140,19 @@ func (r *linuxProbeSymbolRegistry) publish(token string, symbol linuxProbeSymbol
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if existing, ok := r.symbols[token]; ok && !reflect.DeepEqual(existing, symbol) {
+	if existing, ok := r.symbols[token]; ok && !equalLinuxProbeSymbol(existing, symbol) {
 		return fmt.Errorf("Linux probe symbolic value collision %q", token)
 	}
 	r.symbols[token] = symbol
 	return nil
+}
+
+func equalLinuxProbeSymbol(left, right linuxProbeSymbol) bool {
+	if left.kind == "selection" && right.kind == "selection" {
+		return equalLinuxProbeSelectionInputs(left.selectionInputs, right.selectionInputs) &&
+			slices.Equal(left.selectionValues, right.selectionValues)
+	}
+	return reflect.DeepEqual(left, right)
 }
 
 func (r *linuxProbeSymbolRegistry) lookup(token string) (linuxProbeSymbol, bool) {
@@ -198,7 +220,7 @@ func (e *LinuxProbeEvaluator) adoptSymbolRecursive(token string, state *linuxPro
 			return fmt.Errorf("Linux probe symbolic value %q has invalid result scope %q", token, reference.Scope)
 		}
 		if e.scope == "host" && reference.Scope != "host" {
-			return fmt.Errorf("host Linux probe evaluator cannot adopt target-scoped symbolic value %q", token)
+			return &linuxProbeScopeAdoptionError{token: token, kind: "symbolic value"}
 		}
 		return nil
 	}
@@ -225,11 +247,11 @@ func (e *LinuxProbeEvaluator) adoptSymbolRecursive(token string, state *linuxPro
 			return linuxProbeSymbol{}, false, fmt.Errorf("Linux probe symbolic value %q has invalid toolset-path scope %q", token, scope)
 		}
 		if e.scope == "host" && scope != "host" {
-			return linuxProbeSymbol{}, false, fmt.Errorf("host Linux probe evaluator cannot adopt target-scoped toolset path %q", token)
+			return linuxProbeSymbol{}, false, &linuxProbeScopeAdoptionError{token: token, kind: "toolset path"}
 		}
 	}
 
-	values := []string{symbol.trueText, symbol.falseText}
+	values := []string{symbol.trueText, symbol.falseText, symbol.sourceShellWords}
 	values = append(values, symbol.selectionValues...)
 	if symbol.textTransform != nil {
 		values = append(values, symbol.textTransform.sourceToken)

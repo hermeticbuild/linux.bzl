@@ -657,6 +657,31 @@ func TestAnalyzeCompactKbuildCompilerOutputsHonorsOptionTerminator(t *testing.T)
 	}
 }
 
+func TestAnalyzeCompactKbuildCCompilerRetainsImplicitAndJSONOutputs(t *testing.T) {
+	analysis, err := analyzeCompactKbuildCompilerOutputs(CompactKbuildProfile{}, "cc", []string{
+		"-fstack-usage", "--coverage", "-gsplit-dwarf",
+		"-MJ", "${tree:prep}/metadata/foo.json",
+		"-c", "-o", "${tree:prep}/drivers/foo.o", "drivers/foo.c",
+	}, "drivers/foo.o")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := analysis.PrimaryOutput, "drivers/foo.o"; got != want {
+		t.Fatalf("primary output = %q, want %q", got, want)
+	}
+	if got, want := analysis.PersistentOutputs, []string{
+		"drivers/foo.dwo", "drivers/foo.gcno", "drivers/foo.su", "metadata/foo.json",
+	}; !slices.Equal(got, want) {
+		t.Fatalf("persistent outputs = %#v, want %#v", got, want)
+	}
+	if got, want := analysis.WorkingDirectories, []string{"drivers", "metadata"}; !slices.Equal(got, want) {
+		t.Fatalf("working directories = %#v, want %#v", got, want)
+	}
+	if got, want := analysis.Arguments[4], "${work:root}/metadata/foo.json"; got != want {
+		t.Fatalf("-MJ output argument = %q, want %q", got, want)
+	}
+}
+
 func TestAnalyzeCompactKbuildCompilerOutputsRejectsObjectTreeEscape(t *testing.T) {
 	for _, test := range []struct {
 		role      string

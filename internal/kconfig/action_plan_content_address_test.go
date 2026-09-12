@@ -2,6 +2,7 @@ package kconfig
 
 import (
 	"encoding/base64"
+	"fmt"
 	"reflect"
 	"slices"
 	"strconv"
@@ -466,4 +467,322 @@ func TestContentAddressActionPlanNodesRewritesSelectedDependencyEdges(t *testing
 	if _, err := plan.entries(); err != nil {
 		t.Fatalf("content-addressed selected graph is invalid: %v", err)
 	}
+}
+
+func TestContentAddressActionPlanNodesSharedPersistentRoots(t *testing.T) {
+	plan := contentAddressSharedRootsTestPlan(t, false)
+	before := cloneActionPlanNodes(plan.Nodes)
+	oldStore := plan.inputSetStore
+	nodes := make(map[string]ActionPlanNode, len(plan.Nodes))
+	for _, node := range plan.Nodes {
+		nodes[node.ID] = node
+	}
+	if err := validateActionPlanAcyclic(nodes, oldStore); err != nil {
+		t.Fatalf("shared persistent-root DAG rejected: %v", err)
+	}
+	if err := contentAddressActionPlanNodes(plan); err != nil {
+		t.Fatal(err)
+	}
+	finalIDs := make(map[string]string, len(before))
+	for index, oldNode := range before {
+		node := plan.Nodes[index]
+		if node.ID != node.ContentID() || node.ID == oldNode.ID {
+			t.Fatalf("node %s was not content-addressed: got %s", oldNode.ID, node.ID)
+		}
+		finalIDs[oldNode.ID] = node.ID
+	}
+	for index, oldNode := range before {
+		node := plan.Nodes[index]
+		for ordinal, input := range oldNode.Inputs {
+			if got, want := node.Inputs[ordinal].ProducerID, finalIDs[input.ProducerID]; got != want {
+				t.Fatalf("node %s input %d producer = %s, want %s", oldNode.ID, ordinal, got, want)
+			}
+		}
+		if oldNode.InputSet == "" {
+			continue
+		}
+		// Rebuild each expected root independently, without the shared mapper.
+		// This verifies exact canonical content as well as producer substitution.
+		var entries []ActionPlanInputSetEntry
+		if err := oldStore.Walk(oldNode.InputSet, func(entry ActionPlanInputSetEntry) error {
+			if entry.ProducerID != "" {
+				entry.ProducerID = finalIDs[entry.ProducerID]
+			}
+			entries = append(entries, entry)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		wantRoot := actionPlanInputSetTestInsert(t, NewActionPlanInputSetStore(), "", entries)
+		if node.InputSet != wantRoot {
+			t.Fatalf("node %s root = %s, want independently rebuilt %s", oldNode.ID, node.InputSet, wantRoot)
+		}
+	}
+	if _, err := plan.entries(); err != nil {
+		t.Fatalf("addressed shared-root plan is invalid: %v", err)
+	}
+}
+
+func TestActionPlanCombinedGraphRejectsMixedCycles(t *testing.T) {
+	for _, throughInputSet := range []bool{false, true} {
+		name, wantError := "action back edge", "cycle at"
+		if throughInputSet {
+			name, wantError = "input-set back edge", "cycle through input-set node"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newPlanningActionPlanInputSetStore()
+			producer := "a"
+			if throughInputSet {
+				producer = "c"
+			}
+			root := actionPlanInputSetTestInsert(t, store, "", []ActionPlanInputSetEntry{{
+				Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "generated.h"},
+				ProducerID: producer,
+			}})
+			nodes := []ActionPlanNode{
+				{ID: "a", Inputs: []ActionPlanNodeEdge{{Role: "dependency", ProducerID: "b"}}},
+				{ID: "b", InputSet: root},
+			}
+			if throughInputSet {
+				// a -> root -> c -> b -> root revisits a live trie vertex.
+				nodes[0].Inputs = nil
+				nodes[0].InputSet = root
+				nodes = append(nodes, ActionPlanNode{ID: "c", Inputs: []ActionPlanNodeEdge{{Role: "dependency", ProducerID: "b"}}})
+			}
+			byID := make(map[string]ActionPlanNode, len(nodes))
+			for _, node := range nodes {
+				byID[node.ID] = node
+			}
+			if err := validateActionPlanAcyclic(byID, store); err == nil || !strings.Contains(err.Error(), wantError) {
+				t.Fatalf("acyclic validation error = %v, want %q", err, wantError)
+			}
+			plan := &ActionPlan{Nodes: cloneActionPlanNodes(nodes), inputSetStore: store}
+			if err := contentAddressActionPlanNodes(plan); err == nil || !strings.Contains(err.Error(), wantError) {
+				t.Fatalf("content addressing error = %v, want %q", err, wantError)
+			}
+			if !reflect.DeepEqual(plan.Nodes, nodes) {
+				t.Fatal("cycle rejection partially rewrote the graph")
+			}
+		})
+	}
+}
+
+func TestActionPlanCombinedGraphSeparatesActionAndInputSetIDs(t *testing.T) {
+	plan, recipeID := contentAddressTestPlan(t)
+	entry := ActionPlanInputSetEntry{
+		Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "source.h"},
+		SourceID: "src-00000001",
+	}
+	root := actionPlanInputSetTestInsert(t, plan.inputSetStore, "", []ActionPlanInputSetEntry{entry})
+	// A provisional action ID can equal a canonical trie digest without any
+	// cryptographic collision: the two IDs belong to different namespaces.
+	node := contentAddressTestNode("consumer", recipeID)
+	node.ID, node.InputSet = root, root
+	plan.Nodes = []ActionPlanNode{node}
+	plan.Sources = []ActionPlanSource{{ID: entry.SourceID, Namespace: "kernel", Path: entry.Target.Path}}
+	if err := validateActionPlanAcyclic(map[string]ActionPlanNode{root: node}, plan.inputSetStore); err != nil {
+		t.Fatalf("action/trie ID alias mistaken for a cycle: %v", err)
+	}
+	if err := contentAddressActionPlanNodes(plan); err != nil {
+		t.Fatalf("addressing action/trie ID alias: %v", err)
+	}
+	if got := plan.Nodes[0]; got.ID != node.ContentID() || got.InputSet != root {
+		t.Fatalf("alias changed content: action ID %s, input-set ID %s", got.ID, got.InputSet)
+	}
+	if _, err := plan.entries(); err != nil {
+		t.Fatalf("addressed alias fixture is invalid: %v", err)
+	}
+}
+
+func TestContentAddressActionPlanNodesCanonicalAcrossPlanningOrder(t *testing.T) {
+	forward := contentAddressSharedRootsTestPlan(t, false)
+	reverse := contentAddressSharedRootsTestPlan(t, true)
+	for _, plan := range []*ActionPlan{forward, reverse} {
+		if err := contentAddressActionPlanNodes(plan); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !reflect.DeepEqual(forward.InputSets, reverse.InputSets) {
+		t.Fatal("insertion order or provisional IDs changed canonical input-set content")
+	}
+	want, err := forward.entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reverse.entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatal("node order, insertion order, or provisional IDs changed canonical marker paths/data")
+	}
+	if err := contentAddressActionPlanNodes(forward); err != nil {
+		t.Fatalf("readdressing canonical plan: %v", err)
+	}
+	again, err := forward.entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(again, want) {
+		t.Fatal("content addressing is not idempotent")
+	}
+}
+
+func contentAddressTestPlan(t testing.TB) (*ActionPlan, string) {
+	t.Helper()
+	recipe := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "cc",
+		Arguments: []string{"-o", "${output:00000000}"}, Outputs: []string{"00000000"},
+	}
+	id, err := recipe.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &ActionPlan{
+		Toolsets:      map[string]string{"target": actionPlanTestProbeIdentity},
+		Recipes:       map[string]ActionRecipe{id: recipe},
+		inputSetStore: newPlanningActionPlanInputSetStore(),
+	}, id
+}
+
+func contentAddressTestNode(name, recipeID string) ActionPlanNode {
+	return ActionPlanNode{
+		ID: name, Stage: "target", Kind: "generate", Recipe: recipeID,
+		Tool: "cc", Product: "vmlinux",
+		Outputs: []ActionPlanOutput{{Tree: "objects", Path: name + ".o"}},
+	}
+}
+
+func contentAddressSharedRootsTestPlan(t *testing.T, reverse bool) *ActionPlan {
+	t.Helper()
+	plan, recipeID := contentAddressTestPlan(t)
+	provisionalPrefix := "forward-"
+	if reverse {
+		provisionalPrefix = "reverse-"
+	}
+	addNode := func(name, root string) ActionPlanNode {
+		node := contentAddressTestNode(name, recipeID)
+		node.ID = provisionalPrefix + name
+		node.InputSet = root
+		plan.Nodes = append(plan.Nodes, node)
+		return node
+	}
+	entries := make([]ActionPlanInputSetEntry, 48)
+	for index := range entries {
+		node := addNode(fmt.Sprintf("producer-%04d", index), "")
+		entries[index] = ActionPlanInputSetEntry{
+			Target:      ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: node.Outputs[0].Path},
+			ProducerID:  node.ID,
+			CompilerUse: index%2 == 0, AuxiliaryUse: index%6 == 0,
+		}
+	}
+	if reverse {
+		slices.Reverse(entries)
+	}
+	root := actionPlanInputSetTestInsert(t, plan.inputSetStore, "", entries)
+	first := addNode("first", root)
+	sibling := addNode("sibling", root)
+	extendedRoot := actionPlanInputSetTestInsert(t, plan.inputSetStore, root, []ActionPlanInputSetEntry{{
+		Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: first.Outputs[0].Path},
+		ProducerID: first.ID,
+	}})
+	if actionPlanInputSetTestSharedRootChildren(t, plan.inputSetStore, root, extendedRoot) == 0 {
+		t.Fatal("fixture must share persistent radix subtrees, not only whole roots")
+	}
+	extended := addNode("extended", extendedRoot)
+	join := addNode("join", root)
+	join.Inputs = []ActionPlanNodeEdge{
+		{Role: "dependency", ProducerID: extended.ID},
+		{Role: "dependency", ProducerID: sibling.ID},
+	}
+	joinRecipe := cloneActionRecipe(plan.Recipes[recipeID])
+	joinRecipe.Inputs = []string{"dependency:00000000", "dependency:00000001"}
+	joinRecipe.Arguments = append(joinRecipe.Arguments, "${input:dependency:00000000}", "${input:dependency:00000001}")
+	var err error
+	join.Recipe, err = joinRecipe.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Recipes[join.Recipe] = joinRecipe
+	plan.Nodes[len(plan.Nodes)-1] = join
+	if reverse {
+		slices.Reverse(plan.Nodes)
+	}
+	return plan
+}
+
+func BenchmarkContentAddressActionPlanNodesCumulativeRoots(b *testing.B) {
+	for _, count := range []int{500, 1000, 2000} {
+		b.Run(strconv.Itoa(count), func(b *testing.B) {
+			template := contentAddressCumulativeRootsTestPlan(b, count)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for index := 0; index < b.N; index++ {
+				// Exclude fixture cloning and canonical store import; measure the
+				// combined graph traversal, remapping, and reachable-node export.
+				b.StopTimer()
+				plan := *template
+				plan.Nodes = cloneActionPlanNodes(template.Nodes)
+				plan.inputSetStore = nil
+				if _, err := plan.planningActionPlanInputSetStore(); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+				if err := contentAddressActionPlanNodes(&plan); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkConfigDependencyAnalysisCumulativeRoots(b *testing.B) {
+	for _, count := range []int{500, 1000, 2000} {
+		b.Run(strconv.Itoa(count), func(b *testing.B) {
+			plan := contentAddressCumulativeRootsTestPlan(b, count)
+			// Fixture construction is excluded. Measure both construction of the
+			// retained structural witnesses and their validation during ID lookup.
+			b.ReportAllocs()
+			b.ResetTimer()
+			for index := 0; index < b.N; index++ {
+				analysis, err := BuildActionPlanConfigDependencyAnalysis(plan)
+				if err != nil {
+					b.Fatal(err)
+				}
+				byID, err := analysis.ByNodeID(plan)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(byID) != count {
+					b.Fatalf("analyzed %d actions, want %d", len(byID), count)
+				}
+			}
+		})
+	}
+}
+
+func contentAddressCumulativeRootsTestPlan(t testing.TB, count int) *ActionPlan {
+	t.Helper()
+	plan, recipeID := contentAddressTestPlan(t)
+	root := ""
+	for index := 0; index < count; index++ {
+		node := contentAddressTestNode(fmt.Sprintf("generated-%04d", index), recipeID)
+		// Serialized stores require digest-shaped producer IDs. Each root
+		// contains every earlier action's actual generated provenance.
+		node.ID = actionPlanInputSetTestDigest(node.ID)
+		node.InputSet = root
+		plan.Nodes = append(plan.Nodes, node)
+		var err error
+		root, err = plan.inputSetStore.Insert(root, ActionPlanInputSetEntry{
+			Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: node.Outputs[0].Path},
+			ProducerID: node.ID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := plan.exportReachableActionPlanInputSets(); err != nil {
+		t.Fatal(err)
+	}
+	return plan
 }

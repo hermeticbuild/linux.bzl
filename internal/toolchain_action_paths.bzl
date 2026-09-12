@@ -145,40 +145,39 @@ def _select_next_path(value, cursor, paths, kind, selected):
     for path, item in paths.items():
         start = -1
         search_cursor = cursor
-        exhausted = False
         for _index in range(len(value) + 1):
-            if start < 0 and not exhausted:
-                candidate_start = value.find(path, search_cursor)
-                if candidate_start < 0:
-                    exhausted = True
-                elif _path_occurrence(
-                    value,
-                    candidate_start,
-                    path,
-                    # Repository rules may expose an opaque source directory
-                    # as one source File (for example a prebuilt Clang
-                    # resource root) even though File.is_directory is false.
-                    # Its exact typed path still owns descendants in the
-                    # sandbox; generated regular files do not.
-                    kind == "output_directory" or (kind == "artifact" and (item.is_directory or item.is_source)),
-                    kind == "artifact" and not item.is_directory,
-                ):
-                    start = candidate_start
-                else:
-                    search_cursor = candidate_start + 1
-        candidate = struct(
-            artifact = item if kind == "artifact" else None,
-            kind = kind,
-            path = path,
-            start = start,
-        )
-        if start >= 0 and (
+            candidate_start = value.find(path, search_cursor)
+            if candidate_start < 0:
+                break
+            if _path_occurrence(
+                value,
+                candidate_start,
+                path,
+                # Repository rules may expose an opaque source directory
+                # as one source File (for example a prebuilt Clang
+                # resource root) even though File.is_directory is false.
+                # Its exact typed path still owns descendants in the
+                # sandbox; generated regular files do not.
+                kind == "output_directory" or (kind == "artifact" and (item.is_directory or item.is_source)),
+                kind == "artifact" and not item.is_directory,
+            ):
+                start = candidate_start
+                break
+            search_cursor = candidate_start + 1
+        if start < 0:
+            continue
+        if (
             selected == None or
             start < selected.start or
             (start == selected.start and len(path) > len(selected.path)) or
             (start == selected.start and len(path) == len(selected.path) and _path_priority(kind) > _path_priority(selected.kind))
         ):
-            selected = candidate
+            selected = struct(
+                artifact = item if kind == "artifact" else None,
+                kind = kind,
+                path = path,
+                start = start,
+            )
     return selected
 
 def _next_path(value, cursor, index):
@@ -193,26 +192,25 @@ def render_toolchain_action_value(value, path_index):
     fragments = []
     cursor = 0
     substituted = False
-    exhausted = False
     for _index in range(len(value) + 1):
-        if cursor < len(value) and not exhausted:
-            selected = _next_path(value, cursor, path_index)
-            if selected == None:
-                exhausted = True
-            else:
-                if selected.start > cursor:
-                    fragments.append(value[cursor:selected.start])
-                if selected.kind == "output_directory":
-                    fail("configured toolchain action value %r references generated directory %r only through descendant artifacts; the selected toolchain must expose that directory as an exact File or TreeArtifact for path-mapped execution" % (
-                        value,
-                        selected.path,
-                    ))
-                fragments.extend([
-                    EXECUTION_ROOT_MARKER + "/",
-                    selected.artifact if selected.kind == "artifact" else selected.path,
-                ])
-                cursor = selected.start + len(selected.path)
-                substituted = True
+        if cursor >= len(value):
+            break
+        selected = _next_path(value, cursor, path_index)
+        if selected == None:
+            break
+        if selected.start > cursor:
+            fragments.append(value[cursor:selected.start])
+        if selected.kind == "output_directory":
+            fail("configured toolchain action value %r references generated directory %r only through descendant artifacts; the selected toolchain must expose that directory as an exact File or TreeArtifact for path-mapped execution" % (
+                value,
+                selected.path,
+            ))
+        fragments.extend([
+            EXECUTION_ROOT_MARKER + "/",
+            selected.artifact if selected.kind == "artifact" else selected.path,
+        ])
+        cursor = selected.start + len(selected.path)
+        substituted = True
     if cursor < len(value):
         fragments.append(value[cursor:])
     if not fragments:
@@ -225,25 +223,24 @@ def canonicalize_toolchain_action_value(value, path_index):
         fail("configured toolchain action value contains reserved execution-root marker")
     fragments = []
     cursor = 0
-    exhausted = False
     for _index in range(len(value) + 1):
-        if cursor < len(value) and not exhausted:
-            selected = _next_path(value, cursor, path_index)
-            if selected == None:
-                exhausted = True
-            else:
-                if selected.start > cursor:
-                    fragments.append(value[cursor:selected.start])
-                if selected.kind == "output_directory":
-                    fail("configured toolchain action value %r references generated directory %r only through descendant artifacts; the selected toolchain must expose that directory as an exact File or TreeArtifact for path-mapped execution" % (
-                        value,
-                        selected.path,
-                    ))
-                if selected.kind == "artifact":
-                    fragments.append(_canonical_file_path(selected.artifact, "toolchain action-contract artifact"))
-                else:
-                    fragments.append(path_index.source_directories[selected.path])
-                cursor = selected.start + len(selected.path)
+        if cursor >= len(value):
+            break
+        selected = _next_path(value, cursor, path_index)
+        if selected == None:
+            break
+        if selected.start > cursor:
+            fragments.append(value[cursor:selected.start])
+        if selected.kind == "output_directory":
+            fail("configured toolchain action value %r references generated directory %r only through descendant artifacts; the selected toolchain must expose that directory as an exact File or TreeArtifact for path-mapped execution" % (
+                value,
+                selected.path,
+            ))
+        if selected.kind == "artifact":
+            fragments.append(_canonical_file_path(selected.artifact, "toolchain action-contract artifact"))
+        else:
+            fragments.append(path_index.source_directories[selected.path])
+        cursor = selected.start + len(selected.path)
     if cursor < len(value):
         fragments.append(value[cursor:])
     return "".join(fragments)
