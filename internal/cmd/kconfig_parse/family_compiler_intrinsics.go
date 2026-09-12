@@ -136,6 +136,8 @@ func (p *familyCompilerGuardPipeline) observeIntrinsicCalls(value kconfig.Config
 		// overflow discards discovery before constructing mandatory actions.
 		if p.exceedsLimit("query_membership_limit", p.count, maxFamilyCompilerGuardMemberships) ||
 			p.exceedsLimit("context_limit", len(p.contexts), maxFamilyCompilerGuardQueries) ||
+			p.exceedsLimit("string_limit", len(p.contextStrings), maxFamilyCompilerGuardStrings) ||
+			p.exceedsLimit("reference_limit", p.contextReferences, maxFamilyCompilerGuardReferences) ||
 			p.exceedsLimit("intrinsic_value_limit", p.callCount, maxFamilyCompilerIntrinsicCalls) ||
 			p.exceedsLimit("estimated_bytes_limit", p.bytes, maxFamilyCompilerGuardBytes/2) ||
 			p.exceedsLimit("expanded_bytes_limit", p.expandedBytes, maxFamilyCompilerGuardExpandedBytes) ||

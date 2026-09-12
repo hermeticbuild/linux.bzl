@@ -164,6 +164,48 @@ func TestCompilerIntrinsicInitialWitnessRequiresMeasuredNontextualBinding(t *tes
 	}
 }
 
+func TestFeatureIntrinsicWitnessUsesMeasuredAnswersAndOrdinaryFallbacks(t *testing.T) {
+	for _, operator := range []string{"__has_feature", "__has_extension"} {
+		for _, token := range []string{"0", "1"} {
+			t.Run(operator+"/"+token, func(t *testing.T) {
+				state := compilerIntrinsicStateWithDefinitionsForTest(t, "",
+					map[string]bool{operator: true, "address_sanitizer": false})
+				calls := 0
+				proof := &configDependencyCallCoverage{intrinsic: func(call CompilerIntrinsicCall) (string, string, string) {
+					calls++
+					if call != (CompilerIntrinsicCall{operator, "address_sanitizer"}) {
+						t.Fatalf("unexpected feature request %#v", call)
+					}
+					return token, "independent-measured-answer-" + token, ""
+				}}
+				value, reason := proof.condition(operator+"(address_sanitizer)", state)
+				want := configDependencyMacroUndefined
+				if token == "1" {
+					want = configDependencyMacroDefined
+				}
+				if reason != "" || value != want || calls != 1 || len(proof.intrinsics) != 1 {
+					t.Fatalf("feature answer = %v/%q, calls=%d, witnesses=%v", value, reason, calls, proof.intrinsics)
+				}
+				// A source fallback is an ordinary function macro, even when
+				// the selected compiler also has a builtin with this name.
+				state.setSourceMacroReplacement(operator+"(x) 0", "source-fallback", configDependencyMacroDefined)
+				binding, reason := state.resolveMacroCall(operator)
+				if reason != "" || binding.intrinsic != nil {
+					t.Fatalf("source replacement kept builtin authority: %#v/%q", binding, reason)
+				}
+				proof = &configDependencyCallCoverage{intrinsic: func(CompilerIntrinsicCall) (string, string, string) {
+					t.Fatal("ordinary source fallback reached compiler oracle")
+					return "", "", ""
+				}}
+				value, reason = proof.condition(operator+"(address_sanitizer)", state)
+				if reason != "" || value != configDependencyMacroUndefined {
+					t.Fatalf("source fallback = %v/%q", value, reason)
+				}
+			})
+		}
+	}
+}
+
 func TestCompilerIntrinsicWitnessRevokedByEveryOrderedWrite(t *testing.T) {
 	for name, mutate := range map[string]func(*configDependencyMacroState){
 		"undef":            func(s *configDependencyMacroState) { s.set("__has_attribute", configDependencyMacroUndefined) },

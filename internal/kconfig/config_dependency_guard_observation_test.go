@@ -17,6 +17,14 @@ func TestConfigDependencyOptionalDefinednessObservesOnlyFirstExpandedUnknown(t *
 		name, source, demand string
 	}{
 		{"first failure", "__FIRST __SECOND\n", "__FIRST"},
+		{"defined operand", "#if defined(__CONDITION)\n0\n#endif\n", "__CONDITION"},
+		{"bare defined operand", "#if defined __CONDITION\n0\n#endif\n", "__CONDITION"},
+		{"ifdef operand", "#ifdef __CONDITION\n0\n#endif\n", "__CONDITION"},
+		{"ifndef operand", "#ifndef __CONDITION\n0\n#endif\n", "__CONDITION"},
+		{"inactive defined operand", "#if 0\n#if defined(__INACTIVE)\n0\n#endif\n#endif\n", ""},
+		{"defined local operand", "#define __LOCAL 1\n#if defined(__LOCAL)\n0\n#endif\n", ""},
+		{"undefined local operand", "#undef __REMOVED\n#if defined(__REMOVED)\n0\n#endif\n", ""},
+		{"protected defined replacement", "#define __KNOWN __NOT_EXPANDED\n#if defined(__KNOWN)\n0\n#endif\n", ""},
 		{"wrapper prescan", "#define ID(x) x\nID(__WRAPPED)\n", "__WRAPPED"},
 		{"pasted name", "#define JOIN(a,b) a ## b\nJOIN(__PA,STED)\n", "__PASTED"},
 		{"variadic substitution", "#define V(first, ...) __VA_ARGS__\nV(0, __VARIADIC)\n", "__VARIADIC"},

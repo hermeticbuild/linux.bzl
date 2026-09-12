@@ -357,6 +357,62 @@ func (cut *ActionPlanFamilyExecutionCut) ObserveArtifacts(stores map[string]stri
 	return observeExecutedArtifacts(cut, stores, MaxActionPlanFamilyExecutedArtifactBytes, MaxActionPlanFamilyExecutedArtifactsBytes)
 }
 
+// ObserveHeaders projects bytes already read from the complete execution cut.
+// A known literal header can be a transitive cut output without being an
+// unresolved-header root. Its consumer still needs the normal precise scanner
+// receipt and exact producer/slot proof before replacing a pinned dependency.
+// This neither executes extra generators nor interprets sidecar/config outputs
+// as ordinary headers. The original cut and every pinned allocation stay intact.
+func (observed *ActionPlanFamilyExecutedArtifacts) ObserveHeaders() (*ActionPlanFamilyObservedHeaders, error) {
+	if observed == nil || observed.cut == nil || observed.cut.ID() != observed.cutID {
+		return nil, fmt.Errorf("executed header projection requires a sealed execution")
+	}
+	if _, err := observed.cut.CanonicalJSON(); err != nil {
+		return nil, err
+	}
+	result := &ActionPlanFamilyObservedHeaders{
+		cutID: observed.cutID, headers: []ActionPlanFamilyObservedHeader{},
+		contents: map[string][]byte{}, modes: map[string]uint32{}, allExecutedOutputs: true,
+	}
+	total := 0
+	for _, output := range observed.cut.Outputs() {
+		if output.Output.ObservedPath != "" || configDependencyCompletedResolvedProjection(output.Output.Path) {
+			continue
+		}
+		key := ActionPlanFamilyExecutionCutRoot{NodeID: output.NodeID, Slot: output.Slot}
+		artifact, found := observed.outputs[key]
+		content, haveContent := observed.contents[artifact.contentID]
+		mode, haveMode := observed.modes[artifact.contentID]
+		if !found || artifact.output != output || !haveContent || !haveMode ||
+			executedArtifactContentID(content, mode) != artifact.contentID {
+			return nil, fmt.Errorf("executed header projection changed its authenticated output")
+		}
+		if len(content) > MaxActionPlanFamilyObservedHeaderBytes || len(content) > MaxActionPlanFamilyObservedHeadersBytes-total {
+			return nil, fmt.Errorf("executed header projection exceeds observation budget")
+		}
+		total += len(content)
+		id := observedHeaderContentID(content, mode)
+		if previous, exists := result.contents[id]; exists {
+			if !bytes.Equal(previous, content) || result.modes[id] != mode {
+				return nil, fmt.Errorf("executed header projection content identity collision")
+			}
+		} else {
+			// The executed artifact catalog owns immutable bytes. Public access
+			// remains defensive; retaining this backing storage avoids a second
+			// complete copy of already bounded observations.
+			result.contents[id], result.modes[id] = content, mode
+		}
+		result.headers = append(result.headers, ActionPlanFamilyObservedHeader{
+			NodeID: output.NodeID, Slot: output.Slot, Output: output.Output,
+			ContentID: id, ExecutableMode: mode,
+		})
+	}
+	if err := observed.verifyHeaders(result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // Header and artifact projections must describe the same completed stores.
 // Reusing a cut ID with bytes observed from another execution is not authority.
 func (observed *ActionPlanFamilyExecutedArtifacts) verifyHeaders(headers *ActionPlanFamilyObservedHeaders) error {
@@ -371,8 +427,19 @@ func (observed *ActionPlanFamilyExecutedArtifacts) verifyHeaders(headers *Action
 	for _, output := range observed.cut.Outputs() {
 		sealed[ActionPlanFamilyExecutionCutRoot{NodeID: output.NodeID, Slot: output.Slot}] = output
 	}
-	if len(headers.headers) != len(roots) {
-		return fmt.Errorf("executed header projection lost selected roots")
+	expected := map[ActionPlanFamilyExecutionCutRoot]bool{}
+	for _, root := range roots {
+		expected[root] = true
+	}
+	if headers.allExecutedOutputs {
+		for key, output := range sealed {
+			if output.Output.ObservedPath == "" && !configDependencyCompletedResolvedProjection(output.Output.Path) {
+				expected[key] = true
+			}
+		}
+	}
+	if len(headers.headers) != len(expected) {
+		return fmt.Errorf("executed header projection lost its selected output set")
 	}
 	byRoot := map[ActionPlanFamilyExecutionCutRoot]ActionPlanFamilyObservedHeader{}
 	for _, header := range headers.headers {
@@ -380,9 +447,12 @@ func (observed *ActionPlanFamilyExecutedArtifacts) verifyHeaders(headers *Action
 		if _, duplicate := byRoot[key]; duplicate {
 			return fmt.Errorf("executed header projection repeats an output")
 		}
+		if !expected[key] {
+			return fmt.Errorf("executed header projection contains an unselected output")
+		}
 		byRoot[key] = header
 	}
-	for _, root := range roots {
+	for root := range expected {
 		artifact, haveArtifact := observed.outputs[root]
 		output, haveOutput := sealed[root]
 		header, haveHeader := byRoot[root]
@@ -392,6 +462,7 @@ func (observed *ActionPlanFamilyExecutedArtifacts) verifyHeaders(headers *Action
 		headerMode, haveHeaderMode := headers.modes[header.ContentID]
 		if !haveArtifact || !haveOutput || !haveHeader || !haveContent || !haveMode || !haveHeaderContent || !haveHeaderMode ||
 			artifact.output != output || header.Output != output.Output || header.Output.ObservedPath != "" ||
+			configDependencyCompletedResolvedProjection(header.Output.Path) ||
 			executedArtifactContentID(content, mode) != artifact.contentID ||
 			observedHeaderContentID(content, mode) != header.ContentID ||
 			header.ExecutableMode != mode || headerMode != mode || !bytes.Equal(content, headerContent) {

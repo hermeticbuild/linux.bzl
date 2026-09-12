@@ -100,22 +100,14 @@ func (g *compactKbuildSelectionGraph) compactKbuildSideOutputStateGraph(
 	if g == nil || metadata == nil {
 		return compactKbuildSideOutputStateGraph{}, fmt.Errorf("cannot project side-output state without selections and metadata")
 	}
-	candidateSet := map[compactKbuildSelectionKey]bool{}
-	ordered := make([]compactKbuildSelectionKey, 0, len(candidates))
-	for _, candidate := range candidates {
-		candidate = g.compactKbuildGroupedSelectionRepresentative(candidate)
-		if _, exists := g.selections[candidate]; !exists {
-			return compactKbuildSideOutputStateGraph{}, fmt.Errorf("side-output state candidate %s is not selected", compactKbuildSelectionKeyString(candidate))
-		}
-		if candidateSet[candidate] {
-			continue
-		}
-		candidateSet[candidate] = true
-		ordered = append(ordered, candidate)
+	ordered, err := g.canonicalSideOutputCandidates(candidates)
+	if err != nil {
+		return compactKbuildSideOutputStateGraph{}, err
 	}
-	sort.Slice(ordered, func(i, j int) bool {
-		return compactKbuildSelectionKeyLess(ordered[i], ordered[j])
-	})
+	candidateSet := make(map[compactKbuildSelectionKey]bool, len(ordered))
+	for _, candidate := range ordered {
+		candidateSet[candidate] = true
+	}
 	result := compactKbuildSideOutputStateGraph{
 		parents: make(map[compactKbuildSelectionKey][]compactKbuildSelectionKey, len(ordered)),
 	}

@@ -1581,6 +1581,10 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 		ancestor   string
 	}
 	lineage := map[producerLineage]bool{}
+	// Dependency materialization above is complete. Share adjacency reads for
+	// this call only instead of flattening and sorting every input set again
+	// for each ancestor pair. Retain at most 32K records/references.
+	producerTraversal := actionPlanProducerTraversal{plan: b.plan, remaining: 1 << 15}
 	var lineageInputErr error
 	producerDescendsFrom := func(descendant, ancestor string) bool {
 		key := producerLineage{descendant: descendant, ancestor: ancestor}
@@ -1605,7 +1609,7 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 			if !ok {
 				continue
 			}
-			producers, err := b.plan.actionPlanNodeProducerIDs(node)
+			producers, err := producerTraversal.producers(node)
 			if err != nil {
 				lineageInputErr = err
 				return false

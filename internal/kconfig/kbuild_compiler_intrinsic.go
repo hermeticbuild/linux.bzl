@@ -19,7 +19,8 @@ type CompilerIntrinsicCall struct {
 // This is an admitted operator grammar, not a compiler capability table.
 // Availability and results must be measured independently for each operator.
 func isCompilerIntrinsicOperator(name string) bool {
-	return name == "__has_attribute" || name == "__has_builtin"
+	return name == "__has_attribute" || name == "__has_builtin" ||
+		name == "__has_feature" || name == "__has_extension"
 }
 
 // ValidateCompilerIntrinsicCall accepts the supported call grammar, never a

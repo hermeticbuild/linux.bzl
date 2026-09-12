@@ -87,23 +87,16 @@ func (inventory *configDependencyGuardInventory) names(profile CompactKbuildProf
 				if len(names) >= configDependencyGuardInventoryMaximumNames {
 					break
 				}
-				line := strings.TrimSpace(original)
-				if strings.HasPrefix(line, "%:") {
-					line = "#" + line[2:]
-				}
-				if !strings.HasPrefix(line, "#") {
-					continue
-				}
-				fields := strings.Fields(strings.TrimSpace(line[1:]))
-				if len(fields) != 2 || fields[0] != "ifndef" && fields[0] != "ifdef" {
-					continue
-				}
-				name, valid := configDependencyMacroIdentifier(fields[1])
-				// Ordinary absent names already have a definedness answer. The
-				// reserved namespace is intentionally Unknown after a plain -dM.
-				if valid && name == fields[1] && strings.HasPrefix(name, "_") && !names[name] {
-					// Identifier substrings must not retain whole file prefixes.
-					names[strings.Clone(name)] = true
+				for _, name := range configDependencyCompilerDirectiveDefinedHints(original) {
+					// Inventory syntax is only a query hint. The compiler still
+					// supplies every positive and negative initial fact.
+					if len(names) >= configDependencyGuardInventoryMaximumNames {
+						break
+					}
+					if strings.HasPrefix(name, "_") && !names[name] {
+						// Do not retain the whole source prefix behind a short name.
+						names[strings.Clone(name)] = true
+					}
 				}
 			}
 			return nil

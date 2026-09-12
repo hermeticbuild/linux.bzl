@@ -87,7 +87,8 @@ type familyCompilerGuardWireManifest struct {
 	Round     int
 	Previous  []string
 	Toolsets  map[string]string
-	Contexts  map[string]familyCompilerGuardContext
+	Strings   []string
+	Contexts  map[string]familyCompilerGuardPackedContext
 	Variants  map[string][]familyCompilerGuardWireQuery
 	PlanID    string
 	Truncated bool
@@ -98,8 +99,9 @@ type familyCompilerGuardWireManifest struct {
 func marshalFamilyCompilerGuardManifest(m familyCompilerGuardManifest) ([]byte, error) {
 	wire := familyCompilerGuardWireManifest{
 		Schema: m.Schema, Round: m.Round, Previous: m.Previous, Toolsets: m.Toolsets,
-		Contexts: map[string]familyCompilerGuardContext{}, PlanID: m.PlanID, Truncated: m.Truncated,
+		PlanID: m.PlanID, Truncated: m.Truncated,
 	}
+	contexts := map[string]familyCompilerGuardContext{}
 	if m.Variants != nil {
 		wire.Variants = make(map[string][]familyCompilerGuardWireQuery, len(m.Variants))
 	}
@@ -114,14 +116,14 @@ func marshalFamilyCompilerGuardManifest(m familyCompilerGuardManifest) ([]byte, 
 				return nil, err
 			}
 			id := context.id()
-			if previous, found := wire.Contexts[id]; found {
+			if previous, found := contexts[id]; found {
 				if !equalFamilyCompilerGuardContexts(previous, context) {
 					return nil, fmt.Errorf("compiler guard context ID has contradictory contents")
 				}
 			} else {
 				// These are temporary read-only views used by synchronous JSON
 				// encoding, not retained copies of the caller's compiler scopes.
-				wire.Contexts[id] = context
+				contexts[id] = context
 			}
 			entries[index] = familyCompilerGuardWireQuery{
 				Context: id, Kind: query.Kind, Names: query.Names, Calls: query.Calls,
@@ -129,6 +131,7 @@ func marshalFamilyCompilerGuardManifest(m familyCompilerGuardManifest) ([]byte, 
 		}
 		wire.Variants[name] = entries
 	}
+	wire.Strings, wire.Contexts = packFamilyCompilerGuardContexts(contexts)
 	return json.Marshal(wire)
 }
 
@@ -167,13 +170,9 @@ func unmarshalFamilyCompilerGuardManifest(data []byte) (*familyCompilerGuardMani
 	if len(wire.Contexts) > maxFamilyCompilerGuardQueries {
 		return nil, fmt.Errorf("compiler guard context table exceeds its budget")
 	}
-	for id, context := range wire.Contexts {
-		if err := context.validate(); err != nil {
-			return nil, err
-		}
-		if !validFamilyCompilerGuardContextID(id) || context.id() != id {
-			return nil, fmt.Errorf("compiler guard context table has an invalid content ID")
-		}
+	contexts, err := unpackFamilyCompilerGuardContexts(wire.Strings, wire.Contexts)
+	if err != nil {
+		return nil, err
 	}
 	memberships := 0
 	used := make(map[string]bool, len(wire.Contexts))
@@ -208,7 +207,7 @@ func unmarshalFamilyCompilerGuardManifest(data []byte) (*familyCompilerGuardMani
 			queries = make([]familyCompilerGuardQuery, len(entries))
 		}
 		for index, entry := range entries {
-			queries[index] = wire.Contexts[entry.Context].bind(familyCompilerGuardQuery{
+			queries[index] = contexts[entry.Context].bind(familyCompilerGuardQuery{
 				Kind: entry.Kind, Names: entry.Names, Calls: entry.Calls,
 			})
 		}

@@ -7,6 +7,7 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "kconfig_parse_lib",
     srcs = [
+        "family_compiler_guard_dictionary.go",
         "family_compiler_guard_transport.go",
         "family_compiler_guards.go",
         "family_compiler_intrinsics.go",
@@ -55,6 +56,7 @@ go_test(
     srcs = [
         "deferred_content_selection_test.go",
         "family_compiler_guard_carry_test.go",
+        "family_compiler_guard_dictionary_test.go",
         "family_compiler_guard_transport_test.go",
         "family_compiler_guards_test.go",
         "family_compiler_intrinsic_cardinality_test.go",

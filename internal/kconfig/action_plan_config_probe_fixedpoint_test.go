@@ -969,6 +969,47 @@ func TestActionPlanConfigProbeReplayPreservesConditionalMetadataSuffix(t *testin
 	testActionPlanConfigProbeReplaySplitSuffix(t, "conditional metadata")
 }
 
+func TestActionPlanConfigProbeReplayPreservesUnsplitConditionalMetadata(t *testing.T) {
+	for _, supported := range []bool{false, true} {
+		t.Run(fmt.Sprintf("compiler_options_supported_%t", supported), func(t *testing.T) {
+			testActionPlanConfigProbeReplaySplitSuffixWithOptions(t, "unsplit conditional metadata", supported)
+		})
+	}
+}
+
+func TestActionPlanConfigProbeReplayRejectsUnsplitConditionalCompiler(t *testing.T) {
+	testActionPlanConfigProbeReplaySplitSuffix(t, "unsplit conditional compiler")
+}
+
+func TestCompilerProbeComparisonPreservesCompilerAndUndecidableLines(t *testing.T) {
+	for _, role := range []string{"cc", "cxx", "rustc", "clippy"} {
+		compiler := KbuildActionRoleToken("target", role)
+		for _, line := range []string{
+			compiler + " -c input.c",
+			"if [ yes = yes ]; then " + compiler + " -c input.c; fi",
+			"echo $(" + compiler + " -E input.c)",
+			"'" + compiler + "' -c input.c",
+		} {
+			if compactKbuildRecipeLineHasNoCompiler(line) {
+				t.Fatalf("compiler line admitted as helper-only: %q", line)
+			}
+		}
+	}
+	for _, line := range []string{"$(choose-program) argument", "echo 'unterminated"} {
+		if compactKbuildRecipeLineHasNoCompiler(line) {
+			t.Fatalf("undecidable line admitted as helper-only: %q", line)
+		}
+	}
+	for _, line := range []string{
+		"if [ input.o != scripts/mod/empty.o ]; then __LINUX_BZL_OBJECT_TREE__/scripts/recordmcount input.o; fi",
+		"echo '" + KbuildActionRoleToken("target", "cc") + " is saved command data'",
+	} {
+		if !compactKbuildRecipeLineHasNoCompiler(line) {
+			t.Fatalf("helper-only line classified as compiler: %q", line)
+		}
+	}
+}
+
 func TestActionPlanConfigProbeReplayDropsEmptyConditionalMetadataSelection(t *testing.T) {
 	testActionPlanConfigProbeReplaySplitSuffix(t, "empty conditional metadata")
 }
@@ -978,8 +1019,12 @@ func TestActionPlanConfigProbeReplayRejectsChangedConditionalCompilerSuffix(t *t
 }
 
 func testActionPlanConfigProbeReplaySplitSuffix(t *testing.T, suffixMode string) {
+	testActionPlanConfigProbeReplaySplitSuffixWithOptions(t, suffixMode, true)
+}
+
+func testActionPlanConfigProbeReplaySplitSuffixWithOptions(t *testing.T, suffixMode string, supported bool) {
 	conditionalSuffix := suffixMode != "compiler"
-	conditionalMetadata := suffixMode == "conditional metadata" || suffixMode == "empty conditional metadata"
+	conditionalMetadata := suffixMode == "conditional metadata" || suffixMode == "empty conditional metadata" || suffixMode == "unsplit conditional metadata"
 	const (
 		target  = "scripts/mod/devicetable-offsets.s"
 		source  = "scripts/mod/devicetable-offsets.c"
@@ -1025,6 +1070,19 @@ scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 				"cmd_gensymtypes = $(if $(call cc-option,-ffixedpoint-selected),",
 				"cmd_gensymtypes = $(if $(findstring -pg,$(call cc-option,-ffixedpoint-selected)),")
 		}
+	}
+	if strings.HasPrefix(suffixMode, "unsplit ") {
+		// A harmless but noncanonical prefix keeps the source recipe atomic.
+		// Its compiler query still needs the original symbolic argv while the
+		// selected helper suffix can expand into a shell conditional.
+		makeText = strings.ReplaceAll(makeText, "set -e; $(cmd_$(1))", "set -e; true; $(cmd_$(1))")
+		makeText = strings.ReplaceAll(makeText, "echo metadata-suffix >> $(dot-target).cmd", "if [ $@ != scripts/mod/empty.o ]; then echo metadata-suffix >> $(dot-target).cmd; fi")
+		// Exercise the actual preservation requirement, not only a static
+		// compiler argv next to a dynamic helper: option results and a quoted
+		// privately rooted macro must retain the original query identity too.
+		makeText = strings.ReplaceAll(makeText,
+			"cmd_cc_s_c = $(CC) -Wp,-MMD,$(depfile) -nostdinc -fverbose-asm",
+			"cmd_cc_s_c = $(CC) $(c_flags) -fverbose-asm")
 	}
 	if err := os.WriteFile(makefile, []byte(makeText), 0o644); err != nil {
 		t.Fatal(err)
@@ -1148,6 +1206,9 @@ scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 		t.Fatalf("suffix compiler request present=%t, mode=%s", found, suffixMode)
 	}
 	oracle := successfulProbeOracleForFixedPointTest(t, discovery.Plan)
+	if strings.HasPrefix(suffixMode, "unsplit ") {
+		oracle = fixedPointCompilerOptionOracleForTest(t, discovery.Plan, supported)
+	}
 	if conditionalSuffix {
 		// Recompute Make-text predicates from the selected compiler answers;
 		// the generic fixture's all-success defaults are not derived results.
@@ -1158,6 +1219,12 @@ scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 		}
 	}
 	replay, err := evaluate(oracle)
+	if suffixMode == "unsplit conditional compiler" {
+		if err == nil || !strings.Contains(err.Error(), "compiler-probe") {
+			t.Fatalf("changed unsplit compiler bypassed occurrence matching: %v", err)
+		}
+		return
+	}
 	if suffixMode == "conditional compiler" {
 		if err == nil || !strings.Contains(err.Error(), "compiler-probe suffix command") {
 			t.Fatalf("changed compiler-bearing suffix bypassed occurrence matching: %v", err)
@@ -1169,6 +1236,33 @@ scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 	}
 	if !reflect.DeepEqual(replay.Plan, discovery.Plan) {
 		t.Fatal("suffix replay changed registered request bytes or ordered dependencies")
+	}
+	if suffixMode == "unsplit conditional metadata" {
+		found := false
+		for _, node := range replay.Value.Nodes {
+			recipe := replay.Value.Recipes[node.Recipe]
+			if recipe.Tool != compactKbuildScriptRunnerRole {
+				continue
+			}
+			script := compactKbuildRecipeScriptContentForTest(t, recipe)
+			if !strings.Contains(script, "metadata-suffix") {
+				continue
+			}
+			if node.Kind != "generate" || recipe.CompilerInvocation != nil || !strings.Contains(script, "if [") {
+				t.Fatal("unsplit helper lost its opaque compound execution")
+			}
+			if _, exists := replay.Value.compilerProbeInvocations[node.ID]; !exists {
+				t.Fatal("unsplit helper lost its retained compiler query")
+			}
+			found = true
+		}
+		if found != supported {
+			t.Fatalf("unsplit helper present=%t, compiler options supported=%t", found, supported)
+		}
+		if len(replay.Value.compilerProbeInvocations) == 0 {
+			t.Fatal("unsplit replay omitted the compiler query")
+		}
+		return
 	}
 	var typedPrefix, opaqueSuffix bool
 	for _, node := range replay.Value.Nodes {

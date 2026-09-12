@@ -106,6 +106,36 @@ func (p *ActionPlan) actionPlanNodeProducerIDs(node ActionPlanNode) ([]string, e
 	return producers, nil
 }
 
+// actionPlanProducerTraversal shares adjacency reads only within one immutable
+// traversal. Discard it before changing nodes or input sets. Neither the plan
+// nor the family cache retains a flattened graph. Returned slices are read-only.
+type actionPlanProducerTraversal struct {
+	plan      *ActionPlan
+	byNode    map[string][]string
+	remaining int
+}
+
+func (q *actionPlanProducerTraversal) producers(node ActionPlanNode) ([]string, error) {
+	if producers, ok := q.byNode[node.ID]; ok {
+		return producers, nil
+	}
+	producers, err := q.plan.actionPlanNodeProducerIDs(node)
+	if err != nil {
+		return nil, err
+	}
+	// Charge empty lists too, bounding both records and producer references.
+	// Failed reads are not cached; saturation changes cost, not semantics.
+	cost := 1 + len(producers)
+	if cost <= q.remaining {
+		if q.byNode == nil {
+			q.byNode = map[string][]string{}
+		}
+		q.byNode[node.ID] = producers
+		q.remaining -= cost
+	}
+	return producers, nil
+}
+
 // validateAndEncodeActionPlanInputSets checks the complete serialized store,
 // validates every provenance edge in each consumer's stage, and emits the
 // path-only marker graph understood by map_directory. The manifest is the

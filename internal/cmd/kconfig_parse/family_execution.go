@@ -297,15 +297,16 @@ func newFamilyExecutionPipeline(request *familyExecutionRequest) (*familyExecuti
 	if err != nil {
 		return nil, fmt.Errorf("read initial family execution cut: %w", err)
 	}
-	// These directories must be successful immutable Bazel outputs from that
-	// exact cut. ObserveHeaders reads bytes, not a recipe or declared digest.
-	result.observed, err = result.cut.ObserveHeaders(request.stores)
-	if err != nil {
-		return nil, fmt.Errorf("observe completed family execution cut: %w", err)
-	}
+	// Read the complete immutable cut once. Ordinary transitive outputs can
+	// supply header observations too, even when literal inference meant they
+	// were not unresolved-header roots. These are executed bytes, not recipes.
 	result.artifacts, err = result.cut.ObserveArtifacts(request.stores)
 	if err != nil {
 		return nil, fmt.Errorf("observe completed family execution artifacts: %w", err)
+	}
+	result.observed, err = result.artifacts.ObserveHeaders()
+	if err != nil {
+		return nil, fmt.Errorf("observe completed family execution headers: %w", err)
 	}
 	return result, nil
 }

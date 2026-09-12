@@ -4400,6 +4400,7 @@ def _linux_mapped_kernel_family_impl(ctx):
     # independently, then union them before registering any probe action so an
     # identical request executes once for the complete image family.
     kbuild_probe_plan_fragments = {}
+    kbuild_cpu_profiles = {}
     public_configs = {}
     for variant in sorted(variant_overlays):
         overlay = variant_overlays[variant]
@@ -4513,6 +4514,29 @@ def _linux_mapped_kernel_family_impl(ctx):
             progress_message = "Planning Linux %s Kbuild capability discovery %%{label}" % variant,
         )
         kbuild_probe_plan_fragments[variant] = kbuild_probe_plan
+
+        # An opt-in diagnostic samples the exact initial Kbuild workload. Its
+        # disposable fragment is never a build input or a compiler receipt.
+        kbuild_cpu_profile = ctx.actions.declare_file(prefix + ".kbuild-discovery.cpu.pprof")
+        kbuild_cpu_profiles[variant] = kbuild_cpu_profile
+        profile_args = ctx.actions.args()
+        profile_args.add("-planner", ctx.executable._planner)
+        _add_artifact_path(profile_args, "-out", kbuild_cpu_profile)
+        profile_args.add("-duration", "180s")
+        profile_args.add("--")
+        ctx.actions.run(
+            executable = ctx.executable._profile_capture,
+            inputs = depset(
+                direct = kbuild_probe_inputs,
+                transitive = [rust_source.files] if rust_source != None else [],
+            ),
+            tools = [ctx.attr._planner[DefaultInfo].files_to_run],
+            outputs = [kbuild_cpu_profile],
+            arguments = [profile_args, kbuild_probe_args],
+            execution_requirements = {"supports-path-mapping": "1", "no-cache": "1"},
+            mnemonic = "LinuxKbuildDiscoveryCPUProfile",
+            progress_message = "Sampling Linux %s Kbuild discovery CPU %%{label}" % variant,
+        )
 
     kbuild_probe_plan = ctx.actions.declare_directory(ctx.label.name + ".kbuild-probe-plan")
     kbuild_probe_union_args = ctx.actions.args()
@@ -5033,6 +5057,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             # downloading result trees or substituting for the actual build.
             compiler_guards = depset([round["-family_compiler_guard_manifest"] for round in guard_rounds]),
             config = depset([public_configs[variant]]),
+            kbuild_cpu_profile = depset([kbuild_cpu_profiles[variant]]),
             image = depset([image]),
             kernel_release = depset([record.kernel_release]),
             module_symvers = depset([module_symvers]),

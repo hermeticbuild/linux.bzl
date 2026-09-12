@@ -806,17 +806,20 @@ if it wrote partial output. Other vectors and singleton queries remain
 independent. Missing, malformed, signaled, skipped, or stale results remain
 errors; prior accepted and rejected attempts are replay-validated alike.
 
-The same rounds can measure C/C++ `__has_attribute(identifier)` and
-`__has_builtin(identifier)` calls from entered files. Value-sensitive queries
+The same rounds can measure C/C++ `__has_attribute(identifier)`,
+`__has_builtin(identifier)`, `__has_feature(identifier)`, and
+`__has_extension(identifier)` calls from entered files. Value-sensitive queries
 preserve exact `-D` bodies and return the compiler's integer tokens, not merely
 their truth values. Each round batches reached `(operator, operand)` pairs for
 one exact compiler context into a single action. Its sorted result vector is
 validated in full before
 any answer is admitted; overlapping batches must agree and retain their
-contributing request identities. The round's v4 manifest stores each exact
-compiler context once; query kinds and sibling configs reference that shared
-argument/environment descriptor. Only storage is shared: every variant still
-replays each query against its own current dependencies and toolsets.
+contributing request identities. The round's v5 manifest stores each exact
+compiler context once and dictionary-encodes repeated argument and environment
+strings. Query kinds and sibling configs reference the shared context. Decoding
+preserves argument order, exact bytes, and absent versus empty collections;
+context and query identities do not change. Only storage is shared: every
+variant still replays each query against its own dependencies and toolsets.
 Budgets separately bound 8,192 unique complete query descriptors, 32,768
 per-variant memberships, values, compact discovery data (32 MiB), serialized
 data (64 MiB), and expanded replay descriptors (128 MiB). The latter two
@@ -1051,6 +1054,13 @@ changing normal planner actions or default outputs. Inspect the resulting
 `.compiler-guards-1.cpu.pprof` with `go tool pprof -top` before using it: capture
 checks the complete gzip stream, while pprof validates the profile itself.
 A bounded CPU sample is not a completed-kernel timing or a cache-hit measurement.
+
+To isolate initial Kbuild discovery instead, use
+`--output_groups=kbuild_cpu_profile`. It runs the selected variant's original
+Kbuild discovery arguments after compiler and Kconfig capability setup, without
+demanding the generator cut or any supplemental guard round. The same bounded
+180-second capture publishes only `.kbuild-discovery.cpu.pprof`, never a planner
+result. A planner that finishes earlier publishes its completed CPU profile.
 
 For allocation-stack attribution at the same bounded round-1 workload, use
 `--output_groups=compiler_guard1_heap_profile`. This separate diagnostic action

@@ -240,12 +240,12 @@ func TestFamilyCompilerGuardTransportRejectsInvalidContextGraph(t *testing.T) {
 			case "missing table":
 				wire.Contexts = nil
 			case "empty table":
-				wire.Contexts = map[string]familyCompilerGuardContext{}
+				wire.Contexts = map[string]familyCompilerGuardPackedContext{}
 			case "bad table ID":
 				delete(wire.Contexts, id)
 				wire.Contexts[strings.ToUpper(id)] = context
 			case "changed table contents":
-				context.Arguments = []string{"-DDIFFERENT=1"}
+				context.Scope = "changed"
 				wire.Contexts[id] = context
 			case "missing reference":
 				wire.Variants["base"][0].Context = ""
@@ -255,11 +255,12 @@ func TestFamilyCompilerGuardTransportRejectsInvalidContextGraph(t *testing.T) {
 				wire.Variants["base"][0].Context = strings.Repeat("0", 64)
 			case "unused context":
 				context.Scope = "host"
-				wire.Contexts[context.id()] = context
+				original := familyCompilerGuardTransportManifestForTest().Variants["base"][0].compilerContext()
+				original.Scope = "host"
+				wire.Contexts[original.id()] = context
 			case "too many contexts":
 				for index := range maxFamilyCompilerGuardQueries + 1 {
-					context.Arguments = []string{fmt.Sprint(index)}
-					wire.Contexts[context.id()] = context
+					wire.Contexts[fmt.Sprintf("%064x", index)] = context
 				}
 			case "too many memberships":
 				query := wire.Variants["base"][0]

@@ -18,7 +18,7 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
 
-const familyCompilerGuardSchema = "linux-kbuild-compiler-guards-v4"
+const familyCompilerGuardSchema = "linux-kbuild-compiler-guards-v5"
 const maxFamilyCompilerGuardRounds = 3
 const maxFamilyCompilerGuardBytes = 64 << 20
 const maxFamilyCompilerGuardQueries = 8192
@@ -245,7 +245,7 @@ func readFamilyCompilerGuardManifest(filename string) (*familyCompilerGuardManif
 // limit alone permits millions of tiny JSON objects to expand into gigabytes.
 func preflightFamilyCompilerGuardJSON(data []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	queries, contexts, names, calls, values := 0, 0, 0, 0, 0
+	queries, contexts, names, calls, values, words := 0, 0, 0, 0, 0, 0
 	var value func(int, string) error
 	value = func(depth int, kind string) error {
 		values++
@@ -278,6 +278,9 @@ func preflightFamilyCompilerGuardJSON(data []byte) error {
 				if kind == "root" && strings.EqualFold(field, "Contexts") {
 					child = "contexts"
 				}
+				if kind == "root" && strings.EqualFold(field, "Strings") {
+					child = "strings"
+				}
 				if kind == "contexts" {
 					contexts++
 					if contexts > maxFamilyCompilerGuardQueries {
@@ -309,6 +312,12 @@ func preflightFamilyCompilerGuardJSON(data []byte) error {
 				}
 				if kind == "calls" {
 					calls++
+				}
+				if kind == "strings" {
+					words++
+					if words > maxFamilyCompilerGuardStrings {
+						return fmt.Errorf("compiler guard JSON exceeds its string budget")
+					}
 				}
 				if queries > maxFamilyCompilerGuardMemberships || names > 1<<20 {
 					return fmt.Errorf("compiler guard JSON exceeds its query/name budget")
@@ -361,6 +370,8 @@ type familyCompilerGuardPipeline struct {
 	callCount               int
 	expandedBytes           int
 	contexts                map[string]familyCompilerGuardContext
+	contextStrings          map[string]struct{}
+	contextReferences       int
 	uniqueQueries           map[string]struct{}
 	truncated               bool
 	diagnostics             io.Writer
@@ -711,12 +722,18 @@ func (p *familyCompilerGuardPipeline) internContext(query familyCompilerGuardQue
 		return familyCompilerGuardQuery{}, fmt.Errorf("compiler guard context ID has contradictory contents")
 	}
 	if !found {
+		cost, words, references := familyCompilerGuardContextCost(context, p.contextStrings)
+		if p.contextStrings == nil {
+			p.contextStrings = map[string]struct{}{}
+		}
+		maps.Copy(p.contextStrings, words)
+		p.contextReferences += references
 		context.Arguments = slices.Clone(context.Arguments)
 		context.TranslationUnits = slices.Clone(context.TranslationUnits)
 		context.Environment = maps.Clone(context.Environment)
 		p.contexts[id] = context
 		retained = context
-		p.bytes += len(data) + len(id) + 4
+		p.bytes += cost
 	}
 	p.count++
 	p.bytes += familyCompilerGuardQueryReferenceBytes
@@ -849,6 +866,8 @@ func (p *familyCompilerGuardPipeline) observeDefinedness(value kconfig.ConfigDep
 		p.queryBytes[key] += len(name) + 64
 		if p.exceedsLimit("query_membership_limit", p.count, maxFamilyCompilerGuardMemberships) ||
 			p.exceedsLimit("context_limit", len(p.contexts), maxFamilyCompilerGuardQueries) ||
+			p.exceedsLimit("string_limit", len(p.contextStrings), maxFamilyCompilerGuardStrings) ||
+			p.exceedsLimit("reference_limit", p.contextReferences, maxFamilyCompilerGuardReferences) ||
 			p.exceedsLimit("name_value_limit", p.nameCount, 1<<20) ||
 			p.exceedsLimit("estimated_bytes_limit", p.bytes, maxFamilyCompilerGuardBytes/2) ||
 			p.exceedsLimit("expanded_bytes_limit", p.expandedBytes, maxFamilyCompilerGuardExpandedBytes) ||
@@ -1293,9 +1312,13 @@ func (p *familyCompilerGuardPipeline) admitOptionalQueryForStage(query familyCom
 	data, _ := json.Marshal(context)
 	compact, expanded := familyCompilerGuardQueryReferenceBytes, len(data)+familyCompilerGuardQueryReferenceBytes
 	contexts, unique := len(p.contexts), len(p.uniqueQueries)
+	words, references := len(p.contextStrings), p.contextReferences
 	if !found {
 		contexts++
-		compact += len(data) + len(id) + 4
+		cost, added, refs := familyCompilerGuardContextCost(context, p.contextStrings)
+		compact += cost
+		words += len(added)
+		references += refs
 	}
 	key := query.payloadKey()
 	if _, found := p.uniqueQueries[key]; !found {
@@ -1314,6 +1337,8 @@ func (p *familyCompilerGuardPipeline) admitOptionalQueryForStage(query familyCom
 		{"unique_query_limit", unique, maxFamilyCompilerGuardQueries},
 		{"query_membership_limit", p.count + 1, maxFamilyCompilerGuardMemberships},
 		{"context_limit", contexts, maxFamilyCompilerGuardQueries},
+		{"string_limit", words, maxFamilyCompilerGuardStrings},
+		{"reference_limit", references, maxFamilyCompilerGuardReferences},
 		{"name_value_limit", p.nameCount + len(query.Names), 1 << 20},
 		{"intrinsic_value_limit", p.callCount, maxFamilyCompilerIntrinsicCalls},
 		{"estimated_bytes_limit", p.bytes + compact, maxFamilyCompilerGuardBytes / 2},

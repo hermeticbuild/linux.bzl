@@ -40,8 +40,10 @@ type actionPlanFamilyObservedHeadersWire struct {
 }
 
 // ActionPlanFamilyObservedHeaders is a bounded immutable observation of actual
-// execution-cut outputs. Only ObserveHeaders constructs it; a caller-supplied
-// digest or a plan marker cannot stand in for reading the executed file.
+// execution-cut outputs. The cut's ObserveHeaders reads selected root outputs;
+// executed artifacts' ObserveHeaders derives all ordinary output observations
+// from bytes already read from that same cut. A caller-supplied digest or a plan
+// marker cannot stand in for reading the executed file.
 //
 // This is not permission to emit an executable final family.
 // The caller must authenticate the original replay invocation before exposing
@@ -52,6 +54,9 @@ type ActionPlanFamilyObservedHeaders struct {
 	headers  []ActionPlanFamilyObservedHeader
 	contents map[string][]byte
 	modes    map[string]uint32
+	// Set only when authenticated executed artifacts supplied every ordinary
+	// output, rather than the original unresolved-header roots alone.
+	allExecutedOutputs bool
 }
 
 // observedHeaderContentID deliberately excludes the variant, producer, tree,

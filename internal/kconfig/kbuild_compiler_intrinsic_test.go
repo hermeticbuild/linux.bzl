@@ -16,6 +16,22 @@ type compilerIntrinsicTestValue struct {
 }
 
 func TestCompilerIntrinsicIntegerSourceAndResult(t *testing.T) {
+	for _, operator := range []string{"__has_feature", "__has_extension"} {
+		for _, operand := range []string{"address_sanitizer", "c_static_assert", "unknown_feature_9"} {
+			source, err := compilerIntrinsicIntegerSource(operator, operand)
+			if err != nil || source != "#undef "+operand+"\n"+operator+"("+operand+")\n" {
+				t.Fatalf("feature query %s(%s) = %q, %v", operator, operand, source, err)
+			}
+		}
+		for _, other := range []string{"__has_attribute", "__has_builtin", "__has_feature", "__has_extension"} {
+			if err := ValidateCompilerIntrinsicCall(CompilerIntrinsicCall{operator, other}); err == nil {
+				t.Fatalf("feature query can undefine managed operator %s", other)
+			}
+			if err := ValidateCompilerIntrinsicCall(CompilerIntrinsicCall{other, operator}); err == nil {
+				t.Fatalf("query can undefine managed feature operator %s", operator)
+			}
+		}
+	}
 	for _, operand := range []string{"deprecated", "__retain__", "unknown_attribute_9", strings.Repeat("a", 128)} {
 		source, err := compilerIntrinsicIntegerSource("__has_attribute", operand)
 		if err != nil || source != "#undef "+operand+"\n__has_attribute("+operand+")\n" {

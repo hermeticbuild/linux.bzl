@@ -185,16 +185,22 @@ func (c *configDependencyCallCoverage) condition(text string, state *configDepen
 			return configDependencyMacroUnknown, c.fail("malformed defined operand in conditional call coverage")
 		}
 		name := tokens[index].text
-		definition := state.definition(name)
-		c.conditions = append(c.conditions, configDependencyMacroCallRead{Name: name, State: definition})
-		if definition == configDependencyMacroUnknown {
-			return configDependencyMacroUnknown, c.fail("unresolved defined operand " + name)
-		}
 		if parenthesized {
 			index++
 			if index >= len(tokens) || tokens[index].text != ")" {
 				return configDependencyMacroUnknown, c.fail("unclosed defined operand in conditional call coverage")
 			}
+		}
+		definition := state.definition(name)
+		c.conditions = append(c.conditions, configDependencyMacroCallRead{Name: name, State: definition})
+		if definition == configDependencyMacroUnknown {
+			// defined does not expand its operand, so it bypasses resolver.
+			// Record the same future demand without granting a current fact or
+			// continuing beyond the first unresolved conditional operand.
+			if c.unknown != nil {
+				c.unknown(name)
+			}
+			return configDependencyMacroUnknown, c.fail("unresolved defined operand " + name)
 		}
 		value := "0"
 		if definition == configDependencyMacroDefined {

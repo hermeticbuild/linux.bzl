@@ -116,16 +116,18 @@ func TestFamilyPendingQueriesShareWithOriginalCompilerValues(t *testing.T) {
 			t.Fatal(err)
 		}
 		var manifest struct {
+			Schema    string
 			Truncated bool
-			Contexts  map[string]struct{ Arguments []string }
+			Strings   []string
+			Contexts  map[string]struct{ Arguments []int }
 			Variants  map[string][]struct {
 				Context, Kind string
 				Names         []string
 			}
 		}
 		readHelperJSON(t, filename, &manifest)
-		if manifest.Truncated {
-			t.Fatal("pending fixture truncated the compiler frontier")
+		if manifest.Schema != "linux-kbuild-compiler-guards-v5" || manifest.Truncated {
+			t.Fatal("pending fixture has an unsupported schema or truncated compiler frontier")
 		}
 		for variant, queries := range manifest.Variants {
 			if counts[variant] == nil {
@@ -136,7 +138,11 @@ func TestFamilyPendingQueriesShareWithOriginalCompilerValues(t *testing.T) {
 					if !strings.HasPrefix(name, "__MAPPED_PENDING_") {
 						continue
 					}
-					arguments := manifest.Contexts[query.Context].Arguments
+					context, found := manifest.Contexts[query.Context]
+					if !found {
+						t.Fatal("pending fixture has a dangling context reference")
+					}
+					arguments := compilerGuardStrings(t, manifest.Strings, context.Arguments)
 					if query.Kind != "optional-definedness" && query.Kind != "optional-token-hints" ||
 						!slices.Contains(arguments, "-DMAPPED_PENDING_CONTEXT=7") && !slices.Contains(arguments, "-DMAPPED_PENDING_CONTEXT=11") {
 						t.Fatalf("%s lost its original compiler context or optional tier: %#v", name, query)

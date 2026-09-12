@@ -12,6 +12,14 @@ import (
 // This is an in-process integration fixture, not measured kernel reuse. Both
 // header and executable observations come from the same immutable test stores.
 func TestFamilyArtifactAndHeaderIntegration(t *testing.T) {
+	testFamilyArtifactAndHeaderIntegration(t, false)
+}
+
+func TestFamilyArtifactAndTransitiveHeaderIntegration(t *testing.T) {
+	testFamilyArtifactAndHeaderIntegration(t, true)
+}
+
+func testFamilyArtifactAndHeaderIntegration(t *testing.T, transitiveHeader bool) {
 	for _, changed := range []string{"", "executable", "header", "mode"} {
 		t.Run(changed, func(t *testing.T) {
 			var plans []*ActionPlan
@@ -94,7 +102,13 @@ func TestFamilyArtifactAndHeaderIntegration(t *testing.T) {
 			}
 			var roots []ActionPlanFamilyExecutionCutRoot
 			for index, variant := range variants {
-				roots = append(roots, ActionPlanFamilyExecutionCutRoot{NodeID: family.originalNodeIDs[variant.Name][originalRoots[index]], Slot: 0})
+				slot := 0
+				if transitiveHeader {
+					// Executing the helper also executes its producer's header
+					// output. The header itself is not an unresolved cut root.
+					slot = 1
+				}
+				roots = append(roots, ActionPlanFamilyExecutionCutRoot{NodeID: family.originalNodeIDs[variant.Name][originalRoots[index]], Slot: slot})
 			}
 			cut, err := NewActionPlanFamilyExecutionCut(family, roots)
 			if err != nil {
@@ -132,6 +146,23 @@ func TestFamilyArtifactAndHeaderIntegration(t *testing.T) {
 			artifacts, err := observeExecutedArtifacts(cut, stores, 4096, 65536)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if transitiveHeader {
+				for _, header := range headers.Headers() {
+					if header.Slot == 0 {
+						t.Fatal("legacy root-only observation unexpectedly includes the transitive header")
+					}
+				}
+				headers, err = artifacts.ObserveHeaders()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(headers.Headers()) != len(cut.Outputs()) {
+					t.Fatal("expanded observation omitted an ordinary executed output")
+				}
+				if changed == "" {
+					checkExpandedNonrootHeaderAuthentication(t, artifacts, headers)
+				}
 			}
 			var results []*ActionPlanFamilyVariantPlanningResult
 			for index, plan := range plans {

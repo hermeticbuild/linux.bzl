@@ -2528,6 +2528,15 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		if opaqueReason != "" {
 			match.compilerProbeOpaqueReason = opaqueReason
 		}
+		// A selected non-compiler recipe line may expand from one deferred
+		// Make word into a compound helper command (for example a conditional
+		// postprocessor). It contributes no compiler query. Use its actual
+		// execution text in the comparison twin, preserving the complete opaque
+		// action. Compiler-bearing or undecidable lines retain their symbolic
+		// text and must still match every executable and control-flow occurrence.
+		if compactKbuildRecipeLineHasNoCompiler(rooted) && compactKbuildRecipeLineHasNoCompiler(probeRooted) {
+			probeRooted = rooted
+		}
 		probeRootedTemplates = append(probeRootedTemplates, probeRooted)
 		probeTemplates = append(probeTemplates, compactKbuildFinalizeRootedActionRecipeText(probeRooted))
 	}
@@ -3702,6 +3711,14 @@ func compactKbuildCompoundProgramCommands(value string) ([]compactKbuildRecipeCo
 		return commands[i].programStart < commands[j].programStart
 	})
 	return commands, nil
+}
+
+func compactKbuildRecipeLineHasNoCompiler(template string) bool {
+	commands, err := compactKbuildCompoundProgramCommands(template)
+	return err == nil && !slices.ContainsFunc(commands, func(command compactKbuildRecipeCommand) bool {
+		_, compiler := compactKbuildCommandCompilerRole(command)
+		return compiler
+	})
 }
 
 // compactKbuildWrapCompilerProbeSourceShellWords annotates only the deferred
@@ -5917,7 +5934,15 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 			}
 		}
 	}
-	if len(match.compilerProbeCommands) == 0 && len(match.compilerProbeRootedTemplates) != 0 &&
+	// A linear parse carries public action bindings in its cooked argv. This
+	// compound path rescans the concrete source above, so rescan that linear
+	// handoff's saved probe twin too. Otherwise discovery and control-flow
+	// replay assign different query bytes to a quoted typed-tree macro.
+	needsRootedProbeCommands := len(match.compilerProbeCommands) == 0 ||
+		slices.ContainsFunc(match.compilerProbeCommands, func(command compactKbuildRecipeCommand) bool {
+			return command.programEnd == 0
+		})
+	if needsRootedProbeCommands && len(match.compilerProbeRootedTemplates) != 0 &&
 		slices.ContainsFunc(compilerCommands, func(command compactKbuildRecipeCommand) bool {
 			role, compiler := compactKbuildCommandCompilerRole(command)
 			return compiler && (role == "cc" || role == "cxx")

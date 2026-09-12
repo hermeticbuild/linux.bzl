@@ -451,6 +451,44 @@ func TestConfigDependencyCallCoverageProtectsDefinedOperand(t *testing.T) {
 	}
 }
 
+func TestConfigDependencyCallCoverageDemandsUnknownDefinedOperand(t *testing.T) {
+	for _, expression := range []string{"defined(__UNMEASURED)", "defined __UNMEASURED", "defined(__UNMEASURED) && defined(__LATER)"} {
+		t.Run(expression, func(t *testing.T) {
+			state := macroReplacementStateForTest(t, "")
+			var demands []string
+			proof := &configDependencyCallCoverage{unknown: func(name string) { demands = append(demands, name) }}
+			value, reason := proof.condition(expression, state)
+			if value != configDependencyMacroUnknown || reason != "unresolved defined operand __UNMEASURED" || !slices.Equal(demands, []string{"__UNMEASURED"}) {
+				t.Fatalf("unknown conditional demand = %d, %q, %q", value, reason, demands)
+			}
+			if state.definition("__UNMEASURED") != configDependencyMacroUnknown || proof.complete || len(proof.conditions) != 0 || len(proof.reads) != 0 {
+				t.Fatal("future definedness demand published partial current proof")
+			}
+			proof.condition("defined(__LATER)", state)
+			if len(demands) != 1 {
+				t.Fatal("failed coverage continued observing later operands")
+			}
+		})
+	}
+}
+
+func TestConfigDependencyCallCoverageDefinedDemandDoesNotExpandOrGuess(t *testing.T) {
+	for _, expression := range []string{"defined(NAME)", "!defined(CONFIG_ABSENT)", "defined(__UNMEASURED", "defined()"} {
+		t.Run(expression, func(t *testing.T) {
+			state := macroReplacementStateForTest(t, "#define NAME __UNMEASURED\n")
+			proof := &configDependencyCallCoverage{unknown: func(name string) { t.Fatalf("unexpected demand %q", name) }}
+			value, reason := proof.condition(expression, state)
+			if expression == "defined(NAME)" || expression == "!defined(CONFIG_ABSENT)" {
+				if value != configDependencyMacroDefined || reason != "" {
+					t.Fatalf("known operand lost exact definedness: %d, %q", value, reason)
+				}
+			} else if value != configDependencyMacroUnknown || reason == "" {
+				t.Fatal("malformed defined operand admitted")
+			}
+		})
+	}
+}
+
 func TestConfigDependencyCallCoverageRejectsExpansionGeneratedDefined(t *testing.T) {
 	state := macroReplacementStateForTest(t, "#define DEFINED defined\n")
 	proof := &configDependencyCallCoverage{}

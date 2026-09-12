@@ -41,7 +41,7 @@ func TestConfigDependencyGuardInventoryDiscoversSortedHints(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "empty.h", "")
 	mustWriteSource(t, root, "a.h", "#ifndef __Z_GUARD\n#define __Z_GUARD\n#ifdef _A_GUARD\n#endif\n#endif\n")
-	mustWriteSource(t, root, "b.c", "# ifdef _B_GUARD /* comment */\n#endif\n%:ifndef _DIGRAPH_GUARD\n#endif\n#ifdef ORDINARY_GUARD\n#endif\n#if !defined(_NOT_AN_INVENTORY_HINT)\n#endif\n#ifdef _INVALID-NAME\n#endif\n")
+	mustWriteSource(t, root, "b.c", "# ifdef _B_GUARD /* comment */\n#endif\n%:ifndef _DIGRAPH_GUARD\n#endif\n#ifdef ORDINARY_GUARD\n#endif\n#if !defined(_LITERAL_DEFINED_GUARD)\n#endif\n#ifdef _INVALID-NAME\n#endif\n")
 	mustWriteSource(t, root, "splice.h", "#if\\\nndef _SPLICED_GUARD\n#endif\n#ifdef _A_GUARD\n#endif\n")
 	mustWriteSource(t, root, "late.h", strings.Repeat(" ", configDependencyGuardInventoryPrefixBytes)+"\n#ifndef _TOO_LATE\n#endif\n")
 	mustWriteSource(t, root, "incomplete-prefix.h", "#ifndef _INCOMPLETE_PREFIX\n/*"+strings.Repeat("x", configDependencyGuardInventoryPrefixBytes)+"*/\n#endif\n")
@@ -54,7 +54,7 @@ func TestConfigDependencyGuardInventoryDiscoversSortedHints(t *testing.T) {
 	}
 	profile := configDependencyDefinednessProfileForTest(t, map[string]string{"__LINUX_BZL_SOURCE_TREE__": root})
 	inventory := &configDependencyGuardInventory{}
-	want := []string{"_A_GUARD", "_B_GUARD", "_DIGRAPH_GUARD", "_SPLICED_GUARD", "__Z_GUARD"}
+	want := []string{"_A_GUARD", "_B_GUARD", "_DIGRAPH_GUARD", "_LITERAL_DEFINED_GUARD", "_SPLICED_GUARD", "__Z_GUARD"}
 	if got := inventory.names(profile); !slices.Equal(got, want) {
 		t.Fatalf("inventory = %q, want %q", got, want)
 	}

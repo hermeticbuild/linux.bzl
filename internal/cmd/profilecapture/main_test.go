@@ -48,11 +48,13 @@ func TestMain(m *testing.M) {
 
 func helperOperand(arguments []string, name string) string {
 	for index, argument := range arguments {
-		if argument == "-"+name && index+1 < len(arguments) {
-			return arguments[index+1]
-		}
-		if value, found := strings.CutPrefix(argument, "-"+name+"="); found {
-			return value
+		for _, flag := range []string{"-" + name, "--" + name} {
+			if argument == flag && index+1 < len(arguments) {
+				return arguments[index+1]
+			}
+			if value, found := strings.CutPrefix(argument, flag+"="); found {
+				return value
+			}
 		}
 	}
 	return ""
@@ -95,8 +97,12 @@ func captureHelper(mode string) error {
 	}
 	manifest := helperOperand(arguments, "family_compiler_guard_manifest_out")
 	plan := helperOperand(arguments, "family_compiler_guard_plan_out")
-	if err := os.WriteFile(manifest, []byte("disposable manifest"), 0o600); err != nil {
-		return err
+	if manifest != "" {
+		if err := os.WriteFile(manifest, []byte("disposable manifest"), 0o600); err != nil {
+			return err
+		}
+	} else {
+		plan = helperOperand(arguments, "kbuild_probe_plan_out")
 	}
 	if err := os.Mkdir(plan, 0o700); err != nil {
 		return err
@@ -281,7 +287,7 @@ func TestCaptureProfilePreservesOriginalInvocation(t *testing.T) {
 					t.Fatalf("disposable/original output escaped capture: %s, %v", filename, err)
 				}
 			}
-			if !strings.Contains(stderr.String(), "run go tool pprof -top") {
+			if !strings.Contains(stderr.String(), "validate profile format before interpreting samples") {
 				t.Fatal("capture omitted the mandatory consumer validation warning")
 			}
 		})

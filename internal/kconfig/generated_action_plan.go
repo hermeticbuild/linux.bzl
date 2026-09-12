@@ -104,34 +104,12 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 			return actionPlanLookupKey(left.output.Tree, left.output.Path) < actionPlanLookupKey(right.output.Tree, right.output.Path)
 		})
 	}
-	stateGraphsByPath := map[string]compactKbuildSideOutputStateGraph{}
-	for observedPath, candidateSet := range candidateSetsByPath {
-		candidates := make([]compactKbuildSelectionKey, 0, len(candidateSet))
-		for candidate := range candidateSet {
-			candidates = append(candidates, candidate)
-		}
-		stateGraph, graphErr := selectionGraph.compactKbuildSideOutputStateGraph(m, candidates)
-		if graphErr != nil {
-			return nil, fmt.Errorf("project Kbuild side-output state for %q: %w", observedPath, graphErr)
-		}
-		stateGraphsByPath[observedPath] = stateGraph
+	stateProjections, err := selectionGraph.sideOutputStateProjections(m, candidateSetsByPath, sideOutputDemands)
+	if err != nil {
+		return nil, err
 	}
-	maximalCandidatesByDemand := map[compactKbuildSideOutputDemandStateKey][]compactKbuildSelectionKey{}
-	for _, demand := range sideOutputDemands {
-		stateGraph, graphErr := selectionGraph.compactKbuildSideOutputStateGraph(m, demand.candidates)
-		if graphErr != nil {
-			return nil, fmt.Errorf("project final Kbuild side-output state for %q: %w", demand.output.Path, graphErr)
-		}
-		key := compactKbuildSideOutputDemandStateKey{
-			consumer: selectionGraph.compactKbuildGroupedSelectionRepresentative(demand.consumer),
-			tree:     demand.output.Tree,
-			path:     demand.output.Path,
-		}
-		if previous, exists := maximalCandidatesByDemand[key]; exists && !slices.Equal(previous, stateGraph.maximal) {
-			return nil, fmt.Errorf("grouped Kbuild side-output demand for %q has conflicting maximal state frontiers", demand.output.Path)
-		}
-		maximalCandidatesByDemand[key] = append([]compactKbuildSelectionKey(nil), stateGraph.maximal...)
-	}
+	stateGraphsByPath := stateProjections.byPath
+	maximalCandidatesByDemand := stateProjections.maximalByDemand
 	observedStates := map[string]compactKbuildRuleInput{}
 
 	ordered, err := selectionGraph.materializationOrder(m)
@@ -299,7 +277,11 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 				if !exists {
 					return nil, fmt.Errorf("observed Kbuild path %q has no candidate state graph", observation.path)
 				}
-				for _, parent := range stateGraph.parents[candidate] {
+				parents, exists := stateGraph.parentsFor(candidate)
+				if !exists {
+					return nil, fmt.Errorf("observed Kbuild path %q has no state projection for candidate %s", observation.path, compactKbuildSelectionKeyString(candidate))
+				}
+				for _, parent := range parents {
 					parentObservation, exists := observationByKey[compactKbuildSideOutputObservationKey{
 						candidate: parent, path: observation.path,
 					}]

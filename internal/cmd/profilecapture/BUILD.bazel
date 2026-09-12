@@ -16,6 +16,9 @@ go_binary(
 
 go_test(
     name = "profilecapture_test",
-    srcs = ["main_test.go"],
+    srcs = [
+        "kbuild_capture_test.go",
+        "main_test.go",
+    ],
     embed = [":profilecapture_lib"],
 )

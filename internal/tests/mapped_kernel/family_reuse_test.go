@@ -116,6 +116,23 @@ func TestFamilyPublicConfigMatchesExecutionConfig(t *testing.T) {
 	}
 }
 
+// Decode only the fixture-owned fields under test. The production decoder tests
+// separately authenticate complete descriptors, canonical bytes and budgets.
+func compilerGuardStrings(t *testing.T, words []string, indices []int) []string {
+	t.Helper()
+	if indices == nil {
+		return nil
+	}
+	result := make([]string, len(indices))
+	for i, index := range indices {
+		if index < 0 || index >= len(words) {
+			t.Fatal("compiler guard fixture has a dangling string reference")
+		}
+		result[i] = words[index]
+	}
+	return result
+}
+
 func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 	manifests := strings.Fields(os.Getenv("FAMILY_SMOKE_COMPILER_GUARDS"))
 	if len(manifests) != 3 {
@@ -142,9 +159,10 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 		var manifest struct {
 			Schema    string
 			Truncated bool
+			Strings   []string
 			Contexts  map[string]struct {
 				Scope, Role, Language       string
-				Arguments, TranslationUnits []string
+				Arguments, TranslationUnits []int
 			}
 			Variants map[string][]struct {
 				Context string
@@ -158,7 +176,7 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 		if err := json.Unmarshal(content, &manifest); err != nil {
 			t.Fatalf("decode compiler guard manifest %d: %v", index, err)
 		}
-		if manifest.Schema != "linux-kbuild-compiler-guards-v4" || manifest.Truncated {
+		if manifest.Schema != "linux-kbuild-compiler-guards-v5" || manifest.Truncated {
 			t.Fatalf("compiler guard manifest %d has unsupported schema or a truncated frontier", index)
 		}
 		if len(manifest.Variants) != len(batched) {
@@ -174,6 +192,8 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 				if !found {
 					t.Fatalf("compiler guard manifest %d has a dangling context reference", index)
 				}
+				arguments := compilerGuardStrings(t, manifest.Strings, context.Arguments)
+				units := compilerGuardStrings(t, manifest.Strings, context.TranslationUnits)
 				if query.Kind != "intrinsic-integer" {
 					continue
 				}
@@ -192,7 +212,7 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 				// Reset membership per query: two independent singleton queries
 				// must not satisfy this default-pipeline batching regression.
 				quotedMacro := false
-				for _, argument := range context.Arguments {
+				for _, argument := range arguments {
 					quotedMacro = quotedMacro || strings.HasPrefix(argument, `-DMAPPED_OBJECT_FILE="`) && strings.HasSuffix(argument, `/smoke"`)
 				}
 				batched[variant] = batched[variant] || deprecated && unrecognized && dynamicBuiltin && unknownBuiltin && quotedMacro
@@ -203,7 +223,7 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 				// remain deferred: a direct-argv query does not exercise the shell
 				// word mode needed by the quoted KBUILD_MODFILE replacement.
 				deferredExpressions := 0
-				for _, argument := range context.Arguments {
+				for _, argument := range arguments {
 					digest, symbolic := strings.CutPrefix(argument, "LINUX_BZL_PROBE_")
 					if !symbolic || len(digest) != 64 {
 						continue
@@ -218,9 +238,9 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 				}
 				generatedOffsets[variant] = generatedOffsets[variant] || deprecated && dynamicBuiltin && unknownBuiltin &&
 					context.Scope == "target" && context.Role == "cc" && context.Language == "c" &&
-					len(context.TranslationUnits) == 0 && len(context.Arguments) == 3 && deferredExpressions == 1 &&
-					slices.Contains(context.Arguments, "-DMAPPED_DEFERRED_ASSEMBLY_CONTEXT=1") &&
-					slices.Contains(context.Arguments, "-fverbose-asm")
+					len(units) == 0 && len(arguments) == 3 && deferredExpressions == 1 &&
+					slices.Contains(arguments, "-DMAPPED_DEFERRED_ASSEMBLY_CONTEXT=1") &&
+					slices.Contains(arguments, "-fverbose-asm")
 			}
 		}
 	}

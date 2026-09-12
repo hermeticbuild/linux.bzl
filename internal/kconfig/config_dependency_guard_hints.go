@@ -55,30 +55,9 @@ func configDependencyCompilerGuardHintsForContents(contents []byte) configDepend
 		return true
 	}
 	for original := range strings.SplitSeq(text, "\n") {
-		line := strings.TrimSpace(original)
-		if strings.HasPrefix(line, "%:") {
-			line = "#" + line[2:]
-		}
-		if !strings.HasPrefix(line, "#") {
-			continue
-		}
-		line = strings.TrimSpace(line[1:])
-		end := 0
-		for end < len(line) && configDependencyIdentifierByte(line[end]) {
-			end++
-		}
-		directive, rest := line[:end], strings.TrimSpace(line[end:])
-		switch directive {
-		case "ifdef", "ifndef":
-			name, valid := configDependencyMacroIdentifier(rest)
-			if valid && name == rest && !add(name) {
+		for _, name := range configDependencyCompilerDirectiveDefinedHints(original) {
+			if !add(name) {
 				return configDependencyCompilerGuardHints{truncated: true}
-			}
-		case "if", "elif":
-			for _, name := range configDependencyCompilerLiteralDefinedHints(rest) {
-				if !add(name) {
-					return configDependencyCompilerGuardHints{truncated: true}
-				}
 			}
 		}
 	}
@@ -88,6 +67,35 @@ func configDependencyCompilerGuardHintsForContents(contents []byte) configDepend
 	}
 	slices.Sort(result.names)
 	return result
+}
+
+// Both the initial bounded inventory and entered-file discovery use the same
+// syntax. Call only after comment removal and line splicing. These are names
+// to query, never facts about the current macro state or reached source.
+func configDependencyCompilerDirectiveDefinedHints(line string) []string {
+	line = strings.TrimSpace(line)
+	if strings.HasPrefix(line, "%:") {
+		line = "#" + line[2:]
+	}
+	if !strings.HasPrefix(line, "#") {
+		return nil
+	}
+	line = strings.TrimSpace(line[1:])
+	end := 0
+	for end < len(line) && configDependencyIdentifierByte(line[end]) {
+		end++
+	}
+	directive, rest := line[:end], strings.TrimSpace(line[end:])
+	switch directive {
+	case "ifdef", "ifndef":
+		name, valid := configDependencyMacroIdentifier(rest)
+		if valid && name == rest {
+			return []string{name}
+		}
+	case "if", "elif":
+		return configDependencyCompilerLiteralDefinedHints(rest)
+	}
+	return nil
 }
 
 // This recognizes literal defined operands, not macro-expanded expressions.

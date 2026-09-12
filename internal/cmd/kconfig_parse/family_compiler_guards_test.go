@@ -2140,7 +2140,8 @@ func TestFamilyCompilerGuardLimitDiagnosticsPreserveBoundaries(t *testing.T) {
 					}
 				case "bytes":
 					reason, maximum = "estimated_bytes_limit", maxFamilyCompilerGuardBytes/2
-					p.bytes = maximum - len(contextJSON) - 64 - 4 - familyCompilerGuardQueryReferenceBytes - itemBytes
+					cost, _, _ := familyCompilerGuardContextCost(query.compilerContext(), nil)
+					p.bytes = maximum - cost - familyCompilerGuardQueryReferenceBytes - itemBytes
 				case "expanded bytes":
 					reason, maximum = "expanded_bytes_limit", maxFamilyCompilerGuardExpandedBytes
 					p.expandedBytes = maximum - len(contextJSON) - familyCompilerGuardQueryReferenceBytes - itemBytes

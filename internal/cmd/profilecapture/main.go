@@ -1,6 +1,6 @@
-// profilecapture runs a diagnostic copy of one compiler-guard planner action.
+// profilecapture runs a diagnostic copy of a compiler-guard or Kbuild discovery action.
 // It publishes only a checked gzip capture, never a planner result or receipt.
-// A successful go tool pprof parse is still required before interpreting it.
+// A successful profile-format parse is still required before interpreting it.
 package main
 
 import (
@@ -60,7 +60,7 @@ func capturePlannerArgumentsForKind(original []string, scratch string, duration 
 		switch name {
 		case "cpu_profile", "heap_profile", "profile_duration":
 			return nil, fmt.Errorf("original planner argv already contains -%s", name)
-		case "family_execution_mode", "family_compiler_guard_manifest_out", "family_compiler_guard_plan_out":
+		case "family_execution_mode", "family_compiler_guard_manifest_out", "family_compiler_guard_plan_out", "kbuild_probe_plan_out":
 			if seen[name] {
 				return nil, fmt.Errorf("duplicate -%s", name)
 			}
@@ -85,6 +85,9 @@ func capturePlannerArgumentsForKind(original []string, scratch string, duration 
 			if name == "family_compiler_guard_plan_out" {
 				replacement = filepath.Join(scratch, "plan")
 			}
+			if name == "kbuild_probe_plan_out" {
+				replacement = filepath.Join(scratch, "kbuild-plan")
+			}
 			if joined {
 				prefix, _, _ := strings.Cut(argument, "=")
 				arguments[index] = prefix + "=" + replacement
@@ -93,8 +96,13 @@ func capturePlannerArgumentsForKind(original []string, scratch string, duration 
 			}
 		}
 	}
-	for _, name := range []string{"family_execution_mode", "family_compiler_guard_manifest_out", "family_compiler_guard_plan_out"} {
-		if !seen[name] {
+	guardFlags := []string{"family_execution_mode", "family_compiler_guard_manifest_out", "family_compiler_guard_plan_out"}
+	for _, name := range guardFlags {
+		if seen["kbuild_probe_plan_out"] {
+			if seen[name] {
+				return nil, fmt.Errorf("Kbuild discovery profile mixes guard and Kbuild outputs")
+			}
+		} else if !seen[name] {
 			return nil, fmt.Errorf("missing -%s", name)
 		}
 	}
@@ -268,7 +276,7 @@ func captureProfile(parent context.Context, options captureOptions, stdout, stde
 	if err := os.Rename(validated, out); err != nil {
 		return err
 	}
-	fmt.Fprintln(stderr, "profilecapture: gzip capture only; run go tool pprof -top before interpreting samples; no planner result published")
+	fmt.Fprintln(stderr, "profilecapture: gzip capture only; validate profile format before interpreting samples; no planner result published")
 	return nil
 }
 
