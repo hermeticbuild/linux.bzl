@@ -1,11 +1,138 @@
 package kconfig
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
 	"testing"
 )
+
+// These identities pin the pre-template constructor, including its ordered
+// dependencies. Query-context extraction must not invalidate remote artifacts.
+func TestCompilerProjectedRequestTemplateParity(t *testing.T) {
+	for _, context := range []string{"literal", "symbolic", "source-shell"} {
+		for _, query := range []string{"predefines", "definedness", "optional", "intrinsic"} {
+			t.Run(context+"/"+query, func(t *testing.T) {
+				evaluator, first, second := sourceShellWordsEvaluatorForTest(t, "target")
+				evaluator.sourceRoot = "/fixture/linux"
+				evaluator.sourceArchitecture = "x86"
+				evaluator.tools = map[string]string{"cc": "compiler", "ld": "linker"}
+				scopes := &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{"target": evaluator}}
+				arguments := []string{"-DVALUE=7", "-DVALUE=8", "-UOTHER", "-include", "/fixture/linux/forced.h", "unit.c"}
+				environment := map[string]string{"MODE": "/fixture/linux/include", "LD": "${tool:ld}"}
+				switch context {
+				case "symbolic":
+					arguments = append(arguments, first)
+					environment["MODE"] = second + first
+				case "source-shell":
+					wrapped, err := evaluator.renderSourceShellWords(second)
+					if err != nil {
+						t.Fatal(err)
+					}
+					arguments = append(arguments, wrapped, first)
+					environment["MODE"] = second + first
+				}
+				projection := ProbeCandidateProjectionCompilerPredefines
+				managed := []string{"-E", "-P", "-x", "c", "-"}
+				stdin := "#if defined(__ANSWER)\n1\n#else\n0\n#endif\n"
+				outcome := ProbeOutcome{Kind: "text", Step: query, Stream: "stdout", RequireSuccess: true}
+				switch query {
+				case "predefines":
+					managed = []string{"-dM", "-E", "-x", "c", "-"}
+					stdin = ""
+				case "optional":
+					outcome = ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{Operator: "exit-zero", Step: query}}
+				case "intrinsic":
+					projection = ProbeCandidateProjectionCompilerIntrinsic
+					stdin = "#undef deprecated\n__has_attribute(deprecated)\n"
+				}
+				probe, err := scopes.compilerProjectedRequestWithProjection("target", "cc", "c", arguments,
+					[]string{"unit.c", "unit.c"}, environment, query, managed, stdin, outcome, projection)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request, err := probe.request.CanonicalJSON()
+				if err != nil {
+					t.Fatal(err)
+				}
+				dependencies, err := json.Marshal(probe.dependencies)
+				if err != nil {
+					t.Fatal(err)
+				}
+				identity := fmt.Sprintf("%x", sha256.Sum256(append(append(request, '\n'), dependencies...)))
+				want := map[string]string{
+					"literal/predefines":       "ae37d4da20d0de7b4b96c1247872b08f8503d65d02c82015b6b029b8ba3977f0",
+					"literal/definedness":      "33b4b074fc93c0045674deb1c3f2fd9b5104d395f22b18bc35c8019ed647e345",
+					"literal/optional":         "57109e51d40b03ba3408ad5b50daf835d0548a92a5747385403567ee544c9899",
+					"literal/intrinsic":        "71da40ece211adbbf386d30f4fcec3eb166870693ed543d41cd9102b2592579b",
+					"symbolic/predefines":      "8e3b32f4eeb38ff6fb341b2c0c49731d2e40759369b65054686b26fcd9100d31",
+					"symbolic/definedness":     "a7b25aae7002c275968ec2eac9d36dfda63f9c3c05ae52ecaffbc1b4aef41bf7",
+					"symbolic/optional":        "544d0f5dc8143f2e067aeda13d3c3bc33a4c93e018b096b2e894e2586086ba5d",
+					"symbolic/intrinsic":       "d79348214c45d0dc3519483c7c756558377ea8044ca6aaa5afa3bd3e55cfcb28",
+					"source-shell/predefines":  "440d59c89c885f5fe37ef42a2013448601f3582061aaa4392d93001ed7bac2f7",
+					"source-shell/definedness": "69ef0627159b03d32746ab16f5de08f05e34f39ef7f7e1d8f74342254e023797",
+					"source-shell/optional":    "5d92c7ae1c7b8df8fae8c811f3e4e20246438a1784a9fd055d221bb8bf9b4eaa",
+					"source-shell/intrinsic":   "fd3e6a71d241b223c197bf5c0a9b441bec95e0dcaddc868768820ae8470f1b91",
+				}
+				if identity != want[context+"/"+query] {
+					t.Fatalf("request/dependency identity = %s", identity)
+				}
+				template, err := scopes.compilerProjectedContext("target", "cc", "c", arguments,
+					[]string{"unit.c"}, environment, projection)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Mutate caller inputs and every populated mutable output shape.
+				// The same immutable context must still reproduce the pinned bytes.
+				arguments[0], environment["MODE"] = "changed", "changed"
+				for attempt := range 2 {
+					reused, err := template.query(query, managed, stdin, outcome)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got, err := reused.request.CanonicalJSON()
+					if err != nil || string(got) != string(request) || !slices.Equal(reused.dependencies, probe.dependencies) {
+						t.Fatalf("context reuse %d changed request or ordered dependencies: %v", attempt, err)
+					}
+					step := &reused.request.Steps[0]
+					step.Arguments[0], step.AuxiliaryTools[0] = "changed", "changed"
+					step.Candidate.Base[0], step.Candidate.TranslationUnits[0] = 999, "changed"
+					step.Environment["LD"] = "changed"
+					for index := range step.ConditionalArguments {
+						step.ConditionalArguments[index].Arguments[0] = "changed"
+						step.ConditionalArguments[index].When.Operator = "changed"
+					}
+					for index := range step.ArgumentFragments {
+						step.ArgumentFragments[index].Fragments[0].Value = "changed"
+					}
+					for index := range step.EnvironmentFragments {
+						step.EnvironmentFragments[index].Fragments[0].Value = "changed"
+					}
+					if len(reused.dependencies) != 0 {
+						reused.dependencies[0].NodeID = "changed"
+					}
+				}
+				transferred, err := template.consume(query, managed, stdin, outcome)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := transferred.request.CanonicalJSON()
+				if err != nil || string(got) != string(request) || !slices.Equal(transferred.dependencies, probe.dependencies) {
+					t.Fatalf("context transfer changed request or ordered dependencies: %v", err)
+				}
+				if _, err := template.query(query, managed, stdin, outcome); err == nil {
+					t.Fatal("consumed context was reused")
+				}
+				if _, err := template.consume(query, managed, stdin, outcome); err == nil {
+					t.Fatal("context was transferred twice")
+				}
+			})
+		}
+	}
+}
 
 func TestKbuildCompilerGuardAnswersRetainValueSensitivePayloads(t *testing.T) {
 	for _, test := range []struct {

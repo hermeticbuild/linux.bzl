@@ -2885,6 +2885,33 @@ func (s *KbuildProbeScopes) compilerProjectedRequestWithProjection(
 	outcome ProbeOutcome,
 	projection string,
 ) (*compilerProjectedProbe, error) {
+	context, err := s.compilerProjectedContext(scope, role, language, arguments, translationUnits, environment, projection)
+	if err != nil {
+		return nil, err
+	}
+	// This path owns a fresh context. Transfer it without the extra deep copy
+	// needed when multiple queries borrow a retained context.
+	return context.consume(stepName, managedArguments, stdin, outcome)
+}
+
+// compilerQueryContext owns the source-selected, authenticated argument and
+// environment templates before any particular query is attached. It is local
+// to its owning evaluator: this is not yet a serialized discovery handoff or
+// a source-closure proof. Neither query construction nor returned requests may
+// mutate the context. Predefine and value-sensitive contexts remain distinct.
+type compilerQueryContext struct {
+	evaluator    *LinuxProbeEvaluator
+	scope        string
+	step         ProbeStep
+	dependencies []ProbeReference
+}
+
+func (s *KbuildProbeScopes) compilerProjectedContext(
+	scope, role, language string,
+	arguments, translationUnits []string,
+	environment map[string]string,
+	projection string,
+) (*compilerQueryContext, error) {
 	if s == nil || s.evaluators[scope] == nil {
 		return nil, fmt.Errorf("Kbuild probe workload has no %s scope", scope)
 	}
@@ -2945,19 +2972,67 @@ func (s *KbuildProbeScopes) compilerProjectedRequestWithProjection(
 		})
 		delete(literalEnvironment, name)
 	}
-	dependencies := slices.Clone(lowerer.dependencies)
-	base = append(base, managedArguments...)
-	step := ProbeStep{
-		Name:                 stepName,
-		Tool:                 role,
-		Arguments:            base,
-		Stdin:                stdin,
-		ConditionalArguments: conditional,
-		ArgumentFragments:    fragments,
-		Candidate:            candidate,
-		Environment:          literalEnvironment,
-		EnvironmentFragments: environmentFragments,
+	return &compilerQueryContext{
+		evaluator: evaluator,
+		scope:     scope,
+		step: ProbeStep{
+			Tool:                 role,
+			Arguments:            base,
+			ConditionalArguments: conditional,
+			ArgumentFragments:    fragments,
+			Candidate:            candidate,
+			Environment:          literalEnvironment,
+			EnvironmentFragments: environmentFragments,
+		},
+		dependencies: slices.Clone(lowerer.dependencies),
+	}, nil
+}
+
+func (context *compilerQueryContext) query(
+	stepName string,
+	managedArguments []string,
+	stdin string,
+	outcome ProbeOutcome,
+) (*compilerProjectedProbe, error) {
+	if context == nil || context.evaluator == nil {
+		return nil, fmt.Errorf("compiler query context is nil or consumed")
 	}
+	// Deep-copy also the candidate ownership masks and predicate trees, which
+	// canonicalSourceRequest deliberately does not clone. A returned request
+	// must not be able to change later queries instantiated from this context.
+	request := cloneLinuxProbeRequest(ProbeRequest{
+		Steps:   []ProbeStep{context.step},
+		Outcome: outcome,
+	})
+	owned := *context
+	owned.step = request.Steps[0]
+	owned.dependencies = slices.Clone(context.dependencies)
+	return owned.consume(stepName, managedArguments, stdin, request.Outcome)
+}
+
+// consume transfers a fresh, unshared context into one request. A retained
+// context must use query instead. Clearing the source prevents accidental reuse.
+func (context *compilerQueryContext) consume(
+	stepName string,
+	managedArguments []string,
+	stdin string,
+	outcome ProbeOutcome,
+) (*compilerProjectedProbe, error) {
+	if context == nil || context.evaluator == nil {
+		return nil, fmt.Errorf("compiler query context is nil or consumed")
+	}
+	evaluator, scope, role := context.evaluator, context.scope, context.step.Tool
+	dependencies := context.dependencies
+	request := ProbeRequest{
+		Schema:     LinuxProbeRequestSchema,
+		InputCount: len(dependencies),
+		Steps:      []ProbeStep{context.step},
+		Outcome:    outcome,
+	}
+	*context = compilerQueryContext{}
+	step := request.Steps[0]
+	step.Name, step.Stdin = stepName, stdin
+	step.Arguments = append(step.Arguments, managedArguments...)
 	auxiliary := []string{}
 	for referenced := range probeStepTemplateToolRoles(step) {
 		if referenced == role {
@@ -2973,12 +3048,7 @@ func (s *KbuildProbeScopes) compilerProjectedRequestWithProjection(
 	}
 	sort.Strings(auxiliary)
 	step.AuxiliaryTools = auxiliary
-	request := ProbeRequest{
-		Schema:     LinuxProbeRequestSchema,
-		InputCount: len(dependencies),
-		Steps:      []ProbeStep{step},
-		Outcome:    outcome,
-	}
+	request.Steps[0] = step
 	// Symbol lowering can leave literal ActionRecipe capabilities (for example
 	// ${work:root} in an exported Make value) which this standalone compiler
 	// query cannot bind. Validate exactly the source-normalized request that
