@@ -330,12 +330,18 @@ func (r ProbeRequest) CanonicalJSON() ([]byte, error) {
 }
 
 func (r ProbeRequest) ID() (string, error) {
-	data, err := r.CanonicalJSON()
-	if err != nil {
+	if err := r.Validate(); err != nil {
 		return "", err
 	}
-	digest := sha256.Sum256(data)
-	return hex.EncodeToString(digest[:]), nil
+	// Encoder uses the same default JSON escaping and trailing newline as
+	// CanonicalJSON, but writes its buffer straight to the digest. Large
+	// compiler query programs need not be copied into a caller-owned byte slice
+	// when only their identity is needed. Validation remains identical.
+	digest := sha256.New()
+	if err := json.NewEncoder(digest).Encode(r); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func (r ProbeRequest) ToolRoles() []string {
@@ -912,6 +918,12 @@ func validateProbeWorkingDirectory(value string, sourceRoots map[string]bool, sc
 }
 
 func validateProbeTemplate(value string, scratch, sources, sourceRoots map[string]bool, inputCount int) error {
+	// Most large compiler-query programs contain no template placeholders.
+	// No declaration or malformed-placeholder check can apply without this
+	// prefix; avoid constructing a complete ReplaceAllString copy in that case.
+	if !strings.Contains(value, "${") {
+		return nil
+	}
 	for _, match := range probePlaceholder.FindAllStringSubmatch(value, -1) {
 		switch match[1] {
 		case "scratch":

@@ -235,8 +235,11 @@ func configDependencyCallCoverageCandidate(set ConfigDependencySet) bool {
 	// Only schedule its refinement when a reachable definition uses #; ordinary
 	// cached scans retain their existing cost and discovery behavior. Retain the
 	// original set whenever the complete source/namespace proof fails.
+	// A graph-reachable pragma can likewise be an unused or stringified
+	// argument. This only schedules a complete proof; actual effects still fail.
 	return !set.Opaque && set.refineMacroCalls ||
-		set.Opaque && strings.Contains(set.Reason, "through reachable token pasting macro ")
+		set.Opaque && (strings.Contains(set.Reason, "through reachable token pasting macro ") ||
+			set.Reason == "compiler source closure reaches an unmodeled _Pragma effect")
 }
 
 // The shared compiler probe canonicalizes source-selected object-like -D

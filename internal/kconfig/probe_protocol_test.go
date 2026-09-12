@@ -1,6 +1,9 @@
 package kconfig
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -9,6 +12,83 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestProbeRequestDigestMatchesCanonicalBytes(t *testing.T) {
+	for _, text := range []string{"", "hello\n", "<>&\"\\\t\r\n", "é\u2028\u2029", strings.Repeat("#if defined(SOURCE_HEADER_GUARD)\n1\n#else\n0\n#endif\n", 16000)} {
+		request := testProbeRequest()
+		request.Steps[0].Stdin = text
+		request.Steps[0].Environment = map[string]string{"Z_LAST": "value", "A_FIRST": "<>&\""}
+		data, err := request.CanonicalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := sha256.Sum256(data)
+		got, err := request.ID()
+		if err != nil || got != hex.EncodeToString(want[:]) {
+			t.Fatalf("digest of %d input bytes = %q, %v; want exact canonical digest %x", len(text), got, err, want)
+		}
+		request.Steps[0].Stdin += "changed"
+		changed, err := request.ID()
+		if err != nil || got == changed {
+			t.Fatalf("mutation reused identity: %q, %v", changed, err)
+		}
+	}
+	invalid := testProbeRequest()
+	invalid.Schema = "invalid"
+	if got, err := invalid.ID(); err == nil || got != "" {
+		t.Fatalf("invalid request got identity %q: %v", got, err)
+	}
+}
+
+func TestProbeTemplateLiteralDoesNotCopyProgram(t *testing.T) {
+	literal := strings.Repeat("#if defined(SOURCE_HEADER_GUARD)\n1\n#else\n0\n#endif\n", 16000)
+	if allocations := testing.AllocsPerRun(10, func() {
+		if err := validateProbeTemplate(literal, nil, nil, nil, 0); err != nil {
+			t.Fatal(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("literal template copied its program: %.0f allocations", allocations)
+	}
+	for _, suffix := range []string{"${", "${unsupported:x}", "${scratch:missing}", "${result:00000000.text}"} {
+		if err := validateProbeTemplate(literal+suffix, nil, nil, nil, 0); err == nil {
+			t.Fatalf("literal prefix hid invalid template suffix %q", suffix)
+		}
+	}
+	if err := validateProbeTemplate(literal+"${scratch:present}", map[string]bool{"present": true}, nil, nil, 0); err != nil {
+		t.Fatalf("valid template suffix rejected: %v", err)
+	}
+}
+
+func BenchmarkProbeRequestIdentity(b *testing.B) {
+	names := make([]string, 16000)
+	for i := range names {
+		names[i] = fmt.Sprintf("SOURCE_HEADER_GUARD_%05d", i)
+	}
+	_, source, err := compilerDefinednessSource(names)
+	if err != nil {
+		b.Fatal(err)
+	}
+	request := testProbeRequest()
+	request.Steps[0].Stdin = source
+	for _, buffered := range []bool{true, false} {
+		b.Run(fmt.Sprintf("canonical_copy_%t", buffered), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(source)))
+			for b.Loop() {
+				if buffered {
+					data, err := request.CanonicalJSON()
+					if err != nil {
+						b.Fatal(err)
+					}
+					digest := sha256.Sum256(data)
+					_ = hex.EncodeToString(digest[:])
+				} else if _, err := request.ID(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
 
 func testProbeRequest() ProbeRequest {
 	return ProbeRequest{

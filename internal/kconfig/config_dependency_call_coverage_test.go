@@ -7,6 +7,58 @@ import (
 	"testing"
 )
 
+func TestConfigDependencyCallCoveragePragmaExpansionOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		body   string
+		opaque bool
+	}{
+		{"unused_argument", "DROP(EFFECT)\n", false},
+		{"stringified_argument", "RAW(EFFECT)\n", false},
+		{"inactive_branch", "#if 0\nEFFECT\n#endif\n", false},
+		{"actual_effect", "EFFECT\n", true},
+		{"prescanned_effect", "ID(EFFECT)\n", true},
+		{"conditional_effect", "#if ID(EFFECT)\nCONFIG_OTHER\n#endif\n", true},
+		{"direct_pragma", "#pragma once\n", true},
+		{"macro_stack", "#pragma push_macro(\"DROP\")\n", true},
+		{"unknown_tail", "DROP(EFFECT)\n__UNMEASURED_TAIL\n", true},
+	} {
+		for _, crossHeader := range []bool{false, true} {
+			for _, measured := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/header-%t/measured-%t", tc.name, crossHeader, measured), func(t *testing.T) {
+					definitions := "#define PICK(x) CONFIG_ ## x\n#define DROP(x) 1\n#define RAW(x) #x\n#define ID(x) x\n#define EFFECT _Pragma(\"GCC diagnostic ignored \\\"-Wunused\\\"\")\n"
+					body := "PICK(DRIVER)\n" + tc.body
+					files := map[string]string{"drivers/example/driver.c": definitions + body}
+					wantSources := []string{"drivers/example/driver.c"}
+					if crossHeader {
+						files["drivers/example/driver.c"] = "#include <effect.h>\n" + body
+						files["include/effect.h"] = definitions
+						wantSources = append(wantSources, "include/effect.h")
+					}
+					plan, node := configDependencyCompilePlanForTest(t, files, []string{"-nostdinc", "-I${tree:kernel}/include", "-c", "drivers/example/driver.c"}, nil)
+					configDependencySetCompilerContractForTest(plan, node, CompactKbuildActionContract{})
+					if measured {
+						plan.metadata.compilerPredefines = func(_, _, _ string, _, _ []string, _ map[string]string) (string, bool, error) {
+							return "", true, nil
+						}
+					}
+					set, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
+					wantOpaque := tc.opaque || !measured
+					if err != nil || set.Opaque != wantOpaque {
+						t.Fatalf("effect proof = %#v, %v; want opaque=%t", set, err, wantOpaque)
+					}
+					if !wantOpaque && (!slices.Equal(set.Symbols, []string{"CONFIG_DRIVER"}) || !slices.Equal(set.SourcePaths, wantSources)) {
+						t.Fatalf("complete proof lost exact reads or source: %#v", set)
+					}
+					if wantOpaque && (len(set.Symbols) != 0 || len(set.SourcePaths) != 0 || len(set.ObjectPaths) != 0) {
+						t.Fatalf("incomplete effect proof published a prefix: %#v", set)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestConfigDependencyCallCoverageStringificationReadsThroughProductionScanner(t *testing.T) {
 	for _, paste := range []bool{false, true} {
 		for _, enabled := range []bool{false, true} {
@@ -152,6 +204,35 @@ func TestConfigDependencyCallCoverageStringificationCompilerReplacements(t *test
 				t.Fatalf("compiler replacement reads lost precision or authority: %#v, %v", set, err)
 			}
 		})
+	}
+}
+
+func TestConfigDependencyCallCoverageFreshPasteThroughProductionScanner(t *testing.T) {
+	for _, tail := range []string{"", "__UNMEASURED_PASTE_TAIL\n"} {
+		for _, measured := range []bool{false, true} {
+			t.Run(fmt.Sprintf("opaque-tail-%t/measured-%t", tail != "", measured), func(t *testing.T) {
+				plan, node := configDependencyCompilePlanForTest(t, map[string]string{
+					"drivers/example/driver.c": "#include <fresh-paste.h>\nFWD(LEFT,RIGHT)\n" + tail,
+					"include/fresh-paste.h":    "#define LEFT LEFT\n#define RIGHT RIGHT\n#define LEFTRIGHT CONFIG_DRIVER\n#define JOIN(a,b) a##b\n#define FWD(a,b) JOIN(a,b)\n",
+				}, []string{"-nostdinc", "-I${tree:kernel}/include", "-c", "drivers/example/driver.c"}, nil)
+				configDependencySetCompilerContractForTest(plan, node, CompactKbuildActionContract{})
+				if measured {
+					plan.metadata.compilerPredefines = func(_, _, _ string, _, _ []string, _ map[string]string) (string, bool, error) { return "", true, nil }
+				}
+				set, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
+				wantOpaque := tail != "" || !measured
+				if err != nil || set.Opaque != wantOpaque {
+					t.Fatalf("fresh paste proof = %#v, %v; want opaque=%t", set, err, wantOpaque)
+				}
+				if wantOpaque {
+					if len(set.Symbols) != 0 || len(set.SourcePaths) != 0 || len(set.ObjectPaths) != 0 {
+						t.Fatalf("incomplete paste proof published a prefix: %#v", set)
+					}
+				} else if !slices.Equal(set.Symbols, []string{"CONFIG_DRIVER"}) || !slices.Equal(set.SourcePaths, []string{"drivers/example/driver.c", "include/fresh-paste.h"}) {
+					t.Fatalf("fresh paste lost exact config/source reads: %#v", set)
+				}
+			})
+		}
 	}
 }
 

@@ -2929,7 +2929,13 @@ func interpretConfigDependencyConditionalProgramWithCalls(
 	if program.macroStack {
 		return nil, "source uses an unmodeled macro-stack pragma"
 	}
-	if effect != nil && program.reachablePragma {
+	// The summary cannot distinguish an expanded effect from a discarded or
+	// stringified argument. Only the complete ordered call scanner can prove
+	// that distinction. Keep the summary guard for definedness/text-only paths;
+	// the full scanner rejects actual effects in ordinary and conditional
+	// expansion and publishes nothing unless the entire closure succeeds.
+	completeCalls := textEffect != nil && conditionEffect != nil && macroWriteEffect != nil
+	if effect != nil && program.reachablePragma && !completeCalls {
 		return nil, "conditionally interpreted compiler source uses an unmodeled reachable _Pragma effect"
 	}
 	active := configDependencyMacroDefined

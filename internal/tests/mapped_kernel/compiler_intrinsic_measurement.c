@@ -11,3 +11,13 @@ enum { MAPPED_SELF_VALUE = 17 };
 #define MAPPED_SELF_VALUE MAPPED_SELF_VALUE + 1
 #define MAPPED_IDENTITY(x) x
 const unsigned char measured_self_reference_prescan = MAPPED_IDENTITY(MAPPED_SELF_VALUE);
+
+/* Both operands become unavailable during prescan. Pasting creates a fresh
+ * identifier, whose own self-reference is suppressed only after expansion. */
+enum { MAPPED_LEFTMAPPED_RIGHT = 19 };
+#define MAPPED_LEFT MAPPED_LEFT
+#define MAPPED_RIGHT MAPPED_RIGHT
+#define MAPPED_LEFTMAPPED_RIGHT MAPPED_LEFTMAPPED_RIGHT + 2
+#define MAPPED_RAW_PASTE(a, b) a ## b
+#define MAPPED_PASTE(a, b) MAPPED_RAW_PASTE(a, b)
+const unsigned char measured_fresh_paste = MAPPED_PASTE(MAPPED_LEFT, MAPPED_RIGHT);

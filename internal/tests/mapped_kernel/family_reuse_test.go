@@ -704,6 +704,10 @@ func TestFamilyVariantImagesAreActuallyBuilt(t *testing.T) {
 	if selfReference != 18 {
 		t.Fatalf("independent compiler self-reference prescan byte = %d, want enum value 17 plus one", selfReference)
 	}
+	freshPaste := compiledObjectSymbolByte(t, measurementObject, "measured_fresh_paste")
+	if freshPaste != 21 {
+		t.Fatalf("independent compiler fresh paste byte = %d, want enum value 19 plus two", freshPaste)
+	}
 	for _, variant := range []struct {
 		name  string
 		image []byte
@@ -724,6 +728,9 @@ func TestFamilyVariantImagesAreActuallyBuilt(t *testing.T) {
 		}
 		if got := compiledObjectSymbolByte(t, variant.image, "mapped_self_reference_prescan"); got != selfReference {
 			t.Errorf("%s self-reference prescan byte = %d, independent compiler measurement = %d", variant.name, got, selfReference)
+		}
+		if got := compiledObjectSymbolByte(t, variant.image, "mapped_fresh_paste"); got != freshPaste {
+			t.Errorf("%s fresh paste byte = %d, independent compiler measurement = %d", variant.name, got, freshPaste)
 		}
 		// These mixed calls belong to smoke.c's one exact compiler invocation.
 		// Compare C expressions and source-wrapper #if branches with an actual

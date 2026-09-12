@@ -715,12 +715,10 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 			if n == 0 || n+1 == len(substituted) {
 				return nil, 0, fmt.Errorf("missing paste operand")
 			}
-			// Pasting produces a new token spelling with distinct expansion
-			// eligibility. Keep that case opaque rather than discard or
-			// combine an operand's permanent suppression without a proof.
-			if substituted[n-1].unavailable || substituted[n+1].unavailable {
-				return nil, 0, fmt.Errorf("unsupported paste of unavailable token")
-			}
+			// A valid paste creates a fresh occurrence: neither operand's
+			// permanent suppression belongs to the newly lexed token. Rescan
+			// still authenticates its new binding and applies the active macro
+			// context, so forming an active macro does not re-enable it.
 			joined, err := configDependencyMacroCallLex(substituted[n-1].originalSpelling()+substituted[n+1].originalSpelling(), m.mode)
 			if err != nil || len(joined) != 1 || joined[0].text == "##" ||
 				strings.Contains("\\$@`", joined[0].text) {

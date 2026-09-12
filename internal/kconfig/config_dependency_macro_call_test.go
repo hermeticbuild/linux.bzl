@@ -136,12 +136,66 @@ func TestConfigDependencyMacroCallUnavailableTokenDoesNotMutateDefinition(t *tes
 	}
 }
 
+func TestConfigDependencyMacroCallPasteCreatesFreshOccurrence(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		definitions []string
+		input, want string
+		reads       []string
+	}{
+		{"left", []string{"A A", "JOIN(a,b) a##b", "FWD(a,b) JOIN(a,b)"}, "FWD(A,X)", "AX", nil},
+		{"right", []string{"X X", "JOIN(a,b) a##b", "FWD(a,b) JOIN(a,b)"}, "FWD(A,X)", "AX", nil},
+		{"both", []string{"A A", "X X", "AX CONFIG_DRIVER", "JOIN(a,b) a##b", "FWD(a,b) JOIN(a,b)"}, "FWD(A,X)", "CONFIG_DRIVER", []string{"CONFIG_DRIVER"}},
+		{"fresh function", []string{"A A", "AX(v) CONFIG_DRIVER + v", "JOIN(a,b) a##b(3)", "FWD(a,b) JOIN(a,b)"}, "FWD(A,X)", "CONFIG_DRIVER + 3", []string{"CONFIG_DRIVER"}},
+		{"active result", []string{"A A", "AX FWD(A,X)", "JOIN(a,b) a##b", "FWD(a,b) JOIN(a,b)"}, "FWD(A,X)", "FWD ( A , X )", nil},
+		{"new self reference", []string{"A A", "AX AX + CONFIG_DRIVER", "JOIN(a,b) a##b", "FWD(a,b) JOIN(a,b)"}, "FWD(A,X)", "AX + CONFIG_DRIVER", []string{"CONFIG_DRIVER"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			catalog, err := configDependencyMacroCallFixtureCatalogForTest(tc.definitions...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := configDependencyMacroCallFixtureExpandForTest(catalog, tc.input)
+			if err != nil || strings.Join(got.Tokens, " ") != tc.want || !slices.Equal(got.ConfigReads, tc.reads) {
+				t.Fatalf("fresh paste = %#v, %v; want %q, reads %q", got, err, tc.want, tc.reads)
+			}
+			for name, definitions := range catalog {
+				if !slices.ContainsFunc(got.DefinitionReads, func(read configDependencyMacroCallRead) bool {
+					return read.Name == name && read.State == configDependencyMacroDefined &&
+						read.Origin == definitions[0].origin && read.DefinitionID == definitions[0].identity
+				}) {
+					t.Fatalf("paste lost authenticated binding for %s: %#v", name, got.DefinitionReads)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigDependencyMacroCallFreshPasteRequiresNewBinding(t *testing.T) {
+	catalog, err := configDependencyMacroCallFixtureCatalogForTest("A A", "X X", "JOIN(a,b) a##b", "FWD(a,b) JOIN(a,b)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolve := configDependencyMacroCallFixtureResolver(catalog)
+	for _, state := range []configDependencyMacroDefinition{configDependencyMacroUnknown, configDependencyMacroDefined} {
+		got, reason := configDependencyMacroCallExpand("CONFIG_BEFORE FWD(A,X)", func(name string) (configDependencyMacroCallBinding, string) {
+			if name == "AX" {
+				return configDependencyMacroCallBinding{state: state}, ""
+			}
+			return resolve(name)
+		}, configDependencyMacroCallMode{dollarAsPunctuation: true})
+		if reason == "" || !reflect.DeepEqual(got, configDependencyMacroCallResult{}) {
+			t.Fatalf("fresh spelling reused operand authority: %#v, %q", got, reason)
+		}
+	}
+}
+
 func TestConfigDependencyMacroCallSelfReferenceKeepsUnsupportedBoundaries(t *testing.T) {
 	for _, test := range []struct {
 		definitions   []string
 		input, reason string
 	}{
-		{[]string{"A A", "JOIN(a,b) a##b", "FWD(a,b) JOIN(a,b)"}, "CONFIG_BEFORE FWD(A,X)", "paste of unavailable token"},
+		{[]string{"A A", "AX _Pragma(\"bad\")", "JOIN(a,b) a##b", "FWD(a,b) JOIN(a,b)"}, "CONFIG_BEFORE FWD(A,X)", "preprocessing effect"},
 		{[]string{"F(x) F"}, "CONFIG_BEFORE F(0)(1)", "rescan boundary"},
 		{[]string{"A A", "ALIAS JOIN", "JOIN(a,b) a##b"}, "CONFIG_BEFORE A ALIAS(1,UL)", "rescan boundary"},
 		{[]string{"A A"}, "CONFIG_BEFORE A _Pragma(\"bad\")", "preprocessing effect"},
