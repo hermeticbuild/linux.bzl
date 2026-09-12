@@ -596,6 +596,7 @@ func TestRunProjectsFamilyViewFromExactMarkers(t *testing.T) {
 	outputRoot := filepath.Join(dir, "view")
 	firstNode := strings.Repeat("a", 64)
 	secondNode := strings.Repeat("b", 64)
+	markers := []string{}
 	for _, entry := range []struct {
 		node        string
 		slot        string
@@ -613,6 +614,7 @@ func TestRunProjectsFamilyViewFromExactMarkers(t *testing.T) {
 		if err := os.WriteFile(marker, nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
+		markers = append(markers, marker)
 		source := filepath.Join(storeRoot, "nodes", entry.node, entry.slot)
 		if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
 			t.Fatal(err)
@@ -635,6 +637,8 @@ func TestRunProjectsFamilyViewFromExactMarkers(t *testing.T) {
 		"-family_view_store_root", storeRoot,
 		"-family_view_output_root", outputRoot,
 		"-family_view_expected_count", "2",
+		"-family_view_marker", markers[0],
+		"-family_view_marker", markers[1],
 		"-preserve_mode",
 	}); err != nil {
 		t.Fatal(err)
@@ -693,12 +697,12 @@ func TestProjectFamilyViewFailsClosed(t *testing.T) {
 	}{
 		{name: "wrong count", marker: validMarker, expected: 2, preserve: true, want: "contains 1 markers"},
 		{name: "nonempty marker", marker: validMarker, markerContent: []byte("unexpected"), expected: 1, preserve: true, want: "not an empty regular file"},
-		{name: "bad digest", marker: "from/not-a-digest/00000000/at/result", expected: 1, preserve: true, want: "unexpected marker directory"},
+		{name: "bad digest", marker: "from/not-a-digest/00000000/at/result", expected: 1, preserve: true, want: "invalid grammar"},
 		{name: "missing mode", marker: validMarker, expected: 1, want: "requires -preserve_mode"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			planRoot, storeRoot, outputRoot := makeFixture(t, test.marker, test.markerContent)
-			err := projectFamilyView(planRoot, "base", "image", storeRoot, outputRoot, test.expected, test.preserve)
+			err := projectFamilyView(planRoot, "base", "image", storeRoot, outputRoot, test.expected, test.preserve, []string{filepath.Join(planRoot, "variants", "base", "view", "image", filepath.FromSlash(test.marker))})
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("projectFamilyView error = %v, want %q", err, test.want)
 			}

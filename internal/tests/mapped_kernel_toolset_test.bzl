@@ -1970,8 +1970,55 @@ def mapped_kernel_exec_python_test(name):
         target_under_test = "//internal/tests/mapped_kernel:analysis_smoke",
     )
 
+def _family_view_bounded_cases(env):
+    for prefix in ["batch/", "batch/" + "long-segment/" * 60]:
+        fixture = _family_view_batch_fixture()
+        paths = [child.tree_relative_path for child in fixture.input_directories["plan"].children]
+        for index in range(513):
+            slot = ("00000000" + str(index + 1000))[-8:]
+            artifact = prefix + ("00000000" + str(index))[-8:]
+            paths.append("nodes/target/%s/out/metadata/%s/at/%s" % (fixture.node_id, slot, artifact))
+            for variant in ["base", "debug"]:
+                paths.append("variants/%s/view/metadata/from/%s/%s/at/%s" % (variant, fixture.node_id, slot, artifact))
+        input_directories = dict(fixture.input_directories)
+        input_directories["plan"] = struct(
+            children = [_fake_tree_child(path) for path in paths],
+            directory = "family-plan",
+        )
+        output_directories = dict(fixture.output_directories)
+        output_directories["work"] = _fake_tree_child("work-tree")
+        fake = _fake_map_directory_context()
+        expand_linux_family_plan(
+            fake.template_ctx,
+            input_directories,
+            output_directories,
+            fixture.additional_inputs,
+            fixture.tools,
+            fixture.additional_params,
+        )
+        for variant in ["base", "debug"]:
+            actions = [action for action in fake.actions if action["progress_message"] == "Projecting Linux %s metadata view %%{label}" % variant]
+            asserts.true(env, len(actions) > 1, "large views require bounded projection batches")
+            seen = {}
+            for action in actions:
+                asserts.true(env, len(action["outputs"]) <= 256)
+                markers = _flag_values(action["arguments"][0].values, "-family_view_marker")
+                asserts.equals(env, len(action["outputs"]), len(markers))
+                asserts.equals(env, [len(markers)], _flag_values(action["arguments"][0].values, "-family_view_expected_count"))
+                for marker in markers:
+                    asserts.true(env, marker in action["inputs"], "every named marker is a declared input")
+                path_bytes = 0
+                for artifact in action["inputs"] + action["outputs"]:
+                    path_bytes += len(artifact.path)
+                asserts.true(env, path_bytes <= 64 * 1024, "long paths must also bound projection messages")
+                for output in action["outputs"]:
+                    asserts.false(env, output.name in seen, "each facade leaf must have exactly one writer")
+                    seen[output.name] = True
+            asserts.equals(env, 515, len(seen))
+
 def _mapped_kernel_backend_test_impl(ctx):
     env = unittest.begin(ctx)
+    _family_view_bounded_cases(env)
     _family_source_aggregate_cases(env)
     _family_execution_success_cases(env)
     _family_execution_registration_cases(env)
@@ -1994,9 +2041,9 @@ def _mapped_kernel_backend_test_impl(ctx):
         "LinuxMappedFamilyTarget",
     ], [segment.mnemonic for segment in family_segments])
 
-    # A facade copy is one expanded action per non-empty (variant, tree), not
-    # one action per projected leaf. This fixture has two variants, three
-    # non-empty trees each, and ten leaves in total.
+    # Small facades still use one action per non-empty (variant, tree).
+    # This fixture has two variants, three non-empty trees each, and ten
+    # leaves in total; the large-view case above checks bounded batches.
     fixture = _family_view_batch_fixture()
     fake_context = _fake_map_directory_context()
     expand_linux_family_plan(

@@ -14,7 +14,6 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
@@ -448,185 +447,6 @@ func validateTreeOutputRoot(root string) error {
 	})
 }
 
-type familyViewProjection struct {
-	relative string
-	source   string
-}
-
-func validateFamilyViewDestinations(projections []familyViewProjection) error {
-	destinations := make(map[string]bool, len(projections))
-	for _, projection := range projections {
-		destinations[projection.relative] = true
-	}
-	for _, projection := range projections {
-		for ancestor := path.Dir(projection.relative); ancestor != "."; ancestor = path.Dir(ancestor) {
-			if destinations[ancestor] {
-				return fmt.Errorf("family view destinations %q and %q have a file/subtree collision", ancestor, projection.relative)
-			}
-		}
-	}
-	return nil
-}
-
-func validPlanComponent(value string) bool {
-	if value == "" || len(value) > 240 || !((value[0] >= 'a' && value[0] <= 'z') || (value[0] >= '0' && value[0] <= '9')) {
-		return false
-	}
-	for _, character := range value {
-		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && !strings.ContainsRune("_.+-", character) {
-			return false
-		}
-	}
-	return true
-}
-
-func canonicalRelativePath(value string) bool {
-	return value != "" && !strings.ContainsAny(value, "\\\x00\r\n") && !path.IsAbs(value) && path.Clean(value) == value && value != "." && value != ".." && !strings.HasPrefix(value, "../")
-}
-
-func canonicalDigest(value string) bool {
-	if len(value) != 64 {
-		return false
-	}
-	for _, character := range value {
-		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
-			return false
-		}
-	}
-	return true
-}
-
-func canonicalSlot(value string) bool {
-	if len(value) != 8 {
-		return false
-	}
-	for _, character := range value {
-		if character < '0' || character > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-func validFamilyViewMarkerDirectory(relative string) bool {
-	if relative == "." {
-		return true
-	}
-	parts := strings.Split(filepath.ToSlash(relative), "/")
-	if parts[0] != "from" {
-		return false
-	}
-	if len(parts) == 1 {
-		return true
-	}
-	if !canonicalDigest(parts[1]) {
-		return false
-	}
-	if len(parts) == 2 {
-		return true
-	}
-	if !canonicalSlot(parts[2]) {
-		return false
-	}
-	if len(parts) == 3 {
-		return true
-	}
-	if parts[3] != "at" {
-		return false
-	}
-	if len(parts) == 4 {
-		return true
-	}
-	return canonicalRelativePath(strings.Join(parts[4:], "/"))
-}
-
-func projectFamilyView(planRoot, variant, tree, storeRoot, outputRoot string, expectedCount int, preserveMode bool) error {
-	if planRoot == "" || storeRoot == "" || outputRoot == "" {
-		return fmt.Errorf("family view projection roots must not be empty")
-	}
-	if !validPlanComponent(variant) || !validPlanComponent(tree) {
-		return fmt.Errorf("family view variant/tree %q/%q is invalid", variant, tree)
-	}
-	if expectedCount <= 0 {
-		return fmt.Errorf("family view expected count must be positive")
-	}
-	if !preserveMode {
-		return fmt.Errorf("family view projection requires -preserve_mode")
-	}
-	markerRoot := filepath.Join(planRoot, "variants", variant, "view", tree)
-	projections := make([]familyViewProjection, 0, expectedCount)
-	seenDestinations := map[string]bool{}
-	err := filepath.WalkDir(markerRoot, func(filename string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		relative, err := filepath.Rel(markerRoot, filename)
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			if !validFamilyViewMarkerDirectory(relative) {
-				return fmt.Errorf("family view contains unexpected marker directory %q", filepath.ToSlash(relative))
-			}
-			return nil
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("family view marker %q is a symlink", filepath.ToSlash(relative))
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() || info.Size() != 0 {
-			return fmt.Errorf("family view marker %q is not an empty regular file", filepath.ToSlash(relative))
-		}
-		parts := strings.Split(filepath.ToSlash(relative), "/")
-		if len(parts) < 5 || parts[0] != "from" || !canonicalDigest(parts[1]) || !canonicalSlot(parts[2]) || parts[3] != "at" {
-			return fmt.Errorf("family view marker %q has invalid grammar", filepath.ToSlash(relative))
-		}
-		destination := strings.Join(parts[4:], "/")
-		if !canonicalRelativePath(destination) {
-			return fmt.Errorf("family view marker %q has invalid destination", filepath.ToSlash(relative))
-		}
-		if seenDestinations[destination] {
-			return fmt.Errorf("family view repeats destination %q", destination)
-		}
-		seenDestinations[destination] = true
-		source := filepath.Join(storeRoot, "nodes", parts[1], parts[2])
-		sourceInfo, err := os.Lstat(source)
-		if err != nil {
-			return fmt.Errorf("inspect family view source for %q: %w", destination, err)
-		}
-		if !sourceInfo.Mode().IsRegular() {
-			return fmt.Errorf("family view source for %q is not a regular file", destination)
-		}
-		projections = append(projections, familyViewProjection{relative: destination, source: source})
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if len(projections) != expectedCount {
-		return fmt.Errorf("family view contains %d markers, want %d", len(projections), expectedCount)
-	}
-	sort.Slice(projections, func(i, j int) bool { return projections[i].relative < projections[j].relative })
-	if err := validateFamilyViewDestinations(projections); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(outputRoot, 0o755); err != nil {
-		return fmt.Errorf("create family view output root: %w", err)
-	}
-	if err := validateTreeOutputRoot(outputRoot); err != nil {
-		return err
-	}
-	for _, projection := range projections {
-		if err := copyFile(projection.source, filepath.Join(outputRoot, filepath.FromSlash(projection.relative)), true); err != nil {
-			return fmt.Errorf("project family view %q: %w", projection.relative, err)
-		}
-	}
-	return nil
-}
-
 func decodeArgumentsFile(filename string) ([]string, error) {
 	if filename == "" {
 		return nil, fmt.Errorf("arguments file path is empty")
@@ -710,6 +530,8 @@ func runDirect(args []string) error {
 	viewStoreRoot := flags.String("family_view_store_root", "", "content-addressed family store root")
 	viewOutputRoot := flags.String("family_view_output_root", "", "declared public view output root")
 	viewExpectedCount := flags.Int("family_view_expected_count", 0, "number of exact view markers")
+	var viewMarkers repeatedLine
+	flags.Var(&viewMarkers, "family_view_marker", "exact declared view marker (repeatable)")
 	content := flags.String("content_base64", "", "base64-encoded file contents")
 	preserveMode := flags.Bool("preserve_mode", false, "preserve executable permission bits from a single -input")
 	validateMacroHeader := flags.Bool(validateConfigIndependentMacroHeaderFlag, false, "validate a guarded numeric object-macro header before publishing it")
@@ -732,12 +554,12 @@ func runDirect(args []string) error {
 	}
 	provided := map[string]bool{}
 	flags.Visit(func(value *flag.Flag) { provided[value.Name] = true })
-	viewMode := provided["family_view_plan_root"] || provided["family_view_variant"] || provided["family_view_tree"] || provided["family_view_store_root"] || provided["family_view_output_root"] || provided["family_view_expected_count"]
+	viewMode := provided["family_view_plan_root"] || provided["family_view_variant"] || provided["family_view_tree"] || provided["family_view_store_root"] || provided["family_view_output_root"] || provided["family_view_expected_count"] || provided["family_view_marker"]
 	if viewMode {
 		allowed := map[string]bool{
 			"family_view_plan_root": true, "family_view_variant": true, "family_view_tree": true,
 			"family_view_store_root": true, "family_view_output_root": true,
-			"family_view_expected_count": true, "preserve_mode": true,
+			"family_view_expected_count": true, "family_view_marker": true, "preserve_mode": true,
 		}
 		for name := range provided {
 			if !allowed[name] {
@@ -749,7 +571,7 @@ func runDirect(args []string) error {
 				return fmt.Errorf("family view projection requires -%s", name)
 			}
 		}
-		return projectFamilyView(*viewPlanRoot, *viewVariant, *viewTree, *viewStoreRoot, *viewOutputRoot, *viewExpectedCount, *preserveMode)
+		return projectFamilyView(*viewPlanRoot, *viewVariant, *viewTree, *viewStoreRoot, *viewOutputRoot, *viewExpectedCount, *preserveMode, viewMarkers)
 	}
 	if (*out == "") == (*treeOut == "") {
 		return fmt.Errorf("exactly one of -out or -tree_out is required")

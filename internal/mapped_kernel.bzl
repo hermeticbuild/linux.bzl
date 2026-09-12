@@ -2435,6 +2435,34 @@ def linux_test_family_execution_input_sets(input_sets, nodes):
 def linux_test_family_pinned_outputs(execution, selected_nodes, input_directories):
     return _family_pinned_outputs(execution, selected_nodes, input_directories)
 
+_FAMILY_VIEW_BATCH_MAX_FILES = 256
+_FAMILY_VIEW_BATCH_MAX_PATH_BYTES = 64 * 1024
+
+def _family_view_batches(views, directory, store_root):
+    """Bounds both response file records and exact marker argument bytes."""
+
+    # Bazel 9.1's gRPC client rejects ActionResult messages over 4 MiB. Keep
+    # facade actions well below that limit without changing their outputs or
+    # requiring a client flag. The byte budget also bounds long-path cases.
+    output_root_path = getattr(directory, "path", str(directory))
+    store_root_path = getattr(store_root, "path", str(store_root))
+    batches = []
+    batch = []
+    path_bytes = 0
+    for view in views:
+        size = len(view.marker.path) + len(output_root_path) + len(view.artifact_path) + len(store_root_path) + 128
+        if size > _FAMILY_VIEW_BATCH_MAX_PATH_BYTES:
+            fail("mapped Linux family view path exceeds projection batch budget: %s" % view.artifact_path)
+        if batch and (len(batch) >= _FAMILY_VIEW_BATCH_MAX_FILES or path_bytes + size > _FAMILY_VIEW_BATCH_MAX_PATH_BYTES):
+            batches.append(batch)
+            batch = []
+            path_bytes = 0
+        batch.append(view)
+        path_bytes += size
+    if batch:
+        batches.append(batch)
+    return batches
+
 def expand_linux_family_plan(template_ctx, input_directories, output_directories, additional_inputs, tools, additional_params):
     """Expands one execution-platform segment of the symmetric family DAG."""
     parsed = _parse_family_plan(
@@ -2786,42 +2814,44 @@ def expand_linux_family_plan(template_ctx, input_directories, output_directories
             store_root = output_directories.get(tree)
             if store_root == None:
                 fail("mapped Linux family view %s/%s has no current content-addressed store" % (variant, tree))
-            args = template_ctx.args()
-            _add_artifact_path(args, "-family_view_plan_root", input_directories["plan"].directory)
-            args.add("-family_view_variant", variant)
-            args.add("-family_view_tree", tree)
-            _add_artifact_path(args, "-family_view_store_root", store_root)
-            _add_artifact_path(args, "-family_view_output_root", directory)
-            args.add("-family_view_expected_count", len(selected_views))
-            args.add("-preserve_mode")
-            inputs = list(execution.proof) if execution != None else []
-            view_outputs = []
-            for validation_key in sorted(variant_validations):
-                validation = variant_validations[validation_key]
-                output_key = validation.node_id + ":" + validation.slot
-                validation_input = outputs.get(output_key)
-                if validation_input == None:
-                    descriptor = parsed.declared_outputs.get(output_key)
-                    if descriptor != None:
-                        validation_input = prior_outputs.get(descriptor.tree + ":" + _family_store_path(validation.node_id, validation.slot))
-                if validation_input == None:
-                    fail("mapped Linux family view %s/%s cannot resolve validation %s" % (variant, tree, validation_key))
-                inputs.extend([validation.marker, validation_input])
-            for view in selected_views:
-                source = outputs.get(view.node_id + ":" + view.slot)
-                if source == None:
-                    fail("mapped Linux family view references noncurrent producer %s:%s" % (view.node_id, view.slot))
-                output = template_ctx.declare_file(view.artifact_path, directory = directory)
-                inputs.extend([view.marker, source])
-                view_outputs.append(output)
-            template_ctx.run(
-                executable = _tool_executable(copy_tool),
-                inputs = inputs,
-                tools = [copy_tool],
-                outputs = view_outputs,
-                arguments = [args],
-                progress_message = "Projecting Linux %s %s view %%{label}" % (variant, tree),
-            )
+            for batch in _family_view_batches(selected_views, directory, store_root):
+                args = template_ctx.args()
+                _add_artifact_path(args, "-family_view_plan_root", input_directories["plan"].directory)
+                args.add("-family_view_variant", variant)
+                args.add("-family_view_tree", tree)
+                _add_artifact_path(args, "-family_view_store_root", store_root)
+                _add_artifact_path(args, "-family_view_output_root", directory)
+                args.add("-family_view_expected_count", len(batch))
+                args.add("-preserve_mode")
+                inputs = list(execution.proof) if execution != None else []
+                view_outputs = []
+                for validation_key in sorted(variant_validations):
+                    validation = variant_validations[validation_key]
+                    output_key = validation.node_id + ":" + validation.slot
+                    validation_input = outputs.get(output_key)
+                    if validation_input == None:
+                        descriptor = parsed.declared_outputs.get(output_key)
+                        if descriptor != None:
+                            validation_input = prior_outputs.get(descriptor.tree + ":" + _family_store_path(validation.node_id, validation.slot))
+                    if validation_input == None:
+                        fail("mapped Linux family view %s/%s cannot resolve validation %s" % (variant, tree, validation_key))
+                    inputs.extend([validation.marker, validation_input])
+                for view in batch:
+                    _add_artifact_path(args, "-family_view_marker", view.marker)
+                    source = outputs.get(view.node_id + ":" + view.slot)
+                    if source == None:
+                        fail("mapped Linux family view references noncurrent producer %s:%s" % (view.node_id, view.slot))
+                    output = template_ctx.declare_file(view.artifact_path, directory = directory)
+                    inputs.extend([view.marker, source])
+                    view_outputs.append(output)
+                template_ctx.run(
+                    executable = _tool_executable(copy_tool),
+                    inputs = inputs,
+                    tools = [copy_tool],
+                    outputs = view_outputs,
+                    arguments = [args],
+                    progress_message = "Projecting Linux %s %s view %%{label}" % (variant, tree),
+                )
 
 def _tool_file_path_index_from_list(files):
     path_to_file = {}
