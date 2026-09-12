@@ -163,13 +163,21 @@ func (s *KbuildProbeScopes) compilerSourceCandidates(scope, role string, argumen
 	if err != nil {
 		return candidates
 	}
-	words, complete := possibleCompilerSourceWords(base, conditional, fragments)
-	if !complete {
-		return candidates
-	}
+	var words map[string]bool
+	var enumerated, enumerationComplete bool
 	result := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
-		if words[candidate] {
+		possible, complete := possibleCompilerSourceWord(base, conditional, fragments, candidate)
+		if !complete {
+			// The word automaton avoids exponential optional-flag products.
+			// Keep the bounded exact renderer for syntax it cannot model.
+			if !enumerated {
+				words, enumerationComplete = possibleCompilerSourceWords(base, conditional, fragments)
+				enumerated = true
+			}
+			possible = !enumerationComplete || words[candidate]
+		}
+		if possible {
 			result = append(result, candidate)
 		}
 	}
