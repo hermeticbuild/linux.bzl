@@ -7046,6 +7046,21 @@ func configDependencyCompilerSourceArgument(
 		}
 		return "", false
 	}
+	// A deferred word can render multiple arguments or a different path. Do
+	// not let either suffix matching or lexical cleaning erase that uncertainty.
+	if strings.Contains(argument, "${result:") || strings.Contains(argument, "$(") || linuxProbeSymbolPattern.MatchString(argument) {
+		return "", false
+	}
+	positional := !strings.HasPrefix(argument, "-") && !strings.ContainsRune(argument, '=')
+	canonical := argument
+	if positional && !strings.Contains(argument, "${") {
+		// Kbuild can reuse a source through a parent-relative pattern stem (for
+		// example a private object compiled from ../shared/unit.S). Source edges
+		// already carry canonical paths, while the preserved probe argv retains
+		// that spelling. Match their lexical paths before dropping this operand;
+		// never normalize option payloads or the actual compilation's argv.
+		canonical = path.Clean(argument)
+	}
 	for _, pathname := range sourcePaths {
 		if argument == pathname {
 			return pathname, true
@@ -7053,10 +7068,10 @@ func configDependencyCompilerSourceArgument(
 		// A joined compiler option can legitimately end in the translation-unit
 		// pathname (KBUILD_MODFILE and prefix-map flags commonly do). Only a
 		// positional path may use the rooted-path suffix fallback.
-		if strings.HasPrefix(argument, "-") || strings.ContainsRune(argument, '=') {
+		if !positional {
 			continue
 		}
-		if strings.HasSuffix(argument, "/"+pathname) {
+		if canonical == pathname || strings.HasSuffix(canonical, "/"+pathname) {
 			return pathname, true
 		}
 	}

@@ -4940,6 +4940,45 @@ CONFIG_VISIBLE
 	}
 }
 
+func TestConfigDependencyCompilerPredefineNormalizationResolvesSourceDotSegments(t *testing.T) {
+	const source = "drivers/shared/unit.S"
+	for _, operand := range []string{
+		"drivers/shared/./unit.S",
+		"drivers/consumer/private/../../shared/unit.S",
+		"__LINUX_BZL_SOURCE_TREE__/drivers/consumer/private/../../shared/unit.S",
+		"/immutable/source/drivers/consumer/private/../../shared/unit.S",
+	} {
+		t.Run(operand, func(t *testing.T) {
+			// Option payloads may contain the same path but are not positional
+			// source operands. Only the last word should be removed for probing.
+			want := []string{"-nostdinc", "-DKEEP=" + operand, "-D", "VALUE=" + operand, "-target", operand}
+			arguments := append(slices.Clone(want), "-c", operand)
+			probe, reason := configDependencyCompilerPredefineProbeForInvocation(configDependencyCompilerInvocation{
+				tool: "cc", arguments: arguments, kbuildEnd: len(arguments), configuredContract: true,
+			}, []string{source})
+			if reason != "" || probe.language != "assembler-with-cpp" || len(probe.translationUnits) != 0 ||
+				!slices.Equal(probe.arguments, want) {
+				t.Fatalf("dot-segment source projection = %#v, reason=%q", probe, reason)
+			}
+		})
+	}
+}
+
+func TestConfigDependencyCompilerSourceDotSegmentsDoNotEraseSymbolicOrOptionOwnership(t *testing.T) {
+	const source = "drivers/shared/unit.S"
+	for _, argument := range []string{
+		"-Iunused/../" + source,
+		"-DVALUE=unused/../" + source,
+		"${result:00000000.text}/../" + source,
+		linuxProbeSymbolPrefix + strings.Repeat("1", 64) + "/../" + source,
+		"drivers/different/unit.S",
+	} {
+		if got, ok := configDependencyCompilerSourceArgument(argument, []string{source}, nil); ok {
+			t.Fatalf("non-source operand %q was accepted as %q", argument, got)
+		}
+	}
+}
+
 func TestConfigDependencyCompilerPredefineNormalizationRejectsStdinTranslationUnit(t *testing.T) {
 	for _, arguments := range [][]string{
 		{"-E", "-D__GENKSYMS__", "-nostdinc", "${result:00000000.text}", "-xc", "-"},
