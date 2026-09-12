@@ -63,14 +63,7 @@ func configDependencyCompilerLexicalWitness(
 	if err != nil {
 		return "", false
 	}
-	sources = configDependencyCompilerPredefineSourcePaths(invocation, sources)
-	if invocation.hasPredefineProjection {
-		invocation.arguments = invocation.predefineArguments
-		invocation.kbuildStart = invocation.predefineKbuildStart
-		invocation.kbuildEnd = invocation.predefineKbuildEnd
-		invocation.probeEnvironment = invocation.predefineProbeEnvironment
-	}
-	probe, reason := configDependencyCompilerPredefineProbeForInvocation(invocation, sources)
+	probe, reason := configDependencyCompilerPredefineProbeForActionInvocation(invocation, sources)
 	if reason != "" {
 		return "", false
 	}

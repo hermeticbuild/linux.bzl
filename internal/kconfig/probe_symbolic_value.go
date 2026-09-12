@@ -13,6 +13,9 @@ type probeSymbolicValueLowerer struct {
 	evaluator    *LinuxProbeEvaluator
 	dependencies []ProbeReference
 	ordinals     map[ProbeReference]int
+	// Optional compiler-state queries cannot consume future generated content.
+	// Ordinary symbolic lowering retains its existing behavior.
+	rejectDeferredContent bool
 }
 
 type probeSymbolicValueMode int
@@ -114,6 +117,9 @@ func (l *probeSymbolicValueLowerer) value(value string) ([]ProbeValueFragment, b
 }
 
 func (l *probeSymbolicValueLowerer) valueForMode(value string, mode probeSymbolicValueMode) ([]ProbeValueFragment, bool, error) {
+	if l.rejectDeferredContent && kbuildDeferredContentTokenPattern.MatchString(value) {
+		return nil, true, fmt.Errorf("compiler query depends on deferred Kbuild content")
+	}
 	if !linuxProbeSymbolPattern.MatchString(value) {
 		return nil, false, nil
 	}
@@ -131,6 +137,11 @@ func (l *probeSymbolicValueLowerer) valueForMode(value string, mode probeSymboli
 			return fmt.Errorf("symbolic process value exceeds aggregate depth %d", MaxProbeValueFragmentDepth)
 		}
 		for fragmentIndex, fragment := range values {
+			// A source-shell or Make-text atom can hide the token from the outer
+			// argv. Inspect it during this existing bounded fragment traversal.
+			if l.rejectDeferredContent && kbuildDeferredContentTokenPattern.MatchString(fragment.Value) {
+				return fmt.Errorf("compiler query depends on deferred Kbuild content")
+			}
 			totalFragments++
 			if totalFragments > maxProbeValueFragments {
 				return fmt.Errorf("symbolic process value has more than %d fragments", maxProbeValueFragments)
@@ -143,6 +154,9 @@ func (l *probeSymbolicValueLowerer) valueForMode(value string, mode probeSymboli
 				totalTransforms++
 				totalBytes += len(transform.Function)
 				for _, argument := range transform.Arguments {
+					if l.rejectDeferredContent && kbuildDeferredContentTokenPattern.MatchString(argument) {
+						return fmt.Errorf("compiler query depends on deferred Kbuild content")
+					}
 					totalBytes += len(argument)
 				}
 				for _, group := range transform.ArgumentFragments {
@@ -507,6 +521,9 @@ func (l *probeSymbolicValueLowerer) arguments(arguments []string) ([]string, []P
 	var conditional []ProbeConditionalArguments
 	var argumentFragments []ProbeArgumentFragments
 	for _, argument := range arguments {
+		if l.rejectDeferredContent && kbuildDeferredContentTokenPattern.MatchString(argument) {
+			return nil, nil, nil, fmt.Errorf("compiler query depends on deferred Kbuild content")
+		}
 		if !linuxProbeSymbolPattern.MatchString(argument) {
 			base = append(base, argument)
 			continue
@@ -556,6 +573,13 @@ func (l *probeSymbolicValueLowerer) arguments(arguments []string) ([]string, []P
 			l.reference(input.reference)
 		}
 		for _, branch := range expansion.branches {
+			if l.rejectDeferredContent {
+				for _, argument := range branch.arguments {
+					if kbuildDeferredContentTokenPattern.MatchString(argument) {
+						return nil, nil, nil, fmt.Errorf("compiler query depends on deferred Kbuild content")
+					}
+				}
+			}
 			if len(branch.arguments) == 0 {
 				continue
 			}

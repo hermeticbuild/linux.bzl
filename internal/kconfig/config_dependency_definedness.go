@@ -305,17 +305,9 @@ func configDependencyCompilerDefinednessWitness(
 	if err != nil {
 		return "", false
 	}
-	// Match registration and the scanner: a source-bound forced header is
-	// consumed by the ordered include pass, not an additional translation unit.
-	// Inspect concrete operands before swapping in the preserved projection.
-	sources = configDependencyCompilerPredefineSourcePaths(invocation, sources)
-	if invocation.hasPredefineProjection {
-		invocation.arguments = invocation.predefineArguments
-		invocation.kbuildStart = invocation.predefineKbuildStart
-		invocation.kbuildEnd = invocation.predefineKbuildEnd
-		invocation.probeEnvironment = invocation.predefineProbeEnvironment
-	}
-	probe, reason := configDependencyCompilerPredefineProbeForInvocation(invocation, sources)
+	// Reuse only the exact source-normalized request used by registration and
+	// scanning, including authenticated removal of non-operand prerequisites.
+	probe, reason := configDependencyCompilerPredefineProbeForActionInvocation(invocation, sources)
 	if reason != "" {
 		return "", false
 	}

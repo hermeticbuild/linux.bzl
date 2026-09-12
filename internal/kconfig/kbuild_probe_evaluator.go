@@ -2936,6 +2936,10 @@ func (s *KbuildProbeScopes) compilerProjectedContext(
 		return nil, fmt.Errorf("unsupported compiler query projection %q", projection)
 	}
 	lowerer := newProbeSymbolicValueLowerer(evaluator)
+	// These optional queries run before generated object-tree contents exist.
+	// Keep deferred content on the executable action plan; do not send its
+	// planner token to the compiler as a purported initial-state argument.
+	lowerer.rejectDeferredContent = true
 	base, conditional, fragments, candidate, err := lowerProbeCandidateArguments(
 		lowerer, arguments, probeCandidateArgumentMask(len(arguments)), ProbeCandidatePolicyCC,
 	)
