@@ -962,6 +962,20 @@ func assertFixedPointCompilerSourceShellWords(t *testing.T, plan *ProbePlan, ora
 }
 
 func TestActionPlanConfigProbeReplayPreservesSplitSuffixCompilerProjection(t *testing.T) {
+	testActionPlanConfigProbeReplaySplitSuffix(t, "compiler")
+}
+
+func TestActionPlanConfigProbeReplayPreservesConditionalMetadataSuffix(t *testing.T) {
+	testActionPlanConfigProbeReplaySplitSuffix(t, "conditional metadata")
+}
+
+func TestActionPlanConfigProbeReplayRejectsChangedConditionalCompilerSuffix(t *testing.T) {
+	testActionPlanConfigProbeReplaySplitSuffix(t, "conditional compiler")
+}
+
+func testActionPlanConfigProbeReplaySplitSuffix(t *testing.T, suffixMode string) {
+	conditionalSuffix := suffixMode != "compiler"
+	conditionalMetadata := suffixMode == "conditional metadata"
 	const (
 		target  = "scripts/mod/devicetable-offsets.s"
 		source  = "scripts/mod/devicetable-offsets.c"
@@ -971,7 +985,7 @@ func TestActionPlanConfigProbeReplayPreservesSplitSuffixCompilerProjection(t *te
 	root := t.TempDir()
 	makefile := filepath.Join(root, "Makefile")
 	mustWriteSource(t, root, source, "#if CONFIG_FIXEDPOINT\nint selected;\n#endif\n")
-	if err := os.WriteFile(makefile, []byte(linearFilterCompilerFixture+`
+	makeText := linearFilterCompilerFixture + `
 squote := '
 pound := \#
 escsq = $(subst $(squote),'\$(squote)',$1)
@@ -991,7 +1005,19 @@ cmd_cc_s_c = $(CC) -Wp,-MMD,$(depfile) -nostdinc -fverbose-asm -S -o $@ $<
 scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 	$(call if_changed_dep,cc_s_c)
 	$(call cmd,gensymtypes)
-`), 0o644); err != nil {
+`
+	if conditionalSuffix {
+		makeText = strings.ReplaceAll(makeText, "cmd = set -e; $(cmd_$(1))",
+			"cmd = $(if $(cmd_$(1)),set -e; $(cmd_$(1)),:)")
+		suffixCommand := "echo metadata-suffix >> $(dot-target).cmd"
+		if !conditionalMetadata {
+			suffixCommand = "$(CC) -D__GENKSYMS__ $(c_flags) -E $< >> $(dot-target).cmd"
+		}
+		makeText = strings.ReplaceAll(makeText,
+			"cmd_gensymtypes = if true; then $(CC) -D__GENKSYMS__ $(c_flags) -E $< >> $(dot-target).cmd; fi",
+			"cmd_gensymtypes = $(if $(call cc-option,-ffixedpoint-selected),"+suffixCommand+")")
+	}
+	if err := os.WriteFile(makefile, []byte(makeText), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1109,10 +1135,26 @@ scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 			found = true
 		}
 	}
-	if !found {
-		t.Fatal("discovery did not register the suffix compiler request")
+	if found == conditionalSuffix {
+		t.Fatalf("suffix compiler request present=%t, mode=%s", found, suffixMode)
 	}
-	replay, err := evaluate(successfulProbeOracleForFixedPointTest(t, discovery.Plan))
+	oracle := successfulProbeOracleForFixedPointTest(t, discovery.Plan)
+	if conditionalSuffix {
+		// Recompute Make-text predicates from the selected compiler answers;
+		// the generic fixture's all-success defaults are not derived results.
+		for _, node := range discovery.Plan.Nodes {
+			if isPureDependencyProbeRequest(discovery.Plan.Requests[node.RequestID]) {
+				delete(oracle.results, node.ID)
+			}
+		}
+	}
+	replay, err := evaluate(oracle)
+	if suffixMode == "conditional compiler" {
+		if err == nil || !strings.Contains(err.Error(), "compiler-probe suffix command") {
+			t.Fatalf("changed compiler-bearing suffix bypassed occurrence matching: %v", err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatalf("suffix compiler replay introduced an undiscovered request: %v", err)
 	}
@@ -1124,6 +1166,21 @@ scripts/mod/devicetable-offsets.s: scripts/mod/devicetable-offsets.c FORCE
 		recipe := replay.Value.Recipes[node.Recipe]
 		if node.Kind == "compile" && recipe.CompilerInvocation != nil {
 			typedPrefix = true
+		}
+		if conditionalMetadata && node.Kind == "generate" && recipe.Tool == compactKbuildScriptRunnerRole &&
+			strings.Contains(compactKbuildRecipeScriptContentForTest(t, recipe), "metadata-suffix") {
+			opaqueSuffix = recipe.CompilerInvocation == nil
+			dependencies, err := AnalyzeActionPlanNodeConfigDependencies(replay.Value, node)
+			if err != nil || !dependencies.Opaque {
+				t.Fatalf("metadata suffix lost its conservative configuration contract: %+v, %v", dependencies, err)
+			}
+			if !slices.ContainsFunc(node.Outputs, func(output ActionPlanOutput) bool { return output.Path == target }) ||
+				!slices.ContainsFunc(node.Inputs, func(edge ActionPlanNodeEdge) bool {
+					producer, found := compactKbuildPlanNode(replay.Value, edge.ProducerID)
+					return found && producer.Kind == "compile"
+				}) {
+				t.Fatal("metadata suffix lost its exact compiled-object dependency or publication")
+			}
 		}
 		if projection, ok := replay.Value.compilerProbeInvocations[node.ID]; ok &&
 			slices.Contains(projection.Arguments, "-D__GENKSYMS__") {

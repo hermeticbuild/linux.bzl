@@ -3133,15 +3133,24 @@ func (b *compactKbuildRulePlanBuilder) buildCompactKbuildCmdAndFixdepSplit(
 		return "", fmt.Errorf("suffix program discovery: %w", err)
 	}
 	suffixMatch := match
+	suffixMatch.compilerProbeCommands = nil
 	if len(match.compilerProbeRootedTemplates) != 0 {
-		// The suffix executes a separate compound program. Give it the exact
-		// discovery-form suffix, just as the first template has its own twin;
-		// retaining only the concrete suffix would register new requests after
-		// probe-dependent flags have resolved on replay.
 		if len(match.compilerProbeRootedTemplates) != len(rootedTemplates) {
 			return "", fmt.Errorf("cmd_and_fixdep compiler-probe suffix template count changed from %d to %d", len(rootedTemplates), len(match.compilerProbeRootedTemplates))
 		}
-		probeSuffixTemplate := compactKbuildRecipeLineShells(match.compilerProbeRootedTemplates[1:])
+		suffixMatch.compilerProbeRootedTemplates = slices.Clone(match.compilerProbeRootedTemplates[1:])
+	}
+	if len(suffixMatch.compilerProbeRootedTemplates) != 0 && slices.ContainsFunc(suffixCommands, func(command compactKbuildRecipeCommand) bool {
+		_, compiler := compactKbuildCommandCompilerRole(command)
+		return compiler
+	}) {
+		// Only compiler invocations need the discovery-form twin to preserve
+		// query identity. A source-selected metadata/helper suffix can resolve
+		// from one symbolic Make word into several concrete commands without
+		// containing a compiler at all. Its complete executable program, inputs,
+		// outputs and observed state remain in the opaque suffix action below.
+		// Compiler-bearing suffixes still require exact occurrence matching.
+		probeSuffixTemplate := compactKbuildRecipeLineShells(suffixMatch.compilerProbeRootedTemplates)
 		probeSuffixCommands, err := compactKbuildCompoundProgramCommands(probeSuffixTemplate)
 		if err != nil {
 			return "", fmt.Errorf("cmd_and_fixdep compiler-probe suffix program discovery: %w", err)
