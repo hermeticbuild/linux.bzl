@@ -1,11 +1,170 @@
 package kconfig
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+// Retain the old per-word implementation as an independent equivalence and
+// benchmark oracle. Production normalizes a complete request with one snapshot.
+func canonicalSourceCommandPerWordForTest(sourceRoot, command string) string {
+	if sourceRoot == "" || !strings.ContainsRune(command, '/') {
+		return command
+	}
+	roots := []string{sourceRoot}
+	if absolute, err := filepath.Abs(sourceRoot); err == nil {
+		roots = append(roots, absolute)
+		if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+			roots = append(roots, resolved)
+		}
+	}
+	seen := map[string]bool{}
+	for len(roots) != 0 {
+		longest := 0
+		for index := 1; index < len(roots); index++ {
+			if len(roots[index]) > len(roots[longest]) {
+				longest = index
+			}
+		}
+		root := filepath.ToSlash(filepath.Clean(roots[longest]))
+		roots = append(roots[:longest], roots[longest+1:]...)
+		if root == "" || root == "." || root == "/" || seen[root] {
+			continue
+		}
+		seen[root] = true
+		command = strings.ReplaceAll(command, root+"/", "__LINUX_BZL_SOURCE_TREE__/")
+	}
+	return command
+}
+
+func TestProbeSourceNormalizerMatchesPerWordOracle(t *testing.T) {
+	directory := t.TempDir()
+	physical, alias := filepath.Join(directory, "linux"), filepath.Join(directory, "linux", "alias")
+	if err := os.Mkdir(physical, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(physical, alias); err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range []string{"", ".", "/", "relative/missing/root", directory + "/linux/../missing", physical, alias} {
+		normalizer := (&LinuxProbeEvaluator{sourceRoot: root}).sourceNormalizer()
+		for _, value := range []string{"", "PLAIN", "-DVALUE=1", "$" + "{result:00000000.text}", root, root + "/include", "-I" + root + "/include", alias + "/header.h", physical + "/header.h", root + "-sibling/include", "/unrelated/header.h"} {
+			if got, want := normalizer.command(value), canonicalSourceCommandPerWordForTest(root, value); got != want {
+				t.Errorf("root=%q value=%q: got %q, want %q", root, value, got, want)
+			}
+		}
+	}
+}
+
+func TestProbeSourceNormalizerCapturesRootsOnceAndLazily(t *testing.T) {
+	directory := t.TempDir()
+	first, second, alias := filepath.Join(directory, "first"), filepath.Join(directory, "second"), filepath.Join(directory, "alias")
+	for _, root := range []string{first, second} {
+		if err := os.Mkdir(root, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(first, alias); err != nil {
+		t.Fatal(err)
+	}
+	evaluator := &LinuxProbeEvaluator{sourceRoot: alias}
+	normalizer := evaluator.sourceNormalizer()
+	for _, value := range []string{"", "PLAIN", "-DVALUE=1"} {
+		if normalizer.command(value) != value || normalizer.rootsReady {
+			t.Fatal("non-path operand resolved roots or changed bytes")
+		}
+	}
+	const want = "__LINUX_BZL_SOURCE_TREE__/include"
+	if got := normalizer.command(first + "/include"); got != want || !normalizer.rootsReady {
+		t.Fatalf("initial root capture = %q, ready=%t", got, normalizer.rootsReady)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(second, alias); err != nil {
+		t.Fatal(err)
+	}
+	if got := normalizer.command(first + "/include"); got != want {
+		t.Fatalf("request snapshot re-resolved its source alias: %q", got)
+	}
+	if got := normalizer.command(second + "/include"); got != second+"/include" {
+		t.Fatalf("request snapshot adopted a new physical root: %q", got)
+	}
+	fresh := evaluator.sourceNormalizer()
+	if got := fresh.command(second + "/include"); got != want {
+		t.Fatalf("fresh request retained an earlier root snapshot: %q", got)
+	}
+}
+
+func TestProbeSourceNormalizerPreservesRecursiveRequestShape(t *testing.T) {
+	root := filepath.ToSlash(t.TempDir())
+	requestForRoot := func(prefix string) ProbeRequest {
+		fragment := ProbeValueFragment{
+			Value:     prefix + "/literal",
+			When:      &ProbePredicate{Operator: "and", Operands: []ProbePredicate{{Value: prefix + "/predicate"}}},
+			Fragments: []ProbeValueFragment{{Value: prefix + "/nested"}},
+			Transforms: []ProbeValueTransform{{
+				Function: "subst", Arguments: []string{prefix + "/transform"},
+				ArgumentFragments: []ProbeValueTransformArgumentFragments{{Index: 0, Fragments: []ProbeValueFragment{{Value: prefix + "/dynamic"}}}},
+			}},
+		}
+		return ProbeRequest{
+			Scratch: []ProbeScratch{{Content: prefix + "/scratch"}, {Content: root + "/opaque", ContentIsOpaque: true}},
+			Steps: []ProbeStep{{
+				WorkingDirectory: prefix + "/cwd", Arguments: []string{prefix + "/arg", "PLAIN"},
+				ConditionalArguments: []ProbeConditionalArguments{{Arguments: []string{prefix + "/conditional"}}},
+				ArgumentFragments:    []ProbeArgumentFragments{{Index: 0, Fragments: []ProbeValueFragment{fragment}}},
+				Environment:          map[string]string{"INCLUDE": prefix + "/environment"},
+				EnvironmentFragments: []ProbeEnvironmentFragments{{Name: "FRAG", Fragments: []ProbeValueFragment{fragment}}},
+				Stdin:                prefix + "/stdin", StdinFragments: []ProbeValueFragment{fragment},
+			}},
+			Outcome: ProbeOutcome{Fragments: []ProbeValueFragment{fragment}},
+		}
+	}
+	request := requestForRoot(root)
+	got := (&LinuxProbeEvaluator{sourceRoot: root}).canonicalSourceRequest(request)
+	if want := requestForRoot("__LINUX_BZL_SOURCE_TREE__"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("recursive canonical request changed shape: got %#v, want %#v", got, want)
+	}
+	if !reflect.DeepEqual(request, requestForRoot(root)) {
+		t.Fatal("normalization mutated the caller-owned request")
+	}
+}
+
+func BenchmarkProbeSourceNormalizationBatch(b *testing.B) {
+	root := b.TempDir()
+	arguments := make([]string, 128)
+	for index := range arguments {
+		arguments[index] = fmt.Sprintf("-I%s/include/group-%03d", root, index)
+	}
+	for _, perWord := range []bool{true, false} {
+		name := "request-snapshot"
+		if perWord {
+			name = "previous-per-word"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				normalizer := (&LinuxProbeEvaluator{sourceRoot: root}).sourceNormalizer()
+				for _, argument := range arguments {
+					var result string
+					if perWord {
+						result = canonicalSourceCommandPerWordForTest(root, argument)
+					} else {
+						result = normalizer.command(argument)
+					}
+					if !strings.HasPrefix(result, "-I__LINUX_BZL_SOURCE_TREE__/include/") {
+						b.Fatal(result)
+					}
+				}
+			}
+		})
+	}
+}
 
 func TestCanonicalSourceCommandSourceAndUnrelatedOperands(t *testing.T) {
 	directory := t.TempDir()

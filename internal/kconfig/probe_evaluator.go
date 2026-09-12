@@ -387,20 +387,54 @@ func (e *LinuxProbeEvaluator) Shell(ctx context.Context, command string) (string
 }
 
 func (e *LinuxProbeEvaluator) canonicalSourceCommand(command string) string {
+	normalizer := e.sourceNormalizer()
+	return normalizer.command(command)
+}
+
+// probeSourceNormalizer captures one request's rooted spellings on its first
+// path-bearing field. Recursive templates share this snapshot instead of
+// repeatedly resolving the checkout symlink for every argv/environment word.
+// It is request-local, not a global filesystem cache or source authority.
+type probeSourceNormalizer struct {
+	sourceRoot string
+	roots      []string
+	rootsReady bool
+}
+
+func (e *LinuxProbeEvaluator) sourceNormalizer() probeSourceNormalizer {
+	if e == nil {
+		return probeSourceNormalizer{}
+	}
+	return probeSourceNormalizer{sourceRoot: e.sourceRoot}
+}
+
+func (n *probeSourceNormalizer) command(command string) string {
 	// Canonicalization replaces rooted prefixes ending in '/'. Most compiler
 	// argv and definedness-probe operands contain no slash at all; resolving
 	// source symlinks for each such token cannot change their bytes.
-	if e == nil || e.sourceRoot == "" || !strings.ContainsRune(command, '/') {
+	if n.sourceRoot == "" || !strings.ContainsRune(command, '/') {
 		return command
 	}
-	roots := []string{e.sourceRoot}
-	if absolute, err := filepath.Abs(e.sourceRoot); err == nil {
+	if !n.rootsReady {
+		n.roots = canonicalProbeSourceRoots(n.sourceRoot)
+		n.rootsReady = true
+	}
+	for _, root := range n.roots {
+		command = strings.ReplaceAll(command, root+"/", "__LINUX_BZL_SOURCE_TREE__/")
+	}
+	return command
+}
+
+func canonicalProbeSourceRoots(sourceRoot string) []string {
+	roots := []string{sourceRoot}
+	if absolute, err := filepath.Abs(sourceRoot); err == nil {
 		roots = append(roots, absolute)
 		if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
 			roots = append(roots, resolved)
 		}
 	}
 	seen := map[string]bool{}
+	canonical := []string{}
 	for len(roots) != 0 {
 		// Replace longest spellings first in case one checkout path is nested
 		// beneath another. Only complete rooted prefixes are canonicalized.
@@ -416,75 +450,85 @@ func (e *LinuxProbeEvaluator) canonicalSourceCommand(command string) string {
 			continue
 		}
 		seen[root] = true
-		command = strings.ReplaceAll(command, root+"/", "__LINUX_BZL_SOURCE_TREE__/")
+		canonical = append(canonical, root)
 	}
-	return command
+	return canonical
 }
 
 func (e *LinuxProbeEvaluator) canonicalSourceRequest(request ProbeRequest) ProbeRequest {
+	normalizer := e.sourceNormalizer()
+	return normalizer.request(request)
+}
+
+func (n *probeSourceNormalizer) request(request ProbeRequest) ProbeRequest {
 	request.Scratch = slices.Clone(request.Scratch)
 	for index := range request.Scratch {
 		if !request.Scratch[index].ContentIsOpaque {
-			request.Scratch[index].Content = e.canonicalSourceCommand(request.Scratch[index].Content)
+			request.Scratch[index].Content = n.command(request.Scratch[index].Content)
 		}
 	}
 	request.Steps = slices.Clone(request.Steps)
 	for index := range request.Steps {
 		step := request.Steps[index]
-		step.WorkingDirectory = e.canonicalSourceCommand(step.WorkingDirectory)
+		step.WorkingDirectory = n.command(step.WorkingDirectory)
 		step.Arguments = slices.Clone(step.Arguments)
 		for argument := range step.Arguments {
-			step.Arguments[argument] = e.canonicalSourceCommand(step.Arguments[argument])
+			step.Arguments[argument] = n.command(step.Arguments[argument])
 		}
 		step.ConditionalArguments = slices.Clone(step.ConditionalArguments)
 		for conditional := range step.ConditionalArguments {
 			step.ConditionalArguments[conditional].Arguments = slices.Clone(step.ConditionalArguments[conditional].Arguments)
 			for argument := range step.ConditionalArguments[conditional].Arguments {
-				step.ConditionalArguments[conditional].Arguments[argument] = e.canonicalSourceCommand(step.ConditionalArguments[conditional].Arguments[argument])
+				step.ConditionalArguments[conditional].Arguments[argument] = n.command(step.ConditionalArguments[conditional].Arguments[argument])
 			}
 		}
 		step.ArgumentFragments = slices.Clone(step.ArgumentFragments)
 		for groupIndex := range step.ArgumentFragments {
 			group := step.ArgumentFragments[groupIndex]
-			group.Fragments = e.canonicalSourceFragments(group.Fragments)
+			group.Fragments = n.fragments(group.Fragments)
 			step.ArgumentFragments[groupIndex] = group
 		}
 		step.Environment = maps.Clone(step.Environment)
 		for name, value := range step.Environment {
-			step.Environment[name] = e.canonicalSourceCommand(value)
+			step.Environment[name] = n.command(value)
 		}
 		step.EnvironmentFragments = slices.Clone(step.EnvironmentFragments)
 		for environmentIndex := range step.EnvironmentFragments {
 			entry := step.EnvironmentFragments[environmentIndex]
-			entry.Fragments = e.canonicalSourceFragments(entry.Fragments)
+			entry.Fragments = n.fragments(entry.Fragments)
 			step.EnvironmentFragments[environmentIndex] = entry
 		}
-		step.Stdin = e.canonicalSourceCommand(step.Stdin)
-		step.StdinFragments = e.canonicalSourceFragments(step.StdinFragments)
+		step.Stdin = n.command(step.Stdin)
+		step.StdinFragments = n.fragments(step.StdinFragments)
 		request.Steps[index] = step
 	}
-	request.Outcome.Fragments = e.canonicalSourceFragments(request.Outcome.Fragments)
+	request.Outcome.Fragments = n.fragments(request.Outcome.Fragments)
 	return request
 }
 
 func (e *LinuxProbeEvaluator) canonicalSourceFragments(fragments []ProbeValueFragment) []ProbeValueFragment {
+	normalizer := e.sourceNormalizer()
+	return normalizer.fragments(fragments)
+}
+
+func (n *probeSourceNormalizer) fragments(fragments []ProbeValueFragment) []ProbeValueFragment {
 	fragments = slices.Clone(fragments)
 	for fragmentIndex := range fragments {
 		fragment := fragments[fragmentIndex]
-		fragment.Value = e.canonicalSourceCommand(fragment.Value)
-		fragment.When = e.canonicalSourcePredicate(fragment.When)
-		fragment.Fragments = e.canonicalSourceFragments(fragment.Fragments)
+		fragment.Value = n.command(fragment.Value)
+		fragment.When = n.predicate(fragment.When)
+		fragment.Fragments = n.fragments(fragment.Fragments)
 		fragment.Transforms = slices.Clone(fragment.Transforms)
 		for transformIndex := range fragment.Transforms {
 			transform := fragment.Transforms[transformIndex]
 			transform.Arguments = slices.Clone(transform.Arguments)
 			for argumentIndex := range transform.Arguments {
-				transform.Arguments[argumentIndex] = e.canonicalSourceCommand(transform.Arguments[argumentIndex])
+				transform.Arguments[argumentIndex] = n.command(transform.Arguments[argumentIndex])
 			}
 			transform.ArgumentFragments = slices.Clone(transform.ArgumentFragments)
 			for groupIndex := range transform.ArgumentFragments {
 				group := transform.ArgumentFragments[groupIndex]
-				group.Fragments = e.canonicalSourceFragments(group.Fragments)
+				group.Fragments = n.fragments(group.Fragments)
 				transform.ArgumentFragments[groupIndex] = group
 			}
 			fragment.Transforms[transformIndex] = transform
@@ -494,15 +538,15 @@ func (e *LinuxProbeEvaluator) canonicalSourceFragments(fragments []ProbeValueFra
 	return fragments
 }
 
-func (e *LinuxProbeEvaluator) canonicalSourcePredicate(predicate *ProbePredicate) *ProbePredicate {
+func (n *probeSourceNormalizer) predicate(predicate *ProbePredicate) *ProbePredicate {
 	if predicate == nil {
 		return nil
 	}
 	clone := *predicate
-	clone.Value = e.canonicalSourceCommand(clone.Value)
+	clone.Value = n.command(clone.Value)
 	clone.Operands = slices.Clone(clone.Operands)
 	for index := range clone.Operands {
-		operand := e.canonicalSourcePredicate(&clone.Operands[index])
+		operand := n.predicate(&clone.Operands[index])
 		clone.Operands[index] = *operand
 	}
 	return &clone
