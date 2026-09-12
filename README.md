@@ -1039,10 +1039,19 @@ Ordinary compiler-probe discovery registers requests without retaining discarded
 dependency annotations. An exact, already registered but unavailable compiler
 state lets discovery skip the source scan that would stop at that same request;
 unmatched compiler invocations still use the full admission checks. Supplemental
-guard-only rounds freshly lower and verify the original graph and scan the
-authenticated generated headers, but do not finalize a graph or publish reuse
-evidence. Final family replay still performs the full analysis, content
-addressing, and evidence sealing before any cross-config substitution.
+guard-only rounds restore the original lowered graph from an initial-action
+checkpoint and scan the authenticated generated headers, but do not finalize a
+graph or publish reuse evidence. Initial planning publishes a bounded compressed
+checkpoint per variant in one declared directory: the provisional graph and its
+compiler request/expression namespace, not cached compiler answers or source-read
+proofs. Compiler requests are stored once and referenced by their original IDs.
+Every guard round and final replay consumes that directory alongside the original
+source, config, tool, probe, and execution-cut inputs. Replay independently resolves
+the current Kconfig, rebinds current source roots and compiler scopes, and validates
+the saved contracts before analysis. It skips repeated Make evaluation and lowering;
+an invalid checkpoint fails instead of silently selecting another planning path.
+Final family replay still performs the full analysis, content addressing, and
+evidence sealing before any cross-config substitution.
 
 For planner CPU diagnostics, `--output_groups=compiler_guard1_cpu_profile`
 samples the second supplemental guard round for up to 180 seconds using its

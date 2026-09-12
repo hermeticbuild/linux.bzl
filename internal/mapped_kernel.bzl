@@ -4689,6 +4689,7 @@ def _linux_mapped_kernel_family_impl(ctx):
         _add_artifact_path(initial_args, "-family_execution_segment_out", cut_plans[segment.name], format = segment.name + "=%s")
         _add_artifact_path(replay_args, "-family_execution_segment_out", family_plans[segment.name], format = segment.name + "=%s")
     execution_cut = ctx.actions.declare_file(ctx.label.name + ".execution-cut.json")
+    checkpoints = ctx.actions.declare_directory(ctx.label.name + ".lowered-checkpoints-v1")
     cut_selection = ctx.actions.declare_directory(ctx.label.name + ".cut-selection")
     pinned_selection = ctx.actions.declare_directory(ctx.label.name + ".pinned-selection")
     observed_headers = ctx.actions.declare_directory(ctx.label.name + ".observed-headers")
@@ -4697,9 +4698,11 @@ def _linux_mapped_kernel_family_impl(ctx):
     guard_cpu_profile = ctx.actions.declare_file(ctx.label.name + ".compiler-guards-1.cpu.pprof")
     guard_heap_profile = ctx.actions.declare_file(ctx.label.name + ".compiler-guards-1.heap.pprof")
     initial_args.add("-family_execution_mode", "initial")
+    _add_artifact_path(initial_args, "-family_execution_checkpoint_out", checkpoints)
     _add_artifact_path(initial_args, "-family_execution_cut_out", execution_cut)
     _add_artifact_path(initial_args, "-family_execution_selection_out", cut_selection)
     replay_args.add("-family_execution_mode", "replay")
+    _add_artifact_path(replay_args, "-family_execution_checkpoint_in", checkpoints)
     _add_artifact_path(replay_args, "-family_execution_cut_in", execution_cut)
     _add_artifact_path(replay_args, "-family_execution_pinned_out", pinned_selection)
     _add_artifact_path(replay_args, "-family_execution_headers_out", observed_headers)
@@ -4713,7 +4716,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             direct = family_planner_inputs,
             transitive = [rust_source.files] if rust_source != None else [],
         ),
-        outputs = initial_outputs + [execution_cut, cut_selection] + [cut_plans[segment.name] for segment in family_segments],
+        outputs = initial_outputs + [execution_cut, cut_selection, checkpoints] + [cut_plans[segment.name] for segment in family_segments],
         arguments = [family_planner_args, initial_args],
         execution_requirements = {"supports-path-mapping": "1"},
         mnemonic = "LinuxMappedFamilySnapshotPlan",
@@ -4784,6 +4787,7 @@ def _linux_mapped_kernel_family_impl(ctx):
                 guard_plan = ctx.actions.declare_directory(prefix + ".plan")
                 guard_args = ctx.actions.args()
                 guard_args.add("-family_execution_mode", "guards")
+                _add_artifact_path(guard_args, "-family_execution_checkpoint_in", checkpoints)
                 _add_artifact_path(guard_args, "-family_execution_cut_in", execution_cut)
                 _add_artifact_path(guard_args, "-family_compiler_guard_manifest_out", guard_manifest)
                 _add_artifact_path(guard_args, "-family_compiler_guard_plan_out", guard_plan)
@@ -4795,7 +4799,7 @@ def _linux_mapped_kernel_family_impl(ctx):
                     for flag, artifact in previous.items():
                         _add_artifact_path(guard_args, flag, artifact, format = str(previous_index) + "=%s")
                 guard_action_inputs = depset(
-                    direct = family_planner_inputs + [execution_cut] +
+                    direct = family_planner_inputs + [execution_cut, checkpoints] +
                              [initial_variants[name].snapshot for name in sorted(initial_variants)] +
                              [cut_stores[tree] for tree in sorted(cut_stores)] + guard_inputs,
                     transitive = [rust_source.files] if rust_source != None else [],
@@ -4902,7 +4906,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             ctx.actions.run(
                 executable = ctx.executable._planner,
                 inputs = depset(
-                    direct = family_planner_inputs + [execution_cut] +
+                    direct = family_planner_inputs + [execution_cut, checkpoints] +
                              [initial_variants[name].snapshot for name in sorted(initial_variants)] +
                              [cut_stores[tree] for tree in sorted(cut_stores)] + guard_inputs,
                     transitive = [rust_source.files] if rust_source != None else [],

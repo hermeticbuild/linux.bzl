@@ -7,6 +7,8 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "kconfig_parse_lib",
     srcs = [
+        "checkpoint_metadata.go",
+        "family_checkpoint.go",
         "family_compiler_guard_dictionary.go",
         "family_compiler_guard_transport.go",
         "family_compiler_guards.go",
@@ -55,6 +57,7 @@ go_test(
     name = "kconfig_parse_test",
     srcs = [
         "deferred_content_selection_test.go",
+        "family_checkpoint_test.go",
         "family_compiler_guard_carry_test.go",
         "family_compiler_guard_dictionary_test.go",
         "family_compiler_guard_transport_test.go",

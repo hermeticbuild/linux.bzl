@@ -111,36 +111,37 @@ type linuxKbuildProbeValue struct {
 }
 
 type linuxKbuildProbeOptions struct {
-	tree                      *kconfig.Tree
-	rootPath                  string
-	kbuildPath                string
-	configInput               string
-	configOverlays            []string
-	configFlags               map[string]string
-	configMode                string
-	variables                 map[string]string
-	identityVariables         map[string]string
-	sourceRoots               map[string]string
-	sourceNamespaces          map[string]string
-	objectRoot                string
-	objectNamespace           string
-	entryTargets              []string
-	preparationTargets        []string
-	selectedProductsOnly      bool
-	analyzeConfigDependencies bool
-	guardDiscoveryOnly        bool
-	familyPlanningCache       *kconfig.ActionPlanFamilyPlanningCache
-	familyVariantOptions      *kconfig.ActionPlanFamilyVariantPlanningOptions
-	familyCompilerGuards      *familyCompilerGuardPipeline
-	kbuildInputCache          *kbuildInvocationInputCache
-	kernelVersion             string
-	target                    sourceDerivedLinuxTarget
-	targetFacts               *kconfig.LinuxCompilerFacts
-	hostFacts                 *kconfig.LinuxCompilerFacts
-	targetContract            *hostKbuildContract
-	hostContract              *hostKbuildContract
-	rustSourceRoot            string
-	normalizeConfigValue      func(string) (string, error)
+	checkpointInput, checkpointOutput string
+	tree                              *kconfig.Tree
+	rootPath                          string
+	kbuildPath                        string
+	configInput                       string
+	configOverlays                    []string
+	configFlags                       map[string]string
+	configMode                        string
+	variables                         map[string]string
+	identityVariables                 map[string]string
+	sourceRoots                       map[string]string
+	sourceNamespaces                  map[string]string
+	objectRoot                        string
+	objectNamespace                   string
+	entryTargets                      []string
+	preparationTargets                []string
+	selectedProductsOnly              bool
+	analyzeConfigDependencies         bool
+	guardDiscoveryOnly                bool
+	familyPlanningCache               *kconfig.ActionPlanFamilyPlanningCache
+	familyVariantOptions              *kconfig.ActionPlanFamilyVariantPlanningOptions
+	familyCompilerGuards              *familyCompilerGuardPipeline
+	kbuildInputCache                  *kbuildInvocationInputCache
+	kernelVersion                     string
+	target                            sourceDerivedLinuxTarget
+	targetFacts                       *kconfig.LinuxCompilerFacts
+	hostFacts                         *kconfig.LinuxCompilerFacts
+	targetContract                    *hostKbuildContract
+	hostContract                      *hostKbuildContract
+	rustSourceRoot                    string
+	normalizeConfigValue              func(string) (string, error)
 }
 
 func newLinuxCompilerBootstrapPlan(targetIdentity, hostIdentity string) (*linuxCompilerBootstrapPlan, error) {
@@ -559,6 +560,9 @@ func evaluateLinuxKbuildProbes(
 		},
 		oracle,
 		func(scopes *kconfig.KbuildProbeScopes) (linuxKbuildProbeValue, error) {
+			if opts.checkpointInput != "" {
+				return replayLinuxFamilyCheckpoint(opts, scopes)
+			}
 			identitySourceCache := kbuildInvocationSourceProgramCache(
 				opts.kbuildInputCache, sourceRoot, sourceRoot, opts.sourceRoots,
 			)
@@ -630,6 +634,18 @@ func evaluateLinuxKbuildProbes(
 				)
 			} else if opts.familyVariantOptions != nil {
 				options := *opts.familyVariantOptions
+				var checkpointPlan []byte
+				if opts.checkpointOutput != "" {
+					bindings, bindingErr := linuxFamilyCheckpointBindings(opts, scopes, resolved)
+					if bindingErr != nil {
+						return linuxKbuildProbeValue{}, bindingErr
+					}
+					options.CaptureCheckpoint = func(plan *kconfig.ActionPlan) error {
+						var err error
+						checkpointPlan, err = kconfig.CaptureActionPlanCheckpoint(plan, bindings)
+						return err
+					}
+				}
 				if options.InitialSnapshot != nil {
 					options.ResolvedConfigFiles = resolvedConfigObjectTreeContents(opts.tree, resolved, opts.kernelVersion)
 				}
@@ -659,6 +675,15 @@ func evaluateLinuxKbuildProbes(
 				}
 				if opts.guardDiscoveryOnly {
 					return linuxKbuildProbeValue{target: target, resolved: resolved}, nil
+				}
+				if opts.checkpointOutput != "" {
+					compiler, err := scopes.MarshalActionPlanCompilerCheckpoint(checkpointPlan)
+					if err != nil {
+						return linuxKbuildProbeValue{}, err
+					}
+					if err := writeLinuxFamilyCheckpoint(opts.checkpointOutput, linuxFamilyCheckpoint{Schema: linuxFamilyCheckpointSchema, Variant: options.Variant, Target: target, Plan: checkpointPlan, Compiler: compiler}); err != nil {
+						return linuxKbuildProbeValue{}, err
+					}
 				}
 				return linuxKbuildProbeValue{
 					target: target, resolved: resolved, actionPlan: result.Plan,
@@ -2021,6 +2046,15 @@ func run() (exitCode int) {
 			}
 		}
 		for _, request := range familyPlanRequests {
+			var checkpointInput, checkpointOutput string
+			if familyExecutionRequest != nil {
+				if familyExecutionRequest.checkpointIn != "" {
+					checkpointInput = filepath.Join(familyExecutionRequest.checkpointIn, request.name+".json.gz")
+				}
+				if familyExecutionRequest.checkpointOut != "" {
+					checkpointOutput = filepath.Join(familyExecutionRequest.checkpointOut, request.name+".json.gz")
+				}
+			}
 			profile.phase("variant " + request.name + " evaluation")
 			configFlags, err := familyVariantConfigFlags(baseConfig, request.overlay)
 			if err != nil {
@@ -2028,6 +2062,7 @@ func run() (exitCode int) {
 				return 1
 			}
 			evaluation, evaluateErr := evaluateLinuxKbuildProbes(linuxKbuildProbeOptions{
+				checkpointInput: checkpointInput, checkpointOutput: checkpointOutput,
 				tree: tree, rootPath: *root, kbuildPath: *kbuildPath,
 				configInput: *resolveConfig, configFlags: configFlags,
 				configMode: *configMode, variables: maps.Clone(vars), identityVariables: maps.Clone(identityVariables), sourceRoots: sourceRoots,
@@ -2674,47 +2709,7 @@ func compactMetadata(
 			return nil, nil, fmt.Errorf("resolve source root: %w", err)
 		}
 	}
-	actionRoles := func(scope string, contract *hostKbuildContract) []kconfig.KbuildActionRoleRef {
-		roles := make([]kconfig.KbuildActionRoleRef, 0, len(contract.Actions))
-		for role := range contract.Actions {
-			roles = append(roles, kconfig.KbuildActionRoleRef{Scope: scope, Role: role})
-		}
-		sort.Slice(roles, func(i, j int) bool { return roles[i].Role < roles[j].Role })
-		return roles
-	}
-	actionContracts := func(scope string, contract *hostKbuildContract) map[kconfig.KbuildActionRoleRef]kconfig.CompactKbuildActionContract {
-		contracts := make(map[kconfig.KbuildActionRoleRef]kconfig.CompactKbuildActionContract, len(contract.Actions))
-		for role, action := range contract.Actions {
-			contracts[kconfig.KbuildActionRoleRef{Scope: scope, Role: role}] = kconfig.CompactKbuildActionContract{
-				PrefixArguments: slices.Clone(action.PrefixArgs),
-				SuffixArguments: slices.Clone(action.SuffixArgs),
-				Environment:     maps.Clone(action.Environment),
-			}
-		}
-		return contracts
-	}
-	configuredContracts := actionContracts("target", targetContract)
-	for ref, contract := range actionContracts("host", hostContract) {
-		configuredContracts[ref] = contract
-	}
-	// Preserve whether the caller supplied an object tree independently of its
-	// normalized path. An explicitly supplied tree may alias the source root but
-	// still exposes caller-owned bytes which generated-content probes do not
-	// declare.
-	preconfiguredObjectTree := objectRoot != ""
-	opts := kconfig.CompactMetadataOptions{
-		SourceNamespaces: maps.Clone(sourceNamespaces),
-		ActionRoles: append(
-			actionRoles("target", targetContract),
-			actionRoles("host", hostContract)...,
-		),
-		ActionContracts:         configuredContracts,
-		PreconfiguredObjectTree: preconfiguredObjectTree,
-		SelectedProductsOnly:    selectedProductsOnly,
-	}
-	if rustSourceRoot := strings.TrimSpace(vars["RUST_LIB_SRC"]); rustSourceRoot != "" {
-		opts.SourceNamespaces[rustSourceRoot] = "rust"
-	}
+	opts := linuxCompactMetadataOptions(vars, sourceNamespaces, objectRoot, selectedProductsOnly, targetContract, hostContract)
 	rootDir := sourceRoot
 	if rootDir == "" {
 		rootDir = filepath.Dir(workspacePath(kbuildPath))
@@ -2792,11 +2787,11 @@ func compactMetadata(
 		profiles, selections, imageTarget, parseErr := evaluatedKbuildProfilesWithGeneratedContent(
 			rootDir, objectRoot, entryTargets, preparationTargets, kbuildVars, kbuildOpts, bindProbeEnvironment,
 			linuxKbuildGeneratedContentResolver(
-				probeScopes, resolvedConfigContents, rootDir, objectRoot, preconfiguredObjectTree,
+				probeScopes, resolvedConfigContents, rootDir, objectRoot, opts.PreconfiguredObjectTree,
 			),
 			resolvedConfigContents,
 			kbuildInputCache,
-			preconfiguredObjectTree,
+			opts.PreconfiguredObjectTree,
 		)
 		if parseErr != nil {
 			return kconfig.CompactConfigGraph{}, parseErr

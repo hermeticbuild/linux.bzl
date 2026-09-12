@@ -849,7 +849,7 @@ def _assert_family_observation_pipeline(env, initial, replay, guard_planners, ow
     for flag in immutable_flags:
         asserts.equals(env, _flag_values(initial.argv, flag), _flag_values(replay.argv, flag), "replay changed immutable invocation flag " + flag)
 
-    expected_initial = _family_variant_output_names(owner, variants, True) + [owner + ".execution-cut.json", owner + ".cut-selection"]
+    expected_initial = _family_variant_output_names(owner, variants, True) + [owner + ".execution-cut.json", owner + ".cut-selection", owner + ".lowered-checkpoints-v1"]
     expected_replay = _family_variant_output_names(owner, variants, False) + [owner + ".pinned-selection", owner + ".observed-headers", owner + ".observed-artifacts", owner + ".reuse-report.json"]
     for segment in segments:
         expected_initial.append(owner + ".cut-plan-" + segment.name + "-v7")
@@ -858,6 +858,7 @@ def _assert_family_observation_pipeline(env, initial, replay, guard_planners, ow
     asserts.equals(env, sorted(expected_replay), sorted(replay_outputs.keys()))
 
     for action, flag, name, outputs in [
+        (initial, "-family_execution_checkpoint_out", owner + ".lowered-checkpoints-v1", initial_outputs),
         (initial, "-family_execution_cut_out", owner + ".execution-cut.json", initial_outputs),
         (initial, "-family_execution_selection_out", owner + ".cut-selection", initial_outputs),
         (replay, "-family_execution_pinned_out", owner + ".pinned-selection", replay_outputs),
@@ -879,6 +880,16 @@ def _assert_family_observation_pipeline(env, initial, replay, guard_planners, ow
     snapshot_inputs = _flag_values(replay.argv, "-family_execution_initial_snapshot")
     asserts.equals(env, variants, sorted([value.split("=")[0] for value in snapshot_inputs]))
     additional = {cut.path: True} if cut != None else {}
+    checkpoint = initial_outputs.get(owner + ".lowered-checkpoints-v1")
+    checkpoint_inputs = _flag_values(replay.argv, "-family_execution_checkpoint_in")
+    asserts.equals(env, 1, len(checkpoint_inputs))
+    asserts.equals(env, [], _flag_values(initial.argv, "-family_execution_checkpoint_in"))
+    asserts.equals(env, [], _flag_values(replay.argv, "-family_execution_checkpoint_out"))
+    if checkpoint != None:
+        asserts.true(env, checkpoint.is_directory)
+        additional[checkpoint.path] = True
+        if checkpoint_inputs:
+            asserts.true(env, _action_path_names_artifact(checkpoint_inputs[0], checkpoint))
     for value in snapshot_inputs:
         variant = value.split("=")[0]
         snapshot = initial_outputs.get(owner + "." + variant + ".action-plan.json.gz")
@@ -941,7 +952,7 @@ def _assert_family_observation_pipeline(env, initial, replay, guard_planners, ow
             _assert_selected_rust_sources_are_inputs(env, planner)
             for flag in immutable_flags:
                 asserts.equals(env, _flag_values(initial.argv, flag), _flag_values(planner.argv, flag), description + " changed immutable invocation flag " + flag)
-            for flag in ["-family_execution_cut_in", "-family_execution_initial_snapshot", "-family_execution_store"]:
+            for flag in ["-family_execution_checkpoint_in", "-family_execution_cut_in", "-family_execution_initial_snapshot", "-family_execution_store"]:
                 asserts.equals(env, _flag_values(replay.argv, flag), _flag_values(planner.argv, flag), description + " changed cut evidence flag " + flag)
             asserts.equals(env, sorted(guard_output_suffixes.keys()), sorted([arg for arg in planner.argv if arg.startswith("-") and arg.endswith("_out")]), description + " must not request initial or final planning outputs")
             for flag, suffix in guard_output_suffixes.items():

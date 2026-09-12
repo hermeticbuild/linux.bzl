@@ -15,6 +15,7 @@ import (
 // Execution metadata is transported separately from snapshot v3. Initial
 // planning and replay retain the same original source/object/probe inputs.
 type familyExecutionFlags struct {
+	checkpointOut, checkpointIn                                                            string
 	mode, cutOut, selectionOut, cutIn, pinnedOut, headersOut, artifactsOut, reuseReportOut string
 	segments, initialSnapshots, stores                                                     namedPathFlag
 	provided                                                                               map[string]bool
@@ -26,6 +27,8 @@ func (f *familyExecutionFlags) register(flags *flag.FlagSet) {
 		name, help string
 		value      *string
 	}{
+		{"family_execution_checkpoint_out", "Initial lowered-plan/compiler checkpoint directory output", &f.checkpointOut},
+		{"family_execution_checkpoint_in", "Replay/guard input: initial lowered-plan/compiler checkpoint directory", &f.checkpointIn},
 		{"family_execution_mode", "Generated-header family execution phase: initial, replay or guards", &f.mode},
 		{"family_execution_cut_out", "Initial complete-family execution-cut contract output", &f.cutOut},
 		{"family_execution_selection_out", "Initial authenticated cut selection marker directory", &f.selectionOut},
@@ -63,12 +66,13 @@ func (f *familyExecutionFlags) register(flags *flag.FlagSet) {
 }
 
 func (f *familyExecutionFlags) requested() bool {
-	return f != nil && (len(f.provided) != 0 || f.mode != "" || f.cutOut != "" || f.selectionOut != "" ||
+	return f != nil && (f.checkpointIn != "" || f.checkpointOut != "" || len(f.provided) != 0 || f.mode != "" || f.cutOut != "" || f.selectionOut != "" ||
 		f.cutIn != "" || f.pinnedOut != "" || f.headersOut != "" || f.artifactsOut != "" || f.reuseReportOut != "" ||
 		len(f.segments) != 0 || len(f.initialSnapshots) != 0 || len(f.stores) != 0)
 }
 
 type familyExecutionRequest struct {
+	checkpointOut, checkpointIn                                                            string
 	mode, cutOut, selectionOut, cutIn, pinnedOut, headersOut, artifactsOut, reuseReportOut string
 	segments, initialSnapshots, stores                                                     map[string]string
 	variants                                                                               []familyPlanVariantRequest
@@ -110,6 +114,7 @@ func (f *familyExecutionFlags) request(variants []familyPlanVariantRequest) (*fa
 		return nil, fmt.Errorf("-family_execution_mode must be initial, replay or guards")
 	}
 	request := &familyExecutionRequest{
+		checkpointOut: workspacePath(f.checkpointOut), checkpointIn: workspacePath(f.checkpointIn),
 		mode: f.mode, cutOut: workspacePath(f.cutOut), selectionOut: workspacePath(f.selectionOut),
 		cutIn: workspacePath(f.cutIn), pinnedOut: workspacePath(f.pinnedOut),
 		headersOut: workspacePath(f.headersOut), artifactsOut: workspacePath(f.artifactsOut), reuseReportOut: workspacePath(f.reuseReportOut),
@@ -167,6 +172,21 @@ func (f *familyExecutionFlags) request(variants []familyPlanVariantRequest) (*fa
 	if err := request.validatePaths(); err != nil {
 		return nil, err
 	}
+	if f.mode == "initial" {
+		if f.checkpointOut == "" {
+			return nil, fmt.Errorf("initial family execution requires -family_execution_checkpoint_out")
+		}
+		if f.checkpointIn != "" {
+			return nil, fmt.Errorf("initial family execution does not accept replay-only checkpoint input")
+		}
+	} else {
+		if f.checkpointIn == "" {
+			return nil, fmt.Errorf("family replay/guards require -family_execution_checkpoint_in")
+		}
+		if f.checkpointOut != "" {
+			return nil, fmt.Errorf("family replay/guards do not accept initial-only checkpoint output")
+		}
+	}
 	return request, nil
 }
 
@@ -187,7 +207,8 @@ func (r *familyExecutionRequest) validatePaths() error {
 		outputs["segment "+segment] = output
 	}
 	for name, output := range map[string]string{
-		"cut": r.cutOut, "selection": r.selectionOut, "pinned": r.pinnedOut,
+		"checkpoint": r.checkpointOut,
+		"cut":        r.cutOut, "selection": r.selectionOut, "pinned": r.pinnedOut,
 		"headers": r.headersOut, "artifacts": r.artifactsOut, "reuse report": r.reuseReportOut,
 	} {
 		if output != "" {
@@ -202,6 +223,9 @@ func (r *familyExecutionRequest) validatePaths() error {
 		}
 	}
 	inputs := map[string]string{}
+	if r.checkpointIn != "" {
+		inputs["initial checkpoint"] = r.checkpointIn
+	}
 	if r.cutIn != "" {
 		inputs["initial cut"] = r.cutIn
 	}

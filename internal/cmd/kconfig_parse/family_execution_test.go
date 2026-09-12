@@ -24,11 +24,13 @@ func completeFamilyExecutionFlags(t *testing.T, mode string, variants []familyPl
 		}
 	}
 	if mode == "initial" {
+		flags.checkpointOut = filepath.Join(root, "checkpoints")
 		flags.cutOut = filepath.Join(root, "cut.json")
 		flags.selectionOut = filepath.Join(root, "selection")
 		return flags
 	}
 	flags.cutIn = filepath.Join(root, "initial", "cut.json")
+	flags.checkpointIn = filepath.Join(root, "initial", "checkpoints")
 	if mode != "guards" {
 		flags.pinnedOut = filepath.Join(root, "pinned")
 		flags.headersOut = filepath.Join(root, "headers")
@@ -83,6 +85,12 @@ func TestFamilyExecutionFlagsRequireCompleteUnambiguousPhase(t *testing.T) {
 		{"empty segment", "initial", "empty path", func(f *familyExecutionFlags) { f.segments[0].Path = " " }},
 		{"missing cut output", "initial", "requires", func(f *familyExecutionFlags) { f.cutOut = "" }},
 		{"missing selection", "initial", "requires", func(f *familyExecutionFlags) { f.selectionOut = "" }},
+		{"missing checkpoint output", "initial", "requires -family_execution_checkpoint_out", func(f *familyExecutionFlags) { f.checkpointOut = "" }},
+		{"initial checkpoint input", "initial", "replay-only", func(f *familyExecutionFlags) { f.checkpointIn = "old-checkpoint" }},
+		{"missing checkpoint input", "replay", "require -family_execution_checkpoint_in", func(f *familyExecutionFlags) { f.checkpointIn = "" }},
+		{"replay checkpoint output", "replay", "initial-only", func(f *familyExecutionFlags) { f.checkpointOut = "new-checkpoint" }},
+		{"nested checkpoint output", "initial", "overlap", func(f *familyExecutionFlags) { f.checkpointOut = filepath.Join(f.selectionOut, "checkpoints") }},
+		{"checkpoint overwrite", "replay", "overlaps initial checkpoint", func(f *familyExecutionFlags) { f.headersOut = filepath.Join(f.checkpointIn, "headers") }},
 		{"initial with cut input", "initial", "replay-only", func(f *familyExecutionFlags) { f.cutIn = "old-cut" }},
 		{"initial with pins", "initial", "replay-only", func(f *familyExecutionFlags) { f.pinnedOut = "pins" }},
 		{"initial with headers", "initial", "replay-only", func(f *familyExecutionFlags) { f.headersOut = "headers" }},
@@ -142,6 +150,8 @@ func TestFamilyExecutionGuardsRequireCompleteInputsAndNoOutputs(t *testing.T) {
 		change     func(*familyExecutionFlags)
 	}{
 		{"missing cut", "requires -family_execution_cut_in", func(f *familyExecutionFlags) { f.cutIn = "" }},
+		{"missing checkpoint", "require -family_execution_checkpoint_in", func(f *familyExecutionFlags) { f.checkpointIn = "" }},
+		{"checkpoint output", "initial-only", func(f *familyExecutionFlags) { f.checkpointOut = "output-checkpoint" }},
 		{"empty cut", "requires -family_execution_cut_in", func(f *familyExecutionFlags) { f.cutIn = " " }},
 		{"missing snapshot", "missing name", func(f *familyExecutionFlags) { f.initialSnapshots = f.initialSnapshots[1:] }},
 		{"duplicate snapshot", "repeats name", func(f *familyExecutionFlags) { f.initialSnapshots = append(f.initialSnapshots, f.initialSnapshots[0]) }},
@@ -209,6 +219,10 @@ func TestFamilyExecutionGuardsRejectEveryVariantOutputField(t *testing.T) {
 func TestFamilyExecutionFlagRegistrationRejectsBlankAndRepeatedScalars(t *testing.T) {
 	for _, arguments := range [][]string{
 		{"-family_execution_mode="},
+		{"-family_execution_checkpoint_in="},
+		{"-family_execution_checkpoint_out="},
+		{"-family_execution_checkpoint_in=a", "-family_execution_checkpoint_in=b"},
+		{"-family_execution_checkpoint_out=a", "-family_execution_checkpoint_out=b"},
 		{"-family_execution_mode=initial", "-family_execution_mode=replay"},
 		{"-family_execution_cut_out=one", "-family_execution_cut_out=two"},
 		{"-family_execution_store=objects="},
