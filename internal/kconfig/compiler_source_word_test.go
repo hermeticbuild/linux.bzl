@@ -2,6 +2,7 @@ package kconfig
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -16,6 +17,10 @@ func TestActionPlanConfigProbeManyConditionalFlagsIgnoreUnrelatedSource(t *testi
 		t.Run(prerequisite, func(t *testing.T) {
 			testActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t,
 				"$(strip "+strings.Join(flags, " ")+")", prerequisite)
+		})
+		t.Run(prerequisite+"/private include root", func(t *testing.T) {
+			testActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t,
+				"$(strip "+strings.Join(flags, " ")+" -I$(srctree)/include)", prerequisite)
 		})
 	}
 }
@@ -48,6 +53,67 @@ func TestCompilerSourceWordPresenceAcrossManyConditionalFlags(t *testing.T) {
 		if !complete || possible != test.want {
 			t.Fatalf("word %q: possible=%t complete=%t, want %t", test.word, possible, complete, test.want)
 		}
+	}
+}
+
+func TestCompilerSourceWordPresenceWithPrivateIncludeRoot(t *testing.T) {
+	for _, marker := range []string{compactKbuildActionSourceTreeMarker, compactKbuildActionObjectTreeMarker,
+		compactKbuildActionAbsoluteObjectTreeMarker, compactKbuildActionHostDepsTreeMarker} {
+		fragments := []ProbeValueFragment{{Value: " -std=gnu11 "}}
+		for i := range 32 {
+			fragments = append(fragments, ProbeValueFragment{Value: fmt.Sprintf("-fchoice-%d ", i),
+				When: &ProbePredicate{Operator: "result-true", Result: fmt.Sprintf("%08d", i)}})
+		}
+		fragments = append(fragments, ProbeValueFragment{Value: " -I" + marker + "/lib/crc/arm"})
+		groups := []ProbeArgumentFragments{{Index: 0, Mode: ProbeArgumentFragmentsModeSourceShellWords, Fragments: fragments}}
+		if _, complete := possibleCompilerSourceWords([]string{""}, nil, groups); complete {
+			t.Fatal("fixture no longer exceeds the exact renderer's budget")
+		}
+		if possible, complete := possibleCompilerSourceWord([]string{""}, nil, groups, "scripts/recordmcount.c"); possible || !complete {
+			t.Fatalf("private include root retained unrelated source: possible=%t complete=%t", possible, complete)
+		}
+		include := "-I" + compactKbuildMaterializeActionTreeMarkers(marker) + "/lib/crc/arm"
+		if possible, complete := possibleCompilerSourceWord([]string{""}, nil, groups, include); !possible || !complete {
+			t.Fatal("lost the materialized include word")
+		}
+	}
+}
+
+func TestCompilerSourceWordPrivateRootsMatchSourceShellParser(t *testing.T) {
+	marker := compactKbuildActionSourceTreeMarker
+	condition := &ProbePredicate{Operator: "result-true", Result: "00000000"}
+	for _, prefix := range []string{" -I", "prefix", " "} {
+		for _, suffix := range []string{"", "/file.c", " "} {
+			groups := []ProbeArgumentFragments{{Index: 0, Mode: ProbeArgumentFragmentsModeSourceShellWords,
+				Fragments: []ProbeValueFragment{{Value: prefix + marker + suffix}, {Value: " tail.c", When: condition}}}}
+			words, complete := possibleCompilerSourceWords([]string{""}, nil, groups)
+			if !complete {
+				t.Fatal("small source-shell oracle failed")
+			}
+			for _, word := range append(slices.Collect(maps.Keys(words)), "missing.c") {
+				possible, complete := possibleCompilerSourceWord([]string{""}, nil, groups, word)
+				if !complete || possible != words[word] {
+					t.Fatalf("root spelling %q/%q, word %q: possible=%t complete=%t oracle=%t", prefix, suffix, word, possible, complete, words[word])
+				}
+			}
+		}
+	}
+	for _, fragments := range [][]ProbeValueFragment{
+		{{Value: marker + "/file.c"}},
+		{{Value: "prefix/"}, {Value: compactKbuildActionObjectTreeMarker + "/file.c"}},
+		{{Value: " " + marker + "/"}, {Value: compactKbuildActionObjectTreeMarker + "/file.c"}},
+		{{Value: " " + marker + "/" + compactKbuildActionObjectTreeMarker + "/file.c"}},
+		{{Value: " -I\x01unknown\x02/file.c"}},
+		{{Value: " -I\x01linux-bzl-action-"}, {Value: "source-tree\x02/file.c"}},
+	} {
+		groups := []ProbeArgumentFragments{{Index: 0, Mode: ProbeArgumentFragmentsModeSourceShellWords, Fragments: fragments}}
+		if possible, complete := possibleCompilerSourceWord([]string{""}, nil, groups, "missing.c"); !possible || complete {
+			t.Fatal("joining or malformed root acquired an absence proof")
+		}
+	}
+	groups := []ProbeArgumentFragments{{Index: 0, Fragments: []ProbeValueFragment{{Value: " -I" + marker + "/file.c"}}}}
+	if possible, complete := possibleCompilerSourceWord([]string{""}, nil, groups, "missing.c"); !possible || complete {
+		t.Fatal("ordinary field splitting gained source-shell marker semantics")
 	}
 }
 

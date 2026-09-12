@@ -1,6 +1,9 @@
 package kconfig
 
-import "slices"
+import (
+	"slices"
+	"strings"
+)
 
 const (
 	maxCompilerSourceWordLength = 4096
@@ -12,8 +15,9 @@ const (
 // strings, so thirty conditional flags do not require a billion renderings.
 // A positive or unknown result retains the candidate; only absence removes it.
 type compilerSourceWordMachine struct {
-	word string
-	work int
+	word             string
+	work             int
+	sourceShellWords bool
 }
 
 func (m *compilerSourceWordMachine) charge() bool {
@@ -36,6 +40,24 @@ func plainCompilerSourceWordByte(c byte) bool {
 }
 
 func (m *compilerSourceWordMachine) literal(states []int, value string) ([]int, bool) {
+	if strings.ContainsRune(value, '\x01') {
+		if !m.sourceShellWords || len(value) > maxCompilerSourceWordWork-m.work {
+			return nil, false
+		}
+		m.work += len(value)
+		// The source-shell parser materializes authenticated private roots before
+		// lexing. Only do that leaf-locally when no root can participate in path
+		// joining: a leading marker may join the previous leaf, and a slash
+		// before a marker may collapse an outer or embedded object root. Such
+		// cases still require the complete renderer, as do partial/unknown markers.
+		for _, marker := range []string{compactKbuildActionSourceTreeMarker, compactKbuildActionObjectTreeMarker,
+			compactKbuildActionAbsoluteObjectTreeMarker, compactKbuildActionHostDepsTreeMarker} {
+			if strings.HasPrefix(value, marker) || strings.Contains(value, "/"+marker) {
+				return nil, false
+			}
+		}
+		value = compactKbuildMaterializeActionTreeMarkers(value)
+	}
 	dead, found := len(m.word)+1, len(m.word)+2
 	current := slices.Clone(states)
 	next := make([]int, 0, found+1)
@@ -131,6 +153,7 @@ func (m *compilerSourceWordMachine) group(group ProbeArgumentFragments) (bool, b
 	if group.Mode != "" && group.Mode != ProbeArgumentFragmentsModeSourceShellWords {
 		return true, false
 	}
+	m.sourceShellWords = group.Mode == ProbeArgumentFragmentsModeSourceShellWords
 	fragments := group.Fragments
 	depth := 0
 	// Only a whole-group strip preserves word boundaries. An interior strip
