@@ -67,6 +67,7 @@ type KbuildProbeScopes struct {
 	resolved               successfulStringMemo
 	resolvedStructure      successfulStringMemo
 	sourceGuardInventory   *configDependencyGuardInventory
+	definednessPrograms    compilerDefinednessProgramCache
 	// exactScriptEnvironmentBindings intern complete source-owned process
 	// environments. Profiles retain only the corresponding activation closure;
 	// the binding and active evaluator set remain local to this workload.
@@ -2686,7 +2687,7 @@ func (s *KbuildProbeScopes) CompilerDefinedness(
 	arguments, translationUnits, names []string,
 	environment map[string]string,
 ) (map[string]bool, bool, error) {
-	ordered, stdin, err := compilerDefinednessSource(names)
+	ordered, stdin, err := s.compilerDefinednessProgram(names)
 	if err != nil {
 		return nil, false, unsupportedCompilerPredefineProjection(err)
 	}
@@ -2786,6 +2787,69 @@ func (s *KbuildProbeScopes) CompilerDollarPunctuation(
 		return false, false, fmt.Errorf("compiler dollar punctuation result disagrees with its exact reduction")
 	}
 	return positive, true, nil
+}
+
+const compilerDefinednessProgramCacheEntries = 4
+const compilerDefinednessProgramCacheBytes = 8 << 20
+
+type compilerDefinednessProgram struct {
+	names, ordered []string
+	source         string
+	bytes          int
+}
+
+// This sequential workload-local cache retains only validated source text, not
+// requests, scope bindings or compiler answers. Exact list equality preserves
+// nil/empty shape, duplicates and caller mutation without trusting a hash key.
+type compilerDefinednessProgramCache struct {
+	entries []compilerDefinednessProgram
+	bytes   int
+}
+
+func (s *KbuildProbeScopes) compilerDefinednessProgram(names []string) ([]string, string, error) {
+	if s == nil {
+		return compilerDefinednessSource(names)
+	}
+	cache := &s.definednessPrograms
+	for _, entry := range cache.entries {
+		if (names == nil) == (entry.names == nil) && slices.Equal(names, entry.names) {
+			return slices.Clone(entry.ordered), entry.source, nil
+		}
+	}
+	ordered, source, err := compilerDefinednessSource(names)
+	if err != nil {
+		return nil, "", err
+	}
+	// Compact clears duplicate elements but retains the full backing array.
+	bytes := len(source) + 32*len(names) + 64
+	for _, name := range names {
+		bytes += len(name)
+	}
+	if bytes > compilerDefinednessProgramCacheBytes {
+		return ordered, source, nil
+	}
+	// Detach names from caller-owned slices and potentially large backing
+	// strings. Both stored vectors reference only these owned string bytes.
+	var owned, canonical []string
+	if names != nil {
+		owned = make([]string, len(names))
+		canonical = make([]string, len(names))
+	}
+	for index := range owned {
+		owned[index] = strings.Clone(names[index])
+	}
+	copy(canonical, owned)
+	slices.Sort(canonical)
+	canonical = slices.Compact(canonical)
+	for len(cache.entries) >= compilerDefinednessProgramCacheEntries || cache.bytes+bytes > compilerDefinednessProgramCacheBytes {
+		cache.bytes -= cache.entries[0].bytes
+		copy(cache.entries, cache.entries[1:])
+		cache.entries[len(cache.entries)-1] = compilerDefinednessProgram{}
+		cache.entries = cache.entries[:len(cache.entries)-1]
+	}
+	cache.entries = append(cache.entries, compilerDefinednessProgram{owned, canonical, source, bytes})
+	cache.bytes += bytes
+	return ordered, source, nil
 }
 
 func compilerDefinednessSource(names []string) ([]string, string, error) {

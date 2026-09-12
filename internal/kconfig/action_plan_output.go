@@ -267,6 +267,11 @@ func analyzePreparedActionPlan(
 		var dependencyCache *ActionPlanConfigDependencySharedCache
 		if familyCache != nil {
 			dependencyCache = familyCache.configDependencyCache()
+			// Share only immutable source hints here. A restored plan already
+			// owns an input-set store; attaching the lowering cache replaces it.
+			if plan != nil && plan.metadata != nil {
+				plan.metadata.sourceGuardInventory = familyCache.sourceGuardInventory
+			}
 		}
 		switch {
 		case variantOptions != nil && variantOptions.Cut != nil:

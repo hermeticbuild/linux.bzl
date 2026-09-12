@@ -1,12 +1,95 @@
 package kconfig
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 )
+
+func TestCompilerCheckpointReplaysPrunedPureDefinitions(t *testing.T) {
+	options := compilerDefinednessTestOptions(t)
+	workload := func(scopes *KbuildProbeScopes) (string, error) {
+		e := scopes.evaluators["target"]
+		if _, err := e.requestText(ProbeRequest{Schema: LinuxProbeRequestSchema,
+			Steps:   []ProbeStep{{Name: "measured", Tool: "cc", Arguments: []string{"--version"}}},
+			Outcome: ProbeOutcome{Kind: "text", Step: "measured", Stream: "stdout", RequireSuccess: true}}); err != nil {
+			return "", err
+		}
+		if _, err := e.requestText(ProbeRequest{Schema: LinuxProbeRequestSchema, InputCount: 1,
+			Outcome: ProbeOutcome{Kind: "text", Result: "00000000", Word: 1}}, e.References()[0]); err != nil {
+			return "", err
+		}
+		return e.requestText(ProbeRequest{Schema: LinuxProbeRequestSchema, InputCount: 1,
+			Outcome: ProbeOutcome{Kind: "text", Fragments: []ProbeValueFragment{{Value: "prefix/"}, {Value: "${result:00000000.text}"}}}}, e.References()[1])
+	}
+	scopes := compilerGuardBatchScopesForTest(t, options)
+	if _, err := workload(scopes); err != nil {
+		t.Fatal(err)
+	}
+	data, err := scopes.MarshalActionPlanCompilerCheckpoint([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record kbuildCompilerCheckpoint
+	if err := json.Unmarshal(data, &record); err != nil || len(record.Symbols) != 0 || len(record.Plan.Nodes) != 3 {
+		t.Fatalf("fixture did not prune only symbolic aliases: %v", err)
+	}
+	root, terminal := record.Plan.Nodes[0], record.Plan.Nodes[2]
+	newOracle := func(value string) *ProbeResultOracle {
+		return &ProbeResultOracle{toolsets: maps.Clone(record.Plan.Toolsets), results: map[string]ProbeResult{
+			root.ID: {Schema: LinuxProbeResultSchema, NodeID: root.ID, RequestID: root.RequestID,
+				Scope: root.Scope, ToolsetIdentity: record.Plan.Toolsets[root.Scope], Kind: "text", Text: value,
+				Steps: []ProbeStepResult{{Name: "measured", Status: "success", Stdout: value}}},
+		}}
+	}
+	for _, value := range []string{"first value", "changed value"} {
+		t.Run(value, func(t *testing.T) {
+			freshOracle := newOracle(value)
+			fresh, err := EvaluateKbuildProbeWorkload(options, freshOracle, workload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := newOracle(value)
+			restored, err := EvaluateKbuildProbeWorkload(options, current, func(s *KbuildProbeScopes) (string, error) {
+				return "", s.RestoreCompilerCheckpoint(data, nil)
+			})
+			if err != nil {
+				t.Fatalf("restore lost pure results for pruned symbols: %v", err)
+			}
+			if !reflect.DeepEqual(restored.Plan, fresh.Plan) || !reflect.DeepEqual(current.results, freshOracle.results) {
+				t.Fatal("checkpoint replay differs from fresh source evaluation")
+			}
+			if current.results[terminal.ID].Text != "prefix/"+strings.Fields(value)[0] {
+				t.Fatal("checkpoint did not use the current measured value")
+			}
+		})
+	}
+	for _, defect := range []string{"missing", "stale request", "wrong scope"} {
+		t.Run(defect, func(t *testing.T) {
+			oracle := newOracle("value")
+			result := oracle.results[root.ID]
+			switch defect {
+			case "missing":
+				delete(oracle.results, root.ID)
+			case "stale request":
+				result.RequestID = strings.Repeat("a", 64)
+				oracle.results[root.ID] = result
+			case "wrong scope":
+				result.Scope = "host"
+				oracle.results[root.ID] = result
+			}
+			if _, err := EvaluateKbuildProbeWorkload(options, oracle, func(s *KbuildProbeScopes) (string, error) {
+				return "", s.RestoreCompilerCheckpoint(data, nil)
+			}); err == nil {
+				t.Fatal("checkpoint accepted a missing or stale measured observation")
+			}
+		})
+	}
+}
 
 func TestCompilerCheckpointPreservesScopeAdoption(t *testing.T) {
 	for _, test := range []struct {

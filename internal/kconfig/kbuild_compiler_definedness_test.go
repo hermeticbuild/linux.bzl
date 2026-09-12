@@ -3,7 +3,9 @@ package kconfig
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -12,6 +14,124 @@ import (
 type compilerDefinednessTestValue struct {
 	definitions map[string]bool
 	ready       bool
+}
+
+func TestCompilerDefinednessProgramCacheParityAndOwnership(t *testing.T) {
+	scopes := &KbuildProbeScopes{}
+	cases := [][]string{nil, {}, {"B", "A", "B"}, {"A", "B"}, {"A\x00B"}, {"9bad"}, {""}}
+	for round := 0; round < 3; round++ {
+		for _, names := range cases {
+			wantOrder, wantSource, wantErr := compilerDefinednessSource(names)
+			gotOrder, gotSource, gotErr := scopes.compilerDefinednessProgram(names)
+			if !reflect.DeepEqual(gotOrder, wantOrder) || gotSource != wantSource || fmt.Sprint(gotErr) != fmt.Sprint(wantErr) {
+				t.Fatalf("round %d names %q: cached result differs", round, names)
+			}
+			if len(gotOrder) != 0 {
+				gotOrder[0] = "mutated result"
+			}
+		}
+	}
+	names := []string{"ORIGINAL"}
+	_, original, err := scopes.compilerDefinednessProgram(names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names[0] = "CHANGED"
+	_, changed, err := scopes.compilerDefinednessProgram(names)
+	if err != nil || changed == original {
+		t.Fatal("caller mutation reused a stale program")
+	}
+	_, restored, err := scopes.compilerDefinednessProgram([]string{"ORIGINAL"})
+	if err != nil || restored != original {
+		t.Fatal("caller mutation altered cached program")
+	}
+}
+
+func TestCompilerDefinednessProgramCacheBounds(t *testing.T) {
+	scopes := &KbuildProbeScopes{}
+	duplicates := make([]string, 100)
+	for i := range duplicates {
+		duplicates[i] = "A"
+	}
+	if _, _, err := scopes.compilerDefinednessProgram(duplicates); err != nil {
+		t.Fatal(err)
+	}
+	entry := scopes.definednessPrograms.entries[0]
+	if entry.bytes < 16*(cap(entry.names)+cap(entry.ordered))+100+len(entry.source) {
+		t.Fatal("duplicate compaction hid retained backing storage")
+	}
+	for i := 0; i < 12; i++ {
+		names := []string{strings.Repeat("A", MaxProbeInterpolatedBytes/2) + fmt.Sprint(i)}
+		wantOrder, wantSource, err := compilerDefinednessSource(names)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotOrder, gotSource, err := scopes.compilerDefinednessProgram(names)
+		if err != nil || !slices.Equal(gotOrder, wantOrder) || gotSource != wantSource {
+			t.Fatal("eviction changed query text")
+		}
+		if len(scopes.definednessPrograms.entries) > compilerDefinednessProgramCacheEntries || scopes.definednessPrograms.bytes > compilerDefinednessProgramCacheBytes {
+			t.Fatal("cache exceeded its bound")
+		}
+	}
+	before := scopes.definednessPrograms.bytes
+	if _, _, err := scopes.compilerDefinednessProgram(make([]string, MaxProbeDynamicArgumentWords+1)); err == nil {
+		t.Fatal("oversized caller list accepted")
+	}
+	if scopes.definednessPrograms.bytes != before {
+		t.Fatal("invalid request changed cache")
+	}
+	// Large duplicate vectors retain their backing arrays even though their
+	// canonical programs are tiny. Exercise byte eviction before entry eviction.
+	scopes = &KbuildProbeScopes{}
+	for _, name := range []string{"A", "B", "C", "D"} {
+		names := make([]string, MaxProbeDynamicArgumentWords)
+		for index := range names {
+			names[index] = name
+		}
+		if _, _, err := scopes.compilerDefinednessProgram(names); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(scopes.definednessPrograms.entries) >= compilerDefinednessProgramCacheEntries || scopes.definednessPrograms.bytes > compilerDefinednessProgramCacheBytes {
+		t.Fatal("retained arrays did not trigger byte-budget eviction")
+	}
+}
+
+func BenchmarkCompilerDefinednessProgram(b *testing.B) {
+	chunks := make([][]string, 4)
+	for chunk := range chunks {
+		chunks[chunk] = make([]string, 16000)
+		for i := range chunks[chunk] {
+			chunks[chunk][i] = fmt.Sprintf("SOURCE_HEADER_GUARD_%05d", chunk*16000+i)
+		}
+	}
+	b.Run("uncached", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			for _, names := range chunks {
+				if _, _, err := compilerDefinednessSource(names); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+	b.Run("cached", func(b *testing.B) {
+		scopes := &KbuildProbeScopes{}
+		for _, names := range chunks {
+			if _, _, err := scopes.compilerDefinednessProgram(names); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.ReportAllocs()
+		for b.Loop() {
+			for _, names := range chunks {
+				if _, _, err := scopes.compilerDefinednessProgram(names); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
 }
 
 func compilerDefinednessTestOptions(t *testing.T) KbuildProbeWorkloadOptions {

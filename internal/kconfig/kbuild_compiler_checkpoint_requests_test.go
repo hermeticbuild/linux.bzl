@@ -4,10 +4,106 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestCompilerCheckpointInternsLargeProgramsAcrossRequestContexts(t *testing.T) {
+	options := compilerDefinednessTestOptions(t)
+	scopes := compilerGuardBatchScopesForTest(t, options)
+	program := "/*" + strings.Repeat("source-owned-program", 45000) + "*/\n"
+	for index := 0; index < 80; index++ {
+		if _, err := scopes.evaluators["target"].requestText(ProbeRequest{Schema: LinuxProbeRequestSchema,
+			Steps:   []ProbeStep{{Name: "measure", Tool: "cc", Stdin: program, Arguments: []string{"-E", "-x", "c", "-"}, Environment: map[string]string{"CONTEXT": fmt.Sprint(index)}}},
+			Outcome: ProbeOutcome{Kind: "text", Step: "measure", Stream: "stdout", RequireSuccess: true}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := compilerGuardBatchOrdinaryPlanForTest(t, scopes)
+	unpacked, err := json.Marshal(before)
+	if err != nil || len(unpacked) <= MaxKbuildCompilerCheckpointBytes {
+		t.Fatalf("fixture does not exceed the old wire limit: bytes=%d err=%v", len(unpacked), err)
+	}
+	data, err := scopes.MarshalActionPlanCompilerCheckpoint([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) >= 2<<20 {
+		t.Fatalf("large program repeated in checkpoint: %d bytes", len(data))
+	}
+	if !reflect.DeepEqual(before, compilerGuardBatchOrdinaryPlanForTest(t, scopes)) {
+		t.Fatal("packing mutated the live producer request graph")
+	}
+	fresh := compilerGuardBatchScopesForTest(t, options)
+	if err := fresh.RestoreCompilerCheckpoint(data, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, compilerGuardBatchOrdinaryPlanForTest(t, fresh)) {
+		t.Fatal("program dictionary changed request bytes, IDs, contexts or inputs")
+	}
+	again, err := fresh.MarshalActionPlanCompilerCheckpoint([]byte(`{}`))
+	if err != nil || !bytes.Equal(data, again) {
+		t.Fatalf("program dictionary round trip is not canonical: %v", err)
+	}
+}
+
+func TestCompilerCheckpointRejectsMalformedProgramDictionaries(t *testing.T) {
+	program := strings.Repeat("A", compilerCheckpointStdinThreshold)
+	base := func() kbuildCompilerCheckpoint {
+		return kbuildCompilerCheckpoint{Plan: &ProbePlan{Requests: map[string]ProbeRequest{"r": {Steps: []ProbeStep{{}}}}},
+			StdinPrograms: []string{program}, StdinReferences: map[string][]int{"r": {0}}}
+	}
+	for name, mutate := range map[string]func(*kbuildCompilerCheckpoint){
+		"missing table":     func(r *kbuildCompilerCheckpoint) { r.StdinPrograms = nil },
+		"unused program":    func(r *kbuildCompilerCheckpoint) { r.StdinPrograms = append(r.StdinPrograms, strings.Repeat("B", 256)) },
+		"duplicate program": func(r *kbuildCompilerCheckpoint) { r.StdinPrograms = append(r.StdinPrograms, program) },
+		"unknown request":   func(r *kbuildCompilerCheckpoint) { r.StdinReferences["unknown"] = []int{0} },
+		"wrong extent":      func(r *kbuildCompilerCheckpoint) { r.StdinReferences["r"] = []int{0, 0} },
+		"negative index":    func(r *kbuildCompilerCheckpoint) { r.StdinReferences["r"][0] = -2 },
+		"out of range":      func(r *kbuildCompilerCheckpoint) { r.StdinReferences["r"][0] = 1 },
+		"empty binding":     func(r *kbuildCompilerCheckpoint) { r.StdinReferences["r"][0] = -1 },
+		"second payload":    func(r *kbuildCompilerCheckpoint) { r.Plan.Requests["r"].Steps[0].Stdin = "inline" },
+		"unbound program": func(r *kbuildCompilerCheckpoint) {
+			r.StdinReferences = map[string][]int{}
+			r.Plan.Requests["r"].Steps[0].Stdin = program
+		},
+		"invalid utf8": func(r *kbuildCompilerCheckpoint) { r.StdinPrograms[0] = program + "\xff" },
+		"nul program":  func(r *kbuildCompilerCheckpoint) { r.StdinPrograms[0] = program + "\x00" },
+		"oversized program": func(r *kbuildCompilerCheckpoint) {
+			r.StdinPrograms[0] = strings.Repeat("A", MaxProbeInterpolatedBytes+1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			record := base()
+			mutate(&record)
+			before, _ := json.Marshal(record)
+			if err := unpackCompilerCheckpointStdin(&record); err == nil {
+				t.Fatal("malformed program dictionary accepted")
+			}
+			after, _ := json.Marshal(record)
+			if !bytes.Equal(before, after) {
+				t.Fatal("failed validation partially rebound requests")
+			}
+		})
+	}
+	// A tiny table cannot make validation/hash work grow without a bound.
+	record := base()
+	record.StdinPrograms[0] = strings.Repeat("A", MaxProbeInterpolatedBytes)
+	for index := 0; index <= MaxActionPlanSnapshotBytes/MaxProbeInterpolatedBytes; index++ {
+		id := fmt.Sprint(index)
+		record.Plan.Requests[id] = ProbeRequest{Steps: []ProbeStep{{}}}
+		record.StdinReferences[id] = []int{0}
+	}
+	before := maps.Clone(record.Plan.Requests)
+	if err := unpackCompilerCheckpointStdin(&record); err == nil || !strings.Contains(err.Error(), "expanded plan budget") {
+		t.Fatalf("dictionary amplification not rejected: %v", err)
+	}
+	if !reflect.DeepEqual(before, record.Plan.Requests) {
+		t.Fatal("amplification rejection mutated requests")
+	}
+}
 
 func TestCompilerCheckpointInternsExactRequestState(t *testing.T) {
 	request := ProbeRequest{Schema: LinuxProbeRequestSchema, Sources: []string{}, Steps: []ProbeStep{{Name: "unique-request-program", Arguments: []string{}, Environment: map[string]string{}}}}

@@ -9,7 +9,7 @@ import (
 	"slices"
 )
 
-const kbuildCompilerCheckpointSchema = "linux-kbuild-compiler-checkpoint-v3"
+const kbuildCompilerCheckpointSchema = "linux-kbuild-compiler-checkpoint-v4"
 
 // MaxKbuildCompilerCheckpointBytes bounds compiler request/expression transport.
 const MaxKbuildCompilerCheckpointBytes = 64 << 20
@@ -56,6 +56,8 @@ type kbuildCheckpointScope struct {
 }
 type kbuildCompilerCheckpoint struct {
 	EmptyContainers  [][]string
+	StdinPrograms    []string
+	StdinReferences  map[string][]int
 	Schema           string
 	Plan             *ProbePlan
 	Definitions      map[string]kbuildCheckpointDefinition
@@ -158,6 +160,10 @@ func (s *KbuildProbeScopes) marshalCompilerCheckpoint(actionPlan []byte) ([]byte
 			return nil, err
 		}
 	}
+	if err := packCompilerCheckpointStdin(&r); err != nil {
+		registry.mu.RUnlock()
+		return nil, err
+	}
 	r.EmptyContainers, err = compilerCheckpointEmptyContainers(r)
 	if err != nil {
 		registry.mu.RUnlock()
@@ -199,6 +205,9 @@ func (s *KbuildProbeScopes) RestoreCompilerCheckpoint(data []byte, normalizeUpst
 	}
 	if r.Schema != kbuildCompilerCheckpointSchema || r.Plan == nil || r.Definitions == nil || r.Symbols == nil {
 		return fmt.Errorf("incomplete compiler checkpoint")
+	}
+	if err := unpackCompilerCheckpointStdin(&r); err != nil {
+		return err
 	}
 	if err := bindCompilerCheckpointRequests(&r, false); err != nil {
 		return err
@@ -301,6 +310,24 @@ func (s *KbuildProbeScopes) RestoreCompilerCheckpoint(data []byte, normalizeUpst
 	plan, err := builder.Plan(staged.References()...)
 	if err != nil || !reflect.DeepEqual(plan, r.Plan) {
 		return fmt.Errorf("compiler checkpoint lost ordinary probe closure: %v", err)
+	}
+	// Lowering can discard an intermediate symbolic alias while retaining its
+	// ordinary request/reference. Fresh Make evaluation closes these pure
+	// reductions as it registers them; checkpoint replay must do the same even
+	// when no retained symbol needs to adopt the result. Recompute solely from
+	// the current oracle, never serialize answers or invent process observations.
+	for _, node := range plan.Nodes {
+		request := plan.Requests[node.RequestID]
+		if !isPureDependencyProbeRequest(request) {
+			continue
+		}
+		dependencies := make([]ProbeReference, len(node.Inputs))
+		for index, id := range node.Inputs {
+			dependencies[index] = refs[id]
+		}
+		if err := staged.evaluators[node.Scope].closeReplayPureResult(refs[node.ID], request, dependencies...); err != nil {
+			return fmt.Errorf("restore pure compiler checkpoint result %s: %w", node.ID, err)
+		}
 	}
 	identity, err := staged.exactScriptEnvironmentsKey(staged.currentScriptEnvironments())
 	if err != nil {

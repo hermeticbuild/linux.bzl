@@ -171,6 +171,7 @@ func TestActionPlanCheckpointBackendReplaysCompleteLoweredPlan(t *testing.T) {
 		t.Fatal("retained original planner state")
 	}
 	replayOptions := ActionPlanFamilyVariantPlanningOptions{Variant: "base", InitialSnapshot: &snapshot, Cut: cut, ObservedHeaders: observed, ResolvedConfigFiles: maps.Clone(files)}
+	replayOptions.Cache = NewActionPlanFamilyPlanningCache()
 	if _, err := ReplayActionPlanCheckpoint(restored, ActionPlanFamilyVariantPlanningOptions{Variant: "base"}); err == nil {
 		t.Fatal("checkpoint bypassed complete original replay inputs")
 	}
@@ -192,6 +193,10 @@ func TestActionPlanCheckpointBackendReplaysCompleteLoweredPlan(t *testing.T) {
 		t.Fatal("checkpoint guard discovery omitted the current round callback")
 	}
 	guardOptions := replayOptions
+	guardStore, err := guardPlan.planningActionPlanInputSetStore()
+	if err != nil {
+		t.Fatal(err)
+	}
 	guardCallbacks := 0
 	guardOptions.PrepareCompilerGuards = func() error { guardCallbacks++; return nil }
 	if err := DiscoverActionPlanCheckpointCompilerGuards(guardPlan, guardOptions); err != nil {
@@ -200,9 +205,30 @@ func TestActionPlanCheckpointBackendReplaysCompleteLoweredPlan(t *testing.T) {
 	if guardCallbacks != 1 {
 		t.Fatal("checkpoint guard callback did not run exactly once")
 	}
+	if guardPlan.metadata.sourceGuardInventory != replayOptions.Cache.sourceGuardInventory {
+		t.Fatal("checkpoint guard discovery did not share family source inventory")
+	}
+	if guardPlan.inputSetStore != guardStore {
+		t.Fatal("sharing guard inventory replaced the restored input-set store")
+	}
+	restoredStore, err := restored.planningActionPlanInputSetStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalCallbacks := 0
+	replayOptions.PrepareCompilerGuards = func() error {
+		finalCallbacks++
+		if restored.inputSetStore != restoredStore {
+			t.Fatal("final replay replaced the restored input-set store before analysis")
+		}
+		return nil
+	}
 	result, err := ReplayActionPlanCheckpoint(restored, replayOptions)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if finalCallbacks != 1 || restored.metadata.sourceGuardInventory != replayOptions.Cache.sourceGuardInventory {
+		t.Fatal("final checkpoint replay lost its callback or shared family inventory")
 	}
 	final, _, _, err := buildObservedActionPlanFamily([]*ActionPlanFamilyVariantPlanningResult{result})
 	if err != nil {
