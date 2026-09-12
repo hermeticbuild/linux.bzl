@@ -3712,6 +3712,9 @@ func buildValidatedActionPlanFamilyWithStats(
 			localized.Sources = append(localized.Sources, source)
 		}
 		sort.Slice(localized.Sources, func(i, j int) bool { return localized.Sources[i].ID < localized.Sources[j].ID })
+		if err := relocateFinalPreciseFamilyOutputs(reduction.plan, localized, reduction.structuralID, unionSets); err != nil {
+			return nil, fmt.Errorf("variant %s final precise output allocation: %w", reduction.name, err)
+		}
 		finalIDs, payloads, finalInputSetRoots, err := familyNodeIDs(localized, func(source ActionPlanSource) string { return source.ID })
 		if err != nil {
 			return nil, fmt.Errorf("variant %s final graph: %w", reduction.name, err)
@@ -3960,6 +3963,72 @@ func BuildActionPlanFamily(variants []ActionPlanFamilyVariant) (*ActionPlanFamil
 		return nil, err
 	}
 	return validated.family, nil
+}
+
+// relocateFinalPreciseFamilyOutputs removes allocation salts left behind by
+// structural compatibility partitioning. A fallback config producer can be
+// config-specific during partitioning and then become one precise projection
+// during localization. Its compiler's private output paths must follow that
+// final input boundary too. Opaque nodes (including retained executions) keep
+// their original allocations; final node IDs still hash every actual path.
+func relocateFinalPreciseFamilyOutputs(original, localized *ActionPlan, structuralIDs map[string]string, unionSets map[string]ConfigDependencySet) error {
+	// This is only an identity view: share immutable catalogs and the persistent
+	// input-set store, and copy outputs solely for eligible original nodes. It
+	// neither mutates recipes nor treats a family-looking path as ownership.
+	identity := *localized
+	identity.Nodes = slices.Clone(localized.Nodes)
+	ordinals := make(map[string]int, len(identity.Nodes))
+	for index, node := range identity.Nodes {
+		ordinals[node.ID] = index
+	}
+	owned := map[int]map[int]bool{} // node ordinal -> output slot -> observed state
+	for _, node := range original.Nodes {
+		structuralID := structuralIDs[node.ID]
+		dependencies, classified := unionSets[structuralID]
+		if structuralID == "" || !classified {
+			return fmt.Errorf("precise output allocation requires an original dependency classification")
+		}
+		if !preciseFamilyCompilerNode(original, node, dependencies) {
+			continue
+		}
+		index, found := ordinals[node.ID]
+		if !found || len(identity.Nodes[index].Outputs) != len(node.Outputs) {
+			return fmt.Errorf("precise output allocation lost its original node or slots")
+		}
+		for slot, output := range node.Outputs {
+			observed := plannerOwnedObservedFamilyState(output)
+			_, private := plannerOwnedPrivateFamilyArtifact(output)
+			if !observed && !private {
+				continue
+			}
+			if owned[index] == nil {
+				owned[index] = map[int]bool{}
+				identity.Nodes[index].Outputs = slices.Clone(identity.Nodes[index].Outputs)
+			}
+			owned[index][slot] = observed
+			identity.Nodes[index].Outputs[slot].Path = structuralFamilyOutputPath(output)
+			identity.Nodes[index].Outputs[slot].ArtifactPath = structuralFamilyArtifactPath(output)
+		}
+	}
+	if len(owned) == 0 {
+		return nil
+	}
+	allocationIDs, _, _, err := familyNodeIDs(&identity, func(source ActionPlanSource) string { return source.ID })
+	if err != nil {
+		return err
+	}
+	for index, slots := range owned {
+		node := &localized.Nodes[index]
+		for slot, observed := range slots {
+			if observed {
+				node.Outputs[slot].Path = familyOwnedObservedStatePath(allocationIDs[node.ID], slot)
+				node.Outputs[slot].ArtifactPath = ""
+			} else {
+				node.Outputs[slot].ArtifactPath = familyOwnedArtifactPath(allocationIDs[node.ID], slot)
+			}
+		}
+	}
+	return nil
 }
 
 func familyViewTree(tree string) bool {

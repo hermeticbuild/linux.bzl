@@ -2282,22 +2282,6 @@ func TestActionPlanFamilyNormalizesPlannerOwnedPrivateArtifactsIndependentOfOrde
 				}, "/")),
 			}
 
-			plan := snapshotActionPlan(base.Snapshot)
-			structuralIDs, _, _, err := familyNodeIDsWithArtifactPath(plan, fullConfigSourceIdentity, structuralFamilyArtifactPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			wantProjection := ""
-			for _, node := range plan.Nodes {
-				if len(node.Inputs) == 0 {
-					wantProjection = familyOwnedArtifactPath(structuralIDs[node.ID], 0)
-					break
-				}
-			}
-			if wantProjection == "" {
-				t.Fatal("test chain has no producer")
-			}
-
 			var baselineNodeIDs []string
 			for permutation, variants := range [][]ActionPlanFamilyVariant{{base, overlay}, {overlay, base}} {
 				family, err := BuildActionPlanFamily(variants)
@@ -2330,8 +2314,10 @@ func TestActionPlanFamilyNormalizesPlannerOwnedPrivateArtifactsIndependentOfOrde
 						consumer = node
 					}
 				}
-				if got := actionPlanOutputArtifactPath(producer.Outputs[0]); got != wantProjection {
-					t.Fatalf("permutation %d producer artifact path = %q, want %q", permutation, got, wantProjection)
+				wantProjection := actionPlanOutputArtifactPath(producer.Outputs[0])
+				parts := strings.Split(wantProjection, "/")
+				if len(parts) != 3 || parts[0] != familyOwnedArtifactDirectory || validatePlanDigest("private output allocation", parts[1]) != nil || parts[2] != planOrdinal(0) {
+					t.Fatalf("permutation %d producer artifact path is not a family allocation: %q", permutation, wantProjection)
 				}
 				bindings, err := familyNodeInputBindings(consumer, nodes)
 				if err != nil {
@@ -3903,6 +3889,151 @@ func TestActionPlanFamilyMaterializesPreciseCapsuleThroughPrepCopy(t *testing.T)
 	}
 	if variantLocalCopies != 0 || len(family.Nodes) != 2 {
 		t.Fatalf("variant-local full config copies/nodes = %d/%d, want 0/2", variantLocalCopies, len(family.Nodes))
+	}
+}
+
+func TestActionPlanFamilyPrivateCompileOutputsFollowFinalConfigInputs(t *testing.T) {
+	withPrivateOutput := func(config map[string]string, mode, allocation string) ActionPlanSnapshot {
+		t.Helper()
+		producerMode := mode
+		if mode == "opaque" || mode == "lookalike" {
+			producerMode = "fallback"
+		}
+		snapshot := familyTestPrepCopyCompileSnapshot(t, config, producerMode)
+		plan := snapshotActionPlan(snapshot)
+		sets := make([]ConfigDependencySet, len(plan.Nodes))
+		compilerID := ""
+		for index := range plan.Nodes {
+			node := &plan.Nodes[index]
+			sets[index] = snapshot.ConfigDependencies[node.ID]
+			if node.Kind != "compile" {
+				continue
+			}
+			compilerID = node.ID
+			if mode == "opaque" {
+				sets[index] = ConfigDependencySet{Opaque: true, Reason: "fixture unknown compiler inputs"}
+			}
+			recipe := cloneActionRecipe(plan.Recipes[node.Recipe])
+			recipe.Arguments = append(recipe.Arguments, "-MD", "-MF", "${output:00000001}")
+			recipe.Outputs = append(recipe.Outputs, "00000001", "00000002")
+			recipe.ObservedOutputs = map[string]string{"00000002": "drivers/example.generated"}
+			recipeID, err := recipe.ID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.Recipes[recipeID] = recipe
+			node.Recipe = recipeID
+			prefix := familyIntermediateArtifactDirectory
+			if mode == "lookalike" {
+				prefix = "ordinary-private-path"
+			}
+			node.Outputs = append(node.Outputs, ActionPlanOutput{
+				Tree: "objects", Path: "drivers/.example.o.d",
+				ArtifactPath: path.Join(prefix, allocation, "dependency-file"),
+			}, ActionPlanOutput{
+				Tree: "metadata", Path: path.Join(compactKbuildSideOutputStateDirectory, allocation+".state"),
+				ObservedPath: "drivers/example.generated",
+			})
+		}
+		consumerRecipe := ActionRecipe{
+			Schema: LinuxKernelPlanSchema, Kind: "copy", Tool: "actionfile",
+			Arguments: []string{"-input", "${input:state:00000000}", "-out", "${output:00000000}"},
+			Inputs:    []string{"state:00000000"}, Outputs: []string{"00000000"},
+		}
+		consumerRecipeID, err := consumerRecipe.ID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan.Recipes[consumerRecipeID] = consumerRecipe
+		consumer := ActionPlanNode{
+			ID: "state-consumer", Stage: "target", Kind: "copy", Tool: "actionfile", Recipe: consumerRecipeID, Product: "image",
+			Inputs:  []ActionPlanNodeEdge{{Role: "state", ProducerID: compilerID, Slot: 2}},
+			Outputs: []ActionPlanOutput{{Tree: "image", Path: "compiler-state"}},
+		}
+		store, err := plan.planningActionPlanInputSetStore()
+		if err != nil {
+			t.Fatal(err)
+		}
+		consumer.InputSet, err = store.Insert("", ActionPlanInputSetEntry{
+			Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "state-input"},
+			ProducerID: compilerID, Slot: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan.Nodes = append(plan.Nodes, consumer)
+		sets = append(sets, ConfigDependencySet{})
+		if err := plan.exportReachableActionPlanInputSets(); err != nil {
+			t.Fatal(err)
+		}
+		if err := contentAddressActionPlanNodes(plan); err != nil {
+			t.Fatal(err)
+		}
+		dependencies := map[string]ConfigDependencySet{}
+		for index, node := range plan.Nodes {
+			dependencies[node.ID] = sets[index]
+		}
+		result, err := canonicalActionPlanSnapshot(plan, dependencies, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	for _, mode := range []string{"fallback", "selected", "noncanonical", "opaque", "lookalike"} {
+		for _, used := range []string{"y", "n"} {
+			t.Run(mode+"/used="+used, func(t *testing.T) {
+				base := ActionPlanFamilyVariant{Name: "base", Snapshot: withPrivateOutput(familyTestConfig("y", "n"), mode, strings.Repeat("a", 64))}
+				overlay := ActionPlanFamilyVariant{Name: "overlay", Snapshot: withPrivateOutput(familyTestConfig(used, "m"), mode, strings.Repeat("b", 64))}
+				var baseline []string
+				for _, variants := range [][]ActionPlanFamilyVariant{{base, overlay}, {overlay, base}} {
+					family, err := BuildActionPlanFamily(variants)
+					if err != nil {
+						t.Fatal(err)
+					}
+					compiles := familyCompileNodes(family)
+					want := 2
+					if mode == "fallback" && used == "y" {
+						want = 1
+					}
+					if len(compiles) != want {
+						t.Fatalf("private-output compiles = %d, want %d after final config projection", len(compiles), want)
+					}
+					ids := make([]string, 0, len(compiles))
+					for _, compile := range compiles {
+						ids = append(ids, compile.ID)
+						if want == 1 && !slices.Equal(family.Memberships[compile.ID], []string{"base", "overlay"}) {
+							t.Fatalf("private compiler is not shared: %v", family.Memberships[compile.ID])
+						}
+					}
+					nodes := map[string]ActionPlanNode{}
+					for _, node := range family.Nodes {
+						nodes[node.ID] = node
+					}
+					for _, node := range family.Nodes {
+						if len(node.Inputs) != 1 || node.Inputs[0].Role != "state" {
+							continue
+						}
+						bindings, err := familyNodeInputBindings(node, nodes)
+						if err != nil {
+							t.Fatal(err)
+						}
+						producer := nodes[node.Inputs[0].ProducerID]
+						if bindings.Bindings["state:00000000"].ProjectionPath != producer.Outputs[2].Path {
+							t.Fatal("consumer retained the pre-localization state allocation")
+						}
+						if want == 1 && !slices.Equal(family.Memberships[node.ID], []string{"base", "overlay"}) {
+							t.Fatal("state consumer or persistent input-set edge did not follow the shared compiler")
+						}
+					}
+					sort.Strings(ids)
+					if baseline == nil {
+						baseline = ids
+					} else if !slices.Equal(baseline, ids) {
+						t.Fatal("private compiler identity depends on variant order")
+					}
+				}
+			})
+		}
 	}
 }
 
