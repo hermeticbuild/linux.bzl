@@ -8,16 +8,115 @@ import (
 const (
 	maxCompilerSourceWordLength = 4096
 	maxCompilerSourceWordWork   = 1 << 20
+	compilerWordQuoteModes      = 5
+	compilerWordUnquoted        = 0
+	compilerWordSingleQuoted    = 1
+	compilerWordDoubleQuoted    = 2
+	compilerWordUnquotedEscape  = 3
+	compilerWordDoubleEscape    = 4
 )
 
-// This automaton recognizes one complete unquoted word across a language of
-// independently optional fragments. It retains prefix states, not complete
-// strings, so thirty conditional flags do not require a billion renderings.
+// This automaton recognizes one complete word across a language of independently
+// optional fragments, retaining static source-shell quote/escape state. It keeps
+// prefix states, not complete strings, so thirty conditional flags do not require
+// a billion renderings. Unsupported shell or Make transformations stay unknown.
 // A positive or unknown result retains the candidate; only absence removes it.
 type compilerSourceWordMachine struct {
 	word             string
 	work             int
 	sourceShellWords bool
+	strippedGroup    bool
+}
+
+// States combine a word-prefix state with the shell quoting state. Retaining
+// both across optional leaves avoids enumerating complete compiler argv strings.
+func (m *compilerSourceWordMachine) advance(state int, c byte) (int, bool) {
+	word, quote := state/compilerWordQuoteModes, state%compilerWordQuoteModes
+	dead, found := len(m.word)+1, len(m.word)+2
+	emit := func(c byte) {
+		if word == found {
+			return
+		}
+		if word < len(m.word) && m.word[word] == c {
+			word++
+		} else {
+			word = dead
+		}
+	}
+	if !m.sourceShellWords {
+		if !plainCompilerSourceWordByte(c) {
+			return 0, false
+		}
+	} else {
+		if c < ' ' || c > 0x7e {
+			// Outside quotes, tabs delimit words. Escaped newlines disappear.
+			if c == '\n' && quote == compilerWordUnquotedEscape {
+				if m.strippedGroup {
+					return 0, false
+				}
+				quote = compilerWordUnquoted
+				return word*compilerWordQuoteModes + quote, true
+			}
+			if c != '\t' || quote != compilerWordUnquoted {
+				return 0, false
+			}
+		}
+		// Expansion-bearing spellings stay on the complete renderer. In a
+		// stripped Make group, quoted/escaped whitespace can change the word
+		// itself, so stripping cannot be treated as a word-boundary identity.
+		if c == '$' || c == '`' || m.strippedGroup && c == ' ' && quote != compilerWordUnquoted {
+			return 0, false
+		}
+		switch quote {
+		case compilerWordSingleQuoted:
+			if c == '\'' {
+				quote = compilerWordUnquoted
+			} else {
+				emit(c)
+			}
+			return word*compilerWordQuoteModes + quote, true
+		case compilerWordDoubleQuoted:
+			switch c {
+			case '"':
+				quote = compilerWordUnquoted
+			case '\\':
+				quote = compilerWordDoubleEscape
+			default:
+				emit(c)
+			}
+			return word*compilerWordQuoteModes + quote, true
+		case compilerWordUnquotedEscape:
+			emit(c)
+			return word * compilerWordQuoteModes, true
+		case compilerWordDoubleEscape:
+			if c != '"' && c != '\\' {
+				return 0, false
+			}
+			emit(c)
+			return word*compilerWordQuoteModes + compilerWordDoubleQuoted, true
+		}
+		switch c {
+		case '\'':
+			return word*compilerWordQuoteModes + compilerWordSingleQuoted, true
+		case '"':
+			return word*compilerWordQuoteModes + compilerWordDoubleQuoted, true
+		case '\\':
+			return word*compilerWordQuoteModes + compilerWordUnquotedEscape, true
+		}
+		if !plainCompilerSourceWordByte(c) {
+			return 0, false
+		}
+	}
+	if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+		if word == len(m.word) || word == found {
+			word = found
+		} else {
+			word = 0
+		}
+	} else {
+		emit(c)
+	}
+	return word * compilerWordQuoteModes, true
 }
 
 func (m *compilerSourceWordMachine) charge() bool {
@@ -58,30 +157,21 @@ func (m *compilerSourceWordMachine) literal(states []int, value string) ([]int, 
 		}
 		value = compactKbuildMaterializeActionTreeMarkers(value)
 	}
-	dead, found := len(m.word)+1, len(m.word)+2
 	current := slices.Clone(states)
-	next := make([]int, 0, found+1)
-	seen := make([]bool, found+1)
+	next := make([]int, 0, (len(m.word)+3)*compilerWordQuoteModes)
+	seen := make([]bool, (len(m.word)+3)*compilerWordQuoteModes)
 	for i := range len(value) {
 		c := value[i]
-		if !m.charge() || !plainCompilerSourceWordByte(c) {
+		if !m.charge() {
 			return nil, false
 		}
 		for _, state := range current {
 			if !m.charge() {
 				return nil, false
 			}
-			n := dead
-			switch {
-			case state == found:
-				n = found
-			case c == ' ' || c == '\t' || c == '\r' || c == '\n':
-				n = 0
-				if state == len(m.word) {
-					n = found
-				}
-			case state < len(m.word) && m.word[state] == c:
-				n = state + 1
+			n, complete := m.advance(state, c)
+			if !complete {
+				return nil, false
 			}
 			if !seen[n] {
 				seen[n] = true
@@ -118,7 +208,7 @@ func (m *compilerSourceWordMachine) sequence(fragments []ProbeValueFragment, sta
 			return nil, false
 		}
 		if fragment.When != nil {
-			seen := make([]bool, len(m.word)+3)
+			seen := make([]bool, (len(m.word)+3)*compilerWordQuoteModes)
 			for _, state := range states {
 				seen[state] = true
 			}
@@ -154,6 +244,7 @@ func (m *compilerSourceWordMachine) group(group ProbeArgumentFragments) (bool, b
 		return true, false
 	}
 	m.sourceShellWords = group.Mode == ProbeArgumentFragmentsModeSourceShellWords
+	m.strippedGroup = false
 	fragments := group.Fragments
 	depth := 0
 	// Only a whole-group strip preserves word boundaries. An interior strip
@@ -163,6 +254,7 @@ func (m *compilerSourceWordMachine) group(group ProbeArgumentFragments) (bool, b
 		if !m.charge() || depth >= MaxProbeValueFragmentDepth {
 			return true, false
 		}
+		m.strippedGroup = m.strippedGroup || len(fragments[0].Transforms) != 0
 		fragments = fragments[0].Fragments
 		depth++
 	}
@@ -170,7 +262,15 @@ func (m *compilerSourceWordMachine) group(group ProbeArgumentFragments) (bool, b
 	if !complete {
 		return true, false
 	}
-	return slices.Contains(states, len(m.word)) || slices.Contains(states, len(m.word)+2), true
+	possible := false
+	for _, state := range states {
+		if state%compilerWordQuoteModes != compilerWordUnquoted {
+			return true, false
+		}
+		word := state / compilerWordQuoteModes
+		possible = possible || word == len(m.word) || word == len(m.word)+2
+	}
+	return possible, true
 }
 
 func possibleCompilerSourceWord(base []string, conditional []ProbeConditionalArguments, fragments []ProbeArgumentFragments, candidate string) (bool, bool) {

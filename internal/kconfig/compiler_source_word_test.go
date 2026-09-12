@@ -1,8 +1,10 @@
 package kconfig
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -21,6 +23,10 @@ func TestActionPlanConfigProbeManyConditionalFlagsIgnoreUnrelatedSource(t *testi
 		t.Run(prerequisite+"/private include root", func(t *testing.T) {
 			testActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t,
 				"$(strip "+strings.Join(flags, " ")+" -I$(srctree)/include)", prerequisite)
+		})
+		t.Run(prerequisite+"/quoted namespace", func(t *testing.T) {
+			testActionPlanConfigProbeReplayReusesCcOptionDiscoveryRequest(t,
+				"$(strip "+strings.Join(flags, " ")+" -I$(srctree)/include -DDEFAULT_SYMBOL_NAMESPACE='\"USB_STORAGE\"')", prerequisite)
 		})
 	}
 }
@@ -76,6 +82,120 @@ func TestCompilerSourceWordPresenceWithPrivateIncludeRoot(t *testing.T) {
 		if possible, complete := possibleCompilerSourceWord([]string{""}, nil, groups, include); !possible || !complete {
 			t.Fatal("lost the materialized include word")
 		}
+	}
+}
+
+func TestCompilerSourceWordActualQuotedNamespaceRequest(t *testing.T) {
+	data, err := os.ReadFile("testdata/armv7-quoted-namespace-request.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request ProbeRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		t.Fatal(err)
+	}
+	step := request.Steps[0]
+	if _, complete := possibleCompilerSourceWords(step.Arguments, step.ConditionalArguments, step.ArgumentFragments); complete {
+		t.Fatal("captured request does not exercise the exhaustive-rendering limit")
+	}
+	possible, complete := possibleCompilerSourceWord(step.Arguments, step.ConditionalArguments, step.ArgumentFragments, "scripts/recordmcount.c")
+	if possible || !complete {
+		t.Fatalf("captured request retains unrelated source: possible=%t complete=%t", possible, complete)
+	}
+}
+
+func TestCompilerSourceWordQuotesMatchSourceShellParser(t *testing.T) {
+	condition := &ProbePredicate{Operator: "result-true", Result: "00000000"}
+	for _, text := range []string{
+		`'source.c'`, `source\.c`, `"source.c"`, `-DNAME='"USB_STORAGE"'`,
+		`'source name.c'`, `"source name.c"`, `source\ name.c`, `"source\\name.c"`,
+		`-DNAME=\"literal\"`, `a''b.c`, `a""b.c`,
+		`'a'"b"c.c`, `"a'"b.c`, `'' source.c`, "source\\\n.c",
+	} {
+		// Every split exercises quote/escape state carried across leaf boundaries.
+		for split := 0; split <= len(text); split++ {
+			groups := []ProbeArgumentFragments{{Index: 0, Mode: ProbeArgumentFragmentsModeSourceShellWords,
+				Fragments: []ProbeValueFragment{{Value: text[:split]}, {Value: text[split:]}, {Value: " tail.c", When: condition}}}}
+			words := map[string]bool{}
+			for _, rendered := range []string{text, text + " tail.c"} {
+				parsed, err := ParseProbeSourceShellWords(rendered)
+				if err != nil {
+					t.Fatalf("oracle rejected %q: %v", rendered, err)
+				}
+				for _, word := range parsed {
+					if word != "" {
+						words[word] = true
+					}
+				}
+			}
+			for _, word := range append(slices.Collect(maps.Keys(words)), "missing.c", "source.c", "name.c") {
+				possible, complete := possibleCompilerSourceWord([]string{""}, nil, groups, word)
+				if !complete || possible != words[word] {
+					t.Fatalf("text=%q split=%d word=%q: possible=%t complete=%t oracle=%t", text, split, word, possible, complete, words[word])
+				}
+			}
+		}
+	}
+}
+
+func TestCompilerSourceWordQuotedConditionsAndStripStayConservative(t *testing.T) {
+	condition := &ProbePredicate{Operator: "result-true", Result: "00000000"}
+	strip := ProbeValueTransform{Function: "strip", Arguments: []string{""}, InputArgument: 0}
+	for _, fragments := range [][]ProbeValueFragment{
+		{{Value: "'", When: condition}, {Value: "source.c"}},
+		{{Value: "'unterminated"}}, {{Value: `"unterminated`}}, {{Value: "trailing\\"}},
+		{{Value: `"$expansion"`}}, {{Value: "'`command`'"}},
+		{{Value: `"source\name.c"`}},
+		{{Value: "\"source\\\n.c\""}},
+		{{Value: "'a\tb'"}}, {{Value: "'a\nb'"}},
+		{{Fragments: []ProbeValueFragment{{Value: "'source  name.c'"}}, Transforms: []ProbeValueTransform{strip}}},
+		{{Fragments: []ProbeValueFragment{{Value: "source\\\n.c"}}, Transforms: []ProbeValueTransform{strip}}},
+	} {
+		groups := []ProbeArgumentFragments{{Index: 0, Mode: ProbeArgumentFragmentsModeSourceShellWords, Fragments: fragments}}
+		if possible, complete := possibleCompilerSourceWord([]string{""}, nil, groups, "missing.c"); !possible || complete {
+			t.Fatalf("unsupported quote/strip language acquired absence proof: %#v", fragments)
+		}
+	}
+}
+
+func TestCompilerSourceWordQuotedConditionalLanguageParity(t *testing.T) {
+	condition := &ProbePredicate{Operator: "result-true", Result: "00000000"}
+	parts := []string{"", "a", "b", " ", "'", `"`, `\`, "'a'", `"b"`, " a ", "'a b'"}
+	completeCases := 0
+	for _, a := range parts {
+		for _, b := range parts {
+			for _, c := range parts {
+				group := []ProbeArgumentFragments{{Index: 0, Mode: ProbeArgumentFragmentsModeSourceShellWords,
+					Fragments: []ProbeValueFragment{{Value: a}, {Value: b, When: condition}, {Value: c}}}}
+				words := map[string]bool{}
+				valid := true
+				for _, rendered := range []string{a + c, a + b + c} {
+					parsed, err := ParseProbeSourceShellWords(rendered)
+					valid = valid && err == nil
+					for _, word := range parsed {
+						if word != "" {
+							words[word] = true
+						}
+					}
+				}
+				for _, word := range append(slices.Collect(maps.Keys(words)), "a", "b", "ab", "a b", "missing.c") {
+					possible, complete := possibleCompilerSourceWord([]string{""}, nil, group, word)
+					if !complete {
+						if !possible {
+							t.Fatal("unknown language lost its candidate")
+						}
+						continue
+					}
+					completeCases++
+					if !valid || possible != words[word] {
+						t.Fatalf("parts=%q/%q/%q word=%q: possible=%t oracle=%t valid=%t", a, b, c, word, possible, words[word], valid)
+					}
+				}
+			}
+		}
+	}
+	if completeCases < 500 {
+		t.Fatalf("too little complete quote/conditional coverage: %d", completeCases)
 	}
 }
 
@@ -143,8 +263,6 @@ func TestCompilerSourceWordPresenceMatchesExhaustiveSmallLanguages(t *testing.T)
 func TestCompilerSourceWordPresenceFailsClosed(t *testing.T) {
 	strip := ProbeValueTransform{Function: "strip", Arguments: []string{""}, InputArgument: 0}
 	cases := [][]ProbeValueFragment{
-		{{Value: "'source.c'"}},
-		{{Value: "source\\.c"}},
 		{{Value: "${result:00000000.text}"}},
 		{{Value: "$(command)"}},
 		{{Value: "source.c; command"}},
