@@ -1077,6 +1077,10 @@ type ActionPlan struct {
 	// cache before a possibly-mutated public Nodes slice is used again.
 	workingTreeTopologyCache        map[string][]uint32
 	workingTreeTopologyCacheIndexes int
+	// Metadata input queries summarize immutable subtries, not flattened input
+	// closures. Producer output bindings change at the same boundaries as the
+	// topology index, so both caches are invalidated together.
+	commandMetadataInputQuery *commandMetadataInputQuery
 	// workingTreeMaterializedNodeInputSets and workingTreeMaterializedCoreCache
 	// retain append-stable producer ancestry separately from consumer-local
 	// frontier/native policy. Full index rebuilds and live archive-policy changes
@@ -1608,6 +1612,7 @@ func (p *ActionPlan) clearWorkingTreeTopologyCache() {
 	}
 	p.workingTreeTopologyCache = nil
 	p.workingTreeTopologyCacheIndexes = 0
+	p.commandMetadataInputQuery = nil
 	p.clearWorkingTreeMaterializedCoreCache()
 }
 

@@ -22,6 +22,7 @@ go_library(
         "action_plan_input_set_compaction.go",
         "action_plan_input_set_plan.go",
         "action_plan_output.go",
+        "command_metadata_input_query.go",
         "compact.go",
         "compact_visible_artifact_view.go",
         "compiler_bootstrap.go",

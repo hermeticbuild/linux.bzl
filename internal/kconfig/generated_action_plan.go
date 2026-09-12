@@ -685,7 +685,7 @@ func appendReferencedPlanTrees(plan *ActionPlan, node *ActionPlanNode, recipe *A
 			recipe.Trees = append(recipe.Trees, tree)
 		}
 	}
-	commandMetadataTrees, commandMetadataWorkingTrees, err := actionPlanCommandMetadataSourceTreeClosure(plan, node.Inputs)
+	commandMetadataTrees, commandMetadataWorkingTrees, err := actionPlanCommandMetadataSourceTreeClosure(plan, node)
 	if err != nil {
 		return err
 	}
@@ -751,7 +751,7 @@ func appendReferencedPlanTrees(plan *ActionPlan, node *ActionPlanNode, recipe *A
 // relative compiler paths without treating immutable source roots the same way.
 func actionPlanCommandMetadataSourceTreeClosure(
 	plan *ActionPlan,
-	inputs []ActionPlanNodeEdge,
+	consumer *ActionPlanNode,
 ) ([]string, []string, error) {
 	if plan == nil {
 		return nil, nil, fmt.Errorf("Kbuild command metadata source-tree closure requires an action plan")
@@ -759,24 +759,26 @@ func actionPlanCommandMetadataSourceTreeClosure(
 	plan.ensureNodeLookupIndexes()
 	roots := []string{}
 	seenRoots := map[string]bool{}
-	for _, input := range inputs {
-		producer, ok := plan.nodesByID[input.ProducerID]
-		if !ok {
-			return nil, nil, fmt.Errorf("Kbuild command metadata input references absent producer %q", input.ProducerID)
+	addRoot := func(producerID string, slot int) error {
+		metadata, err := commandMetadataProducerOutput(plan, producerID, slot)
+		if err != nil {
+			return err
 		}
-		if input.Slot < 0 || input.Slot >= len(producer.Outputs) {
-			return nil, nil, fmt.Errorf("Kbuild command metadata input references absent producer %q slot %d", input.ProducerID, input.Slot)
+		if metadata && !seenRoots[producerID] {
+			seenRoots[producerID] = true
+			roots = append(roots, producerID)
 		}
-		output := producer.Outputs[input.Slot]
-		logicalPath := output.Path
-		if output.ObservedPath != "" {
-			logicalPath = output.ObservedPath
+		return nil
+	}
+	for _, input := range consumer.Inputs {
+		if err := addRoot(input.ProducerID, input.Slot); err != nil {
+			return nil, nil, err
 		}
-		if !strings.HasSuffix(canonicalKbuildRulePath(logicalPath), ".cmd") || seenRoots[input.ProducerID] {
-			continue
-		}
-		seenRoots[input.ProducerID] = true
-		roots = append(roots, input.ProducerID)
+	}
+	if err := plan.walkCommandMetadataInputs(consumer.InputSet, commandMetadataGeneratedInput, func(entry ActionPlanInputSetEntry) error {
+		return addRoot(entry.ProducerID, entry.Slot)
+	}); err != nil {
+		return nil, nil, err
 	}
 	if len(roots) == 0 {
 		return nil, nil, nil
@@ -805,16 +807,24 @@ func actionPlanCommandMetadataSourceTreeClosure(
 					}
 				}
 			}
-			for _, edge := range producer.Sources {
-				source, ok := plan.sourcesByID[edge.SourceID]
+			retainSource := func(sourceID string) error {
+				source, ok := plan.sourcesByID[sourceID]
 				if !ok {
-					return fmt.Errorf("Kbuild command metadata producer %q references unknown source %q", producer.ID, edge.SourceID)
+					return fmt.Errorf("Kbuild command metadata producer %q references unknown source %q", producer.ID, sourceID)
 				}
 				if declaredTrees[source.Namespace] {
 					retained[source.Namespace] = true
 				}
+				return nil
 			}
-			return nil
+			for _, edge := range producer.Sources {
+				if err := retainSource(edge.SourceID); err != nil {
+					return err
+				}
+			}
+			return plan.walkCommandMetadataInputs(producer.InputSet, commandMetadataSourceInput, func(entry ActionPlanInputSetEntry) error {
+				return retainSource(entry.SourceID)
+			})
 		})
 		if err != nil {
 			return nil, nil, err

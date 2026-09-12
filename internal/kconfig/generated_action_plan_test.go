@@ -1,6 +1,7 @@
 package kconfig
 
 import (
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -691,6 +692,174 @@ func TestAppendReferencedPlanTreesClosesOnlyCommandMetadataSourceNamespaces(t *t
 			t.Fatalf("multiple metadata roots working trees = %q, want %q", got, want)
 		}
 	})
+}
+
+func TestCommandMetadataSourceClosureFollowsPersistentInputs(t *testing.T) {
+	for _, persistentSource := range []bool{false, true} {
+		for _, persistentConsumer := range []bool{false, true} {
+			t.Run(fmt.Sprintf("source=%t/consumer=%t", persistentSource, persistentConsumer), func(t *testing.T) {
+				plan := &ActionPlan{Recipes: map[string]ActionRecipe{
+					"compile": {WorkingTrees: []string{"external"}},
+				}}
+				sourceID, err := ensureActionPlanSource(plan, "external", "module/hello.c")
+				if err != nil {
+					t.Fatal(err)
+				}
+				store, err := plan.planningActionPlanInputSetStore()
+				if err != nil {
+					t.Fatal(err)
+				}
+				producer := ActionPlanNode{
+					ID: "compile", Recipe: "compile", Trees: []string{"external", "prep"},
+					Outputs: []ActionPlanOutput{
+						{Tree: "metadata", Path: ".captures/source-state", ObservedPath: "module/.hello.o.cmd"},
+						{Tree: "objects", Path: "module/hello.o"},
+					},
+				}
+				if persistentSource {
+					producer.InputSet, err = store.Insert("", ActionPlanInputSetEntry{
+						Target: ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "module/hello.c"}, SourceID: sourceID,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					producer.Sources = []ActionPlanSourceEdge{{Role: "source", SourceID: sourceID}}
+				}
+				plan.Nodes = []ActionPlanNode{producer}
+				for _, slot := range []int{0, 1} {
+					node := ActionPlanNode{}
+					if persistentConsumer {
+						node.InputSet, err = store.Insert("", ActionPlanInputSetEntry{
+							Target: ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "consumed-state"}, ProducerID: "compile", Slot: slot,
+						})
+						if err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						node.Inputs = []ActionPlanNodeEdge{{Role: "state", ProducerID: "compile", Slot: slot}}
+					}
+					recipe := ActionRecipe{}
+					if err := appendReferencedPlanTrees(plan, &node, &recipe); err != nil {
+						t.Fatal(err)
+					}
+					var want []string
+					if slot == 0 {
+						want = []string{"external"}
+					}
+					if !slices.Equal(node.Trees, want) || !slices.Equal(recipe.Trees, want) || !slices.Equal(recipe.WorkingTrees, want) {
+						t.Fatalf("slot %d lost source closure: node=%v recipe=%v working=%v, want=%v", slot, node.Trees, recipe.Trees, recipe.WorkingTrees, want)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCommandMetadataInputQuerySharesSummariesAndInvalidatesBindings(t *testing.T) {
+	producerID := strings.Repeat("a", 64)
+	plan := &ActionPlan{Nodes: []ActionPlanNode{{ID: producerID, Outputs: []ActionPlanOutput{
+		{Tree: "objects", Path: ".hello.o.cmd"}, {Tree: "objects", Path: "hello.o"},
+	}}}}
+	store, err := plan.planningActionPlanInputSetStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := ""
+	for i := range 512 {
+		slot := 1
+		if i == 100 {
+			slot = 0
+		}
+		root, err = store.Insert(root, ActionPlanInputSetEntry{
+			Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: fmt.Sprintf("input-%04d", i)},
+			ProducerID: producerID, Slot: slot,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(want int) {
+		t.Helper()
+		count := 0
+		if err := plan.walkCommandMetadataInputs(root, commandMetadataGeneratedInput, func(entry ActionPlanInputSetEntry) error {
+			count++
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if count != want {
+			t.Fatalf("metadata entries = %d, want %d", count, want)
+		}
+	}
+	check(1)
+	query := plan.commandMetadataInputQuery
+	count := len(query.summaries)
+	if count < 2 {
+		t.Fatal("fixture did not exercise a branched trie")
+	}
+	check(1)
+	if query != plan.commandMetadataInputQuery || len(query.summaries) != count {
+		t.Fatal("unchanged query did not reuse its subtree summaries")
+	}
+	// Changing output provenance requires the same explicit invalidation as
+	// every other public node-index mutation; staging paths remain unchanged.
+	plan.Nodes[0].Outputs[0].Path = "ordinary-output"
+	plan.invalidateLookupIndexes()
+	check(0)
+	if plan.commandMetadataInputQuery == query {
+		t.Fatal("node-index invalidation retained output classification")
+	}
+	query = plan.commandMetadataInputQuery
+	plan.inputSetStore = nil
+	plan.InputSets, err = store.ReachableNodesForRoots([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(0)
+	if plan.commandMetadataInputQuery == query {
+		t.Fatal("store rebinding retained a query into the old store")
+	}
+	query = plan.commandMetadataInputQuery
+	for i := len(query.summaries); i < commandMetadataInputSummaryLimit; i++ {
+		query.summaries[fmt.Sprintf("unused-%d", i)] = 0
+	}
+	check(0)
+	if plan.commandMetadataInputQuery == query || len(plan.commandMetadataInputQuery.summaries) >= commandMetadataInputSummaryLimit {
+		t.Fatal("full summary cache was not bounded/replaced")
+	}
+}
+
+func TestCommandMetadataPersistentInputsRejectInvalidProvenance(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		producer string
+		slot     int
+		message  string
+	}{
+		{"missing producer", "absent", 0, "absent producer"},
+		{"missing slot", "compile", 1, "slot 1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan := &ActionPlan{Nodes: []ActionPlanNode{{ID: "compile", Outputs: []ActionPlanOutput{{Tree: "objects", Path: "hello.o"}}}}}
+			store, err := plan.planningActionPlanInputSetStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, err := store.Insert("", ActionPlanInputSetEntry{
+				Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "ordinary-input"},
+				ProducerID: test.producer, Slot: test.slot,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			node := ActionPlanNode{InputSet: root}
+			err = appendReferencedPlanTrees(plan, &node, &ActionRecipe{})
+			if err == nil || !strings.Contains(err.Error(), test.message) {
+				t.Fatalf("invalid provenance error = %v, want %s", err, test.message)
+			}
+		})
+	}
 }
 
 func TestAppendReferencedPlanTreesClosesKernelSourceRelativeIncludes(t *testing.T) {
