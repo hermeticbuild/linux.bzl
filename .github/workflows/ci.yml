@@ -144,7 +144,12 @@ jobs:
           read -r -a targets <<<"${BAZEL_TARGETS}"
           output_groups=()
           if [[ "${BAZEL_SUITE}" == "x86-64-variants" ]]; then
-            output_groups+=(--output_groups=+reuse_report)
+            # cquery resolves the configured path but does not download remote
+            # outputs. Materialize only the report needed by the local gate.
+            output_groups+=(
+              --output_groups=+reuse_report
+              '--remote_download_regex=.*\.reuse-report\.json$'
+            )
           fi
           configuration_flags=(
             --config=path-mapping
