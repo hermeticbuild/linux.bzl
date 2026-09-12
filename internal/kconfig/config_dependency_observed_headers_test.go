@@ -344,7 +344,7 @@ func TestConfigDependencyObservedHeadersRejectSpeculativeCacheReadLeak(t *testin
 	projection := observation.projections[configDependencyObservedOutputKey{producerID, 0}]
 	profile := plan.selectionGraph.profiles["config-dependency"]
 	scanner := configDependencyClosureScanner{
-		profile: profile, physicalFiles: newConfigDependencyPhysicalFileCache(),
+		sourceLookup: newConfigDependencySourceLookup(profile), physicalFiles: newConfigDependencyPhysicalFileCache(),
 		generated:          map[string]bool{"include/generated/selected.h": true},
 		generatedText:      map[string]configDependencyGeneratedText{"include/generated/selected.h": projection.text},
 		includeDirectories: []configDependencyIncludeDirectory{{logical: "include/generated"}},

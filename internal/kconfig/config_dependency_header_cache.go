@@ -369,7 +369,7 @@ func (s *configDependencyClosureScanner) interpretDirectCompilerHeader(
 	}
 	c.initialize()
 	key := configDependencyHeaderCacheKey{
-		file: file, profile: s.profile.Name, language: s.language,
+		file: file, profile: s.sourceLookup.profileName, language: s.language,
 		search:   configDependencyForcedHeaderSearchKey(s),
 		autoconf: configDependencyForcedHeaderAutoconfKey(autoconf),
 	}

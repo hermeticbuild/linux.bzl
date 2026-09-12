@@ -3289,7 +3289,7 @@ type configDependencyClosureScanner struct {
 	compilerIntrinsicInitialSnapshot  *configDependencyMacroSnapshot
 	compilerIntrinsicAnswered         func(CompilerIntrinsicCall) (bool, error)
 
-	profile                CompactKbuildProfile
+	sourceLookup           configDependencySourceLookup
 	language               string
 	generated              map[string]bool
 	generatedText          map[string]configDependencyGeneratedText
@@ -3618,7 +3618,7 @@ func newConfigDependencyForcedHeaderCacheKey(
 	autoconfDefinitions configDependencyResolvedAutoconfDefinitions,
 ) configDependencyForcedHeaderCacheKey {
 	return configDependencyForcedHeaderCacheKey{
-		profile:             scanner.profile.Name,
+		profile:             scanner.sourceLookup.profileName,
 		language:            scanner.language,
 		searchDirectories:   configDependencyForcedHeaderSearchKey(scanner),
 		forcedFiles:         configDependencyForcedHeaderFilesKey(forcedFiles),
@@ -4105,7 +4105,7 @@ func (s *configDependencyClosureScanner) sourceFile(logical string) (configDepen
 	if logical == "" {
 		return configDependencyScanFile{}, false
 	}
-	physical, ok := ResolveCompactKbuildProfileSourcePath(s.profile, logical)
+	physical, ok := s.sourceLookup.sourcePath(logical)
 	if !ok || !s.physicalFiles.status(physical).exists {
 		return configDependencyScanFile{}, false
 	}
@@ -4143,7 +4143,7 @@ func (s *configDependencyClosureScanner) objectFile(logical string) (configDepen
 		return configDependencyScanFile{}, false
 	}
 	if explicitlyBound && bound.entry.SourceID != "" {
-		physical, ok := ResolveCompactKbuildProfileSourcePath(s.profile, bound.source.Path)
+		physical, ok := s.sourceLookup.sourcePath(bound.source.Path)
 		if !ok || !s.physicalFiles.status(physical).exists {
 			s.setOpaque("persistent compiler source input is unavailable to the planner: " + bound.source.Path)
 			return configDependencyScanFile{}, false
@@ -4192,13 +4192,13 @@ func (s *configDependencyClosureScanner) objectFile(logical string) (configDepen
 	// overlay. Follow its immutable origin for inspection, but keep this file
 	// classified as object-tree input so nested quoted includes still notice a
 	// generated output shadowing the overlay.
-	overlay, err := compactKbuildGraphPathUsesSourceOverlay(s.profile, logical)
+	overlay, err := s.sourceLookup.usesSourceOverlay(logical)
 	if err != nil {
 		s.setOpaque("cannot resolve source overlay for literal include " + logical)
 		return configDependencyScanFile{}, false
 	}
 	if overlay {
-		physical, ok := ResolveCompactKbuildProfileSourcePath(s.profile, logical)
+		physical, ok := s.sourceLookup.sourcePath(logical)
 		if ok && s.physicalFiles.status(physical).exists {
 			return configDependencyScanFile{logical: logical, physical: physical}, true
 		}
@@ -6531,16 +6531,23 @@ func configDependencySourceIncludeCacheKeyForProfile(
 	profile CompactKbuildProfile,
 	directory string,
 ) configDependencySourceIncludeCacheKey {
+	return configDependencySourceIncludeCacheKeyForLookup(newConfigDependencySourceLookup(profile), directory)
+}
+
+func configDependencySourceIncludeCacheKeyForLookup(
+	lookup configDependencySourceLookup,
+	directory string,
+) configDependencySourceIncludeCacheKey {
 	// Keep the original spelling in the key. A missing source template reports
 	// that spelling before canonicalization, so collapsing two spellings here
 	// could change a cached diagnostic even though valid profiles later resolve
 	// them to the same logical directory.
 	key := configDependencySourceIncludeCacheKey{directory: directory}
-	if profile.evaluator == nil || profile.evaluator.template == nil {
+	if !lookup.templateSet {
 		key.bindings = "missing-template"
 		return key
 	}
-	bindings := compactKbuildProfileSourceRootBindings(profile.evaluator.template.sourceRoots)
+	bindings := lookup.bindings
 	prefixes := slices.Sorted(maps.Keys(bindings))
 	parts := make([]string, 0, len(prefixes)*3)
 	for _, prefix := range prefixes {
@@ -6596,18 +6603,11 @@ func configDependencySourceBindingAt(
 // following one could escape the declared immutable roots, while ignoring one
 // could omit bytes which the compiler can read.
 func configDependencyImmutableSourceIncludePaths(
-	profile CompactKbuildProfile,
-	directory string,
-) ([]string, error) {
-	return configDependencyImmutableSourceIncludePathsWithCache(profile, directory, nil)
-}
-
-func configDependencyImmutableSourceIncludePathsWithCache(
-	profile CompactKbuildProfile,
+	lookup configDependencySourceLookup,
 	directory string,
 	cache *configDependencySourceIncludeCache,
 ) ([]string, error) {
-	key := configDependencySourceIncludeCacheKeyForProfile(profile, directory)
+	key := configDependencySourceIncludeCacheKeyForLookup(lookup, directory)
 	walkDir := filepath.WalkDir
 	if cache != nil {
 		cache.initialize()
@@ -6616,7 +6616,7 @@ func configDependencyImmutableSourceIncludePathsWithCache(
 		}
 		walkDir = cache.walkDir
 	}
-	paths, err := configDependencyImmutableSourceIncludePathsUncached(profile, directory, walkDir)
+	paths, err := configDependencyImmutableSourceIncludePathsUncached(lookup, directory, walkDir)
 	if cache != nil {
 		cache.entries[key] = configDependencySourceIncludeCacheResult{
 			paths: slices.Clone(paths),
@@ -6627,11 +6627,11 @@ func configDependencyImmutableSourceIncludePathsWithCache(
 }
 
 func configDependencyImmutableSourceIncludePathsUncached(
-	profile CompactKbuildProfile,
+	lookup configDependencySourceLookup,
 	directory string,
 	walkDir func(string, fs.WalkDirFunc) error,
 ) ([]string, error) {
-	if profile.evaluator == nil || profile.evaluator.template == nil {
+	if !lookup.templateSet {
 		return nil, fmt.Errorf("source include directory %q has no Kbuild source-root mapping", directory)
 	}
 	directory = canonicalKbuildRulePath(directory)
@@ -6640,7 +6640,7 @@ func configDependencyImmutableSourceIncludePathsUncached(
 			return nil, err
 		}
 	}
-	bindings := compactKbuildProfileSourceRootBindings(profile.evaluator.template.sourceRoots)
+	bindings := lookup.bindings
 	basePrefix, base, ok := configDependencySourceBindingAt(bindings, directory)
 	if !ok || base.ambiguous || strings.TrimSpace(base.physical) == "" {
 		return nil, fmt.Errorf("source include directory %q has no unambiguous immutable source root", directory)
@@ -6776,9 +6776,10 @@ func configDependencyExplicitSourceIncludeSnapshotWithCache(
 	arguments []string,
 	cache *configDependencySourceIncludeCache,
 ) (configDependencySourceIncludeSnapshot, error) {
+	lookup := newConfigDependencySourceLookup(profile)
 	directories := map[string]bool{}
 	for _, operand := range KbuildCompilerIncludeOperands(arguments) {
-		location, relative, resolved, err := ResolveCompactKbuildCompilerIncludePath(profile, operand.Operand)
+		location, relative, resolved, err := lookup.includePath(operand.Operand)
 		if err != nil {
 			return configDependencySourceIncludeSnapshot{}, err
 		}
@@ -6789,7 +6790,7 @@ func configDependencyExplicitSourceIncludeSnapshotWithCache(
 	}
 	orderedDirectories := slices.Sorted(maps.Keys(directories))
 	key := configDependencyExplicitSourceIncludeCacheKey{
-		bindings: configDependencySourceIncludeCacheKeyForProfile(profile, "").bindings,
+		bindings: configDependencySourceIncludeCacheKeyForLookup(lookup, "").bindings,
 		directories: configDependencyStringListIdentity(
 			"explicit-source-includes-v1", orderedDirectories,
 		),
@@ -6803,7 +6804,7 @@ func configDependencyExplicitSourceIncludeSnapshotWithCache(
 	paths := map[string]bool{}
 	var snapshotErr error
 	for _, directory := range orderedDirectories {
-		included, err := configDependencyImmutableSourceIncludePathsWithCache(profile, directory, cache)
+		included, err := configDependencyImmutableSourceIncludePaths(lookup, directory, cache)
 		if err != nil {
 			snapshotErr = err
 			break
@@ -7725,12 +7726,12 @@ func appendConfigDependencyEnvironmentSearchRoots(
 	appendExternal("-isystem", environment["SDKROOT"])
 }
 
-func actionPlanNodeConfigDependenciesForProfile(
+func actionPlanNodeConfigDependenciesForSourceLookup(
 	plan *ActionPlan,
 	node ActionPlanNode,
 	recipe ActionRecipe,
 	invocation configDependencyCompilerInvocation,
-	profile CompactKbuildProfile,
+	sourceLookup configDependencySourceLookup,
 	generated map[string]bool,
 	generatedText map[string]configDependencyGeneratedText,
 	resolveGeneratedText func(string) (configDependencyGeneratedText, bool),
@@ -7748,7 +7749,7 @@ func actionPlanNodeConfigDependenciesForProfile(
 	callCoverage bool,
 ) (result ConfigDependencySet) {
 	scanner := configDependencyClosureScanner{
-		profile:              profile,
+		sourceLookup:         sourceLookup,
 		generated:            generated,
 		generatedText:        generatedText,
 		resolveGeneratedText: resolveGeneratedText,
@@ -7801,7 +7802,7 @@ func actionPlanNodeConfigDependenciesForProfile(
 	}
 	translationUnits := make([]configDependencyScanFile, 0, len(sourcePaths))
 	for _, pathname := range sourcePaths {
-		overlay, err := compactKbuildGraphPathUsesSourceOverlay(profile, pathname)
+		overlay, err := sourceLookup.usesSourceOverlay(pathname)
 		if err != nil {
 			return opaqueConfigDependency("compiler translation-unit source overlay cannot be resolved: " + pathname)
 		}
@@ -8050,7 +8051,7 @@ func actionPlanNodeConfigDependenciesForProfile(
 			scanner.appendIncludeDirectory(operand.Flag, configDependencyIncludeDirectory{external: true})
 			continue
 		}
-		location, _, resolved, err := ResolveCompactKbuildCompilerIncludePath(profile, operand.Operand)
+		location, _, resolved, err := sourceLookup.includePath(operand.Operand)
 		if err != nil {
 			return opaqueConfigDependency("compiler include operand cannot be resolved")
 		}
@@ -9775,6 +9776,7 @@ func analyzeActionPlanNodeConfigDependencies(
 				context.observedHeaders.readResolved(node, files)
 			}
 		}
+		sourceLookup := newConfigDependencySourceLookup(profile)
 		analyze := func(calls bool) ConfigDependencySet {
 			var compilerGuards func(configDependencyCompilerPredefineProbe, configDependencyScanFile, configDependencyCompilerGuardHints, string)
 			if plan.metadata != nil && plan.metadata.compilerGuardObserver != nil {
@@ -9782,8 +9784,8 @@ func analyzeActionPlanNodeConfigDependencies(
 					context.recordCompilerGuardHints(plan, node, invocation.tool, probe, file, hints, contentID)
 				}
 			}
-			return actionPlanNodeConfigDependenciesForProfile(
-				plan, node, recipe, invocation, profile, context.generated, generatedText, resolveGeneratedText,
+			return actionPlanNodeConfigDependenciesForSourceLookup(
+				plan, node, recipe, invocation, sourceLookup, context.generated, generatedText, resolveGeneratedText,
 				context.preconfiguredConfigDependencyPaths(profile, plan.metadata), context.autoconfDefinitions,
 				context.physicalFiles, context.parsed,
 				context.conditionalSyntax, context.compilerPredefineRequests, context.compilerPredefines,

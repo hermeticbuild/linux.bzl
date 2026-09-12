@@ -65,7 +65,7 @@ func BenchmarkConfigDependencyHeaderCacheCommonClosure(b *testing.B) {
 			iteration := 0
 			run := func() {
 				scanner := configDependencyClosureScanner{
-					profile: profile, language: "c", headerCache: cache,
+					sourceLookup: newConfigDependencySourceLookup(profile), language: "c", headerCache: cache,
 					physicalFiles: physical, conditionalSyntax: syntax, parsed: parsed,
 					includeDirectories: []configDependencyIncludeDirectory{{source: true}},
 					symbols:            map[string]bool{}, sourcePaths: map[string]bool{}, objectPaths: map[string]bool{},
@@ -160,7 +160,7 @@ func BenchmarkConfigDependencyGuardUncertaintyDiamond(b *testing.B) {
 					parsed := map[string]configDependencyParsedFile{}
 					run := func() {
 						scanner := configDependencyClosureScanner{
-							profile: profile, language: "c", physicalFiles: physical,
+							sourceLookup: newConfigDependencySourceLookup(profile), language: "c", physicalFiles: physical,
 							conditionalSyntax: syntax, parsed: parsed,
 							includeDirectories: []configDependencyIncludeDirectory{{source: true}},
 							symbols:            map[string]bool{}, sourcePaths: map[string]bool{}, objectPaths: map[string]bool{},

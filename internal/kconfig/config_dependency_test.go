@@ -1677,7 +1677,7 @@ CONFIG_ONLY_ON_REENTRY
 
 func TestConfigDependencyForcedHeaderCacheStructuralKeyIsExact(t *testing.T) {
 	baseScanner := configDependencyClosureScanner{
-		profile:            CompactKbuildProfile{Name: "profile"},
+		sourceLookup:       newConfigDependencySourceLookup(CompactKbuildProfile{Name: "profile"}),
 		language:           "c",
 		quoteDirectories:   []configDependencyIncludeDirectory{{logical: "quote", source: true}},
 		includeDirectories: []configDependencyIncludeDirectory{{logical: "include"}},
@@ -1694,7 +1694,7 @@ func TestConfigDependencyForcedHeaderCacheStructuralKeyIsExact(t *testing.T) {
 
 	changedScanners := map[string]configDependencyClosureScanner{}
 	profile := baseScanner
-	profile.profile.Name = "other-profile"
+	profile.sourceLookup.profileName = "other-profile"
 	changedScanners["profile"] = profile
 	language := baseScanner
 	language.language = "assembler-with-cpp"
@@ -2152,7 +2152,7 @@ func BenchmarkConfigDependencyForcedHeaderPrefixAcrossCompilerNodes(b *testing.B
 		parsed map[string]configDependencyParsedFile,
 	) *configDependencyClosureScanner {
 		return &configDependencyClosureScanner{
-			profile: CompactKbuildProfile{Name: "benchmark"}, language: "c",
+			sourceLookup: newConfigDependencySourceLookup(CompactKbuildProfile{Name: "benchmark"}), language: "c",
 			generated: map[string]bool{}, generatedText: map[string]configDependencyGeneratedText{},
 			preconfigured: map[string]string{}, physicalFiles: newConfigDependencyPhysicalFileCache(),
 			symbols: map[string]bool{}, sourcePaths: map[string]bool{}, objectPaths: map[string]bool{},
@@ -2355,7 +2355,7 @@ func configDependencyPhysicalFileCacheScannerForTest(
 	cache *configDependencyPhysicalFileCache,
 ) *configDependencyClosureScanner {
 	return &configDependencyClosureScanner{
-		profile: profile, physicalFiles: cache,
+		sourceLookup: newConfigDependencySourceLookup(profile), physicalFiles: cache,
 		generated: map[string]bool{}, preconfigured: map[string]string{},
 		symbols: map[string]bool{}, sourcePaths: map[string]bool{}, objectPaths: map[string]bool{},
 		queued: map[string]bool{}, queuedPhysical: map[string]bool{},
@@ -4031,8 +4031,8 @@ func BenchmarkConfigDependencyForcedHeaderCacheKeyAutoconfCardinality(b *testing
 			}
 			definitions := newConfigDependencyResolvedAutoconfDefinitions(fragment)
 			scanner := configDependencyClosureScanner{
-				profile:  CompactKbuildProfile{Name: "benchmark"},
-				language: "c",
+				sourceLookup: newConfigDependencySourceLookup(CompactKbuildProfile{Name: "benchmark"}),
+				language:     "c",
 			}
 			var key configDependencyForcedHeaderCacheKey
 			b.ReportAllocs()
@@ -4060,8 +4060,8 @@ func BenchmarkConfigDependencyForcedHeaderCacheLookupHitAutoconfCardinality(b *t
 			}
 			definitions := newConfigDependencyResolvedAutoconfDefinitions(fragment)
 			baseScanner := configDependencyClosureScanner{
-				profile:  CompactKbuildProfile{Name: "benchmark"},
-				language: "c",
+				sourceLookup: newConfigDependencySourceLookup(CompactKbuildProfile{Name: "benchmark"}),
+				language:     "c",
 			}
 			key := newConfigDependencyForcedHeaderCacheKey(
 				&baseScanner, nil, definitions,

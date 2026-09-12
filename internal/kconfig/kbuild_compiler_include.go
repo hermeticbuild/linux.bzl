@@ -96,6 +96,15 @@ func ResolveCompactKbuildCompilerIncludePath(
 	profile CompactKbuildProfile,
 	value string,
 ) (location CompactKbuildInvocationLocation, relative, ok bool, err error) {
+	base, found := CompactKbuildProfileInvocationLocation(profile)
+	return resolveCompactKbuildCompilerIncludePath(base, found, value)
+}
+
+func resolveCompactKbuildCompilerIncludePath(
+	base CompactKbuildInvocationLocation,
+	baseSet bool,
+	value string,
+) (location CompactKbuildInvocationLocation, relative, ok bool, err error) {
 	value = strings.TrimSpace(value)
 	if value == "" || strings.HasPrefix(value, "=") {
 		return CompactKbuildInvocationLocation{}, false, false, nil
@@ -149,8 +158,7 @@ func ResolveCompactKbuildCompilerIncludePath(
 	if strings.Contains(value, `\`) {
 		return CompactKbuildInvocationLocation{}, false, false, fmt.Errorf("compiler include path %q contains a non-portable separator", value)
 	}
-	base, found := CompactKbuildProfileInvocationLocation(profile)
-	if !found {
+	if !baseSet {
 		return CompactKbuildInvocationLocation{}, false, false, nil
 	}
 	directory, pathErr := canonicalCompactKbuildInvocationPath(path.Join(base.Directory, value))

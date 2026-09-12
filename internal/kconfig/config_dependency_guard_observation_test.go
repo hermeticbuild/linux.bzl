@@ -496,7 +496,7 @@ func TestConfigDependencyCompilerIntrinsicStaticHintsSkipMeasuredCalls(t *testin
 		t.Fatal(reason)
 	}
 	scanner := configDependencyClosureScanner{
-		profile: plan.selectionGraph.profiles["config-dependency"], physicalFiles: &configDependencyPhysicalFileCache{},
+		sourceLookup: newConfigDependencySourceLookup(plan.selectionGraph.profiles["config-dependency"]), physicalFiles: &configDependencyPhysicalFileCache{},
 		collectCompilerGuards: true, compilerIntrinsicInitialAvailable: map[string]bool{"__has_attribute": true},
 		compilerIntrinsicInitialSnapshot: state.snapshot,
 		compilerGuardInitialDefinitions:  map[string]bool{"__has_attribute": true},
@@ -536,7 +536,7 @@ func TestConfigDependencyCompilerIntrinsicPendingDemandUsesCurrentFile(t *testin
 	}, []string{"-nostdinc", "-c", pathname})
 	context := newConfigDependencyAnalysisContext(plan)
 	scanner := configDependencyClosureScanner{
-		profile: plan.selectionGraph.profiles["config-dependency"], physicalFiles: context.physicalFiles,
+		sourceLookup: newConfigDependencySourceLookup(plan.selectionGraph.profiles["config-dependency"]), physicalFiles: context.physicalFiles,
 		callCoverage: &configDependencyCallCoverage{},
 	}
 	file, found := scanner.sourceFile("include/nested.h")
@@ -662,7 +662,7 @@ func TestConfigDependencyCompilerGuardObservationCallbackCannotMutateWarmState(t
 	// static production fixture above removes its concrete source argument.
 	// Exercise defensive ownership of that field at the same emission hook.
 	scanner := configDependencyClosureScanner{
-		profile: plan.selectionGraph.profiles["config-dependency"], physicalFiles: context.physicalFiles,
+		sourceLookup: newConfigDependencySourceLookup(plan.selectionGraph.profiles["config-dependency"]), physicalFiles: context.physicalFiles,
 	}
 	file, found := scanner.sourceFile("drivers/example/driver.c")
 	if !found {
@@ -1021,7 +1021,7 @@ func TestConfigDependencyCompilerGuardObservationTruncationIsAllOrNothing(t *tes
 	// the all-or-nothing truncation event; filtering cannot complete it.
 	measuredScanner := configDependencyClosureScanner{
 		collectCompilerGuards: true, compilerGuardInitialDefinitions: measured,
-		profile: plan.selectionGraph.profiles["config-dependency"],
+		sourceLookup: newConfigDependencySourceLookup(plan.selectionGraph.profiles["config-dependency"]),
 	}
 	file, found := measuredScanner.sourceFile("drivers/example/driver.c")
 	if !found {

@@ -236,9 +236,13 @@ func compactKbuildProfileSourceRootBindings(sourceRoots map[string]string) map[s
 // is equivalent to selecting the longest matching source-root prefix, but its
 // cost depends on path depth rather than on the number of configured roots.
 func (r *compactKbuildPlannerRuntime) resolveSourcePath(sourcePath string) (string, bool) {
+	return resolveCompactKbuildSourcePath(r.sourcePathRoots, sourcePath)
+}
+
+func resolveCompactKbuildSourcePath(bindings map[string]compactKbuildSourceRootBinding, sourcePath string) (string, bool) {
 	prefix := sourcePath
 	for {
-		if binding, exists := r.sourcePathRoots[prefix]; exists {
+		if binding, exists := bindings[prefix]; exists {
 			if binding.ambiguous || strings.TrimSpace(binding.physical) == "" {
 				return "", false
 			}
@@ -252,7 +256,7 @@ func (r *compactKbuildPlannerRuntime) resolveSourcePath(sourcePath string) (stri
 		}
 		prefix = prefix[:separator]
 	}
-	if binding, exists := r.sourcePathRoots[""]; exists {
+	if binding, exists := bindings[""]; exists {
 		if binding.ambiguous || strings.TrimSpace(binding.physical) == "" {
 			return "", false
 		}

@@ -29,7 +29,7 @@ func (s *configDependencyClosureScanner) compilerHintLookupView() *configDepende
 		generatedText = map[string]configDependencyGeneratedText{}
 	}
 	return &configDependencyClosureScanner{
-		profile: s.profile, physicalFiles: s.physicalFiles,
+		sourceLookup: s.sourceLookup, physicalFiles: s.physicalFiles,
 		generated: s.generated, generatedText: generatedText,
 		resolveGeneratedText: s.resolveGeneratedText, lookupWorkingInput: s.lookupWorkingInput,
 		preconfigured:    s.preconfigured,

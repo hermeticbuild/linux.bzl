@@ -39,7 +39,7 @@ func newConfigDependencyHeaderCacheFixtureForTest(t *testing.T, files map[string
 
 func (f *configDependencyHeaderCacheFixtureForTest) scanner(cache *configDependencyHeaderCache) *configDependencyClosureScanner {
 	return &configDependencyClosureScanner{
-		profile: f.profile, language: "c", headerCache: cache,
+		sourceLookup: newConfigDependencySourceLookup(f.profile), language: "c", headerCache: cache,
 		physicalFiles: f.physical, conditionalSyntax: f.syntax, parsed: f.parsed,
 		generated: map[string]bool{}, generatedText: map[string]configDependencyGeneratedText{},
 		preconfigured:      map[string]string{},
@@ -513,7 +513,7 @@ func TestConfigDependencyHeaderCacheSeparatesScannerContexts(t *testing.T) {
 		configure func(*configDependencyClosureScanner, *configDependencyMacroState)
 	}{
 		{name: "profile", configure: func(scanner *configDependencyClosureScanner, _ *configDependencyMacroState) {
-			scanner.profile.Name = "different-profile"
+			scanner.sourceLookup.profileName = "different-profile"
 		}},
 		{name: "language", configure: func(scanner *configDependencyClosureScanner, _ *configDependencyMacroState) {
 			scanner.language = "assembler-with-cpp"

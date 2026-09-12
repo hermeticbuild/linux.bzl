@@ -139,7 +139,7 @@ func literalLookaheadScannerForTest(t *testing.T, header string) *configDependen
 		"include/later.h": header,
 	}, []string{"-nostdinc", "-I${tree:kernel}/include", "-c", source})
 	s := &configDependencyClosureScanner{
-		profile: plan.selectionGraph.profiles["config-dependency"], physicalFiles: newConfigDependencyPhysicalFileCache(),
+		sourceLookup: newConfigDependencySourceLookup(plan.selectionGraph.profiles["config-dependency"]), physicalFiles: newConfigDependencyPhysicalFileCache(),
 		collectCompilerGuards: true, callCoverage: &configDependencyCallCoverage{},
 		compilerIntrinsicInitialSnapshot: newConfigDependencyMacroSnapshot(),
 		includeDirectories:               []configDependencyIncludeDirectory{{logical: "include", source: true}},
