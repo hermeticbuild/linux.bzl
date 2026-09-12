@@ -203,6 +203,8 @@ func (g *compactKbuildSelectionGraph) compactKbuildSideOutputStateGraph(
 		visited
 	)
 	state := map[compactKbuildSelectionKey]int{}
+	topologicalOrder := map[compactKbuildSelectionKey]int{}
+	topologicalCandidates := make([]compactKbuildSelectionKey, 0, len(ordered))
 	var visit func(compactKbuildSelectionKey) error
 	visit = func(candidate compactKbuildSelectionKey) error {
 		switch state[candidate] {
@@ -218,6 +220,8 @@ func (g *compactKbuildSelectionGraph) compactKbuildSideOutputStateGraph(
 			}
 		}
 		state[candidate] = visited
+		topologicalOrder[candidate] = len(topologicalOrder)
+		topologicalCandidates = append(topologicalCandidates, candidate)
 		return nil
 	}
 	for _, candidate := range ordered {
@@ -227,6 +231,49 @@ func (g *compactKbuildSelectionGraph) compactKbuildSideOutputStateGraph(
 		if !consumed[candidate] {
 			result.maximal = append(result.maximal, candidate)
 		}
+	}
+	// Stopping at a candidate on each dependency path is not sufficient at a
+	// join: another path may reach an ancestor of that same candidate. Its
+	// absolute state is already carried by the descendant, and merging both
+	// can incorrectly report two ordered writers as unordered. Reduce only
+	// this same-path candidate DAG, never ordinary command prerequisites.
+	// Reduce ancestors first so each later traversal sees their compact DAG.
+	for _, candidate := range topologicalCandidates {
+		parents := result.parents[candidate]
+		if len(parents) < 2 {
+			continue
+		}
+		newestFirst := append([]compactKbuildSelectionKey(nil), parents...)
+		sort.Slice(newestFirst, func(i, j int) bool {
+			return topologicalOrder[newestFirst[i]] > topologicalOrder[newestFirst[j]]
+		})
+		oldest := topologicalOrder[newestFirst[len(newestFirst)-1]]
+		seen := map[compactKbuildSelectionKey]bool{}
+		redundant := map[compactKbuildSelectionKey]bool{}
+		for _, parent := range newestFirst {
+			if seen[parent] {
+				redundant[parent] = true
+				continue
+			}
+			pending := []compactKbuildSelectionKey{parent}
+			for len(pending) != 0 {
+				ancestor := pending[len(pending)-1]
+				pending = pending[:len(pending)-1]
+				if seen[ancestor] || topologicalOrder[ancestor] < oldest {
+					continue
+				}
+				seen[ancestor] = true
+				pending = append(pending, result.parents[ancestor]...)
+			}
+		}
+		// Retain the existing canonical order and no transitive-closure cache.
+		frontier := parents[:0]
+		for _, parent := range parents {
+			if !redundant[parent] {
+				frontier = append(frontier, parent)
+			}
+		}
+		result.parents[candidate] = frontier
 	}
 	return result, nil
 }
