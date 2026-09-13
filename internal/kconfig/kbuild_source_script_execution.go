@@ -1641,6 +1641,24 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 		}
 		return producer, nil
 	}
+	// Materialization is complete before producer-version resolution. Build
+	// this query-local inverse only if an unindexed side output needs it, and
+	// retain selections only for producers in multi-version paths. Grouped
+	// peers remain distinct selections; no global ownership is published.
+	var materializedOwners map[string][]compactKbuildSelectionKey
+	ownerLookupMisses := 0
+	lookupMaterializedOwners := func() map[string][]compactKbuildSelectionKey {
+		if materializedOwners == nil {
+			// A one-off inverse costs more than the direct scan. Keep the first
+			// two fallback reads unchanged; construct it only for repeated work.
+			if ownerLookupMisses < 2 {
+				ownerLookupMisses++
+				return nil
+			}
+			materializedOwners = b.selectionGraph.compactKbuildMaterializedOwnersForVersions(producerVersions)
+		}
+		return materializedOwners
+	}
 	resolveProducerVersions := func(
 		pathname string,
 		versions []compactKbuildRuleInput,
@@ -1721,8 +1739,8 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 				sourceWinner, sourceOrdered := "", false
 				if b.selectionGraph != nil {
 					var orderErr error
-					sourceWinner, sourceOrdered, orderErr = b.selectionGraph.compactKbuildSourceOrderedPathProducer(
-						pathname, left.producer, right.producer,
+					sourceWinner, sourceOrdered, orderErr = b.selectionGraph.compactKbuildSourceOrderedPathProducerWithOwners(
+						pathname, left.producer, right.producer, lookupMaterializedOwners,
 					)
 					if orderErr != nil {
 						return compactKbuildRuleInput{}, orderErr

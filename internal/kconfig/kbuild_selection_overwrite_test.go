@@ -2,11 +2,147 @@ package kconfig
 
 import (
 	"encoding/base64"
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 )
+
+func producerOwnerLookupTestGraph() (*compactKbuildSelectionGraph, []compactKbuildSelectionKey) {
+	keys := []compactKbuildSelectionKey{
+		{profile: "a", target: "a.out", stage: "target"},
+		{profile: "b", target: "b.out", stage: "target"},
+		{profile: "c", target: "c.out", stage: "target"},
+	}
+	g := &compactKbuildSelectionGraph{
+		profiles: map[string]CompactKbuildProfile{
+			"a": {Name: "a"},
+			"b": {Name: "b", InvocationPredecessors: []string{"a"}},
+			"c": {Name: "c", InvocationPredecessors: []string{"b"}},
+		},
+		selections:            make(map[compactKbuildSelectionKey]CompactKbuildSelection),
+		materializedProducers: make(map[compactKbuildSelectionKey]string),
+		outputOwnersByPath:    make(map[string][]compactKbuildSelectionKey),
+	}
+	for index, key := range keys {
+		g.selections[key] = CompactKbuildSelection{Profile: key.profile, Target: key.target, Stage: key.stage, Lifecycle: "target", Scope: "target"}
+		g.materializedProducers[key] = []string{"left", "right", "left"}[index]
+	}
+	return g, keys
+}
+
+func TestProducerOwnerLookupPreservesExactPathOwnersAndAliases(t *testing.T) {
+	g, keys := producerOwnerLookupTestGraph()
+	for subset := 0; subset < 1<<len(keys); subset++ {
+		g.outputOwnersByPath["side.out"] = nil
+		for index, key := range keys {
+			if subset&(1<<index) != 0 {
+				g.outputOwnersByPath["side.out"] = append(g.outputOwnersByPath["side.out"], key)
+			}
+		}
+		for _, left := range []string{"left", "right", "missing", ""} {
+			for _, right := range []string{"left", "right", "missing", ""} {
+				want, wantOK, wantErr := g.compactKbuildSourceOrderedPathProducer("side.out", left, right)
+				for _, partial := range []bool{false, true} {
+					lookup := func() map[string][]compactKbuildSelectionKey {
+						result := map[string][]compactKbuildSelectionKey{left: nil, right: nil}
+						for owner, producer := range g.materializedProducers {
+							if _, wanted := result[producer]; wanted {
+								result[producer] = append(result[producer], owner)
+							}
+						}
+						if partial {
+							delete(result, left)
+						}
+						return result
+					}
+					got, ok, err := g.compactKbuildSourceOrderedPathProducerWithOwners("side.out", left, right, lookup)
+					if got != want || ok != wantOK || fmt.Sprint(err) != fmt.Sprint(wantErr) {
+						t.Fatalf("subset=%d partial=%v %q/%q: %q,%v,%v want %q,%v,%v", subset, partial, left, right, got, ok, err, want, wantOK, wantErr)
+					}
+				}
+			}
+		}
+	}
+	// The path index already identifies both versions. Its exact owner set
+	// must not be expanded with an unrelated alias of the left producer.
+	g.outputOwnersByPath["side.out"] = keys[:2]
+	winner, ok, err := g.compactKbuildSourceOrderedPathProducerWithOwners("side.out", "left", "right", func() map[string][]compactKbuildSelectionKey {
+		t.Fatal("complete path ownership unexpectedly consulted fallback index")
+		return nil
+	})
+	if winner != "right" || !ok || err != nil {
+		t.Fatalf("exact owners: %q,%v,%v", winner, ok, err)
+	}
+}
+
+func TestProducerOwnerLookupFreshLifetimeAndRestrictedKeys(t *testing.T) {
+	g, keys := producerOwnerLookupTestGraph()
+	versions := map[string][]compactKbuildRuleInput{
+		"side.out":   {{producer: "left"}, {producer: "right"}},
+		"absent.out": {{producer: "left"}, {producer: "absent"}},
+		"unique.out": {{producer: "unneeded"}},
+	}
+	first := g.compactKbuildMaterializedOwnersForVersions(versions)
+	if len(first) != 3 || len(first["left"]) != 2 || len(first["right"]) != 1 {
+		t.Fatalf("restricted index: %v", first)
+	}
+	if _, ok := first["absent"]; !ok {
+		t.Fatal("complete scan omitted known absent producer")
+	}
+	g.materializedProducers[keys[2]] = "unneeded"
+	fresh := g.compactKbuildMaterializedOwnersForVersions(versions)
+	if len(first["left"]) != 2 || len(fresh["left"]) != 1 || len(fresh) != 3 {
+		t.Fatalf("fresh=%v old=%v", fresh, first)
+	}
+}
+
+func BenchmarkProducerOwnerLookup(b *testing.B) {
+	for _, count := range []int{32, 8192} {
+		g, keys := producerOwnerLookupTestGraph()
+		delete(g.materializedProducers, keys[2])
+		left, right := strings.Repeat("a", 64), strings.Repeat("b", 64)
+		g.materializedProducers[keys[0]], g.materializedProducers[keys[1]] = left, right
+		for index := 0; index < count; index++ {
+			g.materializedProducers[compactKbuildSelectionKey{profile: fmt.Sprint(index)}] = fmt.Sprintf("%064d", index)
+		}
+		for _, queries := range []int{1, 3, 64} {
+			versions := map[string][]compactKbuildRuleInput{}
+			for query := 0; query < queries; query++ {
+				versions[fmt.Sprintf("side-%d.out", query)] = []compactKbuildRuleInput{{producer: left}, {producer: right}}
+			}
+			for _, indexed := range []bool{false, true} {
+				b.Run(fmt.Sprintf("owners=%d/queries=%d/indexed=%v", count, queries, indexed), func(b *testing.B) {
+					b.ReportAllocs()
+					for iteration := 0; iteration < b.N; iteration++ {
+						var byProducer map[string][]compactKbuildSelectionKey
+						misses := 0
+						lookup := func() map[string][]compactKbuildSelectionKey {
+							if byProducer == nil {
+								if misses < 2 {
+									misses++
+									return nil
+								}
+								byProducer = g.compactKbuildMaterializedOwnersForVersions(versions)
+							}
+							return byProducer
+						}
+						if !indexed {
+							lookup = nil
+						}
+						for query := 0; query < queries; query++ {
+							winner, ok, err := g.compactKbuildSourceOrderedPathProducerWithOwners(fmt.Sprintf("side-%d.out", query), left, right, lookup)
+							if winner != right || !ok || err != nil {
+								b.Fatalf("%q,%v,%v", winner, ok, err)
+							}
+						}
+					}
+				})
+			}
+		}
+	}
+}
 
 func compactKbuildOverwriteTestConfig(t *testing.T, reverse bool) CompactConfig {
 	t.Helper()

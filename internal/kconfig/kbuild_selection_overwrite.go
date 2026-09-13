@@ -270,6 +270,28 @@ func (g *compactKbuildSelectionGraph) compactKbuildTotalOverwriteOrder(
 	return owners, nil
 }
 
+// This reverse index is local to one immutable closure-resolution call, never
+// retained on the graph. Single-version paths need no pairwise comparison.
+func (g *compactKbuildSelectionGraph) compactKbuildMaterializedOwnersForVersions(
+	versionsByPath map[string][]compactKbuildRuleInput,
+) map[string][]compactKbuildSelectionKey {
+	result := make(map[string][]compactKbuildSelectionKey)
+	for _, versions := range versionsByPath {
+		if len(versions) < 2 {
+			continue
+		}
+		for _, version := range versions {
+			result[version.producer] = nil
+		}
+	}
+	for owner, producer := range g.materializedProducers {
+		if _, wanted := result[producer]; wanted {
+			result[producer] = append(result[producer], owner)
+		}
+	}
+	return result
+}
+
 // compactKbuildSourceOrderedPathProducer compares two materialized versions
 // of one logical pathname using only Kbuild's recorded overwrite provenance.
 // The versions may live in different physical stage trees, so they do not
@@ -280,6 +302,16 @@ func (g *compactKbuildSelectionGraph) compactKbuildTotalOverwriteOrder(
 // matching selection pair, no winner is returned.
 func (g *compactKbuildSelectionGraph) compactKbuildSourceOrderedPathProducer(
 	target, leftProducer, rightProducer string,
+) (string, bool, error) {
+	return g.compactKbuildSourceOrderedPathProducerWithOwners(target, leftProducer, rightProducer, nil)
+}
+
+// The optional lookup belongs to one immutable working-tree closure query.
+// It is an index of exact materialized selections, not overwrite or absence
+// evidence. Missing lookup keys fall back to the original full map scan.
+func (g *compactKbuildSelectionGraph) compactKbuildSourceOrderedPathProducerWithOwners(
+	target, leftProducer, rightProducer string,
+	lookup func() map[string][]compactKbuildSelectionKey,
 ) (string, bool, error) {
 	if g == nil || leftProducer == "" || rightProducer == "" || leftProducer == rightProducer {
 		return "", false, nil
@@ -311,9 +343,26 @@ func (g *compactKbuildSelectionGraph) compactKbuildSourceOrderedPathProducer(
 		appendOwner(owner)
 	}
 	if !mapped[leftProducer] || !mapped[rightProducer] {
-		for owner, producer := range g.materializedProducers {
-			if producer == leftProducer || producer == rightProducer {
-				appendOwner(owner)
+		indexed := false
+		if lookup != nil {
+			byProducer := lookup()
+			left, leftKnown := byProducer[leftProducer]
+			right, rightKnown := byProducer[rightProducer]
+			if leftKnown && rightKnown {
+				for _, owner := range left {
+					appendOwner(owner)
+				}
+				for _, owner := range right {
+					appendOwner(owner)
+				}
+				indexed = true
+			}
+		}
+		if !indexed {
+			for owner, producer := range g.materializedProducers {
+				if producer == leftProducer || producer == rightProducer {
+					appendOwner(owner)
+				}
 			}
 		}
 	}
