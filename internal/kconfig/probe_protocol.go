@@ -786,8 +786,28 @@ func validateProbeCandidateArguments(
 // allowing a caller to pair the projection with arbitrary preprocessor code or
 // an unvalidated, supposedly managed macro definition.
 func validateCompilerIntrinsicProbeShape(step ProbeStep) error {
-	_, err := compilerIntrinsicProbeCalls(step)
+	_, err := compilerIntrinsicProbeOperators(step)
 	return err
+}
+
+// Both admitted input shapes share the same literal-preserving projection.
+// The protected bindings come from validated static input, never caller claims.
+func compilerIntrinsicProbeOperators(step ProbeStep) (map[string]bool, error) {
+	if step.Name == compilerCounterSequenceStep {
+		if _, err := compilerCounterProbeCount(step); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"__COUNTER__": true}, nil
+	}
+	calls, err := compilerIntrinsicProbeCalls(step)
+	if err != nil {
+		return nil, err
+	}
+	operators := make(map[string]bool, 2)
+	for _, call := range calls {
+		operators[call.Operator] = true
+	}
+	return operators, nil
 }
 
 // Return the operators only through the exact validated source/argv contract.
@@ -825,39 +845,45 @@ func compilerIntrinsicProbeCalls(step ProbeStep) ([]CompilerIntrinsicCall, error
 	if err != nil || canonical != step.Stdin {
 		return nil, errors.New("compiler intrinsic stdin must be canonical sorted unique calls")
 	}
+	if err := validateCompilerIntrinsicManagedArguments(step); err != nil {
+		return nil, err
+	}
+	return calls, nil
+}
 
+func validateCompilerIntrinsicManagedArguments(step ProbeStep) error {
 	const managedCount = 5
 	prefix := len(step.Arguments) - managedCount
 	if prefix < 0 {
-		return nil, errors.New("compiler intrinsic is missing its managed argv suffix")
+		return errors.New("compiler intrinsic is missing its managed argv suffix")
 	}
 	managed := step.Arguments[prefix:]
 	if managed[0] != "-E" || managed[1] != "-P" || managed[2] != "-x" ||
 		(managed[3] != "c" && managed[3] != "c++") || managed[4] != "-" {
-		return nil, errors.New("compiler intrinsic requires the exact C or C++ managed argv suffix")
+		return errors.New("compiler intrinsic requires the exact C or C++ managed argv suffix")
 	}
 	if len(step.Candidate.Base) != prefix {
-		return nil, errors.New("compiler intrinsic must own every argument before the managed suffix")
+		return errors.New("compiler intrinsic must own every argument before the managed suffix")
 	}
 	for index, owned := range step.Candidate.Base {
 		if owned != index {
-			return nil, errors.New("compiler intrinsic candidate ownership overlaps its managed suffix")
+			return errors.New("compiler intrinsic candidate ownership overlaps its managed suffix")
 		}
 	}
 	if len(step.Candidate.Conditional) != len(step.ConditionalArguments) {
-		return nil, errors.New("compiler intrinsic must own every conditional argument group")
+		return errors.New("compiler intrinsic must own every conditional argument group")
 	}
 	for index, owned := range step.Candidate.Conditional {
 		if owned != index || step.ConditionalArguments[index].Before < 0 || step.ConditionalArguments[index].Before > prefix {
-			return nil, errors.New("compiler intrinsic conditional arguments overlap its managed suffix")
+			return errors.New("compiler intrinsic conditional arguments overlap its managed suffix")
 		}
 	}
 	for _, group := range step.ArgumentFragments {
 		if group.Index < 0 || group.Index >= prefix {
-			return nil, errors.New("compiler intrinsic cannot fragment its managed argv suffix")
+			return errors.New("compiler intrinsic cannot fragment its managed argv suffix")
 		}
 	}
-	return calls, nil
+	return nil
 }
 
 // validateProbeWorkingDirectory admits either exactly one directory-shaped

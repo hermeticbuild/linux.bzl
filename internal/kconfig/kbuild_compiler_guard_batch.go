@@ -25,6 +25,7 @@ type KbuildCompilerGuardBatch struct {
 	terminalIDs  map[string]bool
 	observations map[configDependencyCompilerPredefineRequestKey]map[string]kbuildCompilerGuardAnswerObservation
 	intrinsics   map[configDependencyCompilerPredefineRequestKey]map[CompilerIntrinsicCall]map[string]kbuildCompilerIntrinsicObservation
+	counters     map[configDependencyCompilerPredefineRequestKey]map[string]kbuildCompilerCounterObservation
 	frozen       bool
 	err          error
 }

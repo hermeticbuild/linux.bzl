@@ -342,6 +342,9 @@ type configDependencyMacroState struct {
 	// coverage. The ordinary definedness scanner leaves it nil. Each speculative
 	// branch owns its map; replacement records themselves are immutable values.
 	macroReplacements map[string]configDependencyMacroReplacement
+	// Compiler counter source-order state is branch-owned and every
+	// advance participates in revision validation, even without a namespace write.
+	counter compilerCounterCursor
 	// compilerPredefinedDigest is the canonical defined-name projection of a
 	// successfully parsed compiler -dM result. compilerPredefinedSnapshot pins it
 	// to that exact immutable root: branches and later mutations must not use the
@@ -1023,6 +1026,9 @@ func (s *configDependencyMacroState) applySnapshotChangesWithMaterializedResult(
 
 type configDependencyConditionalMacroStateProjection struct {
 	key string
+	// Optional immutable state for recursive complete-call evaluation. Namespace
+	// snapshots retain a nil pointer; source-specific state is attached to a copy.
+	counter *compilerCounterCursor
 	// facts contains only the finite deviations from the projection's
 	// implicit default.  When unknownNonConfig is set, an absent non-CONFIG
 	// name is Unknown because a validated generated numeric-macro header may
@@ -1051,7 +1057,22 @@ func configDependencyConditionalMacroStateKey(
 	if !valid {
 		return configDependencyConditionalMacroStateProjection{}, false
 	}
-	return snapshot.conditionalProjection()
+	projection, valid := snapshot.conditionalProjection()
+	if !valid || state.counter == (compilerCounterCursor{}) {
+		return projection, valid
+	}
+	if !state.counter.validPosition() {
+		return configDependencyConditionalMacroStateProjection{}, false
+	}
+	counter := state.counter
+	projection.counter = &counter
+	var key strings.Builder
+	key.WriteString("counter-source-state-v1:")
+	appendConfigDependencyCacheString(&key, projection.key)
+	appendConfigDependencyCacheString(&key, counter.sequence.identity)
+	appendConfigDependencyCacheString(&key, strconv.Itoa(counter.next))
+	projection.key = key.String()
+	return projection, true
 }
 
 func configDependencyConditionalMacroDefault(
@@ -1081,6 +1102,16 @@ func (p configDependencyConditionalMacroStateProjection) definition(
 func configDependencyConditionalMacroStateProgress(
 	previous, current configDependencyConditionalMacroStateProjection,
 ) bool {
+	if previous.counter != nil || current.counter != nil {
+		if previous.counter == nil || current.counter == nil ||
+			!previous.counter.validPosition() || !current.counter.validPosition() ||
+			previous.counter.sequence.identity != current.counter.sequence.identity || current.counter.next < previous.counter.next {
+			return false
+		}
+		if current.counter.next > previous.counter.next {
+			return true
+		}
+	}
 	names := map[string]bool{}
 	for name := range previous.facts {
 		names[name] = true
@@ -1894,6 +1925,7 @@ func (s *configDependencyMacroState) branch() *configDependencyMacroState {
 		symbols:              s.symbols,
 		macroExpansions:      s.macroExpansions,
 		macroReplacements:    maps.Clone(s.macroReplacements),
+		counter:              s.counter,
 		forcedHeaderTrace:    s.forcedHeaderTrace,
 		tainted:              s.tainted,
 		parent:               s,
@@ -1913,6 +1945,7 @@ func (s *configDependencyMacroState) consume() {
 	s.symbols = nil
 	s.macroExpansions = nil
 	s.macroReplacements = nil
+	s.counter = compilerCounterCursor{}
 	s.compilerPredefinedDigest = [sha256.Size]byte{}
 	s.compilerPredefinedSnapshot = nil
 	s.forcedHeaderTrace = nil
@@ -1959,13 +1992,15 @@ func (s *configDependencyMacroState) commitBranch(
 	}
 	revision := s.snapshotRevision
 	replacementsChanged := !maps.Equal(s.macroReplacements, branch.macroReplacements)
+	counterChanged := s.counter != branch.counter
 	if !s.applySnapshotChangesWithMaterializedResult(forkSnapshot, branch.snapshotChanges, materialized) {
 		s.tainted = true
 		return false
 	}
 	s.mergeForcedHeaderTouches(branch, false)
 	s.macroReplacements = branch.macroReplacements
-	if replacementsChanged && s.snapshotRevision == revision {
+	s.counter = branch.counter
+	if (replacementsChanged || counterChanged) && s.snapshotRevision == revision {
 		s.snapshotRevision++
 	}
 	branch.consume()
@@ -2113,14 +2148,24 @@ func (s *configDependencyMacroState) mergePossibleBranches(
 		return
 	}
 	replacements := s.joinMacroReplacements(left, right)
+	leftCounter, rightCounter := s.counter, s.counter
+	if left != nil {
+		leftCounter = left.counter
+	}
+	if right != nil {
+		rightCounter = right.counter
+	}
+	counter := joinCompilerCounterCursors(leftCounter, rightCounter)
 	revision := s.snapshotRevision
 	replacementsChanged := !maps.Equal(s.macroReplacements, replacements)
+	counterChanged := s.counter != counter
 	if !s.applySnapshotChanges(forkSnapshot, joinedExact) {
 		s.tainted = true
 		return
 	}
 	s.macroReplacements = replacements
-	if replacementsChanged && s.snapshotRevision == revision {
+	s.counter = counter
+	if (replacementsChanged || counterChanged) && s.snapshotRevision == revision {
 		s.snapshotRevision++
 	}
 	s.mergeForcedHeaderTouches(left, true)
@@ -7961,6 +8006,14 @@ func actionPlanNodeConfigDependenciesForSourceLookup(
 		// deltas; no caller may write this shared root directly.
 		if callCoverage {
 			initial := parsed.state.branch()
+			sequence, _, err := configDependencySupplementalCompilerCounter(plan, actionPlanConfigDependencyScope(node), invocation.tool,
+				probe.language, probe.arguments, probe.translationUnits, probe.environment)
+			if err != nil {
+				return nil, "compiler counter result cannot be replayed: " + err.Error()
+			}
+			initial.installInitialCompilerCounterBinding(result.guardDefinitions,
+				configDependencyCompilerPredefineKey(actionPlanConfigDependencyScope(node), invocation.tool,
+					probe.language, probe.arguments, probe.translationUnits, probe.environment), result.contents, result.guardIdentity, sequence)
 			initial.installInitialCompilerIntrinsics(result.guardDefinitions,
 				configDependencyCompilerPredefineKey(actionPlanConfigDependencyScope(node), invocation.tool,
 					probe.language, probe.arguments, probe.translationUnits, probe.environment),
@@ -7974,6 +8027,7 @@ func actionPlanNodeConfigDependenciesForSourceLookup(
 		return opaqueConfigDependency(reason)
 	}
 	scanner.configureCompilerIntrinsicQueries(plan, node, invocation.tool, guardProbe, compilerGuards)
+	scanner.configureCompilerCounterQueries(plan, node, invocation.tool, guardProbe, compilerGuards)
 	scanner.language = compilerLanguage
 	if callCoverage && macroState == nil {
 		return opaqueConfigDependency("call coverage requires execution-probed compiler state")
@@ -8475,10 +8529,10 @@ func configDependencyCompletedCompilerCandidateForNode(
 		(recipe.Tool != "cc" && recipe.Tool != "cxx" && recipe.CompilerInvocation == nil) {
 		return configDependencyCompletedCompilerCandidate{}, false
 	}
-	// Intrinsic calls carry independent value-sensitive request/result witnesses.
+	// Intrinsic calls and counter sequences carry independent value-sensitive request/result witnesses.
 	// Until this optional cache commits to those witnesses, fresh source/binding
 	// replay is mandatory; the older definedness-only key is insufficient.
-	if answers := plan.metadata.compilerGuardAnswers; answers != nil && len(answers.intrinsics) != 0 {
+	if answers := plan.metadata.compilerGuardAnswers; answers != nil && (len(answers.intrinsics) != 0 || len(answers.counters) != 0) {
 		return configDependencyCompletedCompilerCandidate{}, false
 	}
 	if node.Stage != "prehost" && node.Stage != "host" {

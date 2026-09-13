@@ -19,6 +19,7 @@ type configDependencyMacroCallBinding struct {
 	state      configDependencyMacroDefinition
 	definition *configDependencyMacroCallDefinition
 	intrinsic  *configDependencyCompilerIntrinsicBinding
+	counter    *configDependencyCompilerCounterBinding
 }
 
 // The resolver must describe one immutable effective state for this expansion.
@@ -30,6 +31,8 @@ type configDependencyMacroCallMode struct {
 	// Only a caller with proven compiler/language/options semantics may enable.
 	dollarAsPunctuation bool
 	intrinsic           func(CompilerIntrinsicCall) (token, identity, reason string)
+	counter             compilerCounterCursor
+	counterMissing      func(context string, required int)
 }
 
 type configDependencyMacroCallRead struct {
@@ -44,6 +47,8 @@ type configDependencyMacroCallResult struct {
 	ConfigReads     []string
 	DefinitionReads []configDependencyMacroCallRead
 	IntrinsicReads  []configDependencyCompilerIntrinsicRead
+	CounterReads    []compilerCounterRead
+	Counter         compilerCounterCursor
 	Work            int
 }
 
@@ -143,6 +148,8 @@ type configDependencyMacroCallMachine struct {
 	parsed                                map[*configDependencyMacroCallDefinition]configDependencyMacroCallParsed
 	definitionReads                       map[string]configDependencyMacroCallRead
 	intrinsicReads                        []configDependencyCompilerIntrinsicRead
+	counterReads                          []compilerCounterRead
+	counter                               compilerCounterCursor
 	reads                                 map[string]bool
 	work, definitionBytes, generatedBytes int
 }
@@ -190,10 +197,17 @@ func (m *configDependencyMacroCallMachine) binding(name string) (configDependenc
 	read := configDependencyMacroCallRead{Name: name, State: binding.state}
 	switch binding.state {
 	case configDependencyMacroUndefined:
-		if binding.definition != nil || binding.intrinsic != nil {
+		if binding.definition != nil || binding.intrinsic != nil || binding.counter != nil {
 			return configDependencyMacroCallBinding{}, fmt.Errorf("undefined macro %s has a replacement", name)
 		}
 	case configDependencyMacroDefined:
+		if binding.counter != nil {
+			if binding.definition != nil || binding.intrinsic != nil || !binding.counter.valid(name) {
+				return configDependencyMacroCallBinding{}, fmt.Errorf("macro %s has an invalid compiler counter binding", name)
+			}
+			read.Origin, read.DefinitionID = binding.counter.origin, binding.counter.identity
+			break
+		}
 		if binding.intrinsic != nil {
 			if binding.definition != nil || !binding.intrinsic.valid(name) {
 				return configDependencyMacroCallBinding{}, fmt.Errorf("macro %s has an invalid compiler intrinsic binding", name)
@@ -243,6 +257,9 @@ func (m *configDependencyMacroCallMachine) selected(name string) (configDependen
 	}
 	if binding.intrinsic != nil {
 		return configDependencyMacroCallParsed{function: true}, true, nil
+	}
+	if binding.counter != nil {
+		return configDependencyMacroCallParsed{}, true, nil
 	}
 	return configDependencyMacroCallParsed{function: binding.definition.function}, true, nil
 }
@@ -576,6 +593,28 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 			out = append(out, tok)
 			continue
 		}
+		if binding := m.bindings[tok.text]; binding.counter != nil {
+			read, next, err := m.counter.expand(binding.counter.context)
+			if err != nil {
+				if m.mode.counterMissing != nil {
+					if m.counter == (compilerCounterCursor{}) {
+						m.mode.counterMissing(binding.counter.context, 1)
+					} else if m.counter.validPosition() && m.counter.sequence.context == binding.counter.context && m.counter.next == len(m.counter.sequence.values) {
+						m.mode.counterMissing(binding.counter.context, m.counter.next+1)
+					}
+				}
+				return nil, 0, err
+			}
+			if len(out) >= 4096 || len(m.counterReads) >= maxCompilerCounterExpansions {
+				return nil, 0, fmt.Errorf("counter expansion output budget")
+			}
+			expanded := configDependencyMacroCallToken{text: read.Token}
+			expanded.spacing = configDependencyMacroCallComposeSpacing(tok.spacing, configDependencyMacroCallSpacingEnter(tok.whitespace))
+			out = append(out, expanded)
+			pending = configDependencyMacroCallSpacingExit
+			m.counter, m.counterReads = next, append(m.counterReads, read)
+			continue
+		}
 		if binding := m.bindings[tok.text]; binding.intrinsic != nil {
 			expanded, next, err := m.expandIntrinsic(binding.intrinsic, tokens, i)
 			if err != nil {
@@ -790,6 +829,7 @@ func configDependencyMacroCallExpandTokens(tokens []configDependencyMacroCallTok
 		return configDependencyMacroCallResult{}, "nil macro call resolver"
 	}
 	m := configDependencyMacroCallMachine{
+		counter: mode.counter,
 		resolve: resolve, mode: mode, bindings: map[string]configDependencyMacroCallBinding{},
 		parsed:          map[*configDependencyMacroCallDefinition]configDependencyMacroCallParsed{},
 		definitionReads: map[string]configDependencyMacroCallRead{}, reads: map[string]bool{},
@@ -799,6 +839,7 @@ func configDependencyMacroCallExpandTokens(tokens []configDependencyMacroCallTok
 		return configDependencyMacroCallResult{}, err.Error()
 	}
 	r := configDependencyMacroCallResult{ConfigReads: slices.Sorted(maps.Keys(m.reads)), IntrinsicReads: m.intrinsicReads, Work: m.work}
+	r.Counter, r.CounterReads = m.counter, m.counterReads
 	for _, name := range slices.Sorted(maps.Keys(m.definitionReads)) {
 		r.DefinitionReads = append(r.DefinitionReads, m.definitionReads[name])
 	}

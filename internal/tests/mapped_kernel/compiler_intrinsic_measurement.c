@@ -5,6 +5,12 @@ const unsigned char measured_attribute_unknown = 1 + (__has_attribute(linux_bzl_
 const unsigned char measured_builtin_dynamic_object_size = 1 + (__has_builtin(__builtin_dynamic_object_size) != 0);
 const unsigned char measured_builtin_unknown = 1 + (__has_builtin(__builtin_linux_bzl_unrecognized) != 0);
 
+/* Match only the three actual expansions in smoke.c, independently of its
+ * scanner and supplemental probes. No compiler-family expectation is encoded. */
+const unsigned char measured_counter_first = 17 + __COUNTER__;
+const unsigned char measured_counter_condition = 31 + (__COUNTER__ % 2 != 0);
+const unsigned char measured_counter_last = 41 + __COUNTER__;
+
 /* A self-reference is unavailable for further expansion after argument
  * prescan. The enum supplies its final C value without any compiler table. */
 enum { MAPPED_SELF_VALUE = 17 };

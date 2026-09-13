@@ -250,13 +250,9 @@ func ValidateProjectedProbeCandidateArguments(policy, projection string, argv []
 // unrelated textual operator definitions retain their original behavior. The
 // legacy projected validator keeps its original attribute-only contract.
 func ValidateCompilerIntrinsicProbeCandidateArguments(step ProbeStep, argv []string) ([]ProbeCandidatePathOperand, error) {
-	calls, err := compilerIntrinsicProbeCalls(step)
+	operators, err := compilerIntrinsicProbeOperators(step)
 	if err != nil {
 		return nil, err
-	}
-	operators := make(map[string]bool, 2)
-	for _, call := range calls {
-		operators[call.Operator] = true
 	}
 	tokens := make([]probeCandidateToken, len(argv))
 	for index, argument := range argv {

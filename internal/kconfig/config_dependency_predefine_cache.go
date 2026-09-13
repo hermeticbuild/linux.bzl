@@ -117,7 +117,7 @@ func configDependencyPredefineCacheMeasure(
 		return cost.add(records, len(text), maximumRecords, maximumBytes)
 	}
 	state := &parsed.state
-	if state.parent != nil || state.materializedSnapshotCache != nil || state.forcedHeaderTrace != nil ||
+	if state.parent != nil || state.counter != (compilerCounterCursor{}) || state.materializedSnapshotCache != nil || state.forcedHeaderTrace != nil ||
 		!state.snapshotChanges.empty() || !state.materializedSnapshotPending.empty() ||
 		state.forcedHeaderTouches.first != "" || len(state.forcedHeaderTouches.additional) != 0 ||
 		state.compilerPredefinedSnapshot != nil && state.compilerPredefinedSnapshot != state.snapshot {
@@ -173,7 +173,7 @@ func configDependencyPredefineCacheMeasure(
 		}
 	}
 	for name, replacement := range state.macroReplacements {
-		if replacement.intrinsic != nil || !add(1, name) || !add(0, replacement.text) || !add(0, replacement.origin) {
+		if replacement.intrinsic != nil || replacement.counter != nil || !add(1, name) || !add(0, replacement.text) || !add(0, replacement.origin) {
 			return cost, false
 		}
 	}

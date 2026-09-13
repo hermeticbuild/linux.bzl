@@ -17,6 +17,7 @@ type configDependencyCallCoverage struct {
 	intrinsic   func(CompilerIntrinsicCall) (token, identity, reason string)
 	unknown     func(string)
 	intrinsics  []configDependencyCompilerIntrinsicRead
+	counters    []compilerCounterRead
 	priorTail   bool
 	work        int
 	tokens      int
@@ -31,6 +32,13 @@ func (s *configDependencyMacroState) resolveMacroCall(name string) (configDepend
 	binding := configDependencyMacroCallBinding{state: s.definition(name)}
 	if binding.state == configDependencyMacroDefined {
 		if value, modeled := s.macroReplacements[name]; modeled {
+			if value.counter != nil {
+				if value.text != "" || value.origin != "" || value.intrinsic != nil || !value.counter.valid(name) {
+					return configDependencyMacroCallBinding{}, "invalid initial compiler counter replacement"
+				}
+				binding.counter = value.counter
+				return binding, ""
+			}
 			if value.intrinsic != nil {
 				if value.text != "" || value.origin != "" || !value.intrinsic.valid(name) {
 					return configDependencyMacroCallBinding{}, "invalid initial compiler intrinsic replacement"
@@ -56,6 +64,7 @@ func (c *configDependencyCallCoverage) fail(reason string) string {
 	c.definitions = nil
 	c.conditions = nil
 	c.intrinsics = nil
+	c.counters = nil
 	c.complete = false
 	return c.reason
 }
@@ -80,6 +89,9 @@ func (c *configDependencyCallCoverage) expand(text string, state *configDependen
 	if c.reason != "" {
 		return c.reason
 	}
+	if !state.validSnapshotLineage() || state.macroReplacements == nil {
+		return c.fail("call coverage has invalid source state")
+	}
 	if c.complete {
 		return c.fail("call coverage appended after completion")
 	}
@@ -92,6 +104,7 @@ func (c *configDependencyCallCoverage) expand(text string, state *configDependen
 	}
 	mode := c.mode
 	mode.intrinsic = c.intrinsic
+	mode.counter = state.counter
 	result, reason := configDependencyMacroCallExpand(text, c.resolver(state), mode)
 	if reason != "" {
 		return c.fail(reason)
@@ -101,6 +114,9 @@ func (c *configDependencyCallCoverage) expand(text string, state *configDependen
 	}
 	if reason := c.recordExpansion(result); reason != "" {
 		return reason
+	}
+	if !state.commitCounterExpansion(mode.counter, result) {
+		return c.fail("call coverage counter transition is stale or invalid")
 	}
 	if len(result.Tokens) != 0 {
 		last := result.Tokens[len(result.Tokens)-1]
@@ -112,7 +128,7 @@ func (c *configDependencyCallCoverage) expand(text string, state *configDependen
 func (c *configDependencyCallCoverage) recordExpansion(result configDependencyMacroCallResult) string {
 	c.work += result.Work
 	c.tokens += len(result.Tokens)
-	if c.work > 65536 || c.tokens > 16384 || len(c.conditions)+len(c.definitions)+len(result.DefinitionReads)+len(c.intrinsics)+len(result.IntrinsicReads) > 16384 {
+	if c.work > 65536 || c.tokens > 16384 || len(c.conditions)+len(c.definitions)+len(result.DefinitionReads)+len(c.intrinsics)+len(result.IntrinsicReads)+len(c.counters)+len(result.CounterReads) > 16384 {
 		return c.fail("translation-unit call coverage budget")
 	}
 	if c.reads == nil {
@@ -127,6 +143,7 @@ func (c *configDependencyCallCoverage) recordExpansion(result configDependencyMa
 	}
 	c.definitions = append(c.definitions, result.DefinitionReads...)
 	c.intrinsics = append(c.intrinsics, result.IntrinsicReads...)
+	c.counters = append(c.counters, result.CounterReads...)
 	return ""
 }
 
@@ -210,6 +227,7 @@ func (c *configDependencyCallCoverage) condition(text string, state *configDepen
 	}
 	mode := c.mode
 	mode.intrinsic = c.intrinsic
+	mode.counter = state.counter
 	result, reason := configDependencyMacroCallExpandTokens(protected, c.resolver(state), mode)
 	if reason != "" {
 		return configDependencyMacroUnknown, c.fail(reason)
@@ -226,6 +244,9 @@ func (c *configDependencyCallCoverage) condition(text string, state *configDepen
 	value, reason := configDependencyConditionalInteger(result.Tokens, func(name string) bool { return undefined[name] })
 	if reason != "" {
 		return configDependencyMacroUnknown, c.fail(reason)
+	}
+	if !state.commitCounterExpansion(mode.counter, result) {
+		return configDependencyMacroUnknown, c.fail("conditional counter transition is stale or invalid")
 	}
 	return value, ""
 }

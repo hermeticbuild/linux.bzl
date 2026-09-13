@@ -22,6 +22,7 @@ type ConfigDependencyCompilerGuardObservation struct {
 	Environment                 map[string]string
 	Names                       []string
 	Calls                       []CompilerIntrinsicCall
+	CounterCount                int
 	// OptionalDefinedness is exclusive to typed first-unknown expansion
 	// demands. A rejected vector supplies no facts, not measured negatives.
 	// Combined with Truncated it drops only optional demands, never the
@@ -214,6 +215,13 @@ func (c *configDependencyAnalysisContext) recordCompilerGuardHints(
 	if c.compilerGuardError != nil {
 		return
 	}
+	if hints.counterCount != 0 {
+		if _, err := CompilerCounterSequenceSourceBytes(hints.counterCount); err != nil ||
+			len(hints.names) != 0 || len(hints.calls) != 0 || hints.truncated || hints.optionalDefinedness || hints.optionalTokenHints || hints.literalIncludeHints {
+			c.compilerGuardError = fmt.Errorf("compiler counter observation has invalid or mixed demands")
+			return
+		}
+	}
 	if len(hints.names) != 0 && len(hints.calls) != 0 || hints.truncated && len(hints.names)+len(hints.calls) != 0 ||
 		hints.optionalDefinedness && hints.optionalTokenHints ||
 		hints.literalIncludeHints && !hints.optionalTokenHints ||
@@ -229,9 +237,10 @@ func (c *configDependencyAnalysisContext) recordCompilerGuardHints(
 		OptionalDefinedness: hints.optionalDefinedness,
 		OptionalTokenHints:  hints.optionalTokenHints,
 		LiteralIncludeHints: hints.literalIncludeHints,
+		CounterCount:        hints.counterCount,
 	}
 	if file.logical == "" {
-		if !hints.truncated || len(hints.names) != 0 || len(hints.calls) != 0 {
+		if !hints.truncated || len(hints.names) != 0 || len(hints.calls) != 0 || hints.counterCount != 0 {
 			c.compilerGuardError = fmt.Errorf("compiler guard hints lack an immutable file origin")
 			return
 		}

@@ -141,6 +141,7 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 	seen := map[string]bool{}
 	batched := map[string]bool{"base": false, "irrelevant": false, "relevant": false}
 	generatedOffsets := map[string]bool{}
+	counterMeasured := map[string]bool{}
 	for index, logical := range manifests {
 		if seen[logical] {
 			t.Fatalf("compiler guard manifest %d repeats an earlier runfile", index)
@@ -165,9 +166,10 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 				Arguments, TranslationUnits []int
 			}
 			Variants map[string][]struct {
-				Context string
-				Kind    string
-				Calls   []struct {
+				Context      string
+				Kind         string
+				CounterCount int
+				Calls        []struct {
 					Operator string `json:"operator"`
 					Operand  string `json:"operand"`
 				}
@@ -194,6 +196,16 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 				}
 				arguments := compilerGuardStrings(t, manifest.Strings, context.Arguments)
 				units := compilerGuardStrings(t, manifest.Strings, context.TranslationUnits)
+				if query.Kind == "counter-sequence" {
+					if query.CounterCount < 3 || query.CounterCount > 4096 {
+						t.Fatalf("%s counter query has invalid measured prefix length %d", variant, query.CounterCount)
+					}
+					for _, argument := range arguments {
+						if strings.HasPrefix(argument, `-DMAPPED_OBJECT_FILE="`) && strings.HasSuffix(argument, `/smoke"`) {
+							counterMeasured[variant] = true
+						}
+					}
+				}
 				if query.Kind != "intrinsic-integer" {
 					continue
 				}
@@ -250,6 +262,9 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 		}
 		if !generatedOffsets[variant] {
 			t.Errorf("%s default compiler guard rounds never measure the deferred generated-assembly compiler context", variant)
+		}
+		if !counterMeasured[variant] {
+			t.Errorf("%s default compiler guard rounds never measure smoke.c's counter sequence", variant)
 		}
 	}
 }
@@ -731,6 +746,14 @@ func TestFamilyVariantImagesAreActuallyBuilt(t *testing.T) {
 		}
 		if got := compiledObjectSymbolByte(t, variant.image, "mapped_fresh_paste"); got != freshPaste {
 			t.Errorf("%s fresh paste byte = %d, independent compiler measurement = %d", variant.name, got, freshPaste)
+		}
+		for _, name := range []string{"counter_first", "counter_condition", "counter_last"} {
+			got := compiledObjectSymbolByte(t, variant.image, "mapped_"+name)
+			want := compiledObjectSymbolByte(t, measurementObject, "measured_"+name)
+			if got != want {
+				t.Errorf("%s %s byte = %d, independent compiler measurement = %d", variant.name, name, got, want)
+			}
+			t.Logf("%s actual compiler %s: %d", variant.name, name, got)
 		}
 		// These mixed calls belong to smoke.c's one exact compiler invocation.
 		// Compare C expressions and source-wrapper #if branches with an actual

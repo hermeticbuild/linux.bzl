@@ -22,7 +22,7 @@ func configDependencyMacroEffectStateReady(state *configDependencyMacroState) bo
 		return false
 	}
 	for current := state; current != nil; current = current.parent {
-		if current.macroReplacements != nil || current.forcedHeaderTrace != nil || current.forcedHeaderTouches.size() != 0 {
+		if current.macroReplacements != nil || current.counter != (compilerCounterCursor{}) || current.forcedHeaderTrace != nil || current.forcedHeaderTouches.size() != 0 {
 			return false
 		}
 	}

@@ -27,6 +27,7 @@ go_test(
     srcs = [
         "argument_fragments_test.go",
         "candidate_test.go",
+        "compiler_counter_test.go",
         "compiler_intrinsic_test.go",
         "main_test.go",
         "source_shell_mode_test.go",

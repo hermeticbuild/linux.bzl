@@ -76,10 +76,11 @@ func equalFamilyCompilerGuardContexts(left, right familyCompilerGuardContext) bo
 }
 
 type familyCompilerGuardWireQuery struct {
-	Context string
-	Kind    string `json:",omitempty"`
-	Names   []string
-	Calls   []kconfig.CompilerIntrinsicCall `json:",omitempty"`
+	Context      string
+	Kind         string `json:",omitempty"`
+	Names        []string
+	Calls        []kconfig.CompilerIntrinsicCall `json:",omitempty"`
+	CounterCount int                             `json:",omitempty"`
 }
 
 type familyCompilerGuardWireManifest struct {
@@ -126,7 +127,7 @@ func marshalFamilyCompilerGuardManifest(m familyCompilerGuardManifest) ([]byte, 
 				contexts[id] = context
 			}
 			entries[index] = familyCompilerGuardWireQuery{
-				Context: id, Kind: query.Kind, Names: query.Names, Calls: query.Calls,
+				Context: id, Kind: query.Kind, Names: query.Names, Calls: query.Calls, CounterCount: query.CounterCount,
 			}
 		}
 		wire.Variants[name] = entries
@@ -208,7 +209,7 @@ func unmarshalFamilyCompilerGuardManifest(data []byte) (*familyCompilerGuardMani
 		}
 		for index, entry := range entries {
 			queries[index] = contexts[entry.Context].bind(familyCompilerGuardQuery{
-				Kind: entry.Kind, Names: entry.Names, Calls: entry.Calls,
+				Kind: entry.Kind, Names: entry.Names, Calls: entry.Calls, CounterCount: entry.CounterCount,
 			})
 		}
 		m.Variants[name] = queries

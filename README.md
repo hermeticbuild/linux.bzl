@@ -848,8 +848,28 @@ proven currently undefined single identifiers, and the query freezes that
 operand against initial macro re-expansion. Missing
 answers grant no precision. Assembly, file-sensitive operators such as
 `__has_include`, and other unmodeled calls remain conservative. The optional
-completed-analysis cache is bypassed when intrinsic answers are attached;
+completed-analysis cache is bypassed when intrinsic or counter answers are attached;
 ordinary final artifact sharing still uses the verified dependency result.
+
+The complete-call interpreter can also consume `__COUNTER__` values measured
+from the selected compiler in the exact original invocation context. Positive
+initial definedness and the absence of a textual definition establish the
+nontextual binding; neither establishes its numeric values. A reached expansion
+requests a bounded prefix of compiler-produced integer tokens, initially 64
+and growing only when an unmeasured position is needed, up to 4,096. These are
+work limits, not an assumed starting value or increment. Compatible measured
+prefixes retain their request and toolset witnesses; conflicting results are
+rejected. Every translation unit starts a fresh cursor, includes and branches
+carry its ordered state, and discarded or stringified arguments do not consume
+an expansion. Source or command-line replacements remain ordinary macros.
+An unknown branch history, exhausted vector, or incomplete expansion never
+publishes a partial dependency proof. Namespace-only caches cannot replay this
+state. Counter queries share the existing family value and byte budgets; the
+three discovery rounds are unchanged. A counter first reached during final
+replay therefore still keeps that compilation configuration-specific when no
+earlier round measured its values. Actual GCC and Clang fixture builds compare
+counter-dependent object bytes with an independent run of the same compiler;
+this coverage alone does not establish improved full-kernel reuse.
 
 Measured answers participate in macro-state and cache identities. The
 interpreter processes forced headers

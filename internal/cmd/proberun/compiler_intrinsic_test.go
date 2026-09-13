@@ -160,6 +160,10 @@ func TestRunProbeProtectsExactlyInvokedCompilerIntrinsics(t *testing.T) {
 }
 
 func runCompilerIntrinsicSourceArgumentsForTest(t *testing.T, arguments []string, mode, stdin string, invalid bool) {
+	runCompilerIntrinsicNamedSourceArgumentsForTest(t, arguments, mode, "compiler-intrinsic-integer", stdin, invalid)
+}
+
+func runCompilerIntrinsicNamedSourceArgumentsForTest(t *testing.T, arguments []string, mode, stepName, stdin string, invalid bool) {
 	t.Helper()
 	dir := t.TempDir()
 	identity := "sha256-" + strings.Repeat("6", 64)
@@ -171,7 +175,7 @@ func runCompilerIntrinsicSourceArgumentsForTest(t *testing.T, arguments []string
 		"-include", "undeclared/forced.h", "-Iundeclared/include", "-c", "source.c",
 		"-o", "source.o", "-MMD", "-MF", "source.d")
 	tail := []string{"-E", "-P", "-x", "c", "-"}
-	step := kconfig.ProbeStep{Name: "compiler-intrinsic-integer", Tool: "cc",
+	step := kconfig.ProbeStep{Name: stepName, Tool: "cc",
 		Stdin: stdin,
 		Candidate: &kconfig.ProbeCandidateArguments{Policy: kconfig.ProbeCandidatePolicyCC,
 			Projection: kconfig.ProbeCandidateProjectionCompilerIntrinsic, TranslationUnits: []string{"source.c"}},
@@ -216,7 +220,7 @@ func runCompilerIntrinsicSourceArgumentsForTest(t *testing.T, arguments []string
 	}
 	request := kconfig.ProbeRequest{Schema: kconfig.LinuxProbeRequestSchema, InputCount: len(inputNodeIDs),
 		Steps:   []kconfig.ProbeStep{step},
-		Outcome: kconfig.ProbeOutcome{Kind: "text", Step: "compiler-intrinsic-integer", Stream: "stdout", RequireSuccess: true},
+		Outcome: kconfig.ProbeOutcome{Kind: "text", Step: stepName, Stream: "stdout", RequireSuccess: true},
 	}
 	requestID, err := request.ID()
 	if err != nil {

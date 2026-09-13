@@ -7,6 +7,7 @@ package kconfig
 type configDependencyMacroReplacement struct {
 	text, origin string
 	intrinsic    *configDependencyCompilerIntrinsicBinding
+	counter      *configDependencyCompilerCounterBinding
 }
 
 func (s *configDependencyMacroState) joinMacroReplacements(left, right *configDependencyMacroState) map[string]configDependencyMacroReplacement {

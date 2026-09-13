@@ -42,6 +42,7 @@ type familyCompilerGuardQuery struct {
 	Environment                 map[string]string
 	Names                       []string
 	Calls                       []kconfig.CompilerIntrinsicCall `json:",omitempty"`
+	CounterCount                int                             `json:",omitempty"`
 }
 
 func (q familyCompilerGuardQuery) contextKey() string {
@@ -55,7 +56,8 @@ func (q familyCompilerGuardQuery) payloadKey() string {
 		Context, Kind string
 		Names         []string
 		Calls         []kconfig.CompilerIntrinsicCall
-	}{q.compilerContext().id(), q.Kind, q.Names, q.Calls})
+		CounterCount  int `json:",omitempty"`
+	}{q.compilerContext().id(), q.Kind, q.Names, q.Calls, q.CounterCount})
 	return string(data)
 }
 
@@ -351,15 +353,16 @@ type familyCompilerGuardPriorRound struct {
 }
 
 type familyCompilerGuardPipeline struct {
-	flags    *familyCompilerGuardFlags
-	names    []string
-	toolsets map[string]string
-	previous []string
-	prior    []familyCompilerGuardPriorRound
-	queries  map[string][]familyCompilerGuardQuery
-	plans    []kconfig.ProbePlanVariant
-	active   map[string]*familyCompilerGuardQuery
-	known    map[string]map[string]bool
+	flags        *familyCompilerGuardFlags
+	names        []string
+	toolsets     map[string]string
+	previous     []string
+	prior        []familyCompilerGuardPriorRound
+	queries      map[string][]familyCompilerGuardQuery
+	plans        []kconfig.ProbePlanVariant
+	active       map[string]*familyCompilerGuardQuery
+	known        map[string]map[string]bool
+	counterKnown map[string]int
 	// Exact-vector failed attempts, scoped to fresh current variant replay.
 	// Never interpreted as per-name definedness or source-closure evidence.
 	rejected                map[string]bool
@@ -503,7 +506,7 @@ func newFamilyCompilerGuardPipeline(flags *familyCompilerGuardFlags, inputs []fa
 				last = key
 				queryCount++
 				nameCount += len(query.Names)
-				callCount += len(query.Calls)
+				callCount += len(query.Calls) + query.CounterCount
 				uniqueQueries[query.payloadKey()] = struct{}{}
 				expandedBytes += familyCompilerGuardExpandedQueryBytes(query)
 				if queryCount > maxFamilyCompilerGuardMemberships || len(uniqueQueries) > maxFamilyCompilerGuardQueries ||
@@ -603,6 +606,7 @@ func (p *familyCompilerGuardPipeline) prepareVariant(name string, scopes *kconfi
 	p.activeVariant = name
 	p.active = map[string]*familyCompilerGuardQuery{}
 	p.known = map[string]map[string]bool{}
+	p.counterKnown = map[string]int{}
 	p.rejected = map[string]bool{}
 	p.queryBytes = map[string]int{}
 	p.pendingNames = nil
@@ -638,6 +642,9 @@ func (p *familyCompilerGuardPipeline) prepareVariant(name string, scopes *kconfi
 			}
 			for _, call := range query.Calls {
 				p.known[key][familyCompilerIntrinsicCallKey(call)] = true
+			}
+			if query.CounterCount > p.counterKnown[key] {
+				p.counterKnown[key] = query.CounterCount
 			}
 		}
 		plan, err := batch.Plan()
@@ -701,6 +708,9 @@ func familyCompilerGuardExpandedQueryBytes(query familyCompilerGuardQuery) int {
 	}
 	for _, call := range query.Calls {
 		size += len(call.Operator) + len(call.Operand) + 48
+	}
+	if query.CounterCount != 0 {
+		size += familyCompilerCounterPayloadBytes(query.CounterCount)
 	}
 	return size
 }
@@ -775,6 +785,10 @@ func (p *familyCompilerGuardPipeline) exceedsLimit(reason string, current, maxim
 }
 
 func (p *familyCompilerGuardPipeline) observe(value kconfig.ConfigDependencyCompilerGuardObservation) error {
+	if value.CounterCount != 0 && (len(value.Names) != 0 || len(value.Calls) != 0 ||
+		value.OptionalDefinedness || value.OptionalTokenHints || value.LiteralIncludeHints || value.Truncated) {
+		return fmt.Errorf("compiler observation mixes counter sequence and other demands")
+	}
 	if value.OptionalDefinedness && value.OptionalTokenHints || value.LiteralIncludeHints && !value.OptionalTokenHints {
 		return fmt.Errorf("compiler observation mixes demanded and hinted names")
 	}
@@ -794,6 +808,9 @@ func (p *familyCompilerGuardPipeline) observe(value kconfig.ConfigDependencyComp
 		// The scanner does not expose which source bound failed or its counts.
 		p.truncate("source_hint_limit", 0, 0)
 		return nil
+	}
+	if value.CounterCount != 0 {
+		return p.observeCounterSequence(value)
 	}
 	if len(value.Calls) != 0 {
 		if len(value.Names) != 0 || value.OptionalDefinedness {
@@ -939,6 +956,7 @@ func (p *familyCompilerGuardPipeline) finishVariant(name string, scopes *kconfig
 		return err
 	}
 	p.active, p.known = nil, nil
+	p.counterKnown = nil
 	p.rejected = nil
 	p.priority = nil
 	return nil

@@ -9,6 +9,7 @@ go_library(
     srcs = [
         "checkpoint_metadata.go",
         "family_checkpoint.go",
+        "family_compiler_counter.go",
         "family_compiler_guard_dictionary.go",
         "family_compiler_guard_transport.go",
         "family_compiler_guards.go",
@@ -58,6 +59,7 @@ go_test(
     srcs = [
         "deferred_content_selection_test.go",
         "family_checkpoint_test.go",
+        "family_compiler_counter_test.go",
         "family_compiler_guard_carry_test.go",
         "family_compiler_guard_dictionary_test.go",
         "family_compiler_guard_transport_test.go",

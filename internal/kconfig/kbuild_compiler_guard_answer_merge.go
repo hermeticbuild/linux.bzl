@@ -41,6 +41,9 @@ func MergeKbuildCompilerGuardAnswers(snapshots ...*KbuildCompilerGuardAnswers) (
 		if equivalent && !equalKbuildCompilerIntrinsicAnswers(first.intrinsics, snapshot.intrinsics) {
 			equivalent = false
 		}
+		if equivalent && !equalKbuildCompilerCounterAnswers(first.counters, snapshot.counters) {
+			equivalent = false
+		}
 	}
 	if first == nil || equivalent {
 		return first, nil
@@ -75,6 +78,10 @@ func MergeKbuildCompilerGuardAnswers(snapshots ...*KbuildCompilerGuardAnswers) (
 	}
 	var err error
 	result.intrinsics, err = mergeKbuildCompilerIntrinsicAnswers(snapshots)
+	if err != nil {
+		return nil, err
+	}
+	result.counters, err = mergeKbuildCompilerCounterAnswers(snapshots)
 	if err != nil {
 		return nil, err
 	}

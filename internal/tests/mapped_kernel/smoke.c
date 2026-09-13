@@ -2,6 +2,24 @@
 #include "include/linux/mapped_guard_a.h"
 #include "include/linux/mapped_compiler_types.h"
 
+/* Stateful expansions must follow source order, including discarded and raw
+ * stringified arguments. The test compares against a separate compiler action,
+ * without assuming the counter's initial value or increment. */
+#ifndef __COUNTER__
+#error counter fixture requires a measured compiler counter
+#endif
+#define MAPPED_COUNTER_DROP(x)
+#define MAPPED_COUNTER_RAW(x) #x
+const unsigned char mapped_counter_first = 17 + __COUNTER__;
+MAPPED_COUNTER_DROP(__COUNTER__)
+const char mapped_counter_raw[] = MAPPED_COUNTER_RAW(__COUNTER__);
+#if __COUNTER__ % 2 == 0
+const unsigned char mapped_counter_condition = 31;
+#else
+const unsigned char mapped_counter_condition = 32;
+#endif
+const unsigned char mapped_counter_last = 41 + __COUNTER__;
+
 /* The test reads this byte from the ELF section, not the host-output suffix.
  * The zero-valued source macro requires both reached-header compiler rounds
  * for precise reuse, while leaving the actual compiled value unchanged. */

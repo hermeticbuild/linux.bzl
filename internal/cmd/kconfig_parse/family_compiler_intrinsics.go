@@ -38,7 +38,17 @@ func familyCompilerIntrinsicCallKey(call kconfig.CompilerIntrinsicCall) string {
 }
 
 func (q familyCompilerGuardQuery) validatePayload() error {
+	if q.Kind != familyCompilerCounterQueryKind && q.CounterCount != 0 {
+		return fmt.Errorf("non-counter compiler query contains a sequence count")
+	}
 	switch q.Kind {
+	case familyCompilerCounterQueryKind:
+		if q.Names != nil || q.Calls != nil || q.Language != "c" && q.Language != "c++" {
+			return fmt.Errorf("compiler counter query has a noncanonical payload")
+		}
+		if _, err := kconfig.CompilerCounterSequenceSourceBytes(q.CounterCount); err != nil {
+			return err
+		}
 	case "", familyCompilerOptionalDefinednessQueryKind, familyCompilerTokenHintQueryKind, familyCompilerLiteralHintQueryKind: // Ordinary definedness retains its original shape.
 		if len(q.Calls) != 0 || len(q.Names) == 0 || !slices.IsSorted(q.Names) || len(slices.Compact(slices.Clone(q.Names))) != len(q.Names) {
 			return fmt.Errorf("compiler definedness query has a noncanonical payload")
@@ -83,6 +93,8 @@ func (q familyCompilerGuardQuery) evaluateCompletion(batch *kconfig.KbuildCompil
 	var err error
 	if q.Kind == "" {
 		_, ready, err = batch.CompilerDefinedness(q.Scope, q.Role, q.Language, q.Arguments, q.TranslationUnits, q.Names, q.Environment)
+	} else if q.Kind == familyCompilerCounterQueryKind {
+		ready, err = batch.CompilerCounterSequence(q.Scope, q.Role, q.Language, q.Arguments, q.TranslationUnits, q.CounterCount, q.Environment)
 	} else {
 		_, ready, err = batch.CompilerIntrinsicIntegers(q.Scope, q.Role, q.Language, q.Arguments, q.TranslationUnits, q.Calls, q.Environment)
 	}
