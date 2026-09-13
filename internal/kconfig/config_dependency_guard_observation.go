@@ -24,8 +24,8 @@ type ConfigDependencyCompilerGuardObservation struct {
 	Calls                       []CompilerIntrinsicCall
 	CounterCount                int
 	VariadicCommaSyntax         string
-	// OptionalVariadicHints come from definitions in entered files, not an
-	// actual empty expansion. They must not compete with reached demands.
+	// OptionalVariadicHints come from definitions, not actual empty expansions.
+	// LiteralIncludeHints distinguishes speculative from entered definitions.
 	OptionalVariadicHints bool
 	// OptionalCounterHints request a measured prefix from an entered-file
 	// inventory, not an actually reached counter expansion. Keep admission
@@ -40,8 +40,8 @@ type ConfigDependencyCompilerGuardObservation struct {
 	// literal-include candidates. Candidate discovery does not certify entry.
 	// They must never share an attempt or admission tier with actual demands.
 	OptionalTokenHints bool
-	// LiteralIncludeHints marks the weaker, not-yet-entered subset of token
-	// hints. Coordinators must preserve entered-file admission ahead of it.
+	// LiteralIncludeHints marks not-yet-entered token or variadic inventories.
+	// Speculative grammar must not evict the existing literal binding probes.
 	LiteralIncludeHints bool
 	Truncated           bool
 	Origin              ConfigDependencyCompilerGuardOrigin
@@ -214,15 +214,17 @@ func (s *configDependencyClosureScanner) emitCompilerGuardHints(
 			observe(probe, file, configDependencyCompilerGuardHints{calls: hints.calls}, syntax.compilerGuardContentID)
 		}
 		// The bounded lexer sees this spelling even before complete-call analysis
-		// starts. Only already-entered immutable files can emit this hint; raw
-		// substrings and literal-include lookahead cannot. It certifies no read.
+		// starts. Counter hints require already-entered immutable files; raw
+		// substrings and literal-include lookahead cannot supply them. Grammar
+		// hints below also permit separately bounded immutable lookahead.
+		// Neither hint certifies a read.
 		if !counterHintEmitted && s.compilerCounterHint != nil && hints.counterMention {
 			s.compilerCounterHint(file, syntax.compilerGuardContentID)
 			counterHintEmitted = true
 		}
 		for index, spelling := range []string{"standard", "named"} {
 			if !variadicHintEmitted[index] && s.compilerVariadicHint != nil && hints.variadicMentions[index] {
-				s.compilerVariadicHint(file, syntax.compilerGuardContentID, spelling)
+				s.compilerVariadicHint(file, syntax.compilerGuardContentID, spelling, false)
 				variadicHintEmitted[index] = true
 			}
 		}
@@ -244,7 +246,7 @@ func (c *configDependencyAnalysisContext) recordCompilerGuardHints(
 	}
 	if hints.variadicSyntax != "" && (hints.variadicSyntax != "standard" && hints.variadicSyntax != "named" ||
 		len(hints.names) != 0 || len(hints.calls) != 0 || hints.counterCount != 0 || hints.truncated ||
-		hints.optionalCounterHints || hints.optionalDefinedness || hints.optionalTokenHints || hints.literalIncludeHints) {
+		hints.optionalCounterHints || hints.optionalDefinedness || hints.optionalTokenHints || hints.literalIncludeHints && !hints.optionalVariadicHints) {
 		c.compilerGuardError = fmt.Errorf("variadic comma observation has invalid or mixed demands")
 		return
 	}
@@ -261,7 +263,7 @@ func (c *configDependencyAnalysisContext) recordCompilerGuardHints(
 	}
 	if len(hints.names) != 0 && len(hints.calls) != 0 || hints.truncated && len(hints.names)+len(hints.calls) != 0 ||
 		hints.optionalDefinedness && hints.optionalTokenHints ||
-		hints.literalIncludeHints && !hints.optionalTokenHints ||
+		hints.literalIncludeHints && !hints.optionalTokenHints && !hints.optionalVariadicHints ||
 		(hints.optionalDefinedness || hints.optionalTokenHints) && (len(hints.calls) != 0 || !hints.truncated && len(hints.names) == 0) {
 		c.compilerGuardError = fmt.Errorf("compiler guard observation mixes query kinds or retains truncated hints")
 		return

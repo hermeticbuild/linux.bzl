@@ -183,6 +183,49 @@ func TestConfigDependencyLiteralLookaheadWarmBudgetAndIsolation(t *testing.T) {
 	}
 }
 
+func TestConfigDependencyLiteralLookaheadGrammarBudgetAndIsolation(t *testing.T) {
+	const definitions = "#define NAMED(tail...) \"memory\", ##tail\n#define STANDARD(...) 17, ##__VA_ARGS__\n"
+	for _, tc := range []struct {
+		name, header string
+		work, want   int
+	}{
+		{"complete", definitions, 0, 2},
+		{"no syntax in string", "\"#define F(...) 17, ##__VA_ARGS__\"\n", 0, 0},
+		{"exhausted", definitions, 65535, 0},
+		{"oversized", definitions + strings.Repeat(" ", 65536), 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := literalLookaheadScannerForTest(t, tc.header)
+			entered := maps.Clone(s.compilerGuardFiles)
+			firstWork := 0
+			for pass := range 2 {
+				seen := map[string]bool{}
+				s.compilerVariadicHint = func(file configDependencyScanFile, contentID, syntax string, literal bool) {
+					if !literal || !file.source || file.logical != "include/later.h" || len(contentID) != 64 ||
+						(syntax != "named" && syntax != "standard") || seen[syntax] {
+						t.Fatal("grammar candidate lost exact origin or duplicated syntax")
+					}
+					seen[syntax] = true
+				}
+				budget := &configDependencyOpenedHeaderHintBudget{work: tc.work}
+				s.emitCompilerLiteralIncludeHintLookahead(configDependencyCompilerPredefineProbe{language: "c"},
+					func(configDependencyCompilerPredefineProbe, configDependencyScanFile, configDependencyCompilerGuardHints, string) {
+					}, budget)
+				if len(seen) != tc.want || budget.work > 65536 || pass != 0 && firstWork != budget.work {
+					t.Fatalf("grammar admission changed across cache/work bounds: seen=%v work=%d first=%d", seen, budget.work, firstWork)
+				}
+				firstWork = budget.work
+				if !reflect.DeepEqual(entered, s.compilerGuardFiles) || s.opaqueReason != "original failure" ||
+					!maps.Equal(s.sourcePaths, map[string]bool{"original": true}) ||
+					!maps.Equal(s.objectPaths, map[string]bool{"original-object": true}) ||
+					!reflect.DeepEqual(s.headerTrace, &configDependencyHeaderTrace{}) || len(s.resolvedGeneratedFiles) != 0 {
+					t.Fatal("grammar lookahead acquired source, generated-output or trace authority")
+				}
+			}
+		})
+	}
+}
+
 func TestConfigDependencyLiteralLookaheadExternalRootShadowsSource(t *testing.T) {
 	s := literalLookaheadScannerForTest(t, "__SHADOWED\n")
 	// The root is already entered. An uninspectable earlier search directory

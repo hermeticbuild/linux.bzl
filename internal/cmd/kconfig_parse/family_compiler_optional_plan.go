@@ -1,6 +1,9 @@
 package main
 
 import (
+	"cmp"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -9,23 +12,91 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
 
+// Bounded, private scheduling evidence. One consumer can contribute at most
+// once per variant and projected compiler-context class, regardless of how
+// many headers or names it observes. No source/argument strings are retained.
+// Exhaustion or missing identities discard ALL scores, restoring canonical
+// ordering without suppressing any query or affecting compiler facts.
+type familyCompilerHintConsumers struct {
+	seen     map[[32]byte]struct{}
+	counts   map[[32]byte]int
+	disabled bool
+}
+
+func (c *familyCompilerHintConsumers) observe(class [32]byte, variant, consumer string) {
+	if c.disabled {
+		return
+	}
+	if len(variant) == 0 || len(variant) > 256 || len(consumer) == 0 || len(consumer) > 256 {
+		c.discard()
+		return
+	}
+	var framed [32 + 2 + 256 + 256]byte
+	copy(framed[:32], class[:])
+	binary.BigEndian.PutUint16(framed[32:34], uint16(len(variant)))
+	copy(framed[34:], variant)
+	copy(framed[34+len(variant):], consumer)
+	id := sha256.Sum256(framed[:34+len(variant)+len(consumer)])
+	if _, found := c.seen[id]; found {
+		return
+	}
+	if len(c.seen) >= maxFamilyCompilerGuardMemberships ||
+		c.counts[class] == 0 && len(c.counts) >= maxFamilyCompilerGuardQueries {
+		c.discard()
+		return
+	}
+	if c.seen == nil {
+		c.seen = map[[32]byte]struct{}{}
+		c.counts = map[[32]byte]int{}
+	}
+	c.seen[id] = struct{}{}
+	c.counts[class]++
+}
+
+func (c *familyCompilerHintConsumers) discard() {
+	c.disabled = true
+	c.seen, c.counts = nil, nil
+}
+
+func (stage *familyCompilerGuardOptionalStage) rootConsumerScores() map[string]int {
+	if stage.consumers == nil || stage.consumers.disabled {
+		return nil
+	}
+	scores := map[string]int{}
+	for _, variant := range stage.variants {
+		for _, candidate := range variant.queries {
+			// Shared terminals must not multiply the class's count by the
+			// number of variant memberships. Scheduling equivalence is the
+			// same projection used for pending-name deduplication.
+			score := stage.consumers.counts[familyCompilerGuardSchedulingKey(candidate.query)]
+			scores[candidate.terminal] = max(scores[candidate.terminal], score)
+		}
+	}
+	return scores
+}
+
 // Weak inventories may retain complete query closures under staging pressure.
 // Actual definedness demands retain their separate, stronger admission rules.
 func (stage *familyCompilerGuardOptionalStage) supportsPlanSubset() bool {
 	switch stage.kind {
 	case familyCompilerTokenHintQueryKind, familyCompilerLiteralHintQueryKind,
-		familyCompilerCounterHintQueryKind, familyCompilerVariadicStage:
+		familyCompilerCounterHintQueryKind, familyCompilerVariadicStage, familyCompilerVariadicLookaheadStage:
 		return true
 	default:
 		return false
 	}
 }
 
-// Select a canonical prefix of complete roots in linear graph work. Cost each
+// Select a deterministic prefix of complete roots in linear graph work after
+// ordering them. The unranked entry point keeps canonical ID order. Cost each
 // newly retained node/request once, and stop on the first non-fitting closure:
 // repeatedly retrying large rejected closures would make optional work quadratic.
 // Validate the entire input before dropping anything, including discarded roots.
 func boundedFamilyOptionalHintPlan(plan *kconfig.ProbePlan, terminals []string, byteLimit, nodeLimit int) (*kconfig.ProbePlan, int, error) {
+	return boundedFamilyRankedOptionalHintPlan(plan, terminals, byteLimit, nodeLimit, nil)
+}
+
+func boundedFamilyRankedOptionalHintPlan(plan *kconfig.ProbePlan, terminals []string, byteLimit, nodeLimit int, scores map[string]int) (*kconfig.ProbePlan, int, error) {
 	empty, err := kconfig.SelectProbePlanTerminals(plan, nil)
 	if err != nil {
 		return nil, 0, err
@@ -41,6 +112,14 @@ func boundedFamilyOptionalHintPlan(plan *kconfig.ProbePlan, terminals []string, 
 		if !allowed[root] {
 			return nil, 0, fmt.Errorf("optional hint selects a nonterminal root")
 		}
+	}
+	if len(scores) != 0 {
+		slices.SortFunc(roots, func(a, b string) int {
+			if order := cmp.Compare(scores[b], scores[a]); order != 0 {
+				return order
+			}
+			return cmp.Compare(a, b)
+		})
 	}
 	size, fits := familyCompilerGuardOptionalPlanBytes(empty, byteLimit)
 	if !fits || nodeLimit < 0 {
@@ -118,7 +197,7 @@ func (stage *familyCompilerGuardOptionalStage) trimOptionalHintPlan(byteLimit, n
 			roots = append(roots, candidate.terminal)
 		}
 	}
-	selected, size, err := boundedFamilyOptionalHintPlan(stage.plan, roots, byteLimit, nodeLimit)
+	selected, size, err := boundedFamilyRankedOptionalHintPlan(stage.plan, roots, byteLimit, nodeLimit, stage.rootConsumerScores())
 	if err != nil {
 		return err
 	}
@@ -149,7 +228,7 @@ func (stage *familyCompilerGuardOptionalStage) trimOptionalHintPlan(byteLimit, n
 func (p *familyCompilerGuardPipeline) finishOptionalHintVariant(stage *familyCompilerGuardOptionalStage, variant familyCompilerGuardOptionalVariant, plan *kconfig.ProbePlan) error {
 	// First bound the incoming graph, so union construction still holds at most
 	// two individually bounded plans. Never retain an unbounded incoming sibling.
-	incoming := &familyCompilerGuardOptionalStage{kind: stage.kind, plan: plan, variants: []familyCompilerGuardOptionalVariant{variant}}
+	incoming := &familyCompilerGuardOptionalStage{kind: stage.kind, plan: plan, variants: []familyCompilerGuardOptionalVariant{variant}, consumers: stage.consumers}
 	if err := incoming.trimOptionalHintPlan(maxFamilyCompilerGuardBytes/2, maxFamilyCompilerGuardMemberships); err != nil {
 		return err
 	}

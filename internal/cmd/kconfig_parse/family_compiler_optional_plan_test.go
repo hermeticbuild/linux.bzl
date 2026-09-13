@@ -1,16 +1,19 @@
 package main
 
 import (
+	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
 
 func TestFamilyCompilerWeakHintSubsetPublication(t *testing.T) {
-	for _, literal := range []bool{false, true} {
-		t.Run(map[bool]string{false: "entered", true: "literal"}[literal], func(t *testing.T) {
+	for _, tc := range []struct{ literal, ranked bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		literal := tc.literal
+		t.Run(fmt.Sprintf("literal=%t/ranked=%t", literal, tc.ranked), func(t *testing.T) {
 			toolsets := familyCompilerGuardPlanForTest(t).Toolsets
 			flags, _ := familyCompilerGuardFlagsForTest(t, "guards", 0)
 			p, err := newFamilyCompilerGuardPipeline(&flags, nil,
@@ -43,6 +46,20 @@ func TestFamilyCompilerWeakHintSubsetPublication(t *testing.T) {
 				t.Fatal("fixture did not retain three shared query roots")
 			}
 			root := slices.Min(stage.plan.Terminal)
+			if tc.ranked {
+				root = slices.Max(stage.plan.Terminal)
+				stage.consumers = &familyCompilerHintConsumers{}
+				for _, variant := range stage.variants {
+					for _, candidate := range variant.queries {
+						if candidate.terminal == root {
+							stage.consumers.observe(familyCompilerGuardSchedulingKey(candidate.query), variant.name, "consumer")
+						}
+					}
+				}
+				if stage.rootConsumerScores()[root] != 2 {
+					t.Fatal("shared root multiplied its consumer score by variant membership")
+				}
+			}
 			one, err := kconfig.SelectProbePlanTerminals(stage.plan, []string{root})
 			if err != nil {
 				t.Fatal(err)
@@ -100,9 +117,89 @@ func TestFamilyCompilerWeakHintSubsetPublication(t *testing.T) {
 	}
 }
 
+func TestFamilyCompilerHintConsumerCounts(t *testing.T) {
+	class := [32]byte{1}
+	var forward, reverse familyCompilerHintConsumers
+	observations := [][2]string{{"a", "one"}, {"a", "two"}, {"b", "one"}, {"a", "one"}, {"a", "two"}}
+	for _, value := range observations {
+		forward.observe(class, value[0], value[1])
+	}
+	slices.Reverse(observations)
+	for _, value := range observations {
+		reverse.observe(class, value[0], value[1])
+	}
+	if !reflect.DeepEqual(forward, reverse) || forward.counts[class] != 3 || len(forward.seen) != 3 {
+		t.Fatal("consumer counts depend on observation order or duplicate visits")
+	}
+	// Framing prevents ambiguous variant/consumer concatenations.
+	forward.observe(class, "ab", "c")
+	forward.observe(class, "a", "bc")
+	if forward.counts[class] != 5 {
+		t.Fatal("consumer identity framing collided")
+	}
+	for _, tc := range []struct{ variant, consumer string }{
+		{"", "c"}, {"a", ""}, {strings.Repeat("a", 257), "c"}, {"a", strings.Repeat("c", 257)},
+	} {
+		c := familyCompilerHintConsumers{}
+		c.observe(class, "a", "valid")
+		c.observe(class, tc.variant, tc.consumer)
+		c.observe(class, "a", "later")
+		if !c.disabled || c.counts != nil || c.seen != nil {
+			t.Fatal("invalid identity retained partial scores or reenabled ranking")
+		}
+	}
+	for _, classes := range []bool{false, true} {
+		c := familyCompilerHintConsumers{}
+		limit := maxFamilyCompilerGuardMemberships
+		if classes {
+			limit = maxFamilyCompilerGuardQueries
+		}
+		for n := range limit {
+			key := class
+			if classes {
+				key = [32]byte{byte(n), byte(n >> 8)}
+			}
+			c.observe(key, "a", fmt.Sprint(n))
+			c.observe(key, "a", fmt.Sprint(n))
+		}
+		if c.disabled || len(c.seen) != limit {
+			t.Fatal("exact bound or duplicate consumer rejected")
+		}
+		c.observe([32]byte{255, 255}, "a", "overflow")
+		if !c.disabled || c.counts != nil || c.seen != nil {
+			t.Fatal("overflow kept order-dependent partial scores")
+		}
+	}
+}
+
+func TestFamilyCompilerHintConsumersBeforeNameDeduplication(t *testing.T) {
+	p := &familyCompilerGuardPipeline{activeVariant: "base", known: map[string]map[string]bool{}}
+	for _, consumer := range []string{"one", "two", "one"} {
+		if err := p.observe(kconfig.ConfigDependencyCompilerGuardObservation{
+			Scope: "target", Role: "cc", Language: "c", ConsumerNodeID: consumer,
+			Names: []string{"__NAME"}, OptionalTokenHints: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stage := p.tokenHints
+	if stage == nil || stage.consumers.disabled || stage.ledger.nameCount != 1 || len(stage.consumers.counts) != 1 {
+		t.Fatal("fixture did not deduplicate the pending name")
+	}
+	for _, count := range stage.consumers.counts {
+		if count != 2 {
+			t.Fatal("name deduplication lost distinct compile consumers")
+		}
+	}
+	stage.disable("test")
+	if stage.consumers != nil {
+		t.Fatal("discarded stage retained its scheduling index")
+	}
+}
+
 func TestFamilyCompilerWeakHintSubsetKinds(t *testing.T) {
 	for _, kind := range []string{familyCompilerTokenHintQueryKind, familyCompilerLiteralHintQueryKind,
-		familyCompilerCounterHintQueryKind, familyCompilerVariadicStage} {
+		familyCompilerCounterHintQueryKind, familyCompilerVariadicStage, familyCompilerVariadicLookaheadStage} {
 		if !(&familyCompilerGuardOptionalStage{kind: kind}).supportsPlanSubset() {
 			t.Fatalf("weak tier %s cannot retain a subset", kind)
 		}

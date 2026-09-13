@@ -366,7 +366,13 @@ func configDependencyMacroCallLex(text string, mode configDependencyMacroCallMod
 				i++
 			}
 			if i < len(text) && (text[i] == '"' || text[i] == '\'') {
-				return nil, fmt.Errorf("unsupported literal prefix")
+				// Only encoding/raw prefixes join the quote into one token.
+				// Ordinary identifiers remain separate even without whitespace:
+				// Linux stringification replacements use #op"("#x", "#y")".
+				switch text[start:i] {
+				case "L", "u", "U", "u8", "R", "LR", "uR", "UR", "u8R":
+					return nil, fmt.Errorf("unsupported literal prefix")
+				}
 			}
 			out = append(out, configDependencyMacroCallToken{text: text[start:i], identifier: true})
 		} else if text[i] == '"' || text[i] == '\'' {
@@ -388,6 +394,13 @@ func configDependencyMacroCallLex(text string, mode configDependencyMacroCallMod
 				return nil, fmt.Errorf("unterminated literal")
 			}
 			i++
+			if len(out) != 0 && out[len(out)-1].identifier && !white &&
+				i < len(text) && configDependencyMacroCallIdentifierStart(text[i]) {
+				// Do not newly admit ambiguous C++ user-defined literal suffixes
+				// through the identifier/literal adjacency path. Their expansion
+				// semantics are outside this language-neutral lexer subset.
+				return nil, fmt.Errorf("unsupported adjacent literal suffix")
+			}
 			out = append(out, configDependencyMacroCallToken{text: text[start:i]})
 		} else {
 			punct := ""

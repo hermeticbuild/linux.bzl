@@ -7,6 +7,7 @@ import (
 )
 
 const familyCompilerVariadicStage = "optional-variadic-grammar"
+const familyCompilerVariadicLookaheadStage = "optional-literal-variadic-grammar"
 
 // The kind carries one of two bounded source grammars, not a capability value.
 // Keeping them separate permits independent rejection and exact replay.
@@ -56,11 +57,22 @@ func (p *familyCompilerGuardPipeline) observeVariadicComma(value kconfig.ConfigD
 	ledger := p
 	var stage *familyCompilerGuardOptionalStage
 	if value.OptionalVariadicHints {
-		if p.variadicHints == nil {
-			p.variadicHints = &familyCompilerGuardOptionalStage{kind: familyCompilerVariadicStage,
+		destination, kind := &p.variadicHints, familyCompilerVariadicStage
+		if value.LiteralIncludeHints {
+			if p.variadicHints != nil && p.variadicHints.ledger.active[key] != nil {
+				return nil
+			}
+			destination, kind = &p.variadicLookahead, familyCompilerVariadicLookaheadStage
+		} else if p.variadicLookahead != nil {
+			// Promotion affects scheduling only. Accounting stays conservative;
+			// the weaker tier cannot consume another executable membership.
+			delete(p.variadicLookahead.ledger.active, key)
+		}
+		if *destination == nil {
+			*destination = &familyCompilerGuardOptionalStage{kind: kind,
 				ledger: familyCompilerGuardPipeline{active: map[string]*familyCompilerGuardQuery{}}}
 		}
-		stage = p.variadicHints
+		stage = *destination
 		if stage.disabled {
 			return nil
 		}

@@ -101,12 +101,17 @@ enum { MAPPED_LEFTMAPPED_RIGHT = 19 };
 #define MAPPED_PASTE(a, b) MAPPED_RAW_PASTE(a, b)
 const unsigned char mapped_fresh_paste = MAPPED_PASTE(MAPPED_LEFT, MAPPED_RIGHT);
 
+/* Linux minmax.h deliberately places stringification operands next to string
+ * literals without spaces. CONFIG names here are raw text, not macro reads. */
+#define MAPPED_DIAGNOSTIC(op, x, y) #op"("#x", "#y")"
+#define MAPPED_LABEL "left"
+const char mapped_adjacent_stringification[] = MAPPED_DIAGNOSTIC(min, CONFIG_USED_FAMILY_OPTION, CONFIG_UNUSED_FAMILY_OPTION);
+const char mapped_adjacent_literal[] = MAPPED_LABEL"right";
+
 /* Like Linux COUNT_ARGS, these macros have only a variadic formal. Supplied
  * raw tails preserve the comma even when expansion makes an argument empty.
  * Empty invocations below require separate measured dialect evidence. */
-#define MAPPED_ARG_COUNT(_0, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, N, ...) N
-#define MAPPED_COUNT_ARGS(...) MAPPED_ARG_COUNT(0, ##__VA_ARGS__, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
-#define MAPPED_NAMED_COUNT(args...) MAPPED_ARG_COUNT(0, ##args, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#include "include/linux/mapped_variadic.h"
 #define MAPPED_EMPTY
 const unsigned char mapped_variadic_populated = 47 + MAPPED_COUNT_ARGS(a, b);
 const unsigned char mapped_variadic_expanded_empty = 53 + MAPPED_COUNT_ARGS(MAPPED_EMPTY);

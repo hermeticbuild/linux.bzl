@@ -28,6 +28,13 @@ enum { MAPPED_LEFTMAPPED_RIGHT = 19 };
 #define MAPPED_PASTE(a, b) MAPPED_RAW_PASTE(a, b)
 const unsigned char measured_fresh_paste = MAPPED_PASTE(MAPPED_LEFT, MAPPED_RIGHT);
 
+/* Independently compiled adjacent preprocessing tokens, without consulting
+ * the dependency scanner's lexer or sharing its header definitions. */
+#define REFERENCE_DIAGNOSTIC(op, x, y) #op"("#x", "#y")"
+#define REFERENCE_LABEL "left"
+const char measured_adjacent_stringification[] = REFERENCE_DIAGNOSTIC(min, CONFIG_USED_FAMILY_OPTION, CONFIG_UNUSED_FAMILY_OPTION);
+const char measured_adjacent_literal[] = REFERENCE_LABEL"right";
+
 /* Independently compile the supplied-tail cases, including an argument which
  * expands to no tokens. No GCC/Clang-specific expected-result table is used. */
 #define MAPPED_ARG_COUNT(_0, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, N, ...) N

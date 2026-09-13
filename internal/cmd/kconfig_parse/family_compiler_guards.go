@@ -385,6 +385,7 @@ type familyCompilerGuardPipeline struct {
 	counterHints            *familyCompilerGuardOptionalStage
 	variadicHints           *familyCompilerGuardOptionalStage
 	literalHints            *familyCompilerGuardOptionalStage
+	variadicLookahead       *familyCompilerGuardOptionalStage
 	// Pending reservations are tier-local and never become compiler answers.
 	// Entries are inserted only after the existing context/name/byte limits pass.
 	pendingNames map[[32]byte]map[string]bool
@@ -454,8 +455,9 @@ func (index *familyCompilerGuardPriorityIndex) record(key string, query familyCo
 // bindings and frozen dependency closures survive finishVariant; no scope,
 // evaluator, source scanner or compiler facts are retained here.
 type familyCompilerGuardOptionalStage struct {
-	kind   string
-	ledger familyCompilerGuardPipeline
+	kind      string
+	ledger    familyCompilerGuardPipeline
+	consumers *familyCompilerHintConsumers
 	// One immutable DAG per tier; variants retain only their exact query roots.
 	// Repeated compiler contexts must not occupy the staging budget twice.
 	plan                 *kconfig.ProbePlan
@@ -672,7 +674,7 @@ func (p *familyCompilerGuardPipeline) prepareVariant(name string, scopes *kconfi
 		return err
 	}
 	metadata.SetCompilerGuardAnswers(answers)
-	for _, stage := range []*familyCompilerGuardOptionalStage{p.optional, p.tokenHints, p.counterHints, p.literalHints, p.variadicHints} {
+	for _, stage := range []*familyCompilerGuardOptionalStage{p.optional, p.tokenHints, p.counterHints, p.literalHints, p.variadicHints, p.variadicLookahead} {
 		if stage != nil && !stage.disabled {
 			stage.ledger.active = map[string]*familyCompilerGuardQuery{}
 			stage.ledger.known = p.known
@@ -793,7 +795,7 @@ func (p *familyCompilerGuardPipeline) observe(value kconfig.ConfigDependencyComp
 	}
 	if value.VariadicCommaSyntax != "" {
 		if len(value.Names) != 0 || len(value.Calls) != 0 || value.CounterCount != 0 || value.OptionalCounterHints ||
-			value.OptionalDefinedness || value.OptionalTokenHints || value.LiteralIncludeHints || value.Truncated {
+			value.OptionalDefinedness || value.OptionalTokenHints || value.LiteralIncludeHints && !value.OptionalVariadicHints || value.Truncated {
 			return fmt.Errorf("variadic grammar observation mixes query kinds")
 		}
 		if p.truncated {
@@ -844,6 +846,10 @@ func (p *familyCompilerGuardPipeline) observe(value kconfig.ConfigDependencyComp
 }
 
 func (p *familyCompilerGuardPipeline) observeDefinedness(value kconfig.ConfigDependencyCompilerGuardObservation) error {
+	return p.observeDefinednessWithConsumers(value, nil, "")
+}
+
+func (p *familyCompilerGuardPipeline) observeDefinednessWithConsumers(value kconfig.ConfigDependencyCompilerGuardObservation, consumers *familyCompilerHintConsumers, variant string) error {
 	query := familyCompilerGuardQuery{Scope: value.Scope, Role: value.Role, Language: value.Language, Arguments: value.Arguments, TranslationUnits: value.TranslationUnits, Environment: value.Environment}
 	if value.OptionalDefinedness {
 		if len(value.Names) == 0 {
@@ -868,6 +874,12 @@ func (p *familyCompilerGuardPipeline) observeDefinedness(value kconfig.ConfigDep
 	var pendingKey [32]byte
 	if optional {
 		pendingKey = familyCompilerGuardSchedulingKey(query)
+	}
+	// Count before name deduplication: repeated contexts may introduce no new
+	// names while still serving distinct compile consumers. This is scheduling
+	// evidence only, never a source dependency or compiler answer.
+	if consumers != nil {
+		consumers.observe(pendingKey, variant, value.ConsumerNodeID)
 	}
 	// A rejected prior vector must not reserve names before its exact-vector
 	// rejection is applied at finish. Fall back to original scheduling for its
@@ -983,6 +995,9 @@ func (p *familyCompilerGuardPipeline) finishVariant(name string, scopes *kconfig
 	if err := p.finishOptionalVariant(name, scopes, p.literalHints); err != nil {
 		return err
 	}
+	if err := p.finishOptionalVariant(name, scopes, p.variadicLookahead); err != nil {
+		return err
+	}
 	p.active, p.known = nil, nil
 	p.counterKnown = nil
 	p.rejected = nil
@@ -1031,6 +1046,10 @@ func (p *familyCompilerGuardPipeline) publish() error {
 			return err
 		}
 		p.literalHints = nil
+		if err := p.admitOptionalStage(p.variadicLookahead); err != nil {
+			return err
+		}
+		p.variadicLookahead = nil
 		if err := p.admitOptionalStage(p.counterHints); err != nil {
 			return err
 		}
@@ -1157,6 +1176,9 @@ func (p *familyCompilerGuardPipeline) observeOptionalStage(value kconfig.ConfigD
 			active: map[string]*familyCompilerGuardQuery{}, known: p.known, queryBytes: map[string]int{},
 			priority: p.priority,
 		}}
+		if value.OptionalTokenHints {
+			(*destination).consumers = &familyCompilerHintConsumers{}
+		}
 	}
 	stage := *destination
 	if stage.disabled {
@@ -1166,7 +1188,7 @@ func (p *familyCompilerGuardPipeline) observeOptionalStage(value kconfig.ConfigD
 		stage.disable("source_hint_limit")
 		return nil
 	}
-	if err := stage.ledger.observeDefinedness(value); err != nil {
+	if err := stage.ledger.observeDefinednessWithConsumers(value, stage.consumers, p.activeVariant); err != nil {
 		return err
 	}
 	if stage.ledger.truncated {
@@ -1188,6 +1210,7 @@ func (stage *familyCompilerGuardOptionalStage) disable(reason string) {
 	stage.ledger = familyCompilerGuardPipeline{}
 	stage.plan = nil
 	stage.variants = nil
+	stage.consumers = nil
 	stage.planBytes, stage.planNodes = 0, 0
 }
 
@@ -1319,7 +1342,8 @@ func (p *familyCompilerGuardPipeline) finishOptionalVariant(name string, scopes 
 
 // All optional tiers share the original cap, across all variants. Reconsider
 // them strongest-first whenever a later sibling adds work. Actual demands
-// precede grammar inventories, which precede speculative name/counter hints.
+// precede entered grammar inventories, then name hints, speculative grammar,
+// and counter hints. Literal grammar lookahead must not evict binding probes.
 // At most two grammar queries per compiler context can unblock calls hidden
 // behind unresolved conditions; waiting for the call itself can be too late
 // in the fixed discovery rounds. Priority supplies no grammar facts.
@@ -1327,7 +1351,7 @@ func (p *familyCompilerGuardPipeline) enforceOptionalStagingBudget() error {
 	bytes, nodes := 0, 0
 	// Counter prefetch must never evict any pre-existing hint tier, including
 	// literal lookahead. Spend only its residual storage and query capacity.
-	for _, stage := range []*familyCompilerGuardOptionalStage{p.optional, p.variadicHints, p.tokenHints, p.literalHints, p.counterHints} {
+	for _, stage := range []*familyCompilerGuardOptionalStage{p.optional, p.variadicHints, p.tokenHints, p.literalHints, p.variadicLookahead, p.counterHints} {
 		if stage == nil || stage.disabled {
 			continue
 		}

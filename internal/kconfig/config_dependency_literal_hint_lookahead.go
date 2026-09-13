@@ -192,6 +192,18 @@ func (s *configDependencyClosureScanner) emitCompilerLiteralIncludeHintLookahead
 			if len(names) != 0 {
 				observe(probe, file, configDependencyCompilerGuardHints{names: names, optionalTokenHints: true, literalIncludeHints: true}, syntax.compilerGuardContentID)
 			}
+			// The same complete immutable candidate can reveal compiler grammar
+			// needed only after an earlier unknown binding is measured. This
+			// emits a weak query, never an expansion demand or a read receipt.
+			// Reuse the existing parse and charge the full candidate inventory
+			// above even when it contains no new name hints.
+			if s.compilerVariadicHint != nil && syntax.compilerGuardHintsReady && !syntax.compilerGuardHints.truncated {
+				for index, spelling := range []string{"standard", "named"} {
+					if syntax.compilerGuardHints.variadicMentions[index] {
+						s.compilerVariadicHint(file, syntax.compilerGuardContentID, spelling, true)
+					}
+				}
+			}
 			queue = append(queue, candidate{file, syntax.conditionalProgram})
 		}
 	}

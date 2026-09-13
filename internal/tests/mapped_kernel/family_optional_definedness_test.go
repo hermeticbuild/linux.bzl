@@ -347,6 +347,55 @@ func TestFamilyVariadicCommaGrammarUsesActualCompiler(t *testing.T) {
 	t.Logf("variadic grammar verified against %s", got.CompilerVersion)
 }
 
+func TestFamilyVariadicLookaheadSchedulesBeforeHeaderReplay(t *testing.T) {
+	manifests := strings.Fields(os.Getenv("FAMILY_SMOKE_COMPILER_GUARDS"))
+	if len(manifests) != 3 {
+		t.Fatal("expected the unchanged three-round pipeline")
+	}
+	filename, err := runfiles.Rlocation(manifests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		Schema    string
+		Truncated bool
+		Strings   []string
+		Contexts  map[string]struct {
+			Scope, Role, Language string
+			Arguments             []int
+		}
+		Variants map[string][]struct{ Context, Kind string }
+	}
+	readHelperJSON(t, filename, &manifest)
+	if manifest.Schema != "linux-kbuild-compiler-guards-v5" || manifest.Truncated {
+		t.Fatal("invalid initial supplemental compiler frontier")
+	}
+	for _, variant := range []string{"base", "irrelevant", "relevant"} {
+		seen := map[string]bool{}
+		for _, query := range manifest.Variants[variant] {
+			context, exists := manifest.Contexts[query.Context]
+			if !exists {
+				t.Fatal("dangling grammar context")
+			}
+			arguments := compilerGuardStrings(t, manifest.Strings, context.Arguments)
+			if context.Scope != "target" || context.Role != "cc" || context.Language != "c" ||
+				!slices.ContainsFunc(arguments, func(arg string) bool { return strings.HasPrefix(arg, "-DMAPPED_OBJECT_FILE=") }) {
+				continue
+			}
+			seen[query.Kind] = true
+		}
+		if !seen["variadic-comma-standard"] || !seen["variadic-comma-named"] {
+			t.Errorf("%s did not schedule both later-header grammar queries in the first round", variant)
+		}
+	}
+	// Existing fixture tests independently compare the emitted object bytes,
+	// empty-argument CONFIG selection and compiler grammar. Retain precise
+	// sharing/invalidation too: finding queries alone is not a successful build.
+	var report reuseReport
+	readHelperJSON(t, runfileFromEnv(t, "FAMILY_SMOKE_REUSE_REPORT"), &report)
+	assertCompilerOutputSharing(t, report, "smoke.o")
+}
+
 func TestFamilyConfigMacroWritesPreserveCompilerDiagnostics(t *testing.T) {
 	var got struct {
 		CompilerVersion string                      `json:"compiler_version"`

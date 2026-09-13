@@ -106,6 +106,8 @@ func TestFamilyCompilerVariadicRejectsMixedPayload(t *testing.T) {
 		{Language: "c", VariadicCommaSyntax: "standard", Names: []string{"__A"}},
 		{Language: "c", VariadicCommaSyntax: "standard", OptionalTokenHints: true},
 		{Language: "c", VariadicCommaSyntax: "standard", CounterCount: 1},
+		{Language: "c", VariadicCommaSyntax: "standard", LiteralIncludeHints: true},
+		{Language: "c", VariadicCommaSyntax: "standard", OptionalVariadicHints: true, LiteralIncludeHints: true, OptionalTokenHints: true},
 		{Language: "assembler-with-cpp", VariadicCommaSyntax: "standard"},
 	} {
 		if err := p.observe(value); err == nil {
@@ -278,6 +280,66 @@ func TestFamilyCompilerVariadicHintStagingPriority(t *testing.T) {
 	}
 }
 
+func TestFamilyCompilerVariadicLookaheadPreservesLiteralCapacity(t *testing.T) {
+	for _, pressure := range []string{"none", "publication", "staging"} {
+		t.Run(pressure, func(t *testing.T) {
+			toolsets := familyCompilerGuardPlanForTest(t).Toolsets
+			flags, _ := familyCompilerGuardFlagsForTest(t, "guards", 0)
+			p, err := newFamilyCompilerGuardPipeline(&flags, nil, []familyPlanVariantRequest{{name: "base"}}, toolsets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			scopes := familyCompilerGuardCarryScopesForTest(t, toolsets)
+			if err := p.prepareVariant("base", scopes, &kconfig.CompactMetadata{}); err != nil {
+				t.Fatal(err)
+			}
+			for _, value := range []kconfig.ConfigDependencyCompilerGuardObservation{
+				{Scope: "target", Role: "cc", Language: "c", OptionalVariadicHints: true, LiteralIncludeHints: true, VariadicCommaSyntax: "named"},
+				{Scope: "target", Role: "cc", Language: "c", OptionalTokenHints: true, LiteralIncludeHints: true, Names: []string{"__BINDING"}},
+			} {
+				if err := p.observe(value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := p.finishVariant("base", scopes); err != nil {
+				t.Fatal(err)
+			}
+			if pressure == "staging" {
+				// A later sibling leaves exactly the existing binding plan's
+				// storage. Speculative grammar must not evict that plan.
+				p.optional = &familyCompilerGuardOptionalStage{planBytes: maxFamilyCompilerGuardBytes/2 - p.literalHints.planBytes}
+				if err := p.enforceOptionalStagingBudget(); err != nil {
+					t.Fatal(err)
+				}
+				if p.literalHints.disabled {
+					t.Fatal("lookahead grammar evicted literal binding probes")
+				}
+			}
+			if pressure == "publication" {
+				p.count = maxFamilyCompilerGuardMemberships - 1
+			}
+			if err := p.publish(); err != nil {
+				t.Fatal(err)
+			}
+			manifest, _, err := readFamilyCompilerGuardManifest(flags.manifestOut)
+			if err != nil {
+				t.Fatal(err)
+			}
+			kinds := map[string]int{}
+			for _, q := range manifest.Variants["base"] {
+				kinds[q.Kind]++
+			}
+			wantGrammar := 0
+			if pressure == "none" {
+				wantGrammar = 1
+			}
+			if p.truncated || kinds[familyCompilerLiteralHintQueryKind] != 1 || kinds["variadic-comma-named"] != wantGrammar || len(manifest.Variants["base"]) != 1+wantGrammar {
+				t.Fatalf("lookahead displaced binding probes or disappeared without pressure: %v", kinds)
+			}
+		})
+	}
+}
+
 func TestFamilyCompilerVariadicHintPublicationPriority(t *testing.T) {
 	toolsets := familyCompilerGuardPlanForTest(t).Toolsets
 	flags, _ := familyCompilerGuardFlagsForTest(t, "guards", 0)
@@ -322,5 +384,56 @@ func TestFamilyCompilerVariadicHintPublicationPriority(t *testing.T) {
 	plan, err := kconfig.ReadProbePlan(flags.planOut)
 	if err != nil || len(plan.Nodes) != 2 {
 		t.Fatal("publication lost exact executable membership", err)
+	}
+}
+
+func TestFamilyCompilerVariadicLookaheadPromotionDeduplicates(t *testing.T) {
+	// 0 = literal candidate, 1 = entered definition, 2 = reached expansion.
+	for _, order := range [][]int{{0, 1}, {1, 0}, {0, 2}, {2, 0}, {0, 1, 2}, {2, 1, 0}} {
+		toolsets := familyCompilerGuardPlanForTest(t).Toolsets
+		flags, _ := familyCompilerGuardFlagsForTest(t, "guards", 0)
+		p, err := newFamilyCompilerGuardPipeline(&flags, nil, []familyPlanVariantRequest{{name: "base"}, {name: "overlay"}}, toolsets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, variant := range []string{"base", "overlay"} {
+			scopes := familyCompilerGuardCarryScopesForTest(t, toolsets)
+			if err := p.prepareVariant(variant, scopes, &kconfig.CompactMetadata{}); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				for _, strength := range order {
+					if err := p.observe(kconfig.ConfigDependencyCompilerGuardObservation{
+						Scope: "target", Role: "cc", Language: "c", VariadicCommaSyntax: "named",
+						OptionalVariadicHints: strength != 2, LiteralIncludeHints: strength == 0,
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := p.finishVariant(variant, scopes); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := p.publish(); err != nil {
+			t.Fatal(err)
+		}
+		manifest, _, err := readFamilyCompilerGuardManifest(flags.manifestOut)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.truncated || p.count != 2 || p.callCount != 2 || len(p.contexts) != 1 {
+			t.Fatalf("promotion order %v lost deduplication or variant membership", order)
+		}
+		for _, variant := range []string{"base", "overlay"} {
+			queries := manifest.Variants[variant]
+			if len(queries) != 1 || queries[0].Kind != "variadic-comma-named" {
+				t.Fatalf("order %v duplicated %s queries", order, variant)
+			}
+		}
+		plan, err := kconfig.ReadProbePlan(flags.planOut)
+		if err != nil || len(plan.Terminal) != 1 {
+			t.Fatal("promotion duplicated executable grammar attempt", err)
+		}
 	}
 }

@@ -103,6 +103,44 @@ func TestConfigDependencyMacroCallArityBoundary(t *testing.T) {
 	}
 }
 
+func TestConfigDependencyMacroCallAdjacentStringification(t *testing.T) {
+	// Linux minmax.h uses #op"("#x", "#y")" without separating spaces.
+	// Non-prefix identifiers remain separate preprocessing tokens; raw
+	// stringification must not expand the CONFIG arguments.
+	catalog, err := configDependencyMacroCallFixtureCatalogForTest(
+		`F(op,x,y) #op"("#x", "#y")"`,
+		`LABEL "left"`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		input  string
+		tokens []string
+	}{
+		{`F(min,CONFIG_ONE,CONFIG_TWO)`, []string{`"min"`, `"("`, `"CONFIG_ONE"`, `", "`, `"CONFIG_TWO"`, `")"`}},
+		{`LABEL"right"`, []string{`"left"`, `"right"`}},
+		{`word'c'`, []string{`word`, `'c'`}},
+		{`u8Name"text"`, []string{`u8Name`, `"text"`}},
+	} {
+		result, err := configDependencyMacroCallFixtureExpandForTest(catalog, tc.input)
+		if err != nil || !slices.Equal(result.Tokens, tc.tokens) || len(result.ConfigReads) != 0 {
+			t.Fatalf("adjacent tokens changed raw expansion: %#v, %v", result, err)
+		}
+	}
+	for _, input := range []string{
+		`L"wide"`, `u"unicode"`, `U'c'`, `u8"utf8"`, `R"(raw)"`,
+		`LR"(raw)"`, `uR"(raw)"`, `UR"(raw)"`, `u8R"(raw)"`,
+		`LABEL"text"_suffix`, `LABEL'c'_suffix`, `LABEL"text"suffix`,
+		`LABEL"unterminated`,
+	} {
+		result, err := configDependencyMacroCallFixtureExpandForTest(catalog, "CONFIG_PREFIX "+input)
+		if err == nil || !reflect.DeepEqual(result, configDependencyMacroCallResult{}) {
+			t.Fatalf("unsupported literal spelling published a partial proof: %q: %#v, %v", input, result, err)
+		}
+	}
+}
+
 const linuxShapeCounterHelperForTest = "__COUNT_ARGS(_0,_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11,_12,_13,_14,_15,_n,X...) _n"
 const linuxShapeCounterForTest = "COUNT_ARGS(X...) __COUNT_ARGS(,##X,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0)"
 

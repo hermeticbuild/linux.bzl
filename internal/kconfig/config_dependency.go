@@ -3341,7 +3341,7 @@ type configDependencyClosureScanner struct {
 	compilerIntrinsicAnswered         func(CompilerIntrinsicCall) (bool, error)
 	compilerCounterInitialAvailable   bool
 	compilerCounterHint               func(configDependencyScanFile, string)
-	compilerVariadicHint              func(configDependencyScanFile, string, string)
+	compilerVariadicHint              func(configDependencyScanFile, string, string, bool)
 
 	sourceLookup           configDependencySourceLookup
 	language               string

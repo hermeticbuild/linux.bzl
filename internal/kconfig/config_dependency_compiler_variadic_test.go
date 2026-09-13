@@ -94,6 +94,75 @@ func TestConfigDependencyVariadicCommaHintIsSyntaxOnly(t *testing.T) {
 	}
 }
 
+func TestCompilerVariadicLiteralLookaheadDoesNotProveSource(t *testing.T) {
+	const pathname = "drivers/example/driver.c"
+	plan, node := compilerGuardObservationPlanForTest(t, map[string]string{
+		pathname:              "#define PICK(x) CONFIG_ ## x\nPICK(PREFIX)\n#include <first.h>\n#include <later.h>\n",
+		"include/first.h":     "__FIRST_HEADER\n",
+		"include/later.h":     "#define CLOBBERS(tail...) \"memory\", ##tail\nCLOBBERS()\n",
+		"include/unrelated.h": "#define UNUSED(...) 17, ##__VA_ARGS__\n",
+	}, []string{"-nostdinc", "-I${tree:kernel}/include", "-c", pathname})
+	baseline, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
+	if err != nil || !baseline.Opaque || !strings.Contains(baseline.Reason, "__FIRST_HEADER") {
+		t.Fatalf("fixture did not stop before the grammar header: %#v, %v", baseline, err)
+	}
+	context := newConfigDependencyAnalysisContext(plan)
+	for range 2 {
+		hints := 0
+		plan.metadata.SetCompilerGuardObserver(func(value ConfigDependencyCompilerGuardObservation) error {
+			if value.VariadicCommaSyntax == "" {
+				return nil
+			}
+			if value.VariadicCommaSyntax != "named" || !value.OptionalVariadicHints ||
+				!value.Origin.Source || value.Origin.LogicalPath != "include/later.h" || len(value.Origin.ContentID) != 64 ||
+				len(value.Names)+len(value.Calls) != 0 || value.OptionalTokenHints || !value.LiteralIncludeHints ||
+				value.OptionalDefinedness || value.CounterCount != 0 || value.Truncated {
+				t.Fatalf("lookahead grammar lost its bounded hint-only origin: %#v", value)
+			}
+			hints++
+			return nil
+		})
+		got, err := analyzeActionPlanNodeConfigDependencies(plan, node, context)
+		if err != nil || !reflect.DeepEqual(got, baseline) {
+			t.Fatalf("grammar hint changed the current source proof: %#v != %#v, %v", got, baseline, err)
+		}
+		if hints != 1 {
+			t.Fatalf("got %d grammar hints before reaching the header, want one", hints)
+		}
+	}
+	plan.metadata.SetCompilerGuardObserver(nil)
+	plan.metadata.SetCompilerGuardAnswers(configDependencyGuardAnswersForTest(t, plan, node, []string{"__FIRST_HEADER"}, false))
+	got, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
+	if err != nil || !got.Opaque || !strings.Contains(got.Reason, "variadic comma deletion") || len(got.Symbols) != 0 {
+		t.Fatalf("unmeasured lookahead grammar granted a source proof: %#v, %v", got, err)
+	}
+}
+
+func TestCompilerVariadicLookaheadPromotionPreservesStrength(t *testing.T) {
+	for _, order := range [][]bool{{true, true, false, false, true}, {false, true, false}} {
+		plan, node := compilerGuardObservationPlanForTest(t, map[string]string{"drivers/example/driver.c": ""}, nil)
+		s := &configDependencyClosureScanner{collectCompilerGuards: true}
+		var literal []bool
+		s.configureCompilerVariadicQueries(plan, node, "cc", configDependencyCompilerPredefineProbe{language: "c"},
+			func(_ configDependencyCompilerPredefineProbe, _ configDependencyScanFile, hints configDependencyCompilerGuardHints, _ string) {
+				if !hints.optionalVariadicHints || hints.variadicSyntax != "named" {
+					t.Fatal("hint changed grammar demand kind")
+				}
+				literal = append(literal, hints.literalIncludeHints)
+			})
+		for _, candidate := range order {
+			s.compilerVariadicHint(configDependencyScanFile{}, "immutable-content", "named", candidate)
+		}
+		want := []bool{false}
+		if order[0] {
+			want = []bool{true, false}
+		}
+		if !slices.Equal(literal, want) {
+			t.Fatalf("order %v emitted strengths %v, want %v", order, literal, want)
+		}
+	}
+}
+
 func TestConfigDependencyVariadicGrammarCannotBorrowDefinednessOnlyCache(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "drivers/example/driver.c", "#if CONFIG_USED\n#endif\n")

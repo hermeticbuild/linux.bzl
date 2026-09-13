@@ -766,14 +766,19 @@ func TestFamilyVariantImagesAreActuallyBuilt(t *testing.T) {
 			t.Logf("%s actual compiler %s: %d", variant.name, name, got)
 		}
 		for name, spelling := range map[string]string{
-			"alias_prescan": "MAPPED_RESCAN_F(3)",
-			"disabled_tail": "marker MAPPED_RESCAN_FOO(2)",
+			"alias_prescan":            "MAPPED_RESCAN_F(3)",
+			"disabled_tail":            "marker MAPPED_RESCAN_FOO(2)",
+			"adjacent_stringification": "min(CONFIG_USED_FAMILY_OPTION, CONFIG_UNUSED_FAMILY_OPTION)",
+			"adjacent_literal":         "leftright",
 		} {
 			size := uint64(len(spelling) + 1)
 			got := compiledObjectSymbolBytes(t, variant.image, "mapped_"+name, size)
 			want := compiledObjectSymbolBytes(t, measurementObject, "measured_"+name, size)
 			if !bytes.Equal(got, want) {
 				t.Errorf("%s %s = %q, independent compiler = %q", variant.name, name, got, want)
+			}
+			if strings.HasPrefix(name, "adjacent_") && !bytes.Equal(got, append([]byte(spelling), 0)) {
+				t.Errorf("%s %s emitted unexpected string %q", variant.name, name, got)
 			}
 		}
 		dispatchConfig := byte(103)

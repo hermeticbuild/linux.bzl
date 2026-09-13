@@ -65,11 +65,20 @@ func (s *configDependencyClosureScanner) configureCompilerVariadicQueries(
 		}
 	}
 	if s.collectCompilerGuards && observe != nil {
-		s.compilerVariadicHint = func(file configDependencyScanFile, contentID, syntax string) {
-			if _, answered := answers[syntax]; answered || reasons[syntax] != "" {
+		hinted := map[string]int{}
+		s.compilerVariadicHint = func(file configDependencyScanFile, contentID, syntax string, literal bool) {
+			strength := 2
+			if literal {
+				strength = 1
+			}
+			if _, answered := answers[syntax]; answered || reasons[syntax] != "" || hinted[syntax] >= strength {
 				return
 			}
-			observe(probe, file, configDependencyCompilerGuardHints{variadicSyntax: syntax, optionalVariadicHints: true}, contentID)
+			// A subsequently entered definition upgrades an earlier speculative
+			// hint. At most one observation per syntax and strength; neither
+			// grants facts, and actual expansions retain their own demand.
+			hinted[syntax] = strength
+			observe(probe, file, configDependencyCompilerGuardHints{variadicSyntax: syntax, optionalVariadicHints: true, literalIncludeHints: literal}, contentID)
 		}
 	}
 	if s.callCoverage == nil {

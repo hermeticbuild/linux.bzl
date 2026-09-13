@@ -908,6 +908,10 @@ function name consume following invocation tokens, including Linux's pasted,
 argument-counted dispatch helpers. Pasting creates a fresh token; argument
 prescan cannot borrow tokens after its own invocation. Calls spanning separate
 preprocessing events remain unsupported. No successful prefix grants reuse.
+Ordinary identifiers adjacent to quoted literals remain separate preprocessing
+tokens, including Linux-style `#op"("#x", "#y")"` stringification. Raw CONFIG
+arguments remain text rather than expansion reads. Encoding/raw prefixes and
+ambiguous suffixes on this adjacency path remain outside the supported subset.
 Empty invocations of variadic-only comma-paste macros use separate execution
 measurements for standard and GNU-named syntax, with the selected compiler's
 original language flags, macro definitions, environment and toolset. Successful
@@ -916,10 +920,17 @@ grammar fact. Queries triggered by actual expansion share the bounded demand
 frontier with counter and intrinsic queries. Definition inventories remain
 lower-priority optional hints: discarding them cannot erase an actual demand,
 and an identical demand and hint share one attempt. Within optional staging,
-actual demands precede the bounded two-syntax grammar inventory, followed by
-entered-file names, literal-include names, and counter prefetch. This lets a
+actual demands precede entered-file grammar inventories, followed by
+entered-file names, literal-include names, speculative grammar, and counter prefetch. This lets a
 grammar measurement arrive before a later condition exposes its first call;
-all tiers still share the same storage and publication limits.
+all tiers still share the same storage and publication limits. Grammar hints
+also use the existing bounded literal-include lookahead: a complete immutable
+candidate may request either syntax before it is reached, but never supplies
+a source-read receipt or grammar answer. Speculative grammar cannot evict
+binding probes. Entering a previously hinted header promotes its grammar query;
+each consumer emits at most one hint per syntax and strength, and promotion
+retains one executable attempt per context. Candidate reads and inventories remain
+charged against the unchanged work budget.
 Complete expansion records the measured grammar
 witness, and the older definedness-only completed-proof cache cannot reuse it.
 The GCC/Clang fixture compares C11 and GNU11 probes with independent compiler
@@ -949,15 +960,20 @@ These are hints for future compiler measurements,
 not expansion reads or assumed negative answers. Their optional query vectors
 are separate from actual first-unknown demands and exclude higher-priority
 names. All configs' existing queries and expansion demands are admitted before
-grammar inventories, entered-file token hints, speculative literal-include
-hints, then counter-value hints use the remaining fixed frontier capacity.
+entered-file grammar inventories, entered-file token hints, literal-include
+name hints, speculative grammar, then counter-value hints use the remaining fixed frontier capacity.
 These optional tiers have separate query
 vectors and staging ledgers; their retained plans share the original size and
 node limits. A later config's stronger work may evict speculative hints, never
 the reverse. Each tier retains one shared immutable probe graph across configs,
 so identical dependency closures consume its staging budget only once. Each
-weak tier retains a bounded canonical prefix of complete query closures when
-storage fills, rather than discarding an entire otherwise usable tier. Name
+weak tier retains a bounded prefix of complete query closures when storage
+fills. Entered-file and literal-include hints prefer compiler-context classes
+with more distinct compile consumers, with canonical root IDs breaking ties.
+Repeated header visits cannot inflate counts. This private index retains only
+bounded hashes (at most 32,768 consumer memberships and 8,192 classes per tier);
+missing identities or overflow discard scores and restore canonical ordering.
+Ranking changes no compiler facts, query vectors or tier priorities. Name
 vectors remain indivisible: partial vectors would change compiler rejection
 semantics. Dropped queries and their private dependencies are not published.
 Each config keeps its original allowed terminals; selecting its admitted work cannot
