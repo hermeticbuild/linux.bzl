@@ -136,6 +136,40 @@ func (q *actionPlanProducerTraversal) producers(node ActionPlanNode) ([]string, 
 	return producers, nil
 }
 
+// descendsFrom preserves the producer DFS's reverse-stack order and early
+// ancestor match, including references to missing nodes. Visit tracking uses
+// existing immutable node ordinals, packed into sparse 64-node words. Unlike a
+// dense plan-sized bitmap, storage grows only with the blocks actually reached.
+// This is per-query visitation, not a retained reachability or absence proof.
+func (q *actionPlanProducerTraversal) descendsFrom(descendant, ancestor string) (bool, error) {
+	q.plan.ensureNodeLookupIndexes()
+	pending := []string{descendant}
+	seen := map[uint32]uint64{}
+	for len(pending) != 0 {
+		last := len(pending) - 1
+		producer := pending[last]
+		pending = pending[:last]
+		if producer == ancestor {
+			return true, nil
+		}
+		index, ok := q.plan.nodeIndexesByID[producer]
+		if !ok {
+			continue
+		}
+		word, bit := index/64, uint64(1)<<(index%64)
+		if seen[word]&bit != 0 {
+			continue
+		}
+		seen[word] |= bit
+		producers, err := q.producers(q.plan.Nodes[index])
+		if err != nil {
+			return false, err
+		}
+		pending = append(pending, producers...)
+	}
+	return false, nil
+}
+
 // validateAndEncodeActionPlanInputSets checks the complete serialized store,
 // validates every provenance edge in each consumer's stage, and emits the
 // path-only marker graph understood by map_directory. The manifest is the

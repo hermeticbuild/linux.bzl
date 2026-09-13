@@ -169,6 +169,7 @@ go_test(
         "action_plan_lookup_test.go",
         "action_plan_output_test.go",
         "action_plan_probe_workload_test.go",
+        "action_plan_producer_lineage_test.go",
         "action_plan_snapshot_scale_test.go",
         "action_plan_working_tree_topology_test.go",
         "action_recipe_clone_test.go",

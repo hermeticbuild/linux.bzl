@@ -1591,33 +1591,13 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildWorkingTreeClosureInputsFrom
 		if result, ok := lineage[key]; ok {
 			return result
 		}
-		pending := []string{descendant}
-		seen := map[string]bool{}
-		for len(pending) != 0 {
-			last := len(pending) - 1
-			producer := pending[last]
-			pending = pending[:last]
-			if producer == ancestor {
-				lineage[key] = true
-				return true
-			}
-			if seen[producer] {
-				continue
-			}
-			seen[producer] = true
-			node, ok := b.plan.nodesByID[producer]
-			if !ok {
-				continue
-			}
-			producers, err := producerTraversal.producers(node)
-			if err != nil {
-				lineageInputErr = err
-				return false
-			}
-			pending = append(pending, producers...)
+		result, err := producerTraversal.descendsFrom(descendant, ancestor)
+		if err != nil {
+			lineageInputErr = err
+			return false
 		}
-		lineage[key] = false
-		return false
+		lineage[key] = result
+		return result
 	}
 	// A selected invocation can start from one version of a pathname and then
 	// select another writer for that same pathname. Those versions need not be
