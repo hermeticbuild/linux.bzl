@@ -747,13 +747,23 @@ func TestFamilyVariantImagesAreActuallyBuilt(t *testing.T) {
 		if got := compiledObjectSymbolByte(t, variant.image, "mapped_fresh_paste"); got != freshPaste {
 			t.Errorf("%s fresh paste byte = %d, independent compiler measurement = %d", variant.name, got, freshPaste)
 		}
-		for _, name := range []string{"counter_first", "counter_condition", "counter_last"} {
+		for _, name := range []string{
+			"counter_first", "counter_condition", "counter_last",
+			"variadic_populated", "variadic_expanded_empty", "variadic_separator", "variadic_named", "variadic_condition",
+		} {
 			got := compiledObjectSymbolByte(t, variant.image, "mapped_"+name)
 			want := compiledObjectSymbolByte(t, measurementObject, "measured_"+name)
 			if got != want {
 				t.Errorf("%s %s byte = %d, independent compiler measurement = %d", variant.name, name, got, want)
 			}
 			t.Logf("%s actual compiler %s: %d", variant.name, name, got)
+		}
+		variadicConfig := byte(79)
+		if compiledObjectSymbolByte(t, measurementObject, "measured_variadic_condition") == 67 {
+			variadicConfig = byte(71 + variant.value[0] - '0')
+		}
+		if got := compiledObjectSymbolByte(t, variant.image, "mapped_variadic_config"); got != variadicConfig {
+			t.Errorf("%s supplied-tail CONFIG branch = %d, independent compiler/config require %d", variant.name, got, variadicConfig)
 		}
 		// These mixed calls belong to smoke.c's one exact compiler invocation.
 		// Compare C expressions and source-wrapper #if branches with an actual

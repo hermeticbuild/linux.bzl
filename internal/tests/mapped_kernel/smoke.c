@@ -100,6 +100,29 @@ enum { MAPPED_LEFTMAPPED_RIGHT = 19 };
 #define MAPPED_PASTE(a, b) MAPPED_RAW_PASTE(a, b)
 const unsigned char mapped_fresh_paste = MAPPED_PASTE(MAPPED_LEFT, MAPPED_RIGHT);
 
+/* Like Linux COUNT_ARGS, these macros have only a variadic formal. Supplied
+ * raw tails preserve the comma even when expansion makes an argument empty.
+ * Do not include COUNT_ARGS(): that case requires separate dialect evidence. */
+#define MAPPED_ARG_COUNT(_0, _1, _2, N, ...) N
+#define MAPPED_COUNT_ARGS(...) MAPPED_ARG_COUNT(0, ##__VA_ARGS__, 2, 1, 0)
+#define MAPPED_NAMED_COUNT(args...) MAPPED_ARG_COUNT(0, ##args, 2, 1, 0)
+#define MAPPED_EMPTY
+const unsigned char mapped_variadic_populated = 47 + MAPPED_COUNT_ARGS(a, b);
+const unsigned char mapped_variadic_expanded_empty = 53 + MAPPED_COUNT_ARGS(MAPPED_EMPTY);
+const unsigned char mapped_variadic_separator = 59 + MAPPED_COUNT_ARGS(,);
+const unsigned char mapped_variadic_named = 61 + MAPPED_NAMED_COUNT(a, b);
+#if MAPPED_COUNT_ARGS(a, b) == 2 && MAPPED_COUNT_ARGS(MAPPED_EMPTY) == 1 && MAPPED_COUNT_ARGS(,) == 2 && MAPPED_NAMED_COUNT(a, b) == 2
+const unsigned char mapped_variadic_condition = 67;
+#if MAPPED_OPTION(USED_FAMILY_OPTION)
+const unsigned char mapped_variadic_config = 72;
+#else
+const unsigned char mapped_variadic_config = 71;
+#endif
+#else
+const unsigned char mapped_variadic_condition = 68;
+const unsigned char mapped_variadic_config = 79;
+#endif
+
 int mapped_kernel_smoke(void) {
 	return MAPPED_FAMILY_GENERATED_VALUE;
 }

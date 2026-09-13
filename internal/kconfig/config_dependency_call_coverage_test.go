@@ -59,6 +59,49 @@ func TestConfigDependencyCallCoveragePragmaExpansionOrder(t *testing.T) {
 	}
 }
 
+func TestConfigDependencyCallCoverageOnlyVariadicSuppliedTail(t *testing.T) {
+	for _, named := range []bool{false, true} {
+		for _, tc := range []struct {
+			call, count string
+			opaque      bool
+		}{
+			{"COUNT(a,b)", "2", false},
+			{"COUNT(EMPTY)", "1", false},
+			{"COUNT(,)", "2", false},
+			{"COUNT()", "0", true},
+		} {
+			t.Run(fmt.Sprintf("named-%t/%s", named, tc.call), func(t *testing.T) {
+				formal, tail := "...", "__VA_ARGS__"
+				if named {
+					formal, tail = "args...", "args"
+				}
+				plan, node := configDependencyCompilePlanForTest(t, map[string]string{
+					"drivers/example/driver.c": "#define PICK(x) CONFIG_ ## x\n#include <count.h>\nPICK(PREFIX)\n#if " + tc.call + " == " + tc.count + "\nPICK(SELECTED)\n#else\nPICK(WRONG)\n#endif\n",
+					"include/count.h":          "#define ARG_COUNT(_0,_1,_2,N,...) N\n#define COUNT(" + formal + ") ARG_COUNT(0,##" + tail + ",2,1,0)\n#define EMPTY\n",
+				}, []string{"-nostdinc", "-I${tree:kernel}/include", "-c", "drivers/example/driver.c"}, nil)
+				configDependencySetCompilerContractForTest(plan, node, CompactKbuildActionContract{})
+				plan.metadata.compilerPredefines = func(_, _, _ string, _, _ []string, _ map[string]string) (string, bool, error) {
+					return "", true, nil
+				}
+				context := newConfigDependencyAnalysisContext(plan)
+				for range 2 {
+					set, err := analyzeActionPlanNodeConfigDependencies(plan, node, context)
+					if err != nil || set.Opaque != tc.opaque {
+						t.Fatalf("source-call proof: %#v, %v", set, err)
+					}
+					if tc.opaque {
+						if !strings.Contains(set.Reason, "dialect-dependent variadic comma deletion") || len(set.Symbols)+len(set.SourcePaths)+len(set.ObjectPaths) != 0 {
+							t.Fatalf("ambiguous empty tail published a partial proof: %#v", set)
+						}
+					} else if !slices.Equal(set.Symbols, []string{"CONFIG_PREFIX", "CONFIG_SELECTED"}) || !slices.Equal(set.SourcePaths, []string{"drivers/example/driver.c", "include/count.h"}) {
+						t.Fatalf("supplied-tail condition lost exact source/config reads: %#v", set)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestConfigDependencyCallCoverageStringificationReadsThroughProductionScanner(t *testing.T) {
 	for _, paste := range []bool{false, true} {
 		for _, enabled := range []bool{false, true} {

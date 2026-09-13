@@ -541,7 +541,7 @@ func TestConfigDependencyMacroCallEffectsAndUnknownsFailClosed(t *testing.T) {
 }
 
 func TestConfigDependencyMacroCallUnsupportedGrammarAndBudgets(t *testing.T) {
-	for _, definition := range []string{"F(...) ,##__VA_ARGS__", "F(x,x) x", "F(x) #not_a_formal", "F(x,y,z) x##y##z", "F(x) x/* comment"} {
+	for _, definition := range []string{"F(x,x) x", "F(x) #not_a_formal", "F(x,y,z) x##y##z", "F(x) x/* comment"} {
 		if _, err := configDependencyMacroCallFixtureCatalogForTest(definition); err == nil {
 			t.Fatalf("accepted unsupported definition %q", definition)
 		}
@@ -645,6 +645,11 @@ func TestConfigDependencyMacroCallVariadicExpansion(t *testing.T) {
 		{"gnu config rescan", []string{"F(x,...) x,##__VA_ARGS__", "CONFIG_A 3"}, "F(0,CONFIG_A)", "0 , 3", []string{"CONFIG_A"}},
 		{"gnu nested other callee", []string{"F(x,...) x,##__VA_ARGS__", "ID(x) x"}, "F(0,ID(2))", "0 , 2", nil},
 		{"gnu callee supplied", []string{"F(x,...) x,##__VA_ARGS__", "CALL(f) f(1)", "ID(x) x"}, "F(0,CALL(ID))", "0 , 1", nil},
+		{"only variadic populated", []string{"F(...) 0,##__VA_ARGS__"}, "F(1,2)", "0 , 1 , 2", nil},
+		{"only named variadic", []string{"F(args...) 0,##args"}, "F(1,2)", "0 , 1 , 2", nil},
+		{"only variadic expanded empty", []string{"F(...) 0,##__VA_ARGS__", "EMPTY"}, "F(EMPTY)", "0 ,", nil},
+		{"only variadic empty pair", []string{"F(...) 0,##__VA_ARGS__"}, "F(,)", "0 , ,", nil},
+		{"only variadic config rescan", []string{"F(...) 0,##__VA_ARGS__", "CONFIG_A 3"}, "F(CONFIG_A)", "0 , 3", []string{"CONFIG_A"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, err := configDependencyMacroCallFixtureCatalogForTest(tc.defs...)
@@ -661,7 +666,7 @@ func TestConfigDependencyMacroCallVariadicExpansion(t *testing.T) {
 
 func TestConfigDependencyMacroCallVariadicFailsClosed(t *testing.T) {
 	for _, def := range []string{
-		"F(...) ,##__VA_ARGS__", "F(args...) ,##args", "F(x,...,y) x", "F(x,args...,y) x",
+		"F(x,...,y) x", "F(x,args...,y) x",
 		"F(x,x...) x", "F(x,__VA_ARGS__) x", "F(x,args...) __VA_ARGS__",
 		"F(x,...) __VA_OPT__(x)", "F(x,...) x##__VA_ARGS__",
 		"F(x,...) __VA_ARGS__##x", "F(x,...) x,##__VA_ARGS__##x",
@@ -675,6 +680,8 @@ func TestConfigDependencyMacroCallVariadicFailsClosed(t *testing.T) {
 		defs          []string
 		input, reason string
 	}{
+		{[]string{"F(...) 0,##__VA_ARGS__"}, "F()", "dialect-dependent variadic comma deletion"},
+		{[]string{"F(args...) 0,##args"}, "F(/**/)", "dialect-dependent variadic comma deletion"},
 		{[]string{"F(x,...) x,##__VA_ARGS__"}, "F(0,_Pragma(\"bad\"))", "preprocessing effect"},
 		{[]string{"F(x,...) x,##__VA_ARGS__", "JOIN(a,b) a##b"}, "F(0,JOIN(_Pr,agma))", "preprocessing effect"},
 		{[]string{"F(x,...) x,##__VA_ARGS__", "OUT(a,b) a##b", "JOIN(a,b) a##b", "PRE_effect JOIN(__pr,agma)"}, "F(0,OUT(PRE_,effect))", "preprocessing effect"},

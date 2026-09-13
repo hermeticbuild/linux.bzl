@@ -495,10 +495,6 @@ func configDependencyMacroCallParse(text string, mode configDependencyMacroCallM
 		if tok.text != "##" {
 			continue
 		}
-		if len(d.formals) == 0 && d.variadic != "" && i > 0 && i+1 < len(d.replacement) &&
-			d.replacement[i-1].text == "," && d.replacement[i+1].text == d.variadic {
-			return "", d, fmt.Errorf("dialect-dependent variadic comma deletion")
-		}
 		if i == 0 || i+1 == len(d.replacement) ||
 			i >= 2 && d.replacement[i-2].text == "##" ||
 			i+2 < len(d.replacement) && d.replacement[i+2].text == "##" {
@@ -696,6 +692,13 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 			}
 			if replacement.text == "," && n+2 < len(d.replacement) &&
 				d.replacement[n+1].text == "##" && d.variadic != "" && d.replacement[n+2].text == d.variadic {
+				// With no fixed formal, F() cannot distinguish an omitted
+				// tail from an explicitly empty one without dialect evidence.
+				// A nonempty raw tail has neither ambiguity; expanded-empty
+				// arguments still count as supplied, as they do below.
+				if len(d.formals) == 0 && omittedVariadic {
+					return nil, 0, fmt.Errorf("dialect-dependent variadic comma deletion")
+				}
 				// GNU comma deletion is not ordinary token concatenation.
 				// A supplied tail, even explicitly empty, preserves the comma.
 				// Its raw tokens rescan with this macro disabled, unlike
