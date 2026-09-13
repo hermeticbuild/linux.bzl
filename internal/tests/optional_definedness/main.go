@@ -55,6 +55,7 @@ type fixture struct {
 	plans            map[string]*kconfig.ProbePlan
 	union            *kconfig.ProbePlan
 	macroWrites      map[string]kconfig.ProbeReference
+	variadicCommas   map[string]variadicCommaReferences
 }
 type caseResult struct {
 	NodeID   string          `json:"node_id"`
@@ -63,12 +64,13 @@ type caseResult struct {
 	ExitCode int             `json:"exit_code"`
 }
 type receipt struct {
-	Schema          string                      `json:"schema"`
-	Toolset         string                      `json:"toolset"`
-	CompilerVersion string                      `json:"compiler_version"`
-	Cases           map[string]caseResult       `json:"cases"`
-	Checks          []string                    `json:"checks"`
-	MacroWrites     map[string]macroWriteResult `json:"macro_writes"`
+	Schema          string                         `json:"schema"`
+	Toolset         string                         `json:"toolset"`
+	CompilerVersion string                         `json:"compiler_version"`
+	Cases           map[string]caseResult          `json:"cases"`
+	Checks          []string                       `json:"checks"`
+	MacroWrites     map[string]macroWriteResult    `json:"macro_writes"`
+	VariadicCommas  map[string]variadicCommaResult `json:"variadic_commas"`
 }
 
 func main() {
@@ -117,7 +119,7 @@ func run(opts options) error {
 	if err != nil {
 		return err
 	}
-	if len(results) != len(queryCases())+len(macroWriteCases()) {
+	if len(results) != len(queryCases())+len(macroWriteCases())+2*len(variadicCommaCases()) {
 		return fmt.Errorf("unexpected fixture result count")
 	}
 	got, err := f.verify(oracle)
@@ -210,11 +212,16 @@ func loadFixture(opts options) (*fixture, error) {
 			return nil, err
 		}
 		variants = append(variants, kconfig.ProbePlanVariant{Name: "macro-writes", Plan: writes})
+		variadics, err := f.discoverVariadicCommas()
+		if err != nil {
+			return nil, err
+		}
+		variants = append(variants, kconfig.ProbePlanVariant{Name: "variadic-commas", Plan: variadics})
 		f.union, err = kconfig.MergeProbePlans(variants)
 		if err != nil {
 			return nil, err
 		}
-		if len(f.union.Nodes) != len(queryCases())+len(macroWriteCases()) {
+		if len(f.union.Nodes) != len(queryCases())+len(macroWriteCases())+2*len(variadicCommaCases()) {
 			return nil, fmt.Errorf("fixture cases aliased")
 		}
 		return f, nil
@@ -376,6 +383,10 @@ func (f *fixture) verify(oracle *kconfig.ProbeResultOracle) (*receipt, error) {
 	}
 	report.Checks = []string{"empty-failure-snapshot", "exact-vector-identity", "rejected-only-singleton-miss", "fresh-singleton-answer", "mandatory-success", "mandatory-optional-separation", "ordinary-discovery-unchanged"}
 	report.MacroWrites, err = f.verifyMacroWrites(oracle)
+	if err != nil {
+		return nil, err
+	}
+	report.VariadicCommas, err = f.verifyVariadicCommas(oracle)
 	if err != nil {
 		return nil, err
 	}

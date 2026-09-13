@@ -733,7 +733,7 @@ int selected;
 	}
 }
 
-func TestAnalyzeActionPlanNodeConfigDependenciesRejectsReachableTokenPasteAliases(t *testing.T) {
+func TestAnalyzeActionPlanNodeConfigDependenciesTokenPasteAliasesRequireCompleteState(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		source     string
@@ -780,7 +780,11 @@ int selected = SOURCE_ALIAS(CONFIG_, FEATURE);
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !set.Opaque || !strings.Contains(set.Reason, "reachable token pasting macro") {
+			if test.predefines != "" {
+				if set.Opaque || !slices.Equal(set.Symbols, []string{"CONFIG_FEATURE"}) || !slices.Equal(set.SourcePaths, []string{"drivers/example/driver.c"}) {
+					t.Fatalf("measured alias lost precise dependency closure: %#v", set)
+				}
+			} else if !set.Opaque || !strings.Contains(set.Reason, "reachable token pasting macro") {
 				t.Fatalf("reachable token-paste alias dependency set = %#v, want opaque fallback", set)
 			}
 		})
@@ -1412,8 +1416,8 @@ func TestAnalyzeActionPlanNodeConfigDependenciesForcedHeaderCacheUsesCurrentComp
 			dangerousReason: "unmodeled _Pragma effect",
 		},
 		{
-			name:       "reachable token paste",
-			forcedBody: "CACHE_DISPATCH(left, right)\nCONFIG_FORCED\n",
+			name:       "reachable effect through token paste",
+			forcedBody: "CACHE_DISPATCH(_Pr, agma)(\"once\")\nCONFIG_FORCED\n",
 			firstInert: `#define CACHE_DISPATCH CACHE_SAFE_ONE
 #define CACHE_SAFE_ONE(left, right) left right
 #define CACHE_SAFE_TWO(left, right) right left

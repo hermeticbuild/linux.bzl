@@ -26,6 +26,7 @@ type KbuildCompilerGuardBatch struct {
 	observations map[configDependencyCompilerPredefineRequestKey]map[string]kbuildCompilerGuardAnswerObservation
 	intrinsics   map[configDependencyCompilerPredefineRequestKey]map[CompilerIntrinsicCall]map[string]kbuildCompilerIntrinsicObservation
 	counters     map[configDependencyCompilerPredefineRequestKey]map[string]kbuildCompilerCounterObservation
+	variadics    map[compilerVariadicCommaKey]compilerVariadicCommaObservation
 	frozen       bool
 	err          error
 }

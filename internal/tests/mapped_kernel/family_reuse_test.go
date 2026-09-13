@@ -142,6 +142,7 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 	batched := map[string]bool{"base": false, "irrelevant": false, "relevant": false}
 	generatedOffsets := map[string]bool{}
 	counterMeasured := map[string]bool{}
+	counterPrefetched := map[string]bool{}
 	for index, logical := range manifests {
 		if seen[logical] {
 			t.Fatalf("compiler guard manifest %d repeats an earlier runfile", index)
@@ -196,13 +197,14 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 				}
 				arguments := compilerGuardStrings(t, manifest.Strings, context.Arguments)
 				units := compilerGuardStrings(t, manifest.Strings, context.TranslationUnits)
-				if query.Kind == "counter-sequence" {
+				if query.Kind == "counter-sequence" || query.Kind == "optional-counter-hints" {
 					if query.CounterCount < 3 || query.CounterCount > 4096 {
 						t.Fatalf("%s counter query has invalid measured prefix length %d", variant, query.CounterCount)
 					}
 					for _, argument := range arguments {
 						if strings.HasPrefix(argument, `-DMAPPED_OBJECT_FILE="`) && strings.HasSuffix(argument, `/smoke"`) {
 							counterMeasured[variant] = true
+							counterPrefetched[variant] = counterPrefetched[variant] || query.Kind == "optional-counter-hints"
 						}
 					}
 				}
@@ -265,6 +267,9 @@ func TestFamilyDefaultCompilerGuardPipelineBatchesIntrinsicCalls(t *testing.T) {
 		}
 		if !counterMeasured[variant] {
 			t.Errorf("%s default compiler guard rounds never measure smoke.c's counter sequence", variant)
+		}
+		if !counterPrefetched[variant] {
+			t.Errorf("%s default compiler guard rounds never prefetch smoke.c's counter sequence", variant)
 		}
 	}
 }
@@ -749,7 +754,9 @@ func TestFamilyVariantImagesAreActuallyBuilt(t *testing.T) {
 		}
 		for _, name := range []string{
 			"counter_first", "counter_condition", "counter_last",
-			"variadic_populated", "variadic_expanded_empty", "variadic_separator", "variadic_named", "variadic_condition",
+			"counted_dispatch",
+			"variadic_empty", "variadic_named_empty",
+			"variadic_populated", "variadic_expanded_empty", "variadic_separator", "variadic_named", "variadic_condition", "variadic_maximum",
 		} {
 			got := compiledObjectSymbolByte(t, variant.image, "mapped_"+name)
 			want := compiledObjectSymbolByte(t, measurementObject, "measured_"+name)
@@ -758,7 +765,32 @@ func TestFamilyVariantImagesAreActuallyBuilt(t *testing.T) {
 			}
 			t.Logf("%s actual compiler %s: %d", variant.name, name, got)
 		}
+		for name, spelling := range map[string]string{
+			"alias_prescan": "MAPPED_RESCAN_F(3)",
+			"disabled_tail": "marker MAPPED_RESCAN_FOO(2)",
+		} {
+			size := uint64(len(spelling) + 1)
+			got := compiledObjectSymbolBytes(t, variant.image, "mapped_"+name, size)
+			want := compiledObjectSymbolBytes(t, measurementObject, "measured_"+name, size)
+			if !bytes.Equal(got, want) {
+				t.Errorf("%s %s = %q, independent compiler = %q", variant.name, name, got, want)
+			}
+		}
+		dispatchConfig := byte(103)
+		if compiledObjectSymbolByte(t, measurementObject, "measured_dispatch_condition") != 0 {
+			dispatchConfig = byte(97 + variant.value[0] - '0')
+		}
+		if got := compiledObjectSymbolByte(t, variant.image, "mapped_dispatch_config"); got != dispatchConfig {
+			t.Errorf("%s counted-dispatch CONFIG branch = %d, independent compiler/config require %d", variant.name, got, dispatchConfig)
+		}
 		variadicConfig := byte(79)
+		emptyConfig := byte(113)
+		if compiledObjectSymbolByte(t, measurementObject, "measured_variadic_empty_condition") == 2 {
+			emptyConfig = byte(109 + variant.value[0] - '0')
+		}
+		if got := compiledObjectSymbolByte(t, variant.image, "mapped_variadic_empty_config"); got != emptyConfig {
+			t.Errorf("%s empty variadic CONFIG branch = %d, independent compiler/config require %d", variant.name, got, emptyConfig)
+		}
 		if compiledObjectSymbolByte(t, measurementObject, "measured_variadic_condition") == 67 {
 			variadicConfig = byte(71 + variant.value[0] - '0')
 		}

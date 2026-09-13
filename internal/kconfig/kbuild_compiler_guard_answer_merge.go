@@ -44,6 +44,9 @@ func MergeKbuildCompilerGuardAnswers(snapshots ...*KbuildCompilerGuardAnswers) (
 		if equivalent && !equalKbuildCompilerCounterAnswers(first.counters, snapshot.counters) {
 			equivalent = false
 		}
+		if equivalent && !maps.Equal(first.variadics, snapshot.variadics) {
+			equivalent = false
+		}
 	}
 	if first == nil || equivalent {
 		return first, nil
@@ -82,6 +85,10 @@ func MergeKbuildCompilerGuardAnswers(snapshots ...*KbuildCompilerGuardAnswers) (
 		return nil, err
 	}
 	result.counters, err = mergeKbuildCompilerCounterAnswers(snapshots)
+	if err != nil {
+		return nil, err
+	}
+	result.variadics, err = mergeCompilerVariadicCommaAnswers(snapshots)
 	if err != nil {
 		return nil, err
 	}

@@ -46,8 +46,8 @@ def _compiler_optional_definedness_fixture_impl(ctx):
 
     # The production callback owns compiler invocation, exact action envelopes,
     # runtime closure, marker validation, and normal failed-process recording.
-    # Five optional-query and three macro-write test probes do not add or alter
-    # a production guard round.
+    # Optional-query, macro-write and independent variadic-grammar test probes
+    # do not add or alter a production guard round.
     ctx.actions.map_directory(
         implementation = expand_linux_probe_plan,
         input_directories = {

@@ -52,6 +52,17 @@ func (s *KbuildProbeScopes) compilerCounterSequenceRequest(
 	count int,
 	environment map[string]string,
 ) (*compilerProjectedProbe, error) {
+	return s.compilerCounterSequenceRequestWithOutcome(scope, role, language, arguments, translationUnits, count, environment,
+		ProbeOutcome{Kind: "text", Step: compilerCounterSequenceStep, Stream: "stdout", RequireSuccess: true})
+}
+
+func (s *KbuildProbeScopes) compilerCounterSequenceRequestWithOutcome(
+	scope, role, language string,
+	arguments, translationUnits []string,
+	count int,
+	environment map[string]string,
+	outcome ProbeOutcome,
+) (*compilerProjectedProbe, error) {
 	if language != "c" && language != "c++" {
 		return nil, unsupportedCompilerPredefineProjection(fmt.Errorf("counter sequence requires c or c++ language"))
 	}
@@ -61,7 +72,7 @@ func (s *KbuildProbeScopes) compilerCounterSequenceRequest(
 	}
 	return s.compilerProjectedRequestWithProjection(scope, role, language, arguments, translationUnits, environment,
 		compilerCounterSequenceStep, []string{"-E", "-P", "-x", language, "-"}, stdin,
-		ProbeOutcome{Kind: "text", Step: compilerCounterSequenceStep, Stream: "stdout", RequireSuccess: true},
+		outcome,
 		ProbeCandidateProjectionCompilerIntrinsic)
 }
 

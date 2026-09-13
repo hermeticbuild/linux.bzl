@@ -23,6 +23,14 @@ type ConfigDependencyCompilerGuardObservation struct {
 	Names                       []string
 	Calls                       []CompilerIntrinsicCall
 	CounterCount                int
+	VariadicCommaSyntax         string
+	// OptionalVariadicHints come from definitions in entered files, not an
+	// actual empty expansion. They must not compete with reached demands.
+	OptionalVariadicHints bool
+	// OptionalCounterHints request a measured prefix from an entered-file
+	// inventory, not an actually reached counter expansion. Keep admission
+	// separate from source demands and grant no facts on compiler rejection.
+	OptionalCounterHints bool
 	// OptionalDefinedness is exclusive to typed first-unknown expansion
 	// demands. A rejected vector supplies no facts, not measured negatives.
 	// Combined with Truncated it drops only optional demands, never the
@@ -104,6 +112,8 @@ func (s *configDependencyClosureScanner) emitCompilerGuardHints(
 		observe(probe, configDependencyScanFile{}, configDependencyCompilerGuardHints{truncated: true}, "")
 		return
 	}
+	counterHintEmitted := false
+	variadicHintEmitted := [2]bool{}
 	for _, identity := range slices.Sorted(maps.Keys(s.compilerGuardFiles)) {
 		file := s.compilerGuardFiles[identity]
 		key := s.conditionalSyntaxCacheKey(file)
@@ -203,6 +213,19 @@ func (s *configDependencyClosureScanner) emitCompilerGuardHints(
 		if len(hints.calls) != 0 {
 			observe(probe, file, configDependencyCompilerGuardHints{calls: hints.calls}, syntax.compilerGuardContentID)
 		}
+		// The bounded lexer sees this spelling even before complete-call analysis
+		// starts. Only already-entered immutable files can emit this hint; raw
+		// substrings and literal-include lookahead cannot. It certifies no read.
+		if !counterHintEmitted && s.compilerCounterHint != nil && hints.counterMention {
+			s.compilerCounterHint(file, syntax.compilerGuardContentID)
+			counterHintEmitted = true
+		}
+		for index, spelling := range []string{"standard", "named"} {
+			if !variadicHintEmitted[index] && s.compilerVariadicHint != nil && hints.variadicMentions[index] {
+				s.compilerVariadicHint(file, syntax.compilerGuardContentID, spelling)
+				variadicHintEmitted[index] = true
+			}
+		}
 	}
 	s.emitCompilerOpenedHeaderTokenHints(probe, observe)
 }
@@ -213,6 +236,20 @@ func (c *configDependencyAnalysisContext) recordCompilerGuardHints(
 	hints configDependencyCompilerGuardHints, contentID string,
 ) {
 	if c.compilerGuardError != nil {
+		return
+	}
+	if hints.optionalVariadicHints && hints.variadicSyntax == "" {
+		c.compilerGuardError = fmt.Errorf("optional variadic hint has no grammar syntax")
+		return
+	}
+	if hints.variadicSyntax != "" && (hints.variadicSyntax != "standard" && hints.variadicSyntax != "named" ||
+		len(hints.names) != 0 || len(hints.calls) != 0 || hints.counterCount != 0 || hints.truncated ||
+		hints.optionalCounterHints || hints.optionalDefinedness || hints.optionalTokenHints || hints.literalIncludeHints) {
+		c.compilerGuardError = fmt.Errorf("variadic comma observation has invalid or mixed demands")
+		return
+	}
+	if hints.optionalCounterHints && hints.counterCount == 0 {
+		c.compilerGuardError = fmt.Errorf("optional counter hint has no measured-prefix request")
 		return
 	}
 	if hints.counterCount != 0 {
@@ -234,10 +271,13 @@ func (c *configDependencyAnalysisContext) recordCompilerGuardHints(
 		Role: role, Language: probe.language,
 		Arguments: slices.Clone(probe.arguments), TranslationUnits: slices.Clone(probe.translationUnits),
 		Environment: maps.Clone(probe.environment), Names: slices.Clone(hints.names), Calls: slices.Clone(hints.calls), Truncated: hints.truncated,
-		OptionalDefinedness: hints.optionalDefinedness,
-		OptionalTokenHints:  hints.optionalTokenHints,
-		LiteralIncludeHints: hints.literalIncludeHints,
-		CounterCount:        hints.counterCount,
+		OptionalDefinedness:   hints.optionalDefinedness,
+		OptionalTokenHints:    hints.optionalTokenHints,
+		LiteralIncludeHints:   hints.literalIncludeHints,
+		CounterCount:          hints.counterCount,
+		VariadicCommaSyntax:   hints.variadicSyntax,
+		OptionalVariadicHints: hints.optionalVariadicHints,
+		OptionalCounterHints:  hints.optionalCounterHints,
 	}
 	if file.logical == "" {
 		if !hints.truncated || len(hints.names) != 0 || len(hints.calls) != 0 || hints.counterCount != 0 {
@@ -288,7 +328,7 @@ func configDependencyCompilerGuardObservationHintsForContents(contents []byte) c
 	if hints.truncated {
 		return hints
 	}
-	if !bytes.Contains(contents, []byte("__has_")) &&
+	if !bytes.Contains(contents, []byte("__has_")) && !bytes.Contains(contents, []byte("__COUNTER__")) && !bytes.Contains(contents, []byte("...")) &&
 		!bytes.Contains(contents, []byte("\\\n")) && !bytes.Contains(contents, []byte("\\\r\n")) {
 		return hints
 	}
@@ -318,11 +358,22 @@ func configDependencyCompilerGuardObservationHintsForContents(contents []byte) c
 		return true
 	}
 	for line := range strings.SplitSeq(text, "\n") {
+		switch configDependencyVariadicCommaHint(line) {
+		case "standard":
+			hints.variadicMentions[0] = true
+		case "named":
+			hints.variadicMentions[1] = true
+		}
 		// Per-line lexing preserves late hints beyond the lexer's span budget.
 		// Unsupported lines omit hints, never supply negative evidence.
 		tokens, err := configDependencyMacroCallLex(line, configDependencyMacroCallMode{})
 		if err != nil {
 			continue
+		}
+		for _, token := range tokens {
+			if token.identifier && token.text == "__COUNTER__" {
+				hints.counterMention = true
+			}
 		}
 		for index := 0; index+3 < len(tokens); index++ {
 			if !tokens[index].identifier || !isCompilerIntrinsicOperator(tokens[index].text) ||

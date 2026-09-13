@@ -13,6 +13,7 @@ go_library(
     srcs = [
         "macro_writes.go",
         "main.go",
+        "variadic_comma.go",
     ],
     importpath = "github.com/hermeticbuild/linux.bzl/internal/tests/optional_definedness",
     visibility = ["//visibility:private"],

@@ -18,6 +18,7 @@ type configDependencyCallCoverage struct {
 	unknown     func(string)
 	intrinsics  []configDependencyCompilerIntrinsicRead
 	counters    []compilerCounterRead
+	variadics   []compilerVariadicCommaRead
 	priorTail   bool
 	work        int
 	tokens      int
@@ -65,6 +66,7 @@ func (c *configDependencyCallCoverage) fail(reason string) string {
 	c.conditions = nil
 	c.intrinsics = nil
 	c.counters = nil
+	c.variadics = nil
 	c.complete = false
 	return c.reason
 }
@@ -128,7 +130,7 @@ func (c *configDependencyCallCoverage) expand(text string, state *configDependen
 func (c *configDependencyCallCoverage) recordExpansion(result configDependencyMacroCallResult) string {
 	c.work += result.Work
 	c.tokens += len(result.Tokens)
-	if c.work > 65536 || c.tokens > 16384 || len(c.conditions)+len(c.definitions)+len(result.DefinitionReads)+len(c.intrinsics)+len(result.IntrinsicReads)+len(c.counters)+len(result.CounterReads) > 16384 {
+	if c.work > 65536 || c.tokens > 16384 || len(c.conditions)+len(c.definitions)+len(result.DefinitionReads)+len(c.intrinsics)+len(result.IntrinsicReads)+len(c.counters)+len(result.CounterReads)+len(c.variadics)+len(result.VariadicReads) > 16384 {
 		return c.fail("translation-unit call coverage budget")
 	}
 	if c.reads == nil {
@@ -144,6 +146,7 @@ func (c *configDependencyCallCoverage) recordExpansion(result configDependencyMa
 	c.definitions = append(c.definitions, result.DefinitionReads...)
 	c.intrinsics = append(c.intrinsics, result.IntrinsicReads...)
 	c.counters = append(c.counters, result.CounterReads...)
+	c.variadics = append(c.variadics, result.VariadicReads...)
 	return ""
 }
 

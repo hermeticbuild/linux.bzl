@@ -10,10 +10,16 @@ import (
 // particular, unsupported source syntax may omit hints without proving anything
 // about the omitted names.
 type configDependencyCompilerGuardHints struct {
-	names        []string
-	calls        []CompilerIntrinsicCall
-	counterCount int
-	truncated    bool
+	names                 []string
+	calls                 []CompilerIntrinsicCall
+	counterCount          int
+	optionalCounterHints  bool
+	variadicSyntax        string
+	optionalVariadicHints bool
+	variadicMentions      [2]bool
+	// Lexer-observed spelling in immutable file bytes; never an expansion read.
+	counterMention bool
+	truncated      bool
 	// Only a typed, actually reached expansion demand may opt into a
 	// nonfatal compiler attempt. Static source inventories leave this false.
 	optionalDefinedness bool

@@ -8,6 +8,11 @@ import (
 	"strings"
 )
 
+// Bound signature and argument width independently of expansion work, token
+// output and nesting limits. Linux-style argument counters use 17 fixed
+// parameters and pass up to 32 actual arguments through their helper macro.
+const maxConfigDependencyMacroCallArity = 32
+
 // A definition is immutable after construction. It retains normalized
 // NAME(formals) replacement text, not an eagerly allocated token AST.
 type configDependencyMacroCallDefinition struct {
@@ -33,6 +38,7 @@ type configDependencyMacroCallMode struct {
 	intrinsic           func(CompilerIntrinsicCall) (token, identity, reason string)
 	counter             compilerCounterCursor
 	counterMissing      func(context string, required int)
+	variadicComma       func(syntax string) (deleted bool, identity, reason string)
 }
 
 type configDependencyMacroCallRead struct {
@@ -48,6 +54,7 @@ type configDependencyMacroCallResult struct {
 	DefinitionReads []configDependencyMacroCallRead
 	IntrinsicReads  []configDependencyCompilerIntrinsicRead
 	CounterReads    []compilerCounterRead
+	VariadicReads   []compilerVariadicCommaRead
 	Counter         compilerCounterCursor
 	Work            int
 }
@@ -135,10 +142,11 @@ func (m *configDependencyMacroCallMachine) stringify(tokens []configDependencyMa
 }
 
 type configDependencyMacroCallParsed struct {
-	function    bool
-	formals     []string
-	variadic    string
-	replacement []configDependencyMacroCallToken
+	function       bool
+	formals        []string
+	variadic       string
+	variadicSyntax string
+	replacement    []configDependencyMacroCallToken
 }
 
 type configDependencyMacroCallMachine struct {
@@ -149,6 +157,7 @@ type configDependencyMacroCallMachine struct {
 	definitionReads                       map[string]configDependencyMacroCallRead
 	intrinsicReads                        []configDependencyCompilerIntrinsicRead
 	counterReads                          []compilerCounterRead
+	variadicReads                         []compilerVariadicCommaRead
 	counter                               compilerCounterCursor
 	reads                                 map[string]bool
 	work, definitionBytes, generatedBytes int
@@ -443,6 +452,9 @@ func configDependencyMacroCallParse(text string, mode configDependencyMacroCallM
 		if formals != "" {
 			seen := map[string]bool{}
 			parts := strings.Split(formals, ",")
+			if len(parts) > maxConfigDependencyMacroCallArity {
+				return "", d, fmt.Errorf("formal budget")
+			}
 			for n, formal := range parts {
 				formal = strings.TrimSpace(formal)
 				variadic := strings.HasSuffix(formal, "...")
@@ -451,7 +463,9 @@ func configDependencyMacroCallParse(text string, mode configDependencyMacroCallM
 						return "", d, fmt.Errorf("unsupported variadic signature")
 					}
 					formal = strings.TrimSpace(strings.TrimSuffix(formal, "..."))
+					d.variadicSyntax = "named"
 					if formal == "" {
+						d.variadicSyntax = "standard"
 						formal = "__VA_ARGS__"
 					}
 				}
@@ -470,9 +484,6 @@ func configDependencyMacroCallParse(text string, mode configDependencyMacroCallM
 					d.formals = append(d.formals, formal)
 				}
 			}
-		}
-		if len(d.formals) > 16 {
-			return "", d, fmt.Errorf("formal budget")
 		}
 		rest = rest[close+1:]
 	}
@@ -533,7 +544,9 @@ func configDependencyMacroCallArgumentsWithSeparators(tokens []configDependencyM
 				start = i + 1
 			}
 		}
-		if depth > 32 || len(args) > 16 {
+		// The final argument is appended when the matching ')' is reached.
+		// Seeing the limit-th separator would already require one more slot.
+		if depth > 32 || len(args) >= maxConfigDependencyMacroCallArity {
 			return nil, nil, 0, fmt.Errorf("argument budget")
 		}
 	}
@@ -545,21 +558,101 @@ func (m *configDependencyMacroCallMachine) expand(tokens []configDependencyMacro
 	return out, err
 }
 
+// A context remains active while its last token is being considered. It is
+// popped only when another token is requested, including raw call lookahead.
+// This distinguishes temporary macro disablement from a token's permanent
+// unavailability, and lets a replacement consume following invocation tokens.
+type configDependencyMacroCallContext struct {
+	tokens   []configDependencyMacroCallToken
+	next     int
+	disabled string
+	tail     configDependencyMacroCallSpacing
+}
+
+type configDependencyMacroCallStream struct {
+	contexts []configDependencyMacroCallContext
+	active   map[string]bool
+	pending  configDependencyMacroCallSpacing
+}
+
+func (s *configDependencyMacroCallStream) peek() (configDependencyMacroCallToken, bool) {
+	for len(s.contexts) != 0 {
+		context := &s.contexts[len(s.contexts)-1]
+		if context.next < len(context.tokens) {
+			return context.tokens[context.next], true
+		}
+		s.pending = configDependencyMacroCallComposeSpacing(s.pending, context.tail)
+		if context.disabled != "" {
+			delete(s.active, context.disabled)
+		}
+		s.contexts = s.contexts[:len(s.contexts)-1]
+	}
+	return configDependencyMacroCallToken{}, false
+}
+
+func (s *configDependencyMacroCallStream) take() (configDependencyMacroCallToken, bool) {
+	token, ok := s.peek()
+	if !ok {
+		return token, false
+	}
+	s.contexts[len(s.contexts)-1].next++
+	token.spacing = configDependencyMacroCallComposeSpacing(s.pending, token.spacing)
+	s.pending = 0
+	return token, true
+}
+
+// Collect only a raw, balanced invocation. Argument expansion gets its own
+// bounded stream and cannot borrow tokens after the closing parenthesis.
+func (s *configDependencyMacroCallStream) invocation() ([]configDependencyMacroCallToken, error) {
+	opening, ok := s.take()
+	if !ok || opening.text != "(" {
+		return nil, fmt.Errorf("missing invocation parenthesis")
+	}
+	tokens := []configDependencyMacroCallToken{opening}
+	depth := 1
+	for depth != 0 {
+		token, ok := s.take()
+		if !ok {
+			return nil, fmt.Errorf("unterminated call")
+		}
+		if token.identifier && s.active[token.text] {
+			token.unavailable = true
+		}
+		switch token.text {
+		case "(":
+			depth++
+		case ")":
+			depth--
+		}
+		if depth > 32 || len(tokens) >= 4096 {
+			return nil, fmt.Errorf("argument budget")
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens, nil
+}
+
 func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDependencyMacroCallToken, active map[string]bool) ([]configDependencyMacroCallToken, configDependencyMacroCallSpacing, error) {
 	if len(active) > 32 {
 		return nil, 0, fmt.Errorf("expansion depth budget")
 	}
+	stream := configDependencyMacroCallStream{
+		contexts: []configDependencyMacroCallContext{{tokens: tokens}},
+		active:   maps.Clone(active),
+	}
+	if stream.active == nil {
+		stream.active = map[string]bool{}
+	}
 	var out []configDependencyMacroCallToken
-	var pending configDependencyMacroCallSpacing
-	for i := 0; i < len(tokens); {
+	for {
+		tok, ok := stream.take()
+		if !ok {
+			break
+		}
 		m.work++
 		if m.work > 16384 {
 			return nil, 0, fmt.Errorf("expansion work budget")
 		}
-		tok := tokens[i]
-		tok.spacing = configDependencyMacroCallComposeSpacing(pending, tok.spacing)
-		pending = 0
-		i++
 		if tok.text == "##" || tok.text == "#" {
 			return nil, 0, fmt.Errorf("unsupported nonreplacement paste token")
 		}
@@ -577,7 +670,7 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 		// immutable definition or namespace. It must precede the function
 		// shape check: a disabled function name without '(' is permanently
 		// unavailable too, even if argument substitution later supplies '('.
-		if tok.identifier && found && (tok.unavailable || active[tok.text]) {
+		if tok.identifier && found && (tok.unavailable || stream.active[tok.text]) {
 			tok.unavailable = true
 			if len(out) >= 4096 {
 				return nil, 0, fmt.Errorf("output token budget")
@@ -585,7 +678,15 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 			out = append(out, tok)
 			continue
 		}
-		if !tok.identifier || !found || d.function && (i == len(tokens) || tokens[i].text != "(") {
+		invoked := true
+		if found && d.function {
+			following, ok := stream.peek()
+			invoked = ok && following.text == "("
+		}
+		if !tok.identifier || !found || !invoked {
+			if len(out) >= 4096 {
+				return nil, 0, fmt.Errorf("output token budget")
+			}
 			out = append(out, tok)
 			continue
 		}
@@ -607,12 +708,16 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 			expanded := configDependencyMacroCallToken{text: read.Token}
 			expanded.spacing = configDependencyMacroCallComposeSpacing(tok.spacing, configDependencyMacroCallSpacingEnter(tok.whitespace))
 			out = append(out, expanded)
-			pending = configDependencyMacroCallSpacingExit
+			stream.pending = configDependencyMacroCallSpacingExit
 			m.counter, m.counterReads = next, append(m.counterReads, read)
 			continue
 		}
 		if binding := m.bindings[tok.text]; binding.intrinsic != nil {
-			expanded, next, err := m.expandIntrinsic(binding.intrinsic, tokens, i)
+			invocation, err := stream.invocation()
+			if err != nil {
+				return nil, 0, err
+			}
+			expanded, _, err := m.expandIntrinsic(binding.intrinsic, invocation, 0)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -621,8 +726,7 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 			}
 			expanded.spacing = configDependencyMacroCallComposeSpacing(tok.spacing, configDependencyMacroCallSpacingEnter(tok.whitespace))
 			out = append(out, expanded)
-			pending = configDependencyMacroCallSpacingExit
-			i = next
+			stream.pending = configDependencyMacroCallSpacingExit
 			continue
 		}
 		d, err = m.replacement(tok.text)
@@ -633,7 +737,11 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 		prescannedTail := map[string]configDependencyMacroCallSpacing{}
 		omittedVariadic := false
 		if d.function {
-			args, separators, next, err := configDependencyMacroCallArgumentsWithSeparators(tokens, i)
+			invocation, err := stream.invocation()
+			if err != nil {
+				return nil, 0, err
+			}
+			args, separators, _, err := configDependencyMacroCallArgumentsWithSeparators(invocation, 0)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -657,7 +765,6 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 				}
 				raw[d.variadic] = tail
 			}
-			i = next
 		}
 		var substituted []configDependencyMacroCallToken
 		var substitutionTail configDependencyMacroCallSpacing
@@ -697,7 +804,18 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 				// A nonempty raw tail has neither ambiguity; expanded-empty
 				// arguments still count as supplied, as they do below.
 				if len(d.formals) == 0 && omittedVariadic {
-					return nil, 0, fmt.Errorf("dialect-dependent variadic comma deletion")
+					if m.mode.variadicComma == nil {
+						return nil, 0, fmt.Errorf("dialect-dependent variadic comma deletion")
+					}
+					deleted, identity, reason := m.mode.variadicComma(d.variadicSyntax)
+					if reason != "" || identity == "" {
+						return nil, 0, fmt.Errorf("dialect-dependent variadic comma deletion: %s", reason)
+					}
+					if len(m.variadicReads) >= 4096 {
+						return nil, 0, fmt.Errorf("variadic comma read budget")
+					}
+					m.variadicReads = append(m.variadicReads, compilerVariadicCommaRead{d.variadicSyntax, identity, deleted})
+					omittedVariadic = deleted
 				}
 				// GNU comma deletion is not ordinary token concatenation.
 				// A supplied tail, even explicitly empty, preserves the comma.
@@ -737,7 +855,7 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 				var exists bool
 				actual, exists = prescanned[replacement.text]
 				if !exists {
-					actual, actualTail, err = m.expandWithSpacing(raw[replacement.text], active)
+					actual, actualTail, err = m.expandWithSpacing(raw[replacement.text], stream.active)
 					if err != nil {
 						return nil, 0, err
 					}
@@ -771,46 +889,22 @@ func (m *configDependencyMacroCallMachine) expandWithSpacing(tokens []configDepe
 			substituted = append(append(slices.Clone(substituted[:n-1]), joined[0]), substituted[n+2:]...)
 			n--
 		}
-		nested := maps.Clone(active)
-		nested[tok.text] = true
+		if len(stream.active) >= 32 || len(stream.contexts) >= 33 {
+			return nil, 0, fmt.Errorf("expansion depth budget")
+		}
 		prefix := configDependencyMacroCallComposeSpacing(tok.spacing, configDependencyMacroCallSpacingEnter(tok.whitespace))
 		if len(substituted) != 0 {
 			substituted[0].spacing = configDependencyMacroCallComposeSpacing(prefix, substituted[0].spacing)
 		} else {
 			substitutionTail = configDependencyMacroCallComposeSpacing(prefix, substitutionTail)
 		}
-		expanded, trailing, err := m.expandWithSpacing(substituted, nested)
-		if err != nil {
-			return nil, 0, err
-		}
-		pending = configDependencyMacroCallComposeSpacing(configDependencyMacroCallComposeSpacing(trailing, substitutionTail), configDependencyMacroCallSpacingExit)
-		// Token-local suppression does not establish general context-stack
-		// rescan semantics across replacement/source boundaries. Continue to
-		// refuse both shapes, including boundaries with unavailable tokens.
-		if len(expanded) != 0 && i < len(tokens) && tokens[i].text == "(" {
-			last, exists, err := m.selected(expanded[len(expanded)-1].text)
-			if err != nil {
-				return nil, 0, err
-			}
-			if exists && last.function {
-				return nil, 0, fmt.Errorf("unsupported rescan boundary")
-			}
-		}
-		if len(out) != 0 && len(expanded) != 0 && expanded[0].text == "(" {
-			last, exists, err := m.selected(out[len(out)-1].text)
-			if err != nil {
-				return nil, 0, err
-			}
-			if exists && last.function {
-				return nil, 0, fmt.Errorf("unsupported backwards rescan boundary")
-			}
-		}
-		if len(expanded) > 4096-len(out) {
-			return nil, 0, fmt.Errorf("output token budget")
-		}
-		out = append(out, expanded...)
+		stream.active[tok.text] = true
+		stream.contexts = append(stream.contexts, configDependencyMacroCallContext{
+			tokens: substituted, disabled: tok.text,
+			tail: configDependencyMacroCallComposeSpacing(substitutionTail, configDependencyMacroCallSpacingExit),
+		})
 	}
-	return out, pending, nil
+	return out, stream.pending, nil
 }
 
 // configDependencyMacroCallExpand consumes one complete normalized text span.
@@ -843,6 +937,7 @@ func configDependencyMacroCallExpandTokens(tokens []configDependencyMacroCallTok
 	}
 	r := configDependencyMacroCallResult{ConfigReads: slices.Sorted(maps.Keys(m.reads)), IntrinsicReads: m.intrinsicReads, Work: m.work}
 	r.Counter, r.CounterReads = m.counter, m.counterReads
+	r.VariadicReads = m.variadicReads
 	for _, name := range slices.Sorted(maps.Keys(m.definitionReads)) {
 		r.DefinitionReads = append(r.DefinitionReads, m.definitionReads[name])
 	}

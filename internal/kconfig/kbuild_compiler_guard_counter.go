@@ -18,6 +18,87 @@ type kbuildCompilerCounterAnswer struct {
 	identity string
 }
 
+// OptionalCompilerCounterState describes an authenticated attempt, not the
+// initial macro binding or any source-level expansion history.
+type OptionalCompilerCounterState uint8
+
+const (
+	OptionalCompilerCounterPending OptionalCompilerCounterState = iota
+	OptionalCompilerCounterAnswered
+	OptionalCompilerCounterUnqueryable
+)
+
+// OptionalCompilerCounterSequenceAttempt lets a weak entered-source hint ask
+// for a bounded vector without making normal compiler rejection fatal. Only
+// a successful exact process and fully parsed vector can enter the snapshot.
+// Missing/stale envelopes, signals and malformed success remain errors. The
+// boolean outcome makes this request distinct from mandatory source demands.
+func (b *KbuildCompilerGuardBatch) OptionalCompilerCounterSequenceAttempt(
+	scope, role, language string,
+	arguments, translationUnits []string,
+	count int,
+	environment map[string]string,
+) (state OptionalCompilerCounterState, reference ProbeReference, err error) {
+	if b == nil || b.builder == nil {
+		return OptionalCompilerCounterPending, ProbeReference{}, fmt.Errorf("compiler counter batch is nil")
+	}
+	if b.err != nil {
+		return OptionalCompilerCounterPending, ProbeReference{}, b.err
+	}
+	if b.frozen {
+		return OptionalCompilerCounterPending, ProbeReference{}, fmt.Errorf("compiler counter batch is frozen")
+	}
+	// No error may leave this batch able to publish an earlier partial vector.
+	defer func() {
+		if err != nil {
+			b.err = err
+		}
+	}()
+	probe, err := b.scopes.compilerCounterSequenceRequestWithOutcome(scope, role, language, arguments, translationUnits, count, environment,
+		ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{Operator: "exit-zero", Step: compilerCounterSequenceStep}})
+	if err != nil {
+		return OptionalCompilerCounterPending, ProbeReference{}, err
+	}
+	reference, err = b.registerCompilerGuardProbe(scope, probe)
+	if err != nil {
+		return OptionalCompilerCounterPending, ProbeReference{}, err
+	}
+	if b.oracle == nil {
+		return OptionalCompilerCounterPending, reference, nil
+	}
+	positive, err := probe.evaluator.readBoolean(reference, probe.request, probe.dependencies...)
+	if err != nil {
+		return OptionalCompilerCounterPending, ProbeReference{}, err
+	}
+	result, err := probe.evaluator.readProbeResult(reference, probe.request, probe.dependencies...)
+	if err != nil {
+		return OptionalCompilerCounterPending, ProbeReference{}, err
+	}
+	if result.NodeID != reference.NodeID {
+		return OptionalCompilerCounterPending, ProbeReference{}, fmt.Errorf("optional compiler counter has stale node identity")
+	}
+	step, present := probeResultStep(result.Steps, compilerCounterSequenceStep)
+	if !present || step.Status == "skipped" || step.ExitCode < 0 || step.ExitCode > 255 {
+		return OptionalCompilerCounterPending, ProbeReference{}, fmt.Errorf("optional compiler counter has no normal process completion")
+	}
+	success := step.Status == "success" && step.ExitCode == 0
+	if positive != success {
+		return OptionalCompilerCounterPending, ProbeReference{}, fmt.Errorf("optional compiler counter disagrees with its exact process outcome")
+	}
+	if !success {
+		return OptionalCompilerCounterUnqueryable, reference, nil
+	}
+	key := configDependencyCompilerPredefineKey(scope, role, language, arguments, translationUnits, environment)
+	sequence, err := parseCompilerCounterSequence(fmt.Sprintf("%x", sha256.Sum256([]byte(key))), count, step.Stdout)
+	if err == nil {
+		err = b.recordCounterAnswer(key, reference, sequence)
+	}
+	if err != nil {
+		return OptionalCompilerCounterPending, ProbeReference{}, err
+	}
+	return OptionalCompilerCounterAnswered, reference, nil
+}
+
 // CompilerCounterSequence records a bounded measured vector in this detached
 // replay round. It grants no initial definedness or source-binding authority.
 // Discovery and failed replay cannot publish a partial vector or snapshot.

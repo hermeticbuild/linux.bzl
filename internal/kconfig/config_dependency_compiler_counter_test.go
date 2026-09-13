@@ -38,6 +38,87 @@ func compilerCounterAnswersForPlanTest(t *testing.T, plan *ActionPlan, node Acti
 	return answers
 }
 
+func TestCompilerCounterHintsPrecedeFailedSourceExpansionWithoutGrantingFacts(t *testing.T) {
+	const pathname = "drivers/example/driver.c"
+	const blocked = "#define READ_COUNTER __COUNTER__\n#include <missing.h>\nREAD_COUNTER\n"
+	for _, tc := range []struct {
+		name, source, dump           string
+		measured, positive, wantHint bool
+	}{
+		{"blocked source", blocked, "", true, true, true},
+		{"no initial measurement", blocked, "", false, false, false},
+		{"measured absent", blocked, "", true, false, false},
+		{"text replacement", blocked, "#define __COUNTER__ 7\n", true, true, false},
+		{"unentered header", "#if 0\n#include <unentered.h>\n#endif\nPICK(BASE)\n", "", true, true, false},
+		{"string and comment", "const char *text = \"__COUNTER__\"; /* __COUNTER__ */\nPICK(BASE)\n", "", true, true, false},
+		{"discarded and stringified", "#define DROP(x)\n#define RAW(x) #x\nDROP(__COUNTER__)\nRAW(__COUNTER__)\nPICK(BASE)\n", "", true, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, node := configDependencyCompilePlanForTest(t, map[string]string{
+				pathname:              "#define PICK(x) CONFIG_ ## x\n" + tc.source,
+				"include/unentered.h": "__COUNTER__\n",
+			}, []string{"-nostdinc", "-I${tree:kernel}/include", "-c", pathname}, nil)
+			configDependencyGuardAnswerCompilerForTest(plan, node)
+			plan.metadata.compilerPredefines = func(_, _, _ string, _, _ []string, _ map[string]string) (string, bool, error) {
+				return tc.dump, true, nil
+			}
+			if tc.measured {
+				plan.metadata.SetCompilerGuardAnswers(configDependencyGuardAnswersForTest(t, plan, node, []string{"__COUNTER__"}, tc.positive))
+			}
+			context := newConfigDependencyAnalysisContext(plan)
+			for range 2 {
+				hints, demands, bindingHints := 0, 0, 0
+				plan.metadata.SetCompilerGuardObserver(func(value ConfigDependencyCompilerGuardObservation) error {
+					if value.OptionalTokenHints && slices.Contains(value.Names, "__COUNTER__") {
+						bindingHints++
+					}
+					if value.CounterCount == 0 {
+						return nil
+					}
+					if !value.OptionalCounterHints {
+						demands++
+						return nil
+					}
+					hints++
+					if value.CounterCount != 64 || !value.Origin.Source || value.Origin.LogicalPath != pathname || len(value.Origin.ContentID) != 64 || value.Truncated || value.OptionalDefinedness || value.OptionalTokenHints || value.LiteralIncludeHints {
+						t.Fatalf("hint lost its immutable entered origin or separate kind: %#v", value)
+					}
+					return nil
+				})
+				result, err := analyzeActionPlanNodeConfigDependencies(plan, node, context)
+				if err != nil || demands != 0 || (hints > 0) != tc.wantHint {
+					t.Fatalf("hint readiness or demand boundary: hints=%d demands=%d result=%#v error=%v", hints, demands, result, err)
+				}
+				if tc.source == blocked && (!result.Opaque || len(result.Symbols)+len(result.SourcePaths)+len(result.ObjectPaths) != 0) {
+					t.Fatal("hint supplied a partial source proof")
+				}
+				if !tc.measured && tc.source == blocked && bindingHints == 0 {
+					t.Fatal("early source failure prevented asking about counter availability")
+				}
+			}
+		})
+	}
+}
+
+func TestCompilerCounterHintLexerOnlyRecognizesIdentifierTokens(t *testing.T) {
+	for _, tc := range []struct {
+		source string
+		want   bool
+	}{
+		{"__COUNTER__\n", true},
+		{"#define ID __COUNTER__\n", true},
+		{"#if __COUNTER__\n#endif\n", true},
+		{"__COUN\\\nTER__\n", true},
+		{"\"__COUNTER__\" /* __COUNTER__ */\n", false},
+		{"x__COUNTER__ __COUNTER__suffix\n", false},
+		{strings.Repeat(" ", configDependencyCompilerGuardHintsMaximumBytes) + "__COUNTER__\n", false},
+	} {
+		if got := configDependencyCompilerGuardObservationHintsForContents([]byte(tc.source)).counterMention; got != tc.want {
+			t.Fatalf("counter spelling %q: %t want %t", tc.source[:min(len(tc.source), 80)], got, tc.want)
+		}
+	}
+}
+
 func TestCompilerCounterProductionScannerDemandsAndRestarts(t *testing.T) {
 	const pathname = "drivers/example/driver.c"
 	const source = "#define PICK(x) CONFIG_ ## x\n#define DROP(x)\n#define RAW(x) #x\nDROP(__COUNTER__)\nRAW(__COUNTER__)\n#if __COUNTER__ == 7\nPICK(NEW)\n#else\nPICK(OLD)\n#endif\n#if __COUNTER__ == 42\nPICK(SECOND)\n#endif\n"
@@ -49,7 +130,7 @@ func TestCompilerCounterProductionScannerDemandsAndRestarts(t *testing.T) {
 			plan.metadata.SetCompilerGuardAnswers(definedness)
 			var demands []ConfigDependencyCompilerGuardObservation
 			plan.metadata.SetCompilerGuardObserver(func(value ConfigDependencyCompilerGuardObservation) error {
-				if value.CounterCount != 0 {
+				if value.CounterCount != 0 && !value.OptionalCounterHints {
 					demands = append(demands, value)
 				}
 				return nil
@@ -88,7 +169,8 @@ func TestCompilerCounterProductionScannerOnlyRequestsActualExpansions(t *testing
 		plan.metadata.SetCompilerGuardAnswers(configDependencyGuardAnswersForTest(t, plan, node, []string{"__COUNTER__"}, true))
 		demands := 0
 		plan.metadata.SetCompilerGuardObserver(func(value ConfigDependencyCompilerGuardObservation) error {
-			if value.CounterCount != 0 {
+			// Keep actual-expansion assertions separate from speculative hints.
+			if value.CounterCount != 0 && !value.OptionalCounterHints {
 				demands++
 			}
 			return nil
@@ -113,7 +195,7 @@ func TestCompilerCounterProductionScannerExhaustionRequestsBoundedGrowth(t *test
 	plan.metadata.SetCompilerGuardAnswers(answers)
 	var demands []int
 	plan.metadata.SetCompilerGuardObserver(func(value ConfigDependencyCompilerGuardObservation) error {
-		if value.CounterCount != 0 {
+		if value.CounterCount != 0 && !value.OptionalCounterHints {
 			demands = append(demands, value.CounterCount)
 		}
 		return nil

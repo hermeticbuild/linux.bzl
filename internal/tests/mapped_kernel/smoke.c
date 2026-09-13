@@ -2,6 +2,18 @@
 #include "include/linux/mapped_guard_a.h"
 #include "include/linux/mapped_compiler_types.h"
 
+/* This condition needs a compiler-measured value before ordered expansion can
+ * reach the counter below. Entered-source hints must schedule the counter in
+ * parallel with that value query, rather than wait for a mandatory expansion.
+ * The emitted bytes independently cross-check C and preprocessing evaluation. */
+#if __has_attribute(deprecated) > 1
+#define MAPPED_INTRINSIC_BRANCH 1
+#else
+#define MAPPED_INTRINSIC_BRANCH 0
+#endif
+const unsigned char mapped_intrinsic_expression = __has_attribute(deprecated) > 1;
+const unsigned char mapped_intrinsic_condition = 113 + MAPPED_INTRINSIC_BRANCH;
+
 /* Stateful expansions must follow source order, including discarded and raw
  * stringified arguments. The test compares against a separate compiler action,
  * without assuming the counter's initial value or increment. */
@@ -34,17 +46,6 @@ const unsigned char mapped_generated_header_value = 73 + MAPPED_FAMILY_GENERATED
 #define MAPPED_PASTED_VALUE 0
 #endif
 const unsigned char mapped_pasted_config_value = 91 + MAPPED_PASTED_VALUE;
-
-/* Exercise value-sensitive queries through the selected real compiler and the
- * default supplemental rounds. No compiler-family/version answer is supplied
- * by the test: the emitted bytes cross-check C and preprocessing evaluation. */
-#if __has_attribute(deprecated) > 1
-#define MAPPED_INTRINSIC_BRANCH 1
-#else
-#define MAPPED_INTRINSIC_BRANCH 0
-#endif
-const unsigned char mapped_intrinsic_expression = __has_attribute(deprecated) > 1;
-const unsigned char mapped_intrinsic_condition = 113 + MAPPED_INTRINSIC_BRANCH;
 
 /* Keep a distinct call in the same compiler invocation. An unrecognized
  * attribute is a valid measured integer result, not an unavailable answer.
@@ -102,16 +103,28 @@ const unsigned char mapped_fresh_paste = MAPPED_PASTE(MAPPED_LEFT, MAPPED_RIGHT)
 
 /* Like Linux COUNT_ARGS, these macros have only a variadic formal. Supplied
  * raw tails preserve the comma even when expansion makes an argument empty.
- * Do not include COUNT_ARGS(): that case requires separate dialect evidence. */
-#define MAPPED_ARG_COUNT(_0, _1, _2, N, ...) N
-#define MAPPED_COUNT_ARGS(...) MAPPED_ARG_COUNT(0, ##__VA_ARGS__, 2, 1, 0)
-#define MAPPED_NAMED_COUNT(args...) MAPPED_ARG_COUNT(0, ##args, 2, 1, 0)
+ * Empty invocations below require separate measured dialect evidence. */
+#define MAPPED_ARG_COUNT(_0, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, N, ...) N
+#define MAPPED_COUNT_ARGS(...) MAPPED_ARG_COUNT(0, ##__VA_ARGS__, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#define MAPPED_NAMED_COUNT(args...) MAPPED_ARG_COUNT(0, ##args, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
 #define MAPPED_EMPTY
 const unsigned char mapped_variadic_populated = 47 + MAPPED_COUNT_ARGS(a, b);
 const unsigned char mapped_variadic_expanded_empty = 53 + MAPPED_COUNT_ARGS(MAPPED_EMPTY);
 const unsigned char mapped_variadic_separator = 59 + MAPPED_COUNT_ARGS(,);
 const unsigned char mapped_variadic_named = 61 + MAPPED_NAMED_COUNT(a, b);
-#if MAPPED_COUNT_ARGS(a, b) == 2 && MAPPED_COUNT_ARGS(MAPPED_EMPTY) == 1 && MAPPED_COUNT_ARGS(,) == 2 && MAPPED_NAMED_COUNT(a, b) == 2
+const unsigned char mapped_variadic_maximum = 79 + MAPPED_COUNT_ARGS(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o);
+const unsigned char mapped_variadic_empty = 107 + MAPPED_COUNT_ARGS();
+const unsigned char mapped_variadic_named_empty = 107 + MAPPED_NAMED_COUNT();
+#if MAPPED_COUNT_ARGS() == 0 && MAPPED_NAMED_COUNT() == 0
+#if MAPPED_OPTION(USED_FAMILY_OPTION)
+const unsigned char mapped_variadic_empty_config = 110;
+#else
+const unsigned char mapped_variadic_empty_config = 109;
+#endif
+#else
+const unsigned char mapped_variadic_empty_config = 113;
+#endif
+#if MAPPED_COUNT_ARGS(a, b) == 2 && MAPPED_COUNT_ARGS(MAPPED_EMPTY) == 1 && MAPPED_COUNT_ARGS(,) == 2 && MAPPED_NAMED_COUNT(a, b) == 2 && MAPPED_COUNT_ARGS(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) == 15
 const unsigned char mapped_variadic_condition = 67;
 #if MAPPED_OPTION(USED_FAMILY_OPTION)
 const unsigned char mapped_variadic_config = 72;
@@ -121,6 +134,29 @@ const unsigned char mapped_variadic_config = 71;
 #else
 const unsigned char mapped_variadic_condition = 68;
 const unsigned char mapped_variadic_config = 79;
+#endif
+
+/* Linux-style counted dispatch must rescan a pasted function name together
+ * with the invocation following its replacement context. */
+#define MAPPED_DISPATCH(args...) MAPPED_PASTE(MAPPED_CASE_, MAPPED_COUNT_ARGS(args))(args)
+#define MAPPED_CASE_1(x) 83
+#define MAPPED_CASE_2(x, y) 89
+#define MAPPED_RESCAN_F(x) x
+#define MAPPED_RESCAN_G MAPPED_RESCAN_F
+#define MAPPED_RESCAN_RAW(x) #x
+#define MAPPED_RESCAN_STRING(x) MAPPED_RESCAN_RAW(x)
+#define MAPPED_RESCAN_FOO(x) marker x
+const unsigned char mapped_counted_dispatch = MAPPED_DISPATCH(a, b);
+const char mapped_alias_prescan[] = MAPPED_RESCAN_STRING(MAPPED_RESCAN_G(MAPPED_RESCAN_G)(3));
+const char mapped_disabled_tail[] = MAPPED_RESCAN_STRING(MAPPED_RESCAN_FOO(MAPPED_RESCAN_FOO)(2));
+#if MAPPED_DISPATCH(a) == 83 && MAPPED_DISPATCH(a, b) == 89
+#if MAPPED_OPTION(USED_FAMILY_OPTION)
+const unsigned char mapped_dispatch_config = 98;
+#else
+const unsigned char mapped_dispatch_config = 97;
+#endif
+#else
+const unsigned char mapped_dispatch_config = 103;
 #endif
 
 int mapped_kernel_smoke(void) {

@@ -50,6 +50,120 @@ func configDependencyMacroCallFixtureExpandForTest(c configDependencyMacroCallFi
 	return r, nil
 }
 
+func TestConfigDependencyMacroCallArityBoundary(t *testing.T) {
+	for _, size := range []int{16, 17, 31, 32, 33} {
+		formals, arguments := make([]string, size), make([]string, size)
+		for index := range size {
+			formals[index], arguments[index] = fmt.Sprintf("p%d", index), fmt.Sprintf("%d", index)
+		}
+		for _, variadic := range []bool{false, true} {
+			signature := strings.Join(formals, ",")
+			if variadic {
+				signature += ",..."
+			}
+			_, _, err := configDependencyMacroCallParse("F("+signature+") p0", configDependencyMacroCallMode{})
+			width := size
+			if variadic {
+				width++
+			}
+			if width > 32 {
+				if err == nil || err.Error() != "formal budget" {
+					t.Fatalf("signature width %d: %v", width, err)
+				}
+			} else if err != nil {
+				t.Fatalf("signature width %d: %v", width, err)
+			}
+		}
+		catalog, err := configDependencyMacroCallFixtureCatalogForTest("F(...) __VA_ARGS__")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, empty := range []bool{false, true} {
+			actual := strings.Join(arguments, ",")
+			if empty {
+				actual = strings.Repeat(",", size-1)
+			}
+			got, err := configDependencyMacroCallFixtureExpandForTest(catalog, "CONFIG_PREFIX F("+actual+")")
+			if size > 32 {
+				if err == nil || !strings.Contains(err.Error(), "argument budget") || !reflect.DeepEqual(got, configDependencyMacroCallResult{}) {
+					t.Fatalf("argument width %d published partial result: %#v, %v", size, got, err)
+				}
+			} else if err != nil {
+				t.Fatalf("argument width %d: %v", size, err)
+			}
+		}
+	}
+	// Nested commas are not top-level actual-argument separators.
+	catalog, err := configDependencyMacroCallFixtureCatalogForTest("F(x) x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := configDependencyMacroCallFixtureExpandForTest(catalog, "F(("+strings.Repeat("0,", 40)+"0))"); err != nil {
+		t.Fatalf("nested commas charged as actual arguments: %v", err)
+	}
+}
+
+const linuxShapeCounterHelperForTest = "__COUNT_ARGS(_0,_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11,_12,_13,_14,_15,_n,X...) _n"
+const linuxShapeCounterForTest = "COUNT_ARGS(X...) __COUNT_ARGS(,##X,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0)"
+
+func TestConfigDependencyMacroCallLinuxArgumentCounter(t *testing.T) {
+	catalog, err := configDependencyMacroCallFixtureCatalogForTest(linuxShapeCounterHelperForTest, linuxShapeCounterForTest, "EMPTY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ input, want string }{
+		{"COUNT_ARGS(a)", "1"},
+		{"COUNT_ARGS(EMPTY)", "1"},
+		{"COUNT_ARGS(,)", "2"},
+		{"COUNT_ARGS((a,b))", "1"},
+		{"COUNT_ARGS(a,b,c,d,e,f,g,h,i,j,k,l,m,n,o)", "15"},
+	} {
+		got, err := configDependencyMacroCallFixtureExpandForTest(catalog, tc.input)
+		if err != nil || !slices.Equal(got.Tokens, []string{tc.want}) {
+			t.Fatalf("%s: %#v, %v", tc.input, got, err)
+		}
+	}
+	for _, input := range []string{"COUNT_ARGS()", "COUNT_ARGS(a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p)"} {
+		got, err := configDependencyMacroCallFixtureExpandForTest(catalog, input)
+		if err == nil || !reflect.DeepEqual(got, configDependencyMacroCallResult{}) {
+			t.Fatalf("unsupported counter invocation published a result: %s: %#v, %v", input, got, err)
+		}
+	}
+}
+
+func TestConfigDependencyMacroCallForwardRescan(t *testing.T) {
+	for _, tc := range []struct {
+		name, input, want string
+		definitions       []string
+		reads             []string
+	}{
+		{"object alias", "ALIAS(1,UL)", "1UL", []string{"ALIAS JOIN", "JOIN(a,b) a##b"}, nil},
+		{"disabled function at boundary", "CONFIG_BEFORE F(0)(1)", "CONFIG_BEFORE F ( 1 )", []string{"F(x) F"}, []string{"CONFIG_BEFORE"}},
+		{"alias after self reference", "CONFIG_BEFORE A ALIAS(1,UL)", "CONFIG_BEFORE A 1UL", []string{"A A", "ALIAS JOIN", "JOIN(a,b) a##b"}, []string{"CONFIG_BEFORE"}},
+		{"no backward rescan", "F OPEN 1)", "F ( 1 )", []string{"F(x) CONFIG_WRONG", "OPEN ("}, nil},
+		{"popped alias before prescan", "g(g)(3)", "f ( 3 )", []string{"f(x) x", "g f"}, nil},
+		{"disabled last replacement token", "foo(foo)(2)", "bar foo ( 2 )", []string{"foo(x) bar x"}, nil},
+		{"Linux counted dispatch", "DISPATCH(a,b)", "22", []string{
+			linuxShapeCounterHelperForTest, linuxShapeCounterForTest,
+			"CAT_RAW(a,b) a##b", "CAT(a,b) CAT_RAW(a,b)",
+			"DISPATCH(X...) CAT(SELECT_,COUNT_ARGS(X))(X)",
+			"SELECT_1(x) CONFIG_ONE", "SELECT_2(x,y) CONFIG_TWO",
+			"CONFIG_ONE 11", "CONFIG_TWO 22",
+		}, []string{"CONFIG_TWO"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			catalog, err := configDependencyMacroCallFixtureCatalogForTest(tc.definitions...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := configDependencyMacroCallFixtureExpandForTest(catalog, tc.input)
+			if err != nil || strings.Join(got.Tokens, " ") != tc.want || !slices.Equal(got.ConfigReads, tc.reads) {
+				t.Fatalf("forward rescan: %#v, %v; want %q, reads %q", got, err, tc.want, tc.reads)
+			}
+		})
+	}
+}
+
 func TestConfigDependencyMacroCallSelfReferenceSuppression(t *testing.T) {
 	for _, test := range []struct {
 		name        string
@@ -196,8 +310,7 @@ func TestConfigDependencyMacroCallSelfReferenceKeepsUnsupportedBoundaries(t *tes
 		input, reason string
 	}{
 		{[]string{"A A", "AX _Pragma(\"bad\")", "JOIN(a,b) a##b", "FWD(a,b) JOIN(a,b)"}, "CONFIG_BEFORE FWD(A,X)", "preprocessing effect"},
-		{[]string{"F(x) F"}, "CONFIG_BEFORE F(0)(1)", "rescan boundary"},
-		{[]string{"A A", "ALIAS JOIN", "JOIN(a,b) a##b"}, "CONFIG_BEFORE A ALIAS(1,UL)", "rescan boundary"},
+		{[]string{"ALIAS EFFECT", "EFFECT(x) _Pragma(x)"}, "CONFIG_BEFORE ALIAS(\"bad\")", "preprocessing effect"},
 		{[]string{"A A"}, "CONFIG_BEFORE A _Pragma(\"bad\")", "preprocessing effect"},
 	} {
 		catalog, err := configDependencyMacroCallFixtureCatalogForTest(test.definitions...)
@@ -523,7 +636,6 @@ func TestConfigDependencyMacroCallEffectsAndUnknownsFailClosed(t *testing.T) {
 		{"nested prefix", []string{"OUT(a,b) a##b", "JOIN(a,b) a##b", "PRE_effect JOIN(_Pr,agma)"}, "OUT(PRE_,effect)", "preprocessing effect"},
 		{"prescanned effect", []string{"ID(x) x", "EFFECT _Pragma(\"GCC poison bad\")"}, "ID(EFFECT)", "preprocessing effect"},
 		{"different alternatives", []string{"JOIN(a,b) a##b", "JOIN(b,a) a##b"}, "JOIN(1,UL)", "ambiguous definition"},
-		{"alias across boundary", []string{"ALIAS JOIN", "JOIN(a,b) a##b"}, "ALIAS(1,UL)", "rescan boundary"},
 		{"empty paste argument", []string{"JOIN(a,b) a##b"}, "JOIN(,x)", "placemarker"},
 		{"invalid paste", []string{"JOIN(a,b) a##b"}, "JOIN(1,())", "invalid pasted token"},
 		{"wrong arity", []string{"JOIN(a,b) a##b"}, "JOIN(1)", "argument arity"},

@@ -27,10 +27,43 @@ func TestProbeRequestDigestMatchesCanonicalBytes(t *testing.T) {
 		if err != nil || got != hex.EncodeToString(want[:]) {
 			t.Fatalf("digest of %d input bytes = %q, %v; want exact canonical digest %x", len(text), got, err, want)
 		}
+		node := ProbePlanNode{Scope: "target", RequestID: got}
+		node.ID = node.ContentID()
+		plan := &ProbePlan{
+			Toolsets: map[string]string{"target": "sha256-" + strings.Repeat("4", 64)},
+			Requests: map[string]ProbeRequest{got: request},
+			Nodes:    []ProbePlanNode{node},
+			Terminal: []string{node.ID},
+		}
+		entries, err := plan.entries()
+		if err != nil {
+			t.Fatalf("canonical request rejected by plan: %v", err)
+		}
+		found := false
+		for _, entry := range entries {
+			if entry.path == "requests/"+got+".json" {
+				found = true
+				if !slices.Equal(entry.data, data) {
+					t.Fatal("plan changed the canonical request bytes")
+				}
+			}
+		}
+		if !found {
+			t.Fatal("plan omitted its canonical request")
+		}
 		request.Steps[0].Stdin += "changed"
 		changed, err := request.ID()
 		if err != nil || got == changed {
 			t.Fatalf("mutation reused identity: %q, %v", changed, err)
+		}
+		plan.Requests[got] = request
+		if _, err := plan.entries(); err == nil || !strings.Contains(err.Error(), "does not match canonical content") {
+			t.Fatalf("plan accepted a stale request digest: %v", err)
+		}
+		request.Schema = "invalid"
+		plan.Requests[got] = request
+		if _, err := plan.entries(); err == nil {
+			t.Fatal("plan skipped request validation")
 		}
 	}
 	invalid := testProbeRequest()
@@ -84,6 +117,40 @@ func BenchmarkProbeRequestIdentity(b *testing.B) {
 					_ = hex.EncodeToString(digest[:])
 				} else if _, err := request.ID(); err != nil {
 					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// Compare the old plan-entry double pass with reuse of the canonical bytes
+// that entry emission already needs. Both paths validate the original request
+// and must produce the same identity. This is not a whole-planner benchmark.
+func BenchmarkProbePlanRequestEncoding(b *testing.B) {
+	request := testProbeRequest()
+	request.Steps[0].Stdin = strings.Repeat("#if defined(SOURCE_HEADER_GUARD)\n1\n#else\n0\n#endif\n", 16000)
+	want, err := request.ID()
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, reuse := range []bool{false, true} {
+		b.Run(fmt.Sprintf("reuse_canonical_%t", reuse), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(request.Steps[0].Stdin)))
+			for b.Loop() {
+				data, err := request.CanonicalJSON()
+				if err != nil {
+					b.Fatal(err)
+				}
+				var got string
+				if reuse {
+					digest := sha256.Sum256(data)
+					got = hex.EncodeToString(digest[:])
+				} else {
+					got, err = request.ID()
+				}
+				if err != nil || got != want {
+					b.Fatalf("request identity changed: %q, %v", got, err)
 				}
 			}
 		})

@@ -27,6 +27,7 @@ type KbuildCompilerGuardAnswers struct {
 	entries    map[configDependencyCompilerPredefineRequestKey]kbuildCompilerGuardAnswerEntry
 	intrinsics map[configDependencyCompilerPredefineRequestKey]map[CompilerIntrinsicCall]kbuildCompilerIntrinsicAnswer
 	counters   map[configDependencyCompilerPredefineRequestKey]kbuildCompilerCounterAnswer
+	variadics  map[compilerVariadicCommaKey]compilerVariadicCommaAnswer
 }
 
 // Definedness queries already normalize recognized object-like -D replacement
@@ -140,6 +141,7 @@ func (b *KbuildCompilerGuardBatch) Answers() (*KbuildCompilerGuardAnswers, error
 	}
 	answers.intrinsics = b.intrinsicAnswers(plan.Toolsets)
 	answers.counters = b.counterAnswers(plan.Toolsets)
+	answers.variadics = b.variadicAnswers(plan.Toolsets)
 	return answers, nil
 }
 

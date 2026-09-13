@@ -382,6 +382,8 @@ type familyCompilerGuardPipeline struct {
 	limitCurrent, limitMax  int
 	optional                *familyCompilerGuardOptionalStage
 	tokenHints              *familyCompilerGuardOptionalStage
+	counterHints            *familyCompilerGuardOptionalStage
+	variadicHints           *familyCompilerGuardOptionalStage
 	literalHints            *familyCompilerGuardOptionalStage
 	// Pending reservations are tier-local and never become compiler answers.
 	// Entries are inserted only after the existing context/name/byte limits pass.
@@ -506,7 +508,7 @@ func newFamilyCompilerGuardPipeline(flags *familyCompilerGuardFlags, inputs []fa
 				last = key
 				queryCount++
 				nameCount += len(query.Names)
-				callCount += len(query.Calls) + query.CounterCount
+				callCount += len(query.Calls) + query.CounterCount + query.variadicValues()
 				uniqueQueries[query.payloadKey()] = struct{}{}
 				expandedBytes += familyCompilerGuardExpandedQueryBytes(query)
 				if queryCount > maxFamilyCompilerGuardMemberships || len(uniqueQueries) > maxFamilyCompilerGuardQueries ||
@@ -643,8 +645,8 @@ func (p *familyCompilerGuardPipeline) prepareVariant(name string, scopes *kconfi
 			for _, call := range query.Calls {
 				p.known[key][familyCompilerIntrinsicCallKey(call)] = true
 			}
-			if query.CounterCount > p.counterKnown[key] {
-				p.counterKnown[key] = query.CounterCount
+			if query.CounterCount > p.counterKnown[query.counterContextKey()] {
+				p.counterKnown[query.counterContextKey()] = query.CounterCount
 			}
 		}
 		plan, err := batch.Plan()
@@ -670,10 +672,11 @@ func (p *familyCompilerGuardPipeline) prepareVariant(name string, scopes *kconfi
 		return err
 	}
 	metadata.SetCompilerGuardAnswers(answers)
-	for _, stage := range []*familyCompilerGuardOptionalStage{p.optional, p.tokenHints, p.literalHints} {
+	for _, stage := range []*familyCompilerGuardOptionalStage{p.optional, p.tokenHints, p.counterHints, p.literalHints, p.variadicHints} {
 		if stage != nil && !stage.disabled {
 			stage.ledger.active = map[string]*familyCompilerGuardQuery{}
 			stage.ledger.known = p.known
+			stage.ledger.counterKnown = p.counterKnown
 			stage.ledger.queryBytes = map[string]int{}
 			stage.ledger.pendingNames = nil
 			stage.ledger.priority = p.priority
@@ -702,7 +705,7 @@ func (p *familyCompilerGuardPipeline) reportDiagnostics(event string) {
 
 func familyCompilerGuardExpandedQueryBytes(query familyCompilerGuardQuery) int {
 	data, _ := json.Marshal(query.compilerContext())
-	size := len(data) + familyCompilerGuardQueryReferenceBytes
+	size := len(data) + familyCompilerGuardQueryReferenceBytes + query.variadicBytes()
 	for _, name := range query.Names {
 		size += len(name) + 4
 	}
@@ -785,6 +788,22 @@ func (p *familyCompilerGuardPipeline) exceedsLimit(reason string, current, maxim
 }
 
 func (p *familyCompilerGuardPipeline) observe(value kconfig.ConfigDependencyCompilerGuardObservation) error {
+	if value.OptionalVariadicHints && value.VariadicCommaSyntax == "" {
+		return fmt.Errorf("optional variadic observation has no grammar syntax")
+	}
+	if value.VariadicCommaSyntax != "" {
+		if len(value.Names) != 0 || len(value.Calls) != 0 || value.CounterCount != 0 || value.OptionalCounterHints ||
+			value.OptionalDefinedness || value.OptionalTokenHints || value.LiteralIncludeHints || value.Truncated {
+			return fmt.Errorf("variadic grammar observation mixes query kinds")
+		}
+		if p.truncated {
+			return nil
+		}
+		return p.observeVariadicComma(value)
+	}
+	if value.OptionalCounterHints && value.CounterCount == 0 {
+		return fmt.Errorf("optional counter observation has no measured-prefix request")
+	}
 	if value.CounterCount != 0 && (len(value.Names) != 0 || len(value.Calls) != 0 ||
 		value.OptionalDefinedness || value.OptionalTokenHints || value.LiteralIncludeHints || value.Truncated) {
 		return fmt.Errorf("compiler observation mixes counter sequence and other demands")
@@ -794,6 +813,9 @@ func (p *familyCompilerGuardPipeline) observe(value kconfig.ConfigDependencyComp
 	}
 	if p.truncated {
 		return nil
+	}
+	if value.OptionalCounterHints {
+		return p.observeCounterHints(value)
 	}
 	if value.OptionalDefinedness {
 		return p.observeOptionalDefinedness(value)
@@ -949,7 +971,13 @@ func (p *familyCompilerGuardPipeline) finishVariant(name string, scopes *kconfig
 	if err := p.finishOptionalVariant(name, scopes, p.optional); err != nil {
 		return err
 	}
+	if err := p.finishOptionalVariant(name, scopes, p.variadicHints); err != nil {
+		return err
+	}
 	if err := p.finishOptionalVariant(name, scopes, p.tokenHints); err != nil {
+		return err
+	}
+	if err := p.finishOptionalVariant(name, scopes, p.counterHints); err != nil {
 		return err
 	}
 	if err := p.finishOptionalVariant(name, scopes, p.literalHints); err != nil {
@@ -991,6 +1019,10 @@ func (p *familyCompilerGuardPipeline) publish() error {
 		if err := p.admitOptionalQueries(); err != nil {
 			return err
 		}
+		if err := p.admitOptionalStage(p.variadicHints); err != nil {
+			return err
+		}
+		p.variadicHints = nil
 		if err := p.admitOptionalStage(p.tokenHints); err != nil {
 			return err
 		}
@@ -999,6 +1031,10 @@ func (p *familyCompilerGuardPipeline) publish() error {
 			return err
 		}
 		p.literalHints = nil
+		if err := p.admitOptionalStage(p.counterHints); err != nil {
+			return err
+		}
+		p.counterHints = nil
 	}
 	if p.truncated {
 		// One overflow invalidates the entire new frontier, including already
@@ -1161,6 +1197,7 @@ func (p *familyCompilerGuardPipeline) finishOptionalVariant(name string, scopes 
 	}
 	defer func() {
 		stage.ledger.active, stage.ledger.known, stage.ledger.queryBytes = nil, nil, nil
+		stage.ledger.counterKnown = nil
 		stage.ledger.pendingNames, stage.ledger.priority = nil, nil
 	}()
 	if p.truncated || stage.disabled || len(stage.ledger.active) == 0 {
@@ -1177,6 +1214,18 @@ func (p *familyCompilerGuardPipeline) finishOptionalVariant(name string, scopes 
 		if err := query.validatePayload(); err != nil {
 			return err
 		}
+		if query.Kind == familyCompilerCounterHintQueryKind {
+			// Actual source demands own their own mandatory request. A weak
+			// inventory must not add a duplicate attempt for the same prefix.
+			if strong := p.active[query.counterContextKey()]; strong != nil && strong.CounterCount >= query.CounterCount {
+				continue
+			}
+		}
+		if query.variadicSyntax() != "" && p.active[query.contextKey()] != nil {
+			// A reached demand owns this exact attempt even if its weak hint
+			// was observed first. Never spend optional capacity on a duplicate.
+			continue
+		}
 		// Rejection is authenticated against current ordinary dependencies in
 		// prepareVariant, and binds this exact residual vector, not its names.
 		if p.rejected[query.payloadKey()] {
@@ -1186,7 +1235,21 @@ func (p *familyCompilerGuardPipeline) finishOptionalVariant(name string, scopes 
 			stage.disable("staging_unique_query_limit")
 			return nil
 		}
-		_, state, reference, err := batch.OptionalCompilerDefinednessAttempt(query.Scope, query.Role, query.Language, query.Arguments, query.TranslationUnits, query.Names, query.Environment)
+		var reference kconfig.ProbeReference
+		pending := false
+		if query.Kind == familyCompilerCounterHintQueryKind {
+			var state kconfig.OptionalCompilerCounterState
+			state, reference, err = batch.OptionalCompilerCounterSequenceAttempt(query.Scope, query.Role, query.Language, query.Arguments, query.TranslationUnits, query.CounterCount, query.Environment)
+			pending = state == kconfig.OptionalCompilerCounterPending
+		} else if syntax := query.variadicSyntax(); syntax != "" {
+			var state kconfig.OptionalCompilerVariadicCommaState
+			_, state, reference, err = batch.OptionalCompilerVariadicCommaAttempt(query.Scope, query.Role, query.Language, query.Arguments, query.TranslationUnits, syntax, query.Environment)
+			pending = state == kconfig.OptionalCompilerVariadicCommaPending
+		} else {
+			var state kconfig.OptionalCompilerDefinednessState
+			_, state, reference, err = batch.OptionalCompilerDefinednessAttempt(query.Scope, query.Role, query.Language, query.Arguments, query.TranslationUnits, query.Names, query.Environment)
+			pending = state == kconfig.OptionalCompilerDefinednessPending
+		}
 		if err != nil {
 			var limit *kconfig.CompilerGuardDependencyLimitError
 			if errors.As(err, &limit) {
@@ -1197,7 +1260,7 @@ func (p *familyCompilerGuardPipeline) finishOptionalVariant(name string, scopes 
 			}
 			return err
 		}
-		if state != kconfig.OptionalCompilerDefinednessPending || reference.NodeID == "" {
+		if !pending || reference.NodeID == "" {
 			return fmt.Errorf("optional discovery did not register its exact pending terminal")
 		}
 		variant.queries = append(variant.queries, familyCompilerGuardOptionalQuery{query: query, terminal: reference.NodeID})
@@ -1210,6 +1273,9 @@ func (p *familyCompilerGuardPipeline) finishOptionalVariant(name string, scopes 
 		return err
 	}
 	variant.terminals = slices.Clone(plan.Terminal)
+	if stage.supportsPlanSubset() {
+		return p.finishOptionalHintVariant(stage, variant, plan)
+	}
 	// Bound the incoming detached plan before merging it with retained work.
 	// This also bounds temporary union construction independently of deduplication.
 	if len(plan.Nodes) > maxFamilyCompilerGuardMemberships {
@@ -1248,26 +1314,36 @@ func (p *familyCompilerGuardPipeline) finishOptionalVariant(name string, scopes 
 	stage.planNodes += len(plan.Nodes) - previousNodes
 	stage.plan = plan
 	stage.variants = append(stage.variants, variant)
-	p.enforceOptionalStagingBudget()
-	return nil
+	return p.enforceOptionalStagingBudget()
 }
 
 // All optional tiers share the original cap, across all variants. Reconsider
-// them strongest-first whenever a later sibling adds work: literal candidates
-// may be discarded, but can never evict an entered-file hint or actual demand.
-func (p *familyCompilerGuardPipeline) enforceOptionalStagingBudget() {
+// them strongest-first whenever a later sibling adds work. Actual demands
+// precede grammar inventories, which precede speculative name/counter hints.
+// At most two grammar queries per compiler context can unblock calls hidden
+// behind unresolved conditions; waiting for the call itself can be too late
+// in the fixed discovery rounds. Priority supplies no grammar facts.
+func (p *familyCompilerGuardPipeline) enforceOptionalStagingBudget() error {
 	bytes, nodes := 0, 0
-	for _, stage := range []*familyCompilerGuardOptionalStage{p.optional, p.tokenHints, p.literalHints} {
+	// Counter prefetch must never evict any pre-existing hint tier, including
+	// literal lookahead. Spend only its residual storage and query capacity.
+	for _, stage := range []*familyCompilerGuardOptionalStage{p.optional, p.variadicHints, p.tokenHints, p.literalHints, p.counterHints} {
 		if stage == nil || stage.disabled {
 			continue
 		}
 		if stage.planBytes > maxFamilyCompilerGuardBytes/2-bytes || stage.planNodes > maxFamilyCompilerGuardMemberships-nodes {
-			stage.disable("staging_plan_limit")
-			continue
+			if !stage.supportsPlanSubset() {
+				stage.disable("staging_plan_limit")
+				continue
+			}
+			if err := stage.trimOptionalHintPlan(maxFamilyCompilerGuardBytes/2-bytes, maxFamilyCompilerGuardMemberships-nodes); err != nil {
+				return err
+			}
 		}
 		bytes += stage.planBytes
 		nodes += stage.planNodes
 	}
+	return nil
 }
 
 // Count each already-bounded request separately instead of allocating a second
@@ -1312,7 +1388,7 @@ func (p *familyCompilerGuardPipeline) admitOptionalQuery(query familyCompilerGua
 }
 
 func (p *familyCompilerGuardPipeline) admitOptionalQueryForStage(query familyCompilerGuardQuery, stage *familyCompilerGuardOptionalStage) (familyCompilerGuardQuery, bool, error) {
-	if query.Kind != familyCompilerOptionalDefinednessQueryKind && query.Kind != familyCompilerTokenHintQueryKind && query.Kind != familyCompilerLiteralHintQueryKind {
+	if query.Kind != familyCompilerOptionalDefinednessQueryKind && query.Kind != familyCompilerTokenHintQueryKind && query.Kind != familyCompilerCounterHintQueryKind && query.Kind != familyCompilerLiteralHintQueryKind && query.variadicSyntax() == "" {
 		return familyCompilerGuardQuery{}, false, fmt.Errorf("optional admission received a baseline query")
 	}
 	if err := query.validatePayload(); err != nil {
@@ -1342,11 +1418,19 @@ func (p *familyCompilerGuardPipeline) admitOptionalQueryForStage(query familyCom
 	if _, found := p.uniqueQueries[key]; !found {
 		unique++
 	}
-	stdin := 0
+	stdin := query.variadicBytes()
+	compact += stdin
+	expanded += stdin
 	for _, name := range query.Names {
 		compact += len(name) + 4
 		expanded += len(name) + 4
 		stdin += len(name) + 64
+	}
+	if query.CounterCount != 0 {
+		payload := familyCompilerCounterPayloadBytes(query.CounterCount)
+		compact += payload
+		expanded += payload
+		stdin, _ = kconfig.CompilerCounterSequenceSourceBytes(query.CounterCount)
 	}
 	for _, limit := range []struct {
 		reason           string
@@ -1358,7 +1442,7 @@ func (p *familyCompilerGuardPipeline) admitOptionalQueryForStage(query familyCom
 		{"string_limit", words, maxFamilyCompilerGuardStrings},
 		{"reference_limit", references, maxFamilyCompilerGuardReferences},
 		{"name_value_limit", p.nameCount + len(query.Names), 1 << 20},
-		{"intrinsic_value_limit", p.callCount, maxFamilyCompilerIntrinsicCalls},
+		{"intrinsic_value_limit", p.callCount + query.CounterCount + query.variadicValues(), maxFamilyCompilerIntrinsicCalls},
 		{"estimated_bytes_limit", p.bytes + compact, maxFamilyCompilerGuardBytes / 2},
 		{"expanded_bytes_limit", p.expandedBytes + expanded, maxFamilyCompilerGuardExpandedBytes},
 		{"query_name_limit", len(query.Names), 4096},
@@ -1380,6 +1464,14 @@ func (p *familyCompilerGuardPipeline) admitOptionalQueryForStage(query familyCom
 		p.expandedBytes += len(name) + 4
 	}
 	p.nameCount += len(query.Names)
+	p.bytes += query.variadicBytes()
+	p.expandedBytes += query.variadicBytes()
+	p.callCount += query.variadicValues()
+	if query.CounterCount != 0 {
+		p.bytes += familyCompilerCounterPayloadBytes(query.CounterCount)
+		p.expandedBytes += familyCompilerCounterPayloadBytes(query.CounterCount)
+		p.callCount += query.CounterCount
+	}
 	if p.uniqueQueries == nil {
 		p.uniqueQueries = map[string]struct{}{}
 	}

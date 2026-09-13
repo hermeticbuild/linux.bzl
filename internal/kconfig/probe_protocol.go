@@ -790,9 +790,15 @@ func validateCompilerIntrinsicProbeShape(step ProbeStep) error {
 	return err
 }
 
-// Both admitted input shapes share the same literal-preserving projection.
+// Admitted input shapes share the same literal-preserving projection.
 // The protected bindings come from validated static input, never caller claims.
 func compilerIntrinsicProbeOperators(step ProbeStep) (map[string]bool, error) {
+	if step.Name == compilerVariadicCommaStep {
+		if _, err := compilerVariadicCommaProbeSyntax(step); err != nil {
+			return nil, err
+		}
+		return map[string]bool{compilerVariadicCommaMacro: true}, nil
+	}
 	if step.Name == compilerCounterSequenceStep {
 		if _, err := compilerCounterProbeCount(step); err != nil {
 			return nil, err
@@ -2054,7 +2060,11 @@ func (p *ProbePlan) entries() ([]actionPlanEntry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("probe request %s: %w", id, err)
 		}
-		actual, _ := request.ID()
+		// CanonicalJSON already validated the request and produced the exact
+		// newline-terminated bytes hashed by ID. Reuse those bytes instead of
+		// validating and encoding the same potentially large program again.
+		digest := sha256.Sum256(data)
+		actual := hex.EncodeToString(digest[:])
 		if actual != id {
 			return nil, fmt.Errorf("probe request ID %s does not match canonical content %s", id, actual)
 		}

@@ -243,12 +243,13 @@ func TestFamilyOptionalDefinednessUsesRealCompilerResults(t *testing.T) {
 		ExitCode int             `json:"exit_code"`
 	}
 	var got struct {
-		Schema          string                      `json:"schema"`
-		Toolset         string                      `json:"toolset"`
-		CompilerVersion string                      `json:"compiler_version"`
-		Cases           map[string]caseResult       `json:"cases"`
-		Checks          []string                    `json:"checks"`
-		MacroWrites     map[string]macroWriteResult `json:"macro_writes"`
+		Schema          string                         `json:"schema"`
+		Toolset         string                         `json:"toolset"`
+		CompilerVersion string                         `json:"compiler_version"`
+		Cases           map[string]caseResult          `json:"cases"`
+		Checks          []string                       `json:"checks"`
+		MacroWrites     map[string]macroWriteResult    `json:"macro_writes"`
+		VariadicCommas  map[string]variadicCommaResult `json:"variadic_commas"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -302,6 +303,48 @@ type macroWriteResult struct {
 	NodeID   string `json:"node_id"`
 	Success  bool   `json:"success"`
 	ExitCode int    `json:"exit_code"`
+}
+
+type variadicCommaResult struct {
+	NodeID       string `json:"node_id"`
+	DirectNodeID string `json:"direct_node_id"`
+	DeleteComma  *bool  `json:"delete_comma"`
+	ExitCode     int    `json:"exit_code"`
+}
+
+func TestFamilyVariadicCommaGrammarUsesActualCompiler(t *testing.T) {
+	var got struct {
+		CompilerVersion string                         `json:"compiler_version"`
+		VariadicCommas  map[string]variadicCommaResult `json:"variadic_commas"`
+	}
+	readHelperJSON(t, runfileFromEnv(t, "FAMILY_SMOKE_OPTIONAL_DEFINEDNESS"), &got)
+	if len(got.VariadicCommas) != 6 || strings.TrimSpace(got.CompilerVersion) == "" {
+		t.Fatal("missing real variadic compiler measurements")
+	}
+	seen := map[string]bool{}
+	for _, name := range []string{"standard-c11", "standard-gnu11", "named-c11", "named-gnu11", "standard-conflicting-defines", "named-conflicting-defines"} {
+		entry, ok := got.VariadicCommas[name]
+		if !ok {
+			t.Fatalf("missing %s", name)
+		}
+		for _, node := range []string{entry.NodeID, entry.DirectNodeID} {
+			if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(node) || seen[node] {
+				t.Fatal("missing or aliased independent compiler query")
+			}
+			seen[node] = true
+		}
+		if strings.HasSuffix(name, "conflicting-defines") {
+			if entry.DeleteComma != nil || entry.ExitCode < 1 || entry.ExitCode > 255 {
+				t.Fatal("failed query granted a grammar fact")
+			}
+		} else {
+			if entry.DeleteComma == nil || entry.ExitCode != 0 {
+				t.Fatalf("%s has no successful grammar measurement", name)
+			}
+			t.Logf("%s measured delete-comma=%t", name, *entry.DeleteComma)
+		}
+	}
+	t.Logf("variadic grammar verified against %s", got.CompilerVersion)
 }
 
 func TestFamilyConfigMacroWritesPreserveCompilerDiagnostics(t *testing.T) {

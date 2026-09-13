@@ -1,10 +1,32 @@
 package main
 
-import (
-	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
-)
+import "github.com/hermeticbuild/linux.bzl/internal/kconfig"
 
 const familyCompilerCounterQueryKind = "counter-sequence"
+const familyCompilerCounterHintQueryKind = "optional-counter-hints"
+
+func (q familyCompilerGuardQuery) counterContextKey() string {
+	q.Kind = familyCompilerCounterQueryKind
+	return q.contextKey()
+}
+
+func (p *familyCompilerGuardPipeline) observeCounterHints(value kconfig.ConfigDependencyCompilerGuardObservation) error {
+	if p.counterHints == nil {
+		p.counterHints = &familyCompilerGuardOptionalStage{kind: familyCompilerCounterHintQueryKind,
+			ledger: familyCompilerGuardPipeline{active: map[string]*familyCompilerGuardQuery{}, counterKnown: p.counterKnown}}
+	}
+	stage := p.counterHints
+	if stage.disabled {
+		return nil
+	}
+	if err := stage.ledger.observeCounterSequence(value); err != nil {
+		return err
+	}
+	if stage.ledger.truncated {
+		stage.disable("staging_" + stage.ledger.limitReason)
+	}
+	return nil
+}
 
 // Count carries no per-token wire array, but charge both its framing and the
 // generated input. The total value budget is shared with intrinsic calls.
@@ -23,6 +45,9 @@ func (p *familyCompilerGuardPipeline) observeCounterSequence(value kconfig.Confi
 		Arguments: value.Arguments, TranslationUnits: value.TranslationUnits, Environment: value.Environment,
 		CounterCount: value.CounterCount,
 	}
+	if value.OptionalCounterHints {
+		query.Kind = familyCompilerCounterHintQueryKind
+	}
 	if err := query.validatePayload(); err != nil {
 		return err
 	}
@@ -30,7 +55,7 @@ func (p *familyCompilerGuardPipeline) observeCounterSequence(value kconfig.Confi
 		return err
 	}
 	key := query.contextKey()
-	if p.counterKnown[key] >= query.CounterCount {
+	if p.counterKnown[query.counterContextKey()] >= query.CounterCount {
 		return nil
 	}
 	entry := p.active[key]

@@ -24,10 +24,10 @@ func (s *configDependencyClosureScanner) configureCompilerCounterQueries(
 	probe configDependencyCompilerPredefineProbe,
 	observe func(configDependencyCompilerPredefineProbe, configDependencyScanFile, configDependencyCompilerGuardHints, string),
 ) {
-	if s.callCoverage == nil {
-		return
+	s.compilerCounterHint = nil
+	if s.callCoverage != nil {
+		s.callCoverage.mode.counterMissing = nil
 	}
-	s.callCoverage.mode.counterMissing = nil
 	if !s.collectCompilerGuards || observe == nil || probe.language != "c" && probe.language != "c++" {
 		return
 	}
@@ -39,6 +39,29 @@ func (s *configDependencyClosureScanner) configureCompilerCounterQueries(
 	if err != nil {
 		return
 	} // Initial-state construction reports replay errors.
+	// An entered file can mention the counter before complete call expansion
+	// reaches it. Prefetch is only a weaker scheduling hint, never an expansion
+	// read or a source-state transition. It needs the measured nontextual initial
+	// binding and does not grow an already measured prefix speculatively.
+	if s.compilerCounterInitialAvailable && sequence == nil {
+		s.compilerCounterHint = func(file configDependencyScanFile, contentID string) {
+			observe(probe, file, configDependencyCompilerGuardHints{counterCount: compilerCounterDemandCount(1), optionalCounterHints: true}, contentID)
+		}
+	} else if s.compilerIntrinsicInitialSnapshot != nil {
+		// Availability itself can be hidden behind an earlier source failure.
+		// Ask through the existing weak definedness tier before requesting values;
+		// a spelling, dump omission or failed attempt never means undefined.
+		initial, valid := s.compilerIntrinsicInitialSnapshot.lookup("__COUNTER__")
+		_, measured := s.compilerGuardInitialDefinitions["__COUNTER__"]
+		if valid && initial.definition == configDependencyMacroUnknown && !measured {
+			s.compilerCounterHint = func(file configDependencyScanFile, contentID string) {
+				observe(probe, file, configDependencyCompilerGuardHints{names: []string{"__COUNTER__"}, optionalTokenHints: true}, contentID)
+			}
+		}
+	}
+	if s.callCoverage == nil {
+		return
+	}
 	s.callCoverage.mode.counterMissing = func(context string, required int) {
 		if context != contextID || sequence != nil && required <= len(sequence.values) {
 			return

@@ -342,7 +342,7 @@ type configDependencyMacroState struct {
 	// coverage. The ordinary definedness scanner leaves it nil. Each speculative
 	// branch owns its map; replacement records themselves are immutable values.
 	macroReplacements map[string]configDependencyMacroReplacement
-	// Compiler counter source-order state is branch-owned and every
+	// Isolated counter experiment: source-order state is branch-owned and every
 	// advance participates in revision validation, even without a namespace write.
 	counter compilerCounterCursor
 	// compilerPredefinedDigest is the canonical defined-name projection of a
@@ -3339,6 +3339,9 @@ type configDependencyClosureScanner struct {
 	compilerIntrinsicInitialAvailable map[string]bool
 	compilerIntrinsicInitialSnapshot  *configDependencyMacroSnapshot
 	compilerIntrinsicAnswered         func(CompilerIntrinsicCall) (bool, error)
+	compilerCounterInitialAvailable   bool
+	compilerCounterHint               func(configDependencyScanFile, string)
+	compilerVariadicHint              func(configDependencyScanFile, string, string)
 
 	sourceLookup           configDependencySourceLookup
 	language               string
@@ -7998,8 +8001,12 @@ func actionPlanNodeConfigDependenciesForSourceLookup(
 			}
 		}
 		scanner.compilerIntrinsicInitialSnapshot = parsed.state.snapshot
+		scanner.compilerCounterInitialAvailable = result.guardDefinitions["__COUNTER__"]
 		for _, expansion := range parsed.state.macroExpansions {
 			delete(scanner.compilerIntrinsicInitialAvailable, expansion.name)
+			if expansion.name == "__COUNTER__" {
+				scanner.compilerCounterInitialAvailable = false
+			}
 		}
 		// A parsed predefine dump is immutable after entering the analysis cache.
 		// Translation units and every speculative path inherit it through branch
@@ -8028,6 +8035,7 @@ func actionPlanNodeConfigDependenciesForSourceLookup(
 	}
 	scanner.configureCompilerIntrinsicQueries(plan, node, invocation.tool, guardProbe, compilerGuards)
 	scanner.configureCompilerCounterQueries(plan, node, invocation.tool, guardProbe, compilerGuards)
+	scanner.configureCompilerVariadicQueries(plan, node, invocation.tool, guardProbe, compilerGuards)
 	scanner.language = compilerLanguage
 	if callCoverage && macroState == nil {
 		return opaqueConfigDependency("call coverage requires execution-probed compiler state")
@@ -8529,10 +8537,11 @@ func configDependencyCompletedCompilerCandidateForNode(
 		(recipe.Tool != "cc" && recipe.Tool != "cxx" && recipe.CompilerInvocation == nil) {
 		return configDependencyCompletedCompilerCandidate{}, false
 	}
-	// Intrinsic calls and counter sequences carry independent value-sensitive request/result witnesses.
+	// Intrinsic calls, counter sequences and variadic grammar carry independent
+	// value-sensitive request/result witnesses.
 	// Until this optional cache commits to those witnesses, fresh source/binding
 	// replay is mandatory; the older definedness-only key is insufficient.
-	if answers := plan.metadata.compilerGuardAnswers; answers != nil && (len(answers.intrinsics) != 0 || len(answers.counters) != 0) {
+	if answers := plan.metadata.compilerGuardAnswers; answers != nil && (len(answers.intrinsics) != 0 || len(answers.counters) != 0 || len(answers.variadics) != 0) {
 		return configDependencyCompletedCompilerCandidate{}, false
 	}
 	if node.Stage != "prehost" && node.Stage != "host" {

@@ -38,11 +38,15 @@ func familyCompilerIntrinsicCallKey(call kconfig.CompilerIntrinsicCall) string {
 }
 
 func (q familyCompilerGuardQuery) validatePayload() error {
-	if q.Kind != familyCompilerCounterQueryKind && q.CounterCount != 0 {
+	if q.Kind != familyCompilerCounterQueryKind && q.Kind != familyCompilerCounterHintQueryKind && q.CounterCount != 0 {
 		return fmt.Errorf("non-counter compiler query contains a sequence count")
 	}
 	switch q.Kind {
-	case familyCompilerCounterQueryKind:
+	case "variadic-comma-standard", "variadic-comma-named":
+		if q.Names != nil || q.Calls != nil || q.Language != "c" && q.Language != "c++" {
+			return fmt.Errorf("variadic compiler query has a noncanonical payload")
+		}
+	case familyCompilerCounterQueryKind, familyCompilerCounterHintQueryKind:
 		if q.Names != nil || q.Calls != nil || q.Language != "c" && q.Language != "c++" {
 			return fmt.Errorf("compiler counter query has a noncanonical payload")
 		}
@@ -84,6 +88,38 @@ func (q familyCompilerGuardQuery) evaluate(batch *kconfig.KbuildCompilerGuardBat
 func (q familyCompilerGuardQuery) evaluateCompletion(batch *kconfig.KbuildCompilerGuardBatch) (kconfig.OptionalCompilerDefinednessState, error) {
 	if err := q.validatePayload(); err != nil {
 		return kconfig.OptionalCompilerDefinednessPending, err
+	}
+	if syntax := q.variadicSyntax(); syntax != "" {
+		_, state, _, err := batch.OptionalCompilerVariadicCommaAttempt(q.Scope, q.Role, q.Language, q.Arguments, q.TranslationUnits, syntax, q.Environment)
+		if err != nil {
+			return kconfig.OptionalCompilerDefinednessPending, err
+		}
+		switch state {
+		case kconfig.OptionalCompilerVariadicCommaPending:
+			return kconfig.OptionalCompilerDefinednessPending, nil
+		case kconfig.OptionalCompilerVariadicCommaAnswered:
+			return kconfig.OptionalCompilerDefinednessAnswered, nil
+		case kconfig.OptionalCompilerVariadicCommaUnqueryable:
+			return kconfig.OptionalCompilerDefinednessUnqueryable, nil
+		default:
+			return kconfig.OptionalCompilerDefinednessPending, fmt.Errorf("invalid variadic attempt state")
+		}
+	}
+	if q.Kind == familyCompilerCounterHintQueryKind {
+		state, _, err := batch.OptionalCompilerCounterSequenceAttempt(q.Scope, q.Role, q.Language, q.Arguments, q.TranslationUnits, q.CounterCount, q.Environment)
+		if err != nil {
+			return kconfig.OptionalCompilerDefinednessPending, err
+		}
+		switch state {
+		case kconfig.OptionalCompilerCounterPending:
+			return kconfig.OptionalCompilerDefinednessPending, nil
+		case kconfig.OptionalCompilerCounterAnswered:
+			return kconfig.OptionalCompilerDefinednessAnswered, nil
+		case kconfig.OptionalCompilerCounterUnqueryable:
+			return kconfig.OptionalCompilerDefinednessUnqueryable, nil
+		default:
+			return kconfig.OptionalCompilerDefinednessPending, fmt.Errorf("unknown optional counter completion")
+		}
 	}
 	if q.Kind == familyCompilerOptionalDefinednessQueryKind || q.Kind == familyCompilerTokenHintQueryKind || q.Kind == familyCompilerLiteralHintQueryKind {
 		_, state, err := batch.OptionalCompilerDefinedness(q.Scope, q.Role, q.Language, q.Arguments, q.TranslationUnits, q.Names, q.Environment)

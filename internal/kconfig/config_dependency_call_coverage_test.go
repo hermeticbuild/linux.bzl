@@ -7,6 +7,70 @@ import (
 	"testing"
 )
 
+func TestConfigDependencyCallCoverageLinuxArgumentCounter(t *testing.T) {
+	for _, tc := range []struct{ call, count, reason string }{
+		{"COUNT_ARGS(a)", "1", ""},
+		{"COUNT_ARGS(EMPTY)", "1", ""},
+		{"COUNT_ARGS(,)", "2", ""},
+		{"COUNT_ARGS(a,b,c,d,e,f,g,h,i,j,k,l,m,n,o)", "15", ""},
+		{"COUNT_ARGS()", "0", "dialect-dependent variadic comma deletion"},
+		{"COUNT_ARGS(a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p)", "16", "argument budget"},
+	} {
+		t.Run(tc.call, func(t *testing.T) {
+			plan, node := configDependencyCompilePlanForTest(t, map[string]string{
+				"drivers/example/driver.c": "#include <count.h>\n#define PICK(x) CONFIG_ ## x\nPICK(PREFIX)\n#if " + tc.call + " == " + tc.count + "\nPICK(SELECTED)\n#else\nPICK(WRONG)\n#endif\n",
+				"include/count.h":          "#define " + linuxShapeCounterHelperForTest + "\n#define " + linuxShapeCounterForTest + "\n#define EMPTY\n",
+			}, []string{"-nostdinc", "-I${tree:kernel}/include", "-c", "drivers/example/driver.c"}, nil)
+			configDependencySetCompilerContractForTest(plan, node, CompactKbuildActionContract{})
+			plan.metadata.compilerPredefines = func(_, _, _ string, _, _ []string, _ map[string]string) (string, bool, error) {
+				return "", true, nil
+			}
+			context := newConfigDependencyAnalysisContext(plan)
+			for range 2 {
+				set, err := analyzeActionPlanNodeConfigDependencies(plan, node, context)
+				if err != nil || set.Opaque != (tc.reason != "") {
+					t.Fatalf("Linux argument-counter source proof: %#v, %v", set, err)
+				}
+				if tc.reason != "" {
+					if !strings.Contains(set.Reason, tc.reason) || len(set.Symbols)+len(set.SourcePaths)+len(set.ObjectPaths) != 0 {
+						t.Fatalf("unsupported counter source published a prefix: %#v", set)
+					}
+				} else if !slices.Equal(set.Symbols, []string{"CONFIG_PREFIX", "CONFIG_SELECTED"}) || !slices.Equal(set.SourcePaths, []string{"drivers/example/driver.c", "include/count.h"}) {
+					t.Fatalf("Linux argument counter lost exact source/config reads: %#v", set)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigDependencyCallCoverageLinuxCountedDispatch(t *testing.T) {
+	for _, tail := range []string{"", "_Pragma(\"once\")\n"} {
+		plan, node := configDependencyCompilePlanForTest(t, map[string]string{
+			"drivers/example/driver.c": "#include <dispatch.h>\n#define PICK(x) CONFIG_ ## x\nPICK(PREFIX)\n#if DISPATCH(a,b) == 2\nPICK(SELECTED)\n#else\nPICK(WRONG)\n#endif\n" + tail,
+			"include/dispatch.h": "#define " + linuxShapeCounterHelperForTest + "\n#define " + linuxShapeCounterForTest + "\n" +
+				"#define CAT_RAW(a,b) a##b\n#define CAT(a,b) CAT_RAW(a,b)\n#define DISPATCH(X...) CAT(SELECT_,COUNT_ARGS(X))(X)\n#define SELECT_1(x) 1\n#define SELECT_2(x,y) 2\n",
+		}, []string{"-nostdinc", "-I${tree:kernel}/include", "-c", "drivers/example/driver.c"}, nil)
+		configDependencySetCompilerContractForTest(plan, node, CompactKbuildActionContract{})
+		plan.metadata.compilerPredefines = func(_, _, _ string, _, _ []string, _ map[string]string) (string, bool, error) {
+			return "", true, nil
+		}
+		context := newConfigDependencyAnalysisContext(plan)
+		for range 2 {
+			set, err := analyzeActionPlanNodeConfigDependencies(plan, node, context)
+			if err != nil || set.Opaque != (tail != "") {
+				t.Fatalf("counted-dispatch source proof: %#v, %v", set, err)
+			}
+			if tail != "" {
+				if len(set.Symbols)+len(set.SourcePaths)+len(set.ObjectPaths) != 0 {
+					t.Fatalf("effect after counted dispatch published a prefix: %#v", set)
+				}
+			} else if !slices.Equal(set.Symbols, []string{"CONFIG_PREFIX", "CONFIG_SELECTED"}) || !slices.Equal(set.SourcePaths, []string{"drivers/example/driver.c", "include/dispatch.h"}) || len(set.ObjectPaths) != 0 {
+				t.Fatalf("counted dispatch lost exact closure: %#v", set)
+			}
+		}
+	}
+}
+
 func TestConfigDependencyCallCoveragePragmaExpansionOrder(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

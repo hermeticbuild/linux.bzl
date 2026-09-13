@@ -865,9 +865,21 @@ an expansion. Source or command-line replacements remain ordinary macros.
 An unknown branch history, exhausted vector, or incomplete expansion never
 publishes a partial dependency proof. Namespace-only caches cannot replay this
 state. Counter queries share the existing family value and byte budgets; the
-three discovery rounds are unchanged. A counter first reached during final
-replay therefore still keeps that compilation configuration-specific when no
-earlier round measured its values. Actual GCC and Clang fixture builds compare
+three discovery rounds are unchanged. A bounded lexical hint from an already
+entered file can request initial counter availability before expansion reaches
+it. Once measured availability establishes the original binding, an optional
+query can prefetch its first 64 values. Counter-value hints use only capacity
+left after existing demands, entered-file token hints and literal-include hints.
+When their staged plan is too large, selection retains a canonical prefix of
+complete query/dependency closures within the unchanged byte and node limits.
+Shared roots keep each variant's original terminal permissions; neither a
+counter vector nor a dependency closure is truncated. Strings, comments and
+unentered files do not supply counter hints;
+hints themselves neither consume values nor grant a dependency proof. An
+ordinary failed optional probe supplies no facts, while malformed or mismatched
+results remain errors. A counter first reached during final replay still keeps
+that compilation configuration-specific when no earlier round measured its
+values. Actual GCC and Clang fixture builds compare
 counter-dependent object bytes with an independent run of the same compiler;
 this coverage alone does not establish improved full-kernel reuse.
 
@@ -878,7 +890,10 @@ macro state through the translation unit and its ordinary include closure.
 Boolean combinations of `defined(...)` tests are evaluated from that state.
 The fast scanner inspects replacement bodies for literal `CONFIG_*` aliases.
 When a reachable token paste prevents precision, a bounded second pass can
-prove the complete ordered macro-call stream. It retains exact definition
+prove the complete ordered macro-call stream. Signatures and argument lists
+are bounded to 32 slots, covering Linux's 17-fixed-parameter argument-counting
+helper without changing the separate expansion-work, token or nesting limits.
+It retains exact definition
 text and origin, restores final compiler `-D`/`-U` values after the shared
 definedness probe, and expands every active ordinary-text span and conditional
 expression. Conditional arithmetic uses a checked, portable signed-integer
@@ -888,8 +903,27 @@ bypasses definedness-only header caches and requires a single translation
 unit with `-nostdinc`; unknown compiler bindings, unresolved conditions,
 unsupported expansion forms, or incomplete include coverage reject the entire
 proof. Self-references use token-local suppression across argument prescan and
-replacement rescans; pasting a suppressed token and calls spanning source or
-replacement boundaries remain unsupported. No successful prefix grants reuse.
+replacement rescans. A bounded expansion-context stack lets a replacement's
+function name consume following invocation tokens, including Linux's pasted,
+argument-counted dispatch helpers. Pasting creates a fresh token; argument
+prescan cannot borrow tokens after its own invocation. Calls spanning separate
+preprocessing events remain unsupported. No successful prefix grants reuse.
+Empty invocations of variadic-only comma-paste macros use separate execution
+measurements for standard and GNU-named syntax, with the selected compiler's
+original language flags, macro definitions, environment and toolset. Successful
+answers are immutable and context-bound; rejected or missing probes grant no
+grammar fact. Queries triggered by actual expansion share the bounded demand
+frontier with counter and intrinsic queries. Definition inventories remain
+lower-priority optional hints: discarding them cannot erase an actual demand,
+and an identical demand and hint share one attempt. Within optional staging,
+actual demands precede the bounded two-syntax grammar inventory, followed by
+entered-file names, literal-include names, and counter prefetch. This lets a
+grammar measurement arrive before a later condition exposes its first call;
+all tiers still share the same storage and publication limits.
+Complete expansion records the measured grammar
+witness, and the older definedness-only completed-proof cache cannot reuse it.
+The GCC/Clang fixture compares C11 and GNU11 probes with independent compiler
+invocations and checks compiled empty-argument CONFIG branches and invalidation.
 An independent, lower-priority observer inventories leading-underscore names
 in already-opened source and authenticated generated headers. Its cached,
 bounded inventory includes ordinary tokens and supported literal replacement
@@ -915,13 +949,18 @@ These are hints for future compiler measurements,
 not expansion reads or assumed negative answers. Their optional query vectors
 are separate from actual first-unknown demands and exclude higher-priority
 names. All configs' existing queries and expansion demands are admitted before
-entered-file token hints, followed by speculative literal-include hints, use
-the remaining fixed frontier capacity. These last two tiers have separate query
+grammar inventories, entered-file token hints, speculative literal-include
+hints, then counter-value hints use the remaining fixed frontier capacity.
+These optional tiers have separate query
 vectors and staging ledgers; their retained plans share the original size and
 node limits. A later config's stronger work may evict speculative hints, never
 the reverse. Each tier retains one shared immutable probe graph across configs,
 so identical dependency closures consume its staging budget only once. Each
-config keeps its original allowed terminals; selecting its admitted work cannot
+weak tier retains a bounded canonical prefix of complete query closures when
+storage fills, rather than discarding an entire otherwise usable tier. Name
+vectors remain indivisible: partial vectors would change compiler rejection
+semantics. Dropped queries and their private dependencies are not published.
+Each config keeps its original allowed terminals; selecting its admitted work cannot
 pull in another config's private probes. A rejected hint vector
 supplies no facts and cannot poison a separate demanded-name attempt. Fresh
 complete source replay is still required after successful measurements.
