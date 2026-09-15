@@ -470,7 +470,7 @@ func sourceDerivedLinuxKconfigEnvironment(
 		}
 		return hermeticLinuxKbuildShell(command, root, target, host)
 	}
-	parsed, err := kconfig.ParseKbuildFileTree(filepath.Join(root, "Makefile"), kconfig.KbuildOptions{
+	parsed, err := parseLinuxRootFinalInvocation(root, kconfig.KbuildOptions{
 		RootDir:                        root,
 		Variables:                      values,
 		EnvironmentVariables:           maps.Clone(environment),
@@ -1094,6 +1094,83 @@ type sourceDerivedLinuxTarget struct {
 	UTSMachine string
 }
 
+// parseLinuxRootFinalInvocation follows a source-selected root self-submake.
+// Older Linux Makefiles defer architecture and compiler exports until a second
+// invocation in the object tree. Use the same recursive recipe selection as
+// the Kbuild graph so its exported environment and argv control that pass.
+func parseLinuxRootFinalInvocation(root string, options kconfig.KbuildOptions) (*kconfig.KbuildFile, error) {
+	makefile := filepath.Join(root, "Makefile")
+	skipExportedVariables := options.SkipExportedVariables
+	options.CaptureVariables = append(slices.Clone(options.CaptureVariables), "need-sub-make")
+	outer, err := kconfig.ParseKbuildFileTree(makefile, options)
+	if err != nil || outer.Variables["need-sub-make"] == "" {
+		return outer, err
+	}
+
+	// Target-context exports belong to the selected recursive Make recipe.
+	// Capture its evaluator only when this source actually requests a child.
+	options.CaptureTargetEvaluator = true
+	options.SkipExportedVariables = true
+	options.VariableBase, err = kconfig.NewKbuildVariableBaseWithRecursiveMakeDefault(options.Variables)
+	if err != nil {
+		return nil, err
+	}
+	outer, err = kconfig.ParseKbuildFileTree(makefile, options)
+	if err != nil {
+		return nil, err
+	}
+	profile, err := kconfig.NewCompactKbuildProfile("driver:Makefile", makefile, root, outer)
+	if err != nil {
+		return nil, err
+	}
+	profile.EntryTargets = strings.Fields(options.Variables["MAKECMDGOALS"])
+	if len(profile.EntryTargets) == 0 {
+		return nil, fmt.Errorf("root Makefile requested a sub-make without an entry goal")
+	}
+	if err := kconfig.SetCompactKbuildProfileInvocationLocation(&profile, kconfig.CompactKbuildInvocationLocation{
+		Tree: kconfig.CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		return nil, err
+	}
+	children, err := selectedKbuildRecursiveMakeRequests(profile, nil)
+	if err != nil {
+		return nil, fmt.Errorf("select root Makefile sub-make: %w", err)
+	}
+	if len(children) != 1 || children[0].makefile != "Makefile" || children[0].directory != "" ||
+		children[0].processLocation.Tree != kconfig.CompactKbuildInvocationObjectTree ||
+		children[0].processLocation.Directory != "" || !slices.Equal(children[0].entryTargets, profile.EntryTargets) {
+		return nil, fmt.Errorf("root Makefile requested a sub-make but did not select one equivalent root invocation (found %d children)", len(children))
+	}
+	child := inheritKbuildInvocationCommandLineVariables(
+		children[0], options.CommandLineVariables, options.AutoExportCommandLineVariables,
+	)
+	// The source and object aliases are planner-owned precedence pins. They
+	// remain virtual roots while source-owned exports such as sub_make_done
+	// enter the child's environment.
+	childOptions := options
+	childOptions.CaptureTargetEvaluator = false
+	childOptions.EnvironmentVariables = maps.Clone(child.environment)
+	childOptions.CommandLineVariables = maps.Clone(child.variables)
+	childOptions.AutoExportCommandLineVariables = child.commandLineAutoExport
+	childOptions.Variables = maps.Clone(options.Variables)
+	childOptions.Variables["MAKECMDGOALS"] = strings.Join(child.entryTargets, " ")
+	for _, name := range []string{"abs_srctree", "objtree", "srctree"} {
+		if value, ok := options.CommandLineVariables[name]; ok {
+			childOptions.CommandLineVariables[name] = value
+		}
+	}
+	// The original caller controls whether its final snapshot needs exports.
+	childOptions.SkipExportedVariables = skipExportedVariables
+	final, err := kconfig.ParseKbuildFileTree(makefile, childOptions)
+	if err != nil {
+		return nil, err
+	}
+	if final.Variables["need-sub-make"] != "" {
+		return nil, fmt.Errorf("root Makefile sub-make still requests another invocation")
+	}
+	return final, nil
+}
+
 func sourceDerivedLinuxKconfigIdentity(
 	ctx context.Context,
 	sourceRoot string,
@@ -1148,7 +1225,7 @@ func sourceDerivedLinuxKconfigIdentity(
 		}
 		return hermeticLinuxKbuildShell(command, root, target, host)
 	}
-	parsed, err := kconfig.ParseKbuildFileTree(filepath.Join(root, "Makefile"), kconfig.KbuildOptions{
+	parsed, err := parseLinuxRootFinalInvocation(root, kconfig.KbuildOptions{
 		RootDir:                        root,
 		Variables:                      values,
 		CommandLineVariables:           commandLine,
@@ -1265,7 +1342,7 @@ func sourceDerivedLinuxMakeIdentity(
 	if err != nil {
 		return sourceDerivedLinuxTarget{}, err
 	}
-	parsed, err := kconfig.ParseKbuildFileTree(filepath.Join(root, "Makefile"), options)
+	parsed, err := parseLinuxRootFinalInvocation(root, options)
 	if err != nil {
 		return sourceDerivedLinuxTarget{}, err
 	}

@@ -1188,6 +1188,52 @@ HOST_LFS_CFLAGS := $(shell false)
 	}
 }
 
+func TestSourceDerivedLinuxIdentityFollowsRootSelfSubmake(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(`
+ifneq ($(sub_make_done),1)
+abs_objtree := $(CURDIR)
+abs_srctree := $(realpath $(dir $(lastword $(MAKEFILE_LIST))))
+ifneq ($(abs_srctree),$(abs_objtree))
+need-sub-make := 1
+endif
+export sub_make_done := 1
+ifeq ($(need-sub-make),1)
+$(MAKECMDGOALS) __all: __sub-make
+__sub-make:
+	$(MAKE) -C $(abs_objtree) -f $(abs_srctree)/Makefile $(MAKECMDGOALS)
+endif
+endif
+ifeq ($(need-sub-make),)
+ARCH ?= x86_64
+SRCARCH := x86
+UTS_MACHINE := $(ARCH)
+export SECOND_PASS := from-source
+endif
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	identity := testSourceDerivedLinuxKconfigIdentity(t, root, "x86_64-linux-gnu")
+	if want := (sourceDerivedLinuxTarget{Machine: "x86_64-linux-gnu", Arch: "x86_64", Srcarch: "x86", UTSMachine: "x86_64"}); identity != want {
+		t.Fatalf("identity = %#v, want %#v", identity, want)
+	}
+
+	values := kbuildInvocationSentinelVariables(root, linuxRootKconfigInvocationVariables(root), "")
+	parsed, err := parseLinuxRootFinalInvocation(root, kconfig.KbuildOptions{
+		RootDir:                 root,
+		Variables:               values,
+		SourceRoots:             map[string]string{kbuildEvalSourceTree: root, kbuildEvalObjectTree: root},
+		ConfigVariablesComplete: true,
+		MakeVariablesComplete:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := parsed.ExportedEnvironment()["SECOND_PASS"], "from-source"; got != want {
+		t.Fatalf("Kconfig environment SECOND_PASS = %q, want %q", got, want)
+	}
+}
+
 func TestKbuildBuildOwnerIsExplicitAndExported(t *testing.T) {
 	t.Setenv("USER", "ambient-user-must-not-be-used")
 	t.Setenv("HOSTNAME", "ambient-host-must-not-be-used")
