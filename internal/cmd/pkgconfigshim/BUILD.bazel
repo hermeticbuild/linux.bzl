@@ -5,6 +5,7 @@ go_library(
     srcs = ["main.go"],
     importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/pkgconfigshim",
     visibility = ["//visibility:private"],
+    deps = ["//internal/pkgconfigmanifest"],
 )
 
 go_binary(

@@ -1,126 +1,14 @@
 package main
 
 import (
-	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
+
+	"github.com/hermeticbuild/linux.bzl/internal/pkgconfigmanifest"
 )
-
-const pkgConfigManifestSchema = "linux.bzl/pkg-config-manifest/v1"
-
-const (
-	maxPkgConfigPackages      = 256
-	maxPkgConfigFlags         = 4096
-	maxPkgConfigManifestBytes = 1 << 20
-)
-
-type pkgConfigPackage struct {
-	CFlags []string `json:"cflags"`
-	Libs   []string `json:"libs"`
-}
-
-type pkgConfigManifest struct {
-	Schema   string                      `json:"schema"`
-	Packages map[string]pkgConfigPackage `json:"packages"`
-}
-
-func readPkgConfigManifest(filename string) (*pkgConfigManifest, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, fmt.Errorf("open manifest: %w", err)
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("inspect manifest: %w", err)
-	}
-	if !info.Mode().IsRegular() || info.Size() > maxPkgConfigManifestBytes {
-		return nil, fmt.Errorf("manifest is not a regular file or exceeds %d bytes", maxPkgConfigManifestBytes)
-	}
-	decoder := json.NewDecoder(io.LimitReader(file, maxPkgConfigManifestBytes+1))
-	decoder.DisallowUnknownFields()
-	var manifest pkgConfigManifest
-	if err := decoder.Decode(&manifest); err != nil {
-		return nil, fmt.Errorf("decode manifest: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return nil, fmt.Errorf("decode manifest: trailing JSON value")
-		}
-		return nil, fmt.Errorf("decode manifest: %w", err)
-	}
-	if err := validatePkgConfigManifest(manifest); err != nil {
-		return nil, err
-	}
-	return &manifest, nil
-}
-
-func validatePkgConfigManifest(manifest pkgConfigManifest) error {
-	if manifest.Schema != pkgConfigManifestSchema {
-		return fmt.Errorf("manifest schema = %q, want %q", manifest.Schema, pkgConfigManifestSchema)
-	}
-	if manifest.Packages == nil {
-		return fmt.Errorf("manifest packages are required")
-	}
-	if len(manifest.Packages) > maxPkgConfigPackages {
-		return fmt.Errorf("manifest contains more than %d packages", maxPkgConfigPackages)
-	}
-	names := make([]string, 0, len(manifest.Packages))
-	for name := range manifest.Packages {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	flags := 0
-	for _, name := range names {
-		if !validPkgConfigPackageName(name) {
-			return fmt.Errorf("manifest has invalid package name %q", name)
-		}
-		pkg := manifest.Packages[name]
-		if pkg.CFlags == nil || pkg.Libs == nil {
-			return fmt.Errorf("manifest package %q must define cflags and libs", name)
-		}
-		for _, family := range []struct {
-			kind   string
-			values []string
-		}{
-			{kind: "cflags", values: pkg.CFlags},
-			{kind: "libs", values: pkg.Libs},
-		} {
-			kind, values := family.kind, family.values
-			flags += len(values)
-			if flags > maxPkgConfigFlags {
-				return fmt.Errorf("manifest contains more than %d flags", maxPkgConfigFlags)
-			}
-			for index, value := range values {
-				if value == "" || len(value) > 1<<16 || strings.ContainsAny(value, "\x00\r\n") {
-					return fmt.Errorf("manifest package %q %s flag %d is empty, invalid, or exceeds 64 KiB", name, kind, index)
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func validPkgConfigPackageName(value string) bool {
-	if value == "" || len(value) > 255 {
-		return false
-	}
-	for _, character := range value {
-		if character >= 'a' && character <= 'z' ||
-			character >= 'A' && character <= 'Z' ||
-			character >= '0' && character <= '9' ||
-			strings.ContainsRune("_.+-", character) {
-			continue
-		}
-		return false
-	}
-	return true
-}
 
 type pkgConfigQuery struct {
 	kind     string
@@ -137,7 +25,7 @@ func parsePkgConfigQuery(arguments []string) (pkgConfigQuery, error) {
 			}
 			query.kind = argument
 		default:
-			if !validPkgConfigPackageName(argument) {
+			if !pkgconfigmanifest.ValidPackageName(argument) {
 				return pkgConfigQuery{}, fmt.Errorf("pkg-config query has unsupported argument %q", argument)
 			}
 			query.packages = append(query.packages, argument)
@@ -149,8 +37,8 @@ func parsePkgConfigQuery(arguments []string) (pkgConfigQuery, error) {
 	if len(query.packages) == 0 {
 		return pkgConfigQuery{}, fmt.Errorf("pkg-config query requires at least one package")
 	}
-	if len(query.packages) > maxPkgConfigPackages {
-		return pkgConfigQuery{}, fmt.Errorf("pkg-config query contains more than %d packages", maxPkgConfigPackages)
+	if len(query.packages) > pkgconfigmanifest.MaxPackages {
+		return pkgConfigQuery{}, fmt.Errorf("pkg-config query contains more than %d packages", pkgconfigmanifest.MaxPackages)
 	}
 	return query, nil
 }
@@ -173,7 +61,7 @@ func pkgConfigShellWord(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
-func executePkgConfigQuery(manifest *pkgConfigManifest, query pkgConfigQuery, stdout, stderr io.Writer) int {
+func executePkgConfigQuery(manifest *pkgconfigmanifest.Manifest, query pkgConfigQuery, stdout, stderr io.Writer) int {
 	values := []string{}
 	for _, name := range query.packages {
 		pkg, ok := manifest.Packages[name]
@@ -213,7 +101,7 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "-manifest is required")
 		return 2
 	}
-	manifest, err := readPkgConfigManifest(*manifestFilename)
+	manifest, err := pkgconfigmanifest.Read(*manifestFilename)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2

@@ -68,10 +68,15 @@ func TestPkgConfigShimSupportsLinuxArgumentOrders(t *testing.T) {
 }
 
 func TestPkgConfigShimReportsUnavailablePackageLikePkgConfig(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	status := run([]string{"-manifest", testPkgConfigManifest(t), "--", "--libs", "missing"}, &stdout, &stderr)
-	if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), `package "missing" is unavailable`) {
-		t.Fatalf("unavailable package status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	manifest := testPkgConfigManifest(t)
+	for _, option := range []string{"--libs", "--exists"} {
+		t.Run(option, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			status := run([]string{"-manifest", manifest, "--", option, "missing"}, &stdout, &stderr)
+			if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), `package "missing" is unavailable`) {
+				t.Fatalf("unavailable package status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+			}
+		})
 	}
 }
 

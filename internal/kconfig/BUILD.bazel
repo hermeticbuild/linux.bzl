@@ -325,6 +325,7 @@ go_test(
         "LINUX_BZL_TEST_SCRIPT_RUNTIME": "$(rlocationpath @linux_bzl_busybox//file:busybox)",
     },
     deps = [
+        "//internal/pkgconfigmanifest",
         "//internal/toolaction",
         "@rules_go//go/runfiles",
     ],
