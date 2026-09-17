@@ -1419,6 +1419,12 @@ def _mapped_kernel_toolset_test_impl(ctx):
         asserts.true(env, "actionfile" in sdk.target_tool_files)
         asserts.true(env, "awk" in sdk.target_tool_files)
         asserts.true(env, "lz4" in sdk.target_tool_files)
+        asserts.equals(
+            env,
+            "lz4c",
+            sdk.target_tool_files["lz4"].basename,
+            "the LZ4 tool retains its configured role and executes with the legacy-compatible basename",
+        )
         asserts.true(env, "pahole" in sdk.target_tool_files)
         asserts.true(env, "python3" in sdk.target_tool_files)
         asserts.true(env, "script-runtime" in sdk.target_tool_files)
@@ -1431,6 +1437,11 @@ def _mapped_kernel_toolset_test_impl(ctx):
         asserts.false(env, "pahole" in sdk.host_tool_files)
 
         target_closure = {file.path: True for file in sdk.target_toolchain_files.to_list()}
+        asserts.true(
+            env,
+            any([file.basename == "lz4" for file in sdk.target_toolchain_files.to_list()]),
+            "the LZ4 alias must carry its pinned binary into the target toolchain closure",
+        )
         asserts.true(
             env,
             any([file.basename == "rustc" for file in sdk.target_toolchain_files.to_list()]),

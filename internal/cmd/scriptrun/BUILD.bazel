@@ -20,9 +20,12 @@ go_binary(
 go_test(
     name = "scriptrun_test",
     srcs = ["main_test.go"],
+    data = ["//internal:lz4c"],
     embed = [":scriptrun_lib"],
+    env = {"LINUX_BZL_TEST_LZ4C": "$(rlocationpath //internal:lz4c)"},
     deps = [
         "//internal/toolaction",
         "//internal/toolsetpath",
+        "@rules_go//go/runfiles",
     ],
 )

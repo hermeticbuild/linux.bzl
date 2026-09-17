@@ -5158,7 +5158,7 @@ linux_mapped_kernel_family = rule(
         "_pkg_config": attr.label(cfg = config.exec(exec_group = "host_cc"), default = Label("//internal/cmd/pkgconfigshim"), executable = True),
         "_toolsetidentity": attr.label(cfg = "exec", default = Label("//internal/cmd/toolsetidentity"), executable = True),
         "_host_awk": attr.label(cfg = config.exec(exec_group = "host_cc"), default = Label("@gawk//:gawk"), executable = True),
-        "_lz4": attr.label(cfg = "exec", default = Label("@lz4//programs:lz4"), executable = True),
+        "_lz4": attr.label(cfg = "exec", default = Label("//internal:lz4c"), executable = True),
         "_bison_m4_deny_shell": attr.label(
             cfg = config.exec(exec_group = "host_cc"),
             default = Label("@rules_bison//bison/internal:m4_deny_shell"),

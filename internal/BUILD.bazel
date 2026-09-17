@@ -1,4 +1,5 @@
 load(":execution_platform.bzl", "linux_execution_platform")
+load(":lz4c_tool.bzl", "lz4c_tool")
 load(
     ":rust_toolchain.bzl",
     "execution_bindgen_toolchain_resolver",
@@ -27,6 +28,10 @@ filegroup(
         "repository_utils.bzl",
     ],
     visibility = ["//internal/tests/source_repo:__pkg__"],
+)
+
+lz4c_tool(
+    name = "lz4c",
 )
 
 toolchain_type(

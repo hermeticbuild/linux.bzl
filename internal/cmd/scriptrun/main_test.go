@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bazelbuild/rules_go/go/runfiles"
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 	"github.com/hermeticbuild/linux.bzl/internal/toolsetpath"
 )
@@ -48,6 +49,61 @@ fi
 shift
 exec /bin/sh "$@"
 `)
+}
+
+func TestRunScriptConfiguredLz4AcceptsSelectedLinuxCLIForms(t *testing.T) {
+	logical := os.Getenv("LINUX_BZL_TEST_LZ4C")
+	if logical == "" {
+		t.Fatal("configured LZ4 CLI runfile is missing")
+	}
+	lz4c, err := runfiles.Rlocation(logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	interpreter := writeReplayRuntime(t, directory)
+	input := bytes.Repeat([]byte("selected Kbuild compression input\n"), 4096)
+	compress := func(name, arguments string) []byte {
+		t.Helper()
+		script := filepath.Join(directory, name+".sh")
+		if err := os.WriteFile(script, []byte("#!/bin/sh\nset -e\nlz4 "+arguments+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var output, errors bytes.Buffer
+		err := runScript(scriptRunOptions{
+			interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+			script: script, tools: map[string]string{"lz4": lz4c},
+			toolContracts: map[string]toolaction.Contract{"lz4": {
+				Arguments: []string{}, Environment: map[string]string{},
+			}},
+			stdin: bytes.NewReader(input), stdout: &output, stderr: &errors,
+		})
+		if err != nil || output.Len() == 0 {
+			t.Fatalf("%s compression failed: output bytes=%d, stderr=%q, error=%v", name, output.Len(), errors.String(), err)
+		}
+		return output.Bytes()
+	}
+	legacy := compress("linux-5-10", "-l -c1 stdin stdout")
+	modern := compress("linux-6", "-l -9 - -")
+	if !bytes.Equal(legacy, modern) {
+		t.Fatalf("configured LZ4 CLI produced distinct legacy format bytes for Linux 5.10 and 6.x: lengths %d and %d", len(legacy), len(modern))
+	}
+	decodeScript := filepath.Join(directory, "decode.sh")
+	if err := os.WriteFile(decodeScript, []byte("#!/bin/sh\nset -e\nlz4 -d -c -\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output, errors bytes.Buffer
+	err = runScript(scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		script: decodeScript, tools: map[string]string{"lz4": lz4c},
+		toolContracts: map[string]toolaction.Contract{"lz4": {
+			Arguments: []string{}, Environment: map[string]string{},
+		}},
+		stdin: bytes.NewReader(legacy), stdout: &output, stderr: &errors,
+	})
+	if err != nil || !bytes.Equal(output.Bytes(), input) {
+		t.Fatalf("decompression failed: output bytes=%d, stderr=%q, error=%v", output.Len(), errors.String(), err)
+	}
 }
 
 func TestRunScriptUsesDeclaredSourceStreamsAndExternalTool(t *testing.T) {
