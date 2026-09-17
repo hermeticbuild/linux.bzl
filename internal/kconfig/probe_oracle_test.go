@@ -207,6 +207,76 @@ func TestProbeResultOracleAllowsUnusedDiscoverySuperset(t *testing.T) {
 	}
 }
 
+func TestProbeResultOracleRejectsCaptureModeDisagreement(t *testing.T) {
+	identity := "sha256-" + strings.Repeat("a", 64)
+	builder, err := NewProbePlanBuilder(identity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := "warning\nclang version 22\n"
+	results := map[string]ProbeResult{}
+	references := []ProbeReference{}
+	for _, capture := range []bool{false, true} {
+		stream := "stdout"
+		step := ProbeStepResult{Name: "version", Status: "success", Stdout: "clang version 22\n"}
+		text := "clang version 22"
+		if capture {
+			stream = "combined"
+			step.Stdout = ""
+			step.Combined = &merged
+			text = "warning"
+		}
+		request := ProbeRequest{
+			Schema:  LinuxProbeRequestSchema,
+			Steps:   []ProbeStep{{Name: "version", Tool: "cc", Arguments: []string{"--version"}, CaptureCombined: capture}},
+			Outcome: ProbeOutcome{Kind: "text", Step: "version", Stream: stream, FirstLine: true},
+		}
+		reference, err := builder.Request("target", request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		references = append(references, reference)
+		results[reference.NodeID] = ProbeResult{
+			Schema: LinuxProbeResultSchema, NodeID: reference.NodeID, RequestID: reference.RequestID,
+			Scope: "target", ToolsetIdentity: identity, Kind: "text", Text: text,
+			Steps: []ProbeStepResult{step},
+		}
+	}
+	plan, err := builder.Plan(references...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oracle := &ProbeResultOracle{results: results, toolsets: map[string]string{"target": identity}}
+	if err := oracle.ValidatePlan(plan); err != nil {
+		t.Fatalf("matching capture modes rejected: %v", err)
+	}
+
+	originalSplit := results[references[0].NodeID]
+	split := originalSplit
+	split.Steps = append([]ProbeStepResult(nil), split.Steps...)
+	split.Steps[0].Stdout = ""
+	split.Steps[0].Combined = &merged
+	results[references[0].NodeID] = split
+	if err := split.Validate(); err != nil {
+		t.Fatalf("canonical merged result rejected without request context: %v", err)
+	}
+	if err := oracle.ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "capture mode disagrees") {
+		t.Fatalf("split request accepted merged result: %v", err)
+	}
+	results[references[0].NodeID] = originalSplit
+	wrongSplit := results[references[1].NodeID]
+	wrongSplit.Steps = append([]ProbeStepResult(nil), wrongSplit.Steps...)
+	wrongSplit.Steps[0].Combined = nil
+	wrongSplit.Steps[0].Stdout = "clang version 22\n"
+	results[references[1].NodeID] = wrongSplit
+	if err := wrongSplit.Validate(); err != nil {
+		t.Fatalf("canonical split result rejected without request context: %v", err)
+	}
+	if err := oracle.ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "capture mode disagrees") {
+		t.Fatalf("merged request accepted split result: %v", err)
+	}
+}
+
 func TestReadProbeResultTreeAcceptsOnlyExplicitEmptyMarker(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, ".empty"), nil, 0o600); err != nil {

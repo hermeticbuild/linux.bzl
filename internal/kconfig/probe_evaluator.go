@@ -1165,6 +1165,9 @@ func (e *LinuxProbeEvaluator) output(command string) (string, error) {
 	if value, recognized, err := e.commandLookup(command); recognized || err != nil {
 		return value, err
 	}
+	if value, recognized, err := e.compilerVersionGrepOutput(command); recognized || err != nil {
+		return value, err
+	}
 	if firstLine, localeC, recognized := e.compilerVersionCommand(command); recognized {
 		if firstLine && localeC {
 			return e.facts.VersionText(), nil
@@ -1527,6 +1530,7 @@ func equalLinuxProbeStep(left, right ProbeStep) bool {
 	if left.Name != right.Name || left.Tool != right.Tool ||
 		left.WorkingDirectory != right.WorkingDirectory || left.Stdin != right.Stdin ||
 		left.DiscardStdout != right.DiscardStdout || left.DiscardStderr != right.DiscardStderr ||
+		left.CaptureCombined != right.CaptureCombined ||
 		left.StdoutExecrootRelative != right.StdoutExecrootRelative ||
 		left.StdoutFallbackPath != right.StdoutFallbackPath ||
 		!slices.Equal(left.AuxiliaryTools, right.AuxiliaryTools) ||
@@ -2187,7 +2191,19 @@ func (e *LinuxProbeEvaluator) readText(reference ProbeReference, request ProbeRe
 		if pathOutcome && requestStep.StdoutExecrootRelative && (step.Status != "success" || step.ExitCode != 0 || strings.TrimSpace(step.Stderr) != "") {
 			return "", fmt.Errorf("Linux path probe result %s process did not succeed cleanly", reference.NodeID)
 		}
-		want = step.Stdout
+		if (step.Combined != nil) != requestStep.CaptureCombined {
+			return "", fmt.Errorf("Linux text probe result %s step %q capture mode disagrees with its request", reference.NodeID, step.Name)
+		}
+		switch request.Outcome.Stream {
+		case "stdout":
+			want = step.Stdout
+		case "stderr":
+			want = step.Stderr
+		case "combined":
+			want = *step.Combined
+		default:
+			return "", fmt.Errorf("Linux text probe result %s has unsupported outcome stream %q", reference.NodeID, request.Outcome.Stream)
+		}
 		if request.Outcome.GNUMakeShell {
 			want = NormalizeGNUMakeShellOutput(want)
 		}
@@ -3685,6 +3701,70 @@ func linuxProbeShellEnvironmentToken(field string) (string, bool) {
 		return name, validKbuildCommandEnvironmentName(name)
 	}
 	return "", false
+}
+
+// compilerVersionGrepOutput models a source-owned test of the first compiler
+// version line. The word to match is supplied by Make; the configured compiler
+// and the grep reduction remain separate, identity-bound probe nodes.
+func (e *LinuxProbeEvaluator) compilerVersionGrepOutput(command string) (string, bool, error) {
+	fields := strings.Fields(command)
+	if len(fields) < 3 || !e.isToolToken(fields[0], "cc") || fields[1] != "--version" || fields[2] != "2>&1" {
+		return "", false, nil
+	}
+	fields = fields[3:]
+	if len(fields) < 6 || fields[0] != "|" || fields[1] != "head" {
+		return "", false, nil
+	}
+	var grep []string
+	switch {
+	case fields[2] == "-n1":
+		grep = fields[3:]
+	case len(fields) >= 7 && fields[2] == "-n" && fields[3] == "1":
+		grep = fields[4:]
+	default:
+		return "", false, nil
+	}
+	if len(grep) != 3 || grep[0] != "|" || grep[1] != "grep" {
+		return "", false, nil
+	}
+	literal, static := linuxProbeStaticShellWord(grep[2])
+	if !static {
+		return "", true, e.unsupportedCommand(command)
+	}
+	literal, valid := parseLinuxProbeGrepLiteral(literal)
+	if !valid {
+		return "", true, e.unsupportedCommand(command)
+	}
+	versionRequest := ProbeRequest{
+		Schema: LinuxProbeRequestSchema,
+		Steps: []ProbeStep{{
+			Name: "version", Tool: "cc", Arguments: []string{"--version"}, CaptureCombined: true,
+		}},
+		Outcome: ProbeOutcome{Kind: "text", Step: "version", Stream: "combined", FirstLine: true},
+	}
+	version, err := e.discovery.Request(e.scope, versionRequest)
+	if err != nil {
+		return "", true, err
+	}
+	matched, err := e.requestTruth(ProbeRequest{
+		Schema:     LinuxProbeRequestSchema,
+		InputCount: 1,
+		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{
+			Operator: "result-text-contains", Result: "00000000", Value: literal,
+		}},
+	}, version)
+	if err != nil {
+		return "", true, err
+	}
+	returnValue, err := e.requestText(ProbeRequest{
+		Schema:     LinuxProbeRequestSchema,
+		InputCount: 2,
+		Outcome: ProbeOutcome{Kind: "text", Fragments: []ProbeValueFragment{{
+			Value: "${result:00000000.text}",
+			When:  &ProbePredicate{Operator: "result-true", Result: "00000001"},
+		}}},
+	}, version, matched.reference)
+	return returnValue, true, err
 }
 
 func (e *LinuxProbeEvaluator) compilerVersionCommand(command string) (firstLine, localeC, recognized bool) {

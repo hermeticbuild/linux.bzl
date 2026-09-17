@@ -62,6 +62,12 @@ func TestProbeHelperProcess(t *testing.T) {
 		fmt.Print(strings.Repeat("x", 1024))
 	case "multiline":
 		fmt.Print("supported\nmore\n")
+	case "version-stderr-first":
+		fmt.Fprintln(os.Stderr, "wrapper warning")
+		fmt.Fprintln(os.Stdout, "clang version 22.1.0")
+	case "version-stdout-first":
+		fmt.Fprintln(os.Stdout, "clang version 22.1.0")
+		fmt.Fprintln(os.Stderr, "wrapper warning")
 	case "hang":
 		time.Sleep(2 * time.Second)
 	case "dependency":
@@ -1139,6 +1145,86 @@ func TestRunProbeExecutesGenericRecipeAndWritesCanonicalResult(t *testing.T) {
 	}
 	if result.Boolean == nil || !*result.Boolean || result.Steps[0].Stdout != "supported\nmore\n" {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestRunProbeCapturesMergedChildOutputInWriteOrder(t *testing.T) {
+	for _, test := range []struct {
+		name, helper, stream, text, merged string
+		capture                            bool
+	}{
+		{
+			name: "stderr warning precedes stdout version", helper: "version-stderr-first", stream: "combined",
+			text: "wrapper warning", merged: "wrapper warning\nclang version 22.1.0\n", capture: true,
+		},
+		{
+			name: "stdout version precedes stderr warning", helper: "version-stdout-first", stream: "combined",
+			text: "clang version 22.1.0", merged: "clang version 22.1.0\nwrapper warning\n", capture: true,
+		},
+		{
+			name: "ordinary probes retain separate streams", helper: "version-stderr-first", stream: "stdout",
+			text: "clang version 22.1.0",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			request := kconfig.ProbeRequest{
+				Schema: kconfig.LinuxProbeRequestSchema,
+				Steps: []kconfig.ProbeStep{{
+					Name: "version", Tool: "cc", Arguments: []string{test.helper}, CaptureCombined: test.capture,
+					Environment: map[string]string{"LINUX_BZL_PROBE_HELPER": "1"},
+				}},
+				Outcome: kconfig.ProbeOutcome{Kind: "text", Step: "version", Stream: test.stream, FirstLine: true, TrimSpace: true},
+			}
+			requestID, err := request.ID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			requestData, err := request.CanonicalJSON()
+			if err != nil {
+				t.Fatal(err)
+			}
+			requestPath := filepath.Join(dir, "request.json")
+			if err := os.WriteFile(requestPath, requestData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			identity := "sha256-" + strings.Repeat("a", 64)
+			marker := filepath.Join(dir, identity)
+			if err := os.WriteFile(marker, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			node := kconfig.ProbePlanNode{Scope: "target", RequestID: requestID}
+			node.ID = node.ContentID()
+			resultPath := filepath.Join(dir, "result.json")
+			if err := runTestProbe(t, probeOptions{
+				request: requestPath, result: resultPath, nodeID: node.ID, requestID: requestID, scope: "target",
+				toolsetMarkers: map[string]string{"target": marker},
+				tools: map[string]actionContract{"cc": {
+					path: executable, arguments: []string{"-test.run=TestProbeHelperProcess", "--", kconfig.LinuxKbuildArgsSentinel},
+				}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			result, err := kconfig.ReadProbeResult(resultPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Text != test.text {
+				t.Fatalf("first line = %q, want %q", result.Text, test.text)
+			}
+			step := result.Steps[0]
+			if test.capture {
+				if step.Combined == nil || *step.Combined != test.merged || step.Stdout != "" || step.Stderr != "" {
+					t.Fatalf("merged child output = %#v, want exact %q and no split fields", step, test.merged)
+				}
+			} else if step.Combined != nil || step.Stdout != "clang version 22.1.0\n" || step.Stderr != "wrapper warning\n" {
+				t.Fatalf("ordinary child output = %#v, want separate stdout and stderr", step)
+			}
+		})
 	}
 }
 

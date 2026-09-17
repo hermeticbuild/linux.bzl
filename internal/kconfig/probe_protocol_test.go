@@ -240,6 +240,31 @@ func TestProbeStepStdoutFallbackPathValidation(t *testing.T) {
 	}
 }
 
+func TestProbeRequestCombinedCaptureRequiresMatchingStream(t *testing.T) {
+	request := ProbeRequest{
+		Schema:  LinuxProbeRequestSchema,
+		Steps:   []ProbeStep{{Name: "version", Tool: "cc", CaptureCombined: true}},
+		Outcome: ProbeOutcome{Kind: "text", Step: "version", Stream: "combined"},
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("combined capture rejected: %v", err)
+	}
+	request.Steps[0].CaptureCombined = false
+	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "capture mode disagrees") {
+		t.Fatalf("combined request without capture = %v", err)
+	}
+	request.Steps[0].CaptureCombined = true
+	request.Outcome.Stream = "stdout"
+	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "capture mode disagrees") {
+		t.Fatalf("split outcome with combined capture = %v", err)
+	}
+	request.Outcome.Stream = "combined"
+	request.Steps[0].DiscardStderr = true
+	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "cannot combine output") {
+		t.Fatalf("merged capture with discarded stderr = %v", err)
+	}
+}
+
 func TestProbePlanWritesPathEncodedDAG(t *testing.T) {
 	request := testProbeRequest()
 	request.Sources = []string{"foo", "foo/path", "scripts/δ.sh"}
@@ -504,6 +529,15 @@ func TestProbeRequestRejectsForwardConditionAndUnknownPlaceholder(t *testing.T) 
 	request.Steps[0].Arguments = append(request.Steps[0].Arguments, "${unknown:x}")
 	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "unsupported placeholder") {
 		t.Fatalf("placeholder error = %v", err)
+	}
+}
+
+func TestProbeStepEqualityBindsCombinedOutputCapture(t *testing.T) {
+	left := testProbeRequest().Steps[0]
+	right := left
+	right.CaptureCombined = true
+	if equalLinuxProbeStep(left, right) {
+		t.Fatal("step equality ignored combined output capture")
 	}
 }
 
@@ -1064,6 +1098,27 @@ func TestProbeResultStdoutPathKindValidation(t *testing.T) {
 	invalid.Steps[0].StdoutPathKind = "guessed"
 	if err := invalid.Validate(); err == nil || !strings.Contains(err.Error(), "invalid stdout path kind") {
 		t.Fatalf("invalid stdout path kind error = %v", err)
+	}
+}
+
+func TestProbeResultCombinedOutputRejectsSplitFields(t *testing.T) {
+	merged := ""
+	result := ProbeResult{
+		Schema: LinuxProbeResultSchema, NodeID: strings.Repeat("b", 64), RequestID: strings.Repeat("c", 64),
+		Scope: "target", ToolsetIdentity: "sha256-" + strings.Repeat("d", 64), Kind: "text",
+		Steps: []ProbeStepResult{{Name: "version", Status: "success", Combined: &merged}},
+	}
+	if _, err := result.CanonicalJSON(); err != nil {
+		t.Fatalf("empty merged output was not recorded: %v", err)
+	}
+	result.Steps[0].Stderr = "warning"
+	if err := result.Validate(); err == nil || !strings.Contains(err.Error(), "both merged output and split") {
+		t.Fatalf("merged output with stderr accepted: %v", err)
+	}
+	result.Steps[0].Stderr = ""
+	result.Steps[0].Status, result.Steps[0].ExitCode = "skipped", -1
+	if err := result.Validate(); err == nil || !strings.Contains(err.Error(), "status and process fields disagree") {
+		t.Fatalf("skipped step with merged output accepted: %v", err)
 	}
 }
 

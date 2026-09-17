@@ -898,12 +898,20 @@ func runProbe(opts probeOptions) error {
 		command.Env = environmentList(environment)
 		command.Stdin = strings.NewReader(stdin)
 		stdout, stderr := &limitedBuffer{remaining: opts.outputLimit}, &limitedBuffer{remaining: opts.outputLimit}
-		command.Stdout, command.Stderr = stdout, stderr
-		if step.DiscardStdout {
-			command.Stdout = io.Discard
-		}
-		if step.DiscardStderr {
-			command.Stderr = io.Discard
+		var combined *limitedBuffer
+		if step.CaptureCombined {
+			combined = &limitedBuffer{remaining: opts.outputLimit}
+			// One writer makes exec.Cmd give the child one pipe for both fds;
+			// two independent reader goroutines cannot preserve write order.
+			command.Stdout, command.Stderr = combined, combined
+		} else {
+			command.Stdout, command.Stderr = stdout, stderr
+			if step.DiscardStdout {
+				command.Stdout = io.Discard
+			}
+			if step.DiscardStderr {
+				command.Stderr = io.Discard
+			}
 		}
 		runErr := command.Run()
 		contextErr := ctx.Err()
@@ -911,8 +919,8 @@ func runProbe(opts probeOptions) error {
 		if contextErr != nil {
 			return fmt.Errorf("step %s timed out or was cancelled: %w", step.Name, contextErr)
 		}
-		if stdout.exceeded || stderr.exceeded {
-			return fmt.Errorf("step %s output exceeded %d bytes per stream", step.Name, opts.outputLimit)
+		if stdout.exceeded || stderr.exceeded || combined != nil && combined.exceeded {
+			return fmt.Errorf("step %s output exceeded %d bytes per captured stream", step.Name, opts.outputLimit)
 		}
 		status, exitCode := "success", 0
 		if runErr != nil {
@@ -950,9 +958,14 @@ func runProbe(opts probeOptions) error {
 				}
 			}
 		}
+		var merged *string
+		if combined != nil {
+			value := combined.String()
+			merged = &value
+		}
 		results = append(results, kconfig.ProbeStepResult{
 			Name: step.Name, Status: status, ExitCode: exitCode,
-			Stdout: stdoutValue, StdoutPathKind: stdoutPathKind, Stderr: stderr.String(),
+			Stdout: stdoutValue, StdoutPathKind: stdoutPathKind, Stderr: stderr.String(), Combined: merged,
 		})
 	}
 	result := kconfig.ProbeResult{
@@ -1242,11 +1255,20 @@ func findStep(results []kconfig.ProbeStepResult, name string) (kconfig.ProbeStep
 func stepStream(step kconfig.ProbeStepResult, stream string) (string, error) {
 	switch stream {
 	case "stdout":
+		if step.Combined != nil {
+			return "", fmt.Errorf("probe step %q captured combined output, not stdout", step.Name)
+		}
 		return step.Stdout, nil
 	case "stderr":
+		if step.Combined != nil {
+			return "", fmt.Errorf("probe step %q captured combined output, not stderr", step.Name)
+		}
 		return step.Stderr, nil
 	case "combined":
-		return step.Stdout + step.Stderr, nil
+		if step.Combined == nil {
+			return "", fmt.Errorf("probe step %q did not capture combined output", step.Name)
+		}
+		return *step.Combined, nil
 	default:
 		return "", fmt.Errorf("unsupported probe stream %q", stream)
 	}

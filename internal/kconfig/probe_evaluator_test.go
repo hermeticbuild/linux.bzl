@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -87,6 +89,140 @@ func TestLinuxProbeEvaluatorRejectsPrivateRecursiveMakeBytesFromTextResults(t *t
 			}
 			if got != test.value {
 				t.Fatalf("readText() = %q, want printable value %q", got, test.value)
+			}
+		})
+	}
+}
+
+func TestLinuxProbeEvaluatorReplaysSelectedTextStream(t *testing.T) {
+	for _, test := range []struct {
+		stream string
+		want   string
+	}{
+		{stream: "stdout", want: "stdout"},
+		{stream: "stderr", want: "stderr"},
+		{stream: "combined", want: "stderrstdout"},
+	} {
+		t.Run(test.stream, func(t *testing.T) {
+			builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := ProbeRequest{
+				Schema:  LinuxProbeRequestSchema,
+				Steps:   []ProbeStep{{Name: "version", Tool: "cc", Arguments: []string{"--version"}, CaptureCombined: test.stream == "combined"}},
+				Outcome: ProbeOutcome{Kind: "text", Step: "version", Stream: test.stream},
+			}
+			reference, err := builder.Request("target", request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			step := ProbeStepResult{Name: "version", Status: "success", Stdout: "stdout", Stderr: "stderr"}
+			if test.stream == "combined" {
+				step.Stdout, step.Stderr = "", ""
+				step.Combined = &test.want
+			}
+			result := ProbeResult{
+				Schema: LinuxProbeResultSchema, NodeID: reference.NodeID, RequestID: reference.RequestID,
+				Scope: "target", ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: test.want,
+				Steps: []ProbeStepResult{step},
+			}
+			oracle := &ProbeResultOracle{
+				toolsets: map[string]string{"target": bootstrapTestIdentity},
+				results:  map[string]ProbeResult{reference.NodeID: result},
+			}
+			evaluator := &LinuxProbeEvaluator{oracle: oracle, symbolRegistry: newLinuxProbeSymbolRegistry()}
+			got, err := evaluator.readText(reference, request)
+			if err != nil || got != test.want {
+				t.Fatalf("readText() = %q, %v; want %q", got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestLinuxProbeEvaluatorModelsSourceCompilerVersionGrep(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := newFixtureProbeEvaluator(t, 1, "x86", builder, nil, false)
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	fixture.result.Steps[1].Stderr = "a compiler warning\n"
+	facts, err := ParseLinuxCompilerBootstrapResult(fixture.result, fixture.scope, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator.facts = facts
+	compiler := KbuildActionRoleToken("target", "cc")
+	commands := []string{
+		compiler + " --version 2>&1 | head -n 1 | grep clang",
+		compiler + " --version 2>&1 | head -n1 | grep warning",
+	}
+	for _, command := range commands {
+		value, err := evaluator.output(command)
+		if err != nil || !linuxProbeSymbolPattern.MatchString(value) {
+			t.Fatalf("output(%q) = %q, %v; want symbolic probe", command, value, err)
+		}
+	}
+	if _, err := evaluator.output(compiler + " --version 2>&1 | head -n 1 | grep 'cl.*'"); err == nil || !IsLinuxProbeDeferredRecipeCommand(err) || IsLinuxProbeUnsupportedCommand(err) {
+		t.Fatalf("regex compiler-version grep error = %v, want owned unsupported command", err)
+	}
+	plan, err := builder.Plan(evaluator.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := plan.Nodes[0]
+	request := plan.Requests[version.RequestID]
+	if len(request.Steps) != 1 || request.Steps[0].Tool != "cc" ||
+		!slices.Equal(request.Steps[0].Arguments, []string{"--version"}) || !request.Steps[0].CaptureCombined ||
+		request.Outcome.Stream != "combined" || request.Outcome.TrimSpace {
+		t.Fatalf("compiler version request = %#v", request)
+	}
+	for _, test := range []struct {
+		name, combined, firstLine string
+		matches                   []string
+	}{
+		{
+			name: "warning before clang", combined: "a compiler warning\nclang version 22.1.0\n", firstLine: "a compiler warning",
+			matches: []string{"", "a compiler warning"},
+		},
+		{
+			name: "clang before warning", combined: "clang version 22.1.0\na compiler warning\n", firstLine: "clang version 22.1.0",
+			matches: []string{"clang version 22.1.0", ""},
+		},
+		{
+			name: "leading empty line before clang", combined: "\nclang version 22.1.0\n", firstLine: "",
+			matches: []string{"", ""},
+		},
+		{
+			name: "matching first line retains leading space", combined: " clang version 22.1.0\n", firstLine: " clang version 22.1.0",
+			matches: []string{" clang version 22.1.0", ""},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			oracle := &ProbeResultOracle{
+				toolsets: map[string]string{"target": bootstrapTestIdentity},
+				results: map[string]ProbeResult{
+					version.ID: {
+						Schema: LinuxProbeResultSchema, NodeID: version.ID, RequestID: version.RequestID,
+						Scope: "target", ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: test.firstLine,
+						Steps: []ProbeStepResult{{
+							Name: "version", Status: "success", Combined: &test.combined,
+						}},
+					},
+				},
+			}
+			replay, _ := newFixtureProbeEvaluator(t, 1, "x86", builder, oracle, false)
+			replay.facts = facts
+			for index, command := range commands {
+				value, err := replay.output(command)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resolved, err := replay.ResolveSymbolic(value)
+				if err != nil || resolved != test.matches[index] {
+					t.Fatalf("replay(%q) = %q, %v; want %q", command, resolved, err, test.matches[index])
+				}
 			}
 		})
 	}
@@ -2618,10 +2754,10 @@ func TestLinuxProbeScopeAdoptionBoundsRegistryGraphs(t *testing.T) {
 	newPair := func() (*LinuxProbeEvaluator, *LinuxProbeEvaluator) {
 		registry := newLinuxProbeSymbolRegistry()
 		return &LinuxProbeEvaluator{
-				scope: "host", symbols: map[string]linuxProbeSymbol{}, symbolRegistry: registry,
-			}, &LinuxProbeEvaluator{
-				scope: "host", symbols: map[string]linuxProbeSymbol{}, symbolRegistry: registry,
-			}
+			scope: "host", symbols: map[string]linuxProbeSymbol{}, symbolRegistry: registry,
+		}, &LinuxProbeEvaluator{
+			scope: "host", symbols: map[string]linuxProbeSymbol{}, symbolRegistry: registry,
+		}
 	}
 
 	t.Run("depth", func(t *testing.T) {

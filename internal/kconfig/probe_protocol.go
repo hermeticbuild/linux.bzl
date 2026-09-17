@@ -132,6 +132,10 @@ type ProbeStep struct {
 	// cannot enter the content-addressed ProbeResult or its output limits.
 	DiscardStdout bool `json:"discard_stdout,omitempty"`
 	DiscardStderr bool `json:"discard_stderr,omitempty"`
+	// CaptureCombined directs both child output descriptors to one pipe, as in
+	// a source command with 2>&1. The merged bytes retain their write order;
+	// individual stdout and stderr bytes cannot be reconstructed in this mode.
+	CaptureCombined bool `json:"capture_combined,omitempty"`
 	// StdoutExecrootRelative declares that a successful step's stdout is one
 	// path. proberun strips surrounding whitespace and serializes the path
 	// relative to its execroot, rejecting paths outside that root. This keeps
@@ -296,6 +300,9 @@ type ProbeStepResult struct {
 	Stdout         string `json:"stdout"`
 	StdoutPathKind string `json:"stdout_path_kind,omitempty"` // toolset or fallback
 	Stderr         string `json:"stderr"`
+	// Combined is present only when both child output descriptors shared one
+	// pipe. A pointer distinguishes an empty capture from a split capture.
+	Combined *string `json:"combined,omitempty"`
 }
 
 const (
@@ -492,6 +499,9 @@ func (r ProbeRequest) Validate() error {
 		if step.DiscardStdout && step.StdoutExecrootRelative {
 			return fmt.Errorf("probe step %q cannot discard and normalize stdout", step.Name)
 		}
+		if step.CaptureCombined && (step.DiscardStdout || step.DiscardStderr || step.StdoutExecrootRelative) {
+			return fmt.Errorf("probe step %q cannot combine output with discarded streams or stdout path normalization", step.Name)
+		}
 		if step.StdoutExecrootRelative {
 			if stdoutPathStep != "" {
 				return fmt.Errorf("probe steps %q and %q both declare stdout path provenance", stdoutPathStep, step.Name)
@@ -670,6 +680,10 @@ func (r ProbeRequest) Validate() error {
 	}
 	if err := r.Outcome.validate(steps, scratch, sources, sourceRoots, r.InputCount); err != nil {
 		return err
+	}
+	if r.Outcome.Kind == "text" && r.Outcome.Step != "" &&
+		(r.Outcome.Stream == "combined") != r.Steps[steps[r.Outcome.Step]].CaptureCombined {
+		return fmt.Errorf("probe text outcome step %q capture mode disagrees with stream %q", r.Outcome.Step, r.Outcome.Stream)
 	}
 	if stdoutPathStep != "" && (r.Outcome.Kind != "text" || r.Outcome.Step != stdoutPathStep || r.Outcome.Stream != "stdout") {
 		return fmt.Errorf("probe step %q stdout path provenance must be the direct text stdout outcome", stdoutPathStep)
@@ -1532,8 +1546,11 @@ func (r ProbeResult) Validate() error {
 		if step.Status != "success" && step.Status != "failure" && step.Status != "skipped" {
 			return fmt.Errorf("probe result step %q has invalid status %q", step.Name, step.Status)
 		}
-		if step.Status == "success" && step.ExitCode != 0 || step.Status == "failure" && step.ExitCode == 0 || step.Status == "skipped" && (step.ExitCode != -1 || step.Stdout != "" || step.Stderr != "") {
+		if step.Status == "success" && step.ExitCode != 0 || step.Status == "failure" && step.ExitCode == 0 || step.Status == "skipped" && (step.ExitCode != -1 || step.Stdout != "" || step.Stderr != "" || step.Combined != nil) {
 			return fmt.Errorf("probe result step %q status and process fields disagree", step.Name)
+		}
+		if step.Combined != nil && (step.Stdout != "" || step.Stderr != "" || step.StdoutPathKind != "") {
+			return fmt.Errorf("probe result step %q has both merged output and split or path output", step.Name)
 		}
 		switch step.StdoutPathKind {
 		case "":

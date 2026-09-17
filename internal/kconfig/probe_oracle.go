@@ -184,6 +184,23 @@ func (o *ProbeResultOracle) ValidatePlan(plan *ProbePlan) error {
 		if result.ToolsetIdentity != plan.Toolsets[node.Scope] {
 			return fmt.Errorf("probe node %s result toolset %s differs from plan %s", node.ID, result.ToolsetIdentity, plan.Toolsets[node.Scope])
 		}
+		// Only one OS pipe can preserve the write order of redirected child
+		// stdout and stderr. Bind that result shape to the request's capture
+		// mode before source replay consumes the stored text.
+		for index, step := range result.Steps {
+			if index >= len(request.Steps) || step.Name != request.Steps[index].Name {
+				return fmt.Errorf("probe node %s result step %d %q does not match its request", node.ID, index, step.Name)
+			}
+			if step.Status == "skipped" {
+				if step.Combined != nil {
+					return fmt.Errorf("probe node %s skipped step %q has combined output", node.ID, step.Name)
+				}
+				continue
+			}
+			if (step.Combined != nil) != request.Steps[index].CaptureCombined {
+				return fmt.Errorf("probe node %s step %q result capture mode disagrees with its request", node.ID, step.Name)
+			}
+		}
 	}
 	return nil
 }
