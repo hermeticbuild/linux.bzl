@@ -819,10 +819,10 @@ func runProbe(opts probeOptions) error {
 		if err != nil {
 			return fmt.Errorf("step %s: %w", step.Name, err)
 		}
-		stdin := ""
+		stdin := step.StdinOpaque
 		if len(step.StdinFragments) != 0 {
 			stdin, err = renderFragments("stdin", step.StdinFragments, 0)
-		} else {
+		} else if step.Stdin != "" {
 			stdin, err = expand(step.Stdin)
 			if err != nil {
 				return fmt.Errorf("expand step %s stdin: %w", step.Name, err)

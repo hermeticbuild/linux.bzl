@@ -1453,7 +1453,7 @@ func TestLinuxProbeEvaluatorDiscoversCanonicalCapabilityDAG(t *testing.T) {
 			t.Errorf("request roles = %v", roles)
 		}
 	}
-	if got, want := plan.Nodes[0].RequestID, "2a3c2724f14a5f1b12f74a06ca682bb635dcd4e95f69c5401fbbff28ef09a692"; got != want {
+	if got, want := plan.Nodes[0].RequestID, "0148ee91363a36d6d43f054213d0b694800c684e8f94f5c93473e91a7bcd04ce"; got != want {
 		t.Fatalf("cc-option canonical request ID = %s, want %s", got, want)
 	}
 }

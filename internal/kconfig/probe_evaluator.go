@@ -1528,7 +1528,7 @@ func equalLinuxProbeRequest(left, right ProbeRequest) bool {
 
 func equalLinuxProbeStep(left, right ProbeStep) bool {
 	if left.Name != right.Name || left.Tool != right.Tool ||
-		left.WorkingDirectory != right.WorkingDirectory || left.Stdin != right.Stdin ||
+		left.WorkingDirectory != right.WorkingDirectory || left.Stdin != right.Stdin || left.StdinOpaque != right.StdinOpaque ||
 		left.DiscardStdout != right.DiscardStdout || left.DiscardStderr != right.DiscardStderr ||
 		left.CaptureCombined != right.CaptureCombined ||
 		left.StdoutExecrootRelative != right.StdoutExecrootRelative ||

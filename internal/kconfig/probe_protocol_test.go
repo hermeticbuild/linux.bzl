@@ -174,8 +174,8 @@ func testProbeRequest() ProbeRequest {
 }
 
 func TestProbeRequestCanonicalIdentity(t *testing.T) {
-	if LinuxProbeRequestSchema != "linux-probe-request-v13" {
-		t.Fatalf("probe request schema = %q, want v13", LinuxProbeRequestSchema)
+	if LinuxProbeRequestSchema != "linux-probe-request-v14" {
+		t.Fatalf("probe request schema = %q, want v14", LinuxProbeRequestSchema)
 	}
 	request := testProbeRequest()
 	id, err := request.ID()
@@ -538,6 +538,44 @@ func TestProbeStepEqualityBindsCombinedOutputCapture(t *testing.T) {
 	right.CaptureCombined = true
 	if equalLinuxProbeStep(left, right) {
 		t.Fatal("step equality ignored combined output capture")
+	}
+}
+
+func TestProbeRequestOpaqueStdin(t *testing.T) {
+	request := testProbeRequest()
+	request.Steps[0].Stdin = ""
+	request.Steps[0].StdinOpaque = "${tool:unbound} ${source_root:unbound} ${1} ${tree:kernel}"
+	id, err := request.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := request.ToolRoles(); !slices.Equal(got, []string{"cc"}) {
+		t.Fatalf("opaque stdin created tool capabilities: %q", got)
+	}
+	original := request
+	original.Steps = slices.Clone(request.Steps)
+	request.Steps[0].StdinOpaque += "changed"
+	changedID, err := request.ID()
+	if err != nil || changedID == id || equalLinuxProbeRequest(original, request) {
+		t.Fatalf("opaque bytes did not change request identity: %q, %v", changedID, err)
+	}
+	for name, mutate := range map[string]func(*ProbeRequest){
+		"templated overlap": func(r *ProbeRequest) { r.Steps[0].Stdin = "duplicate" },
+		"fragmented overlap": func(r *ProbeRequest) {
+			r.Steps[0].StdinFragments = []ProbeValueFragment{{Value: "duplicate"}}
+		},
+		"NUL":        func(r *ProbeRequest) { r.Steps[0].StdinOpaque = "\x00" },
+		"size bound": func(r *ProbeRequest) { r.Steps[0].StdinOpaque = strings.Repeat("x", 1<<20+1) },
+		"old schema": func(r *ProbeRequest) { r.Schema = "linux-probe-request-v13" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := request
+			invalid.Steps = slices.Clone(request.Steps)
+			mutate(&invalid)
+			if err := invalid.Validate(); err == nil {
+				t.Fatal("invalid stdin representation was accepted")
+			}
+		})
 	}
 }
 

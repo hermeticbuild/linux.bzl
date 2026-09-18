@@ -41,7 +41,7 @@ func candidateProtocolRequest() ProbeRequest {
 }
 
 func TestProbeCandidateProtocolSchemaAndNilCompatibility(t *testing.T) {
-	if got, want := LinuxProbeRequestSchema, "linux-probe-request-v13"; got != want {
+	if got, want := LinuxProbeRequestSchema, "linux-probe-request-v14"; got != want {
 		t.Fatalf("probe request schema = %q, want %q", got, want)
 	}
 

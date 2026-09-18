@@ -26,7 +26,7 @@ import (
 
 const (
 	LinuxProbePlanSchema    = "linux-probe-plan-v2"
-	LinuxProbeRequestSchema = "linux-probe-request-v13"
+	LinuxProbeRequestSchema = "linux-probe-request-v14"
 	LinuxProbeResultSchema  = "linux-probe-result-v2"
 
 	// Probe candidate policies select the security grammar used for arguments
@@ -126,7 +126,10 @@ type ProbeStep struct {
 	EnvironmentFragments []ProbeEnvironmentFragments `json:"environment_fragments,omitempty"`
 	Stdin                string                      `json:"stdin,omitempty"`
 	StdinFragments       []ProbeValueFragment        `json:"stdin_fragments,omitempty"`
-	When                 *ProbePredicate             `json:"when,omitempty"`
+	// StdinOpaque carries exact bytes without template expansion or source
+	// path normalization. It is mutually exclusive with Stdin/Fragments.
+	StdinOpaque string          `json:"stdin_opaque,omitempty"`
+	When        *ProbePredicate `json:"when,omitempty"`
 	// DiscardStdout and DiscardStderr preserve source shell redirections for
 	// status-only probes. The process still runs normally, but discarded bytes
 	// cannot enter the content-addressed ProbeResult or its output limits.
@@ -609,11 +612,20 @@ func (r ProbeRequest) Validate() error {
 		if argumentFragmentCount > maxProbeValueFragments || argumentFragmentBytes > MaxProbeInterpolatedBytes {
 			return fmt.Errorf("probe step %q argument fragments exceed protocol bounds", step.Name)
 		}
-		if len(step.Stdin) > 1<<20 || strings.ContainsRune(step.Stdin, 0) {
-			return fmt.Errorf("probe step %q stdin is invalid or exceeds 1 MiB", step.Name)
+		stdinForms := 0
+		for _, content := range []string{step.Stdin, step.StdinOpaque} {
+			if len(content) > 1<<20 || strings.ContainsRune(content, 0) {
+				return fmt.Errorf("probe step %q stdin is invalid or exceeds 1 MiB", step.Name)
+			}
+			if content != "" {
+				stdinForms++
+			}
 		}
-		if step.Stdin != "" && len(step.StdinFragments) != 0 {
-			return fmt.Errorf("probe step %q has both literal and fragmented stdin", step.Name)
+		if len(step.StdinFragments) != 0 {
+			stdinForms++
+		}
+		if stdinForms > 1 {
+			return fmt.Errorf("probe step %q has multiple stdin representations", step.Name)
 		}
 		stdinFragmentBytes := 0
 		if len(step.StdinFragments) > maxProbeValueFragments {

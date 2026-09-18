@@ -311,7 +311,7 @@ func TestCanonicalSourceRequestDeepCopiesValueTransformArguments(t *testing.T) {
 	}
 }
 
-func TestCanonicalSourceRequestPreservesOpaqueScratchContent(t *testing.T) {
+func TestCanonicalSourceRequestPreservesOpaqueContent(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "linux")
 	evaluator := &LinuxProbeEvaluator{sourceRoot: root}
 	physical := filepath.ToSlash(filepath.Join(root, "literal-config-value"))
@@ -321,7 +321,7 @@ func TestCanonicalSourceRequestPreservesOpaqueScratchContent(t *testing.T) {
 			{Name: "command", Kind: "file", Content: physical},
 			{Name: "config", Kind: "file", Content: physical, ContentIsOpaque: true},
 		},
-		Steps: []ProbeStep{{Name: "consume", Tool: "cc"}},
+		Steps: []ProbeStep{{Name: "consume", Tool: "cc", StdinOpaque: physical}},
 		Outcome: ProbeOutcome{
 			Kind: "boolean", Predicate: &ProbePredicate{Operator: "exit-zero", Step: "consume"},
 		},
@@ -332,6 +332,9 @@ func TestCanonicalSourceRequestPreservesOpaqueScratchContent(t *testing.T) {
 	}
 	if got := canonical.Scratch[1].Content; got != physical {
 		t.Fatalf("opaque config scratch = %q, want exact bytes %q", got, physical)
+	}
+	if got := canonical.Steps[0].StdinOpaque; got != physical {
+		t.Fatalf("opaque stdin = %q, want exact bytes %q", got, physical)
 	}
 	if got := request.Scratch[0].Content; got != physical {
 		t.Fatalf("canonicalization mutated original scratch content: %q", got)

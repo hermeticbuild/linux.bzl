@@ -64,18 +64,18 @@ func TestCompilerProjectedRequestTemplateParity(t *testing.T) {
 				}
 				identity := fmt.Sprintf("%x", sha256.Sum256(append(append(request, '\n'), dependencies...)))
 				want := map[string]string{
-					"literal/predefines":       "ae37d4da20d0de7b4b96c1247872b08f8503d65d02c82015b6b029b8ba3977f0",
-					"literal/definedness":      "33b4b074fc93c0045674deb1c3f2fd9b5104d395f22b18bc35c8019ed647e345",
-					"literal/optional":         "57109e51d40b03ba3408ad5b50daf835d0548a92a5747385403567ee544c9899",
-					"literal/intrinsic":        "71da40ece211adbbf386d30f4fcec3eb166870693ed543d41cd9102b2592579b",
-					"symbolic/predefines":      "8e3b32f4eeb38ff6fb341b2c0c49731d2e40759369b65054686b26fcd9100d31",
-					"symbolic/definedness":     "a7b25aae7002c275968ec2eac9d36dfda63f9c3c05ae52ecaffbc1b4aef41bf7",
-					"symbolic/optional":        "544d0f5dc8143f2e067aeda13d3c3bc33a4c93e018b096b2e894e2586086ba5d",
-					"symbolic/intrinsic":       "d79348214c45d0dc3519483c7c756558377ea8044ca6aaa5afa3bd3e55cfcb28",
-					"source-shell/predefines":  "440d59c89c885f5fe37ef42a2013448601f3582061aaa4392d93001ed7bac2f7",
-					"source-shell/definedness": "69ef0627159b03d32746ab16f5de08f05e34f39ef7f7e1d8f74342254e023797",
-					"source-shell/optional":    "5d92c7ae1c7b8df8fae8c811f3e4e20246438a1784a9fd055d221bb8bf9b4eaa",
-					"source-shell/intrinsic":   "fd3e6a71d241b223c197bf5c0a9b441bec95e0dcaddc868768820ae8470f1b91",
+					"literal/predefines":       "8a6f21f2c2d07316dbc5b3b1338e856cdf8e6927c0aeb341cc8750a35eb97e45",
+					"literal/definedness":      "495a3b57128b9a432f5993edf48dccdb301371881090ea44fd172f6914e066ea",
+					"literal/optional":         "573176fa191b4feb22bfb5f542268c92e55f0c9c8adb63b0b15aa3680c0faad4",
+					"literal/intrinsic":        "8d81604badfc8006b8505b3a6f8c45f8cbd162fe63c65e9be56c9ac0ddc96ce1",
+					"symbolic/predefines":      "daab77aecd78e83d095272a7ed2cfcf570eb64e1549ca5265e61d4d3d1b53edf",
+					"symbolic/definedness":     "7d2abad59826311e451eb8a64757cef50ca14ca63e1c8a713599ad72046a659d",
+					"symbolic/optional":        "59ea4cee1870d0f2dc58bb7a1ebd134ccce5080ac0f336727e53043496c49dbf",
+					"symbolic/intrinsic":       "8416e91ce66979cec25b3219e95f7e277b1a76fded009b9f0e9be67b4482ebc7",
+					"source-shell/predefines":  "e7cc39cb163555122c71dbbf2ad3b149bbf47a9841fd6f6638541db834b1ddd5",
+					"source-shell/definedness": "5f6b3bfd1ac5eaf143734c46bc1811945a4872626f8889f39fc3c8191fb17a5c",
+					"source-shell/optional":    "c005129ba320cf77f989da053367bc3a68500b5af5a53440b723cca33afcdce5",
+					"source-shell/intrinsic":   "dbf82432a5ba7ab8a04c5578a601e8569243624e281eb4be10cf0343125fbfff",
 				}
 				if identity != want[context+"/"+query] {
 					t.Fatalf("request/dependency identity = %s", identity)
