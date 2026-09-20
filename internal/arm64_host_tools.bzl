@@ -77,7 +77,6 @@ def linux_arm64_host_tools(
         source_repo = source_repo,
         source_root = common.source_root,
         source_tree = common.source_tree,
-        sorttable_tool = common.sorttable_tool,
         vdsomunge_tool = package_label(vdsomunge_tool),
     )
 
@@ -126,6 +125,5 @@ def linux_arm64_configured_host_tools(
         source_repo = shared.source_repo,
         source_root = source_root,
         source_tree = source_tree,
-        sorttable_tool = shared.sorttable_tool,
         vdsomunge_tool = shared.vdsomunge_tool,
     )

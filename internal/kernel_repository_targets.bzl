@@ -1,6 +1,7 @@
 """Private target graph emitted by linux_image."""
 
 load(":architectures.bzl", "linux_architectures")
+load(":common_host_tools.bzl", "linux_sorttable")
 load(":kernel_bundle.bzl", "linux_kernel_bundle", "linux_kernel_exports")
 load(":linux_modules.bzl", "linux_module_sdk")
 load(":linux_objects.bzl", "linux_compressed_image", "linux_resolved_config", "linux_vmlinux")
@@ -94,6 +95,7 @@ def _define_core_outputs(
         config,
         compact_image,
         host_tools,
+        sorttable_config,
         minimum_rustc_version,
         rust_profile_json,
         rust_enabled,
@@ -103,6 +105,13 @@ def _define_core_outputs(
     rust_sdk = prefix + "_rust_sdk"
     vmlinux = prefix + "_vmlinux"
     module_sdk = prefix + "_module_sdk"
+    sorttable = prefix + "_sorttable_tool"
+    linux_sorttable(
+        name = sorttable,
+        config = sorttable_config,
+        source_repo = source_repo,
+        visibility = visibility,
+    )
     if rust_enabled:
         rust_sdk_kwargs = {
             "name": rust_sdk,
@@ -145,7 +154,7 @@ def _define_core_outputs(
         "pahole": Label("@pahole//:pahole"),
         "resolve_btfids_tool": host_tools.resolve_btfids_tool,
         "rust_sdk": ":" + rust_sdk,
-        "sorttable_tool": host_tools.sorttable_tool,
+        "sorttable_tool": ":" + sorttable,
         "source_root": _source_label(source_repo, "Kconfig"),
         "source_tree": _source_tree_inputs(source_repo),
         "srcarch": arch.srcarch,
@@ -295,6 +304,7 @@ def linux_image_targets(
         config = ":_base_config",
         compact_image = graph_image,
         host_tools = host_tools,
+        sorttable_config = base_config,
         minimum_rustc_version = minimum_rustc_version,
         rust_profile_json = rust_profile_json,
         rust_enabled = base_rust_enabled,
@@ -385,6 +395,7 @@ def linux_image_targets(
                 config = ":" + config_target,
                 compact_image = variant_graph_images[variant],
                 host_tools = variant_host_tools,
+                sorttable_config = variant_configs[variant],
                 minimum_rustc_version = minimum_rustc_version,
                 rust_profile_json = rust_profile_json,
                 rust_enabled = variant_rust_enabled[variant],

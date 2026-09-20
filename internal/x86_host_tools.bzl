@@ -359,7 +359,6 @@ def linux_x86_host_tools(
         source_repo = source_repo,
         source_root = common.source_root,
         source_tree = common.source_tree,
-        sorttable_tool = common.sorttable_tool,
         x86_relocs_tool = package_label(relocs_tool),
     )
 
@@ -419,6 +418,5 @@ def linux_x86_configured_host_tools(
         source_repo = shared.source_repo,
         source_root = source_root,
         source_tree = source_tree,
-        sorttable_tool = shared.sorttable_tool,
         x86_relocs_tool = shared.x86_relocs_tool,
     )

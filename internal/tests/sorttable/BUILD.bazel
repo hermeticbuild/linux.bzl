@@ -1,0 +1,59 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+load("//internal:common_host_tools.bzl", "linux_sorttable_config")
+load("//internal:kconfig.bzl", "kconfig_file", "kconfig_overlay")
+
+package(default_visibility = ["//visibility:private"])
+
+kconfig_file(
+    name = "enabled",
+    config = "enabled.config",
+    config_flags = {"CONFIG_BUILDTIME_MCOUNT_SORT": "y"},
+)
+
+kconfig_overlay(
+    name = "disabled",
+    base = ":enabled",
+    set = {"CONFIG_BUILDTIME_MCOUNT_SORT": "n"},
+)
+
+kconfig_overlay(
+    name = "unset",
+    base = ":enabled",
+    unset = ["CONFIG_BUILDTIME_MCOUNT_SORT"],
+)
+
+linux_sorttable_config(
+    name = "enabled_defines",
+    config = ":enabled",
+)
+
+linux_sorttable_config(
+    name = "disabled_defines",
+    config = ":disabled",
+)
+
+linux_sorttable_config(
+    name = "unset_defines",
+    config = ":unset",
+)
+
+cc_test(
+    name = "mcount_enabled_test",
+    srcs = ["config_test.c"],
+    local_defines = ["EXPECT_MCOUNT_SORT=1"],
+    deps = [":enabled_defines"],
+)
+
+cc_test(
+    name = "mcount_disabled_test",
+    srcs = ["config_test.c"],
+    local_defines = ["EXPECT_MCOUNT_SORT=0"],
+    deps = [":disabled_defines"],
+)
+
+cc_test(
+    name = "mcount_unset_test",
+    srcs = ["config_test.c"],
+    local_defines = ["EXPECT_MCOUNT_SORT=0"],
+    deps = [":unset_defines"],
+)

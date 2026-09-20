@@ -111,7 +111,6 @@ def _linux_generic_host_tools(
         "source_repo": source_repo,
         "source_root": common.source_root,
         "source_tree": common.source_tree,
-        "sorttable_tool": common.sorttable_tool,
     }
     if vdsomunge_tool:
         result["vdsomunge_tool"] = package_label(vdsomunge_tool)
@@ -154,7 +153,6 @@ def _linux_generic_configured_host_tools(
         "source_repo": shared.source_repo,
         "source_root": source_root,
         "source_tree": source_tree,
-        "sorttable_tool": shared.sorttable_tool,
     }
     if arch == "arm":
         result["vdsomunge_tool"] = shared.vdsomunge_tool
