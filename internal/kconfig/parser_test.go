@@ -55,6 +55,42 @@ endmenu
 	}
 }
 
+func TestParseLegacyConfigOptions(t *testing.T) {
+	tree, err := Parse(context.Background(), strings.NewReader(`
+config DEFCONFIG_LIST
+	string
+	option defconfig_list
+	default "configs/fallback"
+
+config MODULES
+	bool "Modules"
+	option modules
+
+config ENABLED_BY_ALLNOCONFIG
+	bool "Enable in allnoconfig"
+	option allnoconfig_y
+`), "Kconfig", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tree.defconfigSym != tree.Symbols["DEFCONFIG_LIST"] {
+		t.Errorf("defconfig_list = %#v, want default-config symbol", tree.defconfigSym)
+	}
+	if tree.modulesSym != tree.Symbols["MODULES"] {
+		t.Errorf("modules = %#v, want MODULES", tree.modulesSym)
+	}
+	for _, input := range []string{
+		"config BAD\n\tbool\n\toption unrecognized\n",
+		"config BAD\n\tbool\n\toption modules trailing\n",
+		"config BAD\n\tbool\n\toption \"modules\"\n",
+		"choice\n\toption modules\nendchoice\n",
+	} {
+		if _, err := Parse(context.Background(), strings.NewReader(input), "Kconfig", Options{}); err == nil {
+			t.Errorf("Parse(%q) accepted unsupported option", input)
+		}
+	}
+}
+
 func parserTestExprString(symbol *Symbol) string {
 	if symbol == nil || symbol.RevDep == nil {
 		return ""
@@ -116,6 +152,37 @@ endchoice
 	}
 }
 
+func TestParseChoiceInfersTristateAndUntypedMembers(t *testing.T) {
+	tree, err := Parse(context.Background(), strings.NewReader(`
+choice
+	prompt "Enumeration method"
+
+config BASIC
+	tristate "Basic"
+
+config OTHER
+	prompt "Other"
+endchoice
+`), "Kconfig", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	choice := tree.Root.Children[0].Symbol
+	if choice.Type != SymbolTristate || tree.Symbols["OTHER"].Type != SymbolTristate {
+		t.Fatalf("inferred choice type = %q, untyped member = %q; want tristate", choice.Type, tree.Symbols["OTHER"].Type)
+	}
+	_, err = Parse(context.Background(), strings.NewReader(`
+choice
+	prompt "Invalid"
+config WRONG
+	int "Wrong"
+endchoice
+`), "Kconfig", Options{})
+	if err == nil || !strings.Contains(err.Error(), `choice member "WRONG" must be bool or tristate`) {
+		t.Fatalf("scalar choice member error = %v, want type rejection", err)
+	}
+}
+
 func TestParsePromptlessChoice(t *testing.T) {
 	_, err := Parse(context.Background(), strings.NewReader(`
 choice
@@ -129,6 +196,28 @@ endchoice
 `), "Kconfig", Options{})
 	if err != nil {
 		t.Fatalf("Parse() failed: %v", err)
+	}
+}
+
+func TestParseHelpKeywordAtSameIndentIsText(t *testing.T) {
+	tree, err := Parse(context.Background(), strings.NewReader(`
+config FIRMWARE
+	bool "Build firmware"
+	help
+	This option modifies firmware
+	source to the device driver.
+
+config NEXT
+	bool "Next"
+`), "Kconfig", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tree.Symbols["FIRMWARE"].Menus[0].Help; !strings.Contains(got, "source to the device driver.") {
+		t.Fatalf("help lost same-indentation keyword: %q", got)
+	}
+	if tree.Symbols["NEXT"] == nil {
+		t.Fatal("next source block was swallowed as help")
 	}
 }
 

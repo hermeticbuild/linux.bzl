@@ -81,6 +81,7 @@ type Tree struct {
 	constSymbols map[string]*Symbol
 	anonID       int
 	modulesSym   *Symbol
+	defconfigSym *Symbol
 }
 
 type Source struct {
@@ -155,7 +156,7 @@ func (t *Tree) symbol(name string, constant bool) *Symbol {
 
 func (t *Tree) anonymousSymbol(pos Position) *Symbol {
 	t.anonID++
-	return &Symbol{Name: fmt.Sprintf("<choice@%s:%d:%d>", pos.Filename, pos.Line, t.anonID), Type: SymbolBool}
+	return &Symbol{Name: fmt.Sprintf("<choice@%s:%d:%d>", pos.Filename, pos.Line, t.anonID), Type: SymbolUnknown}
 }
 
 func (m *Menu) addChild(child *Menu) {

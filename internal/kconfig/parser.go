@@ -250,8 +250,8 @@ func (p *parser) parseConfig(lines []sourceLine, idx int, parent *Menu, menuType
 		if entry.Prompt == nil {
 			return idx, p.parseError(entry.Position, "choice member %q must have a prompt", sym.Name)
 		}
-		if sym.Type != SymbolBool {
-			return idx, p.parseError(entry.Position, "choice member %q must be bool", sym.Name)
+		if sym.Type != SymbolUnknown && sym.Type != SymbolBool && sym.Type != SymbolTristate {
+			return idx, p.parseError(entry.Position, "choice member %q must be bool or tristate", sym.Name)
 		}
 		sym.Choice = p.currentChoice.Symbol
 		p.currentChoice.Symbol.ChoiceMembers = append(p.currentChoice.Symbol.ChoiceMembers, sym)
@@ -296,7 +296,25 @@ func (p *parser) parseChoice(lines []sourceLine, idx int, parent *Menu) (int, er
 	p.currentChoice = entry
 	idx, err = p.parseBlock(lines, idx, entry, map[string]bool{"endchoice": true})
 	p.currentChoice = previousChoice
-	return idx, err
+	if err != nil {
+		return idx, err
+	}
+	// scripts/kconfig/menu.c:menu_finalize() infers an untyped choice from
+	// its first typed value, then fills in values without an explicit type.
+	if sym.Type == SymbolUnknown {
+		for _, member := range sym.ChoiceMembers {
+			if member.Type != SymbolUnknown {
+				sym.Type = member.Type
+				break
+			}
+		}
+	}
+	for _, member := range sym.ChoiceMembers {
+		if member.Type == SymbolUnknown {
+			member.Type = sym.Type
+		}
+	}
+	return idx, nil
 }
 
 func (p *parser) parseMenu(lines []sourceLine, idx int, parent *Menu) (int, error) {
@@ -409,7 +427,7 @@ func isOptionKeyword(kw string, class optionClass) bool {
 	switch class {
 	case configOption:
 		switch kw {
-		case "bool", "tristate", "int", "hex", "string", "prompt", "default", "def_bool", "def_tristate", "select", "imply", "range", "modules", "transitional":
+		case "bool", "tristate", "int", "hex", "string", "prompt", "default", "def_bool", "def_tristate", "select", "imply", "range", "modules", "option", "transitional":
 			return true
 		}
 	case choiceOption:
@@ -542,13 +560,27 @@ func (p *parser) applyOption(entry *Menu, toks []token, class optionClass) error
 		}
 		entry.Visibility = andExpr(entry.Visibility, expr)
 	case "modules":
-		if entry.Symbol == nil {
-			return p.parseError(toks[0].pos, "modules option requires a symbol")
+		if len(toks) != 1 {
+			return p.parseError(toks[0].pos, "modules does not accept arguments")
 		}
-		if p.tree.modulesSym != nil && p.tree.modulesSym != entry.Symbol {
-			return p.parseError(toks[0].pos, "modules option already defined by %q", p.tree.modulesSym.Name)
+		return p.setModulesSymbol(entry, toks[0].pos)
+	case "option":
+		if class != configOption || len(toks) != 2 || toks[1].quoted || entry.Symbol == nil {
+			return p.parseError(toks[0].pos, "option expects one unquoted config symbol property")
 		}
-		p.tree.modulesSym = entry.Symbol
+		switch toks[1].value {
+		case "modules":
+			return p.setModulesSymbol(entry, toks[0].pos)
+		case "defconfig_list":
+			if p.tree.defconfigSym != nil && p.tree.defconfigSym != entry.Symbol {
+				return p.parseError(toks[0].pos, "defconfig_list option already defined by %q", p.tree.defconfigSym.Name)
+			}
+			p.tree.defconfigSym = entry.Symbol
+		case "allnoconfig_y":
+			// Native conf owns the baseline mode.
+		default:
+			return p.parseError(toks[1].pos, "unsupported config option %q", toks[1].value)
+		}
 	case "transitional":
 		if entry.Symbol == nil {
 			return p.parseError(toks[0].pos, "transitional option requires a symbol")
@@ -557,6 +589,17 @@ func (p *parser) applyOption(entry *Menu, toks []token, class optionClass) error
 	default:
 		return p.parseError(toks[0].pos, "unsupported option %q", kw)
 	}
+	return nil
+}
+
+func (p *parser) setModulesSymbol(entry *Menu, pos Position) error {
+	if entry.Symbol == nil {
+		return p.parseError(pos, "modules option requires a symbol")
+	}
+	if p.tree.modulesSym != nil && p.tree.modulesSym != entry.Symbol {
+		return p.parseError(pos, "modules option already defined by %q", p.tree.modulesSym.Name)
+	}
+	p.tree.modulesSym = entry.Symbol
 	return nil
 }
 
@@ -638,7 +681,11 @@ func collectHelp(lines []sourceLine, idx int, helpIndent int) (string, int) {
 			continue
 		}
 		indent := visualIndent(raw)
-		if indent <= helpIndent && isBlockKeyword(strings.TrimSpace(raw)) {
+		// scripts/kconfig/lexer.l keeps text at the first help line's
+		// indentation, even when it starts with a Kconfig keyword such as
+		// "source". A shallower indentation ends the help block.
+		if isBlockKeyword(strings.TrimSpace(raw)) &&
+			((firstIndent < 0 && indent <= helpIndent) || (firstIndent >= 0 && indent < firstIndent)) {
 			break
 		}
 		if firstIndent == -1 {
