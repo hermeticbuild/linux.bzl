@@ -67,7 +67,46 @@ func quotedSourceVersionFixtureScopes(t *testing.T) (*KbuildProbeScopes, *ProbeP
 	}
 	scopes := testSourceScriptOutputScopes(t, root, builder, nil)
 	const target = "include/config/kernel.release"
-	return scopes, builder, root, target, map[string]string{"include/config/auto.conf": "CONFIG_LOCALVERSION=\"-fixture\"\n"}
+	return scopes, builder, root, target, map[string]string{"include/config/auto.conf": "# Automatically generated file; DO NOT EDIT.\nCONFIG_LOCALVERSION=\"-fixture\"\n"}
+}
+
+func TestSelectedSourceFilechkValidatesConfigOnlyWhenSourced(t *testing.T) {
+	for _, test := range []struct {
+		name, config  string
+		nested, prior bool
+		want          bool
+	}{
+		{name: "native shell config", config: "# Automatically generated file; DO NOT EDIT.\nCONFIG_LOCALVERSION=\"-fixture\"\n", want: true},
+		{name: "Make string with spaces", config: "CONFIG_CC_VERSION_TEXT=Clang version 22\n"},
+		{name: "active command substitution", config: "CONFIG_LOCALVERSION=\"$(touch side-effect)\"\n"},
+		{name: "nested immutable import", config: "CONFIG_CC_VERSION_TEXT=Clang version 22\n", nested: true},
+		{name: "selected prior writer", config: "CONFIG_LOCALVERSION=\"-prior\"\n", prior: true, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scopes, _, root, target, baseline := quotedSourceVersionFixtureScopes(t)
+			if test.nested {
+				mustWriteSource(t, root, "scripts/source-version", "#!/bin/sh\n. scripts/read-config\nprintf '%s\\n' \"$CONFIG_LOCALVERSION\"\n")
+				mustWriteSource(t, root, "scripts/read-config", ". include/config/auto.conf\n")
+			}
+			var names []string
+			var files, owners map[string]string
+			if test.prior {
+				baseline["include/config/auto.conf"] = "CONFIG_CC_VERSION_TEXT=Clang version 22\n"
+				names = []string{"include/config/auto.conf"}
+				files = map[string]string{names[0]: test.config}
+				owners = map[string]string{names[0]: "selected-prior-writer"}
+			} else {
+				baseline["include/config/auto.conf"] = test.config
+			}
+			recipe := "{\necho \"5.10.270$(sh ${tree:kernel}/scripts/source-version ${tree:kernel})\"\n} > '" + target + "'"
+			_, _, recognized, _, err := scopes.SelectedSourceFilechkOutputText(
+				target, recipe, baseline, names, files, owners, nil,
+			)
+			if err != nil || recognized != test.want {
+				t.Fatalf("source measurement = %t, %v; want recognized=%t", recognized, err, test.want)
+			}
+		})
+	}
 }
 
 func TestSelectedSourceGeneratorBindsScopedHostToolFromExport(t *testing.T) {

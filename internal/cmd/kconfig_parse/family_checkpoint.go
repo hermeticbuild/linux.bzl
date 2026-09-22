@@ -220,7 +220,7 @@ func linuxFamilyCheckpointBindings(opts linuxKbuildProbeOptions, scopes *kconfig
 	}
 	bindings, err := kconfig.NewActionPlanCheckpointBindings(opts.familyVariantOptions.Variant, artifacts,
 		map[string]string{"target": opts.targetFacts.ToolsetIdentity(), "host": opts.hostFacts.ToolsetIdentity()},
-		resolvedConfigObjectTreeContents(opts.tree, resolved), current, metadataOptions, manifestIdentity)
+		opts.nativeConfig.files, current, metadataOptions, manifestIdentity)
 	bindings.VirtualSourceRoots = virtual
 	return bindings, err
 }
@@ -239,11 +239,7 @@ func replayLinuxFamilyCheckpoint(opts linuxKbuildProbeOptions, scopes *kconfig.K
 	if err := scopes.RestoreCompilerCheckpoint(checkpoint.Compiler, opts.normalizeConfigValue); err != nil {
 		return linuxKbuildProbeValue{}, err
 	}
-	resolveOptions, err := resolveConfigOptions(opts.configMode)
-	if err != nil {
-		return linuxKbuildProbeValue{}, err
-	}
-	resolved, err := opts.tree.ResolveConfigWithOptions(opts.configFlags, resolveOptions)
+	resolved, err := opts.nativeConfig.resolved(opts.tree)
 	if err != nil {
 		return linuxKbuildProbeValue{}, err
 	}

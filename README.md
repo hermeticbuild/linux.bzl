@@ -91,8 +91,8 @@ Build another fixed output directly:
 bazel build @example_kernel//:vmlinux
 ```
 
-No `BUILD.bazel` macro is required in the consuming repository. A normal Bazel
-action resolves Kconfig and Kbuild using the selected compiler, and
+No `BUILD.bazel` macro is required in the consuming repository. Declared Bazel
+actions resolve Kconfig and Kbuild using the selected compiler, and
 `map_directory` expands that plan into fine-grained build actions.
 
 ## Public API
@@ -409,6 +409,20 @@ Kconfig and Kbuild run capability probes with the tools selected by Bazel.
 Compiler, assembler, linker, and optional feature symbols therefore describe
 the real registered toolchain rather than a checked-in compiler baseline.
 
+The planner builds `scripts/kconfig/conf` from the selected kernel through its
+own per-object Kbuild graph. Each variant passes its base fragment followed by
+its overlay to native `conf`, preserving assignment order and choice overrides.
+As in Linux's `merge_config.sh`, `KCONFIG_ALLCONFIG` supplies those requests to
+`--alldefconfig` or `--allnoconfig`; `--syncconfig` then writes the complete
+configuration projection. Native Kconfig owns defaults, dependencies, choices,
+and output formats. The Go parser inventories symbols and compiler probes for
+build dependency analysis; it does not resolve configuration values.
+The native output tree owns file formats and presence, including optional
+`rustc_cfg` output and per-symbol dependency markers; later actions consume
+that immutable tree instead of reconstructing those files. Compiler queries
+that place build-worker paths in configuration values are rejected; ordinary
+runtime paths such as `/sbin/init` remain supported.
+
 ## Supported configurations
 
 | Area | Supported |
@@ -502,9 +516,9 @@ itself.
 The base input is a Kconfig fragment. Its architecture comes from the compiler
 selected by the `linux_images.image` platform, so the fragment can stay
 architecture-neutral and need not set architecture symbols. The planner
-derives Linux's make variables, applies Kconfig defaults, dependencies,
-selects, and implies, and runs live tool probes. For other symbols, an absent
-assignment follows Kconfig semantics; use
+derives Linux's make variables and runs live tool probes. Native Kconfig
+applies defaults, dependencies, selects, and implies. An absent assignment
+follows Kconfig semantics; use
 `# CONFIG_NAME is not set` for a deliberate unset.
 
 Named overlays contain only deliberate assignments and unsets:
@@ -759,9 +773,11 @@ when cross-configuration input paths collide. This adds transport actions for
 large nodes; it does not change recipe identity or increase compiler reuse.
 
 For precise compiler nodes, the planner scans the translation unit and literal
-include closure for `CONFIG_*` references and stages a filtered six-file
-Kconfig capsule: the resolved `.config`, `auto.conf`, `auto.conf.cmd`,
-`autoconf.h`, `rustc_cfg`, and `kernel.release`. Each translation unit starts
+include closure for `CONFIG_*` references and stages a filtered native
+Kconfig capsule. It retains selected records from `.config`, `auto.conf`,
+`autoconf.h`, and `rustc_cfg` when present, preserves `auto.conf.cmd`, and
+carries the exact dependency markers demanded by the action. Kernel release
+metadata comes from its separate Kbuild producer. Each translation unit starts
 from the selected configured compiler's probed predefines and configured and
 source-selected `-D`/`-U` operations. Because a predefine dump does not enumerate
 every compiler builtin, the planner also collects a bounded set of reserved
@@ -1121,8 +1137,8 @@ checkpoint per variant in one declared directory: the provisional graph and its
 compiler request/expression namespace, not cached compiler answers or source-read
 proofs. Compiler requests are stored once and referenced by their original IDs.
 Every guard round and final replay consumes that directory alongside the original
-source, config, tool, probe, and execution-cut inputs. Replay independently resolves
-the current Kconfig, rebinds current source roots and compiler scopes, and validates
+source, config, tool, probe, and execution-cut inputs. Replay imports the declared
+native configuration, rebinds current source roots and compiler scopes, and validates
 the saved contracts before analysis. It skips repeated Make evaluation and lowering;
 an invalid checkpoint fails instead of silently selecting another planning path.
 Final family replay still performs the full analysis, content addressing, and

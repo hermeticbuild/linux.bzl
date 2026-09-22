@@ -85,7 +85,7 @@ pending_right.o: pending_right.c include/linux/mapped_pending_hints.h
 	$(call if_changed,pending_right)
 
 .PHONY: modules_prepare
-modules_prepare:
+modules_prepare: prepare
 
 smoke.o: smoke.c include/generated/mapped_family_value.h scripts/basic/fixdep
 	$(call if_changed_dep,cc_o_c)

@@ -18,9 +18,7 @@ LinuxKernelInfo = provider(
 LinuxModuleSdkInfo = provider(
     doc = "Configured Kbuild source, object tree, probes, and toolsets consumed by external modules.",
     fields = {
-        "auto_conf": "Resolved include/config/auto.conf File.",
-        "auto_conf_cmd": "Resolved include/config/auto.conf.cmd File.",
-        "autoconf": "Resolved include/generated/autoconf.h File.",
+        "config_tree": "Exact native configuration TreeArtifact, including optional files and dependency markers.",
         "config": "Resolved kernel .config File.",
         "host_action_args": "Configured linux-kbuild-* host action argv by role.",
         "host_action_environments": "Exact configured host action environment by tool role.",
@@ -46,7 +44,6 @@ LinuxModuleSdkInfo = provider(
         "make_vars": "Configured module Make command-line variables.",
         "rust_source_files": "Selected Rust standard-library source depset.",
         "rust_source_root": "Canonical Rust standard-library source root, or an empty string.",
-        "rustc_cfg": "Resolved include/generated/rustc_cfg File.",
         "sdk": "Execution-time kernel SDK TreeArtifact.",
         "source": "Depset of declared kernel source Files available to mapped external actions.",
         "source_root": "Root Kconfig File anchoring source paths.",

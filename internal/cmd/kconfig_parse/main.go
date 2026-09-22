@@ -101,6 +101,7 @@ type linuxKconfigProbeEvaluation struct {
 	tree                             *kconfig.Tree
 	plan                             *kconfig.ProbePlan
 	target                           sourceDerivedLinuxTarget
+	environment                      func() (map[string]string, error)
 	normalizeToolsetPathCapabilities func(string) (string, error)
 }
 
@@ -117,14 +118,12 @@ type linuxKbuildProbeValue struct {
 }
 
 type linuxKbuildProbeOptions struct {
+	nativeConfig                      *nativeConfigProjection
+	nativeConfigTool                  bool
 	checkpointInput, checkpointOutput string
 	tree                              *kconfig.Tree
 	rootPath                          string
 	kbuildPath                        string
-	configInput                       string
-	configOverlays                    []string
-	configFlags                       map[string]string
-	configMode                        string
 	variables                         map[string]string
 	identityVariables                 map[string]string
 	sourceRoots                       map[string]string
@@ -424,9 +423,20 @@ func evaluateLinuxKconfigProbes(
 		}
 	}
 	return &linuxKconfigProbeEvaluation{
-		tree:                             tree,
-		plan:                             plan,
-		target:                           target,
+		tree:   tree,
+		plan:   plan,
+		target: target,
+		environment: func() (map[string]string, error) {
+			resolved := make(map[string]string, len(environment))
+			for name, value := range environment {
+				value, err := finalEvaluator.ResolveSymbolic(value)
+				if err != nil {
+					return nil, fmt.Errorf("resolve source-exported Kconfig environment %s: %w", name, err)
+				}
+				resolved[name] = value
+			}
+			return resolved, nil
+		},
 		normalizeToolsetPathCapabilities: finalEvaluator.NormalizeOrAuthorizeToolsetPathCapabilities,
 	}, nil
 }
@@ -674,32 +684,36 @@ func evaluateLinuxKbuildProbes(
 			variables["UTS_MACHINE"] = target.UTSMachine
 			graphGuards := []string{}
 			featureDumpRequestIDs := []string{}
-			metadata, resolved, err := compactMetadata(
-				opts.tree,
-				opts.rootPath,
-				opts.kbuildPath,
-				opts.configInput,
-				opts.configOverlays,
-				opts.configFlags,
-				opts.configMode,
-				variables,
-				opts.sourceRoots,
-				opts.sourceNamespaces,
-				opts.objectRoot,
-				opts.objectNamespace,
-				opts.entryTargets,
-				opts.preparationTargets,
-				opts.preparationCandidates,
-				opts.selectedProductsOnly,
-				opts.kbuildInputCache,
-				opts.kernelVersion,
-				opts.targetContract,
-				opts.hostContract,
-				scopes,
-				opts.normalizeConfigValue,
-				opts.graphGuardDiscoveryOnly, &graphGuards,
-				selectedKbuildOutputProbeMeasurement(opts, &featureDumpRequestIDs),
-			)
+			var metadata *kconfig.CompactMetadata
+			var resolved *kconfig.ResolvedConfig
+			if opts.nativeConfigTool {
+				nativeOpts := opts
+				nativeOpts.variables = variables
+				metadata, resolved, err = nativeKconfigToolMetadata(nativeOpts, scopes, sourceRoot)
+			} else {
+				metadata, resolved, err = compactMetadata(
+					opts.tree, opts.nativeConfig,
+					opts.rootPath,
+					opts.kbuildPath,
+					variables,
+					opts.sourceRoots,
+					opts.sourceNamespaces,
+					opts.objectRoot,
+					opts.objectNamespace,
+					opts.entryTargets,
+					opts.preparationTargets,
+					opts.preparationCandidates,
+					opts.selectedProductsOnly,
+					opts.kbuildInputCache,
+					opts.kernelVersion,
+					opts.targetContract,
+					opts.hostContract,
+					scopes,
+					opts.normalizeConfigValue,
+					opts.graphGuardDiscoveryOnly, &graphGuards,
+					selectedKbuildOutputProbeMeasurement(opts, &featureDumpRequestIDs),
+				)
+			}
 			if err != nil {
 				if opts.sourceOutputDiscoveryOnly {
 					var pending *pendingKbuildSourceOutputRead
@@ -784,7 +798,7 @@ func evaluateLinuxKbuildProbes(
 					}
 				}
 				if options.InitialSnapshot != nil {
-					options.ResolvedConfigFiles = resolvedConfigObjectTreeContents(opts.tree, resolved)
+					options.ResolvedConfigFiles = opts.nativeConfig.files
 				}
 				if opts.familyCompilerGuards != nil {
 					options.PrepareCompilerGuards = func() error {
@@ -1052,31 +1066,19 @@ func namedPathMap(values []namedPath) map[string]string {
 }
 
 type familyPlanFlags struct {
-	variants         stringSliceFlag
-	overlays         namedPathFlag
-	resolvedArch     namedPathFlag
-	resolvedConfig   namedPathFlag
-	resolvedAutoConf namedPathFlag
-	resolvedCmd      namedPathFlag
-	resolvedAutoconf namedPathFlag
-	resolvedRustcCfg namedPathFlag
-	snapshots        namedPathFlag
+	variants      stringSliceFlag
+	nativeConfigs namedPathFlag
+	resolvedArch  namedPathFlag
+	snapshots     namedPathFlag
 }
 
 func (f *familyPlanFlags) requested() bool {
-	return f != nil && (len(f.variants) != 0 || len(f.overlays) != 0 ||
-		len(f.resolvedArch) != 0 || len(f.resolvedConfig) != 0 ||
-		len(f.resolvedAutoConf) != 0 || len(f.resolvedCmd) != 0 ||
-		len(f.resolvedAutoconf) != 0 || len(f.resolvedRustcCfg) != 0 ||
-		len(f.snapshots) != 0)
+	return f != nil && (len(f.variants) != 0 ||
+		len(f.nativeConfigs) != 0 || len(f.resolvedArch) != 0 || len(f.snapshots) != 0)
 }
 
 type familyPlanVariantRequest struct {
-	name     string
-	overlay  string
-	arch     string
-	resolved resolvedConfigOutputs
-	snapshot string
+	name, nativeConfig, arch, snapshot string
 }
 
 func familyPlanNamedPaths(
@@ -1129,13 +1131,8 @@ func (f *familyPlanFlags) requestsWithOutputs(outputs bool) ([]familyPlanVariant
 		required bool
 	}
 	fields := []namedValues{
-		{name: "family_plan_overlay", values: f.overlays},
+		{name: "family_plan_native_config", values: f.nativeConfigs},
 		{name: "family_plan_resolved_arch_out", values: f.resolvedArch, required: true},
-		{name: "family_plan_resolved_config_out", values: f.resolvedConfig, required: true},
-		{name: "family_plan_resolved_auto_conf_out", values: f.resolvedAutoConf, required: true},
-		{name: "family_plan_resolved_auto_conf_cmd_out", values: f.resolvedCmd, required: true},
-		{name: "family_plan_resolved_autoconf_out", values: f.resolvedAutoconf, required: true},
-		{name: "family_plan_resolved_rustc_cfg_out", values: f.resolvedRustcCfg, required: true},
 		{name: "family_plan_snapshot_out", values: f.snapshots, required: true},
 	}
 	byFlag := make(map[string]map[string]string, len(fields))
@@ -1143,7 +1140,7 @@ func (f *familyPlanFlags) requestsWithOutputs(outputs bool) ([]familyPlanVariant
 		if !outputs && field.required && len(field.values) != 0 {
 			return nil, fmt.Errorf("compiler guard discovery does not accept -%s", field.name)
 		}
-		values, err := familyPlanNamedPaths(field.name, field.values, variantSet, outputs && field.required)
+		values, err := familyPlanNamedPaths(field.name, field.values, variantSet, (outputs && field.required) || field.name == "family_plan_native_config")
 		if err != nil {
 			return nil, err
 		}
@@ -1153,17 +1150,10 @@ func (f *familyPlanFlags) requestsWithOutputs(outputs bool) ([]familyPlanVariant
 	requests := make([]familyPlanVariantRequest, 0, len(names))
 	for _, name := range names {
 		requests = append(requests, familyPlanVariantRequest{
-			name:    name,
-			overlay: byFlag["family_plan_overlay"][name],
-			arch:    byFlag["family_plan_resolved_arch_out"][name],
-			resolved: resolvedConfigOutputs{
-				config:      byFlag["family_plan_resolved_config_out"][name],
-				autoConf:    byFlag["family_plan_resolved_auto_conf_out"][name],
-				autoConfCmd: byFlag["family_plan_resolved_auto_conf_cmd_out"][name],
-				autoconf:    byFlag["family_plan_resolved_autoconf_out"][name],
-				rustcCfg:    byFlag["family_plan_resolved_rustc_cfg_out"][name],
-			},
-			snapshot: byFlag["family_plan_snapshot_out"][name],
+			name:         name,
+			arch:         byFlag["family_plan_resolved_arch_out"][name],
+			nativeConfig: byFlag["family_plan_native_config"][name],
+			snapshot:     byFlag["family_plan_snapshot_out"][name],
 		})
 	}
 	return requests, nil
@@ -1853,6 +1843,17 @@ func run() (exitCode int) {
 		targetProbeResults           = flag.String("target_probe_results", "", "Target-scoped probe result TreeArtifact consumed by final planning")
 		hostProbeResults             = flag.String("host_probe_results", "", "Host-scoped probe result TreeArtifact consumed by final planning")
 		kconfigProbePlanOut          = flag.String("kconfig_probe_plan_out", "", "Directory to write the source-derived Kconfig capability probe plan")
+		nativeConfigTool             = flag.Bool("native_config_tool", false, "Build the selected source's Kconfig host executable through its per-object Kbuild graph")
+		nativeConf                   = flag.String("native_conf", "", "Selected source Kconfig executable")
+		nativeConfigInput            = flag.String("native_config", "", "Verified native configuration TreeArtifact")
+		nativeConfigOut              = flag.String("native_config_out", "", "Write verified native configuration artifacts to this TreeArtifact")
+		nativeToolsetAnchors         stringSliceFlag
+		nativeSourceRoots            = stringMapFlag{}
+		selectedOutputOut            = flag.String("selected_output_out", "", "Write the producer descriptor for the selected Kbuild executable")
+		projectSelectedOutput        = flag.String("project_selected_output", "", "Project the file identified by a selected Kbuild output descriptor")
+		selectedOutputTrees          = stringMapFlag{}
+		nativeActionContracts        = nativeConfigActionContractFlags{}
+		selectedOutputFile           = flag.String("selected_output_file", "", "Output File for a selected Kbuild projection")
 		targetKconfigProbeResults    = flag.String("target_kconfig_probe_results", "", "Target-scoped Kconfig capability result TreeArtifact consumed by replay")
 		hostKconfigProbeResults      = flag.String("host_kconfig_probe_results", "", "Host-scoped Kconfig capability result TreeArtifact consumed by replay")
 		kbuildProbePlanOut           = flag.String("kbuild_probe_plan_out", "", "Directory to write the source-derived Kbuild capability probe plan")
@@ -1887,15 +1888,10 @@ func run() (exitCode int) {
 		objectRoot                   = flag.String("object_root", "", "Preconfigured Kbuild object tree used as the object namespace")
 		objectNamespace              = flag.String("object_namespace", "", "Action-plan tree namespace for files below -object_root")
 		selectedProductsOnly         = flag.Bool("selected_products_only", false, "Plan only source-selected Kbuild products and omit kernel facade products")
-		resolveConfig                = flag.String("resolve_config", "", ".config input path to resolve through Kconfig defaults and dependencies")
+		resolveConfig                = flag.String("resolve_config", "", "Native Kconfig base fragment path")
 		resolveConfigOverlays        stringSliceFlag
-		configMode                   = flag.String("config_mode", "default", "Config resolver mode. Supported: default, allnoconfig")
+		configMode                   = flag.String("config_mode", "default", "Native Kconfig baseline: default or allnoconfig")
 		resolvedArchOut              = flag.String("resolved_arch_out", "", "Path to write the exact source-derived Linux ARCH")
-		resolvedConfigOut            = flag.String("resolved_config_out", "", "Path to write the resolved .config")
-		resolvedAutoConfOut          = flag.String("resolved_auto_conf_out", "", "Path to write the resolved include/config/auto.conf")
-		resolvedCmdOut               = flag.String("resolved_auto_conf_cmd_out", "", "Path to write the resolved include/config/auto.conf.cmd")
-		resolvedAutoconfOut          = flag.String("resolved_autoconf_out", "", "Path to write the resolved include/generated/autoconf.h")
-		resolvedRustcCfgOut          = flag.String("resolved_rustc_cfg_out", "", "Path to write the resolved include/generated/rustc_cfg")
 		kernelVersion                = flag.String("kernel_version", "", "Base kernel release used for resolved config and Kbuild action planning")
 		heapProfile                  = flag.String("heap_profile", "", "Optional sampled heap profile; requires the separate heap diagnostic binary and bounded CPU profiling")
 		cpuProfile                   = flag.String("cpu_profile", "", "Optional diagnostic CPU profile output; requires -profile_duration")
@@ -1911,13 +1907,8 @@ func run() (exitCode int) {
 	flag.Var(vars, "var", "Shared Kconfig/Kbuild variable in KEY=VALUE form. May be repeated")
 	flag.Var(&actionPlanStageOuts, "action_plan_stage_out", "Stage-specific map_directory action plan in STAGE=PATH form. Must be repeated for every stage")
 	flag.Var(&familyPlan.variants, "family_plan_variant", "Named image-family variant to resolve and plan. May be repeated")
-	flag.Var(&familyPlan.overlays, "family_plan_overlay", "Optional variant config overlay in NAME=PATH form. May be repeated")
+	flag.Var(&familyPlan.nativeConfigs, "family_plan_native_config", "Verified native config tree in NAME=PATH form")
 	flag.Var(&familyPlan.resolvedArch, "family_plan_resolved_arch_out", "Variant source-derived ARCH output in NAME=PATH form")
-	flag.Var(&familyPlan.resolvedConfig, "family_plan_resolved_config_out", "Variant resolved .config output in NAME=PATH form")
-	flag.Var(&familyPlan.resolvedAutoConf, "family_plan_resolved_auto_conf_out", "Variant resolved auto.conf output in NAME=PATH form")
-	flag.Var(&familyPlan.resolvedCmd, "family_plan_resolved_auto_conf_cmd_out", "Variant resolved auto.conf.cmd output in NAME=PATH form")
-	flag.Var(&familyPlan.resolvedAutoconf, "family_plan_resolved_autoconf_out", "Variant resolved autoconf.h output in NAME=PATH form")
-	flag.Var(&familyPlan.resolvedRustcCfg, "family_plan_resolved_rustc_cfg_out", "Variant resolved rustc_cfg output in NAME=PATH form")
 	flag.Var(&familyPlan.snapshots, "family_plan_snapshot_out", "Variant deterministic action-plan snapshot in NAME=PATH form")
 	familyExecution.register(flag.CommandLine)
 	familyCompilerGuards.register(flag.CommandLine)
@@ -1931,7 +1922,18 @@ func run() (exitCode int) {
 	flag.Var(&kbuildTargets, "kbuild_target", "Top-level Kbuild goal. May be repeated")
 	flag.Var(&kbuildPreparationTargets, "kbuild_prepare_target", "Required source-selected Kbuild preparation marker whose reached closure is exported through the module SDK. May be repeated")
 	flag.Var(&kbuildPreparationCandidates, "kbuild_prepare_candidate", "Optional source-selected Kbuild preparation marker, used only if reached through an actual Make goal. May be repeated")
+	flag.Var(selectedOutputTrees, "selected_output_tree", "Selected output tree binding in NAME=PATH form")
+	flag.Var(&nativeToolsetAnchors, "native_toolset_anchor", "Native config action toolset root anchor in SCOPE=ROOT=PATH form")
+	flag.Var(nativeSourceRoots, "native_source_root", "Native config immutable source alias in NAME=PATH form")
+	nativeActionContracts.register(flag.CommandLine)
 	flag.Parse()
+	if *projectSelectedOutput != "" {
+		if err := projectSelectedKbuildOutput(*projectSelectedOutput, selectedOutputTrees, *selectedOutputFile); err != nil {
+			fmt.Fprintf(os.Stderr, "project selected Kbuild output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if (familyExecution.requested() || familyCompilerGuards.requested()) && !familyPlan.requested() {
 		fmt.Fprintln(os.Stderr, "family execution requires -family_plan_variant and its complete outputs")
 		return 2
@@ -2078,11 +2080,6 @@ func run() (exitCode int) {
 			value string
 		}{
 			{name: "-resolved_arch_out", value: *resolvedArchOut},
-			{name: "-resolved_config_out", value: *resolvedConfigOut},
-			{name: "-resolved_auto_conf_out", value: *resolvedAutoConfOut},
-			{name: "-resolved_auto_conf_cmd_out", value: *resolvedCmdOut},
-			{name: "-resolved_autoconf_out", value: *resolvedAutoconfOut},
-			{name: "-resolved_rustc_cfg_out", value: *resolvedRustcCfgOut},
 		}
 		for _, output := range legacyOutputs {
 			if output.value != "" {
@@ -2090,13 +2087,8 @@ func run() (exitCode int) {
 				return 2
 			}
 		}
-		if len(resolveConfigOverlays) != 0 {
-			fmt.Fprintln(os.Stderr, "-resolve_config_overlay cannot be combined with -family_plan_variant; use -family_plan_overlay")
-			return 2
-		}
 	}
 
-	resolvedConfigRequested := len(familyPlanRequests) != 0 || *resolvedConfigOut != "" || *resolvedAutoConfOut != "" || *resolvedCmdOut != "" || *resolvedAutoconfOut != "" || *resolvedRustcCfgOut != ""
 	kbuildPlanningRequested := len(familyPlanRequests) != 0 || *kbuildProbePlanOut != "" || *graphGuardProbePlanOut != "" || *sourceOutputProbePlanOut != "" || *featureDumpProbePlanOut != "" || *targetKbuildProbeResults != "" || len(actionPlanStageOutputs) != 0 || *actionPlanSnapshotOut != ""
 	if len(kbuildVars) != 0 && !kbuildPlanningRequested {
 		fmt.Fprintln(os.Stderr, "-kbuild_var requires Kbuild probe or action planning")
@@ -2135,7 +2127,7 @@ func run() (exitCode int) {
 		fmt.Fprintln(os.Stderr, "Kconfig evaluation requires staged probe discovery or replay via -kconfig_probe_plan_out or target/host Kconfig probe results")
 		return 2
 	}
-	if err := validateKernelVersion(*kernelVersion, resolvedConfigRequested || kbuildPlanningRequested); err != nil {
+	if err := validateKernelVersion(*kernelVersion, kbuildPlanningRequested || *nativeConfigOut != ""); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
@@ -2332,7 +2324,6 @@ func run() (exitCode int) {
 
 	var kbuildActionPlan *kconfig.ActionPlan
 	var kbuildConfigDependencies map[string]kconfig.ConfigDependencySet
-	var kbuildResolvedConfig *kconfig.ResolvedConfig
 	sourceRoots := namedPathMap(sourceRootMaps)
 	rustSourceRoot, rustErr := configuredRustSourceRoot(targetContract, hostContract, vars, sourceRoots)
 	if rustErr != nil {
@@ -2375,6 +2366,33 @@ func run() (exitCode int) {
 	}
 	tree := kconfigEvaluation.tree
 	selectedTarget := kconfigEvaluation.target
+	if *nativeConfigOut != "" {
+		seed, err := readNativeConfigSeed(*resolveConfig, resolveConfigOverlays)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read native configuration input: %v\n", err)
+			return 1
+		}
+		mode, err := nativeConfigMode(*configMode)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		err = runNativeConfig(nativeConfigRunOptions{
+			executable: workspacePath(*nativeConf), sourceRoot: resolvedSrctree, output: workspacePath(*nativeConfigOut),
+			anchors:     nativeToolsetAnchors,
+			sourceRoots: nativeSourceRoots,
+			contracts:   nativeActionContracts,
+			identities:  map[string]string{"target": targetIdentity, "host": hostIdentity},
+			manifests:   map[string]string{"target": workspacePath(*targetToolsetManifest), "host": workspacePath(*hostToolsetManifest)},
+			toolsets:    map[string]configuredKbuildToolsetManifest{"target": targetManifest, "host": hostManifest},
+			evaluation:  kconfigEvaluation, seed: seed, mode: mode,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "generate native configuration: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	// Kconfig probe results belong to the configured kernel and are reused by
 	// external modules. Keep consumer-only variables out of that replay: M, for
 	// example, switches the root Makefile into KBUILD_EXTMOD mode and changes the
@@ -2568,15 +2586,18 @@ func run() (exitCode int) {
 			return 0
 		}
 	}
+	var nativeProjection *nativeConfigProjection
+	if *nativeConfigInput != "" {
+		nativeProjection, err = readDeclaredNativeConfigProjection(workspacePath(*nativeConfigInput))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read native config: %v\n", err)
+			return 1
+		}
+	}
 	if len(familyPlanRequests) != 0 {
 		if *targetKbuildProbeResults == "" {
 			fmt.Fprintln(os.Stderr, "family planning requires staged target and host Kbuild probe results")
 			return 2
-		}
-		baseConfig, err := readConfigFlags(*resolveConfig, nil)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to read family base config: %v\n", err)
-			return 1
 		}
 		oracle, err := kconfig.NewProbeResultOracleFromTrees(
 			map[string]string{
@@ -2627,16 +2648,16 @@ func run() (exitCode int) {
 				}
 			}
 			profile.phase("variant " + request.name + " evaluation")
-			configFlags, err := familyVariantConfigFlags(baseConfig, request.overlay)
+			nativeProjection, err := readDeclaredNativeConfigProjection(request.nativeConfig)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "family variant %s overlay: %v\n", request.name, err)
+				fmt.Fprintf(os.Stderr, "read variant %s native config: %v\n", request.name, err)
 				return 1
 			}
 			evaluation, evaluateErr := evaluateLinuxKbuildProbes(linuxKbuildProbeOptions{
+				nativeConfig:    nativeProjection,
 				checkpointInput: checkpointInput, checkpointOutput: checkpointOutput,
 				tree: tree, rootPath: *root, kbuildPath: *kbuildPath,
-				configInput: *resolveConfig, configFlags: configFlags,
-				configMode: *configMode, variables: maps.Clone(vars), identityVariables: maps.Clone(identityVariables), sourceRoots: sourceRoots,
+				variables: maps.Clone(vars), identityVariables: maps.Clone(identityVariables), sourceRoots: sourceRoots,
 				sourceNamespaces: sourceNamespaces,
 				objectRoot:       *objectRoot, objectNamespace: *objectNamespace,
 				entryTargets: kbuildTargets, preparationTargets: kbuildPreparationTargets, preparationCandidates: kbuildPreparationCandidates,
@@ -2680,16 +2701,12 @@ func run() (exitCode int) {
 				fmt.Fprintf(os.Stderr, "failed to write family variant %s source-derived Linux ARCH: %v\n", request.name, err)
 				return 1
 			}
-			if err := writeResolvedConfigOutputs(tree, value.resolved, request.resolved); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to write family variant %s resolved config: %v\n", request.name, err)
-				return 1
-			}
 			profile.phase("variant " + request.name + " snapshot")
 			if err := kconfig.WriteActionPlanSnapshot(
 				request.snapshot,
 				value.actionPlan,
 				value.configDependencies,
-				resolvedConfigObjectTreeContents(tree, value.resolved),
+				nativeProjection.files,
 			); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to write family variant %s action-plan snapshot: %v\n", request.name, err)
 				return 1
@@ -2715,10 +2732,6 @@ func run() (exitCode int) {
 	}
 
 	if *kbuildProbePlanOut != "" || *graphGuardProbePlanOut != "" || *sourceOutputProbePlanOut != "" || *featureDumpProbePlanOut != "" || *targetKbuildProbeResults != "" {
-		if *resolveConfig == "" {
-			fmt.Fprintln(os.Stderr, "-resolve_config PATH is required for staged Kbuild probes")
-			return 2
-		}
 		var oracle *kconfig.ProbeResultOracle
 		if *targetKbuildProbeResults != "" {
 			oracle, err = kconfig.NewProbeResultOracleFromTrees(
@@ -2734,9 +2747,9 @@ func run() (exitCode int) {
 			}
 		}
 		evaluation, evaluateErr := evaluateLinuxKbuildProbes(linuxKbuildProbeOptions{
+			nativeConfigTool: *nativeConfigTool, nativeConfig: nativeProjection,
 			tree: tree, rootPath: *root, kbuildPath: *kbuildPath,
-			configInput: *resolveConfig, configOverlays: resolveConfigOverlays,
-			configMode: *configMode, variables: vars, identityVariables: identityVariables, sourceRoots: sourceRoots,
+			variables: vars, identityVariables: identityVariables, sourceRoots: sourceRoots,
 			sourceNamespaces: sourceNamespaces,
 			objectRoot:       *objectRoot, objectNamespace: *objectNamespace,
 			entryTargets: kbuildTargets, preparationTargets: kbuildPreparationTargets, preparationCandidates: kbuildPreparationCandidates,
@@ -2827,7 +2840,6 @@ func run() (exitCode int) {
 			return 0
 		}
 		vars["UTS_MACHINE"] = evaluation.Value.target.UTSMachine
-		kbuildResolvedConfig = evaluation.Value.resolved
 		kbuildActionPlan = evaluation.Value.actionPlan
 		if *actionPlanSnapshotOut != "" {
 			kbuildConfigDependencies = evaluation.Value.configDependencies
@@ -2841,26 +2853,6 @@ func run() (exitCode int) {
 		}
 	}
 
-	if resolvedConfigRequested {
-		outputs := resolvedConfigOutputs{
-			config:      *resolvedConfigOut,
-			autoConf:    *resolvedAutoConfOut,
-			autoConfCmd: *resolvedCmdOut,
-			autoconf:    *resolvedAutoconfOut,
-			rustcCfg:    *resolvedRustcCfgOut,
-		}
-		var err error
-		if kbuildResolvedConfig != nil {
-			err = writeResolvedConfigOutputs(tree, kbuildResolvedConfig, outputs)
-		} else {
-			err = writeResolvedConfig(tree, *resolveConfig, resolveConfigOverlays, *configMode, outputs, kconfigEvaluation.normalizeToolsetPathCapabilities)
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write resolved config: %v\n", err)
-			return 1
-		}
-	}
-
 	if len(actionPlanStageOutputs) != 0 {
 		if kbuildActionPlan == nil {
 			fmt.Fprintln(os.Stderr, "action-plan generation requires staged target and host Kbuild probe results")
@@ -2870,22 +2862,24 @@ func run() (exitCode int) {
 			fmt.Fprintf(os.Stderr, "failed to write action plan: %v\n", err)
 			return 1
 		}
+		if *selectedOutputOut != "" {
+			if !*nativeConfigTool {
+				fmt.Fprintln(os.Stderr, "selected executable output requires native Kconfig tool planning")
+				return 2
+			}
+			if err := writeSelectedKbuildOutput(kbuildActionPlan, "scripts/kconfig/conf", *selectedOutputOut); err != nil {
+				fmt.Fprintf(os.Stderr, "write selected Kbuild output: %v\n", err)
+				return 1
+			}
+		}
 	}
 	if *actionPlanSnapshotOut != "" {
 		if kbuildActionPlan == nil {
 			fmt.Fprintln(os.Stderr, "action-plan snapshot generation requires staged target and host Kbuild probe results")
 			return 2
 		}
-		configFiles, err := readResolvedConfigSnapshotFiles(resolvedConfigOutputs{
-			config: *resolvedConfigOut, autoConf: *resolvedAutoConfOut, autoConfCmd: *resolvedCmdOut,
-			autoconf: *resolvedAutoconfOut, rustcCfg: *resolvedRustcCfgOut,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to read resolved config projections for action-plan snapshot: %v\n", err)
-			return 1
-		}
 		if err := kconfig.WriteActionPlanSnapshot(
-			workspacePath(*actionPlanSnapshotOut), kbuildActionPlan, kbuildConfigDependencies, configFiles,
+			workspacePath(*actionPlanSnapshotOut), kbuildActionPlan, kbuildConfigDependencies, nativeProjection.files,
 		); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to write action-plan snapshot: %v\n", err)
 			return 1
@@ -2894,146 +2888,35 @@ func run() (exitCode int) {
 	return 0
 }
 
-type resolvedConfigOutputs struct {
-	config      string
-	autoConf    string
-	autoConfCmd string
-	autoconf    string
-	rustcCfg    string
-}
-
-func readResolvedConfigSnapshotFiles(outputs resolvedConfigOutputs) (map[string]string, error) {
-	paths := map[string]string{
-		".config":                      outputs.config,
-		"include/config/auto.conf":     outputs.autoConf,
-		"include/config/auto.conf.cmd": outputs.autoConfCmd,
-		"include/generated/autoconf.h": outputs.autoconf,
-		"include/generated/rustc_cfg":  outputs.rustcCfg,
-	}
-	files := make(map[string]string, len(paths))
-	for logical, filename := range paths {
-		if filename == "" {
-			return nil, fmt.Errorf("resolved config projection %s has no output path", logical)
-		}
-		data, err := os.ReadFile(workspacePath(filename))
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", logical, err)
-		}
-		files[logical] = string(data)
-	}
-	return files, nil
-}
-
 func writeResolvedArchitecture(path, arch string) error {
 	return os.WriteFile(workspacePath(path), []byte(arch+"\n"), 0o644)
 }
 
-func writeResolvedConfig(
-	tree *kconfig.Tree,
-	input string,
-	overlays []string,
-	configMode string,
-	outputs resolvedConfigOutputs,
-	normalizeConfigValue func(string) (string, error),
-) error {
+// Keep assignment order: native conf gives the last requested choice member
+// priority, including when an overlay selects a different member.
+func readNativeConfigSeed(input string, overlays []string) (string, error) {
 	if input == "" {
-		return fmt.Errorf("-resolve_config is required when resolved config outputs are requested")
+		return "", fmt.Errorf("-resolve_config PATH is required")
 	}
-	missing := map[string]string{
-		"-resolved_config_out":        outputs.config,
-		"-resolved_auto_conf_out":     outputs.autoConf,
-		"-resolved_auto_conf_cmd_out": outputs.autoConfCmd,
-		"-resolved_autoconf_out":      outputs.autoconf,
-		"-resolved_rustc_cfg_out":     outputs.rustcCfg,
-	}
-	var missingFlags []string
-	for flagName, path := range missing {
-		if path == "" {
-			missingFlags = append(missingFlags, flagName)
-		}
-	}
-	sort.Strings(missingFlags)
-	if len(missingFlags) != 0 {
-		return fmt.Errorf("missing required output flags: %s", strings.Join(missingFlags, ", "))
-	}
-
-	raw, err := readConfigFlags(input, overlays)
-	if err != nil {
-		return err
-	}
-	resolveOpts, err := resolveConfigOptions(configMode)
-	if err != nil {
-		return err
-	}
-	resolved, err := tree.ResolveConfigWithOptions(raw, resolveOpts)
-	if err != nil {
-		return err
-	}
-	if err := normalizeResolvedConfigValues(resolved, normalizeConfigValue); err != nil {
-		return err
-	}
-	return writeResolvedConfigOutputs(tree, resolved, outputs)
-}
-
-// readConfigFlags parses one base configuration and applies overlays in order.
-// The returned map is caller-owned, which lets a family planner parse the base
-// once and cheaply clone it before applying each variant overlay.
-func readConfigFlags(input string, overlays []string) (map[string]string, error) {
-	if input == "" {
-		return nil, fmt.Errorf("-resolve_config PATH is required")
-	}
-	file, err := os.Open(workspacePath(input))
-	if err != nil {
-		return nil, err
-	}
-	raw, parseErr := kconfig.ParseConfig(file)
-	closeErr := file.Close()
-	if parseErr != nil {
-		return nil, fmt.Errorf("%s: %w", input, parseErr)
-	}
-	if closeErr != nil {
-		return nil, fmt.Errorf("%s: %w", input, closeErr)
-	}
-	for _, overlay := range overlays {
-		overlayFlags, err := parseConfigPath(workspacePath(overlay))
+	var seed strings.Builder
+	for _, filename := range append([]string{input}, overlays...) {
+		contents, err := os.ReadFile(workspacePath(filename))
 		if err != nil {
-			return nil, fmt.Errorf("%s overlay %s: %w", input, overlay, err)
+			return "", err
 		}
-		for key, value := range overlayFlags {
-			raw[key] = value
+		if _, err := kconfig.ParseConfig(bytes.NewReader(contents)); err != nil {
+			return "", fmt.Errorf("%s: %w", filename, err)
 		}
+		seed.Write(contents)
+		seed.WriteByte('\n')
 	}
-	return raw, nil
+	return seed.String(), nil
 }
 
-func familyVariantConfigFlags(base map[string]string, overlay string) (map[string]string, error) {
-	flags := maps.Clone(base)
-	if flags == nil {
-		flags = map[string]string{}
-	}
-	if overlay == "" {
-		return flags, nil
-	}
-	overlayFlags, err := parseConfigPath(workspacePath(overlay))
-	if err != nil {
-		return nil, err
-	}
-	for key, value := range overlayFlags {
-		flags[key] = value
-	}
-	return flags, nil
-}
-
-// normalizeResolvedConfigValues verifies workload-local compiler-path
-// capabilities and replaces them with the deterministic runtime provenance
-// representation before Kconfig values cross into generated files, Kbuild,
-// or stable compact metadata. The resolver result is private to this call, so
-// replacing its maps cannot mutate the parsed source tree or caller input.
-// Generated config artifacts retain that deterministic provenance token, not
-// a worker-local physical pathname. The typed Kconfig-to-Kbuild import below
-// reauthorizes it for planning and recipe lowering; embedding or executing a
-// path-valued CONFIG string as a physical runtime path is intentionally not
-// supported until those generated contents have their own runtime projection.
+// normalizeResolvedConfigValues validates compiler-path capabilities in an
+// imported native configuration before they enter stable planning metadata.
+// Kbuild reauthorizes these paths for its own workload; native file bytes are
+// never rewritten by this import.
 func normalizeResolvedConfigValues(
 	resolved *kconfig.ResolvedConfig,
 	normalize func(string) (string, error),
@@ -3112,169 +2995,22 @@ func validateKernelVersion(value string, required bool) error {
 	return nil
 }
 
-func resolveConfigOptions(mode string) (kconfig.ResolveConfigOptions, error) {
+func nativeConfigMode(mode string) (string, error) {
 	switch mode {
 	case "", "default":
-		return kconfig.ResolveConfigOptions{}, nil
+		return "--alldefconfig", nil
 	case "allnoconfig":
-		return kconfig.ResolveConfigOptions{AllNoConfig: true}, nil
+		return "--allnoconfig", nil
 	default:
-		return kconfig.ResolveConfigOptions{}, fmt.Errorf("unsupported -config_mode %q", mode)
-	}
-}
-
-func rustcCfgLines(tree *kconfig.Tree, resolved *kconfig.ResolvedConfig) []string {
-	keys := make([]string, 0, len(resolved.Effective))
-	for key := range resolved.Effective {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	var lines []string
-	for _, key := range keys {
-		if !resolved.ShouldWrite(key) {
-			continue
-		}
-		symbol := tree.Symbols[strings.TrimPrefix(key, "CONFIG_")]
-		if symbol == nil || symbol.Type == kconfig.SymbolUnknown {
-			continue
-		}
-		value := resolved.Effective[key]
-		switch symbol.Type {
-		case kconfig.SymbolBool, kconfig.SymbolTristate:
-			if value == "n" {
-				continue
-			}
-			lines = append(lines, "--cfg="+key)
-		}
-		if symbol.Type == kconfig.SymbolHex &&
-			!strings.HasPrefix(value, "0x") &&
-			!strings.HasPrefix(value, "0X") {
-			value = "0x" + value
-		}
-		if symbol.Type == kconfig.SymbolString {
-			value = unquoteKconfigString(value)
-		}
-		lines = append(lines, "--cfg="+key+"="+strconv.Quote(value))
-	}
-	return lines
-}
-
-func unquoteKconfigString(value string) string {
-	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
-		return value
-	}
-
-	value = value[1 : len(value)-1]
-	var out strings.Builder
-	out.Grow(len(value))
-	for i := 0; i < len(value); i++ {
-		if value[i] == '\\' && i+1 < len(value) &&
-			(value[i+1] == '\\' || value[i+1] == '"') {
-			i++
-		}
-		out.WriteByte(value[i])
-	}
-	return out.String()
-}
-
-func kbuildConfigValue(tree *kconfig.Tree, key, value string) string {
-	symbol := tree.Symbols[strings.TrimPrefix(key, "CONFIG_")]
-	if symbol != nil && symbol.Type == kconfig.SymbolString {
-		return unquoteKconfigString(value)
-	}
-	return value
-}
-
-func resolvedConfigObjectTreeContents(
-	tree *kconfig.Tree,
-	resolved *kconfig.ResolvedConfig,
-) map[string]string {
-	keys := make([]string, 0, len(resolved.Effective))
-	for key := range resolved.Effective {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	configLines := make([]string, 0, len(keys))
-	autoConfLines := make([]string, 0, len(keys))
-	headerLines := []string{
-		"/* Generated by Bazel kconfig_parse. */",
-		"#ifndef __GENERATED_AUTOCONF_H__",
-		"#define __GENERATED_AUTOCONF_H__",
-	}
-	for _, key := range keys {
-		value := resolved.Effective[key]
-		if value == "n" {
-			configLines = append(configLines, "# "+key+" is not set")
-			continue
-		}
-		if !resolved.ShouldWrite(key) {
-			continue
-		}
-		symbol := tree.Symbols[strings.TrimPrefix(key, "CONFIG_")]
-		if value != "" {
-			configLines = append(configLines, key+"="+value)
-			if header := configValueToHeaderLine(key, value); header != "" {
-				headerLines = append(headerLines, header)
-			}
-		}
-		if value != "" || (symbol != nil && symbol.Type == kconfig.SymbolString) {
-			// Linux's generated auto.conf keeps string quotes and escaping:
-			// source scripts execute this file as shell assignments. Dropping
-			// quotes would turn a string such as "(none)" into shell syntax.
-			autoConfLines = append(autoConfLines, key+"="+value)
-		}
-	}
-	headerLines = append(headerLines, "#endif")
-
-	return map[string]string{
-		".config":                      strings.Join(configLines, "\n") + "\n",
-		"include/config/auto.conf":     strings.Join(autoConfLines, "\n") + "\n",
-		"include/config/auto.conf.cmd": "cmd_include/config/auto.conf := bazel kconfig_parse -resolve_config\n",
-		"include/generated/autoconf.h": strings.Join(headerLines, "\n") + "\n",
-		"include/generated/rustc_cfg":  strings.Join(rustcCfgLines(tree, resolved), "\n") + "\n",
-	}
-}
-
-func writeResolvedConfigOutputs(tree *kconfig.Tree, resolved *kconfig.ResolvedConfig, outputs resolvedConfigOutputs) error {
-	contents := resolvedConfigObjectTreeContents(tree, resolved)
-	files := map[string]string{
-		outputs.config:      contents[".config"],
-		outputs.autoConf:    contents["include/config/auto.conf"],
-		outputs.autoConfCmd: contents["include/config/auto.conf.cmd"],
-		outputs.autoconf:    contents["include/generated/autoconf.h"],
-		outputs.rustcCfg:    contents["include/generated/rustc_cfg"],
-	}
-	for path, content := range files {
-		if err := os.WriteFile(workspacePath(path), []byte(content), 0o644); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func configValueToHeaderLine(key, value string) string {
-	switch value {
-	case "y":
-		return "#define " + key + " 1"
-	case "m":
-		return "#define " + key + "_MODULE 1"
-	case "", "n":
-		return ""
-	default:
-		return "#define " + key + " " + value
+		return "", fmt.Errorf("unsupported -config_mode %q", mode)
 	}
 }
 
 func compactMetadata(
 	tree *kconfig.Tree,
+	nativeConfig *nativeConfigProjection,
 	rootPath string,
 	kbuildPath string,
-	configInput string,
-	configOverlays []string,
-	configFlags map[string]string,
-	configMode string,
 	vars map[string]string,
 	sourceRoots map[string]string,
 	sourceNamespaces map[string]string,
@@ -3303,13 +3039,7 @@ func compactMetadata(
 	if kbuildPath == "" {
 		return nil, nil, fmt.Errorf("-kbuild is required")
 	}
-	if configInput == "" {
-		return nil, nil, fmt.Errorf("-resolve_config PATH is required")
-	}
-	resolveOpts, err := resolveConfigOptions(configMode)
-	if err != nil {
-		return nil, nil, err
-	}
+	var err error
 	preparationTargets, err = canonicalKbuildPreparationTargets(preparationTargets)
 	if err != nil {
 		return nil, nil, err
@@ -3318,21 +3048,12 @@ func compactMetadata(
 	if err != nil {
 		return nil, nil, fmt.Errorf("canonicalize optional source preparation markers: %w", err)
 	}
-	flags := maps.Clone(configFlags)
-	if flags == nil {
-		flags, err = readConfigFlags(configInput, configOverlays)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-	resolved, err := tree.ResolveConfigWithOptions(flags, resolveOpts)
+	resolved, err := nativeConfig.resolved(tree)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Keep the generated config projection in the upstream Kconfig provenance
-	// representation. Kbuild gets a private clone whose path capabilities are
-	// rebound to this workload's symbolic authority. This matches the legacy
-	// two-resolution behavior without resolving the Kconfig graph twice.
+	// Kbuild gets a private clone whose path capabilities are rebound to this
+	// workload's symbolic authority; the native files remain unchanged.
 	if err := normalizeResolvedConfigValues(resolved, normalizeConfigValue); err != nil {
 		return nil, nil, err
 	}
@@ -3353,6 +3074,7 @@ func compactMetadata(
 		}
 	}
 	opts := linuxCompactMetadataOptions(vars, sourceNamespaces, objectRoot, selectedProductsOnly, targetContract, hostContract)
+	opts.ConfigProjectionPaths = slices.Sorted(maps.Keys(nativeConfig.files))
 	rootDir := sourceRoot
 	if rootDir == "" {
 		rootDir = filepath.Dir(workspacePath(kbuildPath))
@@ -3390,10 +3112,7 @@ func compactMetadata(
 		return nil, nil, err
 	}
 	metadata, err := tree.CompactMetadataForResolvedConfigWithOptions(metadataResolved, opts, func(resolved *kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
-		kbuildVars, err := kbuildVariablesForConfig(vars, tree, resolved)
-		if err != nil {
-			return kconfig.CompactConfigGraph{}, err
-		}
+		kbuildVars := maps.Clone(vars)
 		for name, value := range linuxRootMakeInvocationVariables(rootDir) {
 			if _, configured := kbuildVars[name]; !configured {
 				kbuildVars[name] = value
@@ -3434,7 +3153,7 @@ func compactMetadata(
 			// target probes. Bind its complete snapshot to this profile activation.
 			return probeScopes.BindExactScriptEnvironments(byScope, exported)
 		}
-		resolvedConfigContents := resolvedConfigObjectTreeContents(tree, resolved)
+		resolvedConfigContents := nativeConfig.files
 		var sourceOutputPlan *kconfig.ProbePlan
 		var sourceOutputOracle *kconfig.ProbeResultOracle
 		var sourceOutputDiscoveryOnly bool
@@ -3486,7 +3205,7 @@ func compactMetadata(
 					"selected source script phases require a generated, source-authenticated auto.conf",
 				)
 			}
-			if err := kconfig.ValidateCompactKbuildLinkVmlinuxAutoConf(
+			if err := toolaction.ValidateStaticConfigAssignments(
 				resolvedConfigContents["include/config/auto.conf"],
 			); err != nil {
 				return kconfig.CompactConfigGraph{}, fmt.Errorf(
@@ -3645,6 +3364,9 @@ func evaluatedKbuildInvocationProfiles(
 	}
 	sourceOverlayDirectories := kbuildFrontierSourceOverlayDirectories(baseOptions.SourceRoots)
 	immutableContents = maps.Clone(immutableContents)
+	for pathname := range immutableContents {
+		satisfied[canonicalKbuildProfilePath(pathname, "")] = true
+	}
 	dispatchCommandLine := cloneKbuildVariables(baseOptions.CommandLineVariables)
 	dispatchSyntheticTools := maps.Clone(baseOptions.SyntheticToolCommandLineVariables)
 	dispatchAutoExport := map[string]bool{}
@@ -4562,7 +4284,7 @@ func evaluatedKbuildInvocationProfiles(
 	}
 	selections, err := selectedKbuildSelectionsWithResolvedTargets(
 		profiles, satisfied, nil, rootDir, preparationTargets, effectiveGeneratedContent, resolvedTargets,
-		preconfiguredObjectTree, nativePrerequisiteArtifacts, selectedRootContinuations, preparationCandidates,
+		preconfiguredObjectTree, nativePrerequisiteArtifacts, selectedRootContinuations, preparationCandidates, slices.Sorted(maps.Keys(immutableContents)),
 	)
 	if err != nil {
 		return nil, nil, "", err
@@ -4631,9 +4353,6 @@ func appendUniqueKbuildProfileName(names []string, name string) []string {
 
 func kbuildSatisfiedTargets(sourceIndex kbuildSourceInputIndex) map[string]bool {
 	targets := map[string]bool{}
-	for _, target := range kconfig.ResolvedConfigProjectionOutputs() {
-		targets[canonicalKbuildProfilePath(target, "")] = true
-	}
 	for _, source := range sourceIndex.files {
 		if source = canonicalKbuildProfilePath(source, ""); source != "" {
 			targets[source] = true
@@ -5435,7 +5154,7 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 	generatedContent kbuildGeneratedContentResolver,
 ) ([]kconfig.CompactKbuildSelection, error) {
 	return selectedKbuildSelectionsWithResolvedTargets(
-		profiles, satisfied, stats, sourceRoot, preparationTargets, generatedContent, nil, false, nil, nil, nil,
+		profiles, satisfied, stats, sourceRoot, preparationTargets, generatedContent, nil, false, nil, nil, nil, nil,
 	)
 }
 
@@ -5460,6 +5179,7 @@ func selectedKbuildSelectionsWithResolvedTargets(
 	// Source-selected markers reached through actual Make prerequisites can
 	// shape the SDK without adding conditional goals to MAKECMDGOALS.
 	preparationCandidates []string,
+	nativeConfigPaths []string,
 ) ([]kconfig.CompactKbuildSelection, error) {
 	var err error
 	preparationTargets, err = canonicalKbuildPreparationTargets(preparationTargets)
@@ -7531,7 +7251,7 @@ func selectedKbuildSelectionsWithResolvedTargets(
 	// include activates the working object-tree view, whose lowering rebases the
 	// projection to its immutable config source without inventing a producer.
 	resolvedConfigBaseline := map[string]bool{}
-	for _, pathname := range kconfig.ResolvedConfigProjectionOutputs() {
+	for _, pathname := range nativeConfigPaths {
 		resolvedConfigBaseline[pathname] = true
 	}
 	// Candidate bytes may participate in include discovery before the final
@@ -11665,17 +11385,9 @@ func linuxKbuildGeneratedContentResolver(
 	if scopes == nil {
 		return nil
 	}
-	resolvedConfigContents := make(map[string]string, len(kconfig.ResolvedConfigProjectionOutputs()))
-	for _, pathname := range kconfig.ResolvedConfigProjectionOutputs() {
-		contents, ok := workingTreeContents[pathname]
-		if !ok {
-			// An incomplete ambient contract can never authorize an exact-output
-			// replacement. Keep a non-nil resolver so checked-in source-script
-			// projections remain available below.
-			resolvedConfigContents = nil
-			break
-		}
-		resolvedConfigContents[pathname] = contents
+	resolvedConfigContents := workingTreeContents
+	if _, err := kconfig.NativeConfigProjectionPaths(resolvedConfigContents); err != nil {
+		resolvedConfigContents = nil
 	}
 	return func(
 		profile kconfig.CompactKbuildProfile,
@@ -13618,26 +13330,6 @@ func readToolsetIdentity(root string) (string, error) {
 	return name, nil
 }
 
-func kbuildVariablesForConfig(base map[string]string, tree *kconfig.Tree, config *kconfig.ResolvedConfig) (map[string]string, error) {
-	// scripts/Kbuild.include defines this before the architecture Makefile is
-	// evaluated by Kbuild. Kbuild action planning starts at that Makefile.
-	vars := map[string]string{"comma": ","}
-	for key, value := range base {
-		vars[key] = value
-	}
-	for key, value := range config.Effective {
-		if !config.ShouldWrite(key) || value == "n" {
-			vars[key] = ""
-			continue
-		}
-		vars[key] = kbuildConfigValue(tree, key, value)
-	}
-	if err := kconfig.ValidateKbuildOrdinaryVariables("resolved Kbuild configuration", vars); err != nil {
-		return nil, err
-	}
-	return vars, nil
-}
-
 func workspacePath(path string) string {
 	if path == "" || filepath.IsAbs(path) {
 		return path
@@ -13662,13 +13354,4 @@ func workspaceDirectory(value string) (string, error) {
 		return filepath.Dir(resolved), nil
 	}
 	return "", fmt.Errorf("%q is neither a directory nor a regular root marker", value)
-}
-
-func parseConfigPath(filename string) (map[string]string, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	return kconfig.ParseConfig(file)
 }

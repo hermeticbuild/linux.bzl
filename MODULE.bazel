@@ -87,3 +87,21 @@ register_toolchains("//internal:busybox_script_runtime_toolchain")
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
 go_sdk.nogo(nogo = "@rules_go//:tools_nogo")
+
+# Runtime planner fixtures use the selected kernel's real Kconfig serializer.
+linux_test_source = use_repo_rule("//internal:linux_source_repository.bzl", "linux_source_repository")
+
+linux_test_source(
+    name = "linux_test_6_18_39",
+    dev_dependency = True,
+    version = "6.18.39",
+)
+
+mapped_kernel_source = use_repo_rule("//internal/tests:mapped_kernel_source_repository.bzl", "mapped_kernel_source_repository")
+
+mapped_kernel_source(
+    name = "mapped_kernel_source",
+    dev_dependency = True,
+    fixture_source = "//internal/tests/mapped_kernel:Kconfig",
+    native_source = "@linux_test_6_18_39//:Kconfig",
+)

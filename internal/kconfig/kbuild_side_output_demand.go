@@ -335,7 +335,7 @@ func (g *compactKbuildSelectionGraph) computeCompactKbuildUnruledPrerequisites(
 	}
 
 	resolvedConfig := map[string]bool{}
-	for _, output := range ResolvedConfigProjectionOutputs() {
+	for _, output := range metadata.configProjectionPaths {
 		resolvedConfig[canonicalKbuildRulePath(output)] = true
 	}
 	demands := map[string]bool{}

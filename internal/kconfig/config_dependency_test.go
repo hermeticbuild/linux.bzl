@@ -6494,7 +6494,7 @@ func TestAnalyzeActionPlanNodeConfigDependenciesRecognizesConfigProvenanceForSta
 		"-include", "${source:working-closure:00000001}",
 		"-c", "drivers/example/driver.c",
 	}, nil)
-	configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "autoconf.h"}
+	configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "include/generated/autoconf.h"}
 	plan.Sources = append(plan.Sources, configSource)
 	node.Sources = append(node.Sources, ActionPlanSourceEdge{Role: "working-closure", SourceID: configSource.ID})
 	plan.Nodes[0] = node
@@ -6578,7 +6578,7 @@ func TestAnalyzeActionPlanNodeConfigDependenciesRejectsPositionalConfigSourceBin
 		"${source:working-closure:00000001}",
 		"-c", "drivers/example/driver.c",
 	}, nil)
-	configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "autoconf.h"}
+	configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "include/generated/autoconf.h"}
 	plan.Sources = append(plan.Sources, configSource)
 	node.Sources = append(node.Sources, ActionPlanSourceEdge{Role: "working-closure", SourceID: configSource.ID})
 	plan.Nodes[0] = node
@@ -6622,7 +6622,7 @@ func TestAnalyzeActionPlanNodeConfigDependenciesRejectsForcedNonAutoconfConfigSo
 		"-include", "${source:working-closure:00000001}",
 		"-c", "drivers/example/driver.c",
 	}, nil)
-	configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "auto.conf"}
+	configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "include/config/auto.conf"}
 	plan.Sources = append(plan.Sources, configSource)
 	node.Sources = append(node.Sources, ActionPlanSourceEdge{Role: "working-closure", SourceID: configSource.ID})
 	plan.Nodes[0] = node
@@ -6692,7 +6692,7 @@ func TestAnalyzeActionPlanNodeConfigDependenciesRejectsConfigSourceOutsideCompil
 			plan, node := configDependencyCompilePlanForTest(t, map[string]string{
 				"drivers/example/driver.c": "CONFIG_DRIVER\n",
 			}, []string{"-nostdinc", "-c", "drivers/example/driver.c"}, nil)
-			configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "autoconf.h"}
+			configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "include/generated/autoconf.h"}
 			plan.Sources = append(plan.Sources, configSource)
 			node.Sources = append(node.Sources, ActionPlanSourceEdge{Role: "working-closure", SourceID: configSource.ID})
 			plan.Nodes[0] = node
@@ -6723,7 +6723,7 @@ func TestAnalyzeActionPlanNodeConfigDependenciesRejectsIncompleteCompoundWithSta
 	plan, node := configDependencyCompilePlanForTest(t, map[string]string{
 		"drivers/example/driver.c": "CONFIG_DRIVER\n",
 	}, []string{"-nostdinc", "-c", "drivers/example/driver.c"}, nil)
-	configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "autoconf.h"}
+	configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "include/generated/autoconf.h"}
 	plan.Sources = append(plan.Sources, configSource)
 	node.Sources = append(node.Sources, ActionPlanSourceEdge{Role: "working-closure", SourceID: configSource.ID})
 	plan.Nodes[0] = node
@@ -6872,268 +6872,6 @@ func TestAnalyzeActionPlanNodeConfigDependenciesAllowsStagedUnusedNonCompilerCon
 	}
 }
 
-func configDependencyAttachFallbackProjectionInputForTest(
-	t *testing.T,
-	plan *ActionPlan,
-	node *ActionPlanNode,
-	projectionInput string,
-	projectionOutput string,
-) string {
-	t.Helper()
-	configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: projectionInput}
-	plan.Sources = append(plan.Sources, configSource)
-	copyRecipeID := "fallback-config-copy"
-	copyRecipe := ActionRecipe{
-		Schema: LinuxKernelPlanSchema,
-		Kind:   "copy",
-		Tool:   "actionfile",
-		Arguments: []string{
-			"-input", "${source:input:00000000}",
-			"-out", "${output:00000000}",
-		},
-		Sources: []string{"input:00000000"},
-		Outputs: []string{"00000000"},
-	}
-	copyNode := ActionPlanNode{
-		ID: "fallback-config-copy", Stage: "prep", Kind: "copy", Recipe: copyRecipeID,
-		Tool: "actionfile", Product: "sdk",
-		Sources: []ActionPlanSourceEdge{{Role: "input", SourceID: configSource.ID}},
-		Outputs: []ActionPlanOutput{{Tree: "prep", Path: projectionOutput}},
-	}
-	plan.Recipes[copyRecipeID] = copyRecipe
-	plan.Nodes = append(plan.Nodes, copyNode)
-	binding := "working-closure:" + planOrdinal(len(node.Inputs))
-	node.Inputs = append(node.Inputs, ActionPlanNodeEdge{
-		Role: "working-closure", ProducerID: copyNode.ID, Slot: 0,
-	})
-	consumerRecipe := plan.Recipes[node.Recipe]
-	consumerRecipe.Inputs = append(consumerRecipe.Inputs, binding)
-	plan.Recipes[node.Recipe] = consumerRecipe
-	plan.Nodes[0] = *node
-	return binding
-}
-
-func configDependencyNonCompilerConfigInputPlanForTest(t *testing.T) (*ActionPlan, ActionPlanNode, string) {
-	t.Helper()
-	const recipeID = "non-compiler-config-input-recipe"
-	recipe := ActionRecipe{
-		Schema: LinuxKernelPlanSchema,
-		Kind:   "archive",
-		Tool:   "ar",
-		Arguments: []string{
-			"rcs", "${output:00000000}",
-		},
-		Outputs: []string{"00000000"},
-	}
-	node := ActionPlanNode{
-		ID: "non-compiler-config-input", Stage: "target", Kind: "archive",
-		Recipe: recipeID, Tool: "ar", Product: "image",
-		Outputs: []ActionPlanOutput{{Tree: "objects", Path: "drivers/example/built-in.a"}},
-	}
-	plan := &ActionPlan{
-		Recipes: map[string]ActionRecipe{recipeID: recipe},
-		Nodes:   []ActionPlanNode{node},
-	}
-	binding := configDependencyAttachFallbackProjectionInputForTest(t, plan, &node, ".config", ".config")
-	recipe = plan.Recipes[node.Recipe]
-	if recipe.WorkingInputs == nil {
-		recipe.WorkingInputs = map[string]string{}
-	}
-	recipe.WorkingInputs["input:"+binding] = ".config"
-	plan.Recipes[node.Recipe] = recipe
-	return plan, node, binding
-}
-
-func TestAnalyzeActionPlanNodeConfigDependenciesRejectsNonCompilerConfigInputSemanticUse(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		mutate func(*ActionRecipe, string)
-	}{
-		{
-			name: "argument",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.Arguments = append(recipe.Arguments, "${input:"+binding+"}")
-			},
-		},
-		{
-			name: "environment",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.Environment = map[string]string{"CONFIG_BYTES": "${input:" + binding + "}"}
-			},
-		},
-		{
-			name: "stdin",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.Stdin = "input:" + binding
-			},
-		},
-		{
-			name: "stdout",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.Stdout = "input:" + binding
-			},
-		},
-		{
-			name: "compiler invocation argument",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.CompilerInvocation = &ActionRecipeCompilerInvocation{
-					Tool: "cc", Arguments: []string{"${input:" + binding + "}"},
-				}
-			},
-		},
-		{
-			name: "content substitution",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.ContentSubstitutions = map[string]ActionRecipeContentSubstitution{
-					"config": {Input: "input:" + binding, Transform: ActionRecipeContentTransformMakeShellWord},
-				}
-			},
-		},
-		{
-			name: "command replay argument",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.CommandReplays = []ActionRecipeCommandReplay{{
-					Name: "replay",
-					Invocations: []ActionRecipeCommandReplayInvocation{{
-						Arguments: []string{"${input:" + binding + "}"},
-					}},
-				}}
-			},
-		},
-		{
-			name: "command replay output",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.CommandReplays = []ActionRecipeCommandReplay{{
-					Name: "replay",
-					Invocations: []ActionRecipeCommandReplayInvocation{{
-						Outputs: []string{"${input:" + binding + "}"},
-					}},
-				}}
-			},
-		},
-		{
-			name: "tool",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.Tool = "input:" + binding
-			},
-		},
-		{
-			name: "executable input",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.ExecutableInputs = []string{binding}
-			},
-		},
-		{
-			name: "observed output base",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.ObservedOutputBases = map[string][]string{"00000000": {binding}}
-			},
-		},
-		{
-			name: "auxiliary compound command",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				reference := "input:" + binding
-				recipe.CompilerInvocation = &ActionRecipeCompilerInvocation{}
-				recipe.CompilerInvocation.WorkingInputUsesComplete = true
-				recipe.CompilerInvocation.WorkingInputUses = []string{reference}
-				recipe.CompilerInvocation.AuxiliaryWorkingInputUses = []string{reference}
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			plan, node, binding := configDependencyNonCompilerConfigInputPlanForTest(t)
-			recipe := plan.Recipes[node.Recipe]
-			test.mutate(&recipe, binding)
-			plan.Recipes[node.Recipe] = recipe
-
-			set, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !set.Opaque || !strings.Contains(set.Reason, "non-compiler recipe uses config input binding") {
-				t.Fatalf("non-compiler config-input dependency set = %#v, want opaque semantic-use fallback", set)
-			}
-		})
-	}
-}
-
-func TestAnalyzeActionPlanNodeConfigDependenciesAllowsStagedUnusedNonCompilerConfigInput(t *testing.T) {
-	plan, node, _ := configDependencyNonCompilerConfigInputPlanForTest(t)
-	set, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if set.Opaque || len(set.Symbols) != 0 || len(set.SourcePaths) != 0 || len(set.ObjectPaths) != 0 {
-		t.Fatalf("staged unused non-compiler config-input dependency set = %#v, want config-free", set)
-	}
-}
-
-func TestAnalyzeActionPlanNodeConfigDependenciesModelsForcedAutoconfFallbackInput(t *testing.T) {
-	const binding = "working-closure:00000000"
-	plan, node := configDependencyCompilePlanForTest(t, map[string]string{
-		"drivers/example/driver.c": "CONFIG_INPUT_AUTOCONF\n",
-	}, []string{
-		"-include", "${input:" + binding + "}",
-		"-c", "drivers/example/driver.c",
-	}, nil)
-	if got := configDependencyAttachFallbackProjectionInputForTest(
-		t, plan, &node, "autoconf.h", configDependencyAutoconfPath,
-	); got != binding {
-		t.Fatalf("fallback input binding = %q, want %q", got, binding)
-	}
-
-	set, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if set.Opaque || !slices.Equal(set.Symbols, []string{"CONFIG_INPUT_AUTOCONF"}) ||
-		!slices.Equal(set.ObjectPaths, []string{configDependencyAutoconfPath}) {
-		t.Fatalf("forced fallback autoconf input dependency set = %#v, want precise projection", set)
-	}
-}
-
-func TestAnalyzeActionPlanNodeConfigDependenciesRejectsForcedNonAutoconfFallbackInput(t *testing.T) {
-	const binding = "working-closure:00000000"
-	plan, node := configDependencyCompilePlanForTest(t, map[string]string{
-		"drivers/example/driver.c": "CONFIG_DRIVER\n",
-	}, []string{
-		"-include", "${input:" + binding + "}",
-		"-c", "drivers/example/driver.c",
-	}, nil)
-	configDependencyAttachFallbackProjectionInputForTest(
-		t, plan, &node, "auto.conf", "include/config/auto.conf",
-	)
-
-	set, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !set.Opaque || !strings.Contains(set.Reason, "non-autoconf config projection include/config/auto.conf") {
-		t.Fatalf("forced non-autoconf fallback input dependency set = %#v, want opaque fallback", set)
-	}
-}
-
-func TestAnalyzeActionPlanNodeConfigDependenciesRejectsPositionalConfigFallbackInput(t *testing.T) {
-	const binding = "working-closure:00000000"
-	plan, node := configDependencyCompilePlanForTest(t, map[string]string{
-		"drivers/example/driver.c": "CONFIG_DRIVER\n",
-	}, []string{
-		"${input:" + binding + "}",
-		"-c", "drivers/example/driver.c",
-	}, nil)
-	configDependencyAttachFallbackProjectionInputForTest(
-		t, plan, &node, "autoconf.h", configDependencyAutoconfPath,
-	)
-
-	set, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !set.Opaque || !strings.Contains(set.Reason, "config input binding outside a modeled forced autoconf include") {
-		t.Fatalf("positional fallback input dependency set = %#v, want opaque fallback", set)
-	}
-}
-
 func TestAnalyzeActionPlanNodeConfigDependenciesDoesNotInferAutoconfFromStagedInputDestination(t *testing.T) {
 	const binding = "working-closure:00000000"
 	plan, node := configDependencyCompilePlanForTest(t, map[string]string{
@@ -7167,99 +6905,6 @@ func TestAnalyzeActionPlanNodeConfigDependenciesDoesNotInferAutoconfFromStagedIn
 	}
 	if !set.Opaque || !strings.Contains(set.Reason, "unmodeled generated input binding") {
 		t.Fatalf("destination-only autoconf input dependency set = %#v, want opaque fallback", set)
-	}
-}
-
-func TestAnalyzeActionPlanNodeConfigDependenciesRejectsConfigFallbackInputOutsideCompilerProjection(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		mutate func(*ActionRecipe, string)
-	}{
-		{
-			name: "outer argument",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.Arguments = append(recipe.Arguments, "${input:"+binding+"}")
-			},
-		},
-		{
-			name: "environment",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.Environment = map[string]string{"CONFIG_BYTES": "${input:" + binding + "}"}
-			},
-		},
-		{
-			name: "stdin",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.Stdin = "input:" + binding
-			},
-		},
-		{
-			name: "stdout",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.Stdout = "input:" + binding
-			},
-		},
-		{
-			name: "content substitution",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.ContentSubstitutions = map[string]ActionRecipeContentSubstitution{
-					"config": {Input: "input:" + binding, Transform: ActionRecipeContentTransformMakeShellWord},
-				}
-			},
-		},
-		{
-			name: "command replay",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.CommandReplays = []ActionRecipeCommandReplay{{
-					Name: "replay",
-					Invocations: []ActionRecipeCommandReplayInvocation{{
-						Arguments: []string{"${input:" + binding + "}"},
-					}},
-				}}
-			},
-		},
-		{
-			name: "tool",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.Tool = "input:" + binding
-			},
-		},
-		{
-			name: "executable input",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.ExecutableInputs = []string{binding}
-			},
-		},
-		{
-			name: "observed output base",
-			mutate: func(recipe *ActionRecipe, binding string) {
-				recipe.ObservedOutputBases = map[string][]string{"00000000": {binding}}
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			plan, node := configDependencyCompilePlanForTest(t, map[string]string{
-				"drivers/example/driver.c": "CONFIG_DRIVER\n",
-			}, []string{"-nostdinc", "-c", "drivers/example/driver.c"}, nil)
-			binding := configDependencyAttachFallbackProjectionInputForTest(
-				t, plan, &node, "autoconf.h", configDependencyAutoconfPath,
-			)
-			recipe := plan.Recipes[node.Recipe]
-			recipe.Tool = compactKbuildScriptRunnerRole
-			recipe.CompilerInvocation = &ActionRecipeCompilerInvocation{
-				Tool: "cc", Arguments: []string{"-nostdinc", "-c", "drivers/example/driver.c"},
-			}
-			test.mutate(&recipe, binding)
-			plan.Recipes[node.Recipe] = recipe
-
-			set, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !set.Opaque || !strings.Contains(set.Reason, "config input binding outside its modeled compiler invocation") {
-				t.Fatalf("config input semantic use dependency set = %#v, want opaque fallback", set)
-			}
-		})
 	}
 }
 
@@ -7555,7 +7200,7 @@ func TestAnalyzeActionPlanNodeConfigDependenciesClassifiesPersistentConfigProjec
 		Tool: "cc", Arguments: []string{"-nostdinc", "-c", "drivers/example/driver.c"},
 	}
 	plan.Recipes[node.Recipe] = recipe
-	configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "autoconf.h"}
+	configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "include/generated/autoconf.h"}
 	plan.Sources = append(plan.Sources, configSource)
 	node.InputSet = configDependencyInsertInputSetEntryForTest(t, plan, "", ActionPlanInputSetEntry{
 		Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: configDependencyAutoconfPath},
@@ -8805,20 +8450,21 @@ func TestConfigDependencyMacroDebugArgumentAdmission(t *testing.T) {
 func TestConfigDependencyMacroDebugPreservesOriginalEnvelopeAndFullConfig(t *testing.T) {
 	for _, placement := range []string{"recipe", "configured-prefix", "configured-suffix", "compound", "retained-symbolic-twin"} {
 		t.Run(placement, func(t *testing.T) {
-			const binding = "working-closure:00000000"
+			const binding = "config:00000001"
 			arguments := []string{
-				"-nostdinc", "-include", "${input:" + binding + "}",
+				"-nostdinc", "-include", "${source:" + binding + "}",
 				"-c", "drivers/example/driver.c",
 			}
 			plan, node := configDependencyCompilePlanForTest(t, map[string]string{
 				"drivers/example/driver.c": "#if CONFIG_USED\nint selected;\n#endif\n",
 			}, arguments, map[string]string{"CONFIG_USED": "y", "CONFIG_OTHER": "y"})
-			if got := configDependencyAttachFallbackProjectionInputForTest(
-				t, plan, &node, "autoconf.h", configDependencyAutoconfPath,
-			); got != binding {
-				t.Fatalf("config input binding = %q, want %q", got, binding)
-			}
+			configSource := ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: configDependencyAutoconfPath}
+			plan.Sources = append(plan.Sources, configSource)
+			node.Sources = append(node.Sources, ActionPlanSourceEdge{Role: "config", SourceID: configSource.ID})
+			plan.Nodes[0] = node
 			recipe := plan.Recipes[node.Recipe]
+			recipe.Sources = []string{"source:00000000", binding}
+			recipe.WorkingInputs = map[string]string{"source:" + binding: configDependencyAutoconfPath}
 			contract := CompactKbuildActionContract{}
 			switch placement {
 			case "configured-prefix":
@@ -8832,7 +8478,7 @@ func TestConfigDependencyMacroDebugPreservesOriginalEnvelopeAndFullConfig(t *tes
 				recipe.CompilerInvocation = &ActionRecipeCompilerInvocation{
 					Tool:                     "cc",
 					Arguments:                slices.Clone(recipe.Arguments),
-					WorkingInputUses:         []string{"input:" + binding},
+					WorkingInputUses:         []string{"source:" + binding},
 					WorkingInputUsesComplete: true,
 				}
 				recipe.Tool = compactKbuildScriptRunnerRole
@@ -8862,7 +8508,6 @@ func TestConfigDependencyMacroDebugPreservesOriginalEnvelopeAndFullConfig(t *tes
 			originalNodeID := node.ContentID()
 			originalSources := configDependencySourceTableSnapshotForTest(plan)
 			originalInputs := slices.Clone(node.Inputs)
-			originalProducerID := plan.Nodes[1].ContentID()
 			set, err := AnalyzeActionPlanNodeConfigDependencies(plan, node)
 			if err != nil {
 				t.Fatal(err)
@@ -8876,9 +8521,8 @@ func TestConfigDependencyMacroDebugPreservesOriginalEnvelopeAndFullConfig(t *tes
 				t.Fatalf("opaque input pruning = changed %t, err %v", changed, err)
 			}
 			if node.ContentID() != originalNodeID || !slices.Equal(node.Inputs, originalInputs) ||
-				!slices.Equal(configDependencySourceTableSnapshotForTest(plan), originalSources) ||
-				len(plan.Nodes) != 2 || plan.Nodes[1].ContentID() != originalProducerID {
-				t.Fatal("macro-debug fallback changed original source or producer closure")
+				!slices.Equal(configDependencySourceTableSnapshotForTest(plan), originalSources) {
+				t.Fatal("macro-debug fallback changed original source closure")
 			}
 			retainedInvocation, reason := actionPlanConfigDependencyCompilerInvocation(plan, node, retained)
 			if reason != "" || !slices.Equal(retainedInvocation.arguments, originalArguments) {
@@ -9335,7 +8979,7 @@ func TestRenderConfigCapsuleFiltersResolvedProjections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(capsule.ID) != 64 || len(capsule.Files) != len(ResolvedConfigProjectionOutputs()) {
+	if len(capsule.ID) != 64 || len(capsule.Files) != len(recognizedConfigDocuments()) {
 		t.Fatalf("capsule identity/files = %q/%#v", capsule.ID, capsule.Files)
 	}
 	for pathname, wantFragments := range map[string][]string{
@@ -9556,5 +9200,48 @@ func TestConfigDependencyWitnessRetainsPersistentEntrySemantics(t *testing.T) {
 				t.Fatalf("witness equality after changing %s = %t, want %t", field, equal, wantEqual)
 			}
 		})
+	}
+}
+
+func TestNativeConfigCapsuleOptionalFilesAndMarkerPresence(t *testing.T) {
+	full := resolvedConfigProjectionFixture()
+	delete(full, "include/generated/rustc_cfg")
+	for _, marker := range []string{"include/config/module.h", "include/config/MODULE"} {
+		full[marker] = ""
+	}
+	selected := ConfigDependencySet{Symbols: []string{"CONFIG_MODULE"}, ObjectPaths: []string{"include/config/module.h"}}
+	capsule, err := RenderConfigCapsule(full, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := capsule.Files["include/generated/rustc_cfg"]; exists {
+		t.Fatal("invented optional rustc_cfg")
+	}
+	if value, exists := capsule.Files["include/config/module.h"]; !exists || value != "" {
+		t.Fatal("missing selected empty native marker")
+	}
+	if _, exists := capsule.Files["include/config/MODULE"]; exists {
+		t.Fatal("retained unrelated native marker")
+	}
+	other := selected
+	other.ObjectPaths = []string{"include/config/MODULE"}
+	if familyConfigCapsuleCacheKey(selected) == familyConfigCapsuleCacheKey(other) {
+		t.Fatal("capsule cache ignores exact marker paths")
+	}
+	delete(full, "include/config/module.h")
+	absent, err := RenderConfigCapsule(full, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if absent.ID == capsule.ID {
+		t.Fatal("empty marker and absent marker share an identity")
+	}
+	full["include/config/auto.conf"] = strings.ReplaceAll(full["include/config/auto.conf"], "CONFIG_MODULE=m", "CONFIG_MODULE=\"m\"")
+	changed, err := RenderConfigCapsule(full, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.ID == absent.ID {
+		t.Fatal("native format bytes do not affect capsule identity")
 	}
 }

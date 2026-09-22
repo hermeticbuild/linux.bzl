@@ -17,6 +17,12 @@ func ValidateStaticConfigAssignments(contents string) error {
 		return fmt.Errorf("auto.conf requires LF-terminated assignment lines")
 	}
 	for index, line := range strings.Split(strings.TrimSuffix(contents, "\n"), "\n") {
+		// Native Kconfig includes a comment heading. Only shell whitespace
+		// before a comment is inert; other lines still require an assignment.
+		trimmed := strings.TrimLeft(line, " \t")
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
 		key, value, assigned := strings.Cut(line, "=")
 		if !assigned || !strings.HasPrefix(key, "CONFIG_") || len(key) == len("CONFIG_") {
 			return fmt.Errorf("auto.conf line %d is not a CONFIG_ assignment", index+1)
@@ -40,9 +46,6 @@ func ValidateStaticConfigAssignments(contents string) error {
 				}
 			}
 			continue
-		}
-		if value == "" {
-			return fmt.Errorf("auto.conf line %d has an empty unquoted value", index+1)
 		}
 		for _, ch := range value {
 			if ch != '_' && ch != '.' && ch != '+' && ch != '-' && ch != '/' && ch != ':' &&

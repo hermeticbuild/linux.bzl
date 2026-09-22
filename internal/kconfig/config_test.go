@@ -141,7 +141,7 @@ config ENABLED
 		t.Fatal("resolved config was mutated")
 	}
 	if _, err := tree.CompactMetadataForResolvedConfigWithOptions(
-		nil, CompactMetadataOptions{}, func(*ResolvedConfig) (CompactConfigGraph, error) {
+		nil, CompactMetadataOptions{ConfigProjectionPaths: recognizedConfigDocuments()}, func(*ResolvedConfig) (CompactConfigGraph, error) {
 			return CompactConfigGraph{}, nil
 		},
 	); err == nil || !strings.Contains(err.Error(), "must not be nil") {

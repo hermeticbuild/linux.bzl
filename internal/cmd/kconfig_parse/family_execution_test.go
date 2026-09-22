@@ -134,14 +134,14 @@ func TestFamilyExecutionFlagsRequireCompleteUnambiguousPhase(t *testing.T) {
 }
 
 func TestFamilyExecutionGuardsRequireCompleteInputsAndNoOutputs(t *testing.T) {
-	variants := []familyPlanVariantRequest{{name: "base"}, {name: "debug", overlay: "debug.config"}}
+	variants := []familyPlanVariantRequest{{name: "base"}, {name: "debug"}}
 	flags := completeFamilyExecutionFlags(t, "guards", variants)
 	request, err := flags.request(variants)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if request.mode != "guards" || len(request.segments) != 0 || len(request.variants) != 2 ||
-		request.variants[1].overlay != "debug.config" || len(request.initialSnapshots) != 2 ||
+		len(request.initialSnapshots) != 2 ||
 		len(request.stores) != len(kconfig.LinuxKernelPlanTrees) {
 		t.Fatalf("guard request lost input-only contract: %#v", request)
 	}
@@ -198,11 +198,6 @@ func TestFamilyExecutionGuardsRejectEveryVariantOutputField(t *testing.T) {
 	}{
 		{"arch", func(v *familyPlanVariantRequest) { v.arch = "arch" }},
 		{"snapshot", func(v *familyPlanVariantRequest) { v.snapshot = "snapshot" }},
-		{"config", func(v *familyPlanVariantRequest) { v.resolved.config = "config" }},
-		{"auto.conf", func(v *familyPlanVariantRequest) { v.resolved.autoConf = "auto.conf" }},
-		{"auto.conf.cmd", func(v *familyPlanVariantRequest) { v.resolved.autoConfCmd = "auto.conf.cmd" }},
-		{"autoconf.h", func(v *familyPlanVariantRequest) { v.resolved.autoconf = "autoconf.h" }},
-		{"rustc_cfg", func(v *familyPlanVariantRequest) { v.resolved.rustcCfg = "rustc_cfg" }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			variants := []familyPlanVariantRequest{{name: "base"}}

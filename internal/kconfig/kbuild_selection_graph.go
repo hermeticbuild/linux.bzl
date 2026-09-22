@@ -118,6 +118,60 @@ type compactKbuildSelectionGraphCacheMisses struct {
 	unruledPrerequisite   int
 }
 
+// SelectKbuildOutput narrows an evaluated invocation graph to the dependency
+// closure of one unambiguous file output. Invocation profiles remain intact:
+// their parent goals provide the source-defined ordering of recursive Make
+// prerequisites even when the parent command is outside the selected closure.
+func (m *CompactMetadata) SelectKbuildOutput(target string) error {
+	graph, err := newCompactKbuildSelectionGraph(m.Config)
+	if err != nil {
+		return err
+	}
+	if err := graph.prepareGroupedSelections(m, m.Config); err != nil {
+		return err
+	}
+	owner, exists := graph.owners[target]
+	if !exists {
+		return fmt.Errorf("Kbuild output %q has no unambiguous selected owner", target)
+	}
+	if graph.compactKbuildProfileTargetIsPhony(graph.profiles[owner.profile], target) {
+		return fmt.Errorf("Kbuild output %q is PHONY", target)
+	}
+	selected := map[compactKbuildSelectionKey]bool{}
+	var visit func(compactKbuildSelectionKey) error
+	visit = func(key compactKbuildSelectionKey) error {
+		key = graph.compactKbuildGroupedSelectionRepresentative(key)
+		if selected[key] {
+			return nil
+		}
+		for _, member := range graph.compactKbuildGroupedSelectionMembers(key) {
+			selected[member] = true
+		}
+		dependencies, err := graph.selectionDependencies(m, key)
+		if err != nil {
+			return err
+		}
+		for _, dependency := range dependencies {
+			if err := visit(dependency); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := visit(owner); err != nil {
+		return fmt.Errorf("select Kbuild output %q: %w", target, err)
+	}
+	selections := make([]CompactKbuildSelection, 0, len(selected))
+	for _, key := range graph.ordered {
+		if selected[key] {
+			selections = append(selections, graph.selections[key])
+		}
+	}
+	m.Config.KbuildSelections = selections
+	m.validatedSelectionGraph, err = newCompactKbuildSelectionGraph(m.Config)
+	return err
+}
+
 type compactKbuildProfileStageKey struct {
 	profile string
 	stage   int

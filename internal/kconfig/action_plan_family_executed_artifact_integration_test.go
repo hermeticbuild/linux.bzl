@@ -30,7 +30,7 @@ func testFamilyArtifactAndHeaderIntegration(t *testing.T, transitiveHeader bool)
 				producer := observedCASNodeForTest(t, plan, producerID)
 				producer.Outputs = append(producer.Outputs, ActionPlanOutput{Tree: "prep", Path: "tools/helper"})
 				producerRecipe := cloneActionRecipe(plan.Recipes[producer.Recipe])
-				configSource, err := ensureActionPlanSource(plan, "config", "autoconf.h")
+				configSource, err := ensureActionPlanSource(plan, "config", "include/generated/autoconf.h")
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -422,47 +422,6 @@ func testLinuxCompilerBootstrapResultWithVersion(t *testing.T, reference kconfig
 	}
 }
 
-func writeTestSelectedKconfigChoiceSource(t *testing.T, root string) {
-	t.Helper()
-	source := filepath.Join(root, "scripts", "kconfig", "symbol.c")
-	if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// Match the member-based choice calculation selected by newer Linux
-	// symbol.c, including its visibility check and sym_calc_value call site.
-	if err := os.WriteFile(source, []byte(`
-struct symbol *sym_calc_choice(struct menu *choice)
-{
-	struct symbol *res = 0;
-	struct symbol *sym;
-	struct menu *menu;
-
-	menu_for_each_sub_entry(menu, choice) {
-		sym = menu->sym;
-		sym_calc_visibility(sym);
-		if (sym->visible == no)
-			continue;
-		res = sym;
-		break;
-	}
-	return res;
-}
-
-void sym_calc_value(struct symbol *sym)
-{
-	struct symbol_value newval;
-	struct menu *choice_menu = sym_get_choice_menu(sym);
-
-	if (choice_menu) {
-		sym_calc_choice(choice_menu);
-		newval.tri = sym->curr.tri;
-	}
-}
-`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func writeTestLinuxCompilerMakefiles(t *testing.T, root string) {
 	t.Helper()
 	directory := filepath.Join(root, "scripts")
@@ -509,7 +468,6 @@ endif
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	writeTestSelectedKconfigChoiceSource(t, root)
 }
 
 func testKbuildContracts(actions map[string]configuredKbuildAction, facts *kconfig.LinuxCompilerFacts) (*hostKbuildContract, *hostKbuildContract) {
@@ -712,12 +670,8 @@ func TestRunFamilyPlanningAdmitsOnlyCompleteMeasuredPregraphInputs(t *testing.T)
 	}
 	family := []string{
 		"-family_plan_variant=base",
+		"-family_plan_native_config=base=" + filepath.Join(root, "native-config"),
 		"-family_plan_resolved_arch_out=base=" + filepath.Join(root, "arch"),
-		"-family_plan_resolved_config_out=base=" + filepath.Join(root, "config"),
-		"-family_plan_resolved_auto_conf_out=base=" + filepath.Join(root, "auto-conf"),
-		"-family_plan_resolved_auto_conf_cmd_out=base=" + filepath.Join(root, "auto-conf-cmd"),
-		"-family_plan_resolved_autoconf_out=base=" + filepath.Join(root, "autoconf"),
-		"-family_plan_resolved_rustc_cfg_out=base=" + filepath.Join(root, "rustc-cfg"),
 		"-family_plan_snapshot_out=base=" + filepath.Join(root, "snapshot"),
 	}
 	base := []string{
@@ -1001,11 +955,7 @@ func completeFamilyPlanFlags(root string, names ...string) familyPlanFlags {
 			return namedPath{Name: name, Path: filepath.Join(root, name+suffix)}
 		}
 		flags.resolvedArch = append(flags.resolvedArch, output(".arch"))
-		flags.resolvedConfig = append(flags.resolvedConfig, output(".config"))
-		flags.resolvedAutoConf = append(flags.resolvedAutoConf, output(".auto.conf"))
-		flags.resolvedCmd = append(flags.resolvedCmd, output(".auto.conf.cmd"))
-		flags.resolvedAutoconf = append(flags.resolvedAutoconf, output(".autoconf.h"))
-		flags.resolvedRustcCfg = append(flags.resolvedRustcCfg, output(".rustc_cfg"))
+		flags.nativeConfigs = append(flags.nativeConfigs, output(".native-config"))
 		flags.snapshots = append(flags.snapshots, output(".snapshot.json.gz"))
 	}
 	return flags
@@ -1014,7 +964,6 @@ func completeFamilyPlanFlags(root string, names ...string) familyPlanFlags {
 func TestFamilyPlanRequestsAreNamedStrictAndDeterministic(t *testing.T) {
 	root := t.TempDir()
 	flags := completeFamilyPlanFlags(root, "debug", "base")
-	flags.overlays = append(flags.overlays, namedPath{Name: "debug", Path: filepath.Join(root, "debug.overlay")})
 	requests, err := flags.requests()
 	if err != nil {
 		t.Fatal(err)
@@ -1022,10 +971,7 @@ func TestFamilyPlanRequestsAreNamedStrictAndDeterministic(t *testing.T) {
 	if got := []string{requests[0].name, requests[1].name}; !slices.Equal(got, []string{"base", "debug"}) {
 		t.Fatalf("family request order = %q, want [base debug]", got)
 	}
-	if requests[0].overlay != "" || requests[1].overlay != filepath.Join(root, "debug.overlay") {
-		t.Fatalf("family overlays = %q, %q", requests[0].overlay, requests[1].overlay)
-	}
-	if requests[0].resolved.config != filepath.Join(root, "base.config") ||
+	if requests[0].nativeConfig != filepath.Join(root, "base.native-config") ||
 		requests[1].snapshot != filepath.Join(root, "debug.snapshot.json.gz") {
 		t.Fatalf("family outputs = %#v", requests)
 	}
@@ -1034,14 +980,14 @@ func TestFamilyPlanRequestsAreNamedStrictAndDeterministic(t *testing.T) {
 		"duplicate variant": func(flags *familyPlanFlags) {
 			flags.variants = append(flags.variants, "base")
 		},
-		"unknown overlay": func(flags *familyPlanFlags) {
-			flags.overlays = append(flags.overlays, namedPath{Name: "other", Path: filepath.Join(root, "other.overlay")})
+		"unknown configuration": func(flags *familyPlanFlags) {
+			flags.nativeConfigs = append(flags.nativeConfigs, namedPath{Name: "other", Path: filepath.Join(root, "other.native-config")})
 		},
 		"missing output": func(flags *familyPlanFlags) {
 			flags.snapshots = flags.snapshots[:len(flags.snapshots)-1]
 		},
 		"duplicate output": func(flags *familyPlanFlags) {
-			flags.resolvedConfig = append(flags.resolvedConfig, flags.resolvedConfig[0])
+			flags.resolvedArch = append(flags.resolvedArch, flags.resolvedArch[0])
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1051,38 +997,6 @@ func TestFamilyPlanRequestsAreNamedStrictAndDeterministic(t *testing.T) {
 				t.Fatal("invalid family request succeeded")
 			}
 		})
-	}
-}
-
-func TestFamilyVariantConfigFlagsCloneSharedBase(t *testing.T) {
-	root := t.TempDir()
-	basePath := filepath.Join(root, "base.config")
-	overlayPath := filepath.Join(root, "debug.config")
-	if err := os.WriteFile(basePath, []byte("CONFIG_COMMON=y\nCONFIG_CHANGED=n\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(overlayPath, []byte("CONFIG_CHANGED=y\nCONFIG_DEBUG=y\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	base, err := readConfigFlags(basePath, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plain, err := familyVariantConfigFlags(base, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	debug, err := familyVariantConfigFlags(base, overlayPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if base["CONFIG_CHANGED"] != "n" || plain["CONFIG_CHANGED"] != "n" ||
-		debug["CONFIG_CHANGED"] != "y" || debug["CONFIG_DEBUG"] != "y" {
-		t.Fatalf("base=%#v plain=%#v debug=%#v", base, plain, debug)
-	}
-	plain["CONFIG_COMMON"] = "n"
-	if base["CONFIG_COMMON"] != "y" {
-		t.Fatal("family variant mutated shared base config")
 	}
 }
 
@@ -1624,7 +1538,7 @@ func TestRunRejectsKconfigEvaluationWithoutStagedProbes(t *testing.T) {
 			args: []string{
 				"-root=" + filepath.Join(t.TempDir(), "Kconfig"),
 				"-resolve_config=" + filepath.Join(t.TempDir(), ".config"),
-				"-resolved_config_out=" + filepath.Join(t.TempDir(), "resolved.config"),
+				"-native_config=" + filepath.Join(t.TempDir(), "native-config"),
 				"-kernel_version=6.18.39",
 			},
 		},
@@ -2748,7 +2662,6 @@ func TestKbuildOnlyVariablesStayOutOfReusableKconfigAndReachKbuild(t *testing.T)
 
 	root := t.TempDir()
 	externalRoot := t.TempDir()
-	writeTestSelectedKconfigChoiceSource(t, root)
 	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(`
 ARCH ?= x86
 SRCARCH := $(ARCH)
@@ -2908,7 +2821,6 @@ func TestEvaluateLinuxKconfigProbesLeavesCompilerIdentificationToSourceMake(t *t
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	writeTestSelectedKconfigChoiceSource(t, root)
 	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(`
 COMPILER_MACHINE := $(shell $(CC) -dumpmachine)
 SUBARCH := $(word 1,$(subst -, ,$(COMPILER_MACHINE)))
@@ -2995,7 +2907,6 @@ func TestEvaluateLinuxKconfigProbesUsesGCCExportedDriverFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	writeTestSelectedKconfigChoiceSource(t, root)
 	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(`
 COMPILER_MACHINE := $(shell $(CC) -dumpmachine)
 SUBARCH := $(word 1,$(subst -, ,$(COMPILER_MACHINE)))
@@ -3179,230 +3090,8 @@ func TestLinuxRootKconfigInvocationVariablesSelectConfigBuild(t *testing.T) {
 	}
 }
 
-func TestKbuildVariablesForConfigUsesWrittenConfigView(t *testing.T) {
-	tree, err := kconfig.Parse(
-		t.Context(),
-		strings.NewReader(`
-config DISABLED
-	bool
-config HIDDEN
-	bool
-config MODULE
-	tristate
-config WRITTEN
-	bool
-config STRING
-	string
-config EMPTY
-	string
-`),
-		"Kconfig",
-		kconfig.Options{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	vars, err := kbuildVariablesForConfig(
-		map[string]string{
-			"ARCH":        "arm64",
-			"CONFIG_BASE": "base",
-		},
-		tree,
-		&kconfig.ResolvedConfig{
-			Effective: map[string]string{
-				"CONFIG_DISABLED": "n",
-				"CONFIG_EMPTY":    `""`,
-				"CONFIG_HIDDEN":   "y",
-				"CONFIG_MODULE":   "m",
-				"CONFIG_STRING":   `"one two"`,
-				"CONFIG_WRITTEN":  "y",
-			},
-			Written: map[string]bool{
-				"CONFIG_EMPTY":   true,
-				"CONFIG_MODULE":  true,
-				"CONFIG_STRING":  true,
-				"CONFIG_WRITTEN": true,
-			},
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for key, want := range map[string]string{
-		"ARCH":            "arm64",
-		"CONFIG_BASE":     "base",
-		"CONFIG_DISABLED": "",
-		"CONFIG_EMPTY":    "",
-		"CONFIG_HIDDEN":   "",
-		"CONFIG_MODULE":   "m",
-		"CONFIG_STRING":   "one two",
-		"CONFIG_WRITTEN":  "y",
-		"comma":           ",",
-	} {
-		if got := vars[key]; got != want {
-			t.Fatalf("vars[%q] = %q, want %q", key, got, want)
-		}
-	}
-}
-
-func TestKbuildVariablesForConfigRejectsPrivateRecursiveMakeBytes(t *testing.T) {
-	tree, err := kconfig.Parse(
-		t.Context(),
-		strings.NewReader("config PRIVATE\n\tstring\n"),
-		"Kconfig",
-		kconfig.Options{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, boundary := range []struct {
-		name  string
-		value string
-	}{{name: "opening", value: "\x05"}, {name: "closing", value: "\x06"}} {
-		for _, input := range []struct {
-			name     string
-			base     map[string]string
-			resolved *kconfig.ResolvedConfig
-		}{
-			{
-				name: "configured base",
-				base: map[string]string{"PRIVATE": "prefix" + boundary.value + "suffix"},
-				resolved: &kconfig.ResolvedConfig{
-					Effective: map[string]string{}, Written: map[string]bool{},
-				},
-			},
-			{
-				name: "resolved string",
-				resolved: &kconfig.ResolvedConfig{
-					Effective: map[string]string{
-						"CONFIG_PRIVATE": `"prefix` + boundary.value + `suffix"`,
-					},
-					Written: map[string]bool{"CONFIG_PRIVATE": true},
-				},
-			},
-		} {
-			t.Run(boundary.name+"/"+input.name, func(t *testing.T) {
-				_, err := kbuildVariablesForConfig(input.base, tree, input.resolved)
-				if err == nil || !strings.Contains(err.Error(), "reserved recursive Make provenance byte") {
-					t.Fatalf("kbuildVariablesForConfig() error = %v, want reserved-provenance rejection", err)
-				}
-			})
-		}
-	}
-
-	marker := "__LINUX_BZL_MAKE__"
-	variables, err := kbuildVariablesForConfig(nil, tree, &kconfig.ResolvedConfig{
-		Effective: map[string]string{"CONFIG_PRIVATE": `"` + marker + `"`},
-		Written:   map[string]bool{"CONFIG_PRIVATE": true},
-	})
-	if err != nil {
-		t.Fatalf("printable resolved Kconfig value rejected: %v", err)
-	}
-	if got := variables["CONFIG_PRIVATE"]; got != marker {
-		t.Fatalf("printable resolved Kconfig value = %q, want %q", got, marker)
-	}
-}
-
-func TestKbuildVariablesForConfigDoesNotInventEmptyFirmwareObject(t *testing.T) {
-	tree, err := kconfig.Parse(
-		t.Context(),
-		strings.NewReader(`
-config EXTRA_FIRMWARE
-	string "External firmware"
-`),
-		"Kconfig",
-		kconfig.Options{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved := &kconfig.ResolvedConfig{
-		Effective: map[string]string{"CONFIG_EXTRA_FIRMWARE": `""`},
-		Written:   map[string]bool{"CONFIG_EXTRA_FIRMWARE": true},
-	}
-	dir := t.TempDir()
-	path := filepath.Join(dir, "Makefile")
-	if err := os.WriteFile(path, []byte(`firmware := $(addsuffix .gen.o, $(CONFIG_EXTRA_FIRMWARE))
-obj-y += $(firmware)
-`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	variables, err := kbuildVariablesForConfig(nil, tree, resolved)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kb, err := kconfig.ParseKbuildFileWithOptions(path, kconfig.KbuildOptions{
-		Variables:        variables,
-		CaptureVariables: []string{"firmware"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := kb.Variables["firmware"]; got != "" {
-		t.Fatalf("empty CONFIG_EXTRA_FIRMWARE produced firmware value %q", got)
-	}
-}
-
-func TestWriteResolvedConfigOutputsUsesAutoConfStringEncoding(t *testing.T) {
-	tree, err := kconfig.Parse(
-		t.Context(),
-		strings.NewReader(`
-config ENABLED
-	bool
-config DISABLED
-	bool
-config EXTRA_FIRMWARE
-	string
-config FIRMWARE_LIST
-	string
-`),
-		"Kconfig",
-		kconfig.Options{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	outputs := resolvedConfigOutputs{
-		config:      filepath.Join(dir, ".config"),
-		autoConf:    filepath.Join(dir, "auto.conf"),
-		autoConfCmd: filepath.Join(dir, "auto.conf.cmd"),
-		autoconf:    filepath.Join(dir, "autoconf.h"),
-		rustcCfg:    filepath.Join(dir, "rustc_cfg"),
-	}
-	resolved := &kconfig.ResolvedConfig{
-		Effective: map[string]string{
-			"CONFIG_DISABLED":       "n",
-			"CONFIG_ENABLED":        "y",
-			"CONFIG_EXTRA_FIRMWARE": `""`,
-			"CONFIG_FIRMWARE_LIST":  `"one.bin two.bin"`,
-		},
-		Written: map[string]bool{
-			"CONFIG_ENABLED":        true,
-			"CONFIG_EXTRA_FIRMWARE": true,
-			"CONFIG_FIRMWARE_LIST":  true,
-		},
-	}
-	if err := writeResolvedConfigOutputs(tree, resolved, outputs); err != nil {
-		t.Fatal(err)
-	}
-	for path, want := range map[string]string{
-		outputs.config:   "# CONFIG_DISABLED is not set\nCONFIG_ENABLED=y\nCONFIG_EXTRA_FIRMWARE=\"\"\nCONFIG_FIRMWARE_LIST=\"one.bin two.bin\"\n",
-		outputs.autoConf: "CONFIG_ENABLED=y\nCONFIG_EXTRA_FIRMWARE=\"\"\nCONFIG_FIRMWARE_LIST=\"one.bin two.bin\"\n",
-	} {
-		got, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(got) != want {
-			t.Fatalf("%s =\n%s\nwant:\n%s", filepath.Base(path), got, want)
-		}
-	}
-}
-
 func TestResolvedConfigNormalizesAuthenticatedCompilerPathStrings(t *testing.T) {
-	tree, err := kconfig.Parse(
+	_, err := kconfig.Parse(
 		t.Context(),
 		strings.NewReader("config VENDOR_SDK\n\tstring\n"),
 		"Kconfig",
@@ -3436,7 +3125,7 @@ func TestResolvedConfigNormalizesAuthenticatedCompilerPathStrings(t *testing.T) 
 		if got, want := resolved.Value("CONFIG_VENDOR_SDK"), strconv.Quote(wantCore); got != want {
 			t.Fatalf("replay %d resolved compiler path = %q, want %q", replay, got, want)
 		}
-		contents := resolvedConfigObjectTreeContents(tree, resolved)
+		contents := map[string]string{".config": "CONFIG_VENDOR_SDK=" + resolved.Value("CONFIG_VENDOR_SDK") + "\n"}
 		for path, content := range contents {
 			if strings.Contains(content, "__LINUX_BZL_TOOLSET_PATH_CAPABILITY_V1__") {
 				t.Fatalf("replay %d %s retains transient capability bytes: %q", replay, path, content)
@@ -3506,136 +3195,6 @@ func TestWriteResolvedArchitecturePreservesSourceDerivedValue(t *testing.T) {
 	}
 }
 
-func TestResolvedConfigAutoConfKeepsShellStringQuotes(t *testing.T) {
-	tree, err := kconfig.Parse(t.Context(), strings.NewReader(`
-config DEFAULT_HOSTNAME
-	string
-	default "(none)"
-
-config LOCALVERSION
-	string
-	default ""
-
-config RAW_INT
-	int
-	default 18
-
-config RAW_HEX
-	hex
-	default 0x200000
-`), "Kconfig", kconfig.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := tree.ResolveConfigWithOptions(nil, kconfig.ResolveConfigOptions{AllNoConfig: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if content := resolvedConfigObjectTreeContents(tree, resolved)["include/config/auto.conf"]; !strings.Contains(content, `CONFIG_DEFAULT_HOSTNAME="(none)"`+"\n") {
-		t.Fatalf("generated shell config loses source string quotes: %q", content)
-	}
-	resolved.Effective["CONFIG_DEFAULT_HOSTNAME"] = strconv.Quote(`literal"quoted\path`)
-	content := resolvedConfigObjectTreeContents(tree, resolved)["include/config/auto.conf"]
-	for _, line := range []string{
-		"CONFIG_DEFAULT_HOSTNAME=" + strconv.Quote(`literal"quoted\path`),
-		`CONFIG_LOCALVERSION=""`,
-		`CONFIG_RAW_INT=18`,
-		`CONFIG_RAW_HEX=0x200000`,
-	} {
-		if !strings.Contains(content, line+"\n") {
-			t.Errorf("generated shell config %q does not retain quoted string assignment %q", content, line)
-		}
-	}
-}
-
-func TestResolvedConfigUnsetStateRoundTripsIntoDefaultMode(t *testing.T) {
-	tree, err := kconfig.Parse(
-		t.Context(),
-		strings.NewReader(`
-config DEFAULT_ON
-	bool "Default on"
-	default y
-
-config DEFAULT_OFF
-	bool "Default off"
-`),
-		"Kconfig",
-		kconfig.Options{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := tree.ResolveConfigWithOptions(nil, kconfig.ResolveConfigOptions{AllNoConfig: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	outputs := resolvedConfigOutputs{
-		config:      filepath.Join(dir, ".config"),
-		autoConf:    filepath.Join(dir, "auto.conf"),
-		autoConfCmd: filepath.Join(dir, "auto.conf.cmd"),
-		autoconf:    filepath.Join(dir, "autoconf.h"),
-		rustcCfg:    filepath.Join(dir, "rustc_cfg"),
-	}
-	if err := writeResolvedConfigOutputs(tree, resolved, outputs); err != nil {
-		t.Fatal(err)
-	}
-	config, err := os.ReadFile(outputs.config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := string(config), "# CONFIG_DEFAULT_OFF is not set\n# CONFIG_DEFAULT_ON is not set\n"; got != want {
-		t.Fatalf("resolved .config = %q, want %q", got, want)
-	}
-	raw, err := kconfig.ParseConfig(strings.NewReader(string(config)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	replanned, err := tree.ResolveConfig(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, key := range []string{"CONFIG_DEFAULT_OFF", "CONFIG_DEFAULT_ON"} {
-		if got := replanned.Value(key); got != "n" {
-			t.Fatalf("replanned %s = %q, want n; raw=%#v", key, got, raw)
-		}
-	}
-}
-
-func TestWriteResolvedConfigAcceptsPlainPath(t *testing.T) {
-	tree, err := kconfig.Parse(
-		t.Context(),
-		strings.NewReader("config ENABLED\n\tbool \"Enabled\"\n"),
-		"Kconfig",
-		kconfig.Options{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	input := filepath.Join(dir, "input=config")
-	if err := os.WriteFile(input, []byte("CONFIG_ENABLED=y\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	outputs := resolvedConfigOutputs{
-		config:      filepath.Join(dir, ".config"),
-		autoConf:    filepath.Join(dir, "auto.conf"),
-		autoConfCmd: filepath.Join(dir, "auto.conf.cmd"),
-		autoconf:    filepath.Join(dir, "autoconf.h"),
-		rustcCfg:    filepath.Join(dir, "rustc_cfg"),
-	}
-	if err := writeResolvedConfig(tree, input, nil, "default", outputs, nil); err != nil {
-		t.Fatalf("writeResolvedConfig(%q) failed: %v", input, err)
-	}
-	content, err := os.ReadFile(outputs.config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := string(content), "CONFIG_ENABLED=y\n"; got != want {
-		t.Fatalf("resolved config = %q, want %q", got, want)
-	}
-}
-
 func TestEvaluatedKbuildProfilesReadSourceProducedKernelReleaseForUtsrelease(t *testing.T) {
 	tree, err := kconfig.Parse(
 		t.Context(),
@@ -3650,7 +3209,7 @@ func TestEvaluatedKbuildProfilesReadSourceProducedKernelReleaseForUtsrelease(t *
 		Effective: map[string]string{"CONFIG_LOCALVERSION": `"-test"`},
 		Written:   map[string]bool{"CONFIG_LOCALVERSION": true},
 	}
-	immutableContents := resolvedConfigObjectTreeContents(tree, resolved)
+	immutableContents := nativeConfigFixtureForTest("CONFIG_LOCALVERSION=\"-test\"\n", "CONFIG_LOCALVERSION=\"-test\"\n", "#define CONFIG_LOCALVERSION \"-test\"\n")
 	if _, seeded := immutableContents["include/config/kernel.release"]; seeded {
 		t.Fatal("Kconfig resolve seeded the optional pre-prepare kernel.release before its source filechk writer")
 	}
@@ -3759,9 +3318,8 @@ include/generated/utsrelease.h: include/config/kernel.release FORCE
 		t.Fatalf("completed source writer KERNELRELEASE = %q, want %q", got, want)
 	}
 
-	metadata, err := tree.CompactMetadataWithOptions(
-		nil,
-		kconfig.ResolveConfigOptions{},
+	metadata, err := tree.CompactMetadataForResolvedConfigWithOptions(
+		resolved,
 		kconfig.CompactMetadataOptions{SelectedProductsOnly: true},
 		func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
 			return kconfig.CompactConfigGraph{
@@ -3832,7 +3390,7 @@ func TestEvaluatedKbuildProfilesReplayMeasuredSourceFilechkIntoExportAndUtsrelea
 		Effective: map[string]string{"CONFIG_LOCALVERSION": `"-fixture"`},
 		Written:   map[string]bool{"CONFIG_LOCALVERSION": true},
 	}
-	immutableContents := resolvedConfigObjectTreeContents(tree, resolved)
+	immutableContents := nativeConfigFixtureForTest("CONFIG_LOCALVERSION=\"-fixture\"\n", "CONFIG_LOCALVERSION=\"-fixture\"\n", "#define CONFIG_LOCALVERSION \"-fixture\"\n")
 	const releaseTarget = "include/config/kernel.release"
 	if _, seeded := immutableContents[releaseTarget]; seeded {
 		t.Fatal("Kconfig resolve seeded optional kernel.release before its source writer")
@@ -4089,7 +3647,7 @@ include/generated/utsrelease.h: include/config/kernel.release FORCE
 		values["INSTALL_DTBS_PATH"] != "/kernel/install/dtbs/6.1.188-fixture" {
 		t.Fatalf("completed source writer exports = %#v, want measured release and DTBS path", values)
 	}
-	metadata, err := tree.CompactMetadataWithOptions(nil, kconfig.ResolveConfigOptions{},
+	metadata, err := tree.CompactMetadataForResolvedConfigWithOptions(resolved,
 		metadataOptions,
 		func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
 			return kconfig.CompactConfigGraph{KbuildProfiles: replay.Value.profiles, KbuildSelections: replay.Value.selections}, nil
@@ -4156,68 +3714,6 @@ func TestValidateKernelVersionRequiresExplicitValueForPlanning(t *testing.T) {
 				t.Fatalf("validateKernelVersion error = %q, want required flag diagnostic", err)
 			}
 		})
-	}
-}
-
-func TestRustcCfgLinesMatchKernelEncoding(t *testing.T) {
-	tree, err := kconfig.Parse(
-		t.Context(),
-		strings.NewReader(`
-config BOOL
-	bool
-config TRI
-	tristate
-config STR
-	string
-config EMPTY
-	string
-config INT
-	int
-config HEX
-	hex
-config HEX_PREFIXED
-	hex
-`),
-		"Kconfig",
-		kconfig.Options{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved := &kconfig.ResolvedConfig{
-		Effective: map[string]string{
-			"CONFIG_BOOL":         "y",
-			"CONFIG_EMPTY":        "",
-			"CONFIG_TRI":          "m",
-			"CONFIG_STR":          `"quoted \"value\""`,
-			"CONFIG_INT":          "42",
-			"CONFIG_HEX":          "2a",
-			"CONFIG_HEX_PREFIXED": "0X2A",
-		},
-		Written: map[string]bool{
-			"CONFIG_BOOL":         true,
-			"CONFIG_EMPTY":        true,
-			"CONFIG_TRI":          true,
-			"CONFIG_STR":          true,
-			"CONFIG_INT":          true,
-			"CONFIG_HEX":          true,
-			"CONFIG_HEX_PREFIXED": true,
-		},
-	}
-	got := strings.Join(rustcCfgLines(tree, resolved), "\n")
-	want := strings.Join([]string{
-		`--cfg=CONFIG_BOOL`,
-		`--cfg=CONFIG_BOOL="y"`,
-		`--cfg=CONFIG_EMPTY=""`,
-		`--cfg=CONFIG_HEX="0x2a"`,
-		`--cfg=CONFIG_HEX_PREFIXED="0X2A"`,
-		`--cfg=CONFIG_INT="42"`,
-		`--cfg=CONFIG_STR="quoted \"value\""`,
-		`--cfg=CONFIG_TRI`,
-		`--cfg=CONFIG_TRI="m"`,
-	}, "\n")
-	if got != want {
-		t.Fatalf("rustcCfgLines() =\n%s\nwant:\n%s", got, want)
 	}
 }
 
@@ -5155,9 +4651,7 @@ FORCE:
 		},
 	}}
 	workingTreeContents := map[string]string{}
-	for _, path := range kconfig.ResolvedConfigProjectionOutputs() {
-		workingTreeContents[path] = ""
-	}
+	workingTreeContents = nativeConfigFixtureForTest("", "", "")
 
 	evaluation, err := kconfig.EvaluateKbuildProbeWorkload(
 		probeOptions,
@@ -5219,19 +4713,19 @@ FORCE:
 	}, "all")
 	profile.Name = "root:measured-generated-content-with-config-writer"
 	const exact = "#define MEASURED 1\n"
-	selections, err := selectedKbuildSelectionsWithStatsSourceRootAndGeneratedContent(
+	selections, err := selectedKbuildSelectionsWithResolvedTargets(
 		[]kconfig.CompactKbuildProfile{profile},
 		map[string]bool{
 			"kernel/time/timeconst.bc": true,
 			"auto.conf":                true,
 		},
-		nil, filepath.Dir(profile.Path),
+		nil, filepath.Dir(profile.Path), nil,
 		func(_ kconfig.CompactKbuildProfile, target, _ string, _, _ []string) (string, bool, bool, error) {
 			if target == "include/generated/measured.h" {
 				return exact, true, true, nil
 			}
 			return "", false, false, nil
-		},
+		}, nil, false, nil, nil, nil, []string{"include/config/auto.conf"},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -5557,10 +5051,10 @@ lib/crc/gen_crc32table: lib/crc/gen_crc32table.c include/generated/unrelated.h
 	}
 	profile.EntryTargets = []string{"all"}
 	setTestKbuildInvocationLocation(t, &profile)
-	selections, err := selectedKbuildSelectionsFromSourceRoot(
+	selections, err := selectedKbuildSelectionsWithResolvedTargets(
 		[]kconfig.CompactKbuildProfile{profile},
 		map[string]bool{"lib/crc/gen_crc32table.c": true, "unrelated.in": true},
-		root,
+		nil, root, nil, nil, nil, false, nil, nil, nil, []string{"include/generated/autoconf.h"},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -8099,7 +7593,7 @@ func TestSelectedKbuildNativeFrontiersBindSiblingForceWriters(t *testing.T) {
 	profiles := []kconfig.CompactKbuildProfile{root, firstConsumer, secondConsumer, first, second}
 	satisfied := map[string]bool{"fixdep-first.c": true, "fixdep-second.c": true}
 	selectWithViews := func(views map[string]map[string][]kconfig.CompactKbuildVisibleArtifact) ([]kconfig.CompactKbuildSelection, error) {
-		return selectedKbuildSelectionsWithResolvedTargets(profiles, satisfied, nil, "", nil, nil, nil, false, views, nil, nil)
+		return selectedKbuildSelectionsWithResolvedTargets(profiles, satisfied, nil, "", nil, nil, nil, false, views, nil, nil, nil)
 	}
 	selections, err := selectWithViews(views)
 	if err != nil {
@@ -16242,7 +15736,7 @@ result.o: input.c FORCE
 	}
 
 	selections, err := selectedKbuildSelectionsWithResolvedTargets(
-		[]kconfig.CompactKbuildProfile{profile}, satisfied, nil, "", nil, nil, resolvedTargets, false, nil, nil, nil,
+		[]kconfig.CompactKbuildProfile{profile}, satisfied, nil, "", nil, nil, resolvedTargets, false, nil, nil, nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)

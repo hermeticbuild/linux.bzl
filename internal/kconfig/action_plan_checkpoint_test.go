@@ -16,6 +16,10 @@ import (
 
 func TestActionPlanCheckpointBackendReplaysCompleteLoweredPlan(t *testing.T) {
 	metadata := familyVariantMetadataForTest(t, nil)
+	files := familyTestConfig("1", "0")
+	delete(files, "include/generated/rustc_cfg")
+	files["include/config/used.h"] = ""
+	metadata.configProjectionPaths = slices.Sorted(maps.Keys(files))
 	options := compilerDefinednessTestOptions(t)
 	scopes := compilerGuardBatchScopesForTest(t, options)
 	if err := scopes.BindActionPlanToolsetPathCapabilities(metadata); err != nil {
@@ -39,7 +43,7 @@ func TestActionPlanCheckpointBackendReplaysCompleteLoweredPlan(t *testing.T) {
 		t.Fatal("lowered fixture registered no compiler queries")
 	}
 	oracle := successfulProbeOracleForFixedPointTest(t, probePlan)
-	bindings := ActionPlanCheckpointBindings{Variant: "base", SourceArtifacts: map[string]string{"linux": oldRoot}, Toolsets: maps.Clone(plan.Toolsets), ConfigValues: maps.Clone(metadata.configFragment), ConfigFiles: familyTestConfig("1", "0"), ConfigSymbolUniverse: slices.Clone(metadata.configSymbolUniverse), ActionContracts: maps.Clone(metadata.actionContracts)}
+	bindings := ActionPlanCheckpointBindings{Variant: "base", SourceArtifacts: map[string]string{"linux": oldRoot}, Toolsets: maps.Clone(plan.Toolsets), ConfigValues: maps.Clone(metadata.configFragment), ConfigFiles: maps.Clone(files), ConfigSymbolUniverse: slices.Clone(metadata.configSymbolUniverse), ActionContracts: maps.Clone(metadata.actionContracts)}
 	bindings.ActionRoles = slices.Clone(metadata.actionRoles)
 	data, err := CaptureActionPlanCheckpoint(plan, bindings)
 	if err != nil {
@@ -57,7 +61,6 @@ func TestActionPlanCheckpointBackendReplaysCompleteLoweredPlan(t *testing.T) {
 	for _, node := range addressed.Nodes {
 		dependencies[node.ID] = ConfigDependencySet{Opaque: true, Reason: "initial conservative execution"}
 	}
-	files := familyTestConfig("1", "0")
 	snapshot, err := canonicalActionPlanSnapshot(addressed, dependencies, files)
 	if err != nil {
 		t.Fatal(err)
@@ -121,6 +124,7 @@ func TestActionPlanCheckpointBackendReplaysCompleteLoweredPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	baselineMetadata := familyVariantMetadataForTest(t, nil)
+	baselineMetadata.configProjectionPaths = slices.Clone(metadata.configProjectionPaths)
 	baselineMetadata.Config.KbuildProfiles[0].evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"] = oldRoot
 	if err := baseline.Value.BindActionPlanToolsetPathCapabilities(baselineMetadata); err != nil {
 		t.Fatal(err)
@@ -141,6 +145,21 @@ func TestActionPlanCheckpointBackendReplaysCompleteLoweredPlan(t *testing.T) {
 	restored, err := RestoreActionPlanCheckpoint(data, currentBindings)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !slices.Equal(restored.metadata.configProjectionPaths, metadata.configProjectionPaths) {
+		t.Fatalf("checkpoint changed native config inventory: %q", restored.metadata.configProjectionPaths)
+	}
+	changedBytes := currentBindings
+	changedBytes.ConfigFiles = maps.Clone(currentBindings.ConfigFiles)
+	changedBytes.ConfigFiles["include/config/auto.conf"] += "# native serializer format changed\n"
+	if _, err := RestoreActionPlanCheckpoint(data, changedBytes); err == nil {
+		t.Fatal("checkpoint accepted changed native bytes with identical resolved values")
+	}
+	changedPresence := currentBindings
+	changedPresence.ConfigFiles = maps.Clone(currentBindings.ConfigFiles)
+	delete(changedPresence.ConfigFiles, "include/config/used.h")
+	if _, err := RestoreActionPlanCheckpoint(data, changedPresence); err == nil {
+		t.Fatal("checkpoint accepted missing empty native marker")
 	}
 	var freshScopes *KbuildProbeScopes
 	evaluation, err := EvaluateKbuildProbeWorkload(options, oracle, func(fresh *KbuildProbeScopes) (*KbuildProbeScopes, error) {

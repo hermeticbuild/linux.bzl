@@ -703,7 +703,7 @@ $(OUTPUT)%.o: %.c FORCE
 
 func TestGeneratedActionPlanSelectsSourceReleaseWriterAndSDKProjection(t *testing.T) {
 	const (
-		baselineInput = "auto.conf"
+		baselineInput = "include/config/auto.conf"
 		configOutput  = "include/config/kernel.release"
 		consumer      = "include/generated/release-consumer"
 	)
@@ -718,7 +718,7 @@ include/generated/release-consumer: include/config/kernel.release FORCE
 		"AWK":     KbuildActionRoleToken("target", "awk"),
 		"objtree": "__LINUX_BZL_OBJECT_TREE__",
 	})
-	metadata := &CompactMetadata{
+	metadata := &CompactMetadata{configProjectionPaths: recognizedConfigDocuments(),
 		actionRoles: testScopedActionRoles("awk"),
 		Config: CompactConfig{
 			KbuildProfiles: []CompactKbuildProfile{profile},
@@ -760,21 +760,6 @@ include/generated/release-consumer: include/config/kernel.release FORCE
 	if !ok || plan.Recipes[writer.Recipe].Tool != "awk" {
 		t.Fatalf("config writer = %#v, want selected awk action", writer)
 	}
-	copyCount := 0
-	for _, projection := range resolvedConfigProjections() {
-		producerID, _, found := planProducerByOutput(plan, "prep", projection.output)
-		if !found {
-			t.Errorf("plan omits final config projection prep/%s", projection.output)
-			continue
-		}
-		producer, _ := compactKbuildPlanNode(plan, producerID)
-		if plan.Recipes[producer.Recipe].Tool == "actionfile" {
-			copyCount++
-		}
-	}
-	if got, want := copyCount, len(resolvedConfigProjections()); got != want {
-		t.Fatalf("fallback config copies = %d, want %d", got, want)
-	}
 	consumerID, _, ok := planProducerByOutput(plan, "prep", consumer)
 	if !ok {
 		t.Fatalf("plan omits config consumer prep/%s", consumer)
@@ -807,10 +792,11 @@ func TestGeneratedActionPlanBindsConfigProjectionAsNativePrerequisite(t *testing
 	const (
 		target       = "scripts/target.json"
 		prerequisite = "include/config/auto.conf"
+		marker       = "include/config/USED"
 	)
 	profile := mustCompactKbuildProfileForTest(t, "build:scripts", "scripts/Makefile", "scripts", `
 cmd_target_json = cp $< $@
-scripts/target.json: include/config/auto.conf FORCE
+scripts/target.json: include/config/auto.conf include/config/USED FORCE
 	$(call if_changed,target_json)
 `, nil)
 	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
@@ -818,7 +804,7 @@ scripts/target.json: include/config/auto.conf FORCE
 	}); err != nil {
 		t.Fatal(err)
 	}
-	metadata := &CompactMetadata{
+	metadata := &CompactMetadata{configProjectionPaths: append(recognizedConfigDocuments(), marker),
 		actionRoles: testConfiguredScopedActionRoles,
 		Config: CompactConfig{
 			KbuildProfiles: []CompactKbuildProfile{profile},
@@ -844,20 +830,25 @@ scripts/target.json: include/config/auto.conf FORCE
 		t.Fatalf("missing target producer %q", producerID)
 	}
 	recipe := plan.Recipes[producer.Recipe]
-	configSourceID := ""
-	for _, source := range plan.Sources {
-		if source.Namespace == "config" && source.Path == "auto.conf" {
-			configSourceID = source.ID
-			break
+	for _, pathname := range []string{prerequisite, marker} {
+		configSourceID := ""
+		for _, source := range plan.Sources {
+			if source.Namespace == "config" && source.Path == pathname {
+				configSourceID = source.ID
+				break
+			}
 		}
-	}
-	if configSourceID == "" || !slices.ContainsFunc(producer.Sources, func(edge ActionPlanSourceEdge) bool {
-		return edge.SourceID == configSourceID
-	}) {
-		t.Fatalf("target sources = %#v, want config/auto.conf source %q", producer.Sources, configSourceID)
-	}
-	if !slices.Contains(sortedStringMapValues(recipe.WorkingInputs), prerequisite) {
-		t.Fatalf("target working inputs = %#v, want logical config prerequisite %q", recipe.WorkingInputs, prerequisite)
+		if configSourceID == "" || !slices.ContainsFunc(producer.Sources, func(edge ActionPlanSourceEdge) bool {
+			return edge.SourceID == configSourceID
+		}) {
+			t.Fatalf("target sources = %#v, want native source %s", producer.Sources, pathname)
+		}
+		if !slices.Contains(sortedStringMapValues(recipe.WorkingInputs), pathname) {
+			t.Fatalf("target working inputs = %#v, want native prerequisite %q", recipe.WorkingInputs, pathname)
+		}
+		if _, _, exists := planProducerByOutput(plan, "prep", pathname); exists {
+			t.Fatalf("immutable native prerequisite %s has a redundant producer", pathname)
+		}
 	}
 	if _, err := plan.entries(); err != nil {
 		t.Fatalf("native config-prerequisite plan is invalid: %v", err)
@@ -1348,7 +1339,7 @@ func TestAppendReferencedPlanTreesClosesKernelSourceRelativeIncludes(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	configID, err := ensureActionPlanSource(plan, "config", "autoconf.h")
+	configID, err := ensureActionPlanSource(plan, "config", "include/generated/autoconf.h")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1374,11 +1365,12 @@ func TestAppendReferencedPlanTreesClosesKernelSourceRelativeIncludes(t *testing.
 }
 
 func TestActionPlanSourceNamespaceUsesSelectedExternalRoot(t *testing.T) {
-	metadata := &CompactMetadata{sourceNamespaces: map[string]string{
-		"external/rust-src":                                  "toolchain",
-		"external/rust-src/library":                          "rust",
-		"__LINUX_BZL_SOURCE_TREE__/.linux-bzl/external/demo": "external",
-	}}
+	metadata := &CompactMetadata{
+		sourceNamespaces: map[string]string{
+			"external/rust-src":                                  "toolchain",
+			"external/rust-src/library":                          "rust",
+			"__LINUX_BZL_SOURCE_TREE__/.linux-bzl/external/demo": "external",
+		}}
 	const source = "external/rust-src/library/core/src/lib.rs"
 	if got, err := metadata.actionPlanSourceNamespace(source); err != nil || got != "rust" {
 		t.Fatalf("actionPlanSourceNamespace(%q) = %q, %v; want rust", source, got, err)
@@ -1424,10 +1416,11 @@ func TestActionPlanSourceNamespaceRejectsInvalidSelectedRoot(t *testing.T) {
 }
 
 func TestActionPlanSourceNamespaceRejectsAmbiguousNormalizedRoots(t *testing.T) {
-	metadata := &CompactMetadata{sourceNamespaces: map[string]string{
-		".linux-bzl/external/demo":                           "first",
-		"__LINUX_BZL_SOURCE_TREE__/.linux-bzl/external/demo": "second",
-	}}
+	metadata := &CompactMetadata{
+		sourceNamespaces: map[string]string{
+			".linux-bzl/external/demo":                           "first",
+			"__LINUX_BZL_SOURCE_TREE__/.linux-bzl/external/demo": "second",
+		}}
 	if _, err := metadata.actionPlanSourceNamespace(".linux-bzl/external/demo/source.c"); err == nil || !strings.Contains(err.Error(), "ambiguous namespaces") {
 		t.Fatalf("actionPlanSourceNamespace() ambiguity error = %v", err)
 	}
@@ -1454,9 +1447,10 @@ func TestActionPlanExactSourceNamespaceDoesNotOwnDescendants(t *testing.T) {
 }
 
 func TestActionPlanExactSourceNamespaceRejectsTreeMarkerSyntax(t *testing.T) {
-	metadata := &CompactMetadata{exactSourceNamespaces: map[string]string{
-		"__LINUX_BZL_SOURCE_TREE__/include/generated/sdk.h": "prep",
-	}}
+	metadata := &CompactMetadata{
+		exactSourceNamespaces: map[string]string{
+			"__LINUX_BZL_SOURCE_TREE__/include/generated/sdk.h": "prep",
+		}}
 	if _, err := metadata.actionPlanSourceNamespace("include/generated/sdk.h"); err == nil {
 		t.Fatal("exact source namespace accepted reserved source-tree marker syntax")
 	}

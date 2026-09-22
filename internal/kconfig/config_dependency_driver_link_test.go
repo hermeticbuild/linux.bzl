@@ -31,7 +31,7 @@ func configDependencySourceDriverLinkPlanForTest(t *testing.T, source string, fi
 		"source:source:00000000":          source,
 		"source:working-closure:00000001": "include/generated/autoconf.h",
 	}
-	plan.Sources = append(plan.Sources, ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "autoconf.h"})
+	plan.Sources = append(plan.Sources, ActionPlanSource{ID: "src-00000002", Namespace: "config", Path: "include/generated/autoconf.h"})
 	node.Sources = append(node.Sources, ActionPlanSourceEdge{Role: "working-closure", SourceID: "src-00000002"})
 	plan.Recipes[node.Recipe] = recipe
 	plan.Nodes[0] = node
@@ -219,7 +219,7 @@ func configDependencyUnclassifiedDriverLinkPlanForTest(t *testing.T, persistent 
 		},
 		Sources: []ActionPlanSource{
 			{ID: "src-00000001", Namespace: "kernel", Path: source},
-			{ID: "src-00000002", Namespace: "config", Path: "autoconf.h"},
+			{ID: "src-00000002", Namespace: "config", Path: "include/generated/autoconf.h"},
 		},
 		Products: []ActionPlanProduct{{Name: "image", Tree: "host", Path: LinuxKernelTreeRootMarker}},
 	}

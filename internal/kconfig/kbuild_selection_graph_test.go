@@ -6,6 +6,68 @@ import (
 	"testing"
 )
 
+func TestSelectKbuildOutputRetainsConfigurationBootstrap(t *testing.T) {
+	root := mustCompactKbuildProfileForTest(t, "root", "Makefile", "", `
+.PHONY: scripts_basic syncconfig
+scripts_basic:
+	$(MAKE) -f scripts/Makefile.build obj=scripts/basic
+syncconfig: scripts_basic
+	$(MAKE) -f scripts/Makefile.build obj=scripts/kconfig syncconfig
+`, map[string]string{"MAKE": CompactKbuildRecursiveMakeProvenanceToken})
+	basic := mustCompactKbuildProfileForTest(t, "basic", "scripts/Makefile.build", "", `
+scripts/basic/fixdep:
+	touch $@
+`, nil)
+	basic.EntryTargets = []string{"scripts/basic/fixdep"}
+	conf := mustCompactKbuildProfileForTest(t, "kconfig", "scripts/Makefile.build", "", `
+.PHONY: syncconfig
+scripts/kconfig/parser.tab.c scripts/kconfig/parser.tab.h &: FORCE
+	touch scripts/kconfig/parser.tab.c scripts/kconfig/parser.tab.h
+scripts/kconfig/lexer.lex.c: scripts/kconfig/parser.tab.h
+	touch $@
+scripts/kconfig/conf: scripts/kconfig/parser.tab.c scripts/kconfig/lexer.lex.c
+	touch $@
+syncconfig: scripts/kconfig/conf
+	scripts/kconfig/conf --syncconfig Kconfig
+`, nil)
+	conf.EntryTargets = []string{"syncconfig"}
+	conf.InvocationPredecessors = []string{basic.Name}
+	root.TargetInvocationDependencies = []CompactKbuildInvocationDependency{
+		{Target: "scripts_basic", Profile: basic.Name, Goals: basic.EntryTargets},
+		{Target: "syncconfig", Profile: conf.Name, Goals: conf.EntryTargets},
+	}
+	metadata := &CompactMetadata{Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{root, basic, conf}}}
+	for _, item := range []struct{ profile, target, trigger string }{
+		{basic.Name, "scripts/basic/fixdep", ""},
+		{conf.Name, "scripts/kconfig/parser.tab.c", "scripts/kconfig/parser.tab.c"},
+		{conf.Name, "scripts/kconfig/parser.tab.h", "scripts/kconfig/parser.tab.c"},
+		{conf.Name, "scripts/kconfig/lexer.lex.c", ""},
+		{conf.Name, "scripts/kconfig/conf", ""},
+		{conf.Name, "syncconfig", ""},
+		{root.Name, "syncconfig", ""},
+	} {
+		metadata.Config.KbuildSelections = append(metadata.Config.KbuildSelections, CompactKbuildSelection{
+			Profile: item.profile, Target: item.target, MakeTarget: item.target,
+			GroupedTrigger: item.trigger, Scope: "host", Lifecycle: "target", Stage: "prehost",
+		})
+	}
+	if err := metadata.SelectKbuildOutput("scripts/kconfig/conf"); err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, selected := range metadata.Config.KbuildSelections {
+		paths = append(paths, selected.Target)
+	}
+	want := []string{"scripts/basic/fixdep", "scripts/kconfig/parser.tab.c", "scripts/kconfig/parser.tab.h", "scripts/kconfig/lexer.lex.c", "scripts/kconfig/conf"}
+	slices.Sort(want)
+	if !slices.Equal(paths, want) {
+		t.Fatalf("configuration executable closure = %q, want %q", paths, want)
+	}
+	if _, err := metadata.validatedSelectionGraph.materializationOrder(metadata); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPrepareGroupedSelectionsRejectsMissingTriggerAuthority(t *testing.T) {
 	profile := mustCompactKbuildProfileForTest(t, "grouped", "Makefile", "", `
 first.out second.out &: FORCE

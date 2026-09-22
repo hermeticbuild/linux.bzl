@@ -5,6 +5,8 @@ import (
 	"path"
 	"slices"
 	"strings"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 const maxCompactKbuildSourceScriptWrapperDepth = 32
@@ -338,14 +340,7 @@ func compactKbuildSourceScriptUsageWithSelectedContent(
 // object files and dynamically computed source names remain opaque.
 func compactKbuildDeclaredGeneratedShellSource(profile CompactKbuildProfile, source string) (bool, error) {
 	source = canonicalKbuildRulePath(source)
-	declared := false
-	for _, projection := range resolvedConfigProjections() {
-		if projection.input == "auto.conf" && projection.output == source {
-			declared = true
-			break
-		}
-	}
-	if !declared {
+	if source != "include/config/auto.conf" {
 		return false, nil
 	}
 	location, located := CompactKbuildProfileInvocationLocation(profile)
@@ -366,43 +361,10 @@ func compactKbuildDeclaredGeneratedShellSource(profile CompactKbuildProfile, sou
 	if !exists || !exact {
 		return false, fmt.Errorf("declared generated shell source is absent or has no exact bytes")
 	}
-	if err := validateCompactKbuildConfigShellAssignments(content); err != nil {
+	if err := toolaction.ValidateStaticConfigAssignments(content); err != nil {
 		return false, err
 	}
 	return true, nil
-}
-
-func validateCompactKbuildConfigShellAssignments(content string) error {
-	if !strings.HasSuffix(content, "\n") || strings.ContainsAny(content, "\x00\r") {
-		return fmt.Errorf("generated config shell source lacks a complete LF-delimited assignment")
-	}
-	for number, line := range strings.Split(strings.TrimSuffix(content, "\n"), "\n") {
-		if line == "" {
-			continue
-		}
-		name, value, found := strings.Cut(line, "=")
-		if !found || !strings.HasPrefix(name, "CONFIG_") ||
-			!validKbuildCommandEnvironmentName(name) {
-			return fmt.Errorf("generated config shell source line %d is not one CONFIG_* assignment", number+1)
-		}
-		if strings.HasPrefix(value, `"`) {
-			tokens, err := lexCompactKbuildRecipe(value)
-			if err != nil || len(tokens) != 1 || tokens[0].operator ||
-				tokens[0].shellExpansion || tokens[0].pathnameExpansion ||
-				len(value) < 2 || value[len(value)-1] != '"' {
-				return fmt.Errorf("generated config shell source line %d has active or invalid quoted syntax", number+1)
-			}
-			continue
-		}
-		for _, character := range value {
-			if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
-				(character >= '0' && character <= '9') || strings.ContainsRune("_+-./", character) {
-				continue
-			}
-			return fmt.Errorf("generated config shell source line %d has active or invalid unquoted syntax", number+1)
-		}
-	}
-	return nil
 }
 
 // compactKbuildHermeticScriptEnvironmentUsage reports environment observed by

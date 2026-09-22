@@ -191,12 +191,7 @@ func (f *familyExecutionFlags) request(variants []familyPlanVariantRequest) (*fa
 }
 
 func familyExecutionVariantOutputs(variant familyPlanVariantRequest) map[string]string {
-	return map[string]string{
-		"arch": variant.arch, "snapshot": variant.snapshot,
-		"config": variant.resolved.config, "auto.conf": variant.resolved.autoConf,
-		"auto.conf.cmd": variant.resolved.autoConfCmd, "autoconf.h": variant.resolved.autoconf,
-		"rustc_cfg": variant.resolved.rustcCfg,
-	}
+	return map[string]string{"arch": variant.arch, "snapshot": variant.snapshot}
 }
 
 // Prevent an output from replacing another phase's immutable input (or another
@@ -223,6 +218,11 @@ func (r *familyExecutionRequest) validatePaths() error {
 		}
 	}
 	inputs := map[string]string{}
+	for _, variant := range r.variants {
+		if variant.nativeConfig != "" {
+			inputs["native config "+variant.name] = variant.nativeConfig
+		}
+	}
 	if r.checkpointIn != "" {
 		inputs["initial checkpoint"] = r.checkpointIn
 	}

@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 // selectedSourceOutputProbeLookup keeps an earlier measured source-output plan
@@ -308,11 +310,6 @@ func (e *LinuxProbeEvaluator) selectedSourceFilechkProof(
 			// selected output into the action which produces those bytes.
 			return nil, nil, false, nil
 		}
-		if candidate == "include/config/auto.conf" {
-			if err := validateCompactKbuildConfigShellAssignments(content); err != nil {
-				return nil, nil, false, nil
-			}
-		}
 		staged[candidate] = content
 	}
 	proof = &selectedSourceScriptProof{
@@ -344,16 +341,17 @@ func (e *LinuxProbeEvaluator) selectedSourceFilechkProof(
 			// a later read of its bytes will fail at the consumer boundary.
 			return nil, nil, false, nil
 		}
-		if candidate == "include/config/auto.conf" {
-			if err := validateCompactKbuildConfigShellAssignments(content); err != nil {
-				return nil, nil, false, nil
-			}
-		}
 		staged[candidate] = content
 		proof.owners[candidate] = owner
 	}
 	for candidate := range prewriterObjectFiles {
 		if !seen[candidate] {
+			return nil, nil, false, nil
+		}
+	}
+	if slices.Contains(scan.dotSources, "include/config/auto.conf") {
+		content, exists := staged["include/config/auto.conf"]
+		if !exists || toolaction.ValidateStaticConfigAssignments(content) != nil {
 			return nil, nil, false, nil
 		}
 	}

@@ -209,35 +209,3 @@ vmlinux_link vmlinux "${kallsyms}" ${btf_vmlinux_bin_o}
 		t.Fatalf("newer source with no internal modpost boundary: found=%t, err=%v", found, err)
 	}
 }
-
-func TestValidateCompactKbuildLinkVmlinuxAutoConf(t *testing.T) {
-	for _, contents := range []string{
-		"",
-		"CONFIG_BPF=y\nCONFIG_SMP=n\nCONFIG_INIT_ENV_ARG_LIMIT=32\nCONFIG_BOOT_MAGIC=0x1234\n",
-		`CONFIG_DEFAULT_HOSTNAME="(none)"` + "\n" + `CONFIG_ESCAPED="quote\" and backslash\\ and literal %%"` + "\n",
-	} {
-		if err := ValidateCompactKbuildLinkVmlinuxAutoConf(contents); err != nil {
-			t.Fatalf("safe generated config %q: %v", contents, err)
-		}
-	}
-	for _, test := range []struct {
-		name     string
-		contents string
-	}{
-		{"substitution in quoted value", `CONFIG_LOCALVERSION="$(touch side-effect)"` + "\n"},
-		{"command substitution with backticks", "CONFIG_LOCALVERSION=\"`touch side-effect`\"\n"},
-		{"escaped dollar", `CONFIG_LOCALVERSION="\$(touch side-effect)"` + "\n"},
-		{"extra shell statement", "CONFIG_BPF=y; touch side-effect\n"},
-		{"embedded newline", "CONFIG_NAME=\"one\ntwo\"\n"},
-		{"wrong shell name", "CONFIG_NAME;touch=bad\n"},
-		{"quoted suffix", "CONFIG_NAME=\"hello\"; touch side-effect\n"},
-		{"unquoted shell expansion", "CONFIG_NAME=${PATH}\n"},
-		{"unterminated source", "CONFIG_BPF=y"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if err := ValidateCompactKbuildLinkVmlinuxAutoConf(test.contents); err == nil {
-				t.Fatalf("unsafe generated config accepted: %q", test.contents)
-			}
-		})
-	}
-}

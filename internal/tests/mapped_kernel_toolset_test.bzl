@@ -309,6 +309,8 @@ def _family_view_batch_fixture():
         ),
         "target_toolset_identity": struct(children = [_fake_tree_child(target_identity)]),
     }
+    for variant in ["base", "debug"]:
+        input_directories["native-config@" + variant] = struct(children = [], directory = "native-config-" + variant)
     output_directories = {
         "image": "image-store",
         "metadata": "metadata-store",
@@ -668,7 +670,7 @@ def _family_variant_output_names(owner, variants, initial):
     for variant in variants:
         prefix = owner + "." + variant
         config_prefix = prefix + ".initial" if initial else prefix
-        for suffix in [".arch", ".config", ".auto.conf", ".auto.conf.cmd", ".autoconf.h", ".rustc_cfg"]:
+        for suffix in [".arch"]:
             names.append(config_prefix + suffix)
         names.append(prefix + (".action-plan.json.gz" if initial else ".observed-action-plan.json.gz"))
     return names
@@ -834,8 +836,6 @@ def _assert_family_observation_pipeline(env, initial, replay, guard_planners, ow
         "-root",
         "-srctree",
         "-kbuild",
-        "-resolve_config",
-        "-config_mode",
         "-kernel_version",
         "-target_toolset_identity",
         "-host_toolset_identity",
@@ -852,7 +852,7 @@ def _assert_family_observation_pipeline(env, initial, replay, guard_planners, ow
         "-kbuild_prepare_candidate",
         "-var",
         "-source_root_map",
-        "-family_plan_overlay",
+        "-family_plan_native_config",
     ]
     for flag in immutable_flags:
         asserts.equals(env, _flag_values(initial.argv, flag), _flag_values(replay.argv, flag), "replay changed immutable invocation flag " + flag)
@@ -1008,6 +1008,7 @@ def _family_execution_registration_cases(env):
     segments = linux_test_family_execution_segments()
     variants = ["base", "irrelevant", "relevant"]
     views = {variant: {} for variant in variants}
+    native_configs = {variant: "native-config-" + variant for variant in variants}
     cut_stores = {}
     final_stores = {}
     base_inputs = {"prep": "empty-prep", "host_toolset_identity": "host-identity", "target_toolset_identity": "target-identity"}
@@ -1027,6 +1028,8 @@ def _family_execution_registration_cases(env):
                 expected_inputs["observed-headers"] = "verified-headers"
                 expected_inputs["observed-artifacts"] = "verified-artifacts"
                 expected_inputs.update({"cut-" + tree: cut_stores[tree] for tree in segment.output_trees})
+                if segment.emit_views:
+                    expected_inputs.update({"native-config@" + variant: native_configs[variant] for variant in variants})
             linux_test_register_family_execution_segment(
                 ctx,
                 segment = segment,
@@ -1040,6 +1043,7 @@ def _family_execution_registration_cases(env):
                 observed_headers = "verified-headers",
                 observed_artifacts = "verified-artifacts",
                 view_trees = views,
+                native_configs = native_configs,
                 tools = tools,
                 params = params,
                 requirements = requirements,
@@ -1827,27 +1831,28 @@ def _mapped_kernel_family_wiring_test_impl(ctx):
     ]
     guard_plan_actions = [action for action in actions if action.mnemonic == "LinuxMappedCompilerGuardPlan"]
 
-    config_actions = [action for action in actions if action.mnemonic == "LinuxKconfigResolve"]
+    config_actions = [action for action in actions if action.mnemonic == "LinuxNativeConfig"]
     asserts.equals(env, 3, len(config_actions), "each public configuration resolves before Kbuild planning")
     for variant in ["base", "irrelevant", "relevant"]:
-        expected_name = "family_smoke." + variant + ".kconfig.config"
+        expected_name = "family_smoke." + variant + ".native-config"
         matches = [action for action in config_actions if expected_name in [file.basename for file in action.outputs.to_list()]]
         asserts.equals(env, 1, len(matches), "missing early configuration for " + variant)
         if not matches:
             continue
         action = matches[0]
         output = [file for file in action.outputs.to_list() if file.basename == expected_name][0]
-        values = _flag_values(action.argv, "-resolved_config_out")
+        values = _flag_values(action.argv, "-native_config_out")
         asserts.equals(env, 1, len(values))
         if values:
             asserts.true(env, _action_path_names_artifact(values[0], output))
-        asserts.equals(env, 5, len(action.outputs.to_list()))
+        asserts.equals(env, 1, len(action.outputs.to_list()))
+        asserts.true(env, output.is_directory)
         for flag in ["-kbuild", "-kbuild_probe_plan_out", "-target_kbuild_probe_results", "-family_plan_variant", "-family_execution_mode"]:
             asserts.equals(env, [], _flag_values(action.argv, flag), "configuration must not request " + flag)
         overlays = _flag_values(action.argv, "-resolve_config_overlay")
         asserts.equals(env, 0 if variant == "base" else 1, len(overlays))
         if variant != "base" and overlays:
-            overlay = [file for file in action.inputs.to_list() if file.basename == variant + ".config"]
+            overlay = [file for file in action.inputs.to_list() if _action_path_names_artifact(overlays[0], file)]
             asserts.equals(env, 1, len(overlay))
             if overlay:
                 asserts.true(env, _action_path_names_artifact(overlays[0], overlay[0]))
@@ -1879,21 +1884,17 @@ def _mapped_kernel_family_wiring_test_impl(ctx):
             ["base", "irrelevant", "relevant"],
             _flag_values(family_plan.argv, "-family_plan_variant"),
         )
-        overlay_values = _flag_values(family_plan.argv, "-family_plan_overlay")
-        asserts.equals(env, ["irrelevant", "relevant"], sorted([value.split("=")[0] for value in overlay_values]))
+        config_values = _flag_values(family_plan.argv, "-family_plan_native_config")
+        asserts.equals(env, ["base", "irrelevant", "relevant"], sorted([value.split("=")[0] for value in config_values]))
         for flag in [
             "-family_plan_resolved_arch_out",
-            "-family_plan_resolved_config_out",
-            "-family_plan_resolved_auto_conf_out",
-            "-family_plan_resolved_auto_conf_cmd_out",
-            "-family_plan_resolved_autoconf_out",
-            "-family_plan_resolved_rustc_cfg_out",
             "-family_plan_snapshot_out",
+            "-family_plan_native_config",
         ]:
             asserts.equals(env, 3, len(_flag_values(family_plan.argv, flag)))
         family_plan_inputs = {file.basename: True for file in family_plan.inputs.to_list()}
-        asserts.true(env, "irrelevant.config" in family_plan_inputs)
-        asserts.true(env, "relevant.config" in family_plan_inputs)
+        for variant in ["base", "irrelevant", "relevant"]:
+            asserts.true(env, "family_smoke." + variant + ".native-config" in family_plan_inputs)
     if family_reduce_actions and family_snapshot_plan_actions:
         _assert_family_observation_pipeline(
             env,
@@ -1959,7 +1960,7 @@ def _mapped_kernel_variant_provider_test_impl(ctx):
     asserts.equals(env, ["family_smoke.relevant.image"], [file.basename for file in target[DefaultInfo].files.to_list()])
     if LinuxKernelInfo in target:
         kernel = target[LinuxKernelInfo]
-        asserts.equals(env, "family_smoke.relevant.config", kernel.config.basename)
+        asserts.equals(env, "family_smoke.relevant.kconfig.config", kernel.config.basename)
         asserts.equals(env, "family_smoke.relevant.image", kernel.image.basename)
     if LinuxModuleSdkInfo in target:
         sdk = target[LinuxModuleSdkInfo]
@@ -1968,7 +1969,7 @@ def _mapped_kernel_variant_provider_test_impl(ctx):
             sdk.kernel_key.startswith(str(Label("//internal/tests/mapped_kernel:family_smoke")) + "#relevant#"),
             "family SDK key must include configured artifact/toolset identity",
         )
-        asserts.equals(env, "family_smoke.relevant.config", sdk.config.basename)
+        asserts.equals(env, "family_smoke.relevant.kconfig.config", sdk.config.basename)
     if OutputGroupInfo in target:
         groups = target[OutputGroupInfo]
         asserts.equals(env, [
@@ -2169,13 +2170,25 @@ def _family_view_bounded_cases(env):
             paths.append("nodes/target/%s/out/metadata/%s/at/%s" % (fixture.node_id, slot, artifact))
             for variant in ["base", "debug"]:
                 paths.append("variants/%s/view/metadata/from/%s/%s/at/%s" % (variant, fixture.node_id, slot, artifact))
+        paths.extend([
+            "nodes/target/%s/out/sdk/00000999/at/.config" % fixture.node_id,
+            "variants/base/view/sdk/from/%s/00000999/at/.config" % fixture.node_id,
+        ])
+        for variant in ["base", "debug"]:
+            paths.append("variants/%s/validation/from/%s/00000000" % (variant, fixture.node_id))
         input_directories = dict(fixture.input_directories)
+        native_files = [_fake_tree_child(".config")] + [_fake_tree_child("include/config/" + prefix + str(index)) for index in range(513)]
+        for variant in ["base", "debug"]:
+            input_directories["native-config@" + variant] = struct(children = native_files, directory = "native-config-" + variant)
         input_directories["plan"] = struct(
             children = [_fake_tree_child(path) for path in paths],
             directory = "family-plan",
         )
         output_directories = dict(fixture.output_directories)
         output_directories["work"] = _fake_tree_child("work-tree")
+        output_directories["sdk"] = "sdk-store"
+        for variant in ["base", "debug"]:
+            output_directories["view@%s@sdk" % variant] = variant + "-sdk-view"
         fake = _fake_map_directory_context()
         expand_linux_family_plan(
             fake.template_ctx,
@@ -2186,6 +2199,12 @@ def _family_view_bounded_cases(env):
             fixture.additional_params,
         )
         for variant in ["base", "debug"]:
+            validation_marker = _fake_tree_child("variants/%s/validation/from/%s/00000000" % (variant, fixture.node_id))
+            validation_output = _fake_declare_file(linux_test_family_store_path(fixture.node_id, "00000000"), fixture.output_directories["objects"])
+            for action in fake.actions:
+                if action["progress_message"].startswith("Projecting Linux %s " % variant):
+                    asserts.true(env, validation_marker in action["inputs"], "every facade retains its variant validation marker")
+                    asserts.true(env, validation_output in action["inputs"], "every facade waits for its variant validation output")
             actions = [action for action in fake.actions if action["progress_message"] == "Projecting Linux %s metadata view %%{label}" % variant]
             asserts.true(env, len(actions) > 1, "large views require bounded projection batches")
             seen = {}
@@ -2204,6 +2223,25 @@ def _family_view_bounded_cases(env):
                     asserts.false(env, output.name in seen, "each facade leaf must have exactly one writer")
                     seen[output.name] = True
             asserts.equals(env, 515, len(seen))
+        for variant in ["base", "debug"]:
+            native_actions = [action for action in fake.actions if action["progress_message"] == "Projecting Linux %s native config %%{label}" % variant]
+            asserts.true(env, len(native_actions) > 1, "native configuration uses the same bounded projection batches")
+            retained = {}
+            for action in native_actions:
+                asserts.true(env, len(action["outputs"]) <= 256)
+                copies = _flag_values(action["arguments"][0].values, "-copy")
+                asserts.equals(env, len(action["outputs"]), len(copies))
+                path_bytes = 0
+                for artifact in action["inputs"] + action["outputs"]:
+                    path_bytes += len(artifact.path)
+                asserts.true(env, path_bytes <= 64 * 1024)
+                for source in action["inputs"]:
+                    if source.tree_relative_path.startswith("variants/") or source.tree_relative_path.startswith("nodes/"):
+                        continue
+                    asserts.true(env, source in native_files, "native facade inputs must be exact native TreeFiles")
+                    retained[source.tree_relative_path] = True
+            expected = {source.tree_relative_path: True for source in native_files if variant != "base" or source.tree_relative_path != ".config"}
+            asserts.equals(env, expected, retained, "selected SDK writers override native files; a native-only SDK keeps every file")
 
 def _mapped_kernel_backend_test_impl(ctx):
     env = unittest.begin(ctx)

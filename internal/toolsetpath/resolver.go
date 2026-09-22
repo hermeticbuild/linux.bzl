@@ -43,6 +43,7 @@ type scopeResolver struct {
 	ordered        []artifactBinding
 	projectionRoot string
 	projections    map[string]string
+	physicalRoots  map[string]string
 	shellAliases   bool
 }
 
@@ -202,6 +203,7 @@ func loadScope(execroot, projectionRoot, scope, identity, manifestFilename strin
 		projections:    map[string]string{},
 	}
 	physicalRoots := make(map[string]string, len(manifest.Roots))
+	resolver.physicalRoots = physicalRoots
 	for root, anchorCanonical := range manifest.Roots {
 		filename, exists := anchors[root]
 		if !exists {
@@ -306,6 +308,19 @@ func canonicalArtifactPath(execroot, filename string) (string, error) {
 		return "", err
 	}
 	return toolaction.CanonicalArtifactPath(filepath.ToSlash(relative))
+}
+
+// PhysicalRoots lists the declared toolset roots so persistent outputs can
+// reject worker-local paths, including roots exposed through Bazel symlinks.
+// These roots do not grant access beyond the manifest's exact closure.
+func (r *Resolver) PhysicalRoots() []string {
+	roots := map[string]bool{}
+	for _, scope := range r.byScope {
+		for _, root := range scope.physicalRoots {
+			roots[root] = true
+		}
+	}
+	return sortedScopeKeys(roots)
 }
 
 // Resolve maps a canonical path through the exact closure of its scope.

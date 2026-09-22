@@ -88,13 +88,13 @@ func compactKbuildObjectTreeObservationForTest(
 func TestPreconfiguredObjectTreeProvidesResolvedConfigScriptBaseline(t *testing.T) {
 	objectRoot := t.TempDir()
 	exact := map[string]string{}
-	for _, pathname := range ResolvedConfigProjectionOutputs() {
+	for _, pathname := range recognizedConfigDocuments() {
 		mustWriteSource(t, objectRoot, pathname, "preconfigured\n")
 		exact[pathname] = "prep"
 	}
 	profile := compactKbuildObjectTreeScriptProfileForTest(t, nil)
 	profile.evaluator.template.sourceRoots = map[string]string{"__LINUX_BZL_OBJECT_TREE__": objectRoot}
-	metadata := &CompactMetadata{
+	metadata := &CompactMetadata{configProjectionPaths: recognizedConfigDocuments(),
 		preconfiguredObjectTree: true,
 		exactSourceNamespaces:   exact,
 	}

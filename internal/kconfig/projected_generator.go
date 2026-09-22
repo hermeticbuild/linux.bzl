@@ -1078,23 +1078,11 @@ func projectedGeneratorConfigDependencies(
 		}
 		configPath = projection
 	}
-	if marker, used, err := configDependencyRecipeConfigInputUse(plan, node, recipe, true); err != nil {
-		return ConfigDependencySet{}, "projected generator persistent config input cannot be resolved: " + err.Error()
-	} else if used && strings.HasPrefix(marker, "${input:") && strings.HasSuffix(marker, "}") {
-		binding := strings.TrimSuffix(strings.TrimPrefix(marker, "${input:"), "}")
-		input, ok := actionPlanConfigDependencyInputBinding(plan, node, binding)
-		if !ok || !input.fallback {
-			return ConfigDependencySet{}, "projected generator has an unresolved config input binding"
-		}
-		if configPath != "" && configPath != input.projection {
-			return ConfigDependencySet{}, "projected generator consumes multiple resolved config projections"
-		}
-		configPath = input.projection
-	}
+
 	// ConfigProjectionPrefixes is a source-language proof that this generator
 	// consumes .config. A compacted closure therefore needs no recipe-local
 	// placeholder, but it still must bind that exact working pathname to the
-	// resolved .config source/copy rather than trusting the destination alone.
+	// native .config source rather than trusting the destination alone.
 	entry, found, err := lookupActionPlanConfigDependencyWorkInput(plan, node, ".config")
 	if err != nil {
 		return ConfigDependencySet{}, "projected generator persistent .config input cannot be resolved: " + err.Error()

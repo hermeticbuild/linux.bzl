@@ -550,9 +550,7 @@ init/version-timestamp.o: FORCE
 			},
 		},
 	}
-	metadata := &CompactMetadata{
-		Config: config, actionRoles: testTargetActionRoles("cc"),
-	}
+	metadata := &CompactMetadata{Config: config, actionRoles: testTargetActionRoles("cc")}
 	graph, err := newCompactKbuildSelectionGraph(config)
 	if err != nil {
 		t.Fatal(err)
@@ -1802,7 +1800,7 @@ func TestKbuildHostSourceScriptClosureRebasesConfigProjectionToSource(t *testing
 		Outputs: []ActionPlanOutput{{Tree: "prep", Path: output}},
 	}
 	plan := &ActionPlan{Sources: []ActionPlanSource{source}, Nodes: []ActionPlanNode{projection}}
-	builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{}, plan).forOutput("host", "host", "sdk")
+	builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{configProjectionPaths: recognizedConfigDocuments()}, plan).forOutput("host", "host", "sdk")
 	inputs, err := builder.compactKbuildWorkingTreeClosureInputs("arch/x86/boot/mkcpustr", CompactKbuildProfile{}, nil)
 	if err != nil {
 		t.Fatal(err)

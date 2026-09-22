@@ -4,8 +4,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"strings"
-
-	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 // CompactKbuildLinkVmlinuxSourceSpan is a half-open byte range in the
@@ -185,15 +183,6 @@ func compactKbuildLinkScriptSpans(content string, spans []CompactKbuildLinkVmlin
 		script.WriteString(content[span.Start:span.End])
 	}
 	return script.String()
-}
-
-// ValidateCompactKbuildLinkVmlinuxAutoConf checks the actual config capsule
-// before a link-vmlinux phase repeats its source-defined auto.conf import.
-// Kconfig emits CONFIG_*=value assignments, but a double-quoted value
-// containing $() or backticks would execute each time that file is sourced.
-// The script source alone cannot establish this condition.
-func ValidateCompactKbuildLinkVmlinuxAutoConf(contents string) error {
-	return toolaction.ValidateStaticConfigAssignments(contents)
 }
 
 // AnalyzeCompactKbuildLinkVmlinuxPhases recognizes scripts whose first Make

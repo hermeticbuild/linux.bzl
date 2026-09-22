@@ -67,15 +67,15 @@ vmlinux: scripts/link-vmlinux.sh
 func compactKbuildLinkVmlinuxActionPlan(t *testing.T, config CompactConfig) (*ActionPlan, *compactKbuildSelectionGraph) {
 	t.Helper()
 	metadata := &CompactMetadata{
-
-		Config: config, configFragment: map[string]string{},
+		configProjectionPaths: []string{"include/config/auto.conf"},
+		Config:                config, configFragment: map[string]string{},
 		actionRoles: testConfiguredScopedActionRoles,
 	}
 	plan := &ActionPlan{
 		Recipes:  map[string]ActionRecipe{},
 		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity},
 	}
-	if _, err := ensureActionPlanSource(plan, "config", "auto.conf"); err != nil {
+	if _, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf"); err != nil {
 		t.Fatal(err)
 	}
 	graph, err := metadata.appendGeneratedActionPlan(plan)
@@ -311,13 +311,13 @@ func TestLinkVmlinuxFinalRejectsExportedRootOutsidePrivateObjectTree(t *testing.
 		t.Fatalf("selected source command-head usage=%#v error=%v", usage.objectProgramHeads, usageErr)
 	}
 	metadata := &CompactMetadata{
-
-		Config: config, configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles,
+		configProjectionPaths: []string{"include/config/auto.conf"},
+		Config:                config, configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles,
 	}
 	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}, Toolsets: map[string]string{
 		"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity,
 	}}
-	if _, err := ensureActionPlanSource(plan, "config", "auto.conf"); err != nil {
+	if _, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf"); err != nil {
 		t.Fatal(err)
 	}
 	graph, err := metadata.appendGeneratedActionPlan(plan)
@@ -360,13 +360,13 @@ func TestLinkVmlinuxPreludeLiteralRejectsUnselectedWorkingExecutable(t *testing.
 	const program = "scripts/kallsyms"
 	config := compactKbuildLinkVmlinuxLiteralHostProgramFixture(t, false)
 	metadata := &CompactMetadata{
-
-		Config: config, configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles,
+		configProjectionPaths: []string{"include/config/auto.conf"},
+		Config:                config, configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles,
 	}
 	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}, Toolsets: map[string]string{
 		"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity,
 	}}
-	if _, err := ensureActionPlanSource(plan, "config", "auto.conf"); err != nil {
+	if _, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := appendActionPlanNode(plan, ActionPlanNode{
@@ -505,9 +505,9 @@ func TestLinkVmlinuxFinalStagesExportedHostProgramFromSelectedWriter(t *testing.
 
 func TestLinkVmlinuxFinalRejectsUnselectedProgramAlreadyInWorkingTree(t *testing.T) {
 	config := compactKbuildLinkVmlinuxExportedHostProgramFixture(t, false)
-	metadata := &CompactMetadata{Config: config, configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles}
+	metadata := &CompactMetadata{configProjectionPaths: []string{"include/config/auto.conf"}, Config: config, configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles}
 	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}, Toolsets: map[string]string{"target": actionPlanTestProbeIdentity}}
-	if _, err := ensureActionPlanSource(plan, "config", "auto.conf"); err != nil {
+	if _, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := appendActionPlanNode(plan, ActionPlanNode{
@@ -576,9 +576,9 @@ func TestLinkVmlinuxFinalLeavesAbsentExportedProgramForRuntimeShell(t *testing.T
 					}
 				}
 			}
-			metadata := &CompactMetadata{Config: config, configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles}
+			metadata := &CompactMetadata{configProjectionPaths: []string{"include/config/auto.conf"}, Config: config, configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles}
 			plan := &ActionPlan{Recipes: map[string]ActionRecipe{}, Toolsets: map[string]string{"target": actionPlanTestProbeIdentity}}
-			if _, err := ensureActionPlanSource(plan, "config", "auto.conf"); err != nil {
+			if _, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf"); err != nil {
 				t.Fatal(err)
 			}
 			graph, err := metadata.appendGeneratedActionPlan(plan)
@@ -675,14 +675,14 @@ func TestLinkVmlinuxSelectedPhaseRejectsUnreplayedRecursiveMakeRead(t *testing.T
 			phase.Spans = slices.Clone(analyzed.ObjectSpans)
 		}
 	}
-	metadata := &CompactMetadata{
+	metadata := &CompactMetadata{configProjectionPaths: []string{"include/config/auto.conf"},
 		Config: config, configFragment: map[string]string{},
 		actionRoles: testConfiguredScopedActionRoles,
 	}
 	plan := &ActionPlan{
 		Recipes: map[string]ActionRecipe{}, Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
 	}
-	if _, err := ensureActionPlanSource(plan, "config", "auto.conf"); err != nil {
+	if _, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := metadata.appendGeneratedActionPlan(plan); err == nil ||
@@ -728,7 +728,7 @@ func TestLinkVmlinuxSelectedPhasesActionPlan(t *testing.T) {
 	plan.Nodes = append(plan.Nodes, ActionPlanNode{ID: "selected-boot-image", Stage: "target", Kind: "copy", Tool: "actionfile",
 		Outputs: []ActionPlanOutput{{Tree: "image", Path: terminalConfig.imageTarget}}})
 	plan.invalidateLookupIndexes()
-	if err := (&CompactMetadata{
+	if err := (&CompactMetadata{configProjectionPaths: []string{"include/config/auto.conf"},
 		Config: terminalConfig}).appendTerminalActionPlanNodes(plan, terminalGraph); err != nil {
 		t.Fatalf("terminal projection of selected final script outputs: %v", err)
 	}
@@ -890,12 +890,12 @@ func TestLinkVmlinuxSelectedFinalOutputsRequireActualFinalWrites(t *testing.T) {
 					}
 				}
 			}
-			metadata := &CompactMetadata{
+			metadata := &CompactMetadata{configProjectionPaths: []string{"include/config/auto.conf"},
 				Config: config, configFragment: map[string]string{},
 				actionRoles: testConfiguredScopedActionRoles}
 			plan := &ActionPlan{Recipes: map[string]ActionRecipe{},
 				Toolsets: map[string]string{"target": actionPlanTestProbeIdentity}}
-			if _, err := ensureActionPlanSource(plan, "config", "auto.conf"); err != nil {
+			if _, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf"); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := metadata.appendGeneratedActionPlan(plan); err == nil || !strings.Contains(err.Error(), test.want) {
@@ -942,7 +942,7 @@ func TestLinkVmlinuxSelectedPhaseBindsConfiguredLinkerArgv(t *testing.T) {
 			for index := range config.KbuildProfiles[0].SelectedSourceScriptPhases {
 				config.KbuildProfiles[0].SelectedSourceScriptPhases[index].SourceArguments[0] = test.role
 			}
-			metadata := &CompactMetadata{
+			metadata := &CompactMetadata{configProjectionPaths: []string{"include/config/auto.conf"},
 				Config: config, configFragment: map[string]string{},
 				actionRoles: testConfiguredScopedActionRoles,
 			}
@@ -950,7 +950,7 @@ func TestLinkVmlinuxSelectedPhaseBindsConfiguredLinkerArgv(t *testing.T) {
 				Recipes:  map[string]ActionRecipe{},
 				Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
 			}
-			if _, err := ensureActionPlanSource(plan, "config", "auto.conf"); err != nil {
+			if _, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf"); err != nil {
 				t.Fatal(err)
 			}
 			graph, err := metadata.appendGeneratedActionPlan(plan)
@@ -1005,7 +1005,7 @@ func TestLinkVmlinuxVersionPhaseRejectsExistingObjectState(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			config := compactKbuildLinkVmlinuxPlanFixture(t)
 			test.prepare(t, &config)
-			metadata := &CompactMetadata{
+			metadata := &CompactMetadata{configProjectionPaths: []string{"include/config/auto.conf"},
 				Config: config, configFragment: map[string]string{},
 				actionRoles: testConfiguredScopedActionRoles,
 			}
@@ -1013,7 +1013,7 @@ func TestLinkVmlinuxVersionPhaseRejectsExistingObjectState(t *testing.T) {
 				Recipes:  map[string]ActionRecipe{},
 				Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
 			}
-			if _, err := ensureActionPlanSource(plan, "config", "auto.conf"); err != nil {
+			if _, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf"); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := metadata.appendGeneratedActionPlan(plan); err == nil || !strings.Contains(err.Error(), test.want) {

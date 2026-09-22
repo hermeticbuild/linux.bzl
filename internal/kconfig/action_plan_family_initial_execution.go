@@ -119,8 +119,10 @@ func newActionPlanFamilyInitialExecution(
 		finalNodes[node.ID] = node
 	}
 	configPaths := map[string]bool{}
-	for _, projection := range resolvedConfigProjections() {
-		configPaths[projection.output] = true
+	for _, snapshot := range snapshots {
+		for pathname := range snapshot.ConfigFiles {
+			configPaths[pathname] = true
+		}
 	}
 	roots := map[ActionPlanFamilyExecutionCutRoot]bool{}
 	groups := map[string]*actionPlanFamilyHeaderDemandGroup{}

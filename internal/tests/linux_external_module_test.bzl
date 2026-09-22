@@ -21,6 +21,7 @@ visibility("private")
 
 _PYTHON_EXEC_TOOLS_TOOLCHAIN_TYPE = str(Label("@rules_python//python:exec_tools_toolchain_type"))
 _PERL_TOOLCHAIN_TYPE = str(Label("@rules_perl//perl:toolchain_type"))
+_KERNEL_TARGET_PLATFORM = Label("@llvm//platforms:linux_x86_64")
 _PLAN_STAGES = ["prehost", "bootstrap", "host", "prep", "target"]
 _TEST_LIBELF_COMPILE_FLAGS = ["-I__LINUX_BZL_HOST_DEPS__/external/libelf/include"]
 _TEST_LIBELF_LINK_FLAGS = ["-L__LINUX_BZL_HOST_DEPS__/external/libelf/lib", "-lelf"]
@@ -182,12 +183,9 @@ def _fake_sdk_impl(ctx):
     source_root = ctx.actions.declare_file(ctx.label.name + ".Kconfig")
     kbuild = ctx.actions.declare_file(ctx.label.name + ".Makefile")
     config = ctx.actions.declare_file(ctx.label.name + ".config")
-    auto_conf = ctx.actions.declare_file(ctx.label.name + ".auto.conf")
-    auto_conf_cmd = ctx.actions.declare_file(ctx.label.name + ".auto.conf.cmd")
-    autoconf = ctx.actions.declare_file(ctx.label.name + ".autoconf.h")
-    rustc_cfg = ctx.actions.declare_file(ctx.label.name + ".rustc_cfg")
     kernel_release = ctx.actions.declare_file(ctx.label.name + ".kernel.release")
     sdk = ctx.actions.declare_directory(ctx.label.name + ".sdk")
+    config_tree = ctx.actions.declare_directory(ctx.label.name + ".native-config")
     host_toolset_identity = ctx.actions.declare_directory(ctx.label.name + ".host-toolset")
     target_toolset_identity = ctx.actions.declare_directory(ctx.label.name + ".target-toolset")
     host_toolset_manifest = ctx.actions.declare_file(ctx.label.name + ".host-toolset.json")
@@ -204,10 +202,6 @@ def _fake_sdk_impl(ctx):
         source_root,
         kbuild,
         config,
-        auto_conf,
-        auto_conf_cmd,
-        autoconf,
-        rustc_cfg,
         kernel_release,
         host_toolset_manifest,
         target_toolset_manifest,
@@ -223,6 +217,7 @@ def _fake_sdk_impl(ctx):
     ctx.actions.run_shell(
         outputs = [
             sdk,
+            config_tree,
             host_toolset_identity,
             target_toolset_identity,
             host_probe_results,
@@ -235,6 +230,7 @@ def _fake_sdk_impl(ctx):
         command = "for output in \"$@\"; do mkdir -p \"$output\"; done",
         arguments = [
             sdk.path,
+            config_tree.path,
             host_toolset_identity.path,
             target_toolset_identity.path,
             host_probe_results.path,
@@ -270,10 +266,8 @@ def _fake_sdk_impl(ctx):
     return [
         DefaultInfo(files = depset([marker])),
         LinuxModuleSdkInfo(
-            auto_conf = auto_conf,
-            auto_conf_cmd = auto_conf_cmd,
-            autoconf = autoconf,
             config = config,
+            config_tree = config_tree,
             host_action_args = host_arguments,
             host_action_environments = host_environments,
             host_action_requirements = host_requirements,
@@ -298,7 +292,6 @@ def _fake_sdk_impl(ctx):
             make_vars = ctx.attr.make_vars,
             rust_source_files = depset([rust_source_files]),
             rust_source_root = rust_source_files.path,
-            rustc_cfg = rustc_cfg,
             sdk = sdk,
             source = depset([source_root]),
             source_root = source_root,
@@ -358,14 +351,24 @@ def _fake_kernel(name, **kwargs):
     linux_platform_transition(
         name = name,
         graph = ":" + graph,
-        platform = "@platforms//host",
+        platform = _KERNEL_TARGET_PLATFORM,
         tags = tags,
     )
+
+_SelectedModuleSdkInfo = provider(
+    doc = "The tested module's resolved kernel SDK.",
+    fields = {"sdk": "SDK on the tested module's exact configured kernel edge."},
+)
+
+def _selected_module_sdk_impl(_target, ctx):
+    return [_SelectedModuleSdkInfo(sdk = ctx.rule.attr.kernel[LinuxModuleSdkInfo])]
+
+_selected_module_sdk = aspect(implementation = _selected_module_sdk_impl)
 
 def _external_module_test_impl(ctx):
     env = analysistest.begin(ctx)
     target = analysistest.target_under_test(env)
-    sdk = ctx.attr.kernel[LinuxModuleSdkInfo]
+    sdk = target[_SelectedModuleSdkInfo].sdk
     asserts.true(env, LinuxModuleInfo in target)
     asserts.true(env, OutputGroupInfo in target)
     asserts.equals(env, "sdk-fixture", target[LinuxModuleInfo].kernel_key)
@@ -445,7 +448,6 @@ def _external_module_test_impl(ctx):
     return analysistest.end(env)
 
 _EXTERNAL_MODULE_TEST_ATTRS = {
-    "kernel": attr.label(mandatory = True, providers = [LinuxModuleSdkInfo]),
     "expected_kbuild_vars": attr.string_list(),
     "expected_module_name": attr.string(mandatory = True),
     "expected_output": attr.string(mandatory = True),
@@ -454,16 +456,18 @@ _EXTERNAL_MODULE_TEST_ATTRS = {
 
 _external_module_test = analysistest.make(
     _external_module_test_impl,
+    extra_target_under_test_aspects = [_selected_module_sdk],
     attrs = _EXTERNAL_MODULE_TEST_ATTRS,
     config_settings = {
         # External map actions intentionally resolve an execution platform
         # through the same target/host C++ toolchain types as their SDK.
-        "//command_line_option:platforms": str(Label("@platforms//host")),
+        "//command_line_option:platforms": str(_KERNEL_TARGET_PLATFORM),
     },
 )
 
 _external_module_rust_skew_execution_platform_test = analysistest.make(
     _external_module_test_impl,
+    extra_target_under_test_aspects = [_selected_module_sdk],
     attrs = _EXTERNAL_MODULE_TEST_ATTRS,
     config_settings = {
         "//command_line_option:extra_execution_platforms": [
@@ -471,21 +475,22 @@ _external_module_rust_skew_execution_platform_test = analysistest.make(
             str(_DIVERGENT_RUST_EXECUTION_PLATFORM),
         ],
         "//command_line_option:extra_toolchains": [str(_DIVERGENT_RUST_TOOLCHAIN)],
-        "//command_line_option:host_platform": str(Label("@platforms//host")),
-        "//command_line_option:platforms": str(Label("@platforms//host")),
+        "//command_line_option:host_platform": str(_KERNEL_TARGET_PLATFORM),
+        "//command_line_option:platforms": str(_KERNEL_TARGET_PLATFORM),
     },
 )
 
 _external_module_perl_execution_platform_test = analysistest.make(
     _external_module_test_impl,
+    extra_target_under_test_aspects = [_selected_module_sdk],
     attrs = _EXTERNAL_MODULE_TEST_ATTRS,
     config_settings = {
         "//command_line_option:extra_execution_platforms": [
             str(_PERL_MISSING_EXECUTION_PLATFORM),
             str(_PERL_PRESENT_EXECUTION_PLATFORM),
         ],
-        "//command_line_option:host_platform": str(Label("@platforms//host")),
-        "//command_line_option:platforms": str(Label("@platforms//host")),
+        "//command_line_option:host_platform": str(_KERNEL_TARGET_PLATFORM),
+        "//command_line_option:platforms": str(_KERNEL_TARGET_PLATFORM),
     },
 )
 
@@ -497,7 +502,7 @@ def _reserved_module_make_vars_test_impl(ctx):
 _reserved_module_make_vars_test = analysistest.make(
     _reserved_module_make_vars_test_impl,
     config_settings = {
-        "//command_line_option:platforms": str(Label("@platforms//host")),
+        "//command_line_option:platforms": str(_KERNEL_TARGET_PLATFORM),
     },
     expect_failure = True,
 )
@@ -510,7 +515,7 @@ def _execution_platform_mismatch_test_impl(ctx):
 _execution_platform_mismatch_test = analysistest.make(
     _execution_platform_mismatch_test_impl,
     config_settings = {
-        "//command_line_option:platforms": str(Label("@platforms//host")),
+        "//command_line_option:platforms": str(_KERNEL_TARGET_PLATFORM),
     },
     expect_failure = True,
 )
@@ -561,7 +566,6 @@ def linux_external_module_test(name):
     )
     _external_module_test(
         name = name,
-        kernel = ":" + sdk,
         expected_kbuild_vars = ["LINUX_BZL_EXTERNAL_CFLAG_00000000=-DEXTERNAL_PHASE_TEST=1"],
         expected_module_name = module,
         expected_output = module + ".ko",
@@ -570,7 +574,6 @@ def linux_external_module_test(name):
     )
     _external_module_rust_skew_execution_platform_test(
         name = name + "_rust_skew_execution_platform",
-        kernel = ":" + sdk,
         expected_kbuild_vars = ["LINUX_BZL_EXTERNAL_CFLAG_00000000=-DEXTERNAL_PHASE_TEST=1"],
         expected_module_name = module,
         expected_output = module + ".ko",
@@ -579,7 +582,6 @@ def linux_external_module_test(name):
     )
     _external_module_perl_execution_platform_test(
         name = name + "_perl_execution_platform",
-        kernel = ":" + sdk,
         expected_kbuild_vars = ["LINUX_BZL_EXTERNAL_CFLAG_00000000=-DEXTERNAL_PHASE_TEST=1"],
         expected_module_name = module,
         expected_output = module + ".ko",
@@ -595,7 +597,6 @@ def linux_external_module_test(name):
     )
     _external_module_test(
         name = name + "_module_name_normalization",
-        kernel = ":" + sdk,
         expected_module_name = "_9Mixed_" + name,
         expected_output = normalized_module + ".ko",
         expected_shared_vars = _TEST_SHARED_VARS,

@@ -5683,12 +5683,12 @@ func configDependencyProjectionMention(value string) (string, bool) {
 			offset = index + 1
 		}
 	}
-	for _, projection := range resolvedConfigProjections() {
-		for _, candidate := range []string{projection.output, "${tree:prep}/" + projection.output,
-			"${tree:host}/" + projection.output, "${tree:bootstrap}/" + projection.output,
-			"${tree:prehost}/" + projection.output} {
+	for _, projection := range recognizedConfigDocuments() {
+		for _, candidate := range []string{projection, "${tree:prep}/" + projection,
+			"${tree:host}/" + projection, "${tree:bootstrap}/" + projection,
+			"${tree:prehost}/" + projection} {
 			if value == candidate || containsPath(value, candidate) {
-				return projection.output, true
+				return projection, true
 			}
 		}
 	}
@@ -5738,11 +5738,6 @@ func actionPlanConfigDependencyInputSetProvenance(
 		)
 	}
 	provenance.producer = producer
-	projection, fallback := canonicalFallbackConfigProjection(plan, plan.sourcesByID, producer)
-	if fallback && entry.Slot == 0 {
-		provenance.projection = projection
-		provenance.config = true
-	}
 	return provenance, nil
 }
 
@@ -5848,8 +5843,8 @@ func actionPlanGeneratedConfigDependencyPaths(plan *ActionPlan) map[string]bool 
 			generated[canonicalKbuildRulePath(output.Path)] = true
 		}
 	}
-	for _, projection := range resolvedConfigProjections() {
-		delete(generated, projection.output)
+	for _, pathname := range actionPlanConfigProjectionPaths(plan) {
+		delete(generated, pathname)
 	}
 	return generated
 }
@@ -5979,15 +5974,15 @@ func configDependencyResolvedProjectionSource(source ActionPlanSource) (string, 
 	if sourcePath == "" || sourcePath != source.Path {
 		return "", false
 	}
-	for _, projection := range resolvedConfigProjections() {
+	for _, projection := range recognizedConfigDocuments() {
 		switch source.Namespace {
 		case "config":
-			if sourcePath == projection.input {
-				return projection.output, true
+			if sourcePath == projection {
+				return projection, true
 			}
 		case "capsule":
-			if strings.HasSuffix(sourcePath, "/"+projection.output) {
-				return projection.output, true
+			if strings.HasSuffix(sourcePath, "/"+projection) {
+				return projection, true
 			}
 		}
 	}
@@ -5995,11 +5990,9 @@ func configDependencyResolvedProjectionSource(source ActionPlanSource) (string, 
 }
 
 type configDependencyInputBinding struct {
-	binding    string
-	producer   ActionPlanNode
-	slot       int
-	projection string
-	fallback   bool
+	binding  string
+	producer ActionPlanNode
+	slot     int
 }
 
 func actionPlanConfigDependencyInputBinding(
@@ -6008,7 +6001,7 @@ func actionPlanConfigDependencyInputBinding(
 	binding string,
 ) (configDependencyInputBinding, bool) {
 	role, ordinal, ok := configDependencyBindingOrdinal(binding)
-	if !ok || ordinal >= len(node.Inputs) || plan == nil || plan.ensureSourceLookupIndex() != nil {
+	if !ok || ordinal >= len(node.Inputs) || plan == nil {
 		return configDependencyInputBinding{}, false
 	}
 	plan.ensureNodeLookupIndexes()
@@ -6017,11 +6010,7 @@ func actionPlanConfigDependencyInputBinding(
 	if !ok || edge.Role != role || edge.Slot < 0 || edge.Slot >= len(producer.Outputs) {
 		return configDependencyInputBinding{}, false
 	}
-	projection, fallback := canonicalFallbackConfigProjection(plan, plan.sourcesByID, producer)
-	return configDependencyInputBinding{
-		binding: binding, producer: producer, slot: edge.Slot,
-		projection: projection, fallback: fallback && edge.Slot == 0,
-	}, true
+	return configDependencyInputBinding{binding: binding, producer: producer, slot: edge.Slot}, true
 }
 
 func configDependencyRecipeConfigSourceUse(
@@ -6120,125 +6109,7 @@ func configDependencyRecipeConfigSourceUseWithQuery(
 	if inputSets == nil {
 		inputSets = newConfigDependencyInputSetQuery(plan)
 	}
-	use, found, err := inputSets.configUse(node.InputSet, true, scanAllArguments)
-	if err != nil {
-		return "", false, fmt.Errorf("node %q input set: %w", node.ID, err)
-	}
-	return use, found, nil
-}
-
-func configDependencyRecipeConfigInputUse(
-	plan *ActionPlan,
-	node ActionPlanNode,
-	recipe ActionRecipe,
-	scanAllArguments bool,
-) (string, bool, error) {
-	return configDependencyRecipeConfigInputUseWithQuery(plan, node, recipe, scanAllArguments, nil)
-}
-
-func configDependencyRecipeConfigInputUseWithQuery(
-	plan *ActionPlan,
-	node ActionPlanNode,
-	recipe ActionRecipe,
-	scanAllArguments bool,
-	inputSets *configDependencyInputSetQuery,
-) (string, bool, error) {
-	usesPlaceholder := func(value string) (string, bool) {
-		for _, match := range actionRecipePlaceholder.FindAllStringSubmatch(value, -1) {
-			if len(match) != 3 || match[1] != "input" {
-				continue
-			}
-			input, ok := actionPlanConfigDependencyInputBinding(plan, node, match[2])
-			if ok && input.fallback {
-				return match[0], true
-			}
-		}
-		return "", false
-	}
-	usesReference := func(value string, prefixed bool) (string, bool) {
-		binding := value
-		if prefixed {
-			var ok bool
-			binding, ok = strings.CutPrefix(value, "input:")
-			if !ok {
-				return "", false
-			}
-		}
-		input, ok := actionPlanConfigDependencyInputBinding(plan, node, binding)
-		if ok && input.fallback {
-			return "${input:" + binding + "}", true
-		}
-		return "", false
-	}
-	if scanAllArguments || recipe.CompilerInvocation != nil {
-		for _, argument := range recipe.Arguments {
-			if marker, used := usesPlaceholder(argument); used {
-				return marker, true, nil
-			}
-		}
-	}
-	if scanAllArguments && recipe.CompilerInvocation != nil {
-		for _, argument := range recipe.CompilerInvocation.Arguments {
-			if marker, used := usesPlaceholder(argument); used {
-				return marker, true, nil
-			}
-		}
-	}
-	if recipe.CompilerInvocation != nil {
-		for _, reference := range recipe.CompilerInvocation.AuxiliaryWorkingInputUses {
-			if marker, used := usesReference(reference, true); used {
-				return marker, true, nil
-			}
-		}
-	}
-	for _, value := range recipe.Environment {
-		if marker, used := usesPlaceholder(value); used {
-			return marker, true, nil
-		}
-	}
-	for _, value := range []string{recipe.Stdin, recipe.Stdout} {
-		if marker, used := usesPlaceholder(value); used {
-			return marker, true, nil
-		}
-		if marker, used := usesReference(value, true); used {
-			return marker, true, nil
-		}
-	}
-	for _, substitution := range recipe.ContentSubstitutions {
-		if marker, used := usesReference(substitution.Input, true); used {
-			return marker, true, nil
-		}
-	}
-	for _, replay := range recipe.CommandReplays {
-		for _, invocation := range replay.Invocations {
-			for _, value := range append(slices.Clone(invocation.Arguments), invocation.Outputs...) {
-				if marker, used := usesPlaceholder(value); used {
-					return marker, true, nil
-				}
-			}
-		}
-	}
-	if binding, ok := strings.CutPrefix(recipe.Tool, "input:"); ok {
-		if marker, used := usesReference(binding, false); used {
-			return marker, true, nil
-		}
-	}
-	for _, binding := range recipe.ExecutableInputs {
-		if marker, used := usesReference(binding, false); used {
-			return marker, true, nil
-		}
-	}
-	for _, bases := range recipe.ObservedOutputBases {
-		for _, binding := range bases {
-			if marker, used := usesReference(binding, false); used {
-				return marker, true, nil
-			}
-		}
-	}
-	if inputSets == nil {
-		inputSets = newConfigDependencyInputSetQuery(plan)
-	}
-	use, found, err := inputSets.configUse(node.InputSet, false, scanAllArguments)
+	use, found, err := inputSets.configUse(node.InputSet, scanAllArguments)
 	if err != nil {
 		return "", false, fmt.Errorf("node %q input set: %w", node.ID, err)
 	}
@@ -7177,38 +7048,6 @@ func configDependencyCompilerSourceBindingReason(
 	return ""
 }
 
-func configDependencyCompilerInputBindingReason(
-	arguments []string,
-	inputBindings map[string]configDependencyInputBinding,
-) string {
-	modeledForced := map[int]string{}
-	for _, operand := range KbuildCompilerIncludeOperands(arguments) {
-		if operand.Flag != "-include" && operand.Flag != "-imacros" {
-			continue
-		}
-		input, proven := inputBindings[operand.Operand]
-		if !proven || !input.fallback {
-			continue
-		}
-		if input.projection != configDependencyAutoconfPath {
-			return "compiler explicitly consumes non-autoconf config projection " + input.projection
-		}
-		modeledForced[operand.ArgumentIndex] = operand.Operand
-	}
-	for index, argument := range arguments {
-		for marker, input := range inputBindings {
-			if !input.fallback || !strings.Contains(argument, marker) {
-				continue
-			}
-			if modeledForced[index] == marker {
-				continue
-			}
-			return "compiler argv uses a config input binding outside a modeled forced autoconf include"
-		}
-	}
-	return ""
-}
-
 func configDependencyCompilerUnmodeledForwarder(argument string) bool {
 	if strings.HasPrefix(argument, "-Wa,") || strings.HasPrefix(argument, "-Wl,") ||
 		probeCandidateOptionMatches(argument, "-mllvm", false) {
@@ -7907,9 +7746,6 @@ func actionPlanNodeConfigDependenciesForSourceLookup(
 	); reason != "" {
 		return opaqueConfigDependency(reason)
 	}
-	if reason := configDependencyCompilerInputBindingReason(compilerArguments, invocation.inputBindings); reason != "" {
-		return opaqueConfigDependency(reason)
-	}
 	configuredInternalSystemRoots, reason := configDependencyUnsupportedCompilerArgument(
 		compilerArguments, invocation.kbuildEnd-start,
 	)
@@ -8099,31 +7935,21 @@ func actionPlanNodeConfigDependenciesForSourceLookup(
 				continue
 			}
 			if input, proven := invocation.inputBindings[operand.Operand]; proven {
-				if !input.fallback {
-					if scanner.collectGeneratedHeaders {
-						output := input.producer.Outputs[input.slot]
-						logical := recipe.WorkingInputs["input:"+input.binding]
-						if logical == "" {
-							logical = output.Path
-						}
-						scanner.unavailableGeneratedHeader = configDependencyUnavailableGeneratedHeader{
-							logical: logical, explicitlyBound: true,
-							bound: configDependencyInputSetProvenance{
-								entry:    ActionPlanInputSetEntry{ProducerID: input.producer.ID, Slot: input.slot},
-								producer: input.producer,
-							},
-						}
+				if scanner.collectGeneratedHeaders {
+					output := input.producer.Outputs[input.slot]
+					logical := recipe.WorkingInputs["input:"+input.binding]
+					if logical == "" {
+						logical = output.Path
 					}
-					return opaqueConfigDependency("forced compiler include uses an unmodeled generated input binding")
+					scanner.unavailableGeneratedHeader = configDependencyUnavailableGeneratedHeader{
+						logical: logical, explicitlyBound: true,
+						bound: configDependencyInputSetProvenance{
+							entry:    ActionPlanInputSetEntry{ProducerID: input.producer.ID, Slot: input.slot},
+							producer: input.producer,
+						},
+					}
 				}
-				if input.projection != configDependencyAutoconfPath {
-					return opaqueConfigDependency("compiler explicitly consumes non-autoconf config projection " + input.projection)
-				}
-				forcedIncludes = append(forcedIncludes, forcedConfigDependencyInclude{
-					flag: operand.Flag,
-					file: configDependencyScanFile{logical: input.projection, configProjection: true},
-				})
-				continue
+				return opaqueConfigDependency("forced compiler include uses an unmodeled generated input binding")
 			}
 		}
 		if configuredOperand {
@@ -8670,8 +8496,8 @@ func configDependencyCompletedCompilerCandidateForNode(
 }
 
 func configDependencyCompletedResolvedProjection(pathname string) bool {
-	for _, projection := range resolvedConfigProjections() {
-		if pathname == projection.output {
+	for _, projection := range recognizedConfigDocuments() {
+		if pathname == projection {
 			return true
 		}
 	}
@@ -9594,7 +9420,7 @@ func (c *configDependencyAnalysisContext) recordGeneratedHeaderDemand(
 			return
 		}
 		candidate, exact := actionPlanConfigDependencyInputBinding(plan, consumer, name)
-		if !exact || candidate.fallback || found && (bound.producer.ID != candidate.producer.ID || bound.slot != candidate.slot) {
+		if !exact || found && (bound.producer.ID != candidate.producer.ID || bound.slot != candidate.slot) {
 			return
 		}
 		bound, found = candidate, true
@@ -9752,11 +9578,6 @@ func analyzeActionPlanNodeConfigDependencies(
 		} else if used {
 			return opaqueConfigDependency("non-compiler recipe uses config source binding: " + binding), nil
 		}
-		if binding, used, err := configDependencyRecipeConfigInputUseWithQuery(plan, node, recipe, true, context.inputSets); err != nil {
-			return ConfigDependencySet{}, err
-		} else if used {
-			return opaqueConfigDependency("non-compiler recipe uses config input binding: " + binding), nil
-		}
 		if explicitConfig {
 			return opaqueConfigDependency("action explicitly consumes resolved config projection " + explicitPath), nil
 		}
@@ -9782,11 +9603,6 @@ func analyzeActionPlanNodeConfigDependencies(
 		return ConfigDependencySet{}, err
 	} else if used {
 		return opaqueConfigDependency("compiler recipe uses config source binding outside its modeled compiler invocation: " + binding), nil
-	}
-	if binding, used, err := configDependencyRecipeConfigInputUseWithQuery(plan, node, recipe, false, context.inputSets); err != nil {
-		return ConfigDependencySet{}, err
-	} else if used {
-		return opaqueConfigDependency("compiler recipe uses config input binding outside its modeled compiler invocation: " + binding), nil
 	}
 	if recipe.CompilerInvocation != nil && !recipe.CompilerInvocation.WorkingInputUsesComplete {
 		stagesConfig, err := actionPlanNodeStagesConfigProjectionWithQuery(plan, node, recipe, context.inputSets)
@@ -10305,7 +10121,7 @@ func buildActionPlanConfigDependencyAnalysisWithObservations(
 	return analysis, nil
 }
 
-// ConfigCapsule is one content-addressed six-file resolved-config projection.
+// ConfigCapsule is one content-addressed native config projection.
 // Files are keyed by their logical object-tree path.
 type ConfigCapsule struct {
 	ID    string
@@ -10390,7 +10206,7 @@ func filterConfigProjection(pathname, contents string, selected map[string]bool)
 
 func configCapsuleID(files map[string]string) string {
 	hash := sha256.New()
-	for _, pathname := range ResolvedConfigProjectionOutputs() {
+	for _, pathname := range slices.Sorted(maps.Keys(files)) {
 		contents := files[pathname]
 		fmt.Fprintf(hash, "%08x:%s%016x:", len(pathname), pathname, len(contents))
 		hash.Write([]byte(contents))
@@ -10407,29 +10223,35 @@ func RenderConfigCapsule(full map[string]string, dependencies ConfigDependencySe
 	if err != nil {
 		return ConfigCapsule{}, err
 	}
-	for _, pathname := range ResolvedConfigProjectionOutputs() {
-		if _, ok := full[pathname]; !ok {
-			return ConfigCapsule{}, fmt.Errorf("resolved config projection %q is missing", pathname)
-		}
+	if _, err := NativeConfigProjectionPaths(full); err != nil {
+		return ConfigCapsule{}, err
 	}
-	files := make(map[string]string, len(resolvedConfigProjections()))
+	files := map[string]string{}
 	if set.Opaque {
-		for _, pathname := range ResolvedConfigProjectionOutputs() {
-			files[pathname] = full[pathname]
-		}
+		files = maps.Clone(full)
 	} else {
 		selected := configCapsuleSelectedSymbols(set)
-		files[".config"] = filterConfigProjection(".config", full[".config"], selected)
-		files["include/config/auto.conf"] = filterConfigProjection(
-			"include/config/auto.conf", full["include/config/auto.conf"], selected,
-		)
-		files["include/config/auto.conf.cmd"] = full["include/config/auto.conf.cmd"]
-		files["include/generated/autoconf.h"] = filterConfigProjection(
-			"include/generated/autoconf.h", full["include/generated/autoconf.h"], selected,
-		)
-		files["include/generated/rustc_cfg"] = filterConfigProjection(
-			"include/generated/rustc_cfg", full["include/generated/rustc_cfg"], selected,
-		)
+		for _, document := range recognizedConfigDocuments() {
+			contents, present := full[document]
+			if !present {
+				continue
+			}
+			if document != "include/config/auto.conf.cmd" {
+				contents = filterConfigProjection(document, contents, selected)
+			}
+			files[document] = contents
+		}
+		// Native conf and fixdep have changed marker naming across kernels.
+		// Preserve exact demanded paths and their presence, without reconstructing
+		// a naming convention or coupling unrelated symbols to every action.
+		for _, pathname := range set.ObjectPaths {
+			if _, document := files[pathname]; document {
+				continue
+			}
+			if contents, present := full[pathname]; present {
+				files[pathname] = contents
+			}
+		}
 	}
 	return ConfigCapsule{ID: configCapsuleID(files), Files: files}, nil
 }

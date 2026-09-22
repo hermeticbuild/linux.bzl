@@ -315,6 +315,9 @@ func TestSelectedPhonyNativeCmdWrapperAuthenticatesSourceAndDepfile(t *testing.T
 		}}) || !compactKbuildAuthenticatedExecutionCheckCompletion(plan, node, "missing-syscalls") {
 		t.Fatalf("native cmd wrapper lost its selected source, PHONY trap suppression, or compiler depfile: %#v", recipe)
 	}
+	if err := plan.WriteStages(actionPlanStageOutputsForTest(filepath.Join(t.TempDir(), "plan"))); err != nil {
+		t.Fatalf("native cmd wrapper action plan: %v", err)
+	}
 }
 
 func TestSelectedPhonyWrapperPreservesLiteralAndActiveTreeRoots(t *testing.T) {
@@ -357,6 +360,9 @@ func TestSelectedPhonyWrapperPreservesLiteralAndActiveTreeRoots(t *testing.T) {
 				t.Fatal("changed literal provenance passed selected PHONY source validation")
 			}
 		})
+	}
+	if err := plan.WriteStages(actionPlanStageOutputsForTest(filepath.Join(t.TempDir(), "plan"))); err != nil {
+		t.Fatalf("literal PHONY wrapper action plan: %v", err)
 	}
 }
 

@@ -455,11 +455,10 @@ func canonicalActionPlanSnapshot(plan *ActionPlan, dependencies map[string]Confi
 		}
 		snapshot.ConfigDependencies[node.ID] = canonical
 	}
-	for _, pathname := range ResolvedConfigProjectionOutputs() {
-		if _, ok := snapshot.ConfigFiles[pathname]; !ok {
-			return ActionPlanSnapshot{}, fmt.Errorf("action plan snapshot is missing resolved config projection %q", pathname)
-		}
+	if _, err := NativeConfigProjectionPaths(snapshot.ConfigFiles); err != nil {
+		return ActionPlanSnapshot{}, err
 	}
+
 	sort.Slice(snapshot.Sources, func(i, j int) bool { return snapshot.Sources[i].ID < snapshot.Sources[j].ID })
 	sort.Slice(snapshot.Nodes, func(i, j int) bool { return snapshot.Nodes[i].ID < snapshot.Nodes[j].ID })
 	sort.Slice(snapshot.Products, func(i, j int) bool { return snapshot.Products[i].Name < snapshot.Products[j].Name })
@@ -942,14 +941,17 @@ func (s ActionPlanSnapshot) validateWithStats(stats *actionPlanValidationStats) 
 			return fmt.Errorf("snapshot node %s config dependencies are not canonical", node.ID)
 		}
 	}
-	for _, pathname := range ResolvedConfigProjectionOutputs() {
-		if _, ok := s.ConfigFiles[pathname]; !ok {
-			return fmt.Errorf("snapshot is missing resolved config projection %q", pathname)
+	if _, err := NativeConfigProjectionPaths(s.ConfigFiles); err != nil {
+		return err
+	}
+	for _, source := range s.Sources {
+		if source.Namespace == "config" {
+			if _, exists := s.ConfigFiles[source.Path]; !exists {
+				return fmt.Errorf("snapshot config source %q is absent from native projection", source.Path)
+			}
 		}
 	}
-	if len(s.ConfigFiles) != len(ResolvedConfigProjectionOutputs()) {
-		return fmt.Errorf("snapshot has %d resolved config projections, want %d", len(s.ConfigFiles), len(ResolvedConfigProjectionOutputs()))
-	}
+
 	return nil
 }
 
@@ -1003,8 +1005,8 @@ func compressCanonicalActionPlanSnapshot(data []byte, limit int64) ([]byte, erro
 }
 
 // WriteActionPlanSnapshot publishes a bounded, canonical, lossless variant
-// plan as deterministic gzip. configFiles are keyed by
-// ResolvedConfigProjectionOutputs paths.
+// plan as deterministic gzip. configFiles contain the selected native
+// configuration artifacts, keyed by their object-tree paths.
 func WriteActionPlanSnapshot(output string, plan *ActionPlan, dependencies map[string]ConfigDependencySet, configFiles map[string]string) error {
 	snapshot, err := canonicalActionPlanSnapshot(plan, dependencies, configFiles)
 	if err != nil {
@@ -1945,16 +1947,11 @@ func familyConfigCapsuleCacheKey(dependencies ConfigDependencySet) string {
 	if dependencies.Opaque {
 		return "opaque"
 	}
-	return "symbols\x00" + strings.Join(dependencies.Symbols, "\x00")
+	return "symbols\x00" + strings.Join(dependencies.Symbols, "\x00") + "\x00paths\x00" + strings.Join(dependencies.ObjectPaths, "\x00")
 }
 
 func configSourceCapsulePath(sourcePath string) (string, bool) {
-	for _, projection := range resolvedConfigProjections() {
-		if projection.input == sourcePath {
-			return projection.output, true
-		}
-	}
-	return "", false
+	return sourcePath, nativeConfigArtifactPath(sourcePath)
 }
 
 func familyConfigSourceUsage(plan *ActionPlan, sources map[string]ActionPlanSource) (map[string]bool, error) {
@@ -2738,36 +2735,6 @@ func attachPreciseFamilySourceClosure(
 	return changedRecipes, nil
 }
 
-// canonicalFallbackConfigProjection recognizes only the unconditional copy
-// emitted by appendMissingConfigProjections. Selected Kbuild writers and
-// versioned/noncanonical outputs must retain their full configuration input.
-func canonicalFallbackConfigProjection(plan *ActionPlan, sources map[string]ActionPlanSource, node ActionPlanNode) (string, bool) {
-	if plan == nil || node.Stage != "prep" || node.Kind != "copy" || node.Tool != "actionfile" ||
-		node.Product != "sdk" || len(node.Sources) != 1 || len(node.Inputs) != 0 || len(node.Outputs) != 1 {
-		return "", false
-	}
-	output := node.Outputs[0]
-	if output.Tree != "prep" || !actionPlanOutputIsCanonical(output) || output.ObservedPath != "" {
-		return "", false
-	}
-	source, ok := sources[node.Sources[0].SourceID]
-	if !ok || source.Namespace != "config" || node.Sources[0].Role != "input" {
-		return "", false
-	}
-	projection, ok := configSourceCapsulePath(source.Path)
-	if !ok || projection != output.Path {
-		return "", false
-	}
-	recipe, ok := plan.Recipes[node.Recipe]
-	if !ok || recipe.Schema != LinuxKernelPlanSchema || recipe.Kind != "copy" || recipe.Tool != "actionfile" ||
-		!slices.Equal(recipe.Arguments, []string{"-input", "${source:input:00000000}", "-out", "${output:00000000}"}) ||
-		!slices.Equal(recipe.Sources, []string{"input:00000000"}) || len(recipe.Inputs) != 0 ||
-		!slices.Equal(recipe.Outputs, []string{"00000000"}) {
-		return "", false
-	}
-	return projection, true
-}
-
 type familyPriorTreeInput struct {
 	producerID   string
 	structuralID string
@@ -3472,7 +3439,7 @@ func buildValidatedActionPlanFamilyWithStats(
 			for pathname := range projected {
 				staged[pathname] = true
 			}
-			for _, projection := range ResolvedConfigProjectionOutputs() {
+			for _, projection := range slices.Sorted(maps.Keys(capsule.Files)) {
 				if staged[canonicalKbuildRulePath(projection)] {
 					continue
 				}
@@ -3518,155 +3485,13 @@ func buildValidatedActionPlanFamilyWithStats(
 			}
 		}
 
-		originalNodeIDs := make(map[string]bool, len(reduction.plan.Nodes))
 		originalNodes := make(map[string]ActionPlanNode, len(reduction.plan.Nodes))
-		localizedOriginals := make(map[string]ActionPlanNode, len(localized.Nodes))
-		for index, node := range reduction.plan.Nodes {
-			originalNodeIDs[node.ID] = true
+		for _, node := range reduction.plan.Nodes {
 			originalNodes[node.ID] = node
-			localizedOriginals[node.ID] = localized.Nodes[index]
 		}
-		// Materialize precise config projections at the actual graph boundary.
-		// The cloned copy has the same recipe/logical prep output, but its source
-		// is the consuming compiler node's capsule. It is internal to the shared
-		// store and therefore never becomes a variant public-tree view.
 		localizedInputSets, err := localized.planningActionPlanInputSetStore()
 		if err != nil {
 			return nil, fmt.Errorf("variant %s localized input sets: %w", reduction.name, err)
-		}
-		fallbackProjections := map[string]string{}
-		for id, producer := range originalNodes {
-			if projection, fallback := canonicalFallbackConfigProjection(reduction.plan, oldSources, producer); fallback {
-				fallbackProjections[id] = projection
-			}
-		}
-		projectionClones := map[string]string{}
-		projectionCloneCapsules := map[string]ConfigCapsule{}
-		cloneProjection := func(producerID string, capsule ConfigCapsule) (string, error) {
-			cloneKey := producerID + "\x00" + capsule.ID
-			if cloneID := projectionClones[cloneKey]; cloneID != "" {
-				return cloneID, nil
-			}
-			digest := sha256.Sum256([]byte("linux-kernel-family-config-projection-clone-v1\x00" + reduction.structuralID[producerID] + "\x00" + capsule.ID))
-			cloneID := "projection-clone-" + hex.EncodeToString(digest[:])
-			clone := localizedOriginals[producerID]
-			clone.ID = cloneID
-			clone.Sources = slices.Clone(clone.Sources)
-			sourceID, err := registerSource("capsule", path.Join(capsule.ID, fallbackProjections[producerID]))
-			if err != nil {
-				return "", err
-			}
-			clone.Sources[0].SourceID = sourceID
-			localized.Nodes = append(localized.Nodes, clone)
-			projectionClones[cloneKey] = cloneID
-			projectionCloneCapsules[cloneID] = capsule
-			return cloneID, nil
-		}
-		// Only the few fallback-projection paths depend on the consumer capsule.
-		// Summarize shared subtries once, then remap those paths without scanning
-		// every cumulative working-tree root for every distinct capsule.
-		fallbackSubtries := map[string]bool{}
-		var containsFallbackProjection func(string) (bool, error)
-		containsFallbackProjection = func(root string) (bool, error) {
-			if root == "" {
-				return false, nil
-			}
-			if contains, ok := fallbackSubtries[root]; ok {
-				return contains, nil
-			}
-			node, err := localizedInputSets.nodeAt(root)
-			if err != nil {
-				return false, err
-			}
-			contains := false
-			for _, entry := range node.Entries {
-				if entry.Slot == 0 && fallbackProjections[entry.ProducerID] != "" {
-					contains = true
-					break
-				}
-			}
-			if !contains {
-				for _, child := range node.Children {
-					childContains, err := containsFallbackProjection(child.ID)
-					if err != nil {
-						return false, err
-					}
-					if childContains {
-						contains = true
-						break
-					}
-				}
-			}
-			fallbackSubtries[root] = contains
-			return contains, nil
-		}
-		projectionMappers := map[string]*ActionPlanInputSetTargetStableMapper{}
-		originalCount := len(localized.Nodes)
-		for nodeIndex := 0; nodeIndex < originalCount; nodeIndex++ {
-			consumerID := localized.Nodes[nodeIndex].ID
-			original := originalNodes[consumerID]
-			dependencies := unionSets[reduction.structuralID[consumerID]]
-			recipe, recipeOK := reduction.plan.Recipes[original.Recipe]
-			projectedGenerator := recipeOK && len(recipe.ConfigProjectionPrefixes) != 0 && !dependencies.Opaque
-			if !preciseFamilyCompilerNode(reduction.plan, original, dependencies) && !projectedGenerator {
-				continue
-			}
-			var capsule ConfigCapsule
-			capsuleReady := false
-			for inputIndex := range localized.Nodes[nodeIndex].Inputs {
-				input := localized.Nodes[nodeIndex].Inputs[inputIndex]
-				if input.Slot != 0 || fallbackProjections[input.ProducerID] == "" {
-					continue
-				}
-				if !capsuleReady {
-					capsule, err = nodeCapsule(consumerID)
-					if err != nil {
-						return nil, err
-					}
-					capsuleReady = true
-				}
-				cloneID, err := cloneProjection(input.ProducerID, capsule)
-				if err != nil {
-					return nil, err
-				}
-				localized.Nodes[nodeIndex].Inputs[inputIndex].ProducerID = cloneID
-			}
-			root := localized.Nodes[nodeIndex].InputSet
-			containsFallback, err := containsFallbackProjection(root)
-			if err != nil {
-				return nil, fmt.Errorf("variant %s node %s fallback input set: %w", reduction.name, consumerID, err)
-			}
-			if !containsFallback {
-				continue
-			}
-			if !capsuleReady {
-				capsule, err = nodeCapsule(consumerID)
-				if err != nil {
-					return nil, err
-				}
-			}
-			mapper := projectionMappers[capsule.ID]
-			if mapper == nil {
-				mapper, err = localizedInputSets.newSelectiveTargetStableMapper(func(entry ActionPlanInputSetEntry) (ActionPlanInputSetEntry, error) {
-					if entry.Slot == 0 && fallbackProjections[entry.ProducerID] != "" {
-						cloneID, err := cloneProjection(entry.ProducerID, capsule)
-						if err != nil {
-							return ActionPlanInputSetEntry{}, err
-						}
-						entry.ProducerID = cloneID
-					}
-					return entry, nil
-				}, containsFallbackProjection)
-				if err != nil {
-					return nil, fmt.Errorf("variant %s capsule %s projection mapper: %w", reduction.name, capsule.ID, err)
-				}
-				projectionMappers[capsule.ID] = mapper
-			}
-			root, err = mapper.Map(root)
-			if err != nil {
-				return nil, fmt.Errorf("variant %s node %s projected input set: %w", reduction.name, consumerID, err)
-			}
-			localized.Nodes[nodeIndex].InputSet = root
 		}
 		sharedSourceMapper, err := localizedInputSets.NewTargetStableMapper(func(entry ActionPlanInputSetEntry) (ActionPlanInputSetEntry, error) {
 			if entry.SourceID == "" {
@@ -3741,12 +3566,9 @@ func buildValidatedActionPlanFamilyWithStats(
 				return nil, fmt.Errorf("variant %s node %s config-source input set: %w", reduction.name, node.ID, err)
 			}
 			if containsConfig {
-				capsule, ok := projectionCloneCapsules[node.ID]
-				if !ok {
-					capsule, err = nodeCapsule(node.ID)
-					if err != nil {
-						return nil, err
-					}
+				capsule, err := nodeCapsule(node.ID)
+				if err != nil {
+					return nil, err
 				}
 				mapper := capsuleMappers[capsule.ID]
 				if mapper == nil {
@@ -3772,9 +3594,9 @@ func buildValidatedActionPlanFamilyWithStats(
 					capsuleMappers[capsule.ID] = mapper
 				}
 				root, err = mapper.Map(root)
-			}
-			if err != nil {
-				return nil, fmt.Errorf("variant %s node %s localized input set: %w", reduction.name, node.ID, err)
+				if err != nil {
+					return nil, fmt.Errorf("variant %s node %s localized input set: %w", reduction.name, node.ID, err)
+				}
 			}
 			node.InputSet = root
 		}
@@ -3839,9 +3661,6 @@ func buildValidatedActionPlanFamilyWithStats(
 				nodePayloads[id] = slices.Clone(payloads[provisionalID])
 			}
 			family.Memberships[id] = append(family.Memberships[id], reduction.name)
-			if !originalNodeIDs[provisionalID] {
-				continue
-			}
 			original := originalNodes[provisionalID]
 			dependencies := unionSets[reduction.structuralID[provisionalID]]
 			dependencies = effectiveFamilyNodeConfigDependencies(reduction.plan, original, dependencies, reduction.hasConfigSource[original.ID])
@@ -4055,10 +3874,9 @@ func BuildActionPlanFamily(variants []ActionPlanFamilyVariant) (*ActionPlanFamil
 }
 
 // relocateFinalPreciseFamilyOutputs removes allocation salts left behind by
-// structural compatibility partitioning. A fallback config producer can be
-// config-specific during partitioning and then become one precise projection
-// during localization. Its compiler's private output paths must follow that
-// final input boundary too. Opaque nodes (including retained executions) keep
+// structural compatibility partitioning. Native config inputs become precise
+// per-consumer capsules during localization. Compiler private output paths must
+// follow that final input boundary too. Opaque nodes (including retained executions) keep
 // their original allocations; final node IDs still hash every actual path.
 func relocateFinalPreciseFamilyOutputs(original, localized *ActionPlan, structuralIDs map[string]string, unionSets map[string]ConfigDependencySet) error {
 	// This is only an identity view: share immutable catalogs and the persistent
@@ -4457,13 +4275,8 @@ func (f *ActionPlanFamily) validateRepresentation(stats *actionPlanFamilyValidat
 		if err := validatePlanDigest("config capsule ID", digest); err != nil {
 			return err
 		}
-		if len(files) != len(ResolvedConfigProjectionOutputs()) {
-			return fmt.Errorf("config capsule %s has %d projections, want %d", digest, len(files), len(ResolvedConfigProjectionOutputs()))
-		}
-		for _, pathname := range ResolvedConfigProjectionOutputs() {
-			if _, ok := files[pathname]; !ok {
-				return fmt.Errorf("config capsule %s is missing %q", digest, pathname)
-			}
+		if _, err := NativeConfigProjectionPaths(files); err != nil {
+			return fmt.Errorf("config capsule %s: %w", digest, err)
 		}
 		if actual := configCapsuleID(files); actual != digest {
 			return fmt.Errorf("config capsule ID %s does not match canonical content %s", digest, actual)

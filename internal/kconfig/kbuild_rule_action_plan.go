@@ -2269,9 +2269,9 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildExactGeneratedContentFrontie
 	if err != nil {
 		return false, err
 	}
-	configInputs := make(map[string]string, len(resolvedConfigProjections()))
-	for _, projection := range resolvedConfigProjections() {
-		configInputs[projection.output] = projection.input
+	configInputs := make(map[string]string, len(b.metadata.configProjectionPaths))
+	for _, pathname := range b.metadata.configProjectionPaths {
+		configInputs[pathname] = pathname
 	}
 	seenConfig := make(map[string]bool, len(configInputs))
 	seenDirect := make(map[string]bool, len(directSources))

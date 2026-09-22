@@ -4242,11 +4242,14 @@ func (p *kbuildTreeParser) parseIncludes(parser *kbuildParser, includes []Kbuild
 	baseDir := parser.baseDir
 	depth := parser.includeDepth + 1
 	for _, include := range includes {
-		includePath, ok := p.resolveInclude(include.Path, baseDir)
+		includePath, ok, err := p.resolveInclude(include.Path, baseDir)
+		if err != nil {
+			return err
+		}
 		if !ok {
 			continue
 		}
-		err := p.parseInto(parser, includePath, depth)
+		err = p.parseInto(parser, includePath, depth)
 		if err != nil {
 			if os.IsNotExist(err) && (include.Optional || (p.opts.ConfigVariablesComplete && generatedConfigMakeInclude(includePath))) {
 				continue
@@ -4306,16 +4309,101 @@ func (p *kbuildTreeParser) resolvePath(path, baseDir string) string {
 	return path
 }
 
-func (p *kbuildTreeParser) resolveInclude(path, baseDir string) (string, bool) {
+func (p *kbuildTreeParser) resolveInclude(path, baseDir string) (string, bool, error) {
 	expanded := p.expand(path)
 	if strings.Contains(expanded, "$") || expanded == "" {
-		return "", false
+		return "", false, nil
+	}
+	if p.opts.VirtualFileView != nil && p.opts.InvocationLocation != nil &&
+		!filepath.IsAbs(expanded) && !strings.HasPrefix(expanded, "__LINUX_BZL_OBJECT_TREE__/") &&
+		!strings.HasPrefix(expanded, "__LINUX_BZL_SOURCE_TREE__/") &&
+		expanded != "__LINUX_BZL_OBJECT_TREE__" && expanded != "__LINUX_BZL_SOURCE_TREE__" {
+		location := p.opts.InvocationLocation
+		relative := filepath.ToSlash(filepath.Clean(filepath.Join(location.Directory, expanded)))
+		if relative == "." || relative == ".." || strings.HasPrefix(relative, "../") {
+			return "", false, fmt.Errorf("Kbuild relative include %q escapes the invocation tree", expanded)
+		}
+		switch location.Tree {
+		case CompactKbuildInvocationObjectTree:
+			objectPath := "__LINUX_BZL_OBJECT_TREE__/" + relative
+			// Relative includes use the same selected frontier as $(file <...)
+			// and parse-time shell reads. An absent object file must never fall
+			// through to a stale physical file in the worker's object directory.
+			sourcePath, source := p.immutableSourceIncludePath(relative)
+			if !source {
+				return objectPath, true, nil
+			}
+			_, exists, _, err := p.opts.VirtualFileView.Read(objectPath)
+			if err != nil || exists {
+				return objectPath, true, nil
+			}
+			return sourcePath, true, nil
+		case CompactKbuildInvocationSourceTree:
+			return "__LINUX_BZL_SOURCE_TREE__/" + relative, true, nil
+		default:
+			return "", false, fmt.Errorf("Kbuild relative include %q has unknown invocation tree %q", expanded, location.Tree)
+		}
 	}
 	if p.opts.VirtualFileView != nil &&
 		(expanded == "__LINUX_BZL_OBJECT_TREE__" || strings.HasPrefix(expanded, "__LINUX_BZL_OBJECT_TREE__/")) {
-		return expanded, true
+		return expanded, true, nil
 	}
-	return p.resolvePath(expanded, baseDir), true
+	return p.resolvePath(expanded, baseDir), true, nil
+}
+
+// Only a declared source root can satisfy a relative include absent from the
+// selected object frontier. The normal in-tree invocation aliases source and
+// object to one immutable physical source tree; a distinct mutable object root
+// cannot supply source bytes through its path or a symlink.
+func (p *kbuildTreeParser) immutableSourceIncludePath(relative string) (string, bool) {
+	logical := "__LINUX_BZL_SOURCE_TREE__/" + relative
+	candidate, mapped := mappedSourceRootPath(logical, p.opts.SourceRoots)
+	if !mapped {
+		return "", false
+	}
+	candidate, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", false
+	}
+	resolved, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return "", false
+	}
+	objectRoot := p.opts.SourceRoots["__LINUX_BZL_OBJECT_TREE__"]
+	sourceRoot := ""
+	sourceAliasLength := 0
+	for alias, root := range p.opts.SourceRoots {
+		if (logical == alias || strings.HasPrefix(logical, alias+"/")) && len(alias) > sourceAliasLength {
+			sourceRoot = root
+			sourceAliasLength = len(alias)
+		}
+	}
+	if sourceRoot == "" {
+		return "", false
+	}
+	if objectRoot != "" {
+		objectRoot, err = filepath.Abs(objectRoot)
+		if err != nil {
+			return "", false
+		}
+		sourceRoot, err = filepath.Abs(sourceRoot)
+		if err != nil {
+			return "", false
+		}
+		resolvedObjectRoot, objectErr := filepath.EvalSymlinks(objectRoot)
+		resolvedSourceRoot, sourceErr := filepath.EvalSymlinks(sourceRoot)
+		if objectErr != nil || sourceErr != nil {
+			return "", false
+		}
+		if resolvedObjectRoot != resolvedSourceRoot &&
+			(kbuildPathBelowRoot(candidate, objectRoot) || kbuildPathBelowRoot(resolved, resolvedObjectRoot)) {
+			return "", false
+		}
+	}
+	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+		return candidate, true
+	}
+	return "", false
 }
 
 func (p *kbuildTreeParser) expand(value string) string {

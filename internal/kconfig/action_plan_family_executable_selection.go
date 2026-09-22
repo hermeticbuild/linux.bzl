@@ -37,8 +37,10 @@ func addInitialFamilyExecutableGroupsWithUsage(
 		finalNodes[node.ID] = node
 	}
 	configPaths := map[string]bool{}
-	for _, projection := range resolvedConfigProjections() {
-		configPaths[projection.output] = true
+	for _, variant := range variants {
+		for pathname := range variant.Snapshot.ConfigFiles {
+			configPaths[pathname] = true
+		}
 	}
 	roots := map[ActionPlanFamilyExecutionCutRoot]bool{}
 	// Only the primary header frontier may admit an otherwise opaque consumer.

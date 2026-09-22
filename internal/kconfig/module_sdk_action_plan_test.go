@@ -300,7 +300,8 @@ func TestModuleSDKOrdersMirroredHostPrepWritersBySourceNativeProducer(t *testing
 	seedModuleSDKSymversForTest(t, plan)
 	seedModuleSDKVmlinuxForTest(t, plan)
 	seedModuleSDKReleaseForTest(t, plan)
-	if err := (&CompactMetadata{Config: CompactConfig{}}).appendModuleSDKActionPlanNodes(plan); err != nil {
+	if err := (&CompactMetadata{
+		Config: CompactConfig{}}).appendModuleSDKActionPlanNodes(plan); err != nil {
 		t.Fatalf("source ordered host mirrors cannot publish module SDK: %v", err)
 	}
 	projection := moduleSDKProjectionNodeForTest(t, plan, destination)
@@ -344,7 +345,8 @@ func TestModuleSDKOrdersMirroredHostPrepWritersBySourceNativeProducer(t *testing
 	seedModuleSDKSymversForTest(t, unsafe)
 	seedModuleSDKVmlinuxForTest(t, unsafe)
 	seedModuleSDKReleaseForTest(t, unsafe)
-	if err := (&CompactMetadata{Config: CompactConfig{}}).appendModuleSDKActionPlanNodes(unsafe); err == nil || !strings.Contains(err.Error(), "claimed by") {
+	if err := (&CompactMetadata{
+		Config: CompactConfig{}}).appendModuleSDKActionPlanNodes(unsafe); err == nil || !strings.Contains(err.Error(), "claimed by") {
 		t.Fatalf("unowned prep copy was source-ordered without provenance: %v", err)
 	}
 }

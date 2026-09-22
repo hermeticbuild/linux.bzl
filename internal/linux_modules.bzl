@@ -261,7 +261,7 @@ def _source_prefix(sdk):
 
 def _planner_inputs(sdk, staged, extra = []):
     direct = [
-        sdk.config,
+        sdk.config_tree,
         sdk.host_deps,
         sdk.host_kconfig_probe_results,
         sdk.host_pkg_config_manifest,
@@ -283,7 +283,7 @@ def _add_planner_contract_args(args, sdk, staged):
     args.add("-root", sdk.source_root)
     args.add("-srctree", sdk.source_root)
     args.add("-kbuild", sdk.kbuild)
-    _add_artifact_path(args, "-resolve_config", sdk.config)
+    _add_artifact_path(args, "-native_config", sdk.config_tree)
     args.add("-kernel_version", sdk.version)
     _add_artifact_path(args, "-target_toolset_identity", sdk.target_toolset_identity)
     _add_artifact_path(args, "-host_toolset_identity", sdk.host_toolset_identity)
@@ -469,13 +469,8 @@ def _map_external_plan(ctx, sdk, plans, staged):
         "target_toolset_identity": sdk.target_toolset_identity,
     }
     additional_inputs = {
-        "auto_conf": sdk.auto_conf,
-        "auto_conf_cmd": sdk.auto_conf_cmd,
-        "autoconf": sdk.autoconf,
         "kernel_release": sdk.kernel_release,
-        "resolved_config": sdk.config,
         "rust_source_files": sdk.rust_source_files,
-        "rustc_cfg": sdk.rustc_cfg,
         "source_files": sdk.source,
         "source_root": sdk.source_root,
     }

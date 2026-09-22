@@ -116,7 +116,7 @@ func TestRunScriptRequiresStaticStagedSourceAssignments(t *testing.T) {
 	if err := os.WriteFile(script, []byte("#!/bin/sh\n. \"$1\"\nprintf '%s' \"$CONFIG_SAFE\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(assignments, []byte("CONFIG_SAFE=enabled\n"), 0o600); err != nil {
+	if err := os.WriteFile(assignments, []byte("#\n# Automatically generated file; DO NOT EDIT.\n#\n\nCONFIG_SAFE=enabled\nCONFIG_EMPTY=\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var stdout bytes.Buffer

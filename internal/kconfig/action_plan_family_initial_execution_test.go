@@ -452,19 +452,19 @@ func TestActionPlanFamilyInitialExecutionExcludesConfigProjectionAliases(t *test
 	if err != nil || len(initial.Cut.Roots()) != 0 {
 		t.Fatalf("config projection alias acquired observed-source authority: %v %v", initial, err)
 	}
-	for _, projection := range resolvedConfigProjections() {
+	for _, projection := range recognizedConfigDocuments() {
 		plan := snapshotActionPlan(snapshot)
 		for index := range plan.Nodes {
 			if plan.Nodes[index].ID == demand.ProducerNodeID {
-				plan.Nodes[index].Outputs[0].Path = projection.output
+				plan.Nodes[index].Outputs[0].Path = projection
 			}
 		}
 		changed := initialExecutionSnapshotFromPlanForTest(t, plan, snapshot.ConfigFiles)
-		projectionDemand := initialExecutionDemandForTest(t, changed, projection.output)
+		projectionDemand := initialExecutionDemandForTest(t, changed, projection)
 		initial, err := NewActionPlanFamilyInitialExecution([]ActionPlanFamilyVariant{{Name: "base", Snapshot: changed}},
 			map[string]ConfigDependencyGeneratedHeaderDemandCollection{"base": {Enabled: true, Demands: []ConfigDependencyGeneratedHeaderDemand{projectionDemand}}})
 		if err != nil || len(initial.Cut.Roots()) != 0 {
-			t.Fatalf("config output %s acquired observed-source authority: %v %v", projection.output, initial, err)
+			t.Fatalf("config output %s acquired observed-source authority: %v %v", projection, initial, err)
 		}
 	}
 }

@@ -11,10 +11,34 @@ UTS_MACHINE := x86_64
 endif
 KCONFIG_CONFIG ?= .config
 
+# Use Linux's source-selected host-tool graph for the real config serializer.
+# Ordinary fixture objects read its auto.conf at Make's include boundary.
+export srcroot := $(srctree)
+export SRCARCH KCONFIG_CONFIG
+export KBUILD_HOSTCFLAGS := -O2 -I $(srctree)/scripts/include
+export KBUILD_HOSTLDFLAGS :=
+export KBUILD_HOSTLDLIBS :=
+# Native Kconfig records this exported source query in auto.conf.cmd. The
+# ordinary image parse must compare its measured value before selecting rules.
+CC_VERSION_TEXT = $(subst $(pound),,$(shell LC_ALL=C $(CC) --version 2>/dev/null | head -n 1))
+export CC_VERSION_TEXT
+include $(srctree)/scripts/Kbuild.include
+ifneq ($(filter %config,$(MAKECMDGOALS)),)
+.PHONY: syncconfig olddefconfig scripts_basic FORCE
+syncconfig olddefconfig: scripts_basic
+	$(MAKE) $(build)=scripts/kconfig $@
+scripts_basic:
+	$(MAKE) $(build)=scripts/basic
+FORCE:
+else
+-include include/config/auto.conf
+include include/config/auto.conf.cmd
+
 NOSTDINC_FLAGS := -nostdinc
 LINUXINCLUDE := -I$(srctree)/include -include $(srctree)/include/linux/compiler-version.h -include $(srctree)/include/linux/kconfig.h
 KBUILD_CPPFLAGS := -D__KERNEL__
 KBUILD_CFLAGS := -std=gnu11 -fno-common -fno-PIE
+KBUILD_CFLAGS += -Wframe-larger-than=$(CONFIG_FRAME_WARN)
 KBUILD_AFLAGS := -D__ASSEMBLY__ -fno-PIE
 KBUILD_LDFLAGS :=
 cmd_cc_o_c = $(CC) $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS) -c -o $@ $<
@@ -71,8 +95,13 @@ $(external_modules_order): $(external_module_object)
 $(external_module_symvers): $(external_module_output)
 	: > $@
 else
-.PHONY: all
-all: vmlinux modules.builtin modules.builtin.modinfo kernel
+.PHONY: all prepare
+prepare: include/config/kernel.release
+
+include/config/kernel.release:
+	mkdir -p $(dir $@); printf '%s\n' '$(VERSION).$(PATCHLEVEL).$(SUBLEVEL)' > $@
+
+all: prepare vmlinux modules.builtin modules.builtin.modinfo kernel
 
 .vmlinux.unstripped: scripts/link-vmlinux.sh smoke.o dollar_smoke.o numeric_smoke.o pending_left.o pending_right.o literal_hint.o host-result host-path-probe include/generated/mapped_offsets.h
 	+$(call if_changed,link_vmlinux)
@@ -85,4 +114,6 @@ modules.builtin modules.builtin.modinfo:
 
 kernel: vmlinux
 	cp $< $@
+endif
+
 endif

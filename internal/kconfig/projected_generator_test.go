@@ -786,43 +786,29 @@ func projectedGeneratorPlanForTest(t testing.TB, used, other string) (*ActionPla
 		Recipes:  map[string]ActionRecipe{},
 		metadata: metadata,
 	}
-	configCopyRecipe := ActionRecipe{
-		Schema: LinuxKernelPlanSchema, Kind: "copy", Tool: "actionfile",
-		Arguments: []string{"-input", "${source:input:00000000}", "-out", "${output:00000000}"},
-		Sources:   []string{"input:00000000"}, Outputs: []string{"00000000"},
-	}
-	configCopy, err := appendActionPlanNode(plan, ActionPlanNode{
-		Stage: "prep", Kind: "copy", Tool: "actionfile", Product: "sdk",
-		Sources: []ActionPlanSourceEdge{{Role: "input", SourceID: "src-00000003"}},
-		Outputs: []ActionPlanOutput{{Tree: "prep", Path: ".config"}},
-	}, configCopyRecipe)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	generatorRecipe := ActionRecipe{
 		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "awk",
 		Arguments: []string{
 			"-f", "${source:script:00000000}",
-			"${source:features:00000001}", "${input:config:00000000}",
+			"${source:features:00000001}", "${source:config:00000002}",
 		},
 		WorkingDirectory: "feature-masks",
 		WorkingInputs: map[string]string{
 			"source:script:00000000":   "arch/x86/tools/cpufeaturemasks.awk",
 			"source:features:00000001": "arch/x86/include/asm/cpufeatures.h",
-			"input:config:00000000":    ".config",
+			"source:config:00000002":   ".config",
 		},
-		Sources: []string{"script:00000000", "features:00000001"},
-		Inputs:  []string{"config:00000000"}, Outputs: []string{"00000000"},
-		Stdout: "00000000",
+		Sources: []string{"script:00000000", "features:00000001", "config:00000002"},
+		Outputs: []string{"00000000"},
+		Stdout:  "00000000",
 	}
 	generator, err := appendActionPlanNode(plan, ActionPlanNode{
 		Stage: "prep", Kind: "generate", Tool: "awk", Product: "sdk",
 		Sources: []ActionPlanSourceEdge{
 			{Role: "script", SourceID: "src-00000001"},
 			{Role: "features", SourceID: "src-00000002"},
+			{Role: "config", SourceID: "src-00000003"},
 		},
-		Inputs:  []ActionPlanNodeEdge{{Role: "config", ProducerID: configCopy, Slot: 0}},
 		Outputs: []ActionPlanOutput{{Tree: "prep", Path: projectedGeneratorTestTarget}},
 	}, generatorRecipe)
 	if err != nil {
@@ -993,7 +979,7 @@ func BenchmarkProjectedGeneratorSnapshotLowering(b *testing.B) {
 
 func TestProjectedGeneratorCandidateIsAbsentFromOrdinaryPlanIdentity(t *testing.T) {
 	plan, generatorID, _ := projectedGeneratorPlanForTest(t, "y", "n")
-	if got, want := len(plan.Nodes), 3; got != want {
+	if got, want := len(plan.Nodes), 2; got != want {
 		t.Fatalf("ordinary candidate node count = %d, want %d", got, want)
 	}
 	generator := projectedGeneratorNodeForTest(t, plan, generatorID)
@@ -1039,7 +1025,7 @@ func TestProjectedGeneratorSnapshotLoweringBuildsDifferentialGraph(t *testing.T)
 	if err := lowerProjectedGeneratorsForFamilySnapshot(plan); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := len(plan.Nodes), 6; got != want {
+	if got, want := len(plan.Nodes), 5; got != want {
 		t.Fatalf("lowered node count = %d, want %d", got, want)
 	}
 	raw := projectedGeneratorNodeForTest(t, plan, generatorID)
@@ -1120,24 +1106,23 @@ func TestProjectedGeneratorSnapshotLoweringBuildsDifferentialGraph(t *testing.T)
 func TestProjectedGeneratorSnapshotLoweringUsesAndRewritesPersistentInputSets(t *testing.T) {
 	plan, generatorID, consumerID := projectedGeneratorPlanForTest(t, "y", "n")
 	generator := projectedGeneratorNodeForTest(t, plan, generatorID)
-	configInput := generator.Inputs[0]
+	configSource := generator.Sources[2]
 	store, err := plan.planningActionPlanInputSetStore()
 	if err != nil {
 		t.Fatal(err)
 	}
 	generator.InputSet, err = store.Insert(generator.InputSet, ActionPlanInputSetEntry{
-		Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: ".config"},
-		ProducerID: configInput.ProducerID,
-		Slot:       configInput.Slot,
+		Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: ".config"},
+		SourceID: configSource.SourceID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	generator.Inputs = nil
+	generator.Sources = slices.Clone(generator.Sources[:2])
 	generatorRecipe := plan.Recipes[generator.Recipe]
 	generatorRecipe.Arguments[len(generatorRecipe.Arguments)-1] = ".config"
-	generatorRecipe.Inputs = nil
-	delete(generatorRecipe.WorkingInputs, "input:config:00000000")
+	generatorRecipe.Sources = slices.Clone(generatorRecipe.Sources[:2])
+	delete(generatorRecipe.WorkingInputs, "source:config:00000002")
 	plan.Recipes[generator.Recipe] = generatorRecipe
 
 	consumer := projectedGeneratorNodeForTest(t, plan, consumerID)
@@ -1197,7 +1182,7 @@ func TestProjectedGeneratorSnapshotLoweringOnlyProjectsCanonicalOverwriteWinner(
 	// retained at an immutable private ArtifactPath, while the final writer owns
 	// the canonical logical header.  Both were recognized as projection
 	// candidates before overwrite ownership was assigned.
-	plan.Nodes = slices.Clone(plan.Nodes[:1])
+	plan.Nodes = nil
 	plan.invalidateLookupIndexes()
 	historicalNode := originalGenerator
 	historicalNode.ID = ""
@@ -1242,7 +1227,7 @@ func TestProjectedGeneratorSnapshotLoweringOnlyProjectsCanonicalOverwriteWinner(
 	if err := lowerProjectedGeneratorsForFamilySnapshot(plan); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := len(plan.Nodes), 8; got != want {
+	if got, want := len(plan.Nodes), 7; got != want {
 		t.Fatalf("lowered overwrite node count = %d, want %d", got, want)
 	}
 	if got, want := len(plan.projectedGeneratorValidations), 1; got != want {
@@ -1428,24 +1413,12 @@ func TestProjectedGeneratorFamilyReusesProjectionAcrossIrrelevantConfig(t *testi
 		}
 	}
 
-	producers := make(map[string]ActionPlanNode, len(family.Nodes))
 	sources := make(map[string]ActionPlanSource, len(family.Sources))
-	for _, node := range family.Nodes {
-		producers[node.ID] = node
-	}
 	for _, source := range family.Sources {
 		sources[source.ID] = source
 	}
 	projected := nodes.raw[0]
-	if len(projected.Inputs) != 1 {
-		t.Fatalf("projected generator inputs = %#v, want one capsule-backed .config", projected.Inputs)
-	}
-	projectionCopy := producers[projected.Inputs[0].ProducerID]
-	if projectionCopy.Kind != "copy" || len(projectionCopy.Sources) != 1 ||
-		!slices.Equal(family.Memberships[projectionCopy.ID], wantShared) {
-		t.Fatalf("projected config clone = %#v memberships=%q", projectionCopy, family.Memberships[projectionCopy.ID])
-	}
-	projectedSource := sources[projectionCopy.Sources[0].SourceID]
+	projectedSource := sources[projected.Sources[2].SourceID]
 	digest, projectionPath, ok := strings.Cut(projectedSource.Path, "/")
 	if projectedSource.Namespace != "capsule" || !ok || projectionPath != ".config" {
 		t.Fatalf("projected config source = %#v", projectedSource)
@@ -1456,14 +1429,7 @@ func TestProjectedGeneratorFamilyReusesProjectionAcrossIrrelevantConfig(t *testi
 	}
 
 	for _, full := range nodes.full {
-		if len(full.Inputs) != 1 {
-			t.Fatalf("full replay inputs = %#v, want full .config copy", full.Inputs)
-		}
-		copyNode := producers[full.Inputs[0].ProducerID]
-		if len(copyNode.Sources) != 1 {
-			t.Fatalf("full replay config copy = %#v", copyNode)
-		}
-		source := sources[copyNode.Sources[0].SourceID]
+		source := sources[full.Sources[2].SourceID]
 		fullDigest, projection, ok := strings.Cut(source.Path, "/")
 		if source.Namespace != "capsule" || !ok || projection != ".config" {
 			t.Fatalf("full replay config source = %#v", source)

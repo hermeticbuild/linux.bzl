@@ -2146,7 +2146,7 @@ func TestExactGeneratedContentWithClosureOnlyConfigWriterKeepsConservativeFinalA
 	const (
 		target       = "include/generated/measured.h"
 		source       = "kernel/time/timeconst.bc"
-		configInput  = "auto.conf"
+		configInput  = "include/config/auto.conf"
 		configOutput = "include/config/auto.conf"
 	)
 	prepProfile := CompactKbuildProfile{
@@ -2178,12 +2178,12 @@ func TestExactGeneratedContentWithClosureOnlyConfigWriterKeepsConservativeFinalA
 	}
 	plan := &ActionPlan{}
 	configSourceIDs := map[string]string{}
-	for _, projection := range resolvedConfigProjections() {
-		sourceID, sourceErr := ensureActionPlanSource(plan, "config", projection.input)
+	for _, projection := range recognizedConfigDocuments() {
+		sourceID, sourceErr := ensureActionPlanSource(plan, "config", projection)
 		if sourceErr != nil {
 			t.Fatal(sourceErr)
 		}
-		configSourceIDs[projection.input] = sourceID
+		configSourceIDs[projection] = sourceID
 	}
 	projection := ActionPlanNode{
 		ID: strings.Repeat("a", 64), Stage: "prep", Kind: "copy", Tool: "actionfile", Product: "sdk",
@@ -2196,7 +2196,7 @@ func TestExactGeneratedContentWithClosureOnlyConfigWriterKeepsConservativeFinalA
 		t.Fatal(err)
 	}
 	direct := []compactKbuildRuleInput{{path: source, sourceID: sourceID}}
-	builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{}, plan).
+	builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{configProjectionPaths: recognizedConfigDocuments()}, plan).
 		withSelectionGraph(graph).
 		forSelection(consumerKey, profile).
 		forOutput("target", "objects", "sdk")
@@ -4287,9 +4287,7 @@ func TestConfiguredRustCommandUsesGenericRuleLowering(t *testing.T) {
 		target = "tools/demo.o"
 		source = "tools/demo.rs"
 	)
-	metadata := &CompactMetadata{
-		actionRoles: testScopedActionRoles("rustc"),
-	}
+	metadata := &CompactMetadata{actionRoles: testScopedActionRoles("rustc")}
 
 	for _, test := range []struct {
 		name, stage, tree, product, scope, variable string
@@ -4735,9 +4733,7 @@ func TestHermeticCompilerScriptsProjectRustOutDirAndDepfile(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			metadata := &CompactMetadata{
-				actionRoles: testScopedActionRoles(append(testConfiguredActionRoles, "rustc")...),
-			}
+			metadata := &CompactMetadata{actionRoles: testScopedActionRoles(append(testConfiguredActionRoles, "rustc")...)}
 			plan := &ActionPlan{
 				Toolsets: map[string]string{
 					"host": actionPlanTestProbeIdentity, "target": actionPlanTestProbeIdentity,
@@ -4916,11 +4912,12 @@ tools/result: tools/input.rs FORCE
 	$(call if_changed,build)
 `, test.variables)
 			profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
-			metadata := &CompactMetadata{actionRoles: []KbuildActionRoleRef{
-				{Scope: "host", Role: "cc"},
-				{Scope: "target", Role: "cc"},
-				{Scope: "target", Role: "rustc"},
-			}}
+			metadata := &CompactMetadata{
+				actionRoles: []KbuildActionRoleRef{
+					{Scope: "host", Role: "cc"},
+					{Scope: "target", Role: "cc"},
+					{Scope: "target", Role: "rustc"},
+				}}
 			plan := &ActionPlan{
 				Toolsets: map[string]string{
 					"host": actionPlanTestProbeIdentity, "target": actionPlanTestProbeIdentity,
@@ -6697,12 +6694,12 @@ lib/crc/gen_crc32table: lib/crc/gen_crc32table.c FORCE
 	}); err != nil {
 		t.Fatal(err)
 	}
-	metadata := &CompactMetadata{
+	metadata := &CompactMetadata{configProjectionPaths: recognizedConfigDocuments(),
 		actionRoles: testHostActionRoles("cc"),
 		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
 	}
 	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
-	configSource, err := ensureActionPlanSource(plan, "config", "autoconf.h")
+	configSource, err := ensureActionPlanSource(plan, "config", "include/generated/autoconf.h")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6854,7 +6851,7 @@ cmd_cc_s_c = $(CC) $(filter-out $(DEBUG_CFLAGS) $(CC_FLAGS_LTO), $(c_flags)) -fv
 		ID: strings.Repeat("d", 64), Stage: "prep", Kind: "generate", Tool: "actionfile", Product: "sdk",
 		Outputs: []ActionPlanOutput{{Tree: "prep", Path: unrelated}},
 	}
-	metadata := &CompactMetadata{actionRoles: testScopedActionRoles("cc")}
+	metadata := &CompactMetadata{configProjectionPaths: recognizedConfigDocuments(), actionRoles: testScopedActionRoles("cc")}
 	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
 	configSourceID, err := ensureActionPlanSource(plan, "config", configInput)
 	if err != nil {
@@ -6933,7 +6930,7 @@ cmd_cc_s_c = $(CC) $(filter-out $(DEBUG_CFLAGS) $(CC_FLAGS_LTO), $(c_flags)) -fv
 
 func TestKbuildWorkingTreeClosureRebasesSelectedUnmaterializedConfigProjection(t *testing.T) {
 	const (
-		configInput  = "auto.conf"
+		configInput  = "include/config/auto.conf"
 		configOutput = "include/config/auto.conf"
 		consumer     = "scripts/mod/empty.o"
 	)
@@ -6980,7 +6977,7 @@ func TestKbuildWorkingTreeClosureRebasesSelectedUnmaterializedConfigProjection(t
 			consumerKey := compactKbuildSelectionKey{
 				profile: consumerProfile.Name, target: consumer, stage: stage,
 			}
-			builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{}, plan).
+			builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{configProjectionPaths: recognizedConfigDocuments()}, plan).
 				withSelectionGraph(graph).
 				forSelection(consumerKey, consumerProfile).
 				forOutput(stage, stage, "sdk")
@@ -7007,7 +7004,7 @@ func TestKbuildWorkingTreeClosureRebasesSelectedUnmaterializedConfigProjection(t
 
 func TestKbuildWorkingTreeClosurePrefersMaterializedConfigProjectionForPrepAndTarget(t *testing.T) {
 	const (
-		configInput  = "auto.conf"
+		configInput  = "include/config/auto.conf"
 		configOutput = "include/config/auto.conf"
 		consumer     = "include/generated/timeconst.h"
 	)
@@ -7058,7 +7055,7 @@ func TestKbuildWorkingTreeClosurePrefersMaterializedConfigProjectionForPrepAndTa
 			consumerKey := compactKbuildSelectionKey{
 				profile: consumerProfile.Name, target: consumer, stage: stage,
 			}
-			builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{}, plan).
+			builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{configProjectionPaths: recognizedConfigDocuments()}, plan).
 				withSelectionGraph(graph).
 				forSelection(consumerKey, consumerProfile).
 				forOutput(stage, stage, "sdk")
@@ -7078,7 +7075,7 @@ func TestKbuildWorkingTreeClosurePrefersMaterializedConfigProjectionForPrepAndTa
 }
 
 func TestKbuildWorkingTreeClosureUsesConfigSourceWhenNoWriterIsSelected(t *testing.T) {
-	for _, projection := range resolvedConfigProjections() {
+	for _, projection := range recognizedConfigDocuments() {
 		projection := projection
 		for _, test := range []struct {
 			stage     string
@@ -7088,7 +7085,7 @@ func TestKbuildWorkingTreeClosureUsesConfigSourceWhenNoWriterIsSelected(t *testi
 			{stage: "prep", lifecycle: "prep", scope: "target"},
 			{stage: "target", lifecycle: "target", scope: "target"},
 		} {
-			t.Run(test.stage+"/"+strings.ReplaceAll(projection.output, "/", "_"), func(t *testing.T) {
+			t.Run(test.stage+"/"+strings.ReplaceAll(projection, "/", "_"), func(t *testing.T) {
 				stage := test.stage
 				consumer := "consumer-" + stage
 				profile := CompactKbuildProfile{
@@ -7105,11 +7102,11 @@ func TestKbuildWorkingTreeClosureUsesConfigSourceWhenNoWriterIsSelected(t *testi
 					t.Fatal(err)
 				}
 				plan := &ActionPlan{}
-				sourceID, err := ensureActionPlanSource(plan, "config", projection.input)
+				sourceID, err := ensureActionPlanSource(plan, "config", projection)
 				if err != nil {
 					t.Fatal(err)
 				}
-				builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{}, plan).
+				builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{configProjectionPaths: recognizedConfigDocuments()}, plan).
 					withSelectionGraph(graph).
 					forSelection(compactKbuildSelectionKey{
 						profile: profile.Name, target: consumer, stage: stage,
@@ -7123,8 +7120,8 @@ func TestKbuildWorkingTreeClosureUsesConfigSourceWhenNoWriterIsSelected(t *testi
 					t.Fatalf("working-tree inputs = %#v, want one source-backed config projection", inputs)
 				}
 				input := inputs[0]
-				if input.path != projection.output || input.sourceID != sourceID || input.producer != "" || !input.objectTree || !input.workingOnly {
-					t.Fatalf("source-backed config projection = %#v, want config/%s at %s", input, projection.input, projection.output)
+				if input.path != projection || input.sourceID != sourceID || input.producer != "" || !input.objectTree || !input.workingOnly {
+					t.Fatalf("source-backed config projection = %#v, want config/%s at %s", input, projection, projection)
 				}
 			})
 		}
@@ -7157,9 +7154,10 @@ func TestGenericKbuildRuleDoesNotConflictWithItsOtherMatchingTargetPattern(t *te
 $(obj)/relocs_%.o $(obj)/relocs%2.o: FORCE
 	$(call if_changed,$*)
 `, map[string]string{"obj": "arch/x86/tools"})
-	metadata := &CompactMetadata{Config: CompactConfig{
-		KbuildProfiles: []CompactKbuildProfile{profile},
-	}}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{profile},
+		}}
 
 	match, ok, err := metadata.compactKbuildRuleForProfile(profile, target)
 	if err != nil {
@@ -7184,9 +7182,10 @@ $(obj)/%.o: $(src)/%.c FORCE
 $(host-cobjs): $(obj)/%.o: $(obj)/%.c FORCE
 	$(call if_changed_dep,host-cobjs)
 `, map[string]string{"obj": "arch/x86/tools", "src": "arch/x86/tools"})
-	metadata := &CompactMetadata{Config: CompactConfig{
-		KbuildProfiles: []CompactKbuildProfile{profile},
-	}}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{profile},
+		}}
 
 	match, ok, err := metadata.compactKbuildRuleForProfile(profile, target)
 	if err != nil {
@@ -7213,9 +7212,10 @@ $(host-cobjs): $(obj)/%.o: $(obj)/%.c FORCE
 	$(call if_changed_dep,host-cobjs)
 `, map[string]string{"obj": "arch/x86/tools", "src": "arch/x86/tools"})
 	profile = compactKbuildProfileWithSourcesForTest(t, profile, "arch/x86/tools/relocs_32.c")
-	metadata := &CompactMetadata{Config: CompactConfig{
-		KbuildProfiles: []CompactKbuildProfile{profile},
-	}}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{profile},
+		}}
 
 	match, ok, err := metadata.compactKbuildRuleForProfile(profile, target)
 	if err != nil {
@@ -9216,7 +9216,7 @@ func TestKbuildThinArchiveClosureExcludesIncidentalConfigSource(t *testing.T) {
 	memberSourceID := "src-member"
 	plan := &ActionPlan{
 		Sources: []ActionPlanSource{
-			{ID: configSourceID, Namespace: "config", Path: "auto.conf"},
+			{ID: configSourceID, Namespace: "config", Path: "include/config/auto.conf"},
 			{ID: memberSourceID, Namespace: "kernel", Path: sourceMemberPath},
 		},
 		Recipes: map[string]ActionRecipe{},
@@ -9255,7 +9255,7 @@ func TestKbuildThinArchiveClosureExcludesIncidentalConfigSource(t *testing.T) {
 	if err := plan.markPathSensitiveArchiveOutput(archiveProducer, 0); err != nil {
 		t.Fatal(err)
 	}
-	builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{}, plan)
+	builder := newCompactKbuildRulePlanBuilder(&CompactMetadata{configProjectionPaths: recognizedConfigDocuments()}, plan)
 	inputs, pathSensitive, err := builder.compactKbuildPathSensitiveArchiveClosureInputs(
 		consumer,
 		CompactKbuildProfile{Name: "build:root", Path: "Makefile"},
@@ -9880,11 +9880,11 @@ dummy := y
 	if err != nil {
 		t.Fatal(err)
 	}
-	configSourceID, err := ensureActionPlanSource(plan, "config", "autoconf.h")
+	configSourceID, err := ensureActionPlanSource(plan, "config", "include/generated/autoconf.h")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ambientConfigSourceID, err := ensureActionPlanSource(plan, "config", "auto.conf.cmd")
+	ambientConfigSourceID, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf.cmd")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -10220,7 +10220,7 @@ dummy := y
 	if err != nil {
 		t.Fatal(err)
 	}
-	singleConfig, err := ensureActionPlanSource(singlePlan, "config", "autoconf.h")
+	singleConfig, err := ensureActionPlanSource(singlePlan, "config", "include/generated/autoconf.h")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -11085,7 +11085,7 @@ scripts/basic/fixdep: scripts/basic/fixdep.c FORCE
 	if err != nil {
 		t.Fatal(err)
 	}
-	ambientID, err := ensureActionPlanSource(plan, "config", "auto.conf.cmd")
+	ambientID, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf.cmd")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -11757,9 +11757,7 @@ cmd_postprocess = $(RUSTC) --emit=obj=$@ $<; $(OBJCOPY) --remove-section=.discar
 	}
 	targetKey := compactKbuildSelectionKey{profile: profile.Name, target: target, stage: "target"}
 	builder := newCompactKbuildRulePlanBuilder(
-		&CompactMetadata{
-			actionRoles: testScopedActionRoles(append(testConfiguredActionRoles, "rustc")...),
-		}, plan,
+		&CompactMetadata{actionRoles: testScopedActionRoles(append(testConfiguredActionRoles, "rustc")...)}, plan,
 	).
 		withSelectionGraph(graph).
 		forSelection(targetKey, profile).
@@ -11940,9 +11938,10 @@ func TestGenericKbuildSourceEvidenceRespectsProfileBinding(t *testing.T) {
 	withSource := mustCompactKbuildProfileForTest(t, "build:with-source", "scripts/Makefile.build", "", "", nil)
 	withSource = compactKbuildProfileWithSourcesForTest(t, withSource, source)
 	withoutSource := mustCompactKbuildProfileForTest(t, "build:without-source", "scripts/Makefile.build", "", "", nil)
-	metadata := &CompactMetadata{Config: CompactConfig{
-		KbuildProfiles: []CompactKbuildProfile{withoutSource, withSource},
-	}}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{withoutSource, withSource},
+		}}
 
 	unbound := newCompactKbuildRulePlanBuilder(metadata, &ActionPlan{})
 	if exists, err := unbound.sourcePathExists(source); err != nil || exists {
@@ -12404,9 +12403,10 @@ install_headers: $(objtree)/tools/objtool/libsubcmd/include/subcmd/exec-cmd.h
 	// Model an external-module SDK that already contains this path while the
 	// module's prep graph deliberately replaces it with an exact producer.
 	profile = compactKbuildProfileWithSourcesForTest(t, profile, prerequisite)
-	metadata := &CompactMetadata{Config: CompactConfig{
-		KbuildProfiles: []CompactKbuildProfile{profile},
-	}}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{profile},
+		}}
 	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
 	wantProducer := appendSelectionScopeTestOutput(t, plan, "prep", "prep", prerequisite)
 	match, found, err := metadata.compactKbuildRuleForProfile(profile, target)
@@ -13516,8 +13516,9 @@ FORCE:
 			if !ok || readSnapshot == nil {
 				t.Fatal("source-selected header recipe lost its immutable read snapshot")
 			}
-			metadata := &CompactMetadata{actionRoles: testConfiguredScopedActionRoles,
-				Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
+			metadata := &CompactMetadata{
+				actionRoles: testConfiguredScopedActionRoles,
+				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
 			}
 			writer := compactKbuildSelectionKey{profile: profile.Name, target: release, stage: "prep"}
 			reader := compactKbuildSelectionKey{profile: profile.Name, target: header, stage: "target"}
@@ -13881,8 +13882,9 @@ FORCE:
 			if err != nil {
 				t.Fatal(err)
 			}
-			metadata := &CompactMetadata{actionRoles: testConfiguredScopedActionRoles,
-				Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
+			metadata := &CompactMetadata{
+				actionRoles: testConfiguredScopedActionRoles,
+				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
 			}
 			selection := compactKbuildSelectionKey{profile: profile.Name, target: header, stage: "target"}
 			graph, err := newCompactKbuildSelectionGraph(CompactConfig{
@@ -14004,8 +14006,9 @@ FORCE:
 			if err != nil {
 				t.Fatal(err)
 			}
-			metadata := &CompactMetadata{actionRoles: testConfiguredScopedActionRoles,
-				Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
+			metadata := &CompactMetadata{configProjectionPaths: recognizedConfigDocuments(),
+				actionRoles: testConfiguredScopedActionRoles,
+				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
 			}
 			selection := compactKbuildSelectionKey{profile: profile.Name, target: header, stage: "target"}
 			graph, err := newCompactKbuildSelectionGraph(CompactConfig{
@@ -14019,7 +14022,7 @@ FORCE:
 			}
 			plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
 			if test.configBaseline {
-				if _, err := ensureActionPlanSource(plan, "config", "auto.conf"); err != nil {
+				if _, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf"); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -14048,7 +14051,7 @@ FORCE:
 			wantNamespace := "kernel"
 			wantSource := "release.source"
 			if test.configBaseline {
-				wantNamespace, wantSource = "config", "auto.conf"
+				wantNamespace, wantSource = "config", "include/config/auto.conf"
 			}
 			wantID := plan.sourceIDs[actionPlanLookupKey(wantNamespace, wantSource)]
 			if wantID == "" || !slices.ContainsFunc(node.Sources, func(edge ActionPlanSourceEdge) bool {

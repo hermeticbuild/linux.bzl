@@ -18,6 +18,7 @@ go_test(
         "contract_test.go",
         "manifest_test.go",
         "observed_output_test.go",
+        "shell_assignments_test.go",
     ],
     embed = [":toolaction"],
 )

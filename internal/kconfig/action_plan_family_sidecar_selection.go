@@ -30,8 +30,10 @@ func addInitialFamilySidecarGroups(
 		finalNodes[node.ID] = node
 	}
 	configPaths := map[string]bool{}
-	for _, projection := range resolvedConfigProjections() {
-		configPaths[projection.output] = true
+	for _, variant := range variants {
+		for pathname := range variant.Snapshot.ConfigFiles {
+			configPaths[pathname] = true
+		}
 	}
 	pending := map[string]*actionPlanFamilyHeaderDemandGroup{}
 	type association struct {

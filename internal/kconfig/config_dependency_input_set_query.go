@@ -23,7 +23,7 @@ type configDependencyInputSetEvent struct {
 type configDependencyInputSetSummary struct {
 	staged        bool
 	stageError    configDependencyInputSetEvent
-	uses          [4]configDependencyInputSetEvent
+	uses          [2]configDependencyInputSetEvent
 	structuralErr error
 }
 
@@ -44,15 +44,12 @@ func (q *configDependencyInputSetQuery) stagesConfig(root string) (bool, error) 
 	return summary.staged, nil
 }
 
-func (q *configDependencyInputSetQuery) configUse(root string, source, scanAllArguments bool) (string, bool, error) {
+func (q *configDependencyInputSetQuery) configUse(root string, scanAllArguments bool) (string, bool, error) {
 	summary := q.rootSummary(root)
 	if summary.structuralErr != nil {
 		return "", false, summary.structuralErr
 	}
 	index := 0
-	if source {
-		index += 2
-	}
 	if scanAllArguments {
 		index++
 	}
@@ -130,9 +127,9 @@ func (q *configDependencyInputSetQuery) summarize(id string) configDependencyInp
 				event.description = actionPlanInputSetTargetDescription(entry.Target)
 			}
 			for index := range summary.uses {
-				source, scanAllArguments := index >= 2, index%2 != 0
+				scanAllArguments := index != 0
 				if !(entry.AuxiliaryUse || scanAllArguments && entry.CompilerUse) ||
-					source && entry.SourceID == "" || !source && entry.ProducerID == "" {
+					entry.SourceID == "" {
 					continue
 				}
 				summary.uses[index] = earlierConfigDependencyInputSetEvent(summary.uses[index], event)

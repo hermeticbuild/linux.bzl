@@ -543,6 +543,257 @@ all: $(if $(filter 1,$(feature-bpf)),enabled.o,disabled.o)
 	}
 }
 
+func TestKbuildRelativeIncludeReadsExactInvocationFrontier(t *testing.T) {
+	root := t.TempDir()
+	objectRoot := filepath.Join(root, "object")
+	const marker = "__LINUX_BZL_OBJECT_TREE__"
+	const sourceMarker = "__LINUX_BZL_SOURCE_TREE__"
+	for _, dir := range []string{filepath.Join(objectRoot, "include/config"), filepath.Join(objectRoot, "drivers/demo")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The worker may have an old generated file; only the selected frontier
+	// can supply a generated Make include to this invocation.
+	if err := os.WriteFile(filepath.Join(objectRoot, "include/config/auto.conf"), []byte("CONFIG_FRAME_WARN=stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	makefile := filepath.Join(root, "Makefile")
+	location := CompactKbuildInvocationLocation{Tree: CompactKbuildInvocationObjectTree}
+	view := &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{
+		marker + "/include/config/auto.conf": {content: "CONFIG_FRAME_WARN=2048\n", exact: true},
+	}}
+	options := KbuildOptions{
+		RootDir: root, WorkingDir: objectRoot,
+		SourceRoots:        map[string]string{sourceMarker: root, marker: objectRoot},
+		InvocationLocation: &location, VirtualFileView: view,
+		SourceCache:             NewKbuildSourceCache([]string{root}, []string{objectRoot}),
+		ConfigVariablesComplete: true, CaptureVariables: []string{"KBUILD_CFLAGS", "MAKEFILE_LIST"},
+	}
+	for _, tc := range []struct {
+		name, directory, include string
+	}{
+		{"root", "", "include/config/auto.conf"},
+		{"nested alias", "drivers/demo", "../../include/config/auto.conf"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			location.Directory = tc.directory
+			options.WorkingDir = filepath.Join(objectRoot, tc.directory)
+			options.SourceCache = NewKbuildSourceCache([]string{root}, []string{objectRoot})
+			if err := os.WriteFile(makefile, []byte("include "+tc.include+"\nKBUILD_CFLAGS := -Wframe-larger-than=$(CONFIG_FRAME_WARN)\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			kb, err := ParseKbuildFileTree(makefile, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := kb.Variables["KBUILD_CFLAGS"], "-Wframe-larger-than=2048"; got != want {
+				t.Fatalf("selected native CONFIG_FRAME_WARN flag = %q, want %q", got, want)
+			}
+			if !strings.Contains(kb.Variables["MAKEFILE_LIST"], filepath.Join(objectRoot, "include/config/auto.conf")) {
+				t.Fatalf("included Makefile identity = %q, want object-tree include", kb.Variables["MAKEFILE_LIST"])
+			}
+		})
+	}
+	if !slices.Equal(view.readCalls, []string{
+		marker + "/include/config/auto.conf", marker + "/include/config/auto.conf",
+	}) {
+		t.Fatalf("relative include reads = %q, want canonical selected object paths", view.readCalls)
+	}
+
+	location.Directory = ""
+	options.WorkingDir = objectRoot
+	options.CaptureVariables = append(options.CaptureVariables, "selected")
+	for _, tc := range []struct {
+		name, contents, want string
+		exact                bool
+		optional             bool
+	}{
+		{"absent required", "", "missing", false, false},
+		{"opaque", "CONFIG_FRAME_WARN=1024\n", "requires exact contents", false, false},
+		{"absent optional", "", "", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options.SourceCache = NewKbuildSourceCache([]string{root}, []string{objectRoot})
+			view.files = map[string]testKbuildVirtualFile{}
+			if tc.contents != "" {
+				view.files[marker+"/include/config/auto.conf"] = testKbuildVirtualFile{content: tc.contents, exact: tc.exact}
+			}
+			include := "include"
+			if tc.optional {
+				include = "-include"
+			}
+			if err := os.WriteFile(makefile, []byte(include+" include/config/auto.conf\nselected := yes\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			options.ConfigVariablesComplete = false
+			kb, err := ParseKbuildFileTree(makefile, options)
+			if tc.want == "" {
+				if err != nil || kb.Variables["selected"] != "yes" {
+					t.Fatalf("optional absent virtual include = (%+v, %v)", kb, err)
+				}
+			} else if err == nil || tc.want == "missing" && !os.IsNotExist(err) || tc.want != "missing" && !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("virtual include error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestKbuildRelativeIncludeKeepsSourceAndObjectOwnershipSeparate(t *testing.T) {
+	root := t.TempDir()
+	objectRoot := filepath.Join(root, "object")
+	const marker = "__LINUX_BZL_OBJECT_TREE__"
+	const sourceMarker = "__LINUX_BZL_SOURCE_TREE__"
+	for _, path := range []string{filepath.Join(root, "scripts"), filepath.Join(objectRoot, "scripts")} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "scripts", "Kbuild.include"), []byte("SOURCE_VALUE := immutable\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(objectRoot, "scripts", "Kbuild.include"), []byte("SOURCE_VALUE := stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	makefile := filepath.Join(root, "Makefile")
+	location := CompactKbuildInvocationLocation{Tree: CompactKbuildInvocationObjectTree}
+	view := &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}}
+	options := KbuildOptions{
+		RootDir: root, WorkingDir: objectRoot,
+		SourceRoots:        map[string]string{sourceMarker: root, marker: objectRoot},
+		InvocationLocation: &location, VirtualFileView: view,
+		SourceCache:      NewKbuildSourceCache([]string{root}, []string{objectRoot}),
+		CaptureVariables: []string{"SOURCE_VALUE"},
+	}
+	if err := os.WriteFile(makefile, []byte("include scripts/Kbuild.include\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseKbuildFileTree(makefile, options)
+	if err != nil || parsed.Variables["SOURCE_VALUE"] != "immutable" {
+		t.Fatalf("object invocation's declared source include = (%+v, %v), want immutable", parsed, err)
+	}
+	if !slices.Equal(view.readCalls, []string{marker + "/scripts/Kbuild.include"}) {
+		t.Fatalf("object/source include frontier reads = %q, want object read before declared source", view.readCalls)
+	}
+	view.readCalls = nil
+	options.SourceCache = nil
+	parsed, err = ParseKbuildFileTree(makefile, options)
+	if err != nil || parsed.Variables["SOURCE_VALUE"] != "immutable" ||
+		!slices.Equal(view.readCalls, []string{marker + "/scripts/Kbuild.include"}) {
+		t.Fatalf("uncached declared source include = (%+v, %v), frontier reads %q", parsed, err, view.readCalls)
+	}
+	view.readCalls = nil
+	options.SourceCache = NewKbuildSourceCache([]string{root}, []string{objectRoot, filepath.Join(root, "scripts")})
+	parsed, err = ParseKbuildFileTree(makefile, options)
+	if err != nil || parsed.Variables["SOURCE_VALUE"] != "immutable" ||
+		!slices.Equal(view.readCalls, []string{marker + "/scripts/Kbuild.include"}) {
+		t.Fatalf("uncached-by-policy declared source include = (%+v, %v), frontier reads %q", parsed, err, view.readCalls)
+	}
+	view.readCalls = nil
+	location.Tree = CompactKbuildInvocationSourceTree
+	options.WorkingDir = root
+	parsed, err = ParseKbuildFileTree(makefile, options)
+	if err != nil || parsed.Variables["SOURCE_VALUE"] != "immutable" || len(view.readCalls) != 0 {
+		t.Fatalf("source invocation include = (%+v, %v), frontier reads %q", parsed, err, view.readCalls)
+	}
+
+	// A virtual include's physical identity lies under the object root. It
+	// cannot authorize a later physical child when that child is absent from
+	// the declared frontier, even if stale bytes remain in the worker tree.
+	location.Tree = CompactKbuildInvocationObjectTree
+	options.WorkingDir = objectRoot
+	virtualParent := marker + "/scripts/parent.mk"
+	view.files[virtualParent] = testKbuildVirtualFile{content: "include scripts/child.mk\n", exact: true}
+	if err := os.WriteFile(filepath.Join(objectRoot, "scripts", "child.mk"), []byte("SOURCE_VALUE := stale child\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(makefile, []byte("include $(objtree)/scripts/parent.mk\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	options.SourceCache = NewKbuildSourceCache([]string{root}, []string{objectRoot})
+	options.Variables = map[string]string{"objtree": marker}
+	if parsed, err := ParseKbuildFileTree(makefile, options); err == nil || !os.IsNotExist(err) {
+		t.Fatalf("nested virtual object include error = %v, want missing selected child; reads %q, parsed %+v", err, view.readCalls, parsed)
+	}
+	options.SourceCache = nil
+	if parsed, err := ParseKbuildFileTree(makefile, options); err == nil || !os.IsNotExist(err) {
+		t.Fatalf("uncached nested virtual include error = %v, want missing selected child; parsed %+v", err, parsed)
+	}
+	if err := os.Symlink(filepath.Join(objectRoot, "scripts", "child.mk"), filepath.Join(root, "scripts", "child.mk")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(makefile, []byte("include scripts/child.mk\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if parsed, err := ParseKbuildFileTree(makefile, options); err == nil || !os.IsNotExist(err) {
+		t.Fatalf("source symlink into unselected object tree = (%+v, %v), want missing source-owned child", parsed, err)
+	}
+	if err := os.Remove(filepath.Join(root, "scripts", "child.mk")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../object/scripts/child.mk", filepath.Join(root, "scripts", "child.mk")); err != nil {
+		t.Fatal(err)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relativeSourceRoot, err := filepath.Rel(wd, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options.SourceRoots[sourceMarker] = relativeSourceRoot
+	if parsed, err := ParseKbuildFileTree(makefile, options); err == nil || !os.IsNotExist(err) {
+		t.Fatalf("mixed relative-source/absolute-object symlink include = (%+v, %v), want selected object absence", parsed, err)
+	}
+}
+
+func TestKbuildRelativeSourceIncludeUsesInvocationDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		"Makefile":               "include scripts/Makefile.build\n",
+		"scripts/Makefile.build": "include scripts/Makefile.lib\n",
+		"scripts/Makefile.lib":   "SOURCE_VALUE := immutable\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const objectMarker = "__LINUX_BZL_OBJECT_TREE__"
+	const sourceMarker = "__LINUX_BZL_SOURCE_TREE__"
+	location := CompactKbuildInvocationLocation{Tree: CompactKbuildInvocationObjectTree}
+	view := &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}}
+	parsed, err := ParseKbuildFileTree(filepath.Join(root, "Makefile"), KbuildOptions{
+		RootDir: root, WorkingDir: root,
+		SourceRoots:        map[string]string{sourceMarker: root, objectMarker: root},
+		InvocationLocation: &location, VirtualFileView: view,
+		SourceCache:      NewKbuildSourceCache([]string{root}, nil),
+		CaptureVariables: []string{"SOURCE_VALUE"},
+	})
+	if err != nil || parsed.Variables["SOURCE_VALUE"] != "immutable" {
+		t.Fatalf("immutable source include with aliased object root = (%+v, %v)", parsed, err)
+	}
+	if !slices.Equal(view.readCalls, []string{
+		objectMarker + "/scripts/Makefile.build", objectMarker + "/scripts/Makefile.lib",
+	}) {
+		t.Fatalf("source include reads = %q, want two invocation-rooted virtual misses", view.readCalls)
+	}
+	view.readCalls = nil
+	parsed, err = ParseKbuildFileTree(filepath.Join(root, "Makefile"), KbuildOptions{
+		RootDir: root, WorkingDir: root,
+		SourceRoots:        map[string]string{sourceMarker: root, objectMarker: root},
+		InvocationLocation: &location, VirtualFileView: view,
+		CaptureVariables: []string{"SOURCE_VALUE"},
+	})
+	if err != nil || parsed.Variables["SOURCE_VALUE"] != "immutable" ||
+		!slices.Equal(view.readCalls, []string{objectMarker + "/scripts/Makefile.build", objectMarker + "/scripts/Makefile.lib"}) {
+		t.Fatalf("uncached aliased source/object include = (%+v, %v), frontier reads %q", parsed, err, view.readCalls)
+	}
+}
+
 func TestKbuildVirtualObjectIncludeRequiresDeclaredExactOwner(t *testing.T) {
 	root := t.TempDir()
 	objectRoot := filepath.Join(root, "object")

@@ -4,6 +4,9 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 # silently add it to the ordinary library and enable normal allocation sampling.
 # gazelle:exclude heap_profile_diagnostic.go
 
+# Keep the native conf dependency in its own execution test.
+# gazelle:exclude native_config_execution_test.go
+
 go_library(
     name = "kconfig_parse_lib",
     srcs = [
@@ -24,6 +27,8 @@ go_library(
         "frontier_virtual_file_view.go",
         "graph_guard_round.go",
         "main.go",
+        "native_config.go",
+        "native_config_run.go",
         "path_set.go",
         "profiling.go",
     ],
@@ -33,6 +38,7 @@ go_library(
         "//internal/kconfig",
         "//internal/pkgconfigmanifest",
         "//internal/toolaction",
+        "//internal/toolsetpath",
     ],
 )
 
@@ -82,6 +88,7 @@ go_test(
         "frontier_virtual_file_view_test.go",
         "graph_guard_round_test.go",
         "main_test.go",
+        "native_config_test.go",
         "path_set_test.go",
         "profile_binary_test.go",
         "profile_test.go",
@@ -100,6 +107,29 @@ go_test(
     deps = [
         "//internal/kconfig",
         "//internal/toolaction",
+        "@rules_go//go/runfiles",
+    ],
+)
+
+# keep
+go_test(
+    name = "native_config_test",
+    srcs = ["native_config_execution_test.go"],
+    data = [
+        "//internal/tests/mapped_kernel:native_config_tool",
+        "@linux_bzl_busybox//file:busybox",
+    ],
+    embed = [":kconfig_parse_lib"],
+    env = {
+        "LINUX_BZL_TEST_NATIVE_CONF": "$(rlocationpath //internal/tests/mapped_kernel:native_config_tool)",
+        "LINUX_BZL_TEST_SCRIPT_RUNTIME": "$(rlocationpath @linux_bzl_busybox//file:busybox)",
+    },
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    deps = [
+        "//internal/toolsetpath",
         "@rules_go//go/runfiles",
     ],
 )

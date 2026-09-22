@@ -143,16 +143,19 @@ func TestActionPlanFamilyPersistentInputsReattachSymmetricPriorTreeClosure(t *te
 	}
 }
 
-func TestActionPlanFamilyPersistentInputsLocalizeFallbackProjection(t *testing.T) {
-	for _, producerMode := range []string{"fallback", "selected", "noncanonical"} {
+func TestActionPlanFamilyPersistentInputsLocalizeNativeConfig(t *testing.T) {
+	for _, producerMode := range []string{"native", "selected", "noncanonical"} {
 		t.Run(producerMode, func(t *testing.T) {
 			variants := make([]ActionPlanFamilyVariant, 0, 2)
 			for index, other := range []string{"n", "m"} {
-				variants = append(variants, ActionPlanFamilyVariant{
-					Name: []string{"base", "overlay"}[index],
-					Snapshot: familyPersistentCompilerInputsSnapshotForTest(t,
-						familyTestPrepCopyCompileSnapshot(t, familyTestConfig("y", other), producerMode)),
-				})
+				var snapshot ActionPlanSnapshot
+				if producerMode == "native" {
+					snapshot = familyBenchmarkSnapshotMode(t, familyTestConfig("y", other), 1, "prior-tree-precise")
+				} else {
+					snapshot = familyPersistentCompilerInputsSnapshotForTest(t,
+						familyTestPrepCopyCompileSnapshot(t, familyTestConfig("y", other), producerMode))
+				}
+				variants = append(variants, ActionPlanFamilyVariant{Name: []string{"base", "overlay"}[index], Snapshot: snapshot})
 			}
 			family, err := BuildActionPlanFamily(variants)
 			if err != nil {
@@ -160,45 +163,42 @@ func TestActionPlanFamilyPersistentInputsLocalizeFallbackProjection(t *testing.T
 			}
 			compiles := familyCompileNodes(family)
 			want := 2
-			if producerMode == "fallback" {
+			if producerMode == "native" {
 				want = 1
 			}
 			if len(compiles) != want {
 				t.Fatalf("%s persistent config projection left %d compiles, want %d", producerMode, len(compiles), want)
 			}
-			if producerMode != "fallback" {
+			if producerMode != "native" {
 				return
 			}
 			entries := actionPlanNodeInputSetEntriesForTest(t, &ActionPlan{InputSets: family.InputSets}, compiles[0])
-			if len(entries) != 1 || entries[0].ProducerID == "" {
-				t.Fatalf("localized projection provenance = %#v", entries)
-			}
-			producer, ok := compactKbuildPlanNode(&ActionPlan{Nodes: family.Nodes}, entries[0].ProducerID)
-			if !ok || len(producer.Sources) != 1 {
-				t.Fatalf("localized fallback producer = %#v, found=%t", producer, ok)
+			var headerSourceID string
+			for _, entry := range entries {
+				if entry.Target.Path == "include/generated/autoconf.h" {
+					headerSourceID = entry.SourceID
+				}
 			}
 			for _, source := range family.Sources {
-				if source.ID != producer.Sources[0].SourceID {
+				if source.ID != headerSourceID {
 					continue
 				}
 				capsuleID, _, _ := strings.Cut(source.Path, "/")
 				header := family.Capsules[capsuleID]["include/generated/autoconf.h"]
 				if !strings.Contains(header, "CONFIG_USED") || strings.Contains(header, "CONFIG_OTHER") {
-					t.Fatalf("persistent fallback header = %q, want exact CONFIG_USED capsule", header)
+					t.Fatalf("persistent native header = %q, want exact CONFIG_USED capsule", header)
 				}
 				return
 			}
-			t.Fatal("localized fallback capsule source is absent")
+			t.Fatal("localized native capsule source is absent")
 		})
 	}
 }
 
-func TestActionPlanFamilyPersistentInputsRelevantFallbackConfigStillSplits(t *testing.T) {
+func TestActionPlanFamilyPersistentInputsRelevantNativeConfigStillSplits(t *testing.T) {
 	variants := []ActionPlanFamilyVariant{
-		{Name: "base", Snapshot: familyPersistentCompilerInputsSnapshotForTest(t,
-			familyTestPrepCopyCompileSnapshot(t, familyTestConfig("y", "n"), "fallback"))},
-		{Name: "overlay", Snapshot: familyPersistentCompilerInputsSnapshotForTest(t,
-			familyTestPrepCopyCompileSnapshot(t, familyTestConfig("n", "n"), "fallback"))},
+		{Name: "base", Snapshot: familyBenchmarkSnapshotMode(t, familyTestConfig("y", "n"), 1, "prior-tree-precise")},
+		{Name: "overlay", Snapshot: familyBenchmarkSnapshotMode(t, familyTestConfig("n", "n"), 1, "prior-tree-precise")},
 	}
 	family, err := BuildActionPlanFamily(variants)
 	if err != nil {
@@ -352,11 +352,11 @@ func TestActionPlanFamilyPersistentInputsPruneNormalCmdAndFixdepAmbientConfig(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	configID, err := ensureActionPlanSource(plan, "config", "autoconf.h")
+	configID, err := ensureActionPlanSource(plan, "config", "include/generated/autoconf.h")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ambientID, err := ensureActionPlanSource(plan, "config", "auto.conf.cmd")
+	ambientID, err := ensureActionPlanSource(plan, "config", "include/config/auto.conf.cmd")
 	if err != nil {
 		t.Fatal(err)
 	}

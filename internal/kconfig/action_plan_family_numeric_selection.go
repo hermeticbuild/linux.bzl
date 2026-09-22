@@ -54,8 +54,10 @@ func initialFamilyProspectiveHeaderGroups(
 		return nil, false, nil
 	}
 	configPaths := map[string]bool{}
-	for _, projection := range resolvedConfigProjections() {
-		configPaths[projection.output] = true
+	for _, variant := range variants {
+		for pathname := range variant.Snapshot.ConfigFiles {
+			configPaths[pathname] = true
+		}
 	}
 	groups := map[string]*actionPlanFamilyHeaderDemandGroup{}
 	for _, variant := range variants {

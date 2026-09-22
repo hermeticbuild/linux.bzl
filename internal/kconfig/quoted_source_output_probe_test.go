@@ -16,7 +16,11 @@ type selectedSourceResultReader struct {
 func TestSelectedSourceFilechkMeasuresDirectScriptWithExportAndPrewriterOwner(t *testing.T) {
 	root := t.TempDir()
 	mustWriteSource(t, root, "Kconfig", "mainmenu \"fixture\"\n")
-	mustWriteSource(t, root, "scripts/generate-release", "#!/bin/sh\nset -e\nprintf '%s-fixture\\n' \"$KERNELVERSION\"\n")
+	mustWriteSource(t, root, "scripts/generate-release", `#!/bin/sh
+set -e
+localversion=$(sed -n 's/^CONFIG_LOCALVERSION=//p' include/config/auto.conf)
+printf '%s%s\n' "$KERNELVERSION" "$localversion"
+`)
 	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
 	if err != nil {
 		t.Fatal(err)
@@ -26,7 +30,8 @@ func TestSelectedSourceFilechkMeasuresDirectScriptWithExportAndPrewriterOwner(t 
 	const target = "include/config/kernel.release"
 	recipe := "{\n${tree:kernel}/scripts/generate-release ${tree:kernel}\n} > '" + target + "'"
 	const configPath = "include/config/auto.conf"
-	config := map[string]string{configPath: "CONFIG_LOCALVERSION=\"-selected\"\n"}
+	const nativeAutoConf = "# Automatically generated file; DO NOT EDIT.\nCONFIG_LOCALVERSION=-selected\nCONFIG_CC_VERSION_TEXT=Clang version 22\n"
+	config := map[string]string{configPath: nativeAutoConf}
 	owners := map[string]string{configPath: "selected-config-owner"}
 	query := func(names []string, files map[string]string) (ProbeReference, ProbeRequest) {
 		t.Helper()
@@ -43,6 +48,9 @@ func TestSelectedSourceFilechkMeasuresDirectScriptWithExportAndPrewriterOwner(t 
 		return refs[0], plan.Requests[refs[0].RequestID]
 	}
 	selected, request := query([]string{configPath}, config)
+	if !slices.ContainsFunc(request.Scratch, func(item ProbeScratch) bool { return item.Content == nativeAutoConf }) {
+		t.Fatal("selected script's native Make config bytes changed before measurement")
+	}
 	if !slices.Contains(request.Sources, "scripts/generate-release") ||
 		!slices.Contains(request.SourceRoots, linuxProbeSourceRootName) ||
 		request.Steps[1].Environment["KERNELVERSION"] != "6.18.52" {
