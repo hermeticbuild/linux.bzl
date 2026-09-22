@@ -441,10 +441,11 @@ runtime paths such as `/sbin/init` remain supported.
 | Kernel BPF/BTF | BPF syscall configurations, BTF-enabled `vmlinux`, and module BTF with Rust+DWARF5 kernels |
 | VM verification | Hermetic QEMU boots with initramfs and module-load checks |
 
-The two LTS lines are the maintained compatibility catalog. Other
-integrity-pinned Linux 6.x releases may work, but are experimental until added
-to that catalog and its release checks. Kernel actions target the registered
-toolchain selected by the image platform.
+The two LTS lines are the maintained compatibility catalog. The examples
+workspace also builds an explicitly pinned Linux 5.10.270 x86_64 kernel in CI.
+Other integrity-pinned releases remain experimental until added to the
+catalog and its release checks. Kernel actions target the registered toolchain
+selected by the image platform.
 
 The public kernel contract includes resolved configs, native boot images,
 `System.map`, kernel release metadata,
@@ -1190,6 +1191,7 @@ than producing a mismatched image.
 [`examples/`](examples/) is a standalone Bzlmod workspace containing:
 
 - catalog-backed x86_64 and aarch64 kernels;
+- an explicitly pinned Linux 5.10.270 x86_64 kernel;
 - named debug and LZ4 overlays;
 - a deterministic initramfs built through the public `@linux.bzl` entry point;
 - in-tree module and Kbuild metadata outputs; and
@@ -1203,8 +1205,14 @@ bazel build @example_x86_64//:kernel
 bazel build @example_x86_64//variants/debug:kernel
 bazel build @example_x86_64//variants/lz4:kernel
 bazel build @example_aarch64//:kernel
+bazel build //:x86_64_5_10_kernel
 bazel build //:example_initramfs
 ```
+
+The 5.10 example sets `LLVM_IAS=1` to use Clang's integrated assembler. That
+kernel predates Kbuild's integrated-assembler default and otherwise selects
+an external assembler. CI builds this example separately from the same-source
+configuration variants used to check action reuse.
 
 The standalone compatibility suites exercise the runtime contracts:
 

@@ -104,6 +104,9 @@ jobs:
           - batch: x86-64-variants
             title: x86_64 base + overlays
             targets: "//:x86_64_kernel //:x86_64_debug_kernel //:x86_64_btf_vmlinux //:x86_64_lz4_kernel"
+          - batch: x86-64-5-10
+            title: x86_64 Linux 5.10
+            targets: "//:x86_64_5_10_kernel"
           - batch: aarch64-base
             title: aarch64 base
             targets: "//:aarch64_kernel"

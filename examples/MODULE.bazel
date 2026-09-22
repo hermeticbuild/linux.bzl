@@ -76,6 +76,15 @@ linux_source_repository(
     version = "6.18.39",
 )
 
+linux_source_repository(
+    name = "linux_5_10_270",
+    integrity = "sha256-3nPVKLBL6R9uuGZgqmek1TuWu/ILtaMm54+ALXRN6+c=",
+    module_make_vars = {"LLVM_IAS": "1"},
+    strip_prefix = "linux-5.10.270",
+    urls = ["https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.10.270.tar.xz"],
+    version = "5.10.270",
+)
+
 linux_images = use_extension("@linux.bzl//:extensions.bzl", "linux_images")
 linux_images.image(
     name = "example_x86_64",
@@ -104,8 +113,15 @@ linux_images.image(
     platform = "@llvm//platforms:linux_arm64",
     source = "@linux_6_18_39//:Kconfig",
 )
+linux_images.image(
+    name = "example_x86_64_5_10",
+    config = "//configs:x86_64_5_10.config",
+    platform = "@llvm//platforms:linux_x86_64",
+    source = "@linux_5_10_270//:Kconfig",
+)
 use_repo(
     linux_images,
     "example_aarch64",
     "example_x86_64",
+    "example_x86_64_5_10",
 )

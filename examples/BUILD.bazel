@@ -71,6 +71,11 @@ alias(
 )
 
 alias(
+    name = "x86_64_5_10_kernel",
+    actual = "@example_x86_64_5_10//:kernel",
+)
+
+alias(
     name = "x86_64_debug_kernel",
     actual = "@example_x86_64//variants/debug:kernel",
 )

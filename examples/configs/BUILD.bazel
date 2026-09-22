@@ -6,4 +6,5 @@ exports_files([
     "debug.config",
     "lz4.config",
     "x86_64.config",
+    "x86_64_5_10.config",
 ])

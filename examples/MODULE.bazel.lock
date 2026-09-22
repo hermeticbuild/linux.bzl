@@ -324,8 +324,9 @@
     "@@linux.bzl+//:extensions.bzl%linux_images": {
       "general": {
         "bzlTransitiveDigest": "3NeikY6/Hsxmy2HUgMgj38dleYGuUVREb4sBV6BWRvY=",
-        "usagesDigest": "e+vMswoLMFhZTZBOPj/u6dxDllDqKp7btmBZJfnFwew=",
+        "usagesDigest": "4AHj1IPnnXHKix+BfqyrxywD+hDGKabQbXGg7DLfcNQ=",
         "recordedInputs": [
+          "REPO_MAPPING:,linux_5_10_270 +linux_source_repository+linux_5_10_270",
           "REPO_MAPPING:,linux_6_18_39 +linux_source_repository+linux_6_18_39",
           "REPO_MAPPING:,llvm llvm+"
         ],
@@ -352,6 +353,16 @@
               },
               "platform": "@@llvm+//platforms:linux_x86_64",
               "source": "@@+linux_source_repository+linux_6_18_39//:Kconfig"
+            }
+          },
+          "example_x86_64_5_10": {
+            "repoRuleId": "@@linux.bzl+//internal:linux_image_repository.bzl%linux_image",
+            "attributes": {
+              "config": "@@//configs:x86_64_5_10.config",
+              "config_mode": "default",
+              "overlays": {},
+              "platform": "@@llvm+//platforms:linux_x86_64",
+              "source": "@@+linux_source_repository+linux_5_10_270//:Kconfig"
             }
           }
         }
