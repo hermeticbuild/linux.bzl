@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -32,6 +33,7 @@ import (
 
 const (
 	maxScriptBytes          = 16 << 20
+	maxScriptSourceSpans    = 64
 	maxMulticallListSize    = 1 << 20
 	maxMulticallApplets     = 4096
 	maxReplayManifestBytes  = 1 << 20
@@ -91,6 +93,7 @@ func (f *maxFileSizeFlag) Set(value string) error {
 
 type scriptReplayManifest struct {
 	Name        string                   `json:"name"`
+	DenyAll     bool                     `json:"deny_all,omitempty"`
 	Invocations []scriptReplayInvocation `json:"invocations"`
 }
 
@@ -106,6 +109,7 @@ type scriptReplayInvocation struct {
 // script runs and first-seen receipts remain in parent memory.
 type scriptReplayRuntimeManifest struct {
 	Name        string
+	DenyAll     bool
 	Invocations []scriptReplayRuntimeInvocation
 }
 
@@ -140,6 +144,7 @@ type scriptReplayBroker struct {
 	mu          sync.Mutex
 	closing     bool
 	connections map[*net.UnixConn]bool
+	requestErr  error
 	handlers    sync.WaitGroup
 }
 
@@ -150,27 +155,47 @@ type scriptReplayProxyFailure struct {
 
 func (failure *scriptReplayProxyFailure) Error() string { return failure.message }
 
+// A replay failure invalidates the selected execution even when the source
+// shell handles a proxy's exit status. Ordinary source-script errors can still
+// use the caller's explicit fallback.
+type scriptReplaySafetyError struct{ cause error }
+
+func (failure *scriptReplaySafetyError) Error() string { return failure.cause.Error() }
+func (failure *scriptReplaySafetyError) Unwrap() error { return failure.cause }
+
+// scriptSourceSpan selects exact bytes of a declared immutable source script.
+// Replaying its prelude and one body segment in a new shell does not authorize
+// caller-supplied shell text: the runner assembles the program from this source.
+type scriptSourceSpan struct {
+	start uint64
+	end   uint64
+}
+
 type scriptRunOptions struct {
-	interpreter        string
-	interpreterArgs    []string
-	multicall          string
-	script             string
-	scriptContent      string
-	scriptStdin        bool
-	scriptArgs         []string
-	applets            map[string]string
-	requiredApplets    []string
-	tools              map[string]string
-	trees              map[string]string
-	literalTreeOffsets map[int]bool
-	toolContracts      map[string]toolaction.Contract
-	runtimeToolPath    string
-	toolsetHandoff     string
-	replays            []scriptReplayManifest
-	maxFileSizeBytes   uint64
-	stdin              io.Reader
-	stdout             io.Writer
-	stderr             io.Writer
+	interpreter             string
+	interpreterArgs         []string
+	multicall               string
+	script                  string
+	scriptContent           string
+	scriptStdin             bool
+	scriptSourceSHA256      string
+	scriptSourceSpans       []scriptSourceSpan
+	scriptSourceEmit        string
+	staticSourceAssignments string
+	scriptArgs              []string
+	applets                 map[string]string
+	requiredApplets         []string
+	tools                   map[string]string
+	trees                   map[string]string
+	literalTreeOffsets      map[int]bool
+	toolContracts           map[string]toolaction.Contract
+	runtimeToolPath         string
+	toolsetHandoff          string
+	replays                 []scriptReplayManifest
+	maxFileSizeBytes        uint64
+	stdin                   io.Reader
+	stdout                  io.Writer
+	stderr                  io.Writer
 }
 
 type scriptRunFallback struct {
@@ -187,8 +212,14 @@ func runScriptWithFallback(opts scriptRunOptions, fallback scriptRunFallback) er
 	if err := validateMaxFileSizeBytes(opts.maxFileSizeBytes); err != nil {
 		return err
 	}
+	if err := validateScriptSourcePhaseOptions(opts); err != nil {
+		return err
+	}
 	if err := validateScriptRunFallback(fallback); err != nil {
 		return err
+	}
+	if (len(opts.scriptSourceSpans) != 0 || opts.staticSourceAssignments != "") && fallback.enabled {
+		return fmt.Errorf("source script phases and static source assignments cannot use a script execution fallback")
 	}
 	if !fallback.enabled {
 		return runScript(opts)
@@ -203,6 +234,10 @@ func runScriptWithFallback(opts scriptRunOptions, fallback scriptRunFallback) er
 	var captured bytes.Buffer
 	opts.stdout = &boundedFallbackWriter{writer: &captured, remaining: maxFallbackStdoutBytes}
 	if err := runScriptContext(ctx, opts); err != nil {
+		var replayFailure *scriptReplaySafetyError
+		if errors.As(err, &replayFailure) {
+			return err
+		}
 		if _, writeErr := io.Copy(originalStdout, bytes.NewReader(fallback.stdout)); writeErr != nil {
 			return fmt.Errorf("write script fallback stdout: %w", writeErr)
 		}
@@ -221,8 +256,22 @@ func runScriptContext(ctx context.Context, opts scriptRunOptions) error {
 	if err := validateMaxFileSizeBytes(opts.maxFileSizeBytes); err != nil {
 		return err
 	}
+	if err := validateScriptSourcePhaseOptions(opts); err != nil {
+		return err
+	}
+	if opts.staticSourceAssignments != "" {
+		if opts.scriptSourceEmit != "" {
+			return fmt.Errorf("source script emission cannot validate staged source assignments")
+		}
+		if err := validateStagedStaticSourceAssignments(opts.staticSourceAssignments); err != nil {
+			return err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("execute source script: %w", err)
+	}
+	if opts.scriptSourceEmit != "" {
+		return emitScriptSourcePhase(opts)
 	}
 	if opts.scriptStdin {
 		if opts.script != "" || opts.scriptContent != "" {
@@ -282,10 +331,17 @@ func runScriptContext(ctx context.Context, opts scriptRunOptions) error {
 		return err
 	}
 	script := ""
+	phaseContent := ""
 	if opts.script != "" {
 		script, err = requireSourceScript(opts.script)
 		if err != nil {
 			return err
+		}
+		if len(opts.scriptSourceSpans) != 0 {
+			phaseContent, err = sourceScriptPhaseContent(script, opts.scriptSourceSHA256, opts.scriptSourceSpans)
+			if err != nil {
+				return err
+			}
 		}
 	} else {
 		if len(opts.scriptContent) == 0 || len(opts.scriptContent) > maxScriptBytes || strings.ContainsRune(opts.scriptContent, 0) {
@@ -468,7 +524,14 @@ func runScriptContext(ctx context.Context, opts scriptRunOptions) error {
 		}
 	}
 	arguments := append([]string(nil), opts.interpreterArgs...)
-	arguments = append(arguments, script)
+	if phaseContent != "" {
+		// POSIX sh -c takes the next argument as $0, then binds the original
+		// source-script arguments to $1 onward. An ordinary -script invocation
+		// still executes its original on-disk source path directly.
+		arguments = append(arguments, "-c", phaseContent, script)
+	} else {
+		arguments = append(arguments, script)
+	}
 	arguments = append(arguments, opts.scriptArgs...)
 	command := scriptCommandContext(ctx, interpreter, arguments...)
 	if toolsetAliasRoot != nil {
@@ -505,15 +568,15 @@ func runScriptContext(ctx context.Context, opts scriptRunOptions) error {
 	}
 	if err := verifyScriptReplayReceipts(preparedReplays); err != nil {
 		if commandErr != nil {
-			return fmt.Errorf("execute source script: %v; verify command replay outputs: %w", commandErr, err)
+			return fmt.Errorf("execute source script: %v; verify command replay outputs: %w", commandErr, &scriptReplaySafetyError{err})
 		}
-		return fmt.Errorf("verify command replay outputs: %w", err)
+		return fmt.Errorf("verify command replay outputs: %w", &scriptReplaySafetyError{err})
 	}
 	if brokerErr != nil {
 		if commandErr != nil {
-			return fmt.Errorf("execute source script: %v; stop command replay broker: %w", commandErr, brokerErr)
+			return fmt.Errorf("execute source script: %v; stop command replay broker: %w", commandErr, &scriptReplaySafetyError{brokerErr})
 		}
-		return fmt.Errorf("stop command replay broker: %w", brokerErr)
+		return fmt.Errorf("stop command replay broker: %w", &scriptReplaySafetyError{brokerErr})
 	}
 	if commandErr != nil {
 		return fmt.Errorf("execute source script: %w", commandErr)
@@ -698,6 +761,163 @@ func requireSourceScript(filename string) (string, error) {
 	}
 	if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maxScriptBytes {
 		return "", fmt.Errorf("source script %q is not a bounded regular file", filename)
+	}
+	return absolute, nil
+}
+
+func parseScriptSourceSpans(values []string) ([]scriptSourceSpan, error) {
+	if len(values) > maxScriptSourceSpans {
+		return nil, fmt.Errorf("source script phase has %d spans, maximum %d", len(values), maxScriptSourceSpans)
+	}
+	spans := make([]scriptSourceSpan, 0, len(values))
+	for _, value := range values {
+		startText, endText, ok := strings.Cut(value, ":")
+		start, startErr := strconv.ParseUint(startText, 10, 64)
+		end, endErr := strconv.ParseUint(endText, 10, 64)
+		if !ok || startErr != nil || endErr != nil ||
+			strconv.FormatUint(start, 10) != startText || strconv.FormatUint(end, 10) != endText {
+			return nil, fmt.Errorf("source script span %q must be canonical START:END decimal byte offsets", value)
+		}
+		if end <= start || end > maxScriptBytes {
+			return nil, fmt.Errorf("source script span %q must have 0 <= START < END <= %d", value, maxScriptBytes)
+		}
+		if len(spans) != 0 && start < spans[len(spans)-1].end {
+			return nil, fmt.Errorf("source script span %q overlaps or precedes the previous span", value)
+		}
+		spans = append(spans, scriptSourceSpan{start: start, end: end})
+	}
+	return spans, nil
+}
+
+func validateScriptSourcePhaseOptions(opts scriptRunOptions) error {
+	if len(opts.scriptSourceSpans) == 0 {
+		if opts.scriptSourceEmit != "" {
+			return fmt.Errorf("source script emission requires at least one source span")
+		}
+		if opts.scriptSourceSHA256 != "" {
+			return fmt.Errorf("source script SHA256 requires at least one source span")
+		}
+		return nil
+	}
+	if opts.script == "" || opts.scriptContent != "" || opts.scriptStdin {
+		return fmt.Errorf("source script phase requires a declared source script without evaluated content or stdin script")
+	}
+	if opts.scriptSourceEmit != "" && (opts.interpreter != "" || len(opts.interpreterArgs) != 0 ||
+		opts.multicall != "" || len(opts.scriptArgs) != 0 || len(opts.applets) != 0 ||
+		len(opts.requiredApplets) != 0 || len(opts.tools) != 0 || len(opts.trees) != 0 ||
+		len(opts.literalTreeOffsets) != 0 || len(opts.replays) != 0 || opts.maxFileSizeBytes != 0) {
+		return fmt.Errorf("source script emission cannot be combined with script execution options")
+	}
+	if len(opts.scriptSourceSpans) > maxScriptSourceSpans {
+		return fmt.Errorf("source script phase has %d spans, maximum %d", len(opts.scriptSourceSpans), maxScriptSourceSpans)
+	}
+	digest, err := hex.DecodeString(opts.scriptSourceSHA256)
+	if err != nil || len(digest) != sha256.Size || hex.EncodeToString(digest) != opts.scriptSourceSHA256 {
+		return fmt.Errorf("source script phase requires a lowercase 64-character SHA256 digest")
+	}
+	for index, span := range opts.scriptSourceSpans {
+		if span.end <= span.start || span.end > maxScriptBytes {
+			return fmt.Errorf("source script span %d must have 0 <= START < END <= %d", index, maxScriptBytes)
+		}
+		if index > 0 && span.start < opts.scriptSourceSpans[index-1].end {
+			return fmt.Errorf("source script span %d overlaps or precedes the previous span", index)
+		}
+	}
+	return nil
+}
+
+func sourceScriptPhaseContent(script, expectedSHA256 string, spans []scriptSourceSpan) (string, error) {
+	file, err := os.Open(script)
+	if err != nil {
+		return "", fmt.Errorf("open source script for phase: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("inspect source script for phase: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maxScriptBytes {
+		return "", fmt.Errorf("source script %q is not a bounded regular file", script)
+	}
+	source, err := io.ReadAll(io.LimitReader(file, maxScriptBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read source script for phase: %w", err)
+	}
+	if len(source) > maxScriptBytes {
+		return "", fmt.Errorf("source script phase exceeds %d bytes", maxScriptBytes)
+	}
+	digest := sha256.Sum256(source)
+	if hex.EncodeToString(digest[:]) != expectedSHA256 {
+		return "", fmt.Errorf("source script SHA256 does not match the declared phase source")
+	}
+	var content strings.Builder
+	for index, span := range spans {
+		if span.end > uint64(len(source)) {
+			return "", fmt.Errorf("source script span %d ends past the source file", index)
+		}
+		if span.start > 0 && source[span.start-1] != '\n' ||
+			span.end < uint64(len(source)) && source[span.end-1] != '\n' {
+			return "", fmt.Errorf("source script span %d must select whole source lines", index)
+		}
+		selected := source[span.start:span.end]
+		if bytes.IndexByte(selected, 0) >= 0 {
+			return "", fmt.Errorf("source script span %d contains a NUL byte", index)
+		}
+		content.Write(selected)
+	}
+	return content.String(), nil
+}
+
+// Emit only the bytes authenticated against the declared source script. The
+// output is a separate Bazel-declared file, opened exclusively so a source
+// input, symlink, or earlier writer cannot be replaced by this mode.
+func emitScriptSourcePhase(opts scriptRunOptions) error {
+	destination, err := scriptSourceEmitDestination(opts.scriptSourceEmit)
+	if err != nil {
+		return err
+	}
+	script, err := requireSourceScript(opts.script)
+	if err != nil {
+		return err
+	}
+	content, err := sourceScriptPhaseContent(script, opts.scriptSourceSHA256, opts.scriptSourceSpans)
+	if err != nil {
+		return err
+	}
+	parent := filepath.Dir(destination)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return fmt.Errorf("create source script phase output directory: %w", err)
+	}
+	resolvedParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return fmt.Errorf("inspect source script phase output directory: %w", err)
+	}
+	if resolvedParent != parent {
+		return fmt.Errorf("source script phase output directory %q traverses a symlink", parent)
+	}
+	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create source script phase output: %w", err)
+	}
+	_, writeErr := io.WriteString(output, content)
+	closeErr := output.Close()
+	if writeErr != nil || closeErr != nil {
+		_ = os.Remove(destination)
+		return fmt.Errorf("write source script phase output: %w", errors.Join(writeErr, closeErr))
+	}
+	return nil
+}
+
+func scriptSourceEmitDestination(destination string) (string, error) {
+	if destination == "" || strings.TrimSpace(destination) != destination ||
+		strings.ContainsAny(destination, "\x00\r\n") || filepath.Clean(destination) != destination ||
+		destination == "." || destination == string(filepath.Separator) ||
+		destination == ".." || strings.HasPrefix(destination, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("source script phase output requires a canonical file path without parent traversal")
+	}
+	absolute, err := filepath.Abs(destination)
+	if err != nil {
+		return "", fmt.Errorf("resolve source script phase output: %w", err)
 	}
 	return absolute, nil
 }
@@ -901,7 +1121,10 @@ func validateReplayManifests(manifests []scriptReplayManifest, tools map[string]
 		if _, exists := tools[manifest.Name]; exists {
 			return fmt.Errorf("command replay %q collides with an external tool", manifest.Name)
 		}
-		if len(manifest.Invocations) == 0 {
+		if manifest.DenyAll && len(manifest.Invocations) != 0 {
+			return fmt.Errorf("command replay %q denies all invocations but declares %d", manifest.Name, len(manifest.Invocations))
+		}
+		if !manifest.DenyAll && len(manifest.Invocations) == 0 {
 			return fmt.Errorf("command replay %q has no declared invocations", manifest.Name)
 		}
 		totalInvocations += len(manifest.Invocations)
@@ -960,6 +1183,7 @@ func prepareScriptReplayRuntime(manifest scriptReplayManifest) (*scriptReplayRun
 	}
 	runtimeManifest := &scriptReplayRuntimeManifest{
 		Name:        manifest.Name,
+		DenyAll:     manifest.DenyAll,
 		Invocations: make([]scriptReplayRuntimeInvocation, len(manifest.Invocations)),
 	}
 	for invocationIndex, invocation := range manifest.Invocations {
@@ -1191,6 +1415,9 @@ func (broker *scriptReplayBroker) serve() error {
 		}
 		broker.mu.Lock()
 		if broker.closing {
+			if broker.requestErr == nil {
+				broker.requestErr = fmt.Errorf("command replay connection rejected during broker shutdown")
+			}
 			broker.mu.Unlock()
 			_ = connection.Close()
 			continue
@@ -1220,7 +1447,16 @@ func (broker *scriptReplayBroker) handle(connection *net.UnixConn) {
 	}
 	exitCode, message := scriptReplayResult(err)
 	_ = connection.SetWriteDeadline(time.Now().Add(scriptReplayIOTimeout))
-	_ = writeScriptReplayResponse(connection, exitCode, message)
+	if responseErr := writeScriptReplayResponse(connection, exitCode, message); responseErr != nil && err == nil {
+		err = fmt.Errorf("write command replay response: %w", responseErr)
+	}
+	if err != nil {
+		broker.mu.Lock()
+		if broker.requestErr == nil {
+			broker.requestErr = err
+		}
+		broker.mu.Unlock()
+	}
 }
 
 func (broker *scriptReplayBroker) Close() error {
@@ -1231,10 +1467,16 @@ func (broker *scriptReplayBroker) Close() error {
 		broker.mu.Unlock()
 		acceptErr := <-broker.acceptDone
 		broker.handlers.Wait()
+		broker.mu.Lock()
+		requestErr := broker.requestErr
+		broker.mu.Unlock()
 		if listenerErr != nil && !errors.Is(listenerErr, net.ErrClosed) {
 			broker.closeErr = listenerErr
 		} else if acceptErr != nil && !errors.Is(acceptErr, net.ErrClosed) {
 			broker.closeErr = acceptErr
+		}
+		if requestErr != nil {
+			broker.closeErr = errors.Join(broker.closeErr, fmt.Errorf("command replay request failed: %w", requestErr))
 		}
 		close(broker.closeDone)
 	})
@@ -1247,6 +1489,12 @@ func (broker *scriptReplayBroker) evaluate(replayID uint32, arguments []string) 
 		return fmt.Errorf("unknown command replay identity %d", replayID)
 	}
 	manifest := broker.replays[replayID]
+	if manifest.DenyAll {
+		return &scriptReplayProxyFailure{
+			exitCode: 64,
+			message:  "command replay " + manifest.Name + " rejects all invocations",
+		}
+	}
 	for _, invocation := range manifest.Invocations {
 		if !equalScriptReplayArguments(arguments, invocation.Arguments) {
 			continue
@@ -1703,11 +1951,21 @@ func main() {
 		}
 		return
 	}
-	var appletFlags, interpreterArgs, literalTreeOffsetFlags, replayFlags, requiredAppletFlags, toolFlags, treeFlags repeatedFlag
+	var appletFlags, interpreterArgs, literalTreeOffsetFlags, replayFlags, requiredAppletFlags, scriptSourceSpanFlags, toolFlags, treeFlags repeatedFlag
 	var maxFileSize maxFileSizeFlag
 	interpreter := flag.String("interpreter", "", "declared interpreter executable")
 	multicall := flag.String("multicall", "", "optional declared multicall executable used to populate PATH")
 	script := flag.String("script", "", "declared source script")
+	staticSourceAssignments := flag.String("static_source_assignments", "", "staged generated assignment file required to be static before source script execution")
+	scriptSourceSHA256 := flag.String("script_source_sha256", "", "SHA256 of the declared source script used for a source-derived phase")
+	var scriptSourceEmit string
+	flag.Func("script_source_emit", "emit authenticated source-phase bytes to this declared output without executing", func(value string) error {
+		if value == "" || scriptSourceEmit != "" {
+			return fmt.Errorf("script_source_emit requires one nonempty output path")
+		}
+		scriptSourceEmit = value
+		return nil
+	})
 	scriptContentRaw := flag.String("script_content", "", "raw evaluated Kbuild recipe")
 	scriptContentBase64 := flag.String("script_content_base64", "", "base64-encoded evaluated Kbuild recipe")
 	scriptStdin := flag.Bool("script_stdin", false, "read evaluated Kbuild recipe from stdin")
@@ -1718,6 +1976,7 @@ func main() {
 	flag.Var(&appletFlags, "applet", "runtime applet override NAME=EXECUTABLE (repeatable)")
 	flag.Var(&requiredAppletFlags, "require_applet", "runtime applet required by evaluated script (repeatable)")
 	flag.Var(&replayFlags, "replay_base64", "base64-encoded exact command replay manifest (repeatable)")
+	flag.Var(&scriptSourceSpanFlags, "script_source_span", "source-derived phase byte offsets START:END (repeatable)")
 	flag.Var(&toolFlags, "tool", "external script tool NAME=EXECUTABLE (repeatable)")
 	flag.Var(&treeFlags, "tree", "evaluated-script tree binding NAME=ROOT (repeatable)")
 	flag.Var(&literalTreeOffsetFlags, "literal_tree_offset", "byte offset of a literal evaluated-script tree marker (repeatable)")
@@ -1734,6 +1993,10 @@ func main() {
 	literalTreeOffsets := map[int]bool{}
 	if err == nil {
 		literalTreeOffsets, err = parseLiteralTreeOffsets(literalTreeOffsetFlags)
+	}
+	var sourceSpans []scriptSourceSpan
+	if err == nil {
+		sourceSpans, err = parseScriptSourceSpans(scriptSourceSpanFlags)
 	}
 	var replays []scriptReplayManifest
 	if err == nil {
@@ -1756,7 +2019,7 @@ func main() {
 		if err == nil {
 			err = runScriptWithFallback(scriptRunOptions{
 				interpreter: *interpreter, interpreterArgs: interpreterArgs, multicall: *multicall,
-				script: *script, scriptContent: scriptContent, scriptStdin: *scriptStdin, scriptArgs: flag.Args(), applets: applets, requiredApplets: requiredAppletFlags, tools: tools, trees: trees, literalTreeOffsets: literalTreeOffsets, toolContracts: contracts,
+				script: *script, scriptContent: scriptContent, scriptStdin: *scriptStdin, scriptSourceSHA256: *scriptSourceSHA256, scriptSourceSpans: sourceSpans, scriptSourceEmit: scriptSourceEmit, staticSourceAssignments: *staticSourceAssignments, scriptArgs: flag.Args(), applets: applets, requiredApplets: requiredAppletFlags, tools: tools, trees: trees, literalTreeOffsets: literalTreeOffsets, toolContracts: contracts,
 				runtimeToolPath:  os.Getenv(toolaction.RuntimeToolPathEnvironmentName),
 				toolsetHandoff:   os.Getenv(toolsetpath.HandoffEnvironmentName),
 				replays:          replays,

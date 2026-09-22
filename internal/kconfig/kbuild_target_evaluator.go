@@ -793,12 +793,15 @@ func compactKbuildSelectedCommandEnvironmentEffects(
 	values map[string]string,
 	text string,
 ) ([]KbuildActionRoleRef, []KbuildActionRoleRef, []KbuildDeferredContentQuery, error) {
-	parsed, err := parseCompactKbuildRecipe(
-		compactKbuildProfileCanonicalRecipeText(profile, text),
-		automatic,
+	// The selected Make text may join two planner-injected roots, such as
+	// $(srctree)/$(src). Canonicalize their private provenance before parsing
+	// script argv: the left root owns the resulting path. The final action
+	// lowerer applies this same rooted conversion to the executable recipe.
+	canonical := compactKbuildFinalizeRootedActionRecipeText(
+		compactKbuildProfileEvaluatedRootedActionRecipeText(profile, text),
 	)
+	parsed, err := parseCompactKbuildRecipe(canonical, automatic)
 	if err != nil {
-		canonical := compactKbuildProfileCanonicalRecipeText(profile, text)
 		commands, commandErr := compactKbuildCompoundProgramCommands(canonical)
 		if commandErr != nil {
 			// Program discovery is an environment-projection refinement, not a
@@ -1075,6 +1078,7 @@ func compactKbuildTargetParserWithExportsForLookup(
 	commandLineValues := map[string]kbuildVariable{}
 	commandLineDefined := map[string]bool{}
 	commandLineExported := map[string]bool{}
+	commandLineExportedWhen := map[string]string{}
 	commandLineCaptured := map[string]bool{}
 	for _, variables := range variablePrograms {
 		for _, variable := range variables {
@@ -1085,6 +1089,7 @@ func compactKbuildTargetParserWithExportsForLookup(
 			commandLineCaptured[name] = true
 			commandLineValues[name], commandLineDefined[name] = parser.lookupVariable(name)
 			commandLineExported[name] = parser.exported[name]
+			commandLineExportedWhen[name] = parser.exportedWhen[name]
 		}
 	}
 	type targetVariableFrameState struct {
@@ -1098,7 +1103,7 @@ func compactKbuildTargetParserWithExportsForLookup(
 			state := states[name]
 			override := slices.Contains(variable.Modifiers, "override")
 			if state.override && !override {
-				if collectExports {
+				if collectExports || parser.shellBaseExported != nil {
 					applyKbuildTargetVariableExportModifiers(parser, variable)
 				}
 				continue
@@ -1111,16 +1116,21 @@ func compactKbuildTargetParserWithExportsForLookup(
 						parser.undefineVariable(name)
 					}
 					if collectExports {
-						if commandLineExported[name] {
+						if condition := commandLineExportedWhen[name]; condition != "" {
+							parser.exportedWhen[name] = condition
+							delete(parser.exported, name)
+						} else if commandLineExported[name] {
+							delete(parser.exportedWhen, name)
 							parser.exported[name] = true
 						} else {
+							delete(parser.exportedWhen, name)
 							delete(parser.exported, name)
 						}
 					}
 					state.established = true
 					states[name] = state
 				}
-				if collectExports {
+				if collectExports || parser.shellBaseExported != nil {
 					applyKbuildTargetVariableExportModifiers(parser, variable)
 				}
 				continue
@@ -1137,7 +1147,7 @@ func compactKbuildTargetParserWithExportsForLookup(
 			state.established = true
 			state.override = state.override || override
 			states[name] = state
-			if collectExports {
+			if collectExports || parser.shellBaseExported != nil {
 				applyKbuildTargetVariableExportModifiers(parser, variable)
 			}
 		}
@@ -1149,8 +1159,18 @@ func applyKbuildTargetVariableExportModifiers(parser *kbuildParser, variable Kbu
 	for _, modifier := range variable.Modifiers {
 		switch modifier {
 		case "export":
+			if parser.shellBaseExported != nil {
+				parser.shellExportOverrides[variable.Variable] = true
+				continue
+			}
+			delete(parser.exportedWhen, variable.Variable)
 			parser.exported[variable.Variable] = true
 		case "unexport":
+			if parser.shellBaseExported != nil {
+				parser.shellExportOverrides[variable.Variable] = false
+				continue
+			}
+			delete(parser.exportedWhen, variable.Variable)
 			delete(parser.exported, variable.Variable)
 		}
 	}
@@ -1218,10 +1238,24 @@ func compactKbuildProfileTargetEvaluator(
 	profile CompactKbuildProfile,
 	target string,
 ) (*kbuildTargetEvaluator, error) {
+	graphTarget := compactKbuildGraphTargetPath(target)
+	if lines := profile.targetLineReadSnapshots[graphTarget]; len(lines) > 1 {
+		first := lines[0]
+		for _, line := range lines[1:] {
+			if identity := line.ReadIdentity(); identity != first.ReadIdentity() &&
+				(identity != "" || first.ReadIdentity() != "") {
+				return nil, fmt.Errorf("Kbuild profile %q target %q has executable lines with different file reads; evaluate the selected recipe line snapshot", profile.Name, target)
+			}
+			if line.Evaluation.Profile.controlGeneration != first.Evaluation.Profile.controlGeneration ||
+				!maps.Equal(line.Environment, first.Environment) ||
+				line.CommandShell != first.CommandShell {
+				return nil, fmt.Errorf("Kbuild profile %q target %q has executable lines with different control state, exported environment, or CONFIG_SHELL; evaluate the selected recipe line snapshot", profile.Name, target)
+			}
+		}
+	}
 	if err := ActivateCompactKbuildProfileTargetProbeEnvironment(profile, target); err != nil {
 		return nil, err
 	}
-	graphTarget := compactKbuildGraphTargetPath(target)
 	evaluator := profile.evaluator
 	if graphTarget != "" {
 		if selected := profile.targetEvaluators[graphTarget]; selected != nil {
@@ -1337,6 +1371,9 @@ func evaluateCompactKbuildTargetEnvironmentForMakeTarget(
 		return nil, err
 	}
 	defer cleanup()
+	if err := parser.resolveExportedMembership(); err != nil {
+		return nil, fmt.Errorf("Kbuild target %q: %w", target, err)
+	}
 
 	names := make([]string, 0, len(parser.exported))
 	for name, exported := range parser.exported {
@@ -1368,8 +1405,43 @@ func evaluateCompactKbuildTargetEnvironmentForMakeTarget(
 	return values, nil
 }
 
+// CompactKbuildGraphGuards returns source conditional expressions which need
+// measured results before this invocation can select its exported environment,
+// source includes, or executable recipe lines. No unset/empty export default
+// is inferred from an unresolved expression.
+func CompactKbuildGraphGuards(profile CompactKbuildProfile) []string {
+	if profile.evaluator == nil || profile.evaluator.template == nil {
+		return nil
+	}
+	template := profile.evaluator.template
+	guards := slices.Clone(template.deferredGraphGuards)
+	for _, conditional := range template.exportedWhen {
+		if linuxProbeSymbolPattern.MatchString(conditional) {
+			guards = append(guards, conditional)
+		}
+	}
+	// An exported value becomes inherited Make state in the selected child.
+	// Inspect unconditional exports too: a source conditional can change the
+	// inherited value without changing whether the variable is exported.
+	for name := range template.exported {
+		if variable, defined := template.lookupVariable(name); defined &&
+			linuxProbeSymbolPattern.MatchString(variable.value) {
+			guards = append(guards, variable.value)
+		}
+	}
+	for name := range template.exportedWhen {
+		if variable, defined := template.lookupVariable(name); defined &&
+			linuxProbeSymbolPattern.MatchString(variable.value) {
+			guards = append(guards, variable.value)
+		}
+	}
+	slices.Sort(guards)
+	return slices.Compact(guards)
+}
+
 func cloneKbuildParserForEvaluation(template *kbuildParser) *kbuildParser {
 	parser := *template
+	parser.parseTimeObjectEffects = false
 	parser.kb = &KbuildFile{}
 	parser.environmentVariables = maps.Clone(template.environmentVariables)
 	parser.vars = make(map[string]kbuildVariable, len(template.baseVars)+len(template.vars))
@@ -1381,6 +1453,8 @@ func cloneKbuildParserForEvaluation(template *kbuildParser) *kbuildParser {
 	}
 	parser.baseVars = nil
 	parser.exported = maps.Clone(template.exported)
+	parser.exportedWhen = maps.Clone(template.exportedWhen)
+	parser.deferredGraphGuards = slices.Clone(template.deferredGraphGuards)
 	parser.undefined = maps.Clone(template.undefined)
 	parser.symbolicVariables = maps.Clone(template.symbolicVariables)
 	parser.renderedValueProjections = nil
@@ -1406,6 +1480,7 @@ func cloneKbuildParserForTargetEvaluation(
 	collectExports bool,
 ) *kbuildParser {
 	parser := *template
+	parser.parseTimeObjectEffects = false
 	parser.kb = &KbuildFile{}
 	if len(template.baseVars) == 0 {
 		parser.baseVars = template.vars
@@ -1420,13 +1495,22 @@ func cloneKbuildParserForTargetEvaluation(
 		}
 	}
 	parser.vars = make(map[string]kbuildVariable, overlayCapacity)
+	parser.deferredGraphGuards = slices.Clone(template.deferredGraphGuards)
 	if collectExports {
 		parser.exported = maps.Clone(template.exported)
+		parser.exportedWhen = maps.Clone(template.exportedWhen)
+		parser.shellBaseExported = nil
+		parser.shellBaseExportedWhen = nil
+		parser.shellExportOverrides = nil
 	} else {
 		// Expansion may evaluate an `export` directive even when the caller does
 		// not consume the resulting environment. Keep a small writable map, but
 		// do not clone the invocation's complete export set for every command.
 		parser.exported = map[string]bool{}
+		parser.exportedWhen = map[string]string{}
+		parser.shellBaseExported = template.exported
+		parser.shellBaseExportedWhen = template.exportedWhen
+		parser.shellExportOverrides = map[string]bool{}
 	}
 	parser.undefined = maps.Clone(template.undefined)
 	// Target-specific assignment and lazy expansion both invalidate symbolic

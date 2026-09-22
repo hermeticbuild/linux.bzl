@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
     name = "scriptrun_lib",
-    srcs = ["main.go"],
+    srcs = [
+        "main.go",
+        "static_source_assignments.go",
+    ],
     importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/scriptrun",
     visibility = ["//visibility:private"],
     deps = [

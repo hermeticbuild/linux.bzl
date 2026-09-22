@@ -1383,6 +1383,317 @@ right/%.o: right/%.S FORCE
 	}
 }
 
+func TestCompactKbuildSelectionGraphRetainsDirectoryControlGoalPrerequisites(t *testing.T) {
+	parent := mustCompactKbuildProfileForTest(t, "root", "Makefile", "", `
+build-dir := .
+.PHONY: prepare $(build-dir)
+cmd_prepare = touch $@
+include/generated/prepared.h: FORCE
+	$(call if_changed,prepare)
+prepare: include/generated/prepared.h
+$(build-dir): prepare
+	$(MAKE) -f scripts/Makefile.build obj=.
+`, nil)
+	child := mustCompactKbuildProfileForTest(t, "build:.", "scripts/Makefile.build", "", `
+obj := .
+modules.order: FORCE
+	touch $@
+`, nil)
+	child.EntryTargets = []string{"modules.order"}
+	setTestCompactKbuildInitialVisibleArtifacts(t, &child, []CompactKbuildVisibleArtifact{{
+		Path: "include/generated/prepared.h", Profile: parent.Name, Target: "include/generated/prepared.h",
+	}})
+	parent.TargetInvocationDependencies = []CompactKbuildInvocationDependency{{
+		Target: ".", Profile: child.Name, Goals: child.EntryTargets,
+	}}
+	config := CompactConfig{
+		KbuildProfiles: []CompactKbuildProfile{parent, child},
+		KbuildSelections: []CompactKbuildSelection{
+			{Profile: parent.Name, Target: "include/generated/prepared.h", MakeTarget: "include/generated/prepared.h", Lifecycle: "prep", Scope: "target", Stage: "prep"},
+			{Profile: child.Name, Target: "modules.order", MakeTarget: "modules.order", Lifecycle: "target", Scope: "target", Stage: "target"},
+		},
+	}
+	graph, err := newCompactKbuildSelectionGraph(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{Config: config}
+	match, matched, err := graph.compactKbuildSelectedPhonyRuleForMakeTarget(metadata, parent, ".", ".")
+	if err != nil || !matched || !match.explicit || match.lookupTarget != "." {
+		t.Fatalf("directory control goal rule = (%#v, %t, %v), want exact matched source rule", match, matched, err)
+	}
+	resolutionKey := compactKbuildRuleResolutionKey{
+		metadata: metadata, compactKbuildProfileTargetKey: compactKbuildProfileTargetKey{profile: parent.Name, target: "."},
+		makeTarget: ".",
+	}
+	if _, found := graph.ruleResolutions[resolutionKey]; !found {
+		t.Fatal("directory control goal rule lookup lost its graph target identity")
+	}
+	normal, orderOnly, _, err := graph.compactKbuildTargetRuleContext(parent, ".", match)
+	if err != nil {
+		t.Fatalf("directory control goal rule context: %v", err)
+	}
+	if len(orderOnly) != 0 || len(normal) != 1 || normal[0].graphPath != "prepare" {
+		t.Fatalf("directory control goal prerequisites = (%#v, %#v), want prepare before child invocation", normal, orderOnly)
+	}
+	key := compactKbuildProfileTargetKey{profile: parent.Name, target: "."}
+	if got := graph.targetInvocations[key]; !slices.Equal(got, []string{child.Name}) {
+		t.Fatalf("directory control goal child invocations = %q, want %q", got, child.Name)
+	}
+	if !graph.compactKbuildProfileTargetIsPhony(parent, ".") {
+		t.Fatal("directory control goal lost its PHONY status")
+	}
+	if owner, found := graph.owner("."); found || owner != (compactKbuildSelectionKey{}) ||
+		len(graph.selectionsByTarget["."]) != 0 || len(graph.nativeOwners["."]) != 0 {
+		t.Fatalf("directory control goal became a file artifact: owner=%#v, found=%t", owner, found)
+	}
+	childKey := compactKbuildSelectionKey{profile: child.Name, target: "modules.order", stage: "target"}
+	preparedKey := compactKbuildSelectionKey{profile: parent.Name, target: "include/generated/prepared.h", stage: "prep"}
+	dependencies, err := graph.selectionDependencies(metadata, childKey)
+	if err != nil {
+		t.Fatalf("directory control goal parent frontier: %v", err)
+	}
+	if !slices.Contains(dependencies, preparedKey) {
+		t.Fatalf("directory child dependencies = %#v, want prepare writer %#v", dependencies, preparedKey)
+	}
+	ordered, err := graph.materializationOrder(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ordered) != 2 || ordered[0].Profile != parent.Name || ordered[0].Target != preparedKey.target ||
+		ordered[1].Profile != child.Name || ordered[1].Target != childKey.target {
+		t.Fatalf("directory child materialization order = %#v, want prepare writer before modules.order", ordered)
+	}
+}
+
+func TestCompactKbuildParentPrerequisitesFollowRecursiveOnlyPhonyControl(t *testing.T) {
+	parent, _, _ := selectedControlTestProfile(t, `
+.PHONY: . prepare prepare0 archprepare
+cmd_prepare = touch $@
+include/generated/prepared.h: FORCE
+	$(call if_changed,prepare)
+archprepare:
+prepare0: archprepare
+	@$(MAKE) -f scripts/Makefile.prep
+prepare: prepare0 include/generated/prepared.h
+.: prepare
+	@$(MAKE) -f scripts/Makefile.build
+`, map[string]string{"MAKE": CompactKbuildRecursiveMakeProvenanceToken})
+	stepper, err := NewSelectedKbuildControlStepper(parent, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget("prepare0", "prepare0", ""); err != nil {
+		t.Fatal(err)
+	}
+	line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+		Target: "prepare0", RuleIndex: selectedControlTestRuleIndex(t, parent, "prepare0"), RecipeIndex: 0,
+	}, selectedControlTestFrontier("before-recursive-prepare", selectedControlTestFiles{}, KbuildControlReadArtifact{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stepper.ApplyRecipe(line); err != nil {
+		t.Fatal(err)
+	}
+	evaluation, err := stepper.Finish(selectedControlTestFrontier("after-recursive-prepare", selectedControlTestFiles{}, KbuildControlReadArtifact{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent = evaluation.Profile
+	prepareChild := mustCompactKbuildProfileForTest(t, "build:prep", "scripts/Makefile.prep", "", `
+ready.txt:
+	@touch $@
+`, nil)
+	prepareChild.EntryTargets = []string{"ready.txt"}
+	buildChild := mustCompactKbuildProfileForTest(t, "build:.", "scripts/Makefile.build", "", `
+modules.order:
+	@touch $@
+`, nil)
+	buildChild.EntryTargets = []string{"modules.order"}
+	buildChild.InvocationPredecessors = []string{prepareChild.Name}
+	setTestCompactKbuildInitialVisibleArtifacts(t, &buildChild, []CompactKbuildVisibleArtifact{
+		{Path: "include/generated/prepared.h", Profile: parent.Name, Target: "include/generated/prepared.h"},
+		{Path: "ready.txt", Profile: prepareChild.Name, Target: "ready.txt"},
+	})
+	parent.TargetInvocationDependencies = []CompactKbuildInvocationDependency{
+		{Target: "prepare0", Profile: prepareChild.Name, Goals: prepareChild.EntryTargets,
+			ReplayArguments: []string{"-f", "scripts/Makefile.prep"}},
+		{Target: ".", Profile: buildChild.Name, Goals: buildChild.EntryTargets,
+			ReplayArguments: []string{"-f", "scripts/Makefile.build"}},
+	}
+	config := CompactConfig{
+		KbuildProfiles: []CompactKbuildProfile{parent, prepareChild, buildChild},
+		KbuildSelections: []CompactKbuildSelection{
+			{Profile: parent.Name, Target: "include/generated/prepared.h", MakeTarget: "include/generated/prepared.h", Lifecycle: "prep", Scope: "target", Stage: "prep"},
+			{Profile: prepareChild.Name, Target: "ready.txt", MakeTarget: "ready.txt", Lifecycle: "prep", Scope: "target", Stage: "prep"},
+			{Profile: buildChild.Name, Target: "modules.order", MakeTarget: "modules.order", Lifecycle: "target", Scope: "target", Stage: "target"},
+		},
+	}
+	graph, err := newCompactKbuildSelectionGraph(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{Config: config}
+	consumer := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: buildChild.Name, target: "modules.order"}]
+	dependencies, err := graph.selectionDependencies(metadata, consumer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, predecessor := range []compactKbuildSelectionKey{
+		graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: prepareChild.Name, target: "ready.txt"}],
+		graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: parent.Name, target: "include/generated/prepared.h"}],
+	} {
+		if !slices.Contains(dependencies, predecessor) {
+			t.Fatalf("recursive-only PHONY parent dependencies = %#v, want %s", dependencies, compactKbuildSelectionKeyString(predecessor))
+		}
+	}
+	if _, found := graph.owner("prepare0"); found {
+		t.Fatal("recursive-only PHONY control became a file owner")
+	}
+}
+
+func TestCompactKbuildParentPrerequisitesDoNotImportFutureRecursiveSibling(t *testing.T) {
+	const source = `
+.PHONY: all sequence
+sequence:
+	@$(MAKE) -f scripts/first.mk
+	@$(MAKE) -f scripts/second.mk
+all: sequence
+	@$(MAKE) -f scripts/final.mk
+`
+	parent := mustCompactKbuildProfileForTest(t, "root", "Makefile", "", source,
+		map[string]string{"MAKE": CompactKbuildRecursiveMakeProvenanceToken})
+	first := mustCompactKbuildProfileForTest(t, "first", "scripts/first.mk", "", `
+first.out:
+	@touch $@
+`, nil)
+	first.EntryTargets = []string{"first.out"}
+	second := mustCompactKbuildProfileForTest(t, "second", "scripts/second.mk", "", `
+second.out:
+	@touch $@
+`, nil)
+	second.EntryTargets = []string{"second.out"}
+	second.InvocationPredecessors = []string{first.Name}
+	setTestCompactKbuildInitialVisibleArtifacts(t, &second, []CompactKbuildVisibleArtifact{{
+		Path: "first.out", Profile: first.Name, Target: "first.out",
+	}})
+	final := mustCompactKbuildProfileForTest(t, "final", "scripts/final.mk", "", `
+final.out:
+	@touch $@
+`, nil)
+	final.EntryTargets = []string{"final.out"}
+	final.InvocationPredecessors = []string{second.Name}
+	setTestCompactKbuildInitialVisibleArtifacts(t, &final, []CompactKbuildVisibleArtifact{
+		{Path: "first.out", Profile: first.Name, Target: "first.out"},
+		{Path: "second.out", Profile: second.Name, Target: "second.out"},
+	})
+	parent.TargetInvocationDependencies = []CompactKbuildInvocationDependency{
+		{Target: "sequence", Profile: first.Name, Goals: first.EntryTargets},
+		{Target: "sequence", Profile: second.Name, Goals: second.EntryTargets},
+		// A goal depending on sequence also observes both children while
+		// traversing its prerequisite; its own recipe starts final afterward.
+		{Target: "all", Profile: first.Name, Goals: first.EntryTargets},
+		{Target: "all", Profile: second.Name, Goals: second.EntryTargets},
+		{Target: "all", Profile: final.Name, Goals: final.EntryTargets},
+	}
+	config := CompactConfig{
+		KbuildProfiles: []CompactKbuildProfile{parent, first, second, final},
+		KbuildSelections: []CompactKbuildSelection{
+			{Profile: first.Name, Target: "first.out", MakeTarget: "first.out", Lifecycle: "target", Scope: "target", Stage: "target"},
+			{Profile: second.Name, Target: "second.out", MakeTarget: "second.out", Lifecycle: "target", Scope: "target", Stage: "target"},
+			{Profile: final.Name, Target: "final.out", MakeTarget: "final.out", Lifecycle: "target", Scope: "target", Stage: "target"},
+		},
+	}
+	graph, err := newCompactKbuildSelectionGraph(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{Config: config}
+	key := func(profile, target string) compactKbuildSelectionKey {
+		return compactKbuildSelectionKey{profile: profile, target: target, stage: "target"}
+	}
+	firstKey, secondKey, finalKey := key(first.Name, "first.out"), key(second.Name, "second.out"), key(final.Name, "final.out")
+	for _, test := range []struct {
+		selection compactKbuildSelectionKey
+		want      []compactKbuildSelectionKey
+	}{
+		{selection: firstKey, want: nil},
+		{selection: secondKey, want: []compactKbuildSelectionKey{firstKey}},
+		{selection: finalKey, want: []compactKbuildSelectionKey{secondKey}},
+	} {
+		dependencies, err := graph.selectionDependencies(metadata, test.selection)
+		if err != nil {
+			t.Fatalf("child %s dependencies: %v", compactKbuildSelectionKeyString(test.selection), err)
+		}
+		if !slices.Equal(dependencies, test.want) {
+			t.Fatalf("child %s dependencies = %#v, want %#v", compactKbuildSelectionKeyString(test.selection), dependencies, test.want)
+		}
+	}
+	ordered, err := graph.materializationOrder(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ordered) != 3 || ordered[0].Profile != first.Name || ordered[1].Profile != second.Name || ordered[2].Profile != final.Name {
+		t.Fatalf("source-ordered child materialization = %#v, want first, second, final", ordered)
+	}
+
+	// If the forwarding rule has a selected PHONY status action, it finishes
+	// after both recursive children but before the final parent recipe.
+	statusParent, _, _ := selectedControlTestProfile(t, source,
+		map[string]string{"MAKE": CompactKbuildRecursiveMakeProvenanceToken})
+	stepper, err := NewSelectedKbuildControlStepper(statusParent, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget("sequence", "sequence", ""); err != nil {
+		t.Fatal(err)
+	}
+	for index, frontier := range []string{"before-first-child", "before-second-child"} {
+		line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+			Target: "sequence", RuleIndex: selectedControlTestRuleIndex(t, statusParent, "sequence"), RecipeIndex: index,
+		}, selectedControlTestFrontier(frontier, selectedControlTestFiles{}, KbuildControlReadArtifact{}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stepper.ApplyRecipe(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evaluation, err := stepper.Finish(selectedControlTestFrontier("after-second-child", selectedControlTestFiles{}, KbuildControlReadArtifact{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusParent = evaluation.Profile
+	statusParent.TargetInvocationDependencies = slices.Clone(parent.TargetInvocationDependencies)
+	withStatus := config
+	withStatus.KbuildProfiles = append([]CompactKbuildProfile{statusParent}, config.KbuildProfiles[1:]...)
+	withStatus.KbuildSelections = append(slices.Clone(config.KbuildSelections), CompactKbuildSelection{
+		Profile: parent.Name, Target: "sequence", MakeTarget: "sequence", Lifecycle: "target", Scope: "target", Stage: "target",
+	})
+	statusGraph, err := newCompactKbuildSelectionGraph(withStatus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusMetadata := &CompactMetadata{Config: withStatus}
+	statusKey := key(parent.Name, "sequence")
+	for _, test := range []struct {
+		profile string
+		want    bool
+	}{
+		{profile: first.Name, want: false},
+		{profile: second.Name, want: false},
+		{profile: final.Name, want: true},
+	} {
+		preceding, err := statusGraph.compactKbuildParentPrerequisiteSelections(statusMetadata, test.profile, "target")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := slices.Contains(preceding, statusKey); got != test.want {
+			t.Fatalf("child %s precedes selected sequence status = %t, want %t; dependencies = %#v", test.profile, got, test.want, preceding)
+		}
+	}
+}
+
 func TestCompactKbuildSelectionGraphTraversesLexicalParentPrerequisites(t *testing.T) {
 	const (
 		archive = "arch/x86/kvm/built-in.a"

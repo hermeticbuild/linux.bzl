@@ -2970,16 +2970,20 @@ def linux_test_with_compile_action_arguments(arguments, additional):
 
 def _with_link_runtime_arguments(arguments, runtime_files, owner):
     """Places configured runtime archives after source-selected link inputs."""
+
+    # A source-selected compile/link command can leave an input language such
+    # as -xc active. The runtime Files belong to the configured linker
+    # envelope, so restore ordinary file-type detection before those inputs.
     return _with_compile_action_arguments(
         arguments,
-        [file.path for file in runtime_files],
+        (["-x", "none"] if runtime_files else []) + [file.path for file in runtime_files],
         owner,
     )
 
 def linux_test_with_link_runtime_arguments(arguments, runtime_files):
     return _with_link_runtime_arguments(arguments, runtime_files, "test")
 
-def _kbuild_toolset(ctx, cc_toolchain, scope, additional_compile_flags = []):
+def _kbuild_toolset(ctx, cc_toolchain, scope, additional_compile_flags = [], additional_link_flags = []):
     features = cc_common.configure_features(
         ctx = ctx,
         cc_toolchain = cc_toolchain,
@@ -3049,10 +3053,10 @@ def _kbuild_toolset(ctx, cc_toolchain, scope, additional_compile_flags = []):
         contract_role = _driver_link_contract_role(role)
         compile_owner = _kbuild_action_name(scope, role)
         tools[contract_role] = tools[role]
-        arguments[contract_role] = _merge_action_arguments(
-            link_arguments,
-            arguments[role],
-            "%s %s" % (scope, contract_role),
+        arguments[contract_role] = _with_compile_action_arguments(
+            _merge_action_arguments(link_arguments, arguments[role], "%s %s" % (scope, contract_role)),
+            additional_link_flags,
+            "%s %s dependency link closure" % (scope, contract_role),
         )
         environments[contract_role] = _merge_action_environment(
             link_contract.owner,
@@ -3325,7 +3329,7 @@ def _host_library_artifact(library, what):
     if getattr(library, "alwayslink", False):
         fail("%s requires alwayslink/whole-archive semantics, which cannot be preserved by Linux host dependency staging" % what)
 
-    # A static archive is the native representation for Kbuild's HOSTLD path.
+    # A static archive is the native representation for Kbuild's host links.
     # rules_cc may expose only a PIC archive (notably for elfutils), which is
     # equally valid for an executable link and must not be mistaken for an
     # object-only library.
@@ -3368,6 +3372,18 @@ def _host_dependency_library_search_flags(paths):
             directories[directory] = True
             flags.append("-L" + directory)
     return flags
+
+def _host_dependency_archive_link_flag(staged_path, what):
+    """Passes a declared static archive to HOSTCC's linker as one exact file."""
+    if not staged_path.startswith(_HOST_DEPS_SENTINEL + "/") or not staged_path.endswith(".a"):
+        fail("%s has no declared staged static archive path %r" % (what, staged_path))
+
+    # Kbuild exports these words through Make and a shell. A comma would split
+    # the Clang/GCC -Wl operand; active shell characters would change the path.
+    for character in [",", " ", "\t", "\r", "\n", "\\", "\"", "'", "`", "$", ";", "&", "|", "<", ">", "*", "?", "[", "]", "(", ")"]:
+        if character in staged_path:
+            fail("%s staged static archive path %r cannot be a linker operand" % (what, staged_path))
+    return "-Wl," + staged_path
 
 def _rewrite_host_dependency_link_token(token, paths):
     for source in sorted(paths, key = len, reverse = True):
@@ -3439,6 +3455,9 @@ def linux_test_host_library_artifact(library, what):
 def linux_test_host_dependency_library_search_flags(paths):
     return _host_dependency_library_search_flags(paths)
 
+def linux_test_host_dependency_archive_link_flag(path, what = "test archive"):
+    return _host_dependency_archive_link_flag(path, what)
+
 def linux_test_rewrite_host_dependency_link_flag(flag, paths, what = "test dependency"):
     return _rewrite_host_dependency_link_flag(flag, paths, what)
 
@@ -3483,7 +3502,8 @@ def _host_cc_dependency_projection(target, name):
         for library in _sequence(linker_input.libraries):
             artifact = _host_library_artifact(library, "%s library from %s" % (name, linker_input.owner))
             library_paths.append(staged_paths[artifact.path])
-    link_flags = _host_dependency_library_search_flags(library_paths)
+    library_search_flags = _host_dependency_library_search_flags(library_paths)
+    link_flags = list(library_search_flags)
     for linker_input in linker_inputs:
         for flag in _sequence(linker_input.user_link_flags):
             link_flags.append(_rewrite_host_dependency_link_flag(
@@ -3493,13 +3513,14 @@ def _host_cc_dependency_projection(target, name):
             ))
         for library in _sequence(linker_input.libraries):
             artifact = _host_library_artifact(library, "%s library from %s" % (name, linker_input.owner))
-            link_flags.append(staged_paths[artifact.path])
+            link_flags.append(_host_dependency_archive_link_flag(staged_paths[artifact.path], name))
     if not link_flags:
         fail("%s host dependency has no link inputs" % name)
 
     return struct(
         compile_flags = compile_flags,
         files = staged,
+        library_search_flags = library_search_flags,
         link_flags = link_flags,
     )
 
@@ -3551,7 +3572,8 @@ def _add_host_dependency_variables(args, dependency):
 
 def _add_kernel_kbuild_goals(args):
     args.add("-kbuild_target", "all")
-    args.add("-kbuild_prepare_target", "modules_prepare")
+    args.add("-kbuild_prepare_target", "prepare")
+    args.add("-kbuild_prepare_candidate", "modules_prepare")
 
 def _with_host_generators(
         host,
@@ -3983,7 +4005,6 @@ def _family_variant_plan_outputs(ctx, variant_names, initial):
             auto_conf = ctx.actions.declare_file(config_prefix + ".auto.conf"),
             auto_conf_cmd = ctx.actions.declare_file(config_prefix + ".auto.conf.cmd"),
             autoconf = ctx.actions.declare_file(config_prefix + ".autoconf.h"),
-            kernel_release = ctx.actions.declare_file(config_prefix + ".kernel.release"),
             resolved = ctx.actions.declare_file(config_prefix + ".config"),
             rustc_cfg = ctx.actions.declare_file(config_prefix + ".rustc_cfg"),
             snapshot = ctx.actions.declare_file(prefix + (".action-plan.json.gz" if initial else ".observed-action-plan.json.gz")),
@@ -3996,7 +4017,6 @@ def _family_variant_plan_outputs(ctx, variant_names, initial):
             ("-family_plan_resolved_auto_conf_cmd_out", record.auto_conf_cmd),
             ("-family_plan_resolved_autoconf_out", record.autoconf),
             ("-family_plan_resolved_rustc_cfg_out", record.rustc_cfg),
-            ("-family_plan_resolved_kernel_release_out", record.kernel_release),
             ("-family_plan_snapshot_out", record.snapshot),
         ]:
             _add_artifact_path(args, flag, output, format = variant + "=%s")
@@ -4073,6 +4093,10 @@ def _linux_mapped_kernel_family_impl(ctx):
         host_cc,
         "host",
         additional_compile_flags = libelf.action_compile_flags,
+        additional_link_flags = [
+            flag.replace(_HOST_DEPS_SENTINEL, host_dependencies.tree.path)
+            for flag in libelf.link_flags
+        ],
     )
     host_link_runtime_files = host.link_runtime_files
     host = _with_pkg_config(
@@ -4270,8 +4294,19 @@ def _linux_mapped_kernel_family_impl(ctx):
             target_toolset_manifest,
             target_toolset_anchors,
             target.companion_tools,
+            host_tool_files = host.tools,
+            host_toolchain_files = host_toolchain_files,
+            host_toolset_manifest = host_toolset_manifest,
+            host_toolset_anchors = host_toolset_anchors,
+            host_companion_tools = host.companion_tools,
         ),
-        additional_params = linux_probe_map_directory_params("target", target.arguments, target.environments),
+        additional_params = linux_probe_map_directory_params(
+            "target",
+            target.arguments,
+            target.environments,
+            host_action_args = host.arguments,
+            host_action_environments = host.environments,
+        ),
         env = {},
         execution_requirements = dict(target_requirements, **{"supports-path-mapping": "1"}),
         mnemonic = "LinuxMappedTargetProbe",
@@ -4295,6 +4330,7 @@ def _linux_mapped_kernel_family_impl(ctx):
     _add_artifact_path(kconfig_probe_args, "-host_toolset_identity", host_toolset_identity)
     _add_artifact_path(kconfig_probe_args, "-target_toolset_manifest", target_toolset_manifest)
     _add_artifact_path(kconfig_probe_args, "-host_toolset_manifest", host_toolset_manifest)
+    _add_artifact_path(kconfig_probe_args, "-pkg_config_manifest", pkg_config_manifest)
     _add_artifact_path(kconfig_probe_args, "-target_probe_results", target_probe_results)
     _add_artifact_path(kconfig_probe_args, "-host_probe_results", host_probe_results)
     _add_artifact_path(kconfig_probe_args, "-kconfig_probe_plan_out", kconfig_probe_plan)
@@ -4311,6 +4347,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             host_toolset_identity,
             target_toolset_manifest,
             host_toolset_manifest,
+            pkg_config_manifest,
             target_probe_results,
             host_probe_results,
         ],
@@ -4372,6 +4409,11 @@ def _linux_mapped_kernel_family_impl(ctx):
             target_toolset_manifest,
             target_toolset_anchors,
             target.companion_tools,
+            host_tool_files = host.tools,
+            host_toolchain_files = host_toolchain_files,
+            host_toolset_manifest = host_toolset_manifest,
+            host_toolset_anchors = host_toolset_anchors,
+            host_companion_tools = host.companion_tools,
         ),
         additional_params = linux_probe_map_directory_params(
             "target",
@@ -4379,6 +4421,8 @@ def _linux_mapped_kernel_family_impl(ctx):
             target.environments,
             source_prefix = source_prefix,
             rust_source_root = rust_source_root,
+            host_action_args = host.arguments,
+            host_action_environments = host.environments,
         ),
         env = {},
         execution_requirements = dict(target_requirements, **{"supports-path-mapping": "1"}),
@@ -4399,6 +4443,58 @@ def _linux_mapped_kernel_family_impl(ctx):
     # but request/node IDs are already content-addressed. Generate the fragments
     # independently, then union them before registering any probe action so an
     # identical request executes once for the complete image family.
+    # A measured source guard may select a child whose compiler request has a
+    # different conditional argument DAG. Each round sees only the preceding
+    # measured union. The last round proves convergence and rejects a new
+    # selected terminal instead of using an unmeasured value.
+    graph_guard_round_count = 5
+    graph_guard_probe_plan_fragments = [{} for _ in range(graph_guard_round_count)]
+    graph_guard_probe_plans = []
+    host_graph_guard_probe_round_results = []
+    target_graph_guard_probe_round_results = []
+    for round_index in range(graph_guard_round_count):
+        suffix = "" if round_index == graph_guard_round_count - 1 else ".round-" + str(round_index)
+        graph_guard_probe_plans.append(ctx.actions.declare_directory(ctx.label.name + suffix + ".kbuild-graph-guard-probe-plan"))
+        host_graph_guard_probe_round_results.append(ctx.actions.declare_directory(ctx.label.name + suffix + ".kbuild-graph-guard-results-host"))
+        target_graph_guard_probe_round_results.append(ctx.actions.declare_directory(ctx.label.name + suffix + ".kbuild-graph-guard-results-target"))
+    graph_guard_probe_plan = graph_guard_probe_plans[-1]
+    host_graph_guard_probe_results = host_graph_guard_probe_round_results[-1]
+    target_graph_guard_probe_results = target_graph_guard_probe_round_results[-1]
+
+    # Bazel must declare the whole action DAG during analysis. Five rounds
+    # admit four causally ordered selected writers and a final proof that no
+    # fifth writer was hidden by an earlier pending source read. Exhaustion
+    # fails closed; every pass verifies the current source-selected frontier.
+    source_output_round_count = 5
+    source_output_probe_plan_fragments = [{} for _ in range(source_output_round_count)]
+    source_output_probe_plans = []
+    host_source_output_round_results = []
+    target_source_output_round_results = []
+    for round_index in range(source_output_round_count):
+        suffix = "" if round_index == source_output_round_count - 1 else ".round-" + str(round_index)
+        source_output_probe_plans.append(ctx.actions.declare_directory(ctx.label.name + suffix + ".kbuild-source-output-probe-plan"))
+        host_source_output_round_results.append(ctx.actions.declare_directory(ctx.label.name + suffix + ".kbuild-source-output-results-host"))
+        target_source_output_round_results.append(ctx.actions.declare_directory(ctx.label.name + suffix + ".kbuild-source-output-results-target"))
+    source_output_probe_plan = source_output_probe_plans[-1]
+    host_source_output_results = host_source_output_round_results[-1]
+    target_source_output_results = target_source_output_round_results[-1]
+
+    # A distinct recursive Make child may select another feature include only
+    # after the preceding child's measured status is available. Match the
+    # source-output bound and require the last pass to prove completeness.
+    feature_dump_round_count = 5
+    feature_dump_probe_plan_fragments = [{} for _ in range(feature_dump_round_count)]
+    feature_dump_probe_plans = []
+    host_feature_dump_round_results = []
+    target_feature_dump_round_results = []
+    for round_index in range(feature_dump_round_count):
+        suffix = "" if round_index == feature_dump_round_count - 1 else ".round-" + str(round_index)
+        feature_dump_probe_plans.append(ctx.actions.declare_directory(ctx.label.name + suffix + ".kbuild-feature-dump-probe-plan"))
+        host_feature_dump_round_results.append(ctx.actions.declare_directory(ctx.label.name + suffix + ".kbuild-feature-dump-results-host"))
+        target_feature_dump_round_results.append(ctx.actions.declare_directory(ctx.label.name + suffix + ".kbuild-feature-dump-results-target"))
+    feature_dump_probe_plan = feature_dump_probe_plans[-1]
+    host_feature_dump_probe_results = host_feature_dump_round_results[-1]
+    target_feature_dump_probe_results = target_feature_dump_round_results[-1]
     kbuild_probe_plan_fragments = {}
     kbuild_cpu_profiles = {}
     public_configs = {}
@@ -4420,10 +4516,20 @@ def _linux_mapped_kernel_family_impl(ctx):
         _add_artifact_path(kbuild_probe_args, "-host_toolset_identity", host_toolset_identity)
         _add_artifact_path(kbuild_probe_args, "-target_toolset_manifest", target_toolset_manifest)
         _add_artifact_path(kbuild_probe_args, "-host_toolset_manifest", host_toolset_manifest)
+        _add_artifact_path(kbuild_probe_args, "-pkg_config_manifest", pkg_config_manifest)
         _add_artifact_path(kbuild_probe_args, "-target_probe_results", target_probe_results)
         _add_artifact_path(kbuild_probe_args, "-host_probe_results", host_probe_results)
         _add_artifact_path(kbuild_probe_args, "-host_kconfig_probe_results", host_kconfig_probe_results)
         _add_artifact_path(kbuild_probe_args, "-target_kconfig_probe_results", target_kconfig_probe_results)
+        _add_artifact_path(kbuild_probe_args, "-kbuild_graph_guard_probe_plan", graph_guard_probe_plan)
+        _add_artifact_path(kbuild_probe_args, "-host_kbuild_graph_guard_probe_results", host_graph_guard_probe_results)
+        _add_artifact_path(kbuild_probe_args, "-target_kbuild_graph_guard_probe_results", target_graph_guard_probe_results)
+        _add_artifact_path(kbuild_probe_args, "-kbuild_source_output_probe_plan", source_output_probe_plan)
+        _add_artifact_path(kbuild_probe_args, "-host_kbuild_source_output_results", host_source_output_results)
+        _add_artifact_path(kbuild_probe_args, "-target_kbuild_source_output_results", target_source_output_results)
+        _add_artifact_path(kbuild_probe_args, "-kbuild_feature_dump_probe_plan", feature_dump_probe_plan)
+        _add_artifact_path(kbuild_probe_args, "-host_kbuild_feature_dump_probe_results", host_feature_dump_probe_results)
+        _add_artifact_path(kbuild_probe_args, "-target_kbuild_feature_dump_probe_results", target_feature_dump_probe_results)
         _add_artifact_path(kbuild_probe_args, "-kbuild_probe_plan_out", kbuild_probe_plan)
         _add_host_dependency_variables(kbuild_probe_args, libelf)
         if rust_source != None:
@@ -4439,6 +4545,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             host_toolset_identity,
             target_toolset_manifest,
             host_toolset_manifest,
+            pkg_config_manifest,
             target_probe_results,
             host_probe_results,
             host_kconfig_probe_results,
@@ -4446,6 +4553,259 @@ def _linux_mapped_kernel_family_impl(ctx):
         ]
         if overlay != None:
             kbuild_probe_inputs.append(overlay)
+
+        # A source guard can change exports, the selected recipe, and even the
+        # argv of a later guard. Source discovery may defer an unmeasured
+        # branch; its exact new terminal becomes the next measured round.
+        for round_index in range(graph_guard_round_count):
+            guard_fragment = ctx.actions.declare_directory(prefix + ".kbuild-graph-guard-round-" + str(round_index) + "-fragment")
+            guard_args = ctx.actions.args()
+            guard_args.add("-root", ctx.file.source_root)
+            guard_args.add("-srctree", ctx.file.source_root)
+            guard_args.add("-kbuild", ctx.file.kbuild)
+            _add_artifact_path(guard_args, "-resolve_config", ctx.file.config)
+            if overlay != None:
+                _add_artifact_path(guard_args, "-resolve_config_overlay", overlay)
+            guard_args.add("-config_mode", ctx.attr.config_mode)
+            guard_args.add("-kernel_version", ctx.attr.version)
+            _add_kernel_kbuild_goals(guard_args)
+            for flag, artifact in [
+                ("-target_toolset_identity", target_toolset_identity),
+                ("-host_toolset_identity", host_toolset_identity),
+                ("-target_toolset_manifest", target_toolset_manifest),
+                ("-host_toolset_manifest", host_toolset_manifest),
+                ("-pkg_config_manifest", pkg_config_manifest),
+                ("-target_probe_results", target_probe_results),
+                ("-host_probe_results", host_probe_results),
+                ("-host_kconfig_probe_results", host_kconfig_probe_results),
+                ("-target_kconfig_probe_results", target_kconfig_probe_results),
+            ]:
+                _add_artifact_path(guard_args, flag, artifact)
+            guard_inputs = list(kbuild_probe_inputs)
+            if round_index > 0:
+                previous = round_index - 1
+                prior = [
+                    ("-kbuild_graph_guard_probe_plan", graph_guard_probe_plans[previous]),
+                    ("-host_kbuild_graph_guard_probe_results", host_graph_guard_probe_round_results[previous]),
+                    ("-target_kbuild_graph_guard_probe_results", target_graph_guard_probe_round_results[previous]),
+                ]
+                for flag, artifact in prior:
+                    _add_artifact_path(guard_args, flag, artifact)
+                    guard_inputs.append(artifact)
+            if round_index > 1:
+                earlier_plan = graph_guard_probe_plans[round_index - 2]
+                _add_artifact_path(guard_args, "-kbuild_graph_guard_earlier_plan", earlier_plan)
+                guard_inputs.append(earlier_plan)
+                for flag, artifact in [
+                    ("-kbuild_graph_guard_earlier_host_results", host_graph_guard_probe_round_results[round_index - 2]),
+                    ("-kbuild_graph_guard_earlier_target_results", target_graph_guard_probe_round_results[round_index - 2]),
+                ]:
+                    _add_artifact_path(guard_args, flag, artifact)
+                    guard_inputs.append(artifact)
+            if round_index == graph_guard_round_count - 1:
+                guard_args.add("-kbuild_graph_guard_require_converged")
+            _add_artifact_path(guard_args, "-kbuild_graph_guard_probe_plan_out", guard_fragment)
+            _add_host_dependency_variables(guard_args, libelf)
+            if rust_source != None:
+                guard_args.add("-var", "RUST_LIB_SRC=" + rust_source.root)
+                guard_args.add("-source_root_map", rust_source.root + "=" + rust_source.root)
+            for name, value in ctx.attr.module_make_vars.items():
+                guard_args.add("-var", name + "=" + value)
+            ctx.actions.run(
+                executable = ctx.executable._planner,
+                inputs = depset(
+                    direct = guard_inputs,
+                    transitive = [rust_source.files] if rust_source != None else [],
+                ),
+                outputs = [guard_fragment],
+                arguments = [guard_args],
+                execution_requirements = {"supports-path-mapping": "1"},
+                mnemonic = "LinuxKbuildGraphGuardProbePlan",
+                progress_message = "Planning Linux %s source graph guards round %d %%{label}" % (variant, round_index),
+            )
+            graph_guard_probe_plan_fragments[round_index][variant] = guard_fragment
+        source_guarded_probe_inputs = kbuild_probe_inputs + [
+            graph_guard_probe_plan,
+            host_graph_guard_probe_results,
+            target_graph_guard_probe_results,
+        ]
+
+        # A source-selected output may be read by a later lazy Make export
+        # while its bytes are still unknown to ordinary discovery. Stop at
+        # that causal read, measure only the selected writer's probe closure,
+        # then let ordinary discovery replay the original source expression.
+        for round_index in range(source_output_round_count):
+            source_fragment = ctx.actions.declare_directory(prefix + ".kbuild-source-output-round-" + str(round_index) + "-fragment")
+            source_args = ctx.actions.args()
+            source_args.add("-root", ctx.file.source_root)
+            source_args.add("-srctree", ctx.file.source_root)
+            source_args.add("-kbuild", ctx.file.kbuild)
+            _add_artifact_path(source_args, "-resolve_config", ctx.file.config)
+            if overlay != None:
+                _add_artifact_path(source_args, "-resolve_config_overlay", overlay)
+            source_args.add("-config_mode", ctx.attr.config_mode)
+            source_args.add("-kernel_version", ctx.attr.version)
+            _add_kernel_kbuild_goals(source_args)
+            for flag, artifact in [
+                ("-target_toolset_identity", target_toolset_identity),
+                ("-host_toolset_identity", host_toolset_identity),
+                ("-target_toolset_manifest", target_toolset_manifest),
+                ("-host_toolset_manifest", host_toolset_manifest),
+                ("-pkg_config_manifest", pkg_config_manifest),
+                ("-target_probe_results", target_probe_results),
+                ("-host_probe_results", host_probe_results),
+                ("-host_kconfig_probe_results", host_kconfig_probe_results),
+                ("-target_kconfig_probe_results", target_kconfig_probe_results),
+                ("-kbuild_graph_guard_probe_plan", graph_guard_probe_plan),
+                ("-host_kbuild_graph_guard_probe_results", host_graph_guard_probe_results),
+                ("-target_kbuild_graph_guard_probe_results", target_graph_guard_probe_results),
+            ]:
+                _add_artifact_path(source_args, flag, artifact)
+            source_round_inputs = list(source_guarded_probe_inputs)
+            if round_index > 0:
+                previous = round_index - 1
+                for flag, artifact in [
+                    ("-kbuild_source_output_probe_plan", source_output_probe_plans[previous]),
+                    ("-host_kbuild_source_output_results", host_source_output_round_results[previous]),
+                    ("-target_kbuild_source_output_results", target_source_output_round_results[previous]),
+                    ("-kbuild_feature_dump_probe_plan", feature_dump_probe_plans[previous]),
+                    ("-host_kbuild_feature_dump_probe_results", host_feature_dump_round_results[previous]),
+                    ("-target_kbuild_feature_dump_probe_results", target_feature_dump_round_results[previous]),
+                ]:
+                    _add_artifact_path(source_args, flag, artifact)
+                    source_round_inputs.append(artifact)
+            if round_index > 1:
+                earlier_plan = source_output_probe_plans[round_index - 2]
+                _add_artifact_path(source_args, "-kbuild_source_output_earlier_plan", earlier_plan)
+                source_round_inputs.append(earlier_plan)
+
+                # A source round can be carried forward only when both the
+                # source and feature plans *and their sealed results* match
+                # the preceding paired frontier. Otherwise run discovery.
+                for flag, artifact in [
+                    ("-kbuild_paired_earlier_feature_plan", feature_dump_probe_plans[round_index - 2]),
+                    ("-kbuild_paired_earlier_source_host_results", host_source_output_round_results[round_index - 2]),
+                    ("-kbuild_paired_earlier_source_target_results", target_source_output_round_results[round_index - 2]),
+                    ("-kbuild_paired_earlier_feature_host_results", host_feature_dump_round_results[round_index - 2]),
+                    ("-kbuild_paired_earlier_feature_target_results", target_feature_dump_round_results[round_index - 2]),
+                ]:
+                    _add_artifact_path(source_args, flag, artifact)
+                    source_round_inputs.append(artifact)
+            if round_index == source_output_round_count - 1:
+                source_args.add("-kbuild_source_output_require_converged")
+            _add_artifact_path(source_args, "-kbuild_source_output_probe_plan_out", source_fragment)
+            _add_host_dependency_variables(source_args, libelf)
+            if rust_source != None:
+                source_args.add("-var", "RUST_LIB_SRC=" + rust_source.root)
+                source_args.add("-source_root_map", rust_source.root + "=" + rust_source.root)
+            for name, value in ctx.attr.module_make_vars.items():
+                source_args.add("-var", name + "=" + value)
+            ctx.actions.run(
+                executable = ctx.executable._planner,
+                inputs = depset(
+                    direct = source_round_inputs,
+                    transitive = [rust_source.files] if rust_source != None else [],
+                ),
+                outputs = [source_fragment],
+                arguments = [source_args],
+                execution_requirements = {"supports-path-mapping": "1"},
+                mnemonic = "LinuxKbuildSourceOutputProbePlan",
+                progress_message = "Planning Linux %s causal source outputs %%{label}" % variant,
+            )
+            source_output_probe_plan_fragments[round_index][variant] = source_fragment
+        feature_guarded_probe_inputs = source_guarded_probe_inputs + [
+            source_output_probe_plan,
+            host_source_output_results,
+            target_source_output_results,
+        ]
+
+        # The selected feature table is computed by the source Makefile before
+        # ordinary Kbuild discovery. Measure its declared feature requests
+        # against the exact prior source-output results for this variant.
+        for round_index in range(feature_dump_round_count):
+            feature_fragment = ctx.actions.declare_directory(prefix + ".kbuild-feature-dump-round-" + str(round_index) + "-fragment")
+            feature_args = ctx.actions.args()
+            feature_args.add("-root", ctx.file.source_root)
+            feature_args.add("-srctree", ctx.file.source_root)
+            feature_args.add("-kbuild", ctx.file.kbuild)
+            _add_artifact_path(feature_args, "-resolve_config", ctx.file.config)
+            if overlay != None:
+                _add_artifact_path(feature_args, "-resolve_config_overlay", overlay)
+            feature_args.add("-config_mode", ctx.attr.config_mode)
+            feature_args.add("-kernel_version", ctx.attr.version)
+            _add_kernel_kbuild_goals(feature_args)
+            for flag, artifact in [
+                ("-target_toolset_identity", target_toolset_identity),
+                ("-host_toolset_identity", host_toolset_identity),
+                ("-target_toolset_manifest", target_toolset_manifest),
+                ("-host_toolset_manifest", host_toolset_manifest),
+                ("-pkg_config_manifest", pkg_config_manifest),
+                ("-target_probe_results", target_probe_results),
+                ("-host_probe_results", host_probe_results),
+                ("-host_kconfig_probe_results", host_kconfig_probe_results),
+                ("-target_kconfig_probe_results", target_kconfig_probe_results),
+                ("-kbuild_graph_guard_probe_plan", graph_guard_probe_plan),
+                ("-host_kbuild_graph_guard_probe_results", host_graph_guard_probe_results),
+                ("-target_kbuild_graph_guard_probe_results", target_graph_guard_probe_results),
+                ("-kbuild_source_output_probe_plan", source_output_probe_plans[round_index]),
+                ("-host_kbuild_source_output_results", host_source_output_round_results[round_index]),
+                ("-target_kbuild_source_output_results", target_source_output_round_results[round_index]),
+            ]:
+                _add_artifact_path(feature_args, flag, artifact)
+            feature_round_inputs = source_guarded_probe_inputs + [
+                source_output_probe_plans[round_index],
+                host_source_output_round_results[round_index],
+                target_source_output_round_results[round_index],
+            ]
+            if round_index > 0:
+                previous = round_index - 1
+                for flag, artifact in [
+                    ("-kbuild_feature_dump_probe_plan", feature_dump_probe_plans[previous]),
+                    ("-host_kbuild_feature_dump_probe_results", host_feature_dump_round_results[previous]),
+                    ("-target_kbuild_feature_dump_probe_results", target_feature_dump_round_results[previous]),
+                ]:
+                    _add_artifact_path(feature_args, flag, artifact)
+                    feature_round_inputs.append(artifact)
+            if round_index > 1:
+                earlier_plan = feature_dump_probe_plans[round_index - 2]
+                _add_artifact_path(feature_args, "-kbuild_feature_dump_earlier_plan", earlier_plan)
+                feature_round_inputs.append(earlier_plan)
+                for flag, artifact in [
+                    ("-kbuild_paired_earlier_source_plan", source_output_probe_plans[round_index - 1]),
+                    ("-kbuild_paired_earlier_source_host_results", host_source_output_round_results[round_index - 1]),
+                    ("-kbuild_paired_earlier_source_target_results", target_source_output_round_results[round_index - 1]),
+                    ("-kbuild_paired_earlier_feature_host_results", host_feature_dump_round_results[round_index - 2]),
+                    ("-kbuild_paired_earlier_feature_target_results", target_feature_dump_round_results[round_index - 2]),
+                ]:
+                    _add_artifact_path(feature_args, flag, artifact)
+                    feature_round_inputs.append(artifact)
+            if round_index == feature_dump_round_count - 1:
+                feature_args.add("-kbuild_feature_dump_require_converged")
+            _add_artifact_path(feature_args, "-kbuild_feature_dump_probe_plan_out", feature_fragment)
+            _add_host_dependency_variables(feature_args, libelf)
+            if rust_source != None:
+                feature_args.add("-var", "RUST_LIB_SRC=" + rust_source.root)
+                feature_args.add("-source_root_map", rust_source.root + "=" + rust_source.root)
+            for name, value in ctx.attr.module_make_vars.items():
+                feature_args.add("-var", name + "=" + value)
+            ctx.actions.run(
+                executable = ctx.executable._planner,
+                inputs = depset(
+                    direct = feature_round_inputs,
+                    transitive = [rust_source.files] if rust_source != None else [],
+                ),
+                outputs = [feature_fragment],
+                arguments = [feature_args],
+                execution_requirements = {"supports-path-mapping": "1"},
+                mnemonic = "LinuxKbuildFeatureDumpProbePlan",
+                progress_message = "Planning Linux %s feature-status requests %%{label}" % variant,
+            )
+            feature_dump_probe_plan_fragments[round_index][variant] = feature_fragment
+        kbuild_guarded_probe_inputs = feature_guarded_probe_inputs + [
+            feature_dump_probe_plan,
+            host_feature_dump_probe_results,
+            target_feature_dump_probe_results,
+        ]
 
         # A configuration-only consumer must not wait for Kbuild planning,
         # generator execution, or cross-config sharing proofs. Resolve it from
@@ -4462,6 +4822,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             ("-host_toolset_identity", host_toolset_identity),
             ("-target_toolset_manifest", target_toolset_manifest),
             ("-host_toolset_manifest", host_toolset_manifest),
+            ("-pkg_config_manifest", pkg_config_manifest),
             ("-target_probe_results", target_probe_results),
             ("-host_probe_results", host_probe_results),
             ("-host_kconfig_probe_results", host_kconfig_probe_results),
@@ -4483,7 +4844,6 @@ def _linux_mapped_kernel_family_impl(ctx):
             ("-resolved_auto_conf_cmd_out", ".auto.conf.cmd"),
             ("-resolved_autoconf_out", ".autoconf.h"),
             ("-resolved_rustc_cfg_out", ".rustc_cfg"),
-            ("-resolved_kernel_release_out", ".kernel.release"),
         ]:
             artifact = ctx.actions.declare_file(prefix + ".kconfig" + suffix)
             config_outputs[flag] = artifact
@@ -4504,7 +4864,7 @@ def _linux_mapped_kernel_family_impl(ctx):
         ctx.actions.run(
             executable = ctx.executable._planner,
             inputs = depset(
-                direct = kbuild_probe_inputs,
+                direct = kbuild_guarded_probe_inputs,
                 transitive = [rust_source.files] if rust_source != None else [],
             ),
             outputs = [kbuild_probe_plan],
@@ -4527,7 +4887,7 @@ def _linux_mapped_kernel_family_impl(ctx):
         ctx.actions.run(
             executable = ctx.executable._profile_capture,
             inputs = depset(
-                direct = kbuild_probe_inputs,
+                direct = kbuild_guarded_probe_inputs,
                 transitive = [rust_source.files] if rust_source != None else [],
             ),
             tools = [ctx.attr._planner[DefaultInfo].files_to_run],
@@ -4536,6 +4896,276 @@ def _linux_mapped_kernel_family_impl(ctx):
             execution_requirements = {"supports-path-mapping": "1", "no-cache": "1"},
             mnemonic = "LinuxKbuildDiscoveryCPUProfile",
             progress_message = "Sampling Linux %s Kbuild discovery CPU %%{label}" % variant,
+        )
+
+    for round_index in range(graph_guard_round_count):
+        fragments = graph_guard_probe_plan_fragments[round_index]
+        guard_plan = graph_guard_probe_plans[round_index]
+        guard_host_results = host_graph_guard_probe_round_results[round_index]
+        guard_target_results = target_graph_guard_probe_round_results[round_index]
+        graph_guard_union_args = ctx.actions.args()
+        for variant in sorted(fragments):
+            _add_artifact_path(
+                graph_guard_union_args,
+                "-probe_plan_union_input",
+                fragments[variant],
+                format = variant + "=%s",
+            )
+        _add_artifact_path(graph_guard_union_args, "-probe_plan_union_out", guard_plan)
+        ctx.actions.run(
+            executable = ctx.executable._planner,
+            inputs = [fragments[variant] for variant in sorted(fragments)],
+            outputs = [guard_plan],
+            arguments = [graph_guard_union_args],
+            execution_requirements = {"supports-path-mapping": "1"},
+            mnemonic = "LinuxKbuildGraphGuardProbeUnion",
+        )
+        ctx.actions.map_directory(
+            implementation = expand_linux_probe_plan,
+            input_directories = {
+                _HOST_DEPS_TREE: libelf.tree,
+                "host_toolset_identity": host_toolset_identity,
+                "plan": guard_plan,
+            },
+            additional_inputs = probe_source_inputs,
+            output_directories = {"results": guard_host_results},
+            tools = linux_probe_map_directory_tools(
+                ctx.attr._host_probe_runner[DefaultInfo].files_to_run,
+                host.tools,
+                host_toolchain_files,
+                host_toolset_manifest,
+                host_toolset_anchors,
+                host.companion_tools,
+            ),
+            additional_params = linux_probe_map_directory_params(
+                "host",
+                host.arguments,
+                host.environments,
+                source_prefix = source_prefix,
+                rust_source_root = rust_source_root,
+            ),
+            env = {},
+            execution_requirements = dict(host_requirements, **{"supports-path-mapping": "1"}),
+            exec_group = "host_cc",
+            mnemonic = "LinuxMappedHostKbuildGraphGuardProbe",
+        )
+        ctx.actions.map_directory(
+            implementation = expand_linux_probe_plan,
+            input_directories = {
+                _HOST_DEPS_TREE: libelf.tree,
+                "host_results": guard_host_results,
+                "host_toolset_identity": host_toolset_identity,
+                "plan": guard_plan,
+                "target_toolset_identity": target_toolset_identity,
+            },
+            additional_inputs = probe_source_inputs,
+            output_directories = {"results": guard_target_results},
+            tools = linux_probe_map_directory_tools(
+                ctx.attr._probe_runner[DefaultInfo].files_to_run,
+                target.tools,
+                target_toolchain_files,
+                target_toolset_manifest,
+                target_toolset_anchors,
+                target.companion_tools,
+                host_tool_files = host.tools,
+                host_toolchain_files = host_toolchain_files,
+                host_toolset_manifest = host_toolset_manifest,
+                host_toolset_anchors = host_toolset_anchors,
+                host_companion_tools = host.companion_tools,
+            ),
+            additional_params = linux_probe_map_directory_params(
+                "target",
+                target.arguments,
+                target.environments,
+                source_prefix = source_prefix,
+                rust_source_root = rust_source_root,
+                host_action_args = host.arguments,
+                host_action_environments = host.environments,
+            ),
+            env = {},
+            execution_requirements = dict(target_requirements, **{"supports-path-mapping": "1"}),
+            mnemonic = "LinuxMappedTargetKbuildGraphGuardProbe",
+            toolchain = CC_TOOLCHAIN_TYPE,
+        )
+
+    for round_index in range(source_output_round_count):
+        fragments = source_output_probe_plan_fragments[round_index]
+        round_plan = source_output_probe_plans[round_index]
+        round_host_results = host_source_output_round_results[round_index]
+        round_target_results = target_source_output_round_results[round_index]
+        source_output_union_args = ctx.actions.args()
+        for variant in sorted(fragments):
+            _add_artifact_path(
+                source_output_union_args,
+                "-probe_plan_union_input",
+                fragments[variant],
+                format = variant + "=%s",
+            )
+        _add_artifact_path(source_output_union_args, "-probe_plan_union_out", round_plan)
+        ctx.actions.run(
+            executable = ctx.executable._planner,
+            inputs = [fragments[variant] for variant in sorted(fragments)],
+            outputs = [round_plan],
+            arguments = [source_output_union_args],
+            execution_requirements = {"supports-path-mapping": "1"},
+            mnemonic = "LinuxKbuildSourceOutputProbeUnion",
+        )
+        ctx.actions.map_directory(
+            implementation = expand_linux_probe_plan,
+            input_directories = {
+                _HOST_DEPS_TREE: libelf.tree,
+                "host_toolset_identity": host_toolset_identity,
+                "plan": round_plan,
+            },
+            additional_inputs = probe_source_inputs,
+            output_directories = {"results": round_host_results},
+            tools = linux_probe_map_directory_tools(
+                ctx.attr._host_probe_runner[DefaultInfo].files_to_run,
+                host.tools,
+                host_toolchain_files,
+                host_toolset_manifest,
+                host_toolset_anchors,
+                host.companion_tools,
+            ),
+            additional_params = linux_probe_map_directory_params(
+                "host",
+                host.arguments,
+                host.environments,
+                source_prefix = source_prefix,
+                rust_source_root = rust_source_root,
+            ),
+            env = {},
+            execution_requirements = dict(host_requirements, **{"supports-path-mapping": "1"}),
+            exec_group = "host_cc",
+            mnemonic = "LinuxMappedHostKbuildSourceOutputProbe",
+        )
+        ctx.actions.map_directory(
+            implementation = expand_linux_probe_plan,
+            input_directories = {
+                _HOST_DEPS_TREE: libelf.tree,
+                "host_results": round_host_results,
+                "host_toolset_identity": host_toolset_identity,
+                "plan": round_plan,
+                "target_toolset_identity": target_toolset_identity,
+            },
+            additional_inputs = probe_source_inputs,
+            output_directories = {"results": round_target_results},
+            tools = linux_probe_map_directory_tools(
+                ctx.attr._probe_runner[DefaultInfo].files_to_run,
+                target.tools,
+                target_toolchain_files,
+                target_toolset_manifest,
+                target_toolset_anchors,
+                target.companion_tools,
+                host_tool_files = host.tools,
+                host_toolchain_files = host_toolchain_files,
+                host_toolset_manifest = host_toolset_manifest,
+                host_toolset_anchors = host_toolset_anchors,
+                host_companion_tools = host.companion_tools,
+            ),
+            additional_params = linux_probe_map_directory_params(
+                "target",
+                target.arguments,
+                target.environments,
+                source_prefix = source_prefix,
+                rust_source_root = rust_source_root,
+                host_action_args = host.arguments,
+                host_action_environments = host.environments,
+            ),
+            env = {},
+            execution_requirements = dict(target_requirements, **{"supports-path-mapping": "1"}),
+            mnemonic = "LinuxMappedTargetKbuildSourceOutputProbe",
+            toolchain = CC_TOOLCHAIN_TYPE,
+        )
+
+    for round_index in range(feature_dump_round_count):
+        fragments = feature_dump_probe_plan_fragments[round_index]
+        round_plan = feature_dump_probe_plans[round_index]
+        round_host_results = host_feature_dump_round_results[round_index]
+        round_target_results = target_feature_dump_round_results[round_index]
+        feature_dump_union_args = ctx.actions.args()
+        for variant in sorted(fragments):
+            _add_artifact_path(
+                feature_dump_union_args,
+                "-probe_plan_union_input",
+                fragments[variant],
+                format = variant + "=%s",
+            )
+        _add_artifact_path(feature_dump_union_args, "-probe_plan_union_out", round_plan)
+        ctx.actions.run(
+            executable = ctx.executable._planner,
+            inputs = [fragments[variant] for variant in sorted(fragments)],
+            outputs = [round_plan],
+            arguments = [feature_dump_union_args],
+            execution_requirements = {"supports-path-mapping": "1"},
+            mnemonic = "LinuxKbuildFeatureDumpProbeUnion",
+        )
+        ctx.actions.map_directory(
+            implementation = expand_linux_probe_plan,
+            input_directories = {
+                _HOST_DEPS_TREE: libelf.tree,
+                "host_toolset_identity": host_toolset_identity,
+                "plan": round_plan,
+            },
+            additional_inputs = probe_source_inputs,
+            output_directories = {"results": round_host_results},
+            tools = linux_probe_map_directory_tools(
+                ctx.attr._host_probe_runner[DefaultInfo].files_to_run,
+                host.tools,
+                host_toolchain_files,
+                host_toolset_manifest,
+                host_toolset_anchors,
+                host.companion_tools,
+            ),
+            additional_params = linux_probe_map_directory_params(
+                "host",
+                host.arguments,
+                host.environments,
+                source_prefix = source_prefix,
+                rust_source_root = rust_source_root,
+            ),
+            env = {},
+            execution_requirements = dict(host_requirements, **{"supports-path-mapping": "1"}),
+            exec_group = "host_cc",
+            mnemonic = "LinuxMappedHostKbuildFeatureDumpProbe",
+        )
+        ctx.actions.map_directory(
+            implementation = expand_linux_probe_plan,
+            input_directories = {
+                _HOST_DEPS_TREE: libelf.tree,
+                "host_results": round_host_results,
+                "host_toolset_identity": host_toolset_identity,
+                "plan": round_plan,
+                "target_toolset_identity": target_toolset_identity,
+            },
+            additional_inputs = probe_source_inputs,
+            output_directories = {"results": round_target_results},
+            tools = linux_probe_map_directory_tools(
+                ctx.attr._probe_runner[DefaultInfo].files_to_run,
+                target.tools,
+                target_toolchain_files,
+                target_toolset_manifest,
+                target_toolset_anchors,
+                target.companion_tools,
+                host_tool_files = host.tools,
+                host_toolchain_files = host_toolchain_files,
+                host_toolset_manifest = host_toolset_manifest,
+                host_toolset_anchors = host_toolset_anchors,
+                host_companion_tools = host.companion_tools,
+            ),
+            additional_params = linux_probe_map_directory_params(
+                "target",
+                target.arguments,
+                target.environments,
+                source_prefix = source_prefix,
+                rust_source_root = rust_source_root,
+                host_action_args = host.arguments,
+                host_action_environments = host.environments,
+            ),
+            env = {},
+            execution_requirements = dict(target_requirements, **{"supports-path-mapping": "1"}),
+            mnemonic = "LinuxMappedTargetKbuildFeatureDumpProbe",
+            toolchain = CC_TOOLCHAIN_TYPE,
         )
 
     kbuild_probe_plan = ctx.actions.declare_directory(ctx.label.name + ".kbuild-probe-plan")
@@ -4607,6 +5237,11 @@ def _linux_mapped_kernel_family_impl(ctx):
             target_toolset_manifest,
             target_toolset_anchors,
             target.companion_tools,
+            host_tool_files = host.tools,
+            host_toolchain_files = host_toolchain_files,
+            host_toolset_manifest = host_toolset_manifest,
+            host_toolset_anchors = host_toolset_anchors,
+            host_companion_tools = host.companion_tools,
         ),
         additional_params = linux_probe_map_directory_params(
             "target",
@@ -4614,6 +5249,8 @@ def _linux_mapped_kernel_family_impl(ctx):
             target.environments,
             source_prefix = source_prefix,
             rust_source_root = rust_source_root,
+            host_action_args = host.arguments,
+            host_action_environments = host.environments,
         ),
         env = {},
         execution_requirements = dict(target_requirements, **{"supports-path-mapping": "1"}),
@@ -4639,12 +5276,24 @@ def _linux_mapped_kernel_family_impl(ctx):
     _add_artifact_path(family_planner_args, "-host_toolset_identity", host_toolset_identity)
     _add_artifact_path(family_planner_args, "-target_toolset_manifest", target_toolset_manifest)
     _add_artifact_path(family_planner_args, "-host_toolset_manifest", host_toolset_manifest)
+    _add_artifact_path(family_planner_args, "-pkg_config_manifest", pkg_config_manifest)
     _add_artifact_path(family_planner_args, "-target_probe_results", target_probe_results)
     _add_artifact_path(family_planner_args, "-host_probe_results", host_probe_results)
     _add_artifact_path(family_planner_args, "-host_kconfig_probe_results", host_kconfig_probe_results)
     _add_artifact_path(family_planner_args, "-target_kconfig_probe_results", target_kconfig_probe_results)
     _add_artifact_path(family_planner_args, "-host_kbuild_probe_results", host_kbuild_probe_results)
     _add_artifact_path(family_planner_args, "-target_kbuild_probe_results", target_kbuild_probe_results)
+
+    # Use the same sealed source guards that selected the ordinary probe DAG.
+    _add_artifact_path(family_planner_args, "-kbuild_graph_guard_probe_plan", graph_guard_probe_plan)
+    _add_artifact_path(family_planner_args, "-host_kbuild_graph_guard_probe_results", host_graph_guard_probe_results)
+    _add_artifact_path(family_planner_args, "-target_kbuild_graph_guard_probe_results", target_graph_guard_probe_results)
+    _add_artifact_path(family_planner_args, "-kbuild_source_output_probe_plan", source_output_probe_plan)
+    _add_artifact_path(family_planner_args, "-host_kbuild_source_output_results", host_source_output_results)
+    _add_artifact_path(family_planner_args, "-target_kbuild_source_output_results", target_source_output_results)
+    _add_artifact_path(family_planner_args, "-kbuild_feature_dump_probe_plan", feature_dump_probe_plan)
+    _add_artifact_path(family_planner_args, "-host_kbuild_feature_dump_probe_results", host_feature_dump_probe_results)
+    _add_artifact_path(family_planner_args, "-target_kbuild_feature_dump_probe_results", target_feature_dump_probe_results)
     _add_host_dependency_variables(family_planner_args, libelf)
     if rust_source != None:
         family_planner_args.add("-var", "RUST_LIB_SRC=" + rust_source.root)
@@ -4665,12 +5314,22 @@ def _linux_mapped_kernel_family_impl(ctx):
         host_toolset_identity,
         target_toolset_manifest,
         host_toolset_manifest,
+        pkg_config_manifest,
         target_probe_results,
         host_probe_results,
         host_kconfig_probe_results,
         target_kconfig_probe_results,
         host_kbuild_probe_results,
         target_kbuild_probe_results,
+        graph_guard_probe_plan,
+        host_graph_guard_probe_results,
+        target_graph_guard_probe_results,
+        source_output_probe_plan,
+        host_source_output_results,
+        target_source_output_results,
+        feature_dump_probe_plan,
+        host_feature_dump_probe_results,
+        target_feature_dump_probe_results,
     ] + [
         variant_overlays[variant]
         for variant in sorted(variant_overlays)
@@ -4877,6 +5536,13 @@ def _linux_mapped_kernel_family_impl(ctx):
                             host_toolset_manifest if host_scope else target_toolset_manifest,
                             host_toolset_anchors if host_scope else target_toolset_anchors,
                             selected.companion_tools,
+                            **({} if host_scope else {
+                                "host_tool_files": host.tools,
+                                "host_toolchain_files": host_toolchain_files,
+                                "host_toolset_manifest": host_toolset_manifest,
+                                "host_toolset_anchors": host_toolset_anchors,
+                                "host_companion_tools": host.companion_tools,
+                            })
                         ),
                         additional_params = linux_probe_map_directory_params(
                             scope,
@@ -4884,6 +5550,10 @@ def _linux_mapped_kernel_family_impl(ctx):
                             selected.environments,
                             source_prefix = source_prefix,
                             rust_source_root = rust_source_root,
+                            **({} if host_scope else {
+                                "host_action_args": host.arguments,
+                                "host_action_environments": host.environments,
+                            })
                         ),
                         env = {},
                         execution_requirements = dict(host_requirements if host_scope else target_requirements, **{"supports-path-mapping": "1"}),
@@ -4974,6 +5644,7 @@ def _linux_mapped_kernel_family_impl(ctx):
         modules_builtin = ctx.actions.declare_file(prefix + ".modules.builtin")
         modules_builtin_modinfo = ctx.actions.declare_file(prefix + ".modules.builtin.modinfo")
         modules_manifest = ctx.actions.declare_file(prefix + ".modules.manifest")
+        kernel_release = ctx.actions.declare_file(prefix + ".kernel.release")
         _project(ctx, trees["image"], "kernel", image)
         _project(ctx, trees["vmlinux"], "vmlinux", vmlinux)
         _project(ctx, trees["vmlinux"], "System.map", system_map)
@@ -4982,10 +5653,11 @@ def _linux_mapped_kernel_family_impl(ctx):
         _project(ctx, trees["metadata"], "modules.builtin", modules_builtin)
         _project(ctx, trees["metadata"], "modules.builtin.modinfo", modules_builtin_modinfo)
         _project(ctx, trees["metadata"], "modules.manifest", modules_manifest)
+        _project(ctx, trees["sdk"], "include/config/kernel.release", kernel_release)
         kernel = LinuxKernelInfo(
             arch = record.arch,
             version = ctx.attr.version,
-            kernel_release = record.kernel_release,
+            kernel_release = kernel_release,
             image = image,
             vmlinux = vmlinux,
             config = record.resolved,
@@ -5005,6 +5677,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             host_execution_platform = host_execution_platform,
             host_probe_results = host_probe_results,
             host_probe_runner = ctx.attr._host_probe_runner[DefaultInfo].files_to_run,
+            host_pkg_config_manifest = pkg_config_manifest,
             host_recipe_runner = ctx.attr._host_recipe_runner[DefaultInfo].files_to_run,
             host_tool_files = host_tools,
             host_toolchain_files = host_toolchain_files,
@@ -5025,7 +5698,7 @@ def _linux_mapped_kernel_family_impl(ctx):
                 target_toolset_identity.path,
                 host_toolset_identity.path,
             ]),
-            kernel_release = record.kernel_release,
+            kernel_release = kernel_release,
             libelf_compile_flags = libelf.compile_flags,
             libelf_link_flags = libelf.link_flags,
             make_vars = ctx.attr.module_make_vars,
@@ -5063,7 +5736,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             config = depset([public_configs[variant]]),
             kbuild_cpu_profile = depset([kbuild_cpu_profiles[variant]]),
             image = depset([image]),
-            kernel_release = depset([record.kernel_release]),
+            kernel_release = depset([kernel_release]),
             module_symvers = depset([module_symvers]),
             modules = depset([trees["modules"]]),
             modules_builtin = depset([modules_builtin]),
@@ -5085,6 +5758,27 @@ def _linux_mapped_kernel_family_impl(ctx):
                 host_kbuild_probe_results,
                 target_kbuild_probe_results,
             ]),
+            # Inspect the ordinary Kbuild request graph without running a
+            # selected compiler probe that may itself be the failing action.
+            kbuild_probe_plan = depset([kbuild_probe_plan]),
+            # Hydrate the measured source-only plan without evaluating the
+            # ordinary graph which consumes that plan's sealed results.
+            source_output_probes = depset([
+                source_output_probe_plan,
+                host_source_output_results,
+                target_source_output_results,
+            ]),
+            # The union request manifest alone identifies a source-only
+            # terminal without executing its result map directories.
+            source_output_probe_plan = depset([source_output_probe_plan]),
+            # Inspect the feature request table and measured statuses without
+            # demanding ordinary Kbuild capability discovery.
+            feature_dump_probes = depset([
+                feature_dump_probe_plan,
+                host_feature_dump_probe_results,
+                target_feature_dump_probe_results,
+            ]),
+            feature_dump_probe_plan = depset([feature_dump_probe_plan]),
             reuse_report = depset([reuse_report]),
             sdk = depset([trees["sdk"]]),
             system_map = depset([system_map]),

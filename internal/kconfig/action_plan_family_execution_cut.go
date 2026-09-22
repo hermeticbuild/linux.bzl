@@ -157,16 +157,28 @@ func captureActionPlanFamilyExecutionCut(family *ActionPlanFamily, requested []A
 		}
 	}
 
-	// Snapshot validation currently permits this one exact comparison protocol.
-	// Activate its obligation from either compared producer, never from a shared
-	// distant ancestor which also feeds an unrelated comparison.
+	// A projected/full comparison is activated by either compared producer. An
+	// outputless execution check is activated by its own selected execution node;
+	// it cannot turn an unrelated image producer into an early execution root.
 	validationsByProducer := map[string][]string{}
 	validationIDs := map[string]bool{}
+	checkPlan := &ActionPlan{Recipes: family.Recipes, Sources: family.Sources}
 	for _, validation := range family.Validations {
+		root := nodes[validation.NodeID]
+		if len(root.Outputs) != 0 &&
+			compactKbuildAuthenticatedExecutionCheckCompletion(checkPlan, root, root.Outputs[0].ObservedPath) {
+			if validation.Slot != 0 {
+				return nil, fmt.Errorf("execution cut check %s validates a noncompletion slot %d", root.ID, validation.Slot)
+			}
+			if !validationIDs[root.ID] {
+				validationIDs[root.ID] = true
+				validationsByProducer[root.ID] = append(validationsByProducer[root.ID], root.ID)
+			}
+			continue
+		}
 		if validationIDs[validation.NodeID] {
 			continue
 		}
-		root := nodes[validation.NodeID]
 		want := ActionRecipe{Schema: LinuxKernelPlanSchema, Kind: "metadata", Tool: "actionfile",
 			Arguments: []string{"-compare_input", "${input:projected:00000000}", "-compare_input", "${input:full:00000001}", "-out", "${output:00000000}"},
 			Inputs:    []string{"projected:00000000", "full:00000001"}, Outputs: []string{"00000000"}}

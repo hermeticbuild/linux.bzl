@@ -15,7 +15,15 @@ type kbuildFrontierValue struct {
 	artifact kconfig.CompactKbuildVisibleArtifact
 	content  string
 	exact    bool
-	origin   *kbuildRecursiveMakeFrontier
+	// pendingSourceOutput records an authenticated selected writer whose
+	// source-output probe has been registered but has no measured bytes yet.
+	// A later Make read can terminate only the source-output discovery pass;
+	// ordinary planning and replay require this writer's exact result.
+	pendingSourceOutput bool
+	// These exact selected request IDs are the only terminals an early source
+	// output discovery cut may publish for this visible file version.
+	sourceOutputRequestIDs []string
+	origin                 *kbuildRecursiveMakeFrontier
 }
 
 // kbuildFrontierEntry is one sorted input to
@@ -293,6 +301,12 @@ func kbuildFrontierValueDigestWithContent(
 		writeDigestString(contentIdentity(value.content))
 	} else {
 		_, _ = hash.Write([]byte{0})
+	}
+	if value.pendingSourceOutput {
+		writeDigestString("pending-source-output-v1")
+		for _, requestID := range value.sourceOutputRequestIDs {
+			writeDigestString(requestID)
+		}
 	}
 	var digest [sha256.Size]byte
 	copy(digest[:], hash.Sum(nil))

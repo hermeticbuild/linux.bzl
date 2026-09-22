@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -449,6 +450,42 @@ func (g *compactKbuildSelectionGraph) compactKbuildSelectionPathOwner(
 	return g.compactKbuildSelectionPathOwnerWithFallback(consumer, target, true)
 }
 
+// compactKbuildSelectionNativePrerequisiteOwner binds the version visible
+// when Make completed this target's source-declared native prerequisites.
+// Source-script and compiler reads during the recipe use the ordinary
+// recorded-path resolver instead: a later recursive Make command can replace
+// the same path before those reads occur.
+func (g *compactKbuildSelectionGraph) compactKbuildSelectionNativePrerequisiteOwner(
+	consumer compactKbuildSelectionKey,
+	target string,
+) (compactKbuildSelectionKey, bool, error) {
+	if g == nil {
+		return compactKbuildSelectionKey{}, false, nil
+	}
+	target = canonicalKbuildRulePath(target)
+	artifacts := compactKbuildVisibleArtifactsForPath(g.selectionNativePrerequisites[consumer], target)
+	if len(artifacts) == 0 {
+		return g.compactKbuildSelectionPathOwner(consumer, target)
+	}
+	if _, selected := g.selections[consumer]; !selected {
+		return compactKbuildSelectionKey{}, false, fmt.Errorf("missing Kbuild native prerequisite consumer %s", compactKbuildSelectionKeyString(consumer))
+	}
+	owner, err := g.compactKbuildVisibleArtifactOwner(artifacts[0])
+	if err != nil {
+		return compactKbuildSelectionKey{}, false, fmt.Errorf(
+			"Kbuild selection %s native prerequisite %q: %w",
+			compactKbuildSelectionKeyString(consumer), target, err,
+		)
+	}
+	if owner == consumer || g.forwardingSelections[owner] || !slices.Contains(g.outputOwnersByPath[target], owner) {
+		return compactKbuildSelectionKey{}, false, fmt.Errorf(
+			"Kbuild selection %s native prerequisite %q owner %s is not a distinct selected writer of that logical path",
+			compactKbuildSelectionKeyString(consumer), target, compactKbuildSelectionKeyString(owner),
+		)
+	}
+	return owner, true, nil
+}
+
 func (g *compactKbuildSelectionGraph) compactKbuildSelectionRecordedPathOwner(
 	consumer compactKbuildSelectionKey,
 	target string,
@@ -518,6 +555,9 @@ func (g *compactKbuildSelectionGraph) compactKbuildSelectionPathOwnerWithFallbac
 	for _, candidate := range candidates {
 		candidateSet[candidate] = true
 	}
+	if _, ok := g.selections[consumer]; !ok {
+		return compactKbuildSelectionKey{}, false, fmt.Errorf("missing Kbuild consumer selection %s", compactKbuildSelectionKeyString(consumer))
+	}
 	if allowUniqueWriterFallback {
 		if sameInvocation, ok := g.selectionsByProfileTarget[compactKbuildProfileTargetKey{
 			profile: consumer.profile,
@@ -525,13 +565,6 @@ func (g *compactKbuildSelectionGraph) compactKbuildSelectionPathOwnerWithFallbac
 		}]; ok && candidateSet[sameInvocation] && sameInvocation != consumer && !g.forwardingSelections[sameInvocation] {
 			return sameInvocation, true, nil
 		}
-	}
-	_, ok := g.selections[consumer]
-	if !ok {
-		return compactKbuildSelectionKey{}, false, fmt.Errorf(
-			"missing Kbuild consumer selection %s",
-			compactKbuildSelectionKeyString(consumer),
-		)
 	}
 	var frontierOwner *compactKbuildSelectionKey
 	for _, artifact := range compactKbuildVisibleArtifactsForPath(g.selectionInitialArtifacts[consumer], target) {

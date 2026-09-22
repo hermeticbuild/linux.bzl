@@ -6,6 +6,48 @@ import (
 	"testing"
 )
 
+func TestMissingDeferredContentSelectionDistinguishesSourceOwner(t *testing.T) {
+	profile := mustCompactKbuildProfileForTest(t, "build:compressed", "scripts/Makefile.build", "", "", nil)
+	selectedToken := kbuildDeferredContentTokenPrefix + strings.Repeat("a", 64)
+	missingToken := kbuildDeferredContentTokenPrefix + strings.Repeat("b", 64)
+	selected := KbuildDeferredContentQuery{
+		Token: selectedToken, Command: "scripts/file-size.sh vmlinux.bin.lz4", Target: "vmlinux.bin.lz4",
+		Profile: profile, Origin: KbuildDeferredContentOrigin{Profile: profile.Name, Target: "vmlinux.bin.lz4"},
+		Generation: 1,
+	}
+	profile.deferredContentQueries = map[string]KbuildDeferredContentQuery{selectedToken: selected}
+	metadata := &CompactMetadata{Config: CompactConfig{
+		KbuildProfiles: []CompactKbuildProfile{profile},
+		KbuildSelections: []CompactKbuildSelection{
+			{Profile: profile.Name, Target: selected.Target, DeferredContentQueries: EncodeCompactKbuildDeferredContentQueries([]string{selectedToken})},
+			{Profile: "other:compressed", Target: selected.Target},
+		},
+		KbuildDeferredContentSelections: []KbuildDeferredContentSelection{{
+			Token: selectedToken, Profile: profile.Name, Target: selected.Target,
+			Lifecycle: "target", Scope: "target", Stage: "target",
+		}},
+	}}
+	missing := selected
+	missing.Token = missingToken
+	missing.Command = "scripts/file-size.sh vmlinux.bin.lz4.alt"
+	description := metadata.describeMissingDeferredContentSelection(missing)
+	for _, fragment := range []string{
+		"origin build:compressed:vmlinux.bin.lz4", "generation=1",
+		"1 exact selected targets with 1 query references", "1 same-target selections in other profiles",
+	} {
+		if !strings.Contains(description, fragment) {
+			t.Fatalf("missing-selection source diagnostic %q omits %q", description, fragment)
+		}
+	}
+	metadata.Config.KbuildSelections = metadata.Config.KbuildSelections[1:]
+	if got := metadata.describeMissingDeferredContentSelection(missing); !strings.Contains(got, "0 exact selected targets with 0 query references") {
+		t.Fatalf("missing-origin selection diagnostic = %q, want absent exact target", got)
+	}
+	if strings.Contains(description, selected.Command) {
+		t.Fatalf("missing-selection diagnostic leaked selected command %q", description)
+	}
+}
+
 func TestDeferredKbuildQueryObservesInvocationRelativeObjectOperand(t *testing.T) {
 	profile := CompactKbuildProfile{Name: "external-demo"}
 	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{

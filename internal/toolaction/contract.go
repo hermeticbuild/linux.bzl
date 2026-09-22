@@ -333,6 +333,24 @@ func (c *ExecutionRootProvenanceCapabilityCodec) NormalizeValue(value string) (s
 	})
 }
 
+// NormalizePureMakeTextValue authenticates a path used only as text inside a
+// pure Make function. That function may concatenate punctuation to a path
+// before a surrounding Make comparison removes it. The result must be checked
+// with NormalizeValue before it becomes an action, input, or generated output:
+// this method grants no authority to execute a path with that continuation.
+func (c *ExecutionRootProvenanceCapabilityCodec) NormalizePureMakeTextValue(value string) (string, error) {
+	if c == nil {
+		return "", errors.New("toolset-path capability codec is nil")
+	}
+	return rewriteExecutionRootProvenanceCapabilityValue(value, true, false, func(scope, canonical string, tag []byte) error {
+		want := c.capabilityTag(scope, canonical)
+		if !hmac.Equal(tag, want) {
+			return errors.New("authenticated planning capability tag does not match its scope and path")
+		}
+		return nil
+	})
+}
+
 // CanonicalizeExecutionRootProvenanceCapabilityIdentity removes ephemeral
 // capability tags from stable hash and equality projections. It verifies only
 // the capability's structure, not its authenticity; callers must still apply

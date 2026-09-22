@@ -348,7 +348,11 @@ type ActionRecipeArgumentTransform struct {
 // only an exact argv vector and verifies the declared results before returning
 // success; it cannot execute another build graph dynamically.
 type ActionRecipeCommandReplay struct {
-	Name        string                                `json:"name"`
+	Name string `json:"name"`
+	// DenyAll installs the named proxy for an evaluator-owned exported Make
+	// alias with no selected recursive child. Even a shell-masked attempted
+	// invocation fails the action through the runner's replay broker.
+	DenyAll     bool                                  `json:"deny_all,omitempty"`
 	Invocations []ActionRecipeCommandReplayInvocation `json:"invocations"`
 }
 
@@ -431,6 +435,17 @@ func cloneActionRecipeCompilerProbeInvocation(invocation *actionRecipeCompilerPr
 // ${output:KEY}, ${tool:KEY}, ${tree:KEY}, or ${content:KEY}. The runner rejects
 // undeclared, unused, or malformed bindings. Tool names beginning with
 // "input:" select a generated executable from the node's input bindings.
+// ActionRecipePrivateWorkingEffect is an exact path/type change permitted
+// inside one source-selected execution-only action. Its bytes are private;
+// another action must independently declare a producer before reading them.
+type ActionRecipePrivateWorkingEffect struct {
+	Path             string `json:"path"`
+	Kind             string `json:"kind"`
+	Tree             string `json:"tree,omitempty"`
+	Required         bool   `json:"required,omitempty"`
+	PreserveExisting bool   `json:"preserve_existing,omitempty"`
+}
+
 type ActionRecipe struct {
 	Schema             string                          `json:"schema"`
 	Kind               string                          `json:"kind"`
@@ -478,6 +493,20 @@ type ActionRecipe struct {
 	// output binding after the tool exits. The state distinguishes an absent,
 	// present, or deleted path and retains the node which last changed it.
 	ObservedOutputs map[string]string `json:"observed_outputs,omitempty"`
+	// An execution-only source check may use an observed output as its private
+	// completion artifact. Its logical Make target must remain absent, and the
+	// selected command may not change the staged writable object tree.
+	RequireAbsentObservedOutput string `json:"require_absent_observed_output,omitempty"`
+	RequireUnchangedWorkingTree bool   `json:"require_unchanged_working_tree,omitempty"`
+	// MakePhonyCompletion binds an execution-only status to a selected Make
+	// recipe line and its declared Makefile source, without treating that
+	// Makefile as an executable source script.
+	MakePhonyCompletion *ActionRecipeMakePhonyCompletion `json:"make_phony_completion,omitempty"`
+	// PrivateWorkingEffects bounds side effects of a source-selected PHONY
+	// command which completes without a file named after its logical target.
+	// These paths stay private to the action; they cannot become an undeclared
+	// input of a later action. A symlink target names a declared immutable tree.
+	PrivateWorkingEffects []ActionRecipePrivateWorkingEffect `json:"private_working_effects,omitempty"`
 	// ObservedOutputBases is keyed by an ObservedOutputs binding. Each value
 	// names declared input bindings containing projected maximal predecessor
 	// states. The runner merges them into the absolute regular-file state which
@@ -529,6 +558,12 @@ func cloneActionRecipe(recipe ActionRecipe) ActionRecipe {
 	recipe.WorkingTrees = slices.Clone(recipe.WorkingTrees)
 	recipe.WorkingInputs = maps.Clone(recipe.WorkingInputs)
 	recipe.WorkingOutputs = maps.Clone(recipe.WorkingOutputs)
+	recipe.PrivateWorkingEffects = slices.Clone(recipe.PrivateWorkingEffects)
+	if recipe.MakePhonyCompletion != nil {
+		completion := *recipe.MakePhonyCompletion
+		completion.ExpandedLines = slices.Clone(completion.ExpandedLines)
+		recipe.MakePhonyCompletion = &completion
+	}
 	recipe.ObservedOutputs = maps.Clone(recipe.ObservedOutputs)
 	if recipe.ObservedOutputBases != nil {
 		bases := make(map[string][]string, len(recipe.ObservedOutputBases))
@@ -1041,6 +1076,10 @@ type ActionPlan struct {
 	// witnesses. Terminal product producers acquire ordinary input edges to
 	// these stamps before content addressing; compiler nodes never do.
 	projectedGeneratorValidations []string
+	// Source-authenticated outputless checks own private observed completion
+	// states. Unlike generator comparison stamps they are selected Make recipe
+	// actions whose status must gate every public product in each variant.
+	executionCheckRoots []string
 	// projectedGeneratorInternalNodes identifies snapshot-only raw/replay/check
 	// actions retained by differential validation. Some replay side-output slots
 	// remain public; projectedGeneratorInternalOutputs is the exact per-slot set
@@ -1854,6 +1893,9 @@ func (r ActionRecipe) Validate() error {
 	if r.Schema != LinuxKernelPlanSchema {
 		return fmt.Errorf("recipe schema %q, want %q", r.Schema, LinuxKernelPlanSchema)
 	}
+	if err := validateActionRecipeMakePhonyCompletion(r); err != nil {
+		return err
+	}
 	if compactKbuildContainsPrivateProvenanceByte(r.Tool) {
 		return fmt.Errorf("recipe retains a reserved recursive Make provenance byte")
 	}
@@ -2080,7 +2122,10 @@ func (r ActionRecipe) Validate() error {
 			return fmt.Errorf("recipe repeats command replay %q", replay.Name)
 		}
 		seenReplayNames[replay.Name] = true
-		if len(replay.Invocations) == 0 {
+		if replay.DenyAll && len(replay.Invocations) != 0 {
+			return fmt.Errorf("recipe command replay %q denies all invocations but declares %d", replay.Name, len(replay.Invocations))
+		}
+		if !replay.DenyAll && len(replay.Invocations) == 0 {
 			return fmt.Errorf("recipe command replay %q has no invocations", replay.Name)
 		}
 		for invocationIndex, invocation := range replay.Invocations {
@@ -2206,6 +2251,40 @@ func (r ActionRecipe) Validate() error {
 			seenStates[state] = true
 			used["input"][state] = true
 		}
+	}
+	if r.RequireAbsentObservedOutput != "" {
+		if !observedOutputBindings[r.RequireAbsentObservedOutput] {
+			return fmt.Errorf("recipe absent-output assertion %q is not a declared observed output", r.RequireAbsentObservedOutput)
+		}
+		if !r.RequireUnchangedWorkingTree && len(r.PrivateWorkingEffects) == 0 {
+			return fmt.Errorf("recipe absent-output assertion requires an unchanged or bounded private working tree")
+		}
+	}
+	if len(r.PrivateWorkingEffects) != 0 {
+		if r.RequireAbsentObservedOutput == "" || r.RequireUnchangedWorkingTree ||
+			r.WorkingDirectory == "" || len(r.WorkingOutputs) != 0 || r.Stdout != "" {
+			return fmt.Errorf("bounded private working effects require a private execution-only completion")
+		}
+		seen := map[string]bool{}
+		for index, effect := range r.PrivateWorkingEffects {
+			if err := validatePlanRelativePath("private working effect", effect.Path); err != nil {
+				return err
+			}
+			if seen[effect.Path] || index != 0 && r.PrivateWorkingEffects[index-1].Path >= effect.Path ||
+				effect.Path == r.ObservedOutputs[r.RequireAbsentObservedOutput] {
+				return fmt.Errorf("private working effect %q is duplicated, unordered, or aliases the logical target", effect.Path)
+			}
+			seen[effect.Path] = true
+			if effect.Kind != "regular" && effect.Kind != "symlink" ||
+				effect.Kind == "symlink" && (effect.Tree == "" || !declared["tree"][effect.Tree]) ||
+				effect.Kind == "regular" && effect.Tree != "" ||
+				effect.PreserveExisting && effect.Kind != "regular" {
+				return fmt.Errorf("private working effect %q has invalid kind %q or tree %q", effect.Path, effect.Kind, effect.Tree)
+			}
+		}
+	}
+	if r.RequireUnchangedWorkingTree && (r.WorkingDirectory == "" || len(r.WorkingOutputs) != 0 || r.Stdout != "") {
+		return fmt.Errorf("unchanged working-tree assertion requires a private directory without collected working output or redirected stdout")
 	}
 	if strings.HasPrefix(r.Tool, "input:") {
 		input := strings.TrimPrefix(r.Tool, "input:")

@@ -578,6 +578,35 @@ func TestExecutionRootProvenanceCapabilityRejectsForgery(t *testing.T) {
 	}
 }
 
+func TestExecutionRootProvenanceCapabilityPureMakeTextCannotBecomeActionPath(t *testing.T) {
+	codec := fixedExecutionRootProvenanceCapabilityCodec(t, 0x42)
+	const canonical = "external/gcc/include"
+	capability, err := codec.EncodePath("host", canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := EncodeExecutionRootProvenancePath("host", canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const escapedSpace = "_-_SPACE_-_"
+	if got, err := codec.NormalizePureMakeTextValue(capability + escapedSpace + "-c"); err != nil || got != core+escapedSpace+"-c" {
+		t.Fatalf("pure Make text did not preserve authenticated path core and escaped separator: %v", err)
+	}
+	if _, err := codec.NormalizeValue(capability + escapedSpace + "-c"); err == nil {
+		t.Fatal("escaped Make text became an executable path")
+	}
+	for _, invalid := range []string{
+		core + escapedSpace + "-c",
+		strings.Replace(capability, "external/gcc/include", "external/gcc/lib", 1) + escapedSpace,
+		capability[:len(capability)-1] + differentHexByte(capability[len(capability)-1]) + escapedSpace,
+	} {
+		if _, err := codec.NormalizePureMakeTextValue(invalid); err == nil {
+			t.Fatal("unverified source Make text acquired toolset path authority")
+		}
+	}
+}
+
 func TestExecutionRootProvenanceCapabilityValidatesInputs(t *testing.T) {
 	if _, err := newExecutionRootProvenanceCapabilityCodec(make([]byte, executionRootProvenanceCapabilityKeySize-1)); err == nil {
 		t.Fatal("short capability key was accepted")

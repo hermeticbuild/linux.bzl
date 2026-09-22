@@ -214,9 +214,13 @@ func linuxFamilyCheckpointBindings(opts linuxKbuildProbeOptions, scopes *kconfig
 	if err != nil {
 		return kconfig.ActionPlanCheckpointBindings{}, err
 	}
+	manifestIdentity := ""
+	if opts.hostContract != nil && opts.hostContract.PkgConfigManifest != nil {
+		manifestIdentity = opts.hostContract.PkgConfigManifest.ContentIdentity()
+	}
 	bindings, err := kconfig.NewActionPlanCheckpointBindings(opts.familyVariantOptions.Variant, artifacts,
 		map[string]string{"target": opts.targetFacts.ToolsetIdentity(), "host": opts.hostFacts.ToolsetIdentity()},
-		resolvedConfigObjectTreeContents(opts.tree, resolved, opts.kernelVersion), current, metadataOptions)
+		resolvedConfigObjectTreeContents(opts.tree, resolved), current, metadataOptions, manifestIdentity)
 	bindings.VirtualSourceRoots = virtual
 	return bindings, err
 }

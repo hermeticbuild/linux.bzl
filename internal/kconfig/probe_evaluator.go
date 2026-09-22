@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hermeticbuild/linux.bzl/internal/pkgconfigmanifest"
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
@@ -98,9 +99,12 @@ type LinuxProbeEvaluatorOptions struct {
 	Architecture string
 	// SourceRoot is the selected Linux source directory as seen by the
 	// planner. SourceArchitecture is Linux SRCARCH; it may differ from ARCH.
+	// SourceRootAliases are Make-visible spellings of the same selected root,
+	// e.g. the virtual srctree emitted by a source-derived Make invocation.
 	// ScriptEnvironment contains only explicitly selected, source-visible
 	// values inherited by declared Kconfig scripts.
 	SourceRoot         string
+	SourceRootAliases  []string
 	SourceArchitecture string
 	ScriptEnvironment  map[string]string
 	Facts              *LinuxCompilerFacts
@@ -108,6 +112,10 @@ type LinuxProbeEvaluatorOptions struct {
 	Discovery          ProbeDiscovery
 	Oracle             ProbeResultLookup
 	RustSourceRoot     string
+	// PkgConfigManifest is the immutable, declared package database of the
+	// configured host shim. Only --exists status can be decided from it;
+	// package flag queries retain their measured action producer.
+	PkgConfigManifest *pkgconfigmanifest.Manifest
 }
 
 // LinuxProbeEvaluator emits the capability-only Kconfig probe plan. Shell and
@@ -118,6 +126,7 @@ type LinuxProbeEvaluator struct {
 	scope              string
 	architecture       string
 	sourceRoot         string
+	sourceRootAliases  []string
 	sourceArchitecture string
 	scriptEnvironment  map[string]string
 	facts              *LinuxCompilerFacts
@@ -125,6 +134,7 @@ type LinuxProbeEvaluator struct {
 	discovery          ProbeDiscovery
 	oracle             ProbeResultLookup
 	rustSourceRoot     string
+	pkgConfigManifest  *pkgconfigmanifest.Manifest
 	symbols            map[string]linuxProbeSymbol
 	symbolRegistry     *linuxProbeSymbolRegistry
 	references         []ProbeReference
@@ -267,6 +277,11 @@ func NewLinuxProbeEvaluator(opts LinuxProbeEvaluatorOptions) (*LinuxProbeEvaluat
 	if strings.ContainsRune(opts.SourceRoot, 0) {
 		return nil, fmt.Errorf("Linux probe evaluator has an invalid selected source root")
 	}
+	for _, alias := range opts.SourceRootAliases {
+		if !safeLinuxProbeRelativePath(alias) {
+			return nil, fmt.Errorf("Linux probe evaluator has invalid source root alias %q", alias)
+		}
+	}
 	sourceArchitecture := strings.TrimSpace(opts.SourceArchitecture)
 	if sourceArchitecture == "" {
 		sourceArchitecture = opts.Architecture
@@ -303,13 +318,20 @@ func NewLinuxProbeEvaluator(opts LinuxProbeEvaluatorOptions) (*LinuxProbeEvaluat
 	if tools["cc"] == "" {
 		return nil, fmt.Errorf("Linux probe evaluator requires configured cc role")
 	}
+	if opts.PkgConfigManifest != nil && (opts.Scope != "host" || tools[linuxProbePkgConfigRole] == "") {
+		return nil, fmt.Errorf("declared pkg-config manifest requires the selected host pkg-config role")
+	}
+	if opts.PkgConfigManifest != nil && opts.PkgConfigManifest.ContentIdentity() == "" {
+		return nil, fmt.Errorf("declared pkg-config manifest has no validated content identity")
+	}
 	rustSourceRoot := cleanOptionalProbeSourceRoot(opts.RustSourceRoot)
 	return &LinuxProbeEvaluator{
 		scope: opts.Scope, architecture: opts.Architecture,
-		sourceRoot: cleanOptionalProbeSourceRoot(opts.SourceRoot), sourceArchitecture: sourceArchitecture,
+		sourceRoot: cleanOptionalProbeSourceRoot(opts.SourceRoot), sourceRootAliases: slices.Clone(opts.SourceRootAliases), sourceArchitecture: sourceArchitecture,
 		scriptEnvironment: scriptEnvironment, facts: opts.Facts,
 		tools: tools, discovery: opts.Discovery, oracle: opts.Oracle, rustSourceRoot: rustSourceRoot,
-		symbols: map[string]linuxProbeSymbol{}, symbolRegistry: newLinuxProbeSymbolRegistry(), seen: map[string]bool{},
+		pkgConfigManifest: opts.PkgConfigManifest,
+		symbols:           map[string]linuxProbeSymbol{}, symbolRegistry: newLinuxProbeSymbolRegistry(), seen: map[string]bool{},
 	}, nil
 }
 
@@ -332,10 +354,11 @@ func (e *LinuxProbeEvaluator) WithScriptEnvironment(environment map[string]strin
 	}
 	refreshed, err := NewLinuxProbeEvaluator(LinuxProbeEvaluatorOptions{
 		Scope: e.scope, Architecture: e.architecture,
-		SourceRoot: e.sourceRoot, SourceArchitecture: e.sourceArchitecture,
+		SourceRoot: e.sourceRoot, SourceRootAliases: slices.Clone(e.sourceRootAliases), SourceArchitecture: e.sourceArchitecture,
 		ScriptEnvironment: environment,
 		Facts:             e.facts, Tools: e.tools,
 		Discovery: e.discovery, Oracle: e.oracle, RustSourceRoot: e.rustSourceRoot,
+		PkgConfigManifest: e.pkgConfigManifest,
 	})
 	if err != nil {
 		return nil, err
@@ -1012,11 +1035,11 @@ func (e *LinuxProbeEvaluator) applyAuthenticatedKbuildTextTransform(function str
 	authorized := map[string]bool{}
 	normalized := slices.Clone(arguments)
 	for index, argument := range normalized {
-		argument, err = codec.NormalizeValue(argument)
+		argument, err = codec.NormalizePureMakeTextValue(argument)
 		if err != nil {
 			return "", fmt.Errorf("pure Make function %q argument %d toolset-path capability: %w", function, index, err)
 		}
-		tokens, err := executionRootProvenanceTokens(argument)
+		tokens, err := executionRootProvenanceMakeTextTokens(argument)
 		if err != nil {
 			return "", fmt.Errorf("pure Make function %q argument %d toolset-path provenance: %w", function, index, err)
 		}
@@ -1030,7 +1053,7 @@ func (e *LinuxProbeEvaluator) applyAuthenticatedKbuildTextTransform(function str
 	if err != nil {
 		return "", err
 	}
-	tokens, err := executionRootProvenanceTokens(transformed)
+	tokens, err := executionRootProvenanceMakeTextTokens(transformed)
 	if err != nil {
 		return "", fmt.Errorf("pure Make function %q result toolset-path provenance: %w", function, err)
 	}
@@ -1057,7 +1080,7 @@ func (e *LinuxProbeEvaluator) applyAuthenticatedKbuildTextTransform(function str
 	// Re-verify the complete result. Besides checking every re-sealed token,
 	// this rejects a source expression which manufactures an unpaired printable
 	// capability suffix even when no provenance core survived the transform.
-	verified, err := codec.NormalizeValue(sealedValue)
+	verified, err := codec.NormalizePureMakeTextValue(sealedValue)
 	if err != nil {
 		return "", fmt.Errorf("pure Make function %q result toolset-path capability: %w", function, err)
 	}
@@ -1082,6 +1105,24 @@ func executionRootProvenanceTokens(value string) ([]executionRootProvenanceToken
 	if err := toolaction.ValidateExecutionRootProvenanceValue(value); err != nil {
 		return nil, err
 	}
+	return collectExecutionRootProvenanceTokens(value)
+}
+
+// executionRootProvenanceMakeTextTokens admits path cores adjacent to source
+// text only inside authenticated pure Make evaluation. Stable and executable
+// values still use executionRootProvenanceTokens and its runtime boundary.
+func executionRootProvenanceMakeTextTokens(value string) ([]executionRootProvenanceToken, error) {
+	canonical, err := toolaction.CanonicalizeExecutionRootProvenanceCapabilityIdentity(value)
+	if err != nil {
+		return nil, err
+	}
+	if canonical != value {
+		return nil, fmt.Errorf("pure Make text contains an unverified toolset-path capability suffix")
+	}
+	return collectExecutionRootProvenanceTokens(value)
+}
+
+func collectExecutionRootProvenanceTokens(value string) ([]executionRootProvenanceToken, error) {
 	var tokens []executionRootProvenanceToken
 	for cursor := 0; ; {
 		relativeStart := strings.Index(value[cursor:], toolaction.ExecutionRootProvenanceMarker)
@@ -1092,8 +1133,8 @@ func executionRootProvenanceTokens(value string) ([]executionRootProvenanceToken
 		payloadStart := start + len(toolaction.ExecutionRootProvenanceMarker)
 		relativeEnd := strings.Index(value[payloadStart:], toolaction.ExecutionRootProvenanceTerminator)
 		if relativeEnd < 0 {
-			// ValidateExecutionRootProvenanceValue already diagnosed this shape;
-			// retain a defensive error if its contract ever changes.
+			// The runtime or pure-Make validator already diagnosed this shape;
+			// retain a defensive error if either contract ever changes.
 			return nil, fmt.Errorf("probed toolset path token at byte %d is unterminated", start)
 		}
 		end := payloadStart + relativeEnd + len(toolaction.ExecutionRootProvenanceTerminator)
@@ -1151,6 +1192,9 @@ func (e *LinuxProbeEvaluator) output(command string) (string, error) {
 		return value, err
 	}
 	if value, recognized, err := e.configuredPkgConfigQuery(command); recognized || err != nil {
+		return value, err
+	}
+	if value, recognized, err := e.sourceScriptVersionPipeline(command); recognized || err != nil {
 		return value, err
 	}
 	if value, recognized, err := e.selectedToolSourceQuery(command); recognized || err != nil {
@@ -1326,6 +1370,10 @@ func (e *LinuxProbeEvaluator) compilerMacroGrepStatus(command string) (string, b
 	if err != nil {
 		return "", true, err
 	}
+	usesHostDeps, err := e.candidateHostDependencyRoot(arguments, conditional, argumentFragments, candidate, dependencies)
+	if err != nil {
+		return "", true, err
+	}
 	request := ProbeRequest{
 		Schema: LinuxProbeRequestSchema, InputCount: len(dependencies),
 		Steps: []ProbeStep{{
@@ -1335,6 +1383,9 @@ func (e *LinuxProbeEvaluator) compilerMacroGrepStatus(command string) (string, b
 		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{
 			Operator: "stream-contains", Step: "macro-preprocess", Stream: "stdout", Value: literal,
 		}},
+	}
+	if usesHostDeps {
+		request.SourceRoots = []string{linuxProbeHostDepsRootName}
 	}
 	truth, err := e.requestTruth(request, dependencies...)
 	if err != nil {
@@ -1374,6 +1425,9 @@ func (e *LinuxProbeEvaluator) compilerMachineTokens() []string {
 }
 
 func (e *LinuxProbeEvaluator) commandSucceeds(command string) (linuxProbeTruth, error) {
+	if truth, recognized, err := e.fixedEchoGrepTruth(command); recognized || err != nil {
+		return truth, err
+	}
 	if request, dependencies, recognized, err := e.sourceScriptRequest(command, "boolean"); recognized || err != nil {
 		if err != nil {
 			return linuxProbeTruth{}, err
@@ -1402,6 +1456,9 @@ func (e *LinuxProbeEvaluator) commandSucceeds(command string) (linuxProbeTruth, 
 	if truth, recognized, err := e.assemblerSourceProbe(command); recognized || err != nil {
 		return truth, err
 	}
+	if truth, recognized, err := e.toolVersionQuietGrep(command); recognized || err != nil {
+		return truth, err
+	}
 	if truth, recognized, err := e.linkerOptionProbe(command); recognized || err != nil {
 		return truth, err
 	}
@@ -1409,6 +1466,127 @@ func (e *LinuxProbeEvaluator) commandSucceeds(command string) (linuxProbeTruth, 
 		return truth, err
 	}
 	return linuxProbeTruth{}, e.unhandledCommand(command)
+}
+
+// toolVersionQuietGrep retains a source-owned linker identity check as two
+// declared steps. The first reads the selected tool's stdout; the second
+// tests a source-supplied literal, with optional head -n1 truncation. A
+// failed producer still feeds stdout to grep, as it does in a shell pipeline.
+func (e *LinuxProbeEvaluator) toolVersionQuietGrep(command string) (linuxProbeTruth, bool, error) {
+	fields := strings.Fields(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(command), ";")))
+	if len(fields) < 5 || !e.isToolToken(fields[0], "ld") ||
+		(fields[1] != "-v" && fields[1] != "--version") || fields[2] != "|" {
+		return linuxProbeTruth{}, false, nil
+	}
+	commandWords := fields[3:]
+	firstLine := false
+	if len(commandWords) >= 4 && commandWords[0] == "head" {
+		switch {
+		case commandWords[1] == "-n1":
+			commandWords = commandWords[2:]
+		case len(commandWords) >= 5 && commandWords[1] == "-n" && commandWords[2] == "1":
+			commandWords = commandWords[3:]
+		default:
+			return linuxProbeTruth{}, true, e.unsupportedCommand(command)
+		}
+		if len(commandWords) == 0 || commandWords[0] != "|" {
+			return linuxProbeTruth{}, true, e.unsupportedCommand(command)
+		}
+		firstLine = true
+		commandWords = commandWords[1:]
+	}
+	if len(commandWords) != 3 || commandWords[0] != "grep" || commandWords[1] != "-q" {
+		return linuxProbeTruth{}, true, e.unsupportedCommand(command)
+	}
+	literal, static := linuxProbeStaticShellWord(commandWords[2])
+	if !static {
+		return linuxProbeTruth{}, true, e.unsupportedCommand(command)
+	}
+	literal, valid := parseLinuxProbeGrepLiteral(literal)
+	if !valid {
+		return linuxProbeTruth{}, true, e.unsupportedCommand(command)
+	}
+	version, err := e.requestText(ProbeRequest{
+		Schema:  LinuxProbeRequestSchema,
+		Steps:   []ProbeStep{{Name: "version", Tool: "ld", Arguments: []string{fields[1]}}},
+		Outcome: ProbeOutcome{Kind: "text", Step: "version", Stream: "stdout", FirstLine: firstLine},
+	})
+	if err != nil {
+		return linuxProbeTruth{}, true, err
+	}
+	symbol, symbolic, err := e.symbolArgument(version)
+	if err != nil {
+		return linuxProbeTruth{}, true, err
+	}
+	if !symbolic || symbol.kind != "text" {
+		return linuxProbeTruth{}, true, fmt.Errorf("linker version check has no declared text result")
+	}
+	truth, err := e.requestTruth(ProbeRequest{
+		Schema: LinuxProbeRequestSchema, InputCount: 1,
+		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{
+			Operator: "result-text-contains", Result: "00000000", Value: literal,
+		}},
+	}, symbol.reference)
+	return truth, true, err
+}
+
+// fixedEchoGrepTruth models a quoted, source-expanded value piped to grep -q.
+// The grep pattern is an exact BRE literal; when its input is a measured probe
+// result, the outcome tests that result rather than hardcoding compiler names.
+// Replay rejects bytes which a shell echo could interpret before grep sees
+// them. The selected source must use a different probe shape for such values.
+func (e *LinuxProbeEvaluator) fixedEchoGrepTruth(command string) (linuxProbeTruth, bool, error) {
+	if !strings.HasPrefix(command, `echo `) || !strings.Contains(command, ` | grep -q `) {
+		return linuxProbeTruth{}, false, nil
+	}
+	body, quoted := strings.CutPrefix(command, `echo "`)
+	if !quoted {
+		return linuxProbeTruth{}, true, e.unsupportedCommand(command)
+	}
+	value, literal, matched := strings.Cut(body, `" | grep -q `)
+	if !matched || strings.ContainsRune(value, '"') || len(strings.Fields(literal)) != 1 {
+		return linuxProbeTruth{}, true, e.unsupportedCommand(command)
+	}
+	literal, valid := parseLinuxProbeGrepLiteral(literal)
+	if !valid {
+		return linuxProbeTruth{}, true, e.unsupportedCommand(command)
+	}
+	symbol, symbolic, err := e.symbolArgument(value)
+	if err != nil {
+		return linuxProbeTruth{}, true, err
+	}
+	if !symbolic {
+		if err := validateFixedEchoGrepText(value); err != nil {
+			return linuxProbeTruth{}, true, err
+		}
+		return knownLinuxProbeTruth(strings.Contains(value, literal)), true, nil
+	}
+	if symbol.kind != "text" {
+		return linuxProbeTruth{}, true, e.unsupportedCommand(command)
+	}
+	if e.oracle != nil {
+		resolved, err := e.ResolveSymbolic(value)
+		if err != nil {
+			return linuxProbeTruth{}, true, err
+		}
+		if err := validateFixedEchoGrepText(resolved); err != nil {
+			return linuxProbeTruth{}, true, err
+		}
+	}
+	truth, err := e.requestTruth(ProbeRequest{
+		Schema: LinuxProbeRequestSchema, InputCount: 1,
+		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{
+			Operator: "result-text-contains-echo-safe", Result: "00000000", Value: literal,
+		}},
+	}, symbol.reference)
+	return truth, true, err
+}
+
+func validateFixedEchoGrepText(value string) error {
+	if strings.HasPrefix(value, "-") || strings.ContainsAny(value, "\\$`\x00\r\n") {
+		return fmt.Errorf("quoted echo probe value has shell-dependent bytes")
+	}
+	return nil
 }
 
 func knownLinuxProbeTruth(value bool) linuxProbeTruth {
@@ -1511,6 +1689,7 @@ func equalLinuxProbeSelectionInputs(left, right []linuxProbeSelectionInput) bool
 
 func equalLinuxProbeRequest(left, right ProbeRequest) bool {
 	if left.Schema != right.Schema || left.InputCount != right.InputCount ||
+		left.HostToolsetIdentity != right.HostToolsetIdentity ||
 		!slices.Equal(left.Sources, right.Sources) ||
 		!slices.Equal(left.SourceRoots, right.SourceRoots) ||
 		!slices.Equal(left.Scratch, right.Scratch) ||
@@ -2578,13 +2757,14 @@ func (e *LinuxProbeEvaluator) compilerPreprocessorGrep(command string) (string, 
 	if err != nil {
 		return "", true, err
 	}
+	usesHostDeps, err := e.candidateHostDependencyRoot(arguments, conditional, argumentFragments, candidateOwnership, dependencies)
+	if err != nil {
+		return "", true, err
+	}
 	arguments = append(arguments, "-x", language, "-E", "-")
 	sourceRoots := []string{linuxProbeSourceRootName}
-	for _, argument := range arguments {
-		if strings.Contains(argument, "${source_root:"+linuxProbeHostDepsRootName+"}") {
-			sourceRoots = append(sourceRoots, linuxProbeHostDepsRootName)
-			break
-		}
+	if usesHostDeps {
+		sourceRoots = append(sourceRoots, linuxProbeHostDepsRootName)
 	}
 	slices.Sort(sourceRoots)
 	request := ProbeRequest{
@@ -2752,6 +2932,10 @@ func (e *LinuxProbeEvaluator) compilerPreprocessorTailOutput(command string) (st
 	if err != nil {
 		return "", true, err
 	}
+	usesHostDeps, err := e.candidateHostDependencyRoot(arguments, conditional, argumentFragments, candidate, dependencies)
+	if err != nil {
+		return "", true, err
+	}
 	request := ProbeRequest{
 		Schema: LinuxProbeRequestSchema, InputCount: len(dependencies),
 		Steps: []ProbeStep{{
@@ -2762,6 +2946,9 @@ func (e *LinuxProbeEvaluator) compilerPreprocessorTailOutput(command string) (st
 		Outcome: ProbeOutcome{
 			Kind: "text", Step: "preprocess", Stream: "stdout", TrimSpace: true, LastLine: true,
 		},
+	}
+	if usesHostDeps {
+		request.SourceRoots = []string{linuxProbeHostDepsRootName}
 	}
 	value, err := e.requestText(request, dependencies...)
 	return value, true, err
@@ -2798,6 +2985,10 @@ func (e *LinuxProbeEvaluator) compilerPreprocessorOutput(command string) (string
 	if err != nil {
 		return "", true, err
 	}
+	usesHostDeps, err := e.candidateHostDependencyRoot(arguments, conditional, argumentFragments, candidateOwnership, dependencies)
+	if err != nil {
+		return "", true, err
+	}
 	arguments = append(arguments, "-E", "-P", "-")
 	request := ProbeRequest{
 		Schema: LinuxProbeRequestSchema, InputCount: len(dependencies),
@@ -2807,6 +2998,9 @@ func (e *LinuxProbeEvaluator) compilerPreprocessorOutput(command string) (string
 			Stdin: stdinValue, StdinFragments: stdinFragments,
 		}},
 		Outcome: ProbeOutcome{Kind: "text", Step: "preprocess", Stream: "stdout", TrimSpace: true},
+	}
+	if usesHostDeps {
+		request.SourceRoots = []string{linuxProbeHostDepsRootName}
 	}
 	value, err := e.requestText(request, dependencies...)
 	return value, true, err
@@ -2909,6 +3103,11 @@ func (e *LinuxProbeEvaluator) probeStepEnvironment(primaryRole string, inline ma
 		}
 		if err := validateSourceScriptProtocolLiteral(value); err != nil {
 			return nil, nil, nil, fmt.Errorf("environment %s: %w", name, err)
+		}
+		if e.isSelectedSourceRoot(value) {
+			environment[name] = "${source_root:" + linuxProbeSourceRootName + "}"
+			sourceRootSet[linuxProbeSourceRootName] = true
+			continue
 		}
 		if e.rustSourceRoot != "" && value == e.rustSourceRoot {
 			environment[name] = "${source_root:" + rustProbeSourceRootName + "}"
@@ -3156,6 +3355,10 @@ func (e *LinuxProbeEvaluator) linkerOptionProbe(command string) (linuxProbeTruth
 	if err != nil {
 		return linuxProbeTruth{}, true, err
 	}
+	usesHostDeps, err := e.candidateHostDependencyRoot(arguments, conditional, argumentFragments, candidateOwnership, dependencies)
+	if err != nil {
+		return linuxProbeTruth{}, true, err
+	}
 	if leadingVersion {
 		arguments = append([]string{"-v"}, arguments...)
 		if candidateOwnership != nil {
@@ -3179,6 +3382,9 @@ func (e *LinuxProbeEvaluator) linkerOptionProbe(command string) (linuxProbeTruth
 			ConditionalArguments: conditional, ArgumentFragments: argumentFragments, Candidate: candidateOwnership,
 		}},
 		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{Operator: "exit-zero", Step: "probe"}},
+	}
+	if usesHostDeps {
+		request.SourceRoots = []string{linuxProbeHostDepsRootName}
 	}
 	truth, err := e.requestTruth(request, dependencies...)
 	return truth, true, err
@@ -3217,24 +3423,134 @@ func (e *LinuxProbeEvaluator) assemblerSourceProbe(command string) (linuxProbeTr
 }
 
 func (e *LinuxProbeEvaluator) compileRequest(candidate []string, language, mode, source string) (linuxProbeTruth, error) {
+	candidate, candidateMask, sources, linkerBound, err := e.bindCompilerDeclaredArguments(candidate)
+	if err != nil {
+		return linuxProbeTruth{}, err
+	}
 	arguments, conditional, argumentFragments, candidateOwnership, stdinValue, stdinFragments, dependencies, err := e.lowerSymbolicCandidateProcessInputs(
-		candidate, probeCandidateArgumentMask(len(candidate)), ProbeCandidatePolicyCC, source,
+		candidate, candidateMask, ProbeCandidatePolicyCC, source,
 	)
 	if err != nil {
 		return linuxProbeTruth{}, err
 	}
+	conditional, candidateOwnership, conditionalSources, conditionalLinkerBound, err := e.bindConditionalCompilerDeclaredArguments(conditional, candidateOwnership)
+	if err != nil {
+		return linuxProbeTruth{}, err
+	}
+	usesHostDeps, err := e.candidateHostDependencyRoot(arguments, conditional, argumentFragments, candidateOwnership, dependencies)
+	if err != nil {
+		return linuxProbeTruth{}, err
+	}
+	sources = append(sources, conditionalSources...)
+	slices.Sort(sources)
+	sources = slices.Compact(sources)
+	var auxiliaryTools []string
+	if linkerBound || conditionalLinkerBound {
+		auxiliaryTools = []string{"ld"}
+	}
 	arguments = append(arguments, "-x", language, mode, "-o", "${scratch:output}", "-")
 	request := ProbeRequest{
 		Schema: LinuxProbeRequestSchema, InputCount: len(dependencies),
+		Sources: sources,
 		Scratch: []ProbeScratch{{Name: "output", Kind: "file"}},
 		Steps: []ProbeStep{{
-			Name: "probe", Tool: "cc", Arguments: arguments,
+			Name: "probe", Tool: "cc", AuxiliaryTools: auxiliaryTools, Arguments: arguments,
 			ConditionalArguments: conditional, ArgumentFragments: argumentFragments, Candidate: candidateOwnership,
 			Stdin: stdinValue, StdinFragments: stdinFragments,
+			DiscardStdout: true, DiscardStderr: true,
 		}},
 		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{Operator: "exit-zero", Step: "probe"}},
 	}
+	if usesHostDeps {
+		request.SourceRoots = []string{linuxProbeHostDepsRootName}
+	}
 	return e.requestTruth(request, dependencies...)
+}
+
+// A source-expanded compiler flag can pass an immutable kernel header to the
+// assembler or the configured linker path to Clang. Bind only exact declared
+// source/tool roles before validating every unrelated candidate flag; arbitrary
+// tool selections and forwarded filesystem paths remain candidate-owned.
+func (e *LinuxProbeEvaluator) bindCompilerDeclaredArguments(candidate []string) ([]string, []bool, []string, bool, error) {
+	bound := slices.Clone(candidate)
+	mask := probeCandidateArgumentMask(len(bound))
+	var sources []string
+	linkerBound := false
+	for index, argument := range bound {
+		if argument == "--ld-path="+KbuildActionRoleToken(e.scope, "ld") {
+			if e.tools["ld"] == "" {
+				return nil, nil, nil, false, fmt.Errorf("compiler linker flag %q has no configured %s ld role", argument, e.scope)
+			}
+			bound[index] = "--ld-path=${tool:ld}"
+			mask[index] = false
+			linkerBound = true
+			continue
+		}
+		path, selected := strings.CutPrefix(argument, "-Wa,"+selectedToolSourceTreePrefix)
+		if !selected {
+			continue
+		}
+		path, err := e.immutableLinuxSourcePath(path, false)
+		if err != nil {
+			return nil, nil, nil, false, fmt.Errorf("compiler assembler source flag %q: %w", argument, err)
+		}
+		bound[index] = "-Wa,${source:" + path + "}"
+		mask[index] = false
+		sources = append(sources, path)
+	}
+	slices.Sort(sources)
+	sources = slices.Compact(sources)
+	return bound, mask, sources, linkerBound, nil
+}
+
+// A symbolic capability choice can contribute several argv words in one
+// conditional group. Split such a group at a source-bound file so candidate
+// validation still owns every unrelated flag on either side of that file.
+func (e *LinuxProbeEvaluator) bindConditionalCompilerDeclaredArguments(
+	groups []ProbeConditionalArguments,
+	candidate *ProbeCandidateArguments,
+) ([]ProbeConditionalArguments, *ProbeCandidateArguments, []string, bool, error) {
+	var expanded []ProbeConditionalArguments
+	var sources []string
+	var owned []int
+	linkerBound := false
+	for index, group := range groups {
+		arguments, mask, inputs, selectedLinker, err := e.bindCompilerDeclaredArguments(group.Arguments)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+		linkerBound = linkerBound || selectedLinker
+		sources = append(sources, inputs...)
+		candidateGroup := candidate != nil && slices.Contains(candidate.Conditional, index)
+		if !candidateGroup {
+			group.Arguments = arguments
+			expanded = append(expanded, group)
+			continue
+		}
+		for start := 0; start < len(arguments); {
+			owner := mask[start]
+			end := start + 1
+			for end < len(arguments) && mask[end] == owner {
+				end++
+			}
+			part := group
+			part.Arguments = arguments[start:end]
+			if owner {
+				owned = append(owned, len(expanded))
+			}
+			expanded = append(expanded, part)
+			start = end
+		}
+	}
+	if candidate != nil {
+		copy := *candidate
+		copy.Conditional = owned
+		candidate = &copy
+		if len(copy.Base) == 0 && len(owned) == 0 {
+			candidate = nil
+		}
+	}
+	return expanded, candidate, sources, linkerBound, nil
 }
 
 func (e *LinuxProbeEvaluator) parseLinuxSourceProbe(command string) (string, string, []string, error) {
@@ -3734,6 +4050,17 @@ func (e *LinuxProbeEvaluator) compilerVersionGrepOutput(command string) (string,
 	literal, valid := parseLinuxProbeGrepLiteral(literal)
 	if !valid {
 		return "", true, e.unsupportedCommand(command)
+	}
+	// The configured compiler bootstrap already ran this action with LC_ALL=C;
+	// the probe runner also sets LC_ALL=C by default. A stderr-free first line
+	// is therefore the exact input to this source-owned literal grep. Resolving
+	// it here retains Make's true absent/present export membership when this
+	// command guards an `export` directive.
+	if versionText, exact := e.facts.VersionTextForCombinedStream(); exact {
+		if strings.Contains(versionText, literal) {
+			return versionText, true, nil
+		}
+		return "", true, nil
 	}
 	versionRequest := ProbeRequest{
 		Schema: LinuxProbeRequestSchema,

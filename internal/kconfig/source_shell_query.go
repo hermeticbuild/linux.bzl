@@ -58,6 +58,58 @@ func (s *KbuildProbeScopes) kbuildSourceShell(
 		}
 		return value, nil
 	}
+	// Some source Makefiles spell the host package query as literal
+	// "pkg-config" rather than using HOSTPKG_CONFIG. Bind that exact program
+	// to the configured host shim; its existing query parser validates every
+	// argument, redirection, and fallback before declaring an action.
+	if program == linuxProbePkgConfigRole {
+		command = strings.TrimSpace(command)
+		if strings.HasPrefix(command, linuxProbePkgConfigRole+" ") {
+			evaluator := s.evaluators["host"]
+			if evaluator == nil {
+				return "", fmt.Errorf("source-shell pkg-config query requires the host action scope")
+			}
+			bound := KbuildActionRoleToken("host", linuxProbePkgConfigRole) + strings.TrimPrefix(command, linuxProbePkgConfigRole)
+			return evaluator.KbuildShell(ctx, bound)
+		}
+	}
+	// The feature Makefile reads Perl's build flags while expanding its
+	// selected compiler recipe. Bind this exact source command to the host
+	// Perl applet; the pure source-filter grammar cannot execute it, and an
+	// ambient perl on PATH would change the selected compiler argv.
+	if program == "perl" {
+		evaluator := s.evaluators["host"]
+		if evaluator == nil {
+			return "", fmt.Errorf("Perl Embed source query requires the host action scope")
+		}
+		return evaluator.perlEmbedSourceShellQuery(ctx, command)
+	}
+	// A literal integer expr is a pure Make source calculation. Recipe
+	// discovery disables the generic shell callback to avoid executing recipe
+	// work, but it can still calculate these finite integer operands exactly.
+	// Measured text instead remains a host expr probe with its original result
+	// dependency and its own typed, fail-closed argv contract.
+	if program == "expr" {
+		if linuxProbeSymbolPattern.MatchString(command) {
+			evaluator := s.evaluators["host"]
+			if evaluator == nil {
+				return "", fmt.Errorf("measured expr source query requires the host action scope")
+			}
+			return evaluator.KbuildShell(ctx, command)
+		}
+		return EvaluateKbuildIntegerExpression(command)
+	}
+	if program == "[" {
+		return EvaluateKbuildNumericShellPredicate(command)
+	}
+	// Echo with only quoted empty literal operands has a source-independent
+	// result. Preserve the spaces between operands before GNU Make removes the
+	// trailing newline: two empty words produce one space, not empty text.
+	if program == "echo" {
+		if value, pure := pureKbuildSourceEmptyEcho(command); pure {
+			return value, nil
+		}
+	}
 	// A source-text query is execution-platform work and is independent of the
 	// target compiler. Keep it in the host phase so cross compilation does not
 	// make grep/sort/cut results target-toolset capabilities.
@@ -66,6 +118,91 @@ func (s *KbuildProbeScopes) kbuildSourceShell(
 		return "", &LinuxProbeUnsupportedCommandError{Command: command}
 	}
 	return evaluator.sourceShellQuery(ctx, command, workingDirectory)
+}
+
+func pureKbuildSourceEmptyEcho(command string) (string, bool) {
+	tokens, err := lexCompactKbuildRecipe(command)
+	if err != nil || len(tokens) == 0 || command[tokens[0].start:tokens[0].end] != "echo" {
+		return "", false
+	}
+	for _, token := range tokens[1:] {
+		if token.operator || token.value != "" || token.shellExpansion || token.pathnameExpansion || token.activeBacktick ||
+			!sourceShellQueryQuotedLiteral(command[token.start:token.end]) {
+			return "", false
+		}
+	}
+	if len(tokens) <= 2 {
+		return "", true
+	}
+	return strings.Repeat(" ", len(tokens)-2), true
+}
+
+// perlEmbedSourceShellQuery measures the two source-selected ExtUtils::Embed
+// flag queries. Its argv and stderr discard are reconstructed from a bounded
+// grammar so the source cannot select another module, program, output, or
+// shell command. GNU Make normally treats a failed $(shell ...) as empty
+// stdout. Here missing configured Perl, its module, or its runtime fails
+// closed: silently omitting measured link flags would change the candidate.
+func (e *LinuxProbeEvaluator) perlEmbedSourceShellQuery(ctx context.Context, command string) (string, error) {
+	if e == nil {
+		return "", fmt.Errorf("Perl Embed source query has no evaluator")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	command = strings.TrimSpace(command)
+	if command == "" || len(command) > 4096 || strings.ContainsAny(command, "\x00\r\n") {
+		return "", fmt.Errorf("Perl Embed source query has invalid command text")
+	}
+	tokens, err := lexCompactKbuildRecipe(command)
+	if err != nil {
+		return "", fmt.Errorf("lex Perl Embed source query: %w", err)
+	}
+	if len(tokens) != 7 || tokens[4].operator || tokens[4].value != "2" ||
+		!tokens[5].operator || tokens[5].value != ">" || tokens[6].operator || tokens[6].value != "/dev/null" ||
+		tokens[4].end != tokens[5].start || tokens[5].end != tokens[6].start {
+		return "", fmt.Errorf("Perl Embed source query requires exact argv and stderr discard")
+	}
+	for index, want := range []string{"perl", "-MExtUtils::Embed", "-e"} {
+		if tokens[index].operator || tokens[index].value != want || command[tokens[index].start:tokens[index].end] != want {
+			return "", fmt.Errorf("Perl Embed source query requires exact argv and stderr discard")
+		}
+	}
+	function := tokens[3].value
+	if tokens[3].operator || (function != "ccopts" && function != "ldopts") ||
+		command[tokens[3].start:tokens[3].end] != function ||
+		command[tokens[4].start:tokens[6].end] != "2>/dev/null" {
+		return "", fmt.Errorf("Perl Embed source query requires exact argv and stderr discard")
+	}
+	perl := compactKbuildScriptAppletRolePrefix + "perl"
+	for _, role := range []string{linuxProbeScriptRunner, linuxProbeScriptRuntime, perl} {
+		if e.tools[role] == "" {
+			return "", fmt.Errorf("Perl Embed source query requires configured host %s role", role)
+		}
+	}
+	const stepName = "perl-embed-flags"
+	request := ProbeRequest{
+		Schema: LinuxProbeRequestSchema,
+		Steps: []ProbeStep{{
+			Name: stepName, Tool: linuxProbeScriptRunner,
+			Arguments: []string{
+				"-interpreter", "${tool:" + linuxProbeScriptRuntime + "}",
+				"-interpreter_arg", "sh",
+				"-multicall", "${tool:" + linuxProbeScriptRuntime + "}",
+				"-script_content", "perl -MExtUtils::Embed -e " + function + " 2>/dev/null",
+				"-applet", "perl=${tool:" + perl + "}",
+				"-require_applet", "perl", "-require_applet", "sh", "--",
+			},
+		}},
+		Outcome: ProbeOutcome{
+			Kind: "text", Step: stepName, Stream: "stdout",
+			GNUMakeShell: true, RequireSuccess: true,
+		},
+	}
+	if err := request.Validate(); err != nil {
+		return "", fmt.Errorf("Perl Embed source query request: %w", err)
+	}
+	return e.requestText(request)
 }
 
 func (e *LinuxProbeEvaluator) sourceShellQuery(

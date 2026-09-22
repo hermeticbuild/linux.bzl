@@ -30,6 +30,7 @@ load(
     "linux_test_family_store_path",
     "linux_test_family_tree_input",
     "linux_test_filtered_toolchain_closure_files",
+    "linux_test_host_dependency_archive_link_flag",
     "linux_test_host_dependency_compile_flags",
     "linux_test_host_dependency_library_search_flags",
     "linux_test_host_library_artifact",
@@ -115,6 +116,11 @@ _exec_python_toolchain = rule(
 
 def _flag_values(argv, flag):
     return [argv[index + 1] for index in range(len(argv) - 1) if argv[index] == flag]
+
+def _assert_kernel_kbuild_goals(env, action):
+    asserts.equals(env, ["all"], _flag_values(action.argv, "-kbuild_target"))
+    asserts.equals(env, ["prepare"], _flag_values(action.argv, "-kbuild_prepare_target"))
+    asserts.equals(env, ["modules_prepare"], _flag_values(action.argv, "-kbuild_prepare_candidate"))
 
 def _action_path_names_artifact(value, artifact):
     # Analysis tests see path-mapped argv under bazel-out/cfg while Artifact.path
@@ -662,7 +668,7 @@ def _family_variant_output_names(owner, variants, initial):
     for variant in variants:
         prefix = owner + "." + variant
         config_prefix = prefix + ".initial" if initial else prefix
-        for suffix in [".arch", ".config", ".auto.conf", ".auto.conf.cmd", ".autoconf.h", ".rustc_cfg", ".kernel.release"]:
+        for suffix in [".arch", ".config", ".auto.conf", ".auto.conf.cmd", ".autoconf.h", ".rustc_cfg"]:
             names.append(config_prefix + suffix)
         names.append(prefix + (".action-plan.json.gz" if initial else ".observed-action-plan.json.gz"))
     return names
@@ -823,6 +829,7 @@ def _assert_family_observation_pipeline(env, initial, replay, guard_planners, ow
         asserts.equals(env, variants, _flag_values(action.argv, "-family_plan_variant"))
         _assert_manifest_derived_rust(env, action)
         _assert_selected_rust_sources_are_inputs(env, action)
+        _assert_kernel_kbuild_goals(env, action)
     immutable_flags = [
         "-root",
         "-srctree",
@@ -842,6 +849,7 @@ def _assert_family_observation_pipeline(env, initial, replay, guard_planners, ow
         "-target_kbuild_probe_results",
         "-kbuild_target",
         "-kbuild_prepare_target",
+        "-kbuild_prepare_candidate",
         "-var",
         "-source_root_map",
         "-family_plan_overlay",
@@ -950,6 +958,7 @@ def _assert_family_observation_pipeline(env, initial, replay, guard_planners, ow
             asserts.equals(env, variants, _flag_values(planner.argv, "-family_plan_variant"))
             _assert_manifest_derived_rust(env, planner)
             _assert_selected_rust_sources_are_inputs(env, planner)
+            _assert_kernel_kbuild_goals(env, planner)
             for flag in immutable_flags:
                 asserts.equals(env, _flag_values(initial.argv, flag), _flag_values(planner.argv, flag), description + " changed immutable invocation flag " + flag)
             for flag in ["-family_execution_checkpoint_in", "-family_execution_cut_in", "-family_execution_initial_snapshot", "-family_execution_store"]:
@@ -1077,6 +1086,12 @@ def _mapped_kernel_toolset_test_impl(ctx):
     probe_plan_actions = [action for action in actions if action.mnemonic == "LinuxProbePlan"]
     kconfig_probe_plan_actions = [action for action in actions if action.mnemonic == "LinuxKconfigProbePlan"]
     kbuild_probe_plan_actions = [action for action in actions if action.mnemonic == "LinuxKbuildProbePlan"]
+    kbuild_guard_probe_plan_actions = [action for action in actions if action.mnemonic == "LinuxKbuildGraphGuardProbePlan"]
+    kbuild_guard_union_actions = [action for action in actions if action.mnemonic == "LinuxKbuildGraphGuardProbeUnion"]
+    source_output_plan_actions = [action for action in actions if action.mnemonic == "LinuxKbuildSourceOutputProbePlan"]
+    source_output_union_actions = [action for action in actions if action.mnemonic == "LinuxKbuildSourceOutputProbeUnion"]
+    feature_dump_plan_actions = [action for action in actions if action.mnemonic == "LinuxKbuildFeatureDumpProbePlan"]
+    feature_dump_union_actions = [action for action in actions if action.mnemonic == "LinuxKbuildFeatureDumpProbeUnion"]
     kbuild_probe_union_actions = [action for action in actions if action.mnemonic == "LinuxKbuildProbeUnion"]
     planner_actions = [action for action in actions if action.mnemonic == "LinuxMappedFamilySnapshotPlan"]
     family_plan_actions = [action for action in actions if action.mnemonic == "LinuxMappedFamilyPlan"]
@@ -1088,6 +1103,12 @@ def _mapped_kernel_toolset_test_impl(ctx):
     asserts.equals(env, 1, len(probe_plan_actions))
     asserts.equals(env, 1, len(kconfig_probe_plan_actions))
     asserts.equals(env, 1, len(kbuild_probe_plan_actions))
+    asserts.equals(env, 5, len(kbuild_guard_probe_plan_actions))
+    asserts.equals(env, 5, len(kbuild_guard_union_actions))
+    asserts.equals(env, 5, len(source_output_plan_actions))
+    asserts.equals(env, 5, len(source_output_union_actions))
+    asserts.equals(env, 5, len(feature_dump_plan_actions))
+    asserts.equals(env, 5, len(feature_dump_union_actions))
     asserts.equals(env, 1, len(kbuild_probe_union_actions))
     asserts.equals(env, 1, len(planner_actions))
     asserts.equals(env, 1, len(family_plan_actions))
@@ -1113,6 +1134,7 @@ def _mapped_kernel_toolset_test_impl(ctx):
     if OutputGroupInfo in target:
         asserts.equals(env, ["analysis_smoke.base.arch"], [file.basename for file in target[OutputGroupInfo].arch.to_list()])
         asserts.equals(env, 2, len(target[OutputGroupInfo].toolsets.to_list()))
+        asserts.equals(env, ["analysis_smoke.kbuild-probe-plan"], [file.basename for file in target[OutputGroupInfo].kbuild_probe_plan.to_list()])
         asserts.equals(env, [
             "analysis_smoke.family-plan-bootstrap-v7",
             "analysis_smoke.family-plan-host-v7",
@@ -1161,10 +1183,100 @@ def _mapped_kernel_toolset_test_impl(ctx):
         asserts.equals(env, 1, len([arg for arg in kbuild_probe_plan.argv if arg == "-host_toolset_identity"]))
         asserts.equals(env, 1, len([arg for arg in kbuild_probe_plan.argv if arg == "-target_toolset_manifest"]))
         asserts.equals(env, 1, len([arg for arg in kbuild_probe_plan.argv if arg == "-host_toolset_manifest"]))
-        asserts.equals(env, ["all"], _flag_values(kbuild_probe_plan.argv, "-kbuild_target"))
-        asserts.equals(env, ["modules_prepare"], _flag_values(kbuild_probe_plan.argv, "-kbuild_prepare_target"))
+        _assert_kernel_kbuild_goals(env, kbuild_probe_plan)
         asserts.equals(env, 0, len([value for value in _flag_values(kbuild_probe_plan.argv, "-var") if value.startswith("PYTHON3=")]))
         asserts.equals(env, {}, kbuild_probe_plan.env)
+    if kbuild_guard_probe_plan_actions:
+        for round_index in range(5):
+            name = "analysis_smoke.base.kbuild-graph-guard-round-%d-fragment" % round_index
+            selected = [action for action in kbuild_guard_probe_plan_actions if name in [output.basename for output in action.outputs.to_list()]]
+            asserts.equals(env, 1, len(selected))
+            if not selected:
+                continue
+            action = selected[0]
+            _assert_kernel_kbuild_goals(env, action)
+            asserts.equals(env, 1, len(_flag_values(action.argv, "-kbuild_graph_guard_probe_plan_out")))
+            asserts.equals(env, round_index > 0, len(_flag_values(action.argv, "-kbuild_graph_guard_probe_plan")) == 1)
+            asserts.equals(env, round_index > 1, len(_flag_values(action.argv, "-kbuild_graph_guard_earlier_plan")) == 1)
+            for scope in ["host", "target"]:
+                asserts.equals(env, round_index > 1, len(_flag_values(action.argv, "-kbuild_graph_guard_earlier_%s_results" % scope)) == 1)
+            asserts.equals(env, round_index == 4, "-kbuild_graph_guard_require_converged" in action.argv)
+            if round_index > 0:
+                previous_suffix = ".round-%d" % (round_index - 1)
+                previous_plan = "analysis_smoke" + previous_suffix + ".kbuild-graph-guard-probe-plan"
+                asserts.true(env, previous_plan in [input.basename for input in action.inputs.to_list()])
+                for scope in ["host", "target"]:
+                    previous_results = "analysis_smoke" + previous_suffix + ".kbuild-graph-guard-results-" + scope
+                    asserts.true(env, previous_results in [input.basename for input in action.inputs.to_list()])
+            if round_index > 1:
+                earlier_suffix = ".round-%d" % (round_index - 2)
+                earlier_plan = "analysis_smoke" + earlier_suffix + ".kbuild-graph-guard-probe-plan"
+                asserts.true(env, earlier_plan in [input.basename for input in action.inputs.to_list()])
+                for scope in ["host", "target"]:
+                    earlier_results = "analysis_smoke" + earlier_suffix + ".kbuild-graph-guard-results-" + scope
+                    asserts.true(env, earlier_results in [input.basename for input in action.inputs.to_list()])
+    for round_index in range(5):
+        source_name = "analysis_smoke.base.kbuild-source-output-round-%d-fragment" % round_index
+        source_selected = [action for action in source_output_plan_actions if source_name in [output.basename for output in action.outputs.to_list()]]
+        asserts.equals(env, 1, len(source_selected))
+        feature_name = "analysis_smoke.base.kbuild-feature-dump-round-%d-fragment" % round_index
+        feature_selected = [action for action in feature_dump_plan_actions if feature_name in [output.basename for output in action.outputs.to_list()]]
+        asserts.equals(env, 1, len(feature_selected))
+        if not source_selected or not feature_selected:
+            continue
+        source_action = source_selected[0]
+        feature_action = feature_selected[0]
+        _assert_kernel_kbuild_goals(env, source_action)
+        _assert_kernel_kbuild_goals(env, feature_action)
+        asserts.equals(env, round_index > 0, len(_flag_values(source_action.argv, "-kbuild_source_output_probe_plan")) == 1)
+        asserts.equals(env, round_index > 0, len(_flag_values(source_action.argv, "-kbuild_feature_dump_probe_plan")) == 1)
+        asserts.equals(env, round_index > 1, len(_flag_values(source_action.argv, "-kbuild_source_output_earlier_plan")) == 1)
+        asserts.equals(env, round_index > 1, len(_flag_values(source_action.argv, "-kbuild_paired_earlier_feature_plan")) == 1)
+        asserts.equals(env, [], _flag_values(source_action.argv, "-kbuild_paired_earlier_source_plan"))
+        asserts.equals(env, round_index == 4, "-kbuild_source_output_require_converged" in source_action.argv)
+        asserts.equals(env, 1, len(_flag_values(feature_action.argv, "-kbuild_source_output_probe_plan")))
+        asserts.equals(env, round_index > 0, len(_flag_values(feature_action.argv, "-kbuild_feature_dump_probe_plan")) == 1)
+        asserts.equals(env, round_index > 1, len(_flag_values(feature_action.argv, "-kbuild_feature_dump_earlier_plan")) == 1)
+        asserts.equals(env, round_index > 1, len(_flag_values(feature_action.argv, "-kbuild_paired_earlier_source_plan")) == 1)
+        asserts.equals(env, [], _flag_values(feature_action.argv, "-kbuild_paired_earlier_feature_plan"))
+        asserts.equals(env, round_index == 4, "-kbuild_feature_dump_require_converged" in feature_action.argv)
+        current_source_suffix = "" if round_index == 4 else ".round-%d" % round_index
+        current_source_plan = "analysis_smoke" + current_source_suffix + ".kbuild-source-output-probe-plan"
+        asserts.true(env, current_source_plan in [input.basename for input in feature_action.inputs.to_list()])
+        if round_index > 0:
+            previous_suffix = ".round-%d" % (round_index - 1)
+            previous_source_plan = "analysis_smoke" + previous_suffix + ".kbuild-source-output-probe-plan"
+            previous_feature_plan = "analysis_smoke" + previous_suffix + ".kbuild-feature-dump-probe-plan"
+            source_inputs = [input.basename for input in source_action.inputs.to_list()]
+            feature_inputs = [input.basename for input in feature_action.inputs.to_list()]
+            asserts.true(env, previous_source_plan in source_inputs)
+            asserts.true(env, previous_feature_plan in source_inputs)
+            asserts.true(env, previous_feature_plan in feature_inputs)
+            for scope in ["host", "target"]:
+                asserts.true(env, "analysis_smoke" + previous_suffix + ".kbuild-source-output-results-" + scope in source_inputs)
+                previous_feature_results = "analysis_smoke" + previous_suffix + ".kbuild-feature-dump-results-" + scope
+                asserts.true(env, previous_feature_results in source_inputs)
+                asserts.true(env, previous_feature_results in feature_inputs)
+        if round_index > 1:
+            source_inputs = [input.basename for input in source_action.inputs.to_list()]
+            feature_inputs = [input.basename for input in feature_action.inputs.to_list()]
+            earlier_suffix = ".round-%d" % (round_index - 2)
+            previous_suffix = ".round-%d" % (round_index - 1)
+            for name, inputs in [
+                ("analysis_smoke" + earlier_suffix + ".kbuild-source-output-probe-plan", source_inputs),
+                ("analysis_smoke" + earlier_suffix + ".kbuild-feature-dump-probe-plan", source_inputs),
+                ("analysis_smoke" + previous_suffix + ".kbuild-source-output-probe-plan", feature_inputs),
+                ("analysis_smoke" + earlier_suffix + ".kbuild-feature-dump-probe-plan", feature_inputs),
+            ]:
+                asserts.true(env, name in inputs)
+            for scope in ["host", "target"]:
+                for stage, earlier_result_suffix, inputs in [
+                    ("kbuild-source-output", earlier_suffix, source_inputs),
+                    ("kbuild-feature-dump", earlier_suffix, source_inputs),
+                    ("kbuild-source-output", previous_suffix, feature_inputs),
+                    ("kbuild-feature-dump", earlier_suffix, feature_inputs),
+                ]:
+                    asserts.true(env, "analysis_smoke" + earlier_result_suffix + "." + stage + "-results-" + scope in inputs)
     if kbuild_probe_union_actions:
         kbuild_probe_union = kbuild_probe_union_actions[0]
         asserts.equals(env, 1, len(_flag_values(kbuild_probe_union.argv, "-probe_plan_union_input")))
@@ -1198,8 +1310,7 @@ def _mapped_kernel_toolset_test_impl(ctx):
         asserts.equals(env, 1, len([arg for arg in planner.argv if arg == "-target_kconfig_probe_results"]))
         asserts.equals(env, 1, len([arg for arg in planner.argv if arg == "-host_kbuild_probe_results"]))
         asserts.equals(env, 1, len([arg for arg in planner.argv if arg == "-target_kbuild_probe_results"]))
-        asserts.equals(env, ["all"], _flag_values(planner.argv, "-kbuild_target"))
-        asserts.equals(env, ["modules_prepare"], _flag_values(planner.argv, "-kbuild_prepare_target"))
+        _assert_kernel_kbuild_goals(env, planner)
         asserts.equals(env, 0, len([value for value in _flag_values(planner.argv, "-var") if value.startswith("PYTHON3=")]))
         asserts.equals(env, {}, planner.env)
         asserts.equals(env, 1, len([file for file in planner.outputs.to_list() if file.basename == "analysis_smoke.base.initial.arch"]))
@@ -1284,6 +1395,11 @@ def _mapped_kernel_toolset_test_impl(ctx):
             for role in ["cc-link", "cxx-link"]:
                 argv = action_args[role]
                 markers = [index for index, arg in enumerate(argv) if arg == "__LINUX_BZL_KBUILD_ARGS_V1__"]
+                runtime_indexes = [
+                    index
+                    for index, arg in enumerate(argv)
+                    if arg in closure_paths and arg.endswith(".a") and index > markers[0]
+                ]
                 runtime_paths[role] = sorted([
                     arg
                     for arg in argv[markers[0] + 1:]
@@ -1294,6 +1410,14 @@ def _mapped_kernel_toolset_test_impl(ctx):
                     len(runtime_paths[role]) > 0,
                     "%s %s must append configured runtime archives after source-selected inputs" % (scope, role),
                 )
+                if runtime_indexes:
+                    first_runtime = min(runtime_indexes)
+                    asserts.equals(
+                        env,
+                        ["-x", "none"],
+                        argv[first_runtime - 2:first_runtime],
+                        "%s %s must reset source-selected compiler input language before static runtime Files" % (scope, role),
+                    )
             asserts.equals(
                 env,
                 runtime_paths["cc-link"],
@@ -1313,6 +1437,43 @@ def _mapped_kernel_toolset_test_impl(ctx):
                 for arg in sdk.host_action_args[role]
                 if host_dependency_path in arg
             ]
+            link_search = [arg for arg in dependency_arguments if arg.startswith("-L")]
+            if role in ["cc-link", "cxx-link"]:
+                asserts.true(
+                    env,
+                    "-L" + host_dependency_path + "/external/elfutils+" in link_search and
+                    "-L" + host_dependency_path + "/external/zlib+" in link_search,
+                    "host %s action must search only declared staged libelf/zlib archives for source -l flags" % role,
+                )
+                linked_archives = [
+                    arg
+                    for arg in dependency_arguments
+                    if arg.startswith("-Wl," + host_dependency_path + "/") and arg.endswith(".a")
+                ]
+                asserts.equals(
+                    env,
+                    [
+                        "-Wl," + host_dependency_path + "/external/elfutils+/libelf.a",
+                        "-Wl," + host_dependency_path + "/external/elfutils+/liblibeu.a",
+                        "-Wl," + host_dependency_path + "/external/zlib+/libz.a",
+                    ],
+                    linked_archives,
+                    "host %s action must append the ordered declared libelf CcInfo archive closure after source inputs" % role,
+                )
+                marker = sdk.host_action_args[role].index("__LINUX_BZL_KBUILD_ARGS_V1__")
+                asserts.true(
+                    env,
+                    all([sdk.host_action_args[role].index(archive) > marker for archive in linked_archives]),
+                    "host %s archives must follow source-selected link inputs" % role,
+                )
+            else:
+                asserts.equals(env, [], link_search, "host %s compilation must not inherit link search paths" % role)
+                asserts.equals(
+                    env,
+                    [],
+                    [arg for arg in dependency_arguments if arg.startswith("-Wl," + host_dependency_path + "/")],
+                    "host %s compilation must not inherit dependency archives" % role,
+                )
             asserts.true(
                 env,
                 len(dependency_arguments) > 0,
@@ -1331,7 +1492,8 @@ def _mapped_kernel_toolset_test_impl(ctx):
             for argument in dependency_arguments:
                 asserts.true(
                     env,
-                    argument.startswith("-iquote") or argument.startswith("-isystem"),
+                    argument.startswith("-iquote") or argument.startswith("-isystem") or
+                    (role in ["cc-link", "cxx-link"] and (argument.startswith("-L") or argument.startswith("-Wl,"))),
                     "host %s dependency root must retain its CcInfo search-path class" % role,
                 )
                 rendered = linux_test_render_toolchain_action_value(argument, [sdk.host_deps])
@@ -1401,6 +1563,12 @@ def _mapped_kernel_toolset_test_impl(ctx):
         asserts.equals(env, "-manifest", pkg_config_contract[0])
         asserts.equals(env, "--", pkg_config_contract[2])
         manifest_path = pkg_config_contract[1]
+        asserts.equals(
+            env,
+            manifest_path,
+            sdk.host_pkg_config_manifest.path,
+            "module SDK must expose the image planner's exact configured host package manifest File",
+        )
         pkg_config_manifests = [
             file
             for file in sdk.host_toolchain_files.to_list()
@@ -1673,7 +1841,7 @@ def _mapped_kernel_family_wiring_test_impl(ctx):
         asserts.equals(env, 1, len(values))
         if values:
             asserts.true(env, _action_path_names_artifact(values[0], output))
-        asserts.equals(env, 6, len(action.outputs.to_list()))
+        asserts.equals(env, 5, len(action.outputs.to_list()))
         for flag in ["-kbuild", "-kbuild_probe_plan_out", "-target_kbuild_probe_results", "-family_plan_variant", "-family_execution_mode"]:
             asserts.equals(env, [], _flag_values(action.argv, flag), "configuration must not request " + flag)
         overlays = _flag_values(action.argv, "-resolve_config_overlay")
@@ -1720,7 +1888,6 @@ def _mapped_kernel_family_wiring_test_impl(ctx):
             "-family_plan_resolved_auto_conf_cmd_out",
             "-family_plan_resolved_autoconf_out",
             "-family_plan_resolved_rustc_cfg_out",
-            "-family_plan_resolved_kernel_release_out",
             "-family_plan_snapshot_out",
         ]:
             asserts.equals(env, 3, len(_flag_values(family_plan.argv, flag)))
@@ -3176,6 +3343,8 @@ def _mapped_kernel_backend_test_impl(ctx):
         [
             "--configured-before",
             "__LINUX_BZL_KBUILD_ARGS_V1__",
+            "-x",
+            "none",
             "toolchain/lib/libc++.a",
             "toolchain/lib/libunwind.a",
             "--configured-after",
@@ -3232,6 +3401,13 @@ def _mapped_kernel_backend_test_impl(ctx):
             "__LINUX_BZL_HOST_DEPS__/external/elfutils+/libeu.a",
             "__LINUX_BZL_HOST_DEPS__/external/zlib+/libz.a",
         ]),
+    )
+    asserts.equals(
+        env,
+        "-Wl,__LINUX_BZL_HOST_DEPS__/external/elfutils+/libelf.a",
+        linux_test_host_dependency_archive_link_flag(
+            "__LINUX_BZL_HOST_DEPS__/external/elfutils+/libelf.a",
+        ),
     )
 
     staged_script = "__LINUX_BZL_HOST_DEPS__/external/libelf/version.lds"

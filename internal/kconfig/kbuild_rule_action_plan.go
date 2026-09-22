@@ -65,6 +65,50 @@ func compactKbuildContainsPrivateActionMarker(value string) bool {
 		strings.Contains(value, toolaction.ExecutionRootProvenanceMarker)
 }
 
+func compactKbuildHasRecursiveMakeAliasExport(environment map[string]string) bool {
+	for name, value := range environment {
+		if name != "MAKE" && strings.Contains(value, CompactKbuildRecursiveMakeProvenanceToken) {
+			return true
+		}
+	}
+	return false
+}
+
+// compactKbuildBindRecursiveMakeExportProxy projects only Make-injected
+// provenance into the runner's public proxy name. Every exported alias is
+// processed because a child can read inherited exports without a shell
+// parameter expansion. With no selected recursive child, install a deny-all
+// proxy so even a shell-masked attempted invocation fails the action.
+func compactKbuildBindRecursiveMakeExportProxy(
+	environment map[string]string,
+	replays []ActionRecipeCommandReplay,
+) ([]ActionRecipeCommandReplay, error) {
+	bound := false
+	for _, value := range environment {
+		if strings.Contains(value, CompactKbuildRecursiveMakeProvenanceToken) {
+			bound = true
+			break
+		}
+	}
+	if !bound {
+		return replays, nil
+	}
+	if len(replays) == 0 {
+		replays = []ActionRecipeCommandReplay{{
+			Name: CompactKbuildRecursiveMakeReplayName, DenyAll: true,
+			Invocations: []ActionRecipeCommandReplayInvocation{},
+		}}
+	}
+	if len(replays) != 1 || replays[0].Name != CompactKbuildRecursiveMakeReplayName {
+		return nil, fmt.Errorf("exported recursive Make provenance has no matching replay proxy")
+	}
+	for name, value := range environment {
+		environment[name] = strings.ReplaceAll(value,
+			CompactKbuildRecursiveMakeProvenanceToken, replays[0].Name)
+	}
+	return replays, nil
+}
+
 type compactKbuildRulePlanBuilder struct {
 	metadata                     *CompactMetadata
 	plan                         *ActionPlan
@@ -338,6 +382,10 @@ func compactKbuildRuleEvaluationContext(
 		// resolved and retain Make's raw prerequisite context below.
 		return match.stem, compactKbuildInputPaths(inputs, false), compactKbuildInputPaths(inputs, true), nil
 	}
+	match, err := compactKbuildSelectedRuleEntryMatch(target, match)
+	if err != nil {
+		return "", nil, nil, err
+	}
 	normal, orderOnly, stem, err := evaluatedKbuildSelectedTargetRuleContext(match.profile, target, &match)
 	if err != nil {
 		return "", nil, nil, err
@@ -360,6 +408,10 @@ func compactKbuildRuleAutomaticEvaluationContext(
 			return compactKbuildAutomaticContext{}, err
 		}
 		return compactKbuildAutomaticContext{target: target, stem: stem, normal: normal, order: orderOnly}, nil
+	}
+	match, err := compactKbuildSelectedRuleEntryMatch(target, match)
+	if err != nil {
+		return compactKbuildAutomaticContext{}, err
 	}
 	context, err := evaluatedKbuildSelectedTargetMakeContext(match.profile, target, &match)
 	if err != nil {
@@ -423,7 +475,7 @@ func compactKbuildPrivateActionRootMarker(marker string) string {
 func compactKbuildRootedAutomaticWord(word, graphPath, marker string) string {
 	word = strings.TrimSpace(word)
 	graphPath = compactKbuildGraphTargetPath(graphPath)
-	if word == "" || graphPath == "" || graphPath == "FORCE" {
+	if word == "" || graphPath == "" {
 		return word
 	}
 	if compactKbuildEvaluatedPathNamespace(word) != "" {
@@ -495,6 +547,13 @@ func compactKbuildRuleRootedAutomaticEvaluationContext(
 	inputs []compactKbuildRuleInput,
 	injected map[string]string,
 ) (compactKbuildAutomaticContext, error) {
+	if match.resolved {
+		var err error
+		match, err = compactKbuildSelectedRuleEntryMatch(target, match)
+		if err != nil {
+			return compactKbuildAutomaticContext{}, err
+		}
+	}
 	logical, err := compactKbuildRuleAutomaticEvaluationContext(target, match, inputs)
 	if err != nil || !compactKbuildAutomaticEvaluationUsesTreeRoots(injected) {
 		return logical, err
@@ -507,6 +566,18 @@ func compactKbuildRuleRootedAutomaticEvaluationContext(
 		return marker
 	}
 	root := func(word, graphPath string) (string, error) {
+		phonyPath := graphPath
+		if !match.resolved {
+			// Synthetic lowering supplies input paths instead of the paired
+			// source rule words; its profile still owns PHONY declarations.
+			phonyPath = compactKbuildProfileTargetPath(match.profile, graphPath)
+		}
+		if compactKbuildProfileTargetDeclaredPhony(match.profile, phonyPath) {
+			// GNU Make keeps the declaration-local spelling of a PHONY
+			// prerequisite in $^, $?, and $|. Textual Make filters compare it
+			// with the equally lexical words in $(PHONY); no file is rooted.
+			return word, nil
+		}
 		marker, err := compactKbuildAutomaticGraphPathMarker(match.profile, graphPath, inputs)
 		if err != nil {
 			return "", err
@@ -514,7 +585,9 @@ func compactKbuildRuleRootedAutomaticEvaluationContext(
 		return compactKbuildRootedAutomaticWord(word, graphPath, rootMarker(marker)), nil
 	}
 	if !match.resolved {
-		logical.target = compactKbuildRootedAutomaticWord(logical.target, target, rootMarker("__LINUX_BZL_OBJECT_TREE__"))
+		if !compactKbuildProfileTargetDeclaredPhony(match.profile, compactKbuildProfileTargetPath(match.profile, target)) {
+			logical.target = compactKbuildRootedAutomaticWord(logical.target, target, rootMarker("__LINUX_BZL_OBJECT_TREE__"))
+		}
 		for index := range logical.normal {
 			logical.normal[index], err = root(logical.normal[index], logical.normal[index])
 			if err != nil {
@@ -533,9 +606,16 @@ func compactKbuildRuleRootedAutomaticEvaluationContext(
 	if err != nil {
 		return compactKbuildAutomaticContext{}, err
 	}
-	logical.target = compactKbuildRootedAutomaticWord(
-		detailed.target.makeWord, detailed.target.graphPath, rootMarker("__LINUX_BZL_OBJECT_TREE__"),
-	)
+	if compactKbuildProfileTargetDeclaredPhony(match.profile, target) {
+		// A PHONY $@ names the source-declared Make control, not an object-tree
+		// file. Keep its lexical word for Make's textual functions such as
+		// $(filter-out $(PHONY),$@); there is no file path to project here.
+		logical.target = detailed.target.makeWord
+	} else {
+		logical.target = compactKbuildRootedAutomaticWord(
+			detailed.target.makeWord, detailed.target.graphPath, rootMarker("__LINUX_BZL_OBJECT_TREE__"),
+		)
+	}
 	logical.stem = detailed.stem
 	logical.normal = make([]string, len(detailed.normal))
 	for index, prerequisite := range detailed.normal {
@@ -827,16 +907,21 @@ func compactKbuildPlanStageVisible(producerStage, consumerStage string) bool {
 // action is pulled backward across the bounded prehost -> bootstrap -> host ->
 // prep -> target graph.
 func (b *compactKbuildRulePlanBuilder) existingInput(target string) (compactKbuildRuleInput, bool, error) {
-	return b.existingInputWithSelectedPathFallback(target, true)
+	return b.existingInputWithSelectedPathFallback(target, true, false)
 }
 
 func (b *compactKbuildRulePlanBuilder) existingRecordedInput(target string) (compactKbuildRuleInput, bool, error) {
-	return b.existingInputWithSelectedPathFallback(target, false)
+	return b.existingInputWithSelectedPathFallback(target, false, false)
+}
+
+func (b *compactKbuildRulePlanBuilder) existingNativePrerequisiteInput(target string) (compactKbuildRuleInput, bool, error) {
+	return b.existingInputWithSelectedPathFallback(target, true, true)
 }
 
 func (b *compactKbuildRulePlanBuilder) existingInputWithSelectedPathFallback(
 	target string,
 	allowUniqueWriterFallback bool,
+	nativePrerequisite bool,
 ) (compactKbuildRuleInput, bool, error) {
 	target = canonicalKbuildRulePath(target)
 	if input, ok := b.resolvedSideOutputs[target]; ok {
@@ -849,6 +934,9 @@ func (b *compactKbuildRulePlanBuilder) existingInputWithSelectedPathFallback(
 		resolve := b.selectionGraph.compactKbuildSelectionRecordedPathOwner
 		if allowUniqueWriterFallback {
 			resolve = b.selectionGraph.compactKbuildSelectionPathOwner
+		}
+		if nativePrerequisite {
+			resolve = b.selectionGraph.compactKbuildSelectionNativePrerequisiteOwner
 		}
 		owner, selected, err := resolve(b.selection, target)
 		if err != nil {
@@ -980,6 +1068,141 @@ func (b *compactKbuildRulePlanBuilder) exactObjectTreeArtifactInput(
 	return compactKbuildRuleInput{path: artifact.Path, producer: producer, slot: slot}, nil
 }
 
+// A Make expansion reads from the frozen source frontier before a selected
+// recipe line executes. Bind its authenticated owner even when that path was
+// never named as a native Make prerequisite. The real prerequisite retains
+// its ordinary/order-only role; a generated read alone stages only a working
+// file dependency. A same-target writer is bound to its earlier recipe-local
+// command output by appendCompactKbuildRecipe after the line indexes are known.
+func (b *compactKbuildRulePlanBuilder) compactKbuildSelectedReadInputs(
+	target string, match compactKbuildRuleMatch, inputs []compactKbuildRuleInput,
+) ([]compactKbuildRuleInput, error) {
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil {
+		return nil, err
+	}
+	if match.selectedRecipeSnapshot != nil {
+		snapshots = map[int]*KbuildSelectedControlRecipeSnapshot{-1: match.selectedRecipeSnapshot}
+	}
+	if len(snapshots) == 0 {
+		return inputs, nil
+	}
+	for _, recipeIndex := range slices.Sorted(maps.Keys(snapshots)) {
+		snapshot := snapshots[recipeIndex]
+		for _, read := range snapshot.Reads() {
+			if !read.Exists {
+				continue
+			}
+			if read.Wildcard && read.Artifact == (KbuildControlReadArtifact{}) {
+				// MatchRead also records the complete pattern membership. Its
+				// matched files below supply the producer edges; the pattern
+				// belongs to the source read identity, not to a physical input.
+				if !strings.HasPrefix(read.Path, "__LINUX_BZL_OBJECT_TREE__/") || read.MembershipVersion == "" {
+					return nil, fmt.Errorf("%s: Kbuild target %q recipe %d wildcard %q lacks an owned object-tree membership",
+						match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
+				}
+				continue
+			}
+			if read.Artifact.Producer == (CompactKbuildVisibleArtifact{}) {
+				var input compactKbuildRuleInput
+				switch read.Artifact.Tree {
+				case CompactKbuildInvocationSourceTree:
+					logicalPath, rooted := strings.CutPrefix(read.Path, "__LINUX_BZL_SOURCE_TREE__/")
+					if !rooted || read.Artifact.Identity != read.Path ||
+						!compactKbuildProfileSourcePathExists(snapshot.Evaluation.Profile, logicalPath) {
+						return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q lacks an immutable source-root owner",
+							match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
+					}
+					sourceID, sourceErr := b.metadata.ensureActionPlanSource(b.plan, logicalPath)
+					if sourceErr != nil {
+						return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q source input: %w",
+							match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path, sourceErr)
+					}
+					input = compactKbuildRuleInput{path: logicalPath, sourceID: sourceID}
+				case CompactKbuildInvocationObjectTree:
+					logicalPath, rooted := strings.CutPrefix(read.Path, "__LINUX_BZL_OBJECT_TREE__/")
+					if !rooted || read.Artifact.Identity != "config:"+logicalPath {
+						return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q lacks an authenticated Kconfig projection owner",
+							match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
+					}
+					var available bool
+					input, available, err = b.compactKbuildConfigProjectionBaselineInput(logicalPath)
+					if err != nil {
+						return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q Kconfig input: %w",
+							match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path, err)
+					}
+					if !available {
+						return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q has no declared Kconfig projection input",
+							match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
+					}
+				default:
+					return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q has unknown immutable tree %q",
+						match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path, read.Artifact.Tree)
+				}
+				found := false
+				for _, existing := range inputs {
+					if existing.path != input.path {
+						continue
+					}
+					if existing.sourceID != input.sourceID || existing.producer != "" {
+						return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q immutable source conflicts with its native/previous input",
+							match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
+					}
+					found = true
+					break
+				}
+				if !found {
+					input.workingOnly = true
+					inputs = append(inputs, input)
+				}
+				continue
+			}
+			logicalPath, rooted := strings.CutPrefix(read.Path, "__LINUX_BZL_OBJECT_TREE__/")
+			if read.Artifact.Tree != CompactKbuildInvocationObjectTree || !rooted ||
+				read.Artifact.Producer.Path != compactKbuildGraphTargetPath(logicalPath) {
+				return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q has unsupported selected file namespace/owner",
+					match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
+			}
+			if b.selectionGraph == nil {
+				return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q requires an exact selected writer graph",
+					match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
+			}
+			owner, err := b.selectionGraph.compactKbuildVisibleArtifactOwner(read.Artifact.Producer)
+			if err != nil {
+				return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q owner: %w",
+					match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path, err)
+			}
+			if owner.profile == match.profile.Name && owner.target == target {
+				// This selected target is not materialized yet. Its local output
+				// must be checked against the command's source line below.
+				continue
+			}
+			input, err := b.exactObjectTreeArtifactInput(read.Artifact.Producer)
+			if err != nil {
+				return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q exact producer: %w",
+					match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path, err)
+			}
+			found := false
+			for _, existing := range inputs {
+				if existing.path != input.path {
+					continue
+				}
+				if existing.producer != input.producer || existing.slot != input.slot {
+					return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q exact producer conflicts with its native/previous input",
+						match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
+				}
+				found = true
+				break
+			}
+			if !found {
+				input.workingOnly = true
+				inputs = append(inputs, input)
+			}
+		}
+	}
+	return inputs, nil
+}
+
 // stageVisibleProjectionInput peels only linux.bzl's own one-file copy
 // projections. Kbuild-generated nodes remain opaque: if one is scheduled
 // after the consumer, an explicit Make dependency must classify it into an
@@ -1033,6 +1256,17 @@ type compactKbuildRuleMatch struct {
 	profile CompactKbuildProfile
 	rule    KbuildRule
 	stem    string
+	// A direct occurrence recovered from inside rule_<name> has different
+	// recipe text from its selecting source line. Keep that source line's
+	// immutable Make evaluator when lowering the recovered occurrence.
+	selectedRecipeSnapshot *KbuildSelectedControlRecipeSnapshot
+	// Linear argv commands may outnumber their source recipe lines. Preserve
+	// each command's original line so local generated-file reads bind the
+	// version written before that line, rather than the final target version.
+	commandRecipeIndices []int
+	// Variables used to lower an argv command belong to its own source line,
+	// including CONFIG_SHELL and source script environment inputs.
+	recipeLineValues map[int]map[string]string
 	// lookupTarget is GNU Make's lexical target identity for implicit rules and
 	// local target-specific variables. The action graph continues to use the
 	// separately supplied canonical target path.
@@ -1277,6 +1511,18 @@ func compactKbuildSelectedDirectRecipe(match compactKbuildRuleMatch) (compactKbu
 			match.profile.Name, recipe,
 		)
 	}
+	if snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(match.lookupTarget, match); err != nil {
+		return compactKbuildRuleMatch{}, err
+	} else if len(snapshots) != 0 {
+		for index, snapshot := range snapshots {
+			if !isKbuildRecipeDirectorySetupExpression(match.profile.Rules[match.ruleOrder].Recipe[index]) {
+				if match.selectedRecipeSnapshot != nil {
+					return compactKbuildRuleMatch{}, fmt.Errorf("target profile %q direct Kbuild source occurrence has multiple executable source recipe lines", match.profile.Name)
+				}
+				match.selectedRecipeSnapshot = snapshot
+			}
+		}
+	}
 	match.rule.Recipe = []string{recipe}
 	return match, nil
 }
@@ -1380,17 +1626,36 @@ func (m *CompactMetadata) compactKbuildRuleForProfileMakeTarget(
 	profile CompactKbuildProfile,
 	target, makeTarget string,
 ) (compactKbuildRuleMatch, bool, error) {
-	target = canonicalKbuildRulePath(target)
+	target = compactKbuildGraphTargetPath(target)
 	matches := []compactKbuildRuleMatch{}
 	candidates := compactKbuildRuleCandidatesForMakeTarget(profile, target, makeTarget)
+	selectedRule := -1
+	for _, snapshot := range profile.targetLineReadSnapshots[compactKbuildGraphTargetPath(target)] {
+		if snapshot == nil || snapshot.Line.RuleIndex < 0 || snapshot.Line.RuleIndex >= len(profile.Rules) {
+			return compactKbuildRuleMatch{}, false, fmt.Errorf("Kbuild target %q has invalid source-selected recipe rule", target)
+		}
+		if selectedRule >= 0 && selectedRule != snapshot.Line.RuleIndex {
+			return compactKbuildRuleMatch{}, false, fmt.Errorf(
+				"%s: Kbuild target %q has source-selected lines from rules %d and %d; target-wide action lowering cannot join their distinct recipes",
+				profile.Rules[snapshot.Line.RuleIndex].Position, target, selectedRule, snapshot.Line.RuleIndex,
+			)
+		}
+		selectedRule = snapshot.Line.RuleIndex
+	}
 	explicitRecipeBarrier := false
 	for _, candidate := range candidates {
+		if selectedRule >= 0 && candidate.ruleOrder != selectedRule {
+			continue
+		}
 		if !strings.Contains(candidate.target, "%") && len(candidate.rule.Recipe) != 0 {
 			explicitRecipeBarrier = true
 			break
 		}
 	}
 	for _, candidate := range candidates {
+		if selectedRule >= 0 && candidate.ruleOrder != selectedRule {
+			continue
+		}
 		match := compactKbuildRuleMatch{
 			profile: profile, rule: candidate.rule, stem: candidate.stem, lookupTarget: candidate.lookupTarget,
 			explicit: !strings.Contains(candidate.target, "%"), stemLength: len(candidate.stem),
@@ -1456,13 +1721,32 @@ func (m *CompactMetadata) compactKbuildRuleForProfileMakeTarget(
 }
 
 func (m *CompactMetadata) compactKbuildRuleMatchViableInProfile(target string, match compactKbuildRuleMatch, profile CompactKbuildProfile) (bool, error) {
+	return m.compactKbuildRuleMatchViableWithDeclaredProducer(target, match, profile, nil)
+}
+
+// A GNU Make implicit rule can depend on a source-selected writer in another
+// invocation. Static source and same-profile rule evidence is sufficient for
+// most candidates; discovery/lowering supplies the exact selected producer
+// predicate only when an evaluated prerequisite crosses that boundary.
+func (m *CompactMetadata) compactKbuildRuleMatchViableWithDeclaredProducer(
+	target string,
+	match compactKbuildRuleMatch,
+	profile CompactKbuildProfile,
+	declaredProducer func(string) (bool, error),
+) (bool, error) {
+	var err error
+	match, err = compactKbuildSelectedRuleEntryMatch(target, match)
+	if err != nil {
+		return false, err
+	}
+	profile = match.profile
 	activeImplicitRules := map[int]bool{}
 	if !match.explicit {
 		activeImplicitRules[match.ruleOrder] = true
 	}
 	context, err := evaluatedKbuildTargetMakeContext(profile, target, &match, false)
 	if err != nil {
-		return false, nil
+		return false, err
 	}
 	for _, prerequisites := range [][]compactKbuildEvaluatedPath{context.normal, context.orderOnly} {
 		for _, evaluated := range prerequisites {
@@ -1477,7 +1761,16 @@ func (m *CompactMetadata) compactKbuildRuleMatchViableInProfile(target string, m
 			if compactKbuildRuleCommandSequenceContains(match, path.Base(candidate)) {
 				continue
 			}
-			viable, err := m.compactKbuildTargetHasViableRuleInProfile(candidate, evaluated.makeWord, map[string]bool{target: true}, activeImplicitRules, profile)
+			if declaredProducer != nil {
+				declared, err := declaredProducer(candidate)
+				if err != nil {
+					return false, err
+				}
+				if declared {
+					continue
+				}
+			}
+			viable, err := m.compactKbuildTargetHasViableRuleWithDeclaredProducer(candidate, evaluated.makeWord, map[string]bool{target: true}, activeImplicitRules, profile, declaredProducer)
 			if err != nil {
 				return false, err
 			}
@@ -1495,6 +1788,16 @@ func (m *CompactMetadata) compactKbuildTargetHasViableRuleInProfile(
 	targetStack map[string]bool,
 	implicitRuleStack map[int]bool,
 	profile CompactKbuildProfile,
+) (bool, error) {
+	return m.compactKbuildTargetHasViableRuleWithDeclaredProducer(target, makeTarget, targetStack, implicitRuleStack, profile, nil)
+}
+
+func (m *CompactMetadata) compactKbuildTargetHasViableRuleWithDeclaredProducer(
+	target, makeTarget string,
+	targetStack map[string]bool,
+	implicitRuleStack map[int]bool,
+	profile CompactKbuildProfile,
+	declaredProducer func(string) (bool, error),
 ) (bool, error) {
 	target = canonicalKbuildRulePath(target)
 	source, err := m.compactKbuildGraphSourcePathExists(profile, target)
@@ -1540,9 +1843,13 @@ func (m *CompactMetadata) compactKbuildTargetHasViableRuleInProfile(
 			implicitRuleStack[resolved.ruleOrder] = true
 		}
 		viable := true
-		context, contextErr := evaluatedKbuildTargetMakeContext(profile, target, &match, false)
+		entryMatch, entryErr := compactKbuildSelectedRuleEntryMatch(target, match)
+		if entryErr != nil {
+			return false, entryErr
+		}
+		context, contextErr := evaluatedKbuildTargetMakeContext(entryMatch.profile, target, &entryMatch, false)
 		if contextErr != nil {
-			viable = false
+			return false, contextErr
 		}
 		prerequisites := append(append([]compactKbuildEvaluatedPath(nil), context.normal...), context.orderOnly...)
 		for _, prerequisite := range prerequisites {
@@ -1557,7 +1864,16 @@ func (m *CompactMetadata) compactKbuildTargetHasViableRuleInProfile(
 			if compactKbuildRuleCommandSequenceContains(match, path.Base(candidate)) {
 				continue
 			}
-			candidateViable, candidateErr := m.compactKbuildTargetHasViableRuleInProfile(candidate, prerequisite.makeWord, targetStack, implicitRuleStack, profile)
+			if declaredProducer != nil {
+				declared, declaredErr := declaredProducer(candidate)
+				if declaredErr != nil {
+					return false, declaredErr
+				}
+				if declared {
+					continue
+				}
+			}
+			candidateViable, candidateErr := m.compactKbuildTargetHasViableRuleWithDeclaredProducer(candidate, prerequisite.makeWord, targetStack, implicitRuleStack, profile, declaredProducer)
 			if candidateErr != nil {
 				return false, candidateErr
 			}
@@ -1603,6 +1919,159 @@ func (b *compactKbuildRulePlanBuilder) buildSelectedTarget(target, makeTarget st
 		return "", fmt.Errorf("selected target %q has no evaluated Kbuild rule in profile %q", target, b.profile.Name)
 	}
 	return b.buildResolved(target, &match)
+}
+
+// buildSelectedPhonyStatus executes the one local line whose GNU Make state
+// was frozen at selection time. Source-selected recursive children already
+// have their own actions; an exact sequence edge orders their completion
+// before this private status without replaying Make or inventing a target file.
+func (b *compactKbuildRulePlanBuilder) buildSelectedPhonyStatus(
+	target string, status *compactKbuildSelectedPhonyStatus,
+) (string, error) {
+	if b == nil || !b.selectionBound || b.selectionGraph == nil || status == nil ||
+		status.snapshot == nil || status.match.ruleOrder < 0 ||
+		status.match.ruleOrder >= len(status.match.profile.Rules) ||
+		status.command == "" || b.profile == nil ||
+		b.profile.Name != status.match.profile.Name {
+		return "", fmt.Errorf("selected PHONY target %q has no exact source status", target)
+	}
+	match := status.match
+	match.selectedRecipeSnapshot = status.snapshot
+	inputs, err := b.ruleInputs(target, match)
+	if err != nil {
+		return "", fmt.Errorf("selected PHONY target %q native prerequisites: %w", target, err)
+	}
+	if status.recipeIndex >= 0 {
+		inputs, err = b.compactKbuildSelectedReadInputs(target, match, inputs)
+		if err != nil {
+			return "", fmt.Errorf("selected PHONY target %q line-local reads: %w", target, err)
+		}
+	}
+	rooted, err := compactKbuildRootedActionDirectRecipeText(match.profile, status.command)
+	if err != nil {
+		return "", fmt.Errorf("selected PHONY target %q shell command: %w", target, err)
+	}
+	rooted = compactKbuildFinalizeRootedActionRecipeText(rooted)
+	receipt := &ActionRecipeMakePhonyCompletion{
+		Profile: match.profile.Name, Target: target, SourcePath: match.profile.Path,
+		RuleIndex: match.ruleOrder, RecipeIndex: status.recipeIndex,
+		ExpandedLine: rooted,
+	}
+	return b.buildHermeticKbuildScriptContext(
+		target, match, inputs, rooted, nil, nil,
+		compactKbuildHermeticScriptOptions{PhonyStatus: receipt},
+	)
+}
+
+// A PHONY status is an execution prerequisite, not an object-tree pathname.
+// Bind the selected predecessor's private completion as a sequence edge. A
+// source-selected PHONY cleanup also waits for its complete selected recursive
+// child and native prerequisite closure before executing its own shell line.
+func (b *compactKbuildRulePlanBuilder) appendCompactKbuildSelectedPlanNode(
+	target string, node ActionPlanNode, recipe ActionRecipe,
+) (string, error) {
+	completionEdges := 0
+	seen := map[string]bool{}
+	for _, edge := range node.Inputs {
+		seen[fmt.Sprintf("%s\x00%d", edge.ProducerID, edge.Slot)] = true
+	}
+	appendSequence := func(producer string, slot int) {
+		identity := fmt.Sprintf("%s\x00%d", producer, slot)
+		if seen[identity] {
+			return
+		}
+		seen[identity] = true
+		ordinal := len(node.Inputs)
+		node.Inputs = append(node.Inputs, ActionPlanNodeEdge{
+			Role: "sequence", ProducerID: producer, Slot: slot,
+		})
+		recipe.Inputs = append(recipe.Inputs, fmt.Sprintf("sequence:%08d", ordinal))
+		completionEdges++
+	}
+	if b != nil && b.selectionGraph != nil && b.profile != nil && len(recipe.CommandReplays) != 0 {
+		replayedTargets := map[string]bool{canonicalKbuildRulePath(target): true}
+		replayedArguments := map[string]bool{}
+		for _, replay := range recipe.CommandReplays {
+			if replay.Name != CompactKbuildRecursiveMakeReplayName {
+				continue
+			}
+			for _, invocation := range replay.Invocations {
+				replayedArguments[strings.Join(invocation.Arguments, "\x00")] = true
+			}
+		}
+		for _, output := range node.Outputs {
+			if output.ObservedPath == "" {
+				replayedTargets[canonicalKbuildRulePath(output.Path)] = true
+			}
+		}
+		finalChild := ""
+		if phases := b.selectionGraph.sourcePhasesByOwner[b.selection]; len(phases) != 0 {
+			if len(phases) != 2 {
+				return "", fmt.Errorf("selected target %q has an incomplete source script phase boundary", target)
+			}
+			finalChild = b.selectionGraph.sourcePhaseChildren[phases[1]]
+		}
+		for _, dependency := range b.profile.TargetInvocationDependencies {
+			if !replayedTargets[canonicalKbuildRulePath(dependency.Target)] {
+				continue
+			}
+			if finalChild != "" && dependency.Profile != finalChild {
+				continue
+			}
+			arguments := make([]string, len(dependency.ReplayArguments))
+			for index, argument := range dependency.ReplayArguments {
+				arguments[index] = compactKbuildSourceScriptReplayValue(*b.profile, argument)
+			}
+			if !replayedArguments[strings.Join(arguments, "\x00")] {
+				return "", fmt.Errorf("selected target %q recursive status invocation %q has no exact selected command replay", target, dependency.Profile)
+			}
+			materialization, err := b.compactKbuildInvocationDependencyMaterialization(target, *b.profile, dependency)
+			if err != nil {
+				return "", fmt.Errorf("selected target %q recursive status: %w", target, err)
+			}
+			for _, status := range materialization.statusRoots {
+				if status.producer == "" || status.slot < 0 {
+					return "", fmt.Errorf("selected target %q recursive status has no exact producer", target)
+				}
+				appendSequence(status.producer, status.slot)
+			}
+		}
+	}
+	if b != nil && b.selectionBound && b.selectionGraph != nil && b.metadata != nil {
+		selectedOutput := false
+		for _, output := range node.Outputs {
+			if output.Path == b.selection.target || output.ObservedPath == b.selection.target {
+				selectedOutput = true
+				break
+			}
+		}
+		if selectedOutput {
+			dependencies, err := b.selectionGraph.selectionDependencies(b.metadata, b.selection)
+			if err != nil {
+				return "", fmt.Errorf("selected target %q status dependencies: %w", b.selection.target, err)
+			}
+			for _, dependency := range dependencies {
+				dependency = b.selectionGraph.compactKbuildGroupedSelectionRepresentative(dependency)
+				producer := b.selectionGraph.materializedProducers[dependency]
+				if producer == "" {
+					continue
+				}
+				predecessor, ok := compactKbuildPlanNode(b.plan, producer)
+				if !ok || len(predecessor.Outputs) == 0 {
+					return "", fmt.Errorf("selected target %q predecessor %s lacks a materialized completion", b.selection.target, compactKbuildSelectionKeyString(dependency))
+				}
+				status := compactKbuildAuthenticatedExecutionCheckCompletion(b.plan, predecessor, dependency.target)
+				if !status && recipe.MakePhonyCompletion == nil {
+					continue
+				}
+				appendSequence(producer, 0)
+			}
+		}
+	}
+	if recipe.MakePhonyCompletion != nil {
+		recipe.MakePhonyCompletion.SequenceInputs = completionEdges
+	}
+	return appendActionPlanNode(b.plan, node, recipe)
 }
 
 func (b *compactKbuildRulePlanBuilder) buildResolved(
@@ -1699,7 +2168,10 @@ func (b *compactKbuildRulePlanBuilder) buildResolved(
 			return "", err
 		}
 		selection, ok := b.selectionGraph.selections[b.selection]
-		if ok && selection.ExactGeneratedContentSet {
+		if ok && selection.ExactGeneratedContentSet &&
+			!slices.ContainsFunc(match.profile.targetLineReadSnapshots[target], func(line *KbuildSelectedControlRecipeSnapshot) bool {
+				return line != nil && line.ReadIdentity() != ""
+			}) {
 			exactFrontier, err := b.compactKbuildExactGeneratedContentFrontier(
 				target, match.profile, inputs,
 			)
@@ -1719,6 +2191,13 @@ func (b *compactKbuildRulePlanBuilder) buildResolved(
 				}
 			}
 		}
+	}
+	if producer, proved, err := b.buildSelectedPhonyPrivateSetup(target, match, inputs); proved || err != nil {
+		if err != nil {
+			return "", err
+		}
+		b.memo[target] = producer
+		return producer, nil
 	}
 	// buildCommandTemplate evaluates the concrete command occurrences from the
 	// final private-root input context before lowering them. Repeating the same
@@ -2043,12 +2522,19 @@ func (b *compactKbuildRulePlanBuilder) ruleForEvaluatedTarget(
 }
 
 func (b *compactKbuildRulePlanBuilder) ruleInputs(target string, match compactKbuildRuleMatch) ([]compactKbuildRuleInput, error) {
+	var err error
+	match, err = compactKbuildSelectedRuleEntryMatch(target, match)
+	if err != nil {
+		return nil, err
+	}
 	out := []compactKbuildRuleInput{}
 	seen := map[struct {
 		path      string
 		orderOnly bool
 	}]bool{}
-	appendPrerequisites := func(prerequisites []compactKbuildEvaluatedPath, orderOnly bool) error {
+	activePhony := map[string]bool{}
+	var appendPrerequisites func([]compactKbuildEvaluatedPath, bool) error
+	appendPrerequisites = func(prerequisites []compactKbuildEvaluatedPath, orderOnly bool) error {
 		for _, evaluated := range prerequisites {
 			// The selected target context has already expanded the rule stem and
 			// resolved raw Make paths against the invocation. These are canonical
@@ -2056,6 +2542,121 @@ func (b *compactKbuildRulePlanBuilder) ruleInputs(target string, match compactKb
 			// corrupt explicitly source/object-rooted prerequisites.
 			prerequisite := compactKbuildGraphTargetPath(evaluated.graphPath)
 			if prerequisite == "" || prerequisite == "FORCE" {
+				continue
+			}
+			if b.selectionBound && b.selectionGraph != nil &&
+				b.selectionGraph.compactKbuildProfileTargetIsPhony(*b.profile, prerequisite) {
+				proved, proofErr := b.metadata.compactKbuildSelectedPhonyFeatureGate(
+					*b.profile, prerequisite, evaluated.makeWord,
+				)
+				if proofErr != nil {
+					return fmt.Errorf("target %q PHONY prerequisite %q: %w", target, prerequisite, proofErr)
+				}
+				if proved {
+					// Its selected measured status already proves the only
+					// failure branch unreachable, with no artifact to stage.
+					continue
+				}
+				if selected, exact := b.selectionGraph.compactKbuildSelectedPhonyPrerequisite(b.selection, prerequisite); exact {
+					producer := b.selectionGraph.materializedProducers[selected]
+					if producer != "" {
+						checkNode, materialized := compactKbuildPlanNode(b.plan, producer)
+						if !materialized || !compactKbuildAuthenticatedExecutionCheckCompletion(b.plan, checkNode, prerequisite) {
+							return fmt.Errorf("target %q PHONY prerequisite %q has no authenticated execution status", target, prerequisite)
+						}
+						// The node wrapper adds a sequence edge to this exact producer.
+						// An observed completion is never a working Make file.
+						continue
+					}
+					status, statusErr := b.metadata.compactKbuildSelectedPhonySourceStatus(
+						*b.profile, prerequisite, evaluated.makeWord,
+					)
+					if statusErr != nil {
+						return fmt.Errorf("target %q PHONY prerequisite %q: %w", target, prerequisite, statusErr)
+					}
+					if status != nil {
+						return fmt.Errorf("target %q PHONY prerequisite %q has no materialized execution status", target, prerequisite)
+					}
+					// A source-selected empty or inert PHONY has only prerequisite
+					// closure. The graph has already retained its ordinary owners.
+					continue
+				}
+				if compactKbuildPhonyHasUnselectedRecipe(*b.profile, prerequisite, evaluated.makeWord) {
+					forwarding, forwardErr := b.selectionGraph.compactKbuildUnselectedPhonyForwardsChildren(
+						b.metadata, *b.profile, prerequisite, evaluated.makeWord,
+					)
+					if forwardErr != nil {
+						return forwardErr
+					}
+					if !forwarding {
+						return fmt.Errorf("target %q PHONY prerequisite %q has an unselected executable source rule", target, prerequisite)
+					}
+					match, matched, matchErr := b.selectionGraph.compactKbuildSelectedPhonyRuleForMakeTarget(
+						b.metadata, *b.profile, prerequisite, evaluated.makeWord,
+					)
+					if matchErr != nil {
+						return matchErr
+					}
+					if !matched || !match.explicit {
+						return fmt.Errorf("target %q forwarding PHONY prerequisite %q has no exact source rule", target, prerequisite)
+					}
+					normal, nestedOrderOnly, _, contextErr := b.selectionGraph.compactKbuildTargetRuleContext(*b.profile, prerequisite, match)
+					if contextErr != nil {
+						return contextErr
+					}
+					if activePhony[prerequisite] {
+						return fmt.Errorf("target %q has circular PHONY prerequisite %q", target, prerequisite)
+					}
+					activePhony[prerequisite] = true
+					if err := appendPrerequisites(normal, orderOnly); err != nil {
+						return err
+					}
+					if err := appendPrerequisites(nestedOrderOnly, true); err != nil {
+						return err
+					}
+					delete(activePhony, prerequisite)
+					for _, dependency := range b.profile.TargetInvocationDependencies {
+						if dependency.Target != prerequisite {
+							continue
+						}
+						materialization, materializeErr := b.compactKbuildInvocationDependencyMaterialization(
+							prerequisite, *b.profile, dependency,
+						)
+						if materializeErr != nil {
+							return materializeErr
+						}
+						for _, root := range materialization.roots {
+							root.workingOnly = true
+							out = append(out, root)
+						}
+					}
+					continue
+				}
+				if !compactKbuildPhonyHasExplicitRule(*b.profile, prerequisite, evaluated.makeWord) {
+					// GNU Make completes an explicitly declared but unruled PHONY
+					// target without executing a recipe or producing a file.
+					continue
+				}
+				orderingOnly, normal, nestedOrderOnly, orderingErr := b.selectionGraph.compactKbuildOrderingOnlyRuleContextForMakeTarget(
+					b.metadata, *b.profile, prerequisite, evaluated.makeWord,
+				)
+				if orderingErr != nil {
+					return orderingErr
+				}
+				if !orderingOnly {
+					return fmt.Errorf("target %q PHONY prerequisite %q has no selected execution status", target, prerequisite)
+				}
+				if activePhony[prerequisite] {
+					return fmt.Errorf("target %q has circular PHONY prerequisite %q", target, prerequisite)
+				}
+				activePhony[prerequisite] = true
+				if err := appendPrerequisites(normal, orderOnly); err != nil {
+					return err
+				}
+				if err := appendPrerequisites(nestedOrderOnly, true); err != nil {
+					return err
+				}
+				delete(activePhony, prerequisite)
 				continue
 			}
 			// A rooted prerequisite can share the selected output's graph path
@@ -2082,7 +2683,7 @@ func (b *compactKbuildRulePlanBuilder) ruleInputs(target string, match compactKb
 			// A selected plan producer is exact execution provenance and wins
 			// over a same-path file in a preconfigured object tree. External
 			// module prep overlays deliberately replace SDK leaves this way.
-			if input, ok, err := b.existingInput(prerequisite); err != nil {
+			if input, ok, err := b.existingNativePrerequisiteInput(prerequisite); err != nil {
 				return err
 			} else if ok {
 				input.orderOnly = orderOnly
@@ -2130,7 +2731,28 @@ func (b *compactKbuildRulePlanBuilder) ruleInputs(target string, match compactKb
 			}
 			dependencyViable := dependency.explicit
 			if matched && !dependencyViable {
-				dependencyViable, matchErr = b.metadata.compactKbuildRuleMatchViableInProfile(prerequisite, dependency, *b.profile)
+				dependencyViable, matchErr = b.metadata.compactKbuildRuleMatchViableWithDeclaredProducer(
+					prerequisite, dependency, *b.profile,
+					func(candidate string) (bool, error) {
+						// A predecessor recipe can publish a generated input only
+						// through this consumer's resolved side-output state. It has
+						// no direct selected-target owner, but the same exact input
+						// is staged when the implicit rule is lowered below.
+						if _, resolved := b.resolvedSideOutputs[canonicalKbuildRulePath(candidate)]; resolved {
+							_, available, err := b.existingNativePrerequisiteInput(candidate)
+							return available, err
+						}
+						if !b.selectionBound || b.selectionGraph == nil {
+							return false, nil
+						}
+						_, selected, ownerErr := b.selectionGraph.compactKbuildSelectionNativePrerequisiteOwner(b.selection, candidate)
+						if ownerErr != nil || !selected {
+							return selected, ownerErr
+						}
+						_, selected, err := b.existingNativePrerequisiteInput(candidate)
+						return selected, err
+					},
+				)
 				if matchErr != nil {
 					return matchErr
 				}
@@ -2312,6 +2934,7 @@ type compactKbuildRecipeToken struct {
 	end               int
 	pathnameExpansion bool
 	shellExpansion    bool
+	activeBacktick    bool
 }
 
 const (
@@ -2413,7 +3036,11 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 	// exposing it to the Make evaluator makes nested source expressions such as
 	// $(addprefix -I,$(src) $(obj)) look unresolved. The stable invocation-tree
 	// markers are ordinary Make text and are translated after evaluation.
-	injected, err := compactKbuildSourceScriptInjectionsForRuleTarget(target, match, inputs)
+	entryMatch, err := compactKbuildSelectedRuleEntryMatch(target, match)
+	if err != nil {
+		return "", err
+	}
+	injected, err := compactKbuildSourceScriptInjectionsForRuleTarget(target, entryMatch, inputs)
 	if err != nil {
 		return "", err
 	}
@@ -2424,10 +3051,14 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 	}
 	selections := append([]CompactKbuildCommandTemplate(nil), match.commandTemplates...)
 	probeSelections := append([]CompactKbuildCommandTemplate(nil), selections...)
+	selectedSnapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil {
+		return "", err
+	}
+	selectionRecipeIndices := []int(nil)
 	if match.resolved && len(kbuildRecipeCommandExpressions(match.rule.Recipe)) != 0 {
-		selections, err = evaluatedKbuildRuleCommandSelectionsForMakeTarget(
-			match.profile, target, match.lookupTarget, automaticContext.target, automaticContext.stem,
-			automaticContext.normal, automaticContext.order, injected, match.rule.Recipe, true,
+		selections, selectionRecipeIndices, err = evaluatedKbuildRuleCommandSelectionsBySourceLine(
+			target, match, automaticContext, injected, true,
 		)
 		if err != nil {
 			return "", err
@@ -2439,14 +3070,14 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		match.command = selections[0].Name
 		match.commands = match.commandSequence()
 		commandNames = match.commandSequence()
-		probeSelections, err = evaluatedKbuildRuleCommandSelectionsForMakeTarget(
-			match.profile, target, match.lookupTarget, automaticContext.target, automaticContext.stem,
-			automaticContext.normal, automaticContext.order, injected, match.rule.Recipe, false,
+		var probeIndices []int
+		probeSelections, probeIndices, err = evaluatedKbuildRuleCommandSelectionsBySourceLine(
+			target, match, automaticContext, injected, false,
 		)
 		if err != nil {
 			return "", fmt.Errorf("target %q preserve compiler-probe command selections: %w", target, err)
 		}
-		if len(probeSelections) != len(selections) {
+		if len(probeSelections) != len(selections) || !slices.Equal(selectionRecipeIndices, probeIndices) {
 			return "", fmt.Errorf(
 				"target %q compiler-probe command selection count changed from %d concrete occurrences to %d symbolic occurrences",
 				target, len(selections), len(probeSelections),
@@ -2482,7 +3113,38 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		// the historical direct cmd_<name> boundary.
 		variableNames = append(templateNames, variableNames...)
 	}
-	values, err := evaluateCompactKbuildRuleVariablesRooted(target, match, inputs, injected, variableNames...)
+	valuesMatch := match
+	if len(selectionRecipeIndices) != 0 {
+		valuesMatch.profile = selectedSnapshots[selectionRecipeIndices[0]].Evaluation.Profile
+	} else if len(selectedSnapshots) != 0 {
+		for index := range match.rule.Recipe {
+			if snapshot := selectedSnapshots[index]; snapshot != nil {
+				valuesMatch.profile = snapshot.Evaluation.Profile
+				break
+			}
+		}
+	}
+	values, err := evaluateCompactKbuildRuleVariablesRooted(target, valuesMatch, inputs, injected, variableNames...)
+	if err != nil {
+		return "", err
+	}
+	lineValues := map[int]map[string]string{}
+	if len(selectionRecipeIndices) != 0 {
+		lineValues[selectionRecipeIndices[0]] = values
+	}
+	for _, index := range selectionRecipeIndices {
+		if lineValues[index] != nil {
+			continue
+		}
+		lineMatch := match
+		lineMatch.profile = selectedSnapshots[index].Evaluation.Profile
+		lineValues[index], err = evaluateCompactKbuildRuleVariablesRooted(target, lineMatch, inputs, injected, variableNames...)
+		if err != nil {
+			return "", fmt.Errorf("%s: Kbuild target %q recipe %d variables: %w", match.profile.Rules[match.ruleOrder].Position, target, index, err)
+		}
+	}
+	nativeInputs := slices.Clone(inputs)
+	inputs, err = b.compactKbuildSelectedReadInputs(target, match, inputs)
 	if err != nil {
 		return "", err
 	}
@@ -2556,6 +3218,63 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 			return "", fmt.Errorf("target %q compiler-probe automatic tree paths: %w", target, err)
 		}
 	}
+	// Source recipe lines own independent immutable reads and exports. A
+	// selected line that only creates the already-declared output parent has
+	// no action result; prove its entire evaluated command before selecting a
+	// cmd/fixdep split, argv fallback, or compound script. Keep the source
+	// snapshots and original recipe indexes intact, and project only the
+	// remaining executable line into an action.
+	if compactKbuildRejectTargetWideLineReads(target, match, selectedSnapshots) != nil {
+		activeOccurrences, activeLine, proven, proofErr := compactKbuildSelectedOutputParentSetupOccurrences(
+			target, match, rootedTemplates, selectionRecipeIndices, selectedSnapshots, automaticContext, injected,
+		)
+		if proofErr != nil {
+			return "", proofErr
+		}
+		if proven {
+			if lineValues[activeLine] == nil {
+				return "", fmt.Errorf("%s: Kbuild target %q recipe %d has no selected line variables",
+					match.profile.Rules[match.ruleOrder].Position, target, activeLine)
+			}
+			if len(probeRootedTemplates) != len(rootedTemplates) {
+				return "", fmt.Errorf("%s: Kbuild target %q selected setup changes compiler-probe occurrence count",
+					match.profile.Rules[match.ruleOrder].Position, target)
+			}
+			activeSnapshot := selectedSnapshots[activeLine]
+			match.profile = activeSnapshot.Evaluation.Profile
+			match.selectedRecipeSnapshot = activeSnapshot
+			values = lineValues[activeLine]
+			inputs, err = b.compactKbuildSelectedReadInputs(target, match, slices.Clone(nativeInputs))
+			if err != nil {
+				return "", fmt.Errorf("%s: Kbuild target %q recipe %d selected inputs: %w",
+					match.profile.Rules[match.ruleOrder].Position, target, activeLine, err)
+			}
+			pick := func(words []string) []string {
+				selected := make([]string, 0, len(activeOccurrences))
+				for _, occurrence := range activeOccurrences {
+					selected = append(selected, words[occurrence])
+				}
+				return selected
+			}
+			selected := make([]CompactKbuildCommandTemplate, 0, len(activeOccurrences))
+			for _, occurrence := range activeOccurrences {
+				selected = append(selected, selections[occurrence])
+			}
+			match.commandTemplates = selected
+			match.command = selected[0].Name
+			match.commands = match.commandSequence()
+			templateNames = pick(templateNames)
+			templates = pick(templates)
+			rootedTemplates = pick(rootedTemplates)
+			probeTemplates = pick(probeTemplates)
+			probeRootedTemplates = pick(probeRootedTemplates)
+			selectionRecipeIndices = make([]int, len(activeOccurrences))
+			for index := range selectionRecipeIndices {
+				selectionRecipeIndices[index] = activeLine
+			}
+			selectedSnapshots = map[int]*KbuildSelectedControlRecipeSnapshot{activeLine: activeSnapshot}
+		}
+	}
 	template := strings.Join(templates, "\n")
 	rootedTemplate := strings.Join(rootedTemplates, "\n")
 	match.compilerProbeRootedTemplates = slices.Clone(probeRootedTemplates)
@@ -2579,13 +3298,66 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 	// redirection makes an already object-rooted path look invocation-relative
 	// in split source/object builds.
 	sideEffectCommands := compactKbuildRecipeSideEffectProjection(rootedTemplates, automaticContext)
+	if b.selectionBound && b.selectionGraph != nil &&
+		b.selectionGraph.compactKbuildProfileTargetIsPhony(match.profile, target) &&
+		len(rootedTemplates) == 1 {
+		invocation, selected, selectionErr := compactKbuildSelectedPhonyCommandSourceScript(
+			target, match, automaticContext, injected, b.actionScope(), b.metadata.actionRoles,
+		)
+		if selectionErr != nil {
+			return "", fmt.Errorf("selected PHONY source command: %w", selectionErr)
+		}
+		if selected {
+			if err := compactKbuildRejectTargetWideLineReads(target, match, selectedSnapshots); err != nil {
+				return "", err
+			}
+			lineMatch := match
+			if selectedSnapshots[0] != nil {
+				lineMatch.profile = selectedSnapshots[0].Evaluation.Profile
+			}
+			actual, err := evaluateCompactKbuildTextForMakeTarget(
+				lineMatch.profile, target, match.lookupTarget, automaticContext.target, automaticContext.stem,
+				automaticContext.normal, automaticContext.order, injected, match.rule.Recipe[0], true,
+			)
+			if err != nil {
+				return "", fmt.Errorf("selected PHONY source command Make expansion: %w", err)
+			}
+			rooted, err := compactKbuildRootedActionDirectRecipeText(lineMatch.profile, actual)
+			if err != nil {
+				return "", err
+			}
+			receipt := &ActionRecipeMakePhonyCompletion{
+				Profile: match.profile.Name, Target: target, SourcePath: match.profile.Path,
+				RuleIndex: match.ruleOrder, RecipeIndex: 0,
+				SelectedLine: compactKbuildFinalizeRootedActionRecipeText(rooted),
+				ScriptPath:   invocation.scriptPath,
+				ActionScope:  b.actionScope(),
+			}
+			compound := compactKbuildRecipeLineShells([]string{rooted})
+			commands, err := compactKbuildCompoundProgramCommands(compound)
+			if err != nil {
+				return "", fmt.Errorf("selected PHONY source command discovery: %w", err)
+			}
+			return b.buildHermeticKbuildScriptContext(
+				target, match, inputs, compound, commands,
+				compactKbuildRecipeSideEffectProjection([]string{rooted}, automaticContext),
+				compactKbuildHermeticScriptOptions{
+					PhonyStatus: receipt, PhonyScriptPath: invocation.scriptPath,
+					PhonyPrivateEffects: compactKbuildSourceCheckInvocationDepfileEffects(
+						lineMatch.profile, target, invocation,
+					),
+				},
+			)
+		}
+	}
 	if len(templates) != 0 {
 		split, splitOK := compactKbuildCmdAndFixdepRecipeSplit(
 			target, match, templates[0], rootedTemplates[0], automaticContext,
 		)
 		if splitOK {
 			producer, splitErr := b.buildCompactKbuildCmdAndFixdepSplit(
-				target, match, inputs, values, rootedTemplates, automaticContext, split,
+				target, match, nativeInputs, inputs, rootedTemplates, selectionRecipeIndices,
+				selectedSnapshots, automaticContext, split,
 			)
 			if splitErr != nil {
 				return "", fmt.Errorf(
@@ -2597,6 +3369,9 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		}
 	}
 	if compactKbuildHasDeferredShellSingleWord(match.profile, template) {
+		if err := compactKbuildRejectTargetWideLineReads(target, match, selectedSnapshots); err != nil {
+			return "", err
+		}
 		compoundTemplate := compactKbuildRecipeLineShells(rootedTemplates)
 		commands, discoveryErr := compactKbuildCompoundProgramCommands(compoundTemplate)
 		if discoveryErr != nil {
@@ -2617,6 +3392,9 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		return producer, nil
 	}
 	if compactKbuildRecipeTextHasShellGroup(rootedTemplate) {
+		if err := compactKbuildRejectTargetWideLineReads(target, match, selectedSnapshots); err != nil {
+			return "", err
+		}
 		compoundTemplate := compactKbuildRecipeLineShells(rootedTemplates)
 		commands, discoveryErr := compactKbuildCompoundProgramCommands(compoundTemplate)
 		if discoveryErr != nil {
@@ -2637,6 +3415,7 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		return producer, nil
 	}
 	commands := []compactKbuildRecipeCommand{}
+	commandRecipeIndices := []int{}
 	var commandErr error
 	for index := range templates {
 		parsed, parseErr := parseCompactKbuildRecipe(templates[index], automaticContext)
@@ -2645,6 +3424,11 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 			break
 		}
 		commands = append(commands, parsed...)
+		if len(selectionRecipeIndices) != 0 {
+			for range parsed {
+				commandRecipeIndices = append(commandRecipeIndices, selectionRecipeIndices[index])
+			}
+		}
 	}
 	probeCommands := []compactKbuildRecipeCommand{}
 	if commandErr == nil {
@@ -2676,12 +3460,16 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		match.compilerProbeCommands = probeCommands
 	}
 	if commandErr != nil {
+		if err := compactKbuildRejectTargetWideLineReads(target, match, selectedSnapshots); err != nil {
+			return "", err
+		}
 		fallbackTemplate := compactKbuildRecipeLineShells(rootedTemplates)
 		compound := []compactKbuildRecipeCommand(nil)
 		discovered, discoveryErr := compactKbuildCompoundProgramCommands(fallbackTemplate)
 		archiveCompound, archiveSource, archiveOpaque := false, false, false
 		if discoveryErr == nil {
-			archiveCompound, archiveSource, archiveOpaque, err = b.compactKbuildPathArchiveExecution(target, match, inputs, match.profile, values, discovered)
+			archiveCompound, archiveSource, archiveOpaque, err = b.compactKbuildPathArchiveExecution(
+				target, match, inputs, match.profile, values, discovered)
 			if err != nil {
 				return "", err
 			}
@@ -2702,7 +3490,8 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 			)
 		}
 		producer, fallbackErr := b.buildHermeticKbuildScriptContext(
-			target, match, inputs, fallbackTemplate, compound, sideEffectCommands, compactKbuildHermeticScriptOptions{},
+			target, match, inputs, fallbackTemplate, compound, sideEffectCommands,
+			compactKbuildHermeticScriptOptions{},
 		)
 		if fallbackErr != nil {
 			return "", fmt.Errorf(
@@ -2729,6 +3518,9 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		needsCompound = atomicRecipe
 	}
 	if needsCompound {
+		if err := compactKbuildRejectTargetWideLineReads(target, match, selectedSnapshots); err != nil {
+			return "", err
+		}
 		producer, err := b.buildHermeticKbuildCompoundWithSideEffects(
 			target, match, inputs, compactKbuildRecipeLineShells(rootedTemplates), commands, sideEffectCommands,
 		)
@@ -2737,6 +3529,8 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		}
 		return producer, nil
 	}
+	match.commandRecipeIndices = commandRecipeIndices
+	match.recipeLineValues = lineValues
 	producer, err := b.appendCompactKbuildRecipe(target, match, inputs, values, commands)
 	if err != nil {
 		return "", fmt.Errorf("target %q profile %q variables %s: %w", target, match.profile.Name, strings.Join(templateNames, ","), err)
@@ -3052,15 +3846,44 @@ func compactKbuildCmdAndFixdepRecipeSplit(
 func (b *compactKbuildRulePlanBuilder) buildCompactKbuildCmdAndFixdepSplit(
 	target string,
 	match compactKbuildRuleMatch,
+	nativeInputs []compactKbuildRuleInput,
 	inputs []compactKbuildRuleInput,
-	values map[string]string,
 	rootedTemplates []string,
+	selectionRecipeIndices []int,
+	selectedSnapshots map[int]*KbuildSelectedControlRecipeSnapshot,
 	automatic compactKbuildAutomaticContext,
 	split compactKbuildCmdAndFixdepSplit,
 ) (string, error) {
-	_ = values
 	if len(rootedTemplates) == 0 || len(split.commands) == 0 {
 		return "", fmt.Errorf("cmd_and_fixdep split requires one exact first template")
+	}
+	if len(selectionRecipeIndices) == 0 {
+		if len(selectedSnapshots) != 0 {
+			return "", fmt.Errorf("cmd_and_fixdep split has immutable recipe views but no selected occurrence line indexes")
+		}
+		selectionRecipeIndices = make([]int, len(rootedTemplates))
+	}
+	if len(selectionRecipeIndices) != len(rootedTemplates) {
+		return "", fmt.Errorf("cmd_and_fixdep split has %d templates for %d source recipe line indexes",
+			len(rootedTemplates), len(selectionRecipeIndices))
+	}
+	type sourceGroup struct{ line, start, end int }
+	groups := []sourceGroup{}
+	for index, line := range selectionRecipeIndices {
+		if line < 0 || len(selectedSnapshots) != 0 && selectedSnapshots[line] == nil ||
+			len(groups) != 0 && line < groups[len(groups)-1].line {
+			return "", fmt.Errorf("cmd_and_fixdep split occurrence %d has no source-ordered immutable recipe view %d", index, line)
+		}
+		if len(groups) == 0 || line != groups[len(groups)-1].line {
+			groups = append(groups, sourceGroup{line: line, start: index, end: index + 1})
+		} else {
+			groups[len(groups)-1].end = index + 1
+		}
+	}
+	if len(selectedSnapshots) != 0 && match.capturedEnvironment != nil {
+		if err := compactKbuildRejectTargetWideLineReads(target, match, selectedSnapshots); err != nil {
+			return "", err
+		}
 	}
 	hasSuffix := len(rootedTemplates) > 1
 	observedTarget := canonicalKbuildRulePath(target)
@@ -3079,6 +3902,18 @@ func (b *compactKbuildRulePlanBuilder) buildCompactKbuildCmdAndFixdepSplit(
 	firstTemplate := compactKbuildRecipeLineShells(rootedTemplates[:1])
 	firstSideEffects := compactKbuildRecipeSideEffectProjection(rootedTemplates[:1], automatic)
 	firstMatch := match
+	firstInputs := inputs
+	if firstSnapshot := selectedSnapshots[groups[0].line]; firstSnapshot != nil {
+		firstMatch.profile = firstSnapshot.Evaluation.Profile
+		firstMatch.selectedRecipeSnapshot = firstSnapshot
+		firstInputs, err = firstBuilder.compactKbuildSelectedReadInputs(target, firstMatch, slices.Clone(nativeInputs))
+		if err != nil {
+			return "", fmt.Errorf("atomic first source recipe %d inputs: %w", groups[0].line, err)
+		}
+	}
+	if len(match.compilerProbeRootedTemplates) != 0 {
+		firstMatch.compilerProbeRootedTemplates = slices.Clone(match.compilerProbeRootedTemplates[:1])
+	}
 	if len(match.compilerProbeRootedTemplates) != 0 {
 		if len(match.compilerProbeRootedTemplates) != len(rootedTemplates) {
 			return "", fmt.Errorf("cmd_and_fixdep compiler-probe template count changed from %d to %d", len(rootedTemplates), len(match.compilerProbeRootedTemplates))
@@ -3094,7 +3929,7 @@ func (b *compactKbuildRulePlanBuilder) buildCompactKbuildCmdAndFixdepSplit(
 		firstMatch.compilerProbeCommands = probeCommands
 	}
 	firstProducer, err := firstBuilder.buildHermeticKbuildScriptContext(
-		target, firstMatch, inputs, firstTemplate, split.commands, firstSideEffects,
+		target, firstMatch, firstInputs, firstTemplate, split.commands, firstSideEffects,
 		compactKbuildHermeticScriptOptions{CompilerDependency: true, Intermediate: hasSuffix},
 	)
 	if err != nil {
@@ -3107,99 +3942,153 @@ func (b *compactKbuildRulePlanBuilder) buildCompactKbuildCmdAndFixdepSplit(
 	if !hasSuffix {
 		return firstProducer, nil
 	}
-	suffixInputs := slices.Clone(inputs)
-	carriedOutputs := []string{}
-	carriedSideOutputs := []string{}
-	for slot, output := range firstNode.Outputs {
-		if output.ObservedPath != "" {
-			continue
-		}
-		pathname := canonicalKbuildRulePath(output.Path)
-		if pathname == "" {
-			return "", fmt.Errorf("first-template output slot %d has an empty logical path", slot)
-		}
-		suffixInputs = upsertCompactKbuildRuleInput(suffixInputs, compactKbuildRuleInput{
-			path: pathname, producer: firstProducer, slot: slot, recipeLocal: true, workingOnly: true,
-		})
-		if output.persistent {
-			carriedOutputs = append(carriedOutputs, pathname)
-		} else {
-			carriedSideOutputs = append(carriedSideOutputs, pathname)
-		}
-	}
 	previousStates, err := compactKbuildRecipeObservedStateInputs(firstProducer, firstNode.Outputs, firstObservations)
 	if err != nil {
 		return "", fmt.Errorf("first-template observed state outputs: %w", err)
 	}
-
-	suffixTemplates := slices.Clone(rootedTemplates[1:])
-	suffixTemplate := compactKbuildRecipeLineShells(suffixTemplates)
-	suffixCommands, err := compactKbuildCompoundProgramCommands(suffixTemplate)
-	if err != nil || len(suffixCommands) == 0 {
-		if err == nil {
-			err = fmt.Errorf("suffix has no discovered commands")
-		}
-		return "", fmt.Errorf("suffix program discovery: %w", err)
+	// Occurrences from one Make recipe line share that line's frozen exports,
+	// shell, and read frontier. Later recipe lines may observe newly completed
+	// writers, so each distinct line gets its own source-ordered action and
+	// receives the immediately preceding action's private output versions.
+	suffixGroups := []sourceGroup{}
+	if groups[0].end > 1 {
+		suffixGroups = append(suffixGroups, sourceGroup{line: groups[0].line, start: 1, end: groups[0].end})
 	}
-	suffixMatch := match
-	suffixMatch.compilerProbeCommands = nil
-	if len(match.compilerProbeRootedTemplates) != 0 {
-		if len(match.compilerProbeRootedTemplates) != len(rootedTemplates) {
-			return "", fmt.Errorf("cmd_and_fixdep compiler-probe suffix template count changed from %d to %d", len(rootedTemplates), len(match.compilerProbeRootedTemplates))
+	suffixGroups = append(suffixGroups, groups[1:]...)
+	previousProducer, previousNode := firstProducer, firstNode
+	previousOutputLines := map[string]int{}
+	for _, output := range firstNode.Outputs {
+		if output.ObservedPath == "" {
+			previousOutputLines[canonicalKbuildRulePath(output.Path)] = groups[0].line
 		}
-		suffixMatch.compilerProbeRootedTemplates = slices.Clone(match.compilerProbeRootedTemplates[1:])
 	}
-	if len(suffixMatch.compilerProbeRootedTemplates) != 0 && slices.ContainsFunc(suffixCommands, func(command compactKbuildRecipeCommand) bool {
-		_, compiler := compactKbuildCommandCompilerRole(command)
-		return compiler
-	}) {
-		// Only compiler invocations need the discovery-form twin to preserve
-		// query identity. A source-selected metadata/helper suffix can resolve
-		// from one symbolic Make word into several concrete commands without
-		// containing a compiler at all. Its complete executable program, inputs,
-		// outputs and observed state remain in the opaque suffix action below.
-		// Compiler-bearing suffixes still require exact occurrence matching.
-		probeSuffixTemplate := compactKbuildRecipeLineShells(suffixMatch.compilerProbeRootedTemplates)
-		probeSuffixCommands, err := compactKbuildCompoundProgramCommands(probeSuffixTemplate)
+	for ordinal, group := range suffixGroups {
+		suffixMatch := match
+		suffixMatch.compilerProbeCommands = nil
+		suffixInputs := slices.Clone(inputs)
+		if snapshot := selectedSnapshots[group.line]; snapshot != nil {
+			for _, read := range snapshot.Reads() {
+				if !read.Exists || read.Artifact.Producer.Profile != match.profile.Name ||
+					compactKbuildGraphTargetPath(read.Artifact.Producer.Target) != compactKbuildGraphTargetPath(target) {
+					continue
+				}
+				writerLine, written := previousOutputLines[read.Artifact.Producer.Path]
+				if !written || writerLine >= group.line {
+					return "", fmt.Errorf("%s: Kbuild target %q recipe %d read %q has no proven earlier recipe-local writer version",
+						match.profile.Rules[match.ruleOrder].Position, target, group.line, read.Path)
+				}
+			}
+			suffixMatch.profile = snapshot.Evaluation.Profile
+			suffixMatch.selectedRecipeSnapshot = snapshot
+			suffixInputs = slices.Clone(nativeInputs)
+		}
+		carriedOutputs, carriedSideOutputs := []string{}, []string{}
+		for slot, output := range previousNode.Outputs {
+			if output.ObservedPath != "" {
+				continue
+			}
+			pathname := canonicalKbuildRulePath(output.Path)
+			if pathname == "" {
+				return "", fmt.Errorf("predecessor output slot %d has an empty logical path", slot)
+			}
+			suffixInputs = upsertCompactKbuildRuleInput(suffixInputs, compactKbuildRuleInput{
+				path: pathname, producer: previousProducer, slot: slot, recipeLocal: true, workingOnly: true,
+			})
+			if output.persistent {
+				carriedOutputs = append(carriedOutputs, pathname)
+			} else {
+				carriedSideOutputs = append(carriedSideOutputs, pathname)
+			}
+		}
+		groupObservations, err := compactKbuildRecipeCommandObservedOutputs(
+			observedTarget, ordinal+1, ordinal+1 == len(suffixGroups),
+			b.observedOutputs[observedTarget], previousStates,
+		)
 		if err != nil {
-			return "", fmt.Errorf("cmd_and_fixdep compiler-probe suffix program discovery: %w", err)
+			return "", fmt.Errorf("suffix source recipe %d observed predecessor state: %w", group.line, err)
 		}
-		if len(probeSuffixCommands) != len(suffixCommands) {
-			return "", fmt.Errorf("cmd_and_fixdep compiler-probe suffix command count changed from %d to %d", len(suffixCommands), len(probeSuffixCommands))
-		}
-		for index, command := range suffixCommands {
-			if probeSuffixCommands[index].program != command.program || probeSuffixCommands[index].connector != command.connector {
-				return "", fmt.Errorf("cmd_and_fixdep compiler-probe suffix command %d changes executable or control structure", index)
+		suffixBuilder := *b
+		suffixBuilder.observedOutputs = make(map[string][]compactKbuildObservedOutput, len(b.observedOutputs))
+		for candidate, observations := range b.observedOutputs {
+			if candidate == observedTarget {
+				suffixBuilder.observedOutputs[candidate] = groupObservations
+			} else {
+				suffixBuilder.observedOutputs[candidate] = append([]compactKbuildObservedOutput(nil), observations...)
 			}
 		}
-		suffixMatch.compilerProbeCommands = probeSuffixCommands
-	}
-	suffixSideEffects := compactKbuildRecipeSideEffectProjection(suffixTemplates, automatic)
-	suffixBuilder := *b
-	suffixBuilder.observedOutputs = make(map[string][]compactKbuildObservedOutput, len(b.observedOutputs))
-	for candidate, observations := range b.observedOutputs {
-		cloned := append([]compactKbuildObservedOutput(nil), observations...)
-		if candidate == observedTarget {
-			if len(cloned) != len(previousStates) {
-				return "", fmt.Errorf("suffix has %d observations for %d predecessor states", len(cloned), len(previousStates))
-			}
-			for index := range cloned {
-				cloned[index].baseInputs = []compactKbuildRuleInput{previousStates[index]}
+		if selectedSnapshots[group.line] != nil {
+			suffixInputs, err = suffixBuilder.compactKbuildSelectedReadInputs(target, suffixMatch, suffixInputs)
+			if err != nil {
+				return "", fmt.Errorf("suffix source recipe %d inputs: %w", group.line, err)
 			}
 		}
-		suffixBuilder.observedOutputs[candidate] = cloned
+		suffixTemplates := slices.Clone(rootedTemplates[group.start:group.end])
+		suffixTemplate := compactKbuildRecipeLineShells(suffixTemplates)
+		suffixCommands, err := compactKbuildCompoundProgramCommands(suffixTemplate)
+		if err != nil || len(suffixCommands) == 0 {
+			if err == nil {
+				err = fmt.Errorf("suffix has no discovered commands")
+			}
+			return "", fmt.Errorf("suffix source recipe %d program discovery: %w", group.line, err)
+		}
+		if len(match.compilerProbeRootedTemplates) != 0 {
+			if len(match.compilerProbeRootedTemplates) != len(rootedTemplates) {
+				return "", fmt.Errorf("cmd_and_fixdep compiler-probe suffix template count changed from %d to %d",
+					len(rootedTemplates), len(match.compilerProbeRootedTemplates))
+			}
+			suffixMatch.compilerProbeRootedTemplates = slices.Clone(match.compilerProbeRootedTemplates[group.start:group.end])
+		}
+		if len(suffixMatch.compilerProbeRootedTemplates) != 0 && slices.ContainsFunc(suffixCommands, func(command compactKbuildRecipeCommand) bool {
+			_, compiler := compactKbuildCommandCompilerRole(command)
+			return compiler
+		}) {
+			// Metadata and helper suffixes keep their complete source programs.
+			// A compiler-bearing suffix also keeps its exact probe-form twin.
+			probeTemplate := compactKbuildRecipeLineShells(suffixMatch.compilerProbeRootedTemplates)
+			probeCommands, probeErr := compactKbuildCompoundProgramCommands(probeTemplate)
+			if probeErr != nil || len(probeCommands) != len(suffixCommands) {
+				return "", fmt.Errorf("suffix source recipe %d compiler-probe program structure differs: %v", group.line, probeErr)
+			}
+			for index, command := range suffixCommands {
+				if probeCommands[index].program != command.program || probeCommands[index].connector != command.connector {
+					return "", fmt.Errorf("compiler-probe suffix command %d on source recipe %d changes executable or control structure", index, group.line)
+				}
+			}
+			suffixMatch.compilerProbeCommands = probeCommands
+		}
+		suffixSideEffects := compactKbuildRecipeSideEffectProjection(suffixTemplates, automatic)
+		producer, err := suffixBuilder.buildHermeticKbuildScriptContext(
+			target, suffixMatch, suffixInputs, suffixTemplate, suffixCommands, suffixSideEffects,
+			compactKbuildHermeticScriptOptions{
+				Intermediate:               ordinal+1 < len(suffixGroups),
+				SourceStageIdentity:        fmt.Sprintf("%d:%d", ordinal+1, group.line),
+				CarriedOutputs:             carriedOutputs,
+				RequiredCarriedSideOutputs: carriedSideOutputs,
+			},
+		)
+		if err != nil {
+			return "", fmt.Errorf("opaque suffix source recipe %d: %w", group.line, err)
+		}
+		node, ok := compactKbuildPlanNode(b.plan, producer)
+		if !ok {
+			return "", fmt.Errorf("suffix source recipe %d producer %q is absent from the action plan", group.line, producer)
+		}
+		if ordinal+1 < len(suffixGroups) {
+			previousStates, err = compactKbuildRecipeObservedStateInputs(
+				producer, node.Outputs, groupObservations,
+			)
+			if err != nil {
+				return "", fmt.Errorf("suffix source recipe %d observed state outputs: %w", group.line, err)
+			}
+		}
+		for _, output := range node.Outputs {
+			if output.ObservedPath == "" {
+				previousOutputLines[canonicalKbuildRulePath(output.Path)] = group.line
+			}
+		}
+		previousProducer, previousNode = producer, node
 	}
-	producer, err := suffixBuilder.buildHermeticKbuildScriptContext(
-		target, suffixMatch, suffixInputs, suffixTemplate, suffixCommands, suffixSideEffects,
-		compactKbuildHermeticScriptOptions{
-			CarriedOutputs:             carriedOutputs,
-			RequiredCarriedSideOutputs: carriedSideOutputs,
-		},
-	)
-	if err != nil {
-		return "", fmt.Errorf("opaque suffix: %w", err)
-	}
-	return producer, nil
+	return previousProducer, nil
 }
 
 func compactKbuildRecipeHasPipeline(commands []compactKbuildRecipeCommand) bool {
@@ -3256,6 +4145,9 @@ func compactKbuildRecipeRequiresAtomicExecution(
 	match compactKbuildRuleMatch,
 	commands []compactKbuildRecipeCommand,
 ) (bool, error) {
+	if compactKbuildEmptyArchiveAfterExactRemoval(commands, target) {
+		return true, nil
+	}
 	if len(commands) < 2 {
 		return false, nil
 	}
@@ -3623,12 +4515,8 @@ func compactKbuildTypedWorkingArgument(value, objectRoot string, logicalPaths ma
 		prefix += "@"
 		candidate = strings.TrimPrefix(candidate, "@")
 	}
-	projected := replaceCompactKbuildTreePathPrefix(candidate, "${tree:prep}", objectRoot)
-	projected = replaceCompactKbuildTreePathPrefix(projected, "${work:root}", objectRoot)
-	projected = strings.NewReplacer(
-		"${tree:prep}", objectRoot,
-		"${work:root}", objectRoot,
-	).Replace(projected)
+	projected := replaceCompactKbuildTreeRoot(candidate, "${tree:prep}", objectRoot)
+	projected = replaceCompactKbuildTreeRoot(projected, "${work:root}", objectRoot)
 	if projected != candidate {
 		return prefix + projected
 	}
@@ -3945,6 +4833,74 @@ func compactKbuildArchivePrimaryOutput(arguments []string) (string, bool) {
 		return "", false
 	}
 	return compactKbuildRecipePath(arguments[index])
+}
+
+// Reading, extracting, indexing, moving, or deleting members does not prove
+// that an absent archive target becomes a file. Require one insertion mode,
+// one archive operand, and either a member or proof that the archive is absent
+// before the command. GNU and LLVM ar create an absent archive even with no
+// members in r/q mode. P/S/T are GNU ar modifiers used by Linux's thin built-in
+// archives; they do not replace the required insertion mode.
+func compactKbuildArchiveCreationOutput(arguments []string, absent bool) (string, bool) {
+	if len(arguments) < 2 || len(arguments) == 2 && !absent {
+		return "", false
+	}
+	mode := strings.TrimPrefix(arguments[0], "-")
+	seen := map[rune]bool{}
+	for _, option := range mode {
+		if !strings.ContainsRune("rqcsDvPST", option) || seen[option] {
+			return "", false
+		}
+		seen[option] = true
+	}
+	if seen['r'] == seen['q'] {
+		return "", false
+	}
+	output, valid := compactKbuildArchivePrimaryOutput(arguments)
+	if !valid || output == "" {
+		return "", false
+	}
+	return output, true
+}
+
+func compactKbuildArchiveRemovedBeforeCommand(removal, writer compactKbuildRecipeCommand, target string) bool {
+	if removal.program != "rm" {
+		return false
+	}
+	removed, err := compactKbuildRecipeRemovalPaths(removal)
+	return err == nil && len(removed) == 1 && len(removal.arguments) == 2 &&
+		compactKbuildArchiveOutputMatchesTarget(removed[0].path, removal.arguments[1], target) &&
+		len(writer.arguments) >= 2 &&
+		removal.arguments[1] == writer.arguments[1]
+}
+
+func compactKbuildArchiveOutputMatchesTarget(output, operand, target string) bool {
+	if output == target {
+		return true
+	}
+	return (strings.HasPrefix(target, "__LINUX_BZL_OBJECT_TREE__/") ||
+		strings.HasPrefix(target, "${tree:prep}/")) &&
+		compactKbuildMaterializeActionTreeMarkers(operand) == target
+}
+
+// An empty archive is a physical output only when the complete selected
+// source line first removes that exact archive and then executes the
+// configured archiver in the same shell. Keeping the pair atomic preserves
+// the deletion when an earlier graph version of the archive is staged.
+func compactKbuildEmptyArchiveAfterExactRemoval(commands []compactKbuildRecipeCommand, target string) bool {
+	if len(commands) != 2 || commands[0].connector != ";" && commands[0].connector != "&&" ||
+		commands[1].connector != "" && commands[1].connector != ";" {
+		return false
+	}
+	archiver := commands[1]
+	role, configured := parseKbuildActionRoleToken(archiver.program)
+	if !configured || role.Role != "ar" || len(archiver.arguments) != 2 ||
+		len(archiver.environment) != 0 || archiver.stdin != "" || archiver.stdout != "" ||
+		!compactKbuildArchiveRemovedBeforeCommand(commands[0], archiver, target) {
+		return false
+	}
+	output, creates := compactKbuildArchiveCreationOutput(archiver.arguments, true)
+	return creates && compactKbuildArchiveOutputMatchesTarget(output, archiver.arguments[1], target)
 }
 
 type compactKbuildCommandSubstitutionRange struct {
@@ -5711,6 +6667,13 @@ func replaceCompactKbuildTreePathPrefix(value, marker, replacement string) strin
 	return strings.ReplaceAll(value, marker+"/", prefix)
 }
 
+// Project both a rooted path and a standalone tree root. Source-authored
+// literal spellings carry a distinct protected byte until the finished
+// script's literal offsets have been recorded.
+func replaceCompactKbuildTreeRoot(value, marker, replacement string) string {
+	return strings.ReplaceAll(replaceCompactKbuildTreePathPrefix(value, marker, replacement), marker, replacement)
+}
+
 // buildHermeticKbuildScript is the generic fallback for a selected Kbuild
 // command whose shell control flow cannot be represented as a linear argv
 // graph. The evaluated recipe remains source-owned; configured action-role
@@ -5777,6 +6740,13 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildCompoundWithSideEffect
 }
 
 type compactKbuildHermeticScriptOptions struct {
+	// A source-selected PHONY recipe can have bounded private side effects
+	// while still requiring an execution result and an absent logical target.
+	PhonyPrivateEffects []ActionRecipePrivateWorkingEffect
+	PhonyScriptPath     string
+	// PhonyStatus executes one frozen Make recipe line after its selected
+	// recursive children. Its only output is a private completion state.
+	PhonyStatus *ActionRecipeMakePhonyCompletion
 	// CompilerDependency marks one exact, bounded compound compiler action.
 	// Execution still goes through scriptrun; Kind exposes the typed cache and
 	// config-dependency boundary to the family reducer.
@@ -5784,6 +6754,9 @@ type compactKbuildHermeticScriptOptions struct {
 	// Intermediate gives every ordinary output a planner-private physical path.
 	// A later opaque action republishes the canonical rule outputs.
 	Intermediate bool
+	// SourceStageIdentity distinguishes private output versions of two
+	// intermediate actions from the same source rule with equal command counts.
+	SourceStageIdentity string
 	// CarriedOutputs republishes already-staged persistent files which were
 	// created by an earlier atomic action but are not rediscovered by this
 	// action's own compiler analysis.
@@ -5854,6 +6827,223 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildHermeticExactSourceOperandIn
 	return inputs, nil
 }
 
+// compactKbuildSelectedExportedProgramInputs binds programs invoked through
+// exported shell variables in an immutable, selected source script. The
+// private writable root is an execution path, not a producer: resolve the
+// selected writer before staging its bytes, rather than accepting an
+// incidental prep projection of the same pathname (which can lose mode bits).
+// A program without a selected writer remains an unbound private path until
+// the complete working frontier proves it absent. The authenticated shell
+// then decides whether its guarded call runs: an unexpected call fails the
+// action before any outputs are published.
+func (b *compactKbuildRulePlanBuilder) compactKbuildSelectedExportedProgramInputs(
+	inputs []compactKbuildRuleInput,
+	environment map[string]string,
+	programVariables map[string]bool,
+	executableProgramPaths map[string]bool,
+) ([]compactKbuildRuleInput, map[string]string, error) {
+	missing := map[string]string{}
+	for _, name := range slices.Sorted(maps.Keys(programVariables)) {
+		value := environment[name]
+		if !strings.HasPrefix(value, "${work:root}/") {
+			continue
+		}
+		pathname := strings.TrimPrefix(value, "${work:root}/")
+		if err := validatePlanRelativePath("selected source-script program", pathname); err != nil {
+			return nil, nil, fmt.Errorf("exported program %s=%q: %w", name, value, err)
+		}
+		description := fmt.Sprintf("exported program %s=%q", name, value)
+		var selected bool
+		var err error
+		inputs, selected, err = b.compactKbuildSelectedSourceObjectProgramInput(
+			inputs, pathname, description, executableProgramPaths,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !selected {
+			missing[pathname] = fmt.Sprintf("exported program %s=%q", name, pathname)
+			continue
+		}
+	}
+	return inputs, missing, nil
+}
+
+// A selected immutable script can name a generated executable by appending a
+// static path to an exported object-root value, for example ${objtree}/tools/x.
+// Argument-only path observations do not grant executable authority. Resolve
+// the exact command head through its frozen export before selecting a writer.
+func (b *compactKbuildRulePlanBuilder) compactKbuildSelectedObjectRootProgramInputs(
+	inputs []compactKbuildRuleInput,
+	environment map[string]string,
+	programs map[string]bool,
+	executableProgramPaths map[string]bool,
+) ([]compactKbuildRuleInput, map[string]string, error) {
+	missing := map[string]string{}
+	for _, word := range slices.Sorted(maps.Keys(programs)) {
+		if !compactKbuildObjectTreeProgramPath(word) {
+			return nil, nil, fmt.Errorf("selected source-script object program %q is not a static rooted path", word)
+		}
+		root, suffix, _ := strings.Cut(word, "/")
+		base := "${work:root}"
+		if name, variable := compactKbuildExactShellParameter(root); variable {
+			value, exported := environment[name]
+			if !exported || value != base && !strings.HasPrefix(value, base+"/") {
+				return nil, nil, fmt.Errorf("selected source-script program %q has no exported private object-root value", word)
+			}
+			base = value
+		} else if root != "__LINUX_BZL_OBJECT_TREE__" && root != compactKbuildActionAbsoluteObjectTreeMarker &&
+			root != "${tree:prep}" && root != "${tree:host}" && root != "${tree:bootstrap}" &&
+			root != "${tree:prehost}" && root != "${work:root}" {
+			return nil, nil, fmt.Errorf("selected source-script program %q has no declared object root", word)
+		}
+		pathname := strings.TrimPrefix(strings.TrimPrefix(base+"/"+suffix, "${work:root}/"), "/")
+		if err := validatePlanRelativePath("selected source-script object program", pathname); err != nil {
+			return nil, nil, fmt.Errorf("selected source-script program %q: %w", word, err)
+		}
+		description := fmt.Sprintf("selected source-script object program %q", word)
+		var selected bool
+		var err error
+		inputs, selected, err = b.compactKbuildSelectedSourceObjectProgramInput(
+			inputs, pathname, description, executableProgramPaths,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !selected {
+			missing[pathname] = description
+		}
+	}
+	return inputs, missing, nil
+}
+
+// Literal path commands and exported program heads share the same selected
+// object-file ownership proof. Immutable source-root commands already execute
+// in the declared source tree; relative source programs get an explicit
+// executable copy, while generated helpers must have a selected writer.
+func (b *compactKbuildRulePlanBuilder) compactKbuildSelectedLiteralProgramInputs(
+	inputs []compactKbuildRuleInput,
+	profile CompactKbuildProfile,
+	programs map[string]bool,
+	executableProgramPaths map[string]bool,
+) ([]compactKbuildRuleInput, map[string]string, error) {
+	missing := map[string]string{}
+	for _, word := range slices.Sorted(maps.Keys(programs)) {
+		if compactKbuildSourceScriptProgramUsesSourceRoot(word) {
+			continue
+		}
+		pathname, sourceProgram, resolved := compactKbuildProfileCommandPath(profile, word)
+		if !resolved {
+			return nil, nil, fmt.Errorf("literal source program %q lacks a canonical object-tree path", word)
+		}
+		if sourceProgram {
+			var index int
+			var err error
+			inputs, index, err = b.ensureCommandProgramInput(inputs, pathname, true)
+			if err != nil {
+				return nil, nil, fmt.Errorf("literal source program %q: %w", word, err)
+			}
+			if index < 0 || inputs[index].producer == "" {
+				return nil, nil, fmt.Errorf("literal source program %q has no executable source projection", word)
+			}
+			inputs[index].workingOnly = false
+			executableProgramPaths[pathname] = true
+			continue
+		}
+		description := fmt.Sprintf("literal source program %q", word)
+		var selected bool
+		var err error
+		inputs, selected, err = b.compactKbuildSelectedSourceObjectProgramInput(
+			inputs, pathname, description, executableProgramPaths,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !selected {
+			missing[pathname] = fmt.Sprintf("%s at %q", description, pathname)
+		}
+	}
+	return inputs, missing, nil
+}
+
+func (b *compactKbuildRulePlanBuilder) compactKbuildSelectedSourceObjectProgramInput(
+	inputs []compactKbuildRuleInput,
+	pathname, description string,
+	executableProgramPaths map[string]bool,
+) ([]compactKbuildRuleInput, bool, error) {
+	if b.selectionGraph == nil || !b.selectionBound {
+		return nil, false, fmt.Errorf("%s lacks an exact Kbuild selection", description)
+	}
+	owner, selected, err := b.selectionGraph.compactKbuildSelectionPathOwner(b.selection, pathname)
+	if err != nil {
+		return nil, false, fmt.Errorf("%s: %w", description, err)
+	}
+	if !selected {
+		return inputs, false, nil
+	}
+	input, found, err := b.existingInput(pathname)
+	if err != nil {
+		return nil, false, fmt.Errorf("%s: %w", description, err)
+	}
+	if !found || input.producer == "" || input.producer != b.selectionGraph.materializedProducers[owner] {
+		return nil, false, fmt.Errorf("%s has no exact materialized writer", description)
+	}
+	for _, earlier := range inputs {
+		if earlier.path == pathname && (earlier.producer != input.producer || earlier.slot != input.slot) {
+			return nil, false, fmt.Errorf("%s conflicts with an existing working input", description)
+		}
+	}
+	input.workingOnly = false
+	inputs = upsertCompactKbuildRuleInput(inputs, input)
+	executableProgramPaths[pathname] = true
+	return inputs, true, nil
+}
+
+func (b *compactKbuildRulePlanBuilder) requireAbsentSelectedSourceProgramPaths(
+	frontier compactKbuildInputFrontier,
+	missing map[string]string,
+) error {
+	if len(missing) == 0 {
+		return nil
+	}
+	store, err := b.plan.planningActionPlanInputSetStore()
+	if err != nil {
+		return err
+	}
+	for _, pathname := range slices.Sorted(maps.Keys(missing)) {
+		name := missing[pathname]
+		if slices.ContainsFunc(frontier.direct, func(input compactKbuildRuleInput) bool {
+			return input.path == pathname
+		}) {
+			return fmt.Errorf("%s has an unselected direct working input", name)
+		}
+		if _, present, err := store.Lookup(frontier.inputSet, ActionPlanInputSetTarget{
+			Kind: ActionPlanInputSetWorkTarget, Path: pathname,
+		}); err != nil {
+			return fmt.Errorf("%s working frontier: %w", name, err)
+		} else if present {
+			return fmt.Errorf("%s has an unselected persistent working input", name)
+		}
+		if _, present := CompactKbuildProfileInitialVisibleArtifact(*b.profile, pathname); present {
+			return fmt.Errorf("%s exists in the selected invocation's initial object tree", name)
+		}
+		if _, present := b.resolvedSideOutputs[pathname]; present {
+			return fmt.Errorf("%s has an unselected observed working input", name)
+		}
+		if producer, _, present := b.existingProducer(pathname); present {
+			return fmt.Errorf("%s has unselected plan producer %s", name, producer)
+		}
+		evidence, err := b.sourcePathEvidence(pathname)
+		if err != nil {
+			return fmt.Errorf("%s source evidence: %w", name, err)
+		}
+		if evidence.exists {
+			return fmt.Errorf("%s has an unselected source or preconfigured object file", name)
+		}
+	}
+	return nil
+}
+
 func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 	target string,
 	match compactKbuildRuleMatch,
@@ -5863,6 +7053,19 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 	sideEffectCommands []compactKbuildRecipeCommand,
 	options compactKbuildHermeticScriptOptions,
 ) (string, error) {
+	finalPhase, analyzedFinal, splitFinal, phaseErr := b.compactKbuildLinkVmlinuxFinalSourcePhase(b.selection)
+	if phaseErr != nil {
+		return "", phaseErr
+	}
+	var finalInput compactKbuildRuleInput
+	if splitFinal {
+		var emitErr error
+		finalInput, emitErr = b.emitCompactKbuildLinkVmlinuxFinal(finalPhase, analyzedFinal)
+		if emitErr != nil {
+			return "", fmt.Errorf("emit selected link-vmlinux final source: %w", emitErr)
+		}
+		inputs = append(inputs, finalInput)
+	}
 	directInputs := slices.Clone(inputs)
 	sourceCompoundCommands := slices.Clone(sideEffectCommands)
 	straightLineCompound := sideEffectCommands != nil
@@ -5876,6 +7079,7 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 	if template == "" || len(template) > 1<<20 || strings.ContainsRune(template, 0) {
 		return "", fmt.Errorf("evaluated script is empty, invalid, or exceeds 1 MiB")
 	}
+	sourceTemplate := template
 	if err := validateKbuildDeferredShellSingleWordPlacements(match.profile, template); err != nil {
 		return "", err
 	}
@@ -6156,11 +7360,10 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 		}
 		scriptReplacements = nil
 		recordPrivateScriptTrees(template)
-		template = replaceCompactKbuildTreePathPrefix(template, compactKbuildActionObjectTreeMarker, objectRoot)
+		template = replaceCompactKbuildTreeRoot(template, compactKbuildActionObjectTreeMarker, objectRoot)
 		template = strings.NewReplacer(
 			compactKbuildActionSourceTreeMarker, "${tree:kernel}",
 			compactKbuildActionAbsoluteObjectTreeMarker, "${tree:prep}",
-			compactKbuildActionObjectTreeMarker, objectRoot,
 			compactKbuildActionHostDepsTreeMarker, "${tree:"+linuxProbeHostDepsRootName+"}",
 		).Replace(template)
 	}
@@ -6183,15 +7386,70 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 			compactKbuildActionAbsoluteObjectTreeMarker, "${tree:prep}",
 		).Replace(template)
 	}
-	environmentUsage, err := compactKbuildHermeticScriptEnvironmentUsage(match.profile, template, compoundCommands)
+	selectedSourcePath, selectedContent := "", ""
+	if splitFinal {
+		selectedSourcePath, selectedContent = finalPhase.SourcePath, analyzedFinal.FinalScript
+	}
+	environmentUsage, err := compactKbuildHermeticScriptEnvironmentUsageWithSelectedContent(
+		match.profile, template, compoundCommands, selectedSourcePath, selectedContent,
+	)
 	if err != nil {
 		return "", fmt.Errorf("inspect hermetic script environment: %w", err)
+	}
+	var selectedSourceProgramHeads map[string]bool
+	// Ordinary selected immutable scripts are discovered by the same recursive
+	// usage scan as their exported environment. The split final wrapper hides
+	// its script behind an emitted source span, so scan only its executed bytes.
+	selectedSourceLiteralPrograms := environmentUsage.selectedSourceLiteralProgramHeads
+	selectedSourceObjectPrograms := environmentUsage.selectedSourceObjectProgramHeads
+	if splitFinal {
+		// The selected Make wrapper now invokes only the authenticated final
+		// source span through sh -c, so the generic wrapper scan may no longer
+		// see the original source pathname. Recover its exported capabilities
+		// and object-tree config import from that already authenticated source.
+		selectedSource, sourceErr := compactKbuildSourceScriptUsageWithSelectedContent(
+			match.profile, finalPhase.SourcePath, analyzedFinal.FinalScript,
+		)
+		if sourceErr != nil {
+			return "", fmt.Errorf("inspect selected link-vmlinux source environment: %w", sourceErr)
+		}
+		environmentUsage.merge(selectedSource)
+		// The final shell sources the authenticated prelude before running its
+		// selected tail. Any category of generated command head may be invoked
+		// inside a function defined in the prelude and called by the tail.
+		selectedSourceProgramHeads = selectedSource.programVariables
+		selectedSourceLiteralPrograms = selectedSource.literalProgramHeads
+		selectedSourceObjectPrograms = selectedSource.objectProgramHeads
+	}
+	if splitFinal && !environmentUsage.generatedShellSources["include/config/auto.conf"] {
+		return "", fmt.Errorf("selected link-vmlinux final wrapper lacks its generated static config source")
+	}
+	for _, pathname := range slices.Sorted(maps.Keys(environmentUsage.generatedShellSources)) {
+		baseline, available, baselineErr := b.compactKbuildConfigProjectionBaselineInput(pathname)
+		if baselineErr != nil {
+			return "", fmt.Errorf("source-generated shell input %q: %w", pathname, baselineErr)
+		}
+		if !available {
+			// A generated assignment file could have been replaced by another
+			// selected writer. The source-script scanner checked exact bytes
+			// from this invocation's initial snapshot; do not substitute an
+			// unknown later writer or a source-tree file with the same name.
+			return "", fmt.Errorf("source-generated shell input %q has no exact config baseline", pathname)
+		}
+		baseline.workingOnly = true
+		inputs = upsertCompactKbuildRuleInput(inputs, baseline)
 	}
 	environment, environmentRoles, err := compactKbuildSourceScriptEnvironment(
 		target, match, directInputs, nil, environmentUsage, b.actionScope(), b.metadata.actionRoles,
 	)
 	if err != nil {
 		return "", fmt.Errorf("hermetic script exported environment: %w", err)
+	}
+	if splitFinal {
+		template, err = b.compactKbuildFinalWrapper(template, finalPhase, finalInput, environment)
+		if err != nil {
+			return "", fmt.Errorf("selected link-vmlinux final Make wrapper: %w", err)
+		}
 	}
 	compilerProbeEnvironment := map[string]string(nil)
 	if compilerProbeDependency != nil || len(compoundCompilerProbes) != 0 {
@@ -6205,18 +7463,41 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 		_ = probeEnvironmentRoles
 	}
 	replayTargets := append([]string{target, match.lookupTarget}, compactKbuildRecipeRuleOutputs(target, match)...)
-	commandReplays, err := b.compactKbuildSourceScriptCommandReplays(match.profile, target, replayTargets...)
-	if err != nil {
-		return "", fmt.Errorf("hermetic script recursive replay: %w", err)
+	var commandReplays []ActionRecipeCommandReplay
+	if options.PhonyStatus == nil {
+		commandReplays, err = b.compactKbuildSourceScriptCommandReplays(match.profile, target, replayTargets...)
+		if err != nil {
+			return "", fmt.Errorf("hermetic script recursive replay: %w", err)
+		}
+		if splitFinal {
+			commandReplays, err = b.compactKbuildFinalReplay(b.selection, commandReplays)
+			if err != nil {
+				return "", err
+			}
+		}
 	}
 	if environmentUsage.uses("MAKE") || directMakeReplay {
 		makeValue := environment["MAKE"]
 		switch {
+		case len(commandReplays) != 0 && compactKbuildHasRecursiveMakeAliasExport(environment) &&
+			makeValue != CompactKbuildRecursiveMakeProvenanceToken:
+			// A source assignment may replace MAKE after an earlier simply
+			// expanded alias captured the injected value. The alias owns the
+			// selected replay; preserve the independent source-defined export.
 		case len(commandReplays) != 0 &&
 			(makeValue == "" || makeValue == CompactKbuildRecursiveMakeProvenanceToken || makeValue == commandReplays[0].Name):
 			if makeValue != "" || environmentUsage.uses("MAKE") {
 				environment["MAKE"] = commandReplays[0].Name
 			}
+		case makeValue == CompactKbuildRecursiveMakeProvenanceToken && !directMakeReplay:
+			// An immutable script or its child may only observe the exported
+			// value. Bind it to a deny-all proxy below; a source-owned attempt
+			// to execute it still fails through the runner's sticky broker.
+		case !directMakeReplay && len(commandReplays) == 0 &&
+			!environmentUsage.ObservesAll && !environmentUsage.programVariables["MAKE"]:
+			// A source-defined or absent MAKE which a script reads as data
+			// carries no evaluator-owned replay authority. Preserve an explicitly
+			// exported empty value instead of treating it as an invocation.
 		case makeValue == CompactKbuildRecursiveMakeProvenanceToken:
 			return "", fmt.Errorf("hermetic script reads recursive MAKE but has no discovered replay")
 		case len(commandReplays) != 0:
@@ -6240,12 +7521,79 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 			}
 		}
 	} else {
-		commandReplays = nil
-		if environment["MAKE"] == CompactKbuildRecursiveMakeProvenanceToken {
+		// A different exported name can carry authenticated MAKE provenance.
+		// Preserve a selected replay only when the selected script may observe
+		// that alias; otherwise its proxy must reject every invocation.
+		hasAlias, usedAlias := compactKbuildHasRecursiveMakeAliasExport(environment), false
+		for name, value := range environment {
+			if name != "MAKE" && strings.Contains(value, CompactKbuildRecursiveMakeProvenanceToken) {
+				usedAlias = usedAlias || environmentUsage.uses(name)
+			}
+		}
+		if !hasAlias && environment["MAKE"] == CompactKbuildRecursiveMakeProvenanceToken {
 			delete(environment, "MAKE")
 		}
 		if compilerProbeEnvironment != nil {
 			delete(compilerProbeEnvironment, "MAKE")
+		}
+		// The split final phase has already authenticated both recursive
+		// children against the original selected source. Keep its post-modpost
+		// child replay as phase provenance even though the emitted final script
+		// itself no longer reads MAKE.
+		if !usedAlias && !splitFinal {
+			commandReplays = nil
+		}
+	}
+	commandReplays, err = compactKbuildBindRecursiveMakeExportProxy(environment, commandReplays)
+	if err != nil {
+		return "", fmt.Errorf("hermetic script recursive Make exports: %w", err)
+	}
+	if compilerProbeEnvironment != nil {
+		for name, value := range compilerProbeEnvironment {
+			if strings.Contains(value, CompactKbuildRecursiveMakeProvenanceToken) {
+				return "", fmt.Errorf("compiler-probe environment %q contains unsupported recursive Make alias", name)
+			}
+		}
+	}
+	var absentSourceProgramPaths map[string]string
+	if len(selectedSourceProgramHeads) != 0 {
+		inputs, absentSourceProgramPaths, err = b.compactKbuildSelectedExportedProgramInputs(
+			inputs, environment, selectedSourceProgramHeads, executableProgramPaths,
+		)
+		if err != nil {
+			return "", fmt.Errorf("selected source-script executable inputs: %w", err)
+		}
+	}
+	if len(selectedSourceObjectPrograms) != 0 {
+		var absentObjectProgramPaths map[string]string
+		inputs, absentObjectProgramPaths, err = b.compactKbuildSelectedObjectRootProgramInputs(
+			inputs, environment, selectedSourceObjectPrograms, executableProgramPaths,
+		)
+		if err != nil {
+			return "", fmt.Errorf("selected source-script object executables: %w", err)
+		}
+		if absentSourceProgramPaths == nil {
+			absentSourceProgramPaths = absentObjectProgramPaths
+		} else {
+			for pathname, program := range absentObjectProgramPaths {
+				absentSourceProgramPaths[pathname] = program
+			}
+		}
+	}
+	if len(selectedSourceLiteralPrograms) != 0 {
+		var absentLiteralProgramPaths map[string]string
+		inputs, absentLiteralProgramPaths, err = b.compactKbuildSelectedLiteralProgramInputs(
+			inputs, match.profile, selectedSourceLiteralPrograms, executableProgramPaths,
+		)
+		if err != nil {
+			return "", fmt.Errorf("selected source-script executable inputs: %w", err)
+		}
+		if absentSourceProgramPaths == nil {
+			absentSourceProgramPaths = absentLiteralProgramPaths
+		} else {
+			for pathname, program := range absentLiteralProgramPaths {
+				absentSourceProgramPaths[pathname] = program
+			}
 		}
 	}
 	// Stage solving derives object-tree visibility from this exact evaluated
@@ -6266,6 +7614,9 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 		if err != nil {
 			return "", fmt.Errorf("path-sensitive archive closure: %w", err)
 		}
+	}
+	if err := b.requireAbsentSelectedSourceProgramPaths(inputFrontier, absentSourceProgramPaths); err != nil {
+		return "", fmt.Errorf("selected source-script executable inputs: %w", err)
 	}
 	completeWorkingInputUses := compilerDependency != nil &&
 		compactKbuildCompoundWorkingInputUsesComplete(match.profile, target, compilerCommands)
@@ -6304,6 +7655,39 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 	}
 	usedRoles := make([]string, 0, len(refs))
 	script := template
+	// A source-selected bare ld may write a rooted object from an invocation
+	// whose cwd is the source tree. Its early writer proof requires ld in both
+	// possible scopes; bind the chosen action scope explicitly here so a
+	// same-named script applet cannot replace the configured linker on PATH.
+	if b.configuredActionRole(KbuildActionRoleRef{Scope: b.actionScope(), Role: "ld"}) &&
+		compactKbuildLinkerSurvivesSourceScript(sourceTemplate, target) {
+		for _, command := range compoundCommands {
+			if command.program != "ld" || command.sourceStart < 0 || command.sourceEnd > len(sourceTemplate) {
+				continue
+			}
+			segment := sourceTemplate[command.sourceStart:command.sourceEnd]
+			if compactKbuildConfiguredToolWritesRootedObjectTarget(segment, target, func(program string) bool { return program == "ld" }) {
+				usedRoles = append(usedRoles, "ld")
+			}
+		}
+	}
+	archiveSegment, archiveAbsent := compactKbuildArchiveSurvivesSourceScript(sourceTemplate, target)
+	if b.configuredActionRole(KbuildActionRoleRef{Scope: b.actionScope(), Role: "ar"}) && archiveSegment != "" {
+		// A direct source recipe may take the script fallback, leaving
+		// compoundCommands nil. compilerCommands still scans the original
+		// immutable source text and carries offsets into sourceTemplate.
+		for _, command := range compilerCommands {
+			if command.program != "ar" || command.sourceStart < 0 || command.sourceEnd > len(sourceTemplate) {
+				continue
+			}
+			segment := sourceTemplate[command.sourceStart:command.sourceEnd]
+			if segment == archiveSegment && compactKbuildConfiguredArchiveWritesRootedObjectTarget(
+				segment, target, func(program string) bool { return program == "ar" }, archiveAbsent,
+			) {
+				usedRoles = append(usedRoles, "ar")
+			}
+		}
+	}
 	for _, sourceRef := range refs {
 		ref, binding, valid := kbuildActionRoleBinding(sourceRef, b.actionScope())
 		if !valid || !b.configuredActionRole(ref) {
@@ -6361,10 +7745,54 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 	if err != nil {
 		return "", err
 	}
+	if options.PhonyStatus != nil && options.PhonyStatus.ScriptPath != "" {
+		if options.PhonyStatus.ScriptPath != options.PhonyScriptPath ||
+			!strings.HasPrefix(script, "#!/bin/sh\nset -e\n") || !strings.HasSuffix(script, "\n") {
+			return "", fmt.Errorf("selected PHONY source script has no matching projected status line")
+		}
+		options.PhonyStatus.ExpandedLine = strings.TrimSuffix(
+			strings.TrimPrefix(script, "#!/bin/sh\nset -e\n"), "\n",
+		)
+	}
 
 	declaredOutputs, err := b.compactKbuildDeclaredOutputs(target, match)
 	if err != nil {
 		return "", err
+	}
+	if len(options.PhonyPrivateEffects) != 0 {
+		if options.PhonyScriptPath == "" && options.PhonyStatus == nil ||
+			options.PhonyStatus != nil && options.PhonyScriptPath != "" &&
+				options.PhonyStatus.ScriptPath != options.PhonyScriptPath ||
+			len(declaredOutputs) != 1 ||
+			declaredOutputs[0].Path != target || len(sideOutputs) != 0 ||
+			len(compilerOutputs.PersistentOutputs) != 0 || options.Intermediate {
+			return "", fmt.Errorf("selected PHONY private setup has unproven ordinary outputs")
+		}
+		completionSource := options.PhonyScriptPath
+		if options.PhonyStatus != nil {
+			completionSource = options.PhonyStatus.SourcePath
+		}
+		declaredOutputs[0] = ActionPlanOutput{
+			Tree: b.planContext().OutputTree,
+			Path: b.compactKbuildRecipeIntermediateArtifactPath(
+				match.profile, target, 0, "check/"+completionSource+".state",
+			),
+			ObservedPath: target,
+		}
+	}
+	if options.PhonyStatus != nil && len(options.PhonyPrivateEffects) == 0 {
+		if options.PhonyScriptPath != "" && options.PhonyStatus.ScriptPath != options.PhonyScriptPath ||
+			len(declaredOutputs) != 1 || declaredOutputs[0].Path != target ||
+			len(sideOutputs) != 0 || len(compilerOutputs.PersistentOutputs) != 0 || options.Intermediate {
+			return "", fmt.Errorf("selected PHONY Make status has unproven ordinary outputs")
+		}
+		declaredOutputs[0] = ActionPlanOutput{
+			Tree: b.planContext().OutputTree,
+			Path: b.compactKbuildRecipeIntermediateArtifactPath(
+				match.profile, target, 0, "check/"+options.PhonyStatus.SourcePath+".state",
+			),
+			ObservedPath: target,
+		}
 	}
 	persistentOutputs := append(slices.Clone(compilerOutputs.PersistentOutputs), options.CarriedOutputs...)
 	sort.Strings(persistentOutputs)
@@ -6448,6 +7876,14 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 			declaredOutputs[index].ArtifactPath = b.compactKbuildRecipeIntermediateArtifactPath(
 				match.profile, target, len(compoundCommands), declaredOutputs[index].Path,
 			)
+			if options.SourceStageIdentity != "" {
+				original := declaredOutputs[index].ArtifactPath
+				digest := sha256.Sum256([]byte("linux-bzl-kbuild-source-stage-output-v1\x00" +
+					original + "\x00" + options.SourceStageIdentity))
+				declaredOutputs[index].ArtifactPath = path.Join(
+					".linux-bzl-intermediate", hex.EncodeToString(digest[:]), path.Base(original),
+				)
+			}
 		}
 	}
 	kind := "generate"
@@ -6491,6 +7927,20 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 		Environment:        environment,
 		CommandReplays:     commandReplays,
 		CompilerInvocation: compilerDependency,
+	}
+	if splitFinal {
+		recipe.Arguments = append(recipe.Arguments,
+			"-static_source_assignments", "${work:root}/include/config/auto.conf")
+	}
+	if len(options.PhonyPrivateEffects) != 0 {
+		recipe.PrivateWorkingEffects = slices.Clone(options.PhonyPrivateEffects)
+		recipe.RequireAbsentObservedOutput = planOrdinal(0)
+	}
+	if options.PhonyStatus != nil {
+		receipt := *options.PhonyStatus
+		recipe.MakePhonyCompletion = &receipt
+		recipe.RequireAbsentObservedOutput = planOrdinal(0)
+		recipe.RequireUnchangedWorkingTree = len(options.PhonyPrivateEffects) == 0
 	}
 	if compilerProbeDependency != nil {
 		compilerProbeDependency.Environment = maps.Clone(compilerProbeEnvironment)
@@ -6549,6 +7999,10 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 			continue
 		}
 		role := compactKbuildRuleInputEdgeRole(input, "prerequisite")
+		if options.PhonyScriptPath != "" && input.path == options.PhonyScriptPath &&
+			input.sourceID != "" && input.producer == "" {
+			role = "script"
+		}
 		key, err := appendCompactKbuildRecipeInput(&node, &recipe, input, role)
 		if err != nil {
 			return "", err
@@ -6590,6 +8044,20 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 			recipe.ExecutableInputs = append(recipe.ExecutableInputs, key)
 		}
 	}
+	if options.PhonyStatus != nil {
+		if !compactKbuildProfileSourcePathExists(match.profile, options.PhonyStatus.SourcePath) {
+			return "", fmt.Errorf("selected PHONY Makefile %q has no immutable source evidence", options.PhonyStatus.SourcePath)
+		}
+		makefileID, sourceErr := b.metadata.ensureActionPlanSource(b.plan, options.PhonyStatus.SourcePath)
+		if sourceErr != nil {
+			return "", sourceErr
+		}
+		_, sourceErr = appendCompactKbuildRecipeInput(&node, &recipe,
+			compactKbuildRuleInput{path: options.PhonyStatus.SourcePath, sourceID: makefileID}, "makefile")
+		if sourceErr != nil {
+			return "", sourceErr
+		}
+	}
 	for sourceID, name := range immutableSourceEnvironments {
 		if _, bound := recipe.Environment[name]; !bound {
 			return "", fmt.Errorf("immutable source %q has no final recipe source binding", sourceID)
@@ -6602,10 +8070,32 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 		recipe.CompilerInvocation.AuxiliaryWorkingInputUses = slices.Compact(recipe.CompilerInvocation.AuxiliaryWorkingInputUses)
 		recipe.CompilerInvocation.WorkingInputUsesComplete = completeWorkingInputUses
 	}
+	if splitFinal {
+		finalOutputs, err := b.appendCompactKbuildLinkVmlinuxFinalOutputs(analyzedFinal, declaredOutputs, recipe)
+		if err != nil {
+			return "", err
+		}
+		insert := len(declaredOutputs)
+		for index, output := range declaredOutputs {
+			if output.ObservedPath != "" {
+				insert = index
+				break
+			}
+		}
+		declaredOutputs = slices.Insert(declaredOutputs, insert, finalOutputs...)
+		node.Outputs = slices.Insert(node.Outputs, insert, finalOutputs...)
+	}
 	for slot, output := range declaredOutputs {
 		binding := fmt.Sprintf("%08d", slot)
 		recipe.Outputs = append(recipe.Outputs, binding)
-		recipe.WorkingOutputs[binding] = output.Path
+		if output.ObservedPath != "" {
+			if recipe.ObservedOutputs == nil {
+				recipe.ObservedOutputs = map[string]string{}
+			}
+			recipe.ObservedOutputs[binding] = output.ObservedPath
+		} else {
+			recipe.WorkingOutputs[binding] = output.Path
+		}
 	}
 	if err := b.bindCompactKbuildSourceOverlayWorkingTree(match.profile, &recipe); err != nil {
 		return "", fmt.Errorf("source overlay working tree: %w", err)
@@ -6613,7 +8103,7 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 	if err := appendReferencedPlanTrees(b.plan, &node, &recipe, recipe.Arguments...); err != nil {
 		return "", err
 	}
-	producer, err := appendActionPlanNode(b.plan, node, recipe)
+	producer, err := b.appendCompactKbuildSelectedPlanNode(target, node, recipe)
 	if err != nil {
 		return "", err
 	}
@@ -6624,6 +8114,9 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 	}
 	for _, output := range declaredOutputs {
 		b.memo[output.Path] = producer
+	}
+	if len(options.PhonyPrivateEffects) != 0 || options.PhonyStatus != nil {
+		b.memo[target] = producer
 	}
 	return producer, nil
 }
@@ -6713,6 +8206,10 @@ func compactKbuildRecipeExecutionText(value string) string {
 // made from the exact evaluated recipe; no macro names, targets, or compiler
 // families are encoded here.
 func evaluatedKbuildDirectRecipeEffects(target string, match compactKbuildRuleMatch) (action, directorySetup bool, err error) {
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil {
+		return false, false, err
+	}
 	if kbuildDirectFilechkRecipeSupported(match.rule.Recipe) {
 		return true, false, nil
 	}
@@ -6724,7 +8221,7 @@ func evaluatedKbuildDirectRecipeEffects(target string, match compactKbuildRuleMa
 	if err != nil {
 		return false, false, err
 	}
-	for _, raw := range match.rule.Recipe {
+	for recipeIndex, raw := range match.rule.Recipe {
 		if isKbuildRecipeDirectorySetupExpression(raw) {
 			directorySetup = true
 			continue
@@ -6734,18 +8231,30 @@ func evaluatedKbuildDirectRecipeEffects(target string, match compactKbuildRuleMa
 		} else if controlEffect {
 			continue
 		}
+		lineMatch := match
+		if len(snapshots) != 0 {
+			lineMatch.profile = snapshots[recipeIndex].Evaluation.Profile
+		}
 		evaluated, err := evaluateCompactKbuildTextForMakeTarget(
-			match.profile, target, match.lookupTarget, context.target, context.stem,
+			lineMatch.profile, target, match.lookupTarget, context.target, context.stem,
 			context.normal, context.order, injected, raw, true,
 		)
 		if err != nil {
 			return false, false, fmt.Errorf("target %q profile %q evaluates direct recipe %q: %w", target, match.profile.Name, raw, err)
 		}
-		evaluated = compactKbuildDirectRecipeText(match.profile, evaluated)
+		evaluated = compactKbuildDirectRecipeText(lineMatch.profile, evaluated)
 		for _, line := range strings.Split(evaluated, "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || line == ":" || line == "true" {
 				continue
+			}
+			// A bare archiver in an invocation rooted at the source tree is
+			// selected only when its complete shell line proves a rooted archive
+			// writer and the eventual action scope can bind that same ar role.
+			if CompactKbuildProfileConfiguredToolWritesRootedObjectTargetInScript(
+				lineMatch.profile, line, line, target,
+			) {
+				return true, directorySetup, nil
 			}
 			commands, parseErr := parseCompactKbuildRecipe(line, context)
 			if parseErr != nil {
@@ -6753,12 +8262,26 @@ func evaluatedKbuildDirectRecipeEffects(target string, match compactKbuildRuleMa
 				// preserve shell structure through the hermetic script fallback.
 				return true, directorySetup, nil
 			}
-			lineAction, lineDirectory, effectsErr := evaluatedKbuildParsedRecipeEffects(target, match, commands)
+			lineAction, lineDirectory, effectsErr := evaluatedKbuildParsedRecipeEffects(target, lineMatch, commands)
 			if effectsErr != nil {
 				return false, false, effectsErr
 			}
 			directorySetup = directorySetup || lineDirectory
 			if lineAction {
+				return true, directorySetup, nil
+			}
+			// A selected direct source script can report failure without
+			// naming a writable output. Preserve that executable source
+			// provenance in rule selection; final lowering decides whether
+			// the selected target owns a file or only a check completion.
+			scripts, scriptsErr := readCompactKbuildCommandSourceScriptsForMakeTarget(
+				lineMatch.profile, target, match.lookupTarget, context.target, context.stem,
+				context.normal, context.order, injected, line, true,
+			)
+			if scriptsErr != nil {
+				return false, false, scriptsErr
+			}
+			if len(scripts) != 0 {
 				return true, directorySetup, nil
 			}
 		}
@@ -6872,12 +8395,110 @@ func (b *compactKbuildRulePlanBuilder) buildDirectRecipe(
 	return b.buildGenericDirectRecipe(target, match, inputs)
 }
 
+// A PHONY setup can mix a direct shell line with a source-selected cmd_<name>
+// expansion. Inspect every frozen line before either command dispatch path
+// combines them; differing line-local reads must remain bound to their exact
+// source views, and the PHONY goal never becomes a physical output.
+func (b *compactKbuildRulePlanBuilder) buildSelectedPhonyPrivateSetup(
+	target string, match compactKbuildRuleMatch, inputs []compactKbuildRuleInput,
+) (string, bool, error) {
+	if !b.selectionBound || b.selectionGraph == nil ||
+		!b.selectionGraph.compactKbuildProfileTargetIsPhony(match.profile, target) ||
+		len(match.rule.Recipe) != 4 {
+		return "", false, nil
+	}
+	match, err := compactKbuildSelectedRuleEntryMatch(target, match)
+	if err != nil {
+		return "", false, err
+	}
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil || len(snapshots) != 4 {
+		return "", false, err
+	}
+	injected, err := compactKbuildSourceScriptInjectionsForRuleTarget(target, match, inputs)
+	if err != nil {
+		return "", false, err
+	}
+	injected = compactKbuildActionTreeInjections(injected)
+	automatic, err := compactKbuildRuleRootedAutomaticEvaluationContext(target, match, inputs, injected)
+	if err != nil {
+		return "", false, err
+	}
+	lines := make([]string, 0, len(match.rule.Recipe))
+	rootedLines := make([]string, 0, len(match.rule.Recipe))
+	for index, raw := range match.rule.Recipe {
+		if snapshots[index] == nil {
+			return "", false, nil
+		}
+		line := match
+		line.profile = snapshots[index].Evaluation.Profile
+		actual, err := evaluateCompactKbuildTextForMakeTarget(
+			line.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+			automatic.normal, automatic.order, injected, raw, true,
+		)
+		if err != nil {
+			return "", false, fmt.Errorf("selected PHONY private setup line %d: %w", index, err)
+		}
+		rooted, err := compactKbuildRootedActionDirectRecipeText(line.profile, actual)
+		if err != nil {
+			return "", false, err
+		}
+		rootedLines = append(rootedLines, rooted)
+		lines = append(lines, compactKbuildFinalizeRootedActionRecipeText(rooted))
+	}
+	effects, scriptPath, proved, err := compactKbuildSelectedPhonyPrivateSetup(
+		target, match, lines, snapshots, automatic, injected,
+	)
+	if err != nil || !proved {
+		return "", false, err
+	}
+	applets, err := compactKbuildScriptRuntimeApplets(b.metadata.actionRoles, b.actionScope())
+	if err != nil {
+		return "", false, err
+	}
+	for _, applet := range applets {
+		if slices.Contains([]string{"[", "cat", "echo", "false", "ln", "sh", "test"}, applet.name) {
+			return "", false, fmt.Errorf("selected PHONY private setup has unbounded %q script applet", applet.name)
+		}
+	}
+	if err := compactKbuildSelectedPhonyPrivateLineFrontiers(target, match, snapshots, effects); err != nil {
+		return "", false, err
+	}
+	inputs, err = b.compactKbuildSelectedReadInputs(target, match, inputs)
+	if err != nil {
+		return "", false, err
+	}
+	first := match
+	first.profile = snapshots[0].Evaluation.Profile
+	first.selectedRecipeSnapshot = snapshots[0]
+	var completion *ActionRecipeMakePhonyCompletion
+	if scriptPath == "" {
+		completion = &ActionRecipeMakePhonyCompletion{
+			Profile: match.profile.Name, Target: target, SourcePath: match.profile.Path,
+			RuleIndex: match.ruleOrder, RecipeIndex: 0,
+			ExpandedLines: slices.Clone(lines),
+		}
+	}
+	producer, err := b.buildHermeticKbuildScriptContext(
+		target, first, inputs, compactKbuildRecipeLineShells(rootedLines), nil, nil,
+		compactKbuildHermeticScriptOptions{
+			PhonyPrivateEffects: effects, PhonyScriptPath: scriptPath,
+			PhonyStatus: completion,
+		},
+	)
+	return producer, true, err
+}
+
 func (b *compactKbuildRulePlanBuilder) buildGenericDirectRecipe(
 	target string,
 	match compactKbuildRuleMatch,
 	inputs []compactKbuildRuleInput,
 ) (string, error) {
-	injected, err := compactKbuildSourceScriptInjectionsForRuleTarget(target, match, inputs)
+	entryMatch, err := compactKbuildSelectedRuleEntryMatch(target, match)
+	if err != nil {
+		return "", err
+	}
+	injected, err := compactKbuildSourceScriptInjectionsForRuleTarget(target, entryMatch, inputs)
 	if err != nil {
 		return "", err
 	}
@@ -6888,7 +8509,12 @@ func (b *compactKbuildRulePlanBuilder) buildGenericDirectRecipe(
 	}
 	rootedLines := make([]string, 0, len(match.rule.Recipe))
 	actualLines := make([]string, 0, len(match.rule.Recipe))
-	for _, raw := range match.rule.Recipe {
+	actualLineIndices := make([]int, 0, len(match.rule.Recipe))
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil {
+		return "", err
+	}
+	for index, raw := range match.rule.Recipe {
 		if isKbuildRecipeDirectorySetupExpression(raw) {
 			continue
 		}
@@ -6900,8 +8526,12 @@ func (b *compactKbuildRulePlanBuilder) buildGenericDirectRecipe(
 			// semantically invalid.
 			continue
 		}
+		lineProfile := match.profile
+		if snapshot := snapshots[index]; snapshot != nil {
+			lineProfile = snapshot.Evaluation.Profile
+		}
 		actual, err := evaluateCompactKbuildTextForMakeTarget(
-			match.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+			lineProfile, target, match.lookupTarget, automatic.target, automatic.stem,
 			automatic.normal, automatic.order, injected, raw, true,
 		)
 		if err != nil {
@@ -6913,6 +8543,115 @@ func (b *compactKbuildRulePlanBuilder) buildGenericDirectRecipe(
 		}
 		rootedLines = append(rootedLines, rooted)
 		actualLines = append(actualLines, compactKbuildFinalizeRootedActionRecipeText(rooted))
+		actualLineIndices = append(actualLineIndices, index)
+	}
+	// An independently selected directory setup (or a Make conditional which
+	// proved pure and expanded to no command) has no action result. Prove that
+	// entire first line before attaching read inputs; the following writer
+	// must observe its own frozen file frontier and exported environment.
+	if compactKbuildRejectTargetWideLineReads(target, match, snapshots) != nil {
+		active, activeLine, proven, proofErr := compactKbuildSelectedOutputParentSetupOccurrences(
+			target, match, rootedLines, actualLineIndices, snapshots, automatic, injected,
+		)
+		if proofErr != nil {
+			return "", proofErr
+		}
+		if proven {
+			activeSnapshot := snapshots[activeLine]
+			match.profile = activeSnapshot.Evaluation.Profile
+			match.selectedRecipeSnapshot = activeSnapshot
+			selectLines := func(lines []string) []string {
+				selected := make([]string, 0, len(active))
+				for _, ordinal := range active {
+					selected = append(selected, lines[ordinal])
+				}
+				return selected
+			}
+			rootedLines = selectLines(rootedLines)
+			actualLines = selectLines(actualLines)
+			actualLineIndices = make([]int, len(active))
+			for index := range actualLineIndices {
+				actualLineIndices[index] = activeLine
+			}
+			snapshots = map[int]*KbuildSelectedControlRecipeSnapshot{activeLine: activeSnapshot}
+		}
+	}
+	if b.selectionBound && b.selectionGraph != nil &&
+		b.selectionGraph.compactKbuildProfileTargetIsPhony(match.profile, target) {
+		if len(match.rule.Recipe) > 1 {
+			for ordinal, actual := range actualLines {
+				lineProfile := match.profile
+				if snapshot := snapshots[actualLineIndices[ordinal]]; snapshot != nil {
+					lineProfile = snapshot.Evaluation.Profile
+				}
+				scripts, scriptErr := readCompactKbuildCommandSourceScriptsForMakeTarget(
+					lineProfile, target, match.lookupTarget, automatic.target, automatic.stem,
+					automatic.normal, automatic.order, injected,
+					compactKbuildDirectRecipeText(lineProfile, actual), true,
+				)
+				if scriptErr != nil {
+					return "", scriptErr
+				}
+				if len(scripts) != 0 {
+					return "", fmt.Errorf("selected multiline PHONY source script has unbounded private effects in recipe %d", actualLineIndices[ordinal])
+				}
+			}
+		}
+	}
+	if frontierErr := compactKbuildRejectTargetWideLineReads(target, match, snapshots); frontierErr != nil {
+		if producer, selected, err := b.buildSelectedDirectFilechkCleanup(
+			target, match, inputs, rootedLines, actualLines, actualLineIndices, snapshots, automatic,
+		); selected || err != nil {
+			return producer, err
+		}
+	}
+	inputs, err = b.compactKbuildSelectedReadInputs(target, match, inputs)
+	if err != nil {
+		return "", err
+	}
+	if frontierErr := compactKbuildRejectTargetWideLineReads(target, match, snapshots); frontierErr != nil {
+		if len(actualLineIndices) == 0 {
+			return "", frontierErr
+		}
+		// A transparent linear source recipe has an artifact boundary after
+		// each command. Preserve each line's read owner and its local writer
+		// through that existing command DAG. A compound shell shares one cwd
+		// and cannot execute two incompatible Make frontiers.
+		lineCommands := []compactKbuildRecipeCommand{}
+		lineCommandIndices := []int{}
+		for ordinal, actual := range actualLines {
+			parsed, parseErr := parseCompactKbuildRecipe(actual, automatic)
+			if parseErr != nil || compactKbuildRecipeHasPipeline(parsed) ||
+				compactKbuildRecipeHasRecursiveMake(parsed) ||
+				compactKbuildContainsProtectedLiteralActionMarker(rootedLines[ordinal]) {
+				return "", fmt.Errorf("direct recipe source line %d requires atomic shell execution: %w",
+					actualLineIndices[ordinal], frontierErr)
+			}
+			lineCommands = append(lineCommands, parsed...)
+			for range parsed {
+				lineCommandIndices = append(lineCommandIndices, actualLineIndices[ordinal])
+			}
+		}
+		atomic, atomicErr := compactKbuildRecipeRequiresAtomicExecution(target, match, lineCommands)
+		if atomicErr != nil || atomic {
+			return "", fmt.Errorf("direct recipe commands require one atomic action: %w", frontierErr)
+		}
+		match.commandRecipeIndices = lineCommandIndices
+		match.recipeLineValues = map[int]map[string]string{}
+		for _, index := range actualLineIndices {
+			lineMatch := match
+			lineMatch.profile = snapshots[index].Evaluation.Profile
+			match.recipeLineValues[index], err = evaluateCompactKbuildRuleVariablesRooted(
+				target, lineMatch, inputs, injected, "target-stem", "CONFIG_SHELL",
+			)
+			if err != nil {
+				return "", fmt.Errorf("%s: Kbuild target %q recipe %d direct variables: %w",
+					match.profile.Rules[match.ruleOrder].Position, target, index, err)
+			}
+		}
+		return b.appendCompactKbuildRecipe(
+			target, match, inputs, match.recipeLineValues[actualLineIndices[0]], lineCommands,
+		)
 	}
 	template := strings.TrimSpace(strings.Join(actualLines, "\n"))
 	rootedTemplate := strings.TrimSpace(strings.Join(rootedLines, "\n"))
@@ -6933,6 +8672,29 @@ func (b *compactKbuildRulePlanBuilder) buildGenericDirectRecipe(
 		return b.buildHermeticKbuildCompoundWithSideEffects(
 			target, match, inputs, compactKbuildRecipeLineShells(rootedLines), commands, sideEffectCommands,
 		)
+	}
+	if parseErr == nil && len(commands) == 1 && b.selectionBound && b.selectionGraph != nil &&
+		b.selectionGraph.compactKbuildProfileTargetIsPhony(match.profile, target) {
+		// A direct PHONY source script has its own failure status even though
+		// GNU Make does not require a file named after the target. Route only
+		// that exact selected invocation through the typed source runner;
+		// unrelated recursive-Make and shell-control goals keep their usual
+		// closure handling.
+		values, variablesErr := evaluateCompactKbuildRuleVariablesRooted(
+			target, match, inputs, injected, "CONFIG_SHELL",
+		)
+		if variablesErr != nil {
+			return "", variablesErr
+		}
+		_, sourceScript, sourceErr := compactKbuildSourceScriptCommandWithSourceArguments(
+			match.profile, commands[0], commands[0].arguments, values, b.actionScope(), b.metadata.actionRoles,
+		)
+		if sourceErr != nil {
+			return "", sourceErr
+		}
+		if sourceScript {
+			return b.appendCompactKbuildRecipe(target, match, inputs, values, commands)
+		}
 	}
 	if parseErr != nil {
 		compound := compactKbuildRecipeLineShells(rootedLines)
@@ -6957,6 +8719,834 @@ func (b *compactKbuildRulePlanBuilder) buildGenericDirectRecipe(
 		}
 	}
 	return b.buildHermeticKbuildScript(target, match, inputs, rootedTemplate)
+}
+
+// A PHONY preparation rule can create private convenience paths while its
+// actual target remains absent. Authenticate the selected shell commands and
+// the immutable source-script writer before granting each private path. The
+// runner checks the complete tree delta and exact symlink destination; no
+// granted path is published as an implicit generated input.
+func compactKbuildSelectedPhonyPrivateLineFrontiers(
+	target string, match compactKbuildRuleMatch,
+	snapshots map[int]*KbuildSelectedControlRecipeSnapshot,
+	effects []ActionRecipePrivateWorkingEffect,
+) error {
+	if match.capturedEnvironment != nil || len(snapshots) != len(match.rule.Recipe) {
+		return fmt.Errorf("selected PHONY private setup has no complete line-local environment")
+	}
+	var first *KbuildSelectedControlRecipeSnapshot
+	reads := map[string]KbuildControlRecipeRead{}
+	for index := range match.rule.Recipe {
+		snapshot := snapshots[index]
+		if snapshot == nil || snapshot.Line.RecipeIndex != index {
+			return fmt.Errorf("selected PHONY private setup recipe %d has no exact frozen source line", index)
+		}
+		if first == nil {
+			first = snapshot
+		} else if first.CommandShell != snapshot.CommandShell ||
+			!maps.Equal(first.Environment, snapshot.Environment) {
+			return fmt.Errorf("selected PHONY private setup recipe %d changes exported environment or command shell", index)
+		}
+		for _, read := range snapshot.Reads() {
+			if earlier, ok := reads[read.Path]; ok && earlier != read {
+				return fmt.Errorf("selected PHONY private setup recipe %d changes exact read %q across lines", index, read.Path)
+			}
+			reads[read.Path] = read
+			objectPath, objectRead := strings.CutPrefix(read.Path, "__LINUX_BZL_OBJECT_TREE__/")
+			if !objectRead {
+				continue
+			}
+			for writerIndex, effect := range effects {
+				// The selected commands create the symlink on line 1, the
+				// wrapper on line 2, and the optional ignore file on line 3.
+				if effect.Kind == "symlink" {
+					writerIndex = 1
+				} else if effect.PreserveExisting {
+					writerIndex = 3
+				} else {
+					writerIndex = 2
+				}
+				if index > writerIndex && (objectPath == effect.Path ||
+					strings.HasPrefix(objectPath, effect.Path+"/") ||
+					read.Wildcard && (strings.ContainsAny(objectPath, "*?[") ||
+						objectPath == path.Dir(effect.Path))) {
+					return fmt.Errorf("selected PHONY private setup recipe %d reads prior private writer %q", index, read.Path)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func compactKbuildSelectedPhonyPrivateSetup(
+	target string,
+	match compactKbuildRuleMatch,
+	lines []string,
+	snapshots map[int]*KbuildSelectedControlRecipeSnapshot,
+	automatic compactKbuildAutomaticContext,
+	injected map[string]string,
+) ([]ActionRecipePrivateWorkingEffect, string, bool, error) {
+	if len(lines) != 4 || len(match.rule.Recipe) != 4 || len(snapshots) != 4 ||
+		compactKbuildRuleHasGroupedOutputs(match.rule) {
+		return nil, "", false, nil
+	}
+	for index, raw := range match.rule.Recipe {
+		snapshot := snapshots[index]
+		if snapshot == nil {
+			return nil, "", false, nil
+		}
+		lineMatch := match
+		lineMatch.profile = snapshot.Evaluation.Profile
+		pure, err := compactKbuildSelectedRecipeSourceExpansionIsPure(target, lineMatch, raw, automatic, injected)
+		if err != nil {
+			return nil, "", false, fmt.Errorf("selected PHONY private setup recipe %d Make expansion: %w", index, err)
+		}
+		if !pure {
+			return nil, "", false, nil
+		}
+	}
+	lineProfile := snapshots[2].Evaluation.Profile
+	scripts, err := readCompactKbuildCommandSourceScriptsForMakeTarget(
+		lineProfile, target, match.lookupTarget, automatic.target, automatic.stem,
+		automatic.normal, automatic.order, injected,
+		compactKbuildDirectRecipeText(lineProfile, lines[2]), true,
+	)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if len(scripts) == 0 {
+		effects, proved := compactKbuildPhonyPrivateInlineEffects(target, lines)
+		if !proved {
+			return nil, "", false, nil
+		}
+		// The optional file is a shell read before the last selected line. Bind
+		// either its prior bytes or its exact absence to that frozen frontier.
+		if snapshots[3].view == nil {
+			return nil, "", false, fmt.Errorf("selected PHONY private setup has no last-line object-tree view")
+		}
+		for _, effect := range effects {
+			if !effect.PreserveExisting {
+				continue
+			}
+			if _, _, _, err := snapshots[3].view.Read("__LINUX_BZL_OBJECT_TREE__/" + effect.Path); err != nil {
+				return nil, "", false, fmt.Errorf("selected PHONY private setup optional file %q: %w", effect.Path, err)
+			}
+		}
+		return effects, "", true, nil
+	}
+	if len(scripts) != 1 {
+		return nil, "", false, nil
+	}
+	if !compactKbuildPhonyPrivateCleanSourceGuard(lines[0]) {
+		return nil, "", false, nil
+	}
+	link, err := parseCompactKbuildRecipe(lines[1], automatic)
+	if err != nil || len(link) != 1 || link[0].program != "ln" ||
+		len(link[0].arguments) != 3 || link[0].arguments[0] != "-fsn" ||
+		link[0].arguments[1] != "${tree:kernel}" ||
+		len(link[0].environment) != 0 || link[0].stdin != "" ||
+		link[0].stdout != "" || link[0].connector != "" ||
+		link[0].programEnd != 0 || link[0].argumentTokens != nil {
+		return nil, "", false, nil
+	}
+	alias, valid := compactKbuildRecipePath(link[0].arguments[2])
+	if !valid || alias == "" || alias != path.Base(alias) || alias == target {
+		return nil, "", false, nil
+	}
+	writer := "Makefile"
+	if !compactKbuildPhonyPrivateMakefileScript(scripts[0].Content) {
+		return nil, "", false, nil
+	}
+	command, err := parseCompactKbuildRecipe(lines[2], automatic)
+	if err != nil || len(command) != 1 || command[0].program != "sh" ||
+		len(command[0].arguments) != 2 ||
+		command[0].arguments[0] != "${tree:kernel}/"+scripts[0].Path ||
+		command[0].arguments[1] != "${tree:kernel}" ||
+		len(command[0].environment) != 0 || command[0].stdin != "" ||
+		command[0].stdout != "" || command[0].connector != "" ||
+		command[0].programEnd != 0 || command[0].argumentTokens != nil {
+		return nil, "", false, nil
+	}
+	scriptPath := scripts[0].Path
+	optionalPath, valid := compactKbuildPhonyPrivateOptionalWriter(lines[3], automatic)
+	if !valid ||
+		alias == writer || alias == optionalPath {
+		return nil, "", false, nil
+	}
+	// test -e inspects the object-tree state before the last shell line. It is
+	// a shell read, so the Make expansion log does not capture it on its own.
+	// Record the exact frozen view here: a prior .gitignore must be staged and
+	// kept byte-identical, while absence must remain tied to this frontier.
+	if snapshots[3].view == nil {
+		return nil, "", false, fmt.Errorf("selected PHONY private setup has no last-line object-tree view")
+	}
+	if _, _, _, err := snapshots[3].view.Read("__LINUX_BZL_OBJECT_TREE__/" + optionalPath); err != nil {
+		return nil, "", false, fmt.Errorf("selected PHONY private setup optional file %q: %w", optionalPath, err)
+	}
+	effects := []ActionRecipePrivateWorkingEffect{
+		{Path: alias, Kind: "symlink", Tree: "kernel", Required: true},
+		{Path: writer, Kind: "regular", Required: true},
+		{Path: optionalPath, Kind: "regular", PreserveExisting: true},
+	}
+	sort.Slice(effects, func(i, j int) bool { return effects[i].Path < effects[j].Path })
+	return effects, scriptPath, true, nil
+}
+
+// An inline private writer may print source-derived text, but every inner
+// command must be a literal echo. Merely finding a top-level redirect is not
+// enough: another command inside the group could write an undeclared file.
+func compactKbuildPhonyPrivateLiteralEchoes(value string, automatic compactKbuildAutomaticContext) bool {
+	tokens, err := lexCompactKbuildRecipe(value)
+	if err != nil || len(tokens) == 0 {
+		return false
+	}
+	commandStart, echoes := true, 0
+	for _, token := range tokens {
+		if token.operator {
+			if token.value != ";" || commandStart {
+				return false
+			}
+			commandStart = true
+			continue
+		}
+		if commandStart {
+			if !compactKbuildSourceTokenIsExactUnquotedWord(value, token, "echo") {
+				return false
+			}
+			echoes++
+			commandStart = false
+		}
+	}
+	// Literal-filechk evaluates cooked arguments while retaining quote
+	// provenance: single-quoted dollar syntax is data, whereas shell-active
+	// command substitutions and parameter expansions decline this proof.
+	protected := strings.ReplaceAll(value, "${tree:kernel}", "SOURCE_TREE")
+	lines, literal, err := parseCompactKbuildLiteralFilechk(protected, automatic)
+	return echoes > 0 && err == nil && literal && len(lines) == echoes
+}
+
+func compactKbuildPhonyPrivateLiteralGroupWriter(value string, automatic compactKbuildAutomaticContext) (string, bool) {
+	command, found := compactKbuildStaticShellGroupOutput(value, automatic)
+	if !found || command.stdout == "" {
+		return "", false
+	}
+	tokens, err := lexCompactKbuildRecipe(value)
+	if err != nil || len(tokens) < 4 || tokens[0].value != "{" || tokens[0].operator {
+		return "", false
+	}
+	closing, found := compactKbuildShellGroupClosingToken(value, tokens)
+	if !found || closing >= len(tokens) || tokens[closing].value != "}" ||
+		!tokens[closing+1].operator || tokens[closing+1].value != ">" {
+		return "", false
+	}
+	// The immutable source tree marker is substituted by action binding before
+	// the shell starts; it is data in a quoted echo argument, not an ambient
+	// shell parameter or command substitution.
+	body := value[tokens[0].end:tokens[closing].start]
+	if !compactKbuildPhonyPrivateLiteralEchoes(body, automatic) {
+		return "", false
+	}
+	return command.stdout, true
+}
+
+func compactKbuildPhonyPrivateInlineWriter(value string, automatic compactKbuildAutomaticContext) (string, bool) {
+	units, found := compactKbuildTopLevelSemicolonUnits(value)
+	if !found || len(units) == 0 {
+		return "", false
+	}
+	writer := ""
+	for index, unit := range units {
+		if unit.conditional {
+			return "", false
+		}
+		if index == 0 && strings.TrimSpace(unit.value) == "set -e" {
+			continue
+		}
+		if output, literal := compactKbuildPhonyPrivateLiteralGroupWriter(unit.value, automatic); literal {
+			if writer != "" || index != len(units)-1 {
+				return "", false
+			}
+			writer = output
+			continue
+		}
+		if writer != "" {
+			return "", false
+		}
+		if !compactKbuildPhonyPrivateLiteralEchoes(unit.value, automatic) {
+			return "", false
+		}
+	}
+	return writer, writer != "" && writer == path.Base(writer)
+}
+
+func compactKbuildPhonyPrivateOptionalWriter(value string, automatic compactKbuildAutomaticContext) (string, bool) {
+	tokens, err := lexCompactKbuildRecipe(value)
+	if err != nil || len(tokens) < 8 || tokens[0].value != "test" || tokens[1].value != "-e" ||
+		tokens[2].operator || !tokens[3].operator || tokens[3].value != "||" {
+		return "", false
+	}
+	checked, valid := compactKbuildStaticShellOutputPath(tokens[2], automatic)
+	if !valid || checked == "" || checked != path.Base(checked) {
+		return "", false
+	}
+	output, literal := compactKbuildPhonyPrivateLiteralGroupWriter(value[tokens[4].start:], automatic)
+	return checked, literal && checked == output
+}
+
+// This parser is also applied to the persisted receipt. No target name or
+// writer basename is trusted: the selected shell lines must account for each
+// private path, and the runner checks exactly these effects after execution.
+func compactKbuildPhonyPrivateInlineEffects(target string, lines []string) ([]ActionRecipePrivateWorkingEffect, bool) {
+	if len(lines) != 4 || !compactKbuildPhonyPrivateCleanSourceGuard(lines[0]) {
+		return nil, false
+	}
+	automatic := compactKbuildAutomaticContext{}
+	link, err := parseCompactKbuildRecipe(lines[1], automatic)
+	if err != nil || len(link) != 1 || link[0].program != "ln" ||
+		len(link[0].arguments) != 3 || link[0].arguments[0] != "-fsn" ||
+		link[0].arguments[1] != "${tree:kernel}" ||
+		len(link[0].environment) != 0 || link[0].stdin != "" ||
+		link[0].stdout != "" || link[0].connector != "" ||
+		link[0].programEnd != 0 || link[0].argumentTokens != nil {
+		return nil, false
+	}
+	alias, ok := compactKbuildRecipePath(link[0].arguments[2])
+	if !ok || alias == "" || alias != path.Base(alias) || alias == target {
+		return nil, false
+	}
+	writer, ok := compactKbuildPhonyPrivateInlineWriter(lines[2], automatic)
+	if !ok || writer == target {
+		return nil, false
+	}
+	optional, ok := compactKbuildPhonyPrivateOptionalWriter(lines[3], automatic)
+	if !ok || optional == target || alias == writer || alias == optional || writer == optional {
+		return nil, false
+	}
+	effects := []ActionRecipePrivateWorkingEffect{
+		{Path: alias, Kind: "symlink", Tree: "kernel", Required: true},
+		{Path: writer, Kind: "regular", Required: true},
+		{Path: optional, Kind: "regular", PreserveExisting: true},
+	}
+	sort.Slice(effects, func(i, j int) bool { return effects[i].Path < effects[j].Path })
+	return effects, true
+}
+
+func compactKbuildPhonyPrivateCleanSourceGuard(value string) bool {
+	value = strings.ReplaceAll(value, "\\\n", " ")
+	value = strings.Join(strings.Fields(value), " ")
+	const prefix = "if [ -f ${tree:kernel}/.config -o -d ${tree:kernel}/include/config -o -d ${tree:kernel}/arch/"
+	if !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	archAndRest := strings.TrimPrefix(value, prefix)
+	arch, rest, ok := strings.Cut(archAndRest, "/include/generated ]; then ")
+	if !ok || arch == "" || strings.ContainsAny(arch, "/\\*?[]$`'\" ;&|") ||
+		!strings.HasSuffix(rest, "; fi") {
+		return false
+	}
+	parts := strings.Split(strings.TrimSuffix(rest, "; fi"), ";")
+	if len(parts) < 2 || len(parts) > 8 || strings.TrimSpace(parts[len(parts)-1]) != "false" {
+		return false
+	}
+	for _, echo := range parts[:len(parts)-1] {
+		echo = strings.TrimSpace(echo)
+		message, ok := strings.CutPrefix(echo, "echo >&2 \"")
+		message = strings.TrimSuffix(message, "\"")
+		message = strings.ReplaceAll(message, "${tree:kernel}", "SOURCE")
+		if !ok || !strings.HasSuffix(echo, "\"") ||
+			strings.ContainsAny(message, "\\\"$`\n\r") {
+			return false
+		}
+	}
+	return true
+}
+
+func compactKbuildPhonyPrivateMakefileScript(content string) bool {
+	lines := []string{}
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || len(lines) == 0 && strings.HasPrefix(line, "#") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return slices.Equal(lines, []string{
+		`if [ "${quiet}" != "silent_" ]; then`,
+		`echo "  GEN     Makefile"`,
+		"fi",
+		"cat << EOF > Makefile",
+		"# Automatically generated by $0: don't edit",
+		"include $1/Makefile",
+		"EOF",
+	})
+}
+
+// The selected filechk wrapper is one source-owned shell line. Its output
+// frontier is closed only when the whole wrapper has the bounded temp-file,
+// compare, rename shape and the nested filechk body emits literal stdout.
+// Checking just a side-output projection would discard conditional writes.
+func compactKbuildSelectedFilechkWrapperBytes(
+	value, body, target string, automatic compactKbuildAutomaticContext, transientOutput *string,
+) (string, string) {
+	// The generic action combines Make's separate recipe shells as exact
+	// subshells. This source line owns the whole subshell, so remove only its
+	// outer parentheses while checking its internal write effects.
+	if !strings.HasPrefix(value, "(\n") || !strings.HasSuffix(value, "\n)") {
+		return "", "filechk source line is not one selected shell"
+	}
+	value = strings.TrimSuffix(strings.TrimPrefix(value, "(\n"), "\n)")
+	targetWord := automatic.target
+	if targetWord == "" {
+		return "", "filechk source target has no rooted automatic word"
+	}
+	lines, literal, err := parseCompactKbuildLiteralFilechk(body, automatic)
+	if err != nil || !literal {
+		return "", "filechk body has unproven effects"
+	}
+	for _, line := range lines {
+		// This wrapper runs shell echo. Its treatment of backslashes is not
+		// byte-exact even if the actionfile literal parser accepts the argv.
+		if strings.ContainsRune(line, '\\') {
+			return "", "filechk echo text has unproven byte semantics"
+		}
+	}
+	units, ok := compactKbuildTopLevelSemicolonUnits(value)
+	if !ok || len(units) != 5 {
+		return "", fmt.Sprintf("wrapper has %d unproven command units (lexical closure %t)", len(units), ok)
+	}
+	command := func(unit compactKbuildTopLevelListUnit, program string, arguments ...string) bool {
+		if unit.conditional {
+			return false
+		}
+		parsed, parseErr := parseCompactKbuildRecipe(unit.value, automatic)
+		if parseErr != nil || len(parsed) != 1 || parsed[0].program != program ||
+			!slices.Equal(parsed[0].arguments, arguments) || len(parsed[0].environment) != 0 ||
+			parsed[0].stdin != "" || parsed[0].stdout != "" || parsed[0].connector != "" {
+			return false
+		}
+		return true
+	}
+	if !command(units[0], "set", "-e") || !command(units[1], "mkdir", "-p", path.Dir(targetWord)+"/") {
+		return "", "wrapper setup differs from the target parent"
+	}
+	group := units[3].value
+	tokens, lexErr := lexCompactKbuildRecipe(group)
+	if lexErr != nil {
+		return "", "filechk output group has unreadable shell syntax"
+	}
+	for len(tokens) != 0 && tokens[len(tokens)-1].operator && tokens[len(tokens)-1].value == ";" {
+		tokens = tokens[:len(tokens)-1]
+	}
+	closing, closed := compactKbuildShellGroupClosingToken(group, tokens)
+	if !closed || closing != len(tokens)-3 ||
+		!tokens[closing+1].operator || tokens[closing+1].value != ">" || tokens[closing+2].operator {
+		return "", "filechk output group writes an unproven path"
+	}
+	temp := tokens[closing+2].value
+	tempPath, validTemp := strings.CutPrefix(temp, compactKbuildActionObjectTreeMarker+"/")
+	if !validTemp {
+		tempPath, validTemp = compactKbuildRecipePath(temp)
+	}
+	tempPath = canonicalKbuildRulePath(tempPath)
+	if !validTemp || !strings.HasSuffix(tempPath, ".tmp") ||
+		path.Dir(tempPath) != path.Dir(target) || tempPath == target {
+		return "", "filechk temporary output is outside the target parent"
+	}
+	groupBody := strings.TrimSpace(group[tokens[0].end:tokens[closing].start])
+	groupBody = strings.TrimSpace(strings.TrimSuffix(groupBody, ";"))
+	groupLines, pureGroup, groupErr := parseCompactKbuildLiteralFilechk(groupBody, automatic)
+	if groupErr != nil || !pureGroup || !slices.Equal(groupLines, lines) ||
+		!command(units[2], "trap", "rm -f "+temp, "EXIT") {
+		return "", "filechk group or temporary cleanup has unproven effects"
+	}
+	// Parse every source word in the conditional branch. A tool that writes a
+	// second path, a nested expansion, or a shell connector cannot masquerade
+	// as an incremental timestamp check.
+	branch, branchErr := lexCompactKbuildRecipe(units[4].value)
+	if branchErr != nil || !units[4].conditional {
+		return "", "filechk compare/rename has unreadable shell syntax"
+	}
+	index := 0
+	match := func(word string, operator bool) bool {
+		if index >= len(branch) || branch[index].operator != operator || branch[index].value != word {
+			return false
+		}
+		index++
+		return true
+	}
+	for _, word := range []struct {
+		value    string
+		operator bool
+	}{
+		{"if", false}, {"[", false}, {"!", false}, {"-r", false},
+		{targetWord, false}, {"]", false}, {"||", true}, {"!", false},
+		{"cmp", false}, {"-s", false}, {targetWord, false}, {temp, false},
+		{";", true}, {"then", false},
+	} {
+		if !match(word.value, word.operator) {
+			return "", "filechk compare reads unproven paths"
+		}
+	}
+	if match("echo", false) {
+		if index >= len(branch) || branch[index].operator || branch[index].shellExpansion ||
+			branch[index].pathnameExpansion || strings.ContainsAny(branch[index].value, "$`\\") {
+			return "", "filechk status command has active shell syntax"
+		}
+		index++
+		if !match(";", true) {
+			return "", "filechk status command is not isolated"
+		}
+	}
+	for _, word := range []struct {
+		value    string
+		operator bool
+	}{
+		{"mv", false}, {"-f", false}, {temp, false}, {targetWord, false},
+		{";", true}, {"fi", false},
+	} {
+		if !match(word.value, word.operator) {
+			return "", "filechk rename writes an unproven path"
+		}
+	}
+	if index != len(branch) {
+		return "", "filechk compare/rename has extra commands"
+	}
+	if transientOutput != nil {
+		*transientOutput = tempPath
+	}
+	return strings.Join(lines, "\n") + "\n", ""
+}
+
+// The authenticated filechk group opens exactly one temporary output. Its
+// source-selected compare/rename and EXIT trap consume that file before this
+// Make recipe line completes. Preserve every other projected command while
+// removing only that exact transient group output from the action contract.
+func compactKbuildSelectedFilechkSurvivingEffects(
+	profile CompactKbuildProfile, transient string,
+	projected []compactKbuildRecipeCommand,
+) ([]compactKbuildRecipeCommand, error) {
+	surviving := make([]compactKbuildRecipeCommand, 0, len(projected))
+	removed := 0
+	for _, command := range projected {
+		if command.program != ":" || command.stdout == "" {
+			surviving = append(surviving, command)
+			continue
+		}
+		output, ok := compactKbuildRecipePath(command.stdout)
+		if !ok {
+			return nil, fmt.Errorf("filechk projects an invalid shell group output")
+		}
+		if !command.stdoutRooted {
+			if scoped, scopedOK := compactKbuildProfileInvocationRelativePath(profile, output); scopedOK {
+				output = scoped
+			}
+		}
+		output = canonicalKbuildRulePath(output)
+		if output != transient {
+			return nil, fmt.Errorf("filechk projects an unauthenticated shell group output %q", output)
+		}
+		removed++
+	}
+	if removed != 1 {
+		return nil, fmt.Errorf("filechk projects %d temporary group outputs, want one", removed)
+	}
+	return surviving, nil
+}
+
+// Cooked shell text can conceal a Make-time write which returned no stdout.
+// Follow the selected call variables in the frozen line state. The only shell
+// query admitted during this read-only proof is source-defined integer expr,
+// whose finite grammar executes no filesystem operation or ambient program.
+func compactKbuildSelectedFilechkMakeExpansionIsPure(
+	target string, match compactKbuildRuleMatch, inputs []compactKbuildRuleInput,
+	automatic compactKbuildAutomaticContext, raw string,
+) (bool, error) {
+	injected, err := compactKbuildSourceScriptInjectionsForRuleTarget(target, match, inputs)
+	if err != nil {
+		return false, err
+	}
+	parser, cleanup, err := compactKbuildTargetParserWithExportsForLookup(
+		match.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+		automatic.normal, automatic.order, compactKbuildActionTreeInjections(injected), false, false,
+	)
+	if err != nil {
+		return false, err
+	}
+	defer cleanup()
+	parser.shell = EvaluateKbuildIntegerExpression
+	parser.shellResultAvailable = func(command string) bool {
+		_, pure := EvaluateKbuildIntegerExpression(command)
+		return pure == nil
+	}
+	return !parser.makeExpansionHasStatefulEffect(raw, map[string]bool{}, 0), nil
+}
+
+// Two physical source recipe lines acquire a single canonical target only
+// after the final line succeeds. Stage the private writer and its observer
+// lineage in a separate mutable plan; a failed second line cannot leave a
+// provisional target writer or lookup indexes in the caller's plan.
+func compactKbuildFilechkCleanupTransactionPlan(plan *ActionPlan) *ActionPlan {
+	staged := *plan
+	staged.Nodes = cloneActionPlanNodes(plan.Nodes)
+	staged.Sources = slices.Clone(plan.Sources)
+	staged.Products = slices.Clone(plan.Products)
+	staged.Recipes = maps.Clone(plan.Recipes)
+	staged.InputSets = maps.Clone(plan.InputSets)
+	staged.deferredContentBuilding = maps.Clone(plan.deferredContentBuilding)
+	staged.pathSensitiveArchiveOutputs = maps.Clone(plan.pathSensitiveArchiveOutputs)
+	staged.observedOutputBases = make(map[string][]ActionPlanNodeEdge, len(plan.observedOutputBases))
+	for path, edges := range plan.observedOutputBases {
+		staged.observedOutputBases[path] = slices.Clone(edges)
+	}
+	staged.compilerProbeInvocations = maps.Clone(plan.compilerProbeInvocations)
+	staged.compoundCompilerProbes = maps.Clone(plan.compoundCompilerProbes)
+	staged.projectedGeneratorValidations = slices.Clone(plan.projectedGeneratorValidations)
+	staged.projectedGeneratorInternalNodes = maps.Clone(plan.projectedGeneratorInternalNodes)
+	staged.projectedGeneratorInternalOutputs = maps.Clone(plan.projectedGeneratorInternalOutputs)
+	staged.projectedGeneratorOriginalOutputs = maps.Clone(plan.projectedGeneratorOriginalOutputs)
+	staged.projectedGeneratorCandidates = maps.Clone(plan.projectedGeneratorCandidates)
+	staged.nodesByID = maps.Clone(plan.nodesByID)
+	staged.nodeIndexesByID = maps.Clone(plan.nodeIndexesByID)
+	staged.outputProducers = maps.Clone(plan.outputProducers)
+	staged.sourceIDs = maps.Clone(plan.sourceIDs)
+	staged.sourcesByID = maps.Clone(plan.sourcesByID)
+	staged.workingTreeTopologyCache = nil
+	staged.commandMetadataInputQuery = nil
+	staged.workingTreeMaterializedNodeInputSets = nil
+	staged.workingTreeMaterializedNodeConflicts = nil
+	staged.workingTreeMaterializedCoreCache = nil
+	staged.workingTreeMaterializedReachedNodes = actionPlanNodeVisitSet{}
+	staged.inputUseProjection = nil
+	staged.probeDiscoveryRecipeCanonical = maps.Clone(plan.probeDiscoveryRecipeCanonical)
+	staged.probeDiscoveryRetainedRecipes = maps.Clone(plan.probeDiscoveryRetainedRecipes)
+	return &staged
+}
+
+// A source Make recipe may create its target in one atomic shell line and
+// execute a separate cleanup line after that output is visible. Each line has
+// its own frozen Make reads, exports, and shell. The bounded filechk/cleanup
+// form stages the first output version and executes the selected cleanup in a
+// second action which republishes the surviving target. A present legacy file
+// needs a deletion-state projection; without one, this split fails closed.
+func (b *compactKbuildRulePlanBuilder) buildSelectedDirectFilechkCleanup(
+	target string, match compactKbuildRuleMatch, nativeInputs []compactKbuildRuleInput,
+	rootedLines, actualLines []string, indexes []int,
+	snapshots map[int]*KbuildSelectedControlRecipeSnapshot,
+	automatic compactKbuildAutomaticContext,
+) (string, bool, error) {
+	if match.capturedEnvironment != nil || len(indexes) != 2 ||
+		len(rootedLines) != 2 || len(actualLines) != 2 ||
+		indexes[0] >= indexes[1] || snapshots[indexes[0]] == nil || snapshots[indexes[1]] == nil {
+		return "", false, nil
+	}
+	if _, _, filechk := kbuildFilechkCall(match.rule.Recipe[indexes[0]]); !filechk {
+		return "", false, nil
+	}
+	cleanupCommands, err := parseCompactKbuildRecipe(actualLines[1], automatic)
+	if err != nil || len(cleanupCommands) != 1 || cleanupCommands[0].program != "rm" ||
+		compactKbuildRecipeHasPipeline(cleanupCommands) || compactKbuildRecipeHasRecursiveMake(cleanupCommands) {
+		return "", false, nil
+	}
+	for _, ref := range b.metadata.actionRoles {
+		for _, applet := range []string{"echo", "mkdir", "cmp", "mv", "rm"} {
+			if ref.Scope == b.actionScope() && ref.Role == compactKbuildScriptAppletRolePrefix+applet {
+				return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d uses a configured %s applet without a declared filechk effect", match.profile.Rules[match.ruleOrder].Position, target, indexes[1], applet)
+			}
+		}
+	}
+	removed, err := compactKbuildRecipeRemovalPaths(cleanupCommands[0])
+	if err != nil || len(removed) != 1 || len(cleanupCommands[0].arguments) != 2 ||
+		compactKbuildRecipeImmutableSourceOutput(cleanupCommands[0].arguments[1]) {
+		return "", false, nil
+	}
+	first, last := snapshots[indexes[0]], snapshots[indexes[1]]
+	location, located := CompactKbuildProfileInvocationLocation(last.Evaluation.Profile)
+	if !located || location.Tree != CompactKbuildInvocationObjectTree {
+		return "", false, nil
+	}
+	legacy := canonicalKbuildRulePath(removed[0].path)
+	if !removed[0].rooted {
+		if relative, valid := compactKbuildProfileInvocationRelativePath(last.Evaluation.Profile, legacy); valid {
+			legacy = canonicalKbuildRulePath(relative)
+		} else {
+			return "", false, nil
+		}
+	}
+	if legacy == "" || legacy == canonicalKbuildRulePath(target) {
+		return "", false, nil
+	}
+	position := match.profile.Rules[match.ruleOrder].Position
+	legacyRead := "__LINUX_BZL_OBJECT_TREE__/" + legacy
+	if last.view == nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d has no frozen object-tree view", position, target, indexes[1])
+	}
+	if _, exists, _, readErr := last.view.Read(legacyRead); readErr != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d path %q: %w", position, target, indexes[1], legacy, readErr)
+	} else if exists {
+		return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d deletes existing %q without an authenticated deletion-state output", position, target, indexes[1], legacy)
+	}
+	if _, overlay, overlayErr := compactKbuildSourceOverlayRoot(last.Evaluation.Profile); overlayErr != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d source overlay: %w", position, target, indexes[1], overlayErr)
+	} else if overlay {
+		return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d cannot prove absent %q beneath a staged source overlay", position, target, indexes[1], legacy)
+	}
+	if source, sourceErr := b.sourcePathEvidence(legacy); sourceErr != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d source path %q: %w", position, target, indexes[1], legacy, sourceErr)
+	} else if source.exists {
+		return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d cannot treat staged source %q as absent", position, target, indexes[1], legacy)
+	}
+	frontier, err := b.compactKbuildWorkingTreeInputFrontier(target, last.Evaluation.Profile, nativeInputs)
+	if err != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d writable frontier: %w", position, target, indexes[1], err)
+	}
+	staged, err := compactKbuildInputFrontierInputs(b.plan, frontier)
+	if err != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d staged inputs: %w", position, target, indexes[1], err)
+	}
+	for _, input := range staged {
+		if canonicalKbuildRulePath(input.path) == legacy {
+			return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d has a staged version of absent %q", position, target, indexes[1], legacy)
+		}
+	}
+	firstTemplate := compactKbuildRecipeLineShells(rootedLines[:1])
+	firstPrograms, discoveryErr := compactKbuildCompoundProgramCommands(firstTemplate)
+	if discoveryErr != nil || len(firstPrograms) == 0 {
+		return "", true, fmt.Errorf("%s: Kbuild target %q filechk recipe %d program discovery: %v", position, target, indexes[0], discoveryErr)
+	}
+	filechk, arguments, _ := kbuildFilechkCall(match.rule.Recipe[indexes[0]])
+	firstMatch := match
+	firstMatch.profile = first.Evaluation.Profile
+	firstMatch.selectedRecipeSnapshot = first
+	pure, purityErr := compactKbuildSelectedFilechkMakeExpansionIsPure(
+		target, firstMatch, nativeInputs, automatic, match.rule.Recipe[indexes[0]],
+	)
+	if purityErr != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q filechk recipe %d Make expansion effect proof: %w", position, target, indexes[0], purityErr)
+	}
+	if !pure {
+		return "", true, fmt.Errorf("%s: Kbuild target %q filechk recipe %d has an unbounded source Make expansion effect", position, target, indexes[0])
+	}
+	values, rootedAutomatic, err := evaluateCompactKbuildDirectFilechkVariables(
+		target, firstMatch, nativeInputs, filechk, arguments,
+	)
+	if err != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q filechk recipe %d source body: %w", position, target, indexes[0], err)
+	}
+	transientOutput := ""
+	firstBytes, unbounded := compactKbuildSelectedFilechkWrapperBytes(
+		firstTemplate, values["filechk_"+filechk], target, rootedAutomatic, &transientOutput,
+	)
+	if unbounded != "" {
+		return "", true, fmt.Errorf("%s: Kbuild target %q filechk recipe %d has an unbounded first-line write frontier: %s", position, target, indexes[0], unbounded)
+	}
+	firstEffects, effectErr := compactKbuildSelectedFilechkSurvivingEffects(
+		firstMatch.profile, transientOutput,
+		compactKbuildRecipeSideEffectProjection(rootedLines[:1], automatic),
+	)
+	if effectErr != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q filechk recipe %d side-output lifecycle: %w", position, target, indexes[0], effectErr)
+	}
+	version := sha256.Sum256([]byte(firstBytes))
+	expectedVersion := hex.EncodeToString(version[:])
+	for _, read := range last.Reads() {
+		if read.Path != "__LINUX_BZL_OBJECT_TREE__/"+canonicalKbuildRulePath(target) || !read.Exists {
+			continue
+		}
+		owner := read.Artifact.Producer
+		identity := "selection:" + owner.Profile + ":" + owner.Target + ":" + owner.Path
+		if owner.Path != canonicalKbuildRulePath(target) ||
+			owner.Target != canonicalKbuildRulePath(target) ||
+			owner.Profile != first.Evaluation.Profile.Name ||
+			read.Artifact.Identity != identity || read.Artifact.Version != expectedVersion {
+			return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d reads a version different from its source-selected first-line writer", position, target, indexes[1])
+		}
+	}
+	observedTarget := canonicalKbuildRulePath(target)
+	firstObservations, err := compactKbuildRecipeCommandObservedOutputs(
+		observedTarget, 0, false, b.observedOutputs[observedTarget], nil,
+	)
+	if err != nil {
+		return "", true, err
+	}
+	firstBuilder := *b
+	transaction := compactKbuildFilechkCleanupTransactionPlan(b.plan)
+	firstBuilder.plan = transaction
+	firstBuilder.memo = maps.Clone(b.memo)
+	firstBuilder.observedOutputs = make(map[string][]compactKbuildObservedOutput, len(b.observedOutputs))
+	for observedPath, observations := range b.observedOutputs {
+		firstBuilder.observedOutputs[observedPath] = slices.Clone(observations)
+	}
+	firstBuilder.observedOutputs[observedTarget] = firstObservations
+	firstInputs, err := firstBuilder.compactKbuildSelectedReadInputs(target, firstMatch, slices.Clone(nativeInputs))
+	if err != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q filechk recipe %d inputs: %w", position, target, indexes[0], err)
+	}
+	firstProducer, err := firstBuilder.buildHermeticKbuildScriptContext(
+		target, firstMatch, firstInputs, firstTemplate, firstPrograms,
+		firstEffects,
+		compactKbuildHermeticScriptOptions{Intermediate: true, SourceStageIdentity: fmt.Sprintf("direct:%d", indexes[0])},
+	)
+	if err != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q atomic filechk recipe %d: %w", position, target, indexes[0], err)
+	}
+	firstNode, found := compactKbuildPlanNode(transaction, firstProducer)
+	if !found {
+		return "", true, fmt.Errorf("%s: Kbuild target %q filechk recipe %d has no staged producer %q", position, target, indexes[0], firstProducer)
+	}
+	previousStates, err := compactKbuildRecipeObservedStateInputs(firstProducer, firstNode.Outputs, firstObservations)
+	if err != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q filechk recipe %d observed state: %w", position, target, indexes[0], err)
+	}
+	finalObservations, err := compactKbuildRecipeCommandObservedOutputs(
+		observedTarget, 1, true, b.observedOutputs[observedTarget], previousStates,
+	)
+	if err != nil {
+		return "", true, err
+	}
+	finalBuilder := *b
+	finalBuilder.plan = transaction
+	finalBuilder.memo = maps.Clone(b.memo)
+	finalBuilder.observedOutputs = make(map[string][]compactKbuildObservedOutput, len(b.observedOutputs))
+	for observedPath, observations := range b.observedOutputs {
+		finalBuilder.observedOutputs[observedPath] = slices.Clone(observations)
+	}
+	finalBuilder.observedOutputs[observedTarget] = finalObservations
+	finalMatch := match
+	finalMatch.profile = last.Evaluation.Profile
+	finalMatch.selectedRecipeSnapshot = last
+	finalInputs := slices.Clone(nativeInputs)
+	carried := []string{}
+	for slot, output := range firstNode.Outputs {
+		if output.ObservedPath != "" {
+			continue
+		}
+		pathname := canonicalKbuildRulePath(output.Path)
+		if pathname == "" || pathname == legacy {
+			return "", true, fmt.Errorf("%s: Kbuild target %q filechk recipe %d has an unbounded staged output %q", position, target, indexes[0], output.Path)
+		}
+		finalInputs = upsertCompactKbuildRuleInput(finalInputs, compactKbuildRuleInput{
+			path: pathname, producer: firstProducer, slot: slot, recipeLocal: true, workingOnly: true,
+		})
+		if output.persistent {
+			carried = append(carried, pathname)
+		}
+	}
+	finalInputs, err = finalBuilder.compactKbuildSelectedReadInputs(target, finalMatch, finalInputs)
+	if err != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q cleanup recipe %d inputs: %w", position, target, indexes[1], err)
+	}
+	finalTemplate := compactKbuildRecipeLineShells(rootedLines[1:])
+	producer, err := finalBuilder.buildHermeticKbuildScriptContext(
+		target, finalMatch, finalInputs, finalTemplate, cleanupCommands,
+		compactKbuildRecipeSideEffectProjection(rootedLines[1:], automatic),
+		compactKbuildHermeticScriptOptions{CarriedOutputs: carried, RequiredCarriedSideOutputs: []string{observedTarget}},
+	)
+	if err != nil {
+		return "", true, fmt.Errorf("%s: Kbuild target %q selected cleanup recipe %d: %w", position, target, indexes[1], err)
+	}
+	*b.plan = *transaction
+	b.memo[canonicalKbuildRulePath(target)] = producer
+	return producer, true, nil
 }
 
 func (b *compactKbuildRulePlanBuilder) buildDirectFilechkRecipe(
@@ -6993,7 +9583,28 @@ func (b *compactKbuildRulePlanBuilder) buildDirectFilechkRecipe(
 		return "", fmt.Errorf("direct recipe has no filechk call")
 	}
 	variableName := "filechk_" + filechk
-	values, automatic, err := evaluateCompactKbuildDirectFilechkVariables(target, match, inputs, filechk, filechkArguments)
+	lineMatch := match
+	if match.selectedRecipeSnapshot != nil {
+		lineMatch.profile = match.selectedRecipeSnapshot.Evaluation.Profile
+	} else if snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match); err != nil {
+		return "", err
+	} else if len(snapshots) != 0 {
+		if err := compactKbuildRejectTargetWideLineReads(target, match, snapshots); err != nil {
+			return "", err
+		}
+		for _, index := range slices.Sorted(maps.Keys(snapshots)) {
+			if _, _, ok := kbuildFilechkCall(match.rule.Recipe[index]); ok {
+				lineMatch.profile = snapshots[index].Evaluation.Profile
+				lineMatch.selectedRecipeSnapshot = snapshots[index]
+				break
+			}
+		}
+	}
+	values, automatic, err := evaluateCompactKbuildDirectFilechkVariables(target, lineMatch, inputs, filechk, filechkArguments)
+	if err != nil {
+		return "", err
+	}
+	inputs, err = b.compactKbuildSelectedReadInputs(target, match, inputs)
 	if err != nil {
 		return "", err
 	}
@@ -7001,15 +9612,29 @@ func (b *compactKbuildRulePlanBuilder) buildDirectFilechkRecipe(
 	if rootedTemplate == "" {
 		return "", fmt.Errorf("evaluated variable %s is empty", variableName)
 	}
-	rootedTemplate = compactKbuildProfileEvaluatedRootedActionRecipeText(match.profile, rootedTemplate)
+	rootedTemplate = compactKbuildProfileEvaluatedRootedActionRecipeText(lineMatch.profile, rootedTemplate)
 	template := compactKbuildFinalizeRootedActionRecipeText(rootedTemplate)
+	if script, selected := compactKbuildQuotedSourceScriptFilechk(template); selected {
+		// The shell forms this quoted word after executing its nested source
+		// script. Its stdout is an input to echo, so argv lowering would erase
+		// the selected generator. The compound scanner retains the nested
+		// executable and the original shell text retains command substitution.
+		compound := compactKbuildFilechkOutputRecipe(rootedTemplate, compactKbuildActionObjectTreeMarker+"/"+target)
+		programs, programErr := compactKbuildCompoundProgramCommands(compound)
+		if programErr != nil {
+			return "", fmt.Errorf("evaluated variable %s source script %q: %w", variableName, script, programErr)
+		}
+		return b.buildHermeticKbuildScriptContext(
+			target, lineMatch, inputs, compound, programs, programs, compactKbuildHermeticScriptOptions{},
+		)
+	}
 	parsedAutomatic := automatic
 	lines, literal, err := parseCompactKbuildLiteralFilechk(template, parsedAutomatic)
 	if err != nil {
 		return "", fmt.Errorf("evaluated variable %s literal output: %w", variableName, err)
 	}
 	if literal && !compactKbuildContainsProtectedLiteralActionMarker(rootedTemplate) {
-		return b.appendCompactKbuildLiteralFilechk(target, match, inputs, lines)
+		return b.appendCompactKbuildLiteralFilechk(target, lineMatch, inputs, lines)
 	}
 	commands, parseErr := parseCompactKbuildRecipe(template, parsedAutomatic)
 	if parseErr != nil {
@@ -7021,14 +9646,14 @@ func (b *compactKbuildRulePlanBuilder) buildDirectFilechkRecipe(
 			return "", fmt.Errorf("evaluated variable %s: argv parse: %v; compound program discovery: %w", variableName, parseErr, programErr)
 		}
 		compound := compactKbuildFilechkOutputRecipe(rootedTemplate, compactKbuildActionObjectTreeMarker+"/"+target)
-		return b.buildHermeticKbuildScriptContext(target, match, inputs, compound, programs, programs, compactKbuildHermeticScriptOptions{})
+		return b.buildHermeticKbuildScriptContext(target, lineMatch, inputs, compound, programs, programs, compactKbuildHermeticScriptOptions{})
 	}
 	if compactKbuildRecipeHasPipeline(commands) || compactKbuildRecipeHasRecursiveMake(commands) || compactKbuildContainsProtectedLiteralActionMarker(rootedTemplate) {
 		// filechk owns the combined stdout of its source-defined command body.
 		// Preserve a live pipeline and capture that stream inside the same staged
 		// object tree instead of serializing it through intermediate actions.
 		compound := compactKbuildFilechkOutputRecipe(rootedTemplate, compactKbuildActionObjectTreeMarker+"/"+target)
-		return b.buildHermeticKbuildPipeline(target, match, inputs, compound, commands)
+		return b.buildHermeticKbuildPipeline(target, lineMatch, inputs, compound, commands)
 	}
 	projectedPrefixes := b.projectedFilechkConfigPrefixes(commands, inputs)
 	if len(projectedPrefixes) != 0 {
@@ -7040,7 +9665,51 @@ func (b *compactKbuildRulePlanBuilder) buildDirectFilechkRecipe(
 	if err != nil {
 		return "", err
 	}
-	return b.appendCompactKbuildRecipe(target, match, inputs, values, commands)
+	return b.appendCompactKbuildRecipe(target, lineMatch, inputs, values, commands)
+}
+
+// compactKbuildQuotedSourceScriptFilechk selects the finite quoted-shell shape
+// whose output depends on a declared source script. Keep the original shell
+// substitution intact for both probe discovery and the final Kbuild action;
+// shell word cooking cannot represent the script's stdout as a literal argv.
+func compactKbuildQuotedSourceScriptFilechk(payload string) (string, bool) {
+	tokens, err := lexCompactKbuildRecipe(payload)
+	if err != nil || len(tokens) != 2 || tokens[0].operator || tokens[0].value != "echo" ||
+		tokens[1].operator || !tokens[1].shellExpansion || tokens[1].pathnameExpansion {
+		return "", false
+	}
+	word := payload[tokens[1].start:tokens[1].end]
+	if len(word) < 4 || word[0] != '"' || word[len(word)-1] != '"' {
+		return "", false
+	}
+	quoted := word[1 : len(word)-1]
+	open := strings.Index(quoted, "$(")
+	if open < 0 || strings.ContainsAny(quoted[:open], "$`\\\"\r\n") {
+		return "", false
+	}
+	for _, character := range quoted[:open] {
+		if !(character >= 'a' && character <= 'z') && !(character >= 'A' && character <= 'Z') &&
+			!(character >= '0' && character <= '9') && !strings.ContainsRune("._+-", character) {
+			return "", false
+		}
+	}
+	close, err := matchingShellCommandSubstitution(quoted, open)
+	if err != nil || close != len(quoted)-1 {
+		return "", false
+	}
+	inner := quoted[open+2 : close]
+	commands, err := lexCompactKbuildRecipe(inner)
+	if err != nil || len(commands) != 3 || commands[0].operator || commands[0].value != "sh" ||
+		commands[1].operator || commands[2].operator || commands[2].value != "${tree:kernel}" {
+		return "", false
+	}
+	script, ok := strings.CutPrefix(commands[1].value, "${tree:kernel}/")
+	if !ok || script == "" || script != canonicalKbuildRulePath(script) ||
+		validatePlanRelativePath("quoted source-script filechk", script) != nil ||
+		strings.ContainsAny(script, "$`\\*?[~;|&<>() \t\r\n") {
+		return "", false
+	}
+	return script, true
 }
 
 // evaluateCompactKbuildDirectFilechkVariables is shared by exact-output
@@ -7562,7 +10231,9 @@ func parseCompactKbuildLiteralFilechk(value string, context compactKbuildAutomat
 			if strings.ContainsAny(field, "\x00\r\n") {
 				return nil, true, fmt.Errorf("literal output field contains a control character")
 			}
-			expanded = append(expanded, compactKbuildRecipeToken{value: field})
+			fieldToken := token
+			fieldToken.value = field
+			expanded = append(expanded, fieldToken)
 		}
 	}
 	first := 0
@@ -7612,9 +10283,12 @@ func parseCompactKbuildLiteralScalarPipeline(value string, context compactKbuild
 		return nil, true, err
 	}
 	inner := trimmed[open+2 : close]
-	words, err := kbuildLiteralShellWords(inner)
+	words, literal, err := kbuildLiteralShellWords(inner)
 	if err != nil {
 		return nil, true, err
+	}
+	if !literal {
+		return nil, false, nil
 	}
 	pipe := slices.Index(words, "|")
 	if pipe < 2 || pipe+2 >= len(words) || slices.Index(words[pipe+1:], "|") >= 0 {
@@ -7685,19 +10359,22 @@ func matchingShellCommandSubstitution(value string, start int) (int, error) {
 	return 0, fmt.Errorf("unterminated shell command substitution")
 }
 
-func kbuildLiteralShellWords(value string) ([]string, error) {
+func kbuildLiteralShellWords(value string) ([]string, bool, error) {
 	tokens, err := lexCompactKbuildRecipe(value)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	words := make([]string, 0, len(tokens))
 	for _, token := range tokens {
+		if token.shellExpansion {
+			return nil, false, nil
+		}
 		if token.operator && token.value != "|" {
-			return nil, fmt.Errorf("literal scalar pipeline uses shell operator %q", token.value)
+			return nil, false, fmt.Errorf("literal scalar pipeline uses shell operator %q", token.value)
 		}
 		words = append(words, strings.ReplaceAll(token.value, compactKbuildLiteralDollarToken, "$"))
 	}
-	return words, nil
+	return words, true, nil
 }
 
 func compactKbuildLiteralCutByteLimit(arguments []string) (int, bool) {
@@ -7752,6 +10429,9 @@ func (p *compactKbuildLiteralFilechkParser) sequence(stops map[string]bool) ([]s
 		p.index++
 		arguments := []string{}
 		for p.index < len(p.tokens) && !p.tokens[p.index].operator {
+			if p.tokens[p.index].activeBacktick {
+				return nil, "", fmt.Errorf("literal echo argument executes backtick substitution")
+			}
 			arguments = append(arguments, p.tokens[p.index].value)
 			p.index++
 		}
@@ -7768,9 +10448,9 @@ func (p *compactKbuildLiteralFilechkParser) sequence(stops map[string]bool) ([]s
 
 func (p *compactKbuildLiteralFilechkParser) conditional() ([]string, error) {
 	p.index++ // if
-	condition := []string{}
+	condition := []compactKbuildRecipeToken{}
 	for p.index < len(p.tokens) && !(p.tokens[p.index].operator && p.tokens[p.index].value == ";") {
-		condition = append(condition, p.tokens[p.index].value)
+		condition = append(condition, p.tokens[p.index])
 		p.index++
 	}
 	if p.index == len(p.tokens) || p.tokens[p.index].value != ";" {
@@ -7853,15 +10533,18 @@ func (p *compactKbuildLiteralFilechkParser) skipConditionalBranch() (string, err
 	return "", fmt.Errorf("literal if condition has no fi")
 }
 
-func evaluateCompactKbuildLiteralTest(fields []string) (bool, error) {
-	if len(fields) < 5 || fields[0] != "[" || fields[len(fields)-1] != "]" {
-		return false, fmt.Errorf("unsupported literal if condition %q", fields)
+func evaluateCompactKbuildLiteralTest(fields []compactKbuildRecipeToken) (bool, error) {
+	if len(fields) < 5 || fields[0].value != "[" || fields[len(fields)-1].value != "]" {
+		return false, fmt.Errorf("unsupported literal if condition %v", fields)
 	}
 	operatorIndex := len(fields) - 3
-	leftFields, operator, right := fields[1:operatorIndex], fields[operatorIndex], fields[operatorIndex+1]
+	leftFields, operator, right := fields[1:operatorIndex], fields[operatorIndex].value, fields[operatorIndex+1].value
+	if fields[operatorIndex].activeBacktick || fields[operatorIndex+1].activeBacktick || fields[len(fields)-1].activeBacktick {
+		return false, fmt.Errorf("literal if condition executes backtick substitution outside its left operand")
+	}
 	left, err := evaluateCompactKbuildLiteralTestOperand(leftFields)
 	if err != nil {
-		return false, fmt.Errorf("unsupported literal if condition %q: %w", fields, err)
+		return false, fmt.Errorf("unsupported literal if condition %v: %w", fields, err)
 	}
 	switch operator {
 	case "=", "==":
@@ -7896,29 +10579,44 @@ func evaluateCompactKbuildLiteralTest(fields []string) (bool, error) {
 	}
 }
 
-func evaluateCompactKbuildLiteralTestOperand(fields []string) (string, error) {
+func evaluateCompactKbuildLiteralTestOperand(fields []compactKbuildRecipeToken) (string, error) {
 	if len(fields) == 1 {
-		return fields[0], nil
+		if fields[0].activeBacktick {
+			return "", fmt.Errorf("literal if operand executes unproved backtick substitution")
+		}
+		return fields[0].value, nil
 	}
 	// Linux uses this fully literal command substitution when generating
 	// utsrelease.h. Evaluate the byte count directly so neither a shell nor host
 	// echo/wc leaks into the build action.
-	if len(fields) >= 7 && (fields[0] == "`echo" || (fields[0] == "`" && fields[1] == "echo")) {
+	if len(fields) >= 7 && (fields[0].value == "`echo" || (fields[0].value == "`" && fields[1].value == "echo")) {
 		echo := 1
-		if fields[0] == "`" {
+		if fields[0].value == "`" {
 			echo = 2
 		}
-		if echo >= len(fields) || fields[echo] != "-n" {
+		if !fields[0].activeBacktick || !fields[len(fields)-1].activeBacktick {
+			return "", fmt.Errorf("literal length condition lacks an active source substitution")
+		}
+		for _, field := range fields[1 : len(fields)-1] {
+			if field.activeBacktick {
+				return "", fmt.Errorf("literal length payload executes nested backtick substitution")
+			}
+		}
+		if echo >= len(fields) || fields[echo].value != "-n" {
 			return "", fmt.Errorf("command substitution is not echo -n")
 		}
-		pipe := slices.Index(fields, "|")
-		if pipe <= echo+1 || pipe+3 >= len(fields) || fields[pipe+1] != "wc" || fields[pipe+2] != "-c" || fields[pipe+3] != "`" || pipe+4 != len(fields) {
+		pipe := slices.IndexFunc(fields, func(field compactKbuildRecipeToken) bool { return field.value == "|" })
+		if pipe <= echo+1 || pipe+3 >= len(fields) || fields[pipe+1].value != "wc" || fields[pipe+2].value != "-c" || fields[pipe+3].value != "`" || pipe+4 != len(fields) {
 			return "", fmt.Errorf("command substitution is not echo -n ... | wc -c")
 		}
-		payload := strings.Join(fields[echo+1:pipe], " ")
+		payloadFields := make([]string, 0, pipe-echo-1)
+		for _, field := range fields[echo+1 : pipe] {
+			payloadFields = append(payloadFields, field.value)
+		}
+		payload := strings.Join(payloadFields, " ")
 		return strconv.Itoa(len([]byte(payload))), nil
 	}
-	return "", fmt.Errorf("unsupported left operand %q", fields)
+	return "", fmt.Errorf("unsupported left operand %v", fields)
 }
 
 func (b *compactKbuildRulePlanBuilder) appendCompactKbuildLiteralFilechk(
@@ -7958,7 +10656,7 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildLiteralFilechk(
 	for _, line := range lines {
 		recipe.Arguments = append(recipe.Arguments, "-line", line)
 	}
-	return appendActionPlanNode(b.plan, node, recipe)
+	return b.appendCompactKbuildSelectedPlanNode(target, node, recipe)
 }
 
 // appendCompactKbuildExactGeneratedContent publishes bytes measured by the
@@ -7998,7 +10696,7 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildExactGeneratedContent(
 		Outputs:     []string{"00000000"},
 		Environment: map[string]string{},
 	}
-	producer, err = appendActionPlanNode(b.plan, node, recipe)
+	producer, err = b.appendCompactKbuildSelectedPlanNode(target, node, recipe)
 	if err != nil {
 		return "", false, err
 	}
@@ -8018,6 +10716,7 @@ func lexCompactKbuildRecipe(value string) ([]compactKbuildRecipeToken, error) {
 	wordStart := -1
 	pathnameExpansion := false
 	shellExpansion := false
+	activeBacktick := false
 	startWord := func(index int) {
 		if !started {
 			wordStart = index
@@ -8030,13 +10729,14 @@ func lexCompactKbuildRecipe(value string) ([]compactKbuildRecipeToken, error) {
 		}
 		tokens = append(tokens, compactKbuildRecipeToken{
 			value: word.String(), start: wordStart, end: end, pathnameExpansion: pathnameExpansion,
-			shellExpansion: shellExpansion,
+			shellExpansion: shellExpansion, activeBacktick: activeBacktick,
 		})
 		word.Reset()
 		started = false
 		wordStart = -1
 		pathnameExpansion = false
 		shellExpansion = false
+		activeBacktick = false
 	}
 	for index := 0; index < len(value); index++ {
 		character := value[index]
@@ -8072,6 +10772,9 @@ func lexCompactKbuildRecipe(value string) ([]compactKbuildRecipeToken, error) {
 				startWord(index)
 				if quote == '"' && (character == '$' || character == '`') {
 					shellExpansion = true
+					if character == '`' {
+						activeBacktick = true
+					}
 				}
 				word.WriteByte(character)
 			}
@@ -8129,6 +10832,9 @@ func lexCompactKbuildRecipe(value string) ([]compactKbuildRecipeToken, error) {
 			}
 			if character == '$' || character == '`' {
 				shellExpansion = true
+				if character == '`' {
+					activeBacktick = true
+				}
 			}
 			word.WriteByte(character)
 		}
@@ -8277,6 +10983,9 @@ func parseCompactKbuildRecipe(value string, context compactKbuildAutomaticContex
 	for _, token := range expanded {
 		if !token.operator {
 			if redirect != "" {
+				if redirect == ">" && compactKbuildRecipeImmutableSourceOutput(token.value) {
+					return nil, fmt.Errorf("output redirection targets immutable Linux source %q", token.value)
+				}
 				rooted := compactKbuildRecipePathExplicitlyRooted(token.value)
 				candidate, ok := compactKbuildCommandPath(token.value)
 				if !ok {
@@ -8342,6 +11051,10 @@ func compactKbuildRecipeDeclaredOutputForProfile(
 	command compactKbuildRecipeCommand,
 	target string,
 ) (string, bool, error) {
+	if ref, configured := parseKbuildActionRoleToken(command.program); configured && ref.Role == "ar" {
+		output, valid := compactKbuildArchiveCreationOutput(command.arguments, false)
+		return output, valid, nil
+	}
 	if output, ok, err := compactKbuildRecipeExplicitOutputForProfile(profile, command, target); err != nil || ok {
 		return output, ok, err
 	}
@@ -8364,6 +11077,9 @@ func compactKbuildRecipePositionalOutput(command compactKbuildRecipeCommand, tar
 		return "", false
 	}
 	argumentIsTarget := func(argument string) (string, bool) {
+		if compactKbuildRecipeImmutableSourceOutput(argument) {
+			return "", false
+		}
 		output, ok := compactKbuildCommandPath(argument)
 		return output, ok && output == target
 	}
@@ -8375,6 +11091,11 @@ func compactKbuildRecipePositionalOutput(command compactKbuildRecipeCommand, tar
 	}
 
 	program := path.Base(command.program)
+	// A path-qualified remover still cannot create its path operand. Do not
+	// classify it as an opaque source program merely because it names $@.
+	if program == "rm" {
+		return "", false
+	}
 	if applet, runtime := compactKbuildAbsoluteRuntimeApplet(command.program); runtime {
 		program = applet
 	} else if _, configured := parseKbuildActionRoleToken(command.program); configured || program != command.program {
@@ -8465,8 +11186,297 @@ func CompactKbuildRecipeWritesTarget(recipe, target string) bool {
 	if err != nil {
 		return false
 	}
+	if compactKbuildEmptyArchiveAfterExactRemoval(commands, target) {
+		return true
+	}
 	for _, command := range commands {
 		if output, declared := compactKbuildRecipeDeclaredOutput(command, target); declared && canonicalKbuildRulePath(output) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// CompactKbuildConfiguredToolWritesRootedObjectTarget authenticates the
+// output of a declared compiler or linker when Make executes in a source directory. In
+// that process, a relative -o pathname writes into the source directory;
+// only an operand rooted in the selected object tree can publish a generated
+// target. Compare the exact -o operand before ordinary output-path projection
+// strips its tree provenance. Other argv fields may name the same pathname as
+// an input and must not turn a relative output into an object writer. Admit
+// one completed command only: a later rename/removal or an unproved conditional
+// would not leave this output visible at the end of the selected recipe line.
+func CompactKbuildConfiguredToolWritesRootedObjectTarget(recipe, target string) bool {
+	return compactKbuildConfiguredToolWritesRootedObjectTarget(recipe, target, nil)
+}
+
+// CompactKbuildProfileConfiguredToolWritesRootedObjectTarget also recognizes
+// a literal linker when both eventual action scopes have an identity-bound ld
+// role. The source walk has not yet classified the action's host/target stage.
+// Final lowering binds the selected role into this same compound script.
+func CompactKbuildProfileConfiguredToolWritesRootedObjectTarget(profile CompactKbuildProfile, recipe, target string) bool {
+	return CompactKbuildProfileConfiguredToolWritesRootedObjectTargetInScript(profile, recipe, recipe, target)
+}
+
+// CompactKbuildProfileConfiguredToolWritesRootedObjectTargetInScript proves
+// that earlier selected shell commands cannot replace the configured linker
+// on PATH before the output command executes.
+func CompactKbuildProfileConfiguredToolWritesRootedObjectTargetInScript(profile CompactKbuildProfile, script, recipe, target string) bool {
+	if profile.evaluator == nil || profile.evaluator.template == nil {
+		return CompactKbuildConfiguredToolWritesRootedObjectTarget(recipe, target) ||
+			compactKbuildConfiguredArchiveWritesRootedObjectTarget(recipe, target, nil, false)
+	}
+	roles := profile.evaluator.template.actionRoles
+	if compactKbuildConfiguredToolWritesRootedObjectTarget(recipe, target, func(program string) bool {
+		return program == "ld" &&
+			compactKbuildLinkerSurvivesSourceScript(script, target) &&
+			slices.Contains(roles, KbuildActionRoleRef{Scope: "host", Role: "ld"}) &&
+			slices.Contains(roles, KbuildActionRoleRef{Scope: "target", Role: "ld"})
+	}) {
+		return true
+	}
+	archiveSegment, archiveAbsent := compactKbuildArchiveSurvivesSourceScript(script, target)
+	archiveRole := func(program string) bool {
+		return program == "ar" &&
+			archiveSegment != "" &&
+			slices.Contains(roles, KbuildActionRoleRef{Scope: "host", Role: "ar"}) &&
+			slices.Contains(roles, KbuildActionRoleRef{Scope: "target", Role: "ar"})
+	}
+	if archiveAbsent && recipe != script && !compactKbuildArchiveCommandMatchesSegment(recipe, archiveSegment, target) {
+		return false
+	}
+	if compactKbuildConfiguredArchiveWritesRootedObjectTarget(recipe, target, archiveRole, archiveAbsent) {
+		return true
+	}
+	if recipe != script || !archiveRole("ar") {
+		return false
+	}
+	return compactKbuildConfiguredArchiveWritesRootedObjectTarget(archiveSegment, target, archiveRole, archiveAbsent)
+}
+
+func compactKbuildArchiveCommandMatchesSegment(recipe, segment, target string) bool {
+	selected, selectedErr := parseCompactKbuildRecipe(recipe, compactKbuildAutomaticContext{target: target})
+	writer, writerErr := parseCompactKbuildRecipe(segment, compactKbuildAutomaticContext{target: target})
+	return selectedErr == nil && writerErr == nil && len(selected) == 1 && len(writer) == 1 &&
+		selected[0].program == writer[0].program &&
+		slices.Equal(selected[0].arguments, writer[0].arguments) &&
+		maps.Equal(selected[0].environment, writer[0].environment) &&
+		selected[0].stdin == writer[0].stdin && selected[0].stdout == writer[0].stdout
+}
+
+func compactKbuildConfiguredArchiveWritesRootedObjectTarget(
+	recipe, target string, configuredPlainProgram func(string) bool, absent bool,
+) bool {
+	target = canonicalKbuildRulePath(target)
+	if err := validatePlanRelativePath("Kbuild archive output", target); err != nil {
+		return false
+	}
+	commands, err := parseCompactKbuildRecipe(recipe, compactKbuildAutomaticContext{target: target})
+	if err != nil || len(commands) != 1 {
+		return false
+	}
+	command := commands[0]
+	if len(command.environment) != 0 || command.stdin != "" || command.stdout != "" ||
+		command.connector != "" && command.connector != ";" {
+		return false
+	}
+	ref, configured := parseKbuildActionRoleToken(command.program)
+	if !configured && configuredPlainProgram != nil && configuredPlainProgram(command.program) {
+		ref, configured = KbuildActionRoleRef{Role: "ar"}, true
+	}
+	if !configured || ref.Role != "ar" {
+		return false
+	}
+	output, creates := compactKbuildArchiveCreationOutput(command.arguments, absent)
+	if !creates || !strings.HasPrefix(compactKbuildMaterializeActionTreeMarkers(command.arguments[1]), "__LINUX_BZL_OBJECT_TREE__/") &&
+		!strings.HasPrefix(command.arguments[1], "${tree:prep}/") {
+		return false
+	}
+	return canonicalKbuildRulePath(output) == target
+}
+
+// Before accepting a bare archiver in the source-tree cwd, prove that the
+// complete selected script runs exactly one archive creation through the
+// private configured ar proxy. The source cleanup is permitted only before
+// the writer and only for the same output; later commands could erase it.
+// Return the one archive command and whether an immediately preceding exact
+// removal established an absent output for a zero-member creation.
+func compactKbuildArchiveSurvivesSourceScript(script, target string) (string, bool) {
+	if strings.Contains(script, "PATH") {
+		return "", false
+	}
+	tokens, err := lexCompactKbuildRecipe(script)
+	if err != nil {
+		return "", false
+	}
+	for _, token := range tokens {
+		if token.operator {
+			switch token.value {
+			case ";", "&&":
+			default:
+				return "", false
+			}
+			continue
+		}
+		switch strings.TrimLeft(token.value, "@+-") {
+		case "if", "then", "elif", "else", "fi", "for", "while", "until", "select", "case", "esac", "do", "done", "eval", "source", ".", "alias", "unalias", "trap", "!":
+			return "", false
+		}
+	}
+	commands, err := compactKbuildCompoundProgramCommands(script)
+	if err != nil {
+		return "", false
+	}
+	segment := ""
+	absent := false
+	var removal compactKbuildRecipeCommand
+	removedImmediatelyBefore := false
+	for _, command := range commands {
+		if command.program == "ar" {
+			absent = removedImmediatelyBefore && compactKbuildArchiveRemovedBeforeCommand(removal, command, target)
+			if segment != "" || command.sourceStart < 0 || command.sourceEnd > len(script) ||
+				!compactKbuildConfiguredArchiveWritesRootedObjectTarget(
+					script[command.sourceStart:command.sourceEnd], target,
+					func(program string) bool { return program == "ar" }, absent,
+				) {
+				return "", false
+			}
+			segment = script[command.sourceStart:command.sourceEnd]
+			continue
+		}
+		if segment != "" {
+			return "", false
+		}
+		removedImmediatelyBefore = false
+		switch command.program {
+		case "echo", ":":
+		case "set":
+			if !slices.Equal(command.arguments, []string{"-e"}) {
+				return "", false
+			}
+		case "rm":
+			removed, err := compactKbuildRecipeRemovalPaths(command)
+			if err != nil || len(removed) != 1 || removed[0].path != target ||
+				!slices.Contains(command.arguments, "-f") {
+				return "", false
+			}
+			removal = command
+			removedImmediatelyBefore = true
+		default:
+			return "", false
+		}
+	}
+	return segment, absent
+}
+
+func compactKbuildLinkerSurvivesSourceScript(script, target string) bool {
+	if strings.Contains(script, "PATH") {
+		return false
+	}
+	// The compound program scanner extracts nested executable names but skips
+	// shell control headers. Such a header can bypass the linker entirely.
+	tokens, err := lexCompactKbuildRecipe(script)
+	if err != nil {
+		return false
+	}
+	for _, token := range tokens {
+		if token.operator {
+			switch token.value {
+			case ";", ">":
+			default:
+				return false
+			}
+			continue
+		}
+		switch strings.TrimLeft(token.value, "@+-") {
+		case "if", "then", "elif", "else", "fi", "for", "while", "until", "select", "case", "esac", "do", "done", "eval", "source", ".", "alias", "unalias", "trap", "!":
+			return false
+		}
+	}
+	commands, err := compactKbuildCompoundProgramCommands(script)
+	if err != nil {
+		return false
+	}
+	linked := false
+	for _, command := range commands {
+		if command.program == "ld" {
+			if linked || command.sourceStart < 0 || command.sourceEnd > len(script) ||
+				!compactKbuildConfiguredToolWritesRootedObjectTarget(
+					script[command.sourceStart:command.sourceEnd], target,
+					func(program string) bool { return program == "ld" },
+				) {
+				return false
+			}
+			linked = true
+			continue
+		}
+		if linked {
+			// The if_changed wrapper persists only its saved command after
+			// the link. Another command may remove or replace the object.
+			if command.program != "printf" || !strings.HasSuffix(command.stdout, ".cmd") {
+				return false
+			}
+			continue
+		}
+		switch command.program {
+		case "set":
+			if !slices.Equal(command.arguments, []string{"-e"}) {
+				return false
+			}
+		case "echo", ":":
+		default:
+			return false
+		}
+	}
+	return linked
+}
+
+func compactKbuildConfiguredToolWritesRootedObjectTarget(recipe, target string, configuredPlainProgram func(string) bool) bool {
+	target = canonicalKbuildRulePath(target)
+	if err := validatePlanRelativePath("Kbuild configured object output", target); err != nil {
+		return false
+	}
+	commands, err := parseCompactKbuildRecipe(recipe, compactKbuildAutomaticContext{target: target})
+	if err != nil || len(commands) != 1 || commands[0].connector != "" && commands[0].connector != ";" {
+		return false
+	}
+	for _, command := range commands {
+		role, selected := parseKbuildActionRoleToken(command.program)
+		if !selected && configuredPlainProgram != nil && configuredPlainProgram(command.program) {
+			if _, overridesPath := command.environment["PATH"]; overridesPath {
+				continue
+			}
+			role, selected = KbuildActionRoleRef{Role: command.program}, true
+		}
+		if !selected || role.Role != "ld" && role.Role != "cc" && role.Role != "cxx" {
+			continue
+		}
+		output := ""
+		seenOutput, ambiguousOutput := false, false
+		for index := 0; index < len(command.arguments); index++ {
+			argument := command.arguments[index]
+			if argument == "--" {
+				break
+			}
+			if argument != "-o" {
+				continue
+			}
+			if seenOutput || index+1 >= len(command.arguments) {
+				ambiguousOutput = true
+				break
+			}
+			seenOutput = true
+			index++
+			output = compactKbuildMaterializeActionTreeMarkers(command.arguments[index])
+		}
+		if !seenOutput || ambiguousOutput {
+			continue
+		}
+		if !strings.HasPrefix(output, "__LINUX_BZL_OBJECT_TREE__/") &&
+			!strings.HasPrefix(output, "${tree:prep}/") {
+			continue
+		}
+		if path, ok := compactKbuildRecipePath(output); ok && canonicalKbuildRulePath(path) == target {
 			return true
 		}
 	}
@@ -8712,6 +11722,9 @@ func compactKbuildRecipePath(value string) (string, bool) {
 	if strings.TrimSpace(value) != value {
 		return "", false
 	}
+	if compactKbuildRecipeImmutableSourceOutput(value) {
+		return "", false
+	}
 	for _, prefix := range []string{"${tree:kernel}/", "${tree:prep}/", "${tree:host}/", "${tree:bootstrap}/", "${tree:prehost}/", "${work:root}/"} {
 		if strings.HasPrefix(value, prefix) {
 			value = strings.TrimPrefix(value, prefix)
@@ -8719,6 +11732,15 @@ func compactKbuildRecipePath(value string) (string, bool) {
 		}
 	}
 	return compactKbuildCommandPath(value)
+}
+
+// The source tree is an immutable action input. Path projection of a command
+// operand normally drops its tree marker, so output recognition must reject a
+// source-rooted destination before comparing its relative graph pathname.
+func compactKbuildRecipeImmutableSourceOutput(value string) bool {
+	value = compactKbuildMaterializeActionTreeMarkers(value)
+	return strings.Contains(value, "__LINUX_BZL_SOURCE_TREE__/") ||
+		strings.HasPrefix(value, "${tree:source}/")
 }
 
 // normalizeCompactKbuildRecipeCommands removes only operations whose complete
@@ -9352,10 +12374,35 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 	if compactKbuildRecipeHasPipeline(commands) {
 		return "", fmt.Errorf("pipeline must be lowered as one compound action")
 	}
-	var err error
+	selectedSnapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil {
+		return "", err
+	}
+	localReads := map[int][]KbuildControlRecipeRead{}
+	for _, recipeIndex := range slices.Sorted(maps.Keys(selectedSnapshots)) {
+		for _, read := range selectedSnapshots[recipeIndex].Reads() {
+			if !read.Exists || read.Artifact.Producer == (CompactKbuildVisibleArtifact{}) {
+				continue
+			}
+			owner, err := b.selectionGraph.compactKbuildVisibleArtifactOwner(read.Artifact.Producer)
+			if err != nil {
+				return "", fmt.Errorf("%s: Kbuild target %q recipe %d read %q owner: %w", match.profile.Rules[match.ruleOrder].Position, target, recipeIndex, read.Path, err)
+			}
+			if owner.profile == match.profile.Name && owner.target == target {
+				localReads[recipeIndex] = append(localReads[recipeIndex], read)
+			}
+		}
+	}
+	if len(localReads) != 0 && len(match.commandRecipeIndices) != len(commands) {
+		return "", fmt.Errorf("%s: Kbuild target %q cannot attach local generated-file reads to source recipe lines", match.profile.Rules[match.ruleOrder].Position, target)
+	}
 	commands, err = normalizeCompactKbuildRecipeCommands(target, commands)
 	if err != nil {
 		return "", err
+	}
+	if len(match.commandRecipeIndices) != 0 && len(match.commandRecipeIndices) != len(commands) {
+		return "", fmt.Errorf("%s: Kbuild target %q command normalization lost selected source recipe line identity",
+			match.profile.Rules[match.ruleOrder].Position, target)
 	}
 	probeCommands := slices.Clone(match.compilerProbeCommands)
 	if len(probeCommands) != 0 {
@@ -9384,6 +12431,7 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 		ruleOutputSet[output] = true
 	}
 	pathProducers := map[string]compactKbuildRuleInput{}
+	localProducerLines := map[string]int{}
 	for _, input := range available {
 		pathProducers[input.path] = input
 	}
@@ -9392,6 +12440,32 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 	previousObservedStates := []compactKbuildRuleInput{}
 	finalProducer := ""
 	for commandIndex, command := range commands {
+		commandMatch := match
+		commandValues := values
+		// GNU Make expands the complete source line before running any shell
+		// commands on that line. An exact read of this target's own output
+		// therefore requires a concrete producer from an earlier source line.
+		if len(match.commandRecipeIndices) != 0 {
+			index := match.commandRecipeIndices[commandIndex]
+			for _, read := range localReads[index] {
+				logicalPath := read.Artifact.Producer.Path
+				input, exists := pathProducers[logicalPath]
+				writerIndex, written := localProducerLines[logicalPath]
+				if !exists || !input.recipeLocal || input.producer == "" ||
+					!written || writerIndex >= index {
+					return "", fmt.Errorf("%s: Kbuild target %q recipe %d read %q has no proven earlier recipe-local writer version",
+						match.profile.Rules[match.ruleOrder].Position, target, index, read.Path)
+				}
+			}
+			// Within this command the source evaluator, exports, shell, and
+			// typed script cwd all belong to the selecting immutable line.
+			commandMatch.profile = selectedSnapshots[index].Evaluation.Profile
+			if matched := match.recipeLineValues[index]; matched != nil {
+				commandValues = matched
+			}
+		}
+		match := commandMatch
+		values := commandValues
 		probeCommand := command
 		if len(probeCommands) != 0 {
 			probeCommand = probeCommands[commandIndex]
@@ -9607,6 +12681,41 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 			}
 			tool = "generated"
 		}
+		literalProgramExecutablePaths := map[string]bool{}
+		var absentLiteralProgramPaths map[string]string
+		if sourceScript && len(scriptInvocation.environmentUsage.literalProgramHeads) != 0 {
+			available, absentLiteralProgramPaths, err = b.compactKbuildSelectedLiteralProgramInputs(
+				available, match.profile, scriptInvocation.environmentUsage.literalProgramHeads,
+				literalProgramExecutablePaths,
+			)
+			if err != nil {
+				return "", fmt.Errorf("command %d source-script executable inputs: %w", commandIndex, err)
+			}
+		}
+		if sourceScript && len(scriptInvocation.environmentUsage.objectProgramHeads) != 0 {
+			programEnvironment, _, environmentErr := compactKbuildSourceScriptEnvironment(
+				target, match, inputs, scriptInvocation.environment, scriptInvocation.environmentUsage,
+				b.actionScope(), b.metadata.actionRoles,
+			)
+			if environmentErr != nil {
+				return "", fmt.Errorf("command %d source-script object program environment: %w", commandIndex, environmentErr)
+			}
+			var absentObjectProgramPaths map[string]string
+			available, absentObjectProgramPaths, err = b.compactKbuildSelectedObjectRootProgramInputs(
+				available, programEnvironment, scriptInvocation.environmentUsage.objectProgramHeads,
+				literalProgramExecutablePaths,
+			)
+			if err != nil {
+				return "", fmt.Errorf("command %d source-script object executables: %w", commandIndex, err)
+			}
+			if absentLiteralProgramPaths == nil {
+				absentLiteralProgramPaths = absentObjectProgramPaths
+			} else {
+				for pathname, program := range absentObjectProgramPaths {
+					absentLiteralProgramPaths[pathname] = program
+				}
+			}
+		}
 		typedOpaqueProgram := tool == "generated"
 		typedResponseFile := !sourceScript && exactResponseFile
 		if typedOpaqueProgram || typedResponseFile {
@@ -9652,6 +12761,9 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 			if err != nil {
 				return "", fmt.Errorf("command %d writable object-tree closure: %w", commandIndex, err)
 			}
+			if err := b.requireAbsentSelectedSourceProgramPaths(availableFrontier, absentLiteralProgramPaths); err != nil {
+				return "", fmt.Errorf("command %d source-script executable inputs: %w", commandIndex, err)
+			}
 			available, err = compactKbuildInputFrontierInputs(b.plan, availableFrontier)
 			if err != nil {
 				return "", fmt.Errorf("command %d inspect writable object-tree frontier: %w", commandIndex, err)
@@ -9695,10 +12807,22 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 				return "", fmt.Errorf("command %d declared output: %w", commandIndex, err)
 			}
 		}
+		selectedPhony := b.selectionBound && b.selectionGraph != nil &&
+			b.selectionGraph.compactKbuildProfileTargetIsPhony(match.profile, target)
+		logicalCheck := writtenOutputPath == "" && sourceScript &&
+			compactKbuildSourceCheckCandidate(target, match, command, sourceScriptArguments, scriptInput, len(commands), selectedPhony)
+		if logicalCheck {
+			// The selected always-run check has no declared file output. A
+			// private observed-state slot records successful execution without
+			// making its logical target appear in Make's writable object tree.
+			writtenOutputPath = b.compactKbuildRecipeIntermediateArtifactPath(
+				match.profile, target, commandIndex, "check/"+scriptInput.sourceID+".state",
+			)
+		}
 		if writtenOutputPath == "" && sourceScript {
-			// An immutable source script owns the selected rule target even when
-			// the wrapper recipe does not repeat $@ in argv. The script bytes and
-			// concrete rule, rather than a script-name table, establish ownership.
+			// A target-producing source script may carry its declared file path
+			// inside the immutable script rather than repeating $@ in Make argv.
+			// Outputless checks are authenticated above before this fallback.
 			writtenOutputPath = target
 		}
 		if writtenOutputPath == "" && len(commands) == 1 && (sourceScript || typedOpaqueProgram || command.programToolRole != "") {
@@ -9809,13 +12933,16 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 		}
 		graphOutputPath := logicalOutputPath
 		graphArtifactPath := ""
-		if !publishesTarget {
+		if !publishesTarget && !logicalCheck {
 			graphArtifactPath = b.compactKbuildRecipeIntermediateArtifactPath(
 				match.profile, target, commandIndex, logicalOutputPath,
 			)
 		}
 		primaryOutputDescriptor := ActionPlanOutput{
 			Tree: b.planContext().OutputTree, Path: graphOutputPath, ArtifactPath: graphArtifactPath,
+		}
+		if logicalCheck {
+			primaryOutputDescriptor.ObservedPath = target
 		}
 		outputDescriptors := []ActionPlanOutput{primaryOutputDescriptor}
 		if publishesTarget {
@@ -9894,6 +13021,10 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 			WorkingDirectories: slices.Clone(compilerOutputs.WorkingDirectories),
 			WorkingInputs:      map[string]string{},
 		}
+		if logicalCheck {
+			recipe.RequireAbsentObservedOutput = planOrdinal(0)
+			recipe.RequireUnchangedWorkingTree = true
+		}
 		probeEnvironment := map[string]string(nil)
 		if sourceScript {
 			var environmentRoles []string
@@ -9933,9 +13064,14 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 				}
 			}
 			if len(recipe.CommandReplays) != 0 {
-				recipe.Environment["MAKE"] = recipe.CommandReplays[0].Name
-			} else if recipe.Environment["MAKE"] == CompactKbuildRecursiveMakeProvenanceToken {
-				delete(recipe.Environment, "MAKE")
+				if recipe.Environment["MAKE"] == CompactKbuildRecursiveMakeProvenanceToken ||
+					!compactKbuildHasRecursiveMakeAliasExport(recipe.Environment) {
+					recipe.Environment["MAKE"] = recipe.CommandReplays[0].Name
+				}
+			}
+			recipe.CommandReplays, err = compactKbuildBindRecursiveMakeExportProxy(recipe.Environment, recipe.CommandReplays)
+			if err != nil {
+				return "", fmt.Errorf("command %d source-script recursive Make exports: %w", commandIndex, err)
 			}
 			recipe.AuxiliaryTools = scriptInvocation.auxiliaryToolRoles(runtimeApplets)
 			node.AuxiliaryTools = slices.Clone(recipe.AuxiliaryTools)
@@ -10018,7 +13154,8 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 				prefix = "input:"
 			}
 			recipe.WorkingInputs[prefix+key] = input.path
-			if sourceScript && input.producer != "" && b.compactKbuildInputIsHostToolOutput(input) {
+			if sourceScript && (literalProgramExecutablePaths[input.path] ||
+				input.producer != "" && b.compactKbuildInputIsHostToolOutput(input)) {
 				recipe.ExecutableInputs = append(recipe.ExecutableInputs, key)
 			}
 			bindings[input.path] = "${" + prefix + key + "}"
@@ -10193,7 +13330,15 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 			recipe.Trees = nil
 			recipe.WorkingTrees = nil
 		}
-		producer, err := appendActionPlanNode(b.plan, node, recipe)
+		if logicalCheck {
+			recipe.PrivateWorkingEffects = compactKbuildSourceCheckCompilerDepfileEffects(
+				match.profile, target, recipe.ExecutionDirectory, recipe.Arguments, recipe.AuxiliaryTools,
+			)
+			if len(recipe.PrivateWorkingEffects) != 0 {
+				recipe.RequireUnchangedWorkingTree = false
+			}
+		}
+		producer, err := b.appendCompactKbuildSelectedPlanNode(target, node, recipe)
 		if err != nil {
 			return "", fmt.Errorf("command %d: %w", commandIndex, err)
 		}
@@ -10260,11 +13405,17 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 			}
 			available = upsertCompactKbuildRuleInput(available, result)
 			pathProducers[logical] = result
+			if len(match.commandRecipeIndices) != 0 {
+				localProducerLines[logical] = match.commandRecipeIndices[commandIndex]
+			}
 			b.memo[logical] = producer
 		}
 		previousProducer, previousSlot = producer, 0
-		if publishesTarget {
+		if publishesTarget || logicalCheck {
 			finalProducer = producer
+			if logicalCheck {
+				b.memo[target] = producer
+			}
 		}
 	}
 	if finalProducer == "" {
@@ -10288,6 +13439,45 @@ func compactKbuildRecipeRuleOutputs(target string, match compactKbuildRuleMatch)
 		outputs = append(outputs, grouped)
 	}
 	return outputs
+}
+
+// An always-y assignment and an explicit PHONY declaration each request an
+// execution even when the selected source-script recipe creates no target
+// file. Bounds headers can share the always-y collection yet write a file;
+// their declared output takes precedence over this check candidate. The
+// runner independently requires that no writable file, including the
+// logical target, changes during a selected outputless check.
+func compactKbuildSourceCheckCandidate(
+	target string,
+	match compactKbuildRuleMatch,
+	command compactKbuildRecipeCommand,
+	sourceArguments []string,
+	script compactKbuildRuleInput,
+	commandCount int,
+	selectedPhony bool,
+) bool {
+	if commandCount != 1 || script.sourceID == "" || script.producer != "" ||
+		command.stdin != "" || command.stdout != "" || command.outputAlias != "" ||
+		compactKbuildRuleHasGroupedOutputs(match.rule) {
+		return false
+	}
+	authored := selectedPhony
+	for _, generated := range match.profile.Generated {
+		if !authored && generated.Kind == "always" && slices.Contains(match.rule.Prerequisites, "FORCE") &&
+			compactKbuildProfileGeneratedTargetPath(match.profile, generated.Target) == target {
+			authored = true
+			break
+		}
+	}
+	if !authored {
+		return false
+	}
+	for _, argument := range sourceArguments {
+		if candidate, pathOperand := compactKbuildProfileCommandOperandPath(match.profile, argument); pathOperand && candidate == target {
+			return false
+		}
+	}
+	return true
 }
 
 // GNU Make's multi-target implicit pattern rules have one recipe invocation
@@ -10420,6 +13610,15 @@ func compactKbuildRecipeDirectorySetup(command compactKbuildRecipeCommand) (bool
 	}
 	for _, directory := range directories {
 		directory = strings.TrimSuffix(directory, "/")
+		for _, component := range strings.Split(directory, "/") {
+			if component == ".." {
+				// Cleaning this path before erasing mkdir loses directories
+				// traversed on the way to its final parent. Unlike the
+				// parse-time object view, this recipe has no directory effects
+				// to publish for those intermediate paths.
+				return false, fmt.Errorf("kernel action plan Kbuild %s directory path %q has unmodeled parent traversal", program, directory)
+			}
+		}
 		if _, ok := compactKbuildRecipePath(directory); !ok {
 			return false, fmt.Errorf("kernel action plan Kbuild %s directory path %q is not a canonicalizable relative path", program, directory)
 		}
@@ -12088,6 +15287,14 @@ func evaluatedKbuildRuleCommands(
 	target string,
 	match compactKbuildRuleMatch,
 ) ([]CompactKbuildCommandTemplate, bool, error) {
+	if snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match); err != nil {
+		return nil, false, err
+	} else if len(snapshots) != 0 {
+		// A target-wide evaluator cannot express the different frozen views of
+		// two recipe lines. Only a complete source-indexed line selection may
+		// decide whether this selected rule has an executable action.
+		return evaluateKbuildRuleCommandsUncached(target, match)
+	}
 	evaluator, err := compactKbuildProfileTargetEvaluator(match.profile, target)
 	if err != nil {
 		return nil, false, err
@@ -12115,12 +15322,324 @@ func evaluatedKbuildRuleCommands(
 	return selections, found, nil
 }
 
+// compactKbuildSelectedRuleRecipeSnapshots indexes the source-visited lines
+// of one selected rule. An empty index is the established target-wide path
+// (including unrelated candidate rules and fixtures with eager control).
+// Once any line of a selected rule is indexed, every executable line must
+// have its own immutable Make state; falling back to the final target state
+// would read a generated file before its source writer runs.
+func compactKbuildSelectedRuleRecipeSnapshots(
+	target string, match compactKbuildRuleMatch,
+) (map[int]*KbuildSelectedControlRecipeSnapshot, error) {
+	if match.ruleOrder < 0 || match.ruleOrder >= len(match.profile.Rules) ||
+		!slices.Equal(match.rule.Recipe, match.profile.Rules[match.ruleOrder].Recipe) {
+		return nil, nil
+	}
+	selected := map[int]*KbuildSelectedControlRecipeSnapshot{}
+	for _, snapshot := range match.profile.targetLineReadSnapshots[compactKbuildGraphTargetPath(target)] {
+		if snapshot == nil {
+			return nil, fmt.Errorf("Kbuild target %q has a nil source recipe snapshot", target)
+		}
+		if snapshot.Line.RuleIndex != match.ruleOrder {
+			continue
+		}
+		index := snapshot.Line.RecipeIndex
+		mismatches := []string{}
+		if snapshot.Line.Target != compactKbuildGraphTargetPath(target) {
+			mismatches = append(mismatches, fmt.Sprintf("target (source %q, selected %q)", snapshot.Line.Target, compactKbuildGraphTargetPath(target)))
+		}
+		if snapshot.Line.LookupTarget != match.lookupTarget {
+			mismatches = append(mismatches, fmt.Sprintf("lookup target (source %q, selected %q)", snapshot.Line.LookupTarget, match.lookupTarget))
+		}
+		if index < 0 || index >= len(match.rule.Recipe) {
+			mismatches = append(mismatches, "recipe index")
+		}
+		if snapshot.Evaluation.Profile.evaluator == nil {
+			mismatches = append(mismatches, "evaluation profile")
+		}
+		if len(mismatches) != 0 {
+			return nil, fmt.Errorf("%s: Kbuild target %q recipe %d has inconsistent source-selected line identity: %s differs", match.profile.Rules[match.ruleOrder].Position, target, index, strings.Join(mismatches, ", "))
+		}
+		if selected[index] != nil {
+			return nil, fmt.Errorf("%s: Kbuild target %q recipe %d has two selected immutable views", match.profile.Rules[match.ruleOrder].Position, target, index)
+		}
+		selected[index] = snapshot
+	}
+	if len(selected) == 0 {
+		return nil, nil
+	}
+	for index, raw := range match.rule.Recipe {
+		if _, control, err := exactKbuildEvalRecipeBody(raw); err != nil {
+			return nil, fmt.Errorf("%s: Kbuild target %q recipe %d: %w", match.profile.Rules[match.ruleOrder].Position, target, index, err)
+		} else if !control && selected[index] == nil {
+			return nil, fmt.Errorf("%s: Kbuild target %q recipe %d has no source-selected immutable view", match.profile.Rules[match.ruleOrder].Position, target, index)
+		}
+	}
+	return selected, nil
+}
+
+// Prerequisites and automatic words belong to the recorded rule-entry view,
+// which can precede the first executable line when a recipe starts with
+// $(eval ...). Keep the finished profile so the target evaluator can validate
+// and use that separate entry; line-local command lowering selects its own
+// frozen recipe views.
+func compactKbuildSelectedRuleEntryMatch(
+	target string, match compactKbuildRuleMatch,
+) (compactKbuildRuleMatch, error) {
+	if _, err := compactKbuildSelectedRuleRecipeSnapshots(target, match); err != nil {
+		return compactKbuildRuleMatch{}, err
+	}
+	return match, nil
+}
+
+func compactKbuildRejectTargetWideLineReads(
+	target string, match compactKbuildRuleMatch,
+	snapshots map[int]*KbuildSelectedControlRecipeSnapshot,
+) error {
+	var first *KbuildSelectedControlRecipeSnapshot
+	for _, index := range slices.Sorted(maps.Keys(snapshots)) {
+		snapshot := snapshots[index]
+		if isKbuildRecipeDirectorySetupExpression(match.profile.Rules[snapshot.Line.RuleIndex].Recipe[index]) {
+			continue
+		}
+		if first == nil {
+			first = snapshot
+			continue
+		}
+		if first.ReadIdentity() != snapshot.ReadIdentity() ||
+			first.CommandShell != snapshot.CommandShell ||
+			!maps.Equal(first.Environment, snapshot.Environment) {
+			return fmt.Errorf("%s: Kbuild target %q recipe %d has different selected file reads, shell, or exports from recipe %d; one target-wide action cannot preserve both immutable frontiers",
+				match.profile.Rules[snapshot.Line.RuleIndex].Position, target, index, first.Line.RecipeIndex)
+		}
+	}
+	return nil
+}
+
+// Return the remaining occurrence indexes only when every preceding source
+// line has been independently proved to create the already-declared output
+// parent. An unsupported line belongs to normal linear lowering or to the
+// caller's target-wide guard; it cannot justify dropping a selected frontier.
+func compactKbuildSelectedOutputParentSetupOccurrences(
+	target string, match compactKbuildRuleMatch, templates []string, indexes []int,
+	snapshots map[int]*KbuildSelectedControlRecipeSnapshot,
+	automatic compactKbuildAutomaticContext, injected map[string]string,
+) ([]int, int, bool, error) {
+	if match.capturedEnvironment != nil || len(snapshots) == 0 ||
+		len(indexes) == 0 || len(indexes) != len(templates) {
+		return nil, -1, false, nil
+	}
+	setupLines := map[int]bool{}
+	activeLine := -1
+	activeOccurrences := []int{}
+	for occurrence, recipeIndex := range indexes {
+		snapshot := snapshots[recipeIndex]
+		if snapshot == nil {
+			return nil, -1, false, nil
+		}
+		if activeLine < 0 {
+			lineMatch := match
+			lineMatch.profile = snapshot.Evaluation.Profile
+			pure, err := compactKbuildSelectedRecipeSourceExpansionIsPure(
+				target, lineMatch, match.rule.Recipe[recipeIndex], automatic, injected,
+			)
+			if err != nil {
+				return nil, -1, false, fmt.Errorf("%s: Kbuild target %q recipe %d output-parent Make expansion: %w",
+					match.profile.Rules[match.ruleOrder].Position, target, recipeIndex, err)
+			}
+			if !pure {
+				return nil, -1, false, nil
+			}
+			setup := false
+			if compactKbuildRecipeExecutionText(templates[occurrence]) == "" {
+				setup = true
+			} else {
+				setup, err = compactKbuildSelectedOutputParentSetupTemplate(
+					target, lineMatch, templates[occurrence], automatic,
+				)
+			}
+			if err != nil {
+				return nil, -1, false, fmt.Errorf("%s: Kbuild target %q recipe %d output-parent setup: %w",
+					match.profile.Rules[match.ruleOrder].Position, target, recipeIndex, err)
+			}
+			if setup {
+				setupLines[recipeIndex] = true
+				continue
+			}
+		}
+		if setupLines[recipeIndex] || activeLine >= 0 && activeLine != recipeIndex {
+			return nil, -1, false, nil
+		}
+		activeLine = recipeIndex
+		activeOccurrences = append(activeOccurrences, occurrence)
+	}
+	if len(setupLines) == 0 || activeLine < 0 {
+		return nil, -1, false, nil
+	}
+	for recipeIndex := range snapshots {
+		if recipeIndex != activeLine && !setupLines[recipeIndex] {
+			return nil, -1, false, nil
+		}
+	}
+	return activeOccurrences, activeLine, true, nil
+}
+
+// A recipe may have run a source function while forming even a harmless
+// looking mkdir command or an empty string. Resolve the selected call bodies
+// and target variables in the same frozen Make state, disabling shell queries
+// so even a cached shell result cannot disguise a filesystem effect. GNU Make
+// file/eval/error and unresolved call bodies also prevent elision.
+func compactKbuildSelectedRecipeSourceExpansionIsPure(
+	target string, match compactKbuildRuleMatch, raw string,
+	automatic compactKbuildAutomaticContext, injected map[string]string,
+) (bool, error) {
+	parser, cleanup, err := compactKbuildTargetParserWithExportsForLookup(
+		match.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+		automatic.normal, automatic.order, injected, false, false,
+	)
+	if err != nil {
+		return false, err
+	}
+	defer cleanup()
+	return !parser.makeExpansionHasStatefulEffect(raw, map[string]bool{}, 0), nil
+}
+
+// A selected mkdir line may have its own source read identity (for example,
+// Make's wildcard check for an output parent). Bazel and mapdirectoryrecipe
+// create declared output parents before the following command runs. Erase a
+// setup occurrence only after its complete selected shell text proves that it
+// does nothing beyond a passive status echo and creating that exact parent.
+func compactKbuildSelectedOutputParentSetupTemplate(
+	target string, match compactKbuildRuleMatch, template string,
+	automatic compactKbuildAutomaticContext,
+) (bool, error) {
+	text := compactKbuildRecipeExecutionText(template)
+	if text == "" || containsUnmodeledKbuildDollar(text) ||
+		strings.ContainsAny(withoutActionPlanTreePlaceholders(text), "`*?[]") {
+		return false, nil
+	}
+	commands, err := parseCompactKbuildRecipe(compactKbuildFinalizeRootedActionRecipeText(text), automatic)
+	if err != nil || len(commands) == 0 {
+		return false, nil
+	}
+	if compactKbuildRecipeImmutableSourceOutput(target) {
+		return false, nil
+	}
+	targetPath, valid := compactKbuildRecipePath(target)
+	if !valid {
+		return false, nil
+	}
+	parent := path.Dir(targetPath)
+	if parent == "." {
+		return false, nil
+	}
+	createdParent := false
+	for _, command := range commands {
+		if command.connector != "" && command.connector != ";" ||
+			len(command.environment) != 0 || command.stdin != "" || command.stdout != "" {
+			return false, nil
+		}
+		switch command.program {
+		case "echo":
+			// A configured echo-named program might write files. Only the bare
+			// selected runtime applet with no active shell syntax is passive.
+			continue
+		case "mkdir":
+			command, err = rewriteCompactKbuildCommandAutomaticPaths(match.profile, target, match, command)
+			if err != nil {
+				return false, err
+			}
+			setup, setupErr := compactKbuildRecipeDirectorySetup(command)
+			if setupErr != nil || !setup || len(command.arguments) != 2 {
+				return false, setupErr
+			}
+			operand := command.arguments[1]
+			if !strings.HasPrefix(operand, "${tree:prep}/") &&
+				!strings.HasPrefix(operand, "${work:root}/") &&
+				!strings.HasPrefix(operand, "__LINUX_BZL_OBJECT_TREE__/") {
+				return false, nil
+			}
+			logicalPath, valid := compactKbuildRecipePath(strings.TrimSuffix(operand, "/"))
+			if !valid || logicalPath != parent {
+				return false, nil
+			}
+			createdParent = true
+		default:
+			return false, nil
+		}
+	}
+	return createdParent, nil
+}
+
+// A source-selected command can expand into several argv commands. Return
+// their selecting recipe indexes alongside the occurrences instead of trying
+// to recover ownership from duplicate recipe text or command names later.
+func evaluatedKbuildRuleCommandSelectionsBySourceLine(
+	target string, match compactKbuildRuleMatch,
+	automatic compactKbuildAutomaticContext,
+	injected map[string]string, resolveSymbolic bool,
+) ([]CompactKbuildCommandTemplate, []int, error) {
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(snapshots) == 0 {
+		selections, err := evaluatedKbuildRuleCommandSelectionsForMakeTarget(
+			match.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+			automatic.normal, automatic.order, injected, match.rule.Recipe, resolveSymbolic,
+		)
+		return selections, nil, err
+	}
+	selections := []CompactKbuildCommandTemplate{}
+	indices := []int{}
+	for index, raw := range match.rule.Recipe {
+		if snapshot := snapshots[index]; snapshot != nil {
+			lineSelections, err := evaluatedKbuildRuleCommandSelectionsForMakeTarget(
+				snapshot.Evaluation.Profile, target, match.lookupTarget,
+				automatic.target, automatic.stem, automatic.normal, automatic.order,
+				injected, []string{raw}, resolveSymbolic,
+			)
+			if err != nil {
+				return nil, nil, fmt.Errorf("%s: Kbuild target %q recipe %d command selection: %w", match.profile.Rules[match.ruleOrder].Position, target, index, err)
+			}
+			selections = append(selections, lineSelections...)
+			for range lineSelections {
+				indices = append(indices, index)
+			}
+		}
+	}
+	return selections, indices, nil
+}
+
 func evaluateKbuildRuleCommandsUncached(
 	target string,
 	match compactKbuildRuleMatch,
 ) ([]CompactKbuildCommandTemplate, bool, error) {
 	if len(kbuildRecipeCommandExpressions(match.rule.Recipe)) == 0 {
-		direct, err := evaluatedKbuildDirectRecipeHasAction(target, match)
+		snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+		if err != nil {
+			return nil, false, err
+		}
+		direct := false
+		if len(snapshots) == 0 {
+			direct, err = evaluatedKbuildDirectRecipeHasAction(target, match)
+		} else {
+			for index := range match.rule.Recipe {
+				snapshot := snapshots[index]
+				if snapshot == nil {
+					continue
+				}
+				lineMatch := match
+				lineMatch.profile = snapshot.Evaluation.Profile
+				lineMatch.rule.Recipe = []string{match.rule.Recipe[index]}
+				lineAction, _, lineErr := evaluatedKbuildDirectRecipeEffects(target, lineMatch)
+				if lineErr != nil {
+					err = fmt.Errorf("%s: Kbuild target %q recipe %d action: %w", match.profile.Rules[match.ruleOrder].Position, target, index, lineErr)
+					break
+				}
+				direct = direct || lineAction
+			}
+		}
 		if err != nil {
 			return nil, false, err
 		}
@@ -12133,15 +15652,20 @@ func evaluateKbuildRuleCommandsUncached(
 	if err != nil {
 		return nil, false, err
 	}
-	selections, err := evaluatedKbuildRuleCommandSelectionsForMakeTarget(
-		match.profile, target, match.lookupTarget, automatic.target, automatic.stem,
-		automatic.normal, automatic.order, nil, match.rule.Recipe, true,
-	)
+	selections, indices, err := evaluatedKbuildRuleCommandSelectionsBySourceLine(target, match, automatic, nil, true)
+	if err != nil {
+		return nil, false, err
+	}
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
 	if err != nil {
 		return nil, false, err
 	}
 	hasAction := false
-	for _, selection := range selections {
+	for selectionIndex, selection := range selections {
+		lineMatch := match
+		if len(indices) != 0 {
+			lineMatch.profile = snapshots[indices[selectionIndex]].Evaluation.Profile
+		}
 		if selection.Name == "" {
 			// Direct occurrences are source-selected executable text. Whether the
 			// command writes the declared target, only a side output, or requires an
@@ -12152,16 +15676,16 @@ func evaluateKbuildRuleCommandsUncached(
 		}
 		template := selection.Text
 		if strings.TrimSpace(template) != "" {
-			evaluated := compactKbuildDirectRecipeText(match.profile, template)
+			evaluated := compactKbuildDirectRecipeText(lineMatch.profile, template)
 			parsed, parseErr := parseCompactKbuildRecipe(evaluated, automatic)
 			if parseErr == nil {
-				templateAction, _, effectsErr := evaluatedKbuildParsedRecipeEffects(target, match, parsed)
+				templateAction, _, effectsErr := evaluatedKbuildParsedRecipeEffects(target, lineMatch, parsed)
 				if effectsErr != nil {
 					return nil, false, fmt.Errorf("target %q profile %q command %q effects: %w", target, match.profile.Name, selection.Name, effectsErr)
 				}
 				if !templateAction {
 					scripts, scriptsErr := ReadCompactKbuildCommandSourceScripts(
-						match.profile, target, automatic.stem,
+						lineMatch.profile, target, automatic.stem,
 						automatic.normal, automatic.order, nil, evaluated,
 					)
 					if scriptsErr != nil {

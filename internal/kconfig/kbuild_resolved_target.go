@@ -38,7 +38,10 @@ type CompactKbuildResolvedTarget struct {
 	target  string
 	match   compactKbuildRuleMatch
 	matched bool
-	effects *compactKbuildResolvedTargetEffectsMemo
+	// A source-selected prerequisite-only rule still owns its exact context,
+	// although it has no executable command or action effects.
+	contextSelected bool
+	effects         *compactKbuildResolvedTargetEffectsMemo
 }
 
 // Keep synchronization behind a pointer so an opaque handle copied by a
@@ -112,6 +115,43 @@ func ResolveCompactKbuildTargetForMakeTarget(
 	}, nil
 }
 
+// ResolveCompactKbuildTargetForSelectedRule retains an indexed source-selected
+// rule for both prerequisites and execution effects. The index already proved
+// this candidate viable in its exact virtual frontier; a fresh physical-source
+// search could pick another implicit recipe while preserving the same target.
+func ResolveCompactKbuildTargetForSelectedRule(
+	profile CompactKbuildProfile,
+	target, makeTarget string,
+	ruleIndex int,
+	stem string,
+) (*CompactKbuildResolvedTarget, error) {
+	target = compactKbuildGraphTargetPath(target)
+	match, err := compactKbuildCandidateMatchForMakeTarget(profile, target, makeTarget, ruleIndex, stem)
+	if err != nil {
+		return nil, err
+	}
+	selections, found, err := evaluatedKbuildRuleCommands(target, match)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		match.commandTemplates = selections
+		match.command = selections[0].Name
+		match.commands = match.commandSequence()
+	}
+	return &CompactKbuildResolvedTarget{
+		profile: profile, target: target, match: match, matched: found, contextSelected: true,
+		effects: &compactKbuildResolvedTargetEffectsMemo{},
+	}, nil
+}
+
+// MatchesSelectedRule checks the candidate retained by an existing target
+// resolution. A caller can reuse its context/effects memo only for that exact
+// source-selected rule and pattern stem.
+func (r *CompactKbuildResolvedTarget) MatchesSelectedRule(ruleIndex int, stem string) bool {
+	return r != nil && r.matched && r.match.ruleOrder == ruleIndex && r.match.stem == stem
+}
+
 // HasSelectedRule reports whether resolution found an executable rule. A
 // false result can still expose prerequisite-only context through Context.
 func (r *CompactKbuildResolvedTarget) HasSelectedRule() bool {
@@ -125,7 +165,7 @@ func (r *CompactKbuildResolvedTarget) Context() (CompactKbuildResolvedTargetCont
 		return CompactKbuildResolvedTargetContext{}, fmt.Errorf("nil resolved Kbuild target")
 	}
 	var selected *compactKbuildRuleMatch
-	if r.matched {
+	if r.matched || r.contextSelected {
 		match := r.match
 		selected = &match
 	}

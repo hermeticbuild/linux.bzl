@@ -59,6 +59,36 @@ func bootstrapSuccess(name, stdout, stderr string) ProbeStepResult {
 	return ProbeStepResult{Name: name, Status: "success", ExitCode: 0, Stdout: stdout, Stderr: stderr}
 }
 
+func TestLinuxCompilerBootstrapCombinedVersionRequiresExactFirstLine(t *testing.T) {
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	for _, test := range []struct {
+		name   string
+		stdout string
+		stderr string
+		want   bool
+	}{
+		{name: "ordinary", stdout: "clang version 22.1.0\n", want: true},
+		{name: "stderr", stdout: "clang version 22.1.0\n", stderr: "warning\n"},
+		{name: "normalized line ending", stdout: "clang version 22.1.0\r\n"},
+		{name: "leading whitespace normalized", stdout: " clang version 22.1.0\n"},
+		{name: "trailing whitespace normalized", stdout: "clang version 22.1.0 \n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := fixture.result
+			result.Steps = append([]ProbeStepResult(nil), result.Steps...)
+			result.Steps[1].Stdout, result.Steps[1].Stderr = test.stdout, test.stderr
+			facts, err := ParseLinuxCompilerBootstrapResult(result, fixture.scope, bootstrapTestIdentity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, exact := facts.VersionTextForCombinedStream()
+			if exact != test.want {
+				t.Fatalf("version first-line parity = %t, want %t", exact, test.want)
+			}
+		})
+	}
+}
+
 func TestLinuxCompilerBootstrapRequestIsMinimalCanonicalPlan(t *testing.T) {
 	request := LinuxCompilerBootstrapRequest()
 	if err := request.Validate(); err != nil {

@@ -21,11 +21,36 @@ func TestModuleSDKProjectsOnlyPreparationClosure(t *testing.T) {
 	seedModuleSDKPlanOutputForTest(t, plan, "host", "host", "scripts/target-lifecycle-only", "vmlinux")
 	generated := seedModuleSDKPlanOutputForTest(t, plan, "prep", "prep", "include/generated/autoconf.h", "sdk")
 	moduleLinkerScript := seedModuleSDKPlanOutputForTest(t, plan, "prep", "prep", "scripts/module.lds", "sdk")
+	release := seedModuleSDKReleaseForTest(t, plan)
 	seedModuleSDKPlanOutputForTest(t, plan, "target", "objects", "vmlinux.o", "vmlinux")
 	persistentMetadata := seedModuleSDKPlanArtifactForTest(t, plan, "prep", ActionPlanOutput{
 		Tree: "prep", Path: "rust/libkernel.rmeta",
 		ArtifactPath: ".linux-bzl-intermediate/rust/libkernel.rmeta", persistent: true,
 	}, "sdk")
+	hostPersistent := seedModuleSDKPlanArtifactForTest(t, plan, "host", ActionPlanOutput{
+		Tree: "host", Path: "scripts/host-persistent.o",
+		ArtifactPath: ".linux-bzl-versions/host-persistent/scripts/host-persistent.o", persistent: true,
+	}, "sdk")
+	if err := appendCompactKbuildHostPrepMirrors(plan, CompactKbuildSelection{
+		Profile: "source-host-profile", Target: "scripts/host-persistent.o", MakeTarget: "scripts/host-persistent.o",
+		Lifecycle: "prep", Scope: "host", Stage: "host",
+	}, hostPersistent.producer); err != nil {
+		t.Fatal(err)
+	}
+	var mirroredPersistent moduleSDKSelectedArtifact
+	for _, node := range plan.Nodes {
+		if node.Stage != "prep" || len(node.Inputs) != 1 || node.Inputs[0].ProducerID != hostPersistent.producer ||
+			len(node.Outputs) != 1 || node.Outputs[0].Path != hostPersistent.path {
+			continue
+		}
+		if !node.Outputs[0].persistent || node.Outputs[0].ArtifactPath != ".linux-bzl-versions/host-persistent/scripts/host-persistent.o" {
+			t.Fatalf("private persistent host mirror = %#v, want exact native output version and SDK membership", node)
+		}
+		mirroredPersistent = moduleSDKSelectedArtifact{producer: node.ID, slot: 0, tree: "prep", path: hostPersistent.path}
+	}
+	if mirroredPersistent.producer == "" {
+		t.Fatal("source-selected private persistent host output has no prep mirror")
+	}
 	seedModuleSDKPlanArtifactForTest(t, plan, "prep", ActionPlanOutput{
 		Tree: "prep", Path: "rust/private-scratch",
 		ArtifactPath: ".linux-bzl-intermediate/rust/private-scratch",
@@ -40,13 +65,15 @@ func TestModuleSDKProjectsOnlyPreparationClosure(t *testing.T) {
 		t.Fatalf("appendModuleSDKActionPlanNodes() failed: %v", err)
 	}
 	for destination, source := range map[string]moduleSDKSelectedArtifact{
-		"scripts/basic/fixdep":         prepFixdep,
-		"scripts/mod/modpost":          prep,
-		"include/generated/autoconf.h": generated,
-		"scripts/module.lds":           moduleLinkerScript,
-		"rust/libkernel.rmeta":         persistentMetadata,
-		"Module.symvers":               symvers,
-		"vmlinux":                      vmlinux,
+		"include/config/kernel.release": release,
+		"scripts/basic/fixdep":          prepFixdep,
+		"scripts/mod/modpost":           prep,
+		"include/generated/autoconf.h":  generated,
+		"scripts/module.lds":            moduleLinkerScript,
+		"rust/libkernel.rmeta":          persistentMetadata,
+		"scripts/host-persistent.o":     mirroredPersistent,
+		"Module.symvers":                symvers,
+		"vmlinux":                       vmlinux,
 	} {
 		projection := moduleSDKProjectionNodeForTest(t, plan, destination)
 		if len(projection.Inputs) != 1 || projection.Inputs[0].ProducerID != source.producer {
@@ -74,6 +101,7 @@ func TestModuleSDKRequiresNativeModuleSymversProduct(t *testing.T) {
 	metadata := &CompactMetadata{Config: CompactConfig{}}
 	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
 	seedModuleSDKPlanOutputForTest(t, plan, "prep", "prep", ".config", "sdk")
+	seedModuleSDKReleaseForTest(t, plan)
 	before := len(plan.Nodes)
 	err := metadata.appendModuleSDKActionPlanNodes(plan)
 	if err == nil || !strings.Contains(err.Error(), `requires selected product "module_symvers"`) {
@@ -88,6 +116,7 @@ func TestModuleSDKRequiresNativeVmlinuxProduct(t *testing.T) {
 	metadata := &CompactMetadata{Config: CompactConfig{}}
 	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
 	seedModuleSDKPlanOutputForTest(t, plan, "prep", "prep", ".config", "sdk")
+	seedModuleSDKReleaseForTest(t, plan)
 	seedModuleSDKSymversForTest(t, plan)
 	before := len(plan.Nodes)
 	err := metadata.appendModuleSDKActionPlanNodes(plan)
@@ -96,6 +125,21 @@ func TestModuleSDKRequiresNativeVmlinuxProduct(t *testing.T) {
 	}
 	if got := len(plan.Nodes); got != before {
 		t.Fatalf("failed SDK projection added %d nodes", got-before)
+	}
+}
+
+func TestModuleSDKRequiresSourceSelectedKernelReleaseWriter(t *testing.T) {
+	metadata := &CompactMetadata{Config: CompactConfig{}}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	seedModuleSDKSymversForTest(t, plan)
+	seedModuleSDKVmlinuxForTest(t, plan)
+	before := len(plan.Nodes)
+	err := metadata.appendModuleSDKActionPlanNodes(plan)
+	if err == nil || !strings.Contains(err.Error(), "source-selected Kbuild writer for include/config/kernel.release") {
+		t.Fatalf("missing source-owned kernel release writer error = %v", err)
+	}
+	if got := len(plan.Nodes); got != before {
+		t.Fatalf("failed kernel release SDK projection added %d nodes", got-before)
 	}
 }
 
@@ -131,6 +175,7 @@ func TestModuleSDKUsesDependencyOrderForCanonicalAndPrivatePersistentVersions(t 
 			}
 			seedModuleSDKSymversForTest(t, plan)
 			seedModuleSDKVmlinuxForTest(t, plan)
+			seedModuleSDKReleaseForTest(t, plan)
 
 			if err := metadata.appendModuleSDKActionPlanNodes(plan); err != nil {
 				t.Fatalf("appendModuleSDKActionPlanNodes() failed: %v", err)
@@ -160,7 +205,7 @@ func TestModuleSDKUsesKbuildOverwriteOrderWithoutActionDependency(t *testing.T) 
 		{name: "later private persistent", canonicalFirst: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			graph, firstKey, secondKey := moduleSDKProbeOverwriteGraphForTest(t, destination)
+			graph, firstKey, secondKey := moduleSDKProbeOverwriteGraphForTest(t, destination, false)
 			metadata := &CompactMetadata{Config: CompactConfig{}}
 			plan := &ActionPlan{
 				Toolsets:       map[string]string{"host": actionPlanTestProbeIdentity, "target": actionPlanTestProbeIdentity},
@@ -199,6 +244,7 @@ func TestModuleSDKUsesKbuildOverwriteOrderWithoutActionDependency(t *testing.T) 
 			}
 			seedModuleSDKSymversForTest(t, plan)
 			seedModuleSDKVmlinuxForTest(t, plan)
+			seedModuleSDKReleaseForTest(t, plan)
 
 			if err := metadata.appendModuleSDKActionPlanNodes(plan); err != nil {
 				t.Fatalf("appendModuleSDKActionPlanNodes() failed: %v", err)
@@ -211,6 +257,95 @@ func TestModuleSDKUsesKbuildOverwriteOrderWithoutActionDependency(t *testing.T) 
 				t.Fatalf("projected action plan is invalid: %v", err)
 			}
 		})
+	}
+}
+
+func TestModuleSDKOrdersMirroredHostPrepWritersBySourceNativeProducer(t *testing.T) {
+	const destination = "tools/objtool/fixdep.o"
+	privatePath := ".linux-bzl-versions/sdk-test/" + destination
+	graph, firstKey, secondKey := moduleSDKProbeOverwriteGraphForTest(t, destination, true)
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"host": actionPlanTestProbeIdentity, "target": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{}, selectionGraph: graph,
+	}
+	first := seedModuleSDKPlanArtifactForTest(t, plan, "host", ActionPlanOutput{
+		Tree: "host", Path: destination, ArtifactPath: privatePath, persistent: true,
+	}, "sdk")
+	second := seedModuleSDKPlanOutputForTest(t, plan, "host", "host", destination, "sdk")
+	if err := graph.recordMaterializedProducer(firstKey, first.producer); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.recordMaterializedProducer(secondKey, second.producer); err != nil {
+		t.Fatal(err)
+	}
+	for _, writer := range []struct {
+		artifact moduleSDKSelectedArtifact
+		profile  string
+	}{{first, "module-sdk-probe-first"}, {second, "module-sdk-probe-second"}} {
+		selection := CompactKbuildSelection{
+			Profile: writer.profile, Target: destination, MakeTarget: destination,
+			Lifecycle: "prep", Scope: "host", Stage: "host",
+		}
+		if err := appendCompactKbuildHostPrepMirrors(plan, selection, writer.artifact.producer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	laterMirror, _, ok := planProducerByOutput(plan, "prep", destination)
+	if !ok {
+		t.Fatal("source-ordered final host writer has no canonical prep publisher")
+	}
+	if got := moduleSDKNativePrepMirrorProducer(plan, destination, laterMirror); got != second.producer {
+		t.Fatalf("final prep mirror source = %q, want host producer %q", got, second.producer)
+	}
+	seedModuleSDKSymversForTest(t, plan)
+	seedModuleSDKVmlinuxForTest(t, plan)
+	seedModuleSDKReleaseForTest(t, plan)
+	if err := (&CompactMetadata{Config: CompactConfig{}}).appendModuleSDKActionPlanNodes(plan); err != nil {
+		t.Fatalf("source ordered host mirrors cannot publish module SDK: %v", err)
+	}
+	projection := moduleSDKProjectionNodeForTest(t, plan, destination)
+	if len(projection.Inputs) != 1 || projection.Inputs[0].ProducerID != laterMirror {
+		t.Fatalf("SDK final %s projection = %#v, want later exact prep mirror %q", destination, projection.Inputs, laterMirror)
+	}
+	if _, err := plan.entries(); err != nil {
+		t.Fatalf("mirrored SDK graph is invalid: %v", err)
+	}
+
+	// An unrelated copy of the earlier host artifact has no declared mirror
+	// contract. The source graph cannot order that prep artifact by guessing
+	// its native producer from a generic copy edge.
+	unsafeGraph, unsafeFirstKey, unsafeSecondKey := moduleSDKProbeOverwriteGraphForTest(t, destination, true)
+	unsafe := &ActionPlan{
+		Toolsets: map[string]string{"host": actionPlanTestProbeIdentity, "target": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{}, selectionGraph: unsafeGraph,
+	}
+	unsafeFirst := seedModuleSDKPlanArtifactForTest(t, unsafe, "host", ActionPlanOutput{
+		Tree: "host", Path: destination, ArtifactPath: privatePath, persistent: true,
+	}, "sdk")
+	unsafeSecond := seedModuleSDKPlanOutputForTest(t, unsafe, "host", "host", destination, "sdk")
+	if err := unsafeGraph.recordMaterializedProducer(unsafeFirstKey, unsafeFirst.producer); err != nil {
+		t.Fatal(err)
+	}
+	if err := unsafeGraph.recordMaterializedProducer(unsafeSecondKey, unsafeSecond.producer); err != nil {
+		t.Fatal(err)
+	}
+	unsafeCopy := seedDependentModuleSDKPlanArtifactForTest(t, unsafe, "prep", ActionPlanOutput{
+		Tree: "prep", Path: destination, ArtifactPath: privatePath, persistent: true,
+	}, "sdk", unsafeFirst)
+	if got := moduleSDKNativePrepMirrorProducer(unsafe, destination, unsafeCopy.producer); got != unsafeCopy.producer {
+		t.Fatalf("unowned copy %q was incorrectly adopted as native host writer %q", unsafeCopy.producer, got)
+	}
+	if err := appendCompactKbuildHostPrepMirrors(unsafe, CompactKbuildSelection{
+		Profile: "module-sdk-probe-second", Target: destination, MakeTarget: destination,
+		Lifecycle: "prep", Scope: "host", Stage: "host",
+	}, unsafeSecond.producer); err != nil {
+		t.Fatal(err)
+	}
+	seedModuleSDKSymversForTest(t, unsafe)
+	seedModuleSDKVmlinuxForTest(t, unsafe)
+	seedModuleSDKReleaseForTest(t, unsafe)
+	if err := (&CompactMetadata{Config: CompactConfig{}}).appendModuleSDKActionPlanNodes(unsafe); err == nil || !strings.Contains(err.Error(), "claimed by") {
+		t.Fatalf("unowned prep copy was source-ordered without provenance: %v", err)
 	}
 }
 
@@ -228,6 +363,7 @@ func TestModuleSDKRejectsUnorderedCanonicalAndPrivatePersistentVersions(t *testi
 	seedModuleSDKPlanOutputForTest(t, plan, "prep", "prep", destination, "sdk")
 	seedModuleSDKSymversForTest(t, plan)
 	seedModuleSDKVmlinuxForTest(t, plan)
+	seedModuleSDKReleaseForTest(t, plan)
 
 	err := metadata.appendModuleSDKActionPlanNodes(plan)
 	if err == nil || !strings.Contains(err.Error(), "is claimed by") {
@@ -244,6 +380,7 @@ func TestModuleSDKSelectedModuleSymversOverridesGenericObjectTreePath(t *testing
 	seedModuleSDKPlanOutputForTest(t, plan, "prep", "prep", "Module.symvers", "sdk")
 	symvers := seedModuleSDKSymversForTest(t, plan)
 	seedModuleSDKVmlinuxForTest(t, plan)
+	seedModuleSDKReleaseForTest(t, plan)
 
 	if err := metadata.appendModuleSDKActionPlanNodes(plan); err != nil {
 		t.Fatalf("appendModuleSDKActionPlanNodes() failed: %v", err)
@@ -304,6 +441,7 @@ rust/helper-wrapper.o: rust/helper.rs FORCE
 	}
 	seedModuleSDKSymversForTest(t, plan)
 	seedModuleSDKVmlinuxForTest(t, plan)
+	seedModuleSDKReleaseForTest(t, plan)
 	if err := metadata.appendModuleSDKActionPlanNodes(plan); err != nil {
 		t.Fatalf("appendModuleSDKActionPlanNodes() failed: %v", err)
 	}
@@ -324,9 +462,15 @@ func seedModuleSDKPlanOutputForTest(t *testing.T, plan *ActionPlan, stage, tree,
 	return seedModuleSDKPlanArtifactForTest(t, plan, stage, ActionPlanOutput{Tree: tree, Path: outputPath}, product)
 }
 
+func seedModuleSDKReleaseForTest(t *testing.T, plan *ActionPlan) moduleSDKSelectedArtifact {
+	t.Helper()
+	return seedModuleSDKPlanOutputForTest(t, plan, "prep", "prep", "include/config/kernel.release", "sdk")
+}
+
 func moduleSDKProbeOverwriteGraphForTest(
 	t *testing.T,
 	destination string,
+	host bool,
 ) (*compactKbuildSelectionGraph, compactKbuildSelectionKey, compactKbuildSelectionKey) {
 	t.Helper()
 	writer := func(name string) CompactKbuildProfile {
@@ -343,12 +487,16 @@ cmd_emit = touch $@
 	}
 	setTestCompactKbuildInitialVisibleArtifacts(t, &second, []CompactKbuildVisibleArtifact{firstArtifact})
 	second.InvocationPredecessors = []string{first.Name}
+	stage, scope := "prep", "target"
+	if host {
+		stage, scope = "host", "host"
+	}
 	config := CompactConfig{
 		KbuildProfiles: []CompactKbuildProfile{first, second},
 		KbuildSelections: []CompactKbuildSelection{
-			{Profile: first.Name, Target: destination, MakeTarget: destination, Lifecycle: "prep", Scope: "target", Stage: "prep"},
+			{Profile: first.Name, Target: destination, MakeTarget: destination, Lifecycle: "prep", Scope: scope, Stage: stage},
 			{
-				Profile: second.Name, Target: destination, MakeTarget: destination, Lifecycle: "prep", Scope: "target", Stage: "prep", UsesInitialObjectTree: true,
+				Profile: second.Name, Target: destination, MakeTarget: destination, Lifecycle: "prep", Scope: scope, Stage: stage, UsesInitialObjectTree: true,
 				InitialObjectTreeArtifacts: EncodeCompactKbuildInitialObjectTreeArtifacts([]CompactKbuildVisibleArtifact{firstArtifact}),
 			},
 		},

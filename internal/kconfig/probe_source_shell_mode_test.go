@@ -64,6 +64,29 @@ func TestProbeSourceShellModeRequiresOwnedCompilerProjection(t *testing.T) {
 	}
 }
 
+func TestProbeSourceShellModeAcceptsOnlyOwnedCompilerLinkArgument(t *testing.T) {
+	request := sourceShellModeTestRequest()
+	request.Steps[0].Candidate.Policy = ProbeCandidatePolicyCCLink
+	request.Steps[0].Candidate.Projection = ""
+	if err := request.Validate(); err != nil {
+		t.Fatalf("source-measured link flags lost bounded compiler authority: %v", err)
+	}
+	ownedID, err := request.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Steps[0].ArgumentFragments[0].Mode = ""
+	plainID, err := request.ID()
+	if err != nil || ownedID == plainID {
+		t.Fatalf("link flag projection is missing from action identity: %v", err)
+	}
+	request.Steps[0].ArgumentFragments[0].Mode = ProbeArgumentFragmentsModeSourceShellWords
+	request.Steps[0].Tool = "ld"
+	if err := request.Validate(); err == nil {
+		t.Fatal("source-measured link flags accepted by a noncompiler executable")
+	}
+}
+
 func TestProbeSourceShellModeValidatesEveryLiteralBoundary(t *testing.T) {
 	const marker = "\x01linux-bzl-action-object-tree\x02"
 	for _, test := range []struct {

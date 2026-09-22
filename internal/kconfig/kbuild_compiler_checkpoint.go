@@ -232,7 +232,7 @@ func (s *KbuildProbeScopes) RestoreCompilerCheckpoint(data []byte, normalizeUpst
 		if len(current.references) != 0 || len(current.symbols) != 0 || current.symbolRegistry == nil || len(current.symbolRegistry.symbols) != 0 {
 			return fmt.Errorf("compiler checkpoint requires unused scopes")
 		}
-		fresh, err := NewLinuxProbeEvaluator(LinuxProbeEvaluatorOptions{Scope: name, Architecture: current.architecture, SourceArchitecture: current.sourceArchitecture, SourceRoot: current.sourceRoot, ScriptEnvironment: maps.Clone(record.Environment), Facts: current.facts, Tools: maps.Clone(current.tools), Discovery: builder, Oracle: current.oracle, RustSourceRoot: current.rustSourceRoot})
+		fresh, err := NewLinuxProbeEvaluator(LinuxProbeEvaluatorOptions{Scope: name, Architecture: current.architecture, SourceArchitecture: current.sourceArchitecture, SourceRoot: current.sourceRoot, SourceRootAliases: slices.Clone(current.sourceRootAliases), ScriptEnvironment: maps.Clone(record.Environment), Facts: current.facts, Tools: maps.Clone(current.tools), Discovery: builder, Oracle: current.oracle, RustSourceRoot: current.rustSourceRoot})
 		if err != nil {
 			return err
 		}

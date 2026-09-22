@@ -21,7 +21,7 @@ func TestActionPlanCheckpointRejectsMalformedOrUnboundState(t *testing.T) {
 	if _, err := RestoreActionPlanCheckpoint(data, b); err != nil {
 		t.Fatal(err)
 	}
-	for _, mutation := range []string{"unknown-field", "duplicate-field", "trailing", "wrong-schema", "variant", "toolset", "config", "config-files", "config-universe", "roles", "contracts", "source-artifacts", "physical-root", "traversal", "absolute", "backslash", "unknown-artifact", "missing-profile-roots", "duplicate-profile", "duplicate-selection", "missing-producer", "unknown-child", "invalid-projection-slot", "missing-compiler-node"} {
+	for _, mutation := range []string{"unknown-field", "duplicate-field", "trailing", "wrong-schema", "old-schema", "variant", "toolset", "config", "config-files", "config-universe", "roles", "contracts", "source-artifacts", "physical-root", "traversal", "absolute", "backslash", "unknown-artifact", "missing-profile-roots", "duplicate-profile", "duplicate-selection", "missing-producer", "unknown-child", "invalid-projection-slot", "missing-compiler-node"} {
 		t.Run(mutation, func(t *testing.T) {
 			var r actionPlanCheckpoint
 			if err := json.Unmarshal(data, &r); err != nil {
@@ -31,6 +31,8 @@ func TestActionPlanCheckpointRejectsMalformedOrUnboundState(t *testing.T) {
 			switch mutation {
 			case "wrong-schema":
 				r.Schema = "other"
+			case "old-schema":
+				r.Schema = "linux-action-plan-checkpoint-v2"
 			case "variant":
 				r.Variant = "other"
 			case "toolset":

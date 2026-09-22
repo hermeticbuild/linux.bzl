@@ -183,7 +183,7 @@ func TestActionPlanFamilyCompilerGuardHookRejectsChangedReplay(t *testing.T) {
 				}
 			case "resolved-config":
 				options.ResolvedConfigFiles = maps.Clone(options.ResolvedConfigFiles)
-				options.ResolvedConfigFiles["include/config/kernel.release"] = "different\n"
+				options.ResolvedConfigFiles["include/config/auto.conf"] = "different\n"
 			case "toolset":
 				target = "sha256-" + strings.Repeat("a", 64)
 			case "variant":

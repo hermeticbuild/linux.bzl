@@ -9324,11 +9324,10 @@ func resolvedConfigProjectionFixture() map[string]string {
 			"--cfg=CONFIG_MODULE=\"m\"",
 			"--cfg=CONFIG_TEXT=\"CONFIG_UNRELATED text\"",
 		}, "\n") + "\n",
-		"include/config/kernel.release": "6.18-selected\n",
 	}
 }
 
-func TestRenderConfigCapsuleFiltersAllSixProjections(t *testing.T) {
+func TestRenderConfigCapsuleFiltersResolvedProjections(t *testing.T) {
 	full := resolvedConfigProjectionFixture()
 	capsule, err := RenderConfigCapsule(full, ConfigDependencySet{
 		Symbols: []string{"CONFIG_MODULE_MODULE", "CONFIG_DISABLED"},
@@ -9340,12 +9339,11 @@ func TestRenderConfigCapsuleFiltersAllSixProjections(t *testing.T) {
 		t.Fatalf("capsule identity/files = %q/%#v", capsule.ID, capsule.Files)
 	}
 	for pathname, wantFragments := range map[string][]string{
-		".config":                       {"# CONFIG_DISABLED is not set", "CONFIG_MODULE=m"},
-		"include/config/auto.conf":      {"CONFIG_MODULE=m"},
-		"include/generated/autoconf.h":  {"__GENERATED_AUTOCONF_H__", "CONFIG_MODULE_MODULE"},
-		"include/generated/rustc_cfg":   {"CONFIG_MODULE", `CONFIG_MODULE="m"`},
-		"include/config/auto.conf.cmd":  {"kconfig_parse -resolve_config"},
-		"include/config/kernel.release": {},
+		".config":                      {"# CONFIG_DISABLED is not set", "CONFIG_MODULE=m"},
+		"include/config/auto.conf":     {"CONFIG_MODULE=m"},
+		"include/generated/autoconf.h": {"__GENERATED_AUTOCONF_H__", "CONFIG_MODULE_MODULE"},
+		"include/generated/rustc_cfg":  {"CONFIG_MODULE", `CONFIG_MODULE="m"`},
+		"include/config/auto.conf.cmd": {"kconfig_parse -resolve_config"},
 	} {
 		contents := capsule.Files[pathname]
 		for _, fragment := range wantFragments {
@@ -9359,8 +9357,8 @@ func TestRenderConfigCapsuleFiltersAllSixProjections(t *testing.T) {
 			}
 		}
 	}
-	if got := capsule.Files["include/config/kernel.release"]; got != "\n" {
-		t.Fatalf("filtered kernel.release = %q, want empty projection", got)
+	if _, hasRelease := capsule.Files["include/config/kernel.release"]; hasRelease {
+		t.Fatalf("Kbuild-owned release was captured as a Kconfig projection: %#v", capsule.Files)
 	}
 }
 

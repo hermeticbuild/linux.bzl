@@ -174,6 +174,8 @@ $(target): FORCE
 		options, err := scopes.Options("target", KbuildOptions{
 			RootDir:                 root,
 			WorkingDir:              root,
+			SourceRoots:             map[string]string{"__LINUX_BZL_OBJECT_TREE__": root},
+			VirtualFileView:         &testKbuildVirtualFileView{},
 			Variables:               map[string]string{"RUSTC": target.Tools["rustc"]},
 			ConfigVariablesComplete: true,
 			MakeVariablesComplete:   true,

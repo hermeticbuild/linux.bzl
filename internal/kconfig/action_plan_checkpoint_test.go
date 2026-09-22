@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"maps"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hermeticbuild/linux.bzl/internal/pkgconfigmanifest"
 )
 
 func TestActionPlanCheckpointBackendReplaysCompleteLoweredPlan(t *testing.T) {
@@ -290,6 +294,58 @@ func TestActionPlanCheckpointVirtualRootsNeedCurrentBindings(t *testing.T) {
 	b.VirtualSourceRoots = map[string]string{virtual: root}
 	if _, err := RestoreActionPlanCheckpoint(data, b); err == nil {
 		t.Fatal("checkpoint virtual root acquired filesystem authority")
+	}
+}
+
+func TestActionPlanCheckpointRejectsChangedDeclaredPkgConfigManifest(t *testing.T) {
+	m := familyVariantMetadataForTest(t, nil)
+	plan, _, err := m.lowerSelectedActionPlan(actionPlanTestProbeIdentity, actionPlanTestProbeIdentity, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := m.Config.KbuildProfiles[0].evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"]
+	b := ActionPlanCheckpointBindings{
+		Variant: "base", SourceArtifacts: map[string]string{"linux": root},
+		Toolsets: plan.Toolsets, ConfigValues: m.configFragment,
+		ConfigFiles: familyTestConfig("1", "0"), ConfigSymbolUniverse: m.configSymbolUniverse,
+		ActionContracts: m.actionContracts, ActionRoles: m.actionRoles,
+	}
+	filename := filepath.Join(t.TempDir(), "pkg-config.json")
+	writeManifest := func(packages string) *pkgconfigmanifest.Manifest {
+		t.Helper()
+		contents := `{"schema":"linux.bzl/pkg-config-manifest/v1","packages":` + packages + `}`
+		if err := os.WriteFile(filename, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		manifest, err := pkgconfigmanifest.Read(filename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return manifest
+	}
+	original := writeManifest(`{"liboptional":{"cflags":[],"libs":[]}}`)
+	if _, present := original.Packages["liboptional"]; !present {
+		t.Fatal("first declared manifest must make liboptional available")
+	}
+	b.HostPkgConfigManifestIdentity = original.ContentIdentity()
+	data, err := CaptureActionPlanCheckpoint(plan, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreActionPlanCheckpoint(data, b); err != nil {
+		t.Fatalf("unchanged declared host manifest rejected: %v", err)
+	}
+	current := writeManifest(`{}`)
+	if _, present := current.Packages["liboptional"]; present || current.ContentIdentity() == original.ContentIdentity() {
+		t.Fatal("same-path manifest did not change package membership and identity")
+	}
+	b.HostPkgConfigManifestIdentity = current.ContentIdentity()
+	if _, err := RestoreActionPlanCheckpoint(data, b); err == nil || !strings.Contains(err.Error(), "host pkg-config manifest") {
+		t.Fatalf("same-path package change was accepted: %v", err)
+	}
+	b.HostPkgConfigManifestIdentity = ""
+	if _, err := RestoreActionPlanCheckpoint(data, b); err == nil || !strings.Contains(err.Error(), "host pkg-config manifest") {
+		t.Fatalf("unbound package manifest was accepted: %v", err)
 	}
 }
 

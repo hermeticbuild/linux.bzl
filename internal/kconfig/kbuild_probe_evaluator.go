@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/hermeticbuild/linux.bzl/internal/pkgconfigmanifest"
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
@@ -32,10 +33,12 @@ type KbuildProbeScopeOptions struct {
 	Architecture       string
 	SourceArchitecture string
 	SourceRoot         string
+	SourceRootAliases  []string
 	ScriptEnvironment  map[string]string
 	Facts              *LinuxCompilerFacts
 	Tools              map[string]string
 	RustSourceRoot     string
+	PkgConfigManifest  *pkgconfigmanifest.Manifest
 }
 
 // compilerPredefineProjectionUnsupportedError is returned before an initial
@@ -73,8 +76,31 @@ type KbuildProbeScopes struct {
 	// the binding and active evaluator set remain local to this workload.
 	exactScriptEnvironmentBindings    map[string]map[string]map[string]string
 	exactScriptEnvironmentActivations map[string]func() error
-	activeExactScriptEnvironment      string
-	activeScriptEnvironmentIdentity   string
+	// The selected filechk observes all exports of its GNU Make invocation,
+	// including explicit host roles which ordinary scope-specific shell probes
+	// cannot execute. Keep this snapshot separate from the scoped evaluators.
+	selectedSourceExportBindings    map[string]map[string]string
+	activeSelectedSourceExports     map[string]string
+	activeExactScriptEnvironment    string
+	activeScriptEnvironmentIdentity string
+	graphGuardResults               *KbuildGraphGuardResults
+	graphGuardDiscoveryOnly         bool
+}
+
+func (s *KbuildProbeScopes) InstallGraphGuardResults(results *KbuildGraphGuardResults, discoveryOnly bool) error {
+	if results == nil {
+		s.graphGuardDiscoveryOnly = discoveryOnly
+		return nil
+	}
+	if err := results.validateScopes(s); err != nil {
+		return err
+	}
+	if s.graphGuardResults != nil {
+		return fmt.Errorf("Kbuild graph guard results were already installed")
+	}
+	s.graphGuardResults = results
+	s.graphGuardDiscoveryOnly = discoveryOnly
+	return nil
 }
 
 const (
@@ -120,6 +146,9 @@ func (e *LinuxProbeEvaluator) SelectSymbolic(value, expected string, equal bool,
 		return "", true, fmt.Errorf("Linux probe evaluator is nil")
 	}
 	scopes := &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{e.scope: e}}
+	if err := scopes.validateSymbolicConsumer(e.scope, value, expected, trueText, falseText); err != nil {
+		return "", true, err
+	}
 	return scopes.selectSymbolic(value, expected, equal, trueText, falseText)
 }
 
@@ -131,6 +160,9 @@ func (e *LinuxProbeEvaluator) TransformSymbolic(function string, args []string) 
 		return "", true, fmt.Errorf("Linux probe evaluator is nil")
 	}
 	scopes := &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{e.scope: e}}
+	if err := scopes.validateSymbolicConsumer(e.scope, args...); err != nil {
+		return "", true, err
+	}
 	return scopes.transformSymbolic(function, args)
 }
 
@@ -169,6 +201,11 @@ func (s *KbuildProbeScopes) Options(scope string, base KbuildOptions) (KbuildOpt
 	if base.probeEnvironmentIdentity != nil {
 		return KbuildOptions{}, fmt.Errorf("Kbuild probe workload %s options already contain a probe-environment identity", scope)
 	}
+	if base.shellExportLoopOverride != nil {
+		return KbuildOptions{}, fmt.Errorf("Kbuild probe workload %s options already contain an incoming shell export activation", scope)
+	}
+	base.RejectUnmeasuredGraphGuards = s.graphGuardResults != nil && !s.graphGuardDiscoveryOnly
+	base.ResolveMeasuredGraphGuards = s.graphGuardResults != nil
 	fallbackShell := base.Shell
 	base.ResolveSymbolic = func(value string) (string, error) {
 		return s.resolveSymbolicForScope(scope, value)
@@ -202,6 +239,92 @@ func (s *KbuildProbeScopes) Options(scope string, base KbuildOptions) (KbuildOpt
 	}
 	base.SourceShell = func(command, workingDirectory string) (string, error) {
 		return s.kbuildSourceShell(context.Background(), command, workingDirectory)
+	}
+	base.shellExportLoopOverride = s.activateIncomingShellExports
+	return base, nil
+}
+
+// activateIncomingShellExports reconstructs GNU Make's incoming process
+// environment for the exported recursive variables currently expanding a
+// $(shell ...) query. The exact workload binding is temporary; returning to
+// the prior binding retains newly registered probe references and gives the
+// next query its original source-ordered environment.
+func (s *KbuildProbeScopes) activateIncomingShellExports(
+	fallbacks []kbuildShellExportFallback,
+) (func() error, error) {
+	previous := s.currentScriptEnvironments()
+	var previousSelectedExports, incomingSelectedExports []map[string]string
+	if s.activeSelectedSourceExports != nil {
+		previousSelectedExports = append(previousSelectedExports, maps.Clone(s.activeSelectedSourceExports))
+		incomingExports := maps.Clone(s.activeSelectedSourceExports)
+		for _, fallback := range fallbacks {
+			incomingExports[fallback.name] = fallback.value
+		}
+		incomingSelectedExports = append(incomingSelectedExports, incomingExports)
+	}
+	incoming := make(map[string]map[string]string, len(previous))
+	for scope, values := range previous {
+		incoming[scope] = maps.Clone(values)
+		for _, fallback := range fallbacks {
+			// GNU Make exports an empty value if the incoming Make process did not
+			// define the variable. Its presence is still part of the process
+			// environment observed by the selected source shell program.
+			incoming[scope][fallback.name] = fallback.value
+		}
+	}
+	restore, err := s.BindExactScriptEnvironments(previous, previousSelectedExports...)
+	if err != nil {
+		return nil, fmt.Errorf("bind original shell export environment: %w", err)
+	}
+	activate, err := s.BindExactScriptEnvironments(incoming, incomingSelectedExports...)
+	if err != nil {
+		return nil, fmt.Errorf("bind incoming shell export environment: %w", err)
+	}
+	if err := activate(); err != nil {
+		return nil, fmt.Errorf("activate incoming shell export environment: %w", err)
+	}
+	return restore, nil
+}
+
+// BindIncomingKbuildShellExportEnvironment applies the same source-defined
+// incoming-export rule in early root Makefile evaluations, before a configured
+// target/host scope workload exists. The caller supplies a mutable evaluator
+// handle and routes its shell and symbolic callbacks through that handle.
+// Each switch carries registered references forward to the final evaluator;
+// replacing a frozen method value would otherwise lose those capabilities.
+func BindIncomingKbuildShellExportEnvironment(
+	evaluator **LinuxProbeEvaluator,
+	base KbuildOptions,
+) (KbuildOptions, error) {
+	if evaluator == nil || *evaluator == nil {
+		return KbuildOptions{}, fmt.Errorf("early Kbuild probe evaluator is nil")
+	}
+	if base.shellExportLoopOverride != nil {
+		return KbuildOptions{}, fmt.Errorf("early Kbuild options already have incoming shell export activation")
+	}
+	base.shellExportLoopOverride = func(fallbacks []kbuildShellExportFallback) (func() error, error) {
+		current := *evaluator
+		previous := maps.Clone(current.scriptEnvironment)
+		incoming := maps.Clone(previous)
+		for _, fallback := range fallbacks {
+			incoming[fallback.name] = fallback.value
+		}
+		if maps.Equal(previous, incoming) {
+			return func() error { return nil }, nil
+		}
+		activated, err := current.WithScriptEnvironment(incoming)
+		if err != nil {
+			return nil, fmt.Errorf("bind incoming early Kbuild probe environment: %w", err)
+		}
+		*evaluator = activated
+		return func() error {
+			restored, err := (*evaluator).WithScriptEnvironment(previous)
+			if err != nil {
+				return fmt.Errorf("restore early Kbuild probe environment: %w", err)
+			}
+			*evaluator = restored
+			return nil
+		}, nil
 	}
 	return base, nil
 }
@@ -657,11 +780,14 @@ func (s *KbuildProbeScopes) transformChainedMakeTextProtocol(function string, ar
 	if !ok || symbol.kind != "make-text" || symbol.makeText == nil {
 		return "", false, nil
 	}
-	// A zero-transform protocol normally keeps the compact direct lowering
-	// chosen by the originating Make function. strip is the exception needed
-	// by recursive Make: it turns that usable word protocol into exact text
-	// without changing the child analysis expression.
-	if len(symbol.makeText.protocolTransforms) == 0 && function != "strip" {
+	// A nonempty filter-out over a complete canonical child can compose its
+	// word protocol before a bytewise consumer such as findstring. An empty
+	// pattern is an identity already handled by the finite-word reducer;
+	// filter also keeps its separable finite words on that existing path.
+	// strip can turn this child's word protocol into exact text as before.
+	zeroTransformWordFilter := function == "filter-out" && strings.TrimSpace(args[0]) != "" &&
+		symbol.makeText.protocolMode == linuxProbeMakeTextProtocolCanonicalWords
+	if len(symbol.makeText.protocolTransforms) == 0 && function != "strip" && !zeroTransformWordFilter {
 		return "", false, nil
 	}
 	if symbol.makeText.protocolMode == linuxProbeMakeTextProtocolUnusable {
@@ -1571,7 +1697,15 @@ func (s *KbuildProbeScopes) symbolOwner(token string) (*LinuxProbeEvaluator, lin
 			return evaluator, symbol, true
 		}
 	}
-	return nil, linuxProbeSymbol{}, false
+	// Source export activation replaces evaluator-local caches, while the
+	// workload registry retains symbols referenced by earlier Make values.
+	// Adopt through the existing scope check before reporting one missing.
+	evaluator, err := s.compatibleSymbolicEvaluator(token)
+	if err != nil {
+		return nil, linuxProbeSymbol{}, false
+	}
+	symbol, ok := evaluator.symbols[token]
+	return evaluator, symbol, ok
 }
 
 // selectSymbolic turns a Make comparison containing probe atoms into either a
@@ -1656,12 +1790,12 @@ func (s *KbuildProbeScopes) selectSymbolic(value, expected string, equal bool, t
 		}
 		return falseText, true, nil
 	}
-	if expected == "" && len(valueMatches) == 1 && valueMatches[0] == value {
+	if len(valueMatches) == 1 && valueMatches[0] == value && len(expectedMatches) == 0 {
 		_, symbol, ok := s.symbolOwner(value)
 		if !ok {
 			return "", true, fmt.Errorf("unknown Linux probe symbolic value %q", value)
 		}
-		if len(bindings) > maxKbuildSymbolicComparisonReferences &&
+		if expected == "" && len(bindings) > maxKbuildSymbolicComparisonReferences &&
 			(symbol.kind == "boolean" || symbol.kind == "selection") {
 			selected, projected, projectionErr := s.selectFiniteSymbolicEmptiness(
 				value, symbol, equal, trueText, falseText,
@@ -1673,19 +1807,21 @@ func (s *KbuildProbeScopes) selectSymbolic(value, expected string, equal bool, t
 				return selected, true, nil
 			}
 		}
-		if symbol.kind == "make-text" {
-			emptiness, proofErr := s.symbolicMakeTextEmptiness(value)
-			if proofErr != nil {
-				return "", true, proofErr
-			}
-			if emptiness != kbuildSymbolicEmptinessUnknown {
-				comparisonEqual := emptiness == kbuildSymbolicEmptinessEmpty
-				if comparisonEqual == equal {
-					return trueText, true, nil
+		if symbol.kind == "make-text" || symbol.kind == "transformed-text" {
+			if symbol.kind == "make-text" && expected == "" {
+				emptiness, proofErr := s.symbolicMakeTextEmptiness(value)
+				if proofErr != nil {
+					return "", true, proofErr
 				}
-				return falseText, true, nil
+				if emptiness != kbuildSymbolicEmptinessUnknown {
+					comparisonEqual := emptiness == kbuildSymbolicEmptinessEmpty
+					if comparisonEqual == equal {
+						return trueText, true, nil
+					}
+					return falseText, true, nil
+				}
 			}
-			selected, materializeErr := s.selectMaterializedMakeTextEmpty(value, equal, trueText, falseText)
+			selected, materializeErr := s.selectMaterializedSymbolicText(value, expected, equal, trueText, falseText)
 			if materializeErr != nil {
 				return "", true, materializeErr
 			}
@@ -1856,14 +1992,15 @@ func (s *KbuildProbeScopes) selectFiniteSymbolicEmptiness(
 	return selected, true, err
 }
 
-// selectMaterializedMakeTextEmpty lowers one exact whole-Make-text value into
-// a pure derived-text probe node, then compares that measured value with the
-// empty string through the ordinary dependency predicate protocol. The first
+// selectMaterializedSymbolicText lowers one complete exact text value into a
+// pure derived-text probe node, then compares it with one concrete literal
+// through the ordinary dependency predicate protocol. The first
 // node runs no process: it applies the same bounded fragment transforms as
 // process arguments and stdin, preserving map_directory's configured-action
 // phase ordering without teaching the planner any compiler-specific facts.
-func (s *KbuildProbeScopes) selectMaterializedMakeTextEmpty(
+func (s *KbuildProbeScopes) selectMaterializedSymbolicText(
 	value string,
+	expected string,
 	equal bool,
 	trueText string,
 	falseText string,
@@ -1875,10 +2012,10 @@ func (s *KbuildProbeScopes) selectMaterializedMakeTextEmpty(
 	lowerer := newProbeSymbolicValueLowerer(evaluator)
 	fragments, symbolic, err := lowerer.value(value)
 	if err != nil {
-		return "", fmt.Errorf("lower whole Make text for empty comparison: %w", err)
+		return "", fmt.Errorf("lower exact symbolic text for literal comparison: %w", err)
 	}
 	if !symbolic || len(fragments) == 0 || len(lowerer.dependencies) == 0 {
-		return "", fmt.Errorf("whole Make text empty comparison has no dynamic protocol value")
+		return "", fmt.Errorf("exact symbolic text literal comparison has no dynamic protocol value")
 	}
 	materialized, err := evaluator.requestText(ProbeRequest{
 		Schema:     LinuxProbeRequestSchema,
@@ -1891,7 +2028,7 @@ func (s *KbuildProbeScopes) selectMaterializedMakeTextEmpty(
 	if err != nil {
 		return "", err
 	}
-	truth, err := evaluator.compareSymbolicString(materialized, "", equal)
+	truth, err := evaluator.compareSymbolicString(materialized, expected, equal)
 	if err != nil {
 		return "", err
 	}
@@ -2296,6 +2433,29 @@ func (s *KbuildProbeScopes) resolveSymbolicForScope(scope, value string) (string
 		if err != nil {
 			return "", err
 		}
+		if s.graphGuardResults != nil && evaluator.oracle == nil {
+			if len(s.graphGuardResults.selected) == 0 {
+				return value, nil
+			}
+			guardReferences, err := s.GraphGuardReferences([]string{value})
+			if err != nil {
+				// The source consumer retains its own structural failure boundary;
+				// an unrelated ordinary compiler value is never a pregraph result.
+				return value, nil
+			}
+			if s.graphGuardResults.binds(guardReferences) {
+				resolved, err := s.graphGuardResults.resolve(evaluator, value)
+				if err != nil {
+					return "", fmt.Errorf("resolve declared source graph guard: %w", err)
+				}
+				s.resolved.store(cacheKey, resolved)
+				return resolved, nil
+			}
+			// A source-selected child can reveal a new graph guard only after this
+			// one declared pregraph batch has run. Preserve the expression so the
+			// graph consumer rejects it rather than treating absent as empty.
+			return value, nil
+		}
 		resolved, err := evaluator.ResolveSymbolic(value)
 		if err != nil {
 			return "", err
@@ -2431,6 +2591,12 @@ func (s *KbuildProbeScopes) kbuildShell(
 	command string,
 	fallback func(string) (string, error),
 ) (string, error) {
+	// The command head, rather than a tool named inside a child Make argv,
+	// owns this parse-time query. In particular CC=host_cc selects the child
+	// compiler without turning the enclosing $(MAKE) into a compiler command.
+	if value, selected, err := s.recursiveMakeFeatureProbe(ctx, command); selected || err != nil {
+		return value, err
+	}
 	toolScopes, err := s.firstConfiguredToolScopes(command, preferredScope)
 	if err != nil {
 		return "", err
@@ -2588,6 +2754,49 @@ func (s *KbuildProbeScopes) References() []ProbeReference {
 		}
 	}
 	return references
+}
+
+// GraphGuardReferences returns only producer terminals of source conditions
+// which can change Kbuild topology. The ordinary source probes still enter the
+// full discovery plan separately; their results do not need to run before
+// graph selection. SelectProbePlanTerminals closes these references over their
+// exact dependency requests when the pregraph plan is published.
+func (s *KbuildProbeScopes) GraphGuardReferences(expressions []string) ([]ProbeReference, error) {
+	references := map[string]ProbeReference{}
+	work := slices.Clone(expressions)
+	seen := map[string]bool{}
+	for len(work) != 0 {
+		if len(seen) > maxKbuildSymbolicComparisonSymbols {
+			return nil, fmt.Errorf("graph guard has too many nested symbolic expressions")
+		}
+		expression := work[len(work)-1]
+		work = work[:len(work)-1]
+		if seen[expression] {
+			continue
+		}
+		seen[expression] = true
+		bindings, symbols, _, err := s.collectSymbolicComparison(expression)
+		if err != nil {
+			return nil, fmt.Errorf("graph guard %q: %w", expression, err)
+		}
+		for _, binding := range bindings {
+			references[binding.input.reference.NodeID] = binding.input.reference
+		}
+		for _, owned := range symbols {
+			if owned.symbol.reference.NodeID != "" {
+				references[owned.symbol.reference.NodeID] = owned.symbol.reference
+			}
+			if owned.symbol.kind == "transformed-text" && owned.symbol.textTransform != nil {
+				work = append(work, owned.symbol.textTransform.sourceToken)
+			}
+		}
+	}
+	ids := slices.Sorted(maps.Keys(references))
+	result := make([]ProbeReference, 0, len(ids))
+	for _, id := range ids {
+		result = append(result, references[id])
+	}
+	return result, nil
 }
 
 // canonicalCompilerPredefineArguments clones arguments and canonicalizes only
@@ -3258,13 +3467,38 @@ func (s *KbuildProbeScopes) BindActionPlanToolsetPathCapabilities(metadata *Comp
 // of the same environment is a no-op.
 func (s *KbuildProbeScopes) BindExactScriptEnvironments(
 	exact map[string]map[string]string,
+	selectedSourceExports ...map[string]string,
 ) (func() error, error) {
 	if s == nil {
 		return nil, fmt.Errorf("Kbuild probe workload is nil")
 	}
+	if len(selectedSourceExports) > 1 {
+		return nil, fmt.Errorf("Kbuild probe workload accepts at most one complete selected source export snapshot")
+	}
 	key, err := s.exactScriptEnvironmentsKey(exact)
 	if err != nil {
 		return nil, err
+	}
+	var selectedExports map[string]string
+	if len(selectedSourceExports) != 0 {
+		selectedExports = maps.Clone(selectedSourceExports[0])
+		if selectedExports == nil {
+			selectedExports = map[string]string{}
+		}
+		target := s.evaluators["target"]
+		if target == nil {
+			return nil, fmt.Errorf("selected source exports require a target probe evaluator")
+		}
+		for name, value := range selectedExports {
+			if !validKbuildCommandEnvironmentName(name) || strings.ContainsRune(value, 0) {
+				return nil, fmt.Errorf("selected source export %q is invalid", name)
+			}
+			if (name == "ARCH" && value != target.architecture) ||
+				(name == "SRCARCH" && value != target.sourceArchitecture) {
+				return nil, fmt.Errorf("selected source export %s=%q disagrees with target architecture", name, value)
+			}
+		}
+		key = selectedSourceExportBindingKey(key, selectedExports)
 	}
 	if s.exactScriptEnvironmentBindings == nil {
 		s.exactScriptEnvironmentBindings = map[string]map[string]map[string]string{}
@@ -3272,9 +3506,16 @@ func (s *KbuildProbeScopes) BindExactScriptEnvironments(
 	if s.exactScriptEnvironmentActivations == nil {
 		s.exactScriptEnvironmentActivations = map[string]func() error{}
 	}
+	if s.selectedSourceExportBindings == nil {
+		s.selectedSourceExportBindings = map[string]map[string]string{}
+	}
 	if previous, ok := s.exactScriptEnvironmentBindings[key]; ok {
 		if !s.equalExactScriptEnvironments(previous, exact) {
 			return nil, fmt.Errorf("Kbuild probe exact environment digest collision")
+		}
+		if stored, selected := s.selectedSourceExportBindings[key]; selected != (selectedExports != nil) ||
+			selected && !maps.Equal(stored, selectedExports) {
+			return nil, fmt.Errorf("Kbuild probe selected source exports digest collision")
 		}
 		return s.exactScriptEnvironmentActivations[key], nil
 	}
@@ -3296,13 +3537,37 @@ func (s *KbuildProbeScopes) BindExactScriptEnvironments(
 		normalized[scope] = environment
 	}
 	s.exactScriptEnvironmentBindings[key] = normalized
+	if selectedExports != nil {
+		s.selectedSourceExportBindings[key] = selectedExports
+	}
 	activate := func() error { return s.activateExactScriptEnvironments(key) }
 	s.exactScriptEnvironmentActivations[key] = activate
 	return activate, nil
 }
 
+// selectedSourceExportBindingKey distinguishes two GNU Make export snapshots
+// even when scope filtering produces identical ordinary probe environments.
+// Each length-prefixed name/value preserves absent versus present-empty.
+func selectedSourceExportBindingKey(scopedKey string, exported map[string]string) string {
+	digest := sha256.New()
+	write := func(value string) {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+		_, _ = digest.Write(size[:])
+		_, _ = digest.Write([]byte(value))
+	}
+	write("selected-source-exports-v1")
+	write(scopedKey)
+	for _, name := range slices.Sorted(maps.Keys(exported)) {
+		write(name)
+		write(exported[name])
+	}
+	return fmt.Sprintf("%x", digest.Sum(nil))
+}
+
 func (s *KbuildProbeScopes) activateExactScriptEnvironments(key string) error {
 	if s.activeExactScriptEnvironment == key {
+		s.activeSelectedSourceExports = s.selectedSourceExportBindings[key]
 		s.activeScriptEnvironmentIdentity = key
 		return nil
 	}
@@ -3319,6 +3584,7 @@ func (s *KbuildProbeScopes) activateExactScriptEnvironments(key string) error {
 	}
 	if unchanged {
 		s.activeExactScriptEnvironment = key
+		s.activeSelectedSourceExports = s.selectedSourceExportBindings[key]
 		s.activeScriptEnvironmentIdentity = key
 		return nil
 	}
@@ -3338,6 +3604,7 @@ func (s *KbuildProbeScopes) activateExactScriptEnvironments(key string) error {
 		s.evaluators[scope] = evaluator
 	}
 	s.activeExactScriptEnvironment = key
+	s.activeSelectedSourceExports = s.selectedSourceExportBindings[key]
 	s.activeScriptEnvironmentIdentity = key
 	s.resolved.clear()
 	s.resolvedStructure.clear()
@@ -3387,6 +3654,10 @@ func (s *KbuildProbeScopes) exactScriptEnvironmentsKey(environments map[string]m
 			}
 		}
 		write(scope)
+		if evaluator.pkgConfigManifest != nil {
+			write("declared-pkg-config-manifest")
+			write(evaluator.pkgConfigManifest.ContentIdentity())
+		}
 		names := make([]string, 0, len(environment)+2)
 		for name := range environment {
 			names = append(names, name)
@@ -3498,6 +3769,17 @@ func (s *KbuildProbeScopes) RefreshScriptEnvironments(exported map[string]map[st
 		changed = true
 	}
 	if !changed {
+		if s.activeSelectedSourceExports != nil {
+			identity, err := s.exactScriptEnvironmentsKey(s.currentScriptEnvironments())
+			if err != nil {
+				return fmt.Errorf("identify refreshed Kbuild probe environments: %w", err)
+			}
+			s.activeScriptEnvironmentIdentity = identity
+			s.resolved.clear()
+			s.resolvedStructure.clear()
+		}
+		s.activeExactScriptEnvironment = ""
+		s.activeSelectedSourceExports = nil
 		return nil
 	}
 	nextEnvironments := s.currentScriptEnvironments()
@@ -3512,6 +3794,7 @@ func (s *KbuildProbeScopes) RefreshScriptEnvironments(exported map[string]map[st
 		s.evaluators[scope] = evaluator
 	}
 	s.activeExactScriptEnvironment = ""
+	s.activeSelectedSourceExports = nil
 	s.activeScriptEnvironmentIdentity = identity
 	s.resolved.clear()
 	s.resolvedStructure.clear()
@@ -3580,10 +3863,11 @@ func EvaluateKbuildProbeWorkload[T any](
 		scopes.baseScriptEnvironments[scope] = maps.Clone(options.ScriptEnvironment)
 		evaluator, err := NewLinuxProbeEvaluator(LinuxProbeEvaluatorOptions{
 			Scope: scope, Architecture: options.Architecture, Facts: options.Facts,
-			SourceRoot: options.SourceRoot, SourceArchitecture: options.SourceArchitecture,
+			SourceRoot: options.SourceRoot, SourceRootAliases: slices.Clone(options.SourceRootAliases), SourceArchitecture: options.SourceArchitecture,
 			ScriptEnvironment: maps.Clone(options.ScriptEnvironment),
 			Tools:             maps.Clone(options.Tools),
 			Discovery:         builder, Oracle: lookup, RustSourceRoot: options.RustSourceRoot,
+			PkgConfigManifest: options.PkgConfigManifest,
 		})
 		if err != nil {
 			return err
@@ -3637,7 +3921,12 @@ func (e *LinuxProbeEvaluator) KbuildShell(ctx context.Context, command string) (
 	}
 	looksLikeTryRun := strings.HasPrefix(command, "set -e;") &&
 		strings.Contains(command, "TMP=") && strings.Contains(command, "if (")
-	match := kbuildTryRunPattern.FindStringSubmatch(command)
+	var match []string
+	for _, pattern := range kbuildTryRunPatterns {
+		if match = pattern.FindStringSubmatch(command); match != nil {
+			break
+		}
+	}
 	if match == nil {
 		if looksLikeTryRun {
 			return "", fmt.Errorf("unsupported Linux Kbuild try-run wrapper %q", command)
@@ -3649,7 +3938,7 @@ func (e *LinuxProbeEvaluator) KbuildShell(ctx context.Context, command string) (
 		e.kbuildShellResults.store(command, value)
 		return value, nil
 	}
-	tempDir, trapDir, mkdirDir := match[1], match[2], match[3]
+	tempDir, tempObject, trapDir, mkdirDir := match[1], match[2], match[3], match[4]
 	// A source-defined TMPOUT=.tmp_$$$$ reaches the shell grammar as .tmp_$$:
 	// Make has removed one escaping layer, while the real shell would replace
 	// the remaining pair with its PID. The symbolic evaluator never executes
@@ -3660,12 +3949,34 @@ func (e *LinuxProbeEvaluator) KbuildShell(ctx context.Context, command string) (
 	if trapDir != tempDir || mkdirDir != tempDir {
 		return "", fmt.Errorf("Linux Kbuild try-run has inconsistent temporary directory")
 	}
-	probeCommand := strings.TrimSpace(match[4])
+	probeCommand := strings.TrimSpace(match[5])
+	if tempObject != "" {
+		// Older Makefiles also name the same private output's `.o` sibling.
+		// Ignore the declaration if the selected command does not use it;
+		// otherwise its shell expansion needs an explicit scratch alias.
+		if tempObject != tempDir+"/tmp.o" {
+			return "", fmt.Errorf("Linux Kbuild try-run has invalid temporary object %q", tempObject)
+		}
+		if strings.Contains(probeCommand, "$TMPO") {
+			return "", fmt.Errorf("Linux Kbuild try-run uses unsupported temporary object alias")
+		}
+	}
+	if truth, recognized, probeErr := e.simpleTryRunCompilerLink(probeCommand); recognized || probeErr != nil {
+		if probeErr != nil {
+			return "", probeErr
+		}
+		value, renderErr := e.renderTruth(truth, match[6], match[7])
+		if renderErr != nil {
+			return "", renderErr
+		}
+		e.kbuildShellResults.store(command, value)
+		return value, nil
+	}
 	if truth, recognized, probeErr := e.compoundTryRunProbe(probeCommand); recognized || probeErr != nil {
 		if probeErr != nil {
 			return "", probeErr
 		}
-		value, renderErr := e.renderTruth(truth, match[5], match[6])
+		value, renderErr := e.renderTruth(truth, match[6], match[7])
 		if renderErr != nil {
 			return "", renderErr
 		}
@@ -3676,7 +3987,7 @@ func (e *LinuxProbeEvaluator) KbuildShell(ctx context.Context, command string) (
 	if err != nil {
 		return "", err
 	}
-	value, err := e.renderTruth(truth, match[5], match[6])
+	value, err := e.renderTruth(truth, match[6], match[7])
 	if err != nil {
 		return "", err
 	}

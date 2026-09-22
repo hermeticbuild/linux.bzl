@@ -332,6 +332,47 @@ func TestCompactKbuildOrderedSamePathWritersUseExactImmutableVersions(t *testing
 	}
 }
 
+func TestCompactKbuildNativePrerequisiteOwnerDoesNotMaskLaterRecipeRead(t *testing.T) {
+	config := compactKbuildOverwriteTestConfig(t, false)
+	root := mustCompactKbuildProfileForTest(t, "root-link", "scripts/root.mk", "", `
+cmd_copy = cat $< > $@
+vmlinux: generated/shared.out FORCE
+	$(call if_changed,copy)
+`, nil)
+	firstArtifact := CompactKbuildVisibleArtifact{
+		Path: "generated/shared.out", Profile: "a-writer", Target: "generated/shared.out",
+	}
+	config.KbuildProfiles = append(config.KbuildProfiles, root)
+	config.KbuildSelections = append(config.KbuildSelections, CompactKbuildSelection{
+		Profile: root.Name, Target: "vmlinux", MakeTarget: "vmlinux",
+		Lifecycle: "target", Scope: "target", Stage: "target",
+		NativePrerequisiteArtifacts: EncodeCompactKbuildInitialObjectTreeArtifacts([]CompactKbuildVisibleArtifact{firstArtifact}),
+	})
+	graph, err := newCompactKbuildSelectionGraph(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootKey := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: root.Name, target: "vmlinux"}]
+	firstKey := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: "a-writer", target: firstArtifact.Target}]
+	if owner, selected, ownerErr := graph.compactKbuildSelectionNativePrerequisiteOwner(rootKey, firstArtifact.Path); ownerErr != nil || !selected || owner != firstKey {
+		t.Fatalf("root native prerequisite owner=(%s,%t,%v), want first writer %s", compactKbuildSelectionKeyString(owner), selected, ownerErr, compactKbuildSelectionKeyString(firstKey))
+	}
+	// A later in-recipe source-script read is evaluated at its own command
+	// frontier. The pre-recipe first version must not be silently projected
+	// into the general script/working-object-tree owner lookup.
+	if owner, selected, ownerErr := graph.compactKbuildSelectionRecordedPathOwner(rootKey, firstArtifact.Path); ownerErr == nil || !compactKbuildPathOwnerIsUnrecorded(ownerErr) || selected {
+		t.Fatalf("root recipe read owner=(%s,%t,%v), want unresolved without source-script command order", compactKbuildSelectionKeyString(owner), selected, ownerErr)
+	}
+	metadata := &CompactMetadata{Config: config, configFragment: map[string]string{}}
+	native, err := graph.computeSelectionNativeDependencies(metadata, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(native, firstKey) {
+		t.Fatalf("native prerequisite dependencies=%#v, want first writer %s", native, compactKbuildSelectionKeyString(firstKey))
+	}
+}
+
 func TestKbuildInvocationMaterializationUsesExactShadowTerminal(t *testing.T) {
 	config := compactKbuildOverwriteTestConfig(t, false)
 	plan, graph := lowerCompactKbuildOverwriteTestPlan(t, config)

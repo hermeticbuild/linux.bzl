@@ -1,6 +1,7 @@
 package kconfig
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -113,6 +114,120 @@ selected := $(if $(found),yes,no)
 		t.Fatal(jsonErr)
 	} else if linuxProbeSymbolPattern.Match(data) {
 		t.Fatalf("findstring request leaked planner-only token: %s", data)
+	}
+}
+
+func TestKbuildRecordMcountFindstringUsesFilteredFlagBytes(t *testing.T) {
+	// v5.10's scripts/Makefile.lib filters complete flag words twice before
+	// scripts/Makefile.build searches the resulting bytes. Removing the -pg
+	// word must still leave a compiler-selected -pg substring in another word.
+	const source = symbolicHardeningCompilerFixture + `
+CC_FLAGS_FTRACE := -pg
+KBUILD_CFLAGS := -pg $(if $(first),-DTHING=-pgsuffix,)
+ccflags-remove-y := -funrelated
+target-stem := vclock_gettime
+CFLAGS_REMOVE_vclock_gettime.o := -pg
+_c_flags = $(filter-out $(CFLAGS_REMOVE_$(target-stem).o), \
+              $(filter-out $(ccflags-remove-y),$(KBUILD_CFLAGS)))
+cmd_record_mcount = $(if $(findstring $(strip $(CC_FLAGS_FTRACE)),$(_c_flags)),recordmcount)
+selected := $(cmd_record_mcount)
+`
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	opts := KbuildProbeWorkloadOptions{Target: testKbuildProbeScopeOptions(t, fixture)}
+	workload := func(scopes *KbuildProbeScopes) (string, error) {
+		options, err := scopes.Options("target", KbuildOptions{
+			Variables:               map[string]string{"CC": opts.Target.Tools["cc"]},
+			ConfigVariablesComplete: true, MakeVariablesComplete: true,
+			CaptureVariables: []string{"selected"},
+		})
+		if err != nil {
+			return "", err
+		}
+		parsed, err := parseKbuildWithOptions(strings.NewReader(source), "scripts/Makefile.build", options, "")
+		if err != nil {
+			return "", err
+		}
+		return parsed.Variables["selected"], nil
+	}
+	discovery, err := EvaluateKbuildProbeWorkload(opts, nil, workload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !linuxProbeSymbolPattern.MatchString(discovery.Value) || len(discovery.Plan.Nodes) < 3 {
+		t.Fatalf("record-mcount discovery = %q, plan %#v; want compiler, derived text and predicate", discovery.Value, discovery.Plan.Nodes)
+	}
+	for _, tc := range []struct {
+		name, want string
+		supported  bool
+	}{
+		{name: "removed complete word", want: ""},
+		{name: "substring survives", supported: true, want: "recordmcount"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "target")
+			if err := os.MkdirAll(filepath.Join(root, "results"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			results := map[string]ProbeResult{}
+			for _, node := range discovery.Plan.Nodes {
+				request := discovery.Plan.Requests[node.RequestID]
+				result := ProbeResult{
+					Schema: LinuxProbeResultSchema, NodeID: node.ID, RequestID: node.RequestID,
+					Scope: node.Scope, ToolsetIdentity: discovery.Plan.Toolsets[node.Scope],
+				}
+				inputs := make(map[string]ProbeResult, len(node.Inputs))
+				for ordinal, predecessor := range node.Inputs {
+					inputs[fmt.Sprintf("%08d", ordinal)] = results[predecessor]
+				}
+				switch {
+				case len(request.Steps) == 1 && request.Outcome.Kind == "boolean":
+					result.Kind = "boolean"
+					value := tc.supported
+					result.Boolean = &value
+					status, exitCode := "failure", 1
+					if value {
+						status, exitCode = "success", 0
+					}
+					result.Steps = []ProbeStepResult{{Name: request.Steps[0].Name, Status: status, ExitCode: exitCode}}
+				case len(request.Steps) == 0 && request.Outcome.Kind == "text":
+					result.Kind = "text"
+					result.Text, err = RenderProbeDependencyFragments(request.Outcome.Fragments, inputs)
+				case len(request.Steps) == 0 && request.Outcome.Kind == "boolean" && request.Outcome.Predicate != nil:
+					result.Kind = "boolean"
+					result.Boolean = new(bool)
+					*result.Boolean, err = EvaluateProbeResultPredicate(*request.Outcome.Predicate, inputs)
+				default:
+					t.Fatalf("unexpected record-mcount request %#v", request)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := result.CanonicalJSON()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, "results", node.ID+".json"), data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				results[node.ID] = result
+			}
+			oracle, err := NewProbeResultOracleFromTrees(map[string]string{"target": root}, discovery.Plan.Toolsets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replay, err := EvaluateKbuildProbeWorkload(opts, oracle, workload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if replay.Value != tc.want || len(replay.Plan.Nodes) != len(discovery.Plan.Nodes) {
+				t.Fatalf("record-mcount replay = %q, want %q; plan nodes %d, want %d", replay.Value, tc.want, len(replay.Plan.Nodes), len(discovery.Plan.Nodes))
+			}
+			for index, node := range replay.Plan.Nodes {
+				if node.ID != discovery.Plan.Nodes[index].ID || node.RequestID != discovery.Plan.Nodes[index].RequestID {
+					t.Fatalf("record-mcount node %d drifted: before %#v, replay %#v", index, discovery.Plan.Nodes[index], node)
+				}
+			}
+		})
 	}
 }
 
@@ -484,9 +599,6 @@ $(first) := value
 endif`,
 		"generated topology": `ifneq ($(first),)
 always-y += generated.h
-endif`,
-		"target variable": `ifneq ($(first),)
-target.o: CFLAGS += -fbranch
 endif`,
 		"define": `ifneq ($(first),)
 define branch_helper

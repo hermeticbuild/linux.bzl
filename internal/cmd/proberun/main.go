@@ -98,6 +98,8 @@ type probeOptions struct {
 	request, result, nodeID, requestID, scope string
 	toolsetManifest                           string
 	toolsetAnchors                            map[string]string
+	hostToolsetManifest                       string
+	hostToolsetAnchors                        map[string]string
 	toolsetMarkers                            map[string]string
 	tools                                     map[string]actionContract
 	runtimeTools                              map[string]string
@@ -129,11 +131,17 @@ func resolveProbeArtifactPaths(opts probeOptions) (probeOptions, error) {
 	opts.request = absolute(opts.request)
 	opts.result = absolute(opts.result)
 	opts.toolsetManifest = absolute(opts.toolsetManifest)
+	opts.hostToolsetManifest = absolute(opts.hostToolsetManifest)
 	toolsetAnchors := make(map[string]string, len(opts.toolsetAnchors))
 	for root, anchor := range opts.toolsetAnchors {
 		toolsetAnchors[root] = absolute(anchor)
 	}
 	opts.toolsetAnchors = toolsetAnchors
+	hostToolsetAnchors := make(map[string]string, len(opts.hostToolsetAnchors))
+	for root, anchor := range opts.hostToolsetAnchors {
+		hostToolsetAnchors[root] = absolute(anchor)
+	}
+	opts.hostToolsetAnchors = hostToolsetAnchors
 	if opts.tempDir != "" {
 		opts.tempDir = absolute(opts.tempDir)
 	}
@@ -554,24 +562,77 @@ func runProbe(opts probeOptions) error {
 	if err != nil {
 		return err
 	}
+	resolvers := map[string]*toolsetPathResolver{opts.scope: toolsetPaths}
+	hasHostScopedTool := false
+	for _, binding := range request.ToolRoles() {
+		scope, _, scoped, valid := toolaction.SplitBinding(binding)
+		if !valid || scoped && (opts.scope != "target" || scope != "host") {
+			return fmt.Errorf("probe has incompatible scoped tool %q", binding)
+		}
+		if scoped {
+			hasHostScopedTool = true
+			if toolsetIdentities["host"] == "" {
+				return fmt.Errorf("probe scoped tool %q has no host toolset marker", binding)
+			}
+			if request.HostToolsetIdentity != toolsetIdentities["host"] {
+				return fmt.Errorf("probe scoped tool %q has host toolset identity %q, marker selects %q", binding, request.HostToolsetIdentity, toolsetIdentities["host"])
+			}
+			if resolvers[scope] == nil {
+				resolvers[scope], err = loadToolsetPathResolver(execroot, scope, toolsetIdentities[scope], opts.hostToolsetManifest, opts.hostToolsetAnchors)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if !hasHostScopedTool && (opts.hostToolsetManifest != "" || len(opts.hostToolsetAnchors) != 0) {
+		return errors.New("probe has a host toolset binding without a scoped host tool")
+	}
+	resolverForRole := func(binding string) (*toolsetPathResolver, string, error) {
+		scope, role, scoped, valid := toolaction.SplitBinding(binding)
+		if !valid {
+			return nil, "", fmt.Errorf("invalid configured tool role %q", binding)
+		}
+		if !scoped {
+			scope = opts.scope
+		}
+		resolver := resolvers[scope]
+		if resolver == nil {
+			return nil, "", fmt.Errorf("configured tool role %q has no identity-bound %s toolset", binding, scope)
+		}
+		return resolver, role, nil
+	}
 	wantRuntimeRoles := make([]string, 0, len(toolsetPaths.manifest.Tools))
 	for role := range toolsetPaths.manifest.Tools {
 		wantRuntimeRoles = append(wantRuntimeRoles, role)
+	}
+	for _, binding := range request.ToolRoles() {
+		if scope, _, scoped, valid := toolaction.SplitBinding(binding); valid && scoped && scope == "host" {
+			wantRuntimeRoles = append(wantRuntimeRoles, binding)
+		}
 	}
 	sort.Strings(wantRuntimeRoles)
 	if err := exactStringBindings("runtime tool", wantRuntimeRoles, opts.runtimeTools); err != nil {
 		return err
 	}
 	for role, filename := range opts.runtimeTools {
-		if err := toolsetPaths.verifyTool(role, filename); err != nil {
+		resolver, baseRole, err := resolverForRole(role)
+		if err != nil {
+			return err
+		}
+		if err := resolver.verifyTool(baseRole, filename); err != nil {
 			return err
 		}
 	}
 	for role, contract := range opts.tools {
-		if err := toolsetPaths.verifyTool(role, contract.path); err != nil {
+		resolver, baseRole, err := resolverForRole(role)
+		if err != nil {
 			return err
 		}
-		if err := toolsetPaths.verifyContract(role, contract); err != nil {
+		if err := resolver.verifyTool(baseRole, contract.path); err != nil {
+			return err
+		}
+		if err := resolver.verifyContract(baseRole, contract); err != nil {
 			return err
 		}
 	}
@@ -620,8 +681,18 @@ func runProbe(opts probeOptions) error {
 		return fmt.Errorf("create probe scratch directory: %w", err)
 	}
 	defer os.RemoveAll(root)
-	if err := toolsetPaths.setProjectionRoot(filepath.Join(root, "toolset")); err != nil {
-		return fmt.Errorf("prepare probe toolset projection: %w", err)
+	for _, scope := range []string{"target", "host"} {
+		resolver := resolvers[scope]
+		if resolver == nil {
+			continue
+		}
+		projection := "toolset"
+		if scope != opts.scope {
+			projection = scope + "-toolset"
+		}
+		if err := resolver.setProjectionRoot(filepath.Join(root, projection)); err != nil {
+			return fmt.Errorf("prepare probe %s toolset projection: %w", scope, err)
+		}
 	}
 	runtimeToolDirectory, cleanupRuntimeTools, err := toolaction.PrepareRuntimeToolDirectory(root, opts.runtimeTools)
 	if err != nil {
@@ -650,6 +721,10 @@ func runProbe(opts probeOptions) error {
 	}
 	results := make([]kconfig.ProbeStepResult, 0, len(request.Steps))
 	for _, step := range request.Steps {
+		stepToolsetPaths, _, err := resolverForRole(step.Tool)
+		if err != nil {
+			return fmt.Errorf("step %s: %w", step.Name, err)
+		}
 		if step.When != nil {
 			run, err := evaluatePredicate(*step.When, results, scratch, opts.sources, resolvedSourceRoots, inputResults, execroot, toolsetPaths)
 			if err != nil {
@@ -801,7 +876,7 @@ func runProbe(opts probeOptions) error {
 				execroot,
 				opts.sources,
 				resolvedSourceRoots,
-				toolsetPaths,
+				stepToolsetPaths,
 			)
 			if err != nil {
 				return err
@@ -946,7 +1021,7 @@ func runProbe(opts probeOptions) error {
 				if err != nil {
 					return fmt.Errorf("canonicalize step %s stdout: %w", step.Name, err)
 				}
-				if _, err := toolsetPaths.resolve(stdoutValue); err != nil {
+				if _, err := stepToolsetPaths.resolve(stdoutValue); err != nil {
 					if step.StdoutFallbackPath != "" && stdoutValue == step.StdoutFallbackPath && errors.Is(err, errToolsetPathOutsideClosure) {
 						stdoutValue = step.StdoutFallbackPath
 						stdoutPathKind = kconfig.ProbeStdoutPathFallback
@@ -1430,14 +1505,16 @@ func parseNamed(raw []string) (map[string]string, error) {
 }
 
 func main() {
-	var toolFlags, runtimeToolFlags, toolsetAnchorFlags, inputFlags, sourceFlags, sourceRootFlags, sourceRootTreeFlags, sourceRootAnchorFlags, sourceRootWitnessFlags, toolsetMarkerFlags, actionArgFlags, actionEnvFlags repeatedFlag
+	var toolFlags, runtimeToolFlags, toolsetAnchorFlags, hostToolsetAnchorFlags, inputFlags, sourceFlags, sourceRootFlags, sourceRootTreeFlags, sourceRootAnchorFlags, sourceRootWitnessFlags, toolsetMarkerFlags, actionArgFlags, actionEnvFlags repeatedFlag
 	request := flag.String("request", "", "canonical probe request JSON")
 	result := flag.String("result", "", "canonical probe result JSON")
 	nodeID := flag.String("node_id", "", "content-addressed probe node ID")
 	requestID := flag.String("request_id", "", "content-addressed request ID")
 	scope := flag.String("scope", "", "target or host toolset scope")
 	toolsetManifest := flag.String("toolset_manifest", "", "current-scope identity-bound toolset manifest")
+	hostToolsetManifest := flag.String("host_toolset_manifest", "", "selected host-scope identity-bound toolset manifest")
 	flag.Var(&toolsetAnchorFlags, "toolset_anchor", "ROOT=PATH current-action typed toolset root anchor (repeatable)")
+	flag.Var(&hostToolsetAnchorFlags, "host_toolset_anchor", "ROOT=PATH selected host-action typed toolset root anchor (repeatable)")
 	flag.Var(&toolFlags, "tool", "ROLE=PATH configured tool (repeatable)")
 	flag.Var(&runtimeToolFlags, "runtime_tool", "ROLE=PATH identity-bound runtime tool alias (repeatable)")
 	flag.Var(&inputFlags, "input", "ORDINAL=RESULT configured dependency result (repeatable)")
@@ -1470,6 +1547,11 @@ func main() {
 	toolsetAnchors, err := parseNamed(toolsetAnchorFlags)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "proberun: toolset anchors: %v\n", err)
+		os.Exit(2)
+	}
+	hostToolsetAnchors, err := parseNamed(hostToolsetAnchorFlags)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "proberun: host toolset anchors: %v\n", err)
 		os.Exit(2)
 	}
 	inputs, err := parseNamed(inputFlags)
@@ -1535,6 +1617,7 @@ func main() {
 	if err := runProbe(probeOptions{
 		request: *request, result: *result, nodeID: *nodeID, requestID: *requestID, scope: *scope,
 		toolsetManifest: *toolsetManifest, toolsetAnchors: toolsetAnchors,
+		hostToolsetManifest: *hostToolsetManifest, hostToolsetAnchors: hostToolsetAnchors,
 		toolsetMarkers: toolsetMarkers, tools: contracts, runtimeTools: runtimeTools, inputs: inputs, sources: sources,
 		sourceRoots: sourceRoots, sourceRootTrees: sourceRootTrees, sourceRootAnchors: sourceRootAnchors, sourceRootWitnesses: sourceRootWitnesses,
 	}); err != nil {

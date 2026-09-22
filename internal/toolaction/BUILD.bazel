@@ -6,6 +6,7 @@ go_library(
         "contract.go",
         "manifest.go",
         "observed_output.go",
+        "shell_assignments.go",
     ],
     importpath = "github.com/hermeticbuild/linux.bzl/internal/toolaction",
     visibility = ["//internal:__subpackages__"],

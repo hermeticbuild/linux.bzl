@@ -11,6 +11,601 @@ import (
 	"testing"
 )
 
+// The exact immutable Linux v5.10.270 source fixture comes from:
+// https://github.com/gregkh/linux/blob/1797d8bf8d0c2e74defad605d14e3553d43a3caf/scripts/setlocalversion
+func pinnedSourceVersionCollectorFixture(t *testing.T) string {
+	t.Helper()
+	content, err := os.ReadFile("testdata/source_setlocalversion_5_10.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(content)
+}
+
+func TestSelectedSourceScriptProgramKeepsEqualSignInDeclaredPath(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := testSymbolicProbeEvaluator(t, builder, nil)
+	root := t.TempDir()
+	mustWriteSource(t, root, "Kconfig", "mainmenu \"fixture\"\n")
+	mustWriteSource(t, root, "scripts/name=selected.sh", "#!/bin/sh\necho selected\n")
+	evaluator.sourceRoot = root
+	script := filepath.ToSlash(filepath.Join(root, "scripts/name=selected.sh"))
+	if !evaluator.sourceScriptSelectedProgram(script) {
+		t.Fatal("a selected script with '=' in its declared pathname escaped script ownership")
+	}
+	request := singleSourceScriptRequest(t, evaluator, script)
+	if !slices.Contains(request.Sources, "scripts/name=selected.sh") {
+		t.Fatalf("selected script path sources = %q, want the immutable declared program", request.Sources)
+	}
+	for _, command := range []string{
+		"env INVALID?=literal " + script,
+		script + " '",
+	} {
+		if !evaluator.sourceScriptSelectedProgram(command) {
+			t.Errorf("malformed selected script %q escaped ownership", command)
+		}
+		if _, err := evaluator.Shell(context.Background(), command); err == nil || IsLinuxProbeUnsupportedCommand(err) {
+			t.Errorf("malformed selected script %q = %v, want owned rejection", command, err)
+		}
+	}
+	if evaluator.sourceScriptSelectedProgram("/configured/cc -I " + script) {
+		t.Fatal("passive compiler source search operand acquired script command ownership")
+	}
+}
+
+func quotedSourceVersionFixtureScopes(t *testing.T) (*KbuildProbeScopes, *ProbePlanBuilder, string, string, map[string]string) {
+	t.Helper()
+	root := t.TempDir()
+	mustWriteSource(t, root, "Kconfig", "mainmenu \"fixture\"\n")
+	mustWriteSource(t, root, "scripts/source-version", pinnedSourceVersionCollectorFixture(t))
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes := testSourceScriptOutputScopes(t, root, builder, nil)
+	const target = "include/config/kernel.release"
+	return scopes, builder, root, target, map[string]string{"include/config/auto.conf": "CONFIG_LOCALVERSION=\"-fixture\"\n"}
+}
+
+func TestSelectedSourceGeneratorBindsScopedHostToolFromExport(t *testing.T) {
+	scopes, _, _, target, baseline := quotedSourceVersionFixtureScopes(t)
+	evaluator := scopes.evaluators["target"]
+	hostCC := KbuildActionRoleToken("host", "cc")
+	evaluator.scriptEnvironment["HOSTCC"] = hostCC
+	evaluator.scriptEnvironment["HOST_WRAPPER"] = hostCC + " --version"
+	evaluator.scriptEnvironment["EMPTY_EXPORT"] = ""
+	recipe := "{\necho \"5.10.270$(sh ${tree:kernel}/scripts/source-version ${tree:kernel})\"\n} > '" + target + "'"
+	proof, staged, recognized, err := evaluator.selectedSourceFilechkProof(target, recipe, baseline, nil, nil, nil)
+	if err != nil || !recognized {
+		t.Fatalf("selected source proof = %t/%v", recognized, err)
+	}
+	context := &selectedSourceOutputExportContext{
+		hostTools:           map[string]string{"cc": "/configured/host/cc"},
+		hostToolsetIdentity: "sha256-" + strings.Repeat("a", 64),
+	}
+	request, _, recognized, err := evaluator.evaluatedScriptOutputTextRequestWithSourceProof(target, recipe, nil, staged, proof, context)
+	if err != nil || !recognized {
+		t.Fatalf("selected source request = %t/%v", recognized, err)
+	}
+	if request.HostToolsetIdentity != context.hostToolsetIdentity {
+		t.Fatalf("selected source request host identity = %q, want %q", request.HostToolsetIdentity, context.hostToolsetIdentity)
+	}
+	step := request.Steps[1]
+	for name, want := range map[string]string{
+		"HOSTCC": "host@cc", "HOST_WRAPPER": "host@cc --version", "EMPTY_EXPORT": "",
+	} {
+		if got, present := step.Environment[name]; !present || got != want {
+			t.Fatalf("source export %s = %q/%t, want %q", name, got, present, want)
+		}
+	}
+	if _, present := step.Environment["MISSING_EXPORT"]; present {
+		t.Fatal("unexported name became present in the selected process environment")
+	}
+	if strings.Contains(strings.Join(step.Arguments, " "), hostCC) {
+		t.Fatal("private host action-role token escaped into selected generator arguments")
+	}
+	if !slices.Contains(step.AuxiliaryTools, "host@cc") {
+		t.Fatalf("selected source step omits declared host compiler: %v", step.AuxiliaryTools)
+	}
+	boundHostTool := false
+	for index, argument := range step.Arguments {
+		if index > 0 && step.Arguments[index-1] == "-tool" && argument == "host@cc=${tool:host@cc}" {
+			boundHostTool = true
+		}
+		if index > 0 && step.Arguments[index-1] == "-replay_base64" {
+			decoded, err := base64.StdEncoding.DecodeString(argument)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(decoded), `"name":"host@cc"`) {
+				t.Fatal("selected host compiler was turned into a denied recursive Make proxy")
+			}
+		}
+	}
+	if !boundHostTool {
+		t.Fatalf("selected source step has no bound host compiler: %q", step.Arguments)
+	}
+	changed := *context
+	changed.hostToolsetIdentity = "sha256-" + strings.Repeat("b", 64)
+	rebuilt, _, recognized, err := evaluator.evaluatedScriptOutputTextRequestWithSourceProof(target, recipe, nil, staged, proof, &changed)
+	if err != nil || !recognized || reflect.DeepEqual(request, rebuilt) {
+		t.Fatalf("selected host toolset changed request = %t/%v/equal:%t", recognized, err, reflect.DeepEqual(request, rebuilt))
+	}
+}
+
+func TestSelectedSourceFilechkDeclinesUnboundNestedHelpers(t *testing.T) {
+	for _, command := range []string{
+		"sh scripts/helper",
+		"helper=scripts/helper; sh \"$helper\"",
+		"sh /tmp/unowned",
+		"/tmp/unowned",
+		"trap '/tmp/unowned' EXIT; printf release",
+		"alias helper='/tmp/unowned'\nhelper",
+		"busybox env sh scripts/helper",
+		"env -S 'sh scripts/helper' printf",
+		"env --split-string='sh scripts/helper' printf",
+		"srctree=.; sh ${srctree}/scripts/helper",
+		"sh __LINUX_BZL_SOURCE_TREE__/scripts/helper",
+		". include/config/auto.conf; sh include/config/auto.conf",
+	} {
+		t.Run(command, func(t *testing.T) {
+			scopes, _, root, target, baseline := quotedSourceVersionFixtureScopes(t)
+			mustWriteSource(t, root, "scripts/source-version", "#!/bin/sh\n"+command+"\n")
+			mustWriteSource(t, root, "scripts/helper", "#!/bin/sh\nprintf 'source-helper\\n'\n")
+			names := []string{"scripts/helper"}
+			files := map[string]string{names[0]: "#!/bin/sh\n. include/config/auto.conf\n"}
+			owners := map[string]string{names[0]: "selected-prior-helper-writer"}
+			recipe := "{\necho \"5.10.270$(sh ${tree:kernel}/scripts/source-version ${tree:kernel})\"\n} > '" + target + "'"
+			_, _, recognized, _, err := scopes.SelectedSourceFilechkOutputText(
+				target, recipe, baseline, names, files, owners, nil,
+			)
+			if err != nil || recognized {
+				t.Fatalf("unbound nested helper proof = %t, %v", recognized, err)
+			}
+		})
+	}
+}
+
+func TestQuotedSourceVersionRequestBindsLocalversionPresenceAndProducer(t *testing.T) {
+	scopes, builder, _, target, baseline := quotedSourceVersionFixtureScopes(t)
+	recipe := "{\necho \"5.10.270$(sh ${tree:kernel}/scripts/source-version ${tree:kernel})\"\n} > '" + target + "'"
+	query := func(names []string, files, owners map[string]string) (string, ProbeRequest) {
+		value, concrete, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+			target, recipe, baseline, names, files, owners, nil,
+		)
+		if err != nil || concrete || !recognized || value != "" || len(refs) != 1 {
+			t.Fatalf("quoted filechk discovery = %q/%t/%t refs=%d/%v", value, concrete, recognized, len(refs), err)
+		}
+		plan, err := builder.Plan(refs...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(plan.Terminal) != 1 || plan.Terminal[0] != refs[0].NodeID {
+			t.Fatalf("selected source terminal = %q, want %q", plan.Terminal, refs[0].NodeID)
+		}
+		request, found := plan.Requests[refs[0].RequestID]
+		if !found {
+			t.Fatalf("selected source request %q missing from plan", refs[0].RequestID)
+		}
+		return refs[0].RequestID, request
+	}
+	missingID, missing := query(nil, nil, nil)
+	if !slices.Contains(missing.Sources, "scripts/source-version") ||
+		!slices.Contains(missing.SourceRoots, "linux") || len(missing.Steps) != 3 {
+		t.Fatalf("source writer probe = %#v, want selected script, full source root and three execution steps", missing)
+	}
+	if slices.Contains(missing.Steps[0].Arguments, "-tree") ||
+		!slices.Contains(missing.Steps[1].Arguments, "-tree") ||
+		!slices.Contains(missing.Steps[2].Arguments, "-tree") {
+		t.Fatal("selected script's source root was offered to unused setup or omitted from actual recipe/validation")
+	}
+	if !strings.Contains(strings.Join(missing.Steps[1].Arguments, " "), "-require_applet grep") {
+		t.Fatal("source SCM SVN pipeline can run grep without SVN, but its private applet was not required")
+	}
+	if strings.Contains(strings.Join(missing.Steps[0].Arguments, " "), "CONFIG_LOCALVERSION=-fixture") {
+		t.Fatal("configuration source bytes escaped their private input scratch")
+	}
+	const selectedAutoConf = "include/config/auto.conf"
+	const replacedAutoConf = "CONFIG_LOCALVERSION=\"-replaced\"\n"
+	autoID, autoRequest := query([]string{selectedAutoConf},
+		map[string]string{selectedAutoConf: replacedAutoConf},
+		map[string]string{selectedAutoConf: "source-profile:selected-auto-conf-writer"})
+	if autoID == missingID {
+		t.Fatal("a selected previous auto.conf writer did not change request identity")
+	}
+	selectedContents, baselineContents := false, false
+	for _, scratch := range autoRequest.Scratch {
+		selectedContents = selectedContents || scratch.Content == replacedAutoConf
+		baselineContents = baselineContents || scratch.Content == baseline[selectedAutoConf]
+	}
+	if !selectedContents || baselineContents {
+		t.Fatal("source version script did not observe the selected previous auto.conf writer")
+	}
+	_, concrete, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, []string{selectedAutoConf}, nil, nil, nil,
+	)
+	if err != nil || concrete || recognized || len(refs) != 0 {
+		t.Fatalf("opaque previous auto.conf writer = concrete=%t recognized=%t refs=%d err=%v", concrete, recognized, len(refs), err)
+	}
+	present := scopes.evaluators["target"].scriptEnvironment
+	present["LOCALVERSION"] = ""
+	presentID, presentRequest := query(nil, nil, nil)
+	if presentID == missingID {
+		t.Fatal("LOCALVERSION absent and present-empty produced the same request identity")
+	}
+	if _, ok := presentRequest.Steps[0].Environment["LOCALVERSION"]; !ok {
+		t.Fatal("present-empty LOCALVERSION was dropped from selected script environment")
+	}
+	delete(present, "LOCALVERSION")
+	// A source-owned auto.conf assignment shadows any Make export, including
+	// one whose value is a different compiler scope's unresolved probe.
+	present["CONFIG_LOCALVERSION"] = "exported-but-shadowed"
+	shadowedID, shadowed := query(nil, nil, nil)
+	if shadowedID == missingID {
+		t.Fatal("the complete GNU Make export membership lost its producer identity")
+	}
+	if got := shadowed.Steps[0].Environment["CONFIG_LOCALVERSION"]; got != "exported-but-shadowed" {
+		t.Fatal("complete selected Make exports lost CONFIG_LOCALVERSION before auto.conf sourced it")
+	}
+	delete(present, "CONFIG_LOCALVERSION")
+	// When auto.conf has no AUTO assignment, the selected process must bind
+	// both its exact inherited value and absent versus present-empty status.
+	present["CONFIG_LOCALVERSION_AUTO"] = ""
+	autoPresentID, autoPresent := query(nil, nil, nil)
+	if autoPresentID == missingID {
+		t.Fatal("missing AUTO and inherited present-empty AUTO had identical source requests")
+	}
+	if value, ok := autoPresent.Steps[0].Environment["CONFIG_LOCALVERSION_AUTO"]; !ok || value != "" {
+		t.Fatal("missing staged AUTO assignment lost the inherited present-empty binding")
+	}
+	delete(present, "CONFIG_LOCALVERSION_AUTO")
+	const selectedLocalversion = "localversion-extra"
+	localContents := map[string]string{selectedLocalversion: "-extra", "unrelated/header": "tracked\n"}
+	firstID, firstRequest := query([]string{selectedLocalversion, "unrelated/header"}, localContents,
+		map[string]string{selectedLocalversion: "source-profile-a:selected-writer", "unrelated/header": "other:selected-writer"})
+	secondID, secondRequest := query([]string{selectedLocalversion, "unrelated/header"}, localContents,
+		map[string]string{selectedLocalversion: "source-profile-b:selected-writer", "unrelated/header": "other:selected-writer"})
+	if firstID == secondID || firstID == missingID || len(firstRequest.Scratch) != len(secondRequest.Scratch) {
+		t.Fatal("a localversion producer changed without changing the exact selected source request")
+	}
+	if !slices.ContainsFunc(firstRequest.Scratch, func(item ProbeScratch) bool {
+		return item.Content == "other:selected-writer" && item.ContentIsOpaque
+	}) {
+		t.Fatal("a prior working file and its owner escaped the selected generator's closed frontier")
+	}
+	_, concrete, recognized, refs, err = scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, []string{"localversion-opaque"}, nil, nil, nil,
+	)
+	if err != nil || concrete || recognized || len(refs) != 0 {
+		t.Fatalf("opaque source-used object file = concrete=%t recognized=%t refs=%d err=%v", concrete, recognized, len(refs), err)
+	}
+}
+
+func TestQuotedSourceVersionRejectsWorkerSCMAndUnsafeSourceLocalversion(t *testing.T) {
+	scopes, _, root, target, baseline := quotedSourceVersionFixtureScopes(t)
+	recipe := "{\necho \"5.10.270$(sh ${tree:kernel}/scripts/source-version ${tree:kernel})\"\n} > '" + target + "'"
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, nil,
+	); err != nil || recognized || len(refs) != 0 {
+		t.Fatalf("source SCM metadata acquired probe authority: recognized=%t refs=%d err=%v", recognized, len(refs), err)
+	}
+	if err := os.Remove(filepath.Join(root, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("scripts/source-version", filepath.Join(root, "localversion-link")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, nil,
+	); err != nil || recognized || len(refs) != 0 {
+		t.Fatalf("source wildcard symlink acquired probe authority: recognized=%t refs=%d err=%v", recognized, len(refs), err)
+	}
+}
+
+func TestQuotedSourceVersionReportsMissingSelectedSourceScript(t *testing.T) {
+	scopes, _, root, target, baseline := quotedSourceVersionFixtureScopes(t)
+	recipe := "{\necho \"5.10.270$(sh ${tree:kernel}/scripts/source-version ${tree:kernel})\"\n} > '" + target + "'"
+	if err := os.Remove(filepath.Join(root, "scripts/source-version")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, nil,
+	)
+	if !recognized || len(refs) != 0 || err == nil || !strings.Contains(err.Error(), "selected filechk source script") {
+		t.Fatalf("missing declared source script = recognized=%t refs=%d err=%v, want selected source error", recognized, len(refs), err)
+	}
+}
+
+func TestQuotedSourceVersionReadsOnlyItsSealedRequestResult(t *testing.T) {
+	scopes, builder, root, target, baseline := quotedSourceVersionFixtureScopes(t)
+	recipe := "{\necho \"5.10.270$(sh ${tree:kernel}/scripts/source-version ${tree:kernel})\"\n} > '" + target + "'"
+	_, _, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, nil,
+	)
+	if err != nil || !recognized || len(refs) != 1 {
+		t.Fatalf("source discovery = refs=%d recognized=%t err=%v", len(refs), recognized, err)
+	}
+	plan, err := builder.Plan(refs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := refs[0]
+	request := plan.Requests[selected.RequestID]
+	const exact = "5.10.270-fixture\n"
+	envelope := linuxProbeEvaluatedScriptSafePrefix + base64.StdEncoding.EncodeToString([]byte(exact)) + "\n"
+	result := ProbeResult{
+		Schema: LinuxProbeResultSchema, NodeID: selected.NodeID, RequestID: selected.RequestID,
+		Scope: "target", ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: envelope,
+		Steps: evaluatedScriptOutputResultSteps(request, envelope),
+	}
+	replay, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayScopes := testSourceScriptOutputScopes(t, root, replay, nil)
+	bytes, concrete, recognized, replayRefs, err := replayScopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, probeResultMap{selected.NodeID: result},
+	)
+	if err != nil || !concrete || !recognized || bytes != exact || len(replayRefs) != 1 || replayRefs[0] != selected {
+		t.Fatalf("sealed source replay = %q/%t/%t refs=%#v/%v", bytes, concrete, recognized, replayRefs, err)
+	}
+	wrongOwner := map[string]string{"localversion-external": "source-profile-b:selected-writer"}
+	if _, concrete, recognized, _, err := replayScopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, []string{"localversion-external"},
+		map[string]string{"localversion-external": "-external"}, wrongOwner,
+		probeResultMap{selected.NodeID: result},
+	); err == nil || concrete || !recognized {
+		t.Fatalf("stale source oracle = concrete=%t recognized=%t err=%v; want owned mismatch", concrete, recognized, err)
+	}
+	// The ordinary replay uses its own oracle when no earlier source oracle was
+	// supplied. This is the same request with the same input fingerprint.
+	ordinary, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinaryScopes := testSourceScriptOutputScopes(t, root, ordinary, probeResultMap{selected.NodeID: result})
+	bytes, concrete, recognized, replayRefs, err = ordinaryScopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, nil,
+	)
+	if err != nil || !concrete || !recognized || bytes != exact || len(replayRefs) != 1 || replayRefs[0] != selected {
+		t.Fatalf("ordinary source replay = %q/%t/%t refs=%#v/%v", bytes, concrete, recognized, replayRefs, err)
+	}
+}
+
+func TestQuotedSourceVersionDiscoveryRegistersWithUnrelatedPriorOracle(t *testing.T) {
+	scopes, builder, _, target, baseline := quotedSourceVersionFixtureScopes(t)
+	recipe := "{\necho \"5.10.270$(sh ${tree:kernel}/scripts/source-version ${tree:kernel})\"\n} > '" + target + "'"
+	guardNodeID := strings.Repeat("f", 64)
+	prior := probeResultMap{guardNodeID: {
+		Schema: LinuxProbeResultSchema, NodeID: guardNodeID, Scope: "target",
+		ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: "previous guarded result",
+	}}
+	scopes.evaluators["target"].oracle = prior
+	value, concrete, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, nil, true,
+	)
+	if err != nil || value != "" || concrete || !recognized || len(refs) != 1 || refs[0].NodeID == guardNodeID {
+		t.Fatalf("source-only discovery with prior oracle = %q/%t/%t refs=%d err=%v", value, concrete, recognized, len(refs), err)
+	}
+	if _, exists := prior[refs[0].NodeID]; exists {
+		t.Fatal("source-only discovery's selected node was already measured by the unrelated prior oracle")
+	}
+	plan, err := builder.Plan(refs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Terminal) != 1 || plan.Terminal[0] != refs[0].NodeID {
+		t.Fatalf("source-only request terminal = %q, want selected reference", plan.Terminal)
+	}
+	_, concrete, recognized, replayRefs, err := scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "missing") || !strings.Contains(err.Error(), refs[0].NodeID) || concrete || !recognized || len(replayRefs) != 0 {
+		t.Fatalf("ordinary missing result = concrete=%t recognized=%t refs=%d err=%v", concrete, recognized, len(replayRefs), err)
+	}
+	// An earlier sealed oracle never falls back to a different current oracle.
+	// Its selected request must have an independently measured result.
+	scopes.evaluators["target"].oracle = probeResultMap{refs[0].NodeID: {
+		Schema: LinuxProbeResultSchema, NodeID: refs[0].NodeID,
+	}}
+	_, concrete, recognized, replayRefs, err = scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, prior,
+	)
+	if err == nil || !strings.Contains(err.Error(), "missing") || !strings.Contains(err.Error(), refs[0].NodeID) || concrete || !recognized || len(replayRefs) != 0 {
+		t.Fatalf("sealed missing result = concrete=%t recognized=%t refs=%d err=%v", concrete, recognized, len(replayRefs), err)
+	}
+}
+
+func TestSelectedSourceFilechkRegistersTargetScopeSourceRequest(t *testing.T) {
+	_, _, root, target, baseline := quotedSourceVersionFixtureScopes(t)
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorNodeID := strings.Repeat("f", 64)
+	prior := probeResultMap{priorNodeID: {
+		Schema: LinuxProbeResultSchema, NodeID: priorNodeID, Scope: "target",
+		ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: "previous Kconfig result",
+	}}
+	scopes := testSourceScriptOutputDualScopes(t, root, builder, prior)
+	recipe := "{\necho \"5.10.270$(sh ${tree:kernel}/scripts/source-version ${tree:kernel})\"\n} > '" + target + "'"
+	for _, scope := range []string{"target"} {
+		evaluator := scopes.evaluators[scope]
+		proof, staged, recognized, err := evaluator.selectedSourceFilechkProof(target, recipe, baseline, nil, nil, nil)
+		if err != nil || !recognized {
+			t.Fatalf("%s selected source script/input proof = recognized=%t err=%v", scope, recognized, err)
+		}
+		request, dependencies, recognized, err := evaluator.evaluatedScriptOutputTextRequestWithSourceProof(target, recipe, nil, staged, proof)
+		if err != nil || !recognized {
+			t.Fatalf("%s selected source request = recognized=%t deps=%d err=%v", scope, recognized, len(dependencies), err)
+		}
+		if !slices.Contains(request.SourceRoots, "linux") || !slices.Contains(request.Sources, "scripts/source-version") {
+			t.Fatalf("%s selected source request lost declared full root or selected script", scope)
+		}
+	}
+	value, concrete, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, nil, true,
+	)
+	if err != nil || value != "" || concrete || !recognized || len(refs) != 1 || refs[0].Scope != "target" {
+		t.Fatalf("selected source discovery = %q/%t/%t refs=%v err=%v", value, concrete, recognized, refs, err)
+	}
+	plan, err := builder.Plan(refs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Terminal) != 1 || !slices.Contains(plan.Terminal, refs[0].NodeID) {
+		t.Fatalf("selected source terminals = %q, want exact target writer", plan.Terminal)
+	}
+	for _, ref := range refs {
+		if ref.NodeID == priorNodeID {
+			t.Fatal("prior Kconfig oracle result was selected as a source request")
+		}
+	}
+}
+
+func TestSelectedSourceFilechkBindsCompleteMakeExportIncludingTargetProbe(t *testing.T) {
+	_, _, root, target, baseline := quotedSourceVersionFixtureScopes(t)
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes := testSourceScriptOutputDualScopes(t, root, builder, nil)
+	targetEvaluator := scopes.evaluators["target"]
+	recipe := "{\necho \"5.10.270$(sh ${tree:kernel}/scripts/source-version ${tree:kernel})\"\n} > '" + target + "'"
+	discover := func() (ProbeReference, ProbeRequest) {
+		t.Helper()
+		_, concrete, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+			target, recipe, baseline, nil, nil, nil, nil, true,
+		)
+		if err != nil || concrete || !recognized || len(refs) != 1 {
+			t.Fatalf("selected source discovery = concrete=%t recognized=%t refs=%v err=%v", concrete, recognized, refs, err)
+		}
+		plan, err := builder.Plan(refs...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return refs[0], plan.Requests[refs[0].RequestID]
+	}
+	without, withoutRequest := discover()
+	truth, err := targetEvaluator.requestTruth(ProbeRequest{
+		Schema:  LinuxProbeRequestSchema,
+		Steps:   []ProbeStep{{Name: "target-compiler-capability", Tool: "cc", Arguments: []string{"--version"}}},
+		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{Operator: "exit-zero", Step: "target-compiler-capability"}},
+	})
+	if err != nil || truth.known || truth.reference.Scope != "target" {
+		t.Fatalf("target compiler boolean source = %#v err=%v", truth, err)
+	}
+	token, err := targetEvaluator.renderTruth(truth, " -fno-tree-loop-im", "")
+	if err != nil || !linuxProbeSymbolPattern.MatchString(token) {
+		t.Fatalf("registered target boolean = %q err=%v", token, err)
+	}
+	targetEvaluator.scriptEnvironment["CFLAGS_GCOV"] = token
+	with, withRequest := discover()
+	if without.RequestID == with.RequestID || !slices.Contains(withRequest.SourceRoots, linuxProbeSourceRootName) {
+		t.Fatal("unobserved target-scope Make export did not bind source request identity")
+	}
+	if withoutRequest.InputCount != 0 || withRequest.InputCount == 0 {
+		t.Fatal("complete selected export did not retain its target probe producer")
+	}
+	if !slices.ContainsFunc(withRequest.Steps[0].EnvironmentFragments, func(value ProbeEnvironmentFragments) bool {
+		return value.Name == "CFLAGS_GCOV"
+	}) {
+		t.Fatal("target probe export was omitted from selected source process")
+	}
+	makeExport := func(request ProbeRequest) string {
+		for _, scratch := range request.Scratch {
+			if scratch.Name == "make-export-identity" {
+				if !scratch.Present || !scratch.ContentIsOpaque || len(scratch.Content) != 64 {
+					t.Fatalf("Make export identity scratch = %#v", scratch)
+				}
+				return scratch.Content
+			}
+		}
+		t.Fatal("source-owned request omitted complete Make export identity")
+		return ""
+	}
+	if makeExport(withoutRequest) == makeExport(withRequest) {
+		t.Fatal("a different GNU Make producer did not change normalized complete export identity")
+	}
+	pinned := pinnedSourceVersionCollectorFixture(t)
+	mutated := strings.Replace(pinned,
+		`res="${res}${CONFIG_LOCALVERSION}${LOCALVERSION}"`,
+		`res="${res}${CONFIG_LOCALVERSION}${CFLAGS_GCOV}${LOCALVERSION}"`, 1)
+	if mutated == pinned {
+		t.Fatal("pinned source lacked the selected exported-name mutation site")
+	}
+	if err := os.WriteFile(filepath.Join(root, "scripts", "source-version"), []byte(mutated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, concrete, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, nil, true,
+	)
+	if err != nil || concrete || !recognized || len(refs) != 1 || refs[0].Scope != "target" || refs[0].RequestID == with.RequestID {
+		t.Fatalf("changed script consuming target probe = concrete=%t recognized=%t refs=%v err=%v", concrete, recognized, refs, err)
+	}
+}
+
+func TestQuotedSourceVersionRejectsUndeclaredRunnerGrepAndAwkEnvironment(t *testing.T) {
+	scopes, builder, _, target, baseline := quotedSourceVersionFixtureScopes(t)
+	recipe := "{\necho \"5.10.270$(sh ${tree:kernel}/scripts/source-version ${tree:kernel})\"\n} > '" + target + "'"
+	request := func() (ProbeReference, ProbeRequest, string) {
+		t.Helper()
+		_, concrete, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+			target, recipe, baseline, nil, nil, nil, nil, true,
+		)
+		if err != nil || concrete || !recognized || len(refs) != 1 {
+			t.Fatalf("runner setting source discovery = concrete=%t recognized=%t refs=%v err=%v", concrete, recognized, refs, err)
+		}
+		plan, err := builder.Plan(refs...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		selected := plan.Requests[refs[0].RequestID]
+		if !slices.Contains(selected.Steps[0].Arguments, "-script_stdin") {
+			t.Fatal("selected source request omitted private setup witness")
+		}
+		return refs[0], selected, selected.Steps[0].StdinOpaque
+	}
+	missing, absentRequest, setup := request()
+	for _, name := range []string{"GREP_OPTIONS", "AWKPATH"} {
+		if _, ok := absentRequest.Steps[1].Environment[name]; ok {
+			t.Fatalf("undeclared runner setting %s entered source process environment", name)
+		}
+		if !strings.Contains(setup, "if [ \"${"+name+"+set}\" = set ]; then exit 1; fi") {
+			t.Fatalf("runner setting %s can leak from the tool contract without an unsafe witness", name)
+		}
+	}
+	scopes.evaluators["target"].scriptEnvironment["GREP_OPTIONS"] = ""
+	scopes.evaluators["target"].scriptEnvironment["AWKPATH"] = "/declared/unused/awk"
+	present, presentRequest, setup := request()
+	if present.RequestID == missing.RequestID {
+		t.Fatal("declared runner grep/awk settings lost Make export and process identity")
+	}
+	for name, want := range map[string]string{
+		"GREP_OPTIONS": "", "AWKPATH": "/declared/unused/awk",
+	} {
+		if value, ok := presentRequest.Steps[1].Environment[name]; !ok || value != want {
+			t.Fatalf("source process %s = %q/%t, want declared %q", name, value, ok, want)
+		}
+		if !strings.Contains(setup, "if [ \"${"+name+"+set}\" != set ]; then exit 1; fi") {
+			t.Fatalf("runner setting %s dropped its declared presence witness", name)
+		}
+	}
+	scopes.evaluators["target"].scriptEnvironment["GREP_OPTIONS"] = "--file=/tmp/unowned-grep-patterns"
+	_, concrete, recognized, refs, err := scopes.SelectedSourceFilechkOutputText(
+		target, recipe, baseline, nil, nil, nil, nil, true,
+	)
+	if err != nil || concrete || recognized || len(refs) != 0 {
+		t.Fatalf("source SVN pipeline with active GREP_OPTIONS = concrete=%t recognized=%t refs=%v err=%v", concrete, recognized, refs, err)
+	}
+}
+
 func TestLinuxSourceScriptProbeDiscoversExtensionlessHelperFromShebang(t *testing.T) {
 	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
 	if err != nil {
@@ -505,6 +1100,117 @@ func TestLinuxSourceScriptProbeExpandsExactEnvironmentAssignmentsOnly(t *testing
 			t.Errorf("Shell(%q) literal TOOL = %q, want literal $CC", command, got)
 		} else if strings.Contains(got, compactKbuildLiteralDollarToken) {
 			t.Errorf("Shell(%q) leaked lexer sentinel in environment %q", command, got)
+		}
+	}
+}
+
+func TestLinuxSourceScriptProbeAcceptsDirectAssignmentPrefix(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := testSymbolicProbeEvaluator(t, builder, nil)
+	evaluator.sourceRootAliases = []string{"__LINUX_BZL_SOURCE_TREE__"}
+	evaluator.scriptEnvironment["srctree"] = "__LINUX_BZL_SOURCE_TREE__"
+	evaluator, err = evaluator.WithScriptEnvironment(evaluator.scriptEnvironment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{
+		`PAHOLE=` + KbuildActionRoleToken("target", "pahole") + ` /src/scripts/pahole-flags.sh`,
+		`env PAHOLE=` + KbuildActionRoleToken("target", "pahole") + ` /src/scripts/pahole-flags.sh`,
+		`PAHOLE=` + KbuildActionRoleToken("target", "pahole") + ` __LINUX_BZL_SOURCE_TREE__/scripts/pahole-flags.sh`,
+		`PAHOLE=` + KbuildActionRoleToken("target", "pahole") + ` VPATH=__LINUX_BZL_SOURCE_TREE__ __LINUX_BZL_SOURCE_TREE__/scripts/pahole-flags.sh`,
+	} {
+		request := singleSourceScriptRequest(t, evaluator, command)
+		if got, want := request.Sources, []string{"Kconfig", "scripts/pahole-flags.sh"}; !slices.Equal(got, want) {
+			t.Errorf("Shell(%q) sources = %q, want %q", command, got, want)
+		}
+		step := request.Steps[0]
+		if got, want := step.Environment["PAHOLE"], "pahole"; got != want {
+			t.Errorf("Shell(%q) PAHOLE = %q, want configured proxy %q", command, got, want)
+		}
+		if got, want := step.Environment["srctree"], "${source_root:linux}"; got != want {
+			t.Errorf("Shell(%q) srctree = %q, want selected source root %q", command, got, want)
+		}
+		if strings.Contains(command, " VPATH=") && step.Environment["VPATH"] != "${source_root:linux}" {
+			t.Errorf("Shell(%q) inline VPATH = %q, want selected source root", command, step.Environment["VPATH"])
+		}
+		if !slices.Contains(step.AuxiliaryTools, "pahole") || request.Outcome.Kind != "text" {
+			t.Errorf("Shell(%q) request has no pahole proxy or text outcome: %#v", command, request)
+		}
+	}
+	for _, command := range []string{
+		`PAHOLE=$MISSING /src/scripts/pahole-flags.sh`,
+		`PAHOLE=one PAHOLE=two /src/scripts/pahole-flags.sh`,
+		`PAHOLE=one __LINUX_BZL_SOURCE_TREE__/scripts/../pahole-flags.sh`,
+		`PAHOLE=` + KbuildActionRoleToken("target", "pahole") + ` /src/scripts/pahole-flags.sh; echo ambient`,
+	} {
+		if _, err := evaluator.Shell(context.Background(), command); err == nil || IsLinuxProbeUnsupportedCommand(err) {
+			t.Errorf("Shell(%q) = %v, want owned rejection", command, err)
+		}
+	}
+}
+
+func TestLinuxSourceScriptPipelineUsesSourceInterpreterAndProducerStdout(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := testSymbolicProbeEvaluator(t, builder, nil)
+	evaluator.tools["awk"] = "/configured/awk"
+	// Kbuild exports AWK to scripts while an AWK shebang selects the same
+	// configured tool as the script interpreter.
+	evaluator.scriptEnvironment["AWK"] = "/configured/awk"
+	evaluator.sourceRoot = t.TempDir()
+	evaluator.sourceRootAliases = []string{"__LINUX_BZL_SOURCE_TREE__"}
+	scripts := filepath.Join(evaluator.sourceRoot, "scripts")
+	if err := os.MkdirAll(scripts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scripts, "filter.sh"), []byte("#!/usr/bin/awk -f\n{ print $1 }\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := KbuildActionRoleToken("target", "ld") + " --version | __LINUX_BZL_SOURCE_TREE__/scripts/filter.sh"
+	value, err := evaluator.Shell(context.Background(), command)
+	if err != nil || !linuxProbeSymbolPattern.MatchString(value) {
+		t.Fatalf("source pipeline = %q, %v; want symbolic script text", value, err)
+	}
+	plan, err := builder.Plan(evaluator.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 2 || !slices.Equal(plan.Nodes[1].Inputs, []string{plan.Nodes[0].ID}) {
+		t.Fatalf("source pipeline dependencies = %#v, want tool stdout then source script", plan.Nodes)
+	}
+	producer := plan.Requests[plan.Nodes[0].RequestID]
+	if producer.Outcome.TrimSpace || producer.Steps[0].Tool != "ld" {
+		t.Errorf("source pipeline producer = %#v, want raw configured linker stdout", producer)
+	}
+	script := plan.Requests[plan.Nodes[1].RequestID]
+	if !slices.Contains(script.Sources, "scripts/filter.sh") || !slices.Contains(script.Steps[0].Arguments, "${tool:awk}") ||
+		!slices.Contains(script.Steps[0].AuxiliaryTools, "awk") || !slices.Contains(script.Steps[0].Arguments, "-f") ||
+		len(script.Steps[0].StdinFragments) != 1 || script.Steps[0].StdinFragments[0].Value != "${result:00000000.text}" {
+		t.Errorf("source pipeline script = %#v, want declared AWK shebang and raw input", script)
+	}
+	if !script.Outcome.RequireSuccess {
+		t.Errorf("source pipeline outcome = %#v, want a successful source filter", script.Outcome)
+	}
+	awkTools := 0
+	for index, argument := range script.Steps[0].Arguments {
+		if argument == "-tool" && index+1 < len(script.Steps[0].Arguments) && script.Steps[0].Arguments[index+1] == "awk=${tool:awk}" {
+			awkTools++
+		}
+	}
+	if awkTools != 1 {
+		t.Errorf("source pipeline binds AWK %d times, want once: %q", awkTools, script.Steps[0].Arguments)
+	}
+	for _, bad := range []string{
+		KbuildActionRoleToken("target", "ld") + " --version | __LINUX_BZL_SOURCE_TREE__/scripts/filter.sh; echo ambient",
+		KbuildActionRoleToken("target", "ld") + " --help | __LINUX_BZL_SOURCE_TREE__/scripts/filter.sh",
+	} {
+		if _, err := evaluator.Shell(context.Background(), bad); err == nil || IsLinuxProbeUnsupportedCommand(err) {
+			t.Errorf("source pipeline %q = %v, want owned rejection", bad, err)
 		}
 	}
 }
@@ -1037,6 +1743,9 @@ func TestKbuildEvaluatedScriptOutputTextDiscoveryUsesExactRecipeAndEnvironment(t
 		t.Fatalf("steps = %#v", request.Steps)
 	}
 	prepare, step, validate := request.Steps[0], request.Steps[1], request.Steps[2]
+	if !strings.Contains(strings.Join(prepare.Arguments, " "), "-tree kernel=${source_root:linux}") {
+		t.Fatal("staging a declared immutable bc source omitted setup's consumed kernel tree binding")
+	}
 	if step.WorkingDirectory != "${scratch:working-tree}" ||
 		prepare.WorkingDirectory != step.WorkingDirectory || validate.WorkingDirectory != step.WorkingDirectory ||
 		step.Environment["SCRIPT_MODE"] != "exact" || step.Environment["CC"] != "cc" {
@@ -1060,14 +1769,10 @@ func TestKbuildEvaluatedScriptOutputTextDiscoveryUsesExactRecipeAndEnvironment(t
 		strings.Contains(string(decoded), "source_root") {
 		t.Fatalf("measured recipe contains probe-only shell state: %q", decoded)
 	}
-	validationIndex := slices.Index(validate.Arguments, "-script_content_base64")
-	if validationIndex < 0 || validationIndex+1 >= len(validate.Arguments) {
-		t.Fatalf("validation argv has no encoded body: %q", validate.Arguments)
+	if !slices.Contains(validate.Arguments, "-script_stdin") {
+		t.Fatalf("validation argv has no stdin body: %q", validate.Arguments)
 	}
-	validationBody, err := base64.StdEncoding.DecodeString(validate.Arguments[validationIndex+1])
-	if err != nil {
-		t.Fatal(err)
-	}
+	validationBody := validate.StdinOpaque
 	for _, want := range []string{
 		"find . -mindepth 1 ! -path './include/generated/timeconst.h' ! -path './include/generated' ! -path './include'",
 		"if [ ! -f 'include/generated/timeconst.h' ] || [ -L 'include/generated/timeconst.h' ]; then unsafe; fi",
@@ -1076,7 +1781,7 @@ func TestKbuildEvaluatedScriptOutputTextDiscoveryUsesExactRecipeAndEnvironment(t
 		"contains_transient()",
 		linuxProbeEvaluatedScriptSafePrefix[:len(linuxProbeEvaluatedScriptSafePrefix)-1],
 	} {
-		if !strings.Contains(string(validationBody), want) {
+		if !strings.Contains(validationBody, want) {
 			t.Errorf("validation script %q omits %q", validationBody, want)
 		}
 	}
@@ -1143,25 +1848,17 @@ func TestKbuildEvaluatedScriptOutputTextCarriesExactWorkingTreeContents(t *testi
 	if separator < 0 || separator+1 >= len(step.Arguments) || step.Arguments[separator+1] != "${scratch:working-input-0000}" {
 		t.Fatalf("working input transport argv = %q", step.Arguments)
 	}
-	encoded := slices.Index(step.Arguments, "-script_content_base64")
-	if encoded < 0 || encoded >= separator || encoded+1 >= len(step.Arguments) {
+	stdin := slices.Index(step.Arguments, "-script_stdin")
+	if stdin < 0 || stdin >= separator {
 		t.Fatalf("evaluated script must precede positional transports: %q", step.Arguments)
 	}
-	body, err := base64.StdEncoding.DecodeString(step.Arguments[encoded+1])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := `cp -- "${1}" '.config'`; !strings.Contains(string(body), want) {
-		t.Errorf("working-tree setup body %q omits %q", body, want)
+	if want := `cp -- "${1}" '.config'`; !strings.Contains(step.StdinOpaque, want) {
+		t.Errorf("working-tree setup body %q omits %q", step.StdinOpaque, want)
 	}
 	validate := empty.Steps[2]
-	validateEncoded := slices.Index(validate.Arguments, "-script_content_base64")
-	validationBody, err := base64.StdEncoding.DecodeString(validate.Arguments[validateEncoded+1])
-	if err != nil {
-		t.Fatal(err)
-	}
+	validationBody := validate.StdinOpaque
 	for _, want := range []string{`cmp -s '.config' "${1}"`, `! -path './.config'`} {
-		if !strings.Contains(string(validationBody), want) {
+		if !strings.Contains(validationBody, want) {
 			t.Errorf("working-tree validation body %q omits %q", validationBody, want)
 		}
 	}

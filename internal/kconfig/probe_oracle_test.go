@@ -207,6 +207,65 @@ func TestProbeResultOracleAllowsUnusedDiscoverySuperset(t *testing.T) {
 	}
 }
 
+func TestProbeResultOracleRejectsPreviousHostToolsetResult(t *testing.T) {
+	targetIdentity := "sha256-" + strings.Repeat("a", 64)
+	hostA := "sha256-" + strings.Repeat("b", 64)
+	hostB := "sha256-" + strings.Repeat("c", 64)
+	request := ProbeRequest{
+		Schema:  LinuxProbeRequestSchema,
+		Steps:   []ProbeStep{{Name: "version", Tool: "host@cc", Arguments: []string{"--version"}}},
+		Outcome: ProbeOutcome{Kind: "text", Step: "version", Stream: "stdout"},
+	}
+	build := func(hostIdentity string) (*ProbePlan, ProbeReference) {
+		t.Helper()
+		builder, err := NewProbePlanBuilder(targetIdentity, hostIdentity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reference, err := builder.Request("target", request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := builder.Plan(reference)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plan, reference
+	}
+	planA, referenceA := build(hostA)
+	planB, referenceB := build(hostB)
+	if referenceA.RequestID == referenceB.RequestID || referenceA.NodeID == referenceB.NodeID {
+		t.Fatalf("host compiler change reused request/node identity: A=%#v B=%#v", referenceA, referenceB)
+	}
+	resultA := ProbeResult{
+		Schema: LinuxProbeResultSchema, NodeID: referenceA.NodeID, RequestID: referenceA.RequestID,
+		Scope: "target", ToolsetIdentity: targetIdentity, Kind: "text", Text: "compiler version A\n",
+		Steps: []ProbeStepResult{{Name: "version", Status: "success", Stdout: "compiler version A\n"}},
+	}
+	if err := resultA.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	oracle := &ProbeResultOracle{
+		results:  map[string]ProbeResult{referenceA.NodeID: resultA},
+		toolsets: map[string]string{"target": targetIdentity, "host": hostA},
+	}
+	if err := oracle.ValidatePlan(planA); err != nil {
+		t.Fatalf("original host compiler result rejected: %v", err)
+	}
+	oracle.toolsets["host"] = hostB
+	if err := oracle.ValidatePlan(planB); err == nil || !strings.Contains(err.Error(), "missing result") {
+		t.Fatalf("previous host compiler result satisfied replacement plan: %v", err)
+	}
+	request.HostToolsetIdentity = hostA
+	builderB, err := NewProbePlanBuilder(targetIdentity, hostB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := builderB.Request("target", request); err == nil || !strings.Contains(err.Error(), "host toolset identity") {
+		t.Fatalf("builder accepted explicit stale host toolset identity: %v", err)
+	}
+}
+
 func TestProbeResultOracleRejectsCaptureModeDisagreement(t *testing.T) {
 	identity := "sha256-" + strings.Repeat("a", 64)
 	builder, err := NewProbePlanBuilder(identity, "")

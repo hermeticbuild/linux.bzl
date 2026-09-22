@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	LinuxKernelActionPlanSnapshotSchema = "linux-kernel-action-plan-snapshot-v3"
+	LinuxKernelActionPlanSnapshotSchema = "linux-kernel-action-plan-snapshot-v4"
 	LinuxKernelFamilyPlanSchema         = "linux-kernel-family-plan-v7"
 	LinuxKernelFamilyReuseReportSchema  = "linux-kernel-family-reuse-report-v2"
 
@@ -103,6 +103,7 @@ type ActionPlanSnapshot struct {
 	InternalOutputs           []ActionPlanSnapshotOutputRef                 `json:"internal_outputs,omitempty"`
 	ProjectedGeneratorOutputs []ActionPlanSnapshotProjectedGeneratorOutputs `json:"projected_generator_outputs,omitempty"`
 	ValidationRoots           []string                                      `json:"validation_roots,omitempty"`
+	ExecutionCheckRoots       []string                                      `json:"execution_check_roots,omitempty"`
 }
 
 type ActionPlanSnapshotOutputRef struct {
@@ -323,6 +324,7 @@ func cloneActionPlan(plan *ActionPlan) *ActionPlan {
 		InputSets:                         cloneActionPlanInputSetNodes(plan.InputSets),
 		Products:                          slices.Clone(plan.Products),
 		projectedGeneratorValidations:     slices.Clone(plan.projectedGeneratorValidations),
+		executionCheckRoots:               slices.Clone(plan.executionCheckRoots),
 		projectedGeneratorInternalNodes:   maps.Clone(plan.projectedGeneratorInternalNodes),
 		projectedGeneratorInternalOutputs: maps.Clone(plan.projectedGeneratorInternalOutputs),
 		projectedGeneratorOriginalOutputs: make(map[string]projectedGeneratorOriginalOutputCommitment, len(plan.projectedGeneratorOriginalOutputs)),
@@ -392,6 +394,7 @@ func snapshotActionPlan(snapshot ActionPlanSnapshot) *ActionPlan {
 	plan.projectedGeneratorInternalOutputs = internalOutputs
 	plan.projectedGeneratorOriginalOutputs = commitments
 	plan.projectedGeneratorValidations = snapshot.ValidationRoots
+	plan.executionCheckRoots = snapshot.ExecutionCheckRoots
 	return cloneActionPlan(plan)
 }
 
@@ -412,16 +415,17 @@ func canonicalActionPlanSnapshot(plan *ActionPlan, dependencies map[string]Confi
 		return ActionPlanSnapshot{}, fmt.Errorf("snapshot input sets: %w", err)
 	}
 	snapshot := ActionPlanSnapshot{
-		Schema:             LinuxKernelActionPlanSnapshotSchema,
-		Toolsets:           maps.Clone(plan.Toolsets),
-		Sources:            slices.Clone(plan.Sources),
-		Recipes:            make(map[string]ActionRecipe, len(plan.Recipes)),
-		Nodes:              cloneActionPlanNodes(plan.Nodes),
-		InputSets:          inputSets,
-		Products:           slices.Clone(plan.Products),
-		ConfigDependencies: make(map[string]ConfigDependencySet, len(plan.Nodes)),
-		ConfigFiles:        maps.Clone(configFiles),
-		ValidationRoots:    slices.Clone(plan.projectedGeneratorValidations),
+		Schema:              LinuxKernelActionPlanSnapshotSchema,
+		Toolsets:            maps.Clone(plan.Toolsets),
+		Sources:             slices.Clone(plan.Sources),
+		Recipes:             make(map[string]ActionRecipe, len(plan.Recipes)),
+		Nodes:               cloneActionPlanNodes(plan.Nodes),
+		InputSets:           inputSets,
+		Products:            slices.Clone(plan.Products),
+		ConfigDependencies:  make(map[string]ConfigDependencySet, len(plan.Nodes)),
+		ConfigFiles:         maps.Clone(configFiles),
+		ValidationRoots:     slices.Clone(plan.projectedGeneratorValidations),
+		ExecutionCheckRoots: slices.Clone(plan.executionCheckRoots),
 	}
 	for id := range plan.projectedGeneratorInternalNodes {
 		snapshot.InternalNodes = append(snapshot.InternalNodes, id)
@@ -468,6 +472,7 @@ func canonicalActionPlanSnapshot(plan *ActionPlan, dependencies map[string]Confi
 		return snapshot.ProjectedGeneratorOutputs[i].NodeID < snapshot.ProjectedGeneratorOutputs[j].NodeID
 	})
 	sort.Strings(snapshot.ValidationRoots)
+	sort.Strings(snapshot.ExecutionCheckRoots)
 	// Validate the exact serialized representation once. Besides the standalone
 	// action-plan contract this covers snapshot-only projected-generator proof
 	// metadata, so the trusted writer can marshal without reconstructing and
@@ -573,6 +578,7 @@ func (s ActionPlanSnapshot) validateWithStats(stats *actionPlanValidationStats) 
 	internal := make(map[string]bool, len(s.InternalNodes))
 	for name, ids := range map[string][]string{
 		"internal_nodes": s.InternalNodes, "validation_roots": s.ValidationRoots,
+		"execution_check_roots": s.ExecutionCheckRoots,
 	} {
 		for index, id := range ids {
 			if index != 0 && id <= ids[index-1] {
@@ -592,6 +598,16 @@ func (s ActionPlanSnapshot) validateWithStats(stats *actionPlanValidationStats) 
 		}
 		if len(nodes[id].Outputs) != 1 || nodes[id].Outputs[0].ObservedPath != "" {
 			return fmt.Errorf("snapshot validation root %s does not own one ordinary output", id)
+		}
+	}
+	for _, id := range s.ExecutionCheckRoots {
+		node := nodes[id]
+		if len(node.Outputs) == 0 ||
+			!compactKbuildAuthenticatedExecutionCheckCompletion(plan, node, node.Outputs[0].ObservedPath) {
+			return fmt.Errorf("snapshot execution check root %s lacks an authenticated completion", id)
+		}
+		if internal[id] {
+			return fmt.Errorf("snapshot execution check root %s is a projected generator internal node", id)
 		}
 	}
 	internalOutputs := map[actionPlanOutputRef]bool{}
@@ -673,6 +689,11 @@ func (s ActionPlanSnapshot) validateWithStats(stats *actionPlanValidationStats) 
 		return nil
 	}
 	for _, id := range s.ValidationRoots {
+		if err := cover(id); err != nil {
+			return err
+		}
+	}
+	for _, id := range s.ExecutionCheckRoots {
 		if err := cover(id); err != nil {
 			return err
 		}
@@ -3786,6 +3807,10 @@ func buildValidatedActionPlanFamilyWithStats(
 			family.originalNodeIDs[reduction.name][original.ID] = finalIDs[original.ID]
 		}
 		exactViews := map[ActionPlanFamilyView]bool{}
+		checkRoots := map[string]bool{}
+		for _, check := range reduction.plan.executionCheckRoots {
+			checkRoots[check] = true
+		}
 		for _, localizedNode := range localized.Nodes {
 			provisionalID := localizedNode.ID
 			id := finalIDs[provisionalID]
@@ -3837,6 +3862,11 @@ func buildValidatedActionPlanFamilyWithStats(
 				family.preciseCompileMemberships[id] = append(family.preciseCompileMemberships[id], reduction.name)
 			}
 			for slot, output := range localizedNode.Outputs {
+				if slot == 0 && checkRoots[provisionalID] {
+					// The private completion is demanded as a validation input;
+					// Its absent-state bytes are never a public object-tree file.
+					continue
+				}
 				if projectedGeneratorOutputIsInternal(reduction.plan, provisionalID, slot) {
 					continue
 				}
@@ -3861,6 +3891,15 @@ func buildValidatedActionPlanFamilyWithStats(
 			id := finalIDs[validation]
 			if id == "" {
 				return nil, fmt.Errorf("variant %s validation root %s has no final identity", reduction.name, validation)
+			}
+			reduction.validations = append(reduction.validations, ActionPlanFamilyValidation{
+				Variant: reduction.name, NodeID: id, Slot: 0,
+			})
+		}
+		for _, check := range reduction.plan.executionCheckRoots {
+			id := finalIDs[check]
+			if id == "" {
+				return nil, fmt.Errorf("variant %s source check root %s has no final identity", reduction.name, check)
 			}
 			reduction.validations = append(reduction.validations, ActionPlanFamilyValidation{
 				Variant: reduction.name, NodeID: id, Slot: 0,

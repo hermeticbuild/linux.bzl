@@ -9,6 +9,13 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
 
+func sameKbuildFrontierTestValue(left, right kbuildFrontierValue) bool {
+	return left.artifact == right.artifact && left.content == right.content &&
+		left.exact == right.exact && left.pendingSourceOutput == right.pendingSourceOutput &&
+		slices.Equal(left.sourceOutputRequestIDs, right.sourceOutputRequestIDs) &&
+		left.origin == right.origin
+}
+
 func TestKbuildFrontierStateBulkBuildAndOrderedRange(t *testing.T) {
 	entries := make([]kbuildFrontierEntry, 1023)
 	for index := range entries {
@@ -31,7 +38,7 @@ func TestKbuildFrontierStateBulkBuildAndOrderedRange(t *testing.T) {
 	}
 	for _, entry := range entries {
 		got, ok := kbuildFrontierGet(state, entry.path)
-		if !ok || got != entry.value {
+		if !ok || !sameKbuildFrontierTestValue(got, entry.value) {
 			t.Fatalf("frontier[%q] = (%#v, %t), want (%#v, true)", entry.path, got, ok, entry.value)
 		}
 	}
@@ -87,10 +94,10 @@ func TestKbuildFrontierStateSetPreservesSnapshotsAndSharesUntouchedSubtrees(t *t
 	if shared == 0 {
 		t.Fatal("path copy did not share any untouched subtree")
 	}
-	if got, _ := kbuildFrontierGet(base, "0"); got == leftValue || got.artifact.Profile != "initial" {
+	if got, _ := kbuildFrontierGet(base, "0"); sameKbuildFrontierTestValue(got, leftValue) || got.artifact.Profile != "initial" {
 		t.Fatalf("updating child snapshot changed base value: %#v", got)
 	}
-	if got, ok := kbuildFrontierGet(left, "0"); !ok || got != leftValue {
+	if got, ok := kbuildFrontierGet(left, "0"); !ok || !sameKbuildFrontierTestValue(got, leftValue) {
 		t.Fatalf("updated snapshot value = (%#v, %t), want (%#v, true)", got, ok, leftValue)
 	}
 
@@ -117,7 +124,7 @@ func TestKbuildFrontierStateSetPreservesSnapshotsAndSharesUntouchedSubtrees(t *t
 	if _, ok := kbuildFrontierGet(left, "7"); ok {
 		t.Fatal("intermediate snapshot observed descendant insertion")
 	}
-	if got, ok := kbuildFrontierGet(later, "7"); !ok || got != newValue {
+	if got, ok := kbuildFrontierGet(later, "7"); !ok || !sameKbuildFrontierTestValue(got, newValue) {
 		t.Fatalf("descendant inserted value = (%#v, %t), want (%#v, true)", got, ok, newValue)
 	}
 

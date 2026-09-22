@@ -2,11 +2,486 @@ package kconfig
 
 import (
 	"fmt"
+	"maps"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 )
+
+func TestSelectedPhonyFeatureGateUsesFrozenSourceStatus(t *testing.T) {
+	for _, test := range []struct {
+		name, target, value, recipe, wantError string
+	}{
+		{name: "libelf success", target: "elfdep", value: "1", recipe: `@if [ "$(feature-libelf)" != "1" ]; then echo "No libelf found"; exit 1 ; fi`},
+		{name: "libelf failure", target: "elfdep", value: "0", recipe: `@if [ "$(feature-libelf)" != "1" ]; then echo "No libelf found"; exit 1 ; fi`, wantError: "No libelf found"},
+		{name: "zlib success", target: "zdep", value: "1", recipe: `@if [ "$(feature-zlib)" != "1" ]; then echo "No zlib found"; exit 1 ; fi`},
+		{name: "zlib failure", target: "zdep", value: "0", recipe: `@if [ "$(feature-zlib)" != "1" ]; then echo "No zlib found"; exit 1 ; fi`, wantError: "No zlib found"},
+		{name: "measured success", value: "1", recipe: `@if [ "$(feature-bpf)" != "1" ]; then echo "BPF API too old"; exit 1 ; fi`},
+		{name: "measured failure", value: "0", recipe: `@if [ "$(feature-bpf)" != "1" ]; then echo "BPF API too old"; exit 1 ; fi`, wantError: "BPF API too old"},
+		{name: "unknown result", value: "pending", recipe: `@if [ "$(feature-bpf)" != "1" ]; then echo "BPF API too old"; exit 1 ; fi`, wantError: "not a resolved boolean"},
+		{name: "changed failure status", value: "1", recipe: `@if [ "$(feature-bpf)" != "1" ]; then echo "BPF API too old"; exit 0 ; fi`, wantError: "unsupported failure branch"},
+		{name: "changed comparison", value: "1", recipe: `@if [ "$(feature-bpf)" != "0" ]; then echo "BPF API too old"; exit 1 ; fi`, wantError: "unsupported source condition"},
+		{name: "extra shell write", value: "1", recipe: `@if [ "$(feature-bpf)" != "1" ]; then echo "BPF API too old"; exit 1 ; fi; echo modified > bpfdep`, wantError: "unsupported failure branch"},
+		{name: "prefixed shell write", value: "1", recipe: `@echo modified > bpfdep; if [ "$(feature-bpf)" != "1" ]; then echo "BPF API too old"; exit 1 ; fi`, wantError: "unsupported source condition"},
+		{name: "second selected command", value: "1", recipe: "@if [ \"$(feature-bpf)\" != \"1\" ]; then echo \"BPF API too old\"; exit 1 ; fi\n\t@echo modified > bpfdep", wantError: "requires one complete selected source line"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			target := test.target
+			if target == "" {
+				target = "bpfdep"
+			}
+			profile, _, _ := selectedControlTestProfile(t,
+				"feature-bpf := "+test.value+"\nfeature-libelf := "+test.value+"\nfeature-zlib := "+test.value+
+					"\n.PHONY: "+target+"\n"+target+":\n\t"+test.recipe+"\n")
+			frontier := selectedControlTestFrontier("selected-feature-gate", selectedControlTestFiles{}, KbuildControlReadArtifact{})
+			stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stepper.BeginTarget(target, target, ""); err != nil {
+				t.Fatal(err)
+			}
+			for recipeIndex := range profile.Rules[selectedControlTestRuleIndex(t, profile, target)].Recipe {
+				line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+					Target: target, RuleIndex: selectedControlTestRuleIndex(t, profile, target), RecipeIndex: recipeIndex,
+				}, frontier)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := stepper.ApplyRecipe(line); err != nil {
+					t.Fatal(err)
+				}
+			}
+			evaluation, err := stepper.Finish(frontier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata := &CompactMetadata{Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}}}
+			proven, err := metadata.compactKbuildSelectedPhonyFeatureGate(evaluation.Profile, target, target)
+			if !proven {
+				t.Fatalf("source feature status was not classified, error %v", err)
+			}
+			if test.wantError == "" && err != nil || test.wantError != "" &&
+				(err == nil || !strings.Contains(err.Error(), test.wantError) || !strings.Contains(err.Error(), "Makefile:")) {
+				t.Fatalf("feature status error = %v, want source-located %q", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestGeneratedActionPlanInspectsSourceSelectedPhonyStatus(t *testing.T) {
+	for _, test := range []struct {
+		name, value, recipe, wantError, wantLine string
+	}{
+		{name: "failed aliased feature keeps failing source status", value: "0", recipe: `@if [ "$(CHECK_BPF)" != "1" ]; then echo "BPF API too old"; exit 1 ; fi`, wantLine: `if [ "0" != "1" ]; then echo "BPF API too old"; exit 1 ; fi`},
+		{name: "successful aliased feature still runs source status", value: "1", recipe: `@if [ "$(CHECK_BPF)" != "1" ]; then echo "BPF API too old"; exit 1 ; fi`, wantLine: `if [ "1" != "1" ]; then echo "BPF API too old"; exit 1 ; fi`},
+		{name: "bare failure", value: "1", recipe: "@false", wantError: "fails its source shell status"},
+		{name: "bare status check", value: "1", recipe: "@test -e missing.file", wantLine: "test -e missing.file"},
+		{name: "inert status", value: "1", recipe: "@:"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const target = "bpfdep"
+			profile, _, _ := selectedControlTestProfile(t, `
+feature-bpf := `+test.value+`
+CHECK_BPF := $(feature-bpf)
+.PHONY: bpfdep
+bpfdep:
+	`+test.recipe+`
+`)
+			frontier := selectedControlTestFrontier("selected-aliased-feature-gate", selectedControlTestFiles{}, KbuildControlReadArtifact{})
+			stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stepper.BeginTarget(target, target, ""); err != nil {
+				t.Fatal(err)
+			}
+			line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+				Target: target, RuleIndex: selectedControlTestRuleIndex(t, profile, target), RecipeIndex: 0,
+			}, frontier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := stepper.ApplyRecipe(line); err != nil {
+				t.Fatal(err)
+			}
+			evaluation, err := stepper.Finish(frontier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata := &CompactMetadata{
+				Config: CompactConfig{
+					KbuildProfiles: []CompactKbuildProfile{evaluation.Profile},
+					KbuildSelections: []CompactKbuildSelection{{
+						Profile: profile.Name, Target: target, MakeTarget: target,
+						Lifecycle: "target", Scope: "target", Stage: "target",
+					}},
+				},
+				configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles,
+			}
+			plan := &ActionPlan{metadata: metadata, Recipes: map[string]ActionRecipe{},
+				Toolsets: map[string]string{"target": actionPlanTestProbeIdentity}}
+			graph, err := metadata.appendGeneratedActionPlan(plan)
+			if test.wantError == "" && err != nil || test.wantError != "" &&
+				(err == nil || !strings.Contains(err.Error(), test.wantError) || !strings.Contains(err.Error(), "Makefile:")) {
+				t.Fatalf("selected PHONY %s completion = %v, want source-located %q", test.name, err, test.wantError)
+			}
+			if err != nil || test.wantLine == "" {
+				return
+			}
+			key := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: profile.Name, target: target}]
+			producer := graph.materializedProducers[key]
+			node, exists := compactKbuildPlanNode(plan, producer)
+			if !exists || !compactKbuildAuthenticatedExecutionCheckCompletion(plan, node, target) {
+				t.Fatalf("PHONY %q lacks a source-authenticated outputless status action", target)
+			}
+			receipt := plan.Recipes[node.Recipe].MakePhonyCompletion
+			if receipt == nil || receipt.ExpandedLine != test.wantLine ||
+				receipt.RecipeIndex != 0 || receipt.SourcePath != "Makefile" {
+				t.Fatalf("selected PHONY source status = %#v, want exact Makefile line %q", receipt, test.wantLine)
+			}
+		})
+	}
+}
+
+func TestSelectedPhonyRecursiveChildCompletesBeforeSourceCleanup(t *testing.T) {
+	const childTarget = "scripts/basic/fixdep"
+	parent, _, _ := selectedControlTestProfile(t, `
+Q := @
+.PHONY: scripts_basic
+scripts_basic:
+	$(Q)$(MAKE) child
+	$(Q)rm -f .tmp_quiet_recordmcount
+`, map[string]string{"MAKE": CompactKbuildRecursiveMakeProvenanceToken})
+	child := mustCompactKbuildProfileForTest(t, "build:scripts/basic", "scripts/basic/Makefile.build", "scripts/basic", `
+scripts/basic/fixdep:
+	@printf 'selected-child\n' > $@
+`, nil)
+	artifact := KbuildControlReadArtifact{
+		Tree: CompactKbuildInvocationObjectTree, Identity: "root/scripts_basic/basic-fixdep",
+		Version: "sha256:source-child-fixdep", Producer: CompactKbuildVisibleArtifact{
+			Path: childTarget, Profile: child.Name, Target: childTarget,
+		},
+	}
+	before := selectedControlTestFrontier("before-recursive-basic", selectedControlTestFiles{}, artifact)
+	after := selectedControlTestFrontier("after-recursive-basic", selectedControlTestFiles{
+		files: map[string]testKbuildVirtualFile{
+			"__LINUX_BZL_OBJECT_TREE__/" + childTarget: {content: "selected-child\n", exact: true},
+		},
+	}, artifact)
+	stepper, err := NewSelectedKbuildControlStepper(parent, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget("scripts_basic", "scripts_basic", ""); err != nil {
+		t.Fatal(err)
+	}
+	index := selectedControlTestRuleIndex(t, parent, "scripts_basic")
+	for recipeIndex, frontier := range []KbuildControlRecipeFrontier{before, after} {
+		line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+			Target: "scripts_basic", RuleIndex: index, RecipeIndex: recipeIndex,
+		}, frontier)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stepper.ApplyRecipe(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evaluation, err := stepper.Finish(after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent = evaluation.Profile
+	parent.EntryTargets = []string{"scripts_basic"}
+	parent.TargetInvocationDependencies = []CompactKbuildInvocationDependency{{
+		Target: "scripts_basic", Profile: child.Name, Goals: []string{childTarget}, ReplayArguments: []string{"child"},
+	}}
+	config := CompactConfig{
+		KbuildProfiles: []CompactKbuildProfile{parent, child},
+		KbuildSelections: []CompactKbuildSelection{
+			{Profile: child.Name, Target: childTarget, MakeTarget: childTarget, Lifecycle: "prep", Scope: "host", Stage: "prehost"},
+			{Profile: parent.Name, Target: "scripts_basic", MakeTarget: "scripts_basic", Lifecycle: "prep", Scope: "host", Stage: "prehost"},
+		},
+	}
+	metadata := &CompactMetadata{Config: config, configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{},
+		Toolsets: map[string]string{"host": actionPlanTestProbeIdentity, "target": actionPlanTestProbeIdentity}}
+	graph, err := metadata.appendGeneratedActionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childKey := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: child.Name, target: childTarget}]
+	parentKey := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: parent.Name, target: "scripts_basic"}]
+	childProducer := graph.materializedProducers[childKey]
+	parentProducer := graph.materializedProducers[parentKey]
+	statusNode, found := compactKbuildPlanNode(plan, parentProducer)
+	if !found || childProducer == "" || !compactKbuildAuthenticatedExecutionCheckCompletion(plan, statusNode, "scripts_basic") {
+		t.Fatalf("selected child %q / cleanup %q have no source-authenticated action order", childProducer, parentProducer)
+	}
+	if !slices.ContainsFunc(statusNode.Inputs, func(edge ActionPlanNodeEdge) bool {
+		return edge.Role == "sequence" && edge.ProducerID == childProducer && edge.Slot == 0
+	}) {
+		t.Fatalf("cleanup status inputs = %#v, want source-selected child sequence", statusNode.Inputs)
+	}
+	statusRecipe := plan.Recipes[statusNode.Recipe]
+	if statusRecipe.MakePhonyCompletion == nil || statusRecipe.MakePhonyCompletion.RecipeIndex != 1 ||
+		statusRecipe.MakePhonyCompletion.ExpandedLine != "rm -f .tmp_quiet_recordmcount" ||
+		statusRecipe.MakePhonyCompletion.SequenceInputs != 1 ||
+		!statusRecipe.RequireUnchangedWorkingTree {
+		t.Fatalf("cleanup status receipt = %#v, want exact second Make line and private status", statusRecipe)
+	}
+	if _, ownsFile := graph.owner("scripts_basic"); ownsFile {
+		t.Fatal("PHONY status registered as ordinary object file")
+	}
+}
+
+func TestSelectedPhonyStatusIsAnExecutionPrerequisiteWithoutAFile(t *testing.T) {
+	profile := selectedPhonyStatusOrderProfile(t, `.PHONY: status
+status: leaf.out
+	@test -e leaf.out
+leaf.out:
+	@printf 'leaf\n' > $@
+consumer.out: status
+	@printf 'consumer\n' > $@
+`)
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{profile},
+			KbuildSelections: []CompactKbuildSelection{
+				{Profile: profile.Name, Target: "leaf.out", MakeTarget: "leaf.out", Lifecycle: "target", Scope: "target", Stage: "target"},
+				{Profile: profile.Name, Target: "status", MakeTarget: "status", Lifecycle: "target", Scope: "target", Stage: "target"},
+				{Profile: profile.Name, Target: "consumer.out", MakeTarget: "consumer.out", Lifecycle: "target", Scope: "target", Stage: "target"},
+			},
+		},
+		configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles,
+	}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}, Toolsets: map[string]string{
+		"target": actionPlanTestProbeIdentity,
+	}}
+	graph, err := metadata.appendGeneratedActionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: profile.Name, target: "status"}]
+	consumer := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: profile.Name, target: "consumer.out"}]
+	statusProducer := graph.materializedProducers[status]
+	consumerProducer := graph.materializedProducers[consumer]
+	statusNode, present := compactKbuildPlanNode(plan, statusProducer)
+	if !present || !compactKbuildAuthenticatedExecutionCheckCompletion(plan, statusNode, "status") {
+		t.Fatalf("selected PHONY status producer %q lacks private completion", statusProducer)
+	}
+	consumerNode, present := compactKbuildPlanNode(plan, consumerProducer)
+	if !present || !slices.ContainsFunc(consumerNode.Inputs, func(edge ActionPlanNodeEdge) bool {
+		return edge.Role == "sequence" && edge.ProducerID == statusProducer && edge.Slot == 0
+	}) {
+		t.Fatalf("selected consumer inputs %#v omit source status %q", consumerNode.Inputs, statusProducer)
+	}
+	if _, ownsFile := graph.owner("status"); ownsFile {
+		t.Fatal("PHONY status became an ordinary Make artifact")
+	}
+}
+
+func TestNestedUnselectedRecursiveRecipeRetainsPhonyStatus(t *testing.T) {
+	child, _, _ := selectedControlTestProfile(t, `.PHONY: status
+status:
+	@test "1" = "1"
+`)
+	stepper, err := NewSelectedKbuildControlStepper(child, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget("status", "status", ""); err != nil {
+		t.Fatal(err)
+	}
+	line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+		Target: "status", RuleIndex: selectedControlTestRuleIndex(t, child, "status"), RecipeIndex: 0,
+	}, selectedControlTestFrontier("before-nested-status", selectedControlTestFiles{}, KbuildControlReadArtifact{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stepper.ApplyRecipe(line); err != nil {
+		t.Fatal(err)
+	}
+	evaluation, err := stepper.Finish(selectedControlTestFrontier("after-nested-status", selectedControlTestFiles{}, KbuildControlReadArtifact{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	child = evaluation.Profile
+	parent := mustCompactKbuildProfileForTest(t, "driver:nested", "nested/Makefile", "", `
+outer.out: sub.out
+	@printf 'outer\n' > $@
+sub.out:
+	@$(MAKE) child; printf 'sub\n' > $@
+`, map[string]string{"MAKE": CompactKbuildRecursiveMakeProvenanceToken})
+	parent.TargetInvocationDependencies = []CompactKbuildInvocationDependency{{
+		Target: "sub.out", Profile: child.Name, Goals: []string{"status"}, ReplayArguments: []string{"child"},
+	}}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{parent, child},
+			KbuildSelections: []CompactKbuildSelection{
+				{Profile: child.Name, Target: "status", MakeTarget: "status", Lifecycle: "prep", Scope: "host", Stage: "host"},
+				{Profile: parent.Name, Target: "outer.out", MakeTarget: "outer.out", Lifecycle: "prep", Scope: "host", Stage: "host"},
+			},
+		},
+		configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles,
+	}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{},
+		Toolsets: map[string]string{"host": actionPlanTestProbeIdentity, "target": actionPlanTestProbeIdentity}}
+	graph, err := metadata.appendGeneratedActionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: child.Name, target: "status"}]
+	statusProducer := graph.materializedProducers[key]
+	if statusProducer == "" {
+		t.Fatal("recursive PHONY child has no outputless completion")
+	}
+	var subordinate ActionPlanNode
+	for _, node := range plan.Nodes {
+		if slices.ContainsFunc(node.Outputs, func(output ActionPlanOutput) bool { return output.Path == "sub.out" }) {
+			subordinate = node
+			break
+		}
+	}
+	if subordinate.ID == "" || !slices.ContainsFunc(subordinate.Inputs, func(edge ActionPlanNodeEdge) bool {
+		return edge.Role == "sequence" && edge.ProducerID == statusProducer && edge.Slot == 0
+	}) {
+		t.Fatalf("unselected nested sub.out inputs = %#v, want child PHONY status %q", subordinate.Inputs, statusProducer)
+	}
+}
+
+func TestSelectedRecursiveStatusRejectsDifferentReplayArguments(t *testing.T) {
+	child := selectedPhonyStatusOrderProfile(t, ".PHONY: status\nstatus:\n\t@test 1 = 1\n")
+	parent := mustCompactKbuildProfileForTest(t, "driver:parent", "parent/Makefile", "", `
+sub.out:
+	@$(MAKE) child; printf 'sub\n' > $@
+`, map[string]string{"MAKE": CompactKbuildRecursiveMakeProvenanceToken})
+	parent.TargetInvocationDependencies = []CompactKbuildInvocationDependency{{
+		Target: "sub.out", Profile: child.Name, Goals: []string{"status"}, ReplayArguments: []string{"child"},
+	}}
+	metadata := &CompactMetadata{Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{parent, child}}}
+	graph, err := newCompactKbuildSelectionGraph(metadata.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).withSelectionGraph(graph).forProfile(parent)
+	_, err = builder.appendCompactKbuildSelectedPlanNode("sub.out", ActionPlanNode{
+		Outputs: []ActionPlanOutput{{Path: "sub.out"}},
+	}, ActionRecipe{CommandReplays: []ActionRecipeCommandReplay{{
+		Name:        CompactKbuildRecursiveMakeReplayName,
+		Invocations: []ActionRecipeCommandReplayInvocation{{Arguments: []string{"unrelated"}}},
+	}}})
+	if err == nil || !strings.Contains(err.Error(), `has no exact selected command replay`) || len(plan.Nodes) != 0 {
+		t.Fatalf("mismatched recursive status replay: nodes %#v, error %v", plan.Nodes, err)
+	}
+}
+
+func TestSelectedFeatureChecksCompleteRecursiveLibbpfWithoutPhonyFiles(t *testing.T) {
+	const (
+		static = "tools/lib/bpf/libbpf-in.o"
+		shared = "tools/lib/bpf/libbpf-shared-in.o"
+	)
+	profile, _, _ := selectedControlTestProfile(t, `
+feature-libelf := 1
+feature-zlib := 1
+feature-bpf := 1
+PHONY += elfdep zdep bpfdep
+.PHONY: $(PHONY)
+all: `+static+` `+shared+`
+elfdep:
+	@if [ "$(feature-libelf)" != "1" ]; then echo "No libelf found"; exit 1 ; fi
+zdep:
+	@if [ "$(feature-zlib)" != "1" ]; then echo "No zlib found"; exit 1 ; fi
+bpfdep:
+	@if [ "$(feature-bpf)" != "1" ]; then echo "BPF API too old"; exit 1 ; fi
+`+static+` `+shared+`: elfdep zdep bpfdep
+	@printf 'built\n' > $@
+`)
+	frontier := selectedControlTestFrontier("selected-libbpf-feature-gates", selectedControlTestFiles{}, KbuildControlReadArtifact{})
+	stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"elfdep", "zdep", "bpfdep", static, shared} {
+		if _, err := stepper.BeginTarget(target, target, ""); err != nil {
+			t.Fatal(err)
+		}
+		line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+			Target: target, RuleIndex: selectedControlTestRuleIndex(t, profile, target), RecipeIndex: 0,
+		}, frontier)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stepper.ApplyRecipe(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evaluation, err := stepper.Finish(frontier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile = evaluation.Profile
+	profile.TargetInvocationDependencies = nil
+	parent := mustCompactKbuildProfileForTest(t, "driver:resolve_btfids", "tools/bpf/resolve_btfids/Makefile", "tools/bpf/resolve_btfids", `
+resolve_btfids:
+	@echo selected
+`, nil)
+	parent.TargetInvocationDependencies = []CompactKbuildInvocationDependency{{
+		Target: "tools/bpf/resolve_btfids/resolve_btfids", Profile: profile.Name,
+		Goals: []string{"all"}, ReplayArguments: []string{"all"},
+	}}
+	selections := []CompactKbuildSelection{}
+	for _, target := range []string{"elfdep", "zdep", "bpfdep", static, shared} {
+		selections = append(selections, CompactKbuildSelection{
+			Profile: profile.Name, Target: target, MakeTarget: target,
+			Lifecycle: "prep", Scope: "host", Stage: "host",
+		})
+	}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles:   []CompactKbuildProfile{profile, parent},
+			KbuildSelections: selections,
+		},
+		actionRoles:    testConfiguredScopedActionRoles,
+		configFragment: map[string]string{},
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"host": actionPlanTestProbeIdentity, "target": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{},
+	}
+	graph, err := metadata.appendGeneratedActionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"elfdep", "zdep", "bpfdep"} {
+		key := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: profile.Name, target: target}]
+		if !graph.compactKbuildProfileTargetIsPhony(profile, target) || graph.materializedProducers[key] != "" {
+			t.Fatalf("proved source check %q has materialized file owner %q", target, graph.materializedProducers[key])
+		}
+	}
+	for _, target := range []string{static, shared} {
+		key := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: profile.Name, target: target}]
+		if graph.materializedProducers[key] == "" {
+			t.Fatalf("regular libbpf consumer %q was not materialized", target)
+		}
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		withSelectionGraph(graph).forProfile(parent).forOutput("host", "host", "sdk")
+	materialization, err := builder.compactKbuildInvocationDependencyMaterialization(
+		"tools/bpf/resolve_btfids/resolve_btfids", parent, parent.TargetInvocationDependencies[0],
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(materialization.outputs, []string{"${work:root}/" + static, "${work:root}/" + shared}) {
+		t.Fatalf("recursive libbpf output paths = %#v, want only regular consumers", materialization.outputs)
+	}
+}
 
 func TestGeneratedActionPlanMaterializesSelectedGroupedPatternPeersOnce(t *testing.T) {
 	const (
@@ -226,7 +701,7 @@ $(OUTPUT)%.o: %.c FORCE
 	}
 }
 
-func TestGeneratedActionPlanLetsSelectedPrepWriterSupersedeConfigSeed(t *testing.T) {
+func TestGeneratedActionPlanSelectsSourceReleaseWriterAndSDKProjection(t *testing.T) {
 	const (
 		baselineInput = "auto.conf"
 		configOutput  = "include/config/kernel.release"
@@ -272,6 +747,11 @@ include/generated/release-consumer: include/config/kernel.release FORCE
 	if configSourceID == "" {
 		t.Fatalf("plan sources omit config/%s: %#v", baselineInput, plan.Sources)
 	}
+	for _, source := range plan.Sources {
+		if source.Namespace == "config" && source.Path == "kernel.release" {
+			t.Fatalf("source-selected kernel.release was seeded by Kconfig: %#v", source)
+		}
+	}
 	writerID, _, ok := planProducerByOutput(plan, "prep", configOutput)
 	if !ok {
 		t.Fatalf("plan omits selected config writer for prep/%s", configOutput)
@@ -292,7 +772,7 @@ include/generated/release-consumer: include/config/kernel.release FORCE
 			copyCount++
 		}
 	}
-	if got, want := copyCount, len(resolvedConfigProjections())-1; got != want {
+	if got, want := copyCount, len(resolvedConfigProjections()); got != want {
 		t.Fatalf("fallback config copies = %d, want %d", got, want)
 	}
 	consumerID, _, ok := planProducerByOutput(plan, "prep", consumer)
@@ -1032,6 +1512,482 @@ func TestGeneratedActionPlanDoesNotInventPhonyArtifacts(t *testing.T) {
 				t.Fatalf("phony control-flow node became an action output: %#v", node)
 			}
 		}
+	}
+}
+
+func TestGeneratedActionPlanExecutesSelectedPhonyModulesCheckAfterOrder(t *testing.T) {
+	const (
+		check  = "modules_check"
+		order  = "modules.order"
+		script = "scripts/modules-check.sh"
+	)
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, "scripts/module-list", "drivers/first/demo.o\ndrivers/second/demo.o\n")
+	mustWriteSource(t, sourceRoot, script, `#!/bin/sh
+set -e
+duplicates=$(sed 's:.*/::' "$1" | sort | uniq -d)
+if [ -n "$duplicates" ]; then
+	echo "error: duplicate module name" >&2
+	exit 1
+fi
+`)
+	profile := mustCompactKbuildProfileForTest(t, "build:modules", "Makefile", "", `
+CONFIG_SHELL := sh
+srctree := __LINUX_BZL_SOURCE_TREE__
+PHONY += modules modules_check
+modules: modules_check
+modules_check: modules.order
+	$(Q)$(CONFIG_SHELL) $(srctree)/scripts/modules-check.sh $<
+modules.order: scripts/module-list FORCE
+	cat $< > $@
+.PHONY: $(PHONY)
+`, nil)
+	if profile.evaluator == nil || profile.evaluator.template == nil {
+		t.Fatal("captured Make evaluator is absent")
+	}
+	profile.evaluator.template.sourceRoots = maps.Clone(profile.evaluator.template.sourceRoots)
+	if profile.evaluator.template.sourceRoots == nil {
+		profile.evaluator.template.sourceRoots = map[string]string{}
+	}
+	profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"] = sourceRoot
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	selections := []CompactKbuildSelection{}
+	for _, target := range []string{"modules", check, order} {
+		selections = append(selections, CompactKbuildSelection{
+			Profile: profile.Name, Target: target, MakeTarget: target,
+			Lifecycle: "target", Scope: "target", Stage: "target",
+		})
+	}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{profile}, KbuildSelections: selections,
+		},
+		configFragment: map[string]string{},
+		actionRoles:    testConfiguredScopedActionRoles,
+	}
+	plan := &ActionPlan{
+		metadata: metadata, Recipes: map[string]ActionRecipe{},
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
+	}
+	graph, err := metadata.appendGeneratedActionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkKey := compactKbuildSelectionKey{profile: profile.Name, target: check, stage: "target"}
+	producer := graph.materializedProducers[checkKey]
+	if producer == "" {
+		t.Fatalf("selected PHONY source check %s was omitted from the plan", compactKbuildSelectionKeyString(checkKey))
+	}
+	if _, materialized := graph.materializedProducers[compactKbuildSelectionKey{
+		profile: profile.Name, target: "modules", stage: "target",
+	}]; materialized {
+		t.Fatal("recursive PHONY modules goal was materialized as a file")
+	}
+	if _, _, found := planProducerByOutput(plan, "objects", check); found {
+		t.Fatal("selected modules_check fabricated a Make-visible object file")
+	}
+	checkNode, found := compactKbuildPlanNode(plan, producer)
+	if !found || checkNode.Tool != compactKbuildScriptRunnerRole {
+		t.Fatalf("modules_check node = %#v, found=%t; want a selected source script", checkNode, found)
+	}
+	recipe := plan.Recipes[checkNode.Recipe]
+	if len(checkNode.Outputs) == 0 || checkNode.Outputs[0].ObservedPath != check ||
+		recipe.ObservedOutputs[planOrdinal(0)] != check || recipe.WorkingOutputs[planOrdinal(0)] != "" ||
+		recipe.RequireAbsentObservedOutput != planOrdinal(0) || !recipe.RequireUnchangedWorkingTree {
+		t.Fatalf("modules_check lost its private execution-only completion: node=%#v recipe=%#v", checkNode, recipe)
+	}
+	orderProducer, _, found := planProducerByOutput(plan, "modules", order)
+	if !found {
+		t.Fatalf("selected modules.order lacks a physical producer: %#v", plan.Nodes)
+	}
+	nativeOrder := false
+	for _, input := range checkNode.Inputs {
+		if input.ProducerID == orderProducer && input.Role != compactKbuildWorkingClosureInputRole {
+			nativeOrder = true
+		}
+	}
+	if !nativeOrder {
+		t.Fatalf("modules_check lost its selected modules.order native predecessor %s: %#v", orderProducer, checkNode.Inputs)
+	}
+	if !slices.Contains(plan.executionCheckRoots, producer) {
+		t.Fatalf("modules_check completion %s is not a demanded execution validation root: %#v", producer, plan.executionCheckRoots)
+	}
+	// The production planner exports the persistent staged-input closure
+	// after generated action lowering and before serializing the plan.
+	if err := plan.exportReachableActionPlanInputSets(); err != nil {
+		t.Fatalf("export modules_check and modules.order input sets: %v", err)
+	}
+	if err := plan.WriteStages(actionPlanStageOutputsForTest(filepath.Join(t.TempDir(), "plan"))); err != nil {
+		t.Fatalf("selected PHONY check plan is invalid: %v", err)
+	}
+}
+
+func TestGeneratedActionPlanRejectsUnsupportedPhonySourceScriptChecks(t *testing.T) {
+	for _, test := range []struct {
+		name, command, wantError string
+		scriptBody               string
+	}{
+		{
+			name:       "physical-output",
+			command:    "$(CONFIG_SHELL) $< $@",
+			wantError:  "produced a file or lost its authenticated outputless execution state",
+			scriptBody: "#!/bin/sh\nset -e\nprintf 'physical\\n' > \"$1\"\n",
+		},
+		{
+			name:      "wrapped-source-script",
+			command:   "set -e; $(CONFIG_SHELL) $<",
+			wantError: "cannot authenticate selected PHONY source script",
+		},
+		{
+			name:      "multiline-source-script",
+			command:   "true\n\t$(CONFIG_SHELL) $<",
+			wantError: "cannot authenticate selected PHONY source script",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile := mustCompactKbuildProfileForTest(t, "build:check", "Makefile", "", `
+CONFIG_SHELL := sh
+PHONY += check
+check: scripts/check.sh FORCE
+	`+test.command+`
+.PHONY: $(PHONY)
+`, nil)
+			sourceRoot := t.TempDir()
+			scriptBody := test.scriptBody
+			if scriptBody == "" {
+				scriptBody = "#!/bin/sh\nset -e\nexit 0\n"
+			}
+			mustWriteSource(t, sourceRoot, "scripts/check.sh", scriptBody)
+			profile.evaluator.template.sourceRoots = maps.Clone(profile.evaluator.template.sourceRoots)
+			if profile.evaluator.template.sourceRoots == nil {
+				profile.evaluator.template.sourceRoots = map[string]string{}
+			}
+			profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"] = sourceRoot
+			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+				Tree: CompactKbuildInvocationObjectTree,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			metadata := &CompactMetadata{
+				Config: CompactConfig{
+					KbuildProfiles: []CompactKbuildProfile{profile},
+					KbuildSelections: []CompactKbuildSelection{{
+						Profile: profile.Name, Target: "check", MakeTarget: "check",
+						Lifecycle: "target", Scope: "target", Stage: "target",
+					}},
+				},
+				configFragment: map[string]string{},
+				actionRoles:    testConfiguredScopedActionRoles,
+			}
+			plan := &ActionPlan{
+				metadata: metadata, Recipes: map[string]ActionRecipe{},
+				Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
+			}
+			if _, err := metadata.appendGeneratedActionPlan(plan); err == nil ||
+				!strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("selected PHONY %s source script lacked a safe execution check: %v", test.name, err)
+			}
+			if len(plan.executionCheckRoots) != 0 {
+				t.Fatalf("unsupported PHONY source script registered a check completion root: %#v", plan.executionCheckRoots)
+			}
+		})
+	}
+}
+
+func TestGeneratedActionPlanExecutesSelectedMultilinePhonySourceSetup(t *testing.T) {
+	const target = "outputmakefile"
+	profile, sourceRoot, _ := selectedControlTestProfile(t, `
+srctree := __LINUX_BZL_SOURCE_TREE__
+objtree := __LINUX_BZL_OBJECT_TREE__
+abs_srctree := $(srctree)
+SRCARCH := x86
+CONFIG_SHELL := sh
+Q := @
+PHONY += outputmakefile
+outputmakefile:
+	$(Q)if [ -f $(srctree)/.config -o \
+		-d $(srctree)/include/config -o \
+		-d $(srctree)/arch/$(SRCARCH)/include/generated ]; then \
+		echo >&2 "***"; \
+		echo >&2 "*** The source tree is not clean, please run 'make$(if $(findstring command line, $(origin ARCH)), ARCH=$(ARCH)) mrproper' $(if $(wildcard $(objtree)/read-marker),yes,no)"; \
+		echo >&2 "*** in $(abs_srctree)"; \
+		echo >&2 "***"; \
+		false; \
+	fi
+	$(Q)ln -fsn $(srctree) source
+	$(Q)$(CONFIG_SHELL) $(srctree)/scripts/mkmakefile $(srctree)
+	$(Q)test -e .gitignore || \
+	{ echo "# this is build directory, ignore it"; echo "*"; } > .gitignore
+.PHONY: $(PHONY)
+`)
+	if err := os.RemoveAll(filepath.Join(sourceRoot, "include", "config")); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteSource(t, sourceRoot, "scripts/mkmakefile", `#!/bin/sh
+if [ "${quiet}" != "silent_" ]; then
+	echo "  GEN     Makefile"
+fi
+cat << EOF > Makefile
+# Automatically generated by $0: don't edit
+include $1/Makefile
+EOF
+`)
+	stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget(target, target, ""); err != nil {
+		t.Fatal(err)
+	}
+	ruleIndex := selectedControlTestRuleIndex(t, profile, target)
+	frontier := selectedControlTestFrontier("before-out-of-tree-setup", selectedControlTestFiles{}, KbuildControlReadArtifact{})
+	for index := range profile.Rules[ruleIndex].Recipe {
+		line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+			Target: target, RuleIndex: ruleIndex, RecipeIndex: index,
+		}, frontier)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := evaluateCompactKbuildTextForMakeTarget(
+			line.Evaluation.Profile, target, line.Line.LookupTarget,
+			line.Line.AutomaticTarget, line.Line.Stem,
+			line.Line.Normal, line.Line.OrderOnly, nil,
+			profile.Rules[ruleIndex].Recipe[index], true,
+		); err != nil {
+			t.Fatalf("selected PHONY recipe %d Make expansion: %v", index, err)
+		}
+		if err := stepper.ApplyRecipe(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evaluation, err := stepper.Finish(frontier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := CompactKbuildSelectedControlRecipeSnapshots(evaluation.Profile, target)
+	if len(snapshots) != 4 || snapshots[0].ReadIdentity() == "" ||
+		snapshots[0].ReadIdentity() == snapshots[1].ReadIdentity() {
+		t.Fatalf("selected PHONY line0 should have a distinct exact absent wildcard view: %#v", snapshots)
+	}
+	selection := CompactKbuildSelection{
+		Profile: profile.Name, Target: target, MakeTarget: target,
+		Lifecycle: "prep", Scope: "target", Stage: "prep",
+	}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles:   []CompactKbuildProfile{evaluation.Profile},
+			KbuildSelections: []CompactKbuildSelection{selection},
+		},
+		configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles,
+	}
+	plan := &ActionPlan{metadata: metadata, Recipes: map[string]ActionRecipe{},
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity}}
+	graph, err := metadata.appendGeneratedActionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer := graph.materializedProducers[compactKbuildSelectionKey{
+		profile: profile.Name, target: target, stage: "prep",
+	}]
+	node, found := compactKbuildPlanNode(plan, producer)
+	if !found || !slices.Contains(plan.executionCheckRoots, producer) {
+		t.Fatalf("selected setup completion = %#v, found=%t roots=%#v", node, found, plan.executionCheckRoots)
+	}
+	if _, _, found := planProducerByOutput(plan, "prep", target); found {
+		t.Fatal("PHONY outputmakefile was incorrectly published as a physical Make file")
+	}
+	if _, _, found := planProducerByOutput(plan, "prep", "Makefile"); found {
+		t.Fatalf("private source-root Makefile was published with an action-specific absolute include: %#v", node.Outputs)
+	}
+	if len(plan.Recipes[node.Recipe].PrivateWorkingEffects) != 3 {
+		t.Fatalf("selected private source setup has unbounded effects: %#v", plan.Recipes[node.Recipe].PrivateWorkingEffects)
+	}
+	if err := plan.exportReachableActionPlanInputSets(); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.WriteStages(actionPlanStageOutputsForTest(filepath.Join(t.TempDir(), "plan"))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGeneratedActionPlanExecutesSelectedInlinePhonyPrivateSetup(t *testing.T) {
+	const target = "prepare-output"
+	profile, sourceRoot, _ := selectedControlTestProfile(t, `
+srctree := __LINUX_BZL_SOURCE_TREE__
+objtree := __LINUX_BZL_OBJECT_TREE__
+abs_srctree := $(srctree)
+SRCARCH := x86
+CONFIG_SHELL := sh
+Q := @
+quiet := quiet_
+quiet_cmd_makefile = GEN     Makefile
+echo-cmd = $(if $($(quiet)cmd_$(1)),echo '  $($(quiet)cmd_$(1))';)
+redirect :=
+quiet_redirect :=
+silent_redirect := exec >/dev/null;
+delete-on-interrupt = \
+	$(if $(filter-out $(PHONY), $@), \
+		$(foreach sig, HUP INT QUIT TERM PIPE, \
+			trap 'rm -f $@; trap - $(sig); kill -s $(sig) $$$$' $(sig);))
+cmd = @set -e; $(echo-cmd) $($(quiet)redirect) $(delete-on-interrupt) $(cmd_$(1))
+cmd_makefile = { \
+	echo "\# Automatically generated by $(srctree)/Makefile: don't edit"; \
+	echo "include $(srctree)/Makefile"; \
+	} > Makefile
+PHONY += prepare-output
+prepare-output:
+	$(Q)if [ -f $(srctree)/.config -o \
+		-d $(srctree)/include/config -o \
+		-d $(srctree)/arch/$(SRCARCH)/include/generated ]; then \
+		echo >&2 "***"; \
+		echo >&2 "*** The source tree is not clean, please run 'make mrproper'"; \
+		echo >&2 "*** in $(abs_srctree)"; \
+		echo >&2 "***"; \
+		false; \
+	fi
+	$(Q)ln -fsn $(srctree) source
+	$(call cmd,makefile)
+	$(Q)test -e .gitignore || \
+	{ echo "# this is build directory, ignore it"; echo "*"; } > .gitignore
+.PHONY: $(PHONY)
+`)
+	if err := os.RemoveAll(filepath.Join(sourceRoot, "include", "config")); err != nil {
+		t.Fatal(err)
+	}
+	stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget(target, target, ""); err != nil {
+		t.Fatal(err)
+	}
+	ruleIndex := selectedControlTestRuleIndex(t, profile, target)
+	frontier := selectedControlTestFrontier("before-inline-private-setup", selectedControlTestFiles{}, KbuildControlReadArtifact{})
+	for index := range profile.Rules[ruleIndex].Recipe {
+		line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+			Target: target, RuleIndex: ruleIndex, RecipeIndex: index,
+		}, frontier)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := evaluateCompactKbuildTextForMakeTarget(
+			line.Evaluation.Profile, target, line.Line.LookupTarget,
+			line.Line.AutomaticTarget, line.Line.Stem,
+			line.Line.Normal, line.Line.OrderOnly, nil,
+			profile.Rules[ruleIndex].Recipe[index], true,
+		); err != nil {
+			t.Fatalf("selected inline setup recipe %d Make expansion: %v", index, err)
+		}
+		if err := stepper.ApplyRecipe(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evaluation, err := stepper.Finish(frontier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		Config: CompactConfig{
+			KbuildProfiles: []CompactKbuildProfile{evaluation.Profile},
+			KbuildSelections: []CompactKbuildSelection{{
+				Profile: profile.Name, Target: target, MakeTarget: target,
+				Lifecycle: "prep", Scope: "target", Stage: "prep",
+			}},
+		},
+		configFragment: map[string]string{}, actionRoles: testConfiguredScopedActionRoles,
+	}
+	plan := &ActionPlan{metadata: metadata, Recipes: map[string]ActionRecipe{},
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity}}
+	graph, err := metadata.appendGeneratedActionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer := graph.materializedProducers[compactKbuildSelectionKey{
+		profile: profile.Name, target: target, stage: "prep",
+	}]
+	node, found := compactKbuildPlanNode(plan, producer)
+	if !found || !slices.Contains(plan.executionCheckRoots, producer) ||
+		!compactKbuildAuthenticatedExecutionCheckCompletion(plan, node, target) {
+		t.Fatalf("inline setup has no authenticated execution-only completion: %#v", node)
+	}
+	if _, _, found := planProducerByOutput(plan, "prep", target); found {
+		t.Fatal("inline PHONY setup published a file named by its control target")
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if receipt := recipe.MakePhonyCompletion; receipt == nil ||
+		len(receipt.ExpandedLines) != 4 || len(recipe.PrivateWorkingEffects) != 3 {
+		t.Fatalf("inline setup lost its selected source lines or private effects: %#v", recipe)
+	} else if strings.Contains(receipt.ExpandedLines[2], "trap '") ||
+		!strings.Contains(receipt.ExpandedLines[2], "set -e;") {
+		t.Fatalf("PHONY setup command included a non-PHONY deletion trap or lost its source wrapper: %q", receipt.ExpandedLines[2])
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*ActionRecipe)
+	}{
+		{"changed source line", func(candidate *ActionRecipe) {
+			candidate.MakePhonyCompletion.ExpandedLines[2] += "; touch unexpected"
+		}},
+		{"changed private effect", func(candidate *ActionRecipe) {
+			candidate.PrivateWorkingEffects[1].Path = "unexpected"
+		}},
+		{"changed script", func(candidate *ActionRecipe) {
+			candidate.Arguments = append(candidate.Arguments, "-script_content_base64", "Zm9yZ2Vk")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			altered := cloneActionRecipe(recipe)
+			test.change(&altered)
+			if err := validateActionRecipeMakePhonyCompletion(altered); err == nil {
+				t.Fatal("altered PHONY source line, effect, or script passed receipt validation")
+			}
+		})
+	}
+	altered := *plan
+	altered.Sources = slices.Clone(plan.Sources)
+	for index := range altered.Sources {
+		if altered.Sources[index].Namespace == "kernel" && altered.Sources[index].Path == profile.Path {
+			altered.Sources[index].Path = "different/Makefile"
+		}
+	}
+	if compactKbuildMakePhonyCompletion(&altered, node, target) {
+		t.Fatal("PHONY private completion accepted a different bound Makefile source")
+	}
+	if err := plan.exportReachableActionPlanInputSets(); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.WriteStages(actionPlanStageOutputsForTest(filepath.Join(t.TempDir(), "plan"))); err != nil {
+		t.Fatal(err)
+	}
+	dependencies := make(map[string]ConfigDependencySet, len(plan.Nodes))
+	for _, selected := range plan.Nodes {
+		dependencies[selected.ID] = ConfigDependencySet{Opaque: true, Reason: "selected PHONY source setup"}
+	}
+	checkpoint := filepath.Join(t.TempDir(), "inline-phony.snapshot.json.gz")
+	if err := WriteActionPlanSnapshot(checkpoint, plan, dependencies, familyTestConfig("y", "n")); err != nil {
+		t.Fatalf("write PHONY private checkpoint: %v", err)
+	}
+	restored, err := ReadActionPlanSnapshot(checkpoint)
+	if err != nil {
+		t.Fatalf("read PHONY private checkpoint: %v", err)
+	}
+	if got := snapshotActionPlan(restored); !compactKbuildMakePhonyCompletion(got, node, target) {
+		t.Fatal("PHONY private completion lost its source receipt across checkpoint")
+	}
+	family, err := BuildActionPlanFamily([]ActionPlanFamilyVariant{{Name: "selected", Snapshot: restored}})
+	if err != nil {
+		t.Fatalf("PHONY private completion family: %v", err)
+	}
+	cut, err := NewActionPlanFamilyExecutionCut(family, nil)
+	if err != nil {
+		t.Fatalf("PHONY private completion execution cut: %v", err)
+	}
+	if _, err := cut.Verify(family); err != nil {
+		t.Fatalf("PHONY private execution cut verification: %v", err)
 	}
 }
 

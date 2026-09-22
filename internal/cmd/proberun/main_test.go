@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -123,6 +124,36 @@ func TestProbeHelperProcess(t *testing.T) {
 			os.Exit(14)
 		}
 		fmt.Print("forwarded")
+	case "inspect-scoped-host-contract":
+		contracts, err := toolaction.Decode(os.Getenv(toolaction.EnvironmentName))
+		contract, exists := contracts["host@cc"]
+		wantArguments := []string{"-test.run=^TestProbeHelperProcess$", "--", "selected-host-cc", toolaction.KbuildArgumentsSentinel}
+		if err != nil || !exists || len(contracts) != 1 || !slices.Equal(contract.Arguments, wantArguments) ||
+			contract.Environment["HOST_SELECTED_ENV"] != "host-bound" || os.Getenv("HOST_SELECTED_ENV") != "" || len(args) != 2 || !filepath.IsAbs(args[1]) {
+			fmt.Fprintf(os.Stderr, "contracts=%#v error=%v args=%q primary_host_env=%q", contracts, err, args[1:], os.Getenv("HOST_SELECTED_ENV"))
+			os.Exit(28)
+		}
+		invocation, err := toolaction.SpliceArguments(contract.Arguments, []string{"source-selected"})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(29)
+		}
+		command := exec.Command(args[1], invocation...)
+		for name, value := range contract.Environment {
+			command.Env = append(command.Env, name+"="+value)
+		}
+		output, err := command.CombinedOutput()
+		if err != nil || string(output) != "host-cc-executed" {
+			fmt.Fprintf(os.Stderr, "host child output=%q error=%v", output, err)
+			os.Exit(30)
+		}
+		fmt.Print("scoped-host-call-ok")
+	case "selected-host-cc":
+		if os.Getenv("HOST_SELECTED_ENV") != "host-bound" || strings.Join(args[1:], " ") != "source-selected" {
+			fmt.Fprintf(os.Stderr, "host env=%q arguments=%q", os.Getenv("HOST_SELECTED_ENV"), args[1:])
+			os.Exit(31)
+		}
+		fmt.Print("host-cc-executed")
 	case "runtime-link":
 		if os.Getenv("CONTRACT_VALUE") != "link" {
 			fmt.Fprintf(os.Stderr, "CONTRACT_VALUE=%q", os.Getenv("CONTRACT_VALUE"))
@@ -824,6 +855,116 @@ func TestRunProbeForwardsExactlyDeclaredAuxiliaryActionContracts(t *testing.T) {
 	result, err := kconfig.ReadProbeResult(resultPath)
 	if err != nil || result.Text != "forwarded" {
 		t.Fatalf("auxiliary contract result = %#v, %v", result, err)
+	}
+}
+
+func TestRunProbeExecutesSelectedScopedHostToolWithoutHostResultInput(t *testing.T) {
+	dir := t.TempDir()
+	request := kconfig.ProbeRequest{
+		Schema: kconfig.LinuxProbeRequestSchema,
+		Steps: []kconfig.ProbeStep{{
+			Name: "selected-host-tool", Tool: "runner", AuxiliaryTools: []string{"host@cc"},
+			Arguments: []string{"inspect-scoped-host-contract", "${tool:host@cc}"},
+		}},
+		Outcome: kconfig.ProbeOutcome{Kind: "text", Step: "selected-host-tool", Stream: "stdout"},
+	}
+	// The fixture selects a host toolset after it reads this raw request, then
+	// writes its identity into the canonical request before assigning IDs.
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestPath := filepath.Join(dir, "request.json")
+	if err := os.WriteFile(requestPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := prepareTestProbeWithToolset(t, probeOptions{
+		request: requestPath, result: filepath.Join(dir, "result.json"), scope: "target",
+		tools: map[string]actionContract{
+			"runner": {
+				path:        executable,
+				arguments:   []string{"-test.run=^TestProbeHelperProcess$", "--", kconfig.LinuxKbuildArgsSentinel},
+				environment: map[string]string{"LINUX_BZL_PROBE_HELPER": "1"},
+			},
+			"host@cc": {
+				path:        executable,
+				arguments:   []string{"-test.run=^TestProbeHelperProcess$", "--", "selected-host-cc", kconfig.LinuxKbuildArgsSentinel},
+				environment: map[string]string{"LINUX_BZL_PROBE_HELPER": "1", "HOST_SELECTED_ENV": "host-bound"},
+			},
+		},
+	})
+	if request.InputCount != 0 || prepared.toolsetMarkers["target"] == prepared.toolsetMarkers["host"] {
+		t.Fatal("scoped host executable needs separate host toolset identity without a host result input")
+	}
+	if err := runProbe(prepared); err != nil {
+		t.Fatal(err)
+	}
+	result, err := kconfig.ReadProbeResult(prepared.result)
+	if err != nil || result.Text != "scoped-host-call-ok" {
+		t.Fatalf("scoped host execution result = %#v, %v", result, err)
+	}
+	rewriteRequestIdentity := func(t *testing.T, opts *probeOptions, identity string) {
+		t.Helper()
+		request, err := kconfig.ReadProbeRequest(prepared.request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.HostToolsetIdentity = identity
+		canonical, err := request.CanonicalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts.request = strings.TrimSuffix(opts.result, ".json") + "-request.json"
+		if err := os.WriteFile(opts.request, canonical, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		opts.requestID, err = request.ID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts.nodeID = (kconfig.ProbePlanNode{Scope: opts.scope, RequestID: opts.requestID}).ContentID()
+	}
+	for _, test := range []struct {
+		name, errorText string
+		change          func(*testing.T, *probeOptions)
+	}{
+		{"missing marker", "no host toolset marker", func(t *testing.T, opts *probeOptions) {
+			opts.toolsetMarkers = maps.Clone(opts.toolsetMarkers)
+			delete(opts.toolsetMarkers, "host")
+		}},
+		{"missing manifest", "no host toolset manifest", func(t *testing.T, opts *probeOptions) { opts.hostToolsetManifest = "" }},
+		{"request identity differs from marker", "host toolset identity", func(t *testing.T, opts *probeOptions) {
+			rewriteRequestIdentity(t, opts, "sha256-"+strings.Repeat("0", 64))
+		}},
+		{"manifest identity differs from marker", "host toolset manifest identity", func(t *testing.T, opts *probeOptions) {
+			wrongMarker := filepath.Join(dir, "sha256-"+strings.Repeat("e", 64))
+			if err := os.WriteFile(wrongMarker, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			opts.toolsetMarkers = maps.Clone(opts.toolsetMarkers)
+			opts.toolsetMarkers["host"] = wrongMarker
+			rewriteRequestIdentity(t, opts, filepath.Base(wrongMarker))
+		}},
+		{"mismatched action contract", "identity-bound host toolset manifest", func(t *testing.T, opts *probeOptions) {
+			opts.tools = maps.Clone(opts.tools)
+			contract := opts.tools["host@cc"]
+			contract.environment = maps.Clone(contract.environment)
+			contract.environment["HOST_SELECTED_ENV"] = "tampered"
+			opts.tools["host@cc"] = contract
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := prepared
+			opts.result = filepath.Join(dir, strings.ReplaceAll(test.name, " ", "-")+".json")
+			test.change(t, &opts)
+			if err := runProbe(opts); err == nil || !strings.Contains(err.Error(), test.errorText) {
+				t.Fatalf("scoped host binding error = %v, want %q", err, test.errorText)
+			}
+		})
 	}
 }
 
@@ -1610,6 +1751,26 @@ func TestRunProbeEvaluatedOutputUsesIsolatedValidatedWorkingDirectory(t *testing
 				t.Fatalf("evaluated output result = %#v, want text %q and three successful steps", result, test.want)
 			}
 		})
+	}
+}
+
+func TestRunProbeEvaluatedOutputValidatesLargeWorkingInventory(t *testing.T) {
+	scriptRunner := resolveProbeTestRunfile(t, "LINUX_BZL_TEST_SCRIPTRUN")
+	scriptRuntime := resolveProbeTestRunfile(t, "LINUX_BZL_TEST_SCRIPT_RUNTIME")
+	working := make(map[string]string, 1000)
+	for index := range 1000 {
+		// This native-marker-shaped inventory makes both generated scripts
+		// exceed Linux's 128 KiB limit for one argv element.
+		name := fmt.Sprintf("include/config/PLATFORM_FEATURE_%s_%04d", strings.Repeat("X", 80), index)
+		working[name] = ""
+	}
+	result := executeEvaluatedOutputProbe(t, scriptRunner, scriptRuntime, "", working)
+	const want = "linux-bzl-evaluated-script-output-v1\nMjUwCg==\n"
+	if result.Text != want || len(result.Steps) != 3 ||
+		slices.ContainsFunc(result.Steps, func(step kconfig.ProbeStepResult) bool {
+			return step.Status != "success"
+		}) {
+		t.Fatalf("large exact inventory result = %#v, want %q and three successful steps", result, want)
 	}
 }
 

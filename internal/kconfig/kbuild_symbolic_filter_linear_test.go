@@ -477,6 +477,66 @@ OUTER := $(filter-out -fkeep,prefix $(INNER) suffix)
 	}
 }
 
+func TestKbuildEmbeddedCanonicalFilterKeepsExactWordBoundary(t *testing.T) {
+	const source = linearFilterCompilerFixture + `
+choice := $(call cc-option,-fa)
+INNER := $(filter-out impossible,$(choice) fixed)
+OUTER := $(filter-out impossible,pre$(INNER))
+`
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	opts := KbuildProbeWorkloadOptions{Target: testKbuildProbeScopeOptions(t, fixture)}
+	var evaluatedScopes *KbuildProbeScopes
+	discovery, err := EvaluateKbuildProbeWorkload(opts, nil, func(scopes *KbuildProbeScopes) (string, error) {
+		evaluatedScopes = scopes
+		options, err := scopes.Options("target", KbuildOptions{
+			Variables:               map[string]string{"CC": opts.Target.Tools["cc"]},
+			ConfigVariablesComplete: true, MakeVariablesComplete: true,
+			CaptureVariables: []string{"OUTER"},
+		})
+		if err != nil {
+			return "", err
+		}
+		parsed, err := parseKbuildWithOptions(strings.NewReader(source), "scripts/Makefile.lib", options, "")
+		if err != nil {
+			return "", err
+		}
+		return parsed.Variables["OUTER"], nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovery.Plan.Nodes) != 1 {
+		t.Fatalf("embedded canonical filter registered %d probes, want one compiler result", len(discovery.Plan.Nodes))
+	}
+	evaluator, symbol, ok := evaluatedScopes.symbolOwner(discovery.Value)
+	if !ok || symbol.kind != "make-text" {
+		t.Fatalf("embedded canonical filter lost source function: %q %#v", discovery.Value, symbol)
+	}
+	fragments, dynamic, err := newProbeSymbolicValueLowerer(evaluator).value(discovery.Value)
+	if err != nil || !dynamic {
+		t.Fatalf("embedded canonical filter = %#v, dynamic %t: %v", fragments, dynamic, err)
+	}
+	for _, tc := range []struct {
+		name, want string
+		supported  bool
+	}{
+		{name: "empty choice does not introduce space", want: "prefixed"},
+		{name: "selected choice retains word", supported: true, want: "pre-fa fixed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := RenderProbeDependencyFragments(fragments, map[string]ProbeResult{
+				"00000000": {Kind: "boolean", Boolean: &tc.supported},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("embedded canonical filter = %q, want exact Make bytes %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestKbuildIntermediateTargetsChainsDynamicFilterIntoPatsubstProtocol(t *testing.T) {
 	// scripts/Makefile.build derives generated intermediates with this exact
 	// filter -> patsubst shape. Make the target list itself compiler-dependent

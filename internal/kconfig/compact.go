@@ -118,6 +118,11 @@ type CompactConfig struct {
 type CompactKbuildSelection struct {
 	Profile string
 	Target  string
+	// SourceScriptPhase identifies a source-owned effect between recursive
+	// Make calls in the selected target's immutable script. Version and object
+	// are real file writes with no Make rule of their own; final is the
+	// original Make rule after its earlier phases have completed.
+	SourceScriptPhase string
 	// MakeTarget preserves the concrete lexical filename GNU Make used while
 	// matching declarations for Target. It may contain parent traversals which
 	// disappear from the canonical graph identity in Target. It is mandatory;
@@ -139,6 +144,13 @@ type CompactKbuildSelection struct {
 	// its source-proven producer profile and target; a pathname alone is never
 	// used to rediscover ownership later.
 	InitialObjectTreeArtifacts string
+	// NativePrerequisiteArtifacts identifies the exact producer versions
+	// visible after this target's selected Make prerequisites complete and
+	// before its recipe begins. This target-local frontier can differ from the
+	// invocation's initial frontier when a prerequisite recursively builds or
+	// rewrites an archive. Only source-declared native prerequisite paths are
+	// recorded; later source-script reads have their own producer edges.
+	NativePrerequisiteArtifacts string
 	// GeneratedObjectTreeArtifacts encodes exact selected producers referenced
 	// by immutable source text but not exported through the invocation's initial
 	// frontier. Each record is bound by profile+target provenance before
@@ -221,6 +233,23 @@ func normalizeCompactKbuildSelectionMakeTarget(
 			"Kbuild selection %s target %q has invalid lexical Make target %q",
 			selection.Profile, selection.Target, selection.MakeTarget,
 		)
+	}
+	if selection.SourceScriptPhase != "" {
+		if selection.MakeTarget != selection.Target ||
+			CanonicalKbuildGraphTarget(selection.Target) != selection.Target ||
+			!slices.ContainsFunc(profile.SelectedSourceScriptPhases, func(phase CompactKbuildSelectedSourcePhase) bool {
+				kind := "version"
+				if phase.Ordinal == 1 {
+					kind = "object"
+				}
+				return phase.OutputPath == selection.Target && kind == selection.SourceScriptPhase
+			}) {
+			return CompactKbuildSelection{}, fmt.Errorf(
+				"Kbuild selection %s target %q has no exact source script phase %q",
+				selection.Profile, selection.Target, selection.SourceScriptPhase,
+			)
+		}
+		return selection, nil
 	}
 	if _, aliasesTarget := ResolveCompactKbuildMakeTarget(
 		profile, selection.Target, selection.MakeTarget,
@@ -331,6 +360,20 @@ func compactKbuildSelectionGeneratedObjectTreeArtifacts(selection CompactKbuildS
 	return artifacts, nil
 }
 
+func compactKbuildSelectionNativePrerequisiteArtifacts(selection CompactKbuildSelection) ([]CompactKbuildVisibleArtifact, error) {
+	if selection.NativePrerequisiteArtifacts == "" {
+		return nil, nil
+	}
+	var artifacts []CompactKbuildVisibleArtifact
+	if err := json.Unmarshal([]byte(selection.NativePrerequisiteArtifacts), &artifacts); err != nil {
+		return nil, fmt.Errorf("decode native prerequisite artifacts: %w", err)
+	}
+	if len(artifacts) == 0 || EncodeCompactKbuildInitialObjectTreeArtifacts(artifacts) != selection.NativePrerequisiteArtifacts {
+		return nil, fmt.Errorf("native prerequisite artifact encoding is not canonical")
+	}
+	return artifacts, nil
+}
+
 // CompactKbuildProfile binds one terminal, preparation, or host Kbuild
 // invocation to its source-derived evaluator. Consumers request only the
 // targets they need instead of serializing the invocation's variable state.
@@ -344,6 +387,13 @@ type CompactKbuildProfile struct {
 	// scripts/Makefile.build and for recursive make -C invocations.
 	invocationLocation    CompactKbuildInvocationLocation
 	invocationLocationSet bool
+	// A selected incremental control traversal may execute several lines for
+	// one target against different immutable read frontiers. Target-wide callers
+	// must use a per-line snapshot when observed file reads differ.
+	targetLineReadSnapshots map[string][]*KbuildSelectedControlRecipeSnapshot
+	// GNU Make expands a selected rule's prerequisites when entering its
+	// target. Preserve that state before prerequisite recipes can change it.
+	targetRuleEntrySnapshots map[string]*KbuildSelectedControlRuleEntry
 	// initialVisibleArtifactView is immutable, process-local provenance. The
 	// selected action graph serializes only queried artifact subsets, never this
 	// backing representation.
@@ -361,6 +411,10 @@ type CompactKbuildProfile struct {
 	// profile and goals come from the evaluated Make argv; action ordering never
 	// infers this edge from an output or script filename.
 	TargetInvocationDependencies []CompactKbuildInvocationDependency
+	// SelectedSourceScriptPhases are exact writes within a selected immutable
+	// source script, retained separately from real Make targets. Their output
+	// identity and source spans are bound to the enclosing Make recipe.
+	SelectedSourceScriptPhases []CompactKbuildSelectedSourcePhase
 	// EntryTargets are the concrete goals requested from this Make invocation.
 	// They are derived from the selected parent rule/recipe, never from every
 	// target that happens to be declared in the parsed file.
@@ -511,6 +565,43 @@ func CompactKbuildGroupedActionForTarget(
 	return action.ruleIndex, action.stem, action.trigger, append([]string(nil), action.outputs...), true
 }
 
+// TransferCompactKbuildGroupedActions retains first-reached GNU Make grouped
+// recipe authority when the source-order control stepper returns its final
+// evaluator. DFS binds the trigger on its local profile copy; this bridge
+// carries only those authenticated source rule records into the final profile.
+func TransferCompactKbuildGroupedActions(destination *CompactKbuildProfile, source CompactKbuildProfile) error {
+	if destination == nil || destination.Name != source.Name || destination.Path != source.Path ||
+		destination.Directory != source.Directory || !slices.Equal(destination.EntryTargets, source.EntryTargets) ||
+		len(destination.Rules) != len(source.Rules) {
+		return fmt.Errorf("cannot transfer grouped Kbuild trigger authority across different source invocations")
+	}
+	if len(source.groupedActions) == 0 {
+		return nil
+	}
+	triggers := make([]string, 0, len(source.groupedActions))
+	for target, action := range source.groupedActions {
+		if action == nil || action.ruleIndex < 0 || action.ruleIndex >= len(source.Rules) ||
+			source.Rules[action.ruleIndex].Position != destination.Rules[action.ruleIndex].Position ||
+			!slices.Contains(action.outputs, target) {
+			return fmt.Errorf("grouped Kbuild output %q has unsupported or conflicting source rule authority", target)
+		}
+		if target == action.trigger {
+			triggers = append(triggers, target)
+		}
+	}
+	sort.Strings(triggers)
+	for _, trigger := range triggers {
+		action := source.groupedActions[trigger]
+		if err := BindCompactKbuildGroupedAction(destination, action.ruleIndex, action.stem, trigger, action.outputs); err != nil {
+			return err
+		}
+	}
+	if len(destination.groupedActions) != len(source.groupedActions) {
+		return fmt.Errorf("grouped Kbuild outputs do not cover every source-selected recipe peer")
+	}
+	return nil
+}
+
 // EffectiveCompactKbuildRecipeRuleIndexes returns the recipe declarations GNU
 // Make executes for one already-selected target context. Ordinary colon and
 // grouped-colon declarations have one effective recipe (the last declaration
@@ -630,6 +721,21 @@ type CompactKbuildInvocationDependency struct {
 	Profile         string
 	Goals           []string
 	ReplayArguments []string
+	// SourcePhaseBefore identifies the source-script write completed before
+	// this Make invocation starts. It is empty for ordinary recursive Make.
+	SourcePhaseBefore string
+}
+
+type CompactKbuildSelectedSourcePhase struct {
+	OwnerTarget  string
+	OutputPath   string
+	SourcePath   string
+	Ordinal      int
+	SourceSHA256 string
+	Spans        []CompactKbuildLinkVmlinuxSourceSpan
+	// SourceArguments are the exact positional words supplied to this script
+	// by its selected Make shell command, before either recursive Make boundary.
+	SourceArguments []string
 }
 
 type CompactMetadataOptions struct {
@@ -993,6 +1099,70 @@ func EvaluateCompactKbuildTargetRuleContext(profile CompactKbuildProfile, target
 	return evaluatedKbuildTargetRuleContext(profile, target)
 }
 
+// EvaluateCompactKbuildCandidatePrerequisitesForMakeTarget evaluates one
+// indexed GNU Make rule before implicit-rule viability selects a recipe.
+// Second expansion must run in the rule-entry Make view: a raw $$(name)
+// prerequisite is an expression, not a literal filename. Keeping the
+// candidate identity avoids using a different implicit recipe's context to
+// decide whether this candidate can be made.
+func EvaluateCompactKbuildCandidatePrerequisitesForMakeTarget(
+	profile CompactKbuildProfile,
+	target, makeTarget string,
+	ruleIndex int,
+	stem string,
+) (CompactKbuildResolvedTargetContext, error) {
+	selected, err := compactKbuildCandidateMatchForMakeTarget(profile, target, makeTarget, ruleIndex, stem)
+	if err != nil {
+		return CompactKbuildResolvedTargetContext{}, err
+	}
+	context, err := evaluatedKbuildTargetMakeContext(profile, target, &selected, false)
+	if err != nil {
+		return CompactKbuildResolvedTargetContext{}, err
+	}
+	project := func(values []compactKbuildEvaluatedPath) []CompactKbuildResolvedPrerequisite {
+		out := make([]CompactKbuildResolvedPrerequisite, len(values))
+		for index, value := range values {
+			out[index] = CompactKbuildResolvedPrerequisite{Target: value.graphPath, MakeTarget: value.makeWord}
+		}
+		return out
+	}
+	return CompactKbuildResolvedTargetContext{
+		Normal: project(context.normal), OrderOnly: project(context.orderOnly), Stem: context.stem,
+	}, nil
+}
+
+func compactKbuildCandidateMatchForMakeTarget(
+	profile CompactKbuildProfile,
+	target, makeTarget string,
+	ruleIndex int,
+	stem string,
+) (compactKbuildRuleMatch, error) {
+	target = compactKbuildGraphTargetPath(target)
+	if ruleIndex < 0 || ruleIndex >= len(profile.Rules) {
+		return compactKbuildRuleMatch{}, fmt.Errorf("candidate rule %d for target %q is outside profile %q", ruleIndex, target, profile.Name)
+	}
+	var selected *compactKbuildRuleMatch
+	for _, candidate := range compactKbuildRuleCandidatesForMakeTarget(profile, target, makeTarget) {
+		if candidate.ruleOrder != ruleIndex || candidate.stem != stem {
+			continue
+		}
+		if selected != nil {
+			return compactKbuildRuleMatch{}, fmt.Errorf("candidate rule %d stem %q for target %q is ambiguous in profile %q", ruleIndex, stem, target, profile.Name)
+		}
+		match := compactKbuildRuleMatch{
+			profile: profile, rule: candidate.rule, stem: candidate.stem,
+			lookupTarget: candidate.lookupTarget, ruleOrder: candidate.ruleOrder,
+			targetOrder: candidate.targetOrder, resolved: true,
+			explicit: !strings.Contains(candidate.target, "%"), stemLength: len(candidate.stem),
+		}
+		selected = &match
+	}
+	if selected == nil {
+		return compactKbuildRuleMatch{}, fmt.Errorf("candidate rule %d stem %q does not own target %q in profile %q", ruleIndex, stem, target, profile.Name)
+	}
+	return *selected, nil
+}
+
 type compactKbuildEvaluatedPath struct {
 	graphPath string
 	makeWord  string
@@ -1074,6 +1244,14 @@ func compactKbuildStableMakeWord(profile CompactKbuildProfile, value string) (st
 		return selected.marker, nil
 	}
 	return selected.marker + "/" + filepathToSlash(selected.relative), nil
+}
+
+// StableCompactKbuildMakeWord preserves the selected Make target's lexical
+// spelling while mirroring GNU Make's leading ./ normalization and replacing
+// declared physical tree roots with stable source/object markers. Recursive
+// discovery and action lowering must use the same $@ word for one source rule.
+func StableCompactKbuildMakeWord(profile CompactKbuildProfile, value string) (string, error) {
+	return compactKbuildStableMakeWord(profile, value)
 }
 
 func compactKbuildEvaluatedPathNamespace(value string) string {
@@ -1193,6 +1371,23 @@ func evaluatedKbuildTargetMakeContext(
 			}
 		}
 	}
+	secondExpansionProfile := profile
+	entry, recordedEntry := profile.targetRuleEntrySnapshots[target]
+	if entry != nil || recordedEntry {
+		if entry == nil || entry.Line.Target != target || entry.Line.LookupTarget != lookupTarget ||
+			entry.Line.RuleIndex != selected.ruleOrder || entry.Line.Stem != selected.stem ||
+			entry.Profile.Name != profile.Name {
+			return compactKbuildEvaluatedRuleContext{}, fmt.Errorf(
+				"target %q profile %q second expansion has no matching source-selected rule entry snapshot",
+				target, profile.Name,
+			)
+		}
+		// Prerequisites may mutate Make variables before this target's first
+		// recipe runs. Reuse the evaluator that selected them at target entry.
+		secondExpansionProfile = entry.Profile
+		secondExpansionProfile.targetLineReadSnapshots = nil
+		secondExpansionProfile.targetRuleEntrySnapshots = nil
+	}
 	selectedRules := []match{selected}
 	// GNU Make combines every ordinary explicit declaration with the selected
 	// recipe even when that recipe comes from an implicit pattern. Kbuild's
@@ -1224,17 +1419,48 @@ func evaluatedKbuildTargetMakeContext(
 			if orderOnly {
 				values = candidate.rule.OrderOnly
 			}
-			for _, value := range values {
-				makeWord, err := compactKbuildStableMakeWord(
-					profile, instantiateKbuildRulePattern(value, candidate.stem),
+			var targetParser *kbuildParser
+			var cleanup func()
+			if candidate.rule.SecondExpansion {
+				var err error
+				targetParser, cleanup, err = compactKbuildTargetParserWithExportsForLookup(
+					secondExpansionProfile, target, lookupTarget, candidate.makeTarget, candidate.stem,
+					nil, nil, nil, true, false,
 				)
 				if err != nil {
-					return nil, err
+					return nil, fmt.Errorf("%s: build second expansion target context: %w", candidate.rule.Position, err)
 				}
-				graphPath := instantiateKbuildRulePattern(compactKbuildProfileTargetPath(profile, value), candidate.stem)
-				graphPath = compactKbuildGraphTargetPath(graphPath)
-				if graphPath != "" {
-					out = append(out, compactKbuildEvaluatedPath{graphPath: graphPath, makeWord: makeWord})
+				targetParser.secondExpansionPrerequisites = true
+				defer cleanup()
+			}
+			for _, value := range values {
+				expanded := instantiateKbuildRulePattern(value, candidate.stem)
+				if targetParser != nil {
+					var err error
+					expanded, err = targetParser.expand(expanded)
+					if err != nil {
+						return nil, fmt.Errorf("%s: second-expand prerequisite %q for %q: %w", candidate.rule.Position, value, target, err)
+					}
+					expanded, err = targetParser.resolveKbuildSymbolicWords(expanded)
+					if err != nil {
+						return nil, fmt.Errorf("%s: second-expanded prerequisite %q for %q: %w", candidate.rule.Position, value, target, err)
+					}
+				}
+				for _, word := range strings.Fields(expanded) {
+					if word == "|" {
+						return nil, fmt.Errorf("%s: second-expanded prerequisite %q changes the normal/order-only split", candidate.rule.Position, value)
+					}
+					if candidate.rule.SecondExpansion && (strings.ContainsRune(word, '$') || linuxProbeSymbolPattern.MatchString(word)) {
+						return nil, fmt.Errorf("%s: second-expanded prerequisite %q for %q retains an active reference or probe result in path %q", candidate.rule.Position, value, target, word)
+					}
+					makeWord, err := compactKbuildStableMakeWord(profile, word)
+					if err != nil {
+						return nil, fmt.Errorf("%s: second-expanded prerequisite %q: %w", candidate.rule.Position, value, err)
+					}
+					graphPath := compactKbuildGraphTargetPath(compactKbuildProfileTargetPath(profile, word))
+					if graphPath != "" {
+						out = append(out, compactKbuildEvaluatedPath{graphPath: graphPath, makeWord: makeWord})
+					}
 				}
 			}
 		}

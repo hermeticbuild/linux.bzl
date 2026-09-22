@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"slices"
 	"testing"
 
@@ -48,6 +49,36 @@ func TestKbuildFrontierVirtualFileViewReadsExactAndOpaqueFiles(t *testing.T) {
 	}
 	if _, exists, _, err := view.Read("missing.order"); err != nil || exists {
 		t.Fatal("missing read unexpectedly exists")
+	}
+}
+
+func TestKbuildFrontierVirtualFileViewDistinguishesPendingSelectedSourceFromOpaqueFile(t *testing.T) {
+	const sourcePath = "include/config/generated.release"
+	selected := testKbuildFrontierValue(sourcePath, "", false)
+	selected.artifact = kconfig.CompactKbuildVisibleArtifact{
+		Path: sourcePath, Profile: "source-selected-root", Target: sourcePath,
+	}
+	selected.pendingSourceOutput = true
+	state := newKbuildFrontierStateFromSorted([]kbuildFrontierEntry{
+		{path: sourcePath, value: selected},
+		{path: "include/config/opaque.info", value: testKbuildFrontierValue("include/config/opaque.info", "", false)},
+	})
+	view := kbuildFrontierVirtualFileView{state: state, immutableContents: map[string]string{sourcePath: "stale\n"}}
+	for _, path := range []string{sourcePath, kbuildEvalObjectTree + "/" + sourcePath} {
+		_, exists, exact, err := view.Read(path)
+		var pending *pendingKbuildSourceOutputRead
+		if !exists || exact || !errors.As(err, &pending) || pending.artifact != selected.artifact {
+			t.Fatalf("pending selected Read(%q) = (exists %t, exact %t, error %v), want selected writer %v", path, exists, exact, err, selected.artifact)
+		}
+	}
+	if _, exists, exact, err := view.Read("include/config/opaque.info"); err != nil || !exists || exact {
+		t.Fatalf("unregistered opaque writer Read() = (exists %t, exact %t, error %v)", exists, exact, err)
+	}
+	selected.pendingSourceOutput = false
+	selected.content, selected.exact = "measured\n", true
+	view.state = kbuildFrontierSet(view.state, sourcePath, selected)
+	if data, exists, exact, err := view.Read(sourcePath); err != nil || !exists || !exact || data != "measured\n" {
+		t.Fatalf("replayed selected writer Read() = (%q, %t, %t, %v)", data, exists, exact, err)
 	}
 }
 

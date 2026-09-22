@@ -323,7 +323,7 @@ func (l *probeSymbolicValueLowerer) valueWhen(
 				break
 			}
 			if symbol.makeText.protocolMode == linuxProbeMakeTextProtocolUnusable {
-				err = fmt.Errorf("whole Make text symbolic value %q has no proven protocol lowering", token)
+				err = fmt.Errorf("whole Make text symbolic value %q from Make function %q has no proven protocol lowering", token, symbol.makeText.function)
 				break
 			}
 			if len(symbol.makeText.protocolTransforms) != 0 {
@@ -334,16 +334,19 @@ func (l *probeSymbolicValueLowerer) valueWhen(
 			}
 			protocolMode := mode
 			aggregate := false
-			if mode != probeSymbolicValueArgv && symbol.makeText.protocolMode == linuxProbeMakeTextProtocolCanonicalWords {
-				// argv-word equivalence becomes byte-exact only after normalizing
-				// the complete protocol value. Keep surrounding literals outside
-				// this aggregate and apply strip after all conditional children
-				// have been concatenated.
+			wordBoundary := (match[0] == 0 || strings.ContainsAny(value[match[0]-1:match[0]], " \t\r\n\v\f")) &&
+				(match[1] == len(value) || strings.ContainsAny(value[match[1]:match[1]+1], " \t\r\n\v\f"))
+			if symbol.makeText.protocolMode == linuxProbeMakeTextProtocolCanonicalWords &&
+				(mode != probeSymbolicValueArgv || !wordBoundary) {
+				// A canonical child embedded next to literal bytes must first
+				// regain its exact separators. The outer wordwise transform may
+				// otherwise split an intended word at a child protocol's space.
 				protocolMode = probeSymbolicValueArgv
 				aggregate = true
 			}
-			if mode != probeSymbolicValueArgv && symbol.makeText.protocolMode == linuxProbeMakeTextProtocolArgvWords {
-				err = fmt.Errorf("whole Make text symbolic value %q is argv-word-equivalent but not exact for environment or stdin lowering", token)
+			if symbol.makeText.protocolMode == linuxProbeMakeTextProtocolArgvWords &&
+				(mode != probeSymbolicValueArgv || !wordBoundary) {
+				err = fmt.Errorf("whole Make text symbolic value %q is argv-word-equivalent but not exact at a Make word boundary", token)
 				break
 			}
 			expanded, err = l.valueWhen(symbol.makeText.protocolValue, when, depth+1, visiting, protocolMode, budget)

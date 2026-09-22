@@ -86,7 +86,11 @@ type LinuxCompilerFacts struct {
 	toolsetIdentity string
 	machine         string
 	versionText     string
-	predefines      string
+	// When the compiler's version action wrote no stderr and its first-line
+	// bytes need no line-ending normalization, the Kbuild evaluator may reuse
+	// this measured line for a source-owned merged-stream literal grep.
+	versionLineHasNoStderr bool
+	predefines             string
 }
 
 func (f *LinuxCompilerFacts) Scope() string { return f.scope }
@@ -99,6 +103,10 @@ func (f *LinuxCompilerFacts) Machine() string { return f.machine }
 // output, matching the value Linux obtains with `head -n 1`. Source Makefiles
 // own every interpretation of this value.
 func (f *LinuxCompilerFacts) VersionText() string { return f.versionText }
+
+func (f *LinuxCompilerFacts) VersionTextForCombinedStream() (string, bool) {
+	return f.versionText, f.versionLineHasNoStderr
+}
 
 // Predefines returns the exact stdout produced by
 // `cc -dM -E -x c /dev/null`. It is intentionally not parsed into a macro map:
@@ -191,6 +199,8 @@ func ParseLinuxCompilerBootstrapResult(result ProbeResult, scope, toolsetIdentit
 
 	return &LinuxCompilerFacts{
 		scope: scope, toolsetIdentity: toolsetIdentity, machine: machine, versionText: versionText,
+		versionLineHasNoStderr: steps[bootstrapCompilerVersion].Stderr == "" && !strings.ContainsRune(steps[bootstrapCompilerVersion].Stdout, '\r') &&
+			versionText == strings.SplitN(steps[bootstrapCompilerVersion].Stdout, "\n", 2)[0],
 		predefines: predefines,
 	}, nil
 }

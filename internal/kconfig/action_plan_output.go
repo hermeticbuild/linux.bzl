@@ -365,6 +365,7 @@ func finalizePreparedActionPlan(prepared *actionPlanPreparedAnalysis, variantOpt
 				projectedGeneratorInternalNodes:   plan.projectedGeneratorInternalNodes,
 				projectedGeneratorInternalOutputs: plan.projectedGeneratorInternalOutputs,
 				projectedGeneratorOriginalOutputs: plan.projectedGeneratorOriginalOutputs,
+				executionCheckRoots:               slices.Clone(plan.executionCheckRoots),
 			}
 		}
 	}
@@ -562,6 +563,14 @@ func contentAddressActionPlanNodes(plan *ActionPlan) error {
 		}
 		validations = append(validations, node.ID)
 	}
+	executionChecks := make([]string, 0, len(plan.executionCheckRoots))
+	for _, oldID := range plan.executionCheckRoots {
+		node, ok := resolvedNode(oldID)
+		if !ok {
+			return fmt.Errorf("execution check root references unknown node %s", oldID)
+		}
+		executionChecks = append(executionChecks, node.ID)
+	}
 	internal := make(map[string]bool, len(plan.projectedGeneratorInternalNodes))
 	for oldID := range plan.projectedGeneratorInternalNodes {
 		node, ok := resolvedNode(oldID)
@@ -591,6 +600,7 @@ func contentAddressActionPlanNodes(plan *ActionPlan) error {
 		commitments[node.ID] = commitment
 	}
 	plan.projectedGeneratorValidations = validations
+	plan.executionCheckRoots = executionChecks
 	plan.projectedGeneratorInternalNodes = internal
 	plan.projectedGeneratorInternalOutputs = internalOutputs
 	plan.projectedGeneratorOriginalOutputs = commitments

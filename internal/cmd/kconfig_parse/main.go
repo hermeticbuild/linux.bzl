@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
+	"github.com/hermeticbuild/linux.bzl/internal/pkgconfigmanifest"
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
@@ -53,7 +54,7 @@ func addKbuildOnlyVariables(variables, kbuildVariables map[string]string) map[st
 
 func validateConfiguredKbuildInputs(
 	variables, kbuildVariables map[string]string,
-	targets, preparationTargets []string,
+	targets, preparationTargets, preparationCandidates []string,
 ) error {
 	for _, input := range []struct {
 		name   string
@@ -72,6 +73,7 @@ func validateConfiguredKbuildInputs(
 	}{
 		{name: "-kbuild_target", values: targets},
 		{name: "-kbuild_prepare_target", values: preparationTargets},
+		{name: "-kbuild_prepare_candidate", values: preparationCandidates},
 	} {
 		for index, value := range input.values {
 			if err := kconfig.ValidateKbuildOrdinaryValue(
@@ -103,11 +105,15 @@ type linuxKconfigProbeEvaluation struct {
 }
 
 type linuxKbuildProbeValue struct {
-	target               sourceDerivedLinuxTarget
-	resolved             *kconfig.ResolvedConfig
-	actionPlan           *kconfig.ActionPlan
-	configDependencies   map[string]kconfig.ConfigDependencySet
-	familyPlanningResult *kconfig.ActionPlanFamilyVariantPlanningResult
+	target                 sourceDerivedLinuxTarget
+	resolved               *kconfig.ResolvedConfig
+	graphGuards            []string
+	graphGuardReferences   []kconfig.ProbeReference
+	sourceOutputRequestIDs []string
+	featureDumpRequestIDs  []string
+	actionPlan             *kconfig.ActionPlan
+	configDependencies     map[string]kconfig.ConfigDependencySet
+	familyPlanningResult   *kconfig.ActionPlanFamilyVariantPlanningResult
 }
 
 type linuxKbuildProbeOptions struct {
@@ -127,9 +133,17 @@ type linuxKbuildProbeOptions struct {
 	objectNamespace                   string
 	entryTargets                      []string
 	preparationTargets                []string
+	preparationCandidates             []string
 	selectedProductsOnly              bool
 	analyzeConfigDependencies         bool
 	guardDiscoveryOnly                bool
+	graphGuardDiscoveryOnly           bool
+	graphGuardResults                 *kconfig.KbuildGraphGuardResults
+	sourceOutputDiscoveryOnly         bool
+	sourceOutputPlan                  *kconfig.ProbePlan
+	sourceOutputOracle                *kconfig.ProbeResultOracle
+	featureDumpDiscoveryOnly          bool
+	featureDumpResults                *kconfig.KbuildGraphGuardResults
 	familyPlanningCache               *kconfig.ActionPlanFamilyPlanningCache
 	familyVariantOptions              *kconfig.ActionPlanFamilyVariantPlanningOptions
 	familyCompilerGuards              *familyCompilerGuardPipeline
@@ -142,6 +156,42 @@ type linuxKbuildProbeOptions struct {
 	hostContract                      *hostKbuildContract
 	rustSourceRoot                    string
 	normalizeConfigValue              func(string) (string, error)
+}
+
+type kbuildSelectedSourceOutputMeasurement struct {
+	plan                      *kconfig.ProbePlan
+	oracle                    *kconfig.ProbeResultOracle
+	discoveryOnly             bool
+	sourceOutputDiscoveryOnly bool
+	featureDumpDiscoveryOnly  bool
+	featureDumpResults        *kconfig.KbuildGraphGuardResults
+	featureDumpRequestIDs     *[]string
+}
+
+func selectedKbuildOutputProbeMeasurement(opts linuxKbuildProbeOptions, requestIDs *[]string) kbuildSelectedSourceOutputMeasurement {
+	return kbuildSelectedSourceOutputMeasurement{
+		plan: opts.sourceOutputPlan, oracle: opts.sourceOutputOracle,
+		// Both passes replay source writers whose exact results are sealed.
+		discoveryOnly: opts.sourceOutputDiscoveryOnly || opts.featureDumpDiscoveryOnly,
+		// Only the source pass may stop before registering a feature probe.
+		sourceOutputDiscoveryOnly: opts.sourceOutputDiscoveryOnly,
+		featureDumpDiscoveryOnly:  opts.featureDumpDiscoveryOnly,
+		featureDumpResults:        opts.featureDumpResults,
+		featureDumpRequestIDs:     requestIDs,
+	}
+}
+
+func (measurement kbuildSelectedSourceOutputMeasurement) selectedFeaturePass(scopes *kconfig.KbuildProbeScopes) *kbuildSelectedFeatureDump {
+	return selectedFeatureDumpProbePass(
+		scopes, measurement.featureDumpResults,
+		measurement.sourceOutputDiscoveryOnly, measurement.featureDumpDiscoveryOnly,
+		measurement.featureDumpRequestIDs,
+	)
+}
+
+type kbuildInvocationMeasurements struct {
+	sourceOutput kbuildSelectedSourceOutputResolver
+	featureDump  *kbuildSelectedFeatureDump
 }
 
 func newLinuxCompilerBootstrapPlan(targetIdentity, hostIdentity string) (*linuxCompilerBootstrapPlan, error) {
@@ -277,6 +327,7 @@ func evaluateLinuxKconfigProbes(
 		Scope:              "target",
 		Architecture:       bootstrapArchitecture,
 		SourceRoot:         sourceRoot,
+		SourceRootAliases:  []string{kbuildEvalSourceTree},
 		SourceArchitecture: bootstrapArchitecture,
 		ScriptEnvironment:  linuxProbeScriptEnvironment(bootstrapArchitecture, bootstrapArchitecture, "target", variables, targetContract.MakeVariables, tools, rustSourceRoot),
 		Facts:              targetFacts,
@@ -290,7 +341,7 @@ func evaluateLinuxKconfigProbes(
 	}
 	target, err := sourceDerivedLinuxKconfigIdentity(
 		ctx, sourceRoot, variables,
-		targetContract, hostContract, bootstrapEvaluator, sourceCache,
+		targetContract, hostContract, &bootstrapEvaluator, sourceCache,
 	)
 	if err != nil {
 		return nil, err
@@ -306,6 +357,7 @@ func evaluateLinuxKconfigProbes(
 		Scope:              "target",
 		Architecture:       target.Arch,
 		SourceRoot:         sourceRoot,
+		SourceRootAliases:  []string{kbuildEvalSourceTree},
 		SourceArchitecture: target.Srcarch,
 		ScriptEnvironment:  policyScriptEnvironment,
 		Facts:              targetFacts,
@@ -319,7 +371,7 @@ func evaluateLinuxKconfigProbes(
 	}
 	sourceEnvironment, err := sourceDerivedLinuxKconfigEnvironment(
 		ctx, sourceRoot, target.Arch, variables, environment,
-		targetContract, hostContract, policyEvaluator, sourceCache,
+		targetContract, hostContract, &policyEvaluator, sourceCache,
 	)
 	if err != nil {
 		return nil, err
@@ -339,12 +391,22 @@ func evaluateLinuxKconfigProbes(
 	if err != nil {
 		return nil, fmt.Errorf("create final source-exported Kconfig probe evaluator: %w", err)
 	}
+	shell := func(ctx context.Context, command string) (string, error) {
+		value, probeErr := finalEvaluator.Shell(ctx, command)
+		if probeErr == nil || !kconfig.IsLinuxProbeUnsupportedCommand(probeErr) {
+			return value, probeErr
+		}
+		// Older Kconfig files expand optional host-config defaults, including
+		// uname -r, while parsing. Reuse the source Makefile's hermetic shell
+		// fallback so no host kernel release enters the declared config plan.
+		return hermeticLinuxKbuildShell(command, sourceRoot)
+	}
 	tree, err := kconfig.ParseFile(ctx, root, kconfig.Options{
 		RootDir:         sourceRoot,
 		SourceRoots:     sourceRoots,
 		Variables:       variables,
 		Env:             environment,
-		Shell:           finalEvaluator.Shell,
+		Shell:           shell,
 		ResolveSymbolic: finalEvaluator.ResolveSymbolic,
 	})
 	if err != nil {
@@ -425,7 +487,7 @@ func sourceDerivedLinuxKconfigEnvironment(
 	variables map[string]string,
 	environment map[string]string,
 	target, host *hostKbuildContract,
-	evaluator *kconfig.LinuxProbeEvaluator,
+	evaluator **kconfig.LinuxProbeEvaluator,
 	sourceCaches ...*kconfig.KbuildSourceCache,
 ) (map[string]string, error) {
 	var sourceCache *kconfig.KbuildSourceCache
@@ -461,30 +523,41 @@ func sourceDerivedLinuxKconfigEnvironment(
 		commandLine[name] = values[name]
 	}
 	shell := func(command string) (string, error) {
-		value, probeErr := evaluator.KbuildShell(ctx, command)
+		value, probeErr := (*evaluator).KbuildShell(ctx, command)
 		if probeErr == nil {
 			return value, nil
 		}
 		if !kconfig.IsLinuxProbeUnsupportedCommand(probeErr) {
 			return "", probeErr
 		}
-		return hermeticLinuxKbuildShell(command, root, target, host)
+		return hermeticEarlyKbuildShell(command, root)
 	}
-	parsed, err := parseLinuxRootFinalInvocation(root, kconfig.KbuildOptions{
-		RootDir:                        root,
-		Variables:                      values,
-		EnvironmentVariables:           maps.Clone(environment),
-		CommandLineVariables:           commandLine,
-		AutoExportCommandLineVariables: kbuildConfiguredCommandLineAutoExports(configured, target, host),
-		SourceRoots:                    map[string]string{kbuildEvalSourceTree: root, kbuildEvalObjectTree: root},
-		ConfigVariablesComplete:        true,
-		MakeVariablesComplete:          true,
-		Shell:                          shell,
-		ResolveSymbolic:                evaluator.ResolveSymbolic,
-		SelectSymbolic:                 evaluator.SelectSymbolic,
-		TransformSymbolic:              evaluator.TransformSymbolic,
-		SourceCache:                    sourceCache,
+	rootOptions, err := kconfig.BindIncomingKbuildShellExportEnvironment(evaluator, kconfig.KbuildOptions{
+		RootDir:                           root,
+		Variables:                         values,
+		EnvironmentVariables:              maps.Clone(environment),
+		CommandLineVariables:              commandLine,
+		SyntheticToolCommandLineVariables: kbuildSyntheticToolRoleCommandLineVariables(target, host, configured),
+		AutoExportCommandLineVariables:    kbuildConfiguredCommandLineAutoExports(configured, target, host),
+		SourceRoots:                       map[string]string{kbuildEvalSourceTree: root, kbuildEvalObjectTree: root},
+		ConfigVariablesComplete:           true,
+		MakeVariablesComplete:             true,
+		Shell:                             shell,
+		ResolveSymbolic: func(value string) (string, error) {
+			return (*evaluator).ResolveSymbolic(value)
+		},
+		SelectSymbolic: func(value, expected string, equal bool, trueText, falseText string) (string, bool, error) {
+			return (*evaluator).SelectSymbolic(value, expected, equal, trueText, falseText)
+		},
+		TransformSymbolic: func(function string, args []string) (string, bool, error) {
+			return (*evaluator).TransformSymbolic(function, args)
+		},
+		SourceCache: sourceCache,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("bind source-derived Linux Kconfig environment: %w", err)
+	}
+	parsed, err := parseLinuxRootFinalInvocation(root, rootOptions)
 	if err != nil {
 		return nil, fmt.Errorf("evaluate source-derived Linux Kconfig environment: %w", err)
 	}
@@ -541,9 +614,11 @@ func evaluateLinuxKbuildProbes(
 		Architecture:       opts.target.Arch,
 		SourceArchitecture: opts.target.Srcarch,
 		SourceRoot:         sourceRoot,
+		SourceRootAliases:  []string{kbuildEvalSourceTree},
 		ScriptEnvironment:  hostScriptEnvironment,
 		Facts:              opts.hostFacts,
 		Tools:              hostTools,
+		PkgConfigManifest:  opts.hostContract.PkgConfigManifest,
 	}
 	return kconfig.EvaluateKbuildProbeWorkload(
 		kconfig.KbuildProbeWorkloadOptions{
@@ -551,6 +626,7 @@ func evaluateLinuxKbuildProbes(
 				Architecture:       opts.target.Arch,
 				SourceArchitecture: opts.target.Srcarch,
 				SourceRoot:         sourceRoot,
+				SourceRootAliases:  []string{kbuildEvalSourceTree},
 				ScriptEnvironment:  targetScriptEnvironment,
 				Facts:              opts.targetFacts,
 				Tools:              targetTools,
@@ -560,6 +636,9 @@ func evaluateLinuxKbuildProbes(
 		},
 		oracle,
 		func(scopes *kconfig.KbuildProbeScopes) (linuxKbuildProbeValue, error) {
+			if err := scopes.InstallGraphGuardResults(opts.graphGuardResults, opts.graphGuardDiscoveryOnly); err != nil {
+				return linuxKbuildProbeValue{}, err
+			}
 			if opts.checkpointInput != "" {
 				return replayLinuxFamilyCheckpoint(opts, scopes)
 			}
@@ -593,6 +672,8 @@ func evaluateLinuxKbuildProbes(
 				variables[name] = value
 			}
 			variables["UTS_MACHINE"] = target.UTSMachine
+			graphGuards := []string{}
+			featureDumpRequestIDs := []string{}
 			metadata, resolved, err := compactMetadata(
 				opts.tree,
 				opts.rootPath,
@@ -608,6 +689,7 @@ func evaluateLinuxKbuildProbes(
 				opts.objectNamespace,
 				opts.entryTargets,
 				opts.preparationTargets,
+				opts.preparationCandidates,
 				opts.selectedProductsOnly,
 				opts.kbuildInputCache,
 				opts.kernelVersion,
@@ -615,9 +697,64 @@ func evaluateLinuxKbuildProbes(
 				opts.hostContract,
 				scopes,
 				opts.normalizeConfigValue,
+				opts.graphGuardDiscoveryOnly, &graphGuards,
+				selectedKbuildOutputProbeMeasurement(opts, &featureDumpRequestIDs),
 			)
 			if err != nil {
-				return linuxKbuildProbeValue{}, err
+				if opts.sourceOutputDiscoveryOnly {
+					var pending *pendingKbuildSourceOutputRead
+					if errors.As(err, &pending) {
+						if pending.artifact.Path != pending.path || len(pending.requestIDs) == 0 {
+							return linuxKbuildProbeValue{}, fmt.Errorf("source-output discovery cut has no exact selected writer/request provenance: %w", err)
+						}
+						return linuxKbuildProbeValue{
+							target: target, sourceOutputRequestIDs: slices.Clone(pending.requestIDs),
+						}, nil
+					}
+					var pendingFeature *pendingKbuildFeatureDump
+					if errors.As(err, &pendingFeature) {
+						// A feature include belongs to the next measured discovery
+						// stage. No source-output read preceded this boundary.
+						return linuxKbuildProbeValue{target: target}, nil
+					}
+				}
+				if opts.featureDumpDiscoveryOnly {
+					var pendingSource *pendingKbuildSourceOutputRead
+					if errors.As(err, &pendingSource) {
+						if pendingSource.artifact.Path != pendingSource.path || len(pendingSource.requestIDs) == 0 {
+							return linuxKbuildProbeValue{}, fmt.Errorf("feature-dump discovery cut has no exact selected source writer/request provenance: %w", err)
+						}
+						return linuxKbuildProbeValue{target: target, featureDumpRequestIDs: uniquePathsInOrder(featureDumpRequestIDs)}, nil
+					}
+					var pending *pendingKbuildFeatureDump
+					if errors.As(err, &pending) {
+						if len(pending.requestIDs) == 0 {
+							return linuxKbuildProbeValue{}, fmt.Errorf("selected feature dump discovery has no source-authenticated compiler requests: %w", err)
+						}
+						return linuxKbuildProbeValue{target: target, featureDumpRequestIDs: slices.Clone(pending.requestIDs)}, nil
+					}
+				}
+				return linuxKbuildProbeValue{}, fmt.Errorf("resolve source-selected Kbuild metadata: %w", err)
+			}
+			if opts.graphGuardDiscoveryOnly {
+				guardReferences, guardErr := scopes.GraphGuardReferences(graphGuards)
+				if guardErr != nil {
+					return linuxKbuildProbeValue{}, guardErr
+				}
+				return linuxKbuildProbeValue{
+					target: target, resolved: resolved, graphGuards: graphGuards,
+					graphGuardReferences: guardReferences,
+				}, nil
+			}
+			if opts.sourceOutputDiscoveryOnly {
+				// No selected opaque read followed a bounded source writer;
+				// ordinary discovery can use the complete selected graph.
+				return linuxKbuildProbeValue{target: target, resolved: resolved}, nil
+			}
+			if opts.featureDumpDiscoveryOnly {
+				return linuxKbuildProbeValue{
+					target: target, resolved: resolved, featureDumpRequestIDs: uniquePathsInOrder(featureDumpRequestIDs),
+				}, nil
 			}
 			// Action lowering is part of the probe workload itself. Some compiler
 			// and source-script expressions are reached only after the selected
@@ -647,7 +784,7 @@ func evaluateLinuxKbuildProbes(
 					}
 				}
 				if options.InitialSnapshot != nil {
-					options.ResolvedConfigFiles = resolvedConfigObjectTreeContents(opts.tree, resolved, opts.kernelVersion)
+					options.ResolvedConfigFiles = resolvedConfigObjectTreeContents(opts.tree, resolved)
 				}
 				if opts.familyCompilerGuards != nil {
 					options.PrepareCompilerGuards = func() error {
@@ -703,7 +840,7 @@ func evaluateLinuxKbuildProbes(
 				)
 			}
 			if err != nil {
-				return linuxKbuildProbeValue{}, err
+				return linuxKbuildProbeValue{}, fmt.Errorf("lower source-selected Kbuild action graph: %w", err)
 			}
 			return linuxKbuildProbeValue{target: target, resolved: resolved, actionPlan: actionPlan}, nil
 		},
@@ -775,9 +912,37 @@ func configuredKbuildActionsFromManifest(manifest configuredKbuildToolsetManifes
 }
 
 type hostKbuildContract struct {
-	Actions         map[string]configuredKbuildAction
-	CompilerMachine string
-	MakeVariables   map[string]string
+	Actions           map[string]configuredKbuildAction
+	CompilerMachine   string
+	MakeVariables     map[string]string
+	PkgConfigManifest *pkgconfigmanifest.Manifest
+}
+
+// selectedHostPkgConfigManifest reads only the generated File bound by the
+// exact selected host shim action and separately declared as a typed planner
+// input. A custom pkg-config role remains a measured source probe.
+func selectedHostPkgConfigManifest(contract *hostKbuildContract, declaredPath string) (*pkgconfigmanifest.Manifest, error) {
+	if declaredPath == "" {
+		return nil, nil
+	}
+	canonicalDeclaredPath, err := toolaction.CanonicalArtifactPath(declaredPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid declared pkg-config manifest File: %w", err)
+	}
+	if contract == nil {
+		return nil, fmt.Errorf("declared pkg-config manifest requires the selected host action contract")
+	}
+	action, present := contract.Actions["pkg-config"]
+	if !present || action.Path == "" || len(action.PrefixArgs) != 3 || action.PrefixArgs[0] != "-manifest" ||
+		action.PrefixArgs[2] != "--" || len(action.SuffixArgs) != 0 || len(action.Environment) != 0 ||
+		action.PrefixArgs[1] != canonicalDeclaredPath {
+		return nil, fmt.Errorf("declared pkg-config manifest does not match the exact selected host shim action")
+	}
+	manifest, err := pkgconfigmanifest.Read(workspacePath(declaredPath))
+	if err != nil {
+		return nil, fmt.Errorf("read selected host pkg-config manifest: %w", err)
+	}
+	return manifest, nil
 }
 
 func configuredKbuildContract(scope string, actions map[string]configuredKbuildAction, compilerFacts *kconfig.LinuxCompilerFacts) (*hostKbuildContract, error) {
@@ -895,7 +1060,6 @@ type familyPlanFlags struct {
 	resolvedCmd      namedPathFlag
 	resolvedAutoconf namedPathFlag
 	resolvedRustcCfg namedPathFlag
-	resolvedRelease  namedPathFlag
 	snapshots        namedPathFlag
 }
 
@@ -904,7 +1068,7 @@ func (f *familyPlanFlags) requested() bool {
 		len(f.resolvedArch) != 0 || len(f.resolvedConfig) != 0 ||
 		len(f.resolvedAutoConf) != 0 || len(f.resolvedCmd) != 0 ||
 		len(f.resolvedAutoconf) != 0 || len(f.resolvedRustcCfg) != 0 ||
-		len(f.resolvedRelease) != 0 || len(f.snapshots) != 0)
+		len(f.snapshots) != 0)
 }
 
 type familyPlanVariantRequest struct {
@@ -972,7 +1136,6 @@ func (f *familyPlanFlags) requestsWithOutputs(outputs bool) ([]familyPlanVariant
 		{name: "family_plan_resolved_auto_conf_cmd_out", values: f.resolvedCmd, required: true},
 		{name: "family_plan_resolved_autoconf_out", values: f.resolvedAutoconf, required: true},
 		{name: "family_plan_resolved_rustc_cfg_out", values: f.resolvedRustcCfg, required: true},
-		{name: "family_plan_resolved_kernel_release_out", values: f.resolvedRelease, required: true},
 		{name: "family_plan_snapshot_out", values: f.snapshots, required: true},
 	}
 	byFlag := make(map[string]map[string]string, len(fields))
@@ -994,12 +1157,11 @@ func (f *familyPlanFlags) requestsWithOutputs(outputs bool) ([]familyPlanVariant
 			overlay: byFlag["family_plan_overlay"][name],
 			arch:    byFlag["family_plan_resolved_arch_out"][name],
 			resolved: resolvedConfigOutputs{
-				config:        byFlag["family_plan_resolved_config_out"][name],
-				autoConf:      byFlag["family_plan_resolved_auto_conf_out"][name],
-				autoConfCmd:   byFlag["family_plan_resolved_auto_conf_cmd_out"][name],
-				autoconf:      byFlag["family_plan_resolved_autoconf_out"][name],
-				rustcCfg:      byFlag["family_plan_resolved_rustc_cfg_out"][name],
-				kernelRelease: byFlag["family_plan_resolved_kernel_release_out"][name],
+				config:      byFlag["family_plan_resolved_config_out"][name],
+				autoConf:    byFlag["family_plan_resolved_auto_conf_out"][name],
+				autoConfCmd: byFlag["family_plan_resolved_auto_conf_cmd_out"][name],
+				autoconf:    byFlag["family_plan_resolved_autoconf_out"][name],
+				rustcCfg:    byFlag["family_plan_resolved_rustc_cfg_out"][name],
 			},
 			snapshot: byFlag["family_plan_snapshot_out"][name],
 		})
@@ -1079,12 +1241,29 @@ type kbuildInvocationRequest struct {
 	environment               map[string]string
 	variables                 map[string]string
 	commandLineAutoExport     map[string]bool
+	// Evaluator-only selected tool bindings may be replaced by source-authored
+	// role aliases. Ordinary user and recursive argv assignments are unmarked.
+	syntheticToolCommandLine map[string]bool
 	// visibleState is the process-local immutable object-tree snapshot. Request
 	// identity hashes its canonical observable digest; cumulative slice/map
 	// projections are never constructed.
 	visibleState              kbuildFrontierState
 	invocationPredecessors    []string
 	suppressParentCommandLine bool
+}
+
+func equivalentKbuildRootContinuation(parent, child kbuildInvocationRequest) bool {
+	parentTree := parent.processLocation.Tree
+	if parentTree == "" {
+		parentTree = kconfig.CompactKbuildInvocationObjectTree
+	}
+	childTree := child.processLocation.Tree
+	if childTree == "" {
+		childTree = kconfig.CompactKbuildInvocationObjectTree
+	}
+	return parent.makefile == child.makefile && parent.directory == child.directory &&
+		parentTree == childTree && parent.processLocation.Directory == child.processLocation.Directory &&
+		slices.Equal(parent.entryTargets, child.entryTargets)
 }
 
 type sourceDerivedLinuxTarget struct {
@@ -1142,7 +1321,7 @@ func parseLinuxRootFinalInvocation(root string, options kconfig.KbuildOptions) (
 		return nil, fmt.Errorf("root Makefile requested a sub-make but did not select one equivalent root invocation (found %d children)", len(children))
 	}
 	child := inheritKbuildInvocationCommandLineVariables(
-		children[0], options.CommandLineVariables, options.AutoExportCommandLineVariables,
+		children[0], options.CommandLineVariables, options.AutoExportCommandLineVariables, options.SyntheticToolCommandLineVariables,
 	)
 	// The source and object aliases are planner-owned precedence pins. They
 	// remain virtual roots while source-owned exports such as sub_make_done
@@ -1152,6 +1331,7 @@ func parseLinuxRootFinalInvocation(root string, options kconfig.KbuildOptions) (
 	childOptions.EnvironmentVariables = maps.Clone(child.environment)
 	childOptions.CommandLineVariables = maps.Clone(child.variables)
 	childOptions.AutoExportCommandLineVariables = child.commandLineAutoExport
+	childOptions.SyntheticToolCommandLineVariables = maps.Clone(child.syntheticToolCommandLine)
 	childOptions.Variables = maps.Clone(options.Variables)
 	childOptions.Variables["MAKECMDGOALS"] = strings.Join(child.entryTargets, " ")
 	for _, name := range []string{"abs_srctree", "objtree", "srctree"} {
@@ -1176,14 +1356,14 @@ func sourceDerivedLinuxKconfigIdentity(
 	sourceRoot string,
 	variables map[string]string,
 	target, host *hostKbuildContract,
-	evaluator *kconfig.LinuxProbeEvaluator,
+	evaluator **kconfig.LinuxProbeEvaluator,
 	sourceCaches ...*kconfig.KbuildSourceCache,
 ) (sourceDerivedLinuxTarget, error) {
 	var sourceCache *kconfig.KbuildSourceCache
 	if len(sourceCaches) != 0 {
 		sourceCache = sourceCaches[0]
 	}
-	if target == nil || host == nil || evaluator == nil {
+	if target == nil || host == nil || evaluator == nil || *evaluator == nil {
 		return sourceDerivedLinuxTarget{}, fmt.Errorf("source-derived Linux architecture requires selected target/host tools and probe evaluator")
 	}
 	root, err := workspaceDirectory(sourceRoot)
@@ -1216,31 +1396,42 @@ func sourceDerivedLinuxKconfigIdentity(
 		commandLine[name] = values[name]
 	}
 	shell := func(command string) (string, error) {
-		value, probeErr := evaluator.KbuildShell(ctx, command)
+		value, probeErr := (*evaluator).KbuildShell(ctx, command)
 		if probeErr == nil {
 			return value, nil
 		}
 		if !kconfig.IsLinuxProbeUnsupportedCommand(probeErr) {
 			return "", probeErr
 		}
-		return hermeticLinuxKbuildShell(command, root, target, host)
+		return hermeticEarlyKbuildShell(command, root)
 	}
-	parsed, err := parseLinuxRootFinalInvocation(root, kconfig.KbuildOptions{
-		RootDir:                        root,
-		Variables:                      values,
-		CommandLineVariables:           commandLine,
-		AutoExportCommandLineVariables: map[string]bool{},
-		SourceRoots:                    map[string]string{kbuildEvalSourceTree: root, kbuildEvalObjectTree: root},
-		ConfigVariablesComplete:        true,
-		MakeVariablesComplete:          true,
-		Shell:                          shell,
-		ResolveSymbolic:                evaluator.ResolveSymbolic,
-		SelectSymbolic:                 evaluator.SelectSymbolic,
-		TransformSymbolic:              evaluator.TransformSymbolic,
-		CaptureVariables:               []string{"ARCH", "SRCARCH", "UTS_MACHINE"},
-		SkipExportedVariables:          true,
-		SourceCache:                    sourceCache,
+	rootOptions, err := kconfig.BindIncomingKbuildShellExportEnvironment(evaluator, kconfig.KbuildOptions{
+		RootDir:                           root,
+		Variables:                         values,
+		CommandLineVariables:              commandLine,
+		SyntheticToolCommandLineVariables: kbuildSyntheticToolRoleCommandLineVariables(target, host, configured),
+		AutoExportCommandLineVariables:    map[string]bool{},
+		SourceRoots:                       map[string]string{kbuildEvalSourceTree: root, kbuildEvalObjectTree: root},
+		ConfigVariablesComplete:           true,
+		MakeVariablesComplete:             true,
+		Shell:                             shell,
+		ResolveSymbolic: func(value string) (string, error) {
+			return (*evaluator).ResolveSymbolic(value)
+		},
+		SelectSymbolic: func(value, expected string, equal bool, trueText, falseText string) (string, bool, error) {
+			return (*evaluator).SelectSymbolic(value, expected, equal, trueText, falseText)
+		},
+		TransformSymbolic: func(function string, args []string) (string, bool, error) {
+			return (*evaluator).TransformSymbolic(function, args)
+		},
+		CaptureVariables:      []string{"ARCH", "SRCARCH", "UTS_MACHINE"},
+		SkipExportedVariables: true,
+		SourceCache:           sourceCache,
 	})
+	if err != nil {
+		return sourceDerivedLinuxTarget{}, fmt.Errorf("bind source-derived Linux architecture: %w", err)
+	}
+	parsed, err := parseLinuxRootFinalInvocation(root, rootOptions)
 	if err != nil {
 		return sourceDerivedLinuxTarget{}, fmt.Errorf("evaluate source-derived Linux architecture: %w", err)
 	}
@@ -1325,17 +1516,18 @@ func sourceDerivedLinuxMakeIdentity(
 	mappedSourceRoots[kbuildEvalSourceTree] = root
 	mappedSourceRoots[kbuildEvalObjectTree] = root
 	options, err := probeScopes.Options("target", kconfig.KbuildOptions{
-		RootDir:                        root,
-		Variables:                      values,
-		CommandLineVariables:           commandLineVariables,
-		AutoExportCommandLineVariables: map[string]bool{},
-		SourceRoots:                    mappedSourceRoots,
-		ConfigVariablesComplete:        true,
-		MakeVariablesComplete:          true,
-		CaptureVariables:               []string{"ARCH", "SRCARCH", "UTS_MACHINE"},
-		SkipExportedVariables:          true,
+		RootDir:                           root,
+		Variables:                         values,
+		CommandLineVariables:              commandLineVariables,
+		SyntheticToolCommandLineVariables: kbuildSyntheticToolRoleCommandLineVariables(target, host, configured),
+		AutoExportCommandLineVariables:    map[string]bool{},
+		SourceRoots:                       mappedSourceRoots,
+		ConfigVariablesComplete:           true,
+		MakeVariablesComplete:             true,
+		CaptureVariables:                  []string{"ARCH", "SRCARCH", "UTS_MACHINE"},
+		SkipExportedVariables:             true,
 		Shell: func(command string) (string, error) {
-			return hermeticLinuxKbuildShell(command, root, target, host)
+			return hermeticLinuxKbuildShell(command, root)
 		},
 		SourceCache: sourceCache,
 	})
@@ -1357,35 +1549,13 @@ func sourceDerivedLinuxMakeIdentity(
 	return identity, nil
 }
 
-func hermeticLinuxKbuildShell(command, sourceRoot string, target, host *hostKbuildContract) (string, error) {
+func hermeticLinuxKbuildShell(command, sourceRoot string) (string, error) {
 	if value, handled, err := evaluateHermeticKbuildDirectoryQuery(command, sourceRoot); handled {
 		return value, err
 	}
-	commandPath := command
-	for _, sentinel := range []string{kbuildEvalSourceTree, kbuildEvalObjectTree} {
-		if commandPath == sentinel {
-			commandPath = sourceRoot
-			break
-		}
-		if suffix, ok := strings.CutPrefix(commandPath, sentinel+"/"); ok {
-			commandPath = filepath.Join(sourceRoot, filepath.FromSlash(suffix))
-			break
-		}
-	}
-	if !filepath.IsAbs(commandPath) {
-		commandPath = filepath.Join(sourceRoot, filepath.FromSlash(commandPath))
-	}
-	resolvedCommandPath, _ := filepath.EvalSymlinks(commandPath)
-	resolvedBuildVersionPath, _ := filepath.EvalSymlinks(filepath.Join(sourceRoot, "scripts", "build-version"))
-	if commandPath == filepath.Join(sourceRoot, "scripts", "build-version") ||
-		(resolvedCommandPath != "" && resolvedCommandPath == resolvedBuildVersionPath) {
-		// scripts/build-version reads and mutates .version. Planning uses the
-		// same normalized build-version contract as the versionheaders action.
-		return hermeticKbuildBuildVersion, nil
-	}
 	if command == "LC_ALL=C date" {
-		// Wall-clock time cannot affect a hermetic plan. This is the normalized
-		// timestamp emitted by the versionheaders action as well.
+		// Wall-clock time is not a declared build input. The exported default
+		// supplies the same timestamp when native Kbuild evaluates this query.
 		return hermeticKbuildBuildTimestamp, nil
 	}
 	if command == "uname -r" {
@@ -1401,14 +1571,36 @@ func hermeticLinuxKbuildShell(command, sourceRoot string, target, host *hostKbui
 		// are exactly empty, so the result is deterministic without execution.
 		return "", nil
 	}
-	if expression, ok := strings.CutPrefix(command, "expr "); ok {
-		return evaluateHermeticIntegerExpression(expression)
+	if strings.HasPrefix(command, "expr ") {
+		return kconfig.EvaluateKbuildIntegerExpression(command)
+	}
+	if strings.HasPrefix(strings.TrimSpace(command), "[") {
+		// Linux's gcc-min-version source macro evaluates a bounded integer
+		// comparison even while deriving the target identity, before ordinary
+		// Kbuild source-shell probes are available. Use the same finite grammar
+		// as later source evaluation; arbitrary shell commands remain rejected.
+		return kconfig.EvaluateKbuildNumericShellPredicate(command)
 	}
 	unsupportedErr := fmt.Errorf("unsupported hermetic Kbuild shell command %q", command)
 	if strings.Contains(command, kbuildEvalSourceTree) || strings.Contains(command, kbuildEvalObjectTree) {
 		return "", kbuildInvocationPhysicalPathError{err: unsupportedErr}
 	}
 	return "", unsupportedErr
+}
+
+// Before Kconfig produces any object-tree files, a source-owned optional
+// read beneath include/config observes an absent output. Honor the source's
+// stderr suppression without consulting an undeclared local build directory.
+func hermeticEarlyKbuildShell(command, sourceRoot string) (string, error) {
+	simple, single, err := kbuildSingleShellSimpleCommand(command)
+	if err == nil && single && len(simple.assignments) == 0 &&
+		len(simple.argv) == 2 && simple.argv[0] == "cat" &&
+		len(simple.redirections) == 1 && simple.redirections[0] == (kbuildShellRedirection{ioNumber: "2", operator: ">", operand: "/dev/null"}) &&
+		strings.HasPrefix(simple.argv[1], "include/config/") &&
+		!strings.ContainsAny(simple.argv[1], "\\\x00$*?[]{}~`'") && pathpkg.Clean(simple.argv[1]) == simple.argv[1] {
+		return "", nil
+	}
+	return hermeticLinuxKbuildShell(command, sourceRoot)
 }
 
 func evaluateHermeticKbuildDirectoryQuery(command, sourceRoot string) (string, bool, error) {
@@ -1529,16 +1721,31 @@ func kbuildCommandLineVariables(targetContract, host *hostKbuildContract, config
 	// These reproducibility defaults are ordinary, exported Make assignments,
 	// not compiler capabilities or flags; explicit nonempty values remain inputs.
 	out := map[string]string{
-		"KBUILD_BUILD_USER": hermeticKbuildBuildUser,
-		"KBUILD_BUILD_HOST": hermeticKbuildBuildHost,
+		"KBUILD_BUILD_USER":      hermeticKbuildBuildUser,
+		"KBUILD_BUILD_HOST":      hermeticKbuildBuildHost,
+		"KBUILD_BUILD_VERSION":   hermeticKbuildBuildVersion,
+		"KBUILD_BUILD_TIMESTAMP": hermeticKbuildBuildTimestamp,
 	}
 	for name, value := range configured {
-		if (name == "KBUILD_BUILD_USER" || name == "KBUILD_BUILD_HOST") && value == "" {
+		if (name == "KBUILD_BUILD_USER" || name == "KBUILD_BUILD_HOST" || name == "KBUILD_BUILD_VERSION" || name == "KBUILD_BUILD_TIMESTAMP") && value == "" {
 			return nil, fmt.Errorf("%s must be nonempty to avoid ambient build metadata", name)
 		}
 		out[name] = value
 	}
 	for variable, role := range targetContract.MakeVariables {
+		if authoredValue, authored := configured[variable]; authored {
+			scope := "target"
+			if sharedRole, shared := host.MakeVariables[variable]; shared {
+				if sharedRole != role {
+					return nil, fmt.Errorf("target and host toolset manifests bind Make variable %s to different roles (%s and %s)", variable, role, sharedRole)
+				}
+				scope = kconfig.KbuildActionRoleAutoScope
+			}
+			if err := validateConfiguredKbuildToolCLI(variable, role, scope, authoredValue); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		hostRole, shared := host.MakeVariables[variable]
 		if shared {
 			if hostRole != role {
@@ -1556,9 +1763,37 @@ func kbuildCommandLineVariables(targetContract, host *hostKbuildContract, config
 		if _, shared := targetContract.MakeVariables[variable]; shared {
 			continue
 		}
+		if authoredValue, authored := configured[variable]; authored {
+			if err := validateConfiguredKbuildToolCLI(variable, role, "host", authoredValue); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		out[variable] = kbuildActionRoleMakeCommand("host", role)
 	}
 	return out, nil
+}
+
+func validateConfiguredKbuildToolCLI(variable, role, scope, value string) error {
+	if value != kbuildActionRoleMakeCommand(scope, role) {
+		return fmt.Errorf("configured Make command-line %s=%q is not bound to the declared %s %s tool role", variable, value, scope, role)
+	}
+	return nil
+}
+
+func kbuildSyntheticToolRoleCommandLineVariables(target, host *hostKbuildContract, configured map[string]string) map[string]bool {
+	synthetic := map[string]bool{}
+	for variable := range target.MakeVariables {
+		if _, authored := configured[variable]; !authored {
+			synthetic[variable] = true
+		}
+	}
+	for variable := range host.MakeVariables {
+		if _, authored := configured[variable]; !authored {
+			synthetic[variable] = true
+		}
+	}
+	return synthetic
 }
 
 // kbuildActionRoleMakeCommand replaces a Kbuild tool executable with its
@@ -1572,7 +1807,7 @@ func kbuildConfiguredCommandLineAutoExports(
 	configured map[string]string,
 	targetContract, hostContract *hostKbuildContract,
 ) map[string]bool {
-	exported := map[string]bool{"KBUILD_BUILD_USER": true, "KBUILD_BUILD_HOST": true}
+	exported := map[string]bool{"KBUILD_BUILD_USER": true, "KBUILD_BUILD_HOST": true, "KBUILD_BUILD_VERSION": true, "KBUILD_BUILD_TIMESTAMP": true}
 	for name := range configured {
 		if targetContract != nil {
 			if _, internal := targetContract.MakeVariables[name]; internal {
@@ -1589,103 +1824,89 @@ func kbuildConfiguredCommandLineAutoExports(
 	return exported
 }
 
-func evaluateHermeticIntegerExpression(expression string) (string, error) {
-	fields := strings.Fields(strings.ReplaceAll(expression, `\*`, `*`))
-	if len(fields) == 0 || len(fields)%2 == 0 {
-		return "", fmt.Errorf("unsupported integer expression %q", expression)
-	}
-	values := make([]int64, 0, (len(fields)+1)/2)
-	operators := make([]string, 0, len(fields)/2)
-	for index, field := range fields {
-		if index%2 == 0 {
-			value, err := strconv.ParseInt(field, 10, 64)
-			if err != nil {
-				return "", fmt.Errorf("unsupported integer expression %q", expression)
-			}
-			values = append(values, value)
-			continue
-		}
-		if field != "+" && field != "-" && field != "*" {
-			return "", fmt.Errorf("unsupported integer expression %q", expression)
-		}
-		operators = append(operators, field)
-	}
-	for index := 0; index < len(operators); {
-		if operators[index] != "*" {
-			index++
-			continue
-		}
-		values[index] *= values[index+1]
-		values = append(values[:index+1], values[index+2:]...)
-		operators = append(operators[:index], operators[index+1:]...)
-	}
-	result := values[0]
-	for index, operator := range operators {
-		if operator == "+" {
-			result += values[index+1]
-		} else {
-			result -= values[index+1]
-		}
-	}
-	return strconv.FormatInt(result, 10), nil
-}
-
 func main() {
 	os.Exit(run())
 }
 
 func run() (exitCode int) {
 	var (
-		root                        = flag.String("root", "", "Root Kconfig file to parse")
-		srctree                     = flag.String("srctree", "", "Source tree used to resolve source statements")
-		kbuildPath                  = flag.String("kbuild", "", "Kbuild/Makefile path for action-plan generation")
-		actionPlanStageOuts         namedPathFlag
-		actionPlanSnapshotOut       = flag.String("action_plan_snapshot_out", "", "Deterministic gzip transport of a canonical lossless action-plan snapshot for image-family reduction")
-		familyPlan                  familyPlanFlags
-		familyExecution             familyExecutionFlags
-		familyCompilerGuards        familyCompilerGuardFlags
-		actionPlanFamilyVariants    namedPathFlag
-		actionPlanFamilySegmentOuts namedPathFlag
-		actionPlanFamilyOut         = flag.String("action_plan_family_out", "", "Deprecated unified image-family action-plan TreeArtifact")
-		actionPlanReuseReportOut    = flag.String("action_plan_reuse_report_out", "", "Canonical image-family reuse report")
-		probePlanUnionInputs        namedPathFlag
-		probePlanUnionOut           = flag.String("probe_plan_union_out", "", "Unified probe-plan TreeArtifact")
-		targetToolsetIdentity       = flag.String("target_toolset_identity", "", "Directory containing the independently measured target toolset identity marker")
-		hostToolsetIdentity         = flag.String("host_toolset_identity", "", "Directory containing the independently measured host toolset identity marker")
-		targetToolsetManifest       = flag.String("target_toolset_manifest", "", "Identity-bound target Kbuild toolset manifest")
-		hostToolsetManifest         = flag.String("host_toolset_manifest", "", "Identity-bound host Kbuild toolset manifest")
-		probePlanOut                = flag.String("probe_plan_out", "", "Directory to write the execution-time compiler/Kconfig probe plan")
-		targetProbeResults          = flag.String("target_probe_results", "", "Target-scoped probe result TreeArtifact consumed by final planning")
-		hostProbeResults            = flag.String("host_probe_results", "", "Host-scoped probe result TreeArtifact consumed by final planning")
-		kconfigProbePlanOut         = flag.String("kconfig_probe_plan_out", "", "Directory to write the source-derived Kconfig capability probe plan")
-		targetKconfigProbeResults   = flag.String("target_kconfig_probe_results", "", "Target-scoped Kconfig capability result TreeArtifact consumed by replay")
-		hostKconfigProbeResults     = flag.String("host_kconfig_probe_results", "", "Host-scoped Kconfig capability result TreeArtifact consumed by replay")
-		kbuildProbePlanOut          = flag.String("kbuild_probe_plan_out", "", "Directory to write the source-derived Kbuild capability probe plan")
-		targetKbuildProbeResults    = flag.String("target_kbuild_probe_results", "", "Target-scoped Kbuild capability result TreeArtifact consumed by final replay")
-		hostKbuildProbeResults      = flag.String("host_kbuild_probe_results", "", "Host-scoped Kbuild capability result TreeArtifact consumed by final replay")
-		objectRoot                  = flag.String("object_root", "", "Preconfigured Kbuild object tree used as the object namespace")
-		objectNamespace             = flag.String("object_namespace", "", "Action-plan tree namespace for files below -object_root")
-		selectedProductsOnly        = flag.Bool("selected_products_only", false, "Plan only source-selected Kbuild products and omit kernel facade products")
-		resolveConfig               = flag.String("resolve_config", "", ".config input path to resolve through Kconfig defaults and dependencies")
-		resolveConfigOverlays       stringSliceFlag
-		configMode                  = flag.String("config_mode", "default", "Config resolver mode. Supported: default, allnoconfig")
-		resolvedArchOut             = flag.String("resolved_arch_out", "", "Path to write the exact source-derived Linux ARCH")
-		resolvedConfigOut           = flag.String("resolved_config_out", "", "Path to write the resolved .config")
-		resolvedAutoConfOut         = flag.String("resolved_auto_conf_out", "", "Path to write the resolved include/config/auto.conf")
-		resolvedCmdOut              = flag.String("resolved_auto_conf_cmd_out", "", "Path to write the resolved include/config/auto.conf.cmd")
-		resolvedAutoconfOut         = flag.String("resolved_autoconf_out", "", "Path to write the resolved include/generated/autoconf.h")
-		resolvedRustcCfgOut         = flag.String("resolved_rustc_cfg_out", "", "Path to write the resolved include/generated/rustc_cfg")
-		resolvedReleaseOut          = flag.String("resolved_kernel_release_out", "", "Path to write the resolved include/config/kernel.release")
-		kernelVersion               = flag.String("kernel_version", "", "Base kernel release used for resolved config and Kbuild action planning")
-		heapProfile                 = flag.String("heap_profile", "", "Optional sampled heap profile; requires the separate heap diagnostic binary and bounded CPU profiling")
-		cpuProfile                  = flag.String("cpu_profile", "", "Optional diagnostic CPU profile output; requires -profile_duration")
-		profileDuration             = flag.Duration("profile_duration", 0, "Diagnostic wall-time limit: flush CPU profile and exit 124 when reached; requires -cpu_profile")
-		vars                        = stringMapFlag{}
-		kbuildVars                  = stringMapFlag{}
-		sourceRootMaps              = namedPathFlag{}
-		sourceNamespaces            = stringMapFlag{}
-		kbuildTargets               stringSliceFlag
-		kbuildPreparationTargets    stringSliceFlag
+		root                         = flag.String("root", "", "Root Kconfig file to parse")
+		srctree                      = flag.String("srctree", "", "Source tree used to resolve source statements")
+		kbuildPath                   = flag.String("kbuild", "", "Kbuild/Makefile path for action-plan generation")
+		actionPlanStageOuts          namedPathFlag
+		actionPlanSnapshotOut        = flag.String("action_plan_snapshot_out", "", "Deterministic gzip transport of a canonical lossless action-plan snapshot for image-family reduction")
+		familyPlan                   familyPlanFlags
+		familyExecution              familyExecutionFlags
+		familyCompilerGuards         familyCompilerGuardFlags
+		actionPlanFamilyVariants     namedPathFlag
+		actionPlanFamilySegmentOuts  namedPathFlag
+		actionPlanFamilyOut          = flag.String("action_plan_family_out", "", "Deprecated unified image-family action-plan TreeArtifact")
+		actionPlanReuseReportOut     = flag.String("action_plan_reuse_report_out", "", "Canonical image-family reuse report")
+		probePlanUnionInputs         namedPathFlag
+		probePlanUnionOut            = flag.String("probe_plan_union_out", "", "Unified probe-plan TreeArtifact")
+		targetToolsetIdentity        = flag.String("target_toolset_identity", "", "Directory containing the independently measured target toolset identity marker")
+		hostToolsetIdentity          = flag.String("host_toolset_identity", "", "Directory containing the independently measured host toolset identity marker")
+		targetToolsetManifest        = flag.String("target_toolset_manifest", "", "Identity-bound target Kbuild toolset manifest")
+		hostToolsetManifest          = flag.String("host_toolset_manifest", "", "Identity-bound host Kbuild toolset manifest")
+		pkgConfigManifest            = flag.String("pkg_config_manifest", "", "Declared host pkg-config shim package manifest File")
+		probePlanOut                 = flag.String("probe_plan_out", "", "Directory to write the execution-time compiler/Kconfig probe plan")
+		targetProbeResults           = flag.String("target_probe_results", "", "Target-scoped probe result TreeArtifact consumed by final planning")
+		hostProbeResults             = flag.String("host_probe_results", "", "Host-scoped probe result TreeArtifact consumed by final planning")
+		kconfigProbePlanOut          = flag.String("kconfig_probe_plan_out", "", "Directory to write the source-derived Kconfig capability probe plan")
+		targetKconfigProbeResults    = flag.String("target_kconfig_probe_results", "", "Target-scoped Kconfig capability result TreeArtifact consumed by replay")
+		hostKconfigProbeResults      = flag.String("host_kconfig_probe_results", "", "Host-scoped Kconfig capability result TreeArtifact consumed by replay")
+		kbuildProbePlanOut           = flag.String("kbuild_probe_plan_out", "", "Directory to write the source-derived Kbuild capability probe plan")
+		graphGuardProbePlanOut       = flag.String("kbuild_graph_guard_probe_plan_out", "", "Directory to write source-derived Kbuild graph guard probe terminals")
+		graphGuardEarlierPlan        = flag.String("kbuild_graph_guard_earlier_plan", "", "Earlier measured graph guard round for convergence proof")
+		graphGuardEarlierHost        = flag.String("kbuild_graph_guard_earlier_host_results", "", "Earlier host graph guard results for convergence proof")
+		graphGuardEarlierTarget      = flag.String("kbuild_graph_guard_earlier_target_results", "", "Earlier target graph guard results for convergence proof")
+		graphGuardRequireConverged   = flag.Bool("kbuild_graph_guard_require_converged", false, "Reject new source-selected guard requests at the last round")
+		sourceOutputProbePlanOut     = flag.String("kbuild_source_output_probe_plan_out", "", "Directory to write causal source-selected exact-output probe terminals")
+		sourceOutputEarlierPlan      = flag.String("kbuild_source_output_earlier_plan", "", "Earlier measured source-output round for convergence proof")
+		sourceOutputRequireConverged = flag.Bool("kbuild_source_output_require_converged", false, "Reject new selected source-output writers at the last round")
+		featureDumpProbePlanOut      = flag.String("kbuild_feature_dump_probe_plan_out", "", "Directory to write source-selected feature dump compiler probe terminals")
+		featureDumpEarlierPlan       = flag.String("kbuild_feature_dump_earlier_plan", "", "Earlier measured feature-dump round for convergence proof")
+		featureDumpRequireConverged  = flag.Bool("kbuild_feature_dump_require_converged", false, "Reject new selected feature-dump requests at the last round")
+		pairedEarlierSourcePlan      = flag.String("kbuild_paired_earlier_source_plan", "", "Earlier selected source-output plan for paired convergence")
+		pairedEarlierFeaturePlan     = flag.String("kbuild_paired_earlier_feature_plan", "", "Earlier selected feature-dump plan for paired convergence")
+		pairedEarlierSourceHost      = flag.String("kbuild_paired_earlier_source_host_results", "", "Earlier host source-output results for paired convergence")
+		pairedEarlierSourceTarget    = flag.String("kbuild_paired_earlier_source_target_results", "", "Earlier target source-output results for paired convergence")
+		pairedEarlierFeatureHost     = flag.String("kbuild_paired_earlier_feature_host_results", "", "Earlier host feature-dump results for paired convergence")
+		pairedEarlierFeatureTarget   = flag.String("kbuild_paired_earlier_feature_target_results", "", "Earlier target feature-dump results for paired convergence")
+		sourceOutputProbePlan        = flag.String("kbuild_source_output_probe_plan", "", "Measured source-output probe plan consumed during ordinary Kbuild discovery")
+		hostSourceOutputResults      = flag.String("host_kbuild_source_output_results", "", "Host-scoped measured source-output result TreeArtifact")
+		targetSourceOutputResults    = flag.String("target_kbuild_source_output_results", "", "Target-scoped measured source-output result TreeArtifact")
+		featureDumpProbePlan         = flag.String("kbuild_feature_dump_probe_plan", "", "Measured source-selected feature dump probe plan")
+		hostFeatureDumpResults       = flag.String("host_kbuild_feature_dump_probe_results", "", "Host-scoped measured feature dump result TreeArtifact")
+		targetFeatureDumpResults     = flag.String("target_kbuild_feature_dump_probe_results", "", "Target-scoped measured feature dump result TreeArtifact")
+		graphGuardProbePlan          = flag.String("kbuild_graph_guard_probe_plan", "", "Measured Kbuild graph guard probe plan consumed during ordinary probe discovery")
+		hostGraphGuardProbeResults   = flag.String("host_kbuild_graph_guard_probe_results", "", "Host-scoped pregraph capability result TreeArtifact")
+		targetGraphGuardProbeResults = flag.String("target_kbuild_graph_guard_probe_results", "", "Target-scoped pregraph capability result TreeArtifact")
+		targetKbuildProbeResults     = flag.String("target_kbuild_probe_results", "", "Target-scoped Kbuild capability result TreeArtifact consumed by final replay")
+		hostKbuildProbeResults       = flag.String("host_kbuild_probe_results", "", "Host-scoped Kbuild capability result TreeArtifact consumed by final replay")
+		objectRoot                   = flag.String("object_root", "", "Preconfigured Kbuild object tree used as the object namespace")
+		objectNamespace              = flag.String("object_namespace", "", "Action-plan tree namespace for files below -object_root")
+		selectedProductsOnly         = flag.Bool("selected_products_only", false, "Plan only source-selected Kbuild products and omit kernel facade products")
+		resolveConfig                = flag.String("resolve_config", "", ".config input path to resolve through Kconfig defaults and dependencies")
+		resolveConfigOverlays        stringSliceFlag
+		configMode                   = flag.String("config_mode", "default", "Config resolver mode. Supported: default, allnoconfig")
+		resolvedArchOut              = flag.String("resolved_arch_out", "", "Path to write the exact source-derived Linux ARCH")
+		resolvedConfigOut            = flag.String("resolved_config_out", "", "Path to write the resolved .config")
+		resolvedAutoConfOut          = flag.String("resolved_auto_conf_out", "", "Path to write the resolved include/config/auto.conf")
+		resolvedCmdOut               = flag.String("resolved_auto_conf_cmd_out", "", "Path to write the resolved include/config/auto.conf.cmd")
+		resolvedAutoconfOut          = flag.String("resolved_autoconf_out", "", "Path to write the resolved include/generated/autoconf.h")
+		resolvedRustcCfgOut          = flag.String("resolved_rustc_cfg_out", "", "Path to write the resolved include/generated/rustc_cfg")
+		kernelVersion                = flag.String("kernel_version", "", "Base kernel release used for resolved config and Kbuild action planning")
+		heapProfile                  = flag.String("heap_profile", "", "Optional sampled heap profile; requires the separate heap diagnostic binary and bounded CPU profiling")
+		cpuProfile                   = flag.String("cpu_profile", "", "Optional diagnostic CPU profile output; requires -profile_duration")
+		profileDuration              = flag.Duration("profile_duration", 0, "Diagnostic wall-time limit: flush CPU profile and exit 124 when reached; requires -cpu_profile")
+		vars                         = stringMapFlag{}
+		kbuildVars                   = stringMapFlag{}
+		sourceRootMaps               = namedPathFlag{}
+		sourceNamespaces             = stringMapFlag{}
+		kbuildTargets                stringSliceFlag
+		kbuildPreparationTargets     stringSliceFlag
+		kbuildPreparationCandidates  stringSliceFlag
 	)
 	flag.Var(vars, "var", "Shared Kconfig/Kbuild variable in KEY=VALUE form. May be repeated")
 	flag.Var(&actionPlanStageOuts, "action_plan_stage_out", "Stage-specific map_directory action plan in STAGE=PATH form. Must be repeated for every stage")
@@ -1697,7 +1918,6 @@ func run() (exitCode int) {
 	flag.Var(&familyPlan.resolvedCmd, "family_plan_resolved_auto_conf_cmd_out", "Variant resolved auto.conf.cmd output in NAME=PATH form")
 	flag.Var(&familyPlan.resolvedAutoconf, "family_plan_resolved_autoconf_out", "Variant resolved autoconf.h output in NAME=PATH form")
 	flag.Var(&familyPlan.resolvedRustcCfg, "family_plan_resolved_rustc_cfg_out", "Variant resolved rustc_cfg output in NAME=PATH form")
-	flag.Var(&familyPlan.resolvedRelease, "family_plan_resolved_kernel_release_out", "Variant resolved kernel.release output in NAME=PATH form")
 	flag.Var(&familyPlan.snapshots, "family_plan_snapshot_out", "Variant deterministic action-plan snapshot in NAME=PATH form")
 	familyExecution.register(flag.CommandLine)
 	familyCompilerGuards.register(flag.CommandLine)
@@ -1709,7 +1929,8 @@ func run() (exitCode int) {
 	flag.Var(&sourceRootMaps, "source_root_map", "Virtual source prefix to filesystem root in PREFIX=PATH form. May be repeated")
 	flag.Var(sourceNamespaces, "source_namespace", "Canonical source prefix to action-plan tree namespace in PREFIX=NAMESPACE form. May be repeated")
 	flag.Var(&kbuildTargets, "kbuild_target", "Top-level Kbuild goal. May be repeated")
-	flag.Var(&kbuildPreparationTargets, "kbuild_prepare_target", "Top-level Kbuild goal whose source-derived closure is exported through the module SDK. May be repeated")
+	flag.Var(&kbuildPreparationTargets, "kbuild_prepare_target", "Required source-selected Kbuild preparation marker whose reached closure is exported through the module SDK. May be repeated")
+	flag.Var(&kbuildPreparationCandidates, "kbuild_prepare_candidate", "Optional source-selected Kbuild preparation marker, used only if reached through an actual Make goal. May be repeated")
 	flag.Parse()
 	if (familyExecution.requested() || familyCompilerGuards.requested()) && !familyPlan.requested() {
 		fmt.Fprintln(os.Stderr, "family execution requires -family_plan_variant and its complete outputs")
@@ -1784,7 +2005,7 @@ func run() (exitCode int) {
 		return 0
 	}
 	if err := validateConfiguredKbuildInputs(
-		vars, kbuildVars, []string(kbuildTargets), []string(kbuildPreparationTargets),
+		vars, kbuildVars, []string(kbuildTargets), []string(kbuildPreparationTargets), []string(kbuildPreparationCandidates),
 	); err != nil {
 		fmt.Fprintf(os.Stderr, "invalid configured Kbuild input: %v\n", err)
 		return 2
@@ -1820,6 +2041,9 @@ func run() (exitCode int) {
 		{"-probe_plan_out", *probePlanOut},
 		{"-kconfig_probe_plan_out", *kconfigProbePlanOut},
 		{"-kbuild_probe_plan_out", *kbuildProbePlanOut},
+		{"-kbuild_graph_guard_probe_plan_out", *graphGuardProbePlanOut},
+		{"-kbuild_source_output_probe_plan_out", *sourceOutputProbePlanOut},
+		{"-kbuild_feature_dump_probe_plan_out", *featureDumpProbePlanOut},
 	} {
 		if output.value == "" {
 			continue
@@ -1859,7 +2083,6 @@ func run() (exitCode int) {
 			{name: "-resolved_auto_conf_cmd_out", value: *resolvedCmdOut},
 			{name: "-resolved_autoconf_out", value: *resolvedAutoconfOut},
 			{name: "-resolved_rustc_cfg_out", value: *resolvedRustcCfgOut},
-			{name: "-resolved_kernel_release_out", value: *resolvedReleaseOut},
 		}
 		for _, output := range legacyOutputs {
 			if output.value != "" {
@@ -1873,8 +2096,8 @@ func run() (exitCode int) {
 		}
 	}
 
-	resolvedConfigRequested := len(familyPlanRequests) != 0 || *resolvedConfigOut != "" || *resolvedAutoConfOut != "" || *resolvedCmdOut != "" || *resolvedAutoconfOut != "" || *resolvedRustcCfgOut != "" || *resolvedReleaseOut != ""
-	kbuildPlanningRequested := len(familyPlanRequests) != 0 || *kbuildProbePlanOut != "" || *targetKbuildProbeResults != "" || len(actionPlanStageOutputs) != 0 || *actionPlanSnapshotOut != ""
+	resolvedConfigRequested := len(familyPlanRequests) != 0 || *resolvedConfigOut != "" || *resolvedAutoConfOut != "" || *resolvedCmdOut != "" || *resolvedAutoconfOut != "" || *resolvedRustcCfgOut != ""
+	kbuildPlanningRequested := len(familyPlanRequests) != 0 || *kbuildProbePlanOut != "" || *graphGuardProbePlanOut != "" || *sourceOutputProbePlanOut != "" || *featureDumpProbePlanOut != "" || *targetKbuildProbeResults != "" || len(actionPlanStageOutputs) != 0 || *actionPlanSnapshotOut != ""
 	if len(kbuildVars) != 0 && !kbuildPlanningRequested {
 		fmt.Fprintln(os.Stderr, "-kbuild_var requires Kbuild probe or action planning")
 		return 2
@@ -1885,7 +2108,7 @@ func run() (exitCode int) {
 	// paths may be execution-only artifacts and must not be inspected here.
 	if *probePlanOut != "" {
 		if *targetProbeResults != "" || *hostProbeResults != "" || *kconfigProbePlanOut != "" || *targetKconfigProbeResults != "" || *hostKconfigProbeResults != "" ||
-			*kbuildProbePlanOut != "" || *targetKbuildProbeResults != "" || *hostKbuildProbeResults != "" {
+			*kbuildProbePlanOut != "" || *graphGuardProbePlanOut != "" || *targetKbuildProbeResults != "" || *hostKbuildProbeResults != "" {
 			fmt.Fprintln(os.Stderr, "-probe_plan_out cannot be combined with probe result trees or staged Kconfig/Kbuild probe planning")
 			return 2
 		}
@@ -1936,11 +2159,91 @@ func run() (exitCode int) {
 		fmt.Fprintln(os.Stderr, "-kbuild_probe_plan_out cannot be combined with Kbuild probe result trees")
 		return 2
 	}
+	if *sourceOutputProbePlanOut != "" && *targetKbuildProbeResults != "" {
+		fmt.Fprintln(os.Stderr, "source-output probe discovery cannot read ordinary Kbuild probe results")
+		return 2
+	}
+	if *featureDumpProbePlanOut != "" && *targetKbuildProbeResults != "" {
+		fmt.Fprintln(os.Stderr, "feature-dump probe discovery cannot read ordinary Kbuild probe results")
+		return 2
+	}
+	if (*targetSourceOutputResults == "") != (*hostSourceOutputResults == "") ||
+		(*targetSourceOutputResults == "") != (*sourceOutputProbePlan == "") {
+		fmt.Fprintln(os.Stderr, "measured source-output probe results require both scope trees and their selected probe plan")
+		return 2
+	}
+	if *sourceOutputProbePlan != "" && *sourceOutputProbePlanOut == "" && *kbuildProbePlanOut == "" && *featureDumpProbePlanOut == "" && len(familyPlanRequests) == 0 {
+		fmt.Fprintln(os.Stderr, "measured source outputs require later source-output, feature-dump, or ordinary Kbuild probe discovery or family planning")
+		return 2
+	}
+	if (*targetFeatureDumpResults == "") != (*hostFeatureDumpResults == "") ||
+		(*targetFeatureDumpResults == "") != (*featureDumpProbePlan == "") {
+		fmt.Fprintln(os.Stderr, "measured feature-dump probe results require both scope trees and their selected probe plan")
+		return 2
+	}
+	if *featureDumpProbePlan != "" && *sourceOutputProbePlanOut == "" && *featureDumpProbePlanOut == "" && *kbuildProbePlanOut == "" && len(familyPlanRequests) == 0 {
+		fmt.Fprintln(os.Stderr, "measured feature dumps require later source-output, feature-dump, or ordinary Kbuild probe discovery or family planning")
+		return 2
+	}
+	if (*sourceOutputEarlierPlan != "" || *sourceOutputRequireConverged) && (*sourceOutputProbePlanOut == "" || *sourceOutputProbePlan == "") {
+		fmt.Fprintln(os.Stderr, "source-output convergence requires discovery output and a complete prior measured round")
+		return 2
+	}
+	if (*featureDumpEarlierPlan != "" || *featureDumpRequireConverged) && (*featureDumpProbePlanOut == "" || *featureDumpProbePlan == "") {
+		fmt.Fprintln(os.Stderr, "feature-dump convergence requires discovery output and a complete prior measured round")
+		return 2
+	}
+	pairedEarlierResultTrees := []string{
+		*pairedEarlierSourceHost, *pairedEarlierSourceTarget,
+		*pairedEarlierFeatureHost, *pairedEarlierFeatureTarget,
+	}
+	pairedEarlierProvided := *pairedEarlierSourcePlan != "" || *pairedEarlierFeaturePlan != ""
+	for _, tree := range pairedEarlierResultTrees {
+		pairedEarlierProvided = pairedEarlierProvided || tree != ""
+	}
+	if pairedEarlierProvided {
+		sourceRound := *sourceOutputProbePlanOut != "" && *featureDumpProbePlanOut == "" &&
+			*sourceOutputEarlierPlan != "" && *pairedEarlierFeaturePlan != "" && *pairedEarlierSourcePlan == ""
+		featureRound := *featureDumpProbePlanOut != "" && *sourceOutputProbePlanOut == "" &&
+			*featureDumpEarlierPlan != "" && *pairedEarlierSourcePlan != "" && *pairedEarlierFeaturePlan == ""
+		if !sourceRound && !featureRound || *sourceOutputProbePlan == "" || *featureDumpProbePlan == "" {
+			fmt.Fprintln(os.Stderr, "paired source/feature convergence requires exactly one staged discovery output and both complete prior plans")
+			return 2
+		}
+		for _, tree := range pairedEarlierResultTrees {
+			if tree == "" {
+				fmt.Fprintln(os.Stderr, "paired source/feature convergence requires four earlier scope result trees")
+				return 2
+			}
+		}
+	}
+	if (*targetGraphGuardProbeResults == "") != (*hostGraphGuardProbeResults == "") ||
+		(*targetGraphGuardProbeResults == "") != (*graphGuardProbePlan == "") {
+		fmt.Fprintln(os.Stderr, "pregraph probe results require both scope trees and their selected probe plan")
+		return 2
+	}
+	if *graphGuardProbePlanOut != "" && (*targetKbuildProbeResults != "" || *sourceOutputProbePlan != "" || *featureDumpProbePlan != "") {
+		fmt.Fprintln(os.Stderr, "pregraph probe discovery cannot read later source-output, feature-dump, or ordinary Kbuild probe results")
+		return 2
+	}
+	if (*graphGuardEarlierPlan != "" || *graphGuardRequireConverged) && (*graphGuardProbePlanOut == "" || *graphGuardProbePlan == "") {
+		fmt.Fprintln(os.Stderr, "graph guard convergence requires discovery output and a complete prior measured round")
+		return 2
+	}
+	if (*graphGuardEarlierPlan == "") != (*graphGuardEarlierHost == "") ||
+		(*graphGuardEarlierPlan == "") != (*graphGuardEarlierTarget == "") {
+		fmt.Fprintln(os.Stderr, "graph guard convergence requires an earlier plan and both earlier result scopes")
+		return 2
+	}
+	if *graphGuardProbePlan != "" && *graphGuardProbePlanOut == "" && *kbuildProbePlanOut == "" && *sourceOutputProbePlanOut == "" && *featureDumpProbePlanOut == "" && len(familyPlanRequests) == 0 {
+		fmt.Fprintln(os.Stderr, "pregraph probe results are only valid for source-output, feature-dump, ordinary Kbuild probe discovery, or family planning")
+		return 2
+	}
 	if (*targetKbuildProbeResults == "") != (*hostKbuildProbeResults == "") {
 		fmt.Fprintln(os.Stderr, "-target_kbuild_probe_results and -host_kbuild_probe_results must be supplied together")
 		return 2
 	}
-	if (*kbuildProbePlanOut != "" || *targetKbuildProbeResults != "") && *targetKconfigProbeResults == "" {
+	if (*kbuildProbePlanOut != "" || *graphGuardProbePlanOut != "" || *sourceOutputProbePlanOut != "" || *featureDumpProbePlanOut != "" || *targetKbuildProbeResults != "") && *targetKconfigProbeResults == "" {
 		fmt.Fprintln(os.Stderr, "Kbuild probe discovery and replay require replayed Kconfig probe results")
 		return 2
 	}
@@ -2012,6 +2315,11 @@ func run() (exitCode int) {
 	}
 	targetContract.MakeVariables = maps.Clone(targetManifest.MakeVariables)
 	hostContract.MakeVariables = maps.Clone(hostManifest.MakeVariables)
+	hostContract.PkgConfigManifest, err = selectedHostPkgConfigManifest(hostContract, *pkgConfigManifest)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid selected host pkg-config manifest: %v\n", err)
+		return 2
+	}
 	if *srctree == "" {
 		fmt.Fprintln(os.Stderr, "selected Linux tools require -srctree for source-derived architecture selection")
 		return 2
@@ -2074,6 +2382,192 @@ func run() (exitCode int) {
 	vars["ARCH"] = selectedTarget.Arch
 	vars["SRCARCH"] = selectedTarget.Srcarch
 	identityVariables := addKbuildOnlyVariables(vars, kbuildVars)
+	var measuredSourcePlan *kconfig.ProbePlan
+	var measuredSourceOracle *kconfig.ProbeResultOracle
+	if *sourceOutputProbePlan != "" {
+		measuredSourcePlan, err = kconfig.ReadProbePlan(workspacePath(*sourceOutputProbePlan))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read selected source-output probe plan: %v\n", err)
+			return 2
+		}
+		measuredSourceOracle, err = kconfig.NewProbeResultOracleFromTrees(
+			map[string]string{"target": workspacePath(*targetSourceOutputResults), "host": workspacePath(*hostSourceOutputResults)},
+			map[string]string{"target": targetIdentity, "host": hostIdentity},
+		)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read selected source-output probe results: %v\n", err)
+			return 2
+		}
+		if err := measuredSourceOracle.ValidatePlan(measuredSourcePlan); err != nil {
+			fmt.Fprintf(os.Stderr, "validate selected source-output probe results: %v\n", err)
+			return 2
+		}
+	}
+	var measuredFeaturePlan *kconfig.ProbePlan
+	var measuredFeatureResults *kconfig.KbuildGraphGuardResults
+	if *featureDumpProbePlan != "" {
+		selected, readErr := kconfig.ReadProbePlan(workspacePath(*featureDumpProbePlan))
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "read selected feature-dump probe plan: %v\n", readErr)
+			return 2
+		}
+		sealed, readErr := kconfig.NewProbeResultOracleFromTrees(
+			map[string]string{"target": workspacePath(*targetFeatureDumpResults), "host": workspacePath(*hostFeatureDumpResults)},
+			map[string]string{"target": targetIdentity, "host": hostIdentity},
+		)
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "read selected feature-dump probe results: %v\n", readErr)
+			return 2
+		}
+		measuredFeatureResults, readErr = kconfig.NewKbuildGraphGuardResults(selected, sealed)
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "validate selected feature-dump probe results: %v\n", readErr)
+			return 2
+		}
+		measuredFeaturePlan = selected
+	}
+	// Family replay and ordinary Kbuild discovery must select the same
+	// source-guarded Make assignments before expanding exported variables.
+	var graphGuardResults *kconfig.KbuildGraphGuardResults
+	var measuredGraphGuardPlan *kconfig.ProbePlan
+	if *graphGuardProbePlan != "" {
+		guardPlan, guardErr := kconfig.ReadProbePlan(workspacePath(*graphGuardProbePlan))
+		if guardErr != nil {
+			fmt.Fprintf(os.Stderr, "read pregraph source probe plan: %v\n", guardErr)
+			return 2
+		}
+		guardOracle, guardErr := kconfig.NewProbeResultOracleFromTrees(
+			map[string]string{"target": workspacePath(*targetGraphGuardProbeResults), "host": workspacePath(*hostGraphGuardProbeResults)},
+			map[string]string{"target": targetIdentity, "host": hostIdentity},
+		)
+		if guardErr != nil {
+			fmt.Fprintf(os.Stderr, "read pregraph source probe results: %v\n", guardErr)
+			return 2
+		}
+		graphGuardResults, guardErr = kconfig.NewKbuildGraphGuardResults(guardPlan, guardOracle)
+		if guardErr != nil {
+			fmt.Fprintf(os.Stderr, "validate pregraph source probe results: %v\n", guardErr)
+			return 2
+		}
+		measuredGraphGuardPlan = guardPlan
+	}
+	var earlierGraphGuardPlan *kconfig.ProbePlan
+	if *graphGuardEarlierPlan != "" {
+		earlierGraphGuardPlan, err = kconfig.ReadProbePlan(workspacePath(*graphGuardEarlierPlan))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read earlier pregraph source probe plan: %v\n", err)
+			return 2
+		}
+		if err := validateEarlierKbuildGraphGuardRound(earlierGraphGuardPlan, measuredGraphGuardPlan); err != nil {
+			fmt.Fprintf(os.Stderr, "validate earlier pregraph source probe round: %v\n", err)
+			return 2
+		}
+	}
+	if *graphGuardProbePlanOut != "" && earlierGraphGuardPlan != nil {
+		converged, compareErr := sameKbuildSelectedProbeRoundEvidence(
+			"source graph guard",
+			kbuildSelectedProbeRoundEvidence{earlierGraphGuardPlan,
+				workspacePath(*graphGuardEarlierHost), workspacePath(*graphGuardEarlierTarget)},
+			kbuildSelectedProbeRoundEvidence{measuredGraphGuardPlan,
+				workspacePath(*hostGraphGuardProbeResults), workspacePath(*targetGraphGuardProbeResults)},
+		)
+		if compareErr != nil {
+			fmt.Fprintf(os.Stderr, "verify source graph guard convergence: %v\n", compareErr)
+			return 2
+		}
+		if converged {
+			// The selected plan and every measured answer agree across two
+			// rounds, so another source evaluation sees the same guard input.
+			if err := measuredGraphGuardPlan.Write(workspacePath(*graphGuardProbePlanOut)); err != nil {
+				fmt.Fprintf(os.Stderr, "write converged pregraph source probe plan: %v\n", err)
+				return 1
+			}
+			return 0
+		}
+	}
+	var earlierSourceRound, earlierFeatureRound *kconfig.ProbePlan
+	for _, round := range []struct {
+		name, earlier, output string
+		measured              *kconfig.ProbePlan
+	}{
+		{name: "source-output", earlier: *sourceOutputEarlierPlan, output: *sourceOutputProbePlanOut, measured: measuredSourcePlan},
+		{name: "feature-dump", earlier: *featureDumpEarlierPlan, output: *featureDumpProbePlanOut, measured: measuredFeaturePlan},
+	} {
+		if round.earlier == "" {
+			continue
+		}
+		earlier, readErr := kconfig.ReadProbePlan(workspacePath(round.earlier))
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "read earlier %s probe plan: %v\n", round.name, readErr)
+			return 2
+		}
+		if readErr := validateEarlierKbuildSelectedProbeRound(earlier, round.measured, round.name); readErr != nil {
+			fmt.Fprintf(os.Stderr, "validate earlier %s probe round: %v\n", round.name, readErr)
+			return 2
+		}
+		if round.name == "source-output" {
+			earlierSourceRound = earlier
+		} else {
+			earlierFeatureRound = earlier
+		}
+		// Equal consecutive same-type plans do not prove convergence: a newly
+		// measured request in the other stage can reveal a later source writer.
+	}
+	if pairedEarlierProvided {
+		for _, round := range []struct {
+			name, input string
+			measured    *kconfig.ProbePlan
+			earlier     **kconfig.ProbePlan
+		}{
+			{"source-output", *pairedEarlierSourcePlan, measuredSourcePlan, &earlierSourceRound},
+			{"feature-dump", *pairedEarlierFeaturePlan, measuredFeaturePlan, &earlierFeatureRound},
+		} {
+			if round.input == "" {
+				continue
+			}
+			plan, readErr := kconfig.ReadProbePlan(workspacePath(round.input))
+			if readErr != nil {
+				fmt.Fprintf(os.Stderr, "read earlier paired %s probe plan: %v\n", round.name, readErr)
+				return 2
+			}
+			if readErr = validateEarlierKbuildSelectedProbeRound(plan, round.measured, round.name); readErr != nil {
+				fmt.Fprintf(os.Stderr, "validate earlier paired %s probe round: %v\n", round.name, readErr)
+				return 2
+			}
+			*round.earlier = plan
+		}
+		converged, compareErr := sameKbuildSelectedPairedRounds(
+			kbuildSelectedProbeRoundEvidence{earlierSourceRound,
+				workspacePath(*pairedEarlierSourceHost), workspacePath(*pairedEarlierSourceTarget)},
+			kbuildSelectedProbeRoundEvidence{measuredSourcePlan,
+				workspacePath(*hostSourceOutputResults), workspacePath(*targetSourceOutputResults)},
+			kbuildSelectedProbeRoundEvidence{earlierFeatureRound,
+				workspacePath(*pairedEarlierFeatureHost), workspacePath(*pairedEarlierFeatureTarget)},
+			kbuildSelectedProbeRoundEvidence{measuredFeaturePlan,
+				workspacePath(*hostFeatureDumpResults), workspacePath(*targetFeatureDumpResults)},
+		)
+		if compareErr != nil {
+			fmt.Fprintf(os.Stderr, "verify paired source/feature convergence: %v\n", compareErr)
+			return 2
+		}
+		if converged {
+			var output string
+			var prior *kconfig.ProbePlan
+			if *sourceOutputProbePlanOut != "" {
+				output, prior = *sourceOutputProbePlanOut, measuredSourcePlan
+			} else {
+				output, prior = *featureDumpProbePlanOut, measuredFeaturePlan
+			}
+			// Both selected request sets and every measured answer in the paired
+			// frontier are unchanged. The following source parse sees precisely
+			// the same inputs; retain its already sealed selected plan.
+			if writeErr := prior.Write(workspacePath(output)); writeErr != nil {
+				fmt.Fprintf(os.Stderr, "write converged paired probe plan: %v\n", writeErr)
+				return 1
+			}
+			return 0
+		}
+	}
 	if len(familyPlanRequests) != 0 {
 		if *targetKbuildProbeResults == "" {
 			fmt.Fprintln(os.Stderr, "family planning requires staged target and host Kbuild probe results")
@@ -2145,13 +2639,17 @@ func run() (exitCode int) {
 				configMode: *configMode, variables: maps.Clone(vars), identityVariables: maps.Clone(identityVariables), sourceRoots: sourceRoots,
 				sourceNamespaces: sourceNamespaces,
 				objectRoot:       *objectRoot, objectNamespace: *objectNamespace,
-				entryTargets: kbuildTargets, preparationTargets: kbuildPreparationTargets,
+				entryTargets: kbuildTargets, preparationTargets: kbuildPreparationTargets, preparationCandidates: kbuildPreparationCandidates,
 				selectedProductsOnly:      *selectedProductsOnly,
 				analyzeConfigDependencies: true,
 				guardDiscoveryOnly:        guardDiscoveryOnly,
+				graphGuardResults:         graphGuardResults,
 				familyPlanningCache:       familyPlanningCache,
 				familyVariantOptions:      familyExecutionPipeline.variantOptions(request.name, familyPlanningCache),
 				familyCompilerGuards:      guardPipeline,
+				sourceOutputPlan:          measuredSourcePlan,
+				sourceOutputOracle:        measuredSourceOracle,
+				featureDumpResults:        measuredFeatureResults,
 				kbuildInputCache:          kbuildInputCache,
 				kernelVersion:             *kernelVersion, target: selectedTarget,
 				targetFacts: targetCompilerFacts, hostFacts: hostCompilerFacts,
@@ -2182,7 +2680,7 @@ func run() (exitCode int) {
 				fmt.Fprintf(os.Stderr, "failed to write family variant %s source-derived Linux ARCH: %v\n", request.name, err)
 				return 1
 			}
-			if err := writeResolvedConfigOutputs(tree, value.resolved, request.resolved, *kernelVersion); err != nil {
+			if err := writeResolvedConfigOutputs(tree, value.resolved, request.resolved); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to write family variant %s resolved config: %v\n", request.name, err)
 				return 1
 			}
@@ -2191,7 +2689,7 @@ func run() (exitCode int) {
 				request.snapshot,
 				value.actionPlan,
 				value.configDependencies,
-				resolvedConfigObjectTreeContents(tree, value.resolved, *kernelVersion),
+				resolvedConfigObjectTreeContents(tree, value.resolved),
 			); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to write family variant %s action-plan snapshot: %v\n", request.name, err)
 				return 1
@@ -2216,7 +2714,7 @@ func run() (exitCode int) {
 		return 0
 	}
 
-	if *kbuildProbePlanOut != "" || *targetKbuildProbeResults != "" {
+	if *kbuildProbePlanOut != "" || *graphGuardProbePlanOut != "" || *sourceOutputProbePlanOut != "" || *featureDumpProbePlanOut != "" || *targetKbuildProbeResults != "" {
 		if *resolveConfig == "" {
 			fmt.Fprintln(os.Stderr, "-resolve_config PATH is required for staged Kbuild probes")
 			return 2
@@ -2241,19 +2739,85 @@ func run() (exitCode int) {
 			configMode: *configMode, variables: vars, identityVariables: identityVariables, sourceRoots: sourceRoots,
 			sourceNamespaces: sourceNamespaces,
 			objectRoot:       *objectRoot, objectNamespace: *objectNamespace,
-			entryTargets: kbuildTargets, preparationTargets: kbuildPreparationTargets,
+			entryTargets: kbuildTargets, preparationTargets: kbuildPreparationTargets, preparationCandidates: kbuildPreparationCandidates,
 			selectedProductsOnly:      *selectedProductsOnly,
 			analyzeConfigDependencies: *actionPlanSnapshotOut != "",
 			kbuildInputCache:          kbuildInputCache,
 			kernelVersion:             *kernelVersion, target: selectedTarget,
 			targetFacts: targetCompilerFacts, hostFacts: hostCompilerFacts,
 			targetContract: targetContract, hostContract: hostContract,
-			rustSourceRoot:       rustSourceRoot,
-			normalizeConfigValue: kconfigEvaluation.normalizeToolsetPathCapabilities,
+			rustSourceRoot:            rustSourceRoot,
+			normalizeConfigValue:      kconfigEvaluation.normalizeToolsetPathCapabilities,
+			graphGuardDiscoveryOnly:   *graphGuardProbePlanOut != "",
+			graphGuardResults:         graphGuardResults,
+			sourceOutputDiscoveryOnly: *sourceOutputProbePlanOut != "",
+			sourceOutputPlan:          measuredSourcePlan,
+			sourceOutputOracle:        measuredSourceOracle,
+			featureDumpDiscoveryOnly:  *featureDumpProbePlanOut != "",
+			featureDumpResults:        measuredFeatureResults,
 		}, oracle)
 		if evaluateErr != nil {
 			fmt.Fprintf(os.Stderr, "failed to evaluate Kbuild probes: %v\n", evaluateErr)
 			return 1
+		}
+		if *graphGuardProbePlanOut != "" {
+			terminalIDs := make([]string, 0, len(evaluation.Value.graphGuardReferences))
+			for _, reference := range evaluation.Value.graphGuardReferences {
+				terminalIDs = append(terminalIDs, reference.NodeID)
+			}
+			selected, selectedErr := kconfig.SelectProbePlanTerminals(evaluation.Plan, terminalIDs)
+			if selectedErr != nil {
+				fmt.Fprintf(os.Stderr, "select source-derived graph guard probes: %v\n", selectedErr)
+				return 1
+			}
+			selected, selectedErr = nextKbuildGraphGuardRound(measuredGraphGuardPlan, selected, *graphGuardRequireConverged)
+			if selectedErr != nil {
+				fmt.Fprintf(os.Stderr, "extend source-derived graph guard probe plan: %v\n", selectedErr)
+				return 1
+			}
+			if selectedErr = selected.Write(workspacePath(*graphGuardProbePlanOut)); selectedErr != nil {
+				fmt.Fprintf(os.Stderr, "write source-derived graph guard probe plan: %v\n", selectedErr)
+				return 1
+			}
+			return 0
+		}
+		if *sourceOutputProbePlanOut != "" {
+			selected, selectedErr := kconfig.SelectProbePlanTerminals(
+				evaluation.Plan, evaluation.Value.sourceOutputRequestIDs,
+			)
+			if selectedErr != nil {
+				fmt.Fprintf(os.Stderr, "select source-derived causal output probes: %v\n", selectedErr)
+				return 1
+			}
+			selected, selectedErr = nextKbuildSelectedProbeRound(measuredSourcePlan, selected, "source-output", *sourceOutputRequireConverged)
+			if selectedErr != nil {
+				fmt.Fprintf(os.Stderr, "extend causal source-output probe plan: %v\n", selectedErr)
+				return 1
+			}
+			if selectedErr = selected.Write(workspacePath(*sourceOutputProbePlanOut)); selectedErr != nil {
+				fmt.Fprintf(os.Stderr, "write source-derived causal output probe plan: %v\n", selectedErr)
+				return 1
+			}
+			return 0
+		}
+		if *featureDumpProbePlanOut != "" {
+			selected, selectedErr := kconfig.SelectProbePlanTerminals(
+				evaluation.Plan, evaluation.Value.featureDumpRequestIDs,
+			)
+			if selectedErr != nil {
+				fmt.Fprintf(os.Stderr, "select source-derived feature-dump probes: %v\n", selectedErr)
+				return 1
+			}
+			selected, selectedErr = nextKbuildSelectedProbeRound(measuredFeaturePlan, selected, "feature-dump", *featureDumpRequireConverged)
+			if selectedErr != nil {
+				fmt.Fprintf(os.Stderr, "extend selected feature-dump probe plan: %v\n", selectedErr)
+				return 1
+			}
+			if selectedErr = selected.Write(workspacePath(*featureDumpProbePlanOut)); selectedErr != nil {
+				fmt.Fprintf(os.Stderr, "write source-derived feature-dump probe plan: %v\n", selectedErr)
+				return 1
+			}
+			return 0
 		}
 		if *kbuildProbePlanOut != "" {
 			if err := evaluation.Plan.Write(workspacePath(*kbuildProbePlanOut)); err != nil {
@@ -2279,18 +2843,17 @@ func run() (exitCode int) {
 
 	if resolvedConfigRequested {
 		outputs := resolvedConfigOutputs{
-			config:        *resolvedConfigOut,
-			autoConf:      *resolvedAutoConfOut,
-			autoConfCmd:   *resolvedCmdOut,
-			autoconf:      *resolvedAutoconfOut,
-			rustcCfg:      *resolvedRustcCfgOut,
-			kernelRelease: *resolvedReleaseOut,
+			config:      *resolvedConfigOut,
+			autoConf:    *resolvedAutoConfOut,
+			autoConfCmd: *resolvedCmdOut,
+			autoconf:    *resolvedAutoconfOut,
+			rustcCfg:    *resolvedRustcCfgOut,
 		}
 		var err error
 		if kbuildResolvedConfig != nil {
-			err = writeResolvedConfigOutputs(tree, kbuildResolvedConfig, outputs, *kernelVersion)
+			err = writeResolvedConfigOutputs(tree, kbuildResolvedConfig, outputs)
 		} else {
-			err = writeResolvedConfig(tree, *resolveConfig, resolveConfigOverlays, *configMode, outputs, *kernelVersion, kconfigEvaluation.normalizeToolsetPathCapabilities)
+			err = writeResolvedConfig(tree, *resolveConfig, resolveConfigOverlays, *configMode, outputs, kconfigEvaluation.normalizeToolsetPathCapabilities)
 		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to write resolved config: %v\n", err)
@@ -2315,7 +2878,7 @@ func run() (exitCode int) {
 		}
 		configFiles, err := readResolvedConfigSnapshotFiles(resolvedConfigOutputs{
 			config: *resolvedConfigOut, autoConf: *resolvedAutoConfOut, autoConfCmd: *resolvedCmdOut,
-			autoconf: *resolvedAutoconfOut, rustcCfg: *resolvedRustcCfgOut, kernelRelease: *resolvedReleaseOut,
+			autoconf: *resolvedAutoconfOut, rustcCfg: *resolvedRustcCfgOut,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to read resolved config projections for action-plan snapshot: %v\n", err)
@@ -2332,22 +2895,20 @@ func run() (exitCode int) {
 }
 
 type resolvedConfigOutputs struct {
-	config        string
-	autoConf      string
-	autoConfCmd   string
-	autoconf      string
-	rustcCfg      string
-	kernelRelease string
+	config      string
+	autoConf    string
+	autoConfCmd string
+	autoconf    string
+	rustcCfg    string
 }
 
 func readResolvedConfigSnapshotFiles(outputs resolvedConfigOutputs) (map[string]string, error) {
 	paths := map[string]string{
-		".config":                       outputs.config,
-		"include/config/auto.conf":      outputs.autoConf,
-		"include/config/auto.conf.cmd":  outputs.autoConfCmd,
-		"include/generated/autoconf.h":  outputs.autoconf,
-		"include/generated/rustc_cfg":   outputs.rustcCfg,
-		"include/config/kernel.release": outputs.kernelRelease,
+		".config":                      outputs.config,
+		"include/config/auto.conf":     outputs.autoConf,
+		"include/config/auto.conf.cmd": outputs.autoConfCmd,
+		"include/generated/autoconf.h": outputs.autoconf,
+		"include/generated/rustc_cfg":  outputs.rustcCfg,
 	}
 	files := make(map[string]string, len(paths))
 	for logical, filename := range paths {
@@ -2373,19 +2934,17 @@ func writeResolvedConfig(
 	overlays []string,
 	configMode string,
 	outputs resolvedConfigOutputs,
-	kernelVersion string,
 	normalizeConfigValue func(string) (string, error),
 ) error {
 	if input == "" {
 		return fmt.Errorf("-resolve_config is required when resolved config outputs are requested")
 	}
 	missing := map[string]string{
-		"-resolved_config_out":         outputs.config,
-		"-resolved_auto_conf_out":      outputs.autoConf,
-		"-resolved_auto_conf_cmd_out":  outputs.autoConfCmd,
-		"-resolved_autoconf_out":       outputs.autoconf,
-		"-resolved_rustc_cfg_out":      outputs.rustcCfg,
-		"-resolved_kernel_release_out": outputs.kernelRelease,
+		"-resolved_config_out":        outputs.config,
+		"-resolved_auto_conf_out":     outputs.autoConf,
+		"-resolved_auto_conf_cmd_out": outputs.autoConfCmd,
+		"-resolved_autoconf_out":      outputs.autoconf,
+		"-resolved_rustc_cfg_out":     outputs.rustcCfg,
 	}
 	var missingFlags []string
 	for flagName, path := range missing {
@@ -2413,7 +2972,7 @@ func writeResolvedConfig(
 	if err := normalizeResolvedConfigValues(resolved, normalizeConfigValue); err != nil {
 		return err
 	}
-	return writeResolvedConfigOutputs(tree, resolved, outputs, kernelVersion)
+	return writeResolvedConfigOutputs(tree, resolved, outputs)
 }
 
 // readConfigFlags parses one base configuration and applies overlays in order.
@@ -2630,7 +3189,6 @@ func kbuildConfigValue(tree *kconfig.Tree, key, value string) string {
 func resolvedConfigObjectTreeContents(
 	tree *kconfig.Tree,
 	resolved *kconfig.ResolvedConfig,
-	kernelVersion string,
 ) map[string]string {
 	keys := make([]string, 0, len(resolved.Effective))
 	for key := range resolved.Effective {
@@ -2662,31 +3220,31 @@ func resolvedConfigObjectTreeContents(
 			}
 		}
 		if value != "" || (symbol != nil && symbol.Type == kconfig.SymbolString) {
-			autoConfLines = append(autoConfLines, key+"="+kbuildConfigValue(tree, key, value))
+			// Linux's generated auto.conf keeps string quotes and escaping:
+			// source scripts execute this file as shell assignments. Dropping
+			// quotes would turn a string such as "(none)" into shell syntax.
+			autoConfLines = append(autoConfLines, key+"="+value)
 		}
 	}
 	headerLines = append(headerLines, "#endif")
 
-	localVersion := strings.Trim(resolved.Effective["CONFIG_LOCALVERSION"], `"`)
 	return map[string]string{
-		".config":                       strings.Join(configLines, "\n") + "\n",
-		"include/config/auto.conf":      strings.Join(autoConfLines, "\n") + "\n",
-		"include/config/auto.conf.cmd":  "cmd_include/config/auto.conf := bazel kconfig_parse -resolve_config\n",
-		"include/config/kernel.release": kernelVersion + localVersion + "\n",
-		"include/generated/autoconf.h":  strings.Join(headerLines, "\n") + "\n",
-		"include/generated/rustc_cfg":   strings.Join(rustcCfgLines(tree, resolved), "\n") + "\n",
+		".config":                      strings.Join(configLines, "\n") + "\n",
+		"include/config/auto.conf":     strings.Join(autoConfLines, "\n") + "\n",
+		"include/config/auto.conf.cmd": "cmd_include/config/auto.conf := bazel kconfig_parse -resolve_config\n",
+		"include/generated/autoconf.h": strings.Join(headerLines, "\n") + "\n",
+		"include/generated/rustc_cfg":  strings.Join(rustcCfgLines(tree, resolved), "\n") + "\n",
 	}
 }
 
-func writeResolvedConfigOutputs(tree *kconfig.Tree, resolved *kconfig.ResolvedConfig, outputs resolvedConfigOutputs, kernelVersion string) error {
-	contents := resolvedConfigObjectTreeContents(tree, resolved, kernelVersion)
+func writeResolvedConfigOutputs(tree *kconfig.Tree, resolved *kconfig.ResolvedConfig, outputs resolvedConfigOutputs) error {
+	contents := resolvedConfigObjectTreeContents(tree, resolved)
 	files := map[string]string{
-		outputs.config:        contents[".config"],
-		outputs.autoConf:      contents["include/config/auto.conf"],
-		outputs.autoConfCmd:   contents["include/config/auto.conf.cmd"],
-		outputs.autoconf:      contents["include/generated/autoconf.h"],
-		outputs.rustcCfg:      contents["include/generated/rustc_cfg"],
-		outputs.kernelRelease: contents["include/config/kernel.release"],
+		outputs.config:      contents[".config"],
+		outputs.autoConf:    contents["include/config/auto.conf"],
+		outputs.autoConfCmd: contents["include/config/auto.conf.cmd"],
+		outputs.autoconf:    contents["include/generated/autoconf.h"],
+		outputs.rustcCfg:    contents["include/generated/rustc_cfg"],
 	}
 	for path, content := range files {
 		if err := os.WriteFile(workspacePath(path), []byte(content), 0o644); err != nil {
@@ -2724,6 +3282,7 @@ func compactMetadata(
 	objectNamespace string,
 	entryTargets []string,
 	preparationTargets []string,
+	preparationCandidates []string,
 	selectedProductsOnly bool,
 	kbuildInputCache *kbuildInvocationInputCache,
 	kernelVersion string,
@@ -2731,6 +3290,9 @@ func compactMetadata(
 	hostContract *hostKbuildContract,
 	probeScopes *kconfig.KbuildProbeScopes,
 	normalizeConfigValue func(string) (string, error),
+	graphGuardOnly bool,
+	graphGuards *[]string,
+	selectedOutputMeasurement ...kbuildSelectedSourceOutputMeasurement,
 ) (*kconfig.CompactMetadata, *kconfig.ResolvedConfig, error) {
 	if probeScopes == nil {
 		return nil, nil, fmt.Errorf("action-plan generation requires symbolic Kbuild probes")
@@ -2751,6 +3313,10 @@ func compactMetadata(
 	preparationTargets, err = canonicalKbuildPreparationTargets(preparationTargets)
 	if err != nil {
 		return nil, nil, err
+	}
+	preparationCandidates, err = canonicalKbuildPreparationTargets(preparationCandidates)
+	if err != nil {
+		return nil, nil, fmt.Errorf("canonicalize optional source preparation markers: %w", err)
 	}
 	flags := maps.Clone(configFlags)
 	if flags == nil {
@@ -2815,7 +3381,10 @@ func compactMetadata(
 	if len(entryTargets) == 0 {
 		entryTargets = []string{"all"}
 	}
-	entryTargets = uniquePathsInOrder(append(append([]string(nil), entryTargets...), preparationTargets...))
+	// Preparation markers describe actual source-selected goal ancestry.
+	// They do not add goals to MAKECMDGOALS: a conditional modules_prepare
+	// declaration can be absent in a configured kernel with no modules.
+	entryTargets = uniquePathsInOrder(entryTargets)
 	commandLineVariables, err := kbuildCommandLineVariables(targetContract, hostContract, vars)
 	if err != nil {
 		return nil, nil, err
@@ -2835,14 +3404,16 @@ func compactMetadata(
 			return kconfig.CompactConfigGraph{}, fmt.Errorf("resolve hermetic Kbuild source root: %w", err)
 		}
 		kbuildOpts, err := probeScopes.Options("target", kconfig.KbuildOptions{
-			Variables:                      kbuildVars,
-			CommandLineVariables:           commandLineVariables,
-			AutoExportCommandLineVariables: kbuildConfiguredCommandLineAutoExports(vars, targetContract, hostContract),
-			SourceRoots:                    sourceRoots,
-			ConfigVariablesComplete:        true,
-			MakeVariablesComplete:          true,
+			Variables:                         kbuildVars,
+			ActionRoles:                       opts.ActionRoles,
+			CommandLineVariables:              commandLineVariables,
+			SyntheticToolCommandLineVariables: kbuildSyntheticToolRoleCommandLineVariables(targetContract, hostContract, vars),
+			AutoExportCommandLineVariables:    kbuildConfiguredCommandLineAutoExports(vars, targetContract, hostContract),
+			SourceRoots:                       sourceRoots,
+			ConfigVariablesComplete:           true,
+			MakeVariablesComplete:             true,
 			Shell: func(command string) (string, error) {
-				return hermeticLinuxKbuildShell(command, hermeticSourceRoot, targetContract, hostContract)
+				return hermeticLinuxKbuildShell(command, hermeticSourceRoot)
 			},
 		})
 		if err != nil {
@@ -2858,20 +3429,70 @@ func compactMetadata(
 				}
 				byScope[scope] = scoped
 			}
-			return probeScopes.BindExactScriptEnvironments(byScope)
+			// The selected source writer runs in this target Make invocation and
+			// observes all exports, including host roles filtered from ordinary
+			// target probes. Bind its complete snapshot to this profile activation.
+			return probeScopes.BindExactScriptEnvironments(byScope, exported)
 		}
-		resolvedConfigContents := resolvedConfigObjectTreeContents(tree, resolved, kernelVersion)
-		profiles, selections, imageTarget, parseErr := evaluatedKbuildProfilesWithGeneratedContent(
+		resolvedConfigContents := resolvedConfigObjectTreeContents(tree, resolved)
+		var sourceOutputPlan *kconfig.ProbePlan
+		var sourceOutputOracle *kconfig.ProbeResultOracle
+		var sourceOutputDiscoveryOnly bool
+		var featureMeasurement kbuildSelectedSourceOutputMeasurement
+		if len(selectedOutputMeasurement) != 0 {
+			featureMeasurement = selectedOutputMeasurement[0]
+			sourceOutputPlan = featureMeasurement.plan
+			sourceOutputOracle = featureMeasurement.oracle
+			sourceOutputDiscoveryOnly = featureMeasurement.discoveryOnly
+		}
+		var selectedSourceOutput kbuildSelectedSourceOutputResolver
+		if !graphGuardOnly {
+			selectedSourceOutput = linuxKbuildSelectedSourceOutputResolver(
+				probeScopes, resolvedConfigContents, sourceOutputPlan, sourceOutputOracle,
+				sourceOutputDiscoveryOnly,
+			)
+		}
+		profiles, selections, imageTarget, parseErr := evaluatedKbuildProfilesWithGeneratedContentAndCandidates(
 			rootDir, objectRoot, entryTargets, preparationTargets, kbuildVars, kbuildOpts, bindProbeEnvironment,
 			linuxKbuildGeneratedContentResolver(
 				probeScopes, resolvedConfigContents, rootDir, objectRoot, opts.PreconfiguredObjectTree,
 			),
 			resolvedConfigContents,
 			kbuildInputCache,
-			opts.PreconfiguredObjectTree,
+			opts.PreconfiguredObjectTree, graphGuardOnly, preparationCandidates,
+			kbuildInvocationMeasurements{
+				sourceOutput: selectedSourceOutput,
+				featureDump:  featureMeasurement.selectedFeaturePass(probeScopes),
+			},
 		)
 		if parseErr != nil {
 			return kconfig.CompactConfigGraph{}, parseErr
+		}
+		if graphGuardOnly {
+			if graphGuards == nil {
+				return kconfig.CompactConfigGraph{}, fmt.Errorf("pregraph Kbuild discovery has no guard collector")
+			}
+			for _, profile := range profiles {
+				*graphGuards = append(*graphGuards, kconfig.CompactKbuildGraphGuards(profile)...)
+			}
+			return kconfig.CompactConfigGraph{}, nil
+		}
+		for _, profile := range profiles {
+			if len(profile.SelectedSourceScriptPhases) == 0 {
+				continue
+			}
+			if opts.PreconfiguredObjectTree {
+				return kconfig.CompactConfigGraph{}, fmt.Errorf(
+					"selected source script phases require a generated, source-authenticated auto.conf",
+				)
+			}
+			if err := kconfig.ValidateCompactKbuildLinkVmlinuxAutoConf(
+				resolvedConfigContents["include/config/auto.conf"],
+			); err != nil {
+				return kconfig.CompactConfigGraph{}, fmt.Errorf(
+					"selected source script %s repeated auto.conf import: %w", profile.Name, err,
+				)
+			}
 		}
 		deferredSelections, parseErr := kconfig.KbuildDeferredContentSelections(profiles)
 		if parseErr != nil {
@@ -2924,14 +3545,44 @@ func evaluatedKbuildProfilesWithGeneratedContent(
 	immutableContents map[string]string,
 	kbuildInputCache *kbuildInvocationInputCache,
 	preconfiguredObjectTree bool,
+	rootOnly ...bool,
+) ([]kconfig.CompactKbuildProfile, []kconfig.CompactKbuildSelection, string, error) {
+	return evaluatedKbuildProfilesWithGeneratedContentAndCandidates(
+		rootDir, objectRoot, entryTargets, preparationTargets, variables, baseOptions,
+		bindProbeEnvironment, generatedContent, immutableContents, kbuildInputCache,
+		preconfiguredObjectTree, len(rootOnly) != 0 && rootOnly[0], nil,
+	)
+}
+
+func evaluatedKbuildProfilesWithGeneratedContentAndCandidates(
+	rootDir string,
+	objectRoot string,
+	entryTargets []string,
+	preparationTargets []string,
+	variables map[string]string,
+	baseOptions kconfig.KbuildOptions,
+	bindProbeEnvironment func(map[string]string) (func() error, error),
+	generatedContent kbuildGeneratedContentResolver,
+	immutableContents map[string]string,
+	kbuildInputCache *kbuildInvocationInputCache,
+	preconfiguredObjectTree bool,
+	rootOnly bool,
+	preparationCandidates []string,
+	measurements ...kbuildInvocationMeasurements,
 ) ([]kconfig.CompactKbuildProfile, []kconfig.CompactKbuildSelection, string, error) {
 	if rootDir == "" {
 		return nil, nil, "", nil
 	}
 	rootDir = filepath.Clean(rootDir)
+	var sourceOutput kbuildSelectedSourceOutputResolver
+	var featureDump *kbuildSelectedFeatureDump
+	if len(measurements) != 0 {
+		sourceOutput = measurements[0].sourceOutput
+		featureDump = measurements[0].featureDump
+	}
 	profiles, selections, imageTarget, err := evaluatedKbuildInvocationProfiles(
 		rootDir, objectRoot, entryTargets, preparationTargets, variables, baseOptions, bindProbeEnvironment, generatedContent,
-		immutableContents, kbuildInputCache, preconfiguredObjectTree,
+		immutableContents, kbuildInputCache, preconfiguredObjectTree, rootOnly, preparationCandidates, sourceOutput, featureDump,
 	)
 	if err != nil {
 		return nil, nil, "", err
@@ -2962,8 +3613,12 @@ func evaluatedKbuildInvocationProfiles(
 	immutableContents map[string]string,
 	kbuildInputCache *kbuildInvocationInputCache,
 	preconfiguredObjectTree bool,
+	rootOnly bool,
+	preparationCandidates []string,
+	selectedSourceOutput kbuildSelectedSourceOutputResolver,
+	featureDump *kbuildSelectedFeatureDump,
 ) ([]kconfig.CompactKbuildProfile, []kconfig.CompactKbuildSelection, string, error) {
-	if err := validateConfiguredKbuildInputs(variables, nil, entryTargets, preparationTargets); err != nil {
+	if err := validateConfiguredKbuildInputs(variables, nil, entryTargets, preparationTargets, preparationCandidates); err != nil {
 		return nil, nil, "", fmt.Errorf("configure Kbuild root invocation: %w", err)
 	}
 	for _, input := range []struct {
@@ -2991,6 +3646,7 @@ func evaluatedKbuildInvocationProfiles(
 	sourceOverlayDirectories := kbuildFrontierSourceOverlayDirectories(baseOptions.SourceRoots)
 	immutableContents = maps.Clone(immutableContents)
 	dispatchCommandLine := cloneKbuildVariables(baseOptions.CommandLineVariables)
+	dispatchSyntheticTools := maps.Clone(baseOptions.SyntheticToolCommandLineVariables)
 	dispatchAutoExport := map[string]bool{}
 	if baseOptions.AutoExportCommandLineVariables == nil {
 		for name := range dispatchCommandLine {
@@ -3011,6 +3667,7 @@ func evaluatedKbuildInvocationProfiles(
 		// retaining an execroot spelling here would overwrite that stable form.
 		delete(dispatchCommandLine, name)
 		delete(dispatchAutoExport, name)
+		delete(dispatchSyntheticTools, name)
 	}
 	dispatchCommandLine["MAKECMDGOALS"] = strings.Join(entryTargets, " ")
 	dispatchRequest := kbuildInvocationRequest{
@@ -3018,6 +3675,7 @@ func evaluatedKbuildInvocationProfiles(
 		processLocation: kconfig.CompactKbuildInvocationLocation{Tree: kconfig.CompactKbuildInvocationObjectTree},
 		environment:     cloneKbuildVariables(baseOptions.EnvironmentVariables),
 		variables:       dispatchCommandLine, commandLineAutoExport: dispatchAutoExport,
+		syntheticToolCommandLine: dispatchSyntheticTools,
 	}
 	invocationVariables := make(map[string]string, len(variables))
 	for name, value := range variables {
@@ -3042,13 +3700,19 @@ func evaluatedKbuildInvocationProfiles(
 	// action-role tokens follow the same recursive invocation semantics.
 	profileCommandLineVariables := []map[string]string{}
 	profileCommandLineAutoExports := []map[string]bool{}
+	profileCommandLineSyntheticTools := []map[string]bool{}
 	profileCompletedVisibleArtifactDeltas := [][]kconfig.CompactKbuildVisibleArtifact{}
 	profileInitialFrontiers := []kbuildFrontierState{}
 	profileCompletedVisibleContentDeltas := []map[string]string{}
+	profileCompletedPendingSourceDeltas := []map[string][]string{}
+	// Exact native prerequisites are captured at each target's pre-recipe
+	// frontier, which can include selected child Make writes not present when
+	// the enclosing Make process started. Retain only source-used paths and
+	// source-proven producer identities, never the complete frontier.
+	nativePrerequisiteArtifacts := map[string]map[string][]kconfig.CompactKbuildVisibleArtifact{}
 	profileInitialProbeEnvironments := []map[string]string{}
 	profileByRequest := map[[sha256.Size]byte][]int{}
 	profileRequests := []kbuildInvocationRequest{}
-	controlByProfile := map[int]kconfig.KbuildControlEvaluation{}
 	resolvedTargets := newKbuildResolvedTargetCache()
 	activateProbeEnvironment := func(environment map[string]string) error {
 		if bindProbeEnvironment == nil {
@@ -3106,6 +3770,7 @@ func evaluatedKbuildInvocationProfiles(
 		options := baseOptions
 		options.RootDir = rootDir
 		options.WorkingDir = workingDirectory
+		options.InvocationLocation = &processLocation
 		options.VariableBase = invocationVariableBase
 		options.Variables = profileVariables
 		options.EnvironmentVariables = profileEnvironment
@@ -3119,6 +3784,7 @@ func evaluatedKbuildInvocationProfiles(
 			options.CommandLineVariables[name] = profileVariables[name]
 		}
 		options.AutoExportCommandLineVariables = maps.Clone(request.commandLineAutoExport)
+		options.SyntheticToolCommandLineVariables = maps.Clone(request.syntheticToolCommandLine)
 		if options.AutoExportCommandLineVariables == nil {
 			options.AutoExportCommandLineVariables = map[string]bool{}
 		}
@@ -3128,6 +3794,7 @@ func evaluatedKbuildInvocationProfiles(
 		// the source Makefiles retain ownership of their export membership.
 		effectiveCommandLineVariables := cloneKbuildVariables(options.CommandLineVariables)
 		effectiveCommandLineAutoExports := maps.Clone(options.AutoExportCommandLineVariables)
+		effectiveSyntheticTools := maps.Clone(options.SyntheticToolCommandLineVariables)
 		// The real root Makefile derives these paths from CURDIR and from
 		// $(realpath $(lastword $(MAKEFILE_LIST))). During analysis both are an
 		// ephemeral local/RBE execroot, so ordinary variable precedence would
@@ -3164,6 +3831,30 @@ func evaluatedKbuildInvocationProfiles(
 		options.SourceRoots[kbuildEvalSourceTree] = rootDir
 		options.SourceRoots[kbuildEvalObjectTree] = objectRoot
 		options.CaptureVariables = nil
+		featureDumpPath, hasFeatureDump, featureErr := selectedKbuildFeatureDumpPath(rootDir, request.makefile, request)
+		if featureErr != nil {
+			return -1, featureErr
+		}
+		if hasFeatureDump {
+			if cutErr := selectedFeatureDumpSourceCut(featureDump, request.makefile); cutErr != nil {
+				return -1, cutErr
+			}
+			if _, exists := immutableContents[featureDumpPath]; exists {
+				return -1, fmt.Errorf("source-selected feature dump %q conflicts with an existing object-tree input", featureDumpPath)
+			}
+			privateContents := maps.Clone(immutableContents)
+			if privateContents == nil {
+				privateContents = map[string]string{}
+			}
+			privateContents[featureDumpPath] = ""
+			options.VirtualFileView = kbuildFrontierVirtualFileView{
+				state: initialFrontier, directory: processLocation.Directory,
+				sourceOverlayDirectories: sourceOverlayDirectories,
+				immutableContents:        privateContents,
+			}
+			options.CommandLineVariables["FEATURES_DUMP"] = kbuildEvalObjectTree + "/" + featureDumpPath
+			options.CaptureVariables = []string{"FEATURE_TESTS"}
+		}
 		options.CaptureTargetEvaluator = true
 		// The target evaluator retains the parser's export declarations and can
 		// expand them in an exact target context when an action actually needs
@@ -3174,6 +3865,46 @@ func evaluatedKbuildInvocationProfiles(
 		parsed, err := kconfig.ParseKbuildFileTree(makefile, options)
 		if err != nil {
 			return -1, fmt.Errorf("evaluate Kbuild invocation %s: %w", request.name, err)
+		}
+		if hasFeatureDump {
+			candidate, candidateErr := kconfig.NewCompactKbuildProfile(
+				kbuildInvocationProfileNameFromDigest(request.name, requestDigest), makefile, rootDir, parsed,
+			)
+			if candidateErr != nil {
+				return -1, candidateErr
+			}
+			kconfig.SetCompactKbuildProfileDirectory(&candidate, request.directory)
+			if candidateErr = kconfig.SetCompactKbuildProfileInvocationLocation(&candidate, processLocation); candidateErr != nil {
+				return -1, fmt.Errorf("bind feature dump invocation %s: %w", request.name, candidateErr)
+			}
+			content, measureErr := measureSelectedKbuildFeatureDump(
+				rootDir, request.makefile, featureDumpPath, candidate, featureDump,
+			)
+			if measureErr != nil {
+				return -1, measureErr
+			}
+			// The first parse captured only source-owned feature names and the
+			// branch that reads FEATURES_DUMP. Parse the same selected source
+			// against exact sealed bytes before admitting its recipe graph.
+			privateContents := maps.Clone(immutableContents)
+			if privateContents == nil {
+				privateContents = map[string]string{}
+			}
+			privateContents[featureDumpPath] = content
+			options.VirtualFileView = kbuildFrontierVirtualFileView{
+				state: initialFrontier, directory: processLocation.Directory,
+				sourceOverlayDirectories: sourceOverlayDirectories,
+				immutableContents:        privateContents,
+			}
+			parsed, err = kconfig.ParseKbuildFileTree(makefile, options)
+			if err != nil {
+				return -1, fmt.Errorf("replay measured feature dump for invocation %s: %w", request.name, err)
+			}
+		}
+		for _, name := range parsed.SyntheticToolCommandLineDemotions() {
+			delete(effectiveCommandLineVariables, name)
+			delete(effectiveCommandLineAutoExports, name)
+			delete(effectiveSyntheticTools, name)
 		}
 		profile, err := kconfig.NewCompactKbuildProfile(
 			kbuildInvocationProfileNameFromDigest(request.name, requestDigest), makefile, rootDir, parsed,
@@ -3222,6 +3953,7 @@ func evaluatedKbuildInvocationProfiles(
 		profiles = append(profiles, profile)
 		profileCommandLineVariables = append(profileCommandLineVariables, effectiveCommandLineVariables)
 		profileCommandLineAutoExports = append(profileCommandLineAutoExports, effectiveCommandLineAutoExports)
+		profileCommandLineSyntheticTools = append(profileCommandLineSyntheticTools, effectiveSyntheticTools)
 		profileInitialFrontiers = append(profileInitialFrontiers, initialFrontier)
 		profileInitialProbeEnvironments = append(profileInitialProbeEnvironments, maps.Clone(request.environment))
 		profileRequests = append(profileRequests, request)
@@ -3230,56 +3962,61 @@ func evaluatedKbuildInvocationProfiles(
 		// be both stale and quadratic across source-ordered sibling invocations.
 		profileCompletedVisibleArtifactDeltas = append(profileCompletedVisibleArtifactDeltas, nil)
 		profileCompletedVisibleContentDeltas = append(profileCompletedVisibleContentDeltas, nil)
+		profileCompletedPendingSourceDeltas = append(profileCompletedPendingSourceDeltas, nil)
 		profileByRequest[requestDigest] = append(profileByRequest[requestDigest], index)
 		return index, nil
-	}
-	evaluateControl := func(profile kconfig.CompactKbuildProfile) (kconfig.KbuildControlEvaluation, error) {
-		ruleIndex := newKbuildProfileTargetIndex(profile, nil)
-		currentness := newKbuildProfileTargetSatisfaction(profile, ruleIndex, satisfied)
-		return kconfig.EvaluateSelectedKbuildControlEffectsWithOptions(
-			profile,
-			kconfig.KbuildControlEvaluationOptions{
-				SelectedRuleIndexes: func(target, makeTarget string) []int {
-					return kbuildProfileRuleIndexesForMakeTargetIndexed(
-						profile, ruleIndex, target, makeTarget, satisfied,
-					)
-				},
-				TargetIsSatisfied: func(target string) bool {
-					return currentness.targetIsSatisfied(target)
-				},
-				BindProbeEnvironment: bindProbeEnvironment,
-			},
-		)
-	}
-	recordEvaluatedProfile := func(index int, control kconfig.KbuildControlEvaluation) error {
-		resolvedTargets.invalidateProfile(profiles[index].Name)
-		profiles[index] = control.Profile
-		controlByProfile[index] = control
-		return nil
 	}
 	dispatchIndex, err := ensureProfile(dispatchRequest)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	imageTarget := ""
-	if dispatchIndex >= 0 {
-		evaluation, evaluationErr := evaluateControl(profiles[dispatchIndex])
-		if evaluationErr != nil {
-			return nil, nil, "", fmt.Errorf("evaluate selected root Kbuild control effects: %w", evaluationErr)
+	if rootOnly {
+		// Some source trees select an unconditional second invocation of the
+		// same root Makefile before defining their compiler-dependent exports.
+		// Follow only that source-selected root recursion. Stop as soon as a
+		// parsed invocation has graph guards: selecting its recipes or any
+		// other child requires the probe answers this pass is discovering.
+		visited := map[int]bool{}
+		for index := dispatchIndex; index >= 0; {
+			if visited[index] {
+				return nil, nil, "", fmt.Errorf("root Kbuild pregraph recursion reaches invocation cycle %q", profiles[index].Name)
+			}
+			visited[index] = true
+			if len(kconfig.CompactKbuildGraphGuards(profiles[index])) != 0 {
+				break
+			}
+			children, selectionErr := selectedKbuildRecursiveMakeRequests(profiles[index], satisfied)
+			if selectionErr != nil {
+				return nil, nil, "", fmt.Errorf("select deterministic root Kbuild recursion for %q: %w", profiles[index].Name, selectionErr)
+			}
+			if len(children) != 1 {
+				break
+			}
+			child := inheritKbuildInvocationCommandLineVariables(
+				children[0], profileCommandLineVariables[index], profileCommandLineAutoExports[index], profileCommandLineSyntheticTools[index],
+			)
+			child = kbuildInvocationSourceOverlayRequest(child, baseOptions.SourceRoots)
+			if child.makefile != dispatchRequest.makefile || child.directory != dispatchRequest.directory ||
+				child.processLocation.Tree != dispatchRequest.processLocation.Tree ||
+				child.processLocation.Directory != dispatchRequest.processLocation.Directory ||
+				!slices.Equal(child.entryTargets, dispatchRequest.entryTargets) {
+				break
+			}
+			if err := activateProbeEnvironment(child.environment); err != nil {
+				return nil, nil, "", fmt.Errorf("bind selected root Kbuild recursion %q: %w", child.name, err)
+			}
+			childIndex, parseErr := ensureProfile(child)
+			if parseErr != nil {
+				return nil, nil, "", fmt.Errorf("parse selected root Kbuild recursion %q: %w", child.name, parseErr)
+			}
+			if childIndex < 0 {
+				return nil, nil, "", fmt.Errorf("selected root Kbuild recursion %q has no declared Makefile", child.name)
+			}
+			index = childIndex
 		}
-		exported, exportErr := kconfig.ExportedKbuildControlVariables(evaluation)
-		if exportErr != nil {
-			return nil, nil, "", exportErr
-		}
-		if err := recordEvaluatedProfile(dispatchIndex, evaluation); err != nil {
-			return nil, nil, "", err
-		}
-		// The evaluated root invocation is the sole owner of recursive Make's
-		// exported environment.  In particular, KBUILD_IMAGE may depend on the
-		// selected architecture and other root Make state, so derive it from this
-		// exact snapshot instead of the standalone Kbuild directory parser.
-		imageTarget = canonicalKbuildProfilePath(exported["KBUILD_IMAGE"], rootDir)
+		return profiles, nil, "", nil
 	}
+	rootExported := map[string]string{}
 	// Recursive Make is synchronous. Process a selected child to completion
 	// before parsing the next source-ordered child, then replay the parent's
 	// exact frontier. This turns generated text into an ordinary data dependency:
@@ -3287,13 +4024,15 @@ func evaluatedKbuildInvocationProfiles(
 	// filename-, architecture-, or toolchain-specific planner rule.
 	processedProfiles := map[int]bool{}
 	processingProfiles := map[int]bool{}
+	// The first root may select an equivalent recursive Make process before
+	// defining its architecture exports. Preserve each distinct request and
+	// follow only the selected continuation of that root after it completes.
+	type rootContinuation struct {
+		profile int
+		name    string
+	}
+	rootContinuations := map[int][]rootContinuation{}
 	restoreProfileEnvironment := func(index int) error {
-		// The root control evaluation installs its source-selected final export
-		// snapshot before recursive discovery starts. Its incoming request has no
-		// parent environment and therefore must not overwrite that snapshot.
-		if bindProbeEnvironment == nil || index == dispatchIndex {
-			return nil
-		}
 		if err := activateProbeEnvironment(profileInitialProbeEnvironments[index]); err != nil {
 			return fmt.Errorf("restore Kbuild probe environment for invocation %q: %w", profiles[index].Name, err)
 		}
@@ -3331,6 +4070,9 @@ func evaluatedKbuildInvocationProfiles(
 				if data, exact := profileCompletedVisibleContentDeltas[predecessorIndex][artifact.Path]; exact {
 					value.content = data
 					value.exact = true
+				} else if ids := profileCompletedPendingSourceDeltas[predecessorIndex][artifact.Path]; len(ids) != 0 {
+					value.pendingSourceOutput = true
+					value.sourceOutputRequestIDs = slices.Clone(ids)
 				}
 				if previous, exists := kbuildFrontierGet(result.state, artifact.Path); exists && sameFrontierValue(previous, value) {
 					// A child completion includes its inherited frontier. Preserve the
@@ -3351,12 +4093,16 @@ func evaluatedKbuildInvocationProfiles(
 		}
 		value := kbuildFrontierValue{artifact: artifact, origin: frontier}
 		if event.command != "" {
+			commandProfile := profiles[index]
+			if event.recipeControl != nil {
+				commandProfile = event.recipeControl.Profile
+			}
 			commandTarget := event.commandTarget
 			if commandTarget == "" {
 				commandTarget = artifact.Target
 			}
 			resolved, err := kconfig.ResolveCompactKbuildTargetSymbolicText(
-				profiles[index], commandTarget, event.command,
+				commandProfile, commandTarget, event.command,
 			)
 			if err != nil {
 				return frontierReplayResult{}, fmt.Errorf(
@@ -3365,7 +4111,7 @@ func evaluatedKbuildInvocationProfiles(
 				)
 			}
 			data, exact, projectionErr := kbuildInvocationGeneratedTextProjectionFromFrontier(
-				profiles[index], resolved, artifact.Path, result.state,
+				commandProfile, resolved, artifact.Path, result.state,
 			)
 			if projectionErr != nil {
 				return frontierReplayResult{}, fmt.Errorf(
@@ -3376,6 +4122,37 @@ func evaluatedKbuildInvocationProfiles(
 			if exact {
 				value.content = data
 				value.exact = true
+			}
+			if !value.exact && selectedSourceOutput != nil && event.recipeControl != nil {
+				// The source filechk wrapper may emit its only artifact event for
+				// the final tmp-file move. Its command is insufficient to derive
+				// bytes; resolve the source-selected direct payload under this
+				// event's immutable preline Make scope, as final lowering does.
+				resolvedTarget, resolveErr := kconfig.ResolveCompactKbuildTargetForMakeTarget(
+					commandProfile, artifact.Target, commandTarget,
+				)
+				if resolveErr != nil {
+					return frontierReplayResult{}, fmt.Errorf("resolve source writer %s:%s: %w", artifact.Profile, artifact.Target, resolveErr)
+				}
+				candidate, direct, candidateErr := resolvedTarget.SelectedDirectFilechkOutputRecipe()
+				if candidateErr != nil {
+					return frontierReplayResult{}, fmt.Errorf("evaluate source filechk writer %s:%s: %w", artifact.Profile, artifact.Target, candidateErr)
+				}
+				if direct {
+					selected, selectedErr := selectedSourceOutput(commandProfile, artifact.Target, candidate, result.state)
+					if selectedErr != nil {
+						return frontierReplayResult{}, fmt.Errorf("measure source filechk writer %s:%s: %w", artifact.Profile, artifact.Target, selectedErr)
+					}
+					if selected.recognized && selected.concrete {
+						value.content, value.exact = selected.content, true
+					} else if selected.recognized {
+						if len(selected.requestIDs) == 0 {
+							return frontierReplayResult{}, fmt.Errorf("source filechk writer %s:%s registered no measured output requests", artifact.Profile, artifact.Target)
+						}
+						value.pendingSourceOutput = true
+						value.sourceOutputRequestIDs = slices.Clone(selected.requestIDs)
+					}
+				}
 			}
 		}
 		result.state = kbuildFrontierSet(result.state, artifact.Path, value)
@@ -3485,34 +4262,26 @@ func evaluatedKbuildInvocationProfiles(
 		if err := restoreProfileEnvironment(index); err != nil {
 			return err
 		}
-		control, ok := controlByProfile[index]
-		if !ok {
-			var controlErr error
-			control, controlErr = evaluateControl(profiles[index])
-			if controlErr != nil {
-				return fmt.Errorf("evaluate selected Kbuild control effects for invocation %q: %w", profiles[index].Name, controlErr)
-			}
-			if controlErr = recordEvaluatedProfile(index, control); controlErr != nil {
-				return controlErr
-			}
-		}
 
-		var completionFrontier *kbuildRecursiveMakeFrontier
-		children, err := selectedKbuildRecursiveMakePlanWithResolvedTargets(
-			profiles[index], satisfied, &control, &completionFrontier, resolvedTargets,
+		stepper, err := kconfig.NewSelectedKbuildControlStepper(
+			profiles[index], kconfig.KbuildControlEvaluationOptions{
+				BindProbeEnvironment: bindProbeEnvironment,
+				ResetProbeEnvironment: func() error {
+					return activateProbeEnvironment(profileInitialProbeEnvironments[index])
+				},
+			},
 		)
 		if err != nil {
-			return err
+			return fmt.Errorf("begin source-ordered Kbuild control for invocation %q: %w", profiles[index].Name, err)
 		}
-		// Recursive planning copied the exact pre-recipe snapshots needed by
-		// each child into the returned entries. The evaluated profile already
-		// retains its final and target-specific evaluators, so keeping the full
-		// source-order snapshot table while every descendant is processed only
-		// overlaps two complete semantic graphs at peak memory.
-		delete(controlByProfile, index)
-		control = kconfig.KbuildControlEvaluation{}
 		childProfiles := map[string]int{}
-		for _, child := range children {
+		completeChild := func(child kbuildRecursiveMakePlanEntry) error {
+			if previous, alreadyCompleted := childProfiles[child.key]; alreadyCompleted {
+				if !processedProfiles[previous] {
+					return fmt.Errorf("reused recursive Make child %q is not completed", child.request.name)
+				}
+				return nil
+			}
 			if err := restoreProfileEnvironment(index); err != nil {
 				return err
 			}
@@ -3524,6 +4293,7 @@ func evaluatedKbuildInvocationProfiles(
 				child.request,
 				profileCommandLineVariables[index],
 				profileCommandLineAutoExports[index],
+				profileCommandLineSyntheticTools[index],
 			)
 			effectiveRequest = kbuildInvocationSourceOverlayRequest(effectiveRequest, baseOptions.SourceRoots)
 			effectiveRequest.visibleState = visibleFrontier.state
@@ -3545,7 +4315,6 @@ func evaluatedKbuildInvocationProfiles(
 					return fmt.Errorf("refresh Kbuild probe environments for invocation %q: %w", child.request.name, refreshErr)
 				}
 			}
-			beforeProfiles := len(profiles)
 			childIndex, ensureErr := ensureProfile(effectiveRequest)
 			if ensureErr != nil {
 				return ensureErr
@@ -3570,20 +4339,13 @@ func evaluatedKbuildInvocationProfiles(
 					resolvedTargets.invalidateProfile(profiles[childIndex].Name)
 				}
 			}
-			if len(profiles) != beforeProfiles {
-				childControl, controlErr := evaluateControl(profiles[childIndex])
-				if controlErr != nil {
-					return fmt.Errorf(
-						"evaluate selected Kbuild control effects for invocation %q: %w",
-						profiles[childIndex].Name, controlErr,
-					)
-				}
-				if controlErr = recordEvaluatedProfile(childIndex, childControl); controlErr != nil {
-					return controlErr
-				}
-			}
 			if err := processProfile(childIndex); err != nil {
 				return err
+			}
+			if equivalentKbuildRootContinuation(profileRequests[index], effectiveRequest) {
+				rootContinuations[index] = append(rootContinuations[index], rootContinuation{
+					profile: childIndex, name: child.request.name,
+				})
 			}
 			childProfiles[child.key] = childIndex
 			for _, consumer := range child.consumers {
@@ -3594,8 +4356,66 @@ func evaluatedKbuildInvocationProfiles(
 					profiles[index].TargetInvocationDependencies,
 					kconfig.CompactKbuildInvocationDependency{
 						Target: consumer, Profile: profiles[childIndex].Name,
-						Goals:           append([]string(nil), profiles[childIndex].EntryTargets...),
-						ReplayArguments: append([]string(nil), child.replayArguments...),
+						Goals:             append([]string(nil), profiles[childIndex].EntryTargets...),
+						ReplayArguments:   append([]string(nil), child.replayArguments...),
+						SourcePhaseBefore: child.sourcePhaseBefore,
+					},
+				)
+			}
+			return nil
+		}
+		var completionFrontier *kbuildRecursiveMakeFrontier
+		var prerequisiteFrontiers map[string]kbuildTargetNativePrerequisiteFrontier
+		var boundSourceProfile kconfig.CompactKbuildProfile
+		boundProfileSeen := false
+		selectedSourcePhases := map[string]kconfig.CompactKbuildSelectedSourcePhase{}
+		traversal := &kbuildCausalRecipeTraversal{
+			beginTarget: stepper.BeginTarget,
+			beforeLine: func(line kconfig.KbuildSelectedControlRecipeLine, frontier *kbuildRecursiveMakeFrontier) (*kconfig.KbuildSelectedControlRecipeSnapshot, error) {
+				visible, err := replayFrontier(index, frontier, childProfiles)
+				if err != nil {
+					return nil, err
+				}
+				return stepper.BeforeRecipe(line, selectedRecipeFrontier(
+					frontier, visible.state, profileRequests[index].directory,
+					immutableContents, sourceOverlayDirectories,
+				))
+			},
+			afterLine:     stepper.ApplyRecipe,
+			completeChild: completeChild,
+			boundProfile: func(profile kconfig.CompactKbuildProfile) error {
+				boundSourceProfile, boundProfileSeen = profile, true
+				return nil
+			},
+			recordSourcePhase: func(phase kconfig.CompactKbuildSelectedSourcePhase) error {
+				if existing, duplicate := selectedSourcePhases[phase.OutputPath]; duplicate {
+					return fmt.Errorf("source script phases %s/%d and %s/%d both own %q",
+						existing.SourcePath, existing.Ordinal, phase.SourcePath, phase.Ordinal, phase.OutputPath)
+				}
+				selectedSourcePhases[phase.OutputPath] = phase
+				return nil
+			},
+		}
+		children, err := selectedKbuildRecursiveMakePlanWithCausalTraversal(
+			profiles[index], satisfied, &completionFrontier,
+			resolvedTargets, &prerequisiteFrontiers, traversal,
+		)
+		if err != nil {
+			return err
+		}
+		for _, child := range children {
+			childIndex, completed := childProfiles[child.key]
+			if !completed || !processedProfiles[childIndex] {
+				return fmt.Errorf("source-selected recursive Make child %q was not completed before its parent's next recipe", child.request.name)
+			}
+			for _, consumer := range child.consumers {
+				profiles[index].TargetInvocationDependencies = appendKbuildInvocationDependency(
+					profiles[index].TargetInvocationDependencies,
+					kconfig.CompactKbuildInvocationDependency{
+						Target: consumer, Profile: profiles[childIndex].Name,
+						Goals:             append([]string(nil), profiles[childIndex].EntryTargets...),
+						ReplayArguments:   append([]string(nil), child.replayArguments...),
+						SourcePhaseBefore: child.sourcePhaseBefore,
 					},
 				)
 			}
@@ -3603,12 +4423,50 @@ func evaluatedKbuildInvocationProfiles(
 		if err := restoreProfileEnvironment(index); err != nil {
 			return err
 		}
+		for target, prerequisite := range prerequisiteFrontiers {
+			visible, visibleErr := replayFrontier(index, prerequisite.frontier, childProfiles)
+			if visibleErr != nil {
+				return fmt.Errorf("resolve native prerequisites before %s target %q recipe: %w", profiles[index].Name, target, visibleErr)
+			}
+			artifacts := []kconfig.CompactKbuildVisibleArtifact{}
+			for _, path := range prerequisite.paths {
+				if value, present := kbuildFrontierGet(visible.state, path); present {
+					artifacts = append(artifacts, value.artifact)
+				}
+			}
+			if len(artifacts) != 0 {
+				if nativePrerequisiteArtifacts[profiles[index].Name] == nil {
+					nativePrerequisiteArtifacts[profiles[index].Name] = map[string][]kconfig.CompactKbuildVisibleArtifact{}
+				}
+				nativePrerequisiteArtifacts[profiles[index].Name][target] = artifacts
+			}
+		}
 		completedFrontier, replayErr := replayFrontier(index, completionFrontier, childProfiles)
 		if replayErr != nil {
 			return fmt.Errorf("resolve completed frontier for invocation %q: %w", profiles[index].Name, replayErr)
 		}
+		stepped, stepErr := stepper.Finish(selectedRecipeFrontier(
+			completionFrontier, completedFrontier.state, profileRequests[index].directory,
+			immutableContents, sourceOverlayDirectories,
+		))
+		if stepErr != nil {
+			return fmt.Errorf("finish source-ordered control for invocation %q: %w", profiles[index].Name, stepErr)
+		}
+		if !boundProfileSeen {
+			return fmt.Errorf("source-ordered Kbuild invocation %q lost grouped recipe trigger authority", profiles[index].Name)
+		}
+		if transferErr := kconfig.TransferCompactKbuildGroupedActions(&stepped.Profile, boundSourceProfile); transferErr != nil {
+			return fmt.Errorf("retain selected grouped recipe authority for %q: %w", profiles[index].Name, transferErr)
+		}
+		stepped.Profile.TargetInvocationDependencies = profiles[index].TargetInvocationDependencies
+		for _, output := range slices.Sorted(maps.Keys(selectedSourcePhases)) {
+			stepped.Profile.SelectedSourceScriptPhases = append(stepped.Profile.SelectedSourceScriptPhases, selectedSourcePhases[output])
+		}
+		resolvedTargets.invalidateProfile(profiles[index].Name)
+		profiles[index] = stepped.Profile
 		deltaArtifacts := make([]kconfig.CompactKbuildVisibleArtifact, 0, kbuildPathSetLen(completedFrontier.touched))
 		var deltaContents map[string]string
+		var deltaPending map[string][]string
 		var deltaErr error
 		kbuildPathSetRange(completedFrontier.touched, func(path string) bool {
 			initial, initiallyPresent := kbuildFrontierGet(profileInitialFrontiers[index], path)
@@ -3628,6 +4486,11 @@ func evaluatedKbuildInvocationProfiles(
 					deltaContents = map[string]string{}
 				}
 				deltaContents[path] = final.content
+			} else if final.pendingSourceOutput {
+				if deltaPending == nil {
+					deltaPending = map[string][]string{}
+				}
+				deltaPending[path] = slices.Clone(final.sourceOutputRequestIDs)
 			}
 			return true
 		})
@@ -3636,14 +4499,51 @@ func evaluatedKbuildInvocationProfiles(
 		}
 		profileCompletedVisibleArtifactDeltas[index] = deltaArtifacts
 		profileCompletedVisibleContentDeltas[index] = deltaContents
+		profileCompletedPendingSourceDeltas[index] = deltaPending
 		completed = true
 		return nil
 	}
+	selectedRootContinuations := map[string]string{}
 	if dispatchIndex >= 0 {
 		if err := processProfile(dispatchIndex); err != nil {
 			return nil, nil, "", err
 		}
+		visited := map[int]bool{}
+		effectiveRoot := dispatchIndex
+		for {
+			if visited[effectiveRoot] {
+				return nil, nil, "", fmt.Errorf("selected root Make continuation reaches invocation cycle %q", profiles[effectiveRoot].Name)
+			}
+			visited[effectiveRoot] = true
+			continuations := rootContinuations[effectiveRoot]
+			if len(continuations) == 0 {
+				break
+			}
+			for _, selected := range continuations[1:] {
+				if selected.profile != continuations[0].profile {
+					return nil, nil, "", fmt.Errorf(
+						"root Make invocation %q selected distinct equivalent continuations %q (%q) and %q (%q)",
+						profiles[effectiveRoot].Name,
+						continuations[0].name, profiles[continuations[0].profile].Name,
+						selected.name, profiles[selected.profile].Name,
+					)
+				}
+			}
+			selectedRootContinuations[profiles[continuations[0].profile].Name] = profiles[effectiveRoot].Name
+			effectiveRoot = continuations[0].profile
+		}
+		if err := restoreProfileEnvironment(effectiveRoot); err != nil {
+			return nil, nil, "", err
+		}
+		var exportErr error
+		rootExported, exportErr = kconfig.ExportedKbuildControlVariables(
+			kconfig.KbuildControlEvaluation{Profile: profiles[effectiveRoot]},
+		)
+		if exportErr != nil {
+			return nil, nil, "", fmt.Errorf("expand selected final root Make invocation %q exports: %w", profiles[effectiveRoot].Name, exportErr)
+		}
 	}
+	imageTarget := canonicalKbuildProfilePath(rootExported["KBUILD_IMAGE"], rootDir)
 	effectiveGeneratedContent := generatedContent
 	if generatedContent != nil {
 		effectiveGeneratedContent = func(
@@ -3662,10 +4562,15 @@ func evaluatedKbuildInvocationProfiles(
 	}
 	selections, err := selectedKbuildSelectionsWithResolvedTargets(
 		profiles, satisfied, nil, rootDir, preparationTargets, effectiveGeneratedContent, resolvedTargets,
-		preconfiguredObjectTree,
+		preconfiguredObjectTree, nativePrerequisiteArtifacts, selectedRootContinuations, preparationCandidates,
 	)
 	if err != nil {
 		return nil, nil, "", err
+	}
+	for i := range selections {
+		selections[i].NativePrerequisiteArtifacts = kconfig.EncodeCompactKbuildInitialObjectTreeArtifacts(
+			nativePrerequisiteArtifacts[selections[i].Profile][selections[i].Target],
+		)
 	}
 	return profiles, selections, imageTarget, nil
 }
@@ -3709,6 +4614,7 @@ func appendKbuildInvocationDependency(
 ) []kconfig.CompactKbuildInvocationDependency {
 	for _, existing := range dependencies {
 		if existing.Target == candidate.Target && existing.Profile == candidate.Profile &&
+			existing.SourcePhaseBefore == candidate.SourcePhaseBefore &&
 			slices.Equal(existing.Goals, candidate.Goals) && slices.Equal(existing.ReplayArguments, candidate.ReplayArguments) {
 			return dependencies
 		}
@@ -4463,6 +5369,24 @@ type kbuildGeneratedContentResolver func(
 	sourcePrerequisites, generatedPrerequisites []string,
 ) (contents string, concrete, recognized bool, err error)
 
+// kbuildSelectedSourceOutputResolver owns only a selected direct filechk's
+// stdout, including the source script invoked by a quoted shell substitution.
+// It receives the exact prewriter frontier so an object-tree wildcard cannot
+// mistake an opaque selected file for an absent file. Registered request IDs
+// bind pending discovery bytes to this writer's causal artifact version.
+type kbuildSelectedSourceOutputResult struct {
+	content    string
+	concrete   bool
+	recognized bool
+	requestIDs []string
+}
+
+type kbuildSelectedSourceOutputResolver func(
+	profile kconfig.CompactKbuildProfile,
+	target, recipe string,
+	frontier kbuildFrontierState,
+) (kbuildSelectedSourceOutputResult, error)
+
 func selectedKbuildSelectionsWithStats(
 	profiles []kconfig.CompactKbuildProfile,
 	satisfied map[string]bool,
@@ -4511,7 +5435,7 @@ func selectedKbuildSelectionsWithStatsSourceRootPreparationTargetsAndGeneratedCo
 	generatedContent kbuildGeneratedContentResolver,
 ) ([]kconfig.CompactKbuildSelection, error) {
 	return selectedKbuildSelectionsWithResolvedTargets(
-		profiles, satisfied, stats, sourceRoot, preparationTargets, generatedContent, nil, false,
+		profiles, satisfied, stats, sourceRoot, preparationTargets, generatedContent, nil, false, nil, nil, nil,
 	)
 }
 
@@ -4524,20 +5448,42 @@ func selectedKbuildSelectionsWithResolvedTargets(
 	generatedContent kbuildGeneratedContentResolver,
 	resolvedTargets *kbuildResolvedTargetCache,
 	preconfiguredObjectTree bool,
+	// Completed recursive child writes visible before a selected parent's
+	// source-declared Make prerequisites finish. These typed artifacts bind
+	// exact predecessor versions, even when independent sibling invocations
+	// produce the same logical pathname.
+	nativePrerequisiteArtifacts map[string]map[string][]kconfig.CompactKbuildVisibleArtifact,
+	// Record only source-selected equivalent Make processes reached from the
+	// dispatch root. A shared root self-submake can contain multiple goals in
+	// one argv while each goal keeps its own preparation/target closure.
+	selectedRootContinuations map[string]string,
+	// Source-selected markers reached through actual Make prerequisites can
+	// shape the SDK without adding conditional goals to MAKECMDGOALS.
+	preparationCandidates []string,
 ) ([]kconfig.CompactKbuildSelection, error) {
 	var err error
 	preparationTargets, err = canonicalKbuildPreparationTargets(preparationTargets)
 	if err != nil {
 		return nil, err
 	}
-	if len(preparationTargets) != 0 && len(profiles) == 0 {
-		return nil, fmt.Errorf("Kbuild preparation targets require a root invocation profile")
+	preparationCandidates, err = canonicalKbuildPreparationTargets(preparationCandidates)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize optional Kbuild preparation markers: %w", err)
+	}
+	if (len(preparationTargets) != 0 || len(preparationCandidates) != 0) && len(profiles) == 0 {
+		return nil, fmt.Errorf("Kbuild preparation markers require a root invocation profile")
+	}
+	for _, candidate := range preparationCandidates {
+		if slices.Contains(preparationTargets, candidate) {
+			return nil, fmt.Errorf("Kbuild preparation marker %q is both required and optional", candidate)
+		}
 	}
 	type workItem struct {
-		profile    int
-		target     string
-		makeTarget string
-		lifecycle  string
+		profile        int
+		target         string
+		makeTarget     string
+		lifecycle      string
+		originRootGoal string
 	}
 	type actionIdentity struct {
 		profile int
@@ -4621,6 +5567,42 @@ func selectedKbuildSelectionsWithResolvedTargets(
 		currentness[index] = newKbuildProfileTargetSatisfaction(profile, indexes[index], satisfied)
 		evaluations[index] = map[string]targetEvaluation{}
 	}
+	preparationRoots := make(map[string]bool, len(preparationTargets)+len(preparationCandidates))
+	resolvedPreparationRoots := make(map[string]bool, len(preparationTargets))
+	for _, target := range preparationTargets {
+		preparationRoots[target] = true
+	}
+	for _, target := range preparationCandidates {
+		preparationRoots[target] = true
+	}
+	effectiveRootName := ""
+	if len(profiles) != 0 {
+		effectiveRootName = profiles[0].Name
+		visited := map[string]bool{}
+		for {
+			if visited[effectiveRootName] {
+				return nil, fmt.Errorf("selected root preparation marker process cycle at %q", effectiveRootName)
+			}
+			visited[effectiveRootName] = true
+			next := ""
+			for child, parent := range selectedRootContinuations {
+				if parent != effectiveRootName {
+					continue
+				}
+				if next != "" && next != child {
+					return nil, fmt.Errorf("root Make process %q has ambiguous equivalent preparation continuations %q and %q", effectiveRootName, next, child)
+				}
+				next = child
+			}
+			if next == "" {
+				break
+			}
+			if _, declared := profileByName[next]; !declared {
+				return nil, fmt.Errorf("selected root preparation process %q has no source profile", next)
+			}
+			effectiveRootName = next
+		}
+	}
 	scheduled := map[workItem]bool{}
 	normalizeWorkItem := func(item workItem, includeSatisfied bool) (workItem, bool) {
 		if item.profile < 0 || item.profile >= len(profiles) {
@@ -4634,6 +5616,9 @@ func selectedKbuildSelectionsWithResolvedTargets(
 		}
 		if item.lifecycle == "" {
 			item.lifecycle = "target"
+		}
+		if profiles[item.profile].Name == effectiveRootName && preparationRoots[item.target] {
+			item.lifecycle = "prep"
 		}
 		return item, true
 	}
@@ -4664,37 +5649,20 @@ func selectedKbuildSelectionsWithResolvedTargets(
 		// prerequisite declarations before running the one shared recipe.
 		return enqueueWorkItem(item, true)
 	}
-	preparationRoots := make(map[string]bool, len(preparationTargets))
-	resolvedPreparationRoots := make(map[string]bool, len(preparationTargets))
-	for _, target := range preparationTargets {
-		preparationRoots[target] = true
-	}
 	// Invocation discovery always appends the explicitly requested root before
 	// following any recursive Make recipe. Seed from that structural root
 	// position, not from a diagnostic profile-name convention.
+	rootEntryTargets := map[string]bool{}
 	if len(profiles) != 0 {
-		rootEntryTargets := make(map[string]bool, len(profiles[0].EntryTargets))
 		for _, target := range profiles[0].EntryTargets {
 			rootEntryTargets[kconfig.CanonicalKbuildGraphTarget(target)] = true
 		}
-		for _, target := range preparationTargets {
-			if !rootEntryTargets[target] {
-				return nil, fmt.Errorf(
-					"Kbuild preparation target %q is absent from root profile %q entry targets",
-					target, profiles[0].Name,
-				)
-			}
-		}
 		for _, target := range profiles[0].EntryTargets {
 			canonicalTarget := kconfig.CanonicalKbuildGraphTarget(target)
-			lifecycle := "target"
-			if preparationRoots[canonicalTarget] {
-				lifecycle = "prep"
-				if currentness[0].targetIsSatisfied(canonicalTarget) {
-					resolvedPreparationRoots[canonicalTarget] = true
-				}
-			}
-			enqueue(workItem{profile: 0, target: target, lifecycle: lifecycle})
+			enqueue(workItem{
+				profile: 0, target: target, lifecycle: "target",
+				originRootGoal: canonicalTarget,
+			})
 		}
 	}
 
@@ -4724,6 +5692,28 @@ func selectedKbuildSelectionsWithResolvedTargets(
 			for _, ruleIndex := range effectiveRecipeIndexes {
 				effectiveRecipeSet[ruleIndex] = true
 			}
+			selectedLineSnapshots := kconfig.CompactKbuildSelectedControlRecipeSnapshots(profile, item.target)
+			entryProfile := profile
+			if len(selectedLineSnapshots) != 0 {
+				foundEntry := false
+				for _, snapshot := range selectedLineSnapshots {
+					if snapshot == nil {
+						return nil, fmt.Errorf("selected target %s has a nil immutable recipe line view", item.target)
+					}
+					if snapshot.Line.Target != item.target || snapshot.Line.LookupTarget != item.makeTarget ||
+						snapshot.Line.RuleIndex < 0 || snapshot.Line.RuleIndex >= len(profile.Rules) ||
+						!effectiveRecipeSet[snapshot.Line.RuleIndex] || snapshot.Evaluation.Profile.Name != profile.Name {
+						return nil, fmt.Errorf("selected target %s has inconsistent immutable recipe entry authority", item.target)
+					}
+					if !foundEntry {
+						// Prerequisites expand before the first executable line. The
+						// source traversal recorded that line's frozen entry frontier;
+						// later recipe writes cannot influence second expansion.
+						entryProfile = snapshot.Evaluation.Profile
+						foundEntry = true
+					}
+				}
+			}
 			rules := make([]kconfig.KbuildRule, 0, len(ruleIndexes))
 			for _, ruleIndex := range ruleIndexes {
 				rules = append(rules, profile.Rules[ruleIndex])
@@ -4739,7 +5729,7 @@ func selectedKbuildSelectionsWithResolvedTargets(
 				var contextErr error
 				normalWork, orderOnlyWork, selectedStem, evaluation.resolvedTarget, contextErr =
 					evaluateSelectedKbuildRuleContextForMakeTarget(
-						profile, indexes[item.profile], item.target, item.makeTarget,
+						entryProfile, indexes[item.profile], item.target, item.makeTarget,
 						ruleIndexes, effectiveRecipeIndexes,
 					)
 				if contextErr != nil {
@@ -4808,7 +5798,10 @@ func selectedKbuildSelectionsWithResolvedTargets(
 						}
 					}
 					if syntheticGroupedPeer {
-						enqueueGroupedPeer(workItem{profile: groupedTrigger.profile, target: groupedTrigger.target, lifecycle: item.lifecycle})
+						enqueueGroupedPeer(workItem{
+							profile: groupedTrigger.profile, target: groupedTrigger.target,
+							lifecycle: item.lifecycle, originRootGoal: item.originRootGoal,
+						})
 					}
 				} else if _, expectedGrouped := groupedAction[identity]; expectedGrouped {
 					return nil, fmt.Errorf("grouped Kbuild output %s resolves to a different effective recipe", item.target)
@@ -4819,9 +5812,11 @@ func selectedKbuildSelectionsWithResolvedTargets(
 			// materialize a file; recursive children may own a generated pathname
 			// declared by their parent invocation.
 			recipeRules := make([]kconfig.KbuildRule, 0, len(effectiveRecipeIndexes))
+			recipeRuleIndexes := make([]int, 0, len(effectiveRecipeIndexes))
 			for ruleOffset, rule := range rules {
 				if effectiveRecipeSet[ruleIndexes[ruleOffset]] {
 					recipeRules = append(recipeRules, rule)
+					recipeRuleIndexes = append(recipeRuleIndexes, ruleIndexes[ruleOffset])
 				}
 			}
 			if syntheticGroupedPeer {
@@ -4831,24 +5826,68 @@ func selectedKbuildSelectionsWithResolvedTargets(
 				// synthetic peer can discover spurious probes, recursive invocations,
 				// or action roles from a `$@` branch which never executes.
 				recipeRules = nil
+				recipeRuleIndexes = nil
 			}
-			for _, rule := range recipeRules {
+			lineSnapshots := selectedLineSnapshots
+			lineProfiles := map[[2]int]kconfig.CompactKbuildProfile{}
+			for _, snapshot := range lineSnapshots {
+				if snapshot == nil || snapshot.Evaluation.Profile.Name != profile.Name ||
+					snapshot.Line.Target != item.target || snapshot.Line.LookupTarget != item.makeTarget ||
+					!effectiveRecipeSet[snapshot.Line.RuleIndex] ||
+					snapshot.Line.RuleIndex < 0 || snapshot.Line.RuleIndex >= len(profile.Rules) ||
+					snapshot.Line.RecipeIndex < 0 ||
+					snapshot.Line.RecipeIndex >= len(profile.Rules[snapshot.Line.RuleIndex].Recipe) {
+					return nil, fmt.Errorf("selected target %s has inconsistent immutable recipe line authority", item.target)
+				}
+				key := [2]int{snapshot.Line.RuleIndex, snapshot.Line.RecipeIndex}
+				if _, duplicate := lineProfiles[key]; duplicate {
+					return nil, fmt.Errorf("selected target %s recipe %d/%d has two immutable line views",
+						item.target, key[0], key[1])
+				}
+				lineProfiles[key] = snapshot.Evaluation.Profile
+			}
+			for ruleOffset, rule := range recipeRules {
+				selectedRuleIndex := recipeRuleIndexes[ruleOffset]
 				// GNU Make chooses one effective rule context for the target. Explicit
 				// declarations merged with a selected pattern rule share that rule's
 				// automatic $* value; recomputing a stem from each declaration loses
 				// it for expressions such as $(syscall_abis_$*).
 				stem := selectedStem
-				automaticTarget := kbuildProfileRuleAutomaticTarget(profile, rule, item.target, stem)
-				evaluation.automaticTarget = automaticTarget
-				injections, injectionErr := kconfig.CompactKbuildTargetEvaluationInjectionsForMakeTarget(
-					profile, item.target, item.makeTarget, automaticTarget, stem,
-					evaluation.normalMakeTargets, evaluation.orderOnlyMakeTargets,
-				)
-				if injectionErr != nil {
-					return nil, fmt.Errorf("evaluate selected target %s target-context paths: %w", item.target, injectionErr)
+				automaticTarget, automaticErr := kbuildProfileRuleAutomaticTarget(profile, rule, item.target, stem)
+				if automaticErr != nil {
+					return nil, fmt.Errorf("selected target %q rule %s automatic $@ word: %w", item.target, rule.Position, automaticErr)
 				}
-				injections["Q"] = ""
-				for _, recipe := range rule.Recipe {
+				evaluation.automaticTarget = automaticTarget
+				for recipeIndex, recipe := range rule.Recipe {
+					control, controlErr := kconfig.CompactKbuildRecipeIsControlEffect(recipe)
+					if controlErr != nil {
+						return nil, fmt.Errorf("selected target %s recipe %d: %w", item.target, recipeIndex, controlErr)
+					}
+					if control {
+						// The source traversal applied this Make assignment before
+						// recording subsequent executable line snapshots.
+						continue
+					}
+					lineProfile := profile
+					if len(lineSnapshots) != 0 {
+						selected, exists := lineProfiles[[2]int{selectedRuleIndex, recipeIndex}]
+						if !exists {
+							return nil, fmt.Errorf("selected target %s recipe %d/%d has no immutable source line view",
+								item.target, selectedRuleIndex, recipeIndex)
+						}
+						lineProfile = selected
+					}
+					// Every expansion and observation below belongs to this one
+					// executable line's frozen Make variables and file frontier.
+					profile := lineProfile
+					injections, injectionErr := kconfig.CompactKbuildTargetEvaluationInjectionsForMakeTarget(
+						profile, item.target, item.makeTarget, automaticTarget, stem,
+						evaluation.normalMakeTargets, evaluation.orderOnlyMakeTargets,
+					)
+					if injectionErr != nil {
+						return nil, fmt.Errorf("evaluate selected target %s recipe %d target-context paths: %w", item.target, recipeIndex, injectionErr)
+					}
+					injections["Q"] = ""
 					expanded, recipeRoles, err := kconfig.EvaluateCompactKbuildTextActionRolesForMakeTarget(
 						profile, item.target, item.makeTarget, automaticTarget, stem,
 						evaluation.normalMakeTargets, evaluation.orderOnlyMakeTargets, injections, recipe,
@@ -4935,7 +5974,14 @@ func selectedKbuildSelectionsWithResolvedTargets(
 								}
 							}
 						}
-						observation := kconfig.ObserveCompactKbuildObjectTree(resolvedUsageText)
+						observation, observationErr := kbuildSelectedRecipeObjectTreeObservation(
+							profile, item.target, item.makeTarget, automaticTarget, stem,
+							evaluation.normalMakeTargets, evaluation.orderOnlyMakeTargets,
+							injections, resolvedUsageText,
+						)
+						if observationErr != nil {
+							return nil, fmt.Errorf("inspect selected target %s object-tree usage: %w", item.target, observationErr)
+						}
 						if observation.ObservesObjectTree {
 							evaluation.objectTreeSnapshot = true
 							evaluation.objectTreeAllVisible = evaluation.objectTreeAllVisible || observation.ObservesAll
@@ -4997,21 +6043,6 @@ func selectedKbuildSelectionsWithResolvedTargets(
 								evaluation.literalProjection = literal
 								evaluation.literalProjectionSet = true
 							}
-						}
-						observation, observationErr := kconfig.EvaluateCompactKbuildSourceScriptObjectTreeObservationForMakeTarget(
-							profile, item.target, item.makeTarget, automaticTarget, stem,
-							evaluation.normalMakeTargets, evaluation.orderOnlyMakeTargets,
-							injections, resolvedUsageText,
-						)
-						if observationErr != nil {
-							return nil, fmt.Errorf("inspect selected target %s source-script object-tree usage: %w", item.target, observationErr)
-						}
-						if observation.ObservesObjectTree {
-							evaluation.objectTreeSnapshot = true
-							evaluation.objectTreeAllVisible = evaluation.objectTreeAllVisible || observation.ObservesAll
-							evaluation.objectTreeReferences = append(evaluation.objectTreeReferences, observation.References...)
-							evaluation.directObjectTreeAllVisible = evaluation.directObjectTreeAllVisible || observation.ObservesAll
-							evaluation.directObjectTreeReferences = append(evaluation.directObjectTreeReferences, observation.References...)
 						}
 					}
 					processLocation, locationOK := kconfig.CompactKbuildProfileInvocationLocation(profile)
@@ -5115,12 +6146,11 @@ func selectedKbuildSelectionsWithResolvedTargets(
 			}
 			evaluations[item.profile][item.target] = evaluation
 		}
-		if item.profile == 0 && item.lifecycle == "prep" && preparationRoots[item.target] {
-			if evaluation.unruled && !indexes[0].targetIsPhony(profile, item.target) {
-				return nil, fmt.Errorf(
-					"Kbuild preparation target %q has no source rule, recursive invocation, phony declaration, or satisfied input",
-					item.target,
-				)
+		if profile.Name == effectiveRootName && item.lifecycle == "prep" && preparationRoots[item.target] {
+			// A source .PHONY declaration also owns an executable no-op goal;
+			// it gives the marker provenance without inventing a file writer.
+			if evaluation.unruled && !indexes[item.profile].targetIsPhony(profile, item.target) {
+				return nil, fmt.Errorf("selected root Make process %q reached preparation marker %q without a source rule or recursive invocation", profile.Name, item.target)
 			}
 			resolvedPreparationRoots[item.target] = true
 		}
@@ -5128,18 +6158,41 @@ func selectedKbuildSelectionsWithResolvedTargets(
 			if dependency, ok := enqueue(workItem{
 				profile: item.profile, target: prerequisite.target,
 				makeTarget: prerequisite.makeTarget, lifecycle: item.lifecycle,
+				originRootGoal: item.originRootGoal,
 			}); ok {
 				dependencies[item] = append(dependencies[item], dependency)
 			}
 		}
 		for _, child := range evaluation.children {
+			child.originRootGoal = item.originRootGoal
 			child.lifecycle = item.lifecycle
+			if parent, selected := selectedRootContinuations[profiles[child.profile].Name]; selected && parent == profile.Name {
+				// The source selected one recursive Make process with the full
+				// MAKECMDGOALS argv. An enclosing root goal only demands its own
+				// matching child goal as native ancestry. Other child goals still
+				// execute in that same source process, but cannot turn an image
+				// writer into preparation just because modules_prepare shares argv.
+				if !rootEntryTargets[item.originRootGoal] {
+					return nil, fmt.Errorf("selected root Make continuation %q has unrecognized origin goal %q", profiles[child.profile].Name, item.originRootGoal)
+				}
+				if child.target != item.originRootGoal {
+					continue
+				}
+				if preparationRoots[child.target] {
+					child.lifecycle = "prep"
+				} else {
+					child.lifecycle = "target"
+				}
+			}
 			if dependency, ok := enqueue(child); ok {
 				dependencies[item] = append(dependencies[item], dependency)
 			}
 		}
 		for _, peer := range evaluation.groupedPeers {
-			enqueueGroupedPeer(workItem{profile: item.profile, target: peer, lifecycle: item.lifecycle})
+			enqueueGroupedPeer(workItem{
+				profile: item.profile, target: peer,
+				lifecycle: item.lifecycle, originRootGoal: item.originRootGoal,
+			})
 		}
 		materializedAction := evaluation.materialized
 		if group, grouped := groupedAction[actionIdentity{profile: item.profile, target: item.target}]; grouped {
@@ -5153,7 +6206,7 @@ func selectedKbuildSelectionsWithResolvedTargets(
 	}
 	for _, target := range preparationTargets {
 		if !resolvedPreparationRoots[target] {
-			return nil, fmt.Errorf("Kbuild preparation target %q was not resolved from the root invocation", target)
+			return nil, fmt.Errorf("required Kbuild preparation marker %q was not reached through source prerequisites in selected root Make process %q", target, effectiveRootName)
 		}
 	}
 	// A FIFO closure walk may encounter a non-trigger peer before the DFS-selected
@@ -5309,11 +6362,132 @@ func selectedKbuildSelectionsWithResolvedTargets(
 			pending = append(pending, dependencies[candidate]...)
 		}
 	}
+	// A selected source script can write an artifact before its enclosing Make
+	// recipe invokes a recursive child. Admit that distinct, typed writer to
+	// the same selected-owner registry which resolves the child's initial
+	// frontier. Waiting until the final selection list is serialized loses the
+	// writer of .version at init's invocation boundary; assigning its output
+	// to the enclosing vmlinux action would instead introduce a dependency
+	// cycle through the child which consumes it.
+	sourcePhasesByAction := map[actionIdentity]kconfig.CompactKbuildSelectedSourcePhase{}
+	sourcePhasesByOwner := map[actionIdentity]map[int]actionIdentity{}
+	sourcePhaseChildByAction := map[actionIdentity]int{}
+	for profileIndex, profile := range profiles {
+		for _, phase := range profile.SelectedSourceScriptPhases {
+			owner := actionIdentity{profile: profileIndex, target: phase.OwnerTarget}
+			lifecycle := selectedLifecycle[owner]
+			if lifecycle == "" || phase.Ordinal < 0 || phase.Ordinal > 1 ||
+				kconfig.CanonicalKbuildGraphTarget(phase.OutputPath) != phase.OutputPath || phase.OutputPath == "" {
+				return nil, fmt.Errorf("source script phase output %q has no exact selected owner %s:%s", phase.OutputPath, profile.Name, phase.OwnerTarget)
+			}
+			identity := actionIdentity{profile: profileIndex, target: phase.OutputPath}
+			if selectedLifecycle[identity] != "" || sourcePhasesByAction[identity].OutputPath != "" {
+				return nil, fmt.Errorf("source script phase output %q conflicts with another selected writer in %q", phase.OutputPath, profile.Name)
+			}
+			if sourcePhasesByOwner[owner] == nil {
+				sourcePhasesByOwner[owner] = map[int]actionIdentity{}
+			}
+			if previous, exists := sourcePhasesByOwner[owner][phase.Ordinal]; exists {
+				return nil, fmt.Errorf("source script owner %s:%s repeats phase %d through %s", profile.Name, owner.target, phase.Ordinal, previous.target)
+			}
+			sourcePhasesByOwner[owner][phase.Ordinal] = identity
+			sourcePhasesByAction[identity] = phase
+			selectedLifecycle[identity] = lifecycle
+			sourceLifecycle[identity] = sourceLifecycle[owner]
+			// The source effect has no Make rule of its own. Ordinary action
+			// evaluation, command/environment lowering, and rule lookup remain
+			// owned by the enclosing source-selected Make action.
+			evaluationForAction[identity] = targetEvaluation{materialized: true, producesNonIncludeOutput: true}
+		}
+	}
 	actionsByProfile := make([][]actionIdentity, len(profiles))
 	ownerActionsByTarget := map[string][]actionIdentity{}
 	for identity := range selectedLifecycle {
 		actionsByProfile[identity.profile] = append(actionsByProfile[identity.profile], identity)
 		ownerActionsByTarget[identity.target] = append(ownerActionsByTarget[identity.target], identity)
+	}
+	// The selected Make rule has two recursive children separated by its
+	// source-owned writes. Its ordinary dependency closure includes both child
+	// invocations, so copying the complete closure to the early writer would
+	// make the first child depend on its own invocation. Keep the owner's
+	// pre-recipe prerequisites at the first phase, the first child before the
+	// second phase, and the second child before the enclosing Make output.
+	// A child may contain actions in several physical stages; its invocation
+	// boundary is weak here, while an actual artifact read remains a strong
+	// dependency when the exact visible-artifact frontier is bound below.
+	for owner, phases := range sourcePhasesByOwner {
+		first, firstFound := phases[0]
+		second, secondFound := phases[1]
+		if len(phases) != 2 || !firstFound || !secondFound {
+			return nil, fmt.Errorf("source script owner %s:%s has incomplete selected phase writes", profiles[owner.profile].Name, owner.target)
+		}
+		children := [2]int{-1, -1}
+		for _, dependency := range profiles[owner.profile].TargetInvocationDependencies {
+			if dependency.Target != owner.target {
+				continue
+			}
+			child, exists := profileByName[dependency.Profile]
+			if !exists || len(dependency.Goals) == 0 {
+				return nil, fmt.Errorf("source script owner %s:%s has missing selected child %q", profiles[owner.profile].Name, owner.target, dependency.Profile)
+			}
+			ordinal := -1
+			for index, phase := range [2]actionIdentity{first, second} {
+				if dependency.SourcePhaseBefore == phase.target {
+					ordinal = index
+				}
+			}
+			if ordinal < 0 || children[ordinal] >= 0 {
+				return nil, fmt.Errorf("source script owner %s:%s has ambiguous selected child boundary %q", profiles[owner.profile].Name, owner.target, dependency.SourcePhaseBefore)
+			}
+			children[ordinal] = child
+		}
+		if children[0] < 0 || children[1] < 0 || children[0] == children[1] ||
+			len(actionsByProfile[children[0]]) == 0 || len(actionsByProfile[children[1]]) == 0 {
+			return nil, fmt.Errorf("source script owner %s:%s has incomplete selected child actions", profiles[owner.profile].Name, owner.target)
+		}
+		sourcePhaseChildByAction[first] = children[0]
+		sourcePhaseChildByAction[second] = children[1]
+		// The two child profiles can themselves descend through recursive Make.
+		// Exclude their complete subtrees from phase zero's pre-recipe closure,
+		// keeping a distinct earlier writer of the same pathname when its
+		// profile was selected by an ordinary Make prerequisite.
+		childProfiles := map[int]bool{}
+		pending := []int{children[0], children[1]}
+		for len(pending) != 0 {
+			index := pending[0]
+			pending = pending[1:]
+			if childProfiles[index] {
+				continue
+			}
+			childProfiles[index] = true
+			for _, descendant := range profiles[index].TargetInvocationDependencies {
+				if nested, exists := profileByName[descendant.Profile]; exists {
+					pending = append(pending, nested)
+				}
+			}
+		}
+		for dependency := range nativeActionDependencies[owner] {
+			if childProfiles[dependency.profile] {
+				continue
+			}
+			if nativeActionDependencies[first] == nil {
+				nativeActionDependencies[first] = map[actionIdentity]bool{}
+			}
+			nativeActionDependencies[first][dependency] = true
+		}
+		if nativeActionDependencies[second] == nil {
+			nativeActionDependencies[second] = map[actionIdentity]bool{}
+		}
+		nativeActionDependencies[second][first] = true
+		for _, child := range actionsByProfile[children[0]] {
+			if child != second {
+				nativeActionDependencies[second][child] = true
+			}
+		}
+		if nativeActionDependencies[owner] == nil {
+			nativeActionDependencies[owner] = map[actionIdentity]bool{}
+		}
+		nativeActionDependencies[owner][second] = true
 	}
 	// Recursive Make invocation order is an execution edge even when no native
 	// prerequisite path joins the two child graphs. Keep these weak edges
@@ -5341,6 +6515,14 @@ func selectedKbuildSelectionsWithResolvedTargets(
 					}
 				}
 			}
+		}
+	}
+	for phase, childIndex := range sourcePhaseChildByAction {
+		for _, childAction := range actionsByProfile[childIndex] {
+			if invocationActionDependencies[childAction] == nil {
+				invocationActionDependencies[childAction] = map[actionIdentity]bool{}
+			}
+			invocationActionDependencies[childAction][phase] = true
 		}
 	}
 	unionGroupedActionDependencies := func(byAction map[actionIdentity]map[actionIdentity]bool) {
@@ -5473,6 +6655,12 @@ func selectedKbuildSelectionsWithResolvedTargets(
 	var producerPlanIdentity func(actionIdentity) (string, bool, error)
 	producerPlanIdentity = func(identity actionIdentity) (string, bool, error) {
 		identity = physicalAction(identity)
+		if _, phase := sourcePhasesByAction[identity]; phase {
+			// A script write is a typed source effect, not an independent Make
+			// recipe. A same-path alternative cannot be collapsed through the
+			// enclosing rule's command/environment identity.
+			return "", false, nil
+		}
 		if digest, ok := producerPlanIdentities[identity]; ok {
 			return digest, true, nil
 		}
@@ -5887,6 +7075,14 @@ func selectedKbuildSelectionsWithResolvedTargets(
 	// below may enumerate already-selected target paths under compiler-derived
 	// roots, but it never infers an output which Kbuild did not select.
 	selectedActionsByTarget := map[string][]actionIdentity{}
+	for consumer, evaluation := range evaluationForAction {
+		for _, artifact := range nativePrerequisiteArtifacts[profiles[consumer.profile].Name][consumer.target] {
+			if canonical := kconfig.CanonicalKbuildGraphTarget(artifact.Path); canonical != artifact.Path || canonical == "" ||
+				!slices.Contains(evaluation.normalPrerequisites, artifact.Path) && !slices.Contains(evaluation.orderOnly, artifact.Path) {
+				return nil, fmt.Errorf("Kbuild invocation %q action %q records native frontier artifact %q outside its declared Make prerequisites", profiles[consumer.profile].Name, consumer.target, artifact.Path)
+			}
+		}
+	}
 	for identity := range selectedLifecycle {
 		// Phony/control and directory goals execute real recipes but do not
 		// publish a file named by the target. They remain selected actions for
@@ -5911,6 +7107,17 @@ func selectedKbuildSelectionsWithResolvedTargets(
 		// prerequisites are reached through both roots and collapse to the prep
 		// lifecycle above, regardless of their eventual compiler scope.
 		if selectedLifecycle[consumer] == "prep" && selectedLifecycle[producer] != "prep" {
+			return false
+		}
+		// The next recursive Make may overwrite a pathname this consumer just
+		// wrote. Its immutable invocation-start view records the earlier
+		// version even before all compiler and object-tree observation edges
+		// have been collected. Such a successor cannot provide input to its
+		// own source-ordered predecessor, including an action which reads its
+		// output again after writing it.
+		if indexes[producer.profile].initialVisibleArtifactOwnedBy(
+			consumer.target, profiles[consumer.profile].Name, consumer.target,
+		) {
 			return false
 		}
 		return !reachability.reaches(producer, consumer)
@@ -6062,6 +7269,55 @@ func selectedKbuildSelectionsWithResolvedTargets(
 		return true, nil
 	}
 	bindSelectedGeneratedArtifact := func(consumer actionIdentity, reference, origin string) (bool, error) {
+		// A filename can have independent FORCE writers under sibling recursive
+		// Make processes. A source-declared prerequisite sees the exact version
+		// from its own completed child, not all global selected path writers.
+		artifacts := []kconfig.CompactKbuildVisibleArtifact{}
+		for _, artifact := range nativePrerequisiteArtifacts[profiles[consumer.profile].Name][consumer.target] {
+			if artifact.Path == reference {
+				artifacts = append(artifacts, artifact)
+			}
+		}
+		if len(artifacts) != 0 {
+			evaluation := evaluationForAction[consumer]
+			if !slices.Contains(evaluation.normalPrerequisites, reference) && !slices.Contains(evaluation.orderOnly, reference) {
+				return false, fmt.Errorf("Kbuild invocation %q action %q records native frontier artifact %q outside its declared Make prerequisites", profiles[consumer.profile].Name, consumer.target, reference)
+			}
+			if len(artifacts) != 1 {
+				return false, fmt.Errorf("Kbuild invocation %q action %q records %d distinct native frontier versions of %q", profiles[consumer.profile].Name, consumer.target, len(artifacts), reference)
+			}
+			owner, err := resolveVisibleArtifactOwner(consumer, artifacts[0])
+			if err != nil {
+				return false, err
+			}
+			if !slices.Contains(selectedActionsByTarget[reference], owner) || !producerCanFeed(consumer, owner) {
+				return false, fmt.Errorf("Kbuild invocation %q action %q native prerequisite %q refers to an unselected or unavailable source writer %s:%s", profiles[consumer.profile].Name, consumer.target, reference, profiles[owner.profile].Name, owner.target)
+			}
+			return bindGeneratedArtifactCandidates(consumer, reference, origin, []actionIdentity{owner}, false)
+		}
+		// A selected recursive Make child invoked for this very native
+		// prerequisite has already completed before the consumer recipe. Its
+		// returned frontier is the authority for the file the child wrote. A
+		// same-path selected action in another invocation cannot fill a missing
+		// child output, even if it is the only remaining path candidate.
+		evaluation := evaluationForAction[consumer]
+		if slices.Contains(evaluation.normalPrerequisites, reference) || slices.Contains(evaluation.orderOnly, reference) {
+			for _, dependency := range profiles[consumer.profile].TargetInvocationDependencies {
+				if kconfig.CanonicalKbuildGraphTarget(dependency.Target) != reference {
+					continue
+				}
+				child, selected := profileByName[dependency.Profile]
+				childOutput := actionIdentity{profile: child, target: reference}
+				if !selected || !slices.Contains(selectedActionsByTarget[reference], childOutput) ||
+					!nativeActionDependencies[consumer][childOutput] {
+					continue
+				}
+				return false, fmt.Errorf(
+					"Kbuild invocation %q action %q native prerequisite %q has no completed output from selected recursive Make child %q",
+					profiles[consumer.profile].Name, consumer.target, reference, dependency.Profile,
+				)
+			}
+		}
 		return bindGeneratedArtifactCandidates(
 			consumer, reference, origin, selectedFeedCandidates(consumer, reference), false,
 		)
@@ -6648,9 +7904,26 @@ func selectedKbuildSelectionsWithResolvedTargets(
 			}
 		}
 		if observation.ObservesAll {
-			originItem := workItem{profile: effect.origin.profile, target: effect.origin.target, lifecycle: effect.lifecycle}
+			originItems := []workItem{}
+			for item := range scheduled {
+				if item.profile == effect.origin.profile && item.target == effect.origin.target && item.lifecycle == effect.lifecycle {
+					originItems = append(originItems, item)
+				}
+			}
+			if len(originItems) == 0 {
+				return nil, fmt.Errorf("deferred query %q all-visible source origin %s:%s has no selected goal frontier", effect.query.Token, profiles[effect.origin.profile].Name, effect.origin.target)
+			}
+			sort.Slice(originItems, func(i, j int) bool {
+				if originItems[i].originRootGoal != originItems[j].originRootGoal {
+					return originItems[i].originRootGoal < originItems[j].originRootGoal
+				}
+				return originItems[i].makeTarget < originItems[j].makeTarget
+			})
 			seen := map[workItem]bool{}
-			pending := append([]workItem(nil), dependencies[originItem]...)
+			pending := []workItem{}
+			for _, origin := range originItems {
+				pending = append(pending, dependencies[origin]...)
+			}
 			for len(pending) != 0 {
 				candidate := pending[0]
 				pending = pending[1:]
@@ -7221,6 +8494,30 @@ func selectedKbuildSelectionsWithResolvedTargets(
 			scope = "host"
 			stage = "host"
 		}
+		if phase, found := sourcePhasesByAction[identity]; found {
+			owner := actionIdentity{profile: identity.profile, target: phase.OwnerTarget}
+			ownerEffect := actionEffect(owner)
+			ownerStage := effectStage(ownerEffect)
+			ownerScope := "target"
+			if prehostScoped[ownerEffect] || hostScoped[ownerEffect] {
+				ownerScope = "host"
+			}
+			if lifecycle != effectLifecycle[ownerEffect] || scope != ownerScope || stage != ownerStage {
+				return nil, fmt.Errorf("source script phase %s:%s has stage %s/%s outside enclosing owner %s:%s stage %s/%s",
+					profiles[identity.profile].Name, identity.target, stage, scope,
+					profiles[owner.profile].Name, owner.target, ownerStage, ownerScope)
+			}
+			kind := "version"
+			if phase.Ordinal == 1 {
+				kind = "object"
+			}
+			selections = append(selections, kconfig.CompactKbuildSelection{
+				Profile: profiles[identity.profile].Name, Target: identity.target,
+				MakeTarget: identity.target, SourceScriptPhase: kind,
+				Lifecycle: lifecycle, Scope: scope, Stage: stage,
+			})
+			continue
+		}
 		groupedTrigger := ""
 		if _, grouped := groupedAction[identity]; grouped {
 			groupedTrigger = physical.target
@@ -7321,6 +8618,9 @@ type kbuildResolvedTargetKey struct {
 	profile    string
 	target     string
 	makeTarget string
+	selected   bool
+	ruleIndex  int
+	stem       string
 }
 
 type kbuildResolvedTargetResult struct {
@@ -7360,6 +8660,32 @@ func (c *kbuildResolvedTargetCache) resolve(
 		return cached.resolved, cached.err
 	}
 	resolved, err := kconfig.ResolveCompactKbuildTargetForMakeTarget(profile, target, makeTarget)
+	c.values[key] = kbuildResolvedTargetResult{resolved: resolved, err: err}
+	c.profileKeys[profile.Name] = append(c.profileKeys[profile.Name], key)
+	return resolved, err
+}
+
+func (c *kbuildResolvedTargetCache) resolveSelected(
+	profile kconfig.CompactKbuildProfile,
+	target, makeTarget string,
+	ruleIndex int,
+	stem string,
+) (*kconfig.CompactKbuildResolvedTarget, error) {
+	target = kconfig.CanonicalKbuildGraphTarget(target)
+	makeTarget = kbuildProfileLookupTarget(profile, target, makeTarget)
+	if c == nil {
+		return kconfig.ResolveCompactKbuildTargetForSelectedRule(profile, target, makeTarget, ruleIndex, stem)
+	}
+	base := kbuildResolvedTargetKey{profile: profile.Name, target: target, makeTarget: makeTarget}
+	if cached, ok := c.values[base]; ok && cached.err == nil && cached.resolved.MatchesSelectedRule(ruleIndex, stem) {
+		return cached.resolved, nil
+	}
+	key := base
+	key.selected, key.ruleIndex, key.stem = true, ruleIndex, stem
+	if cached, ok := c.values[key]; ok {
+		return cached.resolved, cached.err
+	}
+	resolved, err := kconfig.ResolveCompactKbuildTargetForSelectedRule(profile, target, makeTarget, ruleIndex, stem)
 	c.values[key] = kbuildResolvedTargetResult{resolved: resolved, err: err}
 	c.profileKeys[profile.Name] = append(c.profileKeys[profile.Name], key)
 	return resolved, err
@@ -7469,6 +8795,18 @@ func (i *kbuildProfileTargetIndex) resolveTarget(
 		return kconfig.ResolveCompactKbuildTargetForMakeTarget(profile, target, makeTarget)
 	}
 	return i.resolvedTargets.resolve(profile, target, makeTarget)
+}
+
+func (i *kbuildProfileTargetIndex) resolveSelectedTarget(
+	profile kconfig.CompactKbuildProfile,
+	target, makeTarget string,
+	ruleIndex int,
+	stem string,
+) (*kconfig.CompactKbuildResolvedTarget, error) {
+	if i == nil {
+		return kconfig.ResolveCompactKbuildTargetForSelectedRule(profile, target, makeTarget, ruleIndex, stem)
+	}
+	return i.resolvedTargets.resolveSelected(profile, target, makeTarget, ruleIndex, stem)
 }
 
 // initialVisibleArtifact returns the same last source-ordered exact owner as
@@ -7673,20 +9011,10 @@ func kbuildSelectionPrerequisiteMakeTargets(prerequisites []kbuildSelectionPrere
 	return targets
 }
 
-func canonicalKbuildSelectionPrerequisites(targets []string) []kbuildSelectionPrerequisite {
-	prerequisites := make([]kbuildSelectionPrerequisite, len(targets))
-	for index, target := range targets {
-		prerequisites[index] = kbuildSelectionPrerequisite{target: target, makeTarget: target}
-	}
-	return prerequisites
-}
-
-// evaluateSelectedKbuildRuleContextForMakeTarget keeps evaluator-backed target
-// resolution authoritative while recovering each declaration's exact Make
-// spelling. A lexical target which canonicalizes across directories already
-// has a uniquely reconstructed indexed context; deferring its full resolution
-// until an executable action needs provenance avoids doing that work for
-// dependency-only declarations.
+// evaluateSelectedKbuildRuleContextForMakeTarget binds prerequisites and
+// effects to the same source-selected recipe. The indexed walk can see exact
+// virtual inputs absent from the physical source tree; repeating an implicit
+// rule search from that tree may choose another recipe for the same target.
 func evaluateSelectedKbuildRuleContextForMakeTarget(
 	profile kconfig.CompactKbuildProfile,
 	index *kbuildProfileTargetIndex,
@@ -7695,24 +9023,27 @@ func evaluateSelectedKbuildRuleContextForMakeTarget(
 ) ([]kbuildSelectionPrerequisite, []kbuildSelectionPrerequisite, string, *kconfig.CompactKbuildResolvedTarget, error) {
 	target = kconfig.CanonicalKbuildGraphTarget(target)
 	makeTarget = kbuildProfileLookupTarget(profile, target, makeTarget)
-	reconstructedNormal, reconstructedOrderOnly, reconstructedStem, reconstructed, err :=
-		reconstructSelectedKbuildRuleContextForMakeTarget(
+	selectedCandidate, reconstructed, err :=
+		selectedIndexedKbuildRecipeCandidateForMakeTarget(
 			profile, index, target, makeTarget, ruleIndexes, effectiveRecipeIndexes,
 		)
 	if err != nil {
 		return nil, nil, "", nil, err
 	}
-	if makeTarget != target {
-		if !reconstructed {
-			return nil, nil, "", nil, fmt.Errorf(
-				"lexical Make target %q (canonical %q) has no unique selected recipe context",
-				makeTarget, target,
-			)
-		}
-		return reconstructedNormal, reconstructedOrderOnly, reconstructedStem, nil, nil
+	if !reconstructed && makeTarget != target {
+		return nil, nil, "", nil, fmt.Errorf(
+			"lexical Make target %q (canonical %q) has no unique selected recipe context",
+			makeTarget, target,
+		)
 	}
-
-	resolved, err := index.resolveTarget(profile, target, makeTarget)
+	var resolved *kconfig.CompactKbuildResolvedTarget
+	if reconstructed {
+		resolved, err = index.resolveSelectedTarget(
+			profile, target, makeTarget, selectedCandidate.index, selectedCandidate.stem,
+		)
+	} else {
+		resolved, err = index.resolveTarget(profile, target, makeTarget)
+	}
 	if err != nil {
 		return nil, nil, "", nil, err
 	}
@@ -7720,130 +9051,68 @@ func evaluateSelectedKbuildRuleContextForMakeTarget(
 	if err != nil {
 		return nil, nil, "", nil, err
 	}
-	normal := make([]string, len(context.Normal))
+	normal := make([]kbuildSelectionPrerequisite, len(context.Normal))
 	for index, prerequisite := range context.Normal {
-		normal[index] = prerequisite.Target
-	}
-	orderOnly := make([]string, len(context.OrderOnly))
-	for index, prerequisite := range context.OrderOnly {
-		orderOnly[index] = prerequisite.Target
-	}
-	stem := context.Stem
-	if reconstructed && stem == reconstructedStem &&
-		kbuildSelectionPrerequisiteTargetsEqual(normal, reconstructedNormal) &&
-		kbuildSelectionPrerequisiteTargetsEqual(orderOnly, reconstructedOrderOnly) {
-		return reconstructedNormal, reconstructedOrderOnly, stem, resolved, nil
-	}
-	return canonicalKbuildSelectionPrerequisites(normal), canonicalKbuildSelectionPrerequisites(orderOnly), stem, resolved, nil
-}
-
-func kbuildSelectionPrerequisiteTargetsEqual(
-	targets []string,
-	prerequisites []kbuildSelectionPrerequisite,
-) bool {
-	if len(targets) != len(prerequisites) {
-		return false
-	}
-	for index, target := range targets {
-		if kconfig.CanonicalKbuildGraphTarget(target) != prerequisites[index].target {
-			return false
+		normal[index] = kbuildSelectionPrerequisite{
+			target: prerequisite.Target, makeTarget: prerequisite.MakeTarget,
 		}
 	}
-	return true
+	orderOnly := make([]kbuildSelectionPrerequisite, len(context.OrderOnly))
+	for index, prerequisite := range context.OrderOnly {
+		orderOnly[index] = kbuildSelectionPrerequisite{
+			target: prerequisite.Target, makeTarget: prerequisite.MakeTarget,
+		}
+	}
+	return normal, orderOnly, context.Stem, resolved, nil
 }
 
-// reconstructSelectedKbuildRuleContextForMakeTarget mirrors GNU Make's
-// selected-recipe-first prerequisite merge from the immutable indexed rules.
-// It is deliberately narrow: independent double-colon recipes fall back to the
-// evaluator path because they do not have one shared automatic-variable stem.
-func reconstructSelectedKbuildRuleContextForMakeTarget(
+// selectedIndexedKbuildRecipeCandidateForMakeTarget retains the exact rule
+// chosen with the indexed walk's virtual prerequisite frontier. Independent
+// double-colon recipes lack one shared selected context and use ordinary
+// evaluator resolution instead.
+func selectedIndexedKbuildRecipeCandidateForMakeTarget(
 	profile kconfig.CompactKbuildProfile,
 	index *kbuildProfileTargetIndex,
 	target, makeTarget string,
 	ruleIndexes, effectiveRecipeIndexes []int,
-) ([]kbuildSelectionPrerequisite, []kbuildSelectionPrerequisite, string, bool, error) {
+) (kbuildProfileRuleCandidate, bool, error) {
 	if len(effectiveRecipeIndexes) != 1 {
-		return nil, nil, "", false, nil
+		return kbuildProfileRuleCandidate{}, false, nil
 	}
-	effectiveRuleIndex := effectiveRecipeIndexes[0]
 	selectedRules := map[int]bool{}
 	for _, ruleIndex := range ruleIndexes {
 		selectedRules[ruleIndex] = true
 	}
 	matches := index.ruleMatches(profile, target, makeTarget)
 	selected := kbuildProfileRuleCandidate{}
-	selectedFound := false
+	found := false
 	for _, candidates := range [][]kbuildProfileRuleCandidate{matches.explicit, matches.implicit} {
 		for _, candidate := range candidates {
-			if candidate.index == effectiveRuleIndex && selectedRules[candidate.index] {
-				selected = candidate
-				selectedFound = true
-				break
-			}
-		}
-		if selectedFound {
-			break
-		}
-	}
-	if !selectedFound {
-		return nil, nil, "", false, nil
-	}
-
-	contextRules := []kbuildProfileRuleCandidate{selected}
-	selectedRule := profile.Rules[selected.index]
-	if selectedRule.Separator != "::" {
-		for _, candidate := range matches.explicit {
-			if candidate.index == selected.index || !selectedRules[candidate.index] {
+			if candidate.index != effectiveRecipeIndexes[0] || !selectedRules[candidate.index] {
 				continue
 			}
-			if profile.Rules[candidate.index].Separator == "::" {
-				return nil, nil, "", false, fmt.Errorf(
+			if found {
+				return kbuildProfileRuleCandidate{}, false, fmt.Errorf(
+					"target %q has multiple matches for source-selected rule %d", target, candidate.index,
+				)
+			}
+			selected, found = candidate, true
+		}
+	}
+	if !found {
+		return kbuildProfileRuleCandidate{}, false, nil
+	}
+	if profile.Rules[selected.index].Separator != "::" {
+		for _, candidate := range matches.explicit {
+			if candidate.index != selected.index && selectedRules[candidate.index] &&
+				profile.Rules[candidate.index].Separator == "::" {
+				return kbuildProfileRuleCandidate{}, false, fmt.Errorf(
 					"target %q mixes independent double-colon and merged rule contexts", target,
 				)
 			}
-			contextRules = append(contextRules, candidate)
 		}
 	}
-
-	expand := func(orderOnly bool) []kbuildSelectionPrerequisite {
-		prerequisites := []kbuildSelectionPrerequisite{}
-		for _, candidate := range contextRules {
-			values := profile.Rules[candidate.index].Prerequisites
-			if orderOnly {
-				values = profile.Rules[candidate.index].OrderOnly
-			}
-			for _, value := range values {
-				makeWord := value
-				if strings.Count(makeWord, "%") == 1 {
-					makeWord = strings.Replace(makeWord, "%", candidate.stem, 1)
-				}
-				graphPath := kbuildProfileTarget(profile, makeWord)
-				if graphPath == "" {
-					continue
-				}
-				prerequisites = append(prerequisites, kbuildSelectionPrerequisite{
-					target: graphPath, makeTarget: filepath.ToSlash(strings.TrimSpace(makeWord)),
-				})
-			}
-		}
-		return prerequisites
-	}
-	normal := expand(false)
-	orderOnly := expand(true)
-	if len(orderOnly) != 0 {
-		normalTargets := make(map[string]bool, len(normal))
-		for _, prerequisite := range normal {
-			normalTargets[prerequisite.target] = true
-		}
-		filtered := orderOnly[:0]
-		for _, prerequisite := range orderOnly {
-			if !normalTargets[prerequisite.target] {
-				filtered = append(filtered, prerequisite)
-			}
-		}
-		orderOnly = filtered
-	}
-	return normal, orderOnly, selected.stem, true, nil
+	return selected, true, nil
 }
 
 func (index *kbuildProfileTargetIndex) targetIsPhony(profile kconfig.CompactKbuildProfile, target string) bool {
@@ -8007,18 +9276,66 @@ func kbuildProfileImplicitRuleViableIndexed(
 	activeRules[candidate.index] = true
 	defer delete(activeRules, candidate.index)
 	rule := profile.Rules[candidate.index]
-	for _, prerequisites := range [][]string{rule.Prerequisites, rule.OrderOnly} {
-		for _, rawPrerequisite := range prerequisites {
-			makePrerequisite := strings.Replace(rawPrerequisite, "%", candidate.stem, 1)
-			prerequisite := kbuildProfileTarget(profile, makePrerequisite)
-			if prerequisite == "" || prerequisite == "FORCE" || prerequisite == target || satisfied[prerequisite] {
-				continue
-			}
-			if !kbuildProfileTargetCanBeMadeIndexedForMakeTarget(
-				profile, index, prerequisite, makePrerequisite, satisfied, stack, activeRules,
-			) {
+	prerequisites := []kbuildSelectionPrerequisite{}
+	if rule.SecondExpansion {
+		// The selected target-entry snapshot owns the second expansion;
+		// another implicit candidate cannot borrow that rule's later Make view.
+		if entry := kconfig.CompactKbuildSelectedControlRuleEntrySnapshot(profile, target); entry != nil {
+			if entry.Line.RuleIndex != candidate.index {
 				return false
 			}
+			if entry.Line.Target != target || entry.Line.Stem != candidate.stem ||
+				entry.Line.LookupTarget != candidate.lookupTarget {
+				return true
+			}
+		}
+		for _, snapshot := range kconfig.CompactKbuildSelectedControlRecipeSnapshots(profile, target) {
+			if snapshot != nil && snapshot.Line.RuleIndex != candidate.index {
+				return false
+			}
+			if snapshot == nil || snapshot.Line.Target != target ||
+				snapshot.Line.Stem != candidate.stem || snapshot.Line.LookupTarget != candidate.lookupTarget {
+				// A corrupt snapshot may still name the selected candidate. Let
+				// exact rule evaluation report its source mismatch rather than
+				// silently skipping the candidate's output writer.
+				return true
+			}
+		}
+		context, err := kconfig.EvaluateCompactKbuildCandidatePrerequisitesForMakeTarget(
+			profile, target, candidate.lookupTarget, candidate.index, candidate.stem,
+		)
+		if err != nil {
+			// A candidate whose expansion cannot be proved may still be the
+			// first source-selected recipe. Keep it eligible so the exact rule
+			// context fails closed during the selected target walk instead of
+			// silently skipping its prerequisite and output writer.
+			return true
+		}
+		for _, value := range append(context.Normal, context.OrderOnly...) {
+			prerequisites = append(prerequisites, kbuildSelectionPrerequisite{
+				target: value.Target, makeTarget: value.MakeTarget,
+			})
+		}
+	} else {
+		for _, values := range [][]string{rule.Prerequisites, rule.OrderOnly} {
+			for _, raw := range values {
+				makeWord := strings.Replace(raw, "%", candidate.stem, 1)
+				prerequisites = append(prerequisites, kbuildSelectionPrerequisite{
+					target: kbuildProfileTarget(profile, makeWord), makeTarget: makeWord,
+				})
+			}
+		}
+	}
+	for _, selected := range prerequisites {
+		prerequisite := selected.target
+		makePrerequisite := selected.makeTarget
+		if prerequisite == "" || prerequisite == "FORCE" || prerequisite == target || satisfied[prerequisite] {
+			continue
+		}
+		if !kbuildProfileTargetCanBeMadeIndexedForMakeTarget(
+			profile, index, prerequisite, makePrerequisite, satisfied, stack, activeRules,
+		) {
+			return false
 		}
 	}
 	return true
@@ -8108,14 +9425,14 @@ func kbuildProfileRuleAutomaticTarget(
 	profile kconfig.CompactKbuildProfile,
 	rule kconfig.KbuildRule,
 	target, stem string,
-) string {
+) (string, error) {
 	for _, declared := range rule.Targets {
 		candidate := strings.Replace(declared, "%", stem, 1)
 		if kbuildProfileTarget(profile, candidate) == target {
-			return candidate
+			return kconfig.StableCompactKbuildMakeWord(profile, candidate)
 		}
 	}
-	return target
+	return kconfig.StableCompactKbuildMakeWord(profile, target)
 }
 
 func kbuildRecipeHasAction(recipe string) bool {
@@ -8192,13 +9509,14 @@ func kbuildInvocationDefaultGoal(profile kconfig.CompactKbuildProfile) (string, 
 }
 
 type kbuildRecursiveMakePlanEntry struct {
-	key             string
-	request         kbuildInvocationRequest
-	predecessors    []string
-	consumers       []string
-	frontier        *kbuildRecursiveMakeFrontier
-	replayArguments []string
-	control         *kconfig.KbuildControlEvaluation
+	key               string
+	request           kbuildInvocationRequest
+	predecessors      []string
+	consumers         []string
+	frontier          *kbuildRecursiveMakeFrontier
+	replayArguments   []string
+	control           *kconfig.KbuildControlEvaluation
+	sourcePhaseBefore string
 }
 
 // kbuildRecursiveMakeFrontierEvent is one source-ordered mutation of the
@@ -8206,13 +9524,19 @@ type kbuildRecursiveMakePlanEntry struct {
 // event is a local write by this profile; an invocation event applies the
 // completed frontier of an earlier child invocation. Exactly one field is set.
 type kbuildRecursiveMakeFrontierEvent struct {
-	artifact   kconfig.CompactKbuildVisibleArtifact
-	invocation string
+	artifact    kconfig.CompactKbuildVisibleArtifact
+	invocation  string
+	sourcePhase *kbuildSelectedSourceScriptPhase
 	// command is the exact source-selected recipe segment which materializes
 	// artifact. It remains symbolic until replay, then a deliberately small
 	// shell projection may prove its bytes without executing the recipe.
 	command       string
 	commandTarget string
+	// recipeControl freezes the source Make expression scope before this
+	// particular writer. Replaying an earlier event with the invocation's final
+	// target evaluator could instead read bytes produced by a later line.
+	recipeControl  *kconfig.KbuildControlEvaluation
+	recipeSnapshot *kconfig.KbuildSelectedControlRecipeSnapshot
 }
 
 // kbuildRecursiveMakeFrontier is one immutable node in the causal object-tree
@@ -8256,6 +9580,19 @@ func kbuildRecursiveMakeFrontierEventIdentity(event kbuildRecursiveMakeFrontierE
 		canonicalKbuildToolsetPathCapabilityIdentity(event.artifact.Target),
 		canonicalKbuildToolsetPathCapabilityIdentity(event.commandTarget),
 		canonicalKbuildToolsetPathCapabilityIdentity(event.command),
+		func() string {
+			if event.sourcePhase == nil {
+				return ""
+			}
+			return fmt.Sprintf("%s\x00%d\x00%s\x00%v", event.sourcePhase.sourcePath,
+				event.sourcePhase.ordinal, event.sourcePhase.sourceSHA256, event.sourcePhase.spans)
+		}(),
+		func() string {
+			if event.recipeSnapshot == nil {
+				return ""
+			}
+			return event.recipeSnapshot.ReadIdentity()
+		}(),
 	}, "\x1f")
 }
 
@@ -8396,40 +9733,44 @@ func kbuildRecursiveMakePlanKey(
 // that source-owned ordering after invocation profiles are sorted for stable
 // serialization.
 func selectedKbuildRecursiveMakePlan(profile kconfig.CompactKbuildProfile, satisfied map[string]bool) ([]kbuildRecursiveMakePlanEntry, error) {
-	return selectedKbuildRecursiveMakePlanWithControl(profile, satisfied, nil)
+	return selectedKbuildRecursiveMakePlanWithCompletion(profile, satisfied, nil)
 }
 
-func selectedKbuildRecursiveMakePlanWithControl(
+// selectedKbuildRecursiveMakePlanWithCompletion returns the causal object-tree
+// frontier: independent prerequisites branch and join before their consumer,
+// while successive effects within a recipe remain sequenced.
+func selectedKbuildRecursiveMakePlanWithCompletion(
 	profile kconfig.CompactKbuildProfile,
 	satisfied map[string]bool,
-	control *kconfig.KbuildControlEvaluation,
-) ([]kbuildRecursiveMakePlanEntry, error) {
-	return selectedKbuildRecursiveMakePlanWithControlAndCompletion(profile, satisfied, control, nil)
-}
-
-// selectedKbuildRecursiveMakePlanWithControlAndCompletion additionally returns
-// the causal object-tree frontier at invocation completion. Independent Make
-// prerequisites branch from the same initial state and join only before their
-// consuming recipe; successive effects within a recipe remain sequenced.
-// Production discovery replays that immutable frontier after recursively
-// completing each child so later Make processes can observe both generated-file
-// existence and exact source-derived bytes. The older wrapper remains the
-// focused-test seam.
-func selectedKbuildRecursiveMakePlanWithControlAndCompletion(
-	profile kconfig.CompactKbuildProfile,
-	satisfied map[string]bool,
-	control *kconfig.KbuildControlEvaluation,
 	completion **kbuildRecursiveMakeFrontier,
 ) ([]kbuildRecursiveMakePlanEntry, error) {
-	return selectedKbuildRecursiveMakePlanWithResolvedTargets(profile, satisfied, control, completion, nil)
+	return selectedKbuildRecursiveMakePlanWithCausalTraversal(profile, satisfied, completion, nil, nil, nil)
 }
 
-func selectedKbuildRecursiveMakePlanWithResolvedTargets(
+// One traversal owns Make prerequisite completion, recursive child completion,
+// and every recipe's immutable file/control snapshot. Callbacks run in source
+// order; a later line cannot observe an unprocessed child or a later writer.
+type kbuildCausalRecipeTraversal struct {
+	beginTarget       func(target, makeTarget, parentTarget string) (kconfig.CompactKbuildProfile, error)
+	beforeLine        func(line kconfig.KbuildSelectedControlRecipeLine, frontier *kbuildRecursiveMakeFrontier) (*kconfig.KbuildSelectedControlRecipeSnapshot, error)
+	afterLine         func(snapshot *kconfig.KbuildSelectedControlRecipeSnapshot) error
+	completeChild     func(entry kbuildRecursiveMakePlanEntry) error
+	boundProfile      func(profile kconfig.CompactKbuildProfile) error
+	recordSourcePhase func(phase kconfig.CompactKbuildSelectedSourcePhase) error
+}
+
+type kbuildTargetNativePrerequisiteFrontier struct {
+	frontier *kbuildRecursiveMakeFrontier
+	paths    []string
+}
+
+func selectedKbuildRecursiveMakePlanWithCausalTraversal(
 	profile kconfig.CompactKbuildProfile,
 	satisfied map[string]bool,
-	control *kconfig.KbuildControlEvaluation,
 	completion **kbuildRecursiveMakeFrontier,
 	resolvedTargets *kbuildResolvedTargetCache,
+	beforeRecipe *map[string]kbuildTargetNativePrerequisiteFrontier,
+	causal *kbuildCausalRecipeTraversal,
 ) ([]kbuildRecursiveMakePlanEntry, error) {
 	plan := []kbuildRecursiveMakePlanEntry{}
 	planByRequest := map[string]int{}
@@ -8504,6 +9845,10 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 			replayByRequest[requestKey] = append([]string(nil), invocation.replayArguments...)
 		}
 		key := kbuildRecursiveMakePlanKey(request, frontier)
+		phaseBefore := ""
+		if frontier != nil && frontier.hasEvent && frontier.event.sourcePhase != nil {
+			phaseBefore = frontier.event.sourcePhase.outputPath
+		}
 		filteredPredecessors := []string{}
 		for _, predecessor := range terminals {
 			if predecessor != key && !requestDependsOn(predecessor, key) {
@@ -8519,34 +9864,62 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 			}
 			plan[index].predecessors = appendUnique(plan[index].predecessors, filteredPredecessors...)
 			plan[index].consumers = appendUnique(plan[index].consumers, consumer)
+			if plan[index].sourcePhaseBefore != phaseBefore {
+				return nil, nil, fmt.Errorf("recursive Make child %q has inconsistent source phase predecessor %q and %q", request.name, plan[index].sourcePhaseBefore, phaseBefore)
+			}
 		} else {
 			planByRequest[key] = len(plan)
 			plan = append(plan, kbuildRecursiveMakePlanEntry{
 				key: key, request: request, predecessors: filteredPredecessors, consumers: []string{consumer},
-				frontier:        frontier,
-				replayArguments: append([]string(nil), invocation.replayArguments...),
-				control:         recipeControl,
+				frontier:          frontier,
+				replayArguments:   append([]string(nil), invocation.replayArguments...),
+				control:           recipeControl,
+				sourcePhaseBefore: phaseBefore,
 			})
+		}
+		if causal != nil && causal.completeChild != nil {
+			if err := causal.completeChild(plan[planByRequest[key]]); err != nil {
+				return nil, nil, fmt.Errorf("complete recursive Make child %q before %q continues: %w", request.name, consumer, err)
+			}
 		}
 		frontier = frontiers.sequence(frontier, kbuildRecursiveMakeFrontierEvent{invocation: key})
 		return []string{key}, frontier, nil
 	}
 
-	var visit func(kbuildSelectionPrerequisite, string, bool) (traversalResult, error)
-	visit = func(input kbuildSelectionPrerequisite, origin string, includeSatisfied bool) (traversalResult, error) {
+	var visit func(kbuildSelectionPrerequisite, string, bool, string) (traversalResult, error)
+	visit = func(input kbuildSelectionPrerequisite, origin string, includeSatisfied bool, parentTarget string) (traversalResult, error) {
 		target := kconfig.CanonicalKbuildGraphTarget(input.target)
 		makeTarget := kbuildProfileLookupTarget(profile, target, input.makeTarget)
 		if err := validateKbuildTraversalTarget(profile.Name, origin, target); err != nil {
 			return traversalResult{}, err
 		}
-		if target == "" || target == "FORCE" ||
-			currentness.targetIsSatisfied(target) && !includeSatisfied {
+		if target == "" || target == "FORCE" {
+			return traversalResult{}, nil
+		}
+		entryProfile := profile
+		entryIndex := ruleIndex
+		entryCurrentness := currentness
+		if causal != nil && causal.beginTarget != nil {
+			var err error
+			entryProfile, err = causal.beginTarget(target, makeTarget, parentTarget)
+			if err != nil {
+				return traversalResult{}, fmt.Errorf("begin selected target %s under %s: %w", target, parentTarget, err)
+			}
+			// Share only immutable rule shape. Resolution belongs to this target's
+			// generation and first-reached scope, not the profile's final state.
+			entry := *ruleIndex
+			entry.matches = map[kbuildProfileRuleLookup]kbuildProfileRuleMatches{}
+			entry.resolvedTargets = newKbuildResolvedTargetCache()
+			entryIndex = &entry
+			entryCurrentness = newKbuildProfileTargetSatisfaction(entryProfile, entryIndex, satisfied)
+		}
+		if !includeSatisfied && entryCurrentness.targetIsSatisfied(target) {
 			return traversalResult{}, nil
 		}
 		if _, _, trigger, _, grouped := kconfig.CompactKbuildGroupedActionForTarget(profile, target); grouped && target != trigger {
 			result, err := visit(kbuildSelectionPrerequisite{
 				target: trigger, makeTarget: trigger,
-			}, "grouped trigger for "+target, true)
+			}, "grouped trigger for "+target, true, target)
 			if err != nil {
 				return traversalResult{}, err
 			}
@@ -8566,9 +9939,9 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 		}
 		targetState[target] = 1
 		ruleIndexes := kbuildProfileRuleIndexesForMakeTargetIndexed(
-			profile, ruleIndex, target, makeTarget, satisfied,
+			entryProfile, entryIndex, target, makeTarget, satisfied,
 		)
-		effectiveRecipeIndexes, effectiveRecipeErr := kconfig.EffectiveCompactKbuildRecipeRuleIndexes(profile, ruleIndexes)
+		effectiveRecipeIndexes, effectiveRecipeErr := kconfig.EffectiveCompactKbuildRecipeRuleIndexes(entryProfile, ruleIndexes)
 		if effectiveRecipeErr != nil {
 			return traversalResult{}, fmt.Errorf("select effective recipes for target %s: %w", target, effectiveRecipeErr)
 		}
@@ -8578,14 +9951,14 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 		if len(ruleIndexes) != 0 {
 			var contextErr error
 			normal, orderOnly, stem, _, contextErr = evaluateSelectedKbuildRuleContextForMakeTarget(
-				profile, ruleIndex, target, makeTarget, ruleIndexes, effectiveRecipeIndexes,
+				entryProfile, entryIndex, target, makeTarget, ruleIndexes, effectiveRecipeIndexes,
 			)
 			if contextErr != nil {
 				return traversalResult{}, fmt.Errorf("evaluate selected target %s prerequisite context: %w", target, contextErr)
 			}
 		}
 		groupRuleIndex, groupOutputs, grouped, groupErr := kconfig.ResolveCompactKbuildGroupedRule(
-			profile, ruleIndexes, target, stem,
+			entryProfile, ruleIndexes, target, stem,
 		)
 		if groupErr != nil {
 			return traversalResult{}, fmt.Errorf("resolve selected target %s grouped outputs: %w", target, groupErr)
@@ -8603,7 +9976,7 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 				targetState[target] = 0
 				result, err := visit(kbuildSelectionPrerequisite{
 					target: trigger, makeTarget: trigger,
-				}, "grouped trigger for "+target, true)
+				}, "grouped trigger for "+target, true, target)
 				if err != nil {
 					return traversalResult{}, err
 				}
@@ -8615,7 +9988,7 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 		predecessors := []string{}
 		prerequisiteFrontiers := []*kbuildRecursiveMakeFrontier{}
 		for _, prerequisite := range append(append([]kbuildSelectionPrerequisite(nil), normal...), orderOnly...) {
-			result, err := visit(prerequisite, "prerequisite of "+target, false)
+			result, err := visit(prerequisite, "prerequisite of "+target, false, target)
 			if err != nil {
 				return traversalResult{}, err
 			}
@@ -8626,26 +9999,40 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 			if peer == target {
 				continue
 			}
-			peerMakeTarget := kbuildProfileRuleAutomaticTarget(
+			peerMakeTarget, peerMakeErr := kbuildProfileRuleAutomaticTarget(
 				profile, profile.Rules[groupRuleIndex], peer, stem,
 			)
+			if peerMakeErr != nil {
+				return traversalResult{}, fmt.Errorf("grouped peer %q under %q automatic $@ word: %w", peer, target, peerMakeErr)
+			}
+			peerProfile := entryProfile
+			peerIndex := *entryIndex
+			peerIndex.matches = map[kbuildProfileRuleLookup]kbuildProfileRuleMatches{}
+			peerIndex.resolvedTargets = newKbuildResolvedTargetCache()
+			if causal != nil && causal.beginTarget != nil {
+				var err error
+				peerProfile, err = causal.beginTarget(peer, peerMakeTarget, target)
+				if err != nil {
+					return traversalResult{}, fmt.Errorf("begin grouped peer %s under %s: %w", peer, target, err)
+				}
+			}
 			peerRuleIndexes := kbuildProfileRuleIndexesForMakeTargetIndexed(
-				profile, ruleIndex, peer, peerMakeTarget, satisfied,
+				peerProfile, &peerIndex, peer, peerMakeTarget, satisfied,
 			)
 			peerEffectiveRecipeIndexes, peerEffectiveRecipeErr := kconfig.EffectiveCompactKbuildRecipeRuleIndexes(
-				profile, peerRuleIndexes,
+				peerProfile, peerRuleIndexes,
 			)
 			if peerEffectiveRecipeErr != nil {
 				return traversalResult{}, peerEffectiveRecipeErr
 			}
 			peerNormal, peerOrderOnly, peerStem, _, contextErr := evaluateSelectedKbuildRuleContextForMakeTarget(
-				profile, ruleIndex, peer, peerMakeTarget, peerRuleIndexes, peerEffectiveRecipeIndexes,
+				peerProfile, &peerIndex, peer, peerMakeTarget, peerRuleIndexes, peerEffectiveRecipeIndexes,
 			)
 			if contextErr != nil {
 				return traversalResult{}, fmt.Errorf("evaluate grouped peer %s prerequisite context: %w", peer, contextErr)
 			}
 			peerRuleIndex, peerOutputs, peerGrouped, peerErr := kconfig.ResolveCompactKbuildGroupedRule(
-				profile, peerRuleIndexes, peer, peerStem,
+				peerProfile, peerRuleIndexes, peer, peerStem,
 			)
 			if peerErr != nil {
 				return traversalResult{}, peerErr
@@ -8657,7 +10044,7 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 				return traversalResult{}, err
 			}
 			for _, prerequisite := range append(append([]kbuildSelectionPrerequisite(nil), peerNormal...), peerOrderOnly...) {
-				result, err := visit(prerequisite, "prerequisite of grouped peer "+peer, false)
+				result, err := visit(prerequisite, "prerequisite of grouped peer "+peer, false, peer)
 				if err != nil {
 					return traversalResult{}, err
 				}
@@ -8668,24 +10055,49 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 
 		terminals := reduceTerminals(predecessors)
 		frontier := frontiers.join(prerequisiteFrontiers...)
+		if beforeRecipe != nil && len(effectiveRecipeIndexes) != 0 {
+			paths := []string{}
+			for _, prerequisite := range append(append([]kbuildSelectionPrerequisite(nil), normal...), orderOnly...) {
+				path := kconfig.CanonicalKbuildGraphTarget(prerequisite.target)
+				if path != "" && path != "FORCE" {
+					paths = appendUnique(paths, path)
+				}
+			}
+			if len(paths) != 0 {
+				if *beforeRecipe == nil {
+					*beforeRecipe = map[string]kbuildTargetNativePrerequisiteFrontier{}
+				}
+				(*beforeRecipe)[target] = kbuildTargetNativePrerequisiteFrontier{frontier: frontier, paths: paths}
+			}
+		}
 		for _, selectedRuleIndex := range effectiveRecipeIndexes {
 			rule := profile.Rules[selectedRuleIndex]
-			automaticTarget := kbuildProfileRuleAutomaticTarget(profile, rule, target, stem)
+			automaticTarget, automaticErr := kbuildProfileRuleAutomaticTarget(profile, rule, target, stem)
+			if automaticErr != nil {
+				return traversalResult{}, fmt.Errorf("selected target %q rule %s automatic $@ word: %w", target, rule.Position, automaticErr)
+			}
 			for recipeIndex, recipe := range rule.Recipe {
+				line := kconfig.KbuildSelectedControlRecipeLine{
+					Target: target, LookupTarget: makeTarget, AutomaticTarget: automaticTarget,
+					Stem: stem, RuleIndex: selectedRuleIndex, RecipeIndex: recipeIndex,
+					Normal:    kbuildSelectionPrerequisiteMakeTargets(normal),
+					OrderOnly: kbuildSelectionPrerequisiteMakeTargets(orderOnly),
+				}
 				recipeProfile := profile
 				var recipeControl *kconfig.KbuildControlEvaluation
-				if control != nil {
-					snapshot, ok := kconfig.KbuildControlEvaluationBeforeRecipeIndex(
-						*control, target, selectedRuleIndex, recipeIndex,
-					)
-					if !ok {
-						return traversalResult{}, fmt.Errorf(
-							"selected recursive Make planning has no control-state snapshot for %s target %q at %s recipe %d",
-							profile.Name, target, rule.Position, recipeIndex,
-						)
+				var causalSnapshot *kconfig.KbuildSelectedControlRecipeSnapshot
+				if causal != nil && causal.beforeLine != nil {
+					var snapshotErr error
+					causalSnapshot, snapshotErr = causal.beforeLine(line, frontier)
+					if snapshotErr != nil {
+						return traversalResult{}, fmt.Errorf("bind selected recipe %s target %q line %d frontier: %w", profile.Name, target, recipeIndex, snapshotErr)
 					}
-					recipeProfile = snapshot.Profile
-					recipeControl = &snapshot
+					if causalSnapshot == nil {
+						return traversalResult{}, fmt.Errorf("selected recipe %s target %q line %d has no preline Make state", profile.Name, target, recipeIndex)
+					}
+					recipeControl = &causalSnapshot.Evaluation
+					recipeProfile = recipeControl.Profile
+
 				}
 				effects, err := kbuildSelectedRecipeExecutionEffects(
 					recipeProfile, rule, target, makeTarget, automaticTarget, stem,
@@ -8696,6 +10108,27 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 					return traversalResult{}, fmt.Errorf("interpret selected recipe for %s target %q: %w", profile.Name, target, err)
 				}
 				for _, effect := range effects {
+					if effect.sourcePhase != nil {
+						phase := kconfig.CompactKbuildSelectedSourcePhase{
+							OwnerTarget: target, OutputPath: effect.sourcePhase.outputPath,
+							SourcePath: effect.sourcePhase.sourcePath,
+							Ordinal:    effect.sourcePhase.ordinal, SourceSHA256: effect.sourcePhase.sourceSHA256,
+							Spans:           slices.Clone(effect.sourcePhase.spans),
+							SourceArguments: slices.Clone(effect.sourcePhase.arguments),
+						}
+						if causal != nil && causal.recordSourcePhase != nil {
+							if err := causal.recordSourcePhase(phase); err != nil {
+								return traversalResult{}, fmt.Errorf("record selected source phase for %s target %q: %w", profile.Name, target, err)
+							}
+						}
+						frontier = frontiers.sequence(frontier, kbuildRecursiveMakeFrontierEvent{
+							artifact: kconfig.CompactKbuildVisibleArtifact{
+								Path: phase.OutputPath, Profile: profile.Name, Target: phase.OutputPath,
+							},
+							sourcePhase: effect.sourcePhase, recipeControl: recipeControl, recipeSnapshot: causalSnapshot,
+						})
+						continue
+					}
 					if effect.recursive {
 						terminals, frontier, err = recordInvocation(
 							effect.invocation, target, terminals, frontier, recipeControl,
@@ -8720,8 +10153,14 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 							}
 							frontier = frontiers.sequence(frontier, kbuildRecursiveMakeFrontierEvent{
 								artifact: artifact, command: effect.command, commandTarget: commandTarget,
+								recipeControl: recipeControl, recipeSnapshot: causalSnapshot,
 							})
 						}
+					}
+				}
+				if causal != nil && causal.afterLine != nil {
+					if err := causal.afterLine(causalSnapshot); err != nil {
+						return traversalResult{}, fmt.Errorf("apply selected recipe %s target %q line %d: %w", profile.Name, target, recipeIndex, err)
 					}
 				}
 			}
@@ -8750,7 +10189,7 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 	for _, target := range profile.EntryTargets {
 		result, err := visit(kbuildSelectionPrerequisite{
 			target: target, makeTarget: target,
-		}, "selected goal", false)
+		}, "selected goal", false, "")
 		if err != nil {
 			return nil, err
 		}
@@ -8758,6 +10197,11 @@ func selectedKbuildRecursiveMakePlanWithResolvedTargets(
 	}
 	if completion != nil {
 		*completion = frontiers.join(completionFrontiers...)
+	}
+	if causal != nil && causal.boundProfile != nil {
+		if err := causal.boundProfile(profile); err != nil {
+			return nil, fmt.Errorf("retain selected grouped source trigger authority for %q: %w", profile.Name, err)
+		}
 	}
 	return plan, nil
 }
@@ -8787,6 +10231,54 @@ type kbuildRecipeExecutionEffect struct {
 	recursive          bool
 	materializesTarget bool
 	command            string
+	// A source-script phase is a write inside an immutable shell program,
+	// ordered among its selected recursive Make calls. It is distinct from a
+	// Make rule target and from the enclosing recipe's eventual output.
+	sourcePhase *kbuildSelectedSourceScriptPhase
+}
+
+type kbuildSelectedSourceScriptPhase struct {
+	sourcePath   string
+	outputPath   string
+	ordinal      int
+	sourceSHA256 string
+	spans        []kconfig.CompactKbuildLinkVmlinuxSourceSpan
+	arguments    []string
+}
+
+// kbuildInvocationRecipeWritesTarget binds a command's physical output to the
+// object-tree pathname owned by one selected Make rule. GNU Make's automatic
+// $@ and shell redirections are relative to the process cwd, whereas the
+// selection graph records paths from the object-tree root. Admit only aliases
+// derived from the typed invocation location; a source-tree cwd cannot turn a
+// write into the immutable source tree into a generated object artifact.
+func kbuildInvocationRecipeWritesTarget(
+	profile kconfig.CompactKbuildProfile,
+	recipe, target string,
+	wholeScript ...string,
+) bool {
+	location, ok := kconfig.CompactKbuildProfileInvocationLocation(profile)
+	if !ok {
+		return false
+	}
+	script := recipe
+	if len(wholeScript) != 0 {
+		script = wholeScript[0]
+	}
+	if kconfig.CompactKbuildProfileConfiguredToolWritesRootedObjectTargetInScript(profile, script, recipe, target) {
+		return true
+	}
+	for _, alias := range kbuildInvocationGeneratedTextTargetAliases(target, location.Directory) {
+		if location.Tree != kconfig.CompactKbuildInvocationObjectTree &&
+			!strings.HasPrefix(alias, kbuildEvalObjectTree+"/") &&
+			!strings.HasPrefix(alias, "${tree:prep}/") {
+			continue
+		}
+		if kconfig.CompactKbuildRecipeWritesTarget(recipe, alias) {
+			return true
+		}
+	}
+	return false
 }
 
 // kbuildSelectedRecipeExecutionEffects returns the source-ordered effects of
@@ -8862,7 +10354,7 @@ func kbuildSelectedRecipeExecutionEffects(
 		if strings.Contains(recipe, "$(MAKE)") || strings.Contains(recipe, "${MAKE}") {
 			return nil, nil
 		}
-		if !kbuildRecipeOnlyCreatesDirectories(recipe) && kconfig.CompactKbuildRecipeWritesTarget(recipe, automaticTarget) {
+		if !kbuildRecipeOnlyCreatesDirectories(recipe) && kbuildInvocationRecipeWritesTarget(profile, recipe, target) {
 			// Expansion failed, so retain only existence provenance. Consumers
 			// must not interpret the unevaluated source recipe as exact bytes.
 			return []kbuildRecipeExecutionEffect{{materializesTarget: true}}, nil
@@ -8898,7 +10390,11 @@ func kbuildEvaluatedRecipeExecutionEffects(
 	command string,
 	discoverSourceScripts bool,
 ) ([]kbuildRecipeExecutionEffect, error) {
-	recipeTarget := automaticTarget
+	// Source Make expands $@ with the raw object-root spelling, but recipe
+	// output analysis compares physical graph paths after typed tree projection.
+	// The selected target owns that graph path; the raw automatic spelling may
+	// still carry __LINUX_BZL_OBJECT_TREE__ or another private tree root.
+	recipeTarget := target
 	structuralCommand, err := kconfig.ResolveCompactKbuildTargetSymbolicStructure(profile, target, command)
 	if err != nil {
 		return nil, fmt.Errorf("select recipe symbolic structure: %w", err)
@@ -8933,7 +10429,7 @@ func kbuildEvaluatedRecipeExecutionEffects(
 		return nil, fmt.Errorf("selected target %q profile %q has no typed Kbuild invocation location", target, profile.Name)
 	}
 	wholeRecipeWritesTarget := !kbuildRecipeOnlyCreatesDirectories(command) &&
-		kconfig.CompactKbuildRecipeWritesTarget(command, recipeTarget)
+		kbuildInvocationRecipeWritesTarget(profile, command, recipeTarget)
 	effects := []kbuildRecipeExecutionEffect{}
 	materializedTarget := false
 	var exportedEnvironment map[string]string
@@ -9000,15 +10496,75 @@ func kbuildEvaluatedRecipeExecutionEffects(
 			return fmt.Errorf("resolve recursive Make MAKEOVERRIDES: %w", err)
 		}
 		suppressParentCommandLine := origin != "undefined" && strings.TrimSpace(makeOverrides) == ""
+		makeFlagsOrigin, err := kconfig.EvaluateCompactKbuildTextSymbolicForMakeTarget(
+			profile, target, lookupTarget, automaticTarget, stem, rule.Prerequisites, rule.OrderOnly,
+			injections, "$(origin MAKEFLAGS)",
+		)
+		if err != nil {
+			return fmt.Errorf("evaluate recursive Make MAKEFLAGS origin: %w", err)
+		}
+		parentMakeFlags := ""
+		if makeFlagsOrigin == "command line" {
+			makeFlags, evalErr := kconfig.EvaluateCompactKbuildTextSymbolicForMakeTarget(
+				profile, target, lookupTarget, automaticTarget, stem, rule.Prerequisites, rule.OrderOnly,
+				injections, "$(MAKEFLAGS)",
+			)
+			if evalErr != nil {
+				return fmt.Errorf("evaluate recursive Make MAKEFLAGS: %w", evalErr)
+			}
+			parentMakeFlags = makeFlags
+		}
 		for index := range invocations {
 			inline := invocations[index].request.environment
 			invocations[index].request.environment = cloneKbuildVariables(environment)
 			for name, value := range inline {
 				invocations[index].request.environment[name] = value
 			}
-			invocations[index].request.suppressParentCommandLine = suppressParentCommandLine
+			// GNU Make reads an inline MAKEFLAGS assignment before the child's
+			// makefile, then applies a child argv assignment over it. Either
+			// replacement discards the parent's generated MAKEOVERRIDES for this
+			// child; a parent command-line MAKEFLAGS replacement has the same
+			// effect on the next child. Other exported variables survive in the
+			// child's environment at ordinary environment precedence.
+			flags, replaced := parentMakeFlags, makeFlagsOrigin == "command line"
+			if value, present := inline["MAKEFLAGS"]; present {
+				flags, replaced = value, true
+			}
+			if value, present := invocations[index].request.variables["MAKEFLAGS"]; present {
+				flags, replaced = value, true
+			}
+			makeFlagsAssignments := map[string]string{}
+			if replaced {
+				flags, err = kconfig.ResolveCompactKbuildTargetSymbolicText(profile, target, flags)
+				if err != nil {
+					return fmt.Errorf("resolve selected recursive Make MAKEFLAGS: %w", err)
+				}
+				makeFlagsAssignments, err = kbuildMakeFlagsCommandLineAssignments(flags)
+				if err != nil {
+					return fmt.Errorf("interpret source-selected recursive Make MAKEFLAGS: %w", err)
+				}
+			}
+			invocations[index].request.suppressParentCommandLine = suppressParentCommandLine || replaced
+			for name, value := range makeFlagsAssignments {
+				if _, explicit := invocations[index].request.variables[name]; explicit {
+					continue
+				}
+				invocations[index].request.variables[name] = value
+				invocations[index].request.commandLineAutoExport[name] = true
+			}
 		}
 		return nil
+	}
+	if len(replaySegments) != 0 {
+		// GNU Make expands exported recursive values before starting *every*
+		// selected recipe shell, including a PHONY control recipe with no
+		// recursive Make and no native output. Register source-owned probe
+		// dependencies here during ordinary graph discovery, before its staged
+		// results are frozen for family replay. The selected target, invocation
+		// frontier and shell segment still own the eventual action environment.
+		if _, err := loadExportedEnvironment(); err != nil {
+			return nil, fmt.Errorf("evaluate selected recipe exported environment: %w", err)
+		}
 	}
 	for segmentIndex, segment := range replaySegments {
 		structuralInvocations, err := kbuildRecursiveMakeInvocationsAt(
@@ -9032,12 +10588,21 @@ func kbuildEvaluatedRecipeExecutionEffects(
 			effects = append(effects, kbuildRecipeExecutionEffect{invocation: invocation, recursive: true})
 		}
 		recursive := len(direct) != 0
+		// A pipe supplies stdin to its following command. A redirected final
+		// command can materialize the target, but its bytes belong to the
+		// entire selected recipe, including the preceding pipeline producer.
+		// Keep that source text for exact projection; an isolated `awk ... -`
+		// would otherwise discard the writer of its stdin.
+		writerCommand := segment
+		if segmentIndex > 0 && replayConnectors[segmentIndex-1] == "|" {
+			writerCommand = command
+		}
 
 		if !discoverSourceScripts {
-			if !recursive && !kbuildRecipeOnlyCreatesDirectories(segment) && kconfig.CompactKbuildRecipeWritesTarget(segment, recipeTarget) {
+			if !recursive && !kbuildRecipeOnlyCreatesDirectories(segment) && kbuildInvocationRecipeWritesTarget(profile, segment, recipeTarget, command) {
 				effects = append(effects, kbuildRecipeExecutionEffect{
 					materializesTarget: true,
-					command:            segment,
+					command:            writerCommand,
 				})
 				materializedTarget = true
 			}
@@ -9109,6 +10674,39 @@ func kbuildEvaluatedRecipeExecutionEffects(
 			if err := attachEnvironment(nested); err != nil {
 				return nil, err
 			}
+			if kconfig.CanonicalKbuildGraphTarget(recipeTarget) == "vmlinux" &&
+				pathpkg.Clean(script.Path) == "scripts/link-vmlinux.sh" {
+				phases, selected, phaseErr := kconfig.AnalyzeCompactKbuildLinkVmlinuxPhases(script.Content)
+				if phaseErr != nil {
+					return nil, fmt.Errorf("source script %q phases: %w", script.Path, phaseErr)
+				}
+				if selected {
+					if len(nested) != 2 || !slices.Contains(rule.Prerequisites, script.Path) &&
+						!slices.Contains(rule.OrderOnly, script.Path) {
+						return nil, fmt.Errorf("source script %q has an unsupported selected link invocation or prerequisite", script.Path)
+					}
+					arguments, argumentsErr := kconfig.CompactKbuildSelectedSourceScriptArguments(
+						profile, segment, script.Path, scriptEnvironment["CONFIG_SHELL"],
+					)
+					if argumentsErr != nil {
+						return nil, fmt.Errorf("selected source script %q arguments: %w", script.Path, argumentsErr)
+					}
+					effects = append(effects, kbuildRecipeExecutionEffect{sourcePhase: &kbuildSelectedSourceScriptPhase{
+						sourcePath: script.Path, outputPath: ".version", ordinal: 0,
+						sourceSHA256: phases.SourceSHA256, spans: slices.Clone(phases.VersionSpans),
+						arguments: slices.Clone(arguments),
+					}})
+					effects = append(effects, kbuildRecipeExecutionEffect{invocation: nested[0], recursive: true})
+					effects = append(effects, kbuildRecipeExecutionEffect{sourcePhase: &kbuildSelectedSourceScriptPhase{
+						sourcePath: script.Path, outputPath: "vmlinux.o", ordinal: 1,
+						sourceSHA256: phases.SourceSHA256, spans: slices.Clone(phases.ObjectSpans),
+						arguments: slices.Clone(arguments),
+					}})
+					effects = append(effects, kbuildRecipeExecutionEffect{invocation: nested[1], recursive: true})
+					recursive = true
+					continue
+				}
+			}
 			for _, invocation := range nested {
 				effects = append(effects, kbuildRecipeExecutionEffect{invocation: invocation, recursive: true})
 			}
@@ -9119,7 +10717,7 @@ func kbuildEvaluatedRecipeExecutionEffects(
 			if !declared {
 				return false
 			}
-			if kconfig.CompactKbuildRecipeWritesTarget(script.Content, recipeTarget) {
+			if kbuildInvocationRecipeWritesTarget(profile, script.Content, recipeTarget) {
 				return true
 			}
 			// Linux's terminal link driver owns vmlinux internally rather than
@@ -9130,10 +10728,10 @@ func kbuildEvaluatedRecipeExecutionEffects(
 				pathpkg.Clean(script.Path) == "scripts/link-vmlinux.sh"
 		})
 		if !kbuildRecipeOnlyCreatesDirectories(segment) &&
-			(declaredSourceScriptWriter || !recursive && kconfig.CompactKbuildRecipeWritesTarget(segment, recipeTarget)) {
+			(declaredSourceScriptWriter || !recursive && kbuildInvocationRecipeWritesTarget(profile, segment, recipeTarget, command)) {
 			effects = append(effects, kbuildRecipeExecutionEffect{
 				materializesTarget: true,
-				command:            segment,
+				command:            writerCommand,
 			})
 			materializedTarget = true
 		}
@@ -9581,6 +11179,96 @@ type kbuildIncludeSearchPlan struct {
 	generatedSources []string
 	directories      []kbuildIncludeSearchDirectory
 	forced           []kbuildIncludeTreePath
+}
+
+// kbuildSelectedRecipeObjectTreeObservation combines generic shell reads with
+// the inputs actually used by a selected immutable source script. A compiler
+// search directory passed to a script is not by itself a file read: if the
+// script provably forwards its full argv to that configured compiler, its
+// source-script observation owns the result. Keep ordinary observation for
+// all other shell commands and for a script in a pipeline, with a redirection,
+// or with active shell syntax whose incoming operands can change before it
+// runs.
+func kbuildSelectedRecipeObjectTreeObservation(
+	profile kconfig.CompactKbuildProfile,
+	target, lookupTarget, automaticTarget, stem string,
+	normal, orderOnly []string,
+	injected map[string]string,
+	command string,
+) (kconfig.CompactKbuildObjectTreeObservation, error) {
+	// GNU Make consumes @, +, and - at the start of an executable recipe
+	// line. A quiet status command such as @echo '  LINK     '$@ prints the
+	// target pathname; its displayed operand is not an object-tree read.
+	// Keep prefixes after a shell connector: those belong to the shell, not
+	// to Make's recipe-line grammar.
+	selectedCommand := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(command), "@+-"))
+	script, err := kconfig.EvaluateCompactKbuildSourceScriptObjectTreeObservationForMakeTarget(
+		profile, target, lookupTarget, automaticTarget, stem,
+		normal, orderOnly, injected, selectedCommand,
+	)
+	if err != nil {
+		return kconfig.CompactKbuildObjectTreeObservation{}, err
+	}
+	general := kconfig.ObserveCompactKbuildSelectedRecipeObjectTree(profile, target, selectedCommand, selectedCommand)
+	segments, connectors, shapeErr := kbuildEvaluatedShellCommandShape(selectedCommand)
+	if shapeErr == nil && len(segments) != 0 {
+		// Segment rendering quotes lexical argv anew. That representation is
+		// useful for selected source-script ownership, but it loses whether a
+		// displayed word feeds a pipeline or expands shell substitutions.
+		// Preserve the original shell spelling whenever such syntax is active.
+		withoutOwnedMarkers := strings.NewReplacer(
+			"${tree:kernel}", "", "${tree:prep}", "",
+			"${tree:host}", "", "${tree:bootstrap}", "",
+			"${tree:prehost}", "", "${work:root}", "",
+		).Replace(selectedCommand)
+		mayRequote := !strings.ContainsAny(withoutOwnedMarkers, "$`*?[]") &&
+			!slices.Contains(connectors, "|")
+		segmentObservations := []kconfig.CompactKbuildObjectTreeObservation{}
+		ownedScriptSegment := false
+		for index, segment := range segments {
+			scripts, scriptErr := kconfig.ReadCompactKbuildCommandSourceScriptsSymbolicForMakeTarget(
+				profile, target, lookupTarget, automaticTarget, stem,
+				normal, orderOnly, injected, segment,
+			)
+			if scriptErr != nil {
+				return kconfig.CompactKbuildObjectTreeObservation{}, scriptErr
+			}
+			selectedScript := len(scripts) == 1 &&
+				!(index > 0 && connectors[index-1] == "|") &&
+				!(index < len(connectors) && connectors[index] == "|")
+			if selectedScript {
+				lexed, simple, lexErr := kbuildSingleShellSimpleCommand(segment)
+				if lexErr != nil || !simple || len(lexed.redirections) != 0 {
+					selectedScript = false
+				}
+				withoutOwnedMarkers := strings.NewReplacer(
+					"${tree:kernel}", "", "${tree:prep}", "",
+					"${tree:host}", "", "${tree:bootstrap}", "",
+					"${tree:prehost}", "", "${work:root}", "",
+				).Replace(segment)
+				if strings.ContainsAny(withoutOwnedMarkers, "$`*?[]") {
+					selectedScript = false
+				}
+			}
+			if !selectedScript {
+				segmentObservations = append(segmentObservations, kconfig.ObserveCompactKbuildSelectedRecipeObjectTree(profile, target, selectedCommand, segment))
+			} else {
+				ownedScriptSegment = true
+			}
+		}
+		if ownedScriptSegment && mayRequote {
+			general = kconfig.CompactKbuildObjectTreeObservation{}
+			for _, observed := range segmentObservations {
+				general.ObservesObjectTree = general.ObservesObjectTree || observed.ObservesObjectTree
+				general.ObservesAll = general.ObservesAll || observed.ObservesAll
+				general.References = append(general.References, observed.References...)
+			}
+		}
+	}
+	general.ObservesObjectTree = general.ObservesObjectTree || script.ObservesObjectTree
+	general.ObservesAll = general.ObservesAll || script.ObservesAll
+	general.References = sortedUniquePaths(append(general.References, script.References...))
+	return general, nil
 }
 
 // kbuildSelectedRecipeSourceProjection classifies the complete evaluated
@@ -10035,6 +11723,71 @@ func linuxKbuildGeneratedContentResolver(
 			target, recipe, sourcePrerequisites, resolvedConfigContents,
 		)
 		return contents, concrete, recognized, err
+	}
+}
+
+// linuxKbuildSelectedSourceOutputResolver measures the exact stdout payload
+// selected by a source-script filechk. The producer's pre-recipe Make scope
+// and complete exact working-file frontier are passed by applyFrontierEvent.
+// The prior result oracle may supply bytes to ordinary discovery only when
+// the current selected request has the identical preplan node identity.
+func linuxKbuildSelectedSourceOutputResolver(
+	scopes *kconfig.KbuildProbeScopes,
+	workingTreeContents map[string]string,
+	plan *kconfig.ProbePlan,
+	measured *kconfig.ProbeResultOracle,
+	discoveryOnly bool,
+) kbuildSelectedSourceOutputResolver {
+	if scopes == nil {
+		return nil
+	}
+	// A source-selected filechk can use only its measured source plan and
+	// independently sealed results. Discovery registers the request without
+	// consulting this lookup; an ordinary replay without either fails closed.
+	results := kconfig.NewSelectedSourceOutputProbeLookup(plan, measured)
+	return func(
+		profile kconfig.CompactKbuildProfile,
+		target, recipe string,
+		frontier kbuildFrontierState,
+	) (kbuildSelectedSourceOutputResult, error) {
+		if err := kconfig.ActivateCompactKbuildProfileTargetProbeEnvironment(profile, target); err != nil {
+			return kbuildSelectedSourceOutputResult{}, fmt.Errorf("activate selected source filechk %s:%s environment: %w", profile.Name, target, err)
+		}
+		visibleNames := []string{}
+		visibleFiles := map[string]string{}
+		visibleOwners := map[string]string{}
+		kbuildFrontierRange(frontier, func(path string, file kbuildFrontierValue) bool {
+			visibleNames = append(visibleNames, path)
+			if file.exact {
+				visibleFiles[path] = file.content
+				owner := strings.Join([]string{
+					file.artifact.Profile, file.artifact.Target, file.artifact.Path,
+					kbuildRecursiveMakeFrontierID(file.origin),
+				}, "\x00")
+				digest := sha256.Sum256([]byte(owner))
+				visibleOwners[path] = hex.EncodeToString(digest[:])
+			}
+			return true
+		})
+		text, concrete, recognized, references, err := scopes.SelectedSourceFilechkOutputText(
+			target, recipe, workingTreeContents, visibleNames, visibleFiles, visibleOwners,
+			results, discoveryOnly,
+		)
+		if err != nil || !recognized {
+			return kbuildSelectedSourceOutputResult{}, err
+		}
+		ids := make([]string, 0, len(references))
+		for _, ref := range references {
+			if ref.NodeID == "" || ref.RequestID == "" {
+				return kbuildSelectedSourceOutputResult{}, fmt.Errorf("source writer %s:%s has a reference without selected node/request identity", profile.Name, target)
+			}
+			ids = append(ids, ref.NodeID)
+		}
+		slices.Sort(ids)
+		ids = slices.Compact(ids)
+		return kbuildSelectedSourceOutputResult{
+			content: text, concrete: concrete, recognized: true, requestIDs: ids,
+		}, nil
 	}
 }
 
@@ -10666,6 +12419,63 @@ func cloneKbuildVariables(values map[string]string) map[string]string {
 	return cloned
 }
 
+// kbuildMakeFlagsCommandLineAssignments reads explicit variable definitions
+// in a source-selected MAKEFLAGS replacement. GNU Make also accepts options
+// from this value, so admit only options whose effects cannot alter selected
+// Make variable precedence, source parsing, or the executable graph.
+func kbuildMakeFlagsCommandLineAssignments(value string) (map[string]string, error) {
+	assignments := map[string]string{}
+	for _, word := range strings.Fields(value) {
+		if word == "--" || kbuildMakeFlagsGraphNeutralOption(word) {
+			continue
+		}
+		if strings.HasPrefix(word, "-") || !strings.Contains(word, "=") {
+			return nil, fmt.Errorf("MAKEFLAGS option %q can change selected recursive Make behavior", word)
+		}
+		name, assigned, _ := strings.Cut(word, "=")
+		if !kbuildMakeAssignmentName(name) || strings.ContainsAny(word, "\\\"'`$") {
+			return nil, fmt.Errorf("MAKEFLAGS variable assignment %q is outside the bounded recursive Make grammar", word)
+		}
+		assignments[name] = assigned
+	}
+	return assignments, nil
+}
+
+func kbuildMakeFlagsGraphNeutralOption(word string) bool {
+	switch word {
+	case "--no-print-directory", "--print-directory", "--silent", "--quiet", "--no-builtin-rules", "--no-builtin-variables":
+		return true
+	}
+	if strings.HasPrefix(word, "--jobs=") {
+		word = strings.TrimPrefix(word, "--jobs=")
+	} else if strings.HasPrefix(word, "-j") {
+		word = strings.TrimPrefix(word, "-j")
+	} else {
+		// GNU Make permits a leading option-letter cluster without a dash in
+		// MAKEFLAGS. Only silent output, directory announcements, and disabling
+		// builtins are inert for this explicit source graph.
+		word = strings.TrimPrefix(word, "-")
+		if word == "" {
+			return false
+		}
+		for _, option := range word {
+			if !strings.ContainsRune("swrR", option) {
+				return false
+			}
+		}
+		return true
+	}
+	if word == "" {
+		return true
+	}
+	for _, digit := range word {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // inheritKbuildInvocationCommandLineVariables models GNU Make's recursive
 // MAKEOVERRIDES behavior. Assignments from the parent command line remain
 // command-line variables in a sub-make, while assignments written on the
@@ -10675,8 +12485,13 @@ func inheritKbuildInvocationCommandLineVariables(
 	request kbuildInvocationRequest,
 	parent map[string]string,
 	parentAutoExport map[string]bool,
+	parentSyntheticTools map[string]bool,
 ) kbuildInvocationRequest {
 	variables := make(map[string]string, len(parent)+len(request.variables))
+	syntheticTools := maps.Clone(request.syntheticToolCommandLine)
+	if syntheticTools == nil {
+		syntheticTools = map[string]bool{}
+	}
 	autoExport := maps.Clone(request.commandLineAutoExport)
 	if autoExport == nil {
 		autoExport = map[string]bool{}
@@ -10685,6 +12500,9 @@ func inheritKbuildInvocationCommandLineVariables(
 		for name, value := range parent {
 			if name != "MAKECMDGOALS" {
 				variables[name] = value
+				if parentSyntheticTools[name] {
+					syntheticTools[name] = true
+				}
 				if parentAutoExport[name] {
 					autoExport[name] = true
 				}
@@ -10693,9 +12511,11 @@ func inheritKbuildInvocationCommandLineVariables(
 	}
 	for name, value := range request.variables {
 		variables[name] = value
+		delete(syntheticTools, name)
 	}
 	request.variables = variables
 	request.commandLineAutoExport = autoExport
+	request.syntheticToolCommandLine = syntheticTools
 	return request
 }
 
@@ -10828,6 +12648,9 @@ func forEachCanonicalKbuildInvocationRequestKeyPart(
 	sort.Strings(names)
 	for _, name := range names {
 		visit("command-line:" + name + "=" + canonicalKbuildToolsetPathCapabilityIdentity(request.variables[name]))
+		if request.syntheticToolCommandLine[name] {
+			visit("command-line-synthetic-tool:" + name)
+		}
 		if request.commandLineAutoExport[name] {
 			visit("command-line-export:" + name)
 		}
@@ -10904,6 +12727,9 @@ func canonicalKbuildInvocationRequestsEqual(left, right kbuildInvocationRequest)
 		if left.commandLineAutoExport[name] != right.commandLineAutoExport[name] {
 			return false
 		}
+		if left.syntheticToolCommandLine[name] != right.syntheticToolCommandLine[name] {
+			return false
+		}
 	}
 	return true
 }
@@ -10937,6 +12763,12 @@ func kbuildInvocationGeneratedTextProjectionFromFrontier(
 			path = filepath.ToSlash(filepath.Join(location.Directory, path))
 		}
 		path = kconfig.CanonicalKbuildGraphTarget(path)
+		// A redirected writer cannot read its own output through a cwd-relative
+		// or prep-rooted alias. The prior frontier version is not the file
+		// concurrently opened by this shell command.
+		if path == kconfig.CanonicalKbuildGraphTarget(target) {
+			return "", false
+		}
 		value, found := kbuildFrontierGet(state, path)
 		if !found || !value.exact {
 			return "", false

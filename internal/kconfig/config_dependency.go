@@ -10398,11 +10398,10 @@ func configCapsuleID(files map[string]string) string {
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
-// RenderConfigCapsule projects the six resolved Kconfig files to one action's
+// RenderConfigCapsule projects the resolved Kconfig files to one action's
 // symbols. Opaque sets copy every input byte exactly. Non-opaque sets retain
 // only selected symbol records, the autoconf include guard, and the
-// configuration-independent auto.conf command record. kernel.release is
-// retained only when CONFIG_LOCALVERSION participates in the dependency set.
+// configuration-independent auto.conf command record.
 func RenderConfigCapsule(full map[string]string, dependencies ConfigDependencySet) (ConfigCapsule, error) {
 	set, err := CanonicalConfigDependencySet(dependencies)
 	if err != nil {
@@ -10431,10 +10430,6 @@ func RenderConfigCapsule(full map[string]string, dependencies ConfigDependencySe
 		files["include/generated/rustc_cfg"] = filterConfigProjection(
 			"include/generated/rustc_cfg", full["include/generated/rustc_cfg"], selected,
 		)
-		files["include/config/kernel.release"] = "\n"
-		if selected["CONFIG_LOCALVERSION"] {
-			files["include/config/kernel.release"] = full["include/config/kernel.release"]
-		}
 	}
 	return ConfigCapsule{ID: configCapsuleID(files), Files: files}, nil
 }

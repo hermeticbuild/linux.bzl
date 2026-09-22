@@ -60,6 +60,7 @@ type compactKbuildPlannerRuntime struct {
 	exact        []compactKbuildDeclarationBucket
 	patternIndex map[string]int
 	patterns     []compactKbuildDeclarationBucket
+	phonyTargets map[string]bool
 
 	sourceRoot      string
 	sourcePathRoots map[string]compactKbuildSourceRootBinding
@@ -105,6 +106,7 @@ func newCompactKbuildPlannerRuntime(profile CompactKbuildProfile) *compactKbuild
 	runtime := &compactKbuildPlannerRuntime{
 		exactIndex:         map[string]int{},
 		patternIndex:       map[string]int{},
+		phonyTargets:       map[string]bool{},
 		sourcePathRoots:    map[string]compactKbuildSourceRootBinding{},
 		sources:            map[string]bool{},
 		sourceShellScripts: map[string]bool{},
@@ -129,6 +131,9 @@ func newCompactKbuildPlannerRuntime(profile CompactKbuildProfile) *compactKbuild
 		return index
 	}
 	for ruleOrder, rule := range profile.Rules {
+		compactKbuildVisitRulePhonyTargets(profile, rule, func(target string) {
+			runtime.phonyTargets[compactKbuildGraphTargetPath(target)] = true
+		})
 		for targetOrder, rawTarget := range rule.Targets {
 			target := compactKbuildProfileTargetPath(profile, rawTarget)
 			if target == "" {
@@ -448,6 +453,22 @@ func compactKbuildRuleCandidatesForMakeTarget(profile CompactKbuildProfile, targ
 	if lookupTarget == "" {
 		return nil
 	}
+	// A subordinate rule search can start from a canonical prerequisite path
+	// even though source traversal already selected the same target under its
+	// original lexical Make word. For that canonical-only fallback, replay
+	// GNU Make's recorded lookup spelling rather than inventing a different
+	// $@ context. An explicit lexical caller still has to match the frozen
+	// source identity exactly; an unrelated or invalid snapshot is never an
+	// aliasing authority.
+	if makeTarget == target {
+		entry := CompactKbuildSelectedControlRuleEntrySnapshot(profile, target)
+		if entry != nil && entry.Line.Target == target && entry.Line.LookupTarget != "" {
+			if recorded, valid := ResolveCompactKbuildMakeTarget(profile, target, entry.Line.LookupTarget); valid &&
+				recorded == entry.Line.LookupTarget {
+				lookupTarget = recorded
+			}
+		}
+	}
 	runtime := compactKbuildPlannerRuntimeForProfile(profile)
 	resolved := []compactKbuildResolvedRule{}
 	seen := map[struct{ rule, target int }]bool{}
@@ -464,17 +485,17 @@ func compactKbuildRuleCandidatesForMakeTarget(profile CompactKbuildProfile, targ
 	// Exact declarations are indexed by canonical graph identity. They still
 	// merge into a recipe selected through a lexical implicit-rule alias.
 	if exact := runtime.exactDeclarations(target); exact != nil {
-		appendResolved(resolveCompactKbuildRuleCandidates(profile, target, exact.rules))
+		appendResolved(resolveCompactKbuildRuleCandidates(profile, target, lookupTarget, exact.rules))
 	}
 	// Pattern search uses GNU Make's lexical target. Also retain canonical
 	// pattern matches as a fallback for declarations whose own parent traversal
 	// was canonicalized while the profile index was built.
 	appendResolved(resolveCompactKbuildRuleCandidates(
-		profile, lookupTarget, runtime.matchingPatternRules(lookupTarget),
+		profile, lookupTarget, lookupTarget, runtime.matchingPatternRules(lookupTarget),
 	))
 	if lookupTarget != target {
 		appendResolved(resolveCompactKbuildRuleCandidates(
-			profile, target, runtime.matchingPatternRules(target),
+			profile, target, target, runtime.matchingPatternRules(target),
 		))
 	}
 	sort.SliceStable(resolved, func(i, j int) bool {
@@ -488,7 +509,7 @@ func compactKbuildRuleCandidatesForMakeTarget(profile CompactKbuildProfile, targ
 
 func resolveCompactKbuildRuleCandidates(
 	profile CompactKbuildProfile,
-	target string,
+	target, lookupTarget string,
 	indexed []compactKbuildIndexedRule,
 ) []compactKbuildResolvedRule {
 	out := make([]compactKbuildResolvedRule, 0, len(indexed))
@@ -507,7 +528,7 @@ func resolveCompactKbuildRuleCandidates(
 		}
 		out = append(out, compactKbuildResolvedRule{
 			ruleOrder: candidate.ruleOrder, targetOrder: candidate.targetOrder,
-			rule: rule, target: declaredTarget, lookupTarget: target, stem: stem,
+			rule: rule, target: declaredTarget, lookupTarget: lookupTarget, stem: stem,
 		})
 	}
 	return out

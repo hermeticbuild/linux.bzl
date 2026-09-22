@@ -2,8 +2,10 @@ package kconfig
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -27,6 +29,20 @@ type KbuildFile struct {
 	Variables         map[string]string
 	exportedVariables map[string]string
 	evaluator         *kbuildTargetEvaluator
+	// syntheticToolDemotions are parser-owned configured tool pins replaced
+	// by a source assignment to another declared tool role. They must not be
+	// carried as GNU Make command-line overrides into a selected sub-make.
+	syntheticToolDemotions map[string]bool
+}
+
+// SyntheticToolCommandLineDemotions names evaluator-only tool pins superseded
+// by source-authored role aliases. Genuine Make command-line values never
+// enter this set.
+func (f *KbuildFile) SyntheticToolCommandLineDemotions() []string {
+	if f == nil {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(f.syntheticToolDemotions))
 }
 
 // ExportedEnvironment returns the exact variables exported by the parsed Make
@@ -63,9 +79,12 @@ type KbuildRule struct {
 	Separator     string
 	Prerequisites []string
 	OrderOnly     []string
-	Recipe        []string
-	Condition     KbuildCondition
-	Position      Position
+	// GNU Make expands escaped-dollar prerequisites once more when a preceding
+	// .SECONDEXPANSION: declaration enables it for this source rule.
+	SecondExpansion bool
+	Recipe          []string
+	Condition       KbuildCondition
+	Position        Position
 }
 
 type KbuildTargetVariable struct {
@@ -135,11 +154,18 @@ func NewKbuildVariableBaseWithRecursiveMakeDefault(variables map[string]string) 
 
 type KbuildOptions struct {
 	RootDir string
+	// ActionRoles are the scoped capabilities from the identity-bound toolset.
+	// Source traversal uses them only to prove literal linker output in either
+	// eventual scope; final lowering binds and validates the selected scope.
+	ActionRoles []KbuildActionRoleRef
 	// WorkingDir is the directory in which GNU Make is invoked. It differs
 	// from the directory containing a -f driver for invocations such as
 	// tools/build/Makefile.build.
 	WorkingDir  string
 	SourceRoots map[string]string
+	// InvocationLocation binds relative parse-time reads to the tree and cwd
+	// selected by recursive Make. Nil retains the standalone parser behavior.
+	InvocationLocation *CompactKbuildInvocationLocation
 	// VirtualFileView is the immutable lazy view of files produced by completed
 	// predecessor invocations. Its wildcard matches are merged with physical
 	// files. Reads consult it first, so an opaque generated file cannot fall
@@ -169,6 +195,12 @@ type KbuildOptions struct {
 	// `override` assignment can. This is how the planner pins tool selection to
 	// Bazel's configured target and execution toolchains.
 	CommandLineVariables map[string]string
+	// SyntheticToolCommandLineVariables marks configured tool-role pins that
+	// have command-line precedence only to bind Linux's initial compiler and
+	// auxiliary tool choices. Source assignments to another declared role may
+	// replace these pins. Values supplied by a user or selected Make recipe are
+	// genuine command-line assignments and must not be marked here.
+	SyntheticToolCommandLineVariables map[string]bool
 	// AutoExportCommandLineVariables optionally narrows which command-line
 	// variables GNU Make automatically places in recipe environments. Nil uses
 	// GNU Make's default (every eligible name). Planner-only precedence pins can
@@ -185,10 +217,25 @@ type KbuildOptions struct {
 	// GNU Make does, rather than being retained symbolically for an incomplete
 	// diagnostic parse.
 	MakeVariablesComplete bool
+	// RejectUnmeasuredGraphGuards is set after the source-derived pregraph
+	// capability batch. A newly selected child must not silently discard a
+	// guarded recipe, include, or dynamic include filename and publish an
+	// incomplete per-object action graph.
+	RejectUnmeasuredGraphGuards bool
+	// ResolveMeasuredGraphGuards concretizes only source guards whose exact
+	// terminals have already been measured. A subsequent discovery round may
+	// still defer newly selected guards, whereas ordinary lowering rejects them.
+	ResolveMeasuredGraphGuards bool
 	// Shell evaluates the deliberately small, hermetic subset of $(shell ...)
 	// required by the selected Kbuild invocation. The caller binds it to the
 	// selected toolchain; unsupported commands must return an error.
 	Shell func(command string) (string, error)
+	// When an exported recursive variable invokes $(shell ...), GNU Make
+	// supplies that variable's incoming process value (or exported empty text)
+	// while constructing the shell environment, avoiding a self-reference.
+	// This activation applies only to the one shell query and restores the
+	// original probe environment without discarding newly discovered requests.
+	shellExportLoopOverride func([]kbuildShellExportFallback) (func() error, error)
 	// shellResultAvailable reports whether the exact, fully expanded command
 	// has already completed successfully through Shell's symbolic evaluator.
 	// It must be a read-only cache lookup: the parser uses it only to prove that
@@ -241,6 +288,12 @@ type KbuildOptions struct {
 	// SkipExportedVariables avoids eagerly expanding every export while a
 	// caller evaluates a bounded source-derived Make identity.
 	SkipExportedVariables bool
+}
+
+type kbuildShellExportFallback struct {
+	name    string
+	value   string
+	present bool
 }
 
 // KbuildSourceCache is a process-local cache of immutable Kbuild source
@@ -482,11 +535,16 @@ func parseKbuildFileTree(path string, opts KbuildOptions, variableOverrides map[
 		parsing:           map[string]bool{},
 	}
 	parser := newKbuildParserWithVariableBase(opts.VariableBase, opts.Variables, variableOverrides, "")
+	parser.actionRoles = slices.Clone(opts.ActionRoles)
 	parser.applyEnvironmentVariables(opts.EnvironmentVariables)
 	parser.applyCommandLineVariables(opts.CommandLineVariables, opts.AutoExportCommandLineVariables)
+	parser.syntheticToolCommandLineVariables = maps.Clone(opts.SyntheticToolCommandLineVariables)
 	parser.configVariablesComplete = opts.ConfigVariablesComplete
 	parser.makeVariablesComplete = opts.MakeVariablesComplete
+	parser.rejectUnmeasuredGraphGuards = opts.RejectUnmeasuredGraphGuards
+	parser.resolveMeasuredGraphGuards = opts.ResolveMeasuredGraphGuards || opts.RejectUnmeasuredGraphGuards
 	parser.shell = opts.Shell
+	parser.shellExportLoopOverride = opts.shellExportLoopOverride
 	parser.shellResultAvailable = opts.shellResultAvailable
 	parser.probeEnvironmentIdentity = opts.probeEnvironmentIdentity
 	parser.sourceShell = opts.SourceShell
@@ -498,6 +556,9 @@ func parseKbuildFileTree(path string, opts KbuildOptions, variableOverrides map[
 	parser.sourceRoots = opts.SourceRoots
 	parser.virtualFileView = opts.VirtualFileView
 	parser.workingDir = opts.WorkingDir
+	if err := parser.bindInvocationLocation(opts); err != nil {
+		return nil, err
+	}
 	parser.includeFunc = func(includes []KbuildInclude) error {
 		return treeParser.parseIncludes(parser, includes)
 	}
@@ -537,9 +598,13 @@ func parseKbuildWithOptions(r io.Reader, filename string, opts KbuildOptions, ba
 	parser := newKbuildParserWithVariableBase(opts.VariableBase, opts.Variables, nil, baseDir)
 	parser.applyEnvironmentVariables(opts.EnvironmentVariables)
 	parser.applyCommandLineVariables(opts.CommandLineVariables, opts.AutoExportCommandLineVariables)
+	parser.syntheticToolCommandLineVariables = maps.Clone(opts.SyntheticToolCommandLineVariables)
 	parser.configVariablesComplete = opts.ConfigVariablesComplete
 	parser.makeVariablesComplete = opts.MakeVariablesComplete
+	parser.rejectUnmeasuredGraphGuards = opts.RejectUnmeasuredGraphGuards
+	parser.resolveMeasuredGraphGuards = opts.ResolveMeasuredGraphGuards || opts.RejectUnmeasuredGraphGuards
 	parser.shell = opts.Shell
+	parser.shellExportLoopOverride = opts.shellExportLoopOverride
 	parser.shellResultAvailable = opts.shellResultAvailable
 	parser.probeEnvironmentIdentity = opts.probeEnvironmentIdentity
 	parser.sourceShell = opts.SourceShell
@@ -551,6 +616,9 @@ func parseKbuildWithOptions(r io.Reader, filename string, opts KbuildOptions, ba
 	parser.sourceRoots = opts.SourceRoots
 	parser.virtualFileView = opts.VirtualFileView
 	parser.workingDir = opts.WorkingDir
+	if err := parser.bindInvocationLocation(opts); err != nil {
+		return nil, err
+	}
 	if err := parser.parseReader(r, filename); err != nil {
 		return nil, err
 	}
@@ -594,6 +662,9 @@ func (p *kbuildParser) finalizeSelectedVariableSnapshot(names []string) error {
 }
 
 func (p *kbuildParser) finalizeExportedVariables() error {
+	if err := p.resolveExportedMembership(); err != nil {
+		return err
+	}
 	names := make([]string, 0, len(p.exported))
 	for name, exported := range p.exported {
 		if exported {
@@ -613,6 +684,25 @@ func (p *kbuildParser) finalizeExportedVariables() error {
 		values[name] = value
 	}
 	p.kb.exportedVariables = values
+	return nil
+}
+
+func (p *kbuildParser) resolveExportedMembership() error {
+	for name, condition := range p.exportedWhen {
+		resolved, err := p.resolveKbuildSymbolic(condition)
+		if err != nil {
+			return fmt.Errorf("resolve exported variable %s presence: %w", name, err)
+		}
+		switch resolved {
+		case "1":
+			p.exported[name] = true
+		case "":
+			delete(p.exported, name)
+		default:
+			return fmt.Errorf("exported variable %s has unresolved probe-dependent presence", name)
+		}
+		delete(p.exportedWhen, name)
+	}
 	return nil
 }
 
@@ -817,7 +907,8 @@ func (p *kbuildParser) appendMakefileList(filename string) error {
 }
 
 type kbuildParser struct {
-	kb *KbuildFile
+	kb          *KbuildFile
+	actionRoles []KbuildActionRoleRef
 	// initialVars is an immutable, persistent variable layer. Evaluator clones
 	// share it and applyEnvironmentVariables creates a small overlay instead of
 	// copying or mutating the potentially very large invocation environment.
@@ -826,11 +917,27 @@ type kbuildParser struct {
 	// evaluators.  Parsing and control-effect evaluation keep it nil and own a
 	// complete vars map.  A target evaluation writes only its small overlay,
 	// avoiding a full Make-environment clone for every selected object.
-	baseVars          map[string]kbuildVariable
-	vars              map[string]kbuildVariable
-	exported          map[string]bool
-	undefined         map[string]bool
-	symbolicVariables map[string]kbuildSymbolicVariableState
+	baseVars map[string]kbuildVariable
+	vars     map[string]kbuildVariable
+	exported map[string]bool
+	// Target command evaluators share the source export set without cloning
+	// it for every object. A sparse overlay records target-local modifiers.
+	shellBaseExported     map[string]bool
+	shellBaseExportedWhen map[string]string
+	shellExportOverrides  map[string]bool
+	incomingEnvironment   map[string]string
+	// A source conditional can change whether a variable is exported while
+	// its value remains defined. Preserve membership separately from the value:
+	// an absent variable is different from an exported empty variable.
+	exportedWhen map[string]string
+	// Source includes and recipe lines whose guard needs a probe result cannot
+	// choose an executable branch during discovery. Retain their selectors for
+	// a bounded pregraph capability plan before selecting child Make invocations.
+	deferredGraphGuards         []string
+	rejectUnmeasuredGraphGuards bool
+	resolveMeasuredGraphGuards  bool
+	undefined                   map[string]bool
+	symbolicVariables           map[string]kbuildSymbolicVariableState
 	// renderedValueProjections preserve GNU Make's logical value when an action
 	// evaluator temporarily replaces an invocation variable with a rooted
 	// rendering value. Ordinary expansion keeps the rooted spelling selected by
@@ -848,17 +955,29 @@ type kbuildParser struct {
 	definePos                Position
 	defineBody               []string
 	currentRule              int
-	includeFunc              func([]KbuildInclude) error
-	includeDepth             int
-	shell                    func(command string) (string, error)
-	shellResultAvailable     func(command string) bool
-	probeEnvironmentIdentity func() string
-	sourceShell              func(command, workingDirectory string) (string, error)
-	resolveSymbolic          func(string) (string, error)
-	resolveSymbolicWords     func(string) (string, error)
-	resolveSymbolicStructure func(string) (string, error)
-	selectSymbolic           func(value, expected string, equal bool, trueText, falseText string) (string, bool, error)
-	transformSymbolic        func(function string, args []string) (string, bool, error)
+	// Discovery cannot assign TAB recipes to a rule whose declaration depends
+	// on an unmeasured probe. Keep that owner ambiguous across conditionals
+	// until the next ordinary nonrecipe declaration; replay reparses the exact
+	// source once the graph guard has a sealed answer.
+	deferredRuleOwner bool
+	secondExpansion   bool
+	// Secondary prerequisite expansion is supported for the selected target
+	// and stem. Automatic variables which observe earlier rule prerequisites
+	// require source-order context and must fail closed until that context is
+	// represented rather than expanding as an empty prerequisite list.
+	secondExpansionPrerequisites bool
+	includeFunc                  func([]KbuildInclude) error
+	includeDepth                 int
+	shell                        func(command string) (string, error)
+	shellExportLoopOverride      func([]kbuildShellExportFallback) (func() error, error)
+	shellResultAvailable         func(command string) bool
+	probeEnvironmentIdentity     func() string
+	sourceShell                  func(command, workingDirectory string) (string, error)
+	resolveSymbolic              func(string) (string, error)
+	resolveSymbolicWords         func(string) (string, error)
+	resolveSymbolicStructure     func(string) (string, error)
+	selectSymbolic               func(value, expected string, equal bool, trueText, falseText string) (string, bool, error)
+	transformSymbolic            func(function string, args []string) (string, bool, error)
 	// commandSelectionExpansion is installed only while recovering the leaf
 	// cmd_<name> calls selected by a source-defined rule_<name> macro. The
 	// observer replaces command text with an inert shell word while leaving the
@@ -872,13 +991,28 @@ type kbuildParser struct {
 	// leaf is ordinary data when an outer conditional tests it or a pure text
 	// function transforms it. The ordinary incomplete parser still uses
 	// reference-shaped output to signal an unresolved source expression.
-	expandedReferencesAreLiteral bool
-	configVariablesComplete      bool
-	makeVariablesComplete        bool
-	commandLineVariables         map[string]bool
-	environmentVariables         map[string]bool
-	sourceRoots                  map[string]string
-	virtualFileView              KbuildVirtualFileView
+	expandedReferencesAreLiteral      bool
+	configVariablesComplete           bool
+	makeVariablesComplete             bool
+	commandLineVariables              map[string]bool
+	syntheticToolCommandLineVariables map[string]bool
+	environmentVariables              map[string]bool
+	sourceRoots                       map[string]string
+	virtualFileView                   KbuildVirtualFileView
+	// Parse-time shell writes belong only to source Makefile evaluation.
+	// Selected recipe/target evaluator clones cannot claim these writes as
+	// analysis-time files without an executable action producer.
+	parseTimeObjectEffects bool
+	// Recipe evaluation binds the selected Make invocation's typed cwd. A
+	// physical WorkingDir can represent either declared tree on the analysis
+	// worker, so it cannot decide ownership of a relative $(file < ...) read.
+	invocationLocation    CompactKbuildInvocationLocation
+	invocationLocationSet bool
+	// A source read which falls through the virtual view remains a declared,
+	// immutable source-root read. The selected recipe observer records its
+	// logical path and exact bytes without taking ownership of unrelated
+	// standalone parser reads.
+	sourceFileReadObserver func(path, contents string, exists bool) error
 	// provisionalComputedNames is set only on a target-evaluation clone. A
 	// probe-derived automatic target may make a computed variable name unknown
 	// during discovery; GNU Make then observes that lookup as undefined until
@@ -1003,6 +1137,7 @@ func normalizeKbuildSymbolicVariableState(state kbuildSymbolicVariableState) *kb
 }
 
 func (p *kbuildParser) applyEnvironmentVariables(values map[string]string) {
+	p.incomingEnvironment = maps.Clone(values)
 	if len(values) == 0 {
 		return
 	}
@@ -1072,12 +1207,12 @@ type kbuildVariable struct {
 }
 
 // These are GNU Make built-ins, not ambient environment variables. The parser
-// implements the output-sync-era semantics Linux uses as its Make >= 4.0
-// feature gate, and exposes that capability through the same variables GNU
-// Make injects before reading the first Makefile. Callers may still override
-// them to model a different registered Make frontend.
+// implements the GNU Make 4.4 features Linux uses as its Make >= 4.0 and
+// >= 3.82 feature gates, and exposes those capabilities through the same
+// variables GNU Make injects before reading the first Makefile. Callers may
+// still override them to model a different registered Make frontend.
 var kbuildSemanticMakeBuiltins = map[string]string{
-	".FEATURES":    "output-sync",
+	".FEATURES":    "output-sync undefine",
 	"MAKE_VERSION": "4.4",
 }
 
@@ -1126,15 +1261,37 @@ func newKbuildParserWithVariableBase(variableBase *KbuildVariableBase, vars, ove
 		local[key] = kbuildVariable{value: normalizeKbuildPathVariable(key, value)}
 	}
 	return &kbuildParser{
-		kb:                &KbuildFile{},
-		initialVars:       initial,
-		vars:              local,
-		exported:          map[string]bool{},
-		symbolicVariables: map[string]kbuildSymbolicVariableState{},
-		expanding:         map[string]bool{},
-		baseDir:           baseDir,
-		currentRule:       -1,
+		kb:                     &KbuildFile{},
+		initialVars:            initial,
+		vars:                   local,
+		exported:               map[string]bool{},
+		exportedWhen:           map[string]string{},
+		symbolicVariables:      map[string]kbuildSymbolicVariableState{},
+		expanding:              map[string]bool{},
+		baseDir:                baseDir,
+		currentRule:            -1,
+		parseTimeObjectEffects: true,
 	}
+}
+
+func (p *kbuildParser) bindInvocationLocation(opts KbuildOptions) error {
+	if opts.InvocationLocation == nil {
+		return nil
+	}
+	profile := &CompactKbuildProfile{}
+	if err := SetCompactKbuildProfileInvocationLocation(profile, *opts.InvocationLocation); err != nil {
+		return err
+	}
+	if profile.invocationLocation.Tree == CompactKbuildInvocationObjectTree {
+		root := opts.SourceRoots["__LINUX_BZL_OBJECT_TREE__"]
+		if root == "" || opts.WorkingDir == "" ||
+			filepath.Clean(opts.WorkingDir) != filepath.Join(root, filepath.FromSlash(profile.invocationLocation.Directory)) {
+			return fmt.Errorf("Kbuild object invocation location does not match its declared working directory")
+		}
+	}
+	p.invocationLocation = profile.invocationLocation
+	p.invocationLocationSet = true
+	return nil
 }
 
 func normalizeKbuildPathVariable(name, value string) string {
@@ -1201,16 +1358,41 @@ func (p *kbuildParser) parseSourceLine(source kbuildSourceLine, pos Position) er
 	line := source.text
 	uncommented := source.uncommented
 	if strings.HasPrefix(line, "\t") {
+		if p.deferredRuleOwner {
+			return nil
+		}
 		if p.currentRule >= 0 {
 			// GNU Make conditionals are evaluated before rule parsing. A recipe
 			// can therefore span an if/else/endif block without losing its rule:
 			// inactive recipe lines disappear, while later active lines still
 			// belong to the declaration preceding the conditional.
 			if p.active() {
-				if _, guarded, err := p.activeSymbolicSelector(); err != nil {
+				selector, guarded, err := p.activeSymbolicSelector()
+				if err != nil {
 					return err
-				} else if guarded {
-					return fmt.Errorf("%s: probe-dependent branch changes a rule recipe", pos)
+				}
+				if guarded {
+					selected, err := p.resolveKbuildSymbolic(selector)
+					if err != nil {
+						return fmt.Errorf("%s: resolve probe-dependent recipe guard: %w", pos, err)
+					}
+					if linuxProbeSymbolPattern.MatchString(selected) {
+						p.deferredGraphGuards = append(p.deferredGraphGuards, selector)
+						if p.rejectUnmeasuredGraphGuards {
+							return fmt.Errorf("%s: selected recipe has undeclared probe-dependent graph guard %q", pos, selector)
+						}
+						// Discovery has recorded the conditional's probe, but its
+						// result is unavailable until replay. Do not attach either
+						// branch to the rule's executable recipe yet.
+						return nil
+					}
+					switch strings.TrimSpace(selected) {
+					case "":
+						return nil
+					case "1":
+					default:
+						return fmt.Errorf("%s: probe-dependent recipe guard resolved to non-boolean text %q", pos, selected)
+					}
 				}
 				p.kb.Rules[p.currentRule].Recipe = append(p.kb.Rules[p.currentRule].Recipe, strings.TrimPrefix(line, "\t"))
 			}
@@ -1231,14 +1413,16 @@ func (p *kbuildParser) parseSourceLine(source kbuildSourceLine, pos Position) er
 	if !p.active() {
 		return nil
 	}
+	previousRule, previousDeferredRuleOwner := p.currentRule, p.deferredRuleOwner
 	p.currentRule = -1
+	p.deferredRuleOwner = false
 	// In GNU Make, the part after a leading ';' in a target-specific
 	// assignment is kept as shell text.  In particular, an unescaped '#'
 	// inside that text is not stripped as a Make comment.  Linux uses this for
 	// bindgen sed expressions containing Rust attributes (`#[link_name]`).
 	// Parse that one grammar shape from the original logical line.
 	if kbuildTargetVariableHasShellSuffix(rawLine) {
-		if handled, err := p.parseRule(rawLine, pos); handled || err != nil {
+		if handled, err := p.parseRule(rawLine, pos, previousRule, previousDeferredRuleOwner); handled || err != nil {
 			return err
 		}
 	}
@@ -1262,24 +1446,23 @@ func (p *kbuildParser) parseSourceLine(source kbuildSourceLine, pos Position) er
 	}
 	if lhs, _, _, ok := splitKbuildAssignment(line); ok {
 		if strings.Contains(lhs, ":") {
-			if handled, err := p.parseRule(line, pos); handled || err != nil {
+			if handled, err := p.parseRule(line, pos, previousRule, previousDeferredRuleOwner); handled || err != nil {
 				return err
 			}
 		}
 		return p.parseAssignment(line, pos)
 	}
-	if handled, err := p.parseRule(line, pos); handled || err != nil {
+	if handled, err := p.parseRule(line, pos, previousRule, previousDeferredRuleOwner); handled || err != nil {
 		return err
 	}
 	if containsMakeReference(line) {
-		// A standalone $(shell ...) is a GNU Make parse-time side effect, most
-		// commonly mkdir for an output directory. Planning never materializes
-		// outputs while reading Makefiles, and the expression contributes no
-		// variable, rule, prerequisite, or recipe to the selected graph. Keep it
-		// unevaluated; concrete action lowering creates its declared outputs.
+		// A standalone $(shell ...) can change Make-visible object files before
+		// the next source line. The bounded object-tree shell evaluator records
+		// those effects without writing to the analysis host's filesystem.
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "$(shell ") || strings.HasPrefix(trimmed, "${shell ") {
-			return nil
+			_, err := p.expand(trimmed)
+			return err
 		}
 		_, err := p.expand(line)
 		return err
@@ -1694,6 +1877,10 @@ func (p *kbuildParser) parseKbuildInclude(line string, pos Position) (bool, erro
 			return true, fmt.Errorf("%s: resolve probe-dependent include: %w", pos, resolveErr)
 		}
 		if linuxProbeSymbolPattern.MatchString(resolved) {
+			p.deferredGraphGuards = append(p.deferredGraphGuards, selector)
+			if p.rejectUnmeasuredGraphGuards {
+				return true, fmt.Errorf("%s: selected include has undeclared probe-dependent graph guard %q", pos, selector)
+			}
 			// Discovery records the guard's probe DAG but cannot select source
 			// topology before configured actions run. The replay parse below will
 			// either consume the include or skip it from the measured result.
@@ -1718,6 +1905,10 @@ func (p *kbuildParser) parseKbuildInclude(line string, pos Position) (bool, erro
 			return true, fmt.Errorf("%s: resolve probe-dependent include paths: %w", pos, resolveErr)
 		}
 		if linuxProbeSymbolPattern.MatchString(resolved) {
+			p.deferredGraphGuards = append(p.deferredGraphGuards, expandedPaths)
+			if p.rejectUnmeasuredGraphGuards {
+				return true, fmt.Errorf("%s: selected include filename has undeclared probe-dependent graph guard %q", pos, expandedPaths)
+			}
 			// The include name itself depends on configured probe data. As with
 			// a probe-guarded include above, discovery records the dependency DAG
 			// but defers source topology. Replay expands the concrete name and
@@ -1791,7 +1982,7 @@ func (p *kbuildParser) parseVariableDirective(line string) (bool, error) {
 		} else if guarded {
 			return true, fmt.Errorf("probe-dependent undefine is unsupported")
 		}
-		names, err := p.expandVariableDirectiveNames(rest)
+		names, err := p.expandVariableDirectiveNames(rest, true)
 		if err != nil {
 			return true, err
 		}
@@ -1802,36 +1993,40 @@ func (p *kbuildParser) parseVariableDirective(line string) (bool, error) {
 	}
 
 	if rest, ok := makeDirectiveRest(line, "unexport"); ok {
-		if _, guarded, err := p.activeSymbolicSelector(); err != nil {
+		selector, guarded, err := p.activeSymbolicSelector()
+		if err != nil {
 			return true, err
-		} else if guarded {
-			return true, fmt.Errorf("probe-dependent unexport is unsupported")
 		}
-		names, err := p.expandVariableDirectiveNames(rest)
+		names, err := p.expandVariableDirectiveNames(rest, false)
 		if err != nil {
 			return true, err
 		}
 		for _, name := range names {
-			delete(p.exported, name)
+			if err := p.changeExportMembership(name, selector, guarded, false); err != nil {
+				return true, err
+			}
 		}
 		return true, nil
 	}
 
 	if rest, ok := makeDirectiveRest(line, "export"); ok {
-		if _, guarded, err := p.activeSymbolicSelector(); err != nil {
+		selector, guarded, err := p.activeSymbolicSelector()
+		if err != nil {
 			return true, err
-		} else if guarded {
-			return true, fmt.Errorf("probe-dependent export is unsupported")
 		}
-		names, err := p.expandVariableDirectiveNames(rest)
+		names, err := p.expandVariableDirectiveNames(rest, false)
 		if err != nil {
 			return true, err
 		}
 		for _, name := range names {
-			if _, ok := p.lookupVariable(name); !ok {
-				p.setVariable(name, kbuildVariable{})
+			if !guarded {
+				if _, ok := p.lookupVariable(name); !ok {
+					p.setVariable(name, kbuildVariable{})
+				}
 			}
-			p.exported[name] = true
+			if err := p.changeExportMembership(name, selector, guarded, true); err != nil {
+				return true, err
+			}
 		}
 		return true, nil
 	}
@@ -1839,7 +2034,37 @@ func (p *kbuildParser) parseVariableDirective(line string) (bool, error) {
 	return false, nil
 }
 
-func (p *kbuildParser) expandVariableDirectiveNames(value string) ([]string, error) {
+func (p *kbuildParser) changeExportMembership(name, selector string, guarded, export bool) error {
+	if !guarded {
+		delete(p.exportedWhen, name)
+		if export {
+			p.exported[name] = true
+		} else {
+			delete(p.exported, name)
+		}
+		return nil
+	}
+	previous := p.exportedWhen[name]
+	if previous == "" && p.exported[name] {
+		previous = "1"
+	}
+	next := ""
+	if export {
+		next = "1"
+	}
+	if previous == next {
+		return nil
+	}
+	selected, err := p.selectProbeText(selector, false, next, previous)
+	if err != nil {
+		return fmt.Errorf("retain exported variable %s presence: %w", name, err)
+	}
+	p.exportedWhen[name] = selected
+	delete(p.exported, name)
+	return nil
+}
+
+func (p *kbuildParser) expandVariableDirectiveNames(value string, requireStableIdentity bool) ([]string, error) {
 	expanded, err := p.expand(value)
 	if err != nil {
 		return nil, err
@@ -1852,7 +2077,7 @@ func (p *kbuildParser) expandVariableDirectiveNames(value string) ([]string, err
 		if linuxProbeSymbolPattern.MatchString(name) {
 			return nil, fmt.Errorf("variable directive name depends on an unresolved probe")
 		}
-		if _, uncertain := p.symbolicVariables[name]; uncertain {
+		if _, uncertain := p.symbolicVariables[name]; uncertain && requireStableIdentity {
 			return nil, fmt.Errorf("variable directive observes probe-dependent identity of %q", name)
 		}
 		names = append(names, name)
@@ -1884,7 +2109,7 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 	if !generated {
 		generatedKind, generatedCondition, generated = generatedTargetCondition(lhs)
 	}
-	_, guarded, guardErr := p.activeSymbolicSelector()
+	selector, guarded, guardErr := p.activeSymbolicSelector()
 	if guardErr != nil {
 		return fmt.Errorf("%s: evaluate probe-dependent assignment guard: %w", pos, guardErr)
 	}
@@ -1894,8 +2119,26 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 	if guarded && generated {
 		return fmt.Errorf("%s: probe-dependent branch changes generated-target topology", pos)
 	}
-	if guarded && len(modifiers) != 0 {
-		return fmt.Errorf("%s: probe-dependent assignment has stateful modifiers %q", pos, modifiers)
+	if guarded {
+		for _, modifier := range modifiers {
+			if modifier != "export" && modifier != "unexport" {
+				return fmt.Errorf("%s: probe-dependent assignment has stateful modifier %q", pos, modifier)
+			}
+		}
+	}
+	if p.commandLineVariables[lhs] && p.syntheticToolRoleAlias(lhs, op, rhs) {
+		if guarded {
+			return fmt.Errorf("%s: source tool role alias %s under probe-dependent guard needs conditional command-line origin", pos, lhs)
+		}
+		// This is a configured evaluator pin, not an actual Make CLI value.
+		// The source explicitly selects another declared compiler/tool role;
+		// retain that assignment and its ordinary exported environment.
+		delete(p.commandLineVariables, lhs)
+		delete(p.syntheticToolCommandLineVariables, lhs)
+		if p.kb.syntheticToolDemotions == nil {
+			p.kb.syntheticToolDemotions = map[string]bool{}
+		}
+		p.kb.syntheticToolDemotions[lhs] = true
 	}
 	if p.commandLineVariables[lhs] && !slices.Contains(modifiers, "override") {
 		// A command-line value wins over the assignment, but GNU Make still
@@ -1906,9 +2149,13 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 		for _, modifier := range modifiers {
 			switch modifier {
 			case "export":
-				p.exported[lhs] = true
+				if err := p.changeExportMembership(lhs, selector, guarded, true); err != nil {
+					return err
+				}
 			case "unexport":
-				delete(p.exported, lhs)
+				if err := p.changeExportMembership(lhs, selector, guarded, false); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -1931,7 +2178,7 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 	}
 	rhs, expandedRHS, symbolicState, err := p.retainSymbolicConditionalAssignment(lhs, op, rhs, expandedRHS)
 	if err != nil {
-		return fmt.Errorf("%s: retain probe-dependent assignment %s %s: %w", pos, lhs, op, err)
+		return fmt.Errorf("%s: retain probe-dependent assignment %s %s under guard %q: %w", pos, lhs, op, selector, err)
 	}
 	p.assign(lhs, op, rhs, expandedRHS)
 	if symbolicState != nil {
@@ -1947,9 +2194,13 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 	for _, modifier := range modifiers {
 		switch modifier {
 		case "export":
-			p.exported[lhs] = true
+			if err := p.changeExportMembership(lhs, selector, guarded, true); err != nil {
+				return err
+			}
 		case "unexport":
-			delete(p.exported, lhs)
+			if err := p.changeExportMembership(lhs, selector, guarded, false); err != nil {
+				return err
+			}
 		}
 	}
 	if deferredSimple {
@@ -1974,6 +2225,42 @@ func (p *kbuildParser) parseAssignment(line string, pos Position) error {
 		return nil
 	}
 	return p.parseGeneratedTargetAssignment(generatedKind, generatedCondition, values, pos)
+}
+
+// syntheticToolRoleAlias recognizes only a complete Make variable reference
+// whose existing binding is another selected action role of the same kind.
+// This check does not expand arbitrary source expressions or execute a shell
+// while deciding whether an evaluator-only pin may lose CLI precedence.
+func (p *kbuildParser) syntheticToolRoleAlias(lhs, op, rhs string) bool {
+	if !p.syntheticToolCommandLineVariables[lhs] || op != "=" && op != ":=" {
+		return false
+	}
+	rhs = strings.TrimSpace(rhs)
+	if len(rhs) < 4 || rhs[0] != '$' || rhs[1] != '(' && rhs[1] != '{' {
+		return false
+	}
+	close := byte(')')
+	if rhs[1] == '{' {
+		close = '}'
+	}
+	if rhs[len(rhs)-1] != close {
+		return false
+	}
+	name := rhs[2 : len(rhs)-1]
+	if !kbuildAutomaticEnvironmentName(name) {
+		return false
+	}
+	current, exists := p.lookupVariable(lhs)
+	if !exists {
+		return false
+	}
+	selected, exists := p.lookupVariable(name)
+	if !exists {
+		return false
+	}
+	currentRole, configuredCurrent := parseKbuildActionRoleToken(current.value)
+	selectedRole, configuredSelected := parseKbuildActionRoleToken(selected.value)
+	return configuredCurrent && configuredSelected && currentRole.Role == selectedRole.Role && currentRole.Scope != selectedRole.Scope
 }
 
 // retainSymbolicConditionalAssignment turns branch-local scalar updates into
@@ -2263,15 +2550,38 @@ func (p *kbuildParser) parseGeneratedTargetAssignment(kind string, cond KbuildCo
 	return nil
 }
 
-func (p *kbuildParser) parseRule(line string, pos Position) (bool, error) {
+func (p *kbuildParser) parseRule(line string, pos Position, previousRule int, previousDeferredRuleOwner bool) (bool, error) {
 	targetsText, separator, prerequisitesText, inlineRecipe, ok := splitKbuildRule(line)
 	if !ok {
 		return false, nil
 	}
-	if _, guarded, err := p.activeSymbolicSelector(); err != nil {
+	if selector, guarded, err := p.activeSymbolicSelector(); err != nil {
 		return true, err
 	} else if guarded {
-		return true, fmt.Errorf("%s: probe-dependent branch changes rule or target-specific assignment topology", pos)
+		selected, err := p.resolveKbuildSymbolic(selector)
+		if err != nil {
+			return true, fmt.Errorf("%s: resolve probe-dependent rule guard: %w", pos, err)
+		}
+		if linuxProbeSymbolPattern.MatchString(selected) {
+			p.deferredGraphGuards = append(p.deferredGraphGuards, selector)
+			if p.rejectUnmeasuredGraphGuards {
+				return true, fmt.Errorf("%s: selected rule has undeclared probe-dependent graph guard %q", pos, selector)
+			}
+			p.deferredRuleOwner = true
+			return true, nil
+		}
+		switch strings.TrimSpace(selected) {
+		case "":
+			// The declaration did not exist in this replay. A later TAB after
+			// endif still belongs to the preceding source rule (or remains
+			// ambiguous if that rule is waiting on another guard).
+			p.currentRule = previousRule
+			p.deferredRuleOwner = previousDeferredRuleOwner
+			return true, nil
+		case "1":
+		default:
+			return true, fmt.Errorf("%s: probe-dependent rule guard resolved to non-boolean text %q", pos, selected)
+		}
 	}
 	targets, err := p.expandFields(targetsText)
 	if err != nil {
@@ -2279,6 +2589,12 @@ func (p *kbuildParser) parseRule(line string, pos Position) (bool, error) {
 	}
 	if len(targets) == 0 {
 		return false, nil
+	}
+	if len(targets) == 1 && targets[0] == ".SECONDEXPANSION" {
+		if strings.TrimSpace(prerequisitesText) != "" || strings.TrimSpace(inlineRecipe) != "" {
+			return true, fmt.Errorf("%s: .SECONDEXPANSION with prerequisites or recipe is outside the supported source grammar", pos)
+		}
+		p.secondExpansion = true
 	}
 
 	if variable, op, value, modifiers, ok := splitKbuildTargetVariable(prerequisitesText); ok {
@@ -2325,13 +2641,14 @@ func (p *kbuildParser) parseRule(line string, pos Position) (bool, error) {
 		return true, err
 	}
 	rule := KbuildRule{
-		Targets:       targets,
-		TargetPattern: targetPattern,
-		Separator:     separator,
-		Prerequisites: prerequisites,
-		OrderOnly:     orderOnly,
-		Condition:     p.withActiveCondition(KbuildCondition{Kind: "const", State: "y"}),
-		Position:      pos,
+		Targets:         targets,
+		TargetPattern:   targetPattern,
+		Separator:       separator,
+		Prerequisites:   prerequisites,
+		OrderOnly:       orderOnly,
+		SecondExpansion: p.secondExpansion,
+		Condition:       p.withActiveCondition(KbuildCondition{Kind: "const", State: "y"}),
+		Position:        pos,
 	}
 	if strings.TrimSpace(inlineRecipe) != "" {
 		rule.Recipe = append(rule.Recipe, strings.TrimSpace(inlineRecipe))
@@ -2841,6 +3158,9 @@ func makeArgsContainProbeSymbol(args []string) bool {
 }
 
 func (p *kbuildParser) expandVariable(name, original string, depth int) (string, bool, error) {
+	if p.secondExpansionPrerequisites && isKbuildAutomaticVariable(name) && strings.IndexByte("<^+?|%", name[0]) >= 0 {
+		return "", false, fmt.Errorf("automatic prerequisite %q requires prior rule prerequisite context during second expansion", original)
+	}
 	for i := len(p.locals) - 1; i >= 0; i-- {
 		value, ok := p.locals[i][name]
 		if ok {
@@ -3252,7 +3572,7 @@ func (p *kbuildParser) evalValue(args []string, original string, depth int) (str
 	return value, nil
 }
 
-func (p *kbuildParser) evalShell(args []string, original string, depth int) (string, error) {
+func (p *kbuildParser) evalShell(args []string, original string, depth int) (result string, err error) {
 	if len(args) != 1 {
 		return "", fmt.Errorf("%s: shell function requires exactly one command", p.currentPos)
 	}
@@ -3264,11 +3584,68 @@ func (p *kbuildParser) evalShell(args []string, original string, depth int) (str
 	if command == "" {
 		return "", nil
 	}
+	// GNU Make evaluates recursive exports when launching $(shell ...). If the
+	// exported variable being expanded itself calls shell, its value in that
+	// shell's environment comes from the incoming Make process, not from the
+	// partially expanded value. A target command evaluator shares the root
+	// export set and records only its target-local modifiers.
+	fallbacks := []kbuildShellExportFallback{}
+	for name := range p.expanding {
+		variable, defined := p.lookupVariable(name)
+		if !defined || !variable.recursive {
+			continue
+		}
+		exported, overridden := p.shellExportOverrides[name]
+		if !overridden && (p.exportedWhen[name] != "" || p.shellBaseExportedWhen[name] != "") {
+			return "", fmt.Errorf("%s: shell export %q has unresolved source-dependent membership", p.currentPos, name)
+		}
+		if !overridden {
+			exported = p.exported[name] || p.shellBaseExported[name]
+		}
+		if !exported {
+			continue
+		}
+		incoming, present := p.incomingEnvironment[name]
+		fallbacks = append(fallbacks, kbuildShellExportFallback{name: name, value: incoming, present: present})
+	}
+	if len(fallbacks) != 0 && (p.shell != nil || p.sourceShell != nil) {
+		if p.shellExportLoopOverride == nil {
+			return "", fmt.Errorf("%s: shell needs incoming environment for recursive export, but no scoped activation is available", p.currentPos)
+		}
+		slices.SortFunc(fallbacks, func(a, b kbuildShellExportFallback) int { return strings.Compare(a.name, b.name) })
+		restore, activationErr := p.shellExportLoopOverride(fallbacks)
+		if activationErr != nil {
+			return "", fmt.Errorf("%s: activate incoming shell export environment: %w", p.currentPos, activationErr)
+		}
+		defer func() {
+			if restoreErr := restore(); restoreErr != nil {
+				err = errors.Join(err, fmt.Errorf("%s: restore shell export environment: %w", p.currentPos, restoreErr))
+			}
+		}()
+	}
 	// Action evaluation carries private tree markers so path joins retain
 	// provenance until recipe lowering. Shell/probe callbacks are a separate
 	// stable Make boundary and must observe the public source/object sentinels
 	// captured by their declared filesystem maps.
 	command = compactKbuildMaterializeActionTreeMarkers(command)
+	if p.parseTimeObjectEffects {
+		if value, handled, objectErr := p.parseObjectTreeShell(command); handled {
+			return value, objectErr
+		}
+		if value, handled, formatErr := p.parseFeatureDiagnosticPrintf(command); handled {
+			return value, formatErr
+		}
+	}
+	// A source-owned optional read observes this recipe's immutable object-tree
+	// frontier. A generic shell callback can successfully report the file as
+	// absent before its writer runs; it cannot decide a later read from that
+	// earlier result.
+	if value, handled, readErr := p.optionalObjectTreeShellRead(command); handled {
+		return value, readErr
+	}
+	if value, handled, readErr := p.exactObjectTreeShellCat(command); handled {
+		return value, readErr
+	}
 	if p.shell == nil {
 		if p.sourceShell != nil {
 			value, sourceErr := p.sourceShell(command, p.workingDir)
@@ -3365,6 +3742,20 @@ func (p *kbuildParser) evalIf(args []string, original string, depth int) (string
 	}
 	if containsMakeReference(condition) && !p.expandedReferencesAreLiteral {
 		return original, nil
+	}
+	if p.resolveMeasuredGraphGuards && linuxProbeSymbolPattern.MatchString(condition) {
+		// The selected Make expression has already expanded, including any
+		// source-visible effects. Reuse only an exact sealed pregraph answer
+		// before classifying its truth, as for source ifeq/ifneq directives.
+		// A child-local unmeasured result stays symbolic and must still have a
+		// proven protocol or fail closed below.
+		condition, err = p.resolveKbuildSymbolic(condition)
+		if err != nil {
+			return "", fmt.Errorf("resolve selected Make if condition: %w", err)
+		}
+		if containsMakeReference(condition) && !p.expandedReferencesAreLiteral {
+			return original, nil
+		}
 	}
 	if p.selectSymbolic != nil && linuxProbeSymbolPattern.MatchString(condition) {
 		// Preserve GNU Make's lazy branch expansion when a symbolic condition
@@ -3742,7 +4133,14 @@ func (p *kbuildTreeParser) parseInto(parser *kbuildParser, path string, depth in
 	if depth > p.opts.MaxIncludeDepth {
 		return fmt.Errorf("%s: maximum Kbuild include depth exceeded", path)
 	}
-	resolved := p.resolvePath(path, parser.baseDir)
+	virtualPath, virtual, err := p.virtualObjectIncludePath(path)
+	if err != nil {
+		return err
+	}
+	resolved := virtualPath
+	if !virtual {
+		resolved = p.resolvePath(path, parser.baseDir)
+	}
 	abs, err := filepath.Abs(resolved)
 	if err != nil {
 		return err
@@ -3753,17 +4151,39 @@ func (p *kbuildTreeParser) parseInto(parser *kbuildParser, path string, depth in
 	if p.seen[abs] {
 		return nil
 	}
-	program, sourcePath, eligible, cached, err := p.opts.SourceCache.sourceProgram(abs)
-	if err != nil {
-		return err
+	var virtualContents string
+	if virtual {
+		var exists, exact bool
+		virtualContents, exists, exact, err = p.opts.VirtualFileView.Read(path)
+		if err != nil {
+			return fmt.Errorf("Kbuild virtual include %q: %w", path, err)
+		}
+		if !exists {
+			return &os.PathError{Op: "open", Path: abs, Err: os.ErrNotExist}
+		}
+		if !exact {
+			return fmt.Errorf("Kbuild virtual include %q requires exact contents", path)
+		}
+		if err := ValidateKbuildOrdinaryValue("Kbuild virtual include contents", virtualContents); err != nil {
+			return err
+		}
 	}
+	var program kbuildSourceProgram
+	var sourcePath string
+	var eligible, cached bool
 	var file *os.File
-	if !cached {
-		file, err = os.Open(sourcePath)
+	if !virtual {
+		program, sourcePath, eligible, cached, err = p.opts.SourceCache.sourceProgram(abs)
 		if err != nil {
 			return err
 		}
-		defer file.Close()
+		if !cached {
+			file, err = os.Open(sourcePath)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+		}
 	}
 
 	baseDir := filepath.Dir(abs)
@@ -3772,7 +4192,9 @@ func (p *kbuildTreeParser) parseInto(parser *kbuildParser, path string, depth in
 	parser.baseDir = baseDir
 	parser.includeDepth = depth
 	p.parsing[abs] = true
-	if cached {
+	if virtual {
+		_, err = parser.parseReaderAndCapture(strings.NewReader(virtualContents), abs)
+	} else if cached {
 		err = parser.parseSourceProgram(program, abs)
 	} else {
 		if eligible {
@@ -3791,6 +4213,29 @@ func (p *kbuildTreeParser) parseInto(parser *kbuildParser, path string, depth in
 	}
 	p.seen[abs] = true
 	return nil
+}
+
+// A selected object-tree include must read the same immutable frontier as
+// $(file <...). Never open a physical object file when that frontier declares
+// the path absent or opaque: it may be stale or owned by a different writer.
+// Source-tree includes retain their ordinary physical input and source cache.
+func (p *kbuildTreeParser) virtualObjectIncludePath(path string) (physicalPath string, handled bool, err error) {
+	const marker = "__LINUX_BZL_OBJECT_TREE__"
+	if p.opts.VirtualFileView == nil || (path != marker && !strings.HasPrefix(path, marker+"/")) {
+		return "", false, nil
+	}
+	root, declared := p.opts.SourceRoots[marker]
+	if !declared || root == "" {
+		return "", true, fmt.Errorf("Kbuild virtual include %q has no declared object-tree root", path)
+	}
+	relative, rooted := strings.CutPrefix(path, marker+"/")
+	if !rooted {
+		return "", true, fmt.Errorf("Kbuild virtual include %q requires a canonical object-tree path", path)
+	}
+	if err := validatePlanRelativePath("virtual include", relative); err != nil {
+		return "", true, err
+	}
+	return filepath.Join(root, filepath.FromSlash(relative)), true, nil
 }
 
 func (p *kbuildTreeParser) parseIncludes(parser *kbuildParser, includes []KbuildInclude) error {
@@ -3865,6 +4310,10 @@ func (p *kbuildTreeParser) resolveInclude(path, baseDir string) (string, bool) {
 	expanded := p.expand(path)
 	if strings.Contains(expanded, "$") || expanded == "" {
 		return "", false
+	}
+	if p.opts.VirtualFileView != nil &&
+		(expanded == "__LINUX_BZL_OBJECT_TREE__" || strings.HasPrefix(expanded, "__LINUX_BZL_OBJECT_TREE__/")) {
+		return expanded, true
 	}
 	return p.resolvePath(expanded, baseDir), true
 }
@@ -4200,6 +4649,20 @@ func (p *kbuildParser) evalConditional(keyword, rest string) (kbuildConditionalE
 		}
 		leftExpanded, leftErr := p.expand(left)
 		rightExpanded, rightErr := p.expand(right)
+		if p.resolveMeasuredGraphGuards {
+			// Ordinary discovery can replay only producer results declared by
+			// the source pregraph plan. Resolve those exact scalar operands
+			// before selecting a child conditional: SelectSymbolic otherwise
+			// creates a new branch token from even a measured exported value.
+			// Unmeasured compiler operands remain symbolic for the ordinary
+			// source probe batch and fail at graph-shaping consumers.
+			if leftErr == nil && linuxProbeSymbolPattern.MatchString(leftExpanded) {
+				leftExpanded, leftErr = p.resolveKbuildSymbolic(leftExpanded)
+			}
+			if rightErr == nil && linuxProbeSymbolPattern.MatchString(rightExpanded) {
+				rightExpanded, rightErr = p.resolveKbuildSymbolic(rightExpanded)
+			}
+		}
 		if leftErr == nil && rightErr == nil && p.selectSymbolic != nil {
 			equal := keyword == "ifeq"
 			selected, recognized, selectErr := p.selectSymbolic(
@@ -4228,6 +4691,10 @@ func (p *kbuildParser) evalConditional(keyword, rest string) (kbuildConditionalE
 			}
 		}
 		if leftErr != nil || rightErr != nil {
+			var objectEffect *kbuildParseObjectEffectError
+			if errors.As(leftErr, &objectEffect) || errors.As(rightErr, &objectEffect) {
+				return kbuildConditionalEval{}, objectEffect
+			}
 			if complete {
 				if leftErr != nil {
 					return kbuildConditionalEval{}, fmt.Errorf("expand left conditional operand: %w", leftErr)
@@ -4691,13 +5158,62 @@ func ValidateKbuildOrdinaryVariables(operation string, variables map[string]stri
 func (p *kbuildParser) expandWildcard(patterns string) (string, error) {
 	var out []string
 	for _, pattern := range strings.Fields(patterns) {
-		matches, relBase := p.glob(pattern)
 		pattern = filepath.ToSlash(pattern)
 		query := compactKbuildMaterializeActionTreeMarkers(pattern)
+		relativeRooted := false
+		if p.invocationLocationSet && filepath.IsAbs(pattern) {
+			if _, _, declared := p.mappedFilesystemPath(pattern); !declared {
+				return "", fmt.Errorf("%s: Kbuild absolute wildcard %q has no declared immutable source or virtual object owner", p.currentPos, pattern)
+			}
+		}
+		if p.invocationLocationSet && !filepath.IsAbs(pattern) &&
+			!strings.HasPrefix(query, "__LINUX_BZL_SOURCE_TREE__/") &&
+			!strings.HasPrefix(query, "__LINUX_BZL_OBJECT_TREE__/") &&
+			query != "__LINUX_BZL_SOURCE_TREE__" && query != "__LINUX_BZL_OBJECT_TREE__" {
+			root := ""
+			switch p.invocationLocation.Tree {
+			case CompactKbuildInvocationSourceTree:
+				root = "__LINUX_BZL_SOURCE_TREE__"
+			case CompactKbuildInvocationObjectTree:
+				root = "__LINUX_BZL_OBJECT_TREE__"
+			default:
+				return "", fmt.Errorf("%s: Kbuild wildcard %q has unknown invocation tree %q", p.currentPos, pattern, p.invocationLocation.Tree)
+			}
+			query = filepath.ToSlash(filepath.Join(root, p.invocationLocation.Directory, query))
+			if query != root && !strings.HasPrefix(query, root+"/") {
+				return "", fmt.Errorf("%s: Kbuild wildcard %q escapes the invocation tree", p.currentPos, pattern)
+			}
+			relativeRooted = true
+		}
+		objectOwned := query == "__LINUX_BZL_OBJECT_TREE__" || strings.HasPrefix(query, "__LINUX_BZL_OBJECT_TREE__/")
+		sourceOwned := query == "__LINUX_BZL_SOURCE_TREE__" || strings.HasPrefix(query, "__LINUX_BZL_SOURCE_TREE__/")
+		var matches []string
+		relBase := ""
+		if !p.invocationLocationSet || !objectOwned {
+			physicalPattern := pattern
+			if relativeRooted && sourceOwned {
+				physicalPattern = query
+			}
+			matches, relBase = p.glob(physicalPattern)
+		}
 		_, _, actionRooted := compactKbuildActionTreeRoot(pattern)
 		var lazyMatches []string
 		if p.virtualFileView != nil {
-			lazyMatches = p.virtualFileView.Match(query)
+			if objectOwned || p.parseTimeObjectEffects {
+				if selected, ok := p.virtualFileView.(interface {
+					MatchRead(string) ([]string, error)
+				}); ok {
+					var matchErr error
+					lazyMatches, matchErr = selected.MatchRead(query)
+					if matchErr != nil {
+						return "", fmt.Errorf("%s: Kbuild object wildcard %q: %w", p.currentPos, pattern, matchErr)
+					}
+				} else {
+					lazyMatches = p.virtualFileView.Match(query)
+				}
+			} else {
+				lazyMatches = p.virtualFileView.Match(query)
+			}
 			for _, match := range lazyMatches {
 				if err := ValidateKbuildOrdinaryValue("Kbuild virtual wildcard result", match); err != nil {
 					return "", err
@@ -4710,10 +5226,32 @@ func (p *kbuildParser) expandWildcard(patterns string) (string, error) {
 				for index := range lazyMatches {
 					lazyMatches[index] = compactKbuildRestoreActionTreeMarkers(lazyMatches[index], pattern)
 				}
+			} else if relativeRooted {
+				root := "__LINUX_BZL_OBJECT_TREE__"
+				if sourceOwned {
+					root = "__LINUX_BZL_SOURCE_TREE__"
+				}
+				for index, match := range lazyMatches {
+					if match != root && !strings.HasPrefix(match, root+"/") {
+						return "", fmt.Errorf("%s: Kbuild wildcard %q produced an unowned alias %q", p.currentPos, pattern, match)
+					}
+					rel, err := filepath.Rel(filepath.Join(root, p.invocationLocation.Directory), match)
+					if err != nil {
+						return "", fmt.Errorf("%s: Kbuild wildcard %q cannot resolve matched alias %q", p.currentPos, pattern, match)
+					}
+					lazyMatches[index] = filepath.ToSlash(rel)
+				}
 			}
 		}
 		visible := make([]string, 0, len(matches)+len(lazyMatches))
 		for _, match := range matches {
+			if relativeRooted && sourceOwned {
+				rel, err := filepath.Rel(filepath.Join("__LINUX_BZL_SOURCE_TREE__", p.invocationLocation.Directory), match)
+				if err != nil {
+					return "", fmt.Errorf("%s: Kbuild wildcard %q cannot resolve declared source match %q", p.currentPos, pattern, match)
+				}
+				match = rel
+			}
 			if relBase != "" {
 				if rel, err := filepath.Rel(relBase, match); err == nil {
 					match = rel
@@ -4848,17 +5386,62 @@ func (p *kbuildParser) makeFile(arg, original string) (string, error) {
 	if path == "" || containsMakeReference(path) {
 		return "", nil
 	}
+	// Check each declared root before cleaning the full path: a leading root
+	// followed by ../ can otherwise disappear from the virtual query while the
+	// physical source-root lookup still follows the original escaping path.
+	rawQuery := compactKbuildMaterializeActionTreeMarkers(filepath.ToSlash(path))
+	for _, root := range []struct{ marker, tree string }{
+		{marker: "__LINUX_BZL_SOURCE_TREE__", tree: "source-tree"},
+		{marker: "__LINUX_BZL_OBJECT_TREE__", tree: "object-tree"},
+	} {
+		suffix, rooted := strings.CutPrefix(rawQuery, root.marker+"/")
+		if !rooted {
+			continue
+		}
+		cleaned := filepath.ToSlash(filepath.Clean(suffix))
+		if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			return "", fmt.Errorf("Kbuild file read %q escapes declared %s root", path, root.tree)
+		}
+	}
 	virtualPath := filepath.ToSlash(filepath.Clean(path))
+	// Preserve the source/object root distinction even when both aliases point
+	// at the same physical directory during analysis. Object outputs are visible
+	// only through the selected virtual frontier, including when absent.
+	query := compactKbuildMaterializeActionTreeMarkers(virtualPath)
+	if p.invocationLocationSet && filepath.IsAbs(path) {
+		if _, _, declared := p.mappedFilesystemPath(path); !declared {
+			return "", fmt.Errorf("%s: Kbuild absolute file read %q has no declared immutable source or virtual object owner", p.currentPos, path)
+		}
+	}
+	if !filepath.IsAbs(path) && !strings.HasPrefix(query, "__LINUX_BZL_SOURCE_TREE__/") &&
+		!strings.HasPrefix(query, "__LINUX_BZL_OBJECT_TREE__/") &&
+		query != "__LINUX_BZL_SOURCE_TREE__" && query != "__LINUX_BZL_OBJECT_TREE__" &&
+		p.invocationLocationSet {
+		root := ""
+		switch p.invocationLocation.Tree {
+		case CompactKbuildInvocationSourceTree:
+			root = "__LINUX_BZL_SOURCE_TREE__"
+		case CompactKbuildInvocationObjectTree:
+			root = "__LINUX_BZL_OBJECT_TREE__"
+		default:
+			return "", fmt.Errorf("%s: Kbuild relative file read %q has unknown invocation tree %q", p.currentPos, path, p.invocationLocation.Tree)
+		}
+		query = filepath.ToSlash(filepath.Join(root, p.invocationLocation.Directory, query))
+		if query != root && !strings.HasPrefix(query, root+"/") {
+			return "", fmt.Errorf("%s: Kbuild relative file read %q escapes the invocation tree", p.currentPos, path)
+		}
+		// Source-root fallback below must resolve against the declared source
+		// root even if the worker's physical cwd aliases an object directory.
+		path = query
+	}
 	if p.virtualFileView != nil {
 		// Action lowering replaces evaluator-owned roots with private control-byte
 		// markers. The virtual view models the Make-visible filesystem and speaks
-		// the public sentinel namespace, so normalize only its query. Keep path
-		// unchanged for the physical fallback below, whose source-root map owns the
-		// private aliases.
-		query := compactKbuildMaterializeActionTreeMarkers(virtualPath)
+		// the public sentinel namespace. Keep path unchanged for source-root
+		// physical reads below, whose source-root map owns the private aliases.
 		contents, exists, exact, err := p.virtualFileView.Read(query)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("%s: Kbuild virtual file read %q: %w", p.currentPos, query, err)
 		}
 		if exists {
 			if !exact {
@@ -4871,8 +5454,41 @@ func (p *kbuildParser) makeFile(arg, original string) (string, error) {
 			return contents, nil
 		}
 	}
-	if mapped, _, ok := p.mappedFilesystemPath(path); ok {
+	if query == "__LINUX_BZL_OBJECT_TREE__" || strings.HasPrefix(query, "__LINUX_BZL_OBJECT_TREE__/") {
+		return "", nil
+	}
+	if mapped, prefix, ok := p.mappedFilesystemPath(path); ok {
+		if p.invocationLocationSet &&
+			(query == "__LINUX_BZL_SOURCE_TREE__" || strings.HasPrefix(query, "__LINUX_BZL_SOURCE_TREE__/")) {
+			root, declared := p.sourceRoots[prefix]
+			if !declared {
+				return "", fmt.Errorf("%s: Kbuild source file read %q has no declared source root", p.currentPos, query)
+			}
+			resolvedRoot, rootErr := filepath.EvalSymlinks(root)
+			if rootErr != nil {
+				return "", fmt.Errorf("%s: Kbuild source file read %q cannot resolve its declared source root", p.currentPos, query)
+			}
+			resolvedFile, fileErr := filepath.EvalSymlinks(mapped)
+			if os.IsNotExist(fileErr) {
+				if p.sourceFileReadObserver != nil {
+					if observeErr := p.sourceFileReadObserver(query, "", false); observeErr != nil {
+						return "", observeErr
+					}
+				}
+				return "", nil
+			}
+			if fileErr != nil {
+				return "", fmt.Errorf("%s: Kbuild source file read %q cannot resolve its declared source path", p.currentPos, query)
+			}
+			relative, relErr := filepath.Rel(resolvedRoot, resolvedFile)
+			if relErr != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				return "", fmt.Errorf("%s: Kbuild source file read %q escapes its declared immutable source root", p.currentPos, query)
+			}
+		}
 		path = mapped
+	} else if p.invocationLocationSet &&
+		(query == "__LINUX_BZL_SOURCE_TREE__" || strings.HasPrefix(query, "__LINUX_BZL_SOURCE_TREE__/")) {
+		return "", fmt.Errorf("%s: Kbuild source file read %q has no declared immutable source root", p.currentPos, query)
 	} else if !filepath.IsAbs(path) && p.workingDir != "" {
 		path = filepath.Join(p.workingDir, path)
 	} else if !filepath.IsAbs(path) && p.baseDir != "" {
@@ -4880,7 +5496,22 @@ func (p *kbuildParser) makeFile(arg, original string) (string, error) {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("%s: Kbuild file read %q: %w", p.currentPos, query, err)
+		}
+		if p.sourceFileReadObserver != nil &&
+			(query == "__LINUX_BZL_SOURCE_TREE__" || strings.HasPrefix(query, "__LINUX_BZL_SOURCE_TREE__/")) {
+			if observeErr := p.sourceFileReadObserver(query, "", false); observeErr != nil {
+				return "", observeErr
+			}
+		}
 		return "", nil
+	}
+	if p.sourceFileReadObserver != nil &&
+		(query == "__LINUX_BZL_SOURCE_TREE__" || strings.HasPrefix(query, "__LINUX_BZL_SOURCE_TREE__/")) {
+		if observeErr := p.sourceFileReadObserver(query, string(data), true); observeErr != nil {
+			return "", observeErr
+		}
 	}
 	contents := strings.TrimSuffix(string(data), "\n")
 	if err := ValidateKbuildOrdinaryValue("Kbuild file contents", contents); err != nil {

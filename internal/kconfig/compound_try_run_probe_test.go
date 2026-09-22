@@ -7,6 +7,62 @@ import (
 	"testing"
 )
 
+func TestKbuildSimpleCompilerLinkRetainsMeasuredHostFlagDependencies(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := testSymbolicProbeEvaluator(t, builder, nil)
+	evaluator.tools["cc-link"] = evaluator.tools["cc"]
+	flags := make([]string, 2)
+	for index := range flags {
+		flags[index], err = evaluator.requestText(ProbeRequest{
+			Schema: LinuxProbeRequestSchema,
+			Steps: []ProbeStep{{Name: "flags", Tool: "ld", Arguments: []string{"--version" + strings.Repeat("-", index)}}},
+			Outcome: ProbeOutcome{Kind: "text", Step: "flags", Stream: "stdout"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	wrapper := func(body string) string {
+		return `set -e; TMP=.tmp_$$/tmp; trap "rm -rf .tmp_$$" EXIT; mkdir -p .tmp_$$; if (` + body + `) >/dev/null 2>&1; then echo "1"; else echo "0"; fi`
+	}
+	body := `echo "int main() {}" | /configured/clang ` + flags[0] + ` -xc -o /dev/null ` + flags[1] + ` -`
+	selected, err := evaluator.KbuildShell(context.Background(), wrapper(body))
+	if err != nil || !linuxProbeSymbolPattern.MatchString(selected) {
+		t.Fatalf("source compiler link = %q, %v; want measured boolean", selected, err)
+	}
+	plan, err := builder.Plan(evaluator.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 3 || len(plan.Nodes[2].Inputs) != 2 ||
+		!slices.Equal(plan.Nodes[2].Inputs, []string{plan.Nodes[0].ID, plan.Nodes[1].ID}) {
+		t.Fatalf("compiler link source dependencies = %#v; want both measured flag producers", plan.Nodes)
+	}
+	request := plan.Requests[plan.Nodes[2].RequestID]
+	step := request.Steps[0]
+	if request.InputCount != 2 || step.Tool != "cc" || step.Candidate == nil ||
+		step.Candidate.Policy != ProbeCandidatePolicyCCLink || step.Stdin != "int main() {}\n" ||
+		len(step.ArgumentFragments) != 2 || request.Scratch[0].Name != "output" {
+		t.Fatalf("compiler link step = %#v; want declared cc-link argv and scratch output", request)
+	}
+	for _, group := range step.ArgumentFragments {
+		if group.Mode != ProbeArgumentFragmentsModeSourceShellWords || !slices.Contains(step.Candidate.Base, group.Index) {
+			t.Errorf("measured flags lost candidate-owned shell-word projection: %#v", group)
+		}
+	}
+	for _, bad := range []string{
+		`echo "$(id)" | /configured/clang -xc -o /dev/null -`,
+		`echo "int main() {}" | /configured/clang -xc -o /dev/null -; touch outside`,
+	} {
+		if _, err := evaluator.KbuildShell(context.Background(), wrapper(bad)); err == nil {
+			t.Errorf("active source shell %q unexpectedly reached the declared link probe", bad)
+		}
+	}
+}
+
 func TestKbuildCompoundTryRunPreservesSourceProgramAndPriorProbeInputs(t *testing.T) {
 	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
 	if err != nil {

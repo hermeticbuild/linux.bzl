@@ -39,6 +39,7 @@ type testKbuildVirtualFileView struct {
 	files      map[string]testKbuildVirtualFile
 	matchCalls []string
 	readCalls  []string
+	readErr    error
 }
 
 func (v *testKbuildVirtualFileView) Match(pattern string) []string {
@@ -48,6 +49,9 @@ func (v *testKbuildVirtualFileView) Match(pattern string) []string {
 
 func (v *testKbuildVirtualFileView) Read(path string) (string, bool, bool, error) {
 	v.readCalls = append(v.readCalls, path)
+	if v.readErr != nil {
+		return "", false, false, v.readErr
+	}
 	file, exists := v.files[path]
 	return file.content, exists, file.exact, nil
 }
@@ -482,6 +486,121 @@ captured := $(OBJECT_VALUE)
 	}
 	if got, want := cache.Stats(), (KbuildSourceCacheStats{SourceReads: 1, CacheHits: 1, Entries: 1}); got != want {
 		t.Fatalf("source cache stats = %#v, want source-only reuse %#v", got, want)
+	}
+}
+
+func TestKbuildVirtualObjectIncludeReadsExactFrontierWithoutCachingIt(t *testing.T) {
+	root := t.TempDir()
+	objectRoot := filepath.Join(root, "object")
+	if err := os.MkdirAll(objectRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	makefile := filepath.Join(root, "Makefile")
+	if err := os.WriteFile(makefile, []byte(`include $(objtree)/feature-dump.mk
+all: $(if $(filter 1,$(feature-bpf)),enabled.o,disabled.o)
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// An existing physical file must not replace the version selected by the
+	// declared Make-visible frontier, even on the first cache miss.
+	if err := os.WriteFile(filepath.Join(objectRoot, "feature-dump.mk"), []byte("feature-bpf=stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const marker = "__LINUX_BZL_OBJECT_TREE__"
+	const included = marker + "/feature-dump.mk"
+	view := &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}}
+	cache := NewKbuildSourceCache([]string{root}, []string{objectRoot})
+	for _, tc := range []struct {
+		contents, prerequisite string
+	}{
+		{contents: "feature-bpf=1\n", prerequisite: "enabled.o"},
+		{contents: "feature-bpf=0\n", prerequisite: "disabled.o"},
+	} {
+		view.files[included] = testKbuildVirtualFile{content: tc.contents, exact: true}
+		kb, err := ParseKbuildFileTree(makefile, KbuildOptions{
+			RootDir: root, SourceRoots: map[string]string{marker: objectRoot},
+			Variables: map[string]string{"objtree": marker}, VirtualFileView: view,
+			SourceCache: cache, CaptureVariables: []string{"feature-bpf", "MAKEFILE_LIST"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := kb.Variables["feature-bpf"]; got != strings.TrimSuffix(strings.TrimPrefix(tc.contents, "feature-bpf="), "\n") {
+			t.Fatalf("included feature status = %q, want %q", got, tc.contents)
+		}
+		if len(kb.Rules) != 1 || !slices.Equal(kb.Rules[0].Prerequisites, []string{tc.prerequisite}) {
+			t.Fatalf("selected rule = %+v, want all: %s", kb.Rules, tc.prerequisite)
+		}
+		if want := filepath.Join(objectRoot, "feature-dump.mk"); !strings.Contains(kb.Variables["MAKEFILE_LIST"], want) {
+			t.Fatalf("included Makefile identity = %q, want %q", kb.Variables["MAKEFILE_LIST"], want)
+		}
+	}
+	if !slices.Equal(view.readCalls, []string{included, included}) {
+		t.Fatalf("virtual include reads = %q, want exact rooted object path twice", view.readCalls)
+	}
+	if got, want := cache.Stats(), (KbuildSourceCacheStats{SourceReads: 1, CacheHits: 1, Entries: 1}); got != want {
+		t.Fatalf("source cache stats = %#v, want source-only reuse %#v", got, want)
+	}
+}
+
+func TestKbuildVirtualObjectIncludeRequiresDeclaredExactOwner(t *testing.T) {
+	root := t.TempDir()
+	objectRoot := filepath.Join(root, "object")
+	if err := os.MkdirAll(objectRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const marker = "__LINUX_BZL_OBJECT_TREE__"
+	const included = marker + "/feature-dump.mk"
+	makefile := filepath.Join(root, "Makefile")
+	for _, tc := range []struct {
+		name, include, want string
+		roots               map[string]string
+		view                *testKbuildVirtualFileView
+		missing             bool
+	}{
+		{name: "opaque", include: "include $(objtree)/feature-dump.mk", roots: map[string]string{marker: objectRoot},
+			view: &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{included: {content: "feature-bpf=1\n"}}}, want: "requires exact contents"},
+		{name: "conflicting producer", include: "include $(objtree)/feature-dump.mk", roots: map[string]string{marker: objectRoot},
+			view: &testKbuildVirtualFileView{readErr: fmt.Errorf("distinct selected writers")}, want: "distinct selected writers"},
+		{name: "wrong owner", include: "include $(objtree)/feature-dump.mk", roots: map[string]string{"__LINUX_BZL_SOURCE_TREE__": root},
+			view: &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{included: {content: "feature-bpf=1\n", exact: true}}}, want: "no declared object-tree root"},
+		{name: "escaping alias", include: "include $(objtree)/../feature-dump.mk", roots: map[string]string{marker: objectRoot},
+			view: &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{included: {content: "feature-bpf=1\n", exact: true}}}, want: "not a canonical relative path"},
+		{name: "noncanonical alias", include: "include $(objtree)/nested/./feature-dump.mk", roots: map[string]string{marker: objectRoot},
+			view: &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{included: {content: "feature-bpf=1\n", exact: true}}}, want: "not a canonical relative path"},
+		{name: "absent, physical stale", include: "include $(objtree)/feature-dump.mk", roots: map[string]string{marker: objectRoot},
+			view: &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}}, missing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(makefile, []byte(tc.include+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(objectRoot, "feature-dump.mk"), []byte("feature-bpf=stale\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := ParseKbuildFileTree(makefile, KbuildOptions{
+				RootDir: root, SourceRoots: tc.roots, Variables: map[string]string{"objtree": marker}, VirtualFileView: tc.view,
+			})
+			if err == nil || tc.want != "" && !strings.Contains(err.Error(), tc.want) || tc.missing && !os.IsNotExist(err) {
+				t.Fatalf("object include error = %v, want %q (missing=%t)", err, tc.want, tc.missing)
+			}
+			if tc.name == "escaping alias" || tc.name == "noncanonical alias" || tc.name == "wrong owner" {
+				if len(tc.view.readCalls) != 0 {
+					t.Fatalf("unowned or noncanonical include read virtual path %q", tc.view.readCalls)
+				}
+			}
+		})
+	}
+	if err := os.WriteFile(makefile, []byte("-include $(objtree)/feature-dump.mk\nselected := yes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseKbuildFileTree(makefile, KbuildOptions{
+		RootDir: root, SourceRoots: map[string]string{marker: objectRoot}, Variables: map[string]string{"objtree": marker},
+		VirtualFileView:  &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}},
+		CaptureVariables: []string{"selected"},
+	})
+	if err != nil || parsed.Variables["selected"] != "yes" {
+		t.Fatalf("optional absent object include = %#v, %v; want selected yes", parsed, err)
 	}
 }
 
@@ -1000,6 +1119,398 @@ func TestParseKbuildLazyVirtualFileViewUnknownContentsTakesPrecedence(t *testing
 	}
 }
 
+func TestKbuildRootedObjectFileReadDoesNotUsePhysicalFallback(t *testing.T) {
+	const objectPath = "__LINUX_BZL_OBJECT_TREE__/include/config/kernel.release"
+	const sourcePath = "__LINUX_BZL_SOURCE_TREE__/payload"
+	root := t.TempDir()
+	physicalObject := filepath.Join(root, "include", "config", "kernel.release")
+	if err := os.MkdirAll(filepath.Dir(physicalObject), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(physicalObject, []byte("stale-physical-release\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "payload"), []byte("immutable-source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, filename := range []string{physicalObject, filepath.Join(root, "payload")} {
+		info, err := os.Lstat(filename)
+		if err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("declared test file %q is not a regular physical file: %#v, %v", filename, info, err)
+		}
+	}
+	view := &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}}
+	options := KbuildOptions{
+		SourceRoots: map[string]string{
+			"__LINUX_BZL_OBJECT_TREE__": root,
+			"__LINUX_BZL_SOURCE_TREE__": root,
+		},
+		Variables: map[string]string{
+			"objtree": "__LINUX_BZL_OBJECT_TREE__",
+			"srctree": "__LINUX_BZL_SOURCE_TREE__",
+		},
+		CaptureVariables: []string{"object", "source"},
+	}
+	const makefile = "object := $(file < $(objtree)/include/config/kernel.release)\nsource := $(file < $(srctree)/payload)\n"
+	check := func(wantObject string, wantReads []string) {
+		t.Helper()
+		kb, err := parseKbuildWithOptions(strings.NewReader(makefile), "Makefile", options, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := kb.Variables["object"]; got != wantObject {
+			t.Fatalf("object-root file read = %q, want %q", got, wantObject)
+		}
+		if got := kb.Variables["source"]; got != "immutable-source" {
+			t.Fatalf("source-root physical file read = %q, want declared immutable source", got)
+		}
+		if options.VirtualFileView != nil {
+			if !slices.Equal(view.readCalls, wantReads) {
+				t.Fatalf("virtual file reads = %q, want %q", view.readCalls, wantReads)
+			}
+			view.readCalls = nil
+		}
+	}
+	options.VirtualFileView = view
+	check("", []string{objectPath, sourcePath})
+	view.files[objectPath] = testKbuildVirtualFile{content: "source-generated-release\n", exact: true}
+	check("source-generated-release", []string{objectPath, sourcePath})
+	view.files[objectPath] = testKbuildVirtualFile{content: "opaque", exact: false}
+	if _, err := parseKbuildWithOptions(strings.NewReader(makefile), "Makefile", options, ""); err == nil ||
+		!strings.Contains(err.Error(), `visible virtual file "__LINUX_BZL_OBJECT_TREE__/include/config/kernel.release" requires exact contents`) {
+		t.Fatalf("opaque object-root file read error = %v, want exact-content rejection", err)
+	}
+	view.readCalls = nil
+	view.files["payload"] = testKbuildVirtualFile{content: "forged-virtual-alias\n", exact: true}
+	for _, test := range []struct{ variable, tree string }{
+		{variable: "objtree", tree: "object-tree"},
+		{variable: "srctree", tree: "source-tree"},
+	} {
+		invocation := "invalid := $(file < $(" + test.variable + ")/../payload)\n"
+		if _, err := parseKbuildWithOptions(strings.NewReader(invocation), "Makefile", options, ""); err == nil ||
+			!strings.Contains(err.Error(), "escapes declared "+test.tree+" root") {
+			t.Fatalf("%s file read crossing declared root error = %v, want rejection", test.tree, err)
+		}
+		if len(view.readCalls) != 0 {
+			t.Fatalf("%s escaping file read queried forged virtual alias %q", test.tree, view.readCalls)
+		}
+	}
+	options.VirtualFileView = nil
+	check("", nil)
+}
+
+func TestKbuildParseTimeObjectTreeFeatureDumpUsesExactPriorVersion(t *testing.T) {
+	const root = "__LINUX_BZL_OBJECT_TREE__"
+	const filename = root + "/tools/lib/bpf/FEATURE-DUMP.libbpf"
+	const makefile = `OUTPUT := $(objtree)/tools/lib/bpf/
+OUTPUT_FEATURES := $(OUTPUT)feature/
+FEATURE_USER := .libbpf
+FEATURE_DUMP_FILENAME = $(OUTPUT)FEATURE-DUMP$(FEATURE_USER)
+$(shell mkdir -p $(OUTPUT_FEATURES))
+FEATURE_DUMP := $(shell touch $(FEATURE_DUMP_FILENAME); cat $(FEATURE_DUMP_FILENAME))
+ifeq ($(findstring feature-bpf=1,$(FEATURE_DUMP)),)
+selected := missing
+all: missing.o
+else
+selected := present
+all: present.o
+endif
+$(shell rm -f $(FEATURE_DUMP_FILENAME))
+$(foreach feat,libelf zlib bpf,$(shell echo "feature-$(feat)=1" >> $(FEATURE_DUMP_FILENAME)))
+stored := $(file < $(FEATURE_DUMP_FILENAME))
+relative := $(file < FEATURE-DUMP.libbpf)
+present := $(wildcard FEATURE-DUMP.libbpf)
+MSG = $(shell printf '...%30s: [ \033[32mon\033[m  ]' bpf)
+$(info $(MSG))
+`
+	for _, tc := range []struct {
+		name, previous, selected string
+	}{
+		{name: "absent", selected: "missing"},
+		{name: "existing", previous: "feature-bpf=1\n", selected: "present"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			view := &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}}
+			if tc.previous != "" {
+				view.files[filename] = testKbuildVirtualFile{content: tc.previous, exact: true}
+			}
+			kb, err := parseKbuildWithOptions(strings.NewReader(makefile), "Makefile.feature", KbuildOptions{
+				Variables:        map[string]string{"objtree": root},
+				SourceRoots:      map[string]string{root: "/declared/object"},
+				WorkingDir:       "/declared/object/tools/lib/bpf",
+				VirtualFileView:  view,
+				CaptureVariables: []string{"selected", "stored", "relative", "present", "FEATURE_DUMP", "MSG"},
+			}, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := kb.Variables["selected"]; got != tc.selected {
+				t.Fatalf("feature dump selected %q, want %q", got, tc.selected)
+			}
+			if len(kb.Rules) != 1 || len(kb.Rules[0].Prerequisites) != 1 || kb.Rules[0].Prerequisites[0] != tc.selected+".o" {
+				t.Fatalf("feature dump selected graph %+v, want all: %s.o", kb.Rules, tc.selected)
+			}
+			if got := kb.Variables["FEATURE_DUMP"]; got != strings.TrimSuffix(tc.previous, "\n") {
+				t.Fatalf("prior feature dump %q, want %q", got, tc.previous)
+			}
+			if got, want := kb.Variables["stored"], "feature-libelf=1\nfeature-zlib=1\nfeature-bpf=1"; got != want {
+				t.Fatalf("appended feature dump = %q, want %q", got, want)
+			}
+			if got := kb.Variables["relative"]; got != kb.Variables["stored"] {
+				t.Fatalf("cwd-relative read %q differs from rooted dump %q", got, kb.Variables["stored"])
+			}
+			if got := kb.Variables["present"]; got != "FEATURE-DUMP.libbpf" {
+				t.Fatalf("cwd-relative wildcard = %q, want FEATURE-DUMP.libbpf", got)
+			}
+			if got, want := kb.Variables["MSG"], "...                           bpf: [ \x1b[32mon\x1b[m  ]"; got != want {
+				t.Fatalf("source diagnostic printf = %q, want %q", got, want)
+			}
+			if _, exists := view.files[filename]; exists && tc.previous == "" {
+				t.Fatal("parse-time effect modified the immutable prior view")
+			}
+		})
+	}
+	for _, tc := range []struct{ name, makefile, prior, want string }{
+		{"opaque previous", makefile, "opaque", "requires exact prior object contents"},
+		{"escaped path", `$(shell echo "feature-bpf=1" >> $(objtree)/../escaped)`, "", "canonical relative path"},
+		{"active shell expansion", `$(shell echo "$UNDECLARED" >> $(objtree)/FEATURE-DUMP)`, "", "dynamic shell word"},
+		{"foreign source write", `$(shell echo "feature-bpf=1" >> __LINUX_BZL_SOURCE_TREE__/FEATURE-DUMP)`, "", "requires a hermetic evaluator"},
+		{"custom shell", "SHELL := /bin/false\n$(shell touch $(objtree)/cache; cat $(objtree)/cache)", "", "selected SHELL override"},
+		{"custom tool path", "PATH := /custom/applets\n$(shell touch $(objtree)/cache; cat $(objtree)/cache)", "", "selected PATH override"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]testKbuildVirtualFile{}
+			if tc.prior != "" {
+				files[filename] = testKbuildVirtualFile{content: tc.prior, exact: false}
+			}
+			view := &testKbuildVirtualFileView{files: files}
+			_, err := parseKbuildWithOptions(strings.NewReader(tc.makefile+"\n"), "Makefile.feature", KbuildOptions{
+				Variables:        map[string]string{"objtree": root},
+				SourceRoots:      map[string]string{root: "/declared/object"},
+				WorkingDir:       "/declared/object/tools/lib/bpf",
+				VirtualFileView:  view,
+				CaptureVariables: []string{"selected", "stored", "relative", "present", "FEATURE_DUMP"},
+			}, "")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("parse error = %v, want %q (virtual reads %q)", err, tc.want, view.readCalls)
+			}
+		})
+	}
+}
+
+func TestKbuildParseTimeObjectTreeMultiDirectorySetup(t *testing.T) {
+	const root = "__LINUX_BZL_OBJECT_TREE__"
+	kb, err := parseKbuildWithOptions(strings.NewReader(`obj-dirs := . ./arch/x86/kernel ./include/generated ./kernel ./arch/x86/boot/compressed ./arch/x86/boot/compressed/..
+$(shell mkdir -p $(obj-dirs))
+found := $(wildcard $(objtree)/arch/x86/kernel/ $(objtree)/include/generated/ $(objtree)/kernel/ $(objtree)/arch/x86/boot/compressed/ $(objtree)/arch/x86/boot/)
+`), "scripts/Makefile.build", KbuildOptions{
+		Variables:        map[string]string{"objtree": root},
+		WorkingDir:       "/declared/object",
+		SourceRoots:      map[string]string{root: "/declared/object"},
+		VirtualFileView:  &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}},
+		CaptureVariables: []string{"found"},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := kb.Variables["found"], root+"/arch/x86/kernel/ "+root+"/include/generated/ "+root+"/kernel/ "+root+"/arch/x86/boot/compressed/ "+root+"/arch/x86/boot/"; got != want {
+		t.Fatalf("Make-visible generated directories = %q, want %q", got, want)
+	}
+	for _, tc := range []struct{ name, operand, want string }{
+		{"root escape", "../../../outside", "escapes the declared object tree"},
+		{"temporary root escape", "a/../../a", "escapes the declared object tree"},
+		{"opaque prior traversal", "arch/x86/boot/compressed arch/x86/boot/compressed/..", "untyped prior artifact"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]testKbuildVirtualFile{}
+			if tc.name == "opaque prior traversal" {
+				files[root+"/arch/x86/boot/compressed"] = testKbuildVirtualFile{content: "opaque"}
+			}
+			_, err := parseKbuildWithOptions(strings.NewReader("$(shell mkdir -p "+tc.operand+")\n"), "scripts/Makefile.build", KbuildOptions{
+				WorkingDir: "/declared/object", SourceRoots: map[string]string{root: "/declared/object"},
+				VirtualFileView: &testKbuildVirtualFileView{files: files},
+			}, "")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("parse-time mkdir error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	t.Run("symlink traversal", func(t *testing.T) {
+		objectRoot := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(objectRoot, "arch/x86/boot"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(t.TempDir(), filepath.Join(objectRoot, "arch/x86/boot/compressed")); err != nil {
+			t.Fatal(err)
+		}
+		_, err := parseKbuildWithOptions(strings.NewReader("$(shell mkdir -p arch/x86/boot/compressed arch/x86/boot/compressed/..)\n"), "scripts/Makefile.build", KbuildOptions{
+			WorkingDir: objectRoot, SourceRoots: map[string]string{root: objectRoot},
+			VirtualFileView: &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}},
+		}, "")
+		if err == nil || !strings.Contains(err.Error(), "non-directory or symlink") {
+			t.Fatalf("symlinked mkdir traversal error = %v, want rejection", err)
+		}
+	})
+	if _, err := parseKbuildWithOptions(strings.NewReader("$(shell mkdir -p .)\n"), "Makefile", KbuildOptions{
+		WorkingDir:      "/undeclared/directory",
+		SourceRoots:     map[string]string{root: "/declared/object"},
+		VirtualFileView: &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}},
+	}, ""); err == nil || !strings.Contains(err.Error(), "requires a hermetic evaluator") {
+		t.Fatalf("unowned cwd-relative mkdir error = %v, want source shell authority rejection", err)
+	}
+}
+
+func TestKbuildParseTimeObjectDirectoryWaitsForMeasuredPathname(t *testing.T) {
+	const root = "__LINUX_BZL_OBJECT_TREE__"
+	probe := linuxProbeSymbolPrefix + strings.Repeat("d", 64)
+	source := "$(shell mkdir -p $(OBJDIR))\nseen := $(wildcard $(objtree)/obj/)\n"
+	options := KbuildOptions{
+		Variables:  map[string]string{"objtree": root, "OBJDIR": probe},
+		WorkingDir: "/declared/object", SourceRoots: map[string]string{root: "/declared/object"},
+		VirtualFileView:  &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}},
+		CaptureVariables: []string{"seen"},
+		ResolveSymbolic:  func(value string) (string, error) { return value, nil },
+	}
+	if _, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", options, ""); err == nil ||
+		!strings.Contains(err.Error(), "wildcard") || !strings.Contains(err.Error(), "unmeasured parse-time pathname") {
+		t.Fatalf("unmeasured pathname read error = %v, want conditional object wildcard rejection", err)
+	}
+	options.RejectUnmeasuredGraphGuards = true
+	if _, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", options, ""); err == nil ||
+		!strings.Contains(err.Error(), "undeclared probe-dependent graph guard") {
+		t.Fatalf("undeclared mkdir pathname error = %v, want exact graph guard rejection", err)
+	}
+	options.RejectUnmeasuredGraphGuards = false
+	options.ResolveSymbolic = func(value string) (string, error) {
+		return strings.ReplaceAll(value, probe, "obj"), nil
+	}
+	kb, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", options, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := kb.Variables["seen"], root+"/obj/"; got != want {
+		t.Fatalf("measured mkdir wildcard = %q, want %q", got, want)
+	}
+	options.ResolveSymbolic = func(value string) (string, error) { return value, nil }
+	if _, err := parseKbuildWithOptions(strings.NewReader("$(shell mkdir -p $(OBJDIR))\nread := $(file < $(objtree)/obj/file)\n"), "Makefile", options, ""); err == nil ||
+		!strings.Contains(err.Error(), "unmeasured parse-time pathname") {
+		t.Fatalf("unmeasured pathname read error = %v, want exact-read rejection", err)
+	}
+}
+
+func TestKbuildParseTimeObjectCatReadsExactInvocationFrontier(t *testing.T) {
+	const marker = "__LINUX_BZL_OBJECT_TREE__"
+	objectRoot := t.TempDir()
+	objectDirectory := filepath.Join(objectRoot, "external/demo")
+	if err := os.MkdirAll(objectDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(objectDirectory, "modules.order"), []byte("stale.o\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	location := CompactKbuildInvocationLocation{Tree: CompactKbuildInvocationObjectTree, Directory: "external/demo"}
+	view := &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{
+		marker + "/external/demo/modules.order": {content: "demo.o\nsecond.o\n", exact: true},
+	}}
+	options := KbuildOptions{
+		WorkingDir: objectDirectory, SourceRoots: map[string]string{marker: objectRoot},
+		InvocationLocation: &location, VirtualFileView: view,
+		CaptureVariables: []string{"modules"},
+	}
+	source := "MODORDER := modules.order\nmodules := $(sort $(shell cat $(MODORDER)))\n"
+	kb, err := parseKbuildWithOptions(strings.NewReader(source), "scripts/Makefile.modfinal", options, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := kb.Variables["modules"], "demo.o second.o"; got != want {
+		t.Fatalf("source-selected modules = %q, want %q", got, want)
+	}
+	if len(view.readCalls) != 1 || view.readCalls[0] != marker+"/external/demo/modules.order" {
+		t.Fatalf("modfinal cat read %q, want exact object-tree invocation path", view.readCalls)
+	}
+	for _, tc := range []struct {
+		name, input, want string
+		files             map[string]testKbuildVirtualFile
+	}{
+		{"stale physical file", source, "no completed producer", nil},
+		{"opaque frontier", source, "producer with opaque contents", map[string]testKbuildVirtualFile{marker + "/external/demo/modules.order": {content: "demo.o\n"}}},
+		{"escaping source path", "modules := $(shell cat ../modules.order)\n", "not a canonical relative path", view.files},
+		{"dynamic shell operand", "modules := $(shell cat modules.*)\n", "escaping or dynamic path", view.files},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options.VirtualFileView = &testKbuildVirtualFileView{files: tc.files}
+			if _, err := parseKbuildWithOptions(strings.NewReader(tc.input), "scripts/Makefile.modfinal", options, ""); err == nil ||
+				!strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("parse error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	options.WorkingDir = objectRoot
+	if _, err := parseKbuildWithOptions(strings.NewReader(source), "scripts/Makefile.modfinal", options, ""); err == nil ||
+		!strings.Contains(err.Error(), "does not match its declared working directory") {
+		t.Fatalf("wrong typed cwd error = %v, want rejection", err)
+	}
+}
+
+func TestKbuildParseTimeConditionalObjectWritesDoNotChooseUnmeasuredGraph(t *testing.T) {
+	const root = "__LINUX_BZL_OBJECT_TREE__"
+	const filename = root + "/tools/lib/bpf/FEATURE-DUMP"
+	probe := linuxProbeSymbolPrefix + strings.Repeat("d", 64)
+	const source = `FEATURE_DUMP_FILENAME := $(objtree)/tools/lib/bpf/FEATURE-DUMP
+ifneq ($(FLAG),)
+$(shell rm -f $(FEATURE_DUMP_FILENAME))
+$(shell echo "feature-bpf=1" >> $(FEATURE_DUMP_FILENAME))
+endif
+ifneq ($(wildcard $(FEATURE_DUMP_FILENAME)),)
+all: present.o
+else
+all: absent.o
+endif
+`
+	_, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile.feature", KbuildOptions{
+		Variables:             map[string]string{"objtree": root, "FLAG": probe},
+		SourceRoots:           map[string]string{root: "/declared/object"},
+		VirtualFileView:       &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{filename: {content: "stale\n", exact: true}}},
+		MakeVariablesComplete: true, ConfigVariablesComplete: true,
+		SelectSymbolic: func(value, _ string, _ bool, _, _ string) (string, bool, error) {
+			if linuxProbeSymbolPattern.MatchString(value) {
+				return probe, true, nil
+			}
+			return "", false, nil
+		},
+		ResolveSymbolic: func(value string) (string, error) { return value, nil },
+	}, "")
+	if err == nil || !strings.Contains(err.Error(), "wildcard") || !strings.Contains(err.Error(), "before its graph guard is measured") {
+		t.Fatalf("unmeasured conditional object mutation error = %v, want conditional wildcard rejection", err)
+	}
+}
+
+func TestKbuildRootedSourceFileReadDistinguishesMissingFromUnreadable(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "existing-directory"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	options := KbuildOptions{
+		SourceRoots: map[string]string{"__LINUX_BZL_SOURCE_TREE__": root},
+		Variables:   map[string]string{"srctree": "__LINUX_BZL_SOURCE_TREE__"},
+		VirtualFileView: &testKbuildVirtualFileView{
+			files: map[string]testKbuildVirtualFile{},
+		},
+		CaptureVariables: []string{"missing"},
+	}
+	kb, err := parseKbuildWithOptions(strings.NewReader("missing := $(file < $(srctree)/missing)\n"), "Makefile", options, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := kb.Variables["missing"]; got != "" {
+		t.Fatalf("missing immutable source read = %q, want empty", got)
+	}
+	_, err = parseKbuildWithOptions(strings.NewReader("directory := $(file < $(srctree)/existing-directory)\n"), "Makefile", options, "")
+	if err == nil || !strings.Contains(err.Error(), `Kbuild file read "__LINUX_BZL_SOURCE_TREE__/existing-directory"`) {
+		t.Fatalf("existing immutable source directory read error = %v, want source-located read failure", err)
+	}
+}
+
 func TestKbuildLazyVirtualFileViewIsRetainedByCapturedEvaluator(t *testing.T) {
 	view := &testKbuildVirtualFileView{
 		matches: map[string][]string{
@@ -1266,6 +1777,9 @@ func TestParseKbuildProvidesSemanticGNUmakeBuiltins(t *testing.T) {
 ifeq ($(filter output-sync,$(.FEATURES)),)
 $(error GNU Make >= 4.0 is required. Your Make version is $(MAKE_VERSION))
 endif
+ifeq ($(filter undefine,$(.FEATURES)),)
+$(error GNU Make >= 3.82 is required. Your Make version is $(MAKE_VERSION))
+endif
 selected-version := $(MAKE_VERSION)
 `), 0o644); err != nil {
 		t.Fatal(err)
@@ -1281,8 +1795,14 @@ selected-version := $(MAKE_VERSION)
 	if got, want := kb.Variables["selected-version"], "4.4"; got != want {
 		t.Fatalf("selected-version=%q, want %q", got, want)
 	}
-	if got := strings.Fields(kb.Variables[".FEATURES"]); !slices.Contains(got, "output-sync") {
-		t.Fatalf(".FEATURES=%q omits output-sync", got)
+	if got := strings.Fields(kb.Variables[".FEATURES"]); !slices.Contains(got, "output-sync") || !slices.Contains(got, "undefine") {
+		t.Fatalf(".FEATURES=%q omits the selected Linux Make feature gates", got)
+	}
+	if _, err := ParseKbuildFileTree(path, KbuildOptions{
+		RootDir: dir, MakeVariablesComplete: true,
+		Variables: map[string]string{".FEATURES": "output-sync"},
+	}); err == nil || !strings.Contains(err.Error(), "GNU Make >= 3.82") {
+		t.Fatalf("caller-selected frontend without undefine passed the 6.6 source gate: %v", err)
 	}
 }
 
@@ -1729,6 +2249,856 @@ PRIVATE_FIELD := not-exported
 	}
 }
 
+func TestKbuildProbeConditionalExportPreservesPresence(t *testing.T) {
+	const source = `
+EMPTY :=
+ifneq ($(shell compiler-version),)
+export EMPTY
+unexport INHERITED
+export PINNED := source-value
+endif
+`
+	probe := linuxProbeSymbolPrefix + strings.Repeat("a", 64)
+	type selection struct {
+		value, expected, trueText, falseText string
+		equal                                bool
+	}
+	selections := map[string]selection{}
+	opts := KbuildOptions{
+		EnvironmentVariables:           map[string]string{"INHERITED": "parent"},
+		CommandLineVariables:           map[string]string{"PINNED": "command-line"},
+		AutoExportCommandLineVariables: map[string]bool{},
+		MakeVariablesComplete:          true,
+		ConfigVariablesComplete:        true,
+		CaptureTargetEvaluator:         true,
+		Shell: func(command string) (string, error) {
+			if command != "compiler-version" {
+				return "", fmt.Errorf("unexpected command %q", command)
+			}
+			return probe, nil
+		},
+		SelectSymbolic: func(value, expected string, equal bool, trueText, falseText string) (string, bool, error) {
+			token := linuxProbeSymbolPrefix + fmt.Sprintf("%064x", len(selections)+1)
+			selections[token] = selection{value, expected, trueText, falseText, equal}
+			return token, true, nil
+		},
+	}
+	if _, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", opts, ""); err == nil ||
+		!strings.Contains(err.Error(), "unresolved probe-dependent presence") {
+		t.Fatalf("premature export materialization error = %v, want unresolved membership", err)
+	}
+	opts.SkipExportedVariables = true
+	parsed, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", opts, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name, version string
+		present       map[string]string
+		absent        []string
+	}{
+		{name: "selected", version: "clang", present: map[string]string{"EMPTY": "", "PINNED": "command-line"}, absent: []string{"INHERITED"}},
+		{name: "unselected", version: "", present: map[string]string{"INHERITED": "parent"}, absent: []string{"EMPTY", "PINNED"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			parser := cloneKbuildParserForEvaluation(parsed.evaluator.template)
+			var resolve func(string) string
+			resolve = func(value string) string {
+				if value == probe {
+					return test.version
+				}
+				if selected, ok := selections[value]; ok {
+					match := resolve(selected.value) == resolve(selected.expected)
+					if !selected.equal {
+						match = !match
+					}
+					if match {
+						return resolve(selected.trueText)
+					}
+					return resolve(selected.falseText)
+				}
+				return value
+			}
+			parser.resolveSymbolic = func(value string) (string, error) { return resolve(value), nil }
+			if err := parser.finalizeExportedVariables(); err != nil {
+				t.Fatal(err)
+			}
+			environment := parser.kb.ExportedEnvironment()
+			for name, want := range test.present {
+				if got, exists := environment[name]; !exists || got != want {
+					t.Errorf("exported %s = %q, present %t; want %q, present", name, got, exists, want)
+				}
+			}
+			for _, name := range test.absent {
+				if got, exists := environment[name]; exists {
+					t.Errorf("unexported %s = %q; want absent", name, got)
+				}
+			}
+		})
+	}
+}
+
+func TestKbuildSourceGraphGuardsRetainExportIncludeAndRecipeSelectors(t *testing.T) {
+	makefile := filepath.Join(t.TempDir(), "Makefile")
+	if err := os.WriteFile(makefile, []byte(`
+has_capability := $(shell capability-probe)
+ifeq ($(has_capability),1)
+export CONDITIONAL
+-include optional.mk
+endif
+all:
+ifeq ($(has_capability),1)
+	@echo enabled
+endif
+	@echo ready
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	probe := linuxProbeSymbolPrefix + strings.Repeat("a", 64)
+	sequence := 0
+	parsed, err := ParseKbuildFileTree(makefile, KbuildOptions{
+		CaptureTargetEvaluator: true, MakeVariablesComplete: true, SkipExportedVariables: true,
+		Shell: func(command string) (string, error) {
+			if command != "capability-probe" {
+				return "", fmt.Errorf("unexpected graph probe %q", command)
+			}
+			return probe, nil
+		},
+		SelectSymbolic: func(_, _ string, _ bool, _, _ string) (string, bool, error) {
+			sequence++
+			return linuxProbeSymbolPrefix + fmt.Sprintf("%064x", sequence), true, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := NewCompactKbuildProfile("root", makefile, filepath.Dir(makefile), parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guards := CompactKbuildGraphGuards(profile)
+	if len(guards) < 3 {
+		t.Fatalf("source graph guards = %q, want guarded export, include and recipe", guards)
+	}
+	for _, guard := range guards {
+		if !linuxProbeSymbolPattern.MatchString(guard) {
+			t.Errorf("unmeasured source graph guard %q", guard)
+		}
+	}
+}
+
+func TestKbuildSourceGraphGuardDefersRuleAndItsRecipeOwner(t *testing.T) {
+	const version = "rustc 1.100.0-nightly (923c95cdf 2026-09-16)"
+	const source = `
+previous: FORCE
+	@echo previous
+ifneq "$(shell version-probe)" "rustc 1.100.0-nightly (923c95cdf 2026-09-16)"
+next: $(shell prerequisite-probe)
+	$(shell recipe-only)
+endif
+	@echo following
+last: FORCE
+	@echo last
+`
+	probe := linuxProbeSymbolPrefix + strings.Repeat("a", 64)
+	guard := linuxProbeSymbolPrefix + strings.Repeat("b", 64)
+	parse := func(measured string, resolveGuard, final bool) (*KbuildFile, []string, error) {
+		queries := []string{}
+		opts := KbuildOptions{
+			MakeVariablesComplete:       true,
+			CaptureTargetEvaluator:      true,
+			RejectUnmeasuredGraphGuards: final,
+			ResolveMeasuredGraphGuards:  measured != "" || resolveGuard,
+			Shell: func(command string) (string, error) {
+				queries = append(queries, command)
+				switch command {
+				case "version-probe":
+					return probe, nil
+				case "prerequisite-probe":
+					return "generated", nil
+				default:
+					return "", fmt.Errorf("recipe body executed while parsing: %q", command)
+				}
+			},
+			SelectSymbolic: func(value, expected string, equal bool, whenTrue, whenFalse string) (string, bool, error) {
+				if !linuxProbeSymbolPattern.MatchString(value) && !linuxProbeSymbolPattern.MatchString(expected) {
+					return "", false, nil
+				}
+				if value != probe || expected != version || equal || whenTrue != "1" || whenFalse != "" {
+					return "", true, fmt.Errorf("unexpected version comparison %q, %q, equal=%t", value, expected, equal)
+				}
+				return guard, true, nil
+			},
+			ResolveSymbolic: func(value string) (string, error) {
+				if value == probe && measured != "" {
+					return measured, nil
+				}
+				if value == guard && resolveGuard {
+					return "", nil
+				}
+				return value, nil
+			},
+		}
+		parsed, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", opts, "")
+		return parsed, queries, err
+	}
+	deferred, queries, err := parse("", false, false)
+	if err != nil || !slices.Equal(queries, []string{"version-probe"}) || len(deferred.Rules) != 2 ||
+		!slices.Equal(deferred.Rules[0].Recipe, []string{"@echo previous"}) ||
+		!slices.Equal(deferred.Rules[1].Recipe, []string{"@echo last"}) ||
+		deferred.evaluator == nil || len(deferred.evaluator.template.deferredGraphGuards) != 1 {
+		t.Fatalf("unmeasured rule = %#v, queries %q, err %v", deferred, queries, err)
+	}
+	if _, _, err := parse("", false, true); err == nil || !strings.Contains(err.Error(), "undeclared probe-dependent graph guard") {
+		t.Fatalf("final rule with unmeasured guard error = %v", err)
+	}
+	for _, test := range []struct {
+		name, measured string
+		resolveGuard   bool
+		wantRules      int
+		wantPrior      []string
+		wantNext       []string
+		wantQueries    []string
+	}{
+		{"equal", version, false, 2, []string{"@echo previous", "@echo following"}, nil, []string{"version-probe"}},
+		{"guard token false", "", true, 2, []string{"@echo previous", "@echo following"}, nil, []string{"version-probe"}},
+		{"different", "rustc 1.100.0-nightly (different)", false, 3, []string{"@echo previous"}, []string{"$(shell recipe-only)", "@echo following"}, []string{"version-probe", "prerequisite-probe"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			parsed, queries, err := parse(test.measured, test.resolveGuard, false)
+			if err != nil || len(parsed.Rules) != test.wantRules ||
+				!slices.Equal(parsed.Rules[0].Recipe, test.wantPrior) ||
+				!slices.Equal(queries, test.wantQueries) {
+				t.Fatalf("measured rules = %#v, queries %q, err %v", parsed, queries, err)
+			}
+			if test.wantNext != nil && (!slices.Equal(parsed.Rules[1].Targets, []string{"next"}) ||
+				!slices.Equal(parsed.Rules[1].Prerequisites, []string{"generated"}) ||
+				!slices.Equal(parsed.Rules[1].Recipe, test.wantNext)) {
+				t.Fatalf("selected guarded rule = %#v, want recipe %q", parsed.Rules[1], test.wantNext)
+			}
+			if !slices.Equal(parsed.Rules[len(parsed.Rules)-1].Recipe, []string{"@echo last"}) {
+				t.Fatalf("later unconditional rule = %#v", parsed.Rules[len(parsed.Rules)-1])
+			}
+		})
+	}
+}
+
+func TestKbuildSourceGraphGuardDefersTargetVariableExpansion(t *testing.T) {
+	const source = `
+ifneq ($(shell version-probe),stable)
+target.o: CFLAGS := $(shell immediate-probe)
+target.o: CXXFLAGS = $(shell recursive-probe)
+endif
+after: FORCE
+	@echo after
+`
+	probe := linuxProbeSymbolPrefix + strings.Repeat("a", 64)
+	guard := linuxProbeSymbolPrefix + strings.Repeat("b", 64)
+	for _, test := range []struct {
+		name, answer string
+		measured     bool
+		reject       bool
+		wantError    string
+		wantQueries  []string
+		wantVars     int
+	}{
+		{"unmeasured discovery", "", false, false, "", []string{"version-probe"}, 0},
+		{"unmeasured final", "", false, true, "undeclared probe-dependent graph guard", []string{"version-probe"}, 0},
+		{"measured false", "", true, true, "", []string{"version-probe"}, 0},
+		{"measured true", "1", true, true, "", []string{"version-probe", "immediate-probe"}, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			queries := []string{}
+			kb, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", KbuildOptions{
+				MakeVariablesComplete:       true,
+				CaptureTargetEvaluator:      true,
+				RejectUnmeasuredGraphGuards: test.reject,
+				ResolveMeasuredGraphGuards:  test.measured,
+				Shell: func(command string) (string, error) {
+					queries = append(queries, command)
+					switch command {
+					case "version-probe":
+						return probe, nil
+					case "immediate-probe":
+						return "-fselected", nil
+					default:
+						return "", fmt.Errorf("recursive target-variable RHS executed while parsing: %q", command)
+					}
+				},
+				SelectSymbolic: func(value, expected string, equal bool, whenTrue, whenFalse string) (string, bool, error) {
+					if value != probe || expected != "stable" || equal || whenTrue != "1" || whenFalse != "" {
+						return "", false, nil
+					}
+					return guard, true, nil
+				},
+				ResolveSymbolic: func(value string) (string, error) {
+					if value == guard && test.measured {
+						return test.answer, nil
+					}
+					return value, nil
+				},
+			}, "")
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) || !slices.Equal(queries, test.wantQueries) {
+					t.Fatalf("guarded target assignment error = %v, queries %q", err, queries)
+				}
+				return
+			}
+			if err != nil || !slices.Equal(queries, test.wantQueries) || len(kb.TargetVariables) != test.wantVars ||
+				len(kb.Rules) != 1 || !slices.Equal(kb.Rules[0].Recipe, []string{"@echo after"}) {
+				t.Fatalf("guarded target assignments = %+v, queries %q, err %v", kb, queries, err)
+			}
+			if test.wantVars != 0 {
+				if got := kb.TargetVariables[0]; !slices.Equal(got.Targets, []string{"target.o"}) ||
+					got.Variable != "CFLAGS" || got.Value != "-fselected" {
+					t.Fatalf("selected immediate target variable = %+v", got)
+				}
+				if got := kb.TargetVariables[1]; got.Variable != "CXXFLAGS" ||
+					got.Value != "$(shell recursive-probe)" {
+					t.Fatalf("selected recursive target variable = %+v", got)
+				}
+			}
+		})
+	}
+}
+
+func TestKbuildSourceGraphGuardsRetainInheritedExportedScalar(t *testing.T) {
+	const source = `
+ifeq ($(shell host-link-probe),0)
+SKIP_STACK_VALIDATION := 1
+export SKIP_STACK_VALIDATION
+endif
+`
+	probe := linuxProbeSymbolPrefix + strings.Repeat("a", 64)
+	sequence := 0
+	parsed, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", KbuildOptions{
+		MakeVariablesComplete: true, ConfigVariablesComplete: true,
+		CaptureTargetEvaluator: true, SkipExportedVariables: true,
+		Shell: func(command string) (string, error) {
+			if command != "host-link-probe" {
+				return "", fmt.Errorf("unexpected source probe %q", command)
+			}
+			return probe, nil
+		},
+		SelectSymbolic: func(_, _ string, _ bool, _, _ string) (string, bool, error) {
+			sequence++
+			return linuxProbeSymbolPrefix + fmt.Sprintf("%064x", sequence), true, nil
+		},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := NewCompactKbuildProfile("root", "Makefile", "", parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := parsed.evaluator.template
+	scalar, present := template.lookupVariable("SKIP_STACK_VALIDATION")
+	if !present || !linuxProbeSymbolPattern.MatchString(scalar.value) {
+		t.Fatalf("exported source scalar = %q, defined %t; want conditional probe", scalar.value, present)
+	}
+	guards := CompactKbuildGraphGuards(profile)
+	if !slices.Contains(guards, scalar.value) || !slices.Contains(guards, template.exportedWhen["SKIP_STACK_VALIDATION"]) {
+		t.Fatalf("source graph guards %q omit inherited value %q or membership %q", guards, scalar.value, template.exportedWhen["SKIP_STACK_VALIDATION"])
+	}
+}
+
+func TestKbuildSourceGraphGuardsRetainUnconditionalExportWithConditionalValue(t *testing.T) {
+	const source = `
+CC_FLAGS_FTRACE :=
+PRIVATE_FLAGS :=
+ifeq ($(shell capability-probe),y)
+CC_FLAGS_FTRACE += -mrecord-mcount
+PRIVATE_FLAGS += -private
+endif
+export CC_FLAGS_FTRACE
+`
+	probe := linuxProbeSymbolPrefix + strings.Repeat("a", 64)
+	parsed, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", KbuildOptions{
+		MakeVariablesComplete: true, ConfigVariablesComplete: true,
+		CaptureTargetEvaluator: true, SkipExportedVariables: true,
+		Shell: func(command string) (string, error) {
+			if command != "capability-probe" {
+				return "", fmt.Errorf("unexpected source probe %q", command)
+			}
+			return probe, nil
+		},
+		SelectSymbolic: func(_, _ string, _ bool, _, _ string) (string, bool, error) {
+			return probe, true, nil
+		},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := NewCompactKbuildProfile("root", "Makefile", "", parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := parsed.evaluator.template
+	value, defined := template.lookupVariable("CC_FLAGS_FTRACE")
+	if !defined || !template.exported["CC_FLAGS_FTRACE"] ||
+		!linuxProbeSymbolPattern.MatchString(value.value) {
+		t.Fatalf("source export has no probe-selected flags: value=%q defined=%t export=%t", value.value, defined, template.exported["CC_FLAGS_FTRACE"])
+	}
+	if got := CompactKbuildGraphGuards(profile); !slices.Equal(got, []string{value.value}) {
+		t.Fatalf("exported conditional value guards = %q, want only %q; unexported flags are local", got, value.value)
+	}
+}
+
+func TestKbuildPregraphMeasuredInheritedScalarSelectsChildConditional(t *testing.T) {
+	const source = `
+ifneq ($(SKIP_STACK_VALIDATION),1)
+objtool_args = $(if $(CONFIG_UNWINDER_ORC),orc generate,check)
+endif
+`
+	probe := linuxProbeSymbolPrefix + strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		name, measured, want string
+	}{
+		{name: "skip", measured: "1", want: ""},
+		{name: "validate", measured: "", want: "orc generate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selections := 0
+			parsed := parseCapturedKbuild(t, source, KbuildOptions{
+				EnvironmentVariables:  map[string]string{"SKIP_STACK_VALIDATION": probe},
+				Variables:             map[string]string{"CONFIG_UNWINDER_ORC": "y"},
+				MakeVariablesComplete: true, ConfigVariablesComplete: true,
+				RejectUnmeasuredGraphGuards: true,
+				ResolveSymbolic: func(value string) (string, error) {
+					if value == probe {
+						return tc.measured, nil
+					}
+					return value, nil
+				},
+				SelectSymbolic: func(value, _ string, _ bool, _, _ string) (string, bool, error) {
+					if linuxProbeSymbolPattern.MatchString(value) {
+						selections++
+						return probe, true, nil
+					}
+					return "", false, nil
+				},
+			}, "objtool_args")
+			if got := parsed.Variables["objtool_args"]; got != tc.want {
+				t.Fatalf("selected child objtool_args = %q, want %q", got, tc.want)
+			}
+			if selections != 0 {
+				t.Fatalf("measured child scalar recreated %d source selection tokens", selections)
+			}
+		})
+	}
+}
+
+func TestKbuildMeasuredCompilerGuardSelectsExportedRecipeFlags(t *testing.T) {
+	// The same source-selected compiler flag is later inherited by a compiler
+	// query in an exported Make variable. A family replay must consume the
+	// measured guard before expanding that environment, just as ordinary
+	// Kbuild discovery does.
+	const source = `
+KBUILD_CFLAGS := -Werror
+cc-option-yn = $(shell source-option $(1))
+ifdef CONFIG_FUNCTION_TRACER
+ifdef CONFIG_FTRACE_MCOUNT_RECORD
+ifeq ($(call cc-option-yn,-mrecord-mcount),y)
+CC_FLAGS_FTRACE += -mrecord-mcount
+endif
+endif
+endif
+KBUILD_CFLAGS += $(CC_FLAGS_FTRACE)
+export KBUILD_USERLDFLAGS = $(KBUILD_CFLAGS)
+outputmakefile: scripts/mkmakefile
+	$(CONFIG_SHELL) scripts/mkmakefile
+`
+	const probe = linuxProbeSymbolPrefix + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, test := range []struct {
+		name, measured string
+		want           []string
+	}{
+		{name: "compiler rejects flag", measured: "n", want: []string{"-Werror"}},
+		{name: "compiler accepts flag", measured: "y", want: []string{"-Werror", "-mrecord-mcount"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			parsed := parseCapturedKbuild(t, source, KbuildOptions{
+				Variables: map[string]string{
+					"CONFIG_FUNCTION_TRACER":      "y",
+					"CONFIG_FTRACE_MCOUNT_RECORD": "y",
+					"CONFIG_SHELL":                "sh",
+				},
+				ConfigVariablesComplete:     true,
+				MakeVariablesComplete:       true,
+				RejectUnmeasuredGraphGuards: true,
+				Shell: func(command string) (string, error) {
+					if command != "source-option -mrecord-mcount" {
+						return "", fmt.Errorf("unexpected source compiler query %q", command)
+					}
+					return probe, nil
+				},
+				ResolveSymbolic: func(value string) (string, error) {
+					if value == probe {
+						return test.measured, nil
+					}
+					return value, nil
+				},
+				SelectSymbolic: func(value, _ string, _ bool, _, _ string) (string, bool, error) {
+					if linuxProbeSymbolPattern.MatchString(value) {
+						return "", true, fmt.Errorf("measured source compiler guard was not resolved: %q", value)
+					}
+					return "", false, nil
+				},
+			}, "KBUILD_CFLAGS", "KBUILD_USERLDFLAGS")
+			for _, name := range []string{"KBUILD_CFLAGS", "KBUILD_USERLDFLAGS"} {
+				requireKbuildVariableWords(t, parsed, name, test.want)
+			}
+		})
+	}
+}
+
+func TestKbuildPregraphMeasuredMakeIfSelectsOnlySealedCondition(t *testing.T) {
+	probe := linuxProbeSymbolPrefix + strings.Repeat("c", 64)
+	found := linuxProbeSymbolPrefix + strings.Repeat("d", 64)
+	const source = `
+CC_FLAGS_FTRACE := -pg
+_c_flags := $(CAPABILITY)
+cmd_record_mcount = $(if $(findstring $(CC_FLAGS_FTRACE),$(_c_flags)),recordmcount)
+result := $(cmd_record_mcount)
+`
+	for _, tc := range []struct {
+		name, measured, want string
+	}{
+		{name: "missing trace flag", measured: "-DOTHER=1", want: ""},
+		{name: "embedded trace flag", measured: "-DTHING=-pgsuffix", want: "recordmcount"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selections := 0
+			parsed := parseCapturedKbuild(t, source, KbuildOptions{
+				EnvironmentVariables:  map[string]string{"CAPABILITY": probe},
+				MakeVariablesComplete: true, ConfigVariablesComplete: true,
+				RejectUnmeasuredGraphGuards: true,
+				ResolveSymbolic: func(value string) (string, error) {
+					if value == found {
+						if strings.Contains(tc.measured, "-pg") {
+							return "-pg", nil
+						}
+						return "", nil
+					}
+					return value, nil
+				},
+				TransformSymbolic: func(function string, args []string) (string, bool, error) {
+					if function != "findstring" || !slices.Equal(args, []string{"-pg", probe}) {
+						return "", true, fmt.Errorf("unexpected source Make transform %q(%q)", function, args)
+					}
+					return found, true, nil
+				},
+				SelectSymbolic: func(value, _ string, _ bool, _, _ string) (string, bool, error) {
+					selections++
+					return "", false, fmt.Errorf("unsealed Make if condition %q", value)
+				},
+			}, "result")
+			if got := parsed.Variables["result"]; got != tc.want {
+				t.Fatalf("record-mcount command = %q, want %q", got, tc.want)
+			}
+			if selections != 0 {
+				t.Fatalf("sealed Make if condition selected %d symbolic branches", selections)
+			}
+		})
+	}
+
+	// A child-local result absent from the source guard remains symbolic. In
+	// particular, a stateful branch cannot be expanded just to choose a
+	// plausible value for an unsealed compiler result.
+	_, err := parseKbuildWithOptions(strings.NewReader(`result := $(if $(CAPABILITY),$(eval UNSAFE := yes)recordmcount,safe)`), "Makefile", KbuildOptions{
+		EnvironmentVariables:  map[string]string{"CAPABILITY": probe},
+		MakeVariablesComplete: true, ConfigVariablesComplete: true,
+		RejectUnmeasuredGraphGuards: true,
+		ResolveSymbolic:             func(value string) (string, error) { return value, nil },
+		SelectSymbolic: func(value, _ string, _ bool, _, _ string) (string, bool, error) {
+			if value != probe {
+				return "", false, fmt.Errorf("unexpected probe %q", value)
+			}
+			return probe, true, nil
+		},
+	}, "")
+	if err == nil || !strings.Contains(err.Error(), "stateful branch") {
+		t.Fatalf("unsealed Make if expanded a stateful branch: %v", err)
+	}
+}
+
+func TestKbuildDynamicIncludeFilenameIsASeparateGraphGuard(t *testing.T) {
+	makefile := filepath.Join(t.TempDir(), "Makefile")
+	if err := os.WriteFile(makefile, []byte("candidate = $(shell capability-probe)\n-include $(candidate)\nall:\n\t@echo ready\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	probe := linuxProbeSymbolPrefix + strings.Repeat("a", 64)
+	for _, reject := range []bool{false, true} {
+		parsed, err := ParseKbuildFileTree(makefile, KbuildOptions{
+			CaptureTargetEvaluator: true, SkipExportedVariables: true,
+			MakeVariablesComplete: true, RejectUnmeasuredGraphGuards: reject,
+			Shell: func(command string) (string, error) {
+				if command != "capability-probe" {
+					return "", fmt.Errorf("unexpected include filename probe %q", command)
+				}
+				return probe, nil
+			},
+		})
+		if reject {
+			if err == nil || !strings.Contains(err.Error(), "Makefile:2") || !strings.Contains(err.Error(), "include filename") {
+				t.Errorf("unmeasured dynamic include = %v; want source-positioned rejection", err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		profile, err := NewCompactKbuildProfile("root", makefile, filepath.Dir(makefile), parsed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := CompactKbuildGraphGuards(profile); !slices.Equal(got, []string{probe}) {
+			t.Errorf("dynamic include filename guards = %q, want measured text source", got)
+		}
+	}
+}
+
+func TestKbuildPostPregraphRejectsNewRecipeAndIncludeGuardsAtSource(t *testing.T) {
+	probe := linuxProbeSymbolPrefix + strings.Repeat("b", 64)
+	for _, test := range []struct {
+		name, source, diagnostic string
+	}{
+		{"recipe", "has = $(shell capability-probe)\nall:\nifeq ($(has),1)\n\t@echo enabled\nendif\n", "selected recipe"},
+		{"guarded include", "has = $(shell capability-probe)\nifeq ($(has),1)\n-include optional.mk\nendif\n", "selected include"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			makefile := filepath.Join(t.TempDir(), "Makefile")
+			if err := os.WriteFile(makefile, []byte(test.source), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := ParseKbuildFileTree(makefile, KbuildOptions{
+				MakeVariablesComplete: true, RejectUnmeasuredGraphGuards: true,
+				Shell: func(command string) (string, error) {
+					if command != "capability-probe" {
+						return "", fmt.Errorf("unexpected child guard probe %q", command)
+					}
+					return probe, nil
+				},
+				SelectSymbolic: func(value, _ string, _ bool, _, _ string) (string, bool, error) {
+					if !linuxProbeSymbolPattern.MatchString(value) {
+						return "", false, nil
+					}
+					return linuxProbeSymbolPrefix + strings.Repeat("c", 64), true, nil
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), "Makefile:") || !strings.Contains(err.Error(), test.diagnostic) {
+				t.Fatalf("new child graph guard = %v; want source-positioned %q failure", err, test.diagnostic)
+			}
+		})
+	}
+	makefile := filepath.Join(t.TempDir(), "Makefile")
+	if err := os.WriteFile(makefile, []byte("-include optional.mk\nall:\n\t@echo ready\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseKbuildFileTree(makefile, KbuildOptions{
+		RejectUnmeasuredGraphGuards: true,
+	}); err != nil {
+		t.Fatalf("guard-free child fan-out rejected: %v", err)
+	}
+}
+
+func TestKbuildProbeConditionalRecipeSelectsSourceBranchOnReplay(t *testing.T) {
+	const source = `
+SKIP_STACK_VALIDATION := $(shell has_libelf)
+prepare-objtool: objtool
+ifeq ($(SKIP_STACK_VALIDATION),1)
+ifdef CONFIG_UNWINDER_ORC
+	@echo error: cannot generate ORC metadata without libelf
+	@false
+else
+	@echo warning: cannot validate the stack without libelf
+endif
+endif
+	@echo prepared
+`
+	probe := linuxProbeSymbolPrefix + strings.Repeat("a", 64)
+	type selection struct {
+		value, expected, trueText, falseText string
+		equal                                bool
+	}
+	selections := map[string]selection{}
+	options := KbuildOptions{
+		Variables:               map[string]string{"CONFIG_UNWINDER_ORC": "y"},
+		ConfigVariablesComplete: true,
+		MakeVariablesComplete:   true,
+		Shell: func(command string) (string, error) {
+			if command != "has_libelf" {
+				return "", fmt.Errorf("unexpected command %q", command)
+			}
+			return probe, nil
+		},
+		SelectSymbolic: func(value, expected string, equal bool, trueText, falseText string) (string, bool, error) {
+			token := linuxProbeSymbolPrefix + fmt.Sprintf("%064x", len(selections)+1)
+			selections[token] = selection{value, expected, trueText, falseText, equal}
+			return token, true, nil
+		},
+	}
+	parse := func() []string {
+		t.Helper()
+		kb, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", options, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(kb.Rules) != 1 {
+			t.Fatalf("parsed %d rules, want the source declaration", len(kb.Rules))
+		}
+		return kb.Rules[0].Recipe
+	}
+	if got, want := parse(), []string{"@echo prepared"}; !slices.Equal(got, want) {
+		t.Fatalf("discovery recipe = %#v, want %#v", got, want)
+	}
+	for _, tc := range []struct {
+		name, result, unwinder string
+		want                   []string
+	}{
+		{"missing-libelf-orc", "1", "y", []string{"@echo error: cannot generate ORC metadata without libelf", "@false", "@echo prepared"}},
+		{"present-libelf-orc", "", "y", []string{"@echo prepared"}},
+		{"missing-libelf-no-orc", "1", "", []string{"@echo warning: cannot validate the stack without libelf", "@echo prepared"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options.Variables["CONFIG_UNWINDER_ORC"] = tc.unwinder
+			var resolve func(string) string
+			resolve = func(value string) string {
+				if value == probe {
+					return tc.result
+				}
+				if selected, ok := selections[value]; ok {
+					match := resolve(selected.value) == resolve(selected.expected)
+					if !selected.equal {
+						match = !match
+					}
+					if match {
+						return resolve(selected.trueText)
+					}
+					return resolve(selected.falseText)
+				}
+				return value
+			}
+			options.ResolveSymbolic = func(value string) (string, error) {
+				return resolve(value), nil
+			}
+			if got := parse(); !slices.Equal(got, tc.want) {
+				t.Fatalf("replayed recipe = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+	options.ResolveSymbolic = func(value string) (string, error) {
+		if _, ok := selections[value]; ok {
+			return "unexpected", nil
+		}
+		return value, nil
+	}
+	if _, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", options, ""); err == nil ||
+		!strings.Contains(err.Error(), "non-boolean text") {
+		t.Fatalf("non-boolean recipe guard error = %v, want rejection", err)
+	}
+}
+
+func TestKbuildOptionalObjectTreeShellReadUsesExactVisibleContents(t *testing.T) {
+	const query = "__LINUX_BZL_OBJECT_TREE__/include/config/kernel.release"
+	root := t.TempDir()
+	physical := filepath.Join(root, "include", "config", "kernel.release")
+	if err := os.MkdirAll(filepath.Dir(physical), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(physical, []byte("untracked-host-release\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	view := &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}}
+	shellCalls := 0
+	options := KbuildOptions{
+		SourceRoots:     map[string]string{"__LINUX_BZL_OBJECT_TREE__": root},
+		VirtualFileView: view,
+		Shell: func(command string) (string, error) {
+			shellCalls++
+			return "", nil
+		},
+		SourceShell: func(command, directory string) (string, error) {
+			return "", fmt.Errorf("unselected source-shell fallback for %q", command)
+		},
+	}
+	const source = "KERNELRELEASE = $(shell cat include/config/kernel.release 2> /dev/null)\nexport INSTALL_DTBS_PATH := /dtbs/$(KERNELRELEASE)\n"
+	check := func(want string) {
+		t.Helper()
+		kb, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", options, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := kb.ExportedEnvironment()["INSTALL_DTBS_PATH"]; got != want {
+			t.Fatalf("INSTALL_DTBS_PATH = %q, want %q", got, want)
+		}
+		if !slices.Equal(view.readCalls, []string{query}) {
+			t.Fatalf("optional cat observed %q, want one declared object read", view.readCalls)
+		}
+		if shellCalls != 0 {
+			t.Fatalf("optional cat queried shell %d times, want parser-owned object read", shellCalls)
+		}
+		view.readCalls = nil
+	}
+	check("/dtbs/")
+	view.files[query] = testKbuildVirtualFile{content: "5.10.270-test\n", exact: true}
+	check("/dtbs/5.10.270-test")
+	view.files[query] = testKbuildVirtualFile{content: "unknown", exact: false}
+	if _, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", options, ""); err == nil ||
+		!strings.Contains(err.Error(), "has no exact contents") {
+		t.Fatalf("opaque object-tree read error = %v, want fail-closed", err)
+	}
+	if shellCalls != 0 {
+		t.Fatalf("opaque object read queried shell %d times, want parser-owned rejection", shellCalls)
+	}
+	options.VirtualFileView = nil
+	checkWithoutView, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", options, "")
+	if err != nil || checkWithoutView.ExportedEnvironment()["INSTALL_DTBS_PATH"] != "/dtbs/" {
+		t.Fatalf("ambient object-tree file became input: %#v, %v", checkWithoutView, err)
+	}
+}
+
+func TestKbuildParseTimeEchoRedirectIntoObjectTreeRejectsUnknownWrite(t *testing.T) {
+	root := t.TempDir()
+	_, err := parseKbuildWithOptions(strings.NewReader(`
+GENERATED := $(shell echo literal > $(objtree)/generated.txt)
+`), "Makefile", KbuildOptions{
+		SourceRoots:      map[string]string{"__LINUX_BZL_OBJECT_TREE__": root},
+		VirtualFileView:  &testKbuildVirtualFileView{files: map[string]testKbuildVirtualFile{}},
+		CaptureVariables: []string{"GENERATED"},
+		Variables:        map[string]string{"objtree": "__LINUX_BZL_OBJECT_TREE__"},
+		Shell: func(command string) (string, error) {
+			t.Fatalf("object-tree writer unexpectedly delegated to probe shell: %q", command)
+			return "", nil
+		},
+	}, "")
+	if err == nil || !strings.Contains(err.Error(), "unsupported append command") {
+		t.Fatalf("unrecognized object-tree write error = %v", err)
+	}
+}
+
+func TestKbuildOptionalObjectTreeShellReadRejectsDynamicPaths(t *testing.T) {
+	options := KbuildOptions{
+		SourceRoots: map[string]string{"__LINUX_BZL_OBJECT_TREE__": t.TempDir()},
+		Shell: func(command string) (string, error) {
+			return "", nil
+		},
+		MakeVariablesComplete: true,
+	}
+	for _, command := range []string{
+		"cat include/config/$$PATH_FRAGMENT 2>/dev/null",
+		"cat include/config/*.release 2> /dev/null",
+		"cat include/config/../../Makefile 2>/dev/null",
+		"cat include/config/release;other 2>/dev/null",
+	} {
+		source := "export RELEASE := $(shell " + command + ")\n"
+		if _, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", options, ""); err == nil {
+			t.Errorf("dynamic optional object read %q was accepted", command)
+		}
+	}
+}
+
 func TestKbuildInheritedEnvironmentRemainsExportedUntilSourceUnexportsIt(t *testing.T) {
 	kb, err := parseKbuildWithOptions(strings.NewReader(`
 origin-before := $(origin INHERITED)
@@ -1820,6 +3190,74 @@ sdk_raw := $(value SDK)
 	}
 	if got, want := kb.ExportedEnvironment()["SDK"], "/source/vendor"; got != want {
 		t.Fatalf("exported SDK = %q, want %q", got, want)
+	}
+}
+
+func TestKbuildSourceRoleAliasReplacesOnlySyntheticToolPin(t *testing.T) {
+	const source = "CC = $(HOSTCC)\nexport CC\nselected := $(CC)\norigin := $(origin CC)\n"
+	target := KbuildActionRoleToken("target", "cc")
+	host := KbuildActionRoleToken("host", "cc")
+	for _, test := range []struct {
+		name          string
+		synthetic     map[string]bool
+		wantCC        string
+		wantOrigin    string
+		wantDemotions int
+	}{
+		{name: "source alias supersedes configured pin", synthetic: map[string]bool{"CC": true}, wantCC: host, wantOrigin: "file", wantDemotions: 1},
+		{name: "genuine Make CLI wins source alias", wantCC: target, wantOrigin: "command line"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			kb, err := parseKbuildWithOptions(strings.NewReader(source), "Makefile", KbuildOptions{
+				CommandLineVariables:              map[string]string{"CC": target, "HOSTCC": host},
+				SyntheticToolCommandLineVariables: test.synthetic,
+				AutoExportCommandLineVariables:    map[string]bool{},
+				CaptureVariables:                  []string{"selected", "origin"},
+			}, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := kb.Variables["selected"]; got != test.wantCC {
+				t.Errorf("selected CC = %q, want %q", got, test.wantCC)
+			}
+			if got := kb.Variables["origin"]; got != test.wantOrigin {
+				t.Errorf("CC origin = %q, want %q", got, test.wantOrigin)
+			}
+			if got := kb.ExportedEnvironment()["CC"]; got != test.wantCC {
+				t.Errorf("exported CC = %q, want %q", got, test.wantCC)
+			}
+			if got := kb.SyntheticToolCommandLineDemotions(); len(got) != test.wantDemotions {
+				t.Errorf("tool pin demotions = %v, want %d", got, test.wantDemotions)
+			}
+		})
+	}
+
+	initial, err := parseKbuildWithOptions(strings.NewReader("CC = clang\nselected := $(CC)\norigin := $(origin CC)\n"), "Makefile", KbuildOptions{
+		CommandLineVariables:              map[string]string{"CC": target},
+		SyntheticToolCommandLineVariables: map[string]bool{"CC": true},
+		CaptureVariables:                  []string{"selected", "origin"},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.Variables["selected"] != target || initial.Variables["origin"] != "command line" || len(initial.SyntheticToolCommandLineDemotions()) != 0 {
+		t.Fatalf("root selected compiler binding = %#v, origin %q, demotions %v", initial.Variables, initial.Variables["origin"], initial.SyntheticToolCommandLineDemotions())
+	}
+	_, err = parseKbuildWithOptions(strings.NewReader("ifeq ($(shell host-link-probe),1)\nCC = $(HOSTCC)\nendif\n"), "Makefile", KbuildOptions{
+		CommandLineVariables:              map[string]string{"CC": target, "HOSTCC": host},
+		SyntheticToolCommandLineVariables: map[string]bool{"CC": true},
+		Shell: func(command string) (string, error) {
+			if command != "host-link-probe" {
+				return "", fmt.Errorf("unexpected probe %q", command)
+			}
+			return linuxProbeSymbolPrefix + strings.Repeat("f", 64), nil
+		},
+		SelectSymbolic: func(_, _ string, _ bool, _, _ string) (string, bool, error) {
+			return linuxProbeSymbolPrefix + strings.Repeat("e", 64), true, nil
+		},
+	}, "")
+	if err == nil || !strings.Contains(err.Error(), "needs conditional command-line origin") {
+		t.Fatalf("guarded tool alias changed all branches' compiler origin: %v", err)
 	}
 }
 

@@ -35,6 +35,10 @@ _TOOLSET_MANIFEST = "toolset_manifest"
 _TOOLSET_ANCHOR_PREFIX = "toolset_anchor_"
 _ROLE_TOOL_PREFIX = "probe_role_"
 _COMPANION_TOOL_PREFIX = "companion_tool_"
+_HOST_TOOLCHAIN_FILES = "host_toolchain_files"
+_HOST_TOOLSET_MANIFEST = "host_toolset_manifest"
+_HOST_TOOLSET_ANCHOR_PREFIX = "host_toolset_anchor_"
+_HOST_ROLE_PREFIX = "host@"
 _EMPTY_RESULT_MARKER = ".empty"
 _LINUX_SOURCE_ROOT = "linux"
 _RUST_SOURCE_ROOT = "rust"
@@ -56,6 +60,26 @@ def _valid_name(value):
         character in _NAME
         for character in value.elems()
     ])
+
+def _probe_tool_binding(binding, scope):
+    parts = binding.split("@")
+    if len(parts) == 1 and _valid_name(binding):
+        return struct(role = binding, scope = scope)
+    if len(parts) != 2 or parts[0] not in _SCOPES or not _valid_name(parts[1]):
+        fail("Linux probe has invalid configured tool binding %r" % binding)
+    if scope == "host" and parts[0] == "target":
+        fail("host Linux probe cannot bind target tool %r" % binding)
+    return struct(role = parts[1], scope = parts[0])
+
+def _node_tool_scopes(node):
+    scopes = {}
+    for binding in node["tools"]:
+        scopes[_probe_tool_binding(binding, node["scope"]).scope] = True
+    return scopes
+
+def _probe_role_tool_name(binding, scope):
+    selected = _probe_tool_binding(binding, scope)
+    return _ROLE_TOOL_PREFIX + (_HOST_ROLE_PREFIX + selected.role if scope == "target" and selected.scope == "host" else selected.role)
 
 def _validate_source_path(value, what):
     if not value or value.startswith("/") or value.endswith("/") or "\\" in value:
@@ -302,8 +326,9 @@ def _parse_probe_plan(children):
             node["request"] = parts[3]
         elif field == "tool" and len(parts) == 4:
             role = parts[3]
-            if not _valid_name(role) or role in node["tools"]:
+            if role in node["tools"]:
                 fail("Linux probe node %s has invalid or repeated tool role %r" % (node_id, role))
+            _probe_tool_binding(role, "target")
             node["tools"][role] = True
         elif field == "source":
             source = _decode_source_marker(node_id, marker, parts)
@@ -337,6 +362,7 @@ def _parse_probe_plan(children):
             fail("Linux probe node %s has non-contiguous dependency ordinals %r" % (node_id, ordinals))
         if node["scope"] == "host":
             has_host = True
+        _node_tool_scopes(node)
         for producer in node["inputs"].values():
             dependency = nodes.get(producer)
             if dependency == None:
@@ -486,6 +512,15 @@ def _render_probe_action_value_cached(value, path_index, rendered_values):
         rendered_values[value] = rendered
     return rendered
 
+def _required_probe_identity_scopes(parsed, scope):
+    required = {scope: True}
+    for node in parsed.nodes.values():
+        if node["scope"] == scope:
+            required.update(_node_tool_scopes(node))
+            for producer in node["inputs"].values():
+                required[parsed.nodes[producer]["scope"]] = True
+    return required
+
 def expand_linux_probe_plan(template_ctx, input_directories, output_directories, additional_inputs, tools, additional_params):
     """Expands one host or target scope of a path-encoded ProbePlan."""
     scope = additional_params.get("scope")
@@ -507,11 +542,7 @@ def expand_linux_probe_plan(template_ctx, input_directories, output_directories,
         fail("Linux probe expansion has no plan input directory")
     parsed = _parse_probe_plan(_children_by_path(plan_directory, "Linux probe plan"))
 
-    required_identity_scopes = {scope: True}
-    for node in parsed.nodes.values():
-        if node["scope"] == scope:
-            for producer in node["inputs"].values():
-                required_identity_scopes[parsed.nodes[producer]["scope"]] = True
+    required_identity_scopes = _required_probe_identity_scopes(parsed, scope)
     identities = _validate_toolsets(parsed, input_directories, sorted(required_identity_scopes))
 
     if _RUNNER_TOOL not in tools or _TOOLCHAIN_FILES not in tools or _TOOLSET_MANIFEST not in tools:
@@ -523,12 +554,19 @@ def expand_linux_probe_plan(template_ctx, input_directories, output_directories,
     # bind different Files in another scope or callback. Keep rendering lazy so
     # unused action roles retain their existing validation behavior.
     rendered_action_values = {}
+    rendered_host_action_values = {}
+    host_action_path_index = None
     for node_id, node in parsed.nodes.items():
         if node["scope"] != scope:
             continue
         for role in node["tools"]:
-            if _ROLE_TOOL_PREFIX + role not in tools:
+            if _probe_role_tool_name(role, scope) not in tools:
                 fail("Linux probe node %s requires unavailable %s tool" % (node_id, role))
+        if "host" in _node_tool_scopes(node) and scope == "target":
+            if _HOST_TOOLCHAIN_FILES not in tools or _HOST_TOOLSET_MANIFEST not in tools:
+                fail("Linux probe node %s has no configured host toolset closure or manifest" % node_id)
+            if host_action_path_index == None:
+                host_action_path_index = _toolchain_action_path_index(tools[_HOST_TOOLCHAIN_FILES])
 
     prior = _select_prior_host_results(
         scope,
@@ -603,6 +641,7 @@ def expand_linux_probe_plan(template_ctx, input_directories, output_directories,
             inputs.append(directory.directory)
 
         dependency_scopes = {scope: True}
+        dependency_scopes.update(_node_tool_scopes(node))
         for ordinal, producer in sorted(node["inputs"].items()):
             producer_scope = parsed.nodes[producer]["scope"]
             dependency_scopes[producer_scope] = True
@@ -623,37 +662,59 @@ def expand_linux_probe_plan(template_ctx, input_directories, output_directories,
             if not tool_name.startswith(_ROLE_TOOL_PREFIX):
                 continue
             runtime_role = tool_name[len(_ROLE_TOOL_PREFIX):]
+            if runtime_role.startswith(_HOST_ROLE_PREFIX):
+                continue
             runtime_executable = _tool_executable(runtime_tool)
             _add_artifact_path(args, "-runtime_tool", runtime_executable, format = runtime_role + "=%s")
             inputs.append(runtime_executable)
             selected_tools.append(runtime_tool)
             selected_tools.extend(_companion_tool_bindings(tools, runtime_role))
         for role in sorted(node["tools"]):
-            tool = tools[_ROLE_TOOL_PREFIX + role]
+            selected = _probe_tool_binding(role, scope)
+            tool = tools[_probe_role_tool_name(role, scope)]
             executable = _tool_executable(tool)
-            contract_roles = [role]
-            companion_role = _driver_link_contract_role(role)
-            if companion_role != None and "action_arg_count_" + companion_role in additional_params:
-                contract_roles.append(companion_role)
-            for contract_role in contract_roles:
+            if selected.scope == "host" and scope == "target":
+                _add_artifact_path(args, "-runtime_tool", executable, format = role + "=%s")
+                inputs.append(executable)
+                selected_tools.append(tool)
+                selected_tools.extend(_companion_tool_bindings(tools, _HOST_ROLE_PREFIX + selected.role))
+            elif role != selected.role:
+                _add_artifact_path(args, "-runtime_tool", executable, format = role + "=%s")
+            contract_roles = [selected.role]
+            companion_role = _driver_link_contract_role(selected.role)
+            if companion_role != None:
+                configured_companion = selected.scope + "@" + companion_role if selected.scope != scope else companion_role
+                if "action_arg_count_" + configured_companion in additional_params:
+                    contract_roles.append(companion_role)
+            for contract_role_name in contract_roles:
+                contract_role = selected.scope + "@" + contract_role_name if role != selected.role else contract_role_name
+                configured_role = selected.scope + "@" + contract_role_name if selected.scope != scope else contract_role_name
+
                 # Semantic companion roles deliberately bind the same
                 # source-selected compiler executable; only their configured
                 # action envelope differs.
                 _add_artifact_path(args, "-tool", executable, format = contract_role + "=%s")
-                for argument in _action_arguments(additional_params, contract_role):
+                path_index = host_action_path_index if selected.scope != scope else action_path_index
+                rendered = rendered_host_action_values if selected.scope != scope else rendered_action_values
+                for argument in _action_arguments(additional_params, configured_role):
                     _add_rendered_toolchain_action_value(
                         args,
                         "-action_arg",
-                        _render_probe_action_value_cached(argument, action_path_index, rendered_action_values),
+                        _render_probe_action_value_cached(argument, path_index, rendered),
                         prefix = contract_role + "=",
                     )
-                for environment in _action_environment(additional_params, contract_role):
+                for environment in _action_environment(additional_params, configured_role):
                     _add_rendered_toolchain_action_value(
                         args,
                         "-action_env",
-                        _render_probe_action_value_cached(environment, action_path_index, rendered_action_values),
+                        _render_probe_action_value_cached(environment, path_index, rendered),
                         prefix = contract_role + "=",
                     )
+
+        uses_host_toolset = scope == "target" and "host" in _node_tool_scopes(node)
+        if uses_host_toolset:
+            _add_artifact_path(args, "-host_toolset_manifest", tools[_HOST_TOOLSET_MANIFEST])
+            inputs.append(tools[_HOST_TOOLSET_MANIFEST])
 
         transitive_inputs = []
         if node["sources"] or node["source_roots"]:
@@ -678,10 +739,24 @@ def expand_linux_probe_plan(template_ctx, input_directories, output_directories,
                 expand_directories = False,
                 format_each = "-toolset_anchor=" + root + "=%s",
             )
+        if uses_host_toolset:
+            host_anchors = [
+                (name[len(_HOST_TOOLSET_ANCHOR_PREFIX):], tools[name])
+                for name in sorted(tools)
+                if name.startswith(_HOST_TOOLSET_ANCHOR_PREFIX)
+            ]
+            if not host_anchors:
+                fail("Linux probe node %s has no host toolset root anchors" % node_id)
+            for root, anchor in host_anchors:
+                anchor_args.add_all(
+                    [anchor],
+                    expand_directories = False,
+                    format_each = "-host_toolset_anchor=" + root + "=%s",
+                )
         template_ctx.run(
             executable = tools[_RUNNER_TOOL],
             inputs = depset(direct = inputs, transitive = transitive_inputs),
-            tools = [tools[_TOOLCHAIN_FILES]] + selected_tools,
+            tools = [tools[_TOOLCHAIN_FILES]] + ([tools[_HOST_TOOLCHAIN_FILES]] if uses_host_toolset else []) + selected_tools,
             outputs = [output],
             arguments = [args, anchor_args],
             progress_message = "Probing Linux %s compiler capability %s" % (scope, node_id[:12]),
@@ -693,7 +768,9 @@ def linux_probe_map_directory_params(
         action_args,
         action_environments,
         source_prefix = "",
-        rust_source_root = ""):
+        rust_source_root = "",
+        host_action_args = None,
+        host_action_environments = None):
     """Flattens exact configured action envelopes into Bazel 9 scalar params."""
     if scope not in _SCOPES:
         fail("Linux probe map_directory has invalid scope %r" % scope)
@@ -710,27 +787,47 @@ def linux_probe_map_directory_params(
         "scope": scope,
         "source_prefix": source_prefix,
     }
-    for role in sorted(action_args):
-        if not _valid_name(role):
-            fail("Linux probe action has invalid role %r" % role)
-        argv = action_args[role]
-        if argv and len([value for value in argv if value == _KBUILD_ARGS_SENTINEL]) != 1:
-            fail("Linux probe %s action must contain exactly one Kbuild argument sentinel" % role)
-        params["action_arg_count_" + role] = str(len(argv))
-        for index, argument in enumerate(argv):
-            params["action_arg_%s_%d" % (role, index)] = argument
-        environment = action_environments.get(role, {})
-        params["action_env_count_" + role] = str(len(environment))
-        for index, name in enumerate(sorted(environment)):
-            if not name or "=" in name:
-                fail("Linux probe %s action has invalid environment name %r" % (role, name))
-            params["action_env_%s_%d" % (role, index)] = name + "=" + environment[name]
-    unexpected = sorted([role for role in action_environments if role not in action_args])
-    if unexpected:
-        fail("Linux probe environments have no action argv for roles %r" % unexpected)
+    if (host_action_args == None) != (host_action_environments == None):
+        fail("Linux probe host action arguments and environments must be supplied together")
+    if scope == "host" and host_action_args != None:
+        fail("host Linux probe cannot bind opposite-scope action envelopes")
+    for prefix, arguments, environments in [
+        ("", action_args, action_environments),
+        (_HOST_ROLE_PREFIX, host_action_args or {}, host_action_environments or {}),
+    ]:
+        for role in sorted(arguments):
+            if not _valid_name(role):
+                fail("Linux probe action has invalid role %r" % role)
+            binding = prefix + role
+            argv = arguments[role]
+            if argv and len([value for value in argv if value == _KBUILD_ARGS_SENTINEL]) != 1:
+                fail("Linux probe %s action must contain exactly one Kbuild argument sentinel" % binding)
+            params["action_arg_count_" + binding] = str(len(argv))
+            for index, argument in enumerate(argv):
+                params["action_arg_%s_%d" % (binding, index)] = argument
+            environment = environments.get(role, {})
+            params["action_env_count_" + binding] = str(len(environment))
+            for index, name in enumerate(sorted(environment)):
+                if not name or "=" in name:
+                    fail("Linux probe %s action has invalid environment name %r" % (binding, name))
+                params["action_env_%s_%d" % (binding, index)] = name + "=" + environment[name]
+        unexpected = sorted([role for role in environments if role not in arguments])
+        if unexpected:
+            fail("Linux probe environments have no action argv for roles %r" % unexpected)
     return params
 
-def linux_probe_map_directory_tools(runner, tool_files, toolchain_files, toolset_manifest, toolset_anchors, companion_tools = {}):
+def linux_probe_map_directory_tools(
+        runner,
+        tool_files,
+        toolchain_files,
+        toolset_manifest,
+        toolset_anchors,
+        companion_tools = {},
+        host_tool_files = None,
+        host_toolchain_files = None,
+        host_toolset_manifest = None,
+        host_toolset_anchors = None,
+        host_companion_tools = None):
     """Namespaces configured probe tools away from callback implementation tools."""
     values = {
         _RUNNER_TOOL: runner,
@@ -754,6 +851,27 @@ def linux_probe_map_directory_tools(runner, tool_files, toolchain_files, toolset
             fail("Linux probe companion tools have invalid role %r" % role)
         for index, companion in enumerate(companion_tools[role]):
             values[_COMPANION_TOOL_PREFIX + role + "_" + _ordinal(index)] = companion
+    host_values = [host_tool_files, host_toolchain_files, host_toolset_manifest, host_toolset_anchors, host_companion_tools]
+    if any([value != None for value in host_values]):
+        if any([value == None for value in host_values]):
+            fail("Linux target probe needs the complete configured host toolset")
+        if not host_toolset_anchors:
+            fail("Linux target probe has no host toolset root anchors")
+        values[_HOST_TOOLCHAIN_FILES] = host_toolchain_files
+        values[_HOST_TOOLSET_MANIFEST] = host_toolset_manifest
+        for root, anchor in host_toolset_anchors.items():
+            if not _valid_name(root):
+                fail("Linux target probe has invalid host toolset root anchor %r" % root)
+            values[_HOST_TOOLSET_ANCHOR_PREFIX + root] = anchor
+        for role, tool in host_tool_files.items():
+            if not _valid_name(role):
+                fail("Linux target probe host tool has invalid role %r" % role)
+            values[_ROLE_TOOL_PREFIX + _HOST_ROLE_PREFIX + role] = tool
+        for role in sorted(host_companion_tools):
+            if role not in host_tool_files:
+                fail("Linux target probe host companion tools reference unknown role %r" % role)
+            for index, companion in enumerate(host_companion_tools[role]):
+                values[_COMPANION_TOOL_PREFIX + _HOST_ROLE_PREFIX + role + "_" + _ordinal(index)] = companion
     return values
 
 def linux_test_render_probe_action_value(value, artifacts):
@@ -784,6 +902,9 @@ def linux_test_parse_probe_marker_paths(paths):
 def linux_test_probe_topological_order(nodes):
     """Exercises the production linear-time probe dependency scheduler."""
     return _topological_order(nodes)
+
+def linux_test_required_probe_identity_scopes(parsed, scope):
+    return sorted(_required_probe_identity_scopes(parsed, scope))
 
 def linux_test_select_prior_host_result_paths(scope, parsed, paths):
     """Exercises production host-result selection with path-only test artifacts."""

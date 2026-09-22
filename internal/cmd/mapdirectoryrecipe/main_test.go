@@ -180,6 +180,28 @@ func TestEncodeRecipeCommandReplaysExpandsTypedPaths(t *testing.T) {
 	}
 }
 
+func TestEncodeRecipeCommandReplaysRetainsDenyAllCapability(t *testing.T) {
+	replays := []kconfig.ActionRecipeCommandReplay{{Name: "make", DenyAll: true, Invocations: []kconfig.ActionRecipeCommandReplayInvocation{}}}
+	arguments, err := encodeRecipeCommandReplays(replays, func(value string) (string, error) { return value, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(arguments) != 2 || arguments[0] != "-replay_base64" {
+		t.Fatalf("encoded deny-all replay arguments = %q", arguments)
+	}
+	data, err := base64.StdEncoding.DecodeString(arguments[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got kconfig.ActionRecipeCommandReplay
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "make" || !got.DenyAll || len(got.Invocations) != 0 || !strings.Contains(string(data), `"invocations":[]`) {
+		t.Fatalf("denied recursive Make capability changed during encoding: %s", data)
+	}
+}
+
 func TestExpandValueWithLiteralActionMarkersDoesNotDecodeBindingBytes(t *testing.T) {
 	const generated = "\x04_LINUX_BZL_MAKE__|\x03{tree:prep}"
 	got, err := expandValueWithLiteralActionMarkers(
@@ -2937,6 +2959,252 @@ func runObservedStateRecipe(
 		t.Fatal(err)
 	}
 	return output
+}
+
+func TestSourceCheckCompletionRequiresAbsentTargetAndCleanWritableTree(t *testing.T) {
+	for _, test := range []struct {
+		name, shell, wantError string
+		preexisting, depfile   bool
+	}{
+		{name: "status-only check", shell: "printf 'check completed\\n'", wantError: ""},
+		{name: "script wrote logical target", shell: "printf 'generated\\n' > check", wantError: "logical target"},
+		{name: "configured program wrote sibling", shell: "printf 'unknown\\n' > sibling", wantError: `first changed entry "sibling"`},
+		{name: "selected compiler wrote bounded depfile", shell: "printf 'dependencies\\n' > .check.d", depfile: true},
+		{name: "bounded depfile cannot authorize sibling", shell: "printf 'dependencies\\n' > .check.d; printf 'unknown\\n' > sibling", depfile: true, wantError: `entry "sibling" changed or disappeared`},
+		{name: "bounded depfile must be regular", shell: "ln -s check .check.d", depfile: true, wantError: `private working effect ".check.d" is not a regular file`},
+		{name: "target existed before check", shell: "printf 'should not execute\\n'", preexisting: true, wantError: "already exists before execution"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			helper := filepath.Join(directory, "check-helper")
+			if err := os.WriteFile(helper, []byte("#!/bin/sh\nset -eu\n"+test.shell+"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			recipe := kconfig.ActionRecipe{
+				Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "helper",
+				WorkingDirectory:            "source-check",
+				ObservedOutputs:             map[string]string{"completion": "check"},
+				RequireAbsentObservedOutput: "completion", RequireUnchangedWorkingTree: true,
+				Outputs: []string{"completion"},
+			}
+			if test.depfile {
+				recipe.RequireUnchangedWorkingTree = false
+				recipe.PrivateWorkingEffects = []kconfig.ActionRecipePrivateWorkingEffect{{Path: ".check.d", Kind: "regular"}}
+			}
+			inputs := map[string]string{}
+			if test.preexisting {
+				prior := filepath.Join(directory, "prior-check")
+				if err := os.WriteFile(prior, []byte("prior"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				recipe.Inputs = []string{"prior"}
+				recipe.WorkingInputs = map[string]string{"input:prior": "check"}
+				inputs["prior"] = prior
+			}
+			recipePath, recipeID := writeRecipe(t, recipe)
+			work := filepath.Join(directory, "work")
+			output := filepath.Join(directory, "completion.state")
+			err := runRecipe(recipeOptions{
+				recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
+				toolRole: "helper", workingDirectory: work, workingDirectoryMarker: filepath.Join(work, ".linux-bzl-work-root"),
+				sources: map[string]string{}, inputs: inputs,
+				outputs: map[string]string{"completion": output}, tools: map[string]string{"helper": helper}, trees: map[string]string{},
+			})
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("unbounded source check error = %v, want %q", err, test.wantError)
+				}
+				if _, err := os.Stat(output); !os.IsNotExist(err) {
+					t.Fatalf("failed check published a completion artifact: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state := decodeObservedOutputState(t, output); state.Disposition != toolaction.ObservedOutputAbsent {
+				t.Fatalf("outputless check completion = %#v, want absent source state", state)
+			}
+			if _, err := os.Lstat(filepath.Join(work, "source-check", "check")); !os.IsNotExist(err) {
+				t.Fatalf("completion created a Make-visible check file: %v", err)
+			}
+		})
+	}
+}
+
+func TestSourceSelectedPrivateSetupBoundsWorkingTreeAndCompletion(t *testing.T) {
+	for _, test := range []struct {
+		name, after, wantError string
+		preexisting            bool
+	}{
+		{name: "selected private setup"},
+		{name: "preserve existing ignore file", preexisting: true},
+		{name: "reject deletion of existing ignore file", preexisting: true, after: "rm .gitignore", wantError: "required private working effect"},
+		{name: "reject mutation of existing ignore file", preexisting: true, after: "printf 'changed\\n' >> .gitignore", wantError: "preexisting private working effect"},
+		{name: "unclaimed sibling", after: "printf 'stray\\n' > sibling", wantError: "changed or disappeared"},
+		{name: "wrong symlink", after: "ln -fsn /unbound/source source", wantError: "not a symlink to declared tree"},
+		{name: "logical target created", after: "printf 'fake\\n' > outputmakefile", wantError: "logical target"},
+		{name: "script failed", after: "exit 13", wantError: "exit status 13"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			sourceRoot := filepath.Join(directory, "immutable-source")
+			if err := os.MkdirAll(sourceRoot, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			helper := filepath.Join(directory, "setup-helper")
+			body := "#!/bin/sh\nset -eu\nln -fsn \"$1\" source\nprintf 'include %s/Makefile\\n' \"$1\" > Makefile\n" +
+				"test -e .gitignore || printf '*\\n' > .gitignore\n" + test.after + "\n"
+			if err := os.WriteFile(helper, []byte(body), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			recipe := kconfig.ActionRecipe{
+				Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "helper",
+				Arguments: []string{"${tree:kernel}"}, WorkingDirectory: "source-setup",
+				ObservedOutputs:             map[string]string{"completion": "outputmakefile"},
+				RequireAbsentObservedOutput: "completion", Outputs: []string{"completion"},
+				Trees: []string{"kernel"},
+				PrivateWorkingEffects: []kconfig.ActionRecipePrivateWorkingEffect{
+					{Path: ".gitignore", Kind: "regular", PreserveExisting: true},
+					{Path: "Makefile", Kind: "regular", Required: true},
+					{Path: "source", Kind: "symlink", Tree: "kernel", Required: true},
+				},
+			}
+			inputs := map[string]string{}
+			if test.preexisting {
+				prior := filepath.Join(directory, "prior-ignore")
+				if err := os.WriteFile(prior, []byte("existing\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				recipe.Inputs = []string{"prior"}
+				recipe.WorkingInputs = map[string]string{"input:prior": ".gitignore"}
+				inputs["prior"] = prior
+			}
+			recipePath, recipeID := writeRecipe(t, recipe)
+			work := filepath.Join(directory, "work")
+			completion := filepath.Join(directory, "completion.state")
+			err := runRecipe(recipeOptions{
+				recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
+				toolRole: "helper", workingDirectory: work, workingDirectoryMarker: filepath.Join(work, ".linux-bzl-work-root"),
+				sources: map[string]string{}, inputs: inputs,
+				outputs: map[string]string{"completion": completion}, tools: map[string]string{"helper": helper},
+				trees: map[string]string{"kernel": sourceRoot},
+			})
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("private setup error = %v, want %q", err, test.wantError)
+				}
+				if _, statErr := os.Stat(completion); !os.IsNotExist(statErr) {
+					t.Fatalf("failing private setup published completion: %v", statErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state := decodeObservedOutputState(t, completion); state.Disposition != toolaction.ObservedOutputAbsent {
+				t.Fatalf("private PHONY completion = %#v", state)
+			}
+			if _, statErr := os.Lstat(filepath.Join(work, "source-setup", "outputmakefile")); !os.IsNotExist(statErr) {
+				t.Fatalf("private setup created a physical PHONY target: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestPhonyModulesCheckFailsOnDuplicateBasenameBeforeCompletion(t *testing.T) {
+	for _, test := range []struct {
+		name, modules string
+		conflict      bool
+	}{
+		{name: "unique basenames", modules: "drivers/first/demo.o\ndrivers/second/example.o\n"},
+		{name: "duplicate basenames", modules: "drivers/first/demo.o\ndrivers/second/demo.o\n", conflict: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			moduleOrder := filepath.Join(directory, "modules.order")
+			if err := os.WriteFile(moduleOrder, []byte(test.modules), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			check := filepath.Join(directory, "modules-check.sh")
+			if err := os.WriteFile(check, []byte(`#!/bin/sh
+set -eu
+names=:
+while IFS= read -r module; do
+	name=${module##*/}
+	case "$names" in
+		*":$name:"*) echo "duplicate module name" >&2; exit 13 ;;
+	esac
+	names="$names$name:"
+done < modules.order
+`), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			recipe := kconfig.ActionRecipe{
+				Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "check",
+				WorkingDirectory: "modules-check", Inputs: []string{"order"},
+				WorkingInputs:               map[string]string{"input:order": "modules.order"},
+				ObservedOutputs:             map[string]string{"completion": "modules_check"},
+				RequireAbsentObservedOutput: "completion", RequireUnchangedWorkingTree: true,
+				Outputs: []string{"completion"},
+			}
+			recipePath, recipeID := writeRecipe(t, recipe)
+			workRoot := filepath.Join(directory, "work")
+			completion := filepath.Join(directory, "completion.state")
+			err := runRecipe(recipeOptions{
+				recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
+				toolRole: "check", workingDirectory: workRoot, workingDirectoryMarker: filepath.Join(workRoot, ".linux-bzl-work-root"),
+				inputs: map[string]string{"order": moduleOrder}, sources: map[string]string{},
+				outputs: map[string]string{"completion": completion}, tools: map[string]string{"check": check}, trees: map[string]string{},
+			})
+			if test.conflict {
+				if err == nil || !strings.Contains(err.Error(), "exit status 13") {
+					t.Fatalf("duplicate module check error = %v, want its failed source-script status", err)
+				}
+				if _, err := os.Stat(completion); !os.IsNotExist(err) {
+					t.Fatalf("failing source check published completion state: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state := decodeObservedOutputState(t, completion); state.Disposition != toolaction.ObservedOutputAbsent {
+				t.Fatalf("successful module check completion = %#v, want absent PHONY state", state)
+			}
+			if _, err := os.Stat(filepath.Join(workRoot, "modules-check", "modules_check")); !os.IsNotExist(err) {
+				t.Fatalf("PHONY check created a Make file: %v", err)
+			}
+		})
+	}
+}
+
+func TestOrdinarySourceGeneratorStillRequiresItsDeclaredFile(t *testing.T) {
+	directory := t.TempDir()
+	helper := filepath.Join(directory, "helper")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recipe := kconfig.ActionRecipe{
+		Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "helper",
+		WorkingDirectory: "physical-generator", WorkingOutputs: map[string]string{"file": "generated.h"},
+		Outputs: []string{"file"},
+	}
+	recipePath, recipeID := writeRecipe(t, recipe)
+	output := filepath.Join(directory, "generated.h")
+	work := filepath.Join(directory, "work")
+	err := runRecipe(recipeOptions{
+		recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
+		toolRole: "helper", workingDirectory: work, workingDirectoryMarker: filepath.Join(work, ".linux-bzl-work-root"),
+		sources: map[string]string{}, inputs: map[string]string{},
+		outputs: map[string]string{"file": output}, tools: map[string]string{"helper": helper}, trees: map[string]string{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "collect working output") {
+		t.Fatalf("missing ordinary generator output error = %v", err)
+	}
+	if _, err := os.Stat(output); !os.IsNotExist(err) {
+		t.Fatalf("ordinary generator published a missing file: %v", err)
+	}
 }
 
 func decodeObservedOutputState(t *testing.T, filename string) toolaction.ObservedOutputState {

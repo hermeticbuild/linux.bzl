@@ -90,7 +90,7 @@ func TestFamilyReplayAnalysisSealRequiresUnchangedOriginalCatalog(t *testing.T) 
 				recipe.Arguments = append(slices.Clone(recipe.Arguments), "-DCHANGED=1")
 				current.Recipes[current.Nodes[0].Recipe] = recipe
 			case "config":
-				files["include/config/kernel.release"] = "changed\n"
+				files["include/config/auto.conf"] = "changed\n"
 			case "foreign-plan":
 				current = cloneActionPlan(current)
 			}
@@ -211,7 +211,7 @@ func TestFamilyExecutionCutRejectsChangedReplayBeforeAnalysis(t *testing.T) {
 			case "output":
 				current.Nodes[0].Outputs[0].Path = "different.o"
 			case "config":
-				files["include/config/kernel.release"] += "changed\n"
+				files["include/config/auto.conf"] += "changed\n"
 			case "variant":
 				variant = "unknown"
 			case "nil-plan":

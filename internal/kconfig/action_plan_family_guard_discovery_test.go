@@ -143,7 +143,7 @@ func TestDiscoverVerifiedCompilerGuardsRejectsChangedReplayBeforePreparation(t *
 				})
 			case "config":
 				options.ResolvedConfigFiles = maps.Clone(options.ResolvedConfigFiles)
-				options.ResolvedConfigFiles["include/config/kernel.release"] = "changed\n"
+				options.ResolvedConfigFiles["include/config/auto.conf"] = "changed\n"
 			case "toolset":
 				target = "sha256-" + strings.Repeat("a", 64)
 			case "variant":

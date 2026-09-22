@@ -74,7 +74,7 @@ func NewKbuildCompilerGuardBatch(scopes *KbuildProbeScopes, oracle *ProbeResultO
 		}
 		evaluator, err := NewLinuxProbeEvaluator(LinuxProbeEvaluatorOptions{
 			Scope: scope, Architecture: original.architecture,
-			SourceRoot: original.sourceRoot, SourceArchitecture: original.sourceArchitecture,
+			SourceRoot: original.sourceRoot, SourceRootAliases: slices.Clone(original.sourceRootAliases), SourceArchitecture: original.sourceArchitecture,
 			ScriptEnvironment: maps.Clone(original.scriptEnvironment),
 			Facts:             original.facts, Tools: maps.Clone(original.tools),
 			Discovery: builder, Oracle: lookup, RustSourceRoot: original.rustSourceRoot,

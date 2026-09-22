@@ -191,6 +191,7 @@ def _fake_sdk_impl(ctx):
     host_toolset_identity = ctx.actions.declare_directory(ctx.label.name + ".host-toolset")
     target_toolset_identity = ctx.actions.declare_directory(ctx.label.name + ".target-toolset")
     host_toolset_manifest = ctx.actions.declare_file(ctx.label.name + ".host-toolset.json")
+    host_pkg_config_manifest = ctx.actions.declare_file(ctx.label.name + ".pkg-config.json")
     target_toolset_manifest = ctx.actions.declare_file(ctx.label.name + ".target-toolset.json")
     host_probe_results = ctx.actions.declare_directory(ctx.label.name + ".host-probes")
     target_probe_results = ctx.actions.declare_directory(ctx.label.name + ".target-probes")
@@ -212,6 +213,13 @@ def _fake_sdk_impl(ctx):
         target_toolset_manifest,
     ]:
         ctx.actions.write(file, "fixture\n")
+    ctx.actions.write(
+        host_pkg_config_manifest,
+        json.encode({
+            "schema": "linux.bzl/pkg-config-manifest/v1",
+            "packages": {"libelf": {"cflags": _TEST_LIBELF_COMPILE_FLAGS, "libs": _TEST_LIBELF_LINK_FLAGS}},
+        }) + "\n",
+    )
     ctx.actions.run_shell(
         outputs = [
             sdk,
@@ -255,6 +263,10 @@ def _fake_sdk_impl(ctx):
         host_environments[role] = {}
         target_requirements[role] = {}
         host_requirements[role] = {}
+    host_tools["pkg-config"] = marker
+    host_arguments["pkg-config"] = ["-manifest", host_pkg_config_manifest.path, "--", "__LINUX_BZL_KBUILD_ARGS_V1__"]
+    host_environments["pkg-config"] = {}
+    host_requirements["pkg-config"] = {}
     return [
         DefaultInfo(files = depset([marker])),
         LinuxModuleSdkInfo(
@@ -271,9 +283,10 @@ def _fake_sdk_impl(ctx):
             host_kconfig_probe_results = host_kconfig_probe_results,
             host_probe_results = host_probe_results,
             host_probe_runner = ctx.attr.host_probe_runner[DefaultInfo].files_to_run,
+            host_pkg_config_manifest = host_pkg_config_manifest,
             host_recipe_runner = ctx.attr.host_recipe_runner[DefaultInfo].files_to_run,
             host_tool_files = host_tools,
-            host_toolchain_files = depset([marker], transitive = [host_cc.all_files]),
+            host_toolchain_files = depset([marker, host_pkg_config_manifest], transitive = [host_cc.all_files]),
             host_toolset_anchors = {"root-00000000": marker},
             host_toolset_identity = host_toolset_identity,
             host_toolset_manifest = host_toolset_manifest,
@@ -352,6 +365,7 @@ def _fake_kernel(name, **kwargs):
 def _external_module_test_impl(ctx):
     env = analysistest.begin(ctx)
     target = analysistest.target_under_test(env)
+    sdk = ctx.attr.kernel[LinuxModuleSdkInfo]
     asserts.true(env, LinuxModuleInfo in target)
     asserts.true(env, OutputGroupInfo in target)
     asserts.equals(env, "sdk-fixture", target[LinuxModuleInfo].kernel_key)
@@ -368,6 +382,19 @@ def _external_module_test_impl(ctx):
     expected_root = "__LINUX_BZL_SOURCE_TREE__/.linux-bzl/external/" + ctx.attr.expected_module_name
     expected_kbuild_vars = ["M=" + expected_root] + ctx.attr.expected_kbuild_vars
     for action in probe_planner_actions + planner_actions:
+        manifest_values = _flag_values(action.argv, "-pkg_config_manifest")
+        asserts.equals(env, 1, len(manifest_values))
+        if manifest_values:
+            asserts.true(
+                env,
+                _action_path_names_artifact(manifest_values[0], sdk.host_pkg_config_manifest),
+                "external module planner must use its kernel SDK's exact host package manifest",
+            )
+        asserts.true(
+            env,
+            sdk.host_pkg_config_manifest.path in {file.path: True for file in action.inputs.to_list()},
+            "external module planner must declare its kernel SDK's exact host package manifest File",
+        )
         shared_vars = _flag_values(action.argv, "-var")
         kbuild_vars = _flag_values(action.argv, "-kbuild_var")
         rust_source_vars = [value for value in shared_vars if value.startswith("RUST_LIB_SRC=")]
@@ -418,6 +445,7 @@ def _external_module_test_impl(ctx):
     return analysistest.end(env)
 
 _EXTERNAL_MODULE_TEST_ATTRS = {
+    "kernel": attr.label(mandatory = True, providers = [LinuxModuleSdkInfo]),
     "expected_kbuild_vars": attr.string_list(),
     "expected_module_name": attr.string(mandatory = True),
     "expected_output": attr.string(mandatory = True),
@@ -533,6 +561,7 @@ def linux_external_module_test(name):
     )
     _external_module_test(
         name = name,
+        kernel = ":" + sdk,
         expected_kbuild_vars = ["LINUX_BZL_EXTERNAL_CFLAG_00000000=-DEXTERNAL_PHASE_TEST=1"],
         expected_module_name = module,
         expected_output = module + ".ko",
@@ -541,6 +570,7 @@ def linux_external_module_test(name):
     )
     _external_module_rust_skew_execution_platform_test(
         name = name + "_rust_skew_execution_platform",
+        kernel = ":" + sdk,
         expected_kbuild_vars = ["LINUX_BZL_EXTERNAL_CFLAG_00000000=-DEXTERNAL_PHASE_TEST=1"],
         expected_module_name = module,
         expected_output = module + ".ko",
@@ -549,6 +579,7 @@ def linux_external_module_test(name):
     )
     _external_module_perl_execution_platform_test(
         name = name + "_perl_execution_platform",
+        kernel = ":" + sdk,
         expected_kbuild_vars = ["LINUX_BZL_EXTERNAL_CFLAG_00000000=-DEXTERNAL_PHASE_TEST=1"],
         expected_module_name = module,
         expected_output = module + ".ko",
@@ -564,6 +595,7 @@ def linux_external_module_test(name):
     )
     _external_module_test(
         name = name + "_module_name_normalization",
+        kernel = ":" + sdk,
         expected_module_name = "_9Mixed_" + name,
         expected_output = normalized_module + ".ko",
         expected_shared_vars = _TEST_SHARED_VARS,

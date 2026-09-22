@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -82,6 +83,90 @@ func TestValidateAndRewriteProbeCandidateArgumentsRejectsRenderedAuthority(t *te
 			nil, nil, resolver,
 		); err == nil {
 			t.Fatalf("rendered candidate %q was accepted", candidate)
+		}
+	}
+}
+
+func TestCompilerLinkCandidateBindsDeclaredHostLibraries(t *testing.T) {
+	fixture := newToolsetResolverFixture(t)
+	resolver, err := loadToolsetPathResolver(
+		fixture.execroot, "target", fixture.identity, fixture.manifestFilename, fixture.anchors,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostRoot := filepath.Join(t.TempDir(), "host-deps")
+	libraryDir := filepath.Join(hostRoot, "lib")
+	if err := os.MkdirAll(libraryDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(libraryDir, "libelf.a")
+	if err := os.WriteFile(archive, []byte("archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scratch := t.TempDir()
+	arguments := []string{
+		"-L__LINUX_BZL_HOST_DEPS__/lib", "-lelf",
+		"__LINUX_BZL_HOST_DEPS__/lib/libelf.a",
+	}
+	indexes := []int{0, 1, 2}
+	got, err := validateAndRewriteProbeCandidateArguments(
+		"compile", kconfig.ProbeCandidatePolicyCCLink, "",
+		arguments, arguments, indexes, scratch, scratch, fixture.execroot,
+		nil, map[string]string{"host_deps": hostRoot}, resolver,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"-L" + libraryDir, "-lelf", archive}; !slices.Equal(got, want) {
+		t.Fatalf("bound host linker argv = %q, want %q", got, want)
+	}
+	forwarded := "-Wl,__LINUX_BZL_HOST_DEPS__/lib/libelf.a"
+	got, err = validateAndRewriteProbeCandidateArguments(
+		"compile", kconfig.ProbeCandidatePolicyCCLink, "",
+		[]string{forwarded}, []string{forwarded}, []int{0},
+		scratch, scratch, fixture.execroot,
+		nil, map[string]string{"host_deps": hostRoot}, resolver,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"-Wl," + archive}; !slices.Equal(got, want) {
+		t.Fatalf("bound forwarded host archive = %q, want %q", got, want)
+	}
+	if _, err := validateAndRewriteProbeCandidateArguments(
+		"compile", kconfig.ProbeCandidatePolicyCCLink, "",
+		[]string{forwarded}, []string{forwarded}, []int{0},
+		scratch, scratch, fixture.execroot,
+		nil, nil, resolver,
+	); err == nil {
+		t.Fatal("forwarded host archive with no declared host dependency root was accepted")
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "libelf.a"), []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(hostRoot, "escaped")); err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range []string{
+		"-L__LINUX_BZL_HOST_DEPS__/../outside",
+		"-L__LINUX_BZL_HOST_DEPS__/escaped",
+		"__LINUX_BZL_HOST_DEPS__/escaped/libelf.a",
+		"-Wl,__LINUX_BZL_HOST_DEPS__/escaped/libelf.a",
+		"-Wl,__LINUX_BZL_HOST_DEPS__/../outside/libelf.a",
+		"-Wl,/unbound/libelf.a",
+	} {
+		if _, err := validateAndRewriteProbeCandidateArguments(
+			"compile", kconfig.ProbeCandidatePolicyCCLink, "",
+			[]string{candidate}, []string{candidate}, []int{0},
+			scratch, scratch, fixture.execroot,
+			nil, map[string]string{"host_deps": hostRoot}, resolver,
+		); err == nil {
+			t.Errorf("undeclared host library path %q was accepted", candidate)
 		}
 	}
 }

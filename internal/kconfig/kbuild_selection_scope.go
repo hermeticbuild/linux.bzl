@@ -1,6 +1,10 @@
 package kconfig
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+	"strings"
+)
 
 func compactKbuildSelectionLifecycleScope(selection CompactKbuildSelection) (string, string, error) {
 	lifecycle := selection.Lifecycle
@@ -154,20 +158,30 @@ func appendCompactKbuildHostPrepMirrors(
 		if output.Tree != nativeTree {
 			continue
 		}
-		if existing, _, exists := planProducerByOutput(plan, "prep", output.Path); exists {
+		mirrorOutput := ActionPlanOutput{
+			Tree: "prep", Path: output.Path, ArtifactPath: output.ArtifactPath, persistent: output.persistent,
+		}
+		if plan.selectionGraph != nil {
+			mirrorOutput = plan.selectionGraph.compactKbuildSelectionOutput(
+				compactKbuildSelectionKey{
+					profile: selection.Profile, target: canonicalKbuildRulePath(selection.Target), stage: selection.Stage,
+				}, mirrorOutput,
+			)
+		}
+		if existing, _, exists := planProducerByOutput(plan, "prep", output.Path); exists && actionPlanOutputIsCanonical(mirrorOutput) {
 			return fmt.Errorf(
-				"host-scoped preparation output %q already has prep-tree producer %s",
+				"canonical host-scoped preparation output %q already has prep-tree producer %s; source-selected publisher provenance is required",
 				output.Path, existing,
 			)
 		}
 		node := ActionPlanNode{
 			Stage: "prep", Kind: "copy", Tool: "actionfile", Product: "sdk",
 			Inputs:  []ActionPlanNodeEdge{{Role: "input", ProducerID: producerID, Slot: slot}},
-			Outputs: []ActionPlanOutput{{Tree: "prep", Path: output.Path}},
+			Outputs: []ActionPlanOutput{mirrorOutput},
 		}
 		recipe := ActionRecipe{
 			Schema: LinuxKernelPlanSchema, Kind: "copy", Tool: "actionfile",
-			Arguments: []string{"-input", "${input:input:00000000}", "-out", "${output:00000000}"},
+			Arguments: []string{"-input", "${input:input:00000000}", "-out", "${output:00000000}", "-preserve_mode"},
 			Inputs:    []string{"input:00000000"},
 			Outputs:   []string{"00000000"},
 		}
@@ -177,7 +191,68 @@ func appendCompactKbuildHostPrepMirrors(
 		mirrored++
 	}
 	if mirrored == 0 {
+		if compactKbuildHostPrepCheckCompletion(plan, selection.Target, nativeTree, producer) {
+			// The source check produced an execution state, not a host file.
+			// Its selected native predecessor orders downstream preparation;
+			// there is no filesystem product for the SDK to mirror.
+			return nil
+		}
 		return fmt.Errorf("host-scoped preparation target %q producer %s has no native %s output", selection.Target, producerID, nativeTree)
 	}
 	return nil
+}
+
+// Only an authenticated, execution-only source or Make status may satisfy a
+// host prep selection without a native file. Ordinary observations and
+// incomplete host generators retain the missing-output error above.
+func compactKbuildHostPrepCheckCompletion(
+	plan *ActionPlan, target, nativeTree string, producer ActionPlanNode,
+) bool {
+	return producer.Stage == nativeTree && len(producer.Outputs) != 0 &&
+		producer.Outputs[0].Tree == nativeTree &&
+		compactKbuildAuthenticatedExecutionCheckCompletion(plan, producer, target)
+}
+
+// This private observed output is an execution root, never a Make file or a
+// public tree product. Retain exact source-script and runner assertions across
+// provisional checkpoints and family reduction so it cannot be replaced by an
+// unrelated observed-state action during replay.
+func compactKbuildSourceCheckCompletion(plan *ActionPlan, producer ActionPlanNode, target string) bool {
+	if plan == nil || producer.Tool != compactKbuildScriptRunnerRole || len(producer.Outputs) == 0 {
+		return false
+	}
+	recipe, exists := plan.Recipes[producer.Recipe]
+	if !exists || recipe.MakePhonyCompletion != nil ||
+		recipe.Tool != compactKbuildScriptRunnerRole || recipe.Kind != producer.Kind ||
+		recipe.RequireAbsentObservedOutput != planOrdinal(0) ||
+		recipe.RequireUnchangedWorkingTree == (len(recipe.PrivateWorkingEffects) != 0) ||
+		recipe.ObservedOutputs[planOrdinal(0)] != target || len(recipe.WorkingOutputs) != 0 ||
+		recipe.Stdout != "" || recipe.WorkingDirectory == "" ||
+		len(recipe.Outputs) != len(producer.Outputs) {
+		return false
+	}
+	boundScript := false
+	for ordinal, source := range producer.Sources {
+		if source.Role == "script" && source.SourceID != "" &&
+			slices.Contains(recipe.Sources, fmt.Sprintf("script:%08d", ordinal)) {
+			boundScript = true
+			break
+		}
+	}
+	if !boundScript {
+		return false
+	}
+	primary := producer.Outputs[0]
+	if !actionPlanStageOwnsOutputTree(producer.Stage, primary.Tree) || primary.ObservedPath != target ||
+		!actionPlanOutputIsCanonical(primary) || !strings.HasPrefix(primary.Path, ".linux-bzl-intermediate/") {
+		return false
+	}
+	for slot, output := range producer.Outputs {
+		if output.Tree != primary.Tree || output.ObservedPath == "" ||
+			recipe.ObservedOutputs[planOrdinal(slot)] != output.ObservedPath ||
+			recipe.Outputs[slot] != planOrdinal(slot) {
+			return false
+		}
+	}
+	return true
 }

@@ -51,10 +51,39 @@ func TestCompactKbuildSourceScriptEnvironmentUsageBoundsGeneratedObjectTreeProgr
 	if scan.usage.ObservesAll {
 		t.Fatal("statically named generated object-tree program unexpectedly observes all environment capabilities")
 	}
+	if !scan.usage.objectProgramHeads["${objtree}/scripts/sorttable"] {
+		t.Fatalf("generated executable command head was reduced to an argument read: %#v", scan.usage.objectProgramHeads)
+	}
 	for _, name := range []string{"objtree", "VMLINUX"} {
 		if !scan.usage.Names[name] {
 			t.Errorf("generated object-tree program omitted environment path %s: %q", name, compactKbuildUsageNames(scan.usage))
 		}
+	}
+}
+
+func TestCompactKbuildSourceScriptEnvironmentUsageDistinguishesObjectArgumentsFromCommands(t *testing.T) {
+	scan, err := scanCompactKbuildSourceScript(`printf '%s\n' "${objtree}/scripts/sorttable"` + "\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan.usage.objectProgramHeads) != 0 {
+		t.Fatalf("argument-only object paths became executable program heads: %#v", scan.usage.objectProgramHeads)
+	}
+}
+
+func TestCompactKbuildSourceScriptEnvironmentUsageTracksExportedProgramHeads(t *testing.T) {
+	scan, err := scanCompactKbuildSourceScript(`if [ -n "${CONFIG_DEBUG_INFO_BTF}" -a -n "${CONFIG_BPF}" ]; then
+	${RESOLVE_BTFIDS} vmlinux
+fi
+printf '%s\n' "${RESOLVE_BTFIDS}"
+'${LITERAL_PROGRAM}' vmlinux
+\${ESCAPED_PROGRAM} vmlinux
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !scan.usage.programVariables["RESOLVE_BTFIDS"] || len(scan.usage.programVariables) != 1 {
+		t.Fatalf("selected program-head variables = %#v, want only RESOLVE_BTFIDS", scan.usage.programVariables)
 	}
 }
 
@@ -222,8 +251,6 @@ func TestCompactKbuildSourceScriptEnvironmentUsageFailsClosedForDynamicObservati
 		"env unset listing":   `env -u CC`,
 		"env attached unset":  `env -uCC`,
 		"env long unset":      `env --unset=CC`,
-		"awk environ spaced":  `awk 'BEGIN { print ENVIRON ["CC"] }'`,
-		"awk environ for-in":  `awk 'BEGIN { for (name in ENVIRON) print name }'`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			scan, err := scanCompactKbuildSourceScript(script + "\n")
@@ -234,6 +261,28 @@ func TestCompactKbuildSourceScriptEnvironmentUsageFailsClosedForDynamicObservati
 				t.Fatalf("%q did not conservatively observe all environment capabilities", script)
 			}
 		})
+	}
+}
+
+func TestCompactKbuildSourceScriptEnvironmentUsageDistinguishesChildEnvironment(t *testing.T) {
+	for _, script := range []string{
+		`awk 'BEGIN { print ENVIRON ["CC"] }'`,
+		`awk 'BEGIN { for (name in ENVIRON) print name }'`,
+	} {
+		scan, err := scanCompactKbuildSourceScript(script + "\n")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !scan.usage.observesProcessEnvironment || scan.usage.ObservesAll || !scan.usage.uses("CC") {
+			t.Fatalf("child environment read %q has incorrect environment authority: %#v", script, scan.usage)
+		}
+	}
+	mixed, err := scanCompactKbuildSourceScript("awk 'BEGIN { print ENVIRON[\"CC\"] }'\nsh -c \"$program\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mixed.usage.observesProcessEnvironment || !mixed.usage.ObservesAll {
+		t.Fatalf("child environment read masked an unrelated unbounded shell program: %#v", mixed.usage)
 	}
 }
 
@@ -438,5 +487,64 @@ func TestCompactKbuildSourceScriptEnvironmentUsageRecursesIntoImmutableChildren(
 	want := []string{"CC", "CONFIG_SHELL", "HOSTCC", "OBJCOPY", "srctree"}
 	if got := compactKbuildUsageNames(usage); !reflect.DeepEqual(got, want) {
 		t.Fatalf("recursive environment names = %q, want %q", got, want)
+	}
+}
+
+func TestCompactKbuildSourceScriptUsageSourcesDeclaredGeneratedConfig(t *testing.T) {
+	const autoConfPath = "__LINUX_BZL_OBJECT_TREE__/include/config/auto.conf"
+	root := t.TempDir()
+	for name, content := range map[string]string{
+		"Makefile":                 "all:\n\t@true\n",
+		"scripts/selected.sh":      ". include/config/auto.conf\nprintf '%s\\n' \"${CONFIG_LOCALVERSION}\" \"${LOCALVERSION+set}\"\n",
+		"include/config/auto.conf": "MAKE=source-root-shadow-must-not-be-read\n",
+	} {
+		filename := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(filename), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filename, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, test := range []struct {
+		name     string
+		contents string
+		missing  bool
+		wantErr  bool
+	}{
+		{name: "safe quoted source", contents: "CONFIG_DEFAULT_HOSTNAME=\"(none)\"\nCONFIG_LOCALVERSION=\"\"\nCONFIG_LOCALVERSION_AUTO=y\nCONFIG_PHYSICAL_ALIGN=0x200000\n"},
+		{name: "active substitution", contents: "CONFIG_LOCALVERSION=\"$(uname)\"\n", wantErr: true},
+		{name: "unquoted expression", contents: "CONFIG_DEFAULT_HOSTNAME=(none)\n", wantErr: true},
+		{name: "missing declared source", missing: true, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			files := map[string]testKbuildVirtualFile{}
+			if !test.missing {
+				files[autoConfPath] = testKbuildVirtualFile{content: test.contents, exact: true}
+			}
+			view := &testKbuildVirtualFileView{files: files}
+			kb, err := ParseKbuildFileTree(filepath.Join(root, "Makefile"), KbuildOptions{
+				RootDir: root, ConfigVariablesComplete: true, MakeVariablesComplete: true,
+				CaptureTargetEvaluator: true, VirtualFileView: view,
+				SourceRoots: map[string]string{"__LINUX_BZL_SOURCE_TREE__": root, "__LINUX_BZL_OBJECT_TREE__": root},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			profile, err := NewCompactKbuildProfile("root", filepath.Join(root, "Makefile"), root, kb)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{Tree: CompactKbuildInvocationObjectTree}); err != nil {
+				t.Fatal(err)
+			}
+			usage, err := compactKbuildSourceScriptUsage(profile, "scripts/selected.sh")
+			if (err != nil) != test.wantErr {
+				t.Fatalf("declared config source error = %v, want error %t", err, test.wantErr)
+			}
+			if err == nil && (usage.ObservesAll || usage.Names["MAKE"] || !usage.Names["CONFIG_LOCALVERSION"] || !usage.Names["LOCALVERSION"]) {
+				t.Fatalf("generated config source usage = %#v, want only script-read names", usage)
+			}
+		})
 	}
 }

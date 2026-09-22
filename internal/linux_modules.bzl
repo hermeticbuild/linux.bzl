@@ -264,6 +264,7 @@ def _planner_inputs(sdk, staged, extra = []):
         sdk.config,
         sdk.host_deps,
         sdk.host_kconfig_probe_results,
+        sdk.host_pkg_config_manifest,
         sdk.host_probe_results,
         sdk.host_toolset_identity,
         sdk.host_toolset_manifest,
@@ -288,6 +289,7 @@ def _add_planner_contract_args(args, sdk, staged):
     _add_artifact_path(args, "-host_toolset_identity", sdk.host_toolset_identity)
     _add_artifact_path(args, "-target_toolset_manifest", sdk.target_toolset_manifest)
     _add_artifact_path(args, "-host_toolset_manifest", sdk.host_toolset_manifest)
+    _add_artifact_path(args, "-pkg_config_manifest", sdk.host_pkg_config_manifest)
     _add_artifact_path(args, "-target_probe_results", sdk.target_probe_results)
     _add_artifact_path(args, "-host_probe_results", sdk.host_probe_results)
     _add_artifact_path(args, "-host_kconfig_probe_results", sdk.host_kconfig_probe_results)
@@ -395,6 +397,11 @@ def _kbuild_probe_actions(ctx, sdk, staged):
             sdk.target_toolset_manifest,
             sdk.target_toolset_anchors,
             sdk.target_companion_tools,
+            host_tool_files = sdk.host_tool_files,
+            host_toolchain_files = sdk.host_toolchain_files,
+            host_toolset_manifest = sdk.host_toolset_manifest,
+            host_toolset_anchors = sdk.host_toolset_anchors,
+            host_companion_tools = sdk.host_companion_tools,
         ),
         additional_params = linux_probe_map_directory_params(
             "target",
@@ -402,6 +409,8 @@ def _kbuild_probe_actions(ctx, sdk, staged):
             sdk.target_action_environments,
             source_prefix = _source_prefix(sdk),
             rust_source_root = sdk.rust_source_root,
+            host_action_args = sdk.host_action_args,
+            host_action_environments = sdk.host_action_environments,
         ),
         env = {},
         execution_requirements = dict(target_requirements, **{"supports-path-mapping": "1"}),

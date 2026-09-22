@@ -18,11 +18,32 @@ const maxCompactKbuildSourceScriptWrapperDepth = 32
 // fail-closed result for shell constructs which explicitly inspect or source
 // the environment dynamically.
 type compactKbuildSourceScriptEnvironmentUsage struct {
-	Names           map[string]bool
-	arithmeticNames map[string]bool
-	wholeValues     map[string]bool
-	valuePaths      map[string]map[string]bool
-	programs        map[string]bool
+	Names map[string]bool
+	// generatedShellSources are exact Make-visible object files statically
+	// sourced by a selected immutable script. They must become working-tree
+	// input edges for that script's final action, not just parser metadata.
+	generatedShellSources map[string]bool
+	arithmeticNames       map[string]bool
+	wholeValues           map[string]bool
+	valuePaths            map[string]map[string]bool
+	programs              map[string]bool
+	// programVariables names exported values used as a complete shell command
+	// head. Their executable files must be staged from an exact selected owner;
+	// observing a value in the environment alone does not stage its pathname.
+	programVariables map[string]bool
+	// literalProgramHeads retain the original command words. programSources
+	// drops the source/object root spelling for immutable-script recursion,
+	// which cannot prove where an executed binary is read from.
+	literalProgramHeads map[string]bool
+	// objectProgramHeads are exact command heads formed from an object-root
+	// variable and a static path. Their selected executable owner must be
+	// staged in the private working tree, not merely observed as a path value.
+	objectProgramHeads map[string]bool
+	// selectedSourceLiteralProgramHeads keeps child-script commands distinct
+	// from ordinary Make wrapper commands, whose programs are already bound
+	// by the outer recipe lowerer.
+	selectedSourceLiteralProgramHeads map[string]bool
+	selectedSourceObjectProgramHeads  map[string]bool
 	// argumentVectorUses counts active $*/$@ expansions, while
 	// argumentVectorProgramUses counts the subset which forms a complete shell
 	// command head. positionalArgumentUses keeps any other special positional
@@ -35,6 +56,11 @@ type compactKbuildSourceScriptEnvironmentUsage struct {
 	positionalArgumentIndexes map[int]bool
 	positionalArgumentDynamic bool
 	ObservesAll               bool
+	// A child program can inspect any process export without a corresponding
+	// shell parameter expansion (for example awk's ENVIRON). Keep this
+	// distinct from unbounded shell execution or source imports: a selected
+	// generator may admit it only when every Make export is supplied exactly.
+	observesProcessEnvironment bool
 }
 
 func (u *compactKbuildSourceScriptEnvironmentUsage) add(name string) {
@@ -49,6 +75,12 @@ func (u *compactKbuildSourceScriptEnvironmentUsage) add(name string) {
 func (u *compactKbuildSourceScriptEnvironmentUsage) merge(other compactKbuildSourceScriptEnvironmentUsage) {
 	for name := range other.Names {
 		u.add(name)
+	}
+	for source := range other.generatedShellSources {
+		if u.generatedShellSources == nil {
+			u.generatedShellSources = map[string]bool{}
+		}
+		u.generatedShellSources[source] = true
 	}
 	for name := range other.arithmeticNames {
 		if u.arithmeticNames == nil {
@@ -67,6 +99,21 @@ func (u *compactKbuildSourceScriptEnvironmentUsage) merge(other compactKbuildSou
 	for program := range other.programs {
 		u.addProgram(program)
 	}
+	for name := range other.programVariables {
+		u.addProgramVariable(name)
+	}
+	for program := range other.literalProgramHeads {
+		u.addLiteralProgramHead(program)
+	}
+	for program := range other.objectProgramHeads {
+		u.addObjectProgramHead(program)
+	}
+	for program := range other.selectedSourceLiteralProgramHeads {
+		u.addSelectedSourceLiteralProgramHead(program)
+	}
+	for program := range other.selectedSourceObjectProgramHeads {
+		u.addSelectedSourceObjectProgramHead(program)
+	}
 	u.argumentVectorUses += other.argumentVectorUses
 	u.argumentVectorProgramUses += other.argumentVectorProgramUses
 	u.positionalArgumentUses += other.positionalArgumentUses
@@ -78,6 +125,7 @@ func (u *compactKbuildSourceScriptEnvironmentUsage) merge(other compactKbuildSou
 	}
 	u.positionalArgumentDynamic = u.positionalArgumentDynamic || other.positionalArgumentDynamic
 	u.ObservesAll = u.ObservesAll || other.ObservesAll
+	u.observesProcessEnvironment = u.observesProcessEnvironment || other.observesProcessEnvironment
 }
 
 func (u *compactKbuildSourceScriptEnvironmentUsage) observePositionalArgument(index int) {
@@ -138,14 +186,67 @@ func (u *compactKbuildSourceScriptEnvironmentUsage) addProgram(program string) {
 	u.programs[program] = true
 }
 
+func (u *compactKbuildSourceScriptEnvironmentUsage) addProgramVariable(name string) {
+	if !validKbuildCommandEnvironmentName(name) {
+		return
+	}
+	u.add(name)
+	if u.programVariables == nil {
+		u.programVariables = map[string]bool{}
+	}
+	u.programVariables[name] = true
+}
+
+func (u *compactKbuildSourceScriptEnvironmentUsage) addLiteralProgramHead(word string) {
+	if _, exact := compactKbuildSourceScriptChildPath(word); !exact {
+		return
+	}
+	if u.literalProgramHeads == nil {
+		u.literalProgramHeads = map[string]bool{}
+	}
+	u.literalProgramHeads[word] = true
+}
+
+func (u *compactKbuildSourceScriptEnvironmentUsage) addSelectedSourceLiteralProgramHead(word string) {
+	if u.selectedSourceLiteralProgramHeads == nil {
+		u.selectedSourceLiteralProgramHeads = map[string]bool{}
+	}
+	u.selectedSourceLiteralProgramHeads[word] = true
+}
+
+func (u *compactKbuildSourceScriptEnvironmentUsage) addObjectProgramHead(word string) {
+	if !compactKbuildObjectTreeProgramPath(word) {
+		return
+	}
+	if u.objectProgramHeads == nil {
+		u.objectProgramHeads = map[string]bool{}
+	}
+	u.objectProgramHeads[word] = true
+}
+
+func (u *compactKbuildSourceScriptEnvironmentUsage) addSelectedSourceObjectProgramHead(word string) {
+	if u.selectedSourceObjectProgramHeads == nil {
+		u.selectedSourceObjectProgramHeads = map[string]bool{}
+	}
+	u.selectedSourceObjectProgramHeads[word] = true
+}
+
 func (u compactKbuildSourceScriptEnvironmentUsage) uses(name string) bool {
-	return u.ObservesAll || u.Names[name]
+	return u.ObservesAll || u.observesProcessEnvironment || u.Names[name]
 }
 
 type compactKbuildSourceScriptScan struct {
-	usage          compactKbuildSourceScriptEnvironmentUsage
-	sources        []string
-	programSources []string
+	usage   compactKbuildSourceScriptEnvironmentUsage
+	sources []string
+	// dotSources records only shell `.`/`source` operands. sources also
+	// includes executable shell scripts, which are not assignment imports.
+	dotSources       []string
+	dynamicDotSource bool
+	programSources   []string
+	// Unbound paths and deferred command rewriting cannot be authenticated by
+	// selected source-output measurement. Ordinary lowering owns its separate
+	// tool/object input and wrapper execution contracts.
+	unboundChildExecution bool
 }
 
 // compactKbuildSourceScriptUsage reads the exact selected source program and
@@ -156,8 +257,18 @@ func compactKbuildSourceScriptUsage(
 	profile CompactKbuildProfile,
 	scriptPath string,
 ) (compactKbuildSourceScriptEnvironmentUsage, error) {
+	return compactKbuildSourceScriptUsageWithSelectedContent(profile, scriptPath, "")
+}
+
+// The caller authenticates selectedContent against the immutable source before
+// this scan. Child shell sources still come from that same selected source tree.
+func compactKbuildSourceScriptUsageWithSelectedContent(
+	profile CompactKbuildProfile,
+	scriptPath, selectedContent string,
+) (compactKbuildSourceScriptEnvironmentUsage, error) {
 	usage := compactKbuildSourceScriptEnvironmentUsage{Names: map[string]bool{}}
 	visited := map[string]bool{}
+	root := canonicalKbuildRulePath(scriptPath)
 	var visit func(string) error
 	visit = func(current string) error {
 		current = canonicalKbuildRulePath(current)
@@ -165,16 +276,34 @@ func compactKbuildSourceScriptUsage(
 			return nil
 		}
 		visited[current] = true
-		content, err := readCompactKbuildProfileSource(profile, current)
-		if err != nil {
-			return err
+		content := selectedContent
+		if current != root || selectedContent == "" {
+			selected, err := readCompactKbuildProfileSource(profile, current)
+			if err != nil {
+				return err
+			}
+			content = string(selected)
 		}
-		scan, err := scanCompactKbuildSourceScript(string(content))
+		scan, err := scanCompactKbuildSourceScript(content)
 		if err != nil {
 			return fmt.Errorf("inspect environment use in %q: %w", current, err)
 		}
 		usage.merge(scan.usage)
 		for _, source := range scan.sources {
+			// A script selected from the source tree still runs below the Make
+			// process's object-tree cwd. An object config assignment shadows a
+			// source file with the same relative name in that cwd.
+			declared, sourceErr := compactKbuildDeclaredGeneratedShellSource(profile, source)
+			if sourceErr != nil {
+				return fmt.Errorf("source script %q sources %q: %w", current, source, sourceErr)
+			}
+			if declared {
+				if usage.generatedShellSources == nil {
+					usage.generatedShellSources = map[string]bool{}
+				}
+				usage.generatedShellSources[canonicalKbuildRulePath(source)] = true
+				continue
+			}
 			resolved, ok := compactKbuildStaticSourcedPath(profile, current, source)
 			if !ok {
 				usage.ObservesAll = true
@@ -204,6 +333,78 @@ func compactKbuildSourceScriptUsage(
 	return usage, nil
 }
 
+// compactKbuildDeclaredGeneratedShellSource recognizes only the generated
+// config assignment projection supplied to this exact Make invocation. Other
+// object files and dynamically computed source names remain opaque.
+func compactKbuildDeclaredGeneratedShellSource(profile CompactKbuildProfile, source string) (bool, error) {
+	source = canonicalKbuildRulePath(source)
+	declared := false
+	for _, projection := range resolvedConfigProjections() {
+		if projection.input == "auto.conf" && projection.output == source {
+			declared = true
+			break
+		}
+	}
+	if !declared {
+		return false, nil
+	}
+	location, located := CompactKbuildProfileInvocationLocation(profile)
+	if !located || location.Tree != CompactKbuildInvocationObjectTree ||
+		canonicalKbuildRulePath(location.Directory) != "" {
+		return false, nil
+	}
+	if profile.evaluator == nil || profile.evaluator.template == nil ||
+		profile.evaluator.template.virtualFileView == nil {
+		return false, fmt.Errorf("declared generated shell source has no Make-visible object snapshot")
+	}
+	content, exists, exact, err := profile.evaluator.template.virtualFileView.Read(
+		"__LINUX_BZL_OBJECT_TREE__/" + source,
+	)
+	if err != nil {
+		return false, err
+	}
+	if !exists || !exact {
+		return false, fmt.Errorf("declared generated shell source is absent or has no exact bytes")
+	}
+	if err := validateCompactKbuildConfigShellAssignments(content); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func validateCompactKbuildConfigShellAssignments(content string) error {
+	if !strings.HasSuffix(content, "\n") || strings.ContainsAny(content, "\x00\r") {
+		return fmt.Errorf("generated config shell source lacks a complete LF-delimited assignment")
+	}
+	for number, line := range strings.Split(strings.TrimSuffix(content, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		name, value, found := strings.Cut(line, "=")
+		if !found || !strings.HasPrefix(name, "CONFIG_") ||
+			!validKbuildCommandEnvironmentName(name) {
+			return fmt.Errorf("generated config shell source line %d is not one CONFIG_* assignment", number+1)
+		}
+		if strings.HasPrefix(value, `"`) {
+			tokens, err := lexCompactKbuildRecipe(value)
+			if err != nil || len(tokens) != 1 || tokens[0].operator ||
+				tokens[0].shellExpansion || tokens[0].pathnameExpansion ||
+				len(value) < 2 || value[len(value)-1] != '"' {
+				return fmt.Errorf("generated config shell source line %d has active or invalid quoted syntax", number+1)
+			}
+			continue
+		}
+		for _, character := range value {
+			if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+				(character >= '0' && character <= '9') || strings.ContainsRune("_+-./", character) {
+				continue
+			}
+			return fmt.Errorf("generated config shell source line %d has active or invalid unquoted syntax", number+1)
+		}
+	}
+	return nil
+}
+
 // compactKbuildHermeticScriptEnvironmentUsage reports environment observed by
 // one evaluated shell fallback and by immutable shell helpers it invokes. It is
 // deliberately scope-free: graph discovery has not selected host versus target
@@ -213,12 +414,55 @@ func compactKbuildHermeticScriptEnvironmentUsage(
 	script string,
 	commands []compactKbuildRecipeCommand,
 ) (compactKbuildSourceScriptEnvironmentUsage, error) {
+	return compactKbuildHermeticScriptEnvironmentUsageWithSelectedContent(
+		profile, script, commands, "", "",
+	)
+}
+
+// The split final source phase executes selectedContent in place of the full
+// source pathname in the original Make wrapper. Follow the same immutable
+// children while limiting the root script's capabilities to those bytes.
+func compactKbuildHermeticScriptEnvironmentUsageWithSelectedContent(
+	profile CompactKbuildProfile,
+	script string,
+	commands []compactKbuildRecipeCommand,
+	selectedSourcePath, selectedContent string,
+) (compactKbuildSourceScriptEnvironmentUsage, error) {
 	scan, err := scanCompactKbuildSourceScript(script)
 	if err != nil {
 		return compactKbuildSourceScriptEnvironmentUsage{}, err
 	}
 	usage := scan.usage
 	seen := map[string]bool{}
+	visitSource := func(pathname string) (compactKbuildSourceScriptEnvironmentUsage, error) {
+		if pathname == selectedSourcePath && selectedContent != "" {
+			return compactKbuildSourceScriptUsageWithSelectedContent(profile, pathname, selectedContent)
+		}
+		return compactKbuildSourceScriptUsage(profile, pathname)
+	}
+	// A compound shell whose argv cannot be reduced into command records still
+	// names exact immutable child scripts in the source scan. Follow those
+	// children with the same source proof as the parsed-command path below;
+	// otherwise their executable and environment reads disappear when the
+	// wrapper falls back to one atomic shell action.
+	for _, source := range scan.sources {
+		pathname, found := compactKbuildStaticSourcedPath(profile, "", source)
+		if !found || seen[pathname] || !compactKbuildProfileSourceUsesShell(profile, pathname) {
+			continue
+		}
+		seen[pathname] = true
+		child, childErr := visitSource(pathname)
+		if childErr != nil {
+			return compactKbuildSourceScriptEnvironmentUsage{}, childErr
+		}
+		usage.merge(child)
+		for word := range child.literalProgramHeads {
+			usage.addSelectedSourceLiteralProgramHead(word)
+		}
+		for word := range child.objectProgramHeads {
+			usage.addSelectedSourceObjectProgramHead(word)
+		}
+	}
 	for _, command := range commands {
 		candidates := append([]string{command.program}, command.arguments...)
 		for _, candidate := range candidates {
@@ -227,11 +471,17 @@ func compactKbuildHermeticScriptEnvironmentUsage(
 				continue
 			}
 			seen[pathname] = true
-			child, childErr := compactKbuildSourceScriptUsage(profile, pathname)
+			child, childErr := visitSource(pathname)
 			if childErr != nil {
 				return compactKbuildSourceScriptEnvironmentUsage{}, childErr
 			}
 			usage.merge(child)
+			for word := range child.literalProgramHeads {
+				usage.addSelectedSourceLiteralProgramHead(word)
+			}
+			for word := range child.objectProgramHeads {
+				usage.addSelectedSourceObjectProgramHead(word)
+			}
 		}
 	}
 	return usage, nil
@@ -531,6 +781,8 @@ func scanCompactKbuildSourceScript(content string) (compactKbuildSourceScriptSca
 	inspectCompactKbuildSourceScriptCommands(commands, &scan)
 	slices.Sort(scan.sources)
 	scan.sources = slices.Compact(scan.sources)
+	slices.Sort(scan.dotSources)
+	scan.dotSources = slices.Compact(scan.dotSources)
 	slices.Sort(scan.programSources)
 	scan.programSources = slices.Compact(scan.programSources)
 	return scan, nil
@@ -598,6 +850,9 @@ func scanCompactKbuildBacktickCommands(text string, scan *compactKbuildSourceScr
 		} else {
 			scan.usage.merge(nested.usage)
 			scan.sources = append(scan.sources, nested.sources...)
+			scan.dotSources = append(scan.dotSources, nested.dotSources...)
+			scan.dynamicDotSource = scan.dynamicDotSource || nested.dynamicDotSource
+			scan.unboundChildExecution = scan.unboundChildExecution || nested.unboundChildExecution
 			scan.programSources = append(scan.programSources, nested.programSources...)
 		}
 		index = commandEnd
@@ -673,6 +928,9 @@ func scanCompactKbuildDollarCommandSubstitutions(text string, scan *compactKbuil
 			} else {
 				scan.usage.merge(nested.usage)
 				scan.sources = append(scan.sources, nested.sources...)
+				scan.dotSources = append(scan.dotSources, nested.dotSources...)
+				scan.dynamicDotSource = scan.dynamicDotSource || nested.dynamicDotSource
+				scan.unboundChildExecution = scan.unboundChildExecution || nested.unboundChildExecution
 				scan.programSources = append(scan.programSources, nested.programSources...)
 			}
 			index = end
@@ -1189,8 +1447,11 @@ func inspectCompactKbuildSourceScriptCommands(commandText string, scan *compactK
 		resolveArithmetic(name)
 	}
 	clean := strings.ReplaceAll(commandText, compactKbuildLiteralDollarToken, "")
-	if strings.Contains(clean, "/proc/self/environ") || strings.Contains(clean, "/proc/1/environ") || compactKbuildContainsEnvironmentToken(clean, "ENVIRON") || strings.Contains(clean, "getenv(") {
+	if strings.Contains(clean, "/proc/self/environ") || strings.Contains(clean, "/proc/1/environ") {
 		scan.usage.ObservesAll = true
+	}
+	if compactKbuildContainsEnvironmentToken(clean, "ENVIRON") || strings.Contains(clean, "getenv(") {
+		scan.usage.observesProcessEnvironment = true
 	}
 }
 
@@ -1277,14 +1538,27 @@ func inspectCompactKbuildSourceScriptCommandDepth(
 	dynamicShellProgram := false
 	if name, exact := compactKbuildExactShellParameter(positionalProgram); exact {
 		dynamicShellProgram = name == "CONFIG_SHELL" || name == "SHELL"
+		if !dynamicShellProgram && !strings.Contains(program, compactKbuildLiteralDollarToken) &&
+			!(strings.HasPrefix(program, "'") && strings.HasSuffix(program, "'")) {
+			scan.usage.addProgramVariable(name)
+		}
 	}
 	if !dynamicProgram {
 		scan.usage.addProgram(strings.ReplaceAll(program, compactKbuildLiteralDollarToken, "$"))
 	}
 	if child, exact := compactKbuildSourceScriptChildPath(program); exact {
 		scan.programSources = append(scan.programSources, child)
-	} else if compactKbuildDynamicSourceScriptPath(program) && !compactKbuildObjectTreeProgramPath(program) {
-		scan.usage.ObservesAll = true
+		// Keep the command word as well as the canonical source lookup path.
+		// A source-rooted script executes in the immutable tree, whereas a
+		// relative program (including a generated host helper) must be staged
+		// in the selected action's private object tree.
+		scan.usage.addLiteralProgramHead(program)
+	} else {
+		scan.usage.addObjectProgramHead(program)
+		scan.unboundChildExecution = scan.unboundChildExecution || strings.Contains(program, "/")
+		if compactKbuildDynamicSourceScriptPath(program) && !compactKbuildObjectTreeProgramPath(program) {
+			scan.usage.ObservesAll = true
+		}
 	}
 	if compactKbuildShellProgram(base) || dynamicShellProgram {
 		invocation := compactKbuildShellArguments(arguments)
@@ -1294,7 +1568,8 @@ func inspectCompactKbuildSourceScriptCommandDepth(
 			argument := strings.ReplaceAll(arguments[invocation.scriptIndex], compactKbuildLiteralDollarToken, "$")
 			if child, exact := compactKbuildSourceScriptChildPath(argument); exact {
 				scan.sources = append(scan.sources, child)
-			} else if compactKbuildDynamicSourceScriptPath(argument) {
+				scan.programSources = append(scan.programSources, child)
+			} else {
 				scan.usage.ObservesAll = true
 			}
 		}
@@ -1319,6 +1594,7 @@ func inspectCompactKbuildSourceScriptCommandDepth(
 			}
 			if child, exact := compactKbuildSourceScriptChildPath(argument); exact {
 				scan.sources = append(scan.sources, child)
+				scan.programSources = append(scan.programSources, child)
 			} else if compactKbuildDynamicSourceScriptPath(argument) {
 				scan.usage.ObservesAll = true
 			}
@@ -1326,6 +1602,11 @@ func inspectCompactKbuildSourceScriptCommandDepth(
 		}
 	}
 	switch base {
+	case "trap", "alias":
+		// Their quoted operands can execute later without passing through the
+		// command-head scan. Preserve ordinary shell lowering, but do not use
+		// this script for a measured output proof.
+		scan.unboundChildExecution = true
 	case "eval":
 		resolved := make([]string, 0, len(arguments))
 		bounded := len(arguments) != 0
@@ -1356,12 +1637,17 @@ func inspectCompactKbuildSourceScriptCommandDepth(
 		}
 		scan.usage.merge(nested.usage)
 		scan.sources = append(scan.sources, nested.sources...)
+		scan.dotSources = append(scan.dotSources, nested.dotSources...)
+		scan.dynamicDotSource = scan.dynamicDotSource || nested.dynamicDotSource
+		scan.unboundChildExecution = scan.unboundChildExecution || nested.unboundChildExecution
 		scan.programSources = append(scan.programSources, nested.programSources...)
 	case ".", "source":
 		if len(arguments) == 0 || strings.Contains(arguments[0], "$") {
 			scan.usage.ObservesAll = true
+			scan.dynamicDotSource = true
 		} else {
 			scan.sources = append(scan.sources, arguments[0])
+			scan.dotSources = append(scan.dotSources, arguments[0])
 		}
 	case "printenv":
 		named := false
@@ -1395,7 +1681,7 @@ func inspectCompactKbuildSourceScriptCommandDepth(
 		// BusyBox has a broad applet and global-option grammar. Re-enter only for
 		// the exact applets whose environment/source semantics this scanner owns;
 		// every other invocation remains outside this bounded projection.
-		if applet == "printenv" || compactKbuildShellProgram(applet) {
+		if applet == "printenv" || applet == "env" || compactKbuildShellProgram(applet) {
 			inspectCompactKbuildSourceScriptCommandDepth(arguments, scan, locals, depth+1)
 		}
 	case "set":
@@ -1561,7 +1847,9 @@ func compactKbuildShellCommandMode(arguments []string) bool {
 // compactKbuildEnvProgram returns the first command operand after env options
 // and NAME=VALUE assignments. Options with operands must be consumed exactly:
 // otherwise `env -u NAME` is itself an environment listing and NAME must not be
-// mistaken for a child program. Unknown option grammar is fail-closed.
+// mistaken for a child program. Split-string options can supply the executed
+// command itself and are not bounded by this argv-only scanner. Unknown option
+// grammar is fail-closed.
 func compactKbuildEnvProgram(arguments []string) (int, bool, bool) {
 	options := true
 	for index := 0; index < len(arguments); {
@@ -1577,10 +1865,10 @@ func compactKbuildEnvProgram(arguments []string) (int, bool, bool) {
 				index++
 				continue
 			case strings.HasPrefix(argument, "--unset="), strings.HasPrefix(argument, "--chdir="),
-				strings.HasPrefix(argument, "--split-string="), strings.HasPrefix(argument, "--argv0="):
+				strings.HasPrefix(argument, "--argv0="):
 				index++
 				continue
-			case argument == "--unset", argument == "--chdir", argument == "--split-string", argument == "--argv0":
+			case argument == "--unset", argument == "--chdir", argument == "--argv0":
 				if index+1 >= len(arguments) {
 					return 0, false, true
 				}
@@ -1600,7 +1888,7 @@ func compactKbuildEnvProgram(arguments []string) (int, bool, bool) {
 				switch argument[optionIndex] {
 				case 'i', '0', 'v':
 					continue
-				case 'u', 'C', 'S', 'a':
+				case 'u', 'C', 'a':
 					consumeNext = optionIndex+1 == len(argument)
 					optionIndex = len(argument)
 				default:
@@ -1704,18 +1992,36 @@ func compactKbuildSourceScriptChildPath(word string) (string, bool) {
 	return word, word != ""
 }
 
+func compactKbuildSourceScriptProgramUsesSourceRoot(word string) bool {
+	for _, prefix := range []string{
+		"$srctree/", "${srctree}/", "$abs_srctree/", "${abs_srctree}/",
+		"__LINUX_BZL_SOURCE_TREE__/", "${tree:kernel}/",
+	} {
+		if strings.HasPrefix(word, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func compactKbuildDynamicSourceScriptPath(word string) bool {
 	word = strings.ReplaceAll(word, compactKbuildLiteralDollarToken, "$")
 	return strings.ContainsAny(word, "$`") && (strings.Contains(word, "/") || strings.Contains(word, ".sh"))
 }
 
-// compactKbuildObjectTreeProgramPath recognizes a statically named generated
-// executable beneath the invocation's declared object root. Such a program is
-// an action input, not dynamically sourced shell text: its pathname observes
-// the named root, but does not imply that the surrounding script enumerates
-// every environment capability. A dynamic suffix still fails closed.
+// compactKbuildObjectTreeProgramPath recognizes the syntax of a rooted
+// executable command head with a static suffix. The selected export is checked
+// separately before any executable producer is bound: the name alone cannot
+// claim an object-root capability. A dynamic suffix still fails closed.
 func compactKbuildObjectTreeProgramPath(word string) bool {
 	word = strings.ReplaceAll(word, compactKbuildLiteralDollarToken, "$")
+	if root, suffix, rooted := strings.Cut(word, "/"); rooted {
+		if _, variable := compactKbuildExactShellParameter(root); variable && suffix != "" &&
+			!strings.ContainsAny(suffix, "$`") {
+			canonical := canonicalKbuildRulePath(suffix)
+			return canonical != "" && canonical != "." && canonical == suffix
+		}
+	}
 	for _, prefix := range []string{
 		"$objtree/", "${objtree}/", "$abs_output/", "${abs_output}/",
 		"__LINUX_BZL_OBJECT_TREE__/", compactKbuildActionAbsoluteObjectTreeMarker + "/",

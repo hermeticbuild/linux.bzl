@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 // ProbeReference is the symbolic value retained by Kconfig/Kbuild discovery.
@@ -55,6 +57,20 @@ func (b *ProbePlanBuilder) Request(scope string, request ProbeRequest, dependenc
 	}
 	if (scope != "target" && scope != "host") || b.plan.Toolsets[scope] == "" {
 		return ProbeReference{}, fmt.Errorf("probe request has unavailable scope %q", scope)
+	}
+	hasHostTool := false
+	for _, binding := range request.ToolRoles() {
+		toolScope, _, scoped, valid := toolaction.SplitBinding(binding)
+		if !valid || scoped && (scope != "target" || toolScope != "host" || b.plan.Toolsets["host"] == "") {
+			return ProbeReference{}, fmt.Errorf("%s probe has unavailable scoped tool %q", scope, binding)
+		}
+		hasHostTool = hasHostTool || scoped
+	}
+	if hasHostTool {
+		if request.HostToolsetIdentity != "" && request.HostToolsetIdentity != b.plan.Toolsets["host"] {
+			return ProbeReference{}, fmt.Errorf("%s probe request host toolset identity %q differs from selected %q", scope, request.HostToolsetIdentity, b.plan.Toolsets["host"])
+		}
+		request.HostToolsetIdentity = b.plan.Toolsets["host"]
 	}
 	requestID, err := request.ID()
 	if err != nil {

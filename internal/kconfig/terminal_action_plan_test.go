@@ -1,10 +1,73 @@
 package kconfig
 
 import (
+	"encoding/base64"
 	"slices"
 	"strings"
 	"testing"
 )
+
+func TestCompoundShellExecutesDeclaredLinkScriptRatherThanMerelyDependingOnIt(t *testing.T) {
+	const scriptPath = "scripts/link-vmlinux.sh"
+	profile := mustCompactKbuildProfileForTest(t, "link-vmlinux", "Makefile", "", `
+CONFIG_SHELL = sh
+cmd_link-vmlinux = $(CONFIG_SHELL) $<; true
+vmlinux: scripts/link-vmlinux.sh FORCE
+	+$(call if_changed,link-vmlinux)
+`, map[string]string{"srctree": "__LINUX_BZL_SOURCE_TREE__"})
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, scriptPath)
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	root := profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"]
+	mustWriteSource(t, root, scriptPath, "#!/bin/sh\nprintf linked > vmlinux\n")
+	config := CompactConfig{
+		KbuildProfiles: []CompactKbuildProfile{profile},
+		KbuildSelections: []CompactKbuildSelection{{
+			Profile: profile.Name, Target: "vmlinux", MakeTarget: "vmlinux",
+			Lifecycle: "target", Scope: "target", Stage: "target",
+		}},
+	}
+	metadata := &CompactMetadata{
+		Config: config, configFragment: map[string]string{},
+		actionRoles: testConfiguredScopedActionRoles,
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
+		Recipes: map[string]ActionRecipe{},
+	}
+	if _, err := metadata.appendGeneratedActionPlan(plan); err != nil {
+		t.Fatal(err)
+	}
+	producer, _, ok := planProducerByOutput(plan, "vmlinux", "vmlinux")
+	if !ok {
+		t.Fatalf("selected link action did not produce vmlinux: %#v", plan.Nodes)
+	}
+	indexByID := make(map[string]int, len(plan.Nodes))
+	for index, node := range plan.Nodes {
+		indexByID[node.ID] = index
+	}
+	node := plan.Nodes[indexByID[producer]]
+	recipe := plan.Recipes[node.Recipe]
+	encoded := slices.Index(recipe.Arguments, "-script_content_base64")
+	if encoded < 0 || encoded+1 >= len(recipe.Arguments) {
+		t.Fatalf("selected script recipe has no compound shell text: tool=%q args=%q", recipe.Tool, recipe.Arguments)
+	}
+	command, err := base64.StdEncoding.DecodeString(recipe.Arguments[encoded+1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !actionPlanNodeExecutesImmutableSourceScriptPath(plan, indexByID, node, recipe, "kernel", scriptPath) {
+		t.Fatalf("selected compound link script was not authenticated: sources=%#v inputs=%#v working=%#v command=%q", node.Sources, node.Inputs, recipe.WorkingInputs, command)
+	}
+	withoutInvocation := cloneActionRecipe(recipe)
+	withoutInvocation.Arguments[encoded+1] = base64.StdEncoding.EncodeToString([]byte("#!/bin/sh\nset -e\ntrue\n"))
+	if actionPlanNodeExecutesImmutableSourceScriptPath(plan, indexByID, node, withoutInvocation, "kernel", scriptPath) {
+		t.Fatal("source prerequisite alone authenticated a script which the selected compound command does not execute")
+	}
+}
 
 func TestTerminalImageEntryTargetUsesEvaluatedDemand(t *testing.T) {
 	config := CompactConfig{imageTarget: "arch/arm64/boot/Image"}
@@ -106,6 +169,156 @@ func TestTerminalActionPlanOnlyProjectsSelectedNativeOutputs(t *testing.T) {
 	}
 	if len(wantProducts) != 0 {
 		t.Fatalf("missing terminal products %#v", wantProducts)
+	}
+}
+
+func TestTerminalActionPlanOwnsUnruledModuleOutputsFromSelectedLinkScript(t *testing.T) {
+	const scriptPath = "scripts/link-vmlinux.sh"
+	const sourceScript = `#!/bin/sh
+. include/config/auto.conf
+${OBJCOPY} -j .modinfo -O binary vmlinux.o modules.builtin.modinfo
+tr '\0' '\n' < modules.builtin.modinfo | sed -n 's/^.*\.file=//p' > modules.builtin
+nm vmlinux > System.map
+`
+	profile := mustCompactKbuildProfileForTest(t, "selected", "Makefile", "", `
+vmlinux: FORCE
+	sh scripts/link-vmlinux.sh
+arch/x86/boot/bzImage: vmlinux FORCE
+	cp vmlinux $@
+`, nil)
+	sourceRoot := t.TempDir()
+	mustWriteSource(t, sourceRoot, scriptPath, sourceScript)
+	roots := map[string]string{}
+	for marker, root := range profile.evaluator.template.sourceRoots {
+		roots[marker] = root
+	}
+	roots["__LINUX_BZL_SOURCE_TREE__"] = sourceRoot
+	profile.evaluator.template.sourceRoots = roots
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profile.evaluator.template.virtualFileView = &testKbuildVirtualFileView{
+		files: map[string]testKbuildVirtualFile{
+			"__LINUX_BZL_OBJECT_TREE__/include/config/auto.conf": {
+				content: "CONFIG_LOCALVERSION=\"\"\nCONFIG_LOCALVERSION_AUTO=n\n", exact: true,
+			},
+		},
+	}
+	config := CompactConfig{
+		imageTarget:    "arch/x86/boot/bzImage",
+		KbuildProfiles: []CompactKbuildProfile{profile},
+		KbuildSelections: []CompactKbuildSelection{
+			{Profile: profile.Name, Target: "vmlinux", MakeTarget: "vmlinux", Lifecycle: "target", Scope: "target", Stage: "target"},
+			{Profile: profile.Name, Target: "arch/x86/boot/bzImage", MakeTarget: "arch/x86/boot/bzImage", Lifecycle: "target", Scope: "target", Stage: "target"},
+		},
+	}
+	graph, err := newCompactKbuildSelectionGraph(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipe := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "scriptrun",
+		WorkingDirectory: "link", Environment: map[string]string{"OBJCOPY": "objcopy"},
+		AuxiliaryTools: []string{"objcopy"}, Sources: []string{"script:00000000"},
+		Arguments: []string{"-script", "${source:script:00000000}", "-tool", "objcopy=${tool:objcopy}"},
+		Outputs:   []string{"00000000"}, WorkingOutputs: map[string]string{"00000000": "vmlinux"},
+	}
+	recipeID, err := recipe.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pathname := range []string{"modules.builtin.modinfo", "modules.builtin"} {
+		writes, err := compactKbuildSelectedSourceScriptDeclaresOutput(profile, scriptPath, recipe, pathname)
+		if err != nil || !writes {
+			t.Fatalf("selected immutable source writer for %q = (%t,%v), want a declared output", pathname, writes, err)
+		}
+	}
+	unbound := cloneActionRecipe(recipe)
+	unbound.Environment["OBJCOPY"] = "unconfigured-objcopy"
+	if writes, err := compactKbuildSelectedSourceScriptDeclaresOutput(profile, scriptPath, unbound, "modules.builtin.modinfo"); err != nil || writes {
+		t.Fatalf("unbound source OBJCOPY writer = (%t,%v), want no authenticated configured role", writes, err)
+	}
+	missingTool := cloneActionRecipe(recipe)
+	missingTool.Arguments = []string{"-script", "${source:script:00000000}"}
+	if writes, err := compactKbuildSelectedSourceScriptDeclaresOutput(profile, scriptPath, missingTool, "modules.builtin.modinfo"); err != nil || writes {
+		t.Fatalf("source OBJCOPY without runner tool binding = (%t,%v), want no configured executable", writes, err)
+	}
+	mustWriteSource(t, sourceRoot, scriptPath, "#!/bin/sh\nOBJCOPY=cp\n"+sourceScript)
+	if writes, err := compactKbuildSelectedSourceScriptDeclaresOutput(profile, scriptPath, recipe, "modules.builtin.modinfo"); err == nil || writes ||
+		!strings.Contains(err.Error(), "changes its configured OBJCOPY") {
+		t.Fatalf("source-rebound OBJCOPY writer = (%t,%v), want refused tool binding", writes, err)
+	}
+	mustWriteSource(t, sourceRoot, scriptPath, sourceScript)
+	newPlan := func() *ActionPlan {
+		return &ActionPlan{
+			Toolsets: map[string]string{"target": actionPlanTestProbeIdentity},
+			Recipes:  map[string]ActionRecipe{recipeID: recipe},
+			Sources:  []ActionPlanSource{{ID: "src-00000001", Namespace: "kernel", Path: scriptPath}},
+			Nodes: []ActionPlanNode{
+				{ID: "selected-vmlinux", Stage: "target", Kind: "generate", Tool: "scriptrun",
+					Recipe: recipeID, AuxiliaryTools: []string{"objcopy"},
+					Sources: []ActionPlanSourceEdge{{Role: "script", SourceID: "src-00000001"}},
+					Outputs: []ActionPlanOutput{{Tree: "vmlinux", Path: "vmlinux"}}},
+				{ID: "selected-image", Stage: "target", Kind: "copy", Tool: "actionfile",
+					Outputs: []ActionPlanOutput{{Tree: "image", Path: config.imageTarget}}},
+			},
+		}
+	}
+	plan := newPlan()
+	if err := (&CompactMetadata{Config: config}).appendTerminalActionPlanNodes(plan, graph); err != nil {
+		t.Fatalf("source-selected link script could not publish module products: %v", err)
+	}
+	for _, name := range []string{"modules.builtin.modinfo", "modules.builtin"} {
+		producer, slot, exists := planProducerByOutput(plan, "metadata", name)
+		if !exists || producer != "selected-vmlinux" || slot == 0 {
+			t.Fatalf("unruled source-script output %q = (%q,%d,%t), want selected-vmlinux source slot", name, producer, slot, exists)
+		}
+		if got := plan.Recipes[plan.Nodes[0].Recipe].WorkingOutputs[planOrdinal(slot)]; got != name {
+			t.Fatalf("selected script output %q slot %d working path = %q", name, slot, got)
+		}
+		for _, selection := range config.KbuildSelections {
+			if selection.Target == name {
+				t.Fatalf("terminal fabricated Make selection for source-script output %q", name)
+			}
+		}
+	}
+
+	// Existing metadata from an unrelated producer must not be adopted merely
+	// because the declared source script also names the same pathname.
+	forged := newPlan()
+	forged.Nodes = append(forged.Nodes, ActionPlanNode{
+		ID: "unrelated-modinfo", Outputs: []ActionPlanOutput{{Tree: "metadata", Path: "modules.builtin.modinfo"}},
+	})
+	if err := (&CompactMetadata{Config: config}).appendTerminalActionPlanNodes(forged, graph); err == nil ||
+		!strings.Contains(err.Error(), "unrelated producer") {
+		t.Fatalf("unrelated module metadata owner = %v, want failed source-script provenance", err)
+	}
+
+	// A source variant without the objcopy write cannot satisfy that product
+	// through a filename heuristic or the later stdout redirect alone.
+	mustWriteSource(t, sourceRoot, scriptPath, "#!/bin/sh\ntr x > modules.builtin\n")
+	missing := newPlan()
+	if err := (&CompactMetadata{Config: config}).appendTerminalActionPlanNodes(missing, graph); err == nil ||
+		!strings.Contains(err.Error(), "no declared write") {
+		t.Fatalf("missing source-script modinfo writer = %v, want explicit source absence", err)
+	}
+	mustWriteSource(t, sourceRoot, scriptPath, "#!/bin/sh\necho error 2> modules.builtin.modinfo\n")
+	if writes, err := compactKbuildSelectedSourceScriptDeclaresOutput(profile, scriptPath, recipe, "modules.builtin.modinfo"); err != nil || writes {
+		t.Fatalf("stderr-only redirection = (%t,%v), want no stdout metadata writer", writes, err)
+	}
+	mustWriteSource(t, sourceRoot, scriptPath, "#!/bin/sh\necho error 3> modules.builtin.modinfo\n")
+	if writes, err := compactKbuildSelectedSourceScriptDeclaresOutput(profile, scriptPath, recipe, "modules.builtin.modinfo"); err != nil || writes {
+		t.Fatalf("non-stdout fd redirection = (%t,%v), want no metadata writer", writes, err)
+	}
+	mustWriteSource(t, sourceRoot, scriptPath, "#!/bin/sh\necho error > __LINUX_BZL_SOURCE_TREE__/modules.builtin.modinfo\n")
+	if writes, err := compactKbuildSelectedSourceScriptDeclaresOutput(profile, scriptPath, recipe, "modules.builtin.modinfo"); err != nil || writes {
+		t.Fatalf("immutable source-root output = (%t,%v), want rejected destination", writes, err)
+	}
+	mustWriteSource(t, sourceRoot, scriptPath, "#!/bin/sh\necho error 2 > modules.builtin.modinfo\n")
+	if writes, err := compactKbuildSelectedSourceScriptDeclaresOutput(profile, scriptPath, recipe, "modules.builtin.modinfo"); err != nil || !writes {
+		t.Fatalf("literal operand before stdout redirection = (%t,%v), want declared stdout writer", writes, err)
 	}
 }
 

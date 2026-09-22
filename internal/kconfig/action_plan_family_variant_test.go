@@ -188,7 +188,12 @@ func TestActionPlanFamilyVariantInitialReportsFinalDemandIDs(t *testing.T) {
 
 func familyVariantReplayOptionsForTest(t *testing.T) ActionPlanFamilyVariantPlanningOptions {
 	t.Helper()
-	initial, err := familyVariantMetadataForTest(t, nil).ActionPlanFamilyVariant(actionPlanTestProbeIdentity, actionPlanTestProbeIdentity,
+	return familyVariantReplayOptionsWithMetadataForTest(t, familyVariantMetadataForTest(t, nil))
+}
+
+func familyVariantReplayOptionsWithMetadataForTest(t *testing.T, metadata *CompactMetadata) ActionPlanFamilyVariantPlanningOptions {
+	t.Helper()
+	initial, err := metadata.ActionPlanFamilyVariant(actionPlanTestProbeIdentity, actionPlanTestProbeIdentity,
 		ActionPlanFamilyVariantPlanningOptions{Variant: "base"})
 	if err != nil {
 		t.Fatal(err)
@@ -220,6 +225,57 @@ func familyVariantReplayOptionsForTest(t *testing.T) ActionPlanFamilyVariantPlan
 	}
 	return ActionPlanFamilyVariantPlanningOptions{
 		Variant: "base", InitialSnapshot: &snapshot, Cut: cut, ObservedHeaders: observed, ResolvedConfigFiles: files,
+	}
+}
+
+func familyVariantMetadataWithSourceCheckForTest(t *testing.T) *CompactMetadata {
+	t.Helper()
+	metadata := familyVariantMetadataForTest(t, nil)
+	root := metadata.Config.KbuildProfiles[0].evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"]
+	mustWriteSource(t, root, "scripts/check-output.sh", "#!/bin/sh\nset -e\ntest -f \"$1\"\n")
+	profile := mustCompactKbuildProfileForTest(t, "build:variant-check", "scripts/Makefile.build", "", `
+CONFIG_SHELL := sh
+srctree := __LINUX_BZL_SOURCE_TREE__
+check-output: scripts/check-output.sh FORCE
+	$(CONFIG_SHELL) $(srctree)/scripts/check-output.sh $(srctree)/drivers/variant.c
+.PHONY: check-output FORCE
+FORCE:
+`, nil)
+	profile.evaluator.template.sourceRoots = map[string]string{"__LINUX_BZL_SOURCE_TREE__": root}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{Tree: CompactKbuildInvocationObjectTree}); err != nil {
+		t.Fatal(err)
+	}
+	metadata.Config.KbuildProfiles = append(metadata.Config.KbuildProfiles, profile)
+	metadata.Config.KbuildSelections = append(metadata.Config.KbuildSelections, CompactKbuildSelection{
+		Profile: profile.Name, Target: "check-output", MakeTarget: "check-output",
+		Lifecycle: "target", Scope: "target", Stage: "target",
+	})
+	metadata.actionRoles = append(metadata.actionRoles,
+		KbuildActionRoleRef{Scope: "target", Role: compactKbuildScriptRunnerRole},
+		KbuildActionRoleRef{Scope: "target", Role: compactKbuildScriptRuntimeRole},
+	)
+	return metadata
+}
+
+func TestActionPlanFamilyVariantReplayRetainsSourceCheckExecutionRoot(t *testing.T) {
+	options := familyVariantReplayOptionsWithMetadataForTest(t, familyVariantMetadataWithSourceCheckForTest(t))
+	if len(options.InitialSnapshot.ExecutionCheckRoots) != 1 {
+		t.Fatalf("initial source check roots = %d, want one", len(options.InitialSnapshot.ExecutionCheckRoots))
+	}
+	result, err := familyVariantMetadataWithSourceCheckForTest(t).ActionPlanFamilyVariant(
+		actionPlanTestProbeIdentity, actionPlanTestProbeIdentity, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(result.Plan.executionCheckRoots, options.InitialSnapshot.ExecutionCheckRoots) {
+		t.Fatal("final replay detached from the source check execution root")
+	}
+	contract, err := canonicalFamilyReplayPlan(result.Plan, result.replayConfigFiles)
+	if err != nil || sha256.Sum256(contract) != result.replayContractDigest {
+		t.Fatalf("final source check replay changed its sealed contract: %v", err)
+	}
+	if _, _, _, err := buildObservedActionPlanFamily([]*ActionPlanFamilyVariantPlanningResult{result}); err != nil {
+		t.Fatalf("publish source checked family execution plan: %v", err)
 	}
 }
 
@@ -260,8 +316,8 @@ func TestActionPlanFamilyVariantReplayReturnsFinalObservedUses(t *testing.T) {
 	if err != nil || len(verified) != 1 || verified[0] != use {
 		t.Fatalf("public diagnostic mutation changed retained evidence: %v %v", verified, err)
 	}
-	options.ResolvedConfigFiles["include/config/kernel.release"] = "caller-mutated\n"
-	if result.replayConfigFiles["include/config/kernel.release"] == "caller-mutated\n" {
+	options.ResolvedConfigFiles["include/config/auto.conf"] = "caller-mutated\n"
+	if result.replayConfigFiles["include/config/auto.conf"] == "caller-mutated\n" {
 		t.Fatal("replay config witness aliases mutable caller input")
 	}
 }
@@ -377,7 +433,7 @@ func TestActionPlanFamilyVariantRejectsReplayBeforeCompilerAnalysis(t *testing.T
 			switch failure {
 			case "resolved-config":
 				options.ResolvedConfigFiles = maps.Clone(options.ResolvedConfigFiles)
-				options.ResolvedConfigFiles["include/config/kernel.release"] = "different\n"
+				options.ResolvedConfigFiles["include/config/auto.conf"] = "different\n"
 			case "variant":
 				options.Variant = "other"
 			case "toolset":

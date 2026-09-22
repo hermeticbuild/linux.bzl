@@ -2,7 +2,9 @@ package kconfig
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"os"
@@ -85,6 +87,7 @@ func TestCompactKbuildRecipeWritesTargetUsesLoweredOutputEvidence(t *testing.T) 
 		{name: "copy source", recipe: "cp generated.stamp copied.stamp", writes: false},
 		{name: "diagnostic target", recipe: `printf '%s' "$@"`, writes: false},
 		{name: "remove stale target", recipe: "rm -f $@", writes: false},
+		{name: "path-qualified remover remains a remover", recipe: "/source/bin/rm -f $@", writes: false},
 		{name: "directory target", recipe: "mkdir -p $@", writes: false},
 		{name: "unrelated command", recipe: "echo setup", writes: false},
 		{name: "different output", recipe: "cc -o other.stamp input.c", writes: false},
@@ -96,6 +99,316 @@ func TestCompactKbuildRecipeWritesTargetUsesLoweredOutputEvidence(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestCompactKbuildRecipeWritesTargetRetainsOutputTreeProvenance(t *testing.T) {
+	const output = "tools/objtool/fixdep-in.o"
+	linker := KbuildActionRoleToken("host", "ld")
+	for _, test := range []struct {
+		name, recipe string
+		writes       bool
+	}{
+		{name: "object-rooted host link", recipe: linker + " -r -o __LINUX_BZL_OBJECT_TREE__/" + output + " tools/objtool/fixdep.o", writes: true},
+		{name: "source-rooted host link", recipe: linker + " -r -o __LINUX_BZL_SOURCE_TREE__/" + output + " tools/objtool/fixdep.o"},
+		{name: "source-rooted copy destination", recipe: "cp input.o __LINUX_BZL_SOURCE_TREE__/" + output},
+		{name: "source-rooted redirect", recipe: "echo data > __LINUX_BZL_SOURCE_TREE__/" + output},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := CompactKbuildRecipeWritesTarget(test.recipe, output); got != test.writes {
+				t.Fatalf("CompactKbuildRecipeWritesTarget(%q, %q) = %t, want %t", test.recipe, output, got, test.writes)
+			}
+		})
+	}
+}
+
+func TestConfiguredToolRootedOutputPreservesSourceInvocationCwd(t *testing.T) {
+	const output = "tools/objtool/fixdep-in.o"
+	linker := KbuildActionRoleToken("host", "ld")
+	compiler := KbuildActionRoleToken("host", "cc")
+	for _, test := range []struct {
+		name, recipe string
+		writes       bool
+	}{
+		{name: "declared object output", recipe: linker + " -r -o __LINUX_BZL_OBJECT_TREE__/" + output + " fixdep.o", writes: true},
+		{name: "declared compiler object", recipe: compiler + " -c -o __LINUX_BZL_OBJECT_TREE__/" + output + " fixdep.c", writes: true},
+		{name: "private prep output", recipe: linker + " -r -o ${tree:prep}/" + output + " fixdep.o", writes: true},
+		{name: "relative source cwd output", recipe: linker + " -r -o " + output + " fixdep.o"},
+		{name: "source rooted output", recipe: linker + " -r -o __LINUX_BZL_SOURCE_TREE__/" + output + " fixdep.o"},
+		{name: "wrong object path", recipe: linker + " -r -o __LINUX_BZL_OBJECT_TREE__/other.o fixdep.o"},
+		{name: "rooted input with relative output", recipe: linker + " -r -o " + output + " __LINUX_BZL_OBJECT_TREE__/" + output},
+		{name: "unconfigured linker", recipe: "ld -r -o __LINUX_BZL_OBJECT_TREE__/" + output + " fixdep.o"},
+		{name: "passive target display", recipe: "printf '%s' __LINUX_BZL_OBJECT_TREE__/" + output},
+		{name: "repeated output option", recipe: linker + " -r -o __LINUX_BZL_OBJECT_TREE__/" + output + " -o __LINUX_BZL_OBJECT_TREE__/" + output + " fixdep.o"},
+		{name: "removed after linker", recipe: linker + " -r -o __LINUX_BZL_OBJECT_TREE__/" + output + " fixdep.o; rm -f __LINUX_BZL_OBJECT_TREE__/" + output},
+		{name: "conditional linker", recipe: "echo setup && " + linker + " -r -o __LINUX_BZL_OBJECT_TREE__/" + output + " fixdep.o"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := CompactKbuildConfiguredToolWritesRootedObjectTarget(test.recipe, output); got != test.writes {
+				t.Fatalf("configured tool rooted writer = %t, want %t", got, test.writes)
+			}
+		})
+	}
+}
+
+func TestConfiguredLiteralLinkerRequiresBoundOutputAndSurvivingScript(t *testing.T) {
+	const output = "tools/objtool/fixdep-in.o"
+	profile := mustCompactKbuildProfileForTest(t, "build:fixdep", "tools/build/Makefile.build", "tools/build", "", nil)
+	profile.evaluator.template.actionRoles = []KbuildActionRoleRef{{Scope: "host", Role: "ld"}, {Scope: "target", Role: "ld"}}
+	link := "ld -r -o __LINUX_BZL_OBJECT_TREE__/" + output + " tools/objtool/fixdep.o"
+	for _, test := range []struct {
+		name, script, recipe string
+		writes               bool
+	}{
+		{name: "selected if_changed wrapper", script: "@set -e; echo HOSTLD; " + link + "; printf '%s\\n' 'cmd := ld' > __LINUX_BZL_OBJECT_TREE__/tools/objtool/.fixdep-in.o.cmd", recipe: link, writes: true},
+		{name: "single linker command", script: link, writes: true},
+		{name: "arbitrary output program", script: "printf -r -o __LINUX_BZL_OBJECT_TREE__/" + output},
+		{name: "inline PATH override", script: "PATH=/source/bin " + link},
+		{name: "earlier PATH assignment", script: "export PATH=/source/bin; " + link, recipe: link},
+		{name: "earlier PATH removal", script: "unset PATH; " + link, recipe: link},
+		{name: "earlier linker alias", script: "alias ld=other; " + link, recipe: link},
+		{name: "zero-iteration loop", script: "for x in; do " + link + "; done", recipe: link},
+		{name: "conditional linker", script: "if false; then " + link + "; fi", recipe: link},
+		{name: "later output removal", script: link + "; rm -f __LINUX_BZL_OBJECT_TREE__/" + output, recipe: link},
+		{name: "later output overwrite", script: link + "; echo wrong > __LINUX_BZL_OBJECT_TREE__/" + output, recipe: link},
+		{name: "source-rooted output", script: "ld -r -o __LINUX_BZL_SOURCE_TREE__/" + output + " input.o"},
+		{name: "repeated output", script: link + " -o __LINUX_BZL_OBJECT_TREE__/" + output},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recipe := test.recipe
+			if recipe == "" {
+				recipe = test.script
+			}
+			if got := CompactKbuildProfileConfiguredToolWritesRootedObjectTargetInScript(profile, test.script, recipe, output); got != test.writes {
+				t.Fatalf("selected literal-linker script %q writes = %t, want %t", test.script, got, test.writes)
+			}
+		})
+	}
+	profile.evaluator.template.actionRoles = []KbuildActionRoleRef{{Scope: "target", Role: "ld"}}
+	if CompactKbuildProfileConfiguredToolWritesRootedObjectTarget(profile, link, output) {
+		t.Fatal("target-only linker role claimed host-capable source writer")
+	}
+}
+
+func TestConfiguredArchiveWriterRequiresRootedCreationAndSurvival(t *testing.T) {
+	const output = "tools/objtool/libsubcmd.a"
+	profile := mustCompactKbuildProfileForTest(t, "subcmd", "tools/lib/subcmd/Makefile", "tools/lib/subcmd", "", nil)
+	profile.evaluator.template.actionRoles = []KbuildActionRoleRef{{Scope: "host", Role: "ar"}, {Scope: "target", Role: "ar"}}
+	rooted := "__LINUX_BZL_OBJECT_TREE__/" + output
+	archive := "ar rcs " + rooted + " tools/objtool/libsubcmd-in.o"
+	for _, test := range []struct {
+		name, script, segment string
+		writes                bool
+	}{
+		{name: "source selected archive after stale cleanup", script: "@echo AR; rm -f " + rooted + " && " + archive, segment: archive, writes: true},
+		{name: "complete source script selects archive", script: "rm -f " + rooted + " && " + archive, writes: true},
+		{name: "GNU thin archive before link", script: "rm -f " + rooted + "; ar cDPrST " + rooted + " input.o", writes: true},
+		{name: "GNU thin archive with symbol index", script: "ar cDPrsT " + rooted + " input.o", writes: true},
+		{name: "empty thin archive after exact removal", script: "rm -f " + rooted + "; ar cDPrST " + rooted, writes: true},
+		{name: "empty archive segment retains prior removal", script: "rm -f " + rooted + "; ar cDPrST " + rooted, segment: "ar cDPrST " + rooted, writes: true},
+		{name: "different segment cannot borrow absence proof", script: "rm -f " + rooted + "; ar cDPrST " + rooted, segment: "ar qcs " + rooted},
+		{name: "single archive", script: archive, writes: true},
+		{name: "archive listing", script: "ar t " + rooted, segment: "ar t " + rooted},
+		{name: "archive extraction", script: "ar x " + rooted, segment: "ar x " + rooted},
+		{name: "target only as a member", script: "ar rcs __LINUX_BZL_OBJECT_TREE__/other.a " + rooted},
+		{name: "archive index only", script: "ar s " + rooted},
+		{name: "relative output under source cwd", script: "ar rcs " + output + " tools/objtool/libsubcmd-in.o"},
+		{name: "source tree output", script: "ar rcs __LINUX_BZL_SOURCE_TREE__/" + output + " input.o"},
+		{name: "missing member", script: "ar rcs " + rooted},
+		{name: "empty archive without removal", script: "ar cDPrST " + rooted},
+		{name: "empty archive after different removal", script: "rm -f __LINUX_BZL_OBJECT_TREE__/other.a; ar cDPrST " + rooted},
+		{name: "empty archive after relative removal", script: "rm -f " + output + "; ar cDPrST " + rooted},
+		{name: "empty archive after intervening output", script: "rm -f " + rooted + "; echo data > " + rooted + "; ar cDPrST " + rooted},
+		{name: "empty archive after PATH replacement", script: "rm -f " + rooted + "; PATH=/source/bin ar cDPrST " + rooted},
+		{name: "empty archive after archiver alias", script: "rm -f " + rooted + "; alias ar=other; ar cDPrST " + rooted},
+		{name: "empty archive inside loop", script: "rm -f " + rooted + "; for x in; do ar cDPrST " + rooted + "; done"},
+		{name: "empty archive removed after creation", script: "rm -f " + rooted + "; ar cDPrST " + rooted + "; rm -f " + rooted},
+		{name: "earlier PATH replacement", script: "PATH=/source/bin; " + archive, segment: archive},
+		{name: "earlier archiver alias", script: "alias ar=other; " + archive, segment: archive},
+		{name: "zero-iteration loop", script: "for x in; do " + archive + "; done", segment: archive},
+		{name: "later removal", script: archive + "; rm -f " + rooted, segment: archive},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			segment := test.segment
+			if segment == "" {
+				segment = test.script
+			}
+			if got := CompactKbuildProfileConfiguredToolWritesRootedObjectTargetInScript(profile, test.script, segment, output); got != test.writes {
+				t.Fatalf("source archive script %q output writer = %t, want %t", test.script, got, test.writes)
+			}
+		})
+	}
+	profile.evaluator.template.actionRoles = []KbuildActionRoleRef{{Scope: "target", Role: "ar"}}
+	if CompactKbuildProfileConfiguredToolWritesRootedObjectTarget(profile, archive, output) {
+		t.Fatal("target-only archiver role claimed host-capable archive writer")
+	}
+}
+
+func TestConfiguredArchiveRoleDeclaresOnlyCreationOutput(t *testing.T) {
+	const output = "tools/objtool/libsubcmd.a"
+	role := KbuildActionRoleToken("host", "ar")
+	for _, test := range []struct {
+		name, args string
+		writes     bool
+	}{
+		{name: "insert members", args: "rcs " + output + " libsubcmd-in.o", writes: true},
+		{name: "GNU thin built-in archive", args: "cDPrST " + output + " init.o", writes: true},
+		{name: "GNU thin indexed archive", args: "cDPrsT " + output + " init.o", writes: true},
+		{name: "empty archive without absence proof", args: "cDPrST " + output},
+		{name: "list members", args: "t " + output},
+		{name: "extract members", args: "x " + output},
+		{name: "target mentioned as input member", args: "rcs other.a " + output},
+		{name: "index existing archive", args: "s " + output},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			commands, err := parseCompactKbuildRecipe(role+" "+test.args, compactKbuildAutomaticContext{target: output})
+			if err != nil || len(commands) != 1 {
+				t.Fatalf("parse configured ar %q: commands %#v, error %v", test.args, commands, err)
+			}
+			declared, writes, err := compactKbuildRecipeDeclaredOutputForProfile(CompactKbuildProfile{}, commands[0], output)
+			if err != nil || (writes && declared == output) != test.writes {
+				t.Fatalf("configured ar %q declares (%q, %t, %v), want target %q creation %t", test.args, declared, writes, err, output, test.writes)
+			}
+		})
+	}
+}
+
+func TestEmptyBuiltInArchiveNeedsSameActionExactRemoval(t *testing.T) {
+	const target = "sound/built-in.a"
+	ar := KbuildActionRoleToken("target", "ar")
+	create := ar + " cDPrST " + target
+	for _, test := range []struct {
+		name, script string
+		writes       bool
+	}{
+		{name: "selected empty archive", script: "rm -f " + target + "; " + create, writes: true},
+		{name: "empty indexed archive", script: "rm -f " + target + " && " + ar + " cDPrsT " + target, writes: true},
+		{name: "standalone archiver has no absent output proof", script: create},
+		{name: "wrong removal", script: "rm -f other.a; " + create},
+		{name: "unproven removal program", script: "/source/bin/rm -f " + target + "; " + create},
+		{name: "wrong archive", script: "rm -f " + target + "; " + ar + " cDPrST other.a"},
+		{name: "listing cannot create an archive", script: "rm -f " + target + "; " + ar + " t " + target},
+		{name: "indexing cannot create an archive", script: "rm -f " + target + "; " + ar + " s " + target},
+		{name: "earlier PATH assignment", script: "rm -f " + target + "; PATH=/other/bin " + create},
+		{name: "conditional writer", script: "rm -f " + target + "; if false; then " + create + "; fi"},
+		{name: "later deletion", script: "rm -f " + target + "; " + create + "; rm -f " + target},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := CompactKbuildRecipeWritesTarget(test.script, target); got != test.writes {
+				t.Fatalf("empty archive script %q writes target = %t, want %t", test.script, got, test.writes)
+			}
+		})
+	}
+	rooted := "__LINUX_BZL_OBJECT_TREE__/" + target
+	rootedScript := "rm -f " + rooted + "; " + ar + " cDPrST " + rooted
+	if !CompactKbuildRecipeWritesTarget(rootedScript, rooted) ||
+		CompactKbuildRecipeWritesTarget("rm -f "+target+"; "+create, rooted) {
+		t.Fatal("object-rooted archive alias must retain its output tree provenance")
+	}
+	commands, err := parseCompactKbuildRecipe("rm -f "+target+"; "+create, compactKbuildAutomaticContext{target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	atomic, err := compactKbuildRecipeRequiresAtomicExecution(target, compactKbuildRuleMatch{}, commands)
+	if err != nil || !atomic {
+		t.Fatalf("empty source archive must preserve removal and writer in one action: atomic=%t, error=%v", atomic, err)
+	}
+}
+
+func TestEmptyBuiltInArchiveRetainsSourceRemovalAndConfiguredArchiver(t *testing.T) {
+	const target = "sound/built-in.a"
+	profile := mustCompactKbuildProfileForTest(t, "build:sound", "scripts/Makefile.build", "sound", `
+real-prereqs = $(filter-out FORCE,$^)
+cmd_ar_builtin = rm -f $@; $(AR) cDPrST $@ $(real-prereqs)
+$(obj)/built-in.a: FORCE
+	$(call if_changed,ar_builtin)
+`, map[string]string{"AR": KbuildActionRoleToken("target", "ar"), "obj": "sound"})
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: "sound",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	match, matched, err := metadata.compactKbuildRuleForProfile(profile, target)
+	if err != nil || !matched {
+		t.Fatalf("select empty archive source rule = (%t, %v)", matched, err)
+	}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).forProfile(profile)
+	producer, err := builder.buildCommandTemplate(target, match, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, ok := compactKbuildPlanNode(plan, producer)
+	if !ok || archive.Tool != compactKbuildScriptRunnerRole ||
+		len(archive.Outputs) != 1 || archive.Outputs[0].Path != target {
+		t.Fatalf("empty source archive was not one physical output action: %#v", archive)
+	}
+	recipe := plan.Recipes[archive.Recipe]
+	if !slices.Contains(recipe.AuxiliaryTools, "ar") {
+		t.Fatalf("configured archiver role was not bound into selected action: %#v", recipe)
+	}
+	script := compactKbuildRecipeScriptContentForTest(t, recipe)
+	if !strings.Contains(script, "rm -f ") || !strings.Contains(script, "ar cDPrST ") {
+		t.Fatalf("selected source removal and empty archive creation were not retained together: %q", script)
+	}
+}
+
+func TestConfiguredLiteralLinkerBindsSameCompoundAction(t *testing.T) {
+	const target = "generated/fixdep-in.o"
+	profile := mustCompactKbuildProfileForTest(t, "build:fixdep", "tools/build/Makefile.build", "", `
+generated/fixdep-in.o: input.o FORCE
+	$(call if_changed,host_ld_multi)
+`, nil)
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, "input.o")
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationSourceTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{}, metadata: metadata,
+	}
+	sourceID, err := metadata.ensureActionPlanSource(plan, "input.o")
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := "@set -e; echo '  HOSTLD "
+	template += target + "'; ld -r -o " + compactKbuildActionObjectTreeMarker + "/" + target +
+		" input.o; printf '%s\\n' 'cmd_" + target + " := ld -r' > " + compactKbuildActionObjectTreeMarker + "/generated/.fixdep-in.o.cmd"
+	commands, err := compactKbuildCompoundProgramCommands(template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).forProfile(profile).forOutput("host", "host", "sdk")
+	producer, err := builder.buildHermeticKbuildCompound(target, compactKbuildRuleMatch{
+		profile: profile, rule: profile.Rules[0],
+	}, []compactKbuildRuleInput{{path: "input.o", sourceID: sourceID}}, template, commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeIndex := slices.IndexFunc(plan.Nodes, func(node ActionPlanNode) bool { return node.ID == producer })
+	if nodeIndex < 0 {
+		t.Fatalf("missing source linker producer %q", producer)
+	}
+	node := plan.Nodes[nodeIndex]
+	recipe := plan.Recipes[node.Recipe]
+	if node.Tool != compactKbuildScriptRunnerRole || !slices.Contains(recipe.AuxiliaryTools, "ld") {
+		t.Fatalf("literal ld output was not bound to scoped tool in the same scriptrun action: %#v / %#v", node, recipe)
+	}
+	for index := 0; index+1 < len(recipe.Arguments); index++ {
+		if recipe.Arguments[index] == "-tool" && recipe.Arguments[index+1] == "ld=${tool:ld}" {
+			return
+		}
+	}
+	t.Fatalf("source link action lacks same-action scoped linker proxy: %#v", recipe.Arguments)
 }
 
 func TestCompactKbuildActionRootJoinsPreserveLeftTree(t *testing.T) {
@@ -1073,6 +1386,305 @@ $(obj)/capflags.c: $(cpufeature) $(vmxfeature) $(src)/mkcapflags.sh FORCE
 	}
 }
 
+func TestEvaluatedKbuildDirectScriptsBasicUsesSelectedLineFrontiers(t *testing.T) {
+	const target = "scripts_basic"
+	const path = "__LINUX_BZL_OBJECT_TREE__/scripts/basic/fixdep"
+	profile, _, _ := selectedControlTestProfile(t, `
+Q = $(if $(file < $(objtree)/scripts/basic/fixdep),,@)
+scripts_basic:
+	$(Q)$(MAKE) $(build)=scripts/basic
+	$(Q)rm -f .tmp_quiet_recordmcount
+`)
+	artifact := KbuildControlReadArtifact{
+		Tree: CompactKbuildInvocationObjectTree, Identity: "root/scripts_basic/basic-fixdep",
+		Version: "sha256:source-child-fixdep", Producer: CompactKbuildVisibleArtifact{
+			Path: "scripts/basic/fixdep", Profile: profile.Name, Target: "scripts/basic/fixdep",
+		},
+	}
+	before := selectedControlTestFrontier("before-recursive-basic", selectedControlTestFiles{}, artifact)
+	after := selectedControlTestFrontier("after-recursive-basic", selectedControlTestFiles{
+		files: map[string]testKbuildVirtualFile{path: {content: "source-child-fixdep", exact: true}},
+	}, artifact)
+	stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget(target, target, ""); err != nil {
+		t.Fatal(err)
+	}
+	ruleIndex := selectedControlTestRuleIndex(t, profile, target)
+	for index, frontier := range []KbuildControlRecipeFrontier{before, after} {
+		line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+			Target: target, RuleIndex: ruleIndex, RecipeIndex: index,
+		}, frontier)
+		if err != nil {
+			t.Fatal(err)
+		}
+		quiet, err := EvaluateCompactKbuildText(line.Evaluation.Profile, target, "", nil, nil, nil, "$(Q)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantQuiet := "@"
+		if index == 1 {
+			wantQuiet = ""
+		}
+		if quiet != wantQuiet {
+			t.Fatalf("scripts_basic source recipe %d quiet prefix = %q, want %q", index, quiet, wantQuiet)
+		}
+		if err := stepper.ApplyRecipe(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evaluation, err := stepper.Finish(after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok := selectedControlTestRecipeSnapshot(evaluation, target, ruleIndex, 0)
+	if !ok {
+		t.Fatal("recursive scripts/basic source line has no selected immutable frontier")
+	}
+	second, ok := selectedControlTestRecipeSnapshot(evaluation, target, ruleIndex, 1)
+	if !ok {
+		t.Fatal("scripts_basic cleanup source line has no selected immutable frontier")
+	}
+	if first.ReadIdentity() == second.ReadIdentity() ||
+		len(first.Reads()) != 1 || first.Reads()[0].Exists ||
+		len(second.Reads()) != 1 || !second.Reads()[0].Exists || second.Reads()[0].Artifact != artifact {
+		t.Fatalf("selected scripts_basic line reads = before %#v, after %#v", first.Reads(), second.Reads())
+	}
+	if _, err := EvaluateCompactKbuildTarget(evaluation.Profile, target, "", nil, nil, nil, "Q"); err == nil ||
+		!strings.Contains(err.Error(), "different file reads") {
+		t.Fatalf("scripts_basic target-wide read error = %v, want line snapshot guard", err)
+	}
+	match := compactKbuildRuleMatch{
+		profile: evaluation.Profile, rule: evaluation.Profile.Rules[ruleIndex], ruleOrder: ruleIndex,
+		lookupTarget: target, explicit: true, resolved: true,
+	}
+	action, directorySetup, err := evaluatedKbuildDirectRecipeEffects(target, match)
+	if err != nil || !action || directorySetup {
+		t.Fatalf("source-selected scripts_basic direct effects = action:%t directory:%t error:%v", action, directorySetup, err)
+	}
+	for _, test := range []struct {
+		name, want string
+		mutate     func(*KbuildSelectedControlRecipeSnapshot)
+	}{
+		{name: "wrong lexical target", want: "inconsistent source-selected line identity", mutate: func(line *KbuildSelectedControlRecipeSnapshot) {
+			line.Line.LookupTarget = "unrelated"
+		}},
+		{name: "duplicate recipe index", want: "two selected immutable views", mutate: func(line *KbuildSelectedControlRecipeSnapshot) {
+			line.Line.RecipeIndex = 0
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			corrupt := match
+			corrupt.profile.targetLineReadSnapshots = maps.Clone(match.profile.targetLineReadSnapshots)
+			lines := append([]*KbuildSelectedControlRecipeSnapshot(nil),
+				corrupt.profile.targetLineReadSnapshots[target]...)
+			altered := *lines[1]
+			test.mutate(&altered)
+			lines[1] = &altered
+			corrupt.profile.targetLineReadSnapshots[target] = lines
+			_, _, err := evaluatedKbuildDirectRecipeEffects(target, corrupt)
+			if err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "Makefile:") {
+				t.Fatalf("corrupted scripts_basic source line error = %v, want source-located %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestSelectedExplicitRuleRetainsLexicalOutputDirectorySpelling(t *testing.T) {
+	const target = "tools/bpf/resolve_btfids/libbpf"
+	profile, _, _ := selectedControlTestProfile(t, `
+OUTPUT := $(objtree)/tools/bpf/resolve_btfids/
+.PHONY: all
+all: archive
+archive: | $(OUTPUT)/libbpf
+	@echo archive
+$(OUTPUT) $(OUTPUT)/libbpf $(OUTPUT)/libsubcmd:
+	@echo LIB $@
+`)
+	raw, err := EvaluateCompactKbuildText(profile, target, "", nil, nil, nil, "$(OUTPUT)/libbpf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeWord, err := compactKbuildStableMakeWord(profile, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup, valid := ResolveCompactKbuildMakeTarget(profile, target, makeWord)
+	if !valid || lookup != "tools/bpf/resolve_btfids//libbpf" {
+		t.Fatalf("selected OUTPUT/libbpf lexical lookup = %q, valid %t", lookup, valid)
+	}
+	ruleIndex := -1
+	for index, rule := range profile.Rules {
+		if len(rule.Recipe) != 0 && slices.ContainsFunc(rule.Targets, func(declared string) bool {
+			_, belongs := ResolveCompactKbuildMakeTarget(profile, target, declared)
+			return belongs
+		}) {
+			ruleIndex = index
+			break
+		}
+	}
+	if ruleIndex < 0 {
+		t.Fatalf("source multi-target rule did not declare libbpf: %#v", profile.Rules)
+	}
+	frontier := selectedControlTestFrontier("libbpf-source-entry", selectedControlTestFiles{}, KbuildControlReadArtifact{})
+	stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget(target, makeWord, ""); err != nil {
+		t.Fatal(err)
+	}
+	line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+		Target: target, RuleIndex: ruleIndex, RecipeIndex: 0,
+	}, frontier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stepper.ApplyRecipe(line); err != nil {
+		t.Fatal(err)
+	}
+	evaluation, err := stepper.Finish(frontier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var selected compactKbuildResolvedRule
+	found := false
+	for _, candidate := range compactKbuildRuleCandidatesForMakeTarget(evaluation.Profile, target, makeWord) {
+		if candidate.ruleOrder == ruleIndex {
+			selected, found = candidate, true
+			break
+		}
+	}
+	if !found || selected.lookupTarget != lookup {
+		t.Fatalf("indexed source rule = %#v, found %t, want lexical %q", selected, found, lookup)
+	}
+	match := compactKbuildRuleMatch{
+		profile: evaluation.Profile, rule: evaluation.Profile.Rules[ruleIndex],
+		ruleOrder: ruleIndex, lookupTarget: selected.lookupTarget, resolved: true,
+	}
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil || snapshots[0] == nil || snapshots[0].Line.LookupTarget != lookup {
+		t.Fatalf("selected source line = %#v, error %v; want lexical %q", snapshots, err, lookup)
+	}
+	wrong := match
+	wrong.lookupTarget = "tools/bpf/resolve_btfids/other"
+	if _, err := compactKbuildSelectedRuleRecipeSnapshots(target, wrong); err == nil ||
+		!strings.Contains(err.Error(), "inconsistent source-selected line identity") ||
+		!strings.Contains(err.Error(), "lookup target") {
+		t.Fatalf("mismatched explicit source lookup error = %v, want source-located rejection", err)
+	}
+}
+
+func TestSelectedExplicitArchivePrerequisiteRecoversRecordedLexicalOutputSpelling(t *testing.T) {
+	const target = "tools/bpf/resolve_btfids/libbpf/libbpf.a"
+	const lexical = "tools/bpf/resolve_btfids//libbpf/libbpf.a"
+	profile, _, _ := selectedControlTestProfile(t, `
+OUTPUT := $(objtree)/tools/bpf/resolve_btfids/
+BPFOBJ := $(OUTPUT)/libbpf/libbpf.a
+AR := `+KbuildActionRoleToken("target", "ar")+`
+cmd_archive = $(AR) rcs $@ $^
+all: $(OUTPUT)/resolve_btfids
+$(OUTPUT)/resolve_btfids: $(BPFOBJ)
+	@echo LINK $^ -o $@
+$(BPFOBJ): FORCE
+	$(call if_changed,archive)
+FORCE:
+`)
+	raw, err := EvaluateCompactKbuildText(profile, target, "", nil, nil, nil, "$(BPFOBJ)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeWord, err := compactKbuildStableMakeWord(profile, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookup, valid := ResolveCompactKbuildMakeTarget(profile, target, makeWord); !valid || lookup != lexical {
+		t.Fatalf("source BPFOBJ lookup = %q, valid %t, want %q", lookup, valid, lexical)
+	}
+	ruleIndex := -1
+	for index, rule := range profile.Rules {
+		if len(rule.Recipe) != 0 && slices.ContainsFunc(rule.Targets, func(declared string) bool {
+			lookup, valid := ResolveCompactKbuildMakeTarget(profile, target, declared)
+			return valid && lookup == lexical
+		}) {
+			ruleIndex = index
+			break
+		}
+	}
+	if ruleIndex < 0 {
+		t.Fatalf("source BPFOBJ rule absent: %#v", profile.Rules)
+	}
+	frontier := selectedControlTestFrontier("libbpf-archive-entry", selectedControlTestFiles{}, KbuildControlReadArtifact{})
+	stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget(target, makeWord, ""); err != nil {
+		t.Fatal(err)
+	}
+	line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+		Target: target, RuleIndex: ruleIndex, RecipeIndex: 0,
+	}, frontier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stepper.ApplyRecipe(line); err != nil {
+		t.Fatal(err)
+	}
+	evaluation, err := stepper.Finish(frontier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := CompactKbuildSelectedControlRuleEntrySnapshot(evaluation.Profile, target)
+	if entry == nil || entry.Line.Target != target || entry.Line.LookupTarget != lexical {
+		t.Fatalf("source archive entry = %#v, want canonical %q and lexical %q", entry, target, lexical)
+	}
+	var selected compactKbuildResolvedRule
+	found := false
+	for _, candidate := range compactKbuildRuleCandidatesForMakeTarget(evaluation.Profile, target, target) {
+		if candidate.ruleOrder == ruleIndex {
+			selected, found = candidate, true
+			break
+		}
+	}
+	if !found || selected.lookupTarget != lexical {
+		t.Fatalf("canonical prerequisite rule = %#v, found %t, want lexical %q", selected, found, lexical)
+	}
+	metadata := &CompactMetadata{Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}}}
+	resolved, found, err := metadata.compactKbuildRuleForProfile(evaluation.Profile, target)
+	if err != nil || !found || resolved.lookupTarget != lexical {
+		t.Fatalf("lowered canonical archive rule = %#v, found %t, error %v; want lexical %q", resolved, found, err, lexical)
+	}
+	match := compactKbuildRuleMatch{
+		profile: evaluation.Profile, rule: evaluation.Profile.Rules[ruleIndex],
+		ruleOrder: ruleIndex, lookupTarget: selected.lookupTarget, resolved: true,
+	}
+	if snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match); err != nil || snapshots[0] == nil || snapshots[0].Line.LookupTarget != lexical {
+		t.Fatalf("archive source recipe = %#v, error %v; want lexical %q", snapshots, err, lexical)
+	}
+	context, err := evaluatedKbuildSelectedTargetMakeContext(evaluation.Profile, "tools/bpf/resolve_btfids/resolve_btfids", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(context.normal) != 1 || context.normal[0].graphPath != target || context.normal[0].makeWord != "__LINUX_BZL_OBJECT_TREE__/"+lexical {
+		t.Fatalf("parent source prerequisite = %#v, want graph %q / Make %q", context.normal, target, lexical)
+	}
+	wrong := match
+	wrong.lookupTarget = "tools/bpf/resolve_btfids/./libbpf/libbpf.a"
+	if _, err := compactKbuildSelectedRuleRecipeSnapshots(target, wrong); err == nil ||
+		!strings.Contains(err.Error(), "inconsistent source-selected line identity") ||
+		!strings.Contains(err.Error(), "lookup target") {
+		t.Fatalf("different explicit archive spelling error = %v, want source-located rejection", err)
+	}
+	for _, candidate := range compactKbuildRuleCandidatesForMakeTarget(evaluation.Profile, target, wrong.lookupTarget) {
+		if candidate.ruleOrder == ruleIndex && candidate.lookupTarget == lexical {
+			t.Fatalf("different lexical request was replaced by source archive spelling: %#v", candidate)
+		}
+	}
+}
+
 func TestEvaluatedKbuildInvocationLocalTargetConcatenatesWithOutputOnce(t *testing.T) {
 	profile := mustCompactKbuildProfileForTest(t, "tools", "tools/Makefile", "tools", `
 OUTPUT = $(obj)/
@@ -1129,6 +1741,185 @@ func TestKbuildRootedAutomaticWordPreservesMakeSpelling(t *testing.T) {
 				t.Fatalf("rooted automatic word = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestKbuildRootedAutomaticTargetRetainsPhonyMakeText(t *testing.T) {
+	profile := mustCompactKbuildProfileForTest(t, "driver:phony-context", "Makefile", "", `
+PHONY += outputmakefile
+.PHONY: $(PHONY)
+delete-on-interrupt = $(if $(filter-out $(PHONY), $@),trap 'rm -f $@';)
+outputmakefile:
+	$(delete-on-interrupt) true
+ordinary.out:
+	$(delete-on-interrupt) true
+`, nil)
+	for _, test := range []struct {
+		target, wantTarget string
+		wantTrap           bool
+	}{
+		{target: "outputmakefile", wantTarget: "outputmakefile"},
+		{target: "ordinary.out", wantTarget: "__LINUX_BZL_OBJECT_TREE__/ordinary.out", wantTrap: true},
+	} {
+		t.Run(test.target, func(t *testing.T) {
+			index := selectedControlTestRuleIndex(t, profile, test.target)
+			match := compactKbuildRuleMatch{
+				profile: profile, rule: profile.Rules[index], ruleOrder: index,
+				lookupTarget: test.target, explicit: true, resolved: true,
+			}
+			automatic, err := compactKbuildRuleRootedAutomaticEvaluationContext(test.target, match, nil,
+				map[string]string{"obj": "__LINUX_BZL_OBJECT_TREE__", "src": "__LINUX_BZL_SOURCE_TREE__"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if automatic.target != test.wantTarget {
+				t.Fatalf("rooted automatic $@ = %q, want %q", automatic.target, test.wantTarget)
+			}
+			line, err := evaluateCompactKbuildTextForMakeTarget(profile, test.target, test.target,
+				automatic.target, automatic.stem, automatic.normal, automatic.order, nil,
+				"$(delete-on-interrupt)", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(line, "trap '"); got != test.wantTrap {
+				t.Fatalf("Make's PHONY filter expanded to %q, trap present=%t, want %t", line, got, test.wantTrap)
+			}
+		})
+	}
+}
+
+func TestKbuildRootedAutomaticPrerequisitesRetainPhonyMakeText(t *testing.T) {
+	for _, test := range []struct {
+		name, profileName, makefile, directory, target, source string
+		normal, order                                          []string
+		filteredNormal, filteredOrder                          string
+	}{
+		{
+			name: "vmlinux autoksyms recursive", profileName: "driver:Makefile", makefile: "Makefile",
+			target: "vmlinux",
+			source: `
+PHONY += autoksyms_recursive FORCE scripts_basic
+.PHONY: $(PHONY)
+real-prereqs = $(filter-out $(PHONY),$^)
+newer-prereqs = $(filter-out $(PHONY),$?)
+real-order-only = $(filter-out $(PHONY),$|)
+vmlinux: scripts/link-vmlinux.sh autoksyms_recursive init/built-in.a FORCE | scripts_basic include/generated/compile.h
+	@:
+`,
+			normal: []string{
+				"__LINUX_BZL_SOURCE_TREE__/scripts/link-vmlinux.sh", "autoksyms_recursive",
+				"__LINUX_BZL_OBJECT_TREE__/init/built-in.a", "FORCE",
+			},
+			order:          []string{"scripts_basic", "__LINUX_BZL_OBJECT_TREE__/include/generated/compile.h"},
+			filteredNormal: "__LINUX_BZL_SOURCE_TREE__/scripts/link-vmlinux.sh __LINUX_BZL_OBJECT_TREE__/init/built-in.a",
+			filteredOrder:  "__LINUX_BZL_OBJECT_TREE__/include/generated/compile.h",
+		},
+		{
+			name: "invocation local control alias", profileName: "build:tools/objtool",
+			makefile: "tools/objtool/Makefile", directory: "tools/objtool",
+			target: "tools/objtool/objtool-in.o",
+			source: `
+PHONY += fixdep hostsetup
+.PHONY: $(PHONY)
+real-prereqs = $(filter-out $(PHONY),$^)
+newer-prereqs = $(filter-out $(PHONY),$?)
+real-order-only = $(filter-out $(PHONY),$|)
+tools/objtool/objtool-in.o: tools/objtool/source.o fixdep | hostsetup tools/objtool/generated.h
+	@:
+`,
+			normal:         []string{"__LINUX_BZL_OBJECT_TREE__/tools/objtool/source.o", "fixdep"},
+			order:          []string{"hostsetup", "__LINUX_BZL_OBJECT_TREE__/tools/objtool/generated.h"},
+			filteredNormal: "__LINUX_BZL_OBJECT_TREE__/tools/objtool/source.o",
+			filteredOrder:  "__LINUX_BZL_OBJECT_TREE__/tools/objtool/generated.h",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile := mustCompactKbuildProfileForTest(t, test.profileName, test.makefile,
+				test.directory, test.source, nil)
+			if test.directory == "" {
+				profile = compactKbuildProfileWithSourcesForTest(t, profile, "scripts/link-vmlinux.sh")
+			}
+			if test.directory != "" {
+				if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+					Tree: CompactKbuildInvocationObjectTree, Directory: test.directory,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			index := selectedControlTestRuleIndex(t, profile, test.target)
+			match := compactKbuildRuleMatch{
+				profile: profile, rule: profile.Rules[index], ruleOrder: index,
+				lookupTarget: test.target, explicit: true, resolved: true,
+			}
+			automatic, err := compactKbuildRuleRootedAutomaticEvaluationContext(test.target, match, nil,
+				map[string]string{"obj": "__LINUX_BZL_OBJECT_TREE__", "src": "__LINUX_BZL_SOURCE_TREE__"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(automatic.normal, test.normal) || !slices.Equal(automatic.order, test.order) {
+				t.Fatalf("automatic source words normal=%q order-only=%q, want %q and %q",
+					automatic.normal, automatic.order, test.normal, test.order)
+			}
+			for _, variable := range []string{"real-prereqs", "newer-prereqs", "real-order-only"} {
+				got, err := evaluateCompactKbuildTextForMakeTarget(profile, test.target, match.lookupTarget,
+					automatic.target, automatic.stem, automatic.normal, automatic.order, nil,
+					"$("+variable+")", true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := test.filteredNormal
+				if variable == "real-order-only" {
+					want = test.filteredOrder
+				}
+				if got != want {
+					t.Fatalf("%s = %q, want %q", variable, got, want)
+				}
+			}
+			if test.directory != "" {
+				// Synthetic command-template lowering has no selected rule entry,
+				// but its parsed profile still declares the local Make controls.
+				unresolved := compactKbuildRuleMatch{profile: profile}
+				inputs := []compactKbuildRuleInput{
+					{path: "tools/objtool/source.o"}, {path: "fixdep"},
+					{path: "hostsetup", orderOnly: true},
+					{path: "tools/objtool/generated.h", orderOnly: true},
+				}
+				synthetic, err := compactKbuildRuleRootedAutomaticEvaluationContext(test.target, unresolved,
+					inputs, map[string]string{"obj": "__LINUX_BZL_OBJECT_TREE__"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !slices.Equal(synthetic.normal, test.normal) || !slices.Equal(synthetic.order, test.order) {
+					t.Fatalf("synthetic source-declared PHONY words normal=%q order=%q", synthetic.normal, synthetic.order)
+				}
+				control, err := compactKbuildRuleRootedAutomaticEvaluationContext("fixdep", unresolved,
+					nil, map[string]string{"obj": "__LINUX_BZL_OBJECT_TREE__"})
+				if err != nil || control.target != "fixdep" {
+					t.Fatalf("synthetic source-declared PHONY target = %q, %v", control.target, err)
+				}
+			}
+		})
+	}
+}
+
+func TestKbuildRootedAutomaticForceRequiresSourcePhonyDeclaration(t *testing.T) {
+	profile := mustCompactKbuildProfileForTest(t, "driver:unruled-force", "Makefile", "", `
+normal: FORCE
+	@:
+FORCE:
+`, nil)
+	index := selectedControlTestRuleIndex(t, profile, "normal")
+	match := compactKbuildRuleMatch{
+		profile: profile, rule: profile.Rules[index], ruleOrder: index,
+		lookupTarget: "normal", explicit: true, resolved: true,
+	}
+	automatic, err := compactKbuildRuleRootedAutomaticEvaluationContext("normal", match, nil,
+		map[string]string{"obj": "__LINUX_BZL_OBJECT_TREE__"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(automatic.normal, []string{"__LINUX_BZL_OBJECT_TREE__/FORCE"}) {
+		t.Fatalf("undeclared PHONY FORCE automatic word = %q", automatic.normal)
 	}
 }
 
@@ -1355,8 +2146,8 @@ func TestExactGeneratedContentWithClosureOnlyConfigWriterKeepsConservativeFinalA
 	const (
 		target       = "include/generated/measured.h"
 		source       = "kernel/time/timeconst.bc"
-		configInput  = "kernel.release"
-		configOutput = "include/config/kernel.release"
+		configInput  = "auto.conf"
+		configOutput = "include/config/auto.conf"
 	)
 	prepProfile := CompactKbuildProfile{
 		Name: "prep-config", Path: "Makefile", EntryTargets: []string{configOutput},
@@ -1652,11 +2443,222 @@ func TestGenericKbuildCompoundPreservesLiteralTreeMarkerPayloads(t *testing.T) {
 	}
 }
 
+func TestKbuildSourceScriptPassivelyReadsMakeThroughDenyAllReplay(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "scripts/transform.sh"),
+		[]byte("#!/bin/sh\nprintf '%s\\n' \"$MAKE\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kb, err := parseKbuildWithOptions(strings.NewReader(`
+export MAKE
+cmd_transform = $(srctree)/scripts/transform.sh > $@
+generated/result.h: scripts/transform.sh FORCE
+	$(call if_changed,transform)
+`), "Makefile", KbuildOptions{
+		Variables: map[string]string{
+			"srctree": root, "MAKE": CompactKbuildRecursiveMakeProvenanceToken,
+		},
+		SourceRoots: map[string]string{
+			"__LINUX_BZL_SOURCE_TREE__": root, "__LINUX_BZL_OBJECT_TREE__": root,
+		},
+		ConfigVariablesComplete: true, MakeVariablesComplete: true, CaptureTargetEvaluator: true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := NewCompactKbuildProfile("prep", "Makefile", "", kb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+		actionRoles: testTargetActionRoles("cc"),
+	}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).forProfile(profile)
+	producer, err := builder.build("generated/result.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok || node.Tool != compactKbuildScriptRunnerRole {
+		t.Fatalf("source-script producer = %#v, found %t", node, ok)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if recipe.Environment["MAKE"] != CompactKbuildRecursiveMakeReplayName ||
+		len(recipe.CommandReplays) != 1 || !recipe.CommandReplays[0].DenyAll ||
+		len(recipe.CommandReplays[0].Invocations) != 0 {
+		t.Fatalf("passive MAKE read environment=%q replay=%#v, want exported deny-all proxy",
+			recipe.Environment["MAKE"], recipe.CommandReplays)
+	}
+	if _, err := recipe.CanonicalJSON(); err != nil {
+		t.Fatalf("passive MAKE recipe is not serializable: %v", err)
+	}
+}
+
+func TestKbuildSourceScriptPreservesSourceDefinedMakeWithSelectedAliasReplay(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "scripts/transform.sh"),
+		[]byte("#!/bin/sh\nprintf '%s\\n' \"$MAKE\"\n$MAKE_ALIAS child.o\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kb, err := parseKbuildWithOptions(strings.NewReader(`
+MAKE_ALIAS := $(MAKE)
+MAKE := custom
+export MAKE MAKE_ALIAS
+cmd_transform = $(srctree)/scripts/transform.sh > $@
+generated/result.h: scripts/transform.sh FORCE
+	$(call if_changed,transform)
+`), "Makefile", KbuildOptions{
+		Variables: map[string]string{
+			"srctree": root, "MAKE": CompactKbuildRecursiveMakeProvenanceToken,
+		},
+		SourceRoots: map[string]string{
+			"__LINUX_BZL_SOURCE_TREE__": root, "__LINUX_BZL_OBJECT_TREE__": root,
+		},
+		ConfigVariablesComplete: true, MakeVariablesComplete: true, CaptureTargetEvaluator: true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := NewCompactKbuildProfile("prep", "Makefile", "", kb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.TargetInvocationDependencies = []CompactKbuildInvocationDependency{{
+		Target: "generated/result.h", Profile: "build:child", Goals: []string{"child.o"},
+		ReplayArguments: []string{"child.o"},
+	}}
+	metadata := &CompactMetadata{
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+		actionRoles: testTargetActionRoles("cc"),
+	}
+	plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+	childRecipe := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+		Arguments: []string{"-out", "${output:00000000}"}, Outputs: []string{"00000000"},
+	}
+	childNode := ActionPlanNode{
+		Stage: "target", Kind: "generate", Tool: "actionfile", Product: "vmlinux",
+		Outputs: []ActionPlanOutput{{Tree: "objects", Path: "child.o"}},
+	}
+	if _, err := appendActionPlanNode(plan, childNode, childRecipe); err != nil {
+		t.Fatal(err)
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).forProfile(profile)
+	producer, err := builder.build("generated/result.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok || node.Tool != compactKbuildScriptRunnerRole {
+		t.Fatalf("source-script producer = %#v, found %t", node, ok)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	if recipe.Environment["MAKE"] != "custom" || recipe.Environment["MAKE_ALIAS"] != CompactKbuildRecursiveMakeReplayName ||
+		len(recipe.CommandReplays) != 1 || recipe.CommandReplays[0].DenyAll ||
+		len(recipe.CommandReplays[0].Invocations) != 1 ||
+		!slices.Equal(recipe.CommandReplays[0].Invocations[0].Arguments, []string{"child.o"}) {
+		t.Fatalf("source script MAKE=%q alias=%q replay=%#v, want source data and selected child proxy",
+			recipe.Environment["MAKE"], recipe.Environment["MAKE_ALIAS"], recipe.CommandReplays)
+	}
+}
+
+func TestGenericKbuildCompoundPassivelyReadsSourceDefinedMake(t *testing.T) {
+	const target = "generated/result.h"
+	for _, test := range []struct {
+		name, assignment, want string
+		present                bool
+	}{
+		{name: "custom", assignment: "MAKE := custom\nexport MAKE\n", want: "custom", present: true},
+		{name: "empty export", assignment: "MAKE :=\nexport MAKE\n", present: true},
+		{name: "absent"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile := mustCompactKbuildProfileForTest(t, "build:root", "scripts/Makefile.build", "", test.assignment+`
+cmd_transform = printf '%s\n' "$$MAKE" | tools/filter > $@
+`+target+`: input.txt tools/filter FORCE
+	$(call if_changed,transform)
+`, nil)
+			profile = compactKbuildProfileWithSourcesForTest(t, profile, "input.txt", "tools/filter")
+			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+				Tree: CompactKbuildInvocationObjectTree,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			metadata := &CompactMetadata{
+				actionRoles: testConfiguredScopedActionRoles,
+				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+			}
+			plan := compactGenericRecipePlanForTest()
+			if err := buildCompactKbuildTargetForTest(metadata, plan, target); err != nil {
+				t.Fatal(err)
+			}
+			recipe := plan.Recipes[plan.Nodes[len(plan.Nodes)-1].Recipe]
+			value, present := recipe.Environment["MAKE"]
+			if value != test.want || present != test.present || len(recipe.CommandReplays) != 0 {
+				t.Fatalf("passive MAKE environment=%q, present %t, replay=%#v; want %q, present %t, no replay",
+					value, present, recipe.CommandReplays, test.want, test.present)
+			}
+		})
+	}
+}
+
+func TestGenericKbuildCompoundExportsMakeAliasThroughDenyAllReplay(t *testing.T) {
+	const target = "generated/result.h"
+	profile := mustCompactKbuildProfileForTest(t, "build:root", "scripts/Makefile.build", "", `
+MAKE_ALIAS := $(MAKE) --no-print-directory
+export MAKE MAKE_ALIAS
+cmd_transform = printf '%s\n' "$$MAKE $$MAKE_ALIAS" | tools/filter > $@
+`+target+`: input.txt tools/filter FORCE
+	$(call if_changed,transform)
+`, map[string]string{"MAKE": CompactKbuildRecursiveMakeProvenanceToken})
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, "input.txt", "tools/filter")
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+	}
+	plan := compactGenericRecipePlanForTest()
+	if err := buildCompactKbuildTargetForTest(metadata, plan, target); err != nil {
+		t.Fatal(err)
+	}
+	recipe := plan.Recipes[plan.Nodes[len(plan.Nodes)-1].Recipe]
+	if recipe.Tool != compactKbuildScriptRunnerRole ||
+		recipe.Environment["MAKE"] != CompactKbuildRecursiveMakeReplayName ||
+		recipe.Environment["MAKE_ALIAS"] != CompactKbuildRecursiveMakeReplayName+" --no-print-directory" {
+		t.Fatalf("selected script recipe = %#v, want exact exported alias bound to replay proxy", recipe)
+	}
+	if len(recipe.CommandReplays) != 1 || recipe.CommandReplays[0].Name != CompactKbuildRecursiveMakeReplayName ||
+		!recipe.CommandReplays[0].DenyAll || len(recipe.CommandReplays[0].Invocations) != 0 {
+		t.Fatalf("unused recursive Make alias replay = %#v, want deny-all proxy", recipe.CommandReplays)
+	}
+	if script := compactKbuildRecipeScriptContentForTest(t, recipe); !strings.Contains(script, `$MAKE $MAKE_ALIAS`) {
+		t.Fatalf("selected script lost source-authored exported alias use: %q", script)
+	}
+	if encoded, err := recipe.CanonicalJSON(); err != nil || strings.ContainsAny(string(encoded), compactKbuildPrivateProvenanceBytes) {
+		t.Fatalf("aliased recursive Make action recipe = %q, error %v; want public proxy only", encoded, err)
+	}
+}
+
 func TestGenericKbuildCompoundSeparatesConstructedMakeLiteralFromRecursiveMake(t *testing.T) {
 	const target = "generated/result.h"
 	profile := mustCompactKbuildProfileForTest(t, "build:root", "scripts/Makefile.build", "", `
 make_marker_prefix := __LINUX_BZL_
-cmd_transform = printf '%s\n' '$(make_marker_prefix)MAKE__' > $@; $(MAKE) child.o
+MAKE_ALIAS := $(MAKE) --no-print-directory
+MAKE := custom
+export MAKE MAKE_ALIAS
+cmd_transform = printf '%s\n' "$$MAKE" '$(make_marker_prefix)MAKE__' > $@; $(MAKE_ALIAS) child.o
 `+target+`: FORCE
 	$(call if_changed,transform)
 `, map[string]string{"MAKE": CompactKbuildRecursiveMakeProvenanceToken})
@@ -1667,7 +2669,7 @@ cmd_transform = printf '%s\n' '$(make_marker_prefix)MAKE__' > $@; $(MAKE) child.
 	}
 	profile.TargetInvocationDependencies = []CompactKbuildInvocationDependency{{
 		Target: target, Profile: "build:child", Goals: []string{"child.o"},
-		ReplayArguments: []string{"child.o"},
+		ReplayArguments: []string{"--no-print-directory", "child.o"},
 	}}
 	metadata := &CompactMetadata{
 		actionRoles: testConfiguredScopedActionRoles,
@@ -1692,13 +2694,15 @@ cmd_transform = printf '%s\n' '$(make_marker_prefix)MAKE__' > $@; $(MAKE) child.
 	script := compactKbuildRecipeScriptContentForTest(t, recipe)
 	if strings.Count(script, compactKbuildRecursiveMakeMarker) != 1 ||
 		!strings.Contains(script, "'"+compactKbuildRecursiveMakeMarker+"'") ||
-		!strings.Contains(script, "make child.o") ||
+		!strings.Contains(script, "make --no-print-directory child.o") ||
 		strings.Contains(script, CompactKbuildRecursiveMakeProvenanceToken) {
 		t.Fatalf("constructed literal and recursive Make lost provenance: %q", script)
 	}
-	if len(recipe.CommandReplays) != 1 ||
-		!slices.Equal(recipe.CommandReplays[0].Invocations[0].Arguments, []string{"child.o"}) {
-		t.Fatalf("recursive Make replay = %#v, want exact child.o invocation", recipe.CommandReplays)
+	if len(recipe.CommandReplays) != 1 || recipe.CommandReplays[0].DenyAll || len(recipe.CommandReplays[0].Invocations) != 1 ||
+		!slices.Equal(recipe.CommandReplays[0].Invocations[0].Arguments, []string{"--no-print-directory", "child.o"}) ||
+		recipe.Environment["MAKE"] != "custom" || recipe.Environment["MAKE_ALIAS"] != "make --no-print-directory" {
+		t.Fatalf("recursive Make environment=%q alias=%q replay=%#v, want source-defined MAKE and exact selected child",
+			recipe.Environment["MAKE"], recipe.Environment["MAKE_ALIAS"], recipe.CommandReplays)
 	}
 }
 
@@ -3165,6 +4169,77 @@ $(obj)/../voffset.h: FORCE
 	}
 }
 
+func TestSelectedAlwaysRunSourceCheckPublishesCompletionWithoutMakeFile(t *testing.T) {
+	for _, test := range []struct {
+		name, assignment, target, recipe string
+		completion                       bool
+	}{
+		{name: "outputless selected source check", assignment: "always-y += check", target: "check", recipe: "$(CONFIG_SHELL) $<", completion: true},
+		{name: "physical always-run generated header", assignment: "always-y += generated.h", target: "generated.h", recipe: "$(CONFIG_SHELL) $< $@"},
+		{name: "ordinary script with missing output", target: "ordinary.h", recipe: "$(CONFIG_SHELL) $<"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			source := "scripts/" + test.target + ".sh"
+			profile := mustCompactKbuildProfileForTest(t, "build:root", "Kbuild", "", fmt.Sprintf(`
+CONFIG_SHELL := sh
+obj := .
+%s
+cmd = $(cmd_$(1))
+cmd_check = %s
+%s: %s FORCE
+	$(call cmd,check)
+`, test.assignment, test.recipe, test.target, source), nil)
+			profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
+			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+				Tree: CompactKbuildInvocationObjectTree,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			metadata := &CompactMetadata{
+				actionRoles: testConfiguredScopedActionRoles,
+				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+			}
+			if _, matched, err := metadata.compactKbuildRuleForProfile(profile, test.target); err != nil {
+				t.Fatal(err)
+			} else if !matched {
+				t.Fatalf("source fixture target %q has no selected rule: rules=%#v generated=%#v", test.target, profile.Rules, profile.Generated)
+			}
+			plan := &ActionPlan{
+				Recipes: map[string]ActionRecipe{}, metadata: metadata,
+				Toolsets: map[string]string{"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity},
+			}
+			builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+				forProfile(profile).forOutput("host", "host", "sdk")
+			producer, err := builder.build(test.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			node, found := compactKbuildPlanNode(plan, producer)
+			if !found || node.Tool != compactKbuildScriptRunnerRole {
+				t.Fatalf("source script check producer = %#v, found=%v", node, found)
+			}
+			recipe := plan.Recipes[node.Recipe]
+			if test.completion {
+				if len(node.Outputs) != 1 || node.Outputs[0].ObservedPath != test.target ||
+					strings.Contains(node.Outputs[0].Path, test.target) ||
+					recipe.WorkingOutputs["00000000"] != "" ||
+					recipe.ObservedOutputs["00000000"] != test.target ||
+					recipe.RequireAbsentObservedOutput != "00000000" ||
+					!recipe.RequireUnchangedWorkingTree {
+					t.Fatalf("source check published a Make file or lost exact completion: output=%#v recipe=%#v", node.Outputs, recipe)
+				}
+			} else if len(node.Outputs) != 1 || node.Outputs[0].Path != test.target ||
+				node.Outputs[0].ObservedPath != "" || recipe.WorkingOutputs["00000000"] != test.target ||
+				recipe.RequireUnchangedWorkingTree {
+				t.Fatalf("target-producing source script lost physical output requirement: output=%#v recipe=%#v", node.Outputs, recipe)
+			}
+			if err := plan.WriteStages(actionPlanStageOutputsForTest(filepath.Join(t.TempDir(), "plan"))); err != nil {
+				t.Fatalf("write selected source check plan: %v", err)
+			}
+		})
+	}
+}
+
 func TestCompactKbuildLexicalTraversalWorkingDirectories(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -4380,6 +5455,75 @@ $(OUTPUT)%.o: %.c FORCE
 		if strings.Contains(directory, "tools/lib/subcmd/tools/objtool") {
 			t.Fatalf("split-root compiler output was scoped below source cwd: %q", recipe.WorkingDirectories)
 		}
+	}
+}
+
+func TestSelectedKbuildPatternSourceEntryKeepsMakeAutomaticWord(t *testing.T) {
+	const target = "kernel/bounds.s"
+	profile, sourceRoot, _ := selectedControlTestProfile(t, `
+obj := ./kernel
+src := ./kernel
+target-stem = $(notdir $(basename $@))
+cmd_cc_s_c = $(CC) -fverbose-asm -S -o $@ $<
+$(obj)/%.s: $(src)/%.c FORCE
+	$(cmd_cc_s_c)
+.PHONY: FORCE
+FORCE:
+`)
+	if err := os.MkdirAll(filepath.Join(sourceRoot, "kernel"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "kernel", "bounds.c"), []byte("int bounds;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ruleIndex := -1
+	for index, rule := range profile.Rules {
+		for _, declared := range rule.Targets {
+			if strings.HasSuffix(declared, "/%.s") {
+				ruleIndex = index
+			}
+		}
+	}
+	if ruleIndex < 0 {
+		t.Fatal("selected source Makefile has no bounds pattern rule")
+	}
+	stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget(target, target, ""); err != nil {
+		t.Fatal(err)
+	}
+	frontier := selectedControlTestFrontier("bounds-rule-entry", selectedControlTestFiles{}, KbuildControlReadArtifact{})
+	line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+		Target: target, LookupTarget: target, AutomaticTarget: target, Stem: "bounds",
+		RuleIndex: ruleIndex, RecipeIndex: 0, Normal: []string{"kernel/bounds.c"},
+	}, frontier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stepper.ApplyRecipe(line); err != nil {
+		t.Fatal(err)
+	}
+	evaluation, err := stepper.Finish(frontier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected, err := compactKbuildSourceScriptInjectionsForMakeTarget(
+		evaluation.Profile, target, target, target, "bounds", []string{"kernel/bounds.c"}, nil,
+	)
+	if err != nil || injected["target-stem"] != "bounds" {
+		t.Fatalf("source-selected bounds $@/target-stem = %q, error %v", injected["target-stem"], err)
+	}
+	corrupt := evaluation.Profile
+	corrupt.targetRuleEntrySnapshots = maps.Clone(evaluation.Profile.targetRuleEntrySnapshots)
+	wrong := *corrupt.targetRuleEntrySnapshots[target]
+	wrong.Line.AutomaticTarget = "./kernel/bounds.s"
+	corrupt.targetRuleEntrySnapshots[target] = &wrong
+	if _, err := compactKbuildSourceScriptInjectionsForMakeTarget(
+		corrupt, target, target, target, "bounds", []string{"kernel/bounds.c"}, nil,
+	); err == nil || !strings.Contains(err.Error(), "automatic target") {
+		t.Fatalf("mismatched source entry automatic $@ was accepted: %v", err)
 	}
 }
 
@@ -5789,8 +6933,8 @@ cmd_cc_s_c = $(CC) $(filter-out $(DEBUG_CFLAGS) $(CC_FLAGS_LTO), $(c_flags)) -fv
 
 func TestKbuildWorkingTreeClosureRebasesSelectedUnmaterializedConfigProjection(t *testing.T) {
 	const (
-		configInput  = "kernel.release"
-		configOutput = "include/config/kernel.release"
+		configInput  = "auto.conf"
+		configOutput = "include/config/auto.conf"
 		consumer     = "scripts/mod/empty.o"
 	)
 	prepProfile := CompactKbuildProfile{
@@ -5863,8 +7007,8 @@ func TestKbuildWorkingTreeClosureRebasesSelectedUnmaterializedConfigProjection(t
 
 func TestKbuildWorkingTreeClosurePrefersMaterializedConfigProjectionForPrepAndTarget(t *testing.T) {
 	const (
-		configInput  = "kernel.release"
-		configOutput = "include/config/kernel.release"
+		configInput  = "auto.conf"
+		configOutput = "include/config/auto.conf"
 		consumer     = "include/generated/timeconst.h"
 	)
 	prepProfile := CompactKbuildProfile{
@@ -6827,6 +7971,178 @@ $(obj)/%: $(obj)/%.c FORCE
 	}
 }
 
+func TestImplicitCObjectRequiresSelectedCrossProfileToolProducer(t *testing.T) {
+	const (
+		directory = "arch/x86/entry/vdso"
+		object    = directory + "/vma.o"
+		vdsoNote  = directory + "/vdso-note.o"
+		archive   = directory + "/built-in.a"
+		objtool   = "tools/objtool/objtool"
+	)
+	const vdsoSource = `
+obj = arch/x86/entry/vdso
+src = arch/x86/entry/vdso
+OBJECT_FILES_NON_STANDARD := y
+OBJECT_FILES_NON_STANDARD_vma.o := n
+basetarget = $(basename $(notdir $@))
+objtool_obj = $(if $(patsubst y%,,$(OBJECT_FILES_NON_STANDARD_$(basetarget).o)$(OBJECT_FILES_NON_STANDARD)n),$(objtree)/tools/objtool/objtool)
+objtool_dep = $(if $(filter y,$(CONFIG_STACK_VALIDATION)),$(objtool_obj))
+cmd_cc_o_c = $(CC) -c -o $@ $<
+cmd_as_o_S = $(CC) -c -o $@ $<
+cmd_ar = $(AR) rcs $@ $^
+.SECONDEXPANSION:
+$(obj)/%.o: $(src)/%.c $$(objtool_dep) FORCE
+	$(call if_changed,cc_o_c)
+$(obj)/%.o: $(src)/%.S $$(objtool_dep) FORCE
+	$(call if_changed,as_o_S)
+$(obj)/built-in.a: $(obj)/vma.o $(obj)/vdso-note.o FORCE
+	$(call if_changed,ar)
+`
+	host := mustCompactKbuildProfileForTest(t, "build:tools/objtool", "tools/objtool/Makefile", "tools/objtool", `
+cmd_host_tool = cp $< $@
+tools/objtool/objtool: tools/objtool/objtool.c FORCE
+	$(call if_changed,host_tool)
+`, nil)
+	host = compactKbuildProfileWithSourcesForTest(t, host, "tools/objtool/objtool.c")
+	vdso := mustCompactKbuildProfileForTest(t, "build:"+directory, "scripts/Makefile.build", directory, vdsoSource, map[string]string{
+		"CC": KbuildActionRoleToken("target", "cc"), "AR": KbuildActionRoleToken("target", "ar"),
+		"CONFIG_STACK_VALIDATION": "y",
+		"objtree":                 "__LINUX_BZL_OBJECT_TREE__",
+	})
+	vdso = compactKbuildProfileWithSourcesForTest(t, vdso, directory+"/vma.c", directory+"/vdso-note.S")
+	config := CompactConfig{
+		KbuildProfiles: []CompactKbuildProfile{host, vdso},
+		KbuildSelections: []CompactKbuildSelection{
+			{Profile: host.Name, Target: objtool, MakeTarget: objtool, Lifecycle: "prep", Scope: "host", Stage: "host"},
+			{Profile: vdso.Name, Target: archive, MakeTarget: archive, Lifecycle: "target", Scope: "target", Stage: "target"},
+		},
+	}
+	metadata := &CompactMetadata{Config: config, actionRoles: testConfiguredScopedActionRoles, configFragment: map[string]string{}}
+	graph, err := newCompactKbuildSelectionGraph(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: vdso.Name, target: archive}]
+	hostOwner := graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: host.Name, target: objtool}]
+	if owner, selected, err := graph.compactKbuildSelectionNativePrerequisiteOwner(consumer, objtool); err != nil || !selected || owner != hostOwner {
+		t.Fatalf("cross-profile objtool owner=%s selected=%t error=%v, want registered host %s", compactKbuildSelectionKeyString(owner), selected, err, compactKbuildSelectionKeyString(hostOwner))
+	}
+	archiveRule, archiveMatched, err := metadata.compactKbuildRuleForProfile(vdso, archive)
+	if err != nil || !archiveMatched {
+		t.Fatalf("archive rule = %#v, matched=%t, error=%v", archiveRule, archiveMatched, err)
+	}
+	archiveContext, err := evaluatedKbuildTargetMakeContext(vdso, archive, &archiveRule, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(archiveContext.normal, func(path compactKbuildEvaluatedPath) bool { return path.graphPath == object }) {
+		t.Fatalf("source archive prereqs = %#v, want vma.o", archiveContext.normal)
+	}
+	match, matched, err := metadata.compactKbuildRuleForProfile(vdso, object)
+	if err != nil || !matched {
+		t.Fatalf("source-backed vma C rule = %#v, matched=%t, error=%v", match, matched, err)
+	}
+	objectContext, err := evaluatedKbuildTargetMakeContext(vdso, object, &match, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(objectContext.normal, func(path compactKbuildEvaluatedPath) bool { return path.graphPath == objtool }) {
+		t.Fatalf("source C rule prereqs = %#v, want objtool prerequisite", objectContext.normal)
+	}
+	noteRule, noteMatched, err := metadata.compactKbuildRuleForProfile(vdso, vdsoNote)
+	if err != nil || !noteMatched {
+		t.Fatalf("source-backed vDSO assembly rule = %#v, matched=%t, error=%v", noteRule, noteMatched, err)
+	}
+	noteContext, err := evaluatedKbuildTargetMakeContext(vdso, vdsoNote, &noteRule, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(noteContext.normal, func(path compactKbuildEvaluatedPath) bool { return path.graphPath == objtool }) {
+		t.Fatalf("directory-skipped assembly unexpectedly retained objtool: %#v", noteContext.normal)
+	}
+	disabled := mustCompactKbuildProfileForTest(t, "build:"+directory, "scripts/Makefile.build", directory, vdsoSource, map[string]string{
+		"CC": KbuildActionRoleToken("target", "cc"), "AR": KbuildActionRoleToken("target", "ar"),
+		"CONFIG_STACK_VALIDATION": "n", "objtree": "__LINUX_BZL_OBJECT_TREE__",
+	})
+	disabled = compactKbuildProfileWithSourcesForTest(t, disabled, directory+"/vma.c", directory+"/vdso-note.S")
+	disabledRule, disabledMatched, err := metadata.compactKbuildRuleForProfile(disabled, object)
+	if err != nil || !disabledMatched {
+		t.Fatalf("disabled stack validation vma rule = %#v, matched=%t, error=%v", disabledRule, disabledMatched, err)
+	}
+	disabledContext, err := evaluatedKbuildTargetMakeContext(disabled, object, &disabledRule, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(disabledContext.normal, func(path compactKbuildEvaluatedPath) bool { return path.graphPath == objtool }) {
+		t.Fatalf("disabled stack validation unexpectedly retained objtool: %#v", disabledContext.normal)
+	}
+	if static, err := metadata.compactKbuildRuleMatchViableInProfile(object, match, vdso); err != nil || static {
+		t.Fatalf("unselected objtool gave static implicit rule viability=%t, error=%v", static, err)
+	}
+	dependencies, err := graph.selectionDependencies(metadata, consumer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(dependencies, hostOwner) {
+		t.Fatalf("archive dependencies = %#v, want registered objtool owner %s", dependencies, compactKbuildSelectionKeyString(hostOwner))
+	}
+	const toolProducer = "selected-host-objtool"
+	plan := &ActionPlan{Nodes: []ActionPlanNode{{ID: toolProducer, Stage: "host", Outputs: []ActionPlanOutput{{Tree: "host", Path: objtool}}}}}
+	graph.materializedProducers[hostOwner] = toolProducer
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		withSelectionGraph(graph).
+		forOutput("target", "objects", "image").
+		forSelection(consumer, vdso)
+	inputs, err := builder.ruleInputs(object, match)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(inputs, func(input compactKbuildRuleInput) bool {
+		return input.path == directory+"/vma.c" && input.sourceID != ""
+	}) || !slices.ContainsFunc(inputs, func(input compactKbuildRuleInput) bool {
+		return input.path == objtool && input.producer == toolProducer && input.slot == 0
+	}) {
+		t.Fatalf("vma inputs = %#v, want real C source and selected host objtool output slot", inputs)
+	}
+	delete(graph.materializedProducers, hostOwner)
+	if _, err := builder.ruleInputs(object, match); err == nil || !strings.Contains(err.Error(), "has not been materialized") {
+		t.Fatalf("missing selected host producer was accepted: %v", err)
+	}
+}
+
+func TestImplicitSecondExpansionFailureDoesNotChooseFallbackRule(t *testing.T) {
+	const directory = "arch/x86/entry/vdso"
+	for _, tc := range []struct {
+		name, lateValue, errorText string
+	}{
+		{name: "first prior prerequisite", lateValue: "$<", errorText: "automatic prerequisite"},
+		{name: "all prior prerequisites", lateValue: "$^", errorText: "automatic prerequisite"},
+		{name: "duplicate prior prerequisites", lateValue: "$+", errorText: "automatic prerequisite"},
+		{name: "still active reference", lateValue: "$$unbound", errorText: "retains an active reference"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			profile := mustCompactKbuildProfileForTest(t, "build:"+directory, "scripts/Makefile.build", directory, `
+obj = arch/x86/entry/vdso
+src = arch/x86/entry/vdso
+late_prereq = `+tc.lateValue+`
+cmd_primary = $(CC) -c -o $@ $<
+cmd_fallback = $(CC) -c -o $@ $<
+.SECONDEXPANSION:
+$(obj)/%.o: $(src)/%.c $$(late_prereq) FORCE
+	$(call if_changed,primary)
+$(obj)/%.o: $(src)/%.c FORCE
+	$(call if_changed,fallback)
+`, map[string]string{"CC": KbuildActionRoleToken("target", "cc")})
+			profile = compactKbuildProfileWithSourcesForTest(t, profile, directory+"/vma.c")
+			metadata := &CompactMetadata{Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}}, actionRoles: testConfiguredScopedActionRoles}
+			_, _, err := metadata.compactKbuildRuleForProfile(profile, directory+"/vma.o")
+			if err == nil || !strings.Contains(err.Error(), tc.errorText) || !strings.Contains(err.Error(), "scripts/Makefile.build:") {
+				t.Fatalf("unsupported first implicit rule selected fallback or lost source span: %v", err)
+			}
+		})
+	}
+}
+
 func TestCompactKbuildProfileTargetPathStripsInvocationTreeMarkers(t *testing.T) {
 	profile := CompactKbuildProfile{Directory: "arch/x86/kernel"}
 	for input, want := range map[string]string{
@@ -6952,6 +8268,322 @@ func TestGenericKbuildRecipeErasesValidatedOutputDirectorySetup(t *testing.T) {
 	}
 }
 
+func TestKbuildSelectedOutputParentSetupKeepsRecipeLineBoundaries(t *testing.T) {
+	const target = "tools/objtool/fixdep.o"
+	profile := mustCompactKbuildProfileForTest(t, "build:host", "tools/build/Makefile.build", "", `
+tools/objtool/fixdep.o: FORCE
+	$(call rule_mkdir)
+`, nil)
+	match := compactKbuildRuleMatch{
+		profile: profile, rule: profile.Rules[0], ruleOrder: 0,
+		lookupTarget: target, resolved: true, explicit: true,
+	}
+	for _, check := range []struct {
+		name, line string
+		want       bool
+	}{
+		{"selected status and output parent", "@echo '  MKDIR     '${tree:prep}/tools/objtool/; mkdir -p ${tree:prep}/tools/objtool/", true},
+		{"no status message", "mkdir -p __LINUX_BZL_OBJECT_TREE__/tools/objtool/", true},
+		{"different parent", "mkdir -p ${tree:prep}/tools/peer/", false},
+		{"immutable source parent", "mkdir -p ${tree:kernel}/tools/objtool/", false},
+		{"another filesystem operation", "mkdir -p ${tree:prep}/tools/objtool/; cat ${tree:prep}/input", false},
+		{"status feeds a pipe", "echo '${tree:prep}/input' | sh; mkdir -p ${tree:prep}/tools/objtool/", false},
+		{"active substitution", "echo $(cat ${tree:prep}/input); mkdir -p ${tree:prep}/tools/objtool/", false},
+		{"glob", "mkdir -p ${tree:prep}/tools/objtool/*", false},
+		{"status writes output", "echo ready > ${tree:prep}/other; mkdir -p ${tree:prep}/tools/objtool/", false},
+	} {
+		t.Run(check.name, func(t *testing.T) {
+			got, err := compactKbuildSelectedOutputParentSetupTemplate(
+				target, match, check.line, compactKbuildAutomaticContext{target: target},
+			)
+			if err != nil || got != check.want {
+				t.Fatalf("selected setup = %t, error = %v, want %t for %q", got, err, check.want, check.line)
+			}
+		})
+	}
+}
+
+func TestKbuildSelectedOutputParentSetupKeepsCompilerSourceLineSnapshot(t *testing.T) {
+	const target = "tools/objtool/fixdep-in.o"
+	const marker = "__LINUX_BZL_OBJECT_TREE__/tools/objtool/line.flag"
+	profile, _, _ := selectedControlTestProfile(t, `
+Q = $(if $(wildcard $(objtree)/tools/objtool/line.flag),after,before)
+cmd_mkdir = echo '  MKDIR     '$(objtree)/$(dir $@)' '$(Q); mkdir -p $(objtree)/$(dir $@)
+cmd_compile = printf '%s' $(Q) > $@
+tools/objtool/fixdep-in.o: FORCE
+	$(cmd_mkdir)
+	$(cmd_compile)
+`)
+	artifact := KbuildControlReadArtifact{
+		Tree: CompactKbuildInvocationObjectTree, Identity: "root/fixdep-in/line.flag",
+		Version: "sha256:after-setup", Producer: CompactKbuildVisibleArtifact{
+			Path: "tools/objtool/line.flag", Profile: profile.Name, Target: "writer",
+		},
+	}
+	before := selectedControlTestFrontier("source-setup-before-writer", selectedControlTestFiles{}, artifact)
+	after := selectedControlTestFrontier("source-compiler-after-writer", selectedControlTestFiles{
+		files:   map[string]testKbuildVirtualFile{marker: {content: "created\n", exact: true}},
+		matches: map[string][]string{marker: {marker}},
+	}, artifact)
+	stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget(target, target, ""); err != nil {
+		t.Fatal(err)
+	}
+	ruleIndex := selectedControlTestRuleIndex(t, profile, target)
+	for index, frontier := range []KbuildControlRecipeFrontier{before, after} {
+		line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+			Target: target, RuleIndex: ruleIndex, RecipeIndex: index,
+		}, frontier)
+		if err != nil {
+			t.Fatal(err)
+		}
+		quality, err := EvaluateCompactKbuildText(line.Evaluation.Profile, target, "", nil, nil, nil, "$(Q)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "before"
+		if index == 1 {
+			want = "after"
+		}
+		if quality != want {
+			t.Fatalf("source recipe %d value = %q, want %q", index, quality, want)
+		}
+		if err := stepper.ApplyRecipe(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evaluation, err := stepper.Finish(after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	match := compactKbuildRuleMatch{
+		profile: evaluation.Profile, rule: evaluation.Profile.Rules[ruleIndex], ruleOrder: ruleIndex,
+		lookupTarget: target, explicit: true, resolved: true,
+	}
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil || len(snapshots) != 2 || snapshots[0].ReadIdentity() == snapshots[1].ReadIdentity() {
+		t.Fatalf("source setup/compile immutable snapshots = %#v, error %v", snapshots, err)
+	}
+	context := compactKbuildAutomaticContext{target: target}
+	selections, indexes, err := evaluatedKbuildRuleCommandSelectionsBySourceLine(target, match, context, nil, true)
+	if err != nil || len(selections) != 2 || !slices.Equal(indexes, []int{0, 1}) {
+		t.Fatalf("source setup/compile selections = %#v, indexes %#v, error %v", selections, indexes, err)
+	}
+	rooted := make([]string, len(selections))
+	for occurrence, selected := range selections {
+		rooted[occurrence], err = compactKbuildRootedActionDirectRecipeText(
+			snapshots[indexes[occurrence]].Evaluation.Profile, selected.Text,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	remaining, line, proven, err := compactKbuildSelectedOutputParentSetupOccurrences(
+		target, match, rooted, indexes, snapshots, context, nil,
+	)
+	if err != nil || !proven || line != 1 || !slices.Equal(remaining, []int{1}) ||
+		!slices.Equal(indexes, []int{0, 1}) || len(snapshots) != 2 ||
+		!strings.Contains(rooted[1], "after") || strings.Contains(rooted[1], "before") {
+		t.Fatalf("source setup projection = occurrence %#v, active line %d, proven %t, error %v; source indexes %#v, selected rooted lines %#v", remaining, line, proven, err, indexes, rooted)
+	}
+	unsafe := slices.Clone(rooted)
+	unsafe[0] += "; cat ${tree:prep}/other"
+	if _, _, proven, err := compactKbuildSelectedOutputParentSetupOccurrences(
+		target, match, unsafe, indexes, snapshots, context, nil,
+	); err != nil || proven {
+		t.Fatalf("source setup with extra read was elided: proven %t, error %v", proven, err)
+	}
+}
+
+func TestSelectedKbuildDirectAwkKeepsOutputParentSetupAndSourceInputs(t *testing.T) {
+	const target = "tools/objtool/arch/x86/lib/inat-tables.c"
+	const parent = "__LINUX_BZL_OBJECT_TREE__/tools/objtool/arch/x86/lib/"
+	const script = "tools/arch/x86/tools/gen-insn-attr-x86.awk"
+	const opcodeMap = "tools/arch/x86/lib/x86-opcode-map.txt"
+	for _, parentExists := range []bool{false, true} {
+		name := "parent-absent"
+		if parentExists {
+			name = "parent-present"
+		}
+		t.Run(name, func(t *testing.T) {
+			profile, sourceRoot, _ := selectedControlTestProfile(t, `
+AWK = `+KbuildActionRoleToken("host", "awk")+`
+rule_mkdir = $(if $(wildcard $(objtree)/$(dir $@)),,@echo '  MKDIR    '$(objtree)/$(dir $@); mkdir -p $(objtree)/$(dir $@))
+inat_tables_script = ../arch/x86/tools/gen-insn-attr-x86.awk
+inat_tables_maps = ../arch/x86/lib/x86-opcode-map.txt
+tools/objtool/arch/x86/lib/inat-tables.c: $(inat_tables_script) $(inat_tables_maps)
+	$(call rule_mkdir)
+	@$(AWK) -f $(inat_tables_script) $(inat_tables_maps) > $@
+`)
+			for _, path := range []string{script, opcodeMap} {
+				mustWriteSource(t, sourceRoot, path, "declared input\n")
+			}
+			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+				Tree: CompactKbuildInvocationObjectTree, Directory: "tools/objtool",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			beforeFiles := selectedControlTestFiles{}
+			if parentExists {
+				beforeFiles.files = map[string]testKbuildVirtualFile{parent: {content: "present", exact: true}}
+				beforeFiles.matches = map[string][]string{parent: {parent}}
+			}
+			artifact := KbuildControlReadArtifact{
+				Tree: CompactKbuildInvocationObjectTree, Identity: "test:output-parent",
+				Version: "sha256:output-parent-membership",
+			}
+			before := selectedControlTestFrontier("before-direct-awk", beforeFiles, artifact)
+			after := selectedControlTestFrontier("after-directory-setup", selectedControlTestFiles{}, artifact)
+			stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stepper.BeginTarget(target, target, ""); err != nil {
+				t.Fatal(err)
+			}
+			ruleIndex := selectedControlTestRuleIndex(t, profile, target)
+			for recipeIndex, frontier := range []KbuildControlRecipeFrontier{before, after} {
+				line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+					Target: target, RuleIndex: ruleIndex, RecipeIndex: recipeIndex,
+				}, frontier)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if recipeIndex == 0 {
+					setup, err := EvaluateCompactKbuildText(line.Evaluation.Profile, target, "", nil, nil, nil, "$(call rule_mkdir)")
+					if err != nil || (setup == "") != parentExists {
+						t.Fatalf("source-selected output-parent command = %q, error %v, present %t", setup, err, parentExists)
+					}
+				}
+				if err := stepper.ApplyRecipe(line); err != nil {
+					t.Fatal(err)
+				}
+			}
+			evaluation, err := stepper.Finish(after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			match := compactKbuildRuleMatch{
+				profile: evaluation.Profile, rule: evaluation.Profile.Rules[ruleIndex], ruleOrder: ruleIndex,
+				lookupTarget: target, explicit: true, resolved: true,
+			}
+			snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+			if err != nil || len(snapshots) != 2 || snapshots[0].ReadIdentity() == snapshots[1].ReadIdentity() {
+				t.Fatalf("direct AWK line views = %#v, error %v", snapshots, err)
+			}
+			metadata := &CompactMetadata{
+				actionRoles: testScopedActionRoles("awk"),
+				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
+			}
+			plan := &ActionPlan{
+				Toolsets: map[string]string{"host": actionPlanTestProbeIdentity, "target": actionPlanTestProbeIdentity},
+				Recipes:  map[string]ActionRecipe{}, metadata: metadata,
+			}
+			builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+				forProfile(evaluation.Profile).forOutput("host", "host", "sdk")
+			producer, err := builder.build(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			node, ok := compactKbuildPlanNode(plan, producer)
+			if !ok || node.Tool != compactKbuildScriptRunnerRole ||
+				!slices.Contains(node.AuxiliaryTools, "awk") || len(node.Sources) != 2 ||
+				len(node.Outputs) != 1 ||
+				node.Outputs[0] != (ActionPlanOutput{Tree: "host", Path: target}) {
+				t.Fatalf("selected direct AWK producer = %#v, found %t", node, ok)
+			}
+			actualSources := make(map[string]bool, len(node.Sources))
+			for _, edge := range node.Sources {
+				for _, declared := range plan.Sources {
+					if edge.SourceID == declared.ID && edge.Role == "prerequisite" {
+						actualSources[declared.Path] = true
+					}
+				}
+			}
+			if !actualSources[script] || !actualSources[opcodeMap] || len(actualSources) != 2 {
+				t.Fatalf("selected AWK immutable source closure = %#v, want %q and %q", actualSources, script, opcodeMap)
+			}
+			recipe := plan.Recipes[node.Recipe]
+			text := compactKbuildRecipeScriptContentForTest(t, recipe)
+			if !strings.Contains(text, "-f") || !strings.Contains(text, "gen-insn-attr-x86.awk") ||
+				!strings.Contains(text, "x86-opcode-map.txt") || !strings.Contains(text, target) ||
+				strings.Contains(text, "MKDIR") || strings.Contains(text, "mkdir -p") {
+				t.Fatalf("direct AWK command retained setup or lost source operands: %q", text)
+			}
+			if err := plan.WriteStages(actionPlanStageOutputsForTest(filepath.Join(t.TempDir(), "plan"))); err != nil {
+				t.Fatalf("selected direct AWK plan: %v", err)
+			}
+		})
+	}
+}
+
+func TestSelectedKbuildSetupRejectsMakeExpansionEffects(t *testing.T) {
+	const target = "tools/objtool/arch/x86/lib/inat-tables.c"
+	for _, check := range []struct {
+		name, recipe, evaluated string
+	}{
+		{"empty shell", "$(shell printf touched > $(objtree)/other)", ""},
+		{"mkdir hiding shell", "$(cmd_shell)", "mkdir -p __LINUX_BZL_OBJECT_TREE__/tools/objtool/arch/x86/lib/"},
+		{"mkdir hiding Make file write", "$(cmd_file)", "mkdir -p __LINUX_BZL_OBJECT_TREE__/tools/objtool/arch/x86/lib/"},
+	} {
+		t.Run(check.name, func(t *testing.T) {
+			profile, _, objectRoot := selectedControlTestProfile(t, `
+cmd_shell = $(shell printf touched > $(objtree)/other) mkdir -p $(objtree)/$(dir $@)
+cmd_file = $(file >$(objtree)/other,touched) mkdir -p $(objtree)/$(dir $@)
+tools/objtool/arch/x86/lib/inat-tables.c:
+	`+check.recipe+`
+	printf data > $@
+`)
+			stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stepper.BeginTarget(target, target, ""); err != nil {
+				t.Fatal(err)
+			}
+			ruleIndex := selectedControlTestRuleIndex(t, profile, target)
+			frontier := selectedControlTestFrontier("source-make-effect", selectedControlTestFiles{}, KbuildControlReadArtifact{})
+			for recipeIndex := 0; recipeIndex < 2; recipeIndex++ {
+				line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+					Target: target, RuleIndex: ruleIndex, RecipeIndex: recipeIndex,
+				}, frontier)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := stepper.ApplyRecipe(line); err != nil {
+					t.Fatal(err)
+				}
+			}
+			evaluation, err := stepper.Finish(frontier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			match := compactKbuildRuleMatch{
+				profile: evaluation.Profile, rule: evaluation.Profile.Rules[ruleIndex], ruleOrder: ruleIndex,
+				lookupTarget: target, explicit: true, resolved: true,
+			}
+			snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+			if err != nil || len(snapshots) != 2 {
+				t.Fatalf("selected stateful recipe = %#v, error %v", snapshots, err)
+			}
+			// GNU Make may write another file while forming a command that looks
+			// like mkdir, or may print no command at all. Check the source first.
+			if _, _, proven, err := compactKbuildSelectedOutputParentSetupOccurrences(
+				target, match, []string{check.evaluated, "printf data > " + target}, []int{0, 1}, snapshots,
+				compactKbuildAutomaticContext{target: target}, nil,
+			); err != nil || proven {
+				t.Fatalf("source Make effect was elided: proven %t, error %v", proven, err)
+			}
+			if _, err := os.Stat(filepath.Join(objectRoot, "other")); !os.IsNotExist(err) {
+				t.Fatalf("setup proof executed hidden Make effect: %v", err)
+			}
+		})
+	}
+}
+
 func TestKbuildRecipeDirectorySetupCanonicalizesEvaluatedTreePath(t *testing.T) {
 	command := compactKbuildRecipeCommand{
 		program:   "mkdir",
@@ -6963,6 +8595,11 @@ func TestKbuildRecipeDirectorySetupCanonicalizesEvaluatedTreePath(t *testing.T) 
 	}
 	if !setup {
 		t.Fatal("evaluated mkdir was not recognized as directory setup")
+	}
+	command.arguments[1] = "${tree:prep}/arch/x86/boot/compressed/.."
+	if setup, err := compactKbuildRecipeDirectorySetup(command); err == nil || setup ||
+		!strings.Contains(err.Error(), "unmodeled parent traversal") {
+		t.Fatalf("lexical mkdir traversal = (%t, %v), want unmodeled directory effects", setup, err)
 	}
 }
 
@@ -7078,6 +8715,8 @@ func TestGeneratedArchiveWrapperRunsInTypedWorkingTree(t *testing.T) {
 		object    = directory + "/one.o"
 	)
 	profile := mustCompactKbuildProfileForTest(t, "build:"+directory, "scripts/Makefile.build", directory, `
+PHONY += FORCE
+.PHONY: $(PHONY)
 real-prereqs = $(filter-out FORCE,$^)
 cmd_ar = $(AR_WRAPPER) $@ $(real-prereqs)
 $(obj)/built-in.a: $(obj)/one.o FORCE
@@ -7254,6 +8893,8 @@ func TestGenericKbuildArchivePreservesObjPatsubstAutomaticVariableSemantics(t *t
 	)
 	prerequisites := []string{directory + "/cmdline.o", directory + "/nested.o"}
 	profile := mustCompactKbuildProfileForTest(t, "build:"+directory, "scripts/Makefile.build", directory, `
+PHONY += FORCE
+.PHONY: $(PHONY)
 real-prereqs = $(filter-out FORCE,$^)
 cmd_ar_builtin = rm -f $@; $(if $(real-prereqs), printf "$(obj)/%s " $(patsubst $(obj)/%,%,$(real-prereqs)) | xargs) $(AR) cDPrST $@
 $(obj)/built-in.a: $(obj)/cmdline.o $(obj)/nested.o FORCE
@@ -7566,7 +9207,7 @@ cmd_ld = $(LD) -r -o $@ --whole-archive $< --no-whole-archive
 
 func TestKbuildThinArchiveClosureExcludesIncidentalConfigSource(t *testing.T) {
 	const (
-		configPath       = "include/config/kernel.release"
+		configPath       = "include/config/auto.conf"
 		archivePath      = "arch/x86/built-in.a"
 		sourceMemberPath = "arch/x86/prebuilt.o"
 		consumer         = "vmlinux.o"
@@ -7575,7 +9216,7 @@ func TestKbuildThinArchiveClosureExcludesIncidentalConfigSource(t *testing.T) {
 	memberSourceID := "src-member"
 	plan := &ActionPlan{
 		Sources: []ActionPlanSource{
-			{ID: configSourceID, Namespace: "config", Path: "kernel.release"},
+			{ID: configSourceID, Namespace: "config", Path: "auto.conf"},
 			{ID: memberSourceID, Namespace: "kernel", Path: sourceMemberPath},
 		},
 		Recipes: map[string]ActionRecipe{},
@@ -8243,7 +9884,7 @@ dummy := y
 	if err != nil {
 		t.Fatal(err)
 	}
-	ambientConfigSourceID, err := ensureActionPlanSource(plan, "config", "kernel.release")
+	ambientConfigSourceID, err := ensureActionPlanSource(plan, "config", "auto.conf.cmd")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -8383,7 +10024,7 @@ dummy := y
 		{path: fixdep, producer: fixdepProducer},
 		{path: objtool, producer: objtoolProducer},
 		{path: "include/generated/autoconf.h", sourceID: configSourceID, objectTree: true, workingOnly: true},
-		{path: "include/config/kernel.release", sourceID: ambientConfigSourceID, objectTree: true, workingOnly: true},
+		{path: "include/config/auto.conf.cmd", sourceID: ambientConfigSourceID, objectTree: true, workingOnly: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -8425,8 +10066,8 @@ dummy := y
 			SourceID:    configSourceID,
 			CompilerUse: true,
 		},
-		"include/config/kernel.release": {
-			Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "include/config/kernel.release"},
+		"include/config/auto.conf.cmd": {
+			Target:   ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "include/config/auto.conf.cmd"},
 			SourceID: ambientConfigSourceID,
 		},
 	} {
@@ -8435,8 +10076,8 @@ dummy := y
 			t.Errorf("compiler persistent input for %q = (%#v, %t), want %#v", pathname, got, found, want)
 		}
 	}
-	if usedWorkingPaths["include/config/kernel.release"] {
-		t.Errorf("compiler dependency working-input projection retained ambient kernel release: %#v", usedWorkingPaths)
+	if usedWorkingPaths["include/config/auto.conf.cmd"] {
+		t.Errorf("compiler dependency working-input projection retained ambient config command file: %#v", usedWorkingPaths)
 	}
 	auxiliaryWorkingPaths := map[string]bool{}
 	for _, reference := range compileRecipe.CompilerInvocation.AuxiliaryWorkingInputUses {
@@ -8784,6 +10425,153 @@ func TestGenericKbuildCmdAndFixdepRepublishesRequiredSideOutputFinalState(t *tes
 				t.Fatalf("invalid final producer/slot ownership: %v", err)
 			}
 		})
+	}
+}
+
+func TestKbuildCmdAndFixdepSplitKeepsDistinctSourceStageOutputsAndObservedFrontiers(t *testing.T) {
+	const (
+		target  = "drivers/example/foo.o"
+		source  = "drivers/example/foo.c"
+		fixdep  = "scripts/basic/fixdep"
+		depfile = "drivers/example/.foo.o.d"
+		cmdfile = "drivers/example/.foo.o.cmd"
+	)
+	const objectRoot = "__LINUX_BZL_OBJECT_TREE__/"
+	profile := mustCompactKbuildProfileForTest(t, "build:source-steps", "scripts/Makefile.build", "drivers/example", `
+cmd_cc_o_c = $(CC) -Wp,-MMD,$(objtree)/drivers/example/.foo.o.d -fstack-usage -c -o $(objtree)/drivers/example/foo.o $(srctree)/drivers/example/foo.c; $(objtree)/scripts/basic/fixdep $(objtree)/drivers/example/.foo.o.d $(objtree)/drivers/example/foo.o 'saved command' > $(objtree)/drivers/example/.foo.o.cmd; rm -f $(objtree)/drivers/example/.foo.o.d
+cmd_status1 = echo first >> $(objtree)/drivers/example/.foo.o.cmd
+cmd_status2 = echo second >> $(objtree)/drivers/example/.foo.o.cmd
+cmd_status3 = echo third >> $(objtree)/drivers/example/.foo.o.cmd
+drivers/example/foo.o: drivers/example/foo.c FORCE
+	$(cmd_cc_o_c)
+	$(cmd_status1)
+	$(cmd_status2)
+	$(cmd_status3)
+`, map[string]string{
+		"CC":      KbuildActionRoleToken("target", "cc"),
+		"objtree": "__LINUX_BZL_OBJECT_TREE__",
+		"srctree": "__LINUX_BZL_SOURCE_TREE__",
+	})
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: "drivers/example",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+		actionContracts: map[KbuildActionRoleRef]CompactKbuildActionContract{
+			{Scope: "target", Role: "cc"}: {},
+		},
+	}
+	plan := &ActionPlan{
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity},
+		Recipes:  map[string]ActionRecipe{}, metadata: metadata,
+	}
+	fixdepProducer, err := appendActionPlanNode(plan, ActionPlanNode{
+		Stage: "host", Kind: "generate", Tool: "actionfile", Product: "sdk",
+		Outputs: []ActionPlanOutput{{Tree: "host", Path: fixdep}},
+	}, ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
+		Arguments: []string{"-out", "${output:00000000}", "-content_base64", ""}, Outputs: []string{"00000000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID, err := metadata.ensureActionPlanSource(plan, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := KbuildActionRoleToken("target", "cc") +
+		" -Wp,-MMD," + objectRoot + depfile + " -fstack-usage -c -o " + objectRoot + target +
+		" __LINUX_BZL_SOURCE_TREE__/" + source + "; " + objectRoot + fixdep +
+		" " + objectRoot + depfile + " " + objectRoot + target +
+		" 'saved command' > " + objectRoot + cmdfile + "; rm -f " + objectRoot + depfile
+	rootedTemplates := []string{first,
+		"echo first >> " + objectRoot + cmdfile,
+		"echo second >> " + objectRoot + cmdfile,
+		"echo third >> " + objectRoot + cmdfile,
+	}
+	for index, text := range rootedTemplates {
+		rootedTemplates[index], err = compactKbuildRootedActionDirectRecipeText(profile, text)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ruleIndex := selectedControlTestRuleIndex(t, profile, target)
+	match := compactKbuildRuleMatch{
+		profile: profile, rule: profile.Rules[ruleIndex], ruleOrder: ruleIndex,
+		lookupTarget: target, explicit: true,
+	}
+	automatic := compactKbuildAutomaticContext{target: target}
+	firstCommands := compactKbuildFinalizeRootedActionRecipeText(rootedTemplates[0])
+	split, eligible := compactKbuildCmdAndFixdepRecipeSplit(target, match, firstCommands, rootedTemplates[0], automatic)
+	if !eligible {
+		t.Fatalf("source compiler/fixdep first line is not eligible for an atomic split: %q", rootedTemplates[0])
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		forOutput("target", "objects", "vmlinux").forProfile(profile)
+	builder, err = builder.forObservedOutputs(target, []compactKbuildObservedOutput{{
+		output: ActionPlanOutput{Tree: "metadata", Path: ".captures/source-steps.state"},
+		path:   "drivers/example/opaque.side-effect",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, err := builder.buildCompactKbuildCmdAndFixdepSplit(
+		target, match,
+		[]compactKbuildRuleInput{{path: source, sourceID: sourceID}, {path: fixdep, producer: fixdepProducer}},
+		[]compactKbuildRuleInput{{path: source, sourceID: sourceID}, {path: fixdep, producer: fixdepProducer}},
+		rootedTemplates, []int{0, 1, 2, 3}, nil, automatic, split,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 5 || plan.Nodes[4].ID != producer {
+		t.Fatalf("ordered source split has %#v nodes and producer %q, want seed plus four stages", plan.Nodes, producer)
+	}
+	ordinaryPaths := map[string]bool{}
+	observedPaths := map[string]bool{}
+	previousProducer, previousSlot := "", -1
+	for ordinal, node := range plan.Nodes[1:] {
+		ordinary := slices.IndexFunc(node.Outputs, func(output ActionPlanOutput) bool {
+			return output.Path == target && output.ObservedPath == ""
+		})
+		state := slices.IndexFunc(node.Outputs, func(output ActionPlanOutput) bool {
+			return output.ObservedPath == "drivers/example/opaque.side-effect"
+		})
+		if ordinary < 0 || state < 0 {
+			t.Fatalf("source stage %d omitted target or observed state: %#v", ordinal, node.Outputs)
+		}
+		physical := actionPlanOutputArtifactPath(node.Outputs[ordinary])
+		statePath := actionPlanOutputArtifactPath(node.Outputs[state])
+		if ordinaryPaths[physical] || observedPaths[statePath] ||
+			ordinal < 3 && (!strings.HasPrefix(physical, ".linux-bzl-intermediate/") ||
+				!strings.HasPrefix(statePath, compactKbuildSideOutputStateDirectory+"/commands/")) ||
+			ordinal == 3 && (physical != target || statePath != ".captures/source-steps.state") {
+			t.Fatalf("source stage %d aliases private/final output identity: target %q, state %q", ordinal, physical, statePath)
+		}
+		ordinaryPaths[physical] = true
+		observedPaths[statePath] = true
+		if ordinal != 0 {
+			recipe := plan.Recipes[node.Recipe]
+			bases := recipe.ObservedOutputBases[planOrdinal(state)]
+			if len(bases) != 1 {
+				t.Fatalf("source stage %d observed bases = %#v, want one predecessor state", ordinal, bases)
+			}
+			input := slices.Index(recipe.Inputs, bases[0])
+			if input < 0 || input >= len(node.Inputs) ||
+				node.Inputs[input].Role != "observed-state" ||
+				node.Inputs[input].ProducerID != previousProducer ||
+				node.Inputs[input].Slot != previousSlot {
+				t.Fatalf("source stage %d observed predecessor = input %d, node %#v, want %s slot %d", ordinal, input, node.Inputs, previousProducer, previousSlot)
+			}
+		}
+		previousProducer, previousSlot = node.ID, state
+	}
+	if _, err := plan.entries(); err != nil {
+		t.Fatalf("ordered source stage plan has invalid output ownership: %v", err)
 	}
 }
 
@@ -9273,7 +11061,7 @@ func TestHermeticKbuildSingleDriverLinkIsTypedCompile(t *testing.T) {
 	const (
 		target  = "scripts/basic/fixdep"
 		source  = "scripts/basic/fixdep.c"
-		ambient = "include/config/kernel.release"
+		ambient = "include/config/auto.conf.cmd"
 	)
 	profile := mustCompactKbuildProfileForTest(t, "host:fixdep-link", "scripts/Makefile.host", "", `
 scripts/basic/fixdep: scripts/basic/fixdep.c FORCE
@@ -9297,7 +11085,7 @@ scripts/basic/fixdep: scripts/basic/fixdep.c FORCE
 	if err != nil {
 		t.Fatal(err)
 	}
-	ambientID, err := ensureActionPlanSource(plan, "config", "kernel.release")
+	ambientID, err := ensureActionPlanSource(plan, "config", "auto.conf.cmd")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -10711,6 +12499,77 @@ arch/x86/include/generated/asm/cpufeaturemasks.h: arch/x86/tools/cpufeaturemasks
 	}
 }
 
+func TestSelectedDirectFilechkUsesItsOwnRecipeLineSnapshot(t *testing.T) {
+	const target = "arch/x86/include/generated/asm/cpufeaturemasks.h"
+	const script = "arch/x86/tools/cpufeaturemasks.awk"
+	const header = "arch/x86/include/asm/cpufeatures.h"
+	profile, sourceRoot, _ := selectedControlTestProfile(t, `
+export PHASE = $(if $(wildcard $(objtree)/arch/x86/line.flag),after,before)
+filechk_gen_featuremasks = $(AWK) -f arch/x86/tools/cpufeaturemasks.awk arch/x86/include/asm/cpufeatures.h
+arch/x86/include/generated/asm/cpufeaturemasks.h: arch/x86/tools/cpufeaturemasks.awk arch/x86/include/asm/cpufeatures.h FORCE
+	$(shell mkdir -p $(dir $@))
+	$(call filechk,gen_featuremasks)
+`, map[string]string{"AWK": KbuildActionRoleToken("target", "awk")})
+	mustWriteSource(t, sourceRoot, script, projectedGeneratorTestAWK)
+	mustWriteSource(t, sourceRoot, header, "#define X86_FEATURE_TEST 1\n")
+	stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget(target, target, ""); err != nil {
+		t.Fatal(err)
+	}
+	ruleIndex := selectedControlTestRuleIndex(t, profile, target)
+	for index, name := range []string{"before-parent-setup", "before-filechk"} {
+		line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+			Target: target, RuleIndex: ruleIndex, RecipeIndex: index,
+		}, selectedControlTestFrontier(name, selectedControlTestFiles{}, KbuildControlReadArtifact{}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stepper.ApplyRecipe(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evaluation, err := stepper.Finish(selectedControlTestFrontier(
+		"after-filechk", selectedControlTestFiles{}, KbuildControlReadArtifact{},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := CompactKbuildSelectedControlRecipeSnapshots(evaluation.Profile, target)
+	if len(snapshots) != 2 || snapshots[0].ReadIdentity() == snapshots[1].ReadIdentity() {
+		t.Fatalf("selected setup and filechk line read identities = %#v", snapshots)
+	}
+	if _, err := EvaluateCompactKbuildTarget(evaluation.Profile, target, "", nil, nil, nil, "PHASE"); err == nil || !strings.Contains(err.Error(), "different file reads") {
+		t.Fatalf("target-wide environment error = %v, want selected line requirement", err)
+	}
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
+	}
+	plan := &ActionPlan{
+		Recipes: map[string]ActionRecipe{}, metadata: metadata,
+		Toolsets: map[string]string{"target": actionPlanTestProbeIdentity, "host": actionPlanTestProbeIdentity},
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		forProfile(evaluation.Profile).forOutput("prep", "prep", "sdk")
+	producer, err := builder.build(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, found := compactKbuildPlanNode(plan, producer)
+	if !found || node.Tool != "awk" || len(node.Outputs) != 1 || node.Outputs[0].Path != target {
+		t.Fatalf("source-selected filechk producer = %#v, found %t", node, found)
+	}
+	if got := plan.Recipes[node.Recipe].Environment["PHASE"]; got != "before" {
+		t.Fatalf("selected filechk line environment PHASE = %q, want before", got)
+	}
+	if err := plan.WriteStages(actionPlanStageOutputsForTest(filepath.Join(t.TempDir(), "plan"))); err != nil {
+		t.Fatalf("source-selected filechk action plan: %v", err)
+	}
+}
+
 func TestGenericKbuildDirectRecipeErasesShellDirectorySetup(t *testing.T) {
 	profile := mustCompactKbuildProfileForTest(t, "host:generated", "scripts/host.mk", "", `
 generated-tool: input.c FORCE
@@ -11508,6 +13367,32 @@ func TestGenericKbuildRecipeLowersLiteralScalarPipeline(t *testing.T) {
 	}
 }
 
+func TestGenericKbuildLiteralFilechkRejectsActiveShellSyntax(t *testing.T) {
+	for _, test := range []struct {
+		name, source string
+		literal      bool
+	}{
+		{name: "single quoted substitutions", source: "echo 'literal $(touch unexpected) `touch unexpected`'", literal: true},
+		{name: "double quoted command substitution", source: `echo "$(touch unexpected)"`},
+		{name: "double quoted backticks", source: "echo \"`touch unexpected`\""},
+		{name: "unquoted backticks", source: "echo `touch unexpected`"},
+		{name: "escaped backticks", source: "echo \\`literal\\`", literal: true},
+		{name: "backticks in condition result", source: "if [ x = \"`touch unexpected`\" ]; then echo unsafe; fi"},
+		{name: "inactive backticks resembling length proof", source: "if [ \\`echo -n 1 | wc -c \\` -gt 0 ]; then echo unsafe; fi"},
+		{name: "length proof then active echo", source: "if [ `echo -n 1 | wc -c ` -gt 0 ]; then echo \"`touch unexpected`\"; fi"},
+		{name: "nested backticks in length payload", source: "if [ `echo -n \"`touch unexpected`\" | wc -c ` -gt 0 ]; then echo unsafe; fi"},
+		{name: "backticks in scalar payload", source: "scalar=$(echo \"`touch unexpected`\" | cut -b -2); echo ${scalar}"},
+		{name: "command substitution in scalar payload", source: `scalar=$(echo "$(touch unexpected)" | cut -b -2); echo ${scalar}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, literal, err := parseCompactKbuildLiteralFilechk(test.source, compactKbuildAutomaticContext{})
+			if err != nil || literal != test.literal {
+				t.Fatalf("literal filechk %q = (%t, %v), want literal=%t", test.source, literal, err, test.literal)
+			}
+		})
+	}
+}
+
 func TestGenericKbuildRecipeLowersUtsreleaseLengthGuardWithoutShell(t *testing.T) {
 	makefile := strings.ReplaceAll(`
 KERNELRELEASE = 6.18.39-test
@@ -11543,6 +13428,763 @@ include/generated/utsrelease.h: FORCE
 	want := "#define UTS_RELEASE \"6.18.39-test\""
 	if got := slices.Index(recipe.Arguments, "-line"); got < 0 || got+1 == len(recipe.Arguments) || recipe.Arguments[got+1] != want {
 		t.Fatalf("literal filechk arguments=%q, want line %q", recipe.Arguments, want)
+	}
+}
+
+func TestSelectedKbuildFilechkReadBindsExactSourceWriter(t *testing.T) {
+	const (
+		release  = "include/config/kernel.release"
+		header   = "include/generated/utsrelease.h"
+		readPath = "__LINUX_BZL_OBJECT_TREE__/include/config/kernel.release"
+	)
+	for _, test := range []struct {
+		name, content, wantError string
+		exact                    bool
+		ambiguous                bool
+	}{
+		{name: "exact selected writer", content: "6.18.39-virtual\n", exact: true},
+		{name: "opaque writer", content: "6.18.39-virtual\n", wantError: "opaque"},
+		{name: "ambiguous owner", content: "6.18.39-virtual\n", exact: true, ambiguous: true, wantError: "ambiguous"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile, _, objectRoot := selectedControlTestProfile(t, `
+KERNELRELEASE = $(file < $(objtree)/include/config/kernel.release)
+define filechk_utsrelease.h
+	echo \#define UTS_RELEASE \"$(KERNELRELEASE)\"
+endef
+all: include/config/kernel.release include/generated/utsrelease.h
+include/config/kernel.release: FORCE
+	@printf '6.18.39-virtual\n' > $@
+include/generated/utsrelease.h: FORCE
+	$(call filechk,utsrelease.h)
+.PHONY: FORCE
+FORCE:
+`)
+			physical := filepath.Join(objectRoot, "include", "config", "kernel.release")
+			if err := os.WriteFile(physical, []byte("6.18.39-stale-host\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			selectedWriter := CompactKbuildVisibleArtifact{Path: release, Profile: profile.Name, Target: release}
+			readOwner := KbuildControlReadArtifact{
+				Tree:     CompactKbuildInvocationObjectTree,
+				Identity: "root/release-writer", Version: "sha256/exact-release",
+				Producer: selectedWriter,
+			}
+			files := selectedControlTestFiles{files: map[string]testKbuildVirtualFile{
+				readPath: {content: test.content, exact: test.exact},
+			}}
+			frontier := selectedControlTestFrontier("after-writer", files, readOwner)
+			if test.ambiguous {
+				frontier.ResolveArtifact = func(string) (KbuildControlReadArtifact, bool, error) {
+					return KbuildControlReadArtifact{}, false, fmt.Errorf("ambiguous selected release owners")
+				}
+			}
+			stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stepper.BeginTarget("all", "all", ""); err != nil {
+				t.Fatal(err)
+			}
+			for _, selected := range []struct {
+				target   string
+				frontier KbuildControlRecipeFrontier
+			}{
+				{release, selectedControlTestFrontier("before-writer", selectedControlTestFiles{}, readOwner)},
+				{header, frontier},
+			} {
+				if _, err := stepper.BeginTarget(selected.target, selected.target, "all"); err != nil {
+					t.Fatal(err)
+				}
+				line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+					Target: selected.target, RuleIndex: selectedControlTestRuleIndex(t, profile, selected.target),
+				}, selected.frontier)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := stepper.ApplyRecipe(line); err != nil {
+					t.Fatal(err)
+				}
+			}
+			evaluation, err := stepper.Finish(frontier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			readSnapshot, ok := selectedControlTestRecipeSnapshot(
+				evaluation, header, selectedControlTestRuleIndex(t, profile, header), 0,
+			)
+			if !ok || readSnapshot == nil {
+				t.Fatal("source-selected header recipe lost its immutable read snapshot")
+			}
+			metadata := &CompactMetadata{actionRoles: testConfiguredScopedActionRoles,
+				Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
+			}
+			writer := compactKbuildSelectionKey{profile: profile.Name, target: release, stage: "prep"}
+			reader := compactKbuildSelectionKey{profile: profile.Name, target: header, stage: "target"}
+			graph, err := newCompactKbuildSelectionGraph(CompactConfig{
+				KbuildProfiles: []CompactKbuildProfile{evaluation.Profile},
+				KbuildSelections: []CompactKbuildSelection{
+					{Profile: profile.Name, Target: release, MakeTarget: release, Stage: "prep", Lifecycle: "prep", Scope: "target"},
+					{Profile: profile.Name, Target: header, MakeTarget: header, Stage: "target", Lifecycle: "target", Scope: "target"},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writerNode := ActionPlanNode{
+				ID: strings.Repeat("a", 64), Stage: "prep", Kind: "generate", Tool: "actionfile", Product: "sdk",
+				Outputs: []ActionPlanOutput{{Tree: "prep", Path: release}},
+			}
+			plan := &ActionPlan{Nodes: []ActionPlanNode{writerNode}, Recipes: map[string]ActionRecipe{}}
+			if err := graph.recordMaterializedProducer(writer, writerNode.ID); err != nil {
+				t.Fatal(err)
+			}
+			builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+				withSelectionGraph(graph).forSelection(reader, evaluation.Profile).
+				forOutput("target", "objects", "sdk")
+			producer, err := builder.buildSelectedTarget(header, header)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) ||
+					!strings.Contains(err.Error(), "Makefile:") {
+					t.Fatalf("selected release read error = %v, want source-located %q rejection", err, test.wantError)
+				}
+				if producer != "" || len(plan.Nodes) != 1 {
+					t.Fatalf("invalid read created final producer %q or action plan nodes %#v", producer, plan.Nodes)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			reads := readSnapshot.Reads()
+			if len(reads) == 0 || reads[0].Artifact != readOwner || !reads[0].Exists {
+				t.Fatalf("source recipe read = %#v, want exact selected writer", reads)
+			}
+			producedNode, ok := compactKbuildPlanNode(plan, producer)
+			if !ok {
+				t.Fatalf("selected header has no action plan producer %q", producer)
+			}
+			if !slices.ContainsFunc(producedNode.Inputs, func(edge ActionPlanNodeEdge) bool {
+				return edge.ProducerID == writerNode.ID && edge.Slot == 0
+			}) {
+				t.Fatalf("header inputs = %#v, want exact release writer %q", producedNode.Inputs, writerNode.ID)
+			}
+			recipe := plan.Recipes[producedNode.Recipe]
+			if !slices.Contains(recipe.Arguments, `#define UTS_RELEASE "6.18.39-virtual"`) ||
+				strings.Contains(strings.Join(recipe.Arguments, "\n"), "stale-host") {
+				t.Fatalf("header action arguments = %q, want only virtual UTS release", recipe.Arguments)
+			}
+		})
+	}
+}
+
+func TestSelectedDirectFilechkCleanupKeepsTwoSourceFrontiers(t *testing.T) {
+	const (
+		header = "include/generated/uapi/linux/version.h"
+		legacy = "include/linux/version.h"
+	)
+	for _, check := range []struct {
+		name, cleanup, body                                                                     string
+		present, changedVersion, overrideRM, overrideHostRM, sourceArithmetic, lateMissingOwner bool
+		wantError                                                                               string
+	}{
+		{name: "source cleanup executes", cleanup: "$(Q)rm -f $(old_version_h)"},
+		{name: "existing legacy file requires deletion state", cleanup: "$(Q)rm -f $(old_version_h)", present: true, wantError: "deletes existing"},
+		{name: "unbounded rm command", cleanup: "$(Q)rm $(old_version_h)", wantError: "different selected file reads"},
+		{name: "first filechk body writes the legacy file", cleanup: "$(Q)rm -f $(old_version_h)",
+			body:      `printf 'legacy\\n' > include/linux/version.h; echo version-header-code`,
+			wantError: "unbounded first-line write frontier"},
+		{name: "extra first-line temporary output is not a filechk scratch", cleanup: "$(Q)rm -f $(old_version_h)",
+			body:      `printf 'side\\n' > include/generated/uapi/linux/other.tmp; echo version-header-code`,
+			wantError: "unbounded first-line write frontier"},
+		{name: "selected second line reads a different first writer", cleanup: "$(Q)rm -f $(old_version_h)",
+			changedVersion: true, wantError: "reads a version different"},
+		{name: "configured rm has unknown write effects", cleanup: "$(Q)rm -f $(old_version_h)",
+			overrideRM: true, wantError: "configured rm applet"},
+		{name: "host rm override cannot change target filechk", cleanup: "$(Q)rm -f $(old_version_h)",
+			overrideHostRM: true},
+		{name: "shell echo backslash cannot attest exact header bytes", cleanup: "$(Q)rm -f $(old_version_h)",
+			body: `echo 'a\c'`, wantError: "filechk echo text has unproven byte semantics"},
+		{name: "pinned numeric version header body", cleanup: "$(Q)rm -f $(old_version_h)",
+			sourceArithmetic: true, body: `
+	if [ $(SUBLEVEL) -gt 255 ]; then                                 \
+		echo \#define LINUX_VERSION_CODE $(shell                 \
+		expr $(VERSION) \* 65536 + $(PATCHLEVEL) \* 256 + 255); \
+	else                                                             \
+		echo \#define LINUX_VERSION_CODE $(shell                 \
+		expr $(VERSION) \* 65536 + $(PATCHLEVEL) \* 256 + $(SUBLEVEL)); \
+	fi;                                                              \
+	echo '#define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) +  \
+	((c) > 255 ? 255 : (c)))'`},
+		{name: "failed cleanup cannot cache a private first writer", cleanup: "$(Q)rm -f $(old_version_h)",
+			lateMissingOwner: true, wantError: "cleanup recipe 1 inputs"},
+	} {
+		t.Run(check.name, func(t *testing.T) {
+			body := check.body
+			if body == "" {
+				body = "echo version-header-code"
+			}
+			quiet := "$(file < $(objtree)/include/generated/uapi/linux/version.h)"
+			if check.lateMissingOwner {
+				quiet = "$(file < $(objtree)/include/config/foreign)"
+			}
+			profile, _, _ := selectedControlTestProfile(t, `
+old_version_h := include/linux/version.h
+VERSION := 5
+PATCHLEVEL := 10
+SUBLEVEL := 270
+Q = $(if `+quiet+`,,@)
+define filechk_version_header
+`+body+`
+endef
+filechk = set -e; mkdir -p $(dir $@); trap "rm -f $(dir $@).$(notdir $@).tmp" EXIT; { $(filechk_$(1)); } > $(dir $@).$(notdir $@).tmp; if [ ! -r $@ ] || ! cmp -s $@ $(dir $@).$(notdir $@).tmp; then echo '  UPD $@'; mv -f $(dir $@).$(notdir $@).tmp $@; fi
+include/generated/uapi/linux/version.h: FORCE
+	$(call filechk,version_header)
+	`+check.cleanup+`
+.PHONY: FORCE
+FORCE:
+`)
+			headerPath := "__LINUX_BZL_OBJECT_TREE__/" + header
+			legacyPath := "__LINUX_BZL_OBJECT_TREE__/" + legacy
+			writer := CompactKbuildVisibleArtifact{Path: header, Profile: profile.Name, Target: header}
+			content := "version-header-code\n"
+			if check.changedVersion {
+				content = "different-version-header-code\n"
+			}
+			if check.sourceArithmetic {
+				content = "#define LINUX_VERSION_CODE 330495\n" +
+					"#define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + \t((c) > 255 ? 255 : (c)))\n"
+				profile.evaluator.template.sourceShell = func(command, _ string) (string, error) {
+					return EvaluateKbuildIntegerExpression(command)
+				}
+			}
+			version := sha256.Sum256([]byte(content))
+			owner := KbuildControlReadArtifact{
+				Tree:     CompactKbuildInvocationObjectTree,
+				Identity: "selection:" + writer.Profile + ":" + writer.Target + ":" + writer.Path,
+				Version:  hex.EncodeToString(version[:]), Producer: writer,
+			}
+			files := selectedControlTestFiles{files: map[string]testKbuildVirtualFile{
+				headerPath: {content: content, exact: true},
+			}}
+			foreignPath := "__LINUX_BZL_OBJECT_TREE__/include/config/foreign"
+			if check.lateMissingOwner {
+				files.files[foreignPath] = testKbuildVirtualFile{content: "foreign\n", exact: true}
+			}
+			if check.present {
+				files.files[legacyPath] = testKbuildVirtualFile{content: "old header\n", exact: true}
+			}
+			before := selectedControlTestFrontier("version-header-before-filechk", selectedControlTestFiles{}, owner)
+			after := selectedControlTestFrontier("version-header-after-filechk", files, owner)
+			after.ResolveArtifact = func(path string) (KbuildControlReadArtifact, bool, error) {
+				switch path {
+				case headerPath:
+					return owner, true, nil
+				case legacyPath:
+					return KbuildControlReadArtifact{
+						Tree: CompactKbuildInvocationObjectTree, Identity: "root/legacy-version-header",
+						Version: "sha256:legacy-header", Producer: CompactKbuildVisibleArtifact{
+							Path: legacy, Profile: profile.Name, Target: "legacy-header",
+						},
+					}, check.present, nil
+				case foreignPath:
+					return KbuildControlReadArtifact{
+						Tree:     CompactKbuildInvocationObjectTree,
+						Identity: "selection:other-profile:foreign:include/config/foreign",
+						Version:  "failing-owner-version",
+						Producer: CompactKbuildVisibleArtifact{Path: "include/config/foreign", Profile: "other-profile", Target: "foreign"},
+					}, check.lateMissingOwner, nil
+				default:
+					return KbuildControlReadArtifact{}, false, nil
+				}
+			}
+			stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stepper.BeginTarget(header, header, ""); err != nil {
+				t.Fatal(err)
+			}
+			ruleIndex := selectedControlTestRuleIndex(t, profile, header)
+			for index, frontier := range []KbuildControlRecipeFrontier{before, after} {
+				line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+					Target: header, RuleIndex: ruleIndex, RecipeIndex: index,
+				}, frontier)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if index == 1 {
+					quiet, err := EvaluateCompactKbuildText(line.Evaluation.Profile, header, "", nil, nil, nil, "$(Q)")
+					if err != nil || quiet != "" {
+						t.Fatalf("selected cleanup Make prefix = %q, error %v", quiet, err)
+					}
+				}
+				if err := stepper.ApplyRecipe(line); err != nil {
+					t.Fatal(err)
+				}
+			}
+			evaluation, err := stepper.Finish(after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstView, ok := selectedControlTestRecipeSnapshot(evaluation, header, ruleIndex, 0)
+			if !ok {
+				t.Fatal("first filechk line lacks its selected source view")
+			}
+			lastView, ok := selectedControlTestRecipeSnapshot(evaluation, header, ruleIndex, 1)
+			if !ok || firstView.ReadIdentity() == lastView.ReadIdentity() {
+				t.Fatalf("selected filechk/cleanup views are not different: first %#v, last %#v", firstView.Reads(), lastView.Reads())
+			}
+			roles := slices.Clone(testConfiguredScopedActionRoles)
+			if check.overrideRM {
+				roles = append(roles, KbuildActionRoleRef{Scope: "target", Role: "script-applet-rm"})
+			}
+			if check.overrideHostRM {
+				roles = append(roles, KbuildActionRoleRef{Scope: "host", Role: "script-applet-rm"})
+			}
+			metadata := &CompactMetadata{
+				actionRoles: roles,
+				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
+			}
+			selection := compactKbuildSelectionKey{profile: profile.Name, target: header, stage: "prep"}
+			graph, err := newCompactKbuildSelectionGraph(CompactConfig{
+				KbuildProfiles: []CompactKbuildProfile{evaluation.Profile},
+				KbuildSelections: []CompactKbuildSelection{{
+					Profile: profile.Name, Target: header, MakeTarget: header,
+					Stage: "prep", Lifecycle: "prep", Scope: "target",
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+			builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+				withSelectionGraph(graph).forSelection(selection, evaluation.Profile).
+				forOutput("prep", "prep", "sdk")
+			plan.Toolsets = map[string]string{"target": actionPlanTestProbeIdentity}
+			producer, err := builder.buildSelectedTarget(header, header)
+			if check.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), check.wantError) ||
+					!strings.Contains(err.Error(), "Makefile:") || producer != "" {
+					t.Fatalf("unsupported selected cleanup = producer %q, error %v; want source-located %q", producer, err, check.wantError)
+				}
+				if check.lateMissingOwner {
+					if builder.memo[header] != "" || len(plan.Nodes) != 0 {
+						t.Fatalf("late failure leaked an intermediate or canonical writer: memo %#v, nodes %#v", builder.memo, plan.Nodes)
+					}
+					secondProducer, secondErr := builder.buildSelectedTarget(header, header)
+					if secondErr == nil || !strings.Contains(secondErr.Error(), check.wantError) || secondProducer != "" || builder.memo[header] != "" {
+						t.Fatalf("failed private writer cached as completed target: first %v, second producer %q error %v, memo %#v", err, secondProducer, secondErr, builder.memo)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plan.Nodes) != 2 {
+				t.Fatalf("selected filechk+cleanup nodes = %#v, want two source actions", plan.Nodes)
+			}
+			firstNode, finalNode := plan.Nodes[0], plan.Nodes[1]
+			for _, output := range firstNode.Outputs {
+				if output.ObservedPath == "" && canonicalKbuildRulePath(output.Path) != header {
+					t.Fatalf("filechk first line published transient or unowned output %#v", output)
+				}
+			}
+			for _, working := range plan.Recipes[firstNode.Recipe].WorkingOutputs {
+				if strings.HasSuffix(working, ".tmp") {
+					t.Fatalf("filechk temporary output %q was collected after its source trap/rename", working)
+				}
+			}
+			if finalNode.ID != producer || firstNode.Outputs[0].Path != header ||
+				!strings.HasPrefix(firstNode.Outputs[0].ArtifactPath, ".linux-bzl-intermediate/") ||
+				finalNode.Outputs[0].Path != header || finalNode.Outputs[0].ArtifactPath != "" {
+				t.Fatalf("source-ordered private/canonical header versions = first %#v, final %#v", firstNode, finalNode)
+			}
+			if !slices.ContainsFunc(finalNode.Inputs, func(edge ActionPlanNodeEdge) bool {
+				return edge.ProducerID == firstNode.ID && edge.Slot == 0
+			}) {
+				t.Fatalf("cleanup inputs = %#v, want exact first header version", finalNode.Inputs)
+			}
+			finalRecipe := plan.Recipes[finalNode.Recipe]
+			if !strings.Contains(compactKbuildRecipeScriptContentForTest(t, finalRecipe), "rm -f "+legacy) ||
+				finalRecipe.WorkingOutputs["00000000"] != header ||
+				!slices.ContainsFunc(slices.Sorted(maps.Values(finalRecipe.WorkingInputs)), func(path string) bool { return path == header }) {
+				t.Fatalf("selected cleanup does not execute or carry first header: %#v", finalRecipe)
+			}
+			if _, err := plan.entries(); err != nil {
+				t.Fatalf("selected header action plan is invalid: %v", err)
+			}
+		})
+	}
+}
+
+func TestSelectedKbuildDirectRecipeBindsEarlierLineWriter(t *testing.T) {
+	const (
+		header   = "include/generated/utsrelease.h"
+		release  = "include/config/kernel.release"
+		readPath = "__LINUX_BZL_OBJECT_TREE__/include/config/kernel.release"
+	)
+	for _, test := range []struct {
+		name, writer, wantError string
+	}{
+		{name: "earlier writer", writer: `@printf '6.18.39-virtual\n' > include/config/kernel.release`},
+		{name: "unproven writer", writer: `@printf noop > include/config/other.release`, wantError: "no proven earlier recipe-local writer"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile, _, objectRoot := selectedControlTestProfile(t, `
+KERNELRELEASE = $(file < $(objtree)/include/config/kernel.release)
+`+header+`: FORCE
+	@printf 'before=%s\n' "$(KERNELRELEASE)" > include/config/release.before
+	`+test.writer+`
+	@printf '#define UTS_RELEASE "%s"\n' "$(KERNELRELEASE)" > $@
+.PHONY: FORCE
+FORCE:
+`)
+			if err := os.WriteFile(filepath.Join(objectRoot, "include", "config", "kernel.release"),
+				[]byte("6.18.39-stale-host\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			owner := KbuildControlReadArtifact{
+				Tree:     CompactKbuildInvocationObjectTree,
+				Identity: "root/header/release writer", Version: "sha256/local-release",
+				Producer: CompactKbuildVisibleArtifact{Path: release, Profile: profile.Name, Target: header},
+			}
+			files := selectedControlTestFiles{files: map[string]testKbuildVirtualFile{
+				readPath: {content: "6.18.39-virtual\n", exact: true},
+			}}
+			frontiers := []KbuildControlRecipeFrontier{
+				selectedControlTestFrontier("before-local-writer", selectedControlTestFiles{}, owner),
+				selectedControlTestFrontier("during-local-writer", selectedControlTestFiles{}, owner),
+				selectedControlTestFrontier("after-local-writer", files, owner),
+			}
+			stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stepper.BeginTarget(header, header, ""); err != nil {
+				t.Fatal(err)
+			}
+			ruleIndex := selectedControlTestRuleIndex(t, profile, header)
+			for recipeIndex, frontier := range frontiers {
+				line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+					Target: header, RuleIndex: ruleIndex, RecipeIndex: recipeIndex,
+				}, frontier)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := stepper.ApplyRecipe(line); err != nil {
+					t.Fatal(err)
+				}
+			}
+			evaluation, err := stepper.Finish(frontiers[2])
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata := &CompactMetadata{actionRoles: testConfiguredScopedActionRoles,
+				Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
+			}
+			selection := compactKbuildSelectionKey{profile: profile.Name, target: header, stage: "target"}
+			graph, err := newCompactKbuildSelectionGraph(CompactConfig{
+				KbuildProfiles: []CompactKbuildProfile{evaluation.Profile},
+				KbuildSelections: []CompactKbuildSelection{{
+					Profile: profile.Name, Target: header, MakeTarget: header, Stage: "target", Lifecycle: "target", Scope: "target",
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+			builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+				withSelectionGraph(graph).forSelection(selection, evaluation.Profile).
+				forOutput("target", "objects", "sdk")
+			producer, err := builder.buildSelectedTarget(header, header)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) ||
+					!strings.Contains(err.Error(), "Makefile:") || producer != "" {
+					t.Fatalf("selected local writer error = %v, producer %q, want source-located %q rejection", err, producer, test.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, ok := selectedControlTestRecipeSnapshot(evaluation, header, ruleIndex, 0)
+			if !ok || len(before.Reads()) == 0 || before.Reads()[0].Exists {
+				t.Fatalf("before-writer Make read = %#v, want virtual absence", before.Reads())
+			}
+			after, ok := selectedControlTestRecipeSnapshot(evaluation, header, ruleIndex, 2)
+			if !ok || len(after.Reads()) == 0 || after.Reads()[0].Artifact != owner {
+				t.Fatalf("after-writer Make read = %#v, want exact local writer", after.Reads())
+			}
+			final, ok := compactKbuildPlanNode(plan, producer)
+			if !ok {
+				t.Fatalf("missing selected UTS header producer %q", producer)
+			}
+			literal := strings.Join(plan.Recipes[final.Recipe].Arguments, "\n")
+			if !strings.Contains(literal, "6.18.39-virtual") || strings.Contains(literal, "stale-host") {
+				t.Fatalf("header action arguments %q do not use exact virtual release", literal)
+			}
+			boundLocalWriter := false
+			for _, edge := range final.Inputs {
+				writer, ok := compactKbuildPlanNode(plan, edge.ProducerID)
+				if !ok || writer.ID == final.ID {
+					continue
+				}
+				if edge.Slot >= 0 && edge.Slot < len(writer.Outputs) &&
+					writer.Outputs[edge.Slot].Path == release {
+					boundLocalWriter = true
+				}
+			}
+			if !boundLocalWriter {
+				t.Fatalf("selected UTS reader inputs %#v have no local release writer output", final.Inputs)
+			}
+		})
+	}
+}
+
+func TestSelectedKbuildImmutableReadBindsSourceOrKconfigProjection(t *testing.T) {
+	const header = "include/generated/utsrelease.h"
+	for _, test := range []struct {
+		name, reference, logicalPath, contents, wantError string
+		owner                                             KbuildControlReadArtifact
+		sourceRoot, configBaseline                        bool
+	}{
+		{name: "immutable source-root", reference: "$(srctree)/release.source",
+			logicalPath: "__LINUX_BZL_SOURCE_TREE__/release.source", contents: "6.18.39-source\n", sourceRoot: true},
+		{name: "declared Kconfig object projection", reference: "$(objtree)/include/config/auto.conf",
+			logicalPath: "__LINUX_BZL_OBJECT_TREE__/include/config/auto.conf", contents: "CONFIG_MODULES=y\n",
+			owner: KbuildControlReadArtifact{
+				Tree: CompactKbuildInvocationObjectTree, Identity: "config:include/config/auto.conf", Version: "sha256/config-baseline",
+			}, configBaseline: true},
+		{name: "object file without Kconfig owner", reference: "$(objtree)/include/config/kernel.release",
+			logicalPath: "__LINUX_BZL_OBJECT_TREE__/include/config/kernel.release", contents: "6.18.39-unknown\n",
+			owner: KbuildControlReadArtifact{
+				Tree: CompactKbuildInvocationObjectTree, Identity: "object:unproven", Version: "sha256/unknown-object",
+			}, wantError: "lacks an authenticated Kconfig projection owner"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile, sourceRoot, _ := selectedControlTestProfile(t, `
+KERNELRELEASE = $(file < `+test.reference+`)
+define filechk_utsrelease.h
+	echo \#define UTS_RELEASE \"$(KERNELRELEASE)\"
+endef
+`+header+`: FORCE
+	$(call filechk,utsrelease.h)
+.PHONY: FORCE
+FORCE:
+`)
+			if test.sourceRoot {
+				mustWriteSource(t, sourceRoot, "release.source", test.contents)
+			}
+			files := selectedControlTestFiles{}
+			if !test.sourceRoot {
+				files.files = map[string]testKbuildVirtualFile{
+					test.logicalPath: {content: test.contents, exact: true},
+				}
+			}
+			frontier := selectedControlTestFrontier("immutable-before-header", files, test.owner)
+			stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stepper.BeginTarget(header, header, ""); err != nil {
+				t.Fatal(err)
+			}
+			line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+				Target: header, RuleIndex: selectedControlTestRuleIndex(t, profile, header),
+			}, frontier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := stepper.ApplyRecipe(line); err != nil {
+				t.Fatal(err)
+			}
+			evaluation, err := stepper.Finish(frontier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata := &CompactMetadata{actionRoles: testConfiguredScopedActionRoles,
+				Config: CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
+			}
+			selection := compactKbuildSelectionKey{profile: profile.Name, target: header, stage: "target"}
+			graph, err := newCompactKbuildSelectionGraph(CompactConfig{
+				KbuildProfiles: []CompactKbuildProfile{evaluation.Profile},
+				KbuildSelections: []CompactKbuildSelection{{
+					Profile: profile.Name, Target: header, MakeTarget: header, Stage: "target", Lifecycle: "target", Scope: "target",
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan := &ActionPlan{Recipes: map[string]ActionRecipe{}}
+			if test.configBaseline {
+				if _, err := ensureActionPlanSource(plan, "config", "auto.conf"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+				withSelectionGraph(graph).forSelection(selection, evaluation.Profile).
+				forOutput("target", "objects", "sdk")
+			producer, err := builder.buildSelectedTarget(header, header)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) ||
+					!strings.Contains(err.Error(), "Makefile:") || producer != "" {
+					t.Fatalf("immutable read error = %v, producer %q, want source-located %q", err, producer, test.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			reads := line.Reads()
+			if len(reads) == 0 || !reads[0].Exists || reads[0].Artifact.Producer != (CompactKbuildVisibleArtifact{}) {
+				t.Fatalf("immutable Make read = %#v, want declared source/config owner", reads)
+			}
+			node, ok := compactKbuildPlanNode(plan, producer)
+			if !ok || len(node.Sources) == 0 {
+				t.Fatalf("header action = %#v, want immutable read source edge", node)
+			}
+			wantNamespace := "kernel"
+			wantSource := "release.source"
+			if test.configBaseline {
+				wantNamespace, wantSource = "config", "auto.conf"
+			}
+			wantID := plan.sourceIDs[actionPlanLookupKey(wantNamespace, wantSource)]
+			if wantID == "" || !slices.ContainsFunc(node.Sources, func(edge ActionPlanSourceEdge) bool {
+				return edge.SourceID == wantID
+			}) {
+				t.Fatalf("header immutable sources = %#v, want %s/%s source %q", node.Sources, wantNamespace, wantSource, wantID)
+			}
+		})
+	}
+}
+
+func TestSelectedKbuildObjectWildcardBindsMatchedWriterWithoutNativePrerequisite(t *testing.T) {
+	const (
+		release  = "include/config/kernel.release"
+		list     = "include/generated/release.list"
+		pattern  = "__LINUX_BZL_OBJECT_TREE__/include/config/*.release"
+		readPath = "__LINUX_BZL_OBJECT_TREE__/include/config/kernel.release"
+	)
+	profile, _, objectRoot := selectedControlTestProfile(t, `
+SELECTED = $(wildcard include/config/*.release)
+all: include/config/kernel.release include/generated/release.list
+include/config/kernel.release: FORCE
+	@printf '6.18.39-virtual\n' > $@
+include/generated/release.list: FORCE
+	@printf '%s\n' "$(SELECTED)" > $@
+.PHONY: FORCE
+FORCE:
+`)
+	if err := os.WriteFile(filepath.Join(objectRoot, "include", "config", "kernel.release"),
+		[]byte("stale-object-wildcard\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifact := KbuildControlReadArtifact{
+		Tree: CompactKbuildInvocationObjectTree, Identity: "root/release-writer",
+		Version: "sha256/exact-release", Producer: CompactKbuildVisibleArtifact{
+			Path: release, Profile: profile.Name, Target: release,
+		},
+	}
+	files := selectedControlTestFiles{
+		files: map[string]testKbuildVirtualFile{
+			readPath: {content: "6.18.39-virtual\n", exact: true},
+		},
+		matches: map[string][]string{pattern: {readPath}},
+	}
+	frontier := selectedControlTestFrontier("after-release-writer", files, artifact)
+	stepper, err := NewSelectedKbuildControlStepper(profile, KbuildControlEvaluationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stepper.BeginTarget("all", "all", ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, selected := range []struct {
+		target   string
+		frontier KbuildControlRecipeFrontier
+	}{
+		{release, selectedControlTestFrontier("before-release-writer", selectedControlTestFiles{}, artifact)},
+		{list, frontier},
+	} {
+		if _, err := stepper.BeginTarget(selected.target, selected.target, "all"); err != nil {
+			t.Fatal(err)
+		}
+		line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
+			Target: selected.target, RuleIndex: selectedControlTestRuleIndex(t, profile, selected.target),
+		}, selected.frontier)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stepper.ApplyRecipe(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evaluation, err := stepper.Finish(frontier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := &CompactMetadata{
+		actionRoles: testConfiguredScopedActionRoles,
+		Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
+	}
+	writer := compactKbuildSelectionKey{profile: profile.Name, target: release, stage: "prep"}
+	reader := compactKbuildSelectionKey{profile: profile.Name, target: list, stage: "target"}
+	graph, err := newCompactKbuildSelectionGraph(CompactConfig{
+		KbuildProfiles: []CompactKbuildProfile{evaluation.Profile},
+		KbuildSelections: []CompactKbuildSelection{
+			{Profile: profile.Name, Target: release, MakeTarget: release, Stage: "prep", Lifecycle: "prep", Scope: "target"},
+			{Profile: profile.Name, Target: list, MakeTarget: list, Stage: "target", Lifecycle: "target", Scope: "target"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerNode := ActionPlanNode{ID: strings.Repeat("a", 64), Stage: "prep", Outputs: []ActionPlanOutput{{Tree: "prep", Path: release}}}
+	plan := &ActionPlan{Nodes: []ActionPlanNode{writerNode}, Recipes: map[string]ActionRecipe{}}
+	if err := graph.recordMaterializedProducer(writer, writerNode.ID); err != nil {
+		t.Fatal(err)
+	}
+	builder := newCompactKbuildRulePlanBuilder(metadata, plan).
+		withSelectionGraph(graph).forSelection(reader, evaluation.Profile).
+		forOutput("target", "objects", "sdk")
+	producer, err := builder.buildSelectedTarget(list, list)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := selectedControlTestRecipeSnapshot(evaluation, list, selectedControlTestRuleIndex(t, profile, list), 0)
+	if !ok || snapshot == nil {
+		t.Fatal("selected wildcard recipe lost its immutable source snapshot")
+	}
+	reads := snapshot.Reads()
+	if !slices.ContainsFunc(reads, func(read KbuildControlRecipeRead) bool {
+		return read.Wildcard && read.Exists && read.Path == readPath && read.Artifact == artifact
+	}) || !slices.ContainsFunc(reads, func(read KbuildControlRecipeRead) bool {
+		return read.Wildcard && read.Exists && read.Path == pattern && read.MembershipVersion != ""
+	}) || snapshot.ReadIdentity() == "" {
+		t.Fatalf("wildcard Make reads = %#v, want exact writer and nonempty membership", reads)
+	}
+	node, ok := compactKbuildPlanNode(plan, producer)
+	if !ok {
+		t.Fatalf("wildcard consumer has no plan producer %q", producer)
+	}
+	ownedInput, found := actionPlanNodeInputSetEntryForPathForTest(t, plan, node, release)
+	if !found || ownedInput.Target != (ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: release}) ||
+		ownedInput.ProducerID != writerNode.ID || ownedInput.Slot != 0 {
+		t.Fatalf("wildcard consumer persistent read input = (%#v, %t), want exact writer %q slot 0", ownedInput, found, writerNode.ID)
+	}
+	recipe := plan.Recipes[node.Recipe]
+	encoded := slices.Index(recipe.Arguments, "-script_content_base64")
+	if encoded < 0 || encoded+1 == len(recipe.Arguments) {
+		t.Fatalf("selected wildcard recipe = %#v, want an executable source script", recipe)
+	}
+	script, err := base64.StdEncoding.DecodeString(recipe.Arguments[encoded+1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(script), release) || strings.Contains(string(script), "stale-object-wildcard") {
+		t.Fatalf("selected wildcard script = %q, want only virtual matched path", script)
 	}
 }
 
@@ -11805,4 +14447,66 @@ func compactKbuildCompoundWorkingInputPathsNaiveForTest(
 		}
 	}
 	return used
+}
+
+func TestSelectedPhonyPrivateSourceSetupRejectsWritesThroughSourceAlias(t *testing.T) {
+	const guard = `if [ -f ${tree:kernel}/.config -o -d ${tree:kernel}/include/config -o -d ${tree:kernel}/arch/x86/include/generated ]; then echo >&2 "***"; echo >&2 "*** in ${tree:kernel}"; false; fi`
+	const ignore = `test -e .gitignore || { echo "# this is build directory, ignore it"; echo "*"; } > .gitignore`
+	const script = `#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+if [ "${quiet}" != "silent_" ]; then
+	echo "  GEN     Makefile"
+fi
+cat << EOF > Makefile
+# Automatically generated by $0: don't edit
+include $1/Makefile
+EOF
+`
+	if _, optional := compactKbuildPhonyPrivateOptionalWriter(ignore, compactKbuildAutomaticContext{}); !compactKbuildPhonyPrivateCleanSourceGuard(guard) ||
+		!optional ||
+		!compactKbuildPhonyPrivateMakefileScript(script) {
+		t.Fatal("pinned source guard, optional ignore, or source script was not authenticated")
+	}
+	for _, test := range []struct {
+		name, guard, ignore, script string
+	}{
+		{name: "guard writes through alias", guard: strings.Replace(guard, `false; fi`, `printf modified > source/Makefile; false; fi`, 1), ignore: ignore, script: script},
+		{name: "optional ignore writes through alias", guard: guard, ignore: strings.Replace(ignore, `echo "*";`, `echo "*"; printf modified > source/Makefile;`, 1), script: script},
+		{name: "script writes through alias", guard: guard, ignore: ignore, script: script + "printf modified > source/Makefile\n"},
+		{name: "script skips selected writer", guard: guard, ignore: ignore, script: strings.Replace(script, "cat << EOF > Makefile", "true || cat << EOF > Makefile", 1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, optional := compactKbuildPhonyPrivateOptionalWriter(test.ignore, compactKbuildAutomaticContext{})
+			if compactKbuildPhonyPrivateCleanSourceGuard(test.guard) &&
+				optional &&
+				compactKbuildPhonyPrivateMakefileScript(test.script) {
+				t.Fatal("unsafe private source setup passed its complete source shape")
+			}
+		})
+	}
+}
+
+func TestCompactKbuildPhonyPrivateInlineWriterRequiresLiteralEchoes(t *testing.T) {
+	for _, test := range []struct {
+		name, body string
+		accept     bool
+	}{
+		{name: "plain lines", body: `echo "generated"; echo "include ${tree:kernel}/Makefile";`, accept: true},
+		{name: "single quoted shell syntax", body: "echo 'literal $(touch unexpected) `touch unexpected`';", accept: true},
+		{name: "active command substitution", body: `echo "$(touch unexpected)";`},
+		{name: "active backticks", body: "echo \"`touch unexpected`\";"},
+		{name: "conditional", body: `if true; then echo generated; fi;`},
+		{name: "scalar pipeline", body: `version=$(echo 123 | cut -b -2); echo "$version";`},
+		{name: "hidden writer", body: `echo generated; touch unexpected;`},
+		{name: "inner redirect", body: `echo generated > unexpected;`},
+		{name: "early exit", body: `exit 0; echo generated;`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			group := `{ ` + test.body + ` } > Makefile`
+			output, accepted := compactKbuildPhonyPrivateLiteralGroupWriter(group, compactKbuildAutomaticContext{})
+			if accepted != test.accept || accepted && output != "Makefile" {
+				t.Fatalf("literal group writer = (%q, %t), want accepted=%t", output, accepted, test.accept)
+			}
+		})
+	}
 }

@@ -22,6 +22,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 )
 
 const (
@@ -66,13 +68,16 @@ const (
 // ${source_root:NAME}, and ${tool:ROLE}; no shell expansion or ambient tool
 // lookup is performed.
 type ProbeRequest struct {
-	Schema      string         `json:"schema"`
-	InputCount  int            `json:"input_count,omitempty"`
-	Sources     []string       `json:"sources,omitempty"`
-	SourceRoots []string       `json:"source_roots,omitempty"`
-	Scratch     []ProbeScratch `json:"scratch,omitempty"`
-	Steps       []ProbeStep    `json:"steps"`
-	Outcome     ProbeOutcome   `json:"outcome"`
+	Schema string `json:"schema"`
+	// HostToolsetIdentity binds selected host-scoped tools to the request ID,
+	// including when the target probe has no host result dependency.
+	HostToolsetIdentity string         `json:"host_toolset_identity,omitempty"`
+	InputCount          int            `json:"input_count,omitempty"`
+	Sources             []string       `json:"sources,omitempty"`
+	SourceRoots         []string       `json:"source_roots,omitempty"`
+	Scratch             []ProbeScratch `json:"scratch,omitempty"`
+	Steps               []ProbeStep    `json:"steps"`
+	Outcome             ProbeOutcome   `json:"outcome"`
 }
 
 type ProbeScratch struct {
@@ -198,7 +203,7 @@ const (
 	ProbeArgumentFragmentsModeSignedDecimal = "signed-decimal"
 	// Source-shell-words retains exact deferred recipe text until all Make
 	// transforms have completed, then performs bounded static shell lexing.
-	// Only source-owned compiler projection arguments may opt into this mode.
+	// Source-owned compiler projections and bounded C link checks may opt in.
 	ProbeArgumentFragmentsModeSourceShellWords = "source-shell-words"
 )
 
@@ -491,7 +496,7 @@ func (r ProbeRequest) Validate() error {
 		if _, exists := steps[step.Name]; exists {
 			return fmt.Errorf("probe request repeats step %q", step.Name)
 		}
-		if err := validatePlanName("probe tool role", step.Tool); err != nil {
+		if err := validateProbeToolRole(step.Tool); err != nil {
 			return err
 		}
 		if step.WorkingDirectory != "" {
@@ -506,6 +511,9 @@ func (r ProbeRequest) Validate() error {
 			return fmt.Errorf("probe step %q cannot combine output with discarded streams or stdout path normalization", step.Name)
 		}
 		if step.StdoutExecrootRelative {
+			if _, _, scoped, _ := toolaction.SplitBinding(step.Tool); scoped {
+				return fmt.Errorf("probe step %q cannot assign current-scope stdout path provenance to scoped tool %q", step.Name, step.Tool)
+			}
 			if stdoutPathStep != "" {
 				return fmt.Errorf("probe steps %q and %q both declare stdout path provenance", stdoutPathStep, step.Name)
 			}
@@ -521,7 +529,7 @@ func (r ProbeRequest) Validate() error {
 		}
 		previousAuxiliary := ""
 		for _, role := range step.AuxiliaryTools {
-			if err := validatePlanName("probe auxiliary tool role", role); err != nil {
+			if err := validateProbeToolRole(role); err != nil {
 				return err
 			}
 			if role <= previousAuxiliary {
@@ -586,10 +594,12 @@ func (r ProbeRequest) Validate() error {
 			}
 			if group.Mode == ProbeArgumentFragmentsModeSourceShellWords {
 				candidate := step.Candidate
-				if candidate == nil || candidate.Policy != ProbeCandidatePolicyCC ||
-					(candidate.Projection != ProbeCandidateProjectionCompilerPredefines && candidate.Projection != ProbeCandidateProjectionCompilerIntrinsic) ||
+				compilerProjection := candidate != nil && candidate.Policy == ProbeCandidatePolicyCC &&
+					(candidate.Projection == ProbeCandidateProjectionCompilerPredefines || candidate.Projection == ProbeCandidateProjectionCompilerIntrinsic)
+				compilerLink := candidate != nil && candidate.Policy == ProbeCandidatePolicyCCLink && candidate.Projection == "" && step.Tool == "cc"
+				if !compilerProjection && !compilerLink ||
 					!slices.Contains(candidate.Base, group.Index) {
-					return fmt.Errorf("probe step %q source-shell-words requires a candidate-owned CC compiler projection argument", step.Name)
+					return fmt.Errorf("probe step %q source-shell-words requires a candidate-owned CC compiler argument", step.Name)
 				}
 			}
 			if step.Arguments[group.Index] != "" || len(group.Fragments) == 0 {
@@ -699,6 +709,20 @@ func (r ProbeRequest) Validate() error {
 	}
 	if stdoutPathStep != "" && (r.Outcome.Kind != "text" || r.Outcome.Step != stdoutPathStep || r.Outcome.Stream != "stdout") {
 		return fmt.Errorf("probe step %q stdout path provenance must be the direct text stdout outcome", stdoutPathStep)
+	}
+	hasHostTool := false
+	for _, binding := range r.ToolRoles() {
+		if scope, _, scoped, _ := toolaction.SplitBinding(binding); scoped && scope == "host" {
+			hasHostTool = true
+			break
+		}
+	}
+	if hasHostTool {
+		if err := validateProbeIdentity(r.HostToolsetIdentity); err != nil {
+			return fmt.Errorf("probe request host toolset identity: %w", err)
+		}
+	} else if r.HostToolsetIdentity != "" {
+		return errors.New("probe request has a host toolset identity without a scoped host tool")
 	}
 	return nil
 }
@@ -997,7 +1021,7 @@ func validateProbeTemplate(value string, scratch, sources, sourceRoots map[strin
 				return fmt.Errorf("references undeclared source root %q", match[2])
 			}
 		case "tool":
-			if err := validatePlanName("probe tool role", match[2]); err != nil {
+			if err := validateProbeToolRole(match[2]); err != nil {
 				return err
 			}
 		case "result":
@@ -1013,6 +1037,22 @@ func validateProbeTemplate(value string, scratch, sources, sourceRoots map[strin
 		return fmt.Errorf("contains malformed or unsupported placeholder")
 	}
 	return nil
+}
+
+// validateProbeToolRole permits a host tool in a target probe only through
+// the collision-free configured role namespace used by ordinary Kbuild
+// actions. The request's selected scope and host identity are checked by its
+// plan owner before this role can acquire an executable binding.
+func validateProbeToolRole(value string) error {
+	if err := validatePlanName("probe tool role", value); err == nil {
+		return nil
+	}
+	scope, role, scoped, valid := toolaction.SplitBinding(value)
+	if scoped && valid && scope == "host" && validatePlanName("probe host tool role", role) == nil &&
+		len(value) <= maximumActionPlanNameComponent {
+		return nil
+	}
+	return fmt.Errorf("probe tool role %q is not a canonical current-scope or host-scoped role", value)
 }
 
 func validateProbeSourcePath(value string) error {
@@ -1160,7 +1200,7 @@ func validateProbeValueFragments(
 
 func (p ProbePredicate) validate(steps map[string]int, scratch, sources, sourceRoots map[string]bool, inputCount int) error {
 	leaf := p.Operator == "exit-zero" || p.Operator == "stream-contains" || p.Operator == "stream-matches" || p.Operator == "stream-empty" || p.Operator == "stream-trimmed-empty" || p.Operator == "regular-file" || p.Operator == "execroot-exists" || p.Operator == "execroot-regular-file"
-	resultLeaf := p.Operator == "result-true" || p.Operator == "result-false" || p.Operator == "result-text-empty" || p.Operator == "result-text-equals" || p.Operator == "result-text-contains" || p.Operator == "result-path-fallback"
+	resultLeaf := p.Operator == "result-true" || p.Operator == "result-false" || p.Operator == "result-text-empty" || p.Operator == "result-text-equals" || p.Operator == "result-text-contains" || p.Operator == "result-text-contains-echo-safe" || p.Operator == "result-path-fallback"
 	if !leaf && !resultLeaf && p.Operator != "all" && p.Operator != "any" && p.Operator != "not" {
 		return fmt.Errorf("unsupported predicate operator %q", p.Operator)
 	}
@@ -1191,7 +1231,7 @@ func (p ProbePredicate) validate(steps map[string]int, scratch, sources, sourceR
 		if (p.Operator == "result-text-empty" || p.Operator == "result-path-fallback") && p.Value != "" {
 			return fmt.Errorf("empty-text result predicate has a value")
 		}
-		if (p.Operator == "result-text-equals" || p.Operator == "result-text-contains") && p.Value == "" {
+		if (p.Operator == "result-text-equals" || p.Operator == "result-text-contains" || p.Operator == "result-text-contains-echo-safe") && p.Value == "" {
 			return fmt.Errorf("text result predicate has no value")
 		}
 		return nil
@@ -1666,6 +1706,23 @@ func (p *ProbePlan) Write(outputDir string) error {
 	return writeActionPlanTree(outputDir, entries)
 }
 
+// SameProbePlanContent compares the validated marker trees that Write emits.
+// Reading an empty tree need not preserve whether a Go slice was nil or empty;
+// neither distinction changes the measured request, dependency, or terminal.
+func SameProbePlanContent(left, right *ProbePlan) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	leftEntries, leftErr := left.entries()
+	rightEntries, rightErr := right.entries()
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	return slices.EqualFunc(leftEntries, rightEntries, func(a, b actionPlanEntry) bool {
+		return a.path == b.path && bytes.Equal(a.data, b.data)
+	})
+}
+
 // ReadProbePlan strictly reconstructs a path-encoded v2 probe DAG. The reader
 // regenerates the complete canonical marker tree after parsing it, so omitted
 // derived markers, unknown files, empty directories, symlinks, and
@@ -2111,6 +2168,15 @@ func (p *ProbePlan) entries() ([]actionPlanEntry, error) {
 		request, ok := requests[node.RequestID]
 		if !ok {
 			return nil, fmt.Errorf("probe node %s references unknown request %s", node.ID, node.RequestID)
+		}
+		for _, binding := range request.ToolRoles() {
+			scope, _, scoped, valid := toolaction.SplitBinding(binding)
+			if !valid || scoped && (node.Scope != "target" || scope != "host" || p.Toolsets["host"] == "") {
+				return nil, fmt.Errorf("probe node %s has unavailable scoped tool %q", node.ID, binding)
+			}
+			if scoped && request.HostToolsetIdentity != p.Toolsets["host"] {
+				return nil, fmt.Errorf("probe node %s request host toolset identity %q differs from plan %q", node.ID, request.HostToolsetIdentity, p.Toolsets["host"])
+			}
 		}
 		if err := validatePlanDigest("probe node ID", node.ID); err != nil {
 			return nil, err

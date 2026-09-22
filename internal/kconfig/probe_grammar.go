@@ -10,8 +10,11 @@ import (
 var ifSuccessPattern = regexp.MustCompile(`^\{\s*(.*);\s*\}\s*>/dev/null\s+2>&1\s+&&\s+echo\s+"(.*)"\s+\|\|\s+echo\s+"(.*)"$`)
 
 var (
-	kbuildTryRunPattern = regexp.MustCompile(`(?s)^set -e;\s*TMP=([^;[:space:]]+)/tmp;\s*trap "rm -rf ([^"]+)" EXIT;\s*mkdir -p ([^;[:space:]]+);\s*if \((.*)\) >/dev/null 2>&1;\s*then echo "([^"]*)";\s*else echo "([^"]*)";\s*fi$`)
-	kbuildTryRunTemp    = regexp.MustCompile(`^\.tmp_[0-9]*$`)
+	kbuildTryRunPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?s)^set -e;\s*TMP=([^;[:space:]]+)/tmp;(?:\s*TMPO=([^;[:space:]]+);)?\s*trap "rm -rf ([^"]+)" EXIT;\s*mkdir -p ([^;[:space:]]+);\s*if \((.*)\) >/dev/null 2>&1;\s*then echo "([^"]*)";\s*else echo "([^"]*)";\s*fi$`),
+		regexp.MustCompile(`(?s)^set -e;\s*TMP=([^;[:space:]]+)/tmp;(?:\s*TMPO=([^;[:space:]]+);)?\s*mkdir -p ([^;[:space:]]+);\s*trap "rm -rf ([^"]+)" EXIT;\s*if \((.*)\) >/dev/null 2>&1;\s*then echo "([^"]*)";\s*else echo "([^"]*)";\s*fi$`),
+	}
+	kbuildTryRunTemp = regexp.MustCompile(`^\.tmp_[0-9]*$`)
 )
 
 func unquoteLinuxProbeSource(quoted string) (string, error) {
@@ -156,6 +159,7 @@ const (
 	ProbeCandidatePathInclude       ProbeCandidatePathKind = "include"
 	ProbeCandidatePathForcedInclude ProbeCandidatePathKind = "forced-include"
 	ProbeCandidatePathRegularFile   ProbeCandidatePathKind = "regular-file"
+	ProbeCandidatePathLibraryDir    ProbeCandidatePathKind = "library-directory"
 )
 
 // ProbeCandidatePathOperand locates one path within the original candidate
@@ -203,6 +207,7 @@ var probeCandidatePathOptions = []probeCandidatePathOption{
 	{name: "-iquote", kind: ProbeCandidatePathInclude, joined: true},
 	{name: "-I", kind: ProbeCandidatePathInclude, joined: true},
 	{name: "-F", kind: ProbeCandidatePathInclude, joined: true},
+	{name: "-L", kind: ProbeCandidatePathLibraryDir, joined: true},
 }
 
 const probeCandidatePolicyAssembler = "assembler-forwarded"
@@ -619,6 +624,14 @@ func validateProbeCandidateTokensWithIntrinsics(policy string, tokens []probeCan
 		}
 
 		if !strings.HasPrefix(argument, "-") {
+			if policy == ProbeCandidatePolicyCCLink && strings.HasSuffix(argument, ".a") {
+				paths = append(paths, ProbeCandidatePathOperand{
+					Kind: ProbeCandidatePathRegularFile, Argument: token.argument,
+					Start: token.start, End: token.end,
+				})
+				mayHaveScalarOperand = false
+				continue
+			}
 			if !mayHaveScalarOperand || strings.ContainsAny(argument, `/\\`) {
 				return nil, fmt.Errorf("input path or positional argument is prohibited: %q", argument)
 			}
@@ -656,6 +669,23 @@ func validateProbeCandidateTokensWithIntrinsics(policy string, tokens []probeCan
 		if argument == "-" || argument == "--" {
 			return nil, fmt.Errorf("probe-controlled input or option terminator is prohibited: %q", argument)
 		}
+		if policy == ProbeCandidatePolicyCCLink && strings.HasPrefix(argument, "-l") {
+			if probeCandidateUnsafeForwarder(argument) || forbiddenProbeCandidateOption(argument, policy) == "plugin/code-loading" {
+				return nil, fmt.Errorf("unsafe compiler linker option %q", argument)
+			}
+			library := strings.TrimPrefix(argument, "-l")
+			if library == "" {
+				if index+1 >= len(tokens) {
+					return nil, fmt.Errorf("missing library name for -l")
+				}
+				index++
+				library = tokens[index].value
+			}
+			if !probeCandidateLibraryName(library) {
+				return nil, fmt.Errorf("unsafe library name %q", library)
+			}
+			continue
+		}
 		if option, offset, matched := matchProbeCandidatePathOption(policy, argument); matched {
 			if offset < 0 {
 				if index+1 >= len(tokens) {
@@ -690,6 +720,20 @@ func validateProbeCandidateTokensWithIntrinsics(policy string, tokens []probeCan
 			forwarded, err := splitProbeCandidateForwarding(token, 4)
 			if err != nil {
 				return nil, err
+			}
+			// Kbuild's declared host dependency archives are compiler-driver
+			// link inputs. Forwarding one exact staged archive to the linker
+			// keeps it a library even after the source probe enables -xc.
+			// Raw linker candidates and arbitrary forwarded filenames have no
+			// such host-dependency binding.
+			if policy == ProbeCandidatePolicyCCLink && strings.HasPrefix(argument, "-Wl,") &&
+				len(forwarded) == 1 && strings.HasPrefix(forwarded[0].value, "__LINUX_BZL_HOST_DEPS__/") &&
+				strings.HasSuffix(forwarded[0].value, ".a") {
+				paths = append(paths, ProbeCandidatePathOperand{
+					Kind: ProbeCandidatePathRegularFile, Argument: forwarded[0].argument,
+					Start: forwarded[0].start, End: forwarded[0].end,
+				})
+				continue
 			}
 			forwardedPolicy := policy
 			switch argument[:4] {
@@ -873,6 +917,9 @@ func matchProbeCandidatePathOption(policy, argument string) (probeCandidatePathO
 		if option.kind == ProbeCandidatePathRegularFile && policy != ProbeCandidatePolicyCC {
 			continue
 		}
+		if option.kind == ProbeCandidatePathLibraryDir && policy != ProbeCandidatePolicyCCLink {
+			continue
+		}
 		if argument == option.name {
 			if option.equalsOnly {
 				return option, len(argument), true
@@ -887,6 +934,24 @@ func matchProbeCandidatePathOption(policy, argument string) (probeCandidatePathO
 		}
 	}
 	return probeCandidatePathOption{}, 0, false
+}
+
+func probeCandidateLibraryName(name string) bool {
+	if name == "" || !((name[0] >= 'A' && name[0] <= 'Z') ||
+		(name[0] >= 'a' && name[0] <= 'z') ||
+		(name[0] >= '0' && name[0] <= '9') || name[0] == '_') {
+		return false
+	}
+	for _, character := range name[1:] {
+		if (character >= 'A' && character <= 'Z') ||
+			(character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9') ||
+			strings.ContainsRune("_+.-", character) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validateProbeCandidatePrefixMap(policy, argument string) (bool, error) {

@@ -31,6 +31,7 @@ LinuxModuleSdkInfo = provider(
         "host_kconfig_probe_results": "Replayed host-scoped source-derived Kconfig capability results.",
         "host_probe_results": "Replayed host compiler capability results.",
         "host_probe_runner": "Exact host-configured proberun FilesToRunProvider selected by this kernel.",
+        "host_pkg_config_manifest": "Declared host package database bound to the configured pkg-config shim.",
         "host_recipe_runner": "Exact host-configured mapdirectoryrecipe FilesToRunProvider selected by this kernel.",
         "host_tool_files": "Exact configured host tools, mapped-action helpers, and script runtime by role.",
         "host_toolchain_files": "Complete host compiler, generator, helper, and runtime closure.",

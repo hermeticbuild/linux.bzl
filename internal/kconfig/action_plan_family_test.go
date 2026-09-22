@@ -19,12 +19,11 @@ import (
 
 func familyTestConfig(used, other string) map[string]string {
 	return map[string]string{
-		".config":                       "CONFIG_USED=" + used + "\nCONFIG_OTHER=" + other + "\n",
-		"include/config/auto.conf":      "CONFIG_USED=" + used + "\nCONFIG_OTHER=" + other + "\n",
-		"include/config/auto.conf.cmd":  "cmd_auto_conf := true\n",
-		"include/generated/autoconf.h":  "#ifndef __GENERATED_AUTOCONF_H__\n#define __GENERATED_AUTOCONF_H__\n#define CONFIG_USED " + used + "\n#define CONFIG_OTHER " + other + "\n#endif\n",
-		"include/generated/rustc_cfg":   "--cfg=CONFIG_USED=\"" + used + "\"\n--cfg=CONFIG_OTHER=\"" + other + "\"\n",
-		"include/config/kernel.release": "6.12.0-test\n",
+		".config":                      "CONFIG_USED=" + used + "\nCONFIG_OTHER=" + other + "\n",
+		"include/config/auto.conf":     "CONFIG_USED=" + used + "\nCONFIG_OTHER=" + other + "\n",
+		"include/config/auto.conf.cmd": "cmd_auto_conf := true\n",
+		"include/generated/autoconf.h": "#ifndef __GENERATED_AUTOCONF_H__\n#define __GENERATED_AUTOCONF_H__\n#define CONFIG_USED " + used + "\n#define CONFIG_OTHER " + other + "\n#endif\n",
+		"include/generated/rustc_cfg":  "--cfg=CONFIG_USED=\"" + used + "\"\n--cfg=CONFIG_OTHER=\"" + other + "\"\n",
 	}
 }
 
@@ -173,6 +172,107 @@ func familyTestChainSnapshot(t *testing.T, salt, artifactPath string) ActionPlan
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func familyTestSourceCheckSnapshot(t *testing.T) ActionPlanSnapshot {
+	t.Helper()
+	base := familyTestChainSnapshot(t, "source-check-root", "")
+	plan := snapshotActionPlan(base)
+	const (
+		sourceID = "src-00000003"
+		target   = "modules_check"
+	)
+	plan.Sources = append(plan.Sources, ActionPlanSource{
+		ID: sourceID, Namespace: "kernel", Path: "scripts/modules-check.sh",
+	})
+	recipe := ActionRecipe{
+		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: compactKbuildScriptRunnerRole,
+		Arguments:        []string{"-script", "${source:script:00000000}"},
+		WorkingDirectory: "source-check", WorkingInputs: map[string]string{
+			"source:script:00000000": "scripts/modules-check.sh",
+		},
+		ObservedOutputs:             map[string]string{"00000000": target},
+		RequireAbsentObservedOutput: "00000000", RequireUnchangedWorkingTree: true,
+		Sources: []string{"script:00000000"}, Outputs: []string{"00000000"},
+	}
+	recipeID, err := recipe.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Recipes[recipeID] = recipe
+	check := ActionPlanNode{
+		Stage: "target", Kind: "generate", Recipe: recipeID,
+		Tool: compactKbuildScriptRunnerRole, Product: "vmlinux",
+		Sources: []ActionPlanSourceEdge{{Role: "script", SourceID: sourceID}},
+		Outputs: []ActionPlanOutput{{
+			Tree: "objects", Path: ".linux-bzl-intermediate/check/command-00000000.state",
+			ObservedPath: target,
+		}},
+	}
+	check.ID = check.ContentID()
+	plan.Nodes = append(plan.Nodes, check)
+	plan.executionCheckRoots = []string{check.ID}
+	dependencies := maps.Clone(base.ConfigDependencies)
+	dependencies[check.ID] = ConfigDependencySet{Opaque: true, Reason: "selected source check"}
+	snapshot, err := canonicalActionPlanSnapshot(plan, dependencies, base.ConfigFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func TestSourceCheckExecutionRootGatesImageWithoutPublishingMakeFile(t *testing.T) {
+	snapshot := familyTestSourceCheckSnapshot(t)
+	checkID := snapshot.ExecutionCheckRoots[0]
+	if got := snapshot.ExecutionCheckRoots; !slices.Equal(got, []string{checkID}) {
+		t.Fatalf("source execution-check roots = %q, want %s", got, checkID)
+	}
+	for _, invalid := range []string{"physical image producer", "unbound observation"} {
+		altered := snapshot
+		if invalid == "physical image producer" {
+			for _, node := range snapshot.Nodes {
+				if node.ID != checkID && node.Outputs[0].ObservedPath == "" {
+					altered.ExecutionCheckRoots = []string{node.ID}
+					break
+				}
+			}
+		} else {
+			altered.ExecutionCheckRoots = []string{"missing-source-check"}
+		}
+		if err := altered.validate(); err == nil {
+			t.Fatalf("%s substituted an unverified source-check execution root", invalid)
+		}
+	}
+	family, err := BuildActionPlanFamily([]ActionPlanFamilyVariant{{Name: "base", Snapshot: snapshot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalCheck := family.originalNodeIDs["base"][checkID]
+	if finalCheck == "" || !slices.Contains(family.Validations, ActionPlanFamilyValidation{
+		Variant: "base", NodeID: finalCheck, Slot: 0,
+	}) {
+		t.Fatalf("image view lost source-check validation: final=%q validations=%#v", finalCheck, family.Validations)
+	}
+	for _, view := range family.Views {
+		if view.NodeID == finalCheck && view.Slot == 0 {
+			t.Fatal("private execution-check state was published as a Make file in the objects view")
+		}
+	}
+	entries, err := family.entriesValidated()
+	if err != nil {
+		t.Fatalf("family source-check validation is not an execution root: %v", err)
+	}
+	validationMarker := path.Join("variants", "base", "validation", "from", finalCheck, "00000000")
+	foundValidation := false
+	for _, entry := range entries {
+		if entry.path == validationMarker {
+			foundValidation = true
+			break
+		}
+	}
+	if !foundValidation {
+		t.Fatalf("family emitted no execution-validation marker %s", validationMarker)
+	}
 }
 
 func familyTestInputSetSnapshot(t *testing.T, sourceOrdinal int) ActionPlanSnapshot {

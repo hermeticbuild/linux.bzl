@@ -304,6 +304,85 @@ func TestProbePlanWritesPathEncodedDAG(t *testing.T) {
 	}
 }
 
+func TestProbePlanBindsScopedHostToolWithoutHostResultInput(t *testing.T) {
+	request := testProbeRequest()
+	request.Steps[0].AuxiliaryTools = []string{"host@cc"}
+	request.Steps[0].Arguments = append(request.Steps[0].Arguments, "${tool:host@cc}")
+	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "host toolset identity") {
+		t.Fatalf("standalone host-scoped request without toolset identity: %v", err)
+	}
+	request.HostToolsetIdentity = "sha256-invalid"
+	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "canonical SHA-256 digest") {
+		t.Fatalf("malformed host toolset identity accepted: %v", err)
+	}
+	request.HostToolsetIdentity = ""
+	identity := "sha256-" + strings.Repeat("a", 64)
+	withoutHost, err := NewProbePlanBuilder(identity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := withoutHost.Request("target", request); err == nil || !strings.Contains(err.Error(), "unavailable scoped tool") {
+		t.Fatalf("target probe acquired a host tool without a host identity: %v", err)
+	}
+	hostIdentity := "sha256-" + strings.Repeat("b", 64)
+	withHost, err := NewProbePlanBuilder(identity, hostIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := withHost.Request("target", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := withHost.Plan(reference)
+	if err != nil || len(plan.Nodes) != 1 || len(plan.Nodes[0].Inputs) != 0 {
+		t.Fatalf("target probe with selected host executable = %#v, %v", plan, err)
+	}
+	if got := plan.Requests[reference.RequestID].HostToolsetIdentity; got != hostIdentity {
+		t.Fatalf("request host toolset identity = %q, want %q", got, hostIdentity)
+	}
+	path := "nodes/" + reference.NodeID + "/tool/host@cc"
+	entries, err := plan.entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(entries, func(entry actionPlanEntry) bool { return entry.path == path }) {
+		t.Fatalf("scoped host tool marker %q missing from path-encoded plan", path)
+	}
+	delete(plan.Toolsets, "host")
+	if _, err := plan.entries(); err == nil || !strings.Contains(err.Error(), "unavailable scoped tool") {
+		t.Fatalf("forged plan omitted the scoped toolset identity: %v", err)
+	}
+	plan.Toolsets["host"] = "sha256-" + strings.Repeat("c", 64)
+	if _, err := plan.entries(); err == nil || !strings.Contains(err.Error(), "request host toolset identity") {
+		t.Fatalf("forged plan changed the host toolset identity: %v", err)
+	}
+}
+
+func TestProbeRequestRejectsUnusedHostToolsetIdentity(t *testing.T) {
+	request := testProbeRequest()
+	request.HostToolsetIdentity = "sha256-" + strings.Repeat("b", 64)
+	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "without a scoped host tool") {
+		t.Fatalf("request accepted an unrelated host toolset identity: %v", err)
+	}
+}
+
+func TestProbeRequestRejectsHostStdoutAsTargetPathProvenance(t *testing.T) {
+	request := ProbeRequest{
+		Schema: LinuxProbeRequestSchema, HostToolsetIdentity: "sha256-" + strings.Repeat("b", 64),
+		Steps: []ProbeStep{{
+			Name: "host-path", Tool: "host@cc", StdoutExecrootRelative: true,
+		}},
+		Outcome: ProbeOutcome{Kind: "text", Step: "host-path", Stream: "stdout"},
+	}
+	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "cannot assign current-scope stdout path provenance") {
+		t.Fatalf("host executable path was treated as target toolset evidence: %v", err)
+	}
+	request.Steps[0].StdoutExecrootRelative = false
+	if err := request.Validate(); err != nil {
+		t.Fatalf("ordinary host program stdout lost text probe support: %v", err)
+	}
+}
+
 func testProbePlanUnionVariants(t *testing.T, identity string) (*ProbePlan, *ProbePlan) {
 	t.Helper()
 	build := func(uniqueSource string) *ProbePlan {
@@ -529,6 +608,15 @@ func TestProbeRequestRejectsForwardConditionAndUnknownPlaceholder(t *testing.T) 
 	request.Steps[0].Arguments = append(request.Steps[0].Arguments, "${unknown:x}")
 	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "unsupported placeholder") {
 		t.Fatalf("placeholder error = %v", err)
+	}
+}
+
+func TestProbeRequestEqualityBindsHostToolsetIdentity(t *testing.T) {
+	left := testProbeRequest()
+	right := left
+	right.HostToolsetIdentity = "sha256-" + strings.Repeat("a", 64)
+	if equalLinuxProbeRequest(left, right) {
+		t.Fatal("request equality ignored a different host toolset")
 	}
 }
 

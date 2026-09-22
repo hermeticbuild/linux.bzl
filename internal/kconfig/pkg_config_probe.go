@@ -15,61 +15,76 @@ import (
 const linuxProbePkgConfigRole = "pkg-config"
 
 func (e *LinuxProbeEvaluator) configuredPkgConfigQuery(command string) (string, bool, error) {
-	request, recognized, err := e.configuredPkgConfigQueryRequest(command)
+	request, projection, recognized, err := e.configuredPkgConfigQueryRequest(command)
 	if err != nil || !recognized {
 		return "", recognized, err
+	}
+	if projection != nil && e.pkgConfigManifest != nil {
+		for _, name := range projection.packages {
+			if _, present := e.pkgConfigManifest.Packages[name]; !present {
+				return "", true, nil
+			}
+		}
+		return projection.text, true, nil
 	}
 	value, err := e.requestText(request)
 	return value, true, err
 }
 
-// configuredPkgConfigQueryRequest accepts the two forms used by upstream
+type pkgConfigStatusProjection struct {
+	packages []string
+	text     string
+}
+
+// configuredPkgConfigQueryRequest accepts the forms used by upstream
 // Linux host-tool Makefiles:
 //
 //	CONFIGURED_PKG_CONFIG --cflags PACKAGE 2>/dev/null
 //	CONFIGURED_PKG_CONFIG PACKAGE --libs 2>/dev/null || echo LITERAL
+//	CONFIGURED_PKG_CONFIG --exists PACKAGE 2>/dev/null && echo LITERAL
 //
 // The configured shim validates the package/output-mode grammar again. This
 // parser bounds shell authority: every query word and fallback is literal,
 // stderr may only be discarded to /dev/null, and no other control flow is
 // admitted. scriptrun supplies the configured role through a private proxy.
-func (e *LinuxProbeEvaluator) configuredPkgConfigQueryRequest(command string) (ProbeRequest, bool, error) {
+func (e *LinuxProbeEvaluator) configuredPkgConfigQueryRequest(command string) (ProbeRequest, *pkgConfigStatusProjection, bool, error) {
 	if e == nil {
-		return ProbeRequest{}, false, fmt.Errorf("Linux pkg-config probe evaluator is nil")
+		return ProbeRequest{}, nil, false, fmt.Errorf("Linux pkg-config probe evaluator is nil")
 	}
 	command = strings.TrimSpace(command)
 	if command == "" || len(command) > 1<<16 || strings.ContainsAny(command, "\x00\r\n") {
-		return ProbeRequest{}, false, nil
+		return ProbeRequest{}, nil, false, nil
 	}
 	tokens, err := lexCompactKbuildRecipe(command)
 	if err != nil {
 		if strings.Contains(command, kbuildActionRoleTokenPrefix) {
-			return ProbeRequest{}, true, fmt.Errorf("lex configured pkg-config query: %w", err)
+			return ProbeRequest{}, nil, true, fmt.Errorf("lex configured pkg-config query: %w", err)
 		}
-		return ProbeRequest{}, false, nil
+		return ProbeRequest{}, nil, false, nil
 	}
 	if len(tokens) == 0 || tokens[0].operator {
-		return ProbeRequest{}, false, nil
+		return ProbeRequest{}, nil, false, nil
 	}
 	ref, selected := parseKbuildActionRoleToken(tokens[0].value)
 	if !selected || ref.Role != linuxProbePkgConfigRole {
-		return ProbeRequest{}, false, nil
+		return ProbeRequest{}, nil, false, nil
 	}
 	if ref.Scope != "host" || e.scope != "host" {
-		return ProbeRequest{}, true, fmt.Errorf("configured pkg-config query requires the host action scope")
+		return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config query requires the host action scope")
 	}
 	if e.tools[linuxProbePkgConfigRole] == "" {
-		return ProbeRequest{}, true, fmt.Errorf("configured pkg-config query references an unavailable host action role")
+		return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config query references an unavailable host action role")
 	}
 	if e.tools[linuxProbeScriptRunner] == "" || e.tools[linuxProbeScriptRuntime] == "" {
-		return ProbeRequest{}, true, fmt.Errorf(
+		return ProbeRequest{}, nil, true, fmt.Errorf(
 			"configured pkg-config query requires configured %s and %s roles",
 			linuxProbeScriptRunner, linuxProbeScriptRuntime,
 		)
 	}
 
 	primaryEnd := len(tokens)
-	fallbackIndex := -1
+	continuationIndex := -1
+	projectOnSuccess := false
 	for index := 1; index < len(tokens); index++ {
 		if !tokens[index].operator {
 			continue
@@ -77,18 +92,19 @@ func (e *LinuxProbeEvaluator) configuredPkgConfigQueryRequest(command string) (P
 		switch tokens[index].value {
 		case ">":
 			// The exact descriptor-qualified discard is validated below.
-		case "||":
-			if fallbackIndex >= 0 {
-				return ProbeRequest{}, true, fmt.Errorf("configured pkg-config query repeats its fallback operator")
+		case "||", "&&":
+			if continuationIndex >= 0 {
+				return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config query repeats its shell continuation")
 			}
-			fallbackIndex = index
+			continuationIndex = index
+			projectOnSuccess = tokens[index].value == "&&"
 			primaryEnd = index
 		default:
-			return ProbeRequest{}, true, fmt.Errorf("configured pkg-config query uses unsupported operator %q", tokens[index].value)
+			return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config query uses unsupported operator %q", tokens[index].value)
 		}
 	}
 	if primaryEnd < 5 {
-		return ProbeRequest{}, true, fmt.Errorf("configured pkg-config query omits its exact stderr discard")
+		return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config query omits its exact stderr discard")
 	}
 	redirect := tokens[primaryEnd-3 : primaryEnd]
 	if redirect[0].operator || redirect[0].value != "2" ||
@@ -97,34 +113,54 @@ func (e *LinuxProbeEvaluator) configuredPkgConfigQueryRequest(command string) (P
 		redirect[0].end != redirect[1].start ||
 		command[redirect[0].start:redirect[0].end] != "2" ||
 		command[redirect[2].start:redirect[2].end] != "/dev/null" {
-		return ProbeRequest{}, true, fmt.Errorf("configured pkg-config query requires exact stderr discard 2>/dev/null")
+		return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config query requires exact stderr discard 2>/dev/null")
 	}
 	for _, token := range tokens[1 : primaryEnd-3] {
 		if token.operator {
-			return ProbeRequest{}, true, fmt.Errorf("configured pkg-config query has an operator in its argument list")
+			return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config query has an operator in its argument list")
 		}
 	}
 	queryArguments, err := configuredPkgConfigLiteralArguments(command, tokens[1:primaryEnd-3])
 	if err != nil {
-		return ProbeRequest{}, true, err
+		return ProbeRequest{}, nil, true, err
 	}
 	if err := validateConfiguredPkgConfigArguments(queryArguments); err != nil {
-		return ProbeRequest{}, true, err
+		return ProbeRequest{}, nil, true, err
+	}
+	if projectOnSuccess {
+		exists := false
+		for _, argument := range queryArguments {
+			if argument == "--exists" {
+				exists = true
+			}
+		}
+		if !exists {
+			return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config success projection requires --exists mode")
+		}
 	}
 
-	fallback := ""
-	if fallbackIndex >= 0 {
-		fallbackTokens := tokens[fallbackIndex+1:]
+	continuation := ""
+	if continuationIndex >= 0 {
+		fallbackTokens := tokens[continuationIndex+1:]
 		if len(fallbackTokens) != 2 || fallbackTokens[0].operator || fallbackTokens[0].value != "echo" || fallbackTokens[1].operator ||
 			command[fallbackTokens[0].start:fallbackTokens[0].end] != "echo" {
-			return ProbeRequest{}, true, fmt.Errorf("configured pkg-config query fallback must be exactly echo LITERAL")
+			return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config query fallback must be exactly echo LITERAL")
 		}
-		fallback, err = configuredPkgConfigLiteralWord(command, fallbackTokens[1])
+		continuation, err = configuredPkgConfigLiteralWord(command, fallbackTokens[1])
 		if err != nil {
-			return ProbeRequest{}, true, fmt.Errorf("configured pkg-config query fallback: %w", err)
+			return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config query fallback: %w", err)
 		}
-		if !validConfiguredPkgConfigFallback(fallback) {
-			return ProbeRequest{}, true, fmt.Errorf("configured pkg-config query has unsafe fallback literal %q", fallback)
+		if !validConfiguredPkgConfigFallback(continuation) {
+			return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config query has unsafe fallback literal %q", continuation)
+		}
+	}
+	var projection *pkgConfigStatusProjection
+	if projectOnSuccess {
+		projection = &pkgConfigStatusProjection{text: continuation}
+		for _, argument := range queryArguments {
+			if argument != "--exists" {
+				projection.packages = append(projection.packages, argument)
+			}
 		}
 	}
 
@@ -133,8 +169,15 @@ func (e *LinuxProbeEvaluator) configuredPkgConfigQueryRequest(command string) (P
 		scriptWords = append(scriptWords, sourceShellQueryScriptWord(argument))
 	}
 	script := strings.Join(scriptWords, " ") + " 2>/dev/null"
-	if fallback != "" {
-		script += " || echo " + sourceShellQueryScriptWord(fallback)
+	if continuation != "" {
+		if projectOnSuccess {
+			// `--exists` writes no text: the selected source projects its exit
+			// status to one echo word. A missing declared package therefore
+			// yields empty text, exactly as `&& echo` in the Makefile does.
+			script += " && echo " + sourceShellQueryScriptWord(continuation) + " || :"
+		} else {
+			script += " || echo " + sourceShellQueryScriptWord(continuation)
+		}
 	} else {
 		// GNU Make's shell function consumes stdout even when the command exits
 		// nonzero. Keep the script action successful while scriptrun still fails
@@ -164,9 +207,9 @@ func (e *LinuxProbeEvaluator) configuredPkgConfigQueryRequest(command string) (P
 		},
 	}
 	if err := request.Validate(); err != nil {
-		return ProbeRequest{}, true, fmt.Errorf("configured pkg-config query request: %w", err)
+		return ProbeRequest{}, nil, true, fmt.Errorf("configured pkg-config query request: %w", err)
 	}
-	return request, true, nil
+	return request, projection, true, nil
 }
 
 func configuredPkgConfigLiteralArguments(command string, tokens []compactKbuildRecipeToken) ([]string, error) {

@@ -258,15 +258,56 @@ func sameKbuildDeferredContentQuerySource(left, right KbuildDeferredContentQuery
 
 // ApplyKbuildDeferredContentSelections attaches the independently solved query
 // actions to every profile registry that can expose their tokens. Registries
-// are intentionally process-local and shared by profile copies, so the
-// selected action graph remains out of serialized Make metadata.
+// are intentionally process-local, so the selected action graph remains out
+// of serialized Make metadata. An executable recipe has its own immutable
+// preline Make state: shell queries first expanded by that line, or later by
+// its selected action, live in its registry rather than the final profile's.
 func ApplyKbuildDeferredContentSelections(
 	profiles []CompactKbuildProfile,
 	selections map[string]KbuildDeferredContentSelection,
 ) error {
 	found := map[string]bool{}
+	registries := make([]map[string]KbuildDeferredContentQuery, len(profiles))
 	for profileIndex := range profiles {
-		registry := profiles[profileIndex].deferredContentQueries
+		profile := profiles[profileIndex]
+		registry := maps.Clone(profile.deferredContentQueries)
+		if registry == nil {
+			registry = map[string]KbuildDeferredContentQuery{}
+		}
+		// The source walker records only selected executable recipe lines in
+		// this map. Admit a query from one of those views only when graph
+		// selection independently found the same unforgeable token. Keep the
+		// historical line maps unchanged when publishing its selected owner.
+		for target, snapshots := range profile.targetLineReadSnapshots {
+			for _, snapshot := range snapshots {
+				if snapshot == nil || snapshot.Line.Target != target ||
+					snapshot.Evaluation.Profile.Name != profile.Name {
+					return fmt.Errorf("Kbuild profile %q target %q has an inconsistent selected recipe query snapshot", profile.Name, target)
+				}
+				for token, query := range snapshot.Evaluation.Profile.deferredContentQueries {
+					if _, selected := selections[token]; !selected {
+						continue
+					}
+					normalized, err := normalizedKbuildDeferredContentQuery(query)
+					if err != nil {
+						return err
+					}
+					if normalized.Token != token {
+						return fmt.Errorf("Kbuild profile %q target %q selected recipe query registry key %q differs from token %q", profile.Name, target, token, normalized.Token)
+					}
+					if previous, exists := registry[token]; exists {
+						previous, err = normalizedKbuildDeferredContentQuery(previous)
+						if err != nil {
+							return err
+						}
+						if !sameKbuildDeferredContentQuerySource(previous, normalized) {
+							return fmt.Errorf("Kbuild profile %q target %q selected recipe query %q has conflicting provenance", profile.Name, target, token)
+						}
+					}
+					registry[token] = normalized
+				}
+			}
+		}
 		for token, query := range registry {
 			selection, ok := selections[token]
 			if !ok {
@@ -295,11 +336,15 @@ func ApplyKbuildDeferredContentSelections(
 			registry[token] = normalized
 			found[token] = true
 		}
+		registries[profileIndex] = registry
 	}
 	for token := range selections {
 		if !found[token] {
 			return fmt.Errorf("selected deferred Kbuild content query %q has no profile registry", token)
 		}
+	}
+	for profileIndex := range profiles {
+		profiles[profileIndex].deferredContentQueries = registries[profileIndex]
 	}
 	return nil
 }
@@ -803,7 +848,10 @@ func bindActionRecipeDeferredKbuildContent(plan *ActionPlan, node *ActionPlanNod
 		}
 		selection, ok := plan.metadata.deferredKbuildContentSelection(token)
 		if !ok {
-			return fmt.Errorf("recipe references deferred Kbuild content token %q without a selected query action", token)
+			return fmt.Errorf(
+				"recipe references deferred Kbuild content token %q without a selected query action: %s",
+				token, plan.metadata.describeMissingDeferredContentSelection(query),
+			)
 		}
 		producer, err := builder.buildDeferredKbuildContentQuery(query, selection)
 		if err != nil {
@@ -872,6 +920,29 @@ func bindActionRecipeDeferredKbuildContent(plan *ActionPlan, node *ActionPlanNod
 		}
 	}
 	return nil
+}
+
+// A missing selected query may arise because the solver omitted its source
+// target or because the selected action omitted its query reference. Report
+// that distinction without including captured command or environment values.
+func (m *CompactMetadata) describeMissingDeferredContentSelection(query KbuildDeferredContentQuery) string {
+	exact, references, otherProfile := 0, 0, 0
+	for _, selected := range m.Config.KbuildSelections {
+		if selected.Target != query.Origin.Target {
+			continue
+		}
+		if selected.Profile != query.Origin.Profile {
+			otherProfile++
+			continue
+		}
+		exact++
+		tokens, err := compactKbuildSelectionDeferredContentQueries(selected)
+		if err == nil {
+			references += len(tokens)
+		}
+	}
+	return fmt.Sprintf("registered origin %s:%s generation=%d; %d exact selected targets with %d query references; %d same-target selections in other profiles",
+		query.Origin.Profile, query.Origin.Target, query.Generation, exact, references, otherProfile)
 }
 
 func (m *CompactMetadata) deferredKbuildContentQuery(token string) (KbuildDeferredContentQuery, bool, error) {

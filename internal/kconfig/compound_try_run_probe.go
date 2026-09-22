@@ -21,6 +21,105 @@ type compoundTryRunReplacement struct {
 	value string
 }
 
+// simpleTryRunCompilerLink lowers a source-owned stdin-to-compiler link check
+// to the configured compiler's link action. Text measured by earlier probes
+// becomes candidate-owned argv, never executable shell source. The selected
+// Makefile still controls the C input, argument order, and success condition.
+func (e *LinuxProbeEvaluator) simpleTryRunCompilerLink(command string) (linuxProbeTruth, bool, error) {
+	if !strings.HasPrefix(command, "echo ") || !strings.Contains(command, " | ") {
+		return linuxProbeTruth{}, false, nil
+	}
+	tokens, err := lexCompactKbuildRecipe(command)
+	if err != nil {
+		return linuxProbeTruth{}, false, nil
+	}
+	if len(tokens) < 8 || tokens[0].operator || tokens[0].value != "echo" ||
+		tokens[1].operator || !tokens[2].operator || tokens[2].value != "|" || tokens[3].operator ||
+		!e.isToolToken(tokens[3].value, "cc") {
+		return linuxProbeTruth{}, false, nil
+	}
+	// Other source try-runs may compile instead of link, or compose several
+	// commands; retain their existing compound-shell lowering.
+	if tokens[len(tokens)-1].value != "-" {
+		return linuxProbeTruth{}, false, nil
+	}
+	for _, token := range tokens[4:] {
+		if token.operator || token.value == "-c" || token.value == "-S" {
+			return linuxProbeTruth{}, false, nil
+		}
+	}
+	rawSource := command[tokens[1].start:tokens[1].end]
+	if tokens[1].shellExpansion || tokens[1].pathnameExpansion ||
+		strings.ContainsAny(rawSource, "`$") {
+		return linuxProbeTruth{}, true, fmt.Errorf("compiler link input has active shell expansion")
+	}
+	source, err := unquoteLinuxProbeSource(rawSource)
+	if err != nil || source == "" || len(source) > 1024 || strings.ContainsAny(source, "\x00\r\n") || strings.HasPrefix(source, "-") {
+		return linuxProbeTruth{}, true, fmt.Errorf("compiler link input must be one bounded literal C line: %v", err)
+	}
+	var candidate []string
+	mode, output := false, false
+	for index := 4; index < len(tokens); index++ {
+		token := tokens[index]
+		if token.operator || token.pathnameExpansion || token.shellExpansion {
+			return linuxProbeTruth{}, true, fmt.Errorf("compiler link arguments contain active shell syntax")
+		}
+		switch {
+		case token.value == "-xc" && !mode:
+			mode = true
+		case token.value == "-x" && !mode && index+1 < len(tokens) && tokens[index+1].value == "c":
+			mode = true
+			index++
+		case token.value == "-o" && !output && index+1 < len(tokens) && tokens[index+1].value == "/dev/null":
+			output = true
+			index++
+		case token.value == "-" && index == len(tokens)-1:
+			// The managed compiler input is supplied through stdin.
+		default:
+			if token.value == "-" || token.value == "-o" || token.value == "-x" || token.value == "-xc" {
+				return linuxProbeTruth{}, true, fmt.Errorf("compiler link uses unsupported language, input, or output selection")
+			}
+			word := probeCompilerRootArgument(token.value)
+			if symbol, symbolic, symbolErr := e.symbolArgument(word); symbolErr != nil {
+				return linuxProbeTruth{}, true, symbolErr
+			} else if symbolic && symbol.kind != "boolean" && symbol.kind != "selection" && symbol.kind != "source-shell-words" {
+				word, err = e.renderSourceShellWords(word)
+				if err != nil {
+					return linuxProbeTruth{}, true, err
+				}
+			} else if !symbolic {
+				if err := validateCompoundTryRunWord(word); err != nil {
+					return linuxProbeTruth{}, true, err
+				}
+			}
+			candidate = append(candidate, word)
+		}
+	}
+	if !mode || !output || tokens[len(tokens)-1].value != "-" {
+		return linuxProbeTruth{}, true, fmt.Errorf("compiler link requires literal C stdin and /dev/null output")
+	}
+	arguments, conditional, fragments, owned, dependencies, err := e.lowerSymbolicCandidateArguments(
+		candidate, probeCandidateArgumentMask(len(candidate)), ProbeCandidatePolicyCCLink,
+	)
+	if err != nil {
+		return linuxProbeTruth{}, true, err
+	}
+	arguments = append(arguments, "-x", "c", "-o", "${scratch:output}", "-")
+	request := ProbeRequest{
+		Schema: LinuxProbeRequestSchema, InputCount: len(dependencies),
+		Sources: []string{linuxProbeRootAnchor},
+		SourceRoots: []string{linuxProbeHostDepsRootName, linuxProbeSourceRootName},
+		Scratch: []ProbeScratch{{Name: "output", Kind: "file"}},
+		Steps: []ProbeStep{{
+			Name: "compiler-link", Tool: "cc", Arguments: arguments, ConditionalArguments: conditional,
+			ArgumentFragments: fragments, Candidate: owned, Stdin: source + "\n",
+		}},
+		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{Operator: "exit-zero", Step: "compiler-link"}},
+	}
+	truth, err := e.requestTruth(request, dependencies...)
+	return truth, true, err
+}
+
 // compoundTryRunProbe recognizes a bounded shell command graph containing at
 // least one selected configured tool. The graph and every compiler argument
 // remain Linux source data; this layer validates only shell authority and

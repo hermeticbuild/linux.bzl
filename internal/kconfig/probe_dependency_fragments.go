@@ -39,7 +39,7 @@ func IsProbeResultPredicate(predicate ProbePredicate) bool {
 		return true
 	case "not":
 		return len(predicate.Operands) == 1 && IsProbeResultPredicate(predicate.Operands[0])
-	case "result-true", "result-false", "result-text-empty", "result-text-equals", "result-text-contains", "result-path-fallback":
+	case "result-true", "result-false", "result-text-empty", "result-text-equals", "result-text-contains", "result-text-contains-echo-safe", "result-path-fallback":
 		return true
 	default:
 		return false
@@ -85,10 +85,15 @@ func evaluateProbeResultPredicate(predicate ProbePredicate, inputs map[string]Pr
 			return false, fmt.Errorf("result input %s is not boolean", predicate.Result)
 		}
 		return *result.Boolean == (predicate.Operator == "result-true"), nil
-	case "result-text-empty", "result-text-equals", "result-text-contains":
+	case "result-text-empty", "result-text-equals", "result-text-contains", "result-text-contains-echo-safe":
 		result, ok := inputs[predicate.Result]
 		if !ok || result.Kind != "text" {
 			return false, fmt.Errorf("result input %s is not text", predicate.Result)
+		}
+		if predicate.Operator == "result-text-contains-echo-safe" {
+			if err := validateFixedEchoGrepText(result.Text); err != nil {
+				return false, fmt.Errorf("result input %s quoted echo value: %w", predicate.Result, err)
+			}
 		}
 		switch predicate.Operator {
 		case "result-text-empty":

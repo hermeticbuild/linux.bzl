@@ -87,6 +87,74 @@ func TestKbuildProbeScopesImportAuthenticatedKconfigToolsetPath(t *testing.T) {
 	}
 }
 
+func TestKbuildSavedCommandComparisonEscapesAuthenticatedCompilerPath(t *testing.T) {
+	const canonicalPath = "external/compiler/vendor-sdk"
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	options := KbuildProbeWorkloadOptions{Target: testKbuildProbeScopeOptions(t, fixture)}
+	oracle := &ProbeResultOracle{
+		results:  map[string]ProbeResult{},
+		toolsets: map[string]string{"target": bootstrapTestIdentity},
+	}
+	const source = `
+empty :=
+space := $(empty) $(empty)
+space_escape := _-_SPACE_-_
+cmd_saved = $(SDK) -c input.c
+cmd_current = $(SDK) -c input.c
+cmd_different = $(SDK) -S input.c
+cmd-check = $(filter-out $(subst $(space),$(space_escape),$(strip $(cmd_saved))), \
+                          $(subst $(space),$(space_escape),$(strip $(cmd_$(1)))))
+same = $(call cmd-check,current)
+different = $(call cmd-check,different)
+escaped = $(subst $(space),$(space_escape),$(strip $(cmd_current)))
+`
+	for replay := 0; replay < 2; replay++ {
+		upstream, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
+		if err != nil {
+			t.Fatal(err)
+		}
+		capability, err := upstream.EncodePath("target", canonicalPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evaluation, err := EvaluateKbuildProbeWorkload(options, oracle, func(scopes *KbuildProbeScopes) (map[string]string, error) {
+			imported, err := scopes.ImportToolsetPathCapabilities(capability, upstream.NormalizeValue)
+			if err != nil {
+				return nil, err
+			}
+			parserOptions, err := scopes.Options("target", KbuildOptions{
+				Variables: map[string]string{"SDK": imported}, CaptureVariables: []string{"same", "different", "escaped"},
+				ConfigVariablesComplete: true, MakeVariablesComplete: true,
+			})
+			if err != nil {
+				return nil, err
+			}
+			parsed, err := parseKbuildWithOptions(strings.NewReader(source), "scripts/Kbuild.include", parserOptions, "")
+			if err != nil {
+				return nil, err
+			}
+			result := map[string]string{}
+			for _, name := range []string{"same", "different", "escaped"} {
+				result[name], err = parserOptions.ResolveSymbolic(parsed.Variables[name])
+				if err != nil {
+					return nil, err
+				}
+			}
+			if _, err := scopes.evaluators["target"].NormalizeToolsetPathCapabilities(result["escaped"]); err == nil ||
+				!strings.Contains(err.Error(), "suffix outside its provenance envelope") {
+				return nil, fmt.Errorf("escaped command reached action boundary: %v", err)
+			}
+			return result, nil
+		})
+		if err != nil {
+			t.Fatalf("replay %d saved command: %v", replay, err)
+		}
+		if evaluation.Value["same"] != "" || !strings.Contains(evaluation.Value["different"], "_-_SPACE_-_-S") {
+			t.Fatalf("replay %d saved command comparison did not distinguish the changed command", replay)
+		}
+	}
+}
+
 type kbuildProbeWorkloadFixture struct {
 	TargetFlags string
 	HostFlags   string
@@ -835,6 +903,86 @@ endif
 	}
 }
 
+func TestEarlyKbuildSymbolicSelectorsAdoptCompilerGuardAfterEnvironmentSwitch(t *testing.T) {
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	opts := KbuildProbeWorkloadOptions{Target: testKbuildProbeScopeOptions(t, fixture)}
+	const source = `
+TMPOUT = .tmp_$$$$
+try-run = $(shell set -e; TMP=$(TMPOUT)/tmp; trap "rm -rf $(TMPOUT)" EXIT; mkdir -p $(TMPOUT); if ($(1)) >/dev/null 2>&1; then echo "$(2)"; else echo "$(3)"; fi)
+__cc-option = $(call try-run,$(1) -Werror $(2) -c -x c /dev/null -o "$$TMP",$(2),$(3))
+cc-option = $(call __cc-option,$(CC),$(1),$(2))
+indirect := $(call cc-option,-mindirect-branch-cs-prefix)
+`
+	discovery, err := EvaluateKbuildProbeWorkload(opts, nil, func(scopes *KbuildProbeScopes) (string, error) {
+		options, err := scopes.Options("target", KbuildOptions{
+			Variables:               map[string]string{"CC": opts.Target.Tools["cc"]},
+			ConfigVariablesComplete: true, MakeVariablesComplete: true,
+			CaptureVariables: []string{"indirect"},
+		})
+		if err != nil {
+			return "", err
+		}
+		parsed, err := parseKbuildWithOptions(strings.NewReader(source), "arch/x86/Makefile", options, "")
+		if err != nil {
+			return "", err
+		}
+		indirect := parsed.Variables["indirect"]
+		if !linuxProbeSymbolPattern.MatchString(indirect) {
+			t.Fatalf("source compiler option = %q, want published probe token", indirect)
+		}
+		original := scopes.evaluators["target"]
+		environment := maps.Clone(original.scriptEnvironment)
+		environment["KBUILD_TEST_PHASE"] = "later"
+		refreshed, err := original.WithScriptEnvironment(environment)
+		if err != nil {
+			return "", err
+		}
+		if _, cached := refreshed.symbols[indirect]; cached {
+			t.Fatalf("environment switch retained local symbol cache instead of registry adoption")
+		}
+		// The early one-toolset parser receives these public callbacks while
+		// expanding arch/x86's RETPOLINE_CFLAGS. Its literal Clang flag proves
+		// the value nonempty even when the cc-option result is unmeasured.
+		later, err := parseKbuildWithOptions(strings.NewReader(`
+RETPOLINE_CFLAGS := -mretpoline-external-thunk $(indirect)
+ifeq ($(RETPOLINE_CFLAGS),)
+selected := empty
+else
+selected := nonempty
+endif
+`), "arch/x86/Makefile", KbuildOptions{
+			Variables:               map[string]string{"indirect": indirect},
+			ConfigVariablesComplete: true, MakeVariablesComplete: true,
+			CaptureVariables: []string{"selected"},
+			SelectSymbolic:   refreshed.SelectSymbolic, TransformSymbolic: refreshed.TransformSymbolic,
+			ResolveSymbolic: refreshed.ResolveSymbolic,
+		}, "")
+		if err != nil {
+			return "", err
+		}
+		if later.Variables["selected"] != "nonempty" {
+			t.Fatalf("Clang retpoline branch = %q, want nonempty", later.Variables["selected"])
+		}
+		if _, recognized, err := refreshed.TransformSymbolic("strip", []string{indirect}); err != nil || !recognized {
+			t.Fatalf("early symbolic strip after source environment switch: recognized=%t err=%v", recognized, err)
+		}
+		if _, cached := refreshed.symbols[indirect]; !cached {
+			t.Fatalf("early callbacks did not adopt exact compiler symbol from workload registry")
+		}
+		unknown := linuxProbeSymbolPrefix + strings.Repeat("0", 64)
+		if _, _, err := refreshed.SelectSymbolic(unknown, "", true, "yes", "no"); err == nil {
+			t.Fatal("unpublished compiler symbol accepted after environment switch")
+		}
+		return later.Variables["selected"], nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if discovery.Value != "nonempty" || len(discovery.Plan.Nodes) != 1 {
+		t.Fatalf("retpoline source discovery = %q, plan %#v; want one measured option with a static nonempty branch", discovery.Value, discovery.Plan.Nodes)
+	}
+}
+
 func TestKbuildCompoundSymbolicComparisonRetainsMultipleDependencies(t *testing.T) {
 	fixture := linuxCompilerBootstrapFixtures(t)[1]
 	opts := KbuildProbeWorkloadOptions{Target: testKbuildProbeScopeOptions(t, fixture)}
@@ -871,6 +1019,167 @@ endif
 	}
 	if len(evaluation.Plan.Nodes) != 2 || !linuxProbeSymbolPattern.MatchString(evaluation.Value) {
 		t.Fatalf("multi-result compound comparison = %q, plan %#v; want two inputs and one retained selection", evaluation.Value, evaluation.Plan.Nodes)
+	}
+}
+
+func sourceSelectedPkgConfigPreprocessorPlan(t *testing.T, query, flags string) *ProbePlan {
+	t.Helper()
+	opts := pkgConfigProbeOptions(t)
+	makefile := fmt.Sprintf(`
+pound := \#
+LIBELF_FLAGS := $(shell $(HOSTPKG_CONFIG) %s)
+OBJTOOL_CFLAGS := -Werror %s
+elfshdr := $(shell echo '$(pound)include <libelf.h>' | $(CC) $(OBJTOOL_CFLAGS) -x c -E - 2>/dev/null | grep elf_getshdr)
+`, query, flags)
+	workload := func(scopes *KbuildProbeScopes) (string, error) {
+		options, err := scopes.Options("host", KbuildOptions{
+			Variables: map[string]string{
+				"CC":             KbuildActionRoleToken("host", "cc"),
+				"HOSTPKG_CONFIG": KbuildActionRoleToken("host", linuxProbePkgConfigRole),
+			},
+			ConfigVariablesComplete: true,
+			MakeVariablesComplete:   true,
+			CaptureVariables:        []string{"elfshdr"},
+		})
+		if err != nil {
+			return "", err
+		}
+		parsed, err := parseKbuildWithOptions(strings.NewReader(makefile), "tools/objtool/Makefile", options, "")
+		if err != nil {
+			return "", err
+		}
+		return parsed.Variables["elfshdr"], nil
+	}
+	discovery, err := EvaluateKbuildProbeWorkload(opts, nil, workload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return discovery.Plan
+}
+
+func sourceSelectedPkgConfigPreprocessorRoot(t *testing.T, flags string) {
+	t.Helper()
+	plan := sourceSelectedPkgConfigPreprocessorPlan(t, "libelf --cflags 2>/dev/null", flags)
+	if len(plan.Nodes) != 2 {
+		t.Fatalf("selected package flags and header probe = %#v, want two causal nodes", plan.Nodes)
+	}
+	pkg, preprocess := plan.Nodes[0], plan.Nodes[1]
+	if !slices.Equal(preprocess.Inputs, []string{pkg.ID}) {
+		t.Fatalf("selected header probe inputs = %q, want package producer %s", preprocess.Inputs, pkg.ID)
+	}
+	pkgRequest := plan.Requests[pkg.RequestID]
+	if len(pkgRequest.Steps) != 1 || pkgRequest.Steps[0].Name != "configured-pkg-config-query" {
+		t.Fatalf("selected package producer = %#v", pkgRequest)
+	}
+	request := plan.Requests[preprocess.RequestID]
+	if !slices.Equal(request.SourceRoots, []string{linuxProbeHostDepsRootName, linuxProbeSourceRootName}) ||
+		!slices.Equal(request.Sources, []string{linuxProbeRootAnchor}) ||
+		len(request.Steps) != 1 || request.Steps[0].Name != "preprocess" ||
+		len(request.Steps[0].ArgumentFragments) != 1 {
+		t.Fatalf("source selected package flag root and compiler argv = %#v", request)
+	}
+}
+
+func TestKbuildObjtoolCompilerIncludeDoesNotClaimParseTimeObjectWrite(t *testing.T) {
+	for _, stderrRedirect := range []string{"", " 2>/dev/null"} {
+		t.Run("stderr redirect "+stderrRedirect, func(t *testing.T) {
+			probeOptions := pkgConfigProbeOptions(t)
+			objectRoot := t.TempDir()
+			makefile := `
+pound := \#
+LIBELF_FLAGS := $(shell $(HOSTPKG_CONFIG) libelf --cflags 2>/dev/null)
+LIBSUBCMD_OUTPUT := $(objtree)/tools/objtool/libsubcmd
+OBJTOOL_CFLAGS := -Werror -I$(LIBSUBCMD_OUTPUT)/include $(LIBELF_FLAGS)
+elfshdr := $(shell echo '$(pound)include <libelf.h>' | $(HOSTCC) $(OBJTOOL_CFLAGS) -x c -E -` + stderrRedirect + ` | grep elf_getshdr)
+`
+			discovery, err := EvaluateKbuildProbeWorkload(probeOptions, nil, func(scopes *KbuildProbeScopes) (string, error) {
+				options, optionsErr := scopes.Options("host", KbuildOptions{
+					SourceRoots: map[string]string{"__LINUX_BZL_OBJECT_TREE__": objectRoot},
+					Variables: map[string]string{
+						"HOSTCC":         KbuildActionRoleToken("host", "cc"),
+						"HOSTPKG_CONFIG": KbuildActionRoleToken("host", linuxProbePkgConfigRole),
+						"objtree":        "__LINUX_BZL_OBJECT_TREE__",
+					},
+					ConfigVariablesComplete: true, MakeVariablesComplete: true,
+					CaptureVariables: []string{"elfshdr"},
+				})
+				if optionsErr != nil {
+					return "", optionsErr
+				}
+				parsed, parseErr := parseKbuildWithOptions(strings.NewReader(makefile), "tools/objtool/Makefile", options, "")
+				if parseErr != nil {
+					return "", parseErr
+				}
+				return parsed.Variables["elfshdr"], nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(discovery.Plan.Nodes) != 2 {
+				t.Fatalf("objtool probe nodes = %#v, want pkg-config then preprocess", discovery.Plan.Nodes)
+			}
+			pkg, header := discovery.Plan.Nodes[0], discovery.Plan.Nodes[1]
+			if !slices.Equal(header.Inputs, []string{pkg.ID}) {
+				t.Fatalf("preprocess inputs = %q, want package flags %s", header.Inputs, pkg.ID)
+			}
+			request := discovery.Plan.Requests[header.RequestID]
+			if len(request.Steps) != 1 || request.Steps[0].Name != "preprocess" ||
+				request.Outcome.Predicate == nil || request.Outcome.Predicate.Operator != "all" {
+				t.Fatalf("objtool compiler preprocessor request = %#v", request)
+			}
+		})
+	}
+}
+
+func TestPkgConfigStatusProjectionDoesNotGrantHostCompilerRoot(t *testing.T) {
+	t.Run("status projection with a flag-looking echo", func(t *testing.T) {
+		plan := sourceSelectedPkgConfigPreprocessorPlan(t,
+			"--exists libelf 2>/dev/null && echo --cflags", "$(LIBELF_FLAGS)")
+		if len(plan.Nodes) != 2 || !slices.Equal(plan.Nodes[1].Inputs, []string{plan.Nodes[0].ID}) {
+			t.Fatalf("selected status projection dependency = %#v", plan.Nodes)
+		}
+		request := plan.Requests[plan.Nodes[1].RequestID]
+		if !slices.Equal(request.SourceRoots, []string{linuxProbeSourceRootName}) {
+			t.Fatalf("status text compiler roots = %q, want only Linux", request.SourceRoots)
+		}
+	})
+}
+
+func TestUnownedPkgConfigDependencyDoesNotGrantCandidateHostRoot(t *testing.T) {
+	plan := sourceSelectedPkgConfigPreprocessorPlan(t, "libelf --cflags 2>/dev/null", "$(LIBELF_FLAGS)")
+	if len(plan.Nodes) != 2 {
+		t.Fatalf("source-owned package producer = %#v", plan.Nodes)
+	}
+	pkg := plan.Nodes[0]
+	request := plan.Requests[pkg.RequestID]
+	reference := ProbeReference{NodeID: pkg.ID, RequestID: pkg.RequestID, Scope: pkg.Scope, Kind: request.Outcome.Kind}
+	evaluator := &LinuxProbeEvaluator{symbolRegistry: newLinuxProbeSymbolRegistry()}
+	if err := evaluator.symbolRegistry.publishDefinition(reference, request, nil); err != nil {
+		t.Fatal(err)
+	}
+	// An ordering dependency on the same genuine source query supplies no
+	// candidate argument. Only a fragment at a candidate-owned argv slot
+	// may grant the consumer's host dependency source root.
+	usesHostDeps, err := evaluator.candidateHostDependencyRoot(
+		[]string{"-DONLY_FIXED=1"}, nil, nil,
+		&ProbeCandidateArguments{Policy: ProbeCandidatePolicyCC, Base: []int{0}},
+		[]ProbeReference{reference},
+	)
+	if err != nil || usesHostDeps {
+		t.Fatalf("unowned package dependency grants host root = %t, %v", usesHostDeps, err)
+	}
+}
+
+func TestSourceSelectedPkgConfigFlagsDeclareHostPreprocessorRoot(t *testing.T) {
+	for _, test := range []struct {
+		name, flags string
+	}{
+		{name: "source variable", flags: "$(LIBELF_FLAGS)"},
+		{name: "nested pure Make text", flags: "$(strip $(LIBELF_FLAGS))"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sourceSelectedPkgConfigPreprocessorRoot(t, test.flags)
+		})
 	}
 }
 
@@ -1192,6 +1501,93 @@ flags := $(call cc-option,-fsecond)
 	}
 }
 
+func TestKbuildRecursiveExportSourceShellUsesIncomingEnvironment(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"Kconfig":                 "# declared source root\n",
+		"scripts/pahole-flags.sh": "#!/bin/sh\nprintf '%s\\n' source-flags\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	options := testKbuildProbeScopeOptions(t, fixture)
+	options.SourceRoot = root
+	options.SourceRootAliases = []string{"__LINUX_BZL_SOURCE_TREE__"}
+	options.SourceArchitecture = "x86"
+	options.ScriptEnvironment = map[string]string{"PAHOLE_FLAGS": "previous-exported-value"}
+	options.Tools["pahole"] = "/configured/target/pahole"
+	options.Tools["scriptrun"] = "/configured/target/scriptrun"
+	options.Tools["script-runtime"] = "/configured/target/script-runtime"
+	const makefile = `
+PAHOLE_FLAGS = $(shell PAHOLE=$(PAHOLE) $(srctree)/scripts/pahole-flags.sh)
+export PAHOLE_FLAGS
+observed := $(PAHOLE_FLAGS)
+`
+	for _, test := range []struct {
+		name, incoming string
+		present        bool
+	}{
+		{name: "unset incoming"},
+		{name: "inherited incoming", incoming: "inherited-from-parent", present: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workload := func(scopes *KbuildProbeScopes) (string, error) {
+				inherited := map[string]string{}
+				if test.present {
+					inherited["PAHOLE_FLAGS"] = test.incoming
+				}
+				parserOptions, err := scopes.Options("target", KbuildOptions{
+					RootDir: root, Variables: map[string]string{
+						"PAHOLE":  KbuildActionRoleToken("target", "pahole"),
+						"srctree": "__LINUX_BZL_SOURCE_TREE__",
+					},
+					EnvironmentVariables:  inherited,
+					MakeVariablesComplete: true,
+					CaptureVariables:      []string{"observed"},
+					SkipExportedVariables: true,
+				})
+				if err != nil {
+					return "", err
+				}
+				parsed, err := parseKbuildWithOptions(strings.NewReader(makefile), "Makefile", parserOptions, "")
+				if err != nil {
+					return "", err
+				}
+				if current := scopes.currentScriptEnvironments()["target"]["PAHOLE_FLAGS"]; current != "previous-exported-value" {
+					return "", fmt.Errorf("scoped shell environment was not restored")
+				}
+				return parsed.Variables["observed"], nil
+			}
+			discovery, err := EvaluateKbuildProbeWorkload(KbuildProbeWorkloadOptions{Target: options}, nil, workload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(discovery.Plan.Nodes) != 1 || !linuxProbeSymbolPattern.MatchString(discovery.Value) {
+				t.Fatalf("source shell discovery = %q, nodes = %#v; want one retained helper result", discovery.Value, discovery.Plan.Nodes)
+			}
+			request := discovery.Plan.Requests[discovery.Plan.Nodes[0].RequestID]
+			if !slices.Contains(request.Sources, "scripts/pahole-flags.sh") || len(request.Steps) == 0 {
+				t.Fatalf("source helper request = %#v", request)
+			}
+			for _, step := range request.Steps {
+				if got, present := step.Environment["PAHOLE_FLAGS"]; !present || got != test.incoming {
+					t.Fatalf("incoming PAHOLE_FLAGS in source step = (%q,%t), want (%q,true)", got, present, test.incoming)
+				}
+				for _, fragment := range step.EnvironmentFragments {
+					if fragment.Name == "PAHOLE_FLAGS" {
+						t.Fatalf("source helper depends on its own exported result: %#v", request)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestKbuildProbeEnvironmentRefreshUsesFreshMemosAndRetainsReferences(t *testing.T) {
 	fixture := linuxCompilerBootstrapFixtures(t)[1]
 	target := testKbuildProbeScopeOptions(t, fixture)
@@ -1410,6 +1806,60 @@ func TestKbuildProbeExactEnvironmentBindingsReplaceInternAndRetainReferences(t *
 	}
 	if want := map[string]bool{"first": true, "second": true}; !maps.Equal(boots, want) {
 		t.Fatalf("exact request environments = %#v, want %#v", boots, want)
+	}
+}
+
+func TestEvaluateKbuildProbeWorkloadBindsSourceClangLDFlag(t *testing.T) {
+	fixtures := linuxCompilerBootstrapFixtures(t)
+	opts := KbuildProbeWorkloadOptions{
+		Target: testKbuildProbeScopeOptions(t, fixtures[1]),
+		Host:   ptrKbuildProbeScopeOptions(testKbuildProbeScopeOptions(t, fixtures[0])),
+	}
+	// Executable path equality never changes which configured scope Linux's
+	// source Makefile selected for its compiler and linker contracts.
+	for _, role := range []string{"cc", "ld"} {
+		opts.Host.Tools[role] = opts.Target.Tools[role]
+	}
+	discovery, err := EvaluateKbuildProbeWorkload(opts, nil, func(scopes *KbuildProbeScopes) (string, error) {
+		parseOptions, err := scopes.Options("target", KbuildOptions{
+			Variables: map[string]string{
+				"CC": KbuildActionRoleToken("target", "cc"), "LD": KbuildActionRoleToken("target", "ld"),
+				"CONFIG_CC_IS_CLANG": "y",
+			},
+			MakeVariablesComplete: true, CaptureVariables: []string{"KBUILD_USERLDFLAGS"},
+		})
+		if err != nil {
+			return "", err
+		}
+		parsed, err := parseKbuildWithOptions(strings.NewReader(`
+TMPOUT = .tmp_$$$$
+try-run = $(shell set -e; TMP=$(TMPOUT)/tmp; trap "rm -rf $(TMPOUT)" EXIT; mkdir -p $(TMPOUT); if ($(1)) >/dev/null 2>&1; then echo "$(2)"; else echo "$(3)"; fi)
+__cc-option = $(call try-run,$(1) -Werror $(2) -c -x c /dev/null -o "$$TMP",$(2),$(3))
+cc-option = $(call __cc-option,$(CC),$(1),$(2))
+ifdef CONFIG_CC_IS_CLANG
+KBUILD_USERLDFLAGS += $(call cc-option, --ld-path=$(LD))
+endif
+`), "Makefile", parseOptions, "")
+		if err != nil {
+			return "", err
+		}
+		return parsed.Variables["KBUILD_USERLDFLAGS"], nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !linuxProbeSymbolPattern.MatchString(discovery.Value) || len(discovery.Plan.Nodes) != 1 {
+		t.Fatalf("source Clang linker guard = %q with nodes %#v; want one compiler capability query", discovery.Value, discovery.Plan.Nodes)
+	}
+	node := discovery.Plan.Nodes[0]
+	request := discovery.Plan.Requests[node.RequestID]
+	step := request.Steps[0]
+	if node.Scope != "target" || !slices.Equal(request.ToolRoles(), []string{"cc", "ld"}) ||
+		!slices.Equal(step.AuxiliaryTools, []string{"ld"}) ||
+		!slices.Contains(step.Arguments, "--ld-path=${tool:ld}") ||
+		step.Candidate == nil || !slices.Equal(step.Candidate.Base, []int{0}) ||
+		!step.DiscardStdout || !step.DiscardStderr {
+		t.Fatalf("source Clang linker probe node=%#v request=%#v; want declared target ld and source-suppressed streams", node, request)
 	}
 }
 
@@ -1829,6 +2279,137 @@ func TestKbuildRustObjDirsMaterializesCompleteWordTransformChain(t *testing.T) {
 		!slices.Equal(plan.Nodes[1].Inputs, []string{plan.Nodes[0].ID}) ||
 		!slices.Equal(plan.Nodes[2].Inputs, []string{plan.Nodes[1].ID}) {
 		t.Fatalf("Rust obj-dirs materialization plan = %#v, want three-node dependency chain", plan.Nodes)
+	}
+}
+
+func TestKbuildWholeMakeTextComparesExactSourceLiteral(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := testSymbolicProbeEvaluator(t, builder, nil)
+	compilerText, err := evaluator.requestText(ProbeRequest{
+		Schema:  LinuxProbeRequestSchema,
+		Steps:   []ProbeStep{{Name: "compiler", Tool: "cc", Arguments: []string{"--version"}}},
+		Outcome: ProbeOutcome{Kind: "text", Step: "compiler", Stream: "stdout", FirstLine: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wholeText, err := evaluator.renderMakeTextWithProtocolTransforms(
+		"strip", []string{compilerText}, compilerText,
+		[]linuxProbeMakeTextProtocolTransform{{function: "strip", arguments: []string{""}, inputArgument: 0}},
+		linuxProbeMakeTextProtocolExact,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes := &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{"target": evaluator}}
+	const captured = "rustc 1.100.0-nightly (923c95cdf 2026-09-16)"
+	const nearMatch = "rustc  1.100.0-nightly (923c95cdf 2026-09-16)"
+	for _, test := range []struct {
+		value, expected string
+		equal           bool
+	}{
+		{wholeText, captured, false},
+		{captured, wholeText, true},
+		{wholeText, nearMatch, true},
+	} {
+		selected, recognized, err := scopes.selectSymbolic(test.value, test.expected, test.equal, "selected", "other")
+		if err != nil || !recognized || !linuxProbeSymbolPattern.MatchString(selected) {
+			t.Fatalf("literal Make text comparison = %q, recognized=%t, err=%v", selected, recognized, err)
+		}
+	}
+	plan, err := builder.Plan(evaluator.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, request := range plan.Requests {
+		if request.Outcome.Predicate == nil || request.Outcome.Predicate.Operator != "result-text-equals" {
+			continue
+		}
+		seen[request.Outcome.Predicate.Value] = true
+	}
+	if !seen[captured] || !seen[nearMatch] || len(seen) != 2 {
+		t.Fatalf("exact source literals in measured predicates = %#v", seen)
+	}
+}
+
+func TestKbuildTransformedVersionTextComparesExactNativeLiteral(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := testSymbolicProbeEvaluator(t, builder, nil)
+	scopes := &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{"target": evaluator}}
+	options, err := scopes.Options("target", KbuildOptions{
+		Variables:               map[string]string{"RUSTC": KbuildActionRoleToken("target", "rustc")},
+		ConfigVariablesComplete: true,
+		MakeVariablesComplete:   true,
+		CaptureVariables:        []string{"RUSTC_VERSION_TEXT", "exact_status", "reverse_status", "near_status"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseKbuildWithOptions(strings.NewReader(`
+pound := \#
+RUSTC_VERSION_TEXT=$(subst $(pound),,$(shell $(RUSTC) --version 2>/dev/null))
+export RUSTC_VERSION_TEXT
+ifneq "$(RUSTC_VERSION_TEXT)" "rustc 1.100.0-nightly (923c95cdf 2026-09-16)"
+exact_status := mismatch
+else
+exact_status := match
+endif
+ifneq "rustc 1.100.0-nightly (923c95cdf 2026-09-16)" "$(RUSTC_VERSION_TEXT)"
+reverse_status := mismatch
+else
+reverse_status := match
+endif
+ifneq "$(RUSTC_VERSION_TEXT)" "rustc  1.100.0-nightly (923c95cdf 2026-09-16)"
+near_status := mismatch
+else
+near_status := match
+endif
+`), "include/config/auto.conf.cmd", options, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := parsed.Variables["RUSTC_VERSION_TEXT"]
+	_, symbol, found := scopes.symbolOwner(value)
+	if !found || symbol.kind != "transformed-text" {
+		t.Fatalf("source version value = %#v, want transformed text", symbol)
+	}
+	if exported, ok := parsed.exportedVariables["RUSTC_VERSION_TEXT"]; !ok || exported != value {
+		t.Fatalf("exported source version value = %q, present=%t, want %q", exported, ok, value)
+	}
+	const captured = "rustc 1.100.0-nightly (923c95cdf 2026-09-16)"
+	const nearMatch = "rustc  1.100.0-nightly (923c95cdf 2026-09-16)"
+	for _, name := range []string{"exact_status", "reverse_status", "near_status"} {
+		if selected := parsed.Variables[name]; !linuxProbeSymbolPattern.MatchString(selected) {
+			t.Fatalf("source version comparison %s = %q, want symbolic selection", name, selected)
+		}
+	}
+	plan, err := builder.Plan(evaluator.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 4 {
+		t.Fatalf("version text comparison plan = %#v, want source, derived text, and two exact predicates", plan.Nodes)
+	}
+	seen := map[string]bool{}
+	transformed := false
+	for _, request := range plan.Requests {
+		if request.Outcome.Predicate != nil && request.Outcome.Predicate.Operator == "result-text-equals" {
+			seen[request.Outcome.Predicate.Value] = true
+		}
+		if request.Outcome.Kind == "text" && len(request.Outcome.Fragments) == 1 {
+			fragments := request.Outcome.Fragments[0]
+			transformed = len(fragments.Transforms) == 1 && fragments.Transforms[0].Function == "subst"
+		}
+	}
+	if !seen[captured] || !seen[nearMatch] || len(seen) != 2 || !transformed {
+		t.Fatalf("version source transform/predicates = %t/%#v", transformed, seen)
 	}
 }
 

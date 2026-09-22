@@ -59,6 +59,41 @@ func TestCompactKbuildGeneratedTextProjectionIfChangedWrapper(t *testing.T) {
 	}
 }
 
+func TestCompactKbuildGeneratedTextProjectionSelectedAwkModuleOrder(t *testing.T) {
+	awk := KbuildActionRoleToken(KbuildActionRoleAutoScope, "awk")
+	files := map[string]string{"first.order": "first.o", "second.order": "second.o\nfirst.o\n"}
+	for _, tc := range []struct{ name, recipe, want string }{
+		{"separate file records", awk + ` '!x[$0]++' first.order second.order > modules.order`, "first.o\nsecond.o\n"},
+		{"pipe group records", `{ echo first.o; cat second.order; echo third.o; :; } | ` + awk + ` '!x[$0]++' - > modules.order`, "first.o\nsecond.o\nthird.o\n"},
+		{"source if_changed cmd wrapper", `@set -e; trap 'rm -f modules.order; trap - HUP; kill -s HUP $$' HUP; { :; } | ` + awk + ` '!x[$0]++' - > modules.order; printf '%s\n' 'cmd_modules.order := { :; } | ` + awk + ` '\''!x[$0]++'\'' - > modules.order' > ./.modules.order.cmd`, ""},
+		{"source if_changed wrapper", `@set -e; trap 'rm -f modules.order; trap - HUP; kill -s HUP $$' HUP; { echo first.o; cat second.order; :; } | ` + awk + ` '!x[$0]++' - > modules.order; printf '%s\n' 'savedcmd_modules.order := { echo first.o; } | ` + awk + ` '\''!x[$0]++'\'' - > modules.order' > ./.modules.order.cmd`, "first.o\nsecond.o\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, exact := CompactKbuildGeneratedTextProjection(tc.recipe, "modules.order", files)
+			if !exact || got != tc.want {
+				t.Fatalf("AWK modules.order projection = (%q, %t), want (%q, true)", got, exact, tc.want)
+			}
+			if !CompactKbuildRecipeWritesTarget(tc.recipe, "modules.order") {
+				t.Fatalf("source-selected AWK recipe %q lost its physical modules.order writer", tc.recipe)
+			}
+		})
+	}
+	for _, recipe := range []string{
+		awk + ` '{print $0}' first.order > modules.order`,
+		`awk '!x[$0]++' first.order > modules.order`,
+		awk + ` '!x[$0]++' missing.order > modules.order`,
+		awk + ` '!x[$0]++' modules.order > modules.order`,
+		awk + ` '!x[$0]++' > modules.order`, // stdin is not declared.
+		`{ echo first.o; :; } | ` + awk + ` '!x[$0]++' first.order > modules.order`,
+		`{ echo first.o; :; } | ` + awk + ` '!x[$0]++' - > other.order`,
+		`@set -e; { :; } | ` + awk + ` '!x[$0]++' - > modules.order; printf '%s\n' 'foreign := ` + awk + ` '\''!x[$0]++'\''' > ./.modules.order.cmd`,
+	} {
+		if got, exact := CompactKbuildGeneratedTextProjection(recipe, "modules.order", files); exact {
+			t.Fatalf("unproven AWK writer %q yielded exact %q", recipe, got)
+		}
+	}
+}
+
 func TestCompactKbuildGeneratedTextProjectionAliases(t *testing.T) {
 	for _, test := range []struct {
 		name  string

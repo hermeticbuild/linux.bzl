@@ -195,7 +195,7 @@ func familyExecutionVariantOutputs(variant familyPlanVariantRequest) map[string]
 		"arch": variant.arch, "snapshot": variant.snapshot,
 		"config": variant.resolved.config, "auto.conf": variant.resolved.autoConf,
 		"auto.conf.cmd": variant.resolved.autoConfCmd, "autoconf.h": variant.resolved.autoconf,
-		"rustc_cfg": variant.resolved.rustcCfg, "kernel.release": variant.resolved.kernelRelease,
+		"rustc_cfg": variant.resolved.rustcCfg,
 	}
 }
 

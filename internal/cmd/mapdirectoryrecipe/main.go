@@ -1515,6 +1515,16 @@ func runRecipe(opts recipeOptions) error {
 		command.Stdout = os.Stdout
 	}
 	command.Stderr = os.Stderr
+	if binding := recipe.RequireAbsentObservedOutput; binding != "" && observedBefore[binding].present {
+		return fmt.Errorf("source check logical target %q already exists before execution", recipe.ObservedOutputs[binding])
+	}
+	var workingTreeBefore map[string]recipeWorkingTreeEntry
+	if recipe.RequireUnchangedWorkingTree || len(recipe.PrivateWorkingEffects) != 0 {
+		workingTreeBefore, err = snapshotRecipeWorkingTree(workingRoot)
+		if err != nil {
+			return fmt.Errorf("snapshot source check writable tree before execution: %w", err)
+		}
+	}
 	if err := command.Run(); err != nil {
 		if stdout != nil {
 			_ = stdout.Close()
@@ -1526,10 +1536,33 @@ func runRecipe(opts recipeOptions) error {
 			return fmt.Errorf("close stdout output: %w", err)
 		}
 	}
+	if binding := recipe.RequireAbsentObservedOutput; binding != "" {
+		after, err := snapshotObservedWorkingOutput(workingRoot, observedOutputPaths[binding])
+		if err != nil {
+			return fmt.Errorf("snapshot source check target after execution: %w", err)
+		}
+		if after.present {
+			return fmt.Errorf("source check logical target %q exists after execution", recipe.ObservedOutputs[binding])
+		}
+	}
+	if recipe.RequireUnchangedWorkingTree || len(recipe.PrivateWorkingEffects) != 0 {
+		workingTreeAfter, err := snapshotRecipeWorkingTree(workingRoot)
+		if err != nil {
+			return fmt.Errorf("snapshot source check writable tree after execution: %w", err)
+		}
+		if err := compareRecipeWorkingTreesWithEffects(
+			workingTreeBefore, workingTreeAfter, recipe.PrivateWorkingEffects, opts.trees,
+		); err != nil {
+			return fmt.Errorf("source check changed writable tree: %w", err)
+		}
+	}
 	for _, binding := range sortedKeys(recipe.ObservedOutputs) {
 		after, err := snapshotObservedWorkingOutput(workingRoot, observedOutputPaths[binding])
 		if err != nil {
 			return fmt.Errorf("snapshot observed output %s after execution: %w", binding, err)
+		}
+		if binding == recipe.RequireAbsentObservedOutput && after.present {
+			return fmt.Errorf("source check logical target %q exists after execution", recipe.ObservedOutputs[binding])
 		}
 		state := observedOutputPostState(observedBases[binding], observedBefore[binding], after, opts.expectedNodeID)
 		data, err := toolaction.EncodeObservedOutputState(state)
@@ -1568,6 +1601,160 @@ type observedRegularFileSnapshot struct {
 	present        bool
 	content        []byte
 	executableMode uint32
+}
+
+type recipeWorkingTreeEntry struct {
+	info    os.FileInfo
+	content [sha256.Size]byte
+	link    string
+}
+
+// A successful execution-only check must leave its staged writable namespace
+// unchanged. A status-only Make target may still invoke configured tools or
+// script applets, so inspecting just the logical target would miss side writes.
+// Compare regular bytes, modes, timestamps and inode identity as well as
+// directory and symlink membership before publishing its private completion.
+func snapshotRecipeWorkingTree(root string) (map[string]recipeWorkingTreeEntry, error) {
+	entries := map[string]recipeWorkingTreeEntry{}
+	err := filepath.WalkDir(root, func(filename string, _ os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(root, filename)
+		if err != nil {
+			return err
+		}
+		info, err := os.Lstat(filename)
+		if err != nil {
+			return err
+		}
+		entry := recipeWorkingTreeEntry{info: info}
+		switch {
+		case info.Mode().IsRegular():
+			file, err := os.Open(filename)
+			if err != nil {
+				return err
+			}
+			hash := sha256.New()
+			_, copyErr := io.Copy(hash, file)
+			closeErr := file.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			copy(entry.content[:], hash.Sum(nil))
+		case info.Mode()&os.ModeSymlink != 0:
+			entry.link, err = os.Readlink(filename)
+			if err != nil {
+				return err
+			}
+		case info.IsDir():
+		default:
+			return fmt.Errorf("source check tree entry %q has unsupported file mode %s", relative, info.Mode())
+		}
+		entries[filepath.ToSlash(relative)] = entry
+		return nil
+	})
+	return entries, err
+}
+
+func compareRecipeWorkingTrees(before, after map[string]recipeWorkingTreeEntry) error {
+	return compareRecipeWorkingTreesWithEffects(before, after, nil, nil)
+}
+
+func compareRecipeWorkingTreesWithEffects(
+	before, after map[string]recipeWorkingTreeEntry,
+	effects []kconfig.ActionRecipePrivateWorkingEffect,
+	trees map[string]string,
+) error {
+	allowed := make(map[string]kconfig.ActionRecipePrivateWorkingEffect, len(effects))
+	for _, effect := range effects {
+		allowed[effect.Path] = effect
+		entry, exists := after[effect.Path]
+		if !exists {
+			if effect.Required || effect.PreserveExisting && before[effect.Path].info != nil {
+				return fmt.Errorf("required private working effect %q was not created", effect.Path)
+			}
+			continue
+		}
+		switch effect.Kind {
+		case "regular":
+			if !entry.info.Mode().IsRegular() {
+				return fmt.Errorf("private working effect %q is not a regular file", effect.Path)
+			}
+		case "symlink":
+			expected := trees[effect.Tree]
+			if entry.info.Mode()&os.ModeSymlink == 0 || expected == "" ||
+				filepath.Clean(entry.link) != filepath.Clean(expected) {
+				return fmt.Errorf("private working effect %q is not a symlink to declared tree %q", effect.Path, effect.Tree)
+			}
+		default:
+			return fmt.Errorf("private working effect %q has unsupported kind %q", effect.Path, effect.Kind)
+		}
+		if previous := before[effect.Path]; effect.PreserveExisting && previous.info != nil &&
+			(previous.info.Mode() != entry.info.Mode() || previous.info.Size() != entry.info.Size() ||
+				!previous.info.ModTime().Equal(entry.info.ModTime()) ||
+				!os.SameFile(previous.info, entry.info) || previous.content != entry.content || previous.link != entry.link) {
+			return fmt.Errorf("preexisting private working effect %q was changed", effect.Path)
+		}
+	}
+	if len(effects) == 0 && len(before) != len(after) {
+		changed := make([]string, 0)
+		for pathname := range before {
+			if _, present := after[pathname]; !present {
+				changed = append(changed, pathname)
+			}
+		}
+		for pathname := range after {
+			if _, present := before[pathname]; !present {
+				changed = append(changed, pathname)
+			}
+		}
+		sort.Strings(changed)
+		return fmt.Errorf("file membership changed (%d before, %d after): first changed entry %q", len(before), len(after), changed[0])
+	}
+	keys := make([]string, 0, len(before)+len(after))
+	for relative := range before {
+		keys = append(keys, relative)
+	}
+	for relative := range after {
+		if _, exists := before[relative]; !exists {
+			keys = append(keys, relative)
+		}
+	}
+	sort.Strings(keys)
+	for _, relative := range keys {
+		if _, permitted := allowed[relative]; permitted {
+			continue
+		}
+		left := before[relative]
+		right, exists := after[relative]
+		if !exists || left.info == nil || right.info == nil {
+			return fmt.Errorf("entry %q changed or disappeared", relative)
+		}
+		childEffect := false
+		for _, effect := range effects {
+			if relative == "." || strings.HasPrefix(effect.Path, relative+"/") {
+				childEffect = true
+				break
+			}
+		}
+		if childEffect && left.info.IsDir() && right.info.IsDir() &&
+			left.info.Mode() == right.info.Mode() && os.SameFile(left.info, right.info) &&
+			left.content == right.content && left.link == right.link {
+			// Creating an explicitly allowed child updates its parent directory
+			// timestamp; that does not authorize replacing the directory inode.
+			continue
+		}
+		if left.info.Mode() != right.info.Mode() || left.info.Size() != right.info.Size() ||
+			!left.info.ModTime().Equal(right.info.ModTime()) || !os.SameFile(left.info, right.info) ||
+			left.content != right.content || left.link != right.link {
+			return fmt.Errorf("entry %q changed or disappeared", relative)
+		}
+	}
+	return nil
 }
 
 func mergeObservedOutputBase(
@@ -1715,6 +1902,7 @@ func encodeRecipeCommandReplays(
 	for replayIndex, replay := range replays {
 		expanded := kconfig.ActionRecipeCommandReplay{
 			Name:        replay.Name,
+			DenyAll:     replay.DenyAll,
 			Invocations: make([]kconfig.ActionRecipeCommandReplayInvocation, len(replay.Invocations)),
 		}
 		for invocationIndex, invocation := range replay.Invocations {

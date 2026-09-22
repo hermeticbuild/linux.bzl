@@ -317,6 +317,66 @@ func compactKbuildSourceScriptCommandFields(command string) ([][]string, error) 
 	return commands, nil
 }
 
+// CompactKbuildSelectedSourceScriptArguments records the positional argv of
+// one immutable script selected by an already expanded Make recipe. This is
+// shell syntax and selected program provenance, not an inference from the
+// script filename. An ambiguous or non-file-mode invocation cannot be split
+// into independently executable source phases.
+func CompactKbuildSelectedSourceScriptArguments(
+	profile CompactKbuildProfile, command, sourcePath, configuredShell string,
+) ([]string, error) {
+	commands, err := compactKbuildSourceScriptCommandFields(command)
+	if err != nil {
+		return nil, err
+	}
+	selectedShell := kbuildFields(configuredShell)
+	var arguments []string
+	for _, original := range commands {
+		fields := slices.Clone(original)
+		for len(fields) != 0 {
+			name, _, assignment := strings.Cut(fields[0], "=")
+			if !assignment || !validKbuildCommandEnvironmentName(name) {
+				break
+			}
+			fields = fields[1:]
+		}
+		if len(fields) == 0 {
+			continue
+		}
+		fields[0] = strings.TrimLeft(fields[0], "+@-")
+		path, source, pathLike := compactKbuildProfileCommandPath(profile, fields[0])
+		argvStart := 1
+		if !pathLike || !source {
+			configured := len(selectedShell) != 0 && fields[0] == selectedShell[0] &&
+				len(fields) >= len(selectedShell) && slices.Equal(fields[1:len(selectedShell)], selectedShell[1:])
+			fallback := len(selectedShell) == 0 && fields[0] == "sh"
+			if !configured && !fallback {
+				continue
+			}
+			invocation := compactKbuildShellArguments(fields[1:])
+			if invocation.mode != compactKbuildShellModeFile || invocation.scriptIndex < 0 {
+				return nil, fmt.Errorf("selected source script command does not execute a source file")
+			}
+			argvStart = invocation.scriptIndex + 2
+			if argvStart > len(fields) {
+				return nil, fmt.Errorf("selected source script command has no source operand")
+			}
+			path, source, pathLike = compactKbuildProfileCommandPath(profile, fields[argvStart-1])
+		}
+		if !pathLike || !source || path != sourcePath {
+			continue
+		}
+		if arguments != nil {
+			return nil, fmt.Errorf("source script %q has more than one selected invocation", sourcePath)
+		}
+		arguments = slices.Clone(fields[argvStart:])
+	}
+	if arguments == nil {
+		return nil, fmt.Errorf("source script %q has no exact selected invocation", sourcePath)
+	}
+	return arguments, nil
+}
+
 func compactKbuildSourceScriptProgram(
 	profile CompactKbuildProfile,
 	fields []string,

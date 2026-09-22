@@ -29,6 +29,31 @@ define filechk
 endef
 `
 
+func TestQuotedSourceScriptFilechkPreservesSelectedShellSubstitution(t *testing.T) {
+	for _, test := range []struct {
+		payload string
+		want    string
+	}{
+		{`echo "5.10.270$(sh ${tree:kernel}/scripts/setlocalversion ${tree:kernel})"`, "scripts/setlocalversion"},
+		{`echo "$(sh ${tree:kernel}/scripts/extra ${tree:kernel})"`, "scripts/extra"},
+		{`echo "5.10.270$(sh ${tree:kernel}/scripts/setlocalversion ${tree:kernel} && echo injected)"`, ""},
+		{`echo '5.10.270$(sh ${tree:kernel}/scripts/setlocalversion ${tree:kernel})'`, ""},
+		{`echo "5.10.270$(sh ${tree:kernel}/../other ${tree:kernel})"`, ""},
+		{`echo "5.10.270$(sh ${tree:kernel}/scripts/setlocalversion $(uname))"`, ""},
+		{`echo "${UNDECLARED}$(sh ${tree:kernel}/scripts/setlocalversion ${tree:kernel})"`, ""},
+	} {
+		got, selected := compactKbuildQuotedSourceScriptFilechk(test.payload)
+		if got != test.want || selected != (test.want != "") {
+			t.Errorf("payload %q: source script = %q selected %t, want %q", test.payload, got, selected, test.want)
+		}
+	}
+	selected := `echo "5.10.270$(sh ${tree:kernel}/scripts/setlocalversion ${tree:kernel})"`
+	programs, err := compactKbuildCompoundProgramCommands(compactKbuildFilechkOutputRecipe(selected, "include/config/kernel.release"))
+	if err != nil || len(programs) != 2 || programs[0].program != "echo" || programs[1].program != "sh" {
+		t.Fatalf("nested source program discovery = %#v/%v, want echo then sh", programs, err)
+	}
+}
+
 func selectedFilechkResolvedForTest(t *testing.T, source, target string) *CompactKbuildResolvedTarget {
 	t.Helper()
 	root := t.TempDir()
@@ -1184,6 +1209,17 @@ result: scripts/first.sh scripts/second.sh FORCE
 	}
 	if !strings.Contains(scripts[0].Content, `${MAKE} -f "${srctree}/scripts/child.mk"`) {
 		t.Fatalf("first source script content = %q", scripts[0].Content)
+	}
+	arguments, err := CompactKbuildSelectedSourceScriptArguments(
+		profile, templates[0].Text, "scripts/first.sh", "sh",
+	)
+	if err != nil || !slices.Equal(arguments, []string{"--one"}) {
+		t.Fatalf("first selected source argv = %q, %v", arguments, err)
+	}
+	if _, err := CompactKbuildSelectedSourceScriptArguments(
+		profile, templates[0].Text+"; sh "+filepath.Join(root, "scripts/first.sh")+" --again", "scripts/first.sh", "sh",
+	); err == nil || !strings.Contains(err.Error(), "more than one selected invocation") {
+		t.Fatalf("duplicate selected source invocation error = %v", err)
 	}
 }
 

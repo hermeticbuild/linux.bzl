@@ -7,6 +7,7 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "kconfig_parse_lib",
     srcs = [
+        "causal_frontier_view.go",
         "checkpoint_metadata.go",
         "family_checkpoint.go",
         "family_compiler_counter.go",
@@ -17,9 +18,11 @@ go_library(
         "family_compiler_optional_plan.go",
         "family_compiler_variadic.go",
         "family_execution.go",
+        "feature_dump_stage.go",
         "frontier_join.go",
         "frontier_state.go",
         "frontier_virtual_file_view.go",
+        "graph_guard_round.go",
         "main.go",
         "path_set.go",
         "profiling.go",
@@ -28,6 +31,7 @@ go_library(
     visibility = ["//visibility:private"],
     deps = [
         "//internal/kconfig",
+        "//internal/pkgconfigmanifest",
         "//internal/toolaction",
     ],
 )
@@ -72,13 +76,16 @@ go_test(
         "family_compiler_variadic_test.go",
         "family_execution_test.go",
         "family_guard_discovery_test.go",
+        "feature_dump_stage_test.go",
         "frontier_join_test.go",
         "frontier_state_test.go",
         "frontier_virtual_file_view_test.go",
+        "graph_guard_round_test.go",
         "main_test.go",
         "path_set_test.go",
         "profile_binary_test.go",
         "profile_test.go",
+        "source_phase_frontier_test.go",
         "virtual_file_alias_test.go",
     ],
     data = [

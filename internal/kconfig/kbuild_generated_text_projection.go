@@ -1,6 +1,9 @@
 package kconfig
 
-import "strings"
+import (
+	"path"
+	"strings"
+)
 
 const compactKbuildGeneratedTextPrepPrefix = "${tree:prep}/"
 
@@ -71,16 +74,21 @@ func CompactKbuildGeneratedTextProjectionWithResolver(
 	if err != nil || len(tokens) == 0 {
 		return "", false
 	}
+	segments, _ := compactKbuildGeneratedTextCommandSegments(recipe, tokens)
 	for _, token := range tokens {
 		if token.operator || token.start < 0 || token.end > len(recipe) {
 			continue
 		}
 		spelling := recipe[token.start:token.end]
-		if strings.Contains(spelling, `\`) && spelling != `'%s\n'` {
+		if strings.Contains(spelling, `\`) && spelling != `'%s\n'` &&
+			!compactKbuildGeneratedTextSavedCommandSpelling(recipe, segments, token, target) {
 			return "", false
 		}
 	}
 	if compactKbuildGeneratedTextBrace(recipe, tokens[0], "{") {
+		if content, exact := compactKbuildGeneratedTextAwkPipeline(recipe, tokens, target, resolveExactFile); exact {
+			return content, true
+		}
 		if content, exact := compactKbuildGeneratedTextGroup(recipe, tokens, target, resolveExactFile); exact {
 			return content, true
 		}
@@ -88,6 +96,37 @@ func CompactKbuildGeneratedTextProjectionWithResolver(
 		return content, true
 	}
 	return compactKbuildGeneratedTextSequence(recipe, tokens, target, resolveExactFile)
+}
+
+// if_changed saves its expanded shell command as a quoted literal in a
+// distinct .cmd file. Shell-escaped single quotes in that literal cannot
+// affect the generated target; permit them only for that one structurally
+// authenticated side write, never for the target writer or another command.
+func compactKbuildGeneratedTextSavedCommandSpelling(
+	recipe string, segments [][]compactKbuildRecipeToken,
+	token compactKbuildRecipeToken, target string,
+) bool {
+	for _, segment := range segments {
+		if len(segment) != 5 || segment[2].start != token.start ||
+			segment[0].operator || segment[0].value != "printf" ||
+			segment[1].operator || segment[1].value != `%s\n` ||
+			segment[2].operator || segment[2].shellExpansion || segment[2].pathnameExpansion ||
+			!segment[3].operator || segment[3].value != ">" ||
+			!(strings.HasPrefix(segment[2].value, "cmd_") || strings.HasPrefix(segment[2].value, "savedcmd_")) ||
+			!strings.Contains(segment[2].value, " := ") {
+			continue
+		}
+		spelling := recipe[segment[2].start:segment[2].end]
+		if len(spelling) < 2 || spelling[0] != '\'' || spelling[len(spelling)-1] != '\'' {
+			continue
+		}
+		output, ok := compactKbuildGeneratedTextTokenPath(segment[4])
+		if !ok || output != path.Join(path.Dir(target), "."+path.Base(target)+".cmd") {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // compactKbuildGeneratedTextRecipe removes Make's execution-only recipe
@@ -179,7 +218,7 @@ func compactKbuildGeneratedTextCommandSegments(
 				segments = append(segments, tokens[start:index])
 			}
 			start = index + 1
-		case token.operator && token.value != ">" && braceDepth == 0 && parenDepth == 0:
+		case token.operator && token.value != ">" && token.value != "|" && braceDepth == 0 && parenDepth == 0:
 			return nil, false
 		}
 	}
@@ -234,6 +273,17 @@ func compactKbuildGeneratedTextRedirectedCommand(
 ) (redirect, content string, exact, safe bool) {
 	redirectIndex := -1
 	if len(tokens) != 0 && compactKbuildGeneratedTextBrace(recipe, tokens[0], "{") {
+		if content, exact := compactKbuildGeneratedTextAwkPipeline(recipe, tokens, "", resolveExactFile); exact {
+			last := len(tokens) - 1
+			if tokens[last].operator && tokens[last].value == ";" {
+				last--
+			}
+			redirect, ok := compactKbuildGeneratedTextTokenPath(tokens[last])
+			if !ok {
+				return "", "", false, false
+			}
+			return redirect, content, true, true
+		}
 		closing := -1
 		for index := 1; index < len(tokens); index++ {
 			if compactKbuildGeneratedTextBrace(recipe, tokens[index], "{") {
@@ -271,10 +321,13 @@ func compactKbuildGeneratedTextRedirectedCommand(
 		if !literal {
 			return "", "", false, false
 		}
-		if _, allowed := compactKbuildGeneratedTextApplet(program); !allowed {
+		if _, allowed := compactKbuildGeneratedTextApplet(program); !allowed && !compactKbuildGeneratedTextAwkRole(tokens[0]) {
 			return "", "", false, false
 		}
 		for _, token := range tokens[1:redirectIndex] {
+			if compactKbuildGeneratedTextAwkRole(tokens[0]) {
+				continue // The quoted AWK $0 is checked as an exact source program below.
+			}
 			if token.operator || strings.Contains(token.value, "`") || strings.Contains(token.value, "$") {
 				return "", "", false, false
 			}
@@ -315,6 +368,18 @@ func compactKbuildGeneratedTextRedirectsTarget(recipe, target string) bool {
 	tokens, err := lexCompactKbuildRecipe(recipe)
 	if err != nil || len(tokens) == 0 {
 		return false
+	}
+	if _, exact := compactKbuildGeneratedTextAwkPipeline(
+		recipe, tokens, target, func(string) (string, bool) { return "", true },
+	); exact {
+		return true
+	}
+	if compactKbuildGeneratedTextAwkRole(tokens[0]) {
+		if _, exact := compactKbuildGeneratedTextDirect(
+			recipe, tokens, target, func(string) (string, bool) { return "", true },
+		); exact {
+			return true
+		}
 	}
 	if compactKbuildGeneratedTextBrace(recipe, tokens[0], "{") {
 		closing := -1
@@ -379,7 +444,14 @@ func compactKbuildGeneratedTextGroup(
 		return "", false
 	}
 
-	body := tokens[1:closing]
+	return compactKbuildGeneratedTextGroupBody(tokens[1:closing], target, resolveExactFile)
+}
+
+func compactKbuildGeneratedTextGroupBody(
+	body []compactKbuildRecipeToken,
+	target string,
+	resolveExactFile func(path string) (string, bool),
+) (string, bool) {
 	if len(body) == 0 {
 		return "", false
 	}
@@ -441,7 +513,112 @@ func compactKbuildGeneratedTextDirect(
 	if !ok || redirectTarget != target || !compactKbuildGeneratedTextTerminal(tokens[redirect+2:]) {
 		return "", false
 	}
+	if content, exact := compactKbuildGeneratedTextAwkDirect(recipe, tokens[:redirect], target, resolveExactFile); exact {
+		return content, true
+	}
 	return compactKbuildGeneratedTextCommand(tokens[:redirect], target, resolveExactFile)
+}
+
+// Kbuild's selected modules.order writers use one configured AWK program to
+// preserve the first occurrence of each newline-delimited record. Direct AWK
+// file operands are separate streams; the brace pipeline is one concatenated
+// stdout stream. No other AWK program or subprocess form has this projection.
+func compactKbuildGeneratedTextAwkRole(token compactKbuildRecipeToken) bool {
+	if token.operator {
+		return false
+	}
+	role, ok := parseKbuildActionRoleToken(token.value)
+	return ok && role.Role == "awk"
+}
+
+func compactKbuildGeneratedTextAwkProgram(recipe string, token compactKbuildRecipeToken) bool {
+	return !token.operator && token.start >= 0 && token.end <= len(recipe) &&
+		recipe[token.start:token.end] == `'!x[$0]++'` && token.value == "!x["+compactKbuildLiteralDollarToken+"0]++"
+}
+
+func compactKbuildGeneratedTextAwkRecords(streams []string) string {
+	seen := map[string]bool{}
+	var output strings.Builder
+	for _, stream := range streams {
+		if stream == "" {
+			continue
+		}
+		records := strings.Split(stream, "\n")
+		for index, record := range records {
+			if index == len(records)-1 && record == "" {
+				continue
+			}
+			if !seen[record] {
+				seen[record] = true
+				output.WriteString(record)
+				output.WriteByte('\n')
+			}
+		}
+	}
+	return output.String()
+}
+
+func compactKbuildGeneratedTextAwkDirect(
+	recipe string, tokens []compactKbuildRecipeToken, target string,
+	resolveExactFile func(string) (string, bool),
+) (string, bool) {
+	if len(tokens) < 3 || !compactKbuildGeneratedTextAwkRole(tokens[0]) ||
+		!compactKbuildGeneratedTextAwkProgram(recipe, tokens[1]) || resolveExactFile == nil {
+		return "", false
+	}
+	streams := make([]string, 0, len(tokens)-2)
+	for _, token := range tokens[2:] {
+		name, ok := compactKbuildGeneratedTextTokenPath(token)
+		if !ok || name == target || strings.HasPrefix(name, "-") {
+			return "", false
+		}
+		query := name
+		if strings.HasPrefix(token.value, compactKbuildGeneratedTextPrepPrefix) {
+			query = compactKbuildGeneratedTextPrepPrefix + name
+		}
+		content, exact := resolveExactFile(query)
+		if !exact {
+			return "", false
+		}
+		streams = append(streams, content)
+	}
+	return compactKbuildGeneratedTextAwkRecords(streams), true
+}
+
+func compactKbuildGeneratedTextAwkPipeline(
+	recipe string, tokens []compactKbuildRecipeToken, target string,
+	resolveExactFile func(string) (string, bool),
+) (string, bool) {
+	if len(tokens) < 9 || !compactKbuildGeneratedTextBrace(recipe, tokens[0], "{") {
+		return "", false
+	}
+	closing := -1
+	for index := 1; index < len(tokens); index++ {
+		if compactKbuildGeneratedTextBrace(recipe, tokens[index], "{") {
+			return "", false
+		}
+		if compactKbuildGeneratedTextBrace(recipe, tokens[index], "}") {
+			closing = index
+			break
+		}
+	}
+	if closing < 0 || closing+6 >= len(tokens) || !tokens[closing+1].operator || tokens[closing+1].value != "|" ||
+		!compactKbuildGeneratedTextAwkRole(tokens[closing+2]) ||
+		!compactKbuildGeneratedTextAwkProgram(recipe, tokens[closing+3]) ||
+		tokens[closing+4].operator || tokens[closing+4].value != "-" ||
+		!tokens[closing+5].operator || tokens[closing+5].value != ">" ||
+		!compactKbuildGeneratedTextTerminal(tokens[closing+7:]) {
+		return "", false
+	}
+	redirect, ok := compactKbuildGeneratedTextTokenPath(tokens[closing+6])
+	if !ok || (target != "" && redirect != target) {
+		return "", false
+	}
+	content, exact := compactKbuildGeneratedTextGroupBody(tokens[1:closing], redirect, resolveExactFile)
+	if !exact {
+		return "", false
+	}
+	return compactKbuildGeneratedTextAwkRecords([]string{content}), true
 }
 
 func compactKbuildGeneratedTextCommand(

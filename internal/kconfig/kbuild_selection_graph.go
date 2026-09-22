@@ -2,6 +2,7 @@ package kconfig
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -31,12 +32,13 @@ type compactKbuildGroupedSelectionID struct {
 // profile+target lineage instead, so unrelated invocations may use the same
 // logical path when their physical output trees do not collide.
 type compactKbuildSelectionGraph struct {
-	profiles                    map[string]CompactKbuildProfile
-	selections                  map[compactKbuildSelectionKey]CompactKbuildSelection
-	selectionInitialArtifacts   map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact
-	selectionGeneratedArtifacts map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact
-	deferredContentSelections   map[string]KbuildDeferredContentSelection
-	owners                      map[string]compactKbuildSelectionKey
+	profiles                     map[string]CompactKbuildProfile
+	selections                   map[compactKbuildSelectionKey]CompactKbuildSelection
+	selectionInitialArtifacts    map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact
+	selectionNativePrerequisites map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact
+	selectionGeneratedArtifacts  map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact
+	deferredContentSelections    map[string]KbuildDeferredContentSelection
+	owners                       map[string]compactKbuildSelectionKey
 	// publishedOwners names the one canonical writer for each physical
 	// output-tree/logical-path pair.  Earlier writers in a source-proven total
 	// overwrite chain remain materialized, but publish at reserved immutable
@@ -70,7 +72,19 @@ type compactKbuildSelectionGraph struct {
 	phonyTargets                    map[compactKbuildProfileTargetKey]bool
 	generatedTargets                map[compactKbuildProfileTargetKey]bool
 	targetInvocations               map[compactKbuildProfileTargetKey][]string
-	ruleResolutions                 map[compactKbuildRuleResolutionKey]compactKbuildRuleResolution
+	// Source phases are file writers within one selected Make recipe. Their
+	// selections have separate output identities, while this index retains the
+	// real Make owner and the exact child boundary which follows each write.
+	sourcePhasesBySelection map[compactKbuildSelectionKey]CompactKbuildSelectedSourcePhase
+	sourcePhaseOwners       map[compactKbuildSelectionKey]compactKbuildSelectionKey
+	sourcePhaseChildren     map[compactKbuildSelectionKey]string
+	sourcePhaseBeforeChild  map[string]compactKbuildSelectionKey
+	sourcePhasesByOwner     map[compactKbuildSelectionKey][]compactKbuildSelectionKey
+	// invocationParents records the exact selected parent goal whose recipe
+	// started a recursive Make child. Its prerequisites complete before that
+	// child starts even when the goal is PHONY and has no selected file action.
+	invocationParents map[string][]compactKbuildProfileTargetKey
+	ruleResolutions   map[compactKbuildRuleResolutionKey]compactKbuildRuleResolution
 	// selectedRootRuleResolutions is the bounded handoff between dependency
 	// planning and final lowering. Planning already resolved every selected
 	// root through its exact lexical Make target; retain only those successful
@@ -84,12 +98,13 @@ type compactKbuildSelectionGraph struct {
 	// graph is planned serially, and the cache is invalidated at each structural
 	// mutation boundary before action lowering begins. Only successful results
 	// are retained; callers always receive a copy.
-	resolvedDependencies       map[compactKbuildSelectionMetadataKey][]compactKbuildSelectionKey
-	invocationPredecessors     map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies
-	invocationRecipeSelections map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies
-	terminalSelections         map[compactKbuildTerminalSelectionKey]compactKbuildSelectionDependencies
-	unruledPrerequisites       map[compactKbuildSelectionMetadataKey]compactKbuildPrerequisitePaths
-	cacheMisses                compactKbuildSelectionGraphCacheMisses
+	resolvedDependencies         map[compactKbuildSelectionMetadataKey][]compactKbuildSelectionKey
+	invocationPredecessors       map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies
+	invocationRecipeSelections   map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies
+	parentPrerequisiteSelections map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies
+	terminalSelections           map[compactKbuildTerminalSelectionKey]compactKbuildSelectionDependencies
+	unruledPrerequisites         map[compactKbuildSelectionMetadataKey]compactKbuildPrerequisitePaths
+	cacheMisses                  compactKbuildSelectionGraphCacheMisses
 }
 
 type compactKbuildSelectionGraphCacheMisses struct {
@@ -284,6 +299,7 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 		profiles:                        make(map[string]CompactKbuildProfile, len(config.KbuildProfiles)),
 		selections:                      make(map[compactKbuildSelectionKey]CompactKbuildSelection, len(config.KbuildSelections)),
 		selectionInitialArtifacts:       make(map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact, len(config.KbuildSelections)),
+		selectionNativePrerequisites:    make(map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact, len(config.KbuildSelections)),
 		selectionGeneratedArtifacts:     make(map[compactKbuildSelectionKey][]CompactKbuildVisibleArtifact, len(config.KbuildSelections)),
 		deferredContentSelections:       make(map[string]KbuildDeferredContentSelection, len(config.KbuildDeferredContentSelections)),
 		owners:                          make(map[string]compactKbuildSelectionKey, len(config.KbuildSelections)),
@@ -306,6 +322,12 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 		phonyTargets:                    make(map[compactKbuildProfileTargetKey]bool),
 		generatedTargets:                make(map[compactKbuildProfileTargetKey]bool),
 		targetInvocations:               make(map[compactKbuildProfileTargetKey][]string),
+		sourcePhasesBySelection:         make(map[compactKbuildSelectionKey]CompactKbuildSelectedSourcePhase),
+		sourcePhaseOwners:               make(map[compactKbuildSelectionKey]compactKbuildSelectionKey),
+		sourcePhaseChildren:             make(map[compactKbuildSelectionKey]string),
+		sourcePhaseBeforeChild:          make(map[string]compactKbuildSelectionKey),
+		sourcePhasesByOwner:             make(map[compactKbuildSelectionKey][]compactKbuildSelectionKey),
+		invocationParents:               make(map[string][]compactKbuildProfileTargetKey),
 		ruleResolutions:                 make(map[compactKbuildRuleResolutionKey]compactKbuildRuleResolution),
 		selectedRootRuleResolutions:     make(map[compactKbuildSelectedRuleResolutionKey]compactKbuildRuleResolution),
 		targetRuleContexts:              make(map[compactKbuildTargetRuleContextKey]compactKbuildTargetRuleContext),
@@ -314,6 +336,7 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 		resolvedDependencies:            make(map[compactKbuildSelectionMetadataKey][]compactKbuildSelectionKey),
 		invocationPredecessors:          make(map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies),
 		invocationRecipeSelections:      make(map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies),
+		parentPrerequisiteSelections:    make(map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies),
 		terminalSelections:              make(map[compactKbuildTerminalSelectionKey]compactKbuildSelectionDependencies),
 		unruledPrerequisites:            make(map[compactKbuildSelectionMetadataKey]compactKbuildPrerequisitePaths),
 	}
@@ -331,18 +354,9 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 			graph.generatedTargets[compactKbuildProfileTargetKey{profile: profile.Name, target: candidate}] = true
 		}
 		for _, rule := range profile.Rules {
-			phony := false
-			for _, rawTarget := range rule.Targets {
-				if canonicalKbuildRulePath(rawTarget) == ".PHONY" {
-					phony = true
-				}
-			}
-			if phony {
-				for _, prerequisite := range rule.Prerequisites {
-					target := compactKbuildProfileTargetPath(profile, prerequisite)
-					graph.phonyTargets[compactKbuildProfileTargetKey{profile: profile.Name, target: target}] = true
-				}
-			}
+			compactKbuildVisitRulePhonyTargets(profile, rule, func(target string) {
+				graph.phonyTargets[compactKbuildProfileTargetKey{profile: profile.Name, target: target}] = true
+			})
 		}
 	}
 	for _, selection := range config.KbuildDeferredContentSelections {
@@ -404,6 +418,7 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 			}
 			key := compactKbuildProfileTargetKey{profile: profile.Name, target: target}
 			graph.targetInvocations[key] = append(graph.targetInvocations[key], dependency.Profile)
+			graph.invocationParents[dependency.Profile] = append(graph.invocationParents[dependency.Profile], key)
 		}
 	}
 
@@ -430,6 +445,10 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 		if artifactsErr != nil {
 			return nil, fmt.Errorf("Kbuild selection %s target %q has invalid initial object-tree artifacts: %w", selection.Profile, selection.Target, artifactsErr)
 		}
+		nativePrerequisites, nativeErr := compactKbuildSelectionNativePrerequisiteArtifacts(selection)
+		if nativeErr != nil {
+			return nil, fmt.Errorf("Kbuild selection %s target %q has invalid native prerequisites: %w", selection.Profile, selection.Target, nativeErr)
+		}
 		generatedArtifacts, generatedErr := compactKbuildSelectionGeneratedObjectTreeArtifacts(selection)
 		if generatedErr != nil {
 			return nil, fmt.Errorf("Kbuild selection %s target %q has invalid generated object-tree artifacts: %w", selection.Profile, selection.Target, generatedErr)
@@ -453,6 +472,24 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 				)
 			}
 			previousInitialPath = artifact.Path
+		}
+		previousNativePath := ""
+		for _, artifact := range nativePrerequisites {
+			canonical := canonicalKbuildRulePath(artifact.Path)
+			producerProfile, producerExists := graph.profiles[artifact.Profile]
+			producerTarget := compactKbuildGraphTargetPath(artifact.Target)
+			pathErr := validatePlanRelativePath("native Kbuild prerequisite", artifact.Path)
+			if canonical == "" || canonical != artifact.Path || strings.ContainsAny(artifact.Path, "%$") ||
+				strings.HasSuffix(artifact.Path, "/") || pathErr != nil ||
+				(previousNativePath != "" && artifact.Path <= previousNativePath) || artifact.Path != artifact.Target ||
+				!producerExists || producerTarget != artifact.Target ||
+				!compactKbuildProfileHasCanonicalTargetEvidence(producerProfile, producerTarget) {
+				return nil, fmt.Errorf(
+					"Kbuild selection %s target %q has invalid, ambiguous, or noncanonical native prerequisite artifact %#v",
+					selection.Profile, selection.Target, artifact,
+				)
+			}
+			previousNativePath = artifact.Path
 		}
 		previousGeneratedPath := ""
 		for _, artifact := range generatedArtifacts {
@@ -481,7 +518,8 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 		}
 		target := compactKbuildGraphTargetPath(selection.Target)
 		makeTarget := selection.MakeTarget
-		if target != selection.Target || !compactKbuildProfileHasSelectionTargetEvidence(profile, target, makeTarget) {
+		if target != selection.Target ||
+			selection.SourceScriptPhase == "" && !compactKbuildProfileHasSelectionTargetEvidence(profile, target, makeTarget) {
 			want := compactKbuildProfileTargetPath(profile, selection.Target)
 			return nil, fmt.Errorf(
 				"Kbuild selection %s target %q is not canonical for profile directory %q (want %q)",
@@ -529,13 +567,18 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 			}
 			delete(graph.selections, previous)
 			delete(graph.selectionInitialArtifacts, previous)
+			delete(graph.selectionNativePrerequisites, previous)
 			delete(graph.selectionGeneratedArtifacts, previous)
 		}
 		selection.Target = target
 		graph.selections[key] = selection
 		graph.selectionInitialArtifacts[key] = initialArtifacts
+		graph.selectionNativePrerequisites[key] = nativePrerequisites
 		graph.selectionGeneratedArtifacts[key] = generatedArtifacts
 		selectedTargets[selectionTargetKey] = key
+	}
+	if err := graph.indexSelectedSourcePhases(config); err != nil {
+		return nil, err
 	}
 	for profileTarget, key := range selectedTargets {
 		graph.selectionsByProfileTarget[profileTarget] = key
@@ -600,6 +643,25 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 			publisher := orderedOwners[len(orderedOwners)-1]
 			published = append(published, publisher)
 		}
+		// Prehost and host each own a separate physical tree, but selected
+		// preparation outputs from both are copied into one prep tree. Decide
+		// that tree's publisher from the same source overwrite provenance
+		// before either native action or mirror is materialized. Its earlier
+		// versions keep private prep paths even when each native stage has a
+		// canonical output of its own.
+		mirrorOwners := []compactKbuildSelectionKey{}
+		for _, owner := range terminal {
+			selection := graph.selections[owner]
+			if selection.Lifecycle == "prep" && selection.Scope == "host" &&
+				(selection.Stage == "prehost" || selection.Stage == "host") {
+				mirrorOwners = append(mirrorOwners, owner)
+			}
+		}
+		if len(mirrorOwners) != 0 {
+			if _, orderErr := graph.compactKbuildRegisterOutputOwners(target, "prep", mirrorOwners, false); orderErr != nil {
+				return nil, fmt.Errorf("select host preparation mirror publisher for %q: %w", target, orderErr)
+			}
+		}
 		graph.nativeOwners[target] = published
 		if len(published) == 1 {
 			graph.owners[target] = published[0]
@@ -633,6 +695,224 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 	return graph, nil
 }
 
+// indexSelectedSourcePhases binds each intermediate source-script write to the
+// selected Make rule which invoked its exact source and to the child Make
+// process which starts after that write. No phase is inferred from its output
+// filename or promoted into a fabricated Make rule.
+func (g *compactKbuildSelectionGraph) indexSelectedSourcePhases(config CompactConfig) error {
+	seenOutputs := map[string]compactKbuildSelectionKey{}
+	for _, profile := range config.KbuildProfiles {
+		if len(profile.SelectedSourceScriptPhases) == 0 {
+			continue
+		}
+		groups := map[string][]CompactKbuildSelectedSourcePhase{}
+		for _, phase := range profile.SelectedSourceScriptPhases {
+			if phase.OwnerTarget == "" || compactKbuildGraphTargetPath(phase.OwnerTarget) != phase.OwnerTarget ||
+				phase.OutputPath == "" || compactKbuildGraphTargetPath(phase.OutputPath) != phase.OutputPath ||
+				validatePlanRelativePath("source script phase output", phase.OutputPath) != nil {
+				return fmt.Errorf("Kbuild profile %q has invalid source script phase output %q or owner %q", profile.Name, phase.OutputPath, phase.OwnerTarget)
+			}
+			groups[phase.OwnerTarget] = append(groups[phase.OwnerTarget], phase)
+		}
+		for ownerTarget, phases := range groups {
+			var ownerKey compactKbuildSelectionKey
+			selected := false
+			for key := range g.selections {
+				if key.profile == profile.Name && key.target == ownerTarget {
+					if selected {
+						return fmt.Errorf("source script phase owner %s:%s has ambiguous selected stages", profile.Name, ownerTarget)
+					}
+					ownerKey, selected = key, true
+				}
+			}
+			if !selected || g.selections[ownerKey].SourceScriptPhase != "" ||
+				g.compactKbuildProfileTargetIsPhony(profile, ownerTarget) {
+				return fmt.Errorf("source script phases in profile %q have no real selected Make owner %q", profile.Name, ownerTarget)
+			}
+			if len(phases) != 2 {
+				return fmt.Errorf("selected source script owner %s:%s has %d phases, want two ordered writes", profile.Name, ownerTarget, len(phases))
+			}
+			sort.Slice(phases, func(i, j int) bool { return phases[i].Ordinal < phases[j].Ordinal })
+			if phases[0].Ordinal != 0 || phases[1].Ordinal != 1 ||
+				phases[0].SourcePath != "scripts/link-vmlinux.sh" || phases[1].SourcePath != phases[0].SourcePath {
+				return fmt.Errorf("selected source script owner %s:%s has unsupported phase order or source path", profile.Name, ownerTarget)
+			}
+			if len(phases[0].SourceArguments) == 0 ||
+				!slices.Equal(phases[0].SourceArguments, phases[1].SourceArguments) {
+				return fmt.Errorf("selected source script owner %s:%s has missing or inconsistent source arguments", profile.Name, ownerTarget)
+			}
+			source, err := readCompactKbuildProfileSource(profile, phases[0].SourcePath)
+			if err != nil {
+				return fmt.Errorf("read selected phase source for %s:%s: %w", profile.Name, ownerTarget, err)
+			}
+			analyzed, recognized, err := AnalyzeCompactKbuildLinkVmlinuxPhases(string(source))
+			if err != nil || !recognized {
+				return fmt.Errorf("authenticate selected phase source for %s:%s: recognized=%t, error=%v", profile.Name, ownerTarget, recognized, err)
+			}
+			wantPaths := [2]string{".version", "vmlinux.o"}
+			wantSpans := [2][]CompactKbuildLinkVmlinuxSourceSpan{analyzed.VersionSpans, analyzed.ObjectSpans}
+			for ordinal, phase := range phases {
+				if phase.OutputPath != wantPaths[ordinal] || phase.SourceSHA256 != analyzed.SourceSHA256 ||
+					!slices.Equal(phase.Spans, wantSpans[ordinal]) {
+					return fmt.Errorf("selected source phase %s:%s output %q does not match exact source write %d", profile.Name, ownerTarget, phase.OutputPath, ordinal)
+				}
+			}
+			owner := g.selections[ownerKey]
+			candidates := compactKbuildRuleCandidatesForMakeTarget(profile, ownerTarget, owner.MakeTarget)
+			matchingRules := 0
+			var selectedRule compactKbuildResolvedRule
+			entry := CompactKbuildSelectedControlRuleEntrySnapshot(profile, ownerTarget)
+			for _, candidate := range candidates {
+				if entry != nil && candidate.ruleOrder != entry.Line.RuleIndex ||
+					!slices.Contains(candidate.rule.Prerequisites, phases[0].SourcePath) &&
+						!slices.Contains(candidate.rule.OrderOnly, phases[0].SourcePath) ||
+					len(candidate.rule.Recipe) == 0 {
+					continue
+				}
+				matchingRules++
+				selectedRule = candidate
+			}
+			if matchingRules != 1 {
+				return fmt.Errorf("selected source phase owner %s:%s has %d exact Make rules declaring %q, want one", profile.Name, ownerTarget, matchingRules, phases[0].SourcePath)
+			}
+			arguments, err := compactKbuildSelectedPhaseRecipeArguments(profile, ownerTarget, selectedRule, phases[0].SourcePath)
+			if err != nil {
+				return fmt.Errorf("selected source phase owner %s:%s recipe invocation: %w", profile.Name, ownerTarget, err)
+			}
+			if !slices.Equal(arguments, phases[0].SourceArguments) {
+				return fmt.Errorf("selected source phase owner %s:%s source arguments differ from the exact selected recipe", profile.Name, ownerTarget)
+			}
+			children := map[int]string{}
+			for _, dependency := range profile.TargetInvocationDependencies {
+				if dependency.Target != ownerTarget {
+					continue
+				}
+				ordinal := -1
+				for index, phase := range phases {
+					if dependency.SourcePhaseBefore == phase.OutputPath {
+						ordinal = index
+					}
+				}
+				if ordinal < 0 || children[ordinal] != "" {
+					return fmt.Errorf("selected source phase owner %s:%s has unbound or repeated child boundary %q", profile.Name, ownerTarget, dependency.SourcePhaseBefore)
+				}
+				child, exists := g.profiles[dependency.Profile]
+				wantMakefiles := [2]string{"scripts/Makefile.build", "scripts/Makefile.modpost"}
+				if !exists || canonicalKbuildRulePath(child.Path) != wantMakefiles[ordinal] ||
+					len(dependency.Goals) == 0 {
+					return fmt.Errorf("selected source phase owner %s:%s child %q does not match source Make boundary %d", profile.Name, ownerTarget, dependency.Profile, ordinal)
+				}
+				children[ordinal] = dependency.Profile
+			}
+			if len(children) != len(phases) || children[0] == children[1] {
+				return fmt.Errorf("selected source phase owner %s:%s has incomplete or ambiguous Make child boundaries", profile.Name, ownerTarget)
+			}
+			for ordinal, phase := range phases {
+				key := compactKbuildSelectionKey{profile: profile.Name, target: phase.OutputPath, stage: ownerKey.stage}
+				selection, exists := g.selections[key]
+				kind := [2]string{"version", "object"}[ordinal]
+				if !exists || selection.SourceScriptPhase != kind || selection.MakeTarget != phase.OutputPath ||
+					selection.Lifecycle != owner.Lifecycle || selection.Scope != owner.Scope ||
+					selection.GroupedTrigger != "" || selection.UsesInitialObjectTree ||
+					selection.InitialObjectTreeArtifacts != "" || selection.NativePrerequisiteArtifacts != "" ||
+					selection.GeneratedObjectTreeArtifacts != "" || selection.DeferredContentQueries != "" {
+					return fmt.Errorf("selected source phase %s:%s output %q has no exact phase selection", profile.Name, ownerTarget, phase.OutputPath)
+				}
+				if previous, duplicate := seenOutputs[phase.OutputPath]; duplicate {
+					return fmt.Errorf("source script output %q has ambiguous owners %s and %s", phase.OutputPath, compactKbuildSelectionKeyString(previous), compactKbuildSelectionKeyString(key))
+				}
+				if previous, duplicate := g.sourcePhaseBeforeChild[children[ordinal]]; duplicate {
+					return fmt.Errorf("source script child %q has ambiguous predecessors %s and %s", children[ordinal], compactKbuildSelectionKeyString(previous), compactKbuildSelectionKeyString(key))
+				}
+				seenOutputs[phase.OutputPath] = key
+				g.sourcePhasesBySelection[key] = phase
+				g.sourcePhaseOwners[key] = ownerKey
+				g.sourcePhaseChildren[key] = children[ordinal]
+				g.sourcePhaseBeforeChild[children[ordinal]] = key
+				g.sourcePhasesByOwner[ownerKey] = append(g.sourcePhasesByOwner[ownerKey], key)
+			}
+		}
+	}
+	for key, selection := range g.selections {
+		if selection.SourceScriptPhase != "" {
+			if _, recognized := g.sourcePhasesBySelection[key]; !recognized {
+				return fmt.Errorf("Kbuild selection %s has an unauthenticated source script phase %q", compactKbuildSelectionKeyString(key), selection.SourceScriptPhase)
+			}
+		}
+	}
+	return nil
+}
+
+// A phase inherits argv from the one selected Make command that executed its
+// parent source script. Evaluate recipe occurrences using their recorded
+// line-local Make states, then require precisely one source-script invocation.
+func compactKbuildSelectedPhaseRecipeArguments(
+	profile CompactKbuildProfile, ownerTarget string, rule compactKbuildResolvedRule, sourcePath string,
+) ([]string, error) {
+	match := compactKbuildRuleMatch{
+		profile: profile, rule: rule.rule, lookupTarget: rule.lookupTarget,
+		stem: rule.stem, targetOrder: rule.targetOrder, ruleOrder: rule.ruleOrder, resolved: true,
+	}
+	automatic, err := compactKbuildRuleAutomaticEvaluationContext(ownerTarget, match, nil)
+	if err != nil {
+		return nil, err
+	}
+	injected, err := compactKbuildSourceScriptInjectionsForRuleTarget(ownerTarget, match, nil)
+	if err != nil {
+		return nil, err
+	}
+	commands, indices, err := evaluatedKbuildRuleCommandSelectionsBySourceLine(
+		ownerTarget, match, automatic, injected, true,
+	)
+	if err != nil {
+		return nil, err
+	}
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(ownerTarget, match)
+	if err != nil {
+		return nil, err
+	}
+	var selectedArguments []string
+	selected := false
+	for index, command := range commands {
+		lineProfile := profile
+		if len(indices) != 0 {
+			lineProfile = snapshots[indices[index]].Evaluation.Profile
+		}
+		values, err := evaluateCompactKbuildRecipeVariablesForMakeTarget(
+			lineProfile, ownerTarget, rule.lookupTarget, automatic.target, automatic.stem,
+			automatic.normal, automatic.order, injected, "CONFIG_SHELL",
+		)
+		if err != nil {
+			return nil, err
+		}
+		arguments, err := CompactKbuildSelectedSourceScriptArguments(
+			lineProfile, compactKbuildDirectRecipeText(lineProfile, command.Text), sourcePath,
+			values["CONFIG_SHELL"],
+		)
+		if err != nil {
+			if err.Error() == fmt.Sprintf("source script %q has no exact selected invocation", sourcePath) {
+				continue
+			}
+			return nil, err
+		}
+		if selected {
+			return nil, fmt.Errorf("source script %q has more than one selected recipe invocation", sourcePath)
+		}
+		selectedArguments, selected = arguments, true
+	}
+	if !selected {
+		return nil, fmt.Errorf("source script %q has no exact selected recipe invocation", sourcePath)
+	}
+	return selectedArguments, nil
+}
+
+func (g *compactKbuildSelectionGraph) selectedSourcePhase(
+	key compactKbuildSelectionKey,
+) (CompactKbuildSelectedSourcePhase, compactKbuildSelectionKey, bool) {
+	phase, ok := g.sourcePhasesBySelection[key]
+	return phase, g.sourcePhaseOwners[key], ok
+}
+
 func (g *compactKbuildSelectionGraph) compactKbuildInvocationDescendsTo(parentProfile, target, descendantProfile string) bool {
 	if g == nil || parentProfile == descendantProfile {
 		return false
@@ -652,6 +932,19 @@ func (g *compactKbuildSelectionGraph) compactKbuildInvocationDescendsTo(parentPr
 		queue = append(queue, g.targetInvocations[compactKbuildProfileTargetKey{profile: profile, target: target}]...)
 	}
 	return false
+}
+
+// A child that starts from the parent's same-path version overwrites that
+// version after the parent recipe. It must not become an input of its own
+// source writer, whether that writer is selected directly or reached through
+// an unselected subordinate rule.
+func (g *compactKbuildSelectionGraph) compactKbuildChildOverwritesParentVersion(
+	parentProfile, target, childProfile string,
+) bool {
+	artifact, visible := g.compactKbuildInitialVisibleArtifact(childProfile, target)
+	return visible && artifact == (CompactKbuildVisibleArtifact{
+		Path: target, Profile: parentProfile, Target: target,
+	})
 }
 
 func compactKbuildSelectionStage(stage string) bool {
@@ -704,6 +997,53 @@ func (g *compactKbuildSelectionGraph) selection(key compactKbuildSelectionKey) (
 	}
 	selection, ok := g.selections[key]
 	return selection, ok
+}
+
+// compactKbuildSelectedPhonyPrerequisite retains an execution-only target in
+// the same Make invocation as its consumer. PHONY names do not own regular
+// output paths and therefore cannot be resolved through path-owner indexes.
+func (g *compactKbuildSelectionGraph) compactKbuildSelectedPhonyPrerequisite(
+	consumer compactKbuildSelectionKey, target string,
+) (compactKbuildSelectionKey, bool) {
+	if g == nil {
+		return compactKbuildSelectionKey{}, false
+	}
+	key, selected := g.selectionsByProfileTarget[compactKbuildProfileTargetKey{
+		profile: consumer.profile, target: compactKbuildGraphTargetPath(target),
+	}]
+	if !selected || key == consumer || !g.compactKbuildProfileTargetIsPhony(g.profiles[key.profile], key.target) {
+		return compactKbuildSelectionKey{}, false
+	}
+	return key, true
+}
+
+// A source-selected PHONY recipe may publish only shell status, so the
+// artifact-oriented rule matcher can decline it. Its recorded rule entry still
+// owns the exact prerequisite context, including a second-expanded rule stem.
+func (g *compactKbuildSelectionGraph) compactKbuildSelectedPhonyRuleForMakeTarget(
+	metadata *CompactMetadata, profile CompactKbuildProfile, target, makeTarget string,
+) (compactKbuildRuleMatch, bool, error) {
+	entry := CompactKbuildSelectedControlRuleEntrySnapshot(profile, target)
+	if entry == nil {
+		return g.compactKbuildRuleForProfileMakeTarget(metadata, profile, target, makeTarget)
+	}
+	if entry.Line.Target != target || entry.Profile.Name != profile.Name ||
+		entry.Line.RuleIndex < 0 || entry.Line.RuleIndex >= len(profile.Rules) {
+		return compactKbuildRuleMatch{}, false, fmt.Errorf("selected PHONY target %q in profile %q has no valid source rule entry", target, profile.Name)
+	}
+	for _, candidate := range compactKbuildRuleCandidatesForMakeTarget(profile, target, makeTarget) {
+		if candidate.ruleOrder != entry.Line.RuleIndex || candidate.stem != entry.Line.Stem ||
+			candidate.lookupTarget != entry.Line.LookupTarget {
+			continue
+		}
+		return compactKbuildRuleMatch{
+			profile: profile, rule: profile.Rules[candidate.ruleOrder],
+			lookupTarget: candidate.lookupTarget, stem: candidate.stem,
+			targetOrder: candidate.targetOrder, ruleOrder: candidate.ruleOrder,
+			explicit: !strings.Contains(candidate.target, "%"), resolved: true,
+		}, true, nil
+	}
+	return compactKbuildRuleMatch{}, false, fmt.Errorf("selected PHONY target %q in profile %q has no evaluated source rule for %q", target, profile.Name, makeTarget)
 }
 
 func (g *compactKbuildSelectionGraph) profile(name string) (CompactKbuildProfile, bool) {
@@ -817,6 +1157,9 @@ func (g *compactKbuildSelectionGraph) prepareGroupedSelections(
 			continue
 		}
 		selection := g.selections[key]
+		if selection.SourceScriptPhase != "" {
+			continue
+		}
 		profile, ok := g.profile(key.profile)
 		if !ok {
 			return fmt.Errorf("grouped Kbuild selection references missing profile %q", key.profile)
@@ -944,6 +1287,7 @@ func (g *compactKbuildSelectionGraph) prepareGroupedSelections(
 	g.nativeDependencies = make(map[compactKbuildSelectionMetadataKey]compactKbuildSelectionDependencies)
 	g.invocationPredecessors = make(map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies)
 	g.invocationRecipeSelections = make(map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies)
+	g.parentPrerequisiteSelections = make(map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies)
 	g.terminalSelections = make(map[compactKbuildTerminalSelectionKey]compactKbuildSelectionDependencies)
 	return nil
 }
@@ -1085,6 +1429,7 @@ func (g *compactKbuildSelectionGraph) releasePlanningCaches() {
 	// asks for those exact immutable graph/metadata pairs.
 	g.invocationPredecessors = make(map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies)
 	g.invocationRecipeSelections = make(map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies)
+	g.parentPrerequisiteSelections = make(map[compactKbuildInvocationPredecessorKey]compactKbuildSelectionDependencies)
 	g.terminalSelections = make(map[compactKbuildTerminalSelectionKey]compactKbuildSelectionDependencies)
 	g.unruledPrerequisites = make(map[compactKbuildSelectionMetadataKey]compactKbuildPrerequisitePaths)
 }
@@ -1175,7 +1520,9 @@ func (g *compactKbuildSelectionGraph) compactKbuildRuleForProfileMakeTarget(
 	profile CompactKbuildProfile,
 	target, makeTarget string,
 ) (compactKbuildRuleMatch, bool, error) {
-	target = canonicalKbuildRulePath(target)
+	// A rule target may be an invocation-local control goal such as `.`.
+	// File-path normalization would erase that goal before rule resolution.
+	target = compactKbuildGraphTargetPath(target)
 	makeTarget = compactKbuildRuleLookupTarget(profile, target, makeTarget)
 	key := compactKbuildRuleResolutionKey{
 		metadata: metadata,
@@ -1206,7 +1553,7 @@ func (g *compactKbuildSelectionGraph) compactKbuildTargetRuleContext(
 	target string,
 	match compactKbuildRuleMatch,
 ) ([]compactKbuildEvaluatedPath, []compactKbuildEvaluatedPath, string, error) {
-	target = canonicalKbuildRulePath(target)
+	target = compactKbuildGraphTargetPath(target)
 	makeTarget := compactKbuildRuleLookupTarget(profile, target, match.lookupTarget)
 	key := compactKbuildTargetRuleContextKey{
 		compactKbuildProfileTargetKey: compactKbuildProfileTargetKey{profile: profile.Name, target: target},
@@ -1281,6 +1628,72 @@ func (g *compactKbuildSelectionGraph) compactKbuildProfileTargetIsPhony(
 ) bool {
 	target = compactKbuildGraphTargetPath(target)
 	return g.phonyTargets[compactKbuildProfileTargetKey{profile: profile.Name, target: target}]
+}
+
+// The evaluated .PHONY prerequisite words identify Make control targets.
+// Reuse the same source rule interpretation when a selected recipe evaluates
+// its automatic $@ and when the selection graph indexes those controls.
+func compactKbuildVisitRulePhonyTargets(profile CompactKbuildProfile, rule KbuildRule, visit func(string)) {
+	for _, rawTarget := range rule.Targets {
+		if canonicalKbuildRulePath(rawTarget) != ".PHONY" {
+			continue
+		}
+		for _, prerequisite := range rule.Prerequisites {
+			visit(compactKbuildProfileTargetPath(profile, prerequisite))
+		}
+		return
+	}
+}
+
+func compactKbuildProfileTargetDeclaredPhony(profile CompactKbuildProfile, target string) bool {
+	return compactKbuildPlannerRuntimeForProfile(profile).phonyTargets[compactKbuildGraphTargetPath(target)]
+}
+
+// GNU Make does not search implicit rules for a target declared .PHONY. An
+// otherwise unruled PHONY prerequisite completes without publishing a file;
+// an explicit rule still owns its prerequisite and recipe status semantics.
+func compactKbuildPhonyHasExplicitRule(profile CompactKbuildProfile, target, makeTarget string) bool {
+	for _, candidate := range compactKbuildRuleCandidatesForMakeTarget(profile, target, makeTarget) {
+		if !strings.Contains(candidate.target, "%") {
+			return true
+		}
+	}
+	return false
+}
+
+func compactKbuildPhonyHasUnselectedRecipe(profile CompactKbuildProfile, target, makeTarget string) bool {
+	for _, candidate := range compactKbuildRuleCandidatesForMakeTarget(profile, target, makeTarget) {
+		if !strings.Contains(candidate.target, "%") && len(candidate.rule.Recipe) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// A PHONY target with no selected action can still be a source-selected
+// recursive Make boundary. The frozen recipe must contain only authenticated
+// child invocations (and inert shell lines); the child actions own the actual
+// output files and their completion status. A local shell command instead
+// requires its own selected PHONY status action.
+func (g *compactKbuildSelectionGraph) compactKbuildUnselectedPhonyForwardsChildren(
+	metadata *CompactMetadata, profile CompactKbuildProfile, target, makeTarget string,
+) (bool, error) {
+	if !g.compactKbuildProfileTargetIsPhony(profile, target) ||
+		!compactKbuildPhonyHasUnselectedRecipe(profile, target, makeTarget) {
+		return false, nil
+	}
+	status, err := metadata.compactKbuildSelectedPhonySourceStatus(profile, target, makeTarget)
+	if err != nil {
+		return false, err
+	}
+	if status == nil || status.command != ":" {
+		return false, nil
+	}
+	children := g.targetInvocations[compactKbuildProfileTargetKey{profile: profile.Name, target: target}]
+	if len(children) == 0 {
+		return false, fmt.Errorf("PHONY forwarding target %q in profile %q has no selected recursive child", target, profile.Name)
+	}
+	return true, nil
 }
 
 // materializationOrder returns the selected artifacts in dependency order.
@@ -1397,6 +1810,9 @@ func (g *compactKbuildSelectionGraph) selectionDependenciesSingle(
 	metadata *CompactMetadata,
 	key compactKbuildSelectionKey,
 ) ([]compactKbuildSelectionKey, error) {
+	if _, phase := g.sourcePhasesBySelection[key]; phase {
+		return g.sourcePhaseSelectionDependencies(metadata, key)
+	}
 	dependencies, err := g.selectionNativeDependencies(metadata, key)
 	if err != nil {
 		return nil, err
@@ -1416,6 +1832,25 @@ func (g *compactKbuildSelectionGraph) selectionDependenciesSingle(
 	selected := map[compactKbuildSelectionKey]bool{}
 	for _, dependency := range dependencies {
 		selected[dependency] = true
+	}
+	parentPrerequisites, parentErr := g.compactKbuildParentPrerequisiteSelections(metadata, profile.Name, key.stage)
+	if parentErr != nil {
+		return nil, fmt.Errorf("resolve parent prerequisite frontier for %s: %w", compactKbuildSelectionKeyString(key), parentErr)
+	}
+	for _, parent := range parentPrerequisites {
+		if parent != key && !selected[parent] {
+			selected[parent] = true
+			dependencies = append(dependencies, parent)
+		}
+	}
+	if precedingPhase, phasedChild := g.sourcePhaseBeforeChild[profile.Name]; phasedChild {
+		if compactKbuildSelectionStageOrder(precedingPhase.stage) > compactKbuildSelectionStageOrder(key.stage) {
+			return nil, fmt.Errorf("recursive Make child %s has later-stage source phase %s", compactKbuildSelectionKeyString(key), compactKbuildSelectionKeyString(precedingPhase))
+		}
+		if precedingPhase != key && !selected[precedingPhase] {
+			selected[precedingPhase] = true
+			dependencies = append(dependencies, precedingPhase)
+		}
 	}
 	for _, candidate := range g.sideOutputCandidateDependencies[key] {
 		if candidate == key || selected[candidate] {
@@ -1444,11 +1879,15 @@ func (g *compactKbuildSelectionGraph) selectionDependenciesSingle(
 		}
 	}
 	invocationKey := compactKbuildProfileTargetKey{profile: profile.Name, target: key.target}
+	finalChild := ""
+	if phases := g.sourcePhasesByOwner[key]; len(phases) != 0 {
+		finalChild = g.sourcePhaseChildren[phases[len(phases)-1]]
+	}
 	for _, dependencyProfile := range g.targetInvocations[invocationKey] {
-		if artifact, ok := g.compactKbuildInitialVisibleArtifact(dependencyProfile, key.target); ok &&
-			artifact == (CompactKbuildVisibleArtifact{
-				Path: key.target, Profile: key.profile, Target: key.target,
-			}) {
+		if finalChild != "" && dependencyProfile != finalChild {
+			continue
+		}
+		if g.compactKbuildChildOverwritesParentVersion(key.profile, key.target, dependencyProfile) {
 			// The child invocation starts from this action's same-path output.
 			// It is a source-ordered successor overwrite, not a dependency of
 			// the action which produced that initial version.
@@ -1466,6 +1905,62 @@ func (g *compactKbuildSelectionGraph) selectionDependenciesSingle(
 		}
 	}
 	return dependencies, nil
+}
+
+// Source phases execute inside the real owner's already selected rule. The
+// first phase starts after that rule's native prerequisites, while the second
+// starts after the first recursive child completes. Giving either phase the
+// complete owner's dependencies would make the first child depend on itself.
+func (g *compactKbuildSelectionGraph) sourcePhaseSelectionDependencies(
+	metadata *CompactMetadata, key compactKbuildSelectionKey,
+) ([]compactKbuildSelectionKey, error) {
+	phase := g.sourcePhasesBySelection[key]
+	owner, selected := g.sourcePhaseOwners[key]
+	if !selected {
+		return nil, fmt.Errorf("selected source phase %s has no real Make owner", compactKbuildSelectionKeyString(key))
+	}
+	if phase.Ordinal == 0 {
+		dependencies, err := g.selectionNativeDependencies(metadata, owner)
+		if err != nil {
+			return nil, fmt.Errorf("selected source phase %s owner prerequisites: %w", compactKbuildSelectionKeyString(key), err)
+		}
+		parents, err := g.compactKbuildParentPrerequisiteSelections(metadata, owner.profile, key.stage)
+		if err != nil {
+			return nil, fmt.Errorf("selected source phase %s parent prerequisite frontier: %w", compactKbuildSelectionKeyString(key), err)
+		}
+		predecessors, err := g.compactKbuildInvocationPredecessorSelections(metadata, owner.profile, owner.stage)
+		if err != nil {
+			return nil, fmt.Errorf("selected source phase %s invocation predecessors: %w", compactKbuildSelectionKeyString(key), err)
+		}
+		selected := map[compactKbuildSelectionKey]bool{}
+		ordered := make([]compactKbuildSelectionKey, 0, len(dependencies)+len(parents)+len(predecessors))
+		for _, dependency := range append(append(dependencies, parents...), predecessors...) {
+			if compactKbuildSelectionStageOrder(dependency.stage) > compactKbuildSelectionStageOrder(key.stage) {
+				return nil, fmt.Errorf("selected source phase %s depends on later-stage prerequisite %s", compactKbuildSelectionKeyString(key), compactKbuildSelectionKeyString(dependency))
+			}
+			if dependency != key && !selected[dependency] {
+				selected[dependency] = true
+				ordered = append(ordered, dependency)
+			}
+		}
+		return ordered, nil
+	}
+	if phase.Ordinal != 1 {
+		return nil, fmt.Errorf("selected source phase %s has unsupported ordinal %d", compactKbuildSelectionKeyString(key), phase.Ordinal)
+	}
+	phases := g.sourcePhasesByOwner[owner]
+	if len(phases) != 2 || phases[1] != key {
+		return nil, fmt.Errorf("selected source phase %s has no ordered predecessor", compactKbuildSelectionKeyString(key))
+	}
+	child := g.sourcePhaseChildren[phases[0]]
+	terminals, err := g.compactKbuildTerminalRecipeSelections(metadata, child, key.stage)
+	if err != nil {
+		return nil, fmt.Errorf("selected source phase %s first child %q: %w", compactKbuildSelectionKeyString(key), child, err)
+	}
+	if len(terminals) == 0 {
+		return nil, fmt.Errorf("selected source phase %s first child %q has no selected terminal", compactKbuildSelectionKeyString(key), child)
+	}
+	return append([]compactKbuildSelectionKey{phases[0]}, terminals...), nil
 }
 
 // compactKbuildInvocationPredecessorSelections resolves the source-ordered
@@ -1645,40 +2140,139 @@ func (g *compactKbuildSelectionGraph) computeSelectionNativeDependencies(
 		}
 	}
 	expanded := map[string]bool{}
+	appendChildTerminals := func(target string) error {
+		invocationKey := compactKbuildProfileTargetKey{profile: profile.Name, target: target}
+		for _, childProfile := range g.targetInvocations[invocationKey] {
+			if g.compactKbuildChildOverwritesParentVersion(profile.Name, target, childProfile) {
+				continue
+			}
+			terminals, err := g.compactKbuildTerminalRecipeSelections(metadata, childProfile, key.stage)
+			if err != nil {
+				return fmt.Errorf("resolve recursive invocation dependency %q for unselected target %q of %s: %w",
+					childProfile, target, compactKbuildSelectionKeyString(key), err)
+			}
+			for _, terminal := range terminals {
+				if terminal != key && !selected[terminal] {
+					selected[terminal] = true
+					dependencies = append(dependencies, terminal)
+				}
+			}
+		}
+		return nil
+	}
 	var collect func(compactKbuildEvaluatedPath) error
 	collect = func(evaluated compactKbuildEvaluatedPath) error {
 		target := compactKbuildGraphTargetPath(evaluated.graphPath)
 		if target == "" || target == "FORCE" || target == selection.Target {
 			return nil
 		}
-		owner, exists, ownerErr := g.compactKbuildSelectionPathOwner(key, target)
-		if ownerErr != nil {
-			return ownerErr
+		phony, selectedPhony := g.compactKbuildSelectedPhonyPrerequisite(key, target)
+		if selectedPhony && !selected[phony] {
+			selected[phony] = true
+			dependencies = append(dependencies, phony)
 		}
-		if exists {
-			if owner != key && !selected[owner] {
-				selected[owner] = true
-				dependencies = append(dependencies, owner)
+		if !selectedPhony {
+			if !g.compactKbuildProfileTargetIsPhony(profile, target) {
+				owner, exists, ownerErr := g.compactKbuildSelectionNativePrerequisiteOwner(key, target)
+				if ownerErr != nil {
+					return ownerErr
+				}
+				if exists {
+					if owner != key && !selected[owner] {
+						selected[owner] = true
+						dependencies = append(dependencies, owner)
+					}
+					return nil
+				}
+				source, sourceErr := g.compactKbuildSourcePathExists(metadata, profile, target)
+				if sourceErr != nil {
+					return sourceErr
+				}
+				if source {
+					return nil
+				}
 			}
-			return nil
 		}
-		source, sourceErr := g.compactKbuildSourcePathExists(metadata, profile, target)
-		if sourceErr != nil {
-			return sourceErr
-		}
-		if source || expanded[target] {
+		if expanded[target] {
 			return nil
 		}
 		expanded[target] = true
-		match, matched, err := g.compactKbuildRuleForProfileMakeTarget(
-			metadata, profile, target, evaluated.makeWord,
-		)
+		if !selectedPhony && g.compactKbuildProfileTargetIsPhony(profile, target) {
+			if compactKbuildPhonyHasUnselectedRecipe(profile, target, evaluated.makeWord) {
+				forwarding, err := g.compactKbuildUnselectedPhonyForwardsChildren(
+					metadata, profile, target, evaluated.makeWord,
+				)
+				if err != nil {
+					return err
+				}
+				if !forwarding {
+					return fmt.Errorf("Kbuild selection %s PHONY prerequisite %q has an unselected executable source rule", compactKbuildSelectionKeyString(key), target)
+				}
+				match, matched, err := g.compactKbuildSelectedPhonyRuleForMakeTarget(metadata, profile, target, evaluated.makeWord)
+				if err != nil {
+					return err
+				}
+				if !matched || !match.explicit {
+					return fmt.Errorf("Kbuild selection %s forwarding PHONY prerequisite %q has no exact source rule", compactKbuildSelectionKeyString(key), target)
+				}
+				normal, orderOnly, _, err := g.compactKbuildTargetRuleContext(profile, target, match)
+				if err != nil {
+					return err
+				}
+				for _, prerequisite := range append(normal, orderOnly...) {
+					if err := collect(prerequisite); err != nil {
+						return err
+					}
+				}
+				return appendChildTerminals(target)
+			}
+			orderingOnly, normal, orderOnly, err := g.compactKbuildOrderingOnlyRuleContextForMakeTarget(
+				metadata, profile, target, evaluated.makeWord,
+			)
+			if err != nil {
+				return err
+			}
+			if orderingOnly {
+				for _, prerequisite := range append(normal, orderOnly...) {
+					if err := collect(prerequisite); err != nil {
+						return err
+					}
+				}
+				return appendChildTerminals(target)
+			}
+			if compactKbuildPhonyHasExplicitRule(profile, target, evaluated.makeWord) {
+				return fmt.Errorf("Kbuild selection %s PHONY prerequisite %q has an unselected executable source rule", compactKbuildSelectionKeyString(key), target)
+			}
+			// A .PHONY declaration without an explicit rule completes without
+			// a file. GNU Make never searches implicit rules for that target.
+			return nil
+		}
+		var match compactKbuildRuleMatch
+		var matched bool
+		var err error
+		if selectedPhony {
+			match, matched, err = g.compactKbuildSelectedPhonyRuleForMakeTarget(metadata, profile, target, evaluated.makeWord)
+		} else {
+			match, matched, err = g.compactKbuildRuleForProfileMakeTarget(metadata, profile, target, evaluated.makeWord)
+		}
 		if err != nil {
 			return err
 		}
 		matchViable := match.explicit
 		if matched && !matchViable {
-			matchViable, err = metadata.compactKbuildRuleMatchViableInProfile(target, match, profile)
+			matchViable, err = metadata.compactKbuildRuleMatchViableWithDeclaredProducer(
+				target, match, profile,
+				func(candidate string) (bool, error) {
+					owner, selected, ownerErr := g.compactKbuildSelectionNativePrerequisiteOwner(key, candidate)
+					if ownerErr != nil || !selected {
+						return selected, ownerErr
+					}
+					if owner == key {
+						return false, fmt.Errorf("Kbuild selection %s implicitly depends on itself through %q", compactKbuildSelectionKeyString(key), candidate)
+					}
+					return true, nil
+				},
+			)
 			if err != nil {
 				return err
 			}
@@ -1703,13 +2297,18 @@ func (g *compactKbuildSelectionGraph) computeSelectionNativeDependencies(
 				return err
 			}
 		}
-		return nil
+		return appendChildTerminals(target)
 	}
 
 	makeTarget := selection.MakeTarget
-	match, matched, matchErr := g.compactKbuildRuleForProfileMakeTarget(
-		metadata, profile, selection.Target, makeTarget,
-	)
+	var match compactKbuildRuleMatch
+	var matched bool
+	var matchErr error
+	if g.compactKbuildProfileTargetIsPhony(profile, selection.Target) {
+		match, matched, matchErr = g.compactKbuildSelectedPhonyRuleForMakeTarget(metadata, profile, selection.Target, makeTarget)
+	} else {
+		match, matched, matchErr = g.compactKbuildRuleForProfileMakeTarget(metadata, profile, selection.Target, makeTarget)
+	}
 	if matchErr != nil {
 		return nil, matchErr
 	}

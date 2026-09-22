@@ -406,7 +406,17 @@ func TestValidateProbeCandidateArgumentsRejectsSecurityAndIOAuthority(t *testing
 		{name: "linker remap input", policy: ProbeCandidatePolicyLD, argv: []string{"--remap-inputs-file=map"}},
 		{name: "linker section ordering", policy: ProbeCandidatePolicyLD, argv: []string{"--section-ordering-file=order"}},
 		{name: "linker R input", policy: ProbeCandidatePolicyLD, argv: []string{"-Rsymbols"}},
-		{name: "library path", policy: ProbeCandidatePolicyCCLink, argv: []string{"-Lescape/lib"}},
+		{name: "compile-only library path", policy: ProbeCandidatePolicyCC, argv: []string{"-Lescape/lib"}},
+		{name: "link without library path", policy: ProbeCandidatePolicyCCLink, argv: []string{"-L"}},
+		{name: "link without library name", policy: ProbeCandidatePolicyCCLink, argv: []string{"-l"}},
+		{name: "link library path as name", policy: ProbeCandidatePolicyCCLink, argv: []string{"-l../escape"}},
+		{name: "link response file as name", policy: ProbeCandidatePolicyCCLink, argv: []string{"-l@escape"}},
+		{name: "link dynamic library selection", policy: ProbeCandidatePolicyCCLink, argv: []string{"-l:escape.a"}},
+		{name: "link shell syntax as name", policy: ProbeCandidatePolicyCCLink, argv: []string{"-l$(touch escaped)"}},
+		{name: "plugin option looks like library", policy: ProbeCandidatePolicyCCLink, argv: []string{"-load", "plugin.so"}},
+		{name: "plugin loader looks like library", policy: ProbeCandidatePolicyCCLink, argv: []string{"-load-pass-plugin=plugin.so"}},
+		{name: "link ordinary positional object", policy: ProbeCandidatePolicyCCLink, argv: []string{"external/probe.o"}},
+		{name: "link dynamic positional object", policy: ProbeCandidatePolicyCCLink, argv: []string{"external/libprobe.so"}},
 		{name: "missing include", policy: ProbeCandidatePolicyCC, argv: []string{"-I"}},
 		{name: "empty joined include", policy: ProbeCandidatePolicyCC, argv: []string{"-isystem="}},
 		{name: "include response", policy: ProbeCandidatePolicyCC, argv: []string{"-include", "@header.rsp"}},
@@ -419,6 +429,59 @@ func TestValidateProbeCandidateArgumentsRejectsSecurityAndIOAuthority(t *testing
 				t.Fatalf("ValidateProbeCandidateArguments(%q, %q) = %#v, want error", test.policy, test.argv, paths)
 			}
 		})
+	}
+}
+
+func TestCompilerLinkCandidateCarriesTypedLibraryInputs(t *testing.T) {
+	arguments := []string{
+		"-L__LINUX_BZL_HOST_DEPS__/lib", "-L", "/declared/lib",
+		"-lelf", "-l", "stdc++", "__LINUX_BZL_HOST_DEPS__/lib/libelf.a",
+	}
+	paths, err := ValidateProbeCandidateArguments(ProbeCandidatePolicyCCLink, arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ProbeCandidatePathOperand{
+		{Kind: ProbeCandidatePathLibraryDir, Argument: 0, Start: 2, End: len(arguments[0])},
+		{Kind: ProbeCandidatePathLibraryDir, Argument: 2, Start: 0, End: len(arguments[2])},
+		{Kind: ProbeCandidatePathRegularFile, Argument: 6, Start: 0, End: len(arguments[6])},
+	}
+	if !slices.Equal(paths, want) {
+		t.Fatalf("compiler link candidate paths = %#v, want %#v", paths, want)
+	}
+	for _, policy := range []string{ProbeCandidatePolicyCC, ProbeCandidatePolicyLD} {
+		if _, err := ValidateProbeCandidateArguments(policy, []string{"-L__LINUX_BZL_HOST_DEPS__/lib"}); err == nil {
+			t.Errorf("%s accepted compiler-link-only library directory", policy)
+		}
+	}
+}
+
+func TestCompilerLinkCandidateForwardsDeclaredArchiveAsTypedInput(t *testing.T) {
+	archive := "__LINUX_BZL_HOST_DEPS__/external/elfutils/libelf.a"
+	argument := "-Wl," + archive
+	paths, err := ValidateProbeCandidateArguments(ProbeCandidatePolicyCCLink, []string{argument})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ProbeCandidatePathOperand{{
+		Kind: ProbeCandidatePathRegularFile, Argument: 0, Start: len("-Wl,"), End: len(argument),
+	}}
+	if !slices.Equal(paths, want) {
+		t.Fatalf("forwarded declared archive = %#v, want %#v", paths, want)
+	}
+	for _, test := range []struct {
+		policy string
+		argv   []string
+	}{
+		{ProbeCandidatePolicyLD, []string{argument}},
+		{ProbeCandidatePolicyCC, []string{argument}},
+		{ProbeCandidatePolicyCCLink, []string{"-Wl,/unbound/libelf.a"}},
+		{ProbeCandidatePolicyCCLink, []string{"-Wl," + archive + ",--whole-archive"}},
+		{ProbeCandidatePolicyCCLink, []string{"-Wl,__LINUX_BZL_HOST_DEPS__/external/elfutils/libelf.so"}},
+	} {
+		if got, err := ValidateProbeCandidateArguments(test.policy, test.argv); err == nil {
+			t.Errorf("%s accepted unbound forwarded archive %q: %#v", test.policy, test.argv, got)
+		}
 	}
 }
 

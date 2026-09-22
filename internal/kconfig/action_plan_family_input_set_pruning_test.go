@@ -356,7 +356,7 @@ func TestActionPlanFamilyPersistentInputsPruneNormalCmdAndFixdepAmbientConfig(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	ambientID, err := ensureActionPlanSource(plan, "config", "kernel.release")
+	ambientID, err := ensureActionPlanSource(plan, "config", "auto.conf.cmd")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +370,7 @@ func TestActionPlanFamilyPersistentInputsPruneNormalCmdAndFixdepAmbientConfig(t 
 	producerID, err := builder.buildCommandTemplate(target, match, []compactKbuildRuleInput{
 		{path: source, sourceID: sourceID}, {path: fixdep, producer: fixdepProducer},
 		{path: "include/generated/autoconf.h", sourceID: configID, objectTree: true, workingOnly: true},
-		{path: "include/config/kernel.release", sourceID: ambientID, objectTree: true, workingOnly: true},
+		{path: "include/config/auto.conf.cmd", sourceID: ambientID, objectTree: true, workingOnly: true},
 	})
 	if err != nil {
 		t.Fatal(err)

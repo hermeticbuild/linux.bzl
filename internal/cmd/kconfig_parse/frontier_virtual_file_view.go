@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -49,6 +50,20 @@ type kbuildFrontierVirtualFileView struct {
 	// observes them as existing files from the start of every invocation, while
 	// a source-selected writer in state still supersedes their baseline bytes.
 	immutableContents map[string]string
+}
+
+// pendingKbuildSourceOutputRead is emitted only for a selected source writer
+// whose request is registered in the source-output discovery workload. Its
+// producer identity lets that workload stop on the same causal writer; other
+// probe stages retain the ordinary opaque-read failure.
+type pendingKbuildSourceOutputRead struct {
+	path       string
+	artifact   kconfig.CompactKbuildVisibleArtifact
+	requestIDs []string
+}
+
+func (read *pendingKbuildSourceOutputRead) Error() string {
+	return fmt.Sprintf("source output %q from selected writer %s:%s awaits measured bytes", read.path, read.artifact.Profile, read.artifact.Target)
 }
 
 func (view kbuildFrontierVirtualFileView) Match(pattern string) []string {
@@ -103,12 +118,19 @@ func (view kbuildFrontierVirtualFileView) Read(path string) (string, bool, bool,
 	exact := false
 	content := ""
 	exactPath := ""
+	var pending *pendingKbuildSourceOutputRead
 	for _, global := range paths {
 		value, found := kbuildFrontierGet(view.state, global)
 		if !found {
 			continue
 		}
 		exists = true
+		if value.pendingSourceOutput {
+			if pending != nil && (pending.artifact != value.artifact || !slices.Equal(pending.requestIDs, value.sourceOutputRequestIDs)) {
+				return "", false, false, fmt.Errorf("virtual path alias %q has distinct pending source writers %s:%s and %s:%s", path, pending.artifact.Profile, pending.artifact.Target, value.artifact.Profile, value.artifact.Target)
+			}
+			pending = &pendingKbuildSourceOutputRead{path: global, artifact: value.artifact, requestIDs: slices.Clone(value.sourceOutputRequestIDs)}
+		}
 		if !value.exact {
 			continue
 		}
@@ -123,6 +145,12 @@ func (view kbuildFrontierVirtualFileView) Read(path string) (string, bool, bool,
 		exactPath = global
 	}
 	if exists {
+		if pending != nil {
+			if exact {
+				return "", false, false, fmt.Errorf("virtual path alias %q has both pending source output %q and exact source output %q", path, pending.path, exactPath)
+			}
+			return "", true, false, pending
+		}
 		return content, true, exact, nil
 	}
 	for _, global := range paths {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -23,6 +24,11 @@ func runTestProbe(t *testing.T, opts probeOptions) error {
 }
 
 func runTestProbeWithToolset(t *testing.T, opts probeOptions, additionalToolsetFiles ...string) error {
+	t.Helper()
+	return runProbe(prepareTestProbeWithToolset(t, opts, additionalToolsetFiles...))
+}
+
+func prepareTestProbeWithToolset(t *testing.T, opts probeOptions, additionalToolsetFiles ...string) probeOptions {
 	t.Helper()
 	workingDirectory, err := os.Getwd()
 	if err != nil {
@@ -103,124 +109,142 @@ func runTestProbeWithToolset(t *testing.T, opts probeOptions, additionalToolsetF
 		}
 		roles[role] = bound
 	}
-	if len(roles) == 0 {
+	rolesByScope := map[string]map[string]string{opts.scope: {}}
+	for binding, filename := range roles {
+		scope, role, scoped, valid := toolaction.SplitBinding(binding)
+		if !valid || scoped && (opts.scope != "target" || scope != "host") {
+			t.Fatalf("invalid test tool binding %q for %s probe", binding, opts.scope)
+		}
+		if !scoped {
+			scope, role = opts.scope, binding
+		}
+		if rolesByScope[scope] == nil {
+			rolesByScope[scope] = map[string]string{}
+		}
+		rolesByScope[scope][role] = filename
+	}
+	if len(rolesByScope[opts.scope]) == 0 {
 		executable, err := os.Executable()
 		if err != nil {
 			t.Fatal(err)
 		}
-		roles["cc"] = bind("runtime-cc", executable)
+		filename := bind("runtime-cc", executable)
+		roles["cc"] = filename
+		rolesByScope[opts.scope]["cc"] = filename
 	}
 	for role, filename := range roles {
 		opts.runtimeTools[role] = filename
 	}
 
-	closureFiles := make([]string, 0, len(boundByPath)+len(additionalToolsetFiles))
-	closureFiles = append(closureFiles, sortedStringValues(boundByPath)...)
+	additionalBoundFiles := make([]string, 0, len(additionalToolsetFiles))
 	for index, filename := range additionalToolsetFiles {
 		bound := bind(fmt.Sprintf("closure-%d", index), filename)
-		found := false
-		for _, existing := range closureFiles {
-			if existing == bound {
-				found = true
-				break
-			}
-		}
-		if !found {
-			closureFiles = append(closureFiles, bound)
-		}
+		additionalBoundFiles = append(additionalBoundFiles, bound)
 	}
-	canonicalByFile := map[string]string{}
-	artifactKinds := map[string]string{}
-	closure := make([]string, 0, len(closureFiles))
-	for _, filename := range closureFiles {
-		canonical, err := canonicalActionArtifactPath(workingDirectory, filename)
-		if err != nil {
-			t.Fatalf("canonicalize test toolset artifact %q: %v", filename, err)
-		}
-		canonicalByFile[filename] = canonical
-		closure = append(closure, canonical)
-		info, err := os.Stat(filename)
-		if err != nil {
-			t.Fatalf("inspect test toolset artifact %q: %v", filename, err)
-		}
-		artifactKinds[canonical] = testToolsetArtifactKind(true, info.IsDir())
-	}
-	sort.Strings(closure)
-	artifactRoots, roots, anchors := testToolsetRootBindings(t, workingDirectory, closure, closureFiles)
-	actionValueResolver := &toolsetPathResolver{}
-	for _, filename := range closureFiles {
-		info, err := os.Stat(filename)
-		if err != nil {
-			t.Fatalf("inspect test toolset artifact %q: %v", filename, err)
-		}
-		actionValueResolver.ordered = append(actionValueResolver.ordered, toolsetArtifactBinding{
-			canonical: canonicalByFile[filename],
-			path:      filename,
-			directory: info.IsDir(),
-			source:    true,
-		})
-	}
-
-	manifest := toolaction.KbuildToolsetManifest{
-		Schema:        toolaction.KbuildToolsetManifestSchema,
-		Scope:         opts.scope,
-		Actions:       map[string][]string{},
-		Tools:         map[string]string{},
-		Closure:       closure,
-		ArtifactKinds: artifactKinds,
-		ArtifactRoots: artifactRoots,
-		Roots:         roots,
-		Environments:  map[string]map[string]string{},
-		MakeVariables: map[string]string{},
-		Requirements:  map[string]map[string]string{},
-	}
-	roleNames := make([]string, 0, len(roles))
-	for role := range roles {
-		roleNames = append(roleNames, role)
-	}
-	sort.Strings(roleNames)
-	for _, role := range roleNames {
-		contract := opts.tools[role]
-		manifest.Actions[role] = make([]string, len(contract.arguments))
-		for index, argument := range contract.arguments {
-			manifest.Actions[role][index] = testManifestActionValue(t, actionValueResolver, argument)
-		}
-		manifest.Tools[role] = canonicalByFile[roles[role]]
-		manifest.Environments[role] = map[string]string{}
-		for name, value := range contract.environment {
-			manifest.Environments[role][name] = testManifestActionValue(t, actionValueResolver, value)
-		}
-		manifest.Requirements[role] = map[string]string{}
-	}
-	identity, err := manifest.Identity()
-	if err != nil {
-		t.Fatalf("build test toolset manifest: %v", err)
-	}
-	manifestData, err := json.Marshal(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifestPath := filepath.Join(typedRoot, "manifest.json")
-	if err := os.WriteFile(manifestPath, manifestData, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	marker := filepath.Join(typedRoot, identity)
-	if err := os.WriteFile(marker, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	opts.toolsetManifest = manifestPath
-	opts.toolsetAnchors = anchors
+	identities := map[string]string{}
 	if opts.toolsetMarkers == nil {
 		opts.toolsetMarkers = map[string]string{}
 	}
-	opts.toolsetMarkers[opts.scope] = marker
+	for scope, scopedRoles := range rolesByScope {
+		closureFiles := make([]string, 0, len(scopedRoles)+len(additionalBoundFiles))
+		for _, filename := range scopedRoles {
+			closureFiles = append(closureFiles, filename)
+		}
+		if scope == opts.scope {
+			closureFiles = append(closureFiles, additionalBoundFiles...)
+		}
+		sort.Strings(closureFiles)
+		closureFiles = slices.Compact(closureFiles)
+		canonicalByFile := map[string]string{}
+		artifactKinds := map[string]string{}
+		closure := make([]string, 0, len(closureFiles))
+		actionValueResolver := &toolsetPathResolver{}
+		for _, filename := range closureFiles {
+			canonical, err := canonicalActionArtifactPath(workingDirectory, filename)
+			if err != nil {
+				t.Fatalf("canonicalize %s test toolset artifact %q: %v", scope, filename, err)
+			}
+			canonicalByFile[filename] = canonical
+			closure = append(closure, canonical)
+			info, err := os.Stat(filename)
+			if err != nil {
+				t.Fatalf("inspect %s test toolset artifact %q: %v", scope, filename, err)
+			}
+			artifactKinds[canonical] = testToolsetArtifactKind(true, info.IsDir())
+			actionValueResolver.ordered = append(actionValueResolver.ordered, toolsetArtifactBinding{
+				canonical: canonical, path: filename, directory: info.IsDir(), source: true,
+			})
+		}
+		sort.Strings(closure)
+		artifactRoots, roots, anchors := testToolsetRootBindings(t, workingDirectory, closure, closureFiles)
+		manifest := toolaction.KbuildToolsetManifest{
+			Schema:        toolaction.KbuildToolsetManifestSchema,
+			Scope:         scope,
+			Actions:       map[string][]string{},
+			Tools:         map[string]string{},
+			Closure:       closure,
+			ArtifactKinds: artifactKinds,
+			ArtifactRoots: artifactRoots,
+			Roots:         roots,
+			Environments:  map[string]map[string]string{},
+			MakeVariables: map[string]string{},
+			Requirements:  map[string]map[string]string{},
+		}
+		roleNames := make([]string, 0, len(scopedRoles))
+		for role := range scopedRoles {
+			roleNames = append(roleNames, role)
+		}
+		sort.Strings(roleNames)
+		for _, role := range roleNames {
+			binding := role
+			if scope != opts.scope {
+				binding = scope + "@" + role
+			}
+			contract := opts.tools[binding]
+			manifest.Actions[role] = make([]string, len(contract.arguments))
+			for index, argument := range contract.arguments {
+				manifest.Actions[role][index] = testManifestActionValue(t, actionValueResolver, argument)
+			}
+			manifest.Tools[role] = canonicalByFile[scopedRoles[role]]
+			manifest.Environments[role] = map[string]string{}
+			for name, value := range contract.environment {
+				manifest.Environments[role][name] = testManifestActionValue(t, actionValueResolver, value)
+			}
+			manifest.Requirements[role] = map[string]string{}
+		}
+		identity, err := manifest.Identity()
+		if err != nil {
+			t.Fatalf("build %s test toolset manifest: %v", scope, err)
+		}
+		manifestData, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifestPath := filepath.Join(typedRoot, scope+"-manifest.json")
+		if err := os.WriteFile(manifestPath, manifestData, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(typedRoot, identity)
+		if err := os.WriteFile(marker, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		identities[scope] = identity
+		opts.toolsetMarkers[scope] = marker
+		if scope == opts.scope {
+			opts.toolsetManifest = manifestPath
+			opts.toolsetAnchors = anchors
+		} else {
+			opts.hostToolsetManifest = manifestPath
+			opts.hostToolsetAnchors = anchors
+		}
+	}
 
 	for _, filename := range opts.inputs {
 		input, err := kconfig.ReadProbeResult(filename)
 		if err != nil {
 			t.Fatalf("prepare test probe input: %v", err)
 		}
-		if input.Scope == opts.scope {
+		if identity := identities[input.Scope]; identity != "" {
 			input.ToolsetIdentity = identity
 		} else {
 			otherMarker := filepath.Join(typedRoot, input.ToolsetIdentity)
@@ -237,7 +261,45 @@ func runTestProbeWithToolset(t *testing.T, opts probeOptions, additionalToolsetF
 			t.Fatal(err)
 		}
 	}
-	return runProbe(opts)
+	if identities["host"] != "" && opts.scope == "target" {
+		data, err := os.ReadFile(opts.request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var request kconfig.ProbeRequest
+		if err := json.Unmarshal(data, &request); err != nil {
+			t.Fatal(err)
+		}
+		selectedHostTool := slices.ContainsFunc(request.ToolRoles(), func(binding string) bool {
+			scope, _, scoped, valid := toolaction.SplitBinding(binding)
+			return valid && scoped && scope == "host"
+		})
+		if selectedHostTool {
+			request.HostToolsetIdentity = identities["host"]
+			canonical, err := request.CanonicalJSON()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(opts.request, canonical, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			opts.requestID, err = request.ID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			inputNodeIDs := make([]string, request.InputCount)
+			for index := range inputNodeIDs {
+				name := fmt.Sprintf("%08d", index)
+				input, err := kconfig.ReadProbeResult(opts.inputs[name])
+				if err != nil {
+					t.Fatalf("prepare scoped test probe input %s: %v", name, err)
+				}
+				inputNodeIDs[index] = input.NodeID
+			}
+			opts.nodeID = (kconfig.ProbePlanNode{Scope: opts.scope, RequestID: opts.requestID, Inputs: inputNodeIDs}).ContentID()
+		}
+	}
+	return opts
 }
 
 func testToolsetArtifactKind(source, directory bool) string {

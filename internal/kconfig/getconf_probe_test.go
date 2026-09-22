@@ -421,6 +421,9 @@ func TestTargetFirstGetconfFlagsFeedHostPreprocessorProbe(t *testing.T) {
 	if preprocessRequest.InputCount != 1 || len(preprocessRequest.Steps) != 1 {
 		t.Fatalf("host preprocessor request = %#v", preprocessRequest)
 	}
+	if !slices.Equal(preprocessRequest.SourceRoots, []string{linuxProbeSourceRootName}) {
+		t.Fatalf("getconf-only candidate source roots = %q, want only Linux", preprocessRequest.SourceRoots)
+	}
 	step := preprocessRequest.Steps[0]
 	if len(step.ArgumentFragments) != 1 {
 		t.Fatalf("host preprocessor dynamic argv = %#v, want one getconf-backed slot", step.ArgumentFragments)

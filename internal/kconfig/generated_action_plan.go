@@ -148,14 +148,44 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 			// The first peer in dependency order already published this target.
 			continue
 		}
-		// A .PHONY prerequisite is an ordering/control-flow node, not a
-		// filesystem artifact. Its prerequisite and recursive-Make closures
-		// are ordered above by their selected native artifact owners.
-		if selectionGraph.compactKbuildProfileTargetIsPhony(profile, target) {
-			continue
+		selectedPhony := selectionGraph.compactKbuildProfileTargetIsPhony(profile, target)
+		var phonyStatus *compactKbuildSelectedPhonyStatus
+		if selectedPhony {
+			// A frozen feature gate whose resolved status is already success
+			// has no shell branch to run and no file to publish. Evaluate the
+			// entire selected source line before omitting this PHONY recipe.
+			featureCheck, featureErr := m.compactKbuildSelectedPhonyFeatureGate(
+				profile, target, selection.MakeTarget,
+			)
+			if featureErr != nil {
+				return nil, fmt.Errorf("inspect selected PHONY %s target %q: %w", selection.Stage, target, featureErr)
+			}
+			if featureCheck {
+				continue
+			}
+			// Most PHONY goals only order prerequisite files or recursive Make.
+			// A directly selected immutable source script can instead have its
+			// own failure status without creating a file; authenticate that one
+			// selected Make command before allowing it into action lowering.
+			check, checkErr := m.compactKbuildSelectedPhonySourceScriptCheck(
+				profile, target, selection.MakeTarget, selection.Scope,
+			)
+			if checkErr != nil {
+				return nil, fmt.Errorf("inspect selected PHONY %s target %q: %w", selection.Stage, target, checkErr)
+			}
+			if !check {
+				status, statusErr := m.compactKbuildSelectedPhonySourceStatus(profile, target, selection.MakeTarget)
+				if statusErr != nil {
+					return nil, fmt.Errorf("inspect selected PHONY %s target %q: %w", selection.Stage, target, statusErr)
+				}
+				if status == nil {
+					continue
+				}
+				phonyStatus = status
+			}
 		}
 		setupOnly := false
-		if !selectionGraph.hasSelectedRootRuleResolution(
+		if selection.SourceScriptPhase == "" && !selectedPhony && !selectionGraph.hasSelectedRootRuleResolution(
 			m, selectionKey, profile, target, selection.MakeTarget,
 		) {
 			setupOnly, err = m.compactKbuildTargetIsOrderingOnlyInProfileForMakeTarget(
@@ -315,7 +345,18 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 		if err != nil {
 			return nil, fmt.Errorf("declare evaluated %s target %q side-output observations: %w", selection.Stage, target, err)
 		}
-		producer, buildErr := builder.buildSelectedTarget(target, selection.MakeTarget)
+		producer, buildErr := "", error(nil)
+		if selection.SourceScriptPhase != "" {
+			phase, owner, authenticated := selectionGraph.selectedSourcePhase(selectionKey)
+			if !authenticated {
+				return nil, fmt.Errorf("selected source phase %s has no authenticated owner", compactKbuildSelectionKeyString(selectionKey))
+			}
+			producer, buildErr = builder.buildSelectedSourceScriptPhase(phase, owner)
+		} else if phonyStatus != nil {
+			producer, buildErr = builder.buildSelectedPhonyStatus(target, phonyStatus)
+		} else {
+			producer, buildErr = builder.buildSelectedTarget(target, selection.MakeTarget)
+		}
 		if buildErr != nil {
 			return nil, fmt.Errorf("materialize evaluated %s target %q: %w", selection.Stage, target, buildErr)
 		}
@@ -325,6 +366,13 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 		producerNode, exists := compactKbuildPlanNode(plan, producer)
 		if !exists {
 			return nil, fmt.Errorf("materialized Kbuild selection %s has no action-plan node %q", compactKbuildSelectionKeyString(selectionKey), producer)
+		}
+		completion := compactKbuildAuthenticatedExecutionCheckCompletion(plan, producerNode, target)
+		if selectedPhony && !completion {
+			return nil, fmt.Errorf("selected PHONY source script %q produced a file or lost its authenticated outputless execution state", target)
+		}
+		if completion && !slices.Contains(plan.executionCheckRoots, producer) {
+			plan.executionCheckRoots = append(plan.executionCheckRoots, producer)
 		}
 		for slot, output := range producerNode.Outputs {
 			if output.ObservedPath == "" {
@@ -381,6 +429,472 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 	}
 	plan.releaseProbeDiscoveryPayloads()
 	return selectionGraph, nil
+}
+
+// A selected PHONY recipe may contain recursive Make lines followed by an
+// outputless source shell command. Retain its last local command as an exact
+// line-local execution status; the selected child invocations precede that
+// status through the graph, without manufacturing a file named by the PHONY
+// target. The source rule entry exists even when the file-oriented rule matcher
+// correctly declines this rule.
+type compactKbuildSelectedPhonyStatus struct {
+	match       compactKbuildRuleMatch
+	snapshot    *KbuildSelectedControlRecipeSnapshot
+	command     string
+	recipeIndex int
+}
+
+func (m *CompactMetadata) compactKbuildSelectedPhonySourceStatus(
+	profile CompactKbuildProfile, target, makeTarget string,
+) (*compactKbuildSelectedPhonyStatus, error) {
+	entry := CompactKbuildSelectedControlRuleEntrySnapshot(profile, target)
+	if entry == nil {
+		for _, candidate := range compactKbuildRuleCandidatesForMakeTarget(profile, target, makeTarget) {
+			if candidate.ruleOrder >= 0 && candidate.ruleOrder < len(profile.Rules) &&
+				len(profile.Rules[candidate.ruleOrder].Recipe) != 0 {
+				return nil, fmt.Errorf("%s: selected PHONY target %q has an executable recipe without a source-selected entry", candidate.rule.Position, target)
+			}
+		}
+		return nil, nil
+	}
+	index := entry.Line.RuleIndex
+	if index < 0 || index >= len(profile.Rules) || entry.Line.Target != target ||
+		entry.Profile.Name != profile.Name {
+		return nil, fmt.Errorf("Kbuild PHONY target %q has no valid source-selected rule entry", target)
+	}
+	rule := profile.Rules[index]
+	if len(rule.Recipe) == 0 {
+		return nil, nil
+	}
+	snapshots := CompactKbuildSelectedControlRecipeSnapshots(profile, target)
+	if len(snapshots) != len(rule.Recipe) {
+		return nil, fmt.Errorf("%s: selected PHONY target %q has no complete frozen source recipe", rule.Position, target)
+	}
+	dependencies := []CompactKbuildInvocationDependency{}
+	for _, dependency := range profile.TargetInvocationDependencies {
+		if compactKbuildGraphTargetPath(dependency.Target) == target {
+			dependencies = append(dependencies, dependency)
+		}
+	}
+	consumed := make([]bool, len(dependencies))
+	status := &compactKbuildSelectedPhonyStatus{recipeIndex: -1}
+	localCommand := false
+	for recipeIndex, raw := range rule.Recipe {
+		snapshot := snapshots[recipeIndex]
+		if snapshot == nil || snapshot.Line.RuleIndex != index ||
+			snapshot.Line.RecipeIndex != recipeIndex ||
+			snapshot.Line.LookupTarget != entry.Line.LookupTarget ||
+			snapshot.Line.AutomaticTarget != entry.Line.AutomaticTarget {
+			return nil, fmt.Errorf("%s: selected PHONY target %q recipe %d has no matching source line", rule.Position, target, recipeIndex)
+		}
+		match := compactKbuildRuleMatch{
+			profile: snapshot.Evaluation.Profile, rule: rule, ruleOrder: index,
+			lookupTarget: entry.Line.LookupTarget, stem: entry.Line.Stem,
+			explicit: true, resolved: true,
+		}
+		automatic := compactKbuildAutomaticContext{
+			target: entry.Line.AutomaticTarget, stem: entry.Line.Stem,
+			normal: entry.Line.Normal, order: entry.Line.OrderOnly,
+		}
+		pure, err := compactKbuildSelectedRecipeSourceExpansionIsPure(target, match, raw, automatic, nil)
+		if err != nil {
+			return nil, fmt.Errorf("%s: selected PHONY target %q recipe %d Make expansion: %w", rule.Position, target, recipeIndex, err)
+		}
+		if !pure {
+			return nil, fmt.Errorf("%s: selected PHONY target %q recipe %d has stateful Make expansion", rule.Position, target, recipeIndex)
+		}
+		actual, err := evaluateCompactKbuildTextForMakeTarget(
+			snapshot.Evaluation.Profile, target, entry.Line.LookupTarget,
+			entry.Line.AutomaticTarget, entry.Line.Stem, entry.Line.Normal,
+			entry.Line.OrderOnly, nil, raw, true,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("%s: selected PHONY target %q recipe %d Make value: %w", rule.Position, target, recipeIndex, err)
+		}
+		command := compactKbuildRecipeExecutionText(actual)
+		switch command {
+		case "", ":", "true":
+			continue
+		case "false":
+			return nil, fmt.Errorf("%s: selected PHONY target %q recipe %d fails its source shell status", rule.Position, target, recipeIndex)
+		}
+		words, lexErr := lexCompactKbuildRecipe(command)
+		if lexErr != nil {
+			return nil, fmt.Errorf("%s: selected PHONY target %q recipe %d shell lexing: %w", rule.Position, target, recipeIndex, lexErr)
+		}
+		if len(words) != 0 && words[0].value == CompactKbuildRecursiveMakeProvenanceToken {
+			arguments := make([]string, 0, len(words)-1)
+			for _, word := range words[1:] {
+				if word.operator {
+					return nil, fmt.Errorf("%s: selected PHONY target %q has a compound recursive Make line", rule.Position, target)
+				}
+				arguments = append(arguments, compactKbuildSourceScriptReplayValue(profile, word.value))
+			}
+			found := false
+			for dependencyIndex, dependency := range dependencies {
+				if consumed[dependencyIndex] || len(arguments) != len(dependency.ReplayArguments) {
+					continue
+				}
+				equal := true
+				for argumentIndex, argument := range dependency.ReplayArguments {
+					if arguments[argumentIndex] != compactKbuildSourceScriptReplayValue(profile, argument) {
+						equal = false
+						break
+					}
+				}
+				if equal {
+					consumed[dependencyIndex] = true
+					found = true
+					break
+				}
+			}
+			if !found || localCommand {
+				return nil, fmt.Errorf("%s: selected PHONY target %q recipe %d has no matching source-ordered recursive child", rule.Position, target, recipeIndex)
+			}
+			continue
+		}
+		if localCommand || recipeIndex != len(rule.Recipe)-1 {
+			return nil, fmt.Errorf("%s: selected PHONY target %q has multiple or nonterminal local shell effects", rule.Position, target)
+		}
+		localCommand = true
+		status.match = match
+		status.snapshot = snapshot
+		status.command = command
+		status.recipeIndex = recipeIndex
+	}
+	for index, matched := range consumed {
+		if !matched {
+			return nil, fmt.Errorf("%s: selected PHONY target %q has unaccounted recursive child %q", rule.Position, target, dependencies[index].Profile)
+		}
+	}
+	if !localCommand {
+		if len(dependencies) == 0 {
+			return nil, nil
+		}
+		status.command = ":"
+		status.match = compactKbuildRuleMatch{
+			profile: snapshots[0].Evaluation.Profile, rule: rule, ruleOrder: index,
+			lookupTarget: entry.Line.LookupTarget, stem: entry.Line.Stem,
+			explicit: true, resolved: true,
+		}
+		status.snapshot = snapshots[0]
+	}
+	return status, nil
+}
+
+// compactKbuildSelectedPhonyFeatureGate proves the status-only PHONY idiom in
+// tools Makefiles from one complete source-selected line. A resolved feature
+// value of 1 makes the shell's sole failure branch unreachable; another value
+// would make GNU Make fail before a dependent target, so fail planning at the
+// same source gate. The strict source form and exact frozen Make expansion
+// prevent an unmodeled PHONY command from disappearing as an ordering edge.
+func (m *CompactMetadata) compactKbuildSelectedPhonyFeatureGate(
+	profile CompactKbuildProfile, target, makeTarget string,
+) (bool, error) {
+	match, matched, err := m.compactKbuildRuleForProfileMakeTarget(profile, target, makeTarget)
+	if err != nil || !matched {
+		return false, err
+	}
+	if len(match.rule.Recipe) != 1 {
+		for _, raw := range match.rule.Recipe {
+			if strings.Contains(raw, "$(feature-") {
+				return true, fmt.Errorf("%s: PHONY feature gate %q requires one complete selected source line", match.rule.Position, target)
+			}
+		}
+		return false, nil
+	}
+	raw := strings.TrimSpace(match.rule.Recipe[0])
+	if !strings.HasPrefix(strings.TrimLeft(raw, "@+"), `if [ "$(feature-`) {
+		if strings.Contains(raw, "$(feature-") {
+			return true, fmt.Errorf("%s: PHONY feature gate %q has unsupported source condition", match.rule.Position, target)
+		}
+		return false, nil
+	}
+	source := compactKbuildRecipeExecutionText(raw)
+	const prefix = `if [ "$(feature-`
+	name, rest, ok := strings.Cut(strings.TrimPrefix(source, prefix), `)" != "1" ]; then echo "`)
+	if !strings.HasPrefix(source, prefix) || !ok || name == "" ||
+		strings.ContainsFunc(name, func(character rune) bool {
+			return !(character >= 'a' && character <= 'z' ||
+				character >= '0' && character <= '9' || character == '-' || character == '_')
+		}) {
+		return true, fmt.Errorf("%s: PHONY feature gate %q has unsupported source condition", match.rule.Position, target)
+	}
+	message, suffix, ok := strings.Cut(rest, `"; exit 1`)
+	if !ok || message == "" || strings.ContainsAny(message, "\"'$`\\\n\r;") ||
+		(suffix != " ; fi" && suffix != "; fi") {
+		return true, fmt.Errorf("%s: PHONY feature gate %q has unsupported failure branch", match.rule.Position, target)
+	}
+	match, err = compactKbuildSelectedRuleEntryMatch(target, match)
+	if err != nil {
+		return true, err
+	}
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil {
+		return true, err
+	}
+	if len(snapshots) != 1 || snapshots[0] == nil {
+		return true, fmt.Errorf("%s: PHONY feature gate %q has no frozen source line", match.rule.Position, target)
+	}
+	injected, err := compactKbuildSourceScriptInjectionsForRuleTarget(target, match, nil)
+	if err != nil {
+		return true, err
+	}
+	injected = compactKbuildActionTreeInjections(injected)
+	automatic, err := compactKbuildRuleRootedAutomaticEvaluationContext(target, match, nil, injected)
+	if err != nil {
+		return true, err
+	}
+	lineMatch := match
+	lineMatch.profile = snapshots[0].Evaluation.Profile
+	pure, err := compactKbuildSelectedRecipeSourceExpansionIsPure(target, lineMatch, raw, automatic, injected)
+	if err != nil {
+		return true, err
+	}
+	if !pure {
+		return true, fmt.Errorf("%s: PHONY feature gate %q has a stateful Make expansion", match.rule.Position, target)
+	}
+	expand := func(text string) (string, error) {
+		return evaluateCompactKbuildTextForMakeTarget(
+			lineMatch.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+			automatic.normal, automatic.order, injected, text, true,
+		)
+	}
+	variable := "feature-" + name
+	value, err := expand("$(" + variable + ")")
+	if err != nil {
+		return true, fmt.Errorf("%s: PHONY feature gate %q status %q: %w", match.rule.Position, target, variable, err)
+	}
+	if value != "0" && value != "1" {
+		return true, fmt.Errorf("%s: PHONY feature gate %q status %q is not a resolved boolean", match.rule.Position, target, variable)
+	}
+	actual, err := expand(raw)
+	if err != nil {
+		return true, fmt.Errorf("%s: PHONY feature gate %q recipe: %w", match.rule.Position, target, err)
+	}
+	expected := strings.Replace(source, "$("+variable+")", value, 1)
+	if compactKbuildRecipeExecutionText(actual) != expected {
+		return true, fmt.Errorf("%s: PHONY feature gate %q changed its selected shell command", match.rule.Position, target)
+	}
+	if value != "1" {
+		return true, fmt.Errorf("%s: PHONY feature gate %q failed: %s", match.rule.Position, target, message)
+	}
+	return true, nil
+}
+
+// Check the selected PHONY recipe against its frozen Make evaluator before
+// lowering. A PHONY goal with only prerequisite or recursive-Make closure
+// remains an ordering node. Only one source-backed script invocation is
+// eligible for an execution result; final lowering and the runner separately
+// enforce that it creates no Make-visible file.
+func (m *CompactMetadata) compactKbuildSelectedPhonySourceScriptCheck(
+	profile CompactKbuildProfile, target, makeTarget, scope string,
+) (bool, error) {
+	match, matched, err := m.compactKbuildRuleForProfileMakeTarget(profile, target, makeTarget)
+	if err != nil || !matched {
+		return false, err
+	}
+	if len(match.rule.Recipe) == 0 {
+		return false, nil
+	}
+	match, err = compactKbuildSelectedRuleEntryMatch(target, match)
+	if err != nil {
+		return false, err
+	}
+	injected, err := compactKbuildSourceScriptInjectionsForRuleTarget(target, match, nil)
+	if err != nil {
+		return false, err
+	}
+	injected = compactKbuildActionTreeInjections(injected)
+	automatic, err := compactKbuildRuleRootedAutomaticEvaluationContext(target, match, nil, injected)
+	if err != nil {
+		return false, err
+	}
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil {
+		return false, err
+	}
+	probeSourceScripts := func(lineMatch compactKbuildRuleMatch, actual string) ([]CompactKbuildSourceScript, error) {
+		return readCompactKbuildCommandSourceScriptsForMakeTarget(
+			lineMatch.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+			automatic.normal, automatic.order, injected,
+			compactKbuildDirectRecipeText(lineMatch.profile, actual), true,
+		)
+	}
+	if len(match.rule.Recipe) != 1 {
+		// Inspect each frozen line before retaining an executable PHONY target.
+		// The generic rule lowerer must independently prove its side effects and
+		// successful completion without declaring the PHONY name as a file.
+		sourceScript := false
+		scriptPath := ""
+		rootedLines := make([]string, 0, len(match.rule.Recipe))
+		for index, raw := range match.rule.Recipe {
+			lineMatch := match
+			if snapshot := snapshots[index]; snapshot != nil {
+				lineMatch.profile = snapshot.Evaluation.Profile
+			}
+			actual, evaluateErr := evaluateCompactKbuildTextForMakeTarget(
+				lineMatch.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+				automatic.normal, automatic.order, injected, raw, true,
+			)
+			if evaluateErr != nil {
+				return false, fmt.Errorf("selected PHONY recipe line %d: %w", index, evaluateErr)
+			}
+			rooted, rootErr := compactKbuildRootedActionDirectRecipeText(lineMatch.profile, actual)
+			if rootErr != nil {
+				return false, fmt.Errorf("selected PHONY recipe line %d: %w", index, rootErr)
+			}
+			rootedLines = append(rootedLines, compactKbuildFinalizeRootedActionRecipeText(rooted))
+			scripts, scriptErr := probeSourceScripts(lineMatch, actual)
+			if scriptErr != nil {
+				return false, fmt.Errorf("selected PHONY recipe line %d: %w", index, scriptErr)
+			}
+			if len(scripts) != 0 {
+				sourceScript = true
+				scriptPath = scripts[0].Path
+			}
+		}
+		if sourceScript && len(match.rule.Recipe) != 4 {
+			return false, fmt.Errorf("cannot authenticate selected PHONY source script %q in a multiline Make recipe", scriptPath)
+		}
+		if !sourceScript {
+			_, _, proved, proofErr := compactKbuildSelectedPhonyPrivateSetup(
+				target, match, rootedLines, snapshots, automatic, injected,
+			)
+			if proofErr != nil {
+				return false, proofErr
+			}
+			if proved {
+				return true, nil
+			}
+		}
+		return sourceScript, nil
+	}
+	lineMatch := match
+	if snapshot := snapshots[0]; snapshot != nil {
+		lineMatch.profile = snapshot.Evaluation.Profile
+	}
+	actual, err := evaluateCompactKbuildTextForMakeTarget(
+		lineMatch.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+		automatic.normal, automatic.order, injected, match.rule.Recipe[0], true,
+	)
+	if err != nil {
+		return false, err
+	}
+	rooted, err := compactKbuildRootedActionDirectRecipeText(lineMatch.profile, actual)
+	if err != nil {
+		return false, err
+	}
+	commands, err := parseCompactKbuildRecipe(compactKbuildFinalizeRootedActionRecipeText(rooted), automatic)
+	if err != nil || len(commands) != 1 {
+		invocation, selected, selectionErr := compactKbuildSelectedPhonyCommandSourceScript(
+			target, match, automatic, injected, scope, m.actionRoles,
+		)
+		if selectionErr != nil {
+			return false, selectionErr
+		}
+		if selected && invocation.scriptPath != "" {
+			return true, nil
+		}
+		// The direct parser cannot preserve every shell command form. A
+		// selected source script within such a command still has an execution
+		// result: do not silently erase its failure status. The source probe
+		// observes exactly this frozen Make line and authenticates the script
+		// against the selected source tree before rejecting unsupported shapes.
+		scripts, scriptErr := probeSourceScripts(lineMatch, actual)
+		if scriptErr != nil {
+			return false, scriptErr
+		}
+		if len(scripts) != 0 {
+			return false, fmt.Errorf("cannot authenticate selected PHONY source script %q in an unsupported command shape", scripts[0].Path)
+		}
+		// Recursive-Make PHONY without an executable source script remains
+		// an ordering boundary through its selected native prerequisites.
+		return false, nil
+	}
+	values, err := evaluateCompactKbuildRuleVariablesRooted(
+		target, lineMatch, nil, injected, "CONFIG_SHELL",
+	)
+	if err != nil {
+		return false, err
+	}
+	_, sourceScript, err := compactKbuildSourceScriptCommandWithSourceArguments(
+		lineMatch.profile, commands[0], commands[0].arguments, values, scope, m.actionRoles,
+	)
+	return sourceScript, err
+}
+
+// A complete command-template call retains both its source-selected shell
+// wrapper and the exact cmd_<name> leaf which invoked the immutable script.
+// Inspect the leaf with the same script classifier as a direct recipe; the
+// wrapper is executed whole and separately checked for private side effects.
+func compactKbuildSelectedPhonyCommandSourceScript(
+	target string,
+	match compactKbuildRuleMatch,
+	automatic compactKbuildAutomaticContext,
+	injected map[string]string,
+	scope string,
+	actionRoles []KbuildActionRoleRef,
+) (compactKbuildSourceScriptInvocation, bool, error) {
+	if len(match.rule.Recipe) != 1 ||
+		!CompactKbuildRecipeIsExactCommandTemplateCall(match.rule.Recipe[0]) {
+		return compactKbuildSourceScriptInvocation{}, false, nil
+	}
+	selections, indices, err := evaluatedKbuildRuleCommandSelectionsBySourceLine(
+		target, match, automatic, injected, true,
+	)
+	if err != nil {
+		return compactKbuildSourceScriptInvocation{}, false, err
+	}
+	if len(selections) != 1 || selections[0].Name == "" ||
+		len(indices) != 0 && (len(indices) != 1 || indices[0] != 0) {
+		return compactKbuildSourceScriptInvocation{}, false, nil
+	}
+	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
+	if err != nil {
+		return compactKbuildSourceScriptInvocation{}, false, err
+	}
+	snapshot := snapshots[0]
+	lineMatch := match
+	if len(indices) != 0 {
+		if snapshot == nil {
+			return compactKbuildSourceScriptInvocation{}, false, nil
+		}
+		lineMatch.profile = snapshot.Evaluation.Profile
+	}
+	leaf := compactKbuildDirectRecipeText(lineMatch.profile, selections[0].Text)
+	commands, err := parseCompactKbuildRecipe(leaf, automatic)
+	if err != nil || len(commands) != 1 {
+		return compactKbuildSourceScriptInvocation{}, false, nil
+	}
+	values, err := evaluateCompactKbuildRuleVariablesRooted(
+		target, lineMatch, nil, injected, "CONFIG_SHELL",
+	)
+	if err != nil {
+		return compactKbuildSourceScriptInvocation{}, false, err
+	}
+	invocation, selected, err := compactKbuildSourceScriptCommandWithSourceArguments(
+		lineMatch.profile, commands[0], commands[0].arguments, values, scope, actionRoles,
+	)
+	if err != nil || !selected {
+		return invocation, selected, err
+	}
+	actual, err := evaluateCompactKbuildTextForMakeTarget(
+		lineMatch.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+		automatic.normal, automatic.order, injected, match.rule.Recipe[0], true,
+	)
+	if err != nil {
+		return compactKbuildSourceScriptInvocation{}, false, err
+	}
+	scripts, err := readCompactKbuildCommandSourceScriptsForMakeTarget(
+		lineMatch.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+		automatic.normal, automatic.order, injected,
+		compactKbuildDirectRecipeText(lineMatch.profile, actual), true,
+	)
+	if err != nil {
+		return compactKbuildSourceScriptInvocation{}, false, err
+	}
+	return invocation, len(scripts) == 1 && scripts[0].Path == invocation.scriptPath, nil
 }
 
 func compactKbuildSelectionPlanContext(config CompactConfig, selection CompactKbuildSelection) compactKbuildRulePlanContext {
@@ -608,7 +1122,6 @@ func resolvedConfigProjections() []resolvedConfigProjection {
 		{input: "auto.conf.cmd", output: "include/config/auto.conf.cmd"},
 		{input: "autoconf.h", output: "include/generated/autoconf.h"},
 		{input: "rustc_cfg", output: "include/generated/rustc_cfg"},
-		{input: "kernel.release", output: "include/config/kernel.release"},
 	}
 }
 

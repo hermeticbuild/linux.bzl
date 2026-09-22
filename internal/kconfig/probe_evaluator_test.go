@@ -228,6 +228,255 @@ func TestLinuxProbeEvaluatorModelsSourceCompilerVersionGrep(t *testing.T) {
 	}
 }
 
+func TestLinuxProbeEvaluatorModelsLinkerVersionQuietGrep(t *testing.T) {
+	for _, test := range []struct {
+		command   string
+		firstLine bool
+		literal   string
+	}{
+		{command: "-v | grep -q gold", literal: "gold"},
+		{command: "-v | head -n 1 | grep -q LLD", firstLine: true, literal: "LLD"},
+	} {
+		t.Run(test.command, func(t *testing.T) {
+			builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			evaluator, _ := newFixtureProbeEvaluator(t, 1, "x86", builder, nil, false)
+			command := KbuildActionRoleToken("target", "ld") + " " + test.command
+			truth, err := evaluator.commandSucceeds(command)
+			if err != nil || truth.known {
+				t.Fatalf("commandSucceeds(%q) = %#v, %v; want deferred probe", command, truth, err)
+			}
+			plan, err := builder.Plan(evaluator.References()...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plan.Nodes) != 2 {
+				t.Fatalf("version/grep plan has %d nodes, want 2", len(plan.Nodes))
+			}
+			version := plan.Requests[plan.Nodes[0].RequestID]
+			match := plan.Requests[plan.Nodes[1].RequestID]
+			if len(version.Steps) != 1 || version.Steps[0].Tool != "ld" ||
+				!slices.Equal(version.Steps[0].Arguments, []string{"-v"}) ||
+				version.Outcome.Stream != "stdout" || version.Outcome.FirstLine != test.firstLine ||
+				len(match.Steps) != 0 || match.Outcome.Predicate.Operator != "result-text-contains" ||
+				match.Outcome.Predicate.Value != test.literal ||
+				!slices.Equal(plan.Nodes[1].Inputs, []string{plan.Nodes[0].ID}) {
+				t.Fatalf("version %#+v, match %#+v; want source-owned stdout/grep DAG", version, match)
+			}
+			if _, err := evaluator.commandSucceeds(KbuildActionRoleToken("target", "ld") + " -v | grep -q 'go.*'"); err == nil || !IsLinuxProbeDeferredRecipeCommand(err) {
+				t.Fatalf("regex linker grep error = %v, want fail-closed owned command", err)
+			}
+		})
+	}
+}
+
+func TestLinuxProbeCompilerBindsSourceExpandedAssemblerInput(t *testing.T) {
+	root := t.TempDir()
+	const header = "arch/example/boot/code16gcc.h"
+	path := filepath.Join(root, filepath.FromSlash(header))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(".code16gcc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := newFixtureProbeEvaluator(t, 1, "x86", builder, nil, false)
+	evaluator.sourceRoot = root
+	truth, err := evaluator.compileRequest([]string{"-m32", "-Wa," + selectedToolSourceTreePrefix + header}, "c", "-c", "\n")
+	if err != nil || truth.known {
+		t.Fatalf("source-flagged compiler probe = %#v, %v; want declared probe", truth, err)
+	}
+	plan, err := builder.Plan(evaluator.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 1 {
+		t.Fatalf("compiler probe has %d nodes, want 1", len(plan.Nodes))
+	}
+	request := plan.Requests[plan.Nodes[0].RequestID]
+	if !slices.Equal(request.Sources, []string{header}) ||
+		!slices.Contains(request.Steps[0].Arguments, "-Wa,${source:"+header+"}") ||
+		request.Steps[0].Candidate == nil || !slices.Equal(request.Steps[0].Candidate.Base, []int{0}) {
+		t.Fatalf("compiler probe = %#v; want immutable header and only -m32 candidate-owned", request)
+	}
+	if _, err := evaluator.compileRequest([]string{"-Wa," + selectedToolSourceTreePrefix + "../escape"}, "c", "-c", "\n"); err == nil {
+		t.Fatal("source-root traversal in compiler assembler flag was accepted")
+	}
+	selector, err := evaluator.requestTruth(ProbeRequest{
+		Schema:  LinuxProbeRequestSchema,
+		Steps:   []ProbeStep{{Name: "feature", Tool: "cc", Arguments: []string{"--version"}}},
+		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{Operator: "exit-zero", Step: "feature"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	flags, err := evaluator.renderTruth(selector, "-m16", "-m32 -Wa,"+selectedToolSourceTreePrefix+header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := evaluator.compileRequest([]string{"-Werror", flags}, "c", "-c", "\n"); err != nil {
+		t.Fatalf("symbolic source-flagged compiler probe: %v", err)
+	}
+	plan, err = builder.Plan(evaluator.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dynamic *ProbeRequest
+	for _, node := range plan.Nodes {
+		if request := plan.Requests[node.RequestID]; slices.Equal(request.Sources, []string{header}) && len(request.Steps) != 0 && len(request.Steps[0].ConditionalArguments) != 0 {
+			dynamic = &request
+			break
+		}
+	}
+	if dynamic == nil || dynamic.Steps[0].Candidate == nil {
+		t.Fatal("conditional compiler probe lost its declared header or candidate ownership")
+	}
+	step := dynamic.Steps[0]
+	for index, group := range step.ConditionalArguments {
+		for _, argument := range group.Arguments {
+			if argument == "-Wa,${source:"+header+"}" && slices.Contains(step.Candidate.Conditional, index) {
+				t.Fatalf("source header is candidate-owned in conditional group %d: %#v", index, step)
+			}
+			if (argument == "-m32" || argument == "-m16") && !slices.Contains(step.Candidate.Conditional, index) {
+				t.Fatalf("conditional compiler option %q is not candidate-owned: %#v", argument, step)
+			}
+		}
+	}
+}
+
+func TestLinuxProbeCompilerBindsOnlySameScopeConfiguredLinkerFlag(t *testing.T) {
+	for _, fixtureIndex := range []int{0, 1} {
+		builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evaluator, fixture := newFixtureProbeEvaluator(t, fixtureIndex, "x86", builder, nil, false)
+		selected := "--ld-path=" + KbuildActionRoleToken(fixture.scope, "ld")
+		truth, err := evaluator.compileRequest([]string{"-Werror", selected}, "c", "-c", "\n")
+		if err != nil || truth.known {
+			t.Fatalf("%s declared linker probe = %#v, %v; want measured request", fixture.scope, truth, err)
+		}
+		plan, err := builder.Plan(evaluator.References()...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(plan.Nodes) != 1 {
+			t.Fatalf("%s linker probe nodes = %#v, want one", fixture.scope, plan.Nodes)
+		}
+		request := plan.Requests[plan.Nodes[0].RequestID]
+		step := request.Steps[0]
+		if !slices.Equal(request.ToolRoles(), []string{"cc", "ld"}) ||
+			!slices.Equal(step.AuxiliaryTools, []string{"ld"}) ||
+			!slices.Contains(step.Arguments, "--ld-path=${tool:ld}") ||
+			step.Candidate == nil || !slices.Equal(step.Candidate.Base, []int{0}) ||
+			!step.DiscardStdout || !step.DiscardStderr {
+			t.Fatalf("%s selected linker request = %#v; want ld action contract and only -Werror candidate", fixture.scope, request)
+		}
+		for _, unsafe := range []string{
+			"--ld-path=/usr/bin/ld",
+			"--ld-path=ld.lld",
+			"--ld-path=" + KbuildActionRoleToken(map[string]string{"host": "target", "target": "host"}[fixture.scope], "ld"),
+			selected + "-forged",
+		} {
+			bound, owned, _, declared, err := evaluator.bindCompilerDeclaredArguments([]string{unsafe})
+			if err != nil || declared || !slices.Equal(bound, []string{unsafe}) || !slices.Equal(owned, []bool{true}) {
+				t.Fatalf("%s unsafe linker %q became declared authority: bound=%q owned=%v declared=%t err=%v", fixture.scope, unsafe, bound, owned, declared, err)
+			}
+			if _, err := ValidateProbeCandidateArguments(ProbeCandidatePolicyCC, bound); err == nil || !strings.Contains(err.Error(), "prohibited") {
+				t.Fatalf("%s unsafe linker %q passed candidate policy: %v", fixture.scope, unsafe, err)
+			}
+		}
+		delete(evaluator.tools, "ld")
+		if _, err := evaluator.compileRequest([]string{selected}, "c", "-c", "\n"); err == nil || !strings.Contains(err.Error(), "no configured") {
+			t.Fatalf("%s source ld token without configured action contract = %v", fixture.scope, err)
+		}
+	}
+}
+
+func TestLinuxProbeEvaluatorReusesMeasuredCompilerVersionForSourceGrep(t *testing.T) {
+	for _, test := range []struct {
+		fixture int
+		want    string
+	}{
+		{fixture: 0, want: ""},
+		{fixture: 1, want: "clang version 22.1.0"},
+	} {
+		t.Run(fmt.Sprint(test.fixture), func(t *testing.T) {
+			builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			evaluator, _ := newFixtureProbeEvaluator(t, test.fixture, "x86", builder, nil, false)
+			command := KbuildActionRoleToken(evaluator.scope, "cc") + " --version 2>&1 | head -n 1 | grep clang"
+			got, err := evaluator.output(command)
+			if err != nil || got != test.want {
+				t.Fatalf("source compiler grep = %q, %v; want %q", got, err, test.want)
+			}
+			if refs := evaluator.References(); len(refs) != 0 {
+				t.Fatalf("measured compiler grep requested fresh actions: %#v", refs)
+			}
+		})
+	}
+}
+
+func TestLinuxProbeEvaluatorGrepsMeasuredQuotedText(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := testSymbolicProbeEvaluator(t, builder, nil)
+	source := ProbeRequest{
+		Schema:  LinuxProbeRequestSchema,
+		Steps:   []ProbeStep{{Name: "version", Tool: "cc", Arguments: []string{"--version"}}},
+		Outcome: ProbeOutcome{Kind: "text", Step: "version", Stream: "stdout", FirstLine: true, TrimSpace: true},
+	}
+	version, err := evaluator.requestText(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := `{ echo "` + version + `" | grep -q gcc; } >/dev/null 2>&1 && echo "y" || echo "n"`
+	result, err := evaluator.Shell(context.Background(), command)
+	if err != nil || !linuxProbeSymbolPattern.MatchString(result) {
+		t.Fatalf("quoted measured-text grep = %q, %v; want symbolic truth", result, err)
+	}
+	plan, err := builder.Plan(evaluator.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 2 || !slices.Equal(plan.Nodes[1].Inputs, []string{plan.Nodes[0].ID}) {
+		t.Fatalf("measured-text grep dependency = %#v, want one source then one reduction", plan.Nodes)
+	}
+	if predicate := plan.Requests[plan.Nodes[1].RequestID].Outcome.Predicate; predicate == nil || predicate.Operator != "result-text-contains-echo-safe" || predicate.Value != "gcc" {
+		t.Errorf("measured-text grep predicate = %#v, want source-owned literal", predicate)
+	}
+	for _, malformed := range []string{
+		`echo ` + version + ` | grep -q gcc`,
+		`echo "` + version + `" | grep -qi gcc`,
+		`echo "` + version + `" | grep -q gcc.*`,
+	} {
+		if _, err := evaluator.commandSucceeds(malformed); err == nil || IsLinuxProbeUnsupportedCommand(err) {
+			t.Errorf("commandSucceeds(%q) = %v, want owned rejection", malformed, err)
+		}
+	}
+	for _, invalid := range []string{
+		"-n gcc version", `gcc\tversion`, "gcc\\version",
+		`gcc$(printf unexpected)`, "gcc`printf unexpected`", `${PATH}`,
+	} {
+		if err := validateFixedEchoGrepText(invalid); err == nil {
+			t.Errorf("echo value %q accepted shell-dependent bytes", invalid)
+		}
+		if _, err := evaluator.commandSucceeds(`echo "` + invalid + `" | grep -q gcc`); err == nil {
+			t.Errorf("echo command with %q interpreted shell-dependent bytes as a constant", invalid)
+		}
+	}
+}
+
 func TestLinuxProbeEvaluatorReplaysCompilerPathsWithExecutionRootProvenance(t *testing.T) {
 	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
 	if err != nil {
@@ -715,6 +964,41 @@ func TestKbuildPreprocessorGrepIsAnIdentityBoundCompilerProbe(t *testing.T) {
 	if request.Outcome.Predicate == nil || request.Outcome.Predicate.Operator != "all" || len(request.Outcome.Predicate.Operands) != 2 ||
 		request.Outcome.Predicate.Operands[1].Operator != "stream-contains" || request.Outcome.Predicate.Operands[1].Value != "elf_getshdr" {
 		t.Fatalf("preprocessor reduction = %#v, want exit-zero and source-selected grep", request.Outcome.Predicate)
+	}
+}
+
+func TestKbuildPreprocessorGrepUsesSourceSelectedCompilerRole(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := testSymbolicProbeEvaluator(t, builder, nil)
+	// In a real source invocation these same root markers are declared aliases
+	// for the pinned kernel source. The script-pipeline dispatcher must still
+	// leave compiler include paths to the preprocessor-grep owner.
+	evaluator.sourceRootAliases = []string{"__LINUX_BZL_SOURCE_TREE__"}
+	command := "echo '#include <libelf.h>' | " + KbuildActionRoleToken("target", "cc") +
+		" -Werror -I__LINUX_BZL_SOURCE_TREE__/tools/include" +
+		" -iquote__LINUX_BZL_HOST_DEPS__/external/elfutils+" +
+		" -isystem__LINUX_BZL_HOST_DEPS__/external/elfutils+/libelf" +
+		" -x c -E - | grep elf_getshdr"
+	value, err := evaluator.KbuildShell(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !linuxProbeSymbolPattern.MatchString(value) {
+		t.Fatalf("selected compiler preprocessor result = %q, want one measured probe", value)
+	}
+	plan, err := builder.Plan(evaluator.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 1 || plan.Requests[plan.Nodes[0].RequestID].Steps[0].Tool != "cc" {
+		t.Fatalf("selected compiler preprocessor nodes = %#v, want configured compiler request", plan.Nodes)
+	}
+	unknown := strings.Replace(command, " -x c -E -", " LINUX_BZL_PROBE_2e14be33b206b99c6fe2663b89bd85501ee5a10bd1ae3824a0c5c246ad3b8e2b -x c -E -", 1)
+	if _, err := evaluator.KbuildShell(context.Background(), unknown); err == nil || !strings.Contains(err.Error(), "unknown Linux probe symbolic value") {
+		t.Fatalf("unregistered inherited compiler probe error = %v, want fail-closed source argument", err)
 	}
 }
 
@@ -1453,7 +1737,7 @@ func TestLinuxProbeEvaluatorDiscoversCanonicalCapabilityDAG(t *testing.T) {
 			t.Errorf("request roles = %v", roles)
 		}
 	}
-	if got, want := plan.Nodes[0].RequestID, "0148ee91363a36d6d43f054213d0b694800c684e8f94f5c93473e91a7bcd04ce"; got != want {
+	if got, want := plan.Nodes[0].RequestID, "290611b52f79dd2a775c6273985fcdc698f0247acbcaecf719833fe82e90ac5c"; got != want {
 		t.Fatalf("cc-option canonical request ID = %s, want %s", got, want)
 	}
 }
@@ -1936,6 +2220,38 @@ func TestKbuildShellAcceptsExternalModuleTryRunDirectory(t *testing.T) {
 	} {
 		if validKbuildTryRunTempDir(invalid) {
 			t.Errorf("validKbuildTryRunTempDir(%q) = true", invalid)
+		}
+	}
+}
+
+func TestKbuildShellAcceptsUnusedPrivateTemporaryObjectAlias(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := newFixtureProbeEvaluator(t, 1, "x86", builder, nil, false)
+	command := `set -e; TMP=.tmp_$$/tmp; TMPO=.tmp_$$/tmp.o; trap "rm -rf .tmp_$$" EXIT; mkdir -p .tmp_$$; if (` +
+		KbuildActionRoleToken("target", "cc") +
+		` -Werror -fno-tree-loop-im -c -x c /dev/null -o "$TMP") >/dev/null 2>&1; then echo "-fno-tree-loop-im"; else echo ""; fi`
+	for _, candidate := range []string{
+		command,
+		strings.Replace(command, `trap "rm -rf .tmp_$$" EXIT; mkdir -p .tmp_$$`, `mkdir -p .tmp_$$; trap "rm -rf .tmp_$$" EXIT`, 1),
+	} {
+		value, err := evaluator.KbuildShell(context.Background(), candidate)
+		if err != nil || !linuxProbeSymbolPattern.MatchString(value) {
+			t.Fatalf("Kbuild try-run = %q, %v; want symbolic CC result", value, err)
+		}
+	}
+	plan, err := builder.Plan(evaluator.References()...)
+	if err != nil || len(plan.Nodes) != 1 {
+		t.Fatalf("Kbuild try-run plan = %#v, %v; want one configured CC node", plan, err)
+	}
+	for _, invalid := range []string{
+		strings.Replace(command, "TMPO=.tmp_$$/tmp.o", "TMPO=../outside/tmp.o", 1),
+		strings.Replace(command, `-o "$TMP"`, `-o "$TMPO"`, 1),
+	} {
+		if _, err := evaluator.KbuildShell(context.Background(), invalid); err == nil {
+			t.Errorf("invalid temporary object alias accepted: %q", invalid)
 		}
 	}
 }

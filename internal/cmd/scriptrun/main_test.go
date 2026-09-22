@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -106,6 +108,107 @@ func TestRunScriptConfiguredLz4AcceptsSelectedLinuxCLIForms(t *testing.T) {
 	}
 }
 
+func TestRunScriptRequiresStaticStagedSourceAssignments(t *testing.T) {
+	directory := t.TempDir()
+	interpreter := writeReplayRuntime(t, directory)
+	assignments := filepath.Join(directory, "auto.conf")
+	script := filepath.Join(directory, "phase.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n. \"$1\"\nprintf '%s' \"$CONFIG_SAFE\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assignments, []byte("CONFIG_SAFE=enabled\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	opts := scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		script: script, scriptArgs: []string{assignments}, staticSourceAssignments: assignments,
+		stdout: &stdout,
+	}
+	if err := runScript(opts); err != nil || stdout.String() != "enabled" {
+		t.Fatalf("static staged file: output=%q, error=%v", stdout.String(), err)
+	}
+	// A selected later writer can replace the planner's clean assignment file.
+	// Reject it before the repeated source prelude executes any substitution.
+	sentinel := filepath.Join(directory, "unexpected-side-effect")
+	if err := os.WriteFile(assignments, []byte("CONFIG_SAFE=\"$(touch "+sentinel+")\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	if err := runScript(opts); err == nil || !strings.Contains(err.Error(), "staged static source assignments") {
+		t.Fatalf("executable staged assignment must fail: %v", err)
+	}
+	if _, err := os.Lstat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("invalid staged assignment executed: %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("script ran despite invalid staged assignment: %q", stdout.String())
+	}
+	if err := os.Remove(assignments); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(script, assignments); err != nil {
+		t.Fatal(err)
+	}
+	if err := runScript(opts); err == nil {
+		t.Fatal("staged assignment symlink must fail")
+	}
+	if err := runScriptWithFallback(opts, scriptRunFallback{enabled: true, timeout: time.Second, stdout: []byte("fallback")}); err == nil ||
+		!strings.Contains(err.Error(), "cannot use a script execution fallback") {
+		t.Fatalf("fallback must not mask staged assignment validation: %v", err)
+	}
+}
+
+func TestRunScriptAbsentSourceSelectedProgramPreservesRuntimeGuard(t *testing.T) {
+	directory := t.TempDir()
+	interpreter := writeReplayRuntime(t, directory)
+	script := filepath.Join(directory, "selected-final.sh")
+	assignments := filepath.Join(directory, "auto.conf")
+	if err := os.WriteFile(script, []byte(`#!/bin/sh
+set -e
+. "$1"
+if [ -n "${CONFIG_DEBUG_INFO_BTF}" -a -n "${CONFIG_BPF}" ]; then
+	"${RESOLVE_BTFIDS}" vmlinux
+fi
+printf 'complete'
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RESOLVE_BTFIDS", filepath.Join(directory, "missing-host-executable"))
+	t.Setenv("CONFIG_BPF", "")
+	var stdout, stderr bytes.Buffer
+	opts := scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		script: script, scriptArgs: []string{assignments}, staticSourceAssignments: assignments,
+		stdout: &stdout, stderr: &stderr,
+	}
+	for _, test := range []struct {
+		name, config string
+		runsProgram  bool
+	}{
+		{name: "disabled", config: "CONFIG_DEBUG_INFO_BTF=y\n"},
+		{name: "enabled", config: "CONFIG_BPF=y\nCONFIG_DEBUG_INFO_BTF=y\n", runsProgram: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(assignments, []byte(test.config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stdout.Reset()
+			stderr.Reset()
+			err := runScript(opts)
+			if test.runsProgram {
+				if err == nil || stdout.Len() != 0 || !strings.Contains(stderr.String(), "missing-host-executable") {
+					t.Fatalf("missing active source executable should fail privately: stdout=%q stderr=%q error=%v", stdout.String(), stderr.String(), err)
+				}
+				return
+			}
+			if err != nil || stdout.String() != "complete" {
+				t.Fatalf("disabled source executable should be unused: stdout=%q stderr=%q error=%v", stdout.String(), stderr.String(), err)
+			}
+		})
+	}
+}
+
 func TestRunScriptUsesDeclaredSourceStreamsAndExternalTool(t *testing.T) {
 	directory := t.TempDir()
 	interpreter := writeExecutable(t, directory, "runtime", `#!/bin/sh
@@ -144,6 +247,231 @@ printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$SELECTED_ENV" "$value"
 	}
 	if got, want := stdout.String(), "prefix value|argument|suffix'value|configured ' value|streamed-input\n"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestRunScriptExecutesAuthenticatedSourcePhaseWithOriginalArguments(t *testing.T) {
+	directory := t.TempDir()
+	interpreter := writeReplayRuntime(t, directory)
+	script := filepath.Join(directory, "source $(printf unwanted) script.sh")
+	source := "#!/bin/sh\nset -e\nprintf 'skipped'\nprintf '%s|%s|%s|%s' \"$0\" \"$1\" \"$2\" \"$#\"\n"
+	if err := os.WriteFile(script, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	preludeEnd := strings.Index(source, "printf 'skipped'")
+	phaseStart := strings.Index(source, "printf '%s|%s|%s|%s'")
+	if preludeEnd < 0 || phaseStart < 0 {
+		t.Fatal("test source is missing its phase boundaries")
+	}
+	firstArgument, secondArgument := "first argument", "second $(printf unwanted) ' argument"
+	var stdout, stderr bytes.Buffer
+	err := runScript(scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		script: script, scriptSourceSHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(source))),
+		scriptSourceSpans: []scriptSourceSpan{
+			{start: 0, end: uint64(preludeEnd)},
+			{start: uint64(phaseStart), end: uint64(len(source))},
+		},
+		scriptArgs: []string{firstArgument, secondArgument},
+		stdout:     &stdout, stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runScript(source phase) failed: %v\nstderr: %s", err, stderr.String())
+	}
+	if got, want := stdout.String(), script+"|"+firstArgument+"|"+secondArgument+"|2"; got != want {
+		t.Fatalf("source phase stdout = %q, want %q", got, want)
+	}
+}
+
+func TestRunScriptEmitsExactAuthenticatedSourcePhaseWithoutExecution(t *testing.T) {
+	directory := t.TempDir()
+	script := filepath.Join(directory, "source script.sh")
+	marker := filepath.Join(directory, "executed")
+	source := "#!/bin/sh\n" +
+		"printf unsafe > '" + marker + "'\n" +
+		"printf '%s|%s\\n' \"$0\" \"$1\"\n\n"
+	if err := os.WriteFile(script, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	preludeEnd := strings.Index(source, "printf unsafe")
+	bodyStart := strings.Index(source, "printf '%s|%s\\n'")
+	if preludeEnd < 0 || bodyStart < 0 {
+		t.Fatal("test source has no phase boundaries")
+	}
+	destination := filepath.Join(directory, "generated", "verified phase.sh")
+	var stdout bytes.Buffer
+	err := runScript(scriptRunOptions{
+		script: script, scriptSourceSHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(source))),
+		scriptSourceSpans: []scriptSourceSpan{
+			{start: 0, end: uint64(preludeEnd)},
+			{start: uint64(bodyStart), end: uint64(len(source))},
+		},
+		scriptSourceEmit: destination, stdout: &stdout, stderr: ioDiscard{},
+	})
+	if err != nil {
+		t.Fatalf("emit authenticated source phase: %v", err)
+	}
+	actual, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := source[:preludeEnd] + source[bodyStart:]
+	if !bytes.Equal(actual, []byte(want)) {
+		t.Fatalf("emitted phase bytes = %q, want %q", actual, want)
+	}
+	if !bytes.HasSuffix(actual, []byte("\n\n")) {
+		t.Fatalf("emitted source lost its trailing newlines: %q", actual)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("source emitter wrote to stdout: %q", stdout.String())
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source script executed during emission: marker error = %v", err)
+	}
+}
+
+func TestRunScriptRejectsInvalidSourcePhaseEmission(t *testing.T) {
+	directory := t.TempDir()
+	script := filepath.Join(directory, "source.sh")
+	source := "#!/bin/sh\nprintf unsafe > '" + filepath.Join(directory, "executed") + "'\n"
+	if err := os.WriteFile(script, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	otherSource := filepath.Join(directory, "other.sh")
+	if err := os.WriteFile(otherSource, []byte("#!/bin/sh\nprintf changed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(source)))
+	span := scriptSourceSpan{start: 0, end: uint64(len(source))}
+	destination := filepath.Join(directory, "phase.sh")
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(directory, "link")); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		change  func(*scriptRunOptions)
+		wantErr string
+	}{
+		{"missing source span", func(opts *scriptRunOptions) { opts.scriptSourceSpans = nil }, "requires at least one source span"},
+		{"missing digest", func(opts *scriptRunOptions) { opts.scriptSourceSHA256 = "" }, "requires a lowercase 64-character SHA256"},
+		{"tampered digest", func(opts *scriptRunOptions) { opts.scriptSourceSHA256 = strings.Repeat("0", 64) }, "SHA256 does not match"},
+		{"tampered span", func(opts *scriptRunOptions) { opts.scriptSourceSpans[0].end-- }, "whole source lines"},
+		{"span past source", func(opts *scriptRunOptions) { opts.scriptSourceSpans[0].end++ }, "ends past the source file"},
+		{"different source", func(opts *scriptRunOptions) { opts.script = otherSource }, "SHA256 does not match"},
+		{"nonregular source", func(opts *scriptRunOptions) { opts.script = directory }, "not a bounded regular file"},
+		{"evaluated content", func(opts *scriptRunOptions) { opts.scriptContent = "printf wrong" }, "without evaluated content"},
+		{"stdin content", func(opts *scriptRunOptions) { opts.scriptStdin = true }, "without evaluated content or stdin script"},
+		{"interpreter", func(opts *scriptRunOptions) { opts.interpreter = "/bin/sh" }, "cannot be combined with script execution options"},
+		{"script arguments", func(opts *scriptRunOptions) { opts.scriptArgs = []string{"wrong"} }, "cannot be combined with script execution options"},
+		{"parent traversal", func(opts *scriptRunOptions) { opts.scriptSourceEmit = "../phase.sh" }, "canonical file path without parent traversal"},
+		{"noncanonical destination", func(opts *scriptRunOptions) {
+			opts.scriptSourceEmit = filepath.Join(directory, "foo", "..", "phase.sh") + "/."
+		}, "canonical file path without parent traversal"},
+		{"destination symlink parent", func(opts *scriptRunOptions) { opts.scriptSourceEmit = filepath.Join(directory, "link", "phase.sh") }, "traverses a symlink"},
+		{"existing source destination", func(opts *scriptRunOptions) { opts.scriptSourceEmit = script }, "create source script phase output"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := scriptRunOptions{
+				script: script, scriptSourceSHA256: digest, scriptSourceSpans: []scriptSourceSpan{span},
+				scriptSourceEmit: destination, stdout: ioDiscard{}, stderr: ioDiscard{},
+			}
+			test.change(&opts)
+			if err := runScript(opts); err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("invalid phase emission error = %v, want %q", err, test.wantErr)
+			}
+			if _, err := os.Stat(destination); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("invalid source phase created output: stat error = %v", err)
+			}
+		})
+	}
+	if _, err := os.Stat(filepath.Join(directory, "executed")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("invalid source phase executed shell: marker error = %v", err)
+	}
+	if err := runScriptWithFallback(scriptRunOptions{
+		script: script, scriptSourceSHA256: digest, scriptSourceSpans: []scriptSourceSpan{span},
+		scriptSourceEmit: destination,
+	}, scriptRunFallback{enabled: true, timeout: time.Second, stdout: []byte("masked")}); err == nil || !strings.Contains(err.Error(), "cannot use a script execution fallback") {
+		t.Fatalf("emission fallback error = %v, want rejection", err)
+	}
+}
+
+func TestRunScriptRejectsUnauthenticatedOrMissingSourcePhase(t *testing.T) {
+	directory := t.TempDir()
+	interpreter := writeReplayRuntime(t, directory)
+	script := filepath.Join(directory, "declared-script.sh")
+	source := "#!/bin/sh\nprintf 'phase-ran'\n"
+	if err := os.WriteFile(script, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	otherScript := filepath.Join(directory, "unselected-script.sh")
+	if err := os.WriteFile(otherScript, []byte("#!/bin/sh\nprintf 'unselected'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(source)))
+	validSpan := scriptSourceSpan{start: 0, end: uint64(len(source))}
+	for _, test := range []struct {
+		name    string
+		change  func(*scriptRunOptions)
+		wantErr string
+	}{
+		{name: "source path omitted", change: func(opts *scriptRunOptions) { opts.script = "" }, wantErr: "requires a declared source script"},
+		{name: "source path missing", change: func(opts *scriptRunOptions) { opts.script = filepath.Join(directory, "missing.sh") }, wantErr: "inspect source script"},
+		{name: "different source file", change: func(opts *scriptRunOptions) { opts.script = otherScript }, wantErr: "SHA256 does not match"},
+		{name: "missing digest", change: func(opts *scriptRunOptions) { opts.scriptSourceSHA256 = "" }, wantErr: "requires a lowercase 64-character SHA256"},
+		{name: "noncanonical digest", change: func(opts *scriptRunOptions) { opts.scriptSourceSHA256 = strings.ToUpper(digest) }, wantErr: "requires a lowercase 64-character SHA256"},
+		{name: "evaluated content", change: func(opts *scriptRunOptions) { opts.scriptContent = "printf arbitrary" }, wantErr: "without evaluated content"},
+		{name: "stdin content", change: func(opts *scriptRunOptions) { opts.scriptStdin = true }, wantErr: "without evaluated content or stdin script"},
+		{name: "out of bounds", change: func(opts *scriptRunOptions) { opts.scriptSourceSpans[0].end++ }, wantErr: "ends past the source file"},
+		{name: "partial line", change: func(opts *scriptRunOptions) { opts.scriptSourceSpans[0].start = 1 }, wantErr: "whole source lines"},
+		{name: "overlapping", change: func(opts *scriptRunOptions) { opts.scriptSourceSpans = append(opts.scriptSourceSpans, validSpan) }, wantErr: "overlaps or precedes"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			opts := scriptRunOptions{
+				interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+				script: script, scriptSourceSHA256: digest,
+				scriptSourceSpans: []scriptSourceSpan{validSpan}, stdout: &stdout, stderr: ioDiscard{},
+			}
+			test.change(&opts)
+			if err := runScript(opts); err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("runScript(source phase) error = %v, want %q", err, test.wantErr)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("invalid source phase ran shell commands: %q", stdout.String())
+			}
+		})
+	}
+
+	var stdout bytes.Buffer
+	err := runScriptWithFallback(scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		script: script, scriptSourceSHA256: digest, scriptSourceSpans: []scriptSourceSpan{validSpan},
+		stdout: &stdout, stderr: ioDiscard{},
+	}, scriptRunFallback{enabled: true, timeout: time.Second, stdout: []byte("masked failure")})
+	if err == nil || !strings.Contains(err.Error(), "cannot use a script execution fallback") {
+		t.Fatalf("runScriptWithFallback(source phase) error = %v, want fallback rejection", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("source phase fallback masked the error: %q", stdout.String())
+	}
+}
+
+func TestParseScriptSourceSpansRejectsInvalidRanges(t *testing.T) {
+	for _, values := range [][]string{
+		{""}, {"0"}, {"0:0"}, {"2:1"}, {"01:2"}, {"0:+2"}, {"0:2:3"},
+		{"0:16777217"}, {"0:2", "1:3"}, {"2:4", "0:1"},
+	} {
+		if spans, err := parseScriptSourceSpans(values); err == nil {
+			t.Errorf("parseScriptSourceSpans(%q) = %#v, want rejection", values, spans)
+		}
+	}
+	values := make([]string, maxScriptSourceSpans+1)
+	for index := range values {
+		values[index] = fmt.Sprintf("%d:%d", index, index+1)
+	}
+	if spans, err := parseScriptSourceSpans(values); err == nil {
+		t.Errorf("parseScriptSourceSpans(over maximum) = %#v, want rejection", spans)
 	}
 }
 
@@ -879,6 +1207,113 @@ func TestRunScriptReplayProxyAcceptsOnlyDeclaredArgumentsWithRegularOutputs(t *t
 	}
 }
 
+func TestRunScriptReplayDenyAllPreservesMakeWithoutAllowingCalls(t *testing.T) {
+	t.Setenv("MAKE", "make")
+	directory := t.TempDir()
+	interpreter := writeReplayRuntime(t, directory)
+	child := writeExecutable(t, directory, "read-child-env", "#!/bin/sh\nprintf '%s' \"$MAKE\"\n")
+	options := scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		replays: []scriptReplayManifest{{Name: "make", DenyAll: true}},
+		tools:   map[string]string{"read-child-env": child},
+		toolContracts: map[string]toolaction.Contract{"read-child-env": {
+			Arguments: []string{}, Environment: map[string]string{},
+		}},
+	}
+	for _, test := range []struct {
+		name, script, output, diagnostic string
+	}{
+		{
+			name:   "no call",
+			script: "#!/bin/sh\ntest \"$MAKE\" = make && command -v \"$MAKE\" >/dev/null && printf release\n",
+			output: "release",
+		},
+		{
+			name:   "child inherits exported Make command",
+			script: "#!/bin/sh\nread-child-env\n",
+			output: "make",
+		},
+		{
+			name:       "caught forbidden call",
+			script:     "#!/bin/sh\n\"$MAKE\" unexpected || true\nprintf release\n",
+			output:     "release",
+			diagnostic: "rejects all invocations",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			options.scriptContent = test.script
+			options.stdout, options.stderr = &stdout, &stderr
+			err := runScript(options)
+			if got := stdout.String(); got != test.output {
+				t.Fatalf("script stdout = %q, want %q (error: %v)", got, test.output, err)
+			}
+			if test.diagnostic == "" {
+				if err != nil || stderr.Len() != 0 {
+					t.Fatalf("unused deny-all replay failed: error=%v, stderr=%q", err, stderr.String())
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "command replay request failed") ||
+				!strings.Contains(err.Error(), test.diagnostic) || !strings.Contains(stderr.String(), test.diagnostic) {
+				t.Fatalf("caught replay error was not reported by broker: error=%v, stderr=%q", err, stderr.String())
+			}
+		})
+	}
+	fallback := scriptRunFallback{enabled: true, timeout: time.Minute, stdout: []byte("fallback")}
+	var stdout bytes.Buffer
+	options.stdout, options.stderr = &stdout, ioDiscard{}
+	options.scriptContent = "#!/bin/sh\nexit 23\n"
+	if err := runScriptWithFallback(options, fallback); err != nil || stdout.String() != "fallback" {
+		t.Fatalf("ordinary script failure with deny-all manifest: stdout=%q, error=%v", stdout.String(), err)
+	}
+	stdout.Reset()
+	options.scriptContent = "#!/bin/sh\n\"$MAKE\" unexpected || true\nprintf release\n"
+	if err := runScriptWithFallback(options, fallback); err == nil ||
+		!strings.Contains(err.Error(), "rejects all invocations") || stdout.Len() != 0 {
+		t.Fatalf("fallback masked a caught replay failure: stdout=%q, error=%v", stdout.String(), err)
+	}
+}
+
+func TestRunScriptReplayDeniesCaughtScopedHostTool(t *testing.T) {
+	t.Setenv("HOSTCC", "host@cc")
+	directory := t.TempDir()
+	interpreter := writeReplayRuntime(t, directory)
+	var stdout bytes.Buffer
+	options := scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		replays:       []scriptReplayManifest{{Name: "host@cc", DenyAll: true}},
+		scriptContent: "#!/bin/sh\n\"$HOSTCC\" --version || true\nprintf release\n",
+		stdout:        &stdout, stderr: ioDiscard{},
+	}
+	fallback := scriptRunFallback{enabled: true, timeout: time.Minute, stdout: []byte("fallback")}
+	if err := runScriptWithFallback(options, fallback); err == nil ||
+		!strings.Contains(err.Error(), "rejects all invocations") || stdout.Len() != 0 {
+		t.Fatalf("caught scoped host-tool invocation escaped denial: stdout=%q, error=%v", stdout.String(), err)
+	}
+}
+
+func TestRunScriptReplayCaughtUndeclaredArgumentsStillFail(t *testing.T) {
+	directory := t.TempDir()
+	interpreter := writeReplayRuntime(t, directory)
+	output := filepath.Join(directory, "generated.o")
+	if err := os.WriteFile(output, []byte("materialized"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	err := runScript(scriptRunOptions{
+		interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
+		scriptContent: "#!/bin/sh\nmake unexpected || true\nprintf release\n",
+		replays: []scriptReplayManifest{{
+			Name: "make", Invocations: []scriptReplayInvocation{{Arguments: []string{"expected"}, Outputs: []string{output}}},
+		}},
+		stdout: &stdout, stderr: ioDiscard{},
+	})
+	if stdout.String() != "release" || err == nil || !strings.Contains(err.Error(), "rejected undeclared arguments") {
+		t.Fatalf("caught undeclared call: stdout=%q, error=%v", stdout.String(), err)
+	}
+}
+
 func TestRunScriptReplayKeepsAuthoritativeStateOutOfRuntimeFilesystem(t *testing.T) {
 	directory := t.TempDir()
 	interpreter := writeReplayRuntime(t, directory)
@@ -1287,19 +1722,23 @@ func TestRunScriptReplayProxyRejectsNewOutputMutationAfterReplay(t *testing.T) {
 			directory := t.TempDir()
 			interpreter := writeReplayRuntime(t, directory)
 			output := filepath.Join(directory, "generated.o")
-			err := runScript(scriptRunOptions{
+			var stdout bytes.Buffer
+			err := runScriptWithFallback(scriptRunOptions{
 				interpreter: interpreter, interpreterArgs: []string{"sh"}, multicall: interpreter,
 				scriptContent: "#!/bin/sh\nprintf original >" + shellQuote(output) + "\nmake expected\n" + test.mutation(output) + "\n", replays: []scriptReplayManifest{{
 					Name: "make", Invocations: []scriptReplayInvocation{{Arguments: []string{"expected"}, Outputs: []string{output}}},
 				}},
 				tools: map[string]string{}, toolContracts: map[string]toolaction.Contract{},
-				stdout: ioDiscard{}, stderr: ioDiscard{},
-			})
+				stdout: &stdout, stderr: ioDiscard{},
+			}, scriptRunFallback{enabled: true, timeout: time.Minute, stdout: []byte("masked")})
 			if err == nil {
 				t.Fatal("runScript() accepted a newly created replay output mutated after the boundary")
 			}
 			if !strings.Contains(err.Error(), test.diagnostic) {
 				t.Fatalf("runScript() error = %q, want %q", err, test.diagnostic)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("fallback masked mutated replay output with %q", stdout.String())
 			}
 		})
 	}
@@ -1381,6 +1820,7 @@ func TestDecodeReplayManifestsRejectsMalformedInput(t *testing.T) {
 	}{
 		{name: "base64", values: []string{"%%%"}},
 		{name: "unknown field", values: []string{encode(`{"name":"make","invocations":[],"extra":true}`)}},
+		{name: "deny all with invocations", values: []string{encode(`{"name":"make","deny_all":true,"invocations":[{"arguments":[],"outputs":[]}]}`)}},
 		{name: "invalid name", values: []string{encode(`{"name":"../make","invocations":[{"arguments":[],"outputs":[]}]}`)}},
 		{name: "NUL", values: []string{encode(`{"name":"make","invocations":[{"arguments":["\u0000"],"outputs":[]}]}`)}},
 		{name: "duplicate name", values: []string{

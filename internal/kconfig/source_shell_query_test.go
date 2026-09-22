@@ -19,6 +19,72 @@ type sourceShellQueryBindgenParametersValue struct {
 	parameters string
 }
 
+func TestKbuildSourceShellZeroOperandEchoIsPureAndRequiresNoAction(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, _ := newFixtureProbeEvaluator(t, 0, "x86", builder, nil, false)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "initramfs.cpio"), []byte("declared source data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	host.sourceRoot = root
+	host.tools[linuxProbeScriptRunner] = "/configured/scriptrun"
+	host.tools[linuxProbeScriptRuntime] = "/configured/runtime"
+	scopes := &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{"host": host}}
+	for _, test := range []struct{ command, want string }{
+		{"echo", ""}, {`echo ""`, ""}, {"echo ''", ""}, {`echo "" ''`, " "},
+	} {
+		value, err := scopes.kbuildSourceShell(context.Background(), test.command, root)
+		if err != nil || value != test.want || len(scopes.References()) != 0 {
+			t.Fatalf("source echo %q after GNU Make newline reduction = %q, %v, references %#v; want %q", test.command, value, err, scopes.References(), test.want)
+		}
+	}
+	for _, command := range []string{
+		"echo initramfs.cpio", // A configured nonempty initramfs source needs its own declared path handling.
+		"echo -n", "echo >/dev/null", "LC_ALL=C echo", "echo $HOME", `echo "$(touch output)"`,
+		`echo "" && touch output`, `echo ""; touch output`, "echo `touch output`",
+	} {
+		if _, err := scopes.kbuildSourceShell(context.Background(), command, host.sourceRoot); err == nil {
+			t.Fatalf("source shell admitted unsupported nonempty/configured echo %q", command)
+		}
+		if len(scopes.References()) != 0 {
+			t.Fatalf("unsupported echo %q registered undeclared actions %#v", command, scopes.References())
+		}
+	}
+}
+
+func TestKbuildSourceShellEmptyInitramfsDefaultSelectsSourceBranch(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, _ := newFixtureProbeEvaluator(t, 0, "x86", builder, nil, false)
+	scopes := &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{"host": host}}
+	opts, err := scopes.Options("host", KbuildOptions{
+		Variables:             map[string]string{"CONFIG_INITRAMFS_SOURCE": `""`},
+		MakeVariablesComplete: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseKbuildWithOptions(strings.NewReader(`
+ramfs-input := $(strip $(shell echo $(CONFIG_INITRAMFS_SOURCE)))
+ifeq ($(ramfs-input),)
+all: default.cpio
+else
+all: $(ramfs-input)
+endif
+`), "usr/Makefile", opts, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Rules) != 1 || !slices.Equal(parsed.Rules[0].Prerequisites, []string{"default.cpio"}) || len(scopes.References()) != 0 {
+		t.Fatalf("empty source initramfs branch = %#v, references %#v", parsed.Rules, scopes.References())
+	}
+}
+
 func TestKbuildSourceShellRoutesScopedCompilerAfterLiteralEnvironmentPrefix(t *testing.T) {
 	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
 	if err != nil {
@@ -41,6 +107,153 @@ func TestKbuildSourceShellRoutesScopedCompilerAfterLiteralEnvironmentPrefix(t *t
 	}
 	if references := scopes.References(); len(references) != 0 {
 		t.Fatalf("bootstrap-backed compiler version emitted probe references: %#v", references)
+	}
+}
+
+func TestKbuildSourceShellBindsLiteralPkgConfigToDeclaredHostTool(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := newFixtureProbeEvaluator(t, 1, "x86", builder, nil, false)
+	host, _ := newFixtureProbeEvaluator(t, 0, "x86", builder, nil, false)
+	host.tools[linuxProbePkgConfigRole] = "/configured/pkgconfigshim"
+	host.tools[linuxProbeScriptRunner] = "/configured/scriptrun"
+	host.tools[linuxProbeScriptRuntime] = "/configured/script-runtime"
+	scopes := &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{"target": target, "host": host}}
+	for _, command := range []string{
+		"pkg-config libelf --libs 2>/dev/null || echo $LIBS",
+		"pkg-config libelf --libs 2>/dev/null || sh -c true",
+	} {
+		if _, err := scopes.kbuildSourceShell(context.Background(), command, ""); err == nil {
+			t.Errorf("source query %q unexpectedly admitted dynamic shell authority", command)
+		}
+	}
+	if len(scopes.References()) != 0 {
+		t.Fatal("rejected source package queries emitted probe references")
+	}
+	value, err := scopes.kbuildSourceShell(context.Background(),
+		"pkg-config libelf --libs 2>/dev/null || echo -lelf", "")
+	if err != nil || !linuxProbeSymbolPattern.MatchString(value) {
+		t.Fatalf("literal package query = %q, %v; want one declared result", value, err)
+	}
+	plan, err := builder.Plan(scopes.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 1 || plan.Nodes[0].Scope != "host" {
+		t.Fatalf("literal package query nodes = %#v; want one host action", plan.Nodes)
+	}
+	request := plan.Requests[plan.Nodes[0].RequestID]
+	if request.Steps[0].Tool != linuxProbeScriptRunner ||
+		!slices.Contains(request.Steps[0].AuxiliaryTools, linuxProbePkgConfigRole) ||
+		!strings.Contains(strings.Join(request.Steps[0].Arguments, " "), "pkg-config 'libelf' '--libs' 2>/dev/null || echo '-lelf'") {
+		t.Fatalf("literal package query request = %#v; want configured host shim", request)
+	}
+}
+
+func TestKbuildSourceShellPerlEmbedFlagsUseConfiguredHostApplet(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := newFixtureProbeEvaluator(t, 1, "x86", builder, nil, false)
+	host, _ := newFixtureProbeEvaluator(t, 0, "x86", builder, nil, false)
+	perlRole := compactKbuildScriptAppletRolePrefix + "perl"
+	host.tools[linuxProbeScriptRunner] = "/configured/scriptrun"
+	host.tools[linuxProbeScriptRuntime] = "/configured/script-runtime"
+	host.tools[perlRole] = "/configured/perl"
+	scopes := &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{"target": target, "host": host}}
+	for _, function := range []string{"ccopts", "ldopts"} {
+		command := "perl -MExtUtils::Embed -e " + function + " 2>/dev/null"
+		value, err := scopes.kbuildSourceShell(context.Background(), command, "")
+		if err != nil || !linuxProbeSymbolPattern.MatchString(value) {
+			t.Fatalf("source-selected %s query = %q, %v; want symbolic text", function, value, err)
+		}
+		if normalized, err := normalizeKbuildShellOutput(value); err != nil || normalized != value {
+			t.Fatalf("GNU Make shell normalization changed symbolic %s result: %q, %v", function, normalized, err)
+		}
+	}
+	plan, err := builder.Plan(scopes.References()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 2 {
+		t.Fatalf("Perl Embed query nodes = %#v; want one host request per source function", plan.Nodes)
+	}
+	for _, node := range plan.Nodes {
+		if node.Scope != "host" {
+			t.Fatalf("Perl Embed query scope = %q; want host", node.Scope)
+		}
+		request := plan.Requests[node.RequestID]
+		if request.InputCount != 0 || len(request.Steps) != 1 || len(request.Sources) != 0 || len(request.SourceRoots) != 0 ||
+			request.Outcome.Kind != "text" || request.Outcome.Step != "perl-embed-flags" || request.Outcome.Stream != "stdout" ||
+			!request.Outcome.GNUMakeShell || !request.Outcome.RequireSuccess || request.Outcome.SingleMakeWord {
+			t.Fatalf("Perl Embed text query request = %#v", request)
+		}
+		step := request.Steps[0]
+		if step.Tool != linuxProbeScriptRunner || step.DiscardStderr || step.DiscardStdout || len(step.AuxiliaryTools) != 0 {
+			t.Fatalf("Perl Embed selected runtime step = %#v", step)
+		}
+		if got, want := request.ToolRoles(), []string{perlRole, linuxProbeScriptRuntime, linuxProbeScriptRunner}; !slices.Equal(got, want) {
+			t.Fatalf("Perl Embed configured tool roles = %q, want %q", got, want)
+		}
+		arguments := step.Arguments
+		if len(arguments) != 15 || arguments[0] != "-interpreter" || arguments[1] != "${tool:"+linuxProbeScriptRuntime+"}" ||
+			arguments[2] != "-interpreter_arg" || arguments[3] != "sh" ||
+			arguments[4] != "-multicall" || arguments[5] != "${tool:"+linuxProbeScriptRuntime+"}" ||
+			arguments[6] != "-script_content" ||
+			(arguments[7] != "perl -MExtUtils::Embed -e ccopts 2>/dev/null" && arguments[7] != "perl -MExtUtils::Embed -e ldopts 2>/dev/null") ||
+			arguments[8] != "-applet" || arguments[9] != "perl=${tool:"+perlRole+"}" ||
+			arguments[10] != "-require_applet" || arguments[11] != "perl" ||
+			arguments[12] != "-require_applet" || arguments[13] != "sh" || arguments[14] != "--" {
+			t.Fatalf("Perl Embed request altered source argv or applet binding: %q", arguments)
+		}
+		if strings.Contains(strings.Join(arguments, " "), "/configured/") {
+			t.Fatalf("Perl Embed request leaked host tool path: %q", arguments)
+		}
+	}
+}
+
+func TestKbuildSourceShellPerlEmbedFlagsRejectAlteredAuthority(t *testing.T) {
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, _ := newFixtureProbeEvaluator(t, 0, "x86", builder, nil, false)
+	host.tools[linuxProbeScriptRunner] = "/configured/scriptrun"
+	host.tools[linuxProbeScriptRuntime] = "/configured/script-runtime"
+	perlRole := compactKbuildScriptAppletRolePrefix + "perl"
+	host.tools[perlRole] = "/configured/perl"
+	scopes := &KbuildProbeScopes{evaluators: map[string]*LinuxProbeEvaluator{"host": host}}
+	for _, command := range []string{
+		"perl -MExtUtils::MakeMaker -e ccopts 2>/dev/null",
+		"perl -MExtUtils::Embed -e system('sh') 2>/dev/null",
+		"perl -MExtUtils::Embed -e ccopts -w 2>/dev/null",
+		"perl -I/tmp -MExtUtils::Embed -e ccopts 2>/dev/null",
+		"perl -MExtUtils::Embed -e ccopts 2>/result",
+		"perl -MExtUtils::Embed -e ccopts 2>&1",
+		"perl -MExtUtils::Embed -e ccopts 2 >/dev/null",
+		"perl -MExtUtils::Embed -e ccopts >/dev/null",
+		"perl -MExtUtils::Embed -e ccopts 2>/dev/null; echo unsafe",
+		"perl -MExtUtils::Embed -e ccopts 2>/dev/null $(hostname)",
+		"LC_ALL=C perl -MExtUtils::Embed -e ccopts 2>/dev/null",
+		"/usr/bin/perl -MExtUtils::Embed -e ccopts 2>/dev/null",
+		"perl '-MExtUtils::Embed' -e ccopts 2>/dev/null",
+	} {
+		if value, err := scopes.kbuildSourceShell(context.Background(), command, ""); err == nil {
+			t.Fatalf("altered Perl Embed query %q returned %q without error", command, value)
+		}
+		if len(scopes.References()) != 0 {
+			t.Fatalf("altered Perl Embed query %q registered requests: %#v", command, scopes.References())
+		}
+	}
+	delete(host.tools, perlRole)
+	if _, err := scopes.kbuildSourceShell(context.Background(), "perl -MExtUtils::Embed -e ccopts 2>/dev/null", ""); err == nil || !strings.Contains(err.Error(), perlRole) {
+		t.Fatalf("missing configured Perl applet = %v; want fail-closed role error", err)
+	}
+	if len(scopes.References()) != 0 {
+		t.Fatalf("missing configured Perl applet registered requests: %#v", scopes.References())
 	}
 }
 

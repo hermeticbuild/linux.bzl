@@ -31,6 +31,45 @@ func TestProbeResultPathFallbackPredicateUsesExplicitProvenance(t *testing.T) {
 	}
 }
 
+func TestProbeResultEchoContainsRejectsMeasuredShellSyntax(t *testing.T) {
+	predicate := ProbePredicate{
+		Operator: "result-text-contains-echo-safe", Result: "00000000", Value: "printf",
+	}
+	request := ProbeRequest{
+		Schema: LinuxProbeRequestSchema, InputCount: 1,
+		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &predicate},
+	}
+	if err := request.Validate(); err != nil || !IsProbeResultPredicate(predicate) {
+		t.Fatalf("echo result predicate: valid=%t, error=%v", IsProbeResultPredicate(predicate), err)
+	}
+	for _, test := range []struct {
+		value string
+		want  bool
+		bad   bool
+	}{
+		{value: "printf version", want: true},
+		{value: "clang version"},
+		{value: "$(printf clang)", bad: true},
+		{value: "`printf clang`", bad: true},
+		{value: "-n printf", bad: true},
+	} {
+		got, err := EvaluateProbeResultPredicate(predicate, map[string]ProbeResult{
+			"00000000": dependencyTextResult(test.value),
+		})
+		if test.bad {
+			if err == nil || !strings.Contains(err.Error(), "shell-dependent bytes") {
+				t.Errorf("echo result %q: got %t, error %v; want rejection", test.value, got, err)
+			}
+		} else if err != nil || got != test.want {
+			t.Errorf("echo result %q: got %t, error %v; want %t", test.value, got, err, test.want)
+		}
+	}
+	request.Outcome.Predicate.Value = ""
+	if err := request.Validate(); err == nil {
+		t.Fatal("echo containment predicate accepted empty grep value")
+	}
+}
+
 func dependencyTextResult(value string) ProbeResult {
 	return ProbeResult{Kind: "text", Text: value}
 }

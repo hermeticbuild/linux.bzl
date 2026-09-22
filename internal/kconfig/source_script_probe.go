@@ -6,8 +6,12 @@ package kconfig
 // script runtime, and configured tool action contracts determine the result.
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path"
@@ -420,6 +424,41 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 	sourcePrerequisites []string,
 	workingTreeContents map[string]string,
 ) (ProbeRequest, []ProbeReference, bool, error) {
+	return e.evaluatedScriptOutputTextRequestWithSourceProof(
+		target, recipe, sourcePrerequisites, workingTreeContents, nil,
+	)
+}
+
+// selectedSourceScriptProof binds a source-selected filechk to the immutable
+// script and to the complete, exact working-file frontier before its writer.
+type selectedSourceScriptProof struct {
+	script       string
+	scriptDigest string
+	direct       bool
+	owners       map[string]string
+	processRead  map[string]bool
+}
+
+// selectedSourceOutputExportContext retains the configured host tool authority
+// behind source-exported host action-role tokens. A target-stage source-output
+// probe can observe their public command spelling, but cannot execute a host
+// program without a separately declared cross-scope tool action.
+type selectedSourceOutputExportContext struct {
+	hostTools           map[string]string
+	hostToolsetIdentity string
+}
+
+func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequestWithSourceProof(
+	target string,
+	recipe string,
+	sourcePrerequisites []string,
+	workingTreeContents map[string]string,
+	proof *selectedSourceScriptProof,
+	selectedExports ...*selectedSourceOutputExportContext,
+) (ProbeRequest, []ProbeReference, bool, error) {
+	if len(selectedExports) > 1 || len(selectedExports) == 1 && proof == nil {
+		return ProbeRequest{}, nil, false, fmt.Errorf("selected source export context requires one source-owned writer")
+	}
 	if e == nil {
 		return ProbeRequest{}, nil, false, fmt.Errorf("Linux evaluated-script probe evaluator is nil")
 	}
@@ -427,7 +466,16 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 		return ProbeRequest{}, nil, false, nil
 	}
 	target = canonicalKbuildRulePath(target)
-	recipe, recognized := compactKbuildEvaluatedScriptOutputRecipe(recipe, target, sourcePrerequisites)
+	selected := ""
+	if proof != nil {
+		selected, _, _ = compactKbuildSelectedSourceFilechkRecipe(recipe, target)
+	}
+	var recognized bool
+	if selected != "" {
+		recipe, recognized = selected, true
+	} else if proof == nil {
+		recipe, recognized = compactKbuildEvaluatedScriptOutputRecipe(recipe, target, sourcePrerequisites)
+	}
 	if !recognized {
 		return ProbeRequest{}, nil, false, nil
 	}
@@ -436,7 +484,7 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 	// prerequisites, so even a fully content-addressed process environment would
 	// leave the program frontier open. Keep that source-selected environment
 	// shape on the ordinary Kbuild path.
-	if e.scriptEnvironment["BC_ENV_ARGS"] != "" {
+	if proof == nil && e.scriptEnvironment["BC_ENV_ARGS"] != "" {
 		return ProbeRequest{}, nil, false, nil
 	}
 
@@ -447,6 +495,9 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 		return ProbeRequest{}, nil, false, nil
 	}
 	sources := map[string]bool{linuxProbeRootAnchor: true}
+	if proof != nil {
+		sources[proof.script] = true
+	}
 	stagedSourceModes := map[string]string{}
 	for _, candidate := range sourcePrerequisites {
 		candidate = canonicalKbuildRulePath(candidate)
@@ -495,8 +546,111 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 
 	environment := map[string]string{}
 	auxiliarySet := map[string]bool{}
-	if err := e.inheritSourceScriptEnvironment(environment, auxiliarySet); err != nil {
+	fullExport := environment
+	fullRoles := auxiliarySet
+	if proof != nil {
+		fullExport = map[string]string{}
+		fullRoles = map[string]bool{}
+	}
+	if err := e.inheritSourceScriptEnvironment(fullExport, fullRoles); err != nil {
 		return ProbeRequest{}, nil, false, nil
+	}
+	if proof != nil && fullExport["GREP_OPTIONS"] != "" {
+		// Grep may read undeclared files through inherited option settings.
+		return ProbeRequest{}, nil, false, nil
+	}
+	makeExportIdentity := ""
+	observedProcessPresence := map[string]bool{}
+	selectedRecursiveMakeCapability := false
+	selectedHostPrograms := map[string]bool{}
+	selectedHostToolsetIdentity := ""
+	if proof != nil {
+		// The source-selected GNU Make invocation eagerly evaluates its entire
+		// exported environment before starting this shell. The selected Make
+		// control graph owns those producer dependencies. Bind the normalized
+		// export identities here without forcing an unused target-scope symbol
+		// into a host-scope source script's process environment.
+		identity := sha256.New()
+		configuredRoles := make([]KbuildActionRoleRef, 0, len(e.tools))
+		for role := range e.tools {
+			configuredRoles = append(configuredRoles, KbuildActionRoleRef{Scope: e.scope, Role: role})
+		}
+		if len(selectedExports) != 0 && selectedExports[0] != nil {
+			for role := range selectedExports[0].hostTools {
+				configuredRoles = append(configuredRoles, KbuildActionRoleRef{Scope: "host", Role: role})
+			}
+		}
+		for _, name := range slices.Sorted(maps.Keys(fullExport)) {
+			value := fullExport[name]
+			raw := e.scriptEnvironment[name]
+			identityValue := value
+			if len(selectedExports) != 0 && selectedExports[0] != nil {
+				refs, err := KbuildActionRoleRefs(raw)
+				if err != nil {
+					return ProbeRequest{}, nil, false, fmt.Errorf("selected source export %s: %w", name, err)
+				}
+				for _, sourceRef := range refs {
+					ref, binding, valid := kbuildActionRoleBinding(sourceRef, e.scope)
+					if !valid || ref.Scope == e.scope && e.tools[ref.Role] == "" ||
+						ref.Scope == "host" && selectedExports[0].hostTools[ref.Role] == "" {
+						return ProbeRequest{}, nil, false, fmt.Errorf("selected source export %s references unconfigured %s action role %q", name, ref.Scope, ref.Role)
+					}
+					if ref.Scope == e.scope {
+						auxiliarySet[binding] = true
+					} else {
+						if selectedExports[0].hostToolsetIdentity == "" {
+							return ProbeRequest{}, nil, false, fmt.Errorf("selected source export %s has a host role without a bound host toolset identity", name)
+						}
+						auxiliarySet[binding] = true
+						selectedHostPrograms[binding] = true
+						selectedHostToolsetIdentity = selectedExports[0].hostToolsetIdentity
+					}
+				}
+				if len(refs) != 0 {
+					rewritten, _, err := rewriteKbuildActionRoleRefs(raw, e.scope, configuredRoles, false)
+					if err != nil {
+						return ProbeRequest{}, nil, false, fmt.Errorf("selected source export %s: %w", name, err)
+					}
+					value = rewritten
+					identityValue = raw
+				}
+			}
+			fmt.Fprintf(identity, "%08x:%s%08x:%s", len(name), name, len(identityValue), identityValue)
+			fullExport[name] = value
+		}
+		if len(selectedHostPrograms) != 0 {
+			fmt.Fprintf(identity, "%08x:%s", len(selectedExports[0].hostToolsetIdentity), selectedExports[0].hostToolsetIdentity)
+			for _, program := range slices.Sorted(maps.Keys(selectedHostPrograms)) {
+				fmt.Fprintf(identity, "%08x:%s", len(program), program)
+			}
+		}
+		makeExportIdentity = hex.EncodeToString(identity.Sum(nil))
+
+		// A source script may start a child program which reads an export without
+		// spelling its name in shell text (for example awk's ENVIRON). Forward
+		// every selected Make export with its original scoped probe dependencies.
+		// The evaluator-owned recursive MAKE token is a capability rather than
+		// process text. Use the same public command spelling as ordinary selected
+		// actions, including aliases which interpolate the capability; the
+		// measured action installs a deny-all replay proxy for that spelling.
+		for _, name := range slices.Sorted(maps.Keys(fullExport)) {
+			value := fullExport[name]
+			selectedRecursiveMakeCapability = selectedRecursiveMakeCapability || strings.Contains(value, CompactKbuildRecursiveMakeProvenanceToken)
+			value = strings.ReplaceAll(value, CompactKbuildRecursiveMakeProvenanceToken, CompactKbuildRecursiveMakeReplayName)
+			observedProcessPresence[name] = true
+			environment[name] = value
+			if role, selected, err := e.configuredSourceScriptToolRole(e.scriptEnvironment[name]); err == nil && selected {
+				auxiliarySet[role] = true
+			}
+		}
+		for name := range proof.processRead {
+			if _, present := fullExport[name]; !present && name != "IFS" {
+				observedProcessPresence[name] = false
+			}
+		}
+		// scriptrun supplies the private PATH, locale and temporary directory;
+		// the setup witness rejects unexpected inherited membership for names
+		// the selected script reads from its process environment.
 	}
 	lowerer := newProbeSymbolicValueLowerer(e)
 	environmentFragments, sourceRoots, err := lowerSourceScriptEnvironment(environment, lowerer)
@@ -546,7 +700,7 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 	}
 
 	workingScratchNames := map[string]string{}
-	scratch := make([]ProbeScratch, 0, len(stagedWorkingContents)+1)
+	scratch := make([]ProbeScratch, 0, 2*len(stagedWorkingContents)+1)
 	for index, candidate := range slices.Sorted(maps.Keys(stagedWorkingContents)) {
 		name := fmt.Sprintf("working-input-%04d", index)
 		workingScratchNames[candidate] = name
@@ -554,8 +708,26 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 			Name: name, Kind: "file", Content: stagedWorkingContents[candidate], Present: true,
 			ContentIsOpaque: true,
 		})
+		if proof != nil {
+			if owner, selected := proof.owners[candidate]; selected {
+				scratch = append(scratch, ProbeScratch{
+					Name: fmt.Sprintf("working-owner-%04d", index), Kind: "file", Content: owner,
+					Present: true, ContentIsOpaque: true,
+				})
+			}
+		}
 	}
 	scratch = append(scratch, ProbeScratch{Name: linuxProbeEvaluatedScriptWorkScratch, Kind: "directory"})
+	if proof != nil {
+		scratch = append(scratch, ProbeScratch{
+			Name: "make-export-identity", Kind: "file", Content: makeExportIdentity,
+			Present: true, ContentIsOpaque: true,
+		})
+		scratch = append(scratch, ProbeScratch{
+			Name: "selected-script-identity", Kind: "file", Content: proof.scriptDigest,
+			Present: true, ContentIsOpaque: true,
+		})
+	}
 	slices.SortFunc(scratch, func(left, right ProbeScratch) int {
 		return strings.Compare(left.Name, right.Name)
 	})
@@ -580,6 +752,19 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 	// state, argv, environment, and private cwd as the final Kbuild action.
 	var setup strings.Builder
 	setup.WriteString("#!/bin/sh\nset -e\numask 022\n")
+	if proof != nil {
+		// The selected source's SCM function may query these executables even
+		// when the source tree has no repository. Reject a selected runtime
+		// that offers one rather than allow it to inspect worker ancestry.
+		setup.WriteString("for scm_tool in git hg svn; do if command -v \"$scm_tool\" >/dev/null 2>&1; then exit 1; fi; done\n")
+		for _, name := range slices.Sorted(maps.Keys(observedProcessPresence)) {
+			if observedProcessPresence[name] {
+				fmt.Fprintf(&setup, "if [ \"${%s+set}\" != set ]; then exit 1; fi\n", name)
+			} else {
+				fmt.Fprintf(&setup, "if [ \"${%s+set}\" = set ]; then exit 1; fi\n", name)
+			}
+		}
+	}
 	for _, directory := range slices.Sorted(maps.Keys(workingDirectories)) {
 		setup.WriteString("mkdir -p -- ")
 		setup.WriteString(shellSingleQuoted(directory))
@@ -611,10 +796,13 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 	for _, helper := range []string{"chmod", "cp", "mkdir", "sh"} {
 		setupArguments = append(setupArguments, "-require_applet", helper)
 	}
-	setupArguments = append(setupArguments,
-		"-tree", "kernel=${source_root:"+linuxProbeSourceRootName+"}",
-		"-script_content_base64", base64.StdEncoding.EncodeToString([]byte(setup.String())),
-	)
+	if strings.Contains(setup.String(), "${tree:kernel}") {
+		setupArguments = append(setupArguments, "-tree", "kernel=${source_root:"+linuxProbeSourceRootName+"}")
+	}
+	// These generated scripts scale with the exact working-file inventory.
+	// Transport their bytes through stdin rather than one argv element, whose
+	// operating-system limit can be smaller than the probe protocol bound.
+	setupArguments = append(setupArguments, "-script_stdin")
 	if len(stagedWorkingContents) != 0 {
 		setupArguments = append(setupArguments, "--")
 		for _, candidate := range slices.Sorted(maps.Keys(stagedWorkingContents)) {
@@ -630,8 +818,37 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 	if err != nil {
 		return ProbeRequest{}, nil, false, nil
 	}
+	if proof != nil && proof.direct {
+		// The selected script's shebang is source input, but executable lookup
+		// via that shebang would run the worker's ambient /bin/sh. Supply the
+		// declared shell applet as the program while preserving script argv/$0.
+		from := "{\n${tree:kernel}/" + proof.script + " ${tree:kernel}\n} > " + shellSingleQuoted(target)
+		to := "{\nsh ${tree:kernel}/" + proof.script + " ${tree:kernel}\n} > " + shellSingleQuoted(target)
+		if measuredRecipe != from {
+			return ProbeRequest{}, nil, false, nil
+		}
+		measuredRecipe = to
+	}
 	measuredRecipe = "#!/bin/sh\nset -e\n" + measuredRecipe + "\n"
 	recipeArguments := baseArguments()
+	if proof != nil {
+		// The wrapper and selected script must resolve these programs only from
+		// the private configured multicall runtime, never from the worker PATH.
+		recipeArguments = append(recipeArguments, "-require_applet", "grep", "-require_applet", "sh")
+	}
+	if selectedRecursiveMakeCapability {
+		// Recursive Make may only run a child already admitted by the selected
+		// graph; source-output measurement has no such child invocations.
+		replay, err := json.Marshal(struct {
+			Name        string `json:"name"`
+			DenyAll     bool   `json:"deny_all"`
+			Invocations []any  `json:"invocations"`
+		}{Name: CompactKbuildRecursiveMakeReplayName, DenyAll: true, Invocations: []any{}})
+		if err != nil {
+			return ProbeRequest{}, nil, false, fmt.Errorf("encode selected generator recursive Make denial: %w", err)
+		}
+		recipeArguments = append(recipeArguments, "-replay_base64", base64.StdEncoding.EncodeToString(replay))
+	}
 	for _, tree := range []string{"kernel"} {
 		if strings.Contains(measuredRecipe, "${tree:"+tree+"}") {
 			recipeArguments = append(recipeArguments, "-tree", tree+"=${source_root:"+linuxProbeSourceRootName+"}")
@@ -762,7 +979,7 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 	}
 	validationArguments = append(validationArguments,
 		"-tree", "kernel=${source_root:"+linuxProbeSourceRootName+"}",
-		"-script_content_base64", base64.StdEncoding.EncodeToString([]byte(validation.String())),
+		"-script_stdin",
 		"--",
 	)
 	for _, candidate := range slices.Sorted(maps.Keys(stagedWorkingContents)) {
@@ -785,7 +1002,7 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 	setupStep := ProbeStep{
 		Name: "prepare-evaluated-script-output", Tool: linuxProbeScriptRunner,
 		AuxiliaryTools: auxiliary, WorkingDirectory: "${scratch:" + linuxProbeEvaluatedScriptWorkScratch + "}",
-		Arguments: setupArguments, Environment: environment, EnvironmentFragments: environmentFragments,
+		Arguments: setupArguments, StdinOpaque: setup.String(), Environment: environment, EnvironmentFragments: environmentFragments,
 		DiscardStdout: true,
 	}
 	recipeStep := ProbeStep{
@@ -799,11 +1016,11 @@ func (e *LinuxProbeEvaluator) evaluatedScriptOutputTextRequest(
 	validationStep := ProbeStep{
 		Name: "validate-evaluated-script-output", Tool: linuxProbeScriptRunner,
 		AuxiliaryTools: auxiliary, WorkingDirectory: "${scratch:" + linuxProbeEvaluatedScriptWorkScratch + "}",
-		Arguments: validationArguments, ConditionalArguments: []ProbeConditionalArguments{validationConditional},
+		Arguments: validationArguments, StdinOpaque: validation.String(), ConditionalArguments: []ProbeConditionalArguments{validationConditional},
 		Environment: environment, EnvironmentFragments: environmentFragments,
 	}
 	request := ProbeRequest{
-		Schema: LinuxProbeRequestSchema, InputCount: len(lowerer.dependencies),
+		Schema: LinuxProbeRequestSchema, InputCount: len(lowerer.dependencies), HostToolsetIdentity: selectedHostToolsetIdentity,
 		Sources: declaredSources, SourceRoots: sourceRoots,
 		Scratch: scratch, Steps: []ProbeStep{setupStep, recipeStep, validationStep},
 		Outcome: ProbeOutcome{Kind: "text", Step: validationStep.Name, Stream: "stdout", RequireSuccess: true},
@@ -1006,9 +1223,14 @@ func (e *LinuxProbeEvaluator) immutableLinuxSourcePath(value string, requireShel
 // shell helper beneath the selected Linux source root. Extensionless helpers
 // are selected from their immutable shebang; optional `env NAME=VALUE`
 // prefixes are represented as action environment, and exact configured tool
-// tokens become private scriptrun proxy names. Unknown source scripts require
+// tokens become private scriptrun proxy names. Both direct shell assignment
+// prefixes and `env NAME=VALUE` are accepted. Unknown source scripts require
 // no Go change.
 func (e *LinuxProbeEvaluator) sourceScriptRequest(command string, outcomeKind string) (ProbeRequest, []ProbeReference, bool, error) {
+	return e.sourceScriptRequestWithInterpreter(command, outcomeKind, nil)
+}
+
+func (e *LinuxProbeEvaluator) sourceScriptRequestWithInterpreter(command string, outcomeKind string, interpreter *compactKbuildSourceInterpreter) (ProbeRequest, []ProbeReference, bool, error) {
 	invocation, recognized, err := e.parseSourceScriptInvocation(command)
 	if err != nil || !recognized {
 		return ProbeRequest{}, nil, recognized, err
@@ -1021,12 +1243,29 @@ func (e *LinuxProbeEvaluator) sourceScriptRequest(command string, outcomeKind st
 	if err != nil {
 		return ProbeRequest{}, nil, true, err
 	}
-	prefix := []string{
-		"-interpreter", "${tool:" + linuxProbeScriptRuntime + "}",
-		"-interpreter_arg", "sh",
-		"-multicall", "${tool:" + linuxProbeScriptRuntime + "}",
-		"-script", "${source:" + invocation.path + "}",
+	interpreterRole := linuxProbeScriptRuntime
+	if interpreter != nil && e.tools[interpreter.program] != "" {
+		interpreterRole = interpreter.program
 	}
+	prefix := []string{"-interpreter", "${tool:" + interpreterRole + "}"}
+	if interpreter == nil {
+		prefix = append(prefix, "-interpreter_arg", "sh")
+	} else {
+		if interpreterRole == linuxProbeScriptRuntime {
+			prefix = append(prefix, "-require_applet", interpreter.program, "-interpreter_arg", interpreter.program)
+		} else {
+			invocation.auxiliary = append(invocation.auxiliary, interpreterRole)
+		}
+		for _, argument := range interpreter.arguments {
+			prefix = append(prefix, "-interpreter_arg", argument)
+		}
+	}
+	prefix = append(prefix,
+		"-multicall", "${tool:"+linuxProbeScriptRuntime+"}",
+		"-script", "${source:"+invocation.path+"}",
+	)
+	slices.Sort(invocation.auxiliary)
+	invocation.auxiliary = slices.Compact(invocation.auxiliary)
 	for _, role := range invocation.auxiliary {
 		prefix = append(prefix, "-tool", role+"=${tool:"+role+"}")
 	}
@@ -1087,8 +1326,95 @@ func (e *LinuxProbeEvaluator) sourceScriptRequest(command string, outcomeKind st
 	return request, invocation.dependencies, true, nil
 }
 
+// sourceScriptVersionPipeline keeps a source-selected filter in its declared
+// source tree and feeds it the exact stdout of a configured tool's --version
+// query. Each half is a separate content-addressed probe, so the pipeline has
+// no ambient shell, implicit PATH, or reimplementation of the source script.
+func (e *LinuxProbeEvaluator) sourceScriptVersionPipeline(command string) (string, bool, error) {
+	left, right, pipeline := strings.Cut(command, "|")
+	if !pipeline || !e.looksLikeSourceScript(right) {
+		return "", false, nil
+	}
+	// Declared source paths may also occur inside a configured compiler's
+	// header search flags. Those source-root spellings do not turn an echo | cc
+	// | grep query into a version pipeline. Own only a selected tool followed
+	// by a selected source script as the pipeline's next command.
+	producerFields := strings.Fields(left)
+	if len(producerFields) == 0 {
+		return "", false, nil
+	}
+	_, configured, roleErr := e.configuredToolRole(producerFields[0])
+	if roleErr != nil {
+		return "", true, roleErr
+	}
+	if !configured {
+		return "", false, nil
+	}
+	tokens, err := lexCompactKbuildRecipe(command)
+	if err != nil || len(tokens) != 4 || tokens[0].operator || tokens[1].operator ||
+		tokens[1].value != "--version" || !tokens[2].operator || tokens[2].value != "|" || tokens[3].operator {
+		return "", true, e.unsupportedCommand(command)
+	}
+	role, selected, err := e.configuredToolRole(tokens[0].value)
+	if err != nil {
+		return "", true, err
+	}
+	if !selected {
+		return "", true, e.unsupportedCommand(command)
+	}
+	scriptPath, sourceScript, err := e.sourceScriptRelativePath(tokens[3].value)
+	if err != nil || !sourceScript {
+		return "", true, e.unsupportedCommand(command)
+	}
+	scriptPath, err = e.immutableLinuxSourcePath(scriptPath, false)
+	if err != nil {
+		return "", true, err
+	}
+	file, err := os.Open(filepath.Join(e.sourceRoot, filepath.FromSlash(scriptPath)))
+	if err != nil {
+		return "", true, fmt.Errorf("read declared pipeline script %s: %w", scriptPath, err)
+	}
+	firstLine, readErr := io.ReadAll(io.LimitReader(file, 4096))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		return "", true, fmt.Errorf("read declared pipeline script %s: %v, close: %v", scriptPath, readErr, closeErr)
+	}
+	interpreter, recognized := compactKbuildSourceShebangInterpreter(firstLine)
+	if !recognized || len(firstLine) == 4096 && !strings.ContainsRune(string(firstLine), '\n') {
+		return "", true, fmt.Errorf("declared pipeline script %s has no bounded interpreter shebang", scriptPath)
+	}
+	request, dependencies, recognized, err := e.sourceScriptRequestWithInterpreter(tokens[3].value, "text", &interpreter)
+	if err != nil {
+		return "", true, err
+	}
+	if !recognized {
+		return "", true, e.unsupportedCommand(command)
+	}
+	request.Outcome.RequireSuccess = true
+	version, err := e.requestText(ProbeRequest{
+		Schema:  LinuxProbeRequestSchema,
+		Steps:   []ProbeStep{{Name: "version", Tool: role, Arguments: []string{"--version"}}},
+		Outcome: ProbeOutcome{Kind: "text", Step: "version", Stream: "stdout"},
+	})
+	if err != nil {
+		return "", true, err
+	}
+	symbol, symbolic, err := e.symbolArgument(version)
+	if err != nil || !symbolic || symbol.kind != "text" {
+		return "", true, fmt.Errorf("declared pipeline producer has no exact text result: %w", err)
+	}
+	request.Steps[0].StdinFragments = []ProbeValueFragment{{Value: fmt.Sprintf("${result:%08d.text}", len(dependencies))}}
+	request.InputCount++
+	dependencies = append(dependencies, symbol.reference)
+	if err := request.Validate(); err != nil {
+		return "", true, fmt.Errorf("declared source-script pipeline %s: %w", command, err)
+	}
+	text, err := e.requestText(request, dependencies...)
+	return text, true, err
+}
+
 func (e *LinuxProbeEvaluator) parseSourceScriptInvocation(command string) (linuxSourceScriptInvocation, bool, error) {
-	if !e.looksLikeSourceScript(command) {
+	if !e.sourceScriptSelectedProgram(command) {
 		return linuxSourceScriptInvocation{}, false, nil
 	}
 	// The lexer owns this marker. Reject a source command which already
@@ -1115,20 +1441,28 @@ func (e *LinuxProbeEvaluator) parseSourceScriptInvocation(command string) (linux
 	programIndex := 0
 	if words[0] == "env" {
 		programIndex = 1
-		for programIndex < len(words) {
-			name, value, assignment := strings.Cut(words[programIndex], "=")
-			if !assignment {
+	}
+	for programIndex < len(words) {
+		name, value, assignment := strings.Cut(words[programIndex], "=")
+		if !assignment {
+			break
+		}
+		if !validKbuildCommandEnvironmentName(name) {
+			// An immutable selected script may have '=' in a path component.
+			// The path is the program, never a source environment binding.
+			if _, sourceScript, pathErr := e.sourceScriptRelativePath(words[programIndex]); sourceScript || pathErr != nil {
 				break
 			}
-			if !validKbuildCommandEnvironmentName(name) || strings.ContainsRune(value, 0) {
-				return linuxSourceScriptInvocation{}, true, fmt.Errorf("declared source script has invalid environment assignment %q", words[programIndex])
-			}
-			if _, exists := environment[name]; exists {
-				return linuxSourceScriptInvocation{}, true, fmt.Errorf("declared source script repeats environment %s", name)
-			}
-			environment[name] = value
-			programIndex++
+			return linuxSourceScriptInvocation{}, true, fmt.Errorf("declared source script has invalid environment assignment %q", words[programIndex])
 		}
+		if strings.ContainsRune(value, 0) {
+			return linuxSourceScriptInvocation{}, true, fmt.Errorf("declared source script has invalid environment assignment %q", words[programIndex])
+		}
+		if _, exists := environment[name]; exists {
+			return linuxSourceScriptInvocation{}, true, fmt.Errorf("declared source script repeats environment %s", name)
+		}
+		environment[name] = value
+		programIndex++
 	}
 	if programIndex >= len(words) {
 		return linuxSourceScriptInvocation{}, words[0] == "env", fmt.Errorf("declared source script command has no program")
@@ -1174,13 +1508,16 @@ func (e *LinuxProbeEvaluator) parseSourceScriptInvocation(command string) (linux
 	}
 	for name, value := range environment {
 		selectable := false
-		// These NAME=VALUE words follow the `env` program and are ordinary
-		// argv, not shell assignment prefixes. Exact active expansion is thus
-		// subject to field splitting and empty removal just like script argv;
-		// quote provenance is gone, so reject ambiguous cardinality.
+		// An `env` assignment is an ordinary argv word, while a direct
+		// assignment prefix is a shell word. Reject ambiguous expansion
+		// cardinality for both until quote provenance can be retained.
 		value, selectable, err = e.sourceScriptShellWord(value)
 		if err != nil {
 			return linuxSourceScriptInvocation{}, true, fmt.Errorf("declared source script environment %s: %w", name, err)
+		}
+		if e.isSelectedSourceRoot(value) {
+			environment[name] = "${source_root:" + linuxProbeSourceRootName + "}"
+			continue
 		}
 		environment[name], _, err = rewriteTool(value, selectable)
 		if err != nil {
@@ -1233,6 +1570,90 @@ func (e *LinuxProbeEvaluator) parseSourceScriptInvocation(command string) (linux
 	}, true, nil
 }
 
+// sourceScriptSelectedProgram recognizes the command head, including the
+// source's env and inline assignment prefixes. Source-root spellings in a
+// configured compiler's -I or -iquote operands are immutable input paths,
+// not evidence that its command invokes a source script.
+func (e *LinuxProbeEvaluator) sourceScriptSelectedProgram(command string) bool {
+	if !e.looksLikeSourceScript(command) {
+		return false
+	}
+	tokens, err := lexCompactKbuildRecipe(command)
+	if err != nil {
+		// Preserve ownership of malformed selected script commands so lexer
+		// failures do not pass to an ambient shell fallback. The clean lexer
+		// below handles quoted assignment values with embedded whitespace.
+		fields := strings.Fields(command)
+		if len(fields) == 0 {
+			return false
+		}
+		index := 0
+		if fields[0] == "env" {
+			index++
+		}
+		for index < len(fields) && sourceScriptAssignmentPrefixWord(fields[index]) {
+			index++
+		}
+		if index == len(fields) {
+			return false
+		}
+		return e.sourceScriptSelectedPrefixWord(fields[index:], strings.Trim(fields[index], `"'`))
+	}
+	words := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		if token.operator {
+			break
+		}
+		words = append(words, token.value)
+	}
+	if len(words) == 0 {
+		return false
+	}
+	index := 0
+	if words[0] == "env" {
+		index++
+	}
+	for index < len(words) && sourceScriptAssignmentPrefixWord(words[index]) {
+		index++
+	}
+	if index == len(words) {
+		return false
+	}
+	program, _, err := e.sourceScriptShellWord(words[index])
+	if err != nil {
+		// The exact program spelling still identifies the declared source
+		// script, and parseSourceScriptInvocation reports the richer error.
+		program = words[index]
+	}
+	return e.sourceScriptSelectedPrefixWord(words[index:], program)
+}
+
+func sourceScriptAssignmentPrefixWord(value string) bool {
+	name, _, assignment := strings.Cut(value, "=")
+	return assignment && validKbuildCommandEnvironmentName(name)
+}
+
+// An invalid NAME=value word before a selected source program remains owned
+// by the source-script parser so it can report the malformed environment.
+// An ordinary compiler command with a passive source search operand reaches
+// this helper at its compiler head and cannot acquire source-script authority.
+func (e *LinuxProbeEvaluator) sourceScriptSelectedPrefixWord(words []string, program string) bool {
+	_, recognized, pathErr := e.sourceScriptRelativePath(program)
+	if recognized || pathErr != nil {
+		return true
+	}
+	if len(words) == 0 || !strings.ContainsRune(words[0], '=') {
+		return false
+	}
+	for _, candidate := range words[1:] {
+		_, recognized, pathErr := e.sourceScriptRelativePath(strings.Trim(candidate, `"'`))
+		if recognized || pathErr != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // inheritSourceScriptEnvironment installs the exact source-exported process
 // environment used by both source-script probe forms. Configured executable
 // spellings become private proxy names, while the selected Rust source tree is
@@ -1254,6 +1675,10 @@ func (e *LinuxProbeEvaluator) inheritSourceScriptEnvironment(
 		value := e.scriptEnvironment[name]
 		if err := validateSourceScriptProtocolLiteral(value); err != nil {
 			return fmt.Errorf("declared source script inherited environment %s: %w", name, err)
+		}
+		if e.isSelectedSourceRoot(value) {
+			environment[name] = "${source_root:" + linuxProbeSourceRootName + "}"
+			continue
 		}
 		if e.rustSourceRoot != "" && value == e.rustSourceRoot {
 			environment[name] = "${source_root:" + rustProbeSourceRootName + "}"
@@ -1419,6 +1844,17 @@ func (e *LinuxProbeEvaluator) sourceScriptRelativePath(program string) (string, 
 	if e.sourceRoot == "" {
 		return "", false, nil
 	}
+	for _, alias := range e.sourceRootAliases {
+		if relative, ok := strings.CutPrefix(program, alias+"/"); ok {
+			if err := validateProbeSourcePath(relative); err != nil {
+				return "", true, err
+			}
+			if !strings.HasSuffix(relative, ".sh") && !compactKbuildSourceFileUsesShell(filepath.Join(e.sourceRoot, filepath.FromSlash(relative))) {
+				return "", false, nil
+			}
+			return relative, true, nil
+		}
+	}
 	root := filepath.Clean(e.sourceRoot)
 	candidate := filepath.Clean(program)
 	relative, err := filepath.Rel(root, candidate)
@@ -1438,8 +1874,29 @@ func (e *LinuxProbeEvaluator) sourceScriptRelativePath(program string) (string, 
 	return relative, true, nil
 }
 
+func (e *LinuxProbeEvaluator) isSelectedSourceRoot(value string) bool {
+	if e.sourceRoot == "" {
+		return false
+	}
+	if value == e.sourceRoot {
+		return true
+	}
+	return slices.Contains(e.sourceRootAliases, value)
+}
+
 func (e *LinuxProbeEvaluator) looksLikeSourceScript(command string) bool {
-	return e.sourceRoot != "" && strings.Contains(filepath.ToSlash(command), filepath.ToSlash(e.sourceRoot)+"/")
+	if e.sourceRoot == "" {
+		return false
+	}
+	if strings.Contains(filepath.ToSlash(command), filepath.ToSlash(e.sourceRoot)+"/") {
+		return true
+	}
+	for _, alias := range e.sourceRootAliases {
+		if strings.Contains(command, alias+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *LinuxProbeEvaluator) configuredToolRole(value string) (string, bool, error) {

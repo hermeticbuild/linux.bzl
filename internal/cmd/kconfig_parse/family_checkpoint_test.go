@@ -116,13 +116,21 @@ func TestLinuxCheckpointSourceArtifactsRebindAliases(t *testing.T) {
 		t.Fatal(err)
 	}
 	external := t.TempDir()
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedExternal, err := filepath.EvalSymlinks(external)
+	if err != nil {
+		t.Fatal(err)
+	}
 	options := linuxKbuildProbeOptions{rootPath: root, sourceRoots: map[string]string{"nested": nested, "alias": alias, "external": external}}
 	options.sourceRoots["virtual"] = "virtual"
 	got, virtual, err := linuxCheckpointSourceArtifacts(options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got["alias"] != root || got["external"] != external {
+	if len(got) != 2 || got["alias"] != resolvedRoot || got["external"] != resolvedExternal {
 		t.Fatalf("source artifacts did not collapse aliases: %#v", got)
 	}
 	if !reflect.DeepEqual(virtual, map[string]string{"virtual": "virtual"}) {

@@ -124,6 +124,15 @@ func compactKbuildSourceScriptInjectionsForTarget(
 	target, patternStem string,
 	normal, orderOnly []string,
 ) (map[string]string, error) {
+	if entry, recorded := profile.targetRuleEntrySnapshots[compactKbuildGraphTargetPath(target)]; recorded && entry != nil {
+		// This compatibility entrypoint has no lexical Make target parameters.
+		// A selected rule entry owns their exact $@ and lookup spellings; a
+		// recursive -C invocation need not use the global graph path as $@.
+		return compactKbuildSourceScriptInjectionsForMakeTarget(
+			profile, target, entry.Line.LookupTarget, entry.Line.AutomaticTarget,
+			patternStem, normal, orderOnly,
+		)
+	}
 	return compactKbuildSourceScriptInjectionsForMakeTarget(
 		profile, target, target, target, patternStem, normal, orderOnly,
 	)
@@ -138,8 +147,47 @@ func compactKbuildSourceScriptInjectionsForMakeTarget(
 	if directory == "" {
 		directory = "."
 	}
+	stemProfile := profile
+	entry, recordedEntry := profile.targetRuleEntrySnapshots[compactKbuildGraphTargetPath(target)]
+	if entry != nil || recordedEntry {
+		mismatches := []string{}
+		if entry == nil {
+			mismatches = append(mismatches, "nil source entry")
+		} else {
+			if entry.Line.Target != target {
+				mismatches = append(mismatches, "target")
+			}
+			if entry.Line.LookupTarget != lookupTarget {
+				mismatches = append(mismatches, "lookup target")
+			}
+			if entry.Line.AutomaticTarget != automaticTarget {
+				mismatches = append(mismatches, fmt.Sprintf("automatic target (source %q, lowering %q)", entry.Line.AutomaticTarget, automaticTarget))
+			}
+			if entry.Line.Stem != patternStem {
+				mismatches = append(mismatches, "pattern stem")
+			}
+			if entry.Profile.Name != profile.Name {
+				mismatches = append(mismatches, "profile")
+			}
+			if entry.Line.RuleIndex < 0 || entry.Line.RuleIndex >= len(profile.Rules) {
+				mismatches = append(mismatches, "rule index")
+			} else if entry.Line.RecipeIndex < 0 || entry.Line.RecipeIndex >= len(profile.Rules[entry.Line.RuleIndex].Recipe) {
+				mismatches = append(mismatches, "recipe index")
+			}
+		}
+		if len(mismatches) != 0 {
+			return nil, fmt.Errorf("Kbuild profile %q target %q has no matching source-selected rule entry for target-stem: %s differs",
+				profile.Name, target, strings.Join(mismatches, ", "))
+		}
+		// Target-stem supplies the selected rule's automatic-variable context.
+		// GNU Make fixes that context at rule entry, before a leading eval or
+		// later executable line can change variables or file versions. A
+		// target-wide evaluator cannot provide this source-entry version.
+		stemProfile = entry.Profile
+		stemProfile.targetLineReadSnapshots = nil
+	}
 	values, err := evaluateCompactKbuildTargetForMakeTarget(
-		profile,
+		stemProfile,
 		target,
 		lookupTarget,
 		automaticTarget,
@@ -246,8 +294,9 @@ func compactKbuildSourceScriptReplayValue(profile CompactKbuildProfile, value st
 }
 
 type compactKbuildInvocationMaterialization struct {
-	outputs []string
-	roots   []compactKbuildRuleInput
+	outputs     []string
+	roots       []compactKbuildRuleInput
+	statusRoots []compactKbuildRuleInput
 }
 
 // compactKbuildInvocationDependencyMaterialization resolves the regular files
@@ -269,6 +318,7 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildInvocationDependencyMaterial
 	materialization := compactKbuildInvocationMaterialization{}
 	seenOutputs := map[string]bool{}
 	seenRoots := map[string]bool{}
+	seenStatuses := map[string]bool{}
 	appendOutput := func(pathname string) error {
 		pathname = canonicalKbuildRulePath(pathname)
 		if err := validatePlanRelativePath("recursive Make materialized output", pathname); err != nil {
@@ -290,6 +340,16 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildInvocationDependencyMaterial
 			seenRoots[identity] = true
 			input.objectTree = true
 			materialization.roots = append(materialization.roots, input)
+		}
+	}
+	appendStatusRoot := func(producer string, slot int) {
+		identity := fmt.Sprintf("%s\x00%d", producer, slot)
+		if !seenStatuses[identity] {
+			seenStatuses[identity] = true
+			// A PHONY completion is an execution predecessor. No Make-visible
+			// pathname may be staged for this input in the private work tree.
+			materialization.statusRoots = append(materialization.statusRoots,
+				compactKbuildRuleInput{producer: producer, slot: slot})
 		}
 	}
 
@@ -319,6 +379,54 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildInvocationDependencyMaterial
 		_, materialized := b.selectionGraph.materializedProducers[owner]
 		return materialized, nil
 	}
+	appendPhonyCompletion := func(selection compactKbuildSelectionKey) (bool, error) {
+		selectedProfile, profiled := b.selectionGraph.profile(selection.profile)
+		if !profiled {
+			return false, fmt.Errorf("recursive invocation %q terminal %s has no selected profile", dependency.Profile, compactKbuildSelectionKeyString(selection))
+		}
+		if !b.selectionGraph.compactKbuildProfileTargetIsPhony(selectedProfile, selection.target) {
+			return false, nil
+		}
+		selectedTarget, selected := b.selectionGraph.selection(selection)
+		if !selected {
+			return false, fmt.Errorf("recursive invocation %q PHONY terminal %s has no selected Make target", dependency.Profile, compactKbuildSelectionKeyString(selection))
+		}
+		proved, proofErr := b.metadata.compactKbuildSelectedPhonyFeatureGate(
+			selectedProfile, selection.target, selectedTarget.MakeTarget,
+		)
+		if proofErr != nil {
+			return false, proofErr
+		}
+		if proved {
+			return true, nil
+		}
+		if producer, materialized := b.selectionGraph.materializedProducers[selection]; materialized {
+			node, exists := compactKbuildPlanNode(b.plan, producer)
+			if !exists || !compactKbuildAuthenticatedExecutionCheckCompletion(b.plan, node, selection.target) {
+				return false, fmt.Errorf("recursive invocation %q PHONY terminal %s has no authenticated outputless completion", dependency.Profile, compactKbuildSelectionKeyString(selection))
+			}
+			appendStatusRoot(producer, 0)
+			return true, nil
+		}
+		if CompactKbuildSelectedControlRuleEntrySnapshot(selectedProfile, selection.target) == nil {
+			for _, candidate := range compactKbuildRuleCandidatesForMakeTarget(
+				selectedProfile, selection.target, selectedTarget.MakeTarget,
+			) {
+				if candidate.ruleOrder >= 0 && candidate.ruleOrder < len(selectedProfile.Rules) &&
+					len(selectedProfile.Rules[candidate.ruleOrder].Recipe) != 0 {
+					return false, fmt.Errorf("recursive invocation %q PHONY terminal %s has an executable recipe without a source-selected status", dependency.Profile, compactKbuildSelectionKeyString(selection))
+				}
+			}
+		}
+		status, statusErr := b.metadata.compactKbuildSelectedPhonySourceStatus(selectedProfile, selection.target, selectedTarget.MakeTarget)
+		if statusErr != nil {
+			return false, statusErr
+		}
+		if status != nil {
+			return false, fmt.Errorf("recursive invocation %q PHONY terminal %s has no materialized source status", dependency.Profile, compactKbuildSelectionKeyString(selection))
+		}
+		return true, nil
+	}
 	appendTerminals := func(skipTargets map[string]bool) error {
 		if b == nil || b.selectionGraph == nil {
 			return fmt.Errorf(
@@ -336,6 +444,11 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildInvocationDependencyMaterial
 			)
 		}
 		for _, terminal := range terminals {
+			if handled, statusErr := appendPhonyCompletion(terminal); statusErr != nil {
+				return statusErr
+			} else if handled {
+				continue
+			}
 			skippedProducer := false
 			peerOutputs := map[string]bool{}
 			members := b.selectionGraph.compactKbuildGroupedSelectionMembers(terminal)
@@ -458,6 +571,20 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildInvocationDependencyMaterial
 				profile: dependency.Profile, target: goal,
 			}]
 			if selected {
+				goalProfile, profiled := b.selectionGraph.profile(selection.profile)
+				if !profiled {
+					return compactKbuildInvocationMaterialization{}, fmt.Errorf("recursive invocation %q goal %s has no selected profile", dependency.Profile, compactKbuildSelectionKeyString(selection))
+				}
+				if b.selectionGraph.compactKbuildProfileTargetIsPhony(goalProfile, selection.target) {
+					if _, statusErr := appendPhonyCompletion(selection); statusErr != nil {
+						return compactKbuildInvocationMaterialization{}, statusErr
+					}
+					// The goal's own status is insufficient for replay: Make also
+					// completes its prerequisite recipes, whose ordinary outputs
+					// must be present in the private object tree.
+					unresolvedGoals = append(unresolvedGoals, goal)
+					continue
+				}
 				materialized, err := selectedRootIsMaterialized(selection)
 				if err != nil {
 					return compactKbuildInvocationMaterialization{}, err
@@ -761,7 +888,7 @@ func compactKbuildActionEnvironmentWithResolution(
 // dependencies. In that case the resolved config source is already available
 // and is the authoritative baseline content.
 //
-// Keep this exception local to the six Kconfig-owned projections. Ordinary
+// Keep this exception local to the declared Kconfig-owned projections. Ordinary
 // generated artifacts continue to require exact selection ownership through
 // existingInput.
 func (b *compactKbuildRulePlanBuilder) compactKbuildConfigProjectionBaselineInput(

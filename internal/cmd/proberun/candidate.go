@@ -234,6 +234,20 @@ func resolveProbeCandidatePath(
 		}
 		return empty, nil
 	}
+	// Host package flags come from the declared pkg-config manifest. A prior
+	// probe carries their logical host-dependency paths as text; bind each
+	// validated path operand to this action's own staged host-dependency tree.
+	if relative, marked := strings.CutPrefix(value, "__LINUX_BZL_HOST_DEPS__/"); marked {
+		root := sourceRoots["host_deps"]
+		if root == "" {
+			return "", fmt.Errorf("host dependency candidate path has no declared source root")
+		}
+		canonical, err := toolaction.CanonicalArtifactPath(relative)
+		if err != nil || canonical != relative {
+			return "", fmt.Errorf("host dependency candidate path %q is invalid: %v", value, err)
+		}
+		value = filepath.Join(root, filepath.FromSlash(relative))
+	}
 
 	// Durable compiler-query results use the canonical toolset namespace. Try
 	// that binding before interpreting a relative spelling against the process
@@ -379,6 +393,10 @@ func validateProbeCandidatePathKind(kind kconfig.ProbeCandidatePathKind, filenam
 	case kconfig.ProbeCandidatePathInclude:
 		if !info.IsDir() {
 			return fmt.Errorf("candidate include path %q is not a directory", filename)
+		}
+	case kconfig.ProbeCandidatePathLibraryDir:
+		if !info.IsDir() {
+			return fmt.Errorf("candidate library directory %q is not a directory", filename)
 		}
 	case kconfig.ProbeCandidatePathForcedInclude:
 		if !info.Mode().IsRegular() {

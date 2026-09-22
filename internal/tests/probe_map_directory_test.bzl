@@ -11,6 +11,7 @@ load(
     "linux_test_probe_topological_order",
     "linux_test_render_probe_action_value",
     "linux_test_render_probe_action_values",
+    "linux_test_required_probe_identity_scopes",
     "linux_test_resolve_probe_source_paths",
     "linux_test_select_prior_host_result_paths",
     "linux_test_validate_probe_additional_input_names",
@@ -107,6 +108,16 @@ def _probe_map_directory_test_impl(ctx):
     target_only = linux_test_parse_probe_marker_paths(_target_only_paths())
     asserts.equals(env, [], linux_test_select_prior_host_result_paths("target", target_only, []))
 
+    # Host tools can be selected without a host probe/result predecessor. The
+    # target action must still validate and carry its host toolset identity.
+    mixed_paths = _target_only_paths() + [
+        "toolsets/host/sha256-%s" % ("1" * 64),
+        "nodes/%s/tool/host@cc" % _FINAL,
+    ]
+    mixed = linux_test_parse_probe_marker_paths(mixed_paths)
+    asserts.equals(env, True, "host@cc" in mixed.nodes[_FINAL]["tools"])
+    asserts.equals(env, ["host", "target"], linux_test_required_probe_identity_scopes(mixed, "target"))
+
     params = linux_probe_map_directory_params(
         "target",
         {
@@ -127,6 +138,16 @@ def _probe_map_directory_test_impl(ctx):
     asserts.equals(env, _SENTINEL, params["action_arg_cc_1"])
     asserts.equals(env, "ALPHA=first", params["action_env_cc_0"])
     asserts.equals(env, "ZED=last", params["action_env_cc_1"])
+    host_params = linux_probe_map_directory_params(
+        "target",
+        {"cc": ["target", _SENTINEL]},
+        {"cc": {}},
+        host_action_args = {"cc": ["host", _SENTINEL]},
+        host_action_environments = {"cc": {"HOST_TOOL_ENV": "host-value"}},
+    )
+    asserts.equals(env, "target", host_params["action_arg_cc_0"])
+    asserts.equals(env, "host", host_params["action_arg_host@cc_0"])
+    asserts.equals(env, "HOST_TOOL_ENV=host-value", host_params["action_env_host@cc_0"])
     bootstrap_params = linux_probe_map_directory_params("host", {}, {})
     asserts.equals(env, "", bootstrap_params["source_prefix"])
     asserts.equals(env, "", bootstrap_params["rust_source_root"])
@@ -139,6 +160,11 @@ def _probe_map_directory_test_impl(ctx):
         "exact-toolchain-closure",
         "exact-toolset-manifest",
         {"root-00000000": "exact-toolset-anchor"},
+        host_tool_files = {"cc": "exact-host-cc"},
+        host_toolchain_files = "exact-host-closure",
+        host_toolset_manifest = "exact-host-manifest",
+        host_toolset_anchors = {"host-root-00000000": "exact-host-anchor"},
+        host_companion_tools = {"cc": ["exact-host-companion"]},
     )
     asserts.equals(env, "exact-runner", tools["probe_runner"])
     asserts.equals(env, "exact-toolchain-closure", tools["toolchain_files"])
@@ -146,6 +172,11 @@ def _probe_map_directory_test_impl(ctx):
     asserts.equals(env, "exact-toolset-anchor", tools["toolset_anchor_root-00000000"])
     asserts.equals(env, "exact-cc", tools["probe_role_cc"])
     asserts.equals(env, "exact-ld", tools["probe_role_ld"])
+    asserts.equals(env, "exact-host-cc", tools["probe_role_host@cc"])
+    asserts.equals(env, "exact-host-closure", tools["host_toolchain_files"])
+    asserts.equals(env, "exact-host-manifest", tools["host_toolset_manifest"])
+    asserts.equals(env, "exact-host-anchor", tools["host_toolset_anchor_host-root-00000000"])
+    asserts.equals(env, "exact-host-companion", tools["companion_tool_host@cc_00000000"])
 
     indexed = linux_test_index_probe_source_paths(
         [
@@ -404,6 +435,8 @@ def _invalid_probe_plan_impl(ctx):
         paths.append("nodes/%s/in/00000001/%s" % (_FINAL, _TARGET))
     elif ctx.attr.case == "host_depends_target":
         paths.append("nodes/%s/in/00000000/%s" % (_HOST, _TARGET))
+    elif ctx.attr.case == "host_binds_target":
+        paths.append("nodes/%s/tool/target@cc" % _HOST)
     elif ctx.attr.case == "cycle":
         paths.append("nodes/%s/in/00000001/%s" % (_TARGET, _FINAL))
     elif ctx.attr.case == "unknown_request":
@@ -461,6 +494,7 @@ def probe_map_directory_validation_test(name):
     cases = {
         "cycle": "contains a dependency cycle",
         "host_depends_target": "depends on target node",
+        "host_binds_target": "host Linux probe cannot bind target tool",
         "malformed_source_marker": "has invalid source marker",
         "missing_source": "requests unavailable source",
         "ambiguous_source": "is provided by distinct artifacts",

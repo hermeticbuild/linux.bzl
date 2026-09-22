@@ -139,6 +139,96 @@ func TestSourceScriptObjectTreeObservationIgnoresUnrelatedScript(t *testing.T) {
 	}
 }
 
+func TestSourceScriptObjectTreeObservationReadsSelectedMkcompileVersion(t *testing.T) {
+	const mkcompile = `#!/bin/sh
+TARGET=$1
+if [ -z "$KBUILD_BUILD_VERSION" ]; then
+	VERSION=$(cat .version 2>/dev/null || echo 1)
+else
+	VERSION=$KBUILD_BUILD_VERSION
+fi
+printf '%s\\n' "$VERSION" > "$TARGET"
+`
+	profile := compactKbuildObjectTreeScriptProfileForTest(t, map[string]string{
+		"scripts/mkcompile_h": mkcompile,
+	})
+	command := `sh ${tree:kernel}/scripts/mkcompile_h include/generated/compile.h`
+	want := []string{".version"}
+	if got := compactKbuildObjectTreeObservationForTest(t, profile, command); !got.ObservesObjectTree ||
+		got.ObservesAll || !reflect.DeepEqual(got.References, want) {
+		t.Fatalf("selected mkcompile_h observation = %#v, want %q", got, want)
+	}
+	// The lexical obj= directory is not the child Make process's cwd. A
+	// recursive Makefile.build obj=init still reads the root .version.
+	profile.Directory = "init"
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := compactKbuildObjectTreeObservationForTest(t, profile, command); !reflect.DeepEqual(got.References, want) {
+		t.Fatalf("recursive init invocation observed %#v, want root .version", got)
+	}
+	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
+		Tree: CompactKbuildInvocationObjectTree, Directory: "other",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := compactKbuildObjectTreeObservationForTest(t, profile, command); !reflect.DeepEqual(got.References, []string{"other/.version"}) {
+		t.Fatalf("nested invocation observed %#v, want other/.version", got)
+	}
+	for _, version := range []string{"1", "custom-build"} {
+		got := compactKbuildObjectTreeObservationForTest(
+			t, profile, `KBUILD_BUILD_VERSION=`+version+` `+command,
+		)
+		if got.ObservesObjectTree || got.ObservesAll || len(got.References) != 0 {
+			t.Errorf("version %q observation = %#v, want no .version read", version, got)
+		}
+	}
+	if got := compactKbuildObjectTreeObservationForTest(t, profile,
+		`KBUILD_BUILD_VERSION= `+command); !reflect.DeepEqual(got.References, []string{"other/.version"}) {
+		t.Fatalf("empty version observation = %#v, want relative object read", got)
+	}
+}
+
+func TestSourceScriptObjectTreeObservationRejectsChangedMkcompileVersion(t *testing.T) {
+	const block = `#!/bin/sh
+if [ -z "$KBUILD_BUILD_VERSION" ]; then
+	VERSION=$(cat .version 2>/dev/null || echo 1)
+else
+	VERSION=$KBUILD_BUILD_VERSION
+fi
+`
+	for _, tc := range []struct {
+		name, content string
+		wantRead      bool
+		wantError     bool
+	}{
+		{name: "canonical", content: block, wantRead: true},
+		{name: "alternate source read", content: strings.Replace(block, "cat .version", "cat .version.new", 1), wantError: true},
+		{name: "changed conditional", content: strings.Replace(block, `-z "$KBUILD_BUILD_VERSION"`, `-n "$KBUILD_BUILD_VERSION"`, 1), wantError: true},
+		{name: "additional read", content: block + "cat .version\n", wantError: true},
+		{name: "comment only", content: "#!/bin/sh\n# cat .version\n", wantRead: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			profile := compactKbuildObjectTreeScriptProfileForTest(t, map[string]string{
+				"scripts/mkcompile_h": tc.content,
+			})
+			observed, err := EvaluateCompactKbuildSourceScriptObjectTreeObservationSymbolic(
+				profile, "include/generated/compile.h", "", nil, nil,
+				map[string]string{"objtree": "__LINUX_BZL_OBJECT_TREE__", "srctree": "__LINUX_BZL_SOURCE_TREE__"},
+				`sh ${tree:kernel}/scripts/mkcompile_h include/generated/compile.h`,
+			)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("observation error = %v, want error %t (result %#v)", err, tc.wantError, observed)
+			}
+			if err == nil && observed.ObservesObjectTree != tc.wantRead {
+				t.Fatalf("observation = %#v, want read %t", observed, tc.wantRead)
+			}
+		})
+	}
+}
+
 func TestSourceScriptObjectTreeObservationIgnoresNonScriptRecipeSyntax(t *testing.T) {
 	profile := compactKbuildObjectTreeScriptProfileForTest(t, nil)
 	for _, command := range []string{
@@ -373,6 +463,217 @@ func TestObjectTreeObservationIgnoresPassivePrefixMapsButKeepsReadOperands(t *te
 	}
 }
 
+func TestObjectTreeObservationDistinguishesCompilerOutputFromLaterRead(t *testing.T) {
+	const output = "tools/objtool/fixdep"
+	const input = "tools/objtool/fixdep-in.o"
+	compiler := KbuildActionRoleToken("host", "cc")
+	for _, tc := range []struct {
+		name, flags, suffix string
+		want                []string
+	}{
+		{name: "separated output", flags: "-o ${tree:prep}/" + output, want: []string{input}},
+		{name: "joined output", flags: "-o${tree:prep}/" + output, want: []string{input}},
+		{name: "later command reads output", flags: "-o ${tree:prep}/" + output, suffix: "; cat ${tree:prep}/" + output, want: []string{output, input}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observation := ObserveCompactKbuildObjectTree(
+				compiler + " -r " + tc.flags + " ${tree:prep}/" + input + tc.suffix,
+			)
+			if !observation.ObservesObjectTree || observation.ObservesAll || !reflect.DeepEqual(observation.References, tc.want) {
+				t.Fatalf("compiler output/read observation = %#v, want exact reads %q", observation, tc.want)
+			}
+		})
+	}
+	opaque := ObserveCompactKbuildObjectTree("opaque-tool -o ${tree:prep} input.o")
+	if !opaque.ObservesObjectTree || !opaque.ObservesAll {
+		t.Fatalf("unconfigured tool output observation = %#v, want conservative all-visible", opaque)
+	}
+}
+
+func TestObjectTreeObservationKeepsHostLinkerInputsWithoutReadingItsOutput(t *testing.T) {
+	const output = "tools/objtool/fixdep-in.o"
+	const input = "tools/objtool/fixdep.o"
+	linker := KbuildActionRoleToken("host", "ld")
+	for _, tc := range []struct {
+		name, suffix string
+		want         []string
+	}{
+		{name: "source quiet link and selected host linker", want: []string{input}},
+		{name: "later source command reads linker output", suffix: "; cat ${tree:prep}/" + output, want: []string{output, input}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			command := "echo '  LINK     '${tree:prep}/" + output + "; " + linker +
+				" -r -o ${tree:prep}/" + output + " ${tree:prep}/" + input + tc.suffix
+			observation := ObserveCompactKbuildObjectTree(command)
+			if !observation.ObservesObjectTree || observation.ObservesAll || !reflect.DeepEqual(observation.References, tc.want) {
+				t.Fatalf("source host-link output/read observation = %#v, want exact inputs %q", observation, tc.want)
+			}
+		})
+	}
+	for _, argument := range []string{linker, KbuildActionRoleToken("host", "cc")} {
+		foreign := ObserveCompactKbuildObjectTree("selected-source-script -r -o ${tree:prep}/" + output + " " + argument)
+		if !foreign.ObservesObjectTree || foreign.ObservesAll || !reflect.DeepEqual(foreign.References, []string{output}) {
+			t.Fatalf("role token %q supplied as an argument to unconfigured tool = %#v, want exact destination read", argument, foreign)
+		}
+	}
+}
+
+func TestSelectedPlainLinkerOutputIsNotAnObjectTreeRead(t *testing.T) {
+	const output = "tools/objtool/fixdep-in.o"
+	const input = "tools/objtool/fixdep.o"
+	profile := mustCompactKbuildProfileForTest(t, "build:fixdep", "tools/build/Makefile.build", "", `
+$(OUTPUT)fixdep-in.o: $(OUTPUT)fixdep.o FORCE
+	$(call if_changed,host_ld_multi)
+`, nil)
+	profile.evaluator.template.actionRoles = []KbuildActionRoleRef{
+		{Scope: "host", Role: "ld"}, {Scope: "target", Role: "ld"},
+	}
+	unconfigured := mustCompactKbuildProfileForTest(t, "build:unconfigured", "tools/build/Makefile.build", "", `
+$(OUTPUT)fixdep-in.o: $(OUTPUT)fixdep.o FORCE
+	$(call if_changed,host_ld_multi)
+`, nil)
+	targetOnly := mustCompactKbuildProfileForTest(t, "build:target-only", "tools/build/Makefile.build", "", `
+$(OUTPUT)fixdep-in.o: $(OUTPUT)fixdep.o FORCE
+	$(call if_changed,host_ld_multi)
+`, nil)
+	targetOnly.evaluator.template.actionRoles = []KbuildActionRoleRef{{Scope: "target", Role: "ld"}}
+	link := "ld -r -o __LINUX_BZL_OBJECT_TREE__/" + output + " __LINUX_BZL_OBJECT_TREE__/" + input
+	prepLink := "ld -r -o ${tree:prep}/" + output + " ${tree:prep}/" + input
+	for _, tc := range []struct {
+		name       string
+		command    string
+		configured bool
+		targetOnly bool
+		want       []string
+	}{
+		{name: "selected literal host linker", command: link, configured: true, want: []string{input}},
+		{name: "source if_changed wrapper", command: "@set -e; echo '  HOSTLD   __LINUX_BZL_OBJECT_TREE__/" + output + "'; " +
+			link + "; printf '%s\\n' 'cmd_" + output + " := " + link + "' > __LINUX_BZL_OBJECT_TREE__/tools/objtool/.fixdep-in.o.cmd", configured: true, want: []string{input}},
+		{name: "selected prep-root linker wrapper", command: "@set -e; " + prepLink +
+			"; printf '%s\\n' 'cmd_${tree:prep}/" + output + " := " + prepLink +
+			"' > ${tree:prep}/tools/objtool/.fixdep-in.o.cmd", configured: true, want: []string{input}},
+		{name: "unconfigured literal program", command: link, want: []string{output, input}},
+		{name: "linker configured in only one scope", command: link, targetOnly: true, want: []string{output, input}},
+		{name: "unknown output flag program", command: "unknown -r -o __LINUX_BZL_OBJECT_TREE__/" + output + " __LINUX_BZL_OBJECT_TREE__/" + input, configured: true, want: []string{output, input}},
+		{name: "later source read", command: link + "; cat __LINUX_BZL_OBJECT_TREE__/" + output, configured: true, want: []string{output, input}},
+		{name: "source PATH assignment", command: "PATH=/source/bin " + link, configured: true, want: []string{output, input}},
+		{name: "source PATH removal", command: "unset PATH; " + link, configured: true, want: []string{output, input}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selected := profile
+			if tc.targetOnly {
+				selected = targetOnly
+			} else if !tc.configured {
+				selected = unconfigured
+			}
+			observation := ObserveCompactKbuildSelectedRecipeObjectTree(selected, output, tc.command, tc.command)
+			if observation.ObservesAll || !slices.Equal(observation.References, tc.want) {
+				t.Fatalf("source-selected %q object-tree observation = %#v, want exact reads %q", tc.command, observation, tc.want)
+			}
+		})
+	}
+}
+
+func TestObjectTreeObservationKeepsCompilerDependencyMetadataOutOfReadFrontier(t *testing.T) {
+	const output = "tools/objtool/fixdep.o"
+	const header = "include/generated/autoconf.h"
+	compiler := KbuildActionRoleToken("host", "cc")
+	command := compiler + " -Wp,-MD,${tree:prep}/tools/objtool/.fixdep.o.d" +
+		" -Wp,-MT,${tree:prep}/" + output +
+		" -include ${tree:prep}/" + header +
+		" -c -o ${tree:prep}/" + output + " fixdep.c"
+	observation := ObserveCompactKbuildObjectTree(command)
+	if !observation.ObservesObjectTree || observation.ObservesAll || !reflect.DeepEqual(observation.References, []string{header}) {
+		t.Fatalf("compiler dependency metadata observation = %#v, want only forced header %q", observation, header)
+	}
+	for _, targetFlag := range []string{"-MT", "-MQ"} {
+		separated := ObserveCompactKbuildObjectTree(
+			compiler + " " + targetFlag + " ${tree:prep}/" + output +
+				" -include ${tree:prep}/" + header + " -o ${tree:prep}/" + output,
+		)
+		if !separated.ObservesObjectTree || separated.ObservesAll || !reflect.DeepEqual(separated.References, []string{header}) {
+			t.Fatalf("split %s dependency target observation = %#v, want only forced header %q", targetFlag, separated, header)
+		}
+	}
+	unconfigured := ObserveCompactKbuildObjectTree("unknown-tool -Wp,-MT,${tree:prep}/" + output)
+	if !unconfigured.ObservesObjectTree || unconfigured.ObservesAll || !reflect.DeepEqual(unconfigured.References, []string{output}) {
+		t.Fatalf("unconfigured dependency option = %#v, want conservative filename observation", unconfigured)
+	}
+}
+
+func TestObjectTreeObservationDoesNotExecutePrintedCompilerCommand(t *testing.T) {
+	const output = "tools/objtool/fixdep.o"
+	const header = "include/generated/autoconf.h"
+	compiler := KbuildActionRoleToken("host", "cc")
+	metadata := "${tree:prep}/tools/objtool/.fixdep.o.cmd"
+	command := "printf '%s\\n' 'cmd_${tree:prep}/" + output + " := " + compiler +
+		" -include ${tree:prep}/" + header + " -o ${tree:prep}/" + output + "' >> " + metadata
+	observation := ObserveCompactKbuildObjectTree(command)
+	if !observation.ObservesObjectTree || observation.ObservesAll || !reflect.DeepEqual(observation.References, []string{"tools/objtool/.fixdep.o.cmd"}) {
+		t.Fatalf("printed compiler command observation = %#v, want only prior appended metadata", observation)
+	}
+	active := ObserveCompactKbuildObjectTree("selected-source-tool '" + compiler +
+		" -include ${tree:prep}/" + header + " -o ${tree:prep}/" + output + "'")
+	if !active.ObservesObjectTree || active.ObservesAll && len(active.References) == 0 ||
+		!active.ObservesAll && !reflect.DeepEqual(active.References, []string{header}) {
+		t.Fatalf("serialized compiler passed to source tool observation = %#v, want authenticated forced header", active)
+	}
+}
+
+func TestObjectTreeObservationRetainsPrintedPathsSentToArchivePipeline(t *testing.T) {
+	const input = "generated/input.o"
+	standalone := ObserveCompactKbuildObjectTree("printf '%s ' ${tree:prep}/" + input)
+	if standalone.ObservesObjectTree || standalone.ObservesAll {
+		t.Fatalf("standalone printf observation = %#v, want no file read", standalone)
+	}
+	pipeline := ObserveCompactKbuildObjectTree(
+		"printf '%s ' ${tree:prep}/" + input +
+			" | xargs ar cDPrST ${tree:prep}/generated/archive.a",
+	)
+	if !pipeline.ObservesObjectTree || !slices.Contains(pipeline.References, input) {
+		t.Fatalf("archive pipeline observation = %#v, want printed source input %q retained", pipeline, input)
+	}
+}
+
+func TestObjectTreeObservationSeparatesDisplayAndRedirectFromReads(t *testing.T) {
+	const output = "tools/objtool/fixdep"
+	rooted := "${tree:prep}/" + output
+	for _, tc := range []struct {
+		name, command string
+		want          []string
+		passive       bool
+	}{
+		{name: "echo operand", command: "echo " + rooted, passive: true},
+		{name: "printf operand", command: "printf '%s\\n' " + rooted, passive: true},
+		{name: "single quoted glob printed literally", command: "echo '" + rooted + "*'", passive: true},
+		{name: "escaped glob printed literally", command: "echo " + rooted + "\\*", passive: true},
+		{name: "source quoted concatenation", command: "echo '  LINK     '" + rooted, passive: true},
+		{name: "stdout redirection", command: "echo data > " + rooted, passive: true},
+		{name: "stdin redirection", command: "cat < " + rooted, want: []string{output}},
+		{name: "subsequent cat", command: "echo " + rooted + "; cat " + rooted, want: []string{output}},
+		{name: "active shell substitution", command: "echo \"$(cat " + rooted + ")\"", want: []string{output}},
+		{name: "active glob star", command: "echo " + rooted + "*"},
+		{name: "active glob question", command: "echo " + rooted + "?"},
+		{name: "active glob class", command: "echo " + rooted + "[io]"},
+		{name: "configured source tool named echo", command: "__LINUX_BZL_SOURCE_TREE__/tools/echo " + rooted, want: []string{output}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observation := ObserveCompactKbuildObjectTree(tc.command)
+			if tc.passive {
+				if observation.ObservesObjectTree || observation.ObservesAll || len(observation.References) != 0 {
+					t.Fatalf("passive display/write observation = %#v, want no object-tree read", observation)
+				}
+				return
+			}
+			if !observation.ObservesObjectTree ||
+				(strings.HasPrefix(tc.name, "active glob") && !observation.ObservesAll) ||
+				(!observation.ObservesAll && !reflect.DeepEqual(observation.References, tc.want)) {
+				t.Fatalf("active or source-owned command observation = %#v, want read %q or all-visible", observation, tc.want)
+			}
+		})
+	}
+}
+
 func TestObjectTreeObservationSanitizesSerializedCompilerCommands(t *testing.T) {
 	compiler := KbuildActionRoleToken("host", "cc")
 	value := compiler +
@@ -396,10 +697,10 @@ func TestObjectTreeObservationSanitizesSerializedCompilerCommands(t *testing.T) 
 
 func TestObjectTreeObservationKeepsOpaqueSerializedRootConservative(t *testing.T) {
 	observation := ObserveCompactKbuildObjectTree(
-		`printf '%s\n' 'opaque-tool -I ${tree:prep}' > saved-command`,
+		`opaque-tool -I ${tree:prep}`,
 	)
 	if !observation.ObservesObjectTree || !observation.ObservesAll || len(observation.References) != 0 {
-		t.Fatalf("opaque serialized observation = %#v, want all object-tree paths", observation)
+		t.Fatalf("active opaque tool observation = %#v, want all object-tree paths", observation)
 	}
 }
 

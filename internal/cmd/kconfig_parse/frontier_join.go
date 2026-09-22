@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -19,6 +20,8 @@ func sameFrontierOrigin(left, right *kbuildRecursiveMakeFrontier) bool {
 
 func sameFrontierValue(left, right kbuildFrontierValue) bool {
 	return left.artifact == right.artifact && left.exact == right.exact &&
+		left.pendingSourceOutput == right.pendingSourceOutput &&
+		slices.Equal(left.sourceOutputRequestIDs, right.sourceOutputRequestIDs) &&
 		(!left.exact || left.content == right.content)
 }
 

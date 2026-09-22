@@ -255,6 +255,62 @@ func TestActionPlanFamilyExecutionCutActivatesApplicableValidation(t *testing.T)
 	}
 }
 
+func TestActionPlanFamilyExecutionCutRetainsIndependentSourceCheckInFinalImage(t *testing.T) {
+	snapshot := familyTestSourceCheckSnapshot(t)
+	family := executionCutFamilyForTest(t, snapshot)
+	checkID := family.originalNodeIDs["variant-00000000"][snapshot.ExecutionCheckRoots[0]]
+	if checkID == "" || !slices.Contains(family.Validations, ActionPlanFamilyValidation{
+		Variant: "variant-00000000", NodeID: checkID, Slot: 0,
+	}) {
+		t.Fatal("selected source check was not demanded by the final variant")
+	}
+	roots := executionCutRootsForTest(family, "arch/x86/boot/bzImage")
+	if len(roots) != 1 {
+		t.Fatalf("image fixture has %d ordinary generator roots, want one", len(roots))
+	}
+	cut, err := NewActionPlanFamilyExecutionCut(family, roots)
+	if err != nil {
+		t.Fatalf("ordinary generator cut rejected a private source-check validation: %v", err)
+	}
+	if slices.Contains(cut.NodeIDs(), checkID) || len(cut.contract.Validations) != 0 {
+		t.Fatalf("independent source check was pulled into early generator cut: nodes=%q validations=%#v", cut.NodeIDs(), cut.contract.Validations)
+	}
+	if _, err := cut.Verify(family); err != nil {
+		t.Fatalf("late source-check validation changed ordinary cut proof: %v", err)
+	}
+}
+
+func TestActionPlanFamilyExecutionCutRetainsIndependentMakePhonyCompletionInFinalImage(t *testing.T) {
+	snapshot := makePhonyCompletionSnapshotForTest(t, "rm -f .tmp_quiet_recordmcount", 1)
+	family := executionCutFamilyForTest(t, snapshot)
+	checkID := family.originalNodeIDs["variant-00000000"][snapshot.ExecutionCheckRoots[0]]
+	if checkID == "" || !slices.Contains(family.Validations, ActionPlanFamilyValidation{
+		Variant: "variant-00000000", NodeID: checkID, Slot: 0,
+	}) {
+		t.Fatal("selected Make PHONY completion was not demanded by the final variant")
+	}
+	for _, test := range []struct {
+		name  string
+		roots []ActionPlanFamilyExecutionCutRoot
+	}{
+		{name: "empty early cut"},
+		{name: "independent image cut", roots: executionCutRootsForTest(family, "arch/x86/boot/bzImage")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cut, err := NewActionPlanFamilyExecutionCut(family, test.roots)
+			if err != nil {
+				t.Fatalf("ordinary cut rejected a source-selected Make PHONY completion: %v", err)
+			}
+			if slices.Contains(cut.NodeIDs(), checkID) || len(cut.contract.Validations) != 0 {
+				t.Fatalf("independent Make completion was pulled into early cut: nodes=%q validations=%#v", cut.NodeIDs(), cut.contract.Validations)
+			}
+			if _, err := cut.Verify(family); err != nil {
+				t.Fatalf("late Make completion changed ordinary cut proof: %v", err)
+			}
+		})
+	}
+}
+
 func TestActionPlanFamilyExecutionCutRejectsChangedContracts(t *testing.T) {
 	snapshot := executionCutOpaqueSnapshotForTest(familyTestInputSetSnapshot(t, 1))
 	makeFamily := func() *ActionPlanFamily { return executionCutFamilyForTest(t, snapshot) }

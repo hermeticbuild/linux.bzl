@@ -639,15 +639,12 @@ result: input.txt FORCE
 	if len(effects.ActionRoles) != 0 {
 		t.Fatalf("selected consumer refs = %#v, want no deferred-query roles", effects.ActionRoles)
 	}
-	evaluation, err := EvaluateSelectedKbuildControlEffects(profile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := len(evaluation.Queries), 1; got != want {
-		t.Fatalf("deferred queries = %#v, want %d", evaluation.Queries, want)
+	queries := effects.DeferredContentQueries
+	if got, want := len(queries), 1; got != want {
+		t.Fatalf("deferred queries = %#v, want %d", queries, want)
 	}
 	want := []KbuildActionRoleRef{{Scope: "target", Role: "awk"}}
-	if got := evaluation.Queries[0].ActionRoles; !reflect.DeepEqual(got, want) {
+	if got := queries[0].ActionRoles; !reflect.DeepEqual(got, want) {
 		t.Fatalf("deferred-query refs = %#v, want %#v", got, want)
 	}
 }
@@ -849,6 +846,45 @@ result: scripts/selected.sh FORCE
 			}
 			if !reflect.DeepEqual(effects.ActionRoles, test.want) {
 				t.Fatalf("source-script action refs = %#v, want %#v", effects.ActionRoles, test.want)
+			}
+		})
+	}
+}
+
+func TestEvaluateCompactKbuildSelectedTargetEffectsJoinsInjectedSourceRoots(t *testing.T) {
+	const directory = "arch/x86/kernel/cpu"
+	const target = directory + "/capflags.c"
+	for _, test := range []struct {
+		name, script string
+		invalid      bool
+	}{
+		{name: "source root and source directory", script: "$(srctree)/$(src)/mkcapflags.sh"},
+		{name: "object root cannot claim source script", script: "$(objtree)/$(src)/mkcapflags.sh", invalid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile := mustCompactKbuildProfileForTest(t, "build:cpu", directory+"/Makefile", directory, `
+CONFIG_SHELL := sh
+src := $(obj)
+cmd_mkcapflags = $(CONFIG_SHELL) `+test.script+` $@ $^
+$(obj)/capflags.c: $(src)/mkcapflags.sh FORCE
+	$(call if_changed,mkcapflags)
+`, map[string]string{"obj": directory, "srctree": "__LINUX_BZL_SOURCE_TREE__", "objtree": "__LINUX_BZL_OBJECT_TREE__"})
+			profile = compactKbuildProfileWithSourcesForTest(t, profile, directory+"/mkcapflags.sh")
+			effects, selected, err := EvaluateCompactKbuildSelectedTargetEffects(profile, target)
+			if test.invalid {
+				if err != nil || selected {
+					t.Fatalf("object-rooted script selected: effects=%#v, selected=%t, error=%v", effects, selected, err)
+				}
+				_, matched, classifyErr := compactKbuildSourceScriptCommand(profile,
+					compactKbuildRecipeCommand{program: "sh", arguments: []string{"${tree:prep}/" + directory + "/mkcapflags.sh"}},
+					map[string]string{"CONFIG_SHELL": "sh"}, "target", nil)
+				if !matched || classifyErr == nil || !strings.Contains(classifyErr.Error(), "not a declared source file") {
+					t.Fatalf("object-rooted script classifier = matched %t, error %v; want rejection", matched, classifyErr)
+				}
+				return
+			}
+			if err != nil || !selected {
+				t.Fatalf("selected source-root join = selected %t, error %v", selected, err)
 			}
 		})
 	}
