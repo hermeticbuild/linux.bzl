@@ -2924,57 +2924,47 @@ func normalizeResolvedConfigValues(
 	if resolved == nil || normalize == nil {
 		return nil
 	}
-	normalizeMap := func(kind string, values map[string]string) (map[string]string, error) {
-		if values == nil {
-			return nil, nil
-		}
-		out := maps.Clone(values)
-		keys := make([]string, 0, len(values))
-		for key := range values {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			value := values[key]
-			quoteNormalized := false
-			if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
-				body := value[1 : len(value)-1]
-				if strings.ContainsAny(body, "\x07\x08") {
-					// Reserved provenance bytes are never ordinary Kconfig string
-					// data. Strip only the outer quotes so the capability parser
-					// can validate them without treating the closing quote as a
-					// path suffix.
-					value = body
-					quoteNormalized = true
-				} else if unquoted, decodeErr := strconv.Unquote(value); decodeErr == nil && strings.Contains(unquoted, toolaction.ExecutionRootProvenanceMarker) {
-					// configScalarValue uses strconv.Quote, which renders the two
-					// reserved delimiters as \a and \b. Decode that generated
-					// representation only when it actually contains provenance.
-					// All ordinary quoted values—including Linux-accepted escape
-					// spellings which are not Go literals—remain byte-for-byte
-					// untouched below.
-					value = unquoted
-					quoteNormalized = true
-				}
-			}
-			value, err := normalize(value)
-			if err != nil {
-				return nil, fmt.Errorf("normalize %s Kconfig value %s: %w", kind, key, err)
-			}
-			if quoteNormalized {
-				value = strconv.Quote(value)
-			}
-			out[key] = value
-		}
-		return out, nil
+	values := resolved.Effective
+	out := maps.Clone(values)
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
 	}
-	var err error
-	resolved.Raw, err = normalizeMap("raw", resolved.Raw)
-	if err != nil {
-		return err
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := values[key]
+		quoteNormalized := false
+		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+			body := value[1 : len(value)-1]
+			if strings.ContainsAny(body, "\x07\x08") {
+				// Reserved provenance bytes are never ordinary Kconfig string
+				// data. Strip only the outer quotes so the capability parser
+				// can validate them without treating the closing quote as a
+				// path suffix.
+				value = body
+				quoteNormalized = true
+			} else if unquoted, decodeErr := strconv.Unquote(value); decodeErr == nil && strings.Contains(unquoted, toolaction.ExecutionRootProvenanceMarker) {
+				// Normalized provenance uses strconv.Quote, rendering the
+				// reserved delimiters as \a and \b. Decode that representation
+				// only when it actually contains provenance.
+				// All ordinary quoted values—including Linux-accepted escape
+				// spellings which are not Go literals—remain byte-for-byte
+				// untouched below.
+				value = unquoted
+				quoteNormalized = true
+			}
+		}
+		value, err := normalize(value)
+		if err != nil {
+			return fmt.Errorf("normalize Kconfig value %s: %w", key, err)
+		}
+		if quoteNormalized {
+			value = strconv.Quote(value)
+		}
+		out[key] = value
 	}
-	resolved.Effective, err = normalizeMap("effective", resolved.Effective)
-	return err
+	resolved.Effective = out
+	return nil
 }
 
 func cloneResolvedConfig(resolved *kconfig.ResolvedConfig) *kconfig.ResolvedConfig {
@@ -2982,9 +2972,7 @@ func cloneResolvedConfig(resolved *kconfig.ResolvedConfig) *kconfig.ResolvedConf
 		return nil
 	}
 	return &kconfig.ResolvedConfig{
-		Raw:       maps.Clone(resolved.Raw),
 		Effective: maps.Clone(resolved.Effective),
-		Written:   maps.Clone(resolved.Written),
 	}
 }
 
@@ -3111,7 +3099,7 @@ func compactMetadata(
 	if err != nil {
 		return nil, nil, err
 	}
-	metadata, err := tree.CompactMetadataForResolvedConfigWithOptions(metadataResolved, opts, func(resolved *kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
+	metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(metadataResolved, opts, func(resolved *kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
 		kbuildVars := maps.Clone(vars)
 		for name, value := range linuxRootMakeInvocationVariables(rootDir) {
 			if _, configured := kbuildVars[name]; !configured {

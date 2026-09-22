@@ -133,7 +133,6 @@ go_library(
         "source_shell_query.go",
         "terminal_action_plan.go",
         "token.go",
-        "tristate.go",
         "types.go",
         "util.go",
     ],

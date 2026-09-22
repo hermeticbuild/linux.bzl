@@ -102,15 +102,6 @@ config NUMBER
 	if !maps.Equal(resolved.Effective, want) {
 		t.Fatalf("native values = %#v, want %#v", resolved.Effective, want)
 	}
-	for key := range want {
-		written := key != "CONFIG_DEFAULT_ON" && key != "CONFIG_HIDDEN"
-		if resolved.ShouldWrite(key) != written {
-			t.Errorf("ShouldWrite(%s) = %t, want %t", key, resolved.ShouldWrite(key), written)
-		}
-	}
-	if _, present := resolved.Raw["CONFIG_HIDDEN"]; present {
-		t.Fatal("symbol inventory changed native assignments")
-	}
 	if projection.files[".config"] != config {
 		t.Fatal("import changed native configuration bytes")
 	}

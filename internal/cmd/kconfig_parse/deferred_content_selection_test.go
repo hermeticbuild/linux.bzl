@@ -140,11 +140,7 @@ $(objprefix)/vmlinux.bin: input.bin FORCE
 		t.Fatalf("solver query and selected recipe disagree: selected %t, query count %d, want token %q", actionSelected, len(effects.DeferredContentQueries), queries[0].Token)
 	}
 
-	tree, err := kconfig.Parse(t.Context(), strings.NewReader("config TEST\n\tbool\n"), "Kconfig", kconfig.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	metadata, err := tree.CompactMetadataWithOptions(nil, kconfig.ResolveConfigOptions{},
+	metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(&kconfig.ResolvedConfig{Effective: map[string]string{"CONFIG_TEST": "n"}},
 		kconfig.CompactMetadataOptions{
 			SelectedProductsOnly: true, // This fixture has no root vmlinux product facade.
 			ActionRoles: []kconfig.KbuildActionRoleRef{

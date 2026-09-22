@@ -94,10 +94,10 @@ func projectSelectedKbuildOutput(filename string, trees map[string]string, outpu
 // selects its bootstrap ancestors (including fixdep) and compiler environment.
 // Keep the executable's dependency closure, before the command that invokes it.
 func nativeKconfigToolMetadata(opts linuxKbuildProbeOptions, scopes *kconfig.KbuildProbeScopes, sourceRoot string) (*kconfig.CompactMetadata, *kconfig.ResolvedConfig, error) {
-	resolved := &kconfig.ResolvedConfig{Effective: map[string]string{}, Written: map[string]bool{}}
+	resolved := &kconfig.ResolvedConfig{Effective: map[string]string{}}
 	metadataOptions := linuxCompactMetadataOptions(opts.variables, opts.sourceNamespaces, sourceRoot, true, opts.targetContract, opts.hostContract)
 	metadataOptions.PreconfiguredObjectTree = true
-	metadata, err := opts.tree.CompactMetadataForResolvedConfigWithOptions(resolved, metadataOptions, func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
+	metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(resolved, metadataOptions, func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
 		variables := maps.Clone(opts.variables)
 		for name, value := range linuxRootMakeInvocationVariables(sourceRoot) {
 			if _, configured := variables[name]; !configured {
@@ -226,10 +226,7 @@ func (p *nativeConfigProjection) resolved(tree *kconfig.Tree) (*kconfig.Resolved
 		return nil, fmt.Errorf("parse native .config: %w", err)
 	}
 	resolved := &kconfig.ResolvedConfig{
-		Raw: maps.Clone(native), Effective: native, Written: map[string]bool{},
-	}
-	for key, value := range native {
-		resolved.Written[key] = value != "n"
+		Effective: native,
 	}
 	// Prefix-based generator dependencies must also include currently absent
 	// symbols, so another variant cannot widen their dependency contract.

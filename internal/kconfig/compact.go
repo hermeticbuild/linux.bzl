@@ -843,30 +843,10 @@ func normalizeActionRoles(roles []KbuildActionRoleRef) ([]KbuildActionRoleRef, e
 	return out, nil
 }
 
-// CompactMetadataWithOptions resolves one configuration and the exact
-// source-derived Kbuild selections consumed by action lowering.
-func (t *Tree) CompactMetadataWithOptions(
-	flags map[string]string,
-	resolveOpts ResolveConfigOptions,
-	opts CompactMetadataOptions,
-	graphForConfig func(*ResolvedConfig) (CompactConfigGraph, error),
-) (*CompactMetadata, error) {
-	if graphForConfig == nil {
-		return nil, fmt.Errorf("action-plan config graph resolver must not be nil")
-	}
-	resolved, err := t.ResolveConfigWithOptions(flags, resolveOpts)
-	if err != nil {
-		return nil, err
-	}
-	return t.CompactMetadataForResolvedConfigWithOptions(resolved, opts, graphForConfig)
-}
-
-// CompactMetadataForResolvedConfigWithOptions builds the exact source-derived
-// Kbuild selections for an already-resolved configuration. Family planners use
-// this phase boundary to resolve and normalize each configuration once, then
-// feed the same immutable value to both metadata construction and generated
-// config output. The method does not mutate resolved.
-func (t *Tree) CompactMetadataForResolvedConfigWithOptions(
+// CompactMetadataForResolvedConfigWithOptions builds the source-derived Kbuild
+// selections for an imported native configuration. The same immutable value
+// supplies metadata construction and the selected Kbuild graph.
+func CompactMetadataForResolvedConfigWithOptions(
 	resolved *ResolvedConfig,
 	opts CompactMetadataOptions,
 	graphForConfig func(*ResolvedConfig) (CompactConfigGraph, error),
@@ -934,9 +914,9 @@ func resolvedConfigFragment(config *ResolvedConfig) map[string]string {
 	if config == nil {
 		return fragment
 	}
-	for key := range config.Effective {
-		if config.ShouldWrite(key) {
-			fragment[key] = config.Value(key)
+	for key, value := range config.Effective {
+		if value != "n" {
+			fragment[key] = value
 		}
 	}
 	return fragment

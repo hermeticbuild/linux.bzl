@@ -2436,16 +2436,26 @@ config MEASURED_CAPABILITY
 	if len(replay.plan.Nodes) != 1 || replay.plan.Nodes[0].ID != node.ID {
 		t.Fatalf("replay plan %#v differs from discovery %#v", replay.plan.Nodes, discovery.plan.Nodes)
 	}
-	resolved, err := replay.tree.ResolveConfig(nil)
-	if err != nil {
-		t.Fatal(err)
+	for name, want := range map[string]string{
+		"MEASURED_CAPABILITY": "y", "CC_VERSION_TEXT": facts.VersionText(),
+	} {
+		if got := kconfigDefaultForTest(t, replay.tree, name); got != want {
+			t.Fatalf("replayed %s default = %q, want %q", name, got, want)
+		}
 	}
-	if got := resolved.Value("CONFIG_MEASURED_CAPABILITY"); got != "y" {
-		t.Fatalf("resolved capability = %q, want y", got)
+}
+
+func kconfigDefaultForTest(t *testing.T, tree *kconfig.Tree, name string) string {
+	t.Helper()
+	symbol := tree.Symbols[name]
+	if symbol == nil || len(symbol.Properties) != 1 || symbol.Properties[0].Type != kconfig.PropertyDefault {
+		t.Fatalf("%s does not have exactly one default property: %#v", name, symbol)
 	}
-	if got, want := resolved.Value("CONFIG_CC_VERSION_TEXT"), strconv.Quote(facts.VersionText()); got != want {
-		t.Fatalf("resolved compiler version text = %q, want source-exported %q", got, want)
+	value, ok := symbol.Properties[0].Expr.(*kconfig.SymbolExpr)
+	if !ok || value.Symbol == nil {
+		t.Fatalf("%s default is not a symbol: %#v", name, symbol.Properties[0].Expr)
 	}
+	return value.Symbol.Name
 }
 
 func TestEvaluateLinuxKconfigCompilerPathStringSurvivesResolvedSDKReuse(t *testing.T) {
@@ -2524,24 +2534,24 @@ config VENDOR_SDK
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := replay.tree.ResolveConfig(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	transient := resolved.Value("CONFIG_VENDOR_SDK")
+	transient := kconfigDefaultForTest(t, replay.tree, "VENDOR_SDK")
 	if !strings.Contains(transient, "__LINUX_BZL_TOOLSET_PATH_CAPABILITY_V1__") {
-		t.Fatalf("replayed Kconfig compiler path lacks authenticated planning capability: %q", transient)
+		t.Fatalf("replayed compiler path lacks authenticated planning capability: %q", transient)
 	}
-	if err := normalizeResolvedConfigValues(resolved, replay.normalizeToolsetPathCapabilities); err != nil {
+	stable, err := replay.normalizeToolsetPathCapabilities(transient)
+	if err != nil {
 		t.Fatalf("normalize replayed compiler path %q: %v", transient, err)
 	}
 	wantCore, err := toolaction.EncodeExecutionRootProvenancePath("target", canonicalPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := resolved.Value("CONFIG_VENDOR_SDK"), strconv.Quote(wantCore); got != want {
-		t.Fatalf("normalized Kconfig compiler path = %q, want %q", got, want)
+	if stable != wantCore {
+		t.Fatalf("normalized compiler path = %q, want %q", stable, wantCore)
 	}
+	native := &nativeConfigProjection{files: map[string]string{
+		".config": "CONFIG_VENDOR_SDK=" + strconv.Quote(stable) + "\n",
+	}}
 
 	// LinuxModuleSdkInfo exposes the resolved .config to a later external-module
 	// planner. That fresh Kconfig workload has another random key, but it replays
@@ -2555,17 +2565,30 @@ config VENDOR_SDK
 	if err != nil {
 		t.Fatal(err)
 	}
-	sdkResolved, err := sdkReplay.tree.ResolveConfig(map[string]string{
-		"CONFIG_VENDOR_SDK": resolved.Value("CONFIG_VENDOR_SDK"),
-	})
+	sdkResolved, err := native.resolved(sdkReplay.tree)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := normalizeResolvedConfigValues(sdkResolved, sdkReplay.normalizeToolsetPathCapabilities); err != nil {
 		t.Fatalf("resolved SDK config path was not reauthorized by exact Kconfig replay: %v", err)
 	}
-	if got, want := sdkResolved.Value("CONFIG_VENDOR_SDK"), resolved.Value("CONFIG_VENDOR_SDK"); got != want {
+	if got, want := sdkResolved.Effective["CONFIG_VENDOR_SDK"], strconv.Quote(stable); got != want {
 		t.Fatalf("SDK-reused compiler path = %q, want stable %q", got, want)
+	}
+
+	unmeasured, err := toolaction.EncodeExecutionRootProvenancePath("target", "external/compiler/unmeasured-sdk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized := &nativeConfigProjection{files: map[string]string{
+		".config": "CONFIG_VENDOR_SDK=" + strconv.Quote(unmeasured) + "\n",
+	}}
+	imported, err := unauthorized.resolved(sdkReplay.tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := normalizeResolvedConfigValues(imported, sdkReplay.normalizeToolsetPathCapabilities); err == nil {
+		t.Fatal("SDK import accepted a path absent from the measured compiler result")
 	}
 
 	// The external-module planner imports the stable SDK config into a fresh
@@ -2581,16 +2604,14 @@ config VENDOR_SDK
 			oracle,
 			func(scopes *kconfig.KbuildProbeScopes) (string, error) {
 				importedConfig := &kconfig.ResolvedConfig{
-					Raw:       maps.Clone(sdkResolved.Raw),
 					Effective: maps.Clone(sdkResolved.Effective),
-					Written:   maps.Clone(sdkResolved.Written),
 				}
 				if err := normalizeResolvedConfigValues(importedConfig, func(value string) (string, error) {
 					return scopes.ImportToolsetPathCapabilities(value, sdkReplay.normalizeToolsetPathCapabilities)
 				}); err != nil {
 					return "", err
 				}
-				imported, err := strconv.Unquote(importedConfig.Value("CONFIG_VENDOR_SDK"))
+				imported, err := strconv.Unquote(importedConfig.Effective["CONFIG_VENDOR_SDK"])
 				if err != nil {
 					return "", err
 				}
@@ -3091,15 +3112,6 @@ func TestLinuxRootKconfigInvocationVariablesSelectConfigBuild(t *testing.T) {
 }
 
 func TestResolvedConfigNormalizesAuthenticatedCompilerPathStrings(t *testing.T) {
-	_, err := kconfig.Parse(
-		t.Context(),
-		strings.NewReader("config VENDOR_SDK\n\tstring\n"),
-		"Kconfig",
-		kconfig.Options{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
 	wantCore, err := toolaction.EncodeExecutionRootProvenancePath("target", "external/compiler/vendor-sdk")
 	if err != nil {
 		t.Fatal(err)
@@ -3115,17 +3127,15 @@ func TestResolvedConfigNormalizesAuthenticatedCompilerPathStrings(t *testing.T) 
 			t.Fatal(err)
 		}
 		resolved := &kconfig.ResolvedConfig{
-			Raw:       map[string]string{"CONFIG_VENDOR_SDK": `"` + capability + `"`},
 			Effective: map[string]string{"CONFIG_VENDOR_SDK": `"` + capability + `"`},
-			Written:   map[string]bool{"CONFIG_VENDOR_SDK": true},
 		}
 		if err := normalizeResolvedConfigValues(resolved, codec.NormalizeValue); err != nil {
 			t.Fatalf("replay %d: %v", replay, err)
 		}
-		if got, want := resolved.Value("CONFIG_VENDOR_SDK"), strconv.Quote(wantCore); got != want {
+		if got, want := resolved.Effective["CONFIG_VENDOR_SDK"], strconv.Quote(wantCore); got != want {
 			t.Fatalf("replay %d resolved compiler path = %q, want %q", replay, got, want)
 		}
-		contents := map[string]string{".config": "CONFIG_VENDOR_SDK=" + resolved.Value("CONFIG_VENDOR_SDK") + "\n"}
+		contents := map[string]string{".config": "CONFIG_VENDOR_SDK=" + resolved.Effective["CONFIG_VENDOR_SDK"] + "\n"}
 		for path, content := range contents {
 			if strings.Contains(content, "__LINUX_BZL_TOOLSET_PATH_CAPABILITY_V1__") {
 				t.Fatalf("replay %d %s retains transient capability bytes: %q", replay, path, content)
@@ -3163,7 +3173,6 @@ func TestResolvedConfigPreservesOrdinaryQuotedKconfigEscapes(t *testing.T) {
 		"CONFIG_BACKSPACE_ESCAPE":   `"\b"`,
 	}
 	resolved := &kconfig.ResolvedConfig{
-		Raw:       maps.Clone(values),
 		Effective: maps.Clone(values),
 	}
 	codec, err := toolaction.NewExecutionRootProvenanceCapabilityCodec()
@@ -3172,9 +3181,6 @@ func TestResolvedConfigPreservesOrdinaryQuotedKconfigEscapes(t *testing.T) {
 	}
 	if err := normalizeResolvedConfigValues(resolved, codec.NormalizeValue); err != nil {
 		t.Fatal(err)
-	}
-	if !maps.Equal(resolved.Raw, values) {
-		t.Fatalf("ordinary raw Kconfig strings changed: got %#v, want %#v", resolved.Raw, values)
 	}
 	if !maps.Equal(resolved.Effective, values) {
 		t.Fatalf("ordinary effective Kconfig strings changed: got %#v, want %#v", resolved.Effective, values)
@@ -3196,18 +3202,8 @@ func TestWriteResolvedArchitecturePreservesSourceDerivedValue(t *testing.T) {
 }
 
 func TestEvaluatedKbuildProfilesReadSourceProducedKernelReleaseForUtsrelease(t *testing.T) {
-	tree, err := kconfig.Parse(
-		t.Context(),
-		strings.NewReader("config LOCALVERSION\n\tstring\n"),
-		"Kconfig",
-		kconfig.Options{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
 	resolved := &kconfig.ResolvedConfig{
 		Effective: map[string]string{"CONFIG_LOCALVERSION": `"-test"`},
-		Written:   map[string]bool{"CONFIG_LOCALVERSION": true},
 	}
 	immutableContents := nativeConfigFixtureForTest("CONFIG_LOCALVERSION=\"-test\"\n", "CONFIG_LOCALVERSION=\"-test\"\n", "#define CONFIG_LOCALVERSION \"-test\"\n")
 	if _, seeded := immutableContents["include/config/kernel.release"]; seeded {
@@ -3318,7 +3314,7 @@ include/generated/utsrelease.h: include/config/kernel.release FORCE
 		t.Fatalf("completed source writer KERNELRELEASE = %q, want %q", got, want)
 	}
 
-	metadata, err := tree.CompactMetadataForResolvedConfigWithOptions(
+	metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(
 		resolved,
 		kconfig.CompactMetadataOptions{SelectedProductsOnly: true},
 		func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
@@ -3382,13 +3378,8 @@ include/generated/utsrelease.h: include/config/kernel.release FORCE
 }
 
 func TestEvaluatedKbuildProfilesReplayMeasuredSourceFilechkIntoExportAndUtsrelease(t *testing.T) {
-	tree, err := kconfig.Parse(t.Context(), strings.NewReader("config LOCALVERSION\n\tstring\n"), "Kconfig", kconfig.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
 	resolved := &kconfig.ResolvedConfig{
 		Effective: map[string]string{"CONFIG_LOCALVERSION": `"-fixture"`},
-		Written:   map[string]bool{"CONFIG_LOCALVERSION": true},
 	}
 	immutableContents := nativeConfigFixtureForTest("CONFIG_LOCALVERSION=\"-fixture\"\n", "CONFIG_LOCALVERSION=\"-fixture\"\n", "#define CONFIG_LOCALVERSION \"-fixture\"\n")
 	const releaseTarget = "include/config/kernel.release"
@@ -3647,7 +3638,7 @@ include/generated/utsrelease.h: include/config/kernel.release FORCE
 		values["INSTALL_DTBS_PATH"] != "/kernel/install/dtbs/6.1.188-fixture" {
 		t.Fatalf("completed source writer exports = %#v, want measured release and DTBS path", values)
 	}
-	metadata, err := tree.CompactMetadataForResolvedConfigWithOptions(resolved,
+	metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(resolved,
 		metadataOptions,
 		func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
 			return kconfig.CompactConfigGraph{KbuildProfiles: replay.Value.profiles, KbuildSelections: replay.Value.selections}, nil
@@ -7969,12 +7960,8 @@ FORCE:
 		}
 	}
 
-	tree, err := kconfig.Parse(t.Context(), strings.NewReader("config TEST\n\tbool\n"), "Kconfig", kconfig.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	metadata, err := tree.CompactMetadataWithOptions(
-		nil, kconfig.ResolveConfigOptions{}, kconfig.CompactMetadataOptions{
+	metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(
+		&kconfig.ResolvedConfig{Effective: map[string]string{"CONFIG_TEST": "n"}}, kconfig.CompactMetadataOptions{
 			SelectedProductsOnly: true,
 			ActionRoles: []kconfig.KbuildActionRoleRef{
 				{Scope: "host", Role: "cc"}, {Scope: "host", Role: "ar"}, {Scope: "target", Role: "ar"},
@@ -8736,13 +8723,9 @@ cat init/built-in.a > vmlinux
 	); !found || artifact != want[0] {
 		t.Fatalf("final archive invocation started from %#v, found %t; want first archive %#v", artifact, found, want[0])
 	}
-	tree, err := kconfig.Parse(t.Context(), strings.NewReader("config TEST\n\tbool\n"), "Kconfig", kconfig.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
 	planFor := func(candidate []kconfig.CompactKbuildSelection) (*kconfig.ActionPlan, error) {
-		metadata, err := tree.CompactMetadataWithOptions(
-			nil, kconfig.ResolveConfigOptions{},
+		metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(
+			&kconfig.ResolvedConfig{Effective: map[string]string{"CONFIG_TEST": "n"}},
 			kconfig.CompactMetadataOptions{SelectedProductsOnly: true, ActionRoles: roles},
 			func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
 				return kconfig.CompactConfigGraph{KbuildProfiles: profiles, KbuildSelections: candidate}, nil
