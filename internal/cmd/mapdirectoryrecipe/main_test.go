@@ -1330,7 +1330,7 @@ func TestRunRecipeUsesConfiguredRuntimeToolForCompilerSubprocess(t *testing.T) {
 		recipe: recipePath, kind: "compile", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
 		toolRole: "cc", workingDirectory: workRoot, workingDirectoryMarker: filepath.Join(workRoot, ".linux-bzl-work-root"),
 		sources: map[string]string{}, inputs: map[string]string{}, outputs: map[string]string{"00000000": output},
-		tools: map[string]string{"cc": compiler}, runtimeTools: map[string]string{"ld": linker}, trees: map[string]string{},
+		tools: map[string]string{"cc": compiler}, runtimeTools: map[string]string{"ld": linker, "script-runtime": writeTestShellMulticall(t, directory)}, trees: map[string]string{},
 		actionEnvironment: map[string]string{},
 	}); err != nil {
 		t.Fatal(err)
@@ -1393,7 +1393,7 @@ func TestRunRecipePrependsRuntimeToolsToConfiguredAndRecipePath(t *testing.T) {
 				recipe: recipePath, kind: "compile", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
 				toolRole: "cc", workingDirectory: workRoot, workingDirectoryMarker: filepath.Join(workRoot, ".linux-bzl-work-root"),
 				sources: map[string]string{}, inputs: map[string]string{}, outputs: map[string]string{"00000000": output},
-				tools: map[string]string{"cc": compiler}, runtimeTools: map[string]string{"ld": linker}, trees: map[string]string{},
+				tools: map[string]string{"cc": compiler}, runtimeTools: map[string]string{"ld": linker, "script-runtime": writeTestShellMulticall(t, directory)}, trees: map[string]string{},
 				actionEnvironment: map[string]string{"PATH": configuredPath},
 			}); err != nil {
 				t.Fatal(err)
@@ -1448,7 +1448,7 @@ func TestPrepareRuntimeToolDirectoryRejectsPrivateRuntimeCollision(t *testing.T)
 	if err := os.Mkdir(filepath.Join(directory, ".linux-bzl-tool-runtime"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := prepareRuntimeToolDirectory(directory, map[string]string{"ld": executable}); err == nil || !strings.Contains(err.Error(), "create private runtime-tool root") {
+	if _, _, err := prepareRuntimeToolDirectory(directory, map[string]string{"ld": executable, "script-runtime": writeTestShellMulticall(t, directory)}); err == nil || !strings.Contains(err.Error(), "create private runtime-tool root") {
 		t.Fatalf("private runtime collision error = %v", err)
 	}
 }

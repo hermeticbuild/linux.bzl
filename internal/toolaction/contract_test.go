@@ -658,23 +658,47 @@ func differentHexByte(value byte) string {
 	return "0"
 }
 
-func TestPrepareRuntimeToolDirectoryUsesOnlyDeclaredRoles(t *testing.T) {
+func TestPrepareRuntimeToolDirectoryPreservesSelectedExecutable(t *testing.T) {
 	root := t.TempDir()
-	executable := filepath.Join(root, "selected-linker")
-	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	multicall := filepath.Join(root, "multicall")
+	if err := os.WriteFile(multicall, []byte("#!/bin/sh\nshift\nexec /bin/sh \"$@\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	directory, cleanup, err := PrepareRuntimeToolDirectory(root, map[string]string{"ld": executable})
+	executable := filepath.Join(root, "selected tool's path")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	selectedSymlink := filepath.Join(root, "selected-mode")
+	if err := os.Symlink(executable, selectedSymlink); err != nil {
+		t.Fatal(err)
+	}
+	workingDirectory := filepath.Join(root, "nested", "working-directory")
+	if err := os.MkdirAll(workingDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tools := map[string]string{"ld": executable, "cc-link": selectedSymlink, "script-runtime": multicall}
+	directory, cleanup, err := PrepareRuntimeToolDirectory(root, tools)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	resolved, err := filepath.EvalSymlinks(filepath.Join(directory, "ld"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resolved != executable {
-		t.Fatalf("runtime ld = %q, want %q", resolved, executable)
+	for _, role := range []string{"ld", "cc-link"} {
+		t.Run(role, func(t *testing.T) {
+			arguments := []string{"two words", "", "literal'$value"}
+			// This test's multicall is a script, which macOS cannot use as a
+			// shebang interpreter. Run that same interpreter explicitly.
+			command := exec.Command(multicall, append([]string{"sh", filepath.Join(directory, role)}, arguments...)...)
+			command.Dir = workingDirectory
+			command.Env = []string{"PATH=" + directory}
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("runtime %s: %v\n%s", role, err, output)
+			}
+			want := strings.Join(append([]string{tools[role]}, arguments...), "\n") + "\n"
+			if string(output) != want {
+				t.Fatalf("runtime %s output = %q, want %q", role, output, want)
+			}
+		})
 	}
 }
 
@@ -740,7 +764,7 @@ printf '%s' "$SELECTED_MODE" > "$RESULT"
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			result := filepath.Join(root, "result-"+test.name)
-			command := exec.Command(proxy, test.arguments...)
+			command := exec.Command(multicall, append([]string{"sh", proxy}, test.arguments...)...)
 			command.Env = append(os.Environ(), "RESULT="+result)
 			if output, err := command.CombinedOutput(); err != nil {
 				t.Fatalf("run proxy: %v\n%s", err, output)
@@ -813,7 +837,7 @@ exec /bin/sh "$@"
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			result := filepath.Join(root, "result-"+test.name)
-			command := exec.Command(proxy, test.arguments...)
+			command := exec.Command(multicall, append([]string{"sh", proxy}, test.arguments...)...)
 			command.Env = append(os.Environ(), "RESULT="+result)
 			if output, err := command.CombinedOutput(); err != nil {
 				t.Fatalf("run proxy: %v\n%s", err, output)

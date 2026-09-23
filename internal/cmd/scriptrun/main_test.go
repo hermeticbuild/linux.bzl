@@ -1870,7 +1870,8 @@ exit 64
 			// Use the actual runner's validated directory constructor. Its
 			// noncolliding configured command must remain available too.
 			runtimeTools := map[string]string{
-				"runtime-only": writeExecutable(t, directory, "runtime-only", "#!/bin/sh\nprintf 'runtime-only\\n'\n"),
+				"script-runtime": runtime,
+				"runtime-only":   writeExecutable(t, directory, "runtime-only", "#!/bin/sh\nprintf 'runtime-only\\n'\n"),
 			}
 			if test.configured {
 				runtimeTools["selected"] = writeExecutable(t, directory, "configured", "#!/bin/sh\nprintf 'configured:%s\\n' \"$1\"\n")

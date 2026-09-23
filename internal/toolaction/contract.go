@@ -743,12 +743,6 @@ func InstallToolActionProxy(
 	if _, companion := BaseContractRole(role); companion {
 		return "", fmt.Errorf("tool action proxy role %q is a semantic contract, not an executable role", role)
 	}
-	if directory == "" || multicall == "" || executable == "" {
-		return "", fmt.Errorf("tool action proxy %q requires a directory, multicall runtime, and executable", role)
-	}
-	if !filepath.IsAbs(multicall) || strings.ContainsAny(multicall, "\x00\r\n\t ") || strings.ContainsRune(executable, 0) {
-		return "", fmt.Errorf("tool action proxy %q has an invalid runtime or executable path", role)
-	}
 	contracts := map[string]Contract{role: contract}
 	linkRole := ""
 	if linkContract != nil {
@@ -762,7 +756,16 @@ func InstallToolActionProxy(
 	if err := Validate(contracts); err != nil {
 		return "", err
 	}
+	return installToolProxy(directory, multicall, role, executable, contract, linkContract)
+}
 
+func installToolProxy(directory, multicall, role, executable string, contract Contract, linkContract *Contract) (string, error) {
+	if directory == "" || multicall == "" || executable == "" {
+		return "", fmt.Errorf("tool action proxy %q requires a directory, multicall runtime, and executable", role)
+	}
+	if !filepath.IsAbs(multicall) || strings.ContainsAny(multicall, "\x00\r\n\t ") || strings.ContainsRune(executable, 0) {
+		return "", fmt.Errorf("tool action proxy %q has an invalid runtime or executable path", role)
+	}
 	destination := filepath.Join(directory, role)
 	if err := os.Remove(destination); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err
@@ -881,9 +884,11 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
-// PrepareRuntimeToolDirectory creates a private PATH component containing one
-// symlink per configured tool role.  Callers own privateRoot and must invoke
-// the returned cleanup function.  No ambient PATH entries are inspected.
+// PrepareRuntimeToolDirectory exposes configured tool roles in a private PATH
+// component. Each launcher preserves the selected executable's path and basename:
+// wrappers may locate resources relative to themselves, and a selected symlink
+// may choose a multicall mode. The declared script-runtime must provide POSIX sh.
+// Callers own privateRoot and must invoke the returned cleanup function.
 func PrepareRuntimeToolDirectory(privateRoot string, tools map[string]string) (string, func(), error) {
 	noop := func() {}
 	if len(tools) == 0 {
@@ -921,6 +926,10 @@ func PrepareRuntimeToolDirectory(privateRoot string, tools map[string]string) (s
 		absoluteTools[role] = absolute
 	}
 	sort.Strings(roles)
+	multicall := absoluteTools["script-runtime"]
+	if multicall == "" {
+		return "", noop, fmt.Errorf("runtime tools require a declared script-runtime with a sh applet")
+	}
 
 	runtimeRoot := filepath.Join(privateRoot, ".linux-bzl-tool-runtime")
 	if err := os.Mkdir(runtimeRoot, 0o700); err != nil {
@@ -933,7 +942,7 @@ func PrepareRuntimeToolDirectory(privateRoot string, tools map[string]string) (s
 		return "", noop, fmt.Errorf("create private runtime-tool bin: %w", err)
 	}
 	for _, role := range roles {
-		if err := os.Symlink(absoluteTools[role], filepath.Join(toolDirectory, role)); err != nil {
+		if _, err := installToolProxy(toolDirectory, multicall, role, absoluteTools[role], Contract{}, nil); err != nil {
 			cleanup()
 			return "", noop, fmt.Errorf("install runtime tool %q: %w", role, err)
 		}

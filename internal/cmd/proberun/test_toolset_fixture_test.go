@@ -109,6 +109,13 @@ func prepareTestProbeWithToolset(t *testing.T, opts probeOptions, additionalTool
 		}
 		roles[role] = bound
 	}
+	if roles["script-runtime"] == "" {
+		multicall := filepath.Join(typedRoot, "script-runtime")
+		if err := os.WriteFile(multicall, []byte("#!/bin/sh\nshift\nexec /bin/sh \"$@\"\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		roles["script-runtime"] = multicall
+	}
 	rolesByScope := map[string]map[string]string{opts.scope: {}}
 	for binding, filename := range roles {
 		scope, role, scoped, valid := toolaction.SplitBinding(binding)
@@ -122,15 +129,6 @@ func prepareTestProbeWithToolset(t *testing.T, opts probeOptions, additionalTool
 			rolesByScope[scope] = map[string]string{}
 		}
 		rolesByScope[scope][role] = filename
-	}
-	if len(rolesByScope[opts.scope]) == 0 {
-		executable, err := os.Executable()
-		if err != nil {
-			t.Fatal(err)
-		}
-		filename := bind("runtime-cc", executable)
-		roles["cc"] = filename
-		rolesByScope[opts.scope]["cc"] = filename
 	}
 	for role, filename := range roles {
 		opts.runtimeTools[role] = filename
