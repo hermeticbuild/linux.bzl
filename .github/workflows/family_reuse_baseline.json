@@ -27,26 +27,26 @@
         "btf/lz4": 0,
         "debug/lz4": 0
       },
-      "unique_nodes": 7686,
+      "unique_nodes": 8487,
       "variants": {
         "base": {
-          "nodes": 1920,
-          "precise_compile_nodes": 4,
+          "nodes": 2116,
+          "precise_compile_nodes": 6,
           "typed_compiler_nodes": 1240
         },
         "btf": {
-          "nodes": 2055,
-          "precise_compile_nodes": 4,
+          "nodes": 2381,
+          "precise_compile_nodes": 6,
           "typed_compiler_nodes": 1313
         },
         "debug": {
-          "nodes": 1950,
-          "precise_compile_nodes": 4,
+          "nodes": 2146,
+          "precise_compile_nodes": 6,
           "typed_compiler_nodes": 1269
         },
         "lz4": {
-          "nodes": 1921,
-          "precise_compile_nodes": 4,
+          "nodes": 2117,
+          "precise_compile_nodes": 6,
           "typed_compiler_nodes": 1240
         }
       }
@@ -59,7 +59,7 @@
         "base/btf/lz4": 0,
         "base/debug": 0,
         "base/debug/lz4": 0,
-        "base/lz4": 2,
+        "base/lz4": 23,
         "btf/debug": 0,
         "btf/debug/lz4": 0,
         "btf/lz4": 0,
@@ -72,32 +72,32 @@
         "base/btf/lz4": 0,
         "base/debug": 0,
         "base/debug/lz4": 0,
-        "base/lz4": 2,
+        "base/lz4": 23,
         "btf/debug": 0,
         "btf/debug/lz4": 0,
         "btf/lz4": 0,
         "debug/lz4": 0
       },
-      "unique_nodes": 7711,
+      "unique_nodes": 8495,
       "variants": {
         "base": {
-          "nodes": 1925,
-          "precise_compile_nodes": 4,
+          "nodes": 2119,
+          "precise_compile_nodes": 26,
           "typed_compiler_nodes": 1240
         },
         "btf": {
-          "nodes": 2060,
-          "precise_compile_nodes": 4,
+          "nodes": 2384,
+          "precise_compile_nodes": 26,
           "typed_compiler_nodes": 1313
         },
         "debug": {
-          "nodes": 1955,
-          "precise_compile_nodes": 4,
+          "nodes": 2149,
+          "precise_compile_nodes": 26,
           "typed_compiler_nodes": 1269
         },
         "lz4": {
-          "nodes": 1926,
-          "precise_compile_nodes": 4,
+          "nodes": 2120,
+          "precise_compile_nodes": 26,
           "typed_compiler_nodes": 1240
         }
       }
@@ -110,22 +110,22 @@
   "measured_toolsets": {
     "clang": {
       "9.1.0": {
-        "host": "sha256-fba53efd132507e743bcb288868bc5581b91cd27518b1e142402280b26c1f210",
-        "target": "sha256-f4a89b27b25c46e847628d110e265e8f9a48b3c13cab381c5f22bd4eb7b0a6f4"
+        "host": "sha256-3de234f87eea2ad7574b9b94b47dcbf3d2ed68fb7488e7283c83e323c8a95e84",
+        "target": "sha256-1bf070a762b629c50bee22d4cef7fc663d659557399ed61dc107c4c8f7d4a1d1"
       },
       "9.2.0": {
-        "host": "sha256-fba53efd132507e743bcb288868bc5581b91cd27518b1e142402280b26c1f210",
-        "target": "sha256-f4a89b27b25c46e847628d110e265e8f9a48b3c13cab381c5f22bd4eb7b0a6f4"
+        "host": "sha256-3de234f87eea2ad7574b9b94b47dcbf3d2ed68fb7488e7283c83e323c8a95e84",
+        "target": "sha256-1bf070a762b629c50bee22d4cef7fc663d659557399ed61dc107c4c8f7d4a1d1"
       }
     },
     "gcc": {
       "9.1.0": {
-        "host": "sha256-31d091104347aa8c201e357cb9154bf211cbe53110cf520c8583454185424557",
-        "target": "sha256-8f1fc4cefdb2944b06f941ef27ee83a5deca41c364da4832b14d3dc9c74a71bc"
+        "host": "sha256-fb3aabc66930f25a1fcee5299e31af3bf9ad38c273c71e9d7386192ea22eef7c",
+        "target": "sha256-ec73b454c9331eccce896497b7e46a8f45ad583be42dc6ffd9e60caeaa2f0243"
       },
       "9.2.0": {
-        "host": "sha256-31d091104347aa8c201e357cb9154bf211cbe53110cf520c8583454185424557",
-        "target": "sha256-8f1fc4cefdb2944b06f941ef27ee83a5deca41c364da4832b14d3dc9c74a71bc"
+        "host": "sha256-fb3aabc66930f25a1fcee5299e31af3bf9ad38c273c71e9d7386192ea22eef7c",
+        "target": "sha256-ec73b454c9331eccce896497b7e46a8f45ad583be42dc6ffd9e60caeaa2f0243"
       }
     }
   },
