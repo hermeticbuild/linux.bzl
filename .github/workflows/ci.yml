@@ -87,7 +87,7 @@ jobs:
   examples:
     name: Standalone examples (${{ matrix.suite.title }}, ${{ matrix.compiler }}, Bazel ${{ matrix.bazel }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: ${{ matrix.suite.batch == 'x86-64-variants' && 120 || 90 }}
     strategy:
       fail-fast: false
       matrix:
