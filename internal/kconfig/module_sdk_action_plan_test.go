@@ -55,6 +55,10 @@ func TestModuleSDKProjectsOnlyPreparationClosure(t *testing.T) {
 		Tree: "prep", Path: "rust/private-scratch",
 		ArtifactPath: ".linux-bzl-intermediate/rust/private-scratch",
 	}, "sdk")
+	const observation = ".linux-bzl-observed-side-output/command.state"
+	seedModuleSDKPlanArtifactForTest(t, plan, "prep", ActionPlanOutput{
+		Tree: "prep", Path: observation, ObservedPath: "outputmakefile",
+	}, "sdk")
 	symvers := seedModuleSDKPlanOutputForTest(t, plan, "target", "metadata", "Module.symvers", "module_symvers")
 	plan.Products = append(plan.Products, ActionPlanProduct{
 		Name: "module_symvers", Tree: "metadata", Path: "Module.symvers",
@@ -79,6 +83,9 @@ func TestModuleSDKProjectsOnlyPreparationClosure(t *testing.T) {
 		if len(projection.Inputs) != 1 || projection.Inputs[0].ProducerID != source.producer {
 			t.Errorf("sdk/%s projection input = %#v, want producer %s", destination, projection.Inputs, source.producer)
 		}
+	}
+	if _, _, ok := planProducerByOutput(plan, "sdk", observation); ok {
+		t.Fatal("module SDK projected an internal observation envelope")
 	}
 	if _, _, ok := planProducerByOutput(plan, "sdk", "rust/private-scratch"); ok {
 		t.Fatal("module SDK projected an untagged private scratch output")
@@ -532,6 +539,10 @@ func seedModuleSDKPlanArtifactForTest(t *testing.T, plan *ActionPlan, stage stri
 		Schema: LinuxKernelPlanSchema, Kind: "generate", Tool: "actionfile",
 		Arguments: []string{"-out", "${output:00000000}", "-content_base64", ""},
 		Outputs:   []string{"00000000"},
+	}
+	if output.ObservedPath != "" {
+		recipe.WorkingDirectory = "sdk-observation"
+		recipe.Arguments = []string{"-out", "${work:root}/" + output.ObservedPath, "-content_base64", ""}
 	}
 	producer, err := appendActionPlanNode(plan, node, recipe)
 	if err != nil {

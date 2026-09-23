@@ -83,7 +83,7 @@ func (m *CompactMetadata) appendModuleSDKActionPlanNodes(plan *ActionPlan) error
 			continue
 		}
 		for slot, output := range node.Outputs {
-			if output.Tree != "prep" || (!actionPlanOutputIsCanonical(output) && !output.persistent) {
+			if output.Tree != "prep" || output.ObservedPath != "" || (!actionPlanOutputIsCanonical(output) && !output.persistent) {
 				continue
 			}
 			if err := add("selected prep output", moduleSDKSelectedArtifact{
