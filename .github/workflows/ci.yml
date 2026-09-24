@@ -127,9 +127,9 @@ jobs:
             - examples/.bazelrc
             - examples/MODULE.bazel
             - examples/MODULE.bazel.lock
-            - examples/gcc_toolchain_remote_execution.patch
-            - examples/libbpf_old_uapi_compat.patch
-            - examples/llvm_kbuild_actions.patch
+            - patches/gcc_toolchain_remote_execution.patch
+            - patches/libbpf_old_uapi_compat.patch
+            - patches/llvm_kbuild_actions.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Build ${{ matrix.suite.title }} with ${{ matrix.compiler }}
@@ -298,9 +298,9 @@ jobs:
             - e2e/MODULE.bazel
             - e2e/MODULE.bazel.lock
             - e2e/patches/BUILD.bazel
-            - e2e/patches/gcc_toolchain_remote_execution.patch
-            - e2e/patches/libbpf_old_uapi_compat.patch
-            - e2e/patches/llvm_kbuild_actions.patch
+            - patches/gcc_toolchain_remote_execution.patch
+            - patches/libbpf_old_uapi_compat.patch
+            - patches/llvm_kbuild_actions.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Run ${{ matrix.suite.title }} with ${{ matrix.compiler }}
@@ -387,10 +387,10 @@ jobs:
             - aya_e2e/patches/BUILD.bazel
             - aya_e2e/patches/aya_linux_bzl_api.patch
             - aya_e2e/patches/aya_rust_kernel_module_e2e.patch
-            - aya_e2e/patches/gcc_toolchain_remote_execution.patch
-            - aya_e2e/patches/libbpf_old_uapi_compat.patch
-            - aya_e2e/patches/llvm_kbuild_actions.patch
             - aya_e2e/patches/rules_rust_linker_path_mapping.patch
+            - patches/gcc_toolchain_remote_execution.patch
+            - patches/libbpf_old_uapi_compat.patch
+            - patches/llvm_kbuild_actions.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Run Aya integration VMs with ${{ matrix.compiler }} kernel
@@ -477,12 +477,12 @@ jobs:
             - sonic_e2e/MODULE.bazel
             - sonic_e2e/MODULE.bazel.lock
             - sonic_e2e/arm64_module_test.go
-            - sonic_e2e/gcc_toolchain_remote_execution.patch
-            - sonic_e2e/libbpf_old_uapi_compat.patch
-            - sonic_e2e/llvm_kbuild_actions.patch
             - sonic_e2e/module_test.go
             - sonic_e2e/sai_bcm_kconfig.patch
             - sonic_e2e/sonic.config
+            - patches/gcc_toolchain_remote_execution.patch
+            - patches/libbpf_old_uapi_compat.patch
+            - patches/llvm_kbuild_actions.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Build SONiC linux_ngbde module with ${{ matrix.compiler }}

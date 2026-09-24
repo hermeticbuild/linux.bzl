@@ -1,3 +1,5 @@
+# Consumer modules symlink these shared patches into their own source trees:
+# Bazel requires single_version_override patches to belong to the root module.
 exports_files(
     ["llvm_kbuild_actions.patch"],
     visibility = ["//visibility:public"],

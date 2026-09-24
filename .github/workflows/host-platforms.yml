@@ -47,9 +47,9 @@ jobs:
             - examples/.bazelrc
             - examples/MODULE.bazel
             - examples/MODULE.bazel.lock
-            - examples/gcc_toolchain_remote_execution.patch
-            - examples/libbpf_old_uapi_compat.patch
-            - examples/llvm_kbuild_actions.patch
+            - patches/gcc_toolchain_remote_execution.patch
+            - patches/libbpf_old_uapi_compat.patch
+            - patches/llvm_kbuild_actions.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Build Linux kernels
