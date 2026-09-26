@@ -1260,10 +1260,6 @@ type compactKbuildRuleMatch struct {
 	// recipe text from its selecting source line. Keep that source line's
 	// immutable Make evaluator when lowering the recovered occurrence.
 	selectedRecipeSnapshot *KbuildSelectedControlRecipeSnapshot
-	// Linear argv commands may outnumber their source recipe lines. Preserve
-	// each command's original line so local generated-file reads bind the
-	// version written before that line, rather than the final target version.
-	commandRecipeIndices []int
 	// Variables used to lower an argv command belong to its own source line,
 	// including CONFIG_SHELL and source script environment inputs.
 	recipeLineValues map[int]map[string]string
@@ -2874,8 +2870,10 @@ func containsUnmodeledKbuildDollar(value string) bool {
 // edges, stdin/stdout bindings, and private working paths; no shell reaches an
 // action.
 type compactKbuildRecipeCommand struct {
-	environment map[string]string
-	program     string
+	// Keep the selecting Make line with the command through normalization.
+	recipeSnapshot *KbuildSelectedControlRecipeSnapshot
+	environment    map[string]string
+	program        string
 	// sourceStart/sourceEnd bound the complete simple-command segment before
 	// shell expansion. They let the compound scanner project a masked command or
 	// arithmetic substitution back onto the outer command which consumes its
@@ -3415,7 +3413,6 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		return producer, nil
 	}
 	commands := []compactKbuildRecipeCommand{}
-	commandRecipeIndices := []int{}
 	var commandErr error
 	for index := range templates {
 		parsed, parseErr := parseCompactKbuildRecipe(templates[index], automaticContext)
@@ -3423,12 +3420,12 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 			commandErr = fmt.Errorf("%s: %w", templateNames[index], parseErr)
 			break
 		}
-		commands = append(commands, parsed...)
 		if len(selectionRecipeIndices) != 0 {
-			for range parsed {
-				commandRecipeIndices = append(commandRecipeIndices, selectionRecipeIndices[index])
+			for i := range parsed {
+				parsed[i].recipeSnapshot = selectedSnapshots[selectionRecipeIndices[index]]
 			}
 		}
+		commands = append(commands, parsed...)
 	}
 	probeCommands := []compactKbuildRecipeCommand{}
 	if commandErr == nil {
@@ -3529,7 +3526,6 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		}
 		return producer, nil
 	}
-	match.commandRecipeIndices = commandRecipeIndices
 	match.recipeLineValues = lineValues
 	producer, err := b.appendCompactKbuildRecipe(target, match, inputs, values, commands)
 	if err != nil {
@@ -8618,7 +8614,6 @@ func (b *compactKbuildRulePlanBuilder) buildGenericDirectRecipe(
 		// through that existing command DAG. A compound shell shares one cwd
 		// and cannot execute two incompatible Make frontiers.
 		lineCommands := []compactKbuildRecipeCommand{}
-		lineCommandIndices := []int{}
 		for ordinal, actual := range actualLines {
 			parsed, parseErr := parseCompactKbuildRecipe(actual, automatic)
 			if parseErr != nil || compactKbuildRecipeHasPipeline(parsed) ||
@@ -8627,16 +8622,15 @@ func (b *compactKbuildRulePlanBuilder) buildGenericDirectRecipe(
 				return "", fmt.Errorf("direct recipe source line %d requires atomic shell execution: %w",
 					actualLineIndices[ordinal], frontierErr)
 			}
-			lineCommands = append(lineCommands, parsed...)
-			for range parsed {
-				lineCommandIndices = append(lineCommandIndices, actualLineIndices[ordinal])
+			for i := range parsed {
+				parsed[i].recipeSnapshot = snapshots[actualLineIndices[ordinal]]
 			}
+			lineCommands = append(lineCommands, parsed...)
 		}
 		atomic, atomicErr := compactKbuildRecipeRequiresAtomicExecution(target, match, lineCommands)
 		if atomicErr != nil || atomic {
 			return "", fmt.Errorf("direct recipe commands require one atomic action: %w", frontierErr)
 		}
-		match.commandRecipeIndices = lineCommandIndices
 		match.recipeLineValues = map[int]map[string]string{}
 		for _, index := range actualLineIndices {
 			lineMatch := match
@@ -12393,16 +12387,14 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 			}
 		}
 	}
-	if len(localReads) != 0 && len(match.commandRecipeIndices) != len(commands) {
+	if len(localReads) != 0 && slices.ContainsFunc(commands, func(command compactKbuildRecipeCommand) bool {
+		return command.recipeSnapshot == nil
+	}) {
 		return "", fmt.Errorf("%s: Kbuild target %q cannot attach local generated-file reads to source recipe lines", match.profile.Rules[match.ruleOrder].Position, target)
 	}
 	commands, err = normalizeCompactKbuildRecipeCommands(target, commands)
 	if err != nil {
 		return "", err
-	}
-	if len(match.commandRecipeIndices) != 0 && len(match.commandRecipeIndices) != len(commands) {
-		return "", fmt.Errorf("%s: Kbuild target %q command normalization lost selected source recipe line identity",
-			match.profile.Rules[match.ruleOrder].Position, target)
 	}
 	probeCommands := slices.Clone(match.compilerProbeCommands)
 	if len(probeCommands) != 0 {
@@ -12445,8 +12437,8 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 		// GNU Make expands the complete source line before running any shell
 		// commands on that line. An exact read of this target's own output
 		// therefore requires a concrete producer from an earlier source line.
-		if len(match.commandRecipeIndices) != 0 {
-			index := match.commandRecipeIndices[commandIndex]
+		if snapshot := command.recipeSnapshot; snapshot != nil {
+			index := snapshot.Line.RecipeIndex
 			for _, read := range localReads[index] {
 				logicalPath := read.Artifact.Producer.Path
 				input, exists := pathProducers[logicalPath]
@@ -12459,7 +12451,7 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 			}
 			// Within this command the source evaluator, exports, shell, and
 			// typed script cwd all belong to the selecting immutable line.
-			commandMatch.profile = selectedSnapshots[index].Evaluation.Profile
+			commandMatch.profile = snapshot.Evaluation.Profile
 			if matched := match.recipeLineValues[index]; matched != nil {
 				commandValues = matched
 			}
@@ -13405,8 +13397,8 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 			}
 			available = upsertCompactKbuildRuleInput(available, result)
 			pathProducers[logical] = result
-			if len(match.commandRecipeIndices) != 0 {
-				localProducerLines[logical] = match.commandRecipeIndices[commandIndex]
+			if snapshot := command.recipeSnapshot; snapshot != nil {
+				localProducerLines[logical] = snapshot.Line.RecipeIndex
 			}
 			b.memo[logical] = producer
 		}

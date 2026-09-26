@@ -13836,7 +13836,7 @@ func TestSelectedKbuildDirectRecipeBindsEarlierLineWriter(t *testing.T) {
 			profile, _, objectRoot := selectedControlTestProfile(t, `
 KERNELRELEASE = $(file < $(objtree)/include/config/kernel.release)
 `+header+`: FORCE
-	@printf 'before=%s\n' "$(KERNELRELEASE)" > include/config/release.before
+	@mkdir -p include/config; rm -f $@; printf 'before=%s\n' "$(KERNELRELEASE)" > include/config/release.before
 	`+test.writer+`
 	@printf '#define UTS_RELEASE "%s"\n' "$(KERNELRELEASE)" > $@
 .PHONY: FORCE
