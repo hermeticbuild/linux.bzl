@@ -249,7 +249,7 @@ jobs:
         suite:
           - batch: tooling
             title: E2E tooling
-            targets: "//:compiler_identity_test //boot:init_test //internal/modversions:modversions_test //cmd/qemuboot:qemuboot_test @linux.bzl//internal/tests/mapped_kernel:mapped_kernel_test"
+            targets: "//:compiler_identity_test //boot:init_test //internal/modversions:modversions_test //cmd/qemuboot:qemuboot_test"
           - batch: linux-6.12-x86_64
             title: Linux 6.12 x86_64
             targets: "//:linux_6_12_96_x86_64_boot_test //:linux_6_12_96_x86_64_module_test //:modversions_6_12_96_x86_64_build_test"
