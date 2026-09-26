@@ -8,10 +8,20 @@ _SOURCE_OVERLAY_FILES = [
     # __LINUX_BZL_SOURCE_OVERLAY_FILES__
 ]
 
+# Preserve upstream paths in the logical source tree while keeping extracted
+# files distinct on case-insensitive clients.
+_RENAMED_SOURCE_PATHS = {
+    # __LINUX_BZL_RENAMED_SOURCE_PATHS__
+}
+
+_SOURCE_DIRECTORIES = [
+    # __LINUX_BZL_SOURCE_DIRECTORIES__
+]
+
 exports_files(
     glob(
         ["**"],
-        exclude = _SOURCE_OVERLAY_FILES,
+        exclude = _SOURCE_OVERLAY_FILES + _SOURCE_DIRECTORIES,
         exclude_directories = 0,
     ) + _SOURCE_OVERLAY_FILES,
     visibility = ["//visibility:public"],
@@ -31,6 +41,7 @@ linux_source_runfiles(
     name = "linux_bzl_source_runfiles",
     source_files = [":all_files"],
     source_root = "Kconfig",
+    renamed_paths = _RENAMED_SOURCE_PATHS,
 )
 
 # Public source-only aggregate used by rules_devicetree consumers. It does not

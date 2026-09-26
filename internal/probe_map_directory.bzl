@@ -6,6 +6,7 @@ registers proberun actions. Compiler behavior remains data produced by those
 actions and consumed later by Kconfig/Kbuild.
 """
 
+load(":linux_source_runfiles.bzl", "add_linux_source_arg", "linux_source_path")
 load(
     ":toolchain_action_paths.bzl",
     _EXECUTION_ROOT_MARKER = "EXECUTION_ROOT_MARKER",
@@ -113,13 +114,8 @@ def _canonical_rust_source_file(file):
         ))
     return canonical_path
 
-def _kernel_source_path(file, source_prefix):
-    canonical = file.short_path
-    if source_prefix:
-        prefix = source_prefix + "/"
-        if not canonical.startswith(prefix):
-            fail("mapped Linux source input %s is outside %s" % (file, source_prefix))
-        canonical = canonical[len(prefix):]
+def _kernel_source_path(file, source_prefix, renamed_paths = {}):
+    canonical = linux_source_path(file, source_prefix, renamed_paths)
     _validate_source_path(canonical, "mapped Linux source input")
     return canonical
 
@@ -134,7 +130,7 @@ def _record_source(files, source, file, kind):
         ))
     files[source] = file
 
-def _probe_source_context(additional_inputs, source_prefix, rust_source_root):
+def _probe_source_context(additional_inputs, source_prefix, rust_source_root, renamed_paths = {}):
     unexpected = sorted([name for name in additional_inputs if name not in _SOURCE_INPUTS])
     if unexpected:
         fail("Linux probe expansion has unexpected additional inputs %r" % unexpected)
@@ -146,11 +142,12 @@ def _probe_source_context(additional_inputs, source_prefix, rust_source_root):
     if not has_source_files:
         if "rust_source_files" in additional_inputs:
             fail("Linux probe expansion cannot receive Rust sources without Linux sources")
-        if source_prefix or rust_source_root:
+        if source_prefix or rust_source_root or renamed_paths:
             fail("Linux probe expansion has source-root params without source inputs")
         return struct(
             files = {},
             kernel_files = depset(),
+            rust_paths = {},
             linux_root = None,
             rust_files = depset(),
             rust_root = "",
@@ -161,9 +158,9 @@ def _probe_source_context(additional_inputs, source_prefix, rust_source_root):
     linux_root = additional_inputs["source_root"]
     files = {}
     for file in kernel_files.to_list():
-        _record_source(files, _kernel_source_path(file, source_prefix), file, "mapped Linux source")
+        _record_source(files, _kernel_source_path(file, source_prefix, renamed_paths), file, "mapped Linux source")
 
-    root_path = _kernel_source_path(linux_root, source_prefix)
+    root_path = _kernel_source_path(linux_root, source_prefix, renamed_paths)
     if root_path != "Kconfig":
         fail("Linux probe source_root must be the declared Kconfig, got %r" % root_path)
     indexed_root = files.get("Kconfig")
@@ -199,6 +196,7 @@ def _probe_source_context(additional_inputs, source_prefix, rust_source_root):
     return struct(
         files = files,
         kernel_files = kernel_files,
+        rust_paths = rust_files_by_path,
         linux_root = linux_root,
         rust_files = rust_files,
         rust_root = rust_source_root,
@@ -530,6 +528,7 @@ def expand_linux_probe_plan(template_ctx, input_directories, output_directories,
         additional_inputs,
         additional_params.get("source_prefix", ""),
         additional_params.get("rust_source_root", ""),
+        json.decode(additional_params.get("renamed_paths", "{}")),
     )
     if sorted(output_directories.keys()) != [_RESULT_DIRECTORY]:
         fail("Linux probe expansion requires exactly the %s output directory" % _RESULT_DIRECTORY)
@@ -617,16 +616,13 @@ def expand_linux_probe_plan(template_ctx, input_directories, output_directories,
         source_bindings = _node_source_bindings(node_id, node, source_context, input_directories)
         for source in sorted(source_bindings.sources):
             file = source_bindings.sources[source]
-            _add_artifact_path(args, "-source", file, format = source + "=%s")
-            inputs.append(file)
+            if source_bindings.linux_anchor != None and source not in source_context.rust_paths:
+                add_linux_source_arg(args, "-source", tools["source_runfiles"], source, prefix = source + "=")
+            else:
+                _add_artifact_path(args, "-source", file, format = source + "=%s")
+                inputs.append(file)
         if source_bindings.linux_anchor != None:
-            _add_artifact_path(
-                args,
-                "-source_root_anchor",
-                source_bindings.linux_anchor,
-                format = _LINUX_SOURCE_ROOT + "=%s",
-            )
-            inputs.append(source_bindings.linux_anchor)
+            add_linux_source_arg(args, "-source_root_anchor", tools["source_runfiles"], "Kconfig", prefix = _LINUX_SOURCE_ROOT + "=")
         if source_bindings.rust_root:
             args.add("-source_root", _RUST_SOURCE_ROOT + "=" + source_bindings.rust_root)
             _add_artifact_path(
@@ -657,7 +653,7 @@ def expand_linux_probe_plan(template_ctx, input_directories, output_directories,
             _add_artifact_path(args, "-toolset_marker", identity.file, format = identity_scope + "=%s")
             inputs.append(identity.file)
 
-        selected_tools = []
+        selected_tools = [tools["source_runfiles"]] if source_bindings.linux_anchor != None else []
         for tool_name, runtime_tool in sorted(tools.items()):
             if not tool_name.startswith(_ROLE_TOOL_PREFIX):
                 continue
@@ -770,7 +766,8 @@ def linux_probe_map_directory_params(
         source_prefix = "",
         rust_source_root = "",
         host_action_args = None,
-        host_action_environments = None):
+        host_action_environments = None,
+        renamed_paths = {}):
     """Flattens exact configured action envelopes into Bazel 9 scalar params."""
     if scope not in _SCOPES:
         fail("Linux probe map_directory has invalid scope %r" % scope)
@@ -786,6 +783,7 @@ def linux_probe_map_directory_params(
         "rust_source_root": rust_source_root,
         "scope": scope,
         "source_prefix": source_prefix,
+        "renamed_paths": json.encode(renamed_paths),
     }
     if (host_action_args == None) != (host_action_environments == None):
         fail("Linux probe host action arguments and environments must be supplied together")
@@ -827,13 +825,16 @@ def linux_probe_map_directory_tools(
         host_toolchain_files = None,
         host_toolset_manifest = None,
         host_toolset_anchors = None,
-        host_companion_tools = None):
+        host_companion_tools = None,
+        source_runfiles = None):
     """Namespaces configured probe tools away from callback implementation tools."""
     values = {
         _RUNNER_TOOL: runner,
         _TOOLCHAIN_FILES: toolchain_files,
         _TOOLSET_MANIFEST: toolset_manifest,
     }
+    if source_runfiles != None:
+        values["source_runfiles"] = source_runfiles
     if not toolset_anchors:
         fail("Linux probe map_directory has no toolset root anchors")
     for root, anchor in toolset_anchors.items():
@@ -913,7 +914,7 @@ def linux_test_select_prior_host_result_paths(scope, parsed, paths):
         directory = struct(children = [struct(tree_relative_path = path) for path in paths])
     return sorted(_select_prior_host_results(scope, parsed.nodes, directory).keys())
 
-def _test_source_context(kernel_paths, source_prefix, rust_paths, rust_source_root):
+def _test_source_context(kernel_paths, source_prefix, rust_paths, rust_source_root, renamed_paths):
     kernel_files = [
         struct(path = path, short_path = path, test_identity = str(index))
         for index, path in enumerate(kernel_paths)
@@ -921,7 +922,7 @@ def _test_source_context(kernel_paths, source_prefix, rust_paths, rust_source_ro
     root_candidates = [
         file
         for file in kernel_files
-        if _kernel_source_path(file, source_prefix) == "Kconfig"
+        if _kernel_source_path(file, source_prefix, renamed_paths) == "Kconfig"
     ]
     source_root = root_candidates[0] if root_candidates else struct(
         path = "missing/Kconfig",
@@ -938,19 +939,21 @@ def _test_source_context(kernel_paths, source_prefix, rust_paths, rust_source_ro
             for index, path in enumerate(rust_paths)
         ]
         additional_inputs["rust_source_files"] = depset(rust_files)
-    return _probe_source_context(additional_inputs, source_prefix, rust_source_root)
+    return _probe_source_context(additional_inputs, source_prefix, rust_source_root, renamed_paths)
 
 def linux_test_index_probe_source_paths(
         kernel_paths,
         source_prefix,
         rust_paths = None,
-        rust_source_root = ""):
+        rust_source_root = "",
+        renamed_paths = {}):
     """Returns production logical source keys for path-only test artifacts."""
     return sorted(_test_source_context(
         kernel_paths,
         source_prefix,
         rust_paths,
         rust_source_root,
+        renamed_paths,
     ).files)
 
 def linux_test_resolve_probe_source_paths(
@@ -959,9 +962,10 @@ def linux_test_resolve_probe_source_paths(
         kernel_paths,
         source_prefix,
         rust_paths = None,
-        rust_source_root = ""):
+        rust_source_root = "",
+        renamed_paths = {}):
     """Resolves one parsed node through the production source/root binder."""
-    context = _test_source_context(kernel_paths, source_prefix, rust_paths, rust_source_root)
+    context = _test_source_context(kernel_paths, source_prefix, rust_paths, rust_source_root, renamed_paths)
     bindings = _node_source_bindings(node_id, parsed.nodes[node_id], context, {})
     return struct(
         linux_anchor = bindings.linux_anchor.short_path if bindings.linux_anchor != None else "",

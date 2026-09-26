@@ -5,6 +5,7 @@ load("@rules_cc//cc:find_cc_toolchain.bzl", "CC_TOOLCHAIN_TYPE", "use_cc_toolcha
 load("@rules_flex//flex:toolchain_type.bzl", "FLEX_TOOLCHAIN_TYPE")
 load("@rules_m4//m4:toolchain_type.bzl", "M4_TOOLCHAIN_TYPE")
 load(":execution_platform.bzl", "linux_execution_platform_attr", "linux_execution_platform_label")
+load(":linux_source_runfiles.bzl", "add_linux_source_arg", "linux_source_path")
 load(
     ":mapped_kernel.bzl",
     "expand_linux_plan_stage",
@@ -280,9 +281,9 @@ def _planner_inputs(sdk, staged, extra = []):
     return depset(direct = direct, transitive = [sdk.source, sdk.rust_source_files])
 
 def _add_planner_contract_args(args, sdk, staged):
-    args.add("-root", sdk.source_root)
-    args.add("-srctree", sdk.source_root)
-    args.add("-kbuild", sdk.kbuild)
+    add_linux_source_arg(args, "-root", sdk.source_runfiles, "Kconfig")
+    add_linux_source_arg(args, "-srctree", sdk.source_runfiles, "Kconfig")
+    add_linux_source_arg(args, "-kbuild", sdk.source_runfiles, linux_source_path(sdk.kbuild, _source_prefix(sdk), sdk.renamed_source_paths))
     _add_artifact_path(args, "-native_config", sdk.config_tree)
     args.add("-kernel_version", sdk.version)
     _add_artifact_path(args, "-target_toolset_identity", sdk.target_toolset_identity)
@@ -350,6 +351,7 @@ def _kbuild_probe_actions(ctx, sdk, staged):
     _add_artifact_path(args, "-kbuild_probe_plan_out", plan)
     ctx.actions.run(
         executable = ctx.executable._planner,
+        tools = [sdk.source_runfiles],
         inputs = _planner_inputs(sdk, staged),
         outputs = [plan],
         arguments = [args],
@@ -372,12 +374,14 @@ def _kbuild_probe_actions(ctx, sdk, staged):
             sdk.host_toolset_manifest,
             sdk.host_toolset_anchors,
             sdk.host_companion_tools,
+            source_runfiles = sdk.source_runfiles,
         ),
         additional_params = linux_probe_map_directory_params(
             "host",
             sdk.host_action_args,
             sdk.host_action_environments,
             source_prefix = _source_prefix(sdk),
+            renamed_paths = sdk.renamed_source_paths,
             rust_source_root = sdk.rust_source_root,
         ),
         env = {},
@@ -402,12 +406,14 @@ def _kbuild_probe_actions(ctx, sdk, staged):
             host_toolset_manifest = sdk.host_toolset_manifest,
             host_toolset_anchors = sdk.host_toolset_anchors,
             host_companion_tools = sdk.host_companion_tools,
+            source_runfiles = sdk.source_runfiles,
         ),
         additional_params = linux_probe_map_directory_params(
             "target",
             sdk.target_action_args,
             sdk.target_action_environments,
             source_prefix = _source_prefix(sdk),
+            renamed_paths = sdk.renamed_source_paths,
             rust_source_root = sdk.rust_source_root,
             host_action_args = sdk.host_action_args,
             host_action_environments = sdk.host_action_environments,
@@ -437,6 +443,7 @@ def _external_action_plan(ctx, sdk, staged, probes):
         )
     ctx.actions.run(
         executable = ctx.executable._planner,
+        tools = [sdk.source_runfiles],
         inputs = _planner_inputs(sdk, staged, extra = [probes.host, probes.target]),
         outputs = [plans[stage] for stage in _PLAN_STAGES],
         arguments = [args],
@@ -482,7 +489,7 @@ def _map_external_plan(ctx, sdk, plans, staged):
     mapped_requirements["supports-path-mapping"] = "1"
 
     def mapped_tools(runner, scope):
-        return linux_map_directory_tools(
+        tools = linux_map_directory_tools(
             runner,
             scope,
             sdk.target_tool_files,
@@ -496,6 +503,8 @@ def _map_external_plan(ctx, sdk, plans, staged):
             sdk.target_companion_tools,
             sdk.host_companion_tools,
         )
+        tools["source_runfiles"] = sdk.source_runfiles
+        return tools
 
     def mapped_params(stage, input_tree_aliases = {}, output_tree_bases = {}):
         return linux_map_directory_params(
@@ -507,6 +516,7 @@ def _map_external_plan(ctx, sdk, plans, staged):
             sdk.host_action_environments,
             input_tree_aliases = input_tree_aliases,
             output_tree_bases = output_tree_bases,
+            renamed_paths = sdk.renamed_source_paths,
         )
 
     ctx.actions.map_directory(

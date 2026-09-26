@@ -6,10 +6,7 @@ source_overlay_package_marker_test(name = "source_overlay_package_marker_test")
 go_test(
     name = "source_repo_test",
     size = "medium",
-    srcs = [
-        "source_overlay_repository_test.go",
-        "source_repo_test.go",
-    ],
+    srcs = ["source_overlay_repository_test.go"],
     data = [
         "//:source_repo.BUILD.bazel",
         "//:source_repository_test_bazel_version",

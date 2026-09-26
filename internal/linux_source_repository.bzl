@@ -5,6 +5,7 @@ load(
     ":repository_utils.bzl",
     "linux_makefile_version",
 )
+load(":source_patch.bzl", "translate_linux_source_patch")
 
 visibility("//...")
 
@@ -25,11 +26,46 @@ _KERNEL_RELEASES = {
     ),
 }
 
+# These upstream names collide on case-insensitive hosts. Both members must be
+# moved before extraction: moving them afterward has already lost source bytes.
+# Verified against Linux 5.10.270, 6.12.96, and 6.18.39; this is an inventory of
+# Linux paths, not general archive collision detection.
+_CASE_COLLIDING_SOURCE_PATHS = [
+    "include/uapi/linux/netfilter/xt_CONNMARK.h",
+    "include/uapi/linux/netfilter/xt_connmark.h",
+    "include/uapi/linux/netfilter/xt_DSCP.h",
+    "include/uapi/linux/netfilter/xt_dscp.h",
+    "include/uapi/linux/netfilter/xt_MARK.h",
+    "include/uapi/linux/netfilter/xt_mark.h",
+    "include/uapi/linux/netfilter/xt_RATEEST.h",
+    "include/uapi/linux/netfilter/xt_rateest.h",
+    "include/uapi/linux/netfilter/xt_TCPMSS.h",
+    "include/uapi/linux/netfilter/xt_tcpmss.h",
+    "include/uapi/linux/netfilter_ipv4/ipt_ECN.h",
+    "include/uapi/linux/netfilter_ipv4/ipt_ecn.h",
+    "include/uapi/linux/netfilter_ipv4/ipt_TTL.h",
+    "include/uapi/linux/netfilter_ipv4/ipt_ttl.h",
+    "include/uapi/linux/netfilter_ipv6/ip6t_HL.h",
+    "include/uapi/linux/netfilter_ipv6/ip6t_hl.h",
+    "net/netfilter/xt_DSCP.c",
+    "net/netfilter/xt_dscp.c",
+    "net/netfilter/xt_HL.c",
+    "net/netfilter/xt_hl.c",
+    "net/netfilter/xt_RATEEST.c",
+    "net/netfilter/xt_rateest.c",
+    "net/netfilter/xt_TCPMSS.c",
+    "net/netfilter/xt_tcpmss.c",
+    "tools/memory-model/litmus-tests/Z6.0+pooncelock+poonceLock+pombonce.litmus",
+    "tools/memory-model/litmus-tests/Z6.0+pooncelock+pooncelock+pombonce.litmus",
+]
+
 # Case-insensitive filesystems treat Linux's tools/**/Build make fragments as
 # Bazel package markers. Relocate them on every host for identical repositories.
 _TOOLS_BUILD_FILE = "Build"
 _TOOLS_BUILD_FILE_RELOCATED = "Build.linux-bzl"
 _TOOLS_MAX_DEPTH = 64
+_SOURCE_DIRECTORIES_MARKER = "    # __LINUX_BZL_SOURCE_DIRECTORIES__"
+_RENAMED_SOURCE_PATHS_MARKER = "    # __LINUX_BZL_RENAMED_SOURCE_PATHS__"
 _SOURCE_OVERLAY_FILES_MARKER = "    # __LINUX_BZL_SOURCE_OVERLAY_FILES__"
 _MODULE_TARGET_NAME_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_-"
 _RESERVED_IMAGE_TARGETS = {
@@ -221,8 +257,12 @@ def _integrate_in_tree_modules(rctx):
         content += "\n".join(['source "%s"' % path for path in kconfig_roots]) + "\n"
         rctx.file(root, content, executable = False)
 
-def _relocate_tools_build_files(rctx, tools):
-    relocated = 0
+def _relocate_tools_build_files(rctx):
+    tools = rctx.path("tools")
+    if not tools.exists:
+        return {}
+    renamed_paths = {}
+    root_prefix = str(rctx.path("")) + "/"
     directories = [tools]
     for _ in range(_TOOLS_MAX_DEPTH):
         if not directories:
@@ -233,41 +273,13 @@ def _relocate_tools_build_files(rctx, tools):
                 if entry.is_dir:
                     next_directories.append(entry)
                 elif entry.basename == _TOOLS_BUILD_FILE:
-                    rctx.rename(
-                        entry,
-                        entry.dirname.get_child(_TOOLS_BUILD_FILE_RELOCATED),
-                    )
-                    relocated += 1
+                    relocated = entry.dirname.get_child(_TOOLS_BUILD_FILE_RELOCATED)
+                    rctx.rename(entry, relocated)
+                    renamed_paths[str(relocated)[len(root_prefix):]] = str(entry)[len(root_prefix):]
         directories = next_directories
     if directories:
         fail("Linux tools directory exceeds the supported traversal depth")
-    return relocated
-
-def _normalize_tools_build_files(rctx):
-    tools = rctx.path("tools")
-    if not tools.exists:
-        return
-
-    relocated = _relocate_tools_build_files(rctx, tools)
-    if relocated == 0:
-        return
-
-    makefile = rctx.path("tools/build/Makefile.build")
-    if not makefile.exists:
-        fail("Linux tools contain Build files but no tools/build/Makefile.build")
-
-    build_file_assignment = "build-file := $(dir)/Build\n"
-    relocated_assignment = "build-file := $(dir)/%s\n" % _TOOLS_BUILD_FILE_RELOCATED
-    content = rctx.read(makefile)
-    if build_file_assignment not in content:
-        fail(
-            "Linux tools/build/Makefile.build does not contain the expected Build assignment",
-        )
-    rctx.file(
-        makefile,
-        content.replace(build_file_assignment, relocated_assignment),
-        executable = False,
-    )
+    return renamed_paths
 
 def _linux_source_repository_impl(rctx):
     validate_linux_module_make_vars(
@@ -299,15 +311,41 @@ def _linux_source_repository_impl(rctx):
     if rctx.attr.patch_strip < 0:
         fail("patch_strip must be non-negative")
 
+    source_paths = {
+        path: "linux-bzl-source-files/%d/%s" % (index, path.rsplit("/", 1)[-1])
+        for index, path in enumerate(_CASE_COLLIDING_SOURCE_PATHS)
+    }
+
+    # Match the native extractor's normalized, relative strip prefix before
+    # constructing rename_files keys, which refer to the original tar names.
+    archive_components = []
+    for component in strip_prefix.split("/"):
+        if component in ["", "."]:
+            continue
+        if component == ".." and archive_components and archive_components[-1] != "..":
+            archive_components.pop()
+        elif component != ".." or not strip_prefix.startswith("/"):
+            archive_components.append(component)
+    archive_prefix = "/".join(archive_components) + "/" if archive_components else ""
     rctx.download_and_extract(
         url = urls,
         integrity = integrity,
         strip_prefix = strip_prefix,
+        rename_files = {archive_prefix + logical: archive_prefix + physical for logical, physical in source_paths.items()},
         canonical_id = "linux.bzl-source-%s-%s" % (rctx.attr.version, integrity),
     )
     for patch in rctx.attr.patches:
-        rctx.patch(patch, strip = rctx.attr.patch_strip)
-    _normalize_tools_build_files(rctx)
+        content = rctx.read(patch)
+        translated = translate_linux_source_patch(content, rctx.attr.patch_strip, source_paths)
+        if translated == content:
+            rctx.patch(patch, strip = rctx.attr.patch_strip)
+        else:
+            translated_patch = rctx.path("linux-bzl-source.patch")
+            rctx.file(translated_patch, translated, executable = False)
+            rctx.patch(translated_patch, strip = rctx.attr.patch_strip)
+            rctx.delete(translated_patch)
+    renamed_paths = {physical: logical for logical, physical in source_paths.items() if rctx.path(physical).exists}
+    renamed_paths.update(_relocate_tools_build_files(rctx))
     overlay_files = _stage_source_overlays(rctx)
     _integrate_in_tree_modules(rctx)
     module_targets = _module_targets(rctx)
@@ -333,10 +371,35 @@ def _linux_source_repository_impl(rctx):
         _SOURCE_OVERLAY_FILES_MARKER,
         "\n".join(["    %r," % path for path in overlay_files]),
     )
-    source_build = "load(%r, \"linux_source_runfiles\")\n\n%s" % (
+    if _RENAMED_SOURCE_PATHS_MARKER not in source_build:
+        fail("source repository BUILD template is missing the renamed source paths marker")
+    source_build = source_build.replace(
+        _RENAMED_SOURCE_PATHS_MARKER,
+        "\n".join(["    %r: %r," % (physical, renamed_paths[physical]) for physical in sorted(renamed_paths)]),
+    )
+    directories = {}
+    for logical in renamed_paths.values():
+        parts = logical.split("/")
+        for depth in range(1, len(parts)):
+            directories["/".join(parts[:depth])] = True
+    if _SOURCE_DIRECTORIES_MARKER not in source_build:
+        fail("source repository BUILD template is missing the source directories marker")
+    source_build = source_build.replace(
+        _SOURCE_DIRECTORIES_MARKER,
+        "\n".join(["    %r," % directory for directory in sorted(directories)]),
+    )
+    source_build = "load(%r, \"linux_source_directory\", \"linux_source_runfiles\")\n\n%s" % (
         str(rctx.attr._source_runfiles_bzl),
         source_build,
     )
+    source_build += "\n" + "\n".join([
+        "alias(name = %r, actual = %r)" % (renamed_paths[physical], physical)
+        for physical in sorted(renamed_paths)
+    ]) + "\n"
+    source_build += "\n".join([
+        "linux_source_directory(name = %r, path = %r, source = \":linux_bzl_source_runfiles\")" % (directory, directory)
+        for directory in sorted(directories)
+    ]) + "\n"
     rctx.file("BUILD.bazel", source_build, executable = False)
 
     # Image repositories are deliberately thin: expose only immutable source

@@ -8,8 +8,8 @@ load(
     "expand_linux_family_plan",
     "linux_map_directory_tools",
     "linux_test_add_family_input_set_bindings",
-    "linux_test_add_family_source_binding",
     "linux_test_add_input_set_args",
+    "linux_test_add_source_binding",
     "linux_test_artifact_root_relative",
     "linux_test_bind_input_sets",
     "linux_test_canonical_file_path",
@@ -3228,15 +3228,15 @@ def _mapped_kernel_backend_test_impl(ctx):
     )
     source_descriptor = struct(file = first_exact_source, namespace = "kernel", path = "drivers/percent%s input.c")
     source_args = _fake_args([])
-    linux_test_add_family_source_binding(source_args, "-source", "source:00000000", source_descriptor, source_bundle)
+    linux_test_add_source_binding(source_args, "-source", "source:00000000", source_descriptor, source_bundle)
     asserts.equals(env, ["source:00000000=" + str(source_bundle_anchor) + ".runfiles/kernel/drivers/percent%s input.c"], _flag_values(source_args.values, "-source"))
     asserts.equals(env, [source_bundle_anchor], source_args.typed_values)
     private_args = _fake_args([])
-    linux_test_add_family_source_binding(private_args, "-source", "source:00000000", source_descriptor)
+    linux_test_add_source_binding(private_args, "-source", "source:00000000", source_descriptor)
     asserts.equals(env, [first_exact_source], private_args.typed_values)
     config_args = _fake_args([])
     config_descriptor = struct(file = root_kconfig, namespace = "capsule", path = "autoconf.h")
-    linux_test_add_family_source_binding(config_args, "-source", "config:00000000", config_descriptor, source_bundle)
+    linux_test_add_source_binding(config_args, "-source", "config:00000000", config_descriptor, source_bundle)
     asserts.equals(env, [root_kconfig], config_args.typed_values)
 
     # Every noncurrent descriptor in a trusted stage shard is exact and must be

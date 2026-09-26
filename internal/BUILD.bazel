@@ -26,6 +26,7 @@ filegroup(
         "linux_source_runfiles.bzl",
         "module_make_vars.bzl",
         "repository_utils.bzl",
+        "source_patch.bzl",
     ],
     visibility = ["//internal/tests/source_repo:__pkg__"],
 )

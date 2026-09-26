@@ -47,6 +47,8 @@ LinuxModuleSdkInfo = provider(
         "sdk": "Execution-time kernel SDK TreeArtifact.",
         "source": "Depset of declared kernel source Files available to mapped external actions.",
         "source_root": "Root Kconfig File anchoring source paths.",
+        "source_runfiles": "Exact source FilesToRunProvider exposing upstream logical names.",
+        "renamed_source_paths": "Physical source-root-relative paths mapped to upstream names.",
         "target_action_args": "Configured linux-kbuild-* target action argv by role.",
         "target_action_environments": "Exact configured target action environment by tool role.",
         "target_action_requirements": "Exact configured target execution requirements by tool role.",

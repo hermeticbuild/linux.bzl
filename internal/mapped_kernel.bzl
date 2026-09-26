@@ -10,7 +10,7 @@ load("@rules_m4//m4:toolchain_type.bzl", "M4_TOOLCHAIN_TYPE", "m4_toolchain")
 load(":execution_platform.bzl", "linux_execution_platform_attr", "linux_execution_platform_label")
 load(":host_cc_toolchain.bzl", "host_cc_toolchain", "host_cc_toolchain_attr")
 load(":image_name_validation.bzl", "validate_linux_overlay_name")
-load(":linux_source_runfiles.bzl", "validate_linux_source_runfiles")
+load(":linux_source_runfiles.bzl", "LinuxSourcePathsInfo", "add_linux_source_arg", "linux_source_path", "validate_linux_source_runfiles")
 load(":module_make_vars.bzl", "validate_linux_module_make_vars")
 load(":platform_transition_gateway.bzl", "linux_platform_transition")
 load(
@@ -718,21 +718,16 @@ def _add_family_input_set_bindings(args, producer_artifacts, what):
 def linux_test_add_family_input_set_bindings(args, producer_artifacts):
     _add_family_input_set_bindings(args, producer_artifacts, "test family input set")
 
-def _add_family_source_binding(args, flag, key, source, source_runfiles = None):
+def _add_source_binding(args, flag, key, source, source_runfiles = None):
     """Keeps opaque source operands and their complete aggregate in one tree."""
     if source_runfiles != None and source.namespace == "kernel":
         _validate_path(source.path, "opaque kernel source")
-        args.add_joined(
-            flag,
-            [key + "=", _tool_executable(source_runfiles), ".runfiles/kernel/", source.path],
-            expand_directories = False,
-            join_with = "",
-        )
+        add_linux_source_arg(args, flag, source_runfiles, source.path, prefix = key + "=")
     else:
         _add_artifact_path(args, flag, source.file, format = key + "=%s")
 
-def linux_test_add_family_source_binding(args, flag, key, source, source_runfiles = None):
-    _add_family_source_binding(args, flag, key, source, source_runfiles)
+def linux_test_add_source_binding(args, flag, key, source, source_runfiles = None):
+    _add_source_binding(args, flag, key, source, source_runfiles)
 
 def _add_input_set_args(args, root, input_sets, bound, what, family = False, sources = None, source_runfiles = None):
     """Wires one set closure through the runner's bounded argument transport."""
@@ -770,7 +765,7 @@ def _add_input_set_args(args, root, input_sets, bound, what, family = False, sou
             source = sources.get(source_id) if sources != None else None
             if source == None or source.file != source_artifacts[source_id]:
                 fail("%s has inconsistent source provenance for aggregate binding %s" % (what, source_id))
-            _add_family_source_binding(args, "-input_set_source", source_id, source, source_runfiles)
+            _add_source_binding(args, "-input_set_source", source_id, source, source_runfiles)
         else:
             _add_artifact_path(args, "-input_set_source", source_artifacts[source_id], format = source_id + "=%s")
     if not family:
@@ -1083,14 +1078,10 @@ def _parse_plan(plan, input_directories, additional_inputs, source_prefix, stage
         selected_source_keys[marker.namespace + "/" + marker.path] = True
         selected_source_namespaces[marker.namespace] = True
     source_children = {}
+    renamed_paths = json.decode(additional_params.get("renamed_paths", "{}"))
     if "kernel" in selected_source_namespaces:
         for file in additional_inputs["source_files"].to_list():
-            canonical = file.short_path
-            if source_prefix:
-                prefix = source_prefix + "/"
-                if not canonical.startswith(prefix):
-                    fail("mapped Linux source input %s is outside %s" % (file, source_prefix))
-                canonical = canonical[len(prefix):]
+            canonical = linux_source_path(file, source_prefix, renamed_paths)
             key = "kernel/" + canonical
             if key not in selected_source_keys:
                 continue
@@ -1167,7 +1158,7 @@ def _record_family_source_child(source_children, key, file):
 def linux_test_record_family_source_child(source_children, key, file):
     _record_family_source_child(source_children, key, file)
 
-def _parse_family_plan(plan, input_directories, additional_inputs, source_prefix):
+def _parse_family_plan(plan, input_directories, additional_inputs, source_prefix, renamed_paths = {}):
     """Parses one lossless, symmetric plan for every image-family variant."""
     node_index = _parse_plan_node_index(plan)
     has_schema = False
@@ -1443,12 +1434,7 @@ def _parse_family_plan(plan, input_directories, additional_inputs, source_prefix
     }
     source_children = {}
     for file in additional_inputs["source_files"].to_list():
-        canonical = file.short_path
-        if source_prefix:
-            prefix = source_prefix + "/"
-            if not canonical.startswith(prefix):
-                fail("mapped Linux family source input %s is outside %s" % (file, source_prefix))
-            canonical = canonical[len(prefix):]
+        canonical = linux_source_path(file, source_prefix, renamed_paths)
         key = "kernel/" + canonical
         if key in selected_source_keys:
             _record_family_source_child(source_children, key, file)
@@ -1978,12 +1964,15 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
         input_bindings = node["input_bindings"]
         _add_artifact_path(args, "-input_bindings", input_bindings.file)
         args.add("-expected_input_bindings_id", input_bindings.id)
+        source_runfiles = tools["source_runfiles"] if "kernel" in node["trees"] else None
         input_set_inputs = _add_input_set_args(
             args,
             node.get("input_set"),
             parsed.input_sets,
             bound_input_sets,
             "mapped Linux node %s" % node_id,
+            sources = parsed.sources,
+            source_runfiles = source_runfiles,
         )
         for tree, root in sorted(artifact_tree_roots.items()):
             _add_artifact_path(args, "-artifact_tree", root, format = tree + "=%s")
@@ -1992,7 +1981,7 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
             source = parsed.sources.get(source_id)
             if source == None:
                 fail("mapped Linux node %s references unknown source %s" % (node_id, source_id))
-            _add_artifact_path(args, "-source", source.file, format = key + "=%s")
+            _add_source_binding(args, "-source", key, source, source_runfiles)
             inputs.append(source.file)
         for key in sorted(bindings):
             inputs.append(bindings[key])
@@ -2027,12 +2016,8 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
             transitive_inputs.append(input_set_inputs)
         for tree in sorted(node["trees"]):
             if tree == "kernel" and root_marker != None:
-                # source_root is a File because Args can path-map Files,
-                # but cannot path-map an artifact's dirname string. The
-                # runner accepts the marker and resolves its directory.
-                tree_path = root_marker
-                inputs.append(root_marker)
-                transitive_inputs.append(additional_inputs["source_files"])
+                add_linux_source_arg(args, "-input_tree", source_runfiles, "Kconfig", prefix = "kernel=")
+                continue
             elif _tree_input_directory_name(tree, input_directories, output_directories, additional_params) in input_directories:
                 directory = input_directories[_tree_input_directory_name(tree, input_directories, output_directories, additional_params)]
                 tree_path = directory.directory
@@ -2130,6 +2115,8 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
             )
 
         action_tools = [tools[_TOOLCHAIN_FILES_PREFIX + selected_scope] for selected_scope in sorted(selected_scopes)] + [tools[_TOOLSET_MANIFEST_PREFIX + selected_scope] for selected_scope in sorted(selected_scopes)] + ([selected_tool] if role != "generated" else []) + selected_auxiliary_tools + selected_companion_tools
+        if source_runfiles != None:
+            action_tools.append(source_runfiles)
         transport = args.finish(tools["runner"], work_directory, node_id, depset(inputs, transitive = transitive_inputs), action_tools)
         inputs.extend(transport.inputs)
         template_ctx.run(
@@ -2462,6 +2449,7 @@ def expand_linux_family_plan(template_ctx, input_directories, output_directories
         input_directories,
         additional_inputs,
         additional_params["source_prefix"],
+        json.decode(additional_params.get("renamed_paths", "{}")),
     )
     toolsets = _validate_plan_toolsets(parsed, input_directories)
     action_contracts = _render_toolchain_action_contracts(additional_params, tools)
@@ -2640,7 +2628,7 @@ def expand_linux_family_plan(template_ctx, input_directories, output_directories
             source = parsed.sources.get(source_id)
             if source == None:
                 fail("mapped Linux family node %s references unknown source %s" % (node_id, source_id))
-            _add_family_source_binding(args, "-source", key, source, opaque_source_runfiles)
+            _add_source_binding(args, "-source", key, source, opaque_source_runfiles)
             inputs.append(source.file)
             source_artifacts[key] = source.file
         inputs.extend([bindings[key] for key in sorted(bindings)])
@@ -3855,8 +3843,9 @@ def linux_map_directory_params(
         host_action_args,
         host_action_environments,
         input_tree_aliases = {},
-        output_tree_bases = {}):
-    params = {"source_prefix": source_prefix, "stage": stage}
+        output_tree_bases = {},
+        renamed_paths = {}):
+    params = {"source_prefix": source_prefix, "stage": stage, "renamed_paths": json.encode(renamed_paths)}
     for tree, directory_name in input_tree_aliases.items():
         if tree not in _TREES or not _valid_name(directory_name):
             fail("mapped Linux %s stage has invalid input-tree alias %r=%r" % (stage, tree, directory_name))
@@ -4010,7 +3999,7 @@ def _register_family_execution_segment(ctx, segment, initial, plans, stores, cut
 def linux_test_register_family_execution_segment(ctx, **kwargs):
     _register_family_execution_segment(ctx, **kwargs)
 
-def _native_kconfig_tool(ctx, planner_args, planner_inputs, source_inputs, source_prefix, rust_source_root, scopes, host_deps):
+def _native_kconfig_tool(ctx, planner_args, planner_inputs, source_inputs, source_prefix, rust_source_root, scopes, host_deps, source_runfiles, renamed_paths):
     """Builds the source's conf target through the ordinary per-object stages."""
     requirements = _merge_execution_requirements(
         "native Kconfig target toolset",
@@ -4021,9 +4010,10 @@ def _native_kconfig_tool(ctx, planner_args, planner_inputs, source_inputs, sourc
     probe_plan = ctx.actions.declare_directory(prefix + ".probe-plan")
     discovery_args = ctx.actions.args()
     discovery_args.add("-native_config_tool")
-    discovery_args.add("-kbuild", ctx.file.kbuild)
+    add_linux_source_arg(discovery_args, "-kbuild", source_runfiles, linux_source_path(ctx.file.kbuild, source_prefix, renamed_paths))
     _add_artifact_path(discovery_args, "-kbuild_probe_plan_out", probe_plan)
     ctx.actions.run(
+        tools = [source_runfiles],
         executable = ctx.executable._planner,
         inputs = planner_inputs,
         outputs = [probe_plan],
@@ -4068,6 +4058,7 @@ def _native_kconfig_tool(ctx, planner_args, planner_inputs, source_inputs, sourc
                 selected.manifest,
                 selected.anchors,
                 selected.toolset.companion_tools,
+                source_runfiles = source_runfiles,
                 **host_arguments
             ),
             additional_params = linux_probe_map_directory_params(
@@ -4075,6 +4066,7 @@ def _native_kconfig_tool(ctx, planner_args, planner_inputs, source_inputs, sourc
                 selected.toolset.arguments,
                 selected.toolset.environments,
                 source_prefix = source_prefix,
+                renamed_paths = renamed_paths,
                 rust_source_root = rust_source_root,
                 **host_params
             ),
@@ -4085,7 +4077,7 @@ def _native_kconfig_tool(ctx, planner_args, planner_inputs, source_inputs, sourc
         )
     replay_args = ctx.actions.args()
     replay_args.add("-native_config_tool")
-    replay_args.add("-kbuild", ctx.file.kbuild)
+    add_linux_source_arg(replay_args, "-kbuild", source_runfiles, linux_source_path(ctx.file.kbuild, source_prefix, renamed_paths))
     for scope in ["host", "target"]:
         _add_artifact_path(replay_args, "-" + scope + "_kbuild_probe_results", results[scope])
     plans = {}
@@ -4095,6 +4087,7 @@ def _native_kconfig_tool(ctx, planner_args, planner_inputs, source_inputs, sourc
         plans[stage] = ctx.actions.declare_directory(prefix + ".plan-" + stage)
         _add_artifact_path(replay_args, "-action_plan_stage_out", plans[stage], format = stage + "=%s")
     ctx.actions.run(
+        tools = [source_runfiles],
         executable = ctx.executable._planner,
         inputs = depset(direct = results.values(), transitive = [planner_inputs]),
         outputs = plans.values() + [descriptor],
@@ -4131,6 +4124,7 @@ def _native_kconfig_tool(ctx, planner_args, planner_inputs, source_inputs, sourc
             scopes["target"].toolset.companion_tools,
             scopes["host"].toolset.companion_tools,
         )
+        tools["source_runfiles"] = source_runfiles
         ctx.actions.map_directory(
             implementation = expand_linux_plan_stage,
             input_directories = inputs,
@@ -4144,6 +4138,7 @@ def _native_kconfig_tool(ctx, planner_args, planner_inputs, source_inputs, sourc
                 scopes["target"].toolset.environments,
                 scopes["host"].toolset.arguments,
                 scopes["host"].toolset.environments,
+                renamed_paths = renamed_paths,
             ),
             env = {},
             execution_requirements = dict(requirements, **{"supports-path-mapping": "1"}),
@@ -4188,10 +4183,12 @@ def _family_variant_plan_outputs(ctx, variant_names, initial):
 
 def _linux_mapped_kernel_family_impl(ctx):
     validate_linux_module_make_vars(ctx.attr.module_make_vars, str(ctx.label))
+    renamed_paths = ctx.attr.source_runfiles[LinuxSourcePathsInfo].renamed_paths
     source_runfiles = validate_linux_source_runfiles(
         ctx.attr.source_runfiles[DefaultInfo],
         ctx.files.source_files,
         ctx.file.source_root,
+        renamed_paths,
     )
     target_execution_platform = linux_execution_platform_label(ctx.attr._target_execution_platform)
     host_execution_platform = linux_execution_platform_label(ctx.attr._host_execution_platform)
@@ -4487,8 +4484,8 @@ def _linux_mapped_kernel_family_impl(ctx):
     host_kconfig_probe_results = ctx.actions.declare_directory(ctx.label.name + ".kconfig-probe-results-host")
     target_kconfig_probe_results = ctx.actions.declare_directory(ctx.label.name + ".kconfig-probe-results-target")
     kconfig_probe_args = ctx.actions.args()
-    kconfig_probe_args.add("-root", ctx.file.source_root)
-    kconfig_probe_args.add("-srctree", ctx.file.source_root)
+    add_linux_source_arg(kconfig_probe_args, "-root", source_runfiles, "Kconfig")
+    add_linux_source_arg(kconfig_probe_args, "-srctree", source_runfiles, "Kconfig")
     _add_artifact_path(kconfig_probe_args, "-target_toolset_identity", target_toolset_identity)
     _add_artifact_path(kconfig_probe_args, "-host_toolset_identity", host_toolset_identity)
     _add_artifact_path(kconfig_probe_args, "-target_toolset_manifest", target_toolset_manifest)
@@ -4517,6 +4514,7 @@ def _linux_mapped_kernel_family_impl(ctx):
         transitive = [rust_source.files] if rust_source != None else [],
     )
     ctx.actions.run(
+        tools = [source_runfiles],
         executable = ctx.executable._planner,
         inputs = kconfig_probe_inputs,
         outputs = [kconfig_probe_plan],
@@ -4541,12 +4539,14 @@ def _linux_mapped_kernel_family_impl(ctx):
             host_toolset_manifest,
             host_toolset_anchors,
             host.companion_tools,
+            source_runfiles = source_runfiles,
         ),
         additional_params = linux_probe_map_directory_params(
             "host",
             host.arguments,
             host.environments,
             source_prefix = source_prefix,
+            renamed_paths = renamed_paths,
             rust_source_root = rust_source_root,
         ),
         env = {},
@@ -4577,12 +4577,14 @@ def _linux_mapped_kernel_family_impl(ctx):
             host_toolset_manifest = host_toolset_manifest,
             host_toolset_anchors = host_toolset_anchors,
             host_companion_tools = host.companion_tools,
+            source_runfiles = source_runfiles,
         ),
         additional_params = linux_probe_map_directory_params(
             "target",
             target.arguments,
             target.environments,
             source_prefix = source_prefix,
+            renamed_paths = renamed_paths,
             rust_source_root = rust_source_root,
             host_action_args = host.arguments,
             host_action_environments = host.environments,
@@ -4594,8 +4596,8 @@ def _linux_mapped_kernel_family_impl(ctx):
     )
 
     native_config_args = ctx.actions.args()
-    native_config_args.add("-root", ctx.file.source_root)
-    native_config_args.add("-srctree", ctx.file.source_root)
+    add_linux_source_arg(native_config_args, "-root", source_runfiles, "Kconfig")
+    add_linux_source_arg(native_config_args, "-srctree", source_runfiles, "Kconfig")
     native_config_args.add("-kernel_version", ctx.attr.version)
     native_config_inputs = ctx.files.source_files + [ctx.file.source_root, ctx.file.kbuild]
     for flag, artifact in [
@@ -4670,6 +4672,8 @@ def _linux_mapped_kernel_family_impl(ctx):
         rust_source_root,
         native_scopes,
         libelf.tree,
+        source_runfiles,
+        renamed_paths,
     )
 
     variant_overlays = {"base": None}
@@ -4699,6 +4703,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             for root, anchor in selected.anchors.items():
                 _add_artifact_path(args, "-native_toolset_anchor", anchor, format = scope + "=" + root + "=%s")
         ctx.actions.run(
+            tools = [source_runfiles],
             executable = ctx.executable._planner,
             inputs = depset(
                 direct = [native_config_tool, ctx.file.config] + ([overlay] if overlay != None else []),
@@ -4776,9 +4781,9 @@ def _linux_mapped_kernel_family_impl(ctx):
         prefix = ctx.label.name + "." + variant
         kbuild_probe_plan = ctx.actions.declare_directory(prefix + ".kbuild-probe-plan-fragment")
         kbuild_probe_args = ctx.actions.args()
-        kbuild_probe_args.add("-root", ctx.file.source_root)
-        kbuild_probe_args.add("-srctree", ctx.file.source_root)
-        kbuild_probe_args.add("-kbuild", ctx.file.kbuild)
+        add_linux_source_arg(kbuild_probe_args, "-root", source_runfiles, "Kconfig")
+        add_linux_source_arg(kbuild_probe_args, "-srctree", source_runfiles, "Kconfig")
+        add_linux_source_arg(kbuild_probe_args, "-kbuild", source_runfiles, linux_source_path(ctx.file.kbuild, source_prefix, renamed_paths))
         _add_artifact_path(kbuild_probe_args, "-native_config", native_configs[variant])
         kbuild_probe_args.add("-kernel_version", ctx.attr.version)
         _add_kernel_kbuild_goals(kbuild_probe_args)
@@ -4828,9 +4833,9 @@ def _linux_mapped_kernel_family_impl(ctx):
         for round_index in range(graph_guard_round_count):
             guard_fragment = ctx.actions.declare_directory(prefix + ".kbuild-graph-guard-round-" + str(round_index) + "-fragment")
             guard_args = ctx.actions.args()
-            guard_args.add("-root", ctx.file.source_root)
-            guard_args.add("-srctree", ctx.file.source_root)
-            guard_args.add("-kbuild", ctx.file.kbuild)
+            add_linux_source_arg(guard_args, "-root", source_runfiles, "Kconfig")
+            add_linux_source_arg(guard_args, "-srctree", source_runfiles, "Kconfig")
+            add_linux_source_arg(guard_args, "-kbuild", source_runfiles, linux_source_path(ctx.file.kbuild, source_prefix, renamed_paths))
             _add_artifact_path(guard_args, "-native_config", native_configs[variant])
             guard_args.add("-kernel_version", ctx.attr.version)
             _add_kernel_kbuild_goals(guard_args)
@@ -4877,6 +4882,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             for name, value in ctx.attr.module_make_vars.items():
                 guard_args.add("-var", name + "=" + value)
             ctx.actions.run(
+                tools = [source_runfiles],
                 executable = ctx.executable._planner,
                 inputs = depset(
                     direct = guard_inputs,
@@ -4902,9 +4908,9 @@ def _linux_mapped_kernel_family_impl(ctx):
         for round_index in range(source_output_round_count):
             source_fragment = ctx.actions.declare_directory(prefix + ".kbuild-source-output-round-" + str(round_index) + "-fragment")
             source_args = ctx.actions.args()
-            source_args.add("-root", ctx.file.source_root)
-            source_args.add("-srctree", ctx.file.source_root)
-            source_args.add("-kbuild", ctx.file.kbuild)
+            add_linux_source_arg(source_args, "-root", source_runfiles, "Kconfig")
+            add_linux_source_arg(source_args, "-srctree", source_runfiles, "Kconfig")
+            add_linux_source_arg(source_args, "-kbuild", source_runfiles, linux_source_path(ctx.file.kbuild, source_prefix, renamed_paths))
             _add_artifact_path(source_args, "-native_config", native_configs[variant])
             source_args.add("-kernel_version", ctx.attr.version)
             _add_kernel_kbuild_goals(source_args)
@@ -4963,6 +4969,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             for name, value in ctx.attr.module_make_vars.items():
                 source_args.add("-var", name + "=" + value)
             ctx.actions.run(
+                tools = [source_runfiles],
                 executable = ctx.executable._planner,
                 inputs = depset(
                     direct = source_round_inputs,
@@ -4987,9 +4994,9 @@ def _linux_mapped_kernel_family_impl(ctx):
         for round_index in range(feature_dump_round_count):
             feature_fragment = ctx.actions.declare_directory(prefix + ".kbuild-feature-dump-round-" + str(round_index) + "-fragment")
             feature_args = ctx.actions.args()
-            feature_args.add("-root", ctx.file.source_root)
-            feature_args.add("-srctree", ctx.file.source_root)
-            feature_args.add("-kbuild", ctx.file.kbuild)
+            add_linux_source_arg(feature_args, "-root", source_runfiles, "Kconfig")
+            add_linux_source_arg(feature_args, "-srctree", source_runfiles, "Kconfig")
+            add_linux_source_arg(feature_args, "-kbuild", source_runfiles, linux_source_path(ctx.file.kbuild, source_prefix, renamed_paths))
             _add_artifact_path(feature_args, "-native_config", native_configs[variant])
             feature_args.add("-kernel_version", ctx.attr.version)
             _add_kernel_kbuild_goals(feature_args)
@@ -5048,6 +5055,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             for name, value in ctx.attr.module_make_vars.items():
                 feature_args.add("-var", name + "=" + value)
             ctx.actions.run(
+                tools = [source_runfiles],
                 executable = ctx.executable._planner,
                 inputs = depset(
                     direct = feature_round_inputs,
@@ -5070,6 +5078,7 @@ def _linux_mapped_kernel_family_impl(ctx):
         public_configs[variant] = ctx.actions.declare_file(prefix + ".kconfig.config")
         _project(ctx, native_configs[variant], ".config", public_configs[variant])
         ctx.actions.run(
+            tools = [source_runfiles],
             executable = ctx.executable._planner,
             inputs = depset(
                 direct = kbuild_guarded_probe_inputs,
@@ -5098,7 +5107,7 @@ def _linux_mapped_kernel_family_impl(ctx):
                 direct = kbuild_guarded_probe_inputs,
                 transitive = [rust_source.files] if rust_source != None else [],
             ),
-            tools = [ctx.attr._planner[DefaultInfo].files_to_run],
+            tools = [source_runfiles, ctx.attr._planner[DefaultInfo].files_to_run],
             outputs = [kbuild_cpu_profile],
             arguments = [profile_args, kbuild_probe_args],
             execution_requirements = {"supports-path-mapping": "1", "no-cache": "1"},
@@ -5144,12 +5153,14 @@ def _linux_mapped_kernel_family_impl(ctx):
                 host_toolset_manifest,
                 host_toolset_anchors,
                 host.companion_tools,
+                source_runfiles = source_runfiles,
             ),
             additional_params = linux_probe_map_directory_params(
                 "host",
                 host.arguments,
                 host.environments,
                 source_prefix = source_prefix,
+                renamed_paths = renamed_paths,
                 rust_source_root = rust_source_root,
             ),
             env = {},
@@ -5180,12 +5191,14 @@ def _linux_mapped_kernel_family_impl(ctx):
                 host_toolset_manifest = host_toolset_manifest,
                 host_toolset_anchors = host_toolset_anchors,
                 host_companion_tools = host.companion_tools,
+                source_runfiles = source_runfiles,
             ),
             additional_params = linux_probe_map_directory_params(
                 "target",
                 target.arguments,
                 target.environments,
                 source_prefix = source_prefix,
+                renamed_paths = renamed_paths,
                 rust_source_root = rust_source_root,
                 host_action_args = host.arguments,
                 host_action_environments = host.environments,
@@ -5234,12 +5247,14 @@ def _linux_mapped_kernel_family_impl(ctx):
                 host_toolset_manifest,
                 host_toolset_anchors,
                 host.companion_tools,
+                source_runfiles = source_runfiles,
             ),
             additional_params = linux_probe_map_directory_params(
                 "host",
                 host.arguments,
                 host.environments,
                 source_prefix = source_prefix,
+                renamed_paths = renamed_paths,
                 rust_source_root = rust_source_root,
             ),
             env = {},
@@ -5270,12 +5285,14 @@ def _linux_mapped_kernel_family_impl(ctx):
                 host_toolset_manifest = host_toolset_manifest,
                 host_toolset_anchors = host_toolset_anchors,
                 host_companion_tools = host.companion_tools,
+                source_runfiles = source_runfiles,
             ),
             additional_params = linux_probe_map_directory_params(
                 "target",
                 target.arguments,
                 target.environments,
                 source_prefix = source_prefix,
+                renamed_paths = renamed_paths,
                 rust_source_root = rust_source_root,
                 host_action_args = host.arguments,
                 host_action_environments = host.environments,
@@ -5324,12 +5341,14 @@ def _linux_mapped_kernel_family_impl(ctx):
                 host_toolset_manifest,
                 host_toolset_anchors,
                 host.companion_tools,
+                source_runfiles = source_runfiles,
             ),
             additional_params = linux_probe_map_directory_params(
                 "host",
                 host.arguments,
                 host.environments,
                 source_prefix = source_prefix,
+                renamed_paths = renamed_paths,
                 rust_source_root = rust_source_root,
             ),
             env = {},
@@ -5360,12 +5379,14 @@ def _linux_mapped_kernel_family_impl(ctx):
                 host_toolset_manifest = host_toolset_manifest,
                 host_toolset_anchors = host_toolset_anchors,
                 host_companion_tools = host.companion_tools,
+                source_runfiles = source_runfiles,
             ),
             additional_params = linux_probe_map_directory_params(
                 "target",
                 target.arguments,
                 target.environments,
                 source_prefix = source_prefix,
+                renamed_paths = renamed_paths,
                 rust_source_root = rust_source_root,
                 host_action_args = host.arguments,
                 host_action_environments = host.environments,
@@ -5414,12 +5435,14 @@ def _linux_mapped_kernel_family_impl(ctx):
             host_toolset_manifest,
             host_toolset_anchors,
             host.companion_tools,
+            source_runfiles = source_runfiles,
         ),
         additional_params = linux_probe_map_directory_params(
             "host",
             host.arguments,
             host.environments,
             source_prefix = source_prefix,
+            renamed_paths = renamed_paths,
             rust_source_root = rust_source_root,
         ),
         env = {},
@@ -5450,12 +5473,14 @@ def _linux_mapped_kernel_family_impl(ctx):
             host_toolset_manifest = host_toolset_manifest,
             host_toolset_anchors = host_toolset_anchors,
             host_companion_tools = host.companion_tools,
+            source_runfiles = source_runfiles,
         ),
         additional_params = linux_probe_map_directory_params(
             "target",
             target.arguments,
             target.environments,
             source_prefix = source_prefix,
+            renamed_paths = renamed_paths,
             rust_source_root = rust_source_root,
             host_action_args = host.arguments,
             host_action_environments = host.environments,
@@ -5473,9 +5498,9 @@ def _linux_mapped_kernel_family_impl(ctx):
     variants, family_planner_outputs, replay_args = _family_variant_plan_outputs(ctx, variant_overlays, False)
 
     family_planner_args = ctx.actions.args()
-    family_planner_args.add("-root", ctx.file.source_root)
-    family_planner_args.add("-srctree", ctx.file.source_root)
-    family_planner_args.add("-kbuild", ctx.file.kbuild)
+    add_linux_source_arg(family_planner_args, "-root", source_runfiles, "Kconfig")
+    add_linux_source_arg(family_planner_args, "-srctree", source_runfiles, "Kconfig")
+    add_linux_source_arg(family_planner_args, "-kbuild", source_runfiles, linux_source_path(ctx.file.kbuild, source_prefix, renamed_paths))
     family_planner_args.add("-kernel_version", ctx.attr.version)
     _add_kernel_kbuild_goals(family_planner_args)
     _add_artifact_path(family_planner_args, "-target_toolset_identity", target_toolset_identity)
@@ -5569,6 +5594,7 @@ def _linux_mapped_kernel_family_impl(ctx):
     for variant in sorted(initial_variants):
         _add_artifact_path(replay_args, "-family_execution_initial_snapshot", initial_variants[variant].snapshot, format = variant + "=%s")
     ctx.actions.run(
+        tools = [source_runfiles],
         executable = ctx.executable._planner,
         inputs = depset(
             direct = family_planner_inputs,
@@ -5663,6 +5689,7 @@ def _linux_mapped_kernel_family_impl(ctx):
                     transitive = [rust_source.files] if rust_source != None else [],
                 )
                 ctx.actions.run(
+                    tools = [source_runfiles],
                     executable = ctx.executable._planner,
                     inputs = guard_action_inputs,
                     outputs = [guard_manifest, guard_plan],
@@ -5684,7 +5711,7 @@ def _linux_mapped_kernel_family_impl(ctx):
                     ctx.actions.run(
                         executable = ctx.executable._profile_capture,
                         inputs = guard_action_inputs,
-                        tools = [ctx.attr._planner[DefaultInfo].files_to_run],
+                        tools = [source_runfiles, ctx.attr._planner[DefaultInfo].files_to_run],
                         outputs = [guard_cpu_profile],
                         arguments = [profile_args, family_planner_args, guard_args],
                         execution_requirements = {"supports-path-mapping": "1", "no-cache": "1"},
@@ -5703,7 +5730,7 @@ def _linux_mapped_kernel_family_impl(ctx):
                     ctx.actions.run(
                         executable = ctx.executable._profile_capture,
                         inputs = guard_action_inputs,
-                        tools = [ctx.attr._heap_planner[DefaultInfo].files_to_run],
+                        tools = [source_runfiles, ctx.attr._heap_planner[DefaultInfo].files_to_run],
                         outputs = [guard_heap_profile],
                         arguments = [heap_args, family_planner_args, guard_args],
                         execution_requirements = {"supports-path-mapping": "1", "no-cache": "1"},
@@ -5735,6 +5762,7 @@ def _linux_mapped_kernel_family_impl(ctx):
                             host_toolset_manifest if host_scope else target_toolset_manifest,
                             host_toolset_anchors if host_scope else target_toolset_anchors,
                             selected.companion_tools,
+                            source_runfiles = source_runfiles,
                             **({} if host_scope else {
                                 "host_tool_files": host.tools,
                                 "host_toolchain_files": host_toolchain_files,
@@ -5748,6 +5776,7 @@ def _linux_mapped_kernel_family_impl(ctx):
                             selected.arguments,
                             selected.environments,
                             source_prefix = source_prefix,
+                            renamed_paths = renamed_paths,
                             rust_source_root = rust_source_root,
                             **({} if host_scope else {
                                 "host_action_args": host.arguments,
@@ -5773,6 +5802,7 @@ def _linux_mapped_kernel_family_impl(ctx):
             # A completed TreeArtifact, not a plan marker or partial file,
             # makes generator bytes available to the second planner action.
             ctx.actions.run(
+                tools = [source_runfiles],
                 executable = ctx.executable._planner,
                 inputs = depset(
                     direct = family_planner_inputs + [execution_cut, checkpoints] +
@@ -5811,6 +5841,7 @@ def _linux_mapped_kernel_family_impl(ctx):
                 target.environments,
                 host.arguments,
                 host.environments,
+                renamed_paths = renamed_paths,
             )
             _register_family_execution_segment(
                 ctx,
@@ -5905,6 +5936,8 @@ def _linux_mapped_kernel_family_impl(ctx):
             sdk = trees["sdk"],
             source = depset(ctx.files.source_files),
             source_root = ctx.file.source_root,
+            source_runfiles = source_runfiles,
+            renamed_source_paths = renamed_paths,
             target_action_args = target.arguments,
             target_action_environments = target.environments,
             target_action_requirements = target.requirements_by_role,
@@ -6012,7 +6045,7 @@ linux_mapped_kernel_family = rule(
         "overlays": attr.string_keyed_label_dict(allow_files = True),
         "source_files": attr.label_list(allow_files = True, mandatory = True),
         "source_root": attr.label(allow_single_file = True, mandatory = True),
-        "source_runfiles": attr.label(cfg = "exec", executable = True, mandatory = True),
+        "source_runfiles": attr.label(cfg = "exec", executable = True, mandatory = True, providers = [LinuxSourcePathsInfo]),
         "version": attr.string(mandatory = True),
         "_host_cc_toolchain": host_cc_toolchain_attr(exec_group = "host_cc"),
         "_host_execution_platform": linux_execution_platform_attr(exec_group = "host_cc"),

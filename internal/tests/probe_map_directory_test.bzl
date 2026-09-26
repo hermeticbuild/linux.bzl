@@ -181,12 +181,13 @@ def _probe_map_directory_test_impl(ctx):
     indexed = linux_test_index_probe_source_paths(
         [
             "repo/Kconfig",
-            "repo/scripts/probe.sh",
+            "repo/relocated/probe.sh",
             "repo/scripts/probe.sh/path",
         ],
         "repo",
         rust_paths = ["../rust-src/library/core/src/lib.rs"],
         rust_source_root = "external/rust-src/library",
+        renamed_paths = {"relocated/probe.sh": "scripts/probe.sh"},
     )
     asserts.equals(env, [
         "Kconfig",
@@ -199,16 +200,17 @@ def _probe_map_directory_test_impl(ctx):
         _TARGET,
         [
             "repo/Kconfig",
-            "repo/scripts/probe.sh",
+            "repo/relocated/probe.sh",
             "repo/scripts/probe.sh/path",
         ],
         "repo",
         rust_paths = ["../rust-src/library/core/src/lib.rs"],
         rust_source_root = "external/rust-src/library",
+        renamed_paths = {"relocated/probe.sh": "scripts/probe.sh"},
     )
     asserts.equals(env, "repo/Kconfig", target_sources.linux_anchor)
     asserts.equals(env, "repo/Kconfig", target_sources.sources["Kconfig"])
-    asserts.equals(env, "repo/scripts/probe.sh", target_sources.sources["scripts/probe.sh"])
+    asserts.equals(env, "repo/relocated/probe.sh", target_sources.sources["scripts/probe.sh"])
     asserts.equals(env, "repo/scripts/probe.sh/path", target_sources.sources["scripts/probe.sh/path"])
     final_sources = linux_test_resolve_probe_source_paths(
         parsed,

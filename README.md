@@ -95,6 +95,15 @@ No `BUILD.bazel` macro is required in the consuming repository. Declared Bazel
 actions resolve Kconfig and Kbuild using the selected compiler, and
 `map_directory` expands that plan into fine-grained build actions.
 
+On case-insensitive clients such as macOS, use Linux remote execution and add
+`common --nobuild_runfile_links` to the consuming workspace's `.bazelrc`.
+Linux contains source files whose names differ only by case. The source rule
+preserves the known collision pairs in separate physical locations, then Bazel
+constructs their original paths in the remote runfiles tree. Disabling local
+runfiles links prevents that logical tree from being collapsed on the client.
+Patches still use upstream source paths. The collision inventory covers the
+maintained Linux archives; it does not detect arbitrary archive collisions.
+
 ## Public API
 
 Public build rules and providers are loaded from the root `linux.bzl`.
@@ -505,7 +514,13 @@ Arbitrary patch commands and host patch tools are intentionally not part of the
 API. The complete upstream source archive, including documentation, samples,
 and license material, remains available in the repository.
 
-Every source file and directory in the root package is a public target. This
+Every source file and directory in the root package is a public target. Files
+relocated during extraction retain their upstream labels through aliases.
+Directories containing relocated files are materialized lazily on Linux with
+their original contents; other directory labels remain source inputs. On a
+case-insensitive client, consume those generated directories remotely with
+`--remote_download_minimal`: directly downloading a directory containing
+case-colliding files cannot preserve its contents on that filesystem. This
 allows consumer rules to use directory labels such as `@linux_custom//:include`
 and `@linux_custom//:arch/arm/boot/dts` as include roots. The `:dtb_sources`
 filegroup contains the upstream `.dts`, `.dtsi`, and DT binding headers for

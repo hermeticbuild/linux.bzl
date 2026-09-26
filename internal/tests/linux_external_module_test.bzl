@@ -295,6 +295,8 @@ def _fake_sdk_impl(ctx):
             sdk = sdk,
             source = depset([source_root]),
             source_root = source_root,
+            source_runfiles = ctx.attr.target_recipe_runner[DefaultInfo].files_to_run,
+            renamed_source_paths = {},
             target_action_args = target_arguments,
             target_action_environments = target_environments,
             target_action_requirements = target_requirements,
@@ -385,6 +387,14 @@ def _external_module_test_impl(ctx):
     expected_root = "__LINUX_BZL_SOURCE_TREE__/.linux-bzl/external/" + ctx.attr.expected_module_name
     expected_kbuild_vars = ["M=" + expected_root] + ctx.attr.expected_kbuild_vars
     for action in probe_planner_actions + planner_actions:
+        for flag in ["-root", "-srctree"]:
+            roots = _flag_values(action.argv, flag)
+            asserts.equals(env, 1, len(roots))
+            if roots:
+                suffix = ".runfiles/kernel/Kconfig"
+                asserts.true(env, roots[0].endswith(suffix))
+                asserts.true(env, _action_path_names_artifact(roots[0][:-len(suffix)], sdk.source_runfiles.executable))
+        asserts.true(env, sdk.source_runfiles.executable in action.inputs.to_list())
         manifest_values = _flag_values(action.argv, "-pkg_config_manifest")
         asserts.equals(env, 1, len(manifest_values))
         if manifest_values:

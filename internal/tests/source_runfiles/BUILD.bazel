@@ -1,3 +1,6 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//internal:linux_source_runfiles.bzl", "linux_source_directory", "linux_source_runfiles")
 load("//internal/tests:linux_source_runfiles_test.bzl", "linux_source_runfiles_test")
 
 package(default_visibility = ["//visibility:private"])
@@ -6,4 +9,37 @@ linux_source_runfiles_test(
     name = "linux_source_runfiles_test",
     source_files = ["include/input.h"],
     source_root = "SOURCE_ROOT",
+)
+
+# The client paths are distinct even on APFS; the consumer sees both original
+# header names through the same lazy directory rule exported by source repos.
+linux_source_runfiles(
+    name = "case_sources",
+    renamed_paths = {"other.h": "include/INPUT.h"},
+    source_files = [
+        "include/input.h",
+        "other.h",
+    ],
+    source_root = "SOURCE_ROOT",
+)
+
+linux_source_directory(
+    name = "case_directory",
+    path = "include",
+    source = ":case_sources",
+    tags = ["manual"],
+)
+
+cc_library(
+    name = "case_headers",
+    hdrs = [":case_directory"],
+    includes = ["case_directory.linux-bzl-directory"],
+    tags = ["manual"],
+)
+
+cc_test(
+    name = "source_directory_test",
+    srcs = ["source_directory.c"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [":case_headers"],
 )
