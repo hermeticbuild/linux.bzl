@@ -222,6 +222,7 @@ type KbuildOptions struct {
 	// guarded recipe, include, or dynamic include filename and publish an
 	// incomplete per-object action graph.
 	RejectUnmeasuredGraphGuards bool
+	graphGuardReferences        func([]string) ([]ProbeReference, error)
 	// ResolveMeasuredGraphGuards concretizes only source guards whose exact
 	// terminals have already been measured. A subsequent discovery round may
 	// still defer newly selected guards, whereas ordinary lowering rejects them.
@@ -542,6 +543,7 @@ func parseKbuildFileTree(path string, opts KbuildOptions, variableOverrides map[
 	parser.configVariablesComplete = opts.ConfigVariablesComplete
 	parser.makeVariablesComplete = opts.MakeVariablesComplete
 	parser.rejectUnmeasuredGraphGuards = opts.RejectUnmeasuredGraphGuards
+	parser.graphGuardReferences = opts.graphGuardReferences
 	parser.resolveMeasuredGraphGuards = opts.ResolveMeasuredGraphGuards || opts.RejectUnmeasuredGraphGuards
 	parser.shell = opts.Shell
 	parser.shellExportLoopOverride = opts.shellExportLoopOverride
@@ -602,6 +604,7 @@ func parseKbuildWithOptions(r io.Reader, filename string, opts KbuildOptions, ba
 	parser.configVariablesComplete = opts.ConfigVariablesComplete
 	parser.makeVariablesComplete = opts.MakeVariablesComplete
 	parser.rejectUnmeasuredGraphGuards = opts.RejectUnmeasuredGraphGuards
+	parser.graphGuardReferences = opts.graphGuardReferences
 	parser.resolveMeasuredGraphGuards = opts.ResolveMeasuredGraphGuards || opts.RejectUnmeasuredGraphGuards
 	parser.shell = opts.Shell
 	parser.shellExportLoopOverride = opts.shellExportLoopOverride
@@ -935,6 +938,7 @@ type kbuildParser struct {
 	// a bounded pregraph capability plan before selecting child Make invocations.
 	deferredGraphGuards         []string
 	rejectUnmeasuredGraphGuards bool
+	graphGuardReferences        func([]string) ([]ProbeReference, error)
 	resolveMeasuredGraphGuards  bool
 	undefined                   map[string]bool
 	symbolicVariables           map[string]kbuildSymbolicVariableState
@@ -1379,7 +1383,7 @@ func (p *kbuildParser) parseSourceLine(source kbuildSourceLine, pos Position) er
 					if linuxProbeSymbolPattern.MatchString(selected) {
 						p.deferredGraphGuards = append(p.deferredGraphGuards, selector)
 						if p.rejectUnmeasuredGraphGuards {
-							return fmt.Errorf("%s: selected recipe has undeclared probe-dependent graph guard %q", pos, selector)
+							return p.unmeasuredGraphGuard(pos, "recipe", selector)
 						}
 						// Discovery has recorded the conditional's probe, but its
 						// result is unavailable until replay. Do not attach either
@@ -1853,6 +1857,18 @@ func (p *kbuildParser) activateElseIf(frame *kbuildConditionalFrame, keyword, re
 	return nil
 }
 
+func (p *kbuildParser) unmeasuredGraphGuard(pos Position, use, expression string) error {
+	pending := &UnmeasuredKbuildGraphGuardError{Position: pos, Use: use, Expression: expression}
+	if p.graphGuardReferences != nil {
+		references, err := p.graphGuardReferences([]string{expression})
+		if err != nil {
+			return fmt.Errorf("%s: discover %s guard: %w", pos, use, err)
+		}
+		pending.References = references
+	}
+	return pending
+}
+
 func (p *kbuildParser) parseKbuildInclude(line string, pos Position) (bool, error) {
 	fields := strings.Fields(line)
 	if len(fields) < 2 {
@@ -1879,7 +1895,7 @@ func (p *kbuildParser) parseKbuildInclude(line string, pos Position) (bool, erro
 		if linuxProbeSymbolPattern.MatchString(resolved) {
 			p.deferredGraphGuards = append(p.deferredGraphGuards, selector)
 			if p.rejectUnmeasuredGraphGuards {
-				return true, fmt.Errorf("%s: selected include has undeclared probe-dependent graph guard %q", pos, selector)
+				return true, p.unmeasuredGraphGuard(pos, "include", selector)
 			}
 			// Discovery records the guard's probe DAG but cannot select source
 			// topology before configured actions run. The replay parse below will
@@ -1907,7 +1923,7 @@ func (p *kbuildParser) parseKbuildInclude(line string, pos Position) (bool, erro
 		if linuxProbeSymbolPattern.MatchString(resolved) {
 			p.deferredGraphGuards = append(p.deferredGraphGuards, expandedPaths)
 			if p.rejectUnmeasuredGraphGuards {
-				return true, fmt.Errorf("%s: selected include filename has undeclared probe-dependent graph guard %q", pos, expandedPaths)
+				return true, p.unmeasuredGraphGuard(pos, "include filename", expandedPaths)
 			}
 			// The include name itself depends on configured probe data. As with
 			// a probe-guarded include above, discovery records the dependency DAG
@@ -2565,7 +2581,7 @@ func (p *kbuildParser) parseRule(line string, pos Position, previousRule int, pr
 		if linuxProbeSymbolPattern.MatchString(selected) {
 			p.deferredGraphGuards = append(p.deferredGraphGuards, selector)
 			if p.rejectUnmeasuredGraphGuards {
-				return true, fmt.Errorf("%s: selected rule has undeclared probe-dependent graph guard %q", pos, selector)
+				return true, p.unmeasuredGraphGuard(pos, "rule", selector)
 			}
 			p.deferredRuleOwner = true
 			return true, nil

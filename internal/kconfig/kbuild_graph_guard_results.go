@@ -17,6 +17,56 @@ type KbuildGraphGuardResults struct {
 	selected map[string]ProbeReference
 }
 
+// UnmeasuredKbuildGraphGuardError marks the source boundary that cannot be
+// selected until its exact compiler probe dependencies have been measured.
+// Discovery may schedule References and replay; final planning rejects it.
+type UnmeasuredKbuildGraphGuardError struct {
+	Position   Position
+	Use        string
+	Expression string
+	References []ProbeReference
+}
+
+func (e *UnmeasuredKbuildGraphGuardError) Error() string {
+	return fmt.Sprintf("%s: selected %s has undeclared probe-dependent graph guard %q", e.Position, e.Use, e.Expression)
+}
+
+// MergeKbuildGraphGuardResults retains only authority granted by declared,
+// measured plans. Later source discovery can reveal guards after a generated
+// file or feature table, so those answers join the initial root guard results.
+func MergeKbuildGraphGuardResults(results ...*KbuildGraphGuardResults) (*KbuildGraphGuardResults, error) {
+	results = slices.DeleteFunc(slices.Clone(results), func(result *KbuildGraphGuardResults) bool { return result == nil })
+	switch len(results) {
+	case 0:
+		return nil, nil
+	case 1:
+		return results[0], nil
+	}
+	variants := make([]ProbePlanVariant, 0, len(results))
+	oracle := &ProbeResultOracle{results: map[string]ProbeResult{}, toolsets: maps.Clone(results[0].plan.Toolsets)}
+	for _, result := range results {
+		variants = append(variants, ProbePlanVariant{Name: fmt.Sprint(len(variants)), Plan: result.plan})
+		for _, node := range result.plan.Nodes {
+			reference := ProbeReference{
+				NodeID: node.ID, RequestID: node.RequestID, Scope: node.Scope,
+				Kind: result.plan.Requests[node.RequestID].Outcome.Kind,
+			}
+			measured, err := result.oracle.Result(reference)
+			if err != nil {
+				return nil, err
+			}
+			if err := oracle.recordDerivedResult(measured); err != nil {
+				return nil, err
+			}
+		}
+	}
+	plan, err := MergeProbePlans(variants)
+	if err != nil {
+		return nil, err
+	}
+	return NewKbuildGraphGuardResults(plan, oracle)
+}
+
 func NewKbuildGraphGuardResults(plan *ProbePlan, oracle *ProbeResultOracle) (*KbuildGraphGuardResults, error) {
 	if plan == nil || oracle == nil {
 		return nil, fmt.Errorf("graph guard probe plan and results are required")

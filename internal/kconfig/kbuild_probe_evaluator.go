@@ -206,6 +206,7 @@ func (s *KbuildProbeScopes) Options(scope string, base KbuildOptions) (KbuildOpt
 	}
 	base.RejectUnmeasuredGraphGuards = s.graphGuardResults != nil && !s.graphGuardDiscoveryOnly
 	base.ResolveMeasuredGraphGuards = s.graphGuardResults != nil
+	base.graphGuardReferences = s.GraphGuardReferences
 	fallbackShell := base.Shell
 	base.ResolveSymbolic = func(value string) (string, error) {
 		return s.resolveSymbolicForScope(scope, value)

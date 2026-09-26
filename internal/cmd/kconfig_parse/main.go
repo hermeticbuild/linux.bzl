@@ -646,7 +646,11 @@ func evaluateLinuxKbuildProbes(
 		},
 		oracle,
 		func(scopes *kconfig.KbuildProbeScopes) (linuxKbuildProbeValue, error) {
-			if err := scopes.InstallGraphGuardResults(opts.graphGuardResults, opts.graphGuardDiscoveryOnly); err != nil {
+			guards, err := kconfig.MergeKbuildGraphGuardResults(opts.graphGuardResults, opts.featureDumpResults)
+			if err != nil {
+				return linuxKbuildProbeValue{}, fmt.Errorf("combine measured source guards: %w", err)
+			}
+			if err := scopes.InstallGraphGuardResults(guards, opts.graphGuardDiscoveryOnly); err != nil {
 				return linuxKbuildProbeValue{}, err
 			}
 			if opts.checkpointInput != "" {
@@ -715,6 +719,20 @@ func evaluateLinuxKbuildProbes(
 				)
 			}
 			if err != nil {
+				var guard *kconfig.UnmeasuredKbuildGraphGuardError
+				if (opts.sourceOutputDiscoveryOnly || opts.featureDumpDiscoveryOnly) && errors.As(err, &guard) {
+					if len(guard.References) == 0 {
+						return linuxKbuildProbeValue{}, fmt.Errorf("source guard has no selected probe dependencies: %w", err)
+					}
+					// Source rounds yield to the feature pass, which measures the
+					// guard at this same causal frontier before either pass continues.
+					if opts.featureDumpDiscoveryOnly {
+						for _, reference := range guard.References {
+							featureDumpRequestIDs = append(featureDumpRequestIDs, reference.NodeID)
+						}
+					}
+					return linuxKbuildProbeValue{target: target, featureDumpRequestIDs: uniquePathsInOrder(featureDumpRequestIDs)}, nil
+				}
 				if opts.sourceOutputDiscoveryOnly {
 					var pending *pendingKbuildSourceOutputRead
 					if errors.As(err, &pending) {

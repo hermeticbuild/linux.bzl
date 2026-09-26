@@ -184,3 +184,46 @@ all:
 		t.Fatal("a measured compiler result outside the selected guard closure gained source-selection authority")
 	}
 }
+
+func TestMergeKbuildGraphGuardResultsRejectsConflictingMeasurements(t *testing.T) {
+	fixture := linuxCompilerBootstrapFixtures(t)[1]
+	options := KbuildProbeWorkloadOptions{Target: testKbuildProbeScopeOptions(t, fixture)}
+	discovery, err := EvaluateKbuildProbeWorkload(options, nil, func(scopes *KbuildProbeScopes) (string, error) {
+		parserOptions, err := scopes.Options("target", KbuildOptions{Variables: map[string]string{"CC": KbuildActionRoleToken("target", "cc")}})
+		if err != nil {
+			return "", err
+		}
+		parsed, err := parseKbuildWithOptions(strings.NewReader(`
+TMPOUT = .tmp_$$$$
+try-run = $(shell set -e; TMP=$(TMPOUT)/tmp; trap "rm -rf $(TMPOUT)" EXIT; mkdir -p $(TMPOUT); if ($(1)) >/dev/null 2>&1; then echo "$(2)"; else echo "$(3)"; fi)
+selected := $(call try-run,$(CC) -Werror -c -x c /dev/null -o "$$TMP",y,n)
+`), "Makefile", parserOptions, "")
+		if err != nil {
+			return "", err
+		}
+		return parsed.Variables["selected"], nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	measure := func(supported bool) *KbuildGraphGuardResults {
+		t.Helper()
+		roots := writeKbuildProbeResultsByNode(t, discovery.Plan, func(_ int, _ ProbePlanNode) bool { return supported })
+		oracle, err := NewProbeResultOracleFromTrees(roots, discovery.Plan.Toolsets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		results, err := NewKbuildGraphGuardResults(discovery.Plan, oracle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return results
+	}
+	success := measure(true)
+	if _, err := MergeKbuildGraphGuardResults(success, success); err != nil {
+		t.Fatalf("identical measurements conflict: %v", err)
+	}
+	if _, err := MergeKbuildGraphGuardResults(success, measure(false)); err == nil {
+		t.Fatal("contradictory measurements for the same compiler request were accepted")
+	}
+}
