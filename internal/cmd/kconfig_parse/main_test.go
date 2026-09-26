@@ -11149,14 +11149,11 @@ func TestEvaluatedKbuildProfilesPreserveCommandLineGoalOrderForGroupedTrigger(t 
 	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(`
 z-trigger a-peer &: common.in
 	touch $@
-a-peer: peer-only.source
+a-peer: peer-only.generated
+common.in peer-only.generated:
+	printf generated > $@
 `), 0o644); err != nil {
 		t.Fatal(err)
-	}
-	for _, source := range []string{"common.in", "peer-only.source"} {
-		if err := os.WriteFile(filepath.Join(root, source), []byte(source+"\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
 	}
 	variables := map[string]string{"SRCARCH": "x86"}
 	profiles, selections, _, err := evaluatedKbuildProfilesWithOptions(
@@ -11176,6 +11173,51 @@ a-peer: peer-only.source
 		selection := selectionByTarget(t, selections, target)
 		if selection.GroupedTrigger != "z-trigger" {
 			t.Fatalf("selection %q trigger = %q, want first command-line goal z-trigger", target, selection.GroupedTrigger)
+		}
+	}
+	metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(
+		&kconfig.ResolvedConfig{Effective: map[string]string{"CONFIG_TEST": "n"}},
+		kconfig.CompactMetadataOptions{SelectedProductsOnly: true},
+		func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
+			return kconfig.CompactConfigGraph{KbuildProfiles: profiles, KbuildSelections: selections}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := "sha256-" + strings.Repeat("5c", 32)
+	plan, err := metadata.ActionPlan(identity, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := map[string]kconfig.ActionPlanNode{}
+	for _, node := range plan.Nodes {
+		for _, output := range node.Outputs {
+			nodes[output.Path] = node
+		}
+	}
+	group := nodes["z-trigger"]
+	if group.ID == "" || group.ID != nodes["a-peer"].ID {
+		t.Fatal("grouped peers do not share one physical recipe")
+	}
+	inputs := map[string]bool{}
+	for _, input := range group.Inputs {
+		inputs[input.ProducerID] = true
+	}
+	store, err := kconfig.NewActionPlanInputSetStoreFromNodes(plan.InputSets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Walk(group.InputSet, func(input kconfig.ActionPlanInputSetEntry) error {
+		inputs[input.ProducerID] = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, prerequisite := range []string{"common.in", "peer-only.generated"} {
+		producer := nodes[prerequisite]
+		if producer.ID == "" || !inputs[producer.ID] {
+			t.Fatalf("grouped recipe lacks prerequisite producer %q", prerequisite)
 		}
 	}
 }

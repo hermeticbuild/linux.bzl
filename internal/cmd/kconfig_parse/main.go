@@ -6802,10 +6802,11 @@ func selectedKbuildSelectionsWithResolvedTargets(
 	// below may enumerate already-selected target paths under compiler-derived
 	// roots, but it never infers an output which Kbuild did not select.
 	selectedActionsByTarget := map[string][]actionIdentity{}
-	for consumer, evaluation := range evaluationForAction {
+	for consumer := range evaluationForAction {
+		evaluation := evaluations[consumer.profile][consumer.target]
 		for _, artifact := range nativePrerequisiteArtifacts[profiles[consumer.profile].Name][consumer.target] {
 			if canonical := kconfig.CanonicalKbuildGraphTarget(artifact.Path); canonical != artifact.Path || canonical == "" ||
-				!slices.Contains(evaluation.normalPrerequisites, artifact.Path) && !slices.Contains(evaluation.orderOnly, artifact.Path) {
+				!slices.Contains(evaluation.prerequisites, artifact.Path) && !slices.Contains(evaluation.sourcePrerequisites, artifact.Path) {
 				return nil, fmt.Errorf("Kbuild invocation %q action %q records native frontier artifact %q outside its declared Make prerequisites", profiles[consumer.profile].Name, consumer.target, artifact.Path)
 			}
 		}
@@ -7006,8 +7007,8 @@ func selectedKbuildSelectionsWithResolvedTargets(
 			}
 		}
 		if len(artifacts) != 0 {
-			evaluation := evaluationForAction[consumer]
-			if !slices.Contains(evaluation.normalPrerequisites, reference) && !slices.Contains(evaluation.orderOnly, reference) {
+			evaluation := evaluations[consumer.profile][consumer.target]
+			if !slices.Contains(evaluation.prerequisites, reference) && !slices.Contains(evaluation.sourcePrerequisites, reference) {
 				return false, fmt.Errorf("Kbuild invocation %q action %q records native frontier artifact %q outside its declared Make prerequisites", profiles[consumer.profile].Name, consumer.target, reference)
 			}
 			if len(artifacts) != 1 {
@@ -7027,8 +7028,8 @@ func selectedKbuildSelectionsWithResolvedTargets(
 		// returned frontier is the authority for the file the child wrote. A
 		// same-path selected action in another invocation cannot fill a missing
 		// child output, even if it is the only remaining path candidate.
-		evaluation := evaluationForAction[consumer]
-		if slices.Contains(evaluation.normalPrerequisites, reference) || slices.Contains(evaluation.orderOnly, reference) {
+		evaluation := evaluations[consumer.profile][consumer.target]
+		if slices.Contains(evaluation.prerequisites, reference) || slices.Contains(evaluation.sourcePrerequisites, reference) {
 			for _, dependency := range profiles[consumer.profile].TargetInvocationDependencies {
 				if kconfig.CanonicalKbuildGraphTarget(dependency.Target) != reference {
 					continue
@@ -9728,7 +9729,10 @@ func selectedKbuildRecursiveMakePlanWithCausalTraversal(
 		}
 		predecessors := []string{}
 		prerequisiteFrontiers := []*kbuildRecursiveMakeFrontier{}
-		for _, prerequisite := range append(append([]kbuildSelectionPrerequisite(nil), normal...), orderOnly...) {
+		prerequisitesByTarget := map[string][]kbuildSelectionPrerequisite{
+			target: append(append([]kbuildSelectionPrerequisite(nil), normal...), orderOnly...),
+		}
+		for _, prerequisite := range prerequisitesByTarget[target] {
 			result, err := visit(prerequisite, "prerequisite of "+target, false, target)
 			if err != nil {
 				return traversalResult{}, err
@@ -9784,7 +9788,8 @@ func selectedKbuildRecursiveMakePlanWithCausalTraversal(
 			if err := kconfig.BindCompactKbuildGroupedAction(&profile, peerRuleIndex, peerStem, target, peerOutputs); err != nil {
 				return traversalResult{}, err
 			}
-			for _, prerequisite := range append(append([]kbuildSelectionPrerequisite(nil), peerNormal...), peerOrderOnly...) {
+			prerequisitesByTarget[peer] = append(append([]kbuildSelectionPrerequisite(nil), peerNormal...), peerOrderOnly...)
+			for _, prerequisite := range prerequisitesByTarget[peer] {
 				result, err := visit(prerequisite, "prerequisite of grouped peer "+peer, false, peer)
 				if err != nil {
 					return traversalResult{}, err
@@ -9797,18 +9802,20 @@ func selectedKbuildRecursiveMakePlanWithCausalTraversal(
 		terminals := reduceTerminals(predecessors)
 		frontier := frontiers.join(prerequisiteFrontiers...)
 		if beforeRecipe != nil && len(effectiveRecipeIndexes) != 0 {
-			paths := []string{}
-			for _, prerequisite := range append(append([]kbuildSelectionPrerequisite(nil), normal...), orderOnly...) {
-				path := kconfig.CanonicalKbuildGraphTarget(prerequisite.target)
-				if path != "" && path != "FORCE" {
-					paths = appendUnique(paths, path)
+			for peer, prerequisites := range prerequisitesByTarget {
+				paths := []string{}
+				for _, prerequisite := range prerequisites {
+					path := kconfig.CanonicalKbuildGraphTarget(prerequisite.target)
+					if path != "" && path != "FORCE" {
+						paths = appendUnique(paths, path)
+					}
 				}
-			}
-			if len(paths) != 0 {
-				if *beforeRecipe == nil {
-					*beforeRecipe = map[string]kbuildTargetNativePrerequisiteFrontier{}
+				if len(paths) != 0 {
+					if *beforeRecipe == nil {
+						*beforeRecipe = map[string]kbuildTargetNativePrerequisiteFrontier{}
+					}
+					(*beforeRecipe)[peer] = kbuildTargetNativePrerequisiteFrontier{frontier: frontier, paths: paths}
 				}
-				(*beforeRecipe)[target] = kbuildTargetNativePrerequisiteFrontier{frontier: frontier, paths: paths}
 			}
 		}
 		for _, selectedRuleIndex := range effectiveRecipeIndexes {

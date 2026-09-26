@@ -1316,12 +1316,16 @@ func (g *compactKbuildSelectionGraph) prepareGroupedSelections(
 		baselineComparable.Target = ""
 		baselineComparable.MakeTarget = ""
 		baselineComparable.GroupedTrigger = ""
+		// Peers can declare different native prerequisites. Their exact producer
+		// versions are joined by selection dependencies, not recipe context.
+		baselineComparable.NativePrerequisiteArtifacts = ""
 		for _, peer := range group {
 			selection := g.selections[peer.key]
 			comparable := selection
 			comparable.Target = ""
 			comparable.MakeTarget = ""
 			comparable.GroupedTrigger = ""
+			comparable.NativePrerequisiteArtifacts = ""
 			context := compactKbuildSelectionPlanContext(config, selection)
 			if peer.outputSignature != group[0].outputSignature ||
 				comparable != baselineComparable || context != baselineContext {
