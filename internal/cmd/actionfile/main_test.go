@@ -451,7 +451,7 @@ func TestRunRejectsInvalidAbsoluteObservedOutputStateMerges(t *testing.T) {
 
 func TestRunStagesCanonicalTree(t *testing.T) {
 	dir := t.TempDir()
-	first := filepath.Join(dir, "first")
+	first := filepath.Join(dir, "first input")
 	second := filepath.Join(dir, "second")
 	if err := os.WriteFile(first, []byte("header"), 0o600); err != nil {
 		t.Fatal(err)
@@ -460,11 +460,16 @@ func TestRunStagesCanonicalTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, "tree")
-	if err := run([]string{
+	arguments := []string{
 		"-tree_out", out,
 		"-copy", "external/pkg/include/header.h=" + first,
 		"-copy", "external/pkg/lib/libpkg.a=" + second,
-	}); err != nil {
+	}
+	params := filepath.Join(dir, "copy.params")
+	if err := os.WriteFile(params, []byte(strings.Join(arguments, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"@" + params}); err != nil {
 		t.Fatal(err)
 	}
 	for relative, want := range map[string]string{

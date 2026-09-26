@@ -447,7 +447,7 @@ func validateTreeOutputRoot(root string) error {
 	})
 }
 
-func decodeArgumentsFile(filename string) ([]string, error) {
+func readArgumentsFile(filename string) ([]byte, error) {
 	if filename == "" {
 		return nil, fmt.Errorf("arguments file path is empty")
 	}
@@ -472,6 +472,14 @@ func decodeArgumentsFile(filename string) ([]string, error) {
 	}
 	if len(data) > maxArgumentsFileBytes {
 		return nil, fmt.Errorf("arguments file %q exceeds %d bytes", filename, maxArgumentsFileBytes)
+	}
+	return data, nil
+}
+
+func decodeArgumentsFile(filename string) ([]string, error) {
+	data, err := readArgumentsFile(filename)
+	if err != nil {
+		return nil, err
 	}
 	var arguments []string
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -507,6 +515,19 @@ func decodeArgumentsFile(filename string) ([]string, error) {
 }
 
 func run(args []string) error {
+	// Ordinary Bazel actions can retain typed File operands in a multiline
+	// Args param file. map_directory actions use the JSON transport below.
+	if len(args) == 1 && strings.HasPrefix(args[0], "@") {
+		data, err := readArgumentsFile(strings.TrimPrefix(args[0], "@"))
+		if err != nil {
+			return err
+		}
+		if !bytes.HasSuffix(data, []byte("\n")) || bytes.IndexByte(data, 0) >= 0 {
+			return fmt.Errorf("multiline arguments file must contain newline-terminated arguments without NUL")
+		}
+		return runDirect(strings.Split(string(data[:len(data)-1]), "\n"))
+	}
+
 	if len(args) != 0 && args[0] == "-arguments_file" {
 		if len(args) != 2 {
 			return fmt.Errorf("-arguments_file requires exactly one path and no other arguments")
