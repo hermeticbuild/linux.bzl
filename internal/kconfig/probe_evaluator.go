@@ -2610,16 +2610,16 @@ func (e *LinuxProbeEvaluator) rustcPrintFileNames(command string) (string, bool,
 		fields[5] != "--crate-type" || !safeLinuxProbePathComponent(fields[6]) || fields[7] != "-" {
 		return "", true, e.unsupportedCommand(command)
 	}
-	environment, auxiliaryTools, sourceRoots, err := e.probeStepEnvironment("rustc", inlineEnvironment)
+	environment, err := e.probeStepEnvironment("rustc", inlineEnvironment)
 	if err != nil {
 		return "", true, fmt.Errorf("invalid rustc file-name environment: %w", err)
 	}
 	request := ProbeRequest{
 		Schema:      LinuxProbeRequestSchema,
-		SourceRoots: sourceRoots,
+		SourceRoots: environment.sourceRoots, Sources: environment.sources,
 		Steps: []ProbeStep{{
 			Name: "print-file-names", Tool: "rustc", Arguments: slices.Clone(fields[1:]),
-			AuxiliaryTools: auxiliaryTools, Environment: environment,
+			AuxiliaryTools: environment.auxiliaryTools, Environment: environment.values,
 		}},
 		Outcome: ProbeOutcome{
 			Kind: "text", Step: "print-file-names", Stream: "stdout", TrimSpace: true,
@@ -3068,17 +3068,17 @@ func (e *LinuxProbeEvaluator) rustCompilerOptionProbe(command string) (linuxProb
 	if err := validateRustProbeCandidate(candidate); err != nil {
 		return linuxProbeTruth{}, true, fmt.Errorf("invalid rustc-option candidate: %w", err)
 	}
-	environment, auxiliaryTools, sourceRoots, err := e.probeStepEnvironment("rustc", inlineEnvironment)
+	environment, err := e.probeStepEnvironment("rustc", inlineEnvironment)
 	if err != nil {
 		return linuxProbeTruth{}, true, fmt.Errorf("invalid rustc-option environment: %w", err)
 	}
 	arguments := append(candidate, "--crate-type=rlib", "/dev/null", "--out-dir=${scratch:out}", "-o", "${scratch:out}/tmp.rlib")
 	request := ProbeRequest{
 		Schema: LinuxProbeRequestSchema, Scratch: []ProbeScratch{{Name: "out", Kind: "directory"}},
-		SourceRoots: sourceRoots,
+		SourceRoots: environment.sourceRoots, Sources: environment.sources,
 		Steps: []ProbeStep{{
 			Name: "probe", Tool: "rustc", Arguments: arguments,
-			AuxiliaryTools: auxiliaryTools, Environment: environment,
+			AuxiliaryTools: environment.auxiliaryTools, Environment: environment.values,
 		}},
 		Outcome: ProbeOutcome{Kind: "boolean", Predicate: &ProbePredicate{Operator: "exit-zero", Step: "probe"}},
 	}
@@ -3086,7 +3086,12 @@ func (e *LinuxProbeEvaluator) rustCompilerOptionProbe(command string) (linuxProb
 	return truth, true, err
 }
 
-func (e *LinuxProbeEvaluator) probeStepEnvironment(primaryRole string, inline map[string]string) (map[string]string, []string, []string, error) {
+type probeEnvironment struct {
+	values                               map[string]string
+	auxiliaryTools, sourceRoots, sources []string
+}
+
+func (e *LinuxProbeEvaluator) probeStepEnvironment(primaryRole string, inline map[string]string) (probeEnvironment, error) {
 	merged := maps.Clone(e.scriptEnvironment)
 	if merged == nil {
 		merged = map[string]string{}
@@ -3099,10 +3104,10 @@ func (e *LinuxProbeEvaluator) probeStepEnvironment(primaryRole string, inline ma
 	sourceRootSet := map[string]bool{}
 	for name, value := range merged {
 		if !validKbuildCommandEnvironmentName(name) || strings.ContainsRune(value, 0) {
-			return nil, nil, nil, fmt.Errorf("invalid environment variable %q", name)
+			return probeEnvironment{}, fmt.Errorf("invalid environment variable %q", name)
 		}
 		if err := validateSourceScriptProtocolLiteral(value); err != nil {
-			return nil, nil, nil, fmt.Errorf("environment %s: %w", name, err)
+			return probeEnvironment{}, fmt.Errorf("environment %s: %w", name, err)
 		}
 		if e.isSelectedSourceRoot(value) {
 			environment[name] = "${source_root:" + linuxProbeSourceRootName + "}"
@@ -3116,7 +3121,7 @@ func (e *LinuxProbeEvaluator) probeStepEnvironment(primaryRole string, inline ma
 		}
 		role, selected, err := e.configuredSourceScriptToolRole(value)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("environment %s: %w", name, err)
+			return probeEnvironment{}, fmt.Errorf("environment %s: %w", name, err)
 		}
 		if selected {
 			environment[name] = "${tool:" + role + "}"
@@ -3137,7 +3142,12 @@ func (e *LinuxProbeEvaluator) probeStepEnvironment(primaryRole string, inline ma
 		sourceRoots = append(sourceRoots, root)
 	}
 	slices.Sort(sourceRoots)
-	return environment, auxiliaryTools, sourceRoots, nil
+	var sources []string
+	if sourceRootSet[linuxProbeSourceRootName] {
+		// The action binds the Linux root through this declared source anchor.
+		sources = []string{linuxProbeRootAnchor}
+	}
+	return probeEnvironment{values: environment, auxiliaryTools: auxiliaryTools, sourceRoots: sourceRoots, sources: sources}, nil
 }
 
 func validateRustProbeCandidate(candidate []string) error {

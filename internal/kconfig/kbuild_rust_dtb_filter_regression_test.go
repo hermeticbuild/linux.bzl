@@ -83,11 +83,13 @@ endif
 
 	fixture := linuxCompilerBootstrapFixtures(t)[1]
 	target := testKbuildProbeScopeOptions(t, fixture)
+	target.SourceRoot = t.TempDir()
 	target.Tools["rustc"] = "/configured/target/rustc"
 	target.ScriptEnvironment = map[string]string{
 		"CC":              target.Tools["cc"],
 		"RUSTC":           target.Tools["rustc"],
 		"RUSTC_BOOTSTRAP": "1",
+		"srctree":         target.SourceRoot,
 	}
 	opts := KbuildProbeWorkloadOptions{Target: target}
 	workload := func(scopes *KbuildProbeScopes) (string, error) {
@@ -142,8 +144,8 @@ endif
 			!slices.Equal(request.Steps[0].AuxiliaryTools, []string{"cc"}) ||
 			!reflect.DeepEqual(request.Steps[0].Environment, map[string]string{
 				"ARCH": "x86", "CC": "${tool:cc}", "MAKEFLAGS": "", "RUSTC": "${tool:rustc}",
-				"RUSTC_BOOTSTRAP": "1", "SRCARCH": "x86",
-			}) || len(request.SourceRoots) != 0 ||
+				"RUSTC_BOOTSTRAP": "1", "SRCARCH": "x86", "srctree": "${source_root:linux}",
+			}) || !slices.Equal(request.SourceRoots, []string{"linux"}) || !slices.Equal(request.Sources, []string{"Kconfig"}) ||
 			request.Outcome.Kind != "text" || request.Outcome.Step != "print-file-names" ||
 			request.Outcome.Stream != "stdout" || !request.Outcome.TrimSpace || !request.Outcome.PathComponent ||
 			!request.Outcome.RequireSuccess {

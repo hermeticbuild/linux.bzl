@@ -2770,6 +2770,7 @@ func TestRustCompilerOptionProbeMergesInheritedAndInlineEnvironment(t *testing.T
 	evaluator, _ := newFixtureProbeEvaluator(t, 1, "arm64", builder, nil, true)
 	sourceEnvironment := maps.Clone(evaluator.scriptEnvironment)
 	sourceEnvironment["ROLE_FREE"] = "source-selected"
+	sourceEnvironment["srctree"] = evaluator.sourceRoot
 	sourceEnvironment["RUSTC_BOOTSTRAP"] = "source-selected"
 	evaluator, err = evaluator.WithScriptEnvironment(sourceEnvironment)
 	if err != nil {
@@ -2808,7 +2809,10 @@ func TestRustCompilerOptionProbeMergesInheritedAndInlineEnvironment(t *testing.T
 		if got, want := step.AuxiliaryTools, []string{"bindgen", "cc"}; !slices.Equal(got, want) {
 			t.Errorf("%s rustc auxiliary tools=%q, want %q", bootstrap, got, want)
 		}
-		if got, want := request.SourceRoots, []string{"rust"}; !slices.Equal(got, want) {
+		if !slices.Equal(request.Sources, []string{"Kconfig"}) {
+			t.Fatalf("rustc source-root environment lacks declared anchor: %q", request.Sources)
+		}
+		if got, want := request.SourceRoots, []string{"linux", "rust"}; !slices.Equal(got, want) {
 			t.Errorf("%s rustc source roots=%q, want %q", bootstrap, got, want)
 		}
 	}
