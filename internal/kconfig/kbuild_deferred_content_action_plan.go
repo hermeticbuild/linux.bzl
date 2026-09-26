@@ -1037,11 +1037,12 @@ func (b *compactKbuildRulePlanBuilder) buildDeferredKbuildContentQuery(
 	// Preserve the argv-only fast path for scalar queries. Besides avoiding a
 	// shell, ordinary command lowering discovers exact static file operands (the
 	// generated asm-offsets query is one example) and binds their producers.
+	rootedCommand := compactKbuildProfileEvaluatedRootedActionRecipeText(query.Profile, query.Command)
 	var argvErr error
-	protected, err := protectDeferredKbuildQueryDollars(query.Command)
+	protected, err := protectDeferredKbuildQueryDollars(rootedCommand)
 	if err == nil {
 		var commands []compactKbuildRecipeCommand
-		commands, err = parseCompactKbuildRecipe(protected+" > "+output, compactKbuildAutomaticContext{target: query.Target})
+		commands, err = parseCompactKbuildRecipe(compactKbuildFinalizeRootedActionRecipeText(protected)+" > "+output, compactKbuildAutomaticContext{target: query.Target})
 		if err == nil {
 			for commandIndex := range commands {
 				commands[commandIndex].program = restoreDeferredKbuildQueryLiterals(commands[commandIndex].program)
@@ -1076,7 +1077,6 @@ func (b *compactKbuildRulePlanBuilder) buildDeferredKbuildContentQuery(
 	// materialized while the consumer node is being appended, so ruleInputs
 	// resolves them to their precise producer IDs rather than to tree snapshots.
 	outputTarget := compactKbuildActionObjectTreeMarker + "/" + output
-	rootedCommand := compactKbuildProfileEvaluatedRootedActionRecipeText(query.Profile, query.Command)
 	script := "(\n" + rootedCommand + "\n) > " + outputTarget
 	commands, err := compactKbuildCompoundProgramCommands(script)
 	if err != nil {

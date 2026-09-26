@@ -479,13 +479,14 @@ export STATE := before
 export MODE := base
 export SOURCE_ROOT := $(srctree)
 all:
-	$(eval FIRST := $(shell MODE=inline $(AWK) same))
+	$(eval FIRST := $(shell MODE=inline $(AWK) same $(srctree)/input.txt))
 	$(eval export STATE := after)
-	$(eval SECOND := $(shell MODE=inline $(AWK) same))
+	$(eval SECOND := $(shell MODE=inline $(AWK) same $(srctree)/input.txt))
 `, map[string]string{
 		"AWK":     KbuildActionRoleToken("target", "awk"),
 		"srctree": "__LINUX_BZL_SOURCE_TREE__",
 	})
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, "input.txt")
 	profile.EntryTargets = []string{"all"}
 	stepper := controlTestStepper(t, profile, KbuildControlEvaluationOptions{})
 	if _, err := stepper.BeginTarget("all", "all", ""); err != nil {
@@ -524,6 +525,16 @@ all:
 		}
 		queryCount++
 		recipe := plan.Recipes[node.Recipe]
+		if len(node.Sources) != 1 || len(recipe.Sources) != 1 {
+			t.Fatalf("argv query source bindings = %#v / %q, want input.txt", node.Sources, recipe.Sources)
+		}
+		key := "source:" + recipe.Sources[0]
+		if want := []string{"same", "${" + key + "}"}; !slices.Equal(recipe.Arguments, want) {
+			t.Errorf("argv query arguments = %q, want exact source binding %q", recipe.Arguments, want)
+		}
+		if got := recipe.WorkingInputs[key]; got != "input.txt" {
+			t.Errorf("argv query working source = %q, want input.txt", got)
+		}
 		states[recipe.Environment["STATE"]] = true
 		if got, want := recipe.Environment["MODE"], "inline"; got != want {
 			t.Errorf("argv query MODE = %q, want inline precedence %q", got, want)
