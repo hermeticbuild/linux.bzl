@@ -1691,9 +1691,12 @@ func compareRecipeWorkingTreesWithEffects(
 			}
 		case "symlink":
 			expected := trees[effect.Tree]
+			if expected != "" {
+				expected = filepath.Join(expected, filepath.FromSlash(effect.TreePath))
+			}
 			if entry.info.Mode()&os.ModeSymlink == 0 || expected == "" ||
 				filepath.Clean(entry.link) != filepath.Clean(expected) {
-				return fmt.Errorf("private working effect %q is not a symlink to declared tree %q", effect.Path, effect.Tree)
+				return fmt.Errorf("private working effect %q is not a symlink to declared tree %q at %q", effect.Path, effect.Tree, expected)
 			}
 		default:
 			return fmt.Errorf("private working effect %q has unsupported kind %q", effect.Path, effect.Kind)

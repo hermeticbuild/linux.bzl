@@ -732,12 +732,23 @@ func (m *CompactMetadata) compactKbuildSelectedPhonySourceScriptCheck(
 		)
 	}
 	if len(match.rule.Recipe) != 1 {
+		if len(match.rule.Recipe) == 4 {
+			selected, err := m.compactKbuildPhonyPrivateRecipe(target, match, nil, snapshots)
+			if err != nil {
+				return false, err
+			}
+			_, _, proved, err := compactKbuildSelectedPhonyPrivateSetup(
+				target, match, selected.lines, snapshots, selected.automatic, selected.injected,
+			)
+			if err != nil || proved {
+				return proved, err
+			}
+		}
 		// Inspect each frozen line before retaining an executable PHONY target.
 		// The generic rule lowerer must independently prove its side effects and
 		// successful completion without declaring the PHONY name as a file.
 		sourceScript := false
 		scriptPath := ""
-		rootedLines := make([]string, 0, len(match.rule.Recipe))
 		for index, raw := range match.rule.Recipe {
 			lineMatch := match
 			if snapshot := snapshots[index]; snapshot != nil {
@@ -750,11 +761,6 @@ func (m *CompactMetadata) compactKbuildSelectedPhonySourceScriptCheck(
 			if evaluateErr != nil {
 				return false, fmt.Errorf("selected PHONY recipe line %d: %w", index, evaluateErr)
 			}
-			rooted, rootErr := compactKbuildRootedActionDirectRecipeText(lineMatch.profile, actual)
-			if rootErr != nil {
-				return false, fmt.Errorf("selected PHONY recipe line %d: %w", index, rootErr)
-			}
-			rootedLines = append(rootedLines, compactKbuildFinalizeRootedActionRecipeText(rooted))
 			scripts, scriptErr := probeSourceScripts(lineMatch, actual)
 			if scriptErr != nil {
 				return false, fmt.Errorf("selected PHONY recipe line %d: %w", index, scriptErr)
@@ -766,17 +772,6 @@ func (m *CompactMetadata) compactKbuildSelectedPhonySourceScriptCheck(
 		}
 		if sourceScript && len(match.rule.Recipe) != 4 {
 			return false, fmt.Errorf("cannot authenticate selected PHONY source script %q in a multiline Make recipe", scriptPath)
-		}
-		if !sourceScript {
-			_, _, proved, proofErr := compactKbuildSelectedPhonyPrivateSetup(
-				target, match, rootedLines, snapshots, automatic, injected,
-			)
-			if proofErr != nil {
-				return false, proofErr
-			}
-			if proved {
-				return true, nil
-			}
 		}
 		return sourceScript, nil
 	}

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -3049,50 +3050,73 @@ func TestSourceCheckCompletionRequiresAbsentTargetAndCleanWritableTree(t *testin
 
 func TestSourceSelectedPrivateSetupBoundsWorkingTreeAndCompletion(t *testing.T) {
 	for _, test := range []struct {
-		name, after, wantError string
-		preexisting            bool
+		name, after, wantError, sourcePath string
+		preexisting, sourceDirty           bool
 	}{
 		{name: "selected private setup"},
+		{name: "generated module order is not source dirt", sourcePath: ".linux-bzl/external/module"},
+		{name: "dirty immutable module source", sourcePath: ".linux-bzl/external/module", sourceDirty: true, wantError: "exit status 1"},
 		{name: "preserve existing ignore file", preexisting: true},
 		{name: "reject deletion of existing ignore file", preexisting: true, after: "rm .gitignore", wantError: "required private working effect"},
 		{name: "reject mutation of existing ignore file", preexisting: true, after: "printf 'changed\\n' >> .gitignore", wantError: "preexisting private working effect"},
 		{name: "unclaimed sibling", after: "printf 'stray\\n' > sibling", wantError: "changed or disappeared"},
-		{name: "wrong symlink", after: "ln -fsn /unbound/source source", wantError: "not a symlink to declared tree"},
+		{name: "wrong source subtree", sourcePath: ".linux-bzl/external/module", after: `ln -fsn "$1/.." source`, wantError: "not a symlink to declared tree"},
 		{name: "logical target created", after: "printf 'fake\\n' > outputmakefile", wantError: "logical target"},
 		{name: "script failed", after: "exit 13", wantError: "exit status 13"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			directory := t.TempDir()
 			sourceRoot := filepath.Join(directory, "immutable-source")
-			if err := os.MkdirAll(sourceRoot, 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Join(sourceRoot, test.sourcePath), 0o755); err != nil {
 				t.Fatal(err)
 			}
+			if test.sourceDirty {
+				if err := os.WriteFile(filepath.Join(sourceRoot, test.sourcePath, "modules.order"), []byte("module.o\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tree := "kernel"
+			sourceArgument := "${tree:kernel}"
+			if test.sourcePath != "" {
+				tree = "external"
+				sourceArgument = "${tree:external}/" + test.sourcePath
+			}
 			helper := filepath.Join(directory, "setup-helper")
-			body := "#!/bin/sh\nset -eu\nln -fsn \"$1\" source\nprintf 'include %s/Makefile\\n' \"$1\" > Makefile\n" +
+			body := "#!/bin/sh\nset -eu\ntest ! -f \"$1/modules.order\"\nln -fsn \"$1\" source\nprintf 'include %s/Makefile\\n' \"$1\" > Makefile\n" +
 				"test -e .gitignore || printf '*\\n' > .gitignore\n" + test.after + "\n"
 			if err := os.WriteFile(helper, []byte(body), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			recipe := kconfig.ActionRecipe{
 				Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "helper",
-				Arguments: []string{"${tree:kernel}"}, WorkingDirectory: "source-setup",
-				ObservedOutputs:             map[string]string{"completion": "outputmakefile"},
+				Arguments: []string{sourceArgument}, WorkingDirectory: "source-setup",
+				ExecutionDirectory:          test.sourcePath,
+				ObservedOutputs:             map[string]string{"completion": path.Join(test.sourcePath, "outputmakefile")},
 				RequireAbsentObservedOutput: "completion", Outputs: []string{"completion"},
-				Trees: []string{"kernel"},
+				Trees: []string{tree}, WorkingInputs: map[string]string{},
 				PrivateWorkingEffects: []kconfig.ActionRecipePrivateWorkingEffect{
-					{Path: ".gitignore", Kind: "regular", PreserveExisting: true},
-					{Path: "Makefile", Kind: "regular", Required: true},
-					{Path: "source", Kind: "symlink", Tree: "kernel", Required: true},
+					{Path: path.Join(test.sourcePath, ".gitignore"), Kind: "regular", PreserveExisting: true},
+					{Path: path.Join(test.sourcePath, "Makefile"), Kind: "regular", Required: true},
+					{Path: path.Join(test.sourcePath, "source"), Kind: "symlink", Tree: tree, TreePath: test.sourcePath, Required: true},
 				},
 			}
 			inputs := map[string]string{}
+			if test.sourcePath != "" {
+				generated := filepath.Join(directory, "generated-modules.order")
+				if err := os.WriteFile(generated, []byte("module.o\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				recipe.Inputs = append(recipe.Inputs, "order")
+				recipe.WorkingInputs["input:order"] = path.Join(test.sourcePath, "modules.order")
+				inputs["order"] = generated
+			}
 			if test.preexisting {
 				prior := filepath.Join(directory, "prior-ignore")
 				if err := os.WriteFile(prior, []byte("existing\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
-				recipe.Inputs = []string{"prior"}
-				recipe.WorkingInputs = map[string]string{"input:prior": ".gitignore"}
+				recipe.Inputs = append(recipe.Inputs, "prior")
+				recipe.WorkingInputs["input:prior"] = path.Join(test.sourcePath, ".gitignore")
 				inputs["prior"] = prior
 			}
 			recipePath, recipeID := writeRecipe(t, recipe)
@@ -3103,7 +3127,7 @@ func TestSourceSelectedPrivateSetupBoundsWorkingTreeAndCompletion(t *testing.T) 
 				toolRole: "helper", workingDirectory: work, workingDirectoryMarker: filepath.Join(work, ".linux-bzl-work-root"),
 				sources: map[string]string{}, inputs: inputs,
 				outputs: map[string]string{"completion": completion}, tools: map[string]string{"helper": helper},
-				trees: map[string]string{"kernel": sourceRoot},
+				trees: map[string]string{tree: sourceRoot},
 			})
 			if test.wantError != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantError) {
@@ -3120,7 +3144,7 @@ func TestSourceSelectedPrivateSetupBoundsWorkingTreeAndCompletion(t *testing.T) 
 			if state := decodeObservedOutputState(t, completion); state.Disposition != toolaction.ObservedOutputAbsent {
 				t.Fatalf("private PHONY completion = %#v", state)
 			}
-			if _, statErr := os.Lstat(filepath.Join(work, "source-setup", "outputmakefile")); !os.IsNotExist(statErr) {
+			if _, statErr := os.Lstat(filepath.Join(work, "source-setup", test.sourcePath, "outputmakefile")); !os.IsNotExist(statErr) {
 				t.Fatalf("private setup created a physical PHONY target: %v", statErr)
 			}
 		})

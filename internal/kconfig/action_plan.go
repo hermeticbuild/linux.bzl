@@ -438,10 +438,12 @@ func cloneActionRecipeCompilerProbeInvocation(invocation *actionRecipeCompilerPr
 // ActionRecipePrivateWorkingEffect is an exact path/type change permitted
 // inside one source-selected execution-only action. Its bytes are private;
 // another action must independently declare a producer before reading them.
+// A symlink points to Tree with the optional relative TreePath appended.
 type ActionRecipePrivateWorkingEffect struct {
 	Path             string `json:"path"`
 	Kind             string `json:"kind"`
 	Tree             string `json:"tree,omitempty"`
+	TreePath         string `json:"tree_path,omitempty"`
 	Required         bool   `json:"required,omitempty"`
 	PreserveExisting bool   `json:"preserve_existing,omitempty"`
 }
@@ -2275,9 +2277,14 @@ func (r ActionRecipe) Validate() error {
 				return fmt.Errorf("private working effect %q is duplicated, unordered, or aliases the logical target", effect.Path)
 			}
 			seen[effect.Path] = true
+			if effect.TreePath != "" {
+				if err := validatePlanRelativePath("private symlink tree", effect.TreePath); err != nil {
+					return err
+				}
+			}
 			if effect.Kind != "regular" && effect.Kind != "symlink" ||
 				effect.Kind == "symlink" && (effect.Tree == "" || !declared["tree"][effect.Tree]) ||
-				effect.Kind == "regular" && effect.Tree != "" ||
+				effect.Kind == "regular" && (effect.Tree != "" || effect.TreePath != "") ||
 				effect.PreserveExisting && effect.Kind != "regular" {
 				return fmt.Errorf("private working effect %q has invalid kind %q or tree %q", effect.Path, effect.Kind, effect.Tree)
 			}

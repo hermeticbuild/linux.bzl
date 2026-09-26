@@ -82,7 +82,7 @@ func validateActionRecipeMakePhonyCompletion(recipe ActionRecipe) error {
 			completion.ExpandedLine != "" || len(completion.ExpandedLines) > 128 {
 			return fmt.Errorf("PHONY Make completion has invalid private setup lines")
 		}
-		effects, proved := compactKbuildPhonyPrivateInlineEffects(completion.Target, completion.ExpandedLines)
+		effects, proved := compactKbuildPhonyPrivateInlineEffects(completion.Target, recipe.ExecutionDirectory, completion.ExpandedLines)
 		if !proved || !slices.Equal(effects, recipe.PrivateWorkingEffects) {
 			return fmt.Errorf("PHONY Make completion does not authenticate its bounded private effects")
 		}

@@ -7118,6 +7118,11 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 	executableProgramPaths := map[string]bool{}
 	literalTreeOffsets := []int{}
 	authorizedScriptTrees := map[string]bool{}
+	for _, effect := range options.PhonyPrivateEffects {
+		if effect.Kind == "symlink" {
+			authorizedScriptTrees[effect.Tree] = true
+		}
+	}
 	recordPrivateScriptTrees := func(value string) {
 		if strings.Contains(value, compactKbuildActionSourceTreeMarker) {
 			authorizedScriptTrees["kernel"] = true
@@ -7199,7 +7204,7 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 		match.compilerProbeCommands = probeCommands
 	}
 	directMakeReplay := compactKbuildRecipeHasRecursiveMake(compilerCommands)
-	if compoundCommands != nil {
+	if compoundCommands != nil || len(options.PhonyPrivateEffects) != 0 {
 		executionDirectory, objectRoot, err = compactKbuildTypedPrivateExecution(match.profile)
 		if err != nil {
 			return "", fmt.Errorf("atomic compound typed invocation execution: %w", err)
@@ -8425,6 +8430,86 @@ func (b *compactKbuildRulePlanBuilder) buildDirectRecipe(
 	return b.buildGenericDirectRecipe(target, match, inputs)
 }
 
+type compactKbuildPhonyPrivateRecipe struct {
+	rootedLines []string
+	lines       []string
+	automatic   compactKbuildAutomaticContext
+	injected    map[string]string
+}
+
+// Private setup inspects the original source directory, even when ordinary
+// compiler actions use a staged writable source overlay. Restore that one
+// Make binding before expansion: srcroot and CURDIR can otherwise have the
+// same projected spelling while referring to different trees.
+func (m *CompactMetadata) compactKbuildPhonyPrivateRecipe(
+	target string, match compactKbuildRuleMatch, inputs []compactKbuildRuleInput,
+	snapshots map[int]*KbuildSelectedControlRecipeSnapshot,
+) (compactKbuildPhonyPrivateRecipe, error) {
+	var result compactKbuildPhonyPrivateRecipe
+	injected, err := compactKbuildSourceScriptInjectionsForRuleTarget(target, match, inputs)
+	if err != nil {
+		return result, err
+	}
+	injected = compactKbuildActionTreeInjections(injected)
+	overlay, hasOverlay, err := compactKbuildSourceOverlayRoot(match.profile)
+	if err != nil {
+		return result, err
+	}
+	var sourceProjection compactKbuildSourceOverlayProjection
+	sourceTree := ""
+	if hasOverlay {
+		for _, projection := range compactKbuildProfileSourceOverlayProjections(match.profile) {
+			if projection.prefix == overlay {
+				sourceProjection = projection
+				break
+			}
+		}
+		if sourceProjection.virtual == "" {
+			return result, fmt.Errorf("private setup source overlay %q has no immutable source root", overlay)
+		}
+		namespace, err := m.actionPlanSourceNamespace(overlay)
+		if err != nil {
+			return result, err
+		}
+		if namespace == "kernel" || LinuxKernelPlanTrees[namespace] || namespace == linuxProbeHostDepsRootName {
+			return result, fmt.Errorf("private setup source overlay %q has no independent immutable namespace", overlay)
+		}
+		injected["srcroot"] = sourceProjection.virtual
+		sourceTree = "${tree:" + namespace + "}/" + overlay
+	}
+	automatic, err := compactKbuildRuleRootedAutomaticEvaluationContext(target, match, inputs, injected)
+	if err != nil {
+		return result, err
+	}
+	result.automatic, result.injected = automatic, injected
+	for index, raw := range match.rule.Recipe {
+		line := match
+		if snapshot := snapshots[index]; snapshot != nil {
+			line.profile = snapshot.Evaluation.Profile
+		}
+		actual, err := evaluateCompactKbuildTextForMakeTarget(
+			line.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+			automatic.normal, automatic.order, injected, raw, true,
+		)
+		if err != nil {
+			return result, fmt.Errorf("selected PHONY private setup line %d: %w", index, err)
+		}
+		if hasOverlay {
+			actual = replaceCompactKbuildCanonicalRoot(actual, sourceProjection.virtual, sourceTree)
+			for _, physical := range sourceProjection.physical {
+				actual = replaceCompactKbuildCanonicalRoot(actual, physical, sourceTree)
+			}
+		}
+		rooted, err := compactKbuildRootedActionDirectRecipeText(line.profile, actual)
+		if err != nil {
+			return result, err
+		}
+		result.rootedLines = append(result.rootedLines, rooted)
+		result.lines = append(result.lines, compactKbuildFinalizeRootedActionRecipeText(rooted))
+	}
+	return result, nil
+}
+
 // A PHONY setup can mix a direct shell line with a source-selected cmd_<name>
 // expansion. Inspect every frozen line before either command dispatch path
 // combines them; differing line-local reads must remain bound to their exact
@@ -8445,39 +8530,17 @@ func (b *compactKbuildRulePlanBuilder) buildSelectedPhonyPrivateSetup(
 	if err != nil || len(snapshots) != 4 {
 		return "", false, err
 	}
-	injected, err := compactKbuildSourceScriptInjectionsForRuleTarget(target, match, inputs)
-	if err != nil {
-		return "", false, err
-	}
-	injected = compactKbuildActionTreeInjections(injected)
-	automatic, err := compactKbuildRuleRootedAutomaticEvaluationContext(target, match, inputs, injected)
-	if err != nil {
-		return "", false, err
-	}
-	lines := make([]string, 0, len(match.rule.Recipe))
-	rootedLines := make([]string, 0, len(match.rule.Recipe))
-	for index, raw := range match.rule.Recipe {
+	for index := range match.rule.Recipe {
 		if snapshots[index] == nil {
 			return "", false, nil
 		}
-		line := match
-		line.profile = snapshots[index].Evaluation.Profile
-		actual, err := evaluateCompactKbuildTextForMakeTarget(
-			line.profile, target, match.lookupTarget, automatic.target, automatic.stem,
-			automatic.normal, automatic.order, injected, raw, true,
-		)
-		if err != nil {
-			return "", false, fmt.Errorf("selected PHONY private setup line %d: %w", index, err)
-		}
-		rooted, err := compactKbuildRootedActionDirectRecipeText(line.profile, actual)
-		if err != nil {
-			return "", false, err
-		}
-		rootedLines = append(rootedLines, rooted)
-		lines = append(lines, compactKbuildFinalizeRootedActionRecipeText(rooted))
+	}
+	selected, err := b.metadata.compactKbuildPhonyPrivateRecipe(target, match, inputs, snapshots)
+	if err != nil {
+		return "", false, err
 	}
 	effects, scriptPath, proved, err := compactKbuildSelectedPhonyPrivateSetup(
-		target, match, lines, snapshots, automatic, injected,
+		target, match, selected.lines, snapshots, selected.automatic, selected.injected,
 	)
 	if err != nil || !proved {
 		return "", false, err
@@ -8506,11 +8569,11 @@ func (b *compactKbuildRulePlanBuilder) buildSelectedPhonyPrivateSetup(
 		completion = &ActionRecipeMakePhonyCompletion{
 			Profile: match.profile.Name, Target: target, SourcePath: match.profile.Path,
 			RuleIndex: match.ruleOrder, RecipeIndex: 0,
-			ExpandedLines: slices.Clone(lines),
+			ExpandedLines: slices.Clone(selected.lines),
 		}
 	}
 	producer, err := b.buildHermeticKbuildScriptContext(
-		target, first, inputs, compactKbuildRecipeLineShells(rootedLines), nil, nil,
+		target, first, inputs, compactKbuildRecipeLineShells(selected.rootedLines), nil, nil,
 		compactKbuildHermeticScriptOptions{
 			PhonyPrivateEffects: effects, PhonyScriptPath: scriptPath,
 			PhonyStatus: completion,
@@ -8833,6 +8896,10 @@ func compactKbuildSelectedPhonyPrivateSetup(
 			return nil, "", false, nil
 		}
 	}
+	executionDirectory, _, err := compactKbuildTypedPrivateExecution(match.profile)
+	if err != nil {
+		return nil, "", false, err
+	}
 	lineProfile := snapshots[2].Evaluation.Profile
 	scripts, err := readCompactKbuildCommandSourceScriptsForMakeTarget(
 		lineProfile, target, match.lookupTarget, automatic.target, automatic.stem,
@@ -8843,7 +8910,7 @@ func compactKbuildSelectedPhonyPrivateSetup(
 		return nil, "", false, err
 	}
 	if len(scripts) == 0 {
-		effects, proved := compactKbuildPhonyPrivateInlineEffects(target, lines)
+		effects, proved := compactKbuildPhonyPrivateInlineEffects(target, executionDirectory, lines)
 		if !proved {
 			return nil, "", false, nil
 		}
@@ -8908,7 +8975,7 @@ func compactKbuildSelectedPhonyPrivateSetup(
 	if snapshots[3].view == nil {
 		return nil, "", false, fmt.Errorf("selected PHONY private setup has no last-line object-tree view")
 	}
-	if _, _, _, err := snapshots[3].view.Read("__LINUX_BZL_OBJECT_TREE__/" + optionalPath); err != nil {
+	if _, _, _, err := snapshots[3].view.Read("__LINUX_BZL_OBJECT_TREE__/" + path.Join(executionDirectory, optionalPath)); err != nil {
 		return nil, "", false, fmt.Errorf("selected PHONY private setup optional file %q: %w", optionalPath, err)
 	}
 	effects := []ActionRecipePrivateWorkingEffect{
@@ -8916,8 +8983,20 @@ func compactKbuildSelectedPhonyPrivateSetup(
 		{Path: writer, Kind: "regular", Required: true},
 		{Path: optionalPath, Kind: "regular", PreserveExisting: true},
 	}
+	for index := range effects {
+		effects[index].Path = path.Join(executionDirectory, effects[index].Path)
+	}
 	sort.Slice(effects, func(i, j int) bool { return effects[i].Path < effects[j].Path })
 	return effects, scriptPath, true, nil
+}
+
+func compactKbuildPhonyPrivateLiteralTreePaths(value string) string {
+	return actionRecipePlaceholder.ReplaceAllStringFunc(value, func(marker string) string {
+		if strings.HasPrefix(marker, "${tree:") {
+			return "SOURCE_TREE"
+		}
+		return marker
+	})
 }
 
 // An inline private writer may print source-derived text, but every inner
@@ -8948,7 +9027,7 @@ func compactKbuildPhonyPrivateLiteralEchoes(value string, automatic compactKbuil
 	// Literal-filechk evaluates cooked arguments while retaining quote
 	// provenance: single-quoted dollar syntax is data, whereas shell-active
 	// command substitutions and parameter expansions decline this proof.
-	protected := strings.ReplaceAll(value, "${tree:kernel}", "SOURCE_TREE")
+	protected := compactKbuildPhonyPrivateLiteralTreePaths(value)
 	lines, literal, err := parseCompactKbuildLiteralFilechk(protected, automatic)
 	return echoes > 0 && err == nil && literal && len(lines) == echoes
 }
@@ -9024,39 +9103,70 @@ func compactKbuildPhonyPrivateOptionalWriter(value string, automatic compactKbui
 // This parser is also applied to the persisted receipt. No target name or
 // writer basename is trusted: the selected shell lines must account for each
 // private path, and the runner checks exactly these effects after execution.
-func compactKbuildPhonyPrivateInlineEffects(target string, lines []string) ([]ActionRecipePrivateWorkingEffect, bool) {
-	if len(lines) != 4 || !compactKbuildPhonyPrivateCleanSourceGuard(lines[0]) {
+func compactKbuildPhonyPrivateInlineEffects(target, directory string, lines []string) ([]ActionRecipePrivateWorkingEffect, bool) {
+	if len(lines) != 4 {
 		return nil, false
 	}
 	automatic := compactKbuildAutomaticContext{}
 	link, err := parseCompactKbuildRecipe(lines[1], automatic)
 	if err != nil || len(link) != 1 || link[0].program != "ln" ||
 		len(link[0].arguments) != 3 || link[0].arguments[0] != "-fsn" ||
-		link[0].arguments[1] != "${tree:kernel}" ||
 		len(link[0].environment) != 0 || link[0].stdin != "" ||
 		link[0].stdout != "" || link[0].connector != "" ||
 		link[0].programEnd != 0 || link[0].argumentTokens != nil {
 		return nil, false
 	}
+	root := link[0].arguments[1]
+	binding, ok := strings.CutPrefix(root, "${tree:")
+	if !ok {
+		return nil, false
+	}
+	tree, suffix, ok := strings.Cut(binding, "}")
+	if !ok || validatePlanName("private source tree", tree) != nil ||
+		LinuxKernelPlanTrees[tree] || tree == linuxProbeHostDepsRootName {
+		return nil, false
+	}
+	treePath := ""
+	if suffix != "" {
+		treePath, ok = strings.CutPrefix(suffix, "/")
+		if !ok || validatePlanRelativePath("private source subtree", treePath) != nil {
+			return nil, false
+		}
+	}
+	if !compactKbuildPhonyPrivateSourceGuard(lines[0], root) {
+		return nil, false
+	}
 	alias, ok := compactKbuildRecipePath(link[0].arguments[2])
-	if !ok || alias == "" || alias != path.Base(alias) || alias == target {
+	if !ok || alias == "" || alias != path.Base(alias) || path.Join(directory, alias) == target {
 		return nil, false
 	}
 	writer, ok := compactKbuildPhonyPrivateInlineWriter(lines[2], automatic)
-	if !ok || writer == target {
+	if !ok || path.Join(directory, writer) == target {
 		return nil, false
 	}
 	optional, ok := compactKbuildPhonyPrivateOptionalWriter(lines[3], automatic)
-	if !ok || optional == target || alias == writer || alias == optional || writer == optional {
+	if !ok || path.Join(directory, optional) == target || alias == writer || alias == optional || writer == optional {
 		return nil, false
 	}
 	effects := []ActionRecipePrivateWorkingEffect{
-		{Path: alias, Kind: "symlink", Tree: "kernel", Required: true},
-		{Path: writer, Kind: "regular", Required: true},
-		{Path: optional, Kind: "regular", PreserveExisting: true},
+		{Path: path.Join(directory, alias), Kind: "symlink", Tree: tree, TreePath: treePath, Required: true},
+		{Path: path.Join(directory, writer), Kind: "regular", Required: true},
+		{Path: path.Join(directory, optional), Kind: "regular", PreserveExisting: true},
 	}
 	sort.Slice(effects, func(i, j int) bool { return effects[i].Path < effects[j].Path })
 	return effects, true
+}
+
+func compactKbuildPhonyPrivateSourceGuard(value, root string) bool {
+	if root == "${tree:kernel}" && compactKbuildPhonyPrivateCleanSourceGuard(value) {
+		return true
+	}
+	value = strings.Join(strings.Fields(strings.ReplaceAll(value, "\\\n", " ")), " ")
+	rest, ok := strings.CutPrefix(value, "if [ -f "+root+"/modules.order ]; then ")
+	if !ok {
+		return false
+	}
+	return compactKbuildPhonyPrivateSourceGuardFailure(rest)
 }
 
 func compactKbuildPhonyPrivateCleanSourceGuard(value string) bool {
@@ -9068,8 +9178,14 @@ func compactKbuildPhonyPrivateCleanSourceGuard(value string) bool {
 	}
 	archAndRest := strings.TrimPrefix(value, prefix)
 	arch, rest, ok := strings.Cut(archAndRest, "/include/generated ]; then ")
-	if !ok || arch == "" || strings.ContainsAny(arch, "/\\*?[]$`'\" ;&|") ||
-		!strings.HasSuffix(rest, "; fi") {
+	if !ok || arch == "" || strings.ContainsAny(arch, "/\\*?[]$`'\" ;&|") {
+		return false
+	}
+	return compactKbuildPhonyPrivateSourceGuardFailure(rest)
+}
+
+func compactKbuildPhonyPrivateSourceGuardFailure(rest string) bool {
+	if !strings.HasSuffix(rest, "; fi") {
 		return false
 	}
 	parts := strings.Split(strings.TrimSuffix(rest, "; fi"), ";")
@@ -9080,7 +9196,7 @@ func compactKbuildPhonyPrivateCleanSourceGuard(value string) bool {
 		echo = strings.TrimSpace(echo)
 		message, ok := strings.CutPrefix(echo, "echo >&2 \"")
 		message = strings.TrimSuffix(message, "\"")
-		message = strings.ReplaceAll(message, "${tree:kernel}", "SOURCE")
+		message = compactKbuildPhonyPrivateLiteralTreePaths(message)
 		if !ok || !strings.HasSuffix(echo, "\"") ||
 			strings.ContainsAny(message, "\\\"$`\n\r") {
 			return false
