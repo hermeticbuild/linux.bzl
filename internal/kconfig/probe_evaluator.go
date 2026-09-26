@@ -4142,7 +4142,16 @@ func (e *LinuxProbeEvaluator) unhandledCommand(command string) error {
 
 func (e *LinuxProbeEvaluator) ownsProbeCommand(command string) bool {
 	if e.looksLikeSourceScript(command) {
-		return true
+		commands, err := compactKbuildCompoundProgramCommands(command)
+		if err != nil {
+			// Keep conservative ownership when command positions cannot be parsed.
+			return true
+		}
+		for _, selected := range commands {
+			if e.sourceScriptSelectedProgram(command[selected.sourceStart:selected.sourceEnd]) {
+				return true
+			}
+		}
 	}
 	for _, tool := range e.tools {
 		if tool != "" && strings.Contains(command, tool) {

@@ -1570,10 +1570,9 @@ func (e *LinuxProbeEvaluator) parseSourceScriptInvocation(command string) (linux
 	}, true, nil
 }
 
-// sourceScriptSelectedProgram recognizes the command head, including the
-// source's env and inline assignment prefixes. Source-root spellings in a
-// configured compiler's -I or -iquote operands are immutable input paths,
-// not evidence that its command invokes a source script.
+// sourceScriptSelectedProgram recognizes the command head or a file-mode shell
+// script, including env and inline assignment prefixes. Source-root spellings
+// in a compiler's search operands do not establish source-script ownership.
 func (e *LinuxProbeEvaluator) sourceScriptSelectedProgram(command string) bool {
 	if !e.looksLikeSourceScript(command) {
 		return false
@@ -1641,6 +1640,11 @@ func (e *LinuxProbeEvaluator) sourceScriptSelectedPrefixWord(words []string, pro
 	_, recognized, pathErr := e.sourceScriptRelativePath(program)
 	if recognized || pathErr != nil {
 		return true
+	}
+	if compactKbuildShellProgram(filepath.Base(program)) && len(words) > 1 {
+		if index, fileMode := CompactKbuildShellFileScriptIndex(words[1:]); fileMode && e.looksLikeSourceScript(words[index+1]) {
+			return true
+		}
 	}
 	if len(words) == 0 || !strings.ContainsRune(words[0], '=') {
 		return false

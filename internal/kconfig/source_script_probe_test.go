@@ -1264,6 +1264,8 @@ func TestLinuxSourceScriptProbeRejectsUnmodeledShellExpansionAndPlaceholderColli
 	evaluator.scriptEnvironment["FLAGS"] = "-first -second"
 	evaluator.scriptEnvironment["PLACEHOLDER"] = "${tool:cc}"
 	for _, command := range []string{
+		`echo data; /src/scripts/tool-version.sh`,
+		`sh /src/scripts/tool-version.sh`,
 		`/src/scripts/tool-version.sh --driver=$CC`,
 		`env TOOL=$CC-suffix /src/scripts/tool-version.sh`,
 		"/src/scripts/tool-version.sh --tag=`ambient`",

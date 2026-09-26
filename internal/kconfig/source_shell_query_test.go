@@ -600,6 +600,7 @@ func TestKbuildSourceShellQueryReplaysUpstreamBindgenParametersWordList(t *testi
 	host := testKbuildProbeScopeOptions(t, fixtures[0])
 	for _, options := range []*KbuildProbeScopeOptions{&target, &host} {
 		options.SourceRoot = root
+		options.SourceRootAliases = []string{"__LINUX_BZL_SOURCE_TREE__"}
 		options.Tools[linuxProbeScriptRunner] = "/configured/scriptrun"
 		options.Tools[linuxProbeScriptRuntime] = "/configured/runtime"
 	}
