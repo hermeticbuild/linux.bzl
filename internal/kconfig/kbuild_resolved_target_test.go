@@ -127,6 +127,7 @@ result: input FORCE
 
 	queryProfile := profile
 	queryProfile.InvocationPredecessors = []string{"original-predecessor"}
+	queryProfile.InvocationControlPrerequisites = []CompactKbuildInvocationControlPrerequisite{{Profile: "parent", Target: "prepare"}}
 	queryProfile.TargetInvocationDependencies = []CompactKbuildInvocationDependency{{
 		Target: "original-target", Profile: "original-profile",
 		Goals: []string{"original-goal"}, ReplayArguments: []string{"make", "original-goal"},
@@ -177,6 +178,7 @@ result: input FORCE
 	query.ActionRoles[0] = KbuildActionRoleRef{Scope: "mutated", Role: "mutated"}
 	query.ObjectTree.References[0] = "mutated"
 	query.Profile.InvocationPredecessors[0] = "mutated"
+	query.Profile.InvocationControlPrerequisites[0].Target = "mutated"
 	query.Profile.TargetInvocationDependencies[0].Goals[0] = "mutated"
 	query.Profile.TargetInvocationDependencies[0].ReplayArguments[0] = "mutated"
 	query.Profile.EntryTargets[0] = "mutated"
@@ -197,6 +199,7 @@ result: input FORCE
 		freshQuery.ActionRoles[0] != (KbuildActionRoleRef{Scope: "target", Role: "awk"}) ||
 		freshQuery.ObjectTree.References[0] != "generated/query-input" ||
 		freshQuery.Profile.InvocationPredecessors[0] != "original-predecessor" ||
+		freshQuery.Profile.InvocationControlPrerequisites[0].Target != "prepare" ||
 		freshQuery.Profile.TargetInvocationDependencies[0].Goals[0] != "original-goal" ||
 		freshQuery.Profile.TargetInvocationDependencies[0].ReplayArguments[0] != "make" ||
 		freshQuery.Profile.EntryTargets[0] != "original-entry" ||

@@ -409,6 +409,10 @@ type CompactKbuildProfile struct {
 	// lowering uses it to attribute demanded files written as side effects by
 	// an earlier source-owned recipe.
 	InvocationPredecessors []string
+	// InvocationControlPrerequisites are parent PHONY targets whose complete
+	// recipes finished before this invocation began. They order execution;
+	// they never publish files into the invocation's object-tree frontier.
+	InvocationControlPrerequisites []CompactKbuildInvocationControlPrerequisite
 	// TargetInvocationDependencies record recursive Make invocations selected
 	// by a target's recipe or completed through its prerequisites. Only direct
 	// recipe invocations, including calls inside immutable source scripts, own
@@ -718,6 +722,11 @@ const (
 type CompactKbuildInvocationLocation struct {
 	Tree      CompactKbuildInvocationTree
 	Directory string
+}
+
+type CompactKbuildInvocationControlPrerequisite struct {
+	Profile string
+	Target  string
 }
 
 type CompactKbuildInvocationDependency struct {

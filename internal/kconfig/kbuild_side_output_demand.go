@@ -638,6 +638,15 @@ func (g *compactKbuildSelectionGraph) compactKbuildParentPrerequisiteSelections(
 	}
 	roots := []compactKbuildSelectionKey{}
 	seen := map[compactKbuildSelectionKey]bool{}
+	for _, prerequisite := range child.InvocationControlPrerequisites {
+		selected, found := g.selectionsByProfileTarget[compactKbuildProfileTargetKey{
+			profile: prerequisite.Profile, target: prerequisite.Target,
+		}]
+		if found && compactKbuildSelectionStageOrder(selected.stage) <= cacheKey.stage && !seen[selected] {
+			seen[selected] = true
+			roots = append(roots, selected)
+		}
+	}
 	for _, parentGoal := range g.invocationParents[childProfileName] {
 		parent, exists := g.profile(parentGoal.profile)
 		if !exists {
@@ -702,20 +711,6 @@ func (g *compactKbuildSelectionGraph) compactKbuildParentPrerequisiteSelections(
 				}
 				var phonyNormal, phonyOrderOnly []compactKbuildEvaluatedPath
 				if phonyMatched {
-					if len(phonyMatch.rule.Recipe) != 0 {
-						selected, found := g.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile: parent.Name, target: target}]
-						// An unselected PHONY recipe contributes only its source rule's
-						// prerequisite context to this child's invocation-start frontier.
-						// Its own recursive children are ordered by InvocationPredecessors;
-						// later lines and a completed PHONY status cannot precede a child
-						// launched by the same recipe. A selected status, when present,
-						// remains an explicit predecessor of a later child below.
-						if found && !slices.Contains(g.targetInvocations[compactKbuildProfileTargetKey{profile: parent.Name, target: target}], child.Name) &&
-							compactKbuildSelectionStageOrder(selected.stage) <= cacheKey.stage && !seen[selected] {
-							seen[selected] = true
-							roots = append(roots, selected)
-						}
-					}
 					phonyNormal, phonyOrderOnly, _, phonyErr = g.compactKbuildTargetRuleContext(parent, target, phonyMatch)
 				} else {
 					_, phonyNormal, phonyOrderOnly, phonyErr = g.compactKbuildOrderingOnlyRuleContextForMakeTarget(

@@ -1729,6 +1729,7 @@ final.out:
 	statusParent.TargetInvocationDependencies = slices.Clone(parent.TargetInvocationDependencies)
 	withStatus := config
 	withStatus.KbuildProfiles = append([]CompactKbuildProfile{statusParent}, config.KbuildProfiles[1:]...)
+	withStatus.KbuildProfiles[len(withStatus.KbuildProfiles)-1].InvocationControlPrerequisites = []CompactKbuildInvocationControlPrerequisite{{Profile: parent.Name, Target: "sequence"}}
 	withStatus.KbuildSelections = append(slices.Clone(config.KbuildSelections), CompactKbuildSelection{
 		Profile: parent.Name, Target: "sequence", MakeTarget: "sequence", Lifecycle: "target", Scope: "target", Stage: "target",
 	})

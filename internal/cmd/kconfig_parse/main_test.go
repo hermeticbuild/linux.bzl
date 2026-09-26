@@ -6536,6 +6536,73 @@ drivers/example/built-in.a: drivers/example/target.c
 	}
 }
 
+func TestEvaluatedKbuildProfilesDoNotBindFutureChildOutputIntoParentPrerequisite(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const root = "external/linux-source"
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"Makefile": `
+.PHONY: all prepare outputmakefile
+all: prepare
+	$(MAKE) -f $(srctree)/child.mk module/modules.order
+prepare: outputmakefile
+outputmakefile:
+	@if [ -f $(objtree)/module/modules.order ]; then false; fi
+`,
+		"child.mk": "module/modules.order:\n\tprintf module/example.ko > $@\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	variables := map[string]string{"SRCARCH": "x86"}
+	profiles, selections, _, err := evaluatedKbuildProfilesWithOptions(
+		root, root, []string{"all"}, variables, kconfig.KbuildOptions{
+			RootDir: root, Variables: variables, ConfigVariablesComplete: true, MakeVariablesComplete: true,
+		}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := selectionByTarget(t, selections, "outputmakefile")
+	if check.GeneratedObjectTreeArtifacts != "" {
+		t.Fatalf("parent cleanliness check consumes future child output: %s", check.GeneratedObjectTreeArtifacts)
+	}
+	metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(
+		&kconfig.ResolvedConfig{Effective: map[string]string{"CONFIG_TEST": "n"}},
+		kconfig.CompactMetadataOptions{SelectedProductsOnly: true},
+		func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
+			return kconfig.CompactConfigGraph{KbuildProfiles: profiles, KbuildSelections: selections}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := "sha256-" + strings.Repeat("5c", 32)
+	plan, err := metadata.ActionPlan(identity, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var completion, module kconfig.ActionPlanNode
+	for _, node := range plan.Nodes {
+		if receipt := plan.Recipes[node.Recipe].MakePhonyCompletion; receipt != nil && receipt.Target == "outputmakefile" {
+			completion = node
+		}
+		for _, output := range node.Outputs {
+			if output.Path == "module/modules.order" {
+				module = node
+			}
+		}
+	}
+	if completion.ID == "" || module.ID == "" || !slices.ContainsFunc(module.Inputs, func(input kconfig.ActionPlanNodeEdge) bool {
+		return input.ProducerID == completion.ID && input.Role == "sequence"
+	}) {
+		t.Fatal("recursive module build does not depend on the completed parent check")
+	}
+}
+
 func TestSelectedKbuildSelectionsDoNotPublishPhonyActionsIntoOpaqueRoots(t *testing.T) {
 	profile := selectionRoleProfileWithSources(t, `
 PHONY += prepare outputmakefile
@@ -6622,6 +6689,7 @@ func syntheticSelectionProfileWithEvaluator(t *testing.T, profile kconfig.Compac
 	backed.Directory = profile.Directory
 	setTestCompactKbuildInitialVisibleArtifacts(t, &backed, testCompactKbuildInitialVisibleArtifacts(profile))
 	backed.InvocationPredecessors = append([]string(nil), profile.InvocationPredecessors...)
+	backed.InvocationControlPrerequisites = slices.Clone(profile.InvocationControlPrerequisites)
 	backed.TargetInvocationDependencies = append([]kconfig.CompactKbuildInvocationDependency(nil), profile.TargetInvocationDependencies...)
 	backed.EntryTargets = append([]string(nil), profile.EntryTargets...)
 	backed.Generated = append([]kconfig.KbuildTarget(nil), profile.Generated...)
@@ -9065,6 +9133,11 @@ func TestKbuildInvocationRequestKeyIncludesInvocationPredecessors(t *testing.T) 
 	changed.invocationPredecessors = []string{"producer-b"}
 	if kbuildInvocationRequestKey(request) == kbuildInvocationRequestKey(changed) {
 		t.Fatal("request identity ignored source-ordered invocation predecessors")
+	}
+	changed = request
+	changed.invocationControlPrerequisites = []kconfig.CompactKbuildInvocationControlPrerequisite{{Profile: "parent", Target: "prepare"}}
+	if kbuildInvocationRequestKey(request) == kbuildInvocationRequestKey(changed) || canonicalKbuildInvocationRequestsEqual(request, changed) {
+		t.Fatal("request identity ignored completed parent controls")
 	}
 }
 

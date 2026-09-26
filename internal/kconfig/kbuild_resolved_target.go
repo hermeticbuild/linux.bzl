@@ -75,6 +75,7 @@ func cloneCompactKbuildSelectedTargetEffects(
 // target, just as it does in the source profile retained by the handle.
 func cloneCompactKbuildProfilePublicState(profile CompactKbuildProfile) CompactKbuildProfile {
 	profile.InvocationPredecessors = slices.Clone(profile.InvocationPredecessors)
+	profile.InvocationControlPrerequisites = slices.Clone(profile.InvocationControlPrerequisites)
 	profile.TargetInvocationDependencies = slices.Clone(profile.TargetInvocationDependencies)
 	for index := range profile.TargetInvocationDependencies {
 		dependency := &profile.TargetInvocationDependencies[index]

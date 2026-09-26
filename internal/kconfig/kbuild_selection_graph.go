@@ -448,6 +448,16 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 	}
 	for _, profile := range config.KbuildProfiles {
 		seen := map[string]bool{}
+		controls := map[CompactKbuildInvocationControlPrerequisite]bool{}
+		for _, prerequisite := range profile.InvocationControlPrerequisites {
+			parent, exists := graph.profiles[prerequisite.Profile]
+			if !exists || prerequisite.Profile == profile.Name || controls[prerequisite] ||
+				compactKbuildGraphTargetPath(prerequisite.Target) != prerequisite.Target ||
+				!graph.compactKbuildProfileTargetIsPhony(parent, prerequisite.Target) {
+				return nil, fmt.Errorf("Kbuild invocation %q has invalid completed control prerequisite %#v", profile.Name, prerequisite)
+			}
+			controls[prerequisite] = true
+		}
 		for _, predecessor := range profile.InvocationPredecessors {
 			if predecessor == "" || predecessor == profile.Name || seen[predecessor] {
 				return nil, fmt.Errorf("Kbuild profile %q has invalid invocation predecessor %q", profile.Name, predecessor)
