@@ -9964,6 +9964,11 @@ func replaceCompactKbuildCanonicalRoot(value, root, replacement string) string {
 	if root == "" || !strings.Contains(value, root) {
 		return value
 	}
+	// Action placeholders and protected source literals are not physical
+	// roots, even when a relative source directory has the same name.
+	placeholders := actionRecipePlaceholder.FindAllStringIndex(
+		strings.ReplaceAll(value, compactKbuildLiteralTreeEscapeByte, "$"), -1,
+	)
 	var out strings.Builder
 	for cursor := 0; cursor < len(value); {
 		relative := strings.Index(value[cursor:], root)
@@ -9974,7 +9979,11 @@ func replaceCompactKbuildCanonicalRoot(value, root, replacement string) string {
 		start := cursor + relative
 		end := start + len(root)
 		out.WriteString(value[cursor:start])
-		if compactKbuildCanonicalRootLeadingBoundary(value, start) &&
+		for len(placeholders) != 0 && placeholders[0][1] <= start {
+			placeholders = placeholders[1:]
+		}
+		if (len(placeholders) == 0 || placeholders[0][0] >= end) &&
+			compactKbuildCanonicalRootLeadingBoundary(value, start) &&
 			compactKbuildCanonicalRootTrailingBoundary(value, end) {
 			out.WriteString(replacement)
 		} else {

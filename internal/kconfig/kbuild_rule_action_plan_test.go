@@ -6546,7 +6546,7 @@ func TestCompactKbuildCanonicalRootsAcceptExecrootRelativeTreeArtifacts(t *testi
 cmd_copy = cp $< $@
 `, nil)
 	const (
-		kernelRoot  = "external/linux-source"
+		kernelRoot  = "kernel"
 		objectRoot  = "bazel-out/cfg/bin/external/linux/kernel.tree-sdk"
 		overlayRoot = "bazel-out/cfg/bin/demo.external-source/" + directory
 		rustRoot    = "external/rust-src/library"
@@ -6578,6 +6578,16 @@ cmd_copy = cp $< $@
 			name:  "joined relative include option",
 			input: "-I" + kernelRoot + "/include",
 			want:  "-I${tree:kernel}/include",
+		},
+		{
+			name:  "canonical roots are not physical paths",
+			input: "${tree:kernel}/include __LINUX_BZL_SOURCE_TREE__/include",
+			want:  "${tree:kernel}/include ${tree:kernel}/include",
+		},
+		{
+			name:  "source literal tree name is not a physical path",
+			input: compactKbuildLiteralTreeEscapeByte + "{tree:kernel}/include",
+			want:  compactKbuildLiteralTreeEscapeByte + "{tree:kernel}/include",
 		},
 		{
 			name:  "quoted exact relative root",
