@@ -648,7 +648,7 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildSourceScriptCommandReplays(
 	invocations := []ActionRecipeCommandReplayInvocation{}
 	invocationByArguments := map[string]int{}
 	for _, dependency := range profile.TargetInvocationDependencies {
-		if !targetSet[canonicalKbuildRulePath(dependency.Target)] {
+		if dependency.Prerequisite || !targetSet[canonicalKbuildRulePath(dependency.Target)] {
 			continue
 		}
 		if len(dependency.ReplayArguments) == 0 {

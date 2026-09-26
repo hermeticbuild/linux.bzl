@@ -12,9 +12,10 @@ import (
 // can evaluate the same declaration with different command-line variables or
 // exported state.
 type compactKbuildSelectionKey struct {
-	profile string
-	target  string
-	stage   string
+	profile         string
+	target          string
+	stage           string
+	phonyStatusLine int
 }
 
 // compactKbuildGroupedSelectionID identifies one concrete invocation of a
@@ -59,6 +60,9 @@ type compactKbuildSelectionGraph struct {
 	selectionsByProfileTarget       map[compactKbuildProfileTargetKey]compactKbuildSelectionKey
 	forwardingSelections            map[compactKbuildSelectionKey]bool
 	materializedProducers           map[compactKbuildSelectionKey]string
+	phonyStatusLines                map[compactKbuildSelectionKey]*compactKbuildSelectedPhonyStatus
+	phonyStatusByOwner              map[compactKbuildSelectionKey]compactKbuildSelectionKey
+	phonyStatusBeforeChild          map[string][]compactKbuildSelectionKey
 	// materializedProducerGeneration invalidates process-local planner memos
 	// whose result depends on exact selected producer ownership. Structural
 	// selection policy is immutable before lowering; materialization is the one
@@ -472,7 +476,9 @@ func newCompactKbuildSelectionGraph(config CompactConfig) (*compactKbuildSelecti
 			}
 			key := compactKbuildProfileTargetKey{profile: profile.Name, target: target}
 			graph.targetInvocations[key] = append(graph.targetInvocations[key], dependency.Profile)
-			graph.invocationParents[dependency.Profile] = append(graph.invocationParents[dependency.Profile], key)
+			if !dependency.Prerequisite {
+				graph.invocationParents[dependency.Profile] = append(graph.invocationParents[dependency.Profile], key)
+			}
 		}
 	}
 
@@ -838,7 +844,7 @@ func (g *compactKbuildSelectionGraph) indexSelectedSourcePhases(config CompactCo
 			}
 			children := map[int]string{}
 			for _, dependency := range profile.TargetInvocationDependencies {
-				if dependency.Target != ownerTarget {
+				if dependency.Prerequisite || dependency.Target != ownerTarget {
 					continue
 				}
 				ordinal := -1
@@ -1028,6 +1034,9 @@ func compactKbuildSelectionStageOrder(stage string) int {
 }
 
 func compactKbuildSelectionKeyString(key compactKbuildSelectionKey) string {
+	if key.phonyStatusLine != 0 {
+		return fmt.Sprintf("(%s, %s, %s, recipe %d)", key.profile, key.target, key.stage, key.phonyStatusLine-1)
+	}
 	return fmt.Sprintf("(%s, %s, %s)", key.profile, key.target, key.stage)
 }
 
@@ -1042,7 +1051,10 @@ func compactKbuildSelectionKeyLess(left, right compactKbuildSelectionKey) bool {
 	if left.target != right.target {
 		return left.target < right.target
 	}
-	return left.stage < right.stage
+	if left.stage != right.stage {
+		return left.stage < right.stage
+	}
+	return left.phonyStatusLine < right.phonyStatusLine
 }
 
 func (g *compactKbuildSelectionGraph) selection(key compactKbuildSelectionKey) (CompactKbuildSelection, bool) {
@@ -1864,6 +1876,9 @@ func (g *compactKbuildSelectionGraph) selectionDependenciesSingle(
 	metadata *CompactMetadata,
 	key compactKbuildSelectionKey,
 ) ([]compactKbuildSelectionKey, error) {
+	if status := g.phonyStatusLines[key]; key.phonyStatusLine != 0 && status != nil {
+		return g.phonyStatusDependencies(metadata, key, status)
+	}
 	if _, phase := g.sourcePhasesBySelection[key]; phase {
 		return g.sourcePhaseSelectionDependencies(metadata, key)
 	}
@@ -1931,6 +1946,15 @@ func (g *compactKbuildSelectionGraph) selectionDependenciesSingle(
 			selected[terminal] = true
 			dependencies = append(dependencies, terminal)
 		}
+	}
+	for _, status := range g.phonyStatusBeforeChild[profile.Name] {
+		if !selected[status] {
+			selected[status] = true
+			dependencies = append(dependencies, status)
+		}
+	}
+	if status, exists := g.phonyStatusByOwner[key]; exists && !selected[status] {
+		dependencies = append(dependencies, status)
 	}
 	invocationKey := compactKbuildProfileTargetKey{profile: profile.Name, target: key.target}
 	finalChild := ""
@@ -2409,4 +2433,135 @@ func (g *compactKbuildSelectionGraph) computeSelectionNativeDependencies(
 		}
 	}
 	return dependencies, nil
+}
+
+// preparePhonyStatusLines splits a local check from the completion of its Make
+// target when a recursive child follows it. Both retain the real source owner;
+// only the private completion is new, never a visible object-tree pathname.
+func (g *compactKbuildSelectionGraph) preparePhonyStatusLines(metadata *CompactMetadata) error {
+	g.phonyStatusLines = map[compactKbuildSelectionKey]*compactKbuildSelectedPhonyStatus{}
+	g.phonyStatusByOwner = map[compactKbuildSelectionKey]compactKbuildSelectionKey{}
+	g.phonyStatusBeforeChild = map[string][]compactKbuildSelectionKey{}
+	for _, owner := range slices.Clone(g.ordered) {
+		profile := g.profiles[owner.profile]
+		if !g.compactKbuildProfileTargetIsPhony(profile, owner.target) ||
+			!slices.ContainsFunc(profile.TargetInvocationDependencies, func(dependency CompactKbuildInvocationDependency) bool {
+				return !dependency.Prerequisite && compactKbuildGraphTargetPath(dependency.Target) == owner.target
+			}) {
+			continue
+		}
+		selection := g.selections[owner]
+		status, err := metadata.compactKbuildSelectedPhonySourceStatus(profile, owner.target, selection.MakeTarget)
+		if err != nil {
+			return err
+		}
+		if status == nil || status.recipeIndex < 0 {
+			continue
+		}
+		if len(status.followingChildren) == 0 {
+			g.phonyStatusLines[owner] = status
+			continue
+		}
+		key := owner
+		key.phonyStatusLine = status.recipeIndex + 1
+		selection.phonyStatusLine = key.phonyStatusLine
+		// The owner includes references from later recipe lines. Resolve their
+		// pathnames against this line's frozen frontier, so a following child
+		// cannot become either a dependency or an ambient input of the check.
+		generatedByPath := map[string]CompactKbuildVisibleArtifact{}
+		for _, artifact := range g.selectionGeneratedArtifacts[owner] {
+			visible, found, err := status.snapshot.visibleProducer(artifact.Path)
+			if err != nil {
+				return fmt.Errorf("PHONY %s recipe %d generated input %q: %w", compactKbuildSelectionKeyString(owner), status.recipeIndex, artifact.Path, err)
+			}
+			if found {
+				if visible.Path != artifact.Path {
+					return fmt.Errorf("PHONY recipe frontier changes generated pathname %q to %q", artifact.Path, visible.Path)
+				}
+				generatedByPath[artifact.Path] = visible
+			}
+		}
+		for _, read := range status.snapshot.Reads() {
+			if read.Exists && read.Artifact.Producer != (CompactKbuildVisibleArtifact{}) {
+				artifact := read.Artifact.Producer
+				if previous, exists := generatedByPath[artifact.Path]; exists && previous != artifact {
+					return fmt.Errorf("PHONY recipe read %q conflicts with its frozen generated owner", artifact.Path)
+				}
+				generatedByPath[artifact.Path] = artifact
+			}
+		}
+		generated := make([]CompactKbuildVisibleArtifact, 0, len(generatedByPath))
+		for _, artifact := range generatedByPath {
+			generated = append(generated, artifact)
+		}
+		sort.Slice(generated, func(i, j int) bool { return generated[i].Path < generated[j].Path })
+		selection.GeneratedObjectTreeArtifacts = EncodeCompactKbuildInitialObjectTreeArtifacts(generated)
+		queries, err := compactKbuildSelectionDeferredContentQueries(selection)
+		if err != nil {
+			return err
+		}
+		lineQueries := kbuildDeferredContentTokenPattern.FindAllString(status.command, -1)
+		for _, token := range queries {
+			if _, visible := status.snapshot.Evaluation.Profile.deferredContentQueries[token]; visible {
+				lineQueries = append(lineQueries, token)
+			}
+		}
+		selection.DeferredContentQueries = EncodeCompactKbuildDeferredContentQueries(lineQueries)
+		g.selections[key] = selection
+		g.selectionInitialArtifacts[key] = g.selectionInitialArtifacts[owner]
+		g.selectionNativePrerequisites[key] = g.selectionNativePrerequisites[owner]
+		g.selectionGeneratedArtifacts[key] = generated
+		g.phonyStatusLines[key] = status
+		g.phonyStatusByOwner[owner] = key
+		g.ordered = append(g.ordered, key)
+		for _, child := range status.followingChildren {
+			if slices.Contains(status.precedingChildren, child) {
+				return fmt.Errorf("PHONY %s reuses recursive child %q across a local status", compactKbuildSelectionKeyString(owner), child)
+			}
+			g.phonyStatusBeforeChild[child] = append(g.phonyStatusBeforeChild[child], key)
+		}
+	}
+	g.invalidateResolvedDependencies()
+	return nil
+}
+
+func (g *compactKbuildSelectionGraph) phonyStatusDependencies(
+	metadata *CompactMetadata, key compactKbuildSelectionKey, status *compactKbuildSelectedPhonyStatus,
+) ([]compactKbuildSelectionKey, error) {
+	owner := key
+	owner.phonyStatusLine = 0
+	dependencies, err := g.selectionNativeDependencies(metadata, key)
+	if err != nil {
+		return nil, err
+	}
+	parents, err := g.compactKbuildParentPrerequisiteSelections(metadata, owner.profile, owner.stage)
+	if err != nil {
+		return nil, err
+	}
+	predecessors, err := g.compactKbuildInvocationPredecessorSelections(metadata, owner.profile, owner.stage)
+	if err != nil {
+		return nil, err
+	}
+	dependencies = append(dependencies, parents...)
+	dependencies = append(dependencies, predecessors...)
+	dependencies = append(dependencies, g.phonyStatusBeforeChild[owner.profile]...)
+	for _, child := range status.precedingChildren {
+		terminals, err := g.compactKbuildTerminalRecipeSelections(metadata, child, owner.stage)
+		if err != nil {
+			return nil, err
+		}
+		dependencies = append(dependencies, terminals...)
+	}
+	seen := map[compactKbuildSelectionKey]bool{}
+	result := make([]compactKbuildSelectionKey, 0, len(dependencies))
+	for _, dependency := range dependencies {
+		if dependency == key || compactKbuildSelectionStageOrder(dependency.stage) > compactKbuildSelectionStageOrder(key.stage) {
+			return nil, fmt.Errorf("selected PHONY status %s has invalid prerequisite %s", compactKbuildSelectionKeyString(key), compactKbuildSelectionKeyString(dependency))
+		}
+		if !seen[dependency] {
+			seen[dependency] = true
+			result = append(result, dependency)
+		}
+	}
+	return result, nil
 }

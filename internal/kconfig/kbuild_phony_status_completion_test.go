@@ -172,6 +172,12 @@ func TestMakePhonyCompletionRejectsAlteredRunnerOrSourceBindings(t *testing.T) {
 		{"ordinary output", func(_ *ActionPlan, _ *ActionPlanNode, r *ActionRecipe) {
 			r.WorkingOutputs = map[string]string{"00000000": "scripts_basic"}
 		}},
+		{"recursive command", func(_ *ActionPlan, _ *ActionPlanNode, r *ActionRecipe) {
+			r.CommandReplays = []ActionRecipeCommandReplay{{
+				Name:        CompactKbuildRecursiveMakeReplayName,
+				Invocations: []ActionRecipeCommandReplayInvocation{{Arguments: []string{"child"}}},
+			}}
+		}},
 		{"wrong Makefile", func(p *ActionPlan, _ *ActionPlanNode, _ *ActionRecipe) {
 			p.Sources[len(p.Sources)-1].Path = "other/Makefile"
 		}},

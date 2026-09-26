@@ -70,7 +70,7 @@ func validateActionRecipeMakePhonyCompletion(recipe ActionRecipe) error {
 	private := privateInline || wrapped && len(recipe.PrivateWorkingEffects) != 0
 	switch {
 	case wrapped:
-		if completion.RecipeIndex != 0 || completion.SelectedLine == "" ||
+		if completion.RecipeIndex < 0 || completion.SelectedLine == "" ||
 			(completion.ActionScope != "target" && completion.ActionScope != "host") ||
 			len(completion.SelectedLine) > 1<<20 || strings.ContainsRune(completion.SelectedLine, 0) ||
 			privateInline || completion.ExpandedLine == "" ||
@@ -98,13 +98,18 @@ func validateActionRecipeMakePhonyCompletion(recipe ActionRecipe) error {
 			return fmt.Errorf("PHONY Make completion has invalid expanded shell line")
 		}
 	}
+	if len(recipe.CommandReplays) != 0 &&
+		(len(recipe.CommandReplays) != 1 || recipe.CommandReplays[0].Name != CompactKbuildRecursiveMakeReplayName ||
+			!recipe.CommandReplays[0].DenyAll || len(recipe.CommandReplays[0].Invocations) != 0) {
+		return fmt.Errorf("PHONY Make completion has an invalid recursive Make proxy")
+	}
 	if recipe.Kind != "generate" || recipe.Tool != compactKbuildScriptRunnerRole ||
 		recipe.ArgumentsFile || len(recipe.ArgumentTransforms) != 0 ||
 		recipe.RequireAbsentObservedOutput != planOrdinal(0) ||
 		recipe.RequireUnchangedWorkingTree == private ||
 		!private && len(recipe.PrivateWorkingEffects) != 0 || len(recipe.WorkingOutputs) != 0 ||
 		recipe.Stdout != "" || recipe.Stdin != "" || recipe.WorkingDirectory == "" ||
-		len(recipe.CommandReplays) != 0 || len(recipe.Outputs) != 1 ||
+		len(recipe.Outputs) != 1 ||
 		recipe.Outputs[0] != planOrdinal(0) || len(recipe.ObservedOutputs) != 1 ||
 		recipe.ObservedOutputs[planOrdinal(0)] != completion.Target {
 		return fmt.Errorf("PHONY Make completion lacks a private status-only script recipe")

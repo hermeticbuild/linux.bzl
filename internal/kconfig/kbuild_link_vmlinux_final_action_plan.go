@@ -141,7 +141,7 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildFinalReplay(
 	for index, invocation := range replays[0].Invocations {
 		matching := false
 		for _, dependency := range b.profile.TargetInvocationDependencies {
-			if dependency.Target != owner.target || dependency.Profile != children[index] ||
+			if dependency.Prerequisite || dependency.Target != owner.target || dependency.Profile != children[index] ||
 				len(dependency.ReplayArguments) != len(invocation.Arguments) {
 				continue
 			}

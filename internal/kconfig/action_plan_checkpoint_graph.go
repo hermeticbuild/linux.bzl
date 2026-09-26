@@ -34,6 +34,12 @@ func planCheckpointSelectionRecords[V any](values map[compactKbuildSelectionKey]
 	})
 	var out []planCheckpointSelectionEntry[V]
 	for _, key := range keys {
+		// Recipe boundaries are lowering-only graph nodes, never file owners.
+		// Their executable receipts and sequence edges live in Plan, while
+		// ExecutionCheckRoots retains them across family checkpoint cuts.
+		if key.phonyStatusLine != 0 {
+			continue
+		}
 		out = append(out, planCheckpointSelectionEntry[V]{[3]string{key.profile, key.target, key.stage}, values[key]})
 	}
 	return out
@@ -42,7 +48,7 @@ func planCheckpointSelectionRecords[V any](values map[compactKbuildSelectionKey]
 func planCheckpointSelectionMap[V any](records []planCheckpointSelectionEntry[V]) map[compactKbuildSelectionKey]V {
 	out := map[compactKbuildSelectionKey]V{}
 	for _, record := range records {
-		out[compactKbuildSelectionKey{record.Key[0], record.Key[1], record.Key[2]}] = record.Value
+		out[compactKbuildSelectionKey{profile: record.Key[0], target: record.Key[1], stage: record.Key[2]}] = record.Value
 	}
 	return out
 }
@@ -133,17 +139,17 @@ func restorePlanCheckpointGraph(decoded planCheckpointSelectionGraph) *compactKb
 	}
 	for pathname, owners := range decoded.OutputOwners {
 		for _, owner := range owners {
-			graph.outputOwnersByPath[pathname] = append(graph.outputOwnersByPath[pathname], compactKbuildSelectionKey{owner[0], owner[1], owner[2]})
+			graph.outputOwnersByPath[pathname] = append(graph.outputOwnersByPath[pathname], compactKbuildSelectionKey{profile: owner[0], target: owner[1], stage: owner[2]})
 		}
 	}
 	for profile, targets := range decoded.ProfileTargets {
 		for target, owner := range targets {
-			graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile, target}] = compactKbuildSelectionKey{owner[0], owner[1], owner[2]}
+			graph.selectionsByProfileTarget[compactKbuildProfileTargetKey{profile, target}] = compactKbuildSelectionKey{profile: owner[0], target: owner[1], stage: owner[2]}
 		}
 	}
 	for target, selections := range decoded.SelectionsByTarget {
 		for _, key := range selections {
-			graph.selectionsByTarget[target] = append(graph.selectionsByTarget[target], compactKbuildSelectionKey{key[0], key[1], key[2]})
+			graph.selectionsByTarget[target] = append(graph.selectionsByTarget[target], compactKbuildSelectionKey{profile: key[0], target: key[1], stage: key[2]})
 		}
 	}
 	for profile, targets := range decoded.TargetInvocations {

@@ -112,6 +112,9 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 	maximalCandidatesByDemand := stateProjections.maximalByDemand
 	observedStates := map[string]compactKbuildRuleInput{}
 
+	if err := selectionGraph.preparePhonyStatusLines(m); err != nil {
+		return nil, err
+	}
 	ordered, err := selectionGraph.materializationOrder(m)
 	if err != nil {
 		return nil, err
@@ -139,7 +142,7 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 		if target == "" {
 			return nil, fmt.Errorf("profile %q contains an empty selected target", profile.Name)
 		}
-		selectionKey := compactKbuildSelectionKey{profile: selection.Profile, target: target, stage: selection.Stage}
+		selectionKey := compactKbuildSelectionKey{profile: selection.Profile, target: target, stage: selection.Stage, phonyStatusLine: selection.phonyStatusLine}
 		if selectionGraph.forwardingSelections[selectionKey] {
 			continue
 		}
@@ -149,8 +152,13 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 			continue
 		}
 		selectedPhony := selectionGraph.compactKbuildProfileTargetIsPhony(profile, target)
-		var phonyStatus *compactKbuildSelectedPhonyStatus
-		if selectedPhony {
+		phonyStatus := selectionGraph.phonyStatusLines[selectionKey]
+		if line, exists := selectionGraph.phonyStatusByOwner[selectionKey]; exists {
+			completion := *selectionGraph.phonyStatusLines[line]
+			completion.command, completion.recipeIndex = ":", -1
+			phonyStatus = &completion
+		}
+		if selectedPhony && phonyStatus == nil {
 			// A frozen feature gate whose resolved status is already success
 			// has no shell branch to run and no file to publish. Evaluate the
 			// entire selected source line before omitting this PHONY recipe.
@@ -415,6 +423,9 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 				path: observation.output.Path, producer: stateProducer, slot: slot,
 			}
 		}
+		if selection.phonyStatusLine != 0 {
+			continue
+		}
 		if err := appendCompactKbuildBootstrapProjections(plan, m.Config, selection, producer); err != nil {
 			return nil, err
 		}
@@ -426,17 +437,16 @@ func (m *CompactMetadata) appendGeneratedActionPlan(
 	return selectionGraph, nil
 }
 
-// A selected PHONY recipe may contain recursive Make lines followed by an
-// outputless source shell command. Retain its last local command as an exact
-// line-local execution status; the selected child invocations precede that
-// status through the graph, without manufacturing a file named by the PHONY
-// target. The source rule entry exists even when the file-oriented rule matcher
-// correctly declines this rule.
+// A selected PHONY recipe can order an outputless local shell command among
+// recursive Make calls. Retain the exact frozen line and the child boundaries
+// on either side, without manufacturing a file named by the PHONY target.
 type compactKbuildSelectedPhonyStatus struct {
-	match       compactKbuildRuleMatch
-	snapshot    *KbuildSelectedControlRecipeSnapshot
-	command     string
-	recipeIndex int
+	match             compactKbuildRuleMatch
+	snapshot          *KbuildSelectedControlRecipeSnapshot
+	command           string
+	recipeIndex       int
+	precedingChildren []string
+	followingChildren []string
 }
 
 func (m *CompactMetadata) compactKbuildSelectedPhonySourceStatus(
@@ -467,7 +477,7 @@ func (m *CompactMetadata) compactKbuildSelectedPhonySourceStatus(
 	}
 	dependencies := []CompactKbuildInvocationDependency{}
 	for _, dependency := range profile.TargetInvocationDependencies {
-		if compactKbuildGraphTargetPath(dependency.Target) == target {
+		if !dependency.Prerequisite && compactKbuildGraphTargetPath(dependency.Target) == target {
 			dependencies = append(dependencies, dependency)
 		}
 	}
@@ -540,16 +550,21 @@ func (m *CompactMetadata) compactKbuildSelectedPhonySourceStatus(
 				if equal {
 					consumed[dependencyIndex] = true
 					found = true
+					if localCommand {
+						status.followingChildren = append(status.followingChildren, dependency.Profile)
+					} else {
+						status.precedingChildren = append(status.precedingChildren, dependency.Profile)
+					}
 					break
 				}
 			}
-			if !found || localCommand {
+			if !found {
 				return nil, fmt.Errorf("%s: selected PHONY target %q recipe %d has no matching source-ordered recursive child", rule.Position, target, recipeIndex)
 			}
 			continue
 		}
-		if localCommand || recipeIndex != len(rule.Recipe)-1 {
-			return nil, fmt.Errorf("%s: selected PHONY target %q has multiple or nonterminal local shell effects", rule.Position, target)
+		if localCommand {
+			return nil, fmt.Errorf("%s: selected PHONY target %q has multiple local shell effects", rule.Position, target)
 		}
 		localCommand = true
 		status.match = match

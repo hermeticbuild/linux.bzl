@@ -4083,7 +4083,7 @@ func evaluatedKbuildInvocationProfiles(
 				profiles[index].TargetInvocationDependencies = appendKbuildInvocationDependency(
 					profiles[index].TargetInvocationDependencies,
 					kconfig.CompactKbuildInvocationDependency{
-						Target: consumer, Profile: profiles[childIndex].Name,
+						Target: consumer.target, Profile: profiles[childIndex].Name, Prerequisite: consumer.prerequisite,
 						Goals:             append([]string(nil), profiles[childIndex].EntryTargets...),
 						ReplayArguments:   append([]string(nil), child.replayArguments...),
 						SourcePhaseBefore: child.sourcePhaseBefore,
@@ -4140,7 +4140,7 @@ func evaluatedKbuildInvocationProfiles(
 				profiles[index].TargetInvocationDependencies = appendKbuildInvocationDependency(
 					profiles[index].TargetInvocationDependencies,
 					kconfig.CompactKbuildInvocationDependency{
-						Target: consumer, Profile: profiles[childIndex].Name,
+						Target: consumer.target, Profile: profiles[childIndex].Name, Prerequisite: consumer.prerequisite,
 						Goals:             append([]string(nil), profiles[childIndex].EntryTargets...),
 						ReplayArguments:   append([]string(nil), child.replayArguments...),
 						SourcePhaseBefore: child.sourcePhaseBefore,
@@ -4340,10 +4340,11 @@ func appendKbuildInvocationDependency(
 	dependencies []kconfig.CompactKbuildInvocationDependency,
 	candidate kconfig.CompactKbuildInvocationDependency,
 ) []kconfig.CompactKbuildInvocationDependency {
-	for _, existing := range dependencies {
+	for index, existing := range dependencies {
 		if existing.Target == candidate.Target && existing.Profile == candidate.Profile &&
 			existing.SourcePhaseBefore == candidate.SourcePhaseBefore &&
 			slices.Equal(existing.Goals, candidate.Goals) && slices.Equal(existing.ReplayArguments, candidate.ReplayArguments) {
+			dependencies[index].Prerequisite = existing.Prerequisite && candidate.Prerequisite
 			return dependencies
 		}
 	}
@@ -6149,7 +6150,7 @@ func selectedKbuildSelectionsWithResolvedTargets(
 		}
 		children := [2]int{-1, -1}
 		for _, dependency := range profiles[owner.profile].TargetInvocationDependencies {
-			if dependency.Target != owner.target {
+			if dependency.Prerequisite || dependency.Target != owner.target {
 				continue
 			}
 			child, exists := profileByName[dependency.Profile]
@@ -9234,11 +9235,16 @@ func kbuildInvocationDefaultGoal(profile kconfig.CompactKbuildProfile) (string, 
 	return "", nil
 }
 
+type kbuildRecursiveMakeConsumer struct {
+	target       string
+	prerequisite bool
+}
+
 type kbuildRecursiveMakePlanEntry struct {
 	key               string
 	request           kbuildInvocationRequest
 	predecessors      []string
-	consumers         []string
+	consumers         []kbuildRecursiveMakeConsumer
 	frontier          *kbuildRecursiveMakeFrontier
 	replayArguments   []string
 	control           *kconfig.KbuildControlEvaluation
@@ -9548,6 +9554,15 @@ func selectedKbuildRecursiveMakePlanWithCausalTraversal(
 		}
 		return out
 	}
+	addConsumer := func(entry *kbuildRecursiveMakePlanEntry, target string, prerequisite bool) {
+		for index, consumer := range entry.consumers {
+			if consumer.target == target {
+				entry.consumers[index].prerequisite = consumer.prerequisite && prerequisite
+				return
+			}
+		}
+		entry.consumers = append(entry.consumers, kbuildRecursiveMakeConsumer{target: target, prerequisite: prerequisite})
+	}
 	recordInvocation := func(
 		invocation kbuildRecursiveMakeInvocation,
 		consumer string,
@@ -9589,14 +9604,14 @@ func selectedKbuildRecursiveMakePlanWithCausalTraversal(
 				)
 			}
 			plan[index].predecessors = appendUnique(plan[index].predecessors, filteredPredecessors...)
-			plan[index].consumers = appendUnique(plan[index].consumers, consumer)
+			addConsumer(&plan[index], consumer, false)
 			if plan[index].sourcePhaseBefore != phaseBefore {
 				return nil, nil, fmt.Errorf("recursive Make child %q has inconsistent source phase predecessor %q and %q", request.name, plan[index].sourcePhaseBefore, phaseBefore)
 			}
 		} else {
 			planByRequest[key] = len(plan)
 			plan = append(plan, kbuildRecursiveMakePlanEntry{
-				key: key, request: request, predecessors: filteredPredecessors, consumers: []string{consumer},
+				key: key, request: request, predecessors: filteredPredecessors, consumers: []kbuildRecursiveMakeConsumer{{target: consumer}},
 				frontier:          frontier,
 				replayArguments:   append([]string(nil), invocation.replayArguments...),
 				control:           recipeControl,
@@ -9894,7 +9909,7 @@ func selectedKbuildRecursiveMakePlanWithCausalTraversal(
 		if target != "" && target != "." {
 			for _, terminal := range terminals {
 				if index, exists := planByRequest[terminal]; exists {
-					plan[index].consumers = appendUnique(plan[index].consumers, target)
+					addConsumer(&plan[index], target, true)
 				}
 			}
 		}

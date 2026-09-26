@@ -345,6 +345,27 @@ type KbuildSelectedControlRecipeSnapshot struct {
 	applied      bool
 }
 
+// visibleProducer consults this line's frozen frontier without recording an
+// additional Make read. An opaque selected file has presence provenance even
+// when its bytes have not been measured yet.
+func (s *KbuildSelectedControlRecipeSnapshot) visibleProducer(pathname string) (CompactKbuildVisibleArtifact, bool, error) {
+	if s == nil || s.view == nil || s.view.frontier.ResolveArtifact == nil {
+		return CompactKbuildVisibleArtifact{}, false, fmt.Errorf("selected recipe has no frozen owner resolver")
+	}
+	logical := "__LINUX_BZL_OBJECT_TREE__/" + pathname
+	if resolve := s.view.frontier.ResolvePresenceArtifact; resolve != nil {
+		artifact, found, err := resolve(logical)
+		if err != nil {
+			return CompactKbuildVisibleArtifact{}, false, err
+		}
+		if found {
+			return artifact.Producer, artifact.Producer != (CompactKbuildVisibleArtifact{}), nil
+		}
+	}
+	artifact, found, err := s.view.frontier.ResolveArtifact(logical)
+	return artifact.Producer, found && artifact.Producer != (CompactKbuildVisibleArtifact{}), err
+}
+
 func (s *KbuildSelectedControlRecipeSnapshot) Reads() []KbuildControlRecipeRead {
 	if s == nil || s.view == nil {
 		return nil

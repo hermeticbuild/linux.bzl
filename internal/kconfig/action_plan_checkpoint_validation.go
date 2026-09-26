@@ -5,7 +5,7 @@ import "fmt"
 func validatePlanCheckpointRows[V any](rows []planCheckpointSelectionEntry[V], profiles map[string]planCheckpointProfile) error {
 	var previous compactKbuildSelectionKey
 	for i, row := range rows {
-		key := compactKbuildSelectionKey{row.Key[0], row.Key[1], row.Key[2]}
+		key := compactKbuildSelectionKey{profile: row.Key[0], target: row.Key[1], stage: row.Key[2]}
 		if _, ok := profiles[key.profile]; !ok || key.target == "" {
 			return fmt.Errorf("checkpoint selection has an unknown profile or empty target")
 		}
