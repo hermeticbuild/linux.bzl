@@ -1128,6 +1128,11 @@ func runRecipe(opts recipeOptions) error {
 		workingTreeBindings[name] = true
 	}
 	for name, root := range opts.trees {
+		root, err := toolaction.ExpandExecutionRootValue(root, executionRoot)
+		if err != nil {
+			return fmt.Errorf("expand tree binding %s: %w", name, err)
+		}
+		opts.trees[name] = root
 		if opts.privateInputTrees[name] {
 			continue
 		}

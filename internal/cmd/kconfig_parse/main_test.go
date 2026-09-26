@@ -16277,8 +16277,16 @@ func TestSelectedPhonySourceCheckOrdersRecursiveChild(t *testing.T) {
 	for _, test := range []struct{ before, depfile bool }{{true, false}, {true, true}, {false, false}} {
 		t.Run(fmt.Sprintf("before=%t/depfile=%t", test.before, test.depfile), func(t *testing.T) {
 			root := t.TempDir()
+			libraryRoot := t.TempDir()
+			libraryDirectory := filepath.Join(libraryRoot, "core", "src")
+			if err := os.MkdirAll(libraryDirectory, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(libraryDirectory, "lib.rs"), []byte("declared library\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
 			check := "$(CONFIG_SHELL) $(srctree)/check.sh"
-			script := "#!/bin/sh\ntest -f before.out\ntest -n \"$MAKE\"\n"
+			script := "#!/bin/sh\ntest -f before.out\ntest -n \"$MAKE\"\ntest -r \"$LIBRARY_SRC/core/src/lib.rs\"\n"
 			var effects []kconfig.ActionRecipePrivateWorkingEffect
 			if test.depfile {
 				check += " $(CC) -Wp,-MMD,$(objtree)/.prepare.d -E -x c -"
@@ -16298,6 +16306,7 @@ func TestSelectedPhonySourceCheckOrdersRecursiveChild(t *testing.T) {
 				"Makefile": `
 CONFIG_SHELL := sh
 export MAKE
+export LIBRARY_SRC := external/library
 .PHONY: all prepare prerequisite modules_check
 all: after.out modules_check
 prepare: prerequisite
@@ -16321,6 +16330,7 @@ after.out: prepare
 			profiles, selections, _, err := evaluatedKbuildProfilesWithOptions(
 				root, root, []string{"all"}, variables, kconfig.KbuildOptions{
 					RootDir: root, Variables: variables, ActionRoles: roles, ConfigVariablesComplete: true, MakeVariablesComplete: true,
+					SourceRoots: map[string]string{"external/library": libraryRoot},
 				}, nil,
 			)
 			if err != nil {
@@ -16328,7 +16338,7 @@ after.out: prepare
 			}
 			metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(
 				&kconfig.ResolvedConfig{Effective: map[string]string{"CONFIG_TEST": "n"}},
-				kconfig.CompactMetadataOptions{SelectedProductsOnly: true, ActionRoles: roles, ActionContracts: map[kconfig.KbuildActionRoleRef]kconfig.CompactKbuildActionContract{{Scope: "target", Role: "cc"}: {}}},
+				kconfig.CompactMetadataOptions{SelectedProductsOnly: true, SourceNamespaces: map[string]string{"external/library": "rust"}, ActionRoles: roles, ActionContracts: map[kconfig.KbuildActionRoleRef]kconfig.CompactKbuildActionContract{{Scope: "target", Role: "cc"}: {}}},
 				func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
 					return kconfig.CompactConfigGraph{KbuildProfiles: profiles, KbuildSelections: selections}, nil
 				},
@@ -16342,9 +16352,9 @@ after.out: prepare
 				t.Fatal(err)
 			}
 			bindings, err := kconfig.NewActionPlanCheckpointBindings(
-				"base", map[string]string{"linux": root}, plan.Toolsets, nativeConfigFixtureForTest("# CONFIG_TEST is not set\n", "", ""),
+				"base", map[string]string{"linux": root, "rust": libraryRoot}, plan.Toolsets, nativeConfigFixtureForTest("# CONFIG_TEST is not set\n", "", ""),
 				&kconfig.ResolvedConfig{Effective: map[string]string{"CONFIG_TEST": "n"}},
-				kconfig.CompactMetadataOptions{SelectedProductsOnly: true, ActionRoles: roles, ActionContracts: map[kconfig.KbuildActionRoleRef]kconfig.CompactKbuildActionContract{{Scope: "target", Role: "cc"}: {}}}, "",
+				kconfig.CompactMetadataOptions{SelectedProductsOnly: true, SourceNamespaces: map[string]string{"external/library": "rust"}, ActionRoles: roles, ActionContracts: map[kconfig.KbuildActionRoleRef]kconfig.CompactKbuildActionContract{{Scope: "target", Role: "cc"}: {}}}, "",
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -16371,6 +16381,11 @@ after.out: prepare
 						if completion.ScriptPath != "check.sh" || recipe.RequireUnchangedWorkingTree == test.depfile ||
 							!slices.Equal(recipe.PrivateWorkingEffects, effects) {
 							t.Fatalf("check lost immutable source or outputless contract: %#v", recipe)
+						}
+						if recipe.Environment["LIBRARY_SRC"] != "${tree:rust}" ||
+							!slices.Contains(node.Trees, "rust") || !slices.Contains(recipe.Trees, "rust") {
+							t.Fatalf("PHONY source check lost independent input tree: environment=%#v node=%#v recipe=%#v",
+								recipe.Environment, node.Trees, recipe.Trees)
 						}
 						if len(recipe.CommandReplays) != 1 || recipe.CommandReplays[0].Name != kconfig.CompactKbuildRecursiveMakeReplayName ||
 							!recipe.CommandReplays[0].DenyAll || len(recipe.CommandReplays[0].Invocations) != 0 {

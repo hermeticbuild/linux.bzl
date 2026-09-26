@@ -256,6 +256,8 @@ def linux_test_source_input_namespace_names(directory_name, additional_params):
 def _node_source_closure_keys(node, sources):
     """Returns source depsets needed for language-level recursive loading."""
     closures = {}
+    if "rust" in node["trees"]:
+        closures["rust_source_files"] = True
     for source_id in node["sources"].values():
         source = sources.get(source_id)
         if source != None and source.namespace == "rust":
@@ -266,14 +268,21 @@ def _node_source_closure_keys(node, sources):
             closures["rust_source_files"] = True
     return sorted(closures)
 
-def linux_test_node_source_closure_keys(namespaces):
+def linux_test_node_source_closure_keys(namespaces, trees = []):
     sources = {}
-    node = {"sources": {}}
+    node = {"sources": {}, "trees": trees}
     for index, namespace in enumerate(namespaces):
         source_id = "source-%d" % index
         sources[source_id] = struct(namespace = namespace)
         node["sources"]["input:%d" % index] = source_id
     return _node_source_closure_keys(node, sources)
+
+def _render_rust_source_root(additional_inputs, additional_params):
+    root = additional_params.get("rust_source_root")
+    files = additional_inputs.get("rust_source_files")
+    if not root or files == None:
+        fail("mapped Linux Rust source tree requires its configured root and files")
+    return _render_toolchain_action_value(root, _toolchain_action_path_index(files))
 
 def _parse_plan_node_index(plan):
     """Parses the global lexical node index without touching packed edges."""
@@ -1935,6 +1944,7 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
         "mapped Linux plan",
     )
 
+    rust_source_root = None
     for node_id in sorted(parsed.nodes):
         node = parsed.nodes[node_id]
         recipe_id = node.get("recipe")
@@ -2017,6 +2027,11 @@ def expand_linux_plan_stage(template_ctx, input_directories, output_directories,
         for tree in sorted(node["trees"]):
             if tree == "kernel" and root_marker != None:
                 add_linux_source_arg(args, "-input_tree", source_runfiles, "Kconfig", prefix = "kernel=")
+                continue
+            elif tree == "rust":
+                if rust_source_root == None:
+                    rust_source_root = _render_rust_source_root(additional_inputs, additional_params)
+                _add_rendered_toolchain_action_value(args, "-input_tree", rust_source_root, prefix = "rust=")
                 continue
             elif _tree_input_directory_name(tree, input_directories, output_directories, additional_params) in input_directories:
                 directory = input_directories[_tree_input_directory_name(tree, input_directories, output_directories, additional_params)]
@@ -2556,6 +2571,7 @@ def expand_linux_family_plan(template_ctx, input_directories, output_directories
                 arguments = [args],
                 progress_message = "Importing pinned Linux %s output %s" % (scope, key),
             )
+    rust_source_root = None
     for node_id in sorted(executing_nodes):
         node = executing_nodes[node_id]
         stage = node["stage"]
@@ -2675,6 +2691,11 @@ def expand_linux_family_plan(template_ctx, input_directories, output_directories
                 # Opaque readers retain exactly the old complete source union
                 # through one runfiles aggregate below, not a flat source depset.
 
+            elif tree == "rust":
+                if rust_source_root == None:
+                    rust_source_root = _render_rust_source_root(additional_inputs, additional_params)
+                _add_rendered_toolchain_action_value(args, "-input_tree", rust_source_root, prefix = "rust=")
+                continue
             elif tree in _TREES:
                 tree_input = _family_tree_input(tree, input_directories, output_directories)
                 tree_path = tree_input.path
@@ -3844,8 +3865,11 @@ def linux_map_directory_params(
         host_action_environments,
         input_tree_aliases = {},
         output_tree_bases = {},
-        renamed_paths = {}):
+        renamed_paths = {},
+        rust_source_root = ""):
     params = {"source_prefix": source_prefix, "stage": stage, "renamed_paths": json.encode(renamed_paths)}
+    if rust_source_root:
+        params["rust_source_root"] = rust_source_root
     for tree, directory_name in input_tree_aliases.items():
         if tree not in _TREES or not _valid_name(directory_name):
             fail("mapped Linux %s stage has invalid input-tree alias %r=%r" % (stage, tree, directory_name))
@@ -4139,6 +4163,7 @@ def _native_kconfig_tool(ctx, planner_args, planner_inputs, source_inputs, sourc
                 scopes["host"].toolset.arguments,
                 scopes["host"].toolset.environments,
                 renamed_paths = renamed_paths,
+                rust_source_root = rust_source_root,
             ),
             env = {},
             execution_requirements = dict(requirements, **{"supports-path-mapping": "1"}),
@@ -5842,6 +5867,7 @@ def _linux_mapped_kernel_family_impl(ctx):
                 host.arguments,
                 host.environments,
                 renamed_paths = renamed_paths,
+                rust_source_root = rust_source.root if rust_source != None else "",
             )
             _register_family_execution_segment(
                 ctx,

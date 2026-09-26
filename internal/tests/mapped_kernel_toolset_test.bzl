@@ -2892,6 +2892,12 @@ def _mapped_kernel_backend_test_impl(ctx):
     )
     asserts.equals(
         env,
+        ["rust_source_files"],
+        linux_test_node_source_closure_keys(["kernel"], trees = ["rust"]),
+        "an opaque Rust tree reader must declare its source closure without a direct source edge",
+    )
+    asserts.equals(
+        env,
         [],
         linux_test_node_source_closure_keys(["kernel", "config"]),
         "non-Rust source edges must retain their fine-grained inputs",

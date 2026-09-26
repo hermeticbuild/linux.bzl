@@ -7935,6 +7935,9 @@ func (b *compactKbuildRulePlanBuilder) buildHermeticKbuildScriptContext(
 		// tree placeholders as script bytes, and then base64-encodes the result.
 		scriptValue = script
 	}
+	if err := b.compactKbuildSourceScriptInputTreeEnvironment(match, environment, nil, environmentUsage); err != nil {
+		return "", fmt.Errorf("hermetic script independent source roots: %w", err)
+	}
 	recipe := ActionRecipe{
 		Schema: LinuxKernelPlanSchema,
 		Kind:   kind,
@@ -10119,6 +10122,94 @@ func compactKbuildProfileEvaluatedRootedActionRecipeText(profile CompactKbuildPr
 	)
 	value = compactKbuildPrivateActionRootMarker(value)
 	return compactKbuildProfileRootedActionRecipeText(profile, value)
+}
+
+// An opaque source script can open files beneath exported independent roots
+// without naming those files in argv. Preserve that declared namespace as an
+// input tree, so action expansion closes its source inputs and the runner binds
+// an absolute root before entering the script's private working directory.
+func (b *compactKbuildRulePlanBuilder) compactKbuildSourceScriptInputTreeEnvironment(
+	match compactKbuildRuleMatch,
+	environment, inline map[string]string,
+	usage compactKbuildSourceScriptEnvironmentUsage,
+) error {
+	profile := match.profile
+	if b.metadata == nil || len(environment) == 0 || profile.evaluator == nil || profile.evaluator.template == nil {
+		return nil
+	}
+	// Ordinary global exports are retained even when this script does not
+	// observe them. Only used roots require their complete input closure;
+	// uses also includes dynamic inspection of the process environment.
+	names := []string{}
+	for _, name := range sortedStringMapKeys(environment) {
+		_, explicitlySet := inline[name]
+		if explicitlySet || usage.uses(name) || match.capturedEnvironmentUsage.uses(name) {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	if err := b.metadata.ensureActionPlanSourceNamespaceIndex(); err != nil {
+		return err
+	}
+	roots := map[string]string{}
+	namespaceRoots := map[string]string{}
+	ambiguousNamespaces := map[string]bool{}
+	addRoot := func(root, namespace string) {
+		root = filepath.ToSlash(filepath.Clean(root))
+		if root == "." || root == "/" {
+			return
+		}
+		if previous, exists := roots[root]; exists && previous != namespace {
+			ambiguousNamespaces[previous] = true
+			ambiguousNamespaces[namespace] = true
+		}
+		roots[root] = namespace
+	}
+	for _, prefix := range sortedStringMapKeys(b.metadata.sourceNamespacePrefixes) {
+		physical, exists := profile.evaluator.template.sourceRoots[prefix]
+		if !exists {
+			continue
+		}
+		namespace := b.metadata.sourceNamespacePrefixes[prefix]
+		absolute, err := filepath.Abs(physical)
+		if err != nil {
+			return fmt.Errorf("source namespace %q root: %w", namespace, err)
+		}
+		canonical := absolute
+		if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+			canonical = resolved
+		}
+		if previous, exists := namespaceRoots[namespace]; exists && previous != canonical {
+			ambiguousNamespaces[namespace] = true
+		}
+		namespaceRoots[namespace] = canonical
+		for _, root := range []string{prefix, physical, absolute, canonical} {
+			addRoot(root, namespace)
+		}
+	}
+	ordered := sortedStringMapKeys(roots)
+	sort.SliceStable(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+	for _, name := range names {
+		value := environment[name]
+		for _, root := range ordered {
+			namespace := roots[root]
+			projected := replaceCompactKbuildCanonicalRoot(value, root, "${tree:"+namespace+"}")
+			if projected == value {
+				continue
+			}
+			if ambiguousNamespaces[namespace] {
+				return fmt.Errorf("environment %q source namespace %q has ambiguous source-tree bindings", name, namespace)
+			}
+			if namespace == "kernel" || namespace == linuxProbeHostDepsRootName || LinuxKernelPlanTrees[namespace] {
+				return fmt.Errorf("environment %q independent source namespace %q conflicts with an existing tree", name, namespace)
+			}
+			value = projected
+		}
+		environment[name] = value
+	}
+	return nil
 }
 
 func compactKbuildProfileCanonicalRecipeRoots(
@@ -13231,6 +13322,9 @@ func (b *compactKbuildRulePlanBuilder) appendCompactKbuildRecipe(
 		}
 
 		if sourceScript {
+			if err := b.compactKbuildSourceScriptInputTreeEnvironment(match, recipe.Environment, scriptInvocation.environment, scriptInvocation.environmentUsage); err != nil {
+				return "", fmt.Errorf("command %d independent source roots: %w", commandIndex, err)
+			}
 			scriptBinding, err := appendCompactKbuildRecipeInput(&node, &recipe, scriptInput, "script")
 			if err != nil {
 				return "", err

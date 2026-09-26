@@ -4172,9 +4172,11 @@ $(obj)/../voffset.h: FORCE
 func TestSelectedAlwaysRunSourceCheckPublishesCompletionWithoutMakeFile(t *testing.T) {
 	for _, test := range []struct {
 		name, assignment, target, recipe string
-		completion                       bool
+		completion, readsRoot            bool
+		ambiguousRoot                    bool
 	}{
-		{name: "outputless selected source check", assignment: "always-y += check", target: "check", recipe: "$(CONFIG_SHELL) $<", completion: true},
+		{name: "outputless selected source check", assignment: "always-y += check", target: "check", recipe: "$(CONFIG_SHELL) $<", completion: true, readsRoot: true},
+		{name: "ambiguous independent source roots", assignment: "always-y += check", target: "check", recipe: "$(CONFIG_SHELL) $<", completion: true, readsRoot: true, ambiguousRoot: true},
 		{name: "physical always-run generated header", assignment: "always-y += generated.h", target: "generated.h", recipe: "$(CONFIG_SHELL) $< $@"},
 		{name: "ordinary script with missing output", target: "ordinary.h", recipe: "$(CONFIG_SHELL) $<"},
 	} {
@@ -4182,6 +4184,7 @@ func TestSelectedAlwaysRunSourceCheckPublishesCompletionWithoutMakeFile(t *testi
 			source := "scripts/" + test.target + ".sh"
 			profile := mustCompactKbuildProfileForTest(t, "build:root", "Kbuild", "", fmt.Sprintf(`
 CONFIG_SHELL := sh
+export LIBRARY_SRC := external/library
 obj := .
 %s
 cmd = $(cmd_$(1))
@@ -4190,14 +4193,28 @@ cmd_check = %s
 	$(call cmd,check)
 `, test.assignment, test.recipe, test.target, source), nil)
 			profile = compactKbuildProfileWithSourcesForTest(t, profile, source)
+			physicalRoot := t.TempDir()
+			mustWriteSource(t, physicalRoot, "core/src/lib.rs", "declared library\n")
+			profile.evaluator.template.sourceRoots["external/library"] = physicalRoot
+			profile.evaluator.template.sourceRoots["external/library-alias"] = physicalRoot
+			namespaces := map[string]string{"external/library": "rust", "external/library-alias": "rust"}
+			if test.readsRoot {
+				mustWriteSource(t, profile.evaluator.template.sourceRoots["__LINUX_BZL_SOURCE_TREE__"], source,
+					"#!/bin/sh\ntest -r \"$LIBRARY_SRC/core/src/lib.rs\"\n")
+				if test.ambiguousRoot {
+					profile.evaluator.template.sourceRoots["external/other-library"] = t.TempDir()
+					namespaces["external/other-library"] = "rust"
+				}
+			}
 			if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
 				Tree: CompactKbuildInvocationObjectTree,
 			}); err != nil {
 				t.Fatal(err)
 			}
 			metadata := &CompactMetadata{
-				actionRoles: testConfiguredScopedActionRoles,
-				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
+				actionRoles:      testConfiguredScopedActionRoles,
+				sourceNamespaces: namespaces,
+				Config:           CompactConfig{KbuildProfiles: []CompactKbuildProfile{profile}},
 			}
 			if _, matched, err := metadata.compactKbuildRuleForProfile(profile, test.target); err != nil {
 				t.Fatal(err)
@@ -4211,6 +4228,12 @@ cmd_check = %s
 			builder := newCompactKbuildRulePlanBuilder(metadata, plan).
 				forProfile(profile).forOutput("host", "host", "sdk")
 			producer, err := builder.build(test.target)
+			if test.ambiguousRoot {
+				if err == nil || !strings.Contains(err.Error(), "ambiguous source-tree bindings") {
+					t.Fatalf("ambiguous independent source roots error = %v", err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -4219,6 +4242,14 @@ cmd_check = %s
 				t.Fatalf("source script check producer = %#v, found=%v", node, found)
 			}
 			recipe := plan.Recipes[node.Recipe]
+			if test.readsRoot && (recipe.Environment["LIBRARY_SRC"] != "${tree:rust}" ||
+				!slices.Contains(node.Trees, "rust") || !slices.Contains(recipe.Trees, "rust")) {
+				t.Fatalf("source check lost independent input tree: environment=%#v node=%#v recipe=%#v",
+					recipe.Environment, node.Trees, recipe.Trees)
+			}
+			if !test.readsRoot && (slices.Contains(node.Trees, "rust") || slices.Contains(recipe.Trees, "rust")) {
+				t.Fatalf("unused source export added an input tree: node=%#v recipe=%#v", node.Trees, recipe.Trees)
+			}
 			if test.completion {
 				if len(node.Outputs) != 1 || node.Outputs[0].ObservedPath != test.target ||
 					strings.Contains(node.Outputs[0].Path, test.target) ||

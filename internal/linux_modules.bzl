@@ -517,6 +517,7 @@ def _map_external_plan(ctx, sdk, plans, staged):
             input_tree_aliases = input_tree_aliases,
             output_tree_bases = output_tree_bases,
             renamed_paths = sdk.renamed_source_paths,
+            rust_source_root = sdk.rust_source_root,
         )
 
     ctx.actions.map_directory(

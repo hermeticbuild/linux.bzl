@@ -2963,10 +2963,11 @@ func runObservedStateRecipe(
 
 func TestSourceCheckCompletionRequiresAbsentTargetAndCleanWritableTree(t *testing.T) {
 	for _, test := range []struct {
-		name, shell, wantError string
-		preexisting, depfile   bool
+		name, shell, wantError                string
+		preexisting, depfile, independentRoot bool
 	}{
 		{name: "status-only check", shell: "printf 'check completed\\n'", wantError: ""},
+		{name: "independent source root", shell: `IFS= read -r library < "$LIBRARY_SRC/core/src/lib.rs"; test "$library" = declared-library`, independentRoot: true},
 		{name: "script wrote logical target", shell: "printf 'generated\\n' > check", wantError: "logical target"},
 		{name: "configured program wrote sibling", shell: "printf 'unknown\\n' > sibling", wantError: `first changed entry "sibling"`},
 		{name: "selected compiler wrote bounded depfile", shell: "printf 'dependencies\\n' > .check.d", depfile: true},
@@ -2991,6 +2992,20 @@ func TestSourceCheckCompletionRequiresAbsentTargetAndCleanWritableTree(t *testin
 				recipe.RequireUnchangedWorkingTree = false
 				recipe.PrivateWorkingEffects = []kconfig.ActionRecipePrivateWorkingEffect{{Path: ".check.d", Kind: "regular"}}
 			}
+			trees := map[string]string{}
+			if test.independentRoot {
+				t.Chdir(directory)
+				library := filepath.Join("external", "library", "core", "src")
+				if err := os.MkdirAll(library, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(library, "lib.rs"), []byte("declared-library\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				trees["rust"] = toolaction.ExecutionRootMarker + "/external/library"
+				recipe.Trees = []string{"rust"}
+				recipe.Environment = map[string]string{"LIBRARY_SRC": "${tree:rust}"}
+			}
 			inputs := map[string]string{}
 			if test.preexisting {
 				prior := filepath.Join(directory, "prior-check")
@@ -3008,7 +3023,7 @@ func TestSourceCheckCompletionRequiresAbsentTargetAndCleanWritableTree(t *testin
 				recipe: recipePath, kind: "generate", expectedNodeID: strings.Repeat("a", 64), expectedRecipeID: recipeID,
 				toolRole: "helper", workingDirectory: work, workingDirectoryMarker: filepath.Join(work, ".linux-bzl-work-root"),
 				sources: map[string]string{}, inputs: inputs,
-				outputs: map[string]string{"completion": output}, tools: map[string]string{"helper": helper}, trees: map[string]string{},
+				outputs: map[string]string{"completion": output}, tools: map[string]string{"helper": helper}, trees: trees,
 			})
 			if test.wantError != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantError) {
