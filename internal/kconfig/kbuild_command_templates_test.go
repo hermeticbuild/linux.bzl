@@ -246,7 +246,33 @@ func TestCompactKbuildRecipeIsExactCommandTemplateCall(t *testing.T) {
 }
 
 func TestKbuildSelectedMakeCmdEscapesLeafExactly(t *testing.T) {
-	profile := mustCompactKbuildProfileForTest(t, "build:root", "Makefile", "", `
+	builder, err := NewProbePlanBuilder(bootstrapTestIdentity, bootstrapTestIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, _ := newFixtureProbeEvaluator(t, 1, "x86", builder, nil, true)
+	request := ProbeRequest{
+		Schema: LinuxProbeRequestSchema,
+		Steps: []ProbeStep{{
+			Name: "filename", Tool: "rustc",
+			Arguments: []string{"--print", "file-names", "--crate-name", "macros", "--crate-type", "proc-macro", "-"},
+		}},
+		Outcome: ProbeOutcome{Kind: "text", Step: "filename", Stream: "stdout", TrimSpace: true, PathComponent: true, RequireSuccess: true},
+	}
+	probe, err := evaluator.requestText(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := evaluator.symbols[probe].reference
+	evaluator.oracle = &ProbeResultOracle{
+		toolsets: map[string]string{reference.Scope: bootstrapTestIdentity},
+		results: map[string]ProbeResult{reference.NodeID: {
+			Schema: LinuxProbeResultSchema, NodeID: reference.NodeID, RequestID: reference.RequestID,
+			Scope: reference.Scope, ToolsetIdentity: bootstrapTestIdentity, Kind: "text", Text: "result",
+			Steps: []ProbeStepResult{{Name: "filename", Status: "success", Stdout: "result\n"}},
+		}},
+	}
+	const source = `
 squote := '
 pound := \#
 escsq = $(subst $(squote),'\$(squote)',$1)
@@ -260,18 +286,46 @@ if_changed = $(if $(if-changed-cond),$(cmd_and_savecmd),@:)
 cmd_emit = printf '%s\n' '$$cash $(pound)hash it'\''s' > $@
 generated/result: FORCE
 	$(call if_changed,emit)
-`, nil)
-
-	templates, err := EvaluateCompactKbuildCommandTemplates(
-		profile, profile.Rules[0], "generated/result", "", nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+`
 	const want = `set -e; printf '%s\n' '$cash #hash it'\''s' > generated/result; printf '%s\n' 'savedcmd_generated/result := printf '\''%s\n'\'' '\''$$cash $(pound)hash it'\''\'\'''\''s'\'' > generated/result' > generated/.result.cmd`
-	if len(templates) != 1 || templates[0].Name != "emit" || templates[0].Text != want {
-		t.Fatalf("selected make-cmd template = %#v, want %q", templates, want)
+	for _, test := range []struct {
+		name, target string
+	}{
+		{name: "concrete target", target: "generated/result"},
+		{name: "symbolic target", target: "generated/" + probe},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile := mustCompactKbuildProfileForTest(t, "build:root", "Makefile", "",
+				strings.ReplaceAll(source, "generated/result", test.target), nil)
+			profile.evaluator.template.resolveSymbolic = evaluator.ResolveSymbolic
+			profile.evaluator.template.resolveSymbolicStructure = evaluator.ResolveSymbolicStructure
+			profile.evaluator.template.selectSymbolic = evaluator.SelectSymbolic
+			profile.evaluator.template.transformSymbolic = evaluator.TransformSymbolic
+			for _, concrete := range []bool{true, false} {
+				templates, err := evaluateCompactKbuildCommandTemplates(
+					profile, profile.Rules[0], test.target, test.target, "", nil, concrete,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(templates) != 1 || templates[0].Name != "emit" {
+					t.Fatalf("concrete=%t selected make-cmd templates = %#v, want one emit occurrence", concrete, templates)
+				}
+				text := templates[0].Text
+				if !concrete && test.target != "generated/result" && !linuxProbeSymbolPattern.MatchString(text) {
+					t.Fatalf("symbolic wrapper lost its filename dependency: %q", text)
+				}
+				if !concrete {
+					text, err = evaluator.ResolveSymbolic(text)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				if text != want {
+					t.Fatalf("concrete=%t selected make-cmd text = %q, want %q", concrete, text, want)
+				}
+			}
+		})
 	}
 }
 
@@ -555,7 +609,7 @@ gate = `+conditionToken+`
 if_changed = $(cmd_$(1))
 cmd_first = first-tool $@
 cmd_second = second-tool $@
-cmd_outer = $(if $(gate),$(cmd_first),$(cmd_second))
+cmd_outer = : $(if $(gate),; $(cmd_first),; $(cmd_second))
 result: FORCE
 	$(call if_changed,outer)
 `, nil)

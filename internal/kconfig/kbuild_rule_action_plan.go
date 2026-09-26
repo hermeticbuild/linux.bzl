@@ -14611,6 +14611,59 @@ func evaluatedKbuildRuleCommandSelectionsForMakeTarget(
 	exactReplayParser.expanding = map[string]bool{}
 	exactReplayParser.commandSelectionExpansion = nil
 
+	// Keep the observer's hidden command provenance separate from ordinary
+	// probe words such as a target filename. Branches and transformations can
+	// hide markers anywhere in shell text, including inside an argv word.
+	hiddenSelectionTokens := map[string]bool{}
+	hasHiddenSelections := func(value string) bool {
+		for token := range linuxProbeSymbolPattern.AllString(value) {
+			if hiddenSelectionTokens[token] {
+				return true
+			}
+		}
+		return false
+	}
+	recordHiddenSelections := func(result string, values ...string) {
+		containsSelection := false
+		for _, value := range values {
+			if strings.Contains(value, compactKbuildCommandSelectionMarker) || hasHiddenSelections(value) {
+				containsSelection = true
+				break
+			}
+		}
+		if !containsSelection {
+			return
+		}
+		for token := range linuxProbeSymbolPattern.AllString(result) {
+			// Returning an existing argument or branch does not hide anything
+			// new. Its own hidden provenance, if any, is already recorded.
+			if !slices.ContainsFunc(values, func(value string) bool { return strings.Contains(value, token) }) {
+				hiddenSelectionTokens[token] = true
+			}
+		}
+	}
+	if selectSymbolic := parser.selectSymbolic; selectSymbolic != nil {
+		defer func() { parser.selectSymbolic = selectSymbolic }()
+		parser.selectSymbolic = func(value, expected string, equal bool, trueText, falseText string) (string, bool, error) {
+			selected, recognized, err := selectSymbolic(value, expected, equal, trueText, falseText)
+			if err == nil && recognized {
+				// A marker tested for nonemptiness is data, not a hidden command.
+				recordHiddenSelections(selected, trueText, falseText)
+			}
+			return selected, recognized, err
+		}
+	}
+	if transformSymbolic := parser.transformSymbolic; transformSymbolic != nil {
+		defer func() { parser.transformSymbolic = transformSymbolic }()
+		parser.transformSymbolic = func(function string, args []string) (string, bool, error) {
+			transformed, recognized, err := transformSymbolic(function, args)
+			if err == nil && recognized {
+				recordHiddenSelections(transformed, args...)
+			}
+			return transformed, recognized, err
+		}
+	}
+
 	selectionByMarker := map[string]CompactKbuildCommandTemplate{}
 	ruleStack := []string{}
 	ruleStackIndex := map[string]int{}
@@ -14793,15 +14846,9 @@ func evaluatedKbuildRuleCommandSelectionsForMakeTarget(
 			return expanded, false, nil
 		}
 		// A symbolic Make branch can hide a selected command marker entirely.
-		// Keep the individual speculative selections in that case so discovery
-		// still observes every possible leaf.
-		if linuxProbeSymbolPattern.MatchString(expanded) {
-			for ordinal := markerStart; ordinal < markerEnd; ordinal++ {
-				marker := fmt.Sprintf("%s%08d__", compactKbuildCommandSelectionMarker, ordinal)
-				if !strings.Contains(expanded, marker) {
-					return expanded, false, nil
-				}
-			}
+		// Keep its speculative selections until that branch is concrete.
+		if hasHiddenSelections(expanded) {
+			return expanded, false, nil
 		}
 
 		selectionName := ""
@@ -14916,9 +14963,7 @@ func evaluatedKbuildRuleCommandSelectionsForMakeTarget(
 				return selection, fmt.Errorf("exact selected-wrapper symbolic replay: %w", err)
 			}
 		}
-		if !linuxProbeSymbolPattern.MatchString(exact) {
-			selection.Text = exact
-		}
+		selection.Text = exact
 		return selection, nil
 	}
 	observer = func(name, original string, depth int) (string, bool, error) {
@@ -14974,16 +15019,7 @@ func evaluatedKbuildRuleCommandSelectionsForMakeTarget(
 						// including its command-selection marker, with one probe atom.
 						// Keep those hidden leaves for discovery; a probe atom merely
 						// adjacent to every still-visible marker is ordinary argv data.
-						symbolicHidNestedSelection := false
-						if linuxProbeSymbolPattern.MatchString(nestedValue) {
-							for ordinal := markerStart; ordinal < markerEnd; ordinal++ {
-								marker := fmt.Sprintf("%s%08d__", compactKbuildCommandSelectionMarker, ordinal)
-								if !strings.Contains(nestedValue, marker) {
-									symbolicHidNestedSelection = true
-									break
-								}
-							}
-						}
+						symbolicHidNestedSelection := hasHiddenSelections(nestedValue)
 						if programErr != nil || nestedCommandHead || symbolicHidNestedSelection {
 							return nestedValue, true, nil
 						}
@@ -15119,7 +15155,7 @@ func evaluatedKbuildRuleCommandSelectionsForMakeTarget(
 
 	selections := []CompactKbuildCommandTemplate{}
 	appendExpandedSelections := func(expanded, line string, accesses []CompactKbuildCommandTemplate) (bool, error) {
-		if linuxProbeSymbolPattern.MatchString(expanded) && len(accesses) != 0 {
+		if hasHiddenSelections(expanded) && len(accesses) != 0 {
 			for _, selection := range accesses {
 				replayed, replayErr := replayExactSelection(selection)
 				if replayErr != nil {
