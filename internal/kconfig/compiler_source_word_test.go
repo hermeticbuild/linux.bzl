@@ -42,7 +42,7 @@ func TestCompilerSourceWordPresenceAcrossManyConditionalFlags(t *testing.T) {
 	fragments = append(fragments, ProbeValueFragment{Value: "actual"}, ProbeValueFragment{Value: ".c "})
 	group := ProbeArgumentFragments{Index: 1, Mode: ProbeArgumentFragmentsModeSourceShellWords,
 		Fragments: []ProbeValueFragment{{Fragments: fragments, Transforms: []ProbeValueTransform{{
-			Function: "strip", Arguments: []string{""}, InputArgument: 0,
+			Function: "filter-out", Arguments: []string{"-pg", ""}, InputArgument: 1,
 		}}}},
 	}
 	if _, complete := possibleCompilerSourceWords([]string{"-nostdinc", ""}, nil, []ProbeArgumentFragments{group}); complete {
@@ -95,12 +95,20 @@ func TestCompilerSourceWordActualQuotedNamespaceRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	step := request.Steps[0]
-	if _, complete := possibleCompilerSourceWords(step.Arguments, step.ConditionalArguments, step.ArgumentFragments); complete {
-		t.Fatal("captured request does not exercise the exhaustive-rendering limit")
-	}
-	possible, complete := possibleCompilerSourceWord(step.Arguments, step.ConditionalArguments, step.ArgumentFragments, "scripts/recordmcount.c")
-	if possible || !complete {
-		t.Fatalf("captured request retains unrelated source: possible=%t complete=%t", possible, complete)
+	for _, transform := range []ProbeValueTransform{
+		{Function: "strip", Arguments: []string{""}, InputArgument: 0},
+		{Function: "filter-out", Arguments: []string{"-pg", ""}, InputArgument: 1},
+	} {
+		t.Run(transform.Function, func(t *testing.T) {
+			step.ArgumentFragments[0].Fragments[0].Transforms = []ProbeValueTransform{transform}
+			if _, complete := possibleCompilerSourceWords(step.Arguments, step.ConditionalArguments, step.ArgumentFragments); complete {
+				t.Fatal("captured request does not exercise the exhaustive-rendering limit")
+			}
+			possible, complete := possibleCompilerSourceWord(step.Arguments, step.ConditionalArguments, step.ArgumentFragments, "scripts/recordmcount.c")
+			if possible || !complete {
+				t.Fatalf("captured request retains unrelated source: possible=%t complete=%t", possible, complete)
+			}
+		})
 	}
 }
 
@@ -149,6 +157,9 @@ func TestCompilerSourceWordQuotedConditionsAndStripStayConservative(t *testing.T
 		{{Value: "\"source\\\n.c\""}},
 		{{Value: "'a\tb'"}}, {{Value: "'a\nb'"}},
 		{{Fragments: []ProbeValueFragment{{Value: "'source  name.c'"}}, Transforms: []ProbeValueTransform{strip}}},
+		{{Fragments: []ProbeValueFragment{{Value: "'source  name.c'"}}, Transforms: []ProbeValueTransform{{
+			Function: "filter-out", Arguments: []string{"'source", ""}, InputArgument: 1,
+		}}}},
 		{{Fragments: []ProbeValueFragment{{Value: "source\\\n.c"}}, Transforms: []ProbeValueTransform{strip}}},
 	} {
 		groups := []ProbeArgumentFragments{{Index: 0, Mode: ProbeArgumentFragmentsModeSourceShellWords, Fragments: fragments}}

@@ -231,8 +231,19 @@ func compilerSourceWordGroupWrapper(fragment ProbeValueFragment) bool {
 		return false
 	}
 	for _, transform := range fragment.Transforms {
-		if transform.Function != "strip" || transform.InputArgument != 0 ||
-			len(transform.Arguments) != 1 || transform.Arguments[0] != "" || len(transform.ArgumentFragments) != 0 {
+		if len(transform.ArgumentFragments) != 0 {
+			return false
+		}
+		switch transform.Function {
+		case "strip":
+			if transform.InputArgument != 0 || len(transform.Arguments) != 1 || transform.Arguments[0] != "" {
+				return false
+			}
+		case "filter-out":
+			if transform.InputArgument != 1 || len(transform.Arguments) != 2 || transform.Arguments[1] != "" {
+				return false
+			}
+		default:
 			return false
 		}
 	}
@@ -247,8 +258,10 @@ func (m *compilerSourceWordMachine) group(group ProbeArgumentFragments) (bool, b
 	m.strippedGroup = false
 	fragments := group.Fragments
 	depth := 0
-	// Only a whole-group strip preserves word boundaries. An interior strip
-	// can join adjacent pieces ("a" + strip(" b ") + "c") and stays unknown.
+	// Whole-group strip and filter-out cannot add words when each Make word
+	// is shell-complete; strippedGroup rejects quoted or escaped whitespace.
+	// Ignoring filter-out retains a superset of the possible source words.
+	// Interior transformations can join adjacent pieces and stay unknown.
 	// A conditional whole group additionally permits no words, never a new word.
 	for len(fragments) == 1 && compilerSourceWordGroupWrapper(fragments[0]) {
 		if !m.charge() || depth >= MaxProbeValueFragmentDepth {
