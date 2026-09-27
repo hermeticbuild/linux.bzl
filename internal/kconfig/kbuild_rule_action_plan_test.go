@@ -13992,6 +13992,7 @@ func TestSelectedKbuildImmutableReadBindsSourceOrKconfigProjection(t *testing.T)
 		name, reference, logicalPath, contents, wantError string
 		owner                                             KbuildControlReadArtifact
 		sourceRoot, configBaseline                        bool
+		objectBaseline, preconfigured, exactObject        bool
 	}{
 		{name: "immutable source-root", reference: "$(srctree)/release.source",
 			logicalPath: "__LINUX_BZL_SOURCE_TREE__/release.source", contents: "6.18.39-source\n", sourceRoot: true},
@@ -14000,14 +14001,29 @@ func TestSelectedKbuildImmutableReadBindsSourceOrKconfigProjection(t *testing.T)
 			owner: KbuildControlReadArtifact{
 				Tree: CompactKbuildInvocationObjectTree, Identity: "config:include/config/auto.conf", Version: "sha256/config-baseline",
 			}, configBaseline: true},
+		{name: "declared initial object file", reference: "$(objtree)/include/config/kernel.release",
+			logicalPath: "__LINUX_BZL_OBJECT_TREE__/include/config/kernel.release", contents: "6.12-sdk\n",
+			owner: KbuildControlReadArtifact{
+				Tree: CompactKbuildInvocationObjectTree, Identity: "initial-object:include/config/kernel.release", Version: "sha256/initial-object",
+			}, objectBaseline: true, preconfigured: true, exactObject: true},
+		{name: "initial object owner in fresh planning", reference: "$(objtree)/include/config/kernel.release",
+			logicalPath: "__LINUX_BZL_OBJECT_TREE__/include/config/kernel.release", contents: "6.12-sdk\n",
+			owner: KbuildControlReadArtifact{
+				Tree: CompactKbuildInvocationObjectTree, Identity: "initial-object:include/config/kernel.release", Version: "sha256/initial-object",
+			}, objectBaseline: true, exactObject: true, wantError: "has no declared initial object-tree input"},
+		{name: "initial object owner with only namespace prefix", reference: "$(objtree)/include/config/kernel.release",
+			logicalPath: "__LINUX_BZL_OBJECT_TREE__/include/config/kernel.release", contents: "6.12-sdk\n",
+			owner: KbuildControlReadArtifact{
+				Tree: CompactKbuildInvocationObjectTree, Identity: "initial-object:include/config/kernel.release", Version: "sha256/initial-object",
+			}, objectBaseline: true, preconfigured: true, wantError: "has no declared initial object-tree input"},
 		{name: "object file without Kconfig owner", reference: "$(objtree)/include/config/kernel.release",
 			logicalPath: "__LINUX_BZL_OBJECT_TREE__/include/config/kernel.release", contents: "6.18.39-unknown\n",
 			owner: KbuildControlReadArtifact{
 				Tree: CompactKbuildInvocationObjectTree, Identity: "object:unproven", Version: "sha256/unknown-object",
-			}, wantError: "lacks an authenticated Kconfig projection owner"},
+			}, wantError: "lacks an authenticated immutable object-tree owner"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			profile, sourceRoot, _ := selectedControlTestProfile(t, `
+			profile, sourceRoot, objectRoot := selectedControlTestProfile(t, `
 KERNELRELEASE = $(file < `+test.reference+`)
 define filechk_utsrelease.h
 	echo \#define UTS_RELEASE \"$(KERNELRELEASE)\"
@@ -14019,6 +14035,9 @@ FORCE:
 `)
 			if test.sourceRoot {
 				mustWriteSource(t, sourceRoot, "release.source", test.contents)
+			}
+			if test.objectBaseline {
+				mustWriteSource(t, objectRoot, "include/config/kernel.release", test.contents)
 			}
 			files := selectedControlTestFiles{}
 			if !test.sourceRoot {
@@ -14050,6 +14069,13 @@ FORCE:
 			metadata := &CompactMetadata{configProjectionPaths: recognizedConfigDocuments(),
 				actionRoles: testConfiguredScopedActionRoles,
 				Config:      CompactConfig{KbuildProfiles: []CompactKbuildProfile{evaluation.Profile}},
+			}
+			if test.objectBaseline {
+				metadata.preconfiguredObjectTree = test.preconfigured
+				metadata.sourceNamespaces = map[string]string{"include/config": "prep"}
+				if test.exactObject {
+					metadata.exactSourceNamespaces = map[string]string{"include/config/kernel.release": "prep"}
+				}
 			}
 			selection := compactKbuildSelectionKey{profile: profile.Name, target: header, stage: "target"}
 			graph, err := newCompactKbuildSelectionGraph(CompactConfig{
@@ -14083,7 +14109,7 @@ FORCE:
 			}
 			reads := line.Reads()
 			if len(reads) == 0 || !reads[0].Exists || reads[0].Artifact.Producer != (CompactKbuildVisibleArtifact{}) {
-				t.Fatalf("immutable Make read = %#v, want declared source/config owner", reads)
+				t.Fatalf("immutable Make read = %#v, want declared immutable owner", reads)
 			}
 			node, ok := compactKbuildPlanNode(plan, producer)
 			if !ok || len(node.Sources) == 0 {
@@ -14093,6 +14119,8 @@ FORCE:
 			wantSource := "release.source"
 			if test.configBaseline {
 				wantNamespace, wantSource = "config", "include/config/auto.conf"
+			} else if test.objectBaseline {
+				wantNamespace, wantSource = "prep", "include/config/kernel.release"
 			}
 			wantID := plan.sourceIDs[actionPlanLookupKey(wantNamespace, wantSource)]
 			if wantID == "" || !slices.ContainsFunc(node.Sources, func(edge ActionPlanSourceEdge) bool {

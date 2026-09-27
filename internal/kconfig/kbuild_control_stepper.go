@@ -16,8 +16,8 @@ import (
 // Version names that owner's immutable contents. Both must be stable across
 // invocations which see the same bytes from the same owner. Producer is the
 // comparable selected action owner returned by the same frozen resolver as
-// Identity and Version. Declared source and Kconfig baseline files leave it
-// zero because no selected Kbuild action wrote them.
+// Identity and Version. Declared source, initial object-tree, and Kconfig
+// baseline files leave it zero because no selected Kbuild action wrote them.
 type KbuildControlReadArtifact struct {
 	Tree     CompactKbuildInvocationTree
 	Identity string

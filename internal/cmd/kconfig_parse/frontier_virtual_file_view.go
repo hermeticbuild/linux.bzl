@@ -1,11 +1,14 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
@@ -37,6 +40,58 @@ func (view kbuildFrontierArtifactView) Range(
 	})
 }
 
+// kbuildInitialObjectTree is the declared, immutable object input snapshot.
+// Its names are frozen at discovery; contents are read only when Make asks for
+// them, so wildcard discovery does not load an entire SDK into memory.
+// The caller must keep the declared files immutable for the view's lifetime.
+type kbuildInitialObjectTree struct {
+	root     string
+	files    []string
+	digest   [sha256.Size]byte
+	mu       sync.Mutex
+	contents map[string]string
+}
+
+func newKbuildInitialObjectTree(root string, files []string) *kbuildInitialObjectTree {
+	return &kbuildInitialObjectTree{
+		root: root, files: slices.Clone(files),
+		digest: sha256.Sum256([]byte(strings.Join(files, "\x00"))),
+	}
+}
+
+func (tree *kbuildInitialObjectTree) rangePrefix(prefix string, visit func(string)) {
+	if tree == nil {
+		return
+	}
+	for index := sort.SearchStrings(tree.files, prefix); index < len(tree.files) && strings.HasPrefix(tree.files[index], prefix); index++ {
+		visit(tree.files[index])
+	}
+}
+
+func (tree *kbuildInitialObjectTree) read(path string) (string, bool, error) {
+	if tree == nil {
+		return "", false, nil
+	}
+	if _, found := slices.BinarySearch(tree.files, path); !found {
+		return "", false, nil
+	}
+	tree.mu.Lock()
+	defer tree.mu.Unlock()
+	if content, found := tree.contents[path]; found {
+		return content, true, nil
+	}
+	data, err := os.ReadFile(filepath.Join(tree.root, filepath.FromSlash(path)))
+	if err != nil {
+		return "", false, fmt.Errorf("read declared initial object file %q: %w", path, err)
+	}
+	if tree.contents == nil {
+		tree.contents = map[string]string{}
+	}
+	content := string(data)
+	tree.contents[path] = content
+	return content, true, nil
+}
+
 // kbuildFrontierVirtualFileView presents one immutable recursive-Make object
 // frontier directly to the Kbuild evaluator. It derives Make-visible aliases
 // only for queried prefixes instead of materializing two aliases and an exact
@@ -50,6 +105,7 @@ type kbuildFrontierVirtualFileView struct {
 	// observes them as existing files from the start of every invocation, while
 	// a source-selected writer in state still supersedes their baseline bytes.
 	immutableContents map[string]string
+	initialObjectTree *kbuildInitialObjectTree
 }
 
 // pendingKbuildSourceOutputRead is emitted only for a selected source writer
@@ -98,6 +154,7 @@ func (view kbuildFrontierVirtualFileView) Match(pattern string) []string {
 			visit(path)
 			return true
 		})
+		view.initialObjectTree.rangePrefix(prefix, visit)
 		for path := range view.immutableContents {
 			if strings.HasPrefix(path, prefix) {
 				visit(path)
@@ -156,7 +213,14 @@ func (view kbuildFrontierVirtualFileView) Read(path string) (string, bool, bool,
 	for _, global := range paths {
 		baseline, found := view.immutableContents[global]
 		if !found {
-			continue
+			var err error
+			baseline, found, err = view.initialObjectTree.read(global)
+			if err != nil {
+				return "", false, false, err
+			}
+			if !found {
+				continue
+			}
 		}
 		exists = true
 		if exact && content != baseline {

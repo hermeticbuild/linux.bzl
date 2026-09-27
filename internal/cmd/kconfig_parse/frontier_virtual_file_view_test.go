@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -84,10 +86,32 @@ func TestKbuildFrontierVirtualFileViewDistinguishesPendingSelectedSourceFromOpaq
 
 func TestKbuildFrontierVirtualFileViewReadsImmutableBaselineUntilFrontierReplacesIt(t *testing.T) {
 	const releasePath = "include/config/kernel.release"
+	objectRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(objectRoot, "Module.symvers"), []byte("symbols\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	baseline := map[string]string{releasePath: "6.18.39-baseline\n"}
 	view := kbuildFrontierVirtualFileView{
 		directory:         "scripts",
 		immutableContents: baseline,
+		initialObjectTree: newKbuildInitialObjectTree(objectRoot, []string{"Module.symvers"}),
+	}
+
+	if got, want := view.Match(kbuildEvalObjectTree+"/Module.*"), []string{kbuildEvalObjectTree + "/Module.symvers"}; !slices.Equal(got, want) {
+		t.Fatalf("initial object Match() = %q, want %q", got, want)
+	}
+	if content, exists, exact, err := view.Read("../Module.symvers"); err != nil || !exists || !exact || content != "symbols\n" {
+		t.Fatalf("initial object read = (%q, %t, %t, %v)", content, exists, exact, err)
+	}
+	view.immutableContents["Module.symvers"] = "configured symbols\n"
+	if content, _, _, err := view.Read("../Module.symvers"); err != nil || content != "configured symbols\n" {
+		t.Fatalf("config projection did not replace initial object bytes: %q, %v", content, err)
+	}
+	if err := os.WriteFile(filepath.Join(objectRoot, "later.out"), []byte("later\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := view.Match(kbuildEvalObjectTree + "/later.out"); len(got) != 0 {
+		t.Fatalf("initial object snapshot observed a later physical file: %q", got)
 	}
 
 	rooted := kbuildEvalObjectTree + "/" + releasePath

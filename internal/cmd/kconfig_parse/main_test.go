@@ -7306,10 +7306,16 @@ $(obj)/demo.o: $(src)/demo.rs
 FORCE:
 `)
 	write(root, "scripts/Makefile.modpost", `
+ifeq ($(wildcard Module.symvers),)
+missing-input := Module.symvers
+else
+modpost-args += -i Module.symvers
+modpost-deps += Module.symvers
+endif
 .PHONY: __modpost
 __modpost: $(extmod_prefix)Module.symvers
-$(extmod_prefix)Module.symvers: $(MODORDER)
-	cp $< $@
+$(extmod_prefix)Module.symvers: $(MODORDER) $(modpost-deps)
+	$(if $(wildcard Module.symvers),cp $< $@,$(error kernel Module.symvers disappeared before modpost))
 `)
 	write(root, "scripts/Makefile.modfinal", `
 include $(srctree)/scripts/Kbuild.include
@@ -7327,6 +7333,7 @@ FORCE:
 `)
 	write(externalRoot, "Kbuild", "obj-m += demo.o\n")
 	write(externalRoot, "demo.rs", "external module input\n")
+	write(objectRoot, "Module.symvers", "")
 
 	const externalDirectory = ".linux-bzl/external/demo"
 	externalSourceRoot := kbuildEvalSourceTree + "/" + externalDirectory
@@ -7334,27 +7341,53 @@ FORCE:
 		"M":       externalSourceRoot,
 		"SRCARCH": "x86",
 	}
-	profiles, selections, _, err := evaluatedKbuildProfilesWithOptions(
-		root,
-		objectRoot,
-		[]string{"modules"},
-		variables,
-		kconfig.KbuildOptions{
-			RootDir: root,
-			CommandLineVariables: map[string]string{
-				"M": variables["M"],
-			},
-			AutoExportCommandLineVariables: map[string]bool{"M": true},
-			SourceRoots: map[string]string{
-				externalSourceRoot: externalRoot,
-			},
-			ConfigVariablesComplete: true,
-			MakeVariablesComplete:   true,
+	options := kconfig.KbuildOptions{
+		RootDir: root,
+		CommandLineVariables: map[string]string{
+			"M": variables["M"],
 		},
-		nil,
+		AutoExportCommandLineVariables: map[string]bool{"M": true},
+		SourceRoots: map[string]string{
+			externalSourceRoot: externalRoot,
+		},
+		ConfigVariablesComplete: true,
+		MakeVariablesComplete:   true,
+	}
+	if _, _, _, err := evaluatedKbuildProfilesWithGeneratedContent(
+		root, objectRoot, []string{"modules"}, nil, variables, options,
+		nil, nil, nil, nil, false,
+	); err == nil || !strings.Contains(err.Error(), "kernel Module.symvers disappeared before modpost") {
+		t.Fatalf("fresh object tree unexpectedly exposed the physical SDK input: %v", err)
+	}
+	profiles, selections, _, err := evaluatedKbuildProfilesWithGeneratedContent(
+		root, objectRoot, []string{"modules"}, nil, variables, options,
+		nil, nil, nil, nil, true,
 	)
 	if err != nil {
-		t.Fatalf("evaluatedKbuildProfilesWithOptions() failed: %v", err)
+		t.Fatalf("evaluatedKbuildProfilesWithGeneratedContent() failed: %v", err)
+	}
+
+	modpostFound := false
+	for _, profile := range profiles {
+		if profile.Path != "scripts/Makefile.modpost" {
+			continue
+		}
+		modpostFound = true
+		target := externalDirectory + "/Module.symvers"
+		normal, _, _, err := kconfig.EvaluateCompactKbuildTargetRuleContext(profile, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(normal, "Module.symvers") {
+			t.Fatalf("modpost prerequisites = %q, want the initial kernel Module.symvers", normal)
+		}
+		args, err := kconfig.EvaluateCompactKbuildTextSymbolic(profile, target, "", nil, nil, nil, "$(modpost-args)")
+		if err != nil || args != "-i Module.symvers" {
+			t.Fatalf("modpost arguments = %q, %v, want -i Module.symvers", args, err)
+		}
+	}
+	if !modpostFound {
+		t.Fatal("external module omitted the modpost invocation")
 	}
 
 	selected := map[string]bool{}
@@ -7372,6 +7405,57 @@ FORCE:
 	}
 	if selected[externalDirectory+"/demo.mod.c"] {
 		t.Fatalf("modpost side output became a materialized selection: %#v", selections)
+	}
+
+	metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(
+		&kconfig.ResolvedConfig{Effective: map[string]string{"CONFIG_TEST": "n"}},
+		kconfig.CompactMetadataOptions{
+			SelectedProductsOnly: true, PreconfiguredObjectTree: true,
+			SourceNamespaces:      map[string]string{externalSourceRoot: "external"},
+			ExactSourceNamespaces: map[string]string{"Module.symvers": "prep"},
+		},
+		func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
+			return kconfig.CompactConfigGraph{KbuildProfiles: profiles, KbuildSelections: selections}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := "sha256-" + strings.Repeat("5c", 32)
+	plan, err := metadata.ActionPlan(identity, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kernelSymbols := ""
+	for _, source := range plan.Sources {
+		if source.Namespace == "prep" && source.Path == "Module.symvers" {
+			kernelSymbols = source.ID
+		}
+	}
+	var modpost kconfig.ActionPlanNode
+	for _, node := range plan.Nodes {
+		if slices.ContainsFunc(node.Outputs, func(output kconfig.ActionPlanOutput) bool {
+			return output.Path == externalDirectory+"/Module.symvers"
+		}) {
+			modpost = node
+			break
+		}
+	}
+	bound := slices.ContainsFunc(modpost.Sources, func(source kconfig.ActionPlanSourceEdge) bool {
+		return source.SourceID == kernelSymbols
+	})
+	store, err := kconfig.NewActionPlanInputSetStoreFromNodes(plan.InputSets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Walk(modpost.InputSet, func(input kconfig.ActionPlanInputSetEntry) error {
+		bound = bound || input.SourceID == kernelSymbols
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if kernelSymbols == "" || modpost.ID == "" || !bound {
+		t.Fatal("external modpost did not bind the initial kernel symbol table")
 	}
 }
 
@@ -10928,13 +11012,13 @@ func TestKbuildInvocationInputIndexFollowsSymlinkedSourceRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	index, err := newKbuildInvocationInputIndex(kernelLink, kernelLink, map[string]string{
+	inputs, err := newKbuildInvocationInputIndex(kernelLink, kernelLink, map[string]string{
 		kbuildEvalSourceTree + "/drivers/vendor": moduleLink,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	satisfied := kbuildSatisfiedTargets(index)
+	index, satisfied := inputs.index, inputs.satisfied
 	for _, source := range []string{"arch/x86/boot/mkcpustr.c", "drivers/vendor/vendor.c"} {
 		if !satisfied[source] {
 			t.Fatalf("symlinked source %q absent from input index: %#v", source, index.files)
@@ -11024,16 +11108,18 @@ func TestKbuildInvocationInputsCachesImmutableSnapshotDefensively(t *testing.T) 
 	}
 
 	cache := &kbuildInvocationInputCache{}
-	index, satisfied, err := kbuildInvocationInputs(cache, root, root, nil)
+	inputs, err := kbuildInvocationInputs(cache, root, root, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	index, satisfied := inputs.index, inputs.satisfied
 	if got, want := len(cache.entries), 1; got != want {
 		t.Fatalf("cache entries after first lookup = %d, want %d", got, want)
 	}
 	wantFiles := slices.Clone(index.files)
 	wantDirectories := slices.Clone(index.directories)
 	wantSatisfied := maps.Clone(satisfied)
+	wantObjectFiles := slices.Clone(inputs.objectFiles)
 	if !slices.Contains(wantFiles, "Makefile") || !slices.Contains(wantFiles, "subdirectory/source.c") {
 		t.Fatalf("indexed files = %#v, want fixture sources", wantFiles)
 	}
@@ -11045,15 +11131,17 @@ func TestKbuildInvocationInputsCachesImmutableSnapshotDefensively(t *testing.T) 
 	}
 
 	index.files[0] = "caller-mutation"
+	inputs.objectFiles[0] = "caller-mutation"
 	index.directories[0] = "caller-mutation"
 	delete(satisfied, "Makefile")
 	satisfied["caller-mutation"] = true
 
-	index, satisfied, err = kbuildInvocationInputs(cache, root, root, nil)
+	inputs, err = kbuildInvocationInputs(cache, root, root, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(index.files, wantFiles) || !slices.Equal(index.directories, wantDirectories) {
+	index, satisfied = inputs.index, inputs.satisfied
+	if !slices.Equal(index.files, wantFiles) || !slices.Equal(index.directories, wantDirectories) || !slices.Equal(inputs.objectFiles, wantObjectFiles) {
 		t.Fatalf("cached index leaked caller mutation: files=%#v directories=%#v", index.files, index.directories)
 	}
 	if !maps.Equal(satisfied, wantSatisfied) {
@@ -11064,27 +11152,30 @@ func TestKbuildInvocationInputsCachesImmutableSnapshotDefensively(t *testing.T) 
 	// slices and map through the previous hit.
 	index.files[0] = "second-caller-mutation"
 	satisfied["second-caller-mutation"] = true
-	thirdIndex, thirdSatisfied, err := kbuildInvocationInputs(cache, root, root, nil)
+	third, err := kbuildInvocationInputs(cache, root, root, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(thirdIndex.files, wantFiles) || !maps.Equal(thirdSatisfied, wantSatisfied) {
-		t.Fatalf("cache hit leaked caller mutation: index=%#v satisfied=%#v", thirdIndex, thirdSatisfied)
+	if !slices.Equal(third.index.files, wantFiles) || !maps.Equal(third.satisfied, wantSatisfied) {
+		t.Fatalf("cache hit leaked caller mutation: index=%#v satisfied=%#v", third.index, third.satisfied)
 	}
 
 	objectRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(objectRoot, "generated.h"), []byte("#define GENERATED 1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	separateIndex, separateSatisfied, err := kbuildInvocationInputs(cache, root, objectRoot, nil)
+	separate, err := kbuildInvocationInputs(cache, root, objectRoot, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, want := len(cache.entries), 2; got != want {
 		t.Fatalf("cache entries after distinct object-root lookup = %d, want %d", got, want)
 	}
-	if !slices.Contains(separateIndex.files, "generated.h") || !separateSatisfied["generated.h"] {
-		t.Fatalf("distinct object-root input missing from index=%#v satisfied=%#v", separateIndex, separateSatisfied)
+	if !slices.Equal(separate.objectFiles, []string{"generated.h"}) {
+		t.Fatalf("initial object files = %q, want only generated.h", separate.objectFiles)
+	}
+	if !slices.Contains(separate.index.files, "generated.h") || !separate.satisfied["generated.h"] {
+		t.Fatalf("distinct object-root input missing from index=%#v satisfied=%#v", separate.index, separate.satisfied)
 	}
 }
 

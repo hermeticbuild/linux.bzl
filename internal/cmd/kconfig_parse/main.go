@@ -3358,11 +3358,16 @@ func evaluatedKbuildInvocationProfiles(
 			return nil, nil, "", fmt.Errorf("configure Kbuild root invocation: %w", err)
 		}
 	}
-	sourceIndex, satisfied, err := kbuildInvocationInputs(
+	inputs, err := kbuildInvocationInputs(
 		kbuildInputCache, rootDir, objectRoot, baseOptions.SourceRoots,
 	)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("index Kbuild source inputs: %w", err)
+	}
+	sourceIndex, satisfied := inputs.index, inputs.satisfied
+	var initialObjectTree *kbuildInitialObjectTree
+	if preconfiguredObjectTree {
+		initialObjectTree = newKbuildInitialObjectTree(objectRoot, inputs.objectFiles)
 	}
 	if baseOptions.SourceCache == nil {
 		baseOptions.SourceCache = kbuildInvocationSourceProgramCache(
@@ -3506,6 +3511,7 @@ func evaluatedKbuildInvocationProfiles(
 		options.VirtualFileView = kbuildFrontierVirtualFileView{
 			state: initialFrontier, directory: processLocation.Directory,
 			sourceOverlayDirectories: sourceOverlayDirectories,
+			initialObjectTree:        initialObjectTree,
 			immutableContents:        immutableContents,
 		}
 		options.CommandLineVariables = make(map[string]string, len(request.variables))
@@ -3579,6 +3585,7 @@ func evaluatedKbuildInvocationProfiles(
 			options.VirtualFileView = kbuildFrontierVirtualFileView{
 				state: initialFrontier, directory: processLocation.Directory,
 				sourceOverlayDirectories: sourceOverlayDirectories,
+				initialObjectTree:        initialObjectTree,
 				immutableContents:        privateContents,
 			}
 			options.CommandLineVariables["FEATURES_DUMP"] = kbuildEvalObjectTree + "/" + featureDumpPath
@@ -3623,6 +3630,7 @@ func evaluatedKbuildInvocationProfiles(
 			options.VirtualFileView = kbuildFrontierVirtualFileView{
 				state: initialFrontier, directory: processLocation.Directory,
 				sourceOverlayDirectories: sourceOverlayDirectories,
+				initialObjectTree:        initialObjectTree,
 				immutableContents:        privateContents,
 			}
 			parsed, err = kconfig.ParseKbuildFileTree(makefile, options)
@@ -4108,7 +4116,7 @@ func evaluatedKbuildInvocationProfiles(
 				}
 				return stepper.BeforeRecipe(line, selectedRecipeFrontier(
 					frontier, visible.state, profileRequests[index].directory,
-					immutableContents, sourceOverlayDirectories,
+					immutableContents, sourceOverlayDirectories, initialObjectTree,
 				))
 			},
 			afterLine:     stepper.ApplyRecipe,
@@ -4177,7 +4185,7 @@ func evaluatedKbuildInvocationProfiles(
 		}
 		stepped, stepErr := stepper.Finish(selectedRecipeFrontier(
 			completionFrontier, completedFrontier.state, profileRequests[index].directory,
-			immutableContents, sourceOverlayDirectories,
+			immutableContents, sourceOverlayDirectories, initialObjectTree,
 		))
 		if stepErr != nil {
 			return fmt.Errorf("finish source-ordered control for invocation %q: %w", profiles[index].Name, stepErr)
@@ -4376,8 +4384,9 @@ type kbuildSourceInputIndex struct {
 }
 
 type kbuildInvocationInputSnapshot struct {
-	index     kbuildSourceInputIndex
-	satisfied map[string]bool
+	index       kbuildSourceInputIndex
+	satisfied   map[string]bool
+	objectFiles []string
 }
 
 // kbuildInvocationInputCache is scoped to one sequential family-planner
@@ -4462,10 +4471,12 @@ func cloneKbuildSourceInputIndex(index kbuildSourceInputIndex) kbuildSourceInput
 	}
 }
 
-func cloneKbuildInvocationInputSnapshot(
-	snapshot kbuildInvocationInputSnapshot,
-) (kbuildSourceInputIndex, map[string]bool) {
-	return cloneKbuildSourceInputIndex(snapshot.index), maps.Clone(snapshot.satisfied)
+func cloneKbuildInvocationInputSnapshot(snapshot kbuildInvocationInputSnapshot) kbuildInvocationInputSnapshot {
+	return kbuildInvocationInputSnapshot{
+		index:       cloneKbuildSourceInputIndex(snapshot.index),
+		satisfied:   maps.Clone(snapshot.satisfied),
+		objectFiles: slices.Clone(snapshot.objectFiles),
+	}
 }
 
 func kbuildInvocationInputs(
@@ -4473,33 +4484,25 @@ func kbuildInvocationInputs(
 	rootDir string,
 	objectRoot string,
 	sourceRoots map[string]string,
-) (kbuildSourceInputIndex, map[string]bool, error) {
+) (kbuildInvocationInputSnapshot, error) {
 	cacheKey := ""
 	if cache != nil {
 		cacheKey = kbuildInvocationInputCacheKey(rootDir, objectRoot, sourceRoots)
 		if snapshot, ok := cache.entries[cacheKey]; ok {
-			index, satisfied := cloneKbuildInvocationInputSnapshot(snapshot)
-			return index, satisfied, nil
+			return cloneKbuildInvocationInputSnapshot(snapshot), nil
 		}
 	}
-	index, err := newKbuildInvocationInputIndex(rootDir, objectRoot, sourceRoots)
+	snapshot, err := newKbuildInvocationInputIndex(rootDir, objectRoot, sourceRoots)
 	if err != nil {
-		return kbuildSourceInputIndex{}, nil, err
-	}
-	snapshot := kbuildInvocationInputSnapshot{
-		index:     index,
-		satisfied: kbuildSatisfiedTargets(index),
+		return kbuildInvocationInputSnapshot{}, err
 	}
 	if cache != nil {
 		if cache.entries == nil {
 			cache.entries = map[string]kbuildInvocationInputSnapshot{}
 		}
-		cache.entries[cacheKey] = kbuildInvocationInputSnapshot{
-			index:     cloneKbuildSourceInputIndex(snapshot.index),
-			satisfied: maps.Clone(snapshot.satisfied),
-		}
+		cache.entries[cacheKey] = cloneKbuildInvocationInputSnapshot(snapshot)
 	}
-	return snapshot.index, snapshot.satisfied, nil
+	return snapshot, nil
 }
 
 func newKbuildSourceInputIndex(root string) (kbuildSourceInputIndex, error) {
@@ -4567,7 +4570,7 @@ func appendKbuildSourceInputIndex(index *kbuildSourceInputIndex, root, prefix st
 	})
 }
 
-func newKbuildInvocationInputIndex(rootDir, objectRoot string, sourceRoots map[string]string) (kbuildSourceInputIndex, error) {
+func newKbuildInvocationInputIndex(rootDir, objectRoot string, sourceRoots map[string]string) (kbuildInvocationInputSnapshot, error) {
 	index := kbuildSourceInputIndex{}
 	seenRoots := map[string]bool{}
 	add := func(root, prefix string) error {
@@ -4579,11 +4582,14 @@ func newKbuildInvocationInputIndex(rootDir, objectRoot string, sourceRoots map[s
 		seenRoots[key] = true
 		return appendKbuildSourceInputIndex(&index, root, prefix)
 	}
-	if err := add(rootDir, ""); err != nil {
-		return kbuildSourceInputIndex{}, err
-	}
+	// Preserve the declared object tree independently before source overlays
+	// contribute to the combined prerequisite index.
 	if err := add(objectRoot, ""); err != nil {
-		return kbuildSourceInputIndex{}, err
+		return kbuildInvocationInputSnapshot{}, err
+	}
+	objectFiles := sortedUniquePaths(slices.Clone(index.files))
+	if err := add(rootDir, ""); err != nil {
+		return kbuildInvocationInputSnapshot{}, err
 	}
 	for virtual, physical := range sourceRoots {
 		prefix := ""
@@ -4595,12 +4601,12 @@ func newKbuildInvocationInputIndex(rootDir, objectRoot string, sourceRoots map[s
 			continue
 		}
 		if err := add(physical, prefix); err != nil {
-			return kbuildSourceInputIndex{}, err
+			return kbuildInvocationInputSnapshot{}, err
 		}
 	}
 	index.files = sortedUniquePaths(index.files)
 	index.directories = sortedUniquePaths(index.directories)
-	return index, nil
+	return kbuildInvocationInputSnapshot{index: index, satisfied: kbuildSatisfiedTargets(index), objectFiles: objectFiles}, nil
 }
 
 func mappedKbuildInvocationDirectory(directory, rootDir string, sourceRoots map[string]string) string {

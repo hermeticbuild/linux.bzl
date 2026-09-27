@@ -95,8 +95,7 @@ func projectSelectedKbuildOutput(filename string, trees map[string]string, outpu
 // Keep the executable's dependency closure, before the command that invokes it.
 func nativeKconfigToolMetadata(opts linuxKbuildProbeOptions, scopes *kconfig.KbuildProbeScopes, sourceRoot string) (*kconfig.CompactMetadata, *kconfig.ResolvedConfig, error) {
 	resolved := &kconfig.ResolvedConfig{Effective: map[string]string{}}
-	metadataOptions := linuxCompactMetadataOptions(opts.variables, opts.sourceNamespaces, sourceRoot, true, opts.targetContract, opts.hostContract)
-	metadataOptions.PreconfiguredObjectTree = true
+	metadataOptions := linuxCompactMetadataOptions(opts.variables, opts.sourceNamespaces, "", true, opts.targetContract, opts.hostContract)
 	metadata, err := kconfig.CompactMetadataForResolvedConfigWithOptions(resolved, metadataOptions, func(*kconfig.ResolvedConfig) (kconfig.CompactConfigGraph, error) {
 		variables := maps.Clone(opts.variables)
 		for name, value := range linuxRootMakeInvocationVariables(sourceRoot) {
@@ -137,7 +136,7 @@ func nativeKconfigToolMetadata(opts linuxKbuildProbeOptions, scopes *kconfig.Kbu
 		}
 		profiles, selections, _, err := evaluatedKbuildInvocationProfiles(sourceRoot, sourceRoot,
 			[]string{"syncconfig"}, nil, variables, options, bindEnvironment,
-			nil, nil, opts.kbuildInputCache, true, false, nil, nil, nil)
+			nil, nil, opts.kbuildInputCache, false, false, nil, nil, nil)
 		if err != nil {
 			return kconfig.CompactConfigGraph{}, err
 		}

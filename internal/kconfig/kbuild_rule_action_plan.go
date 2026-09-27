@@ -1121,19 +1121,38 @@ func (b *compactKbuildRulePlanBuilder) compactKbuildSelectedReadInputs(
 					input = compactKbuildRuleInput{path: logicalPath, sourceID: sourceID}
 				case CompactKbuildInvocationObjectTree:
 					logicalPath, rooted := strings.CutPrefix(read.Path, "__LINUX_BZL_OBJECT_TREE__/")
-					if !rooted || read.Artifact.Identity != "config:"+logicalPath {
-						return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q lacks an authenticated Kconfig projection owner",
+					initialObject := read.Artifact.Identity == "initial-object:"+logicalPath
+					if !rooted || !initialObject && read.Artifact.Identity != "config:"+logicalPath {
+						return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q lacks an authenticated immutable object-tree owner",
 							match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
 					}
-					var available bool
-					input, available, err = b.compactKbuildConfigProjectionBaselineInput(logicalPath)
-					if err != nil {
-						return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q Kconfig input: %w",
-							match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path, err)
-					}
-					if !available {
-						return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q has no declared Kconfig projection input",
-							match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
+					if initialObject {
+						available, sourceErr := b.metadata.preconfiguredObjectTreeSourcePathExists(snapshot.Evaluation.Profile, logicalPath)
+						if sourceErr != nil {
+							return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q initial object input: %w",
+								match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path, sourceErr)
+						}
+						if !available {
+							return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q has no declared initial object-tree input",
+								match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
+						}
+						sourceID, sourceErr := b.metadata.ensureActionPlanSource(b.plan, logicalPath)
+						if sourceErr != nil {
+							return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q initial object input: %w",
+								match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path, sourceErr)
+						}
+						input = compactKbuildRuleInput{path: logicalPath, sourceID: sourceID, objectTree: true}
+					} else {
+						var available bool
+						input, available, err = b.compactKbuildConfigProjectionBaselineInput(logicalPath)
+						if err != nil {
+							return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q Kconfig input: %w",
+								match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path, err)
+						}
+						if !available {
+							return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q has no declared Kconfig projection input",
+								match.profile.Rules[snapshot.Line.RuleIndex].Position, target, snapshot.Line.RecipeIndex, read.Path)
+						}
 					}
 				default:
 					return nil, fmt.Errorf("%s: Kbuild target %q recipe %d read %q has unknown immutable tree %q",

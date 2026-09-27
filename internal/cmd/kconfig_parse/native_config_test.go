@@ -140,3 +140,86 @@ func TestDeclaredNativeConfigTreeRootSymlink(t *testing.T) {
 		t.Fatal("serializer output audit accepted a symlink root")
 	}
 }
+
+func TestNativeKconfigToolUsesFreshObjectTree(t *testing.T) {
+	root := t.TempDir()
+	for name, contents := range map[string]string{
+		"Makefile": `
+ifeq ($(wildcard $(srctree)/.gitignore),)
+$(error source .gitignore is missing)
+endif
+ifneq ($(wildcard .gitignore),)
+$(error source .gitignore leaked into the fresh object tree)
+endif
+.PHONY: syncconfig
+syncconfig: scripts/kconfig/conf
+scripts/kconfig/conf: scripts/kconfig/conf.in
+	cp $(srctree)/scripts/kconfig/conf.in $@
+`,
+		".gitignore":              "source ignore rules\n",
+		"scripts/kconfig/conf.in": "native Kconfig tool fixture\n",
+	} {
+		filename := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(filename), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filename, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	identity := "sha256-" + strings.Repeat("5c", 32)
+	bootstrap, err := newLinuxCompilerBootstrapPlan(identity, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetFacts, err := kconfig.ParseLinuxCompilerBootstrapResult(
+		testLinuxCompilerBootstrapResult(t, bootstrap.target, identity, false), "target", identity,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostFacts, err := kconfig.ParseLinuxCompilerBootstrapResult(
+		testLinuxCompilerBootstrapResult(t, bootstrap.host, identity, false), "host", identity,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeOptions := kconfig.KbuildProbeWorkloadOptions{
+		Target: kconfig.KbuildProbeScopeOptions{
+			Architecture: "x86", SourceArchitecture: "x86", SourceRoot: root,
+			Facts: targetFacts, Tools: map[string]string{"cc": "/configured/target-cc"},
+		},
+		Host: &kconfig.KbuildProbeScopeOptions{
+			Architecture: "x86", SourceArchitecture: "x86", SourceRoot: root,
+			Facts: hostFacts, Tools: map[string]string{"cc": "/configured/host-cc"},
+		},
+	}
+	evaluation, err := kconfig.EvaluateKbuildProbeWorkload(probeOptions, nil, func(scopes *kconfig.KbuildProbeScopes) (*kconfig.ActionPlan, error) {
+		metadata, _, err := nativeKconfigToolMetadata(linuxKbuildProbeOptions{
+			variables:      map[string]string{"ARCH": "x86", "SRCARCH": "x86"},
+			targetContract: &hostKbuildContract{}, hostContract: &hostKbuildContract{},
+		}, scopes, root)
+		if err != nil {
+			return nil, err
+		}
+		return metadata.ActionPlan(identity, identity)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := evaluation.Value
+	for _, source := range plan.Sources {
+		if source.Path == ".gitignore" || source.Namespace == "config" {
+			t.Fatalf("native bootstrap staged a nonexistent object input: %#v", source)
+		}
+	}
+	found := false
+	for _, node := range plan.Nodes {
+		for _, output := range node.Outputs {
+			found = found || output.Path == "scripts/kconfig/conf"
+		}
+	}
+	if !found {
+		t.Fatal("native bootstrap omitted the selected conf output")
+	}
+}

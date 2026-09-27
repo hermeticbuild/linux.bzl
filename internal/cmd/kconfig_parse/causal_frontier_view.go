@@ -19,11 +19,13 @@ func selectedRecipeFrontier(
 	directory string,
 	immutableContents map[string]string,
 	sourceOverlayDirectories []string,
+	initialObjectTree *kbuildInitialObjectTree,
 ) kconfig.KbuildControlRecipeFrontier {
 	view := kbuildFrontierVirtualFileView{
 		state: state, directory: directory,
 		sourceOverlayDirectories: sourceOverlayDirectories,
 		immutableContents:        immutableContents,
+		initialObjectTree:        initialObjectTree,
 	}
 	baselineNames := make([]string, 0, len(immutableContents))
 	for name := range immutableContents {
@@ -36,6 +38,9 @@ func selectedRecipeFrontier(
 		identity.Write([]byte{0})
 		identity.Write([]byte(immutableContents[name]))
 		identity.Write([]byte{0})
+	}
+	if initialObjectTree != nil {
+		identity.Write(initialObjectTree.digest[:])
 	}
 	visible := kbuildFrontierDigest(state)
 	identity.Write(visible[:])
@@ -99,22 +104,32 @@ func selectedRecipeFrontier(
 			}
 			var baselinePath string
 			var baseline string
+			baselineIdentity := "config:"
 			for _, candidate := range candidates {
 				text, present := immutableContents[candidate]
+				identity := "config:"
 				if !present {
-					continue
+					var err error
+					text, present, err = initialObjectTree.read(candidate)
+					if err != nil {
+						return kconfig.KbuildControlReadArtifact{}, false, err
+					}
+					if !present {
+						continue
+					}
+					identity = "initial-object:"
 				}
 				if baselinePath != "" && (baselinePath != candidate || baseline != text) {
-					return kconfig.KbuildControlReadArtifact{}, false, fmt.Errorf("recipe read %q has conflicting declared config projection aliases %q and %q", path, baselinePath, candidate)
+					return kconfig.KbuildControlReadArtifact{}, false, fmt.Errorf("recipe read %q has conflicting declared input aliases %q and %q", path, baselinePath, candidate)
 				}
-				baselinePath, baseline = candidate, text
+				baselinePath, baseline, baselineIdentity = candidate, text, identity
 			}
 			if baselinePath == "" {
 				return kconfig.KbuildControlReadArtifact{}, false, nil
 			}
 			version := sha256.Sum256([]byte(baseline))
 			return kconfig.KbuildControlReadArtifact{
-				Tree: tree, Identity: "config:" + baselinePath,
+				Tree: tree, Identity: baselineIdentity + baselinePath,
 				Version: hex.EncodeToString(version[:]),
 			}, true, nil
 		},
