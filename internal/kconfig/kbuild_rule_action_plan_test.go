@@ -1046,7 +1046,7 @@ func TestCompoundProgramDiscoveryRejectsCommandSubstitutionInProgramHead(t *test
 }
 
 func TestCompoundProgramDiscoveryTreatsArithmeticExpansionAsArgumentData(t *testing.T) {
-	recipe := "outer pre$((1 + (2 * 3)))post argument; next done"
+	recipe := "outer pre$((1 + (2 * 3)))post $(( $(inner input) + $(( $(other value) )) )); next done"
 	commands, err := compactKbuildCompoundProgramCommands(recipe)
 	if err != nil {
 		t.Fatal(err)
@@ -1054,8 +1054,12 @@ func TestCompoundProgramDiscoveryTreatsArithmeticExpansionAsArgumentData(t *test
 	programs := make([]string, len(commands))
 	for index, command := range commands {
 		programs[index] = command.program
+		if command.programStart < 0 || command.programEnd > len(recipe) ||
+			recipe[command.programStart:command.programEnd] != command.program {
+			t.Fatalf("command %d has invalid head provenance %#v in %q", index, command, recipe)
+		}
 	}
-	if want := []string{"outer", "next"}; !slices.Equal(programs, want) {
+	if want := []string{"outer", "inner", "other", "next"}; !slices.Equal(programs, want) {
 		t.Fatalf("arithmetic expansion programs=%q, want %q", programs, want)
 	}
 }

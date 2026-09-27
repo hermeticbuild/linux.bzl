@@ -24,8 +24,10 @@ func TestSelectedKbuildCompressionQueryFollowsGeneratedAssemblyPrerequisites(t *
 	const directory = "arch/x86/boot/compressed"
 	const compressed = directory + "/vmlinux.bin.lz4"
 	write("Makefile", `
-all: vmlinux
+all: Image
 	$(MAKE) -f $(srctree)/scripts/Makefile.build obj=arch/x86/boot/compressed arch/x86/boot/compressed/vmlinux
+Image: vmlinux
+	cp $< $@
 vmlinux: input.bin
 	cp $< $@
 `)
@@ -47,7 +49,7 @@ if-changed-cond = 1
 if_changed = $(if $(if-changed-cond),$(cmd_and_savecmd),@:)
 real-prereqs = $(filter-out FORCE,$^)
 size_append = printf $(shell \
-dec_size=$$(wc -c vmlinux | awk '{print $$1}'); \
+dec_size=$$(( $$(wc -c vmlinux | awk '{print $$1}') )); \
 for F in $(real-prereqs); do \
 	fsize=$$($(CONFIG_SHELL) $(srctree)/scripts/file-size.sh $$F); \
 	dec_size=$$(expr $$dec_size + $$fsize); \

@@ -4593,8 +4593,8 @@ func compactKbuildRecipeTextHasPipeline(value string) bool {
 // compactKbuildCompoundProgramCommands extracts the executable word of every
 // simple command in shell text which cannot be lowered by
 // parseCompactKbuildRecipe. The shell connectors are grammar, not policy: no
-// executable name is assigned special behavior here. The returned commands are
-// used solely to validate and materialize path-based programs before scriptrun
+// executable name is assigned special behavior here. The returned commands
+// retain source positions for program and input discovery before scriptrun
 // executes the original text.
 func compactKbuildCompoundProgramCommands(value string) ([]compactKbuildRecipeCommand, error) {
 	ranges, arithmetic, err := compactKbuildCommandSubstitutionRanges(value)
@@ -4994,6 +4994,18 @@ func compactKbuildCommandSubstitutionRanges(value string) ([]compactKbuildComman
 				return nil, nil, err
 			}
 			arithmetic = append(arithmetic, compactKbuildCommandSubstitutionRange{start: index, end: end})
+			// Arithmetic is argument data, but command substitutions inside it
+			// still execute. Preserve their source offsets for command discovery.
+			contentStart := index + 3
+			nested, _, err := compactKbuildCommandSubstitutionRanges(value[contentStart : end-2])
+			if err != nil {
+				return nil, nil, err
+			}
+			for _, substitution := range nested {
+				ranges = append(ranges, compactKbuildCommandSubstitutionRange{
+					start: contentStart + substitution.start, end: contentStart + substitution.end,
+				})
+			}
 			index = end - 1
 			continue
 		}
