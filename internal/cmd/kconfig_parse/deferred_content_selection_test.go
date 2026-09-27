@@ -24,8 +24,10 @@ func TestSelectedKbuildCompressionQueryFollowsGeneratedAssemblyPrerequisites(t *
 	const directory = "arch/x86/boot/compressed"
 	const compressed = directory + "/vmlinux.bin.lz4"
 	write("Makefile", `
-all:
+all: vmlinux
 	$(MAKE) -f $(srctree)/scripts/Makefile.build obj=arch/x86/boot/compressed arch/x86/boot/compressed/vmlinux
+vmlinux: input.bin
+	cp $< $@
 `)
 	write("scripts/Makefile.build", `
 objprefix := $(obj)
@@ -45,7 +47,7 @@ if-changed-cond = 1
 if_changed = $(if $(if-changed-cond),$(cmd_and_savecmd),@:)
 real-prereqs = $(filter-out FORCE,$^)
 size_append = printf $(shell \
-dec_size=0; \
+dec_size=$$(wc -c vmlinux | awk '{print $$1}'); \
 for F in $(real-prereqs); do \
 	fsize=$$($(CONFIG_SHELL) $(srctree)/scripts/file-size.sh $$F); \
 	dec_size=$$(expr $$dec_size + $$fsize); \
@@ -164,11 +166,38 @@ $(objprefix)/vmlinux.bin: input.bin FORCE
 	if err != nil {
 		t.Fatalf("final action lowering lost selected compression query %q: %v", queries[0].Token, err)
 	}
+	rootProducer := ""
+	for _, node := range plan.Nodes {
+		for _, output := range node.Outputs {
+			if output.Path == "vmlinux" {
+				rootProducer = node.ID
+			}
+		}
+	}
+	if rootProducer == "" {
+		t.Fatal("plan omits the root vmlinux producer")
+	}
+	store, err := kconfig.NewActionPlanInputSetStoreFromNodes(plan.InputSets)
+	if err != nil {
+		t.Fatal(err)
+	}
 	queryActions := 0
 	for _, node := range plan.Nodes {
 		for _, output := range node.Outputs {
 			if strings.HasPrefix(output.Path, ".linux-bzl-content/") {
 				queryActions++
+				bound := false
+				if err := store.Walk(node.InputSet, func(input kconfig.ActionPlanInputSetEntry) error {
+					bound = bound || input.ProducerID == rootProducer && input.Target == (kconfig.ActionPlanInputSetTarget{
+						Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "vmlinux",
+					})
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if !bound {
+					t.Fatal("deferred query omits its bare vmlinux input producer")
+				}
 				if got := plan.Recipes[node.Recipe].Environment["QUERY_CONTEXT"]; got != "selected" {
 					t.Fatalf("selected query action executes with QUERY_CONTEXT=%q, want exact exported value", got)
 				}

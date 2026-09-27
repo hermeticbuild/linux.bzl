@@ -49,15 +49,24 @@ func TestMissingDeferredContentSelectionDistinguishesSourceOwner(t *testing.T) {
 }
 
 func TestDeferredKbuildQueryObservesInvocationRelativeObjectOperand(t *testing.T) {
-	profile := CompactKbuildProfile{Name: "external-demo"}
+	const directory = ".linux-bzl/external/demo"
+	const bareInput = directory + "/query-input"
+	profile := mustCompactKbuildProfileForTest(t, "external-demo", "scripts/Makefile.build", directory, "", nil)
+	profile = compactKbuildProfileWithSourcesForTest(t, profile, bareInput)
+	profile.evaluator.template.virtualFileView = &testKbuildVirtualFileView{
+		matches: map[string][]string{
+			"__LINUX_BZL_OBJECT_TREE__/" + bareInput:          {"__LINUX_BZL_OBJECT_TREE__/" + bareInput},
+			"__LINUX_BZL_OBJECT_TREE__/" + directory + "/awk": {"__LINUX_BZL_OBJECT_TREE__/" + directory + "/awk"},
+		},
+	}
 	if err := SetCompactKbuildProfileInvocationLocation(&profile, CompactKbuildInvocationLocation{
-		Tree: CompactKbuildInvocationObjectTree, Directory: ".linux-bzl/external/demo",
+		Tree: CompactKbuildInvocationObjectTree, Directory: directory,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	query, err := normalizedKbuildDeferredContentQuery(KbuildDeferredContentQuery{
 		Command: "awk '{print $1}' ../../../include/generated/asm-offsets.h " +
-			"--input=../../../include/generated/asm-offsets.h section=noload",
+			"--input=../../../include/generated/asm-offsets.h query-input --input=query-input absent section=noload",
 		Target:  "stack_protector_prepare",
 		Profile: profile,
 	})
@@ -66,7 +75,7 @@ func TestDeferredKbuildQueryObservesInvocationRelativeObjectOperand(t *testing.T
 	}
 	if got, want := query.ObjectTree, (CompactKbuildObjectTreeObservation{
 		ObservesObjectTree: true,
-		References:         []string{"include/generated/asm-offsets.h"},
+		References:         []string{bareInput, "include/generated/asm-offsets.h"},
 	}); !slices.Equal(got.References, want.References) ||
 		got.ObservesObjectTree != want.ObservesObjectTree || got.ObservesAll != want.ObservesAll {
 		t.Fatalf("invocation-relative object-tree observation = %#v, want %#v", got, want)
