@@ -1236,7 +1236,7 @@ func actionPlanFamilySegmentOutputMap(values []namedPath) (map[string]string, er
 
 const (
 	hermeticKbuildBuildVersion      = "1"
-	hermeticKbuildBuildTimestamp    = "1970-01-01T00:00:00Z"
+	hermeticKbuildBuildTimestamp    = "1970-01-01 00:00:00"
 	hermeticKbuildBuildUser         = "bazel"
 	hermeticKbuildBuildHost         = "bazel"
 	hermeticKbuildHostKernelRelease = "linux.bzl-unavailable"

@@ -11,6 +11,23 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/toolsetpath"
 )
 
+func TestDefaultBuildTimestampIsAcceptedByScriptRuntime(t *testing.T) {
+	runtime, err := runfiles.Rlocation(os.Getenv("LINUX_BZL_TEST_SCRIPT_RUNTIME"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract := &hostKbuildContract{}
+	variables, err := kbuildCommandLineVariables(contract, contract, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(runtime, "date", "-d", variables["KBUILD_BUILD_TIMESTAMP"], "+%s")
+	command.Env = []string{"LC_ALL=C", "TZ=UTC"}
+	if output, err := command.CombinedOutput(); err != nil || string(output) != "0\n" {
+		t.Fatalf("initramfs timestamp conversion: output=%q, error=%v", output, err)
+	}
+}
+
 func TestNativeConfigRejectsWorkerPathsFromCompiler(t *testing.T) {
 	conf, err := runfiles.Rlocation(os.Getenv("LINUX_BZL_TEST_NATIVE_CONF"))
 	if err != nil {
