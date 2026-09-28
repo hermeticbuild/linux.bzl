@@ -1,1 +1,0 @@
-int compact_net;

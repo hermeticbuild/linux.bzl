@@ -11,6 +11,7 @@ go_binary(
     importpath = "github.com/hermeticbuild/linux.bzl/e2e/boot",
     pure = "on",
     visibility = ["//visibility:private"],
+    deps = ["//internal/modversions"],
 )
 
 go_test(
@@ -20,6 +21,7 @@ go_test(
         "init_test.go",
     ],
     pure = "on",
+    deps = ["//internal/modversions"],
 )
 
 platform_transition_filegroup(

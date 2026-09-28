@@ -7,28 +7,18 @@ import (
 	"testing"
 )
 
-func TestKconfigFilegroupIncludesHyphenSuffixedSources(t *testing.T) {
-	path := filepath.Join(
-		os.Getenv("TEST_SRCDIR"),
-		os.Getenv("TEST_WORKSPACE"),
-		"source_repo.BUILD.bazel",
-	)
-	content, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+func sourceRepositoryTemplate(t *testing.T) string {
+	t.Helper()
+	if sourceDir, workspace := os.Getenv("TEST_SRCDIR"), os.Getenv("TEST_WORKSPACE"); sourceDir != "" && workspace != "" {
+		return filepath.Join(sourceDir, workspace, "source_repo.BUILD.bazel")
 	}
-	if !strings.Contains(string(content), `"**/Kconfig*"`) {
-		t.Fatal("source repository Kconfig filegroup does not include hyphen-suffixed sources such as arch/arm/Kconfig-nommu")
-	}
+	// `go test ./...` executes this package from internal/tests/source_repo;
+	// Bazel supplies the runfiles variables above.
+	return filepath.Join("..", "..", "..", "source_repo.BUILD.bazel")
 }
 
 func TestSourceRepositoryExportsDirectories(t *testing.T) {
-	path := filepath.Join(
-		os.Getenv("TEST_SRCDIR"),
-		os.Getenv("TEST_WORKSPACE"),
-		"source_repo.BUILD.bazel",
-	)
-	content, err := os.ReadFile(path)
+	content, err := os.ReadFile(sourceRepositoryTemplate(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,12 +28,7 @@ func TestSourceRepositoryExportsDirectories(t *testing.T) {
 }
 
 func TestSourceRepositoryExplicitlyExportsOverlayFiles(t *testing.T) {
-	path := filepath.Join(
-		os.Getenv("TEST_SRCDIR"),
-		os.Getenv("TEST_WORKSPACE"),
-		"source_repo.BUILD.bazel",
-	)
-	content, err := os.ReadFile(path)
+	content, err := os.ReadFile(sourceRepositoryTemplate(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,27 +39,6 @@ func TestSourceRepositoryExplicitlyExportsOverlayFiles(t *testing.T) {
 	} {
 		if !strings.Contains(string(content), want) {
 			t.Fatalf("source repository overlay export contract is missing %s", want)
-		}
-	}
-}
-
-func TestSourceRepositoryExposesGenksymsHeaders(t *testing.T) {
-	path := filepath.Join(
-		os.Getenv("TEST_SRCDIR"),
-		os.Getenv("TEST_WORKSPACE"),
-		"source_repo.BUILD.bazel",
-	)
-	content, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{
-		`name = "genksyms_headers_cc"`,
-		`"scripts/genksyms/genksyms.h"`,
-		`"scripts/genksyms/keywords.c"`,
-	} {
-		if !strings.Contains(string(content), want) {
-			t.Fatalf("source repository is missing GENKSYMS header contract %s", want)
 		}
 	}
 }

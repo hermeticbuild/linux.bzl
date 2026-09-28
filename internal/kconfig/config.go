@@ -4,15 +4,16 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"maps"
 	"slices"
 	"strconv"
 	"strings"
 )
 
-// ParseConfig reads a Linux .config file into explicit CONFIG_* assignments.
-// Comments, including unset comments, are intentionally ignored; absent symbols
-// are resolved from their Kconfig defaults when a config is evaluated.
+// ParseConfig reads a Linux .config file into explicit CONFIG_* values.
+// Canonical unset comments are explicit n values; other comments are ignored.
+// This distinction is required when a resolved config is consumed again: an
+// omitted symbol follows its Kconfig default, while an unset symbol must remain
+// disabled.
 func ParseConfig(r io.Reader) (map[string]string, error) {
 	flags := map[string]string{}
 	scanner := bufio.NewScanner(r)
@@ -21,6 +22,12 @@ func ParseConfig(r io.Reader) (map[string]string, error) {
 		lineNo++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
+			continue
+		}
+		if key, ok := parseUnsetConfig(line); ok {
+			if err := setParsedConfig(flags, key, "n", lineNo); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if strings.HasPrefix(line, "#") {
@@ -43,6 +50,18 @@ func ParseConfig(r io.Reader) (map[string]string, error) {
 		return nil, err
 	}
 	return flags, nil
+}
+
+func parseUnsetConfig(line string) (string, bool) {
+	const (
+		prefix = "# "
+		suffix = " is not set"
+	)
+	if !strings.HasPrefix(line, prefix) || !strings.HasSuffix(line, suffix) {
+		return "", false
+	}
+	key := strings.TrimSuffix(strings.TrimPrefix(line, prefix), suffix)
+	return key, isConfigKey(key) && !strings.ContainsAny(key, " \t")
 }
 
 func setParsedConfig(flags map[string]string, key, value string, lineNo int) error {
@@ -77,10 +96,9 @@ func (t *Tree) definedSymbols() []*Symbol {
 // ResolvedConfig contains the raw imported .config values plus the effective
 // values after Kconfig dependency, select, and imply propagation.
 type ResolvedConfig struct {
-	Name      string            `json:"name"`
-	Raw       map[string]string `json:"raw"`
-	Effective map[string]string `json:"effective"`
-	Written   map[string]bool   `json:"written"`
+	Raw       map[string]string
+	Effective map[string]string
+	Written   map[string]bool
 }
 
 func (r *ResolvedConfig) Value(key string) string {
@@ -109,14 +127,13 @@ type ResolveConfigOptions struct {
 }
 
 // ResolveConfig computes effective Kconfig values for one imported .config.
-func (t *Tree) ResolveConfig(name string, raw map[string]string) (*ResolvedConfig, error) {
-	return t.ResolveConfigWithOptions(name, raw, ResolveConfigOptions{})
+func (t *Tree) ResolveConfig(raw map[string]string) (*ResolvedConfig, error) {
+	return t.ResolveConfigWithOptions(raw, ResolveConfigOptions{})
 }
 
 // ResolveConfigWithOptions computes effective Kconfig values for one imported
 // .config with explicit resolver semantics.
-func (t *Tree) ResolveConfigWithOptions(name string, raw map[string]string, opts ResolveConfigOptions) (*ResolvedConfig, error) {
-	raw = WithoutRustToolchainValues(raw)
+func (t *Tree) ResolveConfigWithOptions(raw map[string]string, opts ResolveConfigOptions) (*ResolvedConfig, error) {
 	resolver := &configResolver{
 		tree:        t,
 		rawFlags:    raw,
@@ -198,66 +215,10 @@ func (t *Tree) ResolveConfigWithOptions(name string, raw map[string]string, opts
 			changed = true
 		}
 		if !changed {
-			return resolver.result(name), nil
+			return resolver.result(), nil
 		}
 	}
 	return nil, fmt.Errorf("effective Kconfig values did not converge")
-}
-
-// IsRustToolchainValue reports hidden Kconfig values that must be derived from
-// the rustc selected by Bazel, never imported from a checked-in fragment.
-func IsRustToolchainValue(key string) bool {
-	switch key {
-	case "CONFIG_RUSTC_VERSION",
-		"CONFIG_RUSTC_LLVM_VERSION",
-		"CONFIG_RUSTC_VERSION_TEXT",
-		"CONFIG_RUST_IS_AVAILABLE",
-		"CONFIG_HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC":
-		return true
-	default:
-		return strings.HasPrefix(key, "CONFIG_RUSTC_HAS_")
-	}
-}
-
-// WithoutRustToolchainValues returns a copy with toolchain-owned values
-// removed. Kconfig then obtains them exclusively from the selected Rust facts.
-func WithoutRustToolchainValues(flags map[string]string) map[string]string {
-	filtered := make(map[string]string, len(flags))
-	for key, value := range flags {
-		if !IsRustToolchainValue(key) {
-			filtered[key] = value
-		}
-	}
-	return filtered
-}
-
-// ValidateRustToolchainEquivalence ensures action-time toolchain probing did
-// not change the repository-generated structural Kconfig snapshot. Dynamic
-// Rust toolchain symbols are intentionally ignored.
-func ValidateRustToolchainEquivalence(expected map[string]string, actual *ResolvedConfig) error {
-	expected = WithoutRustToolchainValues(expected)
-	var differences []string
-	for key, want := range expected {
-		if got := actual.Value(key); got != want {
-			differences = append(differences, fmt.Sprintf("%s=%s (generated %s)", key, got, want))
-		}
-	}
-	for key, got := range actual.Effective {
-		if IsRustToolchainValue(key) || !actual.ShouldWrite(key) || got == "" || got == `""` || got == "n" {
-			continue
-		}
-		if _, ok := expected[key]; !ok {
-			differences = append(differences, fmt.Sprintf("%s=%s (absent from generated snapshot)", key, got))
-		}
-	}
-	if len(differences) == 0 {
-		return nil
-	}
-	slices.Sort(differences)
-	if len(differences) > 20 {
-		differences = append(differences[:20], fmt.Sprintf("... and %d more", len(differences)-20))
-	}
-	return fmt.Errorf("selected Rust toolchain changes structural Kconfig values:\n  %s", strings.Join(differences, "\n  "))
 }
 
 type configResolver struct {
@@ -308,7 +269,7 @@ func (t *Tree) choiceSymbols() []*Symbol {
 	return choices
 }
 
-func (r *configResolver) result(name string) *ResolvedConfig {
+func (r *configResolver) result() *ResolvedConfig {
 	effective := map[string]string{}
 	written := map[string]bool{}
 	for _, sym := range r.tree.definedSymbols() {
@@ -323,7 +284,6 @@ func (r *configResolver) result(name string) *ResolvedConfig {
 		raw[key] = value
 	}
 	return &ResolvedConfig{
-		Name:      name,
 		Raw:       raw,
 		Effective: effective,
 		Written:   written,
@@ -341,15 +301,6 @@ func (r *configResolver) baseTri(sym *Symbol) triValue {
 		return triN
 	}
 	return r.defaultTri(sym)
-}
-
-func (r *configResolver) promptedSymbol(sym *Symbol) bool {
-	for _, menu := range sym.Menus {
-		if menu.Prompt != nil {
-			return true
-		}
-	}
-	return false
 }
 
 func (r *configResolver) visibleUserValue(sym *Symbol) bool {
@@ -978,8 +929,4 @@ func compareOrdered[T ordered](left, right T, op string) bool {
 	default:
 		return false
 	}
-}
-
-func sortedConfigKeys(values map[string]string) []string {
-	return slices.Sorted(maps.Keys(values))
 }

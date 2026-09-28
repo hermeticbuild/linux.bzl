@@ -1,0 +1,9 @@
+load("//internal/tests:linux_source_runfiles_test.bzl", "linux_source_runfiles_test")
+
+package(default_visibility = ["//visibility:private"])
+
+linux_source_runfiles_test(
+    name = "linux_source_runfiles_test",
+    source_files = ["include/input.h"],
+    source_root = "SOURCE_ROOT",
+)

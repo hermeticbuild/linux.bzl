@@ -871,7 +871,7 @@ type exprParser struct {
 
 func (p *parser) parseExpr(toks []token) (Expr, error) {
 	if len(toks) == 0 {
-		return nil, p.parseError(Position{}, "expected expression")
+		return nil, p.parseError(p.pp.current, "expected expression")
 	}
 	ep := &exprParser{parser: p, toks: toks}
 	expr, err := ep.parseOr()

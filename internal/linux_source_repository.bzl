@@ -1,10 +1,9 @@
 """Hermetic Linux source repository rule."""
 
+load(":module_make_vars.bzl", "validate_linux_module_make_vars")
 load(
     ":repository_utils.bzl",
-    "LINUX_SOURCE_REPOSITORY_PROTOCOL",
     "linux_makefile_version",
-    "repository_prefix",
 )
 
 visibility("//...")
@@ -32,6 +31,21 @@ _TOOLS_BUILD_FILE = "Build"
 _TOOLS_BUILD_FILE_RELOCATED = "Build.linux-bzl"
 _TOOLS_MAX_DEPTH = 64
 _SOURCE_OVERLAY_FILES_MARKER = "    # __LINUX_BZL_SOURCE_OVERLAY_FILES__"
+_MODULE_TARGET_NAME_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_-"
+_RESERVED_IMAGE_TARGETS = {
+    "config": True,
+    "image": True,
+    "kernel": True,
+    "kernel__mapped": True,
+    "kernel_release": True,
+    "module_symvers": True,
+    "modules": True,
+    "modules_builtin": True,
+    "modules_builtin_modinfo": True,
+    "modules_order": True,
+    "system_map": True,
+    "vmlinux": True,
+}
 
 def _in_tree_path(path, what):
     normalized = path.replace("\\", "/").strip("/")
@@ -44,8 +58,22 @@ def _in_tree_path(path, what):
             fail("%s must not escape or alias the Linux source root, got %r" % (what, path))
     return normalized
 
+def _source_overlay_package_marker_action(path, is_directory):
+    if is_directory:
+        return None
+    basename = path.rsplit("/", 1)[-1]
+    if basename in ["BUILD", "BUILD.bazel"]:
+        return "ignore"
+    if basename.lower() in ["build", "build.bazel"]:
+        return "reject"
+    return None
+
+# Test seam for the cross-filesystem package-boundary check performed while a
+# source overlay is still represented by ordinary repository paths.
+def linux_test_source_overlay_package_marker_action(path, is_directory = False):
+    return _source_overlay_package_marker_action(path, is_directory)
+
 def _stage_source_overlays(rctx):
-    destinations = []
     staged_files = []
     for destination in sorted(rctx.attr.source_overlays.keys()):
         normalized = _in_tree_path(destination, "source_overlays destination")
@@ -71,20 +99,24 @@ def _stage_source_overlays(rctx):
                     if child.is_dir:
                         pending.append((child, child_relative))
                     else:
+                        package_marker_action = _source_overlay_package_marker_action(child_relative, False)
+                        if package_marker_action == "ignore":
+                            continue
+                        if package_marker_action == "reject":
+                            fail(
+                                "source_overlays[%r] contains %r, whose file name case-folds to BUILD or BUILD.bazel but is not an exact Bazel package marker; rename it for deterministic behavior across case-sensitive and case-insensitive filesystems" %
+                                (destination, child_relative),
+                            )
                         files[child_relative] = child
         if pending:
             fail("source_overlays[%r] exceeds maximum directory depth %d" % (destination, _TOOLS_MAX_DEPTH))
         if not files:
-            fail("source_overlays[%r] identifies an empty source tree" % destination)
+            fail("source_overlays[%r] identifies an empty source tree after exact BUILD and BUILD.bazel metadata files are omitted" % destination)
         for relative in sorted(files.keys()):
             staged = normalized + "/" + relative
             rctx.symlink(files[relative], staged)
             staged_files.append(staged)
-        destinations.append(normalized)
-    return struct(
-        destinations = sorted(destinations),
-        files = sorted(staged_files),
-    )
+    return sorted(staged_files)
 
 def _module_kbuild_root_symbol(path):
     normalized = []
@@ -115,6 +147,28 @@ def _module_kbuild_roots(rctx):
             fail("module Kbuild root %r contains neither Kbuild nor Makefile" % path)
         roots[path] = expression
     return roots
+
+def _module_targets(rctx):
+    targets = {}
+    paths = {}
+    for name in sorted(rctx.attr.module_targets.keys()):
+        if not name or name[0] not in "abcdefghijklmnopqrstuvwxyz":
+            fail("module_targets key %r must start with a lowercase ASCII letter" % name)
+        for character in name.elems():
+            if character not in _MODULE_TARGET_NAME_CHARS:
+                fail("module_targets key %r contains unsupported character %r" % (name, character))
+        if name in _RESERVED_IMAGE_TARGETS:
+            fail("module_targets key %r conflicts with a standard Linux image target" % name)
+
+        path = _in_tree_path(rctx.attr.module_targets[name], "module_targets[%r]" % name)
+        if not path.endswith(".ko") or path.rsplit("/", 1)[-1] == ".ko":
+            fail("module_targets[%r] must name a canonical in-tree .ko output, got %r" % (name, path))
+        previous_name = paths.get(path)
+        if previous_name != None:
+            fail("module_targets keys %r and %r both expose %r" % (previous_name, name, path))
+        paths[path] = name
+        targets[name] = path
+    return targets
 
 def _integrate_in_tree_modules(rctx):
     kbuild_roots = _module_kbuild_roots(rctx)
@@ -216,6 +270,10 @@ def _normalize_tools_build_files(rctx):
     )
 
 def _linux_source_repository_impl(rctx):
+    validate_linux_module_make_vars(
+        rctx.attr.module_make_vars,
+        "linux_source_repository %s" % rctx.original_name,
+    )
     catalog = _KERNEL_RELEASES.get(rctx.attr.version)
     has_urls = len(rctx.attr.urls) != 0
     has_integrity = rctx.attr.integrity != ""
@@ -250,8 +308,9 @@ def _linux_source_repository_impl(rctx):
     for patch in rctx.attr.patches:
         rctx.patch(patch, strip = rctx.attr.patch_strip)
     _normalize_tools_build_files(rctx)
-    overlays = _stage_source_overlays(rctx)
+    overlay_files = _stage_source_overlays(rctx)
     _integrate_in_tree_modules(rctx)
+    module_targets = _module_targets(rctx)
 
     makefile = rctx.path("Makefile")
     kconfig = rctx.path("Kconfig")
@@ -268,30 +327,29 @@ def _linux_source_repository_impl(rctx):
         )
 
     source_build = rctx.read(rctx.attr._source_build_file)
-    source_build = source_build.replace(
-        "@rules_cc",
-        repository_prefix(rctx.attr._rules_cc_defs),
-    )
-    source_build = source_build.replace(
-        "@platforms",
-        repository_prefix(rctx.attr._platforms_x86_64),
-    )
     if _SOURCE_OVERLAY_FILES_MARKER not in source_build:
         fail("source repository BUILD template is missing the overlay files marker")
     source_build = source_build.replace(
         _SOURCE_OVERLAY_FILES_MARKER,
-        "\n".join(["    %r," % path for path in overlays.files]),
+        "\n".join(["    %r," % path for path in overlay_files]),
+    )
+    source_build = "load(%r, \"linux_source_runfiles\")\n\n%s" % (
+        str(rctx.attr._source_runfiles_bzl),
+        source_build,
     )
     rctx.file("BUILD.bazel", source_build, executable = False)
+
+    # Image repositories are deliberately thin: expose only immutable source
+    # metadata as Starlark constants so their generated BUILD files never need
+    # to inspect the source tree or execute a compiler during repository
+    # evaluation.
     rctx.file(
-        ".linux-bzl-source.json",
-        json.encode({
-            "integrity": integrity,
-            "module_make_vars": rctx.attr.module_make_vars,
-            "overlay_destinations": overlays.destinations,
-            "protocol": LINUX_SOURCE_REPOSITORY_PROTOCOL,
-            "version": actual_version,
-        }) + "\n",
+        "source_info.bzl",
+        "LINUX_SOURCE_VERSION = %r\nLINUX_MODULE_MAKE_VARS = %r\nLINUX_MODULE_TARGETS = %r\n" % (
+            actual_version,
+            rctx.attr.module_make_vars,
+            module_targets,
+        ),
         executable = False,
     )
     return rctx.repo_metadata(reproducible = True)
@@ -309,7 +367,10 @@ linux_source_repository = repository_rule(
             doc = "In-tree Kconfig files sourced by the kernel root Kconfig.",
         ),
         "module_make_vars": attr.string_dict(
-            doc = "Additional deterministic Make variables used while parsing overlaid Kconfig and Kbuild files.",
+            doc = "Additional deterministic Make variables used while parsing overlaid Kconfig and Kbuild files. M, LIBELF_FLAGS, LIBELF_LIBS, and RUST_LIB_SRC are backend-owned and rejected.",
+        ),
+        "module_targets": attr.string_dict(
+            doc = "Public generated-image target names mapped to canonical in-tree .ko output paths.",
         ),
         "patch_strip": attr.int(
             default = 1,
@@ -321,7 +382,7 @@ linux_source_repository = repository_rule(
         ),
         "source_overlays": attr.string_keyed_label_dict(
             allow_files = True,
-            doc = "Map from in-tree destination directories to marker files identifying source overlay roots.",
+            doc = "Map from in-tree destination directories to marker files identifying source overlay roots. Regular files named exactly BUILD or BUILD.bazel are Bazel metadata and are omitted; case-only variants are rejected for cross-filesystem determinism.",
         ),
         "strip_prefix": attr.string(
             doc = "Archive directory prefix to remove. Catalog entries provide a default.",
@@ -337,12 +398,9 @@ linux_source_repository = repository_rule(
             allow_single_file = True,
             default = Label("//:source_repo.BUILD.bazel"),
         ),
-        "_rules_cc_defs": attr.label(
+        "_source_runfiles_bzl": attr.label(
             allow_single_file = True,
-            default = Label("@rules_cc//cc:defs.bzl"),
-        ),
-        "_platforms_x86_64": attr.label(
-            default = Label("@platforms//cpu:x86_64"),
+            default = Label("//internal:linux_source_runfiles.bzl"),
         ),
     },
     doc = "Downloads an integrity-pinned, complete upstream Linux source tree.",

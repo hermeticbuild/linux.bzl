@@ -42,7 +42,7 @@ endmenu
 	}
 	crypto := tree.Symbols["CRYPTO"]
 	if crypto == nil || crypto.RevDep == nil {
-		t.Fatalf("CRYPTO rev_dep = %v, want select dependency", exprString(crypto.RevDep))
+		t.Fatalf("CRYPTO rev_dep = %v, want select dependency", parserTestExprString(crypto))
 	}
 	if got, want := tree.Root.Prompt.Text, "Example"; got != want {
 		t.Fatalf("root prompt = %q, want %q", got, want)
@@ -53,6 +53,13 @@ endmenu
 	if got := tree.Root.Children[0].Children; len(got) != 1 || got[0].Prompt.Text != "Networking" {
 		t.Fatalf("MODULES children = %#v, want Networking menu", got)
 	}
+}
+
+func parserTestExprString(symbol *Symbol) string {
+	if symbol == nil || symbol.RevDep == nil {
+		return ""
+	}
+	return symbol.RevDep.String()
 }
 
 func TestParseChoice(t *testing.T) {

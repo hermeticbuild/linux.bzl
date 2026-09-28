@@ -5,15 +5,70 @@ module(
 
 bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "gcc_toolchain", version = "0.12.0")
 bazel_dep(name = "linux.bzl", version = "0.0.1")
-bazel_dep(name = "llvm", version = "0.8.14", repo_name = "hermetic_llvm")
+bazel_dep(name = "llvm", version = "0.8.18", repo_name = "hermetic_llvm")
 bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
 bazel_dep(name = "rules_go", version = "0.62.0")
 bazel_dep(name = "rules_qemu", version = "0.3.0")
-bazel_dep(name = "rules_rs", version = "0.0.102")
+bazel_dep(name = "rules_rs", version = "0.0.107")
+
+single_version_override(
+    module_name = "gcc_toolchain",
+    patch_strip = 1,
+    patches = ["//patches:gcc_toolchain_remote_execution.patch"],
+    version = "0.12.0",
+)
+
+single_version_override(
+    module_name = "llvm",
+    patch_strip = 1,
+    patches = ["//patches:llvm_kbuild_actions.patch"],
+    version = "0.8.18",
+)
+
+single_version_override(
+    module_name = "libbpf",
+    patch_strip = 1,
+    patches = ["//patches:libbpf_old_uapi_compat.patch"],
+    version = "1.7.0",
+)
 
 register_toolchains(
+    "//:gcc_cc_toolchain_aarch64",
+    "//:gcc_cc_toolchain_armv7",
+    "//:gcc_cc_toolchain_x86_64",
     "@hermetic_llvm//toolchain:all",
+)
+
+e2e_gcc_toolchains = use_extension(
+    "@gcc_toolchain//toolchain:module_extensions.bzl",
+    "gcc_toolchains",
+)
+e2e_gcc_toolchains.toolchain(
+    name = "e2e_gcc_aarch64",
+    enable_fortran = False,
+    gcc_version = "15.2.0",
+    target_arch = "aarch64",
+)
+e2e_gcc_toolchains.toolchain(
+    name = "e2e_gcc_armv7",
+    enable_fortran = False,
+    gcc_version = "15.2.0",
+    target_arch = "armv7",
+)
+e2e_gcc_toolchains.toolchain(
+    name = "e2e_gcc_x86_64",
+    enable_fortran = False,
+    gcc_version = "15.2.0",
+    target_arch = "x86_64",
+)
+use_repo(
+    e2e_gcc_toolchains,
+    "e2e_gcc_aarch64",
+    "e2e_gcc_armv7",
+    "e2e_gcc_x86_64",
 )
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
@@ -25,7 +80,7 @@ rust_toolchains.toolchain(
 )
 use_repo(rust_toolchains, "default_rust_toolchains")
 
-register_toolchains("@default_rust_toolchains//:all")
+register_toolchains("@default_rust_toolchains//...")
 
 bindgen_toolchains = use_extension("@rules_rs//rs:rules_rust_bindgen.bzl", "rules_rust_bindgen")
 use_repo(bindgen_toolchains, "rules_rust_bindgen")
@@ -61,11 +116,18 @@ linux_source_repository = use_repo_rule(
 
 linux_source_repository(
     name = "e2e_linux_6_12_96",
+    module_targets = {
+        "test_module": "lib/test_module.ko",
+    },
     version = "6.12.96",
 )
 
 linux_source_repository(
     name = "e2e_linux_6_18_39",
+    module_targets = {
+        "cnic_module": "drivers/net/ethernet/broadcom/cnic.ko",
+        "test_module": "lib/test_module.ko",
+    },
     version = "6.18.39",
 )
 

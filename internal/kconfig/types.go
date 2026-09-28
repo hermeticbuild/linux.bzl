@@ -7,19 +7,23 @@ import (
 )
 
 type Options struct {
-	RootDir         string
-	SourceRoots     map[string]string
-	Variables       map[string]string
-	Env             map[string]string
-	UseHostEnv      bool
-	AllowShell      bool
-	Shell           func(context.Context, string) (string, error)
+	RootDir     string
+	SourceRoots map[string]string
+	Variables   map[string]string
+	Env         map[string]string
+	Shell       func(context.Context, string) (string, error)
+	// ResolveSymbolic resolves opaque values returned by Shell at semantic use
+	// sites. Discovery evaluators may return the values unchanged while they
+	// construct a probe DAG; replay evaluators replace them with exact action
+	// results. Shell command expansion intentionally happens before this hook so
+	// a later probe can retain dependencies on earlier symbolic results.
+	ResolveSymbolic func(string) (string, error)
 	MaxIncludeDepth int
 }
 
 type Position struct {
-	Filename string `json:"filename"`
-	Line     int    `json:"line"`
+	Filename string
+	Line     int
 }
 
 func (p Position) String() string {
@@ -30,8 +34,8 @@ func (p Position) String() string {
 }
 
 type Diagnostic struct {
-	Position Position `json:"position"`
-	Message  string   `json:"message"`
+	Position Position
+	Message  string
 }
 
 type SymbolType string
@@ -80,8 +84,8 @@ type Tree struct {
 }
 
 type Source struct {
-	From Position `json:"from"`
-	Path string   `json:"path"`
+	From Position
+	Path string
 }
 
 type Symbol struct {

@@ -1,0 +1,22 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "toolaction",
+    srcs = [
+        "contract.go",
+        "manifest.go",
+        "observed_output.go",
+    ],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/toolaction",
+    visibility = ["//internal:__subpackages__"],
+)
+
+go_test(
+    name = "toolaction_test",
+    srcs = [
+        "contract_test.go",
+        "manifest_test.go",
+        "observed_output_test.go",
+    ],
+    embed = [":toolaction"],
+)
