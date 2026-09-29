@@ -13,7 +13,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/bazelbuild/rules_go/go/runfiles"
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
@@ -69,8 +68,6 @@ func TestProbeHelperProcess(t *testing.T) {
 	case "version-stdout-first":
 		fmt.Fprintln(os.Stdout, "clang version 22.1.0")
 		fmt.Fprintln(os.Stderr, "wrapper warning")
-	case "hang":
-		time.Sleep(2 * time.Second)
 	case "dependency":
 		if got := strings.Join(args[1:], " "); got != "selected=true base" {
 			fmt.Fprintf(os.Stderr, "arguments=%q", got)
@@ -2097,43 +2094,32 @@ func TestRunProbePreservesExactActionEnvelope(t *testing.T) {
 	}
 }
 
-func TestRunProbeFailsOnOutputCapAndTimeout(t *testing.T) {
+func TestRunProbeFailsOnOutputCap(t *testing.T) {
 	executable, _ := os.Executable()
-	for _, test := range []struct {
-		name, mode, want string
-		timeout          time.Duration
-		limit            int
-	}{
-		{name: "output cap", mode: "flood", want: "output exceeded", limit: 8},
-		{name: "timeout", mode: "hang", want: "timed out", timeout: 10 * time.Millisecond},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			dir := t.TempDir()
-			request := kconfig.ProbeRequest{
-				Schema:  kconfig.LinuxProbeRequestSchema,
-				Steps:   []kconfig.ProbeStep{{Name: "step", Tool: "cc", Environment: map[string]string{"LINUX_BZL_PROBE_HELPER": "1"}}},
-				Outcome: kconfig.ProbeOutcome{Kind: "boolean", Predicate: &kconfig.ProbePredicate{Operator: "exit-zero", Step: "step"}},
-			}
-			requestID, _ := request.ID()
-			data, _ := request.CanonicalJSON()
-			requestPath := filepath.Join(dir, "request.json")
-			_ = os.WriteFile(requestPath, data, 0o600)
-			identity := "sha256-" + strings.Repeat("c", 64)
-			marker := filepath.Join(dir, identity)
-			_ = os.WriteFile(marker, nil, 0o600)
-			node := kconfig.ProbePlanNode{Scope: "target", RequestID: requestID}
-			node.ID = node.ContentID()
-			err := runTestProbe(t, probeOptions{
-				request: requestPath, result: filepath.Join(dir, "result.json"), nodeID: node.ID, requestID: requestID, scope: "target",
-				toolsetMarkers: map[string]string{"target": marker}, timeout: test.timeout, outputLimit: test.limit,
-				tools: map[string]actionContract{"cc": {
-					path: executable, arguments: []string{"-test.run=TestProbeHelperProcess", "--", test.mode, kconfig.LinuxKbuildArgsSentinel},
-				}},
-			})
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("runProbe() error = %v, want %q", err, test.want)
-			}
-		})
+	dir := t.TempDir()
+	request := kconfig.ProbeRequest{
+		Schema:  kconfig.LinuxProbeRequestSchema,
+		Steps:   []kconfig.ProbeStep{{Name: "step", Tool: "cc", Environment: map[string]string{"LINUX_BZL_PROBE_HELPER": "1"}}},
+		Outcome: kconfig.ProbeOutcome{Kind: "boolean", Predicate: &kconfig.ProbePredicate{Operator: "exit-zero", Step: "step"}},
+	}
+	requestID, _ := request.ID()
+	data, _ := request.CanonicalJSON()
+	requestPath := filepath.Join(dir, "request.json")
+	_ = os.WriteFile(requestPath, data, 0o600)
+	identity := "sha256-" + strings.Repeat("c", 64)
+	marker := filepath.Join(dir, identity)
+	_ = os.WriteFile(marker, nil, 0o600)
+	node := kconfig.ProbePlanNode{Scope: "target", RequestID: requestID}
+	node.ID = node.ContentID()
+	err := runTestProbe(t, probeOptions{
+		request: requestPath, result: filepath.Join(dir, "result.json"), nodeID: node.ID, requestID: requestID, scope: "target",
+		toolsetMarkers: map[string]string{"target": marker}, outputLimit: 8,
+		tools: map[string]actionContract{"cc": {
+			path: executable, arguments: []string{"-test.run=TestProbeHelperProcess", "--", "flood", kconfig.LinuxKbuildArgsSentinel},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "output exceeded") {
+		t.Fatalf("runProbe() error = %v, want output exceeded", err)
 	}
 }
 

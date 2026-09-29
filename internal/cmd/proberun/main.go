@@ -5,7 +5,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,17 +15,13 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 	"github.com/hermeticbuild/linux.bzl/internal/toolaction"
 	"github.com/hermeticbuild/linux.bzl/internal/toolsetpath"
 )
 
-const (
-	defaultProbeTimeout = 20 * time.Second
-	probeOutputLimit    = 64 << 10
-)
+const probeOutputLimit = 64 << 10
 
 var prohibitedProbeEnvironmentNames = map[string]bool{
 	// Process-loader and language-runtime hooks can execute request-owned code
@@ -110,7 +105,6 @@ type probeOptions struct {
 	sourceRootAnchors                         map[string]string
 	sourceRootWitnesses                       map[string]string
 	tempDir                                   string
-	timeout                                   time.Duration
 	outputLimit                               int
 }
 
@@ -670,9 +664,6 @@ func runProbe(opts probeOptions) error {
 	if actualNodeID := node.ContentID(); actualNodeID != opts.nodeID {
 		return fmt.Errorf("probe node content ID = %s, want %s", actualNodeID, opts.nodeID)
 	}
-	if opts.timeout <= 0 {
-		opts.timeout = defaultProbeTimeout
-	}
 	if opts.outputLimit <= 0 {
 		opts.outputLimit = probeOutputLimit
 	}
@@ -967,8 +958,7 @@ func runProbe(opts probeOptions) error {
 			}
 			environment[toolaction.RuntimeToolPathEnvironmentName] = runtimeToolDirectory
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
-		command := exec.CommandContext(ctx, executableContract.path, arguments...)
+		command := exec.Command(executableContract.path, arguments...)
 		command.Dir = workingDirectory
 		command.Env = environmentList(environment)
 		command.Stdin = strings.NewReader(stdin)
@@ -989,11 +979,6 @@ func runProbe(opts probeOptions) error {
 			}
 		}
 		runErr := command.Run()
-		contextErr := ctx.Err()
-		cancel()
-		if contextErr != nil {
-			return fmt.Errorf("step %s timed out or was cancelled: %w", step.Name, contextErr)
-		}
 		if stdout.exceeded || stderr.exceeded || combined != nil && combined.exceeded {
 			return fmt.Errorf("step %s output exceeded %d bytes per captured stream", step.Name, opts.outputLimit)
 		}
