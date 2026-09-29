@@ -154,7 +154,12 @@ func validateToolClass(
 		if symbol == selectedIdentity {
 			want = "y"
 		}
-		if got := config[symbol]; got != want {
+		got, present := config[symbol]
+		if !present {
+			// Native Kconfig omits disabled symbols without a prompt.
+			got = "n"
+		}
+		if got != want {
 			t.Errorf("%s = %q, want %q from %s probe identity %q", symbol, got, want, className, measurement.name)
 		}
 	}
