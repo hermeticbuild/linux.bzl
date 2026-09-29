@@ -3267,13 +3267,13 @@ func (b *compactKbuildRulePlanBuilder) buildCommandTemplate(
 		}
 	}
 	// Source recipe lines own independent immutable reads and exports. A
-	// selected line that only creates the already-declared output parent has
-	// no action result; prove its entire evaluated command before selecting a
+	// selected line that is inactive or only creates the declared output parent
+	// has no action result; prove its entire expansion before selecting a
 	// cmd/fixdep split, argv fallback, or compound script. Keep the source
 	// snapshots and original recipe indexes intact, and project only the
 	// remaining executable line into an action.
 	if compactKbuildRejectTargetWideLineReads(target, match, selectedSnapshots) != nil {
-		activeOccurrences, activeLine, proven, proofErr := compactKbuildSelectedOutputParentSetupOccurrences(
+		activeOccurrences, activeLine, proven, proofErr := compactKbuildSelectedActiveRecipeOccurrences(
 			target, match, rootedTemplates, selectionRecipeIndices, selectedSnapshots, automaticContext, injected,
 		)
 		if proofErr != nil {
@@ -8243,6 +8243,19 @@ func compactKbuildDirectRecipeTextWithCanonicalizer(
 	return compactKbuildRecipeExecutionText(canonicalize(profile, value))
 }
 
+// Only exact inert commands qualify; arguments, redirects, and compound shell
+// expressions need the ordinary execution and effects proof.
+func compactKbuildRecipeIsNoop(value string) bool {
+	for _, line := range strings.Split(value, "\n") {
+		switch strings.TrimSpace(line) {
+		case "", ":", "true":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // compactKbuildRecipeExecutionText removes GNU Make's recipe-control prefix
 // bytes from evaluated lines before they become shell source. @ and + control
 // Make itself and disappear; - changes command failure semantics, which the
@@ -8311,7 +8324,7 @@ func evaluatedKbuildDirectRecipeEffects(target string, match compactKbuildRuleMa
 		evaluated = compactKbuildDirectRecipeText(lineMatch.profile, evaluated)
 		for _, line := range strings.Split(evaluated, "\n") {
 			line = strings.TrimSpace(line)
-			if line == "" || line == ":" || line == "true" {
+			if compactKbuildRecipeIsNoop(line) {
 				continue
 			}
 			// A bare archiver in an invocation rooted at the source tree is
@@ -8669,12 +8682,11 @@ func (b *compactKbuildRulePlanBuilder) buildGenericDirectRecipe(
 		actualLines = append(actualLines, compactKbuildFinalizeRootedActionRecipeText(rooted))
 		actualLineIndices = append(actualLineIndices, index)
 	}
-	// An independently selected directory setup (or a Make conditional which
-	// proved pure and expanded to no command) has no action result. Prove that
-	// entire first line before attaching read inputs; the following writer
+	// Directory setup and inactive lines have no action result. Prove their
+	// complete expansion before attaching read inputs; the remaining writer
 	// must observe its own frozen file frontier and exported environment.
 	if compactKbuildRejectTargetWideLineReads(target, match, snapshots) != nil {
-		active, activeLine, proven, proofErr := compactKbuildSelectedOutputParentSetupOccurrences(
+		active, activeLine, proven, proofErr := compactKbuildSelectedActiveRecipeOccurrences(
 			target, match, rootedLines, actualLineIndices, snapshots, automatic, injected,
 		)
 		if proofErr != nil {
@@ -14953,15 +14965,7 @@ func evaluatedKbuildRuleCommandSelectionsForMakeTarget(
 	}
 	directExpansionIsControlOnly := func(value string) bool {
 		value = compactKbuildDirectRecipeText(profile, value)
-		allNoops := true
-		for _, line := range strings.Split(value, "\n") {
-			switch strings.TrimSpace(line) {
-			case "", ":", "true":
-			default:
-				allNoops = false
-			}
-		}
-		if allNoops {
+		if compactKbuildRecipeIsNoop(value) {
 			return true
 		}
 		commands, parseErr := parseCompactKbuildRecipe(value, compactKbuildAutomaticContext{
@@ -15725,11 +15729,10 @@ func compactKbuildRejectTargetWideLineReads(
 	return nil
 }
 
-// Return the remaining occurrence indexes only when every preceding source
-// line has been independently proved to create the already-declared output
-// parent. An unsupported line belongs to normal linear lowering or to the
-// caller's target-wide guard; it cannot justify dropping a selected frontier.
-func compactKbuildSelectedOutputParentSetupOccurrences(
+// Select one executable source line after proving that the other lines are
+// inert or only create its declared output parent. Keep unsupported lines for
+// normal linear lowering or the caller's target-wide frontier guard.
+func compactKbuildSelectedActiveRecipeOccurrences(
 	target string, match compactKbuildRuleMatch, templates []string, indexes []int,
 	snapshots map[int]*KbuildSelectedControlRecipeSnapshot,
 	automatic compactKbuildAutomaticContext, injected map[string]string,
@@ -15738,7 +15741,7 @@ func compactKbuildSelectedOutputParentSetupOccurrences(
 		len(indexes) == 0 || len(indexes) != len(templates) {
 		return nil, -1, false, nil
 	}
-	setupLines := map[int]bool{}
+	elidedLines := map[int]bool{}
 	activeLine := -1
 	activeOccurrences := []int{}
 	for occurrence, recipeIndex := range indexes {
@@ -15749,17 +15752,8 @@ func compactKbuildSelectedOutputParentSetupOccurrences(
 		if activeLine < 0 {
 			lineMatch := match
 			lineMatch.profile = snapshot.Evaluation.Profile
-			pure, err := compactKbuildSelectedRecipeSourceExpansionIsPure(
-				target, lineMatch, match.rule.Recipe[recipeIndex], automatic, injected,
-			)
-			if err != nil {
-				return nil, -1, false, fmt.Errorf("%s: Kbuild target %q recipe %d output-parent Make expansion: %w",
-					match.profile.Rules[match.ruleOrder].Position, target, recipeIndex, err)
-			}
-			if !pure {
-				return nil, -1, false, nil
-			}
 			setup := false
+			var err error
 			if compactKbuildRecipeExecutionText(templates[occurrence]) == "" {
 				setup = true
 			} else {
@@ -15772,23 +15766,62 @@ func compactKbuildSelectedOutputParentSetupOccurrences(
 					match.profile.Rules[match.ruleOrder].Position, target, recipeIndex, err)
 			}
 			if setup {
-				setupLines[recipeIndex] = true
+				pure, err := compactKbuildSelectedRecipeSourceExpansionIsPure(
+					target, lineMatch, match.rule.Recipe[recipeIndex], automatic, injected,
+				)
+				if err != nil {
+					return nil, -1, false, fmt.Errorf("%s: Kbuild target %q recipe %d setup Make expansion: %w",
+						match.profile.Rules[match.ruleOrder].Position, target, recipeIndex, err)
+				}
+				if !pure {
+					return nil, -1, false, nil
+				}
+				elidedLines[recipeIndex] = true
 				continue
 			}
 		}
-		if setupLines[recipeIndex] || activeLine >= 0 && activeLine != recipeIndex {
+		if elidedLines[recipeIndex] || activeLine >= 0 && activeLine != recipeIndex {
 			return nil, -1, false, nil
 		}
 		activeLine = recipeIndex
 		activeOccurrences = append(activeOccurrences, occurrence)
 	}
-	if len(setupLines) == 0 || activeLine < 0 {
+	if activeLine < 0 {
 		return nil, -1, false, nil
 	}
-	for recipeIndex := range snapshots {
-		if recipeIndex != activeLine && !setupLines[recipeIndex] {
+	for _, recipeIndex := range slices.Sorted(maps.Keys(snapshots)) {
+		if recipeIndex == activeLine || elidedLines[recipeIndex] {
+			continue
+		}
+		// Command selection omits inactive cmd calls, including Kbuild's
+		// force_checksrc, which expands to @:. Such a line needs no action,
+		// but an empty expansion must not conceal a Make filesystem effect.
+		lineMatch := match
+		lineMatch.profile = snapshots[recipeIndex].Evaluation.Profile
+		raw := match.rule.Recipe[recipeIndex]
+		pure, err := compactKbuildSelectedRecipeSourceExpansionIsPure(target, lineMatch, raw, automatic, injected)
+		if err != nil {
+			return nil, -1, false, fmt.Errorf("%s: Kbuild target %q recipe %d inactive Make expansion: %w",
+				match.profile.Rules[match.ruleOrder].Position, target, recipeIndex, err)
+		}
+		if !pure {
 			return nil, -1, false, nil
 		}
+		actual, err := evaluateCompactKbuildTextForMakeTarget(
+			lineMatch.profile, target, match.lookupTarget, automatic.target, automatic.stem,
+			automatic.normal, automatic.order, injected, raw, true,
+		)
+		if err != nil {
+			return nil, -1, false, fmt.Errorf("%s: Kbuild target %q recipe %d inactive command: %w",
+				match.profile.Rules[match.ruleOrder].Position, target, recipeIndex, err)
+		}
+		if !compactKbuildRecipeIsNoop(compactKbuildRecipeExecutionText(actual)) {
+			return nil, -1, false, nil
+		}
+		elidedLines[recipeIndex] = true
+	}
+	if len(elidedLines) == 0 {
+		return nil, -1, false, nil
 	}
 	return activeOccurrences, activeLine, true, nil
 }

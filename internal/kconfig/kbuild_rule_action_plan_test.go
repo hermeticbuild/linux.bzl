@@ -8355,9 +8355,12 @@ func TestKbuildSelectedOutputParentSetupKeepsCompilerSourceLineSnapshot(t *testi
 Q = $(if $(wildcard $(objtree)/tools/objtool/line.flag),after,before)
 cmd_mkdir = echo '  MKDIR     '$(objtree)/$(dir $@)' '$(Q); mkdir -p $(objtree)/$(dir $@)
 cmd_compile = printf '%s' $(Q) > $@
+cmd = @$(if $(cmd_$(1)),$(cmd_$(1)),:)
 tools/objtool/fixdep-in.o: FORCE
 	$(cmd_mkdir)
 	$(cmd_compile)
+	$(call cmd,force_checksrc)
+	@true
 `)
 	artifact := KbuildControlReadArtifact{
 		Tree: CompactKbuildInvocationObjectTree, Identity: "root/fixdep-in/line.flag",
@@ -8378,23 +8381,15 @@ tools/objtool/fixdep-in.o: FORCE
 		t.Fatal(err)
 	}
 	ruleIndex := selectedControlTestRuleIndex(t, profile, target)
-	for index, frontier := range []KbuildControlRecipeFrontier{before, after} {
+	for index, frontier := range []KbuildControlRecipeFrontier{before, after, after, after} {
 		line, err := stepper.BeforeRecipe(KbuildSelectedControlRecipeLine{
 			Target: target, RuleIndex: ruleIndex, RecipeIndex: index,
 		}, frontier)
 		if err != nil {
 			t.Fatal(err)
 		}
-		quality, err := EvaluateCompactKbuildText(line.Evaluation.Profile, target, "", nil, nil, nil, "$(Q)")
-		if err != nil {
+		if _, err := EvaluateCompactKbuildText(line.Evaluation.Profile, target, "", nil, nil, nil, profile.Rules[ruleIndex].Recipe[index]); err != nil {
 			t.Fatal(err)
-		}
-		want := "before"
-		if index == 1 {
-			want = "after"
-		}
-		if quality != want {
-			t.Fatalf("source recipe %d value = %q, want %q", index, quality, want)
 		}
 		if err := stepper.ApplyRecipe(line); err != nil {
 			t.Fatal(err)
@@ -8409,7 +8404,7 @@ tools/objtool/fixdep-in.o: FORCE
 		lookupTarget: target, explicit: true, resolved: true,
 	}
 	snapshots, err := compactKbuildSelectedRuleRecipeSnapshots(target, match)
-	if err != nil || len(snapshots) != 2 || snapshots[0].ReadIdentity() == snapshots[1].ReadIdentity() {
+	if err != nil || len(snapshots) != 4 || snapshots[0].ReadIdentity() == snapshots[1].ReadIdentity() || len(snapshots[2].Reads()) != 0 || len(snapshots[3].Reads()) != 0 {
 		t.Fatalf("source setup/compile immutable snapshots = %#v, error %v", snapshots, err)
 	}
 	context := compactKbuildAutomaticContext{target: target}
@@ -8426,17 +8421,17 @@ tools/objtool/fixdep-in.o: FORCE
 			t.Fatal(err)
 		}
 	}
-	remaining, line, proven, err := compactKbuildSelectedOutputParentSetupOccurrences(
+	remaining, line, proven, err := compactKbuildSelectedActiveRecipeOccurrences(
 		target, match, rooted, indexes, snapshots, context, nil,
 	)
 	if err != nil || !proven || line != 1 || !slices.Equal(remaining, []int{1}) ||
-		!slices.Equal(indexes, []int{0, 1}) || len(snapshots) != 2 ||
+		!slices.Equal(indexes, []int{0, 1}) || len(snapshots) != 4 ||
 		!strings.Contains(rooted[1], "after") || strings.Contains(rooted[1], "before") {
 		t.Fatalf("source setup projection = occurrence %#v, active line %d, proven %t, error %v; source indexes %#v, selected rooted lines %#v", remaining, line, proven, err, indexes, rooted)
 	}
 	unsafe := slices.Clone(rooted)
 	unsafe[0] += "; cat ${tree:prep}/other"
-	if _, _, proven, err := compactKbuildSelectedOutputParentSetupOccurrences(
+	if _, _, proven, err := compactKbuildSelectedActiveRecipeOccurrences(
 		target, match, unsafe, indexes, snapshots, context, nil,
 	); err != nil || proven {
 		t.Fatalf("source setup with extra read was elided: proven %t, error %v", proven, err)
@@ -8565,7 +8560,7 @@ tools/objtool/arch/x86/lib/inat-tables.c: $(inat_tables_script) $(inat_tables_ma
 	}
 }
 
-func TestSelectedKbuildSetupRejectsMakeExpansionEffects(t *testing.T) {
+func TestSelectedKbuildRecipeElisionRejectsEffects(t *testing.T) {
 	const target = "tools/objtool/arch/x86/lib/inat-tables.c"
 	for _, check := range []struct {
 		name, recipe, evaluated string
@@ -8573,6 +8568,7 @@ func TestSelectedKbuildSetupRejectsMakeExpansionEffects(t *testing.T) {
 		{"empty shell", "$(shell printf touched > $(objtree)/other)", ""},
 		{"mkdir hiding shell", "$(cmd_shell)", "mkdir -p __LINUX_BZL_OBJECT_TREE__/tools/objtool/arch/x86/lib/"},
 		{"mkdir hiding Make file write", "$(cmd_file)", "mkdir -p __LINUX_BZL_OBJECT_TREE__/tools/objtool/arch/x86/lib/"},
+		{"shell command", "printf touched > $(objtree)/other", "printf touched > __LINUX_BZL_OBJECT_TREE__/other"},
 	} {
 		t.Run(check.name, func(t *testing.T) {
 			profile, _, objectRoot := selectedControlTestProfile(t, `
@@ -8616,11 +8612,17 @@ tools/objtool/arch/x86/lib/inat-tables.c:
 			}
 			// GNU Make may write another file while forming a command that looks
 			// like mkdir, or may print no command at all. Check the source first.
-			if _, _, proven, err := compactKbuildSelectedOutputParentSetupOccurrences(
+			if _, _, proven, err := compactKbuildSelectedActiveRecipeOccurrences(
 				target, match, []string{check.evaluated, "printf data > " + target}, []int{0, 1}, snapshots,
 				compactKbuildAutomaticContext{target: target}, nil,
 			); err != nil || proven {
 				t.Fatalf("source Make effect was elided: proven %t, error %v", proven, err)
+			}
+			if _, _, proven, err := compactKbuildSelectedActiveRecipeOccurrences(
+				target, match, []string{"printf data > " + target}, []int{1}, snapshots,
+				compactKbuildAutomaticContext{target: target}, nil,
+			); err != nil || proven {
+				t.Fatalf("unselected source Make effect was elided: proven %t, error %v", proven, err)
 			}
 			if _, err := os.Stat(filepath.Join(objectRoot, "other")); !os.IsNotExist(err) {
 				t.Fatalf("setup proof executed hidden Make effect: %v", err)
