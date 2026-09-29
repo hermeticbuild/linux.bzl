@@ -141,6 +141,8 @@ type recipeOptions struct {
 	inputSetManifestRoot                                string
 	inputSetStoreAnchors                                map[string]string
 	inputSetStorePacks                                  []string
+	inputSetSourceAnchors                               map[string]string
+	inputSetSourcePacks                                 []string
 	sources, inputs, outputs, tools, trees              map[string]string
 	artifactTrees                                       map[string]string
 	privateInputTrees                                   map[string]bool
@@ -507,7 +509,8 @@ func validateActionPlanInputSetManifestGraph(root string, nodes map[string]kconf
 func loadActionPlanInputSet(opts recipeOptions) (resolvedActionPlanInputSet, error) {
 	configured := opts.inputSetRoot != "" || len(opts.inputSetManifests) != 0 ||
 		len(opts.inputSetSources) != 0 || len(opts.inputSetInputs) != 0 ||
-		opts.inputSetManifestRoot != "" || len(opts.inputSetStoreAnchors) != 0 || len(opts.inputSetStorePacks) != 0
+		opts.inputSetManifestRoot != "" || len(opts.inputSetStoreAnchors) != 0 || len(opts.inputSetStorePacks) != 0 ||
+		len(opts.inputSetSourceAnchors) != 0 || len(opts.inputSetSourcePacks) != 0
 	if !configured {
 		return resolvedActionPlanInputSet{}, nil
 	}
@@ -518,8 +521,9 @@ func loadActionPlanInputSet(opts recipeOptions) (resolvedActionPlanInputSet, err
 	if compact && (len(opts.inputSetManifests) != 0 || len(opts.inputSetInputs) != 0) {
 		return resolvedActionPlanInputSet{}, fmt.Errorf("compact input-set transport cannot include explicit manifests or producer bindings")
 	}
-	if !compact && (len(opts.inputSetStoreAnchors) != 0 || len(opts.inputSetStorePacks) != 0) {
-		return resolvedActionPlanInputSet{}, fmt.Errorf("input-set store anchors and packs require compact manifest root")
+	if !compact && (len(opts.inputSetStoreAnchors) != 0 || len(opts.inputSetStorePacks) != 0 ||
+		len(opts.inputSetSourceAnchors) != 0 || len(opts.inputSetSourcePacks) != 0) {
+		return resolvedActionPlanInputSet{}, fmt.Errorf("input-set anchors and packs require compact manifest root")
 	}
 	if !compact && len(opts.inputSetManifests) == 0 {
 		return resolvedActionPlanInputSet{}, fmt.Errorf("input-set root %q has no manifests", opts.inputSetRoot)
@@ -623,6 +627,10 @@ func loadActionPlanInputSet(opts recipeOptions) (resolvedActionPlanInputSet, err
 		)
 	}
 	if compact {
+		opts.inputSetSources, err = resolveCompactActionPlanInputSetSources(expectedSources, opts.inputSetSources, opts.inputSetSourceAnchors, opts.inputSetSourcePacks)
+		if err != nil {
+			return resolvedActionPlanInputSet{}, err
+		}
 		opts.inputSetInputs, err = resolveCompactActionPlanInputSetProducers(expectedInputs, opts.inputSetStoreAnchors, opts.inputSetStorePacks)
 		if err != nil {
 			return resolvedActionPlanInputSet{}, err
@@ -633,6 +641,8 @@ func loadActionPlanInputSet(opts recipeOptions) (resolvedActionPlanInputSet, err
 		for index := range entries {
 			if entries[index].entry.ProducerID != "" {
 				entries[index].input = opts.inputSetInputs[entries[index].provenance]
+			} else {
+				entries[index].input = opts.inputSetSources[entries[index].provenance]
 			}
 		}
 	}
@@ -2347,8 +2357,9 @@ func absolutizeWorkingRecipeOptions(opts *recipeOptions) error {
 		"source": opts.sources, "input": opts.inputs, "output": opts.outputs,
 		"tool": opts.tools, "runtime tool": opts.runtimeTools, "tree": opts.trees,
 		"input-set manifest": opts.inputSetManifests, "input-set source": opts.inputSetSources,
-		"input-set input":        opts.inputSetInputs,
-		"input-set store anchor": opts.inputSetStoreAnchors,
+		"input-set input":         opts.inputSetInputs,
+		"input-set store anchor":  opts.inputSetStoreAnchors,
+		"input-set source anchor": opts.inputSetSourceAnchors,
 	} {
 		for name, value := range values {
 			absolute, err := filepath.Abs(value)
@@ -3037,7 +3048,7 @@ func main() {
 	}
 	var sourceFlags, inputFlags, outputFlags, toolFlags, runtimeToolFlags, treeFlags, artifactTreeFlags, privateInputTreeFlags, actionArgs, actionEnvironment repeatedFlag
 	var inputSetManifestFlags, inputSetSourceFlags, inputSetInputFlags repeatedFlag
-	var inputSetStoreAnchorFlags, inputSetStorePackFlags compactInputSetFlags
+	var inputSetStoreAnchorFlags, inputSetStorePackFlags, inputSetSourceAnchorFlags, inputSetSourcePackFlags compactInputSetFlags
 	var auxiliaryActionRoles, auxiliaryActionArguments, auxiliaryActionEnvironment repeatedFlag
 	var toolsetIdentities, toolsetManifests, toolsetAnchors repeatedFlag
 	recipe := flag.String("recipe", "", "v4 action recipe JSON")
@@ -3072,6 +3083,8 @@ func main() {
 	flag.Var(&inputSetInputFlags, "input_set_input", "persistent input-set producer binding PRODUCER_ID:SLOT=PATH (repeatable)")
 	flag.Var(&inputSetStoreAnchorFlags, "input_set_store_anchor", "compact producer store anchor INDEX:PRODUCER_ID:SLOT=PATH (repeatable)")
 	flag.Var(&inputSetStorePackFlags, "input_set_store_pack", "compact producer store indices START:INDEX.INDEX... (repeatable)")
+	flag.Var(&inputSetSourceAnchorFlags, "input_set_source_anchor", "compact source root anchor INDEX:SOURCE_ID=PATH (repeatable)")
+	flag.Var(&inputSetSourcePackFlags, "input_set_source_pack", "compact source paths START:[[ROOT_INDEX,RELATIVE_PATH],...] (repeatable)")
 	flag.Var(&actionArgs, "action_arg", "configured tool action argument (repeatable)")
 	flag.Var(&actionEnvironment, "action_env", "configured tool action environment NAME=VALUE (repeatable)")
 	flag.Var(&auxiliaryActionRoles, "auxiliary_action_role", "auxiliary configured action role (repeatable)")
@@ -3151,6 +3164,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: input-set store anchors: %v\n", err)
 		os.Exit(2)
 	}
+	inputSetSourceAnchors, err := namedBindings(inputSetSourceAnchorFlags.values)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: input-set source anchors: %v\n", err)
+		os.Exit(2)
+	}
 	privateInputTrees := map[string]bool{}
 	for _, name := range privateInputTreeFlags {
 		if name == "" || strings.ContainsAny(name, "=/\\\x00\r\n\t ") {
@@ -3172,6 +3190,7 @@ func main() {
 		actionEnvironment: actionEnv, auxiliaryActionContracts: auxiliaryContracts, sources: *bindings[0].out, inputs: *bindings[1].out, outputs: *bindings[2].out, tools: *bindings[3].out, runtimeTools: runtimeTools, trees: *bindings[4].out, artifactTrees: artifactTrees, privateInputTrees: privateInputTrees,
 		inputSetManifests: inputSetManifests, inputSetSources: inputSetSources, inputSetInputs: inputSetInputs,
 		inputSetManifestRoot: inputSetManifestRoot.value, inputSetStoreAnchors: inputSetStoreAnchors, inputSetStorePacks: inputSetStorePackFlags.values,
+		inputSetSourceAnchors: inputSetSourceAnchors, inputSetSourcePacks: inputSetSourcePackFlags.values,
 		toolsetIdentities: toolsetIdentities, toolsetManifests: toolsetManifests, toolsetAnchors: toolsetAnchors}
 	if err := runRecipe(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "mapdirectoryrecipe: %v\n", err)

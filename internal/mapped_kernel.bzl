@@ -70,6 +70,7 @@ _MAX_PACKED_INPUT_FILENAME = 240
 _MAX_PACKED_INPUT_TUPLES = 64
 _MAX_INPUT_SET_DEPTH = 64
 _MAX_INPUT_SET_LEAF_ENTRIES = 16
+_MAX_SOURCE_BINDING_PACK_BYTES = 16 * 1024
 _MAX_PLAN_ORDINAL = 99999999
 _STAGES = ["prehost", "bootstrap", "host", "prep", "target"]
 _TREES = ["prehost", "bootstrap", "prep", "host", "objects", "sdk", "vmlinux", "image", "modules", "metadata"]
@@ -738,6 +739,70 @@ def _add_source_binding(args, flag, key, source, source_runfiles = None):
 def linux_test_add_source_binding(args, flag, key, source, source_runfiles = None):
     _add_source_binding(args, flag, key, source, source_runfiles)
 
+def _add_family_input_set_sources(args, artifacts, sources, source_runfiles, what):
+    """Sends source paths once, relative to typed, physically checked anchors.
+
+    The authenticated input-set closure supplies the sorted source IDs. Packs
+    cover only IDs without explicit bindings; renamed physical paths keep the
+    ordinary binding. No source input is replaced by its containing directory.
+    """
+    bindings = []
+    prefixes = {}
+    for source_id in sorted(artifacts):
+        source = sources.get(source_id)
+        if source == None or source.file != artifacts[source_id]:
+            fail("%s has inconsistent source provenance for binding %s" % (what, source_id))
+        _validate_path(source.path, "input-set source")
+        if source_runfiles != None and source.namespace == "kernel":
+            root = source_runfiles.executable.path + ".runfiles/kernel"
+        elif source.file.path.endswith("/" + source.path):
+            root = source.file.path[:-len(source.path) - 1]
+        else:
+            _add_source_binding(args, "-input_set_source", source_id, source, source_runfiles)
+            continue
+        directory = source.path.split("/")[:-1]
+        previous = prefixes.get(root, directory)
+        shared = 0
+        for left, right in zip(previous, directory):
+            if left != right:
+                break
+            shared += 1
+        prefixes[root] = previous[:shared]
+        bindings.append((source_id, source, root))
+
+    roots = {}
+    pack = []
+    pack_bytes = 0
+    start = 0
+    for source_id, source, root in bindings:
+        # The common directory is physical transport context, not staging
+        # metadata. Strip it only after every File's full suffix was checked.
+        prefix = "/".join(prefixes[root])
+        relative = source.path[len(prefix) + 1:] if prefix else source.path
+        index = roots.get(root, len(roots))
+        encoded = json.encode([str(index), relative])
+
+        # Bound individual flags as well as entry counts. Unusually long
+        # relative paths retain the existing bounded argument transport.
+        if len(encoded) > _MAX_SOURCE_BINDING_PACK_BYTES:
+            _add_source_binding(args, "-input_set_source", source_id, source, source_runfiles)
+            continue
+        if root not in roots:
+            roots[root] = index
+            _add_source_binding(args, "-input_set_source_anchor", "%d:%s" % (index, source_id), source, source_runfiles)
+        if pack and (len(pack) == 256 or pack_bytes + len(encoded) + 1 > _MAX_SOURCE_BINDING_PACK_BYTES):
+            args.add("-input_set_source_pack", _ordinal(start) + ":[" + ",".join(pack) + "]")
+            start += len(pack)
+            pack = []
+            pack_bytes = 0
+        pack.append(encoded)
+        pack_bytes += len(encoded) + 1
+    if pack:
+        args.add("-input_set_source_pack", _ordinal(start) + ":[" + ",".join(pack) + "]")
+
+def linux_test_add_family_input_set_sources(args, artifacts, sources, source_runfiles = None):
+    _add_family_input_set_sources(args, artifacts, sources, source_runfiles, "test plan")
+
 def _add_input_set_args(args, root, input_sets, bound, what, family = False, sources = None, source_runfiles = None):
     """Wires one set closure through the runner's bounded argument transport."""
     if root == None:
@@ -769,14 +834,16 @@ def _add_input_set_args(args, root, input_sets, bound, what, family = False, sou
     if family:
         _add_artifact_path(args, "-input_set_manifest_root", input_sets.nodes[root]["manifest"])
         _add_family_input_set_bindings(args, producer_artifacts, what)
-    for source_id in sorted(source_artifacts):
-        if source_runfiles != None:
-            source = sources.get(source_id) if sources != None else None
-            if source == None or source.file != source_artifacts[source_id]:
-                fail("%s has inconsistent source provenance for aggregate binding %s" % (what, source_id))
-            _add_source_binding(args, "-input_set_source", source_id, source, source_runfiles)
-        else:
-            _add_artifact_path(args, "-input_set_source", source_artifacts[source_id], format = source_id + "=%s")
+        _add_family_input_set_sources(args, source_artifacts, sources or {}, source_runfiles, what)
+    else:
+        for source_id in sorted(source_artifacts):
+            if source_runfiles != None:
+                source = sources.get(source_id) if sources != None else None
+                if source == None or source.file != source_artifacts[source_id]:
+                    fail("%s has inconsistent source provenance for aggregate binding %s" % (what, source_id))
+                _add_source_binding(args, "-input_set_source", source_id, source, source_runfiles)
+            else:
+                _add_artifact_path(args, "-input_set_source", source_artifacts[source_id], format = source_id + "=%s")
     if not family:
         for output_key in sorted(producer_artifacts):
             _add_artifact_path(args, "-input_set_input", producer_artifacts[output_key], format = output_key + "=%s")
@@ -1652,7 +1719,7 @@ def linux_test_parse_plan_marker_paths(paths, stage, source_paths = []):
     input_directories = {"plan": plan}
     if source_paths:
         input_directories["kernel"] = struct(children = [
-            struct(tree_relative_path = path)
+            struct(path = "test-sources/" + path, tree_relative_path = path)
             for path in source_paths
         ])
     return _parse_plan(

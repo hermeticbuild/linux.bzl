@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -11,7 +12,10 @@ import (
 	"github.com/hermeticbuild/linux.bzl/internal/kconfig"
 )
 
-const maxCompactInputSetPackEntries = 256
+const (
+	maxCompactInputSetPackEntries = 256
+	maxCompactSourcePackBytes     = 16 * 1024
+)
 
 // Compact flags are bounded even when invoked directly, without a parameter
 // file. Decoding below applies the same limits to programmatic callers.
@@ -214,6 +218,97 @@ func resolveCompactActionPlanInputSetProducers(expected map[string]bool, anchors
 		if !usedRoots[index] || !exists || assigned != index {
 			return nil, fmt.Errorf("compact input-set store anchor does not belong to its assigned index %d", index)
 		}
+	}
+	return bindings, nil
+}
+
+// Source IDs and their order come from the authenticated closure. The callback
+// still owns their physical File bindings, including aliases whose staging
+// targets differ from their source paths. Only their repeated physical prefixes
+// are omitted; each root is recovered from an existing typed leaf, and explicit
+// bindings retain source layouts that cannot use the canonical relative path.
+func resolveCompactActionPlanInputSetSources(expected map[string]bool, explicit, anchors map[string]string, packs []string) (map[string]string, error) {
+	if len(anchors) == 0 && len(packs) == 0 {
+		return explicit, nil
+	}
+	if len(expected) > maxActionPlanInputSetEntries || len(anchors) > len(expected) ||
+		len(anchors) > maxParameterFileArguments || len(packs) > maxParameterFileArguments {
+		return nil, fmt.Errorf("compact input-set source transport exceeds count limit")
+	}
+	keys := make([]string, 0, len(expected))
+	for key := range expected {
+		if _, exists := explicit[key]; !exists {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	type sourcePath struct {
+		root int
+		path string
+	}
+	paths := make(map[string]sourcePath, len(keys))
+	totalBytes := 0
+	for _, pack := range packs {
+		totalBytes += len(pack)
+		if len(pack) > maxCompactSourcePackBytes+11 || totalBytes > maxParameterFileBytes {
+			return nil, fmt.Errorf("compact input-set source pack exceeds transport limit")
+		}
+		startText, body, ok := strings.Cut(pack, ":")
+		start, err := compactInputSetDecimal(startText, 8)
+		if !ok || err != nil || start != len(paths) {
+			return nil, fmt.Errorf("compact input-set source packs must have exact contiguous offsets")
+		}
+		var entries [][]string
+		if err := json.Unmarshal([]byte(body), &entries); err != nil {
+			return nil, fmt.Errorf("decode compact input-set source pack: %w", err)
+		}
+		if len(entries) == 0 || len(entries) > maxCompactInputSetPackEntries || len(entries) > len(keys)-start {
+			return nil, fmt.Errorf("compact input-set source pack has invalid entry count")
+		}
+		for offset, entry := range entries {
+			if len(entry) != 2 {
+				return nil, fmt.Errorf("compact input-set source pack entry must contain a root index and relative path")
+			}
+			index, err := compactInputSetDecimal(entry[0], 0)
+			if err != nil || index >= len(anchors) {
+				return nil, fmt.Errorf("compact input-set source pack references unbound index %q", entry[0])
+			}
+			if err := validateRelativePath(entry[1]); err != nil || strings.ContainsRune(entry[1], 0) {
+				return nil, fmt.Errorf("invalid compact input-set source path %q", entry[1])
+			}
+			paths[keys[start+offset]] = sourcePath{root: index, path: entry[1]}
+		}
+	}
+	if len(paths) != len(keys) {
+		return nil, fmt.Errorf("compact input-set source packs cover %d sources, want %d", len(paths), len(keys))
+	}
+	roots := make([]string, len(anchors))
+	for name, filename := range anchors {
+		totalBytes += len(name) + len(filename)
+		if len(name)+len(filename) > maxParameterFileLineBytes || totalBytes > maxParameterFileBytes {
+			return nil, fmt.Errorf("compact input-set source anchor exceeds transport limit")
+		}
+		indexText, key, ok := strings.Cut(name, ":")
+		index, err := compactInputSetDecimal(indexText, 0)
+		if !ok || err != nil || index >= len(roots) || roots[index] != "" {
+			return nil, fmt.Errorf("invalid or repeated compact input-set source index %q", indexText)
+		}
+		path, exists := paths[key]
+		if !exists || path.root != index {
+			return nil, fmt.Errorf("compact input-set source anchor %q does not belong to its assigned index", key)
+		}
+		root, err := compactInputSetPhysicalRoot(filename, path.path)
+		if err != nil {
+			return nil, err
+		}
+		roots[index] = root
+	}
+	bindings := make(map[string]string, len(expected))
+	for key, filename := range explicit {
+		bindings[key] = filename
+	}
+	for key, path := range paths {
+		bindings[key] = filepath.Join(roots[path.root], filepath.FromSlash(path.path))
 	}
 	return bindings, nil
 }

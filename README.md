@@ -775,6 +775,8 @@ leaf inputs while transporting their bindings compactly. One typed root
 manifest locates its content-addressed child witnesses; one already-declared
 producer leaf per physical store anchors its provenance-addressed layout.
 Bounded ordinal packs assign the verified producer keys to those stores.
+Source bindings use the closure's sorted source IDs and bounded relative-path
+packs anchored by typed source leaves; physically renamed sources stay explicit.
 Staging destinations never locate artifacts, whole stores are not added as
 inputs, and Bazel still maps the typed anchors using the complete action input
 set. Distinct configured stores may remain distinct or legally converge under

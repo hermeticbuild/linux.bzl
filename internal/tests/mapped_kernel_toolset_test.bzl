@@ -8,6 +8,7 @@ load(
     "expand_linux_family_plan",
     "linux_map_directory_tools",
     "linux_test_add_family_input_set_bindings",
+    "linux_test_add_family_input_set_sources",
     "linux_test_add_input_set_args",
     "linux_test_add_source_binding",
     "linux_test_artifact_root_relative",
@@ -408,7 +409,8 @@ def _family_source_aggregate_cases(env):
             source = root + "/" + fixture.input_set_source_artifact.tree_relative_path
             asserts.equals(env, ["kernel=" + root], _flag_values(argv, "-input_tree"))
             asserts.equals(env, ["kernel-source:00000000=" + source], _flag_values(argv, "-source"))
-            asserts.equals(env, [fixture.input_set_source + "=" + source], _flag_values(argv, "-input_set_source"))
+            asserts.equals(env, ["0:" + fixture.input_set_source + "=" + source], _flag_values(argv, "-input_set_source_anchor"))
+            asserts.equals(env, [], _flag_values(argv, "-input_set_source"))
             asserts.equals(env, [], _flag_values(argv, "-private_input_tree"))
             asserts.false(env, "source-root" in inputs)
 
@@ -3061,7 +3063,7 @@ def _mapped_kernel_backend_test_impl(ctx):
         {set_producer + ":00000000": family_producer},
     )
     family_args = _fake_args([])
-    family_inputs = linux_test_add_input_set_args(family_args, set_root, family_sets, family_bound, family = True)
+    family_inputs = linux_test_add_input_set_args(family_args, set_root, family_sets, family_bound, family = True, sources = parsed_sets.sources)
     asserts.equals(env, family_bound[set_root].inputs, family_inputs)
     asserts.equals(env, 4, len(family_inputs.to_list()))
     asserts.equals(env, [family_sets.nodes[set_root]["manifest"]], _flag_values(family_args.values, "-input_set_manifest_root"))
@@ -3103,6 +3105,63 @@ def _mapped_kernel_backend_test_impl(ctx):
     linux_test_add_family_input_set_bindings(reversed_args, {key: packed_artifacts[key] for key in sorted(packed_artifacts, reverse = True)})
     asserts.equals(env, packed_args.values, reversed_args.values)
     asserts.equals(env, packed_args.typed_values, reversed_args.typed_values)
+
+    # Source packs omit IDs already authenticated by the input-set closure and
+    # preserve distinct physical roots. A case-renamed source stays explicit.
+    source_bindings = {}
+    source_files = {}
+    expected_source_paths = []
+    for index in range(257):
+        source_id = "src-" + ("00000000" + str(index))[-8:]
+        basename = "header-" + str(index) + ".h"
+        relative = "tree-" + str(index % 3) + "/include/" + basename
+        file = struct(path = store_prefixes[index % 3] + "/" + relative)
+        source_bindings[source_id] = struct(file = file, namespace = "kernel", path = relative)
+        source_files[source_id] = file
+        expected_source_paths.append([str(index % 3), basename])
+    renamed_file = struct(path = "external/linux/physical-case-rename.h")
+    source_bindings["src-renamed"] = struct(file = renamed_file, namespace = "kernel", path = "include/Case.h")
+    source_files["src-renamed"] = renamed_file
+    source_args = _fake_args([])
+    linux_test_add_family_input_set_sources(source_args, source_files, source_bindings)
+    source_packs = _flag_values(source_args.values, "-input_set_source_pack")
+    asserts.equals(env, 2, len(source_packs))
+    asserts.equals(env, "00000000", source_packs[0][:8])
+    asserts.equals(env, expected_source_paths[:256], json.decode(source_packs[0][9:]))
+    asserts.equals(env, "00000256", source_packs[1][:8])
+    asserts.equals(env, expected_source_paths[256:], json.decode(source_packs[1][9:]))
+    asserts.equals(env, 3, len(_flag_values(source_args.values, "-input_set_source_anchor")))
+    asserts.equals(env, 1, len(_flag_values(source_args.values, "-input_set_source")))
+    asserts.equals(env, 4, len(source_args.typed_values))
+    asserts.true(env, all([source_files["src-" + ("00000000" + str(index))[-8:]] in source_args.typed_values for index in range(3)]))
+    asserts.true(env, renamed_file in source_args.typed_values)
+
+    # Opaque source readers use the established runfiles aggregate's effective
+    # layout, even when original physical Files require case renaming.
+    runfiles = struct(executable = struct(path = "bazel-out/config/bin/source.anchor"))
+    opaque_args = _fake_args([])
+    linux_test_add_family_input_set_sources(opaque_args, source_files, source_bindings, source_runfiles = runfiles)
+    asserts.equals(env, 1, len(_flag_values(opaque_args.values, "-input_set_source_anchor")))
+    asserts.equals(env, [], _flag_values(opaque_args.values, "-input_set_source"))
+    asserts.equals(env, [runfiles.executable], opaque_args.typed_values)
+
+    # Byte limits also split packs before the count limit, and a single long
+    # entry retains the ordinary typed binding instead of overflowing a pack.
+    long_sources = {}
+    for index in range(6):
+        relative = "group-" + str(index) + "/" + ("directory/" * (1700 if index == 5 else 390)) + "header.h"
+        long_sources[str(index)] = struct(
+            file = struct(path = "external/linux/" + relative),
+            namespace = "kernel",
+            path = relative,
+        )
+    long_args = _fake_args([])
+    linux_test_add_family_input_set_sources(long_args, {key: source.file for key, source in long_sources.items()}, long_sources)
+    long_packs = _flag_values(long_args.values, "-input_set_source_pack")
+    asserts.equals(env, 2, len(long_packs))
+    asserts.true(env, all([len(pack) < 17 * 1024 for pack in long_packs]))
+    asserts.equals(env, 1, len(_flag_values(long_args.values, "-input_set_source")))
+    asserts.true(env, long_sources["5"].file in long_args.typed_values)
 
     # Segment expansion must not bind persistent sets used only by a future
     # segment. Their producer TreeFiles do not exist in this segment yet.

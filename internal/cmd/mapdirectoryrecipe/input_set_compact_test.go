@@ -56,14 +56,29 @@ func compactTransportFixture(t *testing.T, mapped bool) (recipeOptions, recipeOp
 	first := compactProducerFixture(t, firstStore, p, 0, "first\n")
 	second := compactProducerFixture(t, secondStore, q, 1, "second\n")
 	third := compactProducerFixture(t, secondStore, q, 2, "third\n")
-	source := filepath.Join(directory, "source")
+	source := filepath.Join(directory, "bazel-out", firstConfig, "bin/sources/source")
+	if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(source, []byte("source\n"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	secondSource := filepath.Join(directory, "bazel-out", secondConfig, "bin/sources/include/second.h")
+	renamedSource := filepath.Join(directory, "physical-case-rename.h")
+	if err := os.MkdirAll(filepath.Dir(secondSource), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, filename := range []string{secondSource, renamedSource} {
+		if err := os.WriteFile(filename, []byte(filename), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	entries := []kconfig.ActionPlanInputSetEntry{
 		{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "renamed/header"}, ProducerID: p, Slot: 0},
 		{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetAmbientTarget, Path: "other/second"}, ProducerID: q, Slot: 1},
 		{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetTreeTarget, Tree: "kernel", Path: "other/third"}, ProducerID: q, Slot: 2, CompilerUse: true, AuxiliaryUse: true},
+		{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "unrelated/second"}, SourceID: "src-00000002"},
+		{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "logical/Case.h"}, SourceID: "src-00000003"},
 	}
 	for index := 0; index < 37; index++ {
 		entries = append(entries, kconfig.ActionPlanInputSetEntry{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: fmt.Sprintf("source/%02d", index)}, SourceID: "src-00000001"})
@@ -71,13 +86,16 @@ func compactTransportFixture(t *testing.T, mapped bool) (recipeOptions, recipeOp
 	root, manifests := writeActionPlanInputSet(t, entries)
 	rootFile := compactManifestFixture(t, root, manifests, filepath.Join(directory, "bazel-out", firstConfig, "bin/family.plan"))
 	explicit := recipeOptions{inputSetRoot: root, inputSetManifests: manifests,
-		inputSetSources: map[string]string{"src-00000001": source},
+		inputSetSources: map[string]string{"src-00000001": source, "src-00000002": secondSource, "src-00000003": renamedSource},
 		inputSetInputs:  map[string]string{actionPlanInputSetProducerBinding(p, 0): first, actionPlanInputSetProducerBinding(q, 1): second, actionPlanInputSetProducerBinding(q, 2): third}}
 	compact := explicit
 	compact.inputSetManifests, compact.inputSetInputs = nil, nil
 	compact.inputSetManifestRoot = rootFile
 	compact.inputSetStoreAnchors = map[string]string{"0:" + actionPlanInputSetProducerBinding(p, 0): first, "1:" + actionPlanInputSetProducerBinding(q, 1): second}
 	compact.inputSetStorePacks = []string{"00000000:0.1", "00000002:1"}
+	compact.inputSetSources = map[string]string{"src-00000003": renamedSource}
+	compact.inputSetSourceAnchors = map[string]string{"0:src-00000001": source, "1:src-00000002": secondSource}
+	compact.inputSetSourcePacks = []string{`00000000:[["0","source"],["1","include/second.h"]]`}
 	return explicit, compact
 }
 
@@ -85,6 +103,8 @@ func cloneCompactOptions(opts recipeOptions) recipeOptions {
 	opts.inputSetSources = cloneStringMap(opts.inputSetSources)
 	opts.inputSetStoreAnchors = cloneStringMap(opts.inputSetStoreAnchors)
 	opts.inputSetStorePacks = append([]string(nil), opts.inputSetStorePacks...)
+	opts.inputSetSourceAnchors = cloneStringMap(opts.inputSetSourceAnchors)
+	opts.inputSetSourcePacks = append([]string(nil), opts.inputSetSourcePacks...)
 	return opts
 }
 
@@ -104,7 +124,7 @@ func TestCompactInputSetEquivalentExplicitAndMappedStores(t *testing.T) {
 				t.Fatal("compact transport changed resolved entries/provenance/targets")
 			}
 			// Input maps are caller-owned; import must not fill or rewrite them.
-			if compact.inputSetInputs != nil || compact.inputSetManifests != nil {
+			if compact.inputSetInputs != nil || compact.inputSetManifests != nil || len(compact.inputSetSources) != 1 {
 				t.Fatal("compact options mutated")
 			}
 		})
@@ -164,7 +184,26 @@ func TestCompactInputSetRejectsInvalidTransport(t *testing.T) {
 		"unused store":                        func(o *recipeOptions) { o.inputSetStorePacks = []string{"00000000:0.0.0"} },
 		"converged root anchor misassignment": func(o *recipeOptions) { o.inputSetStorePacks = []string{"00000000:1.0.1"} },
 		"missing source":                      func(o *recipeOptions) { o.inputSetSources = nil },
-		"extra source":                        func(o *recipeOptions) { o.inputSetSources["src-00000002"] = o.inputSetSources["src-00000001"] },
+		"extra source":                        func(o *recipeOptions) { o.inputSetSources["src-00000004"] = o.inputSetSources["src-00000003"] },
+		"source pack missing":                 func(o *recipeOptions) { o.inputSetSourcePacks = nil },
+		"source pack gap":                     func(o *recipeOptions) { o.inputSetSourcePacks[0] = `00000001:[["0","source"]]` },
+		"source pack traversal": func(o *recipeOptions) {
+			o.inputSetSourcePacks[0] = `00000000:[["0","../source"],["1","include/second.h"]]`
+		},
+		"source pack absolute": func(o *recipeOptions) {
+			o.inputSetSourcePacks[0] = `00000000:[["0","/source"],["1","include/second.h"]]`
+		},
+		"source pack invalid shape": func(o *recipeOptions) {
+			o.inputSetSourcePacks[0] = `00000000:[["0","source","extra"],["1","include/second.h"]]`
+		},
+		"source pack unbound root": func(o *recipeOptions) {
+			o.inputSetSourcePacks[0] = `00000000:[["2","source"],["1","include/second.h"]]`
+		},
+		"source anchor misassignment": func(o *recipeOptions) {
+			o.inputSetSourcePacks[0] = `00000000:[["1","source"],["0","include/second.h"]]`
+		},
+		"source anchor wrong suffix": func(o *recipeOptions) { o.inputSetSourceAnchors["0:src-00000001"] += ".extra" },
+		"source explicit overlap":    func(o *recipeOptions) { o.inputSetSources["src-00000001"] = o.inputSetSourceAnchors["0:src-00000001"] },
 	}
 	for name, change := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -316,14 +355,24 @@ func TestCompactInputSetCLIDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, negative := range []string{"", "repeated root", "duplicate anchor", "explicit override"} {
+	for _, negative := range []string{"", "repeated root", "duplicate anchor", "duplicate source anchor", "explicit override"} {
 		t.Run(negative, func(t *testing.T) {
 			directory := t.TempDir()
 			producer := strings.Repeat("c", 64)
 			input := compactProducerFixture(t, filepath.Join(directory, "bazel-out/cfg/bin/store"), producer, 3, "cli\n")
-			root, manifests := writeActionPlanInputSet(t, []kconfig.ActionPlanInputSetEntry{{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "renamed/input"}, ProducerID: producer, Slot: 3}})
+			source := filepath.Join(directory, "sources/nested/source")
+			if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(source, []byte("source cli\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			root, manifests := writeActionPlanInputSet(t, []kconfig.ActionPlanInputSetEntry{
+				{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "renamed/input"}, ProducerID: producer, Slot: 3},
+				{Target: kconfig.ActionPlanInputSetTarget{Kind: kconfig.ActionPlanInputSetWorkTarget, Path: "renamed/source"}, SourceID: "src-00000001"},
+			})
 			rootFile := compactManifestFixture(t, root, manifests, filepath.Join(directory, "bazel-out/cfg/bin/plan"))
-			recipe := kconfig.ActionRecipe{Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "helper", WorkingDirectory: "object", Arguments: []string{"renamed/input", "${output:00000000}"}, Outputs: []string{"00000000"}}
+			recipe := kconfig.ActionRecipe{Schema: kconfig.LinuxKernelPlanSchema, Kind: "generate", Tool: "helper", WorkingDirectory: "object", Arguments: []string{"renamed/source", "${output:00000000}"}, Outputs: []string{"00000000"}}
 			recipePath, recipeID := writeRecipe(t, recipe)
 			helper := filepath.Join(directory, "helper")
 			if err := os.WriteFile(helper, []byte("#!/bin/sh\nset -eu\nIFS= read -r line < \"$1\"\nprintf '%s\\n' \"$line\" > \"$2\"\n"), 0o755); err != nil {
@@ -333,12 +382,15 @@ func TestCompactInputSetCLIDispatch(t *testing.T) {
 				"-expected_node_id", strings.Repeat("d", 64), "-expected_recipe_id", recipeID,
 				"-working_directory_marker", "work/.linux-bzl-work-root", "-recipe_output", "00000000=out/result",
 				"-input_set_root", root, "-input_set_manifest_root", rootFile,
-				"-input_set_store_anchor", "0:" + actionPlanInputSetProducerBinding(producer, 3) + "=" + input, "-input_set_store_pack", "00000000:0"}
+				"-input_set_store_anchor", "0:" + actionPlanInputSetProducerBinding(producer, 3) + "=" + input, "-input_set_store_pack", "00000000:0",
+				"-input_set_source_anchor", "0:src-00000001=sources/nested/source", "-input_set_source_pack", `00000000:[["0","nested/source"]]`}
 			switch negative {
 			case "repeated root":
 				args = append(args, "-input_set_manifest_root", rootFile)
 			case "duplicate anchor":
 				args = append(args, "-input_set_store_anchor", "0:"+actionPlanInputSetProducerBinding(producer, 3)+"="+input)
+			case "duplicate source anchor":
+				args = append(args, "-input_set_source_anchor", "0:src-00000001=sources/nested/source")
 			case "explicit override":
 				args = append(args, "-input_set_input", actionPlanInputSetProducerBinding(producer, 3)+"="+input)
 			}
@@ -359,7 +411,7 @@ func TestCompactInputSetCLIDispatch(t *testing.T) {
 				t.Fatalf("CLI failed: %v\n%s", err, output)
 			}
 			data, err := os.ReadFile(filepath.Join(directory, "out/result"))
-			if err != nil || string(data) != "cli\n" {
+			if err != nil || string(data) != "source cli\n" {
 				t.Fatalf("CLI output %q: %v", data, err)
 			}
 		})
