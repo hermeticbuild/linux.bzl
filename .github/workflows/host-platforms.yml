@@ -18,14 +18,14 @@ jobs:
   examples:
     name: Standalone kernels (${{ matrix.host }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.host == 'Windows' && 180 || 120 }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - host: macOS
             runner: macos-latest
-            heap: 4g
+            heap: 6g
           - host: Windows
             runner: windows-latest
             heap: 6g
@@ -40,12 +40,16 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-${{ runner.os }}
+          disk-cache: false
           module-root: examples
           repository-cache: |
             - examples/.bazelversion
+            - examples/.bazelrc
             - examples/MODULE.bazel
             - examples/MODULE.bazel.lock
+            - patches/gcc_toolchain_remote_execution.patch
+            - patches/libbpf_old_uapi_compat.patch
+            - patches/llvm_kbuild_actions.patch
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Build Linux kernels
@@ -60,6 +64,8 @@ jobs:
           bazel --host_jvm_args=-Xmx${{ matrix.heap }} \
             --bazelrc="${GITHUB_WORKSPACE}/.github/workflows/ci.bazelrc" \
             build \
+            --noannounce_rc \
+            --disk_cache= \
             //:x86_64_kernel \
             //:x86_64_debug_kernel \
             //:x86_64_lz4_kernel \

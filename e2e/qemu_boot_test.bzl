@@ -23,8 +23,6 @@ def _runfile_path(ctx, file):
 def _qemu_boot_binary_impl(ctx):
     kernel = ctx.attr.kernel[LinuxKernelInfo]
     qemu = ctx.toolchains[_QEMU_TOOLCHAIN]
-    if kernel.arch != ctx.attr.arch:
-        fail("kernel architecture is {}, expected {}".format(kernel.arch, ctx.attr.arch))
     if qemu.target_arch != ctx.attr.arch:
         fail("QEMU toolchain architecture is {}, expected {}".format(qemu.target_arch, ctx.attr.arch))
 

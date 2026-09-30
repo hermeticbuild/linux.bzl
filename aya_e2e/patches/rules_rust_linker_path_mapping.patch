@@ -1,0 +1,294 @@
+diff --git a/rust/private/rustc.bzl b/rust/private/rustc.bzl
+--- a/rust/private/rustc.bzl
++++ b/rust/private/rustc.bzl
+@@ -44,6 +44,7 @@
+     "UnstableRustFeaturesInfo",
+     _BuildInfo = "BuildInfo",
+ )
++load(":rust_link_paths.bzl", "cc_link_argument_path", "cc_link_arguments_for_path_mapping")
+ load(":rustc_resource_set.bzl", "get_rustc_resource_set", "is_codegen_units_enabled")
+ load(":stamp.bzl", "is_stamping_enabled")
+ load(
+@@ -372,6 +373,13 @@
+     """
+     return ctx.fragments.cpp.linkopts
+ 
++def _cc_linker_files(cc_toolchain):
++    if not cc_toolchain:
++        return depset()
++    if hasattr(cc_toolchain, "_linker_files"):
++        return cc_toolchain._linker_files
++    return cc_toolchain.linker_files()
++
+ def get_linker_and_args(ctx, crate_type, toolchain, cc_toolchain, feature_configuration, rpaths, add_flags_for_binary = False):
+     """Gathers cc_common linker information
+ 
+@@ -760,12 +768,7 @@
+     # rules_rust is not coupled with Bazel release. Remove conditional and change to
+     # _linker_files once Starlark CcToolchainInfo is visible to Bazel.
+     # https://github.com/bazelbuild/rules_rust/issues/2425
+-    if not cc_toolchain:
+-        linker_depset = depset()
+-    elif hasattr(cc_toolchain, "_linker_files"):
+-        linker_depset = cc_toolchain._linker_files
+-    else:
+-        linker_depset = cc_toolchain.linker_files()
++    linker_depset = _cc_linker_files(cc_toolchain)
+     compilation_mode = ctx.var["COMPILATION_MODE"]
+ 
+     use_pic = should_use_pic(
+@@ -1368,6 +1371,8 @@
+     # If linker_type is not explicitly set, infer from which linker is actually being used
+     ld_is_direct_driver = False
+ 
++    link_args_support_path_mapping = True
++
+     # Link!
+     if ("link" in emit and crate_info.type not in ["rlib", "lib"]) or add_flags_for_binary:
+         # Rust's built-in linker can handle linking wasm files. We don't want to attempt to use the cc
+@@ -1417,11 +1422,31 @@
+                 if sdkroot != None:
+                     env["SDKROOT"] = sdkroot
+ 
+-            rustc_flags.add(ld, format = "--codegen=linker=%s")
++            # cc_common flattens File-valued toolchain paths outside Args path
++            # mapping. Restore only exact selected linker inputs before adding
++            # rustc's individual flags; do not guess a mapped output prefix.
++            linker_files = _cc_linker_files(cc_toolchain).to_list()
++            output_root = ctx.bin_dir.path.split("/", 1)[0]
++            mapped_link_args, link_args_support_path_mapping = cc_link_arguments_for_path_mapping(
++                [ld] + link_args,
++                linker_files,
++                output_root,
++            )
++            if any([output_root + "/" in value for value in link_env.values()]):
++                link_args_support_path_mapping = False
++            rustc_flags.add_all(
++                mapped_link_args[:1],
++                map_each = cc_link_argument_path,
++                format_each = "--codegen=linker=%s",
++            )
+ 
+-            # Split link args into individual "--codegen=link-arg=" flags to handle nested spaces.
+-            # Additional context: https://github.com/rust-lang/rust/pull/36574
+-            rustc_flags.add_all(link_args, format_each = "--codegen=link-arg=%s")
++            # Keep individual flags, including separated scalar operands and
++            # embedded spaces, in their original order and argument boundaries.
++            rustc_flags.add_all(
++                mapped_link_args[1:],
++                map_each = cc_link_argument_path,
++                format_each = "--codegen=link-arg=%s",
++            )
+ 
+             if remap_path_prefix != None and _should_add_oso_prefix(
+                 toolchain,
+@@ -1652,7 +1677,7 @@
+         rustc_path = rustc_path,
+         rustc_flags = rustc_flags,
+         extra_rustc_flags = rust_flags_args,
+-        supports_path_mapping = not target_has_location_expansion,
++        supports_path_mapping = not target_has_location_expansion and link_args_support_path_mapping,
+         all = all_args,
+     )
+ 
+diff --git a/rust/private/rust_link_paths.bzl b/rust/private/rust_link_paths.bzl
+new file mode 100644
+--- /dev/null
++++ b/rust/private/rust_link_paths.bzl
+@@ -0,0 +1,63 @@
++"""Restore declared C/C++ linker paths before Args path mapping."""
++
++_JOINED_PATH_FLAGS = [
++    "--sysroot=",
++    "--gcc-toolchain=",
++    "--ld-path=",
++    "-resource-dir=",
++    "-fuse-ld=",
++    "-L",
++    "-B",
++]
++
++def _path_fragment(value, files_by_path):
++    file = files_by_path.get(value)
++    if file:
++        return (file, "")
++
++    # A member of a declared TreeArtifact is still an input under that exact
++    # tree. Never infer siblings or parent directories from one ordinary file.
++    pieces = value.split("/")
++    if "." in pieces or ".." in pieces:
++        return None
++    for length in range(len(pieces) - 1, 0, -1):
++        prefix = "/".join(pieces[:length])
++        file = files_by_path.get(prefix)
++        if file and file.is_directory:
++            return (file, value[len(prefix):])
++    return None
++
++def cc_link_arguments_for_path_mapping(arguments, linker_files, output_root):
++    """Returns File-backed linker operands and whether path mapping is safe.
++
++    Only exact selected linker inputs (or declared tree members) are recognized.
++    Unrepresentable output-root strings retain the original argument and make
++    this Rust action opt out; other actions and suite path mapping are unchanged.
++    """
++    files_by_path = {file.path: file for file in linker_files}
++    mapped = []
++    safe = True
++    for argument in arguments:
++        fragment = _path_fragment(argument, files_by_path)
++        prefix = ""
++        if fragment == None:
++            for candidate in _JOINED_PATH_FLAGS:
++                if argument.startswith(candidate):
++                    fragment = _path_fragment(argument[len(candidate):], files_by_path)
++                    if fragment != None:
++                        prefix = candidate
++                        break
++        if fragment != None:
++            mapped.append((prefix, fragment[0], fragment[1]))
++        else:
++            mapped.append(argument)
++            if output_root and output_root + "/" in argument:
++                safe = False
++    return mapped, safe
++
++def cc_link_argument_path(argument):
++    """Renders one operand at Args expansion, with Bazel's mapped File.path."""
++    if type(argument) == "string":
++        return argument
++    prefix, file, suffix = argument
++    return prefix + file.path + suffix
+diff --git a/test/unit/linker_path_mapping/BUILD.bazel b/test/unit/linker_path_mapping/BUILD.bazel
+new file mode 100644
+--- /dev/null
++++ b/test/unit/linker_path_mapping/BUILD.bazel
+@@ -0,0 +1,8 @@
++load(":linker_path_mapping_test.bzl", "execution_test", "mapping_test", "unchanged_test", "unrepresented_test")
++
++package(default_visibility = ["//visibility:public"])
++
++mapping_test(name = "mapping_test")
++unrepresented_test(name = "unrepresented_test")
++unchanged_test(name = "unchanged_test")
++execution_test(name = "execution_test")
+diff --git a/test/unit/linker_path_mapping/linker_path_mapping_test.bzl b/test/unit/linker_path_mapping/linker_path_mapping_test.bzl
+new file mode 100644
+--- /dev/null
++++ b/test/unit/linker_path_mapping/linker_path_mapping_test.bzl
+@@ -0,0 +1,115 @@
++"""Regressions for C/C++ paths carried through Rust linker arguments."""
++
++load("@bazel_skylib//lib:unittest.bzl", "asserts", "unittest")
++
++# buildifier: disable=bzl-visibility
++load("//rust/private:rust_link_paths.bzl", "cc_link_argument_path", "cc_link_arguments_for_path_mapping")
++
++def _file(path, directory = False):
++    return struct(path = path, is_directory = directory)
++
++def _mapping_test_impl(ctx):
++    env = unittest.begin(ctx)
++    directory = _file("bazel-out/config/bin/runtime dir", True)
++    linker = _file("bazel-out/config/bin/linker")
++    original = [
++        linker.path,
++        "-L" + directory.path,
++        "-B" + directory.path,
++        "-resource-dir",
++        directory.path,
++        "--sysroot=" + directory.path,
++        directory.path + "/lib/subdir",
++        "--sysroot=/dev/null",
++        "-Wl,-z,relro,-z,now",
++        "-L/usr/lib",
++        "-L" + directory.path,
++    ]
++    arguments, safe = cc_link_arguments_for_path_mapping(original, [directory, linker], "bazel-out")
++    asserts.true(env, safe)
++    asserts.equals(env, original, [cc_link_argument_path(arg) for arg in arguments])
++
++    # Fake mapped Files test literal prefix/suffix reconstruction independently
++    # of the real execution test below. Source and ordering remain unchanged.
++    mapped = []
++    for arg in arguments:
++        if type(arg) == "string":
++            mapped.append(arg)
++        else:
++            prefix, file, suffix = arg
++            mapped.append(cc_link_argument_path((prefix, _file(file.path.replace("bazel-out/config/", "bazel-out/cfg/"), file.is_directory), suffix)))
++    asserts.equals(env, [arg.replace("bazel-out/config/", "bazel-out/cfg/") for arg in original], mapped)
++    return unittest.end(env)
++
++def _unrepresented_test_impl(ctx):
++    env = unittest.begin(ctx)
++    file = _file("bazel-out/config/bin/input")
++    directory = _file("bazel-out/config/bin/tree", True)
++    for argument in [
++        "-Lbazel-out/config/bin/input/sibling",
++        "-Lbazel-out/config/bin/tree-unrelated",
++        "-Lbazel-out/config/bin/tree/../sibling",
++        "-Lbazel-out/other/bin/missing",
++        "-Wl,--version-script=bazel-out/config/bin/input",
++        "-DNAME=bazel-out/config/bin/input",
++    ]:
++        actual, safe = cc_link_arguments_for_path_mapping([argument], [file, directory], "bazel-out")
++        asserts.false(env, safe)
++        asserts.equals(env, [argument], actual)
++    return unittest.end(env)
++
++def _unchanged_test_impl(ctx):
++    env = unittest.begin(ctx)
++    for original in [[], ["external/compiler/bin/cc", "-pthread", "-L/usr/lib", "-Wl,-rpath,$ORIGIN", "a value with spaces"]]:
++        actual, safe = cc_link_arguments_for_path_mapping(original, [], "bazel-out")
++        asserts.true(env, safe)
++        asserts.equals(env, original, actual)
++    return unittest.end(env)
++
++mapping_test = unittest.make(_mapping_test_impl)
++unrepresented_test = unittest.make(_unrepresented_test_impl)
++unchanged_test = unittest.make(_unchanged_test_impl)
++
++def _execution_test_impl(ctx):
++    directory = ctx.actions.declare_directory(ctx.label.name + ".runtime dir")
++    ctx.actions.run_shell(
++        outputs = [directory],
++        arguments = [directory.path],
++        command = "set -eu; printf input > \"$1/input\"",
++    )
++    output = ctx.actions.declare_file(ctx.label.name + ".checked")
++    arguments, safe = cc_link_arguments_for_path_mapping([
++        "-L" + directory.path,
++        "-B" + directory.path,
++        "-resource-dir",
++        directory.path,
++        "--sysroot=" + directory.path,
++        directory.path + "/input",
++    ], [directory], ctx.bin_dir.path.split("/", 1)[0])
++    if not safe:
++        fail("declared tree paths must remain mappable")
++    args = ctx.actions.args()
++    args.add_all([directory], expand_directories = False)
++    args.add(output)
++    args.add_all(arguments, map_each = cc_link_argument_path)
++    ctx.actions.run_shell(
++        inputs = [directory],
++        outputs = [output],
++        arguments = [args],
++        command = """set -eu
++test "$3" = "-L$1"
++test "$4" = "-B$1"
++test "$5" = "-resource-dir"
++test "$6" = "$1"
++test "$7" = "--sysroot=$1"
++test "$8" = "$1/input"
++test -f "$1/input"
++printf ok > "$2"
++""",
++        execution_requirements = {"supports-path-mapping": ""},
++    )
++    script = ctx.actions.declare_file(ctx.label.name + ".sh")
++    ctx.actions.write(script, "#!/bin/sh\nexit 0\n", is_executable = True)
++    return [DefaultInfo(executable = script, runfiles = ctx.runfiles(files = [output]))]
++
++execution_test = rule(implementation = _execution_test_impl, test = True)

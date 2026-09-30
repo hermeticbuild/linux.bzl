@@ -20,6 +20,7 @@ const (
 	configEnvironment   = "LINUX_BZL_QEMU_CONFIG"
 	serialCaptureLimit  = 1 << 20
 	serialTruncatedNote = "[... serial output truncated; showing last 1048576 bytes ...]\n"
+	returnThunkWarning  = "Unpatched return thunk in use. This should not happen!"
 )
 
 type bootConfig struct {
@@ -45,6 +46,9 @@ type markerWriter struct {
 	found      chan struct{}
 	once       sync.Once
 	capture    tailBuffer
+	// Failure is latched independently of the bounded diagnostic capture.
+	returnThunkTail []byte
+	returnThunkSeen bool
 }
 
 type tailBuffer struct {
@@ -70,6 +74,9 @@ func (w *markerWriter) Write(p []byte) (int, error) {
 	if n > 0 {
 		chunk := p[:n]
 		w.capture.Write(chunk)
+		if !w.returnThunkSeen {
+			w.returnThunkSeen = matchSerialPattern(chunk, []byte(returnThunkWarning), &w.returnThunkTail)
+		}
 		if w.match(chunk) {
 			w.matched = true
 			w.once.Do(func() { close(w.found) })
@@ -79,41 +86,47 @@ func (w *markerWriter) Write(p []byte) (int, error) {
 }
 
 func (w *markerWriter) match(chunk []byte) bool {
-	if bytes.Contains(chunk, w.marker) {
-		w.updateMarkerTail(chunk)
+	return matchSerialPattern(chunk, w.marker, &w.markerTail)
+}
+
+// Keep only enough bytes to match a pattern split across arbitrary writes.
+// This state must not depend on the tail buffer, which can discard warnings.
+func matchSerialPattern(chunk, pattern []byte, tail *[]byte) bool {
+	if bytes.Contains(chunk, pattern) {
+		updateSerialPatternTail(chunk, len(pattern), tail)
 		return true
 	}
 
-	tailLimit := len(w.marker) - 1
-	if len(w.markerTail) > 0 && tailLimit > 0 {
+	tailLimit := len(pattern) - 1
+	if len(*tail) > 0 && tailLimit > 0 {
 		prefixLength := min(len(chunk), tailLimit)
-		boundary := make([]byte, 0, len(w.markerTail)+prefixLength)
-		boundary = append(boundary, w.markerTail...)
+		boundary := make([]byte, 0, len(*tail)+prefixLength)
+		boundary = append(boundary, (*tail)...)
 		boundary = append(boundary, chunk[:prefixLength]...)
-		if bytes.Contains(boundary, w.marker) {
-			w.updateMarkerTail(chunk)
+		if bytes.Contains(boundary, pattern) {
+			updateSerialPatternTail(chunk, len(pattern), tail)
 			return true
 		}
 	}
 
-	w.updateMarkerTail(chunk)
+	updateSerialPatternTail(chunk, len(pattern), tail)
 	return false
 }
 
-func (w *markerWriter) updateMarkerTail(chunk []byte) {
-	tailLimit := len(w.marker) - 1
+func updateSerialPatternTail(chunk []byte, patternLength int, tail *[]byte) {
+	tailLimit := patternLength - 1
 	if tailLimit <= 0 {
-		w.markerTail = nil
+		*tail = nil
 		return
 	}
 	if len(chunk) >= tailLimit {
-		w.markerTail = append(w.markerTail[:0], chunk[len(chunk)-tailLimit:]...)
+		*tail = append((*tail)[:0], chunk[len(chunk)-tailLimit:]...)
 		return
 	}
-	w.markerTail = append(w.markerTail, chunk...)
-	if len(w.markerTail) > tailLimit {
-		copy(w.markerTail, w.markerTail[len(w.markerTail)-tailLimit:])
-		w.markerTail = w.markerTail[:tailLimit]
+	*tail = append(*tail, chunk...)
+	if len(*tail) > tailLimit {
+		copy(*tail, (*tail)[len(*tail)-tailLimit:])
+		*tail = (*tail)[:tailLimit]
 	}
 }
 
@@ -121,6 +134,18 @@ func (w *markerWriter) MarkerFound() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.matched
+}
+
+// Call after QEMU's writers have drained, including after stopping on a success
+// marker. A marker cannot override this exact guest diagnostic, even when the
+// warning arrived later in the same write or has left the capture tail.
+func (w *markerWriter) GuestError() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.returnThunkSeen {
+		return fmt.Errorf("QEMU guest reported %q\nserial output:\n%s", returnThunkWarning, w.capture.String())
+	}
+	return nil
 }
 
 func (w *markerWriter) String() string {
@@ -231,8 +256,11 @@ func run(args []string, output io.Writer) error {
 		if err := stopProcess(cmd, done); err != nil {
 			return fmt.Errorf("stop QEMU after marker: %w", err)
 		}
-		return nil
+		return serial.GuestError()
 	case err := <-done:
+		if guestErr := serial.GuestError(); guestErr != nil {
+			return guestErr
+		}
 		if serial.MarkerFound() {
 			return nil
 		}

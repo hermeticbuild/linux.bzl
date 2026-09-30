@@ -30,7 +30,8 @@ The BTF variant builds `vmlinux` with `CONFIG_DEBUG_INFO_BTF=y`. This consumer
 does not declare a direct `pahole` dependency; the build exercises the
 tool supplied transitively by `linux.bzl`.
 
-Kernel graph repositories also expose their fixed in-tree module outputs:
+Configured image repositories also expose fixed module metadata and a directory
+artifact containing the final in-tree modules:
 
 ```sh
 bazel build @example_x86_64//:modules
@@ -40,8 +41,8 @@ bazel build @example_x86_64//:modules_builtin
 bazel build @example_x86_64//:modules_builtin_modinfo
 ```
 
-The example configurations set `CONFIG_MODULES=n`, so the `:modules`
-projection is an empty file set; these commands exercise the fixed label
+The example configurations set `CONFIG_MODULES=n`, so the `:modules` directory
+artifact is empty; these commands exercise the fixed label
 contract rather than compiling a module. Module build and load coverage lives
 in `e2e`.
 

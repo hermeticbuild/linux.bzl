@@ -1,0 +1,139 @@
+{
+  "compilers": {
+    "clang": {
+      "shared_precise_compiles": {
+        "base/btf": 0,
+        "base/btf/debug": 0,
+        "base/btf/debug/lz4": 0,
+        "base/btf/lz4": 0,
+        "base/debug": 0,
+        "base/debug/lz4": 0,
+        "base/lz4": 4,
+        "btf/debug": 0,
+        "btf/debug/lz4": 0,
+        "btf/lz4": 0,
+        "debug/lz4": 0
+      },
+      "shared_typed_compiles": {
+        "base/btf": 0,
+        "base/btf/debug": 0,
+        "base/btf/debug/lz4": 0,
+        "base/btf/lz4": 0,
+        "base/debug": 0,
+        "base/debug/lz4": 0,
+        "base/lz4": 4,
+        "btf/debug": 0,
+        "btf/debug/lz4": 0,
+        "btf/lz4": 0,
+        "debug/lz4": 0
+      },
+      "unique_nodes": 8487,
+      "variants": {
+        "base": {
+          "nodes": 2116,
+          "precise_compile_nodes": 6,
+          "typed_compiler_nodes": 1240
+        },
+        "btf": {
+          "nodes": 2381,
+          "precise_compile_nodes": 6,
+          "typed_compiler_nodes": 1313
+        },
+        "debug": {
+          "nodes": 2146,
+          "precise_compile_nodes": 6,
+          "typed_compiler_nodes": 1269
+        },
+        "lz4": {
+          "nodes": 2117,
+          "precise_compile_nodes": 6,
+          "typed_compiler_nodes": 1240
+        }
+      }
+    },
+    "gcc": {
+      "shared_precise_compiles": {
+        "base/btf": 0,
+        "base/btf/debug": 0,
+        "base/btf/debug/lz4": 0,
+        "base/btf/lz4": 0,
+        "base/debug": 0,
+        "base/debug/lz4": 0,
+        "base/lz4": 23,
+        "btf/debug": 0,
+        "btf/debug/lz4": 0,
+        "btf/lz4": 0,
+        "debug/lz4": 0
+      },
+      "shared_typed_compiles": {
+        "base/btf": 0,
+        "base/btf/debug": 0,
+        "base/btf/debug/lz4": 0,
+        "base/btf/lz4": 0,
+        "base/debug": 0,
+        "base/debug/lz4": 0,
+        "base/lz4": 23,
+        "btf/debug": 0,
+        "btf/debug/lz4": 0,
+        "btf/lz4": 0,
+        "debug/lz4": 0
+      },
+      "unique_nodes": 8495,
+      "variants": {
+        "base": {
+          "nodes": 2119,
+          "precise_compile_nodes": 26,
+          "typed_compiler_nodes": 1240
+        },
+        "btf": {
+          "nodes": 2384,
+          "precise_compile_nodes": 26,
+          "typed_compiler_nodes": 1313
+        },
+        "debug": {
+          "nodes": 2149,
+          "precise_compile_nodes": 26,
+          "typed_compiler_nodes": 1269
+        },
+        "lz4": {
+          "nodes": 2120,
+          "precise_compile_nodes": 26,
+          "typed_compiler_nodes": 1240
+        }
+      }
+    }
+  },
+  "measured_bazel_versions": [
+    "9.1.0",
+    "9.2.0"
+  ],
+  "measured_toolsets": {
+    "clang": {
+      "9.1.0": {
+        "host": "sha256-70a27a25cd102684d74d5da947bc57ffeb63f2fca093a422062152618ab189cc",
+        "target": "sha256-7341c3ea9f91803e01b36f54bb266f9e9a60507b7125953e257f09617deedb71"
+      },
+      "9.2.0": {
+        "host": "sha256-70a27a25cd102684d74d5da947bc57ffeb63f2fca093a422062152618ab189cc",
+        "target": "sha256-7341c3ea9f91803e01b36f54bb266f9e9a60507b7125953e257f09617deedb71"
+      }
+    },
+    "gcc": {
+      "9.1.0": {
+        "host": "sha256-996cdde61ed0575aee5a7ae58724991591142109f201f04fa8f1f48640e6a562",
+        "target": "sha256-56f0482519bd91abe99d36bfbc10738683d40565e93728fdf83c9489d2a212cf"
+      },
+      "9.2.0": {
+        "host": "sha256-996cdde61ed0575aee5a7ae58724991591142109f201f04fa8f1f48640e6a562",
+        "target": "sha256-56f0482519bd91abe99d36bfbc10738683d40565e93728fdf83c9489d2a212cf"
+      }
+    }
+  },
+  "measurement_status": "measured",
+  "schema": "linux-kernel-family-reuse-baseline-v1",
+  "tolerances": {
+    "reuse_rate_drop_basis_points": 5,
+    "work_count_absolute_nodes": 2,
+    "work_count_basis_points": 25
+  }
+}

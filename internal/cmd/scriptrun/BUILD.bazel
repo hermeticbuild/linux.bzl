@@ -1,0 +1,34 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "scriptrun_lib",
+    srcs = [
+        "main.go",
+        "static_source_assignments.go",
+    ],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/scriptrun",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//internal/toolaction",
+        "//internal/toolsetpath",
+    ],
+)
+
+go_binary(
+    name = "scriptrun",
+    embed = [":scriptrun_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "scriptrun_test",
+    srcs = ["main_test.go"],
+    data = ["//internal:lz4c"],
+    embed = [":scriptrun_lib"],
+    env = {"LINUX_BZL_TEST_LZ4C": "$(rlocationpath //internal:lz4c)"},
+    deps = [
+        "//internal/toolaction",
+        "//internal/toolsetpath",
+        "@rules_go//go/runfiles",
+    ],
+)

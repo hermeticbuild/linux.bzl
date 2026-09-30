@@ -1,10 +1,10 @@
 # linux.bzl e2e
 
 This is a standalone Bzlmod workspace for exercising `linux.bzl` against the
-catalog-backed Linux 6.12.96 and 6.18.39 source archives and
-repository-generated x86_64 and aarch64 kernel graphs. It uses the canonical
+catalog-backed Linux 6.12.96 and 6.18.39 source archives and action-time
+x86_64, aarch64, and armv7 kernel plans. It uses the canonical
 `@linux.bzl` API entry point while retaining a renamed LLVM repository to cover
-Bzlmod repository mappings across generated BUILD files.
+Bzlmod repository mappings across the execution-time mapped action graph.
 
 Build the real `:kernel`, `:image`, `:vmlinux`, `:config`, `:system_map`, and
 `:kernel_release` outputs one architecture at a time:
@@ -16,7 +16,7 @@ bazel test //:kernel_outputs_aarch64_build_test
 ```
 
 Build and boot the catalog releases under TCG in bounded batches. Each
-`bazel shutdown` keeps the next configured kernel graph out of the previous
+`bazel shutdown` keeps the next configured kernel out of the previous
 server's analysis memory:
 
 ```sh
@@ -70,9 +70,9 @@ minimum of Rust 1.78.0 when the selected compiler is probed.
 `linux.bzl` consumes the selected compiler and the matching `rustc_srcs` from
 the resolved Rust-analyzer toolchain; it does not register a production Rust
 toolchain itself. Rust-for-Linux actions require a Linux x86_64 executor even
-when the kernel target is aarch64. They intentionally fail for unsupported
-debug/instrumentation paths or module sources that emit `MODULE_VERSION`,
-`version=`, or `srcversion=` metadata.
+when the kernel target is aarch64. The fixtures exercise the same native
+Kbuild-derived probe and action graph used by the configured kernel; there is
+no separate checked-in Rust module flag or metadata table.
 
 Build one fixed output directly:
 

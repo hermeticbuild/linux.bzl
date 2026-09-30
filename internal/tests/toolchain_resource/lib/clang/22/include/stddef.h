@@ -1,0 +1,1 @@
+/* Source artifact used to prove a configured toolchain resource directory. */

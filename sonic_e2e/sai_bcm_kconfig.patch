@@ -1,0 +1,13 @@
+diff --git a/platform/broadcom/saibcm-modules/sdklt/linux/bde/Kconfig b/platform/broadcom/saibcm-modules/sdklt/linux/bde/Kconfig
+new file mode 100644
+--- /dev/null
++++ b/platform/broadcom/saibcm-modules/sdklt/linux/bde/Kconfig
+@@ -0,0 +1,8 @@
++config LINUX_NGBDE
++	tristate "Broadcom SDKLT next-generation BDE"
++	depends on X86 && PCI
++	help
++	  Build the Broadcom SDKLT next-generation board device driver as
++	  an in-tree kernel module. The driver is available only on x86
++	  systems with PCI support.
++

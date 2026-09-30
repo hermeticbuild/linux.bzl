@@ -57,6 +57,10 @@ func tokenize(stmt string, pos Position, pp *preprocessor) ([]token, error) {
 			if err != nil {
 				return nil, err
 			}
+			value, err = pp.resolveSymbolic(value)
+			if err != nil {
+				return nil, err
+			}
 			toks = append(toks, token{value: value, quoted: true, pos: pos})
 			i = next
 			continue
@@ -75,6 +79,10 @@ func tokenize(stmt string, pos Position, pp *preprocessor) ([]token, error) {
 			continue
 		}
 		word, err = pp.expandString(word, nil)
+		if err != nil {
+			return nil, err
+		}
+		word, err = pp.resolveSymbolic(word)
 		if err != nil {
 			return nil, err
 		}

@@ -1,0 +1,195 @@
+diff --git a/toolchain/cc_toolchain_config.bzl b/toolchain/cc_toolchain_config.bzl
+--- a/toolchain/cc_toolchain_config.bzl
++++ b/toolchain/cc_toolchain_config.bzl
+@@ -106,6 +106,45 @@ def _impl(ctx):
+ 
+     action_configs = []
+ 
++    kbuild_tools = {
++        "ar": "ar",
++        "as": "as",
++        "cc": "gcc",
++        "cxx": "g++",
++        "ld": "ld",
++        "nm": "nm",
++        "objcopy": "objcopy",
++        "objdump": "objdump",
++        "ranlib": "ranlib",
++        "readelf": "readelf",
++        "strip": "strip",
++    }
++    kbuild_actions = []
++    for kbuild_scope in ["host", "target"]:
++        for kbuild_role, kbuild_tool in kbuild_tools.items():
++            kbuild_action = "linux-kbuild-{}-{}".format(kbuild_scope, kbuild_role)
++            kbuild_actions.append(kbuild_action)
++            action_configs.append(action_config(
++                action_name = kbuild_action,
++                enabled = True,
++                tools = [tool(path = tool_paths.get(kbuild_tool))],
++            ))
++    kbuild_args_feature = feature(
++        name = "linux_kbuild_args",
++        enabled = True,
++        flag_sets = [flag_set(
++            actions = kbuild_actions,
++            flag_groups = [flag_group(flags = ["__LINUX_BZL_KBUILD_ARGS_V1__"])],
++        )],
++    )
++
++    for link_action in base_link_actions:
++        action_configs.append(action_config(
++            action_name = link_action,
++            enabled = True,
++            tools = [tool(path = tool_paths.get("g++"))],
++        ))
++
+     action_configs.append(action_config(
+         action_name = "objcopy_embed_data",
+         enabled = True,
+@@ -552,6 +591,7 @@ def _impl(ctx):
+ 
+     features = fortran_extend(
+         [
++            kbuild_args_feature,
+             default_compile_flags_feature,
+             include_paths_feature,
+             library_search_directories_feature,
+diff --git a/toolchain/wrapper.sh.tpl b/toolchain/wrapper.sh.tpl
+--- a/toolchain/wrapper.sh.tpl
++++ b/toolchain/wrapper.sh.tpl
+@@ -19,11 +19,8 @@
+ 
+ set -o errexit -o nounset -o pipefail
+ 
+-# Getting the execroot by navigating to a relative directory from the resolved
+-# symlinks of the BASH_SOURCE[0] is more reliable than navigating to the
+-# execroot from $PWD. This is due to the fact that the Bazel C++ toolchain can
+-# be called from different working directories (e.g. rules_foreign_cc rules).
+-EXECROOT="${EXECROOT:-"$(realpath "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/../../..")"}"
++# Resolve the wrapper with Bash builtins; remote actions need no host coreutils.
++EXECROOT="${EXECROOT:-"$(cd -P -- "${BASH_SOURCE[0]%/*}/../../.." && pwd -P)"}"
+ export EXECROOT
+ export PATH="__PATH__"
+ args=("$@")
+diff --git a/toolchain/defs.bzl b/toolchain/defs.bzl
+--- a/toolchain/defs.bzl
++++ b/toolchain/defs.bzl
+@@ -965,6 +965,12 @@
+         ":coverage_files",
+         ":dwp_files",
+         ":linker_files",
++        ":nm_files",
++        ":objdump_files",
+         ":objcopy_files",
++        ":ranlib",
++        ":readelf",
++        "xbin/ranlib",
++        "xbin/readelf",
+         ":strip_files",
+     ],
+@@ -998,7 +1000,10 @@
+         ":ld",
+         ":ld.bfd",
+         "xbin/ld",
+-    ],
++    ] + glob([
++        "{include_prefix}bin/ld",
++        "{include_prefix}lib/ldscripts/**",
++    ], allow_empty = True),
+     visibility = ["//visibility:public"],
+ )
+
+@@ -1031,6 +1040,7 @@ filegroup(
+         # C includes
+         "lib/gcc/{include_prefix}*/include/**",
+         "lib/gcc/{include_prefix}*/include-fixed/**",
++        "lib/gcc/{include_prefix}*/plugin/include/**",
+         "{include_prefix}include/**",
+         "sysroot/usr/include/**",
+
+diff --git a/toolchain/defs.bzl b/toolchain/defs.bzl
+--- a/toolchain/defs.bzl
++++ b/toolchain/defs.bzl
+@@ -684,7 +685,15 @@ def _render_tool_paths(rctx, path_prefix, binary_prefix):
+         "objdump": "{path_prefix}/bin/{binary_prefix}objdump".format(
+             path_prefix = path_prefix,
+             binary_prefix = binary_prefix,
+         ),
++        "ranlib": "{path_prefix}/bin/{binary_prefix}ranlib".format(
++            path_prefix = path_prefix,
++            binary_prefix = binary_prefix,
++        ),
++        "readelf": "{path_prefix}/bin/{binary_prefix}readelf".format(
++            path_prefix = path_prefix,
++            binary_prefix = binary_prefix,
++        ),
+         "strip": "{path_prefix}/bin/{binary_prefix}strip".format(
+             path_prefix = path_prefix,
+             binary_prefix = binary_prefix,
+@@ -1050,6 +1055,7 @@
+         "bin/{binary_prefix}cpp",
+         "bin/{binary_prefix}g++",
+         "bin/{binary_prefix}gcc",
++        "bin/{binary_prefix}c++",
+ {fortran_bin_gfortran}
+         "xbin/cpp",
+         "xbin/g++",
+@@ -1078,7 +1084,7 @@
+     srcs = [
+         ":ar",
+         "xbin/ar",
+-    ],
++    ] + glob(["{include_prefix}bin/ar"], allow_empty = True),
+     visibility = ["//visibility:public"],
+ )
+
+@@ -1089,7 +1095,7 @@
+         "xbin/as",
+         ":gcc",
+         "xbin/gcc",
+-    ],
++    ] + glob(["{include_prefix}bin/as"], allow_empty = True),
+     visibility = ["//visibility:public"],
+ )
+ 
+@@ -1100,11 +1106,29 @@
+ )
+ 
+ filegroup(
++    name = "nm_files",
++    srcs = [
++        ":nm",
++        "xbin/nm",
++    ] + glob(["{include_prefix}bin/nm"], allow_empty = True),
++    visibility = ["//visibility:public"],
++)
++
++filegroup(
+     name = "objcopy_files",
+     srcs = [
+         ":objcopy",
+         "xbin/objcopy",
+-    ],
++    ] + glob(["{include_prefix}bin/objcopy"], allow_empty = True),
++    visibility = ["//visibility:public"],
++)
++
++filegroup(
++    name = "objdump_files",
++    srcs = [
++        ":objdump",
++        "xbin/objdump",
++    ] + glob(["{include_prefix}bin/objdump"], allow_empty = True),
+     visibility = ["//visibility:public"],
+ )
+ 
+@@ -1113,7 +1137,7 @@
+     srcs = [
+         ":strip",
+         "xbin/strip",
+-    ],
++    ] + glob(["{include_prefix}bin/strip"], allow_empty = True),
+     visibility = ["//visibility:public"],
+ )
+ 

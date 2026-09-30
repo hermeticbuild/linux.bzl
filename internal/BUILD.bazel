@@ -1,6 +1,82 @@
+load(":execution_platform.bzl", "linux_execution_platform")
+load(":lz4c_tool.bzl", "lz4c_tool")
+load(
+    ":rust_toolchain.bzl",
+    "execution_bindgen_toolchain_resolver",
+    "execution_optional_toolchain_bridge",
+    "execution_rust_source_toolchain_resolver",
+    "execution_rust_toolchain_resolver",
+)
+load(":script_runtime_toolchain.bzl", "linux_x86_64_script_runtime_toolchain")
+
 package(default_visibility = ["//:__subpackages__"])
 
 exports_files(
-    ["linux_object_groups.bzl"],
+    [
+        "linux_source_runfiles.bzl",
+        "mapped_kernel.bzl",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "linux_source_repository_test_support",
+    srcs = [
+        "linux_source_repository.bzl",
+        "linux_source_runfiles.bzl",
+        "module_make_vars.bzl",
+        "repository_utils.bzl",
+        "source_patch.bzl",
+    ],
+    visibility = ["//internal/tests/source_repo:__pkg__"],
+)
+
+lz4c_tool(
+    name = "lz4c",
+)
+
+toolchain_type(
+    name = "script_runtime_toolchain_type",
+    visibility = ["//visibility:public"],
+)
+
+linux_execution_platform(
+    name = "execution_platform",
+)
+
+execution_optional_toolchain_bridge(
+    name = "execution_rust_toolchain",
+    resolver = ":execution_rust_toolchain_resolver",
+)
+
+execution_rust_toolchain_resolver(
+    name = "execution_rust_toolchain_resolver",
+)
+
+execution_optional_toolchain_bridge(
+    name = "execution_rust_source_toolchain",
+    resolver = ":execution_rust_source_toolchain_resolver",
+)
+
+execution_rust_source_toolchain_resolver(
+    name = "execution_rust_source_toolchain_resolver",
+)
+
+execution_optional_toolchain_bridge(
+    name = "execution_bindgen_toolchain",
+    resolver = ":execution_bindgen_toolchain_resolver",
+)
+
+execution_bindgen_toolchain_resolver(
+    name = "execution_bindgen_toolchain_resolver",
+)
+
+linux_x86_64_script_runtime_toolchain(
+    name = "busybox_script_runtime_toolchain",
+    applets = {
+        "find": "@linux_bzl_toybox//file:toybox",
+    },
+    implementation_name = "script_runtime",
+    runtime = "@linux_bzl_busybox//file:busybox",
     visibility = ["//visibility:public"],
 )

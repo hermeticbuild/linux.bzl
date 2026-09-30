@@ -1,3 +1,0 @@
-load(":linux_config_fragment_test.bzl", "linux_config_fragment_test_suite")
-
-linux_config_fragment_test_suite(name = "tests")

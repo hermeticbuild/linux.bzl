@@ -1,0 +1,25 @@
+mainmenu "mapped kernel smoke"
+
+config X86
+    bool
+    default y
+
+config X86_64
+    bool
+    default y
+
+config FRAME_WARN
+    int
+    default 2048
+
+config CC_VERSION_TEXT
+    string
+    default "$(CC_VERSION_TEXT)"
+
+config UNUSED_FAMILY_OPTION
+    bool "Unused family option"
+    default n
+
+config USED_FAMILY_OPTION
+    bool "Used family option"
+    default n
