@@ -22,9 +22,10 @@ type actionPlanFamilyExecutedArtifact struct {
 	contentID string
 }
 
-// Substitute only complete compiler envelopes with exact executable staging
-// or exclusively internal sidecar-base uses. The caller must retain the private
-// scanner evidence and complete replay seal; persistent bindings move atomically.
+// Discharge completed ordering checks from explicit actions and substitute exact
+// executable staging or internal sidecar-base uses in complete compiler envelopes.
+// The caller must retain the scanner evidence and complete replay seal;
+// persistent bindings move atomically and executed producers remain pinned.
 func substituteExecutedArtifacts(plan *ActionPlan, dependencies map[string]ConfigDependencySet, replay *ActionPlanFamilyVerifiedReplay, observed *ActionPlanFamilyExecutedArtifacts) (*ActionPlan, map[string]ConfigDependencySet, error) {
 	if replay == nil || observed == nil || observed.cut == nil || replay.cutID != observed.cutID || observed.cut.ID() != observed.cutID {
 		return nil, nil, fmt.Errorf("artifact substitution requires one verified cut")
@@ -76,19 +77,31 @@ func substituteExecutedArtifacts(plan *ActionPlan, dependencies map[string]Confi
 		if !classified {
 			return nil, nil, fmt.Errorf("artifact consumer has no dependency classification")
 		}
-		if replay.executedIDs[node.ID] != "" || !preciseFamilyCompilerNode(plan, *node, dependency) {
+		if replay.executedIDs[node.ID] != "" {
 			continue
 		}
 		recipe := cloned.Recipes[node.Recipe]
-		if recipe.CompilerInvocation == nil || !recipe.CompilerInvocation.WorkingInputUsesComplete || len(recipe.ArgumentTransforms) != 0 {
+		preciseCompiler := preciseFamilyCompilerNode(plan, *node, dependency)
+		// ArgumentsFile transports this same explicit argv. Indirect arguments
+		// and family views can hide reads of an otherwise ordering-only input.
+		explicitActionFile := recipe.Tool == "actionfile" && len(recipe.ContentSubstitutions) == 0 && !slices.ContainsFunc(recipe.Arguments, func(argument string) bool {
+			flag, _, _ := strings.Cut(strings.TrimLeft(argument, "-"), "=")
+			return strings.HasPrefix(argument, "@") || flag == "arguments_file" || strings.HasPrefix(flag, "family_view_")
+		})
+		if !preciseCompiler && !explicitActionFile {
 			continue
 		}
+		if recipe.CompilerInvocation != nil && !recipe.CompilerInvocation.WorkingInputUsesComplete || len(recipe.ArgumentTransforms) != 0 {
+			continue
+		}
+		semantic := familyRecipeSemanticBindings(recipe)
 		withoutBases := cloneActionRecipe(recipe)
 		withoutBases.ObservedOutputBases = nil
 		otherSemantic := familyRecipeSemanticBindings(withoutBases)
 		written := familyRecipeSemanticWorkingPaths(recipe)
+		removed := map[int]bool{}
 		for ordinal, edge := range node.Inputs {
-			if edge.Role == "sequence" {
+			if edge.Role != "sequence" && (!preciseCompiler || recipe.CompilerInvocation == nil) {
 				continue
 			}
 			executedID := replay.executedIDs[edge.ProducerID]
@@ -112,6 +125,43 @@ func substituteExecutedArtifacts(plan *ActionPlan, dependencies map[string]Confi
 				return nil, nil, fmt.Errorf("invalid original artifact slot")
 			}
 			output := producer.Outputs[edge.Slot]
+			if !executedArtifactOutputOwnership(output, artifact.output.Output, edge.Slot) {
+				return nil, nil, fmt.Errorf("artifact changed original output ownership")
+			}
+			binding := recipe.Inputs[ordinal]
+			reference := "input:" + binding
+			if edge.Role == "sequence" {
+				if edge.Slot != 0 || !compactKbuildAuthenticatedExecutionCheckCompletion(plan, producer, output.ObservedPath) ||
+					semantic[reference] || recipe.WorkingInputs[reference] != "" ||
+					slices.Contains(node.Trees, output.Tree) || slices.Contains(recipe.WorkingTrees, output.Tree) {
+					continue
+				}
+				if invocation := recipe.CompilerInvocation; invocation != nil &&
+					(slices.Contains(invocation.WorkingInputUses, reference) || slices.Contains(invocation.AuxiliaryWorkingInputUses, reference)) {
+					continue
+				}
+				materialized, err := actionPlanInputSetProducerIDs(store, node.InputSet)
+				if err != nil {
+					return nil, nil, err
+				}
+				if slices.Contains(materialized, edge.ProducerID) {
+					continue
+				}
+				content, haveContent := observed.contents[artifact.contentID]
+				mode, haveMode := observed.modes[artifact.contentID]
+				if !haveContent || !haveMode || executedArtifactContentID(content, mode) != artifact.contentID {
+					return nil, nil, fmt.Errorf("execution completion changed its authenticated contents")
+				}
+				state, err := toolaction.DecodeObservedOutputState(content)
+				if err != nil || state.Disposition != toolaction.ObservedOutputAbsent {
+					return nil, nil, fmt.Errorf("execution completion is not an absent status output")
+				}
+				// The cut already completed this check. Retain its exact producer
+				// through executedCutRoots and cut.Verify, without salting an
+				// otherwise independent consumer with the check's full config.
+				removed[ordinal] = true
+				continue
+			}
 			// Ordinary public outputs retain their original producer provenance.
 			// A planner-owned metadata sidecar can also have an exclusively
 			// internal consumer: keep its public producer/view, but stage the
@@ -122,11 +172,6 @@ func substituteExecutedArtifacts(plan *ActionPlan, dependencies map[string]Confi
 			if familyViewTree(output.Tree) && (!privateMetadataState || !privatePrehostCopyAllowed) {
 				continue
 			}
-			if !executedArtifactOutputOwnership(output, artifact.output.Output, edge.Slot) {
-				return nil, nil, fmt.Errorf("artifact changed original output ownership")
-			}
-			binding := recipe.Inputs[ordinal]
-			reference := "input:" + binding
 			if output.ObservedPath == "" {
 				if !slices.Contains(recipe.ExecutableInputs, binding) || recipe.WorkingInputs[reference] != output.Path || written[output.Path] {
 					continue
@@ -203,6 +248,35 @@ func substituteExecutedArtifacts(plan *ActionPlan, dependencies map[string]Confi
 					return nil, nil, err
 				}
 			}
+		}
+		if len(removed) != 0 {
+			remap := map[string]string{}
+			retained := make([]ActionPlanNodeEdge, 0, len(node.Inputs)-len(removed))
+			for ordinal, edge := range node.Inputs {
+				if removed[ordinal] {
+					continue
+				}
+				remap["input:"+recipe.Inputs[ordinal]] = edge.Role + ":" + planOrdinal(len(retained))
+				retained = append(retained, edge)
+			}
+			working := map[string]string{}
+			for reference, pathname := range recipe.WorkingInputs {
+				if binding := remap[reference]; binding != "" {
+					reference = "input:" + binding
+				}
+				working[reference] = pathname
+			}
+			recipe = rewriteFamilyRecipeBindings(recipe, remap, working)
+			node.Inputs = retained
+			recipe.Inputs = make([]string, len(retained))
+			for ordinal, edge := range retained {
+				recipe.Inputs[ordinal] = edge.Role + ":" + planOrdinal(ordinal)
+			}
+			id, err := recipe.ID()
+			if err != nil {
+				return nil, nil, err
+			}
+			cloned.Recipes[id], node.Recipe = recipe, id
 		}
 	}
 	cloned.Nodes = append(cloned.Nodes, added...)

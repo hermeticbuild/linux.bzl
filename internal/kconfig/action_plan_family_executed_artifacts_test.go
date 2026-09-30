@@ -91,6 +91,123 @@ func executedArtifactVariantForTest(t *testing.T, other string) ActionPlanFamily
 	return ActionPlanFamilyVariant{Name: name, Snapshot: snapshot}
 }
 
+func executedArtifactSequenceVariantForTest(t *testing.T, variant ActionPlanFamilyVariant, change string) ActionPlanFamilyVariant {
+	t.Helper()
+	plan := snapshotActionPlan(variant.Snapshot)
+	actionfile := strings.HasPrefix(change, "sequence-actionfile")
+	if change == "sequence-direct" || actionfile {
+		// Keep the cut's helper root when the consumer no longer uses it.
+		plan.Products = append(plan.Products, ActionPlanProduct{Name: "sdk", Tree: "prehost", Path: "tools/helper"})
+	}
+	checkPlan := snapshotActionPlan(familyTestSourceCheckSnapshot(t))
+	check, found := compactKbuildPlanNode(checkPlan, checkPlan.executionCheckRoots[0])
+	if !found {
+		t.Fatal("missing source check")
+	}
+	check.ID, check.Stage, check.Outputs[0].Tree = "check", "prehost", "prehost"
+	for _, source := range checkPlan.Sources {
+		if source.ID == check.Sources[0].SourceID {
+			plan.Sources = append(plan.Sources, source)
+			break
+		}
+	}
+	check.Sources = append(check.Sources, ActionPlanSourceEdge{Role: "config", SourceID: "src-00000002"})
+	checkRecipe := cloneActionRecipe(checkPlan.Recipes[check.Recipe])
+	checkRecipe.Sources = append(checkRecipe.Sources, "config:00000001")
+	checkRecipe.WorkingInputs["source:config:00000001"] = "include/generated/autoconf.h"
+	id, err := checkRecipe.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Recipes[id], check.Recipe = checkRecipe, id
+	sets := make([]ConfigDependencySet, len(plan.Nodes))
+	for index := range plan.Nodes {
+		node := &plan.Nodes[index]
+		sets[index] = variant.Snapshot.ConfigDependencies[node.ID]
+		recipe := cloneActionRecipe(plan.Recipes[node.Recipe])
+		if node.Kind == "compile" && change == "sequence-direct" {
+			base := familyTestSnapshot(t, 1, "", variant.Snapshot.ConfigFiles, sets[index])
+			recipe = base.Recipes[base.Nodes[0].Recipe]
+			node.Tool, node.Inputs, node.Outputs = recipe.Tool, nil, base.Nodes[0].Outputs
+		}
+		if node.Kind == "compile" && actionfile {
+			recipe = ActionRecipe{
+				Schema: LinuxKernelPlanSchema, Kind: "copy", Tool: "actionfile",
+				Arguments:     []string{"-input", "${source:source:00000000}", "-out", "${output:00000000}"},
+				ArgumentsFile: true,
+				Sources:       []string{"source:00000000"}, Outputs: []string{"00000000"},
+			}
+			switch change {
+			case "sequence-actionfile-at":
+				recipe.Arguments, recipe.ArgumentsFile = []string{"@${source:source:00000000}"}, false
+			case "sequence-actionfile-json":
+				recipe.Arguments, recipe.ArgumentsFile = []string{"-arguments_file", "${source:source:00000000}"}, false
+			case "sequence-actionfile-content":
+				recipe.Arguments, recipe.ArgumentsFile = []string{"${content:args}"}, false
+				recipe.ContentSubstitutions = map[string]ActionRecipeContentSubstitution{
+					"args": {Input: "source:source:00000000", Transform: ActionRecipeContentTransformMakeShellWord},
+				}
+			}
+			if !recipe.ArgumentsFile {
+				recipe.WorkingDirectory = "copy"
+				recipe.WorkingOutputs = map[string]string{"00000000": "drivers/example.o"}
+			}
+			node.Kind, node.Tool, node.Inputs = recipe.Kind, recipe.Tool, nil
+			node.Sources = slices.DeleteFunc(node.Sources, func(source ActionPlanSourceEdge) bool { return source.Role != "source" })
+			node.Outputs = node.Outputs[:1]
+			sets[index] = ConfigDependencySet{SourcePaths: []string{"drivers/example.c"}}
+		}
+		remap := map[string]string{}
+		for ordinal, input := range node.Inputs {
+			remap["input:"+recipe.Inputs[ordinal]] = input.Role + ":" + planOrdinal(ordinal+1)
+		}
+		working := map[string]string{}
+		for reference, pathname := range recipe.WorkingInputs {
+			if binding := remap[reference]; binding != "" {
+				reference = "input:" + binding
+			}
+			working[reference] = pathname
+		}
+		recipe = rewriteFamilyRecipeBindings(recipe, remap, working)
+		node.Inputs = append([]ActionPlanNodeEdge{{Role: "sequence", ProducerID: check.ID, Slot: 0}}, node.Inputs...)
+		recipe.Inputs = make([]string, len(node.Inputs))
+		for ordinal, input := range node.Inputs {
+			recipe.Inputs[ordinal] = input.Role + ":" + planOrdinal(ordinal)
+		}
+		if node.Kind == "compile" {
+			switch change {
+			case "sequence-data":
+				recipe.Environment = map[string]string{"STATUS": "${input:sequence:00000000}"}
+			case "sequence-input-set":
+				node.InputSet = configDependencyInsertInputSetEntryForTest(t, plan, node.InputSet, ActionPlanInputSetEntry{
+					Target:     ActionPlanInputSetTarget{Kind: ActionPlanInputSetWorkTarget, Path: "status-alias"},
+					ProducerID: check.ID, Slot: 0, CompilerUse: true, AuxiliaryUse: true,
+				})
+			}
+		}
+		id, err := recipe.ID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan.Recipes[id], node.Recipe = recipe, id
+	}
+	plan.Nodes = append(plan.Nodes, check)
+	plan.executionCheckRoots = []string{check.ID}
+	sets = append(sets, ConfigDependencySet{Opaque: true, Reason: "selected source check"})
+	if err := contentAddressActionPlanNodes(plan); err != nil {
+		t.Fatal(err)
+	}
+	dependencies := map[string]ConfigDependencySet{}
+	for index, node := range plan.Nodes {
+		dependencies[node.ID] = sets[index]
+	}
+	variant.Snapshot, err = canonicalActionPlanSnapshot(plan, dependencies, variant.Snapshot.ConfigFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return variant
+}
+
 func TestFamilyExecutedArtifactGraphReuse(t *testing.T) {
 	for _, testcase := range []struct {
 		name   string
@@ -107,10 +224,29 @@ func TestFamilyExecutedArtifactGraphReuse(t *testing.T) {
 		{"persistent work target", toolaction.ObservedOutputAbsent, "work"},
 		{"persistent tree target", toolaction.ObservedOutputAbsent, "tree"},
 		{"persistent additional alias", toolaction.ObservedOutputAbsent, "alias"},
+		{"completed ordering", toolaction.ObservedOutputAbsent, "sequence"},
+		{"direct compiler ordering", toolaction.ObservedOutputAbsent, "sequence-direct"},
+		{"actionfile ordering with canonical arguments transport", toolaction.ObservedOutputAbsent, "sequence-actionfile"},
+		{"actionfile opaque multiline arguments", toolaction.ObservedOutputAbsent, "sequence-actionfile-at"},
+		{"actionfile opaque JSON arguments", toolaction.ObservedOutputAbsent, "sequence-actionfile-json"},
+		{"actionfile arguments from file contents", toolaction.ObservedOutputAbsent, "sequence-actionfile-content"},
+		{"unexecuted ordering", toolaction.ObservedOutputAbsent, "sequence-unexecuted"},
+		{"ordering data use", toolaction.ObservedOutputAbsent, "sequence-data"},
+		{"ordering materialization alias", toolaction.ObservedOutputAbsent, "sequence-input-set"},
+		{"invalid completion", toolaction.ObservedOutputPresent, "sequence-invalid"},
 	} {
 		t.Run(testcase.name, func(t *testing.T) {
 			state := testcase.state
+			consumerKind := "compile"
+			if strings.HasPrefix(testcase.change, "sequence-actionfile") {
+				consumerKind = "copy"
+			}
 			variants := []ActionPlanFamilyVariant{executedArtifactVariantForTest(t, "0"), executedArtifactVariantForTest(t, "1")}
+			if strings.HasPrefix(testcase.change, "sequence") {
+				for index := range variants {
+					variants[index] = executedArtifactSequenceVariantForTest(t, variants[index], testcase.change)
+				}
+			}
 			if testcase.change == "work" || testcase.change == "tree" || testcase.change == "alias" {
 				for index := range variants {
 					variants[index] = executedArtifactPersistentVariantForTest(t, variants[index], testcase.change)
@@ -132,14 +268,14 @@ func TestFamilyExecutedArtifactGraphReuse(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			baselineCompilers := 0
+			baselineConsumers := 0
 			for _, node := range baseline.Nodes {
-				if node.Kind == "compile" {
-					baselineCompilers++
+				if node.Kind == consumerKind {
+					baselineConsumers++
 				}
 			}
-			if baselineCompilers != 2 {
-				t.Fatalf("fixture baseline has %d compilers, want2", baselineCompilers)
+			if baselineConsumers != 2 {
+				t.Fatalf("fixture baseline has %d %s nodes, want2", baselineConsumers, consumerKind)
 			}
 			initial, err := BuildConservativeActionPlanFamily(variants)
 			if err != nil {
@@ -148,10 +284,13 @@ func TestFamilyExecutedArtifactGraphReuse(t *testing.T) {
 			var roots []ActionPlanFamilyExecutionCutRoot
 			for _, variant := range variants {
 				for _, node := range variant.Snapshot.Nodes {
-					if node.Stage == "prehost" {
+					if node.Stage == "prehost" && node.Outputs[0].ObservedPath == "" {
 						roots = append(roots, ActionPlanFamilyExecutionCutRoot{NodeID: initial.originalNodeIDs[variant.Name][node.ID], Slot: 0})
 					}
 				}
+			}
+			if testcase.change == "sequence-unexecuted" {
+				roots = nil
 			}
 			cut, err := NewActionPlanFamilyExecutionCut(initial, roots)
 			if err != nil {
@@ -188,8 +327,23 @@ func TestFamilyExecutedArtifactGraphReuse(t *testing.T) {
 					t.Fatal(err)
 				}
 				updated, sets, err := substituteExecutedArtifacts(plan, variant.Snapshot.ConfigDependencies, replay, observed)
+				if testcase.change == "sequence-invalid" {
+					if err == nil || !strings.Contains(err.Error(), "execution completion is not an absent status output") {
+						t.Fatalf("expected non-absent completion error, got %v", err)
+					}
+					return
+				}
 				if err != nil {
 					t.Fatal(err)
+				}
+				if testcase.change == "sequence-unexecuted" {
+					for _, node := range updated.Nodes {
+						if node.Kind == "compile" && !slices.ContainsFunc(node.Inputs, func(edge ActionPlanNodeEdge) bool {
+							return edge.Role == "sequence"
+						}) {
+							t.Fatal("discarded an unexecuted ordering check")
+						}
+					}
 				}
 				snapshot, err := canonicalActionPlanSnapshot(updated, sets, variant.Snapshot.ConfigFiles)
 				if err != nil {
@@ -204,18 +358,26 @@ func TestFamilyExecutedArtifactGraphReuse(t *testing.T) {
 			if _, err := cut.Verify(family.family); err != nil {
 				t.Fatalf("changed pinned execution: %v", err)
 			}
-			compilers := 0
+			for _, variant := range variants {
+				for _, original := range variant.Snapshot.ExecutionCheckRoots {
+					id := initial.originalNodeIDs[variant.Name][original]
+					if !slices.Contains(family.family.Validations, ActionPlanFamilyValidation{Variant: variant.Name, NodeID: id, Slot: 0}) {
+						t.Fatal("lost the original execution check")
+					}
+				}
+			}
+			consumers := 0
 			for _, node := range family.family.Nodes {
-				if node.Kind == "compile" {
-					compilers++
+				if node.Kind == consumerKind {
+					consumers++
 				}
 			}
 			want := 2
-			if state == toolaction.ObservedOutputAbsent && (testcase.change == "" || testcase.change == "work" || testcase.change == "tree") {
+			if state == toolaction.ObservedOutputAbsent && (testcase.change == "" || testcase.change == "work" || testcase.change == "tree" || testcase.change == "sequence" || testcase.change == "sequence-direct" || testcase.change == "sequence-actionfile") {
 				want = 1
 			}
-			if compilers != want {
-				t.Fatalf("compiler instances=%d, want%d", compilers, want)
+			if consumers != want {
+				t.Fatalf("%s instances=%d, want%d", consumerKind, consumers, want)
 			}
 			for _, view := range family.family.Views {
 				if strings.HasPrefix(view.ArtifactPath, ".linux-bzl-executed-artifacts/") {
