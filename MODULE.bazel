@@ -19,7 +19,7 @@ bazel_dep(name = "rules_bison", version = "0.4.bcr.1")
 bazel_dep(name = "rules_flex", version = "0.4.1")
 bazel_dep(name = "rules_go", version = "0.62.0")
 bazel_dep(name = "rules_perl", version = "0.5.0")
-bazel_dep(name = "rules_rs", version = "0.0.102")
+bazel_dep(name = "rules_rs", version = "0.1.0")
 bazel_dep(name = "zstd", version = "1.5.7.bcr.1")
 
 bazel_dep(name = "tar.bzl", version = "0.9.0", dev_dependency = True)
