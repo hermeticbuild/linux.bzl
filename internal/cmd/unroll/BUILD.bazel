@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "unroll_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/hermeticbuild/linux.bzl/internal/cmd/unroll",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "unroll",
+    embed = [":unroll_lib"],
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "unroll_test",
+    srcs = ["main_test.go"],
+    embed = [":unroll_lib"],
+)

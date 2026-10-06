@@ -194,6 +194,7 @@ func objectVariantContentID(
 	symversions bool,
 	symversionFlags []string,
 	symversionRemoveFlags []string,
+	generated compactGeneratorIdentity,
 ) string {
 	hasher := newCompactContentHasher(compactObjectContentDomain)
 	hasher.writeValue("object=", object)
@@ -238,7 +239,72 @@ func objectVariantContentID(
 	for _, flag := range symversionRemoveFlags {
 		hasher.writeValue("symversion_remove_flag=", flag)
 	}
+	// Written last and only when a generator is present. The hash is a byte
+	// stream of the values actually written, so an object that never acquires
+	// a generator keeps a byte-identical identity.
+	//
+	// This is also required for correctness rather than only for economy:
+	// arm64's sha256-core.o and sha512-core.o share their source, flags and
+	// arguments and differ solely in the target they generate.
+	generated.write(hasher)
 	return hasher.id()
+}
+
+// compactGeneratorIdentity is the generator half of an object's identity.
+//
+// The four values always travel together, are always derived from the same
+// resolved executor, and are all strings or string slices, so passing them
+// positionally alongside seventeen other parameters makes a mis-ordering
+// silent and a wrong content ID the only symptom.
+type compactGeneratorIdentity struct {
+	Source string
+	Kind   string
+	Args   []string
+	Inputs []string
+}
+
+// compactGeneratorIdentityFor derives the identity from a resolved executor;
+// a nil executor is a checked-in source and hashes as no generator.
+func compactGeneratorIdentityFor(executor *GeneratedSourceExecutor) compactGeneratorIdentity {
+	if executor == nil {
+		return compactGeneratorIdentity{}
+	}
+	return compactGeneratorIdentity{
+		Source: executor.Target,
+		Kind:   string(executor.Kind),
+		Args:   append([]string(nil), executor.Args...),
+		Inputs: append([]string(nil), executor.ActionInputs...),
+	}
+}
+
+// generatorIdentity recovers the identity from an emitted variant, so a
+// re-derived content ID cannot disagree with the one that produced it.
+func (v CompactObjectVariant) generatorIdentity() compactGeneratorIdentity {
+	return compactGeneratorIdentity{
+		Source: v.GeneratedSource,
+		Kind:   v.Generator,
+		Args:   v.GeneratorArgs,
+		Inputs: v.GeneratorInputs,
+	}
+}
+
+// write appends the generator fields to a content hash.
+//
+// Both the concrete recipe ID and the object content ID cover these fields,
+// and the two hashes only stay comparable while they write them identically,
+// so the sequence lives here rather than being spelled out at each hasher.
+func (g compactGeneratorIdentity) write(hasher *compactContentHasher) {
+	if g.Kind == "" {
+		return
+	}
+	hasher.writeValue("generated_source=", g.Source)
+	hasher.writeValue("generator=", g.Kind)
+	for _, arg := range g.Args {
+		hasher.writeValue("generator_arg=", arg)
+	}
+	for _, input := range g.Inputs {
+		hasher.writeValue("generator_input=", input)
+	}
 }
 
 func compactCompileEnvironmentValue(environment CompactCompileEnvironment) string {
@@ -987,6 +1053,7 @@ func (metadata *CompactMetadata) validateContentIDs() error {
 			variant.Symversions,
 			variant.SymversionFlags,
 			variant.SymversionRemoveFlags,
+			variant.generatorIdentity(),
 		)
 		if variant.ContentID != expected {
 			return fmt.Errorf("object target %q canonical fields hash to %s, got %s", variant.Target, expected, variant.ContentID)

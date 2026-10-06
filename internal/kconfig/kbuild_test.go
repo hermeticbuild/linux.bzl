@@ -1522,6 +1522,147 @@ $(eval $(obj)/module.o: $(obj)/part1.o $(obj)/part2.o)
 	}
 }
 
+// TestParseKbuildPreservesAutomaticVariablesInCommands pins the precondition
+// the whole generated-source resolver rests on: automatic variables have no
+// Kbuild definition, so they survive expansion verbatim and a captured cmd_*
+// macro still says which argument is the input and which is the output.
+//
+// If this ever breaks, classifying generators by command text becomes
+// impossible and the resolver has to fall back to raw right-hand sides.
+func TestParseKbuildPreservesAutomaticVariablesInCommands(t *testing.T) {
+	kb, err := ParseKbuild(strings.NewReader(`obj := build
+src := source
+cmd_perlasm = $(PERL) $(<) > $(@)
+cmd_perlasm_void = $(PERL) $< void $@
+cmd_unroll = $(AWK) -v N=$* -f $(src)/unroll.awk < $< > $@
+cmd_mkcapflags = $(CONFIG_SHELL) $(src)/mkcapflags.sh $@ $^
+cmd_conmk = $(obj)/conmakehash $< > $@
+cmd_accumulated = first
+cmd_accumulated += second
+cmd_replaced = original
+cmd_replaced = final
+`), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+
+	got := kbuildCommandSummaries(kb.Commands)
+	want := []kbuildCommandSummary{
+		{
+			name:  "perlasm",
+			value: "$(PERL) $(<) > $(@)",
+			raw:   "$(PERL) $(<) > $(@)",
+			line:  3,
+		},
+		{
+			name:  "perlasm_void",
+			value: "$(PERL) $< void $@",
+			raw:   "$(PERL) $< void $@",
+			line:  4,
+		},
+		{
+			name:  "unroll",
+			value: "$(AWK) -v N=$* -f source/unroll.awk < $< > $@",
+			raw:   "$(AWK) -v N=$* -f $(src)/unroll.awk < $< > $@",
+			line:  5,
+		},
+		{
+			name:  "mkcapflags",
+			value: "$(CONFIG_SHELL) source/mkcapflags.sh $@ $^",
+			raw:   "$(CONFIG_SHELL) $(src)/mkcapflags.sh $@ $^",
+			line:  6,
+		},
+		{
+			name:  "conmk",
+			value: "build/conmakehash $< > $@",
+			raw:   "$(obj)/conmakehash $< > $@",
+			line:  7,
+		},
+		{
+			name:  "accumulated",
+			value: "first second",
+			raw:   "first second",
+			line:  9,
+		},
+		{
+			name:  "replaced",
+			value: "final",
+			raw:   "final",
+			line:  11,
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("commands mismatch\nwant: %#v\n got: %#v", want, got)
+	}
+}
+
+// TestParseKbuildParsesStaticPatternRules covers the shape at
+// arch/powerpc/crypto/Makefile in 6.12: "targets: target-pattern: prereqs".
+// Splitting only on the first top-level colon used to glue the second colon
+// onto a bogus prerequisite.
+func TestParseKbuildParsesStaticPatternRules(t *testing.T) {
+	kb, err := ParseKbuild(strings.NewReader(`obj := build
+src := source
+$(obj)/aes-spe-core.o $(obj)/aes-spe-keys.o: $(obj)/%.o: $(src)/%.S
+	$(call if_changed_rule,as_o_S)
+$(obj)/plain.o: $(src)/plain.S
+	$(call if_changed_rule,as_o_S)
+`), "Kbuild")
+	if err != nil {
+		t.Fatalf("ParseKbuild() failed: %v", err)
+	}
+
+	got := kbuildRuleSummaries(kb.Rules)
+	want := []kbuildRuleSummary{
+		{
+			targets:       "build/aes-spe-core.o build/aes-spe-keys.o",
+			targetPattern: "build/%.o",
+			separator:     ":",
+			prerequisites: "source/%.S",
+			recipe:        "$(call if_changed_rule,as_o_S)",
+			line:          3,
+		},
+		{
+			targets:       "build/plain.o",
+			separator:     ":",
+			prerequisites: "source/plain.S",
+			recipe:        "$(call if_changed_rule,as_o_S)",
+			line:          5,
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rules mismatch\nwant: %#v\n got: %#v", want, got)
+	}
+}
+
+func TestMakePatternStem(t *testing.T) {
+	for _, tc := range []struct {
+		pattern string
+		word    string
+		stem    string
+		match   bool
+	}{
+		{pattern: "%.c", word: "int1.c", stem: "int1", match: true},
+		{pattern: "int%.c", word: "int1.c", stem: "1", match: true},
+		{pattern: "%", word: "anything", stem: "anything", match: true},
+		{pattern: "plain.c", word: "plain.c", match: true},
+		{pattern: "plain.c", word: "other.c", match: false},
+		// GNU make requires the prefix and suffix to occupy disjoint parts of
+		// the word. "a" is too short to supply both.
+		{pattern: "a%a", word: "a", match: false},
+		{pattern: "a%a", word: "aa", stem: "", match: true},
+		{pattern: "a%a", word: "aba", stem: "b", match: true},
+		{pattern: "%.S", word: ".S", stem: "", match: true},
+		{pattern: "%.S", word: "S", match: false},
+	} {
+		stem, ok := makePatternStem(tc.pattern, tc.word)
+		if ok != tc.match || stem != tc.stem {
+			t.Errorf("makePatternStem(%q, %q) = (%q, %v), want (%q, %v)",
+				tc.pattern, tc.word, stem, ok, tc.stem, tc.match)
+		}
+	}
+}
+
 func TestParseKbuildRejectsUnterminatedDefine(t *testing.T) {
 	_, err := ParseKbuild(strings.NewReader(`define missing_end
 obj-y += hidden.o
@@ -2579,6 +2720,7 @@ func kbuildIncludeSummaries(includes []KbuildInclude) []kbuildIncludeSummary {
 
 type kbuildRuleSummary struct {
 	targets       string
+	targetPattern string
 	separator     string
 	prerequisites string
 	orderOnly     string
@@ -2591,11 +2733,32 @@ func kbuildRuleSummaries(rules []KbuildRule) []kbuildRuleSummary {
 	for _, rule := range rules {
 		out = append(out, kbuildRuleSummary{
 			targets:       strings.Join(rule.Targets, " "),
+			targetPattern: rule.TargetPattern,
 			separator:     rule.Separator,
 			prerequisites: strings.Join(rule.Prerequisites, " "),
 			orderOnly:     strings.Join(rule.OrderOnly, " "),
 			recipe:        strings.Join(rule.Recipe, "\n"),
 			line:          rule.Position.Line,
+		})
+	}
+	return out
+}
+
+type kbuildCommandSummary struct {
+	name  string
+	value string
+	raw   string
+	line  int
+}
+
+func kbuildCommandSummaries(commands []KbuildCommand) []kbuildCommandSummary {
+	out := make([]kbuildCommandSummary, 0, len(commands))
+	for _, command := range commands {
+		out = append(out, kbuildCommandSummary{
+			name:  command.Name,
+			value: command.Value,
+			raw:   command.Raw,
+			line:  command.Position.Line,
 		})
 	}
 	return out

@@ -208,6 +208,10 @@ _CONTENT_GRAPH_OBJECT_KEYS = [
             "content_id": "string",
             "deps": "string_list",
             "flags": "string_list",
+            "generated_source": "string",
+            "generator": "string",
+            "generator_args": "string_list",
+            "generator_inputs": "string_list",
             "members": "string_list",
             "mode": "string",
             "module_root": "bool",
@@ -1425,8 +1429,16 @@ def _content_graph_metadata_structure_error(metadata):
                 return error
     return ""
 
+# Frozen top-level list shared by every generator-less variant, which is
+# almost all of them.
+_NO_GENERATOR = []
+
 def _action_recipe_key(variant):
-    source = variant.get("source", "")
+    # The compiled language is the generated target's when there is one: a
+    # perlasm object's source is a ".pl" script but it compiles ".S", and a
+    # raid6 object's source is a ".uc" template but it compiles ".c".
+    generated_source = variant.get("generated_source", "")
+    source = generated_source or variant.get("source", "")
     language = ""
     if source.endswith(".c"):
         language = "c"
@@ -1435,9 +1447,23 @@ def _action_recipe_key(variant):
     kind = "compile"
     if variant.get("members", []):
         kind = "arm64_nvhe" if variant.get("object", "") == "arch/arm64/kvm/hyp/nvhe/kvm_nvhe.o" else "composite"
+    generator = variant.get("generator", "")
+    generated = _NO_GENERATOR
+    if generator:
+        # Required for correctness, not just completeness: arm64's
+        # sha256-core.o and sha512-core.o share a source, flags and arguments,
+        # and differ only in which target they generate. Without this they
+        # would be grouped into one action.
+        generated = [
+            generated_source,
+            generator,
+            variant.get("generator_args", []),
+            variant.get("generator_inputs", []),
+        ]
     return json.encode([
         kind,
         language,
+        generated,
         variant.get("mode", ""),
         variant.get("modname", ""),
         variant.get("module_root", False),

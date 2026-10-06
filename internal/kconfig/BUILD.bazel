@@ -12,7 +12,9 @@ go_library(
         "expr.go",
         "expr_dnf.go",
         "generated_header_footprint.go",
+        "generated_source_kinds.go",
         "kbuild.go",
+        "kbuild_generated_source.go",
         "kernelflags_symbols.go",
         "objtool_symbols.go",
         "parser.go",
@@ -37,9 +39,12 @@ go_library(
 go_test(
     name = "kconfig_test",
     srcs = [
+        "compact_generated_source_test.go",
         "compact_test.go",
         "config_footprint_test.go",
         "config_test.go",
+        "generated_source_kinds_test.go",
+        "kbuild_generated_source_test.go",
         "kbuild_test.go",
         "kernelflags_symbols_test.go",
         "parser_test.go",

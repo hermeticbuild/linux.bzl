@@ -64,6 +64,10 @@ type objectVariant struct {
 	ObjtoolForce       bool     `json:"objtool_force,omitempty"`
 	Deps               []string `json:"deps,omitempty"`
 	Members            []string `json:"members,omitempty"`
+	GeneratedSource    string   `json:"generated_source,omitempty"`
+	Generator          string   `json:"generator,omitempty"`
+	GeneratorArgs      []string `json:"generator_args,omitempty"`
+	GeneratorInputs    []string `json:"generator_inputs,omitempty"`
 }
 
 type sourceInput struct {
@@ -762,6 +766,21 @@ func validateContentAddressedMetadata(
 		}
 		for _, arg := range variant.ObjtoolArgs {
 			values = append(values, "objtool_arg="+arg)
+		}
+		// Appended last and only when present, so a variant with no generator
+		// hashes exactly as it did before generated-source support existed.
+		// arm64's sha256-core.o and sha512-core.o make this load-bearing
+		// rather than merely tidy: they share source, flags and arguments and
+		// differ only in the target they generate.
+		if variant.Generator != "" {
+			values = append(values, "generated_source="+variant.GeneratedSource)
+			values = append(values, "generator="+variant.Generator)
+			for _, arg := range variant.GeneratorArgs {
+				values = append(values, "generator_arg="+arg)
+			}
+			for _, input := range variant.GeneratorInputs {
+				values = append(values, "generator_input="+input)
+			}
 		}
 		expected := canonicalContentID(objectContentDomain, values...)
 		if variant.ContentID != expected {

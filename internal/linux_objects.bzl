@@ -739,7 +739,7 @@ def _linux_source_preinclude_flags_for_root(source_root, assembly = False):
     ]
 
 def _is_assembly_source(src):
-    return src != None and (src.basename.endswith(".S") or src.basename.endswith(".s"))
+    return src != None and _is_assembly_path(src.basename)
 
 def _is_shipped_c_source(src):
     return src != None and src.basename.endswith(".c_shipped")
@@ -801,24 +801,29 @@ def _linux_ftrace_remove_flags():
         "-fpatchable-function-entry=2",
     ]
 
-def _linux_perlasm_kind(object):
-    if object in [
-        "lib/crypto/arm/poly1305-core.o",
-        "lib/crypto/arm/sha256-core.o",
-        "lib/crypto/arm/sha512-core.o",
-    ]:
-        return "stdout"
-    if object in [
-        "lib/crypto/arm64/poly1305-core.o",
-        "lib/crypto/arm64/sha256-core.o",
-        "lib/crypto/arm64/sha512-core.o",
-    ]:
-        return "arm64_with_args"
-    if object == "lib/crypto/riscv/poly1305-core.o":
-        return "riscv64_with_args"
-    if object == "lib/crypto/x86/poly1305-x86_64-cryptogams.o":
-        return "stdout"
-    return ""
+def _is_assembly_path(path):
+    return path.endswith(".S") or path.endswith(".s")
+
+# _linux_legacy_perlasm_kind maps an object path to a perlasm flavour.
+#
+# Superseded by the "generator" attribute, which derives the flavour from the
+# rule's own cmd_* text. Retained only because the graph generator is a pinned
+# prebuilt: until the pin is bumped the generated BUILD files carry no
+# generator attribute. These rows describe the post-6.16 lib/crypto layout
+# only, and the arm64 sha256-core row is wrong for 6.12.
+_LINUX_LEGACY_PERLASM_KINDS = {
+    "lib/crypto/arm/poly1305-core.o": "stdout",
+    "lib/crypto/arm/sha256-core.o": "stdout",
+    "lib/crypto/arm/sha512-core.o": "stdout",
+    "lib/crypto/arm64/poly1305-core.o": "arm64_with_args",
+    "lib/crypto/arm64/sha256-core.o": "arm64_with_args",
+    "lib/crypto/arm64/sha512-core.o": "arm64_with_args",
+    "lib/crypto/riscv/poly1305-core.o": "riscv64_with_args",
+    "lib/crypto/x86/poly1305-x86_64-cryptogams.o": "stdout",
+}
+
+def _linux_legacy_perlasm_kind(object):
+    return _LINUX_LEGACY_PERLASM_KINDS.get(object, "")
 
 def _linux_dtb_symbol_base(src):
     basename = src.basename
@@ -5943,6 +5948,109 @@ def _linux_perl_runtime(ctx):
         interpreter = perl_runtime.interpreter,
     )
 
+# _linux_generated_source runs the Kbuild rule that produces this object's
+# source, when the graph generator resolved one, and returns None otherwise.
+#
+# The kind, arguments and inputs are all derived from the Kbuild rule. Only the
+# executor stays hardcoded: no action has an awk, shell or coreutils
+# toolchain, so every kind maps to a Go port or to Perl.
+def _linux_generated_source(ctx):
+    generator = ctx.attr.generator
+    if not generator:
+        return None
+    generated_path = ctx.attr.generated_source
+    if not generated_path:
+        fail("linux_object %s sets generator %s without generated_source" % (ctx.label, generator))
+
+    # The output name comes from the resolved rule target, not from the object
+    # name with an assumed extension: raid6 generates ".c", perlasm ".S".
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + generated_path)
+    inputs = [
+        _source_tree_file(ctx, relpath)
+        for relpath in ctx.attr.generator_inputs
+    ]
+    args = ctx.actions.args()
+
+    # generator_inputs is already exactly what the executor opens, per kind.
+    # Only the perl branches override this, to add the interpreter runtime.
+    action_inputs = depset(inputs)
+
+    if generator in ["perl_stdout", "perl_arg_out"]:
+        if not inputs:
+            fail("linux_object %s generator %s requires a script input" % (ctx.label, generator))
+        perl_runtime = _linux_perl_runtime(ctx)
+        script = inputs[0]
+        action_inputs = depset(inputs, transitive = [perl_runtime.files])
+        mnemonic = "LinuxPerlAsm"
+        message = "Generating Linux perlasm source %{label}"
+        if generator == "perl_arg_out":
+            # The script writes the output itself, so the flavour word and the
+            # output path are ordinary arguments. Which word it is comes from
+            # the rule's cmd_* text, not from the architecture.
+            args.add(script)
+            args.add_all(ctx.attr.generator_args)
+            args.add(out)
+            executable = perl_runtime.interpreter
+        else:
+            # The script writes to stdout, which runandwrite redirects with a
+            # deliberately empty environment, so a script reaching for an
+            # undeclared file fails rather than silently succeeding.
+            args.add(out)
+            args.add(perl_runtime.interpreter)
+            args.add(script)
+            args.add_all(ctx.attr.generator_args)
+            executable = ctx.attr._runandwrite[DefaultInfo].files_to_run
+    elif generator == "raid6_unroll":
+        if not inputs:
+            fail("linux_object %s generator %s requires a template input" % (ctx.label, generator))
+        args.add_all(ctx.attr.generator_args)
+        args.add("-in", inputs[0])
+        args.add("-out", out)
+        executable = ctx.executable._unroll
+        mnemonic = "LinuxRaid6Unroll"
+        message = "Generating Linux RAID6 unrolled source %{label}"
+    elif generator == "raid6_mktables":
+        # The generator reads nothing: it writes the tables from compiled-in
+        # arithmetic, and the graph generator declares no inputs for it.
+        args.add("-out", out)
+        executable = ctx.executable._raid6tables
+        mnemonic = "LinuxRaid6Tables"
+        message = "Generating Linux RAID6 tables %{label}"
+    elif generator == "mkcapflags":
+        # generator_inputs is in rule order: cpufeatures.h, vmxfeatures.h and
+        # the script. The script is not read by the Go port, but it stays an
+        # action input to preserve the object's existing content identity.
+        if len(inputs) < 2:
+            fail("linux_object %s generator mkcapflags requires two feature headers" % ctx.label)
+        args.add("-cpufeatures", inputs[0])
+        args.add("-vmxfeatures", inputs[1])
+        args.add("-out", out)
+        executable = ctx.executable._capflags
+        mnemonic = "LinuxCapflags"
+        message = "Generating Linux x86 CPU capflags %{label}"
+    elif generator == "conmakehash":
+        if not inputs:
+            fail("linux_object %s generator conmakehash requires a font map input" % ctx.label)
+        args.add("-in", inputs[0])
+        args.add("-out", out)
+        executable = ctx.executable._conmakehash
+        mnemonic = "LinuxConsoleMap"
+        message = "Generating Linux console map %{label}"
+    else:
+        fail("linux_object %s uses unsupported generator %s" % (ctx.label, generator))
+
+    path_mapped_run(
+        ctx.actions,
+        executable = executable,
+        inputs = action_inputs,
+        outputs = [out],
+        arguments = [args],
+        mnemonic = mnemonic,
+        progress_message = message,
+    )
+
+    return struct(src = out, files = [out], path = generated_path)
+
 def _linux_compile_environment(ctx, rule_name):
     _validate_content_id(ctx.attr.compile_environment_id, "%s compile_environment_id" % rule_name)
     index = ctx.attr.compile_environment_index[LinuxCompileEnvironmentIndexInfo]
@@ -6012,11 +6120,20 @@ def _linux_object_impl(ctx):
     needs_relacheck = _linux_object_needs_relacheck(ctx.attr.object)
     if needs_relacheck and not ctx.executable.relacheck:
         fail("linux_object %s builds %s and requires relacheck" % (ctx.label, ctx.attr.object))
+
+    # Clang LTO module links do not apply to assembly. What matters is the
+    # language of the source actually compiled, which for a generated source is
+    # the generated target rather than the checked-in input: perlasm produces
+    # ".S" and must be excluded, but raid6's unroll produces ".c" and must not
+    # be. Testing "has a generator" instead would wrongly exclude the latter.
+    compiled_source_path = ctx.attr.generated_source
+    if not compiled_source_path and source_file != None:
+        compiled_source_path = source_file.path
     needs_module_lto_link = (
         ctx.attr.mode == "m" and
         config_values.get("CONFIG_LTO_CLANG") == "y" and
-        not _is_assembly_source(source_file) and
-        not _linux_perlasm_kind(ctx.attr.object) and
+        not _is_assembly_path(compiled_source_path) and
+        not _linux_legacy_perlasm_kind(ctx.attr.object) and
         not _is_dtb_source(source_file) and
         (ctx.attr.module_root or (ctx.attr.objtool_force and ctx.executable.objtool))
     )
@@ -6095,7 +6212,21 @@ def _linux_object_impl(ctx):
         )
         source_version_generated_path_files = [source_version_generated_primary, generated_header_path_file]
         exported_generated_header_path_files.append(generated_header_path_file)
-    perlasm_kind = _linux_perlasm_kind(ctx.attr.object)
+
+    # Rule-derived generated sources take precedence. While the pinned graph
+    # generator still emits no generator attribute this is always None and the
+    # legacy object-keyed branches below run unchanged.
+    rule_generated = _linux_generated_source(ctx)
+    if rule_generated != None:
+        src = rule_generated.src
+        generated_sources.extend(rule_generated.files)
+        source_version_generated_primary = struct(
+            file = rule_generated.src,
+            path = rule_generated.path,
+        )
+        source_version_generated_path_files = [source_version_generated_primary]
+
+    perlasm_kind = "" if rule_generated != None else _linux_legacy_perlasm_kind(ctx.attr.object)
     if perlasm_kind:
         generated = ctx.actions.declare_file(ctx.label.name + ".obj/" + ctx.attr.object[:-len(".o")] + ".S")
         perl_runtime = _linux_perl_runtime(ctx)
@@ -6190,7 +6321,11 @@ def _linux_object_impl(ctx):
         generated_sources.append(_source_tree_file(ctx, "scripts/dtc/libfdt/" + source_relpath.rsplit("/", 1)[-1]))
     if ctx.attr.object == "init/version.o":
         generated_sources.append(_source_tree_file(ctx, "init/version-timestamp.c"))
-    if ctx.attr.object == "arch/x86/kernel/cpu/capflags.o":
+    # The two "rule_generated == None" blocks below duplicate the mkcapflags
+    # and conmakehash branches of _linux_generated_source, as
+    # _LINUX_LEGACY_PERLASM_KINDS duplicates its perl branches. Change both
+    # copies together; all three go when the generator pin is bumped.
+    if rule_generated == None and ctx.attr.object == "arch/x86/kernel/cpu/capflags.o":
         generated = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/kernel/cpu/capflags.c")
         cap_args = ctx.actions.args()
         cpufeatures = _source_tree_file(ctx, "arch/x86/include/asm/cpufeatures.h")
@@ -6209,7 +6344,7 @@ def _linux_object_impl(ctx):
         )
         src = generated
         generated_sources.append(generated)
-    if ctx.attr.object == "drivers/tty/vt/consolemap_deftbl.o":
+    if rule_generated == None and ctx.attr.object == "drivers/tty/vt/consolemap_deftbl.o":
         generated = ctx.actions.declare_file(ctx.label.name + ".obj/drivers/tty/vt/consolemap_deftbl.c")
         con_args = ctx.actions.args()
         con_args.add("-in", source_file)
@@ -6648,6 +6783,33 @@ linux_object = rule(
         ),
         "modname": attr.string(),
         "object": attr.string(mandatory = True),
+        "generated_source": attr.string(
+            doc = "Source-relative path of the source produced by a Kbuild rule, " +
+                  "for example lib/raid6/int1.c. Empty when the object compiles a " +
+                  "checked-in source.",
+        ),
+        "generator": attr.string(
+            doc = "Executor that produces generated_source, derived by the graph " +
+                  "generator from the Kbuild rule's cmd_* text.",
+            # An unrecognised kind is a loading-phase error rather than a
+            # confusing analysis failure deep inside the rule.
+            values = [
+                "",
+                "perl_stdout",
+                "perl_arg_out",
+                "raid6_unroll",
+                "mkcapflags",
+                "conmakehash",
+                "raid6_mktables",
+            ],
+        ),
+        "generator_args": attr.string_list(
+            doc = "Extra generator arguments beyond input and output, in order.",
+        ),
+        "generator_inputs": attr.string_list(
+            doc = "Source-relative paths the generator reads, in Kbuild rule order. " +
+                  "Entry zero is the rule's $<.",
+        ),
         "genksyms": attr.label(
             cfg = "exec",
             doc = "Kernel-source-specific scripts/genksyms/genksyms executable.",
@@ -6712,6 +6874,16 @@ linux_object = rule(
         "_crctables": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/crctables"),
+            executable = True,
+        ),
+        "_unroll": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/unroll"),
+            executable = True,
+        ),
+        "_raid6tables": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/raid6tables"),
             executable = True,
         ),
         "_emptyrootdtb": attr.label(

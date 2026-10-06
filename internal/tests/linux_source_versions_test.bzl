@@ -377,7 +377,7 @@ def linux_source_versions_test_suite(name):
     )
     linux_source_input_index(
         name = source_inputs,
-        groups = ["1", "2", "3", "4", "5", "6"],
+        groups = ["1", "2", "3", "4", "5", "6", "7"],
         source_tree_info = ":" + source_tree,
         srcs = [
             "source_versions/shipped.c_shipped",
@@ -386,6 +386,9 @@ def linux_source_versions_test_suite(name):
             "source_versions/raw.s",
             "source_versions/preprocessed.S",
             "source_versions/regular.c",
+            # Sorts after shipped.c_shipped, so every existing index is
+            # unchanged. A name sorting earlier renumbers all of them.
+            "source_versions/unroll.uc",
         ],
         tags = fixture_tags,
     )
@@ -439,6 +442,7 @@ def linux_source_versions_test_suite(name):
     generated_cases = [
         struct(
             asn1_compiler = None,
+            content_id = "8" * 64,
             expected_paths = ["drivers/test/shipped.c"],
             name = "shipped",
             object = "drivers/test/shipped.o",
@@ -450,16 +454,45 @@ def linux_source_versions_test_suite(name):
                 "drivers/test/parser.asn1.c",
                 "drivers/test/parser.asn1.h",
             ],
+            content_id = "9" * 64,
             name = "asn1",
             object = "drivers/test/parser.asn1.o",
             source_input_file = 1,
         ),
         struct(
             asn1_compiler = None,
+            content_id = "a" * 64,
             expected_paths = ["lib/crypto/x86/poly1305-x86_64-cryptogams.S"],
             name = "perlasm",
             object = "lib/crypto/x86/poly1305-x86_64-cryptogams.o",
             source_input_file = 2,
+        ),
+        # The same perlasm generator reached through the rule-derived
+        # attributes instead of the legacy object table, at the path 6.12 uses.
+        struct(
+            asn1_compiler = None,
+            content_id = "b" * 64,
+            expected_paths = ["arch/x86/crypto/poly1305-x86_64-cryptogams.S"],
+            generated_source = "arch/x86/crypto/poly1305-x86_64-cryptogams.S",
+            generator = "perl_stdout",
+            generator_inputs = ["poly1305.pl"],
+            name = "perlasm_generated",
+            object = "arch/x86/crypto/poly1305-x86_64-cryptogams.o",
+            source_input_file = 2,
+        ),
+        # raid6 generates ".c", not ".S", so the output name has to come from
+        # generated_source rather than the object name.
+        struct(
+            asn1_compiler = None,
+            content_id = "c" * 64,
+            expected_paths = ["lib/raid6/int1.c"],
+            generated_source = "lib/raid6/int1.c",
+            generator = "raid6_unroll",
+            generator_args = ["-n", "1"],
+            generator_inputs = ["unroll.uc"],
+            name = "raid6_unroll",
+            object = "lib/raid6/int1.o",
+            source_input_file = 7,
         ),
     ]
     tests = []
@@ -470,7 +503,11 @@ def linux_source_versions_test_suite(name):
             asn1_compiler = case.asn1_compiler,
             compile_environment_id = _PLAIN_ENVIRONMENT,
             compile_environment_index = ":" + compile_environments,
-            content_id = ("8" if case.name == "shipped" else "9" if case.name == "asn1" else "a") * 64,
+            content_id = case.content_id,
+            generated_source = getattr(case, "generated_source", ""),
+            generator = getattr(case, "generator", ""),
+            generator_args = getattr(case, "generator_args", []),
+            generator_inputs = getattr(case, "generator_inputs", []),
             mode = "m",
             object = case.object,
             source_input_file = case.source_input_file,
