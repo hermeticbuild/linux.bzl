@@ -369,6 +369,14 @@ func linuxCFlags(config map[string]string, arch, version string) []string {
 	if enabled(config, "CONFIG_CC_IS_CLANG") {
 		flags = append(flags, "-fstrict-flex-arrays=3")
 	}
+	// Linux 6.19 includes tagged structs anonymously in other structs
+	// (include/linux/ns/ns_common_types.h), which needs this extension.
+	if kernelVersionAtLeast(version, 6, 19) {
+		flags = append(flags, "-fms-extensions")
+		if enabled(config, "CONFIG_CC_IS_CLANG") {
+			flags = append(flags, "-Wno-microsoft-anon-tag")
+		}
+	}
 	flags = append(flags,
 		"-fno-strict-overflow",
 		"-fno-stack-check",

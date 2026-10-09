@@ -500,3 +500,32 @@ func contains(values []string, want string) bool {
 	}
 	return false
 }
+
+func TestLinuxCFlagsFrom619UseMSExtensions(t *testing.T) {
+	for _, test := range []struct {
+		version string
+		clang   bool
+		want    []string
+		absent  []string
+	}{
+		{version: "6.18.39", clang: true, absent: []string{"-fms-extensions", "-Wno-microsoft-anon-tag"}},
+		{version: "6.19", clang: false, want: []string{"-fms-extensions"}, absent: []string{"-Wno-microsoft-anon-tag"}},
+		{version: "6.19.13", clang: true, want: []string{"-fms-extensions", "-Wno-microsoft-anon-tag"}},
+	} {
+		config := map[string]string{"CONFIG_X86_64": "y"}
+		if test.clang {
+			config["CONFIG_CC_IS_CLANG"] = "y"
+		}
+		flags := linuxCFlags(config, "x86", test.version)
+		for _, flag := range test.want {
+			if !contains(flags, flag) {
+				t.Errorf("linuxCFlags(%q, clang=%t) lacks %s: %v", test.version, test.clang, flag, flags)
+			}
+		}
+		for _, flag := range test.absent {
+			if contains(flags, flag) {
+				t.Errorf("linuxCFlags(%q, clang=%t) has %s: %v", test.version, test.clang, flag, flags)
+			}
+		}
+	}
+}
