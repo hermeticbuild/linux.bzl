@@ -1,0 +1,53 @@
+{
+  "build": {
+    "x86_64": {
+      "backend": "X86",
+      "triple": "x86_64-linux-gnu"
+    },
+    "armv7": {
+      "backend": "ARM",
+      "triple": "arm-linux-gnueabi"
+    },
+    "aarch64": {
+      "backend": "AArch64",
+      "triple": "aarch64-linux-gnu"
+    },
+    "riscv64": {
+      "backend": "RISCV",
+      "triple": "riscv64-linux-gnu"
+    },
+    "s390x": {
+      "backend": "SystemZ",
+      "triple": "s390x-linux-gnu"
+    },
+    "hexagon": {
+      "backend": "Hexagon",
+      "triple": "hexagon-linux-musl"
+    },
+    "loongarch64": {
+      "backend": "LoongArch",
+      "triple": "loongarch64-linux-gnusf"
+    },
+    "mips32": {
+      "backend": "Mips",
+      "triple": "mips-linux-gnu"
+    },
+    "ppc32": {
+      "backend": "PowerPC",
+      "triple": "powerpc-linux-gnu"
+    }
+  },
+  "skip": {
+    "arc": "LLVM source has no ARC integrated assembler; LLD has no ARC ELF linker",
+    "csky": "LLD source has no CSKY ELF linker",
+    "m68k": "LLD source has no M68k ELF linker",
+    "xtensa": "LLD source has no Xtensa ELF linker",
+    "sparc": "LLD SPARCV9 lacks complete input-relocation handling for kernel-required R_SPARC_WDISP16 and R_SPARC_WDISP19"
+  },
+  "compiler_only": {
+    "sparc64": {
+      "backend": "Sparc",
+      "triple": "sparc64-linux-gnu"
+    }
+  }
+}

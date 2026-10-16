@@ -1,0 +1,101 @@
+name: Kernel repository prototype
+
+on:
+  pull_request:
+    paths:
+      - 'tools/kernel_repository/**'
+      - '.github/workflows/kernel-repository.yml'
+  push:
+    branches:
+      - prototype/static-kernel-repository
+    paths:
+      - 'tools/kernel_repository/**'
+      - '.github/workflows/kernel-repository.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-repository-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-generator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      USE_BAZEL_VERSION: 9.1.0
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkout pinned kernel input
+        uses: actions/checkout@v5
+        with:
+          repository: torvalds/linux
+          ref: 0fcb05b72344f40806cbe810de8872f1698bf053
+          path: _tmp/linux
+          persist-credentials: false
+
+      - name: Install bootstrap and tracing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools build-essential bison flex patch strace
+
+      - name: Configure Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: kernel-repository
+          repository-cache: |
+            - MODULE.bazel
+            - MODULE.bazel.lock
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build static generator from source
+        run: python3 tools/kernel_repository/build.py --jobs 4
+
+      - name: Audit standalone generation
+        run: |
+          python3 tools/kernel_repository/test_repository.py \
+            --tool _tmp/kernel-repository/kernel-repository \
+            --linux _tmp/linux --out _tmp/kernel-repository/check --strace
+
+      - name: Create repository-rule consumer
+        run: |
+          python3 tools/kernel_repository/example.py \
+            --generated _tmp/kernel-repository/check/repo
+
+      - name: Test configuration and platform analysis
+        working-directory: _tmp/kernel-repository/example
+        run: |
+          bazel test \
+            @kernel//architecture_tests:multi_platform_test \
+            @kernel//architecture_tests:x86_32_test \
+            @kernel//architecture_tests:unsupported_cpu_test \
+            @kernel//architecture_tests:x86_64_test \
+            @kernel//architecture_tests:aarch64_test \
+            @kernel//architecture_tests:riscv64_test \
+            @kernel//architecture_tests:conflicting_width_test \
+            --jobs=4 --test_output=errors
+
+      - name: Build and link with host tools blocked
+        working-directory: _tmp/kernel-repository/example
+        run: |
+          bazel build @kernel//examples:kernel @kernel//execution_tools:check \
+            @kernel//multi_platform:configs --jobs=4 \
+            --sandbox_block_path=/bin --sandbox_block_path=/usr/bin \
+            --sandbox_block_path=/usr/local/bin
+
+      - name: Upload generation diagnostics and executable
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-repository-prototype
+          path: |
+            _tmp/kernel-repository/kernel-repository
+            _tmp/kernel-repository/check/exec.trace
+            _tmp/kernel-repository/check/generation.log
+            _tmp/kernel-repository/example/bazel-testlogs/**/test.log
+          if-no-files-found: warn
+          retention-days: 7

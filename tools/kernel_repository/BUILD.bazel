@@ -1,0 +1,11 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["repository.bzl"])
+
+filegroup(
+    name = "sources",
+    srcs = glob(
+        ["**"],
+        exclude = ["**/__pycache__/**"],
+    ),
+)

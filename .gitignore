@@ -2,3 +2,4 @@
 .bazelrc.user
 bazel-*
 /dist/
+/_tmp/

@@ -1,0 +1,302 @@
+--- a/src/read.c
++++ b/src/read.c
+@@ -142,7 +142,7 @@
+ static void do_undefine (char *name, enum variable_origin origin,
+                          struct ebuffer *ebuf);
+ static struct variable *do_define (char *name, enum variable_origin origin,
+-                                   struct ebuffer *ebuf);
++                                   struct ebuffer *ebuf, const struct vmodifiers *mods);
+ static int conditional_line (char *line, size_t len, const floc *flocp);
+ static void check_specials (struct nameseq *filep, int set_default);
+ static void check_special_file (struct file *filep, const floc *flocp);
+@@ -571,10 +571,14 @@
+ 
+    SET_DEFAULT is true if we are allowed to set the default goal.  */
+ 
++#include "ast_export.inc"
++
+ static void
+ eval (struct ebuffer *ebuf, int set_default)
+ {
+   char *collapsed = 0;
++  if (getenv ("LINUX_BZL_MAKE_AST"))
++    { ast_read (ebuf); return; }
+   size_t collapsed_length = 0;
+   size_t commands_len = 200;
+   char *commands;
+@@ -752,7 +756,7 @@
+             continue;
+           }
+           else if (vmod.define_v)
+-            v = do_define (p, origin, ebuf);
++            v = do_define (p, origin, ebuf, &vmod);
+           else
+             v = try_variable_definition (fstart, p, origin, 0);
+ 
+@@ -1409,7 +1413,8 @@
+    the variable to be defined.  The following lines remain to be read.  */
+ 
+ static struct variable *
+-do_define (char *name, enum variable_origin origin, struct ebuffer *ebuf)
++do_define (char *name, enum variable_origin origin, struct ebuffer *ebuf,
++           const struct vmodifiers *mods)
+ {
+   struct variable *v;
+   struct variable var;
+@@ -1435,8 +1440,8 @@
+       var.name[var.length] = '\0';
+     }
+ 
+-  /* Expand the variable name and find the beginning (NAME) and end.  */
+-  n = allocated_variable_expand (name);
++  /* Syntax export preserves the unexpanded variable name. */
++  n = getenv ("LINUX_BZL_MAKE_AST") ? xstrdup (name) : allocated_variable_expand (name);
+   name = next_token (n);
+   if (name[0] == '\0')
+     O (fatal, &defstart, _("empty variable name"));
+@@ -1509,8 +1514,17 @@
+   else
+     definition[idx - 1] = '\0';
+ 
+-  v = do_variable_definition (&defstart, name,
+-                              definition, origin, var.flavor, 0);
++  if (getenv ("LINUX_BZL_MAKE_AST"))
++    {
++      var.name = name;
++      var.length = strlen (name);
++      var.value = definition;
++      ast_assignment ("define", "", &var, mods, &defstart);
++      v = NULL;
++    }
++  else
++    v = do_variable_definition (&defstart, name,
++                                definition, origin, var.flavor, 0);
+   free (definition);
+   free (n);
+   return (v);
+@@ -1554,6 +1568,18 @@
+   /* Found one: skip past it and any whitespace after it.  */
+   line += len;
+   NEXT_TOKEN (line);
++
++  /* The syntax path uses this same native conditional operand parser. */
++  if (ast_condition_mode)
++    {
++      if (cmdtype == c_endif) return 0;
++      if (cmdtype == c_else)
++        {
++          if (!*line) return 0;
++          return conditional_line (line, end_of_token (line) - line, flocp);
++        }
++      goto AST_CONDITION;
++    }
+ 
+ #define EXTRATEXT() OS (error, flocp, _("extraneous text after '%s' directive"), cmdname)
+ #define EXTRACMD()  OS (fatal, flocp, _("extraneous '%s'"), cmdname)
+@@ -1661,12 +1687,21 @@
+         return 1;
+       }
+ 
++AST_CONDITION:
+   if (cmdtype == c_ifdef || cmdtype == c_ifndef)
+     {
+       size_t l;
+       char *var;
+       struct variable *v;
+       char *p;
++
++      if (ast_condition_mode)
++        {
++          fprintf (ast_output, ",\"condition\":{\"directive\":\"%s\",\"operands\":[", cmdname);
++          make_ast_export_expression (ast_output, line, SIZE_MAX);
++          fputs ("]}", ast_output);
++          return 0;
++        }
+ 
+       /* Expand the thing we're looking up, so we can use indirect and
+          constructed variable names.  */
+@@ -1728,7 +1763,7 @@
+       else
+         *line++ = '\0';
+ 
+-      s2 = variable_expand (s1);
++      s2 = ast_condition_mode ? s1 : variable_expand (s1);
+       /* We must allocate a new copy of the expanded string because
+          variable_expand re-uses the same buffer.  */
+       l = strlen (s2);
+@@ -1776,6 +1811,15 @@
+       NEXT_TOKEN (line);
+       if (*line != '\0')
+         EXTRATEXT ();
++      if (ast_condition_mode)
++        {
++          fprintf (ast_output, ",\"condition\":{\"directive\":\"%s\",\"operands\":[", cmdname);
++          make_ast_export_expression (ast_output, s1, SIZE_MAX);
++          fputc (',', ast_output);
++          make_ast_export_expression (ast_output, s2, SIZE_MAX);
++          fputs ("]}", ast_output);
++          return 0;
++        }
+ 
+       s2 = variable_expand (s2);
+       conditionals->ignoring[o] = (streq (s1, s2) == (cmdtype == c_ifneq));
+--- a/src/main.c
++++ b/src/main.c
+@@ -2083,6 +2083,20 @@
+ 
+     /* Read all the makefiles.  */
+     read_files = read_all_makefiles (makefiles == 0 ? 0 : makefiles->list);
++    if (getenv ("LINUX_BZL_MAKE_SETUP"))
++      {
++        make_ast_export_setup (getenv ("LINUX_BZL_MAKE_SETUP"));
++        exit (0);
++      }
++    if (getenv ("LINUX_BZL_MAKE_AST"))
++      {
++        struct goaldep *entry;
++        for (entry = read_files; entry; entry = entry->next)
++          if (entry->error)
++            { errno = entry->error; pfatal_with_name (entry->file->name); }
++        exit (0);
++      }
++
+ 
+     arg_job_slots = INVALID_JOB_SLOTS;
+ 
+--- a/src/expand.c
++++ b/src/expand.c
+@@ -216,6 +216,8 @@
+    Return a pointer to LINE, or to the beginning of the buffer if LINE is
+    NULL.
+  */
++#include "expr_export.inc"
++
+ char *
+ variable_expand_string (char *line, const char *string, size_t length)
+ {
+@@ -250,7 +252,10 @@
+ 
+       p1 = strchr (p, '$');
+ 
+-      o = variable_buffer_output (o, p, p1 != 0 ? (size_t) (p1 - p) : strlen (p) + 1);
++      if (make_ast_expression_output)
++        make_ast_expr_literal (p, p1 != 0 ? (size_t) (p1 - p) : strlen (p));
++      else
++        o = variable_buffer_output (o, p, p1 != 0 ? (size_t) (p1 - p) : strlen (p) + 1);
+ 
+       if (p1 == 0)
+         break;
+@@ -264,7 +269,8 @@
+         case '\0':
+           /* $$ or $ at the end of the string means output one $ to the
+              variable output buffer.  */
+-          o = variable_buffer_output (o, p1, 1);
++          if (make_ast_expression_output) make_ast_expr_literal ("$", 1);
++          else o = variable_buffer_output (o, p1, 1);
+           break;
+ 
+         case '(':
+@@ -313,9 +319,14 @@
+                    such as '$($(a)'.  */
+                 if (count < 0)
+                   {
+-                    abeg = expand_argument (beg, p); /* Expand the name.  */
+-                    beg = abeg;
+-                    end = strchr (beg, '\0');
++                    if (make_ast_expression_output)
++                      end = p;
++                    else
++                      {
++                        abeg = expand_argument (beg, p);
++                        beg = abeg;
++                        end = strchr (beg, '\0');
++                      }
+                   }
+               }
+             else
+@@ -328,6 +339,8 @@
+                any variable references inside are now expanded.
+                Is the resultant text a substitution reference?  */
+ 
++            if (make_ast_expression_output)
++              { make_ast_expr_reference (beg, end - beg); break; }
+             colon = lindex (beg, end, ':');
+             if (colon)
+               {
+@@ -415,7 +428,8 @@
+ 
+           /* A $ followed by a random char is a variable reference:
+              $a is equivalent to $(a).  */
+-          o = reference_variable (o, p, 1);
++          if (make_ast_expression_output) make_ast_expr_reference (p, 1);
++          else o = reference_variable (o, p, 1);
+ 
+           break;
+         }
+--- a/src/function.c
++++ b/src/function.c
+@@ -2655,7 +2655,7 @@
+      not, make a duplicate of the string and point into that, nul-terminating
+      each argument.  */
+ 
+-  if (entry_p->expand_args)
++  if (entry_p->expand_args && !make_ast_expression_output)
+     {
+       const char *p;
+       for (p=beg, nargs=0; p <= end; ++argvp)
+@@ -2699,10 +2699,13 @@
+   *argvp = NULL;
+ 
+   /* Finally!  Run the function...  */
+-  *op = expand_builtin_function (*op, nargs, argv, entry_p);
++  if (make_ast_expression_output)
++    make_ast_expr_function (entry_p->name, nargs, argv, entry_p->expand_args);
++  else
++    *op = expand_builtin_function (*op, nargs, argv, entry_p);
+ 
+   /* Free memory.  */
+-  if (entry_p->expand_args)
++  if (entry_p->expand_args && !make_ast_expression_output)
+     for (argvp=argv; *argvp != 0; ++argvp)
+       free (*argvp);
+   else
+--- a/src/variable.h
++++ b/src/variable.h
+@@ -241,3 +241,11 @@
+ 
+ #define MAKELEVEL_NAME "MAKELEVEL"
+ #define MAKELEVEL_LENGTH (CSTRLEN (MAKELEVEL_NAME))
++
++/* Prototype expansion-operation export. */
++extern FILE *make_ast_expression_output;
++void make_ast_export_expression (FILE *, const char *, size_t);
++void make_ast_expr_literal (const char *, size_t);
++void make_ast_expr_function (const char *, unsigned int, char **, int);
++
++void make_ast_export_setup (const char *path);
+--- a/src/job.c
++++ b/src/job.c
+@@ -1697,6 +1697,15 @@
+   char **lines;
+   unsigned int i;
+ 
++  /* Bazel owns the prerequisite graph.  This Make process owns one recipe. */
++  const char *leaf = getenv ("LINUX_BZL_MAKE_LEAF");
++  if (leaf && strcmp (leaf, file->name) != 0)
++    {
++      fprintf (stderr, "Bazel leaf %s attempted undeclared prerequisite recipe %s\n",
++               leaf, file->name);
++      exit (2);
++    }
++
+   /* Let any previously decided-upon jobs that are waiting
+      for the load to go down start before this new one.  */
+   start_waiting_jobs ();
+--- a/src/variable.c
++++ b/src/variable.c
+@@ -2055,3 +2055,5 @@
+   free (oldpath);
+ }
+ #endif
++
++#include "setup_export.inc"

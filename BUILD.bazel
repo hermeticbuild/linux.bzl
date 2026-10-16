@@ -30,12 +30,14 @@ gazelle_test(
 
 buildifier(
     name = "buildifier",
+    exclude_patterns = ["./_tmp"],
     lint_mode = "fix",
     mode = "fix",
 )
 
 buildifier_test(
     name = "buildifier_test",
+    exclude_patterns = ["./_tmp"],
     lint_mode = "warn",
     lint_warnings = [
         "-module-docstring",
