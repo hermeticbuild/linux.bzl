@@ -1,1 +1,3 @@
+# Expected-failure analysis tests include the selected LLVM toolchain closure.
+build --analysis_testing_deps_limit=10000
 try-import %workspace%/.bazelrc.user

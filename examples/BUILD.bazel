@@ -1,5 +1,5 @@
 load("@kernel//rules:example_configs.bzl", "EXAMPLE_CONFIGS")
-load(":kernel.bzl", "example_config_test", "example_initramfs", "kernel_example")
+load(":kernel.bzl", "btf_capability_test", "example_config_test", "example_initramfs", "kernel_example")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -93,4 +93,9 @@ example_config_test(
         "KERNEL_LZ4": "y",
         "KERNEL_GZIP": "n",
     },
+)
+
+btf_capability_test(
+    name = "btf_capability_test",
+    target_under_test = ":x86_64_btf_vmlinux",
 )

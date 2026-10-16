@@ -58,31 +58,19 @@ jobs:
             --tool _tmp/kernel-repository/kernel-repository \
             --linux _tmp/linux --out _tmp/kernel-repository/check --strace
 
-      - name: Create repository-rule consumer
+      - name: Package consumer support
         run: |
-          python3 example.py \
-            --generated _tmp/kernel-repository/check/repo
+          mkdir -p _tmp/kernel-repository/support/rules
+          cp _tmp/kernel-repository/check/repo/MODULE.bazel _tmp/kernel-repository/check/repo/repository-tool.json _tmp/kernel-repository/support/
+          cp _tmp/kernel-repository/check/repo/rules/*.patch _tmp/kernel-repository/support/rules/
+          tar -czf _tmp/kernel-repository/consumer-support.tar.gz -C _tmp/kernel-repository kernel-repository support
 
-      - name: Test configuration and platform analysis
-        working-directory: examples
-        run: |
-          bazel test //:x86_64_config_test //:aarch64_config_test //:debug_config_test //:lz4_config_test \
-            @kernel//architecture_tests:multi_platform_test \
-            @kernel//architecture_tests:x86_32_test \
-            @kernel//architecture_tests:unsupported_cpu_test \
-            @kernel//architecture_tests:x86_64_test \
-            @kernel//architecture_tests:aarch64_test \
-            @kernel//architecture_tests:riscv64_test \
-            @kernel//architecture_tests:conflicting_width_test \
-            --jobs=4 --test_output=errors
-
-      - name: Build and link with host tools blocked
-        working-directory: examples
-        run: |
-          bazel build //:x86_64_kernel //:x86_64_debug_kernel //:x86_64_lz4_kernel //:aarch64_kernel //:example_initramfs @kernel//execution_tools:check \
-            @kernel//multi_platform:configs --jobs=4 \
-            --sandbox_block_path=/bin --sandbox_block_path=/usr/bin \
-            --sandbox_block_path=/usr/local/bin
+      - name: Upload consumer support
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-repository-consumer
+          path: _tmp/kernel-repository/consumer-support.tar.gz
+          retention-days: 7
 
       - name: Upload generation diagnostics and executable
         if: ${{ !cancelled() }}
@@ -95,4 +83,100 @@ jobs:
             _tmp/kernel-repository/check/generation.log
             examples/bazel-testlogs/**/test.log
           if-no-files-found: warn
+          retention-days: 7
+
+  examples:
+    name: Example / ${{ matrix.example }}
+    needs: static-generator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      USE_BAZEL_VERSION: 9.1.0
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - example: x86_64
+            test: //:x86_64_config_test
+            build: //:x86_64_kernel
+          - example: aarch64
+            test: //:aarch64_config_test
+            build: //:aarch64_kernel
+          - example: debug
+            test: //:debug_config_test
+            build: //:x86_64_debug_kernel
+          - example: lz4
+            test: //:lz4_config_test
+            build: //:x86_64_lz4_kernel
+          - example: btf-capability-gap
+            test: //:btf_capability_test
+            build: //:x86_64_btf_vmlinux_config
+          - example: initramfs
+            build: //:example_initramfs
+          - example: graph-metadata
+            build: //:x86_64_shared_graph_metadata
+          - example: platforms
+            test: >-
+              @kernel//architecture_tests:multi_platform_test
+              @kernel//architecture_tests:x86_32_test
+              @kernel//architecture_tests:unsupported_cpu_test
+              @kernel//architecture_tests:x86_64_test
+              @kernel//architecture_tests:aarch64_test
+              @kernel//architecture_tests:riscv64_test
+              @kernel//architecture_tests:conflicting_width_test
+            build: '@kernel//multi_platform:configs @kernel//execution_tools:check'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkout pinned kernel input
+        uses: actions/checkout@v5
+        with:
+          repository: torvalds/linux
+          ref: 0fcb05b72344f40806cbe810de8872f1698bf053
+          path: _tmp/linux
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: kernel-repository-consumer
+          path: _tmp/kernel-repository
+
+      - name: Configure repository-rule consumer
+        run: |
+          tar -xzf _tmp/kernel-repository/consumer-support.tar.gz -C _tmp/kernel-repository
+          python3 example.py --generated _tmp/kernel-repository/support
+
+      - name: Configure Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: example-${{ matrix.example }}
+          repository-cache: |
+            - MODULE.bazel
+            - MODULE.bazel.lock
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Test example analysis
+        if: ${{ matrix.test != '' }}
+        working-directory: examples
+        env:
+          TEST_TARGETS: ${{ matrix.test }}
+        run: bazel test $TEST_TARGETS --jobs=4 --test_output=errors
+
+      - name: Build example with host tools blocked
+        working-directory: examples
+        env:
+          BUILD_TARGETS: ${{ matrix.build }}
+        run: |
+          bazel build $BUILD_TARGETS --jobs=4 \
+            --sandbox_block_path=/bin --sandbox_block_path=/usr/bin \
+            --sandbox_block_path=/usr/local/bin
+
+      - name: Upload example test logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: example-${{ matrix.example }}-logs
+          path: examples/bazel-testlogs/**/test.log
+          if-no-files-found: ignore
           retention-days: 7

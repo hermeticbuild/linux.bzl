@@ -50,3 +50,20 @@ available through `x86_64_btf_vmlinux_config`.
 The former module-output labels and release-specific graph repositories belong
 to the replaced implementation. The prototype currently proves configuration,
 individual object actions, native code generation, and kernel build/link.
+
+CI builds the static generator once, then runs independent example jobs:
+
+| CI example | Bazel build target | Analysis test |
+| --- | --- | --- |
+| x86_64 | `//:x86_64_kernel` | `//:x86_64_config_test` |
+| aarch64 | `//:aarch64_kernel` | `//:aarch64_config_test` |
+| debug | `//:x86_64_debug_kernel` | `//:debug_config_test` |
+| lz4 | `//:x86_64_lz4_kernel` | `//:lz4_config_test` |
+| btf-capability-gap | `//:x86_64_btf_vmlinux_config` | `//:btf_capability_test` |
+| initramfs | `//:example_initramfs` | — |
+| graph-metadata | `//:x86_64_shared_graph_metadata` | — |
+
+A separate platform job runs the generated architecture tests, builds the
+multi-platform configs, and checks execution tools. Every example build blocks
+host tool directories. The BTF test expects the specific missing-capability
+analysis failure; it does not establish that a BTF kernel builds successfully.

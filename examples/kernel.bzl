@@ -1,5 +1,6 @@
 """Examples built from generated Kconfig/Make data and selected Bazel platforms."""
 
+load("@bazel_skylib//lib:unittest.bzl", "analysistest", "asserts")
 load("@kernel//rules:execution_tools.bzl", "EXECUTION_TOOLS_TYPE")
 load("@kernel//rules:image.bzl", "kbuild_resolved_build")
 load("@kernel//rules:rules.bzl", "KernelConfigInfo", "kernel_config")
@@ -80,3 +81,13 @@ example_initramfs = rule(implementation = _initramfs_impl, toolchains = [EXECUTI
     "motd": attr.label(mandatory = True, allow_single_file = True),
     "_writer": attr.label(default = "//:initramfs.py", allow_single_file = True),
 })
+
+def _btf_capability_test_impl(ctx):
+    env = analysistest.begin(ctx)
+    asserts.expect_failure(env, "Required kernel option DEBUG_INFO_BTF=y resolved to n")
+    return analysistest.end(env)
+
+btf_capability_test = analysistest.make(
+    _btf_capability_test_impl,
+    expect_failure = True,
+)
