@@ -1,5 +1,6 @@
 *.swp
 .bazelrc.user
 bazel-*
-/dist/
 /_tmp/
+__pycache__/
+*.pyc

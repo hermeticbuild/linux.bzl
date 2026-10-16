@@ -1,2 +1,2 @@
-aya_e2e/patches/*.patch -whitespace
-tools/kernel_repository/**/*.patch -whitespace
+native/*.patch -whitespace
+renderer/*.patch -whitespace

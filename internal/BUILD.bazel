@@ -1,6 +1,0 @@
-package(default_visibility = ["//:__subpackages__"])
-
-exports_files(
-    ["linux_object_groups.bzl"],
-    visibility = ["//visibility:public"],
-)

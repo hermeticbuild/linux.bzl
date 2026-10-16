@@ -1,51 +1,96 @@
-load("@linux.bzl", "initramfs")
+load("@kernel//rules:example_configs.bzl", "EXAMPLE_CONFIGS")
+load(":kernel.bzl", "example_config_test", "example_initramfs", "kernel_example")
 
 package(default_visibility = ["//visibility:public"])
 
-initramfs(
+exports_files([
+    ".generated/rules_bison_cstdlib.patch",
+    ".generated/rules_cc_autoconf_no_host_shell.patch",
+])
+
+example_initramfs(
     name = "example_initramfs",
-    character_devices = {
-        "/dev/console": "5:1",
-        "/dev/null": "1:3",
-    },
-    directories = ["/proc"],
-    files = {
-        "/etc/motd": "README.md",
-    },
+    motd = "README.md",
 )
 
-alias(
+kernel_example(
     name = "x86_64_kernel",
-    actual = "@example_x86_64//:kernel",
+    platform = "@llvm//platforms:linux_x86_64",
+    requested = EXAMPLE_CONFIGS["x86_64"],
 )
 
-alias(
+kernel_example(
     name = "x86_64_debug_kernel",
-    actual = "@example_x86_64//variants/debug:kernel",
+    overrides = EXAMPLE_CONFIGS["debug"],
+    platform = "@llvm//platforms:linux_x86_64",
+    requested = EXAMPLE_CONFIGS["x86_64"],
 )
 
-alias(
-    name = "x86_64_btf_vmlinux",
-    actual = "@example_x86_64//variants/btf:vmlinux",
-)
-
-alias(
+kernel_example(
     name = "x86_64_lz4_kernel",
-    actual = "@example_x86_64//variants/lz4:kernel",
+    overrides = EXAMPLE_CONFIGS["lz4"],
+    platform = "@llvm//platforms:linux_x86_64",
+    requested = EXAMPLE_CONFIGS["x86_64"],
 )
 
-genrule(
-    name = "x86_64_shared_graph_metadata",
-    srcs = ["@example_x86_64//graph:metadata.json"],
-    outs = ["x86_64_shared_graph_metadata.json"],
-    cmd = "cp $(location @example_x86_64//graph:metadata.json) $@",
-    tags = [
-        "local",
-        "manual",
-    ],
+# Kept as an explicit check of the requested BTF behavior. The current prototype
+# must fail if its declared capability policy cannot enable DEBUG_INFO_BTF.
+kernel_example(
+    name = "x86_64_btf_vmlinux",
+    overrides = EXAMPLE_CONFIGS["btf"],
+    platform = "@llvm//platforms:linux_x86_64",
+    requested = EXAMPLE_CONFIGS["x86_64"],
+    required_options = {"DEBUG_INFO_BTF": "y"},
+    tags = ["manual"],
 )
 
-alias(
+kernel_example(
     name = "aarch64_kernel",
-    actual = "@example_aarch64//:kernel",
+    platform = "@llvm//platforms:linux_aarch64",
+    requested = EXAMPLE_CONFIGS["aarch64"],
+)
+
+filegroup(
+    name = "x86_64_shared_graph_metadata",
+    srcs = [":x86_64_kernel"],
+    output_group = "manifest",
+)
+
+example_config_test(
+    name = "x86_64_config_test",
+    config = ":x86_64_kernel_config",
+    expected = {
+        "X86": "y",
+        "64BIT": "y",
+        "MODULES": "n",
+    },
+)
+
+example_config_test(
+    name = "aarch64_config_test",
+    config = ":aarch64_kernel_config",
+    expected = {
+        "ARM64": "y",
+        "64BIT": "y",
+        "MODULES": "n",
+    },
+)
+
+example_config_test(
+    name = "debug_config_test",
+    config = ":x86_64_debug_kernel_config",
+    expected = {
+        "DEBUG_KERNEL": "y",
+        "LOCALVERSION": '"-debug"',
+        "RANDOMIZE_BASE": "n",
+    },
+)
+
+example_config_test(
+    name = "lz4_config_test",
+    config = ":x86_64_lz4_kernel_config",
+    expected = {
+        "KERNEL_LZ4": "y",
+        "KERNEL_GZIP": "n",
+    },
 )

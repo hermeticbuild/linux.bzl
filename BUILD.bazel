@@ -1,43 +1,59 @@
-# gazelle:prefix github.com/hermeticbuild/linux.bzl
-# gazelle:exclude aya_e2e
-# gazelle:exclude e2e
-# gazelle:exclude examples
-# gazelle:exclude sonic_e2e
-# gazelle:resolve go github.com/bazelbuild/bazel-gazelle/rule @gazelle//rule
-
 load("@buildifier_prebuilt//:rules.bzl", "buildifier", "buildifier_test")
-load("@gazelle//:def.bzl", "gazelle", "gazelle_test")
+load("@rules_python//python:defs.bzl", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files([
-    "extensions.bzl",
-    "linux.bzl",
-    "source_repo.BUILD.bazel",
-])
+exports_files(["repository.bzl"])
 
-gazelle(
-    name = "gazelle",
-    extra_args = ["internal"],
+filegroup(
+    name = "generator_sources",
+    srcs = [
+        "build.py",
+        "example.py",
+        "launcher.c",
+        "test_repository.py",
+    ] + glob(
+        [
+            "native/**",
+            "renderer/**",
+        ],
+        exclude = ["**/__pycache__/**"],
+    ),
 )
 
-gazelle_test(
-    name = "gazelle_test",
-    extra_args = ["internal"],
-    tags = ["no-remote"],
-    workspace = "//:MODULE.bazel",
+py_test(
+    name = "prototype_test",
+    srcs = [
+        "prototype_test.py",
+        "renderer/export.py",
+        "renderer/repository_main.py",
+    ],
+    args = [
+        "--initramfs",
+        "$(rootpath @example_fixtures//:initramfs.py)",
+        "--config-anchor",
+        "$(rootpath @example_fixtures//configs:x86_64.config)",
+    ],
+    data = ["@example_fixtures//:initramfs.py"] + ["@example_fixtures//configs:" + name + ".config" for name in [
+        "x86_64",
+        "aarch64",
+        "debug",
+        "btf",
+        "lz4",
+    ]],
+    imports = ["renderer"],
 )
 
 buildifier(
     name = "buildifier",
-    exclude_patterns = ["./_tmp"],
+    exclude_patterns = ["*/[._]*"],
     lint_mode = "fix",
     mode = "fix",
 )
 
 buildifier_test(
     name = "buildifier_test",
-    exclude_patterns = ["./_tmp"],
+    exclude_patterns = ["*/[._]*"],
     lint_mode = "warn",
     lint_warnings = [
         "-module-docstring",
@@ -47,6 +63,5 @@ buildifier_test(
         "-function-docstring-return",
     ],
     no_sandbox = True,
-    tags = ["no-remote"],
     workspace = "//:MODULE.bazel",
 )

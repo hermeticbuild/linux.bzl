@@ -2,15 +2,9 @@ name: Kernel repository prototype
 
 on:
   pull_request:
-    paths:
-      - 'tools/kernel_repository/**'
-      - '.github/workflows/kernel-repository.yml'
   push:
     branches:
       - prototype/static-kernel-repository
-    paths:
-      - 'tools/kernel_repository/**'
-      - '.github/workflows/kernel-repository.yml'
   workflow_dispatch:
 
 permissions:
@@ -52,24 +46,27 @@ jobs:
             - MODULE.bazel.lock
           cache-save: ${{ github.event_name != 'pull_request' }}
 
+      - name: Test prototype helpers and formatting
+        run: bazel test //... --jobs=4 --test_output=errors
+
       - name: Build static generator from source
-        run: python3 tools/kernel_repository/build.py --jobs 4
+        run: python3 build.py --jobs 4
 
       - name: Audit standalone generation
         run: |
-          python3 tools/kernel_repository/test_repository.py \
+          python3 test_repository.py \
             --tool _tmp/kernel-repository/kernel-repository \
             --linux _tmp/linux --out _tmp/kernel-repository/check --strace
 
       - name: Create repository-rule consumer
         run: |
-          python3 tools/kernel_repository/example.py \
+          python3 example.py \
             --generated _tmp/kernel-repository/check/repo
 
       - name: Test configuration and platform analysis
-        working-directory: _tmp/kernel-repository/example
+        working-directory: examples
         run: |
-          bazel test \
+          bazel test //:x86_64_config_test //:aarch64_config_test //:debug_config_test //:lz4_config_test \
             @kernel//architecture_tests:multi_platform_test \
             @kernel//architecture_tests:x86_32_test \
             @kernel//architecture_tests:unsupported_cpu_test \
@@ -80,9 +77,9 @@ jobs:
             --jobs=4 --test_output=errors
 
       - name: Build and link with host tools blocked
-        working-directory: _tmp/kernel-repository/example
+        working-directory: examples
         run: |
-          bazel build @kernel//examples:kernel @kernel//execution_tools:check \
+          bazel build //:x86_64_kernel //:x86_64_debug_kernel //:x86_64_lz4_kernel //:aarch64_kernel //:example_initramfs @kernel//execution_tools:check \
             @kernel//multi_platform:configs --jobs=4 \
             --sandbox_block_path=/bin --sandbox_block_path=/usr/bin \
             --sandbox_block_path=/usr/local/bin
@@ -96,6 +93,6 @@ jobs:
             _tmp/kernel-repository/kernel-repository
             _tmp/kernel-repository/check/exec.trace
             _tmp/kernel-repository/check/generation.log
-            _tmp/kernel-repository/example/bazel-testlogs/**/test.log
+            examples/bazel-testlogs/**/test.log
           if-no-files-found: warn
           retention-days: 7

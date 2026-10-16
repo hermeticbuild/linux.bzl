@@ -1,5 +1,1 @@
-import %workspace%/.bazelrc.shared
-
-common:remote --extra_execution_platforms=@llvm//:rbe_platform
-
 try-import %workspace%/.bazelrc.user

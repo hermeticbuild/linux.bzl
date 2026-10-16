@@ -1,1 +1,3 @@
 bazel-*
+.generated/
+MODULE.bazel.lock
