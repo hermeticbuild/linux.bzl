@@ -66,6 +66,26 @@ jobs:
         working-directory: experiments/autoconf
         run: python3 validate.py
 
+      - name: Compare Clang and LLD configurations with pristine conf
+        working-directory: experiments/autoconf
+        run: |
+          bazel test //:parity_x86_64_test //:parity_debug_test //:parity_lz4_test //:parity_btf_test //:arm64_parity_test \
+            --extra_toolchains=@llvm//toolchain:linux_x86_64_to_linux_x86_64,@llvm//toolchain:linux_x86_64_to_linux_aarch64 \
+            --test_output=errors
+
+      - name: Check a compiler built in the same invocation
+        working-directory: experiments/autoconf
+        run: bazel test //:action_built_parity_test --extra_toolchains=//:driver_toolchain --test_output=errors
+
+      - name: Check source edit reuse
+        working-directory: experiments/autoconf
+        run: |
+          decoder="$RUNNER_TEMP/autoconf-execution-log-decoder"
+          curl --fail --location --output "$decoder" https://github.com/buildbuddy-io/bazel/releases/download/5.0.492/bazel-5.0.492-linux-x86_64
+          echo "e9e996a1a01555e45433acf9432f9d40d5bda437812a830d6701fe9b09853df9  $decoder" | sha256sum --check
+          chmod +x "$decoder"
+          python3 check_reuse.py --decoder "$decoder" --source ../../_tmp/linux/init/main.c
+
       - name: Upload comparison reports
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
@@ -74,5 +94,6 @@ jobs:
           path: |
             experiments/autoconf/validation/
             experiments/autoconf/bazel-testlogs/**/test.log
+            experiments/autoconf/bazel-out/**/bin/*.report/**
           if-no-files-found: warn
           retention-days: 7

@@ -79,17 +79,19 @@ def build_objtool(ctx, prepared, architecture, host_flags, link_flags, capabilit
         flags = [f.replace("../", source + "/tools/") for f in flags]
         out = ctx.actions.declare_file("objtool/" + obj + ".o")
         ctx.actions.run(
-            executable = execution.commands["gcc"],
+            executable = execution.host_cc,
             arguments = host_flags + flags + ["-c", source + "/" + src, "-o", out.path],
             inputs = depset(generated, transitive = [prepared.files, execution.files]),
             outputs = [out],
+            env = execution.host_compile_env,
         )
         outputs.append(out)
     binary = ctx.actions.declare_file("objtool/objtool")
     ctx.actions.run(
-        executable = execution.commands["gcc"],
+        executable = execution.host_cc,
         arguments = link_flags + [f.path for f in outputs] + ["-lelf", "-lz", "-o", binary.path],
         inputs = outputs,
         outputs = [binary],
+        env = execution.host_link_env,
     )
     return struct(executable = binary, architecture = architecture)

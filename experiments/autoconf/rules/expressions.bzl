@@ -132,10 +132,14 @@ def _builtin(name, a, sources):
         return " ".join(result)
     fail("Make operation %r cannot be evaluated during analysis; it needs explicit lowering: %r" % (name, a))
 
+def _reference(name):
+    return [dict(op = "reference", name = [dict(op = "literal", value = name)])]
+
 def evaluate(terms, variables, sources = {}):
     """Evaluate with an explicit stack: no Starlark recursion or Python fallback."""
     tasks = [("expr", terms, variables, [])]
     values = []
+    cache = variables.get("__cell_sequence__", {}).get("cache", {})
     for _ in range(100000):
         if not tasks:
             return values[0]
@@ -168,9 +172,9 @@ def evaluate(terms, variables, sources = {}):
                     # Keep it opaque rather than expanding subprocesses in it.
                     if probe == "try-run":
                         values.append(json.encode(arguments[1]))
-                        tasks.append(("probe", (probe, arguments), scope, chain))
+                        tasks.append(("probe", (probe, arguments, data.get("probe_context", {})), scope, chain))
                     else:
-                        tasks.extend([("probe", (probe, arguments), scope, chain), ("expr", arguments[1], scope, chain)])
+                        tasks.extend([("probe", (probe, arguments, data.get("probe_context", {})), scope, chain), ("expr", arguments[1], scope, chain)])
                 elif name == "intcmp":
                     tasks.extend([("intcmp", arguments, scope, chain), ("expr", arguments[1], scope, chain), ("expr", arguments[0], scope, chain)])
                 elif name == "origin":
@@ -192,19 +196,44 @@ def evaluate(terms, variables, sources = {}):
             else:
                 fail("Unknown native expression node " + kind)
         elif op == "probe":
-            probe, arguments = data
+            probe, arguments, explicit = data
             option = values.pop().strip()
-            key = probe + ":" + option
+
+            if probe.startswith("rustc"):
+                fail("Rust probes require a declared Rust toolchain")
+            compiler = explicit["compiler"] if explicit else _reference("LD" if probe == "ld-option" else "CC")
+            flag_names = ["KBUILD_LDFLAGS"] if probe == "ld-option" else ["KBUILD_CPPFLAGS", "KBUILD_AFLAGS"] if probe == "as-option" else ["CLANG_FLAGS", "KBUILD_AFLAGS"] if probe == "as-instr" else ["KBUILD_CPPFLAGS", "KBUILD_CFLAGS"]
+            flags = explicit["flags"] if explicit else [term for name in flag_names for term in _reference(name) + [dict(op = "literal", value = " ")]]
+            expressions = [compiler, flags, arguments[1] if probe == "try-run" else [], _reference("objtree"), [dict(op = "literal", value = sources["__source_root__"])] if "__source_root__" in sources else _reference("srctree")]
+            tasks.append(("probe_result", (probe, arguments, option), scope, chain))
+            for index in reversed(range(len(expressions))):
+                tasks.append(("command_expr" if index == 2 and probe == "try-run" else "expr", expressions[index], scope, chain))
+        elif op == "command_expr":
+            tasks.extend([("restore_sources", sources, scope, chain), ("expr", data, scope, chain)])
+            sources = dict(sources, __shell_commands__ = True)
+        elif op == "restore_sources":
+            sources = data
+        elif op == "probe_result":
+            probe, arguments, option = data
+            tool, flags, command, directory, source = values[-5:]
+            values = values[:-5]
+            request = dict(
+                kind = probe,
+                argument = option,
+                compiler = tool,
+                flags = flags.strip(),
+                command = command,
+                environment = sources.get("__probe_environment__", {}),
+                directory = directory,
+                source = source,
+            )
+            key = json.encode(request)
             supported = sources.get("__capabilities__", {}).get(key)
             if supported == None:
                 requests = sources.get("__requests__")
-                if requests != None:
-                    command = ""
-                    if probe == "try-run":
-                        command_sources = dict(sources)
-                        command_sources["__shell_commands__"] = True
-                        command = evaluate(arguments[1], scope, command_sources)
-                    requests[key] = dict(kind = probe, argument = option, command = command)
+                if requests == None:
+                    fail("Compiler probe requires an execution-stage request collector")
+                requests[key] = request
                 supported = False
             if probe in ("cc-option-yn", "rustc-option-yn"):
                 values.append("y" if supported else "n")
@@ -219,7 +248,7 @@ def evaluate(terms, variables, sources = {}):
                 tasks.append(("expr", arguments[2] if len(arguments) > 2 else [], scope, chain))
         elif op == "origin":
             name = values.pop()
-            values.append("file" if name in scope else "undefined")
+            values.append("command line" if name in scope.get("__command_line__", {}) else "file" if name in scope else "undefined")
         elif op == "intcmp":
             left, right = int(values.pop(-2).strip()), int(values.pop().strip())
             index = 2 if left < right else 3 if left == right else 4
@@ -235,17 +264,18 @@ def evaluate(terms, variables, sources = {}):
                 fail("Recursive Make variable: " + " -> ".join(chain + [data]))
             else:
                 cell = scope.get(data, {"value": scope.get("__config__", {}).get(data, "")})
-                if "value" in cell:
-                    values.append(cell["value"])
-                elif "append" in cell:
-                    tasks.append(("cell", cell, scope, []))
-                elif "parts" in cell:
-                    tasks.append(("concat", len(cell["parts"]), scope, chain))
-                    for part in reversed(cell["parts"]):
-                        tasks.append(("cell", part, scope, chain + [data]))
-                else:
-                    tasks.append(("expr", cell["expr"], cell.get("scope", scope), [] if "scope" in cell else chain + [data]))
+                tasks.append(("cell", cell, scope, [] if "scope" in cell or "append" in cell else chain + [data]))
         elif op == "cell":
+            key = (data.get("cache_id"), sources.get("__shell_commands__", False))
+            if data.get("cache_id") != None and key in cache:
+                values.append(cache[key])
+            else:
+                if data.get("cache_id") != None:
+                    tasks.append(("cache", key, scope, chain))
+                tasks.append(("cell_body", data, scope, chain))
+        elif op == "cache":
+            cache[data] = values[-1]
+        elif op == "cell_body":
             if "value" in data:
                 values.append(data["value"])
             elif "append" in data:
@@ -328,6 +358,9 @@ def _condition(branch, variables, sources):
 def program(statements, initial, sources, cells = False):
     """Evaluate assignment/conditional order and produce configured rule edges."""
     variables = dict(initial) if cells else {name: {"value": value} for name, value in initial.items() if name != "__config__"}
+    variables["__cell_sequence__"] = initial.get("__cell_sequence__", {"next": 0, "cache": {}}) if cells else {"next": 0, "cache": {}}
+    variables["__command_line__"] = initial.get("__command_line__", {})
+    variables.update({name: {"value": value} for name, value in variables["__command_line__"].items()})
     variables["__config__"] = initial.get("__config__", {})
     variables["__exports__"] = dict(initial.get("__exports__", {})) if cells else {}
     work = list(reversed(statements))
@@ -420,6 +453,8 @@ def program(statements, initial, sources, cells = False):
                 variables["__exports__"][name] = True
             elif node.get("export") == 2:
                 variables["__exports__"].pop(name, None)
+            if name in variables["__command_line__"] and not node.get("override", False):
+                continue
             expr, flavor = node["value_expression"], node["flavor"]
             old = variables.get(name)
             if flavor == "conditional" and old != None:
@@ -438,6 +473,10 @@ def program(statements, initial, sources, cells = False):
                 variables[name] = {"expr": expr, "raw": node["value"], "scope": dict(variables)}
             else:
                 variables[name] = {"expr": expr, "raw": node["value"]}
+            if "scope" in variables[name] or "append" in variables[name]:
+                sequence = variables["__cell_sequence__"]
+                variables[name]["cache_id"] = sequence["next"]
+                sequence["next"] += 1
         elif kind == "rule":
             current = {
                 "targets": _words(evaluate(node["targets_expression"], variables, sources)),

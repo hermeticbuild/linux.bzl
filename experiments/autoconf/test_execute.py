@@ -33,6 +33,16 @@ class ExecuteTest(unittest.TestCase):
    self.assertEqual(result.returncode,0,result.stderr)
    self.assertEqual((root/'result').read_text(),'#define CONFIG_TEST 1')
 
+ def test_directory_transport_ignores_timestamps(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)
+   outputs=[]
+   for stamp in [100,200]:
+    result=self.run_action(root,[],['headers'],"from pathlib import Path; import os; Path('headers').mkdir(); Path('headers/config.h').write_text('constant'); os.utime('headers/config.h', (%d,%d))"%(stamp,stamp),directory_outputs=['headers'])
+    self.assertEqual(result.returncode,0,result.stderr)
+    outputs.append((root/'headers').read_bytes())
+   self.assertEqual(outputs[0],outputs[1])
+
  def test_failed_command_is_a_build_failure(self):
   with tempfile.TemporaryDirectory() as tmp:
    result=self.run_action(Path(tmp),[],['result'],'raise SystemExit(42)')

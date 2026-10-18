@@ -31,7 +31,7 @@ def decode_literal(node):
     return ast.literal_eval(node)
 
 
-def fixtures(generated, output):
+def fixtures(generated, output, fragments=None):
     """Keep symbolic syntax and programs; never resolve a compiler capability."""
     source = generated / 'options/BUILD.bazel'
     encoded = decode_literal(exported_call(source, 'kernel_option_sources')['files'])
@@ -48,6 +48,7 @@ def fixtures(generated, output):
     # to the measuring runner. Both are regenerated from the same syntax export.
     (output / 'rules/sources.bzl').write_text('SOURCES = ' + repr(encoded) + '\n')
     (output / 'baseline.json').write_text(json.dumps(encoded))
+    (output / 'rules/qualification.bzl').write_text('FRAGMENTS = ' + repr(fragments or {}) + '\n')
     (output / 'profile.json').write_text(json.dumps(profile))
     (output / 'rules/data.bzl').write_text('PROFILE = json.decode(' + repr(json.dumps(profile)) + ')\n')
     (output / 'rules/catalog.bzl').write_text('ACTIONS = json.decode(' + repr(json.dumps(catalog)) + ')\n')
@@ -71,13 +72,27 @@ def fixtures(generated, output):
     (output / 'host-programs.json').write_text(json.dumps(sorted(programs)))
     for directory in [output, output / 'rules', output / 'native']:
         directory.mkdir(exist_ok=True)
-        (directory / 'BUILD.bazel').write_text('exports_files(glob(["*"]))\n')
+        (directory / 'BUILD.bazel').write_text('exports_files(glob(["**"], exclude=["BUILD.bazel"]))\n')
     (output / 'MODULE.bazel').write_text('module(name = "kernel_inputs")\n')
     (output / 'provenance.json').write_text(json.dumps({
         'inputs': {name: hashlib.sha256((generated / name).read_bytes()).hexdigest()
                    for name in ['options/BUILD.bazel', 'configs/BUILD.bazel', 'BUILD.bazel', 'rules/flag_program.bzl']},
         'kconfig_files': len(syntax), 'actions': len(catalog),
     }, indent=2) + '\n')
+
+
+def qualification_fragments():
+    fragments = {}
+    for name in ['x86_64', 'debug', 'lz4', 'btf', 'aarch64']:
+        values = {}
+        for line in (REPOSITORY / 'examples/configs' / (name + '.config')).read_text().splitlines():
+            if line.startswith('CONFIG_') and '=' in line:
+                key, value = line[7:].split('=', 1)
+                values[key] = value
+            elif line.startswith('# CONFIG_') and line.endswith(' is not set'):
+                values[line[9:-11]] = 'n'
+        fragments[name] = values
+    return fragments
 
 
 def main():
@@ -103,7 +118,7 @@ def main():
         if generated.exists():
             shutil.rmtree(generated)
         subprocess.run([str(args.generator.resolve()), 'generate', '--linux', str(linux), '--out', str(generated)], check=True)
-    fixtures(generated, output)
+    fixtures(generated, output, qualification_fragments())
     (output / 'setup.MODULE.bazel').write_text('''local_path_override(module_name = "autoconf_prototype", path = %r)
 local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
 new_local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")

@@ -160,7 +160,10 @@ def register(ctx, target, directory, kind, driver, outputs, dependencies, files,
             outputs = [tree],
             mnemonic = "KbuildHeaders",
         )
-        variables = _scope(setup, directory, target, tree.path, source, ancestry, memberships)
+
+        # Resolve native expressions in the logical object tree; relocate paths
+        # only after probes and target-specific decisions have been evaluated.
+        variables = _scope(setup, directory, target, "__object__", source, ancestry, memberships)
         flags = []
         extra_inputs = []
         if kind == "host":
@@ -223,6 +226,7 @@ def register(ctx, target, directory, kind, driver, outputs, dependencies, files,
             "arguments": [args],
             "inputs": depset([tree] + dependencies.values() + extra_inputs, transitive = [files, setup.files]),
             "outputs": compiler_outputs,
+            "env": (execution_tools(ctx).host_link_env if link else execution_tools(ctx).host_compile_env) if kind == "host" else execution_tools(ctx).environment,
             "mnemonic": (("KbuildHostLink" if link else "KbuildHostCC") if kind == "host" else "KbuildCC"),
             "progress_message": "Compile %s" % target,
         }
@@ -237,8 +241,8 @@ trap 'rm -rf "$work"' EXIT
 cp -a %s/. "$work/"
 cd "$work"
 %s
-"$exec_root/"%s "$@"
-""" % (shell_quote(tree.path), _stage_links(files.to_list() + setup.files.to_list()), shell_quote(setup.tools["CC"]))
+%s "$@"
+""" % (shell_quote(tree.path), _stage_links(files.to_list() + setup.files.to_list()), shell_quote(setup.tools["CC"]) if setup.tools["CC"].startswith("/") else '"$exec_root/"' + shell_quote(setup.tools["CC"]))
             run_recipe(ctx, execution_tools(ctx), command = command, **action)
         else:
             ctx.actions.run(executable = setup.tools["HOSTCC"], **action)

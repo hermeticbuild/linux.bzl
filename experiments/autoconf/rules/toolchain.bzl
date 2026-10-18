@@ -9,6 +9,9 @@ def make_setup(ctx, config, prepared, execution, tools, builtin_include, _compil
     sources["__execution_tools__"] = {n: f.path for n, f in execution.commands.items()}
     sources["__compiler_include__"] = builtin_include
     sources["__host_machine__"] = "x86_64"
+    sources["__probe_environment__"] = dict(execution.environment)
+    sources["__probe_environment__"].update(tools)
+    sources["__probe_environment__"].update(ARCH = config.arch, SRCARCH = config.architecture.srcarch, SUBARCH = config.architecture.subarch, HEADER_ARCH = config.architecture.header_arch)
     sources["__requests__"] = requests
     sources["__capabilities__"] = dict(FLAG_PROGRAM["capabilities"])
     sources["__capabilities__"].update(capabilities)
@@ -31,6 +34,7 @@ def make_setup(ctx, config, prepared, execution, tools, builtin_include, _compil
         "KCONFIG_CONFIG": "__config__",
     }
     initial.update(tools)
+    initial["__command_line__"] = dict(tools, ARCH = config.arch)
     setup_sources = dict(sources)
     setup_sources["__includes__"] = FLAG_PROGRAM["image_setup_programs"]
     variables = program(FLAG_PROGRAM["global"], initial, setup_sources).variables
@@ -54,7 +58,7 @@ def make_setup(ctx, config, prepared, execution, tools, builtin_include, _compil
         variables["__exports__"][name] = True
     setup_file = ctx.actions.declare_file("setup.json")
     observed = {name: evaluate([dict(op = "reference", name = [dict(op = "literal", value = name)])], variables, sources) for name in ["KBUILD_CFLAGS", "KBUILD_AFLAGS", "KBUILD_CPPFLAGS", "KBUILD_LDFLAGS", "KBUILD_HOSTCFLAGS", "KBUILD_HOSTLDFLAGS"]}
-    ctx.actions.write(setup_file, json.encode(dict(tools = tools, architecture = "x86_64", flags = observed)))
+    ctx.actions.write(setup_file, json.encode(dict(tools = tools, architecture = config.arch, flags = observed)))
     return struct(
         file = setup_file,
         identity = config.identity,

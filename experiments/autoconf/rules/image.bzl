@@ -537,6 +537,8 @@ def build_image(ctx, config, setup, prepared, catalog, objtool):
     index["__includes__"] = FLAG_PROGRAM["image_programs"]
     index["__capabilities__"] = setup.sources["__capabilities__"]
     index["__requests__"] = setup.sources["__requests__"]
+    index["__probe_environment__"] = setup.sources["__probe_environment__"]
+    index["__source_root__"] = setup.sources["__source_root__"]
     index["__host_machine__"] = setup.sources["__host_machine__"]
     index["__compiler_include__"] = setup.sources.get("__compiler_include__", "")
     index["__execution_tools__"] = setup.sources["__execution_tools__"]
@@ -555,7 +557,9 @@ def build_image(ctx, config, setup, prepared, catalog, objtool):
     # Recursive Make expands only exported parent variables into a child's
     # environment. Unexported names such as core-y must not affect core.o.
     state["environment"] = {name: {"expr": [{"op": "reference", "name": [{"op": "literal", "value": name}]}], "scope": setup.variables, "raw": ""} for name in setup.variables.get("__exports__", {}) if name in setup.variables}
+    state["environment"]["__command_line__"] = setup.variables["__command_line__"]
     dispatch = dict(setup.variables)
+    state["environment"]["__cell_sequence__"] = setup.variables["__cell_sequence__"]
     for name, text in {"MAKE": "__make_dispatch__", "build": "__build_dispatch__", "Q": "", "KCONFIG_CONFIG": ".config", "srctree": "__source__", "srcroot": "__source__", "objtree": "."}.items():
         dispatch[name] = {"value": text}
     arch_context = program(FLAG_PROGRAM["image_programs"]["arch/" + config.architecture.srcarch + "/Makefile"], dispatch, state["sources"], cells = True)
@@ -611,6 +615,10 @@ def build_image(ctx, config, setup, prepared, catalog, objtool):
             closure = dict(common)
             for dep in deps:
                 closure.update(finished[dep])
+            for dependency in d["deps"]:
+                logical = dependency.removeprefix("__source__/")
+                if logical in source_files and type(source_files[logical]) == "File":
+                    closure[dependency] = source_files[logical]
             outputs = {out: artifacts[out] for out in d["outs"]}
             ancestry, parent = [d["directory"]], d["directory"]
             for _parent in range(len(state["parents"]) + 1):

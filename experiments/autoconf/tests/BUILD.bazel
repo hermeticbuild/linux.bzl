@@ -1,0 +1,19 @@
+load("//rules:schedule_test.bzl", "schedule_fixture")
+load(":expressions_test.bzl", "probe_context_test")
+
+schedule_fixture(
+    name = "scheduler",
+    srcs = [
+        "included.c",
+        "main.c",
+        "other.c",
+        "value.h",
+    ],
+)
+
+probe_context_test(name = "probe_context_test")
+
+exports_files([
+    "compiler_driver.c",
+    "generate.py",
+])

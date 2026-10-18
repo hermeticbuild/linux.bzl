@@ -11,9 +11,8 @@ parser.add_argument("--jobs", type=int, help="Override the workspace Bazel job l
 args=parser.parse_args()
 root=Path(__file__).resolve().parent
 out=root/'validation';out.mkdir(exist_ok=True)
-base=root.parents[1]/'_tmp/autoconf-integrated-output'
-subprocess.run(['bazel','--output_base='+str(base),'build','//...']+(['--jobs='+str(args.jobs)] if args.jobs else []),cwd=root,check=True)
-subprocess.run(['bazel','--output_base='+str(base),'test','//:execute_test','//:configure_test','--test_output=errors'],cwd=root,check=True)
+subprocess.run(['bazel','build','//...']+(['--jobs='+str(args.jobs)] if args.jobs else []),cwd=root,check=True)
+subprocess.run(['bazel','test','//:execute_test','//:configure_test','//:probes_test','//:reuse_report_test','//tests:probe_context_test','--test_output=errors'],cwd=root,check=True)
 summaries={}
 for mode,target in [('minimal','config'),('allno','allno_config'),('debug','debug_config')]:
  subprocess.run([sys.executable,'compare_upstream.py','--mode',mode,'--tree','bazel-bin/'+target+'.tree','--out','validation/'+mode],cwd=root,check=True)

@@ -161,12 +161,14 @@ def lower_probes(value):
         name = const(args[0])
         name = name.strip() if name else None
         if name in PROBES:
+            context = {}
             if name in ('__cc-option', '__rustc-option'):
+                context = {'compiler': args[1], 'flags': args[2]}
                 name = 'cc-option' if name == '__cc-option' else 'rustc-option'
                 args = [literal(name), *args[3:]]
             # Keep the probe symbolic. Its answer belongs to the selected
             # toolchain at analysis time, never the generator's compiler.
-            return {'op': 'function', 'name': 'kbuild_probe', 'arguments': [literal(name), *args[1:]]}
+            return {'op': 'function', 'name': 'kbuild_probe', 'arguments': [literal(name), *args[1:]], 'probe_context': context}
         if name in VERSIONS:
             return {'op': 'function', 'name': 'kbuild_min_version', 'arguments': [
                 [{'op': 'config', 'name': 'CONFIG_' + VERSIONS[name]}], args[1]]}
