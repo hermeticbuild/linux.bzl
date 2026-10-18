@@ -1,0 +1,57 @@
+{
+  "linux_revision": "0fcb05b72344f40806cbe810de8872f1698bf053",
+  "autoconf_api_sha256": "aef006cb2cd64fc787b59dbc277b13aeb79fdf220c1374dba0f61d2c6deb6f58",
+  "compiler": "gcc (Debian 14.2.0-19) 14.2.0",
+  "linker": "GNU ld (GNU Binutils for Debian) 2.44",
+  "profiles": {
+    "minimal": {
+      "symbols_starlark": 18914,
+      "symbols_upstream": 18914,
+      "symbol_differences": 0,
+      "written_differences": 0
+    },
+    "allno": {
+      "symbols_starlark": 18914,
+      "symbols_upstream": 18914,
+      "symbol_differences": 0,
+      "written_differences": 0
+    },
+    "debug": {
+      "symbols_starlark": 18914,
+      "symbols_upstream": 18914,
+      "symbol_differences": 0,
+      "written_differences": 0
+    }
+  },
+  "built_kernel_config": {
+    "symbols_starlark": 18914,
+    "symbols_upstream": 18914,
+    "symbol_differences": 0,
+    "written_differences": 0
+  },
+  "kbuild": {
+    "global_flag_groups": 6,
+    "flag_differences": 0,
+    "config_differences": 0,
+    "profiles": {
+      "minimal": 0,
+      "allno": 0,
+      "debug": 0
+    }
+  },
+  "custom_probes": {
+    "AUTOCONF_PROTOTYPE_CUSTOM": "y",
+    "AUTOCONF_PROTOTYPE_DEPENDENT": "y"
+  },
+  "kernel": {
+    "bytes": 8628464,
+    "artifact_jobs": 1056,
+    "elf": "ELF64 x86-64",
+    "verified_symbols": [
+      "start_kernel",
+      "_text",
+      "x86_64_start_kernel"
+    ]
+  },
+  "scope": "Local GCC acceptance; no boot or hermeticity validation"
+}

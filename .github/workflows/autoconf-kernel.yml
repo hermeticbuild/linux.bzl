@@ -1,0 +1,78 @@
+name: Autoconf kernel acceptance
+
+# The reusable module remains a separate dependency. Until it has a published
+# version, callers supply the repository to check out for its local override.
+on:
+  workflow_dispatch:
+    inputs:
+      autoconf_repository:
+        description: Repository containing the separate autoconf_prototype Bzlmod module (owner/repo)
+        required: true
+        type: string
+      autoconf_ref:
+        description: Commit or ref of the autoconf module
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      USE_BAZEL_VERSION: 9.3.0
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkout separate autoconf module
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.autoconf_repository }}
+          ref: ${{ inputs.autoconf_ref }}
+          path: _tmp/autoconf-dependency
+          persist-credentials: false
+
+      - name: Checkout pinned Linux source
+        uses: actions/checkout@v5
+        with:
+          repository: torvalds/linux
+          ref: 0fcb05b72344f40806cbe810de8872f1698bf053
+          path: _tmp/linux
+          persist-credentials: false
+
+      - name: Install local acceptance prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools build-essential bison flex patch bc libelf-dev zlib1g-dev pkg-config
+
+      - uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: autoconf-kernel
+          repository-cache: |
+            - MODULE.bazel
+            - MODULE.bazel.lock
+
+      - name: Bootstrap static repository compiler
+        run: python3 build.py --jobs 4
+
+      - name: Generate kernel inputs and configure local module override
+        run: |
+          python3 experiments/autoconf/configure.py --autoconf _tmp/autoconf-dependency
+
+      - name: Build kernel and compare with upstream
+        working-directory: experiments/autoconf
+        run: python3 validate.py
+
+      - name: Upload comparison reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: autoconf-kernel-comparisons
+          path: |
+            experiments/autoconf/validation/
+            experiments/autoconf/bazel-testlogs/**/test.log
+          if-no-files-found: warn
+          retention-days: 7

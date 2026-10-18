@@ -119,3 +119,12 @@ the x86, debug, LZ4 and ARM64 examples with
 host tool directories blocked. It runs on this prototype branch, relevant pull
 requests, and manual dispatch. The static executable and diagnostics are uploaded
 as workflow artifacts. Existing root tests remain independent of local checkouts.
+
+## Measured compiler probes
+
+[The autoconf kernel experiment](experiments/autoconf/README.md) integrates the
+execution-time measured-probe approach alongside the maintained examples. It
+keeps `autoconf.bzl` as a separate Bzlmod dependency with an explicit local
+override, regenerates large symbolic exports, and compares a complete local GCC
+kernel build against upstream Kconfig and Kbuild. Its system-tool acceptance
+setup and manual CI workflow are separate from the hermetic LLVM examples.

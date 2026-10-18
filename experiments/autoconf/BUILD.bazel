@@ -1,0 +1,85 @@
+load("@autoconf_prototype//:autoconf.bzl", "autoconf", "compile_test")
+load("@rules_python//python:defs.bzl", "py_test")
+load("//rules:kernel.bzl", "kernel_build")
+load("//rules:options.bzl", "kernel_bool")
+
+exports_files([
+    "probe_runtime.py",
+    "execute.py",
+    "emit.py",
+])
+
+kernel_build(
+    name = "kernel",
+    rounds = 5,
+)
+
+kernel_build(
+    name = "config",
+    config_only = True,
+    rounds = 0,
+)
+
+kernel_build(
+    name = "allno_config",
+    config_only = True,
+    mode = "allno",
+    rounds = 0,
+)
+
+kernel_build(
+    name = "debug_config",
+    config_only = True,
+    requested = {
+        "DEBUG_KERNEL": "y",
+        "DEBUG_INFO_DWARF5": "y",
+        "DEBUG_INFO_NONE": "n",
+        "PRINTK_TIME": "y",
+    },
+    rounds = 0,
+)
+
+autoconf(
+    name = "custom_probes",
+    tests = {"HAVE_CUSTOM_INT128": compile_test(
+        "int f(void) { __int128 x = 0; return (int)x; }",
+        flags = ["-Werror"],
+    )},
+)
+
+kernel_build(
+    name = "custom_config",
+    config_only = True,
+    extra_records = [
+        json.encode(kernel_bool(
+            "AUTOCONF_PROTOTYPE_CUSTOM",
+            default = "HAVE_CUSTOM_INT128",
+            probe = True,
+        )),
+        json.encode(kernel_bool(
+            "AUTOCONF_PROTOTYPE_DEPENDENT",
+            default = "y",
+            depends = "AUTOCONF_PROTOTYPE_CUSTOM",
+        )),
+    ],
+    probes = ":custom_probes",
+    rounds = 0,
+)
+
+py_test(
+    name = "execute_test",
+    srcs = [
+        "execute.py",
+        "test_execute.py",
+    ],
+    main = "test_execute.py",
+)
+
+py_test(
+    name = "configure_test",
+    srcs = [
+        "configure.py",
+        "test_configure.py",
+    ],
+    main = "test_configure.py",
+)

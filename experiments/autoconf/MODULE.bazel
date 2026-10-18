@@ -1,0 +1,18 @@
+module(
+    name = "linux_bzl_autoconf_example",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "rules_cc", version = "0.2.25")
+bazel_dep(name = "rules_python", version = "1.8.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "autoconf_prototype", version = "0.0.0")
+
+include("//:.generated/setup.MODULE.bazel")
+
+host = use_repo_rule("//:host_repo.bzl", "host_repository")
+
+host(
+    name = "host_tools",
+    linux = "@linux_source//:Makefile",
+)

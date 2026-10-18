@@ -1,0 +1,11 @@
+{
+  "revision": "0fcb05b72344f40806cbe810de8872f1698bf053",
+  "sources": {
+    "scripts/kconfig/parser.y": "d85cf8412fe2888fce9cc00744b2ad48fdd6a7c19252e411fef773a67454c56b",
+    "scripts/kconfig/lexer.l": "cc33fed7acb53e4a8d40afcb78e700a771fa302610d65fcc5199030497983673",
+    "scripts/kconfig/preprocess.c": "93c62d8634e3d30d71ae5092a6e49212c980837789693643f15434e74717104e",
+    "scripts/kconfig/conf.c": "6b0543136a9202d06eede775bcaf7b700aa6cb14e88bd960290da8aa2a3f5375",
+    "scripts/kconfig/menu.c": "44c6591272e60c712eadb8a0d68740c23d16d4993ca9a73ceaea83e62fb32ed6",
+    "scripts/kconfig/symbol.c": "85dc34a5d0d23792bbe032a67f348e9d2bb08fcdf4fe0090789ba133606ff031"
+  }
+}
