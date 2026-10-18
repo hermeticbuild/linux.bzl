@@ -1,7 +1,0 @@
-module(
-    name = "linux_bzl_examples",
-    version = "0.0.0",
-)
-
-# Run `python3 example.py` from the repository root after building the generator.
-include("//:.generated/setup.MODULE.bazel")

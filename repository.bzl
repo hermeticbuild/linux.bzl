@@ -9,8 +9,6 @@ def _kernel_repository_impl(ctx):
     # files. Tool-label changes are tracked automatically by repository rules.
     ctx.watch_tree(source)
     arguments = [tool, "generate", "--linux", source, "--out", ctx.path(".")]
-    if ctx.attr.all_backends:
-        arguments.append("--all-backends")
     for fragment in ctx.attr.config_fragments:
         path = ctx.path(fragment)
         ctx.watch(path)
@@ -43,7 +41,6 @@ kernel_repository = repository_rule(
             doc = "Prebuilt kernel-repository executable, not a build-action output.",
         ),
         "config_fragments": attr.label_list(allow_files = [".config"], doc = "Requested config fragments, rendered as data without resolving options."),
-        "all_backends": attr.bool(default = False),
         "timeout": attr.int(default = 600),
     },
     doc = "Parse Make/Kconfig and render symbolic BUILD files at repository fetch time.",

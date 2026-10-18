@@ -1,11 +1,13 @@
-GNU Make integration is the original prototype patch and its three native export
-includes. Linux Kconfig integration is prepared by `prepare.py` from the kernel
-checkout at tool-build time. It preserves source directives rather than following
-them, exports file-local entries, and keeps the existing symbolic compiler facts
-and declared fallback policy. These are generation inputs, not build-action tools.
+GNU Make integration consists of the native syntax-export patch and three export
+includes. Linux Kconfig integration is prepared from the supplied checkout.
+Generation exports file-local syntax with symbolic compiler inputs; the measured
+runtime reprocesses compiler-dependent entries with the selected toolchain.
 
-The launcher invokes each parser in a fresh instance of the same executable.
-`build.py` combines each parser's object files with `ld -r`, then prefixes its
-defined global symbols with `objcopy --redefine-syms`. Undefined libc references
-are untouched. This avoids collisions between Linux, GNU Make and CPython helpers
-without altering their parser logic or using dynamic libraries.
+The generator launcher invokes each parser in a fresh instance of the same static
+executable. `build.py` combines parser objects with `ld -r` and namespaces their
+defined global symbols to avoid collisions with CPython and each other.
+
+`build_parser.py` prepares the measurement syntax tool used by probe actions.
+`build_reference.py` compiles unmodified native `conf` plus an independent symbol
+value reader for tests. These currently use installed bootstrap compilers and
+are explicitly part of the local acceptance setup.

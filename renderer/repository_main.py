@@ -24,7 +24,7 @@ def check_parser_sources(linux):
 
 
 def read_fragment(path):
-    """Read requested values only; Kconfig semantics remain in analysis."""
+    """Read requested values only; Kconfig semantics remain in execution-time Starlark."""
     values = {}
     for number, original in enumerate(path.read_text().splitlines(), 1):
         line = original.strip()
@@ -44,7 +44,7 @@ def read_fragment(path):
     return values
 
 
-def generate(linux, output, all_backends, fragments=()):
+def generate(linux, output, fragments=()):
     check_parser_sources(linux)
     if output == linux or linux in output.parents or output in linux.parents:
         raise ValueError('Output must be outside the Linux source tree')
@@ -60,25 +60,22 @@ def generate(linux, output, all_backends, fragments=()):
                        (p.name in ('Kbuild', 'Makefile') or p.name.startswith('Makefile.') or p.suffix == '.mk'))
         print(f'Exporting {len(paths)} Make files without expanding configuration', file=sys.stderr)
         tree = parse_events(native_events(Path(sys.executable), paths, expressions=True))
-        ast = work / 'ast.json'
-        ast.write_text(json.dumps(tree))
+        from extract import extract
+        from inputs import write_inputs
+        syntax, program, link_script = extract(tree, linux, Path(sys.executable))
         repo = work / 'repo'
-        import generate_backends, generate_image
-        render = generate_backends.main if all_backends else generate_image.main
-        render(['--ast', str(ast), '--make', sys.executable,
-                '--linux', str(linux), '--out', str(repo)])
+        repo.mkdir()
         requests = {}
         for fragment in fragments:
             if fragment.stem in requests:
                 raise ValueError('Duplicate config fragment name: ' + fragment.stem)
             requests[fragment.stem] = read_fragment(fragment)
-        (repo / 'rules/example_configs.bzl').write_text(
-            'EXAMPLE_CONFIGS = json.decode(' + repr(json.dumps(requests)) + ')\n')
+        write_inputs(repo, tree, linux, syntax, program, link_script, requests)
         versions = json.loads((HERE / 'tool-versions.json').read_text())
         (repo / 'repository-tool.json').write_text(json.dumps({
             'format': 1, 'tool_versions': versions,
             'parser_sources': json.loads((HERE / 'parser-sources.json').read_text()),
-            'resolution': 'Bazel analysis', 'all_backends': all_backends,
+            'resolution': 'Bazel execution',
         }, indent=2) + '\n')
         for path in repo.iterdir():
             destination = output / path.name
@@ -95,7 +92,6 @@ def main():
     generate_parser = sub.add_parser('generate')
     generate_parser.add_argument('--linux', type=Path, required=True)
     generate_parser.add_argument('--out', type=Path, required=True)
-    generate_parser.add_argument('--all-backends', action='store_true')
     generate_parser.add_argument('--config-fragment', action='append', type=Path, default=[])
     args = parser.parse_args()
     if args.command == 'version':
@@ -103,7 +99,7 @@ def main():
     else:
         # Internal Make/Kconfig environments are deliberately constructed by
         # their adapters; no compiler, Make variables or Python from the host.
-        generate(args.linux.resolve(), args.out.resolve(), args.all_backends, [p.resolve() for p in args.config_fragment])
+        generate(args.linux.resolve(), args.out.resolve(), [p.resolve() for p in args.config_fragment])
 
 
 if __name__ == '__main__':

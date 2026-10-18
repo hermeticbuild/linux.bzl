@@ -6,13 +6,11 @@ from pathlib import Path
 import subprocess
 import sys
 
-from compiler_capabilities import native_capabilities
 
 HERE = Path(__file__).resolve().parent
 
 
-def export_syntax(linux, output):
-    output.mkdir(parents=True, exist_ok=True)
+def export_syntax(linux):
     executable = Path(sys.executable)
     env = {'LC_ALL': 'C', 'PATH': ''}
     env.update(srctree=str(linux), SRCARCH='__KCONFIG_SRCARCH', ARCH='__KCONFIG_ARCH',

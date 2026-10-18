@@ -3,18 +3,25 @@ module(
     version = "0.0.0",
 )
 
-# Development tools only. Consumers declare the generated kernel toolchains.
-bazel_dep(name = "rules_python", version = "1.8.0", dev_dependency = True)
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "llvm", version = "0.8.24")
+bazel_dep(name = "rules_cc", version = "0.2.25")
+bazel_dep(name = "rules_python", version = "1.8.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "autoconf.bzl", version = "0.0.0")
+git_override(
+    module_name = "autoconf.bzl",
+    commit = "08d970e04ac0592179d7b832e3189ae39a4e042c",
+    remote = "https://github.com/hermeticbuild/autoconf.bzl.git",
+)
+
 bazel_dep(name = "buildifier_prebuilt", version = "8.2.1.1", dev_dependency = True)
 
-python = use_extension("@rules_python//python/extensions:python.bzl", "python", dev_dependency = True)
-python.toolchain(python_version = "3.13")
+include("//:.generated/setup.MODULE.bazel")
 
-example_fixtures = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")
+host = use_repo_rule("//:host_repo.bzl", "host_repository")
 
-example_fixtures(
-    name = "example_fixtures",
-    build_file_content = 'exports_files(["initramfs.py"])',
-    dev_dependency = True,
-    path = "examples",
+host(
+    name = "host_tools",
+    linux = "@linux_source//:Makefile",
 )

@@ -1,4 +1,4 @@
-"""Preserve native absolute utility references as analysis-time tool lookups."""
+"""Preserve native absolute utility references as execution-time tool lookups."""
 import re
 
 _PATH = re.compile(r'/(?:usr/)?bin/([A-Za-z0-9_.+-]+)(?=$|[\s;&|()])')

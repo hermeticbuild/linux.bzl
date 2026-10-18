@@ -1,59 +1,46 @@
-load("@kernel//rules:example_configs.bzl", "EXAMPLE_CONFIGS")
-load(":kernel.bzl", "btf_capability_test", "example_config_test", "example_initramfs", "kernel_example")
+load("@kernel_inputs//rules:qualification.bzl", "FRAGMENTS")
+load("@rules_python//python:defs.bzl", "py_binary")
+load(":kernel.bzl", "example_config_test", "example_initramfs", "kernel_example")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files([
-    ".generated/rules_bison_cstdlib.patch",
-    ".generated/rules_cc_autoconf_no_host_shell.patch",
-])
+exports_files(["initramfs.py"])
+
+py_binary(
+    name = "initramfs_writer",
+    srcs = ["initramfs.py"],
+    main = "initramfs.py",
+)
 
 example_initramfs(
     name = "example_initramfs",
     motd = "README.md",
 )
 
-kernel_example(
-    name = "x86_64_kernel",
-    platform = "@llvm//platforms:linux_x86_64",
-    requested = EXAMPLE_CONFIGS["x86_64"],
-)
-
-kernel_example(
-    name = "x86_64_debug_kernel",
-    overrides = EXAMPLE_CONFIGS["debug"],
-    platform = "@llvm//platforms:linux_x86_64",
-    requested = EXAMPLE_CONFIGS["x86_64"],
-)
-
-kernel_example(
-    name = "x86_64_lz4_kernel",
-    overrides = EXAMPLE_CONFIGS["lz4"],
-    platform = "@llvm//platforms:linux_x86_64",
-    requested = EXAMPLE_CONFIGS["x86_64"],
-)
-
-# Kept as an explicit check of the requested BTF behavior. The current prototype
-# must fail if its declared capability policy cannot enable DEBUG_INFO_BTF.
-kernel_example(
-    name = "x86_64_btf_vmlinux",
-    overrides = EXAMPLE_CONFIGS["btf"],
-    platform = "@llvm//platforms:linux_x86_64",
-    requested = EXAMPLE_CONFIGS["x86_64"],
-    required_options = {"DEBUG_INFO_BTF": "y"},
-    tags = ["manual"],
-)
-
-kernel_example(
-    name = "aarch64_kernel",
-    platform = "@llvm//platforms:linux_aarch64",
-    requested = EXAMPLE_CONFIGS["aarch64"],
-)
+[
+    kernel_example(
+        name = name,
+        cc_toolchain = "@llvm//toolchain:linux_x86_64_to_linux_aarch64" if profile == "aarch64" else "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
+        overrides = FRAGMENTS[profile] if profile not in [
+            "x86_64",
+            "aarch64",
+        ] else {},
+        platform = "@llvm//platforms:linux_aarch64" if profile == "aarch64" else "@llvm//platforms:linux_x86_64",
+        requested = FRAGMENTS["aarch64"] if profile == "aarch64" else FRAGMENTS["x86_64"],
+    )
+    for name, profile in [
+        ("x86_64_kernel", "x86_64"),
+        ("x86_64_debug_kernel", "debug"),
+        ("x86_64_lz4_kernel", "lz4"),
+        ("x86_64_btf_vmlinux", "btf"),
+        ("aarch64_kernel", "aarch64"),
+    ]
+]
 
 filegroup(
     name = "x86_64_shared_graph_metadata",
     srcs = [":x86_64_kernel"],
-    output_group = "manifest",
+    tags = ["manual"],
 )
 
 example_config_test(
@@ -81,7 +68,7 @@ example_config_test(
     config = ":x86_64_debug_kernel_config",
     expected = {
         "DEBUG_KERNEL": "y",
-        "LOCALVERSION": '"-debug"',
+        "LOCALVERSION": '\"-debug\"',
         "RANDOMIZE_BASE": "n",
     },
 )
@@ -95,7 +82,7 @@ example_config_test(
     },
 )
 
-btf_capability_test(
+alias(
     name = "btf_capability_test",
-    target_under_test = ":x86_64_btf_vmlinux",
+    actual = "//:parity_btf_test",
 )

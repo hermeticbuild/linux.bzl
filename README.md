@@ -1,130 +1,107 @@
-# Single-binary kernel repository prototype
+# linux.bzl measured kernel prototype
 
-This branch replaces the previous implementation with the standalone prototype.
-The repository-generation boundary now consists of **one statically linked
-Linux/x86_64 ELF**. It contains GNU Make 4.4.1's patched native syntax exporter,
-the checkout's Linux Kconfig parser, an embedded CPython interpreter, and the
-renderer and Starlark templates. It extracts data/templates to a private temporary
-directory, but never extracts another executable or a shared library. Native
-parser subprocesses execute this same ELF, with separate entry points to isolate
-the upstream parsers' global state.
+This branch contains one kernel implementation. A statically linked generator
+exports symbolic Linux Kconfig and GNU Make syntax. Bazel selects the platform
+and C/C++ toolchains during analysis, measures compiler capabilities as actions,
+and resolves Kconfig and Kbuild in execution-time Starlark callbacks. Each
+compile, generator, archive, and link remains an individual Bazel action.
+Kernel build actions do not invoke Make.
 
-Generation exports symbolic Make expressions, Kconfig entries and source edges.
-Architecture, requested config, compiler facts, flags and object selection still
-resolve during Bazel analysis using the existing platform/toolchain providers.
-Kernel build actions do not invoke Make. The accepted conservative compiler-probe
-fallback policy and existing architecture/boot limitations are unchanged.
+Compiler probes use the separate
+[autoconf.bzl module](https://github.com/hermeticbuild/autoconf.bzl), pinned in
+[MODULE.bazel](MODULE.bazel). Local module development uses Bazel's standard
+`--override_module=autoconf.bzl=/path/to/checkout` flag.
 
-## Build and try it
+## Build and test
 
-From the repository root:
+Run from the repository root with Bazel 9.3.0 and a Linux checkout:
 
 ```sh
-# One-time host bootstrap dependencies (Debian):
-sudo apt-get install musl-tools build-essential bison flex patch
-
+sudo apt-get install musl-tools build-essential bison flex patch bc \
+  libelf-dev zlib1g-dev pkg-config
 python3 build.py --linux _tmp/linux
-
-_tmp/kernel-repository/kernel-repository generate \
-  --linux _tmp/linux --out _tmp/kernel-repository/repo --all-backends
-
-python3 example.py
-cd examples
-bazel build //:x86_64_kernel //:aarch64_kernel
-bazel build @kernel//multi_platform:configs
-# All implemented architectures; this bootstraps the configured LLVM backends:
-bazel build @kernel//multi_platform:kernels
+python3 configure.py --linux _tmp/linux
+bazel test //... --test_output=errors
+python3 validate.py
 ```
 
-Outputs must be empty directories. The bootstrap caches sources/objects under
-`_tmp/kernel-repository/bootstrap`. GNU Make and CPython downloads have pinned
-SHA256 digests. Building the tool currently uses host bootstrap tools; **running
-it, including fetching the generated repository, needs none of those tools**.
-The resulting binary is about 17 MB. `readelf -l -d` must show neither `INTERP`
-nor `NEEDED`. No system Python, libc installation, Make, Bison, Flex, patch or
-compiler is needed at fetch time. The tool requires Linux `/proc/self/exe`.
+The current parser is qualified against Linux commit
+`0fcb05b72344f40806cbe810de8872f1698bf053`. Bootstrap checks its parser sources
+against [native/provenance.json](native/provenance.json).
+The bootstrap uses installed tools. The generated static Linux/x86-64 executable
+contains GNU Make's syntax exporter, the kernel's Kconfig parser, CPython, and the
+exporter code. Generation runs with an empty `PATH`; parser subprocesses execute
+the same ELF. `configure.py` also prepares native measurement and independent
+reference binaries for the current local acceptance setup.
 
-The Kconfig C parser is compiled from the supplied checkout. Its parser/support
-source digests are embedded and checked before generation: rebuild the tool when
-those sources change. Ordinary Kconfig/Makefile changes only require refetching.
-`kernel_repository` watches the source tree for that invalidation.
+`configure.py` creates ignored `.generated/` input data and repository mappings.
+Run it after changing Kconfig or Makefiles. Source edits are tracked directly by
+Bazel. To reuse an export from this version of the generator, pass
+`--generated /path/to/export`.
 
-The maintained [examples](examples/README.md) retain their original config
-fragments and target names. Their BUILD files now use the generated rule API.
+This is still a prototype with declared installed execution utilities and system
+headers/libraries. The measured adapter currently recognizes x86-64 and ARM64
+platforms; complete build/link acceptance covers the minimal x86-64 kernel.
+Configuration parity covers x86-64 and ARM64. Remote execution, fully hermetic
+execution, other architecture images, modules, and booting are not qualified.
 
-## Repository rule
+## Targets
 
-[`repository.bzl`](repository.bzl) exposes:
+| Target | Result |
+| --- | --- |
+| `//:kernel` | Minimal x86-64 `vmlinux` and artifact graph |
+| `//:config` | Resolved minimal `.config`, header, and all-symbol report |
+| `//:allno_config` | Allnoconfig-style configuration |
+| `//:debug_config` | Debug configuration with DWARF5 |
+| `//:custom_config` | Additional Kconfig symbols driven by an autoconf compile probe |
+| `//examples:…` | Original example fragments, configuration tests, and explicit kernel builds |
 
-```starlark
-kernel_repository = use_repo_rule("//:repository.bzl", "kernel_repository")
-kernel_repository(
-    name = "kernel",
-    source = "@linux_source//:Makefile",
-    generator = "@generator//:kernel-repository",
-    all_backends = True,
-)
-```
+The [examples](examples/README.md) are ordinary packages in this workspace.
+Expensive example kernel builds are explicit targets. `bazel test //...` includes
+their configuration assertions; the same fragment requests are also compared
+with unmodified native Linux `conf`.
 
-`source` anchors the actual kernel checkout; `generator` is a prebuilt file label,
-such as an exported local binary or an executable `http_file`. It cannot refer to
-a binary that first needs a Bazel build action: repository fetching precedes
-analysis and execution. The rule invokes it with `PATH` empty, and the tool uses
-fixed environments for native parsing. It does not discover tools on the host.
+## Qualification
 
-Repository rules cannot add Bzlmod dependencies or register toolchains in the
-consumer. `example.py` creates a runnable consumer workspace from the generated
-MODULE template, relocating its local labels to `@kernel` and copying the two
-accepted dependency patches into the root module. The example includes the
-existing BCR dependency/toolchain setup, not another copy of the parser tool.
-`//...` in a consumer addresses its own packages; use `@kernel//...` to address
-the generated repository.
-
-## Checks
+`python3 validate.py` builds the minimal kernel, checks its ELF and entry symbols,
+compares all symbols and written settings for three configurations and the built
+kernel against pristine `conf`, compares six ordered Kbuild flag groups against
+native Make, and checks the custom probe consumer. Reports go to `validation/`.
 
 ```sh
-# Optional host tracing tool, used only by this test runner:
-sudo apt-get install strace
-python3 test_repository.py \
-  --tool _tmp/kernel-repository/kernel-repository \
+bazel test //:parity_x86_64_test //:parity_debug_test //:parity_lz4_test \
+  //:parity_btf_test //:arm64_parity_test \
+  --extra_toolchains=@llvm//toolchain:linux_x86_64_to_linux_x86_64,@llvm//toolchain:linux_x86_64_to_linux_aarch64 \
+  --test_output=errors
+bazel test //:action_built_parity_test \
+  --extra_toolchains=//:driver_toolchain --test_output=errors
+```
+
+The action-built compiler regression verifies that a compiler produced in the
+same invocation supplies the measured configuration. It uses a compiled driver
+around the selected compiler; it does not bootstrap LLVM from source.
+`check_reuse.py` uses Bazel execution logs to verify that a source edit recompiles
+only compiler actions in its actual downstream dependency closure.
+
+Audit the standalone generation boundary with optional host `strace`:
+
+```sh
+python3 test_repository.py --tool _tmp/kernel-repository/kernel-repository \
   --linux _tmp/linux --out _tmp/kernel-repository/check --strace
 ```
 
-This checks static ELF linkage, full generation with empty PATH and poisoned
-compiler/Make/Python environment variables, and an exec trace containing only
-the same binary. It also checks preserved example requests, parser-version and output-directory
-failures. An optional `--reference` can compare Kconfig/Make data with a previously
-generated workspace. Root unit/style checks run with `bazel test //...`.
+The `Kernel acceptance` workflow runs these checks on pushes to the prototype
+branch, pull requests, and manual dispatch. It fetches autoconf.bzl through Bzlmod.
 
-For a build/link check of the repository rule's output, run in the example:
+## Source layout
 
-```sh
-bazel build //:x86_64_kernel //:aarch64_kernel @kernel//execution_tools:check \
-  --sandbox_block_path=/bin --sandbox_block_path=/usr/bin \
-  --sandbox_block_path=/usr/local/bin
-```
+- `renderer/`: native syntax transport, symbolic Make lowering, and input export.
+- `native/`: native parser integration, bootstrap inputs, and reference tooling.
+- `rules/`: the single execution-time Starlark resolver and artifact scheduler.
+- `probe_runtime.py`, `scheduler.py`, `execute.py`: probe, dependency-scan, and action adapters.
+- `examples/`: retained config fragments and platform-selected kernel targets.
 
-`native/` owns parser integration and bootstrap inputs; `renderer/` is the
-independent renderer/runtime snapshot. `launcher.c` owns the static executable's
-entry points, and `build.py` links the three native object groups together.
-Upstream parser global symbols are namespaced before linking; libc references
-remain shared. No dynamically loaded Python extension modules are required.
-
-## CI
-
-The `Kernel repository prototype` workflow checks out a pinned Linux commit, builds
-the tool from scratch, audits generation with an exec trace, exercises the
-repository rule, runs the example and platform analysis tests, and builds/links
-the x86, debug, LZ4 and ARM64 examples with
-host tool directories blocked. It runs on this prototype branch, relevant pull
-requests, and manual dispatch. The static executable and diagnostics are uploaded
-as workflow artifacts. Existing root tests remain independent of local checkouts.
-
-## Measured compiler probes
-
-[The autoconf kernel experiment](experiments/autoconf/README.md) integrates the
-execution-time measured-probe approach alongside the maintained examples. It
-keeps `autoconf.bzl` as a separate Bzlmod dependency with an explicit local
-override, regenerates large symbolic exports, and compares a complete local GCC
-kernel build against upstream Kconfig and Kbuild. Its system-tool acceptance
-setup and manual CI workflow are separate from the hermetic LLVM examples.
+The static exporter also powers [repository.bzl](repository.bzl), which publishes
+a symbolic input repository from a source anchor and prebuilt generator label.
+It does not register toolchains or configure the compiler. The local acceptance
+setup above supplies the measurement/reference tools separately.

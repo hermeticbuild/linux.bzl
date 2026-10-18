@@ -45,7 +45,7 @@ def main():
     result = subprocess.run([tool, '_make', '-f', '/dev/null'], env={'PATH': ''}, capture_output=True, text=True)
     assert result.returncode == 2 and 'Only GNU Make syntax export' in result.stderr
     repo = out / 'repo'
-    command = [str(tool), 'generate', '--linux', str(linux), '--out', str(repo), '--all-backends']
+    command = [str(tool), 'generate', '--linux', str(linux), '--out', str(repo)]
     for fragment in sorted(args.config_dir.glob('*.config')):
         command.extend(['--config-fragment', str(fragment.resolve())])
     if args.strace:
@@ -63,12 +63,14 @@ def main():
         assert set(executable_paths) == {str(tool)}, set(executable_paths)
         assert 'execveat(' not in trace, trace
         print(f'PASS: {len(executable_paths)} execs, all of the same static ELF')
-    assert (repo / 'source').resolve() == linux
     assert not list(repo.glob('.generation-*')), 'Temporary generation files leaked'
     assert not (repo / 'rules/native_make').exists()
+    assert not (repo / 'options').exists(), 'Superseded analysis-time targets were emitted'
+    assert not (repo / 'actions').exists()
+    assert list((repo / 'rules').glob('*.bzl')), 'Missing symbolic runtime inputs'
     assert '${MAKE}' not in (repo / 'rules/link-vmlinux.sh').read_text()
-    requests_text = (repo / 'rules/example_configs.bzl').read_text()
-    requests = json.loads(ast.literal_eval(requests_text[len('EXAMPLE_CONFIGS = json.decode('):-2]))
+    requests_text = (repo / 'rules/qualification.bzl').read_text()
+    requests = json.loads(ast.literal_eval(requests_text[len('FRAGMENTS = json.decode('):-2]))
     assert requests['x86_64']['MODULES'] == 'n'
     assert requests['debug']['LOCALVERSION'] == '"-debug"'
     assert requests['lz4']['KERNEL_GZIP'] == 'n'
@@ -77,10 +79,10 @@ def main():
     assert '/tmp/tmp' not in json.dumps(program), 'Unstable temporary provenance in Make programs'
     if args.reference:
         reference = args.reference.resolve()
-        for name in ('options/BUILD.bazel', 'rules/architecture_data.bzl', 'MODULE.bazel'):
+        for name in ('baseline.json', 'profile.json', 'host-programs.json', 'MODULE.bazel'):
             assert (repo / name).read_bytes() == (reference / name).read_bytes(), name
         assert without_provenance(program) == without_provenance(read_program(reference)), 'Make programs changed'
-        print('PASS: Kconfig and Make programs match the existing prototype')
+        print('PASS: Kconfig and Make programs match the reference export')
     # Errors must not clobber an existing repository or silently accept a parser
     # compiled against a different kernel revision.
     sentinel = repo / 'keep.txt'

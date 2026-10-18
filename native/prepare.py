@@ -12,7 +12,7 @@ def prepare_sources(linux, output):
     parser = parser.replace(source_hook, 'menu_add_entry(NULL, M_COMMENT); current_entry->help = xstrdup($2);')
     finalize = '\tmenu_finalize();'
     assert parser.count(finalize) == 1
-    parser = parser.replace(finalize, '\treturn; /* Link and finalize the syntax in Bazel analysis. */')
+    parser = parser.replace(finalize, '\treturn; /* Link and finalize the syntax in execution-time Starlark. */')
     parser = parser.replace('\tyyparse();', '\t/* Preprocessor definitions shared by the kernel Kconfig files. */\n\tif (strcmp(name, "scripts/Kconfig.include")) {\n\t\tzconf_initscan("scripts/Kconfig.include");\n\t\tyyparse();\n\t\tzconf_initscan(name);\n\t}\n\tyyparse();', 1)
     (output / 'parser.y').write_text(parser)
     subprocess.run(['bison', '-t', '-d', '-o', output / 'parser.tab.c', output / 'parser.y'], check=True)
@@ -28,8 +28,8 @@ def prepare_sources(linux, output):
     after = after.replace('\tv = variable_lookup(name);', '\tres = prototype_probe_fallback(name, argc, argv);\n\tif (res) return res;\n\tv = variable_lookup(name);', 1)
     preprocess = (before + after).replace('\tcmd = argv[0];', '\treturn prototype_shell_fallback(argc, argv);\n\tcmd = argv[0];', 1)
     (output / 'preprocess.c').write_text(preprocess)
-    dump = (HERE / 'dump.c').read_text()
-    dump = dump[:dump.index('int main(')] + (HERE / 'kconfig_syntax.inc').read_text()
+    dump = (HERE / 'kconfig_dump.inc').read_text()
+    dump = dump + (HERE / 'kconfig_syntax.inc').read_text()
     (output / 'dump.c').write_text(dump)
     sources = [src / (n + '.c') for n in ('confdata', 'expr', 'menu', 'symbol', 'util')]
     sources += [output / n for n in ('lexer.lex.c', 'parser.tab.c', 'preprocess.c', 'dump.c')]

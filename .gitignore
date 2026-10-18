@@ -4,3 +4,6 @@ bazel-*
 /_tmp/
 __pycache__/
 *.pyc
+
+/.generated/
+/validation/

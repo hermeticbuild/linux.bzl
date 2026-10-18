@@ -1,5 +1,0 @@
-.generated/
-MODULE.bazel.lock
-validation/
-__pycache__/
-bazel-*

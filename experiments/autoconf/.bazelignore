@@ -1,2 +1,0 @@
-# Generated inputs are consumed through @kernel_inputs, not as local packages.
-.generated
