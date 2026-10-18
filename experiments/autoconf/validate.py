@@ -12,7 +12,7 @@ args=parser.parse_args()
 root=Path(__file__).resolve().parent
 out=root/'validation';out.mkdir(exist_ok=True)
 base=root.parents[1]/'_tmp/autoconf-integrated-output'
-subprocess.run(['bazel','--output_base='+str(base),'build','//:kernel','//:config','//:allno_config','//:debug_config','//:custom_config']+(['--jobs='+str(args.jobs)] if args.jobs else []),cwd=root,check=True)
+subprocess.run(['bazel','--output_base='+str(base),'build','//...']+(['--jobs='+str(args.jobs)] if args.jobs else []),cwd=root,check=True)
 subprocess.run(['bazel','--output_base='+str(base),'test','//:execute_test','//:configure_test','--test_output=errors'],cwd=root,check=True)
 summaries={}
 for mode,target in [('minimal','config'),('allno','allno_config'),('debug','debug_config')]:

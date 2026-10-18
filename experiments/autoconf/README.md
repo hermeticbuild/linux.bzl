@@ -65,7 +65,10 @@ The main targets are:
 | `//:execute_test` | Declared input overlays, directory transport and failure propagation |
 | `//:configure_test` | Symbolic export import and rejection of executable inputs |
 
-`validate.py` builds these targets and runs both Bazel tests. It compares all
+`bazel build //...` builds all experiment targets. Generated input repositories
+are excluded from recursive package discovery with `.bazelignore`.
+
+`validate.py` builds `//...` and runs both Bazel tests. It compares all
 symbol values and written configs for minimal/allno/debug with an independently
 compiled unmodified upstream resolver, checks the configuration used for the
 linked image, compares six ordered global Kbuild flag groups and native
