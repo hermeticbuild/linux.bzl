@@ -1,4 +1,4 @@
-load("@autoconf_prototype//:autoconf.bzl", "autoconf", "compile_test")
+load("@autoconf.bzl//:autoconf.bzl", "autoconf", "compile_test")
 load("@bazel_skylib//rules/directory:subdirectory.bzl", "subdirectory")
 load("@kernel_inputs//rules:qualification.bzl", "FRAGMENTS")
 load("@rules_cc//cc/toolchains:cc_toolchain.bzl", "cc_toolchain")

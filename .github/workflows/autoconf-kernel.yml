@@ -1,18 +1,7 @@
 name: Autoconf kernel acceptance
 
-# The reusable module remains a separate dependency. Until it has a published
-# version, callers supply the repository to check out for its local override.
 on:
   workflow_dispatch:
-    inputs:
-      autoconf_repository:
-        description: Repository containing the separate autoconf_prototype Bzlmod module (owner/repo)
-        required: true
-        type: string
-      autoconf_ref:
-        description: Commit or ref of the autoconf module
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -25,14 +14,6 @@ jobs:
       USE_BAZEL_VERSION: 9.3.0
     steps:
       - uses: actions/checkout@v5
-
-      - name: Checkout separate autoconf module
-        uses: actions/checkout@v5
-        with:
-          repository: ${{ inputs.autoconf_repository }}
-          ref: ${{ inputs.autoconf_ref }}
-          path: _tmp/autoconf-dependency
-          persist-credentials: false
 
       - name: Checkout pinned Linux source
         uses: actions/checkout@v5
@@ -58,9 +39,9 @@ jobs:
       - name: Bootstrap static repository compiler
         run: python3 build.py --jobs 4
 
-      - name: Generate kernel inputs and configure local module override
+      - name: Generate kernel inputs
         run: |
-          python3 experiments/autoconf/configure.py --autoconf _tmp/autoconf-dependency
+          python3 experiments/autoconf/configure.py
 
       - name: Build kernel and compare with upstream
         working-directory: experiments/autoconf

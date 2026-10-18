@@ -1,6 +1,6 @@
 """Execution tools bound to the selected C/C++ toolchain, without probe answers."""
 
-load("@autoconf_prototype//:autoconf.bzl", "toolchain_context")
+load("@autoconf.bzl//:autoconf.bzl", "toolchain_context")
 load("@bazel_skylib//rules/directory:providers.bzl", "DirectoryInfo")
 load("@rules_cc//cc:action_names.bzl", "ACTION_NAMES")
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cc_toolchain", "use_cc_toolchain")

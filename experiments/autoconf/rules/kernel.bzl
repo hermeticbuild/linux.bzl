@@ -1,6 +1,6 @@
 """Autoconf-driven complete kernel artifact graph, planned in Starlark."""
 
-load("@autoconf_prototype//:autoconf.bzl", "AutoconfInfo", "CC_TOOLCHAIN", "read_results")
+load("@autoconf.bzl//:autoconf.bzl", "AutoconfInfo", "read_results")
 load("@kernel_inputs//rules:catalog.bzl", "ACTIONS")
 load("@kernel_inputs//rules:data.bzl", "PROFILE")
 load("@kernel_inputs//rules:flag_program.bzl", "FLAG_PROGRAM")
@@ -15,6 +15,8 @@ load(":runtime.bzl", "context", "read_payload", "writer")
 load(":schedule.bzl", "schedule", "write_payload")
 load(":solver.bzl", "resolve_options")
 load(":toolchain.bzl", "make_setup")
+
+CC_TOOLCHAIN = "@rules_cc//cc:toolchain_type"
 
 # Fixed map_directory callback signature.
 # buildifier: disable=unused-variable

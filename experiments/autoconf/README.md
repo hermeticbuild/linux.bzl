@@ -6,19 +6,21 @@ compiler capabilities, and registers each compile, generator, archive and link
 step as a separate action. Make is used only during generation and independent
 validation. Unresolved probes in the final graph fail the build.
 
-The reusable probe API remains a **separate Bzlmod dependency**, currently named
-`autoconf_prototype`. No copy of its implementation is included here.
-`configure.py` writes an ignored `local_path_override` to the supplied checkout.
+The reusable probe API remains a **separate Bzlmod dependency**, pinned to
+[`hermeticbuild/autoconf.bzl`](https://github.com/hermeticbuild/autoconf.bzl) at
+`08d970e04ac0592179d7b832e3189ae39a4e042c`. No copy of its implementation is included here.
+For local module development, pass Bazel
+`--override_module=autoconf.bzl=/path/to/checkout`.
 The existing `examples/` workspace and analysis-time implementation remain
 available separately.
 
 From the linux.bzl repository root:
 
 ```sh
-# Requires a Linux checkout and a separate autoconf module checkout.
+# Requires a Linux checkout; Bazel fetches the separate autoconf module.
 python3 build.py --linux _tmp/linux
 python3 experiments/autoconf/configure.py \
-  --linux _tmp/linux --autoconf _tmp/autoconf-prototype
+  --linux _tmp/linux
 cd experiments/autoconf
 python3 validate.py
 ```
@@ -123,10 +125,9 @@ allowlist. `kernel/fork.o` is the independent control.
 The small `//tests:scheduler` fixture exercises the same scheduling path with a
 generated header and two independent objects.
 
-The `Autoconf kernel acceptance` workflow is manually dispatched with an
-`autoconf_repository` and `autoconf_ref`. It checks out that separate module and
-uses the same local override and acceptance path. Automatic prototype CI remains
-independent of an unpublished module checkout.
+The `Autoconf kernel acceptance` workflow is manually dispatched without inputs.
+Bazel fetches the pinned separate module through Bzlmod, using the same
+acceptance path as the local experiment.
 
 `PROVENANCE.json` records the imported adapter's original hashes, and
 `native/provenance.json` records the tested upstream parser sources. The

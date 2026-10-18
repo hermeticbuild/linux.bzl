@@ -98,13 +98,10 @@ def qualification_fragments():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--linux', type=Path, default=REPOSITORY / '_tmp/linux')
-    parser.add_argument('--autoconf', type=Path, default=REPOSITORY / '_tmp/autoconf-prototype')
     parser.add_argument('--generator', type=Path, default=REPOSITORY / '_tmp/kernel-repository/kernel-repository')
     parser.add_argument('--generated', type=Path, help='Existing static generator output; otherwise regenerate it')
     args = parser.parse_args()
-    linux, autoconf = args.linux.resolve(), args.autoconf.resolve()
-    if not (autoconf / 'autoconf.bzl').is_file():
-        parser.error('--autoconf must point to the separate autoconf.bzl module checkout')
+    linux = args.linux.resolve()
     provenance = json.loads((ROOT / 'native/provenance.json').read_text())
     for name, expected in provenance['sources'].items():
         if hashlib.sha256((linux / name).read_bytes()).hexdigest() != expected:
@@ -119,12 +116,11 @@ def main():
             shutil.rmtree(generated)
         subprocess.run([str(args.generator.resolve()), 'generate', '--linux', str(linux), '--out', str(generated)], check=True)
     fixtures(generated, output, qualification_fragments())
-    (output / 'setup.MODULE.bazel').write_text('''local_path_override(module_name = "autoconf_prototype", path = %r)
-local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+    (output / 'setup.MODULE.bazel').write_text('''local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
 new_local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")
 local_repository(name = "kernel_inputs", path = %r)
 new_local_repository(name = "linux_source", path = %r, build_file_content = 'exports_files(["Makefile"])')
-''' % (str(autoconf), str(output), str(linux)))
+''' % (str(output), str(linux)))
     (output / 'inputs.json').write_text(json.dumps({'linux': str(linux)}))
     subprocess.run([sys.executable, str(ROOT / 'native/build_parser.py'), '--linux', str(linux)], check=True)
     subprocess.run([sys.executable, str(ROOT / 'native/build_reference.py'), '--linux', str(linux)], check=True)
