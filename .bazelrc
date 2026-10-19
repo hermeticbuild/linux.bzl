@@ -1,3 +1,5 @@
 build --experimental_allow_map_directory
+# Python entrypoints must use their declared runtime on bare Linux executors.
+build --@rules_python//python/config_settings:bootstrap_impl=script
 build --jobs=8
 try-import %workspace%/.bazelrc.user

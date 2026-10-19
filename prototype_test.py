@@ -2,50 +2,42 @@
 from pathlib import Path
 import stat
 import argparse
-import importlib.util
 import sys
-import tempfile
 import unittest
 
-from repository_main import read_fragment
+from native.configure import merge_fragments
+from examples.initramfs import archive
 parser = argparse.ArgumentParser()
-parser.add_argument('--initramfs', required=True)
 parser.add_argument('--config-anchor', required=True)
 inputs, test_args = parser.parse_known_args()
-spec = importlib.util.spec_from_file_location('example_initramfs', inputs.initramfs)
-initramfs = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(initramfs)
-archive = initramfs.archive
 
 
 class FragmentTest(unittest.TestCase):
-    def parse(self, text):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'requested.config'
-            path.write_text(text)
-            return read_fragment(path)
-
     def test_values_remain_requested_data(self):
-        self.assertEqual(self.parse('CONFIG_X=y\nCONFIG_LEVEL=0x20\nCONFIG_TEXT="a=b"\n# CONFIG_OFF is not set\n'),
-                         {'X': 'y', 'LEVEL': '0x20', 'TEXT': '"a=b"', 'OFF': 'n'})
+        text = 'CONFIG_X=y\nCONFIG_LEVEL=0x20\nCONFIG_TEXT="a=b"\n# CONFIG_OFF is not set\n'
+        self.assertEqual(merge_fragments([text], {}), text)
 
     def test_last_assignment_wins_and_keeps_request_order(self):
-        values = self.parse('CONFIG_X=y\nCONFIG_Y=m\n# CONFIG_X is not set\n')
-        self.assertEqual(list(values), ['Y', 'X'])
-        self.assertEqual(values['X'], 'n')
+        self.assertEqual(merge_fragments(['CONFIG_X=y\nCONFIG_Y=m\n', '# CONFIG_X is not set\n'], {}),
+                         'CONFIG_Y=m\n# CONFIG_X is not set\n')
+        self.assertEqual(merge_fragments(['CONFIG_X=y\nCONFIG_Y=m\n'], {'X': 'n'}),
+                         'CONFIG_Y=m\n# CONFIG_X is not set\n')
 
     def test_invalid_lines_fail(self):
         for text in ['not a config\n', 'CONFIG_BAD-NAME=y\n']:
             with self.subTest(text=text), self.assertRaises(ValueError):
-                self.parse(text)
+                merge_fragments([text], {})
 
     def test_existing_fragments(self):
         root = Path(inputs.config_anchor).parent
-        self.assertEqual(read_fragment(root / 'x86_64.config')['MODULES'], 'n')
-        self.assertEqual(read_fragment(root / 'debug.config')['LOCALVERSION'], '"-debug"')
-        self.assertEqual(read_fragment(root / 'btf.config')['DEBUG_INFO_BTF'], 'y')
-        self.assertEqual(read_fragment(root / 'lz4.config')['KERNEL_LZ4'], 'y')
-        self.assertEqual(read_fragment(root / 'aarch64.config')['SERIAL_AMBA_PL011'], 'y')
+        for name, assignment in [('x86_64', '# CONFIG_MODULES is not set'),
+                                 ('debug', 'CONFIG_LOCALVERSION="-debug"'),
+                                 ('btf', 'CONFIG_DEBUG_INFO_BTF=y'),
+                                 ('lz4', 'CONFIG_KERNEL_LZ4=y'),
+                                 ('aarch64', 'CONFIG_SERIAL_AMBA_PL011=y')]:
+            with self.subTest(fragment=name):
+                result = merge_fragments([(root / (name + '.config')).read_text()], {})
+                self.assertIn(assignment, result.splitlines())
 
 
 class InitramfsTest(unittest.TestCase):

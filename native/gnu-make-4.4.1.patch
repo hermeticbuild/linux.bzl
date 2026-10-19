@@ -1,3 +1,4 @@
+diff --git a/src/read.c b/src/read.c
 --- a/src/read.c
 +++ b/src/read.c
 @@ -142,7 +142,7 @@
@@ -140,14 +141,19 @@
  
        s2 = variable_expand (s2);
        conditionals->ignoring[o] = (streq (s1, s2) == (cmdtype == c_ifneq));
+diff --git a/src/main.c b/src/main.c
 --- a/src/main.c
 +++ b/src/main.c
-@@ -2083,6 +2083,20 @@
+@@ -2083,6 +2083,24 @@
  
      /* Read all the makefiles.  */
      read_files = read_all_makefiles (makefiles == 0 ? 0 : makefiles->list);
 +    if (getenv ("LINUX_BZL_MAKE_SETUP"))
 +      {
++        struct goaldep *entry;
++        for (entry = read_files; entry; entry = entry->next)
++          if (entry->error && !(entry->flags & RM_DONTCARE))
++            { errno = entry->error; pfatal_with_name (entry->file->name); }
 +        make_ast_export_setup (getenv ("LINUX_BZL_MAKE_SETUP"));
 +        exit (0);
 +      }
@@ -163,6 +169,7 @@
  
      arg_job_slots = INVALID_JOB_SLOTS;
  
+diff --git a/src/expand.c b/src/expand.c
 --- a/src/expand.c
 +++ b/src/expand.c
 @@ -216,6 +216,8 @@
@@ -233,6 +240,7 @@
  
            break;
          }
+diff --git a/src/function.c b/src/function.c
 --- a/src/function.c
 +++ b/src/function.c
 @@ -2655,7 +2655,7 @@
@@ -260,6 +268,7 @@
      for (argvp=argv; *argvp != 0; ++argvp)
        free (*argvp);
    else
+diff --git a/src/variable.h b/src/variable.h
 --- a/src/variable.h
 +++ b/src/variable.h
 @@ -241,3 +241,11 @@
@@ -274,6 +283,7 @@
 +void make_ast_expr_function (const char *, unsigned int, char **, int);
 +
 +void make_ast_export_setup (const char *path);
+diff --git a/src/job.c b/src/job.c
 --- a/src/job.c
 +++ b/src/job.c
 @@ -1697,6 +1697,15 @@
@@ -292,6 +302,7 @@
    /* Let any previously decided-upon jobs that are waiting
       for the load to go down start before this new one.  */
    start_waiting_jobs ();
+diff --git a/src/variable.c b/src/variable.c
 --- a/src/variable.c
 +++ b/src/variable.c
 @@ -2055,3 +2055,5 @@

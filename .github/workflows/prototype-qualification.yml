@@ -1,0 +1,35 @@
+name: Measured kernel qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      native_config_only:
+        description: Run only the focused native configuration prerequisite
+        type: boolean
+        default: true
+      syntax_only:
+        description: Run only the generic syntax exporter build and runtime audit
+        type: boolean
+        default: false
+      exporter_only:
+        description: Run native exporter and manifest checks on all supported hosts
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-config-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-config:
+    if: ${{ !inputs.exporter_only }}
+    uses: ./.github/workflows/kernel.yml
+    with:
+      native_config_only: ${{ inputs.native_config_only }}
+      syntax_only: ${{ inputs.syntax_only }}
+  exporter:
+    if: ${{ inputs.exporter_only }}
+    uses: ./.github/workflows/exporter.yml

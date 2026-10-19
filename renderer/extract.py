@@ -7,7 +7,6 @@ from pathlib import Path
 import programs as backend
 from export import native_events, parse_events
 from syntax import walk, relative
-from kconfig_syntax import export_syntax
 from text_transforms import lower_text_transforms
 from compiler_queries import lower_compiler_queries
 from shell_outputs import output_redirections
@@ -148,9 +147,9 @@ def image_selected(body, wanted):
 
 def extract(tree, linux, make):
     global _INCLUDE_DIRECTIVES, _INCLUDE_HEADER_RULES
-    syntax = export_syntax(linux)
     setup_files = {relative(source["file"], linux) for source in tree["files"]} | {"scripts/Kbuild.include"}
-    extras = [p for p in sorted(linux.rglob('Makefile*')) if p.is_file()] + sorted(linux.rglob('Kbuild.*')) + sorted(linux.rglob('Platform')) + [linux / 'scripts/Kbuild.include', linux / 'tools/objtool/Build', *sorted(linux.glob('tools/objtool/arch/*/Build')), linux / 'tools/lib/subcmd/Build']
+    extras = [p for pattern in ('Makefile*', 'Kbuild.*', 'Platform') for p in sorted(linux.rglob(pattern)) if p.is_file()]
+    extras += [linux / 'scripts/Kbuild.include', linux / 'tools/objtool/Build', *sorted(linux.glob('tools/objtool/arch/*/Build')), linux / 'tools/lib/subcmd/Build']
     existing = {Path(f['file']).resolve() for f in tree['files']}
     tree['files'].extend(parse_events(native_events(make, [p for p in extras if p.resolve() not in existing], expressions=True))['files'])
     entries = []
@@ -188,19 +187,13 @@ def extract(tree, linux, make):
                 result.append(n)
         return result
     data['image_flag_programs'] = {p: flag_body(body) for p, body in bodies.items()}
-    data['directories'] = {p: body for p, body in data['image_flag_programs'].items() if p.rsplit('/', 1)[-1] in ('Makefile', 'Kbuild') and p != 'Makefile'}
     data['image_programs'] = bodies
     data['image_compile_commands'] = sorted({n['name'][4:] for body in bodies.values() for n, _ in walk(body) if n['kind'] in ('assignment', 'define') and n.get('name', '').startswith('cmd_') and backend.refs(n['value_expression']) & {'c_flags', 'a_flags'}})
     data['image_postlink_outputs'] = {p: [expr for n, _ in walk(body) if n['kind'] in ('assignment', 'define') and n.get('name', '').startswith('cmd_') for expr in output_redirections(n['value_expression'])] for p, body in bodies.items() if p.endswith('/Makefile.postlink')}
     data['image_dtbs'] = bodies['scripts/Makefile.dtbs']
     data['graph_helpers'] = graph
-    data['image_arch'] = [{'kind': 'directive', 'directive': 'include', 'arguments_expression': [
-        {'op': 'literal', 'value': 'arch/'}, {'op': 'reference', 'name': [{'op': 'literal', 'value': 'SRCARCH'}]}, {'op': 'literal', 'value': '/Makefile'}]}]
     top = bodies['Makefile']
     top_nodes = [n for n, _ in walk(top)]
-    first = next(n['line'] for n in top_nodes if n.get('name') == 'core-y')
-    last = next(n['line'] for n in top_nodes if n.get('name') == 'libs-y')
-    data['image_roots_init'] = backend.bounded(top, first, last)
     data['image_roots'] = backend.slice_program(backend.bounded(top, next(n['line'] for n in top_nodes if n.get('name') == 'ARCH_CORE'), next(n['line'] for n in top_nodes if n.get('name') == 'KBUILD_LDS')), {'ARCH_CORE', 'ARCH_LIB', 'ARCH_DRIVERS', 'KBUILD_LDS', 'KBUILD_VMLINUX_OBJS', 'KBUILD_VMLINUX_LIBS'})
     def export_directives(body):
         result = []
@@ -230,16 +223,11 @@ def extract(tree, linux, make):
             return [host_fallback(v) for v in value]
         if isinstance(value, dict):
             if value.get('op') == 'function' and value.get('name') == 'shell':
-                if 'libelf --cflags' in make_text(value['arguments'][0]):
-                    return {'op': 'literal', 'value': ''}  # Supplied by the CcInfo dependency.
-                if 'grep elf_getshdr' in make_text(value['arguments'][0]):
-                    return {'op': 'function', 'name': 'kbuild_libelf_api', 'arguments': []}
-                return {'op': 'function', 'name': 'kbuild_host_fallback', 'arguments': [[{'op': 'literal', 'value': make_text(value['arguments'][0])}]]}
+                return dict(value, name='kbuild_host_shell')
             return {k: host_fallback(v) for k, v in value.items()}
         return value
-    data['image_host_objtool'] = host_fallback(backend.slice_program(bodies['tools/objtool/Makefile'], {'OBJTOOL_CFLAGS', 'BUILD_ORC', 'BUILD_KLP'}))
+    data['image_host_objtool'] = host_fallback(backend.slice_program(bodies['tools/scripts/Makefile.include'] + bodies['tools/objtool/Makefile'], {'OBJTOOL_CFLAGS', 'OBJTOOL_LDFLAGS', 'BUILD_ORC', 'BUILD_KLP', 'BUILD_DISAS'}))
     data['image_host_build'] = backend.slice_program(bodies['tools/objtool/Build'], {'objtool-y'}) + [n for n in bodies['tools/objtool/Build'] if n['kind'] == 'rule']
-    data['image_host_arch'] = bodies
     data['image_host_subcmd'] = backend.slice_program(bodies['tools/lib/subcmd/Makefile'] + bodies['tools/lib/subcmd/Build'], {'libsubcmd-y', 'CFLAGS'})
     _INCLUDE_DIRECTIVES = True
     data['image_link_global'] = backend.slice_program(backend.bounded(top, min(n['line'] for n in top_nodes if n.get('name') == 'LDFLAGS_vmlinux'), max(n['line'] for n in top_nodes if n.get('name') == 'LDFLAGS_vmlinux')), {'LDFLAGS_vmlinux'})
@@ -273,7 +261,6 @@ def extract(tree, linux, make):
             wanted.update(extra)
         raise ValueError('Cross-file Make dependency slice did not converge')
     data['image_setup_programs'] = slice_includes(setup_roots)
-    data['image_graph_programs'] = slice_includes({'libs-y', 'core-y', 'drivers-y', 'BITS', 'UTS_MACHINE', 'REALMODE_CFLAGS'})
     _INCLUDE_HEADER_RULES = True
     header_body, active = [], False
     for node in bodies['scripts/Makefile.asm-headers']:
@@ -326,4 +313,4 @@ def extract(tree, linux, make):
                 active = False
         return result
     data['image_implicit_rules'] = implicit_rules(bodies['scripts/Makefile.build']) + implicit_rules(bodies['scripts/Makefile.lib'])
-    return syntax, data, link_script
+    return data, link_script

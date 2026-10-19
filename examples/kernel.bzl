@@ -2,6 +2,7 @@
 
 load("@bazel_skylib//lib:shell.bzl", "shell")
 load("@rules_python//python:defs.bzl", "py_test")
+load("//rules:config.bzl", "kernel_config")
 load("//rules:kernel.bzl", "kernel_build")
 
 # Fixed Bazel transition callback signature.
@@ -28,23 +29,27 @@ _configured = rule(implementation = _configured_impl, attrs = {
     "_allowlist_function_transition": attr.label(default = "@bazel_tools//tools/allowlists/function_transition_allowlist"),
 })
 
-def kernel_example(name, requested, platform, cc_toolchain, overrides = {}):
-    requested = dict(requested, **overrides)
-    for suffix, config_only in [("_configuration", True), ("_unconfigured", False)]:
-        kernel_build(
-            name = name + suffix,
-            config_only = config_only,
-            mode = "qualification",
-            requested = requested,
-            rounds = 0 if config_only else 64,
-            tags = ["manual"],
-        )
+def kernel_example(name, fragments, platform, cc_toolchain):
+    kernel_config(
+        name = name + "_configuration",
+        source = "//native:source",
+        fragments = fragments,
+        pahole = "@pahole//:pahole",
+        tags = ["manual"],
+    )
+    kernel_build(
+        name = name + "_unconfigured",
+        config = ":" + name + "_configuration",
+        syntax = "@kernel_syntax//:program",
+        tags = ["manual"],
+    )
+    for public, target in [(name + "_config", name + "_configuration"), (name, name + "_unconfigured")]:
         _configured(
-            name = name + ("_config" if config_only else ""),
-            target = ":" + name + suffix,
+            name = public,
+            target = ":" + target,
             platform = platform,
             cc_toolchain = cc_toolchain,
-            tags = ["manual"] if not config_only else [],
+            tags = ["manual"],
         )
 
 def example_config_test(name, config, expected):
@@ -54,6 +59,7 @@ def example_config_test(name, config, expected):
         main = "//:test_config_values.py",
         args = ["$(location " + config + ")", shell.quote(json.encode(expected))],
         data = [config],
+        tags = ["manual"],
     )
 
 def _initramfs_impl(ctx):

@@ -7,30 +7,30 @@ def read_payload(expanded):
     text = "".join([_ASCII[int(encoded[i:i + 2], 16) - 32] for i in range(0, len(encoded), 2)])
     return json.decode(text)
 
-def writer(tctx, python, script, root):
+def writer(tctx, python, script, root, python_files):
     count = []
 
     # buildifier: disable=unused-variable
     def write(output, content, **kwargs):
         count.append(0)
         if len(content) < 60000:
-            tctx.run(executable = python, inputs = [script], outputs = [output], arguments = [script.path, output.path, content])
+            tctx.run(executable = python, inputs = depset([script], transitive = [python_files]), outputs = [output], arguments = [script.path, output.path, content])
             return
         parts = []
         for start in range(0, len(content), 240000):
             piece = content[start:start + 240000]
             part = tctx.declare_file("write/%d-%d" % (len(count), start), directory = root)
-            tctx.run(executable = python, inputs = [script], outputs = [part], arguments = [script.path, "--chunks", part.path] + [piece[i:i + 16000] for i in range(0, len(piece), 16000)])
+            tctx.run(executable = python, inputs = depset([script], transitive = [python_files]), outputs = [part], arguments = [script.path, "--chunks", part.path] + [piece[i:i + 16000] for i in range(0, len(piece), 16000)])
             parts.append(part)
-        tctx.run(executable = python, inputs = parts + [script], outputs = [output], arguments = [script.path, "--concat", output.path] + [p.path for p in parts])
+        tctx.run(executable = python, inputs = depset(parts + [script], transitive = [python_files]), outputs = [output], arguments = [script.path, "--concat", output.path] + [p.path for p in parts])
 
     return write
 
-def context(tctx, roots, tools, params, planning = False, recorded = None):
+def context(tctx, roots, tools, params, planning = False, recorded = None, kernel_roots = ["vmlinux"], required_options = {}):
     runtime_tools = tools
     virtual = {}
     sequence = []
-    write_file = writer(tctx, tools["python"], tools["emit"], roots["scratch"])
+    write_file = writer(tctx, tools["python"], tools["emit"], roots["scratch"], tools["python_files"])
     common_paths, common_manifest = {}, None
     if recorded != None:
         common = depset(transitive = [tools["compiler_files"], tools["execution_files"]]).to_list()
@@ -66,7 +66,7 @@ def context(tctx, roots, tools, params, planning = False, recorded = None):
         return struct(values = values, add_all = add_all, add = add)
 
     # buildifier: disable=unused-variable
-    def run(executable, outputs, inputs = [], arguments = [], tools = [], env = {}, **kwargs):
+    def run(executable, outputs, inputs = [], arguments = [], tools = [], env = None, **kwargs):
         if planning:
             return
         sequence.append(0)
@@ -78,6 +78,7 @@ def context(tctx, roots, tools, params, planning = False, recorded = None):
         if type(executable) == "File":
             all_files.append(executable)
             executable = executable.path
+        environment = dict(runtime_tools.get("environment", {}) if env == None else env)
         spec = dict(
             executable = executable,
             arguments = flat,
@@ -85,7 +86,8 @@ def context(tctx, roots, tools, params, planning = False, recorded = None):
             outputs = [f.path for f in outputs],
             directory_inputs = [f.path for f in all_files if f.path in virtual],
             directory_outputs = [f.path for f in outputs if f.path in virtual],
-            environment = env,
+            environment = environment,
+            path_environment = runtime_tools.get("path_environment", {}),
         )
         if recorded != None:
             spec["inputs"] = [path for path in spec["inputs"] if path not in common_paths] + [common_manifest.path]
@@ -108,7 +110,7 @@ def context(tctx, roots, tools, params, planning = False, recorded = None):
             return
         tctx.run(
             executable = params.python,
-            inputs = depset([manifest, params.executor] + all_files),
+            inputs = depset([manifest, params.executor] + all_files, transitive = [runtime_tools["python_files"]]),
             outputs = outputs,
             tools = [tool for name, tool in runtime_tools.items() if name.startswith("compiler_tool_")],
             arguments = [params.executor.path, manifest.path],
@@ -126,12 +128,12 @@ def context(tctx, roots, tools, params, planning = False, recorded = None):
         shell = tools["commands"]["sh"],
         python = tools["python"],
         environment = runtime_tools.get("environment", {}),
-        path_environment = {},
+        path_environment = runtime_tools.get("path_environment", {}),
     )
     return struct(
         actions = struct(declare_file = declare_file, declare_directory = declare_directory, write = write, args = args, run = run),
         execution = execution,
         file = struct(_materialize = params.materialize, _link_script = params.link_script),
         label = struct(name = "kernel"),
-        attr = struct(roots = ["vmlinux"], architecture_roots = {}, required_options = {}),
+        attr = struct(roots = kernel_roots, required_options = required_options),
     )

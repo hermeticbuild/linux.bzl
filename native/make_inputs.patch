@@ -1,0 +1,29 @@
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -616,3 +616,26 @@
+     }),
+     visibility = ["//visibility:public"],
+ )
++
++# Share the native source inventory and configured headers with AST consumers.
++filegroup(
++    name = "posix_parser_inputs",
++    srcs = MAKE_SRCS + MAKE_HDRS + LIB_HDRS + POSIX_LIB_SRCS + POSIX_LIB_HDRS + [
++        "src/posixos.c",
++        ":config_h",
++        ":gmk_default_h",
++    ],
++    visibility = ["//visibility:public"],
++)
++
++# GNU Make's !USE_SYSTEM_GLOB branch supplies the GNU hooks absent in musl.
++filegroup(
++    name = "gnu_glob_inputs",
++    srcs = [
++        "lib/fnmatch.c",
++        "lib/glob.c",
++        ":lib_fnmatch_h",
++        ":lib_glob_h",
++    ],
++    visibility = ["//visibility:public"],
++)

@@ -1,5 +1,4 @@
-"""Measure native Kconfig and context-specific Kbuild queries as Bazel actions."""
-import concurrent.futures
+"""Measure context-specific native Kbuild queries as Bazel actions."""
 import json
 import os
 from pathlib import Path
@@ -13,8 +12,10 @@ def publish(output, value):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(value, ensure_ascii=True, separators=(',', ':')).encode().hex()
+    print(f'Payload: {len(encoded) // 2} JSON bytes; {(len(encoded) + 179) // 180} chunks', file=sys.stderr, flush=True)
     for start in range(0, len(encoded), 180):
-        (output / ('%08d=' % (start // 180) + encoded[start:start + 180])).touch()
+        with (output / ('%08d=' % (start // 180) + encoded[start:start + 180])).open('xb'):
+            pass
     (output / 'report.json').write_text(json.dumps(value, indent=2))
 
 
@@ -49,73 +50,12 @@ def absolute_environment(environment, execution_root):
     return result
 
 
-def compiler_environment(spec, execution_root):
-    roles = {name: str(execution_root / path) for name, path in spec['roles'].items()}
-    arch = spec['architecture']
-    environment = dict(absolute_environment(spec.get('compile_env', {}), execution_root), LC_ALL='C', LANG='C')
-    environment.update(spec.get('tool_environment', {}))
-    environment.update(roles)
-    environment.update(
-        srctree=str(Path(spec['source']).resolve()), ARCH=arch['arch'], SRCARCH=arch['srcarch'],
-        SUBARCH=arch['subarch'], HEADER_ARCH=arch['header_arch'], KERNELVERSION='prototype',
-        HOSTCC=str(execution_root / spec['host_roles']['CC']), RUSTC='false', PAHOLE='false',
-        PAHOLE_VERSION='0', PATH=environment.get('PATH', os.environ['PATH']),
-        CLANG_FLAGS=shlex.join(absolute_arguments(spec['compile_flags'], execution_root)),
-    )
-    environment['CC_VERSION_TEXT'] = subprocess.check_output([roles['CC'], '--version'], env=environment, text=True).splitlines()[0]
-    return environment
-
-
-def kconfig(spec, output):
-    execution_root = Path.cwd()
-    root = Path(spec['source']).resolve()
-    baseline = json.loads(Path(spec['baseline']).read_text())
-    sources = {key: json.loads(value) if isinstance(value, str) else value for key, value in baseline.items()}
-    reachable, pending = set(), ['Kconfig']
-    while pending:
-        name = pending.pop()
-        if name in reachable:
-            continue
-        reachable.add(name)
-        for node in sources[name]:
-            if node['kind'] == 'source':
-                path = node['path']
-                arch = spec['architecture']
-                for key, value in {'SRCARCH': arch['srcarch'], 'ARCH': arch['arch'], 'SUBARCH': arch['subarch'], 'HEADER_ARCH': arch['header_arch']}.items():
-                    path = path.replace('__KCONFIG_' + key, value)
-                pending.append(path)
-    environment = compiler_environment(spec, execution_root)
-    binary = str(Path(spec['syntax']).resolve())
-
-    def export(name):
-        result = subprocess.run([binary, name], cwd=root, env=environment, capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(name + '\n' + result.stderr)
-        nodes = json.loads(result.stdout)
-        if len(nodes) != len(sources[name]):
-            return [{'file': name, 'nodes': nodes}]
-        return [{'file': name, 'index': i, 'node': node} for i, node in enumerate(nodes) if node != sources[name][i]]
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
-        patches = [patch for group in pool.map(export, sorted(reachable)) for patch in group]
-    host = str(execution_root / spec['host_roles']['CC'])
-    host_flags = absolute_arguments(spec['host_compile_flags'], execution_root)
-    host_capabilities = {}
-    host_environment = dict(environment, **absolute_environment(spec.get('host_compile_env', {}), execution_root))
-    for program in json.loads(Path(spec['host_programs']).read_text()):
-        command = program.replace('$(pound)', '#').replace('$(HOSTCC)', shlex.quote(host)).replace('$(HOSTCFLAGS)', shlex.join(host_flags)).replace('$(HOSTPKG_CONFIG)', 'pkg-config').replace('$$', '$')
-        result = subprocess.run(['/bin/sh', '-c', command], env=host_environment, text=True, capture_output=True, timeout=30)
-        if result.returncode not in (0, 1):
-            raise RuntimeError(command + '\n' + result.stderr)
-        host_capabilities[program] = result.stdout.strip()
-    result = subprocess.run([host, *host_flags, '-Werror', '-x', 'c', '-', '-c', '-o', '/dev/null'], input='#include <libelf.h>\nvoid *p = elf_getshdrnum;\n', env=host_environment, text=True, capture_output=True)
-    host_capabilities['__libelf_modern_api__'] = result.returncode == 0
-    publish(output, dict(patches=patches, capabilities={}, host_capabilities=host_capabilities, history=[], files=len(reachable), compiler=environment['CC_VERSION_TEXT'], toolchain=spec))
-
-
 def probe_command(request, work, execution_root):
     """Build the native helper command using its complete evaluated context."""
-    kind, argument = request['kind'], request['argument']
+    kind = request['kind']
+    if kind in {'try-run', 'host-shell'}:
+        return [str(execution_root / request['environment']['CONFIG_SHELL']), '-c', request['command']]
+    argument = request['argument']
     compiler = shlex.split(request['compiler'])
     compiler[0] = str(execution_root / compiler[0])
     flags = shlex.split(request['flags'])
@@ -129,8 +69,6 @@ def probe_command(request, work, execution_root):
         return [*compiler, '-Werror', *flags, '-Wa,--fatal-warnings', '-c', '-x', 'assembler-with-cpp', str(source), '-o', str(obj)]
     if kind == 'as-option':
         return [*compiler, '-Werror', *flags, *shlex.split(argument), '-c', '-x', 'assembler-with-cpp', '/dev/null', '-o', str(obj)]
-    if kind == 'try-run':
-        return ['/bin/sh', '-c', request['command']]
     if kind.startswith('rustc'):
         raise RuntimeError('Rust probes require a declared Rust toolchain')
     options = ['-Wno-' + argument] if kind == 'cc-disable-warning' else shlex.split(argument)
@@ -164,12 +102,15 @@ def probes(spec, output):
             (directory / '.config').write_text(spec.get('config', ''))
             command = probe_command(request, work, execution_root)
             environment = absolute_environment(request['environment'], execution_root)
-            environment.update(LC_ALL='C', TMP=str(work / 'tmp'), TMPDIR=str(work), PATH=environment.get('PATH', os.environ['PATH']))
+            infrastructure_error = work / 'infrastructure-error'
+            environment.update(LC_ALL='C', TMP=str(work / 'tmp'), TMPDIR=str(work), KBUILD_EXEC_ROOT=str(execution_root), KBUILD_PROBE_ERROR=str(infrastructure_error))
             result = subprocess.run(command, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30, env=environment)
-            if result.returncode not in (0, 1):
+            if infrastructure_error.exists():
+                raise RuntimeError('Kbuild probe infrastructure failed: ' + infrastructure_error.read_text())
+            if request['kind'] != 'host-shell' and result.returncode not in (0, 1):
                 raise RuntimeError(f'{key}: unexpected exit {result.returncode}\n{result.stderr}')
-            answers[key] = result.returncode == 0
-            records.append(dict(key=key, argv=[arg.replace(str(work), '__probe_tmp__') for arg in command], status=result.returncode, stderr=result.stderr.replace(str(work), '__probe_tmp__')))
+            answers[key] = result.stdout.rstrip('\n').replace('\n', ' ') if request['kind'] == 'host-shell' else result.returncode == 0
+            records.append(dict(key=key, argv=[arg.replace(str(work), '__probe_tmp__') for arg in command], status=result.returncode, stdout=result.stdout.replace(str(work), '__probe_tmp__'), stderr=result.stderr.replace(str(work), '__probe_tmp__')))
     previous['capabilities'] = answers
     previous['history'].append(records)
     publish(output, previous)
@@ -177,4 +118,9 @@ def probes(spec, output):
 
 if __name__ == '__main__':
     inputs = json.loads(Path(sys.argv[2]).read_text())
-    (kconfig if sys.argv[1] == 'kconfig' else probes)(inputs, sys.argv[3])
+    if sys.argv[1] == 'seed':
+        publish(sys.argv[3], dict(capabilities={}, history=[]))
+    elif sys.argv[1] == 'kbuild':
+        probes(inputs, sys.argv[3])
+    else:
+        raise ValueError(f'Unsupported probe operation: {sys.argv[1]!r}')

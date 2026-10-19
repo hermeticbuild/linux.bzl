@@ -1,0 +1,148 @@
+name: Native syntax exporters
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: exporter-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  exporter:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: linux_x86_64
+            runner: ubuntu-24.04
+            target: linux_x86_64_musl
+            bazel_sha256: d302d22ed77ee5658b87857249baa579db84300ecebe0a1e9a357b5b20f80eb8
+          - host: linux_aarch64
+            runner: ubuntu-24.04-arm
+            target: linux_aarch64_musl
+            bazel_sha256: 615cc2509819047e4930fe6643c5f01ebd705ccadf75e8f0b85f9b83cc6a6ca0
+          - host: macos_aarch64
+            runner: macos-15
+            target: macos_aarch64
+            bazel_sha256: f29ca3f3bf577eb1619aeeed401b64a10901c8da8031aaa4add54a4ad0e99e3a
+          - host: macos_x86_64
+            runner: macos-15-intel
+            target: macos_x86_64
+            bazel_sha256: ab0c51f2d51cb86c82b12be4901c7f4aa088afc39a7d71f610ed0f1d54f76de4
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      USE_BAZEL_VERSION: 9.3.0
+      BAZELISK_VERIFY_SHA256: ${{ matrix.bazel_sha256 }}
+      EXPORTER_HOST: ${{ matrix.host }}
+      EXPORTER_TARGET: ${{ matrix.target }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: exporter-${{ matrix.host }}
+          bazelrc: |
+            startup --host_jvm_args=-Xmx8g
+          repository-cache: |
+            - MODULE.bazel
+            - MODULE.bazel.lock
+      - name: Build and exercise the native exporter
+        run: |
+          bazel test //native:exporter_archive //:repository_test //:generation_test \
+            --platforms="@llvm//platforms:$EXPORTER_TARGET" \
+            --extra_execution_platforms="@llvm//platforms:$EXPORTER_HOST" \
+            --jobs=4 --test_output=errors --profile="$RUNNER_TEMP/exporter.profile.gz"
+      - name: Exercise the host manifest and syntax repository
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import shutil
+          import subprocess
+
+          host = os.environ['EXPORTER_HOST']
+          architecture = platform.machine().replace('arm64', 'aarch64')
+          native_host = {'Linux': 'linux', 'Darwin': 'macos'}[platform.system()] + '_' + architecture
+          assert native_host == host, (native_host, host)
+          options = [
+              '--platforms=@llvm//platforms:' + os.environ['EXPORTER_TARGET'],
+              '--extra_execution_platforms=@llvm//platforms:' + host,
+              '--jobs=4',
+          ]
+          archive_path = subprocess.check_output([
+              'bazel', 'cquery', '//native:exporter_archive', *options,
+              '--output=starlark',
+              r'--starlark:expr="\n".join([file.path for file in target.files.to_list() if file.path.endswith(".tar.gz")])',
+          ], text=True).splitlines()
+          assert len(archive_path) == 1, archive_path
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'exporter'
+          evidence.mkdir()
+          archive = evidence / ('kbuild-exporter-' + host.replace('_', '-', 1) + '.tar.gz')
+          shutil.copyfile(archive_path[0], archive)
+          digest = hashlib.sha256(archive.read_bytes()).digest()
+          manifest = {
+              'format': 1,
+              'platforms': {host: {
+                  'url': archive.as_uri(),
+                  'integrity': 'sha256-' + base64.b64encode(digest).decode(),
+              }},
+          }
+          manifest_bytes = (json.dumps(manifest, indent=2) + '\n').encode()
+          (evidence / 'manifest.json').write_bytes(manifest_bytes)
+          manifest_path = Path('exporter-host-manifest.json')
+          assert not manifest_path.exists(), manifest_path
+          module = Path('MODULE.bazel')
+          original = module.read_bytes()
+          declaration = b'kernel_syntax_tool(\n    name = "kbuild_exporter",\n    dev_dependency = True,\n)'
+          assert original.count(declaration) == 1
+          modified = original.replace(declaration, declaration[:-1] + b'    manifest = "//:exporter-host-manifest.json",\n)')
+          try:
+              manifest_path.write_bytes(manifest_bytes)
+              module.write_bytes(modified)
+              subprocess.run(['bazel', 'build', '@kernel_syntax//:export/report.json', *options], check=True)
+              report_paths = subprocess.check_output([
+                  'bazel', 'cquery', '@kernel_syntax//:export/report.json', *options, '--output=files',
+              ], text=True).splitlines()
+              assert len(report_paths) == 1, report_paths
+              execution_root = Path(subprocess.check_output(['bazel', 'info', 'execution_root', *options], text=True).strip())
+              report = execution_root / report_paths[0]
+              receipt = {
+                  'source': os.environ['GITHUB_SHA'],
+                  'host': host,
+                  'target': os.environ['EXPORTER_TARGET'],
+                  'archive_sha256': digest.hex(),
+                  'archive_bytes': archive.stat().st_size,
+                  'module_sha256': hashlib.sha256(original).hexdigest(),
+                  'validation_module_sha256': hashlib.sha256(modified).hexdigest(),
+                  'manifest_url_scheme': 'file',
+                  'report_sha256': hashlib.sha256(report.read_bytes()).hexdigest(),
+                  'report_bytes': report.stat().st_size,
+              }
+              (evidence / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          finally:
+              module.write_bytes(original)
+              manifest_path.unlink(missing_ok=True)
+          PY
+      - name: Retain native exporter evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: exporter-${{ matrix.host }}
+          path: |
+            ${{ runner.temp }}/exporter/
+            ${{ runner.temp }}/exporter.profile.gz
+            bazel-testlogs/**/test.log
+            bazel-testlogs/**/test.xml
+          if-no-files-found: error
+          retention-days: 7

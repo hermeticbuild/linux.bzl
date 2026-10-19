@@ -1,0 +1,7 @@
+load("@linux.bzl//rules:source_files.bzl", "kernel_source_files")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Makefile"])
+
+kernel_source_files(name = "sources")

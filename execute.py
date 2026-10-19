@@ -48,7 +48,9 @@ def execute(spec, scanner=None):
         if not executable.startswith('/'):
             executable = str(real / executable)
         arguments = scanner(spec, work) if scanner else spec['arguments']
-        subprocess.run([executable, *arguments], cwd=work, env=spec['environment'], check=True)
+        environment = dict(spec['environment'], KBUILD_EXEC_ROOT=str(work))
+        environment.update({name: str(work / path) for name, path in spec.get('path_environment', {}).items()})
+        subprocess.run([executable, *arguments], cwd=work, env=environment, check=True)
         if scanner:
             return scanner.dependencies(work)
         for name in spec['outputs']:

@@ -6,14 +6,14 @@ _ASCII = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abc
 _HEX = "0123456789abcdef"
 _CODES = {c: _HEX[(i + 32) // 16] + _HEX[(i + 32) % 16] for i, c in enumerate(_ASCII.elems())}
 
-def write_payload(tctx, python, emit, root, value):
+def write_payload(tctx, python, emit, root, value, python_files):
     report = tctx.declare_file("report.json", directory = root)
-    writer(tctx, python, emit, root)(report, json.encode(value))
+    writer(tctx, python, emit, root, python_files)(report, json.encode(value))
     encoded = "".join([_CODES[c] for c in json.encode(value).elems()])
     outputs = [tctx.declare_file(("00000000" + str(start // 180))[-8:] + "=" + encoded[start:start + 180], directory = root) for start in range(0, len(encoded), 180)]
     for start in range(0, len(outputs), 500):
         batch = outputs[start:start + 500]
-        tctx.run(executable = python, inputs = [emit], outputs = batch, arguments = [emit.path, "--touch"] + [f.path for f in batch], progress_message = "Write kernel schedule metadata")
+        tctx.run(executable = python, inputs = depset([emit], transitive = [python_files]), outputs = batch, arguments = [emit.path, "--touch"] + [f.path for f in batch], progress_message = "Write kernel schedule metadata")
 
 def _available(input_directories, tools, additional_inputs, params):
     available = {f.path: f for f in input_directories["literals"].children}
@@ -40,7 +40,7 @@ def _stage(tctx, input_directories, output_directories, tools, additional_inputs
     for name in input_directories:
         if name.startswith("scan_"):
             scanned.update(read_payload(input_directories[name]))
-    write = writer(tctx, tools["python"], tools["emit"], output_directories["scratch"])
+    write = writer(tctx, tools["python"], tools["emit"], output_directories["scratch"], tools["python_files"])
     requests = []
     produced = {path: True for job in jobs for path in job["outputs"]}
     unknown = {path: True for job in jobs for path in job["inputs"] if path not in available and path not in produced}
@@ -110,7 +110,7 @@ def _export(tctx, input_directories, output_directories, tools, additional_input
         tctx.run(
             executable = tools["python"],
             arguments = [tools["runner"].path, "copy", file.path, output.path],
-            inputs = [tools["runner"], tools["executor"], file],
+            inputs = depset([tools["runner"], tools["executor"], file], transitive = [tools["python_files"]]),
             outputs = [output],
             progress_message = "Export kernel artifact " + relative,
         )

@@ -1,6 +1,5 @@
 """Analysis-time command lowering with explicit inputs and direct LLVM actions."""
 
-load("@kernel_inputs//rules:flag_program.bzl", "FLAG_PROGRAM")
 load(":execution_tools.bzl", "execution_tools", "run_recipe")
 load(":expressions.bzl", "evaluate", "make_words", "match", "program")
 
@@ -72,17 +71,18 @@ def _scope(setup, directory, target, objtree, source, ancestry = None, membershi
         variables["obj"] = {"value": parent}
         variables["src"] = {"value": source + "/" + parent}
         prefix = "" if parent == "." else parent + "/"
-        path = prefix + "Kbuild" if prefix + "Kbuild" in FLAG_PROGRAM["directories"] else prefix + "Makefile"
+        programs = setup.program["image_flag_programs"]
+        path = prefix + "Kbuild" if prefix + "Kbuild" in programs else prefix + "Makefile"
         variables["MAKEFILE_LIST"] = {"value": source + "/" + path}
-        scope = program(FLAG_PROGRAM["directories"].get(path, []), variables, setup.sources, cells = True)
+        scope = program([] if path == "Makefile" else programs.get(path, []), variables, setup.sources, cells = True)
         variables = scope.variables
         target_assignments.extend(scope.target_assignments)
         inherited_c.append(value("subdir-ccflags-y", variables, setup.sources))
         inherited_a.append(value("subdir-asflags-y", variables, setup.sources))
     for name, inherited in [("KBUILD_CFLAGS", inherited_c), ("KBUILD_AFLAGS", inherited_a)]:
         variables[name] = {"value": value(name, variables, setup.sources) + " " + " ".join(inherited)}
-    variables = program(FLAG_PROGRAM["helpers"], variables, setup.sources, cells = True).variables
-    object_scope = program(FLAG_PROGRAM["image_object_helpers"], variables, setup.sources, cells = True)
+    variables = program(setup.program["helpers"], variables, setup.sources, cells = True).variables
+    object_scope = program(setup.program["image_object_helpers"], variables, setup.sources, cells = True)
     variables = object_scope.variables
     for name, text in memberships.items():
         variables[name] = {"value": text}
@@ -134,7 +134,7 @@ def register(ctx, target, directory, kind, driver, outputs, dependencies, files,
             "real-prereqs": " ".join([dependencies[p].path for p in object_members]),
         }.items():
             variables[key] = {"value": val}
-        expr = FLAG_PROGRAM["image_archives"]["library" if target.endswith("/lib.a") else "builtin"]
+        expr = setup.program["image_archives"]["library" if target.endswith("/lib.a") else "builtin"]
         command = evaluate(expr, variables, setup.sources)
         run_recipe(
             ctx,
@@ -181,6 +181,7 @@ def register(ctx, target, directory, kind, driver, outputs, dependencies, files,
                 ctx.actions.run(
                     executable = setup.tools["HOSTCC"],
                     arguments = compile_flags,
+                    env = execution_tools(ctx).host_compile_env,
                     inputs = depset([tree] + dependencies.values(), transitive = [files, setup.files]),
                     outputs = [obj],
                     mnemonic = "KbuildHostCC",
@@ -270,10 +271,10 @@ def codegen(ctx, target, directory, outputs, dependencies, files, source, config
         return
     variables = _scope(setup, directory, target, "__object__", source, ancestry)
     key = "Kbuild" if directory == "." else directory + "/Kbuild"
-    if key not in FLAG_PROGRAM["commands"]:
+    if key not in setup.program["commands"]:
         key = "Makefile" if directory == "." else directory + "/Makefile"
     for path in ["scripts/Makefile.lib", "scripts/Makefile.host", "scripts/Makefile.build", key, "arch/" + config.architecture.srcarch + "/Makefile"]:
-        variables = program(FLAG_PROGRAM["commands"].get(path, []), variables, setup.sources, cells = True).variables
+        variables = program(setup.program["commands"].get(path, []), variables, setup.sources, cells = True).variables
     variables["src"] = {"value": source + "/" + directory}
     variables["obj"] = {"value": "__object__/" + directory}
     variables["@"] = {"value": "__object__/" + target}
@@ -318,8 +319,8 @@ def codegen(ctx, target, directory, outputs, dependencies, files, source, config
         name = "syshdr" if "/unistd_" in target else "systbl"
         first = source + "/arch/" + config.architecture.srcarch + "/entry/syscalls/syscall_" + ("32" if "32" in target and "x32" not in target else "64") + ".tbl"
         key = "arch/" + config.architecture.srcarch + "/entry/syscalls/Makefile"
-        variables = program(FLAG_PROGRAM["commands"][key], variables, setup.sources, cells = True).variables
-        for assignment in FLAG_PROGRAM["target_assignments"][key]:
+        variables = program(setup.program["commands"][key], variables, setup.sources, cells = True).variables
+        for assignment in setup.program["target_assignments"][key]:
             patterns = make_words(evaluate(assignment["targets_expression"], variables, setup.sources))
             if any([match(p, target) != None for p in patterns]):
                 n = evaluate(assignment["name_expression"], variables, setup.sources)
@@ -357,13 +358,13 @@ def codegen(ctx, target, directory, outputs, dependencies, files, source, config
         outputs = outputs.values(),
         mnemonic = "KbuildGenerate",
         progress_message = "Generate %s" % target,
-        env = {"KBUILD_VERBOSE": "0", "srctree": source},
+        env = dict(execution_tools(ctx).environment, KBUILD_VERBOSE = "0", srctree = source),
     )
 
 # These helpers register actions through the callback adapter, rather than BUILD macros.
 # buildifier: disable=unnamed-macro
 def native_codegen(ctx, target, outputs, dependencies, files, source, config, setup, native):
-    variables = program(FLAG_PROGRAM["image_command_helpers"], native["variables"], setup.sources, cells = True).variables
+    variables = program(setup.program["image_command_helpers"], native["variables"], setup.sources, cells = True).variables
     variables.update(native["variables"])
     for name, tool in setup.tools.items():
         variables[name] = {"value": tool}
@@ -437,18 +438,18 @@ def native_codegen(ctx, target, outputs, dependencies, files, source, config, se
     stage = ctx.actions.declare_directory(outputs.values()[0].basename + ".native-inputs/" + target)
     manifest = ctx.actions.declare_file(stage.basename + ".mapping/" + target + ".json")
     arranged = {p: f.path for p, f in dependencies.items()}
-    arranged["include/config/auto.conf"] = config.config.path
+    arranged["include/config/auto.conf"] = config.auto_conf.path
     arranged[".config"] = config.config.path
     ctx.actions.write(manifest, json.encode(arranged))
     ctx.actions.run(
         executable = execution_tools(ctx).python,
         arguments = [ctx.file._materialize.path, manifest.path, stage.path],
-        inputs = depset([ctx.file._materialize, manifest, config.config] + dependencies.values(), transitive = [execution_tools(ctx).files]),
+        inputs = depset([ctx.file._materialize, manifest, config.config, config.auto_conf] + dependencies.values(), transitive = [execution_tools(ctx).files]),
         outputs = [stage],
         mnemonic = "KbuildNativeInputs",
     )
     exports = dict(setup.tools)
-    for name in ["KBUILD_VMLINUX_LIBS", "KBUILD_LDS", "KERNELRELEASE", "SRCARCH"] + (FLAG_PROGRAM["image_link_exports"] if native.get("final_link") else []):
+    for name in ["KBUILD_VMLINUX_LIBS", "KBUILD_LDS", "KERNELRELEASE", "SRCARCH"] + (setup.program["image_link_exports"] if native.get("final_link") else []):
         if name not in ("KBUILD_VMLINUX_LIBS", "KBUILD_LDS", "KERNELRELEASE", "SRCARCH") and name not in variables.get("__exports__", {}):
             continue
         exports[name] = value(name, variables, setup.sources).replace("__source__", source).replace("__object__", ".")
@@ -481,5 +482,5 @@ cd "$work"
         outputs = outputs.values(),
         mnemonic = "KbuildCC" if native.get("compile") else "KbuildGenerate",
         progress_message = "Native generator %s" % target,
-        env = {"KBUILD_VERBOSE": "0", "srctree": source},
+        env = dict(execution_tools(ctx).environment, KBUILD_VERBOSE = "0", srctree = source),
     )

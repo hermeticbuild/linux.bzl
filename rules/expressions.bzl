@@ -44,16 +44,16 @@ def _builtin(name, a, sources):
         return sources["__compiler_include__"]
     if name == "kbuild_sed":
         return sed_substitute(a[0], a[1])
-    if name == "kbuild_libelf_api":
-        return "elf_getshdr" if sources.get("__libelf_modern_api__") else ""
-    if name == "kbuild_host_fallback":
-        answers = sources.get("__host_capabilities__", {})
-        if a[0] in answers:
-            return answers[a[0]]
-
-        # buildifier: disable=print
-        print("WARNING: unresolved objtool host capability; using empty fallback: " + a[0])
-        return ""
+    if name == "kbuild_host_shell":
+        request = dict(kind = "host-shell", command = a[0], environment = sources["__probe_environment__"], directory = ".", source = sources["__source_root__"])
+        key = json.encode(request)
+        result = sources.get("__capabilities__", {}).get(key)
+        if result == None:
+            sources["__requests__"][key] = request
+            return ""
+        if type(result) != "string":
+            fail("Native host shell query returned a non-string value: " + key)
+        return result
     if name == "shell" and sources.get("__shell_commands__"):
         return "$(" + a[0] + ")"
     if name == "kbuild_min_version":

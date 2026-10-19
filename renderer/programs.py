@@ -170,7 +170,7 @@ def lower_probes(value):
 
 
 def initial_program(tree, linux, make):
-    global_program, directory, helpers, bodies = flags_program(tree, linux, defer_arch=True)
+    global_program, _, helpers, bodies = flags_program(tree, linux, defer_arch=True)
     capabilities = {}
     commands = {p: slice_program(body, {'cmd_asn1_compiler', 'cmd_bison', 'cmd_flex', 'cmd_gzip', 'cmd_elfconfig', 'cmd_build_OID_registry', 'cmd_syshdr', 'cmd_systbl', 'filechk_offsets', 'filechk_gen_featuremasks', 'filechk_gentimeconst', 'filechk_cat', 'out', 'uapi'}) for p, body in bodies.items()}
     target_assignments = [n for f in tree['files'] for n, _ in walk(f['body']) if n['kind'] == 'target_assignment']
@@ -182,6 +182,6 @@ def initial_program(tree, linux, make):
         for field in ('targets', 'name', 'value'):
             n[field + '_expression'] = expressions[f'x{i}_{field}']
     targets = {p: [n for n, _ in walk(body) if n['kind'] == 'target_assignment'] for p, body in bodies.items()}
-    data = lower_probes({'global': global_program, 'directories': directory, 'helpers': helpers, 'commands': commands, 'target_assignments': targets})
+    data = lower_probes({'global': global_program, 'helpers': helpers, 'commands': commands, 'target_assignments': targets})
     data['capabilities'] = capabilities
     return data

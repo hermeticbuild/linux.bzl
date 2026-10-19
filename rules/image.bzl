@@ -1,6 +1,5 @@
 """Resolve configured prerequisite programs and register one action per artifact."""
 
-load("@kernel_inputs//rules:flag_program.bzl", "FLAG_PROGRAM")
 load(":commands.bzl", "register", "shell_words")
 load(":expressions.bzl", "evaluate", "make_words", "match", "program", "source_index")
 
@@ -23,7 +22,7 @@ def _context(directory, state):
         fail("Kbuild architecture mismatch: " + directory)
     if directory not in state["contexts"]:
         prefix = "" if directory == "." else directory + "/"
-        programs = FLAG_PROGRAM["image_programs"]
+        programs = state["program"]["image_programs"]
         statements = programs.get(prefix + "Kbuild", programs.get(prefix + "Makefile"))
         if statements == None:
             fail("No exported Make program for " + directory)
@@ -52,11 +51,9 @@ def _context(directory, state):
 
         # Setup already evaluated the architecture include. Replaying it here
         # repeats += assignments (including platform load addresses).
-        bodies = [FLAG_PROGRAM["image_roots"], FLAG_PROGRAM["graph_init"], statements, FLAG_PROGRAM["graph_helpers"]] if directory == "." else [FLAG_PROGRAM["image_common"], FLAG_PROGRAM["graph_init"], statements, FLAG_PROGRAM["helpers"], FLAG_PROGRAM["graph_helpers"]]
+        bodies = [state["program"]["image_roots"], state["program"]["graph_init"], statements, state["program"]["graph_helpers"]] if directory == "." else [state["program"]["image_common"], state["program"]["graph_init"], statements, state["program"]["helpers"], state["program"]["graph_helpers"]]
         for body in bodies:
             sources = dict(state["sources"])
-            if body == FLAG_PROGRAM["image_arch"]:
-                sources["__includes__"] = FLAG_PROGRAM["image_graph_programs"]
             result = program(body, initial, sources, cells = True)
             initial = result.variables
             if body == statements:
@@ -67,10 +64,10 @@ def _context(directory, state):
         context = local_context
         dtb_rules = []
         if directory in state["dtbs_lists"] or any([p.endswith((".dtb.o", ".dtbo.o")) for p in make_words(_value("real-obj-y", initial, state["sources"]))]):
-            dtbs = program(FLAG_PROGRAM["image_dtbs"], initial, state["sources"], cells = True)
+            dtbs = program(state["program"]["image_dtbs"], initial, state["sources"], cells = True)
             initial = dtbs.variables
             dtb_rules = dtbs.rules
-        implicit = program(FLAG_PROGRAM["image_implicit_rules"], initial, state["sources"], cells = True)
+        implicit = program(state["program"]["image_implicit_rules"], initial, state["sources"], cells = True)
         state["contexts"][directory] = struct(variables = initial, rules = context.rules + dtb_rules + implicit.rules, target_assignments = context.target_assignments)
     return state["contexts"][directory]
 
@@ -200,7 +197,7 @@ def _link_descriptor(path, state):
         outs = outs + state["postlink_outputs"]
         scripts = _context("scripts", state)
         deps.extend(["scripts/" + name for name in make_words(_value("hostprogs-always-y", scripts.variables, state["sources"]))])
-    variables = program(FLAG_PROGRAM["image_link"][driver], variables, state["sources"], cells = True).variables
+    variables = program(state["program"]["image_link"][driver], variables, state["sources"], cells = True).variables
     if driver == "modpost":
         variables["modpost-args"] = {"append": [variables["modpost-args"], {"value": "vmlinux.o"}]}
     native = {
@@ -234,7 +231,7 @@ def _prepare_contexts(state, arch_context):
             variables = dict(state["setup"].variables)
             for name, text in {"obj": directory, "SRCARCH": arch, "srctree": "__source__", "srcroot": "__source__", "generic": "include/" + uapi + "asm-generic"}.items():
                 variables[name] = {"value": text}
-            header = program(FLAG_PROGRAM["image_asm_headers"], variables, state["sources"], cells = True)
+            header = program(state["program"]["image_asm_headers"], variables, state["sources"], cells = True)
             state["contexts"][directory] = header
             for path in make_words(_value("generic-y", header.variables, state["sources"]) + " " + _value("syscall-y", header.variables, state["sources"])):
                 state["header_owners"][path] = directory
@@ -319,7 +316,7 @@ def _prepare_contexts(state, arch_context):
                     arch = overrides["ARCH"]
                     variables = dict(context.variables)
                     variables.update({"ARCH": {"value": arch}, "SRCARCH": {"value": arch}})
-                    child = program(FLAG_PROGRAM["image_programs"]["arch/" + arch + "/Makefile"], variables, state["sources"], cells = True)
+                    child = program(state["program"]["image_programs"]["arch/" + arch + "/Makefile"], variables, state["sources"], cells = True)
                     child_directory = "@architecture:" + arch
                     state["contexts"][child_directory] = child
                     for child_goal in words[3:]:
@@ -480,7 +477,7 @@ def _describe(path, state):
     native = _recipe(path, directory, state)
     if native != None:
         command = evaluate(native["arguments"][0], native["variables"], state["sources"]).strip()
-        if kind != "host" and command in FLAG_PROGRAM["image_compile_commands"]:
+        if kind != "host" and command in state["program"]["image_compile_commands"]:
             native["compile"] = True
         if kind != "host" and command in ("cc_o_c", "as_o_S"):
             kind = "compile"
@@ -507,14 +504,14 @@ def _describe(path, state):
 # buildifier: disable=unnamed-macro
 def build_image(ctx, config, setup, prepared, catalog, objtool):
     for name, expected in ctx.attr.required_options.items():
-        if config.values.get(name, "n") != expected:
-            fail("Required kernel option %s=%s resolved to %s" % (name, expected, config.values.get(name, "n")))
+        if config.values.get(name) != expected:
+            fail("Required kernel option %s=%s resolved to %s" % (name, expected, config.values.get(name)))
     if setup.identity != config.identity:
         fail("Mixed native setup and kernel configuration")
     files = prepared.files
     source_files = prepared.logical
     index = source_index(["__source__/" + p for p in source_files])
-    index["__includes__"] = FLAG_PROGRAM["image_programs"]
+    index["__includes__"] = setup.program["image_programs"]
     index["__capabilities__"] = setup.sources["__capabilities__"]
     index["__requests__"] = setup.sources["__requests__"]
     index["__probe_environment__"] = setup.sources["__probe_environment__"]
@@ -523,6 +520,7 @@ def build_image(ctx, config, setup, prepared, catalog, objtool):
     index["__compiler_include__"] = setup.sources.get("__compiler_include__", "")
     index["__execution_tools__"] = setup.sources["__execution_tools__"]
     state = {
+        "program": setup.program,
         "catalog": catalog,
         "contexts": {},
         "parents": {},
@@ -542,20 +540,20 @@ def build_image(ctx, config, setup, prepared, catalog, objtool):
     state["environment"]["__cell_sequence__"] = setup.variables["__cell_sequence__"]
     for name, text in {"MAKE": "__make_dispatch__", "build": "__build_dispatch__", "Q": "", "KCONFIG_CONFIG": ".config", "srctree": "__source__", "srcroot": "__source__", "objtree": "."}.items():
         dispatch[name] = {"value": text}
-    arch_context = program(FLAG_PROGRAM["image_programs"]["arch/" + config.architecture.srcarch + "/Makefile"], dispatch, state["sources"], cells = True)
+    arch_context = program(setup.program["image_programs"]["arch/" + config.architecture.srcarch + "/Makefile"], dispatch, state["sources"], cells = True)
     state["known_products"] = {}
     _prepare_contexts(state, arch_context)
-    link_context = program(FLAG_PROGRAM["image_programs"]["scripts/Makefile.vmlinux"], _context(".", state).variables, state["sources"], cells = True)
+    link_context = program(setup.program["image_programs"]["scripts/Makefile.vmlinux"], _context(".", state).variables, state["sources"], cells = True)
     state["contexts"]["@vmlinux"] = link_context
     state["link_owners"] = {p: True for p in make_words(_value("targets", link_context.variables, state["sources"]))}
     postlink = "arch/" + config.architecture.srcarch + "/Makefile.postlink"
     state["postlink_outputs"] = []
-    if postlink in FLAG_PROGRAM["image_programs"]:
-        post = program(FLAG_PROGRAM["image_programs"][postlink], _context(".", state).variables, state["sources"], cells = True)
+    if postlink in setup.program["image_programs"]:
+        post = program(setup.program["image_programs"][postlink], _context(".", state).variables, state["sources"], cells = True)
         state["contexts"]["@postlink"] = post
-        state["postlink_outputs"] = [_normalize(evaluate(expr, post.variables, state["sources"])) for expr in FLAG_PROGRAM["image_postlink_outputs"].get(postlink, [])]
+        state["postlink_outputs"] = [_normalize(evaluate(expr, post.variables, state["sources"])) for expr in setup.program["image_postlink_outputs"].get(postlink, [])]
     state["known_products"] = {p: True for p in ["built-in-fixup.a", "vmlinux.a", "vmlinux.o", "vmlinux.symvers", ".vmlinux.export.c", "vmlinux.unstripped", "vmlinux", "System.map", ".config", "include/config/auto.conf", "include/generated/autoconf.h"] + state["postlink_outputs"]}
-    pending = list(ctx.attr.roots) + ctx.attr.architecture_roots.get(config.architecture.srcarch, [])
+    pending = list(ctx.attr.roots)
     descriptors, producers = {}, {}
     for _ in range(100000):
         if not pending:
@@ -656,12 +654,7 @@ def build_image(ctx, config, setup, prepared, catalog, objtool):
     ctx.actions.write(manifest, json.encode({
         "identity": config.identity,
         "config": config.config.path,
-        "config_report": config.report.path,
         "setup": setup.file.path,
         "members": members,
         "artifacts": {p: f.path for p, f in artifacts.items()},
     }))
-    return [
-        DefaultInfo(files = depset([manifest, config.report, setup.file] + artifacts.values())),
-        OutputGroupInfo(boot = depset([artifacts[p] for p in ctx.attr.architecture_roots.get(config.architecture.srcarch, [])]), kernel = depset([artifacts["vmlinux"]] if "vmlinux" in artifacts else []), manifest = depset([manifest])),
-    ]

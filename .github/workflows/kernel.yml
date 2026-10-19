@@ -5,6 +5,22 @@ on:
   push:
     branches: [prototype/static-kernel-repository]
   workflow_dispatch:
+    inputs:
+      native_config_only:
+        description: Run the focused native configuration prerequisite
+        type: boolean
+        default: false
+      syntax_only:
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      native_config_only:
+        type: boolean
+        default: false
+      syntax_only:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -14,7 +30,55 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  native-config:
+    if: ${{ inputs.native_config_only && !inputs.syntax_only }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      USE_BAZEL_VERSION: 9.3.0
+    steps:
+      - uses: actions/checkout@v5
+      - uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: autoconf-kernel
+          repository-cache: |
+            - MODULE.bazel
+            - MODULE.bazel.lock
+      - name: Test source-selected native configuration
+        timeout-minutes: 50
+        run: |
+          bazel test //native:config_tests //:action_built_config_test \
+            --platforms=@llvm//platforms:linux_x86_64 \
+            --extra_execution_platforms=@llvm//platforms:linux_x86_64 \
+            --extra_toolchains=//:driver_toolchain --jobs=4 \
+            --profile="$RUNNER_TEMP/native-config.profile.gz" --test_output=errors --keep_going
+      - name: Retain native configuration evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-config
+          path: |
+            ${{ runner.temp }}/native-config.profile.gz
+            bazel-testlogs/**/test.log
+            bazel-out/**/bin/native/**/config-report.json
+            bazel-out/**/bin/native/**/probes.jsonl
+            bazel-out/**/bin/native/**/requested.config
+            bazel-out/**/bin/native/**/.config
+            bazel-out/**/bin/native/**/include/config/auto.conf
+            bazel-out/**/bin/native/**/include/generated/autoconf.h
+            bazel-out/**/bin/native/**/values/report.json
+            bazel-out/**/bin/action_built_config/config-report.json
+            bazel-out/**/bin/action_built_config/probes.jsonl
+            bazel-out/**/bin/action_built_config/.config
+            bazel-out/**/bin/action_built_config/include/config/auto.conf
+            bazel-out/**/bin/action_built_config/include/generated/autoconf.h
+            bazel-out/**/bin/action_built_config/values/report.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
   kernel:
+    if: ${{ !inputs.native_config_only || inputs.syntax_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -23,6 +87,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Checkout pinned Linux source
+        if: ${{ !inputs.syntax_only }}
         uses: actions/checkout@v5
         with:
           repository: torvalds/linux
@@ -30,10 +95,9 @@ jobs:
           path: _tmp/linux
           persist-credentials: false
 
-      - name: Install local acceptance prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools build-essential bison flex patch strace bc libelf-dev zlib1g-dev pkg-config
+      - name: Expose the editable source through the declared source interface
+        if: ${{ !inputs.syntax_only }}
+        run: cp native/linux_source.BUILD.bazel _tmp/linux/BUILD.bazel
 
       - uses: bazel-contrib/setup-bazel@0.19.0
         with:
@@ -43,40 +107,60 @@ jobs:
             - MODULE.bazel
             - MODULE.bazel.lock
 
-      - name: Bootstrap static repository compiler
-        run: python3 build.py --jobs 4
-
-      - name: Generate kernel inputs
+      - name: Install tracing tool
         run: |
-          python3 configure.py
+          sudo apt-get update
+          sudo apt-get install --yes strace
 
-      - name: Audit standalone generation
+      - name: Build and audit the generic syntax exporter
         run: |
-          python3 test_repository.py --tool _tmp/kernel-repository/kernel-repository \
-            --linux _tmp/linux --out _tmp/kernel-repository/check --strace
+          bazel test //native:exporter_archive //:repository_test \
+            --platforms=@llvm//platforms:linux_x86_64_musl \
+            --extra_execution_platforms=@llvm//platforms:linux_x86_64 --jobs=4 --test_output=errors --test_arg=--strace
 
-      - name: Test root and example targets
-        run: bazel test //... --test_output=errors
-
-      - name: Build kernel and compare with upstream
-        run: python3 validate.py
-
-      - name: Compare Clang and LLD configurations with pristine conf
+      - name: Select the declared exporter directory for consumers
+        if: ${{ !inputs.syntax_only }}
         run: |
-          bazel test //:parity_x86_64_test //:parity_debug_test //:parity_lz4_test //:parity_btf_test //:arm64_parity_test \
-            --extra_toolchains=@llvm//toolchain:linux_x86_64_to_linux_x86_64,@llvm//toolchain:linux_x86_64_to_linux_aarch64 \
-            --test_output=errors
+          exporter="$(bazel cquery //native:exporter_archive \
+            --platforms=@llvm//platforms:linux_x86_64_musl \
+            --extra_execution_platforms=@llvm//platforms:linux_x86_64 \
+            --output=starlark --starlark:expr='"\n".join([file.path for file in target.files.to_list() if file.is_directory])')"
+          echo "KBUILD_EXPORTER=$GITHUB_WORKSPACE/$exporter" >> "$GITHUB_ENV"
 
-      - name: Check a compiler built in the same invocation
-        run: bazel test //:action_built_parity_test --extra_toolchains=//:driver_toolchain --test_output=errors
+      - name: Test the native configuration and measured build owners
+        if: ${{ !inputs.syntax_only }}
+        run: |
+          bazel test //... //native:config_tests //:action_built_config_test \
+            //examples:x86_64_config_test //examples:aarch64_config_test \
+            //examples:debug_config_test //examples:lz4_config_test //examples:btf_capability_test \
+            --override_repository=linux_source="$GITHUB_WORKSPACE/_tmp/linux" \
+            --override_repository=kbuild_exporter="$KBUILD_EXPORTER" \
+            --platforms=@llvm//platforms:linux_x86_64 \
+            --extra_execution_platforms=@llvm//platforms:linux_x86_64 \
+            --extra_toolchains=//:driver_toolchain --jobs=4 --test_output=errors --keep_going
+
+      - name: Check native Kbuild flags and the linked kernel
+        if: ${{ !inputs.syntax_only }}
+        run: |
+          bazel test //:kernel_acceptance_test \
+            --override_repository=linux_source="$GITHUB_WORKSPACE/_tmp/linux" \
+            --override_repository=kbuild_exporter="$KBUILD_EXPORTER" \
+            --platforms=@llvm//platforms:linux_x86_64 \
+            --extra_execution_platforms=@llvm//platforms:linux_x86_64 --jobs=4 --test_output=errors
 
       - name: Check source edit reuse
+        if: ${{ !inputs.syntax_only }}
         run: |
           decoder="$RUNNER_TEMP/autoconf-execution-log-decoder"
           curl --fail --location --output "$decoder" https://github.com/buildbuddy-io/bazel/releases/download/5.0.492/bazel-5.0.492-linux-x86_64
           echo "e9e996a1a01555e45433acf9432f9d40d5bda437812a830d6701fe9b09853df9  $decoder" | sha256sum --check
           chmod +x "$decoder"
-          python3 check_reuse.py --decoder "$decoder" --source _tmp/linux/init/main.c
+          python3 check_reuse.py --decoder "$decoder" --source _tmp/linux/init/main.c \
+            --bazel-option="--override_repository=linux_source=$GITHUB_WORKSPACE/_tmp/linux" \
+            --bazel-option="--override_repository=kbuild_exporter=$KBUILD_EXPORTER" \
+            --bazel-option=--platforms=@llvm//platforms:linux_x86_64 \
+            --bazel-option=--extra_execution_platforms=@llvm//platforms:linux_x86_64 \
+            --bazel-option=--jobs=4
 
       - name: Upload comparison reports
         if: ${{ !cancelled() }}
@@ -85,10 +169,11 @@ jobs:
           name: kernel-acceptance
           path: |
             validation/
-            _tmp/kernel-repository/kernel-repository
-            _tmp/kernel-repository/check/generation.log
-            _tmp/kernel-repository/check/exec.trace
+            bazel-out/**/bin/native/exporter_archive.tar.gz
+            bazel-testlogs/repository_test/test.outputs/
             bazel-testlogs/**/test.log
-            bazel-out/**/bin/*.report/**
+            bazel-out/**/bin/kernel_validation/**
+            bazel-out/**/bin/native/**/config-report.json
+            bazel-out/**/bin/action_built_config/config-report.json
           if-no-files-found: warn
           retention-days: 7

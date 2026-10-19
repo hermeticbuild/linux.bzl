@@ -66,7 +66,7 @@ def native_events(make, paths, expressions=False, variables=None):
         # Batch native invocations to stay below the system's argument limit.
         events = []
         for start in range(0, len(paths), 128):
-            command = [str(make.resolve()), '_make', '-rR', '--no-print-directory']
+            command = [str(make[0].resolve()), *make[1:], '-rR', '--no-print-directory']
             for path in paths[start:start + 128]:
                 command.extend(['-f', str(path.resolve())])
             command.extend(name + '=' + value for name, value in (variables or {}).items())
@@ -123,7 +123,7 @@ def main():
     variables = dict(value.split('=', 1) for value in args.var)
     if any(not name.isidentifier() for name in variables):
         parser.error('--var requires plain variable names')
-    events = native_events(args.make, paths, args.expressions, variables)
+    events = native_events([args.make], paths, args.expressions, variables)
     tree = parse_events(events)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(tree, indent=2) + '\n')
