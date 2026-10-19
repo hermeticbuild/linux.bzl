@@ -36,6 +36,13 @@ git_override(
 bazel_dep(name = "buildifier_prebuilt", version = "8.2.1.1", dev_dependency = True)
 
 single_version_override(
+    module_name = "bazel_lib",
+    patch_strip = 1,
+    patches = ["//native:bazel_lib_copy_directory_symlinks.patch"],
+    version = "3.7.2",
+)
+
+single_version_override(
     module_name = "make",
     patch_strip = 1,
     patches = ["//native:make_inputs.patch"],
