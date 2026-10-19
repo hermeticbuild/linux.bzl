@@ -48,12 +48,16 @@ The execution-tools contract currently selects Linux x86-64. A macOS caller may
 use a Linux execution platform; this does not make Linux `conf` executable on
 Darwin. The generic Make exporter also builds on native macOS.
 
-The root must apply the Bison and rules_cc_autoconf patches used in
+The root must apply the Bison, rules_cc_autoconf, and zlib patches used in
 [MODULE.bazel](MODULE.bazel). Bzlmod ignores dependency-owned
 `single_version_override` declarations; those patch files must be copied into
 the consuming root. The Make input patch is needed only when building the exporter
 or running its producer-owned native Make validation fixture. Native source
 patches in `native/` have a separate owner: they apply to the pinned kernel archive itself.
+
+The zlib patch keeps its unconfigured public header compatible with native
+`-Wundef` diagnostics without supplying header availability. Native zlib configure
+still regenerates that header from its unchanged template and runs its own checks.
 
 ## Build and test
 

@@ -1,3 +1,5 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//rules:schedule_test.bzl", "schedule_fixture")
 load(":expressions_test.bzl", "probe_context_test")
 load(":source_files_test.bzl", "source_files_test")
@@ -14,6 +16,57 @@ schedule_fixture(
 )
 
 probe_context_test(name = "probe_context_test")
+
+[
+    cc_library(
+        name = "zlib_headers_" + name,
+        srcs = ["zlib_headers.c"],
+        copts = [
+            "-Wundef",
+            "-Werror",
+        ],
+        local_defines = ["EXPECT_HEADERS=" + expected] + definitions,
+        tags = ["manual"],
+        deps = ["@zlib"],
+    )
+    for name, expected, definitions in [
+        ("absent", "0", []),
+        (
+            "empty",
+            "0",
+            [
+                "HAVE_UNISTD_H=",
+                "HAVE_STDARG_H=",
+            ],
+        ),
+        (
+            "zero",
+            "0",
+            [
+                "HAVE_UNISTD_H=0",
+                "HAVE_STDARG_H=0",
+            ],
+        ),
+        (
+            "one",
+            "1",
+            [
+                "HAVE_UNISTD_H=1",
+                "HAVE_STDARG_H=1",
+            ],
+        ),
+    ]
+]
+
+build_test(
+    name = "zlib_headers_test",
+    targets = [":zlib_headers_" + name for name in [
+        "absent",
+        "empty",
+        "zero",
+        "one",
+    ]],
+)
 
 exports_files([
     "compiler_driver.c",
