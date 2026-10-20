@@ -7,6 +7,18 @@ the downstream source/config/build/artifact interface.
 load("//execution_tools:defs.bzl", "EXECUTION_TOOLS_TYPE")
 load(":kernel.bzl", "KernelBuildInfo")
 
+def _execution_tool_impl(ctx):
+    return [DefaultInfo(
+        files = depset([ctx.executable.tool]),
+        runfiles = ctx.attr.tool[DefaultInfo].default_runfiles,
+    )]
+
+execution_tool = rule(
+    implementation = _execution_tool_impl,
+    attrs = {"tool": attr.label(mandatory = True, executable = True, cfg = "exec")},
+    doc = "Expose an execution-platform tool to a test's data and location arguments.",
+)
+
 def _impl(ctx):
     kernel = ctx.attr.kernel[KernelBuildInfo]
     config = kernel.config
@@ -34,7 +46,7 @@ def _impl(ctx):
     ctx.actions.run(
         executable = execution.python,
         arguments = ["-B", ctx.file._checker.path, spec.path, output.path],
-        inputs = depset([spec, kernel.directory, config.directory, ctx.file._checker, ctx.file._configure, ctx.file._spec_types, ctx.file._runtime], transitive = [config.source.files, config.compiler.files, config.host_compiler.files, config.pahole.files, execution.build_files]),
+        inputs = depset([spec, kernel.directory, config.directory, ctx.file._checker, ctx.file._configure, ctx.file._spec_types, ctx.file._runtime, ctx.file._payload], transitive = [config.source.files, config.compiler.files, config.host_compiler.files, config.pahole.files, execution.build_files]),
         tools = config.compiler.tools + config.host_compiler.tools + [config.pahole.files_to_run, ctx.attr._make[DefaultInfo].files_to_run] + execution.build_tools,
         outputs = [output],
         env = {"PYTHONPATH": ctx.file._runtime.dirname, "PYTHONDONTWRITEBYTECODE": "1"},
@@ -52,5 +64,6 @@ kernel_validation = rule(
         "_configure": attr.label(default = "//native:configure.py", allow_single_file = True),
         "_spec_types": attr.label(default = "//native:spec.py", allow_single_file = True),
         "_runtime": attr.label(default = "//:probe_runtime.py", allow_single_file = True),
+        "_payload": attr.label(default = "//:payload.py", allow_single_file = True),
     },
 )

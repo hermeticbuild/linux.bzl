@@ -32,7 +32,7 @@ def _native_conf_impl(ctx):
     ctx.actions.run(
         executable = execution.python,
         arguments = ["-B", ctx.file._builder.path, spec.path, output.path],
-        inputs = depset(sources + [spec, ctx.file._builder, ctx.file._runtime, ctx.file._spec_types, ctx.file._main, ctx.file._process], transitive = [compiler.files, execution.bootstrap_files]),
+        inputs = depset(sources + [spec, ctx.file._builder, ctx.file._runtime, ctx.file._payload, ctx.file._spec_types, ctx.file._main, ctx.file._process], transitive = [compiler.files, execution.bootstrap_files]),
         tools = compiler.tools + execution.bootstrap_tools,
         outputs = [output],
         env = {"PYTHONPATH": ctx.file._runtime.dirname, "PYTHONDONTWRITEBYTECODE": "1"},
@@ -49,6 +49,7 @@ _native_conf = rule(
         "compiler": attr.label(default = "//native:compiler", cfg = "exec", providers = [KernelCompilerInfo]),
         "_builder": attr.label(default = "//native:build_conf.py", allow_single_file = True),
         "_runtime": attr.label(default = "//:probe_runtime.py", allow_single_file = True),
+        "_payload": attr.label(default = "//:payload.py", allow_single_file = True),
         "_spec_types": attr.label(default = "//native:spec.py", allow_single_file = True),
         "_main": attr.label(default = "//native:conf_main.c", allow_single_file = True),
         "_process": attr.label(default = "//native:conf_process.c", allow_single_file = True),

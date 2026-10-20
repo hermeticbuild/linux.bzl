@@ -59,7 +59,7 @@ def _impl(ctx):
         extension = ctx.file.kconfig_extension.path if ctx.file.kconfig_extension else None,
     )))
     files = depset(
-        [spec, ctx.file._driver, ctx.file._runtime, ctx.file._spec_types] + ctx.files.fragments + ([ctx.file.kconfig_extension] if ctx.file.kconfig_extension else []),
+        [spec, ctx.file._driver, ctx.file._runtime, ctx.file._payload, ctx.file._spec_types] + ctx.files.fragments + ([ctx.file.kconfig_extension] if ctx.file.kconfig_extension else []),
         transitive = [source.files, compiler.files, host.files, execution.files, ctx.attr.pahole[DefaultInfo].files],
     )
     tools = execution.tools + compiler.tools + host.tools + [source.conf, ctx.attr.pahole[DefaultInfo].files_to_run]
@@ -106,6 +106,7 @@ kernel_config = rule(
         "kconfig_extension": attr.label(allow_single_file = True),
         "_driver": attr.label(default = "//native:configure.py", allow_single_file = True),
         "_runtime": attr.label(default = "//:probe_runtime.py", allow_single_file = True),
+        "_payload": attr.label(default = "//:payload.py", allow_single_file = True),
         "_spec_types": attr.label(default = "//native:spec.py", allow_single_file = True),
         "_emit": attr.label(default = "//:emit.py", allow_single_file = True),
         "_x86_64": attr.label(default = "@platforms//cpu:x86_64"),

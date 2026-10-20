@@ -1,6 +1,7 @@
 load("@autoconf.bzl//:autoconf.bzl", "autoconf", "compile_test")
 load("@bazel_skylib//lib:shell.bzl", "shell")
 load("@bazel_skylib//rules/directory:subdirectory.bzl", "subdirectory")
+load("@llvm//toolchain/args:llvm_target_triple.bzl", "LLVM_TARGET_TRIPLE")
 load("@rules_python//python:defs.bzl", "py_test")
 load("//rules:compiler.bzl", "kernel_compiler")
 load("//rules:config.bzl", "kernel_config")
@@ -43,6 +44,7 @@ kernel_compiler(
     name = "compiler",
     assembler_flags = ["-fintegrated-as"],
     builtin_headers = ":llvm_builtin_headers",
+    target_flags = ["-target"] + LLVM_TARGET_TRIPLE,
     tools = {
         "@llvm//tools:clang": "CC",
         "@llvm//tools:clang++": "CXX",
@@ -65,6 +67,7 @@ kernel_compiler(
     for name, repository in [
         ("source", "linux_source"),
         ("source_5_10", "linux_5_10"),
+        ("source_6_18", "linux_6_18"),
     ]
 ]
 

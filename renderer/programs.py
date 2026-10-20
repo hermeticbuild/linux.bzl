@@ -29,6 +29,11 @@ def refs(value):
     if not isinstance(value, dict):
         return set()
     result = set()
+    if value.get('directive') in ('ifdef', 'ifndef') and 'operands' in value:
+        # The operand names a variable; even a literal name reads its value.
+        name = const(value['operands'][0])
+        if name is not None:
+            result.add(name.strip())
     if value.get('op') == 'reference':
         name = const(value['name'])
         if name is not None:
@@ -69,6 +74,23 @@ def selected(body, wanted):
     return out
 
 
+def export_directives(body):
+    """Retain export ownership and only the guards that control it."""
+    result = []
+    for node in body:
+        if node['kind'] == 'conditional':
+            branches = [dict(branch, body=export_directives(branch['body']))
+                        for branch in node['branches']]
+            if any(branch['body'] for branch in branches):
+                result.append(dict(node, branches=branches))
+        elif node['kind'] == 'directive' and node.get('directive') in ('export', 'unexport'):
+            result.append(node)
+        elif node['kind'] in ('assignment', 'define') and node.get('export') in (1, 2):
+            result.append({'kind': 'directive', 'directive': 'export' if node['export'] == 1 else 'unexport',
+                           'arguments': node['name'], 'arguments_expression': node['name_expression']})
+    return result
+
+
 def slice_program(body, wanted):
     wanted = set(wanted)
     for _ in range(100):
@@ -94,8 +116,35 @@ def bounded(body, low, high):
     return out
 
 
+def phase_body(body, anchor):
+    """Select an established invocation while retaining its value guards."""
+    location = (anchor['file'], anchor['line'])
+    matches = [node for node, _ in walk(body)
+               if (node['file'], node['line']) == location]
+    if len(matches) != 1:
+        raise ValueError(f'Expected one native phase anchor at {location}, got {matches}')
+    result = []
+    for node in body:
+        if node['kind'] == 'conditional':
+            branches = [branch for branch in node['branches']
+                        if any((child['file'], child['line']) == location
+                               for child, _ in walk(branch['body']))]
+            if branches:
+                result.extend(phase_body(branches[0]['body'], anchor))
+                continue
+        result.append(node)
+    return result
+
+
 def flags_program(tree, linux, defer_arch=False):
     bodies = {relative(f['file'], linux): f['body'] for f in tree['files']}
+    flag_includes = set()
+    for node, _ in walk(bodies['Makefile']):
+        if node['kind'] == 'assignment' and node.get('name', '').startswith('include-'):
+            paths = const(node['value_expression'])
+            if paths is None:
+                raise ValueError(f"Flag include paths must be source literals: {node['value']}")
+            flag_includes.update(paths.split())
     def expand(body, stack=()):
         out = []
         for n in body:
@@ -110,11 +159,8 @@ def flags_program(tree, linux, defer_arch=False):
                 if arg == '$(addprefix , $(include-y))':
                     # Retain the configuration-dependent include list as a
                     # program operation evaluated by the analysis interpreter.
-                    out.append({'kind': 'flag_includes', 'files': {p: expand(bodies[p], stack + (p,)) for p in bodies
-                                if p.startswith('scripts/Makefile.') and p.rsplit('/', 1)[-1] in
-                                ['Makefile.warn', 'Makefile.debug', 'Makefile.btf', 'Makefile.kasan', 'Makefile.kcsan',
-                                 'Makefile.kmsan', 'Makefile.ubsan', 'Makefile.kcov', 'Makefile.randstruct',
-                                 'Makefile.kstack_erase', 'Makefile.autofdo', 'Makefile.propeller', 'Makefile.context-analysis', 'Makefile.gcc-plugins']}})
+                    out.append({'kind': 'flag_includes', 'files': {p: expand(bodies[p], stack + (p,))
+                                for p in sorted(flag_includes) if p in bodies}})
                 elif arg in bodies and arg not in stack and arg != 'scripts/Makefile.compiler':
                     out.extend(expand(bodies[arg], stack + (arg,)))
             else:
@@ -123,11 +169,15 @@ def flags_program(tree, linux, defer_arch=False):
     # Derive setup boundaries from native assignment events instead of copying
     # flag values or configuring Linux during BUILD generation.
     nodes = list(walk(bodies['Makefile']))
-    low = next(n['line'] for n, _ in nodes if n.get('name') == 'KBUILD_USERHOSTCFLAGS')
+    compiler_flags = [n['line'] for n, _ in nodes
+                      if n.get('name', '').startswith('KBUILD_') and n.get('name', '').endswith('CFLAGS')]
+    if not compiler_flags:
+        raise ValueError('Top Makefile has no KBUILD compiler flag definitions')
+    low = min(compiler_flags)
     high = next(n['line'] for n, _ in nodes if n.get('name') == 'KBUILD_LDFLAGS' and '-z noexecstack' in n.get('value', ''))
     top = expand(bounded(bodies['Makefile'], low, high))
-    # Compiler helper definitions are symbolic analysis intrinsics. Unknown
-    # capabilities warn and use the native helper's failure branch.
+    # Compiler helper definitions stay symbolic until the selected compiler
+    # executes their probes in the configured build context.
     common = bodies['scripts/Kbuild.include']
     # Directory and helper references also pull their global flag definitions
     # into the setup program (sanitizer/module flags, for example).

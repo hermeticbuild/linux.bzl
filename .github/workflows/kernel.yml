@@ -6,21 +6,16 @@ on:
     branches: [prototype/static-kernel-repository]
   workflow_dispatch:
     inputs:
-      native_config_only:
-        description: Run the focused native configuration prerequisite
-        type: boolean
-        default: false
-      syntax_only:
-        type: boolean
-        default: false
+      scope:
+        description: Validation scope
+        type: choice
+        options: [full, native-config, syntax, native-tools]
+        default: full
   workflow_call:
     inputs:
-      native_config_only:
-        type: boolean
-        default: false
-      syntax_only:
-        type: boolean
-        default: false
+      scope:
+        type: string
+        default: full
 
 permissions:
   contents: read
@@ -31,11 +26,11 @@ concurrency:
 
 jobs:
   native-config:
-    if: ${{ inputs.native_config_only && !inputs.syntax_only }}
+    if: ${{ inputs.scope == 'native-config' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      USE_BAZEL_VERSION: 9.3.0
+      BAZELISK_VERIFY_SHA256: 3fdff352a996a99e298c9104e616dba6df8bf58a0fd5fc67f32926a2fc0a0358
     steps:
       - uses: actions/checkout@v5
       - uses: bazel-contrib/setup-bazel@0.19.0
@@ -78,16 +73,25 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
   kernel:
-    if: ${{ !inputs.native_config_only || inputs.syntax_only }}
+    if: ${{ inputs.scope != 'native-config' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: ${{ (inputs.scope || 'full') == 'full' && 360 || 60 }}
     env:
-      USE_BAZEL_VERSION: 9.3.0
+      BAZELISK_VERIFY_SHA256: 3fdff352a996a99e298c9104e616dba6df8bf58a0fd5fc67f32926a2fc0a0358
     steps:
       - uses: actions/checkout@v5
 
+      - name: Validate scope
+        env:
+          VALIDATION_SCOPE: ${{ inputs.scope || 'full' }}
+        run: |
+          case "$VALIDATION_SCOPE" in
+            full|syntax|native-tools) ;;
+            *) echo "Unknown validation scope: $VALIDATION_SCOPE" >&2; exit 1 ;;
+          esac
+
       - name: Checkout pinned Linux source
-        if: ${{ !inputs.syntax_only }}
+        if: ${{ (inputs.scope || 'full') == 'full' }}
         uses: actions/checkout@v5
         with:
           repository: torvalds/linux
@@ -96,13 +100,17 @@ jobs:
           persist-credentials: false
 
       - name: Expose the editable source through the declared source interface
-        if: ${{ !inputs.syntax_only }}
-        run: cp native/linux_source.BUILD.bazel _tmp/linux/BUILD.bazel
+        if: ${{ (inputs.scope || 'full') == 'full' }}
+        run: |
+          git -C _tmp/linux apply "$GITHUB_WORKSPACE/native/linux_piggy_dependency.patch"
+          cp native/linux_source.BUILD.bazel _tmp/linux/BUILD.bazel
+          touch _tmp/linux/REPO.bazel
 
       - uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
           disk-cache: autoconf-kernel
+          bazelrc: startup --host_jvm_args=-Xmx8g
           repository-cache: |
             - MODULE.bazel
             - MODULE.bazel.lock
@@ -119,7 +127,7 @@ jobs:
             --extra_execution_platforms=@llvm//platforms:linux_x86_64 --jobs=4 --test_output=errors --test_arg=--strace
 
       - name: Select the declared exporter directory for consumers
-        if: ${{ !inputs.syntax_only }}
+        if: ${{ inputs.scope != 'syntax' }}
         run: |
           exporter="$(bazel cquery //native:exporter_archive \
             --platforms=@llvm//platforms:linux_x86_64_musl \
@@ -127,10 +135,84 @@ jobs:
             --output=starlark --starlark:expr='"\n".join([file.path for file in target.files.to_list() if file.is_directory])')"
           echo "KBUILD_EXPORTER=$GITHUB_WORKSPACE/$exporter" >> "$GITHUB_ENV"
 
-      - name: Test the native configuration and measured build owners
-        if: ${{ !inputs.syntax_only }}
+      - name: Test scheduler and toolchain helpers
+        if: ${{ inputs.scope == 'native-tools' }}
         run: |
-          bazel test //... //native:config_tests //:action_built_config_test \
+          bazel test //:execute_test //:reuse_report_test //:prototype_test \
+            //tests:probe_context_test //tests:probe_rounds_test //tests:payload_test //tests:source_files_test //tests:zlib_headers_test //:probes_test \
+            --override_repository=kbuild_exporter="$KBUILD_EXPORTER" \
+            --platforms=@llvm//platforms:linux_x86_64 \
+            --extra_execution_platforms=@llvm//platforms:linux_x86_64 \
+            --jobs=4 --test_output=errors --keep_going \
+            --profile="$RUNNER_TEMP/native-tools-helpers.profile.gz"
+
+      - name: Build the scheduler fixture and source-native BTF tools
+        if: ${{ inputs.scope == 'native-tools' }}
+        timeout-minutes: 50
+        run: |
+          bazel build //tests:scheduler //:native_btf_tools //:native_btf_tools_5_10 //:native_btf_tools_6_18 //execution_tools:check \
+            --override_repository=kbuild_exporter="$KBUILD_EXPORTER" \
+            --platforms=@llvm//platforms:linux_x86_64 \
+            --extra_execution_platforms=@llvm//platforms:linux_x86_64 \
+            --experimental_output_paths=strip --output_groups=+qualification_manifest --jobs=4 --keep_going \
+            --execution_log_compact_file="$RUNNER_TEMP/native-tools.execution.pb.zst" \
+            --profile="$RUNNER_TEMP/native-tools.profile.gz" \
+            --experimental_aquery_dump_after_build_format=jsonproto \
+            --experimental_aquery_dump_after_build_output_file="$RUNNER_TEMP/native-tools.aquery.json"
+
+      - name: Build the native compiler controls
+        if: ${{ inputs.scope == 'native-tools' }}
+        timeout-minutes: 20
+        run: |
+          bazel build //:native_compiler_checks //:native_compiler_checks_5_10 \
+            --override_repository=kbuild_exporter="$KBUILD_EXPORTER" \
+            --platforms=@llvm//platforms:linux_x86_64 \
+            --extra_execution_platforms=@llvm//platforms:linux_x86_64 \
+            --experimental_output_paths=strip --//:validate_native_objects --remote_download_outputs=all \
+            --output_groups=+qualification_manifest --jobs=4 --keep_going \
+            --execution_log_compact_file="$RUNNER_TEMP/native-controls.execution.pb.zst" \
+            --profile="$RUNNER_TEMP/native-controls.profile.gz" \
+            --experimental_aquery_dump_after_build_format=jsonproto \
+            --experimental_aquery_dump_after_build_output_file="$RUNNER_TEMP/native-controls.aquery.json"
+
+      - name: Authenticate and compare the native compiler controls
+        if: ${{ inputs.scope == 'native-tools' }}
+        run: |
+          evidence="$GITHUB_WORKSPACE/validation/compiler-controls"
+          mkdir -p "$evidence"
+          options=(
+            --override_repository=kbuild_exporter="$KBUILD_EXPORTER"
+            --platforms=@llvm//platforms:linux_x86_64
+            --extra_execution_platforms=@llvm//platforms:linux_x86_64
+            --experimental_output_paths=strip --//:validate_native_objects --remote_download_outputs=all --jobs=4
+          )
+          for name in default 5_10; do
+            target=//:native_compiler_checks
+            if [[ "$name" == 5_10 ]]; then target+=_5_10; fi
+            cp "$RUNNER_TEMP/native-controls.aquery.json" "$evidence/$name.aquery.json"
+            bazel cquery "$target" "${options[@]}" \
+              --output=files --output_groups=qualification_manifest > "$evidence/$name.manifest-path"
+          done
+          execution_root="$(bazel info execution_root)"
+          bazel run //:ir_compare "${options[@]}" -- \
+            --controls-results "$evidence" --execution-root "$execution_root"
+
+      - name: Fetch the compact execution log decoder
+        if: ${{ (inputs.scope || 'full') == 'full' }}
+        run: |
+          decoder="$RUNNER_TEMP/autoconf-execution-log-decoder"
+          curl --fail --location --output "$decoder" https://github.com/buildbuddy-io/bazel/releases/download/5.0.492/bazel-5.0.492-linux-x86_64
+          echo "e9e996a1a01555e45433acf9432f9d40d5bda437812a830d6701fe9b09853df9  $decoder" | sha256sum --check
+          chmod +x "$decoder"
+          echo "EXECUTION_LOG_DECODER=$decoder" >> "$GITHUB_ENV"
+
+      - name: Qualify native configuration, products, compiler family, and source edits
+        if: ${{ (inputs.scope || 'full') == 'full' }}
+        # Bound the whole sequence so post steps can upload evidence and save
+        # caches; setup time and service limits still affect available headroom.
+        timeout-minutes: 330
+        run: |
+          bazel test //... //native:config_tests //:action_built_config_test //execution_tools:check \
             //examples:x86_64_config_test //examples:aarch64_config_test \
             //examples:debug_config_test //examples:lz4_config_test //examples:btf_capability_test \
             --override_repository=linux_source="$GITHUB_WORKSPACE/_tmp/linux" \
@@ -139,41 +221,47 @@ jobs:
             --extra_execution_platforms=@llvm//platforms:linux_x86_64 \
             --extra_toolchains=//:driver_toolchain --jobs=4 --test_output=errors --keep_going
 
-      - name: Check native Kbuild flags and the linked kernel
-        if: ${{ !inputs.syntax_only }}
-        run: |
           bazel test //:kernel_acceptance_test \
             --override_repository=linux_source="$GITHUB_WORKSPACE/_tmp/linux" \
             --override_repository=kbuild_exporter="$KBUILD_EXPORTER" \
             --platforms=@llvm//platforms:linux_x86_64 \
             --extra_execution_platforms=@llvm//platforms:linux_x86_64 --jobs=4 --test_output=errors
 
-      - name: Check source edit reuse
-        if: ${{ !inputs.syntax_only }}
-        run: |
-          decoder="$RUNNER_TEMP/autoconf-execution-log-decoder"
-          curl --fail --location --output "$decoder" https://github.com/buildbuddy-io/bazel/releases/download/5.0.492/bazel-5.0.492-linux-x86_64
-          echo "e9e996a1a01555e45433acf9432f9d40d5bda437812a830d6701fe9b09853df9  $decoder" | sha256sum --check
-          chmod +x "$decoder"
-          python3 check_reuse.py --decoder "$decoder" --source _tmp/linux/init/main.c \
+          python3 check_reuse.py --family --decoder "$EXECUTION_LOG_DECODER" --source _tmp/linux/init/main.c \
             --bazel-option="--override_repository=linux_source=$GITHUB_WORKSPACE/_tmp/linux" \
             --bazel-option="--override_repository=kbuild_exporter=$KBUILD_EXPORTER" \
             --bazel-option=--platforms=@llvm//platforms:linux_x86_64 \
             --bazel-option=--extra_execution_platforms=@llvm//platforms:linux_x86_64 \
+            --bazel-option=--experimental_output_paths=strip \
+            --bazel-option=--experimental_sandbox_async_tree_delete_idle_threads=0 \
             --bazel-option=--jobs=4
 
       - name: Upload comparison reports
-        if: ${{ !cancelled() }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: kernel-acceptance
           path: |
             validation/
+            ${{ runner.temp }}/native-tools*
+            ${{ runner.temp }}/native-controls*
             bazel-out/**/bin/native/exporter_archive.tar.gz
             bazel-testlogs/repository_test/test.outputs/
             bazel-testlogs/**/test.log
             bazel-out/**/bin/kernel_validation/**
             bazel-out/**/bin/native/**/config-report.json
             bazel-out/**/bin/action_built_config/config-report.json
+            bazel-out/**/bin/tests/scheduler.manifest.json
+            bazel-out/**/bin/tests/scheduler.tree/**
+            bazel-out/**/bin/native_btf_tools.manifest.json
+            bazel-out/**/bin/native_btf_tools.tree/**
+            bazel-out/**/bin/native_btf_tools_5_10.manifest.json
+            bazel-out/**/bin/native_btf_tools_5_10.tree/**
+            bazel-out/**/bin/native_btf_tools_6_18.manifest.json
+            bazel-out/**/bin/native_btf_tools_6_18.tree/**
+            bazel-out/**/bin/native_compiler_checks.manifest.json
+            bazel-out/**/bin/native_compiler_checks.tree/**
+            bazel-out/**/bin/native_compiler_checks_5_10.manifest.json
+            bazel-out/**/bin/native_compiler_checks_5_10.tree/**
           if-no-files-found: warn
           retention-days: 7

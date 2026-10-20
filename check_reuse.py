@@ -1,15 +1,35 @@
 #!/usr/bin/env python3
-"""Measure real object action reuse, restoring the edited source on every exit."""
+"""Run native compiler-family or source-mutation reuse qualification."""
+
 import argparse
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
+from typing import TextIO
 import uuid
 
+from qualification import ir_reuse_report, reuse_report
 
-def records(stream):
+
+FAMILY_TARGETS = {
+    "base": "//examples:x86_64_kernel",
+    "unchanged": "//examples:x86_64_kernel",
+    "lz4": "//examples:x86_64_lz4_kernel",
+    "debug": "//examples:x86_64_debug_kernel",
+    "btf": "//examples:x86_64_btf_vmlinux",
+    "changed": "//examples:x86_64_changed_kernel",
+}
+
+
+def records(stream: TextIO) -> Iterator[dict[str, object]]:
+    """Read the decoder's concatenated JSON without retaining its input trees."""
     decoder = json.JSONDecoder()
-    buffer = ''
+    buffer = ""
     read_size = 65536
     while True:
         chunk = stream.read(read_size)
@@ -23,6 +43,8 @@ def records(stream):
                     raise
                 read_size = min(read_size * 2, 16 * 1024 * 1024)
                 break
+            if not isinstance(value, dict):
+                raise ValueError("Compact log entry is not an object")
             yield value
             buffer = buffer[end:]
             read_size = 65536
@@ -30,108 +52,182 @@ def records(stream):
             return
 
 
-def executed_objects(decoder, log, inventory):
-    paths, executed = {}, set()
-    command = [decoder, 'print', '--compact_execution_log=' + str(log), '--raw=true', '--sort=false']
-    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as process:
-        for entry in records(process.stdout):
-            for kind in ['file', 'directory', 'unresolvedSymlink']:
-                if kind in entry:
-                    paths[int(entry['id'])] = entry[kind]['path']
-            spawn = entry.get('spawn')
-            if not spawn or spawn.get('cacheHit') or not spawn.get('runner'):
-                continue
-            if spawn.get('mnemonic') != 'KernelArtifact':
-                continue
-            for output in spawn.get('outputs', []):
-                path = paths.get(int(output.get('outputId', 0)), '')
-                marker = '/artifacts/'
-                if marker in path:
-                    relative = path.split(marker, 1)[1]
-                    if relative in inventory:
-                        executed.add(inventory[relative])
+def project(entry: dict[str, object]) -> dict[str, object] | None:
+    """Keep the original reporter projection, including native cache digests."""
+    match entry:
+        case {"invocation": {"id": str(invocation), "hashFunctionName": str(algorithm)}}:
+            return {"invocation": invocation, "hashFunctionName": algorithm}
+        case {"spawn": dict(spawn)}:
+            digest = spawn.get("digest", {})
+            if not isinstance(digest, dict):
+                raise ValueError(f"Invalid compact action digest: {digest}")
+            return {"spawn": {
+                "outputs": spawn.get("outputs", []),
+                "mnemonic": spawn["mnemonic"],
+                "runner": spawn.get("runner", ""),
+                "cacheHit": spawn.get("cacheHit", False),
+                "exitCode": spawn.get("exitCode", 0),
+                "status": spawn.get("status", ""),
+                "digest": {"hash": digest.get("hash", ""), "sizeBytes": int(digest.get("sizeBytes", 0))},
+            }}
+    for kind in ("file", "directory", "unresolvedSymlink"):
+        match entry.get(kind):
+            case {"path": str(path)}:
+                return {"id": int(entry["id"]), "path": path}
+    if "invocation" in entry:
+        raise ValueError(f"Invalid compact invocation: {entry}")
+    return None
+
+
+def decode(decoder: str, log: Path, output: Path) -> None:
+    command = [decoder, "print", "--compact_execution_log=" + str(log), "--raw=true", "--sort=false"]
+    with output.open("w") as stream, subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as process:
+        assert process.stdout is not None
+        try:
+            for entry in records(process.stdout):
+                if (record := project(entry)) is not None:
+                    stream.write(json.dumps(record) + "\n")
+        except BaseException:
+            process.terminate()
+            raise
         if process.wait():
-            raise RuntimeError('Compact execution log decoder failed')
-    return sorted(executed)
+            raise RuntimeError(f"Compact execution log decoder failed: {log}")
 
 
-def inventory(metadata, artifact_prefix):
-    jobs = json.loads((metadata / 'report.json').read_text())
-    result = {}
-    for job in jobs:
-        if job['scan'] is None:
-            continue
-        for path in job['outputs']:
-            if not path.endswith('.o'):
-                continue
-            relative = path.split('.graph/', 1)[1]
-            if '.raw/' in relative:
-                result[relative] = relative.split('.raw/', 1)[1]
-            elif relative.startswith(artifact_prefix):
-                result[relative] = relative[len(artifact_prefix):]
-    return result
-
-
-
-def affected_targets(graph, changed):
-    """Follow actual producer edges, including generated sources after linking."""
-    affected = {changed}
-    members = graph['members']
-    for _ in range(len(members) + 1):
-        new = {row['target'] for row in members if affected.intersection(row['dependencies'])}
-        if new.issubset(affected):
-            return affected
-        affected.update(new)
-    raise ValueError('Artifact dependency closure did not converge')
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--decoder', required=True)
-    parser.add_argument('--source', type=Path, required=True)
-    parser.add_argument('--changed', default='init/main.o')
-    parser.add_argument('--control', default='kernel/fork.o')
-    parser.add_argument('--target', default='//:kernel')
-    parser.add_argument('--metadata', type=Path, default=Path('bazel-bin/kernel.schedule64'))
-    parser.add_argument('--artifact-prefix', default='kernel.artifacts/')
-    parser.add_argument('--graph', type=Path)
-    parser.add_argument('--out', type=Path, default=Path('validation/reuse'))
-    parser.add_argument('--bazel-option', action='append', default=[])
-    args = parser.parse_args()
-    args.out.mkdir(parents=True, exist_ok=True)
-    original = args.source.read_bytes()
-    phases = {}
-    marker = None
+@contextmanager
+def append_edit(path: Path, original: bytes, suffix: bytes) -> Iterator[None]:
+    if path.read_bytes() != original:
+        raise RuntimeError(f"Source changed concurrently before the reuse edit: {path}")
+    path.write_bytes(original + suffix)
     try:
-        for phase in ['baseline', 'unchanged', 'edited']:
-            if phase == 'edited':
-                if args.source.read_bytes() != original:
-                    raise RuntimeError('Source changed concurrently before the reuse edit')
-                marker = ('\n/* Bazel reuse check ' + uuid.uuid4().hex + ' */\n').encode()
-                args.source.write_bytes(original + marker)
-            log = (args.out / (phase + '.execution.pb.zst')).resolve()
-            subprocess.run(['bazel', 'build', args.target, '--execution_log_compact_file=' + str(log), *args.bazel_option], check=True)
-            objects = inventory(args.metadata, args.artifact_prefix)
-            if args.changed not in objects.values() or args.control not in objects.values():
-                raise AssertionError('Changed and control objects must both be in the compiler inventory')
-            phases[phase] = executed_objects(args.decoder, log, objects)
+        yield
     finally:
-        if marker is not None:
-            current = args.source.read_bytes()
-            if marker in current:
-                args.source.write_bytes(current.replace(marker, b"", 1))
-    graph = args.graph or (Path('bazel-bin/kernel.tree/kernel.json') if args.target == '//:kernel' else None)
-    allowed = affected_targets(json.loads(graph.read_text()), args.changed) if graph else {args.changed}
-    if args.control in allowed:
-        raise AssertionError('The control must be independent of the changed object')
-    unrelated = [name for name in phases['edited'] if name not in allowed]
-    result = dict(inventory=len(set(objects.values())), executed=phases, unrelated=unrelated, affected_compilers=sorted(allowed.intersection(objects.values())),
-                  passed=not phases['unchanged'] and args.changed in phases['edited'] and not unrelated)
-    (args.out / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
-    print(json.dumps(result, indent=2))
-    if not result['passed']:
-        raise SystemExit('Object actions did not preserve selective source reuse')
+        # Remove only this trial's unique addition, preserving concurrent edits.
+        current = path.read_bytes()
+        if suffix in current:
+            path.write_bytes(current.replace(suffix, b"", 1))
 
 
-if __name__ == '__main__':
+def measure(decoder: str, target: str, options: list[str], directory: Path, name: str, workspace: Path, *, family: bool = False) -> Path:
+    options = [*options, "--//:validate_native_objects"]
+    # Snapshots read original declared Files, including cached intermediates.
+    # Requesting exported copies alone does not materialize their inputs.
+    capture_options = [
+        *options, "--remote_download_outputs=all", "--output_groups=+boot,+qualification_manifest",
+        "--sandbox_block_path=/bin", "--sandbox_block_path=/usr/bin", "--sandbox_block_path=/usr/local/bin",
+    ]
+    log = directory / f"{name}.execution.pb.zst"
+    subprocess.run([
+        "bazel", "build", target, *capture_options,
+        "--execution_log_compact_file=" + str(log),
+        "--profile=" + str(directory / f"{name}.profile.gz"),
+        # Capture completed producers before another command checks source
+        # changes and can dirty their retained Skyframe owners.
+        "--experimental_aquery_dump_after_build_format=jsonproto",
+        "--experimental_aquery_dump_after_build_output_file=" + str(directory / f"{name}.aquery.json"),
+    ], cwd=workspace, check=True)
+    decode(decoder, log, directory / f"{name}.execution.jsonl")
+    with (directory / f"{name}.manifest-path").open("w") as output:
+        subprocess.run([
+            "bazel", "cquery", target, *options,
+            "--output=files", "--output_groups=qualification_manifest",
+        ], cwd=workspace, stdout=output, check=True)
+    execution_root = Path(subprocess.check_output(["bazel", "info", "execution_root"], cwd=workspace, text=True).strip())
+    snapshot = ir_reuse_report.snapshot if family else reuse_report.snapshot
+    snapshot(directory, name, execution_root)
+    return execution_root
+
+
+def family(decoder: str, options: list[str], directory: Path, workspace: Path, mutation_directory: Path | None = None) -> None:
+    for name in ir_reuse_report.FAMILY_PHASES:
+        execution_root = measure(decoder, FAMILY_TARGETS[name], options, directory, name, workspace, family=True)
+        if mutation_directory is not None and name in ("base", "unchanged"):
+            mutation_name = "baseline" if name == "base" else name
+            # Both comparisons use this invocation's evidence. A second warm
+            # build can omit every local action-cache hit from the spawn log.
+            for suffix in ("execution.pb.zst", "execution.jsonl", "profile.gz", "aquery.json", "manifest-path"):
+                shutil.copyfile(directory / f"{name}.{suffix}", mutation_directory / f"{mutation_name}.{suffix}")
+            # Snapshot actual stage Files before another configuration can
+            # replace them; do not substitute the family reporter's schema.
+            reuse_report.snapshot(mutation_directory, mutation_name, execution_root)
+    # Each comparator must run even when the other rejects the evidence.
+    comparison = subprocess.run([
+        sys.executable, "-m", "qualification.ir_compare", "--family-results", str(directory),
+    ], cwd=workspace)
+    reuse = subprocess.run([
+        sys.executable, "-m", "qualification.ir_reuse_report", "report", str(directory), "--family",
+    ], cwd=workspace)
+    if comparison.returncode or reuse.returncode:
+        raise SystemExit(f"Compiler-family qualification failed: parity={comparison.returncode}, reuse={reuse.returncode}; see {directory}")
+
+
+def mutations(decoder: str, target: str, options: list[str], directory: Path, workspace: Path, source: Path, *, baseline_captured: bool = False) -> None:
+    root = source.parent.parent
+    paths = [source, root / "init/do_mounts.h", root / "usr/default_cpio_list", root / "scripts/Makefile.lib"]
+    originals = [path.read_bytes() for path in paths]
+    for path, content in zip(paths, originals, strict=True):
+        (directory / (path.name + ".original")).write_bytes(content)
+    nonce = uuid.uuid4()
+    octals = "".join(f"\\{byte:03o}" for byte in nonce.bytes[:4])
+    edits = [
+        f"\n/* kernel source reuse {nonce} */\n".encode(),
+        f"\n/* kernel header reuse {nonce} */\n".encode(),
+        f"\ndir /linux-bzl-incbin-{nonce} 0755 0 0\n".encode(),
+        f'\n# kernel gzip reuse {nonce}\ncmd_gzip += ; printf "{octals}" | dd of=$@ bs=1 seek=4 conv=notrunc status=none\n'.encode(),
+    ]
+    # Each later mutation is measured on top of the preceding one, exactly as
+    # in the original trial. Restore only our additions on every normal exit.
+    with ExitStack() as stack:
+        for index, name in enumerate(reuse_report.PHASES):
+            if baseline_captured and index < 2:
+                continue
+            if index >= 2:
+                edit = index - 2
+                stack.enter_context(append_edit(paths[edit], originals[edit], edits[edit]))
+            measure(decoder, target, options, directory, name, workspace)
+    result = reuse_report.report(directory)
+    (directory / "reuse-report.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result["qualification"], indent=2))
+    if not all(result["qualification"][key] for key in (
+        "all_unrelated_compiles_reused", "header_edit_recompiled_only_consumers",
+        "incbin_edit_recompiled_only_consumer", "gzip_edit_recompiled_only_consumer",
+    )):
+        raise SystemExit("Kernel dependency reuse qualification failed; see reuse-report.json")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--decoder", required=True)
+    parser.add_argument("--family", action="store_true", help="Qualify base/unchanged/LZ4/debug/BTF/changed configurations")
+    parser.add_argument("--source", type=Path, help="Editable native init/main.c; combine with --family to share its baseline capture")
+    parser.add_argument("--target", help="Standalone mutation target (default: //examples:x86_64_kernel)")
+    parser.add_argument("--out", type=Path, help="Empty evidence directory (default: validation, validation/family, or validation/reuse)")
+    parser.add_argument("--bazel-option", action="append", default=[])
+    args = parser.parse_args()
+    workspace = Path(os.environ.get("BUILD_WORKSPACE_DIRECTORY", os.getcwd()))
+    if args.family and args.target is not None:
+        parser.error("--target applies only to standalone mutation qualification")
+    if not args.family and args.source is None:
+        parser.error("mutation qualification requires --source")
+    source = (workspace / args.source).resolve() if args.source is not None else None
+    if source is not None and (source.parts[-2:] != ("init", "main.c") or not source.is_file()):
+        parser.error("--source must identify native init/main.c for the fixed mutation controls")
+    combined = args.family and source is not None
+    default = "validation" if combined else "validation/family" if args.family else "validation/reuse"
+    directory = (workspace / (args.out or Path(default))).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    if any(directory.iterdir()):
+        parser.error("--out already contains evidence; choose a separate empty directory")
+    family_directory, mutation_directory = directory, directory
+    if combined:
+        family_directory, mutation_directory = directory / "family", directory / "reuse"
+        family_directory.mkdir()
+        mutation_directory.mkdir()
+    if args.family:
+        family(args.decoder, args.bazel_option, family_directory, workspace, mutation_directory if combined else None)
+    if source is not None:
+        mutations(args.decoder, args.target or FAMILY_TARGETS["base"], args.bazel_option, mutation_directory, workspace, source, baseline_captured=combined)
+
+
+if __name__ == "__main__":
     main()

@@ -9,13 +9,14 @@ def _impl(ctx):
         fail("Kernel artifact must be a normalized native relative path: " + path)
     kernel = ctx.attr.kernel[KernelBuildInfo]
     native_config = path in [".config", "include/config/auto.conf", "include/generated/autoconf.h"]
-    source = kernel.directory.path + "/" + ("" if native_config else "kernel.artifacts/") + path
+    directory = kernel.config.directory if native_config else kernel.directory
+    source = directory.path + "/" + ("" if native_config else "kernel.artifacts/") + path
     output = ctx.actions.declare_file(ctx.label.name)
     execution = ctx.toolchains[EXECUTION_TOOLS_TYPE].execution
     ctx.actions.run(
         executable = execution.python,
         arguments = ["-B", ctx.file._runner.path, "copy", source, output.path],
-        inputs = depset([kernel.directory, ctx.file._runner, ctx.file._executor], transitive = [execution.python_files]),
+        inputs = depset([directory, ctx.file._runner, ctx.file._executor, ctx.file._payload], transitive = [execution.python_files]),
         outputs = [output],
         mnemonic = "KernelArtifactSelect",
     )
@@ -29,5 +30,6 @@ kernel_artifact = rule(
         "path": attr.string(mandatory = True),
         "_runner": attr.label(default = "//:scheduler.py", allow_single_file = True),
         "_executor": attr.label(default = "//:execute.py", allow_single_file = True),
+        "_payload": attr.label(default = "//:payload.py", allow_single_file = True),
     },
 )

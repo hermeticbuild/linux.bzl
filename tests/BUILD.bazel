@@ -2,20 +2,26 @@ load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//rules:schedule_test.bzl", "schedule_fixture")
 load(":expressions_test.bzl", "probe_context_test")
+load(":runtime_test.bzl", "payload_test")
 load(":source_files_test.bzl", "source_files_test")
-load(":syntax_test.bzl", "syntax_identity_test")
+load(":syntax_test.bzl", "probe_rounds_test", "syntax_identity_test")
 
 schedule_fixture(
     name = "scheduler",
     srcs = [
+        "direct.S",
+        "embedded.txt",
         "included.c",
         "main.c",
         "other.c",
+        "parser.y",
         "value.h",
     ],
 )
 
 probe_context_test(name = "probe_context_test")
+
+payload_test(name = "payload_test")
 
 [
     cc_library(
@@ -74,6 +80,8 @@ exports_files([
 ])
 
 syntax_identity_test(name = "syntax_identity_test")
+
+probe_rounds_test(name = "probe_rounds_test")
 
 source_files_test(
     name = "source_files_test",

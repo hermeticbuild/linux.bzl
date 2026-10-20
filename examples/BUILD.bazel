@@ -1,4 +1,5 @@
 load("@rules_python//python:defs.bzl", "py_binary")
+load("//rules:kernel.bzl", "kernel_build")
 load(":kernel.bzl", "example_config_test", "example_initramfs", "kernel_example")
 
 package(default_visibility = ["//visibility:public"])
@@ -16,6 +17,23 @@ example_initramfs(
     motd = "README.md",
 )
 
+# Variants transition this label flag, keeping one action owner for native C.
+label_flag(
+    name = "configuration",
+    build_setting_default = ":x86_64_kernel_configuration",
+)
+
+kernel_build(
+    name = "kernel",
+    config = ":configuration",
+    roots = ["vmlinux"] + select({
+        "@platforms//cpu:aarch64": ["arch/arm64/boot/Image"],
+        "@platforms//cpu:x86_64": ["arch/x86/boot/bzImage"],
+    }),
+    syntax = "@kernel_syntax//:program",
+    tags = ["manual"],
+)
+
 [
     kernel_example(
         name = name,
@@ -31,6 +49,29 @@ example_initramfs(
         ("aarch64_kernel", "aarch64"),
     ]
 ]
+
+# The changed-configuration control needs only the affected object and the
+# compiler diagnostic fixture; the four full variants share :kernel above.
+kernel_build(
+    name = "changed_kernel",
+    config = ":configuration",
+    required_options = {"PANIC_TIMEOUT": "37"},
+    roots = [
+        "kernel/panic.o",
+        "lib/ctype.o",
+    ],
+    syntax = "@kernel_syntax//:program",
+    tags = ["manual"],
+)
+
+kernel_example(
+    name = "x86_64_changed_kernel",
+    build_target = "changed_kernel",
+    cc_toolchain = "@llvm//toolchain:linux_x86_64_to_linux_x86_64",
+    fragments = ["//examples/configs:x86_64.config"],
+    platform = "@llvm//platforms:linux_x86_64",
+    requested = {"PANIC_TIMEOUT": "37"},
+)
 
 filegroup(
     name = "x86_64_shared_graph_metadata",

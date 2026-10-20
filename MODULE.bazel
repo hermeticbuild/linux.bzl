@@ -6,7 +6,7 @@ module(
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "llvm", version = "0.8.24")
 bazel_dep(name = "rules_cc", version = "0.2.25")
-bazel_dep(name = "rules_python", version = "1.8.0")
+bazel_dep(name = "rules_python", version = "1.9.2")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "autoconf.bzl", version = "0.0.0")
 bazel_dep(name = "bazel_lib", version = "3.7.2")
@@ -124,6 +124,8 @@ kernel_source_archive(
     build_file = "//native:linux_source.BUILD.bazel",
     dev_dependency = True,
     integrity = "sha256-jrekIMzzqD8KL0yXrfTcfw5KvJjRDqVF0f2JE+qtXAU=",
+    patch_strip = 1,
+    patches = ["//native:linux_piggy_dependency.patch"],
     strip_prefix = "linux-0fcb05b72344f40806cbe810de8872f1698bf053",
     type = "tar.gz",
     urls = ["https://codeload.github.com/torvalds/linux/tar.gz/0fcb05b72344f40806cbe810de8872f1698bf053"],
@@ -134,8 +136,58 @@ kernel_source_archive(
     build_file = "//native:linux_source.BUILD.bazel",
     dev_dependency = True,
     integrity = "sha256-3nPVKLBL6R9uuGZgqmek1TuWu/ILtaMm54+ALXRN6+c=",
+    patch_strip = 1,
+    patches = [
+        "//native:linux_piggy_dependency.patch",
+    ],
     strip_prefix = "linux-5.10.270",
     urls = ["https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.10.270.tar.xz"],
+)
+
+kernel_source_archive(
+    name = "linux_5_15",
+    build_file = "//native:linux_source.BUILD.bazel",
+    dev_dependency = True,
+    integrity = "sha256-wHiC4eUo7+IGVnom3jCxktuNxDaZdNTvTOcIaR+hFIw=",
+    patch_strip = 1,
+    patches = [
+        "//native:linux_piggy_dependency.patch",
+    ],
+    strip_prefix = "linux-5.15.221",
+    urls = ["https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.15.221.tar.xz"],
+)
+
+kernel_source_archive(
+    name = "linux_6_1",
+    build_file = "//native:linux_source.BUILD.bazel",
+    dev_dependency = True,
+    integrity = "sha256-7U0KyxMHwjUjDInvwJTiEOYpBZP5Sn5hfyixABEBozo=",
+    patch_strip = 1,
+    patches = ["//native:linux_piggy_dependency.patch"],
+    strip_prefix = "linux-6.1.188",
+    urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.188.tar.xz"],
+)
+
+kernel_source_archive(
+    name = "linux_6_6",
+    build_file = "//native:linux_source.BUILD.bazel",
+    dev_dependency = True,
+    integrity = "sha256-t0pD0GMICbeHHMkGrBVelWy8Cy54p0UfXmyL/LEgjDA=",
+    patch_strip = 1,
+    patches = ["//native:linux_piggy_dependency.patch"],
+    strip_prefix = "linux-6.6.157",
+    urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.157.tar.xz"],
+)
+
+kernel_source_archive(
+    name = "linux_6_12",
+    build_file = "//native:linux_source.BUILD.bazel",
+    dev_dependency = True,
+    integrity = "sha256-jO4Z4YObtv9NUlTXYZM65qtnBJLV7QMOCagFODINXEw=",
+    patch_strip = 1,
+    patches = ["//native:linux_piggy_dependency.patch"],
+    strip_prefix = "linux-6.12.110",
+    urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.110.tar.xz"],
 )
 
 kernel_source_archive(
@@ -143,6 +195,8 @@ kernel_source_archive(
     build_file = "//native:linux_source.BUILD.bazel",
     dev_dependency = True,
     integrity = "sha256-K2lWT31P6gyFmxlZujNwnubpE5vRAOMKhTtXFZqCIbg=",
+    patch_strip = 1,
+    patches = ["//native:linux_piggy_dependency.patch"],
     strip_prefix = "linux-6.18.52",
     urls = ["https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.52.tar.xz"],
 )
@@ -187,5 +241,19 @@ kernel_syntax_repository(
     name = "kernel_syntax",
     dev_dependency = True,
     source = "@linux_source//:Makefile",
+    tool = "@kbuild_exporter//:kbuild-exporter",
+)
+
+kernel_syntax_repository(
+    name = "kernel_syntax_5_10",
+    dev_dependency = True,
+    source = "@linux_5_10//:Makefile",
+    tool = "@kbuild_exporter//:kbuild-exporter",
+)
+
+kernel_syntax_repository(
+    name = "kernel_syntax_6_18",
+    dev_dependency = True,
+    source = "@linux_6_18//:Makefile",
     tool = "@kbuild_exporter//:kbuild-exporter",
 )

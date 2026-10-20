@@ -6,10 +6,28 @@ import sys
 import unittest
 
 from native.configure import merge_fragments
+from native_recipe import fold_newlines, interpolate
 from examples.initramfs import archive
 parser = argparse.ArgumentParser()
 parser.add_argument('--config-anchor', required=True)
 inputs, test_args = parser.parse_known_args()
+
+
+class NativeRecipeTest(unittest.TestCase):
+    def test_make_shell_newlines(self):
+        for raw, expected in [(b"", b""), (b"\n\r\n", b""),
+                              (b"a\r\nb\n\n", b"a b"),
+                              (b"a \n\n", b"a "), (b"a\rb", b"a\rb")]:
+            with self.subTest(raw=raw):
+                self.assertEqual(fold_newlines(raw), expected)
+        with self.assertRaisesRegex(ValueError, "NUL"):
+            fold_newlines(b"a\0b")
+
+    def test_results_are_inserted_once(self):
+        self.assertEqual(interpolate(b"printf __KBUILD_SHELL_RESULT_0__", [b"\\141"]), b"printf \\141")
+        self.assertEqual(interpolate(b"__KBUILD_SHELL_RESULT_0__", [b"__KBUILD_SHELL_RESULT_1__"]), b"__KBUILD_SHELL_RESULT_1__")
+        with self.assertRaisesRegex(ValueError, "Unresolved"):
+            interpolate(b"__KBUILD_SHELL_RESULT_1__", [b"first"])
 
 
 class FragmentTest(unittest.TestCase):

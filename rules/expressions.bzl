@@ -7,7 +7,15 @@ rejected rather than run during analysis.
 
 load(":text_transforms.bzl", "sed_substitute")
 
+_SHELL_PREFIX = "__KBUILD_SHELL_RESULT_"
+
+def static_value(value, operation):
+    if _SHELL_PREFIX in value:
+        fail("Deferred Make shell output requires execution before %s" % operation)
+    return value
+
 def _words(value):
+    static_value(value, "word expansion")
     return [w for w in value.replace("\t", " ").replace("\n", " ").replace("\r", " ").split(" ") if w]
 
 def _match(pattern, word):
@@ -31,6 +39,13 @@ def _glob(pattern, word):
     return previous[-1]
 
 def _builtin(name, a, sources):
+    if name == "shell" and "__shell_commands__" in sources:
+        commands = sources["__shell_commands__"]
+        result = _SHELL_PREFIX + str(len(commands)) + "__"
+        commands.append(a[0])
+        return result
+    for argument in a:
+        static_value(argument, "Make function " + name)
     if name == "kbuild_execution_tool":
         tools = sources.get("__execution_tools__", {})
         if a[0] not in tools:
@@ -45,7 +60,7 @@ def _builtin(name, a, sources):
     if name == "kbuild_sed":
         return sed_substitute(a[0], a[1])
     if name == "kbuild_host_shell":
-        request = dict(kind = "host-shell", command = a[0], environment = sources["__probe_environment__"], directory = ".", source = sources["__source_root__"])
+        request = dict(kind = "host-shell", command = a[0], environment = sources["__probe_environment__"], directory = ".", source = sources["__source_root__"], directories = sources.get("__probe_directories__", []))
         key = json.encode(request)
         result = sources.get("__capabilities__", {}).get(key)
         if result == None:
@@ -54,8 +69,6 @@ def _builtin(name, a, sources):
         if type(result) != "string":
             fail("Native host shell query returned a non-string value: " + key)
         return result
-    if name == "shell" and sources.get("__shell_commands__"):
-        return "$(" + a[0] + ")"
     if name == "kbuild_min_version":
         return "y" if int(a[0] or "0") >= int(a[1].strip()) else ""
     if name == "error":
@@ -209,10 +222,12 @@ def evaluate(terms, variables, sources = {}):
             for index in reversed(range(len(expressions))):
                 tasks.append(("command_expr" if index == 2 and probe == "try-run" else "expr", expressions[index], scope, chain))
         elif op == "command_expr":
-            tasks.extend([("restore_sources", sources, scope, chain), ("expr", data, scope, chain)])
-            sources = dict(sources, __shell_commands__ = True)
+            command_sources = dict(sources, __shell_commands__ = [], __shell_cache__ = {})
+            tasks.extend([("restore_sources", (sources, command_sources), scope, chain), ("expr", data, scope, chain)])
+            sources = command_sources
         elif op == "restore_sources":
-            sources = data
+            sources, command_sources = data
+            values.append(struct(command = values.pop(), shell_commands = command_sources["__shell_commands__"]))
         elif op == "probe_result":
             probe, arguments, option = data
             tool, flags, command, directory, source = values[-5:]
@@ -222,11 +237,13 @@ def evaluate(terms, variables, sources = {}):
                 argument = option,
                 compiler = tool,
                 flags = flags.strip(),
-                command = command,
+                command = command.command if probe == "try-run" else command,
                 environment = sources.get("__probe_environment__", {}),
                 directory = directory,
                 source = source,
             )
+            if probe == "try-run" and command.shell_commands:
+                request["shell_commands"] = command.shell_commands
             key = json.encode(request)
             supported = sources.get("__capabilities__", {}).get(key)
             if supported == None:
@@ -247,15 +264,17 @@ def evaluate(terms, variables, sources = {}):
             else:
                 tasks.append(("expr", arguments[2] if len(arguments) > 2 else [], scope, chain))
         elif op == "origin":
-            name = values.pop()
+            name = static_value(values.pop(), "variable origin")
             values.append("command line" if name in scope.get("__command_line__", {}) else "file" if name in scope else "undefined")
         elif op == "intcmp":
-            left, right = int(values.pop(-2).strip()), int(values.pop().strip())
+            left, right = int(static_value(values.pop(-2), "integer comparison").strip()), int(static_value(values.pop(), "integer comparison").strip())
             index = 2 if left < right else 3 if left == right else 4
             tasks.append(("expr", data[index] if index < len(data) else (data[3] if len(data) > 3 and left > right else []), scope, chain))
         elif op == "lookup_name":
-            tasks.append(("lookup", values.pop(), scope, chain))
+            tasks.append(("lookup", static_value(values.pop(), "variable name"), scope, chain))
         elif op == "lookup":
+            if data == ".SHELLSTATUS":
+                fail("Make .SHELLSTATUS requires execution-time expression evaluation")
             if ":" in data and "=" in data:
                 name, substitution = data.split(":", 1)
                 before, after = substitution.split("=", 1)
@@ -266,15 +285,19 @@ def evaluate(terms, variables, sources = {}):
                 cell = scope.get(data, {"value": scope.get("__config__", {}).get(data, "")})
                 tasks.append(("cell", cell, scope, [] if "scope" in cell or "append" in cell else chain + [data]))
         elif op == "cell":
-            key = (data.get("cache_id"), sources.get("__shell_commands__", False))
-            if data.get("cache_id") != None and key in cache:
-                values.append(cache[key])
+            # A cached slot is meaningful only within its capture list. Keep
+            # simple-variable reuse without leaking slots into another action.
+            cell_cache = sources.setdefault("__shell_cache__", {}) if "__shell_commands__" in sources else cache
+            key = data.get("cache_id")
+            if key != None and key in cell_cache:
+                values.append(cell_cache[key])
             else:
-                if data.get("cache_id") != None:
-                    tasks.append(("cache", key, scope, chain))
+                if key != None:
+                    tasks.append(("cache", (cell_cache, key), scope, chain))
                 tasks.append(("cell_body", data, scope, chain))
         elif op == "cache":
-            cache[data] = values[-1]
+            cell_cache, key = data
+            cell_cache[key] = values[-1]
         elif op == "cell_body":
             if "value" in data:
                 values.append(data["value"])
@@ -292,7 +315,7 @@ def evaluate(terms, variables, sources = {}):
                 tasks.append(("expr", data["expr"], data.get("scope", scope), [] if "scope" in data else chain))
         elif op == "append_result":
             new, old = values.pop(), values.pop()
-            values.append(old + (" " if old else "") + new)
+            values.append(old + (" " if static_value(old, "append spacing") else "") + new)
         elif op == "substitute":
             before, after = data
             values.append(_builtin("patsubst", [
@@ -301,17 +324,17 @@ def evaluate(terms, variables, sources = {}):
                 values.pop(),
             ], sources))
         elif op == "if":
-            condition = values.pop().strip()
+            condition = static_value(values.pop(), "Make conditional").strip()
             tasks.append(("expr", data[1] if condition else data[2] if len(data) > 2 else [], scope, chain))
         elif op == "logic":
             name, arguments, index = data
-            value = values.pop()
+            value = static_value(values.pop(), "Make boolean expression")
             if (name == "or" and value.strip()) or (name == "and" and not value.strip()) or index + 1 == len(arguments):
                 values.append(value)
             else:
                 tasks.extend([("logic", (name, arguments, index + 1), scope, chain), ("expr", arguments[index + 1], scope, chain)])
         elif op == "foreach":
-            words, name = _words(values.pop()), values.pop().strip()
+            words, name = _words(values.pop()), static_value(values.pop(), "foreach variable").strip()
             tasks.append(("join", len(words), scope, chain))
             for word in reversed(words):
                 local = dict(scope)
@@ -323,7 +346,7 @@ def evaluate(terms, variables, sources = {}):
             local = dict(scope)
             for i, value in enumerate(args):
                 local[str(i)] = {"value": value}
-            tasks.append(("lookup", args[0].strip(), local, chain))
+            tasks.append(("lookup", static_value(args[0], "called variable").strip(), local, chain))
     fail("Make expression exceeded 100000 evaluation steps")
 
 def source_index(paths):
@@ -343,15 +366,15 @@ def _condition(branch, variables, sources):
         if branch["directive"] == "else" and not branch["arguments"]:
             return True
         fail("Missing native conditional operands at %s:%s; regenerate the AST" % (branch.get("file"), branch["line"]))
-    args = [evaluate(a, variables, sources) for a in condition["operands"]]
+    args = [static_value(evaluate(a, variables, sources), "Make directive condition") for a in condition["operands"]]
     directive = condition["directive"]
     if directive in ("ifdef", "ifndef"):
         # Native ifdef tests the stored value, without recursively expanding it.
         cell = variables.get(args[0].strip(), {"value": variables.get("__config__", {}).get(args[0].strip(), "")})
         if "scope" in cell or "append" in cell or "parts" in cell:
-            defined = bool(evaluate([{"op": "reference", "name": [{"op": "literal", "value": args[0].strip()}]}], variables, sources))
+            defined = bool(static_value(evaluate([{"op": "reference", "name": [{"op": "literal", "value": args[0].strip()}]}], variables, sources), "Make defined condition"))
         else:
-            defined = bool(cell.get("value", cell.get("raw", "")))
+            defined = bool(static_value(cell.get("value", cell.get("raw", "")), "Make defined condition"))
         return defined == (directive == "ifdef")
     return (args[0] == args[1]) == (directive == "ifeq")
 
@@ -428,8 +451,6 @@ def program(statements, initial, sources, cells = False):
             paths = _words(evaluate(node["arguments_expression"], variables, sources))
             for path in reversed(paths):
                 path = path.removeprefix("__source__/").removeprefix(sources.get("__source_root__", "__source__") + "/").removeprefix("./")
-                if path in ("include/config/auto.conf", "include/config/auto.conf.cmd"):
-                    continue
                 parts = []
                 for part in path.split("/"):
                     if part == "..":
@@ -437,6 +458,12 @@ def program(statements, initial, sources, cells = False):
                     elif part and part != ".":
                         parts.append(part)
                 path = "/".join(parts)
+
+                # Native auto.conf Make values already populate __config__.
+                # These generated includes may use the logical object root;
+                # they are not source syntax in the exported include map.
+                if path.removeprefix("__object__/") in ("include/config/auto.conf", "include/config/auto.conf.cmd"):
+                    continue
                 body = sources.get("__includes__", {}).get(path)
                 if body == None:
                     if node["directive"] == "include":
@@ -485,6 +512,11 @@ def program(statements, initial, sources, cells = False):
                 "recipe": False,
                 "implicit": node.get("implicit", False),
             }
+            if "secondary_expression" in node:
+                current.update(
+                    secondary_expression = node["secondary_expression"],
+                    secondary_inputs = {name: {"value": evaluate(expression, variables, sources)} for name, expression in node["secondary_inputs"].items()},
+                )
             rules.append(current)
         elif kind == "recipe" and current != None:
             current["recipe"] = True

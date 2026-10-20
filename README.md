@@ -10,7 +10,9 @@ One generic Make/Python exporter, built with Bazel and pinned by host artifact
 integrity, exports source-only Kbuild syntax at repository time. Execution-time
 callbacks measure native compiler and host-library queries and register separate
 compiler, generator, archive, and linker actions. Dependency scans select the
-source/header inputs for each compiler action. Product actions do not run Make.
+source and generated header inputs for each compiler action. Target product
+actions do not run Make. The BTF resolver uses a host libbpf archive and installed
+headers built together by its selected kernel source's native Make rules.
 
 ## Consumer interface
 
@@ -61,7 +63,23 @@ still regenerates that header from its unchanged template and runs its own check
 
 ## Build and test
 
-Use Bazel 9.3.0 and the registered Linux execution toolchain:
+Use Bazelisk with the version in [`.bazelversion`](.bazelversion) and the registered
+Linux execution toolchain. The temporary
+[Bazel fork](https://github.com/tamird/bazel/releases/tag/10.0.0-bb0242a676)
+provides native literal writes for action templates and includes their
+expanded children in action graph exports.
+Concrete child producers are required to qualify native compiler ancestry.
+Qualification captures them inside the measured build, before a later command
+can invalidate retained analysis state. This capture disables Skymeld and omits
+command text; producer ancestry uses declared edges and actual cache identity
+comes from the compact execution log.
+The release includes source, binary hashes, and native Linux and macOS
+test provenance for x86-64 and ARM64.
+The fork also repairs modified inputs during in-memory sandbox reuse. Input discovery guards already evaluated inputs, including
+cache-restored inputs, together with scheduling dependencies. Newly discovered
+inputs are evaluated before execution guards them, so pruned runfiles do not
+require metadata that was never loaded.
+Stock Bazel 9.3.0 does not provide these interfaces.
 
 The [LLVM toolchain index](llvm_toolchain_index.json) selects
 [corrected LLVM 23.1.2 packages](https://github.com/tamird/hermetic-llvm/releases/tag/llvm-23.1.2-ir1)
@@ -101,9 +119,23 @@ not a bootstrap of LLVM itself.
 `//:kernel_acceptance_test` checks the existing minimal vmlinux, its ELF/entry
 symbols, and six ordered flag groups against native GNU Make. It uses the
 already-produced native configuration, without configuring the kernel again.
-`check_reuse.py` retains the baseline/unchanged/source-edit experiment using actual
-execution logs and producer dependencies. Expensive build/configuration targets
-are explicitly tagged `manual`.
+`check_reuse.py --family` runs base, unchanged, LZ4, debug, BTF, and the bounded
+`PANIC_TIMEOUT=37` control, then runs both object/diagnostic and reuse comparisons.
+The default mode runs the six source-mutation phases. Combine `--family` with
+`--source /path/to/linux/init/main.c` to capture base and unchanged once for both comparisons,
+before the remaining family configurations and source edits. This retains the
+first invocation's compiler observations, which a repeated local cache hit may
+omit from its execution log. Both retain actual execution logs and producer
+dependencies. The qualification reporters authenticate native
+compiler inventory, split C object ancestry, integrated reference parity, and
+cross-configuration backend action identity. Reference objects are enabled by
+`--//:validate_native_objects`, which also records the source-selected LZ4 and
+Make recipe-ordering checks and the two deferred compiler diagnostic controls.
+The manual `native_compiler_checks` and `native_compiler_checks_5_10` targets
+request only `lib/ctype.o` for focused execution of these controls. Production
+builds omit the validation actions. Example variants
+transition one build label so corresponding backend paths share an action owner.
+Expensive build/configuration targets are explicitly tagged `manual`.
 
 The native-config checkpoint is qualified. The migrated product path still needs
 runtime qualification. Complete boot/module support across all six source lines,
