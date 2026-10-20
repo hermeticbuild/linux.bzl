@@ -65,11 +65,14 @@ def example_config_test(name, config, expected):
     )
 
 def _initramfs_impl(ctx):
+    runtime = ctx.attr._python_runtime[platform_common.ToolchainInfo].py3_runtime
+    if runtime.interpreter == None:
+        fail("Example initramfs requires a declared Python interpreter")
     output = ctx.actions.declare_file(ctx.label.name + ".cpio")
     ctx.actions.run(
-        executable = ctx.attr._writer[DefaultInfo].files_to_run,
-        arguments = [ctx.file.motd.path, output.path],
-        inputs = [ctx.file.motd],
+        executable = runtime.interpreter,
+        arguments = [ctx.file._writer.path, ctx.file.motd.path, output.path],
+        inputs = depset([ctx.file._writer, ctx.file.motd, runtime.interpreter], transitive = [runtime.files]),
         outputs = [output],
         mnemonic = "ExampleInitramfs",
     )
@@ -77,5 +80,6 @@ def _initramfs_impl(ctx):
 
 example_initramfs = rule(implementation = _initramfs_impl, attrs = {
     "motd": attr.label(mandatory = True, allow_single_file = True),
-    "_writer": attr.label(default = "//examples:initramfs_writer", cfg = "exec", executable = True),
+    "_writer": attr.label(default = "//examples:initramfs.py", cfg = "exec", allow_single_file = True),
+    "_python_runtime": attr.label(default = "@rules_python//python:current_py_toolchain", cfg = "exec"),
 })

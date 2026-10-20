@@ -1,16 +1,9 @@
-load("@rules_python//python:defs.bzl", "py_binary")
 load("//rules:kernel.bzl", "kernel_build")
 load(":kernel.bzl", "example_config_test", "example_initramfs", "kernel_example")
 
 package(default_visibility = ["//visibility:public"])
 
 exports_files(["initramfs.py"])
-
-py_binary(
-    name = "initramfs_writer",
-    srcs = ["initramfs.py"],
-    main = "initramfs.py",
-)
 
 example_initramfs(
     name = "example_initramfs",

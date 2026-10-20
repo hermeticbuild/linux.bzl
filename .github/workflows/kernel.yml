@@ -139,7 +139,7 @@ jobs:
         if: ${{ inputs.scope == 'native-tools' }}
         run: |
           bazel test //:execute_test //:reuse_report_test //:prototype_test \
-            //tests:probe_context_test //tests:probe_rounds_test //tests:payload_test //tests:source_files_test //tests:zlib_headers_test //:probes_test \
+            //tests:probe_context_test //tests:probe_rounds_test //tests:payload_test //tests:source_files_test //tests:initramfs_test //tests:zlib_headers_test //:probes_test \
             --override_repository=kbuild_exporter="$KBUILD_EXPORTER" \
             --platforms=@llvm//platforms:linux_x86_64 \
             --extra_execution_platforms=@llvm//platforms:linux_x86_64 \
