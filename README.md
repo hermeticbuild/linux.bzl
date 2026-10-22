@@ -72,7 +72,9 @@ templates and includes their expanded child actions in action graph exports.
 These interfaces support per-object preprocessing reuse, metadata generation,
 and their qualification. The release includes source,
 binary hashes, and native Linux and macOS test provenance for x86-64 and ARM64.
-The fork also repairs modified inputs during in-memory sandbox reuse. Input discovery guards already evaluated inputs, including
+The fork also repairs modified inputs during in-memory sandbox reuse. The
+qualification workflow enables in-memory stashes with synchronous stash updates
+and deletion. Input discovery guards already evaluated inputs, including
 cache-restored inputs, together with scheduling dependencies. Newly discovered
 inputs are evaluated before execution guards them, so pruned runfiles do not
 require metadata that was never loaded.
@@ -125,12 +127,29 @@ first invocation's compiler observations, which a repeated local cache hit may
 omit from its execution log. Both retain actual execution logs and producer
 dependencies. The qualification reporters authenticate native
 compiler inventory, split C object ancestry, integrated reference parity, and
-cross-configuration backend action identity. They also authenticate every
-preprocessing scan, including host helpers and integrated references, against
-the expanded action graph and compact execution log. Unchanged builds must
-execute no scans; source and header mutations must execute the affected scans
-without repeating unrelated preprocessing. These scan counts are retained
-alongside the native compiler-role denominator and backend reuse checks.
+cross-configuration backend action identity. Mutation selectivity includes native
+host compilers; the family parity denominator remains target C objects.
+The [static family baseline](qualification/family_baseline.json) records the
+resolved configurations, product compiler inventory, and measured action-key
+sharing from a complete family qualification. It bounds aggregate product
+compiler work and every backend family membership. It requires at least 187
+LZ4, 184 debug and seven BTF backend retrievals matching earlier captures,
+as measured from disk-cache hits in the warm sequence. Each target counts once
+per capture, without attributing which matching predecessor populated the cache.
+These 378 required retrievals bound fresh executions to at most 7,786 of the
+8,164 product compiler roles. Additional sharing is allowed. Update this baseline
+deliberately when changing the source, configurations, or compiler inputs.
+Product compiler counts exclude integrated references and diagnostic controls.
+Absent execution records are reported separately from cache hits. These bounds
+cover compiler roles; they do not bound archive, link, or other native recipe
+work, nor build duration.
+The reporters also authenticate every preprocessing scan, including host
+helpers and integrated references, against the expanded action graph and
+compact execution log. An unchanged build may retrieve cached results but must
+not execute a `KernelArtifact`, `KernelLLVMBackend`, or `KernelDependencyScan`
+action. Source and header mutations must execute the affected scans without
+repeating unrelated preprocessing. These scan counts are retained alongside
+the native compiler-role denominator and backend reuse checks.
 
 Earlier batched-scan reports omitted preprocessing from their compiler-work
 accounting. Backend cache-hit evidence from those reports remains specific to
@@ -152,10 +171,10 @@ builds omit the validation actions. Example variants
 transition one build label so corresponding backend paths share an action owner.
 Expensive build/configuration targets are explicitly tagged `manual`.
 
-The native-config checkpoint is qualified. The migrated product path still needs
-runtime qualification. Complete boot/module support across all six source lines,
-both architectures, cross-configuration compiler sharing, and production mutation
-coverage remain acceptance requirements; config-only results do not establish them.
+Kernel acceptance requires boot and module coverage across all six source lines
+and both architectures, native compiler parity, cross-configuration compiler
+sharing, and production source-mutation checks. Configuration-only results do not
+establish these properties.
 
 ## Owners
 

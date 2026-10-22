@@ -306,6 +306,7 @@ py_test(
         "check_reuse.py",
         "test_reuse.py",
     ] + glob(["qualification/*.py"]),
+    data = ["qualification/family_baseline.json"],
     main = "test_reuse.py",
 )
 

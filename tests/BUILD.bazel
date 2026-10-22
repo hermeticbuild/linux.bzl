@@ -5,6 +5,7 @@ load("@rules_python//python:defs.bzl", "py_test")
 load("//rules:initramfs.bzl", "initramfs")
 load("//rules:schedule_test.bzl", "schedule_fixture")
 load(":expressions_test.bzl", "probe_context_test")
+load(":native_exports_test.bzl", "native_exports_fixture")
 load(":runtime_test.bzl", "payload_test")
 load(":source_files_test.bzl", "source_files_test")
 load(":syntax_test.bzl", "probe_rounds_test", "syntax_identity_test")
@@ -25,6 +26,13 @@ schedule_fixture(
 probe_context_test(name = "probe_context_test")
 
 payload_test(name = "payload_test")
+
+native_exports_fixture(name = "native_exports")
+
+build_test(
+    name = "native_exports_test",
+    targets = [":native_exports"],
+)
 
 [
     cc_library(

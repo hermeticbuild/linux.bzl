@@ -4,6 +4,7 @@
 import argparse
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,50 @@ FAMILY_TARGETS = {
     "btf": "//examples:x86_64_btf_vmlinux",
     "changed": "//examples:x86_64_changed_kernel",
 }
+
+
+@contextmanager
+def phase(directory: Path, name: str, stage: str, *, target: str | None = None) -> Iterator[dict[str, int]]:
+    """Record the last reached operation without changing qualification results."""
+    def record(status: str, **details: object) -> None:
+        line = json.dumps({
+            "time": datetime.now(UTC).isoformat(),
+            "directory": str(directory),
+            "phase": name,
+            "stage": stage,
+            "target": target,
+            "status": status,
+            **details,
+        })
+        write_error: OSError | None = None
+        try:
+            with (directory / "progress.jsonl").open("a") as output:
+                output.write(line + "\n")
+        except OSError as error:
+            write_error = error
+        try:
+            print(line, flush=True)
+            if write_error is not None:
+                print(f"Could not retain qualification progress: {write_error}", file=sys.stderr, flush=True)
+        except OSError:
+            # A full filesystem or closed console must not replace the
+            # measured operation's result, including an existing exception.
+            pass
+
+    result: dict[str, int] = {}
+    record("started")
+    try:
+        yield result
+    except BaseException as error:
+        details: dict[str, object] = {"error": type(error).__name__}
+        if isinstance(error, subprocess.CalledProcessError):
+            details["returncode"] = error.returncode
+        elif isinstance(error, SystemExit):
+            details["exit"] = error.code
+        record("failed", **details)
+        raise
+    else:
+        record("failed" if result.get("returncode", 0) else "completed", **result)
 
 
 def records(stream: TextIO) -> Iterator[dict[str, object]]:
@@ -111,30 +156,40 @@ def append_edit(path: Path, original: bytes, suffix: bytes) -> Iterator[None]:
 def measure(decoder: str, target: str, options: list[str], directory: Path, name: str, workspace: Path, *, family: bool = False) -> Path:
     options = [*options, "--//:validate_native_objects"]
     # Snapshots read original declared Files, including cached intermediates.
-    # Requesting exported copies alone does not materialize their inputs.
+    # Request those files without also requesting the exported tree or
+    # the staging copies that native recipes consume remotely.
     capture_options = [
-        *options, "--remote_download_outputs=all", "--output_groups=+boot,+qualification_manifest",
+        *options, "--remote_download_outputs=minimal",
+        "--remote_download_regex=.*[.](stage|backend)[0-9]+/artifacts/kernel[.](ir|integrated|raw|artifacts|validation)/.*",
+        "--remote_download_regex=.*[.]manifest[.]json",
+        "--remote_download_regex=.*/[.]config",
+        "--output_groups=+boot,+qualification_manifest",
         "--sandbox_block_path=/bin", "--sandbox_block_path=/usr/bin", "--sandbox_block_path=/usr/local/bin",
     ]
     log = directory / f"{name}.execution.pb.zst"
-    subprocess.run([
-        "bazel", "build", target, *capture_options,
-        "--execution_log_compact_file=" + str(log),
-        "--profile=" + str(directory / f"{name}.profile.gz"),
-        # Capture completed producers before another command checks source
-        # changes and can dirty their retained Skyframe owners.
-        "--experimental_aquery_dump_after_build_format=jsonproto",
-        "--experimental_aquery_dump_after_build_output_file=" + str(directory / f"{name}.aquery.json"),
-    ], cwd=workspace, check=True)
-    decode(decoder, log, directory / f"{name}.execution.jsonl")
-    with (directory / f"{name}.manifest-path").open("w") as output:
+    with phase(directory, name, "build", target=target):
         subprocess.run([
-            "bazel", "cquery", target, *options,
-            "--output=files", "--output_groups=qualification_manifest",
-        ], cwd=workspace, stdout=output, check=True)
-    execution_root = Path(subprocess.check_output(["bazel", "info", "execution_root"], cwd=workspace, text=True).strip())
+            "bazel", "build", target, *capture_options,
+            "--execution_log_compact_file=" + str(log),
+            "--profile=" + str(directory / f"{name}.profile.gz"),
+            # Capture completed producers before another command checks source
+            # changes and can dirty their retained Skyframe owners.
+            "--experimental_aquery_dump_after_build_format=jsonproto",
+            "--experimental_aquery_dump_after_build_output_file=" + str(directory / f"{name}.aquery.json"),
+        ], cwd=workspace, check=True)
+    with phase(directory, name, "decode", target=target):
+        decode(decoder, log, directory / f"{name}.execution.jsonl")
+    with phase(directory, name, "manifest", target=target):
+        with (directory / f"{name}.manifest-path").open("w") as output:
+            subprocess.run([
+                "bazel", "cquery", target, *options,
+                "--output=files", "--output_groups=qualification_manifest",
+            ], cwd=workspace, stdout=output, check=True)
+    with phase(directory, name, "execution_root", target=target):
+        execution_root = Path(subprocess.check_output(["bazel", "info", "execution_root"], cwd=workspace, text=True).strip())
     snapshot = ir_reuse_report.snapshot if family else reuse_report.snapshot
-    snapshot(directory, name, execution_root)
+    with phase(directory, name, "snapshot", target=target):
+        snapshot(directory, name, execution_root)
     return execution_root
 
 
@@ -143,20 +198,25 @@ def family(decoder: str, options: list[str], directory: Path, workspace: Path, m
         execution_root = measure(decoder, FAMILY_TARGETS[name], options, directory, name, workspace, family=True)
         if mutation_directory is not None and name in ("base", "unchanged"):
             mutation_name = "baseline" if name == "base" else name
-            # Both comparisons use this invocation's evidence. A second warm
-            # build can omit every local action-cache hit from the spawn log.
-            for suffix in ("execution.pb.zst", "execution.jsonl", "profile.gz", "aquery.json", "manifest-path"):
-                shutil.copyfile(directory / f"{name}.{suffix}", mutation_directory / f"{mutation_name}.{suffix}")
-            # Snapshot actual stage Files before another configuration can
-            # replace them; do not substitute the family reporter's schema.
-            reuse_report.snapshot(mutation_directory, mutation_name, execution_root)
+            with phase(mutation_directory, mutation_name, "shared_snapshot", target=FAMILY_TARGETS[name]):
+                # Both comparisons use this invocation's evidence. A second warm
+                # build can omit every local action-cache hit from the spawn log.
+                for suffix in ("execution.pb.zst", "execution.jsonl", "profile.gz", "aquery.json", "manifest-path"):
+                    shutil.copyfile(directory / f"{name}.{suffix}", mutation_directory / f"{mutation_name}.{suffix}")
+                # Snapshot actual stage Files before another configuration can
+                # replace them; do not substitute the family reporter's schema.
+                reuse_report.snapshot(mutation_directory, mutation_name, execution_root)
     # Each comparator must run even when the other rejects the evidence.
-    comparison = subprocess.run([
-        sys.executable, "-m", "qualification.ir_compare", "--family-results", str(directory),
-    ], cwd=workspace)
-    reuse = subprocess.run([
-        sys.executable, "-m", "qualification.ir_reuse_report", "report", str(directory), "--family",
-    ], cwd=workspace)
+    with phase(directory, "family", "parity") as result:
+        comparison = subprocess.run([
+            sys.executable, "-m", "qualification.ir_compare", "--family-results", str(directory),
+        ], cwd=workspace)
+        result["returncode"] = comparison.returncode
+    with phase(directory, "family", "reuse") as result:
+        reuse = subprocess.run([
+            sys.executable, "-m", "qualification.ir_reuse_report", "report", str(directory), "--family",
+        ], cwd=workspace)
+        result["returncode"] = reuse.returncode
     if comparison.returncode or reuse.returncode:
         raise SystemExit(f"Compiler-family qualification failed: parity={comparison.returncode}, reuse={reuse.returncode}; see {directory}")
 
@@ -185,14 +245,15 @@ def mutations(decoder: str, target: str, options: list[str], directory: Path, wo
                 edit = index - 2
                 stack.enter_context(append_edit(paths[edit], originals[edit], edits[edit]))
             measure(decoder, target, options, directory, name, workspace)
-    result = reuse_report.report(directory)
-    (directory / "reuse-report.json").write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps(result["qualification"], indent=2))
-    if not all(result["qualification"][key] for key in (
-        "all_unrelated_compiles_reused", "header_edit_recompiled_only_consumers",
-        "incbin_edit_recompiled_only_consumer", "gzip_edit_recompiled_only_consumer",
-    )):
-        raise SystemExit("Kernel dependency reuse qualification failed; see reuse-report.json")
+    with phase(directory, "mutations", "reuse"):
+        result = reuse_report.report(directory)
+        (directory / "reuse-report.json").write_text(json.dumps(result, indent=2) + "\n")
+        print(json.dumps(result["qualification"], indent=2))
+        if not all(result["qualification"][key] for key in (
+            "all_unrelated_compiles_reused", "header_edit_recompiled_only_consumers",
+            "incbin_edit_recompiled_only_consumer", "gzip_edit_recompiled_only_consumer",
+        )):
+            raise SystemExit("Kernel dependency reuse qualification failed; see reuse-report.json")
 
 
 def main() -> None:

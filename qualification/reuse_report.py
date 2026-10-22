@@ -638,20 +638,11 @@ def snapshot_scans(directory: Path, name: str, manifest: KernelManifest, graph: 
     (directory / f"{name}.scans.json").write_text(json.dumps(values, indent=2) + "\n")
 
 
-def snapshot(directory: Path, name: str, workspace: Path) -> None:
-    graph = ActionGraph.read(directory / f"{name}.aquery.json")
-    manifest = read_manifest(directory, name, workspace, graph)
-    _, compilers = authenticate_compilers(manifest, graph)
-    snapshot_scans(directory, name, manifest, graph)
-    snapshot_native_recipe_checks(directory, name, workspace, manifest, graph)
-    artifacts = manifest["artifacts"]
+def compiler_snapshot(compilers: dict[str, CompilerRecord], graph: ActionGraph, workspace: Path, boot_headers: dict[str, tuple[str, str]]) -> dict[str, dict[str, object]]:
+    """Project authenticated compiler producers and their generated inputs."""
     inventory = {}
-    paths = {}
-    boot_headers = {header: hashlib.sha256((workspace / artifacts[header]).read_bytes()).hexdigest() for header in BOOT_HEADERS}
     for target, compiler in compilers.items():
-        source, obj, kind = compiler["source"], compiler["object"], compiler["kind"]
-        if kind == "host":
-            continue
+        source, obj = compiler["source"], compiler["object"]
         roles = {"single": obj}
         bitcode_digest = None
         if "frontend" in compiler or "bitcode" in compiler:
@@ -673,10 +664,22 @@ def snapshot(directory: Path, name: str, workspace: Path) -> None:
             action = graph.producer(path)
             assert action["mnemonic"] in COMPILER_MNEMONICS, (target, role)
             outputs[role] = sorted(mapped(graph.artifacts[str(item)]) for item in action["outputIds"])
-            generated_inputs[role] = {header: digest for header, digest in boot_headers.items() if graph.consumes(path, artifacts[header])}
+            generated_inputs[role] = {header: digest for header, (artifact, digest) in boot_headers.items() if graph.consumes(path, artifact)}
         inventory[target] = {"source": source, "outputs": outputs, "bitcode_digest": bitcode_digest, "generated_inputs": generated_inputs}
-        paths[target] = obj
     assert inventory, "No product compiler actions"
+    return inventory
+
+
+def snapshot(directory: Path, name: str, workspace: Path) -> None:
+    graph = ActionGraph.read(directory / f"{name}.aquery.json")
+    manifest = read_manifest(directory, name, workspace, graph)
+    _, compilers = authenticate_compilers(manifest, graph)
+    snapshot_scans(directory, name, manifest, graph)
+    snapshot_native_recipe_checks(directory, name, workspace, manifest, graph)
+    artifacts = manifest["artifacts"]
+    boot_headers = {header: (artifacts[header], hashlib.sha256((workspace / artifacts[header]).read_bytes()).hexdigest()) for header in BOOT_HEADERS}
+    inventory = compiler_snapshot(compilers, graph, workspace, boot_headers)
+    paths = {target: compiler["object"] for target, compiler in compilers.items()}
     for target in ("usr/initramfs_inc_data", ".vmlinux.export.c", PIGGY_SOURCE, GZIP_PAYLOAD):
         paths[target] = artifacts[target]
     # Authenticate the extra boot compiler reached by a changed initramfs.
@@ -686,7 +689,7 @@ def snapshot(directory: Path, name: str, workspace: Path) -> None:
     controls = ("init/main.o", "kernel/fork.o", "usr/initramfs_data.o", ".vmlinux.export.o", PIGGY_OBJECT,
                 "usr/initramfs_inc_data", ".vmlinux.export.c", PIGGY_SOURCE, GZIP_PAYLOAD)
     digests = {target: hashlib.sha256((workspace / paths[target]).read_bytes()).hexdigest() for target in controls}
-    digests.update(boot_headers)
+    digests.update({header: digest for header, (_, digest) in boot_headers.items()})
     digests["decompressed_gzip"] = hashlib.sha256(gzip.decompress((workspace / paths[GZIP_PAYLOAD]).read_bytes())).hexdigest()
     (directory / f"{name}.compilers.json").write_text(json.dumps(inventory, indent=2) + "\n")
     (directory / f"{name}.digests.json").write_text(json.dumps(digests, indent=2) + "\n")
@@ -783,8 +786,14 @@ def scan_measurements(directory: Path, names: tuple[str, ...]) -> tuple[dict[str
         raise ValueError(f"Baseline did not observe every compiler scan: {sorted(missing)}")
     if inventories["unchanged"] != inventories[first]:
         raise ValueError("Unchanged compiler scan inventory differs")
-    if phases["unchanged"].executed:
-        raise ValueError("Unchanged build executed compiler scans")
+    # KernelArtifact also owns host, assembly, codegen and integrated compiles,
+    # plus native links and generators outside the C-object parity inventory.
+    if executed := {
+        mnemonic: count
+        for (mnemonic, outcome), count in phases["unchanged"].mnemonics.items()
+        if mnemonic in COMPILER_MNEMONICS | {SCAN_MNEMONIC} and outcome == "executed"
+    }:
+        raise ValueError(f"Unchanged build executed native actions: {executed}")
     return inventories, phases
 
 
@@ -914,7 +923,7 @@ def report(directory: Path) -> dict[str, object]:
         "native_recipe_checks": native_recipes,
         "compile_inventory_unchanged": True,
         "qualification": {
-            "unrelated_logical_objects": len(compilers) - 1,
+            "unrelated_compiler_targets": len(compilers) - 1,
             "unrelated_compiler_actions": len(unrelated),
             "unrelated_executed_after_edit": len(unrelated_executed),
             "unrelated_not_executed_after_edit": len(unrelated - edited.executed),
@@ -924,7 +933,7 @@ def report(directory: Path) -> dict[str, object]:
             "incbin_edit_recompiled_only_consumer": incbin_consumers <= phases["incbin"].executed <= incbin_allowed,
             "gzip_edit_recompiled_only_consumer": phases["gzip"].executed == gzip_consumers,
         },
-        "logical_kernel_objects": len(compilers),
+        "logical_compiler_targets": len(compilers),
         "compiler_phase_counts": dict(Counter(role for record in compilers.values() for role in record.outputs)),
         "phases": {name: dict(value.report(), compiler_phases={
             role: {outcome: sum(value.outcome(record.outputs[role]) == outcome for record in compilers.values() if role in record.outputs)

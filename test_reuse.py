@@ -1,7 +1,9 @@
 """Qualification rejects missing roles, invented hits and broad invalidation."""
 
 import copy
+import hashlib
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -237,6 +239,19 @@ class ReuseTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "native compiler descriptor"):
             reuse_report.read_manifest(self.directory, "base", self.directory, graph)
 
+    def test_compiler_snapshot_retains_authenticated_host(self) -> None:
+        graph, manifest = self.native_graph()
+        target = "scripts/basic/fixdep"
+        manifest["artifacts"][target] = "helper.o"
+        manifest["compilers"][target] = {"kind": "host", "source": "source.c", "object": "helper.o"}
+        manifest["compiler_jobs"].append({"kind": "host", "source": "source.c", "target": target, "phase": "single", "outputs": ["helper.o"]})
+        graph.producer("helper.o")["inputDepSetIds"] = graph.producer("frontend.bc")["inputDepSetIds"]
+        graph.dep_sets["1"]["directArtifactIds"].append(graph.identities["helper.o"])
+        _, compilers = reuse_report.authenticate_compilers(manifest, graph)
+        (self.directory / "frontend.bc").write_bytes(b"IR")
+        snapshot = reuse_report.compiler_snapshot(compilers, graph, self.directory, {})
+        self.assertEqual(snapshot[target], {"source": "source.c", "outputs": {"single": ["helper.o"]}, "bitcode_digest": None, "generated_inputs": {"single": {}}})
+
     def native_recipe_graph(self) -> tuple[reuse_report.ActionGraph, dict]:
         _, manifest = self.native_graph()
         paths = self.native_recipe_files(self.directory / "controls")
@@ -416,6 +431,7 @@ class ReuseTest(unittest.TestCase):
 
     def family(self) -> None:
         targets = ["kernel/panic.o", "arch/x86/boot/string.o", "lib/ctype.o", "lib/string.o"]
+        configs = {}
         for phase in ir_reuse_report.FAMILY_PHASES:
             self.native_recipe_files(self.directory / "native-recipes" / phase)
             selected = targets + (["debug/only.o"] if phase == "debug" else [])
@@ -434,7 +450,7 @@ class ReuseTest(unittest.TestCase):
                 for role in ("frontend", "integrated", "object"):
                     identity = len(entries) + 1
                     entries.append({"id": identity, "path": paths[role]})
-                    entries.append(spawn(identity, backend=role == "object", hit=phase == "lz4", digest=role + content))
+                    entries.append(spawn(identity, backend=role == "object", hit=phase in ("lz4", "debug", "btf"), digest=role + content))
             self.write(f"{phase}.ir.json", snapshot)
             scan_targets = {target: {"frontend": (value["paths"]["frontend"],), "integrated": (value["paths"]["integrated"],)} for target, value in snapshot.items()}
             self.scan_records(phase, scan_targets, entries, set(selected) | {"helper"} if phase != "unchanged" else set(), cached=phase == "lz4")
@@ -444,13 +460,36 @@ class ReuseTest(unittest.TestCase):
                 "debug": ["CONFIG_DEBUG_KERNEL=y", 'CONFIG_LOCALVERSION="-debug"'],
                 "btf": ["CONFIG_DEBUG_INFO_BTF=y"], "lz4": ["CONFIG_KERNEL_LZ4=y"],
             }.get(phase, [])
-            self.write(f"{phase}.products.json", {"compilers": compilers, "products": {"vmlinux": {}, "arch/x86/boot/bzImage": {}}, "config": "\n".join(config)})
+            configs[phase] = "\n".join(config)
+            self.write(f"{phase}.products.json", {"compilers": compilers, "products": {"vmlinux": {}, "arch/x86/boot/bzImage": {}}, "config": configs[phase]})
             self.write(f"diagnostics/{phase}/report.json", diagnostics())
         self.write("base.compiler.json", {"arch/x86/boot/string.o": {"flags": ["-g", "-m16"]}})
+        self.write("family-baseline.json", {
+            "variants": {
+                name: {
+                    "compiler_counts": {"c": len(selected), "assembly": 0, "host": 0, "codegen": 0},
+                    "compiler_inventory_sha256": hashlib.sha256(json.dumps(sorted((target, "c", "source/" + target.removesuffix(".o") + ".c") for target in selected), separators=(",", ":")).encode()).hexdigest(),
+                    "product_compiler_actions": 2 * len(selected),
+                    "config_sha256": hashlib.sha256(configs[name].encode()).hexdigest(),
+                }
+                for name in ir_reuse_report.FAMILY
+                for selected in [targets + (["debug/only.o"] if name == "debug" else [])]
+            },
+            "aggregate": {"product_compiler_instances": 34, "distinct_product_compiler_action_keys": 10, "repeated_backend_instances": 12},
+            "backend_memberships": {
+                "/".join(members): 4
+                for size in range(2, 5)
+                for members in itertools.combinations(ir_reuse_report.FAMILY, size)
+            },
+            "backend_retrievals": {"lz4": 4, "debug": 4, "btf": 4},
+        })
+
+    def family_report(self, directory: Path) -> None:
+        ir_reuse_report.summarize(directory, self.directory / "family-baseline.json")
 
     def test_family_requires_equal_ir_equal_keys_and_actual_hits(self) -> None:
         self.family()
-        ir_reuse_report.summarize(self.directory)
+        self.family_report(self.directory)
         ir_compare.compare_family(self.directory)
         result = json.loads((self.directory / "ir-reuse.json").read_text())
         self.assertEqual(result["base_lz4"]["actual_backend_cache_hits"], 4)
@@ -467,9 +506,74 @@ class ReuseTest(unittest.TestCase):
                     backend["cacheHit"] = False
                 path.write_text("\n".join(map(json.dumps, entries)) + "\n")
                 with self.assertRaises(AssertionError):
-                    ir_reuse_report.summarize(self.directory)
+                    self.family_report(self.directory)
                 failed = json.loads((self.directory / "ir-reuse.json").read_text())
                 self.assertEqual(failed["base_lz4"]["actual_backend_cache_hits"], 3)
+
+    def test_family_regression_covers_non_c_work_and_all_configurations(self) -> None:
+        for defect in ("host_work", "source_substitution", "config", "frontend_cost", "btf_sharing", "missing_observation", "missing_hit_floor"):
+            with self.subTest(defect=defect):
+                self.family()
+                if defect in ("host_work", "config"):
+                    path = self.directory / "debug.products.json"
+                    products = json.loads(path.read_text())
+                    if defect == "host_work":
+                        products["compilers"]["scripts/new.o"] = {"kind": "host", "source": "scripts/new.c", "object": "scripts/new.o"}
+                    else:
+                        products["config"] += "\nCONFIG_UNMEASURED_CHANGE=y"
+                    self.write(path.name, products)
+                elif defect == "source_substitution":
+                    for name in ir_reuse_report.FAMILY_PHASES:
+                        path = self.directory / f"{name}.products.json"
+                        products = json.loads(path.read_text())
+                        if "lib/ctype.o" in products["compilers"]:
+                            products["compilers"]["lib/ctype.o"]["source"] = "source/replacement.c"
+                        self.write(path.name, products)
+                elif defect == "missing_hit_floor":
+                    path = self.directory / "family-baseline.json"
+                    baseline = json.loads(path.read_text())
+                    del baseline["backend_retrievals"]["debug"]
+                    self.write(path.name, baseline)
+                else:
+                    path = self.directory / "btf.execution.jsonl"
+                    entries = [json.loads(line) for line in path.read_text().splitlines()]
+                    role = "frontend" if defect == "frontend_cost" else "object"
+                    output = next(entry["id"] for entry in entries if entry.get("path", "").endswith(f"/{role}/lib/ctype.o"))
+                    selected = next(entry for entry in entries if {"outputId": output} in entry.get("spawn", {}).get("outputs", []))
+                    if defect == "missing_observation":
+                        entries.remove(selected)
+                    else:
+                        selected["spawn"]["digest"]["hash"] = "lost-sharing"
+                    path.write_text("\n".join(map(json.dumps, entries)) + "\n")
+                with self.assertRaises(AssertionError):
+                    self.family_report(self.directory)
+
+    def test_family_requires_retrieval_in_each_later_capture(self) -> None:
+        for phase in ("lz4", "debug", "btf"):
+            with self.subTest(phase=phase):
+                self.family()
+                path = self.directory / f"{phase}.execution.jsonl"
+                entries = [json.loads(line) for line in path.read_text().splitlines()]
+                backend = next(entry["spawn"] for entry in entries if entry.get("spawn", {}).get("mnemonic") == "KernelLLVMBackend")
+                backend["cacheHit"] = False
+                path.write_text("\n".join(map(json.dumps, entries)) + "\n")
+                with self.assertRaises(AssertionError):
+                    self.family_report(self.directory)
+                result = json.loads((self.directory / "ir-reuse.json").read_text())
+                self.assertEqual(result["regression"]["violations"], [f"{phase} matched backend retrievals: got 3, floor 4"])
+
+    def test_family_regression_allows_additional_sharing(self) -> None:
+        self.family()
+        path = self.directory / "family-baseline.json"
+        baseline = json.loads(path.read_text())
+        baseline["aggregate"]["distinct_product_compiler_action_keys"] += 1
+        baseline["aggregate"]["repeated_backend_instances"] -= 1
+        baseline["backend_memberships"]["base/btf"] -= 1
+        self.write(path.name, baseline)
+        self.family_report(self.directory)
+        result = json.loads((self.directory / "ir-reuse.json").read_text())
+        self.assertEqual(result["regression"]["aggregate"], {"product_compiler_instances": 34, "distinct_product_compiler_action_keys": 10, "repeated_backend_instances": 12})
+        self.assertEqual(result["regression"]["violations"], [])
 
     def test_parity_and_diagnostics_are_independent_required_gates(self) -> None:
         for defect in ("parity", "diagnostics"):
@@ -490,7 +594,7 @@ class ReuseTest(unittest.TestCase):
             with self.subTest(family=family):
                 if family:
                     self.family()
-                    report = ir_reuse_report.summarize
+                    report = self.family_report
                     phase = "btf"
                 else:
                     self.mutation()
@@ -505,14 +609,32 @@ class ReuseTest(unittest.TestCase):
         self.family()
         value = ir_reuse_report.read_snapshot(self.directory / "unchanged.ir.json")
         self.log("unchanged", [{"id": 1, "path": value["kernel/panic.o"]["paths"]["object"]}, spawn(1, backend=True)])
-        with self.assertRaises(AssertionError):
-            ir_reuse_report.summarize(self.directory)
+        with self.assertRaisesRegex(ValueError, "Unchanged build executed native actions"):
+            self.family_report(self.directory)
         path = self.write("inventory.json", {"unit.o": {
             "source": "unit.c", "outputs": {"backend": ["unit.o"]},
             "bitcode_digest": "IR", "generated_inputs": {"backend": {}},
         }})
         with self.assertRaisesRegex(ValueError, "compiler phases"):
             reuse_report.read_compilers(path)
+
+    def test_unchanged_rejects_native_execution_outside_product_inventory(self) -> None:
+        for family in (True, False):
+            with self.subTest(family=family):
+                if family:
+                    self.family()
+                    report = self.family_report
+                else:
+                    self.mutation()
+                    report = reuse_report.report
+                # This output is absent from both fixture compiler inventories.
+                entries = [{"id": 1, "path": "helper.o"}, spawn(1, hit=True)]
+                self.log("unchanged", entries)
+                report(self.directory)
+                entries[-1]["spawn"]["cacheHit"] = False
+                self.log("unchanged", entries)
+                with self.assertRaisesRegex(ValueError, "Unchanged build executed native actions"):
+                    report(self.directory)
 
     def mutation(self) -> dict[str, dict[str, tuple[str, ...]]]:
         c_targets = ["init/main.o", "kernel/fork.o", "init/do_mounts.o", "init/do_mounts_initrd.o", "init/initramfs.o", ".vmlinux.export.o"]
@@ -590,8 +712,8 @@ class ReuseTest(unittest.TestCase):
         scans = json.loads((self.directory / "unchanged.scans.json").read_text())
         self.append_scan_spawn(entries, scans[-1]["outputs"])
         self.log("unchanged", entries)
-        with self.assertRaisesRegex(ValueError, "Unchanged build executed compiler scans"):
-            ir_reuse_report.summarize(self.directory)
+        with self.assertRaisesRegex(ValueError, "Unchanged build executed native actions"):
+            self.family_report(self.directory)
 
     def test_six_phase_selective_mutation_and_omissions(self) -> None:
         self.mutation()

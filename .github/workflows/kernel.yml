@@ -56,19 +56,19 @@ jobs:
           path: |
             ${{ runner.temp }}/native-config.profile.gz
             bazel-testlogs/**/test.log
-            bazel-out/**/bin/native/**/config-report.json
-            bazel-out/**/bin/native/**/probes.jsonl
-            bazel-out/**/bin/native/**/requested.config
-            bazel-out/**/bin/native/**/.config
-            bazel-out/**/bin/native/**/include/config/auto.conf
-            bazel-out/**/bin/native/**/include/generated/autoconf.h
-            bazel-out/**/bin/native/**/values/report.json
-            bazel-out/**/bin/action_built_config/config-report.json
-            bazel-out/**/bin/action_built_config/probes.jsonl
-            bazel-out/**/bin/action_built_config/.config
-            bazel-out/**/bin/action_built_config/include/config/auto.conf
-            bazel-out/**/bin/action_built_config/include/generated/autoconf.h
-            bazel-out/**/bin/action_built_config/values/report.json
+            bazel-out/*/bin/native/**/config-report.json
+            bazel-out/*/bin/native/**/probes.jsonl
+            bazel-out/*/bin/native/**/requested.config
+            bazel-out/*/bin/native/**/.config
+            bazel-out/*/bin/native/**/include/config/auto.conf
+            bazel-out/*/bin/native/**/include/generated/autoconf.h
+            bazel-out/*/bin/native/**/values/report.json
+            bazel-out/*/bin/action_built_config/config-report.json
+            bazel-out/*/bin/action_built_config/probes.jsonl
+            bazel-out/*/bin/action_built_config/.config
+            bazel-out/*/bin/action_built_config/include/config/auto.conf
+            bazel-out/*/bin/action_built_config/include/generated/autoconf.h
+            bazel-out/*/bin/action_built_config/values/report.json
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
@@ -76,6 +76,10 @@ jobs:
     if: ${{ inputs.scope != 'native-config' }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ (inputs.scope || 'full') == 'full' && 360 || 60 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        qualification: ${{ fromJSON((inputs.scope || 'full') == 'full' && '["family", "mutations"]' || '["selected"]') }}
     env:
       BAZELISK_VERIFY_SHA256: 3fdff352a996a99e298c9104e616dba6df8bf58a0fd5fc67f32926a2fc0a0358
     steps:
@@ -109,8 +113,10 @@ jobs:
       - uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: autoconf-kernel
-          bazelrc: startup --host_jvm_args=-Xmx8g
+          bazelrc: |
+            startup --host_jvm_args=-Xmx8g
+            build --experimental_sandbox_async_tree_delete_idle_threads=0
+            build --experimental_inmemory_sandbox_stashes
           repository-cache: |
             - MODULE.bazel
             - MODULE.bazel.lock
@@ -121,8 +127,14 @@ jobs:
           sudo apt-get install --yes strace
 
       - name: Build and audit the generic syntax exporter
+        env:
+          VALIDATION_SCOPE: ${{ inputs.scope || 'full' }}
         run: |
-          bazel test //native:exporter_archive //:repository_test \
+          source_options=()
+          if [[ "$VALIDATION_SCOPE" == full ]]; then
+            source_options+=(--override_repository=linux_source="$GITHUB_WORKSPACE/_tmp/linux")
+          fi
+          bazel test //native:exporter_archive //:repository_test "${source_options[@]}" \
             --platforms=@llvm//platforms:linux_x86_64_musl \
             --extra_execution_platforms=@llvm//platforms:linux_x86_64 --jobs=4 --test_output=errors --test_arg=--strace
 
@@ -206,62 +218,143 @@ jobs:
           chmod +x "$decoder"
           echo "EXECUTION_LOG_DECODER=$decoder" >> "$GITHUB_ENV"
 
-      - name: Qualify native configuration, products, compiler family, and source edits
+      - name: Qualify ${{ matrix.qualification }}
         if: ${{ (inputs.scope || 'full') == 'full' }}
-        # Bound the whole sequence so post steps can upload evidence and save
-        # caches; setup time and service limits still affect available headroom.
+        # Keep each complete warm sequence within one job budget. The mutation
+        # job captures its own baseline and unchanged build.
         timeout-minutes: 330
+        shell: bash
+        env:
+          QUALIFICATION: ${{ matrix.qualification }}
         run: |
-          bazel test //... //native:config_tests //:action_built_config_test //execution_tools:check \
-            //examples:x86_64_config_test //examples:aarch64_config_test \
-            //examples:debug_config_test //examples:lz4_config_test //examples:btf_capability_test \
-            --override_repository=linux_source="$GITHUB_WORKSPACE/_tmp/linux" \
-            --override_repository=kbuild_exporter="$KBUILD_EXPORTER" \
-            --platforms=@llvm//platforms:linux_x86_64 \
-            --extra_execution_platforms=@llvm//platforms:linux_x86_64 \
-            --extra_toolchains=//:driver_toolchain --jobs=4 --test_output=errors --keep_going
+          {
+            trap 'qualification_status=$?; printf "%s exit %s\n" "$(date -u +%FT%TZ)" "$qualification_status" >> "$RUNNER_TEMP/qualification-phases.log" || :; df -h . "$RUNNER_TEMP" || :; df -i . "$RUNNER_TEMP" || :; exit "$qualification_status"' EXIT
+            qualification_phase() {
+              printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$RUNNER_TEMP/qualification-phases.log"
+            }
+            df -h . "$RUNNER_TEMP"
+            df -i . "$RUNNER_TEMP"
+            if [[ "$QUALIFICATION" == family ]]; then
+              qualification_phase initial-tests started
+              bazel test //... //native:config_tests //:action_built_config_test //execution_tools:check \
+                //examples:x86_64_config_test //examples:aarch64_config_test \
+                //examples:debug_config_test //examples:lz4_config_test //examples:btf_capability_test \
+                --override_repository=linux_source="$GITHUB_WORKSPACE/_tmp/linux" \
+                --override_repository=kbuild_exporter="$KBUILD_EXPORTER" \
+                --platforms=@llvm//platforms:linux_x86_64 \
+                --extra_execution_platforms=@llvm//platforms:linux_x86_64 \
+                --extra_toolchains=//:driver_toolchain --config=remote --test_output=errors --keep_going
+              qualification_phase initial-tests completed
 
-          bazel test //:kernel_acceptance_test \
-            --override_repository=linux_source="$GITHUB_WORKSPACE/_tmp/linux" \
-            --override_repository=kbuild_exporter="$KBUILD_EXPORTER" \
-            --platforms=@llvm//platforms:linux_x86_64 \
-            --extra_execution_platforms=@llvm//platforms:linux_x86_64 --jobs=4 --test_output=errors
+              qualification_phase native-acceptance started
+              bazel test //:kernel_acceptance_test \
+                --override_repository=linux_source="$GITHUB_WORKSPACE/_tmp/linux" \
+                --override_repository=kbuild_exporter="$KBUILD_EXPORTER" \
+                --platforms=@llvm//platforms:linux_x86_64 \
+                --extra_execution_platforms=@llvm//platforms:linux_x86_64 --config=remote --test_output=errors
+              qualification_phase native-acceptance completed
+              # Share compiler results across the family builds. Let Bazel trim
+              # the cache while idle to leave room for the BTF outputs.
+              qualification_options=(
+                --family
+                --bazel-option="--disk_cache=$HOME/.cache/bazel-disk"
+                --bazel-option=--disk_cache_gc_max_size=5G
+                --bazel-option=--disk_cache_gc_idle_delay=0
+              )
+            else
+              qualification_options=(--source _tmp/linux/init/main.c)
+            fi
 
-          python3 check_reuse.py --family --decoder "$EXECUTION_LOG_DECODER" --source _tmp/linux/init/main.c \
-            --bazel-option="--override_repository=linux_source=$GITHUB_WORKSPACE/_tmp/linux" \
-            --bazel-option="--override_repository=kbuild_exporter=$KBUILD_EXPORTER" \
-            --bazel-option=--platforms=@llvm//platforms:linux_x86_64 \
-            --bazel-option=--extra_execution_platforms=@llvm//platforms:linux_x86_64 \
-            --bazel-option=--experimental_output_paths=strip \
-            --bazel-option=--experimental_sandbox_async_tree_delete_idle_threads=0 \
-            --bazel-option=--jobs=4
+            qualification_phase "$QUALIFICATION" started
+            python3 check_reuse.py "${qualification_options[@]}" --decoder "$EXECUTION_LOG_DECODER" \
+              --bazel-option="--override_repository=linux_source=$GITHUB_WORKSPACE/_tmp/linux" \
+              --bazel-option="--override_repository=kbuild_exporter=$KBUILD_EXPORTER" \
+              --bazel-option=--platforms=@llvm//platforms:linux_x86_64 \
+              --bazel-option=--extra_execution_platforms=@llvm//platforms:linux_x86_64 \
+              --bazel-option=--experimental_output_paths=strip \
+              --bazel-option=--config=remote
+            qualification_phase "$QUALIFICATION" completed
+          } 2>&1 | tee "$RUNNER_TEMP/qualification.log"
+
+      - name: Prepare bounded qualification diagnostics
+        if: ${{ always() && (inputs.scope || 'full') == 'full' }}
+        timeout-minutes: 1
+        run: |
+          diagnostics="$RUNNER_TEMP/qualification-diagnostics"
+          mkdir -p "$diagnostics"
+          if [[ -f "$RUNNER_TEMP/qualification.log" ]]; then
+            tail -c 2097152 "$RUNNER_TEMP/qualification.log" > "$diagnostics/console-tail.log"
+          fi
+          if [[ -f "$RUNNER_TEMP/qualification-phases.log" ]]; then
+            cp "$RUNNER_TEMP/qualification-phases.log" "$diagnostics/"
+          fi
+          { df -h . "$RUNNER_TEMP" || :; df -i . "$RUNNER_TEMP" || :; } > "$diagnostics/storage.log"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+
+          diagnostics = Path(os.environ["RUNNER_TEMP"]) / "qualification-diagnostics"
+          inventory = []
+          for directory in (Path("validation/family"), Path("validation/reuse")):
+              if not directory.is_dir():
+                  continue
+              for path in sorted(directory.iterdir()):
+                  inventory.append({
+                      "path": str(path),
+                      "kind": "directory" if path.is_dir() else "file",
+                      "size_bytes": path.stat().st_size,
+                  })
+                  if path.is_file() and path.name.endswith(".profile.gz"):
+                      profiles = diagnostics / "profiles" / directory.name
+                      profiles.mkdir(parents=True, exist_ok=True)
+                      shutil.copyfile(path, profiles / path.name)
+              progress = directory / "progress.jsonl"
+              if progress.is_file():
+                  with progress.open("rb") as source:
+                      source.seek(max(0, progress.stat().st_size - 131072))
+                      (diagnostics / f"{directory.name}-progress.jsonl").write_bytes(source.read())
+          (diagnostics / "inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
+          PY
+
+      - name: Upload bounded qualification diagnostics
+        if: ${{ always() && (inputs.scope || 'full') == 'full' }}
+        timeout-minutes: 3
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-qualification-diagnostics-${{ matrix.qualification }}
+          path: ${{ runner.temp }}/qualification-diagnostics/
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload comparison reports
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: kernel-acceptance
+          name: kernel-acceptance${{ (inputs.scope || 'full') == 'full' && format('-{0}', matrix.qualification) || '' }}
           path: |
             validation/
             ${{ runner.temp }}/native-tools*
             ${{ runner.temp }}/native-controls*
-            bazel-out/**/bin/native/exporter_archive.tar.gz
+            bazel-out/*/bin/native/exporter_archive.tar.gz
             bazel-testlogs/repository_test/test.outputs/
             bazel-testlogs/**/test.log
-            bazel-out/**/bin/kernel_validation/**
-            bazel-out/**/bin/native/**/config-report.json
-            bazel-out/**/bin/action_built_config/config-report.json
-            bazel-out/**/bin/tests/scheduler.manifest.json
-            bazel-out/**/bin/tests/scheduler.tree/**
-            bazel-out/**/bin/native_btf_tools.manifest.json
-            bazel-out/**/bin/native_btf_tools.tree/**
-            bazel-out/**/bin/native_btf_tools_5_10.manifest.json
-            bazel-out/**/bin/native_btf_tools_5_10.tree/**
-            bazel-out/**/bin/native_btf_tools_6_18.manifest.json
-            bazel-out/**/bin/native_btf_tools_6_18.tree/**
-            bazel-out/**/bin/native_compiler_checks.manifest.json
-            bazel-out/**/bin/native_compiler_checks.tree/**
-            bazel-out/**/bin/native_compiler_checks_5_10.manifest.json
-            bazel-out/**/bin/native_compiler_checks_5_10.tree/**
+            bazel-out/*/bin/kernel_validation/**
+            bazel-out/*/bin/native/**/config-report.json
+            bazel-out/*/bin/action_built_config/config-report.json
+            bazel-out/*/bin/tests/scheduler.manifest.json
+            bazel-out/*/bin/tests/scheduler.tree/**
+            bazel-out/*/bin/native_btf_tools.manifest.json
+            bazel-out/*/bin/native_btf_tools.tree/**
+            bazel-out/*/bin/native_btf_tools_5_10.manifest.json
+            bazel-out/*/bin/native_btf_tools_5_10.tree/**
+            bazel-out/*/bin/native_btf_tools_6_18.manifest.json
+            bazel-out/*/bin/native_btf_tools_6_18.tree/**
+            bazel-out/*/bin/native_compiler_checks.manifest.json
+            bazel-out/*/bin/native_compiler_checks.tree/**
+            bazel-out/*/bin/native_compiler_checks_5_10.manifest.json
+            bazel-out/*/bin/native_compiler_checks_5_10.tree/**
           if-no-files-found: warn
           retention-days: 7

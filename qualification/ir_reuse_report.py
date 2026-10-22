@@ -65,6 +65,36 @@ class Execution(TypedDict):
     frontend: list[FrontendOutcome]
 
 
+class ProductInventory(TypedDict):
+    compilers: dict[str, NativeCompilerRecord]
+    config: str
+
+
+class Workload(TypedDict):
+    compiler_counts: dict[str, int]
+    compiler_inventory_sha256: str
+    product_compiler_actions: int
+    config_sha256: str
+
+
+class Membership(TypedDict):
+    common_c_compilers: int
+    equal_native_backend_actions: list[str]
+
+
+class BackendReuse(TypedDict):
+    eligible: int
+    cache_hits: int
+    executed: int
+
+
+class FamilyBaseline(TypedDict):
+    variants: dict[str, Workload]
+    aggregate: dict[str, int]
+    backend_memberships: dict[str, int]
+    backend_retrievals: dict[str, int]
+
+
 def string_map(value: object) -> dict[str, str]:
     if not isinstance(value, dict) or any(not isinstance(key, str) or not isinstance(item, str) for key, item in value.items()):
         raise ValueError(f"Expected a string map, got {value}")
@@ -201,7 +231,7 @@ def authenticate(directory: Path, name: str, workspace: Path, manifest: KernelMa
     (directory / f"{name}.products.json").write_text(json.dumps(result, indent=2) + "\n")
 
 
-def execution(path: Path, targets: dict[str, ArtifactRecord]) -> Execution:
+def execution(path: Path, targets: dict[str, ArtifactRecord], inventory: dict[str, NativeCompilerRecord]) -> Execution:
     entries = records(path)
     match next(entries, None):
         case {"invocation": str(invocation), "hashFunctionName": str(hash_function)} if invocation and hash_function:
@@ -215,6 +245,12 @@ def execution(path: Path, targets: dict[str, ArtifactRecord]) -> Execution:
     }
     if len(selected) != len(targets) * 3:
         raise ValueError("Compiler roles share output paths in one invocation")
+    for target, compiler in inventory.items():
+        if compiler["kind"] != "c":
+            output = mapped(compiler["object"])
+            if output in selected:
+                raise ValueError(f"Compiler roles share output path: {output}")
+            selected[output] = target, "single"
     paths: dict[int, str] = {}
     seen: set[str] = set()
     outcomes: dict[str, Outcome] = {}
@@ -267,7 +303,102 @@ def execution(path: Path, targets: dict[str, ArtifactRecord]) -> Execution:
     return {"invocation": invocation, "hash_function": hash_function, "outcomes": outcomes, "frontend": frontend}
 
 
-def summarize(directory: Path) -> None:
+def workload(products: ProductInventory) -> Workload:
+    """Count authenticated product roles, excluding integrated references."""
+    compilers = products["compilers"]
+    members = sorted((target, value["kind"], mapped(value["source"])) for target, value in compilers.items())
+    counts = {kind: sum(value["kind"] == kind for value in compilers.values()) for kind in ("c", "assembly", "host", "codegen")}
+    return {
+        "compiler_counts": counts,
+        "compiler_inventory_sha256": hashlib.sha256(json.dumps(members, separators=(",", ":")).encode()).hexdigest(),
+        "product_compiler_actions": 2 * counts["c"] + sum(counts[kind] for kind in ("assembly", "host", "codegen")),
+        "config_sha256": hashlib.sha256(products["config"].encode()).hexdigest(),
+    }
+
+
+def ordered_backend_reuse(order: tuple[str, ...], phases: dict[str, Execution], memberships: dict[str, Membership]) -> dict[str, BackendReuse]:
+    result = {}
+    for index, name in enumerate(order[1:], start=1):
+        # Pair memberships already require the same owner/source, actual
+        # backend key and IR. Union predecessors so one current retrieval is
+        # counted once, without attributing which phase populated the cache.
+        eligible = set().union(*(
+            memberships["/".join(member for member in FAMILY if member in (prior, name))]["equal_native_backend_actions"]
+            for prior in order[:index]
+        ))
+        hits = sum(phases[name]["outcomes"]["object:" + target]["cache_hit"] for target in eligible)
+        result[name] = {"eligible": len(eligible), "cache_hits": hits, "executed": len(eligible) - hits}
+    return result
+
+
+def regression(products: dict[str, ProductInventory], phases: dict[str, Execution], memberships: dict[str, Membership], baseline: FamilyBaseline) -> dict[str, object]:
+    """Keep configured work, equal action keys and actual retrieval distinct."""
+    variants = {name: workload(products[name]) for name in FAMILY}
+    product_keys, backend = set(), set()
+    backend_instances = 0
+    for name in FAMILY:
+        expected = variants[name]["compiler_counts"]["c"]
+        outcomes = [value for key, value in phases[name]["outcomes"].items() if key.startswith("object:")]
+        # Silence is valid for unchanged, which is outside this four-variant
+        # aggregate. It cannot supply an unobserved cross-variant cache key.
+        assert len(outcomes) == len(phases[name]["frontend"]) == expected, (name, expected, len(outcomes), len(phases[name]["frontend"]))
+        product_outcomes = phases[name]["frontend"] + [value for key, value in phases[name]["outcomes"].items() if not key.startswith("integrated:")]
+        assert len(product_outcomes) == variants[name]["product_compiler_actions"], (name, len(product_outcomes), variants[name])
+        product_keys.update((value["action_digest"]["hash"], value["action_digest"]["size_bytes"]) for value in product_outcomes)
+        backend.update((value["action_digest"]["hash"], value["action_digest"]["size_bytes"]) for value in outcomes)
+        backend_instances += len(outcomes)
+    aggregate = {
+        "product_compiler_instances": sum(value["product_compiler_actions"] for value in variants.values()),
+        "distinct_product_compiler_action_keys": len(product_keys),
+        "repeated_backend_instances": backend_instances - len(backend),
+    }
+    observed = {}
+    for name in FAMILY:
+        single = {target: value for target, value in products[name]["compilers"].items() if value["kind"] != "c"}
+        roles = {"c_frontend": phases[name]["frontend"], "c_backend": [value for key, value in phases[name]["outcomes"].items() if key.startswith("object:")]}
+        roles.update({
+            kind: [phases[name]["outcomes"]["single:" + target] for target, value in single.items() if value["kind"] == kind and "single:" + target in phases[name]["outcomes"]]
+            for kind in ("assembly", "host", "codegen")
+        })
+        observed[name] = {
+            role: {
+                "executed": sum(not value["cache_hit"] for value in values),
+                "cache_hits": sum(value["cache_hit"] for value in values),
+                "not_observed": variants[name]["compiler_counts"]["c" if role.startswith("c_") else role] - len(values),
+            }
+            for role, values in roles.items()
+        }
+    counts = {name: len(value["equal_native_backend_actions"]) for name, value in memberships.items()}
+    assert baseline["variants"].keys() == variants.keys(), baseline["variants"]
+    assert baseline["backend_memberships"].keys() == counts.keys(), baseline["backend_memberships"]
+    violations = []
+    for name, actual in variants.items():
+        if actual != baseline["variants"][name]:
+            violations.append(f"{name} product compiler workload: got {actual}, baseline {baseline['variants'][name]}")
+    for name, actual in aggregate.items():
+        expected = baseline["aggregate"][name]
+        if name == "distinct_product_compiler_action_keys":
+            valid = actual <= expected
+        elif name == "repeated_backend_instances":
+            valid = actual >= expected
+        else:
+            valid = actual == expected
+        if not valid:
+            violations.append(f"{name}: got {actual}, baseline {expected}")
+    for name, actual in counts.items():
+        if actual < baseline["backend_memberships"][name]:
+            violations.append(f"{name} equal backend actions: got {actual}, floor {baseline['backend_memberships'][name]}")
+    order = tuple(name for name in FAMILY_PHASES if name in FAMILY)
+    assert baseline["backend_retrievals"].keys() == set(order[1:]), baseline["backend_retrievals"]
+    ordered = ordered_backend_reuse(order, phases, memberships)
+    for name, actual in ordered.items():
+        expected = baseline["backend_retrievals"][name]
+        if actual["cache_hits"] < expected:
+            violations.append(f"{name} matched backend retrievals: got {actual['cache_hits']}, floor {expected}")
+    return {"variants": variants, "aggregate": aggregate, "observed": observed, "backend_memberships": counts, "ordered_backend_reuse": ordered, "violations": violations}
+
+
+def summarize(directory: Path, baseline_path: Path = Path(__file__).with_name("family_baseline.json")) -> None:
     names = FAMILY_PHASES
     native_recipes = {name: read_native_recipe_checks(directory, name) for name in names}
     scan_inventories, scan_phases = scan_measurements(directory, names)
@@ -275,14 +406,14 @@ def summarize(directory: Path) -> None:
     expected = snapshots["base"].keys()
     assert expected and all(snapshots.values()), "Empty native compiler inventory"
     assert snapshots["unchanged"].keys() == expected, "Unchanged compiler inventory differs"
-    phases = {name: execution(directory / f"{name}.execution.jsonl", snapshots[name]) for name in names}
+    products = {name: json.loads((directory / f"{name}.products.json").read_text()) for name in names}
+    phases = {name: execution(directory / f"{name}.execution.jsonl", snapshots[name], products[name]["compilers"]) for name in names}
     assert len({value["invocation"] for value in phases.values()}) == len(names), "Repeated invocation IDs"
     assert len({value["hash_function"] for value in phases.values()}) == 1, "Different action-cache digest algorithms"
     parity = {
         name: [target for target, record in values.items() if record["digests"]["integrated"] != record["digests"]["object"]]
         for name, values in snapshots.items()
     }
-    products = {name: json.loads((directory / f"{name}.products.json").read_text()) for name in names}
     common = expected & snapshots["lz4"].keys()
     common = {target for target in common if mapped(products["base"]["compilers"][target]["source"]) == mapped(products["lz4"]["compilers"][target]["source"])}
     equal = [target for target in sorted(common) if snapshots["base"][target]["digests"]["bitcode"] == snapshots["lz4"][target]["digests"]["bitcode"]]
@@ -342,9 +473,11 @@ def summarize(directory: Path) -> None:
         "base_panic": "CONFIG_PANIC_TIMEOUT=0" in products["base"]["config"].splitlines(),
         "changed_panic": "CONFIG_PANIC_TIMEOUT=37" in products["changed"]["config"].splitlines(),
     }
+    result["regression"] = regression(products, phases, memberships, json.loads(baseline_path.read_text()))
     (directory / "ir-reuse.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({key: value for key, value in result.items() if key not in ("phases", "products")}, indent=2))
     assert all(result["family_checks"].values()), result["family_checks"]
+    assert not result["regression"]["violations"], result["regression"]["violations"]
     assert len(hits) >= 4, hits
     assert unchanged_digests and not unchanged_executions, result
     # A previous invocation may have cached the changed configuration too.
