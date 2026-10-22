@@ -63,6 +63,15 @@ still regenerates that header from its unchanged template and runs its own check
 
 Use Bazel 9.3.0 and the registered Linux execution toolchain:
 
+The [LLVM toolchain index](llvm_toolchain_index.json) selects
+[corrected LLVM 23.1.2 packages](https://github.com/tamird/hermetic-llvm/releases/tag/llvm-23.1.2-ir1)
+for Linux and macOS. The correction preserves diagnostics and inlining-chain
+notes when compiling LLVM IR without an AST source manager. Compiler tools,
+C/C++ toolchains, and builtin headers still come from the same ordinary archive.
+A consuming root must select this exported index with
+`llvm_toolchain_minimal.index(file = "@linux//:llvm_toolchain_index.json")`,
+using its repository name for this dependency; root index tags take precedence.
+
 ```sh
 bazel test //native:config_tests //:action_built_config_test \
   --platforms=@llvm//platforms:linux_x86_64 \
